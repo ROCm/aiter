@@ -47,7 +47,6 @@ from flydsl.expr.typing import T
 from flydsl.runtime.device import get_rocm_arch
 
 from aiter.ops.flydsl.kernels import vector
-
 from aiter.ops.flydsl.utils import addressable_lds_bytes_for_gfx
 
 from .splitk_hgemm import (
@@ -72,6 +71,7 @@ STAGES = 2
 WARP_SIZE = 64
 DTYPE_BYTES = 2
 LDG_VEC_SIZE = 8
+
 
 def _ceil_div(x: int, y: int) -> int:
     return (x + y - 1) // y
@@ -206,9 +206,7 @@ def compile_small_m_hgemm_kernel(
     BLOCK_K = TILE_K
     IS_SPLIT_K = SPLIT_K > 1
     if not small_m_tile_k_is_swizzle_safe(BLOCK_K):
-        raise ValueError(
-            f"TILE_K={TILE_K} is not supported by the XOR-16 LDS swizzle"
-        )
+        raise ValueError(f"TILE_K={TILE_K} is not supported by the XOR-16 LDS swizzle")
     if k % SPLIT_K != 0:
         raise ValueError(f"K={k} is not divisible by SPLIT_K={SPLIT_K}")
     ks = k // SPLIT_K
@@ -797,9 +795,7 @@ def compile_small_m_hgemm_kernel(
             pair = vector.bitcast(T.i64x2, frag)
             halves = []
             for half in range_constexpr(2):
-                part = vector.extract(
-                    pair, static_position=[half], dynamic_position=[]
-                )
+                part = vector.extract(pair, static_position=[half], dynamic_position=[])
                 halves.append(
                     vector.bitcast(
                         T.f16x4,
@@ -1019,9 +1015,7 @@ def compile_small_m_hgemm_kernel(
                     n_local_idx = global_tid // LDG_B_X_THREADS
                     k_local_idx = global_tid % LDG_B_X_THREADS * LDG_VEC_SIZE
                     col_in_bytes = k_local_idx * DTYPE_BYTES
-                    col_in_bytes = swizzle_xor16(
-                        n_local_idx, col_in_bytes, k_blocks16
-                    )
+                    col_in_bytes = swizzle_xor16(n_local_idx, col_in_bytes, k_blocks16)
                     slot_valid = arith.cmpi(
                         arith.CmpIPredicate.ult,
                         fx.Index(global_tid),
@@ -1225,8 +1219,7 @@ def compile_small_m_hgemm_kernel(
                     * MFMA_PER_WARP_K
                 )
                 LDG_TOTAL = (
-                    STAGE_VMEM_A_COUNT
-                    + N_TILE_REPEAT * WARP_K_STEPS * WARP_N_STEPS
+                    STAGE_VMEM_A_COUNT + N_TILE_REPEAT * WARP_K_STEPS * WARP_N_STEPS
                 )
                 avg_mfma_count = (MFMA_TOTAL + LDG_TOTAL - 1) // LDG_TOTAL
                 mfma_sched = OnlineScheduler(MFMA_TOTAL, MFMA_TOTAL)

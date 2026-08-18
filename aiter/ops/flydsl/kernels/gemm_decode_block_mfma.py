@@ -13,10 +13,10 @@ from flydsl.expr.arith import ArithValue
 from flydsl.expr.typing import Int32, T
 
 from .gemm_decode_common import (
-    ActivationSource,
-    BlockMfmaDecodeConfig,
     MFMA_K,
     WAVE_SIZE,
+    ActivationSource,
+    BlockMfmaDecodeConfig,
     add_bias_f32,
     bf16x4_slice,
     block_mfma_staged_k,
@@ -151,16 +151,13 @@ def _compute_column_tile(
     """Compute one logical N tile and return values for guarded stores."""
     columns = config.columns_per_wave
     logical_columns = [
-        column_base + fx.Int32(column)
-        for column in range_constexpr(columns)
+        column_base + fx.Int32(column) for column in range_constexpr(columns)
     ]
     safe_columns = []
     for column in range_constexpr(columns):
         column_coord = logical_columns[column]
         valid = column_coord < fx.Int32(geometry.n)
-        safe_columns.append(
-            ArithValue(raw(valid)).select(column_coord, fx.Int32(0))
-        )
+        safe_columns.append(ArithValue(raw(valid)).select(column_coord, fx.Int32(0)))
     accumulator_zero = arith.constant_vector(0.0, T.vec(4, T.f32))
     accumulators = [
         [accumulator_zero for _ in range_constexpr(columns)]
@@ -189,9 +186,7 @@ def _compute_column_tile(
                     a_smem=a_smem,
                     k_base=k_base,
                     m=geometry.m,
-                    row_stride=(
-                        geometry.staged_k if geometry.use_lds else geometry.k
-                    ),
+                    row_stride=(geometry.staged_k if geometry.use_lds else geometry.k),
                     width=geometry.width,
                 )
             )
@@ -324,10 +319,9 @@ def _make_block_kernel(
         ):
             tid = fx.Int32(gpu.thread_idx.x)
             wave, lane = wave_lane_coordinates(tid, waves)
-            first_column = (
-                gpu.block_idx.x * fx.Int32(waves * columns)
-                + wave * fx.Int32(columns)
-            )
+            first_column = gpu.block_idx.x * fx.Int32(
+                waves * columns
+            ) + wave * fx.Int32(columns)
             a_global = make_buffer_matrix(A, m, k)
             b_global = make_buffer_matrix(B, n, k)
             c_global = make_buffer_matrix(C, m, n)
@@ -418,13 +412,8 @@ def _make_block_kernel(
             for row in range_constexpr(m):
                 for column in range_constexpr(columns):
                     column_coord = logical_columns[column]
-                    if (lane == fx.Int32(WAVE_SIZE - 1)) & (
-                        column_coord < fx.Int32(n)
-                    ):
-                        element = (
-                            fx.Int32(row) * fx.Int32(n)
-                            + fx.Int32(column_coord)
-                        )
+                    if (lane == fx.Int32(WAVE_SIZE - 1)) & (column_coord < fx.Int32(n)):
+                        element = fx.Int32(row) * fx.Int32(n) + fx.Int32(column_coord)
                         value = reduced[row][column]
                         if const_expr(has_bias):
                             value = add_bias_f32(
@@ -452,10 +441,9 @@ def _make_block_kernel(
         ):
             tid = fx.Int32(gpu.thread_idx.x)
             wave, lane = wave_lane_coordinates(tid, waves)
-            first_column = (
-                gpu.block_idx.x * fx.Int32(waves * columns)
-                + wave * fx.Int32(columns)
-            )
+            first_column = gpu.block_idx.x * fx.Int32(
+                waves * columns
+            ) + wave * fx.Int32(columns)
             a_global = make_buffer_matrix(A, m, k)
             b_global = make_buffer_matrix(B, n, k)
             c_global = make_buffer_matrix(C, m, n)
@@ -562,9 +550,8 @@ def _make_block_kernel(
                             if (lane == fx.Int32(WAVE_SIZE - 1)) & (
                                 column_coord < fx.Int32(n)
                             ):
-                                element = (
-                                    fx.Int32(row) * fx.Int32(n)
-                                    + fx.Int32(column_coord)
+                                element = fx.Int32(row) * fx.Int32(n) + fx.Int32(
+                                    column_coord
                                 )
                                 value = reduced[row][column]
                                 if const_expr(has_bias):
@@ -620,11 +607,7 @@ def compile_gemm_decode_block_mfma_bf16(
     else:
         grid_workgroups = logical_workgroups
         persistent_turns = 1
-    cache_tag = (
-        f"{kernel_name}_cus{num_cus}"
-        if config.persistent_n
-        else kernel_name
-    )
+    cache_tag = f"{kernel_name}_cus{num_cus}" if config.persistent_n else kernel_name
 
     kernel = _make_block_kernel(
         m=m,
@@ -636,10 +619,9 @@ def compile_gemm_decode_block_mfma_bf16(
         has_bias=has_bias,
     )
     kernel_attributes = (
-        {"rocdl.waves_per_eu": config.waves_per_eu}
-        if config.waves_per_eu
-        else {}
+        {"rocdl.waves_per_eu": config.waves_per_eu} if config.waves_per_eu else {}
     )
+    default_stream = fx.Stream(None)
 
     if persistent_turns == 1:
 
@@ -650,7 +632,7 @@ def compile_gemm_decode_block_mfma_bf16(
             C: fx.Tensor,
             BIAS: fx.Tensor,
             cache_identity: fx.Constexpr[str],
-            stream: fx.Stream = fx.Stream(None),
+            stream: fx.Stream = default_stream,
         ):
             kernel(A, B, C, BIAS, value_attrs=kernel_attributes).launch(
                 grid=(grid_workgroups, 1, 1),
@@ -667,7 +649,7 @@ def compile_gemm_decode_block_mfma_bf16(
             C: fx.Tensor,
             BIAS: fx.Tensor,
             cache_identity: fx.Constexpr[str],
-            stream: fx.Stream = fx.Stream(None),
+            stream: fx.Stream = default_stream,
         ):
             kernel(
                 A,
@@ -688,14 +670,12 @@ def compile_gemm_decode_block_mfma_bf16(
         B: fx.Tensor,
         C: fx.Tensor,
         bias: fx.Tensor | None = None,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream = default_stream,
     ):
         if has_bias and bias is None:
             raise ValueError("This decode launcher requires `bias`.")
         if not has_bias and bias is not None:
-            raise ValueError(
-                "This decode launcher was compiled without bias support."
-            )
+            raise ValueError("This decode launcher was compiled without bias support.")
         return _run_compiled(
             launch,
             A,

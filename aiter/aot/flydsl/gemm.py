@@ -163,8 +163,7 @@ def _parse_decode_row(row: dict[str, str | None], kernel_name: str) -> dict:
     )
     if missing:
         raise ValueError(
-            "FlyDSL decode CSV row is missing required values: "
-            + ", ".join(missing)
+            "FlyDSL decode CSV row is missing required values: " + ", ".join(missing)
         )
 
     m = int(row["M"])
@@ -193,9 +192,7 @@ def _parse_decode_row(row: dict[str, str | None], kernel_name: str) -> dict:
         )
     has_bias = _parse_bool(row["bias"])
     if name_has_bias != has_bias:
-        raise ValueError(
-            "FlyDSL decode CSV bias metadata does not match kernel name"
-        )
+        raise ValueError("FlyDSL decode CSV bias metadata does not match kernel name")
     if row["dtype"].strip() != "torch.bfloat16":
         raise ValueError("FlyDSL decode AOT requires BF16 input dtype")
     if row["outdtype"].strip() != "torch.bfloat16":
@@ -283,20 +280,17 @@ def parse_csv(csv_path: str):
                 params.get("kind") == "hgemm"
                 and int(row.get("splitK", "0")) != params["split_k"]
             ):
-                raise ValueError(
-                    "FlyDSL HGEMM CSV splitK does not match kernel name"
-                )
-            if (
-                params.get("kind") == "hgemm"
-                and params.get("target_gfx") != gfx
-            ):
+                raise ValueError("FlyDSL HGEMM CSV splitK does not match kernel name")
+            if params.get("kind") == "hgemm" and params.get("target_gfx") != gfx:
                 raise ValueError(
                     "FlyDSL HGEMM CSV architecture does not match kernel name"
                 )
-            if params.get("kind") == "hgemm" and (
-                params.get("n"),
-                params.get("k"),
-            ) != (n, k):
+            if (
+                params.get("kind") == "hgemm"
+                and params.get("n") is not None
+                and params.get("k") is not None
+                and (params.get("n"), params.get("k")) != (n, k)
+            ):
                 raise ValueError("FlyDSL HGEMM CSV N/K does not match kernel name")
 
             job = {

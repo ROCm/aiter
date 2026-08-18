@@ -19,7 +19,6 @@ from aiter.ops.flydsl.gemm_kernels import (
     gemm_decode_bf16,
 )
 
-
 ARCH = get_gfx_runtime()
 SUPPORTED_ARCHS = ("gfx942", "gfx950")
 ATOL = 0.125
@@ -42,8 +41,11 @@ def _inputs(m: int, n: int, k: int) -> tuple[torch.Tensor, torch.Tensor]:
 
 def _bias(n: int) -> torch.Tensor:
     return (
-        ((torch.arange(n, device="cuda", dtype=torch.int32) * 3) % 17) - 8
-    ).to(torch.float32).div_(16).bfloat16()
+        (((torch.arange(n, device="cuda", dtype=torch.int32) * 3) % 17) - 8)
+        .to(torch.float32)
+        .div_(16)
+        .bfloat16()
+    )
 
 
 def _reference(
@@ -58,9 +60,7 @@ def _reference(
 
 
 def _output(m: int, n: int) -> torch.Tensor:
-    return torch.full(
-        (m, n), torch.nan, device="cuda", dtype=torch.bfloat16
-    )
+    return torch.full((m, n), torch.nan, device="cuda", dtype=torch.bfloat16)
 
 
 def _assert_output(
@@ -213,3 +213,11 @@ def test_block_mfma_graph_replay_on_non_default_stream() -> None:
         graph.replay()
     side.synchronize()
     _assert_output(output, reference)
+
+
+def test_output_must_not_overlap_bias() -> None:
+    m, n, k = 3, 64, 128
+    a, b = _inputs(m, n, k)
+    output = _output(m, n)
+    with pytest.raises(ValueError, match="overlap bias"):
+        gemm_decode_bf16(a, b, output, _wave_config(m, k), bias=output[0])

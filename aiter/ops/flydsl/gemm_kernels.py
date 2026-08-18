@@ -24,11 +24,6 @@ from aiter.ops.flydsl.kernels.tensor_shim import (
 )
 
 from .kernels.gemm_decode_block_mfma import compile_gemm_decode_block_mfma_bf16
-from .kernels.hgemm_dispatch import (
-    KERNEL_FAMILY_HGEMM,
-    KERNEL_FAMILY_SMALL_M,
-    compile_flydsl_hgemm_kernel,
-)
 from .kernels.gemm_decode_common import (
     ActivationSource,
     BlockMfmaDecodeConfig,
@@ -43,6 +38,11 @@ from .kernels.gemm_decode_common import (
     parse_gemm_decode_kernel_name,
 )
 from .kernels.gemm_decode_wave import compile_gemm_decode_wave_bf16
+from .kernels.hgemm_dispatch import (
+    KERNEL_FAMILY_HGEMM,
+    KERNEL_FAMILY_SMALL_M,
+    compile_flydsl_hgemm_kernel,
+)
 from .kernels.small_m_hgemm import SMALL_M_KERNEL_MAX
 from .kernels.splitk_hgemm import SPLIT_K_SEMAPHORE_MAX_LEN
 from .utils import get_shared_memory_per_block, is_flydsl_available
@@ -78,7 +78,7 @@ KERNEL_ASYNC_COPY = get_rocm_arch() != "gfx942"
 _HGEMM_KERNEL_RE = re.compile(
     r"^flydsl_gemm(?P<stages>\d+)_"
     r"a(?P<a_dtype>[a-z0-9]+)_w(?P<w_dtype>[a-z0-9]+)_(?P<out_dtype>[a-z0-9]+)_"
-    r"n(?P<n>[1-9]\d*)_k(?P<k>[1-9]\d*)_"
+    r"(?:n(?P<n>[1-9]\d*)_k(?P<k>[1-9]\d*)_)?"
     r"t(?P<tile_m>\d+)x(?P<tile_n>\d+)x(?P<tile_k>\d+)_"
     r"split_k(?P<split_k>\d+)_"
     r"block_m_warp(?P<block_m_warps>\d+)_"
@@ -116,6 +116,7 @@ KERNEL_CONFIG_VARIANTS = [
     }
     for wm, wn, wk in HGEMM_WARP_SHAPE_OPTIONS
 ]
+
 
 def _normalize_supported_kernel_metadata(
     *,
@@ -563,6 +564,8 @@ def get_flydsl_splitk_hgemm_kernel_params(name: str) -> dict | None:
 
     block_k_warps = m.group("block_k_warps")
     block_k_warps = int(block_k_warps) if block_k_warps else 1
+    n_text = m.group("n")
+    k_text = m.group("k")
     return {
         "kernel_family": KERNEL_FAMILY_HGEMM,
         "stages": int(m.group("stages")),
@@ -579,8 +582,8 @@ def get_flydsl_splitk_hgemm_kernel_params(name: str) -> dict | None:
         "c_to_lds": m.group("c_to_lds") == "True",
         "dtype": m.group("a_dtype"),
         "out_dtype": m.group("out_dtype"),
-        "n": int(m.group("n")),
-        "k": int(m.group("k")),
+        "n": int(n_text) if n_text is not None else None,
+        "k": int(k_text) if k_text is not None else None,
         "target_gfx": m.group("target_gfx"),
     }
 
@@ -966,6 +969,7 @@ def flydsl_small_m_hgemm(
 
 def _overlaps(lhs: torch.Tensor, rhs: torch.Tensor) -> bool:
     """Check if two tensors overlap in memory."""
+
     def _storage_range(tensor: torch.Tensor) -> tuple[int, int]:
         begin = tensor.data_ptr()
         return begin, begin + tensor.numel() * tensor.element_size()
@@ -1014,11 +1018,16 @@ def validate_gemm_decode_tensors(
                 f"{name} must have shape {expected_shapes[name]}, "
                 f"got {tuple(tensor.shape)}"
             )
-        if not tensor.is_contiguous() or tuple(tensor.stride()) != expected_strides[name]:
+        if (
+            not tensor.is_contiguous()
+            or tuple(tensor.stride()) != expected_strides[name]
+        ):
             raise ValueError(f"{name} must use packed row-major storage")
 
     if _overlaps(C, A) or _overlaps(C, B):
         raise ValueError("C must not overlap A or B")
+    if bias is not None and _overlaps(C, bias):
+        raise ValueError("C must not overlap bias")
     gfx = get_gfx_runtime() if arch is None else arch
     if gfx not in ("gfx942", "gfx950"):
         raise ValueError(f"decode GEMM requires gfx942 or gfx950, got {gfx}")

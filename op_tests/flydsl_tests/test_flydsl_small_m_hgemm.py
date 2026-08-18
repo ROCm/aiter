@@ -14,7 +14,6 @@ pytest.importorskip("flydsl")
 from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.flydsl.gemm_kernels import flydsl_small_m_hgemm
 
-
 ARCH = get_gfx_runtime()
 SUPPORTED_ARCHS = ("gfx942", "gfx950")
 ATOL = 0.125
@@ -112,9 +111,11 @@ def _inputs(
     bias = None
     if case.with_bias:
         bias = (
-            ((torch.arange(case.n, device="cuda", dtype=torch.int32) * 5) % 19)
-            - 9
-        ).to(torch.float32).div_(16).bfloat16()
+            (((torch.arange(case.n, device="cuda", dtype=torch.int32) * 5) % 19) - 9)
+            .to(torch.float32)
+            .div_(16)
+            .bfloat16()
+        )
     return a, b, bias
 
 
@@ -153,11 +154,7 @@ def test_small_m_hgemm_matches_fp32_oracle(case: Case) -> None:
 
     assert returned is output
     assert torch.isfinite(output).all()
-    atol, rtol = (
-        (SPLIT_K_ATOL, SPLIT_K_RTOL)
-        if case.split_k > 1
-        else (ATOL, RTOL)
-    )
+    atol, rtol = (SPLIT_K_ATOL, SPLIT_K_RTOL) if case.split_k > 1 else (ATOL, RTOL)
     torch.testing.assert_close(
         output,
         _reference(a, b, bias),

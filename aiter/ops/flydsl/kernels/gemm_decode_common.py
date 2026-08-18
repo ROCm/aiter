@@ -4,11 +4,12 @@
 
 from __future__ import annotations
 
+import re
+from collections.abc import Iterator
 from dataclasses import dataclass
 from enum import Enum
 from itertools import product
-import re
-from typing import Iterator, TypeAlias
+from typing import TypeAlias
 
 import flydsl.expr as fx
 from flydsl._mlir import ir
@@ -22,7 +23,6 @@ from aiter.ops.flydsl.kernels import buffer_ops, vector
 from aiter.ops.flydsl.utils import addressable_lds_bytes_for_gfx
 
 from .tensor_shim import _to_raw as raw
-
 
 # Host configuration, validation, naming, and enumeration.
 WAVE_SIZE = 64
@@ -144,9 +144,11 @@ class WaveDecodeConfig:
             raise ValueError("dot2 BF16 contraction requires gfx950")
         if arch == "gfx950" and self.contraction != ContractionMode.DOT2_BF16:
             raise ValueError("gfx950 wave policy uses native dot2 BF16 contraction")
-        if self.output_rounding == OutputRounding.STOCHASTIC:
-            if not traits.supports_stochastic:
-                raise ValueError("stochastic BF16 conversion requires gfx950")
+        if (
+            self.output_rounding == OutputRounding.STOCHASTIC
+            and not traits.supports_stochastic
+        ):
+            raise ValueError("stochastic BF16 conversion requires gfx950")
         if self.reduction == ReductionMode.DPP and k % self.kvec:
             raise ValueError("DPP reduction requires K divisible by kvec")
         validate_wave_i32_addressing(m, n, k, self)
@@ -201,16 +203,16 @@ class BlockMfmaDecodeConfig:
                     "once and safely reused across N turns"
                 )
         elif self.workgroups_per_cu != 1:
-            raise ValueError(
-                "workgroups_per_cu only applies to N-persistent BlockMFMA"
-            )
+            raise ValueError("workgroups_per_cu only applies to N-persistent BlockMFMA")
         if self.waves_per_eu not in (0, 1, 2, 4):
             raise ValueError("waves_per_eu must be 0, 1, 2, or 4")
         validate_cache_policy(self.b_cache_modifier)
         validate_block_mfma_i32_addressing(m, n, k, self)
-        if self.output_rounding == OutputRounding.STOCHASTIC:
-            if not traits.supports_stochastic:
-                raise ValueError("stochastic BF16 conversion requires gfx950")
+        if (
+            self.output_rounding == OutputRounding.STOCHASTIC
+            and not traits.supports_stochastic
+        ):
+            raise ValueError("stochastic BF16 conversion requires gfx950")
         if self.activation_source == ActivationSource.FULL_LDS:
             required = block_mfma_lds_bytes(m, k)
             lds_limit = addressable_lds_bytes_for_gfx(arch)
@@ -295,9 +297,7 @@ def validate_wave_i32_addressing(
     full_tiles = k // k_tile
     tail_start = full_tiles * k_tile
     has_tail = k % k_tile != 0
-    rounded_k_boundary = (
-        tail_start + k_tile - 1 if has_tail else k - 1
-    )
+    rounded_k_boundary = tail_start + k_tile - 1 if has_tail else k - 1
     row_blocks = m // config.m_per_wave
     column_blocks = n // config.n_per_wave
     values = {
@@ -359,9 +359,7 @@ def validate_block_mfma_grid_i32(
     logical_workgroups = (n + tile_columns - 1) // tile_columns
     grid_cap = num_cus * config.workgroups_per_cu
     grid_workgroups = min(logical_workgroups, grid_cap)
-    persistent_turns = (
-        logical_workgroups + grid_workgroups - 1
-    ) // grid_workgroups
+    persistent_turns = (logical_workgroups + grid_workgroups - 1) // grid_workgroups
     column_stride = grid_workgroups * tile_columns
     max_turn_column = (
         (persistent_turns - 1) * column_stride
@@ -993,8 +991,10 @@ def convert_bf16(value, element, rounding: OutputRounding):
     if rounding == OutputRounding.RNE:
         return arith_dialect.TruncFOp(T.bf16, raw(value)).result
     seed = (
-        ArithValue(raw(element)) * fx.Int32(0x45D9F3B)
-    ) ^ (ArithValue(raw(element)) << fx.Int32(16)) ^ fx.Int32(0x27D4EB2D)
+        (ArithValue(raw(element)) * fx.Int32(0x45D9F3B))
+        ^ (ArithValue(raw(element)) << fx.Int32(16))
+        ^ fx.Int32(0x27D4EB2D)
+    )
     converted = llvm.inline_asm(
         ir.IntegerType.get_signless(32),
         [raw(value), raw(seed)],

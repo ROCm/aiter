@@ -104,12 +104,8 @@ def compile_gemm_decode_wave_bf16(
         BIAS: fx.Tensor,
     ):
         _, lane = wave_lane_coordinates(gpu.thread_idx.x, 1)
-        column_block = (
-            gpu.block_idx.y if use_column_grid_y else gpu.block_idx.x
-        )
-        row_block = (
-            gpu.block_idx.x if use_column_grid_y else gpu.block_idx.y
-        )
+        column_block = gpu.block_idx.y if use_column_grid_y else gpu.block_idx.x
+        row_block = gpu.block_idx.x if use_column_grid_y else gpu.block_idx.y
         column_owner_layout = fx.make_layout(
             (n // np, np),
             (np, 1),
@@ -138,10 +134,7 @@ def compile_gemm_decode_wave_bf16(
             for column in range_constexpr(np)
         ]
         accumulators = [
-            [
-                zero_wave_accumulator(config.contraction)
-                for _ in range_constexpr(np)
-            ]
+            [zero_wave_accumulator(config.contraction) for _ in range_constexpr(np)]
             for _ in range_constexpr(mp)
         ]
 
@@ -183,8 +176,7 @@ def compile_gemm_decode_wave_bf16(
                 )
         else:
             for batch in range_constexpr(
-                (full_tiles + config.prefetch_depth - 1)
-                // config.prefetch_depth
+                (full_tiles + config.prefetch_depth - 1) // config.prefetch_depth
             ):
                 batch_tiles = min(
                     config.prefetch_depth,
@@ -302,6 +294,8 @@ def compile_gemm_decode_wave_bf16(
                         config.output_rounding,
                     )
 
+    default_stream = fx.Stream(None)
+
     @flyc.jit
     def launch(
         A: fx.Tensor,
@@ -309,7 +303,7 @@ def compile_gemm_decode_wave_bf16(
         C: fx.Tensor,
         BIAS: fx.Tensor,
         cache_identity: fx.Constexpr[str],
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream = default_stream,
     ):
         wave_decode_kernel(
             A,
@@ -319,9 +313,7 @@ def compile_gemm_decode_wave_bf16(
             value_attrs={"rocdl.waves_per_eu": config.waves_per_eu},
         ).launch(
             grid=(
-                (m // mp, n // np, 1)
-                if use_column_grid_y
-                else (n // np, m // mp, 1)
+                (m // mp, n // np, 1) if use_column_grid_y else (n // np, m // mp, 1)
             ),
             block=(64, 1, 1),
             stream=stream,
@@ -332,14 +324,12 @@ def compile_gemm_decode_wave_bf16(
         B: fx.Tensor,
         C: fx.Tensor,
         bias: fx.Tensor | None = None,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream = default_stream,
     ):
         if has_bias and bias is None:
             raise ValueError("This decode launcher requires `bias`.")
         if not has_bias and bias is not None:
-            raise ValueError(
-                "This decode launcher was compiled without bias support."
-            )
+            raise ValueError("This decode launcher was compiled without bias support.")
         return _run_compiled(
             launch,
             A,

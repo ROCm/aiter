@@ -41,8 +41,8 @@ FLYDSL_TUNE_ERROR = None
 try:
     if is_flydsl_available():
         from aiter.ops.flydsl.gemm_kernels import (
-            BlockMfmaDecodeConfig,
             SPLIT_K_SEMAPHORE_MAX_LEN,
+            BlockMfmaDecodeConfig,
             WaveDecodeConfig,
             flydsl_hgemm,
             gemm_decode_bf16,
@@ -166,7 +166,7 @@ def resolve_vllm_wvsplitk(library=None):
                     weight, activation, bias, cu_count
                 )
             ), metadata
-        except Exception as error:
+        except Exception as error:  # noqa: BLE001
             metadata["reason"] = f"{type(error).__name__}: {error}"
             return None, metadata
 
@@ -187,8 +187,10 @@ def resolve_vllm_wvsplitk(library=None):
                     weight, activation, cu_count, bias
                 )
             ), metadata
-    except Exception as error:
-        metadata["reason"] = f"public wrapper unavailable: {type(error).__name__}: {error}"
+    except Exception as error:  # noqa: BLE001
+        metadata["reason"] = (
+            f"public wrapper unavailable: {type(error).__name__}: {error}"
+        )
 
     try:
         op = torch.ops._rocm_C.wvSplitK
@@ -204,9 +206,12 @@ def resolve_vllm_wvsplitk(library=None):
                 weight, activation, bias, cu_count
             )
         ), metadata
-    except Exception as error:
-        metadata["reason"] = f"registered op unavailable: {type(error).__name__}: {error}"
+    except Exception as error:  # noqa: BLE001
+        metadata["reason"] = (
+            f"registered op unavailable: {type(error).__name__}: {error}"
+        )
         return None, metadata
+
 
 OPUS_TUNE_ERROR = None
 try:
@@ -534,7 +539,6 @@ def run_vllm_wvsplitk_bf16(input, weight, bias=None, otype=dtypes.bf16):
 
 
 _flydsl_decode_graphs = {}
-FLYDSL_DECODE_TUNE_GRAPH_REPEATS = 10
 
 
 def run_flydsl_decode_bf16(input, weight, output, bias, otype, arch, config):
@@ -576,15 +580,14 @@ def run_flydsl_decode_bf16(input, weight, output, bias, otype, arch, config):
         stream.synchronize()
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, stream=stream):
-            for _ in range(FLYDSL_DECODE_TUNE_GRAPH_REPEATS):
-                gemm_decode_bf16(
-                    input,
-                    weight,
-                    output,
-                    config,
-                    bias=bias,
-                    stream=stream,
-                )
+            gemm_decode_bf16(
+                input,
+                weight,
+                output,
+                config,
+                bias=bias,
+                stream=stream,
+            )
         current.wait_stream(stream)
         _flydsl_decode_graphs[key] = graph
     graph.replay()
@@ -1148,9 +1151,7 @@ class GemmA16W16Tuner(GemmCommonTuner):
             )
         logger.info(f"FlyDSL candidate count for M={M}, N={N}, K={K}: {len(tasks)}")
         if getattr(self, "candidate_policy", "bounded") == "bounded":
-            tasks = [
-                task for task in tasks if int(task[4][2]["split_k"]) in (1, 2, 4)
-            ]
+            tasks = [task for task in tasks if int(task[4][2]["split_k"]) in (1, 2, 4)]
             tasks = _round_robin_representatives(
                 tasks,
                 limit=8,
@@ -1176,7 +1177,9 @@ class GemmA16W16Tuner(GemmCommonTuner):
             or iter_gemm_decode_configs is None
             or gemm_decode_kernel_name is None
         ):
-            logger.warning(f"FlyDSL decode not available, skip. reason: {FLYDSL_TUNE_ERROR}")
+            logger.warning(
+                f"FlyDSL decode not available, skip. reason: {FLYDSL_TUNE_ERROR}"
+            )
             return []
         M, N, K = map(int, info_keys[2:5])
         if (
@@ -1197,11 +1200,10 @@ class GemmA16W16Tuner(GemmCommonTuner):
         tasks = []
         decode_run_kwargs = dict(run_kwargs)
         # PyTorch profiler timing does not observe FlyDSL's direct HIP launch.
-        # Keep the existing mp_tuner flow but use its CUDA/HIP-event backend.
+        # Keep the existing mp_tuner flow and CUDA/HIP-event backend; capture
+        # one kernel into a HIP graph so replay times a single launch without
+        # a shared mp_tuner timing divisor.
         decode_run_kwargs["use_cuda_event"] = True
-        # One graph replay contains ten kernel launches, so a short event
-        # screen still averages 30 launches per candidate. The
-        # fastest candidates receive a separate rotating-weight confirmation.
         decode_run_kwargs["num_warmup"] = 1
         decode_run_kwargs["num_iters"] = 3
         # Decode has a deliberately stricter absolute/relative correctness gate
@@ -1254,12 +1256,10 @@ class GemmA16W16Tuner(GemmCommonTuner):
                     None,
                     None,
                     ("out_asm",),
-                    FLYDSL_DECODE_TUNE_GRAPH_REPEATS,
                 )
             )
         logger.info(
-            f"FlyDSL decode candidate count for M={M}, N={N}, K={K}: "
-            f"{len(tasks)}"
+            f"FlyDSL decode candidate count for M={M}, N={N}, K={K}: {len(tasks)}"
         )
         return tasks
 
@@ -1535,9 +1535,7 @@ class GemmA16W16Tuner(GemmCommonTuner):
                 task.extend(self._get_flydsl_tasks(*common))
             if "all" in libtype or "flydsl_decode" in libtype:
                 task.extend(self._get_flydsl_decode_tasks(*common))
-            if with_vllm_wvsplitk and (
-                "all" in libtype or "vllm_wvsplitk" in libtype
-            ):
+            if with_vllm_wvsplitk and ("all" in libtype or "vllm_wvsplitk" in libtype):
                 task.extend(self._get_vllm_wvsplitk_tasks(*common))
             if "all" in libtype or "skinny" in libtype:
                 task.extend(self._get_skinny_tasks(*common))
@@ -1582,9 +1580,7 @@ class GemmA16W16Tuner(GemmCommonTuner):
     def post_process(self, rets, args, topk=-1, fast_mode=False):
         """Write comparison rows to profiles but never promote them to tuned CSV."""
         rets = list(rets)
-        promotable = [
-            result for result in rets if result[0][4] != "vllm_wvsplitk"
-        ]
+        promotable = [result for result in rets if result[0][4] != "vllm_wvsplitk"]
         profile_file = args.profile_file
         if profile_file:
             profiledf = self.result_to_df(sorted(rets, key=lambda result: result[0]))

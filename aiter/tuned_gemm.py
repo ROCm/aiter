@@ -165,11 +165,17 @@ def get_GEMM_A16W16_config(
                     flydsl_config = aiter.ops.flydsl.gemm_kernels.get_flydsl_splitk_hgemm_kernel_params(
                         config["kernelName"]
                     )
+                    name_n = None if flydsl_config is None else flydsl_config.get("n")
+                    name_k = None if flydsl_config is None else flydsl_config.get("k")
+                    shape_mismatch = (
+                        name_n is not None
+                        and name_k is not None
+                        and (name_n != N or name_k != K)
+                    )
                     if (
                         flydsl_config is None
                         or flydsl_config.get("target_gfx") != gfx
-                        or flydsl_config.get("n") != N
-                        or flydsl_config.get("k") != K
+                        or shape_mismatch
                         or int(config["splitK"]) != flydsl_config.get("split_k")
                     ):
                         logger.warning(
@@ -519,15 +525,16 @@ def flydsl_gemm(
         config["kernelName"]
     )
     runtime_shape = (int(weights.shape[0]), int(inp.shape[1]))
-    kernel_shape = (
-        None
-        if flydsl_config is None
-        else (flydsl_config.get("n"), flydsl_config.get("k"))
-    )
-    if kernel_shape != runtime_shape:
+    parsed_n = None if flydsl_config is None else flydsl_config.get("n")
+    parsed_k = None if flydsl_config is None else flydsl_config.get("k")
+    if (
+        parsed_n is not None
+        and parsed_k is not None
+        and (parsed_n, parsed_k) != runtime_shape
+    ):
         raise ValueError(
             "FlyDSL HGEMM kernel N/K identity does not match launch: "
-            f"kernel={kernel_shape}, runtime={runtime_shape}"
+            f"kernel={(parsed_n, parsed_k)}, runtime={runtime_shape}"
         )
     stages = flydsl_config["stages"]
     fused_bias = None

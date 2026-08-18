@@ -70,7 +70,6 @@ def worker(
     output_keys=None,
     _arg_key_list=None,
     catastrophic_check=True,
-    timing_divisor=1,
 ):
     from aiter.test_common import run_perftest
 
@@ -96,6 +95,7 @@ def worker(
         us = float("inf")
         try:
             res, us = run_perftest(func, *args, **kwargs)
+            us = round(us, 4)
 
         except (RuntimeError, ValueError) as e:
             print(f"run gpu func warning: info:{info}\t {e}", flush=True)
@@ -110,8 +110,6 @@ def worker(
             retry_count += 1
         if us == 0:
             print(f"Warning: try run {max_retries} times, but still get 0!")
-        if us > 0:
-            us = round(us / timing_divisor, 4)
         torch.cuda.synchronize()
         if us == -1 or res is None:
             return info, us, round(max_err_ratio, 4)
@@ -314,8 +312,6 @@ def work_group(GPUIDMap, fast_mode, err_ratio, in_data, tasks, verbose=False):
             # Optional rest[2]: custom compare callable (e.g. cosine diff for a8w4).
             # Optional rest[3]: explicit max_abs_delta for catastrophic error detection.
             # Optional rest[4]: output_keys -- names of output tensors to NaN-init.
-            # Optional rest[5]: timing divisor for one callable that deliberately
-            # replays multiple kernel launches (for dispatch-overhead amortization).
             rtol = rest[0] if len(rest) > 0 else 1e-2
             atol = rest[1] if len(rest) > 1 else 1e-2
             compare_fn = rest[2] if len(rest) > 2 and callable(rest[2]) else None
@@ -325,13 +321,6 @@ def work_group(GPUIDMap, fast_mode, err_ratio, in_data, tasks, verbose=False):
                 if len(rest) > 4 and isinstance(rest[4], (list, tuple))
                 else None
             )
-            timing_divisor = (
-                rest[5]
-                if len(rest) > 5 and isinstance(rest[5], (int, float))
-                else 1
-            )
-            if timing_divisor <= 0:
-                raise ValueError("timing_divisor must be positive")
             arg_key_list = list(args[0]) if gen_data is not None else None
 
             work_args = (
@@ -349,8 +338,6 @@ def work_group(GPUIDMap, fast_mode, err_ratio, in_data, tasks, verbose=False):
                 max_abs_delta,
                 output_keys,
                 arg_key_list,
-                True,
-                timing_divisor,
             )
 
             # Run worker with explicit GPU ID
@@ -400,7 +387,7 @@ def mp_tuner(
         fast_mode: Skip result comparison if True
         shape_grouped: Group tasks by shape
         err_ratio: Error tolerance ratio
-        timeout: Timeout in seconds for each isolated candidate (None = no timeout)
+        timeout: Timeout in seconds for each task group (None = no timeout)
 
     Returns:
         List of (info, latency, error_ratio) tuples
@@ -412,13 +399,7 @@ def mp_tuner(
     start_idx = 0
     if not tasks:
         return []
-    if shape_grouped and timeout is not None:
-        print(
-            "[Task Grouping] Disabling shape grouping because candidate "
-            "timeouts must not discard completed winners."
-        )
-        shape_grouped = False
-    elif mp_num == 1 and fast_mode == 0:
+    if mp_num == 1 and fast_mode == 0:
         shape_grouped = True
     # time.sleep(2)
     task_group = []
@@ -568,10 +549,7 @@ def mp_tuner(
                     if elapsed is not None and elapsed > timeout:
                         consecutive_timeouts += 1
 
-                        error_msg = (
-                            f"[!] Candidate {k} exceeded its {timeout}s execution "
-                            f"budget after {elapsed:.1f}s"
-                        )
+                        error_msg = f"[!] Task {k} timed out after {elapsed:.1f}s (limit: {timeout}s) - likely GPU hang or infinite loop"
                         print(error_msg)
                         failed_tasks.append((k, "timeout"))
 
@@ -583,16 +561,13 @@ def mp_tuner(
                         )
                         completed_this_round.append((k, async_result))
 
-                        # Isolate the timed-out worker and preserve all completed
-                        # candidate results before resubmitting unfinished work.
+                        # Trigger pool restart for timeout (similar to crash)
                         pool_restart_needed = True
 
-                        # Restart promptly when several workers exceed their
-                        # independent candidate budgets.
+                        # If half the GPUs worth of consecutive timeouts, pool is in bad shape
                         if consecutive_timeouts >= half_gpu:
                             print(
-                                f"\n[!] {consecutive_timeouts} candidate budgets "
-                                f"expired (>= {half_gpu}/{mp_num} workers)"
+                                f"\n[!] {consecutive_timeouts} consecutive tasks timed out (>= {half_gpu}/{mp_num} GPUs likely stuck)"
                             )
                             print("[!] Triggering immediate pool restart...\n")
                             break
@@ -629,8 +604,8 @@ def mp_tuner(
                     error_msg = f"[Failed] Task {k} failed with {error_type}: {e}"
                     failed_tasks.append((k, "unknown error"))
 
-                    # Record a dummy result so reconstruction has one entry for
-                    # every failed task.
+                    # Always record a dummy result so reconstruction never sees an empty list
+                    # (previously only timeout path did this; async.get() failures left no result_dict[k]).
                     dummy_results = []
                     add_dummy_result(k, dummy_results)
                     result_dict[k] = (
@@ -725,7 +700,7 @@ def mp_tuner(
             f"  Total tasks: {len(rets)}\n"
             f"  Successful: {len(rets) - len(failed_tasks)}\n"
             f"  Failed: {len(failed_tasks)}\n"
-            f"    - Candidate timeouts: {timeout_count}\n"
+            f"    - Timeouts (GPU hang): {timeout_count}\n"
             f"    - Crashes (memory fault): {crash_count}\n"
             f"{'=' * 60}"
         )
