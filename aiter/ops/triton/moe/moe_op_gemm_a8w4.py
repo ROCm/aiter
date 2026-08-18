@@ -359,13 +359,21 @@ def moe_gemm_a8w4(
     # External residual to fold into reduce_grouped writeback (saves the
     # standalone routed+shared elementwise add).
     residual=None,
+    backend=None,
 ):
     """
     Y[:, :] = 0.
     for e in num_experts:
         Y[idxs_y_m(e), :] += matmul(X[idxs_x_m(e), :], W[e, :, :])
     """
-    use_gluon = get_arch() == "gfx1250"
+    if backend is None:
+        backend = "gluon" if get_arch() == "gfx1250" else "triton"
+    assert backend in ("triton", "gluon"), f"Invalid backend: {backend}"
+    if backend == "gluon":
+        assert (
+            get_arch() == "gfx1250"
+        ), f"Gluon backend requires gfx1250, got {get_arch()}"
+    use_gluon = backend == "gluon"
     if preshuffled:
         assert (
             use_gluon

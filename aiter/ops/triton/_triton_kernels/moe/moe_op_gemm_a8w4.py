@@ -308,13 +308,9 @@ def _moe_gemm_a8w4(
         "SWIZZLE_MX_SCALE must be None, 'CDNA4_SCALE' or 'GFX1250_SCALE'",
     )
     if SWIZZLE_MX_SCALE is not None:
-        # CDNA4_SCALE (gfx950, kwidth 8) and GFX1250_SCALE (n32k4, kwidth 4)
-        # both fold 32 N-lanes into one scale row; only the intra-tile order
-        # differs, so the block geometry is shared and the decode is not.
         tl.static_assert(stride_w_mx_k is not None)
         tl.static_assert(stride_w_mx_n is not None)
         NON_K_PRESHUFFLE_BLOCK_SIZE: tl.constexpr = 32
-        # n32k4: must stay in step with SCALE_KWIDTH in the gfx1250 gluon kernel
         GFX1250_SCALE_KWIDTH: tl.constexpr = 4
         PACKED_MX_BLOCK: tl.constexpr = MX_SCALE_BLOCK_K * NON_K_PRESHUFFLE_BLOCK_SIZE
         SCALE_BLOCK_N: tl.constexpr = BLOCK_N // NON_K_PRESHUFFLE_BLOCK_SIZE

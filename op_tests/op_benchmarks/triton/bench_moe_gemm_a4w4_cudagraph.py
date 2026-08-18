@@ -31,10 +31,11 @@ that feeds each layer -- is built once outside the timed region, mirroring the
 build()/fn() split in mi450-scripts/run_moe_a4w4.py so the numbers are
 comparable to that runner (which benches one projection per invocation).
 
-`moe_gemm_a4w4` picks its kernel from the arch: the gluon kernels on gfx1250 --
+`moe_gemm_a4w4` defaults to the gluon kernels on gfx1250 --
 _moe_gemm_a4w4_decode when routing picks block_m == 16 and _moe_gemm_a4w4_prefill
-otherwise -- and the triton kernel on gfx950. --preshuffle enables the
-gluon-only gfx1250 WMMA weight preshuffle.
+otherwise -- and the triton kernel elsewhere. --backend pins one instead (gluon
+needs gfx1250). --preshuffle enables the gluon-only gfx1250 WMMA weight
+preshuffle.
 """
 
 import argparse
@@ -241,15 +242,17 @@ def pin_routed_experts(logits, n_routed, n_expts_act):
     return masked, n_pinned
 
 
-def backend_name():
-    """Backend moe_gemm_a4w4 runs here -- it derives this from the arch."""
+def backend_name(backend=None):
+    """Backend moe_gemm_a4w4 runs, resolving None the way the op does."""
+    if backend is not None:
+        return backend
     return "gluon" if get_arch() == "gfx1250" else "triton"
 
 
-def kernel_variant(block_m):
+def kernel_variant(block_m, backend=None):
     """Compiled kernel moe_gemm_a4w4 dispatches to -- same rule as
     run_moe_a4w4.py's `name` subcommand."""
-    if backend_name() != "gluon":
+    if backend_name(backend) != "gluon":
         return "_moe_gemm_a4w4"
     return "_moe_gemm_a4w4_decode" if block_m == 16 else "_moe_gemm_a4w4_prefill"
 
@@ -264,6 +267,7 @@ def bench_mlp_single_weight_init(
     w_dtype,
     TP,
     preshuffle,
+    backend,
     routed_experts,
     rep,
     layers=LAYERS,
@@ -336,6 +340,7 @@ def bench_mlp_single_weight_init(
             swizzle_mx_scale=swizzle_mx_scale1,
             preshuffle_weights=preshuffle,
             apply_swiglu=True,
+            backend=backend,
         )
 
     # layer 2 reads layer 1's swiglu output; quantize it once here so the timed
@@ -356,6 +361,7 @@ def bench_mlp_single_weight_init(
             scatter_indx=scatter_indx,
             swizzle_mx_scale=swizzle_mx_scale2,
             preshuffle_weights=preshuffle,
+            backend=backend,
         )
 
     y2 = layer2()
@@ -412,7 +418,7 @@ def bench_mlp_single_weight_init(
 
     return {
         "layers": measured,
-        "kernel": kernel_variant(rdata.block_m),
+        "kernel": kernel_variant(rdata.block_m, backend),
         "block_m": rdata.block_m,
         "routed_experts": routed,
     }
@@ -428,6 +434,7 @@ def bench_mlp(
     w_dtype,
     TP,
     preshuffle,
+    backend,
     routed_experts,
     rep,
     layers=LAYERS,
@@ -445,6 +452,7 @@ def bench_mlp(
             w_dtype,
             TP,
             preshuffle,
+            backend,
             routed_experts,
             rep,
             layers,
@@ -479,6 +487,7 @@ def roofline_mlp(
     w_dtype,
     TP,
     preshuffle,
+    backend,
     routed_experts,
     rep,
     layers=LAYERS,
@@ -497,7 +506,7 @@ def roofline_mlp(
     )
     if routed_experts is not None:
         stem += f"-routed={routed_experts}"
-    stem += f"-{backend_name()}"
+    stem += f"-{backend_name(backend)}"
     if preshuffle:
         stem += "-preshuffled"
     if tuple(layers) != LAYERS:
@@ -514,6 +523,7 @@ def roofline_mlp(
         w_dtype,
         TP,
         preshuffle,
+        backend,
         routed_experts,
         rep,  # fixed args
         layers,
@@ -559,6 +569,13 @@ def parse_args(args: list[str] | None = None):
         "dim, TOPK multiplies the row count each GEMM sees (batch * TOPK "
         "routed rows). Use --routed-experts to pin how many of the TOTAL "
         "actually receive tokens.",
+    )
+    parser.add_argument(
+        "--backend",
+        choices=["triton", "gluon"],
+        default=None,
+        help="Kernel backend for moe_gemm_a4w4. Default: unset, i.e. the arch "
+        "default (gluon on gfx1250, triton elsewhere). gluon requires gfx1250.",
     )
     parser.add_argument(
         "--preshuffle",
@@ -634,6 +651,7 @@ def main(args: list[str] | None = None) -> None:
         quantized_dtypes[1],
         TP=1,
         preshuffle=parsed_args.preshuffle,
+        backend=parsed_args.backend,
         routed_experts=parsed_args.routed_experts,
         rep=parsed_args.rep,
         # dedupe, keeping the canonical report order rather than argv order
