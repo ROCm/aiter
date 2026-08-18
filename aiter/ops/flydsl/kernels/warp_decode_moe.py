@@ -542,6 +542,177 @@ def build_gate_up_fp8_module(
 
 
 # -------------------------------------------------------------------------
+# B4 -- gate_up FP8-activation x FP8-weight (CK gate_fp8_d2 peer)
+# -------------------------------------------------------------------------
+def build_gate_up_fp8_act_module(
+    hidden: int,
+    inter: int,
+    top_k: int,
+    *,
+    kvector: int | None = None,
+    serialize_dot2: bool = True,
+    scale_bn: int,
+    scale_bk: int,
+    scale_bxk: int | None = None,
+    num_experts: int | None = None,
+):
+    """Build the gate_up launcher with **FP8 activation** (CK ``gate_fp8_d2`` peer).
+
+    Same ``silu(gate)*up`` epilogue and FP8 e4m3 weights as
+    :func:`build_gate_up_fp8_module`, but the activation ``x`` is FP8 e4m3 with a
+    ``Block2D<1, scale_bxk>`` per-(token, K-block) scale (CK ``XScale = Block2D<1,
+    128>``). Both operands go through the scaled convert to BF16 (scale folded
+    *after* dot2, exponent-only, main plan ?2): per K-block the lane partial gets
+    ``dot * (x_scale_block * w_scale_block)`` before the single wavefront reduce.
+    Block2D<BN,BK> weight scale matches CK ``WScaleAll = Block2D<128,128>``.
+    """
+    if kvector is None:
+        kvector = pick_kvector(hidden)
+    if kvector % 2 != 0:
+        raise ValueError(f"kVector must be even for dot2, got {kvector}")
+    if kvector % 4 != 0:
+        raise ValueError(f"FP8-act kVector must be a multiple of 4, got {kvector}")
+    ktile_n = WARP_SIZE * kvector
+    if hidden % ktile_n != 0:
+        raise ValueError(f"HIDDEN={hidden} not divisible by 64*kVector={ktile_n}")
+    num_iter = hidden // ktile_n
+    n_pairs = kvector // 2  # bf16 pairs / lane / iter
+    n_wwords = kvector // 4  # fp8 dwords / lane / iter (4 fp8 each), x and w alike
+    if scale_bk % kvector != 0:
+        raise ValueError(
+            f"block2d scale_bk={scale_bk} must be a multiple of kVector={kvector} "
+            "so each lane's K-chunk lies in one scale block"
+        )
+    if hidden % scale_bk != 0:
+        raise ValueError(f"HIDDEN={hidden} not divisible by scale_bk={scale_bk}")
+    if scale_bxk is None:
+        scale_bxk = scale_bk
+    if hidden % scale_bxk != 0:
+        raise ValueError(f"HIDDEN={hidden} not divisible by scale_bxk={scale_bxk}")
+    if scale_bxk % kvector != 0:
+        raise ValueError(
+            f"x scale_bxk={scale_bxk} must be a multiple of kVector={kvector}"
+        )
+    scale_cols_g = hidden // scale_bk
+    scale_cols_x = hidden // scale_bxk
+    # K3 Tier-2: fold the per-expert i64 base when the FP8 weight pool exceeds the
+    # i32 byte range (see build_gate_up_fp8_module / B5).
+    use_i64_base = const_expr(
+        num_experts is not None and num_experts * inter * hidden >= 2**31
+    )
+    bytes_per_expert = inter * hidden  # fp8 = 1 byte/elem
+
+    @flyc.kernel
+    def _kernel(
+        x_ptr: fx.Pointer,
+        xs_ptr: fx.Pointer,
+        wg_ptr: fx.Pointer,
+        wu_ptr: fx.Pointer,
+        wgs_ptr: fx.Pointer,
+        wus_ptr: fx.Pointer,
+        rid_ptr: fx.Pointer,
+        out_ptr: fx.Pointer,
+    ):
+        bid = fx.block_idx.x
+        lane = fx.thread_idx.x
+
+        neuron_j = bid % inter
+        d = bid // inter
+        expert_k = d % top_k
+        token_b = d // top_k
+
+        rid_rsrc = _ptr_rsrc(rid_ptr)
+        e = fx.Int32(
+            buffer_ops.buffer_load(
+                rid_rsrc, token_b * top_k + expert_k, vec_width=1, dtype=T.i32()
+            )
+        )
+        w_row = e * inter + neuron_j
+
+        x_rsrc = _ptr_rsrc(x_ptr)
+        xs_rsrc = _ptr_rsrc(xs_ptr)
+        if const_expr(use_i64_base):
+            ebase = fx.Int64(e) * fx.Int64(bytes_per_expert)
+            wg_rsrc = _ptr_rsrc_off(wg_ptr, ebase)
+            wu_rsrc = _ptr_rsrc_off(wu_ptr, ebase)
+            w_word_base = neuron_j * (hidden // 4)
+        else:
+            wg_rsrc = _ptr_rsrc(wg_ptr)
+            wu_rsrc = _ptr_rsrc(wu_ptr)
+            w_word_base = w_row * (hidden // 4)
+
+        one_f32 = fx.Float32(1.0).ir_value()
+        wgs_rsrc = _ptr_rsrc(wgs_ptr)
+        wus_rsrc = _ptr_rsrc(wus_ptr)
+
+        row_blk = w_row // scale_bn
+        gate_acc_l = fx.Float32(0.0)
+        up_acc_l = fx.Float32(0.0)
+        for i in range_constexpr(num_iter):
+            k_base = i * ktile_n + lane * kvector
+            # both x and w are 4 fp8/word -> same dword layout per lane.
+            x_word0 = (token_b * hidden + k_base) // 4
+            w_word0 = w_word_base + k_base // 4
+            xw = load_i32_words(x_rsrc, x_word0, n_wwords)
+            gw = load_i32_words(wg_rsrc, w_word0, n_wwords)
+            uw = load_i32_words(wu_rsrc, w_word0, n_wwords)
+            gd = fx.Float32(0.0).ir_value()
+            ud = fx.Float32(0.0).ir_value()
+            for ipair in range_constexpr(n_pairs):
+                w_word = ipair // 2
+                w_hi = (ipair % 2) == 1
+                x_i32 = bf16x2_to_i32(fp8x2_to_bf16x2(xw[w_word], one_f32, hi=w_hi))
+                g_i32 = bf16x2_to_i32(fp8x2_to_bf16x2(gw[w_word], one_f32, hi=w_hi))
+                u_i32 = bf16x2_to_i32(fp8x2_to_bf16x2(uw[w_word], one_f32, hi=w_hi))
+                gd = dot2_f32_bf16(x_i32, g_i32, gd, serialize=serialize_dot2)
+                ud = dot2_f32_bf16(x_i32, u_i32, ud, serialize=serialize_dot2)
+            sidx = fx.Int32(row_blk * scale_cols_g + k_base // scale_bk)
+            xsidx = fx.Int32(token_b * scale_cols_x + k_base // scale_bxk)
+            gs_i = buffer_ops.buffer_load(wgs_rsrc, sidx, vec_width=1, dtype=T.f32())
+            us_i = buffer_ops.buffer_load(wus_rsrc, sidx, vec_width=1, dtype=T.f32())
+            xs_i = buffer_ops.buffer_load(xs_rsrc, xsidx, vec_width=1, dtype=T.f32())
+            gate_acc_l = gate_acc_l + fx.Float32(gd) * (
+                fx.Float32(gs_i) * fx.Float32(xs_i)
+            )
+            up_acc_l = up_acc_l + fx.Float32(ud) * (fx.Float32(us_i) * fx.Float32(xs_i))
+        gate_acc = fx.Float32(wave_reduce_add_f32(gate_acc_l.ir_value()))
+        up_acc = fx.Float32(wave_reduce_add_f32(up_acc_l.ir_value()))
+
+        sig = fx.Float32(1.0) / (
+            fx.Float32(1.0) + fxmath.exp(fx.Float32(0.0) - gate_acc)
+        )
+        out_val = gate_acc * sig * up_acc
+
+        out_off = (token_b * top_k + expert_k) * inter + neuron_j
+        out_rsrc = _ptr_rsrc(out_ptr)
+        if lane == 0:
+            buffer_ops.buffer_store(BFloat16(out_val).ir_value(), out_rsrc, out_off)
+
+    @flyc.jit
+    def _launch(
+        x_ptr: fx.Pointer,
+        xs_ptr: fx.Pointer,
+        wg_ptr: fx.Pointer,
+        wu_ptr: fx.Pointer,
+        wgs_ptr: fx.Pointer,
+        wus_ptr: fx.Pointer,
+        rid_ptr: fx.Pointer,
+        out_ptr: fx.Pointer,
+        grid_x: fx.Int32,
+        stream: fx.Stream,
+    ):
+        _kernel(
+            x_ptr, xs_ptr, wg_ptr, wu_ptr, wgs_ptr, wus_ptr, rid_ptr, out_ptr
+        ).launch(
+            grid=(grid_x, 1, 1),
+            block=(WARP_SIZE, 1, 1),
+            stream=stream,
+        )
+
+    return _launch
+
+
+# -------------------------------------------------------------------------
 # Phase 3 -- down_reduce FP8 fast path (BF16 intermediate, FP8 e4m3 weights)
 # -------------------------------------------------------------------------
 def build_down_reduce_fp8_module(
