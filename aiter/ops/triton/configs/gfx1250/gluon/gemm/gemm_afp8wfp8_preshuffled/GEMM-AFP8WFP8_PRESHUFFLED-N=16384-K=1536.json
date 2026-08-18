@@ -5,10 +5,10 @@
         "BLOCK_SIZE_K": 256,
         "GROUP_SIZE_M": 1,
         "NUM_KSPLIT": 1,
-        "num_warps": 4,
-        "waves_per_eu": 2,
+        "num_warps": 2,
+        "waves_per_eu": 1,
         "NUM_BUFFERS": 5,
-        "cache_modifier": ".ca",
+        "cache_modifier": null,
         "LOOP_UNROLL_FACTOR": 1,
         "B_SCALE_TDM": true,
         "kernel_type": "bandwidth_bound"
