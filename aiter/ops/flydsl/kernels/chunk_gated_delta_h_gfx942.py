@@ -299,8 +299,6 @@ def compile_chunk_gated_delta_h_gfx942(
         )
     BT_STEPS_LOCAL = (BT // MFMA_K) // NR_SPLIT
 
-    # Per-wave accumulators: only this wave's slice of the N_REPEAT axis.
-    NUM_H_ACCS = NUM_K_BLOCKS * N_REPEAT_LOCAL
 
     # -- Loop-carried gate/u prefetch --
     # g/gk/u for chunk i+1 depend on nothing produced by chunk i, so they are
@@ -422,6 +420,12 @@ def compile_chunk_gated_delta_h_gfx942(
     ROWS_PER_BATCH_64 = BLOCK_THREADS // THREADS_PER_ROW_64
     W_BATCHED = ROWS_PER_BATCH_64 <= BT and BT % ROWS_PER_BATCH_64 == 0
     NUM_LOAD_BATCHES_64 = BT // ROWS_PER_BATCH_64 if W_BATCHED else 0
+
+    STRIDE_W_C = K if WU_CONTIGUOUS else H * K
+    STRIDE_Q_C = Hg * K
+    # Half a LOAD_VEC_WIDTH run: the XOR swizzle splits a thread's bf16x8 into two
+    # 4-element LDS groups that are not adjacent (see the g2s block in the kernel).
+    LDS_HALF = LOAD_VEC_WIDTH // 2
 
     W_THREADS_PER_ROW = K // LOAD_VEC_WIDTH  # 16 for K=128
     W_SLOTS = BT * W_THREADS_PER_ROW  # 1024 for BT=64, K=128
@@ -545,7 +549,6 @@ def compile_chunk_gated_delta_h_gfx942(
 
         k_ = GTensor(k_tensor, dtype=T.bf16, shape=(-1,))
         u_ = GTensor(u_tensor, dtype=T.bf16, shape=(-1,))
-        w_ = GTensor(w_tensor, dtype=T.bf16, shape=(-1,))
         g_ = GTensor(g_tensor, dtype=T.f32, shape=(-1,))
         if const_expr(USE_GK):
             gk_ = GTensor(gk_tensor, dtype=T.f32, shape=(-1,))
@@ -555,7 +558,6 @@ def compile_chunk_gated_delta_h_gfx942(
         if const_expr(SAVE_NEW_VALUE):
             vn_ = GTensor(v_new_tensor, dtype=T.bf16, shape=(-1,))
         if const_expr(COMPUTE_OUTPUT):
-            q_ = GTensor(q_tensor, dtype=T.bf16, shape=(-1,))
             o_ = GTensor(o_tensor, dtype=T.bf16, shape=(-1,))
         state_t = T.bf16 if STATE_DTYPE_BF16 else T.f32
         if const_expr(USE_INITIAL_STATE):
@@ -605,28 +607,6 @@ def compile_chunk_gated_delta_h_gfx942(
             # q aliases w: w is dead after GEMM1, q is only loaded after GEMM2.
             lds_q_ptr = lds_w_ptr
 
-        # -- Group-major + XOR LDS addressing --
-        # A buffer of R rows x C columns is stored as [R][C/4][4]: each row is
-        # NG = C/4 groups of 4 bf16 (8 B = one MFMA fragment), and the group index
-        # is XOR-swizzled by the row so that the 16 lanes of a fragment (whose row
-        # indices are 16 consecutive values) map to 16 distinct groups -- covering
-        # all 32 banks exactly once. Returns the element index of the group base.
-        def _grp_idx(row, grp, cols, ng):
-            # The mask folds the row's bits 3+ onto its low bits before the XOR.
-            # A plain ``row & (ng-1)`` would suffice for the MFMA fragment reads
-            # (row = ...*16 + lane_n varies in the low bits), but the k
-            # store-transpose writes rows ``(tid%16)*8 + e``, whose low 4 bits
-            # take only two distinct values across its 16 lanes -- 8-way bank
-            # multiplicity. Folding in ``row >> 3`` keys the swizzle on the bits
-            # that site does vary, which puts every LDS site at its conflict
-            # floor.
-            #
-            # Safe by construction: XOR by a fixed per-row value is a bijection
-            # on the group index, so this only permutes slots within a row, and
-            # reads and writes derive the mask from the same row.
-            mask = (row ^ (row >> fx.Int32(3))) & fx.Int32(ng - 1)
-            return row * fx.Int32(cols) + ((grp ^ mask) * fx.Int32(4))
-
         # 4 bf16 = 8 B: one ds_read_b64 / ds_write_b64, and one MFMA A/B fragment.
         v4bf16_type = T.vec(4, T.bf16)
 
@@ -665,24 +645,16 @@ def compile_chunk_gated_delta_h_gfx942(
             return _grp_idx_single(bt_row, bt_grp, BT, LDS_A_NG)
 
         # -- Cooperative load decomposition (see W_BATCHED above) --
-        if const_expr(W_BATCHED):
-            load_row_in_batch = tid // fx.Int32(THREADS_PER_ROW_64)
-            load_col_base = (tid % fx.Int32(THREADS_PER_ROW_64)) * fx.Int32(
-                LOAD_VEC_WIDTH
-            )
+        assert W_BATCHED, "Must have batched w-load"
+        load_row_in_batch = tid // fx.Int32(THREADS_PER_ROW_64)
+        load_col_base = (tid % fx.Int32(THREADS_PER_ROW_64)) * fx.Int32(
+            LOAD_VEC_WIDTH
+        )
 
-            def _w_slot(i_load):
-                kb, batch = divmod(i_load, NUM_LOAD_BATCHES_64)
-                row = fx.Int32(batch * ROWS_PER_BATCH_64) + load_row_in_batch
-                return row, fx.Int32(kb * 64) + load_col_base
-
-        else:
-
-            def _w_slot(i_load):
-                s = fx.Int32(i_load * BLOCK_THREADS) + tid
-                row = s // fx.Int32(W_THREADS_PER_ROW)
-                col_grp = s % fx.Int32(W_THREADS_PER_ROW)
-                return row, col_grp * fx.Int32(LOAD_VEC_WIDTH)
+        def _w_slot(i_load):
+            kb, batch = divmod(i_load, NUM_LOAD_BATCHES_64)
+            row = fx.Int32(batch * ROWS_PER_BATCH_64) + load_row_in_batch
+            return row, fx.Int32(kb * 64) + load_col_base
 
         # k uses its own mapping so the transpose store can be packed: thread ->
         # (row-quad, k-col-group). Consecutive tids walk k-col groups, so a full
@@ -735,6 +707,85 @@ def compile_chunk_gated_delta_h_gfx942(
             w_base = (bos * fx.Int32(H) + i_h) * fx.Int32(K)
             stride_v = fx.Int32(H * V)
             stride_w = fx.Int32(H * K)
+
+        # -- Tiled w staging: HBM [BT, K] tile -> lds_w --
+        # Two destination views: 
+        # sW_hi is sW_lo composed with a + LDS_HALF offset, which addresses the hi group
+        # from the LO tile coordinate.
+        w_inner_layout = fx.make_ordered_layout((BT, K), (1, 0))
+        w_swz = fx.static(_single_xor_swz(K, LDS_W_NG))
+        sW_lo = fx.make_view(
+            lds_w_ptr, fx.make_composed_layout(w_swz, w_inner_layout)
+        )
+        sW_hi = fx.make_view(
+            lds_w_ptr, fx.make_composed_layout(w_swz, LDS_HALF, w_inner_layout)
+        )
+        w_copy_tile = fx.make_tile(
+            ROWS_PER_BATCH_64, LOAD_VEC_WIDTH * THREADS_PER_ROW_64
+        )
+        _w_tv_thr = (THREADS_PER_ROW_64, ROWS_PER_BATCH_64)
+        _w_tv_thr_stride = (ROWS_PER_BATCH_64 * LOAD_VEC_WIDTH, 1)
+        w_tv_load = fx.make_layout(
+            (_w_tv_thr, (1, LOAD_VEC_WIDTH)),
+            (_w_tv_thr_stride, (1, ROWS_PER_BATCH_64)),
+        )
+        w_tv_store = fx.make_layout(
+            (_w_tv_thr, (1, LDS_HALF)),
+            (_w_tv_thr_stride, (1, ROWS_PER_BATCH_64)),
+        )
+        cp_w_g2r = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.BFloat16)
+        cp_w_r2s = fx.make_copy_atom(fx.UniversalCopy64b(), fx.BFloat16)
+        tc_w_g2r = fx.make_tiled_copy(cp_w_g2r, w_tv_load, w_copy_tile).get_slice(tid)
+        tc_w_r2s = fx.make_tiled_copy(cp_w_r2s, w_tv_store, w_copy_tile).get_slice(tid)
+
+        w_git = fx.get_iter(fx.rocdl.make_buffer_tensor(w_tensor, max_size=False))
+        gW = fx.Tensor(
+            fx.make_view(w_git, fx.make_layout((BT, K), (STRIDE_W_C, 1)))
+        )
+        pS_w = tc_w_g2r.partition_S(gW)
+        pD_w_lo = tc_w_r2s.partition_D(sW_lo)
+        pD_w_hi = tc_w_r2s.partition_D(sW_hi)
+        if const_expr(COMPUTE_OUTPUT):
+            q_git = fx.get_iter(
+                fx.rocdl.make_buffer_tensor(q_tensor, max_size=False)
+            )
+            gQ = fx.Tensor(
+                fx.make_view(q_git, fx.make_layout((BT, K), (STRIDE_Q_C, 1)))
+            )
+            pS_q = tc_w_g2r.partition_S(gQ)
+
+        def _stage_g2r(pS, base, stride, it_i32):
+            """Issue chunk ``it_i32``'s [BT, K] tile into a register fragment."""
+            frag = fx.make_fragment_like(pS)
+            fx.copy(
+                cp_w_g2r,
+                pS,
+                frag,
+                soffset=base + it_i32 * fx.Int32(BT) * stride,
+            )
+            return frag.load()
+
+        def _stage_r2s(w_vec, dst_lo, dst_hi):
+            """Store a staged [BT, K] fragment into LDS as two 4-element halves."""
+            v = fx.Vector(w_vec)
+            halves = []
+            for off in (0, LDS_HALF):
+                halves.append(
+                    fx.Vector.from_elements(
+                        [
+                            v[j * LOAD_VEC_WIDTH + off + e]
+                            for j in range_constexpr(W_LOADS_PER_THREAD)
+                            for e in range_constexpr(LDS_HALF)
+                        ],
+                        dtype=fx.BFloat16,
+                    )
+                )
+            f_lo = fx.make_fragment_like(dst_lo)
+            f_hi = fx.make_fragment_like(dst_hi)
+            f_lo.store(halves[0])
+            f_hi.store(halves[1])
+            fx.copy(cp_w_r2s, f_lo, dst_lo)
+            fx.copy(cp_w_r2s, f_hi, dst_hi)
 
         if const_expr(SAVE_NEW_VALUE):
             if const_expr(IS_VARLEN):
@@ -794,7 +845,11 @@ def compile_chunk_gated_delta_h_gfx942(
                 add_whole = fx.Vector.from_elements(add_elems, dtype=fx.Float32)
                 h_accs_c[kb].store(cur + add_whole)
 
+        # k's non-packed-transpose fallback still stages by hand, one bf16x8 per
+        # (batch, kb) slot.
         NUM_W_LOADS = W_LOADS_PER_THREAD
+        # w rides the loop-carried state as one tiled-copy fragment.
+        N_W_CARRY = 1
 
         def _load_gate_u(it_i32):
             """Issue chunk ``it_i32``'s g/gk/u loads; return them as a flat list.
@@ -844,13 +899,9 @@ def compile_chunk_gated_delta_h_gfx942(
 
         # -- Prologue: pre-load first chunk's w + gate/u data --
         i_t0_i32 = fx.Int32(0)
-        w_prefetch_init = []
-        for i_load in range_constexpr(W_LOADS_PER_THREAD):
-            row, col = _w_slot(i_load)
-            abs_row = i_t0_i32 * fx.Int32(BT) + row
-            safe_row = (abs_row < T_local).select(abs_row, fx.Int32(0))
-            g_off = w_base + safe_row * stride_w + col
-            w_prefetch_init.append(w_.vec_load((fx.Int64(g_off),), LOAD_VEC_WIDTH))
+        # One tiled copy covers every (batch, kb) slot; the whole [BT, K] tile is
+        # one carried fragment.
+        w_prefetch_init = [_stage_g2r(pS_w, w_base, stride_w, i_t0_i32)]
 
         gu_prefetch_init = _load_gate_u(i_t0_i32)
 
@@ -860,22 +911,9 @@ def compile_chunk_gated_delta_h_gfx942(
         nt_idx = fx.Int64(NT)
 
         for i_t, state in range(c_zero, nt_idx, c_one, init=init_state):
-            w_prefetch_all = list(state[:NUM_W_LOADS])
-            gu_prefetch_all = list(state[NUM_W_LOADS:])
+            w_prefetch_all = list(state[:N_W_CARRY])
+            gu_prefetch_all = list(state[N_W_CARRY:])
             i_t_i32 = fx.Int32(i_t)
-
-            # -- w LDS write offsets (group-major [BT][K/4][4] + XOR) --
-            # Each thread holds a bf16x8 run = two adjacent k-groups, whose
-            # swizzled positions are NOT adjacent, so the single ds_write_b128
-            # becomes two ds_write_b64. That is the price of making the far
-            # hotter A-frag read (below) conflict-free.
-            w_prefetch_lds_all = []
-            for i_load in range_constexpr(W_LOADS_PER_THREAD):
-                row, col = _w_slot(i_load)
-                grp = col // fx.Int32(4)
-                w_prefetch_lds_all.append(
-                    (_lds_w_idx(row, grp), _lds_w_idx(row, grp + fx.Int32(1)))
-                )
 
             # -- Store h snapshot to LDS (group-major [BV][K/4][4] + XOR) --
             # h_accs element e = h[v_local = nr*16 + lane_n, k = kb*64 + wid*16 +
@@ -940,17 +978,7 @@ def compile_chunk_gated_delta_h_gfx942(
                     h_.vec_store((fx.Int64(h_off),), bf16_pair, 8)
 
             # -- Store prefetched w to LDS (two b64 halves per bf16x8) --
-            for i_wp in range_constexpr(NUM_W_LOADS):
-                wvec = w_prefetch_all[i_wp]
-                off_lo, off_hi = w_prefetch_lds_all[i_wp]
-                lo = fx.Vector.from_elements(
-                    [wvec[e] for e in range_constexpr(4)], dtype=fx.BFloat16
-                )
-                hi = fx.Vector.from_elements(
-                    [wvec[4 + e] for e in range_constexpr(4)], dtype=fx.BFloat16
-                )
-                fx.ptr_store(lo, lds_w_ptr + off_lo)
-                fx.ptr_store(hi, lds_w_ptr + off_hi)
+            _stage_r2s(w_prefetch_all[0], pD_w_lo, pD_w_hi)
 
             gpu.barrier()
 
@@ -1004,13 +1032,8 @@ def compile_chunk_gated_delta_h_gfx942(
             u_prefetch = gu_all[N_GATE_G + N_GATE_GK :]
 
             # -- GEMM1: bv = w @ h  (contraction over K) --
-            sW = fx.make_view(
-                lds_w_ptr,
-                fx.make_composed_layout(
-                    fx.static(_single_xor_swz(K, LDS_W_NG)),
-                    fx.make_ordered_layout((BT, K), (1, 0)),
-                ),
-            )
+            # A operand reads the very view the g2s copy wrote (see sW_lo).
+            sW = sW_lo
             sH = fx.make_view(
                 lds_h_ptr,
                 fx.make_composed_layout(
@@ -1215,14 +1238,10 @@ def compile_chunk_gated_delta_h_gfx942(
             #          (measured ~+2%); the K6 stage then covers these loads.
             def _issue_next_prefetch():
                 next_i_t_i32 = i_t_i32 + fx.Int32(1)
-                w_next = []
-                for i_load in range_constexpr(W_LOADS_PER_THREAD):
-                    row, col = _w_slot(i_load)
-                    abs_row = next_i_t_i32 * fx.Int32(BT) + row
-                    safe_row = (abs_row < T_local).select(abs_row, fx.Int32(0))
-                    g_off = w_base + safe_row * stride_w + col
-                    w_next.append(w_.vec_load((fx.Int64(g_off),), LOAD_VEC_WIDTH))
-                return w_next, _load_gate_u(next_i_t_i32)
+                return (
+                    [_stage_g2r(pS_w, w_base, stride_w, next_i_t_i32)],
+                    _load_gate_u(next_i_t_i32),
+                )
 
             if const_expr(not COMPUTE_OUTPUT):
                 w_next_prefetch, gu_next_prefetch = _issue_next_prefetch()
@@ -1230,13 +1249,7 @@ def compile_chunk_gated_delta_h_gfx942(
                 # Issue q's HBM loads before GEMM2 so their latency hides behind
                 # GEMM2's MFMA chain. q is independent of GEMM2; only the lds_q
                 # store must wait for GEMM1's lds_w readers (barrier below).
-                q_prefetch = []
-                for i_load in range_constexpr(W_LOADS_PER_THREAD):
-                    row, col = _w_slot(i_load)
-                    abs_row = i_t_i32 * fx.Int32(BT) + row
-                    safe_row = (abs_row < T_local).select(abs_row, fx.Int32(0))
-                    qoff = q_base + safe_row * stride_q + col
-                    q_prefetch.append(q_.vec_load((fx.Int64(qoff),), LOAD_VEC_WIDTH))
+                q_prefetch = _stage_g2r(pS_q, q_base, stride_q, i_t_i32)
 
             # -- GEMM2: h += k^T @ v_new  (contraction over BT), NATIVE (N2) --
             # Output h is [K, V], contraction BT. Per 64-K block: M = the 64 K
@@ -1295,18 +1308,7 @@ def compile_chunk_gated_delta_h_gfx942(
                 b_frag_t = fx.make_rmem_tensor(4, fx.BFloat16)
                 # -- Store prefetched q into lds_q (aliases lds_w, dead after
                 #    GEMM1) --
-                for i_qp in range_constexpr(NUM_W_LOADS):
-                    qvec = q_prefetch[i_qp]
-                    row, col = _w_slot(i_qp)
-                    grp = col // fx.Int32(4)
-                    lo = fx.Vector.from_elements(
-                        [qvec[e] for e in range_constexpr(4)], dtype=fx.BFloat16
-                    )
-                    hi = fx.Vector.from_elements(
-                        [qvec[4 + e] for e in range_constexpr(4)], dtype=fx.BFloat16
-                    )
-                    fx.ptr_store(lo, lds_q_ptr + _lds_w_idx(row, grp))
-                    fx.ptr_store(hi, lds_q_ptr + _lds_w_idx(row, grp + fx.Int32(1)))
+                _stage_r2s(q_prefetch, pD_w_lo, pD_w_hi)
 
                 gpu.barrier()
 
@@ -1315,13 +1317,9 @@ def compile_chunk_gated_delta_h_gfx942(
                 # B=h (lds_h, [BV,K]), contraction K, N=V. Native tiled copies over
                 # single-XOR views into a wide C-fragment; bridge back to the
                 # frag_o is consumed directly by the combine (no bridge).
-                sQ = fx.make_view(
-                    lds_q_ptr,
-                    fx.make_composed_layout(
-                        fx.static(_single_xor_swz(K, LDS_W_NG)),
-                        fx.make_ordered_layout((BT, K), (1, 0)),
-                    ),
-                )
+                # lds_q aliases lds_w, so GEMM3's A operand reads the same view
+                # the staging copy wrote (as GEMM1's does).
+                sQ = sW_lo
                 sH3 = fx.make_view(
                     lds_h_ptr,
                     fx.make_composed_layout(
