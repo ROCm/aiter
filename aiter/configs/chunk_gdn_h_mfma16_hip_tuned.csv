@@ -10,9 +10,9 @@
 #
 # AOT compile coverage lives in
 # ``aiter/configs/chunk_gdn_h_mfma16_hip_untuned.csv``. Add new model shapes
-# there first, then run the K5 BV tune script and merge the measured rows here
-# after review. Do not append tune output directly to this file; write to /tmp
-# and merge manually.
+# there first, then run ``csrc/gdn_k5/chunk_gdn_h_mfma16_hip_tune.py`` and merge
+# the measured rows here after review. Do not append tune output directly to this
+# file; write to /tmp and merge manually.
 #
 # Columns
 #   model             free-form name, diagnostics only
