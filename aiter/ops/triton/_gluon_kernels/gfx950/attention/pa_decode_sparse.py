@@ -777,6 +777,15 @@ def _pa_decode_sparse(
     GATHER_W0: gl.constexpr,
     # NOPE_CHUNK: width of one dequant piece (HEAD_SIZE = one shot, prior behaviour).
     NOPE_CHUNK: gl.constexpr,
+    # How many of the NUM_SPLITS programs share the main (SWA) segment. The two
+    # segments have very different shapes -- main is a contiguous window whose
+    # length is fixed by the sliding window, extra is the top-k list -- so one
+    # split count has to be wrong for one of them. Splitting main past
+    # main_len/BLOCK_K turns every full tile into a half-empty masked one, while
+    # extra still wants the CTAs. MAIN_SPLITS <= NUM_SPLITS lets main stop at whole
+    # tiles and extra keep going; programs with split_id >= MAIN_SPLITS get an
+    # empty main range and contribute an extra-only partial.
+    MAIN_SPLITS: gl.constexpr,
     # Per-cache buffer/global gate. buffer_load carries a 32-bit offset, so a cache
     # whose span exceeds that must gather via 64-bit gl.load -- but the two caches
     # are sized independently (SWA window vs full compressed history), so gating
@@ -897,8 +906,8 @@ def _pa_decode_sparse(
     main_start = gl.load(main_indptr_ptr + query_idx)
     main_end = gl.load(main_indptr_ptr + query_idx + 1)
     main_len = main_end - main_start
-    main_chunk = (main_len + NUM_SPLITS - 1) // NUM_SPLITS
-    main_lo = split_id * main_chunk
+    main_chunk = (main_len + MAIN_SPLITS - 1) // MAIN_SPLITS
+    main_lo = gl.minimum(split_id * main_chunk, main_len)
     main_hi = gl.minimum(main_lo + main_chunk, main_len)
     m_i, l_i, acc = _process_segment(
         q_dot,

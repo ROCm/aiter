@@ -497,6 +497,45 @@ def _decode_num_splits(
     return best_splits
 
 
+def _decode_num_splits_occ(num_queries, heads_blocks, avg_main, avg_extra, block_k):
+    """Split-K count for the gfx950 gluon kernel: fill the machine, but never
+    split a segment finer than one BLOCK_K tile.
+
+    Two facts set this. (a) The kernel is 256 unified VGPRs and 68,608 B of LDS,
+    so a CU holds two workgroups -- the launch wants ~2*CU programs before extra
+    splits stop paying. (b) Splitting a segment past its tile count does not divide
+    the work, it *multiplies* it: every split then owns a partial tile, and a
+    partial tile costs a full masked gather for a fraction of the tokens. So the
+    split count is capped by the larger segment's tile count, and the main segment
+    separately stops at its own (see MAIN_SPLITS in the kernel).
+
+    Measured at C=64 H=16 BLOCK_K=64 (attn = kernel + reduce, us), this rule picks
+    the sweep optimum at extra in {8, 64, 272, 512, 1024, 2048} and lands within
+    1.4% at extra=128:
+
+        extra      8    64   128   272   512  1024  2048
+        picked S   2     2     2     5     8     8     8
+        best S     2     2     4     5     8     8     8
+        old model  2     2     2     3     4     4     4
+        old  us  14.0  14.6  17.9  21.3  22.0  29.8  45.6
+        new  us  14.0  14.4  17.4  19.5  20.9  26.9  38.1
+    """
+    num_sms = get_num_sms()
+    base_wg = max(1, num_queries * heads_blocks)
+    cta_cap = max(1, (2 * num_sms) // base_wg)
+    main_tiles = max(1, math.ceil(avg_main / block_k)) if avg_main > 0 else 0
+    extra_tiles = max(1, math.ceil(avg_extra / block_k)) if avg_extra > 0 else 0
+    tiles = max(1, main_tiles, extra_tiles)
+    if base_wg >= num_sms:
+        # Already at least one workgroup per CU without splitting, so a split buys
+        # only the second occupancy slot -- worth an extra round trip of the
+        # [queries, heads, D] f32 partials plus a reduce launch only when each
+        # split still owns a real run of tiles. At C=256 extra=8 (2 tiles) forcing
+        # a split costs 31%; at extra=2048 (32 tiles) it saves 19%.
+        return max(1, min(cta_cap, tiles // 4))
+    return max(1, min(cta_cap, tiles))
+
+
 def _pa_decode_sparse_gfx950_gluon(
     q,
     cache,
@@ -642,6 +681,10 @@ def _pa_decode_sparse_gfx950_gluon(
         num_splits = max(1, int(_sp))
     elif kv_splits is not None:
         num_splits = max(1, int(kv_splits))
+    elif _os.environ.get("AITER_PA_DECODE_SPLIT_POLICY", "occ") == "occ":
+        num_splits = _decode_num_splits_occ(
+            num_queries, heads_blocks, avg_main, avg_extra, BLOCK_K
+        )
     else:
         num_splits = _decode_num_splits(
             num_queries, heads_blocks, avg_main, avg_extra, BLOCK_K
@@ -686,6 +729,16 @@ def _pa_decode_sparse_gfx950_gluon(
     _wp = _os.environ.get("AITER_PA_DECODE_WPEU")
     if _wp:
         waves_per_eu = int(_wp)
+
+    # Cap the main segment's split count at whole BLOCK_K tiles: past that every
+    # split's main range is a partial tile, which costs a full masked gather for
+    # half the tokens. extra keeps all num_splits programs.
+    main_splits = num_splits
+    if has_extra and avg_main > 0:
+        main_splits = max(1, min(num_splits, int(math.ceil(avg_main / BLOCK_K))))
+    _ms = _os.environ.get("AITER_PA_DECODE_SPLITS_MAIN")
+    if _ms:
+        main_splits = max(1, min(num_splits, int(_ms)))
 
     grid = (num_queries, num_splits, heads_blocks)
     _pa_decode_sparse_gfx950[grid](
@@ -736,6 +789,7 @@ def _pa_decode_sparse_gfx950_gluon(
         UNIFORM=UNIFORM,
         GATHER_W0=GATHER_W0,
         NOPE_CHUNK=nope_chunk,
+        MAIN_SPLITS=main_splits,
         MAIN_USE_BUFFER_LOAD=main_use_buffer_load,
         EXTRA_USE_BUFFER_LOAD=extra_use_buffer_load,
         HAS_INVALID=has_invalid,
