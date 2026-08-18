@@ -138,6 +138,7 @@ def test_grouped_persistent_csv_and_env_selection(monkeypatch):
 
     monkeypatch.setenv("AITER_FLYDSL_GROUPED_PERSISTENT", "0")
     assert _select_grouped_persistent(True, 12, 3) == (0, 0)
+    assert _select_grouped_persistent(False, 12, 3, enabled_override=True) == (1, 9)
 
 
 def test_grouped_persistent_rejects_partial_cluster(monkeypatch):
@@ -147,6 +148,47 @@ def test_grouped_persistent_rejects_partial_cluster(monkeypatch):
     monkeypatch.setenv("AITER_FLYDSL_GROUPED_PERSISTENT_WORKERS", "2")
     with pytest.raises(ValueError, match="at least one cluster_n=4"):
         _select_grouped_persistent(False, None, 4)
+
+
+def test_ep_contiguous_psum_builds_persistent_tile_map():
+    from aiter.ops.flydsl.grouped_moe_gfx1250 import contiguous_psum_remap
+
+    experts, route_max_m, tile_m, topk = 4, 8, 4, 2
+    counts = torch.tensor([3, 0, 5, 2], dtype=torch.int32)
+    rows = torch.tensor(
+        [[0, 1], [2, 16], [17, 18], [19, 20], [24, 25]], dtype=torch.int32
+    )
+    valid_routes = torch.tensor([rows.numel()], dtype=torch.int32)
+    capacity = experts * route_max_m
+    ep_rowmap = torch.empty((capacity + 1, 2), dtype=torch.int32)
+    ep_scatter_params = {
+        "gather_w": torch.ones(rows.numel(), dtype=torch.bfloat16),
+        "tis": torch.arange(rows.shape[0], dtype=torch.int32),
+        "ep_rowmap": ep_rowmap,
+        "cap_rows": capacity,
+        "topk": topk,
+        "max_tok": rows.shape[0],
+        "slot_stride": rows.shape[0] * topk,
+    }
+
+    starts, psum, contiguous_m, storage = contiguous_psum_remap(
+        counts,
+        rows,
+        experts,
+        route_max_m,
+        tile_m,
+        num_valid_routes=valid_routes,
+        map_capacity_m=capacity,
+        build_tile_map=True,
+        ep_scatter_params=ep_scatter_params,
+    )
+    torch.cuda.synchronize()
+
+    assert starts.cpu().tolist() == [0, 4, 4, 12]
+    assert psum.cpu().tolist() == [3, 4, 9, 14]
+    assert contiguous_m.item() == 16
+    assert storage.numel() == experts + capacity // tile_m
+    assert storage[experts : experts + 4].cpu().tolist() == [0, 2, 2, 3]
 
 
 @pytest.mark.parametrize(

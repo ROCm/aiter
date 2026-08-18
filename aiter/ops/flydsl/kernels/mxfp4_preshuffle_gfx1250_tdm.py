@@ -96,15 +96,9 @@ def persistent_tile_map_cache_plan(arena_b, n_experts, lds_capacity_b=320 * 1024
     cache_off = ((arena_b + 15) // 16) * 16
     cache_b = ((n_experts * 4 + 15) // 16) * 16
     resident = max(1, lds_capacity_b // arena_b)
-    enabled = (
-        n_experts > 0
-        and lds_capacity_b // (cache_off + cache_b) >= resident
-    )
-    return (
-        (cache_off + cache_b, cache_off, 1)
-        if enabled
-        else (arena_b, cache_off, 0)
-    )
+    enabled = n_experts > 0 and lds_capacity_b // (cache_off + cache_b) >= resident
+    return (cache_off + cache_b, cache_off, 1) if enabled else (arena_b, cache_off, 0)
+
 
 @flyc.jit
 def launch_gemm_a8w4_tdm(
@@ -139,8 +133,7 @@ def launch_gemm_a8w4_tdm(
     # (grouped_row = blk_m + row) is P2P-written -- pre-multiplied by its route
     # weight -- into the origin peer's cco symmetric ``comb_inp[slot]`` (slot =
     # origin_lid*topk + k). The per-row (dst_packed, f32 weight) map is a
-    # (cap_rows, 2) i32 tensor passed at runtime via ``arg_ep_row_map``. EP and
-    # persistent scheduling are mutually exclusive at runtime.
+    # (cap_rows, 2) i32 tensor passed at runtime via ``arg_ep_row_map``.
     enable_ep_scatter: Constexpr[int] = 0,
     ep_arena_handle: Constexpr[int] = 0,
     ep_combine_input_offset: Constexpr[int] = 0,
@@ -202,9 +195,9 @@ def launch_gemm_a8w4_tdm(
     # persistent shape; operand keepalive + the LDS-drain barrier make reuse safe.
     output_tail_overlap = persistent_on
     if persistent_on:
-        assert persistent_workers % cluster_n == 0, (
-            "persistent_workers must contain complete clusters"
-        )
+        assert (
+            persistent_workers % cluster_n == 0
+        ), "persistent_workers must contain complete clusters"
     cache_tag = (
         K,
         tile_m,
@@ -244,9 +237,7 @@ def launch_gemm_a8w4_tdm(
         if stage1_act != 0:
             raise ValueError("enable_ep_scatter is gemm2-only (stage1_act must be 0)")
         if stage1_quant_out:
-            raise ValueError(
-                "enable_ep_scatter is incompatible with stage1_quant_out"
-            )
+            raise ValueError("enable_ep_scatter is incompatible with stage1_quant_out")
     warp_tile_m = tile_m // m_warp
     warp_tile_n = tile_n // n_warp
     wmma_m_rep = warp_tile_m // WMMA_M
@@ -276,10 +267,8 @@ def launch_gemm_a8w4_tdm(
     SC_INNER = tile_k // 4
     _SA_SUPERS, SB_SUPERS = tile_m // 32, tile_n // 32
     AS_KSTEPS = tile_k // 128
-    AS_INNER = AS_KSTEPS * wmma_m_rep * 16
-    AS_SUPERS = m_warp
-    # One outer row is one wave's M tile. Its inner (k128, wm, lane16)
-    # layout gives each WMMA scale operand a contiguous 16-dword block.
+    AS_INNER = AS_KSTEPS * wmma_m_rep
+    AS_SUPERS = tile_m // wmma_m_rep
     STAGE_SA = ((AS_SUPERS * AS_INNER * 4 + 15) // 16) * 16
     STAGE_SB = ((SB_SUPERS * SC_INNER * 4 + 15) // 16) * 16
     SA_OFF = STAGE_A + STAGE_B
@@ -316,8 +305,8 @@ def launch_gemm_a8w4_tdm(
     )
     # Persistent (survives the mainloop) LDS slot for the prefetched EP rowmap:
     # tile_m rows x 8 bytes (dst_i32 | weight_bits_i32). Carved off the tail of
-    # the same allocation so it is disjoint from the reused A/B/C arena. EP is
-    # non-persistent, so SHARED_ARENA_B == CORE_ARENA_B here (>=128-aligned).
+    # the same allocation so it is disjoint from the reused A/B/C arena and the
+    # persistent next-tile lookahead slot.
     ROWMAP_LDS_B = tile_m * 8 if enable_ep_scatter else 0
 
     # Quant epilogue compile-time constants.
@@ -454,8 +443,7 @@ def launch_gemm_a8w4_tdm(
                 expert = lo
             # Per-expert A-data OOB: bound to the owning expert's valid row.
             mn_oob = (
-                tile_map_at((expert < n_experts).select(expert, n_experts - 1))
-                - blk_m
+                tile_map_at((expert < n_experts).select(expert, n_experts - 1)) - blk_m
             )
             return TileCoords(
                 blk_m,
@@ -471,7 +459,7 @@ def launch_gemm_a8w4_tdm(
 
         B_BATCH_ROWS = n64 // 16
         N_SUPERS = (n64 + 31) // 32
-        AS_ROW = (K // 128) * wmma_m_rep * 16
+        AS_ROW = (K // 128) * wmma_m_rep
 
         SB_OUTER_STRIDE = K4
 
@@ -539,12 +527,12 @@ def launch_gemm_a8w4_tdm(
             2,
             4,
         ), "num_waves_per_tensor_tdm must be 1, 2, or 4"
-        assert num_waves_per_tensor_tdm <= num_waves, (
-            "waves per tensor cannot exceed workgroup waves"
-        )
-        assert (4 * num_waves_per_tensor_tdm) % num_waves == 0, (
-            "A/B/SA/SB ownership must cover every workgroup wave"
-        )
+        assert (
+            num_waves_per_tensor_tdm <= num_waves
+        ), "waves per tensor cannot exceed workgroup waves"
+        assert (
+            4 * num_waves_per_tensor_tdm
+        ) % num_waves == 0, "A/B/SA/SB ownership must cover every workgroup wave"
         # TDMs one wave issues per k-tile: its share of the four A/B/SA/SB jobs.
         # Both the tensorcnt arithmetic and the WMMA interleave count in these.
         TDM_PER = 4 * num_waves_per_tensor_tdm // num_waves
@@ -697,7 +685,7 @@ def launch_gemm_a8w4_tdm(
             add_tdm_loads(
                 jobs,
                 gSA_base,
-                (coords.blk_m64 // (wmma_m_rep * 16)) * AS_ROW,
+                (coords.blk_m64 // wmma_m_rep) * AS_ROW,
                 AS_ROW,
                 None,
                 AS_INNER,
@@ -707,7 +695,6 @@ def launch_gemm_a8w4_tdm(
                 lds_row=AS_INNER,
                 k_adv=AS_INNER * 4,
                 wv=waves[2],
-                split_inner=AS_SUPERS < len(waves[2]),
             )
             add_tdm_loads(
                 jobs,
@@ -817,8 +804,10 @@ def launch_gemm_a8w4_tdm(
                 STAGE_A + (wnb // 16) * B_LDS_ROW + kgrp * 256 + lane16 * 16
             )
             assert wmma_m_rep == 1 or wmma_m_rep % 2 == 0
-            sa_lane = lane16 if wmma_m_rep == 1 else lane
-            lds_sa_lane_off = SA_OFF + wave_m * (AS_INNER * 4) + sa_lane * 4
+            sa_kgrp = 0 if wmma_m_rep == 1 else kgrp
+            lds_sa_lane_off = (
+                SA_OFF + (wmb // wmma_m_rep + lane16) * (AS_INNER * 4) + sa_kgrp * 4
+            )
             # One full-wave load covers both 16-column halves of an N32 scale
             # super-row. WMMA opsel_a selects lane 0:15 or 16:31 for each wn.
             assert warp_tile_n % 32 == 0, "load_sb split requires a 32-aligned wnb"
@@ -878,7 +867,7 @@ def launch_gemm_a8w4_tdm(
                 return load_half(wn)
 
             def load_sa(buf, sm, ksl):
-                off = (ksl * wmma_m_rep + sm * 2) * 16 * 4
+                off = (ksl * wmma_m_rep + sm * 2) * 4
                 return lds_load_b32(lds_sa_base(buf), fx.Int32(off))[0]
 
             def load_sb(buf, sn, ksl):
@@ -1136,8 +1125,10 @@ def launch_gemm_a8w4_tdm(
                     # or -- on the last one -- the next tile's subtile 0, into slot 0.
                     if const_expr(not is_last):
                         next_rmem = rmem_slots[(ksl + 1) % 2]
-                        load_nxt_fn = lambda n=next_rmem, k=ksl + 1: load_state(  # noqa: E731
-                            n, buf, k
+                        load_nxt_fn = (
+                            lambda n=next_rmem, k=ksl + 1: load_state(  # noqa: E731
+                                n, buf, k
+                            )
                         )
                     elif const_expr(carries):
                         next_rmem = rmem_slots[0]
@@ -1157,14 +1148,10 @@ def launch_gemm_a8w4_tdm(
                             output_tail_issue_fn
                             if const_expr(is_last and output_tail_issue_fn is not None)
                             else (
-                                do_issue
-                                if const_expr(tail_issue and is_last)
-                                else None
+                                do_issue if const_expr(tail_issue and is_last) else None
                             )
                         ),
-                        issue_reuses_lds=(
-                            is_last and output_tail_issue_fn is not None
-                        ),
+                        issue_reuses_lds=(is_last and output_tail_issue_fn is not None),
                     )
                     # One region per k128: sched_group_barrier only partitions
                     # within a region, and only sched_barrier delimits one.
@@ -1192,8 +1179,9 @@ def launch_gemm_a8w4_tdm(
                     # last WMMA on the now-free HBM without perturbing the
                     # mainloop's exact tensor_wait counts. ext=mn_oob clamps to this
                     # expert's valid rows (padding rows are left unloaded and masked
-                    # in the epilogue). The mainloop-exit pipeline_fence(0) drains +
-                    # barriers it before the epilogue reads dst/weight from LDS.
+                    # in the epilogue). Persistent mode issues it immediately before
+                    # the next tile's K0 prologue, then waits only for this older
+                    # rowmap transfer before the epilogue reads dst/weight from LDS.
                     _rm_i32 = fx.get_iter(arg_ep_row_map)
                     _rm_gt = global_view(
                         _rm_i32, coords.blk_m64 * fx.Int64(2), (tile_m, 2), (2, 1)
@@ -1207,6 +1195,15 @@ def launch_gemm_a8w4_tdm(
                     _rm_dst = lds_view(
                         fx.recast_iter(p32_shared, _rowmap_lds_ptr), (tile_m, 2), (2, 1)
                     )
+
+                def issue_output_tail():
+                    # Keep rowmap older than the next-tile prologue in tensorcnt
+                    # order. The epilogue can then wait for rowmap while leaving
+                    # the prologue outstanding in its disjoint LDS lookahead slot.
+                    if const_expr(enable_ep_scatter):
+                        fx.copy(_rm_atom, _rm_gt, _rm_dst)
+                    issue_next_output_tile()
+
                 if const_expr(persistent_on):
                     # Deferred producer/consumer fence: tile/expert resolution
                     # above overlaps the previous C store and this tile's k0;
@@ -1234,7 +1231,7 @@ def launch_gemm_a8w4_tdm(
                         ptr_to_idx(base_ptr + NEXT_PROLOGUE_OFF),
                         None,
                         output_tail_issue_fn=(
-                            issue_next_output_tile
+                            issue_output_tail
                             if output_tail_overlap and K_TILES == 1
                             else None
                         ),
@@ -1259,7 +1256,7 @@ def launch_gemm_a8w4_tdm(
                                 ptr_to_idx(buf_ptr(s)),
                                 None,
                                 output_tail_issue_fn=(
-                                    issue_next_output_tile
+                                    issue_output_tail
                                     if output_tail_overlap and kt + 1 == K_TILES
                                     else None
                                 ),
@@ -1309,9 +1306,7 @@ def launch_gemm_a8w4_tdm(
                                 outstanding=TDM_PER
                                 * max(0, num_buffers - 1 - j - (1 if has_next else 0))
                             )
-                            if const_expr(
-                                enable_ep_scatter and j == num_buffers - 1
-                            ):
+                            if const_expr(enable_ep_scatter and j == num_buffers - 1):
                                 # A/B TDM drained (outstanding==0 above); issue the
                                 # rowmap TDM here so it overlaps this last WMMA on
                                 # the idle HBM.
@@ -1419,6 +1414,15 @@ def launch_gemm_a8w4_tdm(
                 if const_expr(not persistent_on):
                     # Peer multicast loads are pairwise matched with ours.
                     pipeline_fence(outstanding=0)
+                elif const_expr(enable_ep_scatter):
+                    # Rowmap was issued before next tile K0. Keep K0 outstanding
+                    # across this epilogue, but make rowmap visible before reading
+                    # its destination/weight pairs. The final tile has no K0.
+                    if next_work < total_work:
+                        tdm_ops.tensor_wait(TDM_PER)
+                    else:
+                        tdm_ops.tensor_wait(0)
+                    workgroup_barrier()
                 STORE_N = (tile_n // 2) if stage1_act else tile_n
                 # Unpadded, a row is STORE_N/2 dwords (a multiple of 32), so the 16
                 # rows one b128 writes all hit one bank -- 16-way. +16 cols spreads
@@ -1460,7 +1464,7 @@ def launch_gemm_a8w4_tdm(
                     is_kgrp0 = fx.Int32(kgrp) == fx.Int32(0)
                     # i32_n is the pre-activation gate+up width; the quantized
                     # output has half as many columns and one scale dword per K128.
-                    q_dst_scale_dwpr = i32_n // 256
+                    q_dst_scale_dwpr = (i32_n // 256) * quant_wmma_rep
 
                     v2i32_ty = T.vec(2, T.i32)
                     QRPT_LOG2 = int(math.log2(QUANT_ROWS_PER_TILE))
@@ -1477,7 +1481,8 @@ def launch_gemm_a8w4_tdm(
                             scale_tile = row_i32 >> QRPT_LOG2
                             row_in_tile = row_i32 & (QUANT_ROWS_PER_TILE - 1)
                             wmma_row = row_in_tile >> 4
-                            scale_lane = row_in_tile & 15
+                            out_row = (scale_tile << 4) | (row_in_tile & 15)
+                            out_row_scaled = out_row * q_dst_scale_dwpr + wmma_row
 
                             e8m0_bytes = []
                             mx_blk_is = []
@@ -1545,13 +1550,7 @@ def launch_gemm_a8w4_tdm(
                                     scale_dw = mx_blk_is[mx_blk] >> 2
                                     byte_in_dw = mx_blk_is[mx_blk] & 3
                                     dst_byte = (
-                                        (
-                                            (scale_tile * q_dst_scale_dwpr + scale_dw)
-                                            * quant_wmma_rep
-                                            + wmma_row
-                                        )
-                                        * 16
-                                        + scale_lane
+                                        out_row_scaled + scale_dw * quant_wmma_rep
                                     ) * 4 + byte_in_dw
                                     fx.ptr_store(
                                         e8m0_bytes[mx_blk], scale_ptr + dst_byte
@@ -1695,9 +1694,7 @@ def launch_gemm_a8w4_tdm(
                     )
                     _comb_iter = fx.inttoptr(
                         _comb_ptr_ty,
-                        fx.Int64(
-                            ep_win.lsa_ptr(fx.Int32(0), ep_combine_input_offset)
-                        ),
+                        fx.Int64(ep_win.lsa_ptr(fx.Int32(0), ep_combine_input_offset)),
                     )
                     _comb_view = global_view(
                         _comb_iter, 0, (_oob, STORE_N), (_stride_elems, 1)

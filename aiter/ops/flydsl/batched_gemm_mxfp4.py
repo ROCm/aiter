@@ -96,9 +96,14 @@ def _select_grouped_persistent(
     csv_enabled: int | bool,
     csv_workers: int | None,
     cluster_n: int,
+    enabled_override: bool | None = None,
 ) -> tuple[int, int]:
     """Resolve CSV/env persistent scheduling to a complete-cluster CTA count."""
-    enabled = _grouped_persistent_enabled(csv_enabled)
+    enabled = (
+        bool(enabled_override)
+        if enabled_override is not None
+        else _grouped_persistent_enabled(csv_enabled)
+    )
     if not enabled:
         return 0, 0
 
@@ -166,6 +171,8 @@ def flydsl_grouped_gemm_a8w4_masked(
     next_stage_prefetch=0,
     grouped_persistent_m=0,
     persistent_workers=None,
+    allow_persistent=True,
+    force_persistent=False,
     situ_beta=1.0,
     situ_linear_beta=1.0,
 ):
@@ -222,11 +229,15 @@ def flydsl_grouped_gemm_a8w4_masked(
             f"[grouped-moe tdm] cluster_n={cluster_n} needs n_tiles={n_tiles} "
             f"(N={N}, tile_n={tile_n}) to be an exact multiple"
         )
-    grouped_persistent_m, persistent_workers = _select_grouped_persistent(
-        grouped_persistent_m,
-        persistent_workers,
-        cluster_n,
-    )
+    if allow_persistent:
+        grouped_persistent_m, persistent_workers = _select_grouped_persistent(
+            grouped_persistent_m,
+            persistent_workers,
+            cluster_n,
+            enabled_override=True if force_persistent else None,
+        )
+    else:
+        grouped_persistent_m, persistent_workers = 0, 0
     launch_gemm_a8w4_tdm(
         out,
         ptr_arg(a),

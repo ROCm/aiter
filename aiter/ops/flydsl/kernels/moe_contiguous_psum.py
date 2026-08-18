@@ -434,6 +434,7 @@ def build_moe_contiguous_psum_remap_ep_module():
         topids_to_rows: fx.Pointer,
         starts: fx.Pointer,
         psum: fx.Pointer,
+        m_tile_expert: fx.Pointer,
         contiguous_m: fx.Pointer,
         numel: Int32,
         experts: Int32,
@@ -469,6 +470,7 @@ def build_moe_contiguous_psum_remap_ep_module():
         rows_rsrc = ptr_rsrc(topids_to_rows)
         s_rsrc = ptr_rsrc(starts)
         p_rsrc = ptr_rsrc(psum)
+        mt_rsrc = ptr_rsrc(m_tile_expert)
         c_rsrc = ptr_rsrc(contiguous_m)
         w_rsrc = ptr_rsrc(gather_w)
         tis_rsrc = ptr_rsrc(tis)
@@ -535,6 +537,23 @@ def build_moe_contiguous_psum_remap_ep_module():
                 m_tid = buffer_ops.buffer_load(m_rsrc, tid, vec_width=1, dtype=i32)
                 buffer_ops.buffer_store(start, s_rsrc, tid)
                 buffer_ops.buffer_store(start + ArithValue(m_tid), p_rsrc, tid)
+                build_map = arith.cmpi(
+                    CmpIPredicate.ne,
+                    ptrtoint(m_tile_expert),
+                    arith.constant(0, type=T.i64),
+                )
+                _if_map = scf.IfOp(build_map)
+                with ir.InsertionPoint(_if_map.then_block):
+                    start_tile = ArithValue(arith.divui(start, tile_v))
+                    valid_tiles = ArithValue(
+                        arith.divui(ArithValue(m_tid) + tile_minus_1, tile_v)
+                    )
+                    map_loop = scf.ForOp(zero, _raw(valid_tiles), one)
+                    with ir.InsertionPoint(map_loop.body):
+                        local_tile = ArithValue(map_loop.induction_variable)
+                        buffer_ops.buffer_store(tid, mt_rsrc, start_tile + local_tile)
+                        scf.YieldOp([])
+                    scf.YieldOp([])
                 is_last = arith.cmpi(
                     CmpIPredicate.eq,
                     tid,
@@ -623,6 +642,7 @@ def build_moe_contiguous_psum_remap_ep_module():
         topids_to_rows: fx.Pointer,
         starts: fx.Pointer,
         psum: fx.Pointer,
+        m_tile_expert: fx.Pointer,
         contiguous_m: fx.Pointer,
         numel: fx.Int32,
         experts: fx.Int32,
@@ -647,6 +667,7 @@ def build_moe_contiguous_psum_remap_ep_module():
             topids_to_rows,
             starts,
             psum,
+            m_tile_expert,
             contiguous_m,
             numel,
             experts,

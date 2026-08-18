@@ -512,6 +512,12 @@ def _grouped_a8w4_tdm_moe(
             "max_tok": int(stage2_scatter.max_tokens_per_rank),
             "slot_stride": int(stage2_scatter.max_tokens_per_rank) * int(topk),
         }
+    _ep_scatter_persistent = enable_ep_scatter and (
+        os.environ.get("AITER_EP_SCATTER_PERSISTENT", "0").lower() in _TRUTHY_ENV
+    )
+    _persistent_requested = (
+        _grouped_persistent_enabled(grouped_persistent_m) or _ep_scatter_persistent
+    )
     _starts, _psum, _, psum = contiguous_psum_remap(
         _masked_m,
         topids_to_rows,
@@ -520,8 +526,7 @@ def _grouped_a8w4_tdm_moe(
         tile_m,
         num_valid_routes=_ep_nvr,
         map_capacity_m=contiguous_m,
-        build_tile_map=_grouped_persistent_enabled(grouped_persistent_m)
-        and ep_scatter_params is None,
+        build_tile_map=_persistent_requested,
         ep_scatter_params=ep_scatter_params,
     )
     # gemm2 kwargs that turn the felix TDM GEMM2 epilogue into the fused P2P
@@ -564,8 +569,17 @@ def _grouped_a8w4_tdm_moe(
         "persistent_workers": persistent_workers,
     }
     _gemm2_kw = dict(_ep_gemm2_kwargs)
-    if not enable_ep_scatter:
-        _gemm2_kw.update(_persistent_kw)
+    _gemm2_kw.update(_persistent_kw)
+    if _ep_scatter_persistent:
+        # Benchmark/experimental mode: enable only GEMM2 persistent even when
+        # the global grouped-persistent override keeps GEMM1 non-persistent.
+        _gemm2_kw["force_persistent"] = True
+    # The direct map is built at GEMM1's tile_m granularity. Reusing it with a
+    # different GEMM2 tile_m would index the wrong expert (and can read past the
+    # map when tile_m2 is smaller). EP scatter/prologue overlap also remains
+    # opt-in until its persistent loop beats the static Stage2 launch.
+    if tile_m2 != tile_m or (enable_ep_scatter and not _ep_scatter_persistent):
+        _gemm2_kw["allow_persistent"] = False
     _b1 = (
         bias1.to(dtype).contiguous()
         if (bias1 is not None and bias1.numel() > 0)
@@ -1330,22 +1344,20 @@ def contiguous_psum_remap(
     experts = int(experts)
     masked_m_i32 = masked_m[:experts].to(torch.int32)
     starts = torch.empty(experts, dtype=torch.int32, device=device)
-    if ep_scatter_params is not None:
-        psum = torch.empty(experts, dtype=torch.int32, device=device)
-        m_tile_expert = torch.empty(0, dtype=torch.int32, device=device)
-    else:
-        if map_capacity_m is None:
-            map_capacity_m = experts * int(route_max_m)
-        max_m_tiles = (
-            (int(map_capacity_m) + int(tile_m) - 1) // int(tile_m)
-            if build_tile_map
-            else 0
-        )
-        tile_map_storage = torch.empty(
-            experts + max_m_tiles, dtype=torch.int32, device=device
-        )
-        psum = tile_map_storage[:experts]
-        m_tile_expert = tile_map_storage[experts:]
+    if map_capacity_m is None:
+        map_capacity_m = experts * int(route_max_m)
+    max_m_tiles = (
+        (int(map_capacity_m) + int(tile_m) - 1) // int(tile_m) if build_tile_map else 0
+    )
+    tile_map_storage = torch.empty(
+        experts + max_m_tiles, dtype=torch.int32, device=device
+    )
+    psum = tile_map_storage[:experts]
+    m_tile_expert = (
+        tile_map_storage[experts:]
+        if build_tile_map
+        else torch.empty(0, dtype=torch.int32, device=device)
+    )
     contiguous_m_t = torch.empty(1, dtype=torch.int32, device=device)
     topids_flat = topids_to_rows.reshape(-1)
     # Only remap the valid routes; dead-tail rows are unwritten and must not be
@@ -1372,6 +1384,7 @@ def contiguous_psum_remap(
             ptr_arg(topids_flat),
             ptr_arg(starts),
             ptr_arg(psum),
+            ptr_arg(m_tile_expert),
             ptr_arg(contiguous_m_t),
             int(topids_flat.numel()),
             experts,
@@ -1387,7 +1400,7 @@ def contiguous_psum_remap(
             int(ep_scatter_params["slot_stride"]),
             stream=torch.cuda.current_stream(),
         )
-        return starts, psum, contiguous_m_t, psum
+        return starts, psum, contiguous_m_t, tile_map_storage
     launch = _get_compiled_contiguous_psum_remap()
     launch(
         ptr_arg(masked_m_i32),
