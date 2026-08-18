@@ -485,9 +485,7 @@ _flydsl_mla_reduce_v1_op.__signature__ = _mlar_sig.replace(
     parameters=[p for n, p in _mlar_sig.parameters.items() if n != "stream"]
 )
 _flydsl_mla_reduce_v1_op.__annotations__ = {
-    k: v
-    for k, v in _orig_flydsl_mla_reduce_v1.__annotations__.items()
-    if k != "stream"
+    k: v for k, v in _orig_flydsl_mla_reduce_v1.__annotations__.items() if k != "stream"
 }
 
 if not hasattr(torch.ops.aiter, "flydsl_mla_reduce_v1"):
