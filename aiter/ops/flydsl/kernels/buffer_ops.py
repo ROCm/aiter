@@ -28,6 +28,8 @@ Example:
 
 from __future__ import annotations
 
+import inspect
+
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import arith as std_arith
 from flydsl._mlir.dialects import llvm, rocdl
@@ -118,6 +120,38 @@ def _create_i32_constant(value: int) -> ir.Value:
     attr = ir.IntegerAttr.get(i32_type, value)
     op = std_arith.ConstantOp(i32_type, attr)
     return _unwrap_value(op.result)
+
+
+_RAW_PTR_BUFFER_AUX_IS_OPERAND: bool | None = None
+
+
+def _raw_ptr_buffer_aux_is_operand() -> bool:
+    """True when flydsl passes cache policy as an aux operand Value (new API)."""
+    global _RAW_PTR_BUFFER_AUX_IS_OPERAND
+    if _RAW_PTR_BUFFER_AUX_IS_OPERAND is None:
+        sig = inspect.signature(rocdl.RawPtrBufferLoadOp.__init__)
+        positional = [
+            p
+            for p in list(sig.parameters.values())[1:]
+            if p.kind
+            in (
+                inspect.Parameter.POSITIONAL_ONLY,
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            )
+        ]
+        _RAW_PTR_BUFFER_AUX_IS_OPERAND = len(positional) >= 5
+    return _RAW_PTR_BUFFER_AUX_IS_OPERAND
+
+
+def _buffer_cache_aux(cache_modifier: int) -> tuple[ir.Value | None, ir.Attribute | None]:
+    """Return (aux_operand, aux_kwarg) for RawPtrBufferLoad/StoreOp."""
+    if _raw_ptr_buffer_aux_is_operand():
+        return _create_i32_constant(cache_modifier), None
+    if cache_modifier:
+        return None, ir.IntegerAttr.get(
+            ir.IntegerType.get_signless(32), cache_modifier
+        )
+    return None, None
 
 
 def _to_i32_offset(offset: ir.Value) -> ir.Value:
@@ -593,20 +627,25 @@ def buffer_load(
             soffset = _create_i32_constant(soffset_bytes)
         else:
             soffset = _to_i32_offset(_unwrap_value(soffset_bytes))
-    aux_attr = (
-        ir.IntegerAttr.get(ir.IntegerType.get_signless(32), cache_modifier)
-        if cache_modifier
-        else None
-    )
+    aux_operand, aux_kwarg = _buffer_cache_aux(cache_modifier)
 
     # Emit buffer load
-    load_op = rocdl.RawPtrBufferLoadOp(
-        result_type,
-        rsrc,
-        offset,
-        soffset,
-        aux=aux_attr,
-    )
+    if aux_operand is not None:
+        load_op = rocdl.RawPtrBufferLoadOp(
+            result_type,
+            rsrc,
+            offset,
+            soffset,
+            aux_operand,
+        )
+    else:
+        load_op = rocdl.RawPtrBufferLoadOp(
+            result_type,
+            rsrc,
+            offset,
+            soffset,
+            aux=aux_kwarg,
+        )
 
     return load_op.result
 
@@ -683,17 +722,22 @@ def buffer_store(
             soffset = _create_i32_constant(int(soffset_bytes))
         else:
             soffset = _to_i32_offset(_unwrap_value(soffset_bytes))
-    aux_attr = (
-        ir.IntegerAttr.get(ir.IntegerType.get_signless(32), cache_modifier)
-        if cache_modifier
-        else None
-    )
+    aux_operand, aux_kwarg = _buffer_cache_aux(cache_modifier)
 
     # Emit buffer store
-    rocdl.RawPtrBufferStoreOp(
-        data,
-        rsrc,
-        offset,
-        soffset,
-        aux=aux_attr,
-    )
+    if aux_operand is not None:
+        rocdl.RawPtrBufferStoreOp(
+            data,
+            rsrc,
+            offset,
+            soffset,
+            aux_operand,
+        )
+    else:
+        rocdl.RawPtrBufferStoreOp(
+            data,
+            rsrc,
+            offset,
+            soffset,
+            aux=aux_kwarg,
+        )
