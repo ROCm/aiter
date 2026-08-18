@@ -533,7 +533,19 @@ def _decode_num_splits_occ(num_queries, heads_blocks, avg_main, avg_extra, block
         # split still owns a real run of tiles. At C=256 extra=8 (2 tiles) forcing
         # a split costs 31%; at extra=2048 (32 tiles) it saves 19%.
         return max(1, min(cta_cap, tiles // 4))
-    return max(1, min(cta_cap, tiles))
+    if tiles <= cta_cap:
+        return max(1, tiles)
+    # The cap binds, so every split owns several tiles and the only question is
+    # whether the last one is partial. S * ceil(tiles/S) is the number of tiles
+    # actually executed: at 18 tiles, S=8 runs 24 of them and S=6 runs 18. Take the
+    # largest S in range that executes the fewest -- largest because, ties aside,
+    # more programs is more memory parallelism.
+    best_s, best_cost = 1, tiles
+    for s in range(2, cta_cap + 1):
+        cost = s * math.ceil(tiles / s)
+        if cost <= best_cost:
+            best_s, best_cost = s, cost
+    return best_s
 
 
 def _pa_decode_sparse_gfx950_gluon(
