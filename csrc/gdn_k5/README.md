@@ -15,7 +15,8 @@ python3 csrc/gdn_k5/chunk_gdn_h_mfma16_hip_tune.py \
   -o /tmp/chunk_gdn_h_mfma16_hip_tuned.candidate.csv
 ```
 
-4. Validate the checked-in tuned table on the current GPU:
+4. Validate the checked-in tuned table on the current GPU (default 10% ``us``
+   drift tolerance; CI ``test_run_config`` passes 40% for small-shape variance):
 ```bash
 python3 csrc/gdn_k5/chunk_gdn_h_mfma16_hip_tune.py \
   --run_config aiter/configs/chunk_gdn_h_mfma16_hip_tuned.csv

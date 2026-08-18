@@ -69,6 +69,7 @@ FAMILIES = [
     ("AITER_CONFIG_GEMM_BF16", "bf16_tuned_gemm"),
     ("AITER_CONFIG_FMOE", "tuned_fmoe"),
     ("AITER_CONFIG_GROUPED_FMOE", "tuned_grouped_fmoe"),
+    ("AITER_CONFIG_GDN_K5_MFMA16_HIP", "chunk_gdn_h_mfma16_hip_tuned"),
 ]
 
 
@@ -220,6 +221,11 @@ class TestConfigShapeCollision(unittest.TestCase):
 
     def test_grouped_fmoe(self):
         self._check_family("AITER_CONFIG_GROUPED_FMOE", "tuned_grouped_fmoe")
+
+    def test_gdn_k5_mfma16_hip(self):
+        self._check_family(
+            "AITER_CONFIG_GDN_K5_MFMA16_HIP", "chunk_gdn_h_mfma16_hip_tuned"
+        )
 
 
 def _fix_real_tree():

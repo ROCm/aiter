@@ -319,6 +319,16 @@ TUNER_FAMILIES = {
         "exclude_patterns": ["batched"],
         "config_property": "AITER_CONFIG_GEMM_BF16_FILE",
     },
+    "gdn_k5_mfma16_hip": {
+        "script": "csrc/gdn_k5/chunk_gdn_h_mfma16_hip_tune.py",
+        "csv_pattern": "chunk_gdn_h_mfma16_hip_tuned",
+        "exclude_patterns": ["untuned"],
+        "timeout": 1800,
+        "config_property": "AITER_CONFIG_GDN_K5_MFMA16_HIP_FILE",
+        # Small tc=40 shapes have high run-to-run variance; keep this loose
+        # enough for CI drift checks (ERROR/no_case still fail hard).
+        "extra_args": ["--run_config_tol_pct", "40"],
+    },
 }
 
 
@@ -413,6 +423,9 @@ class TestRunConfig(unittest.TestCase):
 
     def test_csrc_bf16(self):
         self._test_family("csrc_bf16")
+
+    def test_gdn_k5_mfma16_hip(self):
+        self._test_family("gdn_k5_mfma16_hip")
 
 
 @unittest.skipUnless(_gpu_available(), "No GPU available")

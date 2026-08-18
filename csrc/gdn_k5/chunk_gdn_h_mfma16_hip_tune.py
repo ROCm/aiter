@@ -341,34 +341,44 @@ def _run_tune(args):
 def _run_config(args, config_file: str):
     rows = _read_csv_rows(config_file)
     if not rows:
-        print(f"no rows in {config_file}")
+        print("no rows in", config_file)
         return []
 
     cases = _load_k5_cases()
     results = []
-    header = f"{'model':40s} {'BV':>4s} {'csv_us':>8s} {'live_us':>8s} {'delta%':>7s} {'status':>8s}"
-    print(header)
-    print("-" * len(header))
+    print("Shape | e2e_us | Status")
+    print("-" * 60)
 
     for row in rows:
         case = _find_case_for_row(cases, row)
-        shape = f"{row['model']} tc={row['total_chunks']}"
+        shape = f"({row['model']}, tc={row['total_chunks']}, BV={row['BV']})"
         if case is None:
-            results.append({"shape": shape, "us": -1, "status": "no_case"})
-            print(f"{shape:40s} {'':4s} {float(row['us']):8.1f} {'':8s} {'':7s} {'no_case':>8s}")
+            results.append({"shape": shape, "us": -1, "status": "ERROR"})
+            print(f"{shape} | {'-1':>10} | ERROR")
+            print("reason: no matching K5 prefill case")
             continue
 
         snapshot_dtype = _case_snapshot_dtype(case)
         inputs, *_rest = _build_k5_inputs(case, snapshot_dtype)
         bv = int(row["BV"])
         csv_us = float(row["us"])
-        live_us = _bench_us(inputs, bv, args.warmup, args.iters)
-        delta = (live_us - csv_us) / csv_us * 100 if csv_us > 0 else 0.0
-        status = "ok" if abs(delta) <= max(args.run_config_tol_pct, 0.0) else "drift"
+        try:
+            live_us = _bench_us(inputs, bv, args.warmup, args.iters)
+            delta = (live_us - csv_us) / csv_us * 100 if csv_us > 0 else 0.0
+            if abs(delta) <= max(args.run_config_tol_pct, 0.0):
+                status = "OK"
+            else:
+                status = "MISMATCH"
+                print("reason: live_us drift {:.1f}% vs csv (tol {:.1f}%)".format(
+                    delta, args.run_config_tol_pct
+                ))
+        except Exception as exc:  # noqa: BLE001
+            live_us = -1.0
+            status = "ERROR"
+            print(f"reason: {exc}")
         results.append({"shape": shape, "us": live_us, "status": status})
-        print(
-            f"{shape:40s} {bv:4d} {csv_us:8.1f} {live_us:8.1f} {delta:7.1f} {status:>8s}"
-        )
+        us_str = f"{live_us:.1f}" if live_us >= 0 else "-1"
+        print(f"{shape} | {us_str:>10} | {status}")
         del inputs
         torch.cuda.empty_cache()
     return results
@@ -488,7 +498,7 @@ def main():
     if args.run_config:
         config_file = args.tune_file if args.run_config is True else args.run_config
         results = _run_config(args, config_file)
-        bad = [r for r in results if r["status"] not in {"ok"}]
+        bad = [r for r in results if r["status"] not in {"OK", "SKIP"}]
         if bad:
             sys.exit(1)
         return
