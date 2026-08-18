@@ -67,6 +67,7 @@ def _run_and_check(
     apply_output_norm: bool,
     pad: int = 0,
     hidden_size: int = _D,
+    rows_per_wg: int | None = None,
 ):
     block_write_idx = num_blocks if write_block else -1
     (
@@ -113,6 +114,7 @@ def _run_and_check(
         block_write_idx,
         _EPS,
         _EPS,
+        rows_per_wg,
     )
     torch.cuda.synchronize()
 
@@ -143,6 +145,7 @@ def _run_and_check(
             parent[..., hidden_size:], expected_padding
         ), f"kernel modified {name} padding"
     assert output.is_contiguous(), "output must be contiguous"
+    return error
 
 
 def test_flydsl_attn_res_correctness():
@@ -160,15 +163,6 @@ def test_flydsl_attn_res_correctness():
 
     _run_and_check(17, _MAX_BLOCKS, False, False, False, hidden_size=_D_SMALL)
     _run_and_check(17, _MAX_BLOCKS - 1, True, True, True, hidden_size=_D_SMALL)
-    _run_and_check(
-        17,
-        _MAX_BLOCKS - 1,
-        True,
-        True,
-        True,
-        pad=8,
-        hidden_size=_D_SMALL,
-    )
 
     for tokens in (1, 320):
         _run_and_check(tokens, _MAX_BLOCKS, False, False, False)
@@ -302,10 +296,11 @@ def benchmark_flydsl_attn_res(
     apply_output_norm: bool,
     pad: int = 0,
     hidden_size: int = _D,
+    rows_per_wg: int = 1,
 ):
     """Validate and measure one supported prefill flag specialization."""
     block_write_idx = num_blocks if write_block else -1
-    _run_and_check(
+    err = _run_and_check(
         tokens,
         num_blocks,
         has_delta,
@@ -313,6 +308,7 @@ def benchmark_flydsl_attn_res(
         apply_output_norm,
         pad=pad,
         hidden_size=hidden_size,
+        rows_per_wg=rows_per_wg,
     )
 
     # Allocate fresh buffers for timing: delta and snapshot paths mutate inputs
@@ -338,6 +334,7 @@ def benchmark_flydsl_attn_res(
         block_write_idx,
         _EPS,
         _EPS,
+        rows_per_wg,
     )
 
     # k source reads, optional delta read + prefix write, optional snapshot
@@ -354,11 +351,13 @@ def benchmark_flydsl_attn_res(
         "write_block": write_block,
         "apply_output_norm": apply_output_norm,
         "pad": pad,
+        "rows_per_wg": rows_per_wg,
         "us": round(us, 3),
         "GB/s": round(gbps, 0),
         "%peak": round(gbps / _PEAK_BW_GBPS_GFX950 * 100, 1),
         "floor_us": round(floor_us, 3),
         "efficiency": round(floor_us / us, 3),
+        "flydsl err": err,
     }
 
 
@@ -368,20 +367,29 @@ def main():
         "--tokens",
         type=int,
         nargs="+",
-        default=[1, 17, 320],
+        default=[1, 4, 17, 320],
         help="Prefill token counts to test and benchmark",
     )
     args = parser.parse_args()
-    configs = (
-        (_D, _MAX_BLOCKS, False, False, False, 0),
-        (_D, _MAX_BLOCKS - 1, True, True, True, 0),
-        (_D, 0, True, True, True, 0),
-        (_D, _MAX_BLOCKS, True, False, False, 0),
-        (_D, _MAX_BLOCKS, False, False, True, 0),
-        (_D, _MAX_BLOCKS - 1, True, True, True, 8),
-        (_D_SMALL, _MAX_BLOCKS, False, False, False, 0),
-        (_D_SMALL, _MAX_BLOCKS - 1, True, True, True, 0),
-        (_D_SMALL, _MAX_BLOCKS - 1, True, True, True, 8),
+    large_d_configs = (
+        (_D, _MAX_BLOCKS, False, False, False, 0, 1),
+        (_D, _MAX_BLOCKS - 1, True, True, True, 0, 1),
+        (_D, 0, True, True, True, 0, 1),
+        (_D, _MAX_BLOCKS, True, False, False, 0, 1),
+        (_D, _MAX_BLOCKS, False, False, True, 0, 1),
+        (_D, _MAX_BLOCKS - 1, True, True, True, 8, 1),
+    )
+    # R=4 is D=1024-only: packing a multi-wave D=7168 row is rejected.
+    small_d_configs = tuple(
+        (*cfg, rows)
+        for cfg, rows in itertools.product(
+            (
+                (_D_SMALL, _MAX_BLOCKS, False, False, False, 0),
+                (_D_SMALL, _MAX_BLOCKS - 1, True, True, True, 0),
+                (_D_SMALL, _MAX_BLOCKS - 1, True, True, True, 8),
+            ),
+            (1, 4),
+        )
     )
     results = [
         benchmark_flydsl_attn_res(
@@ -392,9 +400,20 @@ def main():
             apply_output_norm,
             pad=pad,
             hidden_size=hidden_size,
+            rows_per_wg=rows_per_wg,
         )
-        for hidden_size, num_blocks, has_delta, write_block, apply_output_norm, pad in configs
-        for tokens in args.tokens
+        for (
+            hidden_size,
+            num_blocks,
+            has_delta,
+            write_block,
+            apply_output_norm,
+            pad,
+            rows_per_wg,
+        ), tokens in itertools.product(
+            (*large_d_configs, *small_d_configs),
+            args.tokens,
+        )
     ]
     print(pd.DataFrame(results).to_string(index=False))
 
