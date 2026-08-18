@@ -45,6 +45,100 @@ def _fp8_to_f32(x_u8, FP8_FNUZ: gl.constexpr):
 
 
 @gluon.jit
+def _split2(x):
+    """Contiguous register split along dim 1: [A, B] -> two [A, B//2].
+
+    x0 takes columns [0, B//2), x1 takes [B//2, B). Both halves come back in the
+    input's own layout, so with warps tiling dim 0 (see ``gather_l``) the column
+    direction is a pure per-lane register repeat and the split is a rename -- no
+    cross-lane traffic. ``assert_trivial`` makes a non-free split a compile error
+    rather than a silent LDS round-trip.
+    """
+    layout: gl.constexpr = x.type.layout
+    x_r = x.reshape(x.shape[0], 2, x.shape[1] // 2).permute(0, 2, 1)
+    x0, x1 = gl.split(x_r)
+    x0 = gl.convert_layout(x0, layout, assert_trivial=True)
+    x1 = gl.convert_layout(x1, layout, assert_trivial=True)
+    return x0, x1
+
+
+@gluon.jit
+def _deq_store(x_u8, sc, kv_smem, off, UNIFORM: gl.constexpr, FP8_FNUZ: gl.constexpr):
+    """Dequant one fp8 slab and write it straight to kv_smem[:, off:off+W].
+
+    Keep the dequant in f32: gfx950 has no bf16 multiply, so a bf16 path lowers to
+    an emulated mul and doubles the loop. ``sc`` is the raw per-64-group exponent
+    byte (packed fp8_ds_mla, UE8M0) or an f32 scale (uniform pool).
+    """
+    W: gl.constexpr = x_u8.shape[1]
+    if UNIFORM:
+        scale = sc
+    else:
+        scale = gl.exp2(sc.to(gl.float32) - 127.0)
+    kv_smem.slice(off, W, dim=1).store(
+        (_fp8_to_f32(x_u8, FP8_FNUZ) * scale).to(gl.bfloat16)
+    )
+
+
+@gluon.jit
+def _deq_store_tile(
+    x_u8,
+    sc,
+    kv_smem,
+    NOPE_CHUNK: gl.constexpr,
+    UNIFORM: gl.constexpr,
+    FP8_FNUZ: gl.constexpr,
+):
+    """Dequant a whole gathered fp8 tile into kv_smem in NOPE_CHUNK-wide pieces.
+
+    The f32 expansion is 4x the fp8 tile (a [64, 512] tile is 128 f32 VGPRs/lane),
+    so materializing it in one shot is what pins the kernel at 1 wave/SIMD.
+    Splitting first makes the dependence chain explicit -- piece c's converts feed
+    piece c's ds_writes and die -- so only HEAD_SIZE/NOPE_CHUNK-th of it is ever
+    live. The splits themselves are register renames (see ``_split2``).
+    """
+    W: gl.constexpr = x_u8.shape[1]
+    if NOPE_CHUNK >= W:
+        _deq_store(x_u8, sc, kv_smem, 0, UNIFORM, FP8_FNUZ)
+    else:
+        x0, x1 = _split2(x_u8)
+        s0, s1 = _split2(sc)
+        W2: gl.constexpr = W // 2
+        if NOPE_CHUNK >= W2:
+            _deq_store(x0, s0, kv_smem, 0, UNIFORM, FP8_FNUZ)
+            _deq_store(x1, s1, kv_smem, W2, UNIFORM, FP8_FNUZ)
+        else:
+            x00, x01 = _split2(x0)
+            s00, s01 = _split2(s0)
+            x10, x11 = _split2(x1)
+            s10, s11 = _split2(s1)
+            W4: gl.constexpr = W // 4
+            if NOPE_CHUNK >= W4:
+                _deq_store(x00, s00, kv_smem, 0, UNIFORM, FP8_FNUZ)
+                _deq_store(x01, s01, kv_smem, W4, UNIFORM, FP8_FNUZ)
+                _deq_store(x10, s10, kv_smem, 2 * W4, UNIFORM, FP8_FNUZ)
+                _deq_store(x11, s11, kv_smem, 3 * W4, UNIFORM, FP8_FNUZ)
+            else:
+                W8: gl.constexpr = W // 8
+                y0, y1 = _split2(x00)
+                t0, t1 = _split2(s00)
+                _deq_store(y0, t0, kv_smem, 0, UNIFORM, FP8_FNUZ)
+                _deq_store(y1, t1, kv_smem, W8, UNIFORM, FP8_FNUZ)
+                y0, y1 = _split2(x01)
+                t0, t1 = _split2(s01)
+                _deq_store(y0, t0, kv_smem, 2 * W8, UNIFORM, FP8_FNUZ)
+                _deq_store(y1, t1, kv_smem, 3 * W8, UNIFORM, FP8_FNUZ)
+                y0, y1 = _split2(x10)
+                t0, t1 = _split2(s10)
+                _deq_store(y0, t0, kv_smem, 4 * W8, UNIFORM, FP8_FNUZ)
+                _deq_store(y1, t1, kv_smem, 5 * W8, UNIFORM, FP8_FNUZ)
+                y0, y1 = _split2(x11)
+                t0, t1 = _split2(s11)
+                _deq_store(y0, t0, kv_smem, 6 * W8, UNIFORM, FP8_FNUZ)
+                _deq_store(y1, t1, kv_smem, 7 * W8, UNIFORM, FP8_FNUZ)
+
+
+@gluon.jit
 def _slots(
     indices_ptr,
     seg_start,
@@ -106,6 +200,7 @@ def _decode_tile(
     HEAD_SIZE: gl.constexpr,
     BLOCK_M: gl.constexpr,
     BLOCK_K: gl.constexpr,
+    NOPE_CHUNK: gl.constexpr,
     HEAD_ALIGNED: gl.constexpr,
     MASKED: gl.constexpr,
     UNIFORM: gl.constexpr,
@@ -154,7 +249,7 @@ def _decode_tile(
         else:
             x_u8 = _cache_load(cache_ptr, kv_off, USE_BUFFER_LOAD)
             sc = _cache_load(cache_bf16_ptr, scl_off, USE_BUFFER_LOAD)
-        kv_smem.store((_fp8_to_f32(x_u8, FP8_FNUZ) * sc).to(gl.bfloat16))
+        _deq_store_tile(x_u8, sc, kv_smem, NOPE_CHUNK, True, FP8_FNUZ)
     elif IS_FP8:
         # DSv4 packed fp8_ds_mla: NoPE fp8 + embedded UE8M0 + separate RoPE-bf16.
         nope_off = (block_idx_g * cs0 + pos_g * 576)[:, None] + offs_full[None, :]
@@ -171,12 +266,7 @@ def _decode_tile(
         else:
             x_u8 = _cache_load(cache_ptr, nope_off, USE_BUFFER_LOAD)
             exps = _cache_load(cache_ptr, scl_off, USE_BUFFER_LOAD)
-        # Keep the dequant in f32: gfx950 has no bf16 multiply, so a bf16 path
-        # lowers to an emulated mul and doubles the loop.
-        x_fp8 = x_u8.to(gl.float8e4nv, bitcast=True)
-        scales = gl.exp2(exps.to(gl.float32) - 127.0)
-        k_nope = (x_fp8.to(gl.float32) * scales).to(gl.bfloat16)
-        kv_smem.store(k_nope)
+        _deq_store_tile(x_u8, exps, kv_smem, NOPE_CHUNK, False, FP8_FNUZ)
         block_idx_gr, pos_gr, valid_gr = _slots(
             indices_ptr,
             seg_start,
@@ -270,8 +360,14 @@ def _gd_fp8(
     HAS_INVALID: gl.constexpr,
     FP8_FNUZ: gl.constexpr,
 ):
-    """Gather + dequant one full fp8 tile to bf16 regs. Split from the LDS-write/MFMA
-    so the gather issues an iteration early."""
+    """Gather one full fp8 tile. Split from the LDS-write/MFMA so the gather issues
+    an iteration early.
+
+    The prefetch is carried across the MFMA in **raw fp8**, not dequantized bf16:
+    the loop keeps two tiles in flight, and a [BLOCK_K, HEAD_SIZE] tile is 32
+    VGPRs/lane as u8 but 64 as bf16, so dequantizing here would burn an extra 64
+    VGPRs on loop-carried state alone. The consumer dequants (chunked) instead.
+    """
     if not USE_BUFFER_LOAD:
         cs0 = cs0.to(gl.int64)  # >2 GB cache: 64-bit gather offsets (see _cache_load)
     bg, pg, valid = _slots(
@@ -290,19 +386,14 @@ def _gd_fp8(
         scl_off = (bg * NGRP)[:, None] + (offs_full[None, :] // 64)
         x_u8 = _cache_load(cache_ptr, kv_off, USE_BUFFER_LOAD)
         sc = _cache_load(cache_bf16_ptr, scl_off, USE_BUFFER_LOAD)
-        k_nope = (_fp8_to_f32(x_u8, FP8_FNUZ) * sc).to(gl.bfloat16)
-        k_rope = k_nope  # unused for UNIFORM (rope slice-store skipped) -> DCE'd
+        k_rope = x_u8  # unused for UNIFORM (rope slice-store skipped) -> DCE'd
     else:
         nope_off = (bg * cs0 + pg * 576)[:, None] + offs_full[None, :]
         scl_off = (bg * cs0 + BLOCK_SIZE * 576 + pg * 8)[:, None] + (
             offs_full[None, :] // 64
         )
         x_u8 = _cache_load(cache_ptr, nope_off, USE_BUFFER_LOAD)
-        exps = _cache_load(cache_ptr, scl_off, USE_BUFFER_LOAD)
-        k_nope = (
-            x_u8.to(gl.float8e4nv, bitcast=True).to(gl.float32)
-            * gl.exp2(exps.to(gl.float32) - 127.0)
-        ).to(gl.bfloat16)
+        sc = _cache_load(cache_ptr, scl_off, USE_BUFFER_LOAD)
         bgr, pgr, _ = _slots(
             indices_ptr,
             seg_start,
@@ -315,12 +406,13 @@ def _gd_fp8(
         )
         rope_off = (bgr * (cs0 // 2) + pgr * 288 + 224)[:, None] + offs_rope[None, :]
         k_rope = _cache_load(cache_bf16_ptr, rope_off, USE_BUFFER_LOAD)
-    return k_nope, k_rope, valid
+    return x_u8, sc, k_rope, valid
 
 
 @gluon.jit
 def _qkpv_fp8(
-    k_nope,
+    x_u8,
+    sc,
     k_rope,
     valid,
     q_dot,
@@ -340,15 +432,17 @@ def _qkpv_fp8(
     HEAD_SIZE: gl.constexpr,
     BLOCK_M: gl.constexpr,
     BLOCK_K: gl.constexpr,
+    NOPE_CHUNK: gl.constexpr,
     HEAD_ALIGNED: gl.constexpr,
     UNIFORM: gl.constexpr,
+    FP8_FNUZ: gl.constexpr,
     HAS_INVALID: gl.constexpr,
 ):
-    """Write a prefetched bf16 tile to LDS, then QK -> softmax -> PV. UNIFORM skips
-    the RoPE slice-store (the whole head is one fp8 tile). When HAS_INVALID, mask the
-    columns of -1-sentinel slots (``valid`` from _gd_fp8) to -inf."""
+    """Dequant a prefetched fp8 tile into LDS, then QK -> softmax -> PV. UNIFORM
+    skips the RoPE slice-store (the whole head is one fp8 tile). When HAS_INVALID,
+    mask the columns of -1-sentinel slots (``valid`` from _gd_fp8) to -inf."""
     neg_inf = float("-inf")
-    kv_smem.store(k_nope)
+    _deq_store_tile(x_u8, sc, kv_smem, NOPE_CHUNK, UNIFORM, FP8_FNUZ)
     if not UNIFORM:
         kv_smem.slice(NOPE_DIM, ROPE_DIM, dim=1).store(k_rope)
     k = kv_smem.permute([1, 0]).load(k_layout)
@@ -416,6 +510,7 @@ def _process_segment(
     HEAD_SIZE: gl.constexpr,
     BLOCK_M: gl.constexpr,
     BLOCK_K: gl.constexpr,
+    NOPE_CHUNK: gl.constexpr,
     HEAD_ALIGNED: gl.constexpr,
     UNIFORM: gl.constexpr,
     USE_BUFFER_LOAD: gl.constexpr,
@@ -434,7 +529,7 @@ def _process_segment(
     if IS_FP8:
         n_full = (hi_full - lo) // BLOCK_K
         if n_full > 0:
-            kn, kr, vld = _gd_fp8(
+            kn, ks, kr, vld = _gd_fp8(
                 cache_ptr,
                 cache_bf16_ptr,
                 indices_ptr,
@@ -455,7 +550,7 @@ def _process_segment(
                 FP8_FNUZ,
             )
             for i in range(1, n_full):
-                kn2, kr2, vld2 = _gd_fp8(
+                kn2, ks2, kr2, vld2 = _gd_fp8(
                     cache_ptr,
                     cache_bf16_ptr,
                     indices_ptr,
@@ -477,6 +572,7 @@ def _process_segment(
                 )
                 m_i, l_i, acc = _qkpv_fp8(
                     kn,
+                    ks,
                     kr,
                     vld,
                     q_dot,
@@ -496,13 +592,16 @@ def _process_segment(
                     HEAD_SIZE,
                     BLOCK_M,
                     BLOCK_K,
+                    NOPE_CHUNK,
                     HEAD_ALIGNED,
                     UNIFORM,
+                    FP8_FNUZ,
                     HAS_INVALID,
                 )
-                kn, kr, vld = kn2, kr2, vld2
+                kn, ks, kr, vld = kn2, ks2, kr2, vld2
             m_i, l_i, acc = _qkpv_fp8(
                 kn,
+                ks,
                 kr,
                 vld,
                 q_dot,
@@ -522,8 +621,10 @@ def _process_segment(
                 HEAD_SIZE,
                 BLOCK_M,
                 BLOCK_K,
+                NOPE_CHUNK,
                 HEAD_ALIGNED,
                 UNIFORM,
+                FP8_FNUZ,
                 HAS_INVALID,
             )
     else:
@@ -562,6 +663,7 @@ def _process_segment(
                 HEAD_SIZE,
                 BLOCK_M,
                 BLOCK_K,
+                NOPE_CHUNK,
                 HEAD_ALIGNED,
                 False,
                 UNIFORM,
@@ -605,6 +707,7 @@ def _process_segment(
             HEAD_SIZE,
             BLOCK_M,
             BLOCK_K,
+            NOPE_CHUNK,
             HEAD_ALIGNED,
             True,
             UNIFORM,
@@ -668,6 +771,12 @@ def _pa_decode_sparse(
     HEAD_ALIGNED: gl.constexpr,
     MFMA_K: gl.constexpr,
     UNIFORM: gl.constexpr,
+    # Experiment knobs (driver reads AITER_PA_DECODE_* env vars; defaults = prior
+    # behaviour). GATHER_W0: put the NoPE gather's warps on dim 0 (rows) instead of
+    # dim 1 (columns).
+    GATHER_W0: gl.constexpr,
+    # NOPE_CHUNK: width of one dequant piece (HEAD_SIZE = one shot, prior behaviour).
+    NOPE_CHUNK: gl.constexpr,
     # Per-cache buffer/global gate. buffer_load carries a 32-bit offset, so a cache
     # whose span exceeds that must gather via 64-bit gl.load -- but the two caches
     # are sized independently (SWA window vs full compressed history), so gating
@@ -717,10 +826,17 @@ def _pa_decode_sparse(
 
     # 16 uint8 = 128-bit fp8 gather loads
     GSPT: gl.constexpr = 16
+    # Warps on dim 1 (columns) vs dim 0 (rows). Coalescing is identical either way
+    # -- a row's 128 contiguous bytes always come from 8 threads -- but the row
+    # index vector lives in SliceLayout(1, gather_l), so warps-on-dim-1 replicates
+    # it across all NUM_WARPS and every lane carries BLOCK_K/8 slots, while
+    # warps-on-dim-0 carries BLOCK_K/(8*NUM_WARPS). Dim 0 also makes the column
+    # direction a pure per-lane register repeat, so a chunked dequant can split it
+    # with a trivial (register-renaming) layout convert.
     gather_l: gl.constexpr = gl.BlockedLayout(
         size_per_thread=[1, GSPT],
         threads_per_warp=[8, 8],
-        warps_per_cta=[1, NUM_WARPS],
+        warps_per_cta=[NUM_WARPS, 1] if GATHER_W0 else [1, NUM_WARPS],
         order=[1, 0],
     )
     # Warps tile dim 0 here, one warp already covers all 64 RoPE columns, so putting
@@ -815,6 +931,7 @@ def _pa_decode_sparse(
         HEAD_SIZE,
         BLOCK_M,
         BLOCK_K,
+        NOPE_CHUNK,
         HEAD_ALIGNED,
         UNIFORM,
         MAIN_USE_BUFFER_LOAD,
@@ -860,6 +977,7 @@ def _pa_decode_sparse(
             HEAD_SIZE,
             BLOCK_M,
             BLOCK_K,
+            NOPE_CHUNK,
             HEAD_ALIGNED,
             UNIFORM,
             EXTRA_USE_BUFFER_LOAD,
@@ -949,15 +1067,26 @@ def _pa_decode_sparse_reduce(
     """Split-KV combine: merge the per-split partials, fold the attn sink, and write
     the final output. Partials store m in the base-2 exponent domain (row-max *
     softmax_scale * log2e), matching the triton reduce. Grid: (num_queries, heads_blocks).
+
+    BLOCK_M is the reduce's own head tile and is deliberately decoupled from the
+    attention kernel's: the combine is pure bandwidth over
+    [num_queries, num_heads, HEAD_SIZE] f32, so the only thing that matters is
+    having enough workgroups to cover the machine. At BLOCK_M = num_heads there is
+    one workgroup per query -- 64 of them on a 256-CU part, i.e. 3/4 of the GPU
+    idle and one wave to hide every partial-load latency behind.
     """
     NUM_WARPS: gl.constexpr = gl.num_warps()
     RCP_LN2: gl.constexpr = 1.4426950408889634
     query_idx = gl.program_id(0)
     pid_h = gl.program_id(1)
 
+    # One warp covers [BLOCK_M, 64//BLOCK_M * 8] -- lay the 64 lanes out so a
+    # small BLOCK_M spends them on the head dim instead of idling them on rows.
+    TPW0: gl.constexpr = BLOCK_M if BLOCK_M < 8 else 8
+    TPW1: gl.constexpr = 64 // TPW0
     BLK: gl.constexpr = gl.BlockedLayout(
         size_per_thread=[1, 8],
-        threads_per_warp=[8, 8],
+        threads_per_warp=[TPW0, TPW1],
         warps_per_cta=[1, NUM_WARPS],
         order=[1, 0],
     )

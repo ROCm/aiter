@@ -267,6 +267,9 @@ def pa_decode_sparse(
     # mismatches between 2D (m/l) and 3D (acc) loads.
     reduce_num_warps = 1 if use_gluon else 4
     reduce_waves_per_eu = 4 if use_gluon else 1
+    _rw = _os.environ.get("AITER_PA_DECODE_REDUCE_WARPS")
+    if _rw and use_gluon:
+        reduce_num_warps = int(_rw)
     USE_EXP2 = True
 
     # Infer KV_SPLITS from inputs when caller doesn't override.
@@ -508,7 +511,9 @@ def _pa_decode_sparse_gfx950_gluon(
 
     # Tuned launch config (gfx950 / MI355), inlined. BLOCK_M = heads per MFMA M-tile;
     # BLOCK_K = KV tile; num_warps = BLOCK_K // 16 (warps tile the dot-N, MFMA N=16).
-    BLOCK_M, BLOCK_K, MFMA_K, waves_per_eu = 16, 64, 16, 0
+    # waves_per_eu=2 caps the allocator at 256 unified VGPRs, the 2 waves/SIMD
+    # threshold on gfx950's 512-VGPR file. Reachable only with the chunked dequant.
+    BLOCK_M, BLOCK_K, MFMA_K, waves_per_eu = 16, 64, 16, 2
     # AITER_PA_DECODE_BLOCK_K: experiment override for the KV tile width.
     # num_warps stays BLOCK_K//16 (warps tile the dot-N, MFMA N=16).
     import os as _os
@@ -521,6 +526,9 @@ def _pa_decode_sparse_gfx950_gluon(
     if _mk:
         MFMA_K = int(_mk)
     num_warps = max(1, BLOCK_K // 16)
+    # AITER_PA_DECODE_GATHER_W0: NoPE gather warps on dim 0 (rows) instead of dim 1.
+    GATHER_W0 = _os.environ.get("AITER_PA_DECODE_GATHER_W0", "1") == "1"
+    # AITER_PA_DECODE_NOPE_CHUNK: width of one fp8 dequant piece (0/unset = one shot).
     NOPE_DIM, ROPE_DIM = 448, 64
     MAX_BYTES = 2**31 - 1
 
@@ -614,7 +622,11 @@ def _pa_decode_sparse_gfx950_gluon(
     heads_blocks = (num_heads + BLOCK_M - 1) // BLOCK_M
     out = torch.empty_like(q, dtype=torch.bfloat16)
 
-    if kv_splits is not None:
+    # AITER_PA_DECODE_SPLITS: experiment override for the split-K count.
+    _sp = _os.environ.get("AITER_PA_DECODE_SPLITS")
+    if _sp:
+        num_splits = max(1, int(_sp))
+    elif kv_splits is not None:
         num_splits = max(1, int(kv_splits))
     else:
         num_splits = _decode_num_splits(
@@ -640,6 +652,16 @@ def _pa_decode_sparse_gfx950_gluon(
     else:
         part_m = part_l = part_acc = out  # unused placeholders (never dereferenced)
         pm_stride0 = pm_stride_s = pa_stride0 = pa_stride_s = pa_stride_h = 0
+
+    # 128 is the narrowest piece the gather layout can split to for free (below
+    # that a split falls inside a thread's 16-byte run, which Triton rejects).
+    _nc = _os.environ.get("AITER_PA_DECODE_NOPE_CHUNK")
+    nope_chunk = int(_nc) if _nc else min(128, head_dim)
+    # AITER_PA_DECODE_WPEU: amdgpu-waves-per-eu floor. 2 caps the allocator at 256
+    # unified VGPRs (the 2 waves/SIMD threshold) instead of letting it run to 512.
+    _wp = _os.environ.get("AITER_PA_DECODE_WPEU")
+    if _wp:
+        waves_per_eu = int(_wp)
 
     grid = (num_queries, num_splits, heads_blocks)
     _pa_decode_sparse_gfx950[grid](
@@ -688,6 +710,8 @@ def _pa_decode_sparse_gfx950_gluon(
         HEAD_ALIGNED=HEAD_ALIGNED,
         MFMA_K=MFMA_K,
         UNIFORM=UNIFORM,
+        GATHER_W0=GATHER_W0,
+        NOPE_CHUNK=nope_chunk,
         MAIN_USE_BUFFER_LOAD=main_use_buffer_load,
         EXTRA_USE_BUFFER_LOAD=extra_use_buffer_load,
         HAS_INVALID=has_invalid,
@@ -701,7 +725,20 @@ def _pa_decode_sparse_gfx950_gluon(
     if skip_reduce:
         return part_acc, part_m, part_l
 
-    rgrid = (num_queries, heads_blocks)
+    # The combine is pure bandwidth over [num_queries, num_heads, head_dim] f32,
+    # so size its head tile for workgroup count, not for the attention kernel's
+    # BLOCK_M: at BLOCK_M=num_heads there is one workgroup per query (64 on a
+    # 256-CU part). One head per workgroup gives num_queries*num_heads of them and
+    # enough concurrent waves to hide the partial-load latency.
+    red_block_m = 1
+    _rbm = _os.environ.get("AITER_PA_DECODE_REDUCE_BLOCK_M")
+    if _rbm:
+        red_block_m = int(_rbm)
+    red_warps = 1
+    _rw = _os.environ.get("AITER_PA_DECODE_REDUCE_WARPS")
+    if _rw:
+        red_warps = int(_rw)
+    rgrid = (num_queries, (num_heads + red_block_m - 1) // red_block_m)
     _pa_decode_sparse_reduce_gfx950[rgrid](
         part_m,
         part_l,
@@ -718,9 +755,9 @@ def _pa_decode_sparse_gfx950_gluon(
         num_heads,
         HAS_SINK=has_sink,
         HEAD_SIZE=head_dim,
-        BLOCK_M=BLOCK_M,
+        BLOCK_M=red_block_m,
         NUM_SPLITS=num_splits,
-        HEAD_ALIGNED=HEAD_ALIGNED,
-        num_warps=4,
+        HEAD_ALIGNED=num_heads % red_block_m == 0,
+        num_warps=red_warps,
     )
     return out
