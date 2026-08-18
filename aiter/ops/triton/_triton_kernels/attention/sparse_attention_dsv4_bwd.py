@@ -7,7 +7,7 @@
     ``delta = rowsum(O * dO)`` -- the standard flash-attention "o_dot_do" preamble. Streams the
     bf16 inputs and accumulates in fp32, so it moves exactly the working set.
 
-``_bwd_dkv_gather_acc_v4`` + ``build_inverted_topk_fast``
+``_bwd_dkv_gather_acc_v4`` + ``build_inverted_topk``
     Reduce ``interm[t, slot, :]`` into ``dkv[kv_row, :]`` over the top-k mapping. The scatter is
     inverted into a CSR gather (each output KV row collects its own contributors), so no atomics
     are needed. ``BLOCK_E`` entries are carried per loop iteration, which both widens the load
@@ -118,30 +118,34 @@ def _bwd_dkv_gather_acc_v4(
     tl.store(dKV_acc_ptr + acc_base + offs_d, acc)
 
 
-def build_inverted_topk_fast(topk_indices_slice, num_kv):
-    """CSR inverted index over ``num_kv`` KV rows. Bit-identical to the reference below.
+def build_inverted_topk(topk_indices_slice, num_kv):
+    """CSR inverted index over ``num_kv`` KV rows.
 
     One stable sort yields both the permutation (``inv_data``) and the sorted keys;
     ``inv_ptr[k] = searchsorted(sorted, k, 'left')`` = the number of entries with value < k,
     which is exactly what ``cumsum(bincount(flat+1))`` computes. Invalid (-1) entries sort to
     the front, so ``inv_ptr[0]`` starts past them and they are never visited.
 
-    Two things make this ~3x faster than the reference:
+    Two details carry most of the cost, and the obvious formulation gets both wrong -- writing
+    this as ``bincount`` + ``cumsum`` over int64 keys measured 3x slower for the same output:
       * the sort key is narrowed to int16 when ``num_kv`` fits, so the radix sort makes 2
         byte-passes instead of 8;
-      * ``searchsorted`` replaces the separate ``bincount`` + ``cumsum`` passes.
+      * ``searchsorted`` does the job of the separate ``bincount`` + ``cumsum`` passes.
 
     Returns ``inv_ptr[num_kv+1]`` int32, ``inv_data[T*R]`` int32.
     """
+    # row_ids is the searchsorted query: [0 .. num_kv], one per KV row plus the end sentinel.
+    # Its dtype must match `keys` -- searchsorted is built per branch for that reason, not by
+    # accident.
     flat_kv = topk_indices_slice.reshape(-1)  # [T*R] int32; -1 = invalid
     if num_kv < 32767:  # int16 range, -1 included
         keys = flat_kv.to(torch.int16)
-        ar = torch.arange(num_kv + 1, device=flat_kv.device, dtype=torch.int16)
+        row_ids = torch.arange(num_kv + 1, device=flat_kv.device, dtype=torch.int16)
     else:
         keys = flat_kv.to(torch.int32)
-        ar = torch.arange(num_kv + 1, device=flat_kv.device, dtype=torch.int32)
+        row_ids = torch.arange(num_kv + 1, device=flat_kv.device, dtype=torch.int32)
     sorted_vals, inv_data = torch.sort(keys, stable=True)
-    inv_ptr = torch.searchsorted(sorted_vals, ar).to(torch.int32)
+    inv_ptr = torch.searchsorted(sorted_vals, row_ids).to(torch.int32)
     return inv_ptr, inv_data.to(torch.int32)
 
 

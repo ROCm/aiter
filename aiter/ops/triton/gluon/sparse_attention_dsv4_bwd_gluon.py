@@ -13,7 +13,7 @@ softmax denominator only, ``topk == -1`` masked):
     is read from LDS once and feeds both the ``S`` and ``dP`` MFMAs. Also emits the ``dS`` / ``P``
     chunks the dKV-interm kernel consumes.
 
-``_dkv_interm_v4_bd_kernel``
+``_dkv_interm_v4_kernel``
     ``interm[t, slot, d] = sum_h ( dS[t,h,slot]*Q[t,h,d] + P[t,h,slot]*dO[t,h,d] )``, contracting
     over ALL heads inside one MFMA pair so nothing accumulates across a loop over heads. Q and dO
     are transposed once into registers and D is split across ``grid.y``, which is what keeps them
@@ -392,7 +392,7 @@ def sparse_mla_bwd_dq_gluon(
 
 
 @gluon.jit
-def _dkv_interm_v4_bd_kernel(
+def _dkv_interm_v4_kernel(
     Q_ptr,  # [T, H, D] bf16
     dO_ptr,  # [T, H, D] bf16
     dS_ptr,  # [T, H, R_CHUNK] bf16
@@ -607,7 +607,7 @@ def _dkv_interm_v4_bd_kernel(
         )
 
 
-def sparse_mla_bwd_dkv_interm_v4_bd(
+def sparse_mla_bwd_dkv_interm_v4(
     q,
     do,
     chunk_dS,
@@ -624,11 +624,10 @@ def sparse_mla_bwd_dkv_interm_v4_bd(
 ):
     """V4 dKV-interm, Q/dO read once. Returns interm [T, R_CHUNK, D] bf16.
 
-    Defaults measured at T=4096 H=128 topk=512 (MI355X): 1.170 ms vs 1.631 for
-    ``dkv_interm_v4`` = 1.39x. Sweep notes:
+    Defaults measured at T=4096 H=128 topk=512 on gfx950 (MI355X): 1.170 ms. Sweep notes:
       * BD=256 beats 128 (traffic: dS/P costs D/BD x).
-      * MFMA_K=32 is worth ~14% at the best config -- it did NOT matter in the old kernel,
-        which was bandwidth-saturated; it does here.
+      * MFMA_K=32 is worth ~14% at the best config. It only pays once the kernel is off the
+        bandwidth ceiling, which is what splitting D across grid.y buys.
       * PREFETCH=0: prefetching dS/P helps at BD=128 but is consistently WORSE at BD=256
         (1.181 -> 1.306), where the extra live registers cost occupancy.
       * DUAL_STAGE=1 (both prologue copies behind one drain) is a small consistent win.
@@ -639,7 +638,7 @@ def sparse_mla_bwd_dkv_interm_v4_bd(
     h_pow2 = H_POW2 or triton.next_power_of_2(H)
     if interm is None:
         interm = torch.empty(T, R_CHUNK, D, dtype=torch.bfloat16, device=q.device)
-    _dkv_interm_v4_bd_kernel[(T, D // BD)](
+    _dkv_interm_v4_kernel[(T, D // BD)](
         q,
         do,
         chunk_dS,

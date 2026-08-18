@@ -40,12 +40,12 @@ delta 0.178 / dQ 1.391 / interm 1.152 / CSR build 0.130 / gather 0.503 / d_sink 
 import torch
 
 from aiter.ops.triton._triton_kernels.attention.sparse_attention_dsv4_bwd import (
-    build_inverted_topk_fast,
+    build_inverted_topk,
     delta_v4,
     dkv_gather_acc,
 )
 from aiter.ops.triton.gluon.sparse_attention_dsv4_bwd_gluon import (
-    sparse_mla_bwd_dkv_interm_v4_bd as _dkv_interm_gluon,
+    sparse_mla_bwd_dkv_interm_v4 as _dkv_interm_gluon,
 )
 from aiter.ops.triton.gluon.sparse_attention_dsv4_bwd_gluon import (
     sparse_mla_bwd_dq_gluon as _dq_gluon,
@@ -150,7 +150,7 @@ def sparse_mla_bwd_dsv4(
         _dkv_interm_gluon(
             q, do, chunk_dS, chunk_P, R_CHUNK, BD=_BD_DKV, TILE_K=tk_dkv, interm=interm
         )
-        inv_ptr, inv_data = build_inverted_topk_fast(
+        inv_ptr, inv_data = build_inverted_topk(
             topk_indices[:, r : r + R_CHUNK], num_kv
         )
         dkv_gather_acc(interm, inv_ptr, inv_data, dkv_acc)
