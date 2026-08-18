@@ -49,11 +49,6 @@ on:
         required: false
         type: string
         default: "1,8,16,32,64,128,256"
-      sglang_disaggregation_waiting_timeout:
-        description: "Seconds to wait for disaggregation KV transfer completion"
-        required: false
-        type: string
-        default: "600"
       run_accuracy:
         description: "Run the GSM8K correctness gate before the perf sweep"
         required: false
@@ -149,10 +144,9 @@ jobs:
               "SLURM_PARTITION_OVERRIDE": value("slurm_partition", "SLURM_PARTITION_DEFAULT"),
               "SLURM_EXCLUSIVE_OVERRIDE": value("slurm_exclusive", "SLURM_EXCLUSIVE_DEFAULT"),
               "CONC_LIST": value("conc_list", "CONC_LIST_DEFAULT"),
-              "SGLANG_DISAGGREGATION_WAITING_TIMEOUT": value(
-                  "sglang_disaggregation_waiting_timeout",
-                  "SGLANG_DISAGGREGATION_WAITING_TIMEOUT_DEFAULT",
-              ),
+              "SGLANG_DISAGGREGATION_WAITING_TIMEOUT": os.environ[
+                  "SGLANG_DISAGGREGATION_WAITING_TIMEOUT_DEFAULT"
+              ],
               "RUN_ACCURACY": value("run_accuracy", "RUN_ACCURACY_DEFAULT"),
               "TIME_LIMIT_OVERRIDE": value("time_limit", "TIME_LIMIT_DEFAULT"),
           }
