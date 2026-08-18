@@ -8,9 +8,9 @@
 #          file and fans each row out over legal BV / snapshot / state /
 #          g_head_major (x state-pool indices where applicable).
 #
-# Adding a model means adding a row here first; run
-# ``op_tests/op_benchmarks/triton/tune_gated_delta_rule_bv.py`` separately to
-# produce winners for ``chunk_gdn_h_mfma16_hip_tuned.csv``.
+# Adding a model means adding a row here first; run the K5 BV tune script
+# separately to produce winners for
+# ``aiter/configs/chunk_gdn_h_mfma16_hip_tuned.csv``.
 #
 # Columns
 #   model             free-form name, diagnostics only

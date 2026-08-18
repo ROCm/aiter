@@ -24,10 +24,10 @@ Two compiled products live behind K5 and this module builds both:
     which is what ``use_chunk_flydsl=True`` in
     ``chunk_gated_delta_rule_fwd_opt_vk`` actually dispatches. Without it the
     first prefill of every process pays ~2.3s of JIT (~0.1-0.3s even with a
-    warm disk cache). AOT reads ``chunk_gdn_h_mfma16_hip_untuned.csv`` (GEMM
-    untuned-style shape list); runtime BV lookup reads
-    ``chunk_gdn_h_mfma16_hip_tuned.csv`` separately. See
-    ``parse_csv_mfma16_hip``.
+    warm disk cache). AOT reads ``aiter/configs/chunk_gdn_h_mfma16_hip_untuned.csv``
+    (untuned-style shape list); runtime BV lookup reads
+    ``aiter/configs/chunk_gdn_h_mfma16_hip_tuned.csv`` via ``AITER_CONFIGS``.
+    See ``parse_csv_mfma16_hip``.
 
 Usage:
     # Compile both kernels from their default tables
@@ -79,6 +79,7 @@ from aiter.aot.flydsl.common import (
     override_env,
     run_jobs_parallel,
 )
+from aiter.jit.core import AITER_ROOT_DIR
 from aiter.ops.flydsl.kernels.chunk_gated_delta_h import compile_chunk_gated_delta_h
 from aiter.ops.flydsl.kernels.chunk_gated_delta_h_mfma16x16x16 import (
     compile_chunk_gated_delta_h_mfma16_hip,
@@ -108,13 +109,11 @@ _TORCH_DTYPE = {
 # mfma16_hip fork
 # --------------------------------------------------------------------------
 
-# Untuned shape list for AOT (GEMM-style); runtime BV lookup uses the separate
-# ``chunk_gdn_h_mfma16_hip_tuned.csv`` next to the kernel host wrapper.
+# Untuned shape list for AOT (``aiter/configs/chunk_gdn_h_mfma16_hip_untuned.csv``);
+# runtime BV lookup uses ``aiter/configs/chunk_gdn_h_mfma16_hip_tuned.csv`` via
+# ``AITER_CONFIGS``.
 _DEFAULT_CSV_MFMA16_HIP = (
-    Path(__file__).resolve().parents[2]
-    / "ops"
-    / "flydsl"
-    / "chunk_gdn_h_mfma16_hip_untuned.csv"
+    Path(f"{AITER_ROOT_DIR}/aiter/configs/chunk_gdn_h_mfma16_hip_untuned.csv")
 )
 DEFAULT_CSVS_MFMA16_HIP = [str(_DEFAULT_CSV_MFMA16_HIP)]
 # Used only when a csv row leaves ``arch`` empty and neither ARCH/GPU_ARCHS nor

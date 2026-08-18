@@ -150,6 +150,11 @@ AITER_CONFIG_GEMM_BF16 = os.getenv(
     f"{AITER_ROOT_DIR}/aiter/configs/bf16_tuned_gemm.csv",
 )
 
+AITER_CONFIG_GDN_K5_MFMA16_HIP = os.getenv(
+    "AITER_CONFIG_GDN_K5_MFMA16_HIP",
+    f"{AITER_ROOT_DIR}/aiter/configs/chunk_gdn_h_mfma16_hip_tuned.csv",
+)
+
 
 class AITER_CONFIG:
     @property
@@ -224,6 +229,14 @@ class AITER_CONFIG:
     def AITER_CONFIG_GEMM_BF16_FILE(self):
         return self.get_config_file(
             "AITER_CONFIG_GEMM_BF16", AITER_CONFIG_GEMM_BF16, "bf16_tuned_gemm"
+        )
+
+    @property
+    def AITER_CONFIG_GDN_K5_MFMA16_HIP_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_GDN_K5_MFMA16_HIP",
+            AITER_CONFIG_GDN_K5_MFMA16_HIP,
+            "chunk_gdn_h_mfma16_hip_tuned",
         )
 
     @property

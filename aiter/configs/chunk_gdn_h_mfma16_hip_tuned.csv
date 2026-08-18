@@ -8,11 +8,11 @@
 #            state_bf16, total_chunks, max_seq_chunks). A miss falls back to
 #            the _hipeq_select_bv CU/LDS rule, so partial coverage is fine.
 #
-# AOT compile coverage lives in ``chunk_gdn_h_mfma16_hip_untuned.csv``. Add new
-# model shapes there first, then run
-# ``op_tests/op_benchmarks/triton/tune_gated_delta_rule_bv.py`` and merge the
-# measured rows here after review. Do not append tune output directly to this
-# file; write to /tmp and merge manually (GEMM-style workflow).
+# AOT compile coverage lives in
+# ``aiter/configs/chunk_gdn_h_mfma16_hip_untuned.csv``. Add new model shapes
+# there first, then run the K5 BV tune script and merge the measured rows here
+# after review. Do not append tune output directly to this file; write to /tmp
+# and merge manually.
 #
 # Columns
 #   model             free-form name, diagnostics only

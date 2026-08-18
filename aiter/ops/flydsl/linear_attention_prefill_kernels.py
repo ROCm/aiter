@@ -28,6 +28,7 @@ import torch
 import triton
 from flydsl.runtime.device import get_rocm_arch
 
+from aiter.jit.core import AITER_CONFIGS
 from ..triton._triton_kernels.gated_delta_rule.utils import (
     GatedDeltaRulePrefillMetadata,
     build_gated_delta_rule_prefill_metadata,
@@ -675,12 +676,13 @@ _MFMA16_HIP_MIN_FLYDSL_VERSION = "0.2.0"
 _GFX_ARCH = get_rocm_arch().split(":")[0]
 _IS_GFX942 = _GFX_ARCH.startswith("gfx942")
 
-# Offline-measured BV winners (``chunk_gdn_h_mfma16_hip_tuned.csv``), consulted
-# before the CU/LDS rule below. AOT compile shapes live in the separate untuned
-# table. See the csv headers for the schema and how to extend them.
-_BV_TUNED_CSV = os.path.join(
-    os.path.dirname(__file__), "chunk_gdn_h_mfma16_hip_tuned.csv"
-)
+# Offline-measured BV winners (``aiter/configs/chunk_gdn_h_mfma16_hip_tuned.csv``),
+# resolved via ``AITER_CONFIGS`` (supports env override and model_configs merge).
+# AOT compile shapes live in the separate untuned table.
+
+
+def _bv_tuned_csv_path() -> str:
+    return AITER_CONFIGS.AITER_CONFIG_GDN_K5_MFMA16_HIP_FILE
 
 
 def _load_tuned_bv_table() -> dict[tuple, int]:
@@ -692,7 +694,7 @@ def _load_tuned_bv_table() -> dict[tuple, int]:
     """
     table: dict[tuple, int] = {}
     try:
-        with open(_BV_TUNED_CSV, "r", encoding="utf-8", newline="") as f:
+        with open(_bv_tuned_csv_path(), "r", encoding="utf-8", newline="") as f:
             rows = csv.DictReader(
                 line for line in f if not line.lstrip().startswith("#")
             )
