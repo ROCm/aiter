@@ -186,10 +186,59 @@ def _split_ax(x, AXIS: gl.constexpr):
     return a, b
 
 
+# fp8 (e4m3 OCP) x E8M0 -> bf16, one instruction per 2 elements. $0 takes the low two
+# fp8 bytes of the 32-bit source, $1 the high two via op_sel. "=&v" (early clobber) is
+# load-bearing: without it the allocator may give an output the same VGPR as the scale
+# input, and the first convert then clobbers the scale before the second reads it --
+# silently wrong in exactly the elements $1 produces.
+_DEQ_ASM: gl.constexpr = gl.constexpr(
+    "v_cvt_scalef32_pk_bf16_fp8 $0, $2, $3\n"
+    "v_cvt_scalef32_pk_bf16_fp8 $1, $2, $3 op_sel:[1,0,0]"
+)
+# $0 must be early-clobber: the second convert re-reads $2/$3 after $0 is written,
+# so an output sharing a register with an input would read a clobbered scale. $1 is
+# written last, after every read, so it may alias an input -- one more reuse for the
+# allocator. 4 constraints, not 5: an i16 scale packs into one register where an f32
+# scale took two ($4 was never named).
+_DEQ_CONS: gl.constexpr = gl.constexpr("=&v,=v,v,v")
+
+
+@gluon.jit
+def _deq_asm(x16, e_u8, W8: gl.constexpr, out_l: gl.constexpr):
+    """[BLOCK_K, W8/2] int16 (4 packed fp8 per 32 bits) + raw E8M0 byte -> [BLOCK_K, W8] bf16.
+
+    The scale operand is read as E8M0 -- the hardware takes bits [30:23] and nothing
+    else. Those are bits [14:7] of the operand's high half, so a 16-bit `e << 7` in
+    both halves of the register puts the exponent exactly where an f32 `e << 23`
+    would, and an i16 operand costs ONE register at pack=2 where f32 cost two.
+    Converting to f32 with exp2 also works but is a longer chain for nothing. Because the scale is a power of two this is bit-identical to the f32
+    chain: fp8 -> bf16 is exact (3 mantissa bits into 8) and scaling by 2^k stays exact.
+    """
+    lo, hi = gl.inline_asm_elementwise(
+        _DEQ_ASM,
+        _DEQ_CONS,
+        [x16, (e_u8.to(gl.uint16) << 7)],
+        dtype=(gl.bfloat16, gl.bfloat16),
+        is_pure=True,
+        pack=2,
+    )
+    # lo carries fp8 elements 4i+{0,1} and hi 4i+{2,3}, so the flat order is
+    # 4i + 2*lohi + s. A lane's 8 int16 are the same 16-byte run the u8 gather used,
+    # so this whole interleave stays inside one lane -- assert_trivial proves it.
+    W16: gl.constexpr = W8 // 2
+    lo3 = lo.reshape(lo.shape[0], W16 // 2, 2)
+    hi3 = hi.reshape(hi.shape[0], W16 // 2, 2)
+    both = gl.join(lo3, hi3).permute(0, 1, 3, 2).reshape(lo.shape[0], W8)
+    # Back to the byte-gather layout, or the kv_smem store sees the join/permute layout
+    # and lowers to narrow ds_writes (112 ds_write_b128 -> 28, and ~1.5x slower).
+    return gl.convert_layout(both, out_l, assert_trivial=True)
+
+
 @gluon.jit
 def _deq_store(
     x_u8, sc, kv_smem, off,
     AXIS: gl.constexpr, UNIFORM: gl.constexpr, FP8_FNUZ: gl.constexpr,
+    ASM_DEQ: gl.constexpr, gather_l: gl.constexpr,
 ):
     """Dequant one fp8 slab and write it straight to kv_smem[:, off:off+W].
 
@@ -197,15 +246,30 @@ def _deq_store(
     an emulated mul and doubles the loop. ``sc`` is the raw per-64-group exponent
     byte (packed fp8_ds_mla, UE8M0) or an f32 scale (uniform pool).
     """
-    if UNIFORM:
-        scale = sc
+    if ASM_DEQ:
+        # x_u8 is the int16 view here (see _gd_fp8), so its column count is W8/2.
+        W8: gl.constexpr = x_u8.shape[1] * 2
+        # Adjacent fp8 columns share a scale (groups are 64 wide, so even), which makes
+        # dropping every other broadcast column exact.
+        s_even, _ = gl.split(sc.reshape(sc.shape[0], sc.shape[1] // 2, 2))
+        # split leaves a SliceLayout of a 3-D parent; the asm needs both operands in
+        # the int16 gather's own layout.
+        s_even = gl.convert_layout(s_even, x_u8.type.layout)
+        val = _deq_asm(x_u8.to(gl.int16, bitcast=True), s_even, W8, gather_l)
+        if AXIS == 1:
+            kv_smem.slice(off, W8, dim=1).store(val)
+        else:
+            kv_smem.slice(off, x_u8.shape[0], dim=0).store(val)
     else:
-        scale = gl.exp2(sc.to(gl.float32) - 127.0)
-    val = (_fp8_to_f32(x_u8, FP8_FNUZ) * scale).to(gl.bfloat16)
-    if AXIS == 1:
-        kv_smem.slice(off, x_u8.shape[1], dim=1).store(val)
-    else:
-        kv_smem.slice(off, x_u8.shape[0], dim=0).store(val)
+        if UNIFORM:
+            scale = sc
+        else:
+            scale = gl.exp2(sc.to(gl.float32) - 127.0)
+        val = (_fp8_to_f32(x_u8, FP8_FNUZ) * scale).to(gl.bfloat16)
+        if AXIS == 1:
+            kv_smem.slice(off, x_u8.shape[1], dim=1).store(val)
+        else:
+            kv_smem.slice(off, x_u8.shape[0], dim=0).store(val)
 
 
 @gluon.jit
@@ -215,6 +279,8 @@ def _deq_store_tile(
     kv_smem,
     NOPE_CHUNK: gl.constexpr,
     AXIS: gl.constexpr,
+    ASM_DEQ: gl.constexpr,
+    gather_l: gl.constexpr,
     UNIFORM: gl.constexpr,
     FP8_FNUZ: gl.constexpr,
 ):
@@ -229,14 +295,14 @@ def _deq_store_tile(
     """
     W: gl.constexpr = x_u8.shape[1] if AXIS == 1 else x_u8.shape[0]
     if NOPE_CHUNK >= W:
-        _deq_store(x_u8, sc, kv_smem, 0, AXIS, UNIFORM, FP8_FNUZ)
+        _deq_store(x_u8, sc, kv_smem, 0, AXIS, UNIFORM, FP8_FNUZ, ASM_DEQ, gather_l)
     else:
         x0, x1 = _split_ax(x_u8, AXIS)
         s0, s1 = _split_ax(sc, AXIS)
         W2: gl.constexpr = W // 2
         if NOPE_CHUNK >= W2:
-            _deq_store(x0, s0, kv_smem, 0, AXIS, UNIFORM, FP8_FNUZ)
-            _deq_store(x1, s1, kv_smem, W2, AXIS, UNIFORM, FP8_FNUZ)
+            _deq_store(x0, s0, kv_smem, 0, AXIS, UNIFORM, FP8_FNUZ, ASM_DEQ, gather_l)
+            _deq_store(x1, s1, kv_smem, W2, AXIS, UNIFORM, FP8_FNUZ, ASM_DEQ, gather_l)
         else:
             x00, x01 = _split_ax(x0, AXIS)
             s00, s01 = _split_ax(s0, AXIS)
@@ -244,28 +310,28 @@ def _deq_store_tile(
             s10, s11 = _split_ax(s1, AXIS)
             W4: gl.constexpr = W // 4
             if NOPE_CHUNK >= W4:
-                _deq_store(x00, s00, kv_smem, 0, AXIS, UNIFORM, FP8_FNUZ)
-                _deq_store(x01, s01, kv_smem, W4, AXIS, UNIFORM, FP8_FNUZ)
-                _deq_store(x10, s10, kv_smem, 2 * W4, AXIS, UNIFORM, FP8_FNUZ)
-                _deq_store(x11, s11, kv_smem, 3 * W4, AXIS, UNIFORM, FP8_FNUZ)
+                _deq_store(x00, s00, kv_smem, 0, AXIS, UNIFORM, FP8_FNUZ, ASM_DEQ, gather_l)
+                _deq_store(x01, s01, kv_smem, W4, AXIS, UNIFORM, FP8_FNUZ, ASM_DEQ, gather_l)
+                _deq_store(x10, s10, kv_smem, 2 * W4, AXIS, UNIFORM, FP8_FNUZ, ASM_DEQ, gather_l)
+                _deq_store(x11, s11, kv_smem, 3 * W4, AXIS, UNIFORM, FP8_FNUZ, ASM_DEQ, gather_l)
             else:
                 W8: gl.constexpr = W // 8
                 y0, y1 = _split_ax(x00, AXIS)
                 t0, t1 = _split_ax(s00, AXIS)
-                _deq_store(y0, t0, kv_smem, 0, AXIS, UNIFORM, FP8_FNUZ)
-                _deq_store(y1, t1, kv_smem, W8, AXIS, UNIFORM, FP8_FNUZ)
+                _deq_store(y0, t0, kv_smem, 0, AXIS, UNIFORM, FP8_FNUZ, ASM_DEQ, gather_l)
+                _deq_store(y1, t1, kv_smem, W8, AXIS, UNIFORM, FP8_FNUZ, ASM_DEQ, gather_l)
                 y0, y1 = _split_ax(x01, AXIS)
                 t0, t1 = _split_ax(s01, AXIS)
-                _deq_store(y0, t0, kv_smem, 2 * W8, AXIS, UNIFORM, FP8_FNUZ)
-                _deq_store(y1, t1, kv_smem, 3 * W8, AXIS, UNIFORM, FP8_FNUZ)
+                _deq_store(y0, t0, kv_smem, 2 * W8, AXIS, UNIFORM, FP8_FNUZ, ASM_DEQ, gather_l)
+                _deq_store(y1, t1, kv_smem, 3 * W8, AXIS, UNIFORM, FP8_FNUZ, ASM_DEQ, gather_l)
                 y0, y1 = _split_ax(x10, AXIS)
                 t0, t1 = _split_ax(s10, AXIS)
-                _deq_store(y0, t0, kv_smem, 4 * W8, AXIS, UNIFORM, FP8_FNUZ)
-                _deq_store(y1, t1, kv_smem, 5 * W8, AXIS, UNIFORM, FP8_FNUZ)
+                _deq_store(y0, t0, kv_smem, 4 * W8, AXIS, UNIFORM, FP8_FNUZ, ASM_DEQ, gather_l)
+                _deq_store(y1, t1, kv_smem, 5 * W8, AXIS, UNIFORM, FP8_FNUZ, ASM_DEQ, gather_l)
                 y0, y1 = _split_ax(x11, AXIS)
                 t0, t1 = _split_ax(s11, AXIS)
-                _deq_store(y0, t0, kv_smem, 6 * W8, AXIS, UNIFORM, FP8_FNUZ)
-                _deq_store(y1, t1, kv_smem, 7 * W8, AXIS, UNIFORM, FP8_FNUZ)
+                _deq_store(y0, t0, kv_smem, 6 * W8, AXIS, UNIFORM, FP8_FNUZ, ASM_DEQ, gather_l)
+                _deq_store(y1, t1, kv_smem, 7 * W8, AXIS, UNIFORM, FP8_FNUZ, ASM_DEQ, gather_l)
 
 
 @gluon.jit
@@ -328,6 +394,7 @@ def _decode_tile(
     qk_scale,
     kv_smem,
     offs_full,
+    offs_full16,
     offs_rope,
     k_rng_slot,
     k_rng_rope,
@@ -338,6 +405,7 @@ def _decode_tile(
     p_layout: gl.constexpr,
     gather_l: gl.constexpr,
     gather_rope_l: gl.constexpr,
+    gather16_l: gl.constexpr,
     scl_l: gl.constexpr,
     NARROW_SCALE: gl.constexpr,
     IS_FP8: gl.constexpr,
@@ -349,6 +417,7 @@ def _decode_tile(
     BLOCK_K: gl.constexpr,
     NOPE_CHUNK: gl.constexpr,
     CHUNK_AXIS: gl.constexpr,
+    ASM_DEQ: gl.constexpr,
     HEAD_ALIGNED: gl.constexpr,
     MASKED: gl.constexpr,
     UNIFORM: gl.constexpr,
@@ -402,7 +471,7 @@ def _decode_tile(
         else:
             x_u8 = _cache_load(cache_ptr, kv_row, offs_full, USE_BUFFER_LOAD)
             sc = _cache_load(cache_bf16_ptr, scl_row, scl_col, USE_BUFFER_LOAD)
-        _deq_store_tile(x_u8, sc, kv_smem, NOPE_CHUNK, CHUNK_AXIS, True, FP8_FNUZ)
+        _deq_store_tile(x_u8, sc, kv_smem, NOPE_CHUNK, CHUNK_AXIS, ASM_DEQ, gather_l, True, FP8_FNUZ)
     elif IS_FP8:
         # DSv4 packed fp8_ds_mla: NoPE fp8 + embedded UE8M0 + separate RoPE-bf16.
         nope_row = block_idx_g * cs0 + pos_g * 576
@@ -419,10 +488,25 @@ def _decode_tile(
                     cache_ptr, scl_row, scl_col, USE_BUFFER_LOAD,
                     mask=valid_g[:, None], other=127,
                 )
-            x_u8 = _cache_load(
-                cache_ptr, nope_row, offs_full, USE_BUFFER_LOAD,
-                mask=valid_g[:, None], other=0,
-            )
+            if ASM_DEQ:
+                # Same byte as nope_row, addressed in 2-byte units: one shift on a
+                # live vector, and block_idx_g * cs0 stays common with the scale
+                # gather.  Exact -- cs0 and 576 are both even.
+                row16 = gl.convert_layout(
+                    nope_row >> 1, gl.SliceLayout(1, gather16_l)
+                )
+                x_u8 = _cache_load(
+                    cache_bf16_ptr, row16, offs_full16, USE_BUFFER_LOAD,
+                    mask=gl.convert_layout(
+                        valid1d, gl.SliceLayout(1, gather16_l)
+                    )[:, None],
+                    other=0.0,
+                )
+            else:
+                x_u8 = _cache_load(
+                    cache_ptr, nope_row, offs_full, USE_BUFFER_LOAD,
+                    mask=valid_g[:, None], other=0,
+                )
         else:
             if NARROW_SCALE and not USE_BUFFER_LOAD:
                 exps = _scale_load(
@@ -431,8 +515,19 @@ def _decode_tile(
                 )
             else:
                 exps = _cache_load(cache_ptr, scl_row, scl_col, USE_BUFFER_LOAD)
-            x_u8 = _cache_load(cache_ptr, nope_row, offs_full, USE_BUFFER_LOAD)
-        _deq_store_tile(x_u8, exps, kv_smem, NOPE_CHUNK, CHUNK_AXIS, False, FP8_FNUZ)
+            if ASM_DEQ:
+                # Same byte as nope_row, addressed in 2-byte units: one shift on a
+                # live vector, and block_idx_g * cs0 stays common with the scale
+                # gather.  Exact -- cs0 and 576 are both even.
+                row16 = gl.convert_layout(
+                    nope_row >> 1, gl.SliceLayout(1, gather16_l)
+                )
+                x_u8 = _cache_load(
+                    cache_bf16_ptr, row16, offs_full16, USE_BUFFER_LOAD
+                )
+            else:
+                x_u8 = _cache_load(cache_ptr, nope_row, offs_full, USE_BUFFER_LOAD)
+        _deq_store_tile(x_u8, exps, kv_smem, NOPE_CHUNK, CHUNK_AXIS, ASM_DEQ, gather_l, False, FP8_FNUZ)
         block_idx_gr, pos_gr, valid_gr = _slots(
             indices_ptr,
             seg_start,
@@ -521,13 +616,16 @@ def _gd_fp8(
     k_start,
     cs0,
     offs_full,
+    offs_full16,
     offs_rope,
     k_rng_slot,
     k_rng_rope,
     gather_l: gl.constexpr,
     gather_rope_l: gl.constexpr,
+    gather16_l: gl.constexpr,
     scl_l: gl.constexpr,
     NARROW_SCALE: gl.constexpr,
+    ASM_DEQ: gl.constexpr,
     BLOCK_SIZE: gl.constexpr,
     HEAD_SIZE: gl.constexpr,
     UNIFORM: gl.constexpr,
@@ -579,7 +677,22 @@ def _gd_fp8(
             )
         else:
             sc = _cache_load(cache_ptr, scl_row, offs_full // 64, USE_BUFFER_LOAD)
-        x_u8 = _cache_load(cache_ptr, nope_row, offs_full, USE_BUFFER_LOAD)
+        if ASM_DEQ:
+            # 2-byte elements so the asm gets <2 x i16> = 4 packed fp8 in one VGPR out
+            # of a single dword load. Same bytes, same 16-B per-lane run, half the
+            # columns; cache_bf16_ptr is already the 2-byte view of this cache and the
+            # RoPE gather below uses the same cs0//2 / *288 addressing.
+            # The row vector comes from _slots in SliceLayout(1, gather_l); the i16
+            # columns live in gather16_l, and a broadcast needs one parent layout. The
+            # two layouts share their dim-0 tiling, so this convert is a rename.
+            row16 = gl.convert_layout(
+                nope_row >> 1, gl.SliceLayout(1, gather16_l)
+            )
+            x_u8 = _cache_load(
+                cache_bf16_ptr, row16, offs_full16, USE_BUFFER_LOAD
+            )
+        else:
+            x_u8 = _cache_load(cache_ptr, nope_row, offs_full, USE_BUFFER_LOAD)
         bgr, pgr, _ = _slots(
             indices_ptr,
             seg_start,
@@ -615,6 +728,7 @@ def _qkpv_fp8(
     k_layout: gl.constexpr,
     v_layout: gl.constexpr,
     p_layout: gl.constexpr,
+    gather_l: gl.constexpr,
     NOPE_DIM: gl.constexpr,
     ROPE_DIM: gl.constexpr,
     HEAD_SIZE: gl.constexpr,
@@ -622,6 +736,7 @@ def _qkpv_fp8(
     BLOCK_K: gl.constexpr,
     NOPE_CHUNK: gl.constexpr,
     CHUNK_AXIS: gl.constexpr,
+    ASM_DEQ: gl.constexpr,
     HEAD_ALIGNED: gl.constexpr,
     UNIFORM: gl.constexpr,
     FP8_FNUZ: gl.constexpr,
@@ -631,7 +746,7 @@ def _qkpv_fp8(
     skips the RoPE slice-store (the whole head is one fp8 tile). When HAS_INVALID,
     mask the columns of -1-sentinel slots (``valid`` from _gd_fp8) to -inf."""
     neg_inf = float("-inf")
-    _deq_store_tile(x_u8, sc, kv_smem, NOPE_CHUNK, CHUNK_AXIS, UNIFORM, FP8_FNUZ)
+    _deq_store_tile(x_u8, sc, kv_smem, NOPE_CHUNK, CHUNK_AXIS, ASM_DEQ, gather_l, UNIFORM, FP8_FNUZ)
     if not UNIFORM:
         kv_smem.slice(NOPE_DIM, ROPE_DIM, dim=1).store(k_rope)
     k = kv_smem.permute([1, 0]).load(k_layout)
@@ -691,6 +806,7 @@ def _process_segment(
     p_layout: gl.constexpr,
     gather_l: gl.constexpr,
     gather_rope_l: gl.constexpr,
+    gather16_l: gl.constexpr,
     scl_l: gl.constexpr,
     NARROW_SCALE: gl.constexpr,
     slot_l: gl.constexpr,
@@ -703,6 +819,7 @@ def _process_segment(
     BLOCK_K: gl.constexpr,
     NOPE_CHUNK: gl.constexpr,
     CHUNK_AXIS: gl.constexpr,
+    ASM_DEQ: gl.constexpr,
     HEAD_ALIGNED: gl.constexpr,
     UNIFORM: gl.constexpr,
     USE_BUFFER_LOAD: gl.constexpr,
@@ -711,6 +828,8 @@ def _process_segment(
     FP8_FNUZ: gl.constexpr,
 ):
     offs_full = gl.arange(0, HEAD_SIZE, layout=gl.SliceLayout(0, gather_l))
+    # int16 column offsets for the asm dequant's 2-byte gather (half the columns).
+    offs_full16 = gl.arange(0, HEAD_SIZE // 2, layout=gl.SliceLayout(0, gather16_l))
     offs_rope = gl.arange(0, ROPE_DIM, layout=gl.SliceLayout(0, gather_rope_l))
     k_rng_slot = gl.arange(0, BLOCK_K, layout=slot_l)
     k_rng_rope = gl.arange(0, BLOCK_K, layout=gl.SliceLayout(1, gather_rope_l))
@@ -730,13 +849,16 @@ def _process_segment(
                 lo,
                 cs0,
                 offs_full,
+                offs_full16,
                 offs_rope,
                 k_rng_slot,
                 k_rng_rope,
                 gather_l,
                 gather_rope_l,
+                gather16_l,
                 scl_l,
                 NARROW_SCALE,
+                ASM_DEQ,
                 BLOCK_SIZE,
                 HEAD_SIZE,
                 UNIFORM,
@@ -754,13 +876,16 @@ def _process_segment(
                     lo + i * BLOCK_K,
                     cs0,
                     offs_full,
+                    offs_full16,
                     offs_rope,
                     k_rng_slot,
                     k_rng_rope,
                     gather_l,
                     gather_rope_l,
+                    gather16_l,
                     scl_l,
                     NARROW_SCALE,
+                    ASM_DEQ,
                     BLOCK_SIZE,
                     HEAD_SIZE,
                     UNIFORM,
@@ -786,6 +911,7 @@ def _process_segment(
                     k_layout,
                     v_layout,
                     p_layout,
+                    gather_l,
                     NOPE_DIM,
                     ROPE_DIM,
                     HEAD_SIZE,
@@ -793,6 +919,7 @@ def _process_segment(
                     BLOCK_K,
                     NOPE_CHUNK,
                     CHUNK_AXIS,
+                    ASM_DEQ,
                     HEAD_ALIGNED,
                     UNIFORM,
                     FP8_FNUZ,
@@ -816,6 +943,7 @@ def _process_segment(
                 k_layout,
                 v_layout,
                 p_layout,
+                gather_l,
                 NOPE_DIM,
                 ROPE_DIM,
                 HEAD_SIZE,
@@ -823,6 +951,7 @@ def _process_segment(
                 BLOCK_K,
                 NOPE_CHUNK,
                 CHUNK_AXIS,
+                ASM_DEQ,
                 HEAD_ALIGNED,
                 UNIFORM,
                 FP8_FNUZ,
@@ -847,6 +976,7 @@ def _process_segment(
                 qk_scale,
                 kv_smem,
                 offs_full,
+                offs_full16,
                 offs_rope,
                 k_rng_slot,
                 k_rng_rope,
@@ -857,6 +987,7 @@ def _process_segment(
                 p_layout,
                 gather_l,
                 gather_rope_l,
+                gather16_l,
                 scl_l,
                 NARROW_SCALE,
                 IS_FP8,
@@ -868,6 +999,7 @@ def _process_segment(
                 BLOCK_K,
                 NOPE_CHUNK,
                 CHUNK_AXIS,
+                ASM_DEQ,
                 HEAD_ALIGNED,
                 False,
                 UNIFORM,
@@ -895,6 +1027,7 @@ def _process_segment(
             qk_scale,
             kv_smem,
             offs_full,
+            offs_full16,
             offs_rope,
             k_rng_slot,
             k_rng_rope,
@@ -905,6 +1038,7 @@ def _process_segment(
             p_layout,
             gather_l,
             gather_rope_l,
+            gather16_l,
             scl_l,
             NARROW_SCALE,
             IS_FP8,
@@ -916,6 +1050,7 @@ def _process_segment(
             BLOCK_K,
             NOPE_CHUNK,
             CHUNK_AXIS,
+            ASM_DEQ,
             HEAD_ALIGNED,
             True,
             UNIFORM,
@@ -998,6 +1133,7 @@ def _pa_decode_sparse(
     MAIN_SPLITS: gl.constexpr,
     # ADAPTIVE_SPLITS: re-decide the useful split count per query at runtime.
     ADAPTIVE_SPLITS: gl.constexpr,
+    ASM_DEQ: gl.constexpr,
     # Per-cache buffer/global gate. buffer_load carries a 32-bit offset, so a cache
     # whose span exceeds that must gather via 64-bit gl.load -- but the two caches
     # are sized independently (SWA window vs full compressed history), so gating
@@ -1102,6 +1238,14 @@ def _pa_decode_sparse(
         order=[2, 1, 0],
     )
     scl_l: gl.constexpr = gl.SliceLayout(2, scl_l3)
+    # Same tiling as gather_l but 2-byte elements: half the per-thread run, so a lane
+    # still covers the same 16 bytes and the lo/hi interleave stays lane-local.
+    gather16_l: gl.constexpr = gl.BlockedLayout(
+        size_per_thread=[1, GSPT // 2],
+        threads_per_warp=[64 // GATHER_TW1, GATHER_TW1],
+        warps_per_cta=[NUM_WARPS, 1],
+        order=[1, 0],
+    )
     slot_l: gl.constexpr = gl.SliceLayout(1, gather_l)
     blocked_q: gl.constexpr = gl.BlockedLayout(
         size_per_thread=[1, 8],
@@ -1236,6 +1380,7 @@ def _pa_decode_sparse(
         p_layout,
         gather_l,
         gather_rope_l,
+        gather16_l,
         scl_l,
         NARROW_SCALE,
         slot_l,
@@ -1248,6 +1393,7 @@ def _pa_decode_sparse(
         BLOCK_K,
         NOPE_CHUNK,
         CHUNK_AXIS,
+        ASM_DEQ,
         HEAD_ALIGNED,
         UNIFORM,
         MAIN_USE_BUFFER_LOAD,
@@ -1283,6 +1429,7 @@ def _pa_decode_sparse(
             p_layout,
             gather_l,
             gather_rope_l,
+            gather16_l,
             scl_l,
             NARROW_SCALE,
             slot_l,
@@ -1295,6 +1442,7 @@ def _pa_decode_sparse(
             BLOCK_K,
             NOPE_CHUNK,
             CHUNK_AXIS,
+            ASM_DEQ,
             HEAD_ALIGNED,
             UNIFORM,
             EXTRA_USE_BUFFER_LOAD,

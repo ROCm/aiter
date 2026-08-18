@@ -708,18 +708,49 @@ def _pa_decode_sparse_gfx950_gluon(
 
     # AITER_PA_DECODE_SPLITS: experiment override for the split-K count.
     _sp = _os.environ.get("AITER_PA_DECODE_SPLITS")
-    if _sp:
-        num_splits = max(1, int(_sp))
-    elif kv_splits is not None:
-        num_splits = max(1, int(kv_splits))
-    elif _os.environ.get("AITER_PA_DECODE_SPLIT_POLICY", "occ") == "occ":
-        num_splits = _decode_num_splits_occ(
-            num_queries, heads_blocks, avg_main, avg_extra, BLOCK_K
-        )
-    else:
-        num_splits = _decode_num_splits(
-            num_queries, heads_blocks, avg_main, avg_extra, BLOCK_K
-        )
+
+    def _pick_splits(hb):
+        if _sp:
+            return max(1, int(_sp))
+        if kv_splits is not None:
+            return max(1, int(kv_splits))
+        if _os.environ.get("AITER_PA_DECODE_SPLIT_POLICY", "occ") == "occ":
+            return _decode_num_splits_occ(
+                num_queries, hb, avg_main, avg_extra, BLOCK_K
+            )
+        return _decode_num_splits(num_queries, hb, avg_main, avg_extra, BLOCK_K)
+
+    num_splits = _pick_splits(heads_blocks)
+
+    # Short top-k is latency- and coverage-bound rather than throughput-bound: at
+    # <= 2 KV tiles per query the whole launch is a few dozen workgroups on a
+    # 256-CU part, so the win is MORE programs, not fatter ones. Halving BLOCK_M
+    # doubles heads_blocks, which is real parallelism -- unlike a finer split-K,
+    # which hands every split a partial tile (1.14-1.36x worse when forced). Both
+    # gates matter: measured 2-5% better at every concurrency on top-k 8/64, and
+    # 1.06-1.22x WORSE on top-k 272/1024, where the halved MFMA M dominates.
+    _tiles = max(
+        math.ceil(avg_main / BLOCK_K) if avg_main > 0 else 1,
+        math.ceil(avg_extra / BLOCK_K) if avg_extra > 0 else 1,
+    )
+    if (
+        _bm is None
+        and BLOCK_M == 16
+        and num_heads % 8 == 0
+        and _tiles <= 2
+        and num_queries * heads_blocks * num_splits <= get_num_sms()
+    ):
+        _hb8 = (num_heads + 7) // 8
+        _ns8 = _pick_splits(_hb8)
+        # Doubling heads_blocks can push the launch past one workgroup per CU, and
+        # the split policy then answers with fewer splits. At C=128 short top-k that
+        # is 2 -> 1: split-K disappears and the shape goes 0.94x -> 1.11x. Take the
+        # halving only when it costs neither a split nor the occupancy property.
+        if _ns8 >= num_splits and num_queries * _hb8 * _ns8 <= get_num_sms():
+            BLOCK_M = 8
+            HEAD_ALIGNED = num_heads % BLOCK_M == 0
+            heads_blocks = _hb8
+            num_splits = _ns8
 
     if num_splits > 1:
         part_m = torch.empty(
@@ -780,6 +811,16 @@ def _pa_decode_sparse_gfx950_gluon(
     # register picture moves.
     if chunk_axis == 0 or nope_chunk < head_dim:
         waves_per_eu = 2
+    # num_warps is 4 -- one wave per SIMD per workgroup -- so the second occupancy
+    # slot exists only if a CU gets a second workgroup. When the entire launch is at
+    # most one workgroup per CU it cannot, and the 2-waves/EU register cap is then
+    # pure loss: it spills ~29 dwords across the per-tile softmax row-max reduction
+    # and buys no overlap. Measured on the main kernel at C in {4,16,32,64,128} x
+    # top-k in {64,272,1024}: 1 wave/EU + ASM_DEQ is 0.927-0.953x at every shape with
+    # launch <= CU, and 1.19-1.43x *worse* at every shape above it.
+    one_wg_per_cu = num_queries * heads_blocks * num_splits <= get_num_sms()
+    if one_wg_per_cu:
+        waves_per_eu = 1
     _wp = _os.environ.get("AITER_PA_DECODE_WPEU")
     if _wp:
         waves_per_eu = int(_wp)
@@ -799,6 +840,20 @@ def _pa_decode_sparse_gfx950_gluon(
     adaptive_splits = (
         num_splits > 1
         and _os.environ.get("AITER_PA_DECODE_ADAPTIVE", "1") == "1"
+    )
+
+    # AITER_PA_DECODE_ASM_DEQ: fuse the fp8 x E8M0 dequant into
+    # v_cvt_scalef32_pk_bf16_fp8 via inline asm. gfx950 only, packed OCP fp8 only
+    # (UNIFORM scales are f32 and FNUZ is a different encoding), and bit-identical
+    # there because the scale is a power of two.
+    # Default follows the occupancy decision: the fused convert is a shorter
+    # dependent chain but a wider live range, so it pays only where the extra
+    # registers are free (see one_wg_per_cu). 0/1 forces it either way.
+    asm_deq = (
+        _os.environ.get("AITER_PA_DECODE_ASM_DEQ", "1" if one_wg_per_cu else "0") == "1"
+        and not UNIFORM
+        and not fp8_fnuz
+        and main_is_fp8
     )
 
     grid = (num_queries, num_splits, heads_blocks)
@@ -855,6 +910,7 @@ def _pa_decode_sparse_gfx950_gluon(
         PART_STORE_CACHE=_os.environ.get('AITER_PA_DECODE_PART_ST', ''),
         MAIN_SPLITS=main_splits,
         ADAPTIVE_SPLITS=adaptive_splits,
+        ASM_DEQ=asm_deq,
         MAIN_USE_BUFFER_LOAD=main_use_buffer_load,
         EXTRA_USE_BUFFER_LOAD=extra_use_buffer_load,
         IDX_BUFFER_LOAD=idx_use_buffer_load,
