@@ -1322,7 +1322,8 @@ def _pa_decode_sparse(
             acc = acc * alpha[:, None]
         else:
             l_final = l_pv
-        out = acc / l_final[:, None]
+        one_over_l = 1.0 / l_final
+        out = acc * one_over_l[:, None]
         offs_d_o = gl.arange(0, HEAD_SIZE, layout=gl.SliceLayout(0, pv_layout))
         o_off = (
             query_idx * out_stride0 + h_pv[:, None] * out_stride1 + offs_d_o[None, :]
@@ -1490,7 +1491,11 @@ def _pa_decode_sparse_reduce(
         ).to(gl.float32)
         l_final = l_final + gl.exp2(sink * RCP_LN2 - m_final)
 
-    out = acc / l_final[:, None]
+    # One reciprocal per row, then a broadcast multiply: an f32 divide lowers to a
+    # ~10-instruction sequence, so dividing the whole [BLOCK_M, HEAD_SIZE] tile costs
+    # that per element.
+    one_over_l = 1.0 / l_final
+    out = acc * one_over_l[:, None]
     o_off = (query_idx * out_stride0 + h[:, None] * out_stride1 + offs_d[None, :]).to(
         gl.int32
     )
