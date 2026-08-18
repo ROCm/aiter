@@ -1,22 +1,24 @@
+import math
+
 import torch
 import triton
-import math
+
 from aiter.ops.triton.gemm.basic.gemm_a16w8_blockscale import (
     gemm_a16w8_blockscale,
     gemm_a16w8_blockscale_preshuffle,
 )
-from op_tests.triton_tests.gemm.basic.test_gemm_a16w8_blockscale import (
-    generate_gemm_a16w8_blockscale_inputs,
-)
 from op_tests.op_benchmarks.triton.utils.argparse import (
-    get_parser,
     add_argparse_ff,
     get_ff_args,
+    get_parser,
 )
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    get_caller_name_no_ext,
     get_shape_benchmark_object,
     print_vgpr,
-    get_caller_name_no_ext,
+)
+from op_tests.triton_tests.gemm.basic.test_gemm_a16w8_blockscale import (
+    generate_gemm_a16w8_blockscale_inputs,
 )
 
 block_shape = (128, 128)
@@ -106,7 +108,7 @@ def main(args=None):
     parsed_args, defaults = parse_args(args=args)
     if parsed_args.print_vgpr:
         print("Retrieving VGPR usage for Triton kernels...")
-        fun = lambda: run_benchmark(parsed_args, defaults)  # noqa: E731
+        fun = lambda: run_benchmark(parsed_args, defaults)
         print_vgpr(fun, get_caller_name_no_ext())
         return
     run_benchmark(parsed_args, defaults)

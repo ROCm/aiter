@@ -3,7 +3,6 @@
 #pragma once
 
 #include "../opus_moe_stage2_utils_gfx950.cuh"
-#include "opus_moe_pipeline_stage2_a8w4_decode_generic_gfx950.cuh"
 #include "opus_moe_pipeline_stage2_a8w4_decode_policy_gfx950.cuh"
 
 #include "opus/opus.hpp"
@@ -113,6 +112,29 @@ inline __device__ void opus_moe_stage2_a8w4_decode_make_tile(
     col_base = tile_n_id * BN;
 }
 
+template<typename T, int ScalePair, int Mi, typename Fn>
+inline __device__ void opus_moe_stage2_a8w4_decode_with_a_selector(
+    int route_base,
+    int wave_id_m,
+    const Fn& run)
+{
+    constexpr int a_sel_base = ScalePair * 2;
+    if constexpr(T::M_MFMA_PER_WAVE == 1)
+    {
+        const int a_half = T::T_M == 1
+                               ? ((route_base / T::MMA_M) & 1)
+                               : wave_id_m;
+        if(a_half == 0)
+            run(opus::number<a_sel_base>{});
+        else
+            run(opus::number<a_sel_base + 1>{});
+    }
+    else
+    {
+        run(opus::number<a_sel_base + (Mi & 1)>{});
+    }
+}
+
 template<typename T>
 inline __device__ bool opus_moe_stage2_a8w4_decode_load_route_metadata(
     const opus_moe_stage2_a8w4_kargs& kargs,
@@ -121,8 +143,7 @@ inline __device__ bool opus_moe_stage2_a8w4_decode_load_route_metadata(
     int tid,
     int32_t* __restrict__ smem_a_base,
     int32_t* __restrict__ smem_route_base,
-    float* __restrict__ smem_weight,
-    bool& full_route_tile)
+    float* __restrict__ smem_weight)
 {
     const int token_num = kargs.token_num;
     const int topk = kargs.topk;
@@ -141,9 +162,12 @@ inline __device__ bool opus_moe_stage2_a8w4_decode_load_route_metadata(
             const bool valid_route = token < token_num && slot < topk;
             if(valid_route)
             {
-                a_base = static_cast<int32_t>(
-                    static_cast<int64_t>(token) * kargs.stride_a_t +
-                    static_cast<int64_t>(slot) * kargs.stride_a_k);
+                a_base = kargs.stride_a_k == 0
+                             ? static_cast<int32_t>(
+                                   static_cast<int64_t>(row) * kargs.stride_a_t)
+                             : static_cast<int32_t>(
+                                   static_cast<int64_t>(token) * kargs.stride_a_t +
+                                   static_cast<int64_t>(slot) * kargs.stride_a_k);
                 weight = (kargs.sorted_weights == nullptr) ? 1.0f : kargs.sorted_weights[row];
                 if constexpr(T::DIRECT_ATOMIC_OUT)
                     route_row = static_cast<int32_t>(token);
@@ -159,25 +183,246 @@ inline __device__ bool opus_moe_stage2_a8w4_decode_load_route_metadata(
     }
     if constexpr(T::DIRECT_ATOMIC_OUT)
     {
-        full_route_tile = false;
+        if(route_base + T::B_M <= sorted_rows)
+        {
+            __syncthreads();
+            return true;
+        }
         return __syncthreads_or(has_route) != 0;
     }
     else
     {
-        if constexpr(T::IS_BM32_BN256)
+        if constexpr(T::IS_BM32_BN256 || T::IS_BM64_BN256)
         {
-            // Fast path for full sorted tiles. Store-side route_row guards are
-            // still kept so malformed metadata cannot write a negative route row.
+            // Full sorted tiles do not need a route-count reduction.
             if(route_base + T::B_M <= sorted_rows)
             {
                 __syncthreads();
-                full_route_tile = true;
                 return true;
             }
         }
         const int route_count = __syncthreads_count(has_route);
-        full_route_tile = route_count == T::B_M;
         return route_count != 0;
+    }
+}
+
+// Runtime-K pipeline with a fixed-size LDS ring and compile-time slot indices.
+template<typename T,
+         typename IssueAPayload,
+         typename WaitAPayload,
+         typename LoadBScale,
+         typename LoadAScale,
+         typename ComputeTile>
+inline __device__ void opus_moe_stage2_a8w4_decode_run_k_pipeline_gfx950(
+    int k_tiles,
+    int col_base,
+    int b_payload_row_stride_bytes,
+    IssueAPayload& issue_a_payload,
+    WaitAPayload& wait_a_payload,
+    LoadBScale& load_b_scale,
+    LoadAScale& load_a_scale,
+    ComputeTile& compute_tile)
+{
+    using namespace opus;
+
+    static_assert(T::A_LDS_STAGES == 2 * T::PAIR_SLOTS);
+    constexpr int TILES_PER_CHUNK = T::A_LDS_STAGES;
+    constexpr int B_TILE_BYTE_STEP =
+        T::K_STEP_PACKED * T::B_PAYLOAD_K_STRIDE_BYTES;
+
+    // Seed the guaranteed first K pair, then predicate optional ring slots.
+    issue_a_payload(0_I, 0);
+    issue_a_payload(1_I, T::K_STEP_PACKED);
+    if constexpr(T::A_LDS_STAGES == 4)
+    {
+        if(k_tiles > 2)
+        {
+            issue_a_payload(2_I, 2 * T::K_STEP_PACKED);
+            if(k_tiles > 3)
+                issue_a_payload(3_I, 3 * T::K_STEP_PACKED);
+        }
+    }
+
+    // Drain directly when K fits the ring and no slot is reused.
+    if(__builtin_expect(k_tiles <= TILES_PER_CHUNK, 1))
+    {
+        const int first_b_tile_base = col_base * b_payload_row_stride_bytes;
+        static_for<T::PAIR_SLOTS>([&](auto pair_slot) {
+            constexpr int EvenStage = 2 * pair_slot.value;
+            constexpr int OddStage = EvenStage + 1;
+            if(k_tiles <= EvenStage)
+                return;
+
+            int b_scale[T::HALF_N_MFMA_PER_WAVE];
+            int a_scale[T::M_MFMA_PER_WAVE];
+            constexpr int ScaleWordBase =
+                pair_slot.value * T::SCALE_WORDS_PER_GROUP_PACK;
+            if constexpr(T::OVERLAP_SHORT_A_STAGES && pair_slot.value == 0)
+            {
+                constexpr int PendingAStageLoads =
+                    (T::A_LDS_STAGES - 1) * T::M_MFMA_PER_WAVE;
+                if(k_tiles < TILES_PER_CHUNK)
+                    wait_a_payload(0_I);
+                else
+                    wait_a_payload(number<PendingAStageLoads>{});
+            }
+            load_b_scale(ScaleWordBase, b_scale);
+            load_a_scale(ScaleWordBase, a_scale);
+            if constexpr(pair_slot.value == 0 && !T::OVERLAP_SHORT_A_STAGES)
+            {
+                constexpr int PendingScaleLoads =
+                    T::HALF_N_MFMA_PER_WAVE + T::M_MFMA_PER_WAVE;
+                wait_a_payload(number<PendingScaleLoads>{});
+            }
+
+            compute_tile(0_I,
+                         number<pair_slot.value == 0>{},
+                         0_I,
+                         number<EvenStage>{},
+                         first_b_tile_base + EvenStage * B_TILE_BYTE_STEP,
+                         b_scale,
+                         a_scale);
+            if constexpr(T::OVERLAP_SHORT_A_STAGES && pair_slot.value == 0)
+                wait_a_payload(0_I);
+            if(k_tiles > OddStage)
+            {
+                compute_tile(1_I,
+                             0_I,
+                             0_I,
+                             number<OddStage>{},
+                             first_b_tile_base + OddStage * B_TILE_BYTE_STEP,
+                             b_scale,
+                             a_scale);
+            }
+        });
+        return;
+    }
+
+    if constexpr(T::STEADY_PAIR_SLOTS == 1)
+    {
+        const int pair_count = (k_tiles + 1) / 2;
+        int b_tile_base = col_base * b_payload_row_stride_bytes;
+        int scale_word_base = 0;
+        #pragma unroll 1
+        for(int pair = 0; pair < pair_count;
+            ++pair,
+            b_tile_base += 2 * B_TILE_BYTE_STEP,
+            scale_word_base += T::SCALE_WORDS_PER_GROUP_PACK)
+        {
+            int b_scale[T::HALF_N_MFMA_PER_WAVE];
+            int a_scale[T::M_MFMA_PER_WAVE];
+            load_b_scale(scale_word_base, b_scale);
+            load_a_scale(scale_word_base, a_scale);
+            constexpr int PendingScaleLoads =
+                T::HALF_N_MFMA_PER_WAVE + T::M_MFMA_PER_WAVE;
+            wait_a_payload(number<PendingScaleLoads>{});
+
+            compute_tile(0_I, 0_I, 0_I, 0_I, b_tile_base, b_scale, a_scale);
+            const int next_even_tile = 2 * pair + 2;
+            if(next_even_tile < k_tiles)
+            {
+                __builtin_amdgcn_s_barrier();
+                issue_a_payload(0_I, next_even_tile * T::K_STEP_PACKED);
+            }
+
+            const int odd_tile = 2 * pair + 1;
+            if(odd_tile < k_tiles)
+            {
+                compute_tile(1_I,
+                             0_I,
+                             0_I,
+                             1_I,
+                             b_tile_base + B_TILE_BYTE_STEP,
+                             b_scale,
+                             a_scale);
+                const int next_odd_tile = next_even_tile + 1;
+                if(next_odd_tile < k_tiles)
+                {
+                    __builtin_amdgcn_s_barrier();
+                    issue_a_payload(1_I, next_odd_tile * T::K_STEP_PACKED);
+                }
+            }
+        }
+    }
+    else
+    {
+        int chunk_tile_base = 0;
+        int chunk_k_base = 0;
+        int chunk_b_tile_base = col_base * b_payload_row_stride_bytes;
+        int chunk_scale_word_base = 0;
+
+        #pragma unroll 1
+        for(; chunk_tile_base < k_tiles;
+            chunk_tile_base += TILES_PER_CHUNK,
+            chunk_k_base += TILES_PER_CHUNK * T::K_STEP_PACKED,
+            chunk_b_tile_base += TILES_PER_CHUNK * B_TILE_BYTE_STEP,
+            chunk_scale_word_base +=
+                T::PAIR_SLOTS * T::SCALE_WORDS_PER_GROUP_PACK)
+        {
+            static_for<T::PAIR_SLOTS>([&](auto pair_slot) {
+                constexpr int EvenStage = 2 * pair_slot.value;
+                constexpr int OddStage = EvenStage + 1;
+                const int even_tile = chunk_tile_base + EvenStage;
+                if(even_tile >= k_tiles)
+                    return;
+
+                int b_scale[T::HALF_N_MFMA_PER_WAVE];
+                int a_scale[T::M_MFMA_PER_WAVE];
+                const int scale_word_base =
+                    chunk_scale_word_base +
+                    pair_slot.value * T::SCALE_WORDS_PER_GROUP_PACK;
+                load_b_scale(scale_word_base, b_scale);
+                load_a_scale(scale_word_base, a_scale);
+                if constexpr(pair_slot.value == 0)
+                {
+                    constexpr int PendingScaleLoads =
+                        T::HALF_N_MFMA_PER_WAVE + T::M_MFMA_PER_WAVE;
+                    wait_a_payload(number<PendingScaleLoads>{});
+                }
+
+                const int even_b_tile_base =
+                    chunk_b_tile_base + EvenStage * B_TILE_BYTE_STEP;
+                compute_tile(0_I,
+                             0_I,
+                             0_I,
+                             number<EvenStage>{},
+                             even_b_tile_base,
+                             b_scale,
+                             a_scale);
+                const int next_even_tile = even_tile + TILES_PER_CHUNK;
+                if(next_even_tile < k_tiles)
+                {
+                    __builtin_amdgcn_s_barrier();
+                    issue_a_payload(number<EvenStage>{},
+                                    chunk_k_base +
+                                        (TILES_PER_CHUNK + EvenStage) *
+                                            T::K_STEP_PACKED);
+                }
+
+                const int odd_tile = even_tile + 1;
+                if(odd_tile < k_tiles)
+                {
+                    const int odd_b_tile_base =
+                        chunk_b_tile_base + OddStage * B_TILE_BYTE_STEP;
+                    compute_tile(1_I,
+                                 0_I,
+                                 0_I,
+                                 number<OddStage>{},
+                                 odd_b_tile_base,
+                                 b_scale,
+                                 a_scale);
+                    const int next_odd_tile = odd_tile + TILES_PER_CHUNK;
+                    if(next_odd_tile < k_tiles)
+                    {
+                        __builtin_amdgcn_s_barrier();
+                        issue_a_payload(number<OddStage>{},
+                                        chunk_k_base +
+                                            (TILES_PER_CHUNK + OddStage) *
+                                                T::K_STEP_PACKED);
+                    }
+                }
+            });
+        }
     }
 }
 
@@ -216,21 +461,10 @@ inline __device__ void opus_moe_stage2_a8w4_decode_unpack_b_mfma_reg(
     reg = __builtin_bit_cast(opus::remove_cvref_t<Reg>, packed);
 }
 
-template<typename D_A, int StageElems, int... Stages>
-inline __device__ auto opus_moe_stage2_a8w4_decode_make_smem_a_stages(
-    char* smem_scratch,
-    opus::seq<Stages...>)
-{
-    return opus::make_array(
-        opus::make_smem(reinterpret_cast<D_A*>(
-            smem_scratch + Stages * StageElems * static_cast<int>(sizeof(D_A))))...);
-}
-
 template<typename T,
          typename Mma,
          typename LayoutA,
          typename LayoutASmem,
-         typename SmemA,
          typename LayoutB,
          typename GmemA,
          typename GmemAScale,
@@ -240,7 +474,7 @@ inline __device__ void opus_moe_stage2_a8w4_decode_mainloop(
     Mma& mma,
     const LayoutA& u_ga,
     const LayoutASmem& u_sa,
-    SmemA& s_a,
+    char* smem_a_scratch,
     const LayoutB& u_gb,
     GmemA& g_a,
     GmemAScale& g_a_scale,
@@ -249,9 +483,11 @@ inline __device__ void opus_moe_stage2_a8w4_decode_mainloop(
     const int32_t* __restrict__ smem_a_base,
     int route_base,
     int col_base,
+    int b_payload_row_stride_bytes,
     int wave_id_m,
     int wave_id_n,
     int scale_row_col_base,
+    const opus_moe_stage2_a8w4_kargs& kargs,
     typename Mma::vtype_c (&v_c)[T::M_MFMA_PER_WAVE][T::N_MFMA_PER_WAVE])
 {
     using namespace opus;
@@ -259,8 +495,8 @@ inline __device__ void opus_moe_stage2_a8w4_decode_mainloop(
 
     using V_A = typename Mma::mfma_type::vtype_a;
     using V_B = typename Mma::mfma_type::vtype_b;
+    using D_A = typename T::D_A;
 
-    static_assert(T::DECODE_EFFECTIVE_INTER_DIM == T::K_TILES * T::K_STEP_PACKED);
     static_assert(T::N_MFMA_PER_WAVE >= 2 && (T::N_MFMA_PER_WAVE % 2) == 0);
     using Schedule = OpusMoeStage2A8W4DecodeSchedule<T>;
     using MainloopSchedule = OpusMoeStage2A8W4DecodeMainloopSchedule;
@@ -274,6 +510,13 @@ inline __device__ void opus_moe_stage2_a8w4_decode_mainloop(
     auto sa_offset = [&](auto mi, auto half) {
         return static_cast<int>(u_sa(mi, half, 0_I));
     };
+    auto make_smem_a_stage = [&](auto stage) {
+        constexpr int Stage = decltype(stage)::value;
+        static_assert(Stage >= 0 && Stage < T::A_LDS_STAGES);
+        return opus::make_smem(reinterpret_cast<D_A*>(
+            smem_a_scratch + Stage * T::A_LDS_STAGE_ELEMS *
+                static_cast<int>(sizeof(D_A))));
+    };
 
     auto a_base_for_ga = [&](int ga) {
         const int local_m = opus_moe_stage2_a8w4_a_local_m<T>(ga);
@@ -286,12 +529,18 @@ inline __device__ void opus_moe_stage2_a8w4_decode_mainloop(
         const int ga = ga_offset(mi);
         a_base[mi.value] = a_base_for_ga(ga);
         a_scale_base_word[mi.value] =
-            opus_moe_stage2_a8w4_a_scale_base_word_offset<T>(route_base, ga_offset(mi));
+            opus_moe_stage2_a8w4_a_scale_base_word_offset<T>(
+                route_base,
+                ga,
+                kargs.a_scale_words_per_row_pack);
     });
     const int b_scale_base_word =
-        opus_moe_stage2_a8w4_b_scale_base_word_offset<T>(scale_row_col_base,
-                                                         gb_offset(0_I));
-    constexpr int b_ni_stride_bytes = T::MMA_N * T::B_PAYLOAD_ROW_STRIDE_BYTES;
+        opus_moe_stage2_a8w4_b_scale_base_word_offset<T>(
+            scale_row_col_base,
+            gb_offset(0_I),
+            wave_id_n,
+            kargs.w_scale_words_per_row_pack);
+    const int b_ni_stride_bytes = T::MMA_N * b_payload_row_stride_bytes;
     constexpr int b_lane_offset_mask = T::B_THREADGROUP_STRIDE_BYTES - 1;
     const int b_lane_offset = gb_offset(0_I) & b_lane_offset_mask;
     const int b_wave_scalar_base =
@@ -305,19 +554,30 @@ inline __device__ void opus_moe_stage2_a8w4_decode_mainloop(
             return;
 
         auto issue_one_mi = [&](auto mi) {
-            auto* smem_lo = s_a[Stage].ptr + sa_offset(mi, 0_I);
-            auto* smem_hi = s_a[Stage].ptr + sa_offset(mi, 1_I);
+            auto s_a_stage = make_smem_a_stage(stage);
+            auto* smem_lo = s_a_stage.ptr + sa_offset(mi, 0_I);
+            auto* smem_hi = s_a_stage.ptr + sa_offset(mi, 1_I);
+            if constexpr(T::IS_BM64_BN256 && T::BLOCK_SIZE == 256)
+            {
+                // Materialize BM64's lane-0 LDS base directly to avoid runtime-K address spills.
+                constexpr int HalfStrideBytes =
+                    opus::get_warp_size() * T::VEC_A * sizeof(D_A);
+                constexpr int MiStrideBytes = 2 * HalfStrideBytes;
+                smem_lo = s_a_stage.ptr + mi.value * MiStrideBytes;
+                smem_hi = smem_lo + HalfStrideBytes;
+            }
+            const int ga = ga_offset(mi);
             const int a_offset_lo = opus_moe_stage2_a8w4_a_payload_byte_offset<T>(
                 a_base[mi.value],
                 k_base,
-                ga_offset(mi));
+                ga);
             if constexpr(Schedule::Mainloop ==
                          MainloopSchedule::SplitALoadByNWave)
             {
                 if(wave_id_n == 0)
                 {
                     g_a.template async_load<T::VEC_A>(
-                        reinterpret_cast<void*>(reinterpret_cast<__UINTPTR_TYPE__>(smem_lo)),
+                        smem_lo,
                         a_offset_lo,
                         0,
                         opus::number<T::CACHECTL_A>{});
@@ -325,7 +585,7 @@ inline __device__ void opus_moe_stage2_a8w4_decode_mainloop(
                 else
                 {
                     g_a.template async_load<T::VEC_A>(
-                        reinterpret_cast<void*>(reinterpret_cast<__UINTPTR_TYPE__>(smem_hi)),
+                        smem_hi,
                         a_offset_lo + T::K_STEP_PACKED / 2,
                         0,
                         opus::number<T::CACHECTL_A>{});
@@ -334,12 +594,12 @@ inline __device__ void opus_moe_stage2_a8w4_decode_mainloop(
             else
             {
                 g_a.template async_load<T::VEC_A>(
-                    reinterpret_cast<void*>(reinterpret_cast<__UINTPTR_TYPE__>(smem_lo)),
+                    smem_lo,
                     a_offset_lo,
                     0,
                     opus::number<T::CACHECTL_A>{});
                 g_a.template async_load<T::VEC_A>(
-                    reinterpret_cast<void*>(reinterpret_cast<__UINTPTR_TYPE__>(smem_hi)),
+                    smem_hi,
                     a_offset_lo + T::K_STEP_PACKED / 2,
                     0,
                     opus::number<T::CACHECTL_A>{});
@@ -368,17 +628,22 @@ inline __device__ void opus_moe_stage2_a8w4_decode_mainloop(
         __builtin_amdgcn_s_barrier();
     };
 
-    auto load_a_payload = [&](auto stage, V_A (&v_a)[T::M_MFMA_PER_WAVE]) {
+    auto load_a_fragment = [&](auto stage, auto mi, V_A& v_a) {
         constexpr int Stage = decltype(stage)::value;
         static_assert(Stage >= 0 && Stage < T::A_LDS_STAGES);
+        auto s_a_stage = make_smem_a_stage(stage);
 
+        auto lo = s_a_stage.template load<T::VEC_A>(sa_offset(mi, 0_I));
+        auto hi = s_a_stage.template load<T::VEC_A>(sa_offset(mi, 1_I));
+        opus_moe_stage2_a8w4_decode_pack_a_mfma_reg(
+            __builtin_bit_cast(opus_moe_stage2_a8w4_decode_u32x4_t, lo),
+            __builtin_bit_cast(opus_moe_stage2_a8w4_decode_u32x4_t, hi),
+            v_a);
+    };
+
+    auto load_a_payload = [&](auto stage, V_A (&v_a)[T::M_MFMA_PER_WAVE]) {
         static_for<T::M_MFMA_PER_WAVE>([&](auto mi) {
-            auto lo = s_a[Stage].template load<T::VEC_A>(sa_offset(mi, 0_I));
-            auto hi = s_a[Stage].template load<T::VEC_A>(sa_offset(mi, 1_I));
-            opus_moe_stage2_a8w4_decode_pack_a_mfma_reg(
-                __builtin_bit_cast(opus_moe_stage2_a8w4_decode_u32x4_t, lo),
-                __builtin_bit_cast(opus_moe_stage2_a8w4_decode_u32x4_t, hi),
-                v_a[mi.value]);
+            load_a_fragment(stage, mi, v_a[mi.value]);
         });
     };
 
@@ -398,10 +663,26 @@ inline __device__ void opus_moe_stage2_a8w4_decode_mainloop(
         });
     };
 
+    auto load_b_packed_fragment = [&](auto n_half,
+                                      auto local_ni,
+                                      int tile_base) {
+        constexpr int NHalf = decltype(n_half)::value;
+        constexpr int LocalNi = decltype(local_ni)::value;
+        static_assert(NHalf == 0 || NHalf == 1);
+        static_assert(LocalNi >= 0 && LocalNi < T::HALF_N_MFMA_PER_WAVE);
+        constexpr int ni = NHalf * T::HALF_N_MFMA_PER_WAVE + LocalNi;
+        const int b_scalar_offset =
+            tile_base + b_wave_scalar_base + ni * b_ni_stride_bytes;
+        auto value = g_b.template load<T::B_BYTES_PER_VEC>(
+            b_lane_offset, b_scalar_offset, opus::number<T::CACHECTL_B>{});
+        return __builtin_bit_cast(opus_moe_stage2_a8w4_decode_u32x4_t, value);
+    };
+
     auto load_a_scale = [&](int k_group_word_base,
                             int (&a_scale)[T::M_MFMA_PER_WAVE]) {
         static_for<T::M_MFMA_PER_WAVE>([&](auto mi) {
-            const int word_offset = a_scale_base_word[mi.value] + k_group_word_base;
+            const int word_offset =
+                a_scale_base_word[mi.value] + k_group_word_base;
             const auto word = g_a_scale.template load<sizeof(uint32_t)>(
                 word_offset * static_cast<int>(sizeof(uint32_t)),
                 0,
@@ -416,7 +697,8 @@ inline __device__ void opus_moe_stage2_a8w4_decode_mainloop(
             const int word_offset = opus_moe_stage2_a8w4_b_scale_word_offset<T>(
                 b_scale_base_word,
                 k_group_word_base,
-                pair.value);
+                pair.value,
+                kargs.w_scale_words_per_row_pack);
             const auto word = g_w_scale.template load<sizeof(uint32_t)>(
                 word_offset * static_cast<int>(sizeof(uint32_t)),
                 0,
@@ -426,12 +708,15 @@ inline __device__ void opus_moe_stage2_a8w4_decode_mainloop(
     };
 
     auto compute_half = [&](auto scale_pair,
+                            auto initialize_acc,
                             auto n_half,
                             const V_A (&v_a)[T::M_MFMA_PER_WAVE],
                             const int (&a_scale)[T::M_MFMA_PER_WAVE],
                             const int (&b_scale)[T::HALF_N_MFMA_PER_WAVE],
                             const V_B (&v_b)[T::HALF_N_MFMA_PER_WAVE]) {
         constexpr int ScalePair = decltype(scale_pair)::value;
+        constexpr bool InitializeAcc =
+            decltype(initialize_acc)::value != 0;
         constexpr int NHalf = decltype(n_half)::value;
         static_assert(ScalePair == 0 || ScalePair == 1);
         static_assert(NHalf == 0 || NHalf == 1);
@@ -441,46 +726,86 @@ inline __device__ void opus_moe_stage2_a8w4_decode_mainloop(
                 constexpr int ni = NHalf * T::HALF_N_MFMA_PER_WAVE + local_ni.value;
                 constexpr int b_sel = ScalePair * 2 + (ni & 1);
                 constexpr int b_scale_index = ni / 2;
-                if constexpr(T::M_MFMA_PER_WAVE == 1 && T::T_M == 2)
-                {
-                    constexpr int a_sel_base = ScalePair * 2;
-                    if(wave_id_m == 0)
-                    {
-                        v_c[mi.value][ni] = mma(v_a[mi.value],
-                                                v_b[local_ni.value],
-                                                v_c[mi.value][ni],
-                                                a_scale[mi.value],
-                                                b_scale[b_scale_index],
-                                                number<a_sel_base>{},
-                                                number<b_sel>{});
-                    }
-                    else
-                    {
-                        v_c[mi.value][ni] = mma(v_a[mi.value],
-                                                v_b[local_ni.value],
-                                                v_c[mi.value][ni],
-                                                a_scale[mi.value],
-                                                b_scale[b_scale_index],
-                                                number<a_sel_base + 1>{},
-                                                number<b_sel>{});
-                    }
-                }
-                else
-                {
-                    constexpr int a_sel = ScalePair * 2 + (mi.value & 1);
-                    v_c[mi.value][ni] = mma(v_a[mi.value],
-                                            v_b[local_ni.value],
-                                            v_c[mi.value][ni],
-                                            a_scale[mi.value],
-                                            b_scale[b_scale_index],
-                                            number<a_sel>{},
-                                            number<b_sel>{});
-                }
+                opus_moe_stage2_a8w4_decode_with_a_selector<
+                    T, ScalePair, mi.value>(
+                    route_base, wave_id_m, [&](auto a_sel) {
+                        if constexpr(InitializeAcc)
+                        {
+                            typename Mma::vtype_c zero_acc{};
+                            v_c[mi.value][ni] = mma(v_a[mi.value],
+                                                    v_b[local_ni.value],
+                                                    zero_acc,
+                                                    a_scale[mi.value],
+                                                    b_scale[b_scale_index],
+                                                    a_sel,
+                                                    number<b_sel>{});
+                        }
+                        else
+                        {
+                            v_c[mi.value][ni] = mma(v_a[mi.value],
+                                                    v_b[local_ni.value],
+                                                    v_c[mi.value][ni],
+                                                    a_scale[mi.value],
+                                                    b_scale[b_scale_index],
+                                                    a_sel,
+                                                    number<b_sel>{});
+                        }
+                    });
             });
         });
     };
 
+    auto compute_fragment = [&](auto scale_pair,
+                                auto initialize_acc,
+                                auto n_half,
+                                auto local_ni,
+                                auto mi,
+                                const V_A& v_a,
+                                const int (&a_scale)[T::M_MFMA_PER_WAVE],
+                                const int (&b_scale)[T::HALF_N_MFMA_PER_WAVE],
+                                const V_B& v_b) {
+        constexpr int ScalePair = decltype(scale_pair)::value;
+        constexpr bool InitializeAcc =
+            decltype(initialize_acc)::value != 0;
+        constexpr int NHalf = decltype(n_half)::value;
+        constexpr int LocalNi = decltype(local_ni)::value;
+        constexpr int Mi = decltype(mi)::value;
+        static_assert(ScalePair == 0 || ScalePair == 1);
+        static_assert(NHalf == 0 || NHalf == 1);
+        static_assert(LocalNi >= 0 && LocalNi < T::HALF_N_MFMA_PER_WAVE);
+        static_assert(Mi >= 0 && Mi < T::M_MFMA_PER_WAVE);
+        constexpr int ni = NHalf * T::HALF_N_MFMA_PER_WAVE + LocalNi;
+        constexpr int b_sel = ScalePair * 2 + (ni & 1);
+        constexpr int b_scale_index = ni / 2;
+
+        opus_moe_stage2_a8w4_decode_with_a_selector<T, ScalePair, Mi>(
+            route_base, wave_id_m, [&](auto a_sel) {
+                if constexpr(InitializeAcc)
+                {
+                    typename Mma::vtype_c zero_acc{};
+                    v_c[Mi][ni] = mma(v_a,
+                                      v_b,
+                                      zero_acc,
+                                      a_scale[Mi],
+                                      b_scale[b_scale_index],
+                                      a_sel,
+                                      number<b_sel>{});
+                }
+                else
+                {
+                    v_c[Mi][ni] = mma(v_a,
+                                      v_b,
+                                      v_c[Mi][ni],
+                                      a_scale[Mi],
+                                      b_scale[b_scale_index],
+                                      a_sel,
+                                      number<b_sel>{});
+                }
+            });
+    };
+
     auto compute_tile = [&](auto scale_pair,
+                            auto initialize_acc,
                             auto wait_for_pending_b_half1,
                             auto stage,
                             int b_tile_base,
@@ -489,160 +814,96 @@ inline __device__ void opus_moe_stage2_a8w4_decode_mainloop(
         constexpr bool WaitForPendingBHalf1 =
             decltype(wait_for_pending_b_half1)::value != 0;
 
-        V_A v_a[T::M_MFMA_PER_WAVE];
-        V_B v_b_half0[T::HALF_N_MFMA_PER_WAVE];
-        V_B v_b_half1[T::HALF_N_MFMA_PER_WAVE];
+        if constexpr(T::IS_BM64_BN256)
+        {
+            // Reuse one expanded BM64 B operand to reduce VGPR pressure.
+            V_A v_a[T::M_MFMA_PER_WAVE];
+            opus_moe_stage2_a8w4_decode_u32x4_t
+                b_packed[2][T::HALF_N_MFMA_PER_WAVE];
+            V_B v_b_fragment;
+            static_for<2>([&](auto n_half) {
+                static_for<T::HALF_N_MFMA_PER_WAVE>([&](auto local_ni) {
+                    b_packed[n_half.value][local_ni.value] =
+                        load_b_packed_fragment(n_half, local_ni, b_tile_base);
+                });
+            });
+            load_a_payload(stage, v_a);
+            __builtin_amdgcn_s_setprio(1);
+            static_for<2>([&](auto n_half) {
+                static_for<T::HALF_N_MFMA_PER_WAVE>([&](auto local_ni) {
+                    opus_moe_stage2_a8w4_decode_unpack_b_mfma_reg(
+                        b_packed[n_half.value][local_ni.value], v_b_fragment);
+                    static_for<T::M_MFMA_PER_WAVE>([&](auto mi) {
+                        compute_fragment(scale_pair,
+                                         initialize_acc,
+                                         n_half,
+                                         local_ni,
+                                         mi,
+                                         v_a[mi.value],
+                                         a_scale,
+                                         b_scale,
+                                         v_b_fragment);
+                    });
+                });
+                __builtin_amdgcn_sched_barrier(0);
+            });
+            __builtin_amdgcn_s_setprio(0);
+        }
+        else
+        {
+            V_A v_a[T::M_MFMA_PER_WAVE];
+            V_B v_b_half0[T::HALF_N_MFMA_PER_WAVE];
+            V_B v_b_half1[T::HALF_N_MFMA_PER_WAVE];
+            load_a_payload(stage, v_a);
+            load_b_half(0, b_tile_base, v_b_half0);
+            load_b_half(1, b_tile_base, v_b_half1);
 
-        load_a_payload(stage, v_a);
-        load_b_half(0, b_tile_base, v_b_half0);
-        load_b_half(1, b_tile_base, v_b_half1);
+            if constexpr(WaitForPendingBHalf1)
+                s_waitcnt_vmcnt(number<T::HALF_N_MFMA_PER_WAVE>{});
 
-        if constexpr(WaitForPendingBHalf1)
-            s_waitcnt_vmcnt(number<T::HALF_N_MFMA_PER_WAVE>{});
+            __builtin_amdgcn_s_setprio(1);
+            compute_half(
+                scale_pair, initialize_acc, 0_I, v_a, a_scale, b_scale, v_b_half0);
 
-        __builtin_amdgcn_s_setprio(1);
-        compute_half(scale_pair, 0_I, v_a, a_scale, b_scale, v_b_half0);
+            if constexpr(WaitForPendingBHalf1)
+                s_waitcnt_vmcnt(0_I);
 
-        if constexpr(WaitForPendingBHalf1)
-            s_waitcnt_vmcnt(0_I);
-
-        compute_half(scale_pair, 1_I, v_a, a_scale, b_scale, v_b_half1);
-        __builtin_amdgcn_s_setprio(0);
+            compute_half(
+                scale_pair, initialize_acc, 1_I, v_a, a_scale, b_scale, v_b_half1);
+            __builtin_amdgcn_s_setprio(0);
+        }
     };
 
-    if constexpr(T::K_TILES == 3)
+    // Streaming paths require explicit accumulator initialization.
+    if(kargs.k_tiles > T::A_LDS_STAGES)
     {
-        auto run_k3_pipeline = [&]() {
-            constexpr int k0 = 0;
-            constexpr int k1 = T::K_STEP_PACKED;
-            constexpr int k2 = 2 * T::K_STEP_PACKED;
-            const int b_tile_base0 =
-                opus_moe_stage2_a8w4_b_payload_tile_base_byte_offset<T>(col_base, k0);
-            const int b_tile_base1 =
-                opus_moe_stage2_a8w4_b_payload_tile_base_byte_offset<T>(col_base, k1);
-            const int b_tile_base2 =
-                opus_moe_stage2_a8w4_b_payload_tile_base_byte_offset<T>(col_base, k2);
-            constexpr int scale_group0 = 0;
-            constexpr int scale_group1 = T::SCALE_WORDS_PER_GROUP_PACK;
-
-            int b_scale0[T::HALF_N_MFMA_PER_WAVE];
-            int b_scale1[T::HALF_N_MFMA_PER_WAVE];
-            int a_scale0[T::M_MFMA_PER_WAVE];
-            int a_scale1[T::M_MFMA_PER_WAVE];
-
-            issue_a_payload(0_I, k0);
-            issue_a_payload(1_I, k1);
-            issue_a_payload(2_I, k2);
-
-            if constexpr(Schedule::Mainloop ==
-                         MainloopSchedule::SplitALoadByNWave)
-            {
-                V_B v_b_tile0_half0[T::HALF_N_MFMA_PER_WAVE];
-                V_B v_b_tile0_half1[T::HALF_N_MFMA_PER_WAVE];
-                load_b_half(0, b_tile_base0, v_b_tile0_half0);
-                load_b_half(1, b_tile_base0, v_b_tile0_half1);
-
-                load_b_scale(scale_group0, b_scale0);
-                load_a_scale(scale_group0, a_scale0);
-                wait_a_payload(number<T::A_LDS_BUFFER_LOAD_INSTS +
-                                      T::HALF_N_MFMA_PER_WAVE +
-                                      T::M_MFMA_PER_WAVE +
-                                      2 * T::HALF_N_MFMA_PER_WAVE>{});
-
-                V_A v_a_tile0[T::M_MFMA_PER_WAVE];
-                load_a_payload(0_I, v_a_tile0);
-
-                __builtin_amdgcn_s_setprio(1);
-                compute_half(0_I, 0_I, v_a_tile0, a_scale0, b_scale0, v_b_tile0_half0);
-                compute_half(0_I, 1_I, v_a_tile0, a_scale0, b_scale0, v_b_tile0_half1);
-                __builtin_amdgcn_s_setprio(0);
-            }
-            else
-            {
-                wait_a_payload(number<T::A_LDS_BUFFER_LOAD_INSTS>{});
-                load_b_scale(scale_group0, b_scale0);
-                load_a_scale(scale_group0, a_scale0);
-                compute_tile(0_I, 0_I, 0_I, b_tile_base0, b_scale0, a_scale0);
-            }
-
-            V_A v_a_tile1[T::M_MFMA_PER_WAVE];
-            V_A v_a_tile2[T::M_MFMA_PER_WAVE];
-            V_B v_b_tile1_half0[T::HALF_N_MFMA_PER_WAVE];
-            V_B v_b_tile1_half1[T::HALF_N_MFMA_PER_WAVE];
-            if constexpr(Schedule::Mainloop == MainloopSchedule::SplitALoadByNWave)
-                wait_a_payload(1_I);
-            else
-                wait_a_payload(0_I);
-            s_waitcnt_vmcnt(number<T::HALF_N_MFMA_PER_WAVE>{});
-
-            load_a_payload(1_I, v_a_tile1);
-            load_b_half(0, b_tile_base1, v_b_tile1_half0);
-            load_b_half(1, b_tile_base1, v_b_tile1_half1);
-
-            __builtin_amdgcn_s_setprio(1);
-            compute_half(1_I, 0_I, v_a_tile1, a_scale0, b_scale0, v_b_tile1_half0);
-            s_waitcnt_vmcnt(0_I);
-            load_a_payload(2_I, v_a_tile2);
-            if constexpr(Schedule::Mainloop ==
-                         MainloopSchedule::SplitALoadByNWave)
-            {
-                __builtin_amdgcn_s_barrier();
-            }
-            compute_half(1_I, 1_I, v_a_tile1, a_scale0, b_scale0, v_b_tile1_half1);
-            __builtin_amdgcn_s_setprio(0);
-
-            load_b_scale(scale_group1, b_scale1);
-            load_a_scale(scale_group1, a_scale1);
-
-            V_B v_b_tile2_half0[T::HALF_N_MFMA_PER_WAVE];
-            V_B v_b_tile2_half1[T::HALF_N_MFMA_PER_WAVE];
-            load_b_half(0, b_tile_base2, v_b_tile2_half0);
-            load_b_half(1, b_tile_base2, v_b_tile2_half1);
-
-            __builtin_amdgcn_s_setprio(1);
-            compute_half(0_I, 0_I, v_a_tile2, a_scale1, b_scale1, v_b_tile2_half0);
-            s_waitcnt_vmcnt(0_I);
-            compute_half(0_I, 1_I, v_a_tile2, a_scale1, b_scale1, v_b_tile2_half1);
-            __builtin_amdgcn_s_setprio(0);
-        };
-        run_k3_pipeline();
+        static_for<T::M_MFMA_PER_WAVE>([&](auto mi) {
+            static_for<T::N_MFMA_PER_WAVE>([&](auto ni) {
+                clear(v_c[mi.value][ni.value]);
+            });
+        });
     }
-    else
-    {
-        opus_moe_stage2_a8w4_decode_run_generic_pipeline_gfx950<T>(
-            col_base,
-            issue_a_payload,
-            wait_a_payload,
-            load_b_scale,
-            load_a_scale,
-            compute_tile);
-    }
+
+    opus_moe_stage2_a8w4_decode_run_k_pipeline_gfx950<T>(
+        kargs.k_tiles,
+        col_base,
+        b_payload_row_stride_bytes,
+        issue_a_payload,
+        wait_a_payload,
+        load_b_scale,
+        load_a_scale,
+        compute_tile);
+
+    // Synchronize before reusing the A-ring LDS allocation for the C-shuffle epilogue.
+    __builtin_amdgcn_s_barrier();
 }
 
 // Epilogue: direct atomic output or route-out store.
-typedef __bf16 opus_moe_stage2_a8w4_decode_bf16x2_t __attribute__((ext_vector_type(2)));
 typedef uint32_t opus_moe_stage2_a8w4_decode_u32x4_store_t
     __attribute__((ext_vector_type(4)));
 
-inline __device__ void opus_moe_stage2_a8w4_decode_atomic_add_bf16x2(
-    uint32_t packed_bf16x2,
-    __amdgpu_buffer_rsrc_t out_rsrc,
-    int byte_offset)
-{
-    const opus_moe_stage2_a8w4_decode_bf16x2_t data =
-        __builtin_bit_cast(opus_moe_stage2_a8w4_decode_bf16x2_t, packed_bf16x2);
-#if OPUS_HAS_RAW_PTR_ATOMIC_FADD_V2F16_BUILTIN
-    __builtin_amdgcn_raw_ptr_buffer_atomic_fadd_v2f16(data, out_rsrc, byte_offset, 0, 0);
-#else
-    opus::i32x4_t rsrc;
-    __builtin_memcpy(&rsrc, &out_rsrc, sizeof(opus::i32x4_t));
-    opus::llvm_amdgcn_raw_buffer_atomic_fadd_v2f16(
-        __builtin_bit_cast(opus::fp16x2_t, data), rsrc, byte_offset, 0, 0);
-#endif
-}
-
-template<typename T, typename CAcc>
-inline __device__ void opus_moe_stage2_a8w4_decode_write_direct_acc_to_smem(
+template<typename T, bool CheckRoute, typename CAcc>
+inline __device__ void opus_moe_stage2_a8w4_decode_write_acc_to_smem(
     CAcc (&v_c)[T::M_MFMA_PER_WAVE][T::N_MFMA_PER_WAVE],
     const OpusMoeStage2A8W4CShuffleLayout<T>& c_layout,
     const int32_t* __restrict__ smem_route_base,
@@ -651,44 +912,16 @@ inline __device__ void opus_moe_stage2_a8w4_decode_write_direct_acc_to_smem(
 {
     using namespace opus;
 
-    static_assert(T::DIRECT_ATOMIC_OUT);
-
     auto* smem_c_bf16 = reinterpret_cast<hip_bfloat16*>(smem_c_pair);
 
     static_for<T::M_MFMA_PER_WAVE>([&](auto mi) {
         static_for<T::VEC_C>([&](auto ii) {
             const int local_m = c_layout.acc_local_m(mi.value, ii.value);
-            if(smem_route_base[local_m] >= 0)
+            if constexpr(CheckRoute)
             {
-                const float weight = smem_weight[local_m];
-                static_for<T::N_MFMA_PER_WAVE>([&](auto ni) {
-                    const int local_col = c_layout.acc_local_col(ni.value);
-                    smem_c_bf16[c_layout.smem_scalar_index(local_m, local_col)] =
-                        opus_moe_gfx950_cvt_bf16_f32(
-                            static_cast<float>(v_c[mi.value][ni.value][ii.value]) *
-                            weight);
-                });
+                if(smem_route_base[local_m] < 0)
+                    return;
             }
-        });
-    });
-}
-
-template<typename T, typename CAcc>
-inline __device__ void opus_moe_stage2_a8w4_decode_write_route_out_acc_to_smem(
-    CAcc (&v_c)[T::M_MFMA_PER_WAVE][T::N_MFMA_PER_WAVE],
-    const OpusMoeStage2A8W4CShuffleLayout<T>& c_layout,
-    const float* __restrict__ smem_weight,
-    uint32_t* __restrict__ smem_c_pair)
-{
-    using namespace opus;
-
-    static_assert(!T::DIRECT_ATOMIC_OUT);
-
-    auto* smem_c_bf16 = reinterpret_cast<hip_bfloat16*>(smem_c_pair);
-
-    static_for<T::M_MFMA_PER_WAVE>([&](auto mi) {
-        static_for<T::VEC_C>([&](auto ii) {
-            const int local_m = c_layout.acc_local_m(mi.value, ii.value);
             const float weight = smem_weight[local_m];
             static_for<T::N_MFMA_PER_WAVE>([&](auto ni) {
                 const int local_col = c_layout.acc_local_col(ni.value);
@@ -708,7 +941,7 @@ inline __device__ void opus_moe_stage2_a8w4_decode_atomic_smem_to_out(
     const OpusMoeStage2A8W4CShuffleLayout<T>& c_layout,
     int col_base,
     int64_t output_row_stride,
-    __amdgpu_buffer_rsrc_t out_rsrc)
+    opus::i32x4_t out_rsrc)
 {
     constexpr int CSHUFFLE_NLANE =
         OpusMoeStage2A8W4CShuffleLayout<T>::CSHUFFLE_NLANE;
@@ -717,7 +950,6 @@ inline __device__ void opus_moe_stage2_a8w4_decode_atomic_smem_to_out(
     constexpr int PAIRS_PER_ROW =
         OpusMoeStage2A8W4CShuffleLayout<T>::PAIRS_PER_ROW;
     constexpr int ATOMIC_GROUPS = PAIRS_PER_ROW / CSHUFFLE_NLANE;
-    using Schedule = OpusMoeStage2A8W4DecodeSchedule<T>;
     static_assert(T::BLOCK_SIZE % CSHUFFLE_NLANE == 0);
     static_assert(T::B_M % CSHUFFLE_MLANE == 0);
     static_assert((PAIRS_PER_ROW & (PAIRS_PER_ROW - 1)) == 0);
@@ -733,16 +965,17 @@ inline __device__ void opus_moe_stage2_a8w4_decode_atomic_smem_to_out(
         {
             const int token = smem_route_base[local_m];
             const int pair_base = c_layout.smem_pair_index(local_m, col0);
-            const int byte_offset =
-                c_layout.output_byte_offset(token, output_row_stride, col_base, col0);
+            const int byte0 =
+                c_layout.output_elem_offset(token, output_row_stride, col_base, col0) *
+                static_cast<int>(sizeof(opus::bf16_t));
             opus::static_for<ATOMIC_GROUPS>([&](auto group) {
                 constexpr int pair_delta = group.value * CSHUFFLE_NLANE;
                 constexpr int byte_delta =
-                    pair_delta * static_cast<int>(sizeof(uint32_t));
-                opus_moe_stage2_a8w4_decode_atomic_add_bf16x2(
-                    smem_c_pair[pair_base + pair_delta],
-                    out_rsrc,
-                    byte_offset + byte_delta);
+                    pair_delta * T::ELEM_PER_ATOMIC * static_cast<int>(sizeof(opus::bf16_t));
+                const auto data = __builtin_bit_cast(
+                    opus::bf16x2_t, smem_c_pair[pair_base + pair_delta]);
+                opus::llvm_amdgcn_raw_buffer_atomic_fadd_v2bf16(
+                    data, out_rsrc, byte0 + byte_delta, 0, 0);
             });
         }
     }
@@ -755,8 +988,7 @@ inline __device__ void opus_moe_stage2_a8w4_decode_store_smem_to_route_out(
     const OpusMoeStage2A8W4CShuffleLayout<T>& c_layout,
     int col_base,
     hip_bfloat16* __restrict__ out,
-    int64_t output_row_stride,
-    bool full_route_tile)
+    int64_t output_row_stride)
 {
     constexpr int PAIRS_PER_ROW =
         OpusMoeStage2A8W4CShuffleLayout<T>::PAIRS_PER_ROW;
@@ -788,34 +1020,20 @@ inline __device__ void opus_moe_stage2_a8w4_decode_store_smem_to_route_out(
                 row_pair));
     };
 
-    if(full_route_tile)
+    #pragma unroll
+    for(int row_iter = 0; row_iter < T::B_M / ROWS_PER_ITER; ++row_iter)
     {
-        #pragma unroll
-        for(int row_iter = 0; row_iter < T::B_M / ROWS_PER_ITER; ++row_iter)
-        {
-            const int local_m = row_iter * ROWS_PER_ITER + row_in_iter;
-            const int route_row = smem_route_base[local_m];
-            if(route_row >= 0)
-                store_row(local_m, route_row);
-        }
-    }
-    else
-    {
-        #pragma unroll
-        for(int row_iter = 0; row_iter < T::B_M / ROWS_PER_ITER; ++row_iter)
-        {
-            const int local_m = row_iter * ROWS_PER_ITER + row_in_iter;
-            const int route_row = smem_route_base[local_m];
-            if(route_row >= 0)
-                store_row(local_m, route_row);
-        }
+        const int local_m = row_iter * ROWS_PER_ITER + row_in_iter;
+        const int route_row = smem_route_base[local_m];
+        if(route_row >= 0)
+            store_row(local_m, route_row);
     }
 }
 
 // MXFP8 route_out store: fp8 e4m3 + per-8col e8m0 (1-byte) scale. Per-thread
 // scale (each thread owns 8 cols) -> NO cross-lane reduction. Row layout:
 // [model_dim fp8 | model_dim/8 e8m0 scale bytes]. 0.56x of bf16 -> store ~ -44%.
-template<typename T, bool FullRouteTile>
+template<typename T>
 inline __device__ void opus_moe_stage2_a8w4_decode_store_smem_to_route_out_fp8(
     const uint32_t* __restrict__ smem_c_pair,
     const int32_t* __restrict__ smem_route_base,
@@ -883,16 +1101,8 @@ inline __device__ void opus_moe_stage2_a8w4_decode_store_smem_to_route_out_fp8(
     {
         const int local_m = row_iter * ROWS_PER_ITER + row_in_iter;
         const int route_row = smem_route_base[local_m];
-        if constexpr(FullRouteTile)
-        {
-            if(route_row >= 0)
-                store_row(local_m, route_row);
-        }
-        else
-        {
-            if(route_row >= 0)
-                store_row(local_m, route_row);
-        }
+        if(route_row >= 0)
+            store_row(local_m, route_row);
     }
 }
 
@@ -905,7 +1115,7 @@ inline __device__ void opus_moe_stage2_a8w4_decode_direct_epilogue(
     uint32_t* __restrict__ smem_c_pair,
     int col_base,
     int64_t output_row_stride,
-    __amdgpu_buffer_rsrc_t output_rsrc)
+    opus::i32x4_t out_rsrc)
 {
     using namespace opus;
     using opus::operator""_I;
@@ -913,7 +1123,7 @@ inline __device__ void opus_moe_stage2_a8w4_decode_direct_epilogue(
     static_assert(T::B_N == T::C_LDS_N);
     static_assert(T::DIRECT_ATOMIC_OUT);
 
-    opus_moe_stage2_a8w4_decode_write_direct_acc_to_smem<T>(
+    opus_moe_stage2_a8w4_decode_write_acc_to_smem<T, true>(
         v_c,
         c_layout,
         smem_route_base,
@@ -927,7 +1137,7 @@ inline __device__ void opus_moe_stage2_a8w4_decode_direct_epilogue(
         c_layout,
         col_base,
         output_row_stride,
-        output_rsrc);
+        out_rsrc);
 }
 
 template<typename T, typename CAcc>
@@ -939,8 +1149,7 @@ inline __device__ void opus_moe_stage2_a8w4_decode_route_out_epilogue(
     uint32_t* __restrict__ smem_c_pair,
     int col_base,
     hip_bfloat16* __restrict__ out,
-    int64_t output_row_stride,
-    bool full_route_tile)
+    int64_t output_row_stride)
 {
     using namespace opus;
     using opus::operator""_I;
@@ -948,9 +1157,10 @@ inline __device__ void opus_moe_stage2_a8w4_decode_route_out_epilogue(
     static_assert(T::B_N == T::C_LDS_N);
     static_assert(!T::DIRECT_ATOMIC_OUT);
 
-    opus_moe_stage2_a8w4_decode_write_route_out_acc_to_smem<T>(
+    opus_moe_stage2_a8w4_decode_write_acc_to_smem<T, false>(
         v_c,
         c_layout,
+        smem_route_base,
         smem_weight,
         smem_c_pair);
     s_waitcnt_lgkmcnt(0_I);
@@ -961,8 +1171,43 @@ inline __device__ void opus_moe_stage2_a8w4_decode_route_out_epilogue(
         c_layout,
         col_base,
         out,
-        output_row_stride,
-        full_route_tile);
+        output_row_stride);
+}
+
+template<typename T, typename CAcc>
+inline __device__ void opus_moe_stage2_a8w4_decode_route_out_fp8_epilogue(
+    CAcc (&v_c)[T::M_MFMA_PER_WAVE][T::N_MFMA_PER_WAVE],
+    const OpusMoeStage2A8W4CShuffleLayout<T>& c_layout,
+    const int32_t* __restrict__ smem_route_base,
+    const float* __restrict__ smem_weight,
+    uint32_t* __restrict__ smem_c_pair,
+    int col_base,
+    uint8_t* __restrict__ out_base,
+    int64_t row_stride_bytes,
+    int scale_col_off)
+{
+    using namespace opus;
+    using opus::operator""_I;
+
+    static_assert(T::B_N == T::C_LDS_N);
+    static_assert(!T::DIRECT_ATOMIC_OUT);
+
+    opus_moe_stage2_a8w4_decode_write_acc_to_smem<T, false>(
+        v_c,
+        c_layout,
+        smem_route_base,
+        smem_weight,
+        smem_c_pair);
+    s_waitcnt_lgkmcnt(0_I);
+    __syncthreads();
+    opus_moe_stage2_a8w4_decode_store_smem_to_route_out_fp8<T>(
+        smem_c_pair,
+        smem_route_base,
+        c_layout,
+        col_base,
+        out_base,
+        row_stride_bytes,
+        scale_col_off);
 }
 
 #endif // __gfx950__
@@ -971,7 +1216,8 @@ inline __device__ void opus_moe_stage2_a8w4_decode_route_out_epilogue(
 // Kernel entry.
 template<typename Traits>
 __global__ __launch_bounds__(Traits::BLOCK_SIZE, Traits::MIN_BLOCKS_PER_CU) void
-opus_moe_stage2_a8w4_decode_kernel_gfx950(opus_moe_stage2_a8w4_kargs kargs)
+opus_moe_stage2_a8w4_decode_kernel_gfx950(
+    opus_moe_stage2_a8w4_kargs kargs)
 {
 #ifdef __HIP_DEVICE_COMPILE__
 #if defined(__gfx950__)
@@ -991,7 +1237,9 @@ opus_moe_stage2_a8w4_decode_kernel_gfx950(opus_moe_stage2_a8w4_kargs kargs)
     if(route_base >= sorted_rows)
         return;
     const int token_num = kargs.token_num;
-    const int sorted_block_id = route_base / T::SORT_BLOCK_M;
+    // Use shifts for the supported power-of-two sort blocks.
+    const int sorted_block_id =
+        route_base >> __builtin_ctz(static_cast<unsigned>(kargs.sort_block_m));
     const int expert_id = kargs.sorted_expert_ids[sorted_block_id];
 
     const int tid = static_cast<int>(thread_id_x());
@@ -1015,12 +1263,6 @@ opus_moe_stage2_a8w4_decode_kernel_gfx950(opus_moe_stage2_a8w4_kargs kargs)
         (A_LDS_BYTES > C_LDS_BYTES) ? A_LDS_BYTES : C_LDS_BYTES;
     __shared__ __align__(T::BYTES_PER_VEC) char smem_scratch[SCRATCH_BYTES];
     auto* smem_c_pair = reinterpret_cast<uint32_t*>(smem_scratch);
-    auto s_a = opus_moe_stage2_a8w4_decode_make_smem_a_stages<
-        D_A,
-        T::A_LDS_STAGE_ELEMS>(smem_scratch,
-                              opus::make_index_seq<T::A_LDS_STAGES>{});
-
-    bool full_route_tile = false;
     const bool has_route = opus_moe_stage2_a8w4_decode_load_route_metadata<T>(
         kargs,
         route_base,
@@ -1028,26 +1270,25 @@ opus_moe_stage2_a8w4_decode_kernel_gfx950(opus_moe_stage2_a8w4_kargs kargs)
         tid,
         smem_a_base,
         smem_route_base,
-        smem_weight,
-        full_route_tile);
+        smem_weight);
     if(!has_route)
         return;
 
-    auto mma = make_mfma<D_MFMA_A, D_MFMA_B, D_ACC>(
-        number<T::MMA_M>{},
-        number<T::MMA_N>{},
-        number<T::MMA_K>{});
+    auto mma = make_tiled_mma<D_MFMA_A, D_MFMA_B, D_ACC>(
+        seq<1, 1, 1>{},
+        seq<1, 1, 1>{},
+        seq<T::MMA_M, T::MMA_N, T::MMA_K>{});
 
     const D_A* __restrict__ inter_states =
         reinterpret_cast<const D_A*>(kargs.inter_states_fp8);
     const uint8_t* __restrict__ w2 = kargs.w2_fp4;
     const uint8_t* __restrict__ a2_scale = kargs.a2_scale_e8m0;
     const uint8_t* __restrict__ w2_scale = kargs.w2_scale_e8m0;
-    const unsigned int a_size_bytes =
-        static_cast<unsigned int>(static_cast<unsigned long long>(token_num) *
-                                  static_cast<unsigned long long>(kargs.stride_a_t));
+    const unsigned int a_size_bytes = static_cast<unsigned int>(
+        static_cast<unsigned long long>(kargs.stride_a_k == 0 ? sorted_rows : token_num) *
+        static_cast<unsigned long long>(kargs.stride_a_t));
     const unsigned int a_scale_size_bytes =
-        static_cast<unsigned int>(static_cast<unsigned long long>(sorted_rows) *
+        static_cast<unsigned int>(static_cast<unsigned long long>(kargs.a_scale_rows) *
                                   static_cast<unsigned long long>(kargs.stride_a_scale_route));
     auto g_a = make_gmem(inter_states, a_size_bytes);
     auto g_a_scale = make_gmem(a2_scale, a_scale_size_bytes);
@@ -1059,20 +1300,16 @@ opus_moe_stage2_a8w4_decode_kernel_gfx950(opus_moe_stage2_a8w4_kargs kargs)
     auto g_w_scale = make_gmem(w2_scale, w_scale_size_bytes);
     auto u_ga = opus_moe_stage2_a8w4_layout_ga<T>(lane_id, wave_id_m);
     auto u_sa = opus_moe_stage2_a8w4_layout_sa<T>(lane_id, wave_id_m);
-    auto u_gb = opus_moe_stage2_a8w4_layout_gb<T>(lane_id, wave_id_n);
-    auto u_c = opus_moe_stage2_a8w4_layout_c<T>(wave_id_m, wave_id_n);
+    const int b_payload_row_stride_bytes = static_cast<int>(kargs.stride_w_h);
+    auto u_gb = opus_moe_stage2_a8w4_layout_gb<T>(
+        lane_id, wave_id_n, b_payload_row_stride_bytes);
 
     typename decltype(mma)::vtype_c v_c[T::M_MFMA_PER_WAVE][T::N_MFMA_PER_WAVE];
-    static_for<T::M_MFMA_PER_WAVE>([&](auto mi) {
-        static_for<T::N_MFMA_PER_WAVE>([&](auto ni) {
-            clear(v_c[mi.value][ni.value]);
-        });
-    });
 
     opus_moe_stage2_a8w4_decode_mainloop<T>(mma,
                                             u_ga,
                                             u_sa,
-                                            s_a,
+                                            smem_scratch,
                                             u_gb,
                                             g_a,
                                             g_a_scale,
@@ -1081,15 +1318,18 @@ opus_moe_stage2_a8w4_decode_kernel_gfx950(opus_moe_stage2_a8w4_kargs kargs)
                                             smem_a_base,
                                             route_base,
                                             col_base,
+                                            b_payload_row_stride_bytes,
                                             wave_id_m,
                                             wave_id_n,
                                             scale_row_col_base,
+                                            kargs,
                                             v_c);
 
     if constexpr(!Schedule::MainloopEndsWithSmemBarrier)
     {
         __syncthreads();
     }
+    auto u_c = opus_moe_stage2_a8w4_layout_c<T>(wave_id_m, wave_id_n);
     if constexpr(T::DIRECT_ATOMIC_OUT)
     {
         constexpr int output_rows_per_token = 1;
@@ -1098,8 +1338,19 @@ opus_moe_stage2_a8w4_decode_kernel_gfx950(opus_moe_stage2_a8w4_kargs kargs)
             static_cast<unsigned long long>(output_rows_per_token) *
             static_cast<unsigned long long>(kargs.stride_o_t) *
             static_cast<unsigned long long>(sizeof(hip_bfloat16)));
-        auto output_rsrc = opus::make_buffer_rsrc(static_cast<void*>(kargs.out_bf16),
-                                                  output_size_bytes);
+        // Build the output buffer descriptor as a plain i32x4 rather than via
+        // make_gmem/make_buffer_rsrc: the __builtin_amdgcn_make_buffer_rsrc
+        // intrinsic result is held across the atomic loop at +2 VGPR, which tips
+        // the zero-headroom atomic decode kernels into 32 B/lane scratch (~4-7%
+        // regression). The plain descriptor packs into cheap registers. The
+        // atomic itself still uses the opus raw-buffer primitive.
+        const auto output_ptr_bits = reinterpret_cast<__UINTPTR_TYPE__>(kargs.out_bf16);
+        const opus::i32x4_t out_rsrc{
+            static_cast<int>(static_cast<unsigned int>(output_ptr_bits)),
+            static_cast<int>((static_cast<unsigned long long>(output_ptr_bits) >> 32) &
+                             0xffffu),
+            static_cast<int>(output_size_bytes),
+            static_cast<int>(opus::buffer_default_config())};
         opus_moe_stage2_a8w4_decode_direct_epilogue<T>(
             v_c,
             u_c,
@@ -1108,28 +1359,20 @@ opus_moe_stage2_a8w4_decode_kernel_gfx950(opus_moe_stage2_a8w4_kargs kargs)
             smem_c_pair,
             col_base,
             kargs.stride_o_t,
-            output_rsrc);
+            out_rsrc);
     }
     else if(kargs.route_out_fp8)
     {
-        opus_moe_stage2_a8w4_decode_write_route_out_acc_to_smem<T>(
-            v_c, u_c, smem_weight, smem_c_pair);
-        s_waitcnt_lgkmcnt(0_I);
-        __syncthreads();
-        if(full_route_tile)
-        {
-            opus_moe_stage2_a8w4_decode_store_smem_to_route_out_fp8<T, true>(
-                smem_c_pair, smem_route_base, u_c, col_base,
-                reinterpret_cast<uint8_t*>(kargs.out_bf16),
-                kargs.route_out_row_bytes, kargs.model_dim);
-        }
-        else
-        {
-            opus_moe_stage2_a8w4_decode_store_smem_to_route_out_fp8<T, false>(
-                smem_c_pair, smem_route_base, u_c, col_base,
-                reinterpret_cast<uint8_t*>(kargs.out_bf16),
-                kargs.route_out_row_bytes, kargs.model_dim);
-        }
+        opus_moe_stage2_a8w4_decode_route_out_fp8_epilogue<T>(
+            v_c,
+            u_c,
+            smem_route_base,
+            smem_weight,
+            smem_c_pair,
+            col_base,
+            reinterpret_cast<uint8_t*>(kargs.out_bf16),
+            kargs.route_out_row_bytes,
+            kargs.model_dim);
     }
     else
     {
@@ -1141,8 +1384,7 @@ opus_moe_stage2_a8w4_decode_kernel_gfx950(opus_moe_stage2_a8w4_kargs kargs)
             smem_c_pair,
             col_base,
             kargs.out_bf16,
-            kargs.stride_o_t,
-            full_route_tile);
+            kargs.stride_o_t);
     }
 #endif // __gfx950__
 #endif // __HIP_DEVICE_COMPILE__

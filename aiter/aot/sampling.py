@@ -1,14 +1,15 @@
-from collections import namedtuple
-import os
 import concurrent.futures
+import os
+from collections import namedtuple
+
 from csrc.cpp_itfs.sampling.top_k_renorm_probs import (
     compile as top_k_renorm_probs_compile,
 )
-from csrc.cpp_itfs.sampling.top_p_sampling_from_probs import (
-    compile as top_p_sampling_from_probs_compile,
-)
 from csrc.cpp_itfs.sampling.top_k_top_p_sampling_from_probs import (
     compile as top_k_top_p_sampling_from_probs_compile,
+)
+from csrc.cpp_itfs.sampling.top_p_sampling_from_probs import (
+    compile as top_p_sampling_from_probs_compile,
 )
 
 TopKRenormConfig = namedtuple(

@@ -350,19 +350,19 @@ def _build_bf16_inputs(
         sink = torch.full(
             (num_heads,), float("-inf"), dtype=torch.float32, device=device
         )
-    return dict(
-        q_bf16=q_bf16,
-        kv_bf16=kv_bf16,
-        qo_indptr=qo_indptr,
-        kv_indptr=kv_indptr,
-        kv_page_indices=kv_page_indices,
-        kv_last_page_lens=kv_last_page_lens,
-        sink=sink,
-        max_seqlen_q=q_seq_logical,
-        kv_seq_lens=kv_seq_lens,
-        batch=batch,
-        q_seq_logical=q_seq_logical,
-    )
+    return {
+        "q_bf16": q_bf16,
+        "kv_bf16": kv_bf16,
+        "qo_indptr": qo_indptr,
+        "kv_indptr": kv_indptr,
+        "kv_page_indices": kv_page_indices,
+        "kv_last_page_lens": kv_last_page_lens,
+        "sink": sink,
+        "max_seqlen_q": q_seq_logical,
+        "kv_seq_lens": kv_seq_lens,
+        "batch": batch,
+        "q_seq_logical": q_seq_logical,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -481,24 +481,24 @@ def test_mla_v4_nm(
         (total_q, num_kv_splits, num_heads, 1), dtype=dtypes.fp32, device=device
     )
 
-    common_kwargs = dict(
-        q=q_packed,
-        qrope=q_rope.contiguous(),
-        kv_buffer=kv_packed,
-        kvrope=kv_rope.contiguous(),
-        output=output_buf,
-        qo_indptr=inputs["qo_indptr"],
-        kv_indptr=inputs["kv_indptr"],
-        kv_page_indices=inputs["kv_page_indices"],
-        kv_last_page_lens=inputs["kv_last_page_lens"],
-        split_indptr=split_indptr,
-        max_seqlen_q=inputs["max_seqlen_q"],
-        sink=inputs["sink"],
-        sm_scale=sm_scale,
-        num_kv_splits=num_kv_splits,
-        logits=logits_buf,
-        attn_lse=lse_buf,
-    )
+    common_kwargs = {
+        "q": q_packed,
+        "qrope": q_rope.contiguous(),
+        "kv_buffer": kv_packed,
+        "kvrope": kv_rope.contiguous(),
+        "output": output_buf,
+        "qo_indptr": inputs["qo_indptr"],
+        "kv_indptr": inputs["kv_indptr"],
+        "kv_page_indices": inputs["kv_page_indices"],
+        "kv_last_page_lens": inputs["kv_last_page_lens"],
+        "split_indptr": split_indptr,
+        "max_seqlen_q": inputs["max_seqlen_q"],
+        "sink": inputs["sink"],
+        "sm_scale": sm_scale,
+        "num_kv_splits": num_kv_splits,
+        "logits": logits_buf,
+        "attn_lse": lse_buf,
+    }
 
     # out_16_nosplit=1 is single-pass only (no stage2 merge) -> num_kv_splits==1.
     candidates = {"v4_nm": 0}

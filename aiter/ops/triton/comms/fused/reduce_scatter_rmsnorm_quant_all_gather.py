@@ -13,17 +13,19 @@ This module implements a fully fused Triton kernel that performs:
 Based on Iris example: examples/22_rs_rmsnorm_fp8quant_ag/reduce_scatter_rmsnorm_quant_fused.py
 """
 
+import logging
+from typing import TYPE_CHECKING
+
 import torch
-from torch import Tensor
 import triton
 import triton.language as tl
-import logging
-from typing import Optional, TYPE_CHECKING
+from torch import Tensor
+
+from aiter.ops.triton._triton_kernels.normalization.rmsnorm import _rms_norm_kernel
+from aiter.ops.triton.comms.all_gather import _all_gather_impl
 
 # Import shared implementations
 from aiter.ops.triton.comms.reduce_scatter import _reduce_scatter_impl
-from aiter.ops.triton.comms.all_gather import _all_gather_impl
-from aiter.ops.triton._triton_kernels.normalization.rmsnorm import _rms_norm_kernel
 
 if TYPE_CHECKING:
     from ..iris import IrisCommContext
@@ -231,11 +233,11 @@ def reduce_scatter_rmsnorm_quant_all_gather(
     quant_mode: str = "none",
     do_allgather: bool = True,
     # Pre-allocated buffers (optional, for reuse across iterations)
-    rs_buffer: Optional[Tensor] = None,
-    norm_buffer: Optional[Tensor] = None,
-    fp8_out: Optional[Tensor] = None,
-    gather_out: Optional[Tensor] = None,
-) -> tuple[Optional[Tensor], Optional[Tensor], Optional[Tensor]]:
+    rs_buffer: Tensor | None = None,
+    norm_buffer: Tensor | None = None,
+    fp8_out: Tensor | None = None,
+    gather_out: Tensor | None = None,
+) -> tuple[Tensor | None, Tensor | None, Tensor | None]:
     """
     Fused reduce-scatter + RMSNorm + quantization + all-gather operation.
 

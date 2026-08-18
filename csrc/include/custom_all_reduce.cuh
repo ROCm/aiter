@@ -709,6 +709,7 @@ __global__ void __launch_bounds__(512, 1) allgather_naive(
         int write_idx     = warp_id * size + idx;
         result[write_idx] = ptrs[warp_id][idx];
     }
+    end_sync<ngpus, true>(sg, self_sg, rank);
 }
 
 template <typename T, int ngpus>
@@ -736,6 +737,7 @@ __global__ void __launch_bounds__(512, 1) allgather_vec(
         int write_idx                                   = warp_id * size + idx;
         *(reinterpret_cast<P*>(&result[0]) + write_idx) = ptrs[warp_id][idx];
     }
+    end_sync<ngpus, true>(sg, self_sg, rank);
 }
 
 template <typename T, int ngpus>
@@ -772,6 +774,7 @@ __global__ void __launch_bounds__(512, 1) allgather_lastdim(RankData* _dp,
         int write_idx                                   = (ngpus * y + warp_id) * last_dim_size + x;
         *(reinterpret_cast<P*>(&result[0]) + write_idx) = ptrs[warp_id][idx];
     }
+    end_sync<ngpus, true>(sg, self_sg, rank);
 }
 
 // ========== reduce_scatter kernel start ==========
@@ -813,6 +816,7 @@ __global__ void __launch_bounds__(512, 1) reduce_scatter_split_first_dim(
         *(reinterpret_cast<P*>(result) + store_index) =
             packed_reduce<P, ngpus, A>(ptrs, load_index);
     }
+    end_sync<ngpus, true>(sg, self_sg, rank);
 }
 
 // reduce_scatter, scatter on last dim — naive (non-vectorized) fallback.
@@ -850,6 +854,7 @@ __global__ void __launch_bounds__(256, 1) reduce_scatter_split_lastdim_naive(
     }
     result[i] = downcast_s<T>(rslt_reg);
   }
+  end_sync<ngpus, true>(sg, self_sg, rank);
 }
 
 // reduce_scatter, scatter on last dim — vectorized (16B / thread).
@@ -883,6 +888,7 @@ __global__ void __launch_bounds__(256, 1) reduce_scatter_split_lastdim(
     int load_index = index_y * packed_dim_n + rank * splited_n + index_x;
     *(reinterpret_cast<P*>(result) + i) = packed_reduce<P, ngpus, A>(ptrs, load_index);
   }
+  end_sync<ngpus, true>(sg, self_sg, rank);
 }
 
 // reduce_scatter, scatter on middle dim — naive (non-vectorized) fallback.
@@ -920,6 +926,7 @@ __global__ void __launch_bounds__(256, 1) reduce_scatter_split_middim_naive(
     }
     result[i] = downcast_s<T>(rslt_reg);
   }
+  end_sync<ngpus, true>(sg, self_sg, rank);
 }
 
 // reduce_scatter, scatter on middle dim — vectorized (16B / thread along k).
@@ -954,6 +961,7 @@ __global__ void __launch_bounds__(256, 1) reduce_scatter_split_middim(
     int load_index = index_m * (n * packed_dim_k) + (rank * splited_n + index_n) * packed_dim_k + index_k;
     *(reinterpret_cast<P*>(result) + i) = packed_reduce<P, ngpus, A>(ptrs, load_index);
   }
+  end_sync<ngpus, true>(sg, self_sg, rank);
 }
 // ========== reduce_scatter kernel end ==========
 
@@ -1797,7 +1805,8 @@ __device__ __forceinline__ void ar_fusion_epilogue(A& in,
                                                    int block_size,
                                                    OutT* __restrict__ output,
                                                    float* __restrict__ scale_out,
-                                                   bool active = true)
+                                                   bool active            = true,
+                                                   T* __restrict__ bf16_output = nullptr)
 {
     if constexpr(std::is_same_v<T, OutT>)
     {
@@ -1815,6 +1824,18 @@ __device__ __forceinline__ void ar_fusion_epilogue(A& in,
         A out;
         ar_fusion_epilogue_rms_norm<P, A, A, float, PACK_SIZE, 32, GEMMA_NORM>(
             out, in, weight, eps, hidden_dim, block_size);
+        // Optionally write the pre-quantization bf16/fp16 normed output so
+        // v32 DSA models (e.g. GLM-5.2) whose indexer GEMMs run in bf16 can
+        // reuse the same normed activation while attention QKV keeps per-token
+        // FP8. Zero-overhead when not requested (branch on the pointer).
+        if(bf16_output != nullptr && active)
+        {
+            P bf16_pack;
+#pragma unroll
+            for(int i = 0; i < PACK_SIZE; ++i)
+                bf16_pack[i] = downcast_s<T>(out[i]);
+            *reinterpret_cast<P*>(bf16_output + idx) = bf16_pack;
+        }
         float amax  = ar_fusion_epilogue_reduce_abs_max<A, PACK_SIZE>(out, block_size);
         float scale = amax == 0.f ? 1.f : amax / FP8_UPBOUND;
         out_quant   = packQuant<opus::fp32_t, PACK_SIZE>(out, scale);
@@ -1934,7 +1955,8 @@ __global__ void __launch_bounds__(1024, 1)
                                    int input_hidden_dim,
                                    int hidden_dim,
                                    int out_hidden_dim,
-                                   float eps)
+                                   float eps,
+                                   T* __restrict__ bf16_output = nullptr)
 {
     constexpr int pack_size = 16 / sizeof(T);
     int block_size          = hidden_dim / pack_size;
@@ -2022,13 +2044,19 @@ __global__ void __launch_bounds__(1024, 1)
             padded_block_size,
             output,
             scale_out,
-            active);
+            active,
+            bf16_output);
         if(active_tail)
         {
             OP zero_pack{};
             *reinterpret_cast<OP*>(output + out_idx) = zero_pack;
         }
     }
+    // Pair start_sync with a final barrier before any rank can reuse the
+    // registered input buffer or this block's signal slot for the next fused
+    // collective. Without it, a faster rank may advance while a peer is still
+    // reading the previous invocation, causing silent cross-request corruption.
+    end_sync<ngpus, true>(sg, self_sg, rank);
 }
 
 // Per-group quant variant of the 1-stage fused allreduce+rmsnorm kernel.
@@ -2112,6 +2140,7 @@ __global__ void __launch_bounds__(1024, 1)
             acc, weight_p, hidden_dim, eps, idx, tidx, padded_block_size,
             group_size, output, scale_out, active, bf16_output, token_num);
     }
+    end_sync<ngpus, true>(sg, self_sg, rank);
 }
 
 template <typename T, typename OutT, int NGPUS>
@@ -2221,6 +2250,7 @@ __global__ void __launch_bounds__(1024, 1)
             acc, weight_p, hidden_dim, eps, idx, tidx, padded_block_size,
             output, scale_out, active, bf16_output);
     }
+    end_sync<ngpus, true>(sg, self_sg, rank);
 }
 
 template <typename T, int NGPUS>
@@ -2400,7 +2430,8 @@ void allreduce_fusion_kernel_1stage_launcher(RankData* _dp,
                                              int hidden_dim,
                                              int out_hidden_dim,
                                              float eps,
-                                             hipStream_t stream)
+                                             hipStream_t stream,
+                                             T* bf16_output = nullptr)
 {
     constexpr int PACK_SIZE  = 16 / sizeof(T);
     constexpr int WARP_SIZE  = 32;
@@ -2425,7 +2456,8 @@ void allreduce_fusion_kernel_1stage_launcher(RankData* _dp,
                                                     input_hidden_dim,
                                                     hidden_dim,
                                                     out_hidden_dim,
-                                                    eps);
+                                                    eps,
+                                                    bf16_output);
 }
 
 template <typename T, int PACK_SIZE>
@@ -2733,7 +2765,8 @@ __global__ void __launch_bounds__(1024, 1)
                                    float* __restrict__ scale_out,
                                    int size,
                                    int hidden_dim,
-                                   float eps)
+                                   float eps,
+                                   T* __restrict__ bf16_output = nullptr)
 {
     constexpr int pack_size = 16 / sizeof(T);
     int block_size          = hidden_dim / pack_size;
@@ -2811,7 +2844,8 @@ __global__ void __launch_bounds__(1024, 1)
             acc[v] = upcast_s(vec[v]);
         }
         ar_fusion_epilogue<P, A, T, OutT, pack_size, GEMMA_NORM>(
-            acc, weight_p, hidden_dim, eps, idx, tidx, block_size, output, scale_out);
+            acc, weight_p, hidden_dim, eps, idx, tidx, block_size, output, scale_out,
+            /*active=*/true, bf16_output);
     }
 }
 
@@ -2828,7 +2862,8 @@ void allreduce_fusion_kernel_2stage_launcher(RankData* _dp,
                                              int size,
                                              int hidden_dim,
                                              float eps,
-                                             hipStream_t stream)
+                                             hipStream_t stream,
+                                             T* bf16_output = nullptr)
 {
     constexpr int PACK_SIZE = 16 / sizeof(T);
     int BLOCK_SIZE          = hidden_dim / PACK_SIZE;
@@ -2849,7 +2884,8 @@ void allreduce_fusion_kernel_2stage_launcher(RankData* _dp,
                                                             scale_out,
                                                             size,
                                                             hidden_dim,
-                                                            eps);
+                                                            eps,
+                                                            bf16_output);
 }
 
 // Per-group quant variant of the 2-stage kernel.
@@ -2982,7 +3018,8 @@ __global__ void __launch_bounds__(1024, 1)
                                           float* __restrict__ scale_out,
                                           int size,
                                           int hidden_dim,
-                                          float eps)
+                                          float eps,
+                                          T* __restrict__ bf16_output = nullptr)
 {
     constexpr int pack_size = 16 / sizeof(T);
     int block_size          = hidden_dim / pack_size;
@@ -3009,7 +3046,8 @@ __global__ void __launch_bounds__(1024, 1)
             acc[v] = upcast_s(vec[v]);
         }
         ar_fusion_epilogue<P, A, T, OutT, pack_size, GEMMA_NORM>(
-            acc, weight_p, hidden_dim, eps, idx, tidx, block_size, output, scale_out);
+            acc, weight_p, hidden_dim, eps, idx, tidx, block_size, output, scale_out,
+            /*active=*/true, bf16_output);
     }
 }
 
@@ -3129,7 +3167,8 @@ void allreduce_fusion_kernel_split_launcher(RankData* _dp,
                                             int size,
                                             int hidden_dim,
                                             float eps,
-                                            hipStream_t stream)
+                                            hipStream_t stream,
+                                            T* bf16_output = nullptr)
 {
     // step 1, run reduce-scatter + allgather cross device save
     dim3 block(512);
@@ -3160,7 +3199,8 @@ void allreduce_fusion_kernel_split_launcher(RankData* _dp,
     dim3 numBlocks(nblocks);
     local_device_load_rmsnorm_quant_naive<T, OutT, GEMMA_NORM>
         <<<numBlocks, threadsPerBlock, 0, stream>>>(
-            sg, rank, residual_inp, residual_out, output, weight, scale_out, size, hidden_dim, eps);
+            sg, rank, residual_inp, residual_out, output, weight, scale_out, size, hidden_dim, eps,
+            bf16_output);
 }
 
 // Stage 2 for split AR+MHC(post) is launched via optimized mhc_post kernels on the
@@ -4375,7 +4415,8 @@ void dispatchFusedAllReduceRMSNormQuant(hipStream_t stream,
                                         int m,
                                         int n,
                                         bool use_1stage,
-                                        bool gemma_norm = false)
+                                        bool gemma_norm = false,
+                                        T* bf16_output  = nullptr)
 {
     auto d   = 16 / sizeof(T);
     int size = m * n;
@@ -4398,12 +4439,13 @@ void dispatchFusedAllReduceRMSNormQuant(hipStream_t stream,
         {                                                                               \
             gemma_template_launcher(ptrs, sg_, self_sg_, rank_, residual_inp,           \
                                     residual_out, output, weight, scale_out, size, n, n, \
-                                    n, eps, stream);                                    \
+                                    n, eps, stream, bf16_output);                       \
         }                                                                               \
         else                                                                            \
         {                                                                               \
             template_launcher(ptrs, sg_, self_sg_, rank_, residual_inp, residual_out,    \
-                              output, weight, scale_out, size, n, n, n, eps, stream);   \
+                              output, weight, scale_out, size, n, n, n, eps, stream,     \
+                              bf16_output);                                             \
         }                                                                               \
     } while(0)
 
@@ -4414,12 +4456,13 @@ void dispatchFusedAllReduceRMSNormQuant(hipStream_t stream,
         {                                                                                \
             gemma_template_launcher(ptrs, sg_, self_sg_, rank_, residual_inp,            \
                                     residual_out, output, weight, scale_out, size, n,     \
-                                    eps, stream);                                        \
+                                    eps, stream, bf16_output);                           \
         }                                                                                \
         else                                                                             \
         {                                                                                \
             template_launcher(ptrs, sg_, self_sg_, rank_, residual_inp, residual_out,     \
-                              output, weight, scale_out, size, n, eps, stream);          \
+                              output, weight, scale_out, size, n, eps, stream,            \
+                              bf16_output);                                              \
         }                                                                                \
     } while(0)
 

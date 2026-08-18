@@ -25,14 +25,14 @@ Notation (from mHC paper arXiv:2512.24880v2):
 import torch
 
 __all__ = [
+    "generate_mhc_inputs",
+    "generate_mhc_post_inputs",
+    "get_test_shapes",
+    "is_doubly_stochastic",
+    "mhc_post_torch",
     "mhc_torch",
     "sinkhorn_knopp_exp_domain_torch",
     "sinkhorn_knopp_log_domain_torch",
-    "is_doubly_stochastic",
-    "generate_mhc_inputs",
-    "get_test_shapes",
-    "mhc_post_torch",
-    "generate_mhc_post_inputs",
 ]
 
 # =============================================================================
@@ -178,7 +178,7 @@ def sinkhorn_knopp_exp_domain_torch(
     Returns:
         Doubly stochastic matrices with shape (M, N, N)
     """
-    M, N, _ = logits.shape
+    _M, _N, _ = logits.shape
 
     A = logits.to(torch.float32)
 
@@ -311,10 +311,7 @@ def is_doubly_stochastic(P: torch.Tensor, tol: float = 1e-3) -> bool:
 
     # Check column sums ≈ 1
     col_sums = P.sum(dim=-2)  # (M, N)
-    if not torch.allclose(col_sums, torch.ones_like(col_sums), atol=tol):
-        return False
-
-    return True
+    return torch.allclose(col_sums, torch.ones_like(col_sums), atol=tol)
 
 
 # =============================================================================

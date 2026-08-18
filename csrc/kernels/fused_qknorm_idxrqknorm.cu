@@ -200,7 +200,10 @@ __device__ __forceinline__ void normAndRope(
 
 template <typename scalar_t,
           typename cache_t,
+          typename index_cache_t,
           vllm::Fp8KVCacheDataType kv_dt,
+          vllm::Fp8KVCacheDataType index_dt,
+          bool kPerTokenKVScale,
           bool kIsSparse,
           bool kInsertKV,
           bool kAsmLayout>
@@ -218,8 +221,9 @@ __global__ void fusedQKNormIdxrQKNormKernel(
     const int64_t* __restrict__ index_slot_mapping,
     cache_t* __restrict__ kv_cache_k,
     cache_t* __restrict__ kv_cache_v,
-    scalar_t* __restrict__ index_cache,
-    // Per-token dynamic-quant OUTPUT dequant scales (fp8 path only). Layout mirrors
+    index_cache_t* __restrict__ index_cache,
+    // Per-token dynamic-quant OUTPUT dequant scales (fp8 per-token path only).
+    // Null for the SGLang unit-scale fp8 contract. Layout mirrors
     // reshape_and_cache_with_pertoken_quant:
     //   asm_layout : [num_blocks, num_kv_heads, block_size]
     //     idx = block_idx*(nkv*block_size) + head*block_size + block_offset
@@ -252,7 +256,6 @@ __global__ void fusedQKNormIdxrQKNormKernel(
     const int v_slots = kInsertKV ? nkv : 0;
     const int idx_slots = kIsSparse ? niq + 1 : 0;
     const int slots_per_token = nq + nkv + v_slots + idx_slots;
-
     const int token_idx = global_warp_idx / slots_per_token;
     const int slot = global_warp_idx % slots_per_token;
     if(token_idx >= num_tokens)
@@ -264,7 +267,6 @@ __global__ void fusedQKNormIdxrQKNormKernel(
     const int v_begin = nq + nkv;
     const int iq_begin = nq + nkv + v_slots;
     const int ik_slot = iq_begin + niq;
-
     const bool is_q = slot < k_begin;
     const bool is_k = slot >= k_begin && slot < v_begin;
     bool is_v = false;
@@ -344,7 +346,8 @@ __global__ void fusedQKNormIdxrQKNormKernel(
                 // Per-token dynamic quant: amax over the lane's raw V elems, then a
                 // full-warp max -> the (token, head) head-dim amax. scale = amax/FP8_MAX.
                 float v_scale_val = 1.0f;
-                if constexpr(kv_dt != vllm::Fp8KVCacheDataType::kAuto)
+                if constexpr(kv_dt != vllm::Fp8KVCacheDataType::kAuto &&
+                             kPerTokenKVScale)
                 {
                     float local_amax = 0.0f;
 #pragma unroll
@@ -414,14 +417,16 @@ __global__ void fusedQKNormIdxrQKNormKernel(
         {
             if(is_ik)
             {
-                storeElems(index_cache + mapped_slot * kHeadDim + dim_base, elems);
+                storeCacheElems<scalar_t, index_cache_t, index_dt>(
+                    index_cache + mapped_slot * kHeadDim + dim_base, elems, 1.0f);
             }
             else if(is_k)
             {
                 // Per-token dynamic quant: amax over the lane's post-norm/rope K elems,
                 // then a full-warp max -> the (token, head) head-dim amax.
                 float k_scale_val = 1.0f;
-                if constexpr(kv_dt != vllm::Fp8KVCacheDataType::kAuto)
+                if constexpr(kv_dt != vllm::Fp8KVCacheDataType::kAuto &&
+                             kPerTokenKVScale)
                 {
                     float local_amax = 0.0f;
 #pragma unroll
@@ -479,7 +484,11 @@ __global__ void fusedQKNormIdxrQKNormKernel(
     }
 }
 
-template <typename scalar_t, typename cache_t, vllm::Fp8KVCacheDataType kv_dt>
+template <typename scalar_t,
+          typename cache_t,
+          typename index_cache_t,
+          vllm::Fp8KVCacheDataType kv_dt,
+          vllm::Fp8KVCacheDataType index_dt>
 void launchFusedQKNormIdxrQKNorm(
     scalar_t* qkv,
     scalar_t* q_out,
@@ -494,7 +503,7 @@ void launchFusedQKNormIdxrQKNorm(
     const int64_t* index_slot_mapping,
     cache_t* kv_cache_k,
     cache_t* kv_cache_v,
-    scalar_t* index_cache,
+    index_cache_t* index_cache,
     float* k_scale,
     float* v_scale,
     float eps,
@@ -514,6 +523,7 @@ void launchFusedQKNormIdxrQKNorm(
     int64_t v_s_head,
     bool has_index,
     bool insert_kv,
+    bool per_token_kv_scale,
     bool asm_layout,
     hipStream_t stream)
 {
@@ -529,8 +539,16 @@ void launchFusedQKNormIdxrQKNorm(
         return;
     }
 
-#define LAUNCH(IS_SPARSE, INSERT, ASM)                                                      \
-    fusedQKNormIdxrQKNormKernel<scalar_t, cache_t, kv_dt, IS_SPARSE, INSERT, ASM>      \
+#define LAUNCH(IS_SPARSE, INSERT, ASM, PER_TOKEN)                                            \
+    fusedQKNormIdxrQKNormKernel<scalar_t,                                                    \
+                                cache_t,                                                     \
+                                index_cache_t,                                               \
+                                kv_dt,                                                       \
+                                index_dt,                                                    \
+                                PER_TOKEN,                                                   \
+                                IS_SPARSE,                                                   \
+                                INSERT,                                                      \
+                                ASM>                                                         \
         <<<grid, kBlockSize, 0, stream>>>(qkv,                                               \
                                           q_out,                                             \
                                           index_q_out,                                       \
@@ -563,17 +581,30 @@ void launchFusedQKNormIdxrQKNorm(
                                           v_s_token,                                         \
                                           v_s_head)
 
-#define LAUNCH_ASM(IS_SPARSE, INSERT)   \
-    do                                  \
-    {                                   \
-        if(asm_layout)                  \
-        {                               \
-            LAUNCH(IS_SPARSE, INSERT, true);  \
-        }                               \
-        else                            \
-        {                               \
-            LAUNCH(IS_SPARSE, INSERT, false); \
-        }                               \
+#define LAUNCH_SCALE(IS_SPARSE, INSERT, ASM)                    \
+    do                                                          \
+    {                                                           \
+        if(per_token_kv_scale)                                  \
+        {                                                       \
+            LAUNCH(IS_SPARSE, INSERT, ASM, true);                \
+        }                                                       \
+        else                                                    \
+        {                                                       \
+            LAUNCH(IS_SPARSE, INSERT, ASM, false);               \
+        }                                                       \
+    } while(0)
+
+#define LAUNCH_ASM(IS_SPARSE, INSERT)                            \
+    do                                                          \
+    {                                                           \
+        if(asm_layout)                                          \
+        {                                                       \
+            LAUNCH_SCALE(IS_SPARSE, INSERT, true);               \
+        }                                                       \
+        else                                                    \
+        {                                                       \
+            LAUNCH_SCALE(IS_SPARSE, INSERT, false);              \
+        }                                                       \
     } while(0)
 
     if(has_index)
@@ -599,6 +630,7 @@ void launchFusedQKNormIdxrQKNorm(
         }
     }
 #undef LAUNCH_ASM
+#undef LAUNCH_SCALE
 #undef LAUNCH
 }
 
@@ -626,6 +658,7 @@ static void fused_qknorm_idxrqknorm_impl(
     std::optional<aiter_tensor_t> index_q_out,
     std::optional<aiter_tensor_t> index_slot_mapping,
     const std::string& kv_cache_dtype,
+    const std::string& index_cache_dtype,
     std::optional<aiter_tensor_t> k_scale,
     std::optional<aiter_tensor_t> v_scale,
     bool asm_layout)
@@ -666,6 +699,10 @@ static void fused_qknorm_idxrqknorm_impl(
     const bool insert_kv = kv_cache_k.has_value();
     const bool fp8_kv_cache =
         insert_kv && kv_cache_dtype.rfind("fp8", 0) == 0;
+    const bool fp8_kv_per_token =
+        fp8_kv_cache && kv_cache_dtype != "fp8_e4m3_unit";
+    const bool fp8_index_cache =
+        insert_kv && has_index && index_cache_dtype.rfind("fp8", 0) == 0;
     const int expected_row = (nq + 2 * nkv + (has_index ? niq + 1 : 0)) * kHeadDim;
     AITER_CHECK(positions.dim() == 1 && positions.size(0) >= num_tokens,
                 "positions must be 1D with at least num_tokens elements");
@@ -721,9 +758,22 @@ static void fused_qknorm_idxrqknorm_impl(
                             index_slot_mapping->size(0) >= num_tokens,
                         "index_slot_mapping must be 1D with at least num_tokens elements");
             AITER_CHECK(index_cache.has_value() && index_cache->is_gpu() &&
-                            index_cache->is_contiguous() &&
-                            index_cache->dtype() == qkv.dtype(),
-                        "sparse insert mode requires contiguous matching index_cache");
+                            index_cache->is_contiguous(),
+                        "sparse insert mode requires contiguous CUDA index_cache");
+            AITER_CHECK(index_cache_dtype == "auto" ||
+                            index_cache_dtype.rfind("fp8", 0) == 0,
+                        "sparse insert mode expects index_cache_dtype='auto' or fp8");
+            if(fp8_index_cache)
+            {
+                AITER_CHECK(index_cache->dtype() == AITER_DTYPE_fp8 ||
+                                index_cache->dtype() == AITER_DTYPE_u8,
+                            "fp8 sparse insert mode requires fp8 or uint8 index_cache");
+            }
+            else
+            {
+                AITER_CHECK(index_cache->dtype() == qkv.dtype(),
+                            "non-fp8 sparse insert mode requires matching index_cache");
+            }
         }
 
         // K/V cache dtype + scale checks (common to both layouts). kv_cache_k is the
@@ -732,19 +782,30 @@ static void fused_qknorm_idxrqknorm_impl(
         AITER_CHECK(kc.is_gpu(), "kv cache must be CUDA");
         if(fp8_kv_cache)
         {
-            AITER_CHECK(kv_cache_dtype == "fp8" || kv_cache_dtype == "fp8_e4m3",
-                        "fused_qknorm_idxrqknorm fp8 cache insert supports fp8_e4m3 only");
+            AITER_CHECK(kv_cache_dtype == "fp8" || kv_cache_dtype == "fp8_e4m3" ||
+                            kv_cache_dtype == "fp8_e4m3_unit",
+                        "fused_qknorm_idxrqknorm fp8 cache insert supports "
+                        "fp8_e4m3 per-token or fp8_e4m3_unit only");
             AITER_CHECK(kc.dtype() == AITER_DTYPE_fp8 || kc.dtype() == AITER_DTYPE_u8,
                         "fp8 kv_cache must use float8_e4m3 or uint8 storage");
-            // k_scale/v_scale are per-token dynamic-quant OUTPUT tensors (fp32). Their
-            // exact shape is validated in the asm/page-128 branches below.
-            AITER_CHECK(k_scale.has_value() && v_scale.has_value() &&
-                            k_scale->is_gpu() && v_scale->is_gpu() &&
-                            k_scale->is_contiguous() && v_scale->is_contiguous() &&
-                            k_scale->dtype() == AITER_DTYPE_fp32 &&
-                            v_scale->dtype() == AITER_DTYPE_fp32,
-                        "fp8 per-token insert requires contiguous float32 CUDA "
-                        "k_scale/v_scale output tensors");
+            AITER_CHECK(k_scale.has_value() == v_scale.has_value(),
+                        "k_scale and v_scale must be provided together");
+            if(fp8_kv_per_token)
+            {
+                // k_scale/v_scale are per-token dynamic-quant OUTPUT tensors (fp32).
+                // Their exact shape is validated in the layout branches below.
+                AITER_CHECK(k_scale.has_value() && k_scale->is_gpu() && v_scale->is_gpu() &&
+                                k_scale->is_contiguous() && v_scale->is_contiguous() &&
+                                k_scale->dtype() == AITER_DTYPE_fp32 &&
+                                v_scale->dtype() == AITER_DTYPE_fp32,
+                            "fp8 per-token insert requires contiguous float32 CUDA "
+                            "k_scale/v_scale output tensors");
+            }
+            else
+            {
+                AITER_CHECK(!k_scale.has_value(),
+                            "fp8_e4m3_unit does not accept k_scale/v_scale tensors");
+            }
         }
         else
         {
@@ -790,7 +851,7 @@ static void fused_qknorm_idxrqknorm_impl(
                             "* 128 elements");
             }
             // strides unused in asm_layout (kernel computes SHUFFLE offsets directly).
-            if(fp8_kv_cache)
+            if(fp8_kv_per_token)
             {
                 // Per-token dequant scales: [num_blocks, num_kv_heads, block_size]
                 // (mirrors reshape_and_cache_with_pertoken_quant asm_layout).
@@ -832,7 +893,7 @@ static void fused_qknorm_idxrqknorm_impl(
             v_s_block = kv_cache_v->stride(0);
             v_s_token = kv_cache_v->stride(1);
             v_s_head = kv_cache_v->stride(2);
-            if(fp8_kv_cache)
+            if(fp8_kv_per_token)
             {
                 // Per-token dequant scales: [num_kv_heads, max_kv_tokens] with
                 // idx = head * max_kv_tokens + slot (mirrors
@@ -877,7 +938,61 @@ static void fused_qknorm_idxrqknorm_impl(
         using T = scalar_t;
         if(fp8_kv_cache)
         {
-            launchFusedQKNormIdxrQKNorm<T, opus::fp8_t, vllm::Fp8KVCacheDataType::kFp8E4M3>(
+            if(fp8_index_cache)
+            {
+                launchFusedQKNormIdxrQKNorm<T,
+                                            opus::fp8_t,
+                                            opus::fp8_t,
+                                            vllm::Fp8KVCacheDataType::kFp8E4M3,
+                                            vllm::Fp8KVCacheDataType::kFp8E4M3>(
+                reinterpret_cast<T*>(qkv.data_ptr()),
+                q_out.has_value() ? reinterpret_cast<T*>(q_out->data_ptr()) : nullptr,
+                index_q_out.has_value() ? reinterpret_cast<T*>(index_q_out->data_ptr())
+                                        : nullptr,
+                reinterpret_cast<const T*>(q_norm_weight.data_ptr()),
+                reinterpret_cast<const T*>(k_norm_weight.data_ptr()),
+                has_index ? reinterpret_cast<const T*>(index_q_norm_weight->data_ptr())
+                          : nullptr,
+                has_index ? reinterpret_cast<const T*>(index_k_norm_weight->data_ptr())
+                          : nullptr,
+                reinterpret_cast<const T*>(cos_sin_cache.data_ptr()),
+                reinterpret_cast<int64_t*>(positions.data_ptr()),
+                insert_kv ? reinterpret_cast<int64_t*>(slot_mapping->data_ptr()) : nullptr,
+                (insert_kv && has_index) ? reinterpret_cast<int64_t*>(index_slot_mapping->data_ptr()) : nullptr,
+                insert_kv ? reinterpret_cast<opus::fp8_t*>(kv_cache_k->data_ptr()) : nullptr,
+                insert_kv ? reinterpret_cast<opus::fp8_t*>(kv_cache_v->data_ptr()) : nullptr,
+                (insert_kv && has_index) ? reinterpret_cast<opus::fp8_t*>(index_cache->data_ptr())
+                                         : nullptr,
+                fp8_kv_per_token ? reinterpret_cast<float*>(k_scale->data_ptr()) : nullptr,
+                fp8_kv_per_token ? reinterpret_cast<float*>(v_scale->data_ptr()) : nullptr,
+                static_cast<float>(eps),
+                static_cast<int>(rotary_dim),
+                num_tokens,
+                nq,
+                nkv,
+                niq,
+                static_cast<int>(block_size),
+                x,
+                max_kv_tokens,
+                k_s_block,
+                k_s_token,
+                k_s_head,
+                v_s_block,
+                v_s_token,
+                v_s_head,
+                has_index,
+                insert_kv,
+                fp8_kv_per_token,
+                asm_layout,
+                stream);
+            }
+            else
+            {
+                launchFusedQKNormIdxrQKNorm<T,
+                                            opus::fp8_t,
+                                            T,
+                                            vllm::Fp8KVCacheDataType::kFp8E4M3,
+                                            vllm::Fp8KVCacheDataType::kAuto>(
                 reinterpret_cast<T*>(qkv.data_ptr()),
                 q_out.has_value() ? reinterpret_cast<T*>(q_out->data_ptr()) : nullptr,
                 index_q_out.has_value() ? reinterpret_cast<T*>(index_q_out->data_ptr())
@@ -896,8 +1011,8 @@ static void fused_qknorm_idxrqknorm_impl(
                 insert_kv ? reinterpret_cast<opus::fp8_t*>(kv_cache_v->data_ptr()) : nullptr,
                 (insert_kv && has_index) ? reinterpret_cast<T*>(index_cache->data_ptr())
                                          : nullptr,
-                insert_kv ? reinterpret_cast<float*>(k_scale->data_ptr()) : nullptr,
-                insert_kv ? reinterpret_cast<float*>(v_scale->data_ptr()) : nullptr,
+                fp8_kv_per_token ? reinterpret_cast<float*>(k_scale->data_ptr()) : nullptr,
+                fp8_kv_per_token ? reinterpret_cast<float*>(v_scale->data_ptr()) : nullptr,
                 static_cast<float>(eps),
                 static_cast<int>(rotary_dim),
                 num_tokens,
@@ -915,12 +1030,68 @@ static void fused_qknorm_idxrqknorm_impl(
                 v_s_head,
                 has_index,
                 insert_kv,
+                fp8_kv_per_token,
                 asm_layout,
                 stream);
+            }
         }
         else
         {
-            launchFusedQKNormIdxrQKNorm<T, T, vllm::Fp8KVCacheDataType::kAuto>(
+            if(fp8_index_cache)
+            {
+                launchFusedQKNormIdxrQKNorm<T,
+                                            T,
+                                            opus::fp8_t,
+                                            vllm::Fp8KVCacheDataType::kAuto,
+                                            vllm::Fp8KVCacheDataType::kFp8E4M3>(
+                reinterpret_cast<T*>(qkv.data_ptr()),
+                q_out.has_value() ? reinterpret_cast<T*>(q_out->data_ptr()) : nullptr,
+                index_q_out.has_value() ? reinterpret_cast<T*>(index_q_out->data_ptr())
+                                        : nullptr,
+                reinterpret_cast<const T*>(q_norm_weight.data_ptr()),
+                reinterpret_cast<const T*>(k_norm_weight.data_ptr()),
+                has_index ? reinterpret_cast<const T*>(index_q_norm_weight->data_ptr())
+                          : nullptr,
+                has_index ? reinterpret_cast<const T*>(index_k_norm_weight->data_ptr())
+                          : nullptr,
+                reinterpret_cast<const T*>(cos_sin_cache.data_ptr()),
+                reinterpret_cast<int64_t*>(positions.data_ptr()),
+                insert_kv ? reinterpret_cast<int64_t*>(slot_mapping->data_ptr()) : nullptr,
+                (insert_kv && has_index) ? reinterpret_cast<int64_t*>(index_slot_mapping->data_ptr()) : nullptr,
+                insert_kv ? reinterpret_cast<T*>(kv_cache_k->data_ptr()) : nullptr,
+                insert_kv ? reinterpret_cast<T*>(kv_cache_v->data_ptr()) : nullptr,
+                (insert_kv && has_index) ? reinterpret_cast<opus::fp8_t*>(index_cache->data_ptr())
+                                         : nullptr,
+                nullptr,
+                nullptr,
+                static_cast<float>(eps),
+                static_cast<int>(rotary_dim),
+                num_tokens,
+                nq,
+                nkv,
+                niq,
+                static_cast<int>(block_size),
+                x,
+                max_kv_tokens,
+                k_s_block,
+                k_s_token,
+                k_s_head,
+                v_s_block,
+                v_s_token,
+                v_s_head,
+                has_index,
+                insert_kv,
+                fp8_kv_per_token,
+                asm_layout,
+                stream);
+            }
+            else
+            {
+                launchFusedQKNormIdxrQKNorm<T,
+                                            T,
+                                            T,
+                                            vllm::Fp8KVCacheDataType::kAuto,
+                                            vllm::Fp8KVCacheDataType::kAuto>(
                 reinterpret_cast<T*>(qkv.data_ptr()),
                 q_out.has_value() ? reinterpret_cast<T*>(q_out->data_ptr()) : nullptr,
                 index_q_out.has_value() ? reinterpret_cast<T*>(index_q_out->data_ptr())
@@ -958,8 +1129,10 @@ static void fused_qknorm_idxrqknorm_impl(
                 v_s_head,
                 has_index,
                 insert_kv,
+                fp8_kv_per_token,
                 asm_layout,
                 stream);
+            }
         }
     });
 }
@@ -985,58 +1158,10 @@ void fused_qknorm_idxrqknorm(
     std::optional<aiter_tensor_t> q_out,
     std::optional<aiter_tensor_t> index_q_out,
     std::optional<aiter_tensor_t> index_slot_mapping,
-    bool asm_layout)
-{
-    fused_qknorm_idxrqknorm_impl(qkv,
-                                                q_norm_weight,
-                                                k_norm_weight,
-                                                cos_sin_cache,
-                                                positions,
-                                                num_heads,
-                                                num_kv_heads,
-                                                rotary_dim,
-                                                eps,
-                                                index_q_norm_weight,
-                                                index_k_norm_weight,
-                                                num_index_heads,
-                                                slot_mapping,
-                                                kv_cache_k,
-                                                kv_cache_v,
-                                                index_cache,
-                                                block_size,
-                                                q_out,
-                                                index_q_out,
-                                                index_slot_mapping,
-                                                "auto",
-                                                std::nullopt,
-                                                std::nullopt,
-                                                asm_layout);
-}
-
-void fused_qknorm_idxrqknorm_fp8(
-    aiter_tensor_t& qkv,
-    const aiter_tensor_t& q_norm_weight,
-    const aiter_tensor_t& k_norm_weight,
-    const aiter_tensor_t& cos_sin_cache,
-    const aiter_tensor_t& positions,
-    int64_t num_heads,
-    int64_t num_kv_heads,
-    int64_t rotary_dim,
-    double eps,
-    const aiter_tensor_t& index_q_norm_weight,
-    const aiter_tensor_t& index_k_norm_weight,
-    int64_t num_index_heads,
-    const aiter_tensor_t& slot_mapping,
-    std::optional<aiter_tensor_t> kv_cache_k,
-    std::optional<aiter_tensor_t> kv_cache_v,
-    aiter_tensor_t& index_cache,
-    int64_t block_size,
-    aiter_tensor_t& q_out,
-    aiter_tensor_t& index_q_out,
-    const aiter_tensor_t& index_slot_mapping,
     const std::string& kv_cache_dtype,
-    const aiter_tensor_t& k_scale,
-    const aiter_tensor_t& v_scale,
+    const std::string& index_cache_dtype,
+    std::optional<aiter_tensor_t> k_scale,
+    std::optional<aiter_tensor_t> v_scale,
     bool asm_layout)
 {
     fused_qknorm_idxrqknorm_impl(qkv,
@@ -1060,6 +1185,7 @@ void fused_qknorm_idxrqknorm_fp8(
                                                 index_q_out,
                                                 index_slot_mapping,
                                                 kv_cache_dtype,
+                                                index_cache_dtype,
                                                 k_scale,
                                                 v_scale,
                                                 asm_layout);

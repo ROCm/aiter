@@ -24,7 +24,7 @@ def compile(
     logits_dtype: str,
     sink_dtype: str,
     use_sinks: bool,
-    folder: str = None,
+    folder: str | None = None,
 ):
     return compile_template_op(
         src_template,

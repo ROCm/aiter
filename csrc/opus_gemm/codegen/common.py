@@ -15,11 +15,11 @@ WARP_SIZE = 64
 W3_KERNEL_PAIRS = {
     "a16w16_kbuf2v": "a16w16_kbuf2v_sk",
     "a16w16_kbuf2v_bk128": "a16w16_kbuf2v_bk128_sk",
-    "a16w16_kbuf1": "a16w16_kbuf1_sk",
     "a16w16_quad_mfma32_kbuf1": "a16w16_quad_mfma32_kbuf1_sk",
 }
 _NOSPLIT = tuple(W3_KERNEL_PAIRS.keys())
-_SPLITK = tuple(W3_KERNEL_PAIRS.values())
+_GFX942_SPLITK_ONLY = ("a16w16_kbuf1_sk",)
+_SPLITK = tuple(W3_KERNEL_PAIRS.values()) + _GFX942_SPLITK_ONLY
 _GFX942_A16W16_TAGS = (
     _SPLITK
     + (
@@ -40,6 +40,9 @@ _A16W16_TAGS = (
     "a16w16_cluster_tdm_splitk_ws",
     # gfx1250 CLUSTER-LAUNCH (multicast) TDM split-K (fp32 workspace + reduce).
     "a16w16_clusterlaunch_tdm_splitk_ws",
+    # gfx1250 FUSED single-kernel in-cluster split-K reduce (no reduce kernel);
+    # B multicast + GL2-resident partial workspace + cluster-barrier sync.
+    "a16w16_clusterlaunch_tdm_splitk_fuse",
 ) + _GFX942_A16W16_TAGS
 
 EMIT_REGISTRY = {}

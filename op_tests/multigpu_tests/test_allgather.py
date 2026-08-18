@@ -1,33 +1,32 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import argparse
+import logging
 import os
-from typing import Optional
+from multiprocessing import Pool, freeze_support, set_start_method
 
+import pandas as pd
 import torch
 import torch.distributed as dist
-import argparse
-import pandas as pd
-from aiter import dtypes
 
+from aiter import dtypes
+from aiter.dist.communication_op import tensor_model_parallel_all_gather
 from aiter.dist.parallel_state import (
+    destroy_distributed_environment,
+    destroy_model_parallel,
     ensure_model_parallel_initialized,
-    init_distributed_environment,
-    set_custom_all_reduce,
     get_tp_group,
     graph_capture,
-    destroy_model_parallel,
-    destroy_distributed_environment,
+    init_distributed_environment,
+    set_custom_all_reduce,
 )
-from aiter.dist.utils import get_open_port, get_distributed_init_method, get_ip
-from aiter.dist.communication_op import tensor_model_parallel_all_gather
+from aiter.dist.utils import get_distributed_init_method, get_ip, get_open_port
 from aiter.test_common import (
+    benchmark,
     checkAllclose,
     perftest,
-    benchmark,
 )
-from multiprocessing import set_start_method, Pool, freeze_support
-import logging
 
 logger = logging.getLogger("aiter")
 
@@ -42,7 +41,7 @@ def run_allgather(
     withGraph=False,
     use_custom=False,
     dim=0,
-    distributed_init_method: Optional[str] = None,
+    distributed_init_method: str | None = None,
 ):
     device = torch.device(f"cuda:{rankID}")
     torch.cuda.set_device(device)
@@ -65,11 +64,8 @@ def run_allgather(
 
     if withGraph:
         graph = torch.cuda.CUDAGraph()
-        with graph_capture() as gc:
-            with torch.cuda.graph(graph, stream=gc.stream):
-                out = tensor_model_parallel_all_gather(
-                    x, use_custom=use_custom, dim=dim
-                )
+        with graph_capture() as gc, torch.cuda.graph(graph, stream=gc.stream):
+            out = tensor_model_parallel_all_gather(x, use_custom=use_custom, dim=dim)
         out.fill_(0)
 
         @perftest()
@@ -101,7 +97,7 @@ def call_ccl_allgather_naive(
     x,
     use_custom=True,
     loop_time=1,
-    distributed_init_method: Optional[str] = None,
+    distributed_init_method: str | None = None,
 ):
     device = torch.device(f"cuda:{rankID}")
     torch.cuda.set_device(device)
@@ -116,8 +112,10 @@ def call_ccl_allgather_naive(
     ensure_model_parallel_initialized(tp_size, pp_size)
     x = x.to(device)
 
-    # warmup and align all gpu
-    group = get_tp_group().device_group
+    # warmup and align all gpu. device_group is a plain attribute assigned in
+    # GroupCoordinator.__init__, so the access itself does nothing -- the point is
+    # get_tp_group(), which raises if the TP group was never initialised.
+    _ = get_tp_group().device_group
     torch.cuda.synchronize()
 
     for i in range(loop_time):
@@ -137,7 +135,7 @@ def allgather_acctest(
     shape,
     dtype,
     use_custom=False,
-    distributed_init_method: Optional[str] = None,
+    distributed_init_method: str | None = None,
 ):
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = "49373"
@@ -186,7 +184,7 @@ def allgather_perftest(
     withGraph=False,
     use_custom=False,
     dim=0,
-    distributed_init_method: Optional[str] = None,
+    distributed_init_method: str | None = None,
 ):
     print(f"run perf test, use custom allgather {use_custom}")
     os.environ["MASTER_ADDR"] = "127.0.0.1"
@@ -243,6 +241,21 @@ l_shape = [
     # threshold: 64 MB (2 GPU) / 32 MB (4 GPU) / 16 MB (8 GPU)
     # this shape = 4097*8192*2 bytes ≈ 64.015 MB, exceeds even the 2-GPU threshold
     (4097, 8192),
+    # --- gfx1250 unrolled-allgather tail-coverage repro ---
+    # The gfx1250 ag_gfx1250_lastdim / ag_gfx1250_naive_unroll4 kernels loop
+    # with guard `idx + blockDim.x*(unroll-1) < size`, so any tail shorter than
+    # blockDim.x*unroll packed elements is never written (output is
+    # torch.empty -> garbage). Triggered only when the packed element count is
+    # NOT a multiple of that stride. Existing shapes all divide evenly so they
+    # never hit the tail; these do.
+    #
+    # dim=-1 (LM head geometry): DeepSeek-V4 vocab=129280, tp=4 -> per-rank
+    # shard 32320. packed last_dim = 32320/8 = 4040; size = 65*4040 = 262600,
+    # which is NOT a multiple of 512*4 = 2048 -> lastdim kernel drops the tail.
+    (65, 32320),
+    # dim=0 path: size = 65*7168/8 = 58240, NOT a multiple of 256*4 = 1024 ->
+    # naive_unroll4 kernel drops the tail.
+    (65, 7168),
 ]
 
 parser = argparse.ArgumentParser(description="config input of test")
@@ -265,6 +278,14 @@ parser.add_argument(
     default=None,
     help="shape. e.g. -s 128,8192",
 )
+parser.add_argument(
+    "-t",
+    "--tp_size",
+    type=int,
+    choices=[2, 4, 8],
+    default=4,
+    help="tensor-parallel world size (default: 4)",
+)
 
 
 if __name__ == "__main__":
@@ -276,6 +297,7 @@ if __name__ == "__main__":
         l_dtype = [dtypes.d_dtypes[args.dtype]]
     if args.shape is not None:
         l_shape = [args.shape]
+    tp_size = args.tp_size
     l_dim = [0, -1]
     df = []
     for dtype in l_dtype:
@@ -283,7 +305,7 @@ if __name__ == "__main__":
             for dim in l_dim:
                 for use_custom in [False, True]:
                     ret = allgather_perftest(
-                        8,
+                        tp_size,
                         1,
                         shape,
                         dtype,

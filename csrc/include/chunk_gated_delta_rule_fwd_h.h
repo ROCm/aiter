@@ -15,6 +15,7 @@ void chunk_gated_delta_rule_fwd_h_hip(
     aiter_tensor_t g,
     aiter_tensor_t gk,
     aiter_tensor_t initial_state,
+    aiter_tensor_t initial_state_indices,
     aiter_tensor_t cu_seqlens,
     aiter_tensor_t chunk_offsets,
     aiter_tensor_t h,
