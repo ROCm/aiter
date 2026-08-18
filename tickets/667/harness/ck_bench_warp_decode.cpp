@@ -28,6 +28,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <random>
@@ -518,6 +519,229 @@ static void bench(const Shape& sh, index_t B, int cold, int iters, int rotate_en
 }
 
 // ---------------------------------------------------------------------------
+// D7-lite numerical validation (CK_WD_VALIDATE=1): run the FP8/BF16 kernels ONCE
+// on real, host-quantized inputs and dump inputs+output to disk so a Python
+// validator can rebuild the torch reference on the *identical* bytes and compare
+// (cos / allclose).  Perf mode is untouched -- this path returns before the
+// timing loop.  FP4 is intentionally skipped (needs the e8m0 (1,32) pack, tracked
+// in full D7 / B1); scales are a single uniform constant per operand so the
+// comparison is independent of CK's internal Block2D scale-index layout.
+// ---------------------------------------------------------------------------
+
+static constexpr float VAL_WSCALE = 0.5f; // uniform weight dequant scale
+static constexpr float VAL_XSCALE = 0.5f; // uniform fp8-activation dequant scale
+
+static void write_raw(const std::string& path, const void* data, std::size_t bytes)
+{
+    std::ofstream f(path, std::ios::binary);
+    f.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(bytes));
+}
+
+template <typename Kern>
+static bool run_once(typename Kern::Kargs a)
+{
+    if(!Kern::IsSupportedArgument(a))
+        return false;
+    stream_config s{};
+    make_kernel(Kern{}, Kern::GridSize(a), Kern::BlockSize(), 0, a)(s);
+    HIP_CHECK_ERROR(hipDeviceSynchronize());
+    return true;
+}
+
+// Deterministic host fills -----------------------------------------------------
+static std::vector<bf16_t> host_bf16(std::size_t n, std::mt19937& rng, float lo, float hi)
+{
+    std::uniform_real_distribution<float> d(lo, hi);
+    std::vector<bf16_t> v(n);
+    for(auto& e : v)
+        e = type_convert<bf16_t>(d(rng));
+    return v;
+}
+static std::vector<fp8_t> host_fp8(std::size_t n, std::mt19937& rng, float lo, float hi)
+{
+    std::uniform_real_distribution<float> d(lo, hi);
+    std::vector<fp8_t> v(n);
+    for(auto& e : v)
+        e = type_convert<fp8_t>(d(rng));
+    return v;
+}
+
+static void validate(const std::string& dir)
+{
+    // Small shapes but honoring the kernels' divisibility gates:
+    //   gate_up needs HIDDEN % (warp_size*kVector==512) == 0,
+    //   down needs INTER % 512 == 0; Block2D<128,128> needs dims % 128 == 0;
+    //   bk = B*K <= E so every routed slot hits a distinct expert.
+    const index_t B = 4, H = 512, I = 512, K = 2, E = 8;
+    const int bk = static_cast<int>(B) * static_cast<int>(K);
+    std::mt19937 rng(20260818u);
+
+    // Router ids: distinct experts per (token,slot); router wts uniform 1/K.
+    std::vector<int32_t> rids(bk);
+    for(int i = 0; i < bk; ++i)
+        rids[i] = i % static_cast<int>(E);
+    std::vector<float> rwts(bk, 1.0f / static_cast<float>(K));
+
+    DeviceMem rids_dev(bk * sizeof(int32_t));
+    rids_dev.ToDevice(rids.data());
+    DeviceMem rwts_dev(bk * sizeof(float));
+    rwts_dev.ToDevice(rwts.data());
+    auto rids_ptr = static_cast<const int32_t*>(rids_dev.GetDeviceBuffer());
+    auto rwts_ptr = static_cast<const float*>(rwts_dev.GetDeviceBuffer());
+
+    // Uniform scale buffers (fill the whole allocation so any read index == const).
+    auto fill_scale = [](DeviceMem& m, std::size_t n, float val) {
+        std::vector<float> s(n, val);
+        m.ToDevice(s.data());
+    };
+
+    // Shared weights (host-quantized fp8) for gate/up, reused by both gate kernels.
+    auto wg_h = host_fp8(static_cast<std::size_t>(E) * I * H, rng, -0.25f, 0.25f);
+    auto wu_h = host_fp8(static_cast<std::size_t>(E) * I * H, rng, -0.25f, 0.25f);
+    DeviceMem wg_dev(wg_h.size() * sizeof(fp8_t)), wu_dev(wu_h.size() * sizeof(fp8_t));
+    wg_dev.ToDevice(wg_h.data());
+    wu_dev.ToDevice(wu_h.data());
+    DeviceMem wg_sc(static_cast<std::size_t>(E) * I * (H / 128) * sizeof(float));
+    DeviceMem wu_sc(static_cast<std::size_t>(E) * I * (H / 128) * sizeof(float));
+    fill_scale(wg_sc, static_cast<std::size_t>(E) * I * (H / 128), VAL_WSCALE);
+    fill_scale(wu_sc, static_cast<std::size_t>(E) * I * (H / 128), VAL_WSCALE);
+
+    DeviceMem inter_dev(static_cast<std::size_t>(B) * K * I * sizeof(bf16_t)); // gate out / down in
+    DeviceMem gu_out_dev(static_cast<std::size_t>(B) * K * I * sizeof(bf16_t));
+    std::vector<std::string> done;
+
+    // -- gate_bf16_d2 : bf16 act x fp8 weight -----------------------------------
+    {
+        auto x_h = host_bf16(static_cast<std::size_t>(B) * H, rng, -1.0f, 1.0f);
+        DeviceMem x_dev(x_h.size() * sizeof(bf16_t));
+        x_dev.ToDevice(x_h.data());
+        typename GUKernBF16D2::Kargs a{};
+        a.p_x                 = x_dev.GetDeviceBuffer();
+        a.p_x_scale           = nullptr;
+        a.p_w_gate            = wg_dev.GetDeviceBuffer();
+        a.p_w_gate_scale      = static_cast<const float*>(wg_sc.GetDeviceBuffer());
+        a.p_w_up              = wu_dev.GetDeviceBuffer();
+        a.p_w_up_scale        = static_cast<const float*>(wu_sc.GetDeviceBuffer());
+        a.p_router_ids        = rids_ptr;
+        a.p_intermediate      = gu_out_dev.GetDeviceBuffer();
+        a.b                   = B;
+        a.hidden              = H;
+        a.inter               = I;
+        a.top_k               = K;
+        a.e                   = E;
+        a.stride_x            = H;
+        a.stride_w_gate       = H;
+        a.stride_w_up         = H;
+        a.stride_intermediate = I;
+        if(run_once<GUKernBF16D2>(a))
+        {
+            std::vector<bf16_t> out(static_cast<std::size_t>(B) * K * I);
+            gu_out_dev.FromDevice(out.data());
+            write_raw(dir + "/gate_bf16_d2.x.bin", x_h.data(), x_h.size() * sizeof(bf16_t));
+            write_raw(dir + "/gate_bf16_d2.wg.bin", wg_h.data(), wg_h.size() * sizeof(fp8_t));
+            write_raw(dir + "/gate_bf16_d2.wu.bin", wu_h.data(), wu_h.size() * sizeof(fp8_t));
+            write_raw(dir + "/gate_bf16_d2.rids.bin", rids.data(), rids.size() * sizeof(int32_t));
+            write_raw(dir + "/gate_bf16_d2.out.bin", out.data(), out.size() * sizeof(bf16_t));
+            done.push_back("gate_bf16_d2");
+        }
+        else
+            std::cerr << "# validate: gate_bf16_d2 unsupported, skipped\n";
+    }
+
+    // -- gate_fp8_d2 : fp8 act x fp8 weight -------------------------------------
+    {
+        auto x_h = host_fp8(static_cast<std::size_t>(B) * H, rng, -1.0f, 1.0f);
+        DeviceMem x_dev(x_h.size() * sizeof(fp8_t));
+        x_dev.ToDevice(x_h.data());
+        DeviceMem x_sc(static_cast<std::size_t>(B) * (H / 128) * sizeof(float));
+        fill_scale(x_sc, static_cast<std::size_t>(B) * (H / 128), VAL_XSCALE);
+        typename GUKernFP8D2::Kargs a{};
+        a.p_x                 = x_dev.GetDeviceBuffer();
+        a.p_x_scale           = static_cast<const float*>(x_sc.GetDeviceBuffer());
+        a.p_w_gate            = wg_dev.GetDeviceBuffer();
+        a.p_w_gate_scale      = static_cast<const float*>(wg_sc.GetDeviceBuffer());
+        a.p_w_up              = wu_dev.GetDeviceBuffer();
+        a.p_w_up_scale        = static_cast<const float*>(wu_sc.GetDeviceBuffer());
+        a.p_router_ids        = rids_ptr;
+        a.p_intermediate      = gu_out_dev.GetDeviceBuffer();
+        a.b                   = B;
+        a.hidden              = H;
+        a.inter               = I;
+        a.top_k               = K;
+        a.e                   = E;
+        a.stride_x            = H;
+        a.stride_w_gate       = H;
+        a.stride_w_up         = H;
+        a.stride_intermediate = I;
+        if(run_once<GUKernFP8D2>(a))
+        {
+            std::vector<bf16_t> out(static_cast<std::size_t>(B) * K * I);
+            gu_out_dev.FromDevice(out.data());
+            write_raw(dir + "/gate_fp8_d2.x.bin", x_h.data(), x_h.size() * sizeof(fp8_t));
+            write_raw(dir + "/gate_fp8_d2.wg.bin", wg_h.data(), wg_h.size() * sizeof(fp8_t));
+            write_raw(dir + "/gate_fp8_d2.wu.bin", wu_h.data(), wu_h.size() * sizeof(fp8_t));
+            write_raw(dir + "/gate_fp8_d2.rids.bin", rids.data(), rids.size() * sizeof(int32_t));
+            write_raw(dir + "/gate_fp8_d2.out.bin", out.data(), out.size() * sizeof(bf16_t));
+            done.push_back("gate_fp8_d2");
+        }
+        else
+            std::cerr << "# validate: gate_fp8_d2 unsupported, skipped\n";
+    }
+
+    // -- down_h2_d2 : bf16 inter x fp8 weight -----------------------------------
+    {
+        auto inter_h = host_bf16(static_cast<std::size_t>(B) * K * I, rng, -1.0f, 1.0f);
+        inter_dev.ToDevice(inter_h.data());
+        auto wd_h = host_fp8(static_cast<std::size_t>(E) * H * I, rng, -0.25f, 0.25f);
+        DeviceMem wd_dev(wd_h.size() * sizeof(fp8_t));
+        wd_dev.ToDevice(wd_h.data());
+        DeviceMem wd_sc(static_cast<std::size_t>(E) * (H / 128) * (I / 128) * sizeof(float));
+        fill_scale(wd_sc, static_cast<std::size_t>(E) * (H / 128) * (I / 128), VAL_WSCALE);
+        DeviceMem y_dev(static_cast<std::size_t>(B) * H * sizeof(bf16_t));
+        typename DnKernFP8H2D2::Kargs a{};
+        a.p_intermediate      = inter_dev.GetDeviceBuffer();
+        a.p_w_down            = wd_dev.GetDeviceBuffer();
+        a.p_w_down_scale      = static_cast<const float*>(wd_sc.GetDeviceBuffer());
+        a.p_router_ids        = rids_ptr;
+        a.p_router_wts        = rwts_ptr;
+        a.p_y                 = y_dev.GetDeviceBuffer();
+        a.b                   = B;
+        a.hidden              = H;
+        a.inter               = I;
+        a.top_k               = K;
+        a.e                   = E;
+        a.stride_intermediate = I;
+        a.stride_w_down       = I;
+        a.stride_y            = H;
+        if(run_once<DnKernFP8H2D2>(a))
+        {
+            std::vector<bf16_t> out(static_cast<std::size_t>(B) * H);
+            y_dev.FromDevice(out.data());
+            write_raw(
+                dir + "/down_h2_d2.inter.bin", inter_h.data(), inter_h.size() * sizeof(bf16_t));
+            write_raw(dir + "/down_h2_d2.wd.bin", wd_h.data(), wd_h.size() * sizeof(fp8_t));
+            write_raw(dir + "/down_h2_d2.rids.bin", rids.data(), rids.size() * sizeof(int32_t));
+            write_raw(dir + "/down_h2_d2.rwts.bin", rwts.data(), rwts.size() * sizeof(float));
+            write_raw(dir + "/down_h2_d2.out.bin", out.data(), out.size() * sizeof(bf16_t));
+            done.push_back("down_h2_d2");
+        }
+        else
+            std::cerr << "# validate: down_h2_d2 unsupported, skipped\n";
+    }
+
+    // Manifest: dims + uniform scales + which kernels dumped (fixed file naming).
+    std::ostringstream js;
+    js << "{\n  \"B\": " << B << ", \"H\": " << H << ", \"I\": " << I << ", \"K\": " << K
+       << ", \"E\": " << E << ",\n  \"wscale\": " << VAL_WSCALE << ", \"xscale\": " << VAL_XSCALE
+       << ",\n  \"kernels\": [";
+    for(std::size_t i = 0; i < done.size(); ++i)
+        js << (i ? ", " : "") << '"' << done[i] << '"';
+    js << "]\n}\n";
+    write_raw(dir + "/manifest.json", js.str().data(), js.str().size());
+    std::cerr << "# validate: wrote " << done.size() << " kernel dump(s) to " << dir << "\n";
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -538,6 +762,15 @@ static std::vector<std::string> split_csv(const char* s)
 
 int main()
 {
+    // D7-lite numerical validation: dump FP8/BF16 kernel I/O for a Python torch
+    // cross-check, then exit (perf mode stays the default when the flag is unset).
+    if(const char* v = std::getenv("CK_WD_VALIDATE"); v && std::string(v) != "0")
+    {
+        const char* d = std::getenv("CK_WD_VALIDATE_DIR");
+        validate(d && *d ? std::string(d) : std::string("./ck_validate_dump"));
+        return 0;
+    }
+
     // Shape filter from env
     auto shape_env = split_csv(std::getenv("CK_WD_SHAPES"));
     auto batch_env = split_csv(std::getenv("CK_WD_BATCHES"));
