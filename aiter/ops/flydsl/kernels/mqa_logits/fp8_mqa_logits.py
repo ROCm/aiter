@@ -519,7 +519,6 @@ def _build_kernel_mfma_r_w(
     K_STEPS = D // MFMA_K  # MFMA K-steps over the head dim
     N_TILES_PER_WAVE = N_TILES // WPB  # column-tiles per wave
 
-    fm_fast = arith.FastMathFlags.fast
     mfma_fn = mfma.fn
 
     _cvt_tag = ""
@@ -669,7 +668,7 @@ def _build_kernel_mfma_r_w(
                         fx.Int32(mi * MFMA_M + mfma.acc_head_static_offsets[ii])
                         + lane_head
                     )
-                    row_w[mi][ii] = fx.Float32(w_t[row, h_w]).ir_value()
+                    row_w[mi][ii] = fx.Float32(w_t[row, h_w])
             w_frag[j] = row_w
 
         # ---- Union window across all RPB rows ----
@@ -711,7 +710,7 @@ def _build_kernel_mfma_r_w(
                 col = col0 + abs_ni * fx.Int32(MFMA_N) + lane_mod_N
                 cols[ni] = col
                 col_clamped = _imin(col, seq_len_kv - fx.Int32(1))
-                kv_scales_tile[ni] = fx.Float32(sc_t[col_clamped]).ir_value()
+                kv_scales_tile[ni] = fx.Float32(sc_t[col_clamped])
                 base_b = col_clamped * fx.Int32(D)
                 for kk in range_constexpr(K_STEPS):
                     b_packs[ni][kk] = _load_frag(
@@ -725,7 +724,7 @@ def _build_kernel_mfma_r_w(
                 for ni in range_constexpr(N_TILES_PER_WAVE):
                     col = cols[ni]
                     kv_scale = kv_scales_tile[ni]
-                    col_sum = f32_0.ir_value()
+                    col_sum = f32_0
                     for mi in range_constexpr(M_TILES):
                         acc = Vec.filled(ACC_ELEMS, 0.0, fx.Float32)
                         for kk in range_constexpr(K_STEPS):
@@ -740,21 +739,14 @@ def _build_kernel_mfma_r_w(
                         # whole column sum is scaled once (below) instead of every
                         # head term -- drops M_TILES*4 muls to one.
                         for ii in range_constexpr(ACC_ELEMS):
-                            score = Vec(acc)[ii].ir_value()
-                            relu = fx.Float32(score).maximumf(f32_0).ir_value()
-                            wsc = arith.MulFOp(
-                                relu, w_frag[j][mi][ii], fastmath=fm_fast
-                            ).result
-                            col_sum = arith.AddFOp(
-                                col_sum, wsc, fastmath=fm_fast
-                            ).result
-                    col_sum = arith.MulFOp(col_sum, kv_scale, fastmath=fm_fast).result
+                            relu = Vec(acc)[ii].maximumf(f32_0)
+                            col_sum = col_sum + relu * w_frag[j][mi][ii]
+                    col_sum = col_sum * kv_scale
 
                     # Head-reduce within the wave (width=64) via the atom's
                     # shuffle_xor butterfly (16, 32 for the 16x16 atoms).
                     for sh in mfma.shuffle_offsets:
-                        peer = fx.Float32(col_sum).shuffle_xor(sh, 64).ir_value()
-                        col_sum = arith.AddFOp(col_sum, peer, fastmath=fm_fast).result
+                        col_sum = col_sum + col_sum.shuffle_xor(sh, 64)
 
                     # Only lane_div_N==0 lanes hold the MFMA_N distinct columns.
                     # `col >= start` is required: the tile loop is BKV-aligned
@@ -768,7 +760,7 @@ def _build_kernel_mfma_r_w(
                     # assignment to `out_row_t` and tries to carry the
                     # TensorView out of the scf.if as a result.
                     def _store():
-                        out_row_t[col] = fx.Float32(col_sum)  # noqa: B023
+                        out_row_t[col] = col_sum  # noqa: B023
 
                     if is_writer:
                         _store()
@@ -952,7 +944,6 @@ def _build_kernel_mfma_lds_pipe(
             NC >= 2
         ), f"swizzle needs D/frag_bytes>=2 (D={D}, frag_bytes={mfma.frag_bytes})"
 
-    fm_fast = arith.FastMathFlags.fast
     mfma_fn = mfma.fn
 
     # Using raw_ptr_buffer_load_lds requires the destination LDS address to be aligned to at least 128 bytes.
@@ -1125,7 +1116,7 @@ def _build_kernel_mfma_lds_pipe(
                 for ii in range_constexpr(mfma.ACC_ELEMS):
                     static_off = mfma.acc_head_static_offsets[ii]
                     h_w = fx.Int32(mi * mfma.MFMA_M + static_off) + h_w_static_offset
-                    row_w[mi][ii] = fx.Float32(w_t[row, h_w]).ir_value()
+                    row_w[mi][ii] = fx.Float32(w_t[row, h_w])
             w_frag[j] = row_w
 
         # ---- Union KV window across all block rows (all waves cooperate) ----
@@ -1202,7 +1193,7 @@ def _build_kernel_mfma_lds_pipe(
                 col = col0 + fx.Int32(ni * mfma.MFMA_N) + lane_mod_N
                 cols[ni] = col
                 col_cl = _imin(col, seq_len_kv - fx.Int32(1))
-                kv_scales_tile[ni] = fx.Float32(sc_t[col_cl]).ir_value()
+                kv_scales_tile[ni] = fx.Float32(sc_t[col_cl])
                 col_local = fx.Int32(ni * mfma.MFMA_N) + lane_mod_N
                 for kk in range_constexpr(K_STEPS):
                     if const_expr(swizzle):
@@ -1244,7 +1235,7 @@ def _build_kernel_mfma_lds_pipe(
                 for ni in range_constexpr(N_TILES):
                     col = cols[ni]
                     kv_scale = kv_scales_tile[ni]
-                    col_sum = f32_0.ir_value()
+                    col_sum = f32_0
                     for mi in range_constexpr(M_TILES):
                         acc = Vec.filled(mfma.ACC_ELEMS, 0.0, fx.Float32)
                         for kk in range_constexpr(K_STEPS):
@@ -1255,19 +1246,12 @@ def _build_kernel_mfma_lds_pipe(
                                 ),
                             )
                         for ii in range_constexpr(mfma.ACC_ELEMS):
-                            score = Vec(acc)[ii].ir_value()
-                            relu = fx.Float32(score).maximumf(f32_0).ir_value()
-                            wsc = arith.MulFOp(
-                                relu, w_frag[j][mi][ii], fastmath=fm_fast
-                            ).result
-                            col_sum = arith.AddFOp(
-                                col_sum, wsc, fastmath=fm_fast
-                            ).result
-                    col_sum = arith.MulFOp(col_sum, kv_scale, fastmath=fm_fast).result
+                            relu = Vec(acc)[ii].maximumf(f32_0)
+                            col_sum = col_sum + relu * w_frag[j][mi][ii]
+                    col_sum = col_sum * kv_scale
 
                     for sh in mfma.shuffle_offsets:
-                        peer = fx.Float32(col_sum).shuffle_xor(sh, 64).ir_value()
-                        col_sum = arith.AddFOp(col_sum, peer, fastmath=fm_fast).result
+                        col_sum = col_sum + col_sum.shuffle_xor(sh, 64)
 
                     in_window = (col >= starts[j]) & (col < ends[j])
                     is_writer = (lane_div_N == fx.Int32(0)) & in_window
@@ -1275,7 +1259,7 @@ def _build_kernel_mfma_lds_pipe(
                     # Closure, not a bare subscript store -- see the direct-load
                     # builder's epilogue for why.
                     def _store():
-                        out_row_t[col] = fx.Float32(col_sum)  # noqa: B023
+                        out_row_t[col] = col_sum  # noqa: B023
 
                     if is_writer:
                         _store()
