@@ -106,6 +106,10 @@ _LAZY_IMPORTS = {
         ".warp_decode_moe",
         "flydsl_warp_decode_gate_up_fp4",
     ),
+    "flydsl_warp_decode_gate_up_fp8act": (
+        ".warp_decode_moe",
+        "flydsl_warp_decode_gate_up_fp8act",
+    ),
 }
 
 __all__ = [
@@ -134,6 +138,7 @@ __all__ = [
     "flydsl_warp_decode_gate_up",
     "flydsl_warp_decode_gate_up_bf16",
     "flydsl_warp_decode_gate_up_fp4",
+    "flydsl_warp_decode_gate_up_fp8act",
 ]
 
 
