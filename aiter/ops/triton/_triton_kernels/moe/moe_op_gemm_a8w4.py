@@ -105,6 +105,30 @@ def unswizzle_mx_scale_cdna4(
     return x
 
 
+@triton.jit
+def unswizzle_mx_scale_gfx1250(
+    scale_buffer_slice,
+    BLOCK_N: tl.constexpr,
+    MX_SCALE_BLOCK_K: tl.constexpr,
+    PRESHUFFLE_FACTOR: tl.constexpr,
+    SCALE_KWIDTH: tl.constexpr,
+):
+    scale_buffer_slice = (
+        scale_buffer_slice.reshape(
+            (
+                BLOCK_N // PRESHUFFLE_FACTOR,
+                MX_SCALE_BLOCK_K // SCALE_KWIDTH,
+                PRESHUFFLE_FACTOR,
+                SCALE_KWIDTH,
+            )
+        )
+        .permute((0, 2, 1, 3))
+        .reshape((BLOCK_N, MX_SCALE_BLOCK_K))
+    )
+
+    return scale_buffer_slice
+
+
 @triton.jit(launch_metadata=matmul_launch_metadata)
 def _moe_gemm_a8w4(
     Y,
@@ -277,10 +301,21 @@ def _moe_gemm_a8w4(
     MX_SCALE_BLOCK_K: tl.constexpr = BLOCK_K // MX_PACK_DIVISOR
 
     WMxScale += expt_id * stride_w_mx_e
-    if SWIZZLE_MX_SCALE == "CDNA4_SCALE":
+    tl.static_assert(
+        SWIZZLE_MX_SCALE is None
+        or SWIZZLE_MX_SCALE == "CDNA4_SCALE"
+        or SWIZZLE_MX_SCALE == "GFX1250_SCALE",
+        "SWIZZLE_MX_SCALE must be None, 'CDNA4_SCALE' or 'GFX1250_SCALE'",
+    )
+    if SWIZZLE_MX_SCALE is not None:
+        # CDNA4_SCALE (gfx950, kwidth 8) and GFX1250_SCALE (n32k4, kwidth 4)
+        # both fold 32 N-lanes into one scale row; only the intra-tile order
+        # differs, so the block geometry is shared and the decode is not.
         tl.static_assert(stride_w_mx_k is not None)
         tl.static_assert(stride_w_mx_n is not None)
         NON_K_PRESHUFFLE_BLOCK_SIZE: tl.constexpr = 32
+        # n32k4: must stay in step with SCALE_KWIDTH in the gfx1250 gluon kernel
+        GFX1250_SCALE_KWIDTH: tl.constexpr = 4
         PACKED_MX_BLOCK: tl.constexpr = MX_SCALE_BLOCK_K * NON_K_PRESHUFFLE_BLOCK_SIZE
         SCALE_BLOCK_N: tl.constexpr = BLOCK_N // NON_K_PRESHUFFLE_BLOCK_SIZE
     else:
@@ -341,6 +376,14 @@ def _moe_gemm_a8w4(
                 BLOCK_N,
                 MX_SCALE_BLOCK_K,
             )
+        elif SWIZZLE_MX_SCALE == "GFX1250_SCALE":
+            w_scales = unswizzle_mx_scale_gfx1250(
+                tl.load(WMxScalePtrs, cache_modifier=W_CACHE_MODIFIER),
+                BLOCK_N,
+                MX_SCALE_BLOCK_K,
+                NON_K_PRESHUFFLE_BLOCK_SIZE,
+                GFX1250_SCALE_KWIDTH,
+            )
         else:
             w_scales = tl.load(WMxScalePtrs)
 
@@ -377,6 +420,14 @@ def _moe_gemm_a8w4(
                 tl.load(WMxScalePtrs, cache_modifier=W_CACHE_MODIFIER),
                 BLOCK_N,
                 MX_SCALE_BLOCK_K,
+            )
+        elif SWIZZLE_MX_SCALE == "GFX1250_SCALE":
+            w_scales = unswizzle_mx_scale_gfx1250(
+                tl.load(WMxScalePtrs, cache_modifier=W_CACHE_MODIFIER),
+                BLOCK_N,
+                MX_SCALE_BLOCK_K,
+                NON_K_PRESHUFFLE_BLOCK_SIZE,
+                GFX1250_SCALE_KWIDTH,
             )
         else:
             w_scales = tl.load(WMxScalePtrs, mask=mask_w_k_scale[None, :])
