@@ -135,7 +135,7 @@ def gemm_a16w16_(
         if config is None:
             arch = get_arch()
             fpath = (
-                f"{AITER_TRITON_CONFIGS_PATH}/{arch}/{backend}/gemm/"
+                f"{AITER_TRITON_CONFIGS_PATH}/{arch}/{backend}/gemm/gemm_a16w16/"
                 f"{arch}-GEMM-A16W16-PERSISTENT-N={N}-K={K}.json"
             )
             raw = load_config_json(fpath, required=False)
