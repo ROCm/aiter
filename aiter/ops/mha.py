@@ -17,6 +17,19 @@ from ..jit.utils.torch_guard import torch_compile_guard
 from ..utility import dtypes
 
 
+def _fmha_kv_byte_extent_ge_u32(
+    max_seqlen_k: int, k: torch.Tensor, v: torch.Tensor
+) -> bool:
+    """True when per-head KV row byte extent reaches the 32-bit buffer-offset limit.
+
+    dim -3 is the token axis in both layouts this is called with: dense BSHD
+    [B, S, H, D] and packed varlen THD [total, H, D].
+    """
+    k_bytes = int(max_seqlen_k) * int(k.stride(-3)) * k.element_size()
+    v_bytes = int(max_seqlen_k) * int(v.stride(-3)) * v.element_size()
+    return k_bytes >= (1 << 32) or v_bytes >= (1 << 32)
+
+
 def cmdGenFunc_mha_fwd(
     q: Tensor,
     k: Tensor,
@@ -1821,6 +1834,8 @@ def _flash_attn_forward(
         if is_fmha_v3_fp8():
             gqa_ratio = nhead_q // nhead_k
             ret = ret and ((gqa_ratio & (gqa_ratio - 1)) == 0)
+        if hdim_q == 192 and hdim_v == 128:
+            ret = ret and not _fmha_kv_byte_extent_ge_u32(seqlen_k, k, v)
         return ret
 
     def can_impl_fmha_fwd_with_sink_asm():
@@ -1939,12 +1954,9 @@ def _flash_attn_forward(
         # OPUS gfx950 dense D_QK=192 / D_V=128 bf16 forward. Enabled by DEFAULT (no env)
         if int(os.environ.get("AITER_DISABLE_FMHA_OPUS", "0")) != 0:
             return False
-        if not (hdim_q == 192 and hdim_v == 128):
-            return False
-        # KV byte extent >= 2^32 wraps the kernel's 32-bit async-load soffset (same as D=128).
-        if seqlen_k * k.stride(1) * k.element_size() >= (1 << 32):
-            return False
-        return not seqlen_k * v.stride(1) * v.element_size() >= 1 << 32
+        # Any KV extent: the kernel rebases the buffer descriptor per KV tile, so the
+        # 32-bit buffer-offset limit no longer bounds the per-head KV row.
+        return hdim_q == 192 and hdim_v == 128
 
     def can_impl_fmha_fwd_bf16_opus():
         # Shared eligibility for the OPUS gfx950 bf16 forward kernels (inference-only:
@@ -2843,6 +2855,8 @@ def _flash_attn_varlen_forward(
         if is_fmha_v3_fp8():
             gqa_ratio = nhead_q // nhead_k
             ret = ret and ((gqa_ratio & (gqa_ratio - 1)) == 0)
+        if hdim_q == 192 and hdim_v == 128 and block_table is None:
+            ret = ret and not _fmha_kv_byte_extent_ge_u32(max_seqlen_k, k, v)
         return ret
 
     def can_impl_fmha_fwd_with_sink_varlen_asm():

@@ -42,7 +42,9 @@
 
 // a16w16-family launcher signature (split-barrier, flatmm, flatmm_splitk):
 // 3 tensors + std::optional<bias> + int splitK so all three populate the
-// same GENERATE_A16W16_TUNE_LOOKUP table. Non-splitk launchers ignore
+// same GENERATE_A16W16_TUNE_LOOKUP_*_GFX950 table. gfx1250's launchers take a
+// workspace tensor on top of this, which is why the lookup macros are emitted
+// per arch (gen_instances.py :: LOOKUP_MACRO_ARCHES). Non-splitk launchers ignore
 // splitK; the splitk launcher treats it as literal KBatch. bias is
 // consumed by the split-barrier and splitk launchers; the flatmm launcher
 // rejects any non-empty bias up front (HAS_BIAS=false on its warp-spec
