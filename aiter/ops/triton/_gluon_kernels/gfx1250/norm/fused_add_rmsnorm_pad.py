@@ -37,12 +37,15 @@ def _gluon_fused_add_rmsnorm_pad_kernel(
     BLOCK_SIZE_N: gl.constexpr,
 ):
     start_pid = gl.program_id(0)
+    NUM_WARPS: gl.constexpr = gl.num_warps()
+    WARP_SIZE: gl.constexpr = 32
+    CTA_NUM_THREADS: gl.constexpr = NUM_WARPS * WARP_SIZE
 
     # create 1d layout for n_offs
     n_offs_layout: gl.constexpr = gl.BlockedLayout(
-        [(BLOCK_SIZE_N + 127) // 128],  # size per thread
-        [32],  # threads per warp
-        [4],  # warps per cta
+        [(BLOCK_SIZE_N + CTA_NUM_THREADS - 1) // CTA_NUM_THREADS],  # size per thread
+        [WARP_SIZE],  # threads per warp
+        [NUM_WARPS],  # warps per cta
         [0],  # order
     )
 
