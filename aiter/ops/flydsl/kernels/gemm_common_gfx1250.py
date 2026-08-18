@@ -6,7 +6,6 @@ import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as llvm_dialect
 from flydsl.expr import arith, gpu, rocdl, tdm_ops
-from flydsl.expr.arith import ArithValue
 from flydsl.expr.arith import _to_raw as _raw
 from flydsl.expr.rocdl import cluster
 from flydsl.expr.typing import T
@@ -41,54 +40,6 @@ def make_lds_copy_ops(bits):
         fx.copy_atom_call(atom, rmem, _view(lds_base_idx, byte_offset))
 
     return load, store
-
-
-def addr_keepalive(*base_indices):
-    """Pin address registers live to this program point.
-
-    At full VGPR pressure the allocator reuses a ds_load's base-address register
-    as the *destination* of a later ds_load once that address is dead. Earlier
-    loads off the base may still be in flight, so the overwrite is a WAR hazard
-    and the backend gates it with ``s_wait_alu depctr_vm_vsrc(N)``. Reading the
-    bases from a side-effecting no-op extends their live ranges past those later
-    loads, forcing fresh destination registers and removing the gate.
-
-    Emits no instruction: the asm body is empty, only the "v" constraints and the
-    side-effect marker reach the allocator. Assumes VGPR headroom (occupancy
-    already at the floor and no spills).
-    """
-    ops = [_raw(arith.index_cast(T.i32, ArithValue(base))) for base in base_indices]
-    vgpr_keepalive(*ops)
-
-
-def vgpr_keepalive(*raw_vals):
-    """Pin arbitrary VGPR *data* values live to this program point.
-
-    The data-register analogue of :func:`addr_keepalive`. Where that pins ds
-    base *addresses*, this pins whole register values passed in raw, reading each
-    through a side-effecting no-op so its live range extends past this point and
-    the allocator cannot reuse its physical register(s) for an earlier def.
-
-    Motivating case (epilogue): store data is produced by a ``v_cvt`` batch into a
-    small VGPR window, then stored to LDS. Reusing that window across stores lets
-    the next cvt batch overwrite registers in-flight stores still read -- a WAR the
-    backend gates with ``s_wait_alu depctr_vm_vsrc(N)``. Pinning one batch across
-    the next forces fresh registers and the wait disappears. Needs VGPR headroom.
-
-    Args:
-        *raw_vals: raw ``ir.Value`` operands (e.g. ``vec<4xi32>`` store data).
-    """
-    vals = [_raw(v) for v in raw_vals]
-    if not vals:
-        return
-    llvm_dialect.InlineAsmOp(
-        res=None,
-        operands_=vals,
-        asm_string="; vgpr keepalive",
-        constraints=",".join(["v"] * len(vals)),
-        has_side_effects=True,
-        is_align_stack=False,
-    )
 
 
 def make_sgpr_opaque(val_i32):
@@ -353,6 +304,5 @@ __all__ = [
     "make_lds_copy_ops",
     "pipeline_fence",
     "situv2_consts",
-    "vgpr_keepalive",
     "workgroup_barrier",
 ]

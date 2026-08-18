@@ -16,7 +16,6 @@ from aiter.ops.flydsl.kernels import vector
 from aiter.utility.mx_types import MxDtypeInt as MxDtype
 
 from .gemm_common_gfx1250 import (
-    addr_keepalive,
     batched_silu_swiglu,
     batched_situv2,
     fused_silu_swiglu_elem,
@@ -25,7 +24,6 @@ from .gemm_common_gfx1250 import (
     make_sgpr_opaque,
     pipeline_fence,
     situv2_consts,
-    vgpr_keepalive,
     workgroup_barrier,
 )
 from .quant_utils import (
@@ -729,10 +727,6 @@ def launch_gemm_a8w4_tdm(
                 slot.b[wn].store(load_b(buf, wn, ksl))
             for wm in range_constexpr(wmma_m_rep):
                 slot.a[wm].store(load_a(buf, wm, ksl))
-            # Pin all four past the scale loads, or the allocator reuses a base
-            # as a scale destination and the backend gates that WAR with vm_vsrc.
-            addr_keepalive(*lds_bases(buf))
-
         def k_step(
             cur_rmem,
             next_rmem=None,
@@ -782,12 +776,6 @@ def launch_gemm_a8w4_tdm(
             def do_issue():
                 issue(prefetch_kt % num_buffers, prefetch_kt, my_jobs)
 
-            # Form and pin the bases here so the tile pays one va_vdst(0) drain
-            # instead of one per scattered address v_add; unpinned they remat.
-            addr_keepalive(*lds_bases(buf))
-            if const_expr(next_stage_buf is not None):
-                addr_keepalive(*lds_bases(next_stage_buf))
-
             def spread(total, slots):
                 counts = []
                 previous = 0
@@ -798,7 +786,6 @@ def launch_gemm_a8w4_tdm(
                 return counts
 
             def emit_hints(ksl, tail_mfma=0):
-                return
                 has_next = ksl + 1 < KWS or (
                     ksl + 1 == KWS and next_stage_buf is not None
                 )
@@ -1142,14 +1129,8 @@ def launch_gemm_a8w4_tdm(
                         alignment=2,
                     )
                     bias_map = fx.recast_iter(bias_ptr_type, arg_bias)
-                # Ping-pong the b128 store data across VGPR banks: pinning the
-                # last rows' data across this row's cvts forces fresh registers.
-                STORE_PIPE_DEPTH = 4
-                STORE_PIN_STRIDE = 2
-                recent_hv_rows = []
                 for wm in range_constexpr(wmma_m_rep):
                     row_rel = wmb + wm * 16 + lane16
-                    cur_hv_raws = []
                     for wn in range_constexpr(output_n_rep):
                         col_rel = wnb + wn * 16 + kgrp * 8
                         acc = Vec(accs[wm * output_n_rep + wn])
@@ -1197,17 +1178,6 @@ def launch_gemm_a8w4_tdm(
                                 (row_rel * STORE_PITCH + col_rel) * 2,
                                 hv_i32,
                             )
-                            cur_hv_raws.append(hv_i32)
-                    if const_expr(not stage1_act):
-                        recent_hv_rows.append(cur_hv_raws)
-                        if const_expr(wm % STORE_PIN_STRIDE == STORE_PIN_STRIDE - 1):
-                            pin = [
-                                r
-                                for row in recent_hv_rows[-STORE_PIPE_DEPTH:]
-                                for r in row
-                            ]
-                            if pin:
-                                vgpr_keepalive(*pin)
 
             # -- Shared LDS -> TDM store to global --
             # dscnt-only barrier: the TDM store reads LDS, not the e8m0 scales
