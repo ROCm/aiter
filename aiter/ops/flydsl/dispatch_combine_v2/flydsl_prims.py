@@ -88,6 +88,40 @@ def atomic_max_agent(addr_i64, val):
     ).res
 
 
+def _lds_ptr(addr_i64):
+    return _llvm_d.IntToPtrOp(
+        _llvm_d.PointerType.get(address_space=3), arith.unwrap(addr_i64)
+    ).result
+
+
+def atomic_add_lds(addr_i64, val):
+    """Workgroup-scope LDS fetch-and-add at addr_i64; returns old value.
+
+    ``addr_i64`` is a raw LDS byte address (``ptrtoint`` of a SharedAllocator
+    pointer), not a global one: the block-local counters this serves are hit by
+    every lane of every warp in the block, which in global memory would be a
+    device-scope atomic per route.
+    """
+    return _llvm_d.AtomicRMWOp(
+        _llvm_d.AtomicBinOp.add,
+        _lds_ptr(addr_i64),
+        arith.unwrap(val),
+        _llvm_d.AtomicOrdering.monotonic,
+        syncscope="workgroup",
+        alignment=4,
+    ).res
+
+
+def load_i32_lds(addr_i64):
+    """Plain i32 load from a raw LDS byte address."""
+    return _llvm_d.LoadOp(T.i32, _lds_ptr(addr_i64), alignment=4).res
+
+
+def store_i32_lds(addr_i64, val):
+    """Plain i32 store to a raw LDS byte address."""
+    _llvm_d.StoreOp(arith.unwrap(val), _lds_ptr(addr_i64), alignment=4)
+
+
 def store_i32_system(addr_i64, offset, val):
     """System-release i32 store at addr + offset*4."""
     _llvm_d.StoreOp(
