@@ -109,8 +109,9 @@ def launch_gemm_a8w4_tdm(
     WAVE = 32
     PACK_TK = tile_k // 2
     KWS = tile_k // WMMA_K
-    # A spare LDS buffer is required while the next tile's first k128 is carried.
-    next_stage_on = 1 if (next_stage_prefetch and num_buffers >= 3) else 0
+    # Double buffering is sufficient: the carry reads the other LDS buffer
+    # before the post-compute barrier permits reusing the current buffer.
+    next_stage_on = 1 if (next_stage_prefetch and num_buffers >= 2) else 0
     cache_tag = (
         K,
         tile_m,
