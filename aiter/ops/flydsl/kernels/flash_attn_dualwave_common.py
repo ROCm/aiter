@@ -1680,16 +1680,18 @@ class DualwaveFp8GemmHelper(DualwaveFp8KernelContext):
         # Wide fp8 QK: mfma_scale (32x32x64) with unit E8M0 scales, i32x8 operands.
         return rocdl.mfma_scale_f32_32x32x64_f8f6f4(
             self.v16f32_type,
-            as_mlir_value(a_i32x8),
-            as_mlir_value(b_i32x8),
-            as_mlir_value(c_v16),
-            0,
-            0,
-            0,
-            as_mlir_value(fx.Int32(0x7F7F7F7F)),
-            0,
-            as_mlir_value(fx.Int32(0x7F7F7F7F)),
-        ).result
+            [
+                as_mlir_value(a_i32x8),
+                as_mlir_value(b_i32x8),
+                as_mlir_value(c_v16),
+                0,
+                0,
+                0,
+                as_mlir_value(fx.Int32(0x7F7F7F7F)),
+                0,
+                as_mlir_value(fx.Int32(0x7F7F7F7F)),
+            ],
+        )
 
     def _mfma_acc_bf16(self, a_v8, b_v8, c_v16):
         return fly.mma_atom_call_ssa(
