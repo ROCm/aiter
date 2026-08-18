@@ -1120,10 +1120,6 @@ def bench_gate_up(
         x, w_gate, w_up, router_ids, wgs, wus, mode, scale_block
     )  # not timed
 
-    outputs = B * TOPK * INTER
-    flops = 4 * HIDDEN * outputs  # 2 dots (gate+up) x 2 (mul+add) x HIDDEN
-    wbytes = 2 * outputs * HIDDEN  # gate+up FP8 rows streamed (1 B each)
-
     fn = lambda: flydsl_warp_decode_gate_up(  # noqa: E731
         x,
         w_gate,
@@ -1152,13 +1148,14 @@ def bench_gate_up(
         printLog=False,
     )
     assert _cosine(ref, got) >= 0.999, f"gate_up {mode}: correctness regression"
-    tbs = wbytes / us / 1e6 if us > 0 else 0.0
+    # B3: single source of truth for the byte/FLOP model (weight_stream, FP8 weights).
+    m = compute_metrics("gate_up", B, HIDDEN, INTER, TOPK, "fp8", us)
     return {
         "gfx": get_gfx(),
         "us": us,
-        "TFLOPS": flops / us / 1e6 if us > 0 else 0.0,
-        "TB/s": tbs,
-        "%peak": 100.0 * tbs / _HBM_PEAK_TBS,
+        "TFLOPS": m["TFLOPS"],
+        "TB/s": m["TB/s"],
+        "%peak": m["%peak"],
         "err": err,
     }
 
@@ -1174,10 +1171,6 @@ def bench_down(
     ref = _ref_down(
         inter, w_down, router_ids, router_wts, wds, mode, scale_block
     )  # not timed
-
-    outputs = B * HIDDEN
-    flops = 2 * INTER * TOPK * outputs  # TOPK dots of length INTER x 2 (mul+add)
-    wbytes = outputs * TOPK * INTER  # FP8 down rows streamed (1 B each)
 
     fn = lambda: flydsl_warp_decode_down_reduce(  # noqa: E731
         inter,
@@ -1206,13 +1199,14 @@ def bench_down(
         printLog=False,
     )
     assert _cosine(ref, got) >= 0.999, f"down {mode}: correctness regression"
-    tbs = wbytes / us / 1e6 if us > 0 else 0.0
+    # B3: single source of truth for the byte/FLOP model (weight_stream, FP8 weights).
+    m = compute_metrics("down", B, HIDDEN, INTER, TOPK, "fp8", us)
     return {
         "gfx": get_gfx(),
         "us": us,
-        "TFLOPS": flops / us / 1e6 if us > 0 else 0.0,
-        "TB/s": tbs,
-        "%peak": 100.0 * tbs / _HBM_PEAK_TBS,
+        "TFLOPS": m["TFLOPS"],
+        "TB/s": m["TB/s"],
+        "%peak": m["%peak"],
         "err": err,
     }
 
@@ -1224,11 +1218,6 @@ def bench_down_fp4(B, INTER, HIDDEN, E, TOPK, timing, num_iters, num_warmup):
     )
     out = torch.empty((B, HIDDEN), dtype=torch.bfloat16, device=inter.device)
     ref = _ref_down_fp4(inter, w_deq, router_ids, router_wts)  # not timed
-
-    outputs = B * HIDDEN
-    flops = 2 * INTER * TOPK * outputs  # identical to FP8: TOPK dots x 2 (mul+add)
-    # FP4 down streams 0.5 B/elt of weights + the E8M0 scale bytes (INTER/32/row).
-    wbytes = outputs * TOPK * INTER // 2 + outputs * TOPK * (INTER // _MXFP4_BK)
 
     fn = lambda: flydsl_warp_decode_down_reduce_fp4(  # noqa: E731
         inter,
@@ -1256,13 +1245,15 @@ def bench_down_fp4(B, INTER, HIDDEN, E, TOPK, timing, num_iters, num_warmup):
         printLog=False,
     )
     assert _cosine(ref, got) >= 0.99, "down fp4: correctness regression"
-    tbs = wbytes / us / 1e6 if us > 0 else 0.0
+    # B3: single source of truth for the byte/FLOP model (weight_stream, FP4 weights
+    # + E8M0 block-scale bytes at INTER/_MXFP4_BK per row).
+    m = compute_metrics("down", B, HIDDEN, INTER, TOPK, "fp4", us)
     return {
         "gfx": get_gfx(),
         "us": us,
-        "TFLOPS": flops / us / 1e6 if us > 0 else 0.0,
-        "TB/s": tbs,
-        "%peak": 100.0 * tbs / _HBM_PEAK_TBS,
+        "TFLOPS": m["TFLOPS"],
+        "TB/s": m["TB/s"],
+        "%peak": m["%peak"],
         "err": err,
     }
 
