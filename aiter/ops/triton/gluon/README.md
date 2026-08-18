@@ -58,7 +58,7 @@ Some features (e.g., scheduling hints like `sched_barrier`) require the [AMD Glu
   <td>TBD</td><td>TBD</td><td>TBD</td>
 </tr>
 <tr>
-  <td><code>sparse_attention_<br>dsv4_bwd_gluon</code></td><td>DSv4 Sparse<br>MLA Backward</td><td>CDNA4</td>
+  <td><code>sparse_attention_<br>dsv4_bwd</code></td><td>DSv4 Sparse<br>MLA Backward</td><td>CDNA4</td>
   <td nowrap>Q/KV/dO/O: bf16, K == V<br>head_dim = 512 (dense)<br>lse: fp32, sink-inclusive<br>num_kv &ge; T (pool ok)<br>topk % 32 == 0<br>gfx950 only</td>
   <td>python op_tests/triton_tests/<br>attention/test_sparse_<br>attention_dsv4_bwd.py</td>
   <td>~407<br>TFLOPS</td><td>—</td><td>—</td>
@@ -253,7 +253,7 @@ python op_tests/test_mla.py -c 10000 100000 -b 1 3 4 -n 16,1 -d bf16 -kvd bf16 -
 | 100K     | 3     | 85            | 19               | 88.77  | 3.89 |
 | 100K     | 4     | 64            | 25               | 106.96 | 4.31 |
 
-### `sparse_attention_dsv4_bwd_gluon.py` — DeepSeek V4 Sparse MLA Backward
+### `sparse_attention_dsv4_bwd.py` — DeepSeek V4 Sparse MLA Backward
 
 **Public entry:** `aiter.ops.triton.attention.sparse_attention_dsv4_bwd.sparse_mla_bwd_dsv4(q, kv, do, o, lse, topk_indices, attn_sink=None, scale=None, R_CHUNK=None)` -> `(dq, dkv, d_sink)`
 

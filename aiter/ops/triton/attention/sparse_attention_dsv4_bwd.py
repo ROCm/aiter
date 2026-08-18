@@ -39,16 +39,12 @@ delta 0.178 / dQ 1.391 / interm 1.152 / CSR build 0.130 / gather 0.503 / d_sink 
 
 import torch
 
-from aiter.ops.triton._triton_kernels.attention.sparse_attention_dsv4_bwd import (
+from aiter.ops.triton.gluon.sparse_attention_dsv4_bwd import (
     build_inverted_topk,
     delta_v4,
     dkv_gather_acc,
-)
-from aiter.ops.triton.gluon.sparse_attention_dsv4_bwd_gluon import (
     sparse_mla_bwd_dkv_interm_v4 as _dkv_interm_gluon,
-)
-from aiter.ops.triton.gluon.sparse_attention_dsv4_bwd_gluon import (
-    sparse_mla_bwd_dq_gluon as _dq_gluon,
+    sparse_mla_bwd_dq as _dq_gluon,
 )
 from aiter.ops.triton.utils._triton import arch_info
 
