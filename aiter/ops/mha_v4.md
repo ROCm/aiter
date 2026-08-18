@@ -125,6 +125,20 @@ preprocessing and an explicit ASM row; unsupported combinations fail. Q/K must c
 Output is BF16, and a supplied `out` must match Q's shape/device. Q, K, and V preprocessing remain
 separate custom ops so distributed schedulers can overlap each with its input communication.
 
+#### Grouped-Query Attention
+
+Both raw entrypoints (`mha_v4` and `mha_v4_mxfp8`) and `mha_v4_packed` accept GQA directly. Q uses
+shape `[batch, query_length, query_heads, 128]`; K and V use
+`[batch, key_value_length, kv_heads, 128]`. K and V must have the same head count, `query_heads`
+must be divisible by `kv_heads`, and the ratio `query_heads / kv_heads` must be one of
+`1, 2, 4, 8, 16`. Ratio 1 is ordinary multi-head attention. The kernel maps each contiguous group
+of query heads to one K/V head; callers must not expand K or V to `query_heads`. Output retains Q's
+batch, sequence, and head dimensions.
+
+For example, Q with 32 heads and K/V with 8 heads selects GQA ratio 4. Q and K still use the same
+number format and canonical quantization recipe; "Q/K formats must match" refers to their encoding,
+not their head counts. Ratios outside the supported power-of-two set fail explicitly.
+
 ### Packed Expert API
 
 This API supports benchmarks, distributed integrations, preprocessing reuse, and callers that
