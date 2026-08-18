@@ -1,9 +1,9 @@
 import pytest
 import torch
 import torch.nn.functional as F
-from aiter.ops.triton.utils._triton.arch_info import get_arch
 
 from aiter.ops.triton.normalization.fused_add_rmsnorm_pad import fused_add_rmsnorm_pad
+from aiter.ops.triton.utils._triton.arch_info import get_arch
 
 
 def generate_inputs(M, N, has_res, dtype):
