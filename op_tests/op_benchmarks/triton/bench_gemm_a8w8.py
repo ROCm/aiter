@@ -4,13 +4,13 @@ from collections.abc import Callable
 
 import triton
 
-from aiter.ops.triton.gemm.basic.gemm_a8w8 import gemm_a8w8 as triton_gemm_a8w8
-from aiter.ops.triton.gluon.gemm_a8w8 import (
+from aiter.ops.triton._gluon_kernels.gfx950.gemm.basic.gemm_a8w8 import (
     gemm_a8w8 as gluon_gemm_a8w8,
 )
-from aiter.ops.triton.gluon.gemm_a8w8 import (
+from aiter.ops.triton._gluon_kernels.gfx950.gemm.basic.gemm_a8w8 import (
     gemm_a8w8_preshuffle as gluon_gemm_a8w8_preshuffle,
 )
+from aiter.ops.triton.gemm.basic.gemm_a8w8 import gemm_a8w8 as triton_gemm_a8w8
 from aiter.ops.triton.utils.types import str_to_torch_dtype
 from op_tests.op_benchmarks.triton.utils.argparse import (
     add_argparse_ff,

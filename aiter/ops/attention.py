@@ -9,7 +9,7 @@ import triton.language as tl
 
 from aiter import dtypes
 from aiter.ops.enum import Enum, MlaVersion, QuantType
-from aiter.ops.triton.gluon.pa_decode_gluon import pa_decode_gluon
+from aiter.ops.triton.utils._triton import arch_info
 from aiter.utility.dtypes import _aiter_dtype_id
 from csrc.cpp_itfs.pa.pa import paged_attention_rocm as paged_attention_rocm_core
 from csrc.cpp_itfs.pa.pa_ragged import (
@@ -20,6 +20,18 @@ from csrc.cpp_itfs.torch_utils import direct_register_custom_op
 
 from ..jit.core import compile_ops, is_experimental_enabled
 from ..jit.utils.chip_info import get_cu_num, get_gfx
+
+# pa_decode_gluon is duplicated per arch generation under _gluon_kernels/<arch>/.
+# The copies are byte-identical today, so this only picks which one is compiled;
+# once they are specialized per arch this is the single selection point.
+if arch_info.get_arch() == "gfx942":
+    from aiter.ops.triton._gluon_kernels.gfx942.attention.pa_decode import (
+        pa_decode_gluon,
+    )
+else:
+    from aiter.ops.triton._gluon_kernels.gfx950.attention.pa_decode import (
+        pa_decode_gluon,
+    )
 
 MD_NAME = "module_attention"
 

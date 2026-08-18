@@ -50,12 +50,34 @@ if triton_version >= Version("3.5.0"):
         _deepgemm_fp8_paged_mqa_logits_stage1_ragged_k,
         _deepgemm_fp8_paged_mqa_logits_varctx_schedule,
     )
-    from aiter.ops.triton.gluon.pa_decode_gluon import get_cdna_version
-    from aiter.ops.triton.gluon.pa_mqa_logits import (
-        _gluon_deepgemm_fp8_paged_mqa_logits,
-        _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle,
-        _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle_varctx,
-    )
+    from aiter.ops.triton.utils._triton.arch_info import get_cdna_version
+
+    # The gluon paged-MQA-logits kernels are duplicated per arch generation under
+    # _gluon_kernels/<arch>/. The copies are byte-identical today, so this only
+    # picks which one is compiled; once they are specialized per arch this is the
+    # single selection point. gfx1250 is a first-class target here -- the kernels
+    # carry IS_GFX1250 branches and a 32-wide warp.
+    # Selected with get_gfx(), the same value this module feeds to GPUTarget and to
+    # the kernel's ARCH constexpr, so the copy compiled always matches the target.
+    _gluon_arch = get_gfx()
+    if _gluon_arch == "gfx1250":
+        from aiter.ops.triton._gluon_kernels.gfx1250.attention.pa_mqa_logits import (
+            _gluon_deepgemm_fp8_paged_mqa_logits,
+            _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle,
+            _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle_varctx,
+        )
+    elif _gluon_arch == "gfx942":
+        from aiter.ops.triton._gluon_kernels.gfx942.attention.pa_mqa_logits import (
+            _gluon_deepgemm_fp8_paged_mqa_logits,
+            _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle,
+            _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle_varctx,
+        )
+    else:
+        from aiter.ops.triton._gluon_kernels.gfx950.attention.pa_mqa_logits import (
+            _gluon_deepgemm_fp8_paged_mqa_logits,
+            _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle,
+            _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle_varctx,
+        )
 
     enable_gluon_pa_mqa_logits = True
     enable_jit_gluon_pa_mqa_logits_kernel = not enable_aot_gluon_pa_mqa_logits

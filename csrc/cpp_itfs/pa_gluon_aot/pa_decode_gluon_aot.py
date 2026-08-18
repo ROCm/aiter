@@ -10,7 +10,6 @@ import triton.language as tl
 from jinja2 import Template
 
 import aiter
-from aiter.ops.triton.gluon.pa_decode_gluon import get_cdna_version
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.types import torch_to_triton_dtype
 from csrc.cpp_itfs.gluon_aot_tools.compile import (
@@ -32,6 +31,21 @@ from csrc.cpp_itfs.utils import (
     not_built,
     run_lib,
 )
+
+# pa_decode is duplicated per arch generation under _gluon_kernels/<arch>/; the
+# copies are byte-identical today, so this only picks which one is compiled.
+if arch_info.get_arch() == "gfx942":
+    from aiter.ops.triton._gluon_kernels.gfx942.attention.pa_decode import (
+        get_cdna_version,
+    )
+
+    _PA_DECODE_REL = "aiter/ops/triton/_gluon_kernels/gfx942/attention/pa_decode.py"
+else:
+    from aiter.ops.triton._gluon_kernels.gfx950.attention.pa_decode import (
+        get_cdna_version,
+    )
+
+    _PA_DECODE_REL = "aiter/ops/triton/_gluon_kernels/gfx950/attention/pa_decode.py"
 
 GLUON_AOT_COMPILE_ENABLED = True
 try:
@@ -273,7 +287,7 @@ def compile(
         os.makedirs(aot_file_dir, exist_ok=True)
 
         compile_args = CompileGluonArgs(
-            path=f"{AITER_CORE_DIR}/aiter/ops/triton/gluon/pa_decode_gluon.py",
+            path=f"{AITER_CORE_DIR}/{_PA_DECODE_REL}",
             kernel_name=gluon_kernel_name,
             signature=signature,
             grid="num_seqs,num_kv_heads,max_context_partition_num",
@@ -318,7 +332,7 @@ def compile(
         reduce_signature = ",".join(reduce_signature_parts)
         reduce_kernel_name = "paged_attention_decode_v2_reduce_kernel"
         reduce_compile_args = CompileArgs(
-            path=f"{AITER_CORE_DIR}/aiter/ops/triton/gluon/pa_decode_gluon.py",
+            path=f"{AITER_CORE_DIR}/{_PA_DECODE_REL}",
             kernel_name=reduce_kernel_name,
             signature=reduce_signature,
             grid="num_seqs,num_kv_heads,1",

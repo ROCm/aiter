@@ -15,11 +15,6 @@ from jinja2 import Template
 
 import aiter
 from aiter import per_tensor_quant, pertoken_quant
-from aiter.ops.triton.gluon.pa_decode_gluon import (
-    get_cdna_version,
-    paged_attention_decode_v2_gluon_dot_kernel,
-    paged_attention_decode_v2_gluon_large_block_dot_kernel,
-)
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.test_common import perftest
 from csrc.cpp_itfs.gluon_aot_tools.compile_gluon import (
@@ -40,6 +35,25 @@ from op_tests.triton_tests.test_pa_decode_gluon import (
     shuffle_value_cache_layout,
     torch_attention_compute,
 )
+
+# pa_decode is duplicated per arch generation under _gluon_kernels/<arch>/; the
+# copies are byte-identical today, so this only picks which one is compiled.
+if arch_info.get_arch() == "gfx942":
+    from aiter.ops.triton._gluon_kernels.gfx942.attention.pa_decode import (
+        get_cdna_version,
+        paged_attention_decode_v2_gluon_dot_kernel,
+        paged_attention_decode_v2_gluon_large_block_dot_kernel,
+    )
+
+    _PA_DECODE_REL = "aiter/ops/triton/_gluon_kernels/gfx942/attention/pa_decode.py"
+else:
+    from aiter.ops.triton._gluon_kernels.gfx950.attention.pa_decode import (
+        get_cdna_version,
+        paged_attention_decode_v2_gluon_dot_kernel,
+        paged_attention_decode_v2_gluon_large_block_dot_kernel,
+    )
+
+    _PA_DECODE_REL = "aiter/ops/triton/_gluon_kernels/gfx950/attention/pa_decode.py"
 
 TORCH_TO_TL_DTYPE = {
     torch.float8_e4m3fnuz: tl.float8e4b8,
@@ -280,7 +294,7 @@ def compile_attention_kernel(
             gluon_kernel_name = "paged_attention_decode_v2_gluon_large_block_dot_kernel"
 
         compile_args = CompileGluonArgs(
-            path=f"{AITER_CORE_DIR}/aiter/ops/triton/gluon/pa_decode_gluon.py",
+            path=f"{AITER_CORE_DIR}/{_PA_DECODE_REL}",
             kernel_name=gluon_kernel_name,
             signature=signature,
             grid="num_seqs,num_kv_heads,max_context_partition_num",
@@ -500,7 +514,7 @@ def run_direct_attention_kernel(
     cdna_version: int,
 ):
     """
-    Directly call the attention kernel from pa_decode_gluon.py with perftest timing
+    Directly call the attention kernel from _gluon_kernels/<arch>/attention/pa_decode.py with perftest timing
     """
     # Convert compute_type from torch.dtype to tl.dtype
     compute_type_tl = TORCH_TO_TL_DTYPE[compute_type]
@@ -903,7 +917,7 @@ def test_attention_kernel(kernel_type: str = "compiled"):
         )
         print(f"Compiled kernel execution time: {compiled_time:.2f} us/iter")
     elif kernel_type == "direct":
-        # Directly call the kernel from pa_decode_gluon.py
+        # Directly call the kernel from _gluon_kernels/<arch>/attention/pa_decode.py
         print("\n=== Running Direct Kernel ===")
         _, direct_time = run_direct_attention_kernel(
             exp_sums,

@@ -1,6 +1,7 @@
 # Gluon Kernel Status
 
 All kernels in this directory are written in Gluon, a GPU programming language at the same level as Triton but with more explicit control over layouts, async copy, and MFMA intrinsics.
+Kernels are filed by target architecture generation under `gfx942/`, `gfx950/` and `gfx1250/`; the host-side wrappers that select and launch them live in `aiter/ops/triton/<category>/`.
 Some features (e.g., scheduling hints like `sched_barrier`) require the [AMD Gluon Extension](https://github.com/ROCm/triton/tree/gluon_ext).
 
 ## Quick Reference
@@ -64,7 +65,7 @@ Some features (e.g., scheduling hints like `sched_barrier`) require the [AMD Glu
 
 ## GEMM Kernels
 
-### `gemm_a8w8.py` — INT8/FP8 GEMM
+### `gfx950/gemm/basic/gemm_a8w8.py` — INT8/FP8 GEMM
 
 **Functions:** `gemm_a8w8(x, w, x_scale, w_scale, bias=None, dtype=bf16, y=None, config=None)`, `gemm_a8w8_preshuffle(...)`
 
@@ -82,7 +83,7 @@ Some features (e.g., scheduling hints like `sched_barrier`) require the [AMD Glu
 
 ---
 
-### `gemm_a8w8_blockscale.py` — FP8 GEMM with block-scale quantization
+### `gfx950/gemm/basic/gemm_a8w8_blockscale.py` — FP8 GEMM with block-scale quantization
 
 **Function:** `gemm_a8w8_blockscale(x, w, x_scale, w_scale, dtype=bf16, y=None, config=None)`
 
@@ -155,7 +156,7 @@ python op_tests/op_benchmarks/triton/bench_gemm_a8w8_blockscale.py [-gluon]
 
 ## Attention Kernels
 
-### `mla_gluon.py` — MLA Decode + DeepSeek V4 Sparse Prefill
+### `gfx950/attention/mla.py` — MLA Decode + DeepSeek V4 Sparse Prefill
 
 **Function:** `mla_gluon(q_nope, q_pe, kv_c, o, page_table, seq_info, sm_scale, k_pe=None, kv_pe_offset=512, use_2d_view=True, kv_scale=1.0, min_kv_seq_len=1, return_lse=False)`
 
@@ -247,7 +248,7 @@ python op_tests/test_mla.py -c 10000 100000 -b 1 3 4 -n 16,1 -d bf16 -kvd bf16 -
 | 100K     | 3     | 85            | 19               | 88.77  | 3.89 |
 | 100K     | 4     | 64            | 25               | 106.96 | 4.31 |
 
-### `pa_decode_gluon.py` — Paged Attention Decode
+### `gfx942/attention/pa_decode.py`, `gfx950/attention/pa_decode.py` — Paged Attention Decode
 
 **Function:** `pa_decode_gluon(output, query, key_cache, value_cache, context_lengths, block_tables, softmax_scale, query_length, max_context_partition_num, context_partition_size, compute_type, query_scale, key_scale, value_scale, ...)`
 

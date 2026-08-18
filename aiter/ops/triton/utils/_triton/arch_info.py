@@ -12,6 +12,16 @@ def get_arch():
     return _CACHED_ARCH
 
 
+def get_cdna_version():
+    """CDNA generation of the live device, or -1 if it is not a CDNA arch."""
+    if get_arch() in ["gfx950"]:
+        return 4
+    elif get_arch() in ["gfx942"]:
+        return 3
+    else:
+        return -1
+
+
 def is_gluon_avail():
     return get_arch() in ("gfx950", "gfx1250")
 

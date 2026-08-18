@@ -14,11 +14,21 @@ import triton
 
 import aiter
 from aiter import dtypes, per_tensor_quant, pertoken_quant
-from aiter.ops.triton.gluon.pa_decode_gluon import (
-    get_recommended_splits,
-    pa_decode_gluon,
-)
+from aiter.ops.triton.utils._triton import arch_info
 from aiter.test_common import benchmark, checkAllclose, perftest
+
+# pa_decode is duplicated per arch generation under _gluon_kernels/<arch>/; the
+# copies are byte-identical today, so this only picks which one is compiled.
+if arch_info.get_arch() == "gfx942":
+    from aiter.ops.triton._gluon_kernels.gfx942.attention.pa_decode import (
+        get_recommended_splits,
+        pa_decode_gluon,
+    )
+else:
+    from aiter.ops.triton._gluon_kernels.gfx950.attention.pa_decode import (
+        get_recommended_splits,
+        pa_decode_gluon,
+    )
 
 try:
     from triton.experimental import gluon  # noqa: F401

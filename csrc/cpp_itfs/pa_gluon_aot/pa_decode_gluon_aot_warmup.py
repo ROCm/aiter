@@ -5,12 +5,23 @@ import torch
 import triton
 
 import aiter
-from aiter.ops.triton.gluon.pa_decode_gluon import (
-    paged_attention_decode_v2_gluon_dot_kernel,
-    paged_attention_decode_v2_gluon_large_block_dot_kernel,
-    paged_attention_decode_v2_reduce_kernel,
-)
+from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.types import torch_to_triton_dtype
+
+# pa_decode is duplicated per arch generation under _gluon_kernels/<arch>/; the
+# copies are byte-identical today, so this only picks which one is compiled.
+if arch_info.get_arch() == "gfx942":
+    from aiter.ops.triton._gluon_kernels.gfx942.attention.pa_decode import (
+        paged_attention_decode_v2_gluon_dot_kernel,
+        paged_attention_decode_v2_gluon_large_block_dot_kernel,
+        paged_attention_decode_v2_reduce_kernel,
+    )
+else:
+    from aiter.ops.triton._gluon_kernels.gfx950.attention.pa_decode import (
+        paged_attention_decode_v2_gluon_dot_kernel,
+        paged_attention_decode_v2_gluon_large_block_dot_kernel,
+        paged_attention_decode_v2_reduce_kernel,
+    )
 
 TORCH_TO_TL_DTYPE_SIG = {
     torch.float8_e4m3fnuz: "fp8e4b8",

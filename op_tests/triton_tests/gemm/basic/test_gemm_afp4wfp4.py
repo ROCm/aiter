@@ -4,14 +4,14 @@ import pytest
 import torch
 import triton
 
+from aiter.ops.triton._gluon_kernels.gfx950.gemm.basic.gemm_afp4wfp4 import (
+    gemm_afp4wfp4 as gluon_gemm_afp4wfp4_CDNA4,
+)
 from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import (
     gemm_afp4wfp4 as triton_gemm_afp4wfp4,
 )
 from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import (
     gemm_afp4wfp4_preshuffle,
-)
-from aiter.ops.triton.gluon.gemm_afp4wfp4 import (
-    gemm_afp4wfp4 as gluon_gemm_afp4wfp4_CDNA4,
 )
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.shuffle import shuffle_scale_gemm, shuffle_weight

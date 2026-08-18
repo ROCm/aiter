@@ -10,6 +10,7 @@ from triton.language.extra.hip import libdevice as hip_libdevice
 
 import aiter
 from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils._triton.arch_info import get_cdna_version
 
 CXX_PS_REDUCE_AVAILABLE = True
 try:
@@ -91,17 +92,6 @@ except ImportError:
 @gluon.jit
 def _fused_max_combine(a1, a2, b1, b2):
     return tl.maximum(a1, b1), tl.maximum(a2, b2)
-
-
-@lru_cache(maxsize=1)
-def get_cdna_version():
-    """Get CDNA version lazily to avoid CUDA initialization during import."""
-    if arch_info.get_arch() in ["gfx950"]:
-        return 4
-    elif arch_info.get_arch() in ["gfx942"]:
-        return 3
-    else:
-        return -1
 
 
 def get_occupancy():

@@ -4,14 +4,14 @@ from collections.abc import Callable
 import torch
 import triton
 
+from aiter.ops.triton._gluon_kernels.gfx950.gemm.basic.gemm_a8w8_blockscale import (
+    gemm_a8w8_blockscale as gluon_gemm_a8w8_blockscale,
+)
 from aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale import (
     gemm_a8w8_blockscale as triton_gemm_a8w8_blockscale,
 )
 from aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale import (
     gemm_a8w8_blockscale_preshuffle as triton_gemm_a8w8_blockscale_preshuffle,
-)
-from aiter.ops.triton.gluon.gemm_a8w8_blockscale import (
-    gemm_a8w8_blockscale as gluon_gemm_a8w8_blockscale,
 )
 from aiter.test_common import checkAllclose
 from op_tests.op_benchmarks.triton.utils.argparse import (

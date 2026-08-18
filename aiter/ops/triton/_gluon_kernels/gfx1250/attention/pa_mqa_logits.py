@@ -8,7 +8,7 @@ import triton.language as tl
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
-from aiter.ops.triton.gluon.pa_decode_gluon import get_cdna_version
+from aiter.ops.triton.utils._triton.arch_info import get_cdna_version
 
 try:
     from triton.experimental.gluon.language.amd.cdna3 import (

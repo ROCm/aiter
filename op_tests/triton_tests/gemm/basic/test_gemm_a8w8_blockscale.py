@@ -6,12 +6,12 @@ import torch
 import torch.nn.functional as F
 
 from aiter.ops.shuffle import shuffle_weight
+from aiter.ops.triton._gluon_kernels.gfx950.gemm.basic.gemm_a8w8_blockscale import (
+    gemm_a8w8_blockscale as gluon_gfx950_gemm_a8w8_blockscale,
+)
 from aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale import (
     gemm_a8w8_blockscale,
     gemm_a8w8_blockscale_preshuffle,
-)
-from aiter.ops.triton.gluon.gemm_a8w8_blockscale import (
-    gemm_a8w8_blockscale as gluon_gfx950_gemm_a8w8_blockscale,
 )
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.types import get_fp8_dtypes, str_to_torch_dtype
