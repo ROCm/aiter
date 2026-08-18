@@ -754,12 +754,16 @@ def _pa_decode_sparse_gfx950_gluon(
         nope_chunk = int(_nc) if _nc else min(128, head_dim)
 
     # waves_per_eu=2 caps the allocator at 256 unified VGPRs, the 2 waves/SIMD
-    # threshold on gfx950's 512-VGPR file. The chunked dequant gets the buffer_load
-    # path to 256 with a single spilled VGPR, but a cache past buffer_load's 2 GB
-    # offset gathers through 64-bit addresses and lands at ~321 -- there the cap
-    # buys nothing and costs ~150 scratch stores (+40% at C4A), so only ask for it
-    # when both caches are on the fast path.
-    if use_buffer_load and (chunk_axis == 0 or nope_chunk < head_dim):
+    # threshold on gfx950's 512-VGPR file. Asked for on both load paths.
+    #
+    # This used to be gated on buffer_load, because a cache past buffer_load's 2 GB
+    # offset gathers through 64-bit addresses and used to land at ~321 VGPRs, where
+    # the cap bought nothing and cost ~150 scratch stores (+40% at C4A). Narrowing
+    # the scale gather brought that path to 283, close enough that the cap now
+    # reaches 256 with 17 spill slots instead of 148 -- worth 0.745x at extra=272
+    # and 0.833x at extra=1024 on the 64-bit path. Re-measure this gate whenever the
+    # register picture moves.
+    if chunk_axis == 0 or nope_chunk < head_dim:
         waves_per_eu = 2
     _wp = _os.environ.get("AITER_PA_DECODE_WPEU")
     if _wp:
