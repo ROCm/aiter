@@ -21,7 +21,7 @@
 #   bash run_g9_compare.sh                      # full of-record sweep -> tickets/667/g9_compare.{md,csv}
 #   bash run_g9_compare.sh --build-ck           # rebuild CK first, then sweep
 #   bash run_g9_compare.sh --repeats 5 -- --shapes qwen3next --batches 1,8
-#   bash run_g9_compare.sh --validate           # D7-lite numerical cross-check (no perf sweep)
+#   bash run_g9_compare.sh --validate           # D7 numerical cross-check (no perf sweep)
 
 set -euo pipefail
 
@@ -65,9 +65,9 @@ if [ "${BUILD_CK_FIRST}" -eq 1 ]; then
     bash "${BUILD_CK}"
 fi
 
-# D7-lite: dump CK FP8/BF16 kernel I/O on real host-quantized inputs, then rebuild
-# the torch reference on the identical bytes and compare (cos / allclose). No perf
-# sweep; exits non-zero if any kernel diverges.
+# D7: dump CK FP8/BF16/FP4 kernel I/O on real host-quantized inputs (non-uniform
+# Block2D scales), then rebuild the torch reference on the identical bytes and
+# compare (cos / allclose). No perf sweep; exits non-zero if any gated kernel diverges.
 if [ "${VALIDATE}" -eq 1 ]; then
     if [ ! -x "${CK_BIN}" ]; then
         echo "==> CK bench binary missing; building ..."
@@ -76,7 +76,7 @@ if [ "${VALIDATE}" -eq 1 ]; then
     DUMP_DIR="${SCRIPT_DIR}/ck_validate_dump"
     mkdir -p "${DUMP_DIR}"
     rm -f "${DUMP_DIR}"/*.bin
-    echo "==> D7-lite numerical cross-check: gpu=${GPU}  dump -> ${DUMP_DIR}"
+    echo "==> D7 numerical cross-check: gpu=${GPU}  dump -> ${DUMP_DIR}"
     HIP_VISIBLE_DEVICES="${GPU}" CK_WD_VALIDATE=1 CK_WD_VALIDATE_DIR="${DUMP_DIR}" "${CK_BIN}"
     "${VENV_PY}" "${SCRIPT_DIR}/validate.py" --dir "${DUMP_DIR}"
     exit $?
