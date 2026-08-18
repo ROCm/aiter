@@ -126,11 +126,13 @@ def _check(op, cfg, comm, rank, world, all_idx, all_wts, all_tok, n_tok, tag):
 
 
 def _time(op, comm, all_idx, all_wts, all_tok, rank, n_tok):
+    """(us per dispatch, tokens landed in this rank's recv buffer)."""
     inp, w, i = all_tok[rank][:n_tok], all_wts[rank][:n_tok], all_idx[rank][:n_tok]
     for _ in range(WARMUP):
-        op.dispatch(inp, w, None, i)
+        _out, _w, _s, _i, total_recv = op.dispatch(inp, w, None, i)
     torch.cuda.synchronize()
     comm.barrier()
+    recv = int(total_recv.item())
     s = torch.cuda.Event(enable_timing=True)
     e = torch.cuda.Event(enable_timing=True)
     s.record()
@@ -139,7 +141,7 @@ def _time(op, comm, all_idx, all_wts, all_tok, rank, n_tok):
     e.record()
     torch.cuda.synchronize()
     comm.barrier()
-    return s.elapsed_time(e) / ITERS * 1000.0
+    return s.elapsed_time(e) / ITERS * 1000.0, recv
 
 
 def main():
@@ -195,11 +197,24 @@ def main():
             op.close()
 
     if BENCH and rank == 0:
-        print(f"\n# dispatch us/call (hidden={HIDDEN} topk={TOPK} world={world})")
-        print(f"{'tokens':>8} {'vector':>10} {'tdm':>10} {'speedup':>9}")
+        # Payload landed per rank: recv tokens of a hidden row each. Counts the
+        # rank's own tokens too -- those never cross the fabric, so at world=4
+        # roughly a quarter of this is local traffic. Same for both transports,
+        # so the ratio is unaffected; the absolute number is not a link figure.
+        row_b = HIDDEN * DTYPE.itemsize
+        print(f"\n# dispatch (hidden={HIDDEN} topk={TOPK} world={world})")
+        print(f"# GB/s = recv tokens x {row_b}B per rank / time")
+        print(
+            f"{'tokens':>8} {'recv':>8} {'vector':>9} {'tdm':>9} {'speedup':>8}"
+            f" {'vec GB/s':>9} {'tdm GB/s':>9}"
+        )
         for ct in SWEEP:
-            v, t = timings["vector"][ct], timings["tdm"][ct]
-            print(f"{ct:>8} {v:>10.1f} {t:>10.1f} {v / t:>8.2f}x")
+            (v, recv), (t, _) = timings["vector"][ct], timings["tdm"][ct]
+            gb = recv * row_b / 1e9
+            print(
+                f"{ct:>8} {recv:>8} {v:>9.1f} {t:>9.1f} {v / t:>7.2f}x"
+                f" {gb / (v * 1e-6):>9.1f} {gb / (t * 1e-6):>9.1f}"
+            )
 
     dist.barrier()
     dist.destroy_process_group()
