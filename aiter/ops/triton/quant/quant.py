@@ -1,15 +1,14 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-from typing import Optional, Tuple
-
-import triton
 import torch
-from aiter.ops.triton._gluon_kernels.gfx1250.quant.quant import (
-    gluon_dynamic_mxfp4_quant_kernel_gfx1250,
-)
+import triton
+
 from aiter.ops.triton._gluon_kernels.gfx950.quant.quant import (
     gluon_dynamic_mxfp4_quant_kernel_gfx950,
+)
+from aiter.ops.triton._gluon_kernels.gfx1250.quant.quant import (
+    gluon_dynamic_mxfp4_quant_kernel_gfx1250,
 )
 from aiter.ops.triton._triton_kernels.quant.quant import (
     _dynamic_mxfp4_quant_kernel,
@@ -23,7 +22,6 @@ from aiter.ops.triton._triton_kernels.quant.quant import (
     _nvfp4_quant_op,
     _static_per_tensor_quant_fp8_i8_kernel,
 )
-
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.types import e4m3_dtype
@@ -67,7 +65,7 @@ def static_per_tensor_quant_fp8_i8(
     rows = x_in.shape[0]
     cols = x_in.shape[1]
     NUM_COL_POW2 = triton.next_power_of_2(cols)
-    grid = lambda meta: (rows,)  # noqa: E731
+    grid = (rows,)
     _static_per_tensor_quant_fp8_i8_kernel[grid](
         qx, x_in, scale_in, cols, x_in.stride(0), NUM_COL_POW2=NUM_COL_POW2
     )
@@ -94,7 +92,7 @@ def dynamic_per_tensor_quant_fp8_i8(
     rows = x_in.shape[0]
     cols = x_in.shape[1]
     NUM_COL_POW2 = triton.next_power_of_2(cols)
-    grid = lambda meta: (rows,)  # noqa: E731
+    grid = (rows,)
     _dynamic_per_tensor_quant_fp8_i8_kernel[grid](
         x_in,
         scale_out,
@@ -137,7 +135,7 @@ def dynamic_per_token_quant_fp8_i8(
     rows = x_in.shape[0]
     cols = x_in.shape[1]
     NUM_COL_POW2 = triton.next_power_of_2(cols)
-    grid = lambda meta: (rows,)  # noqa: E731
+    grid = (rows,)
     _dynamic_per_token_quant_fp8_i8_kernel[grid](
         qx,
         scale_out,
@@ -156,7 +154,9 @@ def dynamic_per_token_quant_fp8_i8(
 
 
 def dynamic_mxfp4_quant(
-    x: torch.Tensor, scaling_mode: str = "even"
+    x: torch.Tensor,
+    scaling_mode: str = "even",
+    use_hw_cvt: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Quantize a tensor to MX FP4 format.
@@ -166,6 +166,14 @@ def dynamic_mxfp4_quant(
         scaling_mode: The method to calculate MX block scaling.
             - "even" (default): `even_round` in `quark.torch.quantization.utils`.
             - etc.
+        use_hw_cvt: On the plain Triton dispatch path, use the native gfx950
+            hardware conversion instruction v_cvt_scalef32_pk_fp4_bf16 instead
+            of the manual bit-manipulation fallback. Requires x to be bf16
+            (auto-disabled otherwise). Ignored on the Gluon dispatch paths:
+            the gfx950 Gluon kernel always uses the hw instruction (and is
+            only selected when x is bf16 -- non-bf16 input on gfx950 falls
+            through to the plain Triton path instead); the gfx1250 Gluon
+            kernel has no hw-cvt path at all.
     Returns:
         A tuple of (x_fp4, blockscale_e8m0).
     """
@@ -174,6 +182,8 @@ def dynamic_mxfp4_quant(
     M, N = x.shape
 
     assert (N // 2) % 2 == 0
+    if use_hw_cvt and x.dtype != torch.bfloat16:
+        use_hw_cvt = False
 
     # This is fixed by spec for MXFP4. Do not tune this.
     MXFP4_QUANT_BLOCK_SIZE = 32
@@ -188,8 +198,8 @@ def dynamic_mxfp4_quant(
     if M <= 32:
         NUM_ITER = 1
         BLOCK_SIZE_M = triton.next_power_of_2(M)
-        BLOCK_SIZE_N = 32
-        NUM_WARPS = 1
+        BLOCK_SIZE_N = 4096 // BLOCK_SIZE_M
+        NUM_WARPS = 4
         NUM_STAGES = 1
     else:
         NUM_ITER = 4
@@ -200,17 +210,17 @@ def dynamic_mxfp4_quant(
 
         if N <= 16384:
             BLOCK_SIZE_M = 32
-            BLOCK_SIZE_N = 128
+            BLOCK_SIZE_N = 256
 
     # for small N values
     if N <= 1024:
         NUM_ITER = 1
         NUM_STAGES = 1
         NUM_WARPS = 4
-        BLOCK_SIZE_N = min(256, triton.next_power_of_2(N))
+        BLOCK_SIZE_N = min(128, triton.next_power_of_2(N))
         # BLOCK_SIZE_N needs to be multiple of 32
         BLOCK_SIZE_N = max(32, BLOCK_SIZE_N)
-        BLOCK_SIZE_M = min(8, triton.next_power_of_2(M))
+        BLOCK_SIZE_M = min(32, triton.next_power_of_2(M))
 
     grid = (
         triton.cdiv(M, BLOCK_SIZE_M),
@@ -218,7 +228,10 @@ def dynamic_mxfp4_quant(
     )
     even_m_n = (M % BLOCK_SIZE_M == 0) and (N % (BLOCK_SIZE_N * NUM_ITER) == 0)
 
-    if arch_info.get_arch() in ("gfx950"):
+    # The gfx950 Gluon kernel dropped its sw (manual bit-manipulation)
+    # fallback and always uses the hw-cvt instruction, which only supports
+    # bf16 -- non-bf16 input falls through to the plain Triton path below.
+    if arch_info.get_arch() == "gfx950" and x.dtype == torch.bfloat16:
         gluon_dynamic_mxfp4_quant_kernel_gfx950[grid](
             x,
             x_fp4,
@@ -239,7 +252,7 @@ def dynamic_mxfp4_quant(
             waves_per_eu=0,
         )
 
-    elif arch_info.get_arch() in ("gfx1250"):
+    elif arch_info.get_arch() == "gfx1250":
         gluon_dynamic_mxfp4_quant_kernel_gfx1250[grid](
             x,
             x_fp4,
@@ -276,6 +289,7 @@ def dynamic_mxfp4_quant(
             BLOCK_SIZE_M=BLOCK_SIZE_M,
             BLOCK_SIZE_N=BLOCK_SIZE_N,
             NUM_STAGES=NUM_STAGES,
+            USE_HW_CVT=use_hw_cvt,
             num_warps=NUM_WARPS,
             waves_per_eu=0,
         )
@@ -284,9 +298,9 @@ def dynamic_mxfp4_quant(
 
 def dynamic_mxfp8_quant(
     x: torch.Tensor,
-    scale: Optional[torch.Tensor] = None,
+    scale: torch.Tensor | None = None,
     quant_dtype: torch.dtype = torch.float8_e4m3fn,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Per-1x32 MXFP8 quantization (e8m0 scale + FP8 e4m3 values).
 
@@ -321,7 +335,8 @@ def dynamic_mxfp8_quant(
         assert scale.dtype == torch.uint8
 
     BLOCK_SIZE_N = triton.next_power_of_2(K)
-    NUM_PRGMS = M
+    # Bound launch overhead on large token-head batches; the kernel loops rows by stride.
+    NUM_PRGMS = min(M, 32768)
     grid = (NUM_PRGMS,)
 
     _dynamic_mxfp8_quant_kernel[grid](
@@ -349,9 +364,9 @@ def dynamic_mxfp8_quant(
 def fp8_legacy_to_mxfp8(
     x_fnuz: torch.Tensor,
     x_scale_fp32: torch.Tensor,
-    y_fn: Optional[torch.Tensor] = None,
-    y_scale: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    y_fn: torch.Tensor | None = None,
+    y_scale: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Transcode (FP8 e4m3fnuz, fp32 1x128 scale) -> (FP8 e4m3fn, e8m0 1x32 scale)
     in a single Triton launch. Replaces the Python dequant+requant cascade
@@ -409,7 +424,7 @@ def fp8_legacy_to_mxfp8(
 
 def dynamic_nvfp4_quant(
     x: torch.Tensor,
-    global_scale: Optional[torch.Tensor] = None,
+    global_scale: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Quantize a tensor to MX FP4 format.

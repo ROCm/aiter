@@ -22,13 +22,14 @@ import sys
 import pandas as pd
 import pytest
 import torch
+
 import aiter
+from aiter.jit.utils.chip_info import get_gfx
 from aiter.test_common import (
     benchmark,
     checkAllclose,
     run_perftest,
 )
-from aiter.jit.utils.chip_info import get_gfx
 from aiter.utility.dtypes import str2Dtype, str2tuple
 
 # NOTE on correctness metrics by score function:
@@ -141,7 +142,7 @@ def _count_routing_mismatches(
         for t in (~match).cpu().nonzero(as_tuple=True)[0].tolist():
             thr = float(cut_cpu[t])
 
-            def _fmt(e):
+            def _fmt(e, t=t, thr=thr):
                 s = float(sel_cpu[t, e])
                 b = float(bias_cpu[e]) if has_bias else 0.0
                 return (

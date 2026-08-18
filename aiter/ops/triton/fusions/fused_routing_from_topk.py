@@ -4,7 +4,6 @@
 # Fused replacement for the multi-kernel "topk → routing data" chain that
 # bridges FusedMoE.select_experts to triton_kernels.matmul_ogs. See the
 # accompanying _triton_kernels/fused_routing_from_topk.py for the kernel.
-from typing import Optional, Tuple
 
 import torch
 import triton
@@ -30,8 +29,8 @@ def fused_routing_from_topk(
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
     n_expts_tot: int,
-    expert_map: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    expert_map: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Sort (token, slot) pairs by their expert id via a single Triton kernel.
 
     Replaces the multi-kernel torch chain (per-row sort, gather, two stable

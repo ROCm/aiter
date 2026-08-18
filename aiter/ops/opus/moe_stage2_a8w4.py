@@ -3,8 +3,6 @@
 
 from __future__ import annotations
 
-from typing import Optional
-
 import torch
 from torch import Tensor
 
@@ -15,11 +13,11 @@ from .moe_stage2_a8w4_meta import (
     OPUS_A8W4_OUT_MODE_FP8,
     opus_a8w4_best_atomic_kid,
     opus_a8w4_decode_kid,
+    opus_a8w4_effective_inter_dim,
     opus_a8w4_kid_block_m,
     opus_a8w4_kid_is_fp8,
     opus_a8w4_kid_name,
     opus_a8w4_kid_uses_route,
-    opus_a8w4_effective_inter_dim,
     opus_a8w4_scale_cols_for_effective_inter_dim,
 )
 
@@ -30,7 +28,7 @@ def _contiguous(tensor: Tensor) -> Tensor:
     return tensor if tensor.is_contiguous() else tensor.contiguous()
 
 
-def _optional_contiguous(tensor: Optional[Tensor]) -> Optional[Tensor]:
+def _optional_contiguous(tensor: Tensor | None) -> Tensor | None:
     return None if tensor is None else _contiguous(tensor)
 
 
@@ -56,7 +54,7 @@ def _pad_scale_rows(tensor: Tensor, rows: int) -> Tensor:
     return padded
 
 
-def _route_out_mode_from_dtype(route_out_dtype: Optional[str]) -> int:
+def _route_out_mode_from_dtype(route_out_dtype: str | None) -> int:
     if route_out_dtype is None:
         return OPUS_A8W4_OUT_MODE_FP8
     route_out_dtype = str(route_out_dtype).strip().lower()
@@ -93,7 +91,7 @@ def _gen_opus_moe_stage2_a8w4_decode_fake_tensors(
     a2_scale: Tensor,
     w2_scale: Tensor,
     sorted_token_ids: Tensor,
-    sorted_weights: Optional[Tensor],
+    sorted_weights: Tensor | None,
     sorted_expert_ids: Tensor,
     num_valid_ids: Tensor,
     out: Tensor,
@@ -122,10 +120,12 @@ def _opus_moe_stage2_a8w4_decode_fwd_raw(
     a2_scale: Tensor,
     w2_scale: Tensor,
     sorted_token_ids: Tensor,
-    sorted_weights: Optional[Tensor],
+    sorted_weights: Tensor | None,
     sorted_expert_ids: Tensor,
     num_valid_ids: Tensor,
     out: Tensor,
+    token_num: int,
+    topk: int,
     block_m: int,
     kernel_id: int,
     inter_dim_pad: int,
@@ -152,19 +152,27 @@ def opus_moe_stage2_a8w4_decode_fwd(
     a2_scale: Tensor,
     w2_scale: Tensor,
     sorted_token_ids: Tensor,
-    sorted_weights: Optional[Tensor],
+    sorted_weights: Tensor | None,
     sorted_expert_ids: Tensor,
     num_valid_ids: Tensor,
     *,
     block_m: int,
     inter_dim_pad: int,
-    out: Optional[Tensor] = None,
+    out: Tensor | None = None,
     kernel_id: int = -1,
     return_per_slot: bool = False,
-    route_out_dtype: Optional[str] = None,
+    route_out_dtype: str | None = None,
+    token_num: int | None = None,
+    topk: int | None = None,
 ) -> Tensor:
+    if inter_states.dim() == 3:
+        token_num = int(inter_states.shape[0])
+        topk = int(inter_states.shape[1])
+    else:
+        token_num = int(token_num)
+        topk = int(topk)
     effective_inter_dim = opus_a8w4_effective_inter_dim(
-        inter_states.shape[2], inter_dim_pad
+        inter_states.shape[-1], inter_dim_pad
     )
     if effective_inter_dim is None:
         raise ValueError(
@@ -180,7 +188,7 @@ def opus_moe_stage2_a8w4_decode_fwd(
         )
     elif not return_per_slot and kernel_id == -1 and block_m == 32:
         kernel_id = opus_a8w4_best_atomic_kid(
-            inter_states.shape[0],
+            token_num,
         )
         block_m = opus_a8w4_kid_block_m(kernel_id)
     route_out = bool(return_per_slot)
@@ -208,13 +216,13 @@ def opus_moe_stage2_a8w4_decode_fwd(
     if out is None:
         if route_out_fp8:
             # MXFP8 route_out: uint8 [rows, md fp8 | md/8 e8m0 scale].
-            rows = inter_states.shape[0] * inter_states.shape[1]
+            rows = token_num * topk
             out = torch.empty((rows, md + md // 8), dtype=torch.uint8, device=w2.device)
         else:
             shape = (
-                (inter_states.shape[0], inter_states.shape[1], w2.shape[1])
+                (token_num, topk, w2.shape[1])
                 if route_out
-                else (inter_states.shape[0], w2.shape[1])
+                else (token_num, w2.shape[1])
             )
             alloc = torch.empty if route_out else torch.zeros
             out = alloc(shape, dtype=torch.bfloat16, device=w2.device)
@@ -233,6 +241,8 @@ def opus_moe_stage2_a8w4_decode_fwd(
         _contiguous(sorted_expert_ids),
         _contiguous(num_valid_ids),
         kernel_out,
+        int(token_num),
+        int(topk),
         int(block_m),
         int(kernel_id),
         int(inter_dim_pad),
@@ -242,7 +252,7 @@ def opus_moe_stage2_a8w4_decode_fwd(
 
 def opus_moe_stage2_reduce_token_slot_route_output_fwd(
     route_out: Tensor,
-    out: Optional[Tensor] = None,
+    out: Tensor | None = None,
     *,
     topk: int | None = None,
     block_n: int | None = None,

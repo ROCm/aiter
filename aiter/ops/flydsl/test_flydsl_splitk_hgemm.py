@@ -239,7 +239,7 @@ def main() -> int:
                     pct_close,
                 )
             )
-        except Exception:
+        except Exception:  # noqa: BLE001
             import traceback
 
             traceback.print_exc()

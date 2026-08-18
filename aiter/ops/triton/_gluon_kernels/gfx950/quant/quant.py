@@ -3,105 +3,65 @@ from triton.experimental.gluon import language as gl
 
 
 @gluon.jit
-def _mxfp4_quant_op(
+def _cvt_scalef32_pk_fp4_bf16(a, b, scale, byte_sel: gl.constexpr):
+    """
+    Native gfx950 hardware instruction wrapper: v_cvt_scalef32_pk_fp4_bf16.
+    Gluon port of the identical Triton-path helper in
+    aiter/ops/triton/_triton_kernels/quant/quant.py -- see there for the
+    full explanation of the tied "0" merge-input constraint.
+    """
+    op_sel2: gl.constexpr = byte_sel & 1
+    op_sel3: gl.constexpr = (byte_sel >> 1) & 1
+    a_bits = a.to(gl.uint16, bitcast=True).to(gl.uint32)
+    b_bits = b.to(gl.uint16, bitcast=True).to(gl.uint32)
+    src = a_bits | (b_bits << 16)
+    old = gl.zeros_like(src)
+    return gl.inline_asm_elementwise(
+        f"v_cvt_scalef32_pk_fp4_bf16 $0, $2, $3 op_sel:[0,0,{op_sel2},{op_sel3}]",
+        "=v,0,v,v",
+        [old, src, scale],
+        dtype=gl.uint32,
+        is_pure=True,
+        pack=1,
+    )
+
+
+@gluon.jit
+def _mxfp4_quant_op_hw(
     x,
     BLOCK_SIZE_N: gl.constexpr,
     BLOCK_SIZE_M: gl.constexpr,
     MXFP4_QUANT_BLOCK_SIZE: gl.constexpr,
 ):
     """
-    Converts given x (in fp32) to mxfp4 format.
-    x: [BLOCK_SIZE_M, BLOCK_SIZE_N], fp32
+    Converts given x (bf16) to mxfp4 format using the native gfx950
+    v_cvt_scalef32_pk_fp4_bf16 hardware conversion instruction.
+    x: [BLOCK_SIZE_M, BLOCK_SIZE_N], bf16
 
+    x stays bf16 throughout (`gl.max` promotes the reduction to fp32
+    internally, so no upfront upcast is needed). Split into evens/odds
+    before reducing so amax descends from the same layout lineage as
+    evens/odds, letting scale_f32 broadcast against them without a
+    layout-mismatch compile error. `bs_e8m0` is the biased e8m0 scale
+    byte; `scale_f32` shifts it into the fp32 exponent field
+    (2^(bs_e8m0-127)) as required by `_cvt_scalef32_pk_fp4_bf16`.
     """
-    EXP_BIAS_FP32: gl.constexpr = 127
-    EXP_BIAS_FP4: gl.constexpr = 1
-    EBITS_F32: gl.constexpr = 8
-    EBITS_FP4: gl.constexpr = 2
-    MBITS_F32: gl.constexpr = 23
-    MBITS_FP4: gl.constexpr = 1
-
-    max_normal: gl.constexpr = 6
-    min_normal: gl.constexpr = 1
     NUM_QUANT_BLOCKS: gl.constexpr = BLOCK_SIZE_N // MXFP4_QUANT_BLOCK_SIZE
-    x = x.reshape(BLOCK_SIZE_M, NUM_QUANT_BLOCKS, MXFP4_QUANT_BLOCK_SIZE)
-    # Calculate scale
-    amax = gl.max(gl.abs(x), axis=-1, keep_dims=True)
+    x = x.reshape(BLOCK_SIZE_M, NUM_QUANT_BLOCKS, MXFP4_QUANT_BLOCK_SIZE // 2, 2)
+    evens, odds = gl.split(x)
+    amax = gl.maximum(gl.abs(evens), gl.abs(odds)).to(gl.float32)
+    amax = gl.max(amax, axis=-1, keep_dims=True)
     amax = amax.to(gl.int32, bitcast=True)
     amax = (amax + 0x200000).to(gl.uint32, bitcast=True) & 0xFF800000
     amax = amax.to(gl.float32, bitcast=True)
     scale_e8m0_unbiased = gl.log2(amax).floor() - 2
     scale_e8m0_unbiased = gl.maximum(-127, gl.minimum(scale_e8m0_unbiased, 127))
+    bs_e8m0 = scale_e8m0_unbiased.to(gl.uint8) + 127
+    scale_f32 = (bs_e8m0.to(gl.uint32) << 23).to(gl.float32, bitcast=True)
 
-    # blockscale_e8m0
-    bs_e8m0 = scale_e8m0_unbiased.to(gl.uint8) + 127  # in fp32, we have 2&(e - 127)
-
-    quant_scale = gl.exp2(-scale_e8m0_unbiased)
-
-    # Compute quantized x
-    qx = x * quant_scale
-
-    # Convert quantized fp32 tensor to uint32 before converting to mxfp4 format
-    # Note: MXFP4  S:1-bit, E:2-bit, M:1-bit
-    #   Zeros: S000 -> +/-0
-    #   Denormal Numbers: S001 -> +/- 0.5
-    #   Normal Numbers:
-    #           S010 -> +/- 1.0
-    #           S011 -> +/- 1.5
-    #           S100 -> +/- 2.0
-    #           S101 -> +/- 3.0
-    #           S110 -> +/- 4.0
-    #           S111 -> +/- 6.0
-    qx = qx.to(gl.uint32, bitcast=True)
-
-    # Extract sign
-    s = qx & 0x80000000
-    # Set everything to positive, will add sign back at the end
-    qx = qx ^ s
-
-    qx_fp32 = qx.to(gl.float32, bitcast=True)
-    saturate_mask = qx_fp32 >= max_normal
-    denormal_mask = (~saturate_mask) & (qx_fp32 < min_normal)
-    normal_mask = ~(saturate_mask | denormal_mask)
-
-    # Denormal numbers
-    denorm_exp: gl.constexpr = (
-        (EXP_BIAS_FP32 - EXP_BIAS_FP4) + (MBITS_F32 - MBITS_FP4) + 1
-    )
-    denorm_mask_int: gl.constexpr = denorm_exp << MBITS_F32
-    denorm_mask_float: gl.constexpr = gl.cast(denorm_mask_int, gl.float32, bitcast=True)
-
-    denormal_x = qx_fp32 + denorm_mask_float
-    denormal_x = denormal_x.to(gl.uint32, bitcast=True)
-    denormal_x -= denorm_mask_int
-    denormal_x = denormal_x.to(gl.uint8)
-
-    # Normal numbers
-    normal_x = qx
-    # resulting mantissa is odd
-    mant_odd = (normal_x >> (MBITS_F32 - MBITS_FP4)) & 1
-    # update exponent, rounding bias part 1
-    val_to_add = ((EXP_BIAS_FP4 - EXP_BIAS_FP32) << MBITS_F32) + (1 << 21) - 1
-    normal_x += val_to_add
-    # rounding bias part 2
-    normal_x += mant_odd
-    # take the bits!
-    normal_x = normal_x >> (MBITS_F32 - MBITS_FP4)
-    normal_x = normal_x.to(gl.uint8)
-
-    # Merge results
-    e2m1_value = gl.full(qx.type.get_block_shapes(), 0x7, dtype=gl.uint8)
-    e2m1_value = gl.where(normal_mask, normal_x, e2m1_value)
-    e2m1_value = gl.where(denormal_mask, denormal_x, e2m1_value)
-    # add sign back
-    sign_lp = s >> (MBITS_F32 + EBITS_F32 - MBITS_FP4 - EBITS_FP4)
-    sign_lp = sign_lp.to(gl.uint8)
-    e2m1_value = e2m1_value | sign_lp
-    e2m1_value = gl.reshape(
-        e2m1_value, [BLOCK_SIZE_M, NUM_QUANT_BLOCKS, MXFP4_QUANT_BLOCK_SIZE // 2, 2]
-    )
-    shift = gl.reshape(gl.arange(0, 2) * 4, [1, 1, 1, 2])
-    x_fp4 = gl.sum((e2m1_value.to(gl.int32) << shift), axis=-1).to(gl.uint8)
+    scale_bcast = scale_f32 + gl.zeros_like(evens).to(gl.float32)
+    packed = _cvt_scalef32_pk_fp4_bf16(evens, odds, scale_bcast, 0)
+    x_fp4 = (packed & 0xFF).to(gl.uint8)
     x_fp4 = x_fp4.reshape(BLOCK_SIZE_M, BLOCK_SIZE_N // 2)
 
     return x_fp4, bs_e8m0.reshape(BLOCK_SIZE_M, NUM_QUANT_BLOCKS)
@@ -140,57 +100,203 @@ def gluon_dynamic_mxfp4_quant_kernel_gfx950(
     stride_bs_n = gl.cast(stride_bs_n_in, gl.int64)
 
     NUM_QUANT_BLOCKS: gl.constexpr = BLOCK_SIZE_N // MXFP4_QUANT_BLOCK_SIZE
+    # Each warp's nominal per-axis tile (given size_per_thread=[1,8],
+    # threads_per_warp=[8,8]) is 8 rows along M or 64 cols along N. Putting all
+    # `num_warps` along an axis whose BLOCK_SIZE can't fit them (nominal tile >
+    # BLOCK_SIZE) leaves most warps idle -- e.g. BLOCK_SIZE_M=8 narrow-N configs.
+    # Prefer the M axis (matches the large-BLOCK_SIZE_N configs this was tuned
+    # for) and only fall back to the N axis when M can't fit all the warps.
+    WARPS_M: gl.constexpr = num_warps if (BLOCK_SIZE_M // 8) >= num_warps else 1
+    WARPS_N: gl.constexpr = num_warps // WARPS_M
+    # N (dim 1) is memory-contiguous; vectorize 8 elements/thread there for dwordx4 loads.
     layout: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[1, 1],
+        size_per_thread=[1, 8],
         threads_per_warp=[8, 8],
-        warps_per_cta=[1, num_warps],
-        order=[0, 1],
+        warps_per_cta=[WARPS_M, WARPS_N],
+        order=[1, 0],
     )
 
-    for pid_n in range(start_n, min(start_n + NUM_ITER, N)):
-        x_offs_m = pid_m * BLOCK_SIZE_M + gl.arange(
-            0, BLOCK_SIZE_M, layout=gl.SliceLayout(1, layout)
-        )
-        x_offs_n = pid_n * BLOCK_SIZE_N + gl.arange(
-            0, BLOCK_SIZE_N, layout=gl.SliceLayout(0, layout)
-        )
-        x_offs = x_offs_m[:, None] * stride_x_m + x_offs_n[None, :] * stride_x_n
+    end_n = min(start_n + NUM_ITER, N)
 
+    # Per-lane intra-block offsets don't depend on pid_n -- compute once so the
+    # buffer_load vaddr operand is loop-invariant (compiler hoists it), like
+    # the non-prefetch kernel already does.
+    local_m = gl.arange(0, BLOCK_SIZE_M, layout=gl.SliceLayout(1, layout))
+    local_n = gl.arange(0, BLOCK_SIZE_N, layout=gl.SliceLayout(0, layout))
+    x_offs = local_m[:, None] * stride_x_m_in + local_n[None, :] * stride_x_n_in
+    # Loop-invariant per-block-column stride: an affine accumulator added to
+    # the scalar base pointer each iteration, so the compiler can strength-
+    # reduce it to one cheap add/iteration instead of re-deriving from an index.
+    x_block_stride = BLOCK_SIZE_N * stride_x_n
+    if not EVEN_M_N:
+        x_offs_m = pid_m * BLOCK_SIZE_M + local_m
+
+    # NUM_STAGES==1 (skinny shapes): plain loop, no cross-iteration overlap.
+    # NUM_STAGES==2 (larger shapes): double-buffered, warp_pipeline_stage-staged
+    # loop below. Gluon has no closures, so the body is duplicated per branch.
+    if NUM_STAGES == 1:
+        for pid_n in range(start_n, end_n):
+            x_block_ptr = (
+                x_ptr
+                + (pid_m * BLOCK_SIZE_M).to(gl.int64) * stride_x_m
+                + (pid_n * BLOCK_SIZE_N).to(gl.int64) * stride_x_n
+            )
+            if EVEN_M_N:
+                x = gl.amd.cdna4.buffer_load(x_block_ptr, x_offs, cache=".cg")
+            else:
+                x_offs_n = pid_n * BLOCK_SIZE_N + local_n
+                x_mask = (x_offs_m < M)[:, None] & (x_offs_n < N)[None, :]
+                x = gl.amd.cdna4.buffer_load(
+                    x_block_ptr, x_offs, mask=x_mask, cache=".cg"
+                )
+
+            out_tensor, bs_e8m0 = _mxfp4_quant_op_hw(
+                x, BLOCK_SIZE_N, BLOCK_SIZE_M, MXFP4_QUANT_BLOCK_SIZE
+            )
+
+            out_m_local = gl.arange(0, BLOCK_SIZE_M)
+            out_n_local = gl.arange(0, BLOCK_SIZE_N // 2)
+            out_offs_m = pid_m * BLOCK_SIZE_M + out_m_local
+            out_offs_n = pid_n * (BLOCK_SIZE_N // 2) + out_n_local
+            out_block_offset = (pid_m * BLOCK_SIZE_M).to(gl.int64) * stride_x_fp4_m + (
+                pid_n * (BLOCK_SIZE_N // 2)
+            ).to(gl.int64) * stride_x_fp4_n
+            out_block_ptr = x_fp4_ptr + out_block_offset
+            out_offs = (
+                out_m_local[:, None] * stride_x_fp4_m_in
+                + out_n_local[None, :] * stride_x_fp4_n_in
+            )
+
+            if EVEN_M_N:
+                gl.amd.cdna4.buffer_store(out_tensor, out_block_ptr, out_offs)
+            else:
+                out_mask = (out_offs_m < M)[:, None] & (out_offs_n < (N // 2))[None, :]
+                gl.amd.cdna4.buffer_store(
+                    out_tensor, out_block_ptr, out_offs, mask=out_mask
+                )
+
+            bs_m_local = gl.arange(0, BLOCK_SIZE_M)
+            bs_n_local = gl.arange(0, NUM_QUANT_BLOCKS)
+            bs_offs_m = pid_m * BLOCK_SIZE_M + bs_m_local
+            bs_offs_n = pid_n * NUM_QUANT_BLOCKS + bs_n_local
+            bs_block_offset = (pid_m * BLOCK_SIZE_M).to(gl.int64) * stride_bs_m + (
+                pid_n * NUM_QUANT_BLOCKS
+            ).to(gl.int64) * stride_bs_n
+            bs_block_ptr = bs_ptr + bs_block_offset
+            bs_offs = (
+                bs_m_local[:, None] * stride_bs_m_in
+                + bs_n_local[None, :] * stride_bs_n_in
+            )
+            if EVEN_M_N:
+                gl.amd.cdna4.buffer_store(bs_e8m0, bs_block_ptr, bs_offs)
+            else:
+                bs_mask = (bs_offs_m < M)[:, None] & (
+                    bs_offs_n
+                    < (N + MXFP4_QUANT_BLOCK_SIZE - 1) // MXFP4_QUANT_BLOCK_SIZE
+                )[None, :]
+                gl.amd.cdna4.buffer_store(
+                    bs_e8m0,
+                    bs_block_ptr,
+                    bs_offs,
+                    mask=bs_mask,
+                )
+    else:
+        # Prologue: load the first iteration unconditionally (start_n < end_n
+        # is guaranteed by the launch grid).
+        pid_n = start_n
+        x_block_ptr = (
+            x_ptr
+            + (pid_m * BLOCK_SIZE_M).to(gl.int64) * stride_x_m
+            + (pid_n * BLOCK_SIZE_N).to(gl.int64) * stride_x_n
+        )
         if EVEN_M_N:
-            x = gl.load(x_ptr + x_offs, cache_modifier=".cg").to(gl.float32)
+            x = gl.amd.cdna4.buffer_load(x_block_ptr, x_offs, cache=".cg")
         else:
+            x_offs_n = pid_n * BLOCK_SIZE_N + local_n
             x_mask = (x_offs_m < M)[:, None] & (x_offs_n < N)[None, :]
-            x = gl.load(x_ptr + x_offs, mask=x_mask, cache_modifier=".cg").to(
-                gl.float32
-            )
+            x = gl.amd.cdna4.buffer_load(x_block_ptr, x_offs, mask=x_mask, cache=".cg")
 
-        out_tensor, bs_e8m0 = _mxfp4_quant_op(
-            x, BLOCK_SIZE_N, BLOCK_SIZE_M, MXFP4_QUANT_BLOCK_SIZE
-        )
+        for pid_n in range(start_n, end_n):
+            # Warp-pipeline staging: marks the load as a separate cluster from
+            # compute+store, letting the backend overlap them across warps.
+            with gl.amd.warp_pipeline_stage("load", priority=1):
+                # Uniform (warp-synchronous) scalar check -- not a per-lane mask --
+                # so this is a plain branch, no divergence.
+                has_next = pid_n + 1 < end_n
+                x_block_ptr_next = x_block_ptr + x_block_stride
+                if EVEN_M_N:
+                    if has_next:
+                        x_next = gl.amd.cdna4.buffer_load(
+                            x_block_ptr_next, x_offs, cache=".cg"
+                        )
+                    else:
+                        x_next = x
+                else:
+                    x_offs_n_next = (pid_n + 1) * BLOCK_SIZE_N + local_n
+                    x_mask_next = (
+                        (x_offs_m < M)[:, None]
+                        & (x_offs_n_next < N)[None, :]
+                        & has_next
+                    )
+                    x_next = gl.amd.cdna4.buffer_load(
+                        x_block_ptr_next, x_offs, mask=x_mask_next, cache=".cg"
+                    )
 
-        out_offs_m = pid_m * BLOCK_SIZE_M + gl.arange(0, BLOCK_SIZE_M)
-        out_offs_n = pid_n * BLOCK_SIZE_N // 2 + gl.arange(0, BLOCK_SIZE_N // 2)
-        out_offs = (
-            out_offs_m[:, None] * stride_x_fp4_m + out_offs_n[None, :] * stride_x_fp4_n
-        )
+            with gl.amd.warp_pipeline_stage("compute_store", priority=0):
+                out_tensor, bs_e8m0 = _mxfp4_quant_op_hw(
+                    x, BLOCK_SIZE_N, BLOCK_SIZE_M, MXFP4_QUANT_BLOCK_SIZE
+                )
 
-        if EVEN_M_N:
-            gl.store(x_fp4_ptr + out_offs, out_tensor)
-        else:
-            out_mask = (out_offs_m < M)[:, None] & (out_offs_n < (N // 2))[None, :]
-            gl.store(x_fp4_ptr + out_offs, out_tensor, mask=out_mask)
+                out_m_local = gl.arange(0, BLOCK_SIZE_M)
+                out_n_local = gl.arange(0, BLOCK_SIZE_N // 2)
+                out_offs_m = pid_m * BLOCK_SIZE_M + out_m_local
+                out_offs_n = pid_n * (BLOCK_SIZE_N // 2) + out_n_local
+                out_block_offset = (pid_m * BLOCK_SIZE_M).to(
+                    gl.int64
+                ) * stride_x_fp4_m + (pid_n * (BLOCK_SIZE_N // 2)).to(
+                    gl.int64
+                ) * stride_x_fp4_n
+                out_block_ptr = x_fp4_ptr + out_block_offset
+                out_offs = (
+                    out_m_local[:, None] * stride_x_fp4_m_in
+                    + out_n_local[None, :] * stride_x_fp4_n_in
+                )
 
-        bs_offs_m = pid_m * BLOCK_SIZE_M + gl.arange(0, BLOCK_SIZE_M)
-        bs_offs_n = pid_n * NUM_QUANT_BLOCKS + gl.arange(0, NUM_QUANT_BLOCKS)
-        bs_offs = bs_offs_m[:, None] * stride_bs_m + bs_offs_n[None, :] * stride_bs_n
-        if EVEN_M_N:
-            gl.store(bs_ptr + bs_offs, bs_e8m0)
-        else:
-            bs_mask = (bs_offs_m < M)[:, None] & (
-                bs_offs_n < (N + MXFP4_QUANT_BLOCK_SIZE - 1) // MXFP4_QUANT_BLOCK_SIZE
-            )[None, :]
-            gl.store(
-                bs_ptr + bs_offs,
-                bs_e8m0,
-                mask=bs_mask,
-            )
+                if EVEN_M_N:
+                    gl.amd.cdna4.buffer_store(out_tensor, out_block_ptr, out_offs)
+                else:
+                    out_mask = (out_offs_m < M)[:, None] & (out_offs_n < (N // 2))[
+                        None, :
+                    ]
+                    gl.amd.cdna4.buffer_store(
+                        out_tensor, out_block_ptr, out_offs, mask=out_mask
+                    )
+
+                bs_m_local = gl.arange(0, BLOCK_SIZE_M)
+                bs_n_local = gl.arange(0, NUM_QUANT_BLOCKS)
+                bs_offs_m = pid_m * BLOCK_SIZE_M + bs_m_local
+                bs_offs_n = pid_n * NUM_QUANT_BLOCKS + bs_n_local
+                bs_block_offset = (pid_m * BLOCK_SIZE_M).to(gl.int64) * stride_bs_m + (
+                    pid_n * NUM_QUANT_BLOCKS
+                ).to(gl.int64) * stride_bs_n
+                bs_block_ptr = bs_ptr + bs_block_offset
+                bs_offs = (
+                    bs_m_local[:, None] * stride_bs_m_in
+                    + bs_n_local[None, :] * stride_bs_n_in
+                )
+                if EVEN_M_N:
+                    gl.amd.cdna4.buffer_store(bs_e8m0, bs_block_ptr, bs_offs)
+                else:
+                    bs_mask = (bs_offs_m < M)[:, None] & (
+                        bs_offs_n
+                        < (N + MXFP4_QUANT_BLOCK_SIZE - 1) // MXFP4_QUANT_BLOCK_SIZE
+                    )[None, :]
+                    gl.amd.cdna4.buffer_store(
+                        bs_e8m0,
+                        bs_block_ptr,
+                        bs_offs,
+                        mask=bs_mask,
+                    )
+
+            x = x_next
+            x_block_ptr = x_block_ptr_next

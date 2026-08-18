@@ -1,25 +1,26 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import heapq
 import math
-from typing import Optional, Tuple
 
-from aiter.ops.enum import QuantType, Enum, MlaVersion
 import torch
 import triton
 import triton.language as tl
+
+from aiter import dtypes
+from aiter.ops.enum import Enum, MlaVersion, QuantType
+from aiter.ops.triton.gluon.pa_decode_gluon import pa_decode_gluon
+from aiter.utility.dtypes import _aiter_dtype_id
 from csrc.cpp_itfs.pa.pa import paged_attention_rocm as paged_attention_rocm_core
 from csrc.cpp_itfs.pa.pa_ragged import (
     paged_attention_ragged as paged_attention_ragged_core,
 )
 from csrc.cpp_itfs.pa.pa_v1 import paged_attention_v1 as paged_attention_v1_core
 from csrc.cpp_itfs.torch_utils import direct_register_custom_op
-from aiter.ops.triton.gluon.pa_decode_gluon import pa_decode_gluon
 
-from aiter import dtypes
-
-from ..jit.utils.chip_info import get_cu_num, get_gfx
 from ..jit.core import compile_ops, is_experimental_enabled
+from ..jit.utils.chip_info import get_cu_num, get_gfx
 
 MD_NAME = "module_attention"
 
@@ -50,7 +51,7 @@ def gen_pa_fwd_native_fake(
     scale_v: float,
     block_size: int,
     quant_algo: int,
-    out: Optional[torch.Tensor] = None,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if out is not None:
         return out
@@ -66,14 +67,14 @@ def gen_pa_fwd_asm(
     context_lens: torch.Tensor,
     block_tables_stride0: int,
     max_qlen: int = 1,
-    K_QScale: Optional[torch.Tensor] = None,
-    V_QScale: Optional[torch.Tensor] = None,
-    out_: Optional[torch.Tensor] = None,
-    qo_indptr: Optional[torch.Tensor] = None,
-    high_precision: Optional[
-        int
-    ] = 1,  # [0, 1, 2] 2 is the highest precision, this is only for fp8 kvcache
-    kernelName: Optional[str] = None,
+    K_QScale: torch.Tensor | None = None,
+    V_QScale: torch.Tensor | None = None,
+    out_: torch.Tensor | None = None,
+    qo_indptr: torch.Tensor | None = None,
+    high_precision: (
+        int | None
+    ) = 1,  # [0, 1, 2] 2 is the highest precision, this is only for fp8 kvcache
+    kernelName: str | None = None,
 ):
     if out_ is not None:
         return out_
@@ -102,7 +103,7 @@ def pa_fwd_naive(
     scale_v: float,
     block_size: int,
     quant_algo: int,
-    out: Optional[torch.Tensor] = None,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor: ...
 
 
@@ -117,12 +118,12 @@ def _pa_fwd_asm(
     context_lens: torch.Tensor,
     block_tables_stride0: int,
     max_qlen: int = 1,
-    K_QScale: Optional[torch.Tensor] = None,
-    V_QScale: Optional[torch.Tensor] = None,
-    out_: Optional[torch.Tensor] = None,
-    qo_indptr: Optional[torch.Tensor] = None,
-    high_precision: Optional[int] = 1,
-    kernelName: Optional[str] = None,
+    K_QScale: torch.Tensor | None = None,
+    V_QScale: torch.Tensor | None = None,
+    out_: torch.Tensor | None = None,
+    qo_indptr: torch.Tensor | None = None,
+    high_precision: int | None = 1,
+    kernelName: str | None = None,
 ) -> None: ...
 
 
@@ -134,14 +135,14 @@ def pa_fwd_asm(
     context_lens: torch.Tensor,
     block_tables_stride0: int,
     max_qlen: int = 1,
-    K_QScale: Optional[torch.Tensor] = None,
-    V_QScale: Optional[torch.Tensor] = None,
-    out_: Optional[torch.Tensor] = None,
-    qo_indptr: Optional[torch.Tensor] = None,
-    high_precision: Optional[
-        int
-    ] = 1,  # [0, 1, 2] 2 is the highest precision, this is only for fp8 kvcache
-    kernelName: Optional[str] = None,
+    K_QScale: torch.Tensor | None = None,
+    V_QScale: torch.Tensor | None = None,
+    out_: torch.Tensor | None = None,
+    qo_indptr: torch.Tensor | None = None,
+    high_precision: (
+        int | None
+    ) = 1,  # [0, 1, 2] 2 is the highest precision, this is only for fp8 kvcache
+    kernelName: str | None = None,
 ) -> torch.Tensor:
     output = out_ if out_ is not None else torch.empty_like(Q)
     _pa_fwd_asm(
@@ -203,20 +204,18 @@ def paged_attention_common(
     scale: float,
     max_qlen: int = 1,
     max_seq_len: int = 1,
-    K_QScale_hip: Optional[torch.Tensor] = None,  # [num_seqs, num_heads]
-    V_QScale_hip: Optional[torch.Tensor] = None,
-    K_QScale_asm: Optional[
-        torch.Tensor
-    ] = None,  # [num_blocks, num_kv_heads, block_size]
-    V_QScale_asm: Optional[torch.Tensor] = None,
-    out_: Optional[torch.Tensor] = None,
-    qo_indptr: Optional[torch.Tensor] = None,
-    high_precision: Optional[
-        int
-    ] = 1,  # [0, 1, 2] 2 is the highest precision, this is only for fp8 kvcache
-    kernelName: Optional[str] = None,
+    K_QScale_hip: torch.Tensor | None = None,  # [num_seqs, num_heads]
+    V_QScale_hip: torch.Tensor | None = None,
+    K_QScale_asm: torch.Tensor | None = None,  # [num_blocks, num_kv_heads, block_size]
+    V_QScale_asm: torch.Tensor | None = None,
+    out_: torch.Tensor | None = None,
+    qo_indptr: torch.Tensor | None = None,
+    high_precision: (
+        int | None
+    ) = 1,  # [0, 1, 2] 2 is the highest precision, this is only for fp8 kvcache
+    kernelName: str | None = None,
     kv_cache_dtype: str = "auto",
-    kv_cache_tensor_dtype: Optional[torch.dtype] = None,
+    kv_cache_tensor_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
     """
     Paged attention forward pass with automatic kernel selection.
@@ -290,20 +289,20 @@ def gen_pa_ps_fwd_asm(
     context_lens: torch.Tensor,
     softmax_scale: float,  # better have ?
     max_qlen: int = 1,
-    K_QScale: Optional[torch.Tensor] = None,
-    V_QScale: Optional[torch.Tensor] = None,
-    out_: Optional[torch.Tensor] = None,
-    qo_indptr: Optional[torch.Tensor] = None,
+    K_QScale: torch.Tensor | None = None,
+    V_QScale: torch.Tensor | None = None,
+    out_: torch.Tensor | None = None,
+    qo_indptr: torch.Tensor | None = None,
     # work_meta_data: Optional[torch.Tensor] = None,
-    work_indptr: Optional[torch.Tensor] = None,
-    work_info: Optional[torch.Tensor] = None,
-    splitData: Optional[torch.Tensor] = None,
-    splitLse: Optional[torch.Tensor] = None,
-    high_precision: Optional[
-        int
-    ] = 1,  # [0, 1, 2] 2 is the highest precision, this is only for fp8 kvcache
-    kernelName: Optional[str] = None,
-    quant_type: Optional[Enum] = QuantType.per_Token.value,
+    work_indptr: torch.Tensor | None = None,
+    work_info: torch.Tensor | None = None,
+    splitData: torch.Tensor | None = None,
+    splitLse: torch.Tensor | None = None,
+    high_precision: (
+        int | None
+    ) = 1,  # [0, 1, 2] 2 is the highest precision, this is only for fp8 kvcache
+    kernelName: str | None = None,
+    quant_type: Enum | None = QuantType.per_Token.value,
 ) -> torch.Tensor:
     if out_ is not None:
         return out_
@@ -326,18 +325,18 @@ def _pa_ps_fwd_asm(
     context_lens: torch.Tensor,
     softmax_scale: float,
     max_qlen: int = 1,
-    K_QScale: Optional[torch.Tensor] = None,
-    V_QScale: Optional[torch.Tensor] = None,
-    out_: Optional[torch.Tensor] = None,
-    qo_indptr: Optional[torch.Tensor] = None,
-    work_indptr: Optional[torch.Tensor] = None,
-    work_info: Optional[torch.Tensor] = None,
-    splitData: Optional[torch.Tensor] = None,
-    splitLse: Optional[torch.Tensor] = None,
+    K_QScale: torch.Tensor | None = None,
+    V_QScale: torch.Tensor | None = None,
+    out_: torch.Tensor | None = None,
+    qo_indptr: torch.Tensor | None = None,
+    work_indptr: torch.Tensor | None = None,
+    work_info: torch.Tensor | None = None,
+    splitData: torch.Tensor | None = None,
+    splitLse: torch.Tensor | None = None,
     mask: int = 0,
-    high_precision: Optional[int] = 1,
-    kernelName: Optional[str] = None,
-    quant_type: Optional[Enum] = QuantType.per_Token.value,
+    high_precision: int | None = 1,
+    kernelName: str | None = None,
+    quant_type: Enum | None = QuantType.per_Token.value,
 ) -> None: ...
 
 
@@ -350,20 +349,20 @@ def pa_ps_fwd_asm(
     context_lens: torch.Tensor,
     softmax_scale: float,
     max_qlen: int = 1,
-    K_QScale: Optional[torch.Tensor] = None,
-    V_QScale: Optional[torch.Tensor] = None,
-    out_: Optional[torch.Tensor] = None,
-    qo_indptr: Optional[torch.Tensor] = None,
-    work_indptr: Optional[torch.Tensor] = None,
-    work_info: Optional[torch.Tensor] = None,
-    splitData: Optional[torch.Tensor] = None,
-    splitLse: Optional[torch.Tensor] = None,
+    K_QScale: torch.Tensor | None = None,
+    V_QScale: torch.Tensor | None = None,
+    out_: torch.Tensor | None = None,
+    qo_indptr: torch.Tensor | None = None,
+    work_indptr: torch.Tensor | None = None,
+    work_info: torch.Tensor | None = None,
+    splitData: torch.Tensor | None = None,
+    splitLse: torch.Tensor | None = None,
     mask: int = 0,
-    high_precision: Optional[
-        int
-    ] = 1,  # [0, 1, 2] 2 is the highest precision, this is only for fp8 kvcache
-    kernelName: Optional[str] = None,
-    quant_type: Optional[Enum] = QuantType.per_Token.value,
+    high_precision: (
+        int | None
+    ) = 1,  # [0, 1, 2] 2 is the highest precision, this is only for fp8 kvcache
+    kernelName: str | None = None,
+    quant_type: Enum | None = QuantType.per_Token.value,
 ) -> torch.Tensor:
     output = out_ if out_ is not None else torch.empty_like(Q)
     _pa_ps_fwd_asm(
@@ -423,16 +422,16 @@ def _pa_decode_bf16_asm(
     k_scale: torch.Tensor,
     v_scale: torch.Tensor,
     out: torch.Tensor,
-    qo_indptr: Optional[torch.Tensor],
+    qo_indptr: torch.Tensor | None,
     kv_indptr: torch.Tensor,
-    work_indptr: Optional[torch.Tensor],
-    work_info: Optional[torch.Tensor],
-    split_o: Optional[torch.Tensor],
-    split_lse: Optional[torch.Tensor],
+    work_indptr: torch.Tensor | None,
+    work_info: torch.Tensor | None,
+    split_o: torch.Tensor | None,
+    split_lse: torch.Tensor | None,
     sink: torch.Tensor,
     gqa: int,
     mtp: int,
-    kernelName: Optional[str],
+    kernelName: str | None,
 ) -> None: ...
 
 
@@ -446,17 +445,17 @@ def pa_decode_bf16_asm(
     kv_indptr: torch.Tensor,
     gqa: int = 8,
     mtp: int = 0,
-    query_scale: Optional[torch.Tensor] = None,
-    key_scale: Optional[torch.Tensor] = None,
-    value_scale: Optional[torch.Tensor] = None,
-    qo_indptr: Optional[torch.Tensor] = None,
-    work_indptr: Optional[torch.Tensor] = None,
-    work_info: Optional[torch.Tensor] = None,
-    split_o: Optional[torch.Tensor] = None,
-    split_lse: Optional[torch.Tensor] = None,
-    sink: Optional[torch.Tensor] = None,
-    out: Optional[torch.Tensor] = None,
-    kernelName: Optional[str] = None,
+    query_scale: torch.Tensor | None = None,
+    key_scale: torch.Tensor | None = None,
+    value_scale: torch.Tensor | None = None,
+    qo_indptr: torch.Tensor | None = None,
+    work_indptr: torch.Tensor | None = None,
+    work_info: torch.Tensor | None = None,
+    split_o: torch.Tensor | None = None,
+    split_lse: torch.Tensor | None = None,
+    sink: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
+    kernelName: str | None = None,
 ) -> torch.Tensor:
     """Public wrapper for the gfx1250 PA decode kernel.
 
@@ -522,11 +521,11 @@ def pa_reduce_v1(
     partial_output: torch.Tensor,
     partial_lse: torch.Tensor,
     reduce_indptr: torch.Tensor,
-    reduce_final_map: Optional[torch.Tensor],
+    reduce_final_map: torch.Tensor | None,
     reduce_partial_map: torch.Tensor,
     max_seqlen_q: int,
     final_output: torch.Tensor,
-    final_lse: Optional[torch.Tensor] = None,
+    final_lse: torch.Tensor | None = None,
     # num_kv_splits is trailing+optional so the ATOM call site (which passes 8
     # positional args, no split count) stays aligned. The kernel uses
     # max(SM_count, num_kv_splits), so the default 0 means "auto" (SM_count).
@@ -561,12 +560,12 @@ def pa_persistent_fwd(
     reduce_indptr: torch.Tensor,
     reduce_final_map: torch.Tensor,
     reduce_partial_map: torch.Tensor,
-    K_QScale: Optional[torch.Tensor] = None,  # [num_blocks, kv_heads, block_size]
-    V_QScale: Optional[torch.Tensor] = None,  # [num_blocks, kv_heads, block_size]
-    softmax_scale: Optional[float] = None,
+    K_QScale: torch.Tensor | None = None,  # [num_blocks, kv_heads, block_size]
+    V_QScale: torch.Tensor | None = None,  # [num_blocks, kv_heads, block_size]
+    softmax_scale: float | None = None,
     mask: int = 0,
     quant_type: QuantType = QuantType.per_Token,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     device = Q.device
     total_s, nhead, v_head_dim = output.shape
     if softmax_scale is None:
@@ -631,14 +630,14 @@ def paged_attention_rocm(
     context_lens: torch.Tensor,
     block_size: int,
     max_context_len: int,
-    alibi_slopes: Optional[torch.Tensor],
+    alibi_slopes: torch.Tensor | None,
     kv_cache_dtype: str,
     k_scale: torch.Tensor,
     v_scale: torch.Tensor,
-    fp8_out_scale: Optional[torch.Tensor] = None,
+    fp8_out_scale: torch.Tensor | None = None,
     partition_size: int = 256,
     mtp: int = 1,
-    q_scale: Optional[torch.Tensor] = None,
+    q_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     paged_attention_rocm_core(
         out,
@@ -681,16 +680,16 @@ def paged_attention_v1(
     value_cache: torch.Tensor,
     scale: float,
     block_tables: torch.Tensor,
-    cu_query_lens: Optional[torch.Tensor],
+    cu_query_lens: torch.Tensor | None,
     context_lens: torch.Tensor,
     max_context_len: int,
-    alibi_slopes: Optional[torch.Tensor],
+    alibi_slopes: torch.Tensor | None,
     kv_cache_dtype: str,
     kv_cache_layout: str,
     logits_soft_cap: float,
     k_scale: torch.Tensor,
     v_scale: torch.Tensor,
-    fp8_out_scale: Optional[torch.Tensor] = None,
+    fp8_out_scale: torch.Tensor | None = None,
     partition_size: int = 256,
     mtp: int = 1,
     sliding_window: int = 0,
@@ -739,13 +738,13 @@ def paged_attention_ragged(
     kv_last_page_lens: torch.Tensor,
     block_size: int,
     max_num_partitions: int,
-    alibi_slopes: Optional[torch.Tensor],
+    alibi_slopes: torch.Tensor | None,
     kv_cache_dtype: str,
     kv_cache_layout: str,
     logits_soft_cap: float,
     k_scale: torch.Tensor,
     v_scale: torch.Tensor,
-    fp8_out_scale: Optional[torch.Tensor] = None,
+    fp8_out_scale: torch.Tensor | None = None,
     partition_size: int = 256,
     mtp: int = 1,
 ) -> torch.Tensor:
@@ -798,10 +797,10 @@ def mla_decode_stage1_asm_fwd(
     kv_page_indices: torch.Tensor,
     # [batch_size]
     kv_last_page_lens: torch.Tensor,
-    num_kv_splits_indptr: Optional[torch.Tensor],
-    work_meta_data: Optional[torch.Tensor],
-    work_indptr: Optional[torch.Tensor],
-    work_info_set: Optional[torch.Tensor],
+    num_kv_splits_indptr: torch.Tensor | None,
+    work_meta_data: torch.Tensor | None,
+    work_indptr: torch.Tensor | None,
+    work_info_set: torch.Tensor | None,
     max_seqlen_q: int,
     page_size: int,
     nhead_kv: int,
@@ -812,20 +811,21 @@ def mla_decode_stage1_asm_fwd(
     splitLse: torch.Tensor,
     output: torch.Tensor,
     # [batch_size, num_heads, v_head_dim]
-    lse: Optional[torch.Tensor] = None,
+    lse: torch.Tensor | None = None,
     # [1] per-tensor
-    q_scale: Optional[torch.Tensor] = None,
-    kv_scale: Optional[torch.Tensor] = None,
+    q_scale: torch.Tensor | None = None,
+    kv_scale: torch.Tensor | None = None,
     # round-robin context-parallel (CP) extension:
     #   g_kv_indptr   : [batch_size+1] GLOBAL kv_indptr (per-request global KV length)
     #   cp_world_size : number of CP ranks (W); 1 == disabled
     #   cp_rank       : this rank id (r); local kv idx j -> global pos j*W + r
-    g_kv_indptr: Optional[torch.Tensor] = None,
+    g_kv_indptr: torch.Tensor | None = None,
     cp_world_size: int = 1,
     cp_rank: int = 0,
     # [batch_size] scratch for gfx1250 packed MLA kernels
-    valid_split_count: Optional[torch.Tensor] = None,
+    valid_split_count: torch.Tensor | None = None,
     use_valid_split_count_reduce: int = 0,
+    causal: bool = True,
 ) -> None: ...
 
 
@@ -850,7 +850,7 @@ def mla_decode_v4_asm(
     kv_page_indices: torch.Tensor,
     # [num_seqs+1]
     split_indptr: torch.Tensor,
-    # [num_heads] FP32 — attention sink logit. Loaded by the kernel via
+    # [num_heads] FP32 -- attention sink logit. Loaded by the kernel via
     # kernarg slot 18 (byte offset 0x120). Caller must ALWAYS pass a real
     # tensor; there is no nullable-sink convention on the C ABI. Pass
     # torch.full((num_heads,), float("-inf")) for "no sink" math.
@@ -872,13 +872,13 @@ def mla_decode_v4_asm(
     # per-request valid kv-split count the kernel writes (slot 19). Pass a
     # real tensor when use_valid_split_count_reduce != 0; otherwise the
     # kernel skips the write and nullptr is fine.
-    valid_split_count: Optional[torch.Tensor] = None,
+    valid_split_count: torch.Tensor | None = None,
     use_valid_split_count_reduce: int = 0,
     # [num_seqs] int32. Unused on the v4 nm path (page_size=1 -> the kernel derives
     # kv_seq_len from the token-level kv_indptr). Optional/nullable: None sends a
     # nullptr; the host guards the deref (asm_mla_v4.cu) and the kernel never loads
     # through it. Placed at the tail because it carries no data on this path.
-    kv_last_page_lens: Optional[torch.Tensor] = None,
+    kv_last_page_lens: torch.Tensor | None = None,
 ) -> None: ...
 
 
@@ -937,7 +937,7 @@ def get_pa_metadata_info_v1(
     )
 
 
-@compile_ops("module_pa_metadata")
+@compile_ops("module_pa_metadata", develop=True)
 def get_pa_metadata_v1(
     seqlens_qo_indptr: torch.Tensor,
     pages_kv_indptr: torch.Tensor,
@@ -1000,7 +1000,6 @@ def get_pa_metadata_v1(
         [5] reduce_partial_map: (#partial_tiles),   The locations in partial buffer of partial tiles waiting for being
                                                     reduced.
     """
-    ...
 
 
 def get_ps_metadata_info_v1(
@@ -1046,7 +1045,7 @@ def get_ps_metadata_info_v1(
     )
 
 
-@compile_ops("module_ps_metadata")
+@compile_ops("module_ps_metadata", develop=True)
 def get_ps_metadata_v1(
     seqlens_qo_indptr: torch.Tensor,
     pages_kv_indptr: torch.Tensor,
@@ -1075,17 +1074,17 @@ def mla_prefill_ps_asm_fwd(
     qo_indptr: torch.Tensor,
     kv_indptr: torch.Tensor,
     kv_page_indices: torch.Tensor,
-    work_indptr: Optional[torch.Tensor],
-    work_info_set: Optional[torch.Tensor],
+    work_indptr: torch.Tensor | None,
+    work_info_set: torch.Tensor | None,
     max_seqlen_q: int,
     softmax_scale: float,
     is_causal: bool,
     splitData: torch.Tensor,
     splitLse: torch.Tensor,
     output: torch.Tensor,
-    q_scale: Optional[torch.Tensor] = None,
-    k_scale: Optional[torch.Tensor] = None,
-    v_scale: Optional[torch.Tensor] = None,
+    q_scale: torch.Tensor | None = None,
+    k_scale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
 ) -> None: ...
 
 
@@ -1164,7 +1163,7 @@ def get_mla_metadata_info_v1(
 
     effective_seqlen_qo = 1 if is_sparse else max_seqlen_qo
     packed_qo_len = effective_seqlen_qo * num_head_qo
-    max_qo_tiles_per_batch = int(math.ceil(packed_qo_len / 16))
+    max_qo_tiles_per_batch = math.ceil(packed_qo_len / 16)
 
     if (
         get_gfx() == "gfx950"
@@ -1173,12 +1172,18 @@ def get_mla_metadata_info_v1(
         and packed_qo_len >= 64
         and num_head_qo <= 64
         and (packed_qo_len < 128 or num_head_qo == 48)
+    ) or (
+        get_gfx() == "gfx950"
+        and q_dtype == dtypes.fp8
+        and kv_dtype == dtypes.fp8
+        and (num_head_qo == 32)
+        and (effective_seqlen_qo == 3)
     ):
         if num_head_qo * 2 > 64:
             # e.g. nhead=48: C++ does  `return seqlen_qo`  (not ceil)
             max_qo_tiles_per_batch = effective_seqlen_qo
         else:
-            max_qo_tiles_per_batch = int(math.ceil(packed_qo_len / 64))
+            max_qo_tiles_per_batch = math.ceil(packed_qo_len / 64)
     elif (
         num_head_qo == 16
         or (
@@ -1213,7 +1218,7 @@ def get_mla_metadata_info_v1(
             and effective_seqlen_qo == 1
         )
     ):
-        max_qo_tiles_per_batch = int(math.ceil(packed_qo_len / 128))
+        max_qo_tiles_per_batch = math.ceil(packed_qo_len / 128)
     elif (
         get_gfx() == "gfx950"
         and (packed_qo_len >= 128 or num_head_qo > 64)
@@ -1224,7 +1229,7 @@ def get_mla_metadata_info_v1(
         if num_head_qo * 2 > 128:
             max_qo_tiles_per_batch = effective_seqlen_qo
         else:
-            max_qo_tiles_per_batch = int(math.ceil(packed_qo_len / 128))
+            max_qo_tiles_per_batch = math.ceil(packed_qo_len / 128)
 
     batch_size = batch_size * max_seqlen_qo if is_sparse else batch_size
     tile_cnt = batch_size * max_qo_tiles_per_batch
@@ -1274,7 +1279,7 @@ def get_mla_metadata_info_v1(
         )
 
 
-@compile_ops("module_mla_metadata", fc_name="get_mla_metadata_v1")
+@compile_ops("module_mla_metadata", fc_name="get_mla_metadata_v1", develop=True)
 def _get_mla_metadata_v1_impl(
     seqlens_qo_indptr: torch.Tensor,
     seqlens_kv_indptr: torch.Tensor,
@@ -1298,10 +1303,10 @@ def _get_mla_metadata_v1_impl(
     intra_batch_mode: bool = False,
     is_cp_round_robin: bool = False,
     mla_version: int = MlaVersion.V32.value,
-    dtype_q_nope: Optional[torch.dtype] = None,
-    dtype_q_rope: Optional[torch.dtype] = None,
-    dtype_kv_nope: Optional[torch.dtype] = None,
-    dtype_kv_rope: Optional[torch.dtype] = None,
+    dtype_q_nope: int | None = None,
+    dtype_q_rope: int | None = None,
+    dtype_kv_nope: int | None = None,
+    dtype_kv_rope: int | None = None,
 ) -> None:
     """Compiled binding for ``get_mla_metadata_v1`` (bound via ``fc_name``).
 
@@ -1353,7 +1358,6 @@ def _get_mla_metadata_v1_impl(
         [5] reduce_partial_map  (#partial_tiles)                Partial-buffer locations of the
                                                 tiles awaiting reduction.
     """
-    ...
 
 
 def get_mla_metadata_v1(
@@ -1379,12 +1383,12 @@ def get_mla_metadata_v1(
     intra_batch_mode: bool = False,
     is_cp_round_robin: bool = False,
     mla_version: int = MlaVersion.V32.value,
-    dtype_q_nope: Optional[torch.dtype] = None,
-    dtype_q_rope: Optional[torch.dtype] = None,
-    dtype_kv_nope: Optional[torch.dtype] = None,
-    dtype_kv_rope: Optional[torch.dtype] = None,
-    dtype_q: Optional[torch.dtype] = None,
-    dtype_kv: Optional[torch.dtype] = None,
+    dtype_q_nope: torch.dtype | None = None,
+    dtype_q_rope: torch.dtype | None = None,
+    dtype_kv_nope: torch.dtype | None = None,
+    dtype_kv_rope: torch.dtype | None = None,
+    dtype_q: torch.dtype | None = None,
+    dtype_kv: torch.dtype | None = None,
 ) -> None:
     """Forward-compatible wrapper around the compiled ``get_mla_metadata_v1``.
 
@@ -1404,6 +1408,14 @@ def get_mla_metadata_v1(
             dtype_kv_nope = dtype_kv
         if dtype_kv_rope is None:
             dtype_kv_rope = dtype_kv
+
+    # develop=True auto-converts torch.Tensor args to aiter_tensor_t but NOT
+    # torch.dtype, so map the per-component dtypes to their AiterDtype enum ids
+    # here (None stays None -> C++ defaults to bf16). Both fp8 torch variants
+    # (e4m3fnuz / e4m3fn) collapse to the single AITER_DTYPE_fp8 id, matching the
+    # C++ side which only distinguishes "is fp8".
+    def _dtype_id(d):
+        return _aiter_dtype_id(d) if d is not None else None
 
     return _get_mla_metadata_v1_impl(
         seqlens_qo_indptr,
@@ -1427,15 +1439,14 @@ def get_mla_metadata_v1(
         max_split_per_batch=max_split_per_batch,
         intra_batch_mode=intra_batch_mode,
         is_cp_round_robin=is_cp_round_robin,
-        mla_version=mla_version,
-        dtype_q_nope=dtype_q_nope,
-        dtype_q_rope=dtype_q_rope,
-        dtype_kv_nope=dtype_kv_nope,
-        dtype_kv_rope=dtype_kv_rope,
+        mla_version=int(mla_version),
+        dtype_q_nope=_dtype_id(dtype_q_nope),
+        dtype_q_rope=_dtype_id(dtype_q_rope),
+        dtype_kv_nope=_dtype_id(dtype_kv_nope),
+        dtype_kv_rope=_dtype_id(dtype_kv_rope),
     )
 
 
-@compile_ops("module_mla_metadata")
 def get_mla_metadata_v1_no_redundant(
     seqlens_qo_indptr: torch.Tensor,
     seqlens_kv_indptr: torch.Tensor,
@@ -1443,7 +1454,14 @@ def get_mla_metadata_v1_no_redundant(
     num_heads_k: int,
     is_causal: bool,
     kv_granularity: int,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
     """
     Arguments:
         cumulated seqlens of q/o: (batch_size + 1), dtype torch.int32.
@@ -1471,7 +1489,311 @@ def get_mla_metadata_v1_no_redundant(
         [5] reduce_partial_map: (#partial_tiles),    The locations in partial buffer of partial tiles waiting for being
                                                      reduced.
     """
-    ...
+    # Pure-Python 1:1 port of the (former) C++ host bin-packing kernel
+    # ``get_mla_metadata_v1_1_host<MlaMetadataV11Traits<64, 1>>`` with
+    # ``no_redundant == true``. This runs on the CPU over plain Python ints;
+    # only the final tensor construction touches the device. Keeping it in
+    # Python lets the shared ``metadata.cu`` compilation unit drop torch
+    # entirely (this op returned a dynamically-sized ``std::vector<Tensor>``,
+    # which is incompatible with the develop=True out-param convention).
+
+    # Traits = MlaMetadataV11Traits<64, 1>: the ASM MLA decode kernel supports
+    # num_heads=16 and qo size 1..4 without qo split, so kPackedQoLenPerWg must
+    # be 4*16=64 to prevent splitting in any supported case.
+    kPackedQoLenPerWg = 64
+    kMaxClusterSize = 1
+    kSplitTolerance = 16
+    no_redundant = True
+    # DW counts of the MlaWorkInfo / MlaPartialTileInfo unions (mla.h).
+    kSizeMlaWorkInfoInDw = 8
+    kSizeMlaPartialTileInfoInDw = 2
+
+    # --- integer helpers (verbatim translations of the ck_tile equivalents) ---
+    def integer_divide_ceil(x, y):
+        return (x + y - 1) // y
+
+    def integer_least_multiple(x, y):
+        return integer_divide_ceil(x, y) * y
+
+    def cal_cost(qo_len, kv_len):
+        return 2 * qo_len + kv_len
+
+    def cal_kv_len(cost, qo_len):
+        return cost - 2 * qo_len
+
+    def cal_packed_causal_kv_len(
+        qo_len, kv_len, qo_tile_idx, packed_qo_tile_len, num_qo_tiles, num_heads, causal
+    ):
+        result = kv_len
+        if causal and (qo_tile_idx < num_qo_tiles):
+            kv_len_init = kv_len - qo_len
+            kv_len_slop = integer_divide_ceil(
+                (qo_tile_idx + 1) * packed_qo_tile_len, num_heads
+            )
+            s = kv_len_init + kv_len_slop
+            # C++: s < kv_len ? s : kv_len
+            result = min(s, kv_len)
+        return result
+
+    # This version just follows Flashinfer.
+    def cal_workload_limit_global_v0(cum_workload, num_clusters, kv_gran):
+        avg_workload_raw = integer_divide_ceil(cum_workload, num_clusters)
+        # C++: avg_workload_raw > 1 ? avg_workload_raw : 1
+        avg_workload = max(1, avg_workload_raw)
+        if avg_workload <= 8:
+            limit = 32
+        elif avg_workload <= 16:
+            limit = 64
+        elif avg_workload <= 32:
+            limit = 128
+        elif avg_workload <= 64:
+            limit = 192
+        else:
+            limit = avg_workload
+        return integer_least_multiple(limit, kv_gran)
+
+    device = seqlens_qo_indptr.device
+    num_cu = torch.cuda.get_device_properties(device).multi_processor_count
+
+    p_seqlens_qo_indptr = seqlens_qo_indptr.to(device="cpu", dtype=torch.int32).tolist()
+    p_seqlens_kv_indptr = seqlens_kv_indptr.to(device="cpu", dtype=torch.int32).tolist()
+
+    num_batches = len(p_seqlens_qo_indptr) - 1
+    num_heads = num_heads_k * num_heads_per_head_k
+
+    # Step.0. Get sequence lengths of query/output and key/value for each batch.
+    batch_infos = []  # (batch_idx, qo_len, kv_len)
+    sum_packed_qo_len = 0
+    for bid in range(num_batches):
+        qo_len = p_seqlens_qo_indptr[bid + 1] - p_seqlens_qo_indptr[bid]
+        kv_len = p_seqlens_kv_indptr[bid + 1] - p_seqlens_kv_indptr[bid]
+        assert (qo_len > 0) and (
+            kv_len > 0
+        ), "get_mla_metadata_v1_no_redundant: Invalid qo_len or/and kv_len!"
+        sum_packed_qo_len += qo_len * num_heads
+        batch_infos.append((bid, qo_len, kv_len))
+    # Sort by cost, high cost first (std::greater<BatchInfo>). Ties may order
+    # differently than std::sort but yield an equally valid partition.
+    batch_infos.sort(key=lambda b: cal_cost(b[1], b[2]), reverse=True)
+
+    # Step.1. Calculate the size of cluster. The size is the number of workgroups
+    # composing each cluster, determined by the average packed qo length.
+    avg_packed_qo_len = sum_packed_qo_len // num_batches
+    cluster_size = min(
+        integer_divide_ceil(avg_packed_qo_len, kPackedQoLenPerWg), kMaxClusterSize
+    )
+    assert (
+        num_cu % cluster_size
+    ) == 0, "get_mla_metadata_v1_no_redundant: Invalid cluster_size!"
+    num_clusters = num_cu // cluster_size
+    cluster_len_q = cluster_size * kPackedQoLenPerWg
+
+    # Step.2.
+    #   a. Get the total valid (after causal masking) kv lengths and the maximum
+    #      workload handled by each cluster.
+    #   b. Get an indptr array about #cluster for each batch in the qo direction.
+    workload_sum = 0
+    num_qo_clusters_indptr = [0]
+    for bid, qo_len, kv_len in batch_infos:
+        packed_qo_len = qo_len * num_heads
+        num_qo_tiles = integer_divide_ceil(packed_qo_len, cluster_len_q)
+        packed_qo_tile_len = min(packed_qo_len, cluster_len_q)
+
+        num_qo_clusters_indptr.append(num_qo_clusters_indptr[-1] + num_qo_tiles)
+
+        for tid in range(num_qo_tiles):
+            kv_len_valid = cal_packed_causal_kv_len(
+                qo_len,
+                kv_len,
+                tid,
+                packed_qo_tile_len,
+                num_qo_tiles,
+                num_heads,
+                is_causal,
+            )
+            # always assume that each batch of tile will be splited once along kv.
+            kv_len_splited = integer_least_multiple(
+                integer_divide_ceil(kv_len_valid, 2), kv_granularity
+            )
+            workload_sum += (
+                2 * cal_cost(packed_qo_tile_len, kv_len_splited) + kv_granularity
+            )
+
+    workload_limit_global = cal_workload_limit_global_v0(
+        workload_sum, num_clusters, kv_granularity
+    )
+
+    # Step.3.1. Allocate output buffers except indptrs.
+    work_info_set = [[] for _ in range(num_clusters)]
+    total_qo_clusters = num_qo_clusters_indptr[-1]
+    reduce_partial_map = [[] for _ in range(total_qo_clusters)]
+    reduce_partial_info = [[-1, -2] for _ in range(total_qo_clusters)]
+
+    # Step.3.2. Declare the priority queue: a min-heap keyed on accumulated cost
+    # (heapq mirrors std::priority_queue with a greater-than comparator). The
+    # cluster id is the tie-breaker; std::priority_queue left ties unspecified,
+    # so ordering may differ but the result is equally valid.
+    cost_heap = [(0, cid) for cid in range(num_clusters)]
+    heapq.heapify(cost_heap)
+
+    # Step.4. Fill the output buffers except indptrs.
+    num_reduce_row = 0
+    num_partial_outputs = 0
+    loc_partial_outputs = 0
+    for bid, qo_len, kv_len in batch_infos:
+        packed_qo_len = qo_len * num_heads
+        num_qo_tiles = integer_divide_ceil(packed_qo_len, cluster_len_q)
+        qo_batch_start = p_seqlens_qo_indptr[bid]
+        kv_batch_start = p_seqlens_kv_indptr[bid]
+        kv_batch_end = p_seqlens_kv_indptr[bid + 1]
+
+        for tid in range(num_qo_tiles):
+            global_cluster_q_idx = num_qo_clusters_indptr[bid] + tid
+
+            remaining_kv_len = cal_packed_causal_kv_len(
+                qo_len, kv_len, tid, cluster_len_q, num_qo_tiles, num_heads, is_causal
+            )
+            kv_start_local = 0
+
+            accum_cost_top, _cid_top = cost_heap[0]
+            remaining_capability_top = cal_kv_len(
+                workload_limit_global - accum_cost_top, cluster_len_q
+            )
+            num_splits_estimated = integer_divide_ceil(
+                remaining_kv_len, remaining_capability_top
+            )
+            # For the case of #splits==2, make sure that the tailing tile is
+            # smaller than kSplitTolerance.
+            if num_splits_estimated == 2:
+                split_kv = (
+                    remaining_kv_len - remaining_capability_top
+                ) > kSplitTolerance
+            else:
+                split_kv = num_splits_estimated > 1
+            kv_len_limit_floor = integer_least_multiple(
+                integer_divide_ceil(kv_len, num_clusters), kv_granularity
+            )
+
+            while True:
+                # Check and update cost_heap.
+                accum_cost, cid = heapq.heappop(cost_heap)
+                remaining_capability = cal_kv_len(
+                    workload_limit_global - accum_cost, cluster_len_q
+                )
+                limit_ori = max(remaining_capability, kv_len_limit_floor)
+                tail_size = (
+                    (remaining_kv_len - limit_ori)
+                    if (remaining_kv_len > limit_ori)
+                    else 0x7FFFFFFF
+                )
+                kv_len_limit_local = (
+                    remaining_kv_len if (tail_size <= kSplitTolerance) else limit_ori
+                )
+                kv_len_consuming = min(remaining_kv_len, kv_len_limit_local)
+                cost = cal_cost(cluster_len_q, kv_len_consuming)
+                new_cost = accum_cost + cost
+                heapq.heappush(cost_heap, (new_cost, cid))
+
+                # Record work (MlaWorkInfo, 8 DWs).
+                qo_start = tid * cluster_len_q + qo_batch_start
+                qo_end = min(qo_start + cluster_len_q, qo_batch_start + qo_len)
+                kv_start = kv_start_local + kv_batch_start
+                kv_end = kv_start + kv_len_consuming
+                kv_offset = kv_batch_end - kv_end
+                if split_kv:
+                    partial_qo_loc = loc_partial_outputs
+                    if len(reduce_partial_map[global_cluster_q_idx]) == 0:
+                        num_reduce_row += 1
+                        reduce_partial_info[global_cluster_q_idx] = [qo_start, qo_end]
+                    reduce_partial_map[global_cluster_q_idx].append(loc_partial_outputs)
+                    num_partial_outputs += 1
+                    loc_partial_outputs += qo_end - qo_start
+                else:
+                    partial_qo_loc = -1
+                # u32All layout: batch_idx, partial_qo_loc, qo_start, qo_end,
+                #                kv_start, kv_end, kv_offset, padding.
+                work_info_set[cid].append(
+                    [
+                        bid,
+                        partial_qo_loc,
+                        qo_start,
+                        qo_end,
+                        kv_start,
+                        kv_end,
+                        kv_offset,
+                        0,
+                    ]
+                )
+
+                # Update state.
+                remaining_kv_len -= kv_len_consuming
+                kv_start_local += kv_len_consuming
+                if not (remaining_kv_len > 0):
+                    break
+
+    # Step.5. Allocate and fill indptrs.
+    work_indptr = [0]
+    for cid in range(num_clusters):
+        if (len(work_info_set[cid]) != 0) or (not no_redundant):
+            work_indptr.append(work_indptr[-1] + len(work_info_set[cid]))
+    num_works = work_indptr[-1]
+
+    reduce_final_map_size = num_reduce_row if no_redundant else total_qo_clusters
+    reduce_final_map = []
+    reduce_indptr = [0]
+    global_cluster_q_idx = 0
+    rid = 0
+    while (global_cluster_q_idx < total_qo_clusters) and (
+        (rid < num_reduce_row) or (not no_redundant)
+    ):
+        if (len(reduce_partial_map[global_cluster_q_idx]) != 0) or (not no_redundant):
+            reduce_indptr.append(
+                reduce_indptr[-1] + len(reduce_partial_map[global_cluster_q_idx])
+            )
+            reduce_final_map.append(reduce_partial_info[global_cluster_q_idx])
+            rid += 1
+        global_cluster_q_idx += 1
+
+    # Step.6. Flatten 2D arrays.
+    work_info_set_flatten = []
+    for cid in range(num_clusters):
+        for wi in work_info_set[cid]:
+            work_info_set_flatten.extend(wi)
+    reduce_partial_map_flatten = []
+    for lst in reduce_partial_map:
+        reduce_partial_map_flatten.extend(lst)
+
+    # Step.7. Create tensors (build on device, matching the original .to(input)).
+    work_info_set_tsr = torch.tensor(
+        work_info_set_flatten, dtype=torch.int32, device=device
+    ).reshape(num_works, kSizeMlaWorkInfoInDw)
+    work_indptr_tsr = torch.tensor(work_indptr, dtype=torch.int32, device=device)
+    reduce_indptr_tsr = torch.tensor(reduce_indptr, dtype=torch.int32, device=device)
+    reduce_final_map_flatten = []
+    for tile in reduce_final_map:
+        reduce_final_map_flatten.extend(tile)
+    reduce_final_map_tsr = torch.tensor(
+        reduce_final_map_flatten, dtype=torch.int32, device=device
+    ).reshape(reduce_final_map_size, kSizeMlaPartialTileInfoInDw)
+    reduce_partial_map_tsr = torch.tensor(
+        reduce_partial_map_flatten, dtype=torch.int32, device=device
+    )
+
+    # Two 64-bit device pointers to the 1st element of work_indptr / work_info.
+    work_metadata_ptrs_tsr = torch.tensor(
+        [work_indptr_tsr.data_ptr(), work_info_set_tsr.data_ptr()],
+        dtype=torch.uint64,
+        device=device,
+    )
+
+    return (
+        work_metadata_ptrs_tsr,
+        work_indptr_tsr,
+        work_info_set_tsr,
+        reduce_indptr_tsr,
+        reduce_final_map_tsr,
+        reduce_partial_map_tsr,
+    )
 
 
 @compile_ops("module_mla_reduce", develop=True)
@@ -1479,12 +1801,12 @@ def mla_reduce_v1(
     partial_output: torch.Tensor,
     partial_lse: torch.Tensor,
     reduce_indptr: torch.Tensor,
-    reduce_final_map: Optional[torch.Tensor],
+    reduce_final_map: torch.Tensor | None,
     reduce_partial_map: torch.Tensor,
     max_seqlen_q: int,
     num_kv_splits: int,
     final_output: torch.Tensor,
-    final_lse: Optional[torch.Tensor] = None,
+    final_lse: torch.Tensor | None = None,
 ) -> None:
     """
     Cross-split (flash-style) reduction for split-KV MLA decode.
@@ -1511,7 +1833,7 @@ def mla_reduce_v1(
         max_seqlen_q: max query length (tokens) per decode step.
         num_kv_splits: sizing hint for the reducer's per-split LDS scratch
             (``max_splits = max(device_cu_count, num_kv_splits)``).
-            **``0`` means auto** — size to the device CU count. Pass a value
+            **``0`` means auto** -- size to the device CU count. Pass a value
             larger than the CU count only to force a bigger split budget;
             values <= CU count (incl. 0) are clamped up to it.
         final_output: [bs, h, dv]. Combined, normalized output (written
@@ -1519,7 +1841,6 @@ def mla_reduce_v1(
         final_lse: optional [bs, h] fp32. Combined LSE; written only when
             provided.
     """
-    ...
 
 
 @triton.jit(do_not_specialize=["tile_reduce_cnt"])
@@ -1579,8 +1900,7 @@ def decode_update_mla_metadata_v1_kernel(
         kv_offset += seq_kv_delta
         if kv_offset <= 0:
             work_kv_len += kv_offset - 1
-            if work_kv_len < 1:
-                work_kv_len = 1
+            work_kv_len = max(work_kv_len, 1)
             kv_offset = 1
         kv_end = seq_kv_end - kv_offset
         kv_start = kv_end - work_kv_len
@@ -1635,7 +1955,7 @@ def decode_update_mla_metadata_v1(
     max_seqlen_qo: int = 1,
     dtype_q: torch.dtype = dtypes.bf16,
     dtype_kv: torch.dtype = dtypes.bf16,
-    num_reject_tokens: Optional[torch.Tensor] = None,
+    num_reject_tokens: torch.Tensor | None = None,
 ) -> None:
     """
     Update MLA metadata incrementally for decode steps where the batch
@@ -1787,7 +2107,7 @@ def hk_mla_v40_decode_fwd_mi3xx(
     split_output: torch.Tensor,
     split_lse: torch.Tensor,
     final_output: torch.Tensor,
-    attn_sink: Optional[torch.Tensor] = None,
+    attn_sink: torch.Tensor | None = None,
 ) -> None: ...
 
 
@@ -1806,7 +2126,7 @@ def hk_mla_v40_decode_fwd(
     split_output: torch.Tensor,
     split_lse: torch.Tensor,
     final_output: torch.Tensor,
-    attn_sink: Optional[torch.Tensor] = None,
+    attn_sink: torch.Tensor | None = None,
 ) -> None:
     """Arch-dispatching entry point for the HK V4.0 MLA decode kernel."""
     arch_id = get_gfx()
@@ -1832,3 +2152,52 @@ def hk_mla_v40_decode_fwd(
         raise NotImplementedError(
             f"hk_mla_v40_decode_fwd has no implementation for arch {arch_id}"
         )
+
+
+@compile_ops("module_ds32_mla", develop=True)
+def mla_decode_stage1_opus_fwd_ds32(
+    q_nope: torch.Tensor,  # [B, H, D_NOPE]          fp8
+    q_rope: torch.Tensor,  # [B, H, D_ROPE]          bf16
+    kv_nope: torch.Tensor,  # [total_tokens, D_NOPE]  fp8
+    kv_rope: torch.Tensor,  # [total_tokens, D_ROPE]  bf16
+    qo_indptr: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    kv_indices: torch.Tensor,
+    kv_last_page_lens: torch.Tensor,
+    work_indptr: torch.Tensor,
+    work_info_set: torch.Tensor,
+    max_seqlen_q: int,
+    page_size: int,
+    nhead_kv: int,
+    softmax_scale: float,
+    logits: torch.Tensor,  # aiter split_output [num_partials,1,H,D_NOPE] fp32
+    attn_lse: torch.Tensor,  # aiter split_lse    [num_partials,1,H,1]      fp32
+    out: torch.Tensor,  # final [B, H, D_NOPE] bf16
+    final_lse: torch.Tensor,
+    q_scale: torch.Tensor,  # [B, H, D_SCALE]         uint8 (E8M0)
+    kv_scale: torch.Tensor,  # [total_tokens, D_SCALE] uint8
+) -> None: ...
+
+
+@compile_ops("module_opus_mla", ffi_type="ctypes")
+def mla_decode_fwd_opus_stage1(
+    q: torch.Tensor,  # [B, H, 576]           fp8 (merged nope+rope)
+    kv: torch.Tensor,  # [total_tokens, 576]   fp8 (merged nope+rope)
+    qo_indptr: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    kv_indices: torch.Tensor,
+    kv_last_page_lens: torch.Tensor,
+    work_indptr: torch.Tensor,
+    work_info_set: torch.Tensor,
+    max_seqlen_q: int,
+    page_size: int,
+    nhead_kv: int,
+    softmax_scale: float,
+    logits: torch.Tensor,  # aiter split_output [num_partials,1,H,512] fp32
+    attn_lse: torch.Tensor,  # aiter split_lse    [num_partials,1,H,1]   fp32
+    out: torch.Tensor,  # final [B, H, 512] bf16
+    final_lse: torch.Tensor | None = None,  # [B, H] fp32
+    q_scale: torch.Tensor | None = None,  # float[1] per-tensor descale
+    kv_scale: torch.Tensor | None = None,  # float[1] per-tensor descale
+    causal: bool = True,  # mask across the max_seqlen_q query tokens
+) -> None: ...

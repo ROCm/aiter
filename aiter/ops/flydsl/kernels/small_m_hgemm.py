@@ -39,13 +39,15 @@ import functools
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from aiter.jit.utils.chip_info import get_gfx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm, scf
 from flydsl.compiler.kernel_function import CompilationContext
-from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl, vector
+from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.runtime.device import get_rocm_arch
+
+from aiter.jit.utils.chip_info import get_gfx
+from aiter.ops.flydsl.kernels import vector
 
 from .splitk_hgemm import (
     OnlineScheduler,
@@ -55,9 +57,9 @@ from .splitk_hgemm import (
 from .tensor_shim import GTensor, _to_raw, get_dtype_in_kernel
 
 __all__ = [
+    "SMALL_M_KERNEL_MAX",
     "compile_small_m_hgemm_kernel",
     "iter_small_m_registry_configs",
-    "SMALL_M_KERNEL_MAX",
     "small_m_kernel_name",
 ]
 
@@ -200,9 +202,10 @@ def _validate_small_m_registry_config(
         wave_repeat = n_tile_repeat == 2 and block_n_warps == 2 and tile_n == 192
         if not (classic_repeat or wave_repeat):
             raise ValueError
-    if persistent_n_tiles > 1:
-        if not b_to_lds or n_tile_repeat != 1 or tile_n < 128 or block_n_warps < 2:
-            raise ValueError
+    if persistent_n_tiles > 1 and (
+        not b_to_lds or n_tile_repeat != 1 or tile_n < 128 or block_n_warps < 2
+    ):
+        raise ValueError
     if n < tile_n or n % tile_n != 0:
         raise ValueError
     if persistent_n_tiles > n // tile_n:
@@ -1386,7 +1389,7 @@ def compile_small_m_hgemm_kernel(
         m: fx.Int32,
         semaphore: fx.Pointer,
         signal: fx.Pointer,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream,
     ):
         ctx = CompilationContext.get_current()
         if const_expr(WAVES_PER_EU > 0):

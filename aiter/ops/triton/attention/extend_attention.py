@@ -17,18 +17,16 @@ Memory-efficient attention for prefill.
 It supports page size = 1 and prefill with KV cache (i.e. extend).
 """
 
-from typing import Optional
 import torch
 import triton
 
-
-from aiter.ops.triton.attention.prefill_attention import context_attention_fwd
-from aiter.ops.triton.utils.logger import AiterTritonLogger
-from aiter.ops.triton.utils.device_info import get_num_xcds
 from aiter.ops.triton._triton_kernels.attention.extend_attention import (
     _fwd_kernel,
     _get_config,
 )
+from aiter.ops.triton.attention.prefill_attention import context_attention_fwd
+from aiter.ops.triton.utils.device_info import get_num_xcds
+from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
 
@@ -50,7 +48,7 @@ def extend_attention_fwd(
     sm_scale=None,
     logit_cap=0.0,
     skip_prefix_custom_mask=True,
-    config: Optional[dict[str, any]] = None,
+    config: dict[str, any] | None = None,
 ):
     """
     Attention for prefill with KV cache (extend phase).

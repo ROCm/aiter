@@ -1,16 +1,17 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import torch
-from torch import Tensor
-import aiter
-from aiter.test_common import checkAllclose, perftest, benchmark
-from aiter import per_tensor_quant
-from aiter.utility import dtypes
-from typing import List
 import argparse
+
+import torch
 import triton
 import triton.language as tl
+from torch import Tensor
+
+import aiter
+from aiter import per_tensor_quant
+from aiter.test_common import benchmark, checkAllclose, perftest
+from aiter.utility import dtypes
 
 
 def rms_norm_forward(x: Tensor, weight: Tensor, eps: float):
@@ -184,7 +185,7 @@ def run_torch_mrope_3d_rms_set_kv_shuffle(
     num_heads_v: int,
     head_size: int,
     is_neox_style: bool,
-    mrope_section: List[int],
+    mrope_section: list[int],
     is_interleaved: bool,
     eps: float,
     q_out: Tensor,
@@ -314,8 +315,6 @@ def run_torch_mrope_3d_rms_set_kv_shuffle(
         k_out.copy_(k_quantized)
         v_out.copy_(v_quantized)
 
-    return None
-
 
 @perftest()
 def run_fused_mrope_3d_rms_set_kv_shuffle(
@@ -330,7 +329,7 @@ def run_fused_mrope_3d_rms_set_kv_shuffle(
     num_heads_v: int,
     head_size: int,
     is_neox_style: bool,
-    mrope_section: List[int],
+    mrope_section: list[int],
     is_interleaved: bool,
     eps: float,
     q_out: Tensor,
@@ -414,7 +413,6 @@ def run_fused_mrope_3d_rms_set_kv_shuffle(
             x,
             rotary_dim,
         )
-    return None
 
 
 @benchmark()

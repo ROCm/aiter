@@ -20,6 +20,7 @@
 #include "aiter_tensor.h"
 
 #include <cmath>
+#include <type_traits>
 
 namespace {
 
@@ -239,14 +240,6 @@ void launch_d192_v128(aiter_tensor_t& q,
 
     kargs.B = B; kargs.N = N; kargs.N_KV = N_KV; kargs.H = H; kargs.H_KV = H_KV;
 
-    // 32-bit KV buffer-offset guard (same as D=128); N_KV bounds the per-group extent in
-    // group mode (max_seqlen_k).
-    const long long k_slice_bytes = (long long)N_KV * (long long)kargs.stride_k_n * 2LL;  // bf16
-    const long long v_slice_bytes = (long long)N_KV * (long long)kargs.stride_v_n * 2LL;
-    AITER_CHECK(k_slice_bytes < (1LL << 32) && v_slice_bytes < (1LL << 32),
-                "OPUS D_QK=192/D_V=128: K/V byte extent (k=", k_slice_bytes, " v=", v_slice_bytes,
-                ") reaches the 32-bit buffer-offset limit (2^32); reduce seqlen_kv");
-
     // Head/tail merge (causal load balance): host is the single source of truth; the
     // kernel reads the OPT_MERGE_HEADTAIL bit and never recomputes it.
     const bool small_shape = (long long)num_q_blocks * H * B < (long long)HEADTAIL_MIN_WG;
@@ -271,13 +264,32 @@ void launch_d192_v128(aiter_tensor_t& q,
         HIP_CALL_LAUNCH(hipGetLastError());
     };
 
-    if (is_group) {
-        if (causal) launch(opus_gqa_d192_traits<32, 64, 8, true,  true>{});
-        else        launch(opus_gqa_d192_traits<32, 64, 8, false, true>{});
-    } else {
-        if (causal) launch(opus_gqa_d192_traits<32, 64, 8, true,  false>{});
-        else        launch(opus_gqa_d192_traits<32, 64, 8, false, false>{});
-    }
+    // Per-tile descriptor rebasing is only needed once a buffer's per-head extent stops
+    // fitting the 32-bit num_records; under that the single-descriptor path is exact and
+    // cheaper. Decided per buffer: K's rows are 1.5x wider than V's here, so K crosses the
+    // limit first. N_KV is max_seqlen_k in group mode, so this bounds every group.
+    const long long k_slice_bytes = (long long)N_KV * (long long)kargs.stride_k_n * 2LL;  // bf16
+    const long long v_slice_bytes = (long long)N_KV * (long long)kargs.stride_v_n * 2LL;
+    const bool large_k = k_slice_bytes >= (1LL << 32);
+    const bool large_v = v_slice_bytes >= (1LL << 32);
+
+    auto launch_by_mode = [&](auto large_k_tag, auto large_v_tag) {
+        constexpr bool LK = decltype(large_k_tag)::value;
+        constexpr bool LV = decltype(large_v_tag)::value;
+        if (is_group) {
+            if (causal) launch(opus_gqa_d192_traits<32, 64, 8, true,  true,  LK, LV>{});
+            else        launch(opus_gqa_d192_traits<32, 64, 8, false, true,  LK, LV>{});
+        } else {
+            if (causal) launch(opus_gqa_d192_traits<32, 64, 8, true,  false, LK, LV>{});
+            else        launch(opus_gqa_d192_traits<32, 64, 8, false, false, LK, LV>{});
+        }
+    };
+    // (small K, large V) needs strides that invert the usual 192/128 row widths; rebasing K
+    // too is still correct there, so it folds into the all-large form rather than costing a
+    // fourth pair of instantiations.
+    if (!large_k && !large_v)     launch_by_mode(std::false_type{}, std::false_type{});
+    else if (large_k && !large_v) launch_by_mode(std::true_type{},  std::false_type{});
+    else                          launch_by_mode(std::true_type{},  std::true_type{});
 }
 
 } // namespace
