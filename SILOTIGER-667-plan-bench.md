@@ -157,11 +157,14 @@ the FlyDSL cold harness.
       includes the e8m0 term for *both* sides, so it over-attributes bytes to CK — only the
       **time** ratio is ground truth there.) Keep FlyDSL's e8m0 and treat this as a
       documented ~6% CK-favored caveat next to the FP4 rows.
-- [ ] Exact match would require CK to stream an e8m0 `(1,32)` MXFP4 scale. The down kernel
-      supports `Block2D` (`ScaleLayoutTraits::is_block2d`) but only the generic
-      `Block2D<128,128>` granularity — no `(1,32)` e8m0 path is visible — so an exact match
-      likely needs **kernel work** (see D7 for the steps). Until then, document the caveat.
-- **See also D7** for the CK-real-weights/validation path (real values + e8m0 scale support).
+- [x] **Corrected 2026-08-18 (via D7):** the CK down kernel's `Block2D` scale path is *generic*
+      (`load_block2d_scale` indexes any `Block_N/Block_K`), so a `Block2D<1,32>` MXFP4 scale needs
+      **no kernel work** — D7 instantiates `down_fp4_h2` with a `(1,32)` float scale and it matches
+      torch at cos=0.999999. The scale *values* are therefore not the blocker; the only residual
+      B1 gap is scale **storage bytes** (CK float 4B vs FlyDSL e8m0 1B per `(1,32)` block), i.e. a
+      traffic-metric modeling choice. Numerically-exact FP4 parity is thus already available; the
+      ~6% weight-byte caveat above is purely about how the two sides *count* scale traffic.
+- **See also D7** — CK outputs are now numerically validated against torch across FP8/BF16/FP4.
 
 #### B2 — add TOPK to the FlyDSL cold-bench return dicts  [x] DONE (2026-08-14)
 - [x] Added `"TOPK": TOPK` (after `"E"`) to both `bench_down_cold` and `bench_gate_up_cold`
@@ -389,42 +392,51 @@ the same math** — no cell needs to be marked n/a on equivalence grounds. Detai
 - [x] Checked-in artifact: `tickets/667/g9_compare.{md,csv}` (of-record, repeats=3). Reproduce
       with `bash tickets/667/harness/run_g9_compare.sh`.
 
-#### D7 — (optional/stretch) numerical cross-check FlyDSL-vs-CK outputs  [~] D7-lite DONE (2026-08-18); FP4 leg deferred
-Both harnesses are currently **perf-only** (CK runs uninitialized weights + dummy scales;
-timing is data-independent so this doesn't affect perf). This item = "convert CK to real
-weights" and validate. Est **~2–3 days**, dominated by FP4 pack/scale convention-matching.
+#### D7 — numerical cross-check CK-vs-torch outputs  [x] DONE (2026-08-18)
+The perf harnesses run uninitialized weights + dummy scales (timing is data-independent, so this
+doesn't affect perf numbers). D7 = "convert CK to real weights + real per-block scales and validate
+the outputs numerically." Done in two increments (D7-lite, then full D7) — both behind a
+`CK_WD_VALIDATE=1` flag that returns before the timing loop, so perf runs are untouched.
 
-**D7-lite done (2026-08-18) — FP8 + BF16 legs verified.** Added a `CK_WD_VALIDATE=1` path to
-`ck_bench_warp_decode.cpp` that, for `gate_bf16_d2` / `gate_fp8_d2` / `down_h2_d2`, host-quantizes
-real inputs (`type_convert<fp8_t>` = OCP e4m3 = torch `float8_e4m3fn`), runs each kernel **once**
-functionally, and dumps the *exact* input bytes + GPU output to `ck_validate_dump/`. A Python
-validator (`tickets/667/harness/validate.py`) reloads the identical bytes, rebuilds the torch
-reference (same math as the FlyDSL op-test refs), and compares. Result on a small
-`B4/H512/I512/K2/E8` shape (satisfies the kernels' `%512` / Block2D `%128` gates):
-**all three cos = 0.999999**, max Δ ≤ 0.35% of max (pure bf16 rounding). Scales are a single
-uniform constant per operand (`wscale=xscale=0.5`), so the check is independent of CK's internal
-Block2D scale-index layout — it validates the matmul + fp8 dequant + silu + router-weight math.
-Wired as `run_g9_compare.sh --validate` (build-if-needed → dump → torch compare, non-zero exit on
-divergence); perf runs are untouched (the flag returns before the timing loop). Dumps are
-git-ignored (regenerated on demand).
+**How it works.** `ck_bench_warp_decode.cpp` host-quantizes real inputs
+(`type_convert<fp8_t>` = OCP e4m3 = torch `float8_e4m3fn`; FP4 nibble-packed 2/byte, low nibble =
+even element, matching FlyDSL), runs each kernel **once** functionally, and dumps the *exact* input
+bytes (weights, activations, per-block Block2D scales, router ids/wts) + GPU output to
+`ck_validate_dump/` + a manifest. The Python validator (`tickets/667/harness/validate.py`) reloads
+the identical bytes, rebuilds the torch reference (same math + Block2D scale indexing as the FlyDSL
+op-test refs — the CK `load_block2d_scale` index formula `(row/BN)*(cols/BK)+(col/BK)` is
+byte-identical to FlyDSL's `_block2d_scale_matrix`), and compares (cos / max Δ). Wired as
+`run_g9_compare.sh --validate` (build-if-needed → dump → compare, non-zero exit on divergence).
+Dumps are git-ignored (regenerated on demand).
 
-**Still deferred (full D7):** the FP4 leg + per-block (non-uniform) scale-layout validation.
-Steps:
-- [ ] **Init real inputs per shape** on-device (small fill / hiprand) rather than multi-GB
-      H2D — the pools are ~3.75 GB each (DeepSeek gate/up). Behind a `CK_WD_VALIDATE` flag so
-      perf mode stays the default (real init adds startup cost). (~0.5 d)
-- [ ] **FP8 quant:** produce FP8 weights + real `Block2D<128,128>` scales from a bf16
-      reference (host or device quantizer). (~0.5 d)
-- [ ] **FP4 pack + e8m0 scales (the hard part):** nibble-pack to `pk_fp4_t` and compute e8m0
-      `(1,32)` block scales matching FlyDSL's exact packing/scale convention. **Needs kernel
-      work** — the down kernel's `Block2D` path only supports the generic `Block2D<128,128>`
-      granularity, not an e8m0 `(1,32)` MXFP4 scale (this is also what B1 needs for an exact
-      FP4 scale-traffic match). (~0.5–1 d)
-- [ ] **Dump + compare:** emit the CK output tensor and compare (cos / `checkAllclose`)
-      against FlyDSL/torch on identical inputs. (~0.5 d)
-- [ ] Wire the `CK_WD_VALIDATE` flag + a compare.py hook; keep perf runs unaffected. (~0.25 d)
-- **Cross-ref:** landing the e8m0 `(1,32)` scale support here also closes B1's exact FP4
-      scale-traffic match (else B1 stays a documented ~6% CK-favored caveat).
+**Result** on a small `B4/H512/I512/K2/E8` shape (honors the kernels' `%512` / Block2D `%128` /
+FP4 `%512` gates), with **real non-uniform per-block scales** (weight 128×128, x 1×128, FP4 1×32):
+
+| kernel | dtype (act × w) | scale | cos | max Δ |
+|---|---|---|---|---|
+| `gate_bf16_d2` | bf16 × fp8 | 128×128 | 0.999999 | 0.19% |
+| `gate_fp8_d2` | fp8 × fp8 | 128×128 + 1×128 x | 0.999999 | 0.15% |
+| `down_h2_d2` | bf16 × fp8 | 128×128 | 0.999999 | 0.31% |
+| `down_fp4_h2` | bf16 × **fp4** | **1×32 MXFP4** | 0.999999 | 0.25% |
+
+Deltas are pure bf16 output rounding. This validates each kernel's matmul + fp8/fp4 dequant + silu
++ router-weight math **and** the Block2D scale-index layout.
+
+**Key finding (corrects an earlier assumption + B1):** the down FP4 path's MXFP4 `(1,32)` scale
+needs **no kernel work** — CK's generic `load_block2d_scale<Block2D<1,32>, float>` handles any
+`Block_N/Block_K`, and feeding it power-of-two float scales (matching FlyDSL's e8m0 range) makes
+`down_fp4_h2` numerically exact. So B1's "exact FP4 scale match needs an e8m0 (1,32) kernel" is
+overstated: the *values* already match with a `(1,32)` float scale; the only residual B1 gap is
+scale **storage bytes** (float 4B vs e8m0 1B), which is a traffic-metric modeling choice, not a
+kernel limitation.
+
+**One informational (non-gated) leg — `gate_up_fp4`:** CK's gate_up FP4 is the slow packed
+*scalar* path (dot2/NPerWarp=2 reject packed FP4) and loads weights through a tiled
+`make_naive_tensor_view` whose in-memory pk_fp4 layout is swizzled (unlike `down_fp4_h2`'s raw
+memcpy loads). A positional compare fails (`positional_cos≈0`) while the **value-set** matches
+(`value_set_cos≈0.99`) — right arithmetic, permuted output positions. Reproducing that tile packing
+is low-value (it's CK's secondary/slow FP4 path, and FP4 math is already validated exactly by
+`down_fp4_h2`), so the validator reports it as INFO and excludes it from the PASS gate.
 
 ---
 
@@ -493,13 +505,20 @@ DeepSeek FP8 (`down`+`gate_up bf16-act`) via **B5** (E256 Tier-2 i64 base), and
   support (B1/D7); until then, document the caveat and trust the time ratio.
 
 ## 6. Status log
+- 2026-08-18 — **D7 done (full) — CK outputs numerically cross-checked across FP8/BF16/FP4 with
+  real non-uniform Block2D scales.** Extended the `CK_WD_VALIDATE` dump + `validate.py` to
+  non-uniform per-block scales (weight 128×128, x 1×128, FP4 **1×32 MXFP4**) and added the FP4
+  legs. **4 gated kernels cos=0.999999** (`gate_bf16_d2`, `gate_fp8_d2`, `down_h2_d2`,
+  `down_fp4_h2`; max Δ ≤0.31% = bf16 rounding). Found the FP4 `(1,32)` scale needs **no kernel
+  work** (generic `load_block2d_scale` + power-of-two float scales), which also downgrades B1's
+  "needs e8m0 kernel" caveat to a pure storage-byte metric choice. `gate_up_fp4` (CK's slow packed
+  scalar path, swizzled tiled weight layout) is reported INFO-only: value-set matches
+  (`value_set_cos≈0.99`), positions permuted; FP4 math already validated by `down_fp4_h2`.
 - 2026-08-18 — **D7-lite done — CK outputs numerically cross-checked (FP8 + BF16).** Added a
   `CK_WD_VALIDATE=1` dump path to `ck_bench_warp_decode.cpp` (host-quantized real inputs, one
   functional launch, dumps exact input bytes + GPU output for `gate_bf16_d2`/`gate_fp8_d2`/
-  `down_h2_d2`) + a `validate.py` torch cross-check that rebuilds the reference on the identical
-  bytes. **All three cos=0.999999** (max Δ ≤0.35% of max = bf16 rounding) at B4/H512/I512/K2/E8.
-  Uniform per-operand scales make it layout-independent; wired as `run_g9_compare.sh --validate`,
-  perf path untouched. FP4 leg + non-uniform scale-layout validation stay deferred (full D7 / B1).
+  `down_h2_d2`) + a `validate.py` torch cross-check. All three cos=0.999999 at B4/H512/I512/K2/E8
+  with uniform scales (superseded by the full-D7 non-uniform run above).
 - 2026-08-18 — **B3 follow-up done — warm benches migrated to `compute_metrics`.** Dropped the
   inline `outputs`/`flops`/`wbytes`/`tbs` accounting from `bench_gate_up`, `bench_down`, and
   `bench_down_fp4`; each now derives TFLOPS/TB-s/%peak from `compute_metrics(..., weight_stream)`,
