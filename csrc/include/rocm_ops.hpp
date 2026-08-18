@@ -2126,6 +2126,33 @@ namespace py = pybind11;
           py::arg("quant_group_size") = 128,           \
           py::arg("scale_shuffle")    = false);
 
+#define MINIMAX_M3_FUSED_QKNORM_ROPE_CACHE_SHUFFLE_PYBIND      \
+    m.def("minimax_m3_qknorm_rope_cache_shuffle_insert",       \
+          &aiter::minimax_m3_qknorm_rope_cache_shuffle_insert, \
+          py::arg("qkv"),                                      \
+          py::arg("q_norm_weight"),                            \
+          py::arg("k_norm_weight"),                            \
+          py::arg("cos_sin_cache"),                            \
+          py::arg("positions"),                                \
+          py::arg("num_heads"),                                \
+          py::arg("num_kv_heads"),                             \
+          py::arg("num_index_heads"),                          \
+          py::arg("rotary_dim"),                               \
+          py::arg("eps"),                                      \
+          py::arg("slot_mapping"),                             \
+          py::arg("k_cache"),                                  \
+          py::arg("v_cache"),                                  \
+          py::arg("q_out"),                                    \
+          py::arg("index_q_norm_weight") = std::nullopt,       \
+          py::arg("index_k_norm_weight") = std::nullopt,       \
+          py::arg("index_slot_mapping")  = std::nullopt,       \
+          py::arg("index_cache")         = std::nullopt,       \
+          py::arg("index_q_out")         = std::nullopt,       \
+          py::arg("kv_cache_dtype")      = "auto",             \
+          py::arg("k_scale")             = std::nullopt,       \
+          py::arg("v_scale")             = std::nullopt,       \
+          py::arg("skip_index_branch")   = false);
+
 #define SMOOTHQUANT_PYBIND                      \
     m.def("smoothquant_fwd", &smoothquant_fwd); \
     m.def("moe_smoothquant_fwd", &moe_smoothquant_fwd);
