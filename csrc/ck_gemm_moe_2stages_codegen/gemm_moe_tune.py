@@ -3,8 +3,10 @@
 
 import functools
 import os
+import re
 import sys
 import tempfile
+from pathlib import Path
 from typing import Any, ClassVar
 
 import pandas as pd
@@ -138,6 +140,47 @@ def _a16w_sorted_cos(ref, res, msg="", printLog=True):
         tag = "passed~" if cos_diff < COS_DIFF_THRESHOLD else "failed!"
         print(f"{msg}[cosine_diff={cos_diff:.6f} {tag}]")
     return cos_diff
+
+
+def _candidate_dump_tag(
+    gfx,
+    cu_num,
+    token,
+    model_dim,
+    inter_dim,
+    expert,
+    topk,
+    act_type,
+    dtype,
+    q_dtype_a,
+    q_dtype_w,
+    q_type,
+    use_g1u1,
+    doweight_stage1,
+):
+    return re.sub(
+        r"[^0-9A-Za-z_.-]+",
+        "_",
+        (
+            f"{gfx}_cu{cu_num}_t{token}_h{model_dim}_i{inter_dim}_e{expert}_k{topk}"
+            f"_act{act_type}_dtype{dtype}_qa{q_dtype_a}_qw{q_dtype_w}_qt{q_type}"
+            f"_g1u1{int(use_g1u1)}_dw{int(doweight_stage1)}"
+        ),
+    )
+
+
+def _dump_prefilter_candidates(profile_df, args, stage_tag):
+    root = os.environ.get("AITER_TUNE_CANDIDATE_DUMP_DIR")
+    if not root:
+        return
+    out = profile_df.copy()
+    out["passed_err_ratio"] = out["err"] <= args.errRatio
+    out["filter_reason"] = ""
+    invalid_time = out["us"].isin([float("inf"), float("-inf"), -1])
+    out.loc[invalid_time, "filter_reason"] = "invalid_time"
+    out.loc[(out["err"] > args.errRatio) & ~invalid_time, "filter_reason"] = "err_ratio"
+    Path(root).mkdir(parents=True, exist_ok=True)
+    out.to_csv(Path(root) / f"{stage_tag}.csv", index=False)
 
 
 def _manifest_flat_by_kernel(df: pd.DataFrame) -> dict:
@@ -858,6 +901,7 @@ class FmoeTuner(TunerCommon):
         topk,
         blockM,
         adtype,
+        b_dtype,
         act_type,
         device="cuda",
     ):
@@ -874,6 +918,7 @@ class FmoeTuner(TunerCommon):
             topk,
             blockM,
             adtype=adtype,
+            b_dtype=b_dtype,
             activation=act_type,
             situ_beta=DEFAULT_SITUV2_BETA,
             situ_linear_beta=DEFAULT_SITUV2_LINEAR_BETA,
@@ -887,9 +932,11 @@ class FmoeTuner(TunerCommon):
             token_num=token,
             block_size=blockM,
         )
-        # Match the normal FlyDSL _fp8 tune variant: a_scale_one=True expects
-        # an unscaled bf16 -> fp8 cast, not a per-1x32 quantized activation.
-        a1_qt_fp8_cast = d["inp"].to(dtypes.fp8) if adtype == "fp8" else None
+        # The a8w4 a_scale_one=True variant uses an unscaled bf16->fp8 cast.
+        # The a8w8 path uses the real per-1x32 payload and E8M0 scale instead.
+        a1_qt_fp8_cast = (
+            d["inp"].to(dtypes.fp8) if adtype == "fp8" and b_dtype == "fp4" else None
+        )
         return {
             "a1_qt": d["a1_qt"],
             "a1_qt_fp8_cast": a1_qt_fp8_cast,
@@ -968,6 +1015,7 @@ class FmoeTuner(TunerCommon):
         topk,
         blockM,
         adtype,
+        b_dtype,
         act_type,
         device="cuda",
     ):
@@ -979,6 +1027,7 @@ class FmoeTuner(TunerCommon):
             topk,
             blockM,
             adtype=adtype,
+            b_dtype=b_dtype,
             activation=act_type,
             situ_beta=DEFAULT_SITUV2_BETA,
             situ_linear_beta=DEFAULT_SITUV2_LINEAR_BETA,
@@ -996,7 +1045,7 @@ class FmoeTuner(TunerCommon):
             "swt": v["swt"],
             "n": v["n"],
             "max_sorted": v["max_sorted"],
-            "ref2": d["ref2"],
+            "ref2": d["ref2_quantized"] if b_dtype == "fp8" else d["ref2"],
         }
 
     @staticmethod
@@ -1054,6 +1103,7 @@ class FmoeTuner(TunerCommon):
             BK=kparams["tile_k"],
             use_nt=kparams["use_nt"],
             a_dtype=kparams["a_dtype"],
+            b_dtype=kparams["b_dtype"],
             epilog=epilog,
             SBM=sbm,
             persist=kparams["persist"],
@@ -3756,31 +3806,33 @@ class FmoeTuner(TunerCommon):
             expert,
             topk,
             act_type,
-            _dtype,
+            dtype,
             q_dtype_a,
             q_dtype_w,
             q_type,
             use_g1u1,
-            _doweight_stage1,
+            doweight_stage1,
         ) = info
-        # gate: per_1x32, fp4 weight + fp4/fp8 activation (fused), use_g1u1 (design 4.3)
+        if dtype != dtypes.bf16:
+            return tasks
+        if doweight_stage1:
+            return tasks
         if q_type != QuantType.per_1x32 or not use_g1u1:
             return tasks
-        if q_dtype_w != dtypes.fp4x2:
+        if q_dtype_a == dtypes.fp4x2 and q_dtype_w == dtypes.fp4x2:
+            adtype, bdtype = "fp4", "fp4"
+        elif q_dtype_a == dtypes.fp8 and q_dtype_w == dtypes.fp4x2:
+            adtype, bdtype = "fp8", "fp4"
+        elif q_dtype_a == dtypes.fp8 and q_dtype_w == dtypes.fp8:
+            adtype, bdtype = "fp8", "fp8"
+        else:
             return tasks
-        adtype = (
-            "fp4"
-            if q_dtype_a == dtypes.fp4x2
-            else ("fp8" if q_dtype_a == dtypes.fp8 else None)
-        )
-        if adtype is None:
-            return tasks
-
-        from aiter.ops.flydsl.mxfp4_v2_tune_utils import v2_stage1_dequant_cosine_err
 
         # v2 always fuses quant; dtype is bf16 out layout at the flydsl kernel level.
         out_dtype_str = "bf16"
-        s1_kernels = get_flydsl_stage1_kernels(adtype, "fp4", out_dtype_str)
+        s1_kernels = get_flydsl_stage1_kernels(adtype, bdtype, out_dtype_str)
+
+        from aiter.ops.flydsl.mxfp4_v2_tune_utils import v2_stage1_dequant_cosine_err
 
         for blockM in blockMs:
             if blockM not in (32, 64, 128):
@@ -3806,13 +3858,15 @@ class FmoeTuner(TunerCommon):
                     s1_params = {
                         **kparams,
                         "out_dtype": "fp8",
-                        "a_scale_one": True,
+                        "a_scale_one": bdtype == "fp4",
                         "gate_mode": "interleave",
                     }
                 else:
                     s1_name = kname + "_fp4"
                     s1_params = {**kparams, "out_dtype": "fp4"}
-                a1_key = "a1_qt_fp8_cast" if adtype == "fp8" else "a1_qt"
+                a1_key = (
+                    "a1_qt_fp8_cast" if adtype == "fp8" and bdtype == "fp4" else "a1_qt"
+                )
                 # info tag: (..., blockM, flat_flag=0, v2=1) -- tail[3]=flat (post_process int(tail[3]) default), tail[4]=v2 marker
                 tasks.append(
                     (
@@ -3826,6 +3880,7 @@ class FmoeTuner(TunerCommon):
                             topk,
                             blockM,
                             adtype,
+                            bdtype,
                             act_type,
                         ),
                         FmoeTuner.run_flydsl_v2_stage1_out,
@@ -3867,7 +3922,12 @@ class FmoeTuner(TunerCommon):
                 )
             # ---- v2 stage2 tasks ----
             for kn2, kp in get_flydsl_stage2_v2_kernels(
-                adtype, "fp4", "bf16", blockM, model_dim=model_dim, inter_dim=inter_dim
+                adtype,
+                bdtype,
+                "bf16",
+                blockM,
+                model_dim=model_dim,
+                inter_dim=inter_dim,
             ).items():
                 kp = {**kp, "a_dtype": adtype}
                 # flat=0, v2=1
@@ -3883,6 +3943,7 @@ class FmoeTuner(TunerCommon):
                             topk,
                             blockM,
                             adtype,
+                            bdtype,
                             act_type,
                         ),
                         FmoeTuner.run_flydsl_v2_stage2_out,
@@ -5127,6 +5188,34 @@ class FmoeTuner(TunerCommon):
                 ],
             )
             prorfiles.append(profileDF)
+
+            dump_tag = _candidate_dump_tag(
+                gfx,
+                cu_num,
+                token,
+                model_dim,
+                inter_dim,
+                expert,
+                topk,
+                act_type,
+                dtype,
+                q_dtype_a,
+                q_dtype_w,
+                q_type,
+                use_g1u1,
+                doweight_stage1,
+            )
+            _dump_prefilter_candidates(profileDF, args, dump_tag)
+            if args.verbose:
+                invalid_time = profileDF["us"].isin([float("inf"), float("-inf"), -1])
+                passed = profileDF["err"] <= args.errRatio
+                eligible = passed & ~invalid_time
+                print(
+                    "  candidate summary: "
+                    f"generated={len(profileDF)} passed={int(passed.sum())} "
+                    f"timed={int((~invalid_time).sum())} "
+                    f"filtered={int((~eligible).sum())}"
+                )
 
             ## remove invalid candidate
             profileDF = profileDF[
