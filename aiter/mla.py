@@ -173,7 +173,7 @@ def _mla_decode_reduce_v1_dispatch(
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["BATCH_NUM"])
 def _fwd_kernel_stage2_asm(
     Mid_O,
     Mid_lse,
@@ -195,7 +195,7 @@ def _fwd_kernel_stage2_asm(
     MAYBE_FINAL_OUT: tl.constexpr,
     HAS_FINAL_LSE: tl.constexpr,
     USE_VALID_SPLIT_COUNT_REDUCE: tl.constexpr,
-    BATCH_NUM: tl.constexpr,
+    BATCH_NUM,
     BLOCK_DV: tl.constexpr,
     Lv: tl.constexpr,
     mgc: tl.constexpr,
@@ -554,6 +554,7 @@ def mla_decode_fwd(
     g_kv_indptr=None,
     cp_world_size=1,
     cp_rank=0,
+    causal=True,
 ):
     device = q.device
     assert logit_cap <= 0, f"{logit_cap=} is not support yet"
@@ -690,6 +691,7 @@ def mla_decode_fwd(
             cp_rank,
             valid_split_count,
             use_valid_split_count_reduce,
+            causal,
         )
 
         if num_kv_splits == 1 and (
@@ -871,8 +873,42 @@ def mla_decode_fwd(
             and is_experimental_enabled()
         )
 
-        if use_hk:
-            aiter.hk_mla_v32_decode_fwd(
+        # Opt-in opus merged-buffer fp8 path (gfx950). Requires a single
+        # merged d=576 fp8 q/kv buffer and per-tensor scalar float q/kv scales.
+        use_opus = (
+            os.environ.get("AITER_MLA_USE_OPUS", "0") == "1"
+            and get_gfx() == "gfx950"
+            and q.dtype == dtypes.fp8
+            and kv_buffer.dtype == dtypes.fp8
+            and page_size == 1
+            and q_scale is not None
+            and kv_scale is not None
+        )
+
+        if use_opus:
+            aiter.mla_decode_fwd_opus_stage1(
+                q,
+                kv_buffer,
+                qo_indptr,
+                kv_indptr,
+                kv_indices,
+                kv_last_page_lens,
+                work_indptr,
+                work_info_set,
+                max_seqlen_q,
+                page_size,
+                nhead_kv,
+                sm_scale,
+                logits,
+                attn_lse,
+                o,
+                final_lse,
+                q_scale,
+                kv_scale,
+                causal,
+            )
+        elif use_hk:
+            aiter.hk_mla_decode_fwd(
                 q,
                 kv_buffer,
                 qo_indptr,
@@ -914,6 +950,7 @@ def mla_decode_fwd(
                 cp_rank,
                 None,
                 0,
+                causal,
             )
 
         _mla_decode_reduce_v1_dispatch(
