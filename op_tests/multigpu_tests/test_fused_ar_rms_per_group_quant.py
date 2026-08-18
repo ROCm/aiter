@@ -40,32 +40,32 @@ Usage:
     python test_fused_ar_rms_per_group_quant.py -t 8 --sweep-group-size
 """
 
-import os
-from typing import Optional
-import torch
-import torch.nn.functional as F
-import torch.distributed as dist
 import argparse
 import itertools
-import pandas as pd
-from aiter import dtypes
+import logging
+import os
+from multiprocessing import Pool, freeze_support, set_start_method
 
+import pandas as pd
+import torch
+import torch.distributed as dist
+import torch.nn.functional as F
+
+from aiter import dtypes
 from aiter.dist.parallel_state import (
+    destroy_distributed_environment,
+    destroy_model_parallel,
     ensure_model_parallel_initialized,
+    get_tp_group,
     init_distributed_environment,
     set_custom_all_reduce,
-    get_tp_group,
-    destroy_model_parallel,
-    destroy_distributed_environment,
 )
-from aiter.dist.utils import get_open_port, get_distributed_init_method, get_ip
+from aiter.dist.utils import get_distributed_init_method, get_ip, get_open_port
 from aiter.test_common import (
+    benchmark,
     checkAllclose,
     perftest,
-    benchmark,
 )
-from multiprocessing import set_start_method, Pool, freeze_support
-import logging
 
 logger = logging.getLogger("aiter")
 
@@ -201,7 +201,7 @@ def fused_ar_rmsnorm_per_group_quant(
     eps,
     group_size=128,
     withGraph=False,
-    distributed_init_method: Optional[str] = None,
+    distributed_init_method: str | None = None,
     emit_bf16: bool = False,
     transpose_scale: bool = False,
 ):
@@ -258,9 +258,9 @@ def fused_ar_rmsnorm_per_group_quant(
 
     result, us = run_fused(x)
     if emit_bf16:
-        out_fp8, scale_out, res_out, bf16_out = result
+        out_fp8, scale_out, _res_out, bf16_out = result
     else:
-        out_fp8, scale_out, res_out = result
+        out_fp8, scale_out, _res_out = result
         bf16_out = None
 
     # The returned scale carries the logical (M, num_groups) shape for both
@@ -315,7 +315,7 @@ def test_fused_ar_rmsnorm_per_group_quant(
     dtype,
     group_size=128,
     withGraph=False,
-    distributed_init_method: Optional[str] = None,
+    distributed_init_method: str | None = None,
     emit_bf16: bool = False,
     transpose_scale: bool = False,
 ):

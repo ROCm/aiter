@@ -3,8 +3,8 @@
 
 import argparse
 
-import torch
 import pandas as pd
+import torch
 
 import aiter
 from aiter import dtypes, rmsnorm2d_fwd

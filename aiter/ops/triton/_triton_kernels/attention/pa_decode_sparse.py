@@ -91,6 +91,7 @@ def _pa_decode_sparse(
     QUANT_KV: tl.constexpr,
     GROUP_SIZE: tl.constexpr,
     NUM_GROUPS: tl.constexpr,
+    USE_EXP2: tl.constexpr,
     num_warps: tl.constexpr,
 ):
     """3D split-K sparse paged-decode. Grid: (N, ceil(H/BLOCK_H), KV_SPLITS).
@@ -125,12 +126,11 @@ def _pa_decode_sparse(
         mask=h_mask[:, None] & d_mask[None, :],
         other=0.0,
     )
-    # Fold softmax_scale AND log2(e) into q once, so the QK dot lands scores in
-    # the base-2 domain and the per-element softmax can use the bare exp2 HW
-    # instruction (v_exp_f32) instead of natural exp (which adds a *log2(e) fmac
-    # in front of every exp). Mirrors ATOM's qk_scale = softmax_scale * LOG2E.
+    # When USE_EXP2, fold log2(e) into q so QK scores land in the base-2
+    # domain and per-element softmax uses the bare exp2 HW instruction.
     LOG2E = 1.4426950408889634
-    q = (q.to(tl.float32) * (softmax_scale * LOG2E)).to(q_ptr.dtype.element_ty)
+    qk_scale = softmax_scale * LOG2E if USE_EXP2 else softmax_scale
+    q = (q.to(tl.float32) * qk_scale).to(q_ptr.dtype.element_ty)
 
     kv_start = tl.load(kv_indptr_ptr + t)
     kv_end = tl.load(kv_indptr_ptr + t + 1)
@@ -147,17 +147,18 @@ def _pa_decode_sparse(
     tile_end = tl.minimum((pid_k + 1) * tiles_per_segment, num_tiles)
 
     if KV_SPLITS == 1:
-        # Fold sink as initial running max so it participates in the softmax
-        # denom; sink contributes 0 to acc (virtual K with weight 1). Scores
-        # live in the base-2 domain, so lift the sink there too (* LOG2E).
+        sink_scale = LOG2E if USE_EXP2 else 1.0
         sink = (
             tl.load(attn_sink_ptr + h_offs, mask=h_mask, other=float("-inf")).to(
                 tl.float32
             )
-            * LOG2E
+            * sink_scale
         )
         m_i = sink
-        l_i = tl.exp2(sink - m_i)
+        if USE_EXP2:
+            l_i = tl.exp2(sink - m_i)
+        else:
+            l_i = tl.full((BLOCK_H,), 1.0, dtype=tl.float32)
     else:
         m_i = tl.full((BLOCK_H,), float("-inf"), dtype=tl.float32)
         l_i = tl.zeros((BLOCK_H,), dtype=tl.float32)
@@ -182,16 +183,23 @@ def _pa_decode_sparse(
         else:
             valid = in_range
 
+        # 64-bit before the multiply: a slot index fits 32 bits (the index
+        # buffer is int32 by ABI) but `slot * kv_stride_n` does not. A unified
+        # V4 pool runs to ~150M rows, so at a 512-element row the product
+        # passes 2^31 only 2.8% of the way in and every row above that is read
+        # from a wrapped address -- silently, since the wrapped offset still
+        # lands inside the same allocation.
+        slot_off = slot.to(tl.int64)
         kv_raw = tl.load(
             unified_kv_ptr
-            + slot[:, None] * kv_stride_n
+            + slot_off[:, None] * kv_stride_n
             + d_offs[None, :] * kv_stride_d,
             mask=valid[:, None] & d_mask[None, :],
             other=0.0,
         )
         if QUANT_KV:
             scales_full = tl.load(
-                kv_scales_ptr + slot[:, None] * ks_stride_n + g_idx_per_d[None, :],
+                kv_scales_ptr + slot_off[:, None] * ks_stride_n + g_idx_per_d[None, :],
                 mask=valid[:, None] & d_mask[None, :],
                 other=0.0,
             )
@@ -208,8 +216,12 @@ def _pa_decode_sparse(
         # m_new == -inf, so exp(m_i - m_new) = exp(-inf + inf) = NaN. With
         # l_i/acc still 0 that NaN survives as 0*NaN = NaN and poisons the
         # split's partials (and the reduce). Treat such a tile as a no-op.
-        alpha = tl.where(m_new == float("-inf"), 1.0, tl.exp2(m_i - m_new))
-        p = tl.exp2(scores - m_new[:, None])
+        if USE_EXP2:
+            alpha = tl.where(m_new == float("-inf"), 1.0, tl.exp2(m_i - m_new))
+            p = tl.exp2(scores - m_new[:, None])
+        else:
+            alpha = tl.where(m_new == float("-inf"), 1.0, tl.exp(m_i - m_new))
+            p = tl.exp(scores - m_new[:, None])
         p = tl.where(h_mask[:, None] & valid[None, :], p, 0.0)
         l_new = l_i * alpha + tl.sum(p, axis=1)
 

@@ -4,9 +4,12 @@
 #pragma once
 
 #include "aiter_hip_common.h"
-#include "dispatch_utils.h"
+#include "aiter_dispatch.h"
+#include "aiter_stream.h"
+#include "aiter_tensor.h"
 #include "hip_float8.h"
-#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
+#include <numeric>
+#include <string>
 #include <type_traits>
 
 #ifdef __HIP_DEVICE_COMPILE__
@@ -43,7 +46,7 @@
 
 // When ENABLE_ROPE_POSITIONS_INT32 is non-zero at compile time (e.g. -DENABLE_ROPE_POSITIONS_INT32=1),
 // RoPE cached-indirect kernels are also built for int32 positions tensors; dispatch switches on
-// positions.scalar_type() at runtime. When zero, only int64 (torch.long) positions are accepted.
+// the positions dtype at runtime. When zero, only int64 (long) positions are accepted.
 
 namespace aiter {
 // =====================================================================================================================
@@ -283,26 +286,26 @@ __device__ __forceinline__ void store_payload(o_scalar_t* p_buffer,
 }
 
 #ifdef __HIP_DEVICE_COMPILE__
-// Map torch/c10 types to opus-compatible types for ext_vector_type
+// Map aiter/hip scalar types to opus-compatible types for ext_vector_type
 template <typename T>
 struct opus_type_map
 {
     using type = T;
 };
 template <>
-struct opus_type_map<c10::Half>
+struct opus_type_map<__half>
 {
     using type = opus::fp16_t;
 };
 template <>
-struct opus_type_map<c10::BFloat16>
+struct opus_type_map<hip_bfloat16>
 {
     using type = opus::bf16_t;
 };
 template <typename T>
 using opus_type_t = typename opus_type_map<T>::type;
 
-// Helper to create opus gmem accessor with automatic pointer cast from c10 types to opus types
+// Helper to create opus gmem accessor with automatic pointer cast from hip types to opus types
 template <typename T>
 __device__ __forceinline__ auto opus_gmem(const T* ptr)
 {
@@ -4455,7 +4458,7 @@ __launch_bounds__(256, 8) __global__
 template <int32_t RotateStyle,
           bool ReuseFreqsFrontPart,
           bool Is2D,
-          typename scalar_t = ck_tile::fp16_t>
+          typename scalar_t>
 std::tuple<dim3, dim3, int32_t, int32_t> get_grid_config(const int32_t size_s_h,
                                                          const int32_t size_s_w,
                                                          const int32_t size_b,
@@ -4556,7 +4559,7 @@ void dispatch_1c_sbhd_uncached(scalar_t* __restrict__ p_output,
                                const int32_t stride_o_h,
                                const int32_t stride_o_d)
 {
-    const hipStream_t stream = at::hip::getCurrentHIPStream();
+    const hipStream_t stream = aiter::getCurrentHIPStream();
 
     const bool all_stride_d_eq_1 = (stride_i_d == 1) && (stride_o_d == 1);
     auto [grid, block, vec_pairs, threads_per_sb] =
@@ -4714,7 +4717,7 @@ void dispatch_2c_sbhd_uncached(scalar_t* __restrict__ p_output_x,
                                const int32_t stride_oy_h,
                                const int32_t stride_oy_d)
 {
-    const hipStream_t stream = at::hip::getCurrentHIPStream();
+    const hipStream_t stream = aiter::getCurrentHIPStream();
 
     const bool all_stride_d_eq_1 =
         (stride_ix_d == 1) && (stride_iy_d == 1) && (stride_ox_d == 1) && (stride_oy_d == 1);
@@ -4920,7 +4923,7 @@ void dispatch_1c_sbhd_cached(scalar_t* __restrict__ p_output,
                              const int32_t stride_o_h,
                              const int32_t stride_o_d)
 {
-    const hipStream_t stream = at::hip::getCurrentHIPStream();
+    const hipStream_t stream = aiter::getCurrentHIPStream();
 
     const bool all_stride_d_eq_1 = (stride_i_d == 1) && (stride_o_d == 1);
     auto [grid, block, vec_pairs, threads_per_sb] =
@@ -5082,7 +5085,7 @@ void dispatch_2c_sbhd_cached(scalar_t* __restrict__ p_output_x,
                              const int32_t stride_oy_h,
                              const int32_t stride_oy_d)
 {
-    const hipStream_t stream = at::hip::getCurrentHIPStream();
+    const hipStream_t stream = aiter::getCurrentHIPStream();
 
     const bool all_stride_d_eq_1 =
         (stride_ix_d == 1) && (stride_iy_d == 1) && (stride_ox_d == 1) && (stride_oy_d == 1);
@@ -5294,7 +5297,7 @@ void dispatch_1c_sbhd_cached_indirect(scalar_t* __restrict__ p_output,
                                       const int32_t stride_o_h,
                                       const int32_t stride_o_d)
 {
-    const hipStream_t stream = at::hip::getCurrentHIPStream();
+    const hipStream_t stream = aiter::getCurrentHIPStream();
 
     const bool all_stride_d_eq_1 = (stride_i_d == 1) && (stride_o_d == 1);
     auto [grid, block, vec_pairs, threads_per_sb] =
@@ -5469,7 +5472,7 @@ void dispatch_2c_sbhd_cached_indirect(scalar_t* __restrict__ p_output_x,
                                       const int32_t stride_oy_h,
                                       const int32_t stride_oy_d)
 {
-    const hipStream_t stream = at::hip::getCurrentHIPStream();
+    const hipStream_t stream = aiter::getCurrentHIPStream();
 
     const bool all_stride_d_eq_1 =
         (stride_ix_d == 1) && (stride_iy_d == 1) && (stride_ox_d == 1) && (stride_oy_d == 1);
@@ -5692,7 +5695,7 @@ void dispatch_1c_sbhd_cached_indirect2(scalar_t* __restrict__ p_output,
                                        const int32_t stride_o_h,
                                        const int32_t stride_o_d)
 {
-    const hipStream_t stream = at::hip::getCurrentHIPStream();
+    const hipStream_t stream = aiter::getCurrentHIPStream();
 
     const bool all_stride_d_eq_1 = (stride_i_d == 1) && (stride_o_d == 1);
     auto [grid, block, vec_pairs, threads_per_sb] =
@@ -5874,7 +5877,7 @@ void dispatch_2c_sbhd_cached_indirect2(scalar_t* __restrict__ p_output_x,
                                        const int32_t stride_oy_h,
                                        const int32_t stride_oy_d)
 {
-    const hipStream_t stream = at::hip::getCurrentHIPStream();
+    const hipStream_t stream = aiter::getCurrentHIPStream();
 
     const bool all_stride_d_eq_1 =
         (stride_ix_d == 1) && (stride_iy_d == 1) && (stride_ox_d == 1) && (stride_oy_d == 1);
@@ -6097,7 +6100,7 @@ void dispatch_1c_thd_uncached(scalar_t* __restrict__ p_output,
                               const int32_t stride_o_h,
                               const int32_t stride_o_d)
 {
-    const hipStream_t stream = at::hip::getCurrentHIPStream();
+    const hipStream_t stream = aiter::getCurrentHIPStream();
 
     const bool all_stride_d_eq_1 = (stride_i_d == 1) && (stride_o_d == 1);
     auto [grid, block, vec_pairs, threads_per_sb] =
@@ -6243,7 +6246,7 @@ void dispatch_1c_2d_cached(scalar_t* __restrict__ p_output,
                            const int32_t stride_o_h,
                            const int32_t stride_o_d)
 {
-    const hipStream_t stream = at::hip::getCurrentHIPStream();
+    const hipStream_t stream = aiter::getCurrentHIPStream();
 
     const bool all_stride_d_eq_1 = (stride_i_d == 1) && (stride_o_d == 1);
     auto [grid, block, vec_pairs, threads_per_sb] =
@@ -6378,11 +6381,11 @@ void dispatch_1c_2d_cached(scalar_t* __restrict__ p_output,
 }
 } // namespace aiter
 
-// Call sites use positions.data_ptr<pos_t>() inside __VA_ARGS__; pos_t is a local alias.
+// Call sites use the positions pointer (typed pos_t) inside __VA_ARGS__; pos_t is a local alias.
 #if ENABLE_ROPE_POSITIONS_INT32
 #define DISPATCH_ROPE_TYPES_PARAMS_WITH_POSITIONS(                                \
     TYPE0, TYPE1, POSITIONS_ST, ROTATE_STYLE, REUSE_FREQS_FRONT_PART, NOPE_FIRST, NAME, ...) \
-    if((POSITIONS_ST) == at::ScalarType::Int)                                      \
+    if((POSITIONS_ST) == AITER_DTYPE_i32)                                      \
     {                                                                             \
         using pos_t = int32_t;                                                    \
         DISPATCH_ROPE_TYPES_PARAMS(                                               \
@@ -6396,17 +6399,17 @@ void dispatch_1c_2d_cached(scalar_t* __restrict__ p_output,
     }                                                                             \
     else                                                                          \
     {                                                                             \
-        TORCH_CHECK(false,                                                        \
+        AITER_CHECK(false,                                                        \
                     NAME,                                                         \
                     " does not support positions dtype ",                         \
-                    toString((POSITIONS_ST)),                                     \
+                    AiterDtype_to_str((POSITIONS_ST)),                                     \
                     " (compile RoPE sources with -DENABLE_ROPE_POSITIONS_INT32=1 for int32 positions", \
                     " and -DENABLE_ROPE_POSITIONS_INT32=0 for int64/Long positions)."); \
     }
 #else
 #define DISPATCH_ROPE_TYPES_PARAMS_WITH_POSITIONS(                                \
     TYPE0, TYPE1, POSITIONS_ST, ROTATE_STYLE, REUSE_FREQS_FRONT_PART, NOPE_FIRST, NAME, ...) \
-    if((POSITIONS_ST) == at::ScalarType::Long)                                    \
+    if((POSITIONS_ST) == AITER_DTYPE_i64)                                    \
     {                                                                             \
         using pos_t = int64_t;                                                    \
         DISPATCH_ROPE_TYPES_PARAMS(                                               \
@@ -6420,10 +6423,10 @@ void dispatch_1c_2d_cached(scalar_t* __restrict__ p_output,
     }                                                                             \
     else                                                                          \
     {                                                                             \
-        TORCH_CHECK(false,                                                        \
+        AITER_CHECK(false,                                                        \
                     NAME,                                                         \
                     " does not support positions dtype ",                         \
-                    toString((POSITIONS_ST)),                                     \
+                    AiterDtype_to_str((POSITIONS_ST)),                                     \
                     " (compile RoPE sources with -DENABLE_ROPE_POSITIONS_INT32=1 for int32 positions", \
                     " and -DENABLE_ROPE_POSITIONS_INT32=0 for int64/Long positions)."); \
     }
@@ -6433,11 +6436,11 @@ void dispatch_1c_2d_cached(scalar_t* __restrict__ p_output,
     TYPE0, TYPE1, ROTATE_STYLE, REUSE_FREQS_FRONT_PART, NOPE_FIRST, NAME, ...)    \
     switch((TYPE0))                                                               \
     {                                                                             \
-    case at::ScalarType::Float: {                                                 \
+    case AITER_DTYPE_fp32: {                                                 \
         using scalar_t_0 = float;                                                 \
         switch((TYPE1))                                                           \
         {                                                                         \
-        case at::ScalarType::Float: {                                             \
+        case AITER_DTYPE_fp32: {                                             \
             using scalar_t_1 = float;                                             \
             if((REUSE_FREQS_FRONT_PART))                                          \
             {                                                                     \
@@ -6472,7 +6475,7 @@ void dispatch_1c_2d_cached(scalar_t* __restrict__ p_output,
                 }                                                                 \
                 else                                                              \
                 {                                                                 \
-                    TORCH_CHECK(false,                                            \
+                    AITER_CHECK(false,                                            \
                                 NAME " does't support rotate type ",              \
                                 std::to_string((ROTATE_STYLE)),                   \
                                 ".");                                             \
@@ -6511,7 +6514,7 @@ void dispatch_1c_2d_cached(scalar_t* __restrict__ p_output,
                 }                                                                 \
                 else                                                              \
                 {                                                                 \
-                    TORCH_CHECK(false,                                            \
+                    AITER_CHECK(false,                                            \
                                 NAME " does't support rotate type ",              \
                                 std::to_string((ROTATE_STYLE)),                   \
                                 ".");                                             \
@@ -6519,8 +6522,8 @@ void dispatch_1c_2d_cached(scalar_t* __restrict__ p_output,
             }                                                                     \
             break;                                                                \
         }                                                                         \
-        case at::ScalarType::Half: {                                              \
-            using scalar_t_1 = at::Half;                                          \
+        case AITER_DTYPE_fp16: {                                              \
+            using scalar_t_1 = __half;                                          \
             if((REUSE_FREQS_FRONT_PART))                                          \
             {                                                                     \
                 constexpr bool ReuseFreqsFrontPart = true;                        \
@@ -6554,7 +6557,7 @@ void dispatch_1c_2d_cached(scalar_t* __restrict__ p_output,
                 }                                                                 \
                 else                                                              \
                 {                                                                 \
-                    TORCH_CHECK(false,                                            \
+                    AITER_CHECK(false,                                            \
                                 NAME " does't support rotate type ",              \
                                 std::to_string((ROTATE_STYLE)),                   \
                                 ".");                                             \
@@ -6593,7 +6596,7 @@ void dispatch_1c_2d_cached(scalar_t* __restrict__ p_output,
                 }                                                                 \
                 else                                                              \
                 {                                                                 \
-                    TORCH_CHECK(false,                                            \
+                    AITER_CHECK(false,                                            \
                                 NAME " does't support rotate type ",              \
                                 std::to_string((ROTATE_STYLE)),                   \
                                 ".");                                             \
@@ -6601,8 +6604,8 @@ void dispatch_1c_2d_cached(scalar_t* __restrict__ p_output,
             }                                                                     \
             break;                                                                \
         }                                                                         \
-        case at::ScalarType::BFloat16: {                                          \
-            using scalar_t_1 = at::BFloat16;                                      \
+        case AITER_DTYPE_bf16: {                                          \
+            using scalar_t_1 = hip_bfloat16;                                      \
             if((REUSE_FREQS_FRONT_PART))                                          \
             {                                                                     \
                 constexpr bool ReuseFreqsFrontPart = true;                        \
@@ -6636,7 +6639,7 @@ void dispatch_1c_2d_cached(scalar_t* __restrict__ p_output,
                 }                                                                 \
                 else                                                              \
                 {                                                                 \
-                    TORCH_CHECK(false,                                            \
+                    AITER_CHECK(false,                                            \
                                 NAME " does't support rotate type ",              \
                                 std::to_string((ROTATE_STYLE)),                   \
                                 ".");                                             \
@@ -6675,7 +6678,7 @@ void dispatch_1c_2d_cached(scalar_t* __restrict__ p_output,
                 }                                                                 \
                 else                                                              \
                 {                                                                 \
-                    TORCH_CHECK(false,                                            \
+                    AITER_CHECK(false,                                            \
                                 NAME " does't support rotate type ",              \
                                 std::to_string((ROTATE_STYLE)),                   \
                                 ".");                                             \
@@ -6684,20 +6687,20 @@ void dispatch_1c_2d_cached(scalar_t* __restrict__ p_output,
             break;                                                                \
         }                                                                         \
         default:                                                                  \
-            TORCH_CHECK(false,                                                    \
+            AITER_CHECK(false,                                                    \
                         NAME " does't support ",                                  \
-                        toString((TYPE0)),                                        \
+                        AiterDtype_to_str((TYPE0)),                                        \
                         " with ",                                                 \
-                        toString((TYPE1)),                                        \
+                        AiterDtype_to_str((TYPE1)),                                        \
                         ".");                                                     \
         }                                                                         \
         break;                                                                    \
     }                                                                             \
-    case at::ScalarType::Half: {                                                  \
-        using scalar_t_0 = at::Half;                                              \
+    case AITER_DTYPE_fp16: {                                                  \
+        using scalar_t_0 = __half;                                              \
         switch((TYPE1))                                                           \
         {                                                                         \
-        case at::ScalarType::Float: {                                             \
+        case AITER_DTYPE_fp32: {                                             \
             using scalar_t_1 = float;                                             \
             if((REUSE_FREQS_FRONT_PART))                                          \
             {                                                                     \
@@ -6732,7 +6735,7 @@ void dispatch_1c_2d_cached(scalar_t* __restrict__ p_output,
                 }                                                                 \
                 else                                                              \
                 {                                                                 \
-                    TORCH_CHECK(false,                                            \
+                    AITER_CHECK(false,                                            \
                                 NAME " does't support rotate type ",              \
                                 std::to_string((ROTATE_STYLE)),                   \
                                 ".");                                             \
@@ -6771,7 +6774,7 @@ void dispatch_1c_2d_cached(scalar_t* __restrict__ p_output,
                 }                                                                 \
                 else                                                              \
                 {                                                                 \
-                    TORCH_CHECK(false,                                            \
+                    AITER_CHECK(false,                                            \
                                 NAME " does't support rotate type ",              \
                                 std::to_string((ROTATE_STYLE)),                   \
                                 ".");                                             \
@@ -6779,8 +6782,8 @@ void dispatch_1c_2d_cached(scalar_t* __restrict__ p_output,
             }                                                                     \
             break;                                                                \
         }                                                                         \
-        case at::ScalarType::Half: {                                              \
-            using scalar_t_1 = at::Half;                                          \
+        case AITER_DTYPE_fp16: {                                              \
+            using scalar_t_1 = __half;                                          \
             if((REUSE_FREQS_FRONT_PART))                                          \
             {                                                                     \
                 constexpr bool ReuseFreqsFrontPart = true;                        \
@@ -6814,7 +6817,7 @@ void dispatch_1c_2d_cached(scalar_t* __restrict__ p_output,
                 }                                                                 \
                 else                                                              \
                 {                                                                 \
-                    TORCH_CHECK(false,                                            \
+                    AITER_CHECK(false,                                            \
                                 NAME " does't support rotate type ",              \
                                 std::to_string((ROTATE_STYLE)),                   \
                                 ".");                                             \
@@ -6853,7 +6856,7 @@ void dispatch_1c_2d_cached(scalar_t* __restrict__ p_output,
                 }                                                                 \
                 else                                                              \
                 {                                                                 \
-                    TORCH_CHECK(false,                                            \
+                    AITER_CHECK(false,                                            \
                                 NAME " does't support rotate type ",              \
                                 std::to_string((ROTATE_STYLE)),                   \
                                 ".");                                             \
@@ -6861,8 +6864,8 @@ void dispatch_1c_2d_cached(scalar_t* __restrict__ p_output,
             }                                                                     \
             break;                                                                \
         }                                                                         \
-        case at::ScalarType::BFloat16: {                                          \
-            using scalar_t_1 = at::BFloat16;                                      \
+        case AITER_DTYPE_bf16: {                                          \
+            using scalar_t_1 = hip_bfloat16;                                      \
             if((REUSE_FREQS_FRONT_PART))                                          \
             {                                                                     \
                 constexpr bool ReuseFreqsFrontPart = true;                        \
@@ -6896,7 +6899,7 @@ void dispatch_1c_2d_cached(scalar_t* __restrict__ p_output,
                 }                                                                 \
                 else                                                              \
                 {                                                                 \
-                    TORCH_CHECK(false,                                            \
+                    AITER_CHECK(false,                                            \
                                 NAME " does't support rotate type ",              \
                                 std::to_string((ROTATE_STYLE)),                   \
                                 ".");                                             \
@@ -6935,7 +6938,7 @@ void dispatch_1c_2d_cached(scalar_t* __restrict__ p_output,
                 }                                                                 \
                 else                                                              \
                 {                                                                 \
-                    TORCH_CHECK(false,                                            \
+                    AITER_CHECK(false,                                            \
                                 NAME " does't support rotate type ",              \
                                 std::to_string((ROTATE_STYLE)),                   \
                                 ".");                                             \
@@ -6944,20 +6947,20 @@ void dispatch_1c_2d_cached(scalar_t* __restrict__ p_output,
             break;                                                                \
         }                                                                         \
         default:                                                                  \
-            TORCH_CHECK(false,                                                    \
+            AITER_CHECK(false,                                                    \
                         NAME " does't support ",                                  \
-                        toString((TYPE0)),                                        \
+                        AiterDtype_to_str((TYPE0)),                                        \
                         " with ",                                                 \
-                        toString((TYPE1)),                                        \
+                        AiterDtype_to_str((TYPE1)),                                        \
                         ".");                                                     \
         }                                                                         \
         break;                                                                    \
     }                                                                             \
-    case at::ScalarType::BFloat16: {                                              \
-        using scalar_t_0 = at::BFloat16;                                          \
+    case AITER_DTYPE_bf16: {                                              \
+        using scalar_t_0 = hip_bfloat16;                                          \
         switch((TYPE1))                                                           \
         {                                                                         \
-        case at::ScalarType::Float: {                                             \
+        case AITER_DTYPE_fp32: {                                             \
             using scalar_t_1 = float;                                             \
             if((REUSE_FREQS_FRONT_PART))                                          \
             {                                                                     \
@@ -6992,7 +6995,7 @@ void dispatch_1c_2d_cached(scalar_t* __restrict__ p_output,
                 }                                                                 \
                 else                                                              \
                 {                                                                 \
-                    TORCH_CHECK(false,                                            \
+                    AITER_CHECK(false,                                            \
                                 NAME " does't support rotate type ",              \
                                 std::to_string((ROTATE_STYLE)),                   \
                                 ".");                                             \
@@ -7031,7 +7034,7 @@ void dispatch_1c_2d_cached(scalar_t* __restrict__ p_output,
                 }                                                                 \
                 else                                                              \
                 {                                                                 \
-                    TORCH_CHECK(false,                                            \
+                    AITER_CHECK(false,                                            \
                                 NAME " does't support rotate type ",              \
                                 std::to_string((ROTATE_STYLE)),                   \
                                 ".");                                             \
@@ -7039,8 +7042,8 @@ void dispatch_1c_2d_cached(scalar_t* __restrict__ p_output,
             }                                                                     \
             break;                                                                \
         }                                                                         \
-        case at::ScalarType::Half: {                                              \
-            using scalar_t_1 = at::Half;                                          \
+        case AITER_DTYPE_fp16: {                                              \
+            using scalar_t_1 = __half;                                          \
             if((REUSE_FREQS_FRONT_PART))                                          \
             {                                                                     \
                 constexpr bool ReuseFreqsFrontPart = true;                        \
@@ -7074,7 +7077,7 @@ void dispatch_1c_2d_cached(scalar_t* __restrict__ p_output,
                 }                                                                 \
                 else                                                              \
                 {                                                                 \
-                    TORCH_CHECK(false,                                            \
+                    AITER_CHECK(false,                                            \
                                 NAME " does't support rotate type ",              \
                                 std::to_string((ROTATE_STYLE)),                   \
                                 ".");                                             \
@@ -7113,7 +7116,7 @@ void dispatch_1c_2d_cached(scalar_t* __restrict__ p_output,
                 }                                                                 \
                 else                                                              \
                 {                                                                 \
-                    TORCH_CHECK(false,                                            \
+                    AITER_CHECK(false,                                            \
                                 NAME " does't support rotate type ",              \
                                 std::to_string((ROTATE_STYLE)),                   \
                                 ".");                                             \
@@ -7121,8 +7124,8 @@ void dispatch_1c_2d_cached(scalar_t* __restrict__ p_output,
             }                                                                     \
             break;                                                                \
         }                                                                         \
-        case at::ScalarType::BFloat16: {                                          \
-            using scalar_t_1 = at::BFloat16;                                      \
+        case AITER_DTYPE_bf16: {                                          \
+            using scalar_t_1 = hip_bfloat16;                                      \
             if((REUSE_FREQS_FRONT_PART))                                          \
             {                                                                     \
                 constexpr bool ReuseFreqsFrontPart = true;                        \
@@ -7156,7 +7159,7 @@ void dispatch_1c_2d_cached(scalar_t* __restrict__ p_output,
                 }                                                                 \
                 else                                                              \
                 {                                                                 \
-                    TORCH_CHECK(false,                                            \
+                    AITER_CHECK(false,                                            \
                                 NAME " does't support rotate type ",              \
                                 std::to_string((ROTATE_STYLE)),                   \
                                 ".");                                             \
@@ -7195,7 +7198,7 @@ void dispatch_1c_2d_cached(scalar_t* __restrict__ p_output,
                 }                                                                 \
                 else                                                              \
                 {                                                                 \
-                    TORCH_CHECK(false,                                            \
+                    AITER_CHECK(false,                                            \
                                 NAME " does't support rotate type ",              \
                                 std::to_string((ROTATE_STYLE)),                   \
                                 ".");                                             \
@@ -7204,16 +7207,16 @@ void dispatch_1c_2d_cached(scalar_t* __restrict__ p_output,
             break;                                                                \
         }                                                                         \
         default:                                                                  \
-            TORCH_CHECK(false,                                                    \
+            AITER_CHECK(false,                                                    \
                         NAME " does't support ",                                  \
-                        toString((TYPE0)),                                        \
+                        AiterDtype_to_str((TYPE0)),                                        \
                         " with ",                                                 \
-                        toString((TYPE1)),                                        \
+                        AiterDtype_to_str((TYPE1)),                                        \
                         ".");                                                     \
         }                                                                         \
         break;                                                                    \
     }                                                                             \
-    default: TORCH_CHECK(false, NAME " does't support ", toString((TYPE0)), "."); \
+    default: AITER_CHECK(false, NAME " does't support ", AiterDtype_to_str((TYPE0)), "."); \
     }
 
 namespace mrope_utils {
@@ -7237,7 +7240,7 @@ __inline__ __device__ T warp_shfl_xor_sync(T val, int offset)
 // implementation. ds_swizzle and DPP latencies are symmetric, so reversing the
 // order vs the natural DPP-first form is a free constraint that buys us
 // bitwise-identical output to the prior bpermute-based reduce.
-// All lanes hold the full sum on return — XOR butterfly is symmetric, so no
+// All lanes hold the full sum on return -- XOR butterfly is symmetric, so no
 // follow-up broadcast is needed.
 //
 // Body is wrapped in #ifdef __HIP_DEVICE_COMPILE__ to match the rest of this
@@ -7246,7 +7249,7 @@ __inline__ __device__ T warp_shfl_xor_sync(T val, int offset)
 // and break any TU that includes rope_common.h without otherwise pulling in
 // opus.hpp (e.g. csrc/kernels/rope/general_2c_cached_positions_offsets_fwd_kernels.cu).
 // In the host pass the body is empty and the function returns `val`
-// unchanged — fine because these helpers are __device__-only.
+// unchanged -- fine because these helpers are __device__-only.
 template <typename T>
 __inline__ __device__ T warp_reduce_sum(T val)
 {
@@ -7398,7 +7401,7 @@ struct alignas(sizeof(T) * vec_size) vec_t
             }
             else
             {
-                data[i] = ck_tile::type_convert<T>(ck_tile::type_convert<float>(src[i]) / scale);
+                data[i] = static_cast<T>(static_cast<float>(src[i]) / scale);
             }
         }
     }
@@ -7428,12 +7431,12 @@ __inline__ __device__ vec_t<T, vec_size> warp_shfl_sync_vec(vec_t<T, vec_size>& 
 // Unlike warp_reduce_sum / half_warp_reduce_sum where opus::* only appears in
 // the body (and so can be hidden with #ifdef __HIP_DEVICE_COMPILE__ to keep
 // the host pass building), here opus::number<XorOffset> is a default
-// argument in the SIGNATURE — the signature is parsed in both passes, so
+// argument in the SIGNATURE -- the signature is parsed in both passes, so
 // it cannot be #ifdef'd. We use std::integral_constant<int, XorOffset>
 // instead (which doesn't need opus.hpp). Existing callers passing
 // opus::number<X>{} continue to work because opus::number<I> is publicly
 // derived from std::integral_constant<index_t, I> (csrc/include/opus/opus.hpp:57)
-// — pass-by-value slicing of the empty derived type to its empty base is a no-op.
+// -- pass-by-value slicing of the empty derived type to its empty base is a no-op.
 template <typename T, int vec_size, int XorOffset>
 __inline__ __device__ vec_t<T, vec_size>
 warp_shfl_xor_sync_vec(vec_t<T, vec_size>& val,
@@ -7474,7 +7477,7 @@ warp_shfl_xor_sync_vec(vec_t<T, vec_size>& val,
 //
 // Round semantics (bit-identical to __hip_bfloat16(float) ctor for non-NaN inputs):
 //   bf16 = (x + 0x7FFF + ((x >> 16) & 1)) >> 16
-// This is the standard RNE bias trick — adds 0x7FFF for normal rounding, plus the
+// This is the standard RNE bias trick -- adds 0x7FFF for normal rounding, plus the
 // 17-bit ("round") position to break ties to even.
 //
 // NaN handling differs from the ctor: the ctor preserves the NaN payload upper
@@ -7488,11 +7491,11 @@ warp_shfl_xor_sync_vec(vec_t<T, vec_size>& val,
 // mask manipulation (vs 26 instructions for two scalar __hip_bfloat16(float)
 // expansions, each of which serializes the warp via s_and_saveexec / s_xor /
 // s_or around the NaN-check). On gfx95 (CDNA4) it would be a single
-// v_cvt_pk_bf16_f32 — not implemented here yet.
+// v_cvt_pk_bf16_f32 -- not implemented here yet.
 __device__ __forceinline__ uint32_t f32x2_to_bf16x2_rne(float a, float b)
 {
     constexpr uint32_t ROUND_BIAS = 0x7fffu;     // RNE bias
-    constexpr uint32_t FP32_NAN   = 0x7fff0000u; // canonical FP32 NaN → BF16 0x7fff
+    constexpr uint32_t FP32_NAN   = 0x7fff0000u; // canonical FP32 NaN -> BF16 0x7fff
     constexpr uint32_t MERGE_MASK = 0xffff0000u; // upper-half mask for and_or merge
     uint32_t a_bits               = __builtin_bit_cast(uint32_t, a);
     uint32_t b_bits               = __builtin_bit_cast(uint32_t, b);
@@ -7550,7 +7553,7 @@ __device__ __forceinline__ uint32_t f32x2_to_bf16x2_rne(float a, float b)
 // scalar static_cast for other element types. N must be even.
 //
 // The bf16 path saves ~50% of the conversion cost relative to the default
-// per-element static_cast<bf16>(float) — see the comment on
+// per-element static_cast<bf16>(float) -- see the comment on
 // f32x2_to_bf16x2_rne above.
 template <typename T, int N>
 __device__ __forceinline__ void pack_f32_to_vec_t(vec_t<T, N>& dst, const float (&src)[N])
@@ -7577,7 +7580,11 @@ __device__ __forceinline__ void pack_f32_to_vec_t(vec_t<T, N>& dst, const float 
 
 template <typename T, int VEC_SIZE>
 __device__ __forceinline__ void
-warp_rms_norm_(vec_t<T, VEC_SIZE>& input, vec_t<T, VEC_SIZE>& gamma, float rms_dim, float rms_eps)
+warp_rms_norm_(vec_t<T, VEC_SIZE>& input,
+               vec_t<T, VEC_SIZE>& gamma,
+               float rms_dim,
+               float rms_eps,
+               bool gemma_norm = false)
 {
     vec_t<T, VEC_SIZE> norm_out;
     float acc = 0.f;
@@ -7587,13 +7594,14 @@ warp_rms_norm_(vec_t<T, VEC_SIZE>& input, vec_t<T, VEC_SIZE>& gamma, float rms_d
         float v = (float)input[i];
         acc += v * v;
     }
-    // XOR butterfly leaves the same sum in every lane — no extra broadcast needed.
+    // XOR butterfly leaves the same sum in every lane -- no extra broadcast needed.
     acc        = block_utils::warp_reduce_sum<float>(acc);
     auto s_val = rsqrtf(acc / rms_dim + rms_eps);
 #pragma unroll
     for(int i = 0; i < VEC_SIZE; ++i)
     {
-        input[i] = static_cast<T>((float)input[i] * s_val * (float)gamma[i]);
+        const float weight = gemma_norm ? (1.0f + (float)gamma[i]) : (float)gamma[i];
+        input[i] = static_cast<T>((float)input[i] * s_val * weight);
     }
 }
 
@@ -7783,7 +7791,12 @@ __global__ void fused_mrope_rms_kv_kernel(const T* qkv,
                                           int x                    = 0,
                                           int rotary_dim           = 0,
                                           int64_t k_block_stride   = 0,
-                                          int64_t v_block_stride   = 0)
+                                          int64_t v_block_stride   = 0,
+                                          bool gemma_norm          = false,
+                                          int64_t k_token_stride   = 0,
+                                          int64_t k_head_stride    = 0,
+                                          int64_t v_token_stride   = 0,
+                                          int64_t v_head_stride    = 0)
 {
     constexpr int VEC_SIZE        = HEAD_SIZE / WARP_SIZE;
     constexpr int HALF_HEAD_SIZE  = HEAD_SIZE / 2;
@@ -7880,7 +7893,7 @@ __global__ void fused_mrope_rms_kv_kernel(const T* qkv,
                     cos_sin_vec.load(&cos_sin[position_ * rotary_dim_ + access_id_in_head]);
                 }
             }
-            warp_rms_norm_<T, VEC_SIZE>(x_vec, w_vec, HEAD_SIZE, eps);
+            warp_rms_norm_<T, VEC_SIZE>(x_vec, w_vec, HEAD_SIZE, eps, gemma_norm);
             if(in_rotary)
             {
                 const int rotary_neighbor_offset = access_id_in_head < half_rotary
@@ -7959,7 +7972,7 @@ __global__ void fused_mrope_rms_kv_kernel(const T* qkv,
                         &cos_sin[position_ * rotary_dim_ + access_id_in_head / 2 + half_rotary]);
                 }
             }
-            warp_rms_norm_<T, VEC_SIZE>(x_vec, w_vec, HEAD_SIZE, eps);
+            warp_rms_norm_<T, VEC_SIZE>(x_vec, w_vec, HEAD_SIZE, eps, gemma_norm);
             if(in_rotary)
             {
 #pragma unroll
@@ -8001,15 +8014,18 @@ __global__ void fused_mrope_rms_kv_kernel(const T* qkv,
             }
             else
             {
-                // block_size == 0 => non-paged cache (flat [num_slots, num_heads_k, HEAD_SIZE]):
-                // index directly by slot. Otherwise the cache is paged and K/V are interleaved
-                // per block, so index with the cache's real per-block stride (k_block_stride):
-                // offset = block_id*block_stride + block_offset*slot_size + head*HEAD_SIZE + elem
+                // Non-paged (block_size==0) indexes by slot; paged offset =
+                // block*block_stride + slot*tok + head*head + elem.
                 const int64_t slot_size = static_cast<int64_t>(num_heads_k) * HEAD_SIZE;
+                // Each stride 0 => contiguous fallback (num_heads*HEAD_SIZE,
+                // HEAD_SIZE); non-zero writes a strided view (e.g. #44455) in place.
+                const int64_t tok_stride  = (k_token_stride != 0) ? k_token_stride : slot_size;
+                const int64_t head_stride = (k_head_stride != 0) ? k_head_stride
+                                                                  : static_cast<int64_t>(HEAD_SIZE);
                 int64_t offset;
                 if(block_size == 0)
                 {
-                    offset = slot_id * slot_size + head_id_k * HEAD_SIZE + access_id_in_head;
+                    offset = slot_id * tok_stride + head_id_k * head_stride + access_id_in_head;
                 }
                 else
                 {
@@ -8018,8 +8034,8 @@ __global__ void fused_mrope_rms_kv_kernel(const T* qkv,
                     const int64_t block_stride = (k_block_stride != 0)
                                                      ? k_block_stride
                                                      : static_cast<int64_t>(block_size) * slot_size;
-                    offset = block_id * block_stride + block_offset * slot_size +
-                             head_id_k * HEAD_SIZE + access_id_in_head;
+                    offset = block_id * block_stride + block_offset * tok_stride +
+                             head_id_k * head_stride + access_id_in_head;
                 }
                 out_kv_vec.store(k_cache + offset);
             }
@@ -8055,13 +8071,16 @@ __global__ void fused_mrope_rms_kv_kernel(const T* qkv,
         }
         else
         {
-            // Same scheme as the K path above, for the V cache.
-            // block_size == 0 => non-paged cache, index directly by slot.
+            // Same stride-aware scheme as K (block/token/head; 0 => contiguous
+            // fallback, non-zero writes a strided view such as the #44455 packed).
             const int64_t slot_size = static_cast<int64_t>(num_heads_v) * HEAD_SIZE;
+            const int64_t tok_stride  = (v_token_stride != 0) ? v_token_stride : slot_size;
+            const int64_t head_stride = (v_head_stride != 0) ? v_head_stride
+                                                             : static_cast<int64_t>(HEAD_SIZE);
             int64_t offset;
             if(block_size == 0)
             {
-                offset = slot_id * slot_size + head_id_v * HEAD_SIZE + access_id_in_head;
+                offset = slot_id * tok_stride + head_id_v * head_stride + access_id_in_head;
             }
             else
             {
@@ -8070,8 +8089,8 @@ __global__ void fused_mrope_rms_kv_kernel(const T* qkv,
                 const int64_t block_stride = (v_block_stride != 0)
                                                  ? v_block_stride
                                                  : static_cast<int64_t>(block_size) * slot_size;
-                offset                     = block_id * block_stride + block_offset * slot_size +
-                         head_id_v * HEAD_SIZE + access_id_in_head;
+                offset = block_id * block_stride + block_offset * tok_stride +
+                         head_id_v * head_stride + access_id_in_head;
             }
             out_kv_vec.store(v_cache + offset);
         }
@@ -8085,8 +8104,8 @@ __global__ void fused_mrope_rms_kv_kernel(const T* qkv,
     }
 }
 
-// mrope-3D launcher: intentionally relies on the default-0 (contiguous) block stride
-// in fused_mrope_rms_kv_kernel; the stride-aware path is the pts launcher below.
+// mrope-3D launcher: relies on default-0 (contiguous) strides; the fully
+// stride-aware path is the pts launcher (fused_rope_rms_set_kv) below.
 template <typename T, int M, typename KVT>
 void fused_mrope_rms_set_kv(const T* qkv,
                             const T* q_w,
@@ -8116,12 +8135,13 @@ void fused_mrope_rms_set_kv(const T* qkv,
                             bool use_shuffle_layout  = false,
                             int64_t block_size       = 0,
                             int64_t x                = 0,
-                            int64_t rotary_dim       = 0)
+                            int64_t rotary_dim       = 0,
+                            bool gemma_norm          = false)
 {
-    TORCH_CHECK(head_size == 64 || head_size == 128 || head_size == 256);
+    AITER_CHECK(head_size == 64 || head_size == 128 || head_size == 256);
     auto dim           = std::accumulate(mrope_section.begin(), mrope_section.end(), 0);
     auto expected_half = rotary_dim > 0 ? rotary_dim / 2 : head_size / 2;
-    TORCH_CHECK(dim == expected_half,
+    AITER_CHECK(dim == expected_half,
                 "mrope_section sum (",
                 dim,
                 ") must equal rotary_dim/2 (",
@@ -8162,7 +8182,10 @@ void fused_mrope_rms_set_kv(const T* qkv,
                                                         use_shuffle_layout,          \
                                                         block_size,                  \
                                                         x,                           \
-                                                        (int)rotary_dim);            \
+                                                        (int)rotary_dim,             \
+                                                        (int64_t)0,                  \
+                                                        (int64_t)0,                  \
+                                                        gemma_norm);                 \
     }                                                                                \
     else                                                                             \
     {                                                                                \
@@ -8192,7 +8215,10 @@ void fused_mrope_rms_set_kv(const T* qkv,
                                                         use_shuffle_layout,          \
                                                         block_size,                  \
                                                         x,                           \
-                                                        (int)rotary_dim);            \
+                                                        (int)rotary_dim,             \
+                                                        (int64_t)0,                  \
+                                                        (int64_t)0,                  \
+                                                        gemma_norm);                 \
     }
 
     if(is_interleaved)
@@ -8246,9 +8272,13 @@ void fused_rope_rms_set_kv(const T* qkv,
                            int64_t x                = 0,
                            int64_t rotary_dim       = 0,
                            int64_t k_block_stride   = 0,
-                           int64_t v_block_stride   = 0)
+                           int64_t v_block_stride   = 0,
+                           int64_t k_token_stride   = 0,
+                           int64_t k_head_stride    = 0,
+                           int64_t v_token_stride   = 0,
+                           int64_t v_head_stride    = 0)
 {
-    TORCH_CHECK(head_size == 64 || head_size == 128 || head_size == 256);
+    AITER_CHECK(head_size == 64 || head_size == 128 || head_size == 256);
     constexpr int THREAD_BLOCK_SIZE = 256;
     auto total_warps                = num_tokens * (num_heads_q + num_heads_k + num_heads_v);
     auto num_warps_per_block        = THREAD_BLOCK_SIZE / WARP_SIZE;
@@ -8287,7 +8317,12 @@ void fused_rope_rms_set_kv(const T* qkv,
                                                         x,                   \
                                                         (int)rotary_dim,     \
                                                         k_block_stride,      \
-                                                        v_block_stride);     \
+                                                        v_block_stride,      \
+                                                        /*gemma_norm=*/false,\
+                                                        k_token_stride,      \
+                                                        k_head_stride,       \
+                                                        v_token_stride,      \
+                                                        v_head_stride);      \
     }                                                                        \
     else                                                                     \
     {                                                                        \
@@ -8319,7 +8354,12 @@ void fused_rope_rms_set_kv(const T* qkv,
                                                         x,                   \
                                                         (int)rotary_dim,     \
                                                         k_block_stride,      \
-                                                        v_block_stride);     \
+                                                        v_block_stride,      \
+                                                        /*gemma_norm=*/false,\
+                                                        k_token_stride,      \
+                                                        k_head_stride,       \
+                                                        v_token_stride,      \
+                                                        v_head_stride);      \
     }
 
     switch(head_size)

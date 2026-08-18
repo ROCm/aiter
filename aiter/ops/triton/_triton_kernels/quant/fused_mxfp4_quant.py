@@ -392,7 +392,7 @@ def _fused_reduce_act_mul_and_dynamic_mxfp4_quant_kernel(
                     & (x_offs_n[None, None, :] < N1)
                 )
                 other = 0.0
-            elif not (X_NUM_KSPLIT_POW2 == X_NUM_KSPLIT):
+            elif X_NUM_KSPLIT_POW2 != X_NUM_KSPLIT:
                 mask = offs_spk[:, None, None] < X_NUM_KSPLIT
                 other = 0.0
             elif not EVEN_M_N:

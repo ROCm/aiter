@@ -1,10 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import triton
-import torch
 import pytest
-from typing import Tuple
+import torch
+import triton
 
 from aiter.ops.triton.moe.moe_align_block_size import moe_align_block_size_triton
 
@@ -110,7 +109,7 @@ def input_helper(M: int, E: int, top_k: int):
 
 def triton_moe_align_block_size(
     topk_ids: torch.Tensor, block_size: int, num_experts: int
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     max_num_tokens_padded = topk_ids.numel() + num_experts * (block_size - 1)
     sorted_ids = torch.empty(
         (max_num_tokens_padded,), dtype=torch.int32, device=topk_ids.device

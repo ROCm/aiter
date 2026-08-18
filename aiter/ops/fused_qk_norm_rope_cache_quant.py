@@ -3,9 +3,9 @@
 
 import torch
 from torch import Tensor
+
 from ..jit.core import compile_ops
 from ..utility.dtypes import get_dtype_fp8
-from typing import Optional
 
 
 @compile_ops(
@@ -133,9 +133,9 @@ def minimax_qk_norm_rope(
     rotary_dim: int,
     eps: float,
     is_neox_style: bool,
-    q_out: Optional[Tensor] = None,
-    k_out: Optional[Tensor] = None,
-    v_out: Optional[Tensor] = None,
+    q_out: Tensor | None = None,
+    k_out: Tensor | None = None,
+    v_out: Tensor | None = None,
 ) -> tuple[Tensor, Tensor, Tensor]:
     """MiniMax TP1 qkv split with full-vector q/k RMSNorm and RoPE.
 
@@ -175,11 +175,11 @@ _FUSED_QK_FALLBACK_M = 16384
 
 
 def _fused_qk_rmsnorm(
-    q_out: Optional[Tensor],
+    q_out: Tensor | None,
     q: Tensor,
     q_weight: Tensor,
     q_eps: float,
-    k_out: Optional[Tensor],
+    k_out: Tensor | None,
     k: Tensor,
     k_weight: Tensor,
     k_eps: float,
@@ -244,8 +244,8 @@ def fused_qk_norm_rope_cache_pts_quant_shuffle(
     slot_mapping: Tensor,
     per_tensor_k_scale: Tensor,
     per_tensor_v_scale: Tensor,
-    k_out: Optional[Tensor],
-    v_out: Optional[Tensor],
+    k_out: Tensor | None,
+    v_out: Tensor | None,
     return_kv: bool,
     use_shuffle_layout: bool,
     block_size: int,
@@ -306,7 +306,6 @@ def fused_qk_norm_rope_1way(
     (RoPE freqs are computed in fp32 there and the precision is consumed by the
     fp32 rope multiply). Passing bf16/fp16 cos_sin will raise inside the kernel.
     """
-    ...
 
 
 @compile_ops(
@@ -327,10 +326,10 @@ def _fused_qk_norm_rope_group_quant_kernel(
     eps: float,
     is_neox: bool,
     # q_weight: optional per-channel RMSNorm weight for Q [head_dim]. None = weightless (V4-Pro).
-    q_weight: Optional[Tensor] = None,
+    q_weight: Tensor | None = None,
     # q_scale: legacy separate Q scale (unused on the fp8 inline path; scale is written
     #   into q_nope_scale_buff at bytes [nope_dim : nope_dim+2*num_nope_groups), each tile-scale x2).
-    q_scale: Optional[Tensor] = None,
+    q_scale: Tensor | None = None,
     # quant_group_size: 1xG block-scale width for Q. Must be one of {32, 64, 128} and divide head_dim.
     # Ignored when q_nope_scale_buff is bf16.
     quant_group_size: int = 64,
@@ -338,17 +337,21 @@ def _fused_qk_norm_rope_group_quant_kernel(
     scale_dtype: str = "e8m0",
     # q_rope_buff: rotated Q-PE bf16 [num_tokens, num_heads, pe_dim]; required when Q is fp8
     #   (fp8 Q mirrors K: nope fp8 + inline dup e8m0 scale in q_nope_scale_buff, PE bf16 here). None for bf16 Q.
-    q_rope_buff: Optional[Tensor] = None,
-    # --- Optional fused SWA ring-cache write (decode-only) ---
-    # swa_nope_scale_buff: ring [num_slots, cache_size, entry] mirroring k_nope_scale_buff
-    #   (same nope fp8 + inline-scale layout/dtype). swa_rope_buff: ring [num_slots, cache_size, pe_dim] bf16.
-    # state_slot_mapping: [bs] int32 per-seq ring slot. batch_id_per_token: [num_tokens] int32,
-    #   token->seq (-1 = CG-pad, skipped). K row -> swa_*[slot, positions[t] % cache_size, :].
-    # All four together or all None.
-    swa_nope_scale_buff: Optional[Tensor] = None,
-    swa_rope_buff: Optional[Tensor] = None,
-    state_slot_mapping: Optional[Tensor] = None,
-    batch_id_per_token: Optional[Tensor] = None,
+    q_rope_buff: Tensor | None = None,
+    # --- Optional fused SWA write (decode-only) ---
+    # swa_nope_scale_buff [num_rows, entry] / swa_rope_buff [num_rows, pe_dim],
+    # addressed either by swa_block_tables[bid, positions[t] // swa_block_size]
+    # (paged) or by swa_dest_row[t] (rows the caller computed itself, for a
+    # window whose layout this kernel need not know). Pass exactly one.
+    # Both modes still skip a token whose positions[t] is negative: the caller
+    # owns the row, not the staleness test.
+    # batch_id_per_token maps token->seq (-1 = CG-pad, skipped).
+    swa_nope_scale_buff: Tensor | None = None,
+    swa_rope_buff: Tensor | None = None,
+    swa_block_tables: Tensor | None = None,
+    swa_dest_row: Tensor | None = None,
+    swa_block_size: int = 0,
+    batch_id_per_token: Tensor | None = None,
 ) -> None: ...
 
 
@@ -364,32 +367,35 @@ def fused_qk_norm_rope_group_quant(
     # q_out_dtype controls whether Q is quantized: fp8 -> Q group-quant (q_scale produced);
     # bf16/fp16 -> Q stays unquantized. Default bf16. Ignored when an explicit `q_nope_scale_buff` is passed (dtype wins).
     q_out_dtype: torch.dtype = torch.bfloat16,
-    q_nope_scale_buff: Optional[
-        Tensor
-    ] = None,  # bf16: [.,H,512] full rotated Q; fp8: [.,H,512] Q nope+scale. dtype decides quant. Alloc if None.
-    q_rope_buff: Optional[
-        Tensor
-    ] = None,  # [num_tokens, num_heads, rot_dim] bf16 rotated Q-PE; only for fp8 Q. Alloc if None.
-    k_nope_scale_buff: Optional[
-        Tensor
-    ] = None,  # [num_tokens, num_kv_heads, 512] fp8 K nope+scale; allocated (zeroed) if None
-    k_rope_buff: Optional[
-        Tensor
-    ] = None,  # [num_tokens, num_kv_heads, rot_dim] bf16 rotated K-PE; allocated if None
-    q_weight: Optional[
-        Tensor
-    ] = None,  # optional per-channel Q RMSNorm weight [head_dim]
+    q_nope_scale_buff: (
+        Tensor | None
+    ) = None,  # bf16: [.,H,512] full rotated Q; fp8: [.,H,512] Q nope+scale. dtype decides quant. Alloc if None.
+    q_rope_buff: (
+        Tensor | None
+    ) = None,  # [num_tokens, num_heads, rot_dim] bf16 rotated Q-PE; only for fp8 Q. Alloc if None.
+    k_nope_scale_buff: (
+        Tensor | None
+    ) = None,  # [num_tokens, num_kv_heads, 512] fp8 K nope+scale; allocated (zeroed) if None
+    k_rope_buff: (
+        Tensor | None
+    ) = None,  # [num_tokens, num_kv_heads, rot_dim] bf16 rotated K-PE; allocated if None
+    q_weight: Tensor | None = None,  # optional per-channel Q RMSNorm weight [head_dim]
     quant_group_size: int = 64,
     scale_dtype: str = "e8m0",
-    # --- Optional fused SWA ring-cache write (decode-only) ---
-    # swa_nope_scale_buff: ring [num_slots, cache_size, entry] mirroring k_nope_scale_buff
-    #   (same nope fp8 + inline-scale layout/dtype). swa_rope_buff: ring [num_slots, cache_size, rot_dim] bf16.
-    # state_slot_mapping: [bs] int32 per-seq ring slot. batch_id_per_token: [num_tokens] int32 (-1 = skip).
-    # All four together or all None. Caller owns the ring buffers (persistent state cache).
-    swa_nope_scale_buff: Optional[Tensor] = None,
-    swa_rope_buff: Optional[Tensor] = None,
-    state_slot_mapping: Optional[Tensor] = None,
-    batch_id_per_token: Optional[Tensor] = None,
+    # --- Optional fused SWA write (decode-only) ---
+    # swa_nope_scale_buff [num_rows, entry] / swa_rope_buff [num_rows, rot_dim],
+    # addressed either by swa_block_tables[bid, positions[t] // swa_block_size]
+    # (paged) or by swa_dest_row[t] (rows the caller computed itself, for a
+    # window whose layout this kernel need not know). Pass exactly one.
+    # Both modes still skip a token whose positions[t] is negative: the caller
+    # owns the row, not the staleness test.
+    # batch_id_per_token maps token->seq (-1 = skip).
+    swa_nope_scale_buff: Tensor | None = None,
+    swa_rope_buff: Tensor | None = None,
+    swa_block_tables: Tensor | None = None,
+    swa_dest_row: Tensor | None = None,
+    swa_block_size: int | None = None,
+    batch_id_per_token: Tensor | None = None,
 ):
     """DeepSeek-V4 fused Q/K RMSNorm + RoPE + group-quant WITHOUT a paged KV cache.
 
@@ -407,7 +413,7 @@ def fused_qk_norm_rope_group_quant(
     ``k_nope_scale_buff`` -- per (token, kv_head), 512 bytes (head_dim=512):
         [0   : 448)  K-nope fp8                                            (448 B)
         [448 : 462)  e8m0 scale, 2*(nope_dim/64)=14 B, each tile-scale x2  (s0,s0,..,s6,s6)
-        [462 : 512)  pad (zero-initialised)                                (50 B)
+        [462 : 512)  pad (uninitialised -- never read by the asm reader)    (50 B)
       The asm reader reads each tile scale TWICE consecutively, hence the x2 duplication.
 
     ``k_rope_buff`` -- per (token, kv_head), rotated K-PE bf16 [rot_dim]    (128 B).
@@ -447,15 +453,12 @@ def fused_qk_norm_rope_group_quant(
             "NoPE size (head_dim - rot_dim) must be divisible by quant_group_size"
         )
     if q_nope_scale_buff is None:
-        # fp8: nope+scale (zeros for the pad); bf16: plain [.,H,512] rotated Q.
-        q_nope_scale_buff = (
-            torch.zeros(
-                (num_tokens, num_heads, head_dim), dtype=dtypes.fp8, device=q.device
-            )
-            if q_is_fp8
-            else torch.empty(
-                (num_tokens, num_heads, head_dim), dtype=q_out_dtype, device=q.device
-            )
+        # dtype = q_out_dtype covers both cases: when q_is_fp8 the buffer is None
+        # so q_is_fp8 == (q_out_dtype == fp8), i.e. q_out_dtype is already fp8
+        # (nope+scale, pad left uninitialised -- asm reader ignores it); otherwise
+        # it is the plain [.,H,512] rotated bf16 Q.
+        q_nope_scale_buff = torch.empty(
+            (num_tokens, num_heads, head_dim), dtype=q_out_dtype, device=q.device
         )
     if q_is_fp8 and q_rope_buff is None:
         q_rope_buff = torch.empty(
@@ -466,9 +469,9 @@ def fused_qk_norm_rope_group_quant(
             None  # bf16 Q: PE stays in q_nope_scale_buff, no separate rope buffer
         )
     if k_nope_scale_buff is None:
-        # zeros: the kernel writes nope[0:nope) + 14 scale bytes; the trailing pad must
-        # read back as zero for the asm reader, so zero-initialise it here.
-        k_nope_scale_buff = torch.zeros(
+        # The kernel writes nope[0:nope) + 14 scale bytes; the trailing pad is
+        # never read by the asm reader, so no zero-init is needed.
+        k_nope_scale_buff = torch.empty(
             (num_tokens, num_kv_heads, k_entry_bytes), dtype=dtypes.fp8, device=q.device
         )
     if k_rope_buff is None:
@@ -494,7 +497,9 @@ def fused_qk_norm_rope_group_quant(
         q_rope_buff=q_rope_buff,
         swa_nope_scale_buff=swa_nope_scale_buff,
         swa_rope_buff=swa_rope_buff,
-        state_slot_mapping=state_slot_mapping,
+        swa_block_tables=swa_block_tables,
+        swa_dest_row=swa_dest_row,
+        swa_block_size=0 if swa_block_size is None else swa_block_size,
         batch_id_per_token=batch_id_per_token,
     )
     return q_nope_scale_buff, q_rope_buff, k_nope_scale_buff, k_rope_buff
@@ -530,6 +535,8 @@ def _fused_qk_norm_rope_2way_fp8_perhead_quant_kernel(
     k_descale: Tensor,
     q_unquantized: Tensor,
     k_unquantized: Tensor,
+    q_partial_amax: Tensor,
+    k_partial_amax: Tensor,
 ) -> None: ...
 
 
@@ -552,8 +559,8 @@ def fused_qk_norm_rope_2way_fp8_perhead_quant(
     head_size: int,
     is_interleaved: bool,
     eps: float,
-    out_q01: Optional[Tensor] = None,
-    out_k01: Optional[Tensor] = None,
+    out_q01: Tensor | None = None,
+    out_k01: Tensor | None = None,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
     """Same as the pertensor variant, but with per-(batch, head) descales.
 
@@ -601,6 +608,17 @@ def fused_qk_norm_rope_2way_fp8_perhead_quant(
         )
     )
 
+    # Per-warp amax scratch (written once per warp, no atomics) allocated here on
+    # the Python side (torch caching allocator) and passed into the kernel, so the
+    # C++ side never allocates device memory itself.
+    total_warps = total_tokens * (num_heads_q + num_heads_k)
+    q_partial_amax = torch.empty(
+        (batch_size, total_warps), dtype=torch.float32, device=q0.device
+    )
+    k_partial_amax = torch.empty(
+        (batch_size, total_warps), dtype=torch.float32, device=q0.device
+    )
+
     _fused_qk_norm_rope_2way_fp8_perhead_quant_kernel(
         q0,
         k0,
@@ -626,11 +644,138 @@ def fused_qk_norm_rope_2way_fp8_perhead_quant(
         k_descale,
         q_unquantized,
         k_unquantized,
+        q_partial_amax,
+        k_partial_amax,
     )
 
     if not want_bf16:
         q_unquantized = torch.empty(0, dtype=q0.dtype, device=q0.device)
         k_unquantized = torch.empty(0, dtype=k0.dtype, device=k0.device)
+
+    return q_fp8, k_fp8, q_descale, k_descale, q_unquantized, k_unquantized
+
+
+@compile_ops(
+    "module_fused_qk_norm_rope_cache_quant_shuffle",
+    fc_name="fused_qk_norm_rope_1way_fp8_perhead_quant",
+    develop=True,
+)
+def _fused_qk_norm_rope_1way_fp8_perhead_quant_kernel(
+    q: Tensor,
+    k: Tensor,
+    w_q: Tensor,
+    w_k: Tensor,
+    cos_sin: Tensor,
+    batch_size: int,
+    num_tokens: int,
+    num_heads_q: int,
+    num_heads_k: int,
+    head_size: int,
+    is_interleaved: bool,
+    eps: float,
+    q_fp8: Tensor,
+    k_fp8: Tensor,
+    q_descale: Tensor,
+    k_descale: Tensor,
+    q_unquantized: Tensor,
+    k_unquantized: Tensor,
+    q_partial_amax: Tensor,
+    k_partial_amax: Tensor,
+) -> None: ...
+
+
+def fused_qk_norm_rope_1way_fp8_perhead_quant(
+    q: Tensor,
+    k: Tensor,
+    w_q: Tensor,
+    w_k: Tensor,
+    cos_sin: Tensor,
+    batch_size: int,
+    num_tokens: int,
+    num_heads_q: int,
+    num_heads_k: int,
+    head_size: int,
+    is_interleaved: bool,
+    eps: float,
+    out_q: Tensor | None = None,
+    out_k: Tensor | None = None,
+) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+    """Z-Image single-stream fused RoPE+RMSNorm with per-(batch, head) FP8 Q/K."""
+    want_bf16 = out_q is not None or out_k is not None
+    fp8_dtype = get_dtype_fp8()
+
+    q_fp8 = torch.empty(
+        (batch_size, num_tokens, num_heads_q, head_size),
+        dtype=fp8_dtype,
+        device=q.device,
+    )
+    k_fp8 = torch.empty(
+        (batch_size, num_tokens, num_heads_k, head_size),
+        dtype=fp8_dtype,
+        device=k.device,
+    )
+    q_descale = torch.empty(
+        (batch_size, num_heads_q), dtype=torch.float32, device=q.device
+    )
+    k_descale = torch.empty(
+        (batch_size, num_heads_k), dtype=torch.float32, device=k.device
+    )
+    q_unquantized = (
+        out_q
+        if out_q is not None
+        else torch.empty(
+            (batch_size, num_tokens, num_heads_q, head_size),
+            dtype=q.dtype,
+            device=q.device,
+        )
+    )
+    k_unquantized = (
+        out_k
+        if out_k is not None
+        else torch.empty(
+            (batch_size, num_tokens, num_heads_k, head_size),
+            dtype=k.dtype,
+            device=k.device,
+        )
+    )
+
+    # Per-warp amax scratch (written once per warp, no atomics) allocated here on
+    # the Python side (torch caching allocator) and passed into the kernel, so the
+    # C++ side never allocates device memory itself.
+    total_warps = num_tokens * (num_heads_q + num_heads_k)
+    q_partial_amax = torch.empty(
+        (batch_size, total_warps), dtype=torch.float32, device=q.device
+    )
+    k_partial_amax = torch.empty(
+        (batch_size, total_warps), dtype=torch.float32, device=q.device
+    )
+
+    _fused_qk_norm_rope_1way_fp8_perhead_quant_kernel(
+        q,
+        k,
+        w_q,
+        w_k,
+        cos_sin,
+        batch_size,
+        num_tokens,
+        num_heads_q,
+        num_heads_k,
+        head_size,
+        is_interleaved,
+        eps,
+        q_fp8,
+        k_fp8,
+        q_descale,
+        k_descale,
+        q_unquantized,
+        k_unquantized,
+        q_partial_amax,
+        k_partial_amax,
+    )
+
+    if not want_bf16:
+        q_unquantized = torch.empty(0, dtype=q.dtype, device=q.device)
+        k_unquantized = torch.empty(0, dtype=k.dtype, device=k.device)
 
     return q_fp8, k_fp8, q_descale, k_descale, q_unquantized, k_unquantized
 
@@ -722,7 +867,7 @@ def fused_kv_norm_rope_group_quant(
         raise ValueError(
             f"kv must be 2D [T,D] or 3D [T,NK,D]; got rank {kv.dim()} shape={tuple(kv.shape)}"
         )
-    num_tokens, num_kv_heads, head_dim = kv_3d.shape
+    _num_tokens, _num_kv_heads, head_dim = kv_3d.shape
     rot_dim = cos_cache.shape[-1] * 2
     nope_dim = head_dim - rot_dim
     if nope_dim <= 0:
@@ -761,6 +906,7 @@ def _v_2way_per_head_fp8_quant_kernel(
     v1: Tensor,
     v_fp8: Tensor,
     v_descale: Tensor,
+    v_amax: Tensor,
 ) -> None: ...
 
 
@@ -779,5 +925,43 @@ def v_2way_per_head_fp8_quant(v0: Tensor, v1: Tensor) -> tuple[Tensor, Tensor]:
     v_descale = torch.empty(
         (batch_size, num_heads), dtype=torch.float32, device=v0.device
     )
-    _v_2way_per_head_fp8_quant_kernel(v0, v1, v_fp8, v_descale)
+    # v_amax is accumulated with atomic max in the kernel, so it must be
+    # zero-initialized. Allocated here (torch caching allocator) and passed in.
+    v_amax = torch.zeros((batch_size, num_heads), dtype=torch.float32, device=v0.device)
+    _v_2way_per_head_fp8_quant_kernel(v0, v1, v_fp8, v_descale, v_amax)
+    return v_fp8, v_descale
+
+
+@compile_ops(
+    "module_fused_qk_norm_rope_cache_quant_shuffle",
+    fc_name="v_1way_per_head_fp8_quant",
+    develop=True,
+)
+def _v_1way_per_head_fp8_quant_kernel(
+    v: Tensor,
+    v_fp8: Tensor,
+    v_descale: Tensor,
+    v_amax: Tensor,
+) -> None: ...
+
+
+def v_1way_per_head_fp8_quant(v: Tensor) -> tuple[Tensor, Tensor]:
+    """Per-(batch, head) FP8 quant for single-stream V [B, T, H, D]."""
+    batch_size = v.size(0)
+    num_heads = v.size(2)
+    head_size = v.size(3)
+    num_tokens = v.size(1)
+    fp8_dtype = get_dtype_fp8()
+    v_fp8 = torch.empty(
+        (batch_size, num_tokens, num_heads, head_size),
+        dtype=fp8_dtype,
+        device=v.device,
+    )
+    v_descale = torch.empty(
+        (batch_size, num_heads), dtype=torch.float32, device=v.device
+    )
+    # v_amax is accumulated with atomic max in the kernel, so it must be
+    # zero-initialized. Allocated here (torch caching allocator) and passed in.
+    v_amax = torch.zeros((batch_size, num_heads), dtype=torch.float32, device=v.device)
+    _v_1way_per_head_fp8_quant_kernel(v, v_fp8, v_descale, v_amax)
     return v_fp8, v_descale

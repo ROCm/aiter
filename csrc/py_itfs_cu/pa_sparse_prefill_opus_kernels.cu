@@ -147,7 +147,7 @@ void pa_sparse_prefill_fp8_opus_fwd(aiter_tensor_t& q_nope,
 {
     // Single compiled configuration: split NoPE fp8 (448 + 14 E8M0 scales + pad
     // = 512 fp8 slots/row) and RoPE bf16 (64), D_HEAD = 512.
-    using Traits = pa_16mx1_16nx4_fp8_traits<16, 64, 640, 4, fp8_t, bf16_t, bf16_t>;
+    using Traits = pa_16mx1_16nx4_fp8_traits<16, 64, 4, fp8_t, bf16_t, bf16_t>;
     constexpr int D_NOPE_PADDED = Traits::D_NOPE_PADDED_SIZE; // 512
     constexpr int D_ROPE        = Traits::D_ROPE_SIZE;        // 64
     constexpr int D_HEAD        = Traits::D_HEAD_SIZE;        // 512
@@ -262,9 +262,21 @@ void pa_sparse_prefill_fp8_opus_fwd(aiter_tensor_t& q_nope,
     HipDeviceGuard guard(q_nope.device_id);
     const hipStream_t stream = aiter::getCurrentHIPStream();
 
-    const int num_h_blocks = ceil_div(H, Traits::Q_TILE_SIZE * Traits::T_M);
-    dim3 grid(N, num_h_blocks, 1);
-    dim3 block(Traits::BLOCK_SIZE);
-    pa_prefill_16mx1_16nx4_fp8_kernel<Traits><<<grid, block, 0, stream>>>(kargs);
-    HIP_CALL_LAUNCH(hipGetLastError());
+#define LAUNCH_PA_PREFILL_FP8(KERNEL, TRAITS, KV_TILE, NUM_WARPS)                  \
+    do {                                                                          \
+        using KTraits = TRAITS<16, KV_TILE, NUM_WARPS, fp8_t, bf16_t, bf16_t>;    \
+        const int num_h_blocks = ceil_div(H, KTraits::Q_TILE_SIZE * KTraits::T_M);\
+        dim3 grid(N, num_h_blocks, 1);                                            \
+        dim3 block(KTraits::BLOCK_SIZE);                                          \
+        KERNEL<KTraits><<<grid, block, 0, stream>>>(kargs);                       \
+        HIP_CALL_LAUNCH(hipGetLastError());                                       \
+    } while(0)
+
+    // 16mx8_32nx1 (T_M=NUM_WARPS) for H > 32; 16mx1_16nx4 (T_M=1) for H <= 32.
+    if(H <= 32)
+        LAUNCH_PA_PREFILL_FP8(pa_prefill_16mx1_16nx4_fp8_kernel, pa_16mx1_16nx4_fp8_traits, 64, 4);
+    else
+        LAUNCH_PA_PREFILL_FP8(pa_prefill_16mx8_32nx1_fp8_kernel, pa_16mx8_32nx1_fp8_traits, 32, 8);
+
+#undef LAUNCH_PA_PREFILL_FP8
 }
