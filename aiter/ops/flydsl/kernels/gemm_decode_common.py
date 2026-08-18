@@ -1029,7 +1029,7 @@ def mfma_4x4x4_bf16(a_fragment, b_fragment, accumulator):
         raw(accumulator),
         0,
         0,
-        0,
+        fx.rocdl._blgp_attr(0),
     )
 
 
