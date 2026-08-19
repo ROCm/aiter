@@ -282,9 +282,6 @@ def pa_decode_sparse(
     # mismatches between 2D (m/l) and 3D (acc) loads.
     reduce_num_warps = 1 if use_gluon else 4
     reduce_waves_per_eu = 4 if use_gluon else 1
-    _rw = _os.environ.get("AITER_PA_DECODE_REDUCE_WARPS")
-    if _rw and use_gluon:
-        reduce_num_warps = int(_rw)
     USE_EXP2 = True
 
     # Infer KV_SPLITS from inputs when caller doesn't override.
