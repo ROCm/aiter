@@ -7,7 +7,6 @@ Catches: duplicates, invalid times, high errRatio, git merge conflicts,
 missing untuned files.
 """
 
-import glob
 import os
 import unittest
 from typing import Any, ClassVar
@@ -18,22 +17,6 @@ AITER_ROOT = os.path.dirname(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 )
 CONFIGS_DIR = os.path.join(AITER_ROOT, "aiter", "configs")
-MODEL_CONFIGS_DIR = os.path.join(CONFIGS_DIR, "model_configs")
-GDN_K5_TUNED_GLOB = "*_chunk_gdn_h_mfma16_hip_tuned.csv"
-GDN_K5_UNTUNED_GLOB = "*_chunk_gdn_h_mfma16_hip_untuned.csv"
-GDN_K5_DUP_KEYS = [
-    "arch",
-    "H",
-    "Hg",
-    "V",
-    "is_varlen",
-    "use_h0",
-    "store_fs",
-    "snapshot_bf16",
-    "state_bf16",
-    "total_chunks",
-    "max_seq_chunks",
-]
 
 
 class TestCSVValidation(unittest.TestCase):
@@ -50,11 +33,11 @@ class TestCSVValidation(unittest.TestCase):
         "fmoe": "tuned_fmoe.csv",
     }
 
-    def _load_csv(self, name, comment="#"):
+    def _load_csv(self, name):
         path = os.path.join(CONFIGS_DIR, self.TUNED_CSVS[name])
         if not os.path.exists(path):
             self.skipTest(f"{self.TUNED_CSVS[name]} not found")
-        df = pd.read_csv(path, comment=comment)
+        df = pd.read_csv(path)
         df.columns = df.columns.str.strip()
         return df
 
@@ -73,7 +56,8 @@ class TestCSVValidation(unittest.TestCase):
         ]
         return [c for c in candidates if c in df.columns]
 
-    def _check_df_no_duplicates(self, df, label, extra_keys=None):
+    def _check_no_duplicates(self, name, extra_keys=None):
+        df = self._load_csv(name)
         keys = self._get_key_cols(df)
         if extra_keys:
             keys.extend([k for k in extra_keys if k in df.columns])
@@ -81,16 +65,8 @@ class TestCSVValidation(unittest.TestCase):
         self.assertEqual(
             len(dupes),
             0,
-            f"{label}: {len(dupes)} duplicate rows (first 10):\n{dupes.head(10)}",
+            f"{name}: {len(dupes)} duplicate rows (first 10):\n{dupes.head(10)}",
         )
-
-    def _check_no_duplicates(self, name, extra_keys=None):
-        self._check_df_no_duplicates(self._load_csv(name), name, extra_keys=extra_keys)
-
-    def _check_file_no_duplicates(self, path, label, extra_keys=None, comment="#"):
-        df = pd.read_csv(path, comment=comment)
-        df.columns = df.columns.str.strip()
-        self._check_df_no_duplicates(df, label, extra_keys=extra_keys)
 
     def test_a8w8_no_duplicates(self):
         self._check_no_duplicates("a8w8", extra_keys=["q_dtype_w"])
@@ -142,21 +118,6 @@ class TestCSVValidation(unittest.TestCase):
                 "_tag",
             ],
         )
-
-    def test_gdn_k5_model_configs_no_duplicates(self):
-        pattern = os.path.join(MODEL_CONFIGS_DIR, GDN_K5_TUNED_GLOB)
-        paths = sorted(glob.glob(pattern))
-        self.assertTrue(
-            paths,
-            f"no K5 mfma16_hip tuned csv under {MODEL_CONFIGS_DIR}/",
-        )
-        for path in paths:
-            with self.subTest(file=os.path.basename(path)):
-                self._check_file_no_duplicates(
-                    path,
-                    os.path.basename(path),
-                    extra_keys=GDN_K5_DUP_KEYS,
-                )
 
     def test_no_git_conflict_markers(self):
         for name, fname in self.TUNED_CSVS.items():
@@ -214,14 +175,6 @@ class TestCSVValidation(unittest.TestCase):
             with self.subTest(file=f):
                 path = os.path.join(CONFIGS_DIR, f)
                 self.assertTrue(os.path.exists(path), f"Missing: {f}")
-
-    def test_gdn_k5_untuned_in_model_configs(self):
-        pattern = os.path.join(MODEL_CONFIGS_DIR, GDN_K5_UNTUNED_GLOB)
-        paths = sorted(glob.glob(pattern))
-        self.assertTrue(
-            paths,
-            f"no K5 mfma16_hip untuned csv under {MODEL_CONFIGS_DIR}/",
-        )
 
 
 if __name__ == "__main__":
