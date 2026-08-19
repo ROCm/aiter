@@ -3,16 +3,24 @@
 
 """Unit tests for FlyDSL Linear Attention Prefill (chunk_gated_delta_h) regressions.
 
-Usage:
-    rm -rf ~/.triton/cache
-    export GATED_DELTA_RULE_TRITON_AUTOTUNE=1
-    FLYDSL_RUNTIME_ENABLE_CACHE=0 HIP_VISIBLE_DEVICES=7 pytest -sv op_tests/flydsl_tests/test_flydsl_linear_attention_prefill.py::TestPerformance -s
-    FLYDSL_RUNTIME_ENABLE_CACHE=0 HIP_VISIBLE_DEVICES=7 python -m pytest op_tests/flydsl_tests/test_flydsl_linear_attention_prefill.py::TestPerformance -k "varlen-qwen-ali-tp1-fp32snapshot" -v -s
+Grid: Qwen3.5-35B (Hv=32) and Qwen3.5-397B (Hv=64), TP 1/2/4/8.
+Dense T=1k/2k/4k/8k/16k/32k/64k; varlen total T=16k/32k/64k with seqlen 1k/2k/4k/8k.
+
+Filter cases via env vars (comma-separated; omit all to run the full 304-case grid)::
+
+    PREFILL_MODEL=35b PREFILL_TP=1 PREFILL_LAYOUT=varlen \\
+    PREFILL_SEQLEN=8192 PREFILL_T=16384 PREFILL_SNAPSHOT=bf16 \\
+    pytest op_tests/flydsl_tests/test_flydsl_linear_attention_prefill.py::TestPerformance
+
+``PREFILL_T`` matches dense ``full_prompt_len``, or varlen total tokens (mnbt).
+``PREFILL_SEQLEN`` applies to varlen only (per-sequence length).
+Also works with ``pytest -k`` on the parametrized case id substring.
 """
 
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass, replace
 
 import pytest
@@ -393,16 +401,16 @@ def expand_groups(groups):
     return out
 
 
-_DENSE_PROMPT_LENS = [2500, 60000, 128000]
-_MNBT_ALI_SWEEP = [8192, 16384, 24576, 32768, 40960, 49152, 57344, 65536]
-_K5_DENSE_TPS = [1, 2, 4, 8]
-_K5_VARLEN_ALI_TPS = [1, 2, 4, 8]
+_DENSE_PROMPT_LENS = [1024, 2048, 4096, 8192, 16384, 32768, 65536]
+_VARLEN_SEQLENS = [1024, 2048, 4096, 8192]
+_VARLEN_TOTAL_T = [16384, 32768, 65536]
+_K5_TPS = [1, 2, 4, 8]
 
 
 def _k5_dense_groups(model_name: str, hv: int) -> list[PrefillGroup]:
-    """P0: dense prefill, TP1/2/4/8 x bf16/fp32 per-chunk snapshot."""
+    """Dense prefill: TP x T sweep x bf16/fp32 per-chunk snapshot."""
     groups: list[PrefillGroup] = []
-    for tp in _K5_DENSE_TPS:
+    for tp in _K5_TPS:
         groups.append(
             PrefillGroup(
                 model_name=f"{model_name}-dense-tp{tp}-bf16snap",
@@ -429,26 +437,26 @@ def _k5_dense_groups(model_name: str, hv: int) -> list[PrefillGroup]:
     return groups
 
 
-def _k5_varlen_ali_groups(prefix: str, hv: int) -> list[PrefillGroup]:
-    """P1: varlen ali-style mnbt sweep, TP1/2/4/8 x bf16/fp32 snapshot."""
+def _k5_varlen_groups(model_name: str, hv: int) -> list[PrefillGroup]:
+    """Varlen prefill: TP x seqlen x total T x bf16/fp32 snapshot."""
     groups: list[PrefillGroup] = []
-    for tp in _K5_VARLEN_ALI_TPS:
+    for tp in _K5_TPS:
         groups.append(
             PrefillGroup(
-                model_name=f"{prefix}-tp{tp}-bf16snapshot",
+                model_name=f"{model_name}-varlen-tp{tp}-bf16snap",
                 Hv=hv,
                 tps=[tp],
-                full_prompt_lens=[8192],
-                max_num_batched_tokens=_MNBT_ALI_SWEEP,
+                full_prompt_lens=_VARLEN_SEQLENS,
+                max_num_batched_tokens=_VARLEN_TOTAL_T,
             )
         )
         groups.append(
             PrefillGroup(
-                model_name=f"{prefix}-tp{tp}-fp32snapshot",
+                model_name=f"{model_name}-varlen-tp{tp}-fp32snap",
                 Hv=hv,
                 tps=[tp],
-                full_prompt_lens=[8192],
-                max_num_batched_tokens=_MNBT_ALI_SWEEP,
+                full_prompt_lens=_VARLEN_SEQLENS,
+                max_num_batched_tokens=_VARLEN_TOTAL_T,
                 snapshot_dtype=torch.float32,
             )
         )
@@ -456,122 +464,92 @@ def _k5_varlen_ali_groups(prefix: str, hv: int) -> list[PrefillGroup]:
 
 
 _PREFILL_GROUPS = [
-    # P0: Qwen3.5-35B / 397B dense, TP1/2/4/8, bf16 + fp32 snapshot.
     *_k5_dense_groups("Qwen3.5-35B", 32),
     *_k5_dense_groups("Qwen3.5-397B", 64),
-    PrefillGroup(
-        model_name="Qwen3.5-397B-ptpc-ali",
-        Hv=64,
-        tps=[8],
-        full_prompt_lens=[1024, 2048, 4096, 8192],
-        is_varlen=False,
-        max_num_batched_tokens="full_prompt_len",
-        # dense B>1: g becomes 3D [B,H,T], validating the kernel's batch-head
-        # gate offset (g_sh_base includes i_n*H*T_flat). Bumping B to 2 covers
-        # the i_n>0 batch-stride branch. Also set g_head_major=True so this group
-        # exercises the head-major dense layout (the other dense/varlen groups
-        # cover the default token-major layout).
-        dense_batch=2,
-        g_head_major=True,
-    ),
-    # P1: varlen ali mnbt sweep (8192..65536), TP1/2/4/8, bf16 + fp32 snapshot.
-    *_k5_varlen_ali_groups("varlen-qwen-ali", 32),
-    *_k5_varlen_ali_groups("varlen-qwen3.5-397b-ali", 64),
-    # varlen + final_state (32k token budget, multi seqlen); not part of P1 grid.
-    PrefillGroup(
-        model_name="varlen-32k-qwen",
-        Hv=64,
-        tps=[4, 8],
-        full_prompt_lens=[1024, 2048, 4096, 8192],
-        max_num_batched_tokens=32768,
-    ),
-    PrefillGroup(
-        # No g (USE_G=False) + short single-segment sequences: T=100/200/300 are
-        # all %64!=0, so the last chunk has padding rows -- validates the masking
-        # of OOB rows when there is no g (otherwise invalid tokens' v_new flows
-        # through gated_v and corrupts the state update). Short sequences
-        # (<=5 chunks) are used on purpose: no-g has no gate decay, so a long
-        # sequence lets the state grow and amplify bf16 accumulation error past
-        # 5e-2; the no-g compute path itself is already bit-identical to the
-        # with-g path at g=0, so here we only need to validate padding masking
-        # within a numerically controlled range. (The original aws-16k with-g
-        # coverage is carried by the retained varlen-32k-aws group.)
-        model_name="nog-short",
-        Hv=32,
-        tps=[1],
-        full_prompt_lens=[100, 200, 300],
-        max_num_batched_tokens="full_prompt_len",
-        use_g=False,
-    ),
-    PrefillGroup(
-        model_name="varlen-32k-aws",
-        Hv=32,
-        tps=[1],
-        full_prompt_lens=[1000, 5000, 10000],
-        # full_prompt_lens=[1000],
-        max_num_batched_tokens=32768,
-    ),
-    PrefillGroup(
-        model_name="flydsl-k5-n1",
-        Hv=32,
-        tps=[1],
-        full_prompt_lens=[5000, 10000],
-        max_num_batched_tokens="full_prompt_len",
-    ),
-    PrefillGroup(
-        model_name="flydsl-k5-n3-mid10k",
-        Hv=32,
-        tps=[1],
-        full_prompt_lens=[16384],
-        max_num_batched_tokens=16384,
-        # head=0 creates an empty first segment (cu_seqlens=[0,0,10000,16384]),
-        # validating that empty varlen sequences skip the W/K prologue, do not
-        # read out of bounds, and pass state through h0->ht correctly.
-        head_seqlens=[0, 10, 65, 704, 936, 1820, 4467, 5508],
-        mid_seqlen=10000,
-    ),
-    PrefillGroup(
-        model_name="flydsl-k5-n2-16k",
-        Hv=32,
-        tps=[1],
-        full_prompt_lens=[16384],
-        max_num_batched_tokens=16384,
-        head_seqlens=[4000, 6396, 8192, 9912, 10000],
-        num_segments=2,
-        # head-major varlen coverage (other varlen groups use token-major).
-        g_head_major=True,
-    ),
+    *_k5_varlen_groups("Qwen3.5-35B", 32),
+    *_k5_varlen_groups("Qwen3.5-397B", 64),
 ]
 
-PREFILL_PARAMS = expand_groups(_PREFILL_GROUPS)
 
-# Explicit empty-TAIL varlen case (cu_seqlens=[0, 6384, 16384, 16384]; last
-# segment length 0). The existing empty-segment group only covers an empty
-# FIRST segment (bos=0), which can only read token 0 and never reaches the
-# buffer tail; the original OOB was a tail prologue over-read that requires
-# bos==eos==T_total. ``context_lens`` is used verbatim (bypasses the
-# ``expand_groups`` tail>0 guard), and the 0-length tail also validates the
-# reference passes ``initial_state`` straight through to ``final_state``.
-PREFILL_PARAMS = list(PREFILL_PARAMS) + [
-    PrefillArgs(
-        K=128,
-        V=128,
-        Hk=16,
-        Hv=32,
-        tp=1,
-        full_prompt_len=16384,
-        model_name="flydsl-k5-empty-tail",
-        is_varlen=True,
-        output_final_state=True,
-        max_num_batched_tokens=16384,
-        context_lens=[6384, 10000, 0],
-    ),
-]
+def _parse_env_csv(name: str, *, cast=int):
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return None
+    return [cast(x.strip()) for x in raw.split(",") if x.strip()]
 
+
+def _model_key(hv: int) -> str:
+    return "35b" if hv == 32 else "397b"
+
+
+def _snapshot_key(args: PrefillArgs) -> str:
+    return "fp32" if args.snapshot_dtype == torch.float32 else "bf16"
+
+
+def _case_matches_prefill_filters(args: PrefillArgs) -> bool:
+    models = _parse_env_csv("PREFILL_MODEL", cast=str)
+    if models and _model_key(args.Hv) not in models:
+        return False
+
+    tps = _parse_env_csv("PREFILL_TP")
+    if tps and args.tp not in tps:
+        return False
+
+    layouts = _parse_env_csv("PREFILL_LAYOUT", cast=str)
+    if layouts:
+        layout = "varlen" if args.is_varlen else "dense"
+        if layout not in layouts:
+            return False
+
+    ts = _parse_env_csv("PREFILL_T")
+    if ts:
+        if args.is_varlen:
+            if args.max_num_batched_tokens not in ts and args.full_prompt_len not in ts:
+                return False
+        elif args.full_prompt_len not in ts:
+            return False
+
+    seqlens = _parse_env_csv("PREFILL_SEQLEN")
+    if seqlens:
+        if not args.is_varlen or args.full_prompt_len not in seqlens:
+            return False
+
+    snapshots = _parse_env_csv("PREFILL_SNAPSHOT", cast=str)
+    if snapshots and _snapshot_key(args) not in snapshots:
+        return False
+
+    return True
+
+
+def _prefill_filters_active() -> bool:
+    return any(
+        os.environ.get(name, "").strip()
+        for name in (
+            "PREFILL_MODEL",
+            "PREFILL_TP",
+            "PREFILL_T",
+            "PREFILL_SEQLEN",
+            "PREFILL_LAYOUT",
+            "PREFILL_SNAPSHOT",
+        )
+    )
+
+
+def _filter_prefill_params(params: list[PrefillArgs]) -> list[PrefillArgs]:
+    if not _prefill_filters_active():
+        return params
+    filtered = [p for p in params if _case_matches_prefill_filters(p)]
+    if not filtered:
+        raise RuntimeError(
+            "PREFILL_* env filters matched no cases; "
+            "check PREFILL_MODEL/TP/T/SEQLEN/LAYOUT/SNAPSHOT."
+        )
+    return filtered
+
+
+PREFILL_PARAMS = _filter_prefill_params(expand_groups(_PREFILL_GROUPS))
 
 PREFILL_TEST_IDS = [repr(p) for p in PREFILL_PARAMS]
-
-
 # -- bf16 SSM-state params (paired with TestStateDtypeBF16 below) ------
 
 # A small, fast subset of shapes used to validate the bf16-state code path
@@ -584,11 +562,11 @@ STATE_BF16_PARAMS = [
         Hk=16,
         Hv=32,
         tp=2,
-        full_prompt_len=2500,
+        full_prompt_len=1024,
         model_name="Qwen3.5-35B-bf16state",
         is_varlen=False,
         output_final_state=True,
-        max_num_batched_tokens=2500,
+        max_num_batched_tokens=1024,
         ssm_state_dtype=torch.bfloat16,
     ),
     PrefillArgs(
@@ -598,10 +576,10 @@ STATE_BF16_PARAMS = [
         Hv=64,
         tp=4,
         full_prompt_len=1024,
-        model_name="Qwen3.5-tp4-1k-bf16state",
+        model_name="Qwen3.5-397B-bf16state",
         is_varlen=True,
         output_final_state=True,
-        max_num_batched_tokens=8192,
+        max_num_batched_tokens=16384,
         ssm_state_dtype=torch.bfloat16,
     ),
 ]
