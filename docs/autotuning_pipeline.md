@@ -43,7 +43,6 @@ Based on this, we provide two CI paths: one for generating tuned CSVs on demand,
     2. It mirrors the tuning test plan in `op_tests/tuning_tests/README.md`:
         - Level 0+1:
           - `test_csv_validation.py`
-          - `test_config_shape_collision.py`
           - `test_tuner_infra.py`
           - `test_mp_tuner_logic.py`
         - Level 2 pipeline:
