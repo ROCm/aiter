@@ -52,7 +52,8 @@ def launch_gemm_a8w8_256x256(
     block_size: Constexpr[int],
     split_k: Constexpr[int] = 1,
 ):
-    """N must divide 1024; M is unrestricted; K divides 128 and is at least 512."""
+    """N must be a multiple of ``tile_n * cluster_n``; M is unrestricted;
+    K must be divisible by 128 and at least 512 per split."""
 
     assert (tile_m, tile_n, tile_k, m_warp, n_warp, num_buffers) in (
         (256, 256, 128, 2, 2, 4),

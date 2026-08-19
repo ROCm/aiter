@@ -50,7 +50,7 @@ _COMPUTE_PROFILES = (
     (128, 256, 128, 2, 2, 4),
     (128, 256, 128, 2, 2, 3),
 )
-_COMPUTE_CLUSTERS = ((2, 2), (4, 2), (2, 4), (4, 4))
+_COMPUTE_CLUSTERS = ((2, 2), (4, 2), (2, 4), (4, 4), (1, 4))
 _COMPUTE_MIN_K_PER_SPLIT = 512
 
 _CLUSTER_MIN_DIM = 8192
@@ -87,6 +87,14 @@ def _align_up(value: int, align: int) -> int:
 
 def _ceil_div(a: int, b: int) -> int:
     return (a + b - 1) // b
+
+
+def cluster_m_grid_ok_for_tuning(M: int, tile_m: int, cluster_m: int) -> bool:
+    if not cluster_m_grid_ok(M, tile_m, cluster_m):
+        return False
+    if cluster_m == 1:
+        return True
+    return _ceil_div(M // 2 + 1, tile_m) == _ceil_div(M, tile_m)
 
 
 def _tile_valid(tm: int, tn: int, tk: int, mw: int, nw: int) -> bool:
@@ -213,7 +221,7 @@ def kernel_fits_shape(ki: WmmaKernelInstance, M: int, N: int, K: int) -> bool:
             return False
         if N % (ki.tile_n * ki.cluster_n) != 0:
             return False
-        if not cluster_m_grid_ok(M, ki.tile_m, ki.cluster_m):
+        if not cluster_m_grid_ok_for_tuning(M, ki.tile_m, ki.cluster_m):
             return False
         if K % ki.split_k != 0:
             return False
@@ -246,7 +254,7 @@ def kernel_fits_shape(ki: WmmaKernelInstance, M: int, N: int, K: int) -> bool:
     if ki.cluster_m > 1:
         if M < _CLUSTER_MIN_DIM or m_blocks < _CLUSTER_MIN_TILES:
             return False
-        if not cluster_m_grid_ok(M, ki.tile_m, ki.cluster_m):
+        if not cluster_m_grid_ok_for_tuning(M, ki.tile_m, ki.cluster_m):
             return False
     if ki.cluster_n > 1:
         if N < _CLUSTER_MIN_DIM or n_blocks < _CLUSTER_MIN_TILES:
