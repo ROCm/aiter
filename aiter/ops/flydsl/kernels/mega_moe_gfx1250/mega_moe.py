@@ -16,12 +16,14 @@ from aiter.ops.flydsl.moe_common import GateMode
 
 from .combine import _make_combine_fused_reduce, _make_combine_fused_sync
 from .config import _WAVE_SIZE, _select_dispatch_config
-from .dispatch import _make_dispatch
+from .dispatch import _make_dispatch, _make_dispatch_tdm, tdm_max_warps, tdm_stage_capacity
 from .types import Stage2ScatterContext, _from_gpu_ptr
 
 __all__ = ["MegaMoEGfx1250"]
 
 _DISPATCH_BACKENDS = ("flydsl", "mori")
+_DISPATCH_TRANSPORTS = ("auto", "vector", "tdm")
+_TDM_STAGE_POOLS: dict[tuple[int, int, int, int], tuple] = {}
 _MAX_WORLD_SIZE = 72
 _MAX_EXPERTS_PER_RANK = 512
 
@@ -65,6 +67,36 @@ def _mori_dispatch_schedule(config) -> tuple:
     if schedule:
         return tuple((bound, block, warp) for bound, block, warp, _, _ in schedule)
     return ((None, tuned["dispatch_block_num"], tuned["warp_num_per_block"]),)
+
+
+def _tdm_stage_pool(device, npes, stg_cap, topk):
+    """Process-wide destTokId staging SoA for TDM dispatch metadata."""
+    key = (torch.cuda.current_device(), int(npes), int(stg_cap), int(topk))
+    hit = _TDM_STAGE_POOLS.get(key)
+    if hit is not None:
+        return hit
+    slots = npes * stg_cap
+    pool = (
+        torch.empty(slots * topk, dtype=torch.int32, device=device),
+        torch.empty(slots * topk, dtype=torch.int32, device=device),
+        torch.empty(slots, dtype=torch.int32, device=device),
+    )
+    _TDM_STAGE_POOLS[key] = pool
+    return pool
+
+
+def _resolve_dispatch_transport(value: str) -> str:
+    if value not in _DISPATCH_TRANSPORTS:
+        raise ValueError(
+            f"dispatch_transport must be one of {_DISPATCH_TRANSPORTS}, got {value!r}"
+        )
+    if value != "auto":
+        return value
+    if os.environ.get("MEGA_MOE_DISPATCH_TDM") == "1" or os.environ.get(
+        "MORI_EP_DISPATCH_TDM"
+    ) == "1":
+        return "tdm"
+    return "vector"
 
 
 class SymmetricArena:
@@ -119,12 +151,18 @@ class MegaMoEStage2Config:
     dispatch_warp_num_per_block: int | None = None
     schedule: tuple | None = None
     dispatch_backend: str = "flydsl"
+    dispatch_transport: str = "auto"
 
     def __post_init__(self):
         if self.dispatch_backend not in _DISPATCH_BACKENDS:
             raise ValueError(
                 f"dispatch_backend must be one of {_DISPATCH_BACKENDS}, "
                 f"got {self.dispatch_backend!r}"
+            )
+        self.dispatch_transport = _resolve_dispatch_transport(self.dispatch_transport)
+        if self.dispatch_backend == "mori" and self.dispatch_transport == "tdm":
+            raise ValueError(
+                "dispatch_transport='tdm' is only supported with dispatch_backend='flydsl'"
             )
         if not 0 <= self.rank < self.world_size:
             raise ValueError(f"rank={self.rank} must be in [0, {self.world_size})")
@@ -151,6 +189,7 @@ class MegaMoEStage2Config:
             self.world_size,
             self.hidden_dim,
             self.topk,
+            dispatch_transport=self.dispatch_transport,
         )
         if self.dispatch_block_num is None:
             self.dispatch_block_num = tuned["dispatch_block_num"]
@@ -211,6 +250,7 @@ class MegaMoEGfx1250:
         situ_beta: torch.Tensor | None = None,
         situ_linear_beta: torch.Tensor | None = None,
         dispatch_backend: str | None = None,
+        dispatch_transport: str | None = None,
     ):
         """Everything here is fixed for the whole model; forward() takes the rest.
 
@@ -313,6 +353,11 @@ class MegaMoEGfx1250:
                     dispatch_backend
                     if dispatch_backend is not None
                     else os.environ.get("MEGA_DISPATCH", "flydsl")
+                ),
+                dispatch_transport=(
+                    dispatch_transport
+                    if dispatch_transport is not None
+                    else os.environ.get("MEGA_MOE_DISPATCH_TRANSPORT", "auto")
                 ),
             ),
             communicator,
@@ -517,8 +562,52 @@ class MegaMoEGfx1250:
                 )
             ]
         self._dispatch_specs = dispatch_specs
+        self._dispatch_transport = config.dispatch_transport
+        self._dispatch_tdm_variants: dict = {}
+        self._tdm_stage = None
         if config.dispatch_backend == "mori":
             self._dispatch_variants = self._build_mori_dispatch(config)
+        elif config.dispatch_transport == "tdm":
+            tdm_kwargs = dict(
+                rank=config.rank,
+                npes=config.world_size,
+                experts_per_rank=config.experts_per_rank,
+                experts_per_token=config.topk,
+                hidden_dim=config.hidden_dim,
+                hidden_elem_size=2,
+                max_tok_per_rank=config.max_tokens_per_rank,
+                max_recv=config.max_recv,
+                off_tok_off=self._arena.offset("tok_off"),
+                off_recv_num=self._arena.offset("recv_num"),
+                off_tis=self._arena.offset("recv_to_src_token"),
+                off_out_idx=self._arena.offset("out_idx"),
+                off_out_wts=self._arena.offset("out_wts"),
+                off_out_tok=self._arena.offset("disp_out"),
+            )
+            max_warps = tdm_max_warps(
+                hidden_dim=config.hidden_dim,
+                hidden_elem_size=2,
+                npes=config.world_size,
+            )
+            tdm_geom = {
+                spec: (spec[0], min(spec[1], max_warps)) for spec in dispatch_specs
+            }
+            stg_cap, _ = tdm_stage_capacity(
+                npes=config.world_size, max_recv=config.max_recv
+            )
+            self._tdm_stage = _tdm_stage_pool(
+                device, config.world_size, stg_cap, config.topk
+            )
+            built = {}
+            for spec, geom in tdm_geom.items():
+                if geom not in built:
+                    built[geom] = _make_dispatch_tdm(
+                        block_num=geom[0],
+                        warp_num_per_block=geom[1],
+                        **tdm_kwargs,
+                    )
+                self._dispatch_tdm_variants[spec] = built[geom]
+            self._dispatch_variants = self._dispatch_tdm_variants
         else:
             self._dispatch_variants = {
                 spec: _make_dispatch(
@@ -685,19 +774,38 @@ class MegaMoEGfx1250:
         token_count = hidden_states.shape[0]
         spec = self._select_dispatch(token_count)
         stream = fx.Stream(torch.cuda.current_stream())
-        self._dispatch_variants[spec](
-            self._arena.handle,
-            hidden_states.data_ptr(),
-            topk_ids.data_ptr(),
-            topk_weights.data_ptr(),
-            self._token_destination_map.data_ptr(),
-            self._destination_peer_counter.data_ptr(),
-            self._dispatch_barrier.data_ptr(),
-            self._total_recv.data_ptr(),
-            self._config.rank,
-            token_count,
-            stream,
-        )
+        if self._dispatch_transport == "tdm":
+            stg_idx, stg_wt, stg_src = self._tdm_stage
+            self._dispatch_variants[spec](
+                self._arena.handle,
+                hidden_states.data_ptr(),
+                topk_ids.data_ptr(),
+                topk_weights.data_ptr(),
+                self._token_destination_map.data_ptr(),
+                self._destination_peer_counter.data_ptr(),
+                self._dispatch_barrier.data_ptr(),
+                self._total_recv.data_ptr(),
+                stg_idx.data_ptr(),
+                stg_wt.data_ptr(),
+                stg_src.data_ptr(),
+                self._config.rank,
+                token_count,
+                stream,
+            )
+        else:
+            self._dispatch_variants[spec](
+                self._arena.handle,
+                hidden_states.data_ptr(),
+                topk_ids.data_ptr(),
+                topk_weights.data_ptr(),
+                self._token_destination_map.data_ptr(),
+                self._destination_peer_counter.data_ptr(),
+                self._dispatch_barrier.data_ptr(),
+                self._total_recv.data_ptr(),
+                self._config.rank,
+                token_count,
+                stream,
+            )
         reverse_source_view = _from_gpu_ptr(
             self._arena.local_ptr("recv_to_src_token"),
             (self._config.max_recv,),
