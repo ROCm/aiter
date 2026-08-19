@@ -9,12 +9,12 @@ import torch
 
 import aiter
 from aiter import dtypes
+from aiter.jit.core import get_asm_dir
 from aiter.ops.gemm_op_a6w6 import (
     dequant_mxfp6_torch,
     quant_mxfp6_gemm,
     quant_mxfp6_torch,
 )
-from aiter.jit.core import get_asm_dir
 from aiter.test_common import benchmark, checkAllclose, perftest, run_perftest
 
 torch.set_default_device("cuda")
@@ -46,7 +46,7 @@ def test_gemm(dtype, M, N, K, kernel_name=None):
     x = torch.randn((M, K), dtype=dtype)
     w = torch.randn((N, K), dtype=dtype)
 
-    a, avg_a = run_torch(x, w, dtype)
+    a, _avg_a = run_torch(x, w, dtype)
 
     # pack operands + scales into the kernel's mxfp6 layout (done once, untimed)
     xq, xs = quant_mxfp6_gemm(x)

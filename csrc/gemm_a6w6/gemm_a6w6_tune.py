@@ -7,7 +7,8 @@ import math
 import os
 import resource
 import statistics
-from typing import Any, Callable, ClassVar, TypedDict
+from collections.abc import Callable
+from typing import Any, ClassVar, TypedDict
 
 import pandas as pd
 import torch

@@ -3,7 +3,6 @@
 
 import functools
 import os
-from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -125,7 +124,7 @@ try:
     import triton.language as tl
 
     _HAS_TRITON = True
-except Exception:
+except (ImportError, ModuleNotFoundError):
     _HAS_TRITON = False
 
 if _HAS_TRITON:
@@ -293,7 +292,7 @@ def pack_big(codes: np.ndarray, padK: int = _PADK) -> np.ndarray:
 
 def pack_scale(S: np.ndarray, rows: int, padK: int = _PADK) -> np.ndarray:
     """Re-tile [R, K//32] e8m0 scales into the kernel's packed scale blob."""
-    R, NB = S.shape
+    _R, NB = S.shape
     assert rows % _TILE == 0 and NB % 4 == 0, f"rows%{_TILE} and NB%4 required"
     nt, nk = rows // _TILE, NB // 4
     off = np.arange(_SCALE_TILE_BYTES)
@@ -412,7 +411,7 @@ def pack_big_torch(codes: Tensor, padK: int = _PADK) -> Tensor:
 
 def pack_scale_torch(S: Tensor, rows: int, padK: int = _PADK) -> Tensor:
     dev = S.device
-    R, NB = S.shape
+    _R, NB = S.shape
     nt, nk = rows // _TILE, NB // 4
     off = torch.arange(_SCALE_TILE_BYTES, device=dev)
     su = off // 512
@@ -506,8 +505,8 @@ def _default_gemm_a6w6_kernel(M: int, N: int, K: int) -> str:
 
 @functools.lru_cache(maxsize=1024)
 def get_GEMM_A6W6_config(
-    M: int, N: int, K: int, tuned_file: Optional[str] = None
-) -> Optional[dict[str, object]]:
+    M: int, N: int, K: int, tuned_file: str | None = None
+) -> dict[str, object] | None:
     """Return an exact or physical-shape A6W6 tuning record."""
     tuned_file = tuned_file or AITER_CONFIGS.AITER_CONFIG_GEMM_A6W6_FILE
     tuned_file = os.path.abspath(tuned_file)
@@ -551,7 +550,7 @@ def get_GEMM_A6W6_config(
     return None
 
 
-def _select_gemm_a6w6_kernel(M: int, N: int, K: int, kernelName: Optional[str]) -> str:
+def _select_gemm_a6w6_kernel(M: int, N: int, K: int, kernelName: str | None) -> str:
     if kernelName:
         return kernelName
     config = get_GEMM_A6W6_config(M, N, K)
@@ -675,7 +674,7 @@ def _gemm_a6w6_asm(
     B_scale: Tensor,  # packed e8m0 blob
     out: Tensor,  # Out:[M, N] bf16
     K: int,  # logical contraction dim
-    kernelName: Optional[str] = None,
+    kernelName: str | None = None,
     alpha: float = 1.0,
 ) -> None: ...
 
@@ -715,7 +714,7 @@ def gemm_a6w6(
     K: int,
     dtype: torch.dtype = dtypes.bf16,
     alpha: float = 1.0,
-    kernelName: Optional[str] = None,
+    kernelName: str | None = None,
 ) -> Tensor:
     """A6W6 (mxfp6 E2M3, per-1x32 blockscale) GEMM: D = A * B^T.
 
