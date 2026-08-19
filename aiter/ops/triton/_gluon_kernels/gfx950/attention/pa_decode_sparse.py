@@ -798,11 +798,25 @@ def _qkpv_fp8(
                 :, None
             ]
         S = gl.where(col_mask, S, neg_inf)
-    S = S * qk_scale  # see _decode_tile: m_i is carried in base-2 exponent space
-    m_block = _rmax(S, 1)
+    # m_i is carried in base-2 exponent space (see _decode_tile), hence qk_scale.
+    # max commutes with a positive scale (qk_scale = scale * log2(e); any real attention
+    # scale is > 0), so scale the row max -- one value per lane -- rather than every
+    # element of S. That leaves `S * qk_scale - m_new` as the only use of the scaled S,
+    # which lowers to v_fma_f32 (16 of them) where the split form needed a separate
+    # multiply over the tile. -inf * positive = -inf, so masked columns stay masked, and
+    # the row max is the same product bit for bit; only the fused subtract differs, one
+    # rounding instead of two -- measured <= 0.23 of a bf16 output ulp.
+    #
+    # PERFORMANCE-NEUTRAL: 0.989-1.006x across C=32/64/128 x top-k 64/272/1024 and the
+    # 64-bit path, inside the control arm's own 0.996-1.003x. S is [BLOCK_M, BLOCK_K],
+    # only 4 f32 per lane per tile, so nothing here can move a 10 us kernel. Kept
+    # because it is strictly fewer instructions and one fewer rounding. The multiply
+    # that *would* matter is `acc * alpha_pv` (128 f32 per lane) and MFMA has no
+    # accumulator-scale operand, so it cannot fuse.
+    m_block = _rmax(S, 1) * qk_scale
     m_new = _max2(m_i, m_block)
     m_new = gl.where(m_new > neg_inf, m_new, 0.0)
-    p = gl.exp2(S - m_new[:, None])
+    p = gl.exp2(S * qk_scale - m_new[:, None])
     alpha = gl.exp2(m_i - m_new)
     l_new = l_i * alpha + gl.sum(p, axis=1)
     v = kv_smem.load(v_layout)
