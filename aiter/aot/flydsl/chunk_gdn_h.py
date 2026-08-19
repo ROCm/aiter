@@ -49,7 +49,7 @@ from pathlib import Path
 from typing import Any
 
 import flydsl.expr as fx
-from flydsl.utils.parallel import run_jobs_parallel
+from flydsl.utils.parallel import run_parallel_jobs
 
 from aiter.aot.flydsl.common import (
     collect_aot_jobs,
@@ -415,7 +415,7 @@ def main():
     total_t0 = time.time()
 
     print(f"\n--- Compiling {len(all_jobs)} kernels ---")
-    results = run_jobs_parallel(compile_one_config, all_jobs)
+    results = run_parallel_jobs(compile_one_config, all_jobs)
 
     total_elapsed = time.time() - total_t0
 

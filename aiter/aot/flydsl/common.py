@@ -11,7 +11,7 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from typing import Any
 
-from flydsl.utils.parallel import run_jobs_parallel
+from flydsl.utils.parallel import run_parallel_jobs
 
 _MAX_ERRORS_IN_MSG = 10
 
@@ -184,7 +184,7 @@ def run_aot(cache_dir: str) -> None:
         }
         for kind, job in all_jobs
     ]
-    results = run_jobs_parallel(_compile_aot_job, parallel_jobs)
+    results = run_parallel_jobs(_compile_aot_job, parallel_jobs)
 
     ok_by_kind: dict[OpKind, int] = {kind: 0 for kind in OpKind}
     fail_by_kind: dict[OpKind, int] = {kind: 0 for kind in OpKind}

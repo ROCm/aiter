@@ -39,7 +39,7 @@ import sys
 import time
 
 import flydsl.expr as fx
-from flydsl.utils.parallel import run_jobs_parallel
+from flydsl.utils.parallel import run_parallel_jobs
 
 from aiter.aot.flydsl.common import (
     collect_aot_jobs,
@@ -653,7 +653,7 @@ def main():
     # Independent compiles that share one pool for maximum fan-out instead of
     # separate serial passes per kind.
     print(f"\n--- Compiling {len(all_jobs)} kernels ---")
-    results = run_jobs_parallel(
+    results = run_parallel_jobs(
         compile_one_config,
         hgemm_jobs
         + preshuffle_jobs

@@ -28,7 +28,7 @@ import os
 import sys
 import time
 
-from flydsl.utils.parallel import run_jobs_parallel
+from flydsl.utils.parallel import run_parallel_jobs
 
 from aiter.aot.flydsl.common import (
     collect_aot_jobs,
@@ -1137,7 +1137,7 @@ def main():
     # (each writes its own artifact to cache; none reads another's output), so
     # they share a single pool for maximum fan-out instead of serial passes.
     print(f"\n--- Compiling {len(all_jobs)} kernels (stage1 + stage2 + epilogue) ---")
-    results = run_jobs_parallel(
+    results = run_parallel_jobs(
         compile_one_config, stage1_jobs + stage2_jobs + epilogue_jobs
     )
 

@@ -13,7 +13,7 @@ import sys
 import time
 import traceback
 
-from flydsl.utils.parallel import run_jobs_parallel
+from flydsl.utils.parallel import run_parallel_jobs
 
 from aiter.aot.flydsl.common import (
     collect_aot_jobs,
@@ -433,7 +433,7 @@ def main(argv=None):
 
     total_t0 = time.time()
     print(f"--- Compiling {len(jobs)} grouped-MoE kernels ---")
-    results = run_jobs_parallel(compile_one_config, jobs)
+    results = run_parallel_jobs(compile_one_config, jobs)
     total_elapsed = time.time() - total_t0
 
     ok = sum(1 for r in results if r.get("compile_time") is not None)

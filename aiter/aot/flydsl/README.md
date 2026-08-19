@@ -14,7 +14,7 @@ the JIT path hits the cache instead of compiling again.
 | `common.py` | — | Shared job collection, unified AOT orchestration, and cache-hit helpers |
 
 Parallel scheduling is provided by
-`flydsl.utils.parallel.run_jobs_parallel`, including the fork workers, file
+`flydsl.utils.parallel.run_parallel_jobs`, including the fork workers, file
 IPC, timeout handling, and abnormal-exit retries.
 
 ---
