@@ -222,7 +222,7 @@ def _lookup_tuned(M, N, K, a_dtype, b_dtype, tuned_file=None):
     from aiter.jit.utils.chip_info import get_cu_num
     from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
 
-    tf = tuned_file or AITER_CONFIGS.AITER_CONFIG_GEMM_MXSCALE_PRESHUFFLE_FILE
+    tf = tuned_file or AITER_CONFIGS.AITER_CONFIG_GEMM_MXSCALE_BPRESHUFFLE_FILE
     if tf not in _TUNED_CACHE:
         try:
             df = pd.read_csv(tf).drop_duplicates()

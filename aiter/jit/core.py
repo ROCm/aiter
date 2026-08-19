@@ -150,10 +150,12 @@ AITER_CONFIG_GEMM_BF16 = os.getenv(
     f"{AITER_ROOT_DIR}/aiter/configs/bf16_tuned_gemm.csv",
 )
 
-AITER_CONFIG_GEMM_MXSCALE_PRESHUFFLE = os.getenv(
-    "AITER_CONFIG_GEMM_MXSCALE_PRESHUFFLE",
-    f"{AITER_ROOT_DIR}/aiter/configs/mxscale_preshuffle_tuned_gemm.csv",
+AITER_CONFIG_GEMM_MXSCALE_BPRESHUFFLE = os.getenv(
+    "AITER_CONFIG_GEMM_MXSCALE_BPRESHUFFLE",
+    f"{AITER_ROOT_DIR}/aiter/configs/mxscale_bpreshuffle_tuned_gemm.csv",
 )
+# Backward-compat alias for callers importing the old constant by name.
+AITER_CONFIG_GEMM_MXSCALE_PRESHUFFLE = AITER_CONFIG_GEMM_MXSCALE_BPRESHUFFLE
 
 
 class AITER_CONFIG:
@@ -180,12 +182,17 @@ class AITER_CONFIG:
         )
 
     @property
-    def AITER_CONFIG_GEMM_MXSCALE_PRESHUFFLE_FILE(self):
+    def AITER_CONFIG_GEMM_MXSCALE_BPRESHUFFLE_FILE(self):
         return self.get_config_file(
-            "AITER_CONFIG_GEMM_MXSCALE_PRESHUFFLE",
-            AITER_CONFIG_GEMM_MXSCALE_PRESHUFFLE,
-            "mxscale_preshuffle_tuned_gemm",
+            "AITER_CONFIG_GEMM_MXSCALE_BPRESHUFFLE",
+            AITER_CONFIG_GEMM_MXSCALE_BPRESHUFFLE,
+            "mxscale_bpreshuffle_tuned_gemm",
         )
+
+    # Backward-compat alias for the pre-rename property name.
+    AITER_CONFIG_GEMM_MXSCALE_PRESHUFFLE_FILE = (
+        AITER_CONFIG_GEMM_MXSCALE_BPRESHUFFLE_FILE
+    )
 
     @property
     def AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_FILE(self):
@@ -307,6 +314,16 @@ class AITER_CONFIG:
         # "a8w8_tuned_gemm" and trailing ones like "..._mxscale_tuned").
         untuned_name = "untuned".join(merge_name.rsplit("tuned", 1))
         untuned_path = f"{AITER_ROOT_DIR}/aiter/configs/{untuned_name}.csv"
+        if not os.path.exists(untuned_path):
+            from pathlib import Path as _Path
+
+            candidates = sorted(
+                _Path(f"{AITER_ROOT_DIR}/aiter/configs/model_configs/").glob(
+                    f"*{untuned_name}.csv"
+                )
+            )
+            if candidates:
+                untuned_path = str(candidates[0])
         if os.path.exists(untuned_path):
             untunedf = pd.read_csv(untuned_path)
             keys = untunedf.columns.to_list()

@@ -60,7 +60,7 @@ def _tuned_rows():
     the op is expected to serve with a specific kernel.
     """
     try:
-        df = pd.read_csv(AITER_CONFIGS.AITER_CONFIG_GEMM_MXSCALE_PRESHUFFLE_FILE)
+        df = pd.read_csv(AITER_CONFIGS.AITER_CONFIG_GEMM_MXSCALE_BPRESHUFFLE_FILE)
         df = df[(df["gfx"] == get_gfx()) & (df["cu_num"] == get_cu_num())]
     except Exception as e:  # noqa: BLE001 -- missing/malformed CSV: no tuned rows
         aiter.logger.warning("no tuned mxscale rows (%s)", e)

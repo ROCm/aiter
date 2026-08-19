@@ -14,14 +14,13 @@ this change stay valid and `parse_kernel_name` is unchanged.
 
 Usage:
     HIP_VISIBLE_DEVICES=0 python -m aiter.ops.flydsl.gemm_tune.tune_mxscale_preshuffle \
-        --untune_file aiter/configs/mxscale_preshuffle_untuned_gemm.csv
+        --untune_file aiter/configs/model_configs/dsv4_a8w8_mxscale_bpreshuffle_untuned_gemm.csv
 """
 
 import pandas as pd
 import torch
 
 from aiter import dtypes
-from aiter.jit.core import AITER_CONFIG_GEMM_MXSCALE_PRESHUFFLE
 from aiter.ops.flydsl.gemm_tune.flydsl_gemm_mxscale_preshuffle_common import (
     candidates_for,
     kernels_list,
@@ -168,9 +167,9 @@ def run_torch(a_deq, b_deq, dtype=dtypes.bf16):
 class MxscalePreShuffleTuner(GemmCommonTuner):
     ARG_DEFAULTS = {  # noqa: RUF012
         **GemmCommonTuner.ARG_DEFAULTS,
-        "tune_file": f"{AITER_CONFIG_GEMM_MXSCALE_PRESHUFFLE}",
-        "untune_file": "aiter/configs/mxscale_preshuffle_untuned_gemm.csv",
-        "config_env_name": "AITER_CONFIG_GEMM_MXSCALE_PRESHUFFLE",
+        "tune_file": "aiter/configs/model_configs/dsv4_a8w8_mxscale_bpreshuffle_tuned_gemm.csv",
+        "untune_file": "aiter/configs/model_configs/dsv4_a8w8_mxscale_bpreshuffle_untuned_gemm.csv",
+        "config_env_name": "AITER_CONFIG_GEMM_MXSCALE_BPRESHUFFLE",
     }
 
     def _clear_op_caches(self):
