@@ -1082,6 +1082,16 @@ def compile_chunk_gated_delta_h_gfx942(
             ) = _unpack_prefetch(state)
             i_t_i32 = fx.Int32(i_t)
 
+            # -- C-fragment row coordinates --
+            # The MMA's C fragment gives each thread 4 rows of the BT tile:
+            # wid_m*16 + lane_m_base*4 + e. All our MFMA output have this form.
+            frag_row_local = [
+                wid_m * fx.Int32(16) + lane_m_base * fx.Int32(4) + fx.Int32(e)
+                for e in range_constexpr(4)
+            ]
+            frag_row = [i_t_i32 * fx.Int32(BT) + r for r in frag_row_local]
+            frag_row_ok = [r < T_local for r in frag_row]
+
             # -- Store h snapshot to LDS (group-major [BV][K/4][4] + XOR) --
             # h_accs element e = h[v_local = nr*16 + lane_n, k = kb*64 + wid*16 +
             #                      lane_m_base*4 + e].  The four e's are one
@@ -1218,21 +1228,16 @@ def compile_chunk_gated_delta_h_gfx942(
 
             # -- Tail-chunk row mask --
             # On the final chunk, BT rows beyond T_local are padding whose w/u/k
-            # loads were clamped to row 0 (garbage). They must be zeroed in v_new
-            # before the k^T @ v_new state update or final_state is corrupted.
-            row_mask_elems = []
-            for elem_i in range_constexpr(4):
-                bt_row = (
-                    i_t_i32 * fx.Int32(BT)
-                    + wid_m * fx.Int32(16)
-                    + lane_m_base * fx.Int32(4)
-                    + fx.Int32(elem_i)
-                )
-                in_bounds = bt_row < T_local
-                row_mask_elems.append(
-                    in_bounds.select(fx.Float32(1.0), fx.Float32(0.0))
-                )
-            row_mask_vec = fx.Vector.from_elements(row_mask_elems, dtype=fx.Float32)
+            # loads read past the tensor (bounds-checked to zero). They must be
+            # zeroed in v_new before the k^T @ v_new state update or
+            # final_state is corrupted.
+            row_mask_vec = fx.Vector.from_elements(
+                [
+                    ok.select(fx.Float32(1.0), fx.Float32(0.0))
+                    for ok in frag_row_ok
+                ],
+                dtype=fx.Float32,
+            )
             for nr in range_constexpr(N_REPEAT_LOCAL):
                 vn_frags[nr] = vn_frags[nr] * row_mask_vec
 
@@ -1248,16 +1253,14 @@ def compile_chunk_gated_delta_h_gfx942(
                     vn_val = vn_frags[nr]
                     vn_col = i_v * fx.Int32(BV) + _nr_v(nr) + lane_n
                     for elem_i in range_constexpr(4):
-                        vn_bt_row = (
-                            i_t_i32 * fx.Int32(BT)
-                            + wid_m * fx.Int32(16)
-                            + lane_m_base * fx.Int32(4)
-                            + fx.Int32(elem_i)
-                        )
-                        if (vn_bt_row < T_local).ir_value():
+                        if frag_row_ok[elem_i].ir_value():
                             f32_v = vn_val[elem_i]
                             bf16_v = _to_bf16_fast(f32_v)
-                            vn_off = vn_base + vn_bt_row * fx.Int32(V) + vn_col
+                            vn_off = (
+                                vn_base
+                                + frag_row[elem_i] * fx.Int32(V)
+                                + vn_col
+                            )
                             _emit_vn_store(vn_off, bf16_v)
 
             # -- 3. Gating --
@@ -1271,18 +1274,10 @@ def compile_chunk_gated_delta_h_gfx942(
                 exp_g_last = _fast_exp(g_last_val)
                 gate_elems = []
                 for elem_i in range_constexpr(4):
-                    # in_bounds is recomputed here rather than carried: it is a
-                    # couple of VALU ops and keeping it off the prefetch keeps
-                    # the loop-carried set to raw loads only.
-                    abs_row = (
-                        i_t_i32 * fx.Int32(BT)
-                        + wid_m * fx.Int32(16)
-                        + lane_m_base * fx.Int32(4)
-                        + fx.Int32(elem_i)
-                    )
-                    in_bounds = abs_row < T_local
                     gate = _fast_exp(g_last_val - g_row_raw[elem_i])
-                    gate_elems.append(in_bounds.select(gate, fx.Float32(0.0)))
+                    gate_elems.append(
+                        frag_row_ok[elem_i].select(gate, fx.Float32(0.0))
+                    )
                 gate_vec = fx.Vector.from_elements(gate_elems, dtype=fx.Float32)
                 for nr in range_constexpr(N_REPEAT_LOCAL):
                     vn_frags[nr] = vn_frags[nr] * gate_vec
@@ -1520,15 +1515,9 @@ def compile_chunk_gated_delta_h_gfx942(
                     col_abs = i_t_i32 * fx.Int32(BT) + bt_col
                     a_acc = fx.Vector(frag_a[None, None, nr].load())
                     for e in range_constexpr(4):
-                        row_tok = (
-                            wid_m * fx.Int32(16)
-                            + lane_m_base * fx.Int32(4)
-                            + fx.Int32(e)
-                        )
-                        row_abs = i_t_i32 * fx.Int32(BT) + row_tok
                         causal = (
-                            (row_tok >= bt_col)
-                            & (row_abs < T_local)
+                            (frag_row_local[e] >= bt_col)
+                            & frag_row_ok[e]
                             & (col_abs < T_local)
                         )
                         masked.append(
@@ -1623,14 +1612,10 @@ def compile_chunk_gated_delta_h_gfx942(
                     o_scaled = o_out[nr] * scale_vec
                     o_col = i_v * fx.Int32(BV) + _nr_v(nr) + lane_n
                     for elem_i in range_constexpr(4):
-                        o_bt_row = (
-                            i_t_i32 * fx.Int32(BT)
-                            + wid_m * fx.Int32(16)
-                            + lane_m_base * fx.Int32(4)
-                            + fx.Int32(elem_i)
-                        )
-                        if (o_bt_row < T_local).ir_value():
-                            o_off = o_base + o_bt_row * stride_o + o_col
+                        if frag_row_ok[elem_i].ir_value():
+                            o_off = (
+                                o_base + frag_row[elem_i] * stride_o + o_col
+                            )
                             _emit_o_store(o_off, _to_bf16_fast(o_scaled[elem_i]))
 
                 next_prefetch = _stage_prefetch(i_t_i32 + fx.Int32(1))
