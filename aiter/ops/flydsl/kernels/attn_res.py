@@ -33,6 +33,7 @@ from flydsl.expr import math as fmath
 from flydsl.expr.arith import CmpFPredicate
 from flydsl.expr.typing import ReductionOp, Stream
 
+from . import dpp_utils
 from .tensor_shim import _run_compiled
 
 KERNEL_NAME = "flydsl_attn_res"
@@ -50,7 +51,69 @@ _SMALL_D_ROWS_PER_WG = 1
 _SOURCE_PREFETCH_IN_FLIGHT = 3
 # Changing this constant requires _build_attn_res.cache_clear().
 _SOURCE_GROUP_SIZE = 2
+# "auto" uses VALU DPP for one-wave rows and shuffle_xor for multi-wave
+# rows. "swizzle" / "dpp" force one path for A/B. Changing this constant
+# requires _build_attn_res.cache_clear().
+_WAVE_REDUCE_MODE = "auto"
 _LOG2E = math.log2(math.e)
+_DPP_QUAD_XOR1 = 0xB1
+_DPP_QUAD_XOR2 = 0x4E
+_DPP_ROW_SHL4 = 0x104
+_DPP_ROW_SHR4 = 0x114
+_DPP_ROW_SHL8 = 0x108
+_DPP_ROW_SHR8 = 0x118
+_DPP_ROW_MASK = 0xF
+# Banks 0+2 read n+4; banks 1+3 read n-4.
+_DPP_BANK_XOR4_SHL = 0x5
+_DPP_BANK_XOR4_SHR = 0xA
+# Banks 0+1 read n+8; banks 2+3 read n-8.
+_DPP_BANK_XOR8_SHL = 0x3
+_DPP_BANK_XOR8_SHR = 0xC
+
+
+def _dpp_xor_f32(value, offset: int):
+    """Return the f32 held by ``lane ^ offset`` via VALU DPP. Offsets 1, 2, 4, 8 only."""
+    bits = value.bitcast(fx.Int32)
+    if offset == 1:
+        peer = dpp_utils.update_dpp_i32(
+            bits, bits, _DPP_QUAD_XOR1, _DPP_ROW_MASK, _DPP_ROW_MASK, True
+        )
+    elif offset == 2:
+        peer = dpp_utils.update_dpp_i32(
+            bits, bits, _DPP_QUAD_XOR2, _DPP_ROW_MASK, _DPP_ROW_MASK, True
+        )
+    elif offset == 4:
+        shifted = dpp_utils.update_dpp_i32(
+            bits, bits, _DPP_ROW_SHL4, _DPP_ROW_MASK, _DPP_BANK_XOR4_SHL, True
+        )
+        peer = dpp_utils.update_dpp_i32(
+            shifted, bits, _DPP_ROW_SHR4, _DPP_ROW_MASK, _DPP_BANK_XOR4_SHR, True
+        )
+    elif offset == 8:
+        shifted = dpp_utils.update_dpp_i32(
+            bits, bits, _DPP_ROW_SHL8, _DPP_ROW_MASK, _DPP_BANK_XOR8_SHL, True
+        )
+        peer = dpp_utils.update_dpp_i32(
+            shifted, bits, _DPP_ROW_SHR8, _DPP_ROW_MASK, _DPP_BANK_XOR8_SHR, True
+        )
+    else:
+        raise ValueError(
+            "DPP XOR is row-local; offset must be 1, 2, 4, or 8, " f"got {offset}"
+        )
+    return fx.Int32(peer).bitcast(fx.Float32)
+
+
+def _wave_reduce_add_f32(value, mode: str, fastmath):
+    """Wave64 sum. ``dpp`` uses VALU DPP for offsets <= 8; ``swizzle`` uses shuffle_xor."""
+    reduced = value
+    for shift_exp in range_constexpr(int(math.log2(_WARP_SIZE))):
+        offset = _WARP_SIZE // (2 << shift_exp)
+        if mode == "dpp" and offset <= 8:
+            peer = _dpp_xor_f32(reduced, offset)
+        else:
+            peer = reduced.shuffle_xor(offset, _WARP_SIZE)
+        reduced = reduced.addf(peer, fastmath=fastmath)
+    return reduced
 
 
 def _block_threads_for(num_vec: int) -> int:
@@ -121,10 +184,22 @@ def _build_attn_res(
     # One-wave rows have no cross-wave barrier to collapse.
     group_size = _SOURCE_GROUP_SIZE if red_slots > 1 else 1
     num_groups = (num_sources + group_size - 1) // group_size
+    if _WAVE_REDUCE_MODE == "auto":
+        # One-wave rows have no real LDS traffic, so DPP replaces ds_swizzle.
+        # Multi-wave rows still handshake through LDS; DPP lost wall time there.
+        wave_reduce_mode = "dpp" if red_slots == 1 else "swizzle"
+    elif _WAVE_REDUCE_MODE in ("swizzle", "dpp"):
+        wave_reduce_mode = _WAVE_REDUCE_MODE
+    else:
+        raise ValueError(
+            f"_WAVE_REDUCE_MODE must be 'auto', 'swizzle', or 'dpp', "
+            f"got {_WAVE_REDUCE_MODE!r}"
+        )
     kernel_name = (
         f"{KERNEL_NAME}_d{hidden_size}_k{num_sources}_bt{block_threads}"
         f"_r{rows_per_wg}_v{_VEC_WIDTH}_delta{int(has_delta)}_write{int(write_block)}"
         f"_onorm{int(apply_output_norm)}_pf{prefetch_in_flight}_g{group_size}"
+        f"_wr{wave_reduce_mode}"
     )
 
     @fx.struct
@@ -165,12 +240,7 @@ def _build_attn_res(
         log2e = _LOG2E
 
         def wave_reduce_add(value):
-            reduced = value
-            for shift_exp in range_constexpr(int(math.log2(_WARP_SIZE))):
-                offset = _WARP_SIZE // (2 << shift_exp)
-                peer = reduced.shuffle_xor(offset, _WARP_SIZE)
-                reduced = reduced.addf(peer, fastmath=fm_fast)
-            return reduced
+            return _wave_reduce_add_f32(value, wave_reduce_mode, fm_fast)
 
         def store_pair_partials(sumsq_local, dot_local, slot, buf):
             """Wave-reduce and write LDS partials. No barrier."""
