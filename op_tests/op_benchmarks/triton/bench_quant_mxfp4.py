@@ -14,60 +14,9 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
 
 
 def get_default_shapes() -> list[list[int]]:
-    return [
-        [1024, 1024],
-        [4096, 4096],
-        [4096, 8192],
-        [8192, 16384],
-        [16384, 16384],
-        [131072, 16384],
-        [8192, 53248],
-        [16384, 53248],
-        [131072, 53248],
-        [8192, 8192],
-        [16384, 8192],
-        [131072, 8192],
-        [8192, 28672],
-        [16384, 28672],
-        [131072, 28672],
-        [8192, 1536],
-        [16384, 1536],
-        [131072, 1536],
-        [8192, 512],
-        [16384, 512],
-        [131072, 512],
-        [8192, 128],
-        [16384, 128],
-        [131072, 128],
-        [8, 16384],
-        [32, 16384],
-        [128, 16384],
-        [256, 16384],
-        [8, 53248],
-        [32, 53248],
-        [128, 53248],
-        [256, 53248],
-        [8, 8192],
-        [32, 8192],
-        [128, 8192],
-        [256, 8192],
-        [8, 28672],
-        [32, 28672],
-        [128, 28672],
-        [256, 28672],
-        [8, 1536],
-        [32, 1536],
-        [128, 1536],
-        [256, 1536],
-        [8, 512],
-        [32, 512],
-        [128, 512],
-        [256, 512],
-        [8, 128],
-        [32, 128],
-        [128, 128],
-        [256, 128],
-    ]
+    M = [8, 32, 256, 8192, 16384]
+    N = [3072, 7168]
+    return [[m, n] for m in M for n in N]
 
 
 def model_benchmark_shapes(args) -> list[tuple[str, int, int]]:
@@ -143,10 +92,7 @@ def run_benchmark(args):
         quant_fn = get_provider(provider)
 
         def fn():
-            if provider == "triton":
-                quant_fn(x, use_hw_cvt=args.use_hw_cvt)
-            else:
-                quant_fn(x)
+            quant_fn(x)
 
         ms = triton.testing.do_bench_cudagraph(fn, rep=100)
 
@@ -220,12 +166,6 @@ def parse_args(args: list[str] | None = None):
         "-o",
         action="store_true",
         help="Write performance results to CSV file.",
-    )
-    parser.add_argument(
-        "--use-hw-cvt",
-        action="store_true",
-        help="Use the native gfx950 hardware conversion instruction in the "
-        "triton provider (ignored by other providers). Requires bf16 input.",
     )
     return parser.parse_args(args=args)
 

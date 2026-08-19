@@ -3,52 +3,23 @@ from triton.experimental.gluon import language as gl
 
 
 @gluon.jit
-def _cvt_scalef32_pk_fp4_bf16(a, b, scale, byte_sel: gl.constexpr):
-    """
-    Native gfx950 hardware instruction wrapper: v_cvt_scalef32_pk_fp4_bf16.
-    Gluon port of the identical Triton-path helper in
-    aiter/ops/triton/_triton_kernels/quant/quant.py -- see there for the
-    full explanation of the tied "0" merge-input constraint.
-    """
-    op_sel2: gl.constexpr = byte_sel & 1
-    op_sel3: gl.constexpr = (byte_sel >> 1) & 1
-    a_bits = a.to(gl.uint16, bitcast=True).to(gl.uint32)
-    b_bits = b.to(gl.uint16, bitcast=True).to(gl.uint32)
-    src = a_bits | (b_bits << 16)
-    old = gl.zeros_like(src)
-    return gl.inline_asm_elementwise(
-        f"v_cvt_scalef32_pk_fp4_bf16 $0, $2, $3 op_sel:[0,0,{op_sel2},{op_sel3}]",
-        "=v,0,v,v",
-        [old, src, scale],
-        dtype=gl.uint32,
-        is_pure=True,
-        pack=1,
-    )
-
-
-@gluon.jit
-def _mxfp4_quant_op_hw(
+def _mxfp4_quant_op(
     x,
     BLOCK_SIZE_N: gl.constexpr,
     BLOCK_SIZE_M: gl.constexpr,
     MXFP4_QUANT_BLOCK_SIZE: gl.constexpr,
 ):
     """
-    Converts given x (bf16) to mxfp4 format using the native gfx950
-    v_cvt_scalef32_pk_fp4_bf16 hardware conversion instruction.
-    x: [BLOCK_SIZE_M, BLOCK_SIZE_N], bf16
-
-    x stays bf16 throughout (`gl.max` promotes the reduction to fp32
-    internally, so no upfront upcast is needed). Split into evens/odds
-    before reducing so amax descends from the same layout lineage as
-    evens/odds, letting scale_f32 broadcast against them without a
-    layout-mismatch compile error. `bs_e8m0` is the biased e8m0 scale
-    byte; `scale_f32` shifts it into the fp32 exponent field
-    (2^(bs_e8m0-127)) as required by `_cvt_scalef32_pk_fp4_bf16`.
+    Converts x (bf16) [BLOCK_SIZE_M, BLOCK_SIZE_N] to packed mxfp4 bytes via
+    gl.amd.cdna4.scaled_downcast, computing the per-32-element e8m0 scale
+    ourselves. Reduces over split evens/odds, not a plain reshape+max, so
+    amax's layout stays compatible with the split tensors it's compared to.
     """
     NUM_QUANT_BLOCKS: gl.constexpr = BLOCK_SIZE_N // MXFP4_QUANT_BLOCK_SIZE
-    x = x.reshape(BLOCK_SIZE_M, NUM_QUANT_BLOCKS, MXFP4_QUANT_BLOCK_SIZE // 2, 2)
-    evens, odds = gl.split(x)
+    x_grouped = x.reshape(
+        BLOCK_SIZE_M, NUM_QUANT_BLOCKS, MXFP4_QUANT_BLOCK_SIZE // 2, 2
+    )
+    evens, odds = gl.split(x_grouped)
     amax = gl.maximum(gl.abs(evens), gl.abs(odds)).to(gl.float32)
     amax = gl.max(amax, axis=-1, keep_dims=True)
     amax = amax.to(gl.int32, bitcast=True)
@@ -57,14 +28,11 @@ def _mxfp4_quant_op_hw(
     scale_e8m0_unbiased = gl.log2(amax).floor() - 2
     scale_e8m0_unbiased = gl.maximum(-127, gl.minimum(scale_e8m0_unbiased, 127))
     bs_e8m0 = scale_e8m0_unbiased.to(gl.uint8) + 127
-    scale_f32 = (bs_e8m0.to(gl.uint32) << 23).to(gl.float32, bitcast=True)
+    bs_e8m0 = bs_e8m0.reshape(BLOCK_SIZE_M, NUM_QUANT_BLOCKS)
 
-    scale_bcast = scale_f32 + gl.zeros_like(evens).to(gl.float32)
-    packed = _cvt_scalef32_pk_fp4_bf16(evens, odds, scale_bcast, 0)
-    x_fp4 = (packed & 0xFF).to(gl.uint8)
-    x_fp4 = x_fp4.reshape(BLOCK_SIZE_M, BLOCK_SIZE_N // 2)
+    x_fp4 = gl.amd.cdna4.scaled_downcast(x, bs_e8m0, "e2m1", axis=1)
 
-    return x_fp4, bs_e8m0.reshape(BLOCK_SIZE_M, NUM_QUANT_BLOCKS)
+    return x_fp4, bs_e8m0
 
 
 @gluon.jit
@@ -150,7 +118,7 @@ def gluon_dynamic_mxfp4_quant_kernel_gfx950(
                     x_block_ptr, x_offs, mask=x_mask, cache=".cg"
                 )
 
-            out_tensor, bs_e8m0 = _mxfp4_quant_op_hw(
+            out_tensor, bs_e8m0 = _mxfp4_quant_op(
                 x, BLOCK_SIZE_N, BLOCK_SIZE_M, MXFP4_QUANT_BLOCK_SIZE
             )
 
@@ -243,7 +211,7 @@ def gluon_dynamic_mxfp4_quant_kernel_gfx950(
                     )
 
             with gl.amd.warp_pipeline_stage("compute_store", priority=0):
-                out_tensor, bs_e8m0 = _mxfp4_quant_op_hw(
+                out_tensor, bs_e8m0 = _mxfp4_quant_op(
                     x, BLOCK_SIZE_N, BLOCK_SIZE_M, MXFP4_QUANT_BLOCK_SIZE
                 )
 
