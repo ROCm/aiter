@@ -77,7 +77,6 @@ def launch_gemm_a8w4_tdm(
     SB_OFF = STAGE_A + STAGE_B + STAGE_SA
     PITCH = ((STAGE_A + STAGE_B + STAGE_SA + STAGE_SB + 127) // 128) * 128
 
-    out_elem = T.f16 if out_is_f16 else T.bf16
     out_cls = fx.Float16 if out_is_f16 else fx.BFloat16
 
     C_STORE_B = ((tile_m * tile_n * 2 + 127) // 128) * 128
