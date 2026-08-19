@@ -7,7 +7,7 @@ Minimal test suite for validating the aiter tuning infrastructure.
 | File | Level | GPU | What it tests |
 |------|-------|-----|---------------|
 | `test_csv_validation.py` | 0 | No | Tuned CSV integrity: duplicates (all families), invalid times, errRatio, git conflicts |
-| `test_config_shape_collision.py` | 0 | No | Cross-file shape collision via real `get_config_file` merge (all families incl. K5) |
+| `test_config_shape_collision.py` | 0 | No | Cross-file shape collision via real `get_config_file` merge (all registered families) |
 | `test_tuner_infra.py` | 1 | No | `base_tuner` utilities: CSV I/O, merge, dedup, calculate, post_process topk, update_config_files |
 | `test_compare_logic.py` | 1 | No | Compare/update_improved: `_build_compare_update_plan`, `_merge_compare_filtered_results` |
 | `test_mp_tuner_logic.py` | 1 | No | `mp_tuner` polling: timeout, AcceleratorError, KeyError, pool restart |
@@ -33,12 +33,7 @@ Minimal test suite for validating the aiter tuning infrastructure.
 
 ## Config resolution
 
-`test_run_config` and `test_csv_validation` (K5) resolve tuned config files through `AITER_CONFIGS` in `aiter/jit/core.py` — the same path used by production operators at runtime. Shared helpers live in `config_utils.py`:
-
-- `resolve_merged_tuned_path(config_property)` — merged CSV path (used by `test_run_config`)
-- `load_merged_tuned_dataframe(...)` — merged CSV as DataFrame (used by K5 BV conflict check)
-
-This validates that:
+`test_run_config` resolves tuned config files through `AITER_CONFIGS` in `aiter/jit/core.py` — the same path used by production operators at runtime. This validates that:
 
 1. The `AITER_CONFIG_*` env var names and default file paths in `core.py` are correct
 2. Model-specific configs under `aiter/configs/model_configs/` are properly discovered and merged

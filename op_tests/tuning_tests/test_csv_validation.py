@@ -7,20 +7,16 @@ Catches: duplicates, invalid times, high errRatio, git merge conflicts,
 missing untuned files.
 """
 
-import glob
 import os
 import unittest
 from typing import Any, ClassVar
 
 import pandas as pd
 
-from op_tests.tuning_tests.config_utils import load_merged_tuned_dataframe
-
 AITER_ROOT = os.path.dirname(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 )
 CONFIGS_DIR = os.path.join(AITER_ROOT, "aiter", "configs")
-MODEL_CONFIGS_DIR = os.path.join(CONFIGS_DIR, "model_configs")
 
 
 class TestCSVValidation(unittest.TestCase):
@@ -35,7 +31,6 @@ class TestCSVValidation(unittest.TestCase):
         "bf16": "bf16_tuned_gemm.csv",
         "bf16_batched": "bf16_tuned_batched_gemm.csv",
         "fmoe": "tuned_fmoe.csv",
-        "gdn_k5_mfma16_hip": "chunk_gdn_h_mfma16_hip_tuned.csv",
     }
 
     def _load_csv(self, name, comment="#"):
@@ -124,37 +119,6 @@ class TestCSVValidation(unittest.TestCase):
             ],
         )
 
-    def test_gdn_k5_mfma16_hip_no_conflicting_bv(self):
-        try:
-            df = load_merged_tuned_dataframe(
-                "AITER_CONFIG_GDN_K5_MFMA16_HIP_FILE",
-                fallback_base_name=self.TUNED_CSVS["gdn_k5_mfma16_hip"],
-                fallback_model_glob="*_chunk_gdn_h_mfma16_hip_tuned.csv",
-            )
-        except FileNotFoundError:
-            self.skipTest("gdn_k5 merged tuned CSV not found")
-        key_cols = [
-            "arch",
-            "H",
-            "Hg",
-            "V",
-            "is_varlen",
-            "use_h0",
-            "store_fs",
-            "snapshot_bf16",
-            "state_bf16",
-            "total_chunks",
-            "max_seq_chunks",
-        ]
-        grouped = df.groupby(key_cols, dropna=False)["BV"]
-        conflicts = grouped.nunique() > 1
-        bad = conflicts[conflicts].index
-        self.assertEqual(
-            len(bad),
-            0,
-            f"gdn_k5_mfma16_hip: conflicting BV for lookup keys (first 5):\n{bad[:5]}",
-        )
-
     def test_no_git_conflict_markers(self):
         for name, fname in self.TUNED_CSVS.items():
             with self.subTest(csv=name):
@@ -205,24 +169,12 @@ class TestCSVValidation(unittest.TestCase):
             "a8w8_blockscale_untuned_gemm.csv",
             "a8w8_untuned_batched_gemm.csv",
             "bf16_untuned_batched_gemm.csv",
-            "chunk_gdn_h_mfma16_hip_untuned.csv",
             "untuned_fmoe.csv",
         ]
         for f in untuned_files:
             with self.subTest(file=f):
                 path = os.path.join(CONFIGS_DIR, f)
                 self.assertTrue(os.path.exists(path), f"Missing: {f}")
-
-        gdn_model_untuned = sorted(
-            glob.glob(
-                os.path.join(MODEL_CONFIGS_DIR, "*_chunk_gdn_h_mfma16_hip_untuned.csv")
-            )
-        )
-        self.assertGreaterEqual(
-            len(gdn_model_untuned),
-            2,
-            "expected qwen3_5_35b and qwen3_5_397b chunk_gdn_h_mfma16_hip untuned CSVs",
-        )
 
 
 if __name__ == "__main__":
