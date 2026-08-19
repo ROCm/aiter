@@ -323,9 +323,9 @@ def _build_kernel(
     # value (adaptive: R=32 for prefill, R=16 for small-T decode).
     ROWS_PER_WG = rows_per_wg
 
-    assert D % BLOCK_THREADS == 0, (
-        f"D={D} must be divisible by BLOCK_THREADS={BLOCK_THREADS}"
-    )
+    assert (
+        D % BLOCK_THREADS == 0
+    ), f"D={D} must be divisible by BLOCK_THREADS={BLOCK_THREADS}"
     assert NOPE % VEC == 0, f"NOPE={NOPE} must be divisible by VEC={VEC}"
     assert RD % 2 == 0, "rope_head_dim must be even (GPT-J pair layout)"
     assert RD % VEC == 0, f"RD={RD} must be divisible by VEC={VEC}"
@@ -338,20 +338,20 @@ def _build_kernel(
     # --- quant-group layout ------------------------------------------------
     # group_size must divide D evenly AND be a multiple of VEC (so a single
     # thread's VEC-wide slice never crosses a group boundary).
-    assert group_size > 0 and D % group_size == 0, (
-        f"group_size {group_size} must divide head_dim {D}"
-    )
-    assert group_size % VEC == 0, (
-        f"group_size {group_size} must be a multiple of VEC {VEC}"
-    )
+    assert (
+        group_size > 0 and D % group_size == 0
+    ), f"group_size {group_size} must divide head_dim {D}"
+    assert (
+        group_size % VEC == 0
+    ), f"group_size {group_size} must be a multiple of VEC {VEC}"
     TPG = group_size // VEC  # threads per group
     NG = D // group_size  # number of groups per row
-    assert TPG > 0 and (TPG & (TPG - 1)) == 0, (
-        f"TPG {TPG} must be a power of 2 (for butterfly reduce)"
-    )
-    assert scale_dtype in SCALE_DTYPE_OPTIONS, (
-        f"scale_dtype {scale_dtype!r} must be one of {SCALE_DTYPE_OPTIONS}"
-    )
+    assert (
+        TPG > 0 and (TPG & (TPG - 1)) == 0
+    ), f"TPG {TPG} must be a power of 2 (for butterfly reduce)"
+    assert (
+        scale_dtype in SCALE_DTYPE_OPTIONS
+    ), f"scale_dtype {scale_dtype!r} must be one of {SCALE_DTYPE_OPTIONS}"
 
     log2_block = int(math.log2(BLOCK_THREADS))
     log2_tpg = int(math.log2(TPG))
@@ -608,9 +608,7 @@ def _build_kernel(
                     )
                     _fc = _fp8_const()
                     factor = fx.Float32(_fc["max_over_sqrt2"]) * rcp_am
-                    scale_val = (
-                        am_safe * rstd * fx.Float32(_fc["inv_max_sqrt2"])
-                    )
+                    scale_val = am_safe * rstd * fx.Float32(_fc["inv_max_sqrt2"])
 
                 group_idx = tid >> log2_tpg
                 lane_in_group = tid & (TPG - 1)
@@ -658,8 +656,12 @@ def _build_kernel(
                 o = scaled_raw[2 * k + 1]
                 c = cos_vals[k]
                 s = sin_vals[k]
-                rotated[2 * k] = _to_raw(ArithValue(e) * ArithValue(c) - ArithValue(o) * ArithValue(s))
-                rotated[2 * k + 1] = _to_raw(ArithValue(e) * ArithValue(s) + ArithValue(o) * ArithValue(c))
+                rotated[2 * k] = _to_raw(
+                    ArithValue(e) * ArithValue(c) - ArithValue(o) * ArithValue(s)
+                )
+                rotated[2 * k + 1] = _to_raw(
+                    ArithValue(e) * ArithValue(s) + ArithValue(o) * ArithValue(c)
+                )
 
             final_list = [
                 is_rope_t.select(rotated[i], scaled_raw[i])
@@ -693,11 +695,7 @@ def _build_kernel(
             # Q load: use raw buffer_load to handle VEC=16 correctly.
             q_in_rsrc = _ptr_buffer_resource(q_in)
             # Per-token byte offset → dword offset for Q input.
-            q_row_off_elems = (
-                bid_t * (H * D)
-                + head_idx * D
-                + tid * VEC
-            )
+            q_row_off_elems = bid_t * (H * D) + head_idx * D + tid * VEC
             q_off_dw = q_row_off_elems >> 1
             q_f32_list = _load_bf16_raw(q_in_rsrc, q_off_dw)
             q_f32_fly_vec = vector.from_elements(T.vec(VEC, f32), q_f32_list)
@@ -723,9 +721,7 @@ def _build_kernel(
                 qo_rsrc = qo_g_tmp.rsrc
                 row_base_bytes = head_idx * D
                 qs_rsrc = _ptr_buffer_resource(q_scale)
-                scale_base_off_q = (
-                    bid_t * (H * NG) + head_idx * NG
-                )
+                scale_base_off_q = bid_t * (H * NG) + head_idx * NG
                 emit_body(
                     weighted=q_weighted,
                     x_f32_vec=x_f32,
@@ -759,9 +755,7 @@ def _build_kernel(
         else:
             # ---------- KV path ----------
             kv_rsrc = _ptr_buffer_resource(kv_in)
-            kv_off_elems = (
-                bid_t * kv_in_row_stride + tid * VEC
-            )
+            kv_off_elems = bid_t * kv_in_row_stride + tid * VEC
             kv_off_dw = kv_off_elems >> 1
 
             kv_f32_list = _load_bf16_raw(kv_rsrc, kv_off_dw)
@@ -822,9 +816,7 @@ def _build_kernel(
                     # the write 44 rows before that block. The C++ sibling's first
                     # gate is `bid < 0 || pos < 0`; match it, in both modes.
                     pos_ok = pos_i32 >= 0
-                    do_swa = arith.andi(
-                        _to_raw(bid_i32 >= 0), _to_raw(pos_ok)
-                    )
+                    do_swa = arith.andi(_to_raw(bid_i32 >= 0), _to_raw(pos_ok))
                     bid_safe = arith.maxsi(bid_i32, _to_raw(fx.Int32(0)))
                     pos_safe = arith.select(
                         _to_raw(pos_ok), pos_i32, _to_raw(fx.Int32(0))
@@ -888,7 +880,9 @@ def _build_kernel(
                     # multiply, and let it reach the descriptor through the
                     # base address (`static_bytes_offset_i64`) rather than
                     # through the 32-bit offset field, whose window is 4 GiB.
-                    swa_off_bytes = fx.Int64(row_safe) * fx.Int64(swa_pos_stride) * fx.Int64(2)
+                    swa_off_bytes = (
+                        fx.Int64(row_safe) * fx.Int64(swa_pos_stride) * fx.Int64(2)
+                    )
                     swa_g_tmp = GTensor(
                         swa_kv,
                         dtype=T.bf16,
@@ -1507,9 +1501,7 @@ def _build_xhead_kernel(
                 xi = x_f32[vi]
                 if const_expr(w_f32 is not None):
                     xi = _to_raw(ArithValue(xi) * w_f32[vi])
-                scaled.append(
-                    _to_raw(ArithValue(xi) * rstd)
-                )
+                scaled.append(_to_raw(ArithValue(xi) * rstd))
             rot = list(scaled)
             for k in range_constexpr(PAIRS):
                 e = scaled[2 * k]
@@ -1823,17 +1815,11 @@ def _build_tdm(
         _nr_m1 = _to_raw(num_rows - 1)
         tile_base = g * CT  # first tile index this WG owns
         lds_off = fx.Index(_to_raw(wave)) * arith.index(D * eb)
-        row_elem = (
-            wave * D + tid * VEC
-        )  # LDS read pos (this wave)
+        row_elem = wave * D + tid * VEC  # LDS read pos (this wave)
 
         def issue(buf, tile_idx):
             # this wave's row of tile_idx -> buf slot wave*D (clamped to valid row)
-            my_row = ArithValue(
-                arith.minsi(
-                    _to_raw(tile_idx * RT + wave), _nr_m1
-                )
-            )
+            my_row = ArithValue(arith.minsi(_to_raw(tile_idx * RT + wave), _nr_m1))
             desc = tdm_ops.make_tensor_descriptor_2d(
                 q_in,
                 buf,
@@ -1854,17 +1840,11 @@ def _build_tdm(
         def load_cs(tile_idx):
             # pos/cos/sin for the token of (tile_idx, this wave). Callers hoist
             # this across the GROUP tiles of one token (see the stream loop).
-            my_row = ArithValue(
-                arith.minsi(
-                    _to_raw(tile_idx * RT + wave), _nr_m1
-                )
-            )
+            my_row = ArithValue(arith.minsi(_to_raw(tile_idx * RT + wave), _nr_m1))
             if const_expr(log2H is not None):
                 tok = my_row >> log2H
             else:
-                tok = ArithValue(
-                    arith.divsi(_to_raw(my_row), _to_raw(fx.Int32(H)))
-                )
+                tok = ArithValue(arith.divsi(_to_raw(my_row), _to_raw(fx.Int32(H))))
             pos_i32 = buffer_ops.buffer_load(
                 pos_rsrc, _to_raw(tok), vec_width=1, dtype=T.i64
             ).trunci(i32)
@@ -1895,11 +1875,7 @@ def _build_tdm(
             return cos_v, sin_v
 
         def compute_store(buf, tile_idx, cos_v, sin_v):
-            my_row = ArithValue(
-                arith.minsi(
-                    _to_raw(tile_idx * RT + wave), _nr_m1
-                )
-            )
+            my_row = ArithValue(arith.minsi(_to_raw(tile_idx * RT + wave), _nr_m1))
             x = []
             for c in range_constexpr(VEC // 8):
                 off = row_elem + (c * 8)
@@ -1925,27 +1901,17 @@ def _build_tdm(
             # RMSNorm (+ optional per-channel q_weight): (x * w) * rstd. rstd is
             # from unweighted x^2 (matches stock/xhead semantics); mul commutes.
             if const_expr(q_weighted):
-                scaled = [
-                    _to_raw(x[vi] * qw[vi] * rstd)
-                    for vi in range_constexpr(VEC)
-                ]
+                scaled = [_to_raw(x[vi] * qw[vi] * rstd) for vi in range_constexpr(VEC)]
             else:
-                scaled = [
-                    _to_raw(x[vi] * rstd)
-                    for vi in range_constexpr(VEC)
-                ]
+                scaled = [_to_raw(x[vi] * rstd) for vi in range_constexpr(VEC)]
             rot = list(scaled)
             for kk in range_constexpr(PAIRS):
                 e = scaled[2 * kk]
                 o = scaled[2 * kk + 1]
                 c = cos_v[kk]
                 s = sin_v[kk]
-                rot[2 * kk] = _to_raw(
-                    ArithValue(e) * c - ArithValue(o) * s
-                )
-                rot[2 * kk + 1] = _to_raw(
-                    ArithValue(e) * s + ArithValue(o) * c
-                )
+                rot[2 * kk] = _to_raw(ArithValue(e) * c - ArithValue(o) * s)
+                rot[2 * kk + 1] = _to_raw(ArithValue(e) * s + ArithValue(o) * c)
             final = [
                 ArithValue(is_rope).select(rot[i], scaled[i])
                 for i in range_constexpr(VEC)
@@ -1996,9 +1962,7 @@ def _build_tdm(
             lds.finalized = False
             lds.finalize()
         per_wg = RT * CT
-        gx = arith.divsi(
-            _to_raw(num_rows + (per_wg - 1)), _to_raw(fx.Int32(per_wg))
-        )
+        gx = arith.divsi(_to_raw(num_rows + (per_wg - 1)), _to_raw(fx.Int32(per_wg)))
         k = kernel(q_in, cos_cache, sin_cache, positions, q_out, q_weight, num_rows)
         k.launch(
             grid=(gx.index_cast(T.index), 1, 1),
@@ -2142,11 +2106,7 @@ def _build_tdm_kv(*, head_dim, rope_head_dim):
         tid = fx.thread_idx.x
         wave = fx.thread_idx.y
         g = fx.block_idx.x
-        tok = ArithValue(
-            arith.minsi(
-                _to_raw(g * R + wave), _to_raw(num_tokens - 1)
-            )
-        )
+        tok = ArithValue(arith.minsi(_to_raw(g * R + wave), _to_raw(num_tokens - 1)))
 
         cos_rsrc = buffer_ops.create_buffer_resource(cos_cache, max_size=True)
         sin_rsrc = buffer_ops.create_buffer_resource(sin_cache, max_size=True)
@@ -2222,24 +2182,19 @@ def _build_tdm_kv(*, head_dim, rope_head_dim):
         red = _to_raw(sq)
         for sh in range_constexpr(log2b):
             o = BLOCK_THREADS // (2 << sh)
-            red = _to_raw(ArithValue(red) + ArithValue(red).shuffle_xor(o, BLOCK_THREADS))
+            red = _to_raw(
+                ArithValue(red) + ArithValue(red).shuffle_xor(o, BLOCK_THREADS)
+            )
         rstd = fmath.rsqrt(ArithValue(red) * (1.0 / D) + 1e-6)
-        scaled = [
-            _to_raw(x[vi] * w[vi] * rstd)
-            for vi in range_constexpr(VEC)
-        ]
+        scaled = [_to_raw(x[vi] * w[vi] * rstd) for vi in range_constexpr(VEC)]
         rot = list(scaled)
         for kk in range_constexpr(PAIRS):
             e = scaled[2 * kk]
             o = scaled[2 * kk + 1]
             c = cos_v[kk]
             s = sin_v[kk]
-            rot[2 * kk] = _to_raw(
-                ArithValue(e) * c - ArithValue(o) * s
-            )
-            rot[2 * kk + 1] = _to_raw(
-                ArithValue(e) * s + ArithValue(o) * c
-            )
+            rot[2 * kk] = _to_raw(ArithValue(e) * c - ArithValue(o) * s)
+            rot[2 * kk + 1] = _to_raw(ArithValue(e) * s + ArithValue(o) * c)
         final = [
             ArithValue(is_rope).select(rot[i], scaled[i]) for i in range_constexpr(VEC)
         ]
