@@ -7,7 +7,7 @@ Underscore-prefixed so pytest does not collect this as a test module.
 
 Hoists only the pieces that are byte-identical (module quirks aside) across
 the fp8-attention test files in this directory and in
-op_tests/test_unified_attention_flydsl.py. Page-pool builders and the various
+op_tests/flydsl_tests/test_unified_attention_routing.py. Page-pool builders and the various
 reference attention implementations are deliberately NOT here -- they differ
 across files (varlen vs paged vs ragged layouts, causal vs decode-only,
 sinks/ragged/mixed variants) and unifying them risks silently changing which

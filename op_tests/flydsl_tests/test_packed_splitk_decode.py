@@ -53,13 +53,18 @@ PAGE = 64
 H, HKV, D = 64, 4, 128  # GQA 16:1
 SEED = 3
 
-# (batch, ctx, splits, paged)
+# (batch, ctx, splits, paged) at b=9 -- one non-power-of-two batch (the production
+# vLLM trace spans b=7-9 but they share the same batch-tiling path).
+# ctx=16384: the larger page-aligned context, and the stricter KV-addressing case.
+# Both trace contexts (4096, 16384) land in the same evenly-divisible, page-aligned
+# split regime, so one covers it. splits={2,8} span the combine's min/max reduction
+# width; splits=4 divides evenly like the others and crosses no boundary here.
+# The uneven and underfilled split regimes are covered by the ragged cases below,
+# whose short sequences force partial and empty splits at these same split counts.
 CASES = []
-for _b in (7, 8, 9):
-    for _ctx in (4096, 16384):
-        for _sp in (2, 4, 8):
-            CASES.append((_b, _ctx, _sp, False))
-            CASES.append((_b, _ctx, _sp, True))
+for _sp in (2, 8):
+    CASES.append((9, 16384, _sp, False))
+    CASES.append((9, 16384, _sp, True))
 
 # RAGGED decode: each sequence has its OWN kv length via cu_seqlens_kv, one query
 # token each (Sq=1). This is the general decode case split-K must serve -- a batch
@@ -67,15 +72,12 @@ for _b in (7, 8, 9):
 # sequence segment math. Lengths deliberately span short (<1 tile), single-page,
 # odd, and long contexts so the segment [split_t0, split_t_end) differs per seq.
 RAGGED_SEQS = {
-    7: [4096, 8192, 16384, 1024, 6000, 300, 12000],
-    8: [4096, 8192, 16384, 1024, 6000, 300, 12000, 2048],
     9: [4096, 8192, 16384, 1024, 6000, 300, 12000, 2048, 512],
 }
 RAGGED_CASES = []
-for _b in (7, 8, 9):
-    for _sp in (2, 4, 8):
-        RAGGED_CASES.append((_b, _sp, False))
-        RAGGED_CASES.append((_b, _sp, True))
+for _sp in (2, 4, 8):
+    RAGGED_CASES.append((9, _sp, False))
+    RAGGED_CASES.append((9, _sp, True))
 
 
 def reference(qf, qs, kf, ks, vf, vs, d):

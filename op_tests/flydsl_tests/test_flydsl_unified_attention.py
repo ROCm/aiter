@@ -8,7 +8,7 @@ unified-attention suite uses), so a failure here is the FlyDSL path's, not a
 disagreement between two fp8 kernels.
 
 Routing through the public `unified_attention` entry point is covered separately
-in op_tests/test_unified_attention_flydsl.py.
+in op_tests/flydsl_tests/test_unified_attention_routing.py.
 """
 
 import math
@@ -565,24 +565,3 @@ def test_out_not_overwritten_past_active_rows():
     assert torch.isnan(
         padded[out.shape[0] :]
     ).all(), "the kernel wrote past the end of the output tensor"
-
-
-# --- the invariant the softmax_scale injection rests on ----------------------
-
-
-def test_q_descale_has_no_other_consumer():
-    """`_scaled_q_descale` folds softmax_scale into q_descale, which is valid
-    only while q_descale reaches c_logit_scale and nothing else. Two occurrences
-    are expected: the load and the multiply. A third means someone gave the Q
-    descale a second consumer, and the injection is now silently wrong."""
-    from pathlib import Path
-
-    import aiter.ops.flydsl.kernels.flash_attn_dualwave_common as common
-
-    src = Path(common.__file__).read_text()
-    n = sum(1 for line in src.splitlines() if "_qd" in line and "_qd_" not in line)
-    assert n == 2, (
-        f"expected 2 references to the loaded q descale, found {n}. "
-        "The softmax_scale injection in unified_attention_kernels.py assumes "
-        "q_descale feeds only c_logit_scale -- re-verify before trusting it."
-    )

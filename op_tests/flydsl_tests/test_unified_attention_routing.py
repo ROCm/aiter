@@ -23,7 +23,7 @@ from unittest import mock
 import pytest
 import torch
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 import aiter.ops.triton.attention.unified_attention as ua
 from aiter.ops.flydsl.utils import is_flydsl_available
@@ -526,7 +526,6 @@ def test_padded_q_stride_declines_to_triton():
         cu_seqlens_q=cu_q,
         seqused_k=seqused_k,
         max_seqlen_k=max(kv_lens),
-        causal=True,
         window_size=(-1, -1),
         block_table=bt,
         softcap=0,
@@ -609,7 +608,6 @@ def test_predicate_declines_unsupported_geometry():
         "cu_seqlens_q": cu_q,
         "seqused_k": seqused_k,
         "max_seqlen_k": 256,
-        "causal": True,
         "window_size": (-1, -1),
         "block_table": bt,
         "softcap": 0,
@@ -645,10 +643,6 @@ def test_predicate_declines_unsupported_geometry():
     # cache. The flag on this base's 4D linear tensors is an inconsistent combo
     # and must decline (the vectorized loader would mis-address 4D memory).
     assert not _supported(**{**base, "shuffled_kv_cache": True})
-    # causal is intentionally unconstrained here -- non-causal is served (see
-    # test_non_causal_routes_and_agrees below); the assert above only checks
-    # structural geometry, not the mask mode.
-    assert _supported(**{**base, "causal": False})
     # Descales are mandatory on the fp8 path.
     assert not _supported(**{**base, "q_descale": None})
 
@@ -665,7 +659,6 @@ def test_predicate_declines_wrong_dtypes():
         "cu_seqlens_q": cu_q,
         "seqused_k": seqused_k,
         "max_seqlen_k": 256,
-        "causal": True,
         "window_size": (-1, -1),
         "block_table": bt,
         "softcap": 0,
