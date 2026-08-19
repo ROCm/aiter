@@ -660,15 +660,13 @@ void inverse_rope_group_quant(
             const bool super_major =
                 LAYOUT == kScaleN32K4 &&
                 (super_ovr >= 0 ? super_ovr != 0 : S >= 256);
-            int n_super = (((S + 31) / 32) + 7) & ~7;
-            // On large S only: widen remap period so block i and i+n_super (same
-            // 128B chunk) are less likely concurrent on 256-CU parts. Skip small
-            // S -- padding to 1024 there only multiplies empty grid.x launches.
-            if(LAYOUT == kScaleN32K4 && super_major && ((S + 31) / 32) >= 512)
-            {
-                n_super = std::max(
-                    n_super, static_cast<int>(get_num_cu_func()) * 4);
-            }
+            // Round up to a multiple of 8 and no further. Widening the period
+            // past that (to spread a chunk's 32 rows over a longer dispatch
+            // window) costs one empty block per padded row, and that bill grows
+            // with G: at G=16 S=16384 an n_super of 1024 doubled grid.x and cost
+            // 1.47x (5.70 vs 8.41 TB/s against S=16000, which misses the same
+            // threshold). The 8-multiple padding alone is at most 7 supers.
+            const int n_super = (((S + 31) / 32) + 7) & ~7;
             const int s_extent = super_major ? n_super * 32 : S;
 
             // Fallback, for the shapes super-major declines (S < 256, and any
@@ -825,6 +823,22 @@ void inverse_rope_group_quant(
             // transactions. n32k4 does not need this -- its four adjacent k are
             // four adjacent bytes, so it writes like the row-major layout.
             tds = std::max(tds, GS * 8 / wave_size);
+        }
+        else if(!wave64)
+        {
+            // These tiers want one wave per block (see waves_per_block below),
+            // and a block is k_slots * (GS / tds) threads with k_slots capped at
+            // Ks. So a wide slice leaves a partial wave once Ks is small: at
+            // GS=32 with Ks=16 (G=16 here), tds=32 puts one thread on each group
+            // and only 16 of the wave's 32 lanes get work -- measured 5.32 vs
+            // 6.37 TB/s at S=4096. Narrow the slice until the block can fill a
+            // wave; Ks * GS is the widest block this Ks can supply.
+            while(tds > 1 &&
+                  static_cast<int64_t>(scale_n) * GS <
+                      static_cast<int64_t>(tds) * wave_size)
+            {
+                tds >>= 1;
+            }
         }
         }
         tds = std::min(tds, GS);
