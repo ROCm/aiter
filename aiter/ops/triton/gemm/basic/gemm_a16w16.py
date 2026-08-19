@@ -103,7 +103,6 @@ def gemm_a16w16_(
         skip_reduce (Optional[bool]): [triton only] Skip reduction of split-K partial
             results. Returns shape (NUM_KSPLIT, M, N) instead of (M, N).
         kernel_type (str): [gluon only] Kernel variant ("bandwidth_bound", "compute_bound").
-            Ignored when persistent=True; the persistent kernels have one variant.
         backend (Optional[str]): "triton", "gluon", or None (auto-detect).
         persistent (bool): Use the persistent kernel, which launches one workgroup
             per CU and walks a strided subset of the output tiles, instead of one
