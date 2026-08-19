@@ -383,7 +383,7 @@ def _moe_gemm_a4w4(
         tl.static_assert(stride_w_mx_k is not None)
         tl.static_assert(stride_w_mx_n is not None)
         NON_K_PRESHUFFLE_BLOCK_SIZE: tl.constexpr = 32
-        GFX1250_SCALE_KWIDTH: tl.constexpr = 8
+        GFX1250_SCALE_KWIDTH: tl.constexpr = 4
         PACKED_MX_BLOCK: tl.constexpr = MX_SCALE_BLOCK_K * NON_K_PRESHUFFLE_BLOCK_SIZE
         SCALE_BLOCK_N: tl.constexpr = BLOCK_N // NON_K_PRESHUFFLE_BLOCK_SIZE
     else:
