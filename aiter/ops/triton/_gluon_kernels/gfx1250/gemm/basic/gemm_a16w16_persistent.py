@@ -22,6 +22,7 @@ _GLUON_REPR_KEYS = [
     "USE_ACTIVATION",
     "ADD_BIAS",
     "NUM_WGS",
+    "num_warps",
 ]
 
 _gemm_a16w16_persistent_repr = make_kernel_repr(
@@ -31,6 +32,39 @@ _gemm_a16w16_persistent_repr = make_kernel_repr(
 _gemm_a16w16_persistent_compute_bound_repr = make_kernel_repr(
     "gemm_a16w16_persistent_compute_bound_gfx1250_kernel_", _GLUON_REPR_KEYS
 )
+
+
+# These run as plain Python at trace time, which is why the layouts are built
+# here rather than with inline constexpr expressions: a constexpr comparison
+# evaluated by the Gluon frontend (e.g. a comprehension guard on num_warps) is
+# truthy for every candidate, which silently produced a 16-warp WMMA layout.
+@gluon.constexpr_function
+def _warp_bases(num_warps):
+    """One base per bit of num_warps: bit 0 splits along N, the rest along M."""
+    return tuple(
+        (0, 1) if i == 0 else (1 << (i - 1), 0)
+        for i in range(num_warps.bit_length() - 1)
+    )
+
+
+@gluon.constexpr_function
+def _shared_layout_a(BLOCK_M, BLOCK_K):
+    """A is (M, K) row-major, so pad along K."""
+    return gl.PaddedSharedLayout.with_identity_for(
+        [[BLOCK_K, 8]], [BLOCK_M, BLOCK_K], [1, 0]
+    )
+
+
+@gluon.constexpr_function
+def _shared_layout_b(BLOCK_N, BLOCK_K, TRANSPOSE):
+    """Pad along whichever axis B is contiguous in: N for TT, K for TN."""
+    if TRANSPOSE:
+        return gl.PaddedSharedLayout.with_identity_for(
+            [[BLOCK_N, 16]], [BLOCK_K, BLOCK_N], [1, 0]
+        )
+    return gl.PaddedSharedLayout.with_identity_for(
+        [[BLOCK_K, 8]], [BLOCK_N, BLOCK_K], [1, 0]
+    )
 
 
 @gluon.jit(repr=_gemm_a16w16_persistent_repr)
@@ -55,20 +89,24 @@ def gemm_a16w16_persistent_kernel_(
     BLOCK_K: gl.constexpr,
     GROUP_SIZE_M: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
-    SHARED_LAYOUT_A: gl.constexpr,
-    SHARED_LAYOUT_B: gl.constexpr,
-    WARP_BASES: gl.constexpr,
     TRANSPOSE: gl.constexpr,
     activation: gl.constexpr,
     USE_ACTIVATION: gl.constexpr,
     ADD_BIAS: gl.constexpr,
     NUM_WGS: gl.constexpr,
+    num_warps: gl.constexpr,
 ):
 
     gl.static_assert(NUM_BUFFERS >= 2, "persistent gemm requires NUM_BUFFERS >= 2")
 
+    SHARED_LAYOUT_A: gl.constexpr = _shared_layout_a(BLOCK_M, BLOCK_K)
+    SHARED_LAYOUT_B: gl.constexpr = _shared_layout_b(BLOCK_N, BLOCK_K, TRANSPOSE)
+
     WMMA_LAYOUT: gl.constexpr = gl.amd.AMDWMMALayout(
-        version=3, transposed=True, warp_bases=WARP_BASES, instr_shape=[16, 16, 32]
+        version=3,
+        transposed=True,
+        warp_bases=_warp_bases(num_warps),
+        instr_shape=[16, 16, 32],
     )
     OPERAND_LAYOUT_A: gl.constexpr = gl.DotOperandLayout(
         operand_index=0, parent=WMMA_LAYOUT, k_width=8
@@ -139,16 +177,12 @@ def gemm_a16w16_persistent_kernel_(
         load_idx = 0
         compute_idx = 0
 
-        accumulator = gl.zeros(
-            (BLOCK_M, BLOCK_N), dtype=gl.float32, layout=WMMA_LAYOUT
-        )
+        accumulator = gl.zeros((BLOCK_M, BLOCK_N), dtype=gl.float32, layout=WMMA_LAYOUT)
         if ADD_BIAS:
             offs_bias = n_off + gl.arange(
                 0, BLOCK_N, layout=gl.SliceLayout(0, WMMA_LAYOUT)
             )
-            bias_vals = gl.load(
-                bias_ptr + offs_bias, mask=offs_bias < N, other=0.0
-            )
+            bias_vals = gl.load(bias_ptr + offs_bias, mask=offs_bias < N, other=0.0)
             accumulator = accumulator + bias_vals[None, :]
 
         # fill buffers with tiles
@@ -233,12 +267,8 @@ def gemm_a16w16_persistent_kernel_(
         if USE_ACTIVATION:
             accumulator = activation(accumulator)
 
-        offs_cm = m_off + gl.arange(
-            0, BLOCK_M, layout=gl.SliceLayout(1, WMMA_LAYOUT)
-        )
-        offs_cn = n_off + gl.arange(
-            0, BLOCK_N, layout=gl.SliceLayout(0, WMMA_LAYOUT)
-        )
+        offs_cm = m_off + gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, WMMA_LAYOUT))
+        offs_cn = n_off + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, WMMA_LAYOUT))
         offs_c = stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
         mask_c = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
 
@@ -274,21 +304,25 @@ def gemm_a16w16_persistent_compute_bound_kernel_(
     BLOCK_K: gl.constexpr,
     GROUP_SIZE_M: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
-    SHARED_LAYOUT_A: gl.constexpr,
-    SHARED_LAYOUT_B: gl.constexpr,
-    WARP_BASES: gl.constexpr,
     TRANSPOSE: gl.constexpr,
     activation: gl.constexpr,
     USE_ACTIVATION: gl.constexpr,
     ADD_BIAS: gl.constexpr,
     NUM_WGS: gl.constexpr,
+    num_warps: gl.constexpr,
 ):
     gl.static_assert(
         NUM_BUFFERS >= 2, "persistent compute_bound requires NUM_BUFFERS >= 2"
     )
 
+    SHARED_LAYOUT_A: gl.constexpr = _shared_layout_a(BLOCK_M, BLOCK_K)
+    SHARED_LAYOUT_B: gl.constexpr = _shared_layout_b(BLOCK_N, BLOCK_K, TRANSPOSE)
+
     WMMA_LAYOUT: gl.constexpr = gl.amd.AMDWMMALayout(
-        version=3, transposed=True, warp_bases=WARP_BASES, instr_shape=[16, 16, 32]
+        version=3,
+        transposed=True,
+        warp_bases=_warp_bases(num_warps),
+        instr_shape=[16, 16, 32],
     )
     OPERAND_LAYOUT_A: gl.constexpr = gl.DotOperandLayout(
         operand_index=0, parent=WMMA_LAYOUT, k_width=8
@@ -359,16 +393,12 @@ def gemm_a16w16_persistent_compute_bound_kernel_(
         load_idx = 0
         compute_idx = 0
 
-        accumulator = gl.zeros(
-            (BLOCK_M, BLOCK_N), dtype=gl.float32, layout=WMMA_LAYOUT
-        )
+        accumulator = gl.zeros((BLOCK_M, BLOCK_N), dtype=gl.float32, layout=WMMA_LAYOUT)
         if ADD_BIAS:
             offs_bias = n_off + gl.arange(
                 0, BLOCK_N, layout=gl.SliceLayout(0, WMMA_LAYOUT)
             )
-            bias_vals = gl.load(
-                bias_ptr + offs_bias, mask=offs_bias < N, other=0.0
-            )
+            bias_vals = gl.load(bias_ptr + offs_bias, mask=offs_bias < N, other=0.0)
             accumulator = accumulator + bias_vals[None, :]
 
         for _ in gl.static_range(NUM_BUFFERS):
@@ -475,12 +505,8 @@ def gemm_a16w16_persistent_compute_bound_kernel_(
         if USE_ACTIVATION:
             accumulator = activation(accumulator)
 
-        offs_cm = m_off + gl.arange(
-            0, BLOCK_M, layout=gl.SliceLayout(1, WMMA_LAYOUT)
-        )
-        offs_cn = n_off + gl.arange(
-            0, BLOCK_N, layout=gl.SliceLayout(0, WMMA_LAYOUT)
-        )
+        offs_cm = m_off + gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, WMMA_LAYOUT))
+        offs_cn = n_off + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, WMMA_LAYOUT))
         offs_c = stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
         mask_c = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
 

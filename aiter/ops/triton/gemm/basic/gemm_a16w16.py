@@ -169,8 +169,6 @@ def gemm_a16w16_(
             assert (
                 _is_gluon_available()
             ), f"Gluon backend requires one of {_GLUON_SUPPORTED_ARCHS}, got '{get_arch()}'"
-            import triton.experimental.gluon.language as gl
-
             from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_a16w16_persistent import (
                 gemm_a16w16_persistent_kernel_ as _gluon_persistent_kernel,
             )
@@ -208,7 +206,7 @@ def gemm_a16w16_(
                 f"gluon persistent gemm requires x row-major (M, K), got strides "
                 f"{x.stride()}"
             )
-            
+
             if w.stride(1) == 1:
                 TRANSPOSE = True
             elif w.stride(0) == 1:
@@ -218,23 +216,6 @@ def gemm_a16w16_(
                     f"w must be contiguous in at least one dimension, got strides "
                     f"{w.stride()}"
                 )
-
-            shared_a = gl.PaddedSharedLayout.with_identity_for(
-                [[BLOCK_K, 8]], [BLOCK_M, BLOCK_K], [1, 0]
-            )
-            if TRANSPOSE:
-                shared_b = gl.PaddedSharedLayout.with_identity_for(
-                    [[BLOCK_N, 16]], [BLOCK_K, BLOCK_N], [1, 0]
-                )
-            else:
-                shared_b = gl.PaddedSharedLayout.with_identity_for(
-                    [[BLOCK_K, 8]], [BLOCK_N, BLOCK_K], [1, 0]
-                )
-
-            warp_bases = tuple(
-                (0, 1) if i == 0 else (1 << (i - 1), 0)
-                for i in range(num_warps.bit_length() - 1)
-            )
 
             # Persistent, NUM_WGS processes num_tiles
             _LOGGER.info(
@@ -263,9 +244,6 @@ def gemm_a16w16_(
                 BLOCK_K=BLOCK_K,
                 GROUP_SIZE_M=GROUP_SIZE_M,
                 NUM_BUFFERS=NUM_BUFFERS,
-                SHARED_LAYOUT_A=shared_a,
-                SHARED_LAYOUT_B=shared_b,
-                WARP_BASES=warp_bases,
                 TRANSPOSE=TRANSPOSE,
                 activation=_get_activation_from_str(activation) if activation else None,
                 USE_ACTIVATION=activation is not None,
