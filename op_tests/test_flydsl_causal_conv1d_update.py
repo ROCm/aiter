@@ -14,11 +14,20 @@ algorithm behind two different shells, and both are maintained:
   convolution walks each candidate token's parent chain instead of its linear
   predecessor.
 
-Both are measured against one high-precision torch spec (``_reference_update``)
-that covers every path including the tree and the snapshots. The vLLM cases are
-additionally compared with aiter's own Triton ``causal_conv1d_update``, and
-``test_dispatch_seam_routes_to_flydsl`` exercises the opt-in seam that routes
-that Triton entry point to the FlyDSL port.
+Both are measured against one high-precision torch spec (``run_torch``) that
+covers every path including the packed layout, the prefix-caching copy, the tree
+and the snapshots. The vLLM cases are additionally compared with aiter's own
+Triton ``causal_conv1d_update``, and ``test_dispatch_seam_routes_to_flydsl``
+exercises the opt-in seam that routes that Triton entry point to the FlyDSL port.
+
+Nothing here imports ``vllm`` or ``sglang``. The upstream behaviour those
+packages would have supplied is written into ``run_torch`` instead, against the
+revisions named below, which is how the rest of aiter treats upstream references
+(``op_tests/test_causal_conv1d_update.py`` carries Tri Dao's, and
+``op_tests/triton_tests/utils/mla_extend_ref.py`` SGLang's). The cost of that
+choice is real: a spec written from the same reading as the kernel cannot catch a
+misreading of the contract, so the pieces that are transcribed rather than
+derived are marked in place and carry the upstream revision they were read from.
 
 How the numeric bound is set
 ----------------------------
@@ -44,33 +53,42 @@ Sequence indices deliberately start at 1 in the vLLM cases: that wrapper's
 plain ``arange(batch)`` would make sequence 0 a null block and silently skip it.
 ``test_vllm_skips_the_null_block`` covers that behavior on purpose.
 
-When the ``sglang`` package is importable, the SGLang-interface cases pick up an
-extra bit-exact cross-check against its live Triton kernel; without it the torch
-spec above is the ground truth and the cross-check is skipped. vLLM's own kernel
-is picked up the same way for the varlen cases, where it is the only oracle for
-the handful whose per-sequence window upstream narrows below ``width - 1`` -- the
-dense entry point cannot express that, so those rest on it rather than on
-something weaker. The rest of the packed cases are pinned bit for bit against the
-dense path, which the spec already covers.
+Upstream revisions transcribed
+------------------------------
+vLLM ``63a9a5010`` and SGLang ``18107e38d2``, both read on 2026-08-14. Re-read
+them before changing ``run_torch``: the packed layout's window revision and the
+prefix-caching read/write split are transcriptions of those kernels, not
+consequences of the convolution, so they cannot be re-derived from first
+principles if they drift.
 
 Usage:
     HIP_VISIBLE_DEVICES=7 pytest -sv op_tests/test_flydsl_causal_conv1d_update.py
 
-    # or, the way CI invokes it (same checks, no pytest dependency):
+    # or, the way CI invokes it -- the same checks with no pytest dependency,
+    # followed by the perf sweep:
     HIP_VISIBLE_DEVICES=7 python3 op_tests/test_flydsl_causal_conv1d_update.py
+
+    # perf only, one mode:
+    HIP_VISIBLE_DEVICES=7 python3 op_tests/test_flydsl_causal_conv1d_update.py \
+        --run perf --mode varlen -b 128 -s 4
 """
 
 from __future__ import annotations
 
-import importlib
+import argparse
+import itertools
 import os
 import sys
 import traceback
 
+import pandas as pd
 import pytest
 import torch
 
+import aiter
+from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.utils import is_flydsl_available
+from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 if not torch.cuda.is_available():
     pytest.skip("ROCm not available. Skipping GPU tests.", allow_module_level=True)
@@ -82,6 +100,7 @@ if not is_flydsl_available():
 
 try:
     from aiter.ops.flydsl.causal_conv1d_update_kernels import (
+        NULL_BLOCK_ID,
         _causal_conv1d_update_flydsl_supported,
         _causal_conv1d_update_sglang_flydsl_supported,
         causal_conv1d_update_flydsl,
@@ -97,50 +116,17 @@ except ImportError as exc:
     )
 
 
-def _load_live_sglang():
-    """SGLang's own Triton kernel, when the package happens to be importable.
-
-    An optional extra cross-check, matching how the FlyDSL GDN prefill test picks
-    up vLLM's kernel when installed. SGLang is not a dependency of aiter and pulls
-    in heavy transitive ones, so its absence is normal and simply drops the
-    cross-check.
-    """
-    for path in (
-        "sglang.kernels.ops.mamba.causal_conv1d_triton",
-        "sglang.srt.layers.attention.mamba.causal_conv1d_triton",
-    ):
-        try:
-            return importlib.import_module(path).causal_conv1d_update
-        except Exception:  # noqa: BLE001,S112 - absent, or unimportable standalone
-            continue
-    return None
-
-
-def _load_live_vllm():
-    """vLLM's own Triton kernel, when the package happens to be importable.
-
-    The counterpart of :func:`_load_live_sglang`. It is the only oracle for the
-    varlen combinations, whose per-sequence ``state_len`` revision the dense path
-    cannot express, so those cases skip without it rather than assert something
-    weaker.
-    """
-    try:
-        module = importlib.import_module(
-            "vllm.model_executor.layers.mamba.ops.causal_conv1d"
-        )
-    except Exception:  # noqa: BLE001 - absent, or unimportable standalone
-        return None
-    return getattr(module, "causal_conv1d_update", None)
-
-
-causal_conv1d_update_sglang_live = _load_live_sglang()
-causal_conv1d_update_vllm_live = _load_live_vllm()
-
 DEVICE = "cuda"
 DTYPE = torch.bfloat16
 
-#: One bf16 mantissa step, the relative cost of storing any single value.
-_BF16_EPS = 2.0**-8
+#: The kernels are built for CDNA3/CDNA4 and the launch policy is tuned on them.
+SUPPORTED_GFX = ("gfx942", "gfx950")
+
+#: One mantissa step of the storage dtype, the relative cost of storing any
+#: single value. fp16 keeps three more significand bits than bf16, so it has to
+#: be held to the tighter budget or its cases pass on bf16's slack.
+_DTYPE_EPS = {torch.bfloat16: 2.0**-8, torch.float16: 2.0**-11}
+_DTYPE_NAME = {torch.bfloat16: "bf16", torch.float16: "fp16"}
 
 #: How many of those steps a result may accumulate over the whole convolution,
 #: scaled per element by the conditioning (see the module docstring). Covers the
@@ -151,20 +137,20 @@ _ERR_FACTOR = 8.0
 # -- inputs ---------------------------------------------------------------
 
 
-def _make_inputs(batch, dim, width, seqlen, *, spec, seed, has_bias=True):
+def _make_inputs(batch, dim, width, seqlen, *, spec, seed, has_bias=True, dtype=DTYPE):
     """Random problem plus a spare cache line, so indices can start at 1."""
     gen = torch.Generator(device=DEVICE).manual_seed(seed)
     state_len = (width - 1 + (seqlen - 1)) if spec else (width - 1)
     return {
         "x": torch.randn(
-            (batch, dim, seqlen), generator=gen, device=DEVICE, dtype=DTYPE
+            (batch, dim, seqlen), generator=gen, device=DEVICE, dtype=dtype
         ),
         "conv_state": torch.randn(
-            (batch + 1, dim, state_len), generator=gen, device=DEVICE, dtype=DTYPE
+            (batch + 1, dim, state_len), generator=gen, device=DEVICE, dtype=dtype
         ),
-        "weight": torch.randn((dim, width), generator=gen, device=DEVICE, dtype=DTYPE),
+        "weight": torch.randn((dim, width), generator=gen, device=DEVICE, dtype=dtype),
         "bias": (
-            torch.randn((dim,), generator=gen, device=DEVICE, dtype=DTYPE)
+            torch.randn((dim,), generator=gen, device=DEVICE, dtype=dtype)
             if has_bias
             else None
         ),
@@ -199,7 +185,7 @@ def _eagle_tree_links(batch, seqlen):
 # -- high-precision spec --------------------------------------------------
 
 
-def _reference_update(
+def run_torch(
     x,
     conv_state,
     weight,
@@ -208,12 +194,18 @@ def _reference_update(
     num_accepted,
     *,
     skip_line,
+    lens=None,
+    write_indices=None,
     window=None,
     inter_indices=None,
     next_token=None,
     next_sibling=None,
 ):
     """fp64 spec of the update, covering both upstreams' STEP 1-5.
+
+    The reference for every case in this file, named for the aiter convention
+    (``op_tests`` reference implementations are ``run_torch``) and kept at module
+    level so other tests can import it.
 
     Returns ``(out, conv_state, window, parents, scale)``. Only ``out`` is fp64,
     as the yardstick for either bf16 kernel; the rolled state, the snapshots and
@@ -225,6 +217,13 @@ def _reference_update(
     is left completely alone (vLLM spells it ``null_block_id`` and defaults to the
     valid index ``0``; SGLang spells it ``pad_slot_id`` and uses ``-1``).
 
+    ``x`` stays dense ``(batch, dim, seqlen)`` even for the packed layout, so
+    there is one spec and not two. ``lens`` then gives each sequence's real token
+    count and ``seqlen`` is the budget the caller compiled for; only the first
+    ``lens[i]`` columns of ``out`` are meaningful. ``write_indices`` splits the
+    cache line the window is written to from the one the history is read from,
+    which is what Automatic Prefix Caching does.
+
     The chain path accumulates as one fp64 reduction over the width taps rather
     than the kernel's sequential FMA chain, so agreement is a numerical
     cross-check and not a restatement of the implementation.
@@ -233,7 +232,6 @@ def _reference_update(
     width = weight.shape[1]
     is_spec = num_accepted is not None
     state_len = (width - 1 + (seqlen - 1)) if is_spec else (width - 1)
-    val = state_len - seqlen
     tree = next_token is not None
     if inter_indices is None:
         inter_indices = conv_state_indices
@@ -258,6 +256,17 @@ def _reference_update(
         line = int(conv_state_indices[i])
         if line >= conv_state.shape[0] or (skip_line is not None and line == skip_line):
             continue
+        # Upstream revises both lengths by the padding this sequence did not use,
+        # and returns before any store when it owns no tokens at all. Transcribed
+        # from vLLM's kernel rather than derived: without a rollback point the
+        # revision pulls the window below width - 1, which no dense call can be
+        # asked to reproduce.
+        tokens = seqlen if lens is None else int(lens[i])
+        if tokens == 0:
+            continue
+        seq_state_len = state_len - (seqlen - tokens)
+        val = seq_state_len - tokens
+        write_line = line if write_indices is None else int(write_indices[i])
         win_line = int(inter_indices[i])
         raw = conv_state[line]
         state = raw.double()
@@ -267,7 +276,7 @@ def _reference_update(
         cols_raw = [raw[:, offset + k] for k in range(width - 1)]
 
         if tree:
-            for token in range(seqlen):
+            for token in range(tokens):
                 # STEP 3: the parent map is built in token order exactly as the
                 # kernel does -- a child's parent is the current token, and a
                 # sibling inherits the current token's parent.
@@ -299,7 +308,7 @@ def _reference_update(
                 scale[i, :, token] = mag
         else:
             win, win_raw = list(cols), list(cols_raw)
-            for token in range(seqlen):
+            for token in range(tokens):
                 taps = torch.stack(win + [x[i, :, token].double()], dim=1)
                 acc = (taps * w).sum(dim=1) + b
                 out[i, :, token] = acc * torch.sigmoid(acc)
@@ -313,17 +322,19 @@ def _reference_update(
 
         # STEP 2: slide the stored window and blend in the new tokens. The slide
         # is one column when a speculative rollback point is in play and the
-        # whole chunk otherwise, which only differ once 1 < seqlen < width - 1.
-        shift = 1 if is_spec else seqlen
+        # whole chunk otherwise, which only differ once 1 < tokens < width - 1.
+        # Only the revised window is written, so whatever the destination line
+        # held past it stays -- that is upstream's mask, not an omission here.
+        shift = 1 if is_spec else tokens
         rolled = [
             (
                 raw[:, offset + shift + t]
-                if (t + seqlen) < state_len
+                if (t + tokens) < seq_state_len
                 else x[i, :, t - val]
             )
-            for t in range(state_len)
+            for t in range(seq_state_len)
         ]
-        new_state[line, :, :state_len] = torch.stack(rolled, dim=1)
+        new_state[write_line, :, :seq_state_len] = torch.stack(rolled, dim=1)
 
     return out, new_state, new_window, parents, scale
 
@@ -332,13 +343,14 @@ def _reference_update(
 
 
 def _assert_tracks_spec(label, actual, spec, scale, factor=_ERR_FACTOR):
-    """``actual`` (bf16) must sit inside the conditioning-scaled error budget."""
+    """``actual`` must sit inside the conditioning-scaled error budget."""
+    name = _DTYPE_NAME[actual.dtype]
     err = (actual.double() - spec).abs()
-    budget = factor * _BF16_EPS * scale
+    budget = factor * _DTYPE_EPS[actual.dtype] * scale
     ratio = err / budget.clamp_min(torch.finfo(torch.float64).tiny)
     worst = ratio.argmax()
     assert (err <= budget).all(), (
-        f"{label}: output exceeds {factor} bf16 steps of its own conditioning; "
+        f"{label}: output exceeds {factor} {name} steps of its own conditioning; "
         f"worst element {worst.item()}: got {actual.flatten()[worst].item():.6g}, "
         f"spec {spec.flatten()[worst].item():.6g}, "
         f"error {err.flatten()[worst].item():.3e} > budget "
@@ -350,14 +362,14 @@ def _assert_tracks_spec(label, actual, spec, scale, factor=_ERR_FACTOR):
 def _assert_no_worse_than(label, flydsl, other, spec, scale, other_name):
     """FlyDSL must track the spec at least as closely as ``other`` does.
 
-    The two bf16 backends round differently, so requiring them to agree would
-    pin the less accurate one's error. One bf16 step of the element's own
-    conditioning is allowed as slack, so a rounding tie cannot fail this while a
-    real regression still does.
+    The two backends round differently, so requiring them to agree would pin the
+    less accurate one's error. One step of the element's own conditioning is
+    allowed as slack, so a rounding tie cannot fail this while a real regression
+    still does.
     """
     err_fly = (flydsl.double() - spec).abs()
     err_other = (other.double() - spec).abs()
-    slack = _BF16_EPS * scale
+    slack = _DTYPE_EPS[flydsl.dtype] * scale
     regressed = err_fly > err_other + slack
     assert not regressed.any(), (
         f"{label}: FlyDSL is further from the spec than {other_name} on "
@@ -395,18 +407,51 @@ _VLLM_CASES = [
     (8, 256, 3, 4, True),
 ]
 
+#: Every shape in bf16, plus fp16 on a representative few. fp16 is the same
+#: algorithm but a separately compiled specialization, so it needs its own cases;
+#: these four span both widths, both rollback modes and the narrow-window band
+#: without doubling the table, and they are what would catch the error budget
+#: being left at bf16's three-bits-looser step.
+_VLLM_FP16_CASES = [
+    (4, 256, 4, 1, False),
+    (4, 128, 4, 2, False),
+    (32, 384, 4, 4, True),
+    (8, 256, 3, 4, True),
+]
 
-@pytest.mark.parametrize("batch,dim,width,seqlen,spec", _VLLM_CASES)
-def test_vllm_against_spec_and_aiter_triton(batch, dim, width, seqlen, spec):
+
+def _vllm_param(batch, dim, width, seqlen, spec, dtype):
+    """Spell the dtype in the test id; pytest would render it as ``dtype3``."""
+    return pytest.param(
+        batch,
+        dim,
+        width,
+        seqlen,
+        spec,
+        dtype,
+        id=f"b{batch}-d{dim}-w{width}-s{seqlen}"
+        f"-{'spec' if spec else 'nospec'}-{_DTYPE_NAME[dtype]}",
+    )
+
+
+_VLLM_DTYPE_CASES = [_vllm_param(*c, torch.bfloat16) for c in _VLLM_CASES] + [
+    _vllm_param(*c, torch.float16) for c in _VLLM_FP16_CASES
+]
+
+
+@pytest.mark.parametrize("batch,dim,width,seqlen,spec,dtype", _VLLM_DTYPE_CASES)
+def test_vllm_against_spec_and_aiter_triton(batch, dim, width, seqlen, spec, dtype):
     """Drop-in for aiter's Triton causal_conv1d_update, and at least as accurate.
 
     Checks three things at once: the output stays inside its error budget, it is
     no further from the spec than the Triton kernel is, and the ``conv_state``
     roll-back matches both the spec and Triton bit-exactly.
     """
-    t = _make_inputs(batch, dim, width, seqlen, spec=spec, seed=batch * 100 + seqlen)
+    t = _make_inputs(
+        batch, dim, width, seqlen, spec=spec, seed=batch * 100 + seqlen, dtype=dtype
+    )
     indices = torch.arange(1, batch + 1, dtype=torch.int32, device=DEVICE)
-    label = f"vllm b{batch} d{dim} w{width} s{seqlen} spec={spec}"
+    label = f"vllm b{batch} d{dim} w{width} s{seqlen} spec={spec} {_DTYPE_NAME[dtype]}"
 
     state_fly = t["conv_state"].clone()
     out_fly = causal_conv1d_update_flydsl(
@@ -432,7 +477,7 @@ def test_vllm_against_spec_and_aiter_triton(batch, dim, width, seqlen, spec):
         num_accepted_tokens=t["num_accepted"],
     )
 
-    out_spec, state_spec, _, _, scale = _reference_update(
+    out_spec, state_spec, _, _, scale = run_torch(
         t["x"],
         t["conv_state"],
         t["weight"],
@@ -633,7 +678,7 @@ def test_sglang_against_spec(batch, dim, width, seqlen, spec, save_inter, tree):
     out, state, window, parents = _run_sglang(
         causal_conv1d_update_sglang_flydsl, t, batch, seqlen, tree, save_inter
     )
-    out_spec, state_spec, window_spec, parents_spec, scale = _reference_update(
+    out_spec, state_spec, window_spec, parents_spec, scale = run_torch(
         t["x"],
         t["conv_state"],
         t["weight"],
@@ -653,39 +698,6 @@ def test_sglang_against_spec(batch, dim, width, seqlen, spec, save_inter, tree):
         _assert_bit_exact(label, "intermediate_conv_window", window, window_spec)
     if tree:
         _assert_bit_exact(label, "retrieve_parent_token map", parents, parents_spec)
-
-
-@pytest.mark.skipif(
-    causal_conv1d_update_sglang_live is None,
-    reason="the sglang package is not importable here; the torch spec is the oracle",
-)
-@pytest.mark.parametrize("batch,dim,width,seqlen,spec,save_inter,tree", _SGLANG_CASES)
-def test_sglang_matches_live_sglang(batch, dim, width, seqlen, spec, save_inter, tree):
-    """Bit-exact against SGLang's own Triton kernel, when it is installed.
-
-    The FlyDSL kernel deliberately emits the same bare ``v_exp_f32`` /
-    ``v_rcp_f32`` pair that SGLang's Triton silu lowers to and accumulates in the
-    same order, so where this can run at all it must agree exactly.
-    """
-    t = _sglang_problem(batch, dim, width, seqlen, spec, save_inter, tree)
-    label = (
-        f"sglang-live b{batch} d{dim} w{width} s{seqlen} spec={spec} "
-        f"inter={save_inter} tree={tree}"
-    )
-
-    got = _run_sglang(
-        causal_conv1d_update_sglang_flydsl, t, batch, seqlen, tree, save_inter
-    )
-    want = _run_sglang(
-        causal_conv1d_update_sglang_live, t, batch, seqlen, tree, save_inter
-    )
-    for what, actual, expected in zip(
-        ("output", "conv_state", "intermediate_conv_window", "retrieve_parent_token"),
-        got,
-        want,
-    ):
-        if actual is not None:
-            _assert_bit_exact(label, what, actual, expected)
 
 
 # -- the aiter dispatch seam ----------------------------------------------
@@ -754,7 +766,7 @@ def test_dispatch_seam_routes_to_flydsl(batch, dim, width, seqlen, spec, save_in
         "x after the call would silently see stale activations"
     )
 
-    _, _, _, _, scale = _reference_update(
+    _, _, _, _, scale = run_torch(
         t["x"],
         t["conv_state"],
         t["weight"],
@@ -763,7 +775,7 @@ def test_dispatch_seam_routes_to_flydsl(batch, dim, width, seqlen, spec, save_in
         t["num_accepted"],
         skip_line=-1,
     )
-    out_spec, state_spec, window_spec, _, _ = _reference_update(
+    out_spec, state_spec, window_spec, _, _ = run_torch(
         t["x"],
         t["conv_state"],
         t["weight"],
@@ -960,17 +972,11 @@ _VARLEN_CASES = [
 ]
 
 
-#: How far the output may sit from vLLM's Triton, in bf16 steps of its own
-#: magnitude. Not a rounding tie: the two kernels lower silu differently (see
-#: :func:`test_vllm_varlen_matches_live_vllm`), which costs a few steps on the
-#: dense path too, so this is sized to that and not to varlen.
-_VLLM_SILU_STEPS = 8
-
 #: The subset whose sequences are each equivalent to a dense problem. With a
 #: rollback point the window is history + accepted drafts, whose length tracks the
 #: sequence, and at max_query_len == 1 there is no padding to revise away. Without
 #: either, upstream narrows a short sequence's window below width - 1, which the
-#: dense entry point cannot express, so those cases rest on the live oracle below.
+#: dense entry point cannot express, so only the spec reaches those.
 _VARLEN_DENSE_EQUIVALENT = [c for c in _VARLEN_CASES if c[2] or c[1] == 1]
 
 
@@ -1072,35 +1078,44 @@ def test_vllm_varlen_matches_the_dense_path(width, seqlen, spec, lens):
         )
 
 
-@pytest.mark.skipif(
-    causal_conv1d_update_vllm_live is None,
-    reason="the vllm package is not importable here",
-)
 @pytest.mark.parametrize("width,seqlen,spec,lens", _VARLEN_CASES)
-def test_vllm_varlen_matches_live_vllm(width, seqlen, spec, lens):
-    """The packed layout, against vLLM's own kernel on the same inputs.
+def test_vllm_varlen_matches_the_spec(width, seqlen, spec, lens):
+    """Every packed case against the spec, narrowed windows included.
 
-    ``conv_state`` carries the whole point of the mode -- which slots of which
-    cache line each sequence owns once its window has been narrowed, and that an
-    empty slot is left alone -- and it is assembled from copies, so it must agree
-    bit for bit. The output only has to stay close: this kernel emits the same
-    bare ``v_exp_f32`` / ``v_rcp_f32`` pair SGLang's Triton lowers silu to, while
-    vLLM's spells it ``acc / (1 + exp(-acc))``, and the two round apart by a few
-    bf16 steps on the dense path already (measured up to 3.5).
+    The test above only reaches the cases each of whose sequences is a dense
+    problem. This one reaches all of them, because the spec is handed the
+    per-sequence token counts and performs upstream's window revision itself
+    rather than inferring it, which is the part the dense entry point cannot
+    express. ``conv_state`` must match bit for bit -- it is copies all the way
+    down, including the slots past a narrowed window that must keep whatever the
+    cache line already held.
     """
     t = _varlen_problem(width, seqlen, spec, lens)
-    label = f"varlen-live w{width} s{seqlen} spec={spec} lens={lens}"
+    label = f"varlen-spec w{width} s{seqlen} spec={spec} lens={lens}"
 
     got, got_state = _run_varlen(causal_conv1d_update_flydsl, t, seqlen)
-    want, want_state = _run_varlen(causal_conv1d_update_vllm_live, t, seqlen)
-
-    _assert_bit_exact(label, "conv_state", got_state, want_state)
-    delta = (got.float() - want.float()).abs()
-    steps = delta / (_BF16_EPS * want.float().abs().clamp_min(1.0))
-    assert (steps <= _VLLM_SILU_STEPS).all(), (
-        f"{label}: output is {steps.max().item():.1f} bf16 steps from vLLM's, past "
-        f"the {_VLLM_SILU_STEPS} the two silu lowerings account for"
+    out_spec, state_spec, _, _, scale = run_torch(
+        t["x_dense"],
+        t["conv_state"],
+        t["weight"],
+        t["bias"],
+        t["indices"],
+        t["nacc"],
+        skip_line=NULL_BLOCK_ID,
+        lens=lens,
     )
+
+    _assert_bit_exact(label, "conv_state", got_state, state_spec)
+    for i, n in enumerate(lens):
+        if n == 0:
+            continue
+        start = int(t["qsl"][i])
+        _assert_tracks_spec(
+            f"{label} seq {i}",
+            got[start : start + n].T.contiguous(),
+            out_spec[i, :, :n],
+            scale[i, :, :n],
+        )
 
 
 def _with_apc_blocks(t):
@@ -1168,6 +1183,92 @@ def test_vllm_varlen_with_apc_copies_instead_of_clobbering(width, seqlen, spec, 
         _assert_bit_exact(
             label, f"seq {i} source block left alone", apc_state[read], original[read]
         )
+
+
+def _channel_major(x):
+    """``mamba_mixer``'s layout: tokens adjacent, one channel a token count apart.
+
+    Its decode path projects into a channel-major buffer and hands over
+    ``hidden_states_BC_d.transpose(0, 1)`` without making it contiguous.
+    """
+    return x.t().contiguous().t()
+
+
+def _column_slice(x, lead=3, trail=5):
+    """``mamba_mixer2``'s layout: a channel window of a wider fused projection.
+
+    Its input is a column slice of the packed QKV-style projection, so a token's
+    channels are adjacent but consecutive tokens are the whole projection apart.
+    """
+    tokens, dim = x.shape
+    wide = torch.empty(
+        (tokens, lead + dim + trail), device=x.device, dtype=x.dtype
+    ).normal_()
+    view = wide[:, lead : lead + dim]
+    view.copy_(x)
+    return view
+
+
+def _assert_strided(view, source):
+    """Guard the guard: a relayout that came back contiguous tests nothing."""
+    assert not view.is_contiguous() and torch.equal(view, source), (
+        f"relayout produced a {'contiguous' if view.is_contiguous() else 'differing'} "
+        f"tensor (strides {view.stride()}), so the strided path is not exercised"
+    )
+    return view
+
+
+@pytest.mark.parametrize("relayout", [_channel_major, _column_slice])
+def test_vllm_reads_x_through_its_strides(relayout):
+    """Neither mixer makes ``x`` contiguous, so both layouts must give one answer.
+
+    The kernel addresses ``x`` through the strides it is handed, and a wrong
+    assumption there is invisible on a contiguous tensor -- both call sites pass
+    a view. Same values, different layout, so this is bit-exact rather than a
+    tolerance: dense decode covers ``mamba_mixer`` and packed varlen covers
+    ``mamba_mixer2``.
+    """
+    label = f"strided x via {relayout.__name__}"
+
+    # Dense decode, x as (batch, dim).
+    t = _make_inputs(8, 256, 4, 1, spec=False, seed=4242)
+    flat = t["x"].squeeze(-1)
+    indices = torch.arange(1, 9, dtype=torch.int32, device=DEVICE)
+    runs = []
+    for variant in (flat, _assert_strided(relayout(flat), flat)):
+        state = t["conv_state"].clone()
+        out = causal_conv1d_update_flydsl(
+            variant,
+            state,
+            t["weight"],
+            bias=t["bias"],
+            activation="silu",
+            conv_state_indices=indices,
+        )
+        runs.append((out, state))
+    _assert_bit_exact(f"{label} (dense)", "output", runs[1][0], runs[0][0])
+    _assert_bit_exact(f"{label} (dense)", "conv_state", runs[1][1], runs[0][1])
+
+    # Packed varlen, x as (cu_tokens, dim).
+    v = _varlen_problem(4, 4, True, (4, 2, 1, 4))
+    packed = _pack(v["x_dense"], v["lens"])
+    runs = []
+    for variant in (packed, _assert_strided(relayout(packed), packed)):
+        state = v["conv_state"].clone()
+        out = causal_conv1d_update_flydsl(
+            variant,
+            state,
+            v["weight"],
+            bias=v["bias"],
+            activation="silu",
+            conv_state_indices=v["indices"],
+            num_accepted_tokens=v["nacc"],
+            query_start_loc=v["qsl"],
+            max_query_len=4,
+        )
+        runs.append((out, state))
+    _assert_bit_exact(f"{label} (varlen)", "output", runs[1][0], runs[0][0])
+    _assert_bit_exact(f"{label} (varlen)", "conv_state", runs[1][1], runs[0][1])
 
 
 #: (batch, dim, width, seqlen, spec). The first is vLLM's decode + APC call
@@ -1254,6 +1355,23 @@ def test_vllm_apc_copies_instead_of_clobbering(batch, dim, width, seqlen, spec):
         t["conv_state"][t["read_blocks"]],
     )
 
+    # The three assertions above are differential: they would all still hold if
+    # both runs read and wrote the wrong block in the same way. The spec pins the
+    # absolute addresses, so it is what fails if the pair of them agree on a
+    # wrong one.
+    out_spec, state_spec, _, _, scale = run_torch(
+        t["x"],
+        t["conv_state"],
+        t["weight"],
+        t["bias"],
+        t["read_blocks"],
+        t["num_accepted"],
+        skip_line=NULL_BLOCK_ID,
+        write_indices=t["write_blocks"],
+    )
+    _assert_tracks_spec(label, apc_out, out_spec, scale)
+    _assert_bit_exact(label, "conv_state against the spec", apc_state, state_spec)
+
 
 def test_vllm_apc_reads_the_selected_column():
     """The read column is ``initial_state_idx``, not just "the first one".
@@ -1328,20 +1446,234 @@ def test_predicates_refuse_unsupported_shapes():
     assert not _causal_conv1d_update_flydsl_supported(t["x"], short, t["weight"])
 
 
+# -- performance ----------------------------------------------------------
+
+#: ``decode`` is one token per sequence, ``verify`` a speculative window over the
+#: dense layout and ``varlen`` the same window packed the way vLLM hands it over.
+#: aiter's Triton kernel has no packed entry point, so it only runs the first two.
+BENCH_MODES = ("decode", "verify", "varlen")
+
+
+def _bench_problem(batch, dim, width, seqlen, mode, dtype):
+    """Inputs for one benchmark row: the dense problem plus the call it needs."""
+    spec = mode != "decode"
+    t = _make_inputs(
+        batch, dim, width, seqlen, spec=spec, seed=batch * 31 + seqlen, dtype=dtype
+    )
+    t["indices"] = torch.arange(1, batch + 1, dtype=torch.int32, device=DEVICE)
+    call = dict(
+        weight=t["weight"],
+        bias=t["bias"],
+        activation="silu",
+        conv_state_indices=t["indices"],
+        num_accepted_tokens=t["num_accepted"],
+    )
+    if mode == "varlen":
+        call["x"] = _pack(t["x"], (seqlen,) * batch)
+        call["query_start_loc"] = torch.arange(
+            0, (batch + 1) * seqlen, seqlen, dtype=torch.int32, device=DEVICE
+        )
+        call["max_query_len"] = seqlen
+    else:
+        call["x"] = t["x"]
+    return t, call
+
+
+def _bench_bytes(t, batch, dim, seqlen):
+    """Bytes the kernel has to move, at best.
+
+    Every touched cache line is both read (the history taps) and written (the
+    rolled window), so ``conv_state`` counts twice. The weights and bias are one
+    row each and are reread by every workgroup, but they are counted once: what
+    this bounds is the traffic the kernel cannot avoid.
+    """
+    esz = t["x"].element_size()
+    state_len = t["conv_state"].shape[-1]
+    elems = 2 * batch * seqlen * dim + 2 * batch * dim * state_len
+    elems += t["weight"].numel() + (0 if t["bias"] is None else t["bias"].numel())
+    return elems * esz
+
+
+@benchmark()
+def bench_causal_conv1d_update(
+    batch: int = 64,
+    dim: int = 4096,
+    width: int = 4,
+    seqlen: int = 1,
+    mode: str = "decode",
+    dtype: torch.dtype = torch.bfloat16,
+) -> dict:
+    """One row of the perf table: FlyDSL against aiter's Triton kernel.
+
+    Not named ``test_*``: it returns a row instead of asserting, which pytest
+    warns about today and rejects from pytest 9. The test below covers it.
+    """
+    t, call = _bench_problem(batch, dim, width, seqlen, mode, dtype)
+    tokens = batch * seqlen
+
+    # Both entry points overwrite x and conv_state, as upstream does, so every
+    # call gets its own copies and the answer is taken from a clean one: over
+    # run_perftest's ~100 replays the input feeds on its own output and reaches
+    # inf, which costs nothing in time (measured at 0.99-1.00x against a pristine
+    # input) but is not what the spec describes.
+    def fresh():
+        return dict(call, x=call["x"].clone(), conv_state=t["conv_state"].clone())
+
+    out_fly = causal_conv1d_update_flydsl(**fresh())
+    _, us_fly = run_perftest(causal_conv1d_update_flydsl, **fresh())
+    if mode == "varlen":
+        us_tri = float("nan")  # aiter's Triton kernel has no packed entry point
+    else:
+        _, us_tri = run_perftest(causal_conv1d_update_triton, **fresh())
+
+    out_spec, _, _, _, _ = run_torch(
+        t["x"],
+        t["conv_state"],
+        t["weight"],
+        t["bias"],
+        t["indices"],
+        t["num_accepted"],
+        skip_line=0,
+    )
+    if mode == "varlen":
+        out_fly = out_fly.view(batch, seqlen, dim).transpose(1, 2)
+    err = checkAllclose(
+        out_fly.float(),
+        out_spec.float(),
+        rtol=1e-2,
+        atol=1e-2,
+        msg=f"{mode} b{batch} d{dim} w{width} s{seqlen} out",
+    )
+
+    nbytes = _bench_bytes(t, batch, dim, seqlen)
+    return {
+        "gfx": get_gfx(),
+        "dtype": _DTYPE_NAME[dtype],
+        "us": us_fly,
+        "triton_us": us_tri,
+        "TB/s": nbytes / us_fly / 1e6,
+        # width multiply-adds per output element; the bias and the silu are not
+        # counted, so this is the convolution proper.
+        "TFLOPS": 2 * width * tokens * dim / us_fly / 1e6,
+        "err_pct": err,
+    }
+
+
+@pytest.mark.parametrize("mode", BENCH_MODES)
+def test_perf_row_agrees_with_the_spec(mode):
+    """Keep the timing path inside the suite, one small row per mode.
+
+    Nothing else here calls ``run_perftest``, so the harness is the easiest thing
+    in the file to break without noticing -- and ``checkAllclose`` only logs, so
+    the row's error column has to be asserted on to mean anything.
+    """
+    row = bench_causal_conv1d_update(
+        batch=8, dim=512, seqlen=1 if mode == "decode" else 2, mode=mode
+    )
+    assert row["us"] > 0, f"{mode}: no timing recorded"
+    assert row["err_pct"] == 0, (
+        f"{mode}: {row['err_pct']:.1%} of the output is outside checkAllclose's "
+        "1e-2 window against the fp64 spec"
+    )
+
+
 # -- CI entry point -------------------------------------------------------
 
 
-def main():
-    """Run every check without pytest, and exit non-zero if any of them fails.
+_DTYPE_BY_NAME = {name: dt for dt, name in _DTYPE_NAME.items()}
 
-    CI shards ``op_tests/test_*.py`` by invoking ``python3 <file>``, which would
-    otherwise merely define the test functions above and report success. The exit
-    code matters: a harness that prints failures but exits 0 leaves the job green
-    while the kernel is broken.
+
+def _parse_args():
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter,
+        description="Correctness and perf for the FlyDSL causal_conv1d update kernels",
+    )
+    parser.add_argument(
+        "--run",
+        type=str,
+        nargs="*",
+        default=["correctness", "perf"],
+        choices=["correctness", "perf"],
+        help="""Which halves to run. Only correctness sets the exit code.
+        e.g.: --run perf""",
+    )
+    parser.add_argument("-b", "--batch", type=int, nargs="*", default=[1, 32, 128, 512])
+    parser.add_argument("--dim", type=int, nargs="*", default=[2048, 4096])
+    parser.add_argument("-w", "--width", type=int, nargs="*", default=[4])
+    parser.add_argument(
+        "-s",
+        "--seqlen",
+        type=int,
+        nargs="*",
+        default=[1, 2, 4],
+        help="""Tokens per sequence. 1 is decode; the rest are the speculative
+        window, so they are skipped in decode mode and vice versa.""",
+    )
+    parser.add_argument(
+        "-d", "--dtype", type=str, nargs="*", default=["bf16"], choices=["bf16", "fp16"]
+    )
+    parser.add_argument(
+        "--mode", type=str, nargs="*", default=list(BENCH_MODES), choices=BENCH_MODES
+    )
+    return parser.parse_args()
+
+
+def _run_perf_sweep(args):
+    rows = []
+    # Sweep order, slowest to fastest changing: mode, dtype, width, seqlen, dim.
+    for mode, dtype, width, seqlen, dim, batch in itertools.product(
+        args.mode, args.dtype, args.width, args.seqlen, args.dim, args.batch
+    ):
+        # A one-token speculative window is the decode row under another name.
+        if (seqlen == 1) != (mode == "decode"):
+            continue
+        rows.append(
+            bench_causal_conv1d_update(
+                batch=batch,
+                dim=dim,
+                width=width,
+                seqlen=seqlen,
+                mode=mode,
+                dtype=_DTYPE_BY_NAME[dtype],
+            )
+        )
+    if rows:
+        aiter.logger.info(
+            "flydsl causal_conv1d_update perf (markdown):\n%s",
+            pd.DataFrame(rows).to_markdown(index=False),
+        )
+
+
+def main():
+    """Run every check without pytest, then the perf sweep.
+
+    Exits non-zero if any check fails. CI shards ``op_tests/test_*.py`` by
+    invoking ``python3 <file>``, which would otherwise merely define the test
+    functions above and report success. The exit code matters: a harness that
+    prints failures but exits 0 leaves the job green while the kernel is broken.
     """
+    args = _parse_args()
+    if get_gfx() not in SUPPORTED_GFX:
+        aiter.logger.warning(
+            "flydsl causal_conv1d_update is unsupported on %s; skipping", get_gfx()
+        )
+        return 0
+
+    failures = 0
+    if "correctness" in args.run:
+        failures = _run_correctness()
+    if "perf" in args.run:
+        _run_perf_sweep(args)
+    return 1 if failures else 0
+
+
+def _run_correctness():
     torch.manual_seed(0)
     cases = [
-        (test_vllm_against_spec_and_aiter_triton, _VLLM_CASES),
+        (
+            test_vllm_against_spec_and_aiter_triton,
+            [p.values for p in _VLLM_DTYPE_CASES],
+        ),
         (test_vllm_channels_per_thread_agree, [(1,), (2,)]),
         (test_cpt_policy_backs_off_for_long_speculative_windows, [()]),
         (test_vllm_skips_the_null_block, [()]),
@@ -1356,18 +1688,16 @@ def main():
         (test_vllm_predicate_accepts_varlen_and_apc, [()]),
         (test_vllm_varlen_needs_indices_and_a_token_budget, [()]),
         (test_vllm_varlen_matches_the_dense_path, _VARLEN_DENSE_EQUIVALENT),
-        (test_vllm_varlen_matches_live_vllm, _VARLEN_CASES),
+        (test_vllm_varlen_matches_the_spec, _VARLEN_CASES),
         (test_vllm_varlen_with_apc_copies_instead_of_clobbering, _VARLEN_CASES),
+        (test_vllm_reads_x_through_its_strides, [(_channel_major,), (_column_slice,)]),
         (test_vllm_apc_needs_both_index_tensors, [()]),
         (test_vllm_apc_copies_instead_of_clobbering, _APC_CASES),
         (test_vllm_apc_reads_the_selected_column, [()]),
         (test_sglang_predicate_refuses_circular_buffer, [()]),
         (test_predicates_refuse_unsupported_shapes, [()]),
+        (test_perf_row_agrees_with_the_spec, [(m,) for m in BENCH_MODES]),
     ]
-    if causal_conv1d_update_sglang_live is not None:
-        cases.append((test_sglang_matches_live_sglang, _SGLANG_CASES))
-    else:
-        print("skip: sglang not importable, the torch spec is the only oracle")
 
     failures = 0
     for fn, arg_sets in cases:
@@ -1377,13 +1707,15 @@ def main():
                 fn(*args)
             except Exception:  # noqa: BLE001 - report and keep going
                 failures += 1
-                print(f"FAIL {name}")
+                # Unbuffered: redirected to a file these would otherwise all
+                # land after the perf table, which logs to stderr.
+                print(f"FAIL {name}", flush=True)
                 traceback.print_exc()
             else:
-                print(f"ok   {name}")
+                print(f"ok   {name}", flush=True)
 
-    print(f"\n{failures} failure(s)")
-    return 1 if failures else 0
+    print(f"\n{failures} failure(s)", flush=True)
+    return failures
 
 
 if __name__ == "__main__":
