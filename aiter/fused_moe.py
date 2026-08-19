@@ -1269,8 +1269,9 @@ def _mxfp4_per_1x32_weight_expert_to_f32(weight, scale, expert_id, rows, cols):
     from aiter.utility import fp4_utils
 
     weight_e = fp4_utils.mxfp4_to_f32(weight[expert_id])
+    scale_e = scale.reshape(weight.shape[0], rows, cols // 32)[expert_id]
     return (
-        weight_e.view(rows, cols // 32, 32) * scale[expert_id].view(rows, cols // 32, 1)
+        weight_e.view(rows, cols // 32, 32) * scale_e.view(rows, cols // 32, 1)
     ).view(rows, cols)
 
 
