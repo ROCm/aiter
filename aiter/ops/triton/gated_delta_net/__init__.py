@@ -8,6 +8,11 @@ Gated Delta Net Operations (Forward Only).
 This module provides high-level Triton implementations for gated delta rule.
 """
 
+from aiter.ops.triton._triton_kernels.gated_delta_rule.utils import (
+    GatedDeltaRulePrefillMetadata,
+    build_gated_delta_rule_prefill_metadata,
+)
+
 from .causal_conv1d_decode import causal_conv1d_update_split_qkv
 from .causal_conv1d_prefill import (
     causal_conv1d_split_qkv_triton_fn,
@@ -22,6 +27,8 @@ from .gated_delta_rule import (
 )
 
 __all__ = [
+    "GatedDeltaRulePrefillMetadata",
+    "build_gated_delta_rule_prefill_metadata",
     "causal_conv1d_split_qkv_triton_fn",
     "causal_conv1d_split_qkv_triton_tile_fn",
     "causal_conv1d_update_split_qkv",
