@@ -374,9 +374,14 @@ def build_causal_conv1d_update_module(
             offset_dyn = fx.Int32(0)
 
         def _store_run(vals, rsrc, base, stride, total, vectorize):
+            # Every caller only sets ``vectorize`` when the axis stride is 1, so
+            # the slot offset is a compile-time constant there. Spelling it as
+            # one lets the backend fold it into the store's immediate field
+            # instead of re-deriving the byte address from the runtime stride
+            # ahead of each store.
             if fx.const_expr(vectorize):
                 for start, wd in _vec_chunks(total):
-                    off = base + fx.Int32(start) * stride
+                    off = base if fx.const_expr(start == 0) else base + fx.Int32(start)
                     if fx.const_expr(wd == 1):
                         buffer_ops.buffer_store(vals[start], rsrc, off)
                     else:
@@ -703,7 +708,9 @@ def build_causal_conv1d_update_sglang_module(
     weight_contig: bool = True,
     cs_vec: bool = False,
     o_vec: bool = False,
+    i_vec: bool = False,
     save_intermediate: bool = False,
+    save_stream: bool = False,
     has_tree: bool = False,
     channels_per_thread: int = 1,
 ):
@@ -725,6 +732,15 @@ def build_causal_conv1d_update_sglang_module(
     IS_SPEC = bool(is_spec_decoding)
     HAS_NULL_BLOCK = bool(has_null_block)
     SAVE_INTER = bool(save_intermediate)
+    # Same snapshot, written without the aliasing. Consecutive windows overlap in
+    # W-2 taps, so when the caller's snapshot is an overlapping view over one
+    # ``S + W - 2`` run (SGLang's deduplicated layout) the per-step stores land on
+    # addresses already written W-1 times over. This walks the run once instead;
+    # the resulting bytes are identical. The op wrapper decides which mode
+    # applies from the snapshot's strides.
+    SAVE_STREAM = bool(save_stream)
+    assert not (SAVE_INTER and SAVE_STREAM), "pick one snapshot representation"
+    SAVE_ANY = SAVE_INTER or SAVE_STREAM
     TREE = bool(has_tree)
 
     # Effective conv_state window length (matches the SGLang wrapper):
@@ -734,12 +750,17 @@ def build_causal_conv1d_update_sglang_module(
     VAL = ST - S  # tokens before the first x column enters the rolled window
     SHIFT = 1 if IS_SPEC else S  # conv_state slide, per SGLang's STEP 2
 
+    # History columns 1..W-2 followed by the S new tokens: the union of every
+    # per-step window, laid out so step t's window is positions t .. t+W-2.
+    STREAM_LEN = S + W - 2
+
     # Opt A: the W weight taps of one channel are contiguous
     # (weight.stride(1)==1) so load them in one vec load. vec_width supports
     # 2/4; width 3 keeps the scalar path.
     WEIGHT_VEC = bool(weight_contig) and W in (2, 4)
     CS_VEC = bool(cs_vec)
     O_VEC = bool(o_vec)
+    I_VEC = bool(i_vec)
 
     def _vec_chunks(total):
         """Cover [0, total) with dword-aligned vector widths (4, 2) + scalar."""
@@ -820,8 +841,8 @@ def build_causal_conv1d_update_sglang_module(
         csi_r = _rsrc(csi_ptr)
         nacc_r = _rsrc(nacc_ptr) if fx.const_expr(IS_SPEC) else None
         o_r = _rsrc(o_ptr)
-        inter_r = _rsrc(inter_ptr) if fx.const_expr(SAVE_INTER) else None
-        isi_r = _rsrc(isi_ptr) if fx.const_expr(SAVE_INTER) else None
+        inter_r = _rsrc(inter_ptr) if fx.const_expr(SAVE_ANY) else None
+        isi_r = _rsrc(isi_ptr) if fx.const_expr(SAVE_ANY) else None
         rnt_r = _rsrc(rnt_ptr) if fx.const_expr(TREE) else None
         rns_r = _rsrc(rns_ptr) if fx.const_expr(TREE) else None
         rpt_r = _rsrc(rpt_ptr) if fx.const_expr(TREE) else None
@@ -847,7 +868,7 @@ def build_causal_conv1d_update_sglang_module(
         else:
             offset_dyn = fx.Int32(0)
 
-        if fx.const_expr(SAVE_INTER):
+        if fx.const_expr(SAVE_ANY):
             inter_coord = _load_i32(isi_r, idx_seq * sisi)
 
         # ---- EAGLE tree: parent map + per-token tap chain -------------------
@@ -1062,9 +1083,18 @@ def build_causal_conv1d_update_sglang_module(
             ]
 
             def _store_run(vals, rsrc, base, stride, total, vectorize):
+                # Every caller only sets ``vectorize`` when the axis stride is
+                # 1, so the slot offset is a compile-time constant there.
+                # Spelling it as one lets the backend fold it into the store's
+                # immediate field instead of re-deriving the byte address from
+                # the runtime stride ahead of each store.
                 if fx.const_expr(vectorize):
                     for start, wd in _vec_chunks(total):
-                        off = base + fx.Int32(start) * stride
+                        off = (
+                            base
+                            if fx.const_expr(start == 0)
+                            else base + fx.Int32(start)
+                        )
                         if fx.const_expr(wd == 1):
                             buffer_ops.buffer_store(vals[start], rsrc, off)
                         else:
@@ -1082,16 +1112,32 @@ def build_causal_conv1d_update_sglang_module(
                 _store_run(cs_vals, cs_r, cs_base, scs_tok, ST, CS_VEC)
                 _store_run(o_vals, o_r, o_base, so_tok, S, O_VEC)
 
+                if fx.const_expr(SAVE_STREAM):
+                    # ``col_raw[1:] + x_raw``: every tap any token's window can
+                    # reach, in one contiguous run. Slot 0 of the history is the
+                    # only column no window reaches, so it is left out and the
+                    # stream lines up with conv_state's rolled layout.
+                    _store_run(
+                        [col_raw[k] for k in fx.range_constexpr(1, W - 1)] + x_raw,
+                        inter_r,
+                        inter_coord * si_seq + gfeat * si_dim,
+                        si_win,
+                        STREAM_LEN,
+                        I_VEC,
+                    )
+
                 if fx.const_expr(SAVE_INTER):
                     i_base = inter_coord * si_seq + gfeat * si_dim
                     for t in fx.range_constexpr(S):
                         row = i_base + fx.Int32(t) * si_step
-                        for slot in fx.range_constexpr(W - 1):
-                            buffer_ops.buffer_store(
-                                inter_vals[t][slot].to(elem_dtype),
-                                inter_r,
-                                row + fx.Int32(slot) * si_win,
-                            )
+                        _store_run(
+                            [v.to(elem_dtype) for v in inter_vals[t]],
+                            inter_r,
+                            row,
+                            si_win,
+                            W - 1,
+                            I_VEC,
+                        )
 
         for c in fx.range_constexpr(CPT):
             _channel(pid_y * fx.Int32(BN * CPT) + fx.Int32(c * BN) + tid)
@@ -1211,7 +1257,9 @@ def compile_causal_conv1d_update_sglang(
     weight_contig: bool,
     cs_vec: bool,
     o_vec: bool,
+    i_vec: bool,
     save_intermediate: bool,
+    save_stream: bool,
     has_tree: bool,
     channels_per_thread: int,
 ):
@@ -1232,7 +1280,9 @@ def compile_causal_conv1d_update_sglang(
         weight_contig,
         cs_vec,
         o_vec,
+        i_vec,
         save_intermediate,
+        save_stream,
         has_tree,
         channels_per_thread,
     )

@@ -589,6 +589,25 @@ def causal_conv1d_update_flydsl(
     return out.to(original_dtype)
 
 
+def _is_dedup_conv_window(window: torch.Tensor, width: int) -> bool:
+    """Whether ``window`` is SGLang's overlapping (deduplicated) snapshot view.
+
+    On the linear draft chain SGLang allocates the snapshot as a compact
+    ``(cache_lines, dim, seqlen+width-2)`` buffer and exposes it as an
+    ``as_strided`` view whose step axis advances by exactly one tap, so step
+    ``t``'s window is positions ``t .. t+width-2``. Consecutive windows then
+    alias, and writing them one at a time stores every element ``width-1``
+    times. The stride equality below is the tell -- for a dense snapshot the
+    step axis advances by a whole window (``dim*(width-1)`` elements), so it can
+    only coincide with the tap stride under aliasing.
+
+    Guarded on ``width > 2`` because a single-tap window has nothing to
+    deduplicate and its trailing stride is degenerate (size-1 axes carry an
+    arbitrary stride, which would make the comparison meaningless).
+    """
+    return width > 2 and window.stride(1) == window.stride(3)
+
+
 def causal_conv1d_update_sglang_flydsl(
     x: torch.Tensor,
     conv_state: torch.Tensor,
@@ -627,6 +646,11 @@ def causal_conv1d_update_sglang_flydsl(
     - ``intermediate_conv_window``: ``(cache_lines, seqlen, dim, width-1)``;
                             when given, each step's convolution window is
                             snapshotted so any accepted prefix can be restored.
+                            SGLang's linear draft chain hands us an overlapping
+                            ``as_strided`` view over a compact
+                            ``(cache_lines, dim, seqlen+width-2)`` buffer, which
+                            we detect and write once per element instead of
+                            once per window -- see ``_is_dedup_conv_window``.
     - ``retrieve_next_token`` / ``retrieve_next_sibling``: ``(batch, seqlen)``
                             int32 EAGLE tree links; when given, the
                             convolution walks each token's parent chain and
@@ -665,6 +689,11 @@ def causal_conv1d_update_sglang_flydsl(
     state_len_eff = (width - 1 + (seqlen - 1)) if is_spec else (width - 1)
     save_inter = intermediate_conv_window is not None
     has_tree = retrieve_next_token is not None
+    # Same snapshot, same bytes, same destination addresses -- just written once
+    # each instead of once per overlapping window. Purely internal: the caller
+    # keeps passing (and reading back) intermediate_conv_window.
+    save_stream = save_inter and _is_dedup_conv_window(intermediate_conv_window, width)
+    save_window = save_inter and not save_stream
 
     if validate_data:
         assert dim == weight.size(0)
@@ -675,6 +704,10 @@ def causal_conv1d_update_sglang_flydsl(
         assert weight.stride(1) == 1
         if save_inter:
             assert intermediate_state_indices is not None
+            assert intermediate_conv_window.shape[1:] == (seqlen, dim, width - 1), (
+                f"intermediate_conv_window {tuple(intermediate_conv_window.shape)} "
+                f"!= (cache_lines, {seqlen}, {dim}, {width - 1})"
+            )
         if has_tree:
             assert retrieve_next_sibling is not None
             assert retrieve_parent_token is not None
@@ -682,9 +715,15 @@ def causal_conv1d_update_sglang_flydsl(
     if conv_state_indices is None:
         conv_state_indices = torch.arange(batch, dtype=torch.int32, device=x.device)
     if save_inter and intermediate_state_indices is None:
-        intermediate_state_indices = torch.arange(
-            batch, dtype=torch.int32, device=x.device
-        )
+        # Reuse the cache lines rather than synthesising a fresh arange: aiter's
+        # Triton has no separate snapshot index and addresses both through
+        # conv_state_indices, and the dispatch seam forwards it for exactly that
+        # reason, so this is the convention a caller that omits it is asking for.
+        # An arange would instead silently write the snapshot to other rows
+        # whenever conv_state_indices is not itself an arange -- and it costs a
+        # device allocation on every call, which at decode shapes is a
+        # measurable fraction of the launch.
+        intermediate_state_indices = conv_state_indices
 
     if out is None:
         out = torch.empty_like(x)  # SGLang allocates rather than overwriting x
@@ -725,6 +764,10 @@ def causal_conv1d_update_sglang_flydsl(
     # vLLM sibling above for the measured numbers.
     cs_vec = bool(conv_state.stride(2) == 1)
     o_vec = bool(out.stride(2) == 1)
+    # The snapshot's width axis is the fastest-varying one, so its W-1 slots are
+    # adjacent and collapse into one vector store. Without this flag si_win stays
+    # a runtime value and every slot costs a dependent add+shift to re-address.
+    i_vec = bool(save_inter and intermediate_conv_window.stride(3) == 1)
 
     dtype_str = "bf16" if x.dtype == torch.bfloat16 else "fp16"
     launcher = compile_causal_conv1d_update_sglang(
@@ -739,7 +782,9 @@ def causal_conv1d_update_sglang_flydsl(
         bool(weight.stride(1) == 1),
         cs_vec,
         o_vec,
-        bool(save_inter),
+        i_vec,
+        bool(save_window),
+        bool(save_stream),
         bool(has_tree),
         int(channels_per_thread),
     )
@@ -753,6 +798,9 @@ def causal_conv1d_update_sglang_flydsl(
     stride_csi = conv_state_indices.stride(0)
 
     if save_inter:
+        # The stream path addresses the very same memory; it just walks the tap
+        # axis across the whole run instead of restarting it per step, so the
+        # step stride goes unused there.
         si_seq, si_step, si_dim, si_win = intermediate_conv_window.stride()
         sisi = intermediate_state_indices.stride(0)
     else:
