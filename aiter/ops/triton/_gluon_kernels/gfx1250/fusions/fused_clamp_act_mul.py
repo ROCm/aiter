@@ -240,16 +240,26 @@ def _fused_clamp_silu_mul_kernel(
         gate_tile = smem.index(2 * i)
         up_tile = smem.index(2 * i + 1)
 
-        # weights to load
+        # this tile's rows
+        abs_rows = row + m_ids
+        row_mask = abs_rows < M
+
         if HAVE_WEIGHTS:
             if WEIGHT_BROADCAST:
-                # 1D vector, buffer_load is overkill + slower
-                w = gl.load(weights_ptr + row * weights_stride_m)
+                # 1D vector over the tile's rows; buffer_load is overkill + slower
+                w = gl.load(
+                    weights_ptr + abs_rows * weights_stride_m,
+                    mask=row_mask,
+                    other=0.0,
+                )
             else:
                 w = gl.amd.gfx1250.buffer_load(
                     weights_ptr + row.to(gl.int64) * weights_stride_m,
-                    (cols * weights_stride_n).to(gl.int32),
-                    mask=mask,
+                    (
+                        m_ids[:, None] * weights_stride_m
+                        + cols[None, :] * weights_stride_n
+                    ).to(gl.int32),
+                    mask=row_mask[:, None] & mask[None, :],
                     other=0.0,
                     cache=cache_modifier,
                 )
@@ -294,9 +304,12 @@ def _fused_clamp_silu_mul_kernel(
         # apply act(gate)*up
         out = _apply_activation_from_str(gate, ACTIVATION) * up
 
-        # apply weights
+        # apply weights; broadcast form is one value per row of the tile
         if HAVE_WEIGHTS:
-            out = out * w.to(gl.float32)
+            if WEIGHT_BROADCAST:
+                out = out * w.to(gl.float32)[:, None]
+            else:
+                out = out * w.to(gl.float32)
 
         # group quant and store
         if HAS_QUANT:
@@ -370,7 +383,7 @@ def _fused_clamp_silu_mul_kernel(
             result.to(out_ptr.dtype.element_ty),
             out_ptr + row.to(gl.int64) * out_stride_m,
             store_offs,
-            mask=((row + m_ids) < M)[:, None] & mask[None, :],
+            mask=row_mask[:, None] & mask[None, :],
         )
 
     # epilogue
@@ -378,16 +391,25 @@ def _fused_clamp_silu_mul_kernel(
     gate_tile = smem.index(2 * (ROWS_PER_PROG - 1))
     up_tile = smem.index(2 * (ROWS_PER_PROG - 1) + 1)
 
-    # per-row weights, issued while the tile's TDM copy is still in flight
+    # this tile's absolute row ids and the rows that are in range
+    abs_rows = row + m_ids
+    row_mask = abs_rows < M
+
     if HAVE_WEIGHTS:
         if WEIGHT_BROADCAST:
-            w = gl.load(weights_ptr + row * weights_stride_m)
+            w = gl.load(
+                weights_ptr + abs_rows * weights_stride_m,
+                mask=row_mask,
+                other=0.0,
+            )
         else:
             # buffer load weight, also gives slightly better perf
             w = gl.amd.gfx1250.buffer_load(
                 weights_ptr + row.to(gl.int64) * weights_stride_m,
-                (cols * weights_stride_n).to(gl.int32),
-                mask=mask,
+                (
+                    m_ids[:, None] * weights_stride_m + cols[None, :] * weights_stride_n
+                ).to(gl.int32),
+                mask=row_mask[:, None] & mask[None, :],
                 other=0.0,
                 cache=cache_modifier,
             )
@@ -434,9 +456,12 @@ def _fused_clamp_silu_mul_kernel(
     # apply act(gate)*up
     out = _apply_activation_from_str(gate, ACTIVATION) * up
 
-    # apply weights
+    # apply weights; broadcast form is one value per row of the tile
     if HAVE_WEIGHTS:
-        out = out * w.to(gl.float32)
+        if WEIGHT_BROADCAST:
+            out = out * w.to(gl.float32)[:, None]
+        else:
+            out = out * w.to(gl.float32)
 
     # group quant and store
     if HAS_QUANT:
@@ -502,5 +527,5 @@ def _fused_clamp_silu_mul_kernel(
         result.to(out_ptr.dtype.element_ty),
         out_ptr + row.to(gl.int64) * out_stride_m,
         store_offs,
-        mask=((row + m_ids) < M)[:, None] & mask[None, :],
+        mask=row_mask[:, None] & mask[None, :],
     )

@@ -85,7 +85,7 @@ def run_benchmark(args):
         args={"metric": args.metric},
     )
 
-    dtype = args.dtype
+    dtype = dtypes.str2Dtype(args.dtype)
     dtype_quant, quant_block_size, scale_dtype_fmt = _QUANT_MODES[args.quant]
     HAS_QUANT = dtype_quant is not None
     activation = args.activation
@@ -159,9 +159,9 @@ def parse_args(args: list[str] | None = None):
     )
     parser.add_argument(
         "--dtype",
-        type=dtypes.str2Dtype,
-        default=dtypes.bf16,
-        choices=(dtypes.fp16, dtypes.bf16, dtypes.fp32),
+        type=str,
+        default="bf16",
+        choices={"fp16", "bf16", "fp32"},
         help="input/output dtype for the non-quant path. Limited to fp16, bf16, fp32."
         "The fp8 and integer dtypes are quantized *output* "
         "types and are selected with --quant.",
