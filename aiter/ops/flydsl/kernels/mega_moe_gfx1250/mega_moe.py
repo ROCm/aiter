@@ -182,7 +182,10 @@ class Routing:
 
     @property
     def source_token_map(self) -> torch.Tensor:
-        return self.reverse_source_view.clone()
+        # Live view, not a copy: only the next dispatch rewrites this region,
+        # and no peer reaches one until every rank clears _combine_sync, which
+        # is stream-ordered after the gemm2 that reads it.
+        return self.reverse_source_view
 
 
 class MegaMoEGfx1250:
