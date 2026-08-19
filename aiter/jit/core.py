@@ -601,6 +601,7 @@ def check_numa():
 
 
 __mds = {}
+__required_runtime_archs: dict[str, str] = {}
 
 
 @torch_compile_guard()
@@ -646,6 +647,7 @@ def _needs_arch_rebuild(md_name):
     built = _so_offload_archs(so_path)
     if not built or cur in built:
         return False
+    __required_runtime_archs[md_name] = cur
     logger.warning(
         f"[{md_name}] prebuilt .so targets {sorted(built)} but not the "
         f"running arch {cur}; rebuilding for {cur}"
@@ -917,6 +919,13 @@ def build_module(
         flags_cc += flags_extra_cc
         flags_hip += flags_extra_hip
         archs = validate_and_update_archs()
+        required_arch = __required_runtime_archs.get(md_name)
+        if required_arch and required_arch not in archs:
+            archs = [*archs, required_arch]
+            logger.warning(
+                f"[{md_name}] append running arch {required_arch} to GPU_ARCHS "
+                f"for this rebuild (GPU_ARCHS={os.getenv('GPU_ARCHS', 'native')})"
+            )
         flags_hip += [f"--offload-arch={arch}" for arch in archs]
         flags_hip = sorted(set(flags_hip))  # remove same flags
         flags_hip = [el for el in flags_hip if hip_flag_checker(el)]

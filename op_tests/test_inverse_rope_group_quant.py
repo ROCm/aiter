@@ -22,6 +22,7 @@ from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.inverse_rope_group_quant import (
     inverse_rope_group_quant as inverse_rope_group_quant_cpp,
+    scale_shape,
 )
 from aiter.ops.quant import dynamic_per_group_scaled_quant
 from aiter.ops.triton.rope.rope import RotateStyle, _rope_cached_bwd
@@ -52,9 +53,9 @@ AMAX_FLOOR = 1e-8
 
 # One row of the perf table: `once` is called for the correctness check, `bench`
 # is the timed call, `ref` is the (dq, scale_byte) reference it is checked
-# against, `scale_shuffle` is the layout `once`'s scale should have, and
+# against, `scale_layout` is the layout `once`'s scale should have, and
 # `tol` / `scale_tol` are its (rtol, atol) pairs.
-Cand = namedtuple("Cand", "once bench ref scale_shuffle tol scale_tol")
+Cand = namedtuple("Cand", "once bench ref scale_layout tol scale_tol")
 
 # The fused op is a bit-for-bit match against the torch reference, so its scale
 # bytes are compared exactly and its dequantized values only carry fp8 rounding.
@@ -96,32 +97,55 @@ def _scale_bytes(scale):
 
 
 def _unshuffle_mfma_scale(scale_shuffled, S, G, Ks):
-    """Unshuffle mfma-layout scale [G, S_pad, Ks_pad] -> logical [S, G, Ks]."""
-    flat = _scale_bytes(scale_shuffled).flatten().cpu()
-    S_pad = scale_shuffled.shape[1]
-    Ks_pad = scale_shuffled.shape[2]
-    out = torch.zeros(S, G, Ks, dtype=dtypes.u8)
-    for s in range(S):
-        for g in range(G):
-            for k in range(Ks):
-                tile_m = s // 32
-                tile_k = k // 8
-                tile_base = (tile_m * (Ks_pad // 8) + tile_k) * 256
-                lane = (k % 4) * 16 + (s % 16)
-                it = ((s // 16) & 1) + (((k // 4) & 1) << 1)
-                idx = g * S_pad * Ks_pad + tile_base + lane * 4 + it
-                out[s, g, k] = flat[idx]
-    return out.to(scale_shuffled.device)
+    """Unshuffle mfma-layout scale [G, S_pad, Ks_pad] -> logical [S, G, Ks].
+
+    A 256-byte tile's index splits as (k%4, s%16, (k/4)&1, (s/16)&1) at strides
+    (64, 4, 2, 1), so the whole unshuffle is one permute of that factorisation.
+    """
+    S_pad, Ks_pad = scale_shuffled.shape[1], scale_shuffled.shape[2]
+    tiles = _scale_bytes(scale_shuffled).reshape(
+        G, S_pad // 32, Ks_pad // 8, 4, 16, 2, 2
+    )
+    # -> (tile_m, (s/16)&1, s%16, G, tile_k, (k/4)&1, k%4), i.e. s and k rebuilt
+    # most-significant first around the untouched G.
+    out = tiles.permute(1, 6, 4, 0, 2, 5, 3).reshape(S_pad, G, Ks_pad)
+    return out[:S, :, :Ks].contiguous()
 
 
-def _check_scale_layout(scale, s, scale_shuffle, name):
-    """Assert the scale buffer's shape match the requested layout."""
-    if scale_shuffle:
-        assert scale.is_contiguous(), f"{name}: shuffled scale must be contiguous"
-    else:
+def _unshuffle_n32k4_scale(scale_n32k4, S, G, Ks):
+    """Unshuffle n32k4 scale [S_pad/32, G, Ks*32] -> logical [S, G, Ks].
+
+    The last dim splits as (k//4, s%32, k%4), which is exactly the transpose
+    ``aiter.ops.shuffle.shuffle_scale_n32k4`` applies to a weight scale -- so
+    this reads back through the same permutation the consumer relies on.
+    """
+    n_super = scale_n32k4.shape[0]
+    flat = _scale_bytes(scale_n32k4).view(n_super, G, Ks // 4, 32, 4)
+    out = flat.permute(0, 3, 1, 2, 4).reshape(n_super * 32, G, Ks)
+    return out[:S].contiguous()
+
+
+def _unshuffle_scale(scale, s, g, ks, scale_layout):
+    """Scale buffer in `scale_layout` -> logical [s, g, ks] uint8."""
+    if scale_layout in ("mfma", "mfma_tile"):
+        return _unshuffle_mfma_scale(scale, s, g, ks)
+    if scale_layout == "n32k4":
+        return _unshuffle_n32k4_scale(scale, s, g, ks)
+    return _scale_bytes(scale)
+
+
+def _check_scale_layout(scale, s, g, ks, scale_layout, name):
+    """Assert the scale buffer's shape matches the requested layout."""
+    if scale_layout == "row":
         assert (
             scale.stride(2) == 1
         ), f"{name}: expected row-major scale, got strides {scale.stride()}"
+        return
+    assert scale.is_contiguous(), f"{name}: {scale_layout} scale must be contiguous"
+    expect = scale_shape(s, g, ks, scale_layout)
+    assert (
+        tuple(scale.shape) == expect
+    ), f"{name}: {scale_layout} scale should be {expect}, got {tuple(scale.shape)}"
 
 
 def _make_inputs(s, h, head_dim, rd, dtype, seed=0):
@@ -145,18 +169,16 @@ def _make_inputs(s, h, head_dim, rd, dtype, seed=0):
     return o, positions, cos, sin
 
 
-def _alloc_outputs(s, g, d, group_size, scale_shuffle=False):
+def _alloc_outputs(s, g, d, group_size, scale_layout="row"):
     """Pre-allocate (x_fp8, x_scale) the way the wrapper would."""
     from aiter.utility.dtypes import get_dtype_fp8
 
     x_fp8 = torch.empty((s, g, d), dtype=get_dtype_fp8())
-    ks = d // group_size
-    if scale_shuffle:
-        s_pad = ((s + 31) // 32) * 32
-        ks_pad = ((ks + 7) // 8) * 8
-        x_scale = torch.full((g, s_pad, ks_pad), 0x7F, dtype=dtypes.fp8_e8m0)
+    shape = scale_shape(s, g, d // group_size, scale_layout)
+    if scale_layout == "row":
+        x_scale = torch.empty(shape, dtype=dtypes.fp8_e8m0)
     else:
-        x_scale = torch.empty((s, g, ks), dtype=dtypes.fp8_e8m0)
+        x_scale = torch.full(shape, 0x7F, dtype=dtypes.fp8_e8m0)
     return x_fp8, x_scale
 
 
@@ -275,7 +297,6 @@ def test_inverse_rope_group_quant(
 ):
     d = h * head_dim // g
     scale_n = d // group_size
-    shuffle = scale_layout == "shuffle"
 
     o, positions, cos, sin = _make_inputs(s, h, head_dim, rd, dtype)
 
@@ -285,7 +306,7 @@ def test_inverse_rope_group_quant(
     kwargs = {
         "num_groups": g,
         "quant_group_size": group_size,
-        "scale_shuffle": shuffle,
+        "scale_layout": scale_layout,
     }
 
     def fused():
@@ -297,7 +318,7 @@ def test_inverse_rope_group_quant(
     # being norm-preserving, cannot push values out of range -- but it does leave
     # the buffer rotated n times, so correctness runs on a fresh copy instead.
     unfused_scratch = o.clone()
-    unfused_out = _alloc_outputs(s, g, d, group_size, scale_shuffle=False)
+    unfused_out = _alloc_outputs(s, g, d, group_size)
 
     def unfused_bench():
         return run_unfused(
@@ -313,13 +334,13 @@ def test_inverse_rope_group_quant(
             g,
             group_size,
             rd,
-            _alloc_outputs(s, g, d, group_size, scale_shuffle=False),
+            _alloc_outputs(s, g, d, group_size),
         )
 
     funcs = {
-        "cpp": Cand(fused, fused, ref, shuffle, FUSED_TOL, FUSED_SCALE_TOL),
+        "cpp": Cand(fused, fused, ref, scale_layout, FUSED_TOL, FUSED_SCALE_TOL),
         "unfused": Cand(
-            unfused_once, unfused_bench, ref_rt, False, UNFUSED_TOL, UNFUSED_SCALE_TOL
+            unfused_once, unfused_bench, ref_rt, "row", UNFUSED_TOL, UNFUSED_SCALE_TOL
         ),
     }
 
@@ -343,11 +364,8 @@ def test_inverse_rope_group_quant(
         ref_dq, ref_scale = cand.ref
         x_fp8, x_scale = cand.once()
         _, us = run_perftest(cand.bench)
-        _check_scale_layout(x_scale, s, cand.scale_shuffle, name)
-        if cand.scale_shuffle:
-            scale_u8 = _unshuffle_mfma_scale(x_scale, s, g, scale_n)
-        else:
-            scale_u8 = _scale_bytes(x_scale)
+        _check_scale_layout(x_scale, s, g, scale_n, cand.scale_layout, name)
+        scale_u8 = _unshuffle_scale(x_scale, s, g, scale_n, cand.scale_layout)
         dq = (
             x_fp8.to(dtypes.fp32).reshape(s, g, scale_n, group_size)
             * _e8m0_byte_to_scale(scale_u8)[..., None]
@@ -385,14 +403,13 @@ def check_graph(s, h, g, head_dim, rd, group_size, dtype, scale_layout):
     Not part of the perf table: this is a pass/fail check that the host-side
     dispatch tier and the pre-allocated buffers survive capture/replay.
     """
-    shuffle = scale_layout == "shuffle"
     d = h * head_dim // g
     o, positions, cos, sin = _make_inputs(s, h, head_dim, rd, dtype)
-    x_fp8, x_scale = _alloc_outputs(s, g, d, group_size, scale_shuffle=shuffle)
+    x_fp8, x_scale = _alloc_outputs(s, g, d, group_size, scale_layout=scale_layout)
     kwargs = {
         "num_groups": g,
         "quant_group_size": group_size,
-        "scale_shuffle": shuffle,
+        "scale_layout": scale_layout,
         "x_fp8": x_fp8,
         "x_scale": x_scale,
     }
@@ -425,7 +442,7 @@ def check_graph(s, h, g, head_dim, rd, group_size, dtype, scale_layout):
         sin,
         num_groups=g,
         quant_group_size=group_size,
-        scale_shuffle=shuffle,
+        scale_layout=scale_layout,
     )
     torch.cuda.synchronize()
 
@@ -536,21 +553,25 @@ def main():
         type=int,
         nargs="*",
         # The wo_a path uses 128; 32/64 exercise the kernel's other group tiers.
-        default=[128],
-        help="""Quant group size along d.
+        # 32 is in the default because n32k4 exists only there, so dropping it
+        # would silently leave that layout untested on a default run.
+        default=[32, 128],
+        help="""Quant group size along d. n32k4 is skipped unless 32 is swept.
         e.g.: --group-size 32 64 128""",
     )
     parser.add_argument(
         "-l",
         "--scale-layout",
         type=str,
-        choices=["row", "shuffle"],
+        choices=["row", "mfma", "mfma_tile", "n32k4"],
         nargs="*",
-        default=["row", "shuffle"],
+        default=["row", "mfma_tile", "n32k4"],
         help="""e8m0 scale storage:
         row = contiguous [s, g, ks],
-        shuffle = V_MFMA_SCALE_F32_16x16x128_F8 tile-shuffled [g, s_pad, ks_pad].
-        e.g.: -l shuffle""",
+        mfma_tile (mfma) = gfx950 V_MFMA_SCALE tile [g, s_pad, ks_pad],
+        n32k4 = gfx1250 WMMA scaleB [s_pad/32, g, ks*32]
+                (group size must be 32, and ks %% 4 == 0).
+        e.g.: -l n32k4""",
     )
     parser.add_argument(
         "--graph",
@@ -572,6 +593,11 @@ def main():
             args.group_size,
             args.scale_layout,
         ):
+            # n32k4 only exists at group 32: its four packed k groups are one
+            # WMMA-K=128 step, so 4 * group_size has to be 128. The op rejects
+            # anything else, so sweeping it here would only collect failures.
+            if scale_layout == "n32k4" and group_size != 32:
+                continue
             ret = test_inverse_rope_group_quant(
                 s, h, g, head_dim, rd, group_size, dtype, scale_layout
             )
