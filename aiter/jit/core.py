@@ -152,7 +152,7 @@ AITER_CONFIG_GEMM_BF16 = os.getenv(
 
 AITER_CONFIG_GDN_K5_MFMA16_HIP = os.getenv(
     "AITER_CONFIG_GDN_K5_MFMA16_HIP",
-    f"{AITER_ROOT_DIR}/aiter/configs/chunk_gdn_h_mfma16_hip_tuned.csv",
+    f"{AITER_ROOT_DIR}/aiter/configs/model_configs/qwen3_5_35b_chunk_gdn_h_mfma16_hip_tuned.csv",
 )
 
 

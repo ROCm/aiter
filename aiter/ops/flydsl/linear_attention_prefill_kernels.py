@@ -718,21 +718,23 @@ def _tuned_bv(
     """Measured BV for this batch shape, or None to use the rule."""
     if not _BV_TUNED_TABLE:
         return None
-    return _BV_TUNED_TABLE.get(
-        (
-            _GFX_ARCH,
-            H,
-            Hg,
-            V,
-            is_varlen,
-            use_h0,
-            store_fs,
-            snapshot_bf16,
-            state_bf16,
-            total_chunks,
-            max_seq_chunks,
-        )
+    shape_key = (
+        H,
+        Hg,
+        V,
+        is_varlen,
+        use_h0,
+        store_fs,
+        snapshot_bf16,
+        state_bf16,
+        total_chunks,
+        max_seq_chunks,
     )
+    for arch in dict.fromkeys((_GFX_ARCH, "gfx942", "gfx950")):
+        hit = _BV_TUNED_TABLE.get((arch, *shape_key))
+        if hit is not None:
+            return hit
+    return None
 
 
 _INT32_ATTR = "_flydsl_int32_view"

@@ -340,7 +340,7 @@ class TestTunePipeline(unittest.TestCase):
                 ],
                 "extra_args": [
                     "--case",
-                    "397b-ali-tp8-bf16snapshot.*mnbt8192",
+                    "Qwen3.5-397B-varlen-tp8-bf16snap.*TP8_T8192_mnbt16384",
                 ],
                 "timeout": 900,
                 "timeout_mp1": 900,
