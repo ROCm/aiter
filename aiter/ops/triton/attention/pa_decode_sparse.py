@@ -663,6 +663,15 @@ def _pa_decode_sparse_gfx950_gluon(
         avg_main = indices.numel() / max(1, num_queries)
         avg_extra = extra_indices.numel() / max(1, num_queries) if has_extra else 0.0
 
+    # Kernel-side cache-format tags (the kernel is shared with the separated-rope
+    # GLM/MLA path in sparse_mla_decode.py; DSv4 always runs ROPE_SEPARATE=False).
+    if UNIFORM:
+        main_fmt = "uniform" if main_is_fp8 else "bf16"
+        extra_fmt = main_fmt
+    else:
+        main_fmt = "dsv4" if main_is_fp8 else "bf16"
+        extra_fmt = "dsv4" if extra_is_fp8 else "bf16"
+
     # Largest power-of-2 (<=16) dividing BOTH page strides. Lets the kernel assert
     # 16B-aligned row bases so a contiguous row gather can vectorize to dwordx4.
     _s0 = int(cache.stride(0)); _s1 = int(extra_cache.stride(0))
@@ -889,6 +898,11 @@ def _pa_decode_sparse_gfx950_gluon(
         part_m,
         part_l,
         part_acc,
+        # f32 side-channel pointers (per-tensor k_scale / fp8_ds_mla view) --
+        # only the separated-rope formats use them; None keeps the DSv4
+        # kernarg layout byte-identical (constexpr-None args are elided).
+        None,
+        None,
         scale,
         q.stride(0),
         q.stride(1),
@@ -906,20 +920,20 @@ def _pa_decode_sparse_gfx950_gluon(
         num_heads,
         HAS_EXTRA=has_extra,
         HAS_SINK=has_sink,
-        MAIN_IS_FP8=main_is_fp8,
-        EXTRA_IS_FP8=extra_is_fp8,
+        MAIN_FMT=main_fmt,
+        EXTRA_FMT=extra_fmt,
         MAIN_BLOCK_SIZE=main_block,
         EXTRA_BLOCK_SIZE=extra_block,
         CS0_ALIGN=cs0_align,
         NOPE_DIM=nope_dim,
         ROPE_DIM=ROPE_DIM,
         HEAD_SIZE=head_dim,
+        ROPE_SEPARATE=False,
         BLOCK_M=BLOCK_M,
         BLOCK_K=BLOCK_K,
         NUM_SPLITS=num_splits,
         HEAD_ALIGNED=HEAD_ALIGNED,
         MFMA_K=MFMA_K,
-        UNIFORM=UNIFORM,
         GATHER_TW1=gather_tw1,
         LDS_PAD=lds_pad,
         NOPE_CHUNK=nope_chunk,
