@@ -1287,6 +1287,24 @@ def _gemm1_body(
                     payload_row = token_id * fx.Int32(TOPK) + slot_id
                     store_payload(payload_row, packed0, packed1)
 
+        # The bias column depends on (e, n_block_idx, wave_grp, kk, ee) -- never
+        # on the M rep -- so hoist the two global loads out of the mr loop. They
+        # were previously re-issued EPILOGUE_M_REPS times per element, which put
+        # EPILOGUE_M_REPS x 16 redundant global loads per wave straight into the
+        # VMEM-issue path that the ATT profile shows as the top stall.
+        if const_expr(enable_bias):
+            bias_gate = [None] * 8
+            bias_up = [None] * 8
+            bias_base = e * fx.Int32(N_OUT)
+            for ee in range_constexpr(8):
+                out_col = n_block_idx * fx.Int32(BN_INT) + (
+                    wave_grp * fx.Int32(32) + fx.Int32(8) * kk + fx.Int32(ee)
+                )
+                bias_gate[ee] = _global_f32_at(arg_bias, bias_base + out_col)
+                bias_up[ee] = _global_f32_at(
+                    arg_bias, bias_base + fx.Int32(inter) + out_col
+                )
+
         for mr in range_constexpr(EPILOGUE_M_REPS):
             row_local = fx.Int32(mr * 16) + m_lane
 
@@ -1299,14 +1317,8 @@ def _gemm1_body(
                 gate_vs[ee] = acc_load_sum(row_local, gate_col)
                 up_vs[ee] = acc_load_sum(row_local, up_col)
                 if const_expr(enable_bias):
-                    out_col = n_block_idx * fx.Int32(BN_INT) + gate_col
-                    bias_base = e * fx.Int32(N_OUT)
-                    gate_vs[ee] = gate_vs[ee] + _global_f32_at(
-                        arg_bias, bias_base + out_col
-                    )
-                    up_vs[ee] = up_vs[ee] + _global_f32_at(
-                        arg_bias, bias_base + fx.Int32(inter) + out_col
-                    )
+                    gate_vs[ee] = gate_vs[ee] + bias_gate[ee]
+                    up_vs[ee] = up_vs[ee] + bias_up[ee]
             result = _activation_mul_batch(
                 gate_vs,
                 up_vs,
