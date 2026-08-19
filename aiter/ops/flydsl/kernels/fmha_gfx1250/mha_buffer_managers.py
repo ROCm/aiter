@@ -114,7 +114,7 @@ def _assert_multiple(name, val, mult):
 # This flag is the single source of truth and is imported by the kernel module,
 # which flips DEP_MODE in lockstep. Default False -> _wait_alu0() is a no-op and
 # the kernel runs in normal mode 0 (bit-identical to before).
-ENABLE_SCHED_MODE2 = True
+ENABLE_SCHED_MODE2 = True  # TEMP: mode-0 oracle run (RESTORE True after)
 
 # Number of `s_nop 15` (16-cycle) unconditional delays emitted in each tied cover.
 # RATIONALE (2026-08-18): the mode-2 page fault at large seqlen was NOT a coverable
@@ -303,7 +303,24 @@ def _wait_va_vdst(val):
 #       dependency. Measured 0-clean across 512..16384, causal + non-causal.
 # Costs: vm_vsrc/xcnt ~<=10 cyc each, s_nop 8 ~9 cyc (vs asynccnt 0 ~100s).
 _COVER_GLUE_RAW = "s_wait_alu depctr_va_vdst(0)"  # RAW: addr VALU retired before load
-_COVER_GLUE_WAR = "s_wait_alu depctr_vm_vsrc(0)\ns_wait_xcnt 0x0"
+_COVER_GLUE_WAR = "s_wait_alu depctr_vm_vsrc(0)\ns_wait_xcnt 0x0"  # buffer_store WAR
+# Async-load WAR: drop s_wait_xcnt 0 (measured ~155 cyc in the hot loop; the global
+# source-address WAR it guarded is instead held by vm_vsrc alone, re-validate @scale).
+# vm_vsrc is itself optional per-caller: Q (QMgr) disables it because its graduated
+# s_wait_asynccnt culminates in asynccnt(0) before any address-VGPR reuse, which
+# already covers the WAR; K/V keep vm_vsrc.
+_COVER_GLUE_WAR_ASYNC = "s_wait_alu depctr_vm_vsrc(0)"
+
+
+def _sched2_va_vdst_fence():
+    """Mode-2 RAW drain (``va_vdst(0)``) pinned by a full ``sched_barrier(0)`` so the
+    bare cover can't migrate off the param-VALU -> async-issue boundary. No-op in mode 0."""
+    if not ENABLE_SCHED_MODE2:
+        return
+    llvm_dialect.inline_asm(
+        None, [], "s_wait_alu depctr_va_vdst(0)", "", has_side_effects=True
+    )
+    rocdl.sched_barrier(0)
 
 
 def _ir(x):
@@ -311,7 +328,9 @@ def _ir(x):
     return x.ir_value() if hasattr(x, "ir_value") else x
 
 
-def _async_load_to_lds(base_i64, g_offs, lds_offs, imm_offs=None, *, cluster):
+def _async_load_to_lds(
+    base_i64, g_offs, lds_offs, imm_offs=None, *, cluster, war=_COVER_GLUE_WAR_ASYNC
+):
     """Emit a BATCH of async 16B (b128) global->LDS loads sharing one global base.
 
     ``base_i64`` uniform global base (fx.Int64), shared by every load in the batch.
@@ -338,7 +357,10 @@ def _async_load_to_lds(base_i64, g_offs, lds_offs, imm_offs=None, *, cluster):
         <mnem> $0,     $n,     $2n  offset:imm0         # load 0
         <mnem> $1,     $n+1,   $2n  offset:imm1         # load 1
         ...                                             # ... N loads back-to-back
-        s_wait_alu depctr_vm_vsrc(0) / s_wait_xcnt 0    # WAR once: after LAST load
+        <war>                                           # WAR once, after LAST load
+      ``war`` is the trailing WAR-cover string (default ``_COVER_GLUE_WAR_ASYNC`` =
+      vm_vsrc only; pass None/"" to omit it and let the caller own the WAR, e.g. Q
+      whose graduated asynccnt(0) already covers address-VGPR reuse).
       Operands: $0..$(n-1) = LDS byte offsets (v,i32); $n..$(2n-1) = global
       voffsets (v,i32, divergent); $2n = uniform global base (s, i64 sgpr-pair),
       shared. HW computes each global address as base + voffset(+imm); the divergent
@@ -385,8 +407,9 @@ def _async_load_to_lds(base_i64, g_offs, lds_offs, imm_offs=None, *, cluster):
     lines = [_COVER_GLUE_RAW]
     for i, imm in enumerate(imm_offs):
         off_field = f" offset:{imm}" if imm else ""
-        lines.append(f"{mnem} ${i}, ${n + i}, ${2 * n}{off_field}")
-    lines.append(_COVER_GLUE_WAR)
+        lines.append(f"\t{mnem} ${i}, ${n + i}, ${2 * n}{off_field}")
+    if war:  # WAR cover after the LAST load (None/"" -> caller owns the WAR)
+        lines.append(f"\t{war}")
     llvm_dialect.inline_asm(
         None, operands, "\n".join(lines), constraints, has_side_effects=True
     )
@@ -451,13 +474,17 @@ class QManager16b:
             + sw * _CHUNK_BYTES
         )
 
-    def _async_load_vram_to_lds(self, q_base_i64, g_offs, lds_offs, imm_offs=None):
+    def _async_load_vram_to_lds(self, q_base_i64, g_offs, lds_offs, imm_offs=None, war=None):
         """gfx1250 async 16B global->LDS copy — accepts a batch (equal-length lists,
         or scalars for one load). ``imm_offs`` shifts BOTH src and dst by the same
-        bytes in lockstep (default 0). mode-2 emits the batch + a single trailing WAR
-        cover as ONE atomic inline-asm block (see K/V loaders / _async_load_to_lds).
+        bytes in lockstep (default 0). mode-2 emits the batch as ONE atomic inline-asm
+        block. Q passes ``war=None`` to omit the trailing async WAR cover: the
+        graduated ``s_wait_asynccnt`` in ``load_q_to_vgpr`` reaches asynccnt(0) before
+        any address-VGPR reuse (phase-3 shuffle/scale), which already covers the WAR.
         Q uses the plain (non-MCAST) global form."""
-        _async_load_to_lds(q_base_i64, g_offs, lds_offs, imm_offs, cluster=False)
+        _async_load_to_lds(
+            q_base_i64, g_offs, lds_offs, imm_offs, cluster=False, war=war
+        )
 
     def _load_lds_to_vgpr(self, lds_off, vec_ty):
         """ds_load ``vec_ty`` from LDS byte offset ``lds_off`` into a VGPR vector."""
@@ -505,7 +532,9 @@ class QManager16b:
                     + col_chunk * _CHUNK_BYTES
                 )
                 g_offs.append(g_off)
-                lds_offs.append(lds_q_base + self._lds_byte(row, col_chunk, tile))
+                # LDS slot wraps mod lds_tiles: tile t reuses slot t % lds_tiles.
+                slot = tile % self.lds_tiles
+                lds_offs.append(lds_q_base + self._lds_byte(row, col_chunk, slot))
         imm_offs = [0] * len(g_offs)
         return g_offs, lds_offs, imm_offs
 
@@ -520,8 +549,9 @@ class QManager16b:
         klane = lane_idx // _WMMA_M  # 0 or 1
         offs = []
         for tile in fx.range_constexpr(self.k_tiles):
-            offs.append(lds_q_base + self._lds_byte(row, klane, tile))  # lo
-            offs.append(lds_q_base + self._lds_byte(row, klane + 2, tile))  # hi
+            slot = tile % self.lds_tiles  # match global_load_params ring slot
+            offs.append(lds_q_base + self._lds_byte(row, klane, slot))  # lo
+            offs.append(lds_q_base + self._lds_byte(row, klane + 2, slot))  # hi
         return offs
 
     def load_q_to_vgpr(
@@ -541,31 +571,21 @@ class QManager16b:
     ):
         """Stage this warp's 16 x qk_hdim Q tile and return the WMMA A fragments.
 
-        Fully-resident (``lds_tiles == k_tiles``) three-phase load, structured so
-        that NO VALU is interleaved with the memory ops (the mode-2 goal + the
-        LDS-burst strategy):
-
-          1. compute ALL params up front (address VALU) via ``global_load_params`` /
-             ``ds_load_params``;
-          2. issue the whole global->LDS async batch, one ``s_wait_asynccnt 0``, the
-             whole ds_load_b128 read burst, one ``s_wait_dscnt 0`` -- no VALU in
-             between (address VALU already retired at the async block's leading
-             ``va_vdst`` cover; the trailing dscnt covers the read->shuffle WAR);
-          3. shuffle each lo/hi pair into the A fragment and fold ``scale``.
-
+        Software-pipelined ``lds_tiles``-deep LDS ring: all address VALU is hoisted
+        up front, then a steady loop reads the oldest tile and refills its slot while
+        later tiles are still in flight, and a drain loop empties the ring. Async is
+        drained GRADUALLY (``s_wait_asynccnt`` per tile, assumes in-issue-order
+        completion) so a ds_load fires the moment ITS data lands. ``lds_tiles ==
+        k_tiles`` (the default) skips the steady loop = fully-resident drain-only.
         Rows with seq >= q_len are clamped in-bounds and masked later in softmax.
         """
-        if self.lds_tiles != self.k_tiles:
-            raise NotImplementedError(
-                "phased load_q_to_vgpr requires full Q residency "
-                f"(lds_tiles == k_tiles); got lds_tiles={self.lds_tiles}, "
-                f"k_tiles={self.k_tiles}"
-            )
+        k_tiles = self.k_tiles
+        lds_tiles = self.lds_tiles
         lds_q_base = ptr_lds + warp_idx * self._warp_stride
         q_base_i64 = fx.Int64(fx.ptrtoint(fx.get_iter(ptr_Q)))
         warp_row0 = block_x * self.block_m + warp_idx * _WMMA_M
 
-        # ---- Phase 1: all address VALU up front -----------------------------
+        # Phase 1: all address VALU up front (2 async b128 + 2 ds_load per tile).
         g_offs, lds_wr_offs, imm_offs = self.global_load_params(
             lds_q_base=lds_q_base,
             warp_row0=warp_row0,
@@ -577,33 +597,47 @@ class QManager16b:
             lane_idx=lane_idx,
         )
         ds_offs = self.ds_load_params(lds_q_base=lds_q_base, lane_idx=lane_idx)
+        _sched2_va_vdst_fence()  # mode-2: retire phase-1 address VALU before the loads
 
-        # ---- Phase 2: memory ops only, no VALU inserted between --------------
-        # Whole global->LDS batch in one async block (mode-2: single trailing WAR),
-        # then wait all landed, then the whole ds_load_b128 read burst back-to-back,
-        # then one dscnt. create_llvm_ptr on a precomputed offset carries no VALU.
-        self._async_load_vram_to_lds(q_base_i64, g_offs, lds_wr_offs, imm_offs)
-        rocdl.s_wait_asynccnt(0)
         v8_ty = fx.Vector.make_type(_CHUNK_ELEMS, fx.BFloat16)
-        raw_frags = []
-        for off in ds_offs:
-            lds_ptr = buffer_ops.create_llvm_ptr(off, address_space=3)
-            raw_frags.append(fx.Vector(llvm_dialect.load(v8_ty, lds_ptr)))
-        rocdl.s_wait_dscnt(0)
 
-        # ---- Phase 3: shuffle lo/hi + fold scale (VALU) ---------------------
-        # bf16 scale -> packed v_pk_mul_bf16 (no f32 round-trip); an fx.Float32
-        # scale would widen the fragment to f32.
-        scale_bf16 = scale.to(fx.BFloat16)
+        def _read_tile(tile):
+            lo_ptr = buffer_ops.create_llvm_ptr(ds_offs[2 * tile], address_space=3)
+            hi_ptr = buffer_ops.create_llvm_ptr(ds_offs[2 * tile + 1], address_space=3)
+            lo = fx.Vector(llvm_dialect.load(v8_ty, lo_ptr))
+            hi = fx.Vector(llvm_dialect.load(v8_ty, hi_ptr))
+            return lo, hi
+
+        def _refill(tile):
+            lo = 2 * tile
+            self._async_load_vram_to_lds(
+                q_base_i64, g_offs[lo:lo + 2], lds_wr_offs[lo:lo + 2], imm_offs[lo:lo + 2]
+            )
+
+        # Prime: issue the first lds_tiles tiles (2 loads each).
+        n_prime = 2 * lds_tiles
+        self._async_load_vram_to_lds(
+            q_base_i64, g_offs[:n_prime], lds_wr_offs[:n_prime], imm_offs[:n_prime], war=_COVER_GLUE_WAR_ASYNC
+        )
+        scale_bf16 = _wait_tie(scale.to(fx.BFloat16), "s_wait_alu depctr_va_vdst(0)")
+
         q_frags = []
-        for tile in fx.range_constexpr(self.k_tiles):
-            lo = raw_frags[2 * tile]
-            hi = raw_frags[2 * tile + 1]
-            frag = lo.shuffle(hi, list(range(16)))  # v16 bf16, concat(lo, hi)
-            frag = frag * scale_bf16
-            # f32-precision fallback if bf16 scale hurts quality:
-            # frag = (frag.to(fx.Float32) * scale).to(fx.BFloat16)
-            q_frags.append(frag)
+        # Steady loop: read+evict tile (i-lds_tiles), refill tile i into its slot.
+        for i in fx.range_constexpr(lds_tiles, k_tiles):
+            rocdl.s_wait_asynccnt((lds_tiles - 1) * 2)  # oldest tile's 2 loads landed
+            lo, hi = _read_tile(i - lds_tiles)
+            rocdl.s_wait_dscnt(0)  # slot free to overwrite
+            _refill(i)
+            q_frags.append(lo.shuffle(hi, list(range(16))) * scale_bf16)
+        # Drain loop: read the last lds_tiles tiles, no refill; overlap lo scale w/ hi load.
+        for i in fx.range_constexpr(0, lds_tiles):
+            rocdl.s_wait_asynccnt((lds_tiles - 1 - i) * 2)
+            lo, hi = _read_tile(k_tiles - lds_tiles + i)
+            rocdl.s_wait_dscnt(1)  # lo landed (in-order LDS return)
+            lo = lo * scale_bf16
+            rocdl.s_wait_dscnt(0)  # hi landed
+            hi = hi * scale_bf16
+            q_frags.append(lo.shuffle(hi, list(range(16))))
         return q_frags
 
 
