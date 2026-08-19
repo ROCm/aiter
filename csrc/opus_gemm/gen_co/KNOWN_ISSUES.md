@@ -38,16 +38,37 @@ A and B differ **only** in the LDS-driven occupancy — both would allow two wav
 per SIMD on registers alone. A is entirely wrong and B entirely correct, so the
 variable is workgroups-per-CU, not tile size or register pressure.
 
-**What is NOT established: why 2 WG/CU breaks it.** Candidates, undistinguished:
-the per-CU TDM request budget (a limit documented for the *split-K* pipeline in
-`opus_gemm_common.py`, never measured for this one); or the cluster-scope
-`s_barrier_signal(-1)` / `s_barrier_wait(-1)` handshake when two workgroups from
-different clusters share a CU — the non-determinism and grid-size dependence fit
-a barrier released early better than they fit a dropped transfer. Separating
-these needs an ATT capture of a 2-WG/CU run; see `README.md` for the recipe.
+**It is NOT a synchronization bug.** Occupancy alone cannot break a correct
+kernel — two workgroups have separate LDS and should not interact — so the
+obvious reading is that 2 WG/CU merely exposes a latent sync hole. Two
+experiments say otherwise, both run with the pad disabled so the kernel really
+is at 2 WG/CU:
 
-The fix does not rest on the mechanism — it rests on "correct at 1 WG/CU", which
-the A/B control establishes.
+| experiment | `c1x1` nbad/rep | `c4x4` nbad/rep |
+|---|---|---|
+| baseline (no pad) | 17338 / 49742 / 84135 | 12954 / 0 / 3654 |
+| skip the `-3` cluster barrier when cluster is 1x1 | 41856 / 45148 / 30532 | 9354 / 0 / 2638 |
+| **maximal sync**: `s_wait_tensorcnt(0)` + `s_wait_dscnt(0)` + full `s_barrier()` at **every tile** | 52352 / 45527 / 58925 | 9585 / 1896 / 8387 |
+
+Draining every outstanding TDM and LDS read and taking a full workgroup barrier
+before every single tile does not help at all. No amount of synchronisation
+inside the workgroup closes it, so the fault is not ordering between this
+workgroup's own waves.
+
+**What is left, unresolved.** Something in the TDM path that is shared per CU
+and not covered by barriers. The leading suspect is the LDS address in the TDM
+descriptor: `make_tdm` is handed
+`reinterpret_cast<uintptr_t>(smem_a)`, which is a *workgroup-relative* LDS
+offset, and if the TDM engine does not add the workgroup's LDS base then a
+second co-resident workgroup aims its transfers at the first one's LDS. That
+would be immune to barriers, would corrupt both workgroups, and would vanish at
+1 WG/CU where the base is zero — which is everything observed. It is a
+hypothesis: confirming it needs an ATT capture of a 2-WG/CU run (recipe in
+`README.md`) or the gfx1250 TDM ISA description.
+
+If that hypothesis holds, 1 WG/CU is not a workaround for this pipeline but a
+correctness requirement of it, and the pad is the right fix rather than a mask.
+Until it is confirmed, treat the pad as load-bearing and do not remove it.
 
 **Fix.** Pad `LDS_BYTES` past 160 KB when the real footprint is below it, so a
 second workgroup cannot fit. The pad tail is never accessed. This is the same
