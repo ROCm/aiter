@@ -6,7 +6,6 @@
 #include "mhc.h"
 #include "aiter_enum.h"
 #include "aiter_hip_common.h"
-#include "py_itfs_common.h"
 #include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include <c10/core/ScalarType.h>
 

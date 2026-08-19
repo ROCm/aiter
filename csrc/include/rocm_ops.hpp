@@ -297,9 +297,10 @@ namespace py = pybind11;
           py::arg("XQ"),                      \
           py::arg("WQ"),                      \
           py::arg("Y"),                       \
-          py::arg("bias")     = std::nullopt, \
-          py::arg("kernelId") = 0,            \
-          py::arg("splitK")   = 0);
+          py::arg("bias")      = std::nullopt, \
+          py::arg("workspace") = std::nullopt, \
+          py::arg("kernelId")  = 0,            \
+          py::arg("splitK")    = 0);
 
 #define OPUS_BMM_A8W8_MXSCALE_PYBIND \
     m.def("opus_bmm_a8w8_mxscale",   \
@@ -331,6 +332,18 @@ namespace py = pybind11;
           "CUDA stream. Call once per stream eagerly (outside HIP "  \
           "graph capture) before capturing graphs that include "     \
           "opus_gemm splitk kernels under TBO.");
+
+#define OPUS_GEMM_WORKSPACE_RELEASE_PYBIND                             \
+    m.def("opus_gemm_workspace_release",                              \
+          &opus_gemm_workspace_release,                               \
+          "Free the splitk workspace (buffer + handles + registry "  \
+          "entry) for the current CUDA stream. Eager mode only; "    \
+          "no-op if the stream was never registered.");               \
+    m.def("opus_gemm_workspace_release_all",                          \
+          &opus_gemm_workspace_release_all,                           \
+          "Free the splitk workspace for all registered streams and " \
+          "clear the registry. Eager mode only. Use for explicit "   \
+          "teardown before a framework reclaims its stream pool.");
 
 #define OPUS_MOE_PYBIND                                                            \
     m.def("opus_moe_stage2_a8w4_decode_fwd",                                        \
@@ -1397,8 +1410,8 @@ namespace py = pybind11;
     m.def("moe_sum", &aiter::moe_sum, "moe_sum(Tensor! input, Tensor output) -> ()");
 
 #define MOE_TOPK_PYBIND                                      \
-    m.def("topk_softplus",                                   \
-          &aiter::topk_softplus,                             \
+    m.def("topk_gating",                                     \
+          &aiter::topk_gating,                               \
           py::arg("topk_weights"),                           \
           py::arg("topk_indices"),                           \
           py::arg("gating_output"),                          \
@@ -2237,39 +2250,40 @@ namespace py = pybind11;
           py::arg("is_decode"));                 \
     m.def("topk_use_mulblocks", &topk_use_mulblocks, py::arg("numRows"), py::arg("stride0"));
 
-#define MLA_METADATA_PYBIND                                 \
-    m.def("get_mla_metadata_v1",                            \
-          &get_mla_metadata_v1,                             \
-          "get_mla_metadata_v1",                            \
-          py::arg("seqlens_qo_indptr"),                     \
-          py::arg("seqlens_kv_indptr"),                     \
-          py::arg("kv_last_page_lens"),                     \
-          py::arg("num_heads_per_head_k"),                  \
-          py::arg("num_heads_k"),                           \
-          py::arg("is_causal"),                             \
-          py::arg("work_metadata_ptrs"),                    \
-          py::arg("work_info_set"),                         \
-          py::arg("work_indptr"),                           \
-          py::arg("reduce_indptr"),                         \
-          py::arg("reduce_final_map"),                      \
-          py::arg("reduce_partial_map"),                    \
-          py::arg("page_size")           = 1,               \
-          py::arg("kv_granularity")      = 16,              \
-          py::arg("max_seqlen_qo")       = -1,              \
-          py::arg("uni_seqlen_qo")       = -1,              \
-          py::arg("fast_mode")           = true,            \
-          py::arg("topk")                = -1,              \
-          py::arg("max_split_per_batch") = -1,              \
-          py::arg("intra_batch_mode")    = false,           \
-          py::arg("is_cp_round_robin")   = false,           \
-          py::arg("mla_version")         = MlaVersion::V32, \
-          py::arg("dtype_q_nope")        = std::nullopt,    \
-          py::arg("dtype_q_rope")        = std::nullopt,    \
-          py::arg("dtype_kv_nope")       = std::nullopt,    \
-          py::arg("dtype_kv_rope")       = std::nullopt);         \
-    m.def("get_mla_metadata_v1_no_redundant", &get_mla_metadata_v1_no_redundant);
+#define MLA_METADATA_PYBIND                              \
+    AITER_SET_STREAM_PYBIND;                             \
+    m.def("get_mla_metadata_v1",                         \
+          &get_mla_metadata_v1,                          \
+          "get_mla_metadata_v1",                         \
+          py::arg("seqlens_qo_indptr"),                  \
+          py::arg("seqlens_kv_indptr"),                  \
+          py::arg("kv_last_page_lens"),                  \
+          py::arg("num_heads_per_head_k"),               \
+          py::arg("num_heads_k"),                        \
+          py::arg("is_causal"),                          \
+          py::arg("work_metadata_ptrs"),                 \
+          py::arg("work_info_set"),                      \
+          py::arg("work_indptr"),                        \
+          py::arg("reduce_indptr"),                      \
+          py::arg("reduce_final_map"),                   \
+          py::arg("reduce_partial_map"),                 \
+          py::arg("page_size")           = 1,            \
+          py::arg("kv_granularity")      = 16,           \
+          py::arg("max_seqlen_qo")       = -1,           \
+          py::arg("uni_seqlen_qo")       = -1,           \
+          py::arg("fast_mode")           = true,         \
+          py::arg("topk")                = -1,           \
+          py::arg("max_split_per_batch") = -1,           \
+          py::arg("intra_batch_mode")    = false,        \
+          py::arg("is_cp_round_robin")   = false,        \
+          py::arg("mla_version")         = 0,            \
+          py::arg("dtype_q_nope")        = std::nullopt, \
+          py::arg("dtype_q_rope")        = std::nullopt, \
+          py::arg("dtype_kv_nope")       = std::nullopt, \
+          py::arg("dtype_kv_rope")       = std::nullopt);
 
 #define PA_METADATA_PYBIND                       \
+    AITER_SET_STREAM_PYBIND;                     \
     m.def("get_pa_metadata_v1",                  \
           &get_pa_metadata_v1,                   \
           "get_pa_metadata_v1",                  \
@@ -2294,6 +2308,7 @@ namespace py = pybind11;
           py::arg("max_split_per_batch") = -1);
 
 #define PS_METADATA_PYBIND                    \
+    AITER_SET_STREAM_PYBIND;                  \
     m.def("get_ps_metadata_v1",               \
           &get_ps_metadata_v1,                \
           "get_ps_metadata_v1",               \
@@ -2389,17 +2404,17 @@ namespace py = pybind11;
           py::arg("epsilon"),                \
           py::arg("gemma_norm") = false);    \
 
-#define GATED_RMSNORM_QUANT_PYBIND                   \
-    m.def("gated_rmsnorm_fp8_group_quant",           \
-          &aiter::gated_rmsnorm_fp8_group_quant,     \
-          py::arg("out"),                            \
-          py::arg("scale"),                          \
-          py::arg("x"),                              \
-          py::arg("z"),                              \
-          py::arg("weight"),                         \
-          py::arg("epsilon"),                        \
-          py::arg("group_size"),                     \
-          py::arg("transpose_scale") = false,        \
+#define GATED_RMSNORM_QUANT_PYBIND                         \
+    m.def("gated_rmsnorm_fp8_group_quant",                 \
+          &aiter::gated_rmsnorm_fp8_group_quant,           \
+          py::arg("out"),                                  \
+          py::arg("scale"),                                \
+          py::arg("x"),                                    \
+          py::arg("z"),                                    \
+          py::arg("weight"),                               \
+          py::arg("epsilon"),                              \
+          py::arg("group_size"),                           \
+          py::arg("transpose_scale") = false,              \
           "Fused Gated RMSNorm + FP8 Group Quantization"); \
     m.def("gated_rmsnorm_fp8_per_token_quant",             \
           &aiter::gated_rmsnorm_fp8_per_token_quant,       \

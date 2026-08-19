@@ -70,6 +70,28 @@ def bq_view(
     return fx.rocdl.make_buffer_tensor(view, max_size=False)
 
 
+def bq_view_fp8(
+    arg_bq,
+    row_elems,
+    KH4,
+    K_TILES_TOTAL,
+    K_HALVES,
+    num_records_bytes=None,
+):
+    """Layout view over preshuffled FP8 B; pair selects two 16B cells per MFMA."""
+    base = bq_view(
+        arg_bq,
+        row_elems,
+        KH4,
+        K_TILES_TOTAL * 2,
+        K_HALVES,
+        num_records_bytes=num_records_bytes,
+    )
+    shape = (4, 16, K_TILES_TOTAL, K_HALVES, 2, 4)
+    stride = (64, 4, K_HALVES * 2 * 256, 2 * 256, 256, 1)
+    return fx.Tensor(fx.make_view(fx.get_iter(base), fx.make_layout(shape, stride)))
+
+
 def scale_view(
     arg_scale, base_dw, K_TILES_TOTAL, k0_stride_dw=64, num_records_bytes=None
 ):
@@ -88,13 +110,14 @@ def scale_view(
     return fx.rocdl.make_buffer_tensor(view, max_size=False)
 
 
-def scale_mma_atoms(a_dtype):
-    """16 (opselA,opselB) scaled-MFMA atoms; A elem is fp8/fp4, B is fp4."""
+def scale_mma_atoms(a_dtype, b_dtype):
+    """16 (opselA,opselB) scaled-MFMA atoms for FP4/FP8 operands."""
     elem_a = Float8E4M3FN if a_dtype == "fp8" else Float4E2M1FN
+    elem_b = Float8E4M3FN if b_dtype == "fp8" else Float4E2M1FN
     return {
         (osa, osb): fx.make_mma_atom(
             fx.rocdl.cdna4.MFMA_Scale(
-                16, 16, 128, elem_a, Float4E2M1FN, opsel_a=osa, opsel_b=osb
+                16, 16, 128, elem_a, elem_b, opsel_a=osa, opsel_b=osb
             )
         )
         for osa in range(4)
@@ -221,6 +244,7 @@ def gemm2_body_v2(
     aStages,
     a_slot_alias=False,
     a_dtype,
+    b_dtype,
     use_reduce=False,
     topk=1,
     has_pad=False,
@@ -248,6 +272,9 @@ def gemm2_body_v2(
     is_bm16 = BM < 32
     kScaleSubBlocks = max(1, kMChunks // 2)
     is_f8_a = a_dtype == "fp8"  # only the A path differs
+    is_f8_b = b_dtype == "fp8"
+    B_NDW = 8 if is_f8_b else 4
+    B_PAIR = 2 if is_f8_b else 1
     a_pack = 1 if is_f8_a else 2
     KH_TILE_A = BK // a_pack
     slot_bytes = BM * KH_TILE_A
@@ -262,7 +289,7 @@ def gemm2_body_v2(
     N_OUT_rt = fx.Int32(i32_hidden)
     kbs_per_expert_dw = _udiv(N_OUT_rt, fx.Int32(32)) * kBS_stride_n0_dw
     num_n_blocks = _udiv(N_OUT_rt, fx.Int32(BN))
-    KH4 = _udiv(K_rt, fx.Int32(8))
+    KH4 = _udiv(K_rt, fx.Int32(4 if is_f8_b else 8))
     K_TILES_MAX = INTER_MAX // BK
     K_SCALE_CHUNKS_MAX = (INTER_MAX + 255) // 256
 
@@ -272,7 +299,7 @@ def gemm2_body_v2(
     if const_expr(has_pad):
         K_real = K_rt - fx.Int32(i32_kpad)
         halves_real = _udiv(K_real + fx.Int32(127), fx.Int32(128))
-        bq_num_records = halves_real * fx.Int32(1024)
+        bq_num_records = halves_real * fx.Int32(1024 * B_PAIR)
         N_real = N_OUT_rt - fx.Int32(i32_npad)
 
     # block -> (m_block_idx, n_block_idx); e = sorted_expert_ids[SBM-padded sort block] (SBM==BM: sort_block==m_block_idx).
@@ -293,7 +320,7 @@ def gemm2_body_v2(
 
     s_aq_base = lds_base_i32
     lds_acc_base = lds_base_i32
-    mma_atoms = scale_mma_atoms(a_dtype)
+    mma_atoms = scale_mma_atoms(a_dtype, b_dtype)
 
     aq_num_records = fx.Int64(i32_max_m_blocks) * fx.Int64(BM * K_BYTES)
     A_NDW = 8 if is_f8_a else 4
@@ -413,6 +440,15 @@ def gemm2_body_v2(
         if const_expr(has_pad):
             # N-skip: fully-pad-N tile (col >= 16-aligned N_real) -> 0 records so weight loads OOB -> 0.
             nrec = (col < N_real).select(bq_num_records, fx.Int32(0))
+        if const_expr(is_f8_b):
+            return bq_view_fp8(
+                arg_bq,
+                e * N_OUT_rt + col,
+                KH4,
+                K_TILES_MAX,
+                kHalves,
+                num_records_bytes=nrec,
+            )
         return bq_view(
             arg_bq,
             e * N_OUT_rt + col,
@@ -435,8 +471,36 @@ def gemm2_body_v2(
         for mw in range_constexpr(nPairs)
     ]
 
-    frag_tmpl = bq_views[0][0, 0, 0, 0, None]  # i32<4:1> (16B = 32 fp4)
+    frag_tmpl = (
+        None
+        if const_expr(is_f8_b)
+        else bq_views[0][0, 0, 0, 0, None]  # i32<4:1> (16B = 32 fp4)
+    )
     # B-scale word template shares the A-scale layout (sc_frag_tmpl).
+
+    def issue_b_value_load(dst, j, half, kt_rt):
+        if const_expr(is_f8_b):
+            lo = fx.make_rmem_tensor(4, Int32)
+            hi = fx.make_rmem_tensor(4, Int32)
+            fx.copy(
+                b_catom,
+                bq_views[j][lane_div_16, lane_mod_16, kt_rt, half, 0, None],
+                lo,
+            )
+            fx.copy(
+                b_catom,
+                bq_views[j][lane_div_16, lane_mod_16, kt_rt, half, 1, None],
+                hi,
+            )
+            lo_v = Vec(fx.memref_load_vec(lo))
+            hi_v = Vec(fx.memref_load_vec(hi))
+            dst.store(lo_v.shuffle(hi_v, list(range(B_NDW))))
+        else:
+            fx.copy(
+                b_catom,
+                bq_views[j][lane_div_16, lane_mod_16, kt_rt, half, None],
+                dst,
+            )
 
     def issue_bscale_into(bsf, chunk_kt):
         for mw in range_constexpr(nPairs):
@@ -449,15 +513,16 @@ def gemm2_body_v2(
     def issue_b_load_into(bqf, bsf, kt_rt):
         for j in range_constexpr(numAccN):
             for half in range_constexpr(kHalves):
-                fx.copy(
-                    b_catom,
-                    bq_views[j][lane_div_16, lane_mod_16, kt_rt, half, None],
-                    bqf[j][half],
-                )
+                issue_b_value_load(bqf[j][half], j, half, kt_rt)
         if const_expr(bsf is not None):
             issue_bscale_into(bsf, scale_chunk_tile(kt_rt))
 
     def make_bq_fragments():
+        if const_expr(is_f8_b):
+            return [
+                [fx.make_rmem_tensor(B_NDW, Int32) for _ in range_constexpr(kHalves)]
+                for _ in range_constexpr(numAccN)
+            ]
         return [
             [fx.make_fragment_like(frag_tmpl) for _ in range_constexpr(kHalves)]
             for _ in range_constexpr(numAccN)
