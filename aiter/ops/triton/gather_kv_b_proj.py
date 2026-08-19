@@ -156,7 +156,6 @@ def gather_kv_b_proj(
         fp4_scale_k_granularity = 32 if weight_preshuffle else 128
         _triton_gather_kv_b_proj[grid](
             batch_size,
-            total_kv_k,
             k_buffer,
             k_scale,
             kv_indptr,
@@ -187,7 +186,6 @@ def gather_kv_b_proj(
     grid = (batch_size * tp_k_head_num_k,)
     _triton_gather_kv_b_proj[grid](
         batch_size,
-        total_kv_k,
         k_buffer,
         k_scale,
         kv_indptr,

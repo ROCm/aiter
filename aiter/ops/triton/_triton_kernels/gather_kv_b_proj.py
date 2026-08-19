@@ -1056,7 +1056,6 @@ def _triton_gather_kv_b_proj_flat(
 @triton.jit
 def _triton_gather_kv_b_proj(
     batch_size,
-    total_kv,
     k_buffer,  # [num_block, block_size, kv_c_dim + kv_pe_dim]
     k_scale,  # [1] or None
     kv_indptr,  # [batch_size + 1]
