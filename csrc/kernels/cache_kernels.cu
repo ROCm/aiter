@@ -20,6 +20,44 @@
 
 namespace aiter {
 
+// slot_mapping arrives as int64 from the torch stacks -- vLLM allocates it as
+// torch.int64 and SGLang's out_cache_loc is likewise int64 -- and as int32 from
+// JAX front ends, which emit 32-bit integers unless jax_enable_x64 is set at
+// startup, process-wide. The cache kernels therefore have to accept both.
+//
+// The pointer is passed untyped with a width flag rather than templating the
+// kernels on the index type. Templating would double every instantiation
+// produced by DISPATCH_BY_KV_CACHE_DTYPE_OPUS_rmTorch, and this translation unit
+// is a long compile already. The runtime cost is nil: each kernel reads exactly
+// one slot per thread block, and the flag is a kernel argument and therefore
+// uniform across the grid, so it compiles to a scalar branch rather than a
+// divergent one.
+enum class SlotIndexWidth : int
+{
+    kInt32 = 0,
+    kInt64 = 1,
+};
+
+__device__ __forceinline__ int64_t load_slot_index(const void* __restrict__ slot_mapping,
+                                                   int64_t token_idx,
+                                                   SlotIndexWidth width)
+{
+    return width == SlotIndexWidth::kInt64
+               ? static_cast<const int64_t*>(slot_mapping)[token_idx]
+               : static_cast<int64_t>(
+                     static_cast<const int32_t*>(slot_mapping)[token_idx]);
+}
+
+inline SlotIndexWidth slot_index_width(const aiter_tensor_t& slot_mapping)
+{
+    AITER_CHECK(slot_mapping.dtype() == AITER_DTYPE_i32 ||
+                    slot_mapping.dtype() == AITER_DTYPE_i64,
+                "slot_mapping must be int32 or int64, got ",
+                AiterDtype_to_str(slot_mapping.dtype()));
+    return slot_mapping.dtype() == AITER_DTYPE_i32 ? SlotIndexWidth::kInt32
+                                                   : SlotIndexWidth::kInt64;
+}
+
 void swap_blocks(aiter_tensor_t& src, aiter_tensor_t& dst, const aiter_tensor_t& block_mapping)
 {
     bool src_is_gpu = src.is_gpu();
@@ -163,8 +201,7 @@ namespace aiter {
 template <typename scalar_t,
           typename cache_t,
           vllm::Fp8KVCacheDataType kv_dt,
-          bool asmLayout          = false,
-          typename slot_mapping_t = int64_t>
+          bool asmLayout = false>
 __global__ void
 reshape_and_cache_kernel(const scalar_t* __restrict__ key,   // [num_tokens, num_heads, head_size]
                          const scalar_t* __restrict__ value, // [num_tokens, num_heads, head_size]
@@ -172,7 +209,8 @@ reshape_and_cache_kernel(const scalar_t* __restrict__ key,   // [num_tokens, num
                                                              // block_size, x]
                          cache_t* __restrict__ value_cache,  // [num_blocks, num_heads, head_size,
                                                              // block_size]
-                         const slot_mapping_t* __restrict__ slot_mapping, // [num_tokens]
+                         const void* __restrict__ slot_mapping, // [num_tokens], int32 or int64
+                         const SlotIndexWidth slot_width,
                          const int key_stride,
                          const int value_stride,
                          const int num_heads,
@@ -182,16 +220,16 @@ reshape_and_cache_kernel(const scalar_t* __restrict__ key,   // [num_tokens, num
                          const float* k_scale,
                          const float* v_scale)
 {
-    const int64_t token_idx       = blockIdx.x;
-    const slot_mapping_t slot_idx = slot_mapping[token_idx];
+    const int64_t token_idx = blockIdx.x;
+    const int64_t slot_idx  = load_slot_index(slot_mapping, token_idx, slot_width);
     if(slot_idx < 0)
     {
         // Padding token that should be ignored.
         return;
     }
 
-    const int64_t block_idx    = static_cast<int64_t>(slot_idx) / block_size;
-    const int64_t block_offset = static_cast<int64_t>(slot_idx) % block_size;
+    const int64_t block_idx    = slot_idx / block_size;
+    const int64_t block_offset = slot_idx % block_size;
 
     const int n                 = num_heads * head_size;
     const float inverted_kscale = k_scale == nullptr ? 1.0f : 1 / (*k_scale);
@@ -247,9 +285,10 @@ __global__ void reshape_and_cache_flash_kernel(
     const scalar_t* __restrict__ value,       // [num_tokens, num_heads, head_size]
     cache_t* __restrict__ key_cache,          // [num_blocks, block_size, num_heads,
                                               // head_size]
-    cache_t* __restrict__ value_cache,        // [num_blocks, block_size, num_heads,
-                                              // head_size]
-    const int64_t* __restrict__ slot_mapping, // [num_tokens]
+    cache_t* __restrict__ value_cache,     // [num_blocks, block_size, num_heads,
+                                           // head_size]
+    const void* __restrict__ slot_mapping, // [num_tokens], int32 or int64
+    const SlotIndexWidth slot_width,
     const int block_stride,
     const int key_stride,
     const int value_stride,
@@ -260,7 +299,7 @@ __global__ void reshape_and_cache_flash_kernel(
     const float* v_scale)
 {
     const int64_t token_idx = blockIdx.x;
-    const int64_t slot_idx  = slot_mapping[token_idx];
+    const int64_t slot_idx  = load_slot_index(slot_mapping, token_idx, slot_width);
     // NOTE: slot_idx can be -1 if the token is padded
     if(slot_idx < 0)
     {
@@ -3145,7 +3184,8 @@ __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
                                      reinterpret_cast<KV_T*>(value.data_ptr()),                  \
                                      reinterpret_cast<CACHE_T*>(key_cache.data_ptr()),           \
                                      reinterpret_cast<CACHE_T*>(value_cache.data_ptr()),         \
-                                     reinterpret_cast<int64_t*>(slot_mapping.data_ptr()),                           \
+                                     slot_mapping.data_ptr(),                                    \
+                                     slot_width,                                                 \
                                      key_stride,                                                 \
                                      value_stride,                                               \
                                      num_heads,                                                  \
@@ -3161,7 +3201,8 @@ __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
                                      reinterpret_cast<KV_T*>(value.data_ptr()),                  \
                                      reinterpret_cast<CACHE_T*>(key_cache.data_ptr()),           \
                                      reinterpret_cast<CACHE_T*>(value_cache.data_ptr()),         \
-                                     reinterpret_cast<int64_t*>(slot_mapping.data_ptr()),                           \
+                                     slot_mapping.data_ptr(),                                    \
+                                     slot_width,                                                 \
                                      key_stride,                                                 \
                                      value_stride,                                               \
                                      num_heads,                                                  \
@@ -3197,6 +3238,7 @@ void reshape_and_cache(
     dim3 block(std::min(num_heads * head_size, 512));
     HipDeviceGuard device_guard(key.device_id);
     const hipStream_t stream = aiter::getCurrentHIPStream();
+    const SlotIndexWidth slot_width = slot_index_width(slot_mapping);
 
     if(asm_layout)
     {
@@ -3219,7 +3261,8 @@ void reshape_and_cache(
                                      reinterpret_cast<KV_T*>(value.data_ptr()),          \
                                      reinterpret_cast<CACHE_T*>(key_cache.data_ptr()),   \
                                      reinterpret_cast<CACHE_T*>(value_cache.data_ptr()), \
-                                     reinterpret_cast<int64_t*>(slot_mapping.data_ptr()),                   \
+                                     slot_mapping.data_ptr(),                            \
+                                     slot_width,                                         \
                                      block_stride,                                       \
                                      key_stride,                                         \
                                      value_stride,                                       \
@@ -3255,6 +3298,7 @@ void reshape_and_cache_flash(
     dim3 block(std::min(num_heads * head_size, 512));
     HipDeviceGuard device_guard(key.device_id);
     const hipStream_t stream = aiter::getCurrentHIPStream();
+    const SlotIndexWidth slot_width = slot_index_width(slot_mapping);
 
     DISPATCH_BY_KV_CACHE_DTYPE_OPUS_rmTorch(key.dtype(), kv_cache_dtype, CALL_RESHAPE_AND_CACHE_FLASH);
 }
