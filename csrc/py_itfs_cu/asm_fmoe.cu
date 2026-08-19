@@ -369,7 +369,7 @@ int get_heuristic_tile(int inter_dim, int sub_X_cnt, const std::vector<int>& ava
 AITER_CTYPES_ERROR_DECL;
 
 // Direct BF16 G1U1 kernel for gfx1201 small-token-count MoE cases where
-// M <= 4 and M * topk < num_experts.
+// M <= 16 and M * topk < num_experts.
 template <int group_size, bool gate_is_shuffled>
 __global__ void fmoe_g1u1_bf16_small_m_stage1_kernel(const hip_bfloat16* __restrict__ input,
                                                          const hip_bfloat16* __restrict__ gate,

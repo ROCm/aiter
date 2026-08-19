@@ -842,7 +842,7 @@ def _fused_moe_impl(
         and isG1U1
         and activation == ActivationType.Silu
         and dtype == dtypes.bf16
-        and M <= 4
+        and M in (1, 2, 3, 4, 8, 16)
         and hidden_states.is_cuda
         and w1.is_cuda
         and w2.is_cuda

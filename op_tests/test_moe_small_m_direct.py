@@ -28,15 +28,15 @@ def _make_balanced_topk(token: int, topk: int, expert: int):
     return topk_ids.contiguous(), topk_weights.contiguous()
 
 
-@pytest.mark.parametrize("token", [1, 2, 3, 4])
+@pytest.mark.parametrize("token", [1, 2, 3, 4, 8, 16])
+@pytest.mark.parametrize("inter_dim", [128, 256])
 @pytest.mark.parametrize(
     "preshuffle_w1,preshuffle_w2",
     [(False, False), (True, False), (True, True)],
 )
-def test_bf16_g1u1_small_m_direct(token, preshuffle_w1, preshuffle_w2):
-    torch.manual_seed(2026 + token)
+def test_bf16_g1u1_small_m_direct(token, inter_dim, preshuffle_w1, preshuffle_w2):
+    torch.manual_seed(2026 + token + inter_dim)
     model_dim = 2048
-    inter_dim = 256
     expert = 256
     topk = 8
 
