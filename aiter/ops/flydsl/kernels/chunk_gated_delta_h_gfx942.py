@@ -30,7 +30,6 @@ from flydsl.expr.typing import T
 from flydsl._mlir.dialects import arith as _arith
 from flydsl._mlir.dialects import vector as _vector
 
-from .tensor_shim import GTensor, _to_raw
 from .k5_variants import _bv_of_variant, _legal_bv_candidates, _variant_tag
 
 _LOG2E = math.log2(math.e)  # 1.4426950408889634
@@ -302,17 +301,6 @@ def compile_chunk_gated_delta_h_gfx942(
         )
     BT_STEPS_LOCAL = (BT // MFMA_K) // NR_SPLIT
 
-    # -- Loop-carried gate/u prefetch --
-    # g/gk/u for chunk i+1 depend on nothing produced by chunk i, so they are
-    # issued a full iteration ahead. The carried values are RAW LOADS ONLY --
-    # exp() and the in-bounds selects stay at the use site, so no arithmetic
-    # hangs off the loads and nothing forces a wait in the issuing iteration.
-    N_GATE_G = 5 if USE_G else 0  # g_last + 4 g_row
-    # gk is one dwordx4 per 64-wide K block, not four scalar dwords: its 4
-    # elements are consecutive k and -- unlike g_row -- carry no per-element
-    # clamp, so the quad is contiguous and 16 B aligned by construction.
-    N_GATE_GK = NUM_K_BLOCKS if USE_GK else 0  # entries, each an f32x4
-
     # -- LDS layout --
     # Every buffer uses the same GROUP-MAJOR + XOR scheme (see _grp_idx): a
     # logical [R, C] tile is stored as [R][C/4][4] with the group index
@@ -559,18 +547,46 @@ def compile_chunk_gated_delta_h_gfx942(
                 return fx.Int32(nr_local * 16)
             return (fx.Int32(nr_local * NR_SPLIT) + wid_n) * fx.Int32(16)
 
-        g_ = GTensor(g_tensor, dtype=T.f32, shape=(-1,))
+        def _flat_buffer(tensor):
+            """1-D bounds-checked view over ``tensor``'s whole footprint.
+            """
+            buf = fx.rocdl.make_buffer_tensor(tensor, max_size=False)
+            n = fx.get_scalar(fx.cosize(fx.get_layout(buf)))
+            return fx.Tensor(
+                fx.make_view(fx.get_iter(buf), fx.make_layout((n,), (1,)))
+            )
+
+        if const_expr(USE_G):
+            g_buf = fx.Tensor(
+                fx.make_view(
+                    fx.get_iter(
+                        fx.rocdl.make_buffer_tensor(g_tensor, max_size=False)
+                    ),
+                    fx.make_layout((fx.Int32(H) * T_flat,), (1,)),
+                )
+            )
         if const_expr(USE_GK):
-            gk_ = GTensor(gk_tensor, dtype=T.f32, shape=(-1,))
+            # [n/4, 4]: one row is gk's 4-wide contiguous quad. The element
+            # offset is always 4-aligned -- K % 4 == 0 (asserted above) and
+            # every addend (H*K, i_h*K, kb*64, wid_m*16, lane_m_base*4) is a
+            # multiple of 4 -- so quad // 4 is exact.
+            gk_buf = fx.Tensor(
+                fx.make_view(
+                    fx.get_iter(
+                        fx.rocdl.make_buffer_tensor(gk_tensor, max_size=False)
+                    ),
+                    fx.make_layout((T_flat * fx.Int32(H * K // 4), 4), (4, 1)),
+                )
+            )
 
         if const_expr(SAVE_NEW_VALUE):
-            vn_ = GTensor(v_new_tensor, dtype=T.bf16, shape=(-1,))
+            vn_buf = _flat_buffer(v_new_tensor)
         if const_expr(COMPUTE_OUTPUT):
-            o_ = GTensor(o_tensor, dtype=T.bf16, shape=(-1,))
+            o_buf = _flat_buffer(o_tensor)
 
         if const_expr(IS_VARLEN):
-            cu_ = GTensor(cu_seqlens_tensor, dtype=T.i32, shape=(-1,))
-            co_ = GTensor(chunk_offsets_tensor, dtype=T.i32, shape=(-1,))
+            cu_buf = fx.rocdl.make_buffer_tensor(cu_seqlens_tensor, max_size=False)
+            co_buf = fx.rocdl.make_buffer_tensor(chunk_offsets_tensor, max_size=False)
 
         # -- MMA atom --
         # One 16x16x16 bf16 MFMA per wave, replicated 1x1x1.
@@ -678,12 +694,12 @@ def compile_chunk_gated_delta_h_gfx942(
         # boh (the chunk-offset base) only addresses the h snapshot, so it -- and
         # the chunk_offsets read that produces it -- is skipped when not STORE_H.
         if const_expr(IS_VARLEN):
-            bos = cu_[fx.Int64(i_n)]
-            eos = cu_[fx.Int64(i_n) + fx.Int64(1)]
+            bos = cu_buf[(i_n,)]
+            eos = cu_buf[(i_n + fx.Int32(1),)]
             T_local = eos - bos
             NT = (T_local + fx.Int32(BT - 1)) // fx.Int32(BT)
             if const_expr(STORE_H):
-                boh = co_[fx.Int64(i_n)]
+                boh = co_buf[(i_n,)]
         else:
             bos = i_n * T_val
             T_local = T_val
@@ -983,22 +999,24 @@ def compile_chunk_gated_delta_h_gfx942(
                 )
                 h_accs_c[kb].store(cur + add_whole)
 
-        # w and u ride the loop-carried state as tiled-copy fragments, ahead of
-        # the scalar gate values.
-        N_WU_CARRY = 2
+        # -- Loop-carried prefetch --
+        # ``_stage_prefetch`` and ``_unpack_prefetch`` are structural inverses:
+        # the unpack walks the flat list in issue order, so neither side carries
+        # an index into the other.
+        def _stage_prefetch(it_i32):
+            """Issue every chunk-``it_i32`` load that rides the carried state.
 
-        def _load_gate(it_i32):
-            """Issue chunk ``it_i32``'s g/gk loads; return them as a flat list.
+            Order: w tile, u tile, then g_last / 4 g_row / one gk quad per
+            64-wide K block.
 
-            Pure loads -- no exp, no in-bounds select -- so nothing in the
-            issuing iteration depends on the results. Order must match the
-            N_GATE_G / N_GATE_GK unpacking in the loop body.
-
-            Out-of-range rows (the tail chunk, and all of the speculative chunk
-            NT) are address-clamped to row 0 like the w prefetch; the values are
-            masked at the use site, so the garbage is harmless.
+            Raw loads only: no exp, no in-bounds select, no vector packing.
+            Nothing in the issuing iteration depends on the results and the
+            loads never force a wait where they are issued.
             """
-            out = []
+            out = [
+                _stage_g2r(buf_cp_g2r_128b_bf16, pS_w, w_base, stride_w, it_i32),
+                _stage_g2r(cp_u_g2r, pS_u, u_base, stride_v, it_i32),
+            ]
             next_end = (it_i32 + fx.Int32(1)) * fx.Int32(BT)
             last_idx = (next_end < T_local).select(
                 next_end, T_local
@@ -1009,11 +1027,14 @@ def compile_chunk_gated_delta_h_gfx942(
                 + lane_m_base * fx.Int32(4)
             )
             if const_expr(USE_G):
-                out.append(g_[fx.Int64(i_h * T_flat + (bos + last_idx))])
+                out.append(g_buf[(i_h * T_flat + (bos + last_idx),)])
                 for elem_i in range_constexpr(4):
+                    # No address clamp: g_buf is bounds-checked, so a row past
+                    # the tensor reads a hardware zero, and both use sites
+                    # already discard out-of-range rows (K5 masks the gate via
+                    # in_bounds.select, the fused path guards the o store).
                     abs_row = row_base + fx.Int32(elem_i)
-                    safe_row = (abs_row < T_local).select(abs_row, fx.Int32(0))
-                    out.append(g_[fx.Int64(i_h * T_flat + (bos + safe_row))])
+                    out.append(g_buf[(i_h * T_flat + (bos + abs_row),)])
             if const_expr(USE_GK):
                 gk_chunk_base = (bos + last_idx) * fx.Int32(H * K) + i_h * fx.Int32(K)
                 for kb in range_constexpr(NUM_K_BLOCKS):
@@ -1023,32 +1044,42 @@ def compile_chunk_gated_delta_h_gfx942(
                         + wid_m * fx.Int32(16)
                         + lane_m_base * fx.Int32(4)
                     )
-                    out.append(gk_.vec_load((fx.Int64(quad),), 4))
+                    out.append(gk_buf[(quad // fx.Int32(4), None)].load())
             return out
 
-        def _stage_wu(it_i32):
-            """Issue chunk ``it_i32``'s w and u tiles as two carried fragments."""
-            return [
-                _stage_g2r(buf_cp_g2r_128b_bf16, pS_w, w_base, stride_w, it_i32),
-                _stage_g2r(cp_u_g2r, pS_u, u_base, stride_v, it_i32),
-            ]
+        def _unpack_prefetch(carried):
+            """Inverse of ``_stage_prefetch``; returns (w, u, g_last, g_row, gk)."""
+            vals = iter(carried)
+            w_frag = next(vals)
+            u_frag = next(vals)
+            g_last = next(vals) if const_expr(USE_G) else None
+            g_row = (
+                [next(vals) for _ in range_constexpr(4)]
+                if const_expr(USE_G)
+                else None
+            )
+            gk = (
+                [next(vals) for _ in range_constexpr(NUM_K_BLOCKS)]
+                if const_expr(USE_GK)
+                else None
+            )
+            return w_frag, u_frag, g_last, g_row, gk
 
-        # -- Prologue: pre-load first chunk's w/u + gate data --
+        # -- Prologue: pre-load the first chunk --
         i_t0_i32 = fx.Int32(0)
-        # One tiled copy covers every (batch, kb) slot; the whole [BT, K] tile is
-        # one carried fragment.
-        wu_prefetch_init = _stage_wu(i_t0_i32)
-
-        g_prefetch_init = _load_gate(i_t0_i32)
-
-        init_state = wu_prefetch_init + g_prefetch_init
+        init_state = _stage_prefetch(i_t0_i32)
         c_zero = fx.Int64(0)
         c_one = fx.Int64(1)
         nt_idx = fx.Int64(NT)
 
         for i_t, state in range(c_zero, nt_idx, c_one, init=init_state):
-            wu_prefetch_all = list(state[:N_WU_CARRY])
-            gu_prefetch_all = list(state[N_WU_CARRY:])
+            (
+                w_frag,
+                u_frag,
+                g_last_carried,
+                g_row_carried,
+                gk_quads,
+            ) = _unpack_prefetch(state)
             i_t_i32 = fx.Int32(i_t)
 
             # -- Store h snapshot to LDS (group-major [BV][K/4][4] + XOR) --
@@ -1102,7 +1133,7 @@ def compile_chunk_gated_delta_h_gfx942(
                 fx.copy(cp_h_r2g, f_g, pD_h_g, soffset=offset,)
 
             # -- Store prefetched w to LDS (two b64 halves per bf16x8) --
-            _stage_r2s(wu_prefetch_all[0], pD_w_lo, pD_w_hi)
+            _stage_r2s(w_frag, pD_w_lo, pD_w_hi)
 
             gpu.barrier()
 
@@ -1129,20 +1160,15 @@ def compile_chunk_gated_delta_h_gfx942(
                     buf_cp_g2r_128b_bf16, pS_k, k_base, stride_k, i_t_i32
                 )
 
-            # -- g / gk: unpack this chunk's values, prefetched last iter --
-            # These come off the loop-carried state as bare IR values.
-            gu_all = list(gu_prefetch_all)
-
+            # -- g / gk: type this chunk's values, prefetched last iter --
+            # They come off the loop-carried state as bare IR values.
             def _as_f32(v):
                 return fx.Float32(as_ir_value(v))
 
             if const_expr(USE_G):
-                g_last_val = _as_f32(gu_all[0])
-                g_row_raw = [_as_f32(v) for v in gu_all[1:5]]
-            if const_expr(USE_GK):
-                # one f32x4 per 64-wide K block (see N_GATE_GK)
-                gk_quads = gu_all[N_GATE_G : N_GATE_G + N_GATE_GK]
-            u_prefetch = fx.Vector(wu_prefetch_all[1])
+                g_last_val = _as_f32(g_last_carried)
+                g_row_raw = [_as_f32(v) for v in g_row_carried]
+            u_prefetch = fx.Vector(u_frag)
 
             # -- GEMM1: bv = w @ h  (contraction over K) --
             # A operand reads the very view the g2s copy wrote (see sW_lo).
@@ -1212,11 +1238,11 @@ def compile_chunk_gated_delta_h_gfx942(
 
             # -- 2b. Store v_new for output --
             if const_expr(SAVE_NEW_VALUE):
-                # The store must go through a helper: a bare ``vn_[off] = ...``
+                # The store must go through a helper: a bare ``vn_buf[off] = ...``
                 # inside ``if (...).ir_value():`` makes the scf.if try to yield
-                # the GTensor (TypeError).
+                # the tensor (TypeError).
                 def _emit_vn_store(off, value):
-                    vn_[fx.Int64(off)] = value
+                    vn_buf[(off,)] = value
 
                 for nr in range_constexpr(N_REPEAT_LOCAL):
                     vn_val = vn_frags[nr]
@@ -1340,15 +1366,8 @@ def compile_chunk_gated_delta_h_gfx942(
             #   fused: after the o store, because that slot is taken by the q
             #          load, whose latency hides behind GEMM2's MFMA chain,
             #          the K6 stage then covers these loads.
-            def _issue_next_prefetch():
-                next_i_t_i32 = i_t_i32 + fx.Int32(1)
-                return (
-                    _stage_wu(next_i_t_i32),
-                    _load_gate(next_i_t_i32),
-                )
-
             if const_expr(not COMPUTE_OUTPUT):
-                wu_next_prefetch, gu_next_prefetch = _issue_next_prefetch()
+                next_prefetch = _stage_prefetch(i_t_i32 + fx.Int32(1))
             else:
                 # Issue q's HBM loads before GEMM2 so their latency hides behind
                 # GEMM2's MFMA chain. q is independent of GEMM2; only the lds_q
@@ -1593,11 +1612,11 @@ def compile_chunk_gated_delta_h_gfx942(
                         )
 
                 # -- Scale and store o -> HBM [T_flat, H, V] token-major --
-                # The store must go through a helper: a bare ``o_[off] = ...``
+                # The store must go through a helper: a bare ``o_buf[off] = ...``
                 # inside ``if (...).ir_value():`` makes the scf.if try to yield
-                # the GTensor (TypeError). Same pattern as the v_new store.
+                # the tensor (TypeError). Same pattern as the v_new store.
                 def _emit_o_store(off, value):
-                    o_[fx.Int64(off)] = value
+                    o_buf[(off,)] = value
 
                 scale_vec = fx.full(4, fx.Float32(SCALE), fx.Float32)
                 for nr in range_constexpr(N_REPEAT_LOCAL):
@@ -1614,9 +1633,9 @@ def compile_chunk_gated_delta_h_gfx942(
                             o_off = o_base + o_bt_row * stride_o + o_col
                             _emit_o_store(o_off, _to_bf16_fast(o_scaled[elem_i]))
 
-                wu_next_prefetch, gu_next_prefetch = _issue_next_prefetch()
+                next_prefetch = _stage_prefetch(i_t_i32 + fx.Int32(1))
 
-            yield wu_next_prefetch + gu_next_prefetch
+            yield next_prefetch
 
         # -- Epilogue: store final state --
         if const_expr(STORE_FINAL_STATE):
