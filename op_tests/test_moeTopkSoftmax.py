@@ -271,11 +271,14 @@ def test_biased_grouped_topk(
     num_iters=101,
     num_warmup=2,
     gating_output=None,
+    correction_bias_dtype=None,
 ):
     ret = {}
     if gating_output is None:
         gating_output = torch.randn((token, expert), dtype=dtype)
-    correction_bias = torch.randn((expert,), dtype=dtype)
+    if correction_bias_dtype is None:
+        correction_bias_dtype = dtype
+    correction_bias = torch.randn((expert,), dtype=correction_bias_dtype)
 
     (w_ref, id_ref, score_ref), us_ref = run_perftest(
         aiter.biased_grouped_topk_torch,
@@ -292,8 +295,11 @@ def test_biased_grouped_topk(
     w_ref = w_ref * scale_factor
     w_aiter = torch.empty_strided((token, topk), (topk + 10, 1), dtype=dtypes.fp32)
     id_aiter = torch.empty_strided((token, topk), (topk + 10, 1), dtype=dtypes.i32)
+    topk_op = aiter.biased_grouped_topk_hip
+    if gating_output.dtype != correction_bias.dtype:
+        topk_op = aiter.biased_grouped_topk_mixed_dtype
     _, us_aiter = run_perftest(
-        aiter.biased_grouped_topk_hip,
+        topk_op,
         gating_output,
         correction_bias,
         w_aiter,
@@ -717,6 +723,7 @@ for token in args.token:
         True,  # need_renorm
         dtypes.bf16,
         gating_output=gating_output,
+        correction_bias_dtype=dtypes.fp32,
         num_iters=args.iters,
         num_warmup=args.warmup,
     )
