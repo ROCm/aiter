@@ -39,6 +39,7 @@ import sys
 import time
 
 import flydsl.expr as fx
+from flydsl.utils.parallel import run_jobs_parallel
 
 from aiter.aot.flydsl.common import (
     collect_aot_jobs,
@@ -46,7 +47,6 @@ from aiter.aot.flydsl.common import (
     cu_num_to_arch,
     job_identity,
     override_env,
-    run_jobs_parallel,
 )
 from aiter.jit.core import AITER_CONFIGS
 from aiter.ops.flydsl.bpreshuffle_gemm_gfx1250 import (

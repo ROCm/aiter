@@ -28,13 +28,14 @@ import os
 import sys
 import time
 
+from flydsl.utils.parallel import run_jobs_parallel
+
 from aiter.aot.flydsl.common import (
     collect_aot_jobs,
     compile_only_env,
     cu_num_to_arch,
     job_identity,
     override_env,
-    run_jobs_parallel,
 )
 from aiter.jit.core import AITER_CONFIGS
 from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg as _ptr_view_safe

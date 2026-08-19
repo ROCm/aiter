@@ -49,6 +49,7 @@ from pathlib import Path
 from typing import Any
 
 import flydsl.expr as fx
+from flydsl.utils.parallel import run_jobs_parallel
 
 from aiter.aot.flydsl.common import (
     collect_aot_jobs,
@@ -56,7 +57,6 @@ from aiter.aot.flydsl.common import (
     dedupe_jobs,
     job_identity,
     override_env,
-    run_jobs_parallel,
 )
 from aiter.ops.flydsl.kernels.chunk_gated_delta_h import compile_chunk_gated_delta_h
 

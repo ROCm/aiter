@@ -11,7 +11,11 @@ the JIT path hits the cache instead of compiling again.
 | `gemm.py` | `GEMM` | GEMM kernels |
 | `grouped_moe.py` | `GROUPED_MOE` | gfx1250 grouped MoE GEMM kernels |
 | `chunk_gdn_h.py` | `CHUNK_GDN_H` | chunk-gdn-h kernels |
-| `common.py` | — | Shared job collection, the deadlock-free fork pool, and cache-hit checking logic |
+| `common.py` | — | Shared job collection, unified AOT orchestration, and cache-hit helpers |
+
+Parallel scheduling is provided by
+`flydsl.utils.parallel.run_jobs_parallel`, including the fork workers, file
+IPC, timeout handling, and abnormal-exit retries.
 
 ---
 
@@ -65,10 +69,10 @@ python -m aiter.aot.flydsl.chunk_gdn_h --target-arch gfx942
 | --- | --- | --- |
 | `AITER_AOT_IMPORT` | Set to `1` so `import aiter` only loads the lightweight JIT core and skips the full top-level op namespace — faster and avoids heavy import side effects during AOT compilation (this is what `setup.py` sets while pre-compiling). | `0` |
 | `FLYDSL_RUNTIME_CACHE_DIR` | Cache directory | `~/.flydsl/cache` |
-| `AITER_FLYDSL_AOT_WORKERS` | Max concurrent worker processes. Set explicitly to honor it verbatim (bypasses the memory cap below); `0`/negative clamps to 1. Each worker uses ~1.5–2.5 GB RSS. | `min(affinity-aware CPUs, 64)`, then capped by available memory |
-| `AITER_FLYDSL_AOT_MEM_PER_WORKER_GB` | Assumed GiB/worker for the **auto memory cap** that keeps the OOM-killer from firing. Only applies when `AITER_FLYDSL_AOT_WORKERS` is **not** set; `0` disables the cap. | `2.0` |
-| `AITER_FLYDSL_AOT_TIMEOUT` | Per-kernel wall-clock cap (seconds). A worker stuck *alive* past this is killed (and retried); `0` disables. | `1200` |
-| `AITER_FLYDSL_AOT_MAX_RETRIES` | Retries for a worker that **died abnormally** (OOM-kill / segfault / timeout-kill). A clean compile error is never retried. `0` disables. | `2` |
+| `FLYDSL_AOT_WORKERS` | Max concurrent worker processes. Set explicitly to honor it verbatim (bypasses the memory cap below); `0`/negative clamps to 1. Each worker uses ~1.5–2.5 GB RSS. | `min(affinity-aware CPUs, 64)`, then capped by available memory |
+| `FLYDSL_AOT_MEM_PER_WORKER_GB` | Assumed GiB/worker for the **auto memory cap** that keeps the OOM-killer from firing. Only applies when `FLYDSL_AOT_WORKERS` is **not** set; non-positive disables the cap. | `2.0` |
+| `FLYDSL_AOT_TIMEOUT` | Per-kernel wall-clock cap (seconds). A worker stuck *alive* past this is killed (and retried); non-positive disables. | `1200` |
+| `FLYDSL_AOT_MAX_RETRIES` | Retries for a worker that **died abnormally** (OOM-kill / segfault / timeout-kill). A clean compile error is never retried; negative values clamp to `0`. | `2` |
 | `AITER_CONFIGS` | Resolves the default CSV lookup path (same as the runtime JIT) | repo built-in |
 | `ARCH` / `GPU_ARCHS` | **Banner/logging only** — printed as the "Target arch" line. Does **not** control the compiled target. | auto-detect |
 
@@ -83,7 +87,7 @@ python -m aiter.aot.flydsl.chunk_gdn_h --target-arch gfx942
 Example:
 
 ```bash
-AITER_FLYDSL_AOT_WORKERS=16 python -m aiter.aot.flydsl.moe
+FLYDSL_AOT_WORKERS=16 python -m aiter.aot.flydsl.moe
 ```
 
 ---
@@ -92,9 +96,9 @@ AITER_FLYDSL_AOT_WORKERS=16 python -m aiter.aot.flydsl.moe
 
 Compiling successfully is not enough — you also want to verify that the **runtime
 actually hits the AOT cache** (no cache miss). That is done by
-`op_tests/test_moe_2stage.py`, which wraps test cases with
-`aiter.aot.flydsl.common.fail_on_aot_cache_miss`: if the runtime falls back to
-JIT compilation, the case fails.
+`op_tests/test_moe_2stage.py`, which wraps cache-checking cases with
+`aiter.aot.flydsl.common.run_only_env`: if the runtime would fall back to JIT
+compilation, the case fails.
 
 Full flow:
 
@@ -137,11 +141,11 @@ python op_tests/test_moe_2stage.py
   nanobind==2.12.0` if CMake reports it missing) so the on-`PYTHONPATH` build dir
   is refreshed to the right version.
 - **Worker OOM / killed (exitcode -9)**: abnormal exits are auto-retried
-  (`AITER_FLYDSL_AOT_MAX_RETRIES`) and the default worker count is already
-  memory-capped (`AITER_FLYDSL_AOT_MEM_PER_WORKER_GB`). If it still happens,
-  lower `AITER_FLYDSL_AOT_WORKERS` or raise the assumed GiB/worker.
+  (`FLYDSL_AOT_MAX_RETRIES`) and the default worker count is already
+  memory-capped (`FLYDSL_AOT_MEM_PER_WORKER_GB`). If it still happens, lower
+  `FLYDSL_AOT_WORKERS` or raise the assumed GiB/worker.
 - **A kernel hangs / never finishes**: it is killed once it exceeds
-  `AITER_FLYDSL_AOT_TIMEOUT` (default 1200 s) and then retried. Lower the timeout
+  `FLYDSL_AOT_TIMEOUT` (default 1200 s) and then retried. Lower the timeout
   to fail faster, or raise it for genuinely slow kernels.
 - **`hipModuleLoadData ... hipErrorNoBinaryForGpu` printed but the kernel still
   shows `[OK]`**: expected when AOT-compiling for an arch that is **not** the

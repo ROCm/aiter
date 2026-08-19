@@ -6,22 +6,13 @@
 from __future__ import annotations
 
 import enum
-import json
-import multiprocessing
 import os
-import shutil
-import tempfile
-import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
-from multiprocessing.connection import wait as wait_for_sentinels
 from typing import Any
 
-_DEFAULT_KERNEL_TIMEOUT = 1200.0
-_DEFAULT_MAX_WORKERS = 64
-_DEFAULT_MAX_RETRIES = 2
-_DEFAULT_MEM_PER_WORKER_GB = 2.0
+from flydsl.utils.parallel import run_jobs_parallel
+
 _MAX_ERRORS_IN_MSG = 10
 
 
@@ -34,17 +25,6 @@ class OpKind(enum.Enum):
     GEMM = "gemm"
     GROUPED_MOE = "grouped_moe"
     CHUNK_GDN_H = "chunk_gdn_h"
-
-
-@dataclass(frozen=True)
-class JobLabel:
-    """Diagnostic label attached to a submitted future."""
-
-    kind: OpKind
-    kernel_name: str
-
-    def __str__(self) -> str:
-        return f"{self.kind.name} {self.kernel_name}"
 
 
 _CU_NUM_TO_ARCH = {
@@ -162,254 +142,19 @@ def _compile_one_config_for(kind: OpKind) -> Callable[..., dict[str, Any]]:
         from .grouped_moe import compile_one_config
     elif kind is OpKind.CHUNK_GDN_H:
         from .chunk_gdn_h import compile_one_config
-    elif kind is OpKind.GROUPED_MOE:
-        # grouped_moe AOT not wired up yet (no jobs are ever collected); keep a
-        # trivial stub so the dispatch is total.
-        return lambda **_kw: {}
     else:
         raise ValueError(f"unknown FlyDSL AOT kind: {kind!r}")
     return compile_one_config
 
 
-def _run_one_to_file(
-    worker: Callable[..., dict[str, Any]], kwargs: dict[str, Any], out_path: str
-) -> None:
-    result = worker(**kwargs)
-    tmp_path = out_path + ".tmp"
-    with open(tmp_path, "w") as f:
-        json.dump(result, f)
-    os.replace(tmp_path, out_path)
-
-
-def _affinity_aware_cpu_count() -> int:
-    """Number of CPUs this process may actually use (respects cgroup /
-    cpuset limits via ``sched_getaffinity``, unlike ``os.cpu_count()``).
-    Falls back to ``cpu_count`` and is clamped to >=1."""
-    try:
-        n = len(os.sched_getaffinity(0))
-    except (AttributeError, OSError):
-        n = os.cpu_count() or 0
-    return max(n, 1)
-
-
-def get_kernel_timeout() -> float:
-    env = os.environ.get("AITER_FLYDSL_AOT_TIMEOUT")
-    if env is None:
-        return _DEFAULT_KERNEL_TIMEOUT
-    try:
-        return max(float(env), 0.0)
-    except ValueError as e:
-        raise ValueError(
-            f"AITER_FLYDSL_AOT_TIMEOUT must be a number of seconds, got {env!r}"
-        ) from e
-
-
-def get_max_retries() -> int:
-    env = os.environ.get("AITER_FLYDSL_AOT_MAX_RETRIES")
-    if env is None:
-        return _DEFAULT_MAX_RETRIES
-    try:
-        return max(int(env), 0)
-    except ValueError as e:
-        raise ValueError(
-            f"AITER_FLYDSL_AOT_MAX_RETRIES must be an integer, got {env!r}"
-        ) from e
-
-
-def _memory_worker_cap(default_workers: int) -> int:
-    env = os.environ.get("AITER_FLYDSL_AOT_MEM_PER_WORKER_GB")
-    try:
-        per_gb = float(env) if env else _DEFAULT_MEM_PER_WORKER_GB
-    except ValueError as e:
-        raise ValueError(
-            f"AITER_FLYDSL_AOT_MEM_PER_WORKER_GB must be a number, got {env!r}"
-        ) from e
-    if per_gb <= 0:
-        return default_workers
-    try:
-        import psutil
-
-        avail_gb = psutil.virtual_memory().available / (1024**3)
-    except Exception:  # noqa: BLE001
-        return default_workers
-    return min(default_workers, max(1, int(avail_gb / per_gb)))
-
-
-def get_max_workers(num_jobs: int) -> int:
-    workers_env = os.environ.get("AITER_FLYDSL_AOT_WORKERS")
-    if workers_env is not None:
-        try:
-            max_workers = max(int(workers_env), 1)
-        except ValueError as e:
-            raise ValueError(
-                f"AITER_FLYDSL_AOT_WORKERS must be an integer, got {workers_env!r}"
-            ) from e
-    else:
-        max_workers = min(_affinity_aware_cpu_count(), _DEFAULT_MAX_WORKERS)
-        # Auto path only: also bound by memory so we never trip the OOM-killer.
-        max_workers = _memory_worker_cap(max_workers)
-    return min(max_workers, num_jobs)
-
-
-def _run_file_pool(
-    specs: list[tuple[Callable[..., dict[str, Any]], dict[str, Any], Any]],
-    max_workers: int,
-    kernel_timeout: float,
-    max_retries: int,
-    result_dir: str,
-) -> list[dict[str, Any] | None]:
-    ctx = multiprocessing.get_context("fork")
-    n = len(specs)
-    results: list[dict[str, Any] | None] = [None] * n
-    attempts = [0] * n
-    retries_used = 0
-    completed = 0
-    progress_stride = max(1, n // 20)
-
-    queue = list(range(n))
-    queue.reverse()  # pop() from the tail -> submission order; retries appended
-    running: dict[Any, tuple[int, float | None]] = {}  # proc -> (idx, deadline)
-
-    def launch() -> None:
-        while queue and len(running) < max_workers:
-            idx = queue.pop()
-            worker, kwargs, _label = specs[idx]
-            out_path = os.path.join(result_dir, f"k{idx}.json")
-            try:
-                os.remove(out_path)  # clear any stale file from a prior attempt
-            except OSError:
-                pass
-            proc = ctx.Process(target=_run_one_to_file, args=(worker, kwargs, out_path))
-            proc.start()
-            deadline = (
-                (time.monotonic() + kernel_timeout) if kernel_timeout > 0 else None
-            )
-            running[proc] = (idx, deadline)
-
-    def note_done() -> None:
-        """Mark one spec as finalized (succeeded or definitively failed) and emit
-        a throttled overall-progress line."""
-        nonlocal completed
-        completed += 1
-        if completed % progress_stride == 0 or completed == n:
-            print(f"  ... {completed}/{n} kernels done", flush=True)
-
-    def retry_or_drop(idx: int, reason: str) -> None:
-        """Abnormal exit: requeue for retry, or -- once retries are exhausted --
-        give up, leaving results[idx]=None to mark the worker as dead/killed."""
-        nonlocal retries_used
-        if attempts[idx] < max_retries:
-            attempts[idx] += 1
-            retries_used += 1
-            queue.append(idx)
-            print(
-                f"[aiter] FlyDSL {specs[idx][2]} {reason}; "
-                f"retry {attempts[idx]}/{max_retries}",
-                flush=True,
-            )
-        else:
-            note_done()  # terminal: results[idx] stays None (== died/killed)
-
-    def reap(proc: Any) -> None:
-        idx, _ = running.pop(proc)
-        out_path = os.path.join(result_dir, f"k{idx}.json")
-        if proc.exitcode != 0:
-            # Worker died abnormally (OOM-kill -9, segfault -11, ...) before
-            # writing its result. Transient -> retry (terminal once retries run
-            # out, leaving results[idx]=None).
-            retry_or_drop(idx, f"worker crashed (exitcode={proc.exitcode})")
-            return
-        # Clean exit (exitcode 0): deterministic, never retried.
-        result: dict[str, Any] | None = None
-        if os.path.isfile(out_path):
-            try:
-                with open(out_path) as f:
-                    result = json.load(f)
-            except Exception:  # noqa: BLE001
-                result = None
-        if result is None:
-            label = specs[idx][2]
-            name = label.kernel_name if isinstance(label, JobLabel) else str(label)
-            result = {"kernel_name": name, "compile_time": None}
-        results[idx] = result
-        note_done()
-
-    try:
-        launch()
-        while running:
-            if kernel_timeout > 0:
-                nearest = min(d for (_, d) in running.values() if d is not None)
-                wait_timeout: float | None = max(0.0, nearest - time.monotonic())
-            else:
-                wait_timeout = None
-            wait_for_sentinels([p.sentinel for p in running], timeout=wait_timeout)
-
-            for proc in list(running):
-                if not proc.is_alive():
-                    proc.join()
-                    reap(proc)
-
-            if kernel_timeout > 0:
-                now = time.monotonic()
-                for proc in list(running):
-                    idx, deadline = running[proc]
-                    if deadline is not None and now > deadline and proc.is_alive():
-                        proc.kill()
-                        proc.join()
-                        running.pop(proc)
-                        retry_or_drop(
-                            idx,
-                            f"exceeded per-kernel timeout ({kernel_timeout:.0f}s); killed",
-                        )
-
-            launch()  # refill freed slots (including any just-requeued retries)
-    finally:
-        # Kill any survivors (e.g. on an unexpected exception) so we never leave
-        # orphaned compilers blocking the caller's exit.
-        for proc in list(running):
-            try:
-                if proc.is_alive():
-                    proc.kill()
-            except Exception:  # noqa: BLE001,S110
-                pass
-
-    if retries_used:
-        print(
-            f"[aiter] FlyDSL AOT: {retries_used} retr"
-            f"{'y' if retries_used == 1 else 'ies'} after abnormal worker exits",
-            flush=True,
-        )
-    return results
-
-
-def run_jobs_parallel(
-    worker: Callable[..., dict[str, Any]],
-    jobs: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    if not jobs:
-        return []
-    max_workers = get_max_workers(len(jobs))
-    print(
-        f"[aiter] FlyDSL AOT: {len(jobs)} kernels, {max_workers} worker processes",
-        flush=True,
-    )
-    result_dir = tempfile.mkdtemp(prefix="aot_results_")
-    try:
-        specs = [(worker, job, str(job.get("kernel_name", "?"))) for job in jobs]
-        raw = _run_file_pool(
-            specs, max_workers, get_kernel_timeout(), get_max_retries(), result_dir
-        )
-    finally:
-        shutil.rmtree(result_dir, ignore_errors=True)
-    out: list[dict[str, Any]] = []
-    for job, res in zip(jobs, raw):
-        if res is None:
-            out.append(
-                {"kernel_name": job.get("kernel_name", "?"), "compile_time": None}
-            )
-        else:
-            out.append(res)
-    return out
+def _compile_aot_job(
+    kind: str,
+    job: dict[str, Any],
+    kernel_name: str,
+) -> dict[str, Any]:
+    """Dispatch one uniform parallel job to its aiter AOT compiler."""
+    del kernel_name
+    return _compile_one_config_for(OpKind(kind))(**job)
 
 
 def run_aot(cache_dir: str) -> None:
@@ -425,73 +170,53 @@ def run_aot(cache_dir: str) -> None:
         print("[aiter] FlyDSL AOT: no kernels to compile, skipping")
         return
 
-    max_workers = get_max_workers(len(all_jobs))
-
-    # Per-child result files live here -- recreated fresh so stale results
-    # from a previous (e.g. crashed) build can never be mistaken for this
-    # run's output.
-    result_dir = os.path.join(cache_dir, ".aot_results")
-    shutil.rmtree(result_dir, ignore_errors=True)
-    os.makedirs(result_dir, exist_ok=True)
-
     print(
         f"[aiter] FlyDSL AOT: {len(all_jobs)} kernels "
         f"({'+'.join(k.name for k in OpKind)}), "
-        f"{max_workers} worker processes (cache: {cache_dir})"
+        f"cache: {cache_dir}"
     )
 
-    # One uniform task per kernel: worker = the kind's compile_one_config.
-    specs = [
-        (
-            _compile_one_config_for(kind),
-            job,
-            JobLabel(kind=kind, kernel_name=str(job.get("kernel_name", "?"))),
-        )
+    parallel_jobs = [
+        {
+            "kind": kind.value,
+            "job": job,
+            "kernel_name": str(job.get("kernel_name", "?")),
+        }
         for kind, job in all_jobs
     ]
+    results = run_jobs_parallel(_compile_aot_job, parallel_jobs)
 
-    try:
-        raw = _run_file_pool(
-            specs,
-            max_workers,
-            get_kernel_timeout(),
-            get_max_retries(),
-            result_dir,
+    ok_by_kind: dict[OpKind, int] = {kind: 0 for kind in OpKind}
+    fail_by_kind: dict[OpKind, int] = {kind: 0 for kind in OpKind}
+    errors: list[str] = []
+    for (kind, job), result in zip(all_jobs, results):
+        if result.get("compile_time") is not None:
+            ok_by_kind[kind] += 1
+        else:
+            fail_by_kind[kind] += 1
+            kernel_name = str(job.get("kernel_name", "?"))
+            errors.append(
+                f"FlyDSL {kind.name} {kernel_name} failed to produce a kernel "
+                "(compile error, worker crash, or timeout)"
+            )
+
+    for kind in OpKind:
+        print(
+            f"[aiter] FlyDSL {kind.name} AOT: "
+            f"compiled {ok_by_kind[kind]} ok, {fail_by_kind[kind]} failed"
         )
-
-        ok_by_kind: dict[OpKind, int] = {k: 0 for k in OpKind}
-        fail_by_kind: dict[OpKind, int] = {k: 0 for k in OpKind}
-        errors: list[str] = []
-        for (kind, _job), result, spec in zip(all_jobs, raw, specs):
-            label = spec[2]
-            if result is not None and result.get("compile_time") is not None:
-                ok_by_kind[kind] += 1
-            elif result is None:
-                # Died (crash/OOM) or timed out, even after retries.
-                fail_by_kind[kind] += 1
-                errors.append(f"FlyDSL {label} worker died or timed out")
-            else:
-                # Clean exit but no kernel (deterministic compile error).
-                fail_by_kind[kind] += 1
-                errors.append(f"FlyDSL {label} produced no kernel")
-
-        for kind in OpKind:
-            print(
-                f"[aiter] FlyDSL {kind.name} AOT: "
-                f"compiled {ok_by_kind[kind]} ok, {fail_by_kind[kind]} failed"
-            )
-        if errors:
-            seen: set[str] = set()
-            unique_errors = [e for e in errors if not (e in seen or seen.add(e))]
-            head = unique_errors[:_MAX_ERRORS_IN_MSG]
-            suffix = ""
-            if len(unique_errors) > _MAX_ERRORS_IN_MSG:
-                suffix = (
-                    f"; ... ({len(unique_errors) - _MAX_ERRORS_IN_MSG} more unique)"
-                )
-            tally = ", ".join(f"{k.name}: {fail_by_kind[k]} failed" for k in OpKind)
-            raise AssertionError(
-                f"[aiter] FlyDSL AOT failures ({tally}): " + "; ".join(head) + suffix
-            )
-    finally:
-        shutil.rmtree(result_dir, ignore_errors=True)
+    if errors:
+        seen: set[str] = set()
+        unique_errors = [
+            error for error in errors if not (error in seen or seen.add(error))
+        ]
+        head = unique_errors[:_MAX_ERRORS_IN_MSG]
+        suffix = ""
+        if len(unique_errors) > _MAX_ERRORS_IN_MSG:
+            suffix = f"; ... ({len(unique_errors) - _MAX_ERRORS_IN_MSG} more unique)"
+        tally = ", ".join(
+            f"{kind.name}: {fail_by_kind[kind]} failed" for kind in OpKind
+        )
+        raise AssertionError(
+            f"[aiter] FlyDSL AOT failures ({tally}): " + "; ".join(head) + suffix
+        )

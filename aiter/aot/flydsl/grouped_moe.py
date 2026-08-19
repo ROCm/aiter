@@ -13,12 +13,13 @@ import sys
 import time
 import traceback
 
+from flydsl.utils.parallel import run_jobs_parallel
+
 from aiter.aot.flydsl.common import (
     collect_aot_jobs,
     compile_only_env,
     job_identity,
     override_env,
-    run_jobs_parallel,
 )
 from aiter.jit.core import AITER_CONFIGS
 from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
