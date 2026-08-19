@@ -166,11 +166,10 @@ _UNPINNED = {
 
 
 @pytest.fixture
-def isolated_conv_config_cache(monkeypatch):
+def isolated_conv_config_cache():
     """Keep mocked architectures and synthetic config tables test-local."""
     conv_config_utils._get_conv_config_cached.cache_clear()
     conv_config_utils.has_conv_config.cache_clear()
-    monkeypatch.setattr(conv2d_module, "CONV_AUTOTUNE_ENABLED", False)
     yield
     conv_config_utils._get_conv_config_cached.cache_clear()
     conv_config_utils.has_conv_config.cache_clear()

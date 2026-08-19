@@ -3,8 +3,9 @@
 
 import torch
 
-# Channel padding granularity for prepacked weights/inputs. Must align with the
-# BLOCK_K autotune candidates in _triton_kernels/conv/helpers.py — change with care.
+# Channel-block and padding granularity for prepacked inputs and weights.
+# Per-architecture JSON configurations were tuned with this value; changing
+# it requires validating and retuning the Conv2D configurations.
 BLOCK_K = 64
 
 

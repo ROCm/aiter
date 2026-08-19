@@ -8,28 +8,21 @@ from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils.conv_config_utils import get_conv_config
 
 from ..activation import _gelu_tanh, _relu, _relu6
-from .helpers import CONV_AUTOTUNE_ENABLED
 
 
 def _get_config_nhwc(shape_key=None, M=None, variants=()):
-    if CONV_AUTOTUNE_ENABLED:
-        return {}
     return get_conv_config(
         "CONV-3X3-NHWC", shape_key=shape_key, M=M, variants=variants
     )
 
 
 def _get_config_cblocked(shape_key=None, M=None, variants=()):
-    if CONV_AUTOTUNE_ENABLED:
-        return {}
     return get_conv_config(
         "CONV-3X3-CBLOCKED", shape_key=shape_key, M=M, variants=variants
     )
 
 
 def _get_config_nchw(shape_key=None, M=None, variants=()):
-    if CONV_AUTOTUNE_ENABLED:
-        return {}
     return get_conv_config(
         "CONV-3X3-NCHW", shape_key=shape_key, M=M, variants=variants
     )
@@ -475,163 +468,3 @@ def _conv2d_3x3_nchw_kernel(
         + q_idx[None, :] * stride_y_q
     )
     tl.store(y_ptrs, acc, mask=(kout_mask[:, None] & m_mask[None, :]))
-
-
-# Autotune search spaces (used when AITER_TRITON_CONV_AUTOTUNE=1).
-AUTOTUNE_3x3_NHWC_CONFIGS = [
-    triton.Config(
-        {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_SIZE_M": 8},
-        num_warps=8,
-        num_stages=1,
-    ),
-    triton.Config(
-        {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_SIZE_M": 8},
-        num_warps=4,
-        num_stages=1,
-    ),
-    triton.Config(
-        {"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 64, "GROUP_SIZE_M": 8},
-        num_warps=4,
-        num_stages=1,
-    ),
-    triton.Config(
-        {"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_SIZE_M": 8},
-        num_warps=4,
-        num_stages=1,
-    ),
-    triton.Config(
-        {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 64, "GROUP_SIZE_M": 4},
-        num_warps=4,
-        num_stages=1,
-    ),
-    triton.Config(
-        {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 32, "GROUP_SIZE_M": 4},
-        num_warps=4,
-        num_stages=1,
-    ),
-    # gfx1100 (RDNA3): smaller tiles / fewer warps.
-    triton.Config(
-        {"BLOCK_M": 32, "BLOCK_N": 32, "BLOCK_K": 64, "GROUP_SIZE_M": 4},
-        num_warps=2,
-        num_stages=1,
-    ),
-    triton.Config(
-        {"BLOCK_M": 32, "BLOCK_N": 64, "BLOCK_K": 64, "GROUP_SIZE_M": 4},
-        num_warps=4,
-        num_stages=1,
-    ),
-    triton.Config(
-        {"BLOCK_M": 64, "BLOCK_N": 32, "BLOCK_K": 64, "GROUP_SIZE_M": 4},
-        num_warps=4,
-        num_stages=1,
-    ),
-    triton.Config(
-        {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 64, "GROUP_SIZE_M": 4},
-        num_warps=2,
-        num_stages=1,
-    ),
-]
-
-AUTOTUNE_3x3_CBLOCKED_CONFIGS = [
-    triton.Config(
-        {"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_SIZE_M": 8},
-        num_warps=4,
-        num_stages=1,
-    ),
-    triton.Config(
-        {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 64, "GROUP_SIZE_M": 4},
-        num_warps=4,
-        num_stages=1,
-    ),
-    triton.Config(
-        {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 128, "GROUP_SIZE_M": 4},
-        num_warps=4,
-        num_stages=1,
-    ),
-    triton.Config(
-        {"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 64, "GROUP_SIZE_M": 8},
-        num_warps=4,
-        num_stages=1,
-    ),
-    triton.Config(
-        {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_SIZE_M": 8},
-        num_warps=8,
-        num_stages=1,
-    ),
-    triton.Config(
-        {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_SIZE_M": 8},
-        num_warps=4,
-        num_stages=1,
-    ),
-    # gfx1100 (RDNA3): smaller tiles / fewer warps. BLOCK_K kept <= Cb (64) to
-    # preserve coalesced channel loads (see DESIGN.md §5.3).
-    triton.Config(
-        {"BLOCK_M": 32, "BLOCK_N": 32, "BLOCK_K": 64, "GROUP_SIZE_M": 4},
-        num_warps=2,
-        num_stages=1,
-    ),
-    triton.Config(
-        {"BLOCK_M": 32, "BLOCK_N": 64, "BLOCK_K": 64, "GROUP_SIZE_M": 4},
-        num_warps=4,
-        num_stages=1,
-    ),
-    triton.Config(
-        {"BLOCK_M": 64, "BLOCK_N": 32, "BLOCK_K": 64, "GROUP_SIZE_M": 4},
-        num_warps=4,
-        num_stages=1,
-    ),
-    triton.Config(
-        {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 64, "GROUP_SIZE_M": 4},
-        num_warps=2,
-        num_stages=1,
-    ),
-]
-
-
-AUTOTUNE_3x3_NCHW_CONFIGS = [
-    triton.Config(
-        {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_SIZE_M": 8},
-        num_warps=8,
-        num_stages=1,
-    ),
-    triton.Config(
-        {"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_SIZE_M": 8},
-        num_warps=4,
-        num_stages=1,
-    ),
-    triton.Config(
-        {"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 64, "GROUP_SIZE_M": 8},
-        num_warps=8,
-        num_stages=1,
-    ),
-    triton.Config(
-        {"BLOCK_M": 256, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_SIZE_M": 8},
-        num_warps=8,
-        num_stages=1,
-    ),
-    triton.Config(
-        {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 64, "GROUP_SIZE_M": 4},
-        num_warps=4,
-        num_stages=1,
-    ),
-]
-
-
-if CONV_AUTOTUNE_ENABLED:
-    _conv2d_3x3_nchw_kernel = triton.autotune(
-        configs=AUTOTUNE_3x3_NCHW_CONFIGS,
-        key=["M_total", "K_out", "C_pad"],
-        cache_results=True,
-    )(_conv2d_3x3_nchw_kernel)
-
-    _conv2d_3x3_nhwc_kernel = triton.autotune(
-        configs=AUTOTUNE_3x3_NHWC_CONFIGS,
-        key=["M_total", "K_out", "C_pad"],
-        cache_results=True,
-    )(_conv2d_3x3_nhwc_kernel)
-
-    _conv2d_3x3_cblocked_kernel = triton.autotune(
-        configs=AUTOTUNE_3x3_CBLOCKED_CONFIGS,
-        key=["M_total", "K_out", "C_pad"],
-        cache_results=True,
-    )(_conv2d_3x3_cblocked_kernel)

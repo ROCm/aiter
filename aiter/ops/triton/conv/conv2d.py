@@ -8,7 +8,6 @@ from enum import Enum
 import torch
 import triton
 
-from aiter.ops.triton._triton_kernels.conv.helpers import CONV_AUTOTUNE_ENABLED
 from aiter.ops.triton.conv._launch import (
     _launch_1x1,
     _launch_3x3_cblocked,
@@ -81,8 +80,6 @@ def _nchw_direct_is_profitable(
     dilation,
 ) -> bool:
     """Whether direct NCHW should replace a materialized NCHWc input pack."""
-    if CONV_AUTOTUNE_ENABLED:
-        return N * H * W >= _NCHW_DIRECT_MIN_PIXELS
     config_name = "CONV-3X3-NCHW"
     if not has_conv_config(config_name):
         return False

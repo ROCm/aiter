@@ -28,14 +28,15 @@ at large channel counts; most modern checkpoints — LLMs, diffusion VAEs
 
 This op takes the opposite approach: a single set of Triton kernels
 that runs **fp16 and bf16 through the same code path**, supports
-**both NCHW and NHWC end-to-end** (NHWC inputs run on an NHWC kernel —
-no NHWC↔NCHW conversion), and gets reasonable performance across the
+**both NCHW and NHWC end-to-end** (channels-last inputs stay channels-last;
+an ordinary contiguous input requested with `layout="nhwc"` is converted once),
+and gets reasonable performance across the
 full matrix **without per-architecture kernel implementations** (one
 set of Triton kernels for every arch, with a thin per-arch JSON config
 layer — see Tuning). A shape-driven
 router picks between six kernel families so the right kernel runs per layer
-automatically. Weight transforms are LRU-cached. Large NCHW 3×3 activations
-are read directly; small activations use one fused Triton NCHWc pack.
+automatically. Weight transforms are LRU-cached. Tuned NCHW 3×3 activations
+can be read directly; other eligible shapes use one fused Triton NCHWc pack.
 
 ---
 
@@ -94,8 +95,8 @@ A shape-driven router picks one of six kernel families:
 | Family | When it runs |
 |---|---|
 | 1×1 GEMM | `R==1, S==1` |
-| Direct NCHW 3×3 | Large tuned NCHW activations; no input repack |
-| 3×3 cblocked (NCHW) | Small 3×3 activations using a fused NCHWc pack |
+| Direct NCHW 3×3 | Tuned NCHW shapes selected by a crossover or exact-route table; no input repack |
+| 3×3 cblocked (NCHW) | Eligible NCHW shapes not routed direct; uses a fused NCHWc pack |
 | 3×3 NHWC | 3×3 with channels-last input — no input repack |
 | Winograd F(4×4, 3×3) | Eligible non-wave32 targets where transforms amortize |
 | General | non-1×1/3×3 and narrow-channel NCHW 3×3 |
@@ -115,11 +116,11 @@ and seed under both backends, only VAE convs swapped to Triton): max diff
 
 ## Constraints
 
-- `groups` must equal 1 (depthwise / grouped not yet implemented).
-- `padding_mode` must be `"zeros"`. The pad *amount* (`padding=`, e.g.
-  `(1, 1)` or asymmetric `(0, 2)`) is unrestricted; only the pad *value*
-  is — `"reflect"`, `"replicate"`, and `"circular"` fall back to PyTorch /
-  MIOpen.
+- Only `groups=1` is implemented; callers must send depthwise or grouped
+  convolutions to another backend.
+- Only zero padding is implemented. The height and width pad amounts may
+  differ, for example `(0, 2)`, but callers must send `"reflect"`,
+  `"replicate"`, and `"circular"` padding modes to PyTorch/MIOpen.
 - Inputs must be `fp16` or `bf16`.
 - Forward only (no backward / training).
 
@@ -132,7 +133,7 @@ Run from the AITER repo root (`/app/aiter` in this tree, or `PYTHONPATH=/app/ait
 ### Correctness (CI-collected; skipped on unsupported archs)
 
 ```bash
-pytest op_tests/triton_tests/conv/                                # full matrix, 74 tests
+pytest op_tests/triton_tests/conv/                                # full matrix, 81 tests
 pytest op_tests/triton_tests/conv/ -k "no_bias and fp16_nchw"     # subset
 pytest op_tests/triton_tests/conv/ -k "test_edge"                 # one test family
 ```
@@ -214,14 +215,15 @@ pin → generic shape pin → `M_LEQ_x` bucket → `"any"` fallback. No
 runtime autotune in the hot path, so CI compile time stays predictable and
 the first call hits no tuning tax.
 
-Configs are available for gfx1100, gfx1151, gfx1200, gfx1201, gfx1250, gfx942,
-and gfx950. The gfx1100 and gfx1151 direct-NCHW tables use exact-shape routing: shapes not
-measured faster than the complete NCHWc path remain on the cblocked fallback.
+RDNA configs are available for gfx1100, gfx1151, gfx1200, and gfx1201. The
+optional direct-NCHW table exists for gfx1100, gfx1151, and gfx1201. gfx1100
+and gfx1151 use exact-shape routing, so shapes not measured faster than the
+complete NCHWc path remain on the cblocked fallback; gfx1201 uses the
+configurable spatial crossover.
 
-If you need to retune at runtime (e.g. while developing a new kernel), set
-`AITER_TRITON_CONV_AUTOTUNE=1` — this restores the original `@triton.autotune`
-behaviour across the `AUTOTUNE_*_CONFIGS` lists defined alongside each kernel
-in `_triton_kernels/conv/conv_*.py` for the current process.
+Retuning is an offline development workflow. Candidate search spaces and the
+tuning driver live outside the production package; only the resulting JSON
+files are shipped with the kernels.
 
 ---
 
@@ -246,7 +248,7 @@ aiter/ops/triton/conv/                Kernel library
   README.md, DESIGN.md
 
 aiter/ops/triton/_triton_kernels/conv/   @triton.jit kernels
-  (1x1, direct NCHW/cblocked/NHWC 3x3, general, 5 Winograd kernels)
+  (1x1, direct NCHW/cblocked/NHWC 3x3, general, 4 Winograd kernels)
   nchw_to_cblocked.py                    Fused NCHW-to-NCHWc layout kernel
 
 op_tests/triton_tests/conv/           Pytest unit tests (CI-collected; skipped on unsupported archs)

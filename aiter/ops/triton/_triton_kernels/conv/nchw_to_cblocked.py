@@ -6,12 +6,8 @@ import triton.language as tl
 
 from aiter.ops.triton.utils.conv_config_utils import get_conv_config
 
-from .helpers import CONV_AUTOTUNE_ENABLED
-
 
 def _get_config(shape_key=None, M=None, variants=()):
-    if CONV_AUTOTUNE_ENABLED:
-        return {}
     return get_conv_config(
         "CONV-PREPACK", shape_key=shape_key, M=M, variants=variants
     )
@@ -57,25 +53,3 @@ def _nchw_to_cblocked_kernel(
         tl.trans(tile),
         mask=(offs_m[:, None] < HW) & (offs_c[None, :] < C_PAD),
     )
-
-
-AUTOTUNE_NCHW_TO_CBLOCKED_CONFIGS = [
-    triton.Config({"BLOCK_C": 32, "BLOCK_M": 32}, num_warps=4, num_stages=1),
-    triton.Config({"BLOCK_C": 32, "BLOCK_M": 64}, num_warps=4, num_stages=1),
-    triton.Config({"BLOCK_C": 32, "BLOCK_M": 128}, num_warps=8, num_stages=1),
-    triton.Config(
-        {"BLOCK_C": 32, "BLOCK_M": 128, "waves_per_eu": 2},
-        num_warps=8,
-        num_stages=1,
-    ),
-    triton.Config({"BLOCK_C": 64, "BLOCK_M": 32}, num_warps=4, num_stages=1),
-    triton.Config({"BLOCK_C": 64, "BLOCK_M": 64}, num_warps=8, num_stages=1),
-]
-
-
-if CONV_AUTOTUNE_ENABLED:
-    _nchw_to_cblocked_kernel = triton.autotune(
-        configs=AUTOTUNE_NCHW_TO_CBLOCKED_CONFIGS,
-        key=["C", "HW"],
-        cache_results=True,
-    )(_nchw_to_cblocked_kernel)
