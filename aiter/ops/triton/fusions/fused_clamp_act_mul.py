@@ -15,72 +15,61 @@ from aiter.ops.triton._triton_kernels.fusions.fused_clamp_act_mul import (
     _fused_clamp_silu_mul_kernel,
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH, load_config_json
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
 
-# Architectures that have a gluon kernel
-_GLUON_SUPPORTED_ARCHS = ("gfx1250",)
 
+def _get_config(M: int, N: int, block_size_n: int, backend: str) -> dict:
+    """Tuned config for ``(M, N)`` on ``backend``, or the untuned default.
 
-def _is_gluon_available():
-    """True if the current GPU arch has a Gluon port of this kernel."""
-    try:
-        arch = get_arch()
-        return any(s in arch for s in _GLUON_SUPPORTED_ARCHS)
-    except Exception:  # noqa: BLE001
-        return False
+    Both backends read ``configs/{arch}/{backend}/fused_clamp_act_mul/``.
 
+    gluon takes the N-specialized ``FUSED_CLAMP_ACT_MUL-N={N}.json`` and falls
+    back to ``DEFAULT.json``; within the specialized file the largest
+    ``M_LEQ_<x> <= M`` wins, so an M below the smallest tuned point falls
+    through to the default. A null ``BLOCK_SIZE_N`` means "keep the caller's
+    width" (the whole row unless overridden).
 
-def _get_config(M: int, N: int, block_size_n: int) -> dict:
-    # For gluon
-    if M == 128 and N == 4096:
-        return {
-            "ROWS_PER_PROG": 1,
-            "BLOCK_SIZE_M": 1,
-            "BLOCK_SIZE_N": 512,
-            "num_warps": 2,
-            "waves_per_eu": 4,
-        }
-    if M == 16384 and N == 4096:
-        return {
-            "ROWS_PER_PROG": 2,
-            "BLOCK_SIZE_M": 2,
-            "BLOCK_SIZE_N": 256,
-            "num_warps": 1,
-            "waves_per_eu": 5,
-        }
-    if M == 4096 and N == 512:
-        return {
-            "ROWS_PER_PROG": 1,
-            "BLOCK_SIZE_M": 4,
-            "BLOCK_SIZE_N": 512,
-            "num_warps": 1,
-            "waves_per_eu": 4,
-        }
-    if M == 16384 and N == 8192:
-        return {
-            "ROWS_PER_PROG": 1,
-            "BLOCK_SIZE_M": 2,
-            "BLOCK_SIZE_N": 512,
-            "num_warps": 1,
-            "waves_per_eu": 6,
-        }
-    if M == 8192 and N == 8192:
-        return {
-            "ROWS_PER_PROG": 3,
-            "BLOCK_SIZE_M": 4,
-            "BLOCK_SIZE_N": 512,
-            "num_warps": 4,
-            "waves_per_eu": 6,
-        }
-    return {
-        "ROWS_PER_PROG": 1,
-        "BLOCK_SIZE_M": 1,
-        "BLOCK_SIZE_N": block_size_n,
-        "num_warps": 1,
-        "waves_per_eu": 1,
-    }
+    triton takes ``DEFAULT.json`` for the running arch and picks the smallest
+    ``N_LEQ_<x> >= block_size_n``, else ``any``. M and N are unused there --
+    the triton kernel only tunes on the row width.
+
+    Returns:
+        The config dict for this shape.
+    """
+    arch = get_arch()
+    base = f"{AITER_TRITON_CONFIGS_PATH}/{arch}/{backend}/fused_clamp_act_mul"
+
+    if backend == "triton":
+        raw = load_config_json(f"{base}/DEFAULT.json", required=True)
+        for bound in sorted(
+            int(k[len("N_LEQ_") :]) for k in raw if k.startswith("N_LEQ_")
+        ):
+            if block_size_n <= bound:
+                return dict(raw[f"N_LEQ_{bound}"])
+        return dict(raw["any"])
+
+    config = None
+    specialized = load_config_json(
+        f"{base}/FUSED_CLAMP_ACT_MUL-N={N}.json", required=False
+    )
+    if specialized is not None:
+        for bound in sorted(
+            int(k[len("M_LEQ_") :]) for k in specialized if k.startswith("M_LEQ_")
+        ):
+            if M >= bound:
+                config = dict(specialized[f"M_LEQ_{bound}"])
+            else:
+                break
+
+    if config is None:
+        config = dict(load_config_json(f"{base}/DEFAULT.json", required=True)["any"])
+
+    if config["BLOCK_SIZE_N"] is None:
+        config["BLOCK_SIZE_N"] = block_size_n
+    return config
 
 
 def fused_clamp_act_mul(
@@ -95,7 +84,6 @@ def fused_clamp_act_mul(
     quant_block_size: int = 128,
     scale_dtype_fmt: Literal["fp32", "ue8m0"] = "fp32",
     shuffle_scale: bool = False,
-    block_size_n: int | None = None,
     backend: str | None = None,
 ):
     """
@@ -181,6 +169,9 @@ def fused_clamp_act_mul(
 
         # determine scale shape
         if shuffle_scale:
+            # Scales are preshuffled inside the kernel (see e8m0_shuffle/
+            # aiter.ops.shuffle.shuffle_scale): rows padded to a multiple of 256
+            # and block-cols to a multiple of 8, written in the tiled layout.
             scale_m_pad = (M + 255) // 256 * 256
             scale_n_pad = (num_blocks + 7) // 8 * 8
             if scale is None:
@@ -245,6 +236,8 @@ def fused_clamp_act_mul(
     # determine scale strides
     scale_n_pad = 0
     if HAS_QUANT:
+        # Kernel writes directly into the (scale_m_pad, scale_n_pad) buffer
+        # using the shuffled offset, so the plain row/col strides are unused.
         if shuffle_scale:
             scale_row_stride = scale.stride(0)
             scale_col_stride = scale.stride(1)
@@ -266,7 +259,7 @@ def fused_clamp_act_mul(
 
     # choose backend
     if backend is None:
-        backend = "gluon" if _is_gluon_available() else "triton"
+        backend = "gluon" if get_arch() in ("gfx1250",) else "triton"
     backend = backend.lower()
     assert backend in (
         "triton",
@@ -275,7 +268,7 @@ def fused_clamp_act_mul(
 
     if backend == "gluon":
         # Config if applicable, otherwise defaults
-        config = _get_config(M, n_half, BLOCK_SIZE_N)
+        config = _get_config(M, n_half, BLOCK_SIZE_N, "gluon")
         ROWS_PER_PROG = config["ROWS_PER_PROG"]
         BLOCK_SIZE_M = config["BLOCK_SIZE_M"]
         BLOCK_SIZE_N = config["BLOCK_SIZE_N"]
@@ -288,7 +281,7 @@ def fused_clamp_act_mul(
             f"quant_block_size ({quant_block_size})"
         )
 
-        # triton/gluon
+        # gluon -> power of 2 necessary
         assert (
             BLOCK_SIZE_M & (BLOCK_SIZE_M - 1) == 0
         ), f"BLOCK_SIZE_M ({BLOCK_SIZE_M}) must be a power of two"
@@ -296,9 +289,9 @@ def fused_clamp_act_mul(
             BLOCK_SIZE_N & (BLOCK_SIZE_N - 1) == 0
         ), f"BLOCK_SIZE_N ({BLOCK_SIZE_N}) must be a power of two"
 
-        assert (
-            _is_gluon_available()
-        ), f"Gluon backend requires one of {_GLUON_SUPPORTED_ARCHS}, got '{get_arch()}'"
+        assert get_arch() in (
+            "gfx1250",
+        ), f"Gluon backend requires gfx1250, got '{get_arch()}'"
 
         # (M chunks * rows to process, N tiles)
         _fused_clamp_silu_mul_gluon_kernel[
@@ -342,12 +335,7 @@ def fused_clamp_act_mul(
         )
     else:
         # only for triton
-        if BLOCK_SIZE_N <= 512:
-            num_warps = 1
-        elif BLOCK_SIZE_N <= 2048:
-            num_warps = 4
-        else:
-            num_warps = 8
+        num_warps = _get_config(M, n_half, BLOCK_SIZE_N, "triton")["num_warps"]
 
         _fused_clamp_silu_mul_kernel[(M,)](
             inp,

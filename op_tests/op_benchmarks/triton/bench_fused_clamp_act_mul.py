@@ -91,11 +91,15 @@ def run_benchmark(args):
     activation = args.activation
     swiglu_limit = args.swiglu_limit
     weighted = bool(args.weighted)
+    weight_shape = args.weight_shape
 
     @triton.testing.perf_report([benchmark])
     def bench_fused_clamp_act_mul(M, n_half, metric, **kwargs):
         inp = torch.randn((M, 2 * n_half), dtype=dtype, device="cuda") * 3.0
-        weights = torch.randn((M, 1), dtype=dtype, device="cuda") if weighted else None
+        weights = None
+        if weighted:
+            w_cols = 1 if weight_shape == "broadcast" else n_half
+            weights = torch.randn((M, w_cols), dtype=dtype, device="cuda")
 
         # Preallocate outputs so the timed fn does no allocation (clean CUDA-graph
         # capture): the wrapper writes into the provided out/scale buffers.
@@ -124,10 +128,11 @@ def run_benchmark(args):
         ms = triton.testing.do_bench_cudagraph(fn, rep=100, return_mode="mean")
 
         # Memory-bound: read gate+up (M x 2N), write out (M x N) + small scale
-        # buffer; broadcast [M,1] weights are negligible but counted.
+        # buffer. Weights add M x 1 when broadcast (negligible) or a full
+        # M x n_half read when per-element, so count the tensor as it is.
         mem_read = M * (2 * n_half) * inp.element_size()
         if weighted:
-            mem_read += M * inp.element_size()
+            mem_read += weights.numel() * weights.element_size()
         mem_write = M * n_half * out.element_size()
         if HAS_QUANT:
             mem_write += M * num_blocks * scale.element_size()
@@ -156,7 +161,10 @@ def parse_args(args: list[str] | None = None):
         "--dtype",
         type=dtypes.str2Dtype,
         default=dtypes.bf16,
-        help="input/output dtype for the non-quant path (e.g. bf16)",
+        choices=(dtypes.fp16, dtypes.bf16, dtypes.fp32),
+        help="input/output dtype for the non-quant path. Limited to fp16, bf16, fp32."
+        "The fp8 and integer dtypes are quantized *output* "
+        "types and are selected with --quant.",
     )
     parser.add_argument(
         "--shape",
@@ -182,7 +190,7 @@ def parse_args(args: list[str] | None = None):
     parser.add_argument(
         "--quant",
         type=str,
-        choices=["none", "fp8", "ue8m0"],
+        choices=list(_QUANT_MODES.keys()),
         default="none",
         help="quant mode: none | fp8 (fp32 scales) | ue8m0 (MXFP8)",
     )
@@ -203,7 +211,16 @@ def parse_args(args: list[str] | None = None):
         "--weighted",
         type=int,
         default=1,
-        help="1 to multiply broadcast [M,1] row weights, 0 to skip",
+        help="1 to multiply by row weights, 0 to skip. Use --weight-shape to "
+        "pick the weight layout.",
+    )
+    parser.add_argument(
+        "--weight-shape",
+        type=str,
+        default="broadcast",
+        choices=("broadcast", "full"),
+        help="weight layout when --weighted 1: 'broadcast' is [M, 1] applied "
+        "across the row, 'full' is [M, n_half], one weight per output element.",
     )
     parser.add_argument(
         "-print_vgpr",
