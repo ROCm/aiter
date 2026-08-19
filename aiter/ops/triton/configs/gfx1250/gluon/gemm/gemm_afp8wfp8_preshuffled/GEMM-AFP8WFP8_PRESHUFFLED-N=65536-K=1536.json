@@ -25,7 +25,7 @@
         "cache_modifier": ".ca",
         "LOOP_UNROLL_FACTOR": 4,
         "B_SCALE_TDM": true,
-        "kernel_type": "bandwidth_bound"
+        "kernel_type": "compute_bound"
     },
     "any": {
         "BLOCK_SIZE_M": 256,
