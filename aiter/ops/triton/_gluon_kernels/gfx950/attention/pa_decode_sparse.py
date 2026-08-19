@@ -356,23 +356,9 @@ def _slots(
     # of exec-mask branching in the kernel (20 of 55 s_and_saveexec_b64 on the
     # buffer path, all from the masked tail), because a masked gl.load predicates
     # while a masked buffer_load folds the mask into the offset.
-    if UNI_TILE:
-        # One body for full and partial tiles. Read a REAL index -- k_pos clamped into
-        # the segment -- instead of masking the load, and fold the range test into
-        # `valid`, which _qkpv_fp8 already turns into a -inf score mask. An
-        # out-of-range lane then gathers a genuine row whose score is -inf, which is
-        # exactly how -1 sentinels are already handled on the full-tile path.
-        in_range = k_pos < hi
-        kp = gl.minimum(k_pos, gl.maximum(hi - 1, 0))
-        if IDX_BUFFER_LOAD:
-            slot = gl.amd.cdna4.buffer_load(ptr=indices_ptr + seg_start, offsets=kp)
-        else:
-            slot = gl.load(indices_ptr + seg_start + kp)
-        valid = in_range
-        if HAS_INVALID:
-            valid = valid & (slot >= 0) & (slot < num_rows)
-        slot = gl.where(valid, slot, 0)
-    elif MASKED:
+    if MASKED:
+        # Legacy peeled tail (UNI_TILE=0, and the bf16 path). Predicating the read is
+        # what makes this expensive: a masked gl.load branches on exec.
         in_range = k_pos < hi
         if IDX_BUFFER_LOAD:
             slot = gl.amd.cdna4.buffer_load(
@@ -383,13 +369,21 @@ def _slots(
         valid = in_range & (slot >= 0) & (slot < num_rows)
         slot = gl.where(valid, slot, 0)
     else:
+        # UNI_TILE lets the partial tile ride this same body: clamp the index-list read
+        # into the segment rather than predicating it, so every lane reads a genuine
+        # in-segment index, and add the range test to `valid` -- which becomes a -inf
+        # score mask, exactly how -1 sentinels are already handled here. hi >= 1
+        # whenever this runs (_gd_fp8 is guarded by n_full > 0, so hi > lo >= 0).
+        off = gl.minimum(k_pos, hi - 1) if UNI_TILE else k_pos
         if IDX_BUFFER_LOAD:
-            slot = gl.amd.cdna4.buffer_load(ptr=indices_ptr + seg_start, offsets=k_pos)
+            slot = gl.amd.cdna4.buffer_load(ptr=indices_ptr + seg_start, offsets=off)
         else:
-            slot = gl.load(indices_ptr + seg_start + k_pos)
-        valid = slot >= 0  # -1 sentinels: clamp in-bounds, mask score below
+            slot = gl.load(indices_ptr + seg_start + off)
+        valid = (k_pos < hi) if UNI_TILE else (slot >= 0)
         if HAS_INVALID:
-            slot = gl.where(valid, slot, 0)
+            if UNI_TILE:
+                valid = valid & (slot >= 0)
+            slot = gl.where(valid, slot, 0)  # -1 sentinels: clamp, mask score below
     return (slot // BLOCK_SIZE).to(gl.int32), (slot % BLOCK_SIZE).to(gl.int32), valid
 
 
@@ -652,7 +646,6 @@ def _gd_fp8(
     FP8_FNUZ: gl.constexpr,
     UNI_TILE: gl.constexpr = False,
     seg_hi=0,
-    num_rows=0,
 ):
     """Gather one full fp8 tile. Split from the LDS-write/MFMA so the gather issues
     an iteration early.
@@ -668,8 +661,8 @@ def _gd_fp8(
         indices_ptr,
         seg_start,
         k_start + k_rng_slot,
-        seg_hi,  # hi/num_rows: unused unless UNI_TILE
-        num_rows,
+        seg_hi,  # hi: unused unless UNI_TILE; num_rows: MASKED only
+        0,
         BLOCK_SIZE,
         False,
         HAS_INVALID,
@@ -719,7 +712,7 @@ def _gd_fp8(
             seg_start,
             k_start + k_rng_rope,
             seg_hi,
-            num_rows,
+            0,
             BLOCK_SIZE,
             False,
             HAS_INVALID,
@@ -912,7 +905,6 @@ def _process_segment(
                 FP8_FNUZ,
                 UNI_TILE,
                 hi,
-                num_rows,
             )
             for i in range(1, n_full):
                 kn2, ks2, kr2, vld2 = _gd_fp8(
@@ -942,7 +934,6 @@ def _process_segment(
                     FP8_FNUZ,
                     UNI_TILE,
                     hi,
-                    num_rows,
                 )
                 m_i, l_i, acc = _qkpv_fp8(
                     kn,
@@ -1065,7 +1056,6 @@ def _process_segment(
                 FP8_FNUZ,
                 UNI_TILE,
                 hi,
-                num_rows,
             )
 
     if (not UNI_TILE) or (not IS_FP8):
