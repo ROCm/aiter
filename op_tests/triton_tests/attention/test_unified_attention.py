@@ -6,6 +6,7 @@ import pytest
 import torch
 
 from aiter.ops.triton.attention.unified_attention import (
+    get_arch,
     is_2d_gluon_available,
     unified_attention,
 )
@@ -529,6 +530,140 @@ def test_triton_unified_attn_3d(
             rtol=rtol,
             tol_err_ratio=tol_err_ratio,
             msg="unified_attn_3d output",
+        )
+        <= tol_err_ratio
+    )
+
+
+# RDNA compilation check for LDS overflow when head_size is
+# large(256 as in Gemma3, 512 as in Gemma4's
+# global-attention layers).
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        [(1, 1328)],
+        [(1, 523), (1, 37), (1, 2011)],
+        [(1, 1328), (1, 777), (1, 2011), (1, 600)],
+    ],
+)
+@pytest.mark.parametrize("num_heads", [(8, 1)])
+@pytest.mark.parametrize("head_size", [256, 512])
+@pytest.mark.parametrize("block_size", [64])
+@pytest.mark.parametrize(
+    "q_dtype, kv_dtype, o_dtype",
+    [
+        (torch.bfloat16, torch.bfloat16, torch.bfloat16),
+        (e4m3_dtype, e4m3_dtype, torch.bfloat16),
+    ],
+)
+@pytest.mark.parametrize("num_blocks", [2048])
+@torch.inference_mode()
+def test_triton_unified_attn_3d_rdna_lds(
+    seq_lens: list[tuple[int, int]],
+    num_heads: tuple[int, int],
+    head_size: int,
+    block_size: int,
+    q_dtype: torch.dtype,
+    kv_dtype: torch.dtype,
+    o_dtype: torch.dtype,
+    num_blocks: int,
+) -> None:
+    torch.cuda.empty_cache()
+    if not get_arch().is_rdna:
+        pytest.skip(f"RDNA-only LDS guard test; skip {DEVICE_ARCH}")
+
+    torch.manual_seed(0)
+    query_lens = [x[0] for x in seq_lens]
+
+    (
+        query,
+        key_cache,
+        value_cache,
+        maybe_shuffled_key_cache,
+        maybe_shuffled_value_cache,
+        sinks,
+        output,
+        cu_query_lens,
+        kv_lens,
+        max_query_len,
+        max_kv_len,
+        scale,
+        window_size,
+        block_tables,
+        maybe_quant_query,
+        query_scales,
+        q_descale,
+        k_descale,
+        v_descale,
+        output_scale,
+    ) = generate_data(
+        seq_lens=seq_lens,
+        num_blocks=num_blocks,
+        block_size=block_size,
+        head_size=head_size,
+        num_heads=num_heads,
+        sliding_window=None,
+        q_dtype=q_dtype,
+        kv_dtype=kv_dtype,
+        out_dtype=o_dtype,
+        shuffled_kv_cache=False,
+        use_out_scale=False,
+        device="cuda",
+    )
+
+    unified_attention(
+        q=maybe_quant_query,
+        k=maybe_shuffled_key_cache,
+        v=maybe_shuffled_value_cache,
+        out=output,
+        cu_seqlens_q=cu_query_lens,
+        seqused_k=kv_lens,
+        max_seqlen_q=max_query_len,
+        max_seqlen_k=max_kv_len,
+        softmax_scale=scale,
+        causal=True,
+        window_size=window_size,
+        block_table=block_tables,
+        softcap=0,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        q_scales=query_scales,
+        output_scale=output_scale,
+        sinks=sinks,
+        shuffled_kv_cache=False,
+    )
+
+    ref_output = ref_paged_attn(
+        query=query,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        query_lens=query_lens,
+        kv_lens=kv_lens,
+        block_tables=block_tables,
+        scale=scale,
+        out_dtype=o_dtype,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        output_scale=output_scale,
+        sliding_window=None,
+        soft_cap=None,
+        sinks=sinks,
+    )
+
+    atol, rtol = 1.5e-2, 1e-2
+    if q_dtype != torch.bfloat16 or kv_dtype != torch.bfloat16:
+        atol, rtol = 1.5e-1, 1.5e-1
+    tol_err_ratio = 0.01
+    assert (
+        checkAllclose(
+            output.to(torch.bfloat16),
+            ref_output.to(torch.bfloat16),
+            atol=atol,
+            rtol=rtol,
+            tol_err_ratio=tol_err_ratio,
+            msg="unified_attn_3d rdna lds",
         )
         <= tol_err_ratio
     )

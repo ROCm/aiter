@@ -210,17 +210,38 @@ def select_3d_config(
             e4m3_dtype,
         ), f"kv_cache_dtype only supports F16 ({torch.float16}) BF16 ({torch.bfloat16}), FP8 ({e4m3_dtype}) in arch = {DEVICE_ARCH}"
 
-        if head_size >= 512 and not arch.is_rdna:
-            attn_warps, attn_stages = 4, 1
-        occ = waves_per_eu * 4 // attn_warps
-        target_num_prgms = target_num_prgms * occ
-
         TILE_SIZE = min(64, triton.next_power_of_2(block_size))
 
         MAX_SEGMENTS = min(128, math.ceil(max_seqlen_k / TILE_SIZE))
         MIN_SEGMENTS = min(8, MAX_SEGMENTS)
-        if head_size >= 512 and not arch.is_rdna:
+        # RDNA has a smaller LDS budget; shrink the config so the KV tile fits
+        # and avoid an LDS-overflow compile failure when head_size is large.
+        if arch.is_rdna:
+            def _get_lds_limit():
+                # Per-workgroup LDS budget.
+                try:
+                    from triton.compiler import max_shared_mem
+                    from triton.runtime import driver
+
+                    return max_shared_mem(driver.active.get_current_device())
+                except (ImportError, AttributeError, RuntimeError):
+                    return 64 * 1024
+
+            RDNA_LDS_LIMIT = _get_lds_limit()
+            kv_tile_bytes = (
+                TILE_SIZE * triton.next_power_of_2(head_size) * kv_cache_dtype.itemsize
+            )
+            if attn_stages * kv_tile_bytes >= RDNA_LDS_LIMIT:
+                attn_stages = 1
+            while TILE_SIZE > 16 and kv_tile_bytes >= RDNA_LDS_LIMIT:
+                TILE_SIZE //= 2
+                kv_tile_bytes //= 2
+        elif head_size >= 512:
             MIN_SEGMENTS = min(16, MAX_SEGMENTS)
+            attn_warps, attn_stages = 4, 1
+
+        occ = waves_per_eu * 4 // attn_warps
+        target_num_prgms = target_num_prgms * occ
         if num_segments == 0:
             num_segments = math.ceil(target_num_prgms / num_2d_prgms)
             num_segments = min(num_segments, MAX_SEGMENTS)
