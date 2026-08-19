@@ -164,11 +164,9 @@ def _assert_supported(
         and out_dtype == "fp4"
         and not inline_quant
         and not interleave
-        and act == "situv2"
     ):
         raise NotImplementedError(
-            "flydsl mxfp4 GEMM1 BN64 is restricted to "
-            "BM32 A4W4 non-inline separated SiTUv2"
+            "flydsl mxfp4 GEMM1 BN64 is restricted to BM32 A4W4 non-inline separated"
         )
     if num_waves not in (2, 4):
         raise NotImplementedError(

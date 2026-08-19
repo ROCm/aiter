@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025-2026 FlyDSL Project Contributors
 
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
@@ -1608,14 +1609,18 @@ def compile_gemm1_a4w4_port(
         BN in (64, 128, 256) and BK == 256
     ), f"only BN in (64, 128, 256) and BK==256 supported, got BN={BN} BK={BK}"
     if BN == 64:
+        # Activation is not part of the BN64 specialization: BN_INT = BN // 2 is
+        # the gate (and up) column count, and both the epilogue column mapping
+        # and the scale-group layout above are written against BN_INT, so BN64
+        # is one complete 32-column MX group for any activation. Only the tile
+        # shape and data layout are constrained.
         assert (
             BM == 32
             and a_dtype == "fp4"
             and out_dtype == "fp4"
             and not inline_quant
             and not interleave
-            and act == "situv2"
-        ), "BN64 is restricted to BM32 A4W4 non-inline separated SiTUv2"
+        ), "BN64 is restricted to BM32 A4W4 non-inline separated"
     if num_waves == 2:
         assert BN == 64, "the two-wave specialization requires effective BN64"
     if native_scale_layout:
@@ -1626,7 +1631,11 @@ def compile_gemm1_a4w4_port(
         assert BM == 32, "k_wave > 1 is currently restricted to BM32"
         assert not inline_quant, "k_wave > 1 does not support inline quantization"
         assert not interleave, "k_wave > 1 requires separated gate/up layout"
-        assert not enable_bias, "k_wave > 1 does not support fused bias"
+        # Fused bias is k_wave-safe: every K-wave writes its partial accumulator
+        # to its own acc_idx(wave_k, ...) LDS group, the cross-wave reduction
+        # happens once inside acc_load_sum(), and run_epilogue() -- the only
+        # place the bias is added -- runs under `wave_k == 0`. So the bias lands
+        # exactly once, after the reduction, as it does for k_wave == 1.
         assert not wide_mfma, "k_wave > 1 does not support wide MFMA"
         assert v2_output_layout, "k_wave > 1 requires v2 sorted output"
         assert (
