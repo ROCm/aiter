@@ -1,74 +1,23 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Benchmark the whole GDN prefill block per K5 backend x snapshot dtype.
+"""Benchmark the full GDN prefill block (``chunk_gated_delta_rule_opt_vk``).
 
-``bench_gated_delta_rule_snapshot_dtype.py`` times the snapshot producer (K5)
-and consumer (K6) in isolation. This benchmark instead runs the full
-``chunk_gated_delta_rule_opt_vk`` block a serving stack calls, and splits the
-measurement three ways:
+Times wall / device (K1..K6) / launch-only / host gap for flydsl vs hip (optional
+triton). Shapes are built from ``--model`` + ``--tp`` + ``--t`` + ``--n`` for
+Qwen3.5-35B (Hv=32) and Qwen3.5-397B (Hv=64) only.
 
-* wall time -- the host-visible block latency (median of CUDA-event timings),
-* device time per stage -- profiler self time bucketed into K1..K6,
-* launch only -- the python-side cost of one call, measured without syncing,
-* host gap -- wall minus device total.
+Example::
 
-`launch only` is what reads the host gap: it is a floor on wall time, so a
-shape whose device work sits below it is launch bound and the gap is that
-shortfall. A gap above `launch only` instead means a wrapper stalled the
-stream, which is what the metadata=None runs below show.
-
-Shapes are the ``PrefillArgs`` cases from the K5 test suite
-(``op_tests/flydsl_tests/test_flydsl_linear_attention_prefill.py``), selected by
-their pytest ids, so a block measurement and the K5-only table in that suite
-describe the same workload. ``--list-cases`` prints the available ids.
-
-The block is timed with a prebuilt ``GatedDeltaRulePrefillMetadata``, matching
-how a serving stack builds the chunk schedule once and reuses it across the
-layer stack. Pass ``--without-metadata`` to also time the metadata=None path,
-where each wrapper recovers the chunk counts with a blocking device-to-host
-copy that shows up as host gap rather than device time.
-
-States are per-sequence and dense by default. Pass ``--with-state-pool`` to
-also time the indexed path a serving stack uses, where ``initial_state`` is a
-pool wider than the batch and K5 gathers each sequence's slot from an index
-array, writing the final state back into that same slot.
-
-Usage examples
---------------
-# Default: the varlen-qwen-ali-tp1 T=8192 single-sequence case, bf16 vs fp32
-# snapshots, flydsl vs hip
-python bench_gated_delta_rule_block.py
-
-# List the case ids this benchmark can run
-python bench_gated_delta_rule_block.py --list-cases
-
-# Any subset of the suite, matched as regexes against the case ids. Case ids
-# start with the PrefillGroup name, so a prefix runs that group's whole sweep,
-# and several patterns run several groups; more than one case adds a
-# cross-case summary table (--summary-only drops the per-case ones).
-python bench_gated_delta_rule_block.py --summary-only \
-    --case "^varlen-qwen-ali-tp1-" "^varlen-qwen3.5-397b-ptpc-ali-"
-
-# Quantify what skipping the prebuilt chunk schedule costs
-python bench_gated_delta_rule_block.py --without-metadata
-
-# Quantify what the indexed state pool costs against the dense states
-python bench_gated_delta_rule_block.py --with-state-pool
-
-# Also time the per-step indices re-validation a serving loop pays after
-# rewriting the slot mapping in place (cache cold on every layer call)
-python bench_gated_delta_rule_block.py --with-state-pool --with-state-pool-cold-check
-
-# Per-kernel breakdown behind the stage buckets
-python bench_gated_delta_rule_block.py --show-kernels
+    python bench_gated_delta_rule_block.py --model 35b --tp 1 --t 8192 --n 1
+    python bench_gated_delta_rule_block.py --model 397b --tp 4 --t 8192 --n 8 \\
+        --snapshot-dtype bf16 fp32
 """
 
 from __future__ import annotations
 
 import argparse
 import importlib.util
-import re
 import statistics
 import sys
 import time
@@ -85,18 +34,17 @@ from aiter.ops.triton.gated_delta_net import chunk_gated_delta_rule_opt_vk
 
 CHUNK_SIZE = 64
 
-# One sequence of 8192 on the TP1 shape: the smallest case that exposes the
-# full fp32-snapshot store cost (BV=64 at H=32 keeps every CU busy).
-DEFAULT_CASE_PATTERN = r"^varlen-qwen-ali-tp1-fp32snapshot.*_mnbt8192_"
-
 _K5_TEST_PATH = (
     Path(__file__).resolve().parents[2]
     / "flydsl_tests"
     / "test_flydsl_linear_attention_prefill.py"
 )
 
-# Kernel-name needle -> stage bucket. The K5 needles cover the three backends
-# (hip / flydsl / triton); everything unmatched lands in "other".
+MODELS = {
+    "35b": {"label": "Qwen3.5-35B", "Hv": 32},
+    "397b": {"label": "Qwen3.5-397B", "Hv": 64},
+}
+
 STAGE_RULES = [
     ("cumsum_scaled_dot_kkt", "K1+K2 cumsum/KKT"),
     ("merge_16x16_to_64x64_inverse", "K3 solve_tril"),
@@ -120,21 +68,57 @@ TOTALS = ["kernel total", "wall total", "launch only", "host gap"]
 DTYPES = {"bf16": torch.bfloat16, "fp32": torch.float32}
 
 
-def _load_k5_cases():
-    """Return the K5 suite's ``[(case_id, PrefillArgs)]`` list.
-
-    The suite owns the shape definitions (``PrefillGroup`` -> ``PrefillArgs``),
-    so it is imported as a plain module rather than duplicated here. It skips
-    itself at import time when ROCm or flydsl is missing, which surfaces as an
-    exception outside pytest.
-    """
+def _load_prefill_args_cls():
     spec = importlib.util.spec_from_file_location(
         "_gdn_k5_prefill_cases", _K5_TEST_PATH
     )
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
-    return list(zip(module.PREFILL_TEST_IDS, module.PREFILL_PARAMS, strict=True))
+    return module.PrefillArgs
+
+
+def _build_case(
+    PrefillArgs,
+    *,
+    model: str,
+    tp: int,
+    t: int,
+    n: int,
+    dense: bool,
+    snapshot_name: str,
+):
+    spec = MODELS[model]
+    snapshot_dtype = DTYPES[snapshot_name] if snapshot_name == "fp32" else None
+    if dense:
+        return PrefillArgs(
+            K=128,
+            V=128,
+            Hk=16,
+            Hv=spec["Hv"],
+            tp=tp,
+            full_prompt_len=t,
+            model_name=f"{spec['label']}-dense-bench",
+            max_num_batched_tokens=t,
+            is_varlen=False,
+            output_final_state=False,
+            snapshot_dtype=snapshot_dtype,
+        )
+    if n < 1:
+        raise SystemExit("--n must be >= 1 for varlen")
+    return PrefillArgs(
+        K=128,
+        V=128,
+        Hk=16,
+        Hv=spec["Hv"],
+        tp=tp,
+        full_prompt_len=t,
+        model_name=f"{spec['label']}-varlen-bench",
+        max_num_batched_tokens=n * t,
+        is_varlen=True,
+        output_final_state=True,
+        snapshot_dtype=snapshot_dtype,
+    )
 
 
 def _stage_of(kernel_name: str) -> str:
@@ -145,16 +129,6 @@ def _stage_of(kernel_name: str) -> str:
 
 
 def _build_inputs(case, seed, with_state_pool=False):
-    """Materialize the block-level tensors a ``PrefillArgs`` case describes.
-
-    The K5 suite builds K5's own operands (k / w / u); the block entry takes the
-    layer inputs instead, so q / v / beta are built here from the same shape
-    fields. q and k are L2-normalized and v is scaled down to keep the
-    recurrence in the numeric range the suite uses.
-
-    ``with_state_pool`` additionally builds the operands of the indexed path:
-    a state pool wider than the batch plus the slot indices into it.
-    """
     torch.manual_seed(seed)
     device = torch.device("cuda")
     context_lens = case.resolve_context_lens()
@@ -176,8 +150,6 @@ def _build_inputs(case, seed, with_state_pool=False):
         batch = case.dense_batch
         num_states = batch
         cu_seqlens = None
-        # Without cu_seqlens the wrappers take the layout from the tensor
-        # shapes, so there is no chunk schedule to prebuild.
         metadata = None
 
     q = F.normalize(
@@ -205,13 +177,9 @@ def _build_inputs(case, seed, with_state_pool=False):
         ).to(case.ssm_state_dtype)
 
     initial_state = make_states(num_states)
-
-    # A serving stack holds the states in a pool wider than the running batch
-    # and hands K5 the slots this batch owns, so oversize the pool and scatter
-    # the slots rather than passing an identity mapping the gather sees through.
     state_pool = make_states(2 * num_states) if with_state_pool else None
     state_indices = (
-        torch.randperm(2 * num_states)[:num_states].to(device=device, dtype=torch.int32)
+        torch.randperm(2 * num_states).to(device=device, dtype=torch.int32)[:num_states]
         if with_state_pool
         else None
     )
@@ -242,9 +210,6 @@ def _make_callable(
     *,
     cold_indices_check=False,
 ):
-    # The indexed path reads and writes the pool, so the states it walks are
-    # the ones the previous iteration wrote back. The gates decay, so the
-    # recurrence stays in range across a benchmark loop.
     initial_state = (
         tensors["state_pool"] if state_indices is not None else tensors["initial_state"]
     )
@@ -252,9 +217,6 @@ def _make_callable(
 
     def run():
         if cold_indices_check and state_indices is not None:
-            # Serving rewrites the slot mapping in place each step. FlyDSL no
-            # longer re-validates index values on the host (HIP parity), so
-            # this mainly exercises any copy/narrow cost from ``.to(int32)``.
             new_slots = torch.randperm(pool_size, device=state_indices.device)[
                 : state_indices.numel()
             ]
@@ -295,14 +257,6 @@ def _bench_wall_us(run, warmup_iters, bench_iters):
 
 
 def _bench_launch_us(run, warmup_iters, bench_iters):
-    """Median python-side cost of one block call, measured without syncing.
-
-    The device stays behind the host here, so this is what the host needs to
-    enqueue the block: dispatch, allocations and the kernel launches. It is a
-    floor on wall time -- a shape whose device work is below it is launch
-    bound, and the wall-minus-device gap is that shortfall rather than a stall
-    inside a wrapper.
-    """
     for _ in range(warmup_iters):
         run()
     torch.cuda.synchronize()
@@ -365,27 +319,7 @@ def _print_table(labels, rows):
         )
 
 
-def _select_cases(cases, patterns):
-    selected = [
-        (case_id, case)
-        for case_id, case in cases
-        if any(re.search(p, case_id) for p in patterns)
-    ]
-    if not selected:
-        raise SystemExit(
-            f"No K5 case id matches {patterns}; run --list-cases to see the ids."
-        )
-    return selected
-
-
 def _print_summary(records, metrics):
-    """Cross-case view: one table per metric, cases down, configs across.
-
-    A case contributes one row per snapshot dtype, so the columns stay dense
-    when a sweep mixes bf16 and fp32 groups (the case id already carries the
-    shape, the snapshot policy does not fit in it). Each non-HIP backend also
-    gets a speedup-vs-HIP column, >1 meaning that backend is the faster one.
-    """
     columns, row_keys, cells = [], [], {}
     for rec in records:
         if rec["column"] not in columns:
@@ -395,18 +329,22 @@ def _print_summary(records, metrics):
             row_keys.append(row_key)
         cells[(row_key, rec["column"])] = rec["row"]
 
-    # (ratio column, numerator column, denominator column) for every backend
-    # timed against HIP under the same metadata variant.
     ratios = []
     for column in columns:
-        backend, _, meta = column.partition(" ")
-        hip_column = f"hip {meta}"
-        if backend != "hip" and hip_column in columns:
-            ratios.append((f"{backend[:3]}/hip {meta}", hip_column, column))
+        if column == "hip" or column.startswith("hip "):
+            continue
+        backend, _, suffix = column.partition(" ")
+        hip_column = "hip" if not suffix else f"hip {suffix}"
+        if hip_column in columns:
+            label = f"{backend[:3]}/hip"
+            if suffix:
+                label += f" {suffix}"
+            ratios.append((label, hip_column, column))
 
     case_width = max(len(case_id) for case_id, _ in row_keys) + 2
-    col_width = max(12, max(len(column) for column, _, _ in ratios) + 2)
-    col_width = max(col_width, max(len(column) for column in columns) + 2)
+    col_width = max(12, max(len(column) for column in columns) + 2)
+    if ratios:
+        col_width = max(col_width, max(len(column) for column, _, _ in ratios) + 2)
     for metric in metrics:
         header = f"{metric + ' (us)':<{case_width}}{'snap':>6}"
         header += "".join(f"{column:>{col_width}}" for column in columns)
@@ -422,8 +360,6 @@ def _print_summary(records, metrics):
             for _, hip_column, column in ratios:
                 hip_row = cells.get((row_key, hip_column))
                 row = cells.get((row_key, column))
-                # host gap goes to zero (and through it, on jitter), so a ratio
-                # there would be noise rather than a speedup.
                 if hip_row is None or row is None or row[metric] <= 0.0:
                     line += "-".rjust(col_width)
                 else:
@@ -433,20 +369,11 @@ def _print_summary(records, metrics):
 
 def _run_case(case_id, case, args):
     if not case.use_g:
-        # The suite's no-g cases exercise K5's padding masking directly; the
-        # block entry always cumsums a gate, so there is no g=None path here.
         print(f"\n== {case_id}\nskipped: the block entry requires g")
         return []
 
-    # The indexed path writes the final state back into its pool slot, so it
-    # only applies to cases that ask for a final state at all.
     with_pool = args.with_state_pool and case.output_final_state
     tensors = _build_inputs(case, args.seed, with_state_pool=with_pool)
-    metadata_variants = [("meta", tensors["metadata"])]
-    if args.without_metadata and tensors["metadata"] is not None:
-        metadata_variants.append(("no-meta", None))
-    # The dense variant carries no suffix, keeping the labels of a run that
-    # does not ask for the pool unchanged.
     state_variants = [("", None)]
     if with_pool:
         state_variants.append(("pool", tensors["state_indices"]))
@@ -456,40 +383,30 @@ def _run_case(case_id, case, args):
     records = []
     labels, rows, per_kernel_rows = [], {}, {}
     for backend in args.backends:
-        for dtype_name in args.snapshot_dtype:
-            snapshot_dtype = (
-                case.snapshot_dtype if dtype_name == "case" else DTYPES[dtype_name]
+        snapshot_dtype = case.snapshot_dtype or case.dtype
+        snapshot_name = "fp32" if snapshot_dtype == torch.float32 else "bf16"
+        for state_name, state_indices in state_variants:
+            run = _make_callable(
+                tensors,
+                case,
+                backend,
+                snapshot_dtype,
+                prefill_metadata=tensors["metadata"],
+                state_indices=state_indices,
+                cold_indices_check=state_name == "pool-cold",
             )
-            snapshot_name = (
-                "fp32" if snapshot_dtype == torch.float32 else "bf16"
-            )  # None resolves to k.dtype, i.e. bf16 here
-            for meta_name, metadata in metadata_variants:
-                for state_name, state_indices in state_variants:
-                    run = _make_callable(
-                        tensors,
-                        case,
-                        backend,
-                        snapshot_dtype,
-                        prefill_metadata=metadata,
-                        state_indices=state_indices,
-                        cold_indices_check=state_name == "pool-cold",
-                    )
-                    parts = (backend, snapshot_name, meta_name, state_name)
-                    label = " ".join(part for part in parts if part)
-                    labels.append(label)
-                    rows[label], per_kernel_rows[label] = _measure(run, args)
-                    records.append(
-                        {
-                            "case": case_id,
-                            "snap": snapshot_name,
-                            "column": " ".join(
-                                part
-                                for part in (backend, meta_name, state_name)
-                                if part
-                            ),
-                            "row": rows[label],
-                        }
-                    )
+            parts = (backend, snapshot_name, state_name)
+            label = " ".join(part for part in parts if part)
+            labels.append(label)
+            rows[label], per_kernel_rows[label] = _measure(run, args)
+            records.append(
+                {
+                    "case": case_id,
+                    "snap": snapshot_name,
+                    "column": " ".join(part for part in (backend, state_name) if part),
+                    "row": rows[label],
+                }
+            )
 
     if not args.summary_only:
         if with_pool:
@@ -498,11 +415,11 @@ def _run_case(case_id, case, args):
             pool_note = ", pool skipped (needs final_state=on)"
         else:
             pool_note = ""
+        layout = "dense" if not case.is_varlen else f"varlen N={tensors['num_seqs']}"
         print(f"\n== {case_id}")
         print(
-            f"TP{case.tp} Hg={case.Hg} H={case.H} K={case.K} V={case.V} "
-            f"{'varlen' if case.is_varlen else f'dense B={case.dense_batch}'}, "
-            f"T={tensors['total_tokens']} ({tensors['num_seqs']} seqs), "
+            f"TP{case.tp} Hg={case.Hg} H={case.H} K={case.K} V={case.V} {layout}, "
+            f"T={tensors['total_tokens']}, "
             f"final_state={'on' if case.output_final_state else 'off'}{pool_note}"
         )
         _print_table(labels, rows)
@@ -517,20 +434,55 @@ def _run_case(case_id, case, args):
     return records
 
 
+def _selected_cases(args, PrefillArgs):
+    cases = []
+    for snap in args.snapshot_dtype:
+        case = _build_case(
+            PrefillArgs,
+            model=args.model,
+            tp=args.tp,
+            t=args.t,
+            n=args.n,
+            dense=args.dense,
+            snapshot_name=snap,
+        )
+        cases.append((repr(case), case))
+    return cases
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Benchmark the GDN prefill block per K5 backend and snapshot dtype."
+        description="Benchmark GDN prefill block for Qwen3.5-35B / 397B shapes."
     )
     parser.add_argument(
-        "--case",
-        nargs="+",
-        default=[DEFAULT_CASE_PATTERN],
-        help="Regexes matched against the K5 suite's case ids (see --list-cases).",
+        "--model",
+        choices=sorted(MODELS),
+        default="35b",
+        help="Qwen3.5-35B (Hv=32) or Qwen3.5-397B (Hv=64).",
     )
     parser.add_argument(
-        "--list-cases",
+        "--tp",
+        type=int,
+        default=1,
+        choices=[1, 2, 4, 8],
+        help="Tensor-parallel rank count (Hg=Hk/tp, H=Hv/tp).",
+    )
+    parser.add_argument(
+        "--t",
+        type=int,
+        default=8192,
+        help="Per-sequence token length (full_prompt_len).",
+    )
+    parser.add_argument(
+        "--n",
+        type=int,
+        default=1,
+        help="Varlen batch size: num sequences with length --t (mnbt = n * t). Ignored with --dense.",
+    )
+    parser.add_argument(
+        "--dense",
         action="store_true",
-        help="Print the K5 suite case ids this benchmark can run, then exit.",
+        help="Dense layout (single seq, no cu_seqlens) instead of varlen.",
     )
     parser.add_argument(
         "--backends",
@@ -541,47 +493,31 @@ def main() -> None:
     parser.add_argument(
         "--snapshot-dtype",
         nargs="+",
-        choices=["case", "bf16", "fp32"],
-        default=["case"],
-        help="'case' keeps the snapshot policy the case id encodes.",
-    )
-    parser.add_argument(
-        "--without-metadata",
-        action="store_true",
-        help="Also time each config with prefill_metadata=None, exposing the "
-        "chunk-schedule device-to-host copy as host gap.",
+        choices=["bf16", "fp32"],
+        default=["bf16"],
+        help="Per-chunk h snapshot dtype to benchmark.",
     )
     parser.add_argument(
         "--with-state-pool",
         action="store_true",
-        help="Also time each config against an indexed state pool, where K5 "
-        "gathers each sequence's slot from an index array and writes the "
-        "final state back in place. Cases without a final state keep the "
-        "dense states only.",
+        help="Also benchmark indexed initial_state_indices / state pool.",
     )
     parser.add_argument(
         "--with-state-pool-cold-check",
         action="store_true",
-        help="When ``--with-state-pool`` is set, also time a variant that "
-        "rewrites ``initial_state_indices`` in place before every call, "
-        "matching a serving loop that updates the slot mapping each step.",
+        help="Rewrite state_indices each call (with --with-state-pool).",
     )
-    parser.add_argument(
-        "--show-kernels",
-        action="store_true",
-        help="Print the per-kernel device times behind the stage buckets.",
-    )
+    parser.add_argument("--show-kernels", action="store_true")
     parser.add_argument(
         "--summary-metrics",
         nargs="+",
         choices=STAGES + TOTALS,
         default=["wall total", "K5 state scan", "host gap"],
-        help="Metrics tabulated across cases when more than one case runs.",
     )
     parser.add_argument(
         "--summary-only",
         action="store_true",
-        help="Print only the cross-case summary, not the per-case stage tables.",
+        help="Skip per-case tables when multiple snapshot dtypes are requested.",
     )
     parser.add_argument("--warmup-iters", type=int, default=10)
     parser.add_argument("--bench-iters", type=int, default=50)
@@ -589,19 +525,22 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=20260811)
     args = parser.parse_args()
 
-    cases = _load_k5_cases()
-    if args.list_cases:
-        for case_id, _ in cases:
-            print(case_id)
-        return
+    PrefillArgs = _load_prefill_args_cls()
+    selected = _selected_cases(args, PrefillArgs)
 
     props = torch.cuda.get_device_properties(0)
+    spec = MODELS[args.model]
+    layout = "dense" if args.dense else f"varlen n={args.n}"
     print(f"\ngfx={props.gcnArchName} CUs={props.multi_processor_count}")
     print(
-        f"wall / launch = median of {args.bench_iters} CUDA-event / unsynced "
-        f"host timings; device = {args.prof_iters}-iter profiler self time"
+        f"shape: {spec['label']} TP{args.tp} T={args.t} {layout} "
+        f"snapshot={','.join(args.snapshot_dtype)}"
     )
-    selected = _select_cases(cases, args.case)
+    print(
+        f"wall / launch = median of {args.bench_iters} timings; "
+        f"device = {args.prof_iters}-iter profiler self time"
+    )
+
     records = []
     for case_id, case in selected:
         records += _run_case(case_id, case, args)
