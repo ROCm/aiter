@@ -85,11 +85,10 @@ TESTS = [
         "model_id": "deepseek-ai/DeepSeek-V3.2",
         "model_path_env": "DEEPSEEK_V32_MODEL_PATH",
         "test_type": "Accuracy",
-        "timeout_minutes": 70,
+        "timeout_minutes": 150,
         "extra_exec_args": "",
-        "test_command": "python3 run_suite.py --hw amd --suite nightly-amd-8-gpu-mi35x-deepseek-v32 --nightly --timeout-per-file 3600",
-        "run_on_pr": False,
-        "comment": "Run in nightly first while failures are investigated.",
+        "test_command": "python3 run_suite.py --hw amd --suite nightly-amd-8-gpu-mi35x-deepseek-v32 --nightly --timeout-per-file 7200",
+        "run_on_pr": True,
         "run_on_schedule": True,
     },
     {
@@ -127,6 +126,11 @@ SGLANG_CI_PATCHES = [
     },
     {
         "path": "scripts/ci/amd/amd_ci_install_dependency.sh",
+        "old": "docker cp human-eval ci_sglang:/",
+        "new": "docker cp human-eval ci_sglang:/\n  docker exec ci_sglang git config --global --add safe.directory /human-eval",
+    },
+    {
+        "path": "scripts/ci/amd/amd_ci_install_dependency.sh",
         "old": "install_with_retry docker exec -w /human-eval ci_sglang pip install --cache-dir=/sgl-data/pip-cache -e .",
         "new": "install_with_retry docker exec -w /human-eval ci_sglang pip install --cache-dir=/sgl-data/pip-cache --no-build-isolation -e .",
     },
@@ -149,6 +153,11 @@ SGLANG_CI_PATCHES = [
         "path": "test/registered/amd/accuracy/mi35x/test_deepseek_v32_eval_mi35x.py",
         "old": 'model_path="deepseek-ai/DeepSeek-V3.2",',
         "new": 'model_path=os.environ.get("DEEPSEEK_V32_MODEL_PATH", "deepseek-ai/DeepSeek-V3.2"),',
+    },
+    {
+        "path": "test/registered/amd/accuracy/mi35x/test_deepseek_v32_eval_mi35x.py",
+        "old": '        timeout=5400,\n        variant="basic",',
+        "new": '        timeout=7200,\n        variant="basic",',
     },
 ]
 

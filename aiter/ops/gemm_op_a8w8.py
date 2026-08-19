@@ -175,6 +175,13 @@ def gemm_a8w8_bpreshuffle_flydsl(
             XQ, WQ, x_scale, w_scale, Out, kernel_name
         )
 
+    if kernel_name.startswith("flydsl_bpreshuffle_8w_"):
+        from .flydsl.gemm_a8w8_bpreshuffle_8wave import run_gemm_a8w8_bpreshuffle_8wave
+
+        return run_gemm_a8w8_bpreshuffle_8wave(
+            XQ, WQ, x_scale, w_scale, Out, kernel_name
+        )
+
     from .flydsl.gemm_kernels import flydsl_preshuffle_gemm_a8
 
     parsed = _parse_flydsl_kernel_name(kernel_name)
@@ -200,7 +207,7 @@ def gemm_a8w8_bpreshuffle_flydsl(
     return Out
 
 
-def gemm_a8w8_blockscale_bpreshuffle_flydsl(
+def gemm_a8w8_mxfp8_128_bpreshuffle_flydsl(
     XQ: Tensor,
     WQ: Tensor,
     x_scale: Tensor,
@@ -211,13 +218,13 @@ def gemm_a8w8_blockscale_bpreshuffle_flydsl(
     kernel_name = str(config.get("kernelName", ""))
     if get_gfx() != "gfx1250":
         raise RuntimeError(
-            "gemm_a8w8_blockscale_bpreshuffle_flydsl is only supported on gfx1250"
+            "gemm_a8w8_mxfp8_128_bpreshuffle_flydsl is only supported on gfx1250"
         )
-    from .flydsl.blockscale_bpreshuffle_gemm_gfx1250 import (
-        run_gemm_a8w8_blockscale_bpreshuffle_gfx1250,
+    from .flydsl.mxfp8_128_bpreshuffle_gemm_gfx1250 import (
+        run_gemm_a8w8_mxfp8_128_bpreshuffle_gfx1250,
     )
 
-    return run_gemm_a8w8_blockscale_bpreshuffle_gfx1250(
+    return run_gemm_a8w8_mxfp8_128_bpreshuffle_gfx1250(
         XQ, WQ, x_scale, w_scale, Out, kernel_name
     )
 
@@ -888,7 +895,13 @@ def gemm_a8w8_blockscale_bpreshuffle_fake(
     x_scale: Tensor,
     w_scale: Tensor,
     dtype: torch.dtype = dtypes.bf16,
+    out: Tensor | None = None,
 ) -> Tensor:
+    # Must mirror the real signature (incl. out=): the abstract_impl forwards the
+    # out= kwarg here at trace time. When out is given the real fn returns it, so
+    # the fake returns it too (preserves tensor identity for mutation/aliasing).
+    if out is not None:
+        return out
     return torch.empty(XQ.shape[0], WQ.shape[0], dtype=dtype, device=XQ.device)
 
 
@@ -899,6 +912,7 @@ def gemm_a8w8_blockscale_bpreshuffle(
     x_scale: Tensor,
     w_scale: Tensor,
     dtype: torch.dtype = dtypes.bf16,
+    out: Tensor | None = None,
 ) -> Tensor:
     assert dtype in [
         dtypes.bf16,
@@ -907,18 +921,30 @@ def gemm_a8w8_blockscale_bpreshuffle(
     m = XQ.shape[0]
     n = WQ.shape[0]
     k = XQ.shape[1]
-    Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
+    # `out`: optional caller-owned output buffer so the result lands at a FIXED
+    # address (needed to capture this GEMM's consumer into a cudagraph without a
+    # per-step input copy). The ck/cktile/asm/opus/flydsl paths below take Y
+    # positionally and write into it, so honoring `out` there is free. The
+    # triton-fallback branches self-allocate their output and CANNOT honor `out`
+    # -> assert loud rather than silently returning a different address.
+    if out is not None:
+        assert out.shape == (m, n) and out.dtype == dtype and out.device == XQ.device, (
+            f"gemm_a8w8_blockscale_bpreshuffle: out buffer {tuple(out.shape)}/"
+            f"{out.dtype} != expected ({m},{n})/{dtype}"
+        )
+        Y = out
+    else:
+        Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
 
-    use_gfx1250_flydsl_blockscale = (
+    use_gfx1250_flydsl_mxfp8_128 = (
         get_gfx() == "gfx1250"
         and x_scale.dtype == dtypes.fp8_e8m0
         and w_scale.dtype == dtypes.fp8_e8m0
     )
-    if use_gfx1250_flydsl_blockscale:
+    if use_gfx1250_flydsl_mxfp8_128:
         if not is_flydsl_available():
             raise RuntimeError(
-                "gfx1250 a8w8 blockscale bpreshuffle with fp8_e8m0 scales "
-                "requires FlyDSL"
+                "gfx1250 mxfp8_128 bpreshuffle (fp8_e8m0 scales) requires FlyDSL"
             )
         config = get_CKGEMM_config(
             m,
@@ -927,11 +953,11 @@ def gemm_a8w8_blockscale_bpreshuffle(
             AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE,
         )
         if config is not None and config["libtype"] == "flydsl":
-            return gemm_a8w8_blockscale_bpreshuffle_flydsl(
+            return gemm_a8w8_mxfp8_128_bpreshuffle_flydsl(
                 XQ, WQ, x_scale, w_scale, Y, config
             )
 
-        from ..ops.flydsl.gemm_tune.flydsl_gemm_a8w8_blockscale_bpreshuffle_wmma_common import (
+        from ..ops.flydsl.gemm_tune.flydsl_gemm_mxfp8_128_bpreshuffle_wmma_common import (
             kernel_fits_shape,
             kernels_list,
         )
@@ -946,7 +972,7 @@ def gemm_a8w8_blockscale_bpreshuffle(
                 f"[gfx1250] gemm_a8w8_blockscale_bpreshuffle untuned "
                 f"M={m}, N={n}, K={k}; falling back to flydsl kernel '{ki.name}'."
             )
-            return gemm_a8w8_blockscale_bpreshuffle_flydsl(
+            return gemm_a8w8_mxfp8_128_bpreshuffle_flydsl(
                 XQ, WQ, x_scale, w_scale, Y, {"kernelName": ki.name}
             )
 
@@ -981,12 +1007,14 @@ def gemm_a8w8_blockscale_bpreshuffle(
             "NUM_KSPLIT": 1,
             "kpack": 2,
         }
+        # triton impl accepts a pre-allocated `y=` -> forward `out` (zero-copy).
         return _gemm_a8w8_blockscale_preshuffle_triton(
             xq,
             wq.reshape(n // 16, k * 16),
             x_scale,
             w_scale,
             dtype=dtype,
+            y=Y,  # honor caller out= (zero-copy); Y = out or fresh empty
             config=_fallback_cfg,
             is_x_scale_tranposed=x_scale.stride(0) != 1,
         )
@@ -1009,12 +1037,15 @@ def gemm_a8w8_blockscale_bpreshuffle(
         backend = kernelName if kernelName in ("triton", "gluon") else None
         xq = XQ if XQ.dtype != torch.uint8 else XQ.view(dtypes.fp8)
         wq = WQ if WQ.dtype != torch.uint8 else WQ.view(dtypes.fp8)
+        # The triton impl accepts a pre-allocated output via `y=`; forward `out`
+        # so the result lands at the caller's fixed address (zero-copy path).
         return _gemm_a8w8_blockscale_preshuffle_triton(
             xq,
             wq.reshape(n // 16, k * 16),
             x_scale,
             w_scale,
             dtype=dtype,
+            y=Y,  # honor caller out= (zero-copy); Y = out or fresh empty
             backend=backend,
             is_x_scale_tranposed=x_scale.stride(0) != 1,
         )
@@ -1044,7 +1075,7 @@ def gemm_a8w8_blockscale_bpreshuffle(
                 XQ, WQ, x_scale, w_scale, Y, kernelId=kernelId
             )
         elif libtype == "flydsl" and is_flydsl_available():
-            return gemm_a8w8_blockscale_bpreshuffle_flydsl(
+            return gemm_a8w8_mxfp8_128_bpreshuffle_flydsl(
                 XQ, WQ, x_scale, w_scale, Y, config
             )
     try:

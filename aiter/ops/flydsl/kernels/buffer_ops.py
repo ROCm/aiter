@@ -120,6 +120,23 @@ def _create_i32_constant(value: int) -> ir.Value:
     return _unwrap_value(op.result)
 
 
+def _to_i32_offset(offset: ir.Value) -> ir.Value:
+    """Normalize an already-unwrapped offset value to i32.
+
+    Accepts index (index_cast), i32 (as-is), wider ints e.g. i64 (trunc), and
+    narrower ints (sign-extend). Lets callers pass fx.Int64 offsets (element or
+    byte) without hitting the ``index_cast i64<->i32`` incompatibility.
+    """
+    ot = offset.type
+    if isinstance(ot, ir.IntegerType):
+        if ot.width == 32:
+            return offset
+        if ot.width > 32:
+            return _unwrap_value(std_arith.TruncIOp(T.i32(), offset).result)
+        return _unwrap_value(std_arith.ExtSIOp(T.i32(), offset).result)
+    return _unwrap_value(std_arith.IndexCastOp(T.i32(), offset).result)
+
+
 @dsl_loc_tracing
 def _create_i16_constant(value: int) -> ir.Value:
     """Create i16 constant using standard MLIR arith dialect."""
@@ -531,10 +548,8 @@ def buffer_load(
         offset = offset.ir_value()
     offset = _unwrap_value(offset)
 
-    # Convert offset to i32 if needed
-    if not isinstance(offset.type, ir.IntegerType) or offset.type.width != 32:
-        op = std_arith.IndexCastOp(T.i32(), offset)
-        offset = _unwrap_value(op.result)
+    # Convert offset to i32 if needed (accepts index/i64/i32)
+    offset = _to_i32_offset(offset)
 
     # IMPORTANT: Buffer load offset is in BYTES, not elements!
     # For vec4xf32, each element is 4 bytes, so multiply offset by 4
@@ -577,11 +592,12 @@ def buffer_load(
         if isinstance(soffset_bytes, int):
             soffset = _create_i32_constant(soffset_bytes)
         else:
-            soffset = _unwrap_value(soffset_bytes)
-            if not isinstance(soffset.type, ir.IntegerType) or soffset.type.width != 32:
-                op = std_arith.IndexCastOp(T.i32(), soffset)
-                soffset = _unwrap_value(op.result)
-    aux_flags = _create_i32_constant(cache_modifier)
+            soffset = _to_i32_offset(_unwrap_value(soffset_bytes))
+    aux_attr = (
+        ir.IntegerAttr.get(ir.IntegerType.get_signless(32), cache_modifier)
+        if cache_modifier
+        else None
+    )
 
     # Emit buffer load
     load_op = rocdl.RawPtrBufferLoadOp(
@@ -589,7 +605,7 @@ def buffer_load(
         rsrc,
         offset,
         soffset,
-        aux_flags,  # soffset (scalar byte offset)  # aux (cache modifiers)
+        aux=aux_attr,
     )
 
     return load_op.result
@@ -634,10 +650,8 @@ def buffer_store(
     rsrc = _unwrap_value(rsrc)
     offset = _unwrap_value(offset)
 
-    # Convert offset to i32 if needed
-    if not isinstance(offset.type, ir.IntegerType) or offset.type.width != 32:
-        op = std_arith.IndexCastOp(T.i32(), offset)
-        offset = _unwrap_value(op.result)
+    # Convert offset to i32 if needed (accepts index/i64/i32)
+    offset = _to_i32_offset(offset)
 
     # IMPORTANT: RawPtrBufferStoreOp offset is in BYTES.
     # For backward compat, `buffer_store()` accepts element offsets by default
@@ -668,11 +682,12 @@ def buffer_store(
         if isinstance(soffset_bytes, int):
             soffset = _create_i32_constant(int(soffset_bytes))
         else:
-            soffset = _unwrap_value(soffset_bytes)
-            if not isinstance(soffset.type, ir.IntegerType) or soffset.type.width != 32:
-                op = std_arith.IndexCastOp(T.i32(), soffset)
-                soffset = _unwrap_value(op.result)
-    aux_flags = _create_i32_constant(cache_modifier)
+            soffset = _to_i32_offset(_unwrap_value(soffset_bytes))
+    aux_attr = (
+        ir.IntegerAttr.get(ir.IntegerType.get_signless(32), cache_modifier)
+        if cache_modifier
+        else None
+    )
 
     # Emit buffer store
     rocdl.RawPtrBufferStoreOp(
@@ -680,5 +695,5 @@ def buffer_store(
         rsrc,
         offset,
         soffset,
-        aux_flags,  # soffset (scalar byte offset)  # aux (cache modifiers)
+        aux=aux_attr,
     )

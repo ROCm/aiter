@@ -392,6 +392,9 @@ def _batched_gemm_bf16_compute_bound_kernel(
     ADD_BIAS: gl.constexpr,
     NUM_KSPLIT: gl.constexpr,
     SPLITK_BLOCK_SIZE: gl.constexpr,
+    num_warps: gl.constexpr,
+    waves_per_eu: gl.constexpr,
+    cache_modifier: gl.constexpr,
 ):
     gl.static_assert(NUM_BUFFERS >= 2, "compute_bound kernel requires NUM_BUFFERS >= 2")
 

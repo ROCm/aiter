@@ -7,7 +7,6 @@
 #include "aiter_stream.h"
 #include "dsv4_rotate_quant.h"
 #include "rocprim/rocprim.hpp"
-#include <hipcub/hipcub.hpp>
 
 namespace aiter {
 
@@ -463,7 +462,7 @@ void rotate_activation_fp4quant(aiter_tensor_t& out,
     }
     else if(dim == 1024)
     {
-        ROTATE_ACTIVATION_FP4QUANT_KERNEL_IMPL(1024, true, 16, "rotate_activation_fp4quant");
+        ROTATE_ACTIVATION_FP4QUANT_KERNEL_IMPL(1024, true, 32, "rotate_activation_fp4quant");
     }
     else
     {
@@ -503,7 +502,7 @@ void rotate_activation(aiter_tensor_t& out,
     }
     else if(dim == 1024)
     {
-        ROTATE_ACTIVATION_FP4QUANT_KERNEL_IMPL(1024, false, 16, "rotate_activation");
+        ROTATE_ACTIVATION_FP4QUANT_KERNEL_IMPL(1024, false, 32, "rotate_activation");
     }
     else
     {
@@ -796,7 +795,7 @@ void rope_rotate_activation_fp4quant(aiter_tensor_t& out,
     }
     else if(dim == 1024)
     {
-        ROPE_ROTATE_ACTIVATION_FP4QUANT_KERNEL_IMPL(1024, true, 16,
+        ROPE_ROTATE_ACTIVATION_FP4QUANT_KERNEL_IMPL(1024, true, 32,
             "rope_rotate_activation_fp4quant");
     }
     else
@@ -869,7 +868,7 @@ void rope_rotate_activation(aiter_tensor_t& out,
     }
     else if(dim == 1024)
     {
-        ROPE_ROTATE_ACTIVATION_FP4QUANT_KERNEL_IMPL(1024, false, 16,
+        ROPE_ROTATE_ACTIVATION_FP4QUANT_KERNEL_IMPL(1024, false, 32,
             "rope_rotate_activation");
     }
     else
@@ -1113,7 +1112,7 @@ void rope_rotate_activation_fp8quant(aiter_tensor_t& out,
     }
     else if(dim == 1024)
     {
-        ROPE_ROTATE_ACTIVATION_FP8QUANT_KERNEL_IMPL(1024, 16, "rope_rotate_activation_fp8quant");
+        ROPE_ROTATE_ACTIVATION_FP8QUANT_KERNEL_IMPL(1024, 32, "rope_rotate_activation_fp8quant");
     }
     else
     {
@@ -1515,7 +1514,7 @@ void rmsnorm_rope_rotate_activation_fp4quant_kvcache(aiter_tensor_t& kvcache,
     else if(dim == 1024)
     {
         NORM_ROPE_ROTATE_ACTIVATION_FP4QUANT_KVCACHE_KERNEL_IMPL(
-            1024, true, 16, "rmsnorm_rope_rotate_activation_fp4quant_kvcache");
+            1024, true, 32, "rmsnorm_rope_rotate_activation_fp4quant_kvcache");
     }
     else
     {
