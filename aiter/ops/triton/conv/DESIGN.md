@@ -357,7 +357,7 @@ because real inference produces a new activation on every layer invocation.
 ### 5.3a `_conv2d_3x3_nchw_kernel`
 
 Architectures can use either the default `N*H*W >= 512` crossover or an
-exact-route table. gfx1100 uses generic exact pins because direct versus
+exact-route table. gfx1100 and gfx1151 use generic exact pins because direct versus
 cblocked performance depends on channels, output channels, stride, and spatial
 size; the JSON contains only shapes where direct wins by at least the tuning
 margin for both fp16 and bf16. Selected inputs stay in contiguous NCHW and

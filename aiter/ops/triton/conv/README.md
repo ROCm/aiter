@@ -214,8 +214,8 @@ pin → generic shape pin → `M_LEQ_x` bucket → `"any"` fallback. No
 runtime autotune in the hot path, so CI compile time stays predictable and
 the first call hits no tuning tax.
 
-Configs are available for gfx1100, gfx1200, gfx1201, gfx1250, gfx942, and
-gfx950. The gfx1100 direct-NCHW table uses exact-shape routing: shapes not
+Configs are available for gfx1100, gfx1151, gfx1200, gfx1201, gfx1250, gfx942,
+and gfx950. The gfx1100 and gfx1151 direct-NCHW tables use exact-shape routing: shapes not
 measured faster than the complete NCHWc path remain on the cblocked fallback.
 
 If you need to retune at runtime (e.g. while developing a new kernel), set
