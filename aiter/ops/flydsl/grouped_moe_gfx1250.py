@@ -477,9 +477,22 @@ def _grouped_a8w4_tdm_moe(
         )
     else:
         _masked_m, topids_to_rows = flydsl_moe_topids_to_rows(topk_ids, E, max_m)
-    _starts, psum, _ = contiguous_psum_remap(
-        _masked_m, topids_to_rows, E, max_m, tile_m, num_valid_routes=_ep_nvr
+    from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
+        routeks_uses_ksplit,
     )
+
+    fuse_remap_quant = not routeks_uses_ksplit(token_num * topk, 8)
+    if fuse_remap_quant:
+        _starts, psum, _ = contiguous_psum(_masked_m, E, tile_m)
+    else:
+        _starts, psum, _ = contiguous_psum_remap(
+            _masked_m,
+            topids_to_rows,
+            E,
+            max_m,
+            tile_m,
+            num_valid_routes=_ep_nvr,
+        )
     psum = psum.to(torch.int32).contiguous()
 
     out_is_f16 = 1 if (dtype == torch.float16 or dtype == dtypes.fp16) else 0
@@ -523,6 +536,8 @@ def _grouped_a8w4_tdm_moe(
         masked_m=None,
         topids_to_rows=topids_to_rows,
         source_topk=topk,
+        row_starts=_starts if fuse_remap_quant else None,
+        route_max_m=max_m if fuse_remap_quant else 0,
         num_valid_routes=_ep_nvr,
     )
 
