@@ -654,11 +654,38 @@ def compile_chunk_gated_delta_h_gfx942(
                 lds_A_ptr = lds.lds_A.ptr
 
         # Every LDS buffer is a group-major [R][C/4][4] tile whose group index is
-        # XOR-swizzled by the row, so an MFMA fragment's 16 lanes cover all 32 banks. 
+        # XOR-swizzled by the row, so an MFMA fragment's 16 lanes cover all 32 banks.
         def _single_xor_swz(cols, ng):
             return fx.SwizzleType.get(
                 int(math.log2(ng)), 2, int(math.log2(cols)) - 2
             )
+
+        # -- Hand-addressed group-major + XOR (K5 k^T / v_new^T only) --
+        # The composed-layout swizzle above expresses only a single XOR fold
+        # (group ^ (row & (ng-1))). That is correct for every buffer whose hot
+        # site reads/writes an MFMA fragment, whose 16 rows vary in the low bits.
+        # The k store-transpose is different: it writes rows (tid%16)*8 + e, and
+        # across the 16 lanes of one fragment those low 4 bits take only two
+        # values -> 8-way bank multiplicity. flydsl's layout-lowering drops the
+        # nested/second XOR needed to key the swizzle on the bits that site does
+        # vary (row >> 3), so lds_kt (and lds_vnt, stored the same transposed
+        # way) are addressed by hand here. _grp_idx folds row bits 3+ onto the
+        # low bits before the XOR, which puts both the transpose write and the
+        # GEMM2 fragment read at their conflict floor. The XOR is a bijection on
+        # the group index, so store and load -- deriving the mask from the same
+        # row -- stay consistent.
+        def _grp_idx(row, grp, cols, ng):
+            mask = (row ^ (row >> fx.Int32(3))) & fx.Int32(ng - 1)
+            return row * fx.Int32(cols) + ((grp ^ mask) * fx.Int32(4))
+
+        def _lds_kt_idx(k_row, bt_grp):
+            return _grp_idx(k_row, bt_grp, BT, LDS_KT_NG)
+
+        def _lds_vnt_idx(v_local, bt_grp):
+            return _grp_idx(v_local, bt_grp, BT, LDS_VNT_NG)
+
+        # 4 bf16 = 8 B: one ds_read_b64 / ds_write_b64, one MFMA A/B fragment.
+        v4bf16_type = T.vec(4, T.bf16)
 
         # -- C-fragment destinations --
         # An MFMA C fragment holds 4 consecutive M values at one N. For every
@@ -802,52 +829,31 @@ def compile_chunk_gated_delta_h_gfx942(
             fx.rocdl.make_buffer_tensor(k_tensor, max_size=False)
         )
         if const_expr(KT_TRANSPOSED):
-            # HBM [BT, K] -> lds_kt [K, BT]. Load and store want opposite
-            # contiguity (HBM along k_col for coalescing, LDS along bt_row so 4
-            # rows pack into one ds_write_b64): 4 quad-strided loads, an
-            # in-register transpose, then K_VEC_WIDTH b64 stores.
-            k_inner_T = fx.make_layout(
-                (BT, K // K_VEC_WIDTH), (1, K_VEC_WIDTH * BT)
-            )
-            sKT_T = [
+            # HBM [BT, K] -> lds_kt [K, BT]. This is a genuine transpose and its
+            # LDS write is hand-addressed (see _grp_idx above): the composed
+            # swizzle cannot express the row>>3 fold the transpose store needs.
+            # Thread -> (row-quad, k-col-group): consecutive tids walk k-col
+            # groups, so a full K row is covered by K_COL_GROUPS consecutive
+            # threads (contiguous HBM). Each thread owns K_SLOTS_PER_THREAD
+            # slots; a slot is 4 BT-consecutive rows at one K_VEC_WIDTH-wide
+            # k-col group, so the 4 rows form one bt-group -> one ds_write_b64.
+            # [n/K_VEC_WIDTH, K_VEC_WIDTH]: one row is one contiguous k-col
+            # group. k_off is always K_VEC_WIDTH-aligned (k_base/stride_k are
+            # multiples of K and kx_col_base is a multiple of K_VEC_WIDTH), so
+            # off // K_VEC_WIDTH is exact.
+            _k_bt = fx.rocdl.make_buffer_tensor(k_tensor, max_size=False)
+            _k_n = fx.get_scalar(fx.cosize(fx.get_layout(_k_bt)))
+            k_kt_buf = fx.Tensor(
                 fx.make_view(
-                    lds_kt_ptr,
-                    fx.make_composed_layout(swz_kt, e * BT, k_inner_T),
-                )
-                for e in range(K_VEC_WIDTH)
-            ]
-            cp_k_g2r = fx.make_copy_atom(
-                _buffer_copy_atoms()[K_VEC_WIDTH](), fx.BFloat16
-            )
-            tc_k_g2r = fx.make_tiled_copy(
-                cp_k_g2r,
-                fx.make_layout(
-                    ((K_COL_GROUPS, K_ROW_QUAD_STRIDE), (1, K_VEC_WIDTH)),
-                    (
-                        (K_ROW_QUAD_STRIDE * K_VEC_WIDTH, 1),
-                        (1, K_ROW_QUAD_STRIDE),
+                    fx.get_iter(_k_bt),
+                    fx.make_layout(
+                        (_k_n // fx.Int32(K_VEC_WIDTH), K_VEC_WIDTH),
+                        (K_VEC_WIDTH, 1),
                     ),
-                ),
-                fx.make_tile(K_ROW_QUAD_STRIDE, K),
-            ).get_slice(tid)
-            tc_k_r2s = fx.make_tiled_copy(
-                univ_cp_r2s_64b_bf16,
-                fx.make_layout(
-                    ((K_COL_GROUPS, K_ROW_QUAD_STRIDE), (1, 4)),
-                    ((4 * K_ROW_QUAD_STRIDE, 4), (1, 1)),
-                ),
-                fx.make_tile(4 * K_ROW_QUAD_STRIDE, K_COL_GROUPS),
-            ).get_slice(tid)
-            # Rows {0, 4, 8, ...} of the chunk: the row-in-quad j is a UNIFORM
-            # j*stride_k shift, so it rides in soffset and one view serves all 4.
-            gK = fx.Tensor(
-                fx.make_view(
-                    k_git,
-                    fx.make_layout((BT // 4, K), (4 * STRIDE_K_C, 1)),
                 )
             )
-            pS_k = tc_k_g2r.partition_S(gK)
-            pD_k = [tc_k_r2s.partition_D(v) for v in sKT_T]
+            kx_col_base = (tid % fx.Int32(K_COL_GROUPS)) * fx.Int32(K_VEC_WIDTH)
+            kx_row_quad = tid // fx.Int32(K_COL_GROUPS)
         else:
             # HBM [BT, K] -> lds_kt [BT, K]: source and destination agree.
             sK_lo = fx.make_view(
@@ -1149,22 +1155,35 @@ def compile_chunk_gated_delta_h_gfx942(
 
             # -- k prefetch (issued now, stored to LDS after GEMM1) --
             if const_expr(KT_TRANSPOSED):
-                # One fragment per row-in-quad: the quad-strided view supplies
-                # rows {0,4,8,...} and j shifts by a uniform j*stride_k. Each
-                # fragment holds this thread's K_VEC_WIDTH k-cols for all of its
-                # K_SLOTS_PER_THREAD row-quads.
-                k_prefetch = [
-                    fx.Vector(
-                        _stage_g2r(
-                            cp_k_g2r,
-                            pS_k,
-                            k_base + fx.Int32(j) * stride_k,
-                            stride_k,
-                            i_t_i32,
+                # Each thread owns K_SLOTS_PER_THREAD slots; a slot is 4
+                # BT-consecutive rows at one K_VEC_WIDTH-wide k-col group. Rows
+                # are gathered here so the transpose store below is a packed
+                # ds_write_b64 with no cross-lane movement. k_prefetch[s][j] is
+                # k[row = (kx_row_quad + s*K_ROW_QUAD_STRIDE)*4 + j,
+                #   col = kx_col_base + (0..K_VEC_WIDTH-1)].
+                k_prefetch = []
+                k_prefetch_lds_t = []  # row-quad per slot -> lds_kt[k, bt] group
+                for s in range_constexpr(K_SLOTS_PER_THREAD):
+                    row_quad = kx_row_quad + fx.Int32(s * K_ROW_QUAD_STRIDE)
+                    quad_rows = []
+                    for j in range_constexpr(4):
+                        row = row_quad * fx.Int32(4) + fx.Int32(j)
+                        abs_row = i_t_i32 * fx.Int32(BT) + row
+                        safe_row = (abs_row < T_local).select(
+                            abs_row, fx.Int32(0)
                         )
-                    )
-                    for j in range_constexpr(4)
-                ]
+                        k_off = (
+                            k_base + safe_row * stride_k + kx_col_base
+                        )
+                        quad_rows.append(
+                            fx.Vector(
+                                k_kt_buf[
+                                    (k_off // fx.Int32(K_VEC_WIDTH), None)
+                                ].load()
+                            )
+                        )
+                    k_prefetch.append(quad_rows)
+                    k_prefetch_lds_t.append(row_quad)
             else:
                 k_prefetch = _stage_g2r(
                     buf_cp_g2r_128b_bf16, pS_k, k_base, stride_k, i_t_i32
@@ -1311,40 +1330,55 @@ def compile_chunk_gated_delta_h_gfx942(
 
             # -- 4. State update: h += k^T @ v_new_gated --
             # Store gated v_new transposed as [V, BT] so GEMM2 B-frag (run over
-            # BT for fixed V) is contiguous.
-            _cfrag_to_lds(
-                cp_lds_x4,
-                tc_c_x4,
-                sVNT_C,
-                fx.Vector.from_elements(
-                    [
-                        vn_frags[nr][e]
-                        for nr in range_constexpr(N_REPEAT_LOCAL)
-                        for e in range_constexpr(4)
-                    ],
-                    dtype=fx.Float32,
-                ),
-                N_REPEAT_LOCAL * 4,
-            )
+            # BT for fixed V) is contiguous. On the K5 path GEMM2 reads v_new^T
+            # by hand from the double-XOR-folded layout, so the store must use
+            # the SAME _grp_idx addressing (a single ds_write_b64 per nr: the 4
+            # C-fragment BT rows are one bt-group). The fused path reads it back
+            # over the single-XOR composed view, so it keeps the tiled-copy store.
+            if const_expr(KT_TRANSPOSED):
+                for nr in range_constexpr(N_REPEAT_LOCAL):
+                    vnt_v = _nr_v(nr) + lane_n
+                    vnt_g = wid_m * fx.Int32(4) + lane_m_base
+                    fx.ptr_store(
+                        _to_bf16_fast(vn_frags[nr], 4),
+                        lds_vnt_ptr + _lds_vnt_idx(vnt_v, vnt_g),
+                    )
+            else:
+                _cfrag_to_lds(
+                    cp_lds_x4,
+                    tc_c_x4,
+                    sVNT_C,
+                    fx.Vector.from_elements(
+                        [
+                            vn_frags[nr][e]
+                            for nr in range_constexpr(N_REPEAT_LOCAL)
+                            for e in range_constexpr(4)
+                        ],
+                        dtype=fx.Float32,
+                    ),
+                    N_REPEAT_LOCAL * 4,
+                )
 
             if const_expr(KT_TRANSPOSED):
-                # Store k transposed as [K, BT]. In-register transpose: for each
-                # k-col, gather the 4 BT-consecutive rows this thread loaded into
-                # one bt-group -> one ds_write_b64. No cross-lane movement is
-                # needed; the 4 rows are already local.
-                for e in range_constexpr(K_VEC_WIDTH):
-                    f_kt = fx.make_fragment_like(pD_k[e])
-                    f_kt.store(
-                        fx.Vector.from_elements(
-                            [
-                                k_prefetch[j][s * K_VEC_WIDTH + e]
-                                for s in range_constexpr(K_SLOTS_PER_THREAD)
-                                for j in range_constexpr(4)
-                            ],
+                # Store k transposed as [K, BT], hand-addressed through _grp_idx
+                # (the swizzle lowering cannot express the row>>3 fold this
+                # transpose write needs -- see _grp_idx above). In-register
+                # transpose: for each k-col, the 4 BT-consecutive rows this
+                # thread loaded form one bt-group -> one ds_write_b64. No
+                # cross-lane movement is needed; the 4 rows are already local.
+                for s in range_constexpr(K_SLOTS_PER_THREAD):
+                    quad_rows = k_prefetch[s]
+                    row_quad = k_prefetch_lds_t[s]
+                    for e in range_constexpr(K_VEC_WIDTH):
+                        bt_grp = fx.Vector.from_elements(
+                            [quad_rows[j][e] for j in range_constexpr(4)],
                             dtype=fx.BFloat16,
                         )
-                    )
-                    fx.copy(univ_cp_r2s_64b_bf16, f_kt, pD_k[e])
+                        fx.ptr_store(
+                            bt_grp,
+                            lds_kt_ptr
+                            + _lds_kt_idx(kx_col_base + fx.Int32(e), row_quad),
+                        )
             else:
                 _stage_r2s(k_prefetch, pD_k_lo, pD_k_hi)
 
@@ -1370,59 +1404,113 @@ def compile_chunk_gated_delta_h_gfx942(
                 q_prefetch = _stage_g2r(buf_cp_g2r_128b_bf16, pS_q, q_base, stride_q, i_t_i32)
 
             # -- GEMM2: h += k^T @ v_new  (contraction over BT) --
-            # Output h is [K, V], contraction BT. Per 64-K block: M = the 64 K
-            # output rows (M_WAVES tiles), N = V (NR_SPLIT waves).
-            # Both operands now read over single-XOR composed views: 
-            #   B (lds_vnt) as a [BV,BT] view 
-            #   A (kᵀ, lds_kt) as a per-64-K-block [64,BT] view sliced from the [K,BT] buffer 
-            #   h_accs_c[kb] accumulates in place
-            sVNT = fx.make_view(
-                lds_vnt_ptr,
-                fx.make_composed_layout(
-                    fx.static(_single_xor_swz(BT, LDS_VNT_NG)),
-                    fx.make_ordered_layout((BV, BT), (1, 0)),
-                ),
-            )
-            g2_cp_b = fx.make_tiled_copy_B(cp_lds_x4, mma_16x16x16_mnk).get_slice(tid)
-            g2_pS_v = g2_cp_b.partition_S(sVNT)
-            g2_fv = mma_16x16x16_mnk.make_fragment_B(sVNT)
-            g2_fv_rt = g2_cp_b.retile(g2_fv)
-            # A (kᵀ): logical (k_row, bt) either way -- what differs is whether
-            # the contraction (bt) is contiguous in the bytes underneath.
-            #   KT_TRANSPOSED: buffer is [K, BT], bt is contiguous -> one b64.
-            #   else:          buffer is [BT, K], so this is the transposed read
-            #                  (strides swapped) and bt is K apart -> cp_lds_x1,
-            #                  4 atom calls per fragment.
+            # Output h is [K, V], contraction BT.
+            BT_TILES = BT // MFMA_K
             if const_expr(KT_TRANSPOSED):
+                # K5 path: both operands live in the double-XOR-folded LDS
+                # layout _grp_idx produces (lds_kt and lds_vnt are both stored
+                # transposed and hand-addressed -- see the store sites above),
+                # so their fragments are read by hand with matching addressing
+                # and fed to a scalar MFMA. The composed-view read below cannot
+                # reproduce the row>>3 fold and would read the wrong slots.
+                #
+                # A-frag k: m = K row = kb*64 + wid_m*16 + lane_n,
+                #           contraction bt = bt_s*4 + lane_m_base (group).
+                # B-frag v: n = V = nr*16 + lane_n, same bt group.
+                # The operands are hand-loaded into MMA A/B fragments (same shapes
+                # the fused path builds via make_fragment_A/B) and consumed by the
+                # tiled-MMA atom, so the state update runs the standard
+                # ``fx.gemm(mma_16x16x16_mnk, ...)`` -- only the LDS read stays
+                # hand-addressed (the ptr_load) because the composed-view read
+                # cannot reproduce the row>>3 fold.
                 sKT = fx.make_view(
                     lds_kt_ptr,
+                    fx.make_composed_layout(swz_kt, fx.make_layout((K, BT), (1, K))),
+                )
+                sVNT = fx.make_view(
+                    lds_vnt_ptr,
                     fx.make_composed_layout(
-                        swz_kt, fx.make_ordered_layout((K, BT), (1, 0))
+                        fx.static(_single_xor_swz(BT, LDS_VNT_NG)),
+                        fx.make_ordered_layout((BV, BT), (1, 0)),
                     ),
                 )
-                cp_g2_a = cp_lds_x4
+                g2_fk = mma_16x16x16_mnk.make_fragment_A(
+                    fx.slice(fx.zipped_divide(sKT, (64, BT)), (None, (0, 0)))
+                )
+                g2_fv = mma_16x16x16_mnk.make_fragment_B(sVNT)
+                for kb in range_constexpr(NUM_K_BLOCKS):
+                    for bt_s in range_constexpr(BT_TILES):
+                        k_g = fx.Int32(bt_s * (MFMA_K // 4)) + lane_m_base
+                        k_m = fx.Int32(kb * 64) + wid_m * fx.Int32(16) + lane_n
+                        g2_fk[None, None, bt_s].store(
+                            fx.Vector(
+                                fx.ptr_load(
+                                    lds_kt_ptr + _lds_kt_idx(k_m, k_g),
+                                    result_type=v4bf16_type,
+                                )
+                            )
+                        )
+                        # One B tile carries all N_REPEAT_LOCAL v-fragments; gather
+                        # them (nr-major, matching the fragment's N layout) and
+                        # store the whole bt_s slice in one shot.
+                        g2_fv[None, None, bt_s].store(
+                            fx.Vector.from_elements(
+                                [
+                                    fx.Vector(
+                                        fx.ptr_load(
+                                            lds_vnt_ptr
+                                            + _lds_vnt_idx(_nr_v(nr) + lane_n, k_g),
+                                            result_type=v4bf16_type,
+                                        )
+                                    )[e]
+                                    for nr in range_constexpr(N_REPEAT_LOCAL)
+                                    for e in range_constexpr(4)
+                                ],
+                                dtype=fx.BFloat16,
+                            )
+                        )
+                        fx.gemm(
+                            mma_16x16x16_mnk, h_accs_c[kb],
+                            g2_fk[None, None, bt_s], g2_fv[None, None, bt_s],
+                            h_accs_c[kb],
+                        )
             else:
+                # Fused path: lds_kt is stored [BT, K] (no transpose) and read
+                # over single-XOR composed views -- the plain fold is correct
+                # here. B (lds_vnt) is a [BV, BT] view; A (kᵀ) is a per-64-K-block
+                # [64, BT] view whose contraction (bt) is K apart, so it reads
+                # through cp_lds_x1 (4 atom calls per fragment).
+                sVNT = fx.make_view(
+                    lds_vnt_ptr,
+                    fx.make_composed_layout(
+                        fx.static(_single_xor_swz(BT, LDS_VNT_NG)),
+                        fx.make_ordered_layout((BV, BT), (1, 0)),
+                    ),
+                )
+                g2_cp_b = fx.make_tiled_copy_B(cp_lds_x4, mma_16x16x16_mnk).get_slice(tid)
+                g2_pS_v = g2_cp_b.partition_S(sVNT)
+                g2_fv = mma_16x16x16_mnk.make_fragment_B(sVNT)
+                g2_fv_rt = g2_cp_b.retile(g2_fv)
                 sKT = fx.make_view(
                     lds_kt_ptr,
                     fx.make_composed_layout(swz_kt, fx.make_layout((K, BT), (1, K))),
                 )
                 cp_g2_a = cp_lds_x1
-            g2_cp_a = fx.make_tiled_copy_A(cp_g2_a, mma_16x16x16_mnk).get_slice(tid)
-            g2_fk = mma_16x16x16_mnk.make_fragment_A(
-                fx.slice(fx.zipped_divide(sKT, (64, BT)), (None, (0, 0)))
-            )
-            g2_fk_rt = g2_cp_a.retile(g2_fk)
-            BT_TILES = BT // MFMA_K
-            for kb in range_constexpr(NUM_K_BLOCKS):
-                sKT_kb = fx.slice(fx.zipped_divide(sKT, (64, BT)), (None, (kb, 0)))
-                g2_pS_k = g2_cp_a.partition_S(sKT_kb)
-                for bt_s in range_constexpr(BT_TILES):
-                    fx.copy(cp_g2_a, g2_pS_k[None, None, bt_s], g2_fk_rt[None, None, bt_s])
-                    fx.copy(cp_lds_x4, g2_pS_v[None, None, bt_s], g2_fv_rt[None, None, bt_s])
-                    fx.gemm(
-                        mma_16x16x16_mnk, h_accs_c[kb],
-                        g2_fk[None, None, bt_s], g2_fv[None, None, bt_s], h_accs_c[kb],
-                    )
+                g2_cp_a = fx.make_tiled_copy_A(cp_g2_a, mma_16x16x16_mnk).get_slice(tid)
+                g2_fk = mma_16x16x16_mnk.make_fragment_A(
+                    fx.slice(fx.zipped_divide(sKT, (64, BT)), (None, (0, 0)))
+                )
+                g2_fk_rt = g2_cp_a.retile(g2_fk)
+                for kb in range_constexpr(NUM_K_BLOCKS):
+                    sKT_kb = fx.slice(fx.zipped_divide(sKT, (64, BT)), (None, (kb, 0)))
+                    g2_pS_k = g2_cp_a.partition_S(sKT_kb)
+                    for bt_s in range_constexpr(BT_TILES):
+                        fx.copy(cp_g2_a, g2_pS_k[None, None, bt_s], g2_fk_rt[None, None, bt_s])
+                        fx.copy(cp_lds_x4, g2_pS_v[None, None, bt_s], g2_fv_rt[None, None, bt_s])
+                        fx.gemm(
+                            mma_16x16x16_mnk, h_accs_c[kb],
+                            g2_fk[None, None, bt_s], g2_fv[None, None, bt_s], h_accs_c[kb],
+                        )
 
 
             # =============================================================== #
