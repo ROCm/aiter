@@ -390,9 +390,51 @@ shapes only DeepSeek passes 2 GB (3.74 GB) and its dword index (9.35e8) is still
       (n_waves*WAVE_SIZE*2) == 0`.
 - [ ] Benchmark on small-grid Qwen (INTER=512/256/128, B=1) where these should pay.
 
-### Phase E — Perf scheduling: ILP dot2 + prefetch (G7, G8)  [ ]
-- [ ] Land the **s_nop-free independent-accumulator dot2 + single drain** as a selectable
-      inner-loop form; A/B vs the serialized `s_nop 2` baseline on FP8 (methodology §2).
+### Phase E — Perf scheduling: ILP dot2 + prefetch (G7, G8)  [x]
+- [x] **G7 selectable s_nop-free dot2 landed on FP8 (2026-08-19).** Added `dot2_acc` to
+      `build_gate_up_fp8_module` / `build_down_reduce_fp8_module` (threaded through the cache
+      getters + `flydsl_warp_decode_{gate_up,down_reduce}` entry points): `dot2_acc>1` routes the
+      per-lane dots through the shared `drain_or_chain` → `dot2_f32_bf16_drain` (N independent f32
+      accumulators + one drain add, s_nop only on each accumulator's final write); `dot2_acc=1`
+      keeps the serialized `s_nop 2` baseline. Wired in all four scale branches (pertensor/pertoken
+      span the whole K-range; block2d drains per K-block). **Correctness:** new
+      `test_{gate_up,down_reduce}_fp8_ilp_dot2` force `dot2_acc=4` vs the `dot2_acc=1` baseline —
+      **all 10 cases cos_vs_ref = cos_vs_base = 1.000000** (24/24 FP8 suite green). **A/B** (gfx950,
+      warm/compute-bound, device timing, 200 iters, DeepSeek H7168/I2048 E8 TOPK2, ratio = acc1/acc4;
+      >1 ⇒ ILP faster):
+
+      | B | gate_up (acc1/acc4) | down (acc1/acc4) |
+      |---|---------------------|------------------|
+      | 1 | ~1.00 (neutral)     | ~1.01 (neutral)  |
+      | 2 | **0.94 (ILP −6%)**  | 1.01–1.04 (≈neutral) |
+      | 4 | **0.95 (ILP −5%)**  | **1.07 (ILP +7%)** |
+      | 8 | 0.99 (≈neutral)     | ~1.00 (neutral)  |
+
+      **Verdict — defaults stay `dot2_acc=1`.** gate_up is a **consistent ~5–6% regression** at
+      B=2/4 (mirrors the FP4 gate_up G7 negative: the two independent gate/up dot2 streams already
+      cover the accumulator-RAW hazard, and the 4-accumulator drain's extra VGPR pressure bites once
+      the grid is occupancy-bound). down showed a ~7% win **only** at B=4 in this warm/compute-bound
+      A/B, neutral at B=1/8.
+
+      **Cold-HBM cross-check (the decision-grade regime) — ILP is a no-win (2026-08-19).** Re-ran
+      via the of-record cold harness (`_gen_{down,gate_up}_fp8_pool` full E=128 pool ≫ MALL + router
+      rotation, `Block2D<128,128>`, device timing) so launches stream fresh weights from HBM:
+
+      | B | down (acc1/acc4) | gate_up (acc1/acc4) |
+      |---|------------------|---------------------|
+      | 1 | **0.92 (ILP −8%)** | 0.97 (ILP −3%) |
+      | 2 | **0.94 (ILP −6%)** | 0.98 (ILP −2%) |
+      | 4 | 0.99 (neutral)   | 0.99 (≈neutral) |
+      | 8 | 1.00 (neutral)   | 0.98 (ILP −2%) |
+
+      The warm B=4 down win **does not survive**: cold decode is **memory-latency-floor bound** (same
+      physics that closed split-K G5), so the s_nop removal can't help and the drain's extra VGPR
+      pressure slightly *hurts* at low B (down −6 to −8%). All cos = 1.0000.
+
+      **Verdict — defaults stay `dot2_acc=1` and the knob ships OFF.** G7-on-FP8 is a decisive
+      no-win in the production cold-streaming regime (warm compute-bound gains are an artifact that
+      doesn't carry). Knob retained for A/B/experimentation only; not recommended for any shipped
+      config. (Not ported to the FP8-act builder — same rationale.)
 - [x] **Software-pipelined weight prefetch** — evaluated on FP4 `down` (2026-08-11).
       Implemented as a `prefetch` build flag on `build_down_reduce_fp4_module` (wired through
       `flydsl_warp_decode_down_reduce_fp4(..., prefetch=)`): hoists *every* activation/weight/
@@ -654,3 +696,14 @@ bench/tune target; verify against the shipped weights before publishing numbers.
   `run_g9_compare.sh`). Also flipped the §9 **FP4 gate_up accuracy** risk `[open]→[resolved]`
   (`test_gate_up_fp4_matches_bf16_oracle` cos=1.0 + D7). Net: Phases A/B/C/F now `[x]`; the only
   in-scope open work left is Phase D LDS (G6) + Phase E selectable FP8 ILP (G7 on FP8).
+- _G7 selectable ILP dot2 landed on FP8 + A/B'd (2026-08-19)_ — added the `dot2_acc` knob to the
+  FP8 `gate_up`/`down` builders (shared `drain_or_chain` helper → `dot2_f32_bf16_drain`), threaded
+  through the getters + entry points, across all four scale branches. Correctness: 10 forced
+  `dot2_acc=4`-vs-baseline op_tests, all cos=1.0 (24/24 FP8 suite). A/B (gfx950, warm, DeepSeek
+  H7168/I2048): **warm/compute-bound** — gate_up ILP is a ~5–6% regression at B=2/4, down ILP +7%
+  only at B=4. **Cold-HBM cross-check (E=128 pool ≫ MALL, the production decode regime)** — the warm
+  down win **evaporates**: cold is memory-latency-floor bound (same physics as split-K G5), so ILP is
+  neutral-to-negative everywhere (down −6 to −8% at B=1/2, gate_up −2 to −3%). All cos=1.0. **Verdict:
+  decisive no-win; defaults stay `dot2_acc=1`, knob ships OFF** (retained for A/B only). Closes Phase E
+  (G8 prefetch already done). **Remaining in-scope: Phase D LDS (G6) — flagged in §9 as a likely B=1
+  no-win; isolate the small-grid case first.**

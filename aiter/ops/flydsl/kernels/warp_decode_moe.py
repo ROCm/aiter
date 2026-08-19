@@ -146,6 +146,26 @@ def dot2_f32_bf16_scalar(a_i32, b_i32, acc_f32):
     return acc.ir_value()
 
 
+def drain_or_chain(pairs, *, dot2_acc: int, serialize: bool = True):
+    """Accumulate ``pairs`` (each ``(a_i32, b_i32)``, two bf16 packed per operand)
+    via the G7 s_nop-free drain or the serialized ``s_nop 2`` chain.
+
+    ``dot2_acc > 1`` routes through :func:`dot2_f32_bf16_drain` (``dot2_acc``
+    independent f32 accumulators round-robined, one drain add at the end -- so
+    consecutive dot2s write different registers and need no ``s_nop``); ``dot2_acc
+    <= 1`` keeps the serialized chain (one ``s_nop 2`` per dot2).  Both forms match
+    up to f32 add reassociation; the drain is the ILP variant A/B'd against the
+    serialized baseline (methodology ?2).  ``dot2_acc`` is a build-time constant.
+    """
+    if const_expr(dot2_acc > 1):
+        return dot2_f32_bf16_drain(pairs, n_acc=dot2_acc)
+    acc = fx.Float32(0.0).ir_value()
+    for idx in range_constexpr(len(pairs)):
+        a_i32, b_i32 = pairs[idx]
+        acc = dot2_f32_bf16(a_i32, b_i32, acc, serialize=serialize)
+    return acc
+
+
 def dot2_or_scalar(a_i32, b_i32, acc_f32, *, use_dot2: bool, serialize: bool = True):
     """One packed-bf16 MAC, dispatched to the dot2 path or the scalar-f32 fallback.
 
@@ -380,6 +400,7 @@ def build_gate_up_fp8_module(
     scale_bn: int | None = None,
     scale_bk: int | None = None,
     num_experts: int | None = None,
+    dot2_acc: int = 1,
 ):
     """Build the gate_up FP8 launcher (BF16 activation, FP8 e4m3 weights).
 
@@ -488,16 +509,23 @@ def build_gate_up_fp8_module(
                 xw = load_i32_words(x_rsrc, x_word0, n_pairs)
                 gw = load_i32_words(wg_rsrc, w_word0, n_wwords)
                 uw = load_i32_words(wu_rsrc, w_word0, n_wwords)
-                gd = fx.Float32(0.0).ir_value()
-                ud = fx.Float32(0.0).ir_value()
+                gate_pairs_i = []
+                up_pairs_i = []
                 for ipair in range_constexpr(n_pairs):
                     w_word = ipair // 2
                     w_hi = (ipair % 2) == 1
                     x_i32 = xw[ipair]
                     g_i32 = bf16x2_to_i32(fp8x2_to_bf16x2(gw[w_word], one_f32, hi=w_hi))
                     u_i32 = bf16x2_to_i32(fp8x2_to_bf16x2(uw[w_word], one_f32, hi=w_hi))
-                    gd = dot2_f32_bf16(x_i32, g_i32, gd, serialize=serialize_dot2)
-                    ud = dot2_f32_bf16(x_i32, u_i32, ud, serialize=serialize_dot2)
+                    gate_pairs_i.append((x_i32, g_i32))
+                    up_pairs_i.append((x_i32, u_i32))
+                # G7 ILP within this K-block's pairs (the block scale is folded after).
+                gd = drain_or_chain(
+                    gate_pairs_i, dot2_acc=dot2_acc, serialize=serialize_dot2
+                )
+                ud = drain_or_chain(
+                    up_pairs_i, dot2_acc=dot2_acc, serialize=serialize_dot2
+                )
                 sidx = fx.Int32(row_blk * scale_cols_g + k_base // scale_bk)
                 gs_i = buffer_ops.buffer_load(
                     wgs_rsrc, sidx, vec_width=1, dtype=T.f32()
@@ -510,8 +538,12 @@ def build_gate_up_fp8_module(
             gate_acc = fx.Float32(wave_reduce_add_f32(gate_acc_l.ir_value()))
             up_acc = fx.Float32(wave_reduce_add_f32(up_acc_l.ir_value()))
         else:
-            gate_dot = fx.Float32(0.0).ir_value()
-            up_dot = fx.Float32(0.0).ir_value()
+            # G7 ILP: collect every (iter, pair) contribution, then drain each stream
+            # through `dot2_acc` independent accumulators (single scale after reduce =>
+            # the raw dot is one long cross-iter accumulation, so the drain spans the
+            # whole K-range); `dot2_acc<=1` keeps the serialized `s_nop 2` chain.
+            gate_pairs = []
+            up_pairs = []
             for i in range_constexpr(num_iter):
                 k_base = i * ktile_n + lane * kvector
                 # element bases -> word (i32) offsets: x 2 bf16/word, w 4 fp8/word.
@@ -527,13 +559,15 @@ def build_gate_up_fp8_module(
                     x_i32 = xw[ipair]
                     g_i32 = bf16x2_to_i32(fp8x2_to_bf16x2(gw[w_word], one_f32, hi=w_hi))
                     u_i32 = bf16x2_to_i32(fp8x2_to_bf16x2(uw[w_word], one_f32, hi=w_hi))
-                    gate_dot = dot2_f32_bf16(
-                        x_i32, g_i32, gate_dot, serialize=serialize_dot2
-                    )
-                    up_dot = dot2_f32_bf16(
-                        x_i32, u_i32, up_dot, serialize=serialize_dot2
-                    )
+                    gate_pairs.append((x_i32, g_i32))
+                    up_pairs.append((x_i32, u_i32))
 
+            gate_dot = drain_or_chain(
+                gate_pairs, dot2_acc=dot2_acc, serialize=serialize_dot2
+            )
+            up_dot = drain_or_chain(
+                up_pairs, dot2_acc=dot2_acc, serialize=serialize_dot2
+            )
             gate_sum = wave_reduce_add_f32(gate_dot)
             up_sum = wave_reduce_add_f32(up_dot)
 
@@ -768,6 +802,7 @@ def build_down_reduce_fp8_module(
     kh_per_warp: int = 1,
     k_batch: int = 1,
     num_experts: int | None = None,
+    dot2_acc: int = 1,
 ):
     """Build the down_reduce FP8 launcher (BF16 intermediate, FP8 e4m3 weights).
 
@@ -902,16 +937,18 @@ def build_down_reduce_fp8_module(
                     ]
                     col_blk = k_base // scale_bk
                     for h in range_constexpr(kh_per_warp):
-                        dot_i = fx.Float32(0.0).ir_value()
+                        pairs_i = []
                         for ipair in range_constexpr(n_pairs):
                             w_word = ipair // 2
                             w_hi = (ipair % 2) == 1
                             d_i32 = bf16x2_to_i32(
                                 fp8x2_to_bf16x2(dw[h][w_word], one_f32, hi=w_hi)
                             )
-                            dot_i = dot2_f32_bf16(
-                                aw[ipair], d_i32, dot_i, serialize=serialize_dot2
-                            )
+                            pairs_i.append((aw[ipair], d_i32))
+                        # G7 ILP within this K-block (the block scale is folded after).
+                        dot_i = drain_or_chain(
+                            pairs_i, dot2_acc=dot2_acc, serialize=serialize_dot2
+                        )
                         sidx = fx.Int32(w_row[h] // scale_bn * scale_cols_d + col_blk)
                         ds_i = buffer_ops.buffer_load(
                             wds_rsrc, sidx, vec_width=1, dtype=T.f32()
@@ -933,7 +970,10 @@ def build_down_reduce_fp8_module(
                     )
                     ds = [ds0 for _ in range(kh_per_warp)]
 
-                dot = [fx.Float32(0.0).ir_value() for _ in range(kh_per_warp)]
+                # G7 ILP: collect every (iter, pair) per output h, then drain each
+                # through `dot2_acc` accumulators across the whole K-range (the scale
+                # is folded once after); `dot2_acc<=1` keeps the serialized chain.
+                pairs_h = [[] for _ in range(kh_per_warp)]
                 for i in range_constexpr(iters_per_kb):
                     k_base = (kb * iters_per_kb + i) * ktile_n + lane * kvector
                     inter_row = token_b * top_k + k
@@ -953,14 +993,15 @@ def build_down_reduce_fp8_module(
                             d_i32 = bf16x2_to_i32(
                                 fp8x2_to_bf16x2(dw[h][w_word], one_f32, hi=w_hi)
                             )
-                            dot[h] = dot2_f32_bf16(
-                                aw[ipair], d_i32, dot[h], serialize=serialize_dot2
-                            )
+                            pairs_h[h].append((aw[ipair], d_i32))
 
                 # router_wt * ds is lane-uniform -> fold into each per-lane partial
                 # before the single cross-lane reduce (avoids reduce/k).
                 for h in range_constexpr(kh_per_warp):
-                    acc[h] = acc[h] + fx.Float32(dot[h]) * (
+                    dot_h = drain_or_chain(
+                        pairs_h[h], dot2_acc=dot2_acc, serialize=serialize_dot2
+                    )
+                    acc[h] = acc[h] + fx.Float32(dot_h) * (
                         fx.Float32(rw) * fx.Float32(ds[h])
                     )
 
