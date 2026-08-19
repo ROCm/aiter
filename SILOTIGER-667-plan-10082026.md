@@ -26,14 +26,14 @@ following **gaps** (things the reference has that the WIP does not) and **diverg
 | # | Capability | Reference has | WIP has | Ticket priority |
 |---|---|---|---|---|
 | G1 | **i64-safe weight offsets** (only >8 GB tensors) | ✅ per-row i64 base | ✅ ticket shapes / ✅ FP8 large (K3 Tier-2, B5 2026-08-17) | **resolved** — FP8 `down`/`gate_up` now use a guarded per-expert i64 base (repro E=896 cos 0.999999; DeepSeek E=256 cos 1.0) |
-| G2 | **MXFP4 / FP4 weights** (down + gate_up) | ✅ (down full; gate_up fp4) | ❌ | #1 remaining (ticket) |
+| G2 | **MXFP4 / FP4 weights** (down + gate_up) | ✅ (down full; gate_up fp4) | ✅ (down + gate_up FP4 landed, tested) | **landed** — ticket #1 win (cold-HBM 1.26–1.65×, cos 1.0) |
 | G3 | **BF16-weight path** (`w_dtype="bf16"`) | ✅ (dot2 + scalar) | ❌ FP8-only | scaffold / gfx942 |
 | G4 | **gfx942 / scalar-f32 fallback** (`use_dot2=False`) | ✅ auto-arch | ❌ gfx950-only | portability |
 | G5 | **Split-K** (`k_batch`) + zero-init fusion | ✅ (gate_up 2-phase, down) | ⊘ evaluated — no-win, gated-off, not shipped (attic branch) | ticket lever (closed) |
 | G6 | **LDS cooperative caching** (`n_waves`) | ✅ (down; gate_up dead) | ❌ | ticket lever |
 | G7 | **s_nop-free / independent-accumulator dot2 (ILP)** | ✅ (fp8/fp4) | ❌ serialized `s_nop 2` | perf (deferred) |
 | G8 | **Software-pipelined weight prefetch** | ✅ (bf16 dot2; fp4 `down` flag) | ❌ default (knob) | **perf: ~5% B=1 fp4**, neutral B≥4 |
-| G9 | **CK-Tile cross-benchmark harness** | ✅ (`ck_bench_*.cpp` + compare) | ❌ | validation |
+| G9 | **CK-Tile cross-benchmark harness** | ✅ (`ck_bench_*.cpp` + compare) | ✅ (`compare.py` + `g9_compare` of-record) | **done** — 0 n/a, all 15 cells (2026-08-18) |
 | G10 | **Package public API registration** (`__init__.py`) | ✅ | ✅ (2026-08-11; all 6 entry points) | integration |
 
 FP8/MXFP8 **activation** input is missing from *both* (both take BF16 activations).
@@ -147,7 +147,7 @@ All remain in force.
 
 Status legend: [ ] todo · [~] in progress · [x] done
 
-### Phase A — real-E regression tests + K3-scale addressing (G1)  [~]  ← NOT a ticket blocker
+### Phase A — real-E regression tests + K3-scale addressing (G1)  [x]  ← NOT a ticket blocker
 **Empirically resolved (2026-08-10):** the WIP is **correct at real ticket expert counts**.
 Verified on gfx950 via `/tmp/repro_g1*.py`: gate_up **and** down at DeepSeek-V3
 (E=256, H7168/I2048), *with the max-offset expert 255 forced*, give **cos = 1.000000**
@@ -180,13 +180,13 @@ shapes only DeepSeek passes 2 GB (3.74 GB) and its dword index (9.35e8) is still
 - **Where:** `build_gate_up_fp8_module` / `build_down_reduce_fp8_module` (`_ptr_rsrc` +
   `w_word0`/`a_word0`); only the K3-scale item touches kernel addressing.
 
-### Phase B — MXFP4 / FP4 (G2)  [ ]  ← ticket #1 win
+### Phase B — MXFP4 / FP4 (G2)  [x]  ← ticket #1 win
 - [x] **Primitives de-risked** (gfx950, `/tmp/repro_fp4_primitive.py`): the 4-`sel`
       `cvt_scalef32_pk_bf16_fp4` convert is **exact vs the MXFP4 codebook** and the e8m0
       `shl 23 + bitcast` decode is **bit-exact vs `fp4_utils.e8m0_to_f32`** (normal range).
       Gotcha: `src_sel_index` is an `I32Attr` → must be a compile-time constant (unroll the 4
       `sel` calls; a `for sel in range(4)` becomes an `scf.for` and fails with `bad_cast`).
-- [~] **down FP4** first (the ticket's shipped best; beats FP8 down at B≥2): raw packed
+- [x] **down FP4** first (the ticket's shipped best; beats FP8 down at B≥2): raw packed
       FP4 load → `cvt_scalef32_pk_bf16_fp4` (4 `sel` per i32) → dot2. **e8m0 per-block
       scale** (`block_k=32` covers the lane's `kVector`-elt chunk) applied **in the convert**
       (uniform over the chunk ⇒ ≡ scaling the partial dot); router_wt folded per expert.
@@ -329,14 +329,17 @@ shapes only DeepSeek passes 2 GB (3.74 GB) and its dword index (9.35e8) is still
       1.26–1.54×). FP8 keeps higher raw TB/s (5.7→7.5 vs FP4 4.4→6.6, convert overhead) but moves
       2× the bytes. Real **E=256 FP4-only** confirmed fault-free (28.5/45.9/81.6/150.4 µs, cos 1.0,
       matches E=128 → ratios carry); FP8 E=256 now runs (K3 Tier-2 landed, B5), same as down.
-- [ ] Scale layout: MXFP4 uses **Block2D<1,32> e8m0**; keep the WIP's existing exact-f32
-      fold for FP8 PerTensor/PerToken/Block2D.
-- [ ] Correctness vs torch (MXFP4 dequant via `aiter.utility.fp4_utils`); perf A/B FP4-vs-FP8
-      down at B∈{1,2,4,8} (expect the ticket's 1.2–1.5× at B≥2, neutral at B=1).
+- [x] Scale layout: MXFP4 uses **Block2D<1,32> e8m0** (applied in-convert per lane chunk);
+      the WIP's existing exact-f32 fold is kept for FP8 PerTensor/PerToken/Block2D. **Done** —
+      both FP4 builders decode E8M0 via `e8m0_byte_to_f32` (bit-exact vs `fp4_utils`).
+- [x] Correctness vs torch (MXFP4 dequant via `aiter.utility.fp4_utils`); perf A/B FP4-vs-FP8
+      down at B∈{1,2,4,8}. **Done** — op_tests (`test_{down,gate_up}_fp4`, cos ≥ 0.99) + the
+      cold-HBM A/B tables above confirm the ticket's **1.26–1.54× down** (and 1.44–1.65× gate_up)
+      at B≥2, ~neutral at B=1, `cos = 1.0`.
 - **Where:** new `build_down_reduce_fp4_module` / `build_gate_up_fp4_module` (or a `w_dtype`
   switch inside the existing builders); entry-point `w_dtype` arg.
 
-### Phase C — BF16 weights + gfx942 fallback (G3, G4)  [ ]
+### Phase C — BF16 weights + gfx942 fallback (G3, G4)  [x]
 - [x] `w_dtype="bf16"` path (BF16×BF16 dot2) as a scaffold + non-fp8 correctness oracle
       **(2026-08-11).** Added dedicated `build_gate_up_bf16_module` / `build_down_reduce_bf16_module`
       (mirror the FP8 builders; a bf16 weight dword *is* a dot2 operand, so **no scaled convert
@@ -411,11 +414,15 @@ shapes only DeepSeek passes 2 GB (3.74 GB) and its dword index (9.35e8) is still
       exposed as a tuning knob; **recommend `prefetch=True` for B≤2 decode**. Not yet ported to
       the FP8 or gate_up builders (gate_up is already occupancy-bound, cf. G7).
 
-### Phase F — Validation + integration (G9, G10)  [ ]
-- [ ] **CK-Tile side-by-side:** build the CK bench (`tickets/667/harness/build_ck_bench.sh`,
-      `ck_bench_warp_decode.cpp`), run both, join via `compare_bart.py`, and record a
-      FlyDSL/CK ratio table for DeepSeek-V3 / MiniMax / Qwen3Next at B∈{1,2,4,8}. This is the
-      original plan's last open Phase-4 item.
+### Phase F — Validation + integration (G9, G10)  [x]
+- [x] **CK-Tile side-by-side — DONE (2026-08-18; tracked in the companion
+      [`SILOTIGER-667-plan-bench.md`](./SILOTIGER-667-plan-bench.md)).** `tickets/667/harness/compare.py`
+      generates both sides and joins on the full `(H,I,E,TOPK,B)` key; the of-record artifact
+      `tickets/667/g9_compare.{md,csv}` (repeats=3, reproduce via `run_g9_compare.sh`) covers all
+      15 cells with **0 n/a** — every FlyDSL row has a CK peer across DeepSeek-V3 / MiniMax /
+      Qwen3Next-TP1 at B∈{1,2,4,8}, including the FP8-act peer (B4) and DeepSeek FP8 E=256 (B5
+      Tier-2). D7 additionally validates CK outputs vs torch (FP8/BF16/FP4, non-uniform Block2D
+      scales, all cos=1.0). This closes the original plan's last open Phase-4 item.
 - [x] **Register** the warp-decode entry points in `aiter/ops/flydsl/__init__.py` (behind
       `is_flydsl_available()`, added to `__all__`) — 2026-08-11. All **six** public entry points
       exported: `flydsl_warp_decode_{gate_up,down_reduce}` (FP8) + `_fp4` (MXFP4, ticket #1) +
@@ -426,8 +433,8 @@ shapes only DeepSeek passes 2 GB (3.74 GB) and its dword index (9.35e8) is still
       auto-skip is gone). Driven by `_COLD_MODELS`/`_COLD_BATCHES` →
       `COLD_{DOWN,GATE_UP}_SHAPES`; rows now carry HIDDEN/INTER. All **fp4_cos=1.0**. Headline (device
       timing): gate_up FP4 beats FP8 **1.3–1.8×** (MiniMax) / **1.0–1.2×** (Qwen); down FP4 wins at
-      B≥2, ~neutral at B=1 for the smaller shapes. The **CK side-by-side (G9)** feed of the same shapes
-      is the remaining Phase F item.
+      B≥2, ~neutral at B=1 for the smaller shapes. These same shapes were then fed to the **CK
+      side-by-side (G9)**, which is now complete (of-record `g9_compare` artifact, 0 n/a).
 
 ### Follow-on (out of scope for this convergence)
 - [ ] **Plain FP8 activation** input (per-tensor / per-token): fuse input-side BF16→FP8 quant
@@ -565,8 +572,11 @@ bench/tune target; verify against the shipped weights before publishing numbers.
   **Kimi-K3 breaks** (cos 0.019, 9.85 GB / dword index 2.46e9 > 2^31). Fix = per-row i64 base
   resources, deferred to the K3 follow-on. Repros: `/tmp/repro_g1.py`, `/tmp/repro_g1_down.py`,
   `/tmp/repro_k3_addr.py`.
-- [open] FP4 gate_up **accuracy** (ticket gates FP4 gate_up on accuracy; MXFP4 mantissa is
-  tiny). Measure cos-sim vs BF16-weight reference before claiming the win.
+- [resolved, 2026-08-11] FP4 gate_up **accuracy** (ticket gates FP4 gate_up on accuracy;
+  MXFP4 mantissa is tiny). **Discharged:** Phase C's `test_gate_up_fp4_matches_bf16_oracle`
+  runs the FP4 and BF16 kernels on the same logical weights and gives **cos = 1.000000**, and
+  D7 independently cross-checks FP4 outputs vs torch (non-uniform Block2D scales). The win is
+  validated, not merely claimed.
 - [resolved for split-K] Split-K / LDS were expected to pay only in the **occupancy-bound**
   regime (small-grid Qwen, low B). **Split-K (G5) measured → no-win even there**: B=1 warp-decode
   is launch/memory-latency-floor bound, so partitioning the contraction can't cut the ~4.4µs floor
@@ -630,3 +640,17 @@ bench/tune target; verify against the shipped weights before publishing numbers.
   Qwen3Next-TP1 × B∈{1,2,4,8,32}, both stages, via `_COLD_MODELS`/`_COLD_BATCHES`; FP8 legs auto-skip
   at DeepSeek E256 (2³¹). All fp4_cos=1.0; gate_up FP4 wins 1.3–1.8× (MiniMax). §8.2 model rows +
   Batch axis flipped ✅. **Only G9 (CK side-by-side) remains in Phase F.**
+- _Doc hygiene: reconciled with post-08-11 work (2026-08-19)_ — this convergence doc had drifted
+  from the companion [`-plan-bench.md`](./SILOTIGER-667-plan-bench.md). Flipped stale headers to
+  match reality: **Phase A `[~]→[x]`** (both sub-items done — real-E regression cases + K3-scale
+  B5 Tier-2), **Phase B `[ ]→[x]`** (FP4 down+gate_up landed, tested, cold-HBM win confirmed; closed
+  its two lingering `[ ]` bullets — Block2D<1,32> e8m0 scale layout + torch-correctness/perf-A/B —
+  and the `[~]` down-FP4 bullet), and **Phase F `[ ]→[x]`**. Folded in the two items this doc
+  predates: **B4** (FP8-activation gate_up — `build_gate_up_fp8_act_module` +
+  `flydsl_warp_decode_gate_up_fp8act`, the CK `gate_fp8_d2` peer, DONE 2026-08-18) and **D7** (CK
+  outputs numerically cross-checked vs torch across FP8/BF16/FP4 with non-uniform Block2D scales,
+  DONE 2026-08-18) — both landed via the G9 harness. **G9 (CK side-by-side) marked done**: of-record
+  `tickets/667/g9_compare.{md,csv}` covers all 15 cells with 0 n/a (reproduce via
+  `run_g9_compare.sh`). Also flipped the §9 **FP4 gate_up accuracy** risk `[open]→[resolved]`
+  (`test_gate_up_fp4_matches_bf16_oracle` cos=1.0 + D7). Net: Phases A/B/C/F now `[x]`; the only
+  in-scope open work left is Phase D LDS (G6) + Phase E selectable FP8 ILP (G7 on FP8).
