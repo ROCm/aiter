@@ -95,6 +95,10 @@ def _make_combine_fused_sync(
     block is rounded up to whole waves, so rack-scale domains larger than one
     wave are covered without a cross-wave dependency or barrier -- the kernel's
     cost is the peer wait, not thread count.
+
+    Being a rendezvous, it also fences the next dispatch off the regions this
+    forward still reads, which is what lets ``Routing.source_token_map`` hand
+    gemm2 a live view of ``recv_to_src_token`` instead of a copy.
     """
 
     sync_block_size = ((npes + WAVE - 1) // WAVE) * WAVE
