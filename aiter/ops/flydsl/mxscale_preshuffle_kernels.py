@@ -238,6 +238,7 @@ def _lookup_tuned(M, N, K, a_dtype, b_dtype, tuned_file=None):
     return tbl.get((get_gfx(), get_cu_num(), M, N, K, a_dtype, b_dtype))
 
 
+@functools.lru_cache(maxsize=1024)
 def _heuristic_tile(a_dtype, b_dtype, M, N, K):
     from .gemm_tune.flydsl_gemm_mxscale_preshuffle_common import candidates_for
 
