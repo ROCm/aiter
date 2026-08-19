@@ -294,6 +294,7 @@ def parse_csv(csv_path: str):
                 raise ValueError("FlyDSL HGEMM CSV N/K does not match kernel name")
 
             job = {
+                **params,
                 "kernel_name": kernel_name,
                 "m": m,
                 "n": n,
@@ -301,7 +302,6 @@ def parse_csv(csv_path: str):
                 "cu_num": cu_num,
                 "gfx": gfx,
                 "has_bias": _parse_bool(row.get("bias")),
-                **params,
             }
             key = job_identity(job)
             if key in seen:
