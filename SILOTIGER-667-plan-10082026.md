@@ -354,9 +354,22 @@ shapes only DeepSeek passes 2 GB (3.74 GB) and its dword index (9.35e8) is still
       "isolate the FP4 convert/scale from the reduce" gap noted under the Phase-B correctness item
       — a future FP4 convert regression now fails against the oracle, not just the fp32 matmul ref.
       **36/36 suite.**
-- [ ] `use_dot2=False` scalar-f32 path (bitshift widen + FMA) for gfx942 portability;
-      auto-select by arch (`get_gfx`), mirroring the reference's `_is_gfx950`.
-- [ ] Extend the op_test arch guard to exercise the scalar path where available.
+- [x] `use_dot2=False` scalar-f32 path (bf16→f32 widen + FMA) for gfx942 portability;
+      auto-select by arch (`get_gfx() == "gfx950"` ⇒ dot2, else scalar), mirroring the
+      reference's `_is_gfx950`. Landed on the **BF16 path** (the natural scaffold — bf16
+      weights need no scaled convert, so `v_dot2_f32_bf16` is the only gfx950-specific op).
+      New helpers `dot2_f32_bf16_scalar` (arch-agnostic unpack+FMA) + `dot2_or_scalar`
+      (dispatch) in `kernels/warp_decode_moe.py`; `use_dot2` threaded through both bf16
+      builders, cache getters, and the `flydsl_warp_decode_{gate_up,down_reduce}_bf16`
+      entry points (`use_dot2=None` auto-selects; explicit override forces a path).
+      **FP8/FP4 gfx942 deferred**: those also need arch-specific *converts*
+      (`cvt_scalef32_pk_bf16_*` are gfx950 too), not just a dot2 swap — a separate item.
+- [x] Extend the op_test arch guard to exercise the scalar path where available.
+      `test_{gate_up,down_reduce}_bf16_scalar_fallback` force `use_dot2=False` on gfx950
+      and assert the fallback both (a) matches the fp32 torch ref and (b) matches the dot2
+      path to near bit-exactness. **All 6 forced-scalar cases: `cos_vs_ref = cos_vs_dot2 =
+      1.000000`** — the gfx942 scalar math is validated on gfx950 without MI300 hardware.
+      (Representative gfx942 *perf* still needs real MI300; this covers correctness only.)
 
 ### Phase D — Occupancy levers: split-K + LDS (G5, G6)  [ ]
 > **Split-K (G5) is tracked in its own sub-plan:**

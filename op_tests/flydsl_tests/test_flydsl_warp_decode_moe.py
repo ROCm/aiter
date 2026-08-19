@@ -883,6 +883,60 @@ def test_down_reduce_bf16(case):
 
 
 # -------------------------------------------------------------------------
+# gfx942 scalar-f32 fallback (SILOTIGER-667 Phase C / G4).  The scalar path
+# (`use_dot2=False`) replaces `v_dot2_f32_bf16` (a gfx950 instruction) with pure
+# f32 unpack+FMA, so it compiles and runs on every AMD arch.  We can't test real
+# gfx942 hardware here, but forcing `use_dot2=False` on gfx950 exercises the exact
+# fallback math: we assert (a) it still matches the fp32 torch reference and (b) it
+# matches the dot2 path to near bit-exactness (only f32 add reassociation differs).
+# The auto path (`use_dot2=None`) picks dot2 on gfx950, so these forced cases are
+# the only way to cover the fallback without MI300 hardware.
+# -------------------------------------------------------------------------
+@pytest.mark.parametrize("case", [pytest.param(c, id=c[0]) for c in BF16_GATE_UP_CASES])
+def test_gate_up_bf16_scalar_fallback(case):
+    name, B, HIDDEN, INTER, E, TOPK = case
+    x, w_gate, w_up, router_ids = _gen_bf16_gate_up(B, HIDDEN, INTER, E, TOPK)
+    out_scalar = flydsl_warp_decode_gate_up_bf16(
+        x, w_gate, w_up, router_ids, use_dot2=False
+    )
+    out_dot2 = flydsl_warp_decode_gate_up_bf16(
+        x, w_gate, w_up, router_ids, use_dot2=True
+    )
+    torch.cuda.synchronize()
+    ref = _ref_bf16_gate_up(x, w_gate, w_up, router_ids)
+    cos_ref = _cosine(ref, out_scalar)
+    cos_dot2 = _cosine(out_dot2, out_scalar)
+    print(
+        f"[bf16 gate_up scalar {name}] cos_vs_ref={cos_ref:.6f} "
+        f"cos_vs_dot2={cos_dot2:.6f}"
+    )
+    assert cos_ref >= 0.99, f"scalar gate_up {name}: cos_vs_ref={cos_ref:.6f}"
+    assert cos_dot2 >= 0.9999, f"scalar gate_up {name}: cos_vs_dot2={cos_dot2:.6f}"
+
+
+@pytest.mark.parametrize("case", [pytest.param(c, id=c[0]) for c in BF16_DOWN_CASES])
+def test_down_reduce_bf16_scalar_fallback(case):
+    name, B, INTER, HIDDEN, E, TOPK = case
+    inter, w_down, router_ids, router_wts = _gen_bf16_down(B, INTER, HIDDEN, E, TOPK)
+    out_scalar = flydsl_warp_decode_down_reduce_bf16(
+        inter, w_down, router_ids, router_wts, use_dot2=False
+    )
+    out_dot2 = flydsl_warp_decode_down_reduce_bf16(
+        inter, w_down, router_ids, router_wts, use_dot2=True
+    )
+    torch.cuda.synchronize()
+    ref = _ref_bf16_down(inter, w_down, router_ids, router_wts)
+    cos_ref = _cosine(ref, out_scalar)
+    cos_dot2 = _cosine(out_dot2, out_scalar)
+    print(
+        f"[bf16 down scalar {name}] cos_vs_ref={cos_ref:.6f} "
+        f"cos_vs_dot2={cos_dot2:.6f}"
+    )
+    assert cos_ref >= 0.99, f"scalar down {name}: cos_vs_ref={cos_ref:.6f}"
+    assert cos_dot2 >= 0.9999, f"scalar down {name}: cos_vs_dot2={cos_dot2:.6f}"
+
+
+# -------------------------------------------------------------------------
 # BF16-oracle cross-check: run the FP4 kernel and the BF16 kernel on the *same*
 # logical weights (FP4's e8m0 scales are powers of two + LUT values exact => the
 # fp32 dequant is bf16-exact, so the BF16 kernel fed `w_deq.to(bf16)` computes
