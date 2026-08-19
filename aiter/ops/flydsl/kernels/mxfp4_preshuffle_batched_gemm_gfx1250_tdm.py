@@ -78,6 +78,7 @@ def launch_gemm_a8w4_tdm(
     PITCH = ((STAGE_A + STAGE_B + STAGE_SA + STAGE_SB + 127) // 128) * 128
 
     out_elem = T.f16 if out_is_f16 else T.bf16
+    out_cls = fx.Float16 if out_is_f16 else fx.BFloat16
 
     C_STORE_B = ((tile_m * tile_n * 2 + 127) // 128) * 128
     ARENA_B = max(num_buffers * PITCH, C_STORE_B)
@@ -258,12 +259,11 @@ def launch_gemm_a8w4_tdm(
             )
             gSB_h.append(gsb)
             atomSB_h.append(_tdm1(gsb, None, SB_OUTER_STRIDE, b_mask))
-        _adv = fx.rocdl.advance_tdm_atom
         base_i32 = fx.recast_iter(fx.Int32, base_ptr)
 
-        def _wcopy(w, atom, gt, lv):
+        def _wcopy(w, atom, gt, lv, imm_offset):
             if wave == w:
-                fx.copy(atom, gt, lv)
+                fx.copy(atom, gt, lv, imm_offset=imm_offset)
 
         def issue(s, kt):
             pa = _buf_ptr(s)
@@ -271,43 +271,47 @@ def launch_gemm_a8w4_tdm(
             for h in range_constexpr(2):
                 _wcopy(
                     W_A[h],
-                    _adv(atomA_h[h], kt * A_ROW_B),
+                    atomA_h[h],
                     gA_h[h],
                     _lv(
                         fx.add_offset(pa, h * HM * A_LDS_ROW),
                         (HM, A_ROW_B),
                         (A_LDS_ROW, 1),
                     ),
+                    fx.Int64(kt * A_ROW_B),
                 )
                 _wcopy(
                     W_B[h],
-                    _adv(atomB_h[h], kt * (PACK_TK * 16)),
+                    atomB_h[h],
                     gB_h[h],
                     _lv(
                         fx.add_offset(pa, STAGE_A + h * HB * B_LDS_ROW),
                         (HB, PACK_TK * 16),
                         (B_LDS_ROW, 1),
                     ),
+                    fx.Int64(kt * (PACK_TK * 16)),
                 )
                 _wcopy(
                     W_SA[h],
-                    _adv(atomSA_h[h], kt * (SC_INNER * 4)),
+                    atomSA_h[h],
                     gSA_h[h],
                     _lv(
                         fx.add_offset(base_i32, so4 + SA_OFF // 4 + h * HSA * SC_INNER),
                         (HSA, SC_INNER),
                         (SC_INNER, 1),
                     ),
+                    fx.Int64(kt * (SC_INNER * 4)),
                 )
                 _wcopy(
                     W_SB[h],
-                    _adv(atomSB_h[h], kt * (SC_INNER * 4)),
+                    atomSB_h[h],
                     gSB_h[h],
                     _lv(
                         fx.add_offset(base_i32, so4 + SB_OFF // 4 + h * HSB * SC_INNER),
                         (HSB, SC_INNER),
                         (SC_INNER, 1),
                     ),
+                    fx.Int64(kt * (SC_INNER * 4)),
                 )
 
         wmb = wave_m * warp_tile_m
@@ -457,7 +461,7 @@ def launch_gemm_a8w4_tdm(
             )
             compute_ktile(buf, None)
 
-        accs = [c_frags[idx].load().ir_value() for idx in range_constexpr(n_acc)]
+        accs = [c_frags[idx].load() for idx in range_constexpr(n_acc)]
 
         # Epilogue: stage the WMMA tile through LDS, then TDM-store to global.
         pipeline_fence(outstanding=0, use_cluster=use_cluster)
@@ -465,11 +469,14 @@ def launch_gemm_a8w4_tdm(
             row_rel = wmb + wm * 16 + lane16
             for wn in range_constexpr(wmma_n_rep):
                 col_rel = wnb + wn * 16 + kgrp * 8
-                h = fx.trunc_f(T.vec(8, out_elem), accs[wm * wmma_n_rep + wn])
-                i32v = fx.vector.bitcast(T.vec(4, T.i32), h)
-                lds_store_b128_raw(stC_idx, (row_rel * tile_n + col_rel) * 2, i32v)
+                h = accs[wm * wmma_n_rep + wn].to(out_cls)
+                lds_store_b128_raw(
+                    stC_idx,
+                    (row_rel * tile_n + col_rel) * 2,
+                    h.bitcast(fx.Int32).ir_value(),
+                )
         workgroup_barrier(use_cluster=False)
-        oc = fx.Float16 if out_is_f16 else fx.BFloat16
+        oc = out_cls
         c_off_rt = c_outer_off * fx.Int64(c_stride) + c_inner_off
         gtC = _gv(fx.get_iter(arg_c), c_off_rt, (tile_m, tile_n), (tile_n, 1))
         atomC = _tdm(
