@@ -727,6 +727,7 @@ def launch_gemm_a8w4_tdm(
                 slot.b[wn].store(load_b(buf, wn, ksl))
             for wm in range_constexpr(wmma_m_rep):
                 slot.a[wm].store(load_a(buf, wm, ksl))
+
         def k_step(
             cur_rmem,
             next_rmem=None,
