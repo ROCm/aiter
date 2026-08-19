@@ -59,6 +59,11 @@ scf_if_dispatch = ReplaceIfWithDispatch.scf_if_dispatch
 # config each manager needs through its constructor.
 from .mha_buffer_managers import QManager16b, KManager16b, VManager16b, OManager16b
 
+# Single source of truth for gfx1250 Expert Scheduling Mode 2 (DEP_MODE=2). Lives
+# in mha_buffer_managers (where the s_wait_alu 0 covers are emitted) so the setreg
+# below and the covers flip in lockstep. See _set_sched_mode / _wait_alu0.
+from .mha_buffer_managers import ENABLE_SCHED_MODE2, _wait_alu0, _wait_va_vdst
+
 # ============================================================================
 # Threadgroup / arch constants
 # ============================================================================
@@ -126,14 +131,20 @@ def _load_seqlen_pair(ptr_tensor, idx):
 def _load_sink_logit(ptr_sink, q_head_idx, num_heads_q):
     """Load this lane's per-head sink logit ``sink[q_head_idx]`` from the 1-D
     ``[num_heads_q]`` fp32 ``sink`` — one extra ``exp(sink)`` term in the softmax
-    denominator, in the scaled-score domain (same units as S)."""
-    sink_rsrc = buffer_ops.create_buffer_resource(
-        ptr_sink, num_records_bytes=arith.unwrap(num_heads_q * fx.Int32(4))
-    )
-    val = buffer_ops.buffer_load(
-        sink_rsrc, arith.unwrap(q_head_idx), vec_width=1, dtype=fx.Float32
-    )
-    return fx.Float32(val)
+    denominator, in the scaled-score domain (same units as S).
+
+    Uses a flat ``llvm.load`` (not ``buffer_load``) so the address can carry a
+    tied ``s_wait_alu 0`` cover under sched mode 2: ``buffer_load`` re-scales the
+    offset (``offset * element_bytes``) INTERNALLY, below any external tie, which
+    would leave the VALU->address->load RAW uncovered. Safe without a HW bounds
+    check because ``q_head_idx = kv_head*gqa_ratio + row_idx%gqa_ratio`` is always
+    ``< num_heads_q`` (in-bounds by construction)."""
+    del num_heads_q  # in-bounds by construction; no buffer bounds check needed
+    sink_base_i64 = fx.Int64(fx.ptrtoint(fx.get_iter(ptr_sink)))
+    byte_off = fx.Int64(q_head_idx) * fx.Int64(4)
+    gptr = buffer_ops.create_llvm_ptr(sink_base_i64 + byte_off, address_space=1)
+    gptr = _wait_alu0(gptr)  # mode-2 cover (tied): RAW into the flat sink load
+    return fx.Float32(llvm_dialect.load(ir.F32Type.get(), gptr))
 
 
 def _packed_tile_indices(gqa_ratio, warp_idx, lane_idx):
@@ -162,6 +173,27 @@ def _min_i32(a, b):  # signed 32-bit min of two fx.Int32
 
 def _max_i32(a, b):  # signed 32-bit max of two fx.Int32
     return fx.Int32(arith.maxsi(arith.unwrap(a), arith.unwrap(b)))
+
+
+# ---- gfx1250 Expert Scheduling Mode (SCHED_MODE, hwreg 26) ------------------
+# DEP_MODE=2 disables the conservative VA_VDST / VM_VSRC issue interlocks, so an
+# LDS/VMEM op no longer stalls until every outstanding VALU/WMMA has written back
+# -- the source of the ~24-cyc wmma->ds_load issue bubble (see
+# /jruan/notes/gfx1250_issue_bubble.md; mirrors fmha_kernel.py's _setreg(2074,2)).
+# hwreg enc = id | ((size-1)<<11) = 26 | (1<<11) = 2074 (offset 0, width 2);
+# value 2 = DEP_MODE bits[1:0]. CAUTION: LLVM has no model of this mode and will
+# NOT emit the s_wait_alu depctr_va_vdst cover a VALU->VGPR->ds_load RAW needs ->
+# silent wrong results if a load address is produced by a VALU op right before it.
+# ENABLE_SCHED_MODE2 is imported from mha_buffer_managers (single source of truth,
+# paired with the s_wait_alu 0 covers). Flip it there to toggle mode 2 + covers.
+_WAVE_SCHED_MODE_ENC = 26 | ((2 - 1) << 11)  # = 2074
+
+
+def _set_sched_mode(dep_mode):
+    """s_setreg_imm32_b32 hwreg(WAVE_SCHED_MODE, 0, 2), dep_mode."""
+    imm = arith.unwrap(arith.constant(_WAVE_SCHED_MODE_ENC, type=T.i32))
+    val = arith.unwrap(arith.constant(int(dep_mode), type=T.i32))
+    llvm_dialect.call_intrinsic(None, "llvm.amdgcn.s.setreg", [imm, val], [], [])
 
 
 # ============================================================================
@@ -308,7 +340,9 @@ def _softmax(*, s, m_prev, d_prev, lane_idx, n_block,
     # ---- Pass 1: masked S values + running row max ----
     s_masked = []  # flattened (kvt, i) order
     for kvt in range(NKV):
-        svec = fx.Vector(s[kvt])
+        # mode-2: drain va_vdst so the QK wmma writeback into s[kvt] has landed before
+        # this VALU (extract/mask/max) reads it (no HW interlock under DEP_MODE=2).
+        svec = fx.Vector(_wait_va_vdst(s[kvt]))
         for i in range(8):
             sval = fx.Float32(svec[i])
             if q_max is not None or q_min is not None or kv_len is not None:
@@ -451,6 +485,11 @@ def _core_attention(
     token ranges (``q_start``/``q_len`` and ``kv_start``/``kv_len``) — the only
     part that differs between varlen and batched layouts — and passes them here.
     """
+    # gfx1250 Expert Scheduling Mode 2: drop the VA_VDST/VM_VSRC issue interlocks
+    # for the whole compute (kills the wmma->ds_load bubble). See _set_sched_mode.
+    if ENABLE_SCHED_MODE2:
+        _set_sched_mode(2)
+
     warp_idx = _warp_id()
     lane_idx = _lane_id()
     kv_head, q_head_idx, seq_idx = _packed_tile_indices(gqa_ratio, warp_idx, lane_idx)
@@ -800,11 +839,17 @@ def _core_attention(
         lse_rsrc = buffer_ops.create_buffer_resource(
             ptr_LSE, num_records_bytes=lse_num_records_bytes
         )
+        # mode-2 cover (tied): buffer_store lowers `mask=lse_mask` to an INTERNAL
+        # select(mask, off, 0x7fffffff) that lands right before the store, below any
+        # external tie. Replicate the select here, tie its RESULT, and pass mask=None
+        # so the cover sits immediately before the store (drains the lse_val VALU too).
+        lse_off_masked = lse_mask.select(lse_off_el * fx.Int32(4), fx.Int32(0x7FFFFFFF))
+        lse_off_masked = _wait_alu0(lse_off_masked)
         buffer_ops.buffer_store(
             lse_val,
             lse_rsrc,
-            lse_off_el * fx.Int32(4),
-            mask=lse_mask,
+            lse_off_masked,
+            mask=None,
             offset_is_bytes=True,
         )
 
