@@ -333,6 +333,13 @@ def _tables(device: torch.device) -> tuple[Tensor, Tensor]:
 
 def quant_mxfp6_torch(x: Tensor) -> tuple[Tensor, Tensor]:
     """torch/GPU version of quant_mxfp6: [R,K] float -> (codes uint8, scales uint8)."""
+    if x.ndim != 2:
+        raise ValueError(f"quant_mxfp6_torch expects a 2D [R, K] tensor, got {x.ndim}D")
+    if x.shape[1] == 0 or x.shape[1] % _SCALE_GROUP_SIZE != 0:
+        raise ValueError(
+            "quant_mxfp6_torch requires K to be a positive multiple of "
+            f"{_SCALE_GROUP_SIZE}, got {x.shape[1]}"
+        )
     x = x.float()
     x = _rotate_k32_torch(x)
     R, K = x.shape
@@ -617,9 +624,10 @@ def quant_mxfp6_gemm_out(
 def quant_mxfp6_gemm(w: Tensor) -> tuple[Tensor, Tensor]:
     """Quantize + pack a [rows, K] bf16/fp tensor for the a6w6 kernel.
 
-    Rows are zero-padded to a multiple of 256 and K to a multiple of 128 so
-    that any GEMM shape maps onto the kernel's 256x256 / 128-K tiling. The
-    padded region quantizes to zero and does not affect the result.
+    Rows are represented in a multiple-of-256 layout and K is zero-padded to a
+    multiple of 128 so any GEMM shape maps onto the kernel's 256x256 / 128-K
+    tiling. Row-padding slots and the two trailing ABI K-guard tiles are not
+    consumed by the kernel and their contents are intentionally unspecified.
 
     Returns (packed uint8, packed_scale uint8) torch tensors on w.device.
     Works identically for both A and B operands. Runs entirely on the GPU.
@@ -634,9 +642,10 @@ def quant_mxfp6_gemm(w: Tensor) -> tuple[Tensor, Tensor]:
         x = x.contiguous()
         NK_PAD = padK // _K_TILE + _PADK
         nt = padR // _TILE
-        # The Triton packer writes every tile that the a6w6 GEMM consumes for
-        # the logical K extent.  Avoid full-buffer memset/fill here; those extra
-        # launches are paid on every activation quantization in inference.
+        # The Triton packer writes every logical K tile.  The ASM bounds
+        # accumulation with K; _PADK is addressable pipeline-guard spacing, not
+        # data.  Leave guard and row-padding slots unspecified to avoid a fill
+        # launch on every activation quantization in inference.
         packed = torch.empty(
             nt * NK_PAD * _PACKED_TILE_BYTES,
             dtype=torch.uint8,
@@ -723,6 +732,10 @@ def gemm_a6w6(
     a shape-tuned kernel is selected before the launch is padded. The result is
     sliced back to [M, N].
     """
+    if dtype != dtypes.bf16:
+        raise ValueError(
+            f"gemm_a6w6 currently supports only torch.bfloat16 output, got {dtype}."
+        )
     if float(alpha) != 1.0:
         raise ValueError("gemm_a6w6 currently supports only alpha=1.0.")
     selected_kernel = _select_gemm_a6w6_kernel(M, N, K, kernelName)

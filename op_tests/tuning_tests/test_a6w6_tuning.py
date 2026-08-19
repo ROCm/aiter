@@ -8,6 +8,7 @@ import unittest
 from unittest import mock
 
 import pandas as pd
+import torch
 
 from aiter.ops import gemm_op_a6w6
 from csrc.gemm_a6w6.gemm_a6w6_tune import choose_guarded_kernel
@@ -163,6 +164,30 @@ class TestA6W6TuningLookup(unittest.TestCase):
             gemm_op_a6w6._default_gemm_a6w6_kernel(512, 55296, 6144),
             gemm_op_a6w6._SAFE_FALLBACK_KERNEL_NAME,
         )
+
+
+class TestA6W6ApiValidation(unittest.TestCase):
+    def test_torch_quantizer_rejects_non_matrix_input(self):
+        with self.assertRaisesRegex(ValueError, r"2D \[R, K\] tensor"):
+            gemm_op_a6w6.quant_mxfp6_torch(torch.empty((1, 1, 32)))
+
+    def test_torch_quantizer_rejects_unaligned_k(self):
+        with self.assertRaisesRegex(ValueError, "positive multiple of 32"):
+            gemm_op_a6w6.quant_mxfp6_torch(torch.empty((1, 31)))
+
+    def test_gemm_rejects_unsupported_output_dtype_early(self):
+        packed = torch.empty(0, dtype=torch.uint8)
+        with self.assertRaisesRegex(ValueError, "only torch.bfloat16 output"):
+            gemm_op_a6w6.gemm_a6w6(
+                packed,
+                packed,
+                packed,
+                packed,
+                256,
+                256,
+                128,
+                dtype=torch.float16,
+            )
 
 
 class TestA6W6Manifest(unittest.TestCase):
