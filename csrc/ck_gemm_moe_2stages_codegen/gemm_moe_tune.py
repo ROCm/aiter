@@ -82,6 +82,7 @@ except ImportError:
 if is_flydsl_available():
     try:
         from aiter.ops.flydsl.moe_kernels import (
+            a16w4_config_fits_device,
             flydsl_moe_stage1,
             flydsl_moe_stage2,
             get_flydsl_stage1_kernels,
@@ -120,6 +121,49 @@ TUNE_MOE_EXPERT_BALANCE = (
 )
 
 COS_DIFF_THRESHOLD = 1e-1
+
+
+def _is_a16w4_per1x32(q_dtype_a, q_dtype_w, q_type) -> bool:
+    """bf16/fp16 activation x MX-FP4 weight. Not a8w4 (fp8 A) or a4w4 (fp4 A)."""
+    return (
+        q_type == QuantType.per_1x32
+        and q_dtype_w == dtypes.fp4x2
+        and q_dtype_a in (dtypes.bf16, dtypes.fp16)
+    )
+
+
+def _is_a16wi4_per1x32(q_dtype_a, q_dtype_w, q_type) -> bool:
+    """bf16/fp16 activation x int4 weight (groupwise per_1x32). Not a8w4/a4w4."""
+    return (
+        q_type == QuantType.per_1x32
+        and q_dtype_w == dtypes.i4x2
+        and q_dtype_a in (dtypes.bf16, dtypes.fp16)
+    )
+
+
+# asm fused_topk pairs in fused_moe.fused_topk. Other (E, topk) go through
+# generic topk_softmax, whose current module_moe_asm ABI rejects need_renorm
+# (TypeError: got Tensor). Tuner data only needs valid routing ids.
+_ASM_FUSED_TOPK_PAIRS = {
+    (128, 4),
+    (128, 6),
+    (128, 8),
+    (256, 6),
+    (256, 8),
+    (384, 8),
+    (640, 8),
+}
+
+
+def _tuner_routing_topk(hidden, score, topk):
+    """Top-k routing for tuner tensors. GEMM timing does not depend on the
+    softmax implementation, only on valid (token, expert) ids and weights.
+    """
+    expert = int(score.shape[1])
+    if (expert, int(topk)) in _ASM_FUSED_TOPK_PAIRS:
+        return fused_topk(hidden, score, topk, True)
+    vals, ids = torch.topk(score.float(), int(topk), dim=-1)
+    return torch.softmax(vals, dim=-1), ids.to(torch.int32)
 
 
 def _a16w_sorted_cos(ref, res, msg="", printLog=True):
@@ -1516,7 +1560,7 @@ class FmoeTuner(TunerCommon):
             if routing_seed is not None:
                 torch.manual_seed(int(routing_seed))
             score = torch.randn((token, expert), dtype=dtype)
-        topk_weights, topk_ids = fused_topk(input, score, topk, True)
+        topk_weights, topk_ids = _tuner_routing_topk(input, score, topk)
         if q_type == QuantType.per_1x128:
             a1_qt, a1_scale = aiter.pertoken_quant(
                 input.view(token, -1, 128), quant_dtype=q_dtype_a
@@ -3444,7 +3488,7 @@ class FmoeTuner(TunerCommon):
         if not is_flydsl_available():
             return tasks_flydsl
         (
-            _gfx,
+            gfx,
             _cu_num,
             token,
             model_dim,
@@ -3488,7 +3532,14 @@ class FmoeTuner(TunerCommon):
         )
 
         for blockM in blockMs:
-            if blockM not in [32, 64, 128] or not use_g1u1:
+            if blockM not in [16, 32, 64, 128] or not use_g1u1:
+                continue
+            # a16wmix gemm1 tile_m=128 at tile_k=256 is 128KiB; illegal on gfx942.
+            if (
+                a_dtype_str == "bf16"
+                and gfx == "gfx942"
+                and blockM == 128
+            ):
                 continue
             for kname, kparams in flydsl_s1_kernels.items():
                 is_splitk = kparams.get("k_batch", 1) > 1
@@ -3501,6 +3552,9 @@ class FmoeTuner(TunerCommon):
                 _kb = kparams.get("k_batch", 1)
                 _kw = kparams.get("k_wave", 1)
                 _tk = kparams["tile_k"]
+                # a16wmix has no grid split-K (k_batch must stay 1).
+                if a_dtype_str == "bf16" and _kb != 1:
+                    continue
                 if model_dim % _kb != 0:
                     continue
                 _k_per_batch = model_dim // _kb
@@ -3516,9 +3570,20 @@ class FmoeTuner(TunerCommon):
                 # (e.g. tile_n=32 with k_wave=1) the epilogue writes nothing ->
                 # NaN/garbage output that times fast but is wrong; the tuner would
                 # otherwise pick it. Require num_acc_n >= 1 for a16w4.
+                # Also skip tiles that exceed this GPU's LDS (gfx942=64KiB).
                 if a_dtype_str == "bf16":
                     _n_waves = max(1, 4 // _kw)
                     if (kparams["tile_n"] // _n_waves) < 16:
+                        continue
+                    if inter_dim % kparams["tile_n"] != 0:
+                        continue
+                    if not a16w4_config_fits_device(
+                        1,
+                        kparams["tile_m"],
+                        kparams["tile_n"],
+                        kparams["tile_k"],
+                        _kw,
+                    ):
                         continue
 
                 # (kernel_name, kparams, is_fp4, is_fp8)
@@ -3693,6 +3758,12 @@ class FmoeTuner(TunerCommon):
                     s2_tile_m != blockM
                     or kparams["tile_n"] == 256
                     or inter_dim % kparams["tile_k"] != 0
+                    or not a16w4_config_fits_device(
+                        2,
+                        kparams["tile_m"],
+                        kparams["tile_n"],
+                        kparams["tile_k"],
+                    )
                 ):
                     continue
                 s2_kparams = {**kparams, "sort_block_m": blockM}
@@ -4333,17 +4404,26 @@ class FmoeTuner(TunerCommon):
                 ktm = kparams["tile_m"]
                 if ktm != blockM:
                     continue
-                # Validate split-k compatibility with model_dim
+                # a16wmix has no grid split-K. Skip tiles that overflow this
+                # GPU's LDS (gfx942=64KiB) or have num_acc_n=0.
                 kb = kparams.get("k_batch", 1)
-                if kb > 1:
-                    if model_dim % kb != 0:
-                        continue
-                    k_per_batch = model_dim // kb
-                    if k_per_batch % kparams["tile_k"] != 0:
-                        continue
-                    k_tiles = k_per_batch // kparams["tile_k"]
-                    if k_tiles < 4 or k_tiles % 2 != 0:
-                        continue
+                if kb != 1:
+                    continue
+                _kw = kparams.get("k_wave", 1)
+                _tk = kparams["tile_k"]
+                if not a16w4_config_fits_device(
+                    1, kparams["tile_m"], kparams["tile_n"], kparams["tile_k"], _kw
+                ):
+                    continue
+                # Same K-axis skip as gen_flydsl_2stages_task: k_wave*tile_k
+                # that does not divide model_dim can HSA-fault the worker pool
+                # (t16x16x256_kw4 on K=3584).
+                if model_dim % _tk != 0:
+                    continue
+                if _kw > 1 and (
+                    model_dim % _kw != 0 or (model_dim // _kw) % _tk != 0
+                ):
+                    continue
                 # Int4 kernels: no fuse_fp4_quant. a16wi4 is the a16w-mix port, whose
                 # stage1 returns a SORTED [max_sorted, inter] intermediate, so it must
                 # be scored against the SORTED reference (same as the mxfp4 a16w4 arm
@@ -4429,6 +4509,10 @@ class FmoeTuner(TunerCommon):
                 # tuner can emit a row that fails op_tests/test_moe_2stage.
                 s2_tile_m = kparams["tile_m"]
                 if s2_tile_m != blockM:
+                    continue
+                if not a16w4_config_fits_device(
+                    2, kparams["tile_m"], kparams["tile_n"], kparams["tile_k"]
+                ):
                     continue
                 if kparams.get("mode", "atomic") != "atomic":
                     continue
@@ -4730,7 +4814,7 @@ class FmoeTuner(TunerCommon):
                 w2_qt_fmoe.is_shuffled = True
 
                 score = torch.randn((token, expert), dtype=dtype, device="cuda")
-                topk_weights, topk_ids = fused_topk(hidden, score, topk, True)
+                topk_weights, topk_ids = _tuner_routing_topk(hidden, score, topk)
                 if q_type == QuantType.per_1x128:
                     a1_qt, a1_scale = aiter.pertoken_quant(
                         hidden.view(token, -1, 128), quant_dtype=q_dtype_a
@@ -4934,9 +5018,23 @@ class FmoeTuner(TunerCommon):
             q_type = eval(q_type)
             q_type = QuantType.per_1x128 if q_type == QuantType.per_128x128 else q_type
             print("\nStart tuning", line)
+            # gfx950 owns all per_1x32 (a4w4/a8w4/a16w4/a16wi4). gfx942 has
+            # FlyDSL a16w-mix only (a16w4 MX-FP4 and a16wi4 int4). Do not open
+            # a8w4 / a4w4, and do not revive fp4_bf16.
+            _gfx942_a16w4 = (
+                get_gfx() == "gfx942"
+                and is_flydsl_available()
+                and _is_a16w4_per1x32(q_dtype_a, q_dtype_w, q_type)
+            )
+            _gfx942_a16wi4 = (
+                get_gfx() == "gfx942"
+                and is_flydsl_available()
+                and _is_a16wi4_per1x32(q_dtype_a, q_dtype_w, q_type)
+            )
             if get_gfx() not in ["gfx950"] and q_type in [aiter.QuantType.per_1x32]:
-                print(f"{q_type} is not supported on {get_gfx()}")
-                return []
+                if not (_gfx942_a16w4 or _gfx942_a16wi4):
+                    print(f"{q_type} is not supported on {get_gfx()}")
+                    return []
             if not use_g1u1:
                 print("no moe solution(g1u0) can tune for ", line)
                 continue
@@ -4971,25 +5069,53 @@ class FmoeTuner(TunerCommon):
                     return name == "opus"
                 return True
 
-            if _want("asm"):
-                tasks.extend(self.gen_2stages_asm1_task(info, blockMs))
-            if _want("cktile") and os.environ.get("OPUS_SKIP_CKTILE", "0") != "1":
-                tasks_ck.extend(self.gen_2stages_task(info, blockMs))
-            if _want("flydsl"):
-                tasks_ck.extend(self.gen_flydsl_2stages_task(info, blockMs))
-            if _want("flydslv2"):
-                tasks_ck.extend(self.gen_flydsl_v2_2stages_task(info, blockMs))
-            if _want("flydsli4"):
-                tasks_ck.extend(self.gen_flydsl_i4_2stages_task(info, blockMs))
-            if _want("opus"):
-                tasks_ck.extend(
-                    self.gen_opus_2stages_task(
-                        info,
-                        blockMs,
+            # gfx942 a16w4: tile_m=128 gemm2 LDS does not fit 64KiB, so there
+            # is no legal stage2 pair. Search 16/32/64 (gemm1 tile_m=16 is a
+            # legal decode BM). Illegal (tile, k_wave) pairs are dropped by
+            # a16w4_config_fits_device.
+            # gfx942 a16wi4: i4 registry includes tile_m=16; still skip 128.
+            if _gfx942_a16w4:
+                shape_block_ms = [16, 32, 64]
+            elif _gfx942_a16wi4:
+                shape_block_ms = [16, 32, 64]
+            else:
+                shape_block_ms = blockMs
+            if _gfx942_a16w4:
+                if _want("flydsl"):
+                    tasks_ck.extend(
+                        self.gen_flydsl_2stages_task(info, shape_block_ms)
                     )
-                )
-            if _want("asm"):
-                task_1stage.extend(self.gen_1stage_asm_task(info))
+            elif _gfx942_a16wi4:
+                if _want("flydsli4"):
+                    tasks_ck.extend(
+                        self.gen_flydsl_i4_2stages_task(info, shape_block_ms)
+                    )
+            else:
+                if _want("asm"):
+                    tasks.extend(self.gen_2stages_asm1_task(info, shape_block_ms))
+                if _want("cktile") and os.environ.get("OPUS_SKIP_CKTILE", "0") != "1":
+                    tasks_ck.extend(self.gen_2stages_task(info, shape_block_ms))
+                if _want("flydsl"):
+                    tasks_ck.extend(
+                        self.gen_flydsl_2stages_task(info, shape_block_ms)
+                    )
+                if _want("flydslv2"):
+                    tasks_ck.extend(
+                        self.gen_flydsl_v2_2stages_task(info, shape_block_ms)
+                    )
+                if _want("flydsli4"):
+                    tasks_ck.extend(
+                        self.gen_flydsl_i4_2stages_task(info, shape_block_ms)
+                    )
+                if _want("opus"):
+                    tasks_ck.extend(
+                        self.gen_opus_2stages_task(
+                            info,
+                            shape_block_ms,
+                        )
+                    )
+                if _want("asm"):
+                    task_1stage.extend(self.gen_1stage_asm_task(info))
             if tasks is None and tasks_ck is None and task_1stage is None:
                 print("no moe solution can tune for ", line)
                 continue

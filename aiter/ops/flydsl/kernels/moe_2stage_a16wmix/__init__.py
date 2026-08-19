@@ -104,6 +104,10 @@ def flydsl_a16w4_gemm1(
         raise NotImplementedError(
             f"a16w4 gemm1 only supports gate_mode='separated', got {gate_mode!r}"
         )
+    # Registry encodes "no `_wN` suffix" as waves_per_eu=1. That means compiler
+    # default occupancy, not "pin to 1 wave/EU" (a different compile / AOT key).
+    if waves_per_eu is not None and int(waves_per_eu) <= 1:
+        waves_per_eu = None
 
     BM = tile_m
     TILE_K = tile_k
@@ -210,6 +214,8 @@ def flydsl_a16w4_gemm2(
     """
     if k_batch != 1:
         raise NotImplementedError(f"a16w4 gemm2 only supports k_batch=1, got {k_batch}")
+    if waves_per_eu is not None and int(waves_per_eu) <= 1:
+        waves_per_eu = None
 
     BM = tile_m
     TILE_N = tile_n

@@ -846,8 +846,9 @@ def _precompile_a16w4_to_cache(
     gemm (``_s1_args_fp4``), so it can't reuse ``_precompile_to_cache``'s arg
     builders.  Instead drive the SAME runtime launchers (``flydsl_a16w4_gemm{1,2}``)
     the fused-MoE op uses, under ``COMPILE_ONLY=1`` — the cache key then matches
-    runtime by construction (``waves_per_eu=None``, ``persist=False``,
-    ``w_layout="standard"``, g2 tile downgrade are all applied inside the
+    runtime by construction (``waves_per_eu`` from the kernel name with the same
+    "no `_wN` => None" normalization as ``flydsl_a16w4_gemm1``, ``persist`` from
+    the name, ``w_layout="standard"``, g2 tile downgrade are all applied inside the
     launcher).  The compiled artifact is keyed only on the kernel's constexpr
     params (shapes/tiles/topk/act), never on the launch pointers, grid, or
     ``n_tokens``, so a single 1-elem real placeholder covers every buffer (real,
@@ -872,7 +873,7 @@ def _precompile_a16w4_to_cache(
         "tile_m": tile_m,
         "b_nt": b_nt,
         "xcd_swizzle": xcd_swizzle,
-        "waves_per_eu": None,
+        "waves_per_eu": kwargs.get("waves_per_eu"),
         "stream": 0,
     }
     with compile_only_env():
@@ -917,6 +918,7 @@ def _precompile_a16w4_to_cache(
                 tile_n=g2_tile_n,
                 tile_k=g2_tile_k,
                 w_dtype=b_dtype,
+                persist=bool(kwargs.get("persist", False)),
                 **common,
             )
 

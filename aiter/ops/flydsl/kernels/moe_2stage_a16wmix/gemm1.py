@@ -13,6 +13,7 @@ from flydsl.expr.typing import Vector as Vec
 from aiter.ops.flydsl.kernels import buffer_ops
 from aiter.ops.flydsl.kernels.act import gate_up_act, situ_params
 from aiter.ops.flydsl.kernels.tensor_shim import _to_raw as _raw
+from aiter.ops.flydsl.utils import addressable_lds_bytes_for_gfx
 
 from .utils import (
     _BCol,
@@ -457,6 +458,14 @@ def compile_gemm1_a16w4_port(
         lds_bytes = max(_a_lds_bytes, _reduce_bytes)
     else:
         lds_bytes = _a_lds_bytes
+
+    # use_k16 is the gfx942/CDNA3 MFMA fallback; that arch has 64KiB LDS.
+    if use_k16:
+        _lds_lim = addressable_lds_bytes_for_gfx("gfx942")
+        assert lds_bytes <= _lds_lim, (
+            f"gfx942 a16w4 gemm1 LDS={lds_bytes} exceeds {_lds_lim} "
+            f"(BM={BM}, TILE_N={TILE_N}, TILE_K={TILE_K}, k_wave={k_wave})"
+        )
 
     assert act in (
         "silu",

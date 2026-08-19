@@ -2691,6 +2691,57 @@ def get_2stage_cfgs(
         # w-dtype "fp4" => mxfp4 weight; "fp8" => mxfp8 weight (a8w8).
         _w_type = "fp8" if q_dtype_w == dtypes.fp8 else "fp4"
         _s2_tk = pick_flydsl_stage2_tile_k(inter_dim)
+
+        # gfx942 a16w4 (SiTUv2): 64KiB LDS. Do not reuse the gfx950
+        # tile_m=128 fallback (128KiB). This port has no grid split-K;
+        # small-M occupancy is a narrow tile_n plus intra-block k_wave.
+        if _is_a16w4_situv2 and get_gfx() == "gfx942":
+            if token < 2048:
+                _tile_m, _s1_tn, _s1_kw = 32, 64, 2
+            else:
+                _tile_m, _s1_tn, _s1_kw = 64, 128, 1
+            kn1 = flydsl_kernel_name(
+                1, _a_type, _w_type, _out_type, _tile_m, _s1_tn, 256
+            )
+            if _s1_kw > 1:
+                kn1 += f"_kw{_s1_kw}"
+            kn2 = flydsl_kernel_name(
+                2, _a_type, _w_type, _out_type, _tile_m, 128, _s2_tk, "atomic"
+            )
+            if get_flydsl_kernel_params(kn1) is None:
+                kn1 = flydsl_kernel_name(
+                    1, _a_type, _w_type, _out_type, _tile_m, 128, 256
+                )
+            if get_flydsl_kernel_params(kn2) is None:
+                kn2 = flydsl_kernel_name(
+                    2, _a_type, _w_type, _out_type, _tile_m, 128, _s2_tk, "atomic"
+                )
+            logger.warning(
+                f"[fused_moe] no tuned FlyDSL config for {keys}, "
+                f"using gfx942 a16w4 FlyDSL fallback ({kn1=}, {kn2=})"
+            )
+            enable_bias = _needs_swiglu_bias_support(dtype, q_type)
+            return MOEMetadata(
+                functools.partial(
+                    _flydsl_stage1_wrapper,
+                    kernelName=kn1,
+                    activation=activation,
+                    inter_dim_pad=intermediate_pad,
+                    model_dim_pad=hidden_pad,
+                ),
+                functools.partial(
+                    _flydsl_stage2_wrapper,
+                    kernelName=kn2,
+                    inter_dim_pad=intermediate_pad,
+                    model_dim_pad=hidden_pad,
+                ),
+                _tile_m,
+                -1,  # split_k = -1; a16w-mix has no grid split-K
+                False,
+                has_bias=enable_bias,
+                stage2_has_bias=enable_bias,
+            )
+
         # Per token tier: (tile_m, stage1 suffix, stage2 suffix).
         if token < 2048:
             _tile_m, _s1_sfx, _s2_sfx = 32, "_w2", "_bnt2"

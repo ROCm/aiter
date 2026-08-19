@@ -10,6 +10,8 @@ from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
+from aiter.ops.flydsl.utils import addressable_lds_bytes_for_gfx
+
 from .utils import (
     _gep,
     _global_base_ptr1,
@@ -336,6 +338,14 @@ def compile_gemm2_a16w4_port(
     _a_bytes = BM * KH_TILE_BYTES
     _acc_bytes = BM * TILE_N * 4  # f32 accumulator region
     _lds_bytes = _a_bytes + _acc_bytes
+
+    # use_k16 is the gfx942/CDNA3 MFMA fallback; that arch has 64KiB LDS.
+    if use_k16:
+        _lds_lim = addressable_lds_bytes_for_gfx("gfx942")
+        assert _lds_bytes <= _lds_lim, (
+            f"gfx942 a16w4 gemm2 LDS={_lds_bytes} exceeds {_lds_lim} "
+            f"(BM={BM}, TILE_N={TILE_N}, TILE_K={TILE_K})"
+        )
 
     _wd_tag = "" if w_dtype == "fp4" else f"_{w_dtype}"
     _name = f"gemm2_a16w4{_wd_tag}_port_ne{NE}_h{N_OUT}_i{_K}_bm{BM}_tn{TILE_N}"

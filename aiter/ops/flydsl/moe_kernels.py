@@ -10,6 +10,7 @@ import re
 import torch
 
 from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
+from aiter.ops.flydsl.utils import addressable_lds_bytes_for_gfx
 
 _KERNEL_PARAMS: dict[str, dict] = {}
 
@@ -199,7 +200,13 @@ def get_flydsl_stage1_kernels(
 
     tile_ns = [32, 64, 128] if is_fp4_b else [128]
     tile_ks = [128, 256] if is_a16w4 else [256]
-    tile_ms = [16, 32, 64, 128] if a_dtype == "fp8" and is_fp4_b else [32, 64, 128]
+    # a16w4 BM%16==0; tile_m=16 is a legal decode tile (same port as a16wi4).
+    # gfx942 still drops tile_m=128 via a16w4_config_fits_device (64KiB LDS).
+    tile_ms = (
+        [16, 32, 64, 128]
+        if (a_dtype == "fp8" and is_fp4_b) or is_a16w4
+        else [32, 64, 128]
+    )
 
     waves_per_eus = [1, 2, 3, 4]
     k_batches = [1, 2, 4, 7, 14]
@@ -207,7 +214,10 @@ def get_flydsl_stage1_kernels(
     xcd_swizzles = [0, 1, 4] if is_a16w4 else [0, 4]
 
     for tm in tile_ms:
-        if tm == 32:
+        if is_a16w4:
+            # Full N set; num_acc_n + LDS drop illegal (tile_n, k_wave) pairs.
+            tile_ns = [16, 32, 64, 128, 256]
+        elif tm == 32:
             tile_ns = [32, 64, 128]
         else:
             tile_ns = [64, 128] if is_fp4_a else [128, 256]
@@ -236,13 +246,18 @@ def get_flydsl_stage1_kernels(
                                         base += "_gui"
                                     if xcd > 0:
                                         base += f"_xcd{xcd}"
-                                    # k_wave (intra-block K-slice): only for the
-                                    # small-M tile (tile_m==32), no split-K/mock,
-                                    # and capped to <=8 total waves (<=512 threads).
-                                    num_n_waves = min(4, tn // 32)
+                                    # k_wave (intra-block K-slice). a16w4 searches
+                                    # every BM the port accepts (16/32/64/128);
+                                    # other dtypes keep k_wave on tile_m==32 only.
+                                    # Capped to <=8 total waves (<=512 threads).
+                                    num_n_waves = min(4, max(tn // 32, 1)) if tn >= 16 else 0
                                     k_waves = (
                                         [1, 2, 4]
-                                        if (tm == 32 and kb == 1 and not go)
+                                        if (
+                                            kb == 1
+                                            and not go
+                                            and (tm == 32 or is_a16w4)
+                                        )
                                         else [1]
                                     )
                                     for kw in k_waves:
@@ -254,6 +269,14 @@ def get_flydsl_stage1_kernels(
                                             kw > 1
                                             and a_dtype == "fp8"
                                             and num_n_waves < 2
+                                        ):
+                                            continue
+                                        # a16w4 only: drop silent-zero tiles (num_acc_n==0)
+                                        # and configs that exceed this GPU's LDS
+                                        # (gfx942=64KiB). Other dtypes keep the
+                                        # gfx950 mixed_moe registry unchanged.
+                                        if is_a16w4 and not a16w4_config_fits_device(
+                                            1, tm, tn, tk, kw
                                         ):
                                             continue
                                         name = base + (f"_kw{kw}" if kw > 1 else "")
@@ -316,6 +339,16 @@ def get_flydsl_stage2_kernels(
                                 base_name += f"_bnt{bnt}"
                             if xcd > 0:
                                 base_name += f"_xcd{xcd}"
+                            # a16w4 gemm2 LDS = A tile + f32 acc. Filter on this
+                            # GPU so gfx942 never registers tile_m=128 / tile_n=256
+                            # names that overflow 64KiB. a8w4/a4w4 mixed_moe names
+                            # are not this formula — leave them alone.
+                            if (
+                                a_dtype == "bf16"
+                                and is_fp4
+                                and not a16w4_config_fits_device(2, tm, tn, tk)
+                            ):
+                                continue
                             base_params = {
                                 "stage": 2,
                                 "a_dtype": a_dtype,
@@ -460,7 +493,23 @@ def _register_production_variants_stage2(
 # gfx950 LDS budget per workgroup. A registered name whose LDS request exceeds this
 # is not merely slow, it fails to build ("local memory (N) exceeds limit"), so the
 # tuner never times it and the AOT precompile silently drops the config.
+# gfx942 (CDNA3) is 64KiB; see addressable_lds_bytes_for_gfx / a16w4_config_fits_device.
 _MAX_LDS_BYTES = 160 * 1024
+
+
+def _current_gfx() -> str:
+    """Best-effort runtime gfx id for LDS filtering (empty if unavailable)."""
+    try:
+        from flydsl.runtime.device import get_rocm_arch
+
+        return str(get_rocm_arch()).split(":")[0]
+    except Exception:
+        try:
+            from aiter.jit.utils.chip_info import get_gfx
+
+            return str(get_gfx() or "")
+        except Exception:
+            return ""
 
 
 def _gemm1_lds_bytes(tile_m: int, tile_n: int, tile_k: int, k_wave: int) -> int:
@@ -477,6 +526,55 @@ def _gemm1_lds_bytes(tile_m: int, tile_n: int, tile_k: int, k_wave: int) -> int:
     num_acc_n = (tile_n // (4 // k_wave)) // 16
     reduce_bytes = 4 * (num_acc_n * (tile_m // 16)) * 64 * 4 * 4
     return max(a_lds, reduce_bytes)
+
+
+def _gemm2_lds_bytes(tile_m: int, tile_n: int, tile_k: int) -> int:
+    """LDS bytes ``compile_gemm2_a16w4_port`` allocates: A tile + f32 acc overlay."""
+    return int(tile_m) * int(tile_k) * 2 + int(tile_m) * int(tile_n) * 4
+
+
+def _a16w4_num_acc_n(tile_n: int, k_wave: int = 1) -> int:
+    """MFMA N-tiles per wave. 0 => empty accumulate/store (silent zeros)."""
+    k_wave = max(int(k_wave), 1)
+    if 4 % k_wave:
+        return 0
+    n_waves = 4 // k_wave
+    if n_waves < 1 or int(tile_n) % n_waves:
+        return 0
+    return (int(tile_n) // n_waves) // 16
+
+
+def a16w4_config_fits_device(
+    stage: int,
+    tile_m: int,
+    tile_n: int,
+    tile_k: int,
+    k_wave: int = 1,
+    gfx: str | None = None,
+) -> bool:
+    """True if this a16w-mix tile is legal on ``gfx`` (num_acc_n and LDS).
+
+    gfx942 is 64KiB; gfx950 is 160KiB. Used by the a16w4 registry, tuner, and
+    heuristic so a name that cannot compile is never offered on that GPU.
+
+    If ``gfx`` cannot be resolved (AOT host without a GPU), the gfx950 budget
+    is used so CDNA4 CSV names stay registered; gfx942 still has the compile
+    assert in ``compile_gemm{1,2}_a16w4_port`` when ``use_k16`` is set.
+    """
+    if int(stage) == 1:
+        if _a16w4_num_acc_n(tile_n, k_wave) < 1:
+            return False
+        lds = _gemm1_lds_bytes(tile_m, tile_n, tile_k, k_wave)
+    else:
+        # gemm2: 4 waves split TILE_N; TILE_N//4 must be >= 16.
+        if int(tile_n) // 4 < 16:
+            return False
+        lds = _gemm2_lds_bytes(tile_m, tile_n, tile_k)
+    g = (gfx if gfx is not None else _current_gfx()) or ""
+    if not g.lower().startswith("gfx"):
+        g = "gfx950"
+    limit = addressable_lds_bytes_for_gfx(g)
+    return lds <= limit
 
 
 def get_flydsl_stage1_kernels_int4_bf16(out_dtype: str) -> dict[str, dict]:
@@ -549,8 +647,9 @@ def get_flydsl_stage2_kernels_int4_bf16(out_dtype: str) -> dict[str, dict]:
     so a key it omits is one the two sides default independently -- and ``b_nt`` is
     baked into the gemm2 kernel name, so disagreeing there is a run-only cache miss.
 
-    No ``_persist`` name is registered: ``_flydsl_moe_stage2_impl``'s a16w branch does
-    not forward ``persist`` to the port, so such a name would silently run non-persist.
+    No ``_persist`` name is registered here: int4 stage2 does not currently
+    opt into persist. a16w4 (fp4) stage2 *does* register ``_persist`` and the
+    a16w port forwards it to ``flydsl_a16w4_gemm2``.
     """
     kernels = {}
     a_dtype = "bf16"
@@ -1513,11 +1612,12 @@ def _flydsl_moe_stage1_impl(
 
     dev = a.device
     # a16w-mix ported gemm1: bf16 A x {mxfp4 (a16w4), int4 (a16wi4)} W -> bf16 sorted
-    # intermediate, threaded to stage2 unchanged. Tiles from the CSV kernelName;
-    # waves_per_eu=None (a no-_w name parses to wpe=1, a different kernel). Both
-    # w_dtypes consume the standard (GGUU) N-major preshuffle; a16wi4 W1 is the
-    # OLD-kernel int4 prep (pack_int8_to_packed_int4(shuffle_weight(w,(16,16)))) +
-    # (E,G//2,N,2) bf16 scale.
+    # intermediate, threaded to stage2 unchanged. Tiles from the CSV kernelName.
+    # Occupancy: a name without `_wN` is stored as waves_per_eu=1 meaning compiler
+    # default (pass None), not "pin to 1 wave/EU". Explicit `_w2/_w3/_w4` are
+    # forwarded. Both w_dtypes consume the standard (GGUU) N-major preshuffle;
+    # a16wi4 W1 is the OLD-kernel int4 prep
+    # (pack_int8_to_packed_int4(shuffle_weight(w,(16,16)))) + (E,G//2,N,2) bf16 scale.
     _is_a16w_port = a_dtype == "bf16" and b_dtype in ("fp4", "int4")
     if _is_a16w_port:
         from aiter.ops.flydsl.kernels.moe_2stage_a16wmix import flydsl_a16w4_gemm1
@@ -1553,7 +1653,7 @@ def _flydsl_moe_stage1_impl(
             k_batch=k_batch,
             b_nt=b_nt,
             xcd_swizzle=xcd_swizzle,
-            waves_per_eu=None,
+            waves_per_eu=waves_per_eu,
             act=_act,
             situ_beta=situ_beta,
             situ_linear_beta=situ_linear_beta,
@@ -2071,6 +2171,7 @@ def _flydsl_moe_stage2_impl(
             waves_per_eu=waves_per_eu,
             xcd_swizzle=xcd_swizzle,
             w_dtype=b_dtype,
+            persist=persist,
         )
         return out
 

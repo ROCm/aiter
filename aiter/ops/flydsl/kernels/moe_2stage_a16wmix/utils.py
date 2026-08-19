@@ -171,6 +171,55 @@ def _int4_nibble_to_bf16x8(raw_i32, scale_f32, *, use_k16=False, old_pack=False)
     return v4i32.bitcast(fx.BFloat16)  # v8bf16
 
 
+def _fp4x4_e2m1_to_f32x4(nib_i32):
+    """4 E2M1 nibbles (low nibble of each byte of ``nib_i32``) -> 4 unscaled f32.
+
+    gfx942 fast path from FlyDSL ``moe_gemm_2stage``: one ``v_perm_b32`` byte-LUT
+    gathers the E4M3FNUZ fp8 code for all 4 magnitudes, then hardware
+    ``cvt_pk_f32_fp8``. Replaces the per-nibble IEEE-bit + cmp/select decode
+    that was ~2.4x slower than int4. Sign is forced off when mag==0 so E2M1
+    -0.0 does not become FNUZ NaN (0x80).
+    """
+    mag = nib_i32 & fx.Int32(0x07070707)
+    # v_perm_b32 byte pool {SRC_HI:SRC_LO}: sel 0..3 -> SRC_LO, 4..7 -> SRC_HI.
+    # mag 0..7 -> fp8 0x00,0x38,0x40,0x44,0x48,0x4C,0x50,0x54 (E4M3FNUZ).
+    src_lo = fx.Int32(0x44403800)
+    src_hi = fx.Int32(0x54504C48)
+    magbyte = fx.Int32(rocdl.perm_b32(_raw(src_hi), _raw(src_lo), _raw(mag)))
+    nz = ((mag + fx.Int32(0x7F7F7F7F)).shrui(fx.Int32(7))) & fx.Int32(0x01010101)
+    signbit = (nib_i32 & fx.Int32(0x08080808)) << fx.Int32(4)
+    signmask = nz << fx.Int32(7)
+    fp8_i32 = magbyte | (signbit & signmask)
+    lo = fx.Vector(rocdl.cvt_pk_f32_fp8(T.f32x2, _raw(fp8_i32), False))
+    hi = fx.Vector(rocdl.cvt_pk_f32_fp8(T.f32x2, _raw(fp8_i32), True))
+    return (
+        fx.Float32(lo[0]),
+        fx.Float32(lo[1]),
+        fx.Float32(hi[0]),
+        fx.Float32(hi[1]),
+    )
+
+
+def _mxfp4_nibble_to_bf16x8(raw_i32, scale_f32):
+    """8 MXFP4 E2M1 nibbles in one i32 -> v8bf16.
+
+    gfx942 substitute for ``v_cvt_scalef32_pk_bf16_fp4`` (illegal on CDNA3).
+    Nibble *i* is bits ``[4*i : 4*i+4)``, matching gfx950 cvt sel order
+    (sel 0 = byte0 = K0,K1, ...). *scale_f32* is the E8M0 block scale, still
+    folded per element (same math as the previous select decode).
+    """
+    packed = fx.Int32(raw_i32)
+    even = packed & fx.Int32(0x0F0F0F0F)  # K0,K2,K4,K6
+    odd = packed.shrui(fx.Int32(4)) & fx.Int32(0x0F0F0F0F)  # K1,K3,K5,K7
+    fe = _fp4x4_e2m1_to_f32x4(even)
+    fo = _fp4x4_e2m1_to_f32x4(odd)
+    bf16s = []
+    for i in range_constexpr(4):
+        bf16s.append((fe[i] * scale_f32).to(fx.BFloat16))
+        bf16s.append((fo[i] * scale_f32).to(fx.BFloat16))
+    return fx.Vector.from_elements([_raw(x) for x in bf16s], fx.BFloat16)
+
+
 def _e8m0_byte_to_f32(packed_i32, byte_pos):
     shift = byte_pos * fx.Int32(8)
     b = packed_i32.shrui(shift) & fx.Int32(0xFF)
@@ -442,6 +491,11 @@ def make_b_loader(
 
     Returns a :class:`_BLoader`. The closures emit no IR until called, so building them
     here rather than inline in the kernel body does not perturb instruction order.
+
+    Cache-key note: FlyDSL hashes this factory's source (not nested ``upconvert_b``).
+    Decode edits live in ``_mxfp4_nibble_to_bf16x8`` / ``_fp4x4_e2m1_to_f32x4``; bump
+    this comment (or set FLYDSL_EXTRA_SOURCE_DIRS at this package) after those edits
+    so AOT cache cannot reuse the previous ISA. v_perm LUT decode, 2026-08-18.
     """
     _is_int4 = w_dtype == "int4"
     _is_bf16 = w_dtype == "bf16"
@@ -738,7 +792,10 @@ def make_b_loader(
             return _int4_nibble_to_bf16x8(
                 fx.Int32(i32_val), scale_f32, use_k16=use_k16, old_pack=True
             )
-        # raw[ku//4][ku%4] i32 holds 8 fp4 -> 4x cvt (v2bf16, sel 0..3) -> v8bf16.
+        # raw[ku//4][ku%4] i32 holds 8 fp4. gfx950: 4x v_cvt_scalef32_pk_bf16_fp4.
+        # gfx942 (use_k16): that cvt is illegal; software E2M1->bf16.
+        if const_expr(use_k16):
+            return _mxfp4_nibble_to_bf16x8(fx.Int32(i32_val), scale_f32)
         s_raw = _raw(scale_f32)
         i32s = []
         for sel in range_constexpr(4):
