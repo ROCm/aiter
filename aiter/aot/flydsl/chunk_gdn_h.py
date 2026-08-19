@@ -3,56 +3,15 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""AOT pre-compilation for the FlyDSL chunk-gated-delta-h (K5) kernels.
+"""AOT pre-compile FlyDSL chunk_gdn_h kernels (vk baseline + mfma16_hip fork).
 
-Two compiled products live behind K5 and this module builds both:
+``vk`` reads ``aiter/ops/flydsl/chunk_gdn_h_tuned.csv``; ``mfma16_hip`` reads
+``chunk_gdn_h_mfma16_hip_untuned.csv`` (+ ``model_configs/*``). Runtime BV
+lookup for mfma16_hip uses ``AITER_CONFIG_GDN_K5_MFMA16_HIP``.
 
-``vk``
-    The baseline kernel ``chunk_gdn_fwd_h_flydsl_vk``. Its table
-    ``aiter/ops/flydsl/chunk_gdn_h_tuned.csv`` is an AOT seed list only:
-    runtime BV comes from the ``_heuristic_bv`` rule, which was calibrated
-    against these very rows and never reads the file. Every row already
-    carries each compile-time switch, so a row *is* a compile job -- built
-    twice, ``STATE_DTYPE_BF16`` False (legacy f32-state path) and True
-    (``state_dtype=torch.bfloat16`` callers).
+Usage: ``python -m aiter.aot.flydsl.chunk_gdn_h [--kernel vk|mfma16_hip|all]``
 
-    That one-row-one-job shortcut is only sound while the rule keeps
-    agreeing with the ``BV`` column; today it does for all 26 rows.
-
-``mfma16_hip``
-    The mfma16 / HIP-aligned fork ``chunk_gdn_fwd_h_flydsl_mfma16_hip``,
-    which is what ``use_chunk_flydsl=True`` in
-    ``chunk_gated_delta_rule_fwd_opt_vk`` actually dispatches. Without it the
-    first prefill of every process pays ~2.3s of JIT (~0.1-0.3s even with a
-    warm disk cache). AOT reads ``aiter/configs/chunk_gdn_h_mfma16_hip_untuned.csv``
-    (untuned-style shape list); runtime BV lookup reads
-    ``aiter/configs/chunk_gdn_h_mfma16_hip_tuned.csv`` via ``AITER_CONFIGS``.
-    See ``parse_csv_mfma16_hip``.
-
-Usage:
-    # Compile both kernels from their default tables
-    python -m aiter.aot.flydsl.chunk_gdn_h
-
-    # One kernel only, optionally from custom csv file(s)
-    python -m aiter.aot.flydsl.chunk_gdn_h --kernel vk --csv /path/to/tuned.csv
-    python -m aiter.aot.flydsl.chunk_gdn_h --kernel mfma16_hip
-
-    # Cross-compile every entry for a different GPU arch (host need not
-    # be that GPU; FlyDSL emits ISA for the requested target).
-    python -m aiter.aot.flydsl.chunk_gdn_h --target-arch gfx942
-
-    # List the expanded jobs without compiling
-    python -m aiter.aot.flydsl.chunk_gdn_h --dry-run
-
-Environment variables:
-    FLYDSL_RUNTIME_CACHE_DIR  Cache directory (default: ~/.flydsl/cache)
-    ARCH / GPU_ARCHS          Target GPU architecture. For ``vk`` this is a
-                              logging hint only (its per-job arch comes from
-                              the csv ``arch`` column); for ``mfma16_hip`` it
-                              answers rows that leave ``arch`` empty.
-    FLYDSL_GPU_ARCH           Per-job arch override applied during compile;
-                              ``--target-arch`` takes precedence over both
-                              this env var and the ``arch`` column in csv.
+Environment: ``FLYDSL_RUNTIME_CACHE_DIR``, ``ARCH``/``GPU_ARCHS``, ``FLYDSL_GPU_ARCH``.
 """
 
 from __future__ import annotations
@@ -86,31 +45,18 @@ from aiter.ops.flydsl.kernels.chunk_gated_delta_h_mfma16x16x16 import (
 )
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
-# Default tuned table lives next to the kernel host wrapper.
 _DEFAULT_CSV = (
     Path(__file__).resolve().parents[2] / "ops" / "flydsl" / "chunk_gdn_h_tuned.csv"
 )
 DEFAULT_CSVS = [str(_DEFAULT_CSV)]
-CHUNK_GDN_H_AOT_ARCH_DEFAULT = "gfx950"
-# K5 ships a single kernel today; mirrors the ``@flyc.kernel(name=...)``
-# decorator in ``kernels/chunk_gated_delta_h.py`` so the AOT ``result`` dict
-# and any failure-mode print share one source of truth.
+_AOT_ARCH_DEFAULT = "gfx950"
 _KERNEL_NAME = "chunk_gdn_fwd_h_flydsl_vk"
 
-# Map jsonl ``dtype`` string -> torch dtype name used for dummy tensors.
-# Only bf16 is exercised by the kernel today (state_t is selected
-# separately via ``STATE_DTYPE_BF16``).
 _TORCH_DTYPE = {
     "torch.bfloat16": "bfloat16",
     "torch.float16": "float16",
 }
 
-# --------------------------------------------------------------------------
-# mfma16_hip fork
-# --------------------------------------------------------------------------
-
-# AOT untuned: canonical stub + ``model_configs/*_chunk_gdn_h_mfma16_hip_untuned.csv``.
-# Runtime BV: ``chunk_gdn_h_mfma16_hip_tuned.csv`` merged with model_configs via ``AITER_CONFIGS``.
 _DEFAULT_CSV_MFMA16_HIP = Path(
     f"{AITER_ROOT_DIR}/aiter/configs/chunk_gdn_h_mfma16_hip_untuned.csv"
 )
@@ -123,25 +69,12 @@ DEFAULT_CSVS_MFMA16_HIP = sorted(
         if p.is_file()
     }
 )
-# Used only when a csv row leaves ``arch`` empty and neither ARCH/GPU_ARCHS nor
-# a local GPU can answer.
-MFMA16_HIP_AOT_ARCH_DEFAULT = "gfx950"
-# Mirrors the ``@flyc.kernel(name=...)`` decorator in
-# ``kernels/chunk_gated_delta_h_mfma16x16x16.py``.
 _MFMA16_HIP_KERNEL_NAME = "chunk_gdn_fwd_h_flydsl_mfma16_hip"
-
-_MFMA16_HIP_TORCH_DTYPE = {"torch.bfloat16": "bfloat16"}
-# Mirrors ``_HIPEQ_BV_CANDIDATES`` in linear_attention_prefill_kernels.py; the
-# runtime picks one of these per batch, so all legal ones are pre-compiled.
 _BV_CANDIDATES = (64, 32, 16)
-
-# Compile both dtype / layout / state-index variants the wrapper may dispatch to.
 _SNAPSHOT_BF16 = (True, False)
 _STATE_BF16 = (False, True)
 _G_HEAD_MAJOR = (True, False)
 _USE_STATE_INDICES = (False, True)
-
-# Production dispatch pins from chunk.py (g_cumsum + use_exp2, no gk, save v_new).
 _FIXED_SWITCHES: dict[str, bool] = {
     "use_g": True,
     "use_gk": False,
@@ -209,7 +142,7 @@ def parse_csv(csv_path: str) -> list[dict[str, Any]]:
             try:
                 job = {
                     "dtype": dtype,
-                    "arch": row.get("arch") or CHUNK_GDN_H_AOT_ARCH_DEFAULT,
+                    "arch": row.get("arch") or _AOT_ARCH_DEFAULT,
                     "K": k,
                     "V": v,
                     "BT": int(row.get("BT") or 64),
@@ -381,7 +314,7 @@ def compile_one_config(
     **kwargs,
 ) -> dict:
     """Compile one chunk-gdn-h configuration and save it to cache."""
-    aot_arch = arch or CHUNK_GDN_H_AOT_ARCH_DEFAULT
+    aot_arch = arch or _AOT_ARCH_DEFAULT
     shape_str = _format_shape_str(
         {
             "K": K,
@@ -444,13 +377,7 @@ def _detected_arch() -> str | None:
 
 
 def _resolve_archs(row_arch: str | None) -> list[str]:
-    """Arch list for one mfma16_hip csv row: explicit column, else
-    ARCH/GPU_ARCHS, else the host GPU, else ``MFMA16_HIP_AOT_ARCH_DEFAULT``.
-
-    Unlike the tuned tables of the other AOT kinds, nothing in this csv is
-    arch-specific measurement data, so the sensible default is "whatever this
-    build targets" rather than a literal baked into the file.
-    """
+    """Row arch column, else ARCH/GPU_ARCHS, else host GPU, else ``_AOT_ARCH_DEFAULT``."""
     for raw in (row_arch, os.environ.get("ARCH"), os.environ.get("GPU_ARCHS")):
         if not raw or not raw.strip():
             continue
@@ -460,24 +387,18 @@ def _resolve_archs(row_arch: str | None) -> list[str]:
         archs = [a for a in archs if a.startswith("gfx")]
         if archs:
             return list(dict.fromkeys(archs))
-    return [_detected_arch() or MFMA16_HIP_AOT_ARCH_DEFAULT]
+    return [_detected_arch() or _AOT_ARCH_DEFAULT]
 
 
 def parse_csv_mfma16_hip(csv_path: str) -> list[dict[str, Any]]:
-    """Expand the mfma16_hip untuned table into unique compile jobs.
-
-    Rows collapse to their distinct ``(arch, dtype, K, V, BT, H, Hg, is_varlen,
-    use_h0, store_fs)`` shapes -- the untuned table has one row per AOT-covered
-    compile shape. Each shape then fans out over every legal BV and both dtype
-    specializations.
-    """
+    """Expand mfma16_hip untuned rows into compile jobs (BV/dtype/layout fan-out)."""
     shapes: dict[tuple, None] = {}
 
     with open(csv_path, "r", encoding="utf-8", newline="") as f:
         rows = csv.DictReader(line for line in f if not line.lstrip().startswith("#"))
         for row in rows:
             dtype = (row.get("dtype") or "torch.bfloat16").strip()
-            if dtype not in _MFMA16_HIP_TORCH_DTYPE:
+            if dtype not in _TORCH_DTYPE:
                 print(f"  [WARN] Unsupported dtype {dtype!r}, skipping")
                 continue
 
@@ -544,18 +465,6 @@ def parse_csv_mfma16_hip(csv_path: str) -> list[dict[str, Any]]:
     return jobs
 
 
-def _torch_dtype_for_mfma16_hip(dtype_str: str):
-    import torch
-
-    name = _MFMA16_HIP_TORCH_DTYPE.get(dtype_str)
-    if name is None:
-        raise ValueError(
-            f"Unsupported torch dtype name for chunk_gdn_h mfma16_hip AOT: "
-            f"{dtype_str!r}"
-        )
-    return getattr(torch, name)
-
-
 def _compile_mfma16_hip_to_cache(
     *,
     dtype: str,
@@ -586,17 +495,13 @@ def _compile_mfma16_hip_to_cache(
     import torch
 
     dev = torch.device("cpu")
-    torch_dtype = _torch_dtype_for_mfma16_hip(dtype)
+    torch_dtype = _torch_dtype_for_kernel(dtype)
     state_dtype = torch.bfloat16 if state_bf16 else torch.float32
     snapshot_dtype = torch.bfloat16 if snapshot_bf16 else torch.float32
 
-    # Smallest shape consistent with BT divisibility: only dtype and rank of
-    # each slot reach the compiled artifact, T_flat/N shape the host grid.
     N = B = NT = 1
     T = T_flat = BT
 
-    # Disabled slots take the same 1-element placeholders the wrapper passes,
-    # so the AOT product keys on the same argument signature as the runtime.
     dummy = torch.empty(1, device=dev, dtype=torch.float32)
     int32_dummy = torch.empty(1, device=dev, dtype=torch.int32)
 
@@ -648,8 +553,6 @@ def _compile_mfma16_hip_to_cache(
         SNAPSHOT_DTYPE_BF16=snapshot_bf16,
         G_IS_LOG2_SCALED=g_log2_scaled,
         USE_STATE_INDICES=use_state_indices,
-        # Must track the compile target, not the build host: the runtime keys
-        # this off its own arch (``_IS_GFX942``), so a mismatch is a cache miss.
         SCHED_GFX942=arch.startswith("gfx942"),
         G_HEAD_MAJOR=g_head_major,
         BF16_CONVERT_TRUNC=bf16_convert_trunc,
@@ -694,7 +597,7 @@ def _format_shape_str_mfma16_hip(job: dict) -> str:
 
 def compile_one_config_mfma16_hip(*, arch: str, **kwargs) -> dict:
     """Compile one mfma16_hip configuration and save it to cache."""
-    aot_arch = arch or MFMA16_HIP_AOT_ARCH_DEFAULT
+    aot_arch = arch or _AOT_ARCH_DEFAULT
     kwargs.pop("kernel_name", None)
     shape_str = _format_shape_str_mfma16_hip(kwargs)
     result = {
@@ -739,8 +642,6 @@ class _KernelSpec:
     parse_csv: Callable[[str], list[dict[str, Any]]]
     compile_one_config: Callable[..., dict[str, Any]]
     format_shape: Callable[[dict[str, Any]], str]
-    # Post-parse fan-out that only a standalone run gets. ``mfma16_hip`` does
-    # its fan-out inside parse_csv instead, so the wheel build sees it too.
     expand_jobs: Callable[[list[dict[str, Any]]], list[dict[str, Any]]] | None = None
 
 
