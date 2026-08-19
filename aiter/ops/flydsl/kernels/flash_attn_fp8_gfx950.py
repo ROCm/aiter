@@ -21,7 +21,6 @@ import flydsl.expr as fx
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr.typing import T
-from flydsl.expr.utils.arith import ArithValue
 from flydsl.expr.utils.arith import _to_raw as _raw
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 
@@ -39,7 +38,6 @@ from aiter.ops.flydsl.kernels.flash_attn_dualwave_common import (
     _make_dualwave_swp_fp8_traits,
     _sched_barrier_pairs,
     dtype_to_elem_type,
-    dualwave_splitk_workspace_elems,  # noqa: F401
     stagger_extra_barrier_if_one,
     stagger_extra_barrier_if_zero,
     waitcnt_vm_n,
@@ -376,7 +374,7 @@ def build_flash_attn_dualwave_swp_fp8_module(
             return m_tile
 
         def _main_body():
-            kv_gmem_to_lds.load_k(t0 * BN, t0 % fx.Index(NPF))
+            kv_gmem_to_lds.load_k(t0 * BN, fx.Int32(t0) % fx.Int32(NPF))
             q_loader.stage_q_to_lds()
             rocdl.s_waitcnt(0)
             rocdl.sched_barrier(0)
@@ -387,13 +385,13 @@ def build_flash_attn_dualwave_swp_fp8_module(
 
             q_wide = gemm_helper.load_q_wide() if const_expr(traits.QREG) else None
 
-            kv_gmem_to_lds.load_k((t0 + 1) * BN, (t0 + 1) % fx.Index(NPF))
-            kv_gmem_to_lds.load_v(t0 * BN, t0 % fx.Index(NPF))
-            kv_gmem_to_lds.load_v((t0 + 1) * BN, (t0 + 1) % fx.Index(NPF))
-            kv_gmem_to_lds.load_k((t0 + 2) * BN, (t0 + 2) % fx.Index(NPF))
-            kv_gmem_to_lds.load_k((t0 + 3) * BN, (t0 + 3) % fx.Index(NPF))
-            kv_gmem_to_lds.load_v((t0 + 2) * BN, (t0 + 2) % fx.Index(NPF))
-            kv_gmem_to_lds.load_v((t0 + 3) * BN, (t0 + 3) % fx.Index(NPF))
+            kv_gmem_to_lds.load_k((t0 + 1) * BN, fx.Int32(t0 + 1) % fx.Int32(NPF))
+            kv_gmem_to_lds.load_v(t0 * BN, fx.Int32(t0) % fx.Int32(NPF))
+            kv_gmem_to_lds.load_v((t0 + 1) * BN, fx.Int32(t0 + 1) % fx.Int32(NPF))
+            kv_gmem_to_lds.load_k((t0 + 2) * BN, fx.Int32(t0 + 2) % fx.Int32(NPF))
+            kv_gmem_to_lds.load_k((t0 + 3) * BN, fx.Int32(t0 + 3) % fx.Int32(NPF))
+            kv_gmem_to_lds.load_v((t0 + 2) * BN, fx.Int32(t0 + 2) % fx.Int32(NPF))
+            kv_gmem_to_lds.load_v((t0 + 3) * BN, fx.Int32(t0 + 3) % fx.Int32(NPF))
             # The first loop iteration reads only K1, V0, V1 -- the first three
             # of the seven staged above, and vmcnt retires in issue order, so
             # vmcnt(4) covers exactly them. K2/K3/V2/V3 stay in flight; they are
@@ -437,23 +435,26 @@ def build_flash_attn_dualwave_swp_fp8_module(
             l_row = ctx.c_zero_f
             v_o = [ctx.c_zero_v16f32 for _ in range_constexpr(D_CHUNKS)]
 
-            NPF_I = const_expr(fx.Index(NPF))
+            NPF_I = const_expr(fx.Int32(NPF))
 
             def _ring_wrap(x):
                 return (x >= NPF_I).select(x - NPF_I, x)
 
-            init_args = [m_row, l_row] + v_o + [t0 % fx.Index(NPF)]
+            init_args = [m_row, l_row] + v_o + [fx.Int32(t0) % fx.Int32(NPF)]
             loop_results = init_args
-            for j, loop_args in range(fx.Index(t0), t_end, fx.Index(2), init=init_args):
+            for j, loop_args in range(t0, t_end, fx.Int64(2), init=init_args):
+                # range lowers to scf.for, whose induction var is index-typed; the
+                # tile counter is a bounded Int32 (widened where it feeds addressing).
+                j = fx.Int32(j)
                 m_row = loop_args[0]
                 l_row = loop_args[1]
                 v_o = [loop_args[2 + i] for i in range_constexpr(D_CHUNKS)]
 
                 a_buf = loop_args[2 + D_CHUNKS]
-                b_buf = _ring_wrap(a_buf + fx.Index(1))
-                nn_a_buf = _ring_wrap(a_buf + fx.Index(2))
-                f_a_buf = _ring_wrap(a_buf + fx.Index(4))
-                f_b_buf = _ring_wrap(a_buf + fx.Index(5))
+                b_buf = _ring_wrap(a_buf + fx.Int32(1))
+                nn_a_buf = _ring_wrap(a_buf + fx.Int32(2))
+                f_a_buf = _ring_wrap(a_buf + fx.Int32(4))
+                f_b_buf = _ring_wrap(a_buf + fx.Int32(5))
 
                 # Eight clusters, memory and compute strictly alternating, one
                 # barrier each. Mirrors the upstream bf16 kernel's decomposition, which
@@ -493,7 +494,7 @@ def build_flash_attn_dualwave_swp_fp8_module(
                 # it: its scf.if is gated on a per-wave ballot, so waves can
                 # diverge there and a barrier would deadlock.
                 v_s_b = gemm_helper.qk(v_k_b, q_wide)
-                v_s_b = _mask_sub(v_s_b, j + fx.Index(1))
+                v_s_b = _mask_sub(v_s_b, j + fx.Int32(1))
                 v_s_a, v_s_b = _mask_pair(v_s_a, v_s_b, j)
                 m_tile = _merge_tile_max(v_s_a, v_s_b)
                 v_o, m_new, l_row = softmax_helper.lazy_correct_o(
@@ -513,8 +514,8 @@ def build_flash_attn_dualwave_swp_fp8_module(
                 # the last iterations fetch tiles past t_end -- a fixed 4-tile
                 # overshoot, left unclamped: the kernel is latency-bound, so the
                 # overshoot is absorbed by ring slack.
-                pf_a = j + fx.Index(4)
-                pf_b = j + fx.Index(5)
+                pf_a = fx.Int64(j) + fx.Int64(4)
+                pf_b = fx.Int64(j) + fx.Int64(5)
                 # Resolve both prefetch page ids under ONE lgkmcnt(0) drain, and
                 # reuse them for the V half at C6. K and V for a given tile
                 # resolve the SAME page id, so batching the lookups avoids
@@ -561,11 +562,9 @@ def build_flash_attn_dualwave_swp_fp8_module(
             if const_expr(traits.USE_SINKS):
                 l_row = fx.Float32(softmax_helper.add_sink_denom(l_row, m_row))
             inv_l_rcp = rocdl.rcp(T.f32, _raw(l_row))
-            inv_l = ArithValue(fx.Float32(l_row) > ctx.c_zero_f).select(
-                inv_l_rcp, ctx.c_zero_f
-            )
+            inv_l = (fx.Float32(l_row) > ctx.c_zero_f).select(inv_l_rcp, ctx.c_zero_f)
             if const_expr(traits.FP8_PV):
-                inv_l = ArithValue(inv_l) * ctx.vd_fp8
+                inv_l = fx.Float32(inv_l) * ctx.vd_fp8
             softmax_helper.scale_o(v_o, inv_l)
             # Close the phase shift: group A takes the barrier group B took in
             # the prologue, so both groups have executed the same number over
@@ -636,7 +635,7 @@ def build_flash_attn_dualwave_swp_fp8_module(
         # blocks, so the last block can carry rows past combine_rows (when
         # combine_rows isn't a multiple of 8) -- guard those into a no-op
         # rather than reading/writing past the workspace/O bounds.
-        row_active = ctx.row < fx.Index(combine_rows)
+        row_active = ctx.row < combine_rows
 
         @flyc.jit
         def _run_combine_if_active():
@@ -675,8 +674,8 @@ def build_flash_attn_dualwave_swp_fp8_module(
     ):
         # Make shape/mode traits visible to the JIT cache key.
         _ = _dualwave_swp_fp8_cache_tag
-        bs_idx = fx.Index(batch_size)
-        sl_idx = fx.Index(seq_len)
+        bs_idx = fx.Int64(batch_size)
+        sl_idx = fx.Int64(seq_len)
         # Blocks span BLOCK_Q query POSITIONS (== BLOCK_M when not packing).
         num_q_blocks = (sl_idx + BLOCK_Q - 1) // BLOCK_Q
         if const_expr(SPLITK):
@@ -732,8 +731,8 @@ def build_flash_attn_dualwave_swp_fp8_module(
             # combine_rows < 8 launch still gets one active block instead of a
             # zero-size grid.
             combine_grid_x = (
-                combine_rows + fx.Index(COMBINE_ROWS_PER_BLOCK) - fx.Index(1)
-            ) // fx.Index(COMBINE_ROWS_PER_BLOCK)
+                combine_rows + fx.Int32(COMBINE_ROWS_PER_BLOCK) - fx.Int32(1)
+            ) // fx.Int32(COMBINE_ROWS_PER_BLOCK)
             flash_attn_splitk_combine_kernel(
                 O,
                 DebugCounts,

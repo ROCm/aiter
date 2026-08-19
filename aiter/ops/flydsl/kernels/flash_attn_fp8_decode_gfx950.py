@@ -718,7 +718,7 @@ def build_flash_attn_fp8_decode_module(
             seq_len_kv,
             bt_stride,
         ).launch(
-            grid=(HKV, fx.Index(batch_size), SPLK),
+            grid=(HKV, batch_size, SPLK),
             block=(NW * WARP, 1, 1),
             stream=stream,
         )
@@ -818,7 +818,7 @@ def build_flash_attn_fp8_decode_module(
     ):
         _ = _cache_tag
         combine_kernel(o_ptr, ws_ptr, vd_ptr, cuq_ptr).launch(
-            grid=(HKV, fx.Index(batch_size), 1),
+            grid=(HKV, batch_size, 1),
             block=(WARP, 1, 1),
             stream=stream,
         )

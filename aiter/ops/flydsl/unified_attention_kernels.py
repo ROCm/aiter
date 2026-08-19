@@ -14,8 +14,10 @@ config, falling through to Triton unchanged (matches
 ``ops/gemm_op_a8w8.py``) -- deliberately no dispatch env var, since a code gate
 states an arch/shape-scoped choice more honestly than another undocumented
 backend flag. Force Triton by setting ``_FLYDSL_UNIFIED_ATTN_ARCH`` to ``False`` in
-the Triton module. The one tuning knob is the split-count cap,
-``AITER_UNIFIED_ATTN_MAX_KV_SPLITS`` (see ``_MAX_SEGMENTS``).
+the Triton module. Two env knobs govern dispatch: the split-count cap,
+``AITER_UNIFIED_ATTN_MAX_KV_SPLITS`` (see ``_MAX_SEGMENTS``), and
+``AITER_DECODE_KERNEL``, the decode-kernel on/off master switch (see
+``_USE_DECODE_KERNEL``).
 
 Two tiers chosen at call time from the machine-fill deficit (``_split_count``
 and the gate in ``flydsl_unified_attention``), not from all-decode-ness: an
@@ -505,15 +507,15 @@ def _strides_ok(
     return block_table.stride(1) == 1
 
 
-def _dispatch_mode_ok(window_size, block_table, shuffled_kv_cache, skip_reduce) -> bool:
+def _dispatch_mode_ok(window_size, block_table, skip_reduce) -> bool:
     """Paged, full-window, non-reduce. The reduce flag belongs to a Triton
     layout this kernel does not read; the paged path is the only one wired
     here. (Causal and non-causal are both built.)
 
-    ``shuffled_kv_cache`` is accepted: the vectorized K and V loaders are both
-    correctness-validated against a torch reference, and
-    ``_get_kernel``/``_strides_ok`` route a shuffled call to the vectorized
-    builder and validate its 5D K/V shape.
+    ``shuffled_kv_cache`` is accepted unconditionally by design, not gated
+    here: the vectorized K and V loaders are both correctness-validated
+    against a torch reference, and ``_get_kernel``/``_strides_ok`` route a
+    shuffled call to the vectorized builder and validate its 5D K/V shape.
     """
     return window_size[0] < 0 and block_table is not None and not skip_reduce
 
@@ -608,7 +610,6 @@ def _supported(
     cu_seqlens_q,
     seqused_k,
     max_seqlen_k,
-    causal,
     window_size,
     block_table,
     softcap,
@@ -628,7 +629,8 @@ def _supported(
     skip_reduce,
 ) -> bool:
     """Whether this exact configuration can be served. Kept separate from the
-    marshalling so it can be unit-tested against meta tensors, with no GPU."""
+    marshalling so it can be unit-tested against meta tensors, with no GPU.
+    Causal and non-causal are both built, so this gate does not branch on it."""
     if not is_flydsl_available():
         return False
 
@@ -636,7 +638,7 @@ def _supported(
     num_query_heads = q.shape[1]
 
     return (
-        _dispatch_mode_ok(window_size, block_table, shuffled_kv_cache, skip_reduce)
+        _dispatch_mode_ok(window_size, block_table, skip_reduce)
         and _page_geometry_ok(block_size, max_seqlen_k)
         and _dtypes_ok(q, k, v, out, cu_seqlens_q, seqused_k, block_table)
         and _descales_ok(q_descale, k_descale, v_descale)
@@ -825,7 +827,6 @@ def flydsl_unified_attention(
         cu_seqlens_q,
         seqused_k,
         max_seqlen_k,
-        causal,
         window_size,
         block_table,
         softcap,
