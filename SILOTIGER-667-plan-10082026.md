@@ -30,7 +30,7 @@ following **gaps** (things the reference has that the WIP does not) and **diverg
 | G3 | **BF16-weight path** (`w_dtype="bf16"`) | ✅ (dot2 + scalar) | ❌ FP8-only | scaffold / gfx942 |
 | G4 | **gfx942 / scalar-f32 fallback** (`use_dot2=False`) | ✅ auto-arch | ❌ gfx950-only | portability |
 | G5 | **Split-K** (`k_batch`) + zero-init fusion | ✅ (gate_up 2-phase, down) | ⊘ evaluated — no-win, gated-off, not shipped (attic branch) | ticket lever (closed) |
-| G6 | **LDS cooperative caching** (`n_waves`) | ✅ (down; gate_up dead) | ❌ | ticket lever |
+| G6 | **LDS cooperative caching** (`n_waves`) | ✅ (down; gate_up dead) | ⊘ evaluated — no-win by feasibility (latency-floor bound), not built | ticket lever (closed) |
 | G7 | **s_nop-free / independent-accumulator dot2 (ILP)** | ✅ (fp8/fp4) | ❌ serialized `s_nop 2` | perf (deferred) |
 | G8 | **Software-pipelined weight prefetch** | ✅ (bf16 dot2; fp4 `down` flag) | ❌ default (knob) | **perf: ~5% B=1 fp4**, neutral B≥4 |
 | G9 | **CK-Tile cross-benchmark harness** | ✅ (`ck_bench_*.cpp` + compare) | ✅ (`compare.py` + `g9_compare` of-record) | **done** — 0 n/a, all 15 cells (2026-08-18) |
@@ -374,7 +374,7 @@ shapes only DeepSeek passes 2 GB (3.74 GB) and its dword index (9.35e8) is still
       1.000000`** — the gfx942 scalar math is validated on gfx950 without MI300 hardware.
       (Representative gfx942 *perf* still needs real MI300; this covers correctness only.)
 
-### Phase D — Occupancy levers: split-K + LDS (G5, G6)  [ ]
+### Phase D — Occupancy levers: split-K + LDS (G5, G6)  [x]  ← both closed as no-wins
 > **Split-K (G5) is tracked in its own sub-plan:**
 > [`SILOTIGER-667-plan-Split-K.md`](./SILOTIGER-667-plan-Split-K.md) (steps + status).
 - [~] **Split-K** (`k_batch`) — **evaluated & closed as a no-win (2026-08-11); not shipped.**
@@ -385,10 +385,32 @@ shapes only DeepSeek passes 2 GB (3.74 GB) and its dword index (9.35e8) is still
       default; live impl **archived on `samaario/warp-decode-moe-splitk-attic`**, not in main. gate_up
       2-phase split-K + zero-init folding **not pursued** (same physics). See
       [`SILOTIGER-667-plan-Split-K.md`](./SILOTIGER-667-plan-Split-K.md).
-- [ ] **LDS `n_waves`** cooperative activation staging for down (and a real gate_up
-      implementation, which the reference left as dead params). Guard: `inter %
-      (n_waves*WAVE_SIZE*2) == 0`.
-- [ ] Benchmark on small-grid Qwen (INTER=512/256/128, B=1) where these should pay.
+- [x] **LDS `n_waves` cooperative staging — closed as a predicted no-win by feasibility
+      analysis (2026-08-19); not built.** LDS staging is an *occupancy* lever, so per the §9
+      guidance it was gated on first isolating the small-grid case. **Measured the smallest-grid
+      production shape (Qwen3Next-TP1 H2048/I512/TOPK10) at low B, warm** (gfx950, CU=256, device
+      timing) to test the occupancy-headroom premise:
+
+      | B | gate_up grid (waves/CU) | gate_up µs | down grid (waves/CU) | down µs |
+      |---|-------------------------|-----------|----------------------|---------|
+      | 1 | 5120 (**20×**) | 5.03 | 1024 (**4×**) | 4.13 |
+      | 2 | 10240 (40×) | 6.60 | 2048 (8×) | 5.31 |
+      | 4 | 20480 (80×) | 9.41 | 4096 (16×) | 7.50 |
+      | 8 | 40960 (160×) | 14.50 | 8192 (32×) | 12.19 |
+
+      **Both stages are launch/memory-latency-floor bound, not occupancy-starved** — the exact
+      physics that closed split-K (G5). Even at B=1 the grid already gives 20 waves/CU (gate_up) /
+      4 waves/CU (down), and time is dominated by a ~4–5 µs fixed floor (µs/B falls 5.03→1.54 and
+      4.13→1.16 as B grows 1→32, i.e. work grows 32× but time only ~9×). LDS cooperative caching
+      targets redundant *activation* loads, but (a) it can't lower that latency floor at the decode
+      B's that matter, and (b) the **weights dominate the cold BW** (the cold A/B win came entirely
+      from FP4 halving *weight* bytes; the activation chunk is tiny by comparison). So there is no
+      occupancy headroom or activation-traffic upside for LDS to capture. Closed by analysis rather
+      than building the kernel (avoids repeating the split-K effort for another negative). Repro:
+      `/tmp/g6_feasibility.py`.
+- [x] Benchmark on small-grid Qwen (INTER=512/256/128, B=1) — done (table above). INTER=256/128
+      are sub-`pick_kvector` for `down` (needs INTER%512) so aren't runnable there; INTER=512 (the
+      real Qwen shape) is the binding small-grid case and it's already latency-floor bound.
 
 ### Phase E — Perf scheduling: ILP dot2 + prefetch (G7, G8)  [x]
 - [x] **G7 selectable s_nop-free dot2 landed on FP8 (2026-08-19).** Added `dot2_acc` to
@@ -622,8 +644,9 @@ bench/tune target; verify against the shipped weights before publishing numbers.
 - [resolved for split-K] Split-K / LDS were expected to pay only in the **occupancy-bound**
   regime (small-grid Qwen, low B). **Split-K (G5) measured → no-win even there**: B=1 warp-decode
   is launch/memory-latency-floor bound, so partitioning the contraction can't cut the ~4.4µs floor
-  (closed, gated-off). **LDS (G6) still open** and likely shares this fate at B=1 — isolate the
-  small-grid case before investing.
+  (closed, gated-off). **LDS (G6) — now also closed (2026-08-19)**: the small-grid Qwen isolation
+  (Phase D) confirmed it shares split-K's fate — Qwen3Next B=1 is already 4–20 waves/CU and latency-
+  floor bound (~4–5 µs fixed), so LDS cooperative staging has no occupancy headroom to capture.
 - [resolved, keep] Convert scale is **exponent-only (E8M0)** — see §2.
 
 ## 10. Changelog
@@ -707,3 +730,14 @@ bench/tune target; verify against the shipped weights before publishing numbers.
   decisive no-win; defaults stay `dot2_acc=1`, knob ships OFF** (retained for A/B only). Closes Phase E
   (G8 prefetch already done). **Remaining in-scope: Phase D LDS (G6) — flagged in §9 as a likely B=1
   no-win; isolate the small-grid case first.**
+- _G6 LDS closed as a predicted no-win by feasibility analysis (2026-08-19)_ — before building,
+  isolated the smallest-grid production shape (Qwen3Next-TP1 H2048/I512/TOPK10) per the §9 guidance.
+  At B=1 the grid already gives 20 waves/CU (gate_up) / 4 waves/CU (down) on CU=256, and both stages
+  are launch/memory-latency-floor bound (~4–5 µs fixed floor; 32× work → ~9× time), not occupancy-
+  starved — the same physics that closed split-K (G5). LDS cooperative *activation* staging can't
+  lower that floor and the weights dominate cold BW, so there's no upside to capture. Closed by
+  analysis (not built). Repro `/tmp/g6_feasibility.py`. **Phase D now `[x]` (both occupancy levers
+  evaluated & closed as no-wins). Net: Phases A–F all `[x]` — the SILOTIGER-667 convergence is
+  functionally complete** (ticket-critical FP4 #1 win, real-E, gfx942 fallback, and G9 CK validation
+  all shipped; the three perf levers G5/G6/G7 were each measured and closed as decode no-wins, with
+  G8 prefetch retained as a B≤2 knob).
