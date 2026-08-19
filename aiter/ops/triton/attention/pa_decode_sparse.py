@@ -663,8 +663,7 @@ def _pa_decode_sparse_gfx950_gluon(
         avg_main = indices.numel() / max(1, num_queries)
         avg_extra = extra_indices.numel() / max(1, num_queries) if has_extra else 0.0
 
-    # Kernel-side cache-format tags (the kernel is shared with the separated-rope
-    # GLM/MLA path in sparse_mla_decode.py; DSv4 always runs ROPE_SEPARATE=False).
+    # Kernel-side cache-format tags (kernel shared with sparse_mla_decode.py).
     if UNIFORM:
         main_fmt = "uniform" if main_is_fp8 else "bf16"
         extra_fmt = main_fmt
@@ -898,9 +897,8 @@ def _pa_decode_sparse_gfx950_gluon(
         part_m,
         part_l,
         part_acc,
-        # f32 side-channel pointers (per-tensor k_scale / fp8_ds_mla view) --
-        # only the separated-rope formats use them; None keeps the DSv4
-        # kernarg layout byte-identical (constexpr-None args are elided).
+        # f32 scale pointers (separated-rope formats only); None is elided,
+        # keeping the DSv4 kernarg layout unchanged.
         None,
         None,
         scale,
