@@ -85,24 +85,19 @@ def stage2_cfg_values(cfg: dict, block_m) -> dict[str, object]:
         opus_a8w4_kid_reduce_block_n,
         opus_a8w4_kid_sort_block_m,
         opus_a8w4_kid_uses_route,
-        opus_a8w4_reduce_block_n_from_name,
     )
 
     sort_block_m = _cfg_int(block_m, _DEFAULT_SORT_BLOCK_M)
-    # Preferred path: explicit per-kid name encodes mode (atomic/bf16/fp8) + block_m,
-    # so a single kernelName2 column fully selects the kernel (FlyDSL-style).
+    # Exact kernelName2 lookup selects one kid and its fixed launch settings.
     name = _cfg_str(_cfg_first(cfg, "kernelName2", "kernel_name2", "stage2_kernel"))
     kid = opus_a8w4_kid_from_name(name)
     if kid is not None:
-        reduce_block_n = opus_a8w4_reduce_block_n_from_name(name)
-        if reduce_block_n is None:
-            reduce_block_n = opus_a8w4_kid_reduce_block_n(kid)
         return {
             "kernel_id": kid,
             "stage2_block_m": opus_a8w4_kid_block_m(kid),
             "stage2_sort_block_m": opus_a8w4_kid_sort_block_m(kid),
             "route_out": opus_a8w4_kid_uses_route(kid),
-            "stage2_reduce_block_n": reduce_block_n,
+            "stage2_reduce_block_n": opus_a8w4_kid_reduce_block_n(kid),
         }
     # Legacy fallback: explicit numeric columns.
     kernel_id = _cfg_int(

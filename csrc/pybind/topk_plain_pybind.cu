@@ -3,6 +3,7 @@
 */
 #include "topk_plain.h"
 #include "rocm_ops.hpp"
+#include "aiter_stream.h"
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
