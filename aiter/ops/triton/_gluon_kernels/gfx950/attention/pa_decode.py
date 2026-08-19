@@ -9,7 +9,13 @@ import triton.language as tl
 from triton.language.extra.hip import libdevice as hip_libdevice
 
 import aiter
+from aiter.ops.triton._gluon_kernels._triton_version import require_gluon_triton
 from aiter.ops.triton.utils._triton import arch_info
+
+# These kernels came from aiter/ops/triton/gluon/, whose package __init__ enforced
+# triton>=3.6. Keep that gate on them without extending it to the rest of
+# _gluon_kernels, which was never behind it.
+require_gluon_triton()
 
 CXX_PS_REDUCE_AVAILABLE = True
 try:

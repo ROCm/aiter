@@ -10,10 +10,16 @@ from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 from triton.runtime.jit import constexpr_function
 
+from aiter.ops.triton._gluon_kernels._triton_version import require_gluon_triton
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
 from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH, load_config_json
 from aiter.ops.triton.utils.logger import AiterTritonLogger
+
+# These kernels came from aiter/ops/triton/gluon/, whose package __init__ enforced
+# triton>=3.6. Keep that gate on them without extending it to the rest of
+# _gluon_kernels, which was never behind it.
+require_gluon_triton()
 
 _LOGGER = AiterTritonLogger()
 

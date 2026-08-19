@@ -8,6 +8,13 @@ import triton.language as tl
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
+from aiter.ops.triton._gluon_kernels._triton_version import require_gluon_triton
+
+# These kernels came from aiter/ops/triton/gluon/, whose package __init__ enforced
+# triton>=3.6. Keep that gate on them without extending it to the rest of
+# _gluon_kernels, which was never behind it.
+require_gluon_triton()
+
 try:
     from triton.experimental.gluon.language.amd.cdna3 import (
         s_set_prio as _amd_s_set_prio,
