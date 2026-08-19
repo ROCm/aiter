@@ -118,6 +118,46 @@ def dot2_f32_bf16_drain(pairs, *, n_acc: int = 4):
     return total.ir_value()
 
 
+def dot2_f32_bf16_scalar(a_i32, b_i32, acc_f32):
+    """Arch-agnostic ``d = a.lo*b.lo + a.hi*b.hi + acc`` in pure f32 (the gfx942 path).
+
+    The scalar fallback for :func:`dot2_f32_bf16`: it reinterprets each i32 as its two
+    packed bf16 lanes, widens them to f32, and accumulates with plain multiply-add.  It
+    emits **no** ``v_dot2_f32_bf16`` (a gfx950-only instruction), so it compiles and runs
+    on every AMD arch (gfx942 included).  Numerically it matches the dot2 path up to f32
+    add reassociation only, so a forced-scalar run on gfx950 validates the fallback math.
+    ``acc_f32`` is an f32 ``ir.Value``; returns the updated f32 ``ir.Value``.
+    """
+    from flydsl._mlir.dialects import arith as std_arith
+
+    bf16x2_ty = ir.VectorType.get([2], T.bf16())
+    a_vec = llvm.bitcast(bf16x2_ty, a_i32)
+    b_vec = llvm.bitcast(bf16x2_ty, b_i32)
+
+    def _lane(vec, pos):
+        return std_arith.ExtFOp(
+            T.f32(), vector.extract(vec, static_position=[pos])
+        ).result
+
+    acc = fx.Float32(acc_f32) + fx.Float32(_lane(a_vec, 0)) * fx.Float32(
+        _lane(b_vec, 0)
+    )
+    acc = acc + fx.Float32(_lane(a_vec, 1)) * fx.Float32(_lane(b_vec, 1))
+    return acc.ir_value()
+
+
+def dot2_or_scalar(a_i32, b_i32, acc_f32, *, use_dot2: bool, serialize: bool = True):
+    """One packed-bf16 MAC, dispatched to the dot2 path or the scalar-f32 fallback.
+
+    ``use_dot2=True`` emits ``v_dot2_f32_bf16`` (gfx950 baseline); ``use_dot2=False`` uses
+    the arch-agnostic :func:`dot2_f32_bf16_scalar` (the gfx942 portable path).  ``serialize``
+    only affects the dot2 path -- the scalar path has no dot2->dot2 accumulator-RAW hazard.
+    """
+    if use_dot2:
+        return dot2_f32_bf16(a_i32, b_i32, acc_f32, serialize=serialize)
+    return dot2_f32_bf16_scalar(a_i32, b_i32, acc_f32)
+
+
 def fp8x2_to_bf16x2(src_i32, scale_f32, *, hi: bool):
     """Scaled convert of one fp8(e4m3) pair -> ``vector<2xbf16>``.
 
@@ -1396,6 +1436,7 @@ def build_gate_up_bf16_module(
     *,
     kvector: int | None = None,
     serialize_dot2: bool = True,
+    use_dot2: bool = True,
 ):
     """Build the gate_up launcher with **BF16 weights** (BF16 activation too).
 
@@ -1463,11 +1504,19 @@ def build_gate_up_bf16_module(
             for ipair in range_constexpr(n_pairs):
                 x_i32 = xw[ipair]
                 # No convert: the bf16 weight pair is already a dot2 operand.
-                gate_dot = dot2_f32_bf16(
-                    x_i32, gw[ipair], gate_dot, serialize=serialize_dot2
+                gate_dot = dot2_or_scalar(
+                    x_i32,
+                    gw[ipair],
+                    gate_dot,
+                    use_dot2=use_dot2,
+                    serialize=serialize_dot2,
                 )
-                up_dot = dot2_f32_bf16(
-                    x_i32, uw[ipair], up_dot, serialize=serialize_dot2
+                up_dot = dot2_or_scalar(
+                    x_i32,
+                    uw[ipair],
+                    up_dot,
+                    use_dot2=use_dot2,
+                    serialize=serialize_dot2,
                 )
 
         gate_acc = fx.Float32(wave_reduce_add_f32(gate_dot))
@@ -1509,6 +1558,7 @@ def build_down_reduce_bf16_module(
     kvector: int | None = None,
     serialize_dot2: bool = True,
     kh_per_warp: int = 1,
+    use_dot2: bool = True,
 ):
     """Build the down_reduce launcher with **BF16 weights** (BF16 intermediate too).
 
@@ -1583,8 +1633,12 @@ def build_down_reduce_bf16_module(
                 ]
                 for h in range_constexpr(kh_per_warp):
                     for ipair in range_constexpr(n_pairs):
-                        dot[h] = dot2_f32_bf16(
-                            aw[ipair], dw[h][ipair], dot[h], serialize=serialize_dot2
+                        dot[h] = dot2_or_scalar(
+                            aw[ipair],
+                            dw[h][ipair],
+                            dot[h],
+                            use_dot2=use_dot2,
+                            serialize=serialize_dot2,
                         )
 
             for h in range_constexpr(kh_per_warp):

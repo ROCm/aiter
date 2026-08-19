@@ -19,6 +19,7 @@ import functools
 import flydsl.compiler as flyc
 import torch
 
+from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
 from aiter.ops.flydsl.kernels.warp_decode_moe import (
     build_down_reduce_bf16_module,
@@ -30,6 +31,19 @@ from aiter.ops.flydsl.kernels.warp_decode_moe import (
     build_gate_up_fp8_module,
     pick_kvector,
 )
+
+
+def _default_use_dot2() -> bool:
+    """Auto-select the dot2 path on gfx950; scalar-f32 fallback elsewhere (e.g. gfx942).
+
+    ``v_dot2_f32_bf16`` is a gfx950 instruction; on any other arch the arch-agnostic
+    scalar-f32 path is the portable default.  Explicit ``use_dot2=`` overrides this (the
+    op_test forces ``use_dot2=False`` on gfx950 to validate the gfx942 fallback math).
+    """
+    try:
+        return get_gfx() == "gfx950"
+    except Exception:
+        return True
 
 
 @functools.lru_cache(maxsize=64)
@@ -103,18 +117,21 @@ def _get_gate_up_fp8_act(
 
 
 @functools.lru_cache(maxsize=64)
-def _get_gate_up_bf16(hidden, inter, top_k, kvector, serialize_dot2):
+def _get_gate_up_bf16(hidden, inter, top_k, kvector, serialize_dot2, use_dot2):
     return build_gate_up_bf16_module(
         hidden,
         inter,
         top_k,
         kvector=kvector,
         serialize_dot2=serialize_dot2,
+        use_dot2=use_dot2,
     )
 
 
 @functools.lru_cache(maxsize=64)
-def _get_down_reduce_bf16(inter, hidden, top_k, kvector, serialize_dot2, kh_per_warp):
+def _get_down_reduce_bf16(
+    inter, hidden, top_k, kvector, serialize_dot2, kh_per_warp, use_dot2
+):
     return build_down_reduce_bf16_module(
         inter,
         hidden,
@@ -122,6 +139,7 @@ def _get_down_reduce_bf16(inter, hidden, top_k, kvector, serialize_dot2, kh_per_
         kvector=kvector,
         serialize_dot2=serialize_dot2,
         kh_per_warp=kh_per_warp,
+        use_dot2=use_dot2,
     )
 
 
@@ -606,6 +624,7 @@ def flydsl_warp_decode_gate_up_bf16(
     router_ids: torch.Tensor,
     *,
     serialize_dot2: bool = True,
+    use_dot2: bool | None = None,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """gate_up stage with **BF16 weights** (unquantized oracle; no scales).
@@ -619,6 +638,10 @@ def flydsl_warp_decode_gate_up_bf16(
         x:            [B, HIDDEN] bfloat16.
         w_gate/w_up:  [E, INTER, HIDDEN] bfloat16 (row = e*INTER + j).
         router_ids:   [B, TOPK] int32.
+        use_dot2:     force the compute path -- ``True`` uses ``v_dot2_f32_bf16`` (gfx950),
+                      ``False`` the arch-agnostic scalar-f32 fallback (gfx942 path),
+                      ``None`` auto-selects by arch. Forced ``False`` on gfx950 validates
+                      the fallback math against the dot2 path.
         out:          optional [B, TOPK, INTER] bfloat16 output buffer.
 
     Returns:
@@ -635,11 +658,13 @@ def flydsl_warp_decode_gate_up_bf16(
     assert w_up.shape == w_gate.shape, "w_gate and w_up must share shape"
     TOPK = router_ids.shape[1]
 
+    if use_dot2 is None:
+        use_dot2 = _default_use_dot2()
     kvector = pick_kvector(HIDDEN)
     if out is None:
         out = torch.empty((B, TOPK, INTER), dtype=torch.bfloat16, device=x.device)
 
-    launcher = _get_gate_up_bf16(HIDDEN, INTER, TOPK, kvector, serialize_dot2)
+    launcher = _get_gate_up_bf16(HIDDEN, INTER, TOPK, kvector, serialize_dot2, use_dot2)
     grid_x = B * TOPK * INTER
     _run(
         launcher,
@@ -664,6 +689,7 @@ def flydsl_warp_decode_down_reduce_bf16(
     *,
     kh_per_warp: int | None = None,
     serialize_dot2: bool = True,
+    use_dot2: bool | None = None,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """down_reduce stage with **BF16 weights** (unquantized oracle; no scales).
@@ -677,6 +703,10 @@ def flydsl_warp_decode_down_reduce_bf16(
         router_ids:   [B, TOPK] int32.
         router_wts:   [B, TOPK] float32 (normalized to sum 1 per token).
         kh_per_warp:  outputs per wave (defaults to 2 when HIDDEN is even, else 1).
+        use_dot2:     force the compute path -- ``True`` uses ``v_dot2_f32_bf16`` (gfx950),
+                      ``False`` the arch-agnostic scalar-f32 fallback (gfx942 path),
+                      ``None`` auto-selects by arch. Forced ``False`` on gfx950 validates
+                      the fallback math against the dot2 path.
         out:          optional [B, HIDDEN] bfloat16 output buffer.
 
     Returns:
@@ -696,12 +726,14 @@ def flydsl_warp_decode_down_reduce_bf16(
         kh_per_warp = 2 if HIDDEN % 2 == 0 else 1
     assert HIDDEN % kh_per_warp == 0, "HIDDEN must be divisible by kh_per_warp"
 
+    if use_dot2 is None:
+        use_dot2 = _default_use_dot2()
     kvector = pick_kvector(INTER)
     if out is None:
         out = torch.empty((B, HIDDEN), dtype=torch.bfloat16, device=intermediate.device)
 
     launcher = _get_down_reduce_bf16(
-        INTER, HIDDEN, TOPK, kvector, serialize_dot2, kh_per_warp
+        INTER, HIDDEN, TOPK, kvector, serialize_dot2, kh_per_warp, use_dot2
     )
     grid_x = B * (HIDDEN // kh_per_warp)
     _run(
