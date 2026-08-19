@@ -1,10 +1,16 @@
+import json
+import os
+
 import torch
 
 from aiter.ops.triton._triton_kernels.attention.fp8_mqa_logits import (
     _fp8_mqa_logits_kernel,
 )
 from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
 import inspect
+from typing import Optional
+
 from packaging.version import Version
 import triton
 
@@ -77,82 +83,72 @@ def _gfx942_tile_fits_lds(
     return lds_bytes <= 0.9 * _GFX942_CU_LDS_BYTES
 
 
-# Runtime autotune for the gfx942 non-gluon indexer tile. Candidates are
-# pre-pruned by a KV-tile LDS estimate at occupancy=1, then each is tried
-# under a guarded probe/benchmark: any tile that fails to compile (e.g. an
-# older Triton that spills Q/scores to LDS and overflows 64KB) is skipped,
-# never fatal, and we fall back through smaller tiles down to (64,1) -- the
-# config #3257 validated as crash-safe for the DSv4 indexer on MI300X.
-# Among the tiles that compile we keep the fastest, cached per (head_size,
-# seq_len bucket). Replaces the static occupancy=2 gate: no hard-coded tile
-# -- long prefill keeps (128,2); short/occupancy-bound shapes pick a smaller
-# tile when it actually benchmarks faster.
-_GFX942_MQA_TILE_CANDS = [(128, 2), (128, 1), (64, 2), (64, 1)]
-_gfx942_mqa_tile_cache = {}
+# gfx942 (MI300X) non-gluon indexer tile selection.
+#
+# The tile is *not* tuned at runtime: it is read from a checked-in, arch
+# specific config file (configs/{arch}-FP8_MQA_LOGITS.json), so a given
+# (arch, head_size, seq_len bucket) always compiles the same kernel. The
+# config files are produced offline by
+# op_tests/op_benchmarks/triton/tune_fp8_mqa_logits.py.
+#
+# A static LDS check still guards the config: if the configured tile cannot
+# fit a single workgroup's KV tile in 64KB (e.g. an unusually large
+# head_size, or an older Triton that spills Q/scores to LDS), we shrink
+# deterministically down to (BLOCK_KV=64, num_stages=1) -- the config #3257
+# validated as crash-safe for the DSv4 indexer on MI300X. This is pure
+# arithmetic on the launch parameters, so it is still fully predictable.
+_MQA_SEQ_BUCKETS = (1024, 4096, 16384, 65536)
+_MQA_DEFAULT_CONFIG = {"BLOCK_KV": 128, "num_stages": 2}
 
 
-def _mqa_seq_bucket(seq_len: int) -> int:
-    for b in (1024, 4096, 16384, 65536):
+def _mqa_seq_bucket_key(seq_len: int) -> str:
+    for b in _MQA_SEQ_BUCKETS:
         if seq_len <= b:
-            return b
-    return 1 << 20
+            return f"SEQ_LEN_LEQ_{b}"
+    return f"SEQ_LEN_GT_{_MQA_SEQ_BUCKETS[-1]}"
 
 
-def _probe_ok(launch, bk, ns) -> bool:
-    # Compile + run once; catches an LDS-overflow JIT abort (e.g. an older
-    # Triton that spills Q/scores to LDS) so a too-big tile is rejected, not fatal.
-    try:
-        launch(bk, ns)
-        return True
-    except Exception:
-        return False
+def _get_config(head_size: int, seq_len: int) -> dict:
+    """
+    Tile config for the non-gluon fp8_mqa_logits kernel.
+
+    Looked up in configs/{arch}-FP8_MQA_LOGITS.json as
+    ``["HEAD_SIZE={head_size}"]["SEQ_LEN_LEQ_{bucket}"]``, falling back to the
+    per-head_size ``"default"``, then the file-level ``"default"``, then the
+    built-in (BLOCK_KV=128, num_stages=2). Archs without a config file use the
+    built-in default, i.e. behave exactly as before this file existed.
+    """
+    if not hasattr(_get_config, "_config_dict"):
+        fpath = f"{AITER_TRITON_CONFIGS_PATH}/{arch}-FP8_MQA_LOGITS.json"
+        cfg = {}
+        if os.path.exists(fpath):
+            with open(fpath, "r") as file:
+                cfg = json.load(file)
+        _get_config._config_dict = cfg
+
+    file_cfg = _get_config._config_dict
+    config = dict(_MQA_DEFAULT_CONFIG)
+    config.update(file_cfg.get("default", {}))
+    head_cfg = file_cfg.get(f"HEAD_SIZE={head_size}")
+    if head_cfg is not None:
+        config.update(head_cfg.get("default", {}))
+        config.update(head_cfg.get(_mqa_seq_bucket_key(seq_len), {}))
+    return config
 
 
-def _autotune_gfx942_mqa_tile(head_size: int, seq_len: int, launch):
-    key = (head_size, _mqa_seq_bucket(seq_len))
-    cached = _gfx942_mqa_tile_cache.get(key)
-    if cached is not None:
-        return cached
-    # Pre-prune by the KV-tile LDS estimate at occupancy=1 (single-workgroup
-    # upper bound); the guarded probe/bench below is what actually guarantees
-    # the chosen tile compiles.
-    cands = [
-        (bk, ns)
-        for (bk, ns) in _GFX942_MQA_TILE_CANDS
-        if _gfx942_tile_fits_lds(bk, head_size, ns, occupancy=1)
-    ]
-    if not cands:
-        cands = [(64, 1)]
-    try:
-        from triton.testing import do_bench
-    except Exception:
-        do_bench = None
-
-    best = None
-    if do_bench is not None:
-        best_t = float("inf")
-        for bk, ns in cands:
-            try:
-                t = do_bench(lambda bk=bk, ns=ns: launch(bk, ns), warmup=3, rep=8)
-            except Exception:
-                continue  # won't compile/fit on this Triton -> skip (never fatal)
-            if t < best_t:
-                best_t, best = t, (bk, ns)
-    else:
-        # No benchmarking: probe-compile in preference order, take the first
-        # tile that actually runs (keeps fast (128,2) when it compiles).
-        for bk, ns in cands:
-            if _probe_ok(launch, bk, ns):
-                best = (bk, ns)
-                break
-
-    if best is None:
-        # Every candidate failed to compile (e.g. an old Triton on a large
-        # head_size). Fall back to the smallest tile -- the (64, 1) config
-        # #3257 validated as crash-safe for the DSv4 indexer on MI300X.
-        best = (64, 1)
-    _gfx942_mqa_tile_cache[key] = best
-    return best
+def _gfx942_lds_safe_tile(
+    block_kv: int, num_stages: int, head_size: int
+) -> tuple[int, int]:
+    # Deterministically shrink a configured tile until its KV tile fits LDS for
+    # one workgroup. (64, 1) is the crash-safe floor from #3257.
+    while not _gfx942_tile_fits_lds(block_kv, head_size, num_stages, occupancy=1):
+        if num_stages > 1:
+            num_stages -= 1
+        elif block_kv > 64:
+            block_kv //= 2
+        else:
+            return 64, 1
+    return block_kv, num_stages
 
 
 def fp8_mqa_logits(
@@ -163,6 +159,7 @@ def fp8_mqa_logits(
     cu_starts,
     cu_ends,
     clean_logits=True,
+    config: Optional[dict] = None,
 ):
     """
     This function computes the logits to be used by a topk function for sparse attention.
@@ -177,6 +174,9 @@ def fp8_mqa_logits(
                   are explicitly written as -inf. If False, the kernel skips writing
                   those positions and leaves whatever was in the output buffer there
                   (the caller is responsible for pre-filling with -inf or ignoring them).
+    config:      Optional dict of kernel tuning parameters (BLOCK_KV, num_stages).
+                  When None (default), the config is read from the checked-in
+                  arch-specific config file. No tuning happens at runtime.
 
     Returns:
     logits:      [seq_len, seq_len_kv], dtype float32 (must be initialized to -inf, because of causal masking)
@@ -260,14 +260,16 @@ def fp8_mqa_logits(
                 matrix_instr_nonkdim=matrix_instr_nonkdim,
             )
 
-        # Runtime-autotuned tile on gfx942: pre-pruned by the occupancy=1 LDS
-        # estimate, then guarded-probed so a too-big tile is skipped (never fatal).
+        # Tile comes from the checked-in arch-specific config (no runtime
+        # tuning); on gfx942 a static LDS check can only shrink it.
+        if config is None:
+            config = _get_config(head_size, seq_len)
+        block_kv = config.get("BLOCK_KV", _MQA_DEFAULT_CONFIG["BLOCK_KV"])
+        num_stages = config.get("num_stages", _MQA_DEFAULT_CONFIG["num_stages"])
         if arch == "gfx942":
-            block_kv, num_stages = _autotune_gfx942_mqa_tile(
-                head_size, seq_len, _launch
+            block_kv, num_stages = _gfx942_lds_safe_tile(
+                block_kv, num_stages, head_size
             )
-        else:
-            block_kv, num_stages = 128, 2
         _launch(block_kv, num_stages)
     else:
         num_buffers = 2

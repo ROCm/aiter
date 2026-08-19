@@ -1,0 +1,13 @@
+{
+  "_comment": "Tile configs for the non-gluon Triton fp8_mqa_logits (DSA/NSA indexer) kernel on gfx942. Regenerate with op_tests/op_benchmarks/triton/tune_fp8_mqa_logits.py. Keys: HEAD_SIZE=<d> -> SEQ_LEN_LEQ_{1024,4096,16384,65536} | SEQ_LEN_GT_65536 | default. A static LDS check in fp8_mqa_logits.py may shrink a tile that cannot fit 64KB for one workgroup, down to the crash-safe (64, 1).",
+  "default": {
+    "BLOCK_KV": 128,
+    "num_stages": 2
+  },
+  "HEAD_SIZE=128": {
+    "default": {
+      "BLOCK_KV": 128,
+      "num_stages": 2
+    }
+  }
+}
