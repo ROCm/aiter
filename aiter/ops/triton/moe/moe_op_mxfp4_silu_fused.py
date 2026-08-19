@@ -9,10 +9,12 @@ import triton.language as tl
 
 from aiter.ops.triton._triton_kernels.moe.moe_op_mxfp4_silu_fused import (
     _fused_moe_kernel_mxfp4_silu,
-    get_scaled_dot_format_string,
 )
 from aiter.ops.triton.utils.logger import AiterTritonLogger
-from aiter.ops.triton.utils.types import torch_to_triton_dtype
+from aiter.ops.triton.utils.types import (
+    get_scaled_dot_format_string,
+    torch_to_triton_dtype,
+)
 
 _LOGGER = AiterTritonLogger()
 

@@ -124,8 +124,8 @@ Direct-path loaders bypass the resolver's directory probe. Grep for
 `f"{AITER_TRITON_CONFIGS_PATH}/..."` before moving anything —
 `gluon/gemm_a8w8_blockscale.py` still builds legacy `gemm/gluon/` paths by
 hand (via `load_config_json`) and must be edited when its configs move.
-`gluon/gemm_a8w8.py` and `gluon/gemm_afp4wfp4.py` go through
-`get_gemm_config(backend="gluon")` and need no changes.
+`gluon/gemm_afp4wfp4.py` goes through `get_gemm_config(backend="gluon")` and
+needs no changes.
 
 ---
 

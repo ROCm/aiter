@@ -9,18 +9,6 @@ from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils._triton.moe_common import _write_zeros_to_output
 from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
 
-
-def get_scaled_dot_format_string(dtype: tl.dtype):
-    mapping = {
-        tl.float16: "fp16",
-        tl.bfloat16: "bf16",
-        tl.uint8: "e2m1",
-        tl.float8e4nv: "e4m3",
-        tl.float8e5: "e5m2",
-    }
-    return mapping[dtype]
-
-
 _fused_moe_kernel_mxfp4_silu_repr = make_kernel_repr(
     "_fused_moe_kernel_mxfp4_silu",
     [

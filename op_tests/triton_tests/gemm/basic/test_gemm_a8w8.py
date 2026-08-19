@@ -1,26 +1,28 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import functools
+
 import pytest
 import torch
 import torch.nn.functional as F
 
 from aiter.ops.shuffle import shuffle_weight
 from aiter.ops.triton.gemm.basic.gemm_a8w8 import gemm_a8w8 as triton_gemm_a8w8
-from aiter.ops.triton.gluon.gemm_a8w8 import (
-    gemm_a8w8 as gluon_gemm_a8w8,
-)
-from aiter.ops.triton.gluon.gemm_a8w8 import (
-    gemm_a8w8_preshuffle as gluon_gemm_a8w8_preshuffle,
-)
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.gemm_config_utils import (
     compute_splitk_params,
     get_gemm_config,
 )
 from aiter.ops.triton.utils.types import get_fp8_dtypes, str_to_torch_dtype
+from op_tests.triton_tests.utils.gluon_paths import gluon_import_path
 
 DEVICE_ARCH = arch_info.get_arch()
+
+
+# Gluon kernels were moved. This tests that the old import path and the new one
+# both are working.
+import_path = gluon_import_path("aiter.ops.triton.gemm.basic.gemm_a8w8")
 
 
 def run_torch(x, weight, x_scale, w_scale, bias=None, dtype=torch.bfloat16):
@@ -168,7 +170,7 @@ def test_gemm_fp8(in_dtype, m, n, k, impl: str):
 
     if impl in ["gluon", "gluon_shuffle"] and DEVICE_ARCH != "gfx950":
         pytest.skip(
-            "Gluon implementation is not supported on this device (requires CDNA4)."
+            "Gluon implementation is not supported on this device (requires gfx950)."
         )
 
     if impl == "gluon_shuffle" and (n % 16 != 0 or k % 32 != 0):
@@ -193,9 +195,10 @@ def test_gemm_fp8(in_dtype, m, n, k, impl: str):
     if impl == "triton":
         impl = triton_gemm_a8w8
     elif impl == "gluon":
-        impl = gluon_gemm_a8w8
+        mod = import_path(in_dtype, m, n, k)
+        impl = functools.partial(mod.gemm_a8w8, backend="gluon")
     elif impl == "gluon_shuffle":
-        impl = gluon_gemm_a8w8_preshuffle
+        impl = import_path(in_dtype, m, n, k).gemm_a8w8_preshuffle
     else:
         raise ValueError(f"Unknown implementation: {impl}")
     b = run_triton(x, weight_triton, x_scale, w_scale, bias, out_dtype, y, impl)
@@ -229,7 +232,7 @@ def test_gemm_int8(out_dtype, m, n, k, layout, output, impl: str):
 
     if impl in ["gluon", "gluon_shuffle"] and DEVICE_ARCH != "gfx950":
         pytest.skip(
-            "Gluon implementation is not supported on this device (requires CDNA4)."
+            "Gluon implementation is not supported on this device (requires gfx950)."
         )
 
     if impl == "gluon_shuffle" and (n % 16 != 0 or k % 32 != 0):
@@ -254,9 +257,10 @@ def test_gemm_int8(out_dtype, m, n, k, layout, output, impl: str):
     if impl == "triton":
         impl = triton_gemm_a8w8
     elif impl == "gluon":
-        impl = gluon_gemm_a8w8
+        mod = import_path(out_dtype, m, n, k, layout, output)
+        impl = functools.partial(mod.gemm_a8w8, backend="gluon")
     elif impl == "gluon_shuffle":
-        impl = gluon_gemm_a8w8_preshuffle
+        impl = import_path(out_dtype, m, n, k, layout, output).gemm_a8w8_preshuffle
     else:
         raise ValueError(f"Unknown implementation: {impl}")
     b = run_triton(x, weight_triton, x_scale, w_scale, bias, out_dtype, y, impl)
