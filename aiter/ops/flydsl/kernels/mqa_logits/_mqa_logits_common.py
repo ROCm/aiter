@@ -33,17 +33,15 @@ MFMA_K = 64
 
 
 def _mfma_scale_f32_32x32x64_fp8(result_type, operands):
-    """operands: [a, b, c, cbsz, blgp, opsel_a, scale_a, opsel_b, scale_b]."""
-    from flydsl.expr.rocdl import _unwrap_mfma_operand
-
-    a = _unwrap_mfma_operand(operands[0])
-    b = _unwrap_mfma_operand(operands[1])
-    c = _unwrap_mfma_operand(operands[2])
+    """operands: [a, b, c] or [a, b, c, cbsz, blgp, opsel_a, scale_a, opsel_b, scale_b]."""
     # Neutral e8m0 scale: 4 packed bytes of 127 => 2^(127-127) = 1.0 each.
     neutral = arith.constant(0x7F7F7F7F, type=T.i32)
-    return rocdl.mfma_scale_f32_32x32x64_f8f6f4_(
-        result_type, a, b, c, 0, 0, 0, neutral, 0, neutral
-    )
+    ops = list(operands)
+    if len(ops) < 9:
+        while len(ops) < 6:
+            ops.append(0)
+        ops.extend([neutral, 0, neutral])
+    return rocdl.mfma_scale_f32_32x32x64_f8f6f4(result_type, ops)
 
 
 MFMA_FN = _mfma_scale_f32_32x32x64_fp8
