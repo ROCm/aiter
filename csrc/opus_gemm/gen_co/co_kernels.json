@@ -5122,6 +5122,2199 @@
         1,
         4
       ]
+    },
+    {
+      "kid": 21240,
+      "tag": "a16w16_4wave_co",
+      "block_size": 128,
+      "tile": [
+        128,
+        64,
+        128
+      ],
+      "num_slots": 3,
+      "cluster": [
+        1,
+        1
+      ],
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_vgpr": 1024,
+      "dtypes": {
+        "a": "bf16_t",
+        "b": "bf16_t",
+        "c": "bf16_t",
+        "acc": "fp32_t"
+      },
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "variant": ""
+    },
+    {
+      "kid": 21241,
+      "tag": "a16w16_4wave_co",
+      "block_size": 128,
+      "tile": [
+        128,
+        64,
+        128
+      ],
+      "num_slots": 3,
+      "cluster": [
+        1,
+        2
+      ],
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_vgpr": 1024,
+      "dtypes": {
+        "a": "bf16_t",
+        "b": "bf16_t",
+        "c": "bf16_t",
+        "acc": "fp32_t"
+      },
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "variant": ""
+    },
+    {
+      "kid": 21242,
+      "tag": "a16w16_4wave_co",
+      "block_size": 128,
+      "tile": [
+        128,
+        64,
+        128
+      ],
+      "num_slots": 3,
+      "cluster": [
+        1,
+        3
+      ],
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_vgpr": 1024,
+      "dtypes": {
+        "a": "bf16_t",
+        "b": "bf16_t",
+        "c": "bf16_t",
+        "acc": "fp32_t"
+      },
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "variant": ""
+    },
+    {
+      "kid": 21243,
+      "tag": "a16w16_4wave_co",
+      "block_size": 128,
+      "tile": [
+        128,
+        64,
+        128
+      ],
+      "num_slots": 3,
+      "cluster": [
+        1,
+        4
+      ],
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_vgpr": 1024,
+      "dtypes": {
+        "a": "bf16_t",
+        "b": "bf16_t",
+        "c": "bf16_t",
+        "acc": "fp32_t"
+      },
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "variant": ""
+    },
+    {
+      "kid": 21244,
+      "tag": "a16w16_4wave_co",
+      "block_size": 128,
+      "tile": [
+        128,
+        64,
+        128
+      ],
+      "num_slots": 3,
+      "cluster": [
+        2,
+        1
+      ],
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_vgpr": 1024,
+      "dtypes": {
+        "a": "bf16_t",
+        "b": "bf16_t",
+        "c": "bf16_t",
+        "acc": "fp32_t"
+      },
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "variant": ""
+    },
+    {
+      "kid": 21245,
+      "tag": "a16w16_4wave_co",
+      "block_size": 128,
+      "tile": [
+        128,
+        64,
+        128
+      ],
+      "num_slots": 3,
+      "cluster": [
+        2,
+        2
+      ],
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_vgpr": 1024,
+      "dtypes": {
+        "a": "bf16_t",
+        "b": "bf16_t",
+        "c": "bf16_t",
+        "acc": "fp32_t"
+      },
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "variant": ""
+    },
+    {
+      "kid": 21246,
+      "tag": "a16w16_4wave_co",
+      "block_size": 128,
+      "tile": [
+        128,
+        64,
+        128
+      ],
+      "num_slots": 3,
+      "cluster": [
+        2,
+        3
+      ],
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_vgpr": 1024,
+      "dtypes": {
+        "a": "bf16_t",
+        "b": "bf16_t",
+        "c": "bf16_t",
+        "acc": "fp32_t"
+      },
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "variant": ""
+    },
+    {
+      "kid": 21247,
+      "tag": "a16w16_4wave_co",
+      "block_size": 128,
+      "tile": [
+        128,
+        64,
+        128
+      ],
+      "num_slots": 3,
+      "cluster": [
+        2,
+        4
+      ],
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_vgpr": 1024,
+      "dtypes": {
+        "a": "bf16_t",
+        "b": "bf16_t",
+        "c": "bf16_t",
+        "acc": "fp32_t"
+      },
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "variant": ""
+    },
+    {
+      "kid": 21248,
+      "tag": "a16w16_4wave_co",
+      "block_size": 128,
+      "tile": [
+        128,
+        64,
+        128
+      ],
+      "num_slots": 3,
+      "cluster": [
+        3,
+        1
+      ],
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_vgpr": 1024,
+      "dtypes": {
+        "a": "bf16_t",
+        "b": "bf16_t",
+        "c": "bf16_t",
+        "acc": "fp32_t"
+      },
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "variant": ""
+    },
+    {
+      "kid": 21249,
+      "tag": "a16w16_4wave_co",
+      "block_size": 128,
+      "tile": [
+        128,
+        64,
+        128
+      ],
+      "num_slots": 3,
+      "cluster": [
+        3,
+        2
+      ],
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_vgpr": 1024,
+      "dtypes": {
+        "a": "bf16_t",
+        "b": "bf16_t",
+        "c": "bf16_t",
+        "acc": "fp32_t"
+      },
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "variant": ""
+    },
+    {
+      "kid": 21250,
+      "tag": "a16w16_4wave_co",
+      "block_size": 128,
+      "tile": [
+        128,
+        64,
+        128
+      ],
+      "num_slots": 3,
+      "cluster": [
+        3,
+        3
+      ],
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_vgpr": 1024,
+      "dtypes": {
+        "a": "bf16_t",
+        "b": "bf16_t",
+        "c": "bf16_t",
+        "acc": "fp32_t"
+      },
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "variant": ""
+    },
+    {
+      "kid": 21251,
+      "tag": "a16w16_4wave_co",
+      "block_size": 128,
+      "tile": [
+        128,
+        64,
+        128
+      ],
+      "num_slots": 3,
+      "cluster": [
+        3,
+        4
+      ],
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_vgpr": 1024,
+      "dtypes": {
+        "a": "bf16_t",
+        "b": "bf16_t",
+        "c": "bf16_t",
+        "acc": "fp32_t"
+      },
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "variant": ""
+    },
+    {
+      "kid": 21252,
+      "tag": "a16w16_4wave_co",
+      "block_size": 128,
+      "tile": [
+        128,
+        64,
+        128
+      ],
+      "num_slots": 3,
+      "cluster": [
+        4,
+        1
+      ],
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_vgpr": 1024,
+      "dtypes": {
+        "a": "bf16_t",
+        "b": "bf16_t",
+        "c": "bf16_t",
+        "acc": "fp32_t"
+      },
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "variant": ""
+    },
+    {
+      "kid": 21253,
+      "tag": "a16w16_4wave_co",
+      "block_size": 128,
+      "tile": [
+        128,
+        64,
+        128
+      ],
+      "num_slots": 3,
+      "cluster": [
+        4,
+        2
+      ],
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_vgpr": 1024,
+      "dtypes": {
+        "a": "bf16_t",
+        "b": "bf16_t",
+        "c": "bf16_t",
+        "acc": "fp32_t"
+      },
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "variant": ""
+    },
+    {
+      "kid": 21254,
+      "tag": "a16w16_4wave_co",
+      "block_size": 128,
+      "tile": [
+        128,
+        64,
+        128
+      ],
+      "num_slots": 3,
+      "cluster": [
+        4,
+        3
+      ],
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_vgpr": 1024,
+      "dtypes": {
+        "a": "bf16_t",
+        "b": "bf16_t",
+        "c": "bf16_t",
+        "acc": "fp32_t"
+      },
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "variant": ""
+    },
+    {
+      "kid": 21255,
+      "tag": "a16w16_4wave_co",
+      "block_size": 128,
+      "tile": [
+        128,
+        64,
+        128
+      ],
+      "num_slots": 3,
+      "cluster": [
+        4,
+        4
+      ],
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_vgpr": 1024,
+      "dtypes": {
+        "a": "bf16_t",
+        "b": "bf16_t",
+        "c": "bf16_t",
+        "acc": "fp32_t"
+      },
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "variant": ""
+    },
+    {
+      "kid": 21256,
+      "tag": "a16w16_4wave_wl_co",
+      "block_size": 128,
+      "tile": [
+        128,
+        64,
+        128
+      ],
+      "num_slots": 3,
+      "cluster": [
+        1,
+        1
+      ],
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_vgpr": 1024,
+      "dtypes": {
+        "a": "bf16_t",
+        "b": "bf16_t",
+        "c": "bf16_t",
+        "acc": "fp32_t"
+      },
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "variant": "",
+      "wave_layout": [
+        4,
+        1
+      ]
+    },
+    {
+      "kid": 21257,
+      "tag": "a16w16_4wave_wl_co",
+      "block_size": 128,
+      "tile": [
+        128,
+        64,
+        128
+      ],
+      "num_slots": 3,
+      "cluster": [
+        1,
+        4
+      ],
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_vgpr": 1024,
+      "dtypes": {
+        "a": "bf16_t",
+        "b": "bf16_t",
+        "c": "bf16_t",
+        "acc": "fp32_t"
+      },
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "variant": "",
+      "wave_layout": [
+        4,
+        1
+      ]
+    },
+    {
+      "kid": 21258,
+      "tag": "a16w16_4wave_wl_co",
+      "block_size": 128,
+      "tile": [
+        128,
+        64,
+        128
+      ],
+      "num_slots": 3,
+      "cluster": [
+        4,
+        1
+      ],
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_vgpr": 1024,
+      "dtypes": {
+        "a": "bf16_t",
+        "b": "bf16_t",
+        "c": "bf16_t",
+        "acc": "fp32_t"
+      },
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "variant": "",
+      "wave_layout": [
+        4,
+        1
+      ]
+    },
+    {
+      "kid": 21259,
+      "tag": "a16w16_4wave_wl_co",
+      "block_size": 128,
+      "tile": [
+        128,
+        64,
+        128
+      ],
+      "num_slots": 3,
+      "cluster": [
+        2,
+        2
+      ],
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_vgpr": 1024,
+      "dtypes": {
+        "a": "bf16_t",
+        "b": "bf16_t",
+        "c": "bf16_t",
+        "acc": "fp32_t"
+      },
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "variant": "",
+      "wave_layout": [
+        4,
+        1
+      ]
+    },
+    {
+      "kid": 21260,
+      "tag": "a16w16_4wave_wl_co",
+      "block_size": 128,
+      "tile": [
+        128,
+        64,
+        128
+      ],
+      "num_slots": 3,
+      "cluster": [
+        4,
+        4
+      ],
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_vgpr": 1024,
+      "dtypes": {
+        "a": "bf16_t",
+        "b": "bf16_t",
+        "c": "bf16_t",
+        "acc": "fp32_t"
+      },
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "variant": "",
+      "wave_layout": [
+        4,
+        1
+      ]
+    },
+    {
+      "kid": 21261,
+      "tag": "a16w16_4wave_wl_co",
+      "block_size": 128,
+      "tile": [
+        64,
+        64,
+        128
+      ],
+      "num_slots": 3,
+      "cluster": [
+        1,
+        1
+      ],
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_vgpr": 1024,
+      "dtypes": {
+        "a": "bf16_t",
+        "b": "bf16_t",
+        "c": "bf16_t",
+        "acc": "fp32_t"
+      },
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "variant": "",
+      "wave_layout": [
+        2,
+        2
+      ]
+    },
+    {
+      "kid": 21262,
+      "tag": "a16w16_4wave_wl_co",
+      "block_size": 128,
+      "tile": [
+        64,
+        64,
+        128
+      ],
+      "num_slots": 3,
+      "cluster": [
+        1,
+        4
+      ],
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_vgpr": 1024,
+      "dtypes": {
+        "a": "bf16_t",
+        "b": "bf16_t",
+        "c": "bf16_t",
+        "acc": "fp32_t"
+      },
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "variant": "",
+      "wave_layout": [
+        2,
+        2
+      ]
+    },
+    {
+      "kid": 21263,
+      "tag": "a16w16_4wave_wl_co",
+      "block_size": 128,
+      "tile": [
+        64,
+        64,
+        128
+      ],
+      "num_slots": 3,
+      "cluster": [
+        4,
+        1
+      ],
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_vgpr": 1024,
+      "dtypes": {
+        "a": "bf16_t",
+        "b": "bf16_t",
+        "c": "bf16_t",
+        "acc": "fp32_t"
+      },
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "variant": "",
+      "wave_layout": [
+        2,
+        2
+      ]
+    },
+    {
+      "kid": 21264,
+      "tag": "a16w16_4wave_wl_co",
+      "block_size": 128,
+      "tile": [
+        64,
+        64,
+        128
+      ],
+      "num_slots": 3,
+      "cluster": [
+        2,
+        2
+      ],
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_vgpr": 1024,
+      "dtypes": {
+        "a": "bf16_t",
+        "b": "bf16_t",
+        "c": "bf16_t",
+        "acc": "fp32_t"
+      },
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "variant": "",
+      "wave_layout": [
+        2,
+        2
+      ]
+    },
+    {
+      "kid": 21265,
+      "tag": "a16w16_4wave_wl_co",
+      "block_size": 128,
+      "tile": [
+        64,
+        64,
+        128
+      ],
+      "num_slots": 3,
+      "cluster": [
+        4,
+        4
+      ],
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_vgpr": 1024,
+      "dtypes": {
+        "a": "bf16_t",
+        "b": "bf16_t",
+        "c": "bf16_t",
+        "acc": "fp32_t"
+      },
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "variant": "",
+      "wave_layout": [
+        2,
+        2
+      ]
+    },
+    {
+      "kid": 21266,
+      "tag": "a16w16_4wave_wl_co",
+      "block_size": 128,
+      "tile": [
+        64,
+        128,
+        128
+      ],
+      "num_slots": 3,
+      "cluster": [
+        1,
+        1
+      ],
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_vgpr": 1024,
+      "dtypes": {
+        "a": "bf16_t",
+        "b": "bf16_t",
+        "c": "bf16_t",
+        "acc": "fp32_t"
+      },
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "variant": "",
+      "wave_layout": [
+        2,
+        2
+      ]
+    },
+    {
+      "kid": 21267,
+      "tag": "a16w16_4wave_wl_co",
+      "block_size": 128,
+      "tile": [
+        64,
+        128,
+        128
+      ],
+      "num_slots": 3,
+      "cluster": [
+        1,
+        4
+      ],
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_vgpr": 1024,
+      "dtypes": {
+        "a": "bf16_t",
+        "b": "bf16_t",
+        "c": "bf16_t",
+        "acc": "fp32_t"
+      },
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "variant": "",
+      "wave_layout": [
+        2,
+        2
+      ]
+    },
+    {
+      "kid": 21268,
+      "tag": "a16w16_4wave_wl_co",
+      "block_size": 128,
+      "tile": [
+        64,
+        128,
+        128
+      ],
+      "num_slots": 3,
+      "cluster": [
+        4,
+        1
+      ],
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_vgpr": 1024,
+      "dtypes": {
+        "a": "bf16_t",
+        "b": "bf16_t",
+        "c": "bf16_t",
+        "acc": "fp32_t"
+      },
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "variant": "",
+      "wave_layout": [
+        2,
+        2
+      ]
+    },
+    {
+      "kid": 21269,
+      "tag": "a16w16_4wave_wl_co",
+      "block_size": 128,
+      "tile": [
+        64,
+        128,
+        128
+      ],
+      "num_slots": 3,
+      "cluster": [
+        2,
+        2
+      ],
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_vgpr": 1024,
+      "dtypes": {
+        "a": "bf16_t",
+        "b": "bf16_t",
+        "c": "bf16_t",
+        "acc": "fp32_t"
+      },
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "variant": "",
+      "wave_layout": [
+        2,
+        2
+      ]
+    },
+    {
+      "kid": 21270,
+      "tag": "a16w16_4wave_wl_co",
+      "block_size": 128,
+      "tile": [
+        64,
+        128,
+        128
+      ],
+      "num_slots": 3,
+      "cluster": [
+        4,
+        4
+      ],
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_vgpr": 1024,
+      "dtypes": {
+        "a": "bf16_t",
+        "b": "bf16_t",
+        "c": "bf16_t",
+        "acc": "fp32_t"
+      },
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "variant": "",
+      "wave_layout": [
+        2,
+        2
+      ]
+    },
+    {
+      "kid": 21271,
+      "tag": "a16w16_4wave_wl_co",
+      "block_size": 128,
+      "tile": [
+        96,
+        64,
+        128
+      ],
+      "num_slots": 3,
+      "cluster": [
+        1,
+        1
+      ],
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_vgpr": 1024,
+      "dtypes": {
+        "a": "bf16_t",
+        "b": "bf16_t",
+        "c": "bf16_t",
+        "acc": "fp32_t"
+      },
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "variant": "",
+      "wave_layout": [
+        2,
+        2
+      ]
+    },
+    {
+      "kid": 21272,
+      "tag": "a16w16_4wave_wl_co",
+      "block_size": 128,
+      "tile": [
+        96,
+        64,
+        128
+      ],
+      "num_slots": 3,
+      "cluster": [
+        1,
+        4
+      ],
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_vgpr": 1024,
+      "dtypes": {
+        "a": "bf16_t",
+        "b": "bf16_t",
+        "c": "bf16_t",
+        "acc": "fp32_t"
+      },
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "variant": "",
+      "wave_layout": [
+        2,
+        2
+      ]
+    },
+    {
+      "kid": 21273,
+      "tag": "a16w16_4wave_wl_co",
+      "block_size": 128,
+      "tile": [
+        96,
+        64,
+        128
+      ],
+      "num_slots": 3,
+      "cluster": [
+        4,
+        1
+      ],
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_vgpr": 1024,
+      "dtypes": {
+        "a": "bf16_t",
+        "b": "bf16_t",
+        "c": "bf16_t",
+        "acc": "fp32_t"
+      },
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "variant": "",
+      "wave_layout": [
+        2,
+        2
+      ]
+    },
+    {
+      "kid": 21274,
+      "tag": "a16w16_4wave_wl_co",
+      "block_size": 128,
+      "tile": [
+        96,
+        64,
+        128
+      ],
+      "num_slots": 3,
+      "cluster": [
+        2,
+        2
+      ],
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_vgpr": 1024,
+      "dtypes": {
+        "a": "bf16_t",
+        "b": "bf16_t",
+        "c": "bf16_t",
+        "acc": "fp32_t"
+      },
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "variant": "",
+      "wave_layout": [
+        2,
+        2
+      ]
+    },
+    {
+      "kid": 21275,
+      "tag": "a16w16_4wave_wl_co",
+      "block_size": 128,
+      "tile": [
+        96,
+        64,
+        128
+      ],
+      "num_slots": 3,
+      "cluster": [
+        4,
+        4
+      ],
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_vgpr": 1024,
+      "dtypes": {
+        "a": "bf16_t",
+        "b": "bf16_t",
+        "c": "bf16_t",
+        "acc": "fp32_t"
+      },
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "variant": "",
+      "wave_layout": [
+        2,
+        2
+      ]
+    },
+    {
+      "kid": 21276,
+      "tag": "a16w16_4wave_wl_co",
+      "block_size": 128,
+      "tile": [
+        128,
+        64,
+        128
+      ],
+      "num_slots": 3,
+      "cluster": [
+        1,
+        1
+      ],
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_vgpr": 1024,
+      "dtypes": {
+        "a": "bf16_t",
+        "b": "bf16_t",
+        "c": "bf16_t",
+        "acc": "fp32_t"
+      },
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "variant": "",
+      "wave_layout": [
+        2,
+        2
+      ]
+    },
+    {
+      "kid": 21277,
+      "tag": "a16w16_4wave_wl_co",
+      "block_size": 128,
+      "tile": [
+        128,
+        64,
+        128
+      ],
+      "num_slots": 3,
+      "cluster": [
+        1,
+        4
+      ],
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_vgpr": 1024,
+      "dtypes": {
+        "a": "bf16_t",
+        "b": "bf16_t",
+        "c": "bf16_t",
+        "acc": "fp32_t"
+      },
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "variant": "",
+      "wave_layout": [
+        2,
+        2
+      ]
+    },
+    {
+      "kid": 21278,
+      "tag": "a16w16_4wave_wl_co",
+      "block_size": 128,
+      "tile": [
+        128,
+        64,
+        128
+      ],
+      "num_slots": 3,
+      "cluster": [
+        4,
+        1
+      ],
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_vgpr": 1024,
+      "dtypes": {
+        "a": "bf16_t",
+        "b": "bf16_t",
+        "c": "bf16_t",
+        "acc": "fp32_t"
+      },
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "variant": "",
+      "wave_layout": [
+        2,
+        2
+      ]
+    },
+    {
+      "kid": 21279,
+      "tag": "a16w16_4wave_wl_co",
+      "block_size": 128,
+      "tile": [
+        128,
+        64,
+        128
+      ],
+      "num_slots": 3,
+      "cluster": [
+        2,
+        2
+      ],
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_vgpr": 1024,
+      "dtypes": {
+        "a": "bf16_t",
+        "b": "bf16_t",
+        "c": "bf16_t",
+        "acc": "fp32_t"
+      },
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "variant": "",
+      "wave_layout": [
+        2,
+        2
+      ]
+    },
+    {
+      "kid": 21280,
+      "tag": "a16w16_4wave_wl_co",
+      "block_size": 128,
+      "tile": [
+        128,
+        64,
+        128
+      ],
+      "num_slots": 3,
+      "cluster": [
+        4,
+        4
+      ],
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_vgpr": 1024,
+      "dtypes": {
+        "a": "bf16_t",
+        "b": "bf16_t",
+        "c": "bf16_t",
+        "acc": "fp32_t"
+      },
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "variant": "",
+      "wave_layout": [
+        2,
+        2
+      ]
+    },
+    {
+      "kid": 21281,
+      "tag": "a16w16_4wave_wl_co",
+      "block_size": 128,
+      "tile": [
+        64,
+        64,
+        128
+      ],
+      "num_slots": 3,
+      "cluster": [
+        1,
+        1
+      ],
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_vgpr": 1024,
+      "dtypes": {
+        "a": "bf16_t",
+        "b": "bf16_t",
+        "c": "bf16_t",
+        "acc": "fp32_t"
+      },
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "variant": "",
+      "wave_layout": [
+        1,
+        4
+      ]
+    },
+    {
+      "kid": 21282,
+      "tag": "a16w16_4wave_wl_co",
+      "block_size": 128,
+      "tile": [
+        64,
+        64,
+        128
+      ],
+      "num_slots": 3,
+      "cluster": [
+        1,
+        4
+      ],
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_vgpr": 1024,
+      "dtypes": {
+        "a": "bf16_t",
+        "b": "bf16_t",
+        "c": "bf16_t",
+        "acc": "fp32_t"
+      },
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "variant": "",
+      "wave_layout": [
+        1,
+        4
+      ]
+    },
+    {
+      "kid": 21283,
+      "tag": "a16w16_4wave_wl_co",
+      "block_size": 128,
+      "tile": [
+        64,
+        64,
+        128
+      ],
+      "num_slots": 3,
+      "cluster": [
+        4,
+        1
+      ],
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_vgpr": 1024,
+      "dtypes": {
+        "a": "bf16_t",
+        "b": "bf16_t",
+        "c": "bf16_t",
+        "acc": "fp32_t"
+      },
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "variant": "",
+      "wave_layout": [
+        1,
+        4
+      ]
+    },
+    {
+      "kid": 21284,
+      "tag": "a16w16_4wave_wl_co",
+      "block_size": 128,
+      "tile": [
+        64,
+        64,
+        128
+      ],
+      "num_slots": 3,
+      "cluster": [
+        2,
+        2
+      ],
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_vgpr": 1024,
+      "dtypes": {
+        "a": "bf16_t",
+        "b": "bf16_t",
+        "c": "bf16_t",
+        "acc": "fp32_t"
+      },
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "variant": "",
+      "wave_layout": [
+        1,
+        4
+      ]
+    },
+    {
+      "kid": 21285,
+      "tag": "a16w16_4wave_wl_co",
+      "block_size": 128,
+      "tile": [
+        64,
+        64,
+        128
+      ],
+      "num_slots": 3,
+      "cluster": [
+        4,
+        4
+      ],
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_vgpr": 1024,
+      "dtypes": {
+        "a": "bf16_t",
+        "b": "bf16_t",
+        "c": "bf16_t",
+        "acc": "fp32_t"
+      },
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "variant": "",
+      "wave_layout": [
+        1,
+        4
+      ]
+    },
+    {
+      "kid": 21286,
+      "tag": "a16w16_4wave_wl_co",
+      "block_size": 128,
+      "tile": [
+        64,
+        128,
+        128
+      ],
+      "num_slots": 3,
+      "cluster": [
+        1,
+        1
+      ],
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_vgpr": 1024,
+      "dtypes": {
+        "a": "bf16_t",
+        "b": "bf16_t",
+        "c": "bf16_t",
+        "acc": "fp32_t"
+      },
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "variant": "",
+      "wave_layout": [
+        1,
+        4
+      ]
+    },
+    {
+      "kid": 21287,
+      "tag": "a16w16_4wave_wl_co",
+      "block_size": 128,
+      "tile": [
+        64,
+        128,
+        128
+      ],
+      "num_slots": 3,
+      "cluster": [
+        1,
+        4
+      ],
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_vgpr": 1024,
+      "dtypes": {
+        "a": "bf16_t",
+        "b": "bf16_t",
+        "c": "bf16_t",
+        "acc": "fp32_t"
+      },
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "variant": "",
+      "wave_layout": [
+        1,
+        4
+      ]
+    },
+    {
+      "kid": 21288,
+      "tag": "a16w16_4wave_wl_co",
+      "block_size": 128,
+      "tile": [
+        64,
+        128,
+        128
+      ],
+      "num_slots": 3,
+      "cluster": [
+        4,
+        1
+      ],
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_vgpr": 1024,
+      "dtypes": {
+        "a": "bf16_t",
+        "b": "bf16_t",
+        "c": "bf16_t",
+        "acc": "fp32_t"
+      },
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "variant": "",
+      "wave_layout": [
+        1,
+        4
+      ]
+    },
+    {
+      "kid": 21289,
+      "tag": "a16w16_4wave_wl_co",
+      "block_size": 128,
+      "tile": [
+        64,
+        128,
+        128
+      ],
+      "num_slots": 3,
+      "cluster": [
+        2,
+        2
+      ],
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_vgpr": 1024,
+      "dtypes": {
+        "a": "bf16_t",
+        "b": "bf16_t",
+        "c": "bf16_t",
+        "acc": "fp32_t"
+      },
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "variant": "",
+      "wave_layout": [
+        1,
+        4
+      ]
+    },
+    {
+      "kid": 21290,
+      "tag": "a16w16_4wave_wl_co",
+      "block_size": 128,
+      "tile": [
+        64,
+        128,
+        128
+      ],
+      "num_slots": 3,
+      "cluster": [
+        4,
+        4
+      ],
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_vgpr": 1024,
+      "dtypes": {
+        "a": "bf16_t",
+        "b": "bf16_t",
+        "c": "bf16_t",
+        "acc": "fp32_t"
+      },
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "variant": "",
+      "wave_layout": [
+        1,
+        4
+      ]
+    },
+    {
+      "kid": 21291,
+      "tag": "a16w16_4wave_wl_co",
+      "block_size": 128,
+      "tile": [
+        96,
+        64,
+        128
+      ],
+      "num_slots": 3,
+      "cluster": [
+        1,
+        1
+      ],
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_vgpr": 1024,
+      "dtypes": {
+        "a": "bf16_t",
+        "b": "bf16_t",
+        "c": "bf16_t",
+        "acc": "fp32_t"
+      },
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "variant": "",
+      "wave_layout": [
+        1,
+        4
+      ]
+    },
+    {
+      "kid": 21292,
+      "tag": "a16w16_4wave_wl_co",
+      "block_size": 128,
+      "tile": [
+        96,
+        64,
+        128
+      ],
+      "num_slots": 3,
+      "cluster": [
+        1,
+        4
+      ],
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_vgpr": 1024,
+      "dtypes": {
+        "a": "bf16_t",
+        "b": "bf16_t",
+        "c": "bf16_t",
+        "acc": "fp32_t"
+      },
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "variant": "",
+      "wave_layout": [
+        1,
+        4
+      ]
+    },
+    {
+      "kid": 21293,
+      "tag": "a16w16_4wave_wl_co",
+      "block_size": 128,
+      "tile": [
+        96,
+        64,
+        128
+      ],
+      "num_slots": 3,
+      "cluster": [
+        4,
+        1
+      ],
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_vgpr": 1024,
+      "dtypes": {
+        "a": "bf16_t",
+        "b": "bf16_t",
+        "c": "bf16_t",
+        "acc": "fp32_t"
+      },
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "variant": "",
+      "wave_layout": [
+        1,
+        4
+      ]
+    },
+    {
+      "kid": 21294,
+      "tag": "a16w16_4wave_wl_co",
+      "block_size": 128,
+      "tile": [
+        96,
+        64,
+        128
+      ],
+      "num_slots": 3,
+      "cluster": [
+        2,
+        2
+      ],
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_vgpr": 1024,
+      "dtypes": {
+        "a": "bf16_t",
+        "b": "bf16_t",
+        "c": "bf16_t",
+        "acc": "fp32_t"
+      },
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "variant": "",
+      "wave_layout": [
+        1,
+        4
+      ]
+    },
+    {
+      "kid": 21295,
+      "tag": "a16w16_4wave_wl_co",
+      "block_size": 128,
+      "tile": [
+        96,
+        64,
+        128
+      ],
+      "num_slots": 3,
+      "cluster": [
+        4,
+        4
+      ],
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_vgpr": 1024,
+      "dtypes": {
+        "a": "bf16_t",
+        "b": "bf16_t",
+        "c": "bf16_t",
+        "acc": "fp32_t"
+      },
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "variant": "",
+      "wave_layout": [
+        1,
+        4
+      ]
+    },
+    {
+      "kid": 21296,
+      "tag": "a16w16_4wave_wl_co",
+      "block_size": 128,
+      "tile": [
+        128,
+        64,
+        128
+      ],
+      "num_slots": 3,
+      "cluster": [
+        1,
+        1
+      ],
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_vgpr": 1024,
+      "dtypes": {
+        "a": "bf16_t",
+        "b": "bf16_t",
+        "c": "bf16_t",
+        "acc": "fp32_t"
+      },
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "variant": "",
+      "wave_layout": [
+        1,
+        4
+      ]
+    },
+    {
+      "kid": 21297,
+      "tag": "a16w16_4wave_wl_co",
+      "block_size": 128,
+      "tile": [
+        128,
+        64,
+        128
+      ],
+      "num_slots": 3,
+      "cluster": [
+        1,
+        4
+      ],
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_vgpr": 1024,
+      "dtypes": {
+        "a": "bf16_t",
+        "b": "bf16_t",
+        "c": "bf16_t",
+        "acc": "fp32_t"
+      },
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "variant": "",
+      "wave_layout": [
+        1,
+        4
+      ]
+    },
+    {
+      "kid": 21298,
+      "tag": "a16w16_4wave_wl_co",
+      "block_size": 128,
+      "tile": [
+        128,
+        64,
+        128
+      ],
+      "num_slots": 3,
+      "cluster": [
+        4,
+        1
+      ],
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_vgpr": 1024,
+      "dtypes": {
+        "a": "bf16_t",
+        "b": "bf16_t",
+        "c": "bf16_t",
+        "acc": "fp32_t"
+      },
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "variant": "",
+      "wave_layout": [
+        1,
+        4
+      ]
+    },
+    {
+      "kid": 21299,
+      "tag": "a16w16_4wave_wl_co",
+      "block_size": 128,
+      "tile": [
+        128,
+        64,
+        128
+      ],
+      "num_slots": 3,
+      "cluster": [
+        2,
+        2
+      ],
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_vgpr": 1024,
+      "dtypes": {
+        "a": "bf16_t",
+        "b": "bf16_t",
+        "c": "bf16_t",
+        "acc": "fp32_t"
+      },
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "variant": "",
+      "wave_layout": [
+        1,
+        4
+      ]
+    },
+    {
+      "kid": 21300,
+      "tag": "a16w16_4wave_wl_co",
+      "block_size": 128,
+      "tile": [
+        128,
+        64,
+        128
+      ],
+      "num_slots": 3,
+      "cluster": [
+        4,
+        4
+      ],
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_vgpr": 1024,
+      "dtypes": {
+        "a": "bf16_t",
+        "b": "bf16_t",
+        "c": "bf16_t",
+        "acc": "fp32_t"
+      },
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "variant": "",
+      "wave_layout": [
+        1,
+        4
+      ]
     }
   ]
 }

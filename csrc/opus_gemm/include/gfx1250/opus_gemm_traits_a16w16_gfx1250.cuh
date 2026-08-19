@@ -213,7 +213,18 @@ struct opus_a16w16_4wave_compute_traits_gfx1250 {
     static constexpr int SLOT_BYTES_B = B_N * SMEM_PITCH * (int)sizeof(D_B);
     static constexpr int SEG_BYTES_A  = NUM_SLOTS * SLOT_BYTES_A;
     static constexpr int SEG_BYTES_B  = NUM_SLOTS * SLOT_BYTES_B;
-    static constexpr int LDS_BYTES    = SEG_BYTES_A + SEG_BYTES_B;
+    static constexpr int SEG_BYTES_AB = SEG_BYTES_A + SEG_BYTES_B;
+
+    // 1-WG/CU enforcement via LDS padding, the same trick the split-K traits use
+    // below. This pipeline is only correct at one workgroup per CU: every tile
+    // whose A/B segments fit twice in the 320 KB budget (<= 160 KB) raced --
+    // non-deterministically wrong at large grids, all 50 B_N=64 variants and the
+    // smaller B_N=128 ones, in BOTH the reference and the wave-layout pipeline.
+    // Padding past 160 KB so a second workgroup cannot co-reside fixes it; the
+    // pad tail is never accessed. See gen_co/KNOWN_ISSUES.md.
+    static constexpr int kHalfLds     = 160 * 1024;
+    static constexpr int LDS_BYTES    =
+        (SEG_BYTES_AB <= kHalfLds) ? (kHalfLds + 1024) : SEG_BYTES_AB;
     static_assert(LDS_BYTES <= 320 * 1024, "LDS exceeds the 320KB/CU budget");
 
     // aiter-convention aliases for the host launcher (which never sees the

@@ -1,6 +1,6 @@
 # Known correctness issues in the pre-compiled (`.co`) a16w16 families
 
-Three open defects. All produce **wrong results, not faults**, so only a numeric
+One fixed, two open and guarded. All produce **wrong results, not faults**, so only a numeric
 check sees them. Recorded so the next session starts from the reproducers.
 
 Applies to `a16w16_4wave_co` (reference, `..._4wave_compute_...cuh`) and
@@ -8,48 +8,43 @@ Applies to `a16w16_4wave_co` (reference, `..._4wave_compute_...cuh`) and
 
 ---
 
-## 1. Narrow `B_N` races at large shapes — SHIPPED SET FILTERED
+## 1. Narrow `B_N` raced at large shapes — FIXED
 
-**Status:** open. Affects BOTH families, so it predates the wave-layout work.
-The 60 affected kids have been removed from `co_kernels.json`.
+**Status:** fixed by forcing 1 workgroup per CU. Kept here because the symptom
+was subtle and the diagnosis is worth not repeating.
 
-Non-deterministic: same seed, same data, the wrong-element count changes every
-run — including runs that come out clean.
+Non-deterministic wrong results: same seed, same data, the wrong-element count
+changed every run, including runs that came out clean.
 
 ```
-kid 21182  64x64x128 w1x4 c4x1  @ 2048x2048x7168
+kid 21182  64x64x128 w1x4 c4x1  @ 2048x2048x7168   (before the fix)
   rep0 nbad=25416   rep1 nbad=24602   rep2 nbad=33105
 ```
 
-Scope over 203 kids x {2048x2048x7168, 2048x2048x4096, 4096x4096x4096} x 3 reps:
+**Cause.** This pipeline is only correct at one workgroup per CU. Any tile whose
+A/B LDS segments fit twice in the 320 KB budget (<= 160 KB) let a second
+workgroup co-reside, which oversubscribes the per-CU TDM request budget. The
+predicate separated the population exactly: of 203 variants, every one with
+LDS <= 160 KB raced and every one above it was clean — 50/50 at `B_N = 64`,
+10/51 at `B_N = 128`, 0/51 at `B_N >= 192`.
 
-| `B_N` | racy / total |
-|--:|--:|
-| 64 | **50 / 50** |
-| 128 | 10 / 51 |
-| 192 | 0 / 51 |
-| 256 | 0 / 51 |
+**Fix.** Pad `LDS_BYTES` past 160 KB when the real footprint is below it, so a
+second workgroup cannot fit. The pad tail is never accessed. This is the same
+trick `opus_cluster_tdm_splitk_ws_traits_gfx1250` already uses in this header
+for the same reason. All 61 affected variants verify after the change.
 
-Every `B_N = 64` kid races. `B_N >= 192` is clean. By family: reference 16/64,
-wl 44/139 — **the reference family is affected**, so this is not a regression
-from this session's generalisation work.
+Two traps this hit:
 
-It is shape-dependent as well: `1024x1024x7168` is clean on kid 21182 while
-`2048x2048x*` is not, so a small validation shape will not see it.
+* **Both families were affected** (reference 16/64, wl 44/139), so it predated
+  the wave-layout work — a defect found in new code is not necessarily from it.
+* **`build_co.py` mirrors the LDS formula host-side** and did not know about the
+  pad, so its `group_segment_fixed_size == traits` check failed the build. That
+  check is why the drift was caught instead of shipped; keep the two in step.
 
-**This explains the transient tuner warnings** first seen on the PR #4749
-`M=2048, K=7168` sweep (7 `maxDelta` warnings, then two clean re-runs). A race
-produces exactly that: warnings that do not reproduce, and standalone replays of
-the named kids that look fine. An earlier revision of this file concluded "co
-family cleared" from those clean replays — that was wrong, and clean replays of a
-racy kernel prove nothing.
-
-**Danger:** at `1024x1024x7168` kid 21182's error stays under the tuner's
-`0.1 * max|ref|` bound, so the tuner would *accept* it. The bound is not a
-sufficient gate for this defect.
-
-**Reproducer:** any dropped kid at `2048x2048x7168`, 3 repeats, compare the
-wrong-element count across repeats.
+Earlier notes in this file blamed a `B_N > N` tile-wider-than-matrix bug and then
+"cross-candidate interference in mp_tuner". Both were wrong. The tell was that
+standalone replays of the kids the tuner flagged came out clean — which proves
+nothing about a race, and should have pointed at non-determinism sooner.
 
 ---
 

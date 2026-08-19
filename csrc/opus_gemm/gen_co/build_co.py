@@ -208,9 +208,17 @@ def _kernel_metadata(readelf, path, symbol):
 
 
 def _expected_lds(k):
-    """Mirror of the traits LDS formula (kLdsTotalBytes)."""
+    """Mirror of the traits LDS formula (kLdsTotalBytes).
+
+    Including the 1-WG/CU pad: a tile whose A/B segments fit twice in the
+    320 KB budget is padded past 160 KB so a second workgroup cannot co-reside.
+    Keep this in step with LDS_BYTES in the traits -- the check below compares
+    the two and is the reason the drift was caught rather than shipped.
+    """
     pitch = k.B_K + 16 // 2          # + PAD_ELEMS for bf16
-    return k.num_slots * (k.B_M + k.B_N) * pitch * 2
+    seg = k.num_slots * (k.B_M + k.B_N) * pitch * 2
+    half = 160 * 1024
+    return (half + 1024) if seg <= half else seg
 
 
 # A WMMA destination prints as the ENCODED register plus a comment holding the
