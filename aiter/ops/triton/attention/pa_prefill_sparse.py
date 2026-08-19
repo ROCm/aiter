@@ -21,14 +21,14 @@ take a 1-D ``(kv_indices, kv_indptr)`` pair over one pool.
 import torch
 import triton
 
-from aiter.ops.triton._gluon_kernels.gfx950.attention.mla import (
-    mla_gluon as gluon_mla_sparse_prefill,
-)
 from aiter.ops.triton._gluon_kernels.gfx1250.attention.pa_prefill_sparse import (
     _pa_prefill_sparse as gluon_pa_prefill_sparse,
 )
 from aiter.ops.triton._triton_kernels.attention.sparse_attention_dsv4 import (
     _sparse_attn_prefill_kernel,
+)
+from aiter.ops.triton.gluon.mla_gluon import (
+    mla_gluon as gluon_mla_sparse_prefill,
 )
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.logger import AiterTritonLogger
