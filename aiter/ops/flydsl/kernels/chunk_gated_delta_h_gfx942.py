@@ -430,6 +430,7 @@ def compile_chunk_gated_delta_h_gfx942(
     assert W_BATCHED, "Must have batched w-tensor load"
     NUM_LOAD_BATCHES_64 = BT // ROWS_PER_BATCH_64
 
+    STRIDE_U_C = V if WU_CONTIGUOUS else H * V
     STRIDE_W_C = K if WU_CONTIGUOUS else H * K
     STRIDE_Q_C = Hg * K
     # Half a LOAD_VEC_WIDTH run: the XOR swizzle splits a thread's bf16x8 into two
@@ -558,7 +559,6 @@ def compile_chunk_gated_delta_h_gfx942(
                 return fx.Int32(nr_local * 16)
             return (fx.Int32(nr_local * NR_SPLIT) + wid_n) * fx.Int32(16)
 
-        u_ = GTensor(u_tensor, dtype=T.bf16, shape=(-1,))
         g_ = GTensor(g_tensor, dtype=T.f32, shape=(-1,))
         if const_expr(USE_GK):
             gk_ = GTensor(gk_tensor, dtype=T.f32, shape=(-1,))
@@ -606,6 +606,13 @@ def compile_chunk_gated_delta_h_gfx942(
             tc_c_state = fx.make_tiled_copy_C(cp_state, mma_16x16x16_mnk).get_slice(tid)
         if const_expr(COMPUTE_OUTPUT):
             tc_c_x1 = fx.make_tiled_copy_C(cp_lds_x1, mma_16x16x16_mnk).get_slice(tid)
+
+        # u is consumed as GEMM1's C operand (v_new = u - w @ h), so it loads
+        # straight into the C-fragment layout: 4 BT rows x 1 V column per tile.
+        # Those 4 rows are stride_v apart in HBM, so 16b is the widest atom
+        # available.
+        cp_u_g2r = fx.make_copy_atom(fx.rocdl.BufferCopy16b(), fx.BFloat16)
+        tc_c_u = fx.make_tiled_copy_C(cp_u_g2r, mma_16x16x16_mnk).get_slice(tid)
 
         def _cfrag_to_lds(atom, tc, dst_view, acc_vec, n):
             """Convert an f32 accumulator to bf16 and copy it into ``dst_view``.
@@ -712,6 +719,10 @@ def compile_chunk_gated_delta_h_gfx942(
             stride_v = fx.Int32(H * V)
             stride_w = fx.Int32(H * K)
 
+        # This CTA owns the [i_v*BV, (i_v+1)*BV) column window of u, so the
+        # column offset folds into the base and gU is a [BT, BV] view.
+        u_base = v_base + i_v * fx.Int32(BV)
+
         # -- Tiled w staging: HBM [BT, K] tile -> lds_w --
         # Two destination views: 
         # sW_hi is sW_lo composed with a + LDS_HALF offset, which addresses the hi group
@@ -724,31 +735,42 @@ def compile_chunk_gated_delta_h_gfx942(
         sW_hi = fx.make_view(
             lds_w_ptr, fx.make_composed_layout(w_swz, LDS_HALF, w_inner_layout)
         )
-        w_copy_tile = fx.make_tile(
+
+        # General tiled copy definitions.
+        copy_tile = fx.make_tile(
             ROWS_PER_BATCH_64, LOAD_VEC_WIDTH * THREADS_PER_ROW_64
         )
-        _w_tv_thr = (THREADS_PER_ROW_64, ROWS_PER_BATCH_64)
-        _w_tv_thr_stride = (ROWS_PER_BATCH_64 * LOAD_VEC_WIDTH, 1)
-        w_tv_load = fx.make_layout(
-            (_w_tv_thr, (1, LOAD_VEC_WIDTH)),
-            (_w_tv_thr_stride, (1, ROWS_PER_BATCH_64)),
+        _tv_thr = (THREADS_PER_ROW_64, ROWS_PER_BATCH_64)
+        _tv_thr_stride = (ROWS_PER_BATCH_64 * LOAD_VEC_WIDTH, 1)
+        tv_load = fx.make_layout(
+            (_tv_thr, (1, LOAD_VEC_WIDTH)),
+            (_tv_thr_stride, (1, ROWS_PER_BATCH_64)),
         )
-        w_tv_store = fx.make_layout(
-            (_w_tv_thr, (1, LDS_HALF)),
-            (_w_tv_thr_stride, (1, ROWS_PER_BATCH_64)),
+        tv_store = fx.make_layout(
+            (_tv_thr, (1, LDS_HALF)),
+            (_tv_thr_stride, (1, ROWS_PER_BATCH_64)),
         )
-        cp_w_g2r = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.BFloat16)
-        cp_w_r2s = fx.make_copy_atom(fx.UniversalCopy64b(), fx.BFloat16)
-        tc_w_g2r = fx.make_tiled_copy(cp_w_g2r, w_tv_load, w_copy_tile).get_slice(tid)
-        tc_w_r2s = fx.make_tiled_copy(cp_w_r2s, w_tv_store, w_copy_tile).get_slice(tid)
+        buf_cp_g2r_128b_bf16 = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.BFloat16)
+        univ_cp_r2s_64b_bf16 = fx.make_copy_atom(fx.UniversalCopy64b(), fx.BFloat16)
+        tiled_cp_g2r = fx.make_tiled_copy(buf_cp_g2r_128b_bf16, tv_load, copy_tile).get_slice(tid)
+        tiled_cp_r2s = fx.make_tiled_copy(univ_cp_r2s_64b_bf16, tv_store, copy_tile).get_slice(tid)
 
-        w_git = fx.get_iter(fx.rocdl.make_buffer_tensor(w_tensor, max_size=False))
+        # WU decomposition layout definitions.
+        w_buf_tensor = fx.get_iter(fx.rocdl.make_buffer_tensor(w_tensor, max_size=False))
+        u_buf_tensor = fx.get_iter(fx.rocdl.make_buffer_tensor(u_tensor, max_size=False))
         gW = fx.Tensor(
-            fx.make_view(w_git, fx.make_layout((BT, K), (STRIDE_W_C, 1)))
+            fx.make_view(w_buf_tensor, fx.make_layout((BT, K), (STRIDE_W_C, 1)))
         )
-        pS_w = tc_w_g2r.partition_S(gW)
-        pD_w_lo = tc_w_r2s.partition_D(sW_lo)
-        pD_w_hi = tc_w_r2s.partition_D(sW_hi)
+        gU = fx.Tensor(
+            fx.make_view(u_buf_tensor, fx.make_layout((BT, BV), (STRIDE_U_C, 1)))
+        )
+        pS_w = tiled_cp_g2r.partition_S(gW)
+        # u goes through the MMA's C partitioning, not tiled_cp_g2r: its
+        # consumer wants the C-fragment layout, not a row-contiguous tile.
+        pS_u = tc_c_u.partition_S(gU)
+        pD_w_lo = tiled_cp_r2s.partition_D(sW_lo)
+        pD_w_hi = tiled_cp_r2s.partition_D(sW_hi)
+
         if const_expr(COMPUTE_OUTPUT):
             q_git = fx.get_iter(
                 fx.rocdl.make_buffer_tensor(q_tensor, max_size=False)
@@ -756,7 +778,7 @@ def compile_chunk_gated_delta_h_gfx942(
             gQ = fx.Tensor(
                 fx.make_view(q_git, fx.make_layout((BT, K), (STRIDE_Q_C, 1)))
             )
-            pS_q = tc_w_g2r.partition_S(gQ)
+            pS_q = tiled_cp_g2r.partition_S(gQ)
 
         # -- Tiled k staging --
         swz_kt = fx.static(_single_xor_swz(LDS_KT_COLS, LDS_KT_NG))
@@ -793,7 +815,7 @@ def compile_chunk_gated_delta_h_gfx942(
                 fx.make_tile(K_ROW_QUAD_STRIDE, K),
             ).get_slice(tid)
             tc_k_r2s = fx.make_tiled_copy(
-                cp_w_r2s,
+                univ_cp_r2s_64b_bf16,
                 fx.make_layout(
                     ((K_COL_GROUPS, K_ROW_QUAD_STRIDE), (1, 4)),
                     ((4 * K_ROW_QUAD_STRIDE, 4), (1, 1)),
@@ -822,9 +844,9 @@ def compile_chunk_gated_delta_h_gfx942(
             gK = fx.Tensor(
                 fx.make_view(k_git, fx.make_layout((BT, K), (STRIDE_K_C, 1)))
             )
-            pS_k = tc_w_g2r.partition_S(gK)
-            pD_k_lo = tc_w_r2s.partition_D(sK_lo)
-            pD_k_hi = tc_w_r2s.partition_D(sK_hi)
+            pS_k = tiled_cp_g2r.partition_S(gK)
+            pD_k_lo = tiled_cp_r2s.partition_D(sK_lo)
+            pD_k_hi = tiled_cp_r2s.partition_D(sK_hi)
 
         if const_expr(STORE_H):
             # -- h snapshot drain: lds_h -> HBM  --
@@ -862,9 +884,10 @@ def compile_chunk_gated_delta_h_gfx942(
             )
 
         def _stage_g2r(atom, pS, base, stride, it_i32):
-            """Issue chunk ``it_i32``'s [BT, K] tile into a register fragment.
+            """Issue chunk ``it_i32``'s [BT, *] tile into a register fragment.
 
-            ``atom`` MUST be the atom ``pS`` was partitioned with.
+            ``atom`` MUST be the atom ``pS`` was partitioned with. ``stride`` is
+            the row pitch, so the chunk offset is ``it_i32 * BT`` rows.
             """
             frag = fx.make_fragment_like(pS)
             fx.copy(
@@ -894,8 +917,8 @@ def compile_chunk_gated_delta_h_gfx942(
             f_hi = fx.make_fragment_like(dst_hi)
             f_lo.store(halves[0])
             f_hi.store(halves[1])
-            fx.copy(cp_w_r2s, f_lo, dst_lo)
-            fx.copy(cp_w_r2s, f_hi, dst_hi)
+            fx.copy(univ_cp_r2s_64b_bf16, f_lo, dst_lo)
+            fx.copy(univ_cp_r2s_64b_bf16, f_hi, dst_hi)
 
         if const_expr(SAVE_NEW_VALUE):
             if const_expr(IS_VARLEN):
@@ -960,15 +983,16 @@ def compile_chunk_gated_delta_h_gfx942(
                 )
                 h_accs_c[kb].store(cur + add_whole)
 
-        # w rides the loop-carried state as one tiled-copy fragment.
-        N_W_CARRY = 1
+        # w and u ride the loop-carried state as tiled-copy fragments, ahead of
+        # the scalar gate values.
+        N_WU_CARRY = 2
 
-        def _load_gate_u(it_i32):
-            """Issue chunk ``it_i32``'s g/gk/u loads; return them as a flat list.
+        def _load_gate(it_i32):
+            """Issue chunk ``it_i32``'s g/gk loads; return them as a flat list.
 
             Pure loads -- no exp, no in-bounds select -- so nothing in the
             issuing iteration depends on the results. Order must match the
-            N_GATE_G / N_GATE_GK / N_U unpacking in the loop body.
+            N_GATE_G / N_GATE_GK unpacking in the loop body.
 
             Out-of-range rows (the tail chunk, and all of the speculative chunk
             NT) are address-clamped to row 0 like the w prefetch; the values are
@@ -1000,31 +1024,31 @@ def compile_chunk_gated_delta_h_gfx942(
                         + lane_m_base * fx.Int32(4)
                     )
                     out.append(gk_.vec_load((fx.Int64(quad),), 4))
-            for nr in range_constexpr(N_REPEAT_LOCAL):
-                u_col = i_v * fx.Int32(BV) + _nr_v(nr) + lane_n
-                for elem_i in range_constexpr(4):
-                    abs_row = row_base + fx.Int32(elem_i)
-                    safe_row = (abs_row < T_local).select(abs_row, fx.Int32(0))
-                    u_off = v_base + safe_row * stride_v + u_col
-                    out.append(u_.vec_load((fx.Int64(u_off),), 1))
             return out
 
-        # -- Prologue: pre-load first chunk's w + gate/u data --
+        def _stage_wu(it_i32):
+            """Issue chunk ``it_i32``'s w and u tiles as two carried fragments."""
+            return [
+                _stage_g2r(buf_cp_g2r_128b_bf16, pS_w, w_base, stride_w, it_i32),
+                _stage_g2r(cp_u_g2r, pS_u, u_base, stride_v, it_i32),
+            ]
+
+        # -- Prologue: pre-load first chunk's w/u + gate data --
         i_t0_i32 = fx.Int32(0)
         # One tiled copy covers every (batch, kb) slot; the whole [BT, K] tile is
         # one carried fragment.
-        w_prefetch_init = [_stage_g2r(cp_w_g2r, pS_w, w_base, stride_w, i_t0_i32)]
+        wu_prefetch_init = _stage_wu(i_t0_i32)
 
-        gu_prefetch_init = _load_gate_u(i_t0_i32)
+        g_prefetch_init = _load_gate(i_t0_i32)
 
-        init_state = w_prefetch_init + gu_prefetch_init
+        init_state = wu_prefetch_init + g_prefetch_init
         c_zero = fx.Int64(0)
         c_one = fx.Int64(1)
         nt_idx = fx.Int64(NT)
 
         for i_t, state in range(c_zero, nt_idx, c_one, init=init_state):
-            w_prefetch_all = list(state[:N_W_CARRY])
-            gu_prefetch_all = list(state[N_W_CARRY:])
+            wu_prefetch_all = list(state[:N_WU_CARRY])
+            gu_prefetch_all = list(state[N_WU_CARRY:])
             i_t_i32 = fx.Int32(i_t)
 
             # -- Store h snapshot to LDS (group-major [BV][K/4][4] + XOR) --
@@ -1078,7 +1102,7 @@ def compile_chunk_gated_delta_h_gfx942(
                 fx.copy(cp_h_r2g, f_g, pD_h_g, soffset=offset,)
 
             # -- Store prefetched w to LDS (two b64 halves per bf16x8) --
-            _stage_r2s(w_prefetch_all[0], pD_w_lo, pD_w_hi)
+            _stage_r2s(wu_prefetch_all[0], pD_w_lo, pD_w_hi)
 
             gpu.barrier()
 
@@ -1102,10 +1126,10 @@ def compile_chunk_gated_delta_h_gfx942(
                 ]
             else:
                 k_prefetch = _stage_g2r(
-                    cp_w_g2r, pS_k, k_base, stride_k, i_t_i32
+                    buf_cp_g2r_128b_bf16, pS_k, k_base, stride_k, i_t_i32
                 )
 
-            # -- g / gk / u: unpack this chunk's values, prefetched last iter --
+            # -- g / gk: unpack this chunk's values, prefetched last iter --
             # These come off the loop-carried state as bare IR values.
             gu_all = list(gu_prefetch_all)
 
@@ -1118,7 +1142,7 @@ def compile_chunk_gated_delta_h_gfx942(
             if const_expr(USE_GK):
                 # one f32x4 per 64-wide K block (see N_GATE_GK)
                 gk_quads = gu_all[N_GATE_G : N_GATE_G + N_GATE_GK]
-            u_prefetch = gu_all[N_GATE_G + N_GATE_GK :]
+            u_prefetch = fx.Vector(wu_prefetch_all[1])
 
             # -- GEMM1: bv = w @ h  (contraction over K) --
             # A operand reads the very view the g2s copy wrote (see sW_lo).
@@ -1299,13 +1323,13 @@ def compile_chunk_gated_delta_h_gfx942(
                             dtype=fx.BFloat16,
                         )
                     )
-                    fx.copy(cp_w_r2s, f_kt, pD_k[e])
+                    fx.copy(univ_cp_r2s_64b_bf16, f_kt, pD_k[e])
             else:
                 _stage_r2s(k_prefetch, pD_k_lo, pD_k_hi)
 
             gpu.barrier()
 
-            # -- next iteration's w + gate/u prefetch (batched) --
+            # -- next iteration's w/u + gate prefetch (batched) --
             # On the last iteration these read chunk NT, which is out of range
             # and address-clamped; the values are discarded.
             #
@@ -1319,17 +1343,17 @@ def compile_chunk_gated_delta_h_gfx942(
             def _issue_next_prefetch():
                 next_i_t_i32 = i_t_i32 + fx.Int32(1)
                 return (
-                    [_stage_g2r(cp_w_g2r, pS_w, w_base, stride_w, next_i_t_i32)],
-                    _load_gate_u(next_i_t_i32),
+                    _stage_wu(next_i_t_i32),
+                    _load_gate(next_i_t_i32),
                 )
 
             if const_expr(not COMPUTE_OUTPUT):
-                w_next_prefetch, gu_next_prefetch = _issue_next_prefetch()
+                wu_next_prefetch, gu_next_prefetch = _issue_next_prefetch()
             else:
                 # Issue q's HBM loads before GEMM2 so their latency hides behind
                 # GEMM2's MFMA chain. q is independent of GEMM2; only the lds_q
                 # store must wait for GEMM1's lds_w readers.
-                q_prefetch = _stage_g2r(cp_w_g2r, pS_q, q_base, stride_q, i_t_i32)
+                q_prefetch = _stage_g2r(buf_cp_g2r_128b_bf16, pS_q, q_base, stride_q, i_t_i32)
 
             # -- GEMM2: h += k^T @ v_new  (contraction over BT) --
             # Output h is [K, V], contraction BT. Per 64-K block: M = the 64 K
@@ -1590,9 +1614,9 @@ def compile_chunk_gated_delta_h_gfx942(
                             o_off = o_base + o_bt_row * stride_o + o_col
                             _emit_o_store(o_off, _to_bf16_fast(o_scaled[elem_i]))
 
-                w_next_prefetch, gu_next_prefetch = _issue_next_prefetch()
+                wu_next_prefetch, gu_next_prefetch = _issue_next_prefetch()
 
-            yield w_next_prefetch + gu_next_prefetch
+            yield wu_next_prefetch + gu_next_prefetch
 
         # -- Epilogue: store final state --
         if const_expr(STORE_FINAL_STATE):
