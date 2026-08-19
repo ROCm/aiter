@@ -281,6 +281,18 @@ struct mla_16mx1_16nx8_fp8fp8_ps_traits
                   "the two blocks a read phase spans must sit 16 bank slots apart");
 
     static constexpr size_t smem_q_padding_bytes = 9 * 1024 * sizeof(D_Q);
+
+    // ----- cross-wave softmax reduction scratch (D_ACC) -----
+    // Every wave holds the whole Q_TILE_SIZE rows but only KV_TILE_SIZE of the
+    // NUM_WARPS * KV_TILE_SIZE tokens one GEMM0 step consumes, so its row max and row sum
+    // are partial and the waves have to merge them: one D_ACC per (query row, wave) for
+    // each. Sits behind P in the same Q region, which is dead by the first softmax.
+    static constexpr int smem_ml_elems           = W_M * T_N;                        // 128
+    static constexpr size_t smem_ml_offset_bytes = smem_p_bytes;
+    static constexpr size_t smem_ml_bytes        = 2 * smem_ml_elems * sizeof(D_ACC); // 1024
+    static_assert(smem_ml_offset_bytes % (T_N * sizeof(D_ACC)) == 0,
+                  "the T_N-wide row read wants a naturally aligned base");
+
     // ----- V transpose-read bank swizzle -----
     // A block holds smem_n_per_wave_kv tokens, one per row; the rows in its upper half carry
     // their d-groups XORed by one. Also the rotation modulus of the token deal, and hence a
@@ -292,7 +304,8 @@ struct mla_16mx1_16nx8_fp8fp8_ps_traits
     // the prologue has read Q into registers, and needs no ring of its own since a tile's
     // scores are written and consumed inside one phase.
     static constexpr size_t smem_bytes() { return 2 * smem_kv_bytes + smem_q_padding_bytes; }
-    static_assert(smem_p_bytes <= smem_q_padding_bytes, "P must fit in the Q region it aliases");
+    static_assert(smem_p_bytes + smem_ml_bytes <= smem_q_padding_bytes,
+                  "P and the softmax scratch must fit in the Q region they alias");
 
     // fp8 nope + fp8 rope: one dwordx4 (16 fp8) per thread each -> 2 + 1 loads.
     static constexpr int q_nope_buffer_load_insts =

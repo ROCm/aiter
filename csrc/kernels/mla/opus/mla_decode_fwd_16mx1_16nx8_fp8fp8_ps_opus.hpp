@@ -600,18 +600,53 @@ __device__ inline auto make_layout_rv(int warp_id, int lane_id)
 // O register->gmem store. stride_o_h is a parameter because the same layout serves both
 // destinations: the real output uses kargs.stride_o_h, while the split-KV partial writes
 // a densely packed D_NOPE_SIZE-strided o_accum.
+//
+// 16mx1 splits O along d, not along the rows: GEMM1 contracts over every wave's tokens, so
+// all NUM_WARPS waves carry the same Q_TILE_SIZE rows and warp_id picks which SLICE_D of
+// the output d this one owns -- GEMM1_E_N tiles of W_M x W_N, i.e. 16 x 16 x 4 values,
+// T_N * GEMM1_E_N * W_N == D_NOPE_SIZE across the block. Hence warp_id sits on the d side
+// here (in 16mx8 it sits on the row side, and a wave spans all of d instead).
 template <class T>
 __device__ inline auto make_layout_o(int warp_id, int lane_id, int stride_o_h)
 {
+    static_assert(T::T_N * T::GEMM1_E_N * T::W_N == T::D_NOPE_SIZE,
+                  "the waves' d slices must tile the output d exactly once");
 
+    constexpr auto o_block_shape =
+        opus::make_tuple(opus::number<T::GEMM1_E_M>{},                             // e_m
+                         opus::number<T::W_M>{},                                   // query row
+                         opus::number<T::T_N>{},                                   // wave's d slice
+                         opus::number<T::GEMM1_E_N>{},                             // d-tile in it
+                         opus::number<T::W_M * T::W_N / T::WARP_SIZE / T::VEC_O>{},
+                         opus::number<T::WARP_SIZE / T::W_M>{},                    // lane's d group
+                         opus::number<T::VEC_O>{});
+
+    constexpr auto o_block_dim = opus::make_tuple(
+        opus::make_tuple(opus::y_dim{}, opus::p_dim{}),
+        opus::make_tuple(
+            opus::p_dim{}, opus::y_dim{}, opus::y_dim{}, opus::p_dim{}, opus::y_dim{}));
+
+    return opus::make_layout(
+        o_block_shape,
+        opus::unfold_x_stride(o_block_dim, o_block_shape, opus::tuple{stride_o_h, 1_I}),
+        opus::unfold_p_coord(o_block_dim,
+                             opus::tuple{lane_id % T::W_M, warp_id, lane_id / T::W_M}));
 }
 
 // --- softmax / scaling helpers ---
-// W_M = 16 with 64-wide waves, so a row spans four lane groups: both cross-lane
-// reductions need permlane32_swap followed by permlane16_swap (the d192 FMHA kernel, at
-// W_M = 32, gets away with the 32-swap alone).
-template <typename T, typename V>
-__device__ inline typename T::D_ACC attn_row_max(const V& v_s)
+// Two reductions per row, not one. Within a wave, W_M = 16 against 64-wide waves puts a row
+// across four lane groups, so it takes permlane32_swap followed by permlane16_swap (the
+// d192 FMHA kernel, at W_M = 32, gets away with the 32-swap alone). Across waves, 16mx1
+// gives each wave only KV_TILE_SIZE of the NUM_WARPS * KV_TILE_SIZE tokens a GEMM0 step
+// consumes, so what that leaves is a *partial* row max -- and GEMM1 contracts over all of
+// the tokens, so every wave's O accumulator needs the merged one. The waves swap through
+// s_m: lane writes its row's slot `row * T_N + warp_id`, then reads the whole T_N-wide row
+// back and folds it, so all NUM_WARPS waves leave holding the same value.
+//
+// The caller merges the raw (unscaled) max; the temperature is applied to the single scalar
+// afterwards, which commutes with max because it is positive.
+template <typename T, typename V, typename S>
+__device__ inline typename T::D_ACC attn_row_max(const V& v_s, S& s_m, int warp_id, int lane_id)
 {
     using D_ACC                   = typename T::D_ACC;
     constexpr opus::index_t s_len = opus::vector_traits<V>::size();
@@ -623,7 +658,15 @@ __device__ inline typename T::D_ACC attn_row_max(const V& v_s)
     row_max = max(std::bit_cast<float>(res32.x), std::bit_cast<float>(res32.y));
     opus::vector_t<opus::u32_t, 2> res16 = __builtin_amdgcn_permlane16_swap(
         std::bit_cast<opus::u32_t>(row_max), std::bit_cast<opus::u32_t>(row_max), false, true);
-    return max(std::bit_cast<float>(res16.x), std::bit_cast<float>(res16.y));
+    row_max = max(std::bit_cast<float>(res16.x), std::bit_cast<float>(res16.y));
+
+    const int row = lane_id % T::W_M;
+    opus::store(s_m, row_max, row * T::T_N + warp_id);
+    opus::s_waitcnt_lgkmcnt(0_I);
+    __builtin_amdgcn_s_barrier();
+    auto max_warps = opus::load<T::T_N>(s_m, row * T::T_N);
+    opus::static_for<T::T_N>([&](auto i) { row_max = max(row_max, max_warps[i.value]); });
+    return row_max;
 }
 
 // Fused `v_s * scale - row_max`, one v_fma per element. The caller reduces the *raw*
@@ -654,8 +697,11 @@ __device__ inline void attn_exp2_slice(V& v_s)
 // permlane swaps. The tree is 3 deep instead of 8 for the same instruction count. It sums
 // in a different order and therefore rounds differently, which is harmless here: every
 // term is a positive exp2 result.
-template <typename T, typename V>
-__device__ inline typename T::D_ACC attn_row_sum(const V& v_s)
+//
+// Then the same cross-wave merge attn_row_max does, through s_l: the l_row that normalises
+// O has to cover every wave's tokens, since GEMM1 contracted over all of them.
+template <typename T, typename V, typename S>
+__device__ inline typename T::D_ACC attn_row_sum(const V& v_s, S& s_l, int warp_id, int lane_id)
 {
     using D_ACC                   = typename T::D_ACC;
     constexpr opus::index_t s_len = opus::vector_traits<V>::size();
@@ -676,7 +722,16 @@ __device__ inline typename T::D_ACC attn_row_sum(const V& v_s)
     row_sum = std::bit_cast<float>(res32.x) + std::bit_cast<float>(res32.y);
     opus::vector_t<opus::u32_t, 2> res16 = __builtin_amdgcn_permlane16_swap(
         std::bit_cast<opus::u32_t>(row_sum), std::bit_cast<opus::u32_t>(row_sum), false, true);
-    return std::bit_cast<float>(res16.x) + std::bit_cast<float>(res16.y);
+    row_sum = std::bit_cast<float>(res16.x) + std::bit_cast<float>(res16.y);
+
+    const int row = lane_id % T::W_M;
+    opus::store(s_l, row_sum, row * T::T_N + warp_id);
+    opus::s_waitcnt_lgkmcnt(0_I);
+    __builtin_amdgcn_s_barrier();
+    auto sum_warps = opus::load<T::T_N>(s_l, row * T::T_N);
+    row_sum        = D_ACC(0.0f);
+    opus::static_for<T::T_N>([&](auto i) { row_sum += sum_warps[i.value]; });
+    return row_sum;
 }
 
 template <typename T, typename V>
@@ -730,10 +785,13 @@ __device__ inline int causal_kv_bound(int causal_diagonal, int nhead, int warp_i
     return (warp_id * T::W_M) / nhead + causal_diagonal;
 }
 
-// Masks every score column past `last_valid_kv_pos` to -inf.
+// Masks every score column past `last_valid_kv_pos` to -inf. `kv_base_pos` is the absolute
+// KV position of this wave's first score column, which the caller has to supply because a
+// tile's KV_TILE_SIZE * NUM_WARPS tokens are dealt out KV_TILE_SIZE contiguous ones per
+// wave -- the score tile a wave holds is its own slice of the tile, not the whole of it.
 template <typename T, typename V>
 __device__ inline void
-attn_mask_kv_tile(V& v_s, int last_valid_kv_pos, int kv_tile_idx, opus::u32_t neg_inf_v)
+attn_mask_kv_tile(V& v_s, int last_valid_kv_pos, int kv_base_pos, opus::u32_t neg_inf_v)
 {
     using D_ACC    = typename T::D_ACC;
     using D_ACC_X2 = opus::vector_t<D_ACC, 2>;
@@ -744,7 +802,7 @@ attn_mask_kv_tile(V& v_s, int last_valid_kv_pos, int kv_tile_idx, opus::u32_t ne
     constexpr int c_rept              = elems_per_wave_tile / c_pack;
     constexpr int c_rept_stride       = (T::WARP_SIZE / T::W_M) * c_pack;
 
-    const int k_start_pos = kv_tile_idx * T::KV_TILE_SIZE;
+    const int k_start_pos = kv_base_pos;
     int lane_id           = opus::thread_id_x() % T::WARP_SIZE;
     asm volatile("" : "+v"(lane_id));
     const int lane_group = lane_id / T::W_M;
@@ -811,7 +869,10 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
     int diag_kv_bound = 0;
     if constexpr(T::CAUSAL)
     {
-        diag_kv_bound = (warp_id * T::W_M) / kargs.H + causal_diagonal;
+        // Every wave carries the same Q_TILE_SIZE rows (16mx1 tiles N, not M), and the
+        // dispatch only routes nhead == Q_TILE_SIZE with one query token per request here,
+        // so the whole tile sits on a single diagonal -- no per-wave row offset.
+        diag_kv_bound = causal_diagonal;
     }
 
     const int q_gmem_offset = q_len_ptr_s * kargs.stride_q_b;
@@ -838,6 +899,11 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
     // v_q, with barriers between that read and the first P write covering the cross-wave WAR.
     // No slots either -- a tile's scores are written and read back inside one phase.
     auto s_p = make_smem(reinterpret_cast<D_K*>(smem_buffer));
+    // Cross-wave softmax exchange, behind P in that same dead Q region: one D_ACC per
+    // (query row, wave) for the max and, right after it, one for the sum.
+    auto s_m = make_smem(reinterpret_cast<D_ACC*>(smem_buffer + T::smem_ml_offset_bytes));
+    auto s_l =
+        make_smem(reinterpret_cast<D_ACC*>(smem_buffer + T::smem_ml_offset_bytes) + T::smem_ml_elems);
 
     auto u_gq_nope = make_layout_gq_nope<T>(warp_id, lane_id);
     auto u_sq_nope = make_layout_sq_nope<T>(warp_id);
@@ -881,7 +947,7 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
     typename decltype(mma0)::vtype_b v_k;
     typename decltype(mma0)::vtype_c v_s[2];
     typename decltype(mma1)::vtype_a v_p;
-    typename decltype(mma1)::vtype_b v_v;
+    typename decltype(mma1)::vtype_b v_v[2];
 
     // Both GEMM0 operands are cut the same way, the MFMA being square in M and N: the nope
     // k-steps, then the last k-step, whose low half is rope and whose high half is the d that
@@ -935,8 +1001,13 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
     // prefix. `bound` is the tighter of the two limits; the diagonal one is per-warp
     // (readfirstlane'd warp_id) and the rest workgroup-uniform, so it all stays in SGPRs
     // and the branch is scalar.
-    auto mask_oob_scores = [&](auto& s, int tile_idx) {
-        bool masked = (tile_idx + 1) * T::KV_TILE_SIZE > valid_kv_len;
+    // A tile is KV_TILE_SIZE * NUM_WARPS tokens and this wave owns the KV_TILE_SIZE
+    // contiguous ones at wave_kv_base inside it (make_layout_rk's deal comes out to
+    // warp_id * KV_TILE_SIZE once the DMA's block/row shuffle is composed with the read).
+    constexpr int kv_tile_tokens = T::KV_TILE_SIZE * T::NUM_WARPS;
+    const int wave_kv_base       = warp_id * T::KV_TILE_SIZE;
+    auto mask_oob_scores         = [&](auto& s, int tile_idx) {
+        bool masked = (tile_idx + 1) * kv_tile_tokens > valid_kv_len;
         if constexpr(T::CAUSAL)
         {
             masked = masked || (tile_idx == tile_end - 1);
@@ -948,17 +1019,21 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
             {
                 bound = diag_kv_bound < bound ? diag_kv_bound : bound;
             }
-            attn_mask_kv_tile<T>(s, bound, tile_idx, neg_inf_v);
+            attn_mask_kv_tile<T>(s, bound, tile_idx * kv_tile_tokens + wave_kv_base, neg_inf_v);
         }
     };
 
     auto stage_end = [&]() {
         __builtin_amdgcn_sched_barrier(0);
+        // __builtin_amdgcn_s_barrier();
+        // __builtin_amdgcn_sched_barrier(0);
+    };
+
+    auto stage_end_barrier = [&]() {
+        __builtin_amdgcn_sched_barrier(0);
         __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
     };
-
-    auto slot_of = [&](int tile_idx) { return (tile_idx - tile_begin) & 1; };
 
     // P back out of LDS as GEMM1's whole 16 x W_K A operand: one load over u_rp walks all
     // kk halves and row halves. Fence after so the load/store optimiser cannot pair the
@@ -975,7 +1050,7 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
     async_load<T::VEC_Q>(g_q_nope, s_q.ptr, u_gq_nope, u_sq_nope);
     async_load_kv(s_kv[0].ptr, load_kv_page(tile_begin));
     s_waitcnt_vmcnt(number<T::kv_buffer_load_insts>{}); // slot 0 is read below, so drain it outright
-    stage_end();
+    stage_end_barrier();
 
     // load q from smem
     set_slice(v_q, load<T::VEC_Q>(s_q, u_rq_nope), 0_I, number<qk_nope_len>{});
@@ -985,38 +1060,40 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
     async_load_kv(s_kv[1].ptr, load_kv_page(min(tile_begin + 1, tile_end - 1)));
     s_waitcnt_lgkmcnt(0_I);
     s_waitcnt_vmcnt(number<T::kv_buffer_load_insts>{});
-    stage_end();
+    stage_end_barrier();
 
     if constexpr(STAGGER)
     {
         stage_end();
     }
-    // Page index that the first phase prefetches. Indices past the end are clamped to 0
-    // by the buffer descriptor and land in a slot nobody reads.
+    // Page index the first phase prefetches (tile_begin + 2, the one after the two the
+    // prologue has already staged). Indices past the end read as 0 through the kv_indices
+    // descriptor and land in a slot nobody reads.
     int cur_page      = load_kv_page(min(tile_begin + 2, tile_end - 1));
     int nxt_page      = cur_page;
 
     set_slice(v_k, load<T::VEC_KV>(s_kv[0], u_rk), 0_I, number<qk_rope_end>{});
     s_waitcnt_lgkmcnt(0_I);
-    s_waitcnt_vmcnt(0_I);
     stage_end();
 
     v_s[0] = mma0(v_q, v_k, 0, 0);
     mask_oob_scores(v_s[0], tile_begin);
-    m_row = max(m_row, temperature_scale * attn_row_max<T>(v_s[0]));
+    m_row = max(m_row, temperature_scale * attn_row_max<T>(v_s[0], s_m, warp_id, lane_id));
     attn_scale_sub_row<T>(v_s[0], temperature_scale, m_row);
     attn_exp2_slice<T, 0, s_half_len>(v_s[0]);
     asm volatile("" : "+v"(v_s[0])::);
     stage_end();
 
+    v_v[0] = tr_load<T::VEC_TR_V>(s_kv[0], u_rv);
+    s_waitcnt_lgkmcnt(0_I);
     async_load_kv(s_kv[0].ptr, cur_page);
     s_waitcnt_vmcnt(number<T::kv_buffer_load_insts>{});
-    stage_end();
+    stage_end_barrier();
 
     auto run_phase = [&](auto& vs_cur, auto& vs_prev, int cur_slot, int prev_slot, int t) {
         // stage0 [mem]: load k.
         set_slice(v_k, load<T::VEC_KV>(s_kv[cur_slot], u_rk), 0_I, number<qk_rope_end>{});
-        nxt_page = load_kv_page(t + 3);
+        nxt_page = load_kv_page(t + 2);
         s_waitcnt_lgkmcnt(0_I);
         stage_end();
 
@@ -1024,25 +1101,33 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
         __builtin_amdgcn_s_setprio(1);
         vs_cur = mma0(v_q, v_k, 0, 0);
         attn_exp2_slice<T, s_half_len, s_half_len>(vs_prev);
-        l_row += attn_row_sum<T>(vs_prev);
-        store<T::VEC_WRITE_P>(s_p, cast<D_K>(vs_prev), u_sp);
-        s_waitcnt_lgkmcnt(0_I);
-        stage_end();
+        l_row += attn_row_sum<T>(vs_prev, s_l, warp_id, lane_id);
         stage_end();
 
         // stage2 [mem]: P(t-1) and V(t-1); mask S(t) before stage4's softmax head folds it in.
+        store<T::VEC_WRITE_P>(s_p, cast<D_K>(vs_prev), u_sp);
+        s_waitcnt_lgkmcnt(0_I);
+        stage_end_barrier();
+
         load_p(v_p);
-        v_v = tr_load<T::VEC_TR_V>(s_kv[prev_slot], u_rv);
+        // Capture V(t) into registers before the slot is recycled. Prefetch is tile t+2
+        // (nxt_page), the next occupant of this same slot -- cur_page is t+1 and already
+        // lives in the other slot (or is in flight into it from the previous phase).
+        v_v[cur_slot] = tr_load<T::VEC_TR_V>(s_kv[cur_slot], u_rv);
         mask_oob_scores(vs_cur, t);
         s_waitcnt_lgkmcnt(0_I);
-        stage_end();
+
+        async_load_kv(s_kv[cur_slot].ptr, nxt_page);
+        // Leave the just-issued tile in flight: the next phase reads the *other* slot, and
+        // that phase's identical waitcnt is what drains this one before any wave needs it.
+        s_waitcnt_vmcnt(number<T::kv_buffer_load_insts>{});
+        stage_end_barrier();
 
         // stage3 [compute]: gemm1 PV(t-1) [4 MFMA] || softmax-head(t) [scale-sub + exp2 first half].
         __builtin_amdgcn_s_setprio(1);
-        v_o = mma1(v_p, v_v, v_o, 0, 0);
-        asm volatile("" : "+v"(v_p)::);
+        v_o = mma1(v_p, v_v[prev_slot], v_o, 0, 0);
 
-        row_max      = temperature_scale * attn_row_max<T>(vs_cur);
+        row_max      = temperature_scale * attn_row_max<T>(vs_cur, s_m, warp_id, lane_id);
         below_thresh = ((row_max - m_row) <= RESCALE_THRESHOLD);
         all_below    = (__builtin_amdgcn_ballot_w64(below_thresh) == __builtin_amdgcn_read_exec());
         row_max      = all_below ? m_row : max(m_row, row_max);
@@ -1059,9 +1144,10 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
             scale_output_tile<T>(v_o, rescale_m);
         }
         __builtin_amdgcn_s_setprio(0);
-        stage_end();
 
-        cur_page = nxt_page;
+        stage_end();
+        // nxt_page was the tile just issued into cur_slot; unused after that -- next phase
+        // recomputes its own from t+2.
     };
 
     // --- Main loop: tiles tile_begin+1 .. tile_end-1, two phases unrolled per iteration ---
@@ -1083,7 +1169,7 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
     if(t < tile_end) // even tile count: one unpaired phase left
     {
         __builtin_amdgcn_sched_barrier(0);
-        run_phase(v_s[1], v_s[0], 1,0, t);
+        run_phase(v_s[1], v_s[0], 1, 0, t);
         __builtin_amdgcn_sched_barrier(0);
     }
 
@@ -1098,21 +1184,24 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
     // is what keeps the 128-VGPR v_o off scratch: keep the V read and PV outside the branch.
     auto epilogue_tail = [&](auto& vs_last, int last_slot) {
         attn_exp2_slice<T, s_half_len, s_half_len>(vs_last);
-        l_row += attn_row_sum<T>(vs_last);
+        l_row += attn_row_sum<T>(vs_last, s_l, warp_id, lane_id);
         store<T::VEC_WRITE_P>(s_p, cast<D_K>(vs_last), u_sp);
         s_waitcnt_lgkmcnt(0_I);
-        stage_end();
+        stage_end_barrier();
 
         load_p(v_p);
-        v_v = tr_load<T::VEC_TR_V>(s_kv[last_slot], u_rv);
         s_waitcnt_lgkmcnt(0_I);
         stage_end();
 
-        v_o = mma1(v_p, v_v, v_o, 0, 0);
+        v_o = mma1(v_p, v_v[last_slot], v_o, 0, 0);
         __builtin_amdgcn_sched_barrier(0);
     };
 
-    if(((tile_end) & 1) == 0)
+    // Last V lands in v_v[cur_slot] of the last phase (or v_v[0] from the prologue when
+    // there is only one tile). Phases alternate cur=1,0,1,... so an even tile count
+    // (odd phase count) leaves it in v_v[1], an odd tile count in v_v[0]. Same parity
+    // picks the score buffer the last phase wrote.
+    if(((tile_end - tile_begin) & 1) == 0)
         epilogue_tail(v_s[1], 1);
     else
         epilogue_tail(v_s[0], 0);
@@ -1208,9 +1297,11 @@ mla_decode_fwd_one_req(mla_kargs kargs, int w, char* smem_buffer, float temperat
         auto u_o                = make_layout_o<T>(warp_id, lane_id, kargs.stride_o_h);
         auto v_o_out            = cast<D_OUT>(v_o);
         store<T::VEC_O>(g_o, v_o_out, u_o);
+        // One LSE per query row, and after the cross-wave merge every wave holds the same
+        // m_row / l_row for a row, so one wave writes the whole Q_TILE_SIZE.
         // lse_ptr is null when the caller did not ask for LSE; lse_accum in the split-KV
         // branch is always allocated, so only this side needs the guard.
-        if(kargs.lse_ptr != nullptr && lane_id < T::W_M)
+        if(kargs.lse_ptr != nullptr && warp_id == 0 && lane_id < T::W_M)
         {
             const int lse_offset = q_len_ptr_s * kargs.H;
             auto g_lse           = make_gmem(reinterpret_cast<D_ACC*>(kargs.lse_ptr) + lse_offset,
@@ -1218,7 +1309,7 @@ mla_decode_fwd_one_req(mla_kargs kargs, int w, char* smem_buffer, float temperat
             constexpr float INV_LOG2_E = 0.69314718055994531f; // 1 / LOG2_E == ln(2)
             const D_ACC lse = (l_row > D_ACC(0.0f)) ? ((m_row + log2f(l_row)) * INV_LOG2_E)
                                                     : opus::numeric_limits<D_ACC>::lowest();
-            g_lse.store(lse, warp_id * T::Q_TILE_SIZE + lane_id);
+            g_lse.store(lse, lane_id);
         }
     }
     if(slot >= 0)
@@ -1229,7 +1320,7 @@ mla_decode_fwd_one_req(mla_kargs kargs, int w, char* smem_buffer, float temperat
         auto u_oa           = make_layout_o<T>(warp_id, lane_id, T::D_NOPE_SIZE);
         store<T::VEC_O>(g_oa, v_o, u_oa);
 
-        if(lane_id < T::W_M)
+        if(warp_id == 0 && lane_id < T::W_M)
         {
             const int lse_offset = slot * kargs.H;
             auto g_lse           = make_gmem(reinterpret_cast<D_ACC*>(kargs.lse_accum) + lse_offset,
@@ -1237,7 +1328,7 @@ mla_decode_fwd_one_req(mla_kargs kargs, int w, char* smem_buffer, float temperat
             constexpr float INV_LOG2_E = 0.69314718055994531f; // 1 / LOG2_E == ln(2)
             const D_ACC lse = (l_row > D_ACC(0.0f)) ? ((m_row + log2f(l_row)) * INV_LOG2_E)
                                                     : opus::numeric_limits<D_ACC>::lowest();
-            g_lse.store(lse, warp_id * T::Q_TILE_SIZE + lane_id);
+            g_lse.store(lse, lane_id);
         }
     }
 }
@@ -1277,12 +1368,11 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE,
         // __builtin_amdgcn_sched_barrier(0);
         // __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
-        // mla_decode_fwd_one_req<Traits, false>(kargs, w, smem_buffer, temperature_scale);
-        if(warp_id / 4)
-            mla_decode_fwd_one_req<Traits, true>(kargs, w, smem_buffer, temperature_scale);
-        __builtin_amdgcn_sched_barrier(0);
-        if(!(warp_id / 4))
-            mla_decode_fwd_one_req<Traits, false>(kargs, w, smem_buffer, temperature_scale);
+        // No STAGGER here, and it is not a tuning choice: the softmax reductions are
+        // cross-wave (attn_row_max / attn_row_sum swap through s_m / s_l), so all NUM_WARPS
+        // waves have to sit on the same tile. Skewing two wave groups by a stage would pair
+        // their barriers across different tiles and merge unrelated rows.
+        mla_decode_fwd_one_req<Traits, false>(kargs, w, smem_buffer, temperature_scale);
     }
 }
 
