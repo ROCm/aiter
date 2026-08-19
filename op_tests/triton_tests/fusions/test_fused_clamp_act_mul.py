@@ -17,16 +17,20 @@ from op_tests.triton_tests.quant.test_fused_fp8_quant import (
 
 
 def _torch_reference(inp, swiglu_limit, weights, dtype_quant):
+    # torch is now fp32 instead of bf16, to pass kernel fp32 tests
+    # kernel requires fp32 due to activation
     gate, up = inp.chunk(2, dim=-1)
+    gate = gate.float()
+    up = up.float()
     if swiglu_limit > 0:
         up = torch.clamp(up, min=-swiglu_limit, max=swiglu_limit)
         gate = torch.clamp(gate, max=swiglu_limit)
     y = F.silu(gate) * up
     if weights is not None:
-        y = weights * y
+        y = weights.float() * y
     if dtype_quant is None:
         return y.to(inp.dtype)
-    return per_token_fp8_group_quant(y.float(), dtype_quant, 128)
+    return per_token_fp8_group_quant(y, dtype_quant, 128)
 
 
 @pytest.mark.parametrize("M", [1, 2, 4, 8, 32])
@@ -128,9 +132,7 @@ def test_fused_clamp_act_mul(
 def test_fused_clamp_act_mul_weights_multirow_tile(
     M, n_half, weight_broadcast, backend
 ):
-    """Weights must be applied per row when a tile stages BLOCK_SIZE_M > 1 rows.
-
-    """
+    """Weights must be applied per row when a tile stages BLOCK_SIZE_M > 1 rows."""
 
     if backend == "gluon" and not get_arch() in ("gfx1250",):
         pytest.skip("gluon backend requires gfx1250")
@@ -170,7 +172,7 @@ def test_fused_clamp_act_mul_weights_multirow_tile(
 def test_fused_clamp_act_mul_broadcast_matches_expanded(M, n_half, backend):
     """A [M, 1] broadcast weight must equal the same values expanded to [M, N].
 
-    The two take different code paths so testing if they match, and checked with 
+    The two take different code paths so testing if they match, and checked with
     torch.
     """
     if backend == "gluon" and not get_arch() in ("gfx1250",):
