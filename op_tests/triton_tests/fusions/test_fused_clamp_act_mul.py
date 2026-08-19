@@ -16,16 +16,24 @@ from op_tests.triton_tests.quant.test_fused_fp8_quant import (
 )
 
 
-def _torch_reference(inp, swiglu_limit, weights, dtype_quant):
-    # torch is now fp32 instead of bf16, to pass kernel fp32 tests
-    # kernel requires fp32 due to activation
+_TORCH_ACTIVATIONS = {
+    "silu": F.silu,
+    "gelu": F.gelu,
+    "gelu_tanh": lambda x: F.gelu(x, approximate="tanh"),
+    "relu": F.relu,
+    "relu6": lambda x: F.hardtanh(x, 0.0, 6.0),
+}
+
+
+def _torch_reference(inp, swiglu_limit, weights, dtype_quant, activation="silu"):
     gate, up = inp.chunk(2, dim=-1)
     gate = gate.float()
     up = up.float()
     if swiglu_limit > 0:
         up = torch.clamp(up, min=-swiglu_limit, max=swiglu_limit)
         gate = torch.clamp(gate, max=swiglu_limit)
-    y = F.silu(gate) * up
+    act_fn = _TORCH_ACTIVATIONS[activation]
+    y = act_fn(gate) * up
     if weights is not None:
         y = weights.float() * y
     if dtype_quant is None:
@@ -371,3 +379,186 @@ def test_fused_clamp_act_mul_ue8m0(
         assert torch.equal(got, ref_scale)
     else:
         assert torch.equal(scale[:M, :num_blocks], ref_scale)
+
+
+@pytest.mark.parametrize("activation", ["gelu", "gelu_tanh", "relu", "relu6"])
+@pytest.mark.parametrize("M", [1, 4, 32])
+@pytest.mark.parametrize("D", [2048])
+@pytest.mark.parametrize("dtype_quant", [aiter.dtypes.fp8, None])
+@pytest.mark.parametrize("backend", ["triton", "gluon"])
+def test_fused_clamp_act_mul_activations(M, D, activation, dtype_quant, backend):
+    """Every activation path must match the torch reference."""
+    if backend == "gluon" and get_arch() not in ("gfx1250",):
+        pytest.skip("gluon backend requires gfx1250")
+    if backend == "triton" and get_arch() in ("gfx1250",):
+        pytest.skip("gfx1250 runs the gluon backend only")
+
+    torch.manual_seed(42)
+    inp = torch.randn(M, D, device="cuda", dtype=torch.bfloat16)
+
+    if dtype_quant is not None:
+        out_q, scale = fused_clamp_act_mul(
+            inp, swiglu_limit=0.0, activation=activation,
+            dtype_quant=dtype_quant, backend=backend,
+        )
+        ref_q, ref_s = _torch_reference(inp, 0.0, None, dtype_quant, activation)
+        torch.testing.assert_close(
+            upcast(out_q, scale, torch.bfloat16),
+            upcast(ref_q, ref_s, torch.bfloat16),
+            atol=0.1, rtol=0.1,
+        )
+    else:
+        out = fused_clamp_act_mul(
+            inp, swiglu_limit=0.0, activation=activation,
+            dtype_quant=None, backend=backend,
+        )
+        ref = _torch_reference(inp, 0.0, None, None, activation)
+        torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize(
+    "M, n_half",
+    [
+        # N=4096 config: M_LEQ_16384 → BLOCK_SIZE_M=2, ROWS_PER_PROG=2
+        (16384, 4096),
+        # N=8192 config: M_LEQ_8192 → BLOCK_SIZE_M=4, ROWS_PER_PROG=3
+        (8192, 8192),
+        # N=8192 config: M_LEQ_16384 → BLOCK_SIZE_M=2, ROWS_PER_PROG=1
+        (16384, 8192),
+    ],
+)
+@pytest.mark.parametrize("dtype_quant", [aiter.dtypes.fp8, None])
+@pytest.mark.parametrize("backend", ["triton", "gluon"])
+def test_fused_clamp_act_mul_large_n_configs(M, n_half, dtype_quant, backend):
+    """Exercise tuned configs at N=4096 and N=8192 with ROWS_PER_PROG > 1."""
+    if backend == "gluon" and get_arch() not in ("gfx1250",):
+        pytest.skip("gluon backend requires gfx1250")
+    if backend == "triton" and get_arch() in ("gfx1250",):
+        pytest.skip("gfx1250 runs the gluon backend only")
+
+    torch.manual_seed(7)
+    inp = torch.randn(M, 2 * n_half, device="cuda", dtype=torch.bfloat16)
+
+    if dtype_quant is not None:
+        out_q, scale = fused_clamp_act_mul(
+            inp, swiglu_limit=0.0, activation="silu",
+            dtype_quant=dtype_quant, backend=backend,
+        )
+        ref_q, ref_s = _torch_reference(inp, 0.0, None, dtype_quant)
+        torch.testing.assert_close(
+            upcast(out_q, scale, torch.bfloat16),
+            upcast(ref_q, ref_s, torch.bfloat16),
+            atol=0.1, rtol=0.1,
+        )
+    else:
+        out = fused_clamp_act_mul(
+            inp, swiglu_limit=0.0, activation="silu",
+            dtype_quant=None, backend=backend,
+        )
+        ref = _torch_reference(inp, 0.0, None, None)
+        torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("M", [4, 32])
+@pytest.mark.parametrize("D", [2048])
+@pytest.mark.parametrize("dtype_quant", [aiter.dtypes.fp8, None])
+def test_fused_clamp_act_mul_backend_auto(M, D, dtype_quant):
+    """backend=None must pick the right backend and produce correct results."""
+    torch.manual_seed(42)
+    inp = torch.randn(M, D, device="cuda", dtype=torch.bfloat16)
+
+    if dtype_quant is not None:
+        out_q, scale = fused_clamp_act_mul(
+            inp, swiglu_limit=0.0, activation="silu",
+            dtype_quant=dtype_quant, backend=None,
+        )
+        ref_q, ref_s = _torch_reference(inp, 0.0, None, dtype_quant)
+        torch.testing.assert_close(
+            upcast(out_q, scale, torch.bfloat16),
+            upcast(ref_q, ref_s, torch.bfloat16),
+            atol=0.1, rtol=0.1,
+        )
+    else:
+        out = fused_clamp_act_mul(
+            inp, swiglu_limit=0.0, activation="silu",
+            dtype_quant=None, backend=None,
+        )
+        ref = _torch_reference(inp, 0.0, None, None)
+        torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+
+
+# multiple rows per program according to config
+@pytest.mark.parametrize(
+    "M, n_half",
+    [
+        (13, 512),
+        (4099, 512),
+        (8195, 8192),
+        (16387, 4096),
+    ],
+)
+@pytest.mark.parametrize("dtype_quant", [aiter.dtypes.fp8, None])
+@pytest.mark.parametrize("backend", ["triton", "gluon"])
+def test_fused_clamp_act_mul_odd_m_tail(M, n_half, dtype_quant, backend):
+    """Partial last tile: M not divisible by BLOCK_SIZE_M * ROWS_PER_PROG."""
+    if backend == "gluon" and get_arch() not in ("gfx1250",):
+        pytest.skip("gluon backend requires gfx1250")
+    if backend == "triton" and get_arch() in ("gfx1250",):
+        pytest.skip("gfx1250 runs the gluon backend only")
+
+    torch.manual_seed(99)
+    inp = torch.randn(M, 2 * n_half, device="cuda", dtype=torch.bfloat16)
+
+    if dtype_quant is not None:
+        out_q, scale = fused_clamp_act_mul(
+            inp, swiglu_limit=0.0, activation="silu",
+            dtype_quant=dtype_quant, backend=backend,
+        )
+        ref_q, ref_s = _torch_reference(inp, 0.0, None, dtype_quant)
+        torch.testing.assert_close(
+            upcast(out_q, scale, torch.bfloat16),
+            upcast(ref_q, ref_s, torch.bfloat16),
+            atol=0.1, rtol=0.1,
+        )
+    else:
+        out = fused_clamp_act_mul(
+            inp, swiglu_limit=0.0, activation="silu",
+            dtype_quant=None, backend=backend,
+        )
+        ref = _torch_reference(inp, 0.0, None, None)
+        torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("M", [1, 4, 32])
+@pytest.mark.parametrize("D", [2048])
+@pytest.mark.parametrize("dtype_quant", [aiter.dtypes.fp8, None])
+@pytest.mark.parametrize("backend", ["triton", "gluon"])
+def test_fused_clamp_act_mul_float16_input(M, D, dtype_quant, backend):
+    """float16 inputs must work identically to bfloat16."""
+    if backend == "gluon" and get_arch() not in ("gfx1250",):
+        pytest.skip("gluon backend requires gfx1250")
+    if backend == "triton" and get_arch() in ("gfx1250",):
+        pytest.skip("gfx1250 runs the gluon backend only")
+
+    torch.manual_seed(42)
+    inp = torch.randn(M, D, device="cuda", dtype=torch.float16)
+
+    if dtype_quant is not None:
+        out_q, scale = fused_clamp_act_mul(
+            inp, swiglu_limit=0.0, activation="silu",
+            dtype_quant=dtype_quant, backend=backend,
+        )
+        ref_q, ref_s = _torch_reference(inp, 0.0, None, dtype_quant)
+        torch.testing.assert_close(
+            upcast(out_q, scale, torch.bfloat16),
+            upcast(ref_q, ref_s, torch.bfloat16),
+            atol=0.1, rtol=0.1,
+        )
+    else:
+        out = fused_clamp_act_mul(
+            inp, swiglu_limit=0.0, activation="silu",
+            dtype_quant=None, backend=backend,
+        )
+        ref = _torch_reference(inp, 0.0, None, None)
+        assert out.dtype == inp.dtype
+        torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
