@@ -82,32 +82,35 @@ __device__ constexpr unsigned calc_mask(int pass) {
     return (1 << num_bits) - 1;
 }
 
+// Portable stand-in for hipcub::Traits<T>::UnsignedBits. hipcub dropped the
+// public Traits<> class in ROCm 10, and radix_topk only ever operates on fp32,
+// so we provide just the float ordering type we need instead of relying on
+// hipcub internals.
+template <typename T>
+struct radix_traits;
+template <>
+struct radix_traits<float> {
+    using UnsignedBits = uint32_t;
+};
+
 // Map fp32 to an unsigned representation that preserves ordering under uint32 comparison.
 template <typename T>
-__device__ typename hipcub::Traits<T>::UnsignedBits twiddle_in(T key, bool select_min) {
-    auto bits = reinterpret_cast<typename hipcub::Traits<T>::UnsignedBits&>(key);
-    if constexpr (std::is_same_v<T, float>) {
-        uint32_t mask = (bits >> 31) ? 0 : 0x7fffffff;
-        return bits ^ mask;
-    } else {
-        bits = hipcub::Traits<T>::TwiddleIn(bits);
-        if (!select_min) bits = ~bits;
-        return bits;
-    }
+__device__ typename radix_traits<T>::UnsignedBits twiddle_in(T key, bool select_min) {
+    static_assert(std::is_same_v<T, float>, "radix_topk only supports fp32");
+    (void)select_min;
+    auto bits = reinterpret_cast<typename radix_traits<T>::UnsignedBits&>(key);
+    uint32_t mask = (bits >> 31) ? 0 : 0x7fffffff;
+    return bits ^ mask;
 }
 
 // Inverse of twiddle_in: recover fp32 from unsigned bits.
 template <typename T>
-__device__ T twiddle_out(typename hipcub::Traits<T>::UnsignedBits bits, bool select_min) {
-    if constexpr (std::is_same_v<T, float>) {
-        uint32_t mask = (bits >> 31) ? 0u : 0x7fffffffu;
-        bits ^= mask;
-        return reinterpret_cast<T&>(bits);
-    } else {
-        if (!select_min) bits = ~bits;
-        bits = hipcub::Traits<T>::TwiddleOut(bits);
-        return reinterpret_cast<T&>(bits);
-    }
+__device__ T twiddle_out(typename radix_traits<T>::UnsignedBits bits, bool select_min) {
+    static_assert(std::is_same_v<T, float>, "radix_topk only supports fp32");
+    (void)select_min;
+    uint32_t mask = (bits >> 31) ? 0u : 0x7fffffffu;
+    bits ^= mask;
+    return reinterpret_cast<T&>(bits);
 }
 
 template <typename T, int BitsPerPass>
@@ -169,7 +172,7 @@ __device__ void vectorized_process(size_t thread_rank, size_t num_threads, T con
 template <typename T, typename IdxT>
 struct alignas(128) Counter {
     IdxT k; IdxT len; IdxT previous_len;
-    typename hipcub::Traits<T>::UnsignedBits kth_value_bits;
+    typename radix_traits<T>::UnsignedBits kth_value_bits;
     alignas(128) IdxT filter_cnt;
     alignas(128) IdxT out_cnt;
     alignas(128) IdxT out_back_cnt;
@@ -211,7 +214,7 @@ __device__ void choose_bucket(Counter<T, IdxT>* counter, IdxT const* histogram,
         if (prev < k && cur >= k) {
             counter->k = k - prev;
             counter->len = cur - prev;
-            typename hipcub::Traits<T>::UnsignedBits bucket = i;
+            typename radix_traits<T>::UnsignedBits bucket = i;
             int start_bit = calc_start_bit<T, BitsPerPass>(pass);
             counter->kth_value_bits |= bucket << start_bit;
         }
