@@ -126,36 +126,33 @@ def gather_kv_b_proj(
             max_kv_chunks,
             max(1, (get_num_sms() * 6 + tp_k_head_num_k - 1) // tp_k_head_num_k),
         )
-        if chunk_workers < max_kv_chunks:
-            _triton_gather_kv_b_proj_flat[(tp_k_head_num_k * chunk_workers,)](
-                total_kv_k,
-                k_buffer,
-                k_scale,
-                kv_indices,
-                kv_proj_weight,
-                kv_proj_scale,
-                k_prefix,
-                v_prefix,
-                TpNumHeads=tp_k_head_num_k,
-                QkNopeHeadDim=qk_nope_head_dim,
-                VHeadDim=v_head_dim,
-                KV_CDim=weight_k,
-                KV_PeDim=qk_nope_pe_dim - qk_nope_head_dim,
-                ChunkK=ChunkK,
-                PaddedK=padded_k,
-                PaddedV=padded_v,
-                WEIGHT_PRESHUFFLE=weight_preshuffle,
-                PER_ROW_SCALE=per_row_scale,
-                NO_SCALE=no_scale,
-                num_stages=num_stages,
-            )
-            return
+        _triton_gather_kv_b_proj_flat[(tp_k_head_num_k * chunk_workers,)](
+            total_kv_k,
+            k_buffer,
+            k_scale,
+            kv_indices,
+            kv_proj_weight,
+            kv_proj_scale,
+            k_prefix,
+            v_prefix,
+            TpNumHeads=tp_k_head_num_k,
+            QkNopeHeadDim=qk_nope_head_dim,
+            VHeadDim=v_head_dim,
+            KV_CDim=weight_k,
+            KV_PeDim=qk_nope_pe_dim - qk_nope_head_dim,
+            ChunkK=ChunkK,
+            PaddedK=padded_k,
+            PaddedV=padded_v,
+            WEIGHT_PRESHUFFLE=weight_preshuffle,
+            PER_ROW_SCALE=per_row_scale,
+            NO_SCALE=no_scale,
+            GRID_STRIDE=chunk_workers < max_kv_chunks,
+            num_stages=num_stages,
+        )
+        return
 
-    grid_batch_heads = (
-        tp_k_head_num_k if flat_token_grid else batch_size * tp_k_head_num_k
-    )
-    grid = (grid_batch_heads * max_kv_chunks,)
     if is_fp4_weight:
+        grid = (batch_size * tp_k_head_num_k * max_kv_chunks,)
         fp4_scale_k_granularity = 32 if weight_preshuffle else 128
         _triton_gather_kv_b_proj[grid](
             batch_size,
@@ -187,6 +184,7 @@ def gather_kv_b_proj(
         )
         return
 
+    grid = (batch_size * tp_k_head_num_k,)
     _triton_gather_kv_b_proj[grid](
         batch_size,
         total_kv_k,
@@ -213,6 +211,5 @@ def gather_kv_b_proj(
         PER_ROW_SCALE=per_row_scale,
         NO_SCALE=no_scale,
         SHUFFLED_KV_CACHE=shuffled_kv_cache,
-        FLAT_TOKEN_GRID=flat_token_grid,
         num_stages=num_stages,
     )

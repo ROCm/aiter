@@ -374,7 +374,6 @@ def _triton_gather_kv_b_proj_fp4_impl(
 @triton.jit
 def _triton_gather_kv_b_proj_impl(
     batch_size,
-    total_kv,
     k_buffer,  # [num_block, block_size, kv_c_dim + kv_pe_dim]
     k_scale,  # [1] or None
     kv_indptr,  # [batch_size + 1]
@@ -397,7 +396,6 @@ def _triton_gather_kv_b_proj_impl(
     PER_ROW_SCALE: tl.constexpr = False,
     NO_SCALE: tl.constexpr = False,
     SHUFFLED_KV_CACHE: tl.constexpr = False,
-    FLAT_TOKEN_GRID: tl.constexpr = False,
 ):
     # All three strides are multiplied by runtime indices that can overflow
     # i32 at large scales. Promote the scalar (broadcast) side to i64 so the multiply
@@ -416,41 +414,17 @@ def _triton_gather_kv_b_proj_impl(
     # ===---------------------------------------------------
     # Workload Partition
     # ===---------------------------------------------------
-    # Page-size-1 inputs use one program per (head, global token chunk). Both
-    # kv_indices and output rows are packed in batch-major token order, and this
-    # projection has no cross-token state, so chunks may cross sequence
-    # boundaries without consulting either indptr.
-    #
-    # Other layouts use one program per (batch, head, sequence-local KV chunk).
-    flat_pid = tl.program_id(0)
-    if FLAT_TOKEN_GRID:
-        assert KBlockSize == 1
-        pid_head = flat_pid % TpNumHeads
-        chunk_id = flat_pid // TpNumHeads
-        kv_block_start = 0
-        context_start = 0
-        context_end = total_kv
-        total_kv_block = total_kv
-    else:
-        num_batch_heads = batch_size * TpNumHeads
-        pid = flat_pid % num_batch_heads
-        chunk_id = flat_pid // num_batch_heads
-        pid_batch = pid // TpNumHeads
-        pid_head = pid % TpNumHeads
+    pid = tl.program_id(0)
+    pid_batch = pid // TpNumHeads
+    pid_head = pid % TpNumHeads
 
-        kv_block_start = tl.load(kv_indptr + pid_batch)
-        kv_block_end = tl.load(kv_indptr + pid_batch + 1)
+    kv_block_start = tl.load(kv_indptr + pid_batch)
+    kv_block_end = tl.load(kv_indptr + pid_batch + 1)
 
-        context_start = tl.load(kv_prefix_sum_context_lens + pid_batch)
-        context_end = tl.load(kv_prefix_sum_context_lens + pid_batch + 1)
+    context_start = tl.load(kv_prefix_sum_context_lens + pid_batch)
+    context_end = tl.load(kv_prefix_sum_context_lens + pid_batch + 1)
 
-        total_kv_block = kv_block_end - kv_block_start
-
-    # The generic grid's chunk axis is an upper bound over the whole batch, so
-    # programs past their sequence's end return before loading projection data.
-    # This also handles the empty total_kv case for the flat-token grid.
-    if chunk_id >= (total_kv_block + KBlocksPerChunkK - 1) // KBlocksPerChunkK:
-        return
+    total_kv_block = kv_block_end - kv_block_start
 
     # ===---------------------------------------------------
     # Pipeline Start
@@ -634,139 +608,156 @@ def _triton_gather_kv_b_proj_impl(
     else:
         CHUNK_STRIDE: tl.constexpr = ScaleKGranularity
 
-    block_lane_valid = (
-        chunk_id * KBlocksPerChunkK + tl.arange(0, ChunkK) // KBlockSize
-        < total_kv_block
-    )
-    kv_block_idx = tl.load(
-        kv_indices
-        + kv_block_start
-        + chunk_id * KBlocksPerChunkK
-        + tl.arange(0, ChunkK) // KBlockSize,
-        mask=block_lane_valid,
-        other=0,
-    )
-    if SHUFFLED_KV_CACHE:
-        kv_c_data_base_offset = (
-            kv_block_idx[:, None] * stride_k_buffer
-            + shfl_tok_nope[:, None]
-            + shfl_col_nope[None, :]
-        )  # [ChunkK, ScaleKGranularity]
-    else:
-        kv_c_data_base_offset = (
-            kv_block_idx[:, None] * stride_k_buffer
-            + tl.arange(0, ChunkK)[:, None] % KBlockSize * (KV_CDim + KV_PeDim)
-            + tl.arange(0, ScaleKGranularity)[None, :]
-        )  # [ChunkK, kv_c_dim]
+    for chunk_id in range((total_kv_block + KBlocksPerChunkK - 1) // KBlocksPerChunkK):
+        block_lane_valid = (
+            chunk_id * KBlocksPerChunkK + tl.arange(0, ChunkK) // KBlockSize
+            < total_kv_block
+        )
+        kv_block_idx = tl.load(
+            kv_indices
+            + kv_block_start
+            + chunk_id * KBlocksPerChunkK
+            + tl.arange(0, ChunkK) // KBlockSize,
+            mask=block_lane_valid,
+            other=0,
+        )
+        if SHUFFLED_KV_CACHE:
+            kv_c_data_base_offset = (
+                kv_block_idx[:, None] * stride_k_buffer
+                + shfl_tok_nope[:, None]
+                + shfl_col_nope[None, :]
+            )  # [ChunkK, ScaleKGranularity]
+        else:
+            kv_c_data_base_offset = (
+                kv_block_idx[:, None] * stride_k_buffer
+                + tl.arange(0, ChunkK)[:, None] % KBlockSize * (KV_CDim + KV_PeDim)
+                + tl.arange(0, ScaleKGranularity)[None, :]
+            )  # [ChunkK, kv_c_dim]
 
-    accum_k = tl.zeros((ChunkK, PaddedK), dtype=tl.float32)
-    accum_v = tl.zeros((ChunkK, PaddedV), dtype=tl.float32)
+        accum_k = tl.zeros((ChunkK, PaddedK), dtype=tl.float32)
+        accum_v = tl.zeros((ChunkK, PaddedV), dtype=tl.float32)
 
-    row_mask = block_lane_valid[:, None]
-    kv_c_data_0 = tl.load(
-        k_buffer + kv_c_data_base_offset + 0 * CHUNK_STRIDE,
-        mask=row_mask,
-        other=0.0,
-    )
-    kv_c_data_1 = tl.load(
-        k_buffer + kv_c_data_base_offset + 1 * CHUNK_STRIDE,
-        mask=row_mask,
-        other=0.0,
-    )
-    kv_c_data_2 = tl.load(
-        k_buffer + kv_c_data_base_offset + 2 * CHUNK_STRIDE,
-        mask=row_mask,
-        other=0.0,
-    )
-    kv_c_data_3 = tl.load(
-        k_buffer + kv_c_data_base_offset + 3 * CHUNK_STRIDE,
-        mask=row_mask,
-        other=0.0,
-    )
-    if SHUFFLED_KV_CACHE:
-        kv_pe_data = tl.load(
-            k_buffer
-            + kv_block_idx[:, None] * stride_k_buffer
-            + KBlockSize * KV_CDim
-            + shfl_tok_pe[:, None]
-            + shfl_col_pe[None, :],
+        row_mask = block_lane_valid[:, None]
+        kv_c_data_0 = tl.load(
+            k_buffer + kv_c_data_base_offset + 0 * CHUNK_STRIDE,
             mask=row_mask,
             other=0.0,
         )
-    else:
-        kv_pe_data = tl.load(
-            k_buffer
-            + kv_block_idx[:, None] * stride_k_buffer
-            + tl.arange(0, ChunkK)[:, None] % KBlockSize * (KV_CDim + KV_PeDim)
-            + KV_CDim
+        kv_c_data_1 = tl.load(
+            k_buffer + kv_c_data_base_offset + 1 * CHUNK_STRIDE,
+            mask=row_mask,
+            other=0.0,
+        )
+        kv_c_data_2 = tl.load(
+            k_buffer + kv_c_data_base_offset + 2 * CHUNK_STRIDE,
+            mask=row_mask,
+            other=0.0,
+        )
+        kv_c_data_3 = tl.load(
+            k_buffer + kv_c_data_base_offset + 3 * CHUNK_STRIDE,
+            mask=row_mask,
+            other=0.0,
+        )
+        if SHUFFLED_KV_CACHE:
+            kv_pe_data = tl.load(
+                k_buffer
+                + kv_block_idx[:, None] * stride_k_buffer
+                + KBlockSize * KV_CDim
+                + shfl_tok_pe[:, None]
+                + shfl_col_pe[None, :],
+                mask=row_mask,
+                other=0.0,
+            )
+        else:
+            kv_pe_data = tl.load(
+                k_buffer
+                + kv_block_idx[:, None] * stride_k_buffer
+                + tl.arange(0, ChunkK)[:, None] % KBlockSize * (KV_CDim + KV_PeDim)
+                + KV_CDim
+                + tl.arange(0, KV_PeDim)[None, :],
+                mask=row_mask,
+                other=0.0,
+            )
+
+        if NO_SCALE:
+            accum_k = tl.dot(kv_c_data_0, k_nope_weight_0.T, acc=accum_k)
+            accum_v = tl.dot(kv_c_data_0, v_nope_weight_0.T, acc=accum_v)
+            accum_k = tl.dot(kv_c_data_1, k_nope_weight_1.T, acc=accum_k)
+            accum_v = tl.dot(kv_c_data_1, v_nope_weight_1.T, acc=accum_v)
+            accum_k = tl.dot(kv_c_data_2, k_nope_weight_2.T, acc=accum_k)
+            accum_v = tl.dot(kv_c_data_2, v_nope_weight_2.T, acc=accum_v)
+            accum_k = tl.dot(kv_c_data_3, k_nope_weight_3.T, acc=accum_k)
+            accum_v = tl.dot(kv_c_data_3, v_nope_weight_3.T, acc=accum_v)
+        elif PER_ROW_SCALE:
+            accum_k += (
+                tl.dot(kv_c_data_0, k_nope_weight_0.T) * k_nope_scale_vec[None, :]
+            )
+            accum_v += (
+                tl.dot(kv_c_data_0, v_nope_weight_0.T) * v_nope_scale_vec[None, :]
+            )
+            accum_k += (
+                tl.dot(kv_c_data_1, k_nope_weight_1.T) * k_nope_scale_vec[None, :]
+            )
+            accum_v += (
+                tl.dot(kv_c_data_1, v_nope_weight_1.T) * v_nope_scale_vec[None, :]
+            )
+            accum_k += (
+                tl.dot(kv_c_data_2, k_nope_weight_2.T) * k_nope_scale_vec[None, :]
+            )
+            accum_v += (
+                tl.dot(kv_c_data_2, v_nope_weight_2.T) * v_nope_scale_vec[None, :]
+            )
+            accum_k += (
+                tl.dot(kv_c_data_3, k_nope_weight_3.T) * k_nope_scale_vec[None, :]
+            )
+            accum_v += (
+                tl.dot(kv_c_data_3, v_nope_weight_3.T) * v_nope_scale_vec[None, :]
+            )
+        else:
+            accum_k += tl.dot(kv_c_data_0, k_nope_weight_0.T) * k_nope_scale_0[None, :]
+            accum_v += tl.dot(kv_c_data_0, v_nope_weight_0.T) * v_nope_scale_0[None, :]
+            accum_k += tl.dot(kv_c_data_1, k_nope_weight_1.T) * k_nope_scale_1[None, :]
+            accum_v += tl.dot(kv_c_data_1, v_nope_weight_1.T) * v_nope_scale_1[None, :]
+            accum_k += tl.dot(kv_c_data_2, k_nope_weight_2.T) * k_nope_scale_2[None, :]
+            accum_v += tl.dot(kv_c_data_2, v_nope_weight_2.T) * v_nope_scale_2[None, :]
+            accum_k += tl.dot(kv_c_data_3, k_nope_weight_3.T) * k_nope_scale_3[None, :]
+            accum_v += tl.dot(kv_c_data_3, v_nope_weight_3.T) * v_nope_scale_3[None, :]
+
+        accum_k *= k_scalar_scale
+        accum_v *= k_scalar_scale
+        kv_pe_data *= k_scalar_scale
+
+        context_mask = (
+            context_start + chunk_id * ChunkK + tl.arange(0, ChunkK) < context_end
+        )
+        tl.store(
+            k_prefix
+            + (context_start + chunk_id * ChunkK + tl.arange(0, ChunkK))[:, None]
+            * stride_k_prefix
+            + pid_head * (QkNopeHeadDim + KV_PeDim)
+            + QkNopeHeadDim
             + tl.arange(0, KV_PeDim)[None, :],
-            mask=row_mask,
-            other=0.0,
+            kv_pe_data,
+            mask=context_mask[:, None],
         )
-
-    if NO_SCALE:
-        accum_k = tl.dot(kv_c_data_0, k_nope_weight_0.T, acc=accum_k)
-        accum_v = tl.dot(kv_c_data_0, v_nope_weight_0.T, acc=accum_v)
-        accum_k = tl.dot(kv_c_data_1, k_nope_weight_1.T, acc=accum_k)
-        accum_v = tl.dot(kv_c_data_1, v_nope_weight_1.T, acc=accum_v)
-        accum_k = tl.dot(kv_c_data_2, k_nope_weight_2.T, acc=accum_k)
-        accum_v = tl.dot(kv_c_data_2, v_nope_weight_2.T, acc=accum_v)
-        accum_k = tl.dot(kv_c_data_3, k_nope_weight_3.T, acc=accum_k)
-        accum_v = tl.dot(kv_c_data_3, v_nope_weight_3.T, acc=accum_v)
-    elif PER_ROW_SCALE:
-        accum_k += tl.dot(kv_c_data_0, k_nope_weight_0.T) * k_nope_scale_vec[None, :]
-        accum_v += tl.dot(kv_c_data_0, v_nope_weight_0.T) * v_nope_scale_vec[None, :]
-        accum_k += tl.dot(kv_c_data_1, k_nope_weight_1.T) * k_nope_scale_vec[None, :]
-        accum_v += tl.dot(kv_c_data_1, v_nope_weight_1.T) * v_nope_scale_vec[None, :]
-        accum_k += tl.dot(kv_c_data_2, k_nope_weight_2.T) * k_nope_scale_vec[None, :]
-        accum_v += tl.dot(kv_c_data_2, v_nope_weight_2.T) * v_nope_scale_vec[None, :]
-        accum_k += tl.dot(kv_c_data_3, k_nope_weight_3.T) * k_nope_scale_vec[None, :]
-        accum_v += tl.dot(kv_c_data_3, v_nope_weight_3.T) * v_nope_scale_vec[None, :]
-    else:
-        accum_k += tl.dot(kv_c_data_0, k_nope_weight_0.T) * k_nope_scale_0[None, :]
-        accum_v += tl.dot(kv_c_data_0, v_nope_weight_0.T) * v_nope_scale_0[None, :]
-        accum_k += tl.dot(kv_c_data_1, k_nope_weight_1.T) * k_nope_scale_1[None, :]
-        accum_v += tl.dot(kv_c_data_1, v_nope_weight_1.T) * v_nope_scale_1[None, :]
-        accum_k += tl.dot(kv_c_data_2, k_nope_weight_2.T) * k_nope_scale_2[None, :]
-        accum_v += tl.dot(kv_c_data_2, v_nope_weight_2.T) * v_nope_scale_2[None, :]
-        accum_k += tl.dot(kv_c_data_3, k_nope_weight_3.T) * k_nope_scale_3[None, :]
-        accum_v += tl.dot(kv_c_data_3, v_nope_weight_3.T) * v_nope_scale_3[None, :]
-
-    accum_k *= k_scalar_scale
-    accum_v *= k_scalar_scale
-    kv_pe_data *= k_scalar_scale
-
-    context_mask = (
-        context_start + chunk_id * ChunkK + tl.arange(0, ChunkK) < context_end
-    )
-    tl.store(
-        k_prefix
-        + (context_start + chunk_id * ChunkK + tl.arange(0, ChunkK))[:, None]
-        * stride_k_prefix
-        + pid_head * (QkNopeHeadDim + KV_PeDim)
-        + QkNopeHeadDim
-        + tl.arange(0, KV_PeDim)[None, :],
-        kv_pe_data,
-        mask=context_mask[:, None],
-    )
-    tl.store(
-        k_prefix
-        + (context_start + chunk_id * ChunkK + tl.arange(0, ChunkK))[:, None]
-        * stride_k_prefix
-        + pid_head * (QkNopeHeadDim + KV_PeDim)
-        + offs_n_k[None, :],
-        accum_k,
-        mask=context_mask[:, None] & mask_k[None, :],
-    )
-    tl.store(
-        v_prefix
-        + (context_start + chunk_id * ChunkK + tl.arange(0, ChunkK))[:, None]
-        * stride_v_prefix
-        + pid_head * VHeadDim
-        + offs_n_v[None, :],
-        accum_v,
-        mask=context_mask[:, None] & mask_v[None, :],
-    )
+        tl.store(
+            k_prefix
+            + (context_start + chunk_id * ChunkK + tl.arange(0, ChunkK))[:, None]
+            * stride_k_prefix
+            + pid_head * (QkNopeHeadDim + KV_PeDim)
+            + offs_n_k[None, :],
+            accum_k,
+            mask=context_mask[:, None] & mask_k[None, :],
+        )
+        tl.store(
+            v_prefix
+            + (context_start + chunk_id * ChunkK + tl.arange(0, ChunkK))[:, None]
+            * stride_v_prefix
+            + pid_head * VHeadDim
+            + offs_n_v[None, :],
+            accum_v,
+            mask=context_mask[:, None] & mask_v[None, :],
+        )
 
 
 @triton.jit
@@ -790,6 +781,7 @@ def _triton_gather_kv_b_proj_flat(
     WEIGHT_PRESHUFFLE: tl.constexpr = False,
     PER_ROW_SCALE: tl.constexpr = False,
     NO_SCALE: tl.constexpr = False,
+    GRID_STRIDE: tl.constexpr = False,
 ):
     ScaleKGranularity: tl.constexpr = 128
     ScaleNGranularity: tl.constexpr = 128
@@ -802,7 +794,10 @@ def _triton_gather_kv_b_proj_flat(
     num_chunks = (total_kv + ChunkK - 1) // ChunkK
     if chunk_id >= num_chunks:
         return
-    num_iters = (num_chunks - chunk_id + chunk_stride - 1) // chunk_stride
+    if GRID_STRIDE:
+        num_iters = (num_chunks - chunk_id + chunk_stride - 1) // chunk_stride
+    else:
+        num_iters: tl.constexpr = 1
 
     stride_k_buffer = tl.full([], KV_CDim + KV_PeDim, dtype=tl.int64)
     stride_k_prefix = tl.full(
@@ -1087,7 +1082,6 @@ def _triton_gather_kv_b_proj(
     PER_ROW_SCALE: tl.constexpr = False,
     NO_SCALE: tl.constexpr = False,
     SHUFFLED_KV_CACHE: tl.constexpr = False,
-    FLAT_TOKEN_GRID: tl.constexpr = False,
 ):
     if IS_FP4:
         _triton_gather_kv_b_proj_fp4_impl(
@@ -1118,7 +1112,6 @@ def _triton_gather_kv_b_proj(
     else:
         _triton_gather_kv_b_proj_impl(
             batch_size,
-            total_kv,
             k_buffer,
             k_scale,
             kv_indptr,
@@ -1141,5 +1134,4 @@ def _triton_gather_kv_b_proj(
             PER_ROW_SCALE,
             NO_SCALE,
             SHUFFLED_KV_CACHE,
-            FLAT_TOKEN_GRID,
         )
