@@ -57,6 +57,7 @@ def _get_gate_up(
     scale_bn,
     scale_bk,
     num_experts,
+    dot2_acc,
 ):
     return build_gate_up_fp8_module(
         hidden,
@@ -68,6 +69,7 @@ def _get_gate_up(
         scale_bn=scale_bn,
         scale_bk=scale_bk,
         num_experts=num_experts,
+        dot2_acc=dot2_acc,
     )
 
 
@@ -84,6 +86,7 @@ def _get_down_reduce(
     kh_per_warp,
     k_batch,
     num_experts,
+    dot2_acc,
 ):
     return build_down_reduce_fp8_module(
         inter,
@@ -97,6 +100,7 @@ def _get_down_reduce(
         kh_per_warp=kh_per_warp,
         k_batch=k_batch,
         num_experts=num_experts,
+        dot2_acc=dot2_acc,
     )
 
 
@@ -258,6 +262,7 @@ def flydsl_warp_decode_gate_up(
     w_scale_mode: str = "pertensor",
     scale_block: tuple[int, int] | None = None,
     serialize_dot2: bool = True,
+    dot2_acc: int = 1,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """gate_up stage of warp-decode MoE (BF16 activation, FP8 e4m3 weights).
@@ -279,6 +284,9 @@ def flydsl_warp_decode_gate_up(
             (row-block, K-block) with (BN, BK) = ``scale_block``.
         w_scale_mode: "pertensor", "pertoken" or "block2d".
         scale_block:  (BN, BK) block dims, required when ``w_scale_mode='block2d'``.
+        dot2_acc:     G7 dot2 ILP -- number of independent f32 accumulators for the
+                      s_nop-free multi-accumulator dot2 (>1 enables the drain form;
+                      1 = serialized ``s_nop 2`` baseline). Correctness-invariant.
         out:          optional [B, TOPK, INTER] bfloat16 output buffer.
 
     Returns:
@@ -317,6 +325,7 @@ def flydsl_warp_decode_gate_up(
         scale_bn,
         scale_bk,
         E,
+        dot2_acc,
     )
     grid_x = B * TOPK * INTER
     _run(
@@ -511,6 +520,7 @@ def flydsl_warp_decode_down_reduce(
     serialize_dot2: bool = True,
     kh_per_warp: int | None = None,
     split_k: int | str = 1,
+    dot2_acc: int = 1,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """down_reduce stage of warp-decode MoE (BF16 intermediate, FP8 e4m3 weights).
@@ -541,6 +551,9 @@ def flydsl_warp_decode_down_reduce(
             Pass ``"auto"`` to CU-count-gate the factor: picks the largest valid
             ``k ? {8,4,2}`` with ``base_grid.k <= CuCount`` (and ``num_iter % k == 0``),
             else 1 -- so saturated grids (DeepSeek) stay on the fast path automatically.
+        dot2_acc:     G7 dot2 ILP -- number of independent f32 accumulators for the
+            s_nop-free multi-accumulator dot2 (>1 enables the drain form; 1 =
+            serialized ``s_nop 2`` baseline). Correctness-invariant.
         out:          optional [B, HIDDEN] bfloat16 output buffer.
 
     Returns:
@@ -590,6 +603,7 @@ def flydsl_warp_decode_down_reduce(
         kh_per_warp,
         split_k,
         E,
+        dot2_acc,
     )
     # Split-K writes FP32 partials via atomic-add into a caller-zeroed accumulator;
     # the plain path stores bf16 directly to `out` (Locked decision, main plan ?1.2).
