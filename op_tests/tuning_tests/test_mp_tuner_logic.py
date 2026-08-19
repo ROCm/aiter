@@ -17,10 +17,9 @@ import time
 import unittest
 from multiprocessing import TimeoutError as MPTimeoutError
 
-
-def _wait_for_release(release, value):
-    release.wait(timeout=5)
-    return value
+# Spawn workers must receive picklable callables from importable modules, not
+# from this test file's __main__ namespace.
+_SPAWN_WORKER_STARTUP_SEC = 60
 
 
 class FakeAsyncResult:
@@ -315,9 +314,11 @@ class TestTaskExecutionTiming(unittest.TestCase):
         tuner = importlib.import_module("aiter.utility.mp_tuner")
         init_start_times = getattr(tuner, "_init_task_start_times", None)
         run_with_tracking = getattr(tuner, "_run_with_start_tracking", None)
+        wait_for_event = getattr(tuner, "_wait_for_event", None)
 
         self.assertIsNotNone(init_start_times)
         self.assertIsNotNone(run_with_tracking)
+        self.assertIsNotNone(wait_for_event)
 
         ctx = mp.get_context("spawn")
         start_times = ctx.RawArray("d", 2)
@@ -326,17 +327,21 @@ class TestTaskExecutionTiming(unittest.TestCase):
         pool = ctx.Pool(1, initializer=init_start_times, initargs=(start_times,))
         try:
             first = pool.apply_async(
-                run_with_tracking, (0, _wait_for_release, (release, "first"))
+                run_with_tracking, (0, wait_for_event, (release, "first"))
             )
             second = pool.apply_async(
-                run_with_tracking, (1, _wait_for_release, (release, "second"))
+                run_with_tracking, (1, wait_for_event, (release, "second"))
             )
 
-            deadline = time.monotonic() + 5
+            deadline = time.monotonic() + _SPAWN_WORKER_STARTUP_SEC
             while start_times[0] == 0 and time.monotonic() < deadline:
                 time.sleep(0.01)
 
-            self.assertGreater(start_times[0], 0)
+            self.assertGreater(
+                start_times[0],
+                0,
+                "spawn worker did not record a start time; check pool task errors",
+            )
             self.assertEqual(
                 start_times[1],
                 0,
@@ -344,8 +349,8 @@ class TestTaskExecutionTiming(unittest.TestCase):
             )
 
             release.set()
-            self.assertEqual(first.get(timeout=5), "first")
-            self.assertEqual(second.get(timeout=5), "second")
+            self.assertEqual(first.get(timeout=10), "first")
+            self.assertEqual(second.get(timeout=10), "second")
             self.assertGreater(start_times[1], 0)
         finally:
             release.set()

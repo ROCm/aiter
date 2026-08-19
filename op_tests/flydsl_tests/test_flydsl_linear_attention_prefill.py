@@ -393,29 +393,72 @@ def expand_groups(groups):
     return out
 
 
+_DENSE_PROMPT_LENS = [2500, 60000, 128000]
+_MNBT_ALI_SWEEP = [8192, 16384, 24576, 32768, 40960, 49152, 57344, 65536]
+_K5_DENSE_TPS = [1, 2, 4, 8]
+_K5_VARLEN_ALI_TPS = [1, 2, 4, 8]
+
+
+def _k5_dense_groups(model_name: str, hv: int) -> list[PrefillGroup]:
+    """P0: dense prefill, TP1/2/4/8 x bf16/fp32 per-chunk snapshot."""
+    groups: list[PrefillGroup] = []
+    for tp in _K5_DENSE_TPS:
+        groups.append(
+            PrefillGroup(
+                model_name=f"{model_name}-dense-tp{tp}-bf16snap",
+                Hv=hv,
+                tps=[tp],
+                full_prompt_lens=_DENSE_PROMPT_LENS,
+                is_varlen=False,
+                output_final_state=False,
+                max_num_batched_tokens="full_prompt_len",
+            )
+        )
+        groups.append(
+            PrefillGroup(
+                model_name=f"{model_name}-dense-tp{tp}-fp32snap",
+                Hv=hv,
+                tps=[tp],
+                full_prompt_lens=_DENSE_PROMPT_LENS,
+                is_varlen=False,
+                output_final_state=False,
+                max_num_batched_tokens="full_prompt_len",
+                snapshot_dtype=torch.float32,
+            )
+        )
+    return groups
+
+
+def _k5_varlen_ali_groups(prefix: str, hv: int) -> list[PrefillGroup]:
+    """P1: varlen ali-style mnbt sweep, TP1/2/4/8 x bf16/fp32 snapshot."""
+    groups: list[PrefillGroup] = []
+    for tp in _K5_VARLEN_ALI_TPS:
+        groups.append(
+            PrefillGroup(
+                model_name=f"{prefix}-tp{tp}-bf16snapshot",
+                Hv=hv,
+                tps=[tp],
+                full_prompt_lens=[8192],
+                max_num_batched_tokens=_MNBT_ALI_SWEEP,
+            )
+        )
+        groups.append(
+            PrefillGroup(
+                model_name=f"{prefix}-tp{tp}-fp32snapshot",
+                Hv=hv,
+                tps=[tp],
+                full_prompt_lens=[8192],
+                max_num_batched_tokens=_MNBT_ALI_SWEEP,
+                snapshot_dtype=torch.float32,
+            )
+        )
+    return groups
+
+
 _PREFILL_GROUPS = [
-    # non-varlen + no final state (Qwen3.5-35B family, Hv=32).
-    # Original rows set max_num_batched_tokens == full_prompt_len so that
-    # _build_context_lens emits exactly one segment of length full_prompt_len.
-    PrefillGroup(
-        model_name="Qwen3.5-35B",
-        Hv=32,
-        tps=[1, 2],
-        full_prompt_lens=[2500, 60000, 128000],
-        is_varlen=False,
-        output_final_state=False,
-        max_num_batched_tokens="full_prompt_len",
-    ),
-    # non-varlen + no final state (Qwen3.5-397B family, Hv=64).
-    PrefillGroup(
-        model_name="Qwen3.5-397B",
-        Hv=64,
-        tps=[1, 2],
-        full_prompt_lens=[2500, 60000, 128000],
-        is_varlen=False,
-        output_final_state=False,
-        max_num_batched_tokens="full_prompt_len",
-    ),
+    # P0: Qwen3.5-35B / 397B dense, TP1/2/4/8, bf16 + fp32 snapshot.
+    *_k5_dense_groups("Qwen3.5-35B", 32),
+    *_k5_dense_groups("Qwen3.5-397B", 64),
     PrefillGroup(
         model_name="Qwen3.5-397B-ptpc-ali",
         Hv=64,
@@ -431,50 +474,16 @@ _PREFILL_GROUPS = [
         dense_batch=2,
         g_head_major=True,
     ),
-    # varlen + final_state (default path), TP=4 / TP=8 share everything
-    # else, so they collapse into a single group. Original rows left
-    # max_num_batched_tokens at the PrefillArgs default of 32768, which
-    # makes _build_context_lens slice 32768 into ceil(32768/full_len)
-    # equal-length segments (e.g. 32 segments of length 1024 for the
-    # 1k row). Keeping ``max_num_batched_tokens=None`` here preserves that.
+    # P1: varlen ali mnbt sweep (8192..65536), TP1/2/4/8, bf16 + fp32 snapshot.
+    *_k5_varlen_ali_groups("varlen-qwen-ali", 32),
+    *_k5_varlen_ali_groups("varlen-qwen3.5-397b-ali", 64),
+    # varlen + final_state (32k token budget, multi seqlen); not part of P1 grid.
     PrefillGroup(
         model_name="varlen-32k-qwen",
         Hv=64,
         tps=[4, 8],
         full_prompt_lens=[1024, 2048, 4096, 8192],
         max_num_batched_tokens=32768,
-    ),
-    PrefillGroup(
-        model_name="varlen-qwen3.5-397b-ptpc-ali-bf16snapshot",
-        Hv=64,
-        tps=[8],
-        full_prompt_lens=[8192],
-        max_num_batched_tokens=[8192, 16384, 24576, 32768, 40960, 49152, 57344, 65536],
-        # max_num_batched_tokens=[65536],
-    ),
-    PrefillGroup(
-        model_name="varlen-qwen3.5-397b-ptpc-ali-fp32snapshot",
-        Hv=64,
-        tps=[8],
-        full_prompt_lens=[8192],
-        max_num_batched_tokens=[8192, 16384, 24576, 32768, 40960, 49152, 57344, 65536],
-        snapshot_dtype=torch.float32,
-    ),
-    PrefillGroup(
-        model_name="varlen-qwen-ali-tp1-bf16snapshot",
-        Hv=32,
-        tps=[1],
-        full_prompt_lens=[8192],
-        max_num_batched_tokens=[8192, 16384, 24576, 32768, 40960, 49152, 57344, 65536],
-        # max_num_batched_tokens=[8192],
-    ),
-    PrefillGroup(
-        model_name="varlen-qwen-ali-tp1-fp32snapshot",
-        Hv=32,
-        tps=[1],
-        full_prompt_lens=[8192],
-        max_num_batched_tokens=[8192, 16384, 24576, 32768, 40960, 49152, 57344, 65536],
-        snapshot_dtype=torch.float32,
     ),
     PrefillGroup(
         # No g (USE_G=False) + short single-segment sequences: T=100/200/300 are

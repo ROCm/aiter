@@ -21,10 +21,8 @@ back to their source paths when it finds collisions. We copy the entire
 all globbing, untuned-key lookups, and any write-backs hit the copy, never the
 real repo.
 
-Requires torch (importing ``aiter`` pulls it in); it does not need a GPU. It is
-**not yet wired into any CI workflow** -- run it manually in a torch-enabled
-environment, or add it to a suitable job (e.g. the CPU/level01 tuning tests) to
-make it an actual PR/main regression guard.
+Requires torch (importing ``aiter`` pulls it in); it does not need a GPU. Wired into the
+Level 0+1 CI job (``tuning-tests.yaml`` ``cpu-validation``).
 
 Run:
     python3 -m unittest op_tests.tuning_tests.test_config_shape_collision -v

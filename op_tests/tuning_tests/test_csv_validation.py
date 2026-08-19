@@ -7,16 +7,20 @@ Catches: duplicates, invalid times, high errRatio, git merge conflicts,
 missing untuned files.
 """
 
+import glob
 import os
 import unittest
 from typing import Any, ClassVar
 
 import pandas as pd
 
+from op_tests.tuning_tests.config_utils import load_merged_tuned_dataframe
+
 AITER_ROOT = os.path.dirname(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 )
 CONFIGS_DIR = os.path.join(AITER_ROOT, "aiter", "configs")
+MODEL_CONFIGS_DIR = os.path.join(CONFIGS_DIR, "model_configs")
 
 
 class TestCSVValidation(unittest.TestCase):
@@ -121,7 +125,14 @@ class TestCSVValidation(unittest.TestCase):
         )
 
     def test_gdn_k5_mfma16_hip_no_conflicting_bv(self):
-        df = self._load_csv("gdn_k5_mfma16_hip")
+        try:
+            df = load_merged_tuned_dataframe(
+                "AITER_CONFIG_GDN_K5_MFMA16_HIP_FILE",
+                fallback_base_name=self.TUNED_CSVS["gdn_k5_mfma16_hip"],
+                fallback_model_glob="*_chunk_gdn_h_mfma16_hip_tuned.csv",
+            )
+        except FileNotFoundError:
+            self.skipTest("gdn_k5 merged tuned CSV not found")
         key_cols = [
             "arch",
             "H",
@@ -201,6 +212,19 @@ class TestCSVValidation(unittest.TestCase):
             with self.subTest(file=f):
                 path = os.path.join(CONFIGS_DIR, f)
                 self.assertTrue(os.path.exists(path), f"Missing: {f}")
+
+        gdn_model_untuned = sorted(
+            glob.glob(
+                os.path.join(
+                    MODEL_CONFIGS_DIR, "*_chunk_gdn_h_mfma16_hip_untuned.csv"
+                )
+            )
+        )
+        self.assertGreaterEqual(
+            len(gdn_model_untuned),
+            2,
+            "expected qwen3_5_35b and qwen3_5_397b chunk_gdn_h_mfma16_hip untuned CSVs",
+        )
 
 
 if __name__ == "__main__":

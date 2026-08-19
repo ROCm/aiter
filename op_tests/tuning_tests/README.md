@@ -7,6 +7,7 @@ Minimal test suite for validating the aiter tuning infrastructure.
 | File | Level | GPU | What it tests |
 |------|-------|-----|---------------|
 | `test_csv_validation.py` | 0 | No | Tuned CSV integrity: duplicates (all families), invalid times, errRatio, git conflicts |
+| `test_config_shape_collision.py` | 0 | No | Cross-file shape collision via real `get_config_file` merge (all families incl. K5) |
 | `test_tuner_infra.py` | 1 | No | `base_tuner` utilities: CSV I/O, merge, dedup, calculate, post_process topk, update_config_files |
 | `test_compare_logic.py` | 1 | No | Compare/update_improved: `_build_compare_update_plan`, `_merge_compare_filtered_results` |
 | `test_mp_tuner_logic.py` | 1 | No | `mp_tuner` polling: timeout, AcceleratorError, KeyError, pool restart |
@@ -28,11 +29,16 @@ Minimal test suite for validating the aiter tuning infrastructure.
 | `batched_bf16` | `csrc/ck_batched_gemm_bf16/batched_gemm_bf16_tune.py` | `bf16_tuned_batched_gemm.csv` | ✓ | ✓ + shape_grouped |
 | `fmoe` | `csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py` | `tuned_fmoe.csv` + model_configs | ✓ | ✓ (bf16/fp8/int8/gelu) |
 | `gradlib_bf16` | `gradlib/gradlib/gemm_tuner.py` | `bf16_tuned_gemm.csv` | ✓ | ✓ (hipBLASLt/ASM/FlyDSL) |
-| `gdn_k5_mfma16_hip` | `csrc/gdn_k5/chunk_gdn_h_mfma16_hip_tune.py` | `chunk_gdn_h_mfma16_hip_tuned.csv` | ✓ | ✓ (single varlen case) |
+| `gdn_k5_mfma16_hip` | `csrc/gdn_k5/chunk_gdn_h_mfma16_hip_tune.py` | `chunk_gdn_h_mfma16_hip_tuned.csv` + model_configs | ✓ | ✓ (shape-only varlen smoke) |
 
 ## Config resolution
 
-`test_run_config` resolves tuned config files through `AITER_CONFIGS` in `aiter/jit/core.py` — the same path used by production operators at runtime. This validates that:
+`test_run_config` and `test_csv_validation` (K5) resolve tuned config files through `AITER_CONFIGS` in `aiter/jit/core.py` — the same path used by production operators at runtime. Shared helpers live in `config_utils.py`:
+
+- `resolve_merged_tuned_path(config_property)` — merged CSV path (used by `test_run_config`)
+- `load_merged_tuned_dataframe(...)` — merged CSV as DataFrame (used by K5 BV conflict check)
+
+This validates that:
 
 1. The `AITER_CONFIG_*` env var names and default file paths in `core.py` are correct
 2. Model-specific configs under `aiter/configs/model_configs/` are properly discovered and merged
@@ -45,6 +51,7 @@ If `AITER_CONFIGS` is unavailable (e.g. aiter not installed), the test falls bac
 ```bash
 # Level 0+1 only (no GPU, <10s)
 python3 -m unittest op_tests.tuning_tests.test_csv_validation \
+  op_tests.tuning_tests.test_config_shape_collision \
   op_tests.tuning_tests.test_tuner_infra \
   op_tests.tuning_tests.test_mp_tuner_logic \
   op_tests.tuning_tests.test_online_tune -v

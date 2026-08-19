@@ -33,6 +33,12 @@ def _run_with_start_tracking(task_index, func, args):
     return func(*args)
 
 
+def _wait_for_event(event, value, timeout=30):
+    """Block until *event* is set; used by mp_tuner unit tests under spawn."""
+    event.wait(timeout=timeout)
+    return value
+
+
 def _elapsed_since_task_start(task_start_times, task_index, now=None):
     started_at = task_start_times[task_index]
     if started_at == 0:

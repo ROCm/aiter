@@ -549,14 +549,13 @@ class TestTunePipeline(unittest.TestCase):
         self._run_gradlib(mp=None)
 
     def test_gdn_k5_mfma16_hip_mp1(self):
-        """Smoke-test K5 BV tuning on one varlen 397B 8k case."""
+        """Smoke-test K5 BV tuning on one varlen 397B TP8 shape (no model column)."""
         with tempfile.TemporaryDirectory() as tmp:
             untuned = os.path.join(tmp, "untuned.csv")
             tuned = os.path.join(tmp, "tuned.csv")
             _write_csv(
                 untuned,
                 [
-                    "model",
                     "arch",
                     "dtype",
                     "K",
@@ -570,7 +569,6 @@ class TestTunePipeline(unittest.TestCase):
                 ],
                 [
                     (
-                        "varlen-qwen3.5-397b-ptpc-ali-bf16snapshot",
                         "gfx942",
                         "torch.bfloat16",
                         128,
@@ -590,7 +588,7 @@ class TestTunePipeline(unittest.TestCase):
                 tuned,
                 extra_args=[
                     "--case",
-                    "mnbt8192$",
+                    "397b-ali-tp8-bf16snapshot.*mnbt8192",
                     "--warmup",
                     "2",
                     "--iters",

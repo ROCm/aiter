@@ -36,6 +36,7 @@ from typing import Any
 import torch
 
 from aiter.jit.core import AITER_ROOT_DIR
+from aiter.utility.base_tuner import _read_csv
 from aiter.ops.flydsl.linear_attention_prefill_kernels import (
     _GFX_ARCH,
     _hipeq_select_bv,
@@ -56,10 +57,12 @@ _K5_TEST_PATH = (
     / "flydsl_tests"
     / "test_flydsl_linear_attention_prefill.py"
 )
-_TUNED_HEADER = (
-    "model,arch,dtype,K,V,BT,H,Hg,is_varlen,use_h0,store_fs,snapshot_bf16,"
+_TUNED_COLS = (
+    "arch,dtype,K,V,BT,H,Hg,is_varlen,use_h0,store_fs,snapshot_bf16,"
     "state_bf16,T_flat,N,total_chunks,max_seq_chunks,BV,us"
 )
+_TUNED_HEADER = _TUNED_COLS
+_UNTUNED_SHAPE_COLS = ("K", "V", "BT", "H", "Hg", "is_varlen", "use_h0", "store_fs")
 _LOOKUP_KEYS = (
     "arch",
     "H",
@@ -86,12 +89,43 @@ def _load_k5_cases():
 
 
 def _read_csv_rows(path: str) -> list[dict[str, str]]:
-    with open(path, encoding="utf-8", newline="") as f:
-        return list(csv.DictReader(line for line in f if not line.lstrip().startswith("#")))
+    df = _read_csv(path, comment="#")
+    rows = []
+    for row in df.to_dict("records"):
+        rows.append(
+            {
+                key: "" if val is None or (isinstance(val, float) and val != val) else str(val)
+                for key, val in row.items()
+            }
+        )
+    return rows
 
 
-def _load_untuned_models(path: str) -> set[str]:
-    return {row["model"].strip() for row in _read_csv_rows(path) if row.get("model")}
+def _load_untuned_rows(path: str) -> list[dict[str, str]]:
+    return _read_csv_rows(path)
+
+
+def _untuned_has_model(rows: list[dict[str, str]]) -> bool:
+    return bool(rows) and "model" in rows[0]
+
+
+def _load_untuned_models(rows: list[dict[str, str]]) -> set[str]:
+    return {row["model"].strip() for row in rows if row.get("model")}
+
+
+def _case_matches_untuned_shape(case, row: dict[str, str]) -> bool:
+    bt = int(row.get("BT") or case.BT or 64)
+    use_h0 = _bool_cell(row.get("use_h0") or "True")
+    return (
+        case.K == int(row["K"])
+        and case.V == int(row["V"])
+        and case.BT == bt
+        and case.H == int(row["H"])
+        and case.Hg == int(row["Hg"])
+        and case.is_varlen == _bool_cell(row["is_varlen"])
+        and use_h0
+        and case.output_final_state == _bool_cell(row["store_fs"])
+    )
 
 
 def _chunk_counts(context_lens, batch):
@@ -164,9 +198,10 @@ def _case_matches_row(case, row: dict[str, str]) -> bool:
     snapshot_dtype = _case_snapshot_dtype(case)
     batch = 1 if case.is_varlen else case.dense_batch
     total_chunks, max_seq_chunks = _chunk_counts(case.resolve_context_lens(), batch)
+    if row.get("model") and case.model_name != row["model"]:
+        return False
     return (
-        case.model_name == row["model"]
-        and case.H == int(row["H"])
+        case.H == int(row["H"])
         and case.Hg == int(row["Hg"])
         and case.K == int(row["K"])
         and case.V == int(row["V"])
@@ -226,22 +261,49 @@ def _format_tuned_row(
     max_seq_chunks,
     bv,
     us,
+    *,
+    include_model: bool = False,
 ) -> str:
-    return (
-        f"{case.model_name},{_GFX_ARCH},{case.dtype},{case.K},{case.V},"
-        f"{case.BT},{case.H},{case.Hg},{case.is_varlen},True,"
-        f"{case.output_final_state},"
-        f"{snapshot_dtype is torch.bfloat16},"
-        f"{case.ssm_state_dtype is torch.bfloat16},{T_flat},{N},"
-        f"{total_chunks},{max_seq_chunks},{bv},{us:.1f}"
-    )
+    cells = [
+        *([case.model_name] if include_model else []),
+        _GFX_ARCH,
+        case.dtype,
+        case.K,
+        case.V,
+        case.BT,
+        case.H,
+        case.Hg,
+        case.is_varlen,
+        True,
+        case.output_final_state,
+        snapshot_dtype is torch.bfloat16,
+        case.ssm_state_dtype is torch.bfloat16,
+        T_flat,
+        N,
+        total_chunks,
+        max_seq_chunks,
+        bv,
+        f"{us:.1f}",
+    ]
+    return ",".join(str(c) for c in cells)
 
 
-def _select_cases(cases, untuned_models: set[str], case_patterns: list[str]):
+def _tuned_header(include_model: bool) -> str:
+    if include_model:
+        return "model," + _TUNED_COLS
+    return _TUNED_COLS
+
+
+def _select_cases(cases, untuned_rows, case_patterns: list[str]):
     patterns = [re.compile(p) for p in case_patterns] if case_patterns else []
+    use_model = _untuned_has_model(untuned_rows)
+    untuned_models = _load_untuned_models(untuned_rows) if use_model else set()
     selected = []
     for case_id, case in cases:
-        if case.model_name not in untuned_models:
+        if use_model:
+            if case.model_name not in untuned_models:
+                continue
+        elif not any(_case_matches_untuned_shape(case, row) for row in untuned_rows):
             continue
         if patterns and not any(p.search(case_id) for p in patterns):
             continue
@@ -249,7 +311,7 @@ def _select_cases(cases, untuned_models: set[str], case_patterns: list[str]):
     return selected
 
 
-def _sweep_case(case_id, case, warmup, iters, only_improvements):
+def _sweep_case(case_id, case, warmup, iters, only_improvements, *, include_model=False):
     if case.K != 128 or case.V != 128 or case.BT != 64:
         print(f"{case_id:58s} skipped (kernel supports K=V=128, BT=64 only)")
         return None
@@ -287,23 +349,25 @@ def _sweep_case(case_id, case, warmup, iters, only_improvements):
         max_seq_chunks,
         best,
         times[best],
+        include_model=include_model,
     )
 
 
-def _write_tuned_rows(path: Path, rows: list[str]):
+def _write_tuned_rows(path: Path, rows: list[str], *, include_model: bool = False):
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
-        f.write(_TUNED_HEADER + "\n")
+        f.write(_tuned_header(include_model) + "\n")
         for line in rows:
             f.write(line + "\n")
 
 
 def _run_tune(args):
-    untuned_models = _load_untuned_models(args.untune_file)
+    untuned_rows = _load_untuned_rows(args.untune_file)
+    include_model = _untuned_has_model(untuned_rows)
     cases = _load_k5_cases()
-    selected = _select_cases(cases, untuned_models, args.case)
+    selected = _select_cases(cases, untuned_rows, args.case)
     if not selected:
-        print(f"no case matches untuned models in {args.untune_file}")
+        print(f"no case matches untuned shapes in {args.untune_file}")
         sys.exit(1)
 
     header = (
@@ -315,7 +379,14 @@ def _run_tune(args):
 
     emitted: dict[tuple, str] = {}
     for case_id, case in selected:
-        line = _sweep_case(case_id, case, args.warmup, args.iters, args.only_improvements)
+        line = _sweep_case(
+            case_id,
+            case,
+            args.warmup,
+            args.iters,
+            args.only_improvements,
+            include_model=include_model,
+        )
         if line is None:
             continue
         snapshot_dtype = _case_snapshot_dtype(case)
@@ -333,9 +404,9 @@ def _run_tune(args):
     print(f"\n{len(rows)} tuned rows")
     out_path = Path(args.tune_file)
     if rows:
-        _write_tuned_rows(out_path, rows)
+        _write_tuned_rows(out_path, rows, include_model=include_model)
         print(f"wrote {out_path}")
-    return rows
+    return rows, include_model
 
 
 def _run_config(args, config_file: str):
@@ -351,7 +422,8 @@ def _run_config(args, config_file: str):
 
     for row in rows:
         case = _find_case_for_row(cases, row)
-        shape = f"({row['model']}, tc={row['total_chunks']}, BV={row['BV']})"
+        label = row.get("model") or f"H={row['H']}/Hg={row['Hg']}"
+        shape = f"({label}, tc={row['total_chunks']}, BV={row['BV']})"
         if case is None:
             results.append({"shape": shape, "us": -1, "status": "ERROR"})
             print(f"{shape} | {'-1':>10} | ERROR")
@@ -385,14 +457,20 @@ def _run_config(args, config_file: str):
 
 
 def _merge_improved(existing_path: Path, candidate_rows: list[str], min_pct: float):
+    existing_rows = (
+        _read_csv_rows(str(existing_path)) if existing_path.is_file() else []
+    )
+    include_model = any(row.get("model") for row in existing_rows)
+    header = _tuned_header(include_model)
+    header_cols = header.split(",")
+
     existing = {}
-    if existing_path.is_file():
-        for row in _read_csv_rows(str(existing_path)):
-            existing[_lookup_key_from_row(row)] = row
+    for row in existing_rows:
+        existing[_lookup_key_from_row(row)] = row
 
     candidates = {}
     for line in candidate_rows:
-        row = next(csv.DictReader([_TUNED_HEADER, line]))
+        row = next(csv.DictReader([header, line]))
         candidates[_lookup_key_from_row(row)] = row
 
     merged = dict(existing)
@@ -409,12 +487,11 @@ def _merge_improved(existing_path: Path, candidate_rows: list[str], min_pct: flo
             merged[key] = row
             updated += 1
 
-    out_rows = []
-    for row in merged.values():
-        out_rows.append(
-            ",".join(str(row[col]) for col in _TUNED_HEADER.split(","))
-        )
-    _write_tuned_rows(existing_path, out_rows)
+    out_rows = [
+        ",".join(str(row[col]) for col in header_cols if col in row)
+        for row in merged.values()
+    ]
+    _write_tuned_rows(existing_path, out_rows, include_model=include_model)
     print(f"updated {updated} rows in {existing_path}")
 
 
@@ -428,7 +505,7 @@ def _build_parser():
         "--input_file",
         default=_DEFAULT_UNTUNED,
         dest="untune_file",
-        help="untuned shape list (model names select K5 prefill cases)",
+        help="untuned shape list (legacy rows may use model; model_configs omit it)",
     )
     parser.add_argument(
         "-o",
@@ -471,7 +548,7 @@ def _build_parser():
         "--case",
         nargs="+",
         default=[],
-        help="optional regex filters on pytest case ids (after untuned model filter)",
+        help="optional regex filters on pytest case ids (after untuned shape filter)",
     )
     parser.add_argument("--list-cases", action="store_true")
     parser.add_argument("--warmup", type=int, default=5)
@@ -503,11 +580,11 @@ def main():
             sys.exit(1)
         return
 
-    rows = _run_tune(args)
+    rows, include_model = _run_tune(args)
     if args.compare and rows:
         existing = Path(args.tune_file)
         candidate_path = Path(str(args.tune_file) + ".candidate")
-        _write_tuned_rows(candidate_path, rows)
+        _write_tuned_rows(candidate_path, rows, include_model=include_model)
         print(f"\ncompare candidate: {candidate_path}")
         if args.update_improved:
             _merge_improved(existing, rows, args.min_improvement_pct)

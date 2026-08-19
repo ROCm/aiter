@@ -109,13 +109,22 @@ _TORCH_DTYPE = {
 # mfma16_hip fork
 # --------------------------------------------------------------------------
 
-# Untuned shape list for AOT (``aiter/configs/chunk_gdn_h_mfma16_hip_untuned.csv``);
-# runtime BV lookup uses ``aiter/configs/chunk_gdn_h_mfma16_hip_tuned.csv`` via
-# ``AITER_CONFIGS``.
+# Untuned shape list for AOT: canonical stub plus per-model files under
+# ``aiter/configs/model_configs/*_chunk_gdn_h_mfma16_hip_untuned.csv``.
+# Runtime BV lookup merges ``chunk_gdn_h_mfma16_hip_tuned.csv`` with model_configs
+# via ``AITER_CONFIGS``.
 _DEFAULT_CSV_MFMA16_HIP = (
     Path(f"{AITER_ROOT_DIR}/aiter/configs/chunk_gdn_h_mfma16_hip_untuned.csv")
 )
-DEFAULT_CSVS_MFMA16_HIP = [str(_DEFAULT_CSV_MFMA16_HIP)]
+_MODEL_CONFIG_DIR = Path(f"{AITER_ROOT_DIR}/aiter/configs/model_configs")
+DEFAULT_CSVS_MFMA16_HIP = sorted(
+    {str(_DEFAULT_CSV_MFMA16_HIP)}
+    | {
+        str(p)
+        for p in _MODEL_CONFIG_DIR.glob("*_chunk_gdn_h_mfma16_hip_untuned.csv")
+        if p.is_file()
+    }
+)
 # Used only when a csv row leaves ``arch`` empty and neither ARCH/GPU_ARCHS nor
 # a local GPU can answer.
 MFMA16_HIP_AOT_ARCH_DEFAULT = "gfx950"

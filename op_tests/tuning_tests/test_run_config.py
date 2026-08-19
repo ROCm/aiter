@@ -19,6 +19,8 @@ import subprocess
 import sys
 import unittest
 
+from op_tests.tuning_tests.config_utils import resolve_merged_tuned_path
+
 AITER_ROOT = os.path.dirname(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 )
@@ -59,20 +61,6 @@ def _find_tuned_csvs(pattern):
             ):
                 found.append(os.path.join(d, f))
     return found
-
-
-def _resolve_config_via_aiter(config_property):
-    """Resolve config file through AITER_CONFIGS (same path as production).
-    Returns the resolved file path, or None if unavailable."""
-    try:
-        from aiter.jit.core import AITER_CONFIGS
-
-        config_file = getattr(AITER_CONFIGS, config_property, None)
-        if config_file and os.path.exists(config_file):
-            return config_file
-    except Exception:  # noqa: BLE001,S110
-        pass
-    return None
 
 
 def _merge_config_paths(csv_list):
@@ -342,7 +330,7 @@ class TestRunConfig(unittest.TestCase):
         extra_args = cfg.get("extra_args", None)
 
         config_prop = cfg.get("config_property")
-        merged = _resolve_config_via_aiter(config_prop) if config_prop else None
+        merged = resolve_merged_tuned_path(config_prop) if config_prop else None
 
         if merged:
             csv_names = [f"{config_prop} -> {merged}"]
@@ -483,7 +471,7 @@ class TestRunConfigCustom(unittest.TestCase):
             self.assertIsNotNone(
                 config_prop, f"No config_property defined for family '{family}'"
             )
-            merged = _resolve_config_via_aiter(config_prop)
+            merged = resolve_merged_tuned_path(config_prop)
             self.assertIsNotNone(
                 merged,
                 f"Could not resolve config for {family} via AITER_CONFIGS.{config_prop}",
