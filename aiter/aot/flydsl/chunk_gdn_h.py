@@ -109,10 +109,8 @@ _TORCH_DTYPE = {
 # mfma16_hip fork
 # --------------------------------------------------------------------------
 
-# Untuned shape list for AOT: canonical stub plus per-model files under
-# ``aiter/configs/model_configs/*_chunk_gdn_h_mfma16_hip_untuned.csv``.
-# Runtime BV lookup merges ``chunk_gdn_h_mfma16_hip_tuned.csv`` with model_configs
-# via ``AITER_CONFIGS``.
+# AOT untuned: canonical stub + ``model_configs/*_chunk_gdn_h_mfma16_hip_untuned.csv``.
+# Runtime BV: ``chunk_gdn_h_mfma16_hip_tuned.csv`` merged with model_configs via ``AITER_CONFIGS``.
 _DEFAULT_CSV_MFMA16_HIP = (
     Path(f"{AITER_ROOT_DIR}/aiter/configs/chunk_gdn_h_mfma16_hip_untuned.csv")
 )
@@ -137,24 +135,13 @@ _MFMA16_HIP_TORCH_DTYPE = {"torch.bfloat16": "bfloat16"}
 # runtime picks one of these per batch, so all legal ones are pre-compiled.
 _BV_CANDIDATES = (64, 32, 16)
 
-# Caller-selected dtypes (snapshot_dtype / state_dtype): both specializations
-# are built regardless of what the tuned rows happened to measure.
+# Compile both dtype / layout / state-index variants the wrapper may dispatch to.
 _SNAPSHOT_BF16 = (True, False)
 _STATE_BF16 = (False, True)
-
-# chunk.py pins head-major, but False is the *wrapper's* default (token-major,
-# the HIP g-layout contract), so a caller reaching the wrapper directly gets the
-# value AOT would otherwise skip. Both are cheap to build.
 _G_HEAD_MAJOR = (True, False)
-
-# Indexed state pools: only legal with an initial state and final-state
-# write-back (the wrapper rejects the other combinations), so this fans out on
-# the rows that allow it rather than unconditionally.
 _USE_STATE_INDICES = (False, True)
 
-# Switches the production dispatch pins: chunk.py always passes g_cumsum with
-# use_exp2 pre-scaling, never gk, and always saves v_new. wu_contig is not even
-# a wrapper argument -- the call site hardcodes True.
+# Production dispatch pins from chunk.py (g_cumsum + use_exp2, no gk, save v_new).
 _FIXED_SWITCHES: dict[str, bool] = {
     "use_g": True,
     "use_gk": False,

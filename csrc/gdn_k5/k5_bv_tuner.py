@@ -33,6 +33,7 @@ from aiter.utility.base_tuner import TunerCommon
 
 _DEFAULT_UNTUNED = f"{AITER_ROOT_DIR}/aiter/configs/chunk_gdn_h_mfma16_hip_untuned.csv"
 _DEFAULT_TUNED = f"{AITER_ROOT_DIR}/aiter/configs/chunk_gdn_h_mfma16_hip_tuned.csv"
+_RUN_CONFIG_TOL_PCT = 5.0
 _RESULT_COLS = [c for c in TUNED_COLUMNS if c not in LOOKUP_KEYS]
 
 
@@ -65,17 +66,6 @@ class K5BvTuner(TunerCommon):
             nargs="+",
             default=[],
             help="optional regex filters on pytest case ids (after untuned shape filter)",
-        )
-        self.parser.add_argument(
-            "--only-improvements",
-            action="store_true",
-            help="emit a row only when measured BV beats the rule's choice",
-        )
-        self.parser.add_argument(
-            "--run_config_tol_pct",
-            type=float,
-            default=5.0,
-            help="run_config pass threshold for live_us vs csv us drift (percent)",
         )
         self.parser.add_argument(
             "--list-cases",
@@ -126,18 +116,11 @@ class K5BvTuner(TunerCommon):
             print("-" * len(header))
             self._printed_tune_header = True
 
-        frames = []
         emitted: dict[tuple, dict[str, Any]] = {}
         for _, row in untunedf.iterrows():
             case_id = row["_case_id"]
             case = self._case_by_id[case_id]
-            tuned_row = sweep_case_row(
-                case_id,
-                case,
-                args.warmup,
-                args.iters,
-                args.only_improvements,
-            )
+            tuned_row = sweep_case_row(case_id, case, args.warmup, args.iters)
             if tuned_row is None:
                 continue
             snapshot_dtype = case_snapshot_dtype(case)
@@ -151,11 +134,11 @@ class K5BvTuner(TunerCommon):
             emitted[key] = tuned_row
             torch.cuda.empty_cache()
 
-        if emitted:
-            frames = list(emitted.values())
-        if not frames:
+        if not emitted:
             return []
-        return pd.DataFrame(frames, columns=self.columns).to_dict("records")
+        return pd.DataFrame(list(emitted.values()), columns=self.columns).to_dict(
+            "records"
+        )
 
     def post_process(self, results, args, topk=-1, fast_mode=False):
         if isinstance(results, list):
@@ -187,7 +170,7 @@ class K5BvTuner(TunerCommon):
         resultdf.to_csv(file, index=False)
 
     def run_config(self, args):
-        tol = float(getattr(args, "run_config_tol_pct", 5.0))
+        tol = _RUN_CONFIG_TOL_PCT
         cases = load_k5_cases()
         results = []
         print("Shape | e2e_us | Status")

@@ -14,6 +14,6 @@ python3 csrc/gdn_k5/chunk_gdn_h_mfma16_hip_tune.py \
   --run_config aiter/configs/model_configs/qwen3_5_397b_chunk_gdn_h_mfma16_hip_tuned.csv
 ```
 
-Options: `-i`/`-o`, `--run_config`, `--compare --update_improved`, `--case REGEX ...`, `--only-improvements`, `--list-cases`.
+Options: `-i`/`-o`, `--run_config`, `--compare --update_improved`, `--case REGEX ...`, `--list-cases`.
 
 Missing tuned lookup keys fall back to the CU/LDS BV rule until new rows are merged.

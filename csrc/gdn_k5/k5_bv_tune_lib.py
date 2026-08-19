@@ -226,7 +226,6 @@ def sweep_case_row(
     case,
     warmup: int,
     iters: int,
-    only_improvements: bool = False,
 ) -> dict[str, Any] | None:
     if case.K != 128 or case.V != 128 or case.BT != 64:
         print(f"{case_id:58s} skipped (kernel supports K=V=128, BT=64 only)")
@@ -253,9 +252,6 @@ def sweep_case_row(
     gain = (times[rule] - times[best]) / times[rule] * 100 if rule in times else 0.0
     cells = " ".join(f"{times.get(bv, float('nan')):8.1f}" for bv in BV_CANDIDATES)
     print(f"{case_id:58s} {total_chunks:7d} {cells} {best:5d} {rule:5d} {gain:6.1f}")
-
-    if only_improvements and best == rule:
-        return None
 
     return case_to_tuned_row(
         case,
