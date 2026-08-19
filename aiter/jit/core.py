@@ -154,8 +154,6 @@ AITER_CONFIG_GDN_K5_MFMA16_HIP = os.getenv(
     "AITER_CONFIG_GDN_K5_MFMA16_HIP",
     f"{AITER_ROOT_DIR}/aiter/configs/chunk_gdn_h_mfma16_hip_tuned.csv",
 )
-# Per-model tuned data lives under model_configs/ (qwen3_5_*_chunk_gdn_h_mfma16_hip_tuned.csv),
-# merged at runtime by get_config_file; the canonical path above may not exist on disk.
 
 
 class AITER_CONFIG:
@@ -309,26 +307,7 @@ class AITER_CONFIG:
         # "a8w8_tuned_gemm" and trailing ones like "..._mxscale_tuned").
         untuned_name = "untuned".join(merge_name.rsplit("tuned", 1))
         untuned_path = f"{AITER_ROOT_DIR}/aiter/configs/{untuned_name}.csv"
-        dedup_keys = None
-        if merge_name == "chunk_gdn_h_mfma16_hip_tuned":
-            # K5 tuned rows share untuned compile shapes but differ on chunk
-            # counts and dtype flags; dedup on the runtime BV lookup key.
-            keys = [
-                "arch",
-                "H",
-                "Hg",
-                "V",
-                "is_varlen",
-                "use_h0",
-                "store_fs",
-                "snapshot_bf16",
-                "state_bf16",
-                "total_chunks",
-                "max_seq_chunks",
-            ]
-            dedup_keys = keys + (["_tag"] if has_tag else [])
-            dedup_keys = [k for k in dedup_keys if k in merge_df.columns]
-        elif os.path.exists(untuned_path):
+        if os.path.exists(untuned_path):
             untunedf = pd.read_csv(untuned_path)
             keys = untunedf.columns.to_list()
             if "cu_num" not in keys:
@@ -341,28 +320,7 @@ class AITER_CONFIG:
             # table) key on gfx and never carry cu_num; keeping a missing column
             # in the subset would raise inside pandas' duplicated().
             dedup_keys = [k for k in dedup_keys if k in merge_df.columns]
-        else:
-            logger.warning(
-                f"Untuned config file not found: {untuned_path}. Using all columns for deduplication."
-            )
-
-        if dedup_keys is not None:
             duplicated_mask = merge_df.duplicated(subset=dedup_keys, keep=False)
-            if duplicated_mask.any() and merge_name == "chunk_gdn_h_mfma16_hip_tuned":
-                bv_conflicts = any(
-                    group["BV"].nunique() > 1
-                    for _, group in merge_df[duplicated_mask].groupby(
-                        dedup_keys, dropna=False
-                    )
-                )
-                if not bv_conflicts:
-                    merge_df = (
-                        merge_df.sort_values("us", kind="stable")
-                        .drop_duplicates(subset=dedup_keys, keep="first")
-                        .reset_index(drop=True)
-                    )
-                    duplicated_mask = merge_df.duplicated(subset=dedup_keys, keep=False)
-
             if duplicated_mask.any():
                 dup_count = int(duplicated_mask.sum())
                 dup_rows = merge_df[duplicated_mask].sort_values(dedup_keys)
@@ -405,6 +363,10 @@ class AITER_CONFIG:
                     f"Duplicate rows:\n{dup_rows.to_string(index=False)}\n"
                     f"Updated files:\n{saved_info}"
                 )
+        else:
+            logger.warning(
+                f"Untuned config file not found: {untuned_path}. Using all columns for deduplication."
+            )
 
         from pathlib import Path
 
