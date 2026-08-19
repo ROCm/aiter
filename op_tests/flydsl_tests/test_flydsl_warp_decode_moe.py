@@ -439,6 +439,91 @@ def test_down_reduce_fp8(case):
 
 
 # -------------------------------------------------------------------------
+# Phase E / G7 -- selectable s_nop-free ILP dot2 on FP8.  `dot2_acc>1` drains the
+# per-lane dots through N independent f32 accumulators + one final add instead of
+# the serialized `s_nop 2` chain (`dot2_acc=1`).  The two forms must agree to near
+# bit-exactness (only f32 add *reassociation* differs) and both must match the fp32
+# torch reference -- so these force `dot2_acc=4` on the same inputs as the baseline
+# and cross-check.  Covers pertensor/pertoken/block2d (the block2d drain window is
+# one K-block; the others span the whole K-range).
+# -------------------------------------------------------------------------
+@pytest.mark.skipif(not _HAS_FP8, reason="torch build lacks float8_e4m3fn")
+@pytest.mark.parametrize("case", [pytest.param(c, id=c[0]) for c in GATE_UP_CASES])
+def test_gate_up_fp8_ilp_dot2(case):
+    name, B, HIDDEN, INTER, E, TOPK, mode, scale_block = case
+    x, w_gate, w_up, router_ids, wgs, wus = _gen_gate_up(
+        B, HIDDEN, INTER, E, TOPK, mode, scale_block
+    )
+    out_base = flydsl_warp_decode_gate_up(
+        x,
+        w_gate,
+        w_up,
+        router_ids,
+        wgs,
+        wus,
+        w_scale_mode=mode,
+        scale_block=scale_block,
+        dot2_acc=1,
+    )
+    out_ilp = flydsl_warp_decode_gate_up(
+        x,
+        w_gate,
+        w_up,
+        router_ids,
+        wgs,
+        wus,
+        w_scale_mode=mode,
+        scale_block=scale_block,
+        dot2_acc=4,
+    )
+    torch.cuda.synchronize()
+    ref = _ref_gate_up(x, w_gate, w_up, router_ids, wgs, wus, mode, scale_block)
+    cos_ref = _cosine(ref, out_ilp)
+    cos_base = _cosine(out_base, out_ilp)
+    print(
+        f"[fp8 gate_up ilp {name}] cos_vs_ref={cos_ref:.6f} cos_vs_base={cos_base:.6f}"
+    )
+    assert cos_ref >= 0.999, f"ilp gate_up {name}: cos_vs_ref={cos_ref:.6f}"
+    assert cos_base >= 0.9999, f"ilp gate_up {name}: cos_vs_base={cos_base:.6f}"
+
+
+@pytest.mark.skipif(not _HAS_FP8, reason="torch build lacks float8_e4m3fn")
+@pytest.mark.parametrize("case", [pytest.param(c, id=c[0]) for c in DOWN_CASES])
+def test_down_reduce_fp8_ilp_dot2(case):
+    name, B, INTER, HIDDEN, E, TOPK, mode, scale_block = case
+    inter, w_down, router_ids, router_wts, wds = _gen_down(
+        B, INTER, HIDDEN, E, TOPK, mode, scale_block
+    )
+    out_base = flydsl_warp_decode_down_reduce(
+        inter,
+        w_down,
+        router_ids,
+        router_wts,
+        wds,
+        w_scale_mode=mode,
+        scale_block=scale_block,
+        dot2_acc=1,
+    )
+    out_ilp = flydsl_warp_decode_down_reduce(
+        inter,
+        w_down,
+        router_ids,
+        router_wts,
+        wds,
+        w_scale_mode=mode,
+        scale_block=scale_block,
+        dot2_acc=4,
+    )
+    torch.cuda.synchronize()
+    ref = _ref_down(inter, w_down, router_ids, router_wts, wds, mode, scale_block)
+    cos_ref = _cosine(ref, out_ilp)
+    cos_base = _cosine(out_base, out_ilp)
+    print(f"[fp8 down ilp {name}] cos_vs_ref={cos_ref:.6f} cos_vs_base={cos_base:.6f}")
+    assert cos_ref >= 0.999, f"ilp down {name}: cos_vs_ref={cos_ref:.6f}"
+    assert cos_base >= 0.9999, f"ilp down {name}: cos_vs_base={cos_base:.6f}"
+
+
+# -------------------------------------------------------------------------
 # Phase D / G5 -- Split-K down (see SILOTIGER-667-plan-Split-K.md).  Each split-K
 # wave covers a disjoint INTER sub-range and atomic-adds its FP32 partial into a
 # caller-zeroed accumulator; the result must match the non-split (split_k=1) path
