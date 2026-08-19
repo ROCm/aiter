@@ -49,6 +49,8 @@ MANUAL_SCHEMA_OPS = [
     "mha_batch_prefill",
     "hipb_findallsols",
     "rocb_findallsols",
+    "_hipb_findallsols",
+    "_rocb_findallsols",
     "_ActivationType",
     "_QuantType",
     "init_custom_ar",
