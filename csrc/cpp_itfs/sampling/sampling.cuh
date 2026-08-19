@@ -36,6 +36,27 @@
 
 #include "vec_dtypes.cuh"
 
+// Portable min/max reduction functors. hipcub's Max()/Min() functors are
+// deprecated and no longer exposed as hipcub::Max/hipcub::Min in ROCm 10 hipcub
+// (CCCL 3.0, which points callers at hip::maximum/hip::minimum). Provide our own
+// so BlockReduce().Reduce(...) works across ROCm versions.
+struct AiterMaxOp
+{
+    template <typename T>
+    __host__ __device__ __forceinline__ T operator()(const T& a, const T& b) const
+    {
+        return a > b ? a : b;
+    }
+};
+struct AiterMinOp
+{
+    template <typename T>
+    __host__ __device__ __forceinline__ T operator()(const T& a, const T& b) const
+    {
+        return b < a ? b : a;
+    }
+};
+
 // Oneblock radix-select for TopK: 3-pass 11-bit, pure LDS, no cross-block sync.
 // Replaces the baseline ternary search with deterministic 3-pass radix.
 namespace radix_topk {
@@ -505,7 +526,7 @@ __global__ void radix_topk_one_block_kernel(
                 __syncthreads();
                 float total_sum = hipcub::BlockReduce<float, BlockSize>(renorm_reduce_temp).Sum(local_sum);
                 __syncthreads();
-                float min_val = hipcub::BlockReduce<float, BlockSize>(renorm_reduce_temp).Reduce(local_min, hipcub::Min());
+                float min_val = hipcub::BlockReduce<float, BlockSize>(renorm_reduce_temp).Reduce(local_min, AiterMinOp{});
                 if (threadIdx.x == 0) {
                     renorm_pivot[batch_id] = min_val;
                     renorm_normalizer[batch_id] = __frcp_rn(fmaxf(total_sum, 1e-8f));
@@ -572,7 +593,7 @@ __global__ void radix_topk_one_block_kernel(
                 __syncthreads();
                 float total_sum = hipcub::BlockReduce<float, BlockSize>(renorm_reduce_temp).Sum(local_sum);
                 __syncthreads();
-                float min_val = hipcub::BlockReduce<float, BlockSize>(renorm_reduce_temp).Reduce(local_min, hipcub::Min());
+                float min_val = hipcub::BlockReduce<float, BlockSize>(renorm_reduce_temp).Reduce(local_min, AiterMinOp{});
                 if (threadIdx.x == 0) {
                     renorm_pivot[batch_id] = min_val;
                     renorm_normalizer[batch_id] = __frcp_rn(fmaxf(total_sum, 1e-8f));
@@ -637,7 +658,7 @@ __global__ void radix_topk_one_block_kernel(
                 __syncthreads();
                 float total_sum = hipcub::BlockReduce<float, BlockSize>(renorm_reduce_temp).Sum(local_sum);
                 __syncthreads();
-                float min_val = hipcub::BlockReduce<float, BlockSize>(renorm_reduce_temp).Reduce(local_min, hipcub::Min());
+                float min_val = hipcub::BlockReduce<float, BlockSize>(renorm_reduce_temp).Reduce(local_min, AiterMinOp{});
                 if (threadIdx.x == 0) {
                     renorm_pivot[batch_id] = min_val;
                     renorm_normalizer[batch_id] = __frcp_rn(fmaxf(total_sum, 1e-8f));
@@ -1063,7 +1084,7 @@ __global__ void TopPSamplingFromProbKernel(DType* probs,
         }
         int max_valid =
             BlockReduce<int, BLOCK_THREADS_, REDUCE_ALGORITHM>(temp_storage.block_prim.reduce_int)
-                .Reduce(thread_last_valid, hipcub::Max());
+                .Reduce(thread_last_valid, AiterMaxOp{});
         if(tx == 0 && max_valid != -1)
         {
             temp_storage.last_valid_id = max_valid;
@@ -1223,7 +1244,7 @@ __global__ void TopKTopPSamplingFromProbKernel(DType* probs,
         }
         int max_valid =
             BlockReduce<int, BLOCK_THREADS_, REDUCE_ALGORITHM>(temp_storage.block_prim.reduce_int)
-                .Reduce(thread_last_valid, hipcub::Max());
+                .Reduce(thread_last_valid, AiterMaxOp{});
         if(tx == 0 && max_valid != -1)
         {
             temp_storage.last_valid_id = max_valid;
