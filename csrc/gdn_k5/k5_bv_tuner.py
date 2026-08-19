@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""TunerCommon wrapper for FlyDSL K5 mfma16_hip BV tuning (Fmoe-style)."""
+"""TunerCommon wrapper for FlyDSL K5 mfma16_hip BV tuning."""
 
 from __future__ import annotations
 
@@ -196,7 +196,7 @@ class K5BvTuner(TunerCommon):
         for _, row in self.untunedf.iterrows():
             row_dict = row.to_dict()
             case = find_case_for_row(cases, row_dict)
-            label = row_dict.get("model") or f"H={row_dict['H']}/Hg={row_dict['Hg']}"
+            label = f"H={row_dict['H']}/Hg={row_dict['Hg']}"
             shape = f"({label}, tc={row_dict['total_chunks']}, BV={row_dict['BV']})"
             if case is None:
                 print(f"{shape} | {'-1':>10} | ERROR")

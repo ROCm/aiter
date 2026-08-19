@@ -93,10 +93,6 @@ def case_snapshot_dtype(case):
     return case.snapshot_dtype or case.dtype
 
 
-def untuned_has_model(rows: list[dict[str, str]]) -> bool:
-    return bool(rows) and "model" in rows[0]
-
-
 def case_matches_untuned_shape(case, row: dict[str, str]) -> bool:
     bt = int(row.get("BT") or case.BT or 64)
     use_h0 = bool_cell(row.get("use_h0") or "True")
@@ -114,18 +110,9 @@ def case_matches_untuned_shape(case, row: dict[str, str]) -> bool:
 
 def select_cases(cases, untuned_rows, case_patterns: list[str]):
     patterns = [re.compile(p) for p in case_patterns] if case_patterns else []
-    use_model = untuned_has_model(untuned_rows)
-    untuned_models = (
-        {row["model"].strip() for row in untuned_rows if row.get("model")}
-        if use_model
-        else set()
-    )
     selected = []
     for case_id, case in cases:
-        if use_model:
-            if case.model_name not in untuned_models:
-                continue
-        elif not any(case_matches_untuned_shape(case, row) for row in untuned_rows):
+        if not any(case_matches_untuned_shape(case, row) for row in untuned_rows):
             continue
         if patterns and not any(p.search(case_id) for p in patterns):
             continue
@@ -286,8 +273,6 @@ def case_matches_row(case, row: dict[str, Any]) -> bool:
     snapshot_dtype = case_snapshot_dtype(case)
     batch = 1 if case.is_varlen else case.dense_batch
     total_chunks, max_seq_chunks = chunk_counts(case.resolve_context_lens(), batch)
-    if row.get("model") and case.model_name != row["model"]:
-        return False
     return (
         case.H == int(row["H"])
         and case.Hg == int(row["Hg"])
