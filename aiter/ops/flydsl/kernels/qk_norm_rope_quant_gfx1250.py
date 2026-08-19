@@ -1711,7 +1711,7 @@ def flydsl_qk_norm_rope_xhead(
     rows_per_wg=ROWS_PER_WG,
     heads_per_wave=XHEAD_HEADS_PER_WAVE,
     stream=None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     H, D, RD = num_q_heads, head_dim, rope_head_dim
     T_tok = q.shape[0]
     q_weighted = q_weight is not None
