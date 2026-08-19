@@ -82,7 +82,18 @@ def launch_gemm_a8w4_tdm(
     C_STORE_B = ((tile_m * tile_n * 2 + 127) // 128) * 128
     ARENA_B = max(num_buffers * PITCH, C_STORE_B)
 
-    @flyc.kernel(known_block_size=[block, 1, 1])
+    _afp = "fp4" if a_is_fp4 else "fp8"
+    _layout = "_mbn" if layout_mbn else "_bmn"
+    _cluster = f"_c{cluster_m}x{cluster_n}" if use_cluster else ""
+    _out = "_f16" if out_is_f16 else "_bf16"
+    _kname = (
+        f"a8w4_batched_gemm_tdm_{_afp}"
+        f"_t{tile_m}x{tile_n}x{tile_k}_w{m_warp}x{n_warp}"
+        f"_b{num_buffers}_B{batch}"
+        f"{_layout}{_out}{_cluster}"
+    )
+
+    @flyc.kernel(name=_kname, known_block_size=[block, 1, 1])
     def kernel(
         arg_c: fx.Tensor,
         arg_a: fx.Pointer,
