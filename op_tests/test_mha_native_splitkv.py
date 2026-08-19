@@ -22,7 +22,7 @@ D = 64  # native splitkv is D64 only
 
 def ref_attn(q, k, v, scale, causal):
     # q: (B, Sq, Hq, D); k/v: (B, Sk, Hk, D). Reference in fp32.
-    B, Sq, Hq, _ = q.shape
+    _B, Sq, Hq, _ = q.shape
     Sk, Hk = k.shape[1], k.shape[2]
     g = Hq // Hk
     qf = q.float().permute(0, 2, 1, 3)  # B,Hq,Sq,D
@@ -62,7 +62,7 @@ def test_mha_native_splitkv(B, Sq, Sk, Hq, Hk, causal):
     ns = min((Sk + 63) // 64, 8)
     assert ns > 1, "test must exercise the multi-split path"
 
-    o, lse = torch.ops.aiter.mha_fwd_native_splitkv(
+    o, _lse = torch.ops.aiter.mha_fwd_native_splitkv(
         q, k, v, None, scale, causal, False, ns
     )
     ref = ref_attn(q, k, v, scale, causal)
