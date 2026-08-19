@@ -102,6 +102,296 @@ def _assert_multiple(name, val, mult):
         assert val % mult == 0, f"{name} must be a multiple of {mult}; got {val}"
 
 
+# ---- gfx1250 Expert Scheduling Mode 2 covers -------------------------------
+# When the kernel enables DEP_MODE=2 (see fmha_fwd_prefill_m16x8._set_sched_mode)
+# the HW VA_VDST/VM_VSRC issue interlocks are OFF. LLVM has no model of the mode
+# and emits ZERO covers, so a VALU-produced load address can be read stale. We
+# restore mode-0-equivalent correctness by emitting an explicit `s_wait_alu 0`
+# (== s_waitcnt_depctr 0, BF880000: drain ALL depctr counters) immediately before
+# every memory op that may consume a VALU-produced address/value. This is the
+# conservative baseline; covers are removed selectively once proven false.
+#
+# This flag is the single source of truth and is imported by the kernel module,
+# which flips DEP_MODE in lockstep. Default False -> _wait_alu0() is a no-op and
+# the kernel runs in normal mode 0 (bit-identical to before).
+ENABLE_SCHED_MODE2 = True
+
+# Number of `s_nop 15` (16-cycle) unconditional delays emitted in each tied cover.
+# RATIONALE (2026-08-18): the mode-2 page fault at large seqlen was NOT a coverable
+# pre-load RAW — it was the reused 64-bit address VGPR-pair (garbage HIGH 32 bits)
+# created by tying the *pointer*. The real fix ties the 32-bit OFFSET instead (see
+# the loaders), which keeps the scalar-base + per-chunk voffset form (uniform high
+# bits, distinct offset regs) so `s_wait_alu 0` alone covers the residual offset
+# RAW. The unconditional s_nop pad is no longer needed; kept as a tunable knob at 0.
+_SCHED2_NOP_COUNT = 8
+
+# Field-targeted depctr covers (mnemonics + encodings verified via llvm-mc
+# -mcpu=gfx1250). Under DEP_MODE=2 the HW inserts NO issue interlocks, but the
+# depctr dependency COUNTERS remain maintained, so an explicit field-targeted
+# s_wait_alu is a real *conditional* cover (waits only if the dep is live), not an
+# unconditional s_nop delay:
+#   depctr_va_vdst(0) [0xBF880F9F] — drain pending VALU->VGPR dest writes. Covers a
+#     pre-load RAW: a VALU-produced load address read too early.
+#   depctr_vm_vsrc(0) [0xBF88FF83] — wait until every prior VMEM/async op has READ
+#     its VGPR sources. Covers the post-load WAR: the next chunk's VALU reuses (over-
+#     writes) the async load's address VGPR before the async engine latched it.
+_COVER_RAW_ASM = "s_wait_alu 0"  # full depctr drain (proven-correct config uses nop pad)
+# XCNT experiment (2026-08-19): the async-load address VGPR must stay valid until its
+# GLOBAL address is TRANSLATED (XACK/XNACK), not merely source-read. XCNT counts exactly
+# "issued but not-yet-translated" memory ops; s_wait_xcnt 0 is the compiler's OWN cover for
+# the identical buffer_store address-reuse WAR in this same ISA. vm_vsrc(0) (source-read)
+# may be insufficient -> testing s_wait_xcnt as the WAR counter for both cover placements.
+_COVER_WAR_ASM = "s_wait_xcnt 0x0"
+_COVER_POSTLOAD_ASM = "s_wait_xcnt 0x0"
+# Experiment toggle: when False the tied WAR cover is dropped (pass-through tie only).
+# vm_vsrc(0) covers FAILED at 8192 (pre-offset 7.5% NaN, post-load 3.5%); re-testing with
+# s_wait_xcnt (translation-count) as the counter. Both placements ON to disambiguate
+# counter-issue (H1: pre-offset cover was before the v35 overwrite -> xcnt fixes it) vs
+# placement-issue (H2: v34 overwrite at load+1 -> needs asm-glue).
+_ENABLE_WAR_COVER = True
+_ENABLE_POSTLOAD_COVER = True
+
+
+def _wait_tie(val, asm):
+    """Emit an inline-asm cover TIED to ``val`` (an LLVM pointer or integer): ``val``
+    is threaded in/out and the tied result returned. Tying forces the producer of
+    ``val`` ABOVE the cover and every consumer BELOW it — LLVM has no data dep on a
+    bare operand-less volatile asm and freely reorders pure VALU across it, so an
+    UNTIED cover does not hold placement. No-op unless mode 2."""
+    if not ENABLE_SCHED_MODE2:
+        return val
+    raw = val.ir_value() if hasattr(val, "ir_value") else val
+    tied = llvm_dialect.inline_asm(raw.type, [raw], asm, "=v,0", has_side_effects=True)
+    return type(val)(tied) if hasattr(val, "ir_value") else tied
+
+
+def _wait_alu0(val):
+    """Mode-2 pre-memory-op RAW cover tied to a load address/offset ``val``.
+
+    Emits ``s_wait_alu depctr_va_vdst(0)`` (drain VALU->VGPR writes) + optional
+    ``_SCHED2_NOP_COUNT`` ``s_nop 15`` pads (default 0). Feed the returned value into
+    the consuming memory op. No-op unless mode 2."""
+    asm = _COVER_RAW_ASM + "".join("\ns_nop 15" for _ in range(_SCHED2_NOP_COUNT))
+    return _wait_tie(val, asm)
+
+
+def _war_cover_pre_offset(val):
+    """Mode-2 WAR cover for the reused async-load address VGPR, tied to ``val`` — the
+    EARLIEST input of a chunk's offset computation (before it overwrites the shared
+    address VGPR). Emits ``s_wait_alu depctr_vm_vsrc(0)``: wait until every prior
+    VMEM/async op has READ its VGPR sources, so the previous chunk's async load has
+    latched its address before this chunk overwrites it.
+
+    DEP_MODE=2 drops the HW VM_VSRC interlock that (in mode 0) held this overwrite;
+    without it the overwrite races the async latch -> stale/half address. The cover
+    MUST sit between the previous load and this chunk's overwrite VALU; tying it to
+    the offset's earliest input (which the overwrite VALU consumes) pins it there,
+    where an untied post-load barrier would migrate below the pure-VALU overwrite.
+    No-op unless mode 2."""
+    if not _ENABLE_WAR_COVER:
+        return val
+    return _wait_tie(val, _COVER_WAR_ASM)
+
+
+def _war_post_load(off):
+    """Mode-2 post-load WAR cover — THE fix for the large-seqlen NaN/page-fault.
+
+    Emit IMMEDIATELY AFTER an async load, passing the load's own OFFSET ``off`` as an
+    inline-asm input. Two effects, both required:
+      1. Reading ``off`` extends that VGPR's live range PAST this cover, so RA cannot
+         reuse it for the next chunk's offset until after the cover -> the next-chunk
+         VALU overwrite is forced BELOW the cover (an untied barrier that does not read
+         ``off`` lets LLVM migrate the pure-VALU overwrite above it -> too late).
+      2. ``s_wait_alu depctr_vm_vsrc(0)`` waits until every prior VMEM/async op has READ
+         its VGPR sources, i.e. the async engine has LATCHED this load's address, before
+         the overwrite is allowed to proceed. In mode 0 the HW VM_VSRC interlock did
+         this automatically; DEP_MODE=2 drops it, so we insert it by hand here.
+    ``has_side_effects`` + the ``off`` read pin the cover between the load and the
+    overwrite. No-op unless mode 2. The output (tied to ``off``) is intentionally
+    discarded; only the source-read + the wait matter."""
+    if not ENABLE_SCHED_MODE2 or not _ENABLE_POSTLOAD_COVER:
+        return
+    raw = off.ir_value() if hasattr(off, "ir_value") else off
+    llvm_dialect.inline_asm(
+        raw.type, [raw], _COVER_POSTLOAD_ASM, "=v,0", has_side_effects=True
+    )
+
+
+def _war_post_store(off):
+    """Mode-2 post-``buffer_store`` WAR cover — THE fix for the O-store garbage.
+
+    Emit IMMEDIATELY AFTER a ``buffer_store``, passing the store's own byte OFFSET
+    ``off`` as a tied inline-asm in/out. Same mechanism as ``_war_post_load``: reading
+    ``off`` extends its VGPR live range past the cover so RA cannot reuse it for the
+    next row's offset until the store engine has READ + TRANSLATED it (``vm_vsrc`` +
+    ``xcnt``). DEP_MODE=2 drops mode 0's own VM_VSRC/XCNT interlock on this identical
+    store-address reuse; without the cover the next-row offset VALU races the store's
+    address latch -> O written to a WILD VRAM address -> the real output rows keep
+    pre-kernel garbage (1e37 wild-reads). Tied output discarded. No-op unless mode 2."""
+    if not ENABLE_SCHED_MODE2:
+        return
+    raw = off.ir_value() if hasattr(off, "ir_value") else off
+    llvm_dialect.inline_asm(
+        raw.type, [raw], _COVER_GLUE_WAR, "=v,0", has_side_effects=True
+    )
+
+
+def _war_post_ds(ptr):
+    """Mode-2 post-``ds_load``/``ds_load_tr16`` WAR cover — tie the LDS address AFTER
+    the DS op so RA cannot overwrite the address VGPR before the DS engine has consumed
+    it. DEP_MODE=2 drops the HW interlock that (in mode 0) held that overwrite; without
+    it the next d-tile's address VALU races the DS address read -> the load pulls from a
+    WRONG LDS slot -> a garbage bf16 (bit-patterns reach 3.4e38) flows into the WMMA ->
+    per-d-tile O corruption, FINITE when the stray bf16 is small, WILD (1e37) when large.
+    ``s_wait_dscnt 0`` (all DS retired => this op's address surely read) is the diagnostic
+    wait; the tie pins it between the load and the overwrite. No-op unless mode 2."""
+    if not ENABLE_SCHED_MODE2:
+        return
+    raw = ptr.ir_value() if hasattr(ptr, "ir_value") else ptr
+    llvm_dialect.inline_asm(
+        raw.type, [raw], "s_wait_dscnt 0x0", "=v,0", has_side_effects=True
+    )
+
+
+def _wait_va_vdst(val):
+    """Mode-2 WMMA/VALU-dest -> VALU-consumer cover. DEP_MODE=2 drops the VA_VDST HW
+    interlock that (in mode 0) makes a VALU stall until the long-latency producer that
+    wrote its source VGPR has retired. A ``v_wmma`` accumulator read by softmax/cvt
+    before the wmma writeback lands => the consumer sees a STALE/partial accumulator ->
+    garbage bf16 into the next gemm -> per-tile O corruption (finite or wild). Tie ``val``
+    (the accumulator) through ``s_wait_alu depctr_va_vdst(0)`` so the drain is pinned
+    between the producer and the first consumer of THIS register. Returns the tied raw
+    value; wrap it back into fx.Vector at the call site. No-op unless mode 2."""
+    raw = val.ir_value() if hasattr(val, "ir_value") else val
+    if not ENABLE_SCHED_MODE2:
+        return raw
+    return llvm_dialect.inline_asm(
+        raw.type, [raw], "s_wait_alu depctr_va_vdst(0)", "=v,0", has_side_effects=True
+    )
+
+
+# --- Mode-2 async-load ASM GLUE (THE fix for the large-seqlen WAR NaN) --------
+# A frontend-placed cover (any counter, tied or not) cannot fix the async-load
+# address-VGPR WAR: post-RA, the register allocator inserts the next-chunk offset
+# overwrite (`v_mov`/`v_add`) at load+1, BEFORE the earliest slot a separate cover
+# can occupy (load+2). Mode 0's HW VM_VSRC interlock held that overwrite until the
+# async engine latched the address; mode 2 removes it -> the overwrite races the
+# latch -> corrupt address -> NaN / wild-read / page-fault, but ONLY at scale
+# (>=8192, when many async loads are queued and the latch is delayed).
+#
+# The only guaranteed fix is to make the load and its WAR wait ATOMIC: emit both
+# inside one inline-asm string. The compiler treats the string as opaque and will
+# not insert instructions into it, so the wait is provably adjacent to the load
+# and the overwrite is forced strictly after.
+#
+# The load's three address regs ($0 LDS-dest, $1 global offset, $2 base) have TWO
+# distinct release points; the RA reuses them immediately (the very next instr
+# often overwrites the LDS-dest reg $0), so the WAR must cover BOTH:
+#   (a) GLOBAL source address ($1 offset, $2 base): safe once TRANSLATED.
+#       s_wait_xcnt 0 -> XCNT counts "issued but not-yet-translated" mem ops; this
+#       is the compiler's OWN cover for the identical buffer_store address-reuse WAR
+#       in this same ISA. vm_vsrc(0) [source-read] is included as its companion
+#       (sources entered the pipe). Together they clear all NaN/page-faults and are
+#       0-clean up to 8192 causal and 16384 NON-causal.
+#   (b) LDS-DEST address ($0): the async engine does NOT re-read $0 from the VGPR
+#       at data-arrival — it latches $0 into the async queue entry a few cycles
+#       AFTER issue. Neither xcnt nor vm_vsrc waits for that internal latch, so at
+#       16384 CAUSAL the immediate $0 overwrite still raced it (262/16.7M finite-
+#       wild, no NaN). A short fixed delay lets the latch complete: s_nop 8 (~9 cyc)
+#       closes it with margin. asynccnt 0 also fixes it but costs 100s of cycles
+#       (full data-arrival) and is NOT needed -- the latch, not the write, is the
+#       dependency. Measured 0-clean across 512..16384, causal + non-causal.
+# Costs: vm_vsrc/xcnt ~<=10 cyc each, s_nop 8 ~9 cyc (vs asynccnt 0 ~100s).
+_COVER_GLUE_RAW = "s_wait_alu depctr_va_vdst(0)"  # RAW: addr VALU retired before load
+_COVER_GLUE_WAR = "s_wait_alu depctr_vm_vsrc(0)\ns_wait_xcnt 0x0"
+
+
+def _ir(x):
+    """Unwrap an fx value to its raw MLIR ir.Value (pass-through if already raw)."""
+    return x.ir_value() if hasattr(x, "ir_value") else x
+
+
+def _async_load_to_lds(base_i64, g_offs, lds_offs, imm_offs=None, *, cluster):
+    """Emit a BATCH of async 16B (b128) global->LDS loads sharing one global base.
+
+    ``base_i64`` uniform global base (fx.Int64), shared by every load in the batch.
+    ``g_offs`` / ``lds_offs`` are equal-length lists — one entry per load:
+      g_offs[i]   per-lane global byte offset (fx.Int32, divergent)
+      lds_offs[i] LDS byte offset (fx.Int32)
+    ``imm_offs`` optional equal-length list of compile-time immediate BYTE offsets
+      (Python ints; default all 0). The b128 async instruction's ``offset:`` imm is
+      applied by HW to BOTH the VRAM source AND the LDS destination in lockstep
+      (24-bit signed; see memory ``gfx1250-async-load-to-lds``), so a nonzero imm
+      shifts src and dst together — use it only for a delta that is identical on
+      both sides. ``cluster`` selects the MCAST form (K/V) vs plain global (Q).
+
+    A scalar (non-list) g_off/lds_off/imm_off is accepted and treated as a 1-load
+    batch (back-compat).
+
+    mode 0: each load is the plain rocdl intrinsic — HW issue interlocks handle
+      RAW/WAR. The imm is folded into BOTH the global and LDS addresses (address
+      arithmetic), matching the HW lockstep, since the intrinsic form here takes
+      no separate imm field we rely on.
+    mode 2: emitted as ONE inline-asm block so the compiler cannot slip a next-
+      chunk address-VGPR overwrite between a load and its WAR wait. Layout:
+        s_wait_alu depctr_va_vdst(0)                    # RAW once: addr VALUs retired
+        <mnem> $0,     $n,     $2n  offset:imm0         # load 0
+        <mnem> $1,     $n+1,   $2n  offset:imm1         # load 1
+        ...                                             # ... N loads back-to-back
+        s_wait_alu depctr_vm_vsrc(0) / s_wait_xcnt 0    # WAR once: after LAST load
+      Operands: $0..$(n-1) = LDS byte offsets (v,i32); $n..$(2n-1) = global
+      voffsets (v,i32, divergent); $2n = uniform global base (s, i64 sgpr-pair),
+      shared. HW computes each global address as base + voffset(+imm); the divergent
+      voffsets stay distinct per-chunk regs, the uniform high bits live in the
+      scalar base and can never fault. All operand regs are held live across the
+      whole block, so the single trailing WAR covers every load's address WAR."""
+    if not isinstance(g_offs, (list, tuple)):
+        g_offs = [g_offs]
+    if not isinstance(lds_offs, (list, tuple)):
+        lds_offs = [lds_offs]
+    n = len(g_offs)
+    if len(lds_offs) != n:
+        raise ValueError(f"g_offs/lds_offs length mismatch: {n} vs {len(lds_offs)}")
+    if imm_offs is None:
+        imm_offs = [0] * n
+    elif not isinstance(imm_offs, (list, tuple)):
+        imm_offs = [imm_offs]
+    if len(imm_offs) != n:
+        raise ValueError(f"imm_offs length mismatch: {len(imm_offs)} vs {n}")
+
+    if not ENABLE_SCHED_MODE2:
+        for g_off, lds_off, imm in zip(g_offs, lds_offs, imm_offs):
+            # imm applies to both sides in lockstep -> fold into each address.
+            g_full = g_off + fx.Int32(imm) if imm else g_off
+            lds_full = lds_off + fx.Int32(imm) if imm else lds_off
+            gptr = buffer_ops.create_llvm_ptr(
+                base_i64 + fx.Int64(g_full), address_space=1
+            )
+            lds_ptr = buffer_ops.create_llvm_ptr(lds_full, address_space=3)
+            if cluster:
+                rocdl.cluster_load_async_to_lds(gptr, lds_ptr, _CHUNK_BYTES)
+            else:
+                rocdl_dialect.global_load_async_to_lds_b128(gptr, lds_ptr, 0, 0)
+        return
+
+    mnem = (
+        "cluster_load_async_to_lds_b128" if cluster else "global_load_async_to_lds_b128"
+    )
+    lds_rs = [_ir(x) for x in lds_offs]
+    off_rs = [_ir(x) for x in g_offs]
+    base_r = _ir(base_i64)
+    operands = lds_rs + off_rs + [base_r]
+    constraints = ",".join(["v"] * (2 * n) + ["s"])
+    lines = [_COVER_GLUE_RAW]
+    for i, imm in enumerate(imm_offs):
+        off_field = f" offset:{imm}" if imm else ""
+        lines.append(f"{mnem} ${i}, ${n + i}, ${2 * n}{off_field}")
+    lines.append(_COVER_GLUE_WAR)
+    llvm_dialect.inline_asm(
+        None, operands, "\n".join(lines), constraints, has_side_effects=True
+    )
+
+
 # ============================================================================
 # Q loader (global -> LDS async -> VGPR WMMA fragments)
 # ============================================================================
@@ -161,17 +451,78 @@ class QManager16b:
             + sw * _CHUNK_BYTES
         )
 
-    def _async_load_vram_to_lds(self, q_base_i64, g_off, lds_off):
-        """gfx1250 async 16B global->LDS copy. ``offset``=0: a nonzero imm shifts
-        BOTH src and dst by the same bytes, which our tile/half terms can't use."""
-        gptr = buffer_ops.create_llvm_ptr(q_base_i64 + fx.Int64(g_off), address_space=1)
-        lds_ptr = buffer_ops.create_llvm_ptr(lds_off, address_space=3)
-        rocdl_dialect.global_load_async_to_lds_b128(gptr, lds_ptr, 0, 0)
+    def _async_load_vram_to_lds(self, q_base_i64, g_offs, lds_offs, imm_offs=None):
+        """gfx1250 async 16B global->LDS copy — accepts a batch (equal-length lists,
+        or scalars for one load). ``imm_offs`` shifts BOTH src and dst by the same
+        bytes in lockstep (default 0). mode-2 emits the batch + a single trailing WAR
+        cover as ONE atomic inline-asm block (see K/V loaders / _async_load_to_lds).
+        Q uses the plain (non-MCAST) global form."""
+        _async_load_to_lds(q_base_i64, g_offs, lds_offs, imm_offs, cluster=False)
 
     def _load_lds_to_vgpr(self, lds_off, vec_ty):
         """ds_load ``vec_ty`` from LDS byte offset ``lds_off`` into a VGPR vector."""
         lds_ptr = buffer_ops.create_llvm_ptr(lds_off, address_space=3)
-        return fx.Vector(llvm_dialect.load(vec_ty, lds_ptr))
+        lds_ptr = _wait_alu0(lds_ptr)  # mode-2 cover (tied): RAW into ds_load
+        out = fx.Vector(llvm_dialect.load(vec_ty, lds_ptr))
+        _war_post_ds(lds_ptr)  # mode-2 cover (tied): WAR after ds_load addr read
+        return out
+
+    def global_load_params(
+        self,
+        *,
+        lds_q_base,  # fx.Int32: byte base of THIS warp's LDS region
+        warp_row0,  # fx.Int32: global Q-row of this warp's row 0
+        kv_head,
+        q_start,
+        q_len,
+        stride_q_seq,
+        stride_q_head,
+        lane_idx,
+    ):
+        """Params for EVERY ``global_load_async_to_lds_b128`` of this warp's Q tile.
+
+        Returns ``(g_offs, lds_offs, imm_offs)`` — three equal-length lists, one
+        entry per async b128 group: ``k_tiles`` tiles x 2 half-loads = 8 / 12 / 16
+        groups for qk_hdim 128 / 192 / 256. Pure index arithmetic (no memory op) so
+        the caller can hoist ALL address VALU ahead of the load burst. ``g_offs`` /
+        ``lds_offs`` are the per-lane global (VRAM) and LDS byte offsets; ``imm_offs``
+        is 0 (the intra-tile hdim shift is already folded into ``g_off``). Rows with
+        seq >= q_len are clamped in-bounds (masked later in softmax)."""
+        g_offs, lds_offs = [], []
+        for tile in fx.range_constexpr(self.k_tiles):
+            for half in fx.range_constexpr(2):
+                row = lane_idx // 4 + half * 8  # row within warp [0,16)
+                col_chunk = lane_idx % 4  # 8-col chunk within the 32-col tile [0,4)
+                pr = warp_row0 + row
+                q_head = kv_head * self.gqa_ratio + pr % self.gqa_ratio
+                seq = pr // self.gqa_ratio
+                safe_seq = (seq < q_len).select(seq, fx.Int32(0))  # clamp OOB
+                token = q_start + safe_seq
+                g_off = (
+                    token * stride_q_seq
+                    + q_head * stride_q_head
+                    + fx.Int32(tile * _WMMA_K * _BF16_BYTES)
+                    + col_chunk * _CHUNK_BYTES
+                )
+                g_offs.append(g_off)
+                lds_offs.append(lds_q_base + self._lds_byte(row, col_chunk, tile))
+        imm_offs = [0] * len(g_offs)
+        return g_offs, lds_offs, imm_offs
+
+    def ds_load_params(self, *, lds_q_base, lane_idx):
+        """LDS byte offsets for EVERY ``ds_load_b128`` read of this warp's Q tile.
+
+        Returns a flat list of ``k_tiles`` x 2 (lo, hi) = 8 / 12 / 16 read offsets:
+        read ``2t`` is tile ``t``'s low 8-col half, read ``2t+1`` its high half; the
+        pair shuffles into the 16x32 WMMA A fragment. Pure index math (no memory
+        op)."""
+        row = lane_idx % _WMMA_M
+        klane = lane_idx // _WMMA_M  # 0 or 1
+        offs = []
+        for tile in fx.range_constexpr(self.k_tiles):
+            offs.append(lds_q_base + self._lds_byte(row, klane, tile))  # lo
+            offs.append(lds_q_base + self._lds_byte(row, klane + 2, tile))  # hi
+        return offs
 
     def load_q_to_vgpr(
         self,
@@ -190,65 +541,64 @@ class QManager16b:
     ):
         """Stage this warp's 16 x qk_hdim Q tile and return the WMMA A fragments.
 
-        Software-pipelined ring buffer of ``lds_tiles`` slots: prime the
-        first slots with async global->LDS (swizzled), then for each K-tile wait
-        (graduated ``s_wait_asynccnt``), ds_load_b128 the slot -> v16 bf16 frag,
-        refill the freed slot with a future tile, and pre-scale by ``scale``.
+        Fully-resident (``lds_tiles == k_tiles``) three-phase load, structured so
+        that NO VALU is interleaved with the memory ops (the mode-2 goal + the
+        LDS-burst strategy):
+
+          1. compute ALL params up front (address VALU) via ``global_load_params`` /
+             ``ds_load_params``;
+          2. issue the whole global->LDS async batch, one ``s_wait_asynccnt 0``, the
+             whole ds_load_b128 read burst, one ``s_wait_dscnt 0`` -- no VALU in
+             between (address VALU already retired at the async block's leading
+             ``va_vdst`` cover; the trailing dscnt covers the read->shuffle WAR);
+          3. shuffle each lo/hi pair into the A fragment and fold ``scale``.
+
         Rows with seq >= q_len are clamped in-bounds and masked later in softmax.
         """
+        if self.lds_tiles != self.k_tiles:
+            raise NotImplementedError(
+                "phased load_q_to_vgpr requires full Q residency "
+                f"(lds_tiles == k_tiles); got lds_tiles={self.lds_tiles}, "
+                f"k_tiles={self.k_tiles}"
+            )
         lds_q_base = ptr_lds + warp_idx * self._warp_stride
         q_base_i64 = fx.Int64(fx.ptrtoint(fx.get_iter(ptr_Q)))
         warp_row0 = block_x * self.block_m + warp_idx * _WMMA_M
 
-        def _issue_async(tile, slot):
-            # Coalesced global read -> per-lane swizzled LDS write of logical
-            # ``tile`` into physical ring ``slot`` (2 half-loads).
-            for half in fx.range_constexpr(2):
-                row = lane_idx // 4 + half * 8  # row within warp [0,16)
-                col_chunk = lane_idx % 4  # 8-col chunk within the 32-col tile [0,4)
-                pr = warp_row0 + row
-                q_head = kv_head * self.gqa_ratio + pr % self.gqa_ratio
-                seq = pr // self.gqa_ratio
-                safe_seq = (seq < q_len).select(seq, fx.Int32(0))  # clamp OOB
-                token = q_start + safe_seq
-                g_off = (
-                    token * stride_q_seq
-                    + q_head * stride_q_head
-                    + fx.Int32(tile * _WMMA_K * _BF16_BYTES)
-                    + col_chunk * _CHUNK_BYTES
-                )
-                self._async_load_vram_to_lds(
-                    q_base_i64, g_off, lds_q_base + self._lds_byte(row, col_chunk, slot)
-                )
+        # ---- Phase 1: all address VALU up front -----------------------------
+        g_offs, lds_wr_offs, imm_offs = self.global_load_params(
+            lds_q_base=lds_q_base,
+            warp_row0=warp_row0,
+            kv_head=kv_head,
+            q_start=q_start,
+            q_len=q_len,
+            stride_q_seq=stride_q_seq,
+            stride_q_head=stride_q_head,
+            lane_idx=lane_idx,
+        )
+        ds_offs = self.ds_load_params(lds_q_base=lds_q_base, lane_idx=lane_idx)
 
-        # Prime the ring: tiles 0..lds_tiles-1 map 1:1 onto slots 0..lds_tiles-1.
-        for tile in fx.range_constexpr(self.lds_tiles):
-            _issue_async(tile, tile)
-
+        # ---- Phase 2: memory ops only, no VALU inserted between --------------
+        # Whole global->LDS batch in one async block (mode-2: single trailing WAR),
+        # then wait all landed, then the whole ds_load_b128 read burst back-to-back,
+        # then one dscnt. create_llvm_ptr on a precomputed offset carries no VALU.
+        self._async_load_vram_to_lds(q_base_i64, g_offs, lds_wr_offs, imm_offs)
+        rocdl.s_wait_asynccnt(0)
         v8_ty = fx.Vector.make_type(_CHUNK_ELEMS, fx.BFloat16)
+        raw_frags = []
+        for off in ds_offs:
+            lds_ptr = buffer_ops.create_llvm_ptr(off, address_space=3)
+            raw_frags.append(fx.Vector(llvm_dialect.load(v8_ty, lds_ptr)))
+        rocdl.s_wait_dscnt(0)
+
+        # ---- Phase 3: shuffle lo/hi + fold scale (VALU) ---------------------
         # bf16 scale -> packed v_pk_mul_bf16 (no f32 round-trip); an fx.Float32
         # scale would widen the fragment to f32.
         scale_bf16 = scale.to(fx.BFloat16)
         q_frags = []
         for tile in fx.range_constexpr(self.k_tiles):
-            # Graduated wait: tile t's writes are async ops 2t/2t+1; wait until
-            # only its (and later primed/refilled) copies remain. While still
-            # refilling: 2*(lds_tiles-1); after: 2*(k_tiles-t-1). Equal at t==k-n.
-            if tile < self.k_tiles - self.lds_tiles:
-                rocdl.s_wait_asynccnt((self.lds_tiles - 1) * 2)
-            else:
-                rocdl.s_wait_asynccnt((self.k_tiles - tile - 1) * 2)
-            slot = tile % self.lds_tiles
-            row = lane_idx % _WMMA_M
-            klane = lane_idx // _WMMA_M  # 0 or 1
-            lo = self._load_lds_to_vgpr(lds_q_base + self._lds_byte(row, klane, slot), v8_ty)
-            hi = self._load_lds_to_vgpr(lds_q_base + self._lds_byte(row, klane + 2, slot), v8_ty)
-            # Refill the just-read slot with a future tile. The compiler tracks
-            # only the LDS->VGPR read dependency (dscnt before the mul), so guard
-            # it manually.
-            if tile < self.k_tiles - self.lds_tiles:
-                rocdl.s_wait_dscnt(0)
-                _issue_async(self.lds_tiles + tile, slot)
+            lo = raw_frags[2 * tile]
+            hi = raw_frags[2 * tile + 1]
             frag = lo.shuffle(hi, list(range(16)))  # v16 bf16, concat(lo, hi)
             frag = frag * scale_bf16
             # f32-precision fallback if bf16 scale hurts quality:
@@ -354,12 +704,12 @@ class KManager16b:
             + kv_head * stride_k_head
             + (fx.Int32(col_idx) + chunk * _CHUNK_ELEMS) * _BF16_BYTES
         )
-        gptr = buffer_ops.create_llvm_ptr(k_base_i64 + fx.Int64(g_off), address_space=1)
-        lds_ptr = buffer_ops.create_llvm_ptr(
-            ptr_lds + self._lds_byte(tile_row, tile_col, row_in_tile, chunk),
-            address_space=3,
-        )
-        rocdl.cluster_load_async_to_lds(gptr, lds_ptr, _CHUNK_BYTES)
+        lds_off = ptr_lds + self._lds_byte(tile_row, tile_col, row_in_tile, chunk)
+        # mode-2: load + RAW/WAR covers emitted as ONE atomic inline-asm block so
+        # the RA cannot slip the next-chunk offset overwrite between load and wait
+        # (see _async_load_to_lds). The scalar-base + per-chunk voffset form is kept
+        # by passing base/offset separately.
+        _async_load_to_lds(k_base_i64, g_off, lds_off, cluster=True)
 
     def async_load_vram_to_lds(
         self,
@@ -428,7 +778,10 @@ class KManager16b:
             ptr_lds + self._lds_byte(tile_row, tile_col, row_in_tile, chunk),
             address_space=3,
         )
-        return fx.Vector(llvm_dialect.load(v8_ty, lds_ptr))
+        lds_ptr = _wait_alu0(lds_ptr)  # mode-2 cover (tied): RAW into ds_load
+        out = fx.Vector(llvm_dialect.load(v8_ty, lds_ptr))
+        _war_post_ds(lds_ptr)  # mode-2 cover (tied): WAR after ds_load addr read
+        return out
 
 
 # ============================================================================
@@ -526,11 +879,11 @@ class VManager16b:
             safe_kv = (kv_row < kv_valid).select(kv_row, fx.Int32(0))  # clamp OOB
         token = kv_row0 + safe_kv
         g_off = token * stride_v_seq + kv_head * stride_v_head + d_col * _BF16_BYTES
-        gptr = buffer_ops.create_llvm_ptr(v_base_i64 + fx.Int64(g_off), address_space=1)
-        lds_ptr = buffer_ops.create_llvm_ptr(
-            ptr_lds + self._lds_byte(kv_row, d_col), address_space=3
-        )
-        rocdl.cluster_load_async_to_lds(gptr, lds_ptr, _CHUNK_BYTES)
+        # LDS position uses the UNCLAMPED kv_row (global read uses clamped safe_kv).
+        lds_off = ptr_lds + self._lds_byte(kv_row, d_col)
+        # mode-2: load + RAW/WAR covers as ONE atomic inline-asm block (see K loader
+        # / _async_load_to_lds). Scalar-base + per-chunk voffset form preserved.
+        _async_load_to_lds(v_base_i64, g_off, lds_off, cluster=True)
 
     def async_load_vram_to_lds(
         self,
@@ -593,7 +946,10 @@ class VManager16b:
         lds_ptr = buffer_ops.create_llvm_ptr(
             ptr_lds + self._lds_byte(fetch_kv, fetch_d), address_space=3
         )
-        return fx.Vector(rocdl.ds_load_tr16_b128(v8_ty, lds_ptr))
+        lds_ptr = _wait_alu0(lds_ptr)  # mode-2 cover (tied): RAW into ds_load_tr16
+        out = fx.Vector(rocdl.ds_load_tr16_b128(v8_ty, lds_ptr))
+        _war_post_ds(lds_ptr)  # mode-2 cover (tied): WAR after ds_load_tr16 addr read
+        return out
 
 
 # ============================================================================
@@ -746,6 +1102,10 @@ class OManager16b:
                 lds_ptr = buffer_ops.create_llvm_ptr(
                     lds_warp + self._lds_byte(slot, q_st, d_col), address_space=3
                 )
+                # mode-2 cover (tied): both the addr and the bf16 data (a WMMA-acc
+                # cvt) are VALU-produced -> RAW into the ds_store. Tie both.
+                lds_ptr = _wait_alu0(lds_ptr)
+                bf = _wait_alu0(bf)
                 llvm_dialect.store(bf.ir_value(), lds_ptr, alignment=_CHUNK_BYTES)
                 last = issued
                 issued += 1
@@ -768,7 +1128,9 @@ class OManager16b:
                 lds_ptr = buffer_ops.create_llvm_ptr(
                     lds_warp + self._lds_byte(slot, q_out, d_local), address_space=3
                 )
+                lds_ptr = _wait_alu0(lds_ptr)  # mode-2 cover (tied): RAW into ds_load
                 data = fx.Vector(llvm_dialect.load(v8_ty, lds_ptr))
+                _war_post_ds(lds_ptr)  # mode-2 cover (tied): WAR after ds_load addr read
                 loaded.append((data, q_out, d_local))
                 gidxs.append(issued)
                 issued += 1
@@ -790,13 +1152,26 @@ class OManager16b:
                     + d_base
                     + d_local
                 )
+                # mode-2 cover (tied): buffer_store lowers `mask=valid` to an INTERNAL
+                # select(valid, off, 0x7fffffff) that lands right before the store, so
+                # tying `off_bytes` alone leaves that select uncovered -> stale reused
+                # offset -> wild VRAM address (page fault). Replicate the mask-select
+                # here (valid ? off : OOB), tie its RESULT, and pass mask=None so the
+                # tie sits immediately before the store with no VALU between. (data is
+                # dscnt-covered above.)
+                off_bytes = off_elems * fx.Int32(_BF16_BYTES)
+                off_masked = valid.select(off_bytes, fx.Int32(0x7FFFFFFF))
+                off_masked = _wait_alu0(off_masked)
                 buffer_ops.buffer_store(
                     data,
                     o_rsrc,
-                    off_elems * _BF16_BYTES,
-                    mask=valid,
+                    off_masked,
+                    mask=None,
                     offset_is_bytes=True,
                 )
+                # mode-2 WAR cover: hold off_masked live until the store latches its
+                # address (mode 0's own vm_vsrc/xcnt interlock, dropped by DEP_MODE=2).
+                _war_post_store(off_masked)
 
         # Two-stage pipeline: prime unit 0, then overlap unit u+1's write with unit
         # u's read. n_units == 1 collapses to a single write+read with one RAW wait.
