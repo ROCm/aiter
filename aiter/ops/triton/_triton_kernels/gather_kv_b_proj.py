@@ -652,13 +652,8 @@ def _triton_gather_kv_b_proj_impl(
     # ===---------------------------------------------------
     # Workload Partition
     # ===---------------------------------------------------
-    # Page-size-1 inputs use a bounded worker grid over (head, global token
-    # chunk). Both kv_indices and output rows are packed in batch-major token
-    # order, and this projection has no cross-token state, so workers grid-stride
-    # over chunks that may cross sequence boundaries. Keeping the weights outside
-    # that loop amortizes their loads without sacrificing global load balancing.
-    #
-    # Other layouts use one program per (batch, head, sequence-local KV chunk).
+    # Page-size-1 workers grid-stride over packed token chunks; other layouts use
+    # one program per (batch, head, sequence-local chunk).
     flat_pid = tl.program_id(0)
     if FLAT_TOKEN_GRID:
         assert KBlockSize == 1
@@ -688,9 +683,6 @@ def _triton_gather_kv_b_proj_impl(
         total_kv_block = kv_block_end - kv_block_start
         chunk_stride = 1
 
-    # The generic grid's chunk axis is an upper bound over the whole batch, so
-    # programs past their sequence's end return before loading projection data.
-    # This also handles the empty total_kv case for the flat-token grid.
     num_kv_chunks = (
         total_kv_block + KBlocksPerChunkK - 1
     ) // KBlocksPerChunkK
@@ -931,9 +923,7 @@ def _triton_gather_kv_b_proj_impl(
             )
             chunk_id += chunk_stride
     else:
-        # Keep the one-chunk path inline. In particular, this preserves the
-        # existing page-size>1/shuffled codegen; routing it through the loop
-        # helper lengthens live ranges and measurably hurts that fallback.
+        # Keep the page-size>1/shuffled path inline to preserve its codegen.
         if SHUFFLED_KV_CACHE:
             if k_buffer.dtype.element_ty == tl.bfloat16:
                 K_WIDTH: tl.constexpr = 8

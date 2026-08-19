@@ -120,21 +120,9 @@ def gather_kv_b_proj(
     if arch_info.get_arch() in ("gfx942",) and ChunkK > 64:
         num_stages = 1
 
-    # Size the chunk axis from the actual output token count rather than from
-    # `kv_indices`, whose length may be a much larger preallocated capacity.
-    #
-    # With page_size=1, non-FP4 `kv_indices` and the output rows are both packed
-    # in batch-major token order. Projection is independent per token, so workers
-    # grid-stride over global chunks that may cross sequence boundaries. Cap the
-    # worker count at six programs per CU. A gfx950 sweep from 1 to 32
-    # programs/CU found six best overall across short, long, balanced, and
-    # ragged contexts: fewer workers under-filled the memory/MFMA pipelines,
-    # while more workers duplicated projection-weight loads. The cap affects
-    # scheduling only; every chunk is still covered by the grid-stride loop.
-    #
-    # Other layouts retain the generic (batch, head, KV chunk) partition. Their
-    # physical block indices need per-sequence indptrs to map partial pages to
-    # packed output rows.
+    # Page-size-1 indices and outputs share packed token order, so workers can
+    # grid-stride over global chunks and reuse weights. Six programs/CU was best
+    # in the gfx950 sweep; other layouts keep the existing per-sequence grid.
     max_kv_chunks = max(1, (total_kv_k + ChunkK - 1) // ChunkK)
     flat_token_grid = block_size == 1 and not is_fp4_weight
     grid_stride_chunks = False
