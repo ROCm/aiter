@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-#include "aiter_ctypes_error.h"
 #include "aiter_tensor.h"
+
+// Must follow aiter_tensor.h, which provides the HIP error-bridge dependencies.
+#include "aiter_ctypes_error.h"
 #include "asm_f6gemm_configs.hpp"
 #include <cmath>
 #include <hip/hip_runtime.h>
