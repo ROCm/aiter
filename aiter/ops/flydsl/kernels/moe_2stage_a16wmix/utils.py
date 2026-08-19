@@ -498,18 +498,15 @@ def make_b_loader(
     _g_half = (K // A16WI4_GROUP_SIZE) // 2
 
     # ---- buffer resources -----------------------------------------------------
-    # bf16 W [E, N_OUT, K] whole-tensor extent overflows the 32-bit num_records/i32
-    # byte-offset at large E (E896: 6.6GB): fold the per-expert base into the i64
-    # resource addr and index within the expert. mxfp4/int4 keep the whole-tensor path.
-    if const_expr(_is_bf16):
-        _w_per_expert_bytes = N_OUT * (K * 2)
-        w_base_i64 = fx.Int64(arg_bq) + fx.Int64(e) * fx.Int64(_w_per_expert_bytes)
-        w_tiles = _global_i32_buffer_tiles(
-            w_base_i64, min(_w_per_expert_bytes, 0xFFFFFFFF), 4
-        )
-    else:
-        _w_bytes = NE * N_OUT * K_HALF
-        w_tiles = _global_i32_buffer_tiles(arg_bq, min(_w_bytes, 0xFFFFFFFF), 4)
+    # W's whole-tensor extent overflows the 32-bit num_records and the i32 N index at
+    # large E for every weight dtype (E896: bf16 6.6 GB, mxfp4/int4 9.9 GB at N_OUT=6144),
+    # so fold the per-expert base into the i64 resource address and index within the
+    # expert. num_records then bounds one expert instead of being clamped to 4 GB.
+    _w_per_expert_bytes = N_OUT * (K * 2) if _is_bf16 else N_OUT * K_HALF
+    w_base_i64 = fx.Int64(arg_bq) + fx.Int64(e) * fx.Int64(_w_per_expert_bytes)
+    w_tiles = _global_i32_buffer_tiles(
+        w_base_i64, min(_w_per_expert_bytes, 0xFFFFFFFF), 4
+    )
     # W dwordx4 load via BufferCopy128b atom (cache modifier in the aux field).
     w_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(b_cache_mod), fx.Int32)
     w_reg_lay = fx.make_layout(4, 1)
@@ -518,7 +515,9 @@ def make_b_loader(
         # port MFMA-K32 block is two such slots 128 B apart (see load_b_raw_int4).
         w_copy_atom64 = fx.make_copy_atom(fx.rocdl.BufferCopy64b(b_cache_mod), fx.Int32)
         w_reg_lay2 = fx.make_layout(2, 1)
-        w_tiles8 = _global_i32_buffer_tiles(arg_bq, min(_w_bytes, 0xFFFFFFFF), 2)
+        w_tiles8 = _global_i32_buffer_tiles(
+            w_base_i64, min(_w_per_expert_bytes, 0xFFFFFFFF), 2
+        )
     if _is_int4:
         # int4 groupwise scale buffer (E, G//2, N_OUT, 2) bf16 -> G//2 dwords per N.
         _sw_bytes = NE * N_OUT * _g_half * 4
@@ -572,9 +571,9 @@ def make_b_loader(
     def col(*n_terms):
         """Address one 16-wide N block; this lane owns row ``sum(n_terms) + lane``."""
         col_g = _sum(n_terms[0], n_terms[1:]) + lane_mod_16
-        # bf16 W folds the expert into the resource base (above); mxfp4/int4 index it.
-        _row_expert_off = fx.Int32(0) if const_expr(_is_bf16) else expert_off
-        row = _row_expert_off + col_g
+        # W's resource is re-based per expert, so the row is expert-relative. `ng` keeps
+        # the expert term: the scale tensors are indexed whole and cannot overflow i32.
+        row = col_g
         n_blk = row // fx.Int32(16)
         n_intra = row % fx.Int32(16)
         ng = _sum(expert_off, n_terms)
@@ -583,8 +582,7 @@ def make_b_loader(
     def col_pair(*n_terms, shift):
         """Address a gate|up pair: one block, and the one ``shift`` further along N."""
         col_g = _sum(n_terms[0], n_terms[1:]) + lane_mod_16
-        _row_expert_off = fx.Int32(0) if const_expr(_is_bf16) else expert_off
-        row_g = _row_expert_off + col_g
+        row_g = col_g
         row_u = row_g + shift
         blk_g, intra_g = row_g // fx.Int32(16), row_g % fx.Int32(16)
         blk_u, intra_u = row_u // fx.Int32(16), row_u % fx.Int32(16)
