@@ -796,50 +796,53 @@ void inverse_rope_group_quant(
                               : (wave64 ? 8 : (narrow_slice ? 16 : 32));
         if(tds_ovr <= 0)
         {
-        if(wave64 && !kMfmaTile)
-        {
-            // A launch too small to cover the GPU is wave-starved rather than
-            // bandwidth bound, and there the wide slice only concentrates the
-            // work into fewer blocks. A narrower one puts more lanes on each
-            // group and multiplies the wave count by the same factor (S=1,
-            // GS=128: 8 waves at 16B/thread, 32 at 4B), which is worth more
-            // than the load width. Only while the machine is not yet full,
-            // though -- narrowing a shape that already fills it costs ~8%, and
-            // the deficit has to be read off the launch rather than S, since
-            // rows counts S * num_groups.
-            const bool wave_starved =
-                static_cast<int64_t>(rows) * scale_n * (GS / tds) <
-                simds * wave_size;
-            if(wave_starved)
+            if(wave64 && !kMfmaTile)
             {
-                tds = std::min(tds, S <= 4 ? 2 : 4);
-                tds = std::max(tds, GS / wave_size);
+                // A launch too small to cover the GPU is wave-starved rather
+                // than bandwidth bound, and there the wide slice only
+                // concentrates the work into fewer blocks. A narrower one puts
+                // more lanes on each group and multiplies the wave count by the
+                // same factor (S=1, GS=128: 8 waves at 16B/thread, 32 at 4B),
+                // which is worth more than the load width. Only while the
+                // machine is not yet full, though -- narrowing a shape that
+                // already fills it costs ~8%, and the deficit has to be read
+                // off the launch rather than S, since rows counts
+                // S * num_groups.
+                const bool wave_starved =
+                    static_cast<int64_t>(rows) * scale_n * (GS / tds) <
+                    simds * wave_size;
+                if(wave_starved)
+                {
+                    tds = std::min(tds, S <= 4 ? 2 : 4);
+                    tds = std::max(tds, GS / wave_size);
+                }
             }
-        }
-        if constexpr(kMfmaTile)
-        {
-            // The MFMA tile scatters one byte per 64B of tile, so let a wave own
-            // at least 8 groups: its bytes then merge into fewer write
-            // transactions. n32k4 does not need this -- its four adjacent k are
-            // four adjacent bytes, so it writes like the row-major layout.
-            tds = std::max(tds, GS * 8 / wave_size);
-        }
-        else if(!wave64)
-        {
-            // These tiers want one wave per block (see waves_per_block below),
-            // and a block is k_slots * (GS / tds) threads with k_slots capped at
-            // Ks. So a wide slice leaves a partial wave once Ks is small: at
-            // GS=32 with Ks=16 (G=16 here), tds=32 puts one thread on each group
-            // and only 16 of the wave's 32 lanes get work -- measured 5.32 vs
-            // 6.37 TB/s at S=4096. Narrow the slice until the block can fill a
-            // wave; Ks * GS is the widest block this Ks can supply.
-            while(tds > 1 &&
-                  static_cast<int64_t>(scale_n) * GS <
-                      static_cast<int64_t>(tds) * wave_size)
+            if constexpr(kMfmaTile)
             {
-                tds >>= 1;
+                // The MFMA tile scatters one byte per 64B of tile, so let a wave
+                // own at least 8 groups: its bytes then merge into fewer write
+                // transactions. n32k4 does not need this -- its four adjacent k
+                // are four adjacent bytes, so it writes like the row-major
+                // layout.
+                tds = std::max(tds, GS * 8 / wave_size);
             }
-        }
+            else if(!wave64)
+            {
+                // These tiers want one wave per block (see waves_per_block
+                // below), and a block is k_slots * (GS / tds) threads with
+                // k_slots capped at Ks. So a wide slice leaves a partial wave
+                // once Ks is small: at GS=32 with Ks=16 (G=16 here), tds=32 puts
+                // one thread on each group and only 16 of the wave's 32 lanes
+                // get work -- measured 5.32 vs 6.37 TB/s at S=4096. Narrow the
+                // slice until the block can fill a wave; Ks * GS is the widest
+                // block this Ks can supply.
+                while(tds > 1 &&
+                      static_cast<int64_t>(scale_n) * GS <
+                          static_cast<int64_t>(tds) * wave_size)
+                {
+                    tds >>= 1;
+                }
+            }
         }
         tds = std::min(tds, GS);
         // A logical quant group must fit wholly within one hardware wave.

@@ -22,6 +22,8 @@ from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.inverse_rope_group_quant import (
     inverse_rope_group_quant as inverse_rope_group_quant_cpp,
+)
+from aiter.ops.inverse_rope_group_quant import (
     scale_shape,
 )
 from aiter.ops.quant import dynamic_per_group_scaled_quant
