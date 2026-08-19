@@ -677,9 +677,9 @@ _MFMA16_HIP_MIN_FLYDSL_VERSION = "0.2.0"
 _GFX_ARCH = get_rocm_arch().split(":")[0]
 _IS_GFX942 = _GFX_ARCH.startswith("gfx942")
 
-# Offline-measured BV winners (``aiter/configs/chunk_gdn_h_mfma16_hip_tuned.csv``),
+# Offline-measured BV winners (``model_configs/*_chunk_gdn_h_mfma16_hip_tuned.csv``),
 # resolved via ``AITER_CONFIGS`` (supports env override and model_configs merge).
-# AOT compile shapes live in the separate untuned table.
+# AOT compile shapes live in the separate untuned table under model_configs/.
 
 
 def _bv_tuned_csv_path() -> str:

@@ -154,6 +154,8 @@ AITER_CONFIG_GDN_K5_MFMA16_HIP = os.getenv(
     "AITER_CONFIG_GDN_K5_MFMA16_HIP",
     f"{AITER_ROOT_DIR}/aiter/configs/chunk_gdn_h_mfma16_hip_tuned.csv",
 )
+# Per-model tuned data lives under model_configs/ (qwen3_5_*_chunk_gdn_h_mfma16_hip_tuned.csv),
+# merged at runtime by get_config_file; the canonical path above may not exist on disk.
 
 
 class AITER_CONFIG:

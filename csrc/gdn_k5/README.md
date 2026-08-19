@@ -1,6 +1,6 @@
 # FlyDSL K5 mfma16_hip BV Tune
 
-Model untuned/tuned CSVs live under `aiter/configs/model_configs/` (`qwen3_5_*_chunk_gdn_h_mfma16_hip_{un,t}uned.csv`). Prefill cases are in `op_tests/flydsl_tests/test_flydsl_linear_attention_prefill.py`. Runtime merge uses `AITER_CONFIG_GDN_K5_MFMA16_HIP` (canonical stub + `model_configs/*_tuned.csv`).
+Model untuned/tuned CSVs live under `aiter/configs/model_configs/` (`qwen3_5_*_chunk_gdn_h_mfma16_hip_{un,t}uned.csv`). Prefill cases are in `op_tests/flydsl_tests/test_flydsl_linear_attention_prefill.py`. Runtime merge uses `AITER_CONFIG_GDN_K5_MFMA16_HIP` (`model_configs/*_tuned.csv` only).
 
 ```bash
 # Tune (write candidates under /tmp before merging)

@@ -6,8 +6,8 @@
 """AOT pre-compile FlyDSL chunk_gdn_h kernels (vk baseline + mfma16_hip fork).
 
 ``vk`` reads ``aiter/ops/flydsl/chunk_gdn_h_tuned.csv``; ``mfma16_hip`` reads
-``chunk_gdn_h_mfma16_hip_untuned.csv`` (+ ``model_configs/*``). Runtime BV
-lookup for mfma16_hip uses ``AITER_CONFIG_GDN_K5_MFMA16_HIP``.
+``model_configs/*_chunk_gdn_h_mfma16_hip_untuned.csv``. Runtime BV lookup uses
+``AITER_CONFIG_GDN_K5_MFMA16_HIP`` (``model_configs/*_tuned.csv`` merge).
 
 Usage: ``python -m aiter.aot.flydsl.chunk_gdn_h [--kernel vk|mfma16_hip|all]``
 
@@ -57,17 +57,11 @@ _TORCH_DTYPE = {
     "torch.float16": "float16",
 }
 
-_DEFAULT_CSV_MFMA16_HIP = Path(
-    f"{AITER_ROOT_DIR}/aiter/configs/chunk_gdn_h_mfma16_hip_untuned.csv"
-)
 _MODEL_CONFIG_DIR = Path(f"{AITER_ROOT_DIR}/aiter/configs/model_configs")
 DEFAULT_CSVS_MFMA16_HIP = sorted(
-    {str(_DEFAULT_CSV_MFMA16_HIP)}
-    | {
-        str(p)
-        for p in _MODEL_CONFIG_DIR.glob("*_chunk_gdn_h_mfma16_hip_untuned.csv")
-        if p.is_file()
-    }
+    str(p)
+    for p in _MODEL_CONFIG_DIR.glob("*_chunk_gdn_h_mfma16_hip_untuned.csv")
+    if p.is_file()
 )
 _MFMA16_HIP_KERNEL_NAME = "chunk_gdn_fwd_h_flydsl_mfma16_hip"
 _BV_CANDIDATES = (64, 32, 16)
@@ -719,6 +713,12 @@ def main():
     for name in kernels:
         spec = _KERNEL_SPECS[name]
         csv_paths = [os.path.abspath(p) for p in (args.csv or spec.default_csvs)]
+        if not csv_paths:
+            print(
+                f"Error: no untuned csv files for {name} "
+                f"(expected {spec.default_csvs!r})"
+            )
+            sys.exit(1)
         for csv_path in csv_paths:
             if not os.path.isfile(csv_path):
                 print(f"Error: csv file not found: {csv_path}")

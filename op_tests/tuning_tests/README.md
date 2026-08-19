@@ -29,7 +29,7 @@ Minimal test suite for validating the aiter tuning infrastructure.
 | `batched_bf16` | `csrc/ck_batched_gemm_bf16/batched_gemm_bf16_tune.py` | `bf16_tuned_batched_gemm.csv` | ✓ | ✓ + shape_grouped |
 | `fmoe` | `csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py` | `tuned_fmoe.csv` + model_configs | ✓ | ✓ (bf16/fp8/int8/gelu) |
 | `gradlib_bf16` | `gradlib/gradlib/gemm_tuner.py` | `bf16_tuned_gemm.csv` | ✓ | ✓ (hipBLASLt/ASM/FlyDSL) |
-| `gdn_k5_mfma16_hip` | `csrc/gdn_k5/chunk_gdn_h_mfma16_hip_tune.py` | `chunk_gdn_h_mfma16_hip_tuned.csv` + model_configs | ✓ | ✓ (shape-only varlen smoke) |
+| `gdn_k5_mfma16_hip` | `csrc/gdn_k5/chunk_gdn_h_mfma16_hip_tune.py` | `model_configs/*_chunk_gdn_h_mfma16_hip_tuned.csv` | ✓ | ✓ (shape-only varlen smoke) |
 
 ## Config resolution
 

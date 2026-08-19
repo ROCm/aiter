@@ -31,8 +31,13 @@ from aiter import logger
 from aiter.jit.core import AITER_ROOT_DIR
 from aiter.utility.base_tuner import TunerCommon
 
-_DEFAULT_UNTUNED = f"{AITER_ROOT_DIR}/aiter/configs/chunk_gdn_h_mfma16_hip_untuned.csv"
-_DEFAULT_TUNED = f"{AITER_ROOT_DIR}/aiter/configs/chunk_gdn_h_mfma16_hip_tuned.csv"
+_MODEL_CONFIG_DIR = f"{AITER_ROOT_DIR}/aiter/configs/model_configs"
+_DEFAULT_UNTUNED = (
+    f"{_MODEL_CONFIG_DIR}/qwen3_5_35b_chunk_gdn_h_mfma16_hip_untuned.csv"
+)
+_DEFAULT_TUNED = (
+    f"{_MODEL_CONFIG_DIR}/qwen3_5_35b_chunk_gdn_h_mfma16_hip_tuned.csv"
+)
 _RUN_CONFIG_TOL_PCT = 5.0
 _RESULT_COLS = [c for c in TUNED_COLUMNS if c not in LOOKUP_KEYS]
 
