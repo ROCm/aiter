@@ -10,8 +10,6 @@ from aiter.ops.triton._triton_kernels.gather_kv_b_proj import (
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.device_info import get_num_sms
 
-_FLAT_GRID_PROGRAMS_PER_CU = 6
-
 
 def gather_kv_b_proj(
     k_buffer: torch.Tensor,  # [num_block, block_size, hidden_dim]
@@ -120,14 +118,13 @@ def gather_kv_b_proj(
     if arch_info.get_arch() in ("gfx942",) and ChunkK > 64:
         num_stages = 1
 
-    # Page-size-1 indices and outputs share packed token order, so workers can
-    # grid-stride over global chunks and reuse weights. Six programs/CU was best
-    # in the gfx950 sweep; other layouts keep the existing per-sequence grid.
+    # Page-size-1 workers grid-stride over packed chunks and reuse weights.
+    # Six programs/CU was best in the gfx950 sweep.
     max_kv_chunks = max(1, (total_kv_k + ChunkK - 1) // ChunkK)
     flat_token_grid = block_size == 1 and not is_fp4_weight
     grid_stride_chunks = False
     if flat_token_grid:
-        target_num_programs = get_num_sms() * _FLAT_GRID_PROGRAMS_PER_CU
+        target_num_programs = get_num_sms() * 6
         chunk_workers_per_head = min(
             max_kv_chunks,
             max(1, (target_num_programs + tp_k_head_num_k - 1) // tp_k_head_num_k),
