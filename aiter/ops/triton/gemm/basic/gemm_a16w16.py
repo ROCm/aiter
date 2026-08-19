@@ -217,6 +217,11 @@ def gemm_a16w16_(
                     f"{w.stride()}"
                 )
 
+            warp_bases = tuple(
+                (0, 1) if i == 0 else (1 << (i - 1), 0)
+                for i in range(num_warps.bit_length() - 1)
+            )
+
             # Persistent, NUM_WGS processes num_tiles
             _LOGGER.info(
                 f"GEMM_A16W16 [gluon, persistent]: x={tuple(x.shape)} w={tuple(w.shape)}"
@@ -244,6 +249,7 @@ def gemm_a16w16_(
                 BLOCK_K=BLOCK_K,
                 GROUP_SIZE_M=GROUP_SIZE_M,
                 NUM_BUFFERS=NUM_BUFFERS,
+                WARP_BASES=warp_bases,
                 TRANSPOSE=TRANSPOSE,
                 activation=_get_activation_from_str(activation) if activation else None,
                 USE_ACTIVATION=activation is not None,

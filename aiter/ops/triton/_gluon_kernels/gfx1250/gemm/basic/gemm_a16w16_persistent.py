@@ -34,39 +34,6 @@ _gemm_a16w16_persistent_compute_bound_repr = make_kernel_repr(
 )
 
 
-# These run as plain Python at trace time, which is why the layouts are built
-# here rather than with inline constexpr expressions: a constexpr comparison
-# evaluated by the Gluon frontend (e.g. a comprehension guard on num_warps) is
-# truthy for every candidate, which silently produced a 16-warp WMMA layout.
-@gluon.constexpr_function
-def _warp_bases(num_warps):
-    """One base per bit of num_warps: bit 0 splits along N, the rest along M."""
-    return tuple(
-        (0, 1) if i == 0 else (1 << (i - 1), 0)
-        for i in range(num_warps.bit_length() - 1)
-    )
-
-
-@gluon.constexpr_function
-def _shared_layout_a(BLOCK_M, BLOCK_K):
-    """A is (M, K) row-major, so pad along K."""
-    return gl.PaddedSharedLayout.with_identity_for(
-        [[BLOCK_K, 8]], [BLOCK_M, BLOCK_K], [1, 0]
-    )
-
-
-@gluon.constexpr_function
-def _shared_layout_b(BLOCK_N, BLOCK_K, TRANSPOSE):
-    """Pad along whichever axis B is contiguous in: N for TT, K for TN."""
-    if TRANSPOSE:
-        return gl.PaddedSharedLayout.with_identity_for(
-            [[BLOCK_N, 16]], [BLOCK_K, BLOCK_N], [1, 0]
-        )
-    return gl.PaddedSharedLayout.with_identity_for(
-        [[BLOCK_K, 8]], [BLOCK_N, BLOCK_K], [1, 0]
-    )
-
-
 @gluon.jit(repr=_gemm_a16w16_persistent_repr)
 def gemm_a16w16_persistent_kernel_(
     a_ptr,
@@ -89,6 +56,7 @@ def gemm_a16w16_persistent_kernel_(
     BLOCK_K: gl.constexpr,
     GROUP_SIZE_M: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
+    WARP_BASES: gl.constexpr,
     TRANSPOSE: gl.constexpr,
     activation: gl.constexpr,
     USE_ACTIVATION: gl.constexpr,
@@ -99,13 +67,22 @@ def gemm_a16w16_persistent_kernel_(
 
     gl.static_assert(NUM_BUFFERS >= 2, "persistent gemm requires NUM_BUFFERS >= 2")
 
-    SHARED_LAYOUT_A: gl.constexpr = _shared_layout_a(BLOCK_M, BLOCK_K)
-    SHARED_LAYOUT_B: gl.constexpr = _shared_layout_b(BLOCK_N, BLOCK_K, TRANSPOSE)
+    SHARED_LAYOUT_A: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+        [[BLOCK_K, 8]], [BLOCK_M, BLOCK_K], [1, 0]
+    )
+    if TRANSPOSE:
+        SHARED_LAYOUT_B: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+            [[BLOCK_N, 16]], [BLOCK_K, BLOCK_N], [1, 0]
+        )
+    else:
+        SHARED_LAYOUT_B: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+            [[BLOCK_K, 8]], [BLOCK_N, BLOCK_K], [1, 0]
+        )
 
     WMMA_LAYOUT: gl.constexpr = gl.amd.AMDWMMALayout(
         version=3,
         transposed=True,
-        warp_bases=_warp_bases(num_warps),
+        warp_bases=WARP_BASES,
         instr_shape=[16, 16, 32],
     )
     OPERAND_LAYOUT_A: gl.constexpr = gl.DotOperandLayout(
@@ -304,6 +281,7 @@ def gemm_a16w16_persistent_compute_bound_kernel_(
     BLOCK_K: gl.constexpr,
     GROUP_SIZE_M: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
+    WARP_BASES: gl.constexpr,
     TRANSPOSE: gl.constexpr,
     activation: gl.constexpr,
     USE_ACTIVATION: gl.constexpr,
@@ -315,13 +293,22 @@ def gemm_a16w16_persistent_compute_bound_kernel_(
         NUM_BUFFERS >= 2, "persistent compute_bound requires NUM_BUFFERS >= 2"
     )
 
-    SHARED_LAYOUT_A: gl.constexpr = _shared_layout_a(BLOCK_M, BLOCK_K)
-    SHARED_LAYOUT_B: gl.constexpr = _shared_layout_b(BLOCK_N, BLOCK_K, TRANSPOSE)
+    SHARED_LAYOUT_A: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+        [[BLOCK_K, 8]], [BLOCK_M, BLOCK_K], [1, 0]
+    )
+    if TRANSPOSE:
+        SHARED_LAYOUT_B: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+            [[BLOCK_N, 16]], [BLOCK_K, BLOCK_N], [1, 0]
+        )
+    else:
+        SHARED_LAYOUT_B: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+            [[BLOCK_K, 8]], [BLOCK_N, BLOCK_K], [1, 0]
+        )
 
     WMMA_LAYOUT: gl.constexpr = gl.amd.AMDWMMALayout(
         version=3,
         transposed=True,
-        warp_bases=_warp_bases(num_warps),
+        warp_bases=WARP_BASES,
         instr_shape=[16, 16, 32],
     )
     OPERAND_LAYOUT_A: gl.constexpr = gl.DotOperandLayout(
