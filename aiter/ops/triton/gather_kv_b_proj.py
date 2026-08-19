@@ -6,6 +6,7 @@ import torch
 from aiter.ops.triton._triton_kernels.gather_kv_b_proj import (
     _next_pow2,
     _triton_gather_kv_b_proj,
+    _triton_gather_kv_b_proj_flat,
 )
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.device_info import get_num_sms
@@ -118,21 +119,42 @@ def gather_kv_b_proj(
     if arch_info.get_arch() in ("gfx942",) and ChunkK > 64:
         num_stages = 1
 
-    # Page-size-1 workers grid-stride over packed chunks and reuse weights.
-    # Six programs/CU was best in the gfx950 sweep.
     max_kv_chunks = max(1, (total_kv_k + ChunkK - 1) // ChunkK)
     flat_token_grid = block_size == 1 and not is_fp4_weight
-    grid_stride_chunks = False
     if flat_token_grid:
-        target_num_programs = get_num_sms() * 6
-        chunk_workers_per_head = min(
+        chunk_workers = min(
             max_kv_chunks,
-            max(1, (target_num_programs + tp_k_head_num_k - 1) // tp_k_head_num_k),
+            max(1, (get_num_sms() * 6 + tp_k_head_num_k - 1) // tp_k_head_num_k),
         )
-        grid_stride_chunks = chunk_workers_per_head < max_kv_chunks
-        grid = (tp_k_head_num_k * chunk_workers_per_head,)
-    else:
-        grid = (batch_size * tp_k_head_num_k * max_kv_chunks,)
+        if chunk_workers < max_kv_chunks:
+            _triton_gather_kv_b_proj_flat[(tp_k_head_num_k * chunk_workers,)](
+                total_kv_k,
+                k_buffer,
+                k_scale,
+                kv_indices,
+                kv_proj_weight,
+                kv_proj_scale,
+                k_prefix,
+                v_prefix,
+                TpNumHeads=tp_k_head_num_k,
+                QkNopeHeadDim=qk_nope_head_dim,
+                VHeadDim=v_head_dim,
+                KV_CDim=weight_k,
+                KV_PeDim=qk_nope_pe_dim - qk_nope_head_dim,
+                ChunkK=ChunkK,
+                PaddedK=padded_k,
+                PaddedV=padded_v,
+                WEIGHT_PRESHUFFLE=weight_preshuffle,
+                PER_ROW_SCALE=per_row_scale,
+                NO_SCALE=no_scale,
+                num_stages=num_stages,
+            )
+            return
+
+    grid_batch_heads = (
+        tp_k_head_num_k if flat_token_grid else batch_size * tp_k_head_num_k
+    )
+    grid = (grid_batch_heads * max_kv_chunks,)
     if is_fp4_weight:
         fp4_scale_k_granularity = 32 if weight_preshuffle else 128
         _triton_gather_kv_b_proj[grid](
@@ -192,6 +214,5 @@ def gather_kv_b_proj(
         NO_SCALE=no_scale,
         SHUFFLED_KV_CACHE=shuffled_kv_cache,
         FLAT_TOKEN_GRID=flat_token_grid,
-        GRID_STRIDE_CHUNKS=grid_stride_chunks,
         num_stages=num_stages,
     )
