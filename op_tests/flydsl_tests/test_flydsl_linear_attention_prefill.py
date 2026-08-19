@@ -6,21 +6,18 @@
 Grid: Qwen3.5-35B (Hv=32) and Qwen3.5-397B (Hv=64), TP 1/2/4/8.
 Dense T=1k/2k/4k/8k/16k/32k/64k; varlen total T=16k/32k/64k with seqlen 1k/2k/4k/8k.
 
-Filter cases via env vars (comma-separated; omit all to run the full 304-case grid)::
+Filter cases (omit shape flags for the full 304-case grid)::
 
-    PREFILL_MODEL=35b PREFILL_TP=1 PREFILL_LAYOUT=varlen \\
-    PREFILL_SEQLEN=8192 PREFILL_T=16384 PREFILL_SNAPSHOT=bf16 \\
-    pytest op_tests/flydsl_tests/test_flydsl_linear_attention_prefill.py::TestPerformance
+    python op_tests/flydsl_tests/test_flydsl_linear_attention_prefill.py \\
+        TestPerformance --model 397b --tp 4 --t 8192 --n 8 --snapshot-dtype bf16 fp32
 
-``PREFILL_T`` matches dense ``full_prompt_len``, or varlen total tokens (mnbt).
-``PREFILL_SEQLEN`` applies to varlen only (per-sequence length).
-Also works with ``pytest -k`` on the parametrized case id substring.
+Plain ``pytest`` without these flags still runs the full grid.
 """
 
 from __future__ import annotations
 
+import argparse
 import math
-import os
 from dataclasses import dataclass, replace
 
 import pytest
@@ -471,13 +468,6 @@ _PREFILL_GROUPS = [
 ]
 
 
-def _parse_env_csv(name: str, *, cast=int):
-    raw = os.environ.get(name, "").strip()
-    if not raw:
-        return None
-    return [cast(x.strip()) for x in raw.split(",") if x.strip()]
-
-
 def _model_key(hv: int) -> str:
     return "35b" if hv == 32 else "397b"
 
@@ -486,70 +476,79 @@ def _snapshot_key(args: PrefillArgs) -> str:
     return "fp32" if args.snapshot_dtype == torch.float32 else "bf16"
 
 
-def _case_matches_prefill_filters(args: PrefillArgs) -> bool:
-    models = _parse_env_csv("PREFILL_MODEL", cast=str)
-    if models and _model_key(args.Hv) not in models:
-        return False
+def _current_cli_opts():
+    import sys
 
-    tps = _parse_env_csv("PREFILL_TP")
-    if tps and args.tp not in tps:
-        return False
-
-    layouts = _parse_env_csv("PREFILL_LAYOUT", cast=str)
-    if layouts:
-        layout = "varlen" if args.is_varlen else "dense"
-        if layout not in layouts:
-            return False
-
-    ts = _parse_env_csv("PREFILL_T")
-    if ts:
-        if args.is_varlen:
-            if args.max_num_batched_tokens not in ts and args.full_prompt_len not in ts:
-                return False
-        elif args.full_prompt_len not in ts:
-            return False
-
-    seqlens = _parse_env_csv("PREFILL_SEQLEN")
-    if seqlens:
-        if not args.is_varlen or args.full_prompt_len not in seqlens:
-            return False
-
-    snapshots = _parse_env_csv("PREFILL_SNAPSHOT", cast=str)
-    if snapshots and _snapshot_key(args) not in snapshots:
-        return False
-
-    return True
+    return _build_prefill_cli_parser().parse_known_args(sys.argv[1:])[0]
 
 
-def _prefill_filters_active() -> bool:
+def _cli_has_filters(opts) -> bool:
     return any(
-        os.environ.get(name, "").strip()
-        for name in (
-            "PREFILL_MODEL",
-            "PREFILL_TP",
-            "PREFILL_T",
-            "PREFILL_SEQLEN",
-            "PREFILL_LAYOUT",
-            "PREFILL_SNAPSHOT",
-        )
+        [
+            opts.model,
+            opts.tp is not None,
+            opts.t is not None,
+            opts.n is not None,
+            opts.dense,
+            opts.snapshot_dtype,
+        ]
     )
 
 
-def _filter_prefill_params(params: list[PrefillArgs]) -> list[PrefillArgs]:
-    if not _prefill_filters_active():
-        return params
-    filtered = [p for p in params if _case_matches_prefill_filters(p)]
+def _case_matches_cli(args: PrefillArgs, opts) -> bool:
+    if opts.model and _model_key(args.Hv) != opts.model:
+        return False
+    if opts.tp is not None and args.tp != opts.tp:
+        return False
+    if opts.dense:
+        if args.is_varlen:
+            return False
+    elif opts.n is not None and not args.is_varlen:
+        return False
+    if opts.t is not None:
+        if args.is_varlen:
+            if opts.n is not None:
+                if (
+                    args.full_prompt_len != opts.t
+                    or args.max_num_batched_tokens != opts.n * opts.t
+                ):
+                    return False
+            elif (
+                args.full_prompt_len != opts.t and args.max_num_batched_tokens != opts.t
+            ):
+                return False
+        elif args.full_prompt_len != opts.t:
+            return False
+    return not (opts.snapshot_dtype and _snapshot_key(args) not in opts.snapshot_dtype)
+
+
+def _filtered_prefill_params():
+    opts = _current_cli_opts()
+    if not _cli_has_filters(opts):
+        return PREFILL_PARAMS
+    filtered = [p for p in PREFILL_PARAMS if _case_matches_cli(p, opts)]
     if not filtered:
         raise RuntimeError(
-            "PREFILL_* env filters matched no cases; "
-            "check PREFILL_MODEL/TP/T/SEQLEN/LAYOUT/SNAPSHOT."
+            "No PrefillArgs cases matched --model/--tp/--t/--n/--dense/--snapshot-dtype."
         )
     return filtered
 
 
-PREFILL_PARAMS = _filter_prefill_params(expand_groups(_PREFILL_GROUPS))
+PREFILL_PARAMS = expand_groups(_PREFILL_GROUPS)
 
 PREFILL_TEST_IDS = [repr(p) for p in PREFILL_PARAMS]
+
+
+def pytest_generate_tests(metafunc):
+    if metafunc.function.__name__ not in (
+        "test_correctness_flydsl_mfma16_hip",
+        "test_perf_comparison",
+    ):
+        return
+    params = _filtered_prefill_params()
+    metafunc.parametrize("args", params, ids=[repr(p) for p in params])
+
+
 # -- bf16 SSM-state params (paired with TestStateDtypeBF16 below) ------
 
 # A small, fast subset of shapes used to validate the bf16-state code path
@@ -1078,7 +1077,6 @@ def _assert_k5_outputs_match_ref(
 class TestCorrectness:
     """Correctness and integration coverage for the FlyDSL mfma16 K5 backend."""
 
-    @pytest.mark.parametrize("args", PREFILL_PARAMS, ids=PREFILL_TEST_IDS)
     def test_correctness_flydsl_mfma16_hip(self, args: PrefillArgs):
         """mfma16 / HIP-aligned FlyDSL K5 impl (formerly the "vk" fork): 16x16x16
         MFMA + HIP warp partition. Same VK public outputs as the baseline flydsl
@@ -1536,6 +1534,33 @@ def _print_summary_table(request):
 
 
 class TestPerformance:
-    @pytest.mark.parametrize("args", PREFILL_PARAMS, ids=PREFILL_TEST_IDS)
     def test_perf_comparison(self, args: PrefillArgs):
         _run_perf_comparison(args)
+
+
+def _build_prefill_cli_parser():
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--model", choices=["35b", "397b"], default=None)
+    parser.add_argument("--tp", type=int, choices=[1, 2, 4, 8], default=None)
+    parser.add_argument("--t", type=int, default=None)
+    parser.add_argument(
+        "--n",
+        type=int,
+        default=None,
+        help="varlen sequence count (mnbt = n * t); ignored with --dense",
+    )
+    parser.add_argument("--dense", action="store_true", default=False)
+    parser.add_argument(
+        "--snapshot-dtype",
+        nargs="+",
+        choices=["bf16", "fp32"],
+        default=None,
+    )
+    return parser
+
+
+if __name__ == "__main__":
+    import sys
+
+    _, pytest_argv = _build_prefill_cli_parser().parse_known_args(sys.argv[1:])
+    raise SystemExit(pytest.main([__file__, *pytest_argv]))
