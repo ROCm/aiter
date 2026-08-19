@@ -12,6 +12,13 @@ import aiter
 from aiter.ops.triton._gluon_kernels._triton_version import require_gluon_triton
 from aiter.ops.triton.utils._triton import arch_info
 
+# Re-exported for backward compatibility: callers (including the legacy
+# aiter.ops.triton.gluon.pa_decode_gluon path) imported get_cdna_version from
+# this module before it moved to arch_info. The kernels no longer use it.
+from aiter.ops.triton.utils._triton.arch_info import (  # noqa: F401
+    get_cdna_version,
+)
+
 # These kernels came from aiter/ops/triton/gluon/, whose package __init__ enforced
 # triton>=3.6. Keep that gate on them without extending it to the rest of
 # _gluon_kernels, which was never behind it.
