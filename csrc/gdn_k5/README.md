@@ -15,6 +15,10 @@ python3 setup.py develop
    - **P1 varlen ali**: TP1/2/4/8 × bf16/fp32 snapshot × mnbt 8192..65536
 
 4. Tune BV winners (review candidate before merging into repo):
+
+Implementation follows the Fmoe-style ``TunerCommon`` wrapper in ``k5_bv_tuner.py``;
+``chunk_gdn_h_mfma16_hip_tune.py`` is the CLI entry point.
+
 ```bash
 # Full sweep per model (GPU-heavy; hours on MI300X)
 python3 csrc/gdn_k5/chunk_gdn_h_mfma16_hip_tune.py \
