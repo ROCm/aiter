@@ -148,7 +148,13 @@ the FlyDSL cold harness.
       ratios modestly toward CK. Cross-checks compare.py (minimax B=1 down FP8 = 11.98 A/B vs
       11.16 in-sweep). **Optimization lead:** FlyDSL's block2d scale handling in the `down`
       kernel is a candidate to reclaim that 10–38%.
-- [ ] FP4 down: CK uses a dummy PerTensor scale=1.0 while FlyDSL uses real e8m0 block scale
+- [x] **Resolved as a documented storage-byte caveat via D7 (2026-08-18).** D7 showed CK's generic
+      `load_block2d_scale` handles a `Block2D<1,32>` scale with **no kernel work** and matches torch
+      at cos=0.999999, so the FP4 scale *values* are not a gap; the only residual is scale
+      **storage-byte accounting** (CK float 4B vs FlyDSL e8m0 1B per `(1,32)` block) — a
+      traffic-metric modeling choice, disclosed as the ~6% CK-favored caveat in the artifact header
+      (B1 lines below / D3 / D4 / §5). Not actionable kernel work. Original note (kept for context):
+      CK uses a dummy PerTensor scale=1.0 while FlyDSL uses real e8m0 block scale
       (1,32). **Not perf-negligible (corrected 2026-08-14):** FlyDSL's e8m0 stream is
       `TOPK·H·(I/32)` ≈ 0.33 MB vs the `TOPK·H·I/2` ≈ 5.24 MB FP4 weight stream at Qwen
       down B=1 — **~6%** of the weight bytes. CK's PerTensor streams ~0 scale bytes, so CK
