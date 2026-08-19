@@ -8,6 +8,7 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Int8, T
+from flydsl.expr.typing import as_ir_value as _raw_v
 
 from aiter.jit.utils.chip_info import get_cu_num
 
@@ -94,6 +95,41 @@ def _spart_output_tile_index(block_1d_id, M0, N0, group_num, m01, nmajor=False):
     return m_block_idx, n_block_idx
 
 
+def _pick_epi_lanes(BM, BN, route_out_fp8, g2_scale_blk, nthreads=256):
+    """Epilogue lanes-per-output-row for this tile, or 0 to keep the module default.
+
+    Fewer lanes per row means each lane owns more columns, so the per-route
+    address block (token_id -> out_row -> row_base_addr) is paid fewer times and
+    the value store widens. The constraint is the mxfp8 block amax, which folds
+    across lanes with at most a quad DPP: a scale block may span 1, 2 or 4 lanes.
+    Measured on gfx950 at BM64/BN256/topk16/M=32768: 16 lanes 1.07x, 8 lanes
+    1.06x, 32 lanes (the old fixed value) 1.00x -- hence the 16, 8, 32 order.
+
+    That ordering is BN=256's answer and it is WRONG for the BN=512 tile this
+    now ships. Re-measured there on an idle gfx950, duplicated arms, bit-exact
+    at every shape (cos=1.000000, maxdiff=0.000e+00):
+        t= 4096   16 lanes 218.9 us   32 lanes 214.1 us   x1.022
+        t=16384   16 lanes 493.5      32 lanes 486.8      x1.014
+        t=32768   16 lanes 911.5      32 lanes 905.9      x1.006
+    At BN=512, 16 lanes gives route_vec=32 == g2_scale_blk (no cross-lane amax
+    fold) while 32 lanes gives route_vec=16 and needs a pair DPP fold -- and the
+    fold is cheaper than the wider per-lane work it buys. So the preference is
+    BN-dependent, not universal; only BN>=512 is flipped, leaving BN=256 on the
+    order its own measurement established.
+    """
+    if not route_out_fp8:
+        return 0
+    order = (32, 16, 8) if BN >= 512 else (16, 8, 32)
+    for lanes in order:
+        epi_rows = nthreads // lanes
+        route_vec = BN // lanes
+        if epi_rows == 0 or BM % epi_rows or route_vec == 0 or BN % lanes:
+            continue
+        if g2_scale_blk in (route_vec, 2 * route_vec, 4 * route_vec):
+            return lanes
+    return 0
+
+
 def compile_gemm2_a4w4_port(
     BM=32,
     BN=256,
@@ -113,8 +149,48 @@ def compile_gemm2_a4w4_port(
     g2_ascale_pf=None,
     g2_spart=None,
     g2_bf16_lds=None,
+    g2_cpad=None,
+    g2_swz=None,
+    g2_pk8=None,
+    g2_xcd=None,
+    g2_tr=None,
+    g2_serp=None,
+    g2_maxnreg=None,
     g2_kstatic=False,
     out_dtype="bf16",
+    g2_wpeu=None,
+    g2_off32=False,
+    g2_epi_lanes=0,
+    g2_bfull=None,
+    g2_split_lds=None,
+    g2_wave_epi=None,
+    g2_noepi=None,
+    g2_sched=None,
+    g2_schedmask=None,
+    g2_mfmarep=None,
+    g2_prio=None,
+    g2_apf2=None,
+    g2_bsingle=None,
+    g2_epirep=None,
+    g2_agpr=None,
+    g2_swapab=None,
+    g2_cbase=None,
+    g2_earlybar=None,
+    g2_interleave=None,
+    g2_noppad=None,
+    g2_barpad=None,
+    g2_dspad=None,
+    g2_klnop=None,
+    g2_epinop=None,
+    g2_illag=None,
+    g2_asplit=None,
+    g2_bspread=None,
+    g2_nwaves=None,
+    g2_nrep=None,
+    g2_apre=None,
+    g2_kmerge=None,
+    g2_skippad=None,
+    g2_brstore=None,
 ):
     """Compile gemm2 a4w4 down-proj; epilog 'atomic' (weighted atomic-fadd) or 'reduce' (store into out[token_id*topk+slot]). inter_dim runtime; SBM None -> SBM==BM byte-identical."""
     SBM = _norm_sbm(SBM, BM)
@@ -163,6 +239,9 @@ def compile_gemm2_a4w4_port(
         raise AssertionError(
             f"g2_spart={g2_spart} must encode GroupNum>=1,M01>=1 as GroupNum*100+M01 (e.g. 402)"
         )
+    if g2_wpeu is None:
+        g2_wpeu = int(os.environ.get("MXFP4_G2_WPEU", "0"))
+    g2_wpeu = int(g2_wpeu)
     _validate_v2_gemm2_dtypes(a_dtype, b_dtype)
     assert INTER_MAX % BK == 0, f"INTER_MAX must be a multiple of {BK}, got {INTER_MAX}"
     is_f8 = a_dtype == "fp8"
@@ -170,9 +249,36 @@ def compile_gemm2_a4w4_port(
         default_bf16_lds = "1" if g2_kstatic else "0"
         g2_bf16_lds = os.environ.get("MXFP4_G2_BF16_LDS", default_bf16_lds) == "1"
     g2_bf16_lds = bool(g2_bf16_lds)
+    if g2_cpad is None:
+        g2_cpad = int(os.environ.get("MXFP4_G2_CPAD", "0"))
+    g2_cpad = int(g2_cpad) if g2_bf16_lds else 0
+    if g2_swz is None:
+        g2_swz = int(os.environ.get("MXFP4_G2_SWZ", "0"))
+    g2_swz = int(g2_swz) if g2_bf16_lds else 0
+    if g2_pk8 is None:
+        g2_pk8 = int(os.environ.get("MXFP4_G2_PK8", "1"))
+    g2_pk8 = int(g2_pk8) if g2_bf16_lds else 0
+    if g2_tr is None:
+        g2_tr = int(os.environ.get("MXFP4_G2_TR", "0"))
+    g2_tr = int(g2_tr) if g2_bf16_lds else 0
+    if g2_serp is None:
+        g2_serp = int(os.environ.get("MXFP4_G2_SERP", "0"))
+    g2_serp = int(g2_serp)
+    if g2_maxnreg is None:
+        g2_maxnreg = int(os.environ.get("MXFP4_G2_MAXNREG", "0"))
+    g2_maxnreg = int(g2_maxnreg)
+    if g2_xcd is None:
+        g2_xcd = int(os.environ.get("MXFP4_G2_XCD", "0"))
+    g2_xcd = int(g2_xcd)
     KH_TILE_A = BK // (1 if is_f8 else 2)  # A LDS K-tile bytes (fp8 256, fp4 128)
     slot_bytes = BM * KH_TILE_A
-    c_lds_bytes = BM * BN * (2 if g2_bf16_lds else 4)
+    c_lds_bytes = (
+        BN * (BM + 4) * 2
+        if g2_tr
+        else BM * ((BN // 16) * 18 + 4) * 2
+        if g2_swz
+        else BM * (BN + g2_cpad) * (2 if g2_bf16_lds else 4)
+    )
     # aStages must exceed kStages: the K-loop ds_reads slot kt%aStages then
     # prefetches kt+kStages into (kt+kStages)%aStages, so equal counts make that
     # DMA rewrite the slot being read (cross-wave: waves DMA their own rows but
@@ -181,7 +287,51 @@ def compile_gemm2_a4w4_port(
     # a_slot_alias fence the prefetch instead.
     aStages = 3 if (not g2_bf16_lds or 3 * slot_bytes <= c_lds_bytes) else 2
     a_slot_alias = aStages <= kStages
-    lds_bytes = max(c_lds_bytes, aStages * slot_bytes)
+    K_TILES_RT_MAX = INTER_MAX // BK
+    if g2_apre is None:
+        g2_apre = aStages >= K_TILES_RT_MAX
+    g2_apre = bool(g2_apre) and g2_kstatic
+    if g2_skippad is None:
+        g2_skippad = os.environ.get("MXFP4_G2_SKIPPAD", "0") == "1"
+    g2_skippad = bool(g2_skippad)
+    apre_tag = "_apre" if g2_apre else ""
+    if g2_kmerge is None:
+        g2_kmerge = int(os.environ.get("MXFP4_G2_KMERGE", "1"))
+    _gridmul = int(os.environ.get("MXFP4_G2_GRIDMUL", "1"))
+    g2_kmerge = int(g2_kmerge)
+    kmg_tag = f"_kmg{g2_kmerge}" if g2_kmerge != 1 else ""
+    if g2_brstore is None:
+        g2_brstore = os.environ.get("MXFP4_G2_BRSTORE", "1") == "1"
+    g2_brstore = bool(g2_brstore)
+    skippad_tag = "_skpad" if g2_skippad else ""
+    brs_tag = "" if g2_brstore else "_nobrs"
+    cpad_tag = f"_cpad{g2_cpad}" if g2_cpad else ""
+    swz_tag = "_swz" if g2_swz else ""
+    pk8_tag = "_pk8" if g2_pk8 else ""
+    tr_tag = "_tr" if g2_tr else ""
+    serp_tag = "_serp" if g2_serp else ""
+    mnr_tag = f"_mnr{g2_maxnreg}" if g2_maxnreg else ""
+    xcd_tag = f"_xcd{g2_xcd}" if g2_xcd else ""
+    if g2_split_lds is None:
+        g2_split_lds = os.environ.get("MXFP4_G2_SPLITLDS", "0") == "1"
+    g2_split_lds = bool(g2_split_lds)
+    lds_bytes = (
+        aStages * slot_bytes + c_lds_bytes
+        if (g2_split_lds or g2_asplit)
+        else max(c_lds_bytes, aStages * slot_bytes)
+    )
+    if g2_split_lds and lds_bytes > 160 * 1024:
+        raise AssertionError(
+            f"g2_split_lds needs {lds_bytes} B of LDS, over the 160 KiB gfx950 limit"
+        )
+    g2_ldspad = int(os.environ.get("MXFP4_G2_LDSPAD", "0"))
+    if g2_ldspad:
+        lds_bytes += g2_ldspad * 1024
+        if lds_bytes > 160 * 1024:
+            raise AssertionError(
+                f"MXFP4_G2_LDSPAD={g2_ldspad} gives {lds_bytes} B, over 160 KiB"
+            )
+    ldspad_tag = f"_ldspad{g2_ldspad}" if g2_ldspad else ""
     # N_OUT = model_dim/hidden is runtime; HIDDEN_MAX is a compile/cache bucket
     # so different runtime hidden sizes can reuse one compiled launcher.
     assert (
@@ -217,7 +367,153 @@ def compile_gemm2_a4w4_port(
     sblk_tag = f"_sblk{g2_scale_blk}" if (route_out_fp8 and g2_scale_blk != 8) else ""
     out_tag = "_fp8out" if route_out_fp8 else ""
     tile_tag = "" if (BN, BK) == (256, 256) else f"_bn{BN}_bk{BK}"
-    tag = f"hmax{HIDDEN_MAX}_imax{INTER_MAX}_bm{BM}{tile_tag}{'_nt' if use_nt else ''}_{etag}{atag}{btag}{sbm_tag}{persist_tag}{pad_tag}{bh_tag}{apf_tag}{spart_tag}{bf16lds_tag}{dw_tag}{kst_tag}{pitch_tag}{sblk_tag}{out_tag}_v2"
+    wpeu_tag = f"_wpeu{g2_wpeu}" if g2_wpeu > 0 else ""
+    off32_tag = "_o32" if g2_off32 else ""
+    if g2_nwaves is None:
+        g2_nwaves = int(os.environ.get("MXFP4_G2_NWAVES", "4"))
+    g2_nwaves = int(g2_nwaves)
+    if BN % (g2_nwaves * 16) or BM % g2_nwaves:
+        raise AssertionError(f"g2_nwaves={g2_nwaves} does not tile BM={BM}/BN={BN}")
+    nw_tag = f"_nw{g2_nwaves}" if g2_nwaves != 4 else ""
+    block_threads = g2_nwaves * 64
+    g2_epi_lanes = int(g2_epi_lanes or os.environ.get("MXFP4_G2_EPI_LANES", "0"))
+    if g2_epi_lanes == 0:
+        g2_epi_lanes = _pick_epi_lanes(
+            BM, BN, route_out_fp8, g2_scale_blk, nthreads=block_threads
+        )
+    epil_tag = f"_epil{g2_epi_lanes}" if g2_epi_lanes else ""
+    if g2_bfull is None:
+        g2_bfull = os.environ.get("MXFP4_G2_BFULL", "0") == "1"
+    g2_bfull = bool(g2_bfull) and g2_kstatic
+    bfull_tag = "_bfull" if g2_bfull else ""
+    split_tag = "_splds" if g2_split_lds else ""
+    if g2_wave_epi is None:
+        g2_wave_epi = os.environ.get("MXFP4_G2_WAVE_EPI", "0") == "1"
+    g2_wave_epi = bool(g2_wave_epi) and route_out_fp8 and use_reduce
+    wepi_tag = "_wepi" if g2_wave_epi else ""
+    if g2_noepi is None:
+        g2_noepi = os.environ.get("MXFP4_G2_NOEPI", "0") == "1"
+    g2_noepi = bool(g2_noepi)
+    noepi_tag = "_NOEPIPROBE" if g2_noepi else ""
+    if g2_sched is None:
+        g2_sched = os.environ.get("MXFP4_G2_SCHED", "1") == "1"
+    g2_sched = bool(g2_sched)
+    sched_tag = "" if g2_sched else "_nosched"
+    if g2_schedmask is None:
+        g2_schedmask = int(os.environ.get("MXFP4_G2_SCHEDMASK", "0"), 0)
+    g2_schedmask = int(g2_schedmask)
+    schedmask_tag = f"_sm{g2_schedmask:x}" if g2_schedmask else ""
+    if g2_mfmarep is None:
+        g2_mfmarep = int(os.environ.get("MXFP4_G2_MFMAREP", "1"))
+    g2_mfmarep = max(1, int(g2_mfmarep))
+    mfmarep_tag = f"_mrep{g2_mfmarep}" if g2_mfmarep != 1 else ""
+    if g2_prio is None:
+        g2_prio = int(os.environ.get("MXFP4_G2_PRIO", "1"))
+    g2_prio = int(g2_prio)
+    prio_tag = "" if g2_prio else "_noprio"
+    if g2_apf2 is None:
+        g2_apf2 = int(os.environ.get("MXFP4_G2_APF2", "0"))
+    g2_apf2 = int(g2_apf2)
+    apf2_tag = f"_apf2x{g2_apf2}" if g2_apf2 else ""
+    if g2_bsingle is None:
+        g2_bsingle = os.environ.get("MXFP4_G2_BSINGLE", "0") == "1"
+    g2_bsingle = bool(g2_bsingle)
+    bsingle_tag = "_b1" if g2_bsingle else ""
+    if g2_epirep is None:
+        g2_epirep = int(os.environ.get("MXFP4_G2_EPIREP", "1"))
+    g2_epirep = max(1, int(g2_epirep))
+    epirep_tag = f"_erep{g2_epirep}" if g2_epirep != 1 else ""
+    if g2_agpr is None:
+        g2_agpr = os.environ.get("MXFP4_G2_AGPR", "0") == "1"
+    g2_agpr = bool(g2_agpr)
+    agpr_tag = "_agpr" if g2_agpr else ""
+    if g2_swapab is None:
+        g2_swapab = int(os.environ.get("MXFP4_G2_SWAPAB", "0"))
+    # DEFAULT OFF -- NOT CORRECT YET. Compiled from a cold cache, swapab=1 drops
+    # 56448 of 524288 route-out rows (10.8%) at token=32768; an earlier
+    # "bit-identical" result was a stale-cache artifact and no cpad value fixes it.
+    # The gate below is still required on top: only the reduce path's store_one_mr
+    # understands the swapped lane->(row,col) mapping, the atomic epilogue derives
+    # its route weight from the unswapped one (NaN), and tr/swz/wave-epi stage C
+    # differently.
+    g2_swapab = (
+        int(g2_swapab)
+        if (
+            g2_bf16_lds
+            and route_out_fp8
+            and use_reduce
+            and not g2_wave_epi
+            and not g2_tr
+            and not g2_swz
+        )
+        else 0
+    )
+    swapab_tag = f"_swab{g2_swapab}" if g2_swapab else ""
+    if g2_cbase is None:
+        g2_cbase = int(os.environ.get("MXFP4_G2_CBASE", "0"))
+    g2_cbase = int(g2_cbase)
+    cbase_tag = f"_cb{g2_cbase}" if g2_cbase else ""
+    if g2_earlybar is None:
+        g2_earlybar = os.environ.get("MXFP4_G2_EARLYBAR", "0") == "1"
+    g2_earlybar = bool(g2_earlybar)
+    ebar_tag = "_ebar" if g2_earlybar else ""
+    if g2_interleave is None:
+        g2_interleave = os.environ.get("MXFP4_G2_INTERLEAVE", "1") == "1"
+    g2_interleave = bool(g2_interleave)
+    if g2_noepi:
+        g2_interleave = False
+    if g2_interleave:
+        g2_earlybar = True          # the C/A barrier must precede the final cluster
+        ebar_tag = "_ebar"
+    il_tag = "_il" if g2_interleave else ""
+    if g2_noppad is None:
+        g2_noppad = int(os.environ.get("MXFP4_G2_NOPPAD", "0"))
+    g2_noppad = int(g2_noppad)
+    nop_tag = f"_nop{g2_noppad}" if g2_noppad else ""
+    if g2_barpad is None:
+        g2_barpad = int(os.environ.get("MXFP4_G2_BARPAD", "0"))
+    g2_barpad = int(g2_barpad)
+    barpad_tag = f"_bar{g2_barpad}" if g2_barpad else ""
+    if g2_dspad is None:
+        g2_dspad = int(os.environ.get("MXFP4_G2_DSPAD", "0"))
+    g2_dspad = int(g2_dspad)
+    dsp_tag = f"_dsp{g2_dspad}" if g2_dspad else ""
+    if g2_bspread is None:
+        g2_bspread = os.environ.get("MXFP4_G2_BSPREAD", "0") == "1"
+    g2_bspread = bool(g2_bspread)
+    bsp_tag = "_bsp" if g2_bspread else ""
+    if g2_klnop is None:
+        g2_klnop = int(os.environ.get("MXFP4_G2_KLNOP", "0"))
+    g2_klnop = int(g2_klnop)
+    kln_tag = f"_kln{g2_klnop}" if g2_klnop else ""
+    if g2_epinop is None:
+        g2_epinop = int(os.environ.get("MXFP4_G2_EPINOP", "0"))
+    g2_epinop = int(g2_epinop)
+    epn_tag = f"_epn{g2_epinop}" if g2_epinop else ""
+    if g2_illag is None:
+        g2_illag = int(os.environ.get("MXFP4_G2_ILLAG", "1"))
+    g2_illag = int(g2_illag)
+    illag_tag = f"_lag{g2_illag}" if (g2_interleave and g2_illag != 1) else ""
+    if g2_asplit is None:
+        g2_asplit = os.environ.get("MXFP4_G2_ASPLIT", "0") == "1"
+    g2_asplit = bool(g2_asplit) and not g2_split_lds
+    asp_tag = "_asp" if g2_asplit else ""
+    if g2_cbase and not g2_split_lds:
+        lds_bytes += g2_cbase
+    if g2_swapab and g2_cpad == 0:
+        # Fastest of the pads tried, but note it does NOT make swapab correct
+        # (see the row-drop note above); it only avoids the unpadded case where
+        # all 16 lanes of a write group land in the same LDS bank.
+        g2_cpad = 40
+        cpad_tag = f"_cpad{g2_cpad}"
+    if g2_nrep is None:
+        g2_nrep = int(os.environ.get("MXFP4_G2_NREP", "1"))
+    g2_nrep = int(g2_nrep)
+    if g2_nrep != 1 and not (g2_kstatic and route_out_fp8 and use_reduce):
+        g2_nrep = 1  # the n-block pipeline is only wired for the fp8 route path
+    nrep_tag = ("" if g2_nrep == 1 else
+                f"_nrep{'m' if g2_nrep < 0 else ''}{abs(g2_nrep)}")
+    tag = f"hmax{HIDDEN_MAX}_imax{INTER_MAX}_bm{BM}{tile_tag}{'_nt' if use_nt else ''}_{etag}{atag}{btag}{sbm_tag}{persist_tag}{pad_tag}{bh_tag}{apf_tag}{spart_tag}{bf16lds_tag}{dw_tag}{kst_tag}{pitch_tag}{sblk_tag}{out_tag}{off32_tag}{epil_tag}{bfull_tag}{split_tag}{wepi_tag}{noepi_tag}{sched_tag}{nrep_tag}{apre_tag}{skippad_tag}{brs_tag}{cpad_tag}{swz_tag}{pk8_tag}{tr_tag}{serp_tag}{mnr_tag}{xcd_tag}{wpeu_tag}{ldspad_tag}{schedmask_tag}{mfmarep_tag}{prio_tag}{apf2_tag}{bsingle_tag}{epirep_tag}{agpr_tag}{swapab_tag}{cbase_tag}{ebar_tag}{il_tag}{nop_tag}{barpad_tag}{dsp_tag}{bsp_tag}{kln_tag}{epn_tag}{illag_tag}{asp_tag}{nw_tag}{kmg_tag}_v2"
     name = f"gemm2_a4w4_port_{tag}"
 
     @fx.struct
@@ -253,8 +549,10 @@ def compile_gemm2_a4w4_port(
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
         lds_base_i32 = fx.Int32(fx.ptrtoint(lds.buf.ptr))
 
+        _a_preload = min(aStages, K_TILES_RT_MAX) if g2_apre else kStages
+
         def issue_all_a_loads(m_row0):
-            for slot in range_constexpr(kStages):
+            for slot in range_constexpr(_a_preload):
                 issue_a_load_lds_dt(
                     arg_aq,
                     aq_num,
@@ -308,10 +606,45 @@ def compile_gemm2_a4w4_port(
                 g2_bhoist=g2_bhoist,
                 g2_ascale_pf=g2_ascale_pf,
                 g2_bf16_lds=g2_bf16_lds,
+                g2_cpad=g2_cpad,
+                g2_swz=g2_swz,
+                g2_pk8=g2_pk8,
+                g2_tr=g2_tr,
+                g2_serp=g2_serp,
                 g2_defer_weight=g2_defer_weight,
                 g2_out_pitch_align=g2_out_pitch_align,
                 g2_scale_blk=g2_scale_blk,
                 route_out_fp8=route_out_fp8,
+                g2_off32=g2_off32,
+                g2_epi_lanes=g2_epi_lanes or None,
+                g2_bfull=g2_bfull,
+                g2_split_lds=g2_split_lds,
+                g2_wave_epi=g2_wave_epi,
+                g2_noepi=g2_noepi,
+                g2_sched=g2_sched,
+                g2_schedmask=g2_schedmask,
+                g2_mfmarep=g2_mfmarep,
+                g2_prio=g2_prio,
+                g2_apf2=g2_apf2,
+                g2_bsingle=g2_bsingle,
+                g2_epirep=g2_epirep,
+                g2_swapab=g2_swapab,
+                g2_cbase=g2_cbase,
+                g2_earlybar=g2_earlybar,
+                g2_interleave=g2_interleave,
+                g2_noppad=g2_noppad,
+                g2_barpad=g2_barpad,
+                g2_dspad=g2_dspad,
+                g2_klnop=g2_klnop,
+                g2_epinop=g2_epinop,
+                g2_illag=g2_illag,
+                g2_asplit=g2_asplit,
+                g2_bspread=g2_bspread,
+                g2_nwaves=g2_nwaves,
+                g2_nrep=g2_nrep,
+                g2_apre=g2_apre,
+                g2_kmerge=g2_kmerge,
+                g2_brstore=g2_brstore,
                 mn_idx=mn_idx,
             )
 
@@ -330,20 +663,44 @@ def compile_gemm2_a4w4_port(
             # One-shot with spatial-partitioner remap (g2_spart>0): needs M0=total_m_blocks so cumsum is read FIRST.
             cumsum0 = global_typed_ptr(arg_cumsum, T.i32)[0]
             total_m_blocks = _udiv(cumsum0, BM)
-            bound = total_m_blocks * fx.Int32(num_n_blocks)
+            n_groups = _udiv(num_n_blocks, fx.Int32(abs(g2_nrep)))
+            bound = total_m_blocks * n_groups
+
+            _bx_eff = bx_i32
+            if const_expr(g2_xcd > 0):
+                _nx = fx.Int32(g2_xcd)
+                _xcd = fx.Int32(bx_i32) % _nx
+                _intra = fx.Int32(bx_i32) // _nx
+                _base = bound // _nx
+                _extra = bound % _nx
+                _bx_eff = (
+                    _xcd * _base
+                    + (_xcd < _extra).select(_xcd, _extra)
+                    + _intra
+                )
 
             if fx.Int32(bx_i32) < bound:
                 m_block_idx, n_block_idx = _spart_output_tile_index(
-                    bx_i32,
+                    _bx_eff,
                     total_m_blocks,
-                    num_n_blocks,
+                    num_n_blocks // abs(g2_nrep) if isinstance(num_n_blocks, int) else n_groups,
                     g2_group_num,
                     g2_m01,
                 )
                 unit_bx = m_block_idx * fx.Int32(num_n_blocks) + n_block_idx
-                issue_all_a_loads(m_block_idx * fx.Int32(BM))
-                rocdl.sched_barrier(0)
-                run_unit(unit_bx, mn_idx=(m_block_idx, n_block_idx))
+                _m_row0 = m_block_idx * fx.Int32(BM)
+                _tok0 = (
+                    global_typed_ptr(arg_stids, T.i32)[_m_row0] & fx.Int32(0x00FFFFFF)
+                )
+                _tok0 = fx.Int32(rocdl.readfirstlane(T.i32, _raw_v(_tok0)))
+                if const_expr(not g2_skippad):
+                    issue_all_a_loads(_m_row0)
+                    rocdl.sched_barrier(0)
+                    run_unit(unit_bx, mn_idx=(m_block_idx, n_block_idx))
+                elif _tok0 < i32_M:
+                    issue_all_a_loads(_m_row0)
+                    rocdl.sched_barrier(0)
+                    run_unit(unit_bx, mn_idx=(m_block_idx, n_block_idx))
         else:
             # Persistent-m: fixed cu_num*num_n_blocks grid; each block grid-strides m-tiles by cu_num (aiter `_persist`).
             m_tile0 = _udiv(bx_i32, num_n_blocks)
@@ -369,7 +726,7 @@ def compile_gemm2_a4w4_port(
                 if fx.Int32(m_block) < total_m_blocks:
                     run_unit(unit_bx)
 
-    @flyc.kernel(name=name, known_block_size=[256, 1, 1])
+    @flyc.kernel(name=name, known_block_size=[block_threads, 1, 1])
     def gemm2_kernel(
         arg_aq: fx.Int64,
         arg_ascale: fx.Int64,
@@ -440,7 +797,9 @@ def compile_gemm2_a4w4_port(
     ):
         # i32_max_m_blocks sizes buffer resources; i32_grid_blocks bounds the launch to real m-blocks.
         num_n_blocks = fx.Int32(fx.Uint32(i32_hidden) // fx.Uint32(BN))
-        grid_x = i32_grid_blocks * num_n_blocks
+        grid_x = i32_grid_blocks * (num_n_blocks // fx.Int32(abs(g2_nrep)))
+        if _gridmul > 1:
+            grid_x = grid_x * fx.Int32(_gridmul)
         gemm2_kernel(
             arg_aq,
             arg_ascale,
@@ -459,8 +818,21 @@ def compile_gemm2_a4w4_port(
             arg_out,
             arg_out_scale,
             i32_grid_blocks,
-        ).launch(grid=(grid_x, 1, 1), block=(256, 1, 1), stream=stream)
+        ).launch(grid=(grid_x, 1, 1), block=(block_threads, 1, 1), stream=stream)
 
+    if g2_wpeu > 0:
+        launch_gemm2.compile_hints["waves_per_eu"] = g2_wpeu
+    _func_attrs = {}
+    if g2_maxnreg > 0:
+        _func_attrs["amdgpu-num-vgpr"] = str(g2_maxnreg)
+
+    if g2_agpr:
+        launch_gemm2.compile_hints["llvm_options"] = {
+            "amdgpu-mfma-vgpr-form": False
+        }
+        _func_attrs["amdgpu-agpr-alloc"] = os.environ.get("MXFP4_G2_AGPRN", "128")
+    if _func_attrs:
+        launch_gemm2.compile_hints["func_attrs"] = _func_attrs
     return launch_gemm2
 
 
@@ -487,7 +859,20 @@ def get_g2(
     g2_bf16_lds=None,
     g2_spart=None,
     g2_kstatic=False,
+    g2_off32=False,
 ):
+    g2_epi_lanes = int(os.environ.get("MXFP4_G2_EPI_LANES", "0"))
+    g2_bfull = os.environ.get("MXFP4_G2_BFULL", "0") == "1"
+    g2_split_lds = os.environ.get("MXFP4_G2_SPLITLDS", "0") == "1"
+    g2_wave_epi = os.environ.get("MXFP4_G2_WAVE_EPI", "0") == "1"
+    g2_noepi = os.environ.get("MXFP4_G2_NOEPI", "0") == "1"
+    g2_sched = os.environ.get("MXFP4_G2_SCHED", "1") == "1"
+    g2_nrep = int(os.environ.get("MXFP4_G2_NREP", "1"))
+    _apre_env = os.environ.get("MXFP4_G2_APRE")
+    g2_apre = None if _apre_env is None else (_apre_env == "1")
+    g2_kmerge = int(os.environ.get("MXFP4_G2_KMERGE", "1"))
+    g2_skippad = os.environ.get("MXFP4_G2_SKIPPAD", "0") == "1"
+    g2_brstore = os.environ.get("MXFP4_G2_BRSTORE", "1") == "1"
     # Cache key uses compile-time buckets; runtime inter_dim/model_dim share a
     # launcher while remaining within their respective caps.
     SBM = _norm_sbm(SBM, BM)
@@ -505,6 +890,31 @@ def get_g2(
         default_bf16_lds = "1" if g2_kstatic else "0"
         g2_bf16_lds = os.environ.get("MXFP4_G2_BF16_LDS", default_bf16_lds) == "1"
     g2_bf16_lds = bool(g2_bf16_lds)
+    g2_wpeu = int(os.environ.get("MXFP4_G2_WPEU", "0"))
+    g2_cpad = int(os.environ.get("MXFP4_G2_CPAD", "0"))
+    g2_swz = int(os.environ.get("MXFP4_G2_SWZ", "0"))
+    g2_pk8 = int(os.environ.get("MXFP4_G2_PK8", "1"))
+    g2_xcd = int(os.environ.get("MXFP4_G2_XCD", "0"))
+    g2_tr = int(os.environ.get("MXFP4_G2_TR", "0"))
+    g2_serp = int(os.environ.get("MXFP4_G2_SERP", "0"))
+    g2_maxnreg = int(os.environ.get("MXFP4_G2_MAXNREG", "0"))
+    g2_ldspad = int(os.environ.get("MXFP4_G2_LDSPAD", "0"))
+    g2_schedmask = int(os.environ.get("MXFP4_G2_SCHEDMASK", "0"), 0)
+    g2_mfmarep = int(os.environ.get("MXFP4_G2_MFMAREP", "1"))
+    g2_prio = int(os.environ.get("MXFP4_G2_PRIO", "1"))
+    g2_apf2 = int(os.environ.get("MXFP4_G2_APF2", "0"))
+    g2_bsingle = os.environ.get("MXFP4_G2_BSINGLE", "0") == "1"
+    g2_epirep = int(os.environ.get("MXFP4_G2_EPIREP", "1"))
+    g2_agpr = os.environ.get("MXFP4_G2_AGPR", "0") == "1"
+    g2_swapab = int(os.environ.get("MXFP4_G2_SWAPAB", "0"))
+    g2_cbase = int(os.environ.get("MXFP4_G2_CBASE", "0"))
+    g2_earlybar = os.environ.get("MXFP4_G2_EARLYBAR", "0") == "1"
+    g2_interleave = os.environ.get("MXFP4_G2_INTERLEAVE", "1") == "1"
+    g2_noppad = int(os.environ.get("MXFP4_G2_NOPPAD", "0"))
+    g2_barpad = int(os.environ.get("MXFP4_G2_BARPAD", "0"))
+    g2_dspad = int(os.environ.get("MXFP4_G2_DSPAD", "0"))
+    g2_bspread = os.environ.get("MXFP4_G2_BSPREAD", "0") == "1"
+    g2_nwaves = int(os.environ.get("MXFP4_G2_NWAVES", "4"))
     key = (
         BM,
         BN,
@@ -526,6 +936,43 @@ def get_g2(
         g2_bf16_lds,
         g2_kstatic,
         out_dtype,
+        g2_wpeu,
+        g2_off32,
+        g2_epi_lanes,
+        g2_bfull,
+        g2_split_lds,
+        g2_wave_epi,
+        g2_noepi,
+        g2_sched,
+        g2_nrep,
+        g2_apre,
+        g2_kmerge,
+        g2_skippad,
+        g2_brstore,
+        g2_cpad,
+        g2_swz,
+        g2_pk8,
+        g2_xcd,
+        g2_tr,
+        g2_serp,
+        g2_maxnreg,
+        g2_ldspad,
+        g2_schedmask,
+        g2_mfmarep,
+        g2_prio,
+        g2_apf2,
+        g2_bsingle,
+        g2_epirep,
+        g2_agpr,
+        g2_swapab,
+        g2_cbase,
+        g2_earlybar,
+        g2_interleave,
+        g2_noppad,
+        g2_barpad,
+        g2_dspad,
+        g2_bspread,
+        g2_nwaves,
     )
     launch = G2_CACHE.get(key)
     if launch is None:
@@ -550,6 +997,39 @@ def get_g2(
             g2_bf16_lds=g2_bf16_lds,
             g2_kstatic=g2_kstatic,
             out_dtype=out_dtype,
+            g2_wpeu=g2_wpeu,
+            g2_off32=g2_off32,
+            g2_epi_lanes=g2_epi_lanes,
+            g2_bfull=g2_bfull,
+            g2_split_lds=g2_split_lds,
+            g2_wave_epi=g2_wave_epi,
+            g2_noepi=g2_noepi,
+            g2_sched=g2_sched,
+            g2_nrep=g2_nrep,
+            g2_apre=g2_apre,
+            g2_kmerge=g2_kmerge,
+            g2_skippad=g2_skippad,
+            g2_brstore=g2_brstore,
+            g2_cpad=g2_cpad,
+            g2_swz=g2_swz,
+            g2_pk8=g2_pk8,
+            g2_xcd=g2_xcd,
+            g2_schedmask=g2_schedmask,
+            g2_mfmarep=g2_mfmarep,
+            g2_prio=g2_prio,
+            g2_apf2=g2_apf2,
+            g2_bsingle=g2_bsingle,
+            g2_epirep=g2_epirep,
+            g2_agpr=g2_agpr,
+            g2_swapab=g2_swapab,
+            g2_cbase=g2_cbase,
+            g2_earlybar=g2_earlybar,
+            g2_interleave=g2_interleave,
+            g2_noppad=g2_noppad,
+            g2_barpad=g2_barpad,
+            g2_dspad=g2_dspad,
+            g2_bspread=g2_bspread,
+            g2_nwaves=g2_nwaves,
         )
         G2_CACHE[key] = launch
     return launch
@@ -637,6 +1117,9 @@ def mxfp4_moe_gemm2(
     _kstatic = os.environ.get("MXFP4_G2_KSTATIC", "1") == "1"
     if _kstatic:
         INTER_MAX = D_INTER
+    _off32 = out.numel() * out.element_size() <= 0x7FFFFFFF
+    if os.environ.get("MXFP4_G2_OFF32", "1") != "1":
+        _off32 = False
     launch = get_g2(
         BM,
         BN,
@@ -656,6 +1139,7 @@ def mxfp4_moe_gemm2(
         out_dtype=out_dtype,
         g2_bf16_lds=g2_bf16_lds,
         g2_spart=g2_spart,
+        g2_off32=_off32,
     )
     max_m_blocks = (max_sorted + BM - 1) // BM
     if persist:

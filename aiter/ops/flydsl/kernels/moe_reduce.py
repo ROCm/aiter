@@ -17,6 +17,7 @@ contiguous ``X[tokens, topk, model_dim]`` tensor.
 """
 
 import functools
+import os
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -29,8 +30,7 @@ BLOCK = 256
 FP8_VEC = 8  # fp8 values per 64b buffer load (also the store granularity)
 
 
-@flyc.kernel
-def moe_reduction_kernel(
+def _moe_reduction_body(
     X: fx.Pointer,
     Y: fx.Pointer,
     expert_mask: fx.Pointer,
@@ -46,6 +46,9 @@ def moe_reduction_kernel(
     use_weight: fx.Constexpr[bool],
     scale_blk: fx.Constexpr[int],
     fp8_row_stride: fx.Constexpr[int],
+    BLOCK: fx.Constexpr[int],
+    fp8_vec: fx.Constexpr[int],
+    tokens_per_wg: fx.Constexpr[int],
 ):
     # One tiled-copy reduce for every dtype. Dense (f16/bf16/f32) loads V elems
     # and extends to f32; fp8 route-out loads 8 fp8 bytes + their e8m0 microscale
@@ -54,10 +57,13 @@ def moe_reduction_kernel(
     # an fp8 row is padded with its scale bytes ([N fp8 | N/scale_blk e8m0]).
     is_fp8 = dtype_str == "fp8"
     if const_expr(is_fp8):
-        in_elem, in_bytes, V = fx.Int8, 1, FP8_VEC
+        in_elem, in_bytes, V = fx.Int8, 1, fp8_vec
         row_stride = fp8_row_stride
         out_numeric = fx.Float16 if (out_dtype_str or "bf16") == "f16" else fx.BFloat16
-        load_atom = fx.make_copy_atom(fx.rocdl.BufferCopy64b(), fx.Int8)
+        load_atom = fx.make_copy_atom(
+            fx.rocdl.BufferCopy128b() if fp8_vec == 16 else fx.rocdl.BufferCopy64b(),
+            fx.Int8,
+        )
     else:
         in_elem = (
             fx.Float32
@@ -70,11 +76,11 @@ def moe_reduction_kernel(
         load_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), in_elem)
     out_bytes = out_numeric.width // 8
     is_16b = out_numeric.width < 32
+    TPW = tokens_per_wg
     TILE = BLOCK * V
     store_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), out_numeric)
 
     token, tile, tid = gpu.block_id("x"), gpu.block_id("y"), gpu.thread_id("x")
-    tok64 = fx.Int64(token)
     vec_f32, vec_out = T.vec(V, T.f32), T.vec(V, out_numeric.ir_type)
 
     def _view(elem, ptr_i64, ncols, nbytes):  # 2D [1, ncols] V# buffer descriptor
@@ -91,106 +97,112 @@ def moe_reduction_kernel(
     # Fold the per-token byte offset into the base ptr: keeps voffsets i32-safe
     # for X > 4 GiB.
     x_row_bytes = topk * row_stride * in_bytes
-    xbase = fx.Int64(ptrtoint(X)) + tok64 * fx.Int64(x_row_bytes)
-    xbuf = _view(in_elem, xbase, model_dim, x_row_bytes)
-    ybuf = _view(
-        out_numeric,
-        fx.Int64(ptrtoint(Y)) + tok64 * fx.Int64(model_dim * out_bytes),
-        model_dim,
-        model_dim * out_bytes,
-    )
-    if const_expr(is_fp8):
-        # e8m0 scales trail the values in each row (one byte per scale_blk elems).
-        i8pt = fx.PointerType.get(
-            fx.Int8.ir_type, address_space=fx.AddressSpace.Global, alignment=1
-        )
-        sc_ptr = fx.inttoptr(i8pt, xbase + fx.Int64(model_dim))
-    if const_expr(use_mask):
-        i32pt = fx.PointerType.get(
-            T.i32, address_space=fx.AddressSpace.Global, alignment=4
-        )
-        tk_ptr = fx.inttoptr(
-            i32pt, fx.Int64(ptrtoint(topk_ids)) + tok64 * fx.Int64(topk * 4)
-        )
-        em_ptr = fx.inttoptr(i32pt, fx.Int64(ptrtoint(expert_mask)))
-    if const_expr(use_weight):
-        # Route weights deferred from the stage2 epilogue: scale each expert's
-        # contribution here instead, so the GEMM stores unweighted rows.
-        f32pt = fx.PointerType.get(
-            T.f32, address_space=fx.AddressSpace.Global, alignment=4
-        )
-        tw_ptr = fx.inttoptr(
-            f32pt, fx.Int64(ptrtoint(topk_weights)) + tok64 * fx.Int64(topk * 4)
-        )
-
-    # Tiled copy: BLOCK threads across the tile, V contiguous elems per thread.
-    tile_mn, tv_layout = fx.make_layout_tv(
-        fx.make_layout((1, BLOCK), (1, 1)), fx.make_layout((1, V), (1, 1))
-    )
-    thr_load = fx.make_tiled_copy(load_atom, tv_layout, tile_mn).get_slice(tid)
-    thr_store = fx.make_tiled_copy(store_atom, tv_layout, tile_mn).get_slice(tid)
-
-    def _decode_fp8(vfrag, scale):  # 8 fp8 bytes + its e8m0 scale -> Vector(8, f32)
-        w = fx.Vector(fx.memref_load_vec(vfrag)).bitcast(fx.Int32)
-        words = (w[0], w[0], w[1], w[1])
-        lanes = []
-        for pi in range_constexpr(4):
-            pair = fx.Vector(fx.rocdl.cvt_pk_f32_fp8(T.f32x2, words[pi], bool(pi & 1)))
-            lanes.append(pair[0] * scale)
-            lanes.append(pair[1] * scale)
-        return fx.Vector.from_elements(lanes, fx.Float32)
-
-    def _reduce_tile():
-        p_src = thr_load.partition_S(
-            fx.slice(fx.zipped_divide(xbuf, tile_mn), (None, (0, tile)))
-        )
-        p_dst = thr_store.partition_D(
-            fx.slice(fx.zipped_divide(ybuf, tile_mn), (None, (0, tile)))
-        )
-        # topk rows share one per-thread voffset via a uniform scalar
-        # soffset = k*row_stride, so the loads issue back-to-back.
-        frags = [fx.make_fragment_like(p_src) for _ in range_constexpr(topk)]
-        for k in range_constexpr(topk):
-            fx.copy(load_atom, p_src, frags[k], soffset=fx.Int32(k * row_stride))
-        if const_expr(is_fp8):
-            sc_col = (
-                fx.Int32(tile) * fx.Int32(TILE) + fx.Int32(tid) * fx.Int32(V)
-            ) // fx.Int32(scale_blk)
-            scales = []
-            for k in range_constexpr(topk):
-                e8m0 = fx.Uint32(fx.Uint8(sc_ptr[sc_col + fx.Int32(k * row_stride)]))
-                scales.append((e8m0 << fx.Uint32(23)).bitcast(fx.Float32))
-
-        acc = fx.Vector.filled(V, 0.0, fx.Float32)
-        for k in range_constexpr(topk):
+    for _tp in range_constexpr(TPW):
+        _tok_i32 = fx.Int32(token) * fx.Int32(TPW) + fx.Int32(_tp)
+        if _tok_i32 < i32_m_tokens:
+            tok64 = fx.Int64(_tok_i32)
+            xbase = fx.Int64(ptrtoint(X)) + tok64 * fx.Int64(x_row_bytes)
+            xbuf = _view(in_elem, xbase, model_dim, x_row_bytes)
+            ybuf = _view(
+                out_numeric,
+                fx.Int64(ptrtoint(Y)) + tok64 * fx.Int64(model_dim * out_bytes),
+                model_dim,
+                model_dim * out_bytes,
+            )
             if const_expr(is_fp8):
-                vk = _decode_fp8(frags[k], scales[k])
-            else:
-                vk = fx.Vector(fx.memref_load_vec(frags[k]))
-                vk = vk.extf(vec_f32) if is_16b else vk
-            if const_expr(use_weight):
-                wk = tw_ptr[k]
-                vk = fx.Vector.from_elements(
-                    [vk[i] * wk for i in range_constexpr(V)], fx.Float32
+                i8pt = fx.PointerType.get(
+                    fx.Int8.ir_type, address_space=fx.AddressSpace.Global, alignment=1
                 )
+                sc_ptr = fx.inttoptr(i8pt, xbase + fx.Int64(model_dim))
             if const_expr(use_mask):
-                vk = (em_ptr[tk_ptr[k]] != fx.Int32(0)).select(
-                    vk, fx.Vector.filled(V, 0.0, fx.Float32)
+                i32pt = fx.PointerType.get(
+                    T.i32, address_space=fx.AddressSpace.Global, alignment=4
                 )
-            acc = acc + vk
-        ofrag = fx.make_fragment_like(p_dst)
-        fx.memref_store_vec(acc.truncf(vec_out) if is_16b else acc, ofrag)
-        fx.copy(store_atom, ofrag, p_dst)
+                tk_ptr = fx.inttoptr(
+                    i32pt, fx.Int64(ptrtoint(topk_ids)) + tok64 * fx.Int64(topk * 4)
+                )
+                em_ptr = fx.inttoptr(i32pt, fx.Int64(ptrtoint(expert_mask)))
+            if const_expr(use_weight):
+                f32pt = fx.PointerType.get(
+                    T.f32, address_space=fx.AddressSpace.Global, alignment=4
+                )
+                tw_ptr = fx.inttoptr(
+                    f32pt, fx.Int64(ptrtoint(topk_weights)) + tok64 * fx.Int64(topk * 4)
+                )
 
-    # Skip threads whose column group starts past model_dim (their loads would
-    # read the next row -- in-descriptor, wasted BW); only needed when TILE ∤ md.
-    if const_expr(model_dim % TILE != 0):
-        if fx.Int32(tile) * fx.Int32(TILE) + fx.Int32(tid) * fx.Int32(V) < fx.Int32(
-            model_dim
-        ):
-            _reduce_tile()
-    else:
-        _reduce_tile()
+            tile_mn, tv_layout = fx.make_layout_tv(
+                fx.make_layout((1, BLOCK), (1, 1)), fx.make_layout((1, V), (1, 1))
+            )
+            thr_load = fx.make_tiled_copy(load_atom, tv_layout, tile_mn).get_slice(tid)
+            thr_store = fx.make_tiled_copy(store_atom, tv_layout, tile_mn).get_slice(tid)
+
+            def _decode_fp8(vfrag, scale):  # V fp8 bytes + its e8m0 scale -> Vector(V, f32)
+                w = fx.Vector(fx.memref_load_vec(vfrag)).bitcast(fx.Int32)
+                lanes = []
+                for wi in range_constexpr(V // 4):
+                    for hi in range_constexpr(2):
+                        pair = fx.Vector(fx.rocdl.cvt_pk_f32_fp8(T.f32x2, w[wi], bool(hi)))
+                        lanes.append(pair[0] * scale)
+                        lanes.append(pair[1] * scale)
+                return fx.Vector.from_elements(lanes, fx.Float32)
+
+            def _reduce_tile():
+                p_src = thr_load.partition_S(
+                    fx.slice(fx.zipped_divide(xbuf, tile_mn), (None, (0, tile)))
+                )
+                p_dst = thr_store.partition_D(
+                    fx.slice(fx.zipped_divide(ybuf, tile_mn), (None, (0, tile)))
+                )
+                frags = [fx.make_fragment_like(p_src) for _ in range_constexpr(topk)]
+                for k in range_constexpr(topk):
+                    fx.copy(load_atom, p_src, frags[k], soffset=fx.Int32(k * row_stride))
+                if const_expr(is_fp8):
+                    sc_col = (
+                        fx.Int32(tile) * fx.Int32(TILE) + fx.Int32(tid) * fx.Int32(V)
+                    ) // fx.Int32(scale_blk)
+                    scales = []
+                    for k in range_constexpr(topk):
+                        e8m0 = fx.Uint32(fx.Uint8(sc_ptr[sc_col + fx.Int32(k * row_stride)]))
+                        s_k = (e8m0 << fx.Uint32(23)).bitcast(fx.Float32)
+                        if const_expr(use_weight):
+                            s_k = s_k * tw_ptr[k]
+                        scales.append(s_k)
+
+                acc = fx.Vector.filled(V, 0.0, fx.Float32)
+                for k in range_constexpr(topk):
+                    if const_expr(is_fp8):
+                        vk = _decode_fp8(frags[k], scales[k])
+                    else:
+                        vk = fx.Vector(fx.memref_load_vec(frags[k]))
+                        vk = vk.extf(vec_f32) if is_16b else vk
+                    if const_expr(use_weight) and const_expr(not is_fp8):
+                        wk = tw_ptr[k]
+                        vk = fx.Vector.from_elements(
+                            [vk[i] * wk for i in range_constexpr(V)], fx.Float32
+                        )
+                    if const_expr(use_mask):
+                        vk = (em_ptr[tk_ptr[k]] != fx.Int32(0)).select(
+                            vk, fx.Vector.filled(V, 0.0, fx.Float32)
+                        )
+                    acc = acc + vk
+                ofrag = fx.make_fragment_like(p_dst)
+                fx.memref_store_vec(acc.truncf(vec_out) if is_16b else acc, ofrag)
+                fx.copy(store_atom, ofrag, p_dst)
+
+            if const_expr(model_dim % TILE != 0):
+                if fx.Int32(tile) * fx.Int32(TILE) + fx.Int32(tid) * fx.Int32(V) < fx.Int32(
+                    model_dim
+                ):
+                    _reduce_tile()
+            else:
+                _reduce_tile()
+
+
+@functools.lru_cache(maxsize=8)
+def _reduction_kernel_for(block: int):
+    """@flyc.kernel bakes max_flat_workgroup_size, so one decorated kernel per
+    block size. Cached: the set of block sizes in use is tiny."""
+    return flyc.kernel(known_block_size=[block, 1, 1])(_moe_reduction_body)
 
 
 @functools.lru_cache(maxsize=1024)
@@ -205,6 +217,9 @@ def compile_moe_reduction(
     use_weight: bool = False,
     scale_blk: int | None = None,
     pitch_align: int | None = None,
+    block: int = BLOCK,
+    fp8_vec: int = FP8_VEC,
+    tokens_per_wg: int = 1,
 ):
     """Compile the topk-reduce launcher for one Constexpr set (cached per shape).
 
@@ -213,13 +228,13 @@ def compile_moe_reduction(
     launcher is a distinct object per shape, so the shim's per-exe ``_cf`` cache
     stays correct.
     """
-    V = FP8_VEC if dtype_str == "fp8" else 128 // (32 if dtype_str == "f32" else 16)
-    gy = (model_dim + BLOCK * V - 1) // (BLOCK * V)
+    V = fp8_vec if dtype_str == "fp8" else 128 // (32 if dtype_str == "f32" else 16)
+    gy = (model_dim + block * V - 1) // (block * V)
     out_tag = out_dtype_str or dtype_str
     if dtype_str == "fp8":
         scale_blk = fp8out_scale_blk(model_dim) if scale_blk is None else int(scale_blk)
-        if scale_blk % FP8_VEC:
-            raise ValueError(f"scale_blk {scale_blk} must be a multiple of {FP8_VEC}")
+        if scale_blk % fp8_vec:
+            raise ValueError(f"scale_blk {scale_blk} must be a multiple of {fp8_vec}")
         align = FP8OUT_PITCH_ALIGN if pitch_align is None else int(pitch_align)
         fp8_row_stride = fp8out_row_bytes(
             model_dim, scale_blk=scale_blk, pitch_align=align
@@ -237,7 +252,7 @@ def compile_moe_reduction(
         i32_m_tokens: fx.Int32,
         stream: fx.Stream,
     ):
-        moe_reduction_kernel(
+        _reduction_kernel_for(block)(
             X,
             Y,
             expert_mask,
@@ -253,8 +268,22 @@ def compile_moe_reduction(
             use_weight,
             scale_blk,
             fp8_row_stride,
+            block,
+            fp8_vec,
+            tokens_per_wg,
         ).launch(
-            grid=(fx.Int64(i32_m_tokens), gy, 1), block=(BLOCK, 1, 1), stream=stream
+            grid=(
+                fx.Int64(
+                    (i32_m_tokens + fx.Int32(tokens_per_wg - 1))
+                    // fx.Int32(tokens_per_wg)
+                )
+                if tokens_per_wg > 1
+                else fx.Int64(i32_m_tokens),
+                gy,
+                1,
+            ),
+            block=(block, 1, 1),
+            stream=stream
         )
 
     return launch
