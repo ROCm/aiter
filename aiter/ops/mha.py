@@ -7,6 +7,8 @@ from typing import Any
 import torch
 from torch import Generator, Tensor
 
+from csrc.cpp_itfs.torch_utils import direct_register_custom_op
+
 from ..jit.core import AITER_META_DIR, CK_DIR, ENABLE_CK, compile_ops
 from ..jit.utils.chip_info import get_cu_num, get_gfx
 from ..jit.utils.mha_recipes import (
@@ -261,10 +263,29 @@ def gen_mha_fwd_native_splitkv_fake_tensors(
     return o, lse
 
 
+# torch-free kernel entry: the C++ TU takes aiter_tensor_t views and writes into
+# caller-allocated buffers, so all outputs/scratch are allocated Python-side (see
+# mha_fwd_native_splitkv below) and passed in.
 @compile_ops(
     "module_mha_fwd_native_splitkv",
-    gen_fake=gen_mha_fwd_native_splitkv_fake_tensors,
+    fc_name="mha_fwd_native_splitkv",
+    develop=True,
 )
+def _mha_fwd_native_splitkv(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    o: Tensor,
+    lse: Tensor,
+    scratch_o: Tensor,
+    scratch_lse: Tensor,
+    softmax_scale: float,
+    causal: bool,
+    return_lse: bool,
+    num_splits: int,
+) -> None: ...
+
+
 def mha_fwd_native_splitkv(
     q: Tensor,
     k: Tensor,
@@ -274,7 +295,55 @@ def mha_fwd_native_splitkv(
     causal: bool,
     return_lse: bool,
     num_splits: int,
-) -> tuple[Tensor, Tensor]: ...
+) -> tuple[Tensor, Tensor]:
+    # Registered as torch.ops.aiter.mha_fwd_native_splitkv (opaque under
+    # torch.compile via the fake below); this eager impl allocates every buffer
+    # (the de-torched kernel can no longer allocate) and calls the void kernel.
+    batch_size, seqlen_q, nhead_q, hdim = q.shape
+    G = int(num_splits)
+    o = (
+        out
+        if out is not None
+        else torch.empty(
+            (batch_size, seqlen_q, nhead_q, hdim), dtype=q.dtype, device=q.device
+        )
+    )
+    lse = (
+        torch.empty(
+            (batch_size, nhead_q, seqlen_q), dtype=torch.float32, device=q.device
+        )
+        if return_lse
+        else torch.empty((0,), dtype=torch.float32, device=q.device)
+    )
+    # split-major fp32 scratch: [G,B,Hq,Sq,D] partial-O + [G,B,Hq,Sq] partial-LSE.
+    scratch_o = torch.empty(
+        (G, batch_size, nhead_q, seqlen_q, hdim), dtype=torch.float32, device=q.device
+    )
+    scratch_lse = torch.empty(
+        (G, batch_size, nhead_q, seqlen_q), dtype=torch.float32, device=q.device
+    )
+    _mha_fwd_native_splitkv(
+        q,
+        k,
+        v,
+        o,
+        lse,
+        scratch_o,
+        scratch_lse,
+        softmax_scale,
+        causal,
+        return_lse,
+        num_splits,
+    )
+    return o, lse
+
+
+direct_register_custom_op(
+    "mha_fwd_native_splitkv",
+    mha_fwd_native_splitkv,
+    ["out"],
+    fake_impl=gen_mha_fwd_native_splitkv_fake_tensors,
+)
 
 
 def gen_fmha_v3_fwd_fake_tensors(
@@ -2008,7 +2077,7 @@ def _flash_attn_forward(
             ), (  # ceil(seqlen_k/64); don't silently clamp
                 f"num_splits={ns} too large for seqlen_k={seqlen_k}"
             )
-            out_, softmax_lse = mha_fwd_native_splitkv(
+            out_, softmax_lse = torch.ops.aiter.mha_fwd_native_splitkv(
                 q, k, v, out, softmax_scale, causal, return_lse, ns
             )
             S_dmask = None

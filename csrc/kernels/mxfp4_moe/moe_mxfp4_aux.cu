@@ -11,8 +11,7 @@
 
 #include "moe_mxfp4_aux.h"
 
-#include <ATen/hip/HIPContext.h>
-#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
+#include "aiter_stream.h"
 
 #include <string>
 #include <unordered_map>
@@ -69,7 +68,7 @@ template <class Fn>
 Fn aux_find(const std::unordered_map<std::string, Fn>& table,
             const std::string& key, const char* what) {
     auto it = table.find(key);
-    TORCH_CHECK(it != table.end(), what,
+    AITER_CHECK(it != table.end(), what,
         ": no codegen'd instance for shape key '", key,
         "'. See moe_aux/codegen/gen_instances.py (enumerate_instances).");
     return it->second;
@@ -79,25 +78,25 @@ Fn aux_find(const std::unordered_map<std::string, Fn>& table,
 
 
 void mxfp4_moe_sort_quant_kernel(
-    torch::Tensor& a_input,
-    torch::Tensor& topk_ids,
-    torch::Tensor& topk_weight,
-    torch::Tensor& sorted_token_ids,
-    torch::Tensor& sorted_expert_ids,
-    torch::Tensor& cumsum_tensor,
-    torch::Tensor& reverse_sorted,
-    torch::Tensor& sorted_weights,
-    torch::Tensor& a_quant,
-    torch::Tensor& a_scale,
-    torch::Tensor& m_indices,
-    torch::Tensor& bf16_zero_out,
+    aiter_tensor_t& a_input,
+    aiter_tensor_t& topk_ids,
+    aiter_tensor_t& topk_weight,
+    aiter_tensor_t& sorted_token_ids,
+    aiter_tensor_t& sorted_expert_ids,
+    aiter_tensor_t& cumsum_tensor,
+    aiter_tensor_t& reverse_sorted,
+    aiter_tensor_t& sorted_weights,
+    aiter_tensor_t& a_quant,
+    aiter_tensor_t& a_scale,
+    aiter_tensor_t& m_indices,
+    aiter_tensor_t& bf16_zero_out,
     int64_t NE,
     int64_t TOPK,
     int64_t D_HIDDEN,
     int64_t MB)
 {
-    const at::hip::OptionalHIPGuardMasqueradingAsCUDA guard(device_of(a_input));
-    const hipStream_t stream = at::hip::getCurrentHIPStream();
+    HipDeviceGuard guard(a_input.device_id);
+    const hipStream_t stream = aiter::getCurrentHIPStream();
     const int M = static_cast<int>(a_input.size(0));
 
     void* bf16_zero_ptr = (bf16_zero_out.numel() > 0) ? bf16_zero_out.data_ptr() : nullptr;
@@ -108,27 +107,28 @@ void mxfp4_moe_sort_quant_kernel(
     aux_find(sort_quant_lookup(), key, "mxfp4_moe_sort_quant")(
         stream, M,
         a_input.data_ptr(),
-        topk_ids.data_ptr<int32_t>(), topk_weight.data_ptr<float>(),
-        sorted_token_ids.data_ptr<int32_t>(), sorted_expert_ids.data_ptr<int32_t>(),
-        cumsum_tensor.data_ptr<int32_t>(), reverse_sorted.data_ptr<int32_t>(),
-        sorted_weights.data_ptr<float>(),
+        static_cast<int32_t*>(topk_ids.data_ptr()), static_cast<float*>(topk_weight.data_ptr()),
+        static_cast<int32_t*>(sorted_token_ids.data_ptr()), static_cast<int32_t*>(sorted_expert_ids.data_ptr()),
+        static_cast<int32_t*>(cumsum_tensor.data_ptr()), static_cast<int32_t*>(reverse_sorted.data_ptr()),
+        static_cast<float*>(sorted_weights.data_ptr()),
         a_quant.data_ptr(), a_scale.data_ptr(),
-        m_indices.data_ptr<int32_t>(),
+        static_cast<int32_t*>(m_indices.data_ptr()),
         bf16_zero_ptr);
 }
 
 
 void mxfp4_moe_sort_kernel(
-    torch::Tensor& topk_ids,
-    torch::Tensor& topk_weight,
-    torch::Tensor& sorted_token_ids,
-    torch::Tensor& sorted_expert_ids,
-    torch::Tensor& cumsum_tensor,
-    torch::Tensor& reverse_sorted,
-    torch::Tensor& sorted_weights,
-    torch::Tensor& m_indices,
-    torch::Tensor& bf16_zero_out,
-    torch::Tensor& bf16_zero_workspace,
+    aiter_tensor_t& topk_ids,
+    aiter_tensor_t& topk_weight,
+    aiter_tensor_t& sorted_token_ids,
+    aiter_tensor_t& sorted_expert_ids,
+    aiter_tensor_t& cumsum_tensor,
+    aiter_tensor_t& reverse_sorted,
+    aiter_tensor_t& sorted_weights,
+    aiter_tensor_t& m_indices,
+    aiter_tensor_t& bf16_zero_out,
+    aiter_tensor_t& bf16_zero_workspace,
+    aiter_tensor_t& sort3s_workspace,
     int64_t M_logical,
     int64_t NE,
     int64_t TOPK,
@@ -138,8 +138,8 @@ void mxfp4_moe_sort_kernel(
     int64_t prologue)
 {
     (void)D_INTER;
-    const at::hip::OptionalHIPGuardMasqueradingAsCUDA guard(device_of(topk_ids));
-    const hipStream_t stream = at::hip::getCurrentHIPStream();
+    HipDeviceGuard guard(topk_ids.device_id);
+    const hipStream_t stream = aiter::getCurrentHIPStream();
     const int M = static_cast<int>(M_logical);
 
     void* bf16_zero_ptr = (bf16_zero_out.numel() > 0) ? bf16_zero_out.data_ptr() : nullptr;
@@ -152,20 +152,22 @@ void mxfp4_moe_sort_kernel(
     }
 
     if (prologue == 1 /* threestage */) {
-        auto opts_i32 = torch::TensorOptions().dtype(torch::kInt32).device(topk_ids.device());
-        auto scratch  = torch::empty({(int64_t)NE * kSplitSortCtas + NE}, opts_i32);
-        int32_t* block_offsets = scratch.data_ptr<int32_t>();
+        // Caller-provided int32 scratch (was torch::empty here before de-torch):
+        // block_offsets[NE*kSplitSortCtas] followed by real_counts[NE].
+        AITER_CHECK(sort3s_workspace.numel() >= (size_t)(NE * kSplitSortCtas + NE),
+                    "mxfp4_moe_sort (threestage): sort3s_workspace too small");
+        int32_t* block_offsets = static_cast<int32_t*>(sort3s_workspace.data_ptr());
         int32_t* real_counts   = block_offsets + NE * kSplitSortCtas;
 
         const std::string key = "aux_sort3s_NE" + std::to_string(NE)
             + "_TOPK" + std::to_string(TOPK) + "_MB" + std::to_string(MB);
         aux_find(sort3stage_lookup(), key, "mxfp4_moe_sort (threestage)")(
             stream, M,
-            topk_ids.data_ptr<int32_t>(), topk_weight.data_ptr<float>(),
-            sorted_token_ids.data_ptr<int32_t>(), sorted_expert_ids.data_ptr<int32_t>(),
-            cumsum_tensor.data_ptr<int32_t>(), reverse_sorted.data_ptr<int32_t>(),
-            sorted_weights.data_ptr<float>(),
-            m_indices.data_ptr<int32_t>(),
+            static_cast<int32_t*>(topk_ids.data_ptr()), static_cast<float*>(topk_weight.data_ptr()),
+            static_cast<int32_t*>(sorted_token_ids.data_ptr()), static_cast<int32_t*>(sorted_expert_ids.data_ptr()),
+            static_cast<int32_t*>(cumsum_tensor.data_ptr()), static_cast<int32_t*>(reverse_sorted.data_ptr()),
+            static_cast<float*>(sorted_weights.data_ptr()),
+            static_cast<int32_t*>(m_indices.data_ptr()),
             block_offsets, real_counts);
         return;
     }
@@ -178,11 +180,11 @@ void mxfp4_moe_sort_kernel(
             + "_H" + std::to_string(D_HIDDEN);
         aux_find(sort_only_zi_lookup(), key, "mxfp4_moe_sort (inline_quant+zero_init)")(
             stream, M,
-            topk_ids.data_ptr<int32_t>(), topk_weight.data_ptr<float>(),
-            sorted_token_ids.data_ptr<int32_t>(), sorted_expert_ids.data_ptr<int32_t>(),
-            cumsum_tensor.data_ptr<int32_t>(), reverse_sorted.data_ptr<int32_t>(),
-            sorted_weights.data_ptr<float>(),
-            m_indices.data_ptr<int32_t>(),
+            static_cast<int32_t*>(topk_ids.data_ptr()), static_cast<float*>(topk_weight.data_ptr()),
+            static_cast<int32_t*>(sorted_token_ids.data_ptr()), static_cast<int32_t*>(sorted_expert_ids.data_ptr()),
+            static_cast<int32_t*>(cumsum_tensor.data_ptr()), static_cast<int32_t*>(reverse_sorted.data_ptr()),
+            static_cast<float*>(sorted_weights.data_ptr()),
+            static_cast<int32_t*>(m_indices.data_ptr()),
             bf16_zero_ptr, bf16_zero_ws_ptr, workspace_bytes);
     } else {
         const std::string key = "aux_sortonly_NE" + std::to_string(NE)
@@ -190,27 +192,27 @@ void mxfp4_moe_sort_kernel(
             + "_H" + std::to_string(D_HIDDEN);
         aux_find(sort_only_lookup(), key, "mxfp4_moe_sort (inline_quant)")(
             stream, M,
-            topk_ids.data_ptr<int32_t>(), topk_weight.data_ptr<float>(),
-            sorted_token_ids.data_ptr<int32_t>(), sorted_expert_ids.data_ptr<int32_t>(),
-            cumsum_tensor.data_ptr<int32_t>(), reverse_sorted.data_ptr<int32_t>(),
-            sorted_weights.data_ptr<float>(),
-            m_indices.data_ptr<int32_t>());
+            static_cast<int32_t*>(topk_ids.data_ptr()), static_cast<float*>(topk_weight.data_ptr()),
+            static_cast<int32_t*>(sorted_token_ids.data_ptr()), static_cast<int32_t*>(sorted_expert_ids.data_ptr()),
+            static_cast<int32_t*>(cumsum_tensor.data_ptr()), static_cast<int32_t*>(reverse_sorted.data_ptr()),
+            static_cast<float*>(sorted_weights.data_ptr()),
+            static_cast<int32_t*>(m_indices.data_ptr()));
     }
 }
 
 
 void mxfp4_moe_quant_kernel(
-    torch::Tensor& a_input,
-    torch::Tensor& a_quant,
-    torch::Tensor& a_scale,
-    torch::Tensor& bf16_zero_out,
+    aiter_tensor_t& a_input,
+    aiter_tensor_t& a_quant,
+    aiter_tensor_t& a_scale,
+    aiter_tensor_t& bf16_zero_out,
     int64_t NE,
     int64_t TOPK,
     int64_t D_HIDDEN,
     int64_t MB)
 {
-    const at::hip::OptionalHIPGuardMasqueradingAsCUDA guard(device_of(a_input));
-    const hipStream_t stream = at::hip::getCurrentHIPStream();
+    HipDeviceGuard guard(a_input.device_id);
+    const hipStream_t stream = aiter::getCurrentHIPStream();
     const int M = static_cast<int>(a_input.size(0));
 
     void* bf16_zero_ptr = (bf16_zero_out.numel() > 0) ? bf16_zero_out.data_ptr() : nullptr;
@@ -226,18 +228,18 @@ void mxfp4_moe_quant_kernel(
 
 
 void mxfp4_moe_sort_scales_kernel(
-    torch::Tensor& a_scale,
-    torch::Tensor& sorted_token_ids,
-    torch::Tensor& cumsum_tensor,
-    torch::Tensor& a_scale_sorted_shuffled,
+    aiter_tensor_t& a_scale,
+    aiter_tensor_t& sorted_token_ids,
+    aiter_tensor_t& cumsum_tensor,
+    aiter_tensor_t& a_scale_sorted_shuffled,
     int64_t NE,
     int64_t TOPK,
     int64_t D_HIDDEN,
     int64_t MB,
     int64_t max_sorted)
 {
-    const at::hip::OptionalHIPGuardMasqueradingAsCUDA guard(device_of(a_scale));
-    const hipStream_t stream = at::hip::getCurrentHIPStream();
+    HipDeviceGuard guard(a_scale.device_id);
+    const hipStream_t stream = aiter::getCurrentHIPStream();
     const int M = static_cast<int>(a_scale.size(0));
     (void)TOPK;
 
@@ -249,25 +251,25 @@ void mxfp4_moe_sort_scales_kernel(
         + "_H" + std::to_string(D_HIDDEN);
     aux_find(sort_scales_lookup(), key, "mxfp4_moe_sort_scales")(
         stream, M, static_cast<int>(max_sorted),
-        a_scale.data_ptr(), sorted_token_ids.data_ptr<int32_t>(),
-        cumsum_tensor.data_ptr<int32_t>(),
+        a_scale.data_ptr(), static_cast<int32_t*>(sorted_token_ids.data_ptr()),
+        static_cast<int32_t*>(cumsum_tensor.data_ptr()),
         a_scale_sorted_shuffled.data_ptr());
 }
 
 
 void mxfp4_moe_scatter_reduce_kernel(
-    torch::Tensor& flat_out,
-    torch::Tensor& reverse_sorted,
-    torch::Tensor& sorted_weights,
-    torch::Tensor& out,
+    aiter_tensor_t& flat_out,
+    aiter_tensor_t& reverse_sorted,
+    aiter_tensor_t& sorted_weights,
+    aiter_tensor_t& out,
     int64_t NE,
     int64_t TOPK,
     int64_t D_HIDDEN,
     int64_t MB)
 {
     (void)NE;
-    const at::hip::OptionalHIPGuardMasqueradingAsCUDA guard(device_of(flat_out));
-    const hipStream_t stream = at::hip::getCurrentHIPStream();
+    HipDeviceGuard guard(flat_out.device_id);
+    const hipStream_t stream = aiter::getCurrentHIPStream();
     const int M = static_cast<int>(out.size(0));
 
     // nt_hints on only at BM=128: large M is DRAM-bound, smaller M fits L2.
@@ -278,27 +280,27 @@ void mxfp4_moe_scatter_reduce_kernel(
     aux_find(scatter_reduce_lookup(), key, "mxfp4_moe_scatter_reduce")(
         stream, M,
         flat_out.data_ptr(),
-        reverse_sorted.data_ptr<int32_t>(),
-        sorted_weights.data_ptr<float>(),
+        static_cast<int32_t*>(reverse_sorted.data_ptr()),
+        static_cast<float*>(sorted_weights.data_ptr()),
         out.data_ptr());
 }
 
 
 // MXFP4-input scatter_reduce: flat_out staged as packed fp4 + e8m0 block scales.
 void mxfp4_moe_scatter_reduce_q_kernel(
-    torch::Tensor& flat_out_q,
-    torch::Tensor& flat_out_scale,
-    torch::Tensor& reverse_sorted,
-    torch::Tensor& sorted_weights,
-    torch::Tensor& out,
+    aiter_tensor_t& flat_out_q,
+    aiter_tensor_t& flat_out_scale,
+    aiter_tensor_t& reverse_sorted,
+    aiter_tensor_t& sorted_weights,
+    aiter_tensor_t& out,
     int64_t NE,
     int64_t TOPK,
     int64_t D_HIDDEN,
     int64_t MB)
 {
     (void)NE;
-    const at::hip::OptionalHIPGuardMasqueradingAsCUDA guard(device_of(flat_out_q));
-    const hipStream_t stream = at::hip::getCurrentHIPStream();
+    HipDeviceGuard guard(flat_out_q.device_id);
+    const hipStream_t stream = aiter::getCurrentHIPStream();
     const int M = static_cast<int>(out.size(0));
 
     const int nt = (MB >= 128) ? 1 : 0;
@@ -308,7 +310,7 @@ void mxfp4_moe_scatter_reduce_q_kernel(
     aux_find(scatter_reduce_q_lookup(), key, "mxfp4_moe_scatter_reduce_q")(
         stream, M,
         flat_out_q.data_ptr(), flat_out_scale.data_ptr(),
-        reverse_sorted.data_ptr<int32_t>(),
-        sorted_weights.data_ptr<float>(),
+        static_cast<int32_t*>(reverse_sorted.data_ptr()),
+        static_cast<float*>(sorted_weights.data_ptr()),
         out.data_ptr());
 }
