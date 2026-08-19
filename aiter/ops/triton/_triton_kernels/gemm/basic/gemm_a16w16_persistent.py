@@ -93,7 +93,9 @@ def gemm_a16w16_persistent_kernel_(
         pid = t // NUM_KSPLIT
 
         if NUM_KSPLIT == 1:
-            pid_m, pid_n = pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M=GROUP_SIZE_M)
+            pid_m, pid_n = pid_grid(
+                pid, num_pid_m, num_pid_n, GROUP_SIZE_M=GROUP_SIZE_M
+            )
         else:
             pid_m = pid // num_pid_n
             pid_n = pid % num_pid_n
@@ -129,7 +131,9 @@ def gemm_a16w16_persistent_kernel_(
                         accumulator[None, :], (BLOCK_SIZE_M, BLOCK_SIZE_N)
                     )
                 else:
-                    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
+                    accumulator = tl.zeros(
+                        (BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype
+                    )
             else:
                 accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
 
@@ -143,7 +147,9 @@ def gemm_a16w16_persistent_kernel_(
                     b = tl.load(b_ptrs, cache_modifier=cache_modifier)
                 else:
                     a = tl.load(
-                        a_ptrs, mask=offs_k[None, :] < k_span - k * BLOCK_SIZE_K, other=0.0
+                        a_ptrs,
+                        mask=offs_k[None, :] < k_span - k * BLOCK_SIZE_K,
+                        other=0.0,
                     )
                     b = tl.load(
                         b_ptrs,
