@@ -271,13 +271,7 @@ _HOST_CHUNK_META_ATTR = "_flydsl_host_chunk_meta"
 
 
 def _hipeq_varlen_host_metadata(chunk_offsets: torch.Tensor) -> tuple[int, int]:
-    """Total and maximum per-sequence chunk counts, cached on the tensor.
-
-    Safe because ``chunk_offsets`` identity is stable across forwards (same
-    reasoning as ``_as_int32``); worth doing because the ``tolist`` sits between
-    the K1..K4 launches and K5's and stalls the host until the front end
-    retires: 66us of a 738us T=8k varlen block.
-    """
+    """Total/max per-sequence chunk counts, cached on ``chunk_offsets``."""
     cached = getattr(chunk_offsets, _HOST_CHUNK_META_ATTR, None)
     if cached is not None:
         return cached
@@ -453,8 +447,8 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
         (h, v_new, final_state) in VK-ordered layout (``[..., V, K]`` on the
         last two dims).
 
-    BV-tile selection is rule-based. ``chunk_gdn_h_tuned.csv`` remains an AOT
-    seed list for pre-compilation, but runtime BV selection does not read it.
+    BV-tile selection is rule-based on this entry; the mfma16_hip entry reads
+    ``AITER_CONFIG_GDN_K5_MFMA16_HIP`` first. ``chunk_gdn_h_tuned.csv`` is AOT-only.
     """
     # Layout is fixed to head-major contiguous (matches Triton VK wrapper).
     wu_contiguous = True
@@ -653,49 +647,23 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
     return h, v_new, final_state
 
 
-# ==========================================================================
-# mfma16_hip fork (additive) -- HIP-aligned FlyDSL K5 implementation.
-#
-# Everything below is self-contained and does NOT touch the baseline wrapper
-# above: it has its own compiled-kernel cache, BV selection (reusing the hip
-# K5 selector), launch path, and public entry point
-# ``chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip``. The baseline path keeps
-# its original behaviour / flydsl>=0.1.8 compatibility; the mfma16_hip fork
-# requires flydsl>=0.2.0, enforced lazily below.
-# ==========================================================================
-
-# mfma16_hip fork is written against the fx layout / tiled-copy / tiled-MMA API
-# surface (``make_buffer_tensor``, ``fx.copy``, ``fx.gemm``) that only exists
-# from flydsl 0.2.0. Enforced lazily (in ``_get_or_compile_mfma16_hip``) so
-# importing this module and using the baseline wrapper keeps working on
-# flydsl>=0.1.8.
+# mfma16_hip fork below (flydsl>=0.2.0, lazy-checked); baseline above unchanged.
 _MFMA16_HIP_MIN_FLYDSL_VERSION = "0.2.0"
 
-# gfx942 gate: only the mfma16_hip fork toggles the gfx942 GEMM1 ds-scheduling
-# (SCHED_GFX942). ``get_rocm_arch()`` may return a feature-suffixed string like
-# ``gfx942:sramecc+:xnack-``; normalize before matching.
+# gfx942 gate for SCHED_GFX942; normalize feature-suffixed arch strings first.
 _GFX_ARCH = get_rocm_arch().split(":")[0]
 _IS_GFX942 = _GFX_ARCH.startswith("gfx942")
 
-# Offline-measured BV winners (``model_configs/*_chunk_gdn_h_mfma16_hip_tuned.csv``),
-# resolved via ``AITER_CONFIGS`` (supports env override and model_configs merge).
-# AOT compile shapes live in the separate untuned table under model_configs/.
-
-
-def _bv_tuned_csv_path() -> str:
-    return AITER_CONFIGS.AITER_CONFIG_GDN_K5_MFMA16_HIP_FILE
-
 
 def _load_tuned_bv_table() -> dict[tuple, int]:
-    """Load the tuned BV table at import time.
-
-    Eager and stdlib-only so the read (0.15ms, ~3.6ms via pandas) cannot land in
-    a live server's first prefill. A missing or malformed table is not fatal:
-    every lookup misses and the rule answers, as before the table.
-    """
+    """Load tuned BV rows at import; miss or error falls back to the rule."""
     table: dict[tuple, int] = {}
     try:
-        with open(_bv_tuned_csv_path(), "r", encoding="utf-8", newline="") as f:
+        with open(
+            AITER_CONFIGS.AITER_CONFIG_GDN_K5_MFMA16_HIP_FILE,
+            encoding="utf-8",
+            newline="",
+        ) as f:
             rows = csv.DictReader(
                 line for line in f if not line.lstrip().startswith("#")
             )
@@ -717,8 +685,6 @@ def _load_tuned_bv_table() -> dict[tuple, int]:
                     int(row["max_seq_chunks"]),
                 )
                 bv_int = int(bv)
-                # One physical shape can appear under two model names, so a
-                # duplicate key is fine; a disagreeing one must not pass quietly.
                 if table.get(key, bv_int) != bv_int:
                     warnings.warn(
                         f"chunk_gdn_h_mfma16_hip tuned table disagrees on "
@@ -749,12 +715,7 @@ def _tuned_bv(
     total_chunks: int,
     max_seq_chunks: int,
 ) -> int | None:
-    """Measured BV for this exact batch shape, or None to use the rule.
-
-    Exact rather than nearest-neighbour: the key is all host-side, so this is
-    one dict probe (~0.09us against ~46us of wrapper host time), and an
-    unmeasured shape takes the rule instead of a neighbour's tile.
-    """
+    """Measured BV for this batch shape, or None to use the rule."""
     if not _BV_TUNED_TABLE:
         return None
     return _BV_TUNED_TABLE.get(
@@ -1001,10 +962,8 @@ def chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(
     contract via ``initial_state_indices`` / ``inplace_final_state``, matching
     ``chunk_gated_delta_rule_fwd_h_hip_fn``).
 
-    Unlike the baseline wrapper, BV is chosen by a frozen, self-contained copy
-    of the hip K5 LDS/CU selector (``_hipeq_select_bv``) so it matches the
-    hand-tuned HIP kernel today without importing its private API;
-    ``FLYDSL_K5_MFMA16HIP_BV`` (in {16,32,64}) overrides it for A/B sweeps.
+    Unlike the baseline wrapper, BV is ``_tuned_bv`` then ``_hipeq_select_bv``;
+    ``FLYDSL_K5_MFMA16HIP_BV`` (in {16,32,64}) overrides both for A/B sweeps.
 
     ``state_dtype`` controls the persistent initial/final state, while
     ``snapshot_dtype`` independently controls the per-chunk ``h`` snapshots and
@@ -1263,11 +1222,7 @@ def chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(
     else:
         si_i32 = None
 
-    # BV selection: use the frozen, self-contained copy of the hip K5 LDS/CU
-    # selector (``_hipeq_select_bv`` above) so this fork picks the same BV as
-    # the hand-tuned HIP kernel today, without importing its private API.
-    # dense: total_chunks = B*NT, max_seq_chunks = NT (NT = cdiv(T, BT));
-    # varlen: prebuilt metadata, else off chunk_offsets once (cached there).
+    # BV: tuned table, then hip LDS/CU rule; env override wins last.
     if is_varlen:
         _total_chunks, _max_seq_chunks = (
             host_chunk_meta
@@ -1276,7 +1231,6 @@ def chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(
         )
     else:
         _total_chunks, _max_seq_chunks = B * NT, NT
-    # Measured value first, rule for everything the table does not cover.
     BV = _tuned_bv(
         H=H,
         Hg=Hg,
