@@ -55,6 +55,14 @@ def dedupe_jobs(jobs: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return unique_jobs
 
 
+def compile_failure_info(error: BaseException) -> dict[str, str]:
+    """Return machine-readable failure metadata for a deterministic compile error."""
+    return {
+        "kind": "compile_error",
+        "reason": f"{type(error).__name__}: {error}",
+    }
+
+
 def collect_aot_jobs(
     csv_paths: list[str],
     parse_csv: Callable[[str], list[dict[str, Any]]],
@@ -188,6 +196,7 @@ def run_aot(cache_dir: str) -> None:
 
     ok_by_kind: dict[OpKind, int] = {kind: 0 for kind in OpKind}
     fail_by_kind: dict[OpKind, int] = {kind: 0 for kind in OpKind}
+    failure_causes: dict[str, int] = {}
     errors: list[str] = []
     for (kind, job), result in zip(all_jobs, results):
         if result.get("compile_time") is not None:
@@ -195,9 +204,17 @@ def run_aot(cache_dir: str) -> None:
         else:
             fail_by_kind[kind] += 1
             kernel_name = str(job.get("kernel_name", "?"))
+            failure = result.get("failure")
+            if isinstance(failure, dict):
+                failure_kind = str(failure.get("kind", "unknown"))
+                failure_reason = str(failure.get("reason", "no reason reported"))
+            else:
+                failure_kind = "unknown"
+                failure_reason = "no structured failure metadata"
+            failure_causes[failure_kind] = failure_causes.get(failure_kind, 0) + 1
             errors.append(
-                f"FlyDSL {kind.name} {kernel_name} failed to produce a kernel "
-                "(compile error, worker crash, or timeout)"
+                f"FlyDSL {kind.name} {kernel_name} failed "
+                f"[{failure_kind}]: {failure_reason}"
             )
 
     for kind in OpKind:
@@ -217,6 +234,11 @@ def run_aot(cache_dir: str) -> None:
         tally = ", ".join(
             f"{kind.name}: {fail_by_kind[kind]} failed" for kind in OpKind
         )
+        cause_tally = ", ".join(
+            f"{cause}: {count}" for cause, count in sorted(failure_causes.items())
+        )
         raise AssertionError(
-            f"[aiter] FlyDSL AOT failures ({tally}): " + "; ".join(head) + suffix
+            f"[aiter] FlyDSL AOT failures ({tally}; causes: {cause_tally}): "
+            + "; ".join(head)
+            + suffix
         )

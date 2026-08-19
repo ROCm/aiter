@@ -17,6 +17,7 @@ from flydsl.utils.parallel import run_parallel_jobs
 
 from aiter.aot.flydsl.common import (
     collect_aot_jobs,
+    compile_failure_info,
     compile_only_env,
     job_identity,
     override_env,
@@ -416,13 +417,16 @@ def compile_one_config(**job):
         elapsed = time.time() - t0
         return {**job, "compile_time": elapsed, "compile_arch": aot_arch}
     except Exception as e:  # noqa: BLE001
-        # Catch everything and return cleanly with compile_time=None: the AOT pool
-        # keys off exitcode 0 + compile_time=None to mark "produced no kernel" and
-        # NOT retry it. An escaping exception crashes the worker (exitcode != 0),
-        # which the pool misreads as a transient failure and retries -> deadlock.
+        # Return a deterministic compile failure so the scheduler does not retry
+        # it, while preserving the exception details for the parent process.
         print(f"  [FAIL] compile  {shape_str}  arch={aot_arch}: {e}")
         traceback.print_exc()
-        return {**job, "compile_time": None, "compile_arch": aot_arch}
+        return {
+            **job,
+            "compile_time": None,
+            "compile_arch": aot_arch,
+            "failure": compile_failure_info(e),
+        }
 
 
 def main(argv=None):

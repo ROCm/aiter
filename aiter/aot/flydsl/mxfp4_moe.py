@@ -18,7 +18,12 @@ import os
 import sys
 import time
 
-from aiter.aot.flydsl.common import collect_aot_jobs, compile_only_env, override_env
+from aiter.aot.flydsl.common import (
+    collect_aot_jobs,
+    compile_failure_info,
+    compile_only_env,
+    override_env,
+)
 from aiter.jit.core import AITER_CONFIGS, AITER_ROOT_DIR
 
 _MODEL_CONFIG_DIR = f"{AITER_ROOT_DIR}/aiter/configs/model_configs"
@@ -384,6 +389,7 @@ def compile_one_config(**job):
         result["compile_time"] = elapsed
     except Exception as e:  # noqa: BLE001
         print(f"  [FAIL] compile  stage{stage}  {shape_str}: {e}")
+        result["failure"] = compile_failure_info(e)
 
     return result
 

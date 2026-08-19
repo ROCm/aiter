@@ -43,6 +43,7 @@ from flydsl.utils.parallel import run_parallel_jobs
 
 from aiter.aot.flydsl.common import (
     collect_aot_jobs,
+    compile_failure_info,
     compile_only_env,
     cu_num_to_arch,
     job_identity,
@@ -588,6 +589,7 @@ def compile_one_config(
         result["compile_time"] = elapsed
     except Exception as e:  # noqa: BLE001
         print(f"  [FAIL] compile  {shape_str}  arch={aot_arch}: {e}")
+        result["failure"] = compile_failure_info(e)
 
     return result
 
