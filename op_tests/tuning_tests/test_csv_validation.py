@@ -215,9 +215,7 @@ class TestCSVValidation(unittest.TestCase):
 
         gdn_model_untuned = sorted(
             glob.glob(
-                os.path.join(
-                    MODEL_CONFIGS_DIR, "*_chunk_gdn_h_mfma16_hip_untuned.csv"
-                )
+                os.path.join(MODEL_CONFIGS_DIR, "*_chunk_gdn_h_mfma16_hip_untuned.csv")
             )
         )
         self.assertGreaterEqual(

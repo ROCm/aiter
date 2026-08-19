@@ -598,12 +598,8 @@ class TestTunePipeline(unittest.TestCase):
                 mp=None,
             )
             if result.returncode != 0:
-                print(
-                    f"\n=== gdn_k5_mfma16_hip STDOUT ===\n{result.stdout[-2000:]}"
-                )
-                print(
-                    f"\n=== gdn_k5_mfma16_hip STDERR ===\n{result.stderr[-2000:]}"
-                )
+                print(f"\n=== gdn_k5_mfma16_hip STDOUT ===\n{result.stdout[-2000:]}")
+                print(f"\n=== gdn_k5_mfma16_hip STDERR ===\n{result.stderr[-2000:]}")
             self.assertEqual(result.returncode, 0, "gdn_k5_mfma16_hip tuner failed")
             self.assertTrue(os.path.exists(tuned), "gdn_k5: tuned CSV not created")
             df = pd.read_csv(tuned, comment="#")
@@ -765,7 +761,8 @@ class TestOnlineTuneE2E(unittest.TestCase):
             pass
 
         fp8, qtype = _get_platform_dtypes()
-        script = textwrap.dedent(f"""\
+        script = textwrap.dedent(
+            f"""\
             import torch
             from aiter.fused_moe import fused_moe, fused_topk
             from aiter.ops.shuffle import shuffle_weight
@@ -797,7 +794,8 @@ class TestOnlineTuneE2E(unittest.TestCase):
             )
             print(f"OUTPUT_SHAPE={{out.shape}}")
             print(f"OUTPUT_OK={{out.shape[0] == token and out.shape[1] == model_dim}}")
-        """)
+        """
+        )
 
         script_path = os.path.join(tmp_dir, "online_tune_e2e.py")
         with open(script_path, "w") as f:

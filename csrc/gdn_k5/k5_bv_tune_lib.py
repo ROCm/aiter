@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import importlib.util
+import math
 import os
 import re
 import statistics
@@ -66,9 +67,11 @@ def read_csv_rows(path: str) -> list[dict[str, str]]:
     for row in df.to_dict("records"):
         rows.append(
             {
-                key: ""
-                if val is None or (isinstance(val, float) and val != val)
-                else str(val)
+                key: (
+                    ""
+                    if val is None or (isinstance(val, float) and math.isnan(val))
+                    else str(val)
+                )
                 for key, val in row.items()
             }
         )
@@ -262,9 +265,7 @@ def sweep_case_row(
     )
     gain = (times[rule] - times[best]) / times[rule] * 100 if rule in times else 0.0
     cells = " ".join(f"{times.get(bv, float('nan')):8.1f}" for bv in BV_CANDIDATES)
-    print(
-        f"{case_id:58s} {total_chunks:7d} {cells} {best:5d} {rule:5d} {gain:6.1f}"
-    )
+    print(f"{case_id:58s} {total_chunks:7d} {cells} {best:5d} {rule:5d} {gain:6.1f}")
 
     if only_improvements and best == rule:
         return None
@@ -313,9 +314,7 @@ def dataframe_from_cases(selected: list[tuple[str, Any]]) -> pd.DataFrame:
     for case_id, case in selected:
         snapshot_dtype = case_snapshot_dtype(case)
         batch = 1 if case.is_varlen else case.dense_batch
-        total_chunks, max_seq_chunks = chunk_counts(
-            case.resolve_context_lens(), batch
-        )
+        total_chunks, max_seq_chunks = chunk_counts(case.resolve_context_lens(), batch)
         row = case_to_tuned_row(
             case,
             snapshot_dtype,

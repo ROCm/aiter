@@ -10,11 +10,6 @@ from typing import Any, ClassVar
 
 import pandas as pd
 import torch
-
-from aiter import logger
-from aiter.jit.core import AITER_ROOT_DIR
-from aiter.utility.base_tuner import TunerCommon, _read_csv
-
 from k5_bv_tune_lib import (
     BV_CANDIDATES,
     LOOKUP_KEYS,
@@ -32,9 +27,11 @@ from k5_bv_tune_lib import (
     sweep_case_row,
 )
 
-_DEFAULT_UNTUNED = (
-    f"{AITER_ROOT_DIR}/aiter/configs/chunk_gdn_h_mfma16_hip_untuned.csv"
-)
+from aiter import logger
+from aiter.jit.core import AITER_ROOT_DIR
+from aiter.utility.base_tuner import TunerCommon
+
+_DEFAULT_UNTUNED = f"{AITER_ROOT_DIR}/aiter/configs/chunk_gdn_h_mfma16_hip_untuned.csv"
 _DEFAULT_TUNED = f"{AITER_ROOT_DIR}/aiter/configs/chunk_gdn_h_mfma16_hip_tuned.csv"
 _RESULT_COLS = [c for c in TUNED_COLUMNS if c not in LOOKUP_KEYS]
 
@@ -218,7 +215,9 @@ class K5BvTuner(TunerCommon):
                     status = "ok"
                     print(f"{shape} | {live_us:>10.1f} | OK")
                 else:
-                    status = f"mismatch: live_us drift {delta:.1f}% vs csv (tol {tol:.1f}%)"
+                    status = (
+                        f"mismatch: live_us drift {delta:.1f}% vs csv (tol {tol:.1f}%)"
+                    )
                     print(f"{shape} | {live_us:>10.1f} | MISMATCH")
                     print(f"reason: {status[len('mismatch:'):].strip()}")
             except Exception as exc:  # noqa: BLE001
@@ -279,9 +278,7 @@ class K5BvTuner(TunerCommon):
             print(self.failed, flush=True)
             sys.exit(1)
         if self.success.empty and not self.untunedf.empty:
-            logger.error(
-                "\033[91m[Tuning not Finished]\033[0m no shapes were tuned"
-            )
+            logger.error("\033[91m[Tuning not Finished]\033[0m no shapes were tuned")
             sys.exit(1)
 
     def getKernelName(self, kernel_id):
