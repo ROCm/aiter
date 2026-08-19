@@ -110,10 +110,10 @@ DINLINE opus::fp32_t downcast_s<opus::fp32_t>(opus::fp32_t val)
 // gfx1250 AR supports world_size <= 4; size scratch for the max.
 constexpr int    kLLMaxRanks       = 4;
 // Route to LL when bytes <= this (matches RCCL DDA_ALLREDUCE_LL_THRESHOLD).
-constexpr size_t kLLArMaxBytes     = 131072;            // 128 KiB
+constexpr size_t kLLArMaxBytes     = 4194304;           // 4 MiB
 // Hard per-message payload cap (one slot). Comfortably above the routing
 // threshold so all dtypes at <=128 KiB fit.
-constexpr size_t kLLScratchCapBytes = 262144;           // 256 KiB
+constexpr size_t kLLScratchCapBytes = 4194304;          // 4 MiB
 // Per-rank staging slot capacity, in 8-byte packets.
 constexpr size_t kLLPackCapacity   = kLLScratchCapBytes / 8;  // 32768
 
@@ -219,7 +219,7 @@ DINLINE void ll_load_b128(
 // double-buffered (bank = epoch & 1); the per-epoch flag disambiguates stale
 // lines, so no clearing is needed and it survives CUDA-graph replay.
 template <typename T, int ngpus>
-__global__ void __launch_bounds__(256, 2) ar_ll_gfx1250(
+__global__ void __launch_bounds__(512, 1) ar_ll_gfx1250(
     T* const* __restrict__ peer_scratch, // ngpus scratch bases (device table)
     T* __restrict__ recvbuff,
     const T* __restrict__ sendbuff,
@@ -1082,7 +1082,7 @@ public:
         const size_t bytes = (size_t)numel * sizeof(T);
         const size_t nPk   = bytes >> 3; // 8 payload bytes per packet
 
-        constexpr int threads = 256;
+        const int threads = (bytes < 65536) ? 512 : 256;
         int blocks = std::min<int>(kMaxBlocks, (int)((nPk + threads - 1) / threads));
         if(blocks < 1)
             blocks = 1;
