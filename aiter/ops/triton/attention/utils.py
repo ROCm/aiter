@@ -53,9 +53,9 @@ def block_attn_mask_to_ragged_lut(
     if return_none_if_dense and block_attn_mask.all():
         return None
 
-    counts = block_attn_mask.to(torch.int32).sum(dim=-1)
+    counts = block_attn_mask.sum(dim=-1, dtype=torch.int32)
     lut_count = counts.reshape(-1)
-    lut_start = torch.cumsum(lut_count, dim=0) - lut_count
+    lut_start = torch.cumsum(lut_count, dim=0, dtype=torch.int32) - lut_count
 
     # NOTE: Overallocating the LUT is a waste of memory, but the
     # alternative lut_count.sum(), will cause graph break with torch compile.

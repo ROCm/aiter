@@ -712,7 +712,7 @@ def _moe_gemm_a4w4_prefill(
         PRESHUFFLE_FACTOR_WS: gl.constexpr = 32
         SHUFFLED_BLOCK_K_WS: gl.constexpr = MX_SCALE_BLOCK_K * PRESHUFFLE_FACTOR_WS
         SHUFFLED_BLOCK_N_WS: gl.constexpr = BLOCK_N // PRESHUFFLE_FACTOR_WS
-        SCALE_KWIDTH: gl.constexpr = 8
+        SCALE_KWIDTH: gl.constexpr = 4
     else:
         PRESHUFFLE_FACTOR_WS: gl.constexpr = 1
         SHUFFLED_BLOCK_K_WS: gl.constexpr = MX_SCALE_BLOCK_K
@@ -1374,7 +1374,7 @@ def _moe_gemm_a4w4_decode(
         PRESHUFFLE_FACTOR_WS: gl.constexpr = 32
         SHUFFLED_BLOCK_K_WS: gl.constexpr = MX_SCALE_BLOCK_K * PRESHUFFLE_FACTOR_WS
         SHUFFLED_BLOCK_N_WS: gl.constexpr = BLOCK_N // PRESHUFFLE_FACTOR_WS
-        SCALE_KWIDTH: gl.constexpr = 8
+        SCALE_KWIDTH: gl.constexpr = 4
     else:
         PRESHUFFLE_FACTOR_WS: gl.constexpr = 1
         SHUFFLED_BLOCK_K_WS: gl.constexpr = MX_SCALE_BLOCK_K
