@@ -16,6 +16,7 @@ from codegen import gen_instances_gfx942 as _gfx942  # noqa: F401
 from codegen import gen_instances_gfx950 as _gfx950  # noqa: F401
 from codegen import gen_instances_gfx1250 as _gfx1250  # noqa: F401
 from codegen.common import (
+    _A16W16_CO_TAGS,
     _A16W16_TAGS,
     _GFX942_A16W16_TAGS,
     _NOSPLIT,
@@ -214,6 +215,11 @@ INPUT_DTYPE_MAP = {
 
 # All a16w16 tags share the 4-arg (XQ, WQ, Y, int splitK) lookup-table slot.
 A16W16_TUNE_TAGS = set(_A16W16_TAGS)
+# ... except the pre-compiled (.co) families, which get their own flat-array
+# dispatch table. Their launcher signature has no workspace, so a function
+# pointer to one does not fit the arch's OpusA16W16NoscaleKernel type and it
+# cannot share a table with the split-K kids.
+A16W16_CO_TUNE_TAGS = set(_A16W16_CO_TAGS)
 A8W8_TUNE_TAGS = {"a8w8_blockscale_bpreshuffle_singlebuf"}
 # NOSCALE: 3-arg launchers (a16w16 family + a8w8 non-scale).
 NOSCALE_TAGS = A16W16_TUNE_TAGS | {"a8w8"}
@@ -632,6 +638,12 @@ class opus_gemm_codegen:
                     row_outdtype = str(mnk[3])
                     if target_outdtype is not None and row_outdtype != target_outdtype:
                         continue
+                # Pre-compiled (.co) kids have their own function-pointer type
+                # (no workspace argument), so they cannot go in this table --
+                # they go in the parallel CO table emitted by _emit_co_map()
+                # below, which the gfx1250 dispatch consults first.
+                if k.kernel_tag in A16W16_CO_TUNE_TAGS:
+                    continue
                 is_splitk = k.kernel_tag in SPLITK_TAGS
                 if not is_splitk and ctype not in k.output_dtypes:
                     continue
@@ -651,6 +663,45 @@ class opus_gemm_codegen:
                 f.write(line)
             f.write("\n")
 
+        def _emit_co_map(f, macro_name: str, arch: str):
+            """The (M, N, K) table for the pre-compiled (.co) families.
+
+            Its own macro (and no CTYPE parameter) because these launchers take
+            no workspace argument, so their function pointers do not fit the
+            arch's shared entry type. Without this table a tuned CSV row naming
+            a .co winner was silently dropped from the runtime lookup: the
+            Python path honoured it while the C++ `opus_gemm` entry fell back to
+            the heuristic for the same shape.
+            """
+            f.write(f"#define {macro_name}() \\\n")
+            rows = []
+            for mnk, k in kernels_dict.items():
+                if not (isinstance(mnk, tuple) and mnk[0] > 0):
+                    continue
+                if k.kernel_tag not in A16W16_CO_TUNE_TAGS:
+                    continue
+                if _kid_arch_common(k) != arch:
+                    continue
+                # One output dtype per co family, and it is the real C dtype (no
+                # workspace to stand in for it), so rows whose CSV outdtype is
+                # something else cannot run on this kid.
+                if len(mnk) >= 4:
+                    want = ctype_to_outdtype.get(k.output_dtypes[0])
+                    if want is not None and str(mnk[3]) != want:
+                        continue
+                rows.append(
+                    (int(mnk[0]), int(mnk[1]), int(mnk[2]), k.name, k.output_dtypes[0])
+                )
+
+            rows.sort(key=lambda r: (r[0], r[1], r[2]))
+            n = len(rows)
+            for i, (M, N, K, name, ctype) in enumerate(rows):
+                line = f"    {{ {{{M}, {N}, {K}}}, &{name}<{ctype}> }}, \\\n"
+                if i == n - 1:
+                    line = line.rstrip().rstrip("\\").rstrip() + "\n"
+                f.write(line)
+            f.write("\n")
+
         with open(os.path.join(self.working_path, "opus_gemm_lookup.h"), "w") as f:
             f.write(HEADER)
             for arch in LOOKUP_MACRO_ARCHES:
@@ -661,6 +712,7 @@ class opus_gemm_codegen:
                 _emit_map(
                     f, f"GENERATE_OPUS_LOOKUP_TABLE_FP32_{suffix}", "fp32_t", arch
                 )
+                _emit_co_map(f, f"GENERATE_OPUS_LOOKUP_TABLE_CO_{suffix}", arch)
 
     def gen_a16w16_tune_lookup(self, kernels_dict):
         """Emit opus_gemm_a16w16_tune_lookup.h with int-ID-to-kernel maps for tuning.
@@ -700,11 +752,21 @@ class opus_gemm_codegen:
     {{ {kid}, &{kernel_name}<CTYPE> }},  \\
 """
 
+        # Pre-compiled (.co) kids take a launcher signature with no workspace,
+        # so their function pointers do not fit the arch's shared entry type.
+        # They are emitted into a separate macro with no CTYPE parameter: each
+        # co family is instantiated for exactly one output dtype.
+        CO_ENTRY = """\
+    {{ {kid}, &{kernel_name}<{ctype}> }},  \\
+"""
+
         def _emit_map(f, macro_name, ctype, arch):
             f.write(f"#define {macro_name}(CTYPE) \\\n")
             rows = []
             for kid, k in kernels_dict.items():
                 if not (isinstance(kid, int) and k.kernel_tag in A16W16_TUNE_TAGS):
+                    continue
+                if k.kernel_tag in A16W16_CO_TUNE_TAGS:
                     continue
                 if ctype not in k.output_dtypes:
                     continue
@@ -715,6 +777,30 @@ class opus_gemm_codegen:
             n = len(rows)
             for i, (kid, name) in enumerate(rows):
                 line = ENTRY.format(kid=kid, kernel_name=name)
+                if i == n - 1:
+                    line = line.rstrip().rstrip("\\").rstrip() + "\n"
+                f.write(line)
+            f.write("\n")
+
+        def _emit_co_map(f, macro_name, arch):
+            f.write(f"#define {macro_name}() \\\n")
+            rows = []
+            for kid, k in kernels_dict.items():
+                if not (isinstance(kid, int) and k.kernel_tag in A16W16_CO_TUNE_TAGS):
+                    continue
+                if _kid_arch_common(k) != arch:
+                    continue
+                # One output dtype per co family (asserted, because a second one
+                # would silently drop an entry here).
+                assert len(k.output_dtypes) == 1, (
+                    f"co kid {kid} ({k.name}) must have exactly one output dtype; "
+                    f"got {k.output_dtypes}"
+                )
+                rows.append((kid, k.name, k.output_dtypes[0]))
+            rows.sort(key=lambda r: r[0])
+            n = len(rows)
+            for i, (kid, name, ctype) in enumerate(rows):
+                line = CO_ENTRY.format(kid=kid, kernel_name=name, ctype=ctype)
                 if i == n - 1:
                     line = line.rstrip().rstrip("\\").rstrip() + "\n"
                 f.write(line)
@@ -734,6 +820,7 @@ class opus_gemm_codegen:
                 _emit_map(
                     f, f"GENERATE_A16W16_TUNE_LOOKUP_FP32_{suffix}", "fp32_t", arch
                 )
+                _emit_co_map(f, f"GENERATE_A16W16_CO_TUNE_LOOKUP_{suffix}", arch)
 
     def gen_a8w8_tune_lookup(self, kernels_dict):
         """Emit the int-ID-to-kernel map for A8W8 tuning."""
@@ -893,6 +980,10 @@ void
     aiter_tensor_t &w_scale,
     int splitK);
 """
+        # The gfx1250 split-K families take the 6-arg (workspace-carrying)
+        # launcher signature. The pre-compiled .co families do NOT -- they have
+        # no workspace to pass -- so they fall through to the ordinary 5-arg
+        # a16w16 declaration below.
         GFX1250_SPLITK_TAGS = {
             "a16w16_cluster_tdm_splitk_ws",
             "a16w16_clusterlaunch_tdm_splitk_ws",

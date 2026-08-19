@@ -327,7 +327,8 @@
         "flags_extra_hip": [
             "'-mllvm --amdgpu-mfma-vgpr-form'",
             "('-mllvm -amdgpu-expert-scheduling-mode' if (get_gfx() == 'gfx1250' or 'gfx1250' in os.environ.get('GPU_ARCHS', '')) else '')",
-            "('-mllvm -enable-post-misched=1' if (get_gfx() == 'gfx1250' or 'gfx1250' in os.environ.get('GPU_ARCHS', '')) else '')"
+            "('-mllvm -enable-post-misched=1' if (get_gfx() == 'gfx1250' or 'gfx1250' in os.environ.get('GPU_ARCHS', '')) else '')",
+            "f'-DOPUS_GEN_CO_DIR=\\\\\"{AITER_CSRC_DIR}/opus_gemm/gen_co\\\\\"'"
         ],
         "flags_extra_hip_per_source": {
             "*a8w8_bs_bpreshuf*.device.cu": [

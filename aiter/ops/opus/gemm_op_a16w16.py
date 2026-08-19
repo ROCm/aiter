@@ -321,10 +321,13 @@ def opus_gemm_a16w16_tune(
         splitK = new_splitK
         bias = None
     _check_a16w16_tune_layout(XQ, WQ, Y)
-    # gfx1250 split-K kids [20000, 30000) need a workspace tensor allocated
-    # externally (torch.empty) and passed to the C++ launcher.
+    # split-K kids need a workspace tensor allocated externally (torch.empty)
+    # and passed to the C++ launcher. Asked through is_splitk_kid() rather than
+    # a literal range: the gfx1250 band is not contiguous (the pre-compiled .co
+    # kids at [21000, 23000) sit inside it and take no workspace at all), and a
+    # second spelling of the range is a second thing to keep in sync.
     workspace = None
-    if 20000 <= kernelId < 30000:
+    if is_splitk_kid(kernelId):
         batch, M, N = Y.shape
         workspace = _alloc_splitk_workspace(kernelId, batch, M, N, splitK, XQ.device)
     # Mono-tile kid guard: the launcher requires N / K to be tile-aligned
@@ -414,6 +417,8 @@ _SPLITK_KID_RANGES = (
     (1200, 1300),  # gfx950 non-OOB mirror (+1000)
     (10200, 10300),  # gfx942 (+10000)
     (20000, 21000),  # gfx1250 cluster/TDM split-K
+    # [21000, 27000) is the pre-compiled .co family -- NOT split-K, no workspace.
+    (27000, 30000),  # gfx1250 fused single-kernel split-K (currently unregistered)
 )
 
 

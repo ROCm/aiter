@@ -86,6 +86,7 @@ _patch_flaky_hip_device_count()
 # opus_gemm_common is a sibling file in csrc/opus_gemm/.
 from opus_gemm_common import (
     BIAS_AWARE_KIDS,
+    GFX1250_4WAVE_CO_KIDS,
     GFX1250_CLUSTERLAUNCH_KID_OF,
     GFX1250_PLAIN_KID_OF,
     GFX1250_SPLITK_FUSE_ENABLED,
@@ -108,6 +109,7 @@ from opus_gemm_common import (
     a16w16_persistent_kernels_list_nooob,
     gfx942_nosplit_kernels_list,
     gfx942_splitk_kernels_list,
+    gfx1250_4wave_co_kernels_list,
     gfx1250_clusterlaunch_kernels_list,
     gfx1250_kernels_list,
     gfx1250_splitk_fuse_kernels_list,
@@ -435,6 +437,13 @@ def _gfx1250_select_candidates(
     # the sweep is 496 kids (28 plain + 468 clusterlaunch) and not ~1.9k.
     if GFX1250_SPLITK_FUSE_ENABLED:
         sel |= _gfx1250_fuse_candidates(M, N, K, cu_num)
+
+    # Pre-compiled (.co) kids. Added wholesale rather than scored: the family is
+    # a handful of hand-picked variants from gen_co/co_kernels.json (not a swept
+    # tile space), each one already the answer to "which tile/cluster/VGPR combo
+    # do we want to try", so there is nothing for the tile ranking above to pick
+    # between. kid_rejects_shape drops the ones this shape cannot run.
+    sel |= set(GFX1250_4WAVE_CO_KIDS)
     return frozenset(sel)
 
 
@@ -454,6 +463,12 @@ def candidate_splitK(M: int, N: int, K: int, batch: int, cu_num: int, k_inst):
     range. We compute the same per-slice budget the host reject uses and
     silently drop any split_k that would push workspace past 4 GiB.
     """
+    # Pre-compiled (.co) kids have no split-K at all: no workspace, no partials,
+    # no reduce kernel, and the launcher AITER_CHECKs splitK <= 1. Probing any
+    # other value would just collect exceptions.
+    if k_inst.kernel_tag == "a16w16_4wave_co":
+        return [0]
+
     B_K = k_inst.B_K
     total_iters = _ceil_div(K, B_K)
     # gfx1250 cluster/TDM split-K triple-buffers but tolerates any k_steps>=1
@@ -556,6 +571,17 @@ def kid_rejects_shape(k_inst, M, N, K):
             splitk main kernel's mask_va_tail cover both edge cases, so
             splitk is safe for any (M, N, K).
     """
+    # Pre-compiled (.co) kids: answered first, because almost none of the rules
+    # below apply to them. The pipeline builds NO buffer resource at all (it is
+    # the only a16w16 pipeline with zero make_gmem -- A, B and C all ride TDM
+    # descriptors with 64-bit base and stride), so the 4 GiB filter underneath
+    # is not merely satisfied, it is inapplicable. Every tail is handled by the
+    # D#'s per-dimension saturating clamp, so no M/N/K alignment is required
+    # either. What IS required: the batch strides are int64 but m/n/k are int,
+    # and the traits assert the tile it was compiled for.
+    if k_inst.kernel_tag == "a16w16_4wave_co":
+        return M < 1 or N < 1 or K < 1
+
     # 4 GiB buffer-resource filter. Legacy a16w16 kids build a single
     # AMDGPU buffer-resource per tensor (A/B/C), whose `num_records` field
     # is 32-bit -- any of the three exceeding UINT32_MAX bytes wraps and
@@ -1149,6 +1175,7 @@ a16w16_all_kernels = {
     **gfx1250_kernels_list,
     **gfx1250_clusterlaunch_kernels_list,
     **gfx1250_splitk_fuse_kernels_list,
+    **gfx1250_4wave_co_kernels_list,
 }
 
 # Arch-filter the kid enumeration so the tuner only dispatches kids whose pipeline body has a

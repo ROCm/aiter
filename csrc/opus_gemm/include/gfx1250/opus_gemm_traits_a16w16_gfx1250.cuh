@@ -20,6 +20,7 @@
 
 #include "../opus_gemm_utils.cuh"
 
+#include <cstdint>
 #include <type_traits>
 
 // ── Consumer-wave tiling layout ─────────────────────────────────────────────
@@ -106,6 +107,148 @@ struct opus_gemm_splitk_fuse_kargs_gfx1250
     int num_tiles_n;       // ceil(N / B_N)
 };
 #endif
+
+#ifndef OPUS_GEMM_4WAVE_COMPUTE_KARGS_GFX1250_DEFINED
+#define OPUS_GEMM_4WAVE_COMPUTE_KARGS_GFX1250_DEFINED
+// Kernel arguments for the gfx1250 a16w16 SYMMETRIC 4-wave compute pipeline
+// (kernel_tag a16w16_4wave_co). Shorter than the split-K kargs above because
+// this pipeline has no workspace, no split_k and no bias: every wave both
+// TDM-loads and runs WMMA, and bf16 C is stored straight out through LDS.
+//
+// This kernel is compiled by HIP (not hand-written asm), so it uses the plain
+// C++ kernarg ABI -- do NOT add `packed` or p2/p3 padding members the way the
+// asm .co kargs structs do. Host and device share this one definition, so the
+// two cannot drift.
+// EXACTLY 64 BYTES, and it must stay that way: built with -D__HIPCC_RTC__ the
+// .co has a single by-value kernarg and no hidden/implicit args, so this struct
+// IS the kernarg segment. build_info.json records kernarg_segment_size, which
+// makes "still 64" the regression signal that the ABI has not drifted.
+//
+// The batch strides are 64-bit ELEMENT counts: they cross 2^31 at 4 GiB of bf16,
+// and int arithmetic there is UB long before the hardware minds. The budget for
+// that came from dropping two fields rather than growing the struct:
+//   * a batch COUNT -- grid.z already carries it, the kernel never read it;
+//   * a C batch stride -- the kernel derives m * stride_c, which also stays
+//     correct for a row-padded C, unlike the M * N the host used to pass.
+struct opus_gemm_4wave_compute_kargs_gfx1250 {
+    const void* __restrict__ ptr_a;   //  0  bf16 [batch, M, K]
+    const void* __restrict__ ptr_b;   //  8  bf16 [batch, N, K]  (C = A * B^T)
+    void*       __restrict__ ptr_c;   // 16  bf16 [batch, M, N]
+    int64_t stride_a_batch;           // 24  = M * stride_a
+    int64_t stride_b_batch;           // 32  = N * stride_b
+    int m;                            // 40
+    int n;                            // 44
+    int k;                            // 48
+    int stride_a;                     // 52  A row pitch (>= K)
+    int stride_b;                     // 56  B row pitch (>= K)
+    int stride_c;                     // 60  C row pitch (>= N)
+};
+static_assert(sizeof(opus_gemm_4wave_compute_kargs_gfx1250) == 64,
+              "the 4wave_co kernarg segment is baked into the pre-built .co at "
+              "64 bytes -- changing this size means rebuilding gen_co/*/*.co");
+#endif
+
+// ── 4wave_compute user traits ───────────────────────────────────────────────
+// The compile-time config for the symmetric 4-wave pipeline. Member names are
+// the UPPER_CASE spellings the pipeline body already reads, kept verbatim from
+// the standalone kernel this was ported from: the register pinning in that body
+// is fragile enough (see the pipeline header) that renaming through it is not
+// worth the risk. k-prefixed aliases are added for the host launcher, which
+// follows the aiter convention.
+//
+// CLUSTER_WG_M / CLUSTER_WG_N are template parameters rather than the hardcoded
+// 4/4 of the standalone, so the instance table can sweep cluster geometry.
+template<int BLOCK_SIZE_,
+         int B_M_, int B_N_, int B_K_,
+         int NUM_SLOTS_,
+         typename D_A_, typename D_B_, typename D_C_, typename D_ACC_,
+         int CLUSTER_WG_M_ = 4,
+         int CLUSTER_WG_N_ = 4>
+struct opus_a16w16_4wave_compute_traits_gfx1250 {
+    static constexpr int BLOCK_SIZE = BLOCK_SIZE_;   // 128 = 4 waves x 32
+
+    static constexpr int B_M = B_M_;
+    static constexpr int B_N = B_N_;
+    static constexpr int B_K = B_K_;
+
+    using D_A   = D_A_;
+    using D_B   = D_B_;
+    using D_C   = D_C_;
+    using D_ACC = D_ACC_;
+    static_assert(std::is_same<D_A, D_B>::value, "A/B dtype must match");
+
+    static constexpr int VEC_A = 16 / (int)sizeof(D_A);   // 8 for bf16 (b128 ds_read)
+    static constexpr int VEC_B = 16 / (int)sizeof(D_B);
+
+    // LDS prefetch ring depth. The pipeline keeps 2 TDMs in flight and reuses
+    // slot g%P three steps later, so P >= 3 keeps g, g+1, g+2 distinct.
+    static constexpr int NUM_SLOTS = NUM_SLOTS_;
+    // How many slots the K loop may use is a property of the PIPELINE, not of the
+    // geometry, so each pipeline asserts its own bound.
+    static_assert(NUM_SLOTS >= 2, "the ring needs at least two slots");
+
+    // Cluster-launch multicast geometry: a CLUSTER_WG_M x CLUSTER_WG_N grid of
+    // workgroups per cluster. A is multicast to the CLUSTER_WG_N peers sharing
+    // an M row, B to the CLUSTER_WG_M peers sharing an N column.
+    static constexpr int CLUSTER_WG_M = CLUSTER_WG_M_;
+    static constexpr int CLUSTER_WG_N = CLUSTER_WG_N_;
+    // TDM multicast fans out to at most 5 WGs per group, and the per-cluster
+    // workgroup_mask is 16-bit.
+    static_assert(CLUSTER_WG_M >= 1 && CLUSTER_WG_N >= 1 &&
+                  CLUSTER_WG_M <= 5 && CLUSTER_WG_N <= 5 &&
+                  CLUSTER_WG_M * CLUSTER_WG_N <= 16,
+                  "cluster dims must be 1..5 per side and <= 16 WGs total");
+
+    // TDM/LDS pad: +16B (one PAD_ELEMS group) per B_K row -> bank-conflict-free
+    // b128 ds_read. Only the ELEMENT geometry lives here, because that is all the
+    // host needs to size LDS; the D# pad_interval/pad_amount encoding is derived
+    // by opus::tdm_traits::padding_auto, and the pipeline static_asserts that its
+    // pitch matches SMEM_PITCH so the two can never drift.
+    static_assert((B_K & (B_K - 1)) == 0, "B_K must be a power of 2 for a single pad per row");
+    static constexpr int PAD_ELEMS    = 16 / (int)sizeof(D_A);   // 8 bf16 = +16B
+    static constexpr int SMEM_PITCH   = B_K + PAD_ELEMS;
+
+    // One LDS slot holds the full B_M x B_K (A) / B_N x B_K (B) tile.
+    static constexpr int SLOT_BYTES_A = B_M * SMEM_PITCH * (int)sizeof(D_A);
+    static constexpr int SLOT_BYTES_B = B_N * SMEM_PITCH * (int)sizeof(D_B);
+    static constexpr int SEG_BYTES_A  = NUM_SLOTS * SLOT_BYTES_A;
+    static constexpr int SEG_BYTES_B  = NUM_SLOTS * SLOT_BYTES_B;
+    static constexpr int LDS_BYTES    = SEG_BYTES_A + SEG_BYTES_B;
+    static_assert(LDS_BYTES <= 320 * 1024, "LDS exceeds the 320KB/CU budget");
+
+    // aiter-convention aliases for the host launcher (which never sees the
+    // pipeline header, only this one).
+    static constexpr int kBlockM        = B_M;
+    static constexpr int kBlockN        = B_N;
+    static constexpr int kBlockK        = B_K;
+    static constexpr int kNumSlots      = NUM_SLOTS;
+    static constexpr int kClusterWgM    = CLUSTER_WG_M;
+    static constexpr int kClusterWgN    = CLUSTER_WG_N;
+    static constexpr int kLdsTotalBytes = LDS_BYTES;
+};
+
+// ── 4wave with a CONFIGURABLE WAVE LAYOUT (a16w16_4wave_wl_co) ──────────────
+// Same geometry as the traits above plus TILE_M x TILE_N, the shape in which the
+// four waves tile the block. TILE_M * TILE_N == 4 (checked in the pipeline).
+// (4, 1) reproduces the fixed layout of the reference traits, so the two agree
+// wherever they overlap; the pipeline that reads this one is
+// opus_gemm_pipeline_a16w16_4wave_wl_gfx1250.cuh. kargs are shared -- the block
+// geometry lives entirely here, so the kernarg struct never changes.
+template<int BLOCK_SIZE_,
+         int B_M_, int B_N_, int B_K_,
+         int NUM_SLOTS_,
+         typename D_A_, typename D_B_, typename D_C_, typename D_ACC_,
+         int CLUSTER_WG_M_ = 4,
+         int CLUSTER_WG_N_ = 4,
+         int TILE_M_ = 4,
+         int TILE_N_ = 1>
+struct opus_a16w16_4wave_wl_traits_gfx1250
+    : opus_a16w16_4wave_compute_traits_gfx1250<BLOCK_SIZE_, B_M_, B_N_, B_K_, NUM_SLOTS_,
+                                               D_A_, D_B_, D_C_, D_ACC_,
+                                               CLUSTER_WG_M_, CLUSTER_WG_N_> {
+    static constexpr int TILE_M = TILE_M_;
+    static constexpr int TILE_N = TILE_N_;
+};
 
 // ── User-facing traits = the SINGLE compile-time config the pipeline reads ──
 //   D_A=D_B=bf16, D_ACC=float (WMMA fp32 acc), D_C MUST be float (main kernel

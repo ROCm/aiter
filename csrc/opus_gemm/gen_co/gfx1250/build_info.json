@@ -1,0 +1,6305 @@
+{
+  "arch": "gfx1250",
+  "common_flags": [
+    "-D__HIPCC_RTC__",
+    "-O3",
+    "-std=c++20"
+  ],
+  "device_clang": "clang version 24.0.0git (git@github.com:demonsan/llvm-project.git a23ed35d43a65ca9e229abc9074a64d14009d907)",
+  "hip_clang_path": "/wksp/llvm-project/build/bin",
+  "hipcc": "/opt/rocm/bin/hipcc",
+  "kernels": [
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x128x128_4x1_16x16x32_0x0x0_c1x1_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x128x128_4x1_16x16x32_0x0x0_c1x1_p3_v1024w1.s"
+      },
+      "asm_lines": 3447,
+      "asm_va_vdst0": 16,
+      "asm_wmma": 384,
+      "asm_wmma_dst_hi": 384,
+      "cluster": [
+        1,
+        1
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 2365,
+      "dis_va_vdst0": 16,
+      "dis_wmma": 384,
+      "dis_wmma_dst_hi": 384,
+      "group_segment_fixed_size": 208896,
+      "kernarg_segment_size": 64,
+      "kid": 21016,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_co_128x128x128x128_4x1_16x16x32_0x0x0_c1x1_p3_v1024w1",
+      "tile": [
+        128,
+        128,
+        128
+      ],
+      "traits_args": "128, 128, 128, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 1, 1",
+      "vgpr_count": 512,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x128x128_4x1_16x16x32_0x0x0_c1x2_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x128x128_4x1_16x16x32_0x0x0_c1x2_p3_v1024w1.s"
+      },
+      "asm_lines": 3445,
+      "asm_va_vdst0": 16,
+      "asm_wmma": 384,
+      "asm_wmma_dst_hi": 384,
+      "cluster": [
+        1,
+        2
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 2365,
+      "dis_va_vdst0": 16,
+      "dis_wmma": 384,
+      "dis_wmma_dst_hi": 384,
+      "group_segment_fixed_size": 208896,
+      "kernarg_segment_size": 64,
+      "kid": 21017,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_co_128x128x128x128_4x1_16x16x32_0x0x0_c1x2_p3_v1024w1",
+      "tile": [
+        128,
+        128,
+        128
+      ],
+      "traits_args": "128, 128, 128, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 1, 2",
+      "vgpr_count": 512,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x128x128_4x1_16x16x32_0x0x0_c1x3_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x128x128_4x1_16x16x32_0x0x0_c1x3_p3_v1024w1.s"
+      },
+      "asm_lines": 3445,
+      "asm_va_vdst0": 16,
+      "asm_wmma": 384,
+      "asm_wmma_dst_hi": 384,
+      "cluster": [
+        1,
+        3
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 2365,
+      "dis_va_vdst0": 16,
+      "dis_wmma": 384,
+      "dis_wmma_dst_hi": 384,
+      "group_segment_fixed_size": 208896,
+      "kernarg_segment_size": 64,
+      "kid": 21018,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_co_128x128x128x128_4x1_16x16x32_0x0x0_c1x3_p3_v1024w1",
+      "tile": [
+        128,
+        128,
+        128
+      ],
+      "traits_args": "128, 128, 128, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 1, 3",
+      "vgpr_count": 512,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x128x128_4x1_16x16x32_0x0x0_c1x4_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x128x128_4x1_16x16x32_0x0x0_c1x4_p3_v1024w1.s"
+      },
+      "asm_lines": 3445,
+      "asm_va_vdst0": 16,
+      "asm_wmma": 384,
+      "asm_wmma_dst_hi": 384,
+      "cluster": [
+        1,
+        4
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 2365,
+      "dis_va_vdst0": 16,
+      "dis_wmma": 384,
+      "dis_wmma_dst_hi": 384,
+      "group_segment_fixed_size": 208896,
+      "kernarg_segment_size": 64,
+      "kid": 21019,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_co_128x128x128x128_4x1_16x16x32_0x0x0_c1x4_p3_v1024w1",
+      "tile": [
+        128,
+        128,
+        128
+      ],
+      "traits_args": "128, 128, 128, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 1, 4",
+      "vgpr_count": 512,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x128x128_4x1_16x16x32_0x0x0_c2x1_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x128x128_4x1_16x16x32_0x0x0_c2x1_p3_v1024w1.s"
+      },
+      "asm_lines": 3445,
+      "asm_va_vdst0": 16,
+      "asm_wmma": 384,
+      "asm_wmma_dst_hi": 384,
+      "cluster": [
+        2,
+        1
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 2366,
+      "dis_va_vdst0": 16,
+      "dis_wmma": 384,
+      "dis_wmma_dst_hi": 384,
+      "group_segment_fixed_size": 208896,
+      "kernarg_segment_size": 64,
+      "kid": 21020,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_co_128x128x128x128_4x1_16x16x32_0x0x0_c2x1_p3_v1024w1",
+      "tile": [
+        128,
+        128,
+        128
+      ],
+      "traits_args": "128, 128, 128, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 2, 1",
+      "vgpr_count": 512,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x128x128_4x1_16x16x32_0x0x0_c2x2_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x128x128_4x1_16x16x32_0x0x0_c2x2_p3_v1024w1.s"
+      },
+      "asm_lines": 3452,
+      "asm_va_vdst0": 16,
+      "asm_wmma": 384,
+      "asm_wmma_dst_hi": 384,
+      "cluster": [
+        2,
+        2
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 2365,
+      "dis_va_vdst0": 16,
+      "dis_wmma": 384,
+      "dis_wmma_dst_hi": 384,
+      "group_segment_fixed_size": 208896,
+      "kernarg_segment_size": 64,
+      "kid": 21021,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_co_128x128x128x128_4x1_16x16x32_0x0x0_c2x2_p3_v1024w1",
+      "tile": [
+        128,
+        128,
+        128
+      ],
+      "traits_args": "128, 128, 128, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 2, 2",
+      "vgpr_count": 512,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x128x128_4x1_16x16x32_0x0x0_c2x3_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x128x128_4x1_16x16x32_0x0x0_c2x3_p3_v1024w1.s"
+      },
+      "asm_lines": 3452,
+      "asm_va_vdst0": 16,
+      "asm_wmma": 384,
+      "asm_wmma_dst_hi": 384,
+      "cluster": [
+        2,
+        3
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 2365,
+      "dis_va_vdst0": 16,
+      "dis_wmma": 384,
+      "dis_wmma_dst_hi": 384,
+      "group_segment_fixed_size": 208896,
+      "kernarg_segment_size": 64,
+      "kid": 21022,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_co_128x128x128x128_4x1_16x16x32_0x0x0_c2x3_p3_v1024w1",
+      "tile": [
+        128,
+        128,
+        128
+      ],
+      "traits_args": "128, 128, 128, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 2, 3",
+      "vgpr_count": 512,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x128x128_4x1_16x16x32_0x0x0_c2x4_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x128x128_4x1_16x16x32_0x0x0_c2x4_p3_v1024w1.s"
+      },
+      "asm_lines": 3452,
+      "asm_va_vdst0": 16,
+      "asm_wmma": 384,
+      "asm_wmma_dst_hi": 384,
+      "cluster": [
+        2,
+        4
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 2364,
+      "dis_va_vdst0": 16,
+      "dis_wmma": 384,
+      "dis_wmma_dst_hi": 384,
+      "group_segment_fixed_size": 208896,
+      "kernarg_segment_size": 64,
+      "kid": 21023,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_co_128x128x128x128_4x1_16x16x32_0x0x0_c2x4_p3_v1024w1",
+      "tile": [
+        128,
+        128,
+        128
+      ],
+      "traits_args": "128, 128, 128, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 2, 4",
+      "vgpr_count": 512,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x128x128_4x1_16x16x32_0x0x0_c3x1_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x128x128_4x1_16x16x32_0x0x0_c3x1_p3_v1024w1.s"
+      },
+      "asm_lines": 3445,
+      "asm_va_vdst0": 16,
+      "asm_wmma": 384,
+      "asm_wmma_dst_hi": 384,
+      "cluster": [
+        3,
+        1
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 2366,
+      "dis_va_vdst0": 16,
+      "dis_wmma": 384,
+      "dis_wmma_dst_hi": 384,
+      "group_segment_fixed_size": 208896,
+      "kernarg_segment_size": 64,
+      "kid": 21024,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_co_128x128x128x128_4x1_16x16x32_0x0x0_c3x1_p3_v1024w1",
+      "tile": [
+        128,
+        128,
+        128
+      ],
+      "traits_args": "128, 128, 128, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 3, 1",
+      "vgpr_count": 512,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x128x128_4x1_16x16x32_0x0x0_c3x2_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x128x128_4x1_16x16x32_0x0x0_c3x2_p3_v1024w1.s"
+      },
+      "asm_lines": 3452,
+      "asm_va_vdst0": 16,
+      "asm_wmma": 384,
+      "asm_wmma_dst_hi": 384,
+      "cluster": [
+        3,
+        2
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 2365,
+      "dis_va_vdst0": 16,
+      "dis_wmma": 384,
+      "dis_wmma_dst_hi": 384,
+      "group_segment_fixed_size": 208896,
+      "kernarg_segment_size": 64,
+      "kid": 21025,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_co_128x128x128x128_4x1_16x16x32_0x0x0_c3x2_p3_v1024w1",
+      "tile": [
+        128,
+        128,
+        128
+      ],
+      "traits_args": "128, 128, 128, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 3, 2",
+      "vgpr_count": 512,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x128x128_4x1_16x16x32_0x0x0_c3x3_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x128x128_4x1_16x16x32_0x0x0_c3x3_p3_v1024w1.s"
+      },
+      "asm_lines": 3452,
+      "asm_va_vdst0": 16,
+      "asm_wmma": 384,
+      "asm_wmma_dst_hi": 384,
+      "cluster": [
+        3,
+        3
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 2364,
+      "dis_va_vdst0": 16,
+      "dis_wmma": 384,
+      "dis_wmma_dst_hi": 384,
+      "group_segment_fixed_size": 208896,
+      "kernarg_segment_size": 64,
+      "kid": 21026,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_co_128x128x128x128_4x1_16x16x32_0x0x0_c3x3_p3_v1024w1",
+      "tile": [
+        128,
+        128,
+        128
+      ],
+      "traits_args": "128, 128, 128, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 3, 3",
+      "vgpr_count": 512,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x128x128_4x1_16x16x32_0x0x0_c3x4_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x128x128_4x1_16x16x32_0x0x0_c3x4_p3_v1024w1.s"
+      },
+      "asm_lines": 3452,
+      "asm_va_vdst0": 16,
+      "asm_wmma": 384,
+      "asm_wmma_dst_hi": 384,
+      "cluster": [
+        3,
+        4
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 2364,
+      "dis_va_vdst0": 16,
+      "dis_wmma": 384,
+      "dis_wmma_dst_hi": 384,
+      "group_segment_fixed_size": 208896,
+      "kernarg_segment_size": 64,
+      "kid": 21027,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_co_128x128x128x128_4x1_16x16x32_0x0x0_c3x4_p3_v1024w1",
+      "tile": [
+        128,
+        128,
+        128
+      ],
+      "traits_args": "128, 128, 128, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 3, 4",
+      "vgpr_count": 512,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x128x128_4x1_16x16x32_0x0x0_c4x1_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x128x128_4x1_16x16x32_0x0x0_c4x1_p3_v1024w1.s"
+      },
+      "asm_lines": 3445,
+      "asm_va_vdst0": 16,
+      "asm_wmma": 384,
+      "asm_wmma_dst_hi": 384,
+      "cluster": [
+        4,
+        1
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 2366,
+      "dis_va_vdst0": 16,
+      "dis_wmma": 384,
+      "dis_wmma_dst_hi": 384,
+      "group_segment_fixed_size": 208896,
+      "kernarg_segment_size": 64,
+      "kid": 21028,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_co_128x128x128x128_4x1_16x16x32_0x0x0_c4x1_p3_v1024w1",
+      "tile": [
+        128,
+        128,
+        128
+      ],
+      "traits_args": "128, 128, 128, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 4, 1",
+      "vgpr_count": 512,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x128x128_4x1_16x16x32_0x0x0_c4x2_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x128x128_4x1_16x16x32_0x0x0_c4x2_p3_v1024w1.s"
+      },
+      "asm_lines": 3452,
+      "asm_va_vdst0": 16,
+      "asm_wmma": 384,
+      "asm_wmma_dst_hi": 384,
+      "cluster": [
+        4,
+        2
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 2365,
+      "dis_va_vdst0": 16,
+      "dis_wmma": 384,
+      "dis_wmma_dst_hi": 384,
+      "group_segment_fixed_size": 208896,
+      "kernarg_segment_size": 64,
+      "kid": 21029,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_co_128x128x128x128_4x1_16x16x32_0x0x0_c4x2_p3_v1024w1",
+      "tile": [
+        128,
+        128,
+        128
+      ],
+      "traits_args": "128, 128, 128, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 4, 2",
+      "vgpr_count": 512,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x128x128_4x1_16x16x32_0x0x0_c4x3_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x128x128_4x1_16x16x32_0x0x0_c4x3_p3_v1024w1.s"
+      },
+      "asm_lines": 3452,
+      "asm_va_vdst0": 16,
+      "asm_wmma": 384,
+      "asm_wmma_dst_hi": 384,
+      "cluster": [
+        4,
+        3
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 2364,
+      "dis_va_vdst0": 16,
+      "dis_wmma": 384,
+      "dis_wmma_dst_hi": 384,
+      "group_segment_fixed_size": 208896,
+      "kernarg_segment_size": 64,
+      "kid": 21030,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_co_128x128x128x128_4x1_16x16x32_0x0x0_c4x3_p3_v1024w1",
+      "tile": [
+        128,
+        128,
+        128
+      ],
+      "traits_args": "128, 128, 128, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 4, 3",
+      "vgpr_count": 512,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x128x128_4x1_16x16x32_0x0x0_c4x4_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x128x128_4x1_16x16x32_0x0x0_c4x4_p3_v1024w1.s"
+      },
+      "asm_lines": 3452,
+      "asm_va_vdst0": 16,
+      "asm_wmma": 384,
+      "asm_wmma_dst_hi": 384,
+      "cluster": [
+        4,
+        4
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 2364,
+      "dis_va_vdst0": 16,
+      "dis_wmma": 384,
+      "dis_wmma_dst_hi": 384,
+      "group_segment_fixed_size": 208896,
+      "kernarg_segment_size": 64,
+      "kid": 21031,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_co_128x128x128x128_4x1_16x16x32_0x0x0_c4x4_p3_v1024w1",
+      "tile": [
+        128,
+        128,
+        128
+      ],
+      "traits_args": "128, 128, 128, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 4, 4",
+      "vgpr_count": 512,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x192x128_4x1_16x16x32_0x0x0_c1x1_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x192x128_4x1_16x16x32_0x0x0_c1x1_p3_v1024w1.s"
+      },
+      "asm_lines": 4958,
+      "asm_va_vdst0": 19,
+      "asm_wmma": 576,
+      "asm_wmma_dst_hi": 576,
+      "cluster": [
+        1,
+        1
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 3391,
+      "dis_va_vdst0": 19,
+      "dis_wmma": 576,
+      "dis_wmma_dst_hi": 576,
+      "group_segment_fixed_size": 261120,
+      "kernarg_segment_size": 64,
+      "kid": 21032,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_co_128x128x192x128_4x1_16x16x32_0x0x0_c1x1_p3_v1024w1",
+      "tile": [
+        128,
+        192,
+        128
+      ],
+      "traits_args": "128, 128, 192, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 1, 1",
+      "vgpr_count": 585,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x192x128_4x1_16x16x32_0x0x0_c1x2_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x192x128_4x1_16x16x32_0x0x0_c1x2_p3_v1024w1.s"
+      },
+      "asm_lines": 4953,
+      "asm_va_vdst0": 19,
+      "asm_wmma": 576,
+      "asm_wmma_dst_hi": 576,
+      "cluster": [
+        1,
+        2
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 3391,
+      "dis_va_vdst0": 19,
+      "dis_wmma": 576,
+      "dis_wmma_dst_hi": 576,
+      "group_segment_fixed_size": 261120,
+      "kernarg_segment_size": 64,
+      "kid": 21033,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_co_128x128x192x128_4x1_16x16x32_0x0x0_c1x2_p3_v1024w1",
+      "tile": [
+        128,
+        192,
+        128
+      ],
+      "traits_args": "128, 128, 192, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 1, 2",
+      "vgpr_count": 585,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x192x128_4x1_16x16x32_0x0x0_c1x3_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x192x128_4x1_16x16x32_0x0x0_c1x3_p3_v1024w1.s"
+      },
+      "asm_lines": 4954,
+      "asm_va_vdst0": 19,
+      "asm_wmma": 576,
+      "asm_wmma_dst_hi": 576,
+      "cluster": [
+        1,
+        3
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 3391,
+      "dis_va_vdst0": 19,
+      "dis_wmma": 576,
+      "dis_wmma_dst_hi": 576,
+      "group_segment_fixed_size": 261120,
+      "kernarg_segment_size": 64,
+      "kid": 21034,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_co_128x128x192x128_4x1_16x16x32_0x0x0_c1x3_p3_v1024w1",
+      "tile": [
+        128,
+        192,
+        128
+      ],
+      "traits_args": "128, 128, 192, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 1, 3",
+      "vgpr_count": 585,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x192x128_4x1_16x16x32_0x0x0_c1x4_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x192x128_4x1_16x16x32_0x0x0_c1x4_p3_v1024w1.s"
+      },
+      "asm_lines": 4953,
+      "asm_va_vdst0": 19,
+      "asm_wmma": 576,
+      "asm_wmma_dst_hi": 576,
+      "cluster": [
+        1,
+        4
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 3391,
+      "dis_va_vdst0": 19,
+      "dis_wmma": 576,
+      "dis_wmma_dst_hi": 576,
+      "group_segment_fixed_size": 261120,
+      "kernarg_segment_size": 64,
+      "kid": 21035,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_co_128x128x192x128_4x1_16x16x32_0x0x0_c1x4_p3_v1024w1",
+      "tile": [
+        128,
+        192,
+        128
+      ],
+      "traits_args": "128, 128, 192, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 1, 4",
+      "vgpr_count": 585,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x192x128_4x1_16x16x32_0x0x0_c2x1_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x192x128_4x1_16x16x32_0x0x0_c2x1_p3_v1024w1.s"
+      },
+      "asm_lines": 4954,
+      "asm_va_vdst0": 19,
+      "asm_wmma": 576,
+      "asm_wmma_dst_hi": 576,
+      "cluster": [
+        2,
+        1
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 3393,
+      "dis_va_vdst0": 19,
+      "dis_wmma": 576,
+      "dis_wmma_dst_hi": 576,
+      "group_segment_fixed_size": 261120,
+      "kernarg_segment_size": 64,
+      "kid": 21036,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_co_128x128x192x128_4x1_16x16x32_0x0x0_c2x1_p3_v1024w1",
+      "tile": [
+        128,
+        192,
+        128
+      ],
+      "traits_args": "128, 128, 192, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 2, 1",
+      "vgpr_count": 585,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x192x128_4x1_16x16x32_0x0x0_c2x2_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x192x128_4x1_16x16x32_0x0x0_c2x2_p3_v1024w1.s"
+      },
+      "asm_lines": 4960,
+      "asm_va_vdst0": 19,
+      "asm_wmma": 576,
+      "asm_wmma_dst_hi": 576,
+      "cluster": [
+        2,
+        2
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 3391,
+      "dis_va_vdst0": 19,
+      "dis_wmma": 576,
+      "dis_wmma_dst_hi": 576,
+      "group_segment_fixed_size": 261120,
+      "kernarg_segment_size": 64,
+      "kid": 21037,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_co_128x128x192x128_4x1_16x16x32_0x0x0_c2x2_p3_v1024w1",
+      "tile": [
+        128,
+        192,
+        128
+      ],
+      "traits_args": "128, 128, 192, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 2, 2",
+      "vgpr_count": 585,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x192x128_4x1_16x16x32_0x0x0_c2x3_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x192x128_4x1_16x16x32_0x0x0_c2x3_p3_v1024w1.s"
+      },
+      "asm_lines": 4961,
+      "asm_va_vdst0": 19,
+      "asm_wmma": 576,
+      "asm_wmma_dst_hi": 576,
+      "cluster": [
+        2,
+        3
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 3391,
+      "dis_va_vdst0": 19,
+      "dis_wmma": 576,
+      "dis_wmma_dst_hi": 576,
+      "group_segment_fixed_size": 261120,
+      "kernarg_segment_size": 64,
+      "kid": 21038,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_co_128x128x192x128_4x1_16x16x32_0x0x0_c2x3_p3_v1024w1",
+      "tile": [
+        128,
+        192,
+        128
+      ],
+      "traits_args": "128, 128, 192, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 2, 3",
+      "vgpr_count": 585,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x192x128_4x1_16x16x32_0x0x0_c2x4_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x192x128_4x1_16x16x32_0x0x0_c2x4_p3_v1024w1.s"
+      },
+      "asm_lines": 4960,
+      "asm_va_vdst0": 19,
+      "asm_wmma": 576,
+      "asm_wmma_dst_hi": 576,
+      "cluster": [
+        2,
+        4
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 3390,
+      "dis_va_vdst0": 19,
+      "dis_wmma": 576,
+      "dis_wmma_dst_hi": 576,
+      "group_segment_fixed_size": 261120,
+      "kernarg_segment_size": 64,
+      "kid": 21039,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_co_128x128x192x128_4x1_16x16x32_0x0x0_c2x4_p3_v1024w1",
+      "tile": [
+        128,
+        192,
+        128
+      ],
+      "traits_args": "128, 128, 192, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 2, 4",
+      "vgpr_count": 585,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x192x128_4x1_16x16x32_0x0x0_c3x1_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x192x128_4x1_16x16x32_0x0x0_c3x1_p3_v1024w1.s"
+      },
+      "asm_lines": 4954,
+      "asm_va_vdst0": 19,
+      "asm_wmma": 576,
+      "asm_wmma_dst_hi": 576,
+      "cluster": [
+        3,
+        1
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 3392,
+      "dis_va_vdst0": 19,
+      "dis_wmma": 576,
+      "dis_wmma_dst_hi": 576,
+      "group_segment_fixed_size": 261120,
+      "kernarg_segment_size": 64,
+      "kid": 21040,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_co_128x128x192x128_4x1_16x16x32_0x0x0_c3x1_p3_v1024w1",
+      "tile": [
+        128,
+        192,
+        128
+      ],
+      "traits_args": "128, 128, 192, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 3, 1",
+      "vgpr_count": 585,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x192x128_4x1_16x16x32_0x0x0_c3x2_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x192x128_4x1_16x16x32_0x0x0_c3x2_p3_v1024w1.s"
+      },
+      "asm_lines": 4960,
+      "asm_va_vdst0": 19,
+      "asm_wmma": 576,
+      "asm_wmma_dst_hi": 576,
+      "cluster": [
+        3,
+        2
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 3392,
+      "dis_va_vdst0": 19,
+      "dis_wmma": 576,
+      "dis_wmma_dst_hi": 576,
+      "group_segment_fixed_size": 261120,
+      "kernarg_segment_size": 64,
+      "kid": 21041,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_co_128x128x192x128_4x1_16x16x32_0x0x0_c3x2_p3_v1024w1",
+      "tile": [
+        128,
+        192,
+        128
+      ],
+      "traits_args": "128, 128, 192, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 3, 2",
+      "vgpr_count": 585,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x192x128_4x1_16x16x32_0x0x0_c3x3_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x192x128_4x1_16x16x32_0x0x0_c3x3_p3_v1024w1.s"
+      },
+      "asm_lines": 4961,
+      "asm_va_vdst0": 19,
+      "asm_wmma": 576,
+      "asm_wmma_dst_hi": 576,
+      "cluster": [
+        3,
+        3
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 3390,
+      "dis_va_vdst0": 19,
+      "dis_wmma": 576,
+      "dis_wmma_dst_hi": 576,
+      "group_segment_fixed_size": 261120,
+      "kernarg_segment_size": 64,
+      "kid": 21042,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_co_128x128x192x128_4x1_16x16x32_0x0x0_c3x3_p3_v1024w1",
+      "tile": [
+        128,
+        192,
+        128
+      ],
+      "traits_args": "128, 128, 192, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 3, 3",
+      "vgpr_count": 585,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x192x128_4x1_16x16x32_0x0x0_c3x4_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x192x128_4x1_16x16x32_0x0x0_c3x4_p3_v1024w1.s"
+      },
+      "asm_lines": 4960,
+      "asm_va_vdst0": 19,
+      "asm_wmma": 576,
+      "asm_wmma_dst_hi": 576,
+      "cluster": [
+        3,
+        4
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 3391,
+      "dis_va_vdst0": 19,
+      "dis_wmma": 576,
+      "dis_wmma_dst_hi": 576,
+      "group_segment_fixed_size": 261120,
+      "kernarg_segment_size": 64,
+      "kid": 21043,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_co_128x128x192x128_4x1_16x16x32_0x0x0_c3x4_p3_v1024w1",
+      "tile": [
+        128,
+        192,
+        128
+      ],
+      "traits_args": "128, 128, 192, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 3, 4",
+      "vgpr_count": 585,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x192x128_4x1_16x16x32_0x0x0_c4x1_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x192x128_4x1_16x16x32_0x0x0_c4x1_p3_v1024w1.s"
+      },
+      "asm_lines": 4954,
+      "asm_va_vdst0": 19,
+      "asm_wmma": 576,
+      "asm_wmma_dst_hi": 576,
+      "cluster": [
+        4,
+        1
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 3393,
+      "dis_va_vdst0": 19,
+      "dis_wmma": 576,
+      "dis_wmma_dst_hi": 576,
+      "group_segment_fixed_size": 261120,
+      "kernarg_segment_size": 64,
+      "kid": 21044,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_co_128x128x192x128_4x1_16x16x32_0x0x0_c4x1_p3_v1024w1",
+      "tile": [
+        128,
+        192,
+        128
+      ],
+      "traits_args": "128, 128, 192, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 4, 1",
+      "vgpr_count": 585,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x192x128_4x1_16x16x32_0x0x0_c4x2_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x192x128_4x1_16x16x32_0x0x0_c4x2_p3_v1024w1.s"
+      },
+      "asm_lines": 4960,
+      "asm_va_vdst0": 19,
+      "asm_wmma": 576,
+      "asm_wmma_dst_hi": 576,
+      "cluster": [
+        4,
+        2
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 3391,
+      "dis_va_vdst0": 19,
+      "dis_wmma": 576,
+      "dis_wmma_dst_hi": 576,
+      "group_segment_fixed_size": 261120,
+      "kernarg_segment_size": 64,
+      "kid": 21045,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_co_128x128x192x128_4x1_16x16x32_0x0x0_c4x2_p3_v1024w1",
+      "tile": [
+        128,
+        192,
+        128
+      ],
+      "traits_args": "128, 128, 192, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 4, 2",
+      "vgpr_count": 585,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x192x128_4x1_16x16x32_0x0x0_c4x3_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x192x128_4x1_16x16x32_0x0x0_c4x3_p3_v1024w1.s"
+      },
+      "asm_lines": 4961,
+      "asm_va_vdst0": 19,
+      "asm_wmma": 576,
+      "asm_wmma_dst_hi": 576,
+      "cluster": [
+        4,
+        3
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 3390,
+      "dis_va_vdst0": 19,
+      "dis_wmma": 576,
+      "dis_wmma_dst_hi": 576,
+      "group_segment_fixed_size": 261120,
+      "kernarg_segment_size": 64,
+      "kid": 21046,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_co_128x128x192x128_4x1_16x16x32_0x0x0_c4x3_p3_v1024w1",
+      "tile": [
+        128,
+        192,
+        128
+      ],
+      "traits_args": "128, 128, 192, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 4, 3",
+      "vgpr_count": 585,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x192x128_4x1_16x16x32_0x0x0_c4x4_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x192x128_4x1_16x16x32_0x0x0_c4x4_p3_v1024w1.s"
+      },
+      "asm_lines": 4960,
+      "asm_va_vdst0": 19,
+      "asm_wmma": 576,
+      "asm_wmma_dst_hi": 576,
+      "cluster": [
+        4,
+        4
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 3390,
+      "dis_va_vdst0": 19,
+      "dis_wmma": 576,
+      "dis_wmma_dst_hi": 576,
+      "group_segment_fixed_size": 261120,
+      "kernarg_segment_size": 64,
+      "kid": 21047,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_co_128x128x192x128_4x1_16x16x32_0x0x0_c4x4_p3_v1024w1",
+      "tile": [
+        128,
+        192,
+        128
+      ],
+      "traits_args": "128, 128, 192, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 4, 4",
+      "vgpr_count": 585,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x256x128_4x1_16x16x32_0x0x0_c1x1_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x256x128_4x1_16x16x32_0x0x0_c1x1_p3_v1024w1.s"
+      },
+      "asm_lines": 6392,
+      "asm_va_vdst0": 21,
+      "asm_wmma": 768,
+      "asm_wmma_dst_hi": 768,
+      "cluster": [
+        1,
+        1
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 4324,
+      "dis_va_vdst0": 21,
+      "dis_wmma": 768,
+      "dis_wmma_dst_hi": 768,
+      "group_segment_fixed_size": 313344,
+      "kernarg_segment_size": 64,
+      "kid": 21048,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_co_128x128x256x128_4x1_16x16x32_0x0x0_c1x1_p3_v1024w1",
+      "tile": [
+        128,
+        256,
+        128
+      ],
+      "traits_args": "128, 128, 256, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 1, 1",
+      "vgpr_count": 745,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x256x128_4x1_16x16x32_0x0x0_c1x2_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x256x128_4x1_16x16x32_0x0x0_c1x2_p3_v1024w1.s"
+      },
+      "asm_lines": 6388,
+      "asm_va_vdst0": 21,
+      "asm_wmma": 768,
+      "asm_wmma_dst_hi": 768,
+      "cluster": [
+        1,
+        2
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 4324,
+      "dis_va_vdst0": 21,
+      "dis_wmma": 768,
+      "dis_wmma_dst_hi": 768,
+      "group_segment_fixed_size": 313344,
+      "kernarg_segment_size": 64,
+      "kid": 21049,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_co_128x128x256x128_4x1_16x16x32_0x0x0_c1x2_p3_v1024w1",
+      "tile": [
+        128,
+        256,
+        128
+      ],
+      "traits_args": "128, 128, 256, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 1, 2",
+      "vgpr_count": 745,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x256x128_4x1_16x16x32_0x0x0_c1x3_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x256x128_4x1_16x16x32_0x0x0_c1x3_p3_v1024w1.s"
+      },
+      "asm_lines": 6388,
+      "asm_va_vdst0": 21,
+      "asm_wmma": 768,
+      "asm_wmma_dst_hi": 768,
+      "cluster": [
+        1,
+        3
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 4324,
+      "dis_va_vdst0": 21,
+      "dis_wmma": 768,
+      "dis_wmma_dst_hi": 768,
+      "group_segment_fixed_size": 313344,
+      "kernarg_segment_size": 64,
+      "kid": 21050,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_co_128x128x256x128_4x1_16x16x32_0x0x0_c1x3_p3_v1024w1",
+      "tile": [
+        128,
+        256,
+        128
+      ],
+      "traits_args": "128, 128, 256, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 1, 3",
+      "vgpr_count": 745,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x256x128_4x1_16x16x32_0x0x0_c1x4_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x256x128_4x1_16x16x32_0x0x0_c1x4_p3_v1024w1.s"
+      },
+      "asm_lines": 6388,
+      "asm_va_vdst0": 21,
+      "asm_wmma": 768,
+      "asm_wmma_dst_hi": 768,
+      "cluster": [
+        1,
+        4
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 4324,
+      "dis_va_vdst0": 21,
+      "dis_wmma": 768,
+      "dis_wmma_dst_hi": 768,
+      "group_segment_fixed_size": 313344,
+      "kernarg_segment_size": 64,
+      "kid": 21051,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_co_128x128x256x128_4x1_16x16x32_0x0x0_c1x4_p3_v1024w1",
+      "tile": [
+        128,
+        256,
+        128
+      ],
+      "traits_args": "128, 128, 256, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 1, 4",
+      "vgpr_count": 745,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x256x128_4x1_16x16x32_0x0x0_c2x1_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x256x128_4x1_16x16x32_0x0x0_c2x1_p3_v1024w1.s"
+      },
+      "asm_lines": 6388,
+      "asm_va_vdst0": 21,
+      "asm_wmma": 768,
+      "asm_wmma_dst_hi": 768,
+      "cluster": [
+        2,
+        1
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 4325,
+      "dis_va_vdst0": 21,
+      "dis_wmma": 768,
+      "dis_wmma_dst_hi": 768,
+      "group_segment_fixed_size": 313344,
+      "kernarg_segment_size": 64,
+      "kid": 21052,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_co_128x128x256x128_4x1_16x16x32_0x0x0_c2x1_p3_v1024w1",
+      "tile": [
+        128,
+        256,
+        128
+      ],
+      "traits_args": "128, 128, 256, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 2, 1",
+      "vgpr_count": 745,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x256x128_4x1_16x16x32_0x0x0_c2x2_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x256x128_4x1_16x16x32_0x0x0_c2x2_p3_v1024w1.s"
+      },
+      "asm_lines": 6395,
+      "asm_va_vdst0": 21,
+      "asm_wmma": 768,
+      "asm_wmma_dst_hi": 768,
+      "cluster": [
+        2,
+        2
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 4326,
+      "dis_va_vdst0": 21,
+      "dis_wmma": 768,
+      "dis_wmma_dst_hi": 768,
+      "group_segment_fixed_size": 313344,
+      "kernarg_segment_size": 64,
+      "kid": 21053,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_co_128x128x256x128_4x1_16x16x32_0x0x0_c2x2_p3_v1024w1",
+      "tile": [
+        128,
+        256,
+        128
+      ],
+      "traits_args": "128, 128, 256, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 2, 2",
+      "vgpr_count": 745,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x256x128_4x1_16x16x32_0x0x0_c2x3_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x256x128_4x1_16x16x32_0x0x0_c2x3_p3_v1024w1.s"
+      },
+      "asm_lines": 6395,
+      "asm_va_vdst0": 21,
+      "asm_wmma": 768,
+      "asm_wmma_dst_hi": 768,
+      "cluster": [
+        2,
+        3
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 4326,
+      "dis_va_vdst0": 21,
+      "dis_wmma": 768,
+      "dis_wmma_dst_hi": 768,
+      "group_segment_fixed_size": 313344,
+      "kernarg_segment_size": 64,
+      "kid": 21054,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_co_128x128x256x128_4x1_16x16x32_0x0x0_c2x3_p3_v1024w1",
+      "tile": [
+        128,
+        256,
+        128
+      ],
+      "traits_args": "128, 128, 256, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 2, 3",
+      "vgpr_count": 745,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x256x128_4x1_16x16x32_0x0x0_c2x4_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x256x128_4x1_16x16x32_0x0x0_c2x4_p3_v1024w1.s"
+      },
+      "asm_lines": 6395,
+      "asm_va_vdst0": 21,
+      "asm_wmma": 768,
+      "asm_wmma_dst_hi": 768,
+      "cluster": [
+        2,
+        4
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 4325,
+      "dis_va_vdst0": 21,
+      "dis_wmma": 768,
+      "dis_wmma_dst_hi": 768,
+      "group_segment_fixed_size": 313344,
+      "kernarg_segment_size": 64,
+      "kid": 21055,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_co_128x128x256x128_4x1_16x16x32_0x0x0_c2x4_p3_v1024w1",
+      "tile": [
+        128,
+        256,
+        128
+      ],
+      "traits_args": "128, 128, 256, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 2, 4",
+      "vgpr_count": 745,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x256x128_4x1_16x16x32_0x0x0_c3x1_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x256x128_4x1_16x16x32_0x0x0_c3x1_p3_v1024w1.s"
+      },
+      "asm_lines": 6388,
+      "asm_va_vdst0": 21,
+      "asm_wmma": 768,
+      "asm_wmma_dst_hi": 768,
+      "cluster": [
+        3,
+        1
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 4325,
+      "dis_va_vdst0": 21,
+      "dis_wmma": 768,
+      "dis_wmma_dst_hi": 768,
+      "group_segment_fixed_size": 313344,
+      "kernarg_segment_size": 64,
+      "kid": 21056,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_co_128x128x256x128_4x1_16x16x32_0x0x0_c3x1_p3_v1024w1",
+      "tile": [
+        128,
+        256,
+        128
+      ],
+      "traits_args": "128, 128, 256, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 3, 1",
+      "vgpr_count": 745,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x256x128_4x1_16x16x32_0x0x0_c3x2_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x256x128_4x1_16x16x32_0x0x0_c3x2_p3_v1024w1.s"
+      },
+      "asm_lines": 6395,
+      "asm_va_vdst0": 21,
+      "asm_wmma": 768,
+      "asm_wmma_dst_hi": 768,
+      "cluster": [
+        3,
+        2
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 4324,
+      "dis_va_vdst0": 21,
+      "dis_wmma": 768,
+      "dis_wmma_dst_hi": 768,
+      "group_segment_fixed_size": 313344,
+      "kernarg_segment_size": 64,
+      "kid": 21057,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_co_128x128x256x128_4x1_16x16x32_0x0x0_c3x2_p3_v1024w1",
+      "tile": [
+        128,
+        256,
+        128
+      ],
+      "traits_args": "128, 128, 256, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 3, 2",
+      "vgpr_count": 745,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x256x128_4x1_16x16x32_0x0x0_c3x3_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x256x128_4x1_16x16x32_0x0x0_c3x3_p3_v1024w1.s"
+      },
+      "asm_lines": 6395,
+      "asm_va_vdst0": 21,
+      "asm_wmma": 768,
+      "asm_wmma_dst_hi": 768,
+      "cluster": [
+        3,
+        3
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 4323,
+      "dis_va_vdst0": 21,
+      "dis_wmma": 768,
+      "dis_wmma_dst_hi": 768,
+      "group_segment_fixed_size": 313344,
+      "kernarg_segment_size": 64,
+      "kid": 21058,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_co_128x128x256x128_4x1_16x16x32_0x0x0_c3x3_p3_v1024w1",
+      "tile": [
+        128,
+        256,
+        128
+      ],
+      "traits_args": "128, 128, 256, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 3, 3",
+      "vgpr_count": 745,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x256x128_4x1_16x16x32_0x0x0_c3x4_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x256x128_4x1_16x16x32_0x0x0_c3x4_p3_v1024w1.s"
+      },
+      "asm_lines": 6395,
+      "asm_va_vdst0": 21,
+      "asm_wmma": 768,
+      "asm_wmma_dst_hi": 768,
+      "cluster": [
+        3,
+        4
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 4323,
+      "dis_va_vdst0": 21,
+      "dis_wmma": 768,
+      "dis_wmma_dst_hi": 768,
+      "group_segment_fixed_size": 313344,
+      "kernarg_segment_size": 64,
+      "kid": 21059,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_co_128x128x256x128_4x1_16x16x32_0x0x0_c3x4_p3_v1024w1",
+      "tile": [
+        128,
+        256,
+        128
+      ],
+      "traits_args": "128, 128, 256, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 3, 4",
+      "vgpr_count": 745,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x256x128_4x1_16x16x32_0x0x0_c4x1_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x256x128_4x1_16x16x32_0x0x0_c4x1_p3_v1024w1.s"
+      },
+      "asm_lines": 6388,
+      "asm_va_vdst0": 21,
+      "asm_wmma": 768,
+      "asm_wmma_dst_hi": 768,
+      "cluster": [
+        4,
+        1
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 4325,
+      "dis_va_vdst0": 21,
+      "dis_wmma": 768,
+      "dis_wmma_dst_hi": 768,
+      "group_segment_fixed_size": 313344,
+      "kernarg_segment_size": 64,
+      "kid": 21060,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_co_128x128x256x128_4x1_16x16x32_0x0x0_c4x1_p3_v1024w1",
+      "tile": [
+        128,
+        256,
+        128
+      ],
+      "traits_args": "128, 128, 256, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 4, 1",
+      "vgpr_count": 745,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x256x128_4x1_16x16x32_0x0x0_c4x2_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x256x128_4x1_16x16x32_0x0x0_c4x2_p3_v1024w1.s"
+      },
+      "asm_lines": 6395,
+      "asm_va_vdst0": 21,
+      "asm_wmma": 768,
+      "asm_wmma_dst_hi": 768,
+      "cluster": [
+        4,
+        2
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 4324,
+      "dis_va_vdst0": 21,
+      "dis_wmma": 768,
+      "dis_wmma_dst_hi": 768,
+      "group_segment_fixed_size": 313344,
+      "kernarg_segment_size": 64,
+      "kid": 21061,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_co_128x128x256x128_4x1_16x16x32_0x0x0_c4x2_p3_v1024w1",
+      "tile": [
+        128,
+        256,
+        128
+      ],
+      "traits_args": "128, 128, 256, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 4, 2",
+      "vgpr_count": 745,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x256x128_4x1_16x16x32_0x0x0_c4x3_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x256x128_4x1_16x16x32_0x0x0_c4x3_p3_v1024w1.s"
+      },
+      "asm_lines": 6395,
+      "asm_va_vdst0": 21,
+      "asm_wmma": 768,
+      "asm_wmma_dst_hi": 768,
+      "cluster": [
+        4,
+        3
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 4323,
+      "dis_va_vdst0": 21,
+      "dis_wmma": 768,
+      "dis_wmma_dst_hi": 768,
+      "group_segment_fixed_size": 313344,
+      "kernarg_segment_size": 64,
+      "kid": 21062,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_co_128x128x256x128_4x1_16x16x32_0x0x0_c4x3_p3_v1024w1",
+      "tile": [
+        128,
+        256,
+        128
+      ],
+      "traits_args": "128, 128, 256, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 4, 3",
+      "vgpr_count": 745,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x256x128_4x1_16x16x32_0x0x0_c4x4_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x256x128_4x1_16x16x32_0x0x0_c4x4_p3_v1024w1.s"
+      },
+      "asm_lines": 6395,
+      "asm_va_vdst0": 21,
+      "asm_wmma": 768,
+      "asm_wmma_dst_hi": 768,
+      "cluster": [
+        4,
+        4
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 4323,
+      "dis_va_vdst0": 21,
+      "dis_wmma": 768,
+      "dis_wmma_dst_hi": 768,
+      "group_segment_fixed_size": 313344,
+      "kernarg_segment_size": 64,
+      "kid": 21063,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_co_128x128x256x128_4x1_16x16x32_0x0x0_c4x4_p3_v1024w1",
+      "tile": [
+        128,
+        256,
+        128
+      ],
+      "traits_args": "128, 128, 256, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 4, 4",
+      "vgpr_count": 745,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x128x128_4x1_16x16x32_0x0x0_w4x1_c1x1_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x128x128_4x1_16x16x32_0x0x0_w4x1_c1x1_p3_v1024w1.s"
+      },
+      "asm_lines": 3543,
+      "asm_va_vdst0": 20,
+      "asm_wmma": 384,
+      "asm_wmma_dst_hi": 384,
+      "cluster": [
+        1,
+        1
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 2466,
+      "dis_va_vdst0": 20,
+      "dis_wmma": 384,
+      "dis_wmma_dst_hi": 384,
+      "group_segment_fixed_size": 208896,
+      "kernarg_segment_size": 64,
+      "kid": 21105,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_wl_co_128x128x128x128_4x1_16x16x32_0x0x0_w4x1_c1x1_p3_v1024w1",
+      "tile": [
+        128,
+        128,
+        128
+      ],
+      "traits_args": "128, 128, 128, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 1, 1, 4, 1",
+      "vgpr_count": 512,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x128x128_4x1_16x16x32_0x0x0_w4x1_c1x4_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x128x128_4x1_16x16x32_0x0x0_w4x1_c1x4_p3_v1024w1.s"
+      },
+      "asm_lines": 3544,
+      "asm_va_vdst0": 21,
+      "asm_wmma": 384,
+      "asm_wmma_dst_hi": 384,
+      "cluster": [
+        1,
+        4
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 2465,
+      "dis_va_vdst0": 21,
+      "dis_wmma": 384,
+      "dis_wmma_dst_hi": 384,
+      "group_segment_fixed_size": 208896,
+      "kernarg_segment_size": 64,
+      "kid": 21106,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_wl_co_128x128x128x128_4x1_16x16x32_0x0x0_w4x1_c1x4_p3_v1024w1",
+      "tile": [
+        128,
+        128,
+        128
+      ],
+      "traits_args": "128, 128, 128, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 1, 4, 4, 1",
+      "vgpr_count": 512,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x128x128_4x1_16x16x32_0x0x0_w4x1_c4x1_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x128x128_4x1_16x16x32_0x0x0_w4x1_c4x1_p3_v1024w1.s"
+      },
+      "asm_lines": 3544,
+      "asm_va_vdst0": 21,
+      "asm_wmma": 384,
+      "asm_wmma_dst_hi": 384,
+      "cluster": [
+        4,
+        1
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 2466,
+      "dis_va_vdst0": 21,
+      "dis_wmma": 384,
+      "dis_wmma_dst_hi": 384,
+      "group_segment_fixed_size": 208896,
+      "kernarg_segment_size": 64,
+      "kid": 21107,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_wl_co_128x128x128x128_4x1_16x16x32_0x0x0_w4x1_c4x1_p3_v1024w1",
+      "tile": [
+        128,
+        128,
+        128
+      ],
+      "traits_args": "128, 128, 128, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 4, 1, 4, 1",
+      "vgpr_count": 512,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x128x128_4x1_16x16x32_0x0x0_w4x1_c2x2_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x128x128_4x1_16x16x32_0x0x0_w4x1_c2x2_p3_v1024w1.s"
+      },
+      "asm_lines": 3551,
+      "asm_va_vdst0": 21,
+      "asm_wmma": 384,
+      "asm_wmma_dst_hi": 384,
+      "cluster": [
+        2,
+        2
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 2465,
+      "dis_va_vdst0": 21,
+      "dis_wmma": 384,
+      "dis_wmma_dst_hi": 384,
+      "group_segment_fixed_size": 208896,
+      "kernarg_segment_size": 64,
+      "kid": 21108,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_wl_co_128x128x128x128_4x1_16x16x32_0x0x0_w4x1_c2x2_p3_v1024w1",
+      "tile": [
+        128,
+        128,
+        128
+      ],
+      "traits_args": "128, 128, 128, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 2, 2, 4, 1",
+      "vgpr_count": 512,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x128x128_4x1_16x16x32_0x0x0_w4x1_c4x4_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x128x128_4x1_16x16x32_0x0x0_w4x1_c4x4_p3_v1024w1.s"
+      },
+      "asm_lines": 3551,
+      "asm_va_vdst0": 21,
+      "asm_wmma": 384,
+      "asm_wmma_dst_hi": 384,
+      "cluster": [
+        4,
+        4
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 2464,
+      "dis_va_vdst0": 21,
+      "dis_wmma": 384,
+      "dis_wmma_dst_hi": 384,
+      "group_segment_fixed_size": 208896,
+      "kernarg_segment_size": 64,
+      "kid": 21109,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_wl_co_128x128x128x128_4x1_16x16x32_0x0x0_w4x1_c4x4_p3_v1024w1",
+      "tile": [
+        128,
+        128,
+        128
+      ],
+      "traits_args": "128, 128, 128, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 4, 4, 4, 1",
+      "vgpr_count": 512,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x192x128_4x1_16x16x32_0x0x0_w4x1_c1x1_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x192x128_4x1_16x16x32_0x0x0_w4x1_c1x1_p3_v1024w1.s"
+      },
+      "asm_lines": 5283,
+      "asm_va_vdst0": 55,
+      "asm_wmma": 576,
+      "asm_wmma_dst_hi": 576,
+      "cluster": [
+        1,
+        1
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 3718,
+      "dis_va_vdst0": 55,
+      "dis_wmma": 576,
+      "dis_wmma_dst_hi": 576,
+      "group_segment_fixed_size": 261120,
+      "kernarg_segment_size": 64,
+      "kid": 21110,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_wl_co_128x128x192x128_4x1_16x16x32_0x0x0_w4x1_c1x1_p3_v1024w1",
+      "tile": [
+        128,
+        192,
+        128
+      ],
+      "traits_args": "128, 128, 192, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 1, 1, 4, 1",
+      "vgpr_count": 582,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x192x128_4x1_16x16x32_0x0x0_w4x1_c1x4_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x192x128_4x1_16x16x32_0x0x0_w4x1_c1x4_p3_v1024w1.s"
+      },
+      "asm_lines": 5281,
+      "asm_va_vdst0": 56,
+      "asm_wmma": 576,
+      "asm_wmma_dst_hi": 576,
+      "cluster": [
+        1,
+        4
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 3717,
+      "dis_va_vdst0": 56,
+      "dis_wmma": 576,
+      "dis_wmma_dst_hi": 576,
+      "group_segment_fixed_size": 261120,
+      "kernarg_segment_size": 64,
+      "kid": 21111,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_wl_co_128x128x192x128_4x1_16x16x32_0x0x0_w4x1_c1x4_p3_v1024w1",
+      "tile": [
+        128,
+        192,
+        128
+      ],
+      "traits_args": "128, 128, 192, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 1, 4, 4, 1",
+      "vgpr_count": 582,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x192x128_4x1_16x16x32_0x0x0_w4x1_c4x1_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x192x128_4x1_16x16x32_0x0x0_w4x1_c4x1_p3_v1024w1.s"
+      },
+      "asm_lines": 5282,
+      "asm_va_vdst0": 56,
+      "asm_wmma": 576,
+      "asm_wmma_dst_hi": 576,
+      "cluster": [
+        4,
+        1
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 3719,
+      "dis_va_vdst0": 56,
+      "dis_wmma": 576,
+      "dis_wmma_dst_hi": 576,
+      "group_segment_fixed_size": 261120,
+      "kernarg_segment_size": 64,
+      "kid": 21112,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_wl_co_128x128x192x128_4x1_16x16x32_0x0x0_w4x1_c4x1_p3_v1024w1",
+      "tile": [
+        128,
+        192,
+        128
+      ],
+      "traits_args": "128, 128, 192, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 4, 1, 4, 1",
+      "vgpr_count": 582,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x192x128_4x1_16x16x32_0x0x0_w4x1_c2x2_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x192x128_4x1_16x16x32_0x0x0_w4x1_c2x2_p3_v1024w1.s"
+      },
+      "asm_lines": 5288,
+      "asm_va_vdst0": 56,
+      "asm_wmma": 576,
+      "asm_wmma_dst_hi": 576,
+      "cluster": [
+        2,
+        2
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 3717,
+      "dis_va_vdst0": 56,
+      "dis_wmma": 576,
+      "dis_wmma_dst_hi": 576,
+      "group_segment_fixed_size": 261120,
+      "kernarg_segment_size": 64,
+      "kid": 21113,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_wl_co_128x128x192x128_4x1_16x16x32_0x0x0_w4x1_c2x2_p3_v1024w1",
+      "tile": [
+        128,
+        192,
+        128
+      ],
+      "traits_args": "128, 128, 192, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 2, 2, 4, 1",
+      "vgpr_count": 582,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x192x128_4x1_16x16x32_0x0x0_w4x1_c4x4_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x192x128_4x1_16x16x32_0x0x0_w4x1_c4x4_p3_v1024w1.s"
+      },
+      "asm_lines": 5288,
+      "asm_va_vdst0": 56,
+      "asm_wmma": 576,
+      "asm_wmma_dst_hi": 576,
+      "cluster": [
+        4,
+        4
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 3716,
+      "dis_va_vdst0": 56,
+      "dis_wmma": 576,
+      "dis_wmma_dst_hi": 576,
+      "group_segment_fixed_size": 261120,
+      "kernarg_segment_size": 64,
+      "kid": 21114,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_wl_co_128x128x192x128_4x1_16x16x32_0x0x0_w4x1_c4x4_p3_v1024w1",
+      "tile": [
+        128,
+        192,
+        128
+      ],
+      "traits_args": "128, 128, 192, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 4, 4, 4, 1",
+      "vgpr_count": 582,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x256x128_4x1_16x16x32_0x0x0_w4x1_c1x1_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x256x128_4x1_16x16x32_0x0x0_w4x1_c1x1_p3_v1024w1.s"
+      },
+      "asm_lines": 6886,
+      "asm_va_vdst0": 81,
+      "asm_wmma": 768,
+      "asm_wmma_dst_hi": 768,
+      "cluster": [
+        1,
+        1
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 4827,
+      "dis_va_vdst0": 81,
+      "dis_wmma": 768,
+      "dis_wmma_dst_hi": 768,
+      "group_segment_fixed_size": 313344,
+      "kernarg_segment_size": 64,
+      "kid": 21115,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_wl_co_128x128x256x128_4x1_16x16x32_0x0x0_w4x1_c1x1_p3_v1024w1",
+      "tile": [
+        128,
+        256,
+        128
+      ],
+      "traits_args": "128, 128, 256, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 1, 1, 4, 1",
+      "vgpr_count": 742,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x256x128_4x1_16x16x32_0x0x0_w4x1_c1x4_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x256x128_4x1_16x16x32_0x0x0_w4x1_c1x4_p3_v1024w1.s"
+      },
+      "asm_lines": 6885,
+      "asm_va_vdst0": 82,
+      "asm_wmma": 768,
+      "asm_wmma_dst_hi": 768,
+      "cluster": [
+        1,
+        4
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 4826,
+      "dis_va_vdst0": 82,
+      "dis_wmma": 768,
+      "dis_wmma_dst_hi": 768,
+      "group_segment_fixed_size": 313344,
+      "kernarg_segment_size": 64,
+      "kid": 21116,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_wl_co_128x128x256x128_4x1_16x16x32_0x0x0_w4x1_c1x4_p3_v1024w1",
+      "tile": [
+        128,
+        256,
+        128
+      ],
+      "traits_args": "128, 128, 256, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 1, 4, 4, 1",
+      "vgpr_count": 742,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x256x128_4x1_16x16x32_0x0x0_w4x1_c4x1_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x256x128_4x1_16x16x32_0x0x0_w4x1_c4x1_p3_v1024w1.s"
+      },
+      "asm_lines": 6885,
+      "asm_va_vdst0": 82,
+      "asm_wmma": 768,
+      "asm_wmma_dst_hi": 768,
+      "cluster": [
+        4,
+        1
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 4827,
+      "dis_va_vdst0": 82,
+      "dis_wmma": 768,
+      "dis_wmma_dst_hi": 768,
+      "group_segment_fixed_size": 313344,
+      "kernarg_segment_size": 64,
+      "kid": 21117,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_wl_co_128x128x256x128_4x1_16x16x32_0x0x0_w4x1_c4x1_p3_v1024w1",
+      "tile": [
+        128,
+        256,
+        128
+      ],
+      "traits_args": "128, 128, 256, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 4, 1, 4, 1",
+      "vgpr_count": 742,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x256x128_4x1_16x16x32_0x0x0_w4x1_c2x2_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x256x128_4x1_16x16x32_0x0x0_w4x1_c2x2_p3_v1024w1.s"
+      },
+      "asm_lines": 6892,
+      "asm_va_vdst0": 82,
+      "asm_wmma": 768,
+      "asm_wmma_dst_hi": 768,
+      "cluster": [
+        2,
+        2
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 4828,
+      "dis_va_vdst0": 82,
+      "dis_wmma": 768,
+      "dis_wmma_dst_hi": 768,
+      "group_segment_fixed_size": 313344,
+      "kernarg_segment_size": 64,
+      "kid": 21118,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_wl_co_128x128x256x128_4x1_16x16x32_0x0x0_w4x1_c2x2_p3_v1024w1",
+      "tile": [
+        128,
+        256,
+        128
+      ],
+      "traits_args": "128, 128, 256, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 2, 2, 4, 1",
+      "vgpr_count": 742,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x256x128_4x1_16x16x32_0x0x0_w4x1_c4x4_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x256x128_4x1_16x16x32_0x0x0_w4x1_c4x4_p3_v1024w1.s"
+      },
+      "asm_lines": 6892,
+      "asm_va_vdst0": 82,
+      "asm_wmma": 768,
+      "asm_wmma_dst_hi": 768,
+      "cluster": [
+        4,
+        4
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 4825,
+      "dis_va_vdst0": 82,
+      "dis_wmma": 768,
+      "dis_wmma_dst_hi": 768,
+      "group_segment_fixed_size": 313344,
+      "kernarg_segment_size": 64,
+      "kid": 21119,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_wl_co_128x128x256x128_4x1_16x16x32_0x0x0_w4x1_c4x4_p3_v1024w1",
+      "tile": [
+        128,
+        256,
+        128
+      ],
+      "traits_args": "128, 128, 256, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 4, 4, 4, 1",
+      "vgpr_count": 742,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x192x128_4x1_16x16x32_0x0x0_w2x2_c1x1_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x192x128_4x1_16x16x32_0x0x0_w2x2_c1x1_p3_v1024w1.s"
+      },
+      "asm_lines": 2957,
+      "asm_va_vdst0": 37,
+      "asm_wmma": 288,
+      "asm_wmma_dst_hi": 288,
+      "cluster": [
+        1,
+        1
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 2074,
+      "dis_va_vdst0": 37,
+      "dis_wmma": 288,
+      "dis_wmma_dst_hi": 288,
+      "group_segment_fixed_size": 208896,
+      "kernarg_segment_size": 64,
+      "kid": 21130,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_wl_co_128x64x192x128_4x1_16x16x32_0x0x0_w2x2_c1x1_p3_v1024w1",
+      "tile": [
+        64,
+        192,
+        128
+      ],
+      "traits_args": "128, 64, 192, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 1, 1, 2, 2",
+      "vgpr_count": 416,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x192x128_4x1_16x16x32_0x0x0_w2x2_c1x4_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x192x128_4x1_16x16x32_0x0x0_w2x2_c1x4_p3_v1024w1.s"
+      },
+      "asm_lines": 2955,
+      "asm_va_vdst0": 37,
+      "asm_wmma": 288,
+      "asm_wmma_dst_hi": 288,
+      "cluster": [
+        1,
+        4
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 2073,
+      "dis_va_vdst0": 37,
+      "dis_wmma": 288,
+      "dis_wmma_dst_hi": 288,
+      "group_segment_fixed_size": 208896,
+      "kernarg_segment_size": 64,
+      "kid": 21131,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_wl_co_128x64x192x128_4x1_16x16x32_0x0x0_w2x2_c1x4_p3_v1024w1",
+      "tile": [
+        64,
+        192,
+        128
+      ],
+      "traits_args": "128, 64, 192, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 1, 4, 2, 2",
+      "vgpr_count": 416,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x192x128_4x1_16x16x32_0x0x0_w2x2_c4x1_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x192x128_4x1_16x16x32_0x0x0_w2x2_c4x1_p3_v1024w1.s"
+      },
+      "asm_lines": 2956,
+      "asm_va_vdst0": 37,
+      "asm_wmma": 288,
+      "asm_wmma_dst_hi": 288,
+      "cluster": [
+        4,
+        1
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 2075,
+      "dis_va_vdst0": 37,
+      "dis_wmma": 288,
+      "dis_wmma_dst_hi": 288,
+      "group_segment_fixed_size": 208896,
+      "kernarg_segment_size": 64,
+      "kid": 21132,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_wl_co_128x64x192x128_4x1_16x16x32_0x0x0_w2x2_c4x1_p3_v1024w1",
+      "tile": [
+        64,
+        192,
+        128
+      ],
+      "traits_args": "128, 64, 192, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 4, 1, 2, 2",
+      "vgpr_count": 416,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x192x128_4x1_16x16x32_0x0x0_w2x2_c2x2_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x192x128_4x1_16x16x32_0x0x0_w2x2_c2x2_p3_v1024w1.s"
+      },
+      "asm_lines": 2962,
+      "asm_va_vdst0": 37,
+      "asm_wmma": 288,
+      "asm_wmma_dst_hi": 288,
+      "cluster": [
+        2,
+        2
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 2073,
+      "dis_va_vdst0": 37,
+      "dis_wmma": 288,
+      "dis_wmma_dst_hi": 288,
+      "group_segment_fixed_size": 208896,
+      "kernarg_segment_size": 64,
+      "kid": 21133,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_wl_co_128x64x192x128_4x1_16x16x32_0x0x0_w2x2_c2x2_p3_v1024w1",
+      "tile": [
+        64,
+        192,
+        128
+      ],
+      "traits_args": "128, 64, 192, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 2, 2, 2, 2",
+      "vgpr_count": 416,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x192x128_4x1_16x16x32_0x0x0_w2x2_c4x4_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x192x128_4x1_16x16x32_0x0x0_w2x2_c4x4_p3_v1024w1.s"
+      },
+      "asm_lines": 2962,
+      "asm_va_vdst0": 37,
+      "asm_wmma": 288,
+      "asm_wmma_dst_hi": 288,
+      "cluster": [
+        4,
+        4
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 2072,
+      "dis_va_vdst0": 37,
+      "dis_wmma": 288,
+      "dis_wmma_dst_hi": 288,
+      "group_segment_fixed_size": 208896,
+      "kernarg_segment_size": 64,
+      "kid": 21134,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_wl_co_128x64x192x128_4x1_16x16x32_0x0x0_w2x2_c4x4_p3_v1024w1",
+      "tile": [
+        64,
+        192,
+        128
+      ],
+      "traits_args": "128, 64, 192, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 4, 4, 2, 2",
+      "vgpr_count": 416,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x256x128_4x1_16x16x32_0x0x0_w2x2_c1x1_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x256x128_4x1_16x16x32_0x0x0_w2x2_c1x1_p3_v1024w1.s"
+      },
+      "asm_lines": 3729,
+      "asm_va_vdst0": 45,
+      "asm_wmma": 384,
+      "asm_wmma_dst_hi": 384,
+      "cluster": [
+        1,
+        1
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 2646,
+      "dis_va_vdst0": 45,
+      "dis_wmma": 384,
+      "dis_wmma_dst_hi": 384,
+      "group_segment_fixed_size": 261120,
+      "kernarg_segment_size": 64,
+      "kid": 21135,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_wl_co_128x64x256x128_4x1_16x16x32_0x0x0_w2x2_c1x1_p3_v1024w1",
+      "tile": [
+        64,
+        256,
+        128
+      ],
+      "traits_args": "128, 64, 256, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 1, 1, 2, 2",
+      "vgpr_count": 512,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x256x128_4x1_16x16x32_0x0x0_w2x2_c1x4_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x256x128_4x1_16x16x32_0x0x0_w2x2_c1x4_p3_v1024w1.s"
+      },
+      "asm_lines": 3728,
+      "asm_va_vdst0": 46,
+      "asm_wmma": 384,
+      "asm_wmma_dst_hi": 384,
+      "cluster": [
+        1,
+        4
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 2645,
+      "dis_va_vdst0": 46,
+      "dis_wmma": 384,
+      "dis_wmma_dst_hi": 384,
+      "group_segment_fixed_size": 261120,
+      "kernarg_segment_size": 64,
+      "kid": 21136,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_wl_co_128x64x256x128_4x1_16x16x32_0x0x0_w2x2_c1x4_p3_v1024w1",
+      "tile": [
+        64,
+        256,
+        128
+      ],
+      "traits_args": "128, 64, 256, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 1, 4, 2, 2",
+      "vgpr_count": 512,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x256x128_4x1_16x16x32_0x0x0_w2x2_c4x1_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x256x128_4x1_16x16x32_0x0x0_w2x2_c4x1_p3_v1024w1.s"
+      },
+      "asm_lines": 3728,
+      "asm_va_vdst0": 46,
+      "asm_wmma": 384,
+      "asm_wmma_dst_hi": 384,
+      "cluster": [
+        4,
+        1
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 2646,
+      "dis_va_vdst0": 46,
+      "dis_wmma": 384,
+      "dis_wmma_dst_hi": 384,
+      "group_segment_fixed_size": 261120,
+      "kernarg_segment_size": 64,
+      "kid": 21137,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_wl_co_128x64x256x128_4x1_16x16x32_0x0x0_w2x2_c4x1_p3_v1024w1",
+      "tile": [
+        64,
+        256,
+        128
+      ],
+      "traits_args": "128, 64, 256, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 4, 1, 2, 2",
+      "vgpr_count": 512,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x256x128_4x1_16x16x32_0x0x0_w2x2_c2x2_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x256x128_4x1_16x16x32_0x0x0_w2x2_c2x2_p3_v1024w1.s"
+      },
+      "asm_lines": 3735,
+      "asm_va_vdst0": 46,
+      "asm_wmma": 384,
+      "asm_wmma_dst_hi": 384,
+      "cluster": [
+        2,
+        2
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 2646,
+      "dis_va_vdst0": 46,
+      "dis_wmma": 384,
+      "dis_wmma_dst_hi": 384,
+      "group_segment_fixed_size": 261120,
+      "kernarg_segment_size": 64,
+      "kid": 21138,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_wl_co_128x64x256x128_4x1_16x16x32_0x0x0_w2x2_c2x2_p3_v1024w1",
+      "tile": [
+        64,
+        256,
+        128
+      ],
+      "traits_args": "128, 64, 256, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 2, 2, 2, 2",
+      "vgpr_count": 512,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x256x128_4x1_16x16x32_0x0x0_w2x2_c4x4_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x256x128_4x1_16x16x32_0x0x0_w2x2_c4x4_p3_v1024w1.s"
+      },
+      "asm_lines": 3735,
+      "asm_va_vdst0": 46,
+      "asm_wmma": 384,
+      "asm_wmma_dst_hi": 384,
+      "cluster": [
+        4,
+        4
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 2644,
+      "dis_va_vdst0": 46,
+      "dis_wmma": 384,
+      "dis_wmma_dst_hi": 384,
+      "group_segment_fixed_size": 261120,
+      "kernarg_segment_size": 64,
+      "kid": 21139,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_wl_co_128x64x256x128_4x1_16x16x32_0x0x0_w2x2_c4x4_p3_v1024w1",
+      "tile": [
+        64,
+        256,
+        128
+      ],
+      "traits_args": "128, 64, 256, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 4, 4, 2, 2",
+      "vgpr_count": 512,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x128x128_4x1_16x16x32_0x0x0_w2x2_c1x1_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x128x128_4x1_16x16x32_0x0x0_w2x2_c1x1_p3_v1024w1.s"
+      },
+      "asm_lines": 2502,
+      "asm_va_vdst0": 16,
+      "asm_wmma": 288,
+      "asm_wmma_dst_hi": 288,
+      "cluster": [
+        1,
+        1
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 1738,
+      "dis_va_vdst0": 16,
+      "dis_wmma": 288,
+      "dis_wmma_dst_hi": 288,
+      "group_segment_fixed_size": 182784,
+      "kernarg_segment_size": 64,
+      "kid": 21145,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_wl_co_128x96x128x128_4x1_16x16x32_0x0x0_w2x2_c1x1_p3_v1024w1",
+      "tile": [
+        96,
+        128,
+        128
+      ],
+      "traits_args": "128, 96, 128, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 1, 1, 2, 2",
+      "vgpr_count": 480,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x128x128_4x1_16x16x32_0x0x0_w2x2_c1x4_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x128x128_4x1_16x16x32_0x0x0_w2x2_c1x4_p3_v1024w1.s"
+      },
+      "asm_lines": 2501,
+      "asm_va_vdst0": 17,
+      "asm_wmma": 288,
+      "asm_wmma_dst_hi": 288,
+      "cluster": [
+        1,
+        4
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 1737,
+      "dis_va_vdst0": 17,
+      "dis_wmma": 288,
+      "dis_wmma_dst_hi": 288,
+      "group_segment_fixed_size": 182784,
+      "kernarg_segment_size": 64,
+      "kid": 21146,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_wl_co_128x96x128x128_4x1_16x16x32_0x0x0_w2x2_c1x4_p3_v1024w1",
+      "tile": [
+        96,
+        128,
+        128
+      ],
+      "traits_args": "128, 96, 128, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 1, 4, 2, 2",
+      "vgpr_count": 480,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x128x128_4x1_16x16x32_0x0x0_w2x2_c4x1_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x128x128_4x1_16x16x32_0x0x0_w2x2_c4x1_p3_v1024w1.s"
+      },
+      "asm_lines": 2500,
+      "asm_va_vdst0": 17,
+      "asm_wmma": 288,
+      "asm_wmma_dst_hi": 288,
+      "cluster": [
+        4,
+        1
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 1739,
+      "dis_va_vdst0": 17,
+      "dis_wmma": 288,
+      "dis_wmma_dst_hi": 288,
+      "group_segment_fixed_size": 182784,
+      "kernarg_segment_size": 64,
+      "kid": 21147,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_wl_co_128x96x128x128_4x1_16x16x32_0x0x0_w2x2_c4x1_p3_v1024w1",
+      "tile": [
+        96,
+        128,
+        128
+      ],
+      "traits_args": "128, 96, 128, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 4, 1, 2, 2",
+      "vgpr_count": 480,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x128x128_4x1_16x16x32_0x0x0_w2x2_c2x2_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x128x128_4x1_16x16x32_0x0x0_w2x2_c2x2_p3_v1024w1.s"
+      },
+      "asm_lines": 2507,
+      "asm_va_vdst0": 17,
+      "asm_wmma": 288,
+      "asm_wmma_dst_hi": 288,
+      "cluster": [
+        2,
+        2
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 1738,
+      "dis_va_vdst0": 17,
+      "dis_wmma": 288,
+      "dis_wmma_dst_hi": 288,
+      "group_segment_fixed_size": 182784,
+      "kernarg_segment_size": 64,
+      "kid": 21148,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_wl_co_128x96x128x128_4x1_16x16x32_0x0x0_w2x2_c2x2_p3_v1024w1",
+      "tile": [
+        96,
+        128,
+        128
+      ],
+      "traits_args": "128, 96, 128, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 2, 2, 2, 2",
+      "vgpr_count": 480,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x128x128_4x1_16x16x32_0x0x0_w2x2_c4x4_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x128x128_4x1_16x16x32_0x0x0_w2x2_c4x4_p3_v1024w1.s"
+      },
+      "asm_lines": 2507,
+      "asm_va_vdst0": 17,
+      "asm_wmma": 288,
+      "asm_wmma_dst_hi": 288,
+      "cluster": [
+        4,
+        4
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 1737,
+      "dis_va_vdst0": 17,
+      "dis_wmma": 288,
+      "dis_wmma_dst_hi": 288,
+      "group_segment_fixed_size": 182784,
+      "kernarg_segment_size": 64,
+      "kid": 21149,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_wl_co_128x96x128x128_4x1_16x16x32_0x0x0_w2x2_c4x4_p3_v1024w1",
+      "tile": [
+        96,
+        128,
+        128
+      ],
+      "traits_args": "128, 96, 128, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 4, 4, 2, 2",
+      "vgpr_count": 480,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x192x128_4x1_16x16x32_0x0x0_w2x2_c1x1_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x192x128_4x1_16x16x32_0x0x0_w2x2_c1x1_p3_v1024w1.s"
+      },
+      "asm_lines": 3631,
+      "asm_va_vdst0": 37,
+      "asm_wmma": 432,
+      "asm_wmma_dst_hi": 432,
+      "cluster": [
+        1,
+        1
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 2440,
+      "dis_va_vdst0": 37,
+      "dis_wmma": 432,
+      "dis_wmma_dst_hi": 432,
+      "group_segment_fixed_size": 235008,
+      "kernarg_segment_size": 64,
+      "kid": 21150,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_wl_co_128x96x192x128_4x1_16x16x32_0x0x0_w2x2_c1x1_p3_v1024w1",
+      "tile": [
+        96,
+        192,
+        128
+      ],
+      "traits_args": "128, 96, 192, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 1, 1, 2, 2",
+      "vgpr_count": 464,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x192x128_4x1_16x16x32_0x0x0_w2x2_c1x4_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x192x128_4x1_16x16x32_0x0x0_w2x2_c1x4_p3_v1024w1.s"
+      },
+      "asm_lines": 3627,
+      "asm_va_vdst0": 37,
+      "asm_wmma": 432,
+      "asm_wmma_dst_hi": 432,
+      "cluster": [
+        1,
+        4
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 2439,
+      "dis_va_vdst0": 37,
+      "dis_wmma": 432,
+      "dis_wmma_dst_hi": 432,
+      "group_segment_fixed_size": 235008,
+      "kernarg_segment_size": 64,
+      "kid": 21151,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_wl_co_128x96x192x128_4x1_16x16x32_0x0x0_w2x2_c1x4_p3_v1024w1",
+      "tile": [
+        96,
+        192,
+        128
+      ],
+      "traits_args": "128, 96, 192, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 1, 4, 2, 2",
+      "vgpr_count": 464,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x192x128_4x1_16x16x32_0x0x0_w2x2_c4x1_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x192x128_4x1_16x16x32_0x0x0_w2x2_c4x1_p3_v1024w1.s"
+      },
+      "asm_lines": 3627,
+      "asm_va_vdst0": 37,
+      "asm_wmma": 432,
+      "asm_wmma_dst_hi": 432,
+      "cluster": [
+        4,
+        1
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 2442,
+      "dis_va_vdst0": 37,
+      "dis_wmma": 432,
+      "dis_wmma_dst_hi": 432,
+      "group_segment_fixed_size": 235008,
+      "kernarg_segment_size": 64,
+      "kid": 21152,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_wl_co_128x96x192x128_4x1_16x16x32_0x0x0_w2x2_c4x1_p3_v1024w1",
+      "tile": [
+        96,
+        192,
+        128
+      ],
+      "traits_args": "128, 96, 192, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 4, 1, 2, 2",
+      "vgpr_count": 464,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x192x128_4x1_16x16x32_0x0x0_w2x2_c2x2_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x192x128_4x1_16x16x32_0x0x0_w2x2_c2x2_p3_v1024w1.s"
+      },
+      "asm_lines": 3633,
+      "asm_va_vdst0": 37,
+      "asm_wmma": 432,
+      "asm_wmma_dst_hi": 432,
+      "cluster": [
+        2,
+        2
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 2440,
+      "dis_va_vdst0": 37,
+      "dis_wmma": 432,
+      "dis_wmma_dst_hi": 432,
+      "group_segment_fixed_size": 235008,
+      "kernarg_segment_size": 64,
+      "kid": 21153,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_wl_co_128x96x192x128_4x1_16x16x32_0x0x0_w2x2_c2x2_p3_v1024w1",
+      "tile": [
+        96,
+        192,
+        128
+      ],
+      "traits_args": "128, 96, 192, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 2, 2, 2, 2",
+      "vgpr_count": 464,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x192x128_4x1_16x16x32_0x0x0_w2x2_c4x4_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x192x128_4x1_16x16x32_0x0x0_w2x2_c4x4_p3_v1024w1.s"
+      },
+      "asm_lines": 3633,
+      "asm_va_vdst0": 37,
+      "asm_wmma": 432,
+      "asm_wmma_dst_hi": 432,
+      "cluster": [
+        4,
+        4
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 2440,
+      "dis_va_vdst0": 37,
+      "dis_wmma": 432,
+      "dis_wmma_dst_hi": 432,
+      "group_segment_fixed_size": 235008,
+      "kernarg_segment_size": 64,
+      "kid": 21154,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_wl_co_128x96x192x128_4x1_16x16x32_0x0x0_w2x2_c4x4_p3_v1024w1",
+      "tile": [
+        96,
+        192,
+        128
+      ],
+      "traits_args": "128, 96, 192, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 4, 4, 2, 2",
+      "vgpr_count": 464,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x256x128_4x1_16x16x32_0x0x0_w2x2_c1x1_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x256x128_4x1_16x16x32_0x0x0_w2x2_c1x1_p3_v1024w1.s"
+      },
+      "asm_lines": 4606,
+      "asm_va_vdst0": 44,
+      "asm_wmma": 576,
+      "asm_wmma_dst_hi": 576,
+      "cluster": [
+        1,
+        1
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 3117,
+      "dis_va_vdst0": 44,
+      "dis_wmma": 576,
+      "dis_wmma_dst_hi": 576,
+      "group_segment_fixed_size": 287232,
+      "kernarg_segment_size": 64,
+      "kid": 21155,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_wl_co_128x96x256x128_4x1_16x16x32_0x0x0_w2x2_c1x1_p3_v1024w1",
+      "tile": [
+        96,
+        256,
+        128
+      ],
+      "traits_args": "128, 96, 256, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 1, 1, 2, 2",
+      "vgpr_count": 576,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x256x128_4x1_16x16x32_0x0x0_w2x2_c1x4_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x256x128_4x1_16x16x32_0x0x0_w2x2_c1x4_p3_v1024w1.s"
+      },
+      "asm_lines": 4605,
+      "asm_va_vdst0": 45,
+      "asm_wmma": 576,
+      "asm_wmma_dst_hi": 576,
+      "cluster": [
+        1,
+        4
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 3116,
+      "dis_va_vdst0": 45,
+      "dis_wmma": 576,
+      "dis_wmma_dst_hi": 576,
+      "group_segment_fixed_size": 287232,
+      "kernarg_segment_size": 64,
+      "kid": 21156,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_wl_co_128x96x256x128_4x1_16x16x32_0x0x0_w2x2_c1x4_p3_v1024w1",
+      "tile": [
+        96,
+        256,
+        128
+      ],
+      "traits_args": "128, 96, 256, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 1, 4, 2, 2",
+      "vgpr_count": 576,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x256x128_4x1_16x16x32_0x0x0_w2x2_c4x1_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x256x128_4x1_16x16x32_0x0x0_w2x2_c4x1_p3_v1024w1.s"
+      },
+      "asm_lines": 4604,
+      "asm_va_vdst0": 45,
+      "asm_wmma": 576,
+      "asm_wmma_dst_hi": 576,
+      "cluster": [
+        4,
+        1
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 3118,
+      "dis_va_vdst0": 45,
+      "dis_wmma": 576,
+      "dis_wmma_dst_hi": 576,
+      "group_segment_fixed_size": 287232,
+      "kernarg_segment_size": 64,
+      "kid": 21157,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_wl_co_128x96x256x128_4x1_16x16x32_0x0x0_w2x2_c4x1_p3_v1024w1",
+      "tile": [
+        96,
+        256,
+        128
+      ],
+      "traits_args": "128, 96, 256, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 4, 1, 2, 2",
+      "vgpr_count": 576,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x256x128_4x1_16x16x32_0x0x0_w2x2_c2x2_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x256x128_4x1_16x16x32_0x0x0_w2x2_c2x2_p3_v1024w1.s"
+      },
+      "asm_lines": 4611,
+      "asm_va_vdst0": 45,
+      "asm_wmma": 576,
+      "asm_wmma_dst_hi": 576,
+      "cluster": [
+        2,
+        2
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 3149,
+      "dis_va_vdst0": 45,
+      "dis_wmma": 576,
+      "dis_wmma_dst_hi": 576,
+      "group_segment_fixed_size": 287232,
+      "kernarg_segment_size": 64,
+      "kid": 21158,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_wl_co_128x96x256x128_4x1_16x16x32_0x0x0_w2x2_c2x2_p3_v1024w1",
+      "tile": [
+        96,
+        256,
+        128
+      ],
+      "traits_args": "128, 96, 256, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 2, 2, 2, 2",
+      "vgpr_count": 576,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x256x128_4x1_16x16x32_0x0x0_w2x2_c4x4_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x256x128_4x1_16x16x32_0x0x0_w2x2_c4x4_p3_v1024w1.s"
+      },
+      "asm_lines": 4611,
+      "asm_va_vdst0": 45,
+      "asm_wmma": 576,
+      "asm_wmma_dst_hi": 576,
+      "cluster": [
+        4,
+        4
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 3148,
+      "dis_va_vdst0": 45,
+      "dis_wmma": 576,
+      "dis_wmma_dst_hi": 576,
+      "group_segment_fixed_size": 287232,
+      "kernarg_segment_size": 64,
+      "kid": 21159,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_wl_co_128x96x256x128_4x1_16x16x32_0x0x0_w2x2_c4x4_p3_v1024w1",
+      "tile": [
+        96,
+        256,
+        128
+      ],
+      "traits_args": "128, 96, 256, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 4, 4, 2, 2",
+      "vgpr_count": 576,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x128x128_4x1_16x16x32_0x0x0_w2x2_c1x1_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x128x128_4x1_16x16x32_0x0x0_w2x2_c1x1_p3_v1024w1.s"
+      },
+      "asm_lines": 2977,
+      "asm_va_vdst0": 20,
+      "asm_wmma": 384,
+      "asm_wmma_dst_hi": 384,
+      "cluster": [
+        1,
+        1
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 2027,
+      "dis_va_vdst0": 20,
+      "dis_wmma": 384,
+      "dis_wmma_dst_hi": 384,
+      "group_segment_fixed_size": 208896,
+      "kernarg_segment_size": 64,
+      "kid": 21165,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_wl_co_128x128x128x128_4x1_16x16x32_0x0x0_w2x2_c1x1_p3_v1024w1",
+      "tile": [
+        128,
+        128,
+        128
+      ],
+      "traits_args": "128, 128, 128, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 1, 1, 2, 2",
+      "vgpr_count": 512,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x128x128_4x1_16x16x32_0x0x0_w2x2_c1x4_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x128x128_4x1_16x16x32_0x0x0_w2x2_c1x4_p3_v1024w1.s"
+      },
+      "asm_lines": 2981,
+      "asm_va_vdst0": 21,
+      "asm_wmma": 384,
+      "asm_wmma_dst_hi": 384,
+      "cluster": [
+        1,
+        4
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 2026,
+      "dis_va_vdst0": 21,
+      "dis_wmma": 384,
+      "dis_wmma_dst_hi": 384,
+      "group_segment_fixed_size": 208896,
+      "kernarg_segment_size": 64,
+      "kid": 21166,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_wl_co_128x128x128x128_4x1_16x16x32_0x0x0_w2x2_c1x4_p3_v1024w1",
+      "tile": [
+        128,
+        128,
+        128
+      ],
+      "traits_args": "128, 128, 128, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 1, 4, 2, 2",
+      "vgpr_count": 512,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x128x128_4x1_16x16x32_0x0x0_w2x2_c4x1_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x128x128_4x1_16x16x32_0x0x0_w2x2_c4x1_p3_v1024w1.s"
+      },
+      "asm_lines": 2981,
+      "asm_va_vdst0": 21,
+      "asm_wmma": 384,
+      "asm_wmma_dst_hi": 384,
+      "cluster": [
+        4,
+        1
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 2027,
+      "dis_va_vdst0": 21,
+      "dis_wmma": 384,
+      "dis_wmma_dst_hi": 384,
+      "group_segment_fixed_size": 208896,
+      "kernarg_segment_size": 64,
+      "kid": 21167,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_wl_co_128x128x128x128_4x1_16x16x32_0x0x0_w2x2_c4x1_p3_v1024w1",
+      "tile": [
+        128,
+        128,
+        128
+      ],
+      "traits_args": "128, 128, 128, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 4, 1, 2, 2",
+      "vgpr_count": 512,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x128x128_4x1_16x16x32_0x0x0_w2x2_c2x2_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x128x128_4x1_16x16x32_0x0x0_w2x2_c2x2_p3_v1024w1.s"
+      },
+      "asm_lines": 2988,
+      "asm_va_vdst0": 21,
+      "asm_wmma": 384,
+      "asm_wmma_dst_hi": 384,
+      "cluster": [
+        2,
+        2
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 2026,
+      "dis_va_vdst0": 21,
+      "dis_wmma": 384,
+      "dis_wmma_dst_hi": 384,
+      "group_segment_fixed_size": 208896,
+      "kernarg_segment_size": 64,
+      "kid": 21168,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_wl_co_128x128x128x128_4x1_16x16x32_0x0x0_w2x2_c2x2_p3_v1024w1",
+      "tile": [
+        128,
+        128,
+        128
+      ],
+      "traits_args": "128, 128, 128, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 2, 2, 2, 2",
+      "vgpr_count": 512,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x128x128_4x1_16x16x32_0x0x0_w2x2_c4x4_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x128x128_4x1_16x16x32_0x0x0_w2x2_c4x4_p3_v1024w1.s"
+      },
+      "asm_lines": 2988,
+      "asm_va_vdst0": 21,
+      "asm_wmma": 384,
+      "asm_wmma_dst_hi": 384,
+      "cluster": [
+        4,
+        4
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 2025,
+      "dis_va_vdst0": 21,
+      "dis_wmma": 384,
+      "dis_wmma_dst_hi": 384,
+      "group_segment_fixed_size": 208896,
+      "kernarg_segment_size": 64,
+      "kid": 21169,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_wl_co_128x128x128x128_4x1_16x16x32_0x0x0_w2x2_c4x4_p3_v1024w1",
+      "tile": [
+        128,
+        128,
+        128
+      ],
+      "traits_args": "128, 128, 128, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 4, 4, 2, 2",
+      "vgpr_count": 512,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x192x128_4x1_16x16x32_0x0x0_w2x2_c1x1_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x192x128_4x1_16x16x32_0x0x0_w2x2_c1x1_p3_v1024w1.s"
+      },
+      "asm_lines": 4337,
+      "asm_va_vdst0": 47,
+      "asm_wmma": 576,
+      "asm_wmma_dst_hi": 576,
+      "cluster": [
+        1,
+        1
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 2836,
+      "dis_va_vdst0": 47,
+      "dis_wmma": 576,
+      "dis_wmma_dst_hi": 576,
+      "group_segment_fixed_size": 261120,
+      "kernarg_segment_size": 64,
+      "kid": 21170,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_wl_co_128x128x192x128_4x1_16x16x32_0x0x0_w2x2_c1x1_p3_v1024w1",
+      "tile": [
+        128,
+        192,
+        128
+      ],
+      "traits_args": "128, 128, 192, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 1, 1, 2, 2",
+      "vgpr_count": 512,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x192x128_4x1_16x16x32_0x0x0_w2x2_c1x4_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x192x128_4x1_16x16x32_0x0x0_w2x2_c1x4_p3_v1024w1.s"
+      },
+      "asm_lines": 4333,
+      "asm_va_vdst0": 47,
+      "asm_wmma": 576,
+      "asm_wmma_dst_hi": 576,
+      "cluster": [
+        1,
+        4
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 2835,
+      "dis_va_vdst0": 47,
+      "dis_wmma": 576,
+      "dis_wmma_dst_hi": 576,
+      "group_segment_fixed_size": 261120,
+      "kernarg_segment_size": 64,
+      "kid": 21171,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_wl_co_128x128x192x128_4x1_16x16x32_0x0x0_w2x2_c1x4_p3_v1024w1",
+      "tile": [
+        128,
+        192,
+        128
+      ],
+      "traits_args": "128, 128, 192, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 1, 4, 2, 2",
+      "vgpr_count": 512,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x192x128_4x1_16x16x32_0x0x0_w2x2_c4x1_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x192x128_4x1_16x16x32_0x0x0_w2x2_c4x1_p3_v1024w1.s"
+      },
+      "asm_lines": 4334,
+      "asm_va_vdst0": 47,
+      "asm_wmma": 576,
+      "asm_wmma_dst_hi": 576,
+      "cluster": [
+        4,
+        1
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 2837,
+      "dis_va_vdst0": 47,
+      "dis_wmma": 576,
+      "dis_wmma_dst_hi": 576,
+      "group_segment_fixed_size": 261120,
+      "kernarg_segment_size": 64,
+      "kid": 21172,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_wl_co_128x128x192x128_4x1_16x16x32_0x0x0_w2x2_c4x1_p3_v1024w1",
+      "tile": [
+        128,
+        192,
+        128
+      ],
+      "traits_args": "128, 128, 192, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 4, 1, 2, 2",
+      "vgpr_count": 512,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x192x128_4x1_16x16x32_0x0x0_w2x2_c2x2_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x192x128_4x1_16x16x32_0x0x0_w2x2_c2x2_p3_v1024w1.s"
+      },
+      "asm_lines": 4340,
+      "asm_va_vdst0": 47,
+      "asm_wmma": 576,
+      "asm_wmma_dst_hi": 576,
+      "cluster": [
+        2,
+        2
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 2835,
+      "dis_va_vdst0": 47,
+      "dis_wmma": 576,
+      "dis_wmma_dst_hi": 576,
+      "group_segment_fixed_size": 261120,
+      "kernarg_segment_size": 64,
+      "kid": 21173,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_wl_co_128x128x192x128_4x1_16x16x32_0x0x0_w2x2_c2x2_p3_v1024w1",
+      "tile": [
+        128,
+        192,
+        128
+      ],
+      "traits_args": "128, 128, 192, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 2, 2, 2, 2",
+      "vgpr_count": 512,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x192x128_4x1_16x16x32_0x0x0_w2x2_c4x4_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x192x128_4x1_16x16x32_0x0x0_w2x2_c4x4_p3_v1024w1.s"
+      },
+      "asm_lines": 4340,
+      "asm_va_vdst0": 47,
+      "asm_wmma": 576,
+      "asm_wmma_dst_hi": 576,
+      "cluster": [
+        4,
+        4
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 2834,
+      "dis_va_vdst0": 47,
+      "dis_wmma": 576,
+      "dis_wmma_dst_hi": 576,
+      "group_segment_fixed_size": 261120,
+      "kernarg_segment_size": 64,
+      "kid": 21174,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_wl_co_128x128x192x128_4x1_16x16x32_0x0x0_w2x2_c4x4_p3_v1024w1",
+      "tile": [
+        128,
+        192,
+        128
+      ],
+      "traits_args": "128, 128, 192, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 4, 4, 2, 2",
+      "vgpr_count": 512,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x256x128_4x1_16x16x32_0x0x0_w2x2_c1x1_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x256x128_4x1_16x16x32_0x0x0_w2x2_c1x1_p3_v1024w1.s"
+      },
+      "asm_lines": 5468,
+      "asm_va_vdst0": 48,
+      "asm_wmma": 768,
+      "asm_wmma_dst_hi": 768,
+      "cluster": [
+        1,
+        1
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 3592,
+      "dis_va_vdst0": 48,
+      "dis_wmma": 768,
+      "dis_wmma_dst_hi": 768,
+      "group_segment_fixed_size": 313344,
+      "kernarg_segment_size": 64,
+      "kid": 21175,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_wl_co_128x128x256x128_4x1_16x16x32_0x0x0_w2x2_c1x1_p3_v1024w1",
+      "tile": [
+        128,
+        256,
+        128
+      ],
+      "traits_args": "128, 128, 256, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 1, 1, 2, 2",
+      "vgpr_count": 694,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x256x128_4x1_16x16x32_0x0x0_w2x2_c1x4_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x256x128_4x1_16x16x32_0x0x0_w2x2_c1x4_p3_v1024w1.s"
+      },
+      "asm_lines": 5467,
+      "asm_va_vdst0": 49,
+      "asm_wmma": 768,
+      "asm_wmma_dst_hi": 768,
+      "cluster": [
+        1,
+        4
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 3591,
+      "dis_va_vdst0": 49,
+      "dis_wmma": 768,
+      "dis_wmma_dst_hi": 768,
+      "group_segment_fixed_size": 313344,
+      "kernarg_segment_size": 64,
+      "kid": 21176,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_wl_co_128x128x256x128_4x1_16x16x32_0x0x0_w2x2_c1x4_p3_v1024w1",
+      "tile": [
+        128,
+        256,
+        128
+      ],
+      "traits_args": "128, 128, 256, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 1, 4, 2, 2",
+      "vgpr_count": 694,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x256x128_4x1_16x16x32_0x0x0_w2x2_c4x1_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x256x128_4x1_16x16x32_0x0x0_w2x2_c4x1_p3_v1024w1.s"
+      },
+      "asm_lines": 5467,
+      "asm_va_vdst0": 49,
+      "asm_wmma": 768,
+      "asm_wmma_dst_hi": 768,
+      "cluster": [
+        4,
+        1
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 3592,
+      "dis_va_vdst0": 49,
+      "dis_wmma": 768,
+      "dis_wmma_dst_hi": 768,
+      "group_segment_fixed_size": 313344,
+      "kernarg_segment_size": 64,
+      "kid": 21177,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_wl_co_128x128x256x128_4x1_16x16x32_0x0x0_w2x2_c4x1_p3_v1024w1",
+      "tile": [
+        128,
+        256,
+        128
+      ],
+      "traits_args": "128, 128, 256, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 4, 1, 2, 2",
+      "vgpr_count": 694,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x256x128_4x1_16x16x32_0x0x0_w2x2_c2x2_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x256x128_4x1_16x16x32_0x0x0_w2x2_c2x2_p3_v1024w1.s"
+      },
+      "asm_lines": 5474,
+      "asm_va_vdst0": 49,
+      "asm_wmma": 768,
+      "asm_wmma_dst_hi": 768,
+      "cluster": [
+        2,
+        2
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 3624,
+      "dis_va_vdst0": 49,
+      "dis_wmma": 768,
+      "dis_wmma_dst_hi": 768,
+      "group_segment_fixed_size": 313344,
+      "kernarg_segment_size": 64,
+      "kid": 21178,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_wl_co_128x128x256x128_4x1_16x16x32_0x0x0_w2x2_c2x2_p3_v1024w1",
+      "tile": [
+        128,
+        256,
+        128
+      ],
+      "traits_args": "128, 128, 256, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 2, 2, 2, 2",
+      "vgpr_count": 694,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x256x128_4x1_16x16x32_0x0x0_w2x2_c4x4_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x256x128_4x1_16x16x32_0x0x0_w2x2_c4x4_p3_v1024w1.s"
+      },
+      "asm_lines": 5474,
+      "asm_va_vdst0": 49,
+      "asm_wmma": 768,
+      "asm_wmma_dst_hi": 768,
+      "cluster": [
+        4,
+        4
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 3622,
+      "dis_va_vdst0": 49,
+      "dis_wmma": 768,
+      "dis_wmma_dst_hi": 768,
+      "group_segment_fixed_size": 313344,
+      "kernarg_segment_size": 64,
+      "kid": 21179,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_wl_co_128x128x256x128_4x1_16x16x32_0x0x0_w2x2_c4x4_p3_v1024w1",
+      "tile": [
+        128,
+        256,
+        128
+      ],
+      "traits_args": "128, 128, 256, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 4, 4, 2, 2",
+      "vgpr_count": 694,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x192x128_4x1_16x16x32_0x0x0_w1x4_c1x1_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x192x128_4x1_16x16x32_0x0x0_w1x4_c1x1_p3_v1024w1.s"
+      },
+      "asm_lines": 2551,
+      "asm_va_vdst0": 26,
+      "asm_wmma": 288,
+      "asm_wmma_dst_hi": 288,
+      "cluster": [
+        1,
+        1
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 1682,
+      "dis_va_vdst0": 26,
+      "dis_wmma": 288,
+      "dis_wmma_dst_hi": 288,
+      "group_segment_fixed_size": 208896,
+      "kernarg_segment_size": 64,
+      "kid": 21190,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_wl_co_128x64x192x128_4x1_16x16x32_0x0x0_w1x4_c1x1_p3_v1024w1",
+      "tile": [
+        64,
+        192,
+        128
+      ],
+      "traits_args": "128, 64, 192, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 1, 1, 1, 4",
+      "vgpr_count": 384,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x192x128_4x1_16x16x32_0x0x0_w1x4_c1x4_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x192x128_4x1_16x16x32_0x0x0_w1x4_c1x4_p3_v1024w1.s"
+      },
+      "asm_lines": 2547,
+      "asm_va_vdst0": 26,
+      "asm_wmma": 288,
+      "asm_wmma_dst_hi": 288,
+      "cluster": [
+        1,
+        4
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 1649,
+      "dis_va_vdst0": 26,
+      "dis_wmma": 288,
+      "dis_wmma_dst_hi": 288,
+      "group_segment_fixed_size": 208896,
+      "kernarg_segment_size": 64,
+      "kid": 21191,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_wl_co_128x64x192x128_4x1_16x16x32_0x0x0_w1x4_c1x4_p3_v1024w1",
+      "tile": [
+        64,
+        192,
+        128
+      ],
+      "traits_args": "128, 64, 192, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 1, 4, 1, 4",
+      "vgpr_count": 384,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x192x128_4x1_16x16x32_0x0x0_w1x4_c4x1_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x192x128_4x1_16x16x32_0x0x0_w1x4_c4x1_p3_v1024w1.s"
+      },
+      "asm_lines": 2548,
+      "asm_va_vdst0": 26,
+      "asm_wmma": 288,
+      "asm_wmma_dst_hi": 288,
+      "cluster": [
+        4,
+        1
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 1651,
+      "dis_va_vdst0": 26,
+      "dis_wmma": 288,
+      "dis_wmma_dst_hi": 288,
+      "group_segment_fixed_size": 208896,
+      "kernarg_segment_size": 64,
+      "kid": 21192,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_wl_co_128x64x192x128_4x1_16x16x32_0x0x0_w1x4_c4x1_p3_v1024w1",
+      "tile": [
+        64,
+        192,
+        128
+      ],
+      "traits_args": "128, 64, 192, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 4, 1, 1, 4",
+      "vgpr_count": 384,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x192x128_4x1_16x16x32_0x0x0_w1x4_c2x2_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x192x128_4x1_16x16x32_0x0x0_w1x4_c2x2_p3_v1024w1.s"
+      },
+      "asm_lines": 2554,
+      "asm_va_vdst0": 26,
+      "asm_wmma": 288,
+      "asm_wmma_dst_hi": 288,
+      "cluster": [
+        2,
+        2
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 1681,
+      "dis_va_vdst0": 26,
+      "dis_wmma": 288,
+      "dis_wmma_dst_hi": 288,
+      "group_segment_fixed_size": 208896,
+      "kernarg_segment_size": 64,
+      "kid": 21193,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_wl_co_128x64x192x128_4x1_16x16x32_0x0x0_w1x4_c2x2_p3_v1024w1",
+      "tile": [
+        64,
+        192,
+        128
+      ],
+      "traits_args": "128, 64, 192, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 2, 2, 1, 4",
+      "vgpr_count": 384,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x192x128_4x1_16x16x32_0x0x0_w1x4_c4x4_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x192x128_4x1_16x16x32_0x0x0_w1x4_c4x4_p3_v1024w1.s"
+      },
+      "asm_lines": 2554,
+      "asm_va_vdst0": 26,
+      "asm_wmma": 288,
+      "asm_wmma_dst_hi": 288,
+      "cluster": [
+        4,
+        4
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 1680,
+      "dis_va_vdst0": 26,
+      "dis_wmma": 288,
+      "dis_wmma_dst_hi": 288,
+      "group_segment_fixed_size": 208896,
+      "kernarg_segment_size": 64,
+      "kid": 21194,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_wl_co_128x64x192x128_4x1_16x16x32_0x0x0_w1x4_c4x4_p3_v1024w1",
+      "tile": [
+        64,
+        192,
+        128
+      ],
+      "traits_args": "128, 64, 192, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 4, 4, 1, 4",
+      "vgpr_count": 384,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x256x128_4x1_16x16x32_0x0x0_w1x4_c1x1_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x256x128_4x1_16x16x32_0x0x0_w1x4_c1x1_p3_v1024w1.s"
+      },
+      "asm_lines": 3000,
+      "asm_va_vdst0": 24,
+      "asm_wmma": 384,
+      "asm_wmma_dst_hi": 384,
+      "cluster": [
+        1,
+        1
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 2045,
+      "dis_va_vdst0": 24,
+      "dis_wmma": 384,
+      "dis_wmma_dst_hi": 384,
+      "group_segment_fixed_size": 261120,
+      "kernarg_segment_size": 64,
+      "kid": 21195,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_wl_co_128x64x256x128_4x1_16x16x32_0x0x0_w1x4_c1x1_p3_v1024w1",
+      "tile": [
+        64,
+        256,
+        128
+      ],
+      "traits_args": "128, 64, 256, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 1, 1, 1, 4",
+      "vgpr_count": 512,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x256x128_4x1_16x16x32_0x0x0_w1x4_c1x4_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x256x128_4x1_16x16x32_0x0x0_w1x4_c1x4_p3_v1024w1.s"
+      },
+      "asm_lines": 2999,
+      "asm_va_vdst0": 25,
+      "asm_wmma": 384,
+      "asm_wmma_dst_hi": 384,
+      "cluster": [
+        1,
+        4
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 2044,
+      "dis_va_vdst0": 25,
+      "dis_wmma": 384,
+      "dis_wmma_dst_hi": 384,
+      "group_segment_fixed_size": 261120,
+      "kernarg_segment_size": 64,
+      "kid": 21196,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_wl_co_128x64x256x128_4x1_16x16x32_0x0x0_w1x4_c1x4_p3_v1024w1",
+      "tile": [
+        64,
+        256,
+        128
+      ],
+      "traits_args": "128, 64, 256, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 1, 4, 1, 4",
+      "vgpr_count": 512,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x256x128_4x1_16x16x32_0x0x0_w1x4_c4x1_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x256x128_4x1_16x16x32_0x0x0_w1x4_c4x1_p3_v1024w1.s"
+      },
+      "asm_lines": 2999,
+      "asm_va_vdst0": 25,
+      "asm_wmma": 384,
+      "asm_wmma_dst_hi": 384,
+      "cluster": [
+        4,
+        1
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 2045,
+      "dis_va_vdst0": 25,
+      "dis_wmma": 384,
+      "dis_wmma_dst_hi": 384,
+      "group_segment_fixed_size": 261120,
+      "kernarg_segment_size": 64,
+      "kid": 21197,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_wl_co_128x64x256x128_4x1_16x16x32_0x0x0_w1x4_c4x1_p3_v1024w1",
+      "tile": [
+        64,
+        256,
+        128
+      ],
+      "traits_args": "128, 64, 256, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 4, 1, 1, 4",
+      "vgpr_count": 512,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x256x128_4x1_16x16x32_0x0x0_w1x4_c2x2_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x256x128_4x1_16x16x32_0x0x0_w1x4_c2x2_p3_v1024w1.s"
+      },
+      "asm_lines": 3006,
+      "asm_va_vdst0": 25,
+      "asm_wmma": 384,
+      "asm_wmma_dst_hi": 384,
+      "cluster": [
+        2,
+        2
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 2045,
+      "dis_va_vdst0": 25,
+      "dis_wmma": 384,
+      "dis_wmma_dst_hi": 384,
+      "group_segment_fixed_size": 261120,
+      "kernarg_segment_size": 64,
+      "kid": 21198,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_wl_co_128x64x256x128_4x1_16x16x32_0x0x0_w1x4_c2x2_p3_v1024w1",
+      "tile": [
+        64,
+        256,
+        128
+      ],
+      "traits_args": "128, 64, 256, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 2, 2, 1, 4",
+      "vgpr_count": 512,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x256x128_4x1_16x16x32_0x0x0_w1x4_c4x4_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x256x128_4x1_16x16x32_0x0x0_w1x4_c4x4_p3_v1024w1.s"
+      },
+      "asm_lines": 3006,
+      "asm_va_vdst0": 25,
+      "asm_wmma": 384,
+      "asm_wmma_dst_hi": 384,
+      "cluster": [
+        4,
+        4
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 2043,
+      "dis_va_vdst0": 25,
+      "dis_wmma": 384,
+      "dis_wmma_dst_hi": 384,
+      "group_segment_fixed_size": 261120,
+      "kernarg_segment_size": 64,
+      "kid": 21199,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_wl_co_128x64x256x128_4x1_16x16x32_0x0x0_w1x4_c4x4_p3_v1024w1",
+      "tile": [
+        64,
+        256,
+        128
+      ],
+      "traits_args": "128, 64, 256, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 4, 4, 1, 4",
+      "vgpr_count": 512,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x128x128_4x1_16x16x32_0x0x0_w1x4_c1x1_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x128x128_4x1_16x16x32_0x0x0_w1x4_c1x1_p3_v1024w1.s"
+      },
+      "asm_lines": 2403,
+      "asm_va_vdst0": 18,
+      "asm_wmma": 288,
+      "asm_wmma_dst_hi": 288,
+      "cluster": [
+        1,
+        1
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 1641,
+      "dis_va_vdst0": 18,
+      "dis_wmma": 288,
+      "dis_wmma_dst_hi": 288,
+      "group_segment_fixed_size": 182784,
+      "kernarg_segment_size": 64,
+      "kid": 21205,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_wl_co_128x96x128x128_4x1_16x16x32_0x0x0_w1x4_c1x1_p3_v1024w1",
+      "tile": [
+        96,
+        128,
+        128
+      ],
+      "traits_args": "128, 96, 128, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 1, 1, 1, 4",
+      "vgpr_count": 416,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x128x128_4x1_16x16x32_0x0x0_w1x4_c1x4_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x128x128_4x1_16x16x32_0x0x0_w1x4_c1x4_p3_v1024w1.s"
+      },
+      "asm_lines": 2400,
+      "asm_va_vdst0": 18,
+      "asm_wmma": 288,
+      "asm_wmma_dst_hi": 288,
+      "cluster": [
+        1,
+        4
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 1640,
+      "dis_va_vdst0": 18,
+      "dis_wmma": 288,
+      "dis_wmma_dst_hi": 288,
+      "group_segment_fixed_size": 182784,
+      "kernarg_segment_size": 64,
+      "kid": 21206,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_wl_co_128x96x128x128_4x1_16x16x32_0x0x0_w1x4_c1x4_p3_v1024w1",
+      "tile": [
+        96,
+        128,
+        128
+      ],
+      "traits_args": "128, 96, 128, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 1, 4, 1, 4",
+      "vgpr_count": 416,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x128x128_4x1_16x16x32_0x0x0_w1x4_c4x1_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x128x128_4x1_16x16x32_0x0x0_w1x4_c4x1_p3_v1024w1.s"
+      },
+      "asm_lines": 2399,
+      "asm_va_vdst0": 18,
+      "asm_wmma": 288,
+      "asm_wmma_dst_hi": 288,
+      "cluster": [
+        4,
+        1
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 1642,
+      "dis_va_vdst0": 18,
+      "dis_wmma": 288,
+      "dis_wmma_dst_hi": 288,
+      "group_segment_fixed_size": 182784,
+      "kernarg_segment_size": 64,
+      "kid": 21207,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_wl_co_128x96x128x128_4x1_16x16x32_0x0x0_w1x4_c4x1_p3_v1024w1",
+      "tile": [
+        96,
+        128,
+        128
+      ],
+      "traits_args": "128, 96, 128, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 4, 1, 1, 4",
+      "vgpr_count": 416,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x128x128_4x1_16x16x32_0x0x0_w1x4_c2x2_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x128x128_4x1_16x16x32_0x0x0_w1x4_c2x2_p3_v1024w1.s"
+      },
+      "asm_lines": 2406,
+      "asm_va_vdst0": 18,
+      "asm_wmma": 288,
+      "asm_wmma_dst_hi": 288,
+      "cluster": [
+        2,
+        2
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 1641,
+      "dis_va_vdst0": 18,
+      "dis_wmma": 288,
+      "dis_wmma_dst_hi": 288,
+      "group_segment_fixed_size": 182784,
+      "kernarg_segment_size": 64,
+      "kid": 21208,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_wl_co_128x96x128x128_4x1_16x16x32_0x0x0_w1x4_c2x2_p3_v1024w1",
+      "tile": [
+        96,
+        128,
+        128
+      ],
+      "traits_args": "128, 96, 128, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 2, 2, 1, 4",
+      "vgpr_count": 416,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x128x128_4x1_16x16x32_0x0x0_w1x4_c4x4_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x128x128_4x1_16x16x32_0x0x0_w1x4_c4x4_p3_v1024w1.s"
+      },
+      "asm_lines": 2406,
+      "asm_va_vdst0": 18,
+      "asm_wmma": 288,
+      "asm_wmma_dst_hi": 288,
+      "cluster": [
+        4,
+        4
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 1640,
+      "dis_va_vdst0": 18,
+      "dis_wmma": 288,
+      "dis_wmma_dst_hi": 288,
+      "group_segment_fixed_size": 182784,
+      "kernarg_segment_size": 64,
+      "kid": 21209,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_wl_co_128x96x128x128_4x1_16x16x32_0x0x0_w1x4_c4x4_p3_v1024w1",
+      "tile": [
+        96,
+        128,
+        128
+      ],
+      "traits_args": "128, 96, 128, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 4, 4, 1, 4",
+      "vgpr_count": 416,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x192x128_4x1_16x16x32_0x0x0_w1x4_c1x1_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x192x128_4x1_16x16x32_0x0x0_w1x4_c1x1_p3_v1024w1.s"
+      },
+      "asm_lines": 3298,
+      "asm_va_vdst0": 26,
+      "asm_wmma": 432,
+      "asm_wmma_dst_hi": 432,
+      "cluster": [
+        1,
+        1
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 2059,
+      "dis_va_vdst0": 26,
+      "dis_wmma": 432,
+      "dis_wmma_dst_hi": 432,
+      "group_segment_fixed_size": 235008,
+      "kernarg_segment_size": 64,
+      "kid": 21210,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_wl_co_128x96x192x128_4x1_16x16x32_0x0x0_w1x4_c1x1_p3_v1024w1",
+      "tile": [
+        96,
+        192,
+        128
+      ],
+      "traits_args": "128, 96, 192, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 1, 1, 1, 4",
+      "vgpr_count": 482,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x192x128_4x1_16x16x32_0x0x0_w1x4_c1x4_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x192x128_4x1_16x16x32_0x0x0_w1x4_c1x4_p3_v1024w1.s"
+      },
+      "asm_lines": 3294,
+      "asm_va_vdst0": 26,
+      "asm_wmma": 432,
+      "asm_wmma_dst_hi": 432,
+      "cluster": [
+        1,
+        4
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 2058,
+      "dis_va_vdst0": 26,
+      "dis_wmma": 432,
+      "dis_wmma_dst_hi": 432,
+      "group_segment_fixed_size": 235008,
+      "kernarg_segment_size": 64,
+      "kid": 21211,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_wl_co_128x96x192x128_4x1_16x16x32_0x0x0_w1x4_c1x4_p3_v1024w1",
+      "tile": [
+        96,
+        192,
+        128
+      ],
+      "traits_args": "128, 96, 192, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 1, 4, 1, 4",
+      "vgpr_count": 482,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x192x128_4x1_16x16x32_0x0x0_w1x4_c4x1_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x192x128_4x1_16x16x32_0x0x0_w1x4_c4x1_p3_v1024w1.s"
+      },
+      "asm_lines": 3294,
+      "asm_va_vdst0": 26,
+      "asm_wmma": 432,
+      "asm_wmma_dst_hi": 432,
+      "cluster": [
+        4,
+        1
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 2061,
+      "dis_va_vdst0": 26,
+      "dis_wmma": 432,
+      "dis_wmma_dst_hi": 432,
+      "group_segment_fixed_size": 235008,
+      "kernarg_segment_size": 64,
+      "kid": 21212,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_wl_co_128x96x192x128_4x1_16x16x32_0x0x0_w1x4_c4x1_p3_v1024w1",
+      "tile": [
+        96,
+        192,
+        128
+      ],
+      "traits_args": "128, 96, 192, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 4, 1, 1, 4",
+      "vgpr_count": 482,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x192x128_4x1_16x16x32_0x0x0_w1x4_c2x2_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x192x128_4x1_16x16x32_0x0x0_w1x4_c2x2_p3_v1024w1.s"
+      },
+      "asm_lines": 3300,
+      "asm_va_vdst0": 26,
+      "asm_wmma": 432,
+      "asm_wmma_dst_hi": 432,
+      "cluster": [
+        2,
+        2
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 2059,
+      "dis_va_vdst0": 26,
+      "dis_wmma": 432,
+      "dis_wmma_dst_hi": 432,
+      "group_segment_fixed_size": 235008,
+      "kernarg_segment_size": 64,
+      "kid": 21213,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_wl_co_128x96x192x128_4x1_16x16x32_0x0x0_w1x4_c2x2_p3_v1024w1",
+      "tile": [
+        96,
+        192,
+        128
+      ],
+      "traits_args": "128, 96, 192, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 2, 2, 1, 4",
+      "vgpr_count": 482,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x192x128_4x1_16x16x32_0x0x0_w1x4_c4x4_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x192x128_4x1_16x16x32_0x0x0_w1x4_c4x4_p3_v1024w1.s"
+      },
+      "asm_lines": 3300,
+      "asm_va_vdst0": 26,
+      "asm_wmma": 432,
+      "asm_wmma_dst_hi": 432,
+      "cluster": [
+        4,
+        4
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 2059,
+      "dis_va_vdst0": 26,
+      "dis_wmma": 432,
+      "dis_wmma_dst_hi": 432,
+      "group_segment_fixed_size": 235008,
+      "kernarg_segment_size": 64,
+      "kid": 21214,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_wl_co_128x96x192x128_4x1_16x16x32_0x0x0_w1x4_c4x4_p3_v1024w1",
+      "tile": [
+        96,
+        192,
+        128
+      ],
+      "traits_args": "128, 96, 192, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 4, 4, 1, 4",
+      "vgpr_count": 482,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x256x128_4x1_16x16x32_0x0x0_w1x4_c1x1_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x256x128_4x1_16x16x32_0x0x0_w1x4_c1x1_p3_v1024w1.s"
+      },
+      "asm_lines": 3881,
+      "asm_va_vdst0": 30,
+      "asm_wmma": 576,
+      "asm_wmma_dst_hi": 576,
+      "cluster": [
+        1,
+        1
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 2549,
+      "dis_va_vdst0": 30,
+      "dis_wmma": 576,
+      "dis_wmma_dst_hi": 576,
+      "group_segment_fixed_size": 287232,
+      "kernarg_segment_size": 64,
+      "kid": 21215,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_wl_co_128x96x256x128_4x1_16x16x32_0x0x0_w1x4_c1x1_p3_v1024w1",
+      "tile": [
+        96,
+        256,
+        128
+      ],
+      "traits_args": "128, 96, 256, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 1, 1, 1, 4",
+      "vgpr_count": 646,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x256x128_4x1_16x16x32_0x0x0_w1x4_c1x4_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x256x128_4x1_16x16x32_0x0x0_w1x4_c1x4_p3_v1024w1.s"
+      },
+      "asm_lines": 3880,
+      "asm_va_vdst0": 31,
+      "asm_wmma": 576,
+      "asm_wmma_dst_hi": 576,
+      "cluster": [
+        1,
+        4
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 2548,
+      "dis_va_vdst0": 31,
+      "dis_wmma": 576,
+      "dis_wmma_dst_hi": 576,
+      "group_segment_fixed_size": 287232,
+      "kernarg_segment_size": 64,
+      "kid": 21216,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_wl_co_128x96x256x128_4x1_16x16x32_0x0x0_w1x4_c1x4_p3_v1024w1",
+      "tile": [
+        96,
+        256,
+        128
+      ],
+      "traits_args": "128, 96, 256, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 1, 4, 1, 4",
+      "vgpr_count": 646,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x256x128_4x1_16x16x32_0x0x0_w1x4_c4x1_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x256x128_4x1_16x16x32_0x0x0_w1x4_c4x1_p3_v1024w1.s"
+      },
+      "asm_lines": 3879,
+      "asm_va_vdst0": 31,
+      "asm_wmma": 576,
+      "asm_wmma_dst_hi": 576,
+      "cluster": [
+        4,
+        1
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 2550,
+      "dis_va_vdst0": 31,
+      "dis_wmma": 576,
+      "dis_wmma_dst_hi": 576,
+      "group_segment_fixed_size": 287232,
+      "kernarg_segment_size": 64,
+      "kid": 21217,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_wl_co_128x96x256x128_4x1_16x16x32_0x0x0_w1x4_c4x1_p3_v1024w1",
+      "tile": [
+        96,
+        256,
+        128
+      ],
+      "traits_args": "128, 96, 256, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 4, 1, 1, 4",
+      "vgpr_count": 646,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x256x128_4x1_16x16x32_0x0x0_w1x4_c2x2_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x256x128_4x1_16x16x32_0x0x0_w1x4_c2x2_p3_v1024w1.s"
+      },
+      "asm_lines": 3886,
+      "asm_va_vdst0": 31,
+      "asm_wmma": 576,
+      "asm_wmma_dst_hi": 576,
+      "cluster": [
+        2,
+        2
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 2549,
+      "dis_va_vdst0": 31,
+      "dis_wmma": 576,
+      "dis_wmma_dst_hi": 576,
+      "group_segment_fixed_size": 287232,
+      "kernarg_segment_size": 64,
+      "kid": 21218,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_wl_co_128x96x256x128_4x1_16x16x32_0x0x0_w1x4_c2x2_p3_v1024w1",
+      "tile": [
+        96,
+        256,
+        128
+      ],
+      "traits_args": "128, 96, 256, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 2, 2, 1, 4",
+      "vgpr_count": 646,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x256x128_4x1_16x16x32_0x0x0_w1x4_c4x4_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x256x128_4x1_16x16x32_0x0x0_w1x4_c4x4_p3_v1024w1.s"
+      },
+      "asm_lines": 3886,
+      "asm_va_vdst0": 31,
+      "asm_wmma": 576,
+      "asm_wmma_dst_hi": 576,
+      "cluster": [
+        4,
+        4
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 2548,
+      "dis_va_vdst0": 31,
+      "dis_wmma": 576,
+      "dis_wmma_dst_hi": 576,
+      "group_segment_fixed_size": 287232,
+      "kernarg_segment_size": 64,
+      "kid": 21219,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_wl_co_128x96x256x128_4x1_16x16x32_0x0x0_w1x4_c4x4_p3_v1024w1",
+      "tile": [
+        96,
+        256,
+        128
+      ],
+      "traits_args": "128, 96, 256, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 4, 4, 1, 4",
+      "vgpr_count": 646,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x128x128_4x1_16x16x32_0x0x0_w1x4_c1x1_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x128x128_4x1_16x16x32_0x0x0_w1x4_c1x1_p3_v1024w1.s"
+      },
+      "asm_lines": 2996,
+      "asm_va_vdst0": 31,
+      "asm_wmma": 384,
+      "asm_wmma_dst_hi": 384,
+      "cluster": [
+        1,
+        1
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 2047,
+      "dis_va_vdst0": 31,
+      "dis_wmma": 384,
+      "dis_wmma_dst_hi": 384,
+      "group_segment_fixed_size": 208896,
+      "kernarg_segment_size": 64,
+      "kid": 21225,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_wl_co_128x128x128x128_4x1_16x16x32_0x0x0_w1x4_c1x1_p3_v1024w1",
+      "tile": [
+        128,
+        128,
+        128
+      ],
+      "traits_args": "128, 128, 128, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 1, 1, 1, 4",
+      "vgpr_count": 558,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x128x128_4x1_16x16x32_0x0x0_w1x4_c1x4_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x128x128_4x1_16x16x32_0x0x0_w1x4_c1x4_p3_v1024w1.s"
+      },
+      "asm_lines": 2995,
+      "asm_va_vdst0": 31,
+      "asm_wmma": 384,
+      "asm_wmma_dst_hi": 384,
+      "cluster": [
+        1,
+        4
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 2046,
+      "dis_va_vdst0": 31,
+      "dis_wmma": 384,
+      "dis_wmma_dst_hi": 384,
+      "group_segment_fixed_size": 208896,
+      "kernarg_segment_size": 64,
+      "kid": 21226,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_wl_co_128x128x128x128_4x1_16x16x32_0x0x0_w1x4_c1x4_p3_v1024w1",
+      "tile": [
+        128,
+        128,
+        128
+      ],
+      "traits_args": "128, 128, 128, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 1, 4, 1, 4",
+      "vgpr_count": 558,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x128x128_4x1_16x16x32_0x0x0_w1x4_c4x1_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x128x128_4x1_16x16x32_0x0x0_w1x4_c4x1_p3_v1024w1.s"
+      },
+      "asm_lines": 2995,
+      "asm_va_vdst0": 31,
+      "asm_wmma": 384,
+      "asm_wmma_dst_hi": 384,
+      "cluster": [
+        4,
+        1
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 2047,
+      "dis_va_vdst0": 31,
+      "dis_wmma": 384,
+      "dis_wmma_dst_hi": 384,
+      "group_segment_fixed_size": 208896,
+      "kernarg_segment_size": 64,
+      "kid": 21227,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_wl_co_128x128x128x128_4x1_16x16x32_0x0x0_w1x4_c4x1_p3_v1024w1",
+      "tile": [
+        128,
+        128,
+        128
+      ],
+      "traits_args": "128, 128, 128, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 4, 1, 1, 4",
+      "vgpr_count": 558,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x128x128_4x1_16x16x32_0x0x0_w1x4_c2x2_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x128x128_4x1_16x16x32_0x0x0_w1x4_c2x2_p3_v1024w1.s"
+      },
+      "asm_lines": 3002,
+      "asm_va_vdst0": 31,
+      "asm_wmma": 384,
+      "asm_wmma_dst_hi": 384,
+      "cluster": [
+        2,
+        2
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 2046,
+      "dis_va_vdst0": 31,
+      "dis_wmma": 384,
+      "dis_wmma_dst_hi": 384,
+      "group_segment_fixed_size": 208896,
+      "kernarg_segment_size": 64,
+      "kid": 21228,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_wl_co_128x128x128x128_4x1_16x16x32_0x0x0_w1x4_c2x2_p3_v1024w1",
+      "tile": [
+        128,
+        128,
+        128
+      ],
+      "traits_args": "128, 128, 128, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 2, 2, 1, 4",
+      "vgpr_count": 558,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x128x128_4x1_16x16x32_0x0x0_w1x4_c4x4_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x128x128_4x1_16x16x32_0x0x0_w1x4_c4x4_p3_v1024w1.s"
+      },
+      "asm_lines": 3002,
+      "asm_va_vdst0": 31,
+      "asm_wmma": 384,
+      "asm_wmma_dst_hi": 384,
+      "cluster": [
+        4,
+        4
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 2045,
+      "dis_va_vdst0": 31,
+      "dis_wmma": 384,
+      "dis_wmma_dst_hi": 384,
+      "group_segment_fixed_size": 208896,
+      "kernarg_segment_size": 64,
+      "kid": 21229,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_wl_co_128x128x128x128_4x1_16x16x32_0x0x0_w1x4_c4x4_p3_v1024w1",
+      "tile": [
+        128,
+        128,
+        128
+      ],
+      "traits_args": "128, 128, 128, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 4, 4, 1, 4",
+      "vgpr_count": 558,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x192x128_4x1_16x16x32_0x0x0_w1x4_c1x1_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x192x128_4x1_16x16x32_0x0x0_w1x4_c1x1_p3_v1024w1.s"
+      },
+      "asm_lines": 4101,
+      "asm_va_vdst0": 36,
+      "asm_wmma": 576,
+      "asm_wmma_dst_hi": 576,
+      "cluster": [
+        1,
+        1
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 2501,
+      "dis_va_vdst0": 36,
+      "dis_wmma": 576,
+      "dis_wmma_dst_hi": 576,
+      "group_segment_fixed_size": 261120,
+      "kernarg_segment_size": 64,
+      "kid": 21230,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_wl_co_128x128x192x128_4x1_16x16x32_0x0x0_w1x4_c1x1_p3_v1024w1",
+      "tile": [
+        128,
+        192,
+        128
+      ],
+      "traits_args": "128, 128, 192, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 1, 1, 1, 4",
+      "vgpr_count": 618,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x192x128_4x1_16x16x32_0x0x0_w1x4_c1x4_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x192x128_4x1_16x16x32_0x0x0_w1x4_c1x4_p3_v1024w1.s"
+      },
+      "asm_lines": 4097,
+      "asm_va_vdst0": 36,
+      "asm_wmma": 576,
+      "asm_wmma_dst_hi": 576,
+      "cluster": [
+        1,
+        4
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 2500,
+      "dis_va_vdst0": 36,
+      "dis_wmma": 576,
+      "dis_wmma_dst_hi": 576,
+      "group_segment_fixed_size": 261120,
+      "kernarg_segment_size": 64,
+      "kid": 21231,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_wl_co_128x128x192x128_4x1_16x16x32_0x0x0_w1x4_c1x4_p3_v1024w1",
+      "tile": [
+        128,
+        192,
+        128
+      ],
+      "traits_args": "128, 128, 192, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 1, 4, 1, 4",
+      "vgpr_count": 618,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x192x128_4x1_16x16x32_0x0x0_w1x4_c4x1_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x192x128_4x1_16x16x32_0x0x0_w1x4_c4x1_p3_v1024w1.s"
+      },
+      "asm_lines": 4098,
+      "asm_va_vdst0": 36,
+      "asm_wmma": 576,
+      "asm_wmma_dst_hi": 576,
+      "cluster": [
+        4,
+        1
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 2502,
+      "dis_va_vdst0": 36,
+      "dis_wmma": 576,
+      "dis_wmma_dst_hi": 576,
+      "group_segment_fixed_size": 261120,
+      "kernarg_segment_size": 64,
+      "kid": 21232,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_wl_co_128x128x192x128_4x1_16x16x32_0x0x0_w1x4_c4x1_p3_v1024w1",
+      "tile": [
+        128,
+        192,
+        128
+      ],
+      "traits_args": "128, 128, 192, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 4, 1, 1, 4",
+      "vgpr_count": 618,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x192x128_4x1_16x16x32_0x0x0_w1x4_c2x2_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x192x128_4x1_16x16x32_0x0x0_w1x4_c2x2_p3_v1024w1.s"
+      },
+      "asm_lines": 4104,
+      "asm_va_vdst0": 36,
+      "asm_wmma": 576,
+      "asm_wmma_dst_hi": 576,
+      "cluster": [
+        2,
+        2
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 2532,
+      "dis_va_vdst0": 36,
+      "dis_wmma": 576,
+      "dis_wmma_dst_hi": 576,
+      "group_segment_fixed_size": 261120,
+      "kernarg_segment_size": 64,
+      "kid": 21233,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_wl_co_128x128x192x128_4x1_16x16x32_0x0x0_w1x4_c2x2_p3_v1024w1",
+      "tile": [
+        128,
+        192,
+        128
+      ],
+      "traits_args": "128, 128, 192, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 2, 2, 1, 4",
+      "vgpr_count": 618,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x192x128_4x1_16x16x32_0x0x0_w1x4_c4x4_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x192x128_4x1_16x16x32_0x0x0_w1x4_c4x4_p3_v1024w1.s"
+      },
+      "asm_lines": 4104,
+      "asm_va_vdst0": 36,
+      "asm_wmma": 576,
+      "asm_wmma_dst_hi": 576,
+      "cluster": [
+        4,
+        4
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 2531,
+      "dis_va_vdst0": 36,
+      "dis_wmma": 576,
+      "dis_wmma_dst_hi": 576,
+      "group_segment_fixed_size": 261120,
+      "kernarg_segment_size": 64,
+      "kid": 21234,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_wl_co_128x128x192x128_4x1_16x16x32_0x0x0_w1x4_c4x4_p3_v1024w1",
+      "tile": [
+        128,
+        192,
+        128
+      ],
+      "traits_args": "128, 128, 192, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 4, 4, 1, 4",
+      "vgpr_count": 618,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x256x128_4x1_16x16x32_0x0x0_w1x4_c1x1_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x256x128_4x1_16x16x32_0x0x0_w1x4_c1x1_p3_v1024w1.s"
+      },
+      "asm_lines": 4915,
+      "asm_va_vdst0": 45,
+      "asm_wmma": 768,
+      "asm_wmma_dst_hi": 768,
+      "cluster": [
+        1,
+        1
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 3194,
+      "dis_va_vdst0": 45,
+      "dis_wmma": 768,
+      "dis_wmma_dst_hi": 768,
+      "group_segment_fixed_size": 313344,
+      "kernarg_segment_size": 64,
+      "kid": 21235,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_wl_co_128x128x256x128_4x1_16x16x32_0x0x0_w1x4_c1x1_p3_v1024w1",
+      "tile": [
+        128,
+        256,
+        128
+      ],
+      "traits_args": "128, 128, 256, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 1, 1, 1, 4",
+      "vgpr_count": 806,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x256x128_4x1_16x16x32_0x0x0_w1x4_c1x4_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x256x128_4x1_16x16x32_0x0x0_w1x4_c1x4_p3_v1024w1.s"
+      },
+      "asm_lines": 4914,
+      "asm_va_vdst0": 46,
+      "asm_wmma": 768,
+      "asm_wmma_dst_hi": 768,
+      "cluster": [
+        1,
+        4
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 3193,
+      "dis_va_vdst0": 46,
+      "dis_wmma": 768,
+      "dis_wmma_dst_hi": 768,
+      "group_segment_fixed_size": 313344,
+      "kernarg_segment_size": 64,
+      "kid": 21236,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_wl_co_128x128x256x128_4x1_16x16x32_0x0x0_w1x4_c1x4_p3_v1024w1",
+      "tile": [
+        128,
+        256,
+        128
+      ],
+      "traits_args": "128, 128, 256, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 1, 4, 1, 4",
+      "vgpr_count": 806,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x256x128_4x1_16x16x32_0x0x0_w1x4_c4x1_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x256x128_4x1_16x16x32_0x0x0_w1x4_c4x1_p3_v1024w1.s"
+      },
+      "asm_lines": 4914,
+      "asm_va_vdst0": 46,
+      "asm_wmma": 768,
+      "asm_wmma_dst_hi": 768,
+      "cluster": [
+        4,
+        1
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 3194,
+      "dis_va_vdst0": 46,
+      "dis_wmma": 768,
+      "dis_wmma_dst_hi": 768,
+      "group_segment_fixed_size": 313344,
+      "kernarg_segment_size": 64,
+      "kid": 21237,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_wl_co_128x128x256x128_4x1_16x16x32_0x0x0_w1x4_c4x1_p3_v1024w1",
+      "tile": [
+        128,
+        256,
+        128
+      ],
+      "traits_args": "128, 128, 256, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 4, 1, 1, 4",
+      "vgpr_count": 806,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x256x128_4x1_16x16x32_0x0x0_w1x4_c2x2_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x256x128_4x1_16x16x32_0x0x0_w1x4_c2x2_p3_v1024w1.s"
+      },
+      "asm_lines": 4921,
+      "asm_va_vdst0": 46,
+      "asm_wmma": 768,
+      "asm_wmma_dst_hi": 768,
+      "cluster": [
+        2,
+        2
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 3226,
+      "dis_va_vdst0": 46,
+      "dis_wmma": 768,
+      "dis_wmma_dst_hi": 768,
+      "group_segment_fixed_size": 313344,
+      "kernarg_segment_size": 64,
+      "kid": 21238,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_wl_co_128x128x256x128_4x1_16x16x32_0x0x0_w1x4_c2x2_p3_v1024w1",
+      "tile": [
+        128,
+        256,
+        128
+      ],
+      "traits_args": "128, 128, 256, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 2, 2, 1, 4",
+      "vgpr_count": 806,
+      "vgpr_spill_count": 0
+    },
+    {
+      "asm": {
+        "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x256x128_4x1_16x16x32_0x0x0_w1x4_c4x4_p3_v1024w1.dis",
+        "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x256x128_4x1_16x16x32_0x0x0_w1x4_c4x4_p3_v1024w1.s"
+      },
+      "asm_lines": 4921,
+      "asm_va_vdst0": 46,
+      "asm_wmma": 768,
+      "asm_wmma_dst_hi": 768,
+      "cluster": [
+        4,
+        4
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 3224,
+      "dis_va_vdst0": 46,
+      "dis_wmma": 768,
+      "dis_wmma_dst_hi": 768,
+      "group_segment_fixed_size": 313344,
+      "kernarg_segment_size": 64,
+      "kid": 21239,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 3,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_wl_co_128x128x256x128_4x1_16x16x32_0x0x0_w1x4_c4x4_p3_v1024w1",
+      "tile": [
+        128,
+        256,
+        128
+      ],
+      "traits_args": "128, 128, 256, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 4, 4, 1, 4",
+      "vgpr_count": 806,
+      "vgpr_spill_count": 0
+    }
+  ]
+}
