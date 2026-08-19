@@ -86,6 +86,11 @@ def compile_gemm_a16w16(
         f"bad sched_strategy {sched_strategy!r}",
     )
     _req(split_k >= 1, f"split_k must be >= 1, got {split_k}")
+    _req(
+        not (activation and split_k > 1),
+        "activation is applied per k-split partial; activation with split_k > 1 "
+        "would compute act(partial) summed instead of act(sum)",
+    )
 
     elem_bytes = 2
     elem_bytes_d = 2 if out_dtype in ("f16", "bf16") else 4
@@ -114,7 +119,6 @@ def compile_gemm_a16w16(
         _req(N > 0, "N must be > 0 at compile time when physical_kn=True")
         _req(tile_n & (tile_n - 1) == 0, f"tile_n must be a power of 2, got {tile_n}")
     if not physical_mk:
-        _req(M > 0, "M must be > 0 at compile time when physical_mk=False")
         _req(tile_m & (tile_m - 1) == 0, f"tile_m must be a power of 2, got {tile_m}")
     _req(
         num_k_tiles >= num_buffers - 1,
@@ -131,20 +135,20 @@ def compile_gemm_a16w16(
     N_A_FRAGS, N_B_FRAGS = wmma_m_rep * k_wmma_steps, wmma_n_rep * k_wmma_steps
 
     if physical_mk:
-        a_tile_shape, a_outer_stride, a_pad_interval = (tile_m, tile_k), K, tile_k
+        a_tile_shape, a_pad_interval = (tile_m, tile_k), tile_k
         a_imm_bytes, lds_a_stride = tile_k * elem_bytes, tile_k + LDS_PAD_A
         lds_a_elems = tile_m * lds_a_stride + LDS_PAD_A
     else:
-        a_tile_shape, a_outer_stride, a_pad_interval = (tile_k, tile_m), M, tile_m
-        a_imm_bytes, lds_a_stride = tile_k * M * elem_bytes, tile_m + LDS_PAD_A
+        a_tile_shape, a_pad_interval = (tile_k, tile_m), tile_m
+        a_imm_bytes, lds_a_stride = None, tile_m + LDS_PAD_A
         lds_a_elems = tile_k * lds_a_stride + LDS_PAD_A
 
     if physical_kn:
-        b_tile_shape, b_outer_stride, b_pad_interval = (tile_k, tile_n), N, tile_n
-        b_imm_bytes, lds_b_stride = tile_k * N * elem_bytes, tile_n + LDS_PAD_B
+        b_tile_shape, b_pad_interval = (tile_k, tile_n), tile_n
+        b_imm_bytes, lds_b_stride = None, tile_n + LDS_PAD_B
         lds_b_elems = tile_k * lds_b_stride + LDS_PAD_B
     else:
-        b_tile_shape, b_outer_stride, b_pad_interval = (tile_n, tile_k), K, tile_k
+        b_tile_shape, b_pad_interval = (tile_n, tile_k), tile_k
         b_imm_bytes, lds_b_stride = tile_k * elem_bytes, tile_k + LDS_PAD_B
         lds_b_elems = tile_n * lds_b_stride + LDS_PAD_B
 
@@ -177,6 +181,8 @@ def compile_gemm_a16w16(
         arg_bias: fx.Pointer,
         i32_m: fx.Int32,
         i32_n: fx.Int32,
+        i32_lda: fx.Int32,
+        i32_ldb: fx.Int32,
     ):
         rocdl.disable_xdl_arb_stall()
         elem_ty = _fx_elem.ir_type
@@ -228,6 +234,7 @@ def compile_gemm_a16w16(
                 num_warps=num_warps,
                 pad_interval=pad_interval,
                 pad_amount=pad_amount,
+                early_timeout=True,
             )
 
         m_oob = fx.Int32(m_idx - blk_m)
@@ -235,34 +242,40 @@ def compile_gemm_a16w16(
         a_extents = [m_oob, None] if const_expr(physical_mk) else [None, m_oob]
         b_extents = [None, n_oob] if const_expr(physical_kn) else [n_oob, None]
 
+        lda64 = fx.Int64(fx.Uint64(i32_lda))
+        ldb64 = fx.Int64(fx.Uint64(i32_ldb))
         if const_expr(physical_mk):
-            a_base_off = blk_m64 * K + split_k_base64
+            a_base_off = blk_m64 * lda64 + split_k_base64
         else:
-            a_base_off = split_k_base64 * M + blk_m64
+            a_base_off = split_k_base64 * lda64 + blk_m64
+        a_stride_rt = fx.Int32(i32_lda)
         gA, atom_a = _mk_side(
             arg_x,
             a_base_off,
             a_tile_shape,
-            a_outer_stride,
+            a_stride_rt,
             a_pad_interval,
             LDS_PAD_A,
             a_extents,
         )
         if const_expr(physical_kn):
-            b_base_off = split_k_base64 * N + blk_n64
+            b_base_off = split_k_base64 * ldb64 + blk_n64
         else:
-            b_base_off = blk_n64 * K + split_k_base64
+            b_base_off = blk_n64 * ldb64 + split_k_base64
+        b_stride_rt = fx.Int32(i32_ldb)
         gB, atom_b = _mk_side(
             arg_w,
             b_base_off,
             b_tile_shape,
-            b_outer_stride,
+            b_stride_rt,
             b_pad_interval,
             LDS_PAD_B,
             b_extents,
         )
 
         def _imm64(k_tile, mul):
+            if const_expr(not isinstance(mul, int)):
+                return fx.Int64(fx.Int64(k_tile) * mul)
             if const_expr(isinstance(k_tile, int)):
                 return fx.Int64(k_tile * mul)
             return fx.Int64(fx.Int32(k_tile) * mul)  # mul in i32, widen for TDM
@@ -287,6 +300,17 @@ def compile_gemm_a16w16(
                 for rep in range_constexpr(reps)
             ]
 
+        a_imm_rt = (
+            a_imm_bytes
+            if const_expr(a_imm_bytes is not None)
+            else lda64 * (tile_k * elem_bytes)
+        )
+        b_imm_rt = (
+            b_imm_bytes
+            if const_expr(b_imm_bytes is not None)
+            else ldb64 * (tile_k * elem_bytes)
+        )
+
         # One spec per operand side; A and B differ only in these fields.
         MEM, BASE, BASES, STRIDE, TR, ELEMS, REPS, ATOM, GT, SHAPE, IMM = range(11)
         A_SIDE = (
@@ -300,7 +324,7 @@ def compile_gemm_a16w16(
             atom_a,
             gA,
             a_tile_shape,
-            a_imm_bytes,
+            a_imm_rt,
         )
         B_SIDE = (
             big_b_mem,
@@ -313,7 +337,7 @@ def compile_gemm_a16w16(
             atom_b,
             gB,
             b_tile_shape,
-            b_imm_bytes,
+            b_imm_rt,
         )
 
         def issue_tdm_loads(buf_idx, k_tile):
@@ -441,7 +465,10 @@ def compile_gemm_a16w16(
                     for half in range_constexpr(2):
                         bv = load_bias4(col_tile + half)
                         for i in range_constexpr(4):
-                            elems.append(bv[i].to(fx.Float32))
+                            if const_expr(split_k > 1):
+                                elems.append(bv[i].to(fx.Float32) * (1.0 / split_k))
+                            else:
+                                elems.append(bv[i].to(fx.Float32))
                     bias_vecs.append(
                         fx.Vector.from_elements(elems, fx.Float32).ir_value()
                     )
@@ -637,6 +664,8 @@ def compile_gemm_a16w16(
         arg_bias: fx.Pointer,
         i32_m: fx.Int32,
         i32_n: fx.Int32,
+        i32_lda: fx.Int32,
+        i32_ldb: fx.Int32,
         stream: fx.Stream,
     ):
         gx = (fx.Uint64(i32_m) + (tile_m - 1)) // tile_m
@@ -650,6 +679,8 @@ def compile_gemm_a16w16(
             arg_bias,
             i32_m,
             i32_n,
+            i32_lda,
+            i32_ldb,
             value_attrs={
                 "rocdl.flat_work_group_size": f"{block_threads},{block_threads}",
                 "rocdl.waves_per_eu": wpe if wpe >= 1 else None,

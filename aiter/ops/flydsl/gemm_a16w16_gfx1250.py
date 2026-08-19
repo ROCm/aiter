@@ -49,7 +49,6 @@ def _p(t):
 
 
 _CFG_KEYS = (
-    "M",
     "N",
     "K",
     "tile_m",
@@ -106,8 +105,14 @@ def gemm_a16w16(
     assert x.shape[1] == w.shape[1], "Incompatible K dimensions"
 
     M, K, N = x.shape[0], x.shape[1], w.shape[0]
-    physical_mk = x.stride(1) == 1
-    physical_kn = w.stride(1) != 1
+    assert (
+        x.stride(1) == 1 or x.stride(0) == 1 or 1 in (M, K)
+    ), f"gemm_a16w16: x needs a unit-stride dim for TDM, got strides {tuple(x.stride())}"
+    assert (
+        w.stride(1) == 1 or w.stride(0) == 1 or 1 in (N, K)
+    ), f"gemm_a16w16: w needs a unit-stride dim for TDM, got strides {tuple(w.stride())}"
+    physical_mk = x.stride(1) == 1 or K == 1
+    physical_kn = w.stride(1) != 1 and N > 1
 
     K_padded = ((K + tile_k - 1) // tile_k) * tile_k
     if K_padded != K:
@@ -154,7 +159,6 @@ def gemm_a16w16(
         bias = torch.empty(0, device=x.device, dtype=dtype)
 
     launch_fn = _cached_launcher(
-        M if not physical_mk else 0,
         N,
         K,
         tile_m,
@@ -177,6 +181,14 @@ def gemm_a16w16(
         variant,
     )
 
+    if physical_mk:
+        lda = x.stride(0) if M > 1 else K
+    else:
+        lda = x.stride(1) if K > 1 else M
+    if physical_kn:
+        ldb = w.stride(1) if K > 1 else N
+    else:
+        ldb = w.stride(0) if N > 1 else K
     stream = torch.cuda.current_stream(device=x.device).cuda_stream
     _run_compiled(
         launch_fn,
@@ -186,6 +198,8 @@ def gemm_a16w16(
         _p(bias),
         M,
         N_stride,
+        lda,
+        ldb,
         _fx.Stream(stream),
     )
 
