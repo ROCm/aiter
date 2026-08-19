@@ -806,6 +806,7 @@ def _triton_gather_kv_b_proj_flat(
     stride_v_prefix = tl.full([], TpNumHeads * VHeadDim, dtype=tl.int64)
 
     k_type = k_buffer.dtype.element_ty
+    dot_type = tl.bfloat16 if NO_SCALE else k_type
     k_scalar_scale = 1.0 if k_type == tl.bfloat16 else tl.load(k_scale)
     offs_n_k = tl.arange(0, PaddedK)
     offs_n_v = tl.arange(0, PaddedV)
@@ -837,67 +838,67 @@ def _triton_gather_kv_b_proj_flat(
     if WEIGHT_PRESHUFFLE:
         k_nope_weight_0 = _load_unshuffle_segment(
             k_head_base, 0, QkNopeHeadDim, PaddedK, KV_CDim, ScaleKGranularity
-        ).to(k_type)
+        ).to(dot_type)
         k_nope_weight_1 = _load_unshuffle_segment(
             k_head_base, 1, QkNopeHeadDim, PaddedK, KV_CDim, ScaleKGranularity
-        ).to(k_type)
+        ).to(dot_type)
         k_nope_weight_2 = _load_unshuffle_segment(
             k_head_base, 2, QkNopeHeadDim, PaddedK, KV_CDim, ScaleKGranularity
-        ).to(k_type)
+        ).to(dot_type)
         k_nope_weight_3 = _load_unshuffle_segment(
             k_head_base, 3, QkNopeHeadDim, PaddedK, KV_CDim, ScaleKGranularity
-        ).to(k_type)
+        ).to(dot_type)
         v_nope_weight_0 = _load_unshuffle_segment(
             v_head_base, 0, VHeadDim, PaddedV, KV_CDim, ScaleKGranularity
-        ).to(k_type)
+        ).to(dot_type)
         v_nope_weight_1 = _load_unshuffle_segment(
             v_head_base, 1, VHeadDim, PaddedV, KV_CDim, ScaleKGranularity
-        ).to(k_type)
+        ).to(dot_type)
         v_nope_weight_2 = _load_unshuffle_segment(
             v_head_base, 2, VHeadDim, PaddedV, KV_CDim, ScaleKGranularity
-        ).to(k_type)
+        ).to(dot_type)
         v_nope_weight_3 = _load_unshuffle_segment(
             v_head_base, 3, VHeadDim, PaddedV, KV_CDim, ScaleKGranularity
-        ).to(k_type)
+        ).to(dot_type)
     else:
         k_weight_offset = k_head_base + offs_n_k[:, None] * KV_CDim + offs_k[None, :]
         v_weight_offset = v_head_base + offs_n_v[:, None] * KV_CDim + offs_k[None, :]
         k_nope_weight_0 = tl.load(k_weight_offset, mask=mask_k[:, None], other=0.0).to(
-            k_type
+            dot_type
         )
         k_nope_weight_1 = tl.load(
             k_weight_offset + ScaleKGranularity,
             mask=mask_k[:, None],
             other=0.0,
-        ).to(k_type)
+        ).to(dot_type)
         k_nope_weight_2 = tl.load(
             k_weight_offset + 2 * ScaleKGranularity,
             mask=mask_k[:, None],
             other=0.0,
-        ).to(k_type)
+        ).to(dot_type)
         k_nope_weight_3 = tl.load(
             k_weight_offset + 3 * ScaleKGranularity,
             mask=mask_k[:, None],
             other=0.0,
-        ).to(k_type)
+        ).to(dot_type)
         v_nope_weight_0 = tl.load(v_weight_offset, mask=mask_v[:, None], other=0.0).to(
-            k_type
+            dot_type
         )
         v_nope_weight_1 = tl.load(
             v_weight_offset + ScaleKGranularity,
             mask=mask_v[:, None],
             other=0.0,
-        ).to(k_type)
+        ).to(dot_type)
         v_nope_weight_2 = tl.load(
             v_weight_offset + 2 * ScaleKGranularity,
             mask=mask_v[:, None],
             other=0.0,
-        ).to(k_type)
+        ).to(dot_type)
         v_nope_weight_3 = tl.load(
             v_weight_offset + 3 * ScaleKGranularity,
             mask=mask_v[:, None],
             other=0.0,
-        ).to(k_type)
+        ).to(dot_type)
 
     if (not NO_SCALE) and (not PER_ROW_SCALE):
         k_nope_scale_0 = tl.load(
@@ -951,22 +952,22 @@ def _triton_gather_kv_b_proj_flat(
         )
         kv_c_data_0 = tl.load(
             k_buffer + data_offset, mask=token_mask[:, None], other=0.0
-        )
+        ).to(dot_type)
         kv_c_data_1 = tl.load(
             k_buffer + data_offset + ScaleKGranularity,
             mask=token_mask[:, None],
             other=0.0,
-        )
+        ).to(dot_type)
         kv_c_data_2 = tl.load(
             k_buffer + data_offset + 2 * ScaleKGranularity,
             mask=token_mask[:, None],
             other=0.0,
-        )
+        ).to(dot_type)
         kv_c_data_3 = tl.load(
             k_buffer + data_offset + 3 * ScaleKGranularity,
             mask=token_mask[:, None],
             other=0.0,
-        )
+        ).to(dot_type)
         kv_pe_data = tl.load(
             k_buffer
             + kv_block_idx[:, None] * stride_k_buffer

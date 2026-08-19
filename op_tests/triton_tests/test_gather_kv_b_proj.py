@@ -213,17 +213,24 @@ def _make_kv_test_data(
 
 
 @pytest.mark.parametrize(
-    "batch_size, block_size, num_tp, k_buffer_type, avg_kv_length",
+    "batch_size, block_size, num_tp, k_buffer_type, avg_kv_length, weight_preshuffle",
     [
-        (4, 1, 4, dtypes.fp8, 512),
-        (8, 16, 4, dtypes.fp8, 1024),
-        (32, 32, 4, dtypes.fp8, 2048),
-        (64, 1, 4, torch.bfloat16, 2048),
-        (1, 1, 4, torch.bfloat16, 512),
+        (4, 1, 4, dtypes.fp8, 512, True),
+        (4, 1, 4, dtypes.fp8, 512, False),
+        (8, 16, 4, dtypes.fp8, 1024, True),
+        (32, 32, 4, dtypes.fp8, 2048, True),
+        (64, 1, 4, torch.bfloat16, 2048, True),
+        (1, 1, 4, torch.bfloat16, 512, True),
     ],
 )
 def test_gather_kv_b_proj(
-    batch_size, block_size, num_tp, k_buffer_type, avg_kv_length, perf=False
+    batch_size,
+    block_size,
+    num_tp,
+    k_buffer_type,
+    avg_kv_length,
+    weight_preshuffle,
+    perf=False,
 ):
     torch.manual_seed(0)
     random.seed(0)
@@ -234,8 +241,6 @@ def test_gather_kv_b_proj(
     v_head_dim = 128
     tp_k_head_num = 128 // num_tp
     num_block = 2 * avg_kv_length // block_size
-
-    weight_preshuffle = True
 
     device = "cuda"
     weight_dtype = dtypes.fp8
@@ -335,6 +340,8 @@ def test_gather_kv_b_proj(
     # Validate results
     checkAllclose(k_ref, k_prefix, atol=1e-2, rtol=1e-2)
     checkAllclose(v_ref, v_prefix, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(k_prefix, k_ref, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(v_prefix, v_ref, atol=1e-2, rtol=1e-2)
 
     if perf:
         _, elapsed_us = run_perftest(
@@ -366,15 +373,22 @@ def test_gather_kv_b_proj(
 
 
 @pytest.mark.parametrize(
-    "batch_size, block_size, num_tp, k_buffer_type, avg_kv_length",
+    "batch_size, block_size, num_tp, k_buffer_type, avg_kv_length, weight_preshuffle",
     [
-        (4, 1, 4, dtypes.fp8, 512),
-        (8, 16, 4, dtypes.fp8, 1024),
-        (8, 16, 4, torch.bfloat16, 1024),
+        (4, 1, 4, dtypes.fp8, 512, True),
+        (4, 1, 4, dtypes.fp8, 512, False),
+        (8, 16, 4, dtypes.fp8, 1024, True),
+        (8, 16, 4, torch.bfloat16, 1024, True),
     ],
 )
 def test_gather_kv_b_proj_per_row_scale(
-    batch_size, block_size, num_tp, k_buffer_type, avg_kv_length, perf=False
+    batch_size,
+    block_size,
+    num_tp,
+    k_buffer_type,
+    avg_kv_length,
+    weight_preshuffle,
+    perf=False,
 ):
     """kv_proj_scale [weight_n]: one BF16/FP32 scale per output row (e.g. F8_E4M3 + per-row)."""
     torch.manual_seed(0)
@@ -385,7 +399,6 @@ def test_gather_kv_b_proj_per_row_scale(
     v_head_dim = 128
     tp_k_head_num = 128 // num_tp
     num_block = 2 * avg_kv_length // block_size
-    weight_preshuffle = True
     device = "cuda"
     weight_dtype = dtypes.fp8
     weight_n = tp_k_head_num * (qk_nope_head_dim + v_head_dim)
@@ -479,6 +492,8 @@ def test_gather_kv_b_proj_per_row_scale(
 
     checkAllclose(k_ref, k_prefix, atol=1e-2, rtol=1e-2)
     checkAllclose(v_ref, v_prefix, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(k_prefix, k_ref, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(v_prefix, v_ref, atol=1e-2, rtol=1e-2)
 
     if perf:
         _, elapsed_us = run_perftest(
@@ -510,20 +525,28 @@ def test_gather_kv_b_proj_per_row_scale(
 
 
 @pytest.mark.parametrize(
-    "batch_size, block_size, num_tp, k_buffer_type, avg_kv_length, scale_mode",
+    "batch_size, block_size, num_tp, k_buffer_type, avg_kv_length, scale_mode, weight_preshuffle",
     [
-        (4, 1, 4, torch.bfloat16, 512, "block"),
-        (8, 16, 4, torch.bfloat16, 1024, "block"),
-        (4, 1, 4, dtypes.fp8, 512, "block"),
-        (8, 16, 4, dtypes.fp8, 1024, "block"),
-        (4, 1, 4, torch.bfloat16, 512, "per_row"),
-        (8, 16, 4, torch.bfloat16, 1024, "per_row"),
-        (4, 1, 4, dtypes.fp8, 512, "per_row"),
-        (8, 16, 4, dtypes.fp8, 1024, "per_row"),
+        (4, 1, 4, torch.bfloat16, 512, "block", True),
+        (8, 16, 4, torch.bfloat16, 1024, "block", True),
+        (4, 1, 4, dtypes.fp8, 512, "block", True),
+        (8, 16, 4, dtypes.fp8, 1024, "block", True),
+        (4, 1, 4, torch.bfloat16, 512, "per_row", True),
+        (8, 16, 4, torch.bfloat16, 1024, "per_row", True),
+        (4, 1, 4, dtypes.fp8, 512, "per_row", True),
+        (8, 16, 4, dtypes.fp8, 1024, "per_row", True),
+        (4, 1, 4, dtypes.fp8, 512, "none", False),
     ],
 )
 def test_gather_kv_b_proj_bf16_weight(
-    batch_size, block_size, num_tp, k_buffer_type, avg_kv_length, scale_mode, perf=False
+    batch_size,
+    block_size,
+    num_tp,
+    k_buffer_type,
+    avg_kv_length,
+    scale_mode,
+    weight_preshuffle,
+    perf=False,
 ):
     """Test gather_kv_b_proj with bf16 weight (no quantization on weight).
 
@@ -538,7 +561,6 @@ def test_gather_kv_b_proj_bf16_weight(
     v_head_dim = 128
     tp_k_head_num = 128 // num_tp
     num_block = 2 * avg_kv_length // block_size
-    weight_preshuffle = True
     device = "cuda"
     weight_dtype = torch.bfloat16
     weight_n = tp_k_head_num * (qk_nope_head_dim + v_head_dim)
@@ -587,7 +609,7 @@ def test_gather_kv_b_proj_bf16_weight(
     ).to(weight_dtype)
 
     # Use all-ones scale to simulate no weight quantization
-    if scale_mode == "per_row":
+    if scale_mode in ("per_row", "none"):
         kv_proj_scale = torch.ones((weight_n, 1), device=device, dtype=torch.float32)
     else:
         kv_proj_scale = torch.ones(
@@ -620,6 +642,7 @@ def test_gather_kv_b_proj_bf16_weight(
 
     if weight_preshuffle:
         kv_proj_weight = shuffle_weight(kv_proj_weight)
+    kernel_scale = None if scale_mode == "none" else kv_proj_scale
 
     gather_kv_b_proj(
         k_buffer,
@@ -628,7 +651,7 @@ def test_gather_kv_b_proj_bf16_weight(
         kv_indices,
         kv_prefix_sum_context_lens,
         kv_proj_weight,
-        kv_proj_scale,
+        kernel_scale,
         k_prefix.view(-1, tp_k_head_num, qk_nope_head_dim + kv_pe_dim),
         v_prefix.view(-1, tp_k_head_num, v_head_dim),
         weight_preshuffle=weight_preshuffle,
@@ -636,6 +659,9 @@ def test_gather_kv_b_proj_bf16_weight(
 
     checkAllclose(k_ref, k_prefix, atol=1e-2, rtol=1e-2)
     checkAllclose(v_ref, v_prefix, atol=1e-2, rtol=1e-2)
+    if scale_mode == "none":
+        torch.testing.assert_close(k_prefix, k_ref, atol=1e-2, rtol=1e-2)
+        torch.testing.assert_close(v_prefix, v_ref, atol=1e-2, rtol=1e-2)
 
     if perf:
         _, elapsed_us = run_perftest(
@@ -646,7 +672,7 @@ def test_gather_kv_b_proj_bf16_weight(
             kv_indices,
             kv_prefix_sum_context_lens,
             kv_proj_weight,
-            kv_proj_scale,
+            kernel_scale,
             k_prefix.view(-1, tp_k_head_num, qk_nope_head_dim + kv_pe_dim),
             v_prefix.view(-1, tp_k_head_num, v_head_dim),
             weight_preshuffle=weight_preshuffle,
@@ -1236,6 +1262,7 @@ if __name__ == "__main__":
             args.num_tp,
             k_buffer_type,
             args.kv_length,
+            weight_preshuffle=True,
             perf=True,
         )
         test_gather_kv_b_proj(
@@ -1244,5 +1271,6 @@ if __name__ == "__main__":
             args.num_tp,
             k_buffer_type,
             args.kv_length,
+            weight_preshuffle=True,
             perf=True,
         )
