@@ -52,7 +52,10 @@ from aiter.ops.flydsl.mxfp4_kname import (
     parse_flydsl_v2_gemm2_kernel,
     parse_g2_kname_any,
 )
-from aiter.ops.opus import moe_stage2_a8w4_fused_adapter as _opus_a8w4
+from aiter.ops.opus import moe_stage2_a8w4 as _opus_a8w4
+from aiter.ops.opus.moe_stage1_a8w4 import (
+    opus_a8w4_stage1_wrapper as _opus_a8w4_stage1_wrapper,
+)
 
 BLOCK_SIZE_M = 32
 
@@ -582,6 +585,8 @@ def fused_moe_fake(
     bias1: torch.Tensor | None = None,
     bias2: torch.Tensor | None = None,
     swiglu_limit: float | None = None,
+    beta: float | None = None,
+    linear_beta: float | None = None,
     gate_mode: str = GateMode.SEPARATED.value,
 ) -> torch.Tensor:
     device = topk_ids.device
@@ -1314,57 +1319,6 @@ def _normalize_bias_for_kernel(
     if bias.dtype != torch.float32:
         raise TypeError(f"MoE bias must be fp32, got {bias.dtype}")
     return bias
-
-
-def _opus_a8w4_stage1_wrapper(
-    hidden_states,
-    w1,
-    w2,
-    sorted_token_ids,
-    sorted_expert_ids,
-    num_valid_ids,
-    out,
-    topk,
-    activation,
-    kernelName="",
-    block_m: int = 0,
-    w1_scale=None,
-    a1_scale=None,
-    sorted_weights=None,
-    bias1=None,
-    swiglu_limit: float | None = None,
-    situ_beta: float = 4.0,
-    situ_linear_beta: float = 25.0,
-    inter_dim_pad: int = 0,
-    output_sorted: bool = False,
-    **_kwargs,
-):
-    if sorted_weights is not None:
-        raise NotImplementedError(
-            "Opus A8W4 stage1 does not support routed-weight multiplication"
-        )
-    from aiter.ops.opus.moe_stage1_a8w4 import opus_moe_stage1_a8w4_fwd
-
-    return opus_moe_stage1_a8w4_fwd(
-        hidden_states,
-        w1,
-        a1_scale,
-        w1_scale,
-        sorted_token_ids,
-        sorted_expert_ids,
-        num_valid_ids,
-        topk=int(topk),
-        inter_dim_pad=int(inter_dim_pad),
-        bias=_normalize_bias_for_kernel(bias1),
-        out=out,
-        output_sorted=output_sorted,
-        block_m=int(block_m),
-        kernelName=str(kernelName),
-        activation=activation,
-        swiglu_limit=swiglu_limit,
-        situ_beta=situ_beta,
-        situ_linear_beta=situ_linear_beta,
-    )
 
 
 # TODO: remove this function once kernel handles padding in the runtime
@@ -2401,8 +2355,8 @@ def get_2stage_cfgs(
         cfg.get("kernelName2", "")
     )
     route_bucket_metadata = _opus_a8w4.route_bucket_metadata(cfg) if is_opus_cfg else {}
-    opus_stage2_cfg_values = (
-        _opus_a8w4.stage2_cfg_values(cfg, block_m) if is_opus_cfg else {}
+    opus_stage2_launch = (
+        _opus_a8w4.parse_stage2_config(cfg, block_m) if is_opus_cfg else None
     )
 
     tag = f"({kernelName1=}, {kernelName2=})"
@@ -2527,7 +2481,7 @@ def get_2stage_cfgs(
                 kernelName=kernelName2,
                 inter_dim_pad=intermediate_pad,
                 model_dim_pad=hidden_pad,
-                **opus_stage2_cfg_values,
+                launch=opus_stage2_launch,
             )
         elif is_cktile2:
             stage2_func = functools.partial(
@@ -2846,7 +2800,7 @@ def get_2stage_cfgs(
                 kernelName=kernelName2,
                 inter_dim_pad=intermediate_pad,
                 model_dim_pad=hidden_pad,
-                **opus_stage2_cfg_values,
+                launch=opus_stage2_launch,
             )
         elif kernelName2 and kernelName2.startswith("cktile_"):
             stage2_func = functools.partial(
@@ -2892,7 +2846,7 @@ def get_2stage_cfgs(
             kernelName=kernelName2,
             inter_dim_pad=intermediate_pad,
             model_dim_pad=hidden_pad,
-            **opus_stage2_cfg_values,
+            launch=opus_stage2_launch,
         )
     elif kernelName2 and kernelName2.startswith("cktile_"):
         stage2_func = functools.partial(
@@ -3129,7 +3083,7 @@ def fused_moe_2stages(
     if stage1_func is _flydsl_stage1_wrapper:
         if metadata.skip_inter_quant:
             extra_stage1_args["v2_output_layout"] = True
-        # SiTUv2 beta/linear_beta -> stage1 (runtime on the a16w4 port, baked on a8w4/a4w4); None -> 1.0.
+        # SiTUv2 beta/linear_beta -> stage1 runtime f32 scalars (not compile keys); None -> 1.0.
         extra_stage1_args["situ_beta"] = 1.0 if beta is None else float(beta)
         extra_stage1_args["situ_linear_beta"] = (
             1.0 if linear_beta is None else float(linear_beta)
