@@ -558,46 +558,27 @@ def _pa_decode_sparse_gfx950_gluon(
     has_invalid=False,
     fp8_fnuz=False,
 ):
-    """Merged gfx950 gluon DSv4 sparse-MLA decode driver. Format from ``cache.ndim``:
+    """Merged gfx950 gluon DSv4 sparse-MLA decode driver. Format from cache.ndim:
     3D [nb, block, ...] -> packed fp8_ds_mla (uint8: 448 NoPE fp8 e4m3 OCP +
                            embedded UE8M0 per-64 scale + 64 RoPE bf16) or a bf16
-                           block cache; pass ``extra_*`` for the SWA+top-k two-loop,
+                           block cache; pass extra_* for the SWA+top-k two-loop,
                            else a single segment.
-    2D [pages, D]       -> uniform pool: fp8 (uint8) + ``cache_scales``
-                           [pages, D//64] fp32, or bf16 (``cache_scales`` None).
+    2D [pages, D]       -> uniform pool: fp8 (uint8) + cache_scales
+                           [pages, D//64] fp32, or bf16 (cache_scales None).
     """
     assert q.ndim == 3, f"expected q=[b,h,d], got {q.shape}"
     assert DEVICE_ARCH == "gfx950", "gluon DSv4 decode kernel is gfx950-only"
 
-    # Tuned launch config (gfx950 / MI355), inlined. BLOCK_M = heads per MFMA M-tile;
-    # BLOCK_K = KV tile; num_warps = BLOCK_K // 16 (warps tile the dot-N, MFMA N=16).
-    BLOCK_M, BLOCK_K, MFMA_K, waves_per_eu = 16, 64, 16, 0
-    # AITER_PA_DECODE_BLOCK_K: experiment override for the KV tile width.
-    # num_warps stays BLOCK_K//16 (warps tile the dot-N, MFMA N=16).
-    import os as _os
-    _bk = _os.environ.get("AITER_PA_DECODE_BLOCK_K")
-    if _bk:
-        BLOCK_K = int(_bk)
-    # AITER_PA_DECODE_BLOCK_M: heads per MFMA M-tile. 16 is both the MFMA M and the
-    # DSv4 head count; larger pads and quadruples the accumulator (see RESULTS.md).
-    _bm = _os.environ.get("AITER_PA_DECODE_BLOCK_M")
-    if _bm:
-        BLOCK_M = int(_bm)
-    # AITER_PA_DECODE_MFMA_K: 32 selects CDNA4's double-rate v_mfma_f32_16x16x32_bf16
-    # (16 does 16x16x16, i.e. half the K per instruction).
-    _mk = _os.environ.get("AITER_PA_DECODE_MFMA_K")
-    if _mk:
-        MFMA_K = int(_mk)
+    # Tuned launch config (gfx950 / MI355). BLOCK_M = heads per MFMA M-tile, and 16
+    # is both the MFMA M and the DSv4 head count; BLOCK_K = KV tile; num_warps =
+    # BLOCK_K // 16, because warps tile the dot-N and MFMA N = 16.
+    BLOCK_M, BLOCK_K, MFMA_K = 16, 64, 16
     num_warps = max(1, BLOCK_K // 16)
-    # AITER_PA_DECODE_TW1: threads the NoPE gather spends on the head dim (16 B
-    # each). 32 issues a whole 512 B token row per instruction instead of 8 x 128 B
-    # quarters, which is what a scattered top-k gather wants; the cost is a longer
-    # per-lane slot vector. Measured best at 32 for every extra >= 128 (-10% at
-    # extra=128) and within noise at extra=8.
-    gather_tw1 = int(_os.environ.get("AITER_PA_DECODE_TW1", "32"))
-    # AITER_PA_DECODE_LDS_PAD: bf16 elements of padding after each kv_smem row.
-    lds_pad = int(_os.environ.get("AITER_PA_DECODE_LDS_PAD", "8"))
-    # AITER_PA_DECODE_NOPE_CHUNK: width of one fp8 dequant piece (0/unset = one shot).
+    # Threads the NoPE gather spends on the head dim, 16 B each: 32 requests a whole
+    # 512 B token row per instruction instead of four 128 B quarters, which is what
+    # a scattered top-k gather wants. The cost is a longer per-lane slot vector.
+    gather_tw1 = 32
+    lds_pad = 8  # bf16 elements of padding after each kv_smem row
     NOPE_DIM, ROPE_DIM = 448, 64
     MAX_BYTES = 2**31 - 1
 
@@ -633,7 +614,6 @@ def _pa_decode_sparse_gfx950_gluon(
         main_block, extra_block = 1, 1
         nope_dim = head_dim
         main_num_rows = extra_num_rows = cache.shape[0]
-        cache_bytes = max_addressable_bytes(cache)
         avg_main = indices.numel() / max(1, num_queries)  # one segment; no extra
         avg_extra = 0.0
     else:
@@ -657,9 +637,6 @@ def _pa_decode_sparse_gfx950_gluon(
         nope_dim = NOPE_DIM
         main_num_rows = cache.shape[0] * cache.shape[1]
         extra_num_rows = extra_cache.shape[0] * extra_cache.shape[1]
-        cache_bytes = max(
-            max_addressable_bytes(cache), max_addressable_bytes(extra_cache)
-        )
         avg_main = indices.numel() / max(1, num_queries)
         avg_extra = extra_indices.numel() / max(1, num_queries) if has_extra else 0.0
 
@@ -671,115 +648,73 @@ def _pa_decode_sparse_gfx950_gluon(
         main_fmt = "dsv4" if main_is_fp8 else "bf16"
         extra_fmt = "dsv4" if extra_is_fp8 else "bf16"
 
-    # Largest power-of-2 (<=16) dividing BOTH page strides. Lets the kernel assert
-    # 16B-aligned row bases so a contiguous row gather can vectorize to dwordx4.
-    _s0 = int(cache.stride(0)); _s1 = int(extra_cache.stride(0))
+    # Alignment hint for the page strides so row gathers can vectorize: the largest
+    # power of 2 (<= 16) dividing both.
+    s0, s1 = int(cache.stride(0)), int(extra_cache.stride(0))
     cs0_align = 1
-    for _a in (16, 8, 4, 2):
-        if _s0 % _a == 0 and _s1 % _a == 0:
-            cs0_align = _a
+    for a in (16, 8, 4, 2):
+        if s0 % a == 0 and s1 % a == 0:
+            cs0_align = a
             break
-    # AITER_PA_DECODE_CS0_ALIGN: override for re-measuring the hint (1 = off). As of
-    # the row/column gather split the hint is codegen-neutral -- the column offsets are
-    # compile-time constants, so vectorization no longer depends on knowing cs0's
-    # divisibility, and the emitted load mix is identical with it on and off.
-    _ca = _os.environ.get("AITER_PA_DECODE_CS0_ALIGN")
-    if _ca:
-        cs0_align = int(_ca)
-    # Gate each cache on its OWN span: one oversized cache must not disable the
-    # fast path for the other. (cache_bytes, the max of the two, is kept for the
-    # arch/format asserts below.)
+
+    # Gate each cache on its own span: buffer_load carries a 32-bit offset, and one
+    # oversized cache must not drop the fast path for the other. The index lists are
+    # one int32 per gathered token, far under the limit even for a full batch.
     main_use_buffer_load = max_addressable_bytes(cache) < MAX_BYTES
     extra_use_buffer_load = max_addressable_bytes(extra_cache) < MAX_BYTES
-    # The index lists are one int32 per gathered token, orders of magnitude under
-    # the 2 GB buffer offset limit even for a full batch, so they keep the fast path
-    # regardless of how big the KV caches are.
     idx_use_buffer_load = (
-        _os.environ.get("AITER_PA_DECODE_IDX_BUF", "1") == "1"
-        and max_addressable_bytes(indices) < MAX_BYTES
+        max_addressable_bytes(indices) < MAX_BYTES
         and max_addressable_bytes(extra_indices) < MAX_BYTES
     )
-    use_buffer_load = main_use_buffer_load and extra_use_buffer_load
-    # AITER_PA_DECODE_FORCE_GLOBAL_LOAD emulates a >2GB production cache without
-    # allocating one: 1 = both caches, main = main only, extra = extra only.
-    _fg = _os.environ.get("AITER_PA_DECODE_FORCE_GLOBAL_LOAD", "")
-    if _fg == "1":
-        main_use_buffer_load = extra_use_buffer_load = False
-    elif _fg == "main":
-        main_use_buffer_load = False
-    elif _fg == "extra":
-        extra_use_buffer_load = False
     use_buffer_load = main_use_buffer_load and extra_use_buffer_load
     HEAD_ALIGNED = num_heads % BLOCK_M == 0
     heads_blocks = (num_heads + BLOCK_M - 1) // BLOCK_M
     out = _check_out(out, q, torch.bfloat16)
 
-    # AITER_PA_DECODE_SPLITS: experiment override for the split-K count.
-    _sp = _os.environ.get("AITER_PA_DECODE_SPLITS")
-
     def _pick_splits(hb):
-        if _sp:
-            return max(1, int(_sp))
         if kv_splits is not None:
             return max(1, int(kv_splits))
-        if _os.environ.get("AITER_PA_DECODE_SPLIT_POLICY", "occ") == "occ":
-            return _decode_num_splits_occ(
-                num_queries, hb, avg_main, avg_extra, BLOCK_K
-            )
-        return _decode_num_splits(num_queries, hb, avg_main, avg_extra, BLOCK_K)
+        return _decode_num_splits_occ(num_queries, hb, avg_main, avg_extra, BLOCK_K)
 
     num_splits = _pick_splits(heads_blocks)
 
     # Short top-k is latency- and coverage-bound rather than throughput-bound: at
-    # <= 2 KV tiles per query the whole launch is a few dozen workgroups on a
-    # 256-CU part, so the win is MORE programs, not fatter ones. Halving BLOCK_M
-    # doubles heads_blocks, which is real parallelism -- unlike a finer split-K,
-    # which hands every split a partial tile (1.14-1.36x worse when forced). Both
-    # gates matter: measured 2-5% better at every concurrency on top-k 8/64, and
-    # 1.06-1.22x WORSE on top-k 272/1024, where the halved MFMA M dominates.
-    _tiles = max(
+    # <= 2 KV tiles per query the whole launch is a few dozen workgroups, so what
+    # helps is more programs, not fatter ones. Halving BLOCK_M doubles heads_blocks,
+    # which is real parallelism, unlike a finer split-K that hands every split a
+    # partial tile. It costs MFMA M, though, and doubling heads_blocks can push the
+    # launch past one workgroup per CU, which makes the split policy answer with
+    # fewer splits: take the halving only when it costs neither a split nor the
+    # one-workgroup-per-CU property.
+    tiles = max(
         math.ceil(avg_main / BLOCK_K) if avg_main > 0 else 1,
         math.ceil(avg_extra / BLOCK_K) if avg_extra > 0 else 1,
     )
     if (
-        _bm is None
-        and BLOCK_M == 16
-        and num_heads % 8 == 0
-        and _tiles <= 2
+        num_heads % 8 == 0
+        and tiles <= 2
         and num_queries * heads_blocks * num_splits <= get_num_sms()
     ):
-        _hb8 = (num_heads + 7) // 8
-        _ns8 = _pick_splits(_hb8)
-        # Doubling heads_blocks can push the launch past one workgroup per CU, and
-        # the split policy then answers with fewer splits. At C=128 short top-k that
-        # is 2 -> 1: split-K disappears and the shape goes 0.94x -> 1.11x. Take the
-        # halving only when it costs neither a split nor the occupancy property.
-        if _ns8 >= num_splits and num_queries * _hb8 * _ns8 <= get_num_sms():
+        hb8 = (num_heads + 7) // 8
+        ns8 = _pick_splits(hb8)
+        if ns8 >= num_splits and num_queries * hb8 * ns8 <= get_num_sms():
             BLOCK_M = 8
             HEAD_ALIGNED = num_heads % BLOCK_M == 0
-            heads_blocks = _hb8
-            num_splits = _ns8
+            heads_blocks = hb8
+            num_splits = ns8
 
     if num_splits > 1:
         part_m = torch.empty(
             (num_queries, num_splits, num_heads), dtype=torch.float32, device=q.device
         )
         part_l = torch.empty_like(part_m)
-        # Split-K accumulator partials in bf16. They are ~31% of the kernel's HBM
-        # traffic and ATT puts 8.5% of all stall cycles on the 68 buffer_store of
-        # them, so halving both is worth 6-23% depending on split count. The
-        # mantissa bits it costs are far inside the error the fp8 KV format already
-        # carries: against an fp64 reference, max|delta|/max|ref| goes 3.517e-2 ->
-        # 3.567e-2 at C128A, and the bf16-vs-f32 delta (4-6e-3) is ~6x smaller than
-        # the error already present. Not used on the skip_reduce path, which hands
-        # part_acc back to the caller and must keep its dtype.
-        _pab = (
-            _os.environ.get("AITER_PA_DECODE_PART_BF16", "1") == "1"
-            and not skip_reduce
-        )
+        # bf16 partials halve both the split-K HBM traffic (~31% of the kernel's
+        # bytes) and the store count, and the mantissa bits that costs are well
+        # inside the error the fp8 KV format already carries. skip_reduce hands the
+        # partials back to the caller, so it keeps their dtype.
         part_acc = torch.empty(
             (num_queries, num_splits, num_heads, head_dim),
-            dtype=torch.bfloat16 if _pab else torch.float32,
+            dtype=torch.float32 if skip_reduce else torch.bfloat16,
             device=q.device,
         )
         pm_stride0, pm_stride_s = part_m.stride(0), part_m.stride(1)
@@ -792,96 +727,47 @@ def _pa_decode_sparse_gfx950_gluon(
         part_m = part_l = part_acc = out  # unused placeholders (never dereferenced)
         pm_stride0 = pm_stride_s = pa_stride0 = pa_stride_s = pa_stride_h = 0
 
-    # 128 is the narrowest piece the gather layout can split to for free (below
-    # that a split falls inside a thread's 16-byte run, which Triton rejects), and
-    # the split is only trivial when the gather's warps tile dim 0.
-    # Row-wide gather chunks rows (4 pieces of BLOCK_K/4) instead of 128-wide
-    # column pieces; both leave a quarter of the tile's f32 expansion live.
-    # Split the axis that still has per-lane register repeats: columns when the
-    # gather leaves >=2 column repeats (TW1=8), rows otherwise.
+    # Dequant chunking: split the axis that still has per-lane register repeats,
+    # rows at gather_tw1=32 and 128-wide column pieces otherwise (128 is the
+    # narrowest free split -- below that a piece falls inside a thread's 16-byte
+    # run). Either way a quarter of the tile's f32 expansion is live at a time.
     col_reps = head_dim // (gather_tw1 * 16)
     chunk_axis = 1 if col_reps >= 4 else 0
-    _nc = _os.environ.get("AITER_PA_DECODE_NOPE_CHUNK")
-    if chunk_axis == 0:
-        nope_chunk = int(_nc) if _nc else max(1, BLOCK_K // 4)
-    else:
-        nope_chunk = int(_nc) if _nc else min(128, head_dim)
+    nope_chunk = max(1, BLOCK_K // 4) if chunk_axis == 0 else min(128, head_dim)
 
     # waves_per_eu=2 caps the allocator at 256 unified VGPRs, the 2 waves/SIMD
-    # threshold on gfx950's 512-VGPR file. Asked for on both load paths.
-    #
-    # This used to be gated on buffer_load, because a cache past buffer_load's 2 GB
-    # offset gathers through 64-bit addresses and used to land at ~321 VGPRs, where
-    # the cap bought nothing and cost ~150 scratch stores (+40% at C4A). Narrowing
-    # the scale gather brought that path to 283, close enough that the cap now
-    # reaches 256 with 17 spill slots instead of 148 -- worth 0.745x at extra=272
-    # and 0.833x at extra=1024 on the 64-bit path. Re-measure this gate whenever the
-    # register picture moves.
-    if chunk_axis == 0 or nope_chunk < head_dim:
-        waves_per_eu = 2
-    # num_warps is 4 -- one wave per SIMD per workgroup -- so the second occupancy
-    # slot exists only if a CU gets a second workgroup. When the entire launch is at
-    # most one workgroup per CU it cannot, and the 2-waves/EU register cap is then
-    # pure loss: it spills ~29 dwords across the per-tile softmax row-max reduction
-    # and buys no overlap. Measured on the main kernel at C in {4,16,32,64,128} x
-    # top-k in {64,272,1024}: 1 wave/EU + ASM_DEQ is 0.927-0.953x at every shape with
-    # launch <= CU, and 1.19-1.43x *worse* at every shape above it.
+    # threshold on gfx950's 512-VGPR file, so a CU can hold a second workgroup.
+    # num_warps is 4, one wave per SIMD, so that second slot only exists if the
+    # launch has more than one workgroup per CU; below that the cap buys no overlap
+    # and only spills.
+    waves_per_eu = 2
     one_wg_per_cu = (
-        use_buffer_load
-        and num_queries * heads_blocks * num_splits <= get_num_sms()
+        use_buffer_load and num_queries * heads_blocks * num_splits <= get_num_sms()
     )
     if one_wg_per_cu:
         waves_per_eu = 1
-    _wp = _os.environ.get("AITER_PA_DECODE_WPEU")
-    if _wp:
-        waves_per_eu = int(_wp)
 
     # Cap the main segment's split count at whole BLOCK_K tiles: past that every
     # split's main range is a partial tile, which costs a full masked gather for
     # half the tokens. extra keeps all num_splits programs.
     main_splits = num_splits
     if has_extra and avg_main > 0:
-        main_splits = max(1, min(num_splits, int(math.ceil(avg_main / BLOCK_K))))
-    _ms = _os.environ.get("AITER_PA_DECODE_SPLITS_MAIN")
-    if _ms:
-        main_splits = max(1, min(num_splits, int(_ms)))
+        main_splits = max(1, min(num_splits, math.ceil(avg_main / BLOCK_K)))
 
-    # AITER_PA_DECODE_ADAPTIVE: per-query split count decided in-kernel. Only
-    # meaningful when there is more than one split to give back.
-    adaptive_splits = (
-        num_splits > 1
-        and _os.environ.get("AITER_PA_DECODE_ADAPTIVE", "1") == "1"
-    )
+    # Per-query split count decided in-kernel; only meaningful when there is more
+    # than one split to give back.
+    adaptive_splits = num_splits > 1
 
-    # AITER_PA_DECODE_ASM_DEQ: fuse the fp8 x E8M0 dequant into
-    # v_cvt_scalef32_pk_bf16_fp8 via inline asm. gfx950 only, packed OCP fp8 only
-    # (UNIFORM scales are f32 and FNUZ is a different encoding), and bit-identical
-    # there because the scale is a power of two.
-    # Default follows the occupancy decision: the fused convert is a shorter
-    # dependent chain but a wider live range, so it pays only where the extra
-    # registers are free (see one_wg_per_cu). 0/1 forces it either way.
-    asm_deq = (
-        _os.environ.get("AITER_PA_DECODE_ASM_DEQ", "1" if one_wg_per_cu else "0") == "1"
-        and not UNIFORM
-        and not fp8_fnuz
-        and main_is_fp8
-    )
+    # Fuse the fp8 x E8M0 dequant into v_cvt_scalef32_pk_bf16_fp8 via inline asm:
+    # packed OCP fp8 only (uniform scales are f32, fnuz is a different encoding),
+    # bit-identical there because the scale is a power of two. It trades a shorter
+    # dependent chain for a wider live range, so it pays only where the extra
+    # registers are free -- the same condition that lifts the occupancy cap.
+    asm_deq = one_wg_per_cu and not UNIFORM and not fp8_fnuz and main_is_fp8
 
-    # AITER_PA_DECODE_GRID_ORDER: which launch axis varies fastest. Dim 0 is the
-    # fastest-varying and XCD assignment is round-robin over the linear workgroup id,
-    # so this decides what shares an XCD's L2. "qsh" is the historical order.
-    _go = _os.environ.get("AITER_PA_DECODE_GRID_ORDER", "qsh")
-    _ax = {"q": num_queries, "s": num_splits, "h": heads_blocks}
-    assert sorted(_go) == ["h", "q", "s"], f"bad AITER_PA_DECODE_GRID_ORDER {_go!r}"
-    # AITER_PA_DECODE_UNI_TILE: run the partial last tile through the same body as the
-    # full ones instead of peeling a masked copy of it. Gluon inlines, so the peeled
-    # copy is a second ~1000-instruction gather+dequant+MFMA body whose register demand
-    # spills the tile loop: worth 0.900-0.907x on the buffer path and 0.943-0.972x on
-    # the 64-bit path at >=2 tiles/split, scaling with tiles per split. 0 restores the
-    # peeled tail.
-    uni_tile = _os.environ.get("AITER_PA_DECODE_UNI_TILE", "1") == "1"
-
-    grid = tuple(_ax[c] for c in _go)
+    # Grid dim 0 varies fastest and XCD assignment is round-robin over the linear
+    # workgroup id, so the axis order decides what shares an XCD's L2.
+    grid = (num_queries, num_splits, heads_blocks)
     _pa_decode_sparse_gfx950[grid](
         q,
         cache,
@@ -936,9 +822,12 @@ def _pa_decode_sparse_gfx950_gluon(
         LDS_PAD=lds_pad,
         NOPE_CHUNK=nope_chunk,
         CHUNK_AXIS=chunk_axis,
-        PART_STORE_CACHE=_os.environ.get('AITER_PA_DECODE_PART_ST', ''),
-        GRID_ORDER=_go,
-        UNI_TILE=uni_tile,
+        PART_STORE_CACHE="",
+        GRID_ORDER="qsh",
+        # The partial last tile rides the full-tile body. Gluon inlines, so a peeled
+        # masked copy would be a second gather+dequant+MFMA body, and its register
+        # demand spills the tile loop.
+        UNI_TILE=True,
         MAIN_SPLITS=main_splits,
         ADAPTIVE_SPLITS=adaptive_splits,
         ASM_DEQ=asm_deq,
@@ -956,20 +845,10 @@ def _pa_decode_sparse_gfx950_gluon(
     if skip_reduce:
         return part_acc, part_m, part_l
 
-    # The combine is pure bandwidth over [num_queries, num_heads, head_dim] f32,
-    # so size its head tile for workgroup count, not for the attention kernel's
-    # BLOCK_M: at BLOCK_M=num_heads there is one workgroup per query (64 on a
-    # 256-CU part). One head per workgroup gives num_queries*num_heads of them and
-    # enough concurrent waves to hide the partial-load latency.
-    red_block_m = 1
-    _rbm = _os.environ.get("AITER_PA_DECODE_REDUCE_BLOCK_M")
-    if _rbm:
-        red_block_m = int(_rbm)
-    red_warps = 1
-    _rw = _os.environ.get("AITER_PA_DECODE_REDUCE_WARPS")
-    if _rw:
-        red_warps = int(_rw)
-    rgrid = (num_queries, (num_heads + red_block_m - 1) // red_block_m)
+    # One head per reduce workgroup: the combine is pure bandwidth, so size the grid
+    # for coverage rather than for the attention kernel's tile. num_queries*num_heads
+    # workgroups give enough concurrent waves to hide the partial loads.
+    rgrid = (num_queries, num_heads)
     _pa_decode_sparse_reduce_gfx950[rgrid](
         part_m,
         part_l,
@@ -986,11 +865,10 @@ def _pa_decode_sparse_gfx950_gluon(
         num_heads,
         HAS_SINK=has_sink,
         HEAD_SIZE=head_dim,
-        BLOCK_M=red_block_m,
+        BLOCK_M=1,
         NUM_SPLITS=num_splits,
-        HEAD_ALIGNED=num_heads % red_block_m == 0,
+        HEAD_ALIGNED=True,
         ADAPTIVE_SPLITS=adaptive_splits,
-        PART_LOAD_CACHE=_os.environ.get("AITER_PA_DECODE_PART_LD", ""),
-        num_warps=red_warps,
+        num_warps=1,
     )
     return out

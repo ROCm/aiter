@@ -3,32 +3,32 @@
 
 """Gluon (gfx950) sparse decode for DeepSeek-V4 and separated-rope MLA (GLM-5).
 
-One kernel serves two geometries, selected by the ``ROPE_SEPARATE`` constexpr:
+One kernel serves two geometries, selected by the ROPE_SEPARATE constexpr:
 
     False (DSv4): rope lives inside the pow-2 row. One LDS plane
-        ``kv_smem [BLOCK_K, HEAD_SIZE]``, one QK MFMA chain, V = the same plane.
-    True (MLA):   rope is appended (``kv_lora_rank`` latent + rope = QK width;
-        V = the latent only). A second pow-2 LDS plane ``rope_smem`` holds the
+        kv_smem [BLOCK_K, HEAD_SIZE], one QK MFMA chain, V = the same plane.
+    True (MLA):   rope is appended (kv_lora_rank latent + rope = QK width;
+        V = the latent only). A second pow-2 LDS plane rope_smem holds the
         K-only rope and the QK contraction chains a second MFMA into the first.
         Plane 0 is the entire V in both geometries.
 
-Cache formats (``Fmt.KIND``), per segment:
+Cache formats (Fmt.KIND), per segment:
 
     "bf16"     full-row bf16
     "dsv4"     448 fp8 | 64 bf16 rope (576 B rows) + 8 B UE8M0-per-64 trailer
     "uniform"  whole-row fp8 + separate f32 per-64 kv_scales
-    "tensor"   whole-row fp8 + ONE per-tensor f32 scale (k_scale). The scale
-               never touches the tile loop: K-side folds into qk_scale,
+    "tensor"   whole-row fp8 + a single per-tensor f32 scale (k_scale). The
+               scale never touches the tile loop: K-side folds into qk_scale,
                V-side into p.
     "dsmla"    vLLM fp8_ds_mla: 512 fp8 | 4 f32 per-128 scales | 64 bf16 rope
                (656 B rows); requires ROPE_SEPARATE.
 
 Compile-time state is bundled into aggregates instead of long parameter lists:
-``Cfg`` (geometry, layouts, behavior knobs), ``Fmt`` (per-segment cache
-format), ``Seg`` (runtime pointers/bounds). Two-loop (SWA + top-k) or a single
-segment; 2D and 3D (split-K + reduce) share one kernel. Launchers:
-``aiter/ops/triton/attention/pa_decode_sparse.py`` (DSv4 / uniform pool) and
-``aiter/ops/triton/attention/sparse_mla_decode.py`` (separated-rope MLA).
+Cfg (geometry, layouts, behavior knobs), Fmt (per-segment cache format), Seg
+(runtime pointers/bounds). Two-loop (SWA + top-k) or a single segment; 2D and
+3D (split-K + reduce) share one kernel. Launchers:
+aiter/ops/triton/attention/pa_decode_sparse.py (DSv4 / uniform pool) and
+aiter/ops/triton/attention/sparse_mla_decode.py (separated-rope MLA).
 """
 
 from triton.experimental import gluon
@@ -57,8 +57,8 @@ def _rmax(x, axis):
 
 @gluon.jit
 def _cache_load(ptr, row, col, USE_BUFFER_LOAD: gl.constexpr, mask=None, other=None):
-    """Gather rows[i] + col[j]. ``row`` is the per-token offset in ptr's element
-    units; ``col`` a small compile-time arange. Keeping them apart resolves one
+    """Gather rows[i] + col[j]. row is the per-token offset in ptr's element
+    units; col a small compile-time arange. Keeping them apart resolves one
     pointer per token on the 64-bit path (the column offset folds into the
     load's immediate) instead of a 64-bit add per element."""
     if USE_BUFFER_LOAD:
@@ -109,11 +109,12 @@ def _scale_load(
     OTHER: gl.constexpr,
 ):
     """Gather the NG per-group scales of each token and broadcast to W_FULL
-    columns. Indexing the full row with ``offs // GROUP`` would build a
-    [BLOCK_K, W_FULL] pointer tensor for NG distinct values — redundancy only
-    buffer_load's 32-bit offsets CSE away. ``scl_l`` is chosen so the broadcast
-    lands on ``gather_l`` as a register rename (assert_trivial proves it).
-    Element type follows ``ptr``: u8 E8M0 bytes (OTHER=127 -> 2^0) or f32
+    columns. Indexing the full row with offs // GROUP would build a
+    [BLOCK_K, W_FULL] pointer tensor for NG distinct values, and only
+    buffer_load's 32-bit offsets CSE that redundancy away. scl_l is chosen so
+    the broadcast lands on gather_l as a register rename (assert_trivial
+    proves it).
+    Element type follows ptr: u8 E8M0 bytes (OTHER=127 -> 2^0) or f32
     (OTHER=0.0 -> masked lanes dequant to 0)."""
     cols = gl.arange(0, NG, layout=gl.SliceLayout(0, scl_l))
     rows = gl.convert_layout(row, gl.SliceLayout(1, scl_l))
@@ -156,7 +157,7 @@ def _scale_load(
 def _split2(x):
     """Register split along dim 1: [A, B] -> two [A, B//2] in the input's own
     layout. Free only while the column direction is a per-lane register repeat;
-    ``assert_trivial`` turns anything else into a compile error."""
+    assert_trivial turns anything else into a compile error."""
     layout: gl.constexpr = x.type.layout
     x_r = x.reshape(x.shape[0], 2, x.shape[1] // 2).permute(0, 2, 1)
     x0, x1 = gl.split(x_r)
@@ -188,8 +189,8 @@ def _split_ax(x, AXIS: gl.constexpr):
 
 # fp8 (e4m3 OCP) x E8M0 -> bf16, one instruction per 2 elements. Emitted as two
 # single-output asm calls, not one two-output blob: a single instruction reads
-# all sources before writing dst, so no output needs early clobber — the blob's
-# forced `=&v` liveness spills on a kernel with no VGPR headroom.
+# all its sources before writing dst, so no output needs early clobber. The
+# blob form does, and that forced =&v liveness spills a kernel with no headroom.
 _DEQ_LO: gl.constexpr = gl.constexpr("v_cvt_scalef32_pk_bf16_fp8 $0, $1, $2")
 _DEQ_HI: gl.constexpr = gl.constexpr(
     "v_cvt_scalef32_pk_bf16_fp8 $0, $1, $2 op_sel:[1,0,0]"
@@ -201,10 +202,10 @@ _DEQ_CONS: gl.constexpr = gl.constexpr("=v,v,v")
 def _deq_asm(x16, e_u8, W8: gl.constexpr, out_l: gl.constexpr):
     """[BLOCK_K, W8/2] int16 (4 packed fp8) + raw E8M0 byte -> [BLOCK_K, W8] bf16.
 
-    The hardware reads only bits [30:23] of the scale operand — bits [14:7] of
-    its high half — so a 16-bit ``e << 7`` lands the exponent where an f32
-    ``e << 23`` would, in ONE register. Power-of-two scale keeps this
-    bit-identical to the unfused convert+multiply chain."""
+    The hardware reads only bits [30:23] of the scale operand, i.e. bits [14:7]
+    of its high half, so a 16-bit e << 7 lands the exponent where an f32
+    e << 23 would and costs one register instead of two. The scale is a power of
+    two, so this stays bit-identical to the unfused convert + multiply."""
     sc16 = e_u8.to(gl.uint16) << 7
     lo = gl.inline_asm_elementwise(
         _DEQ_LO, _DEQ_CONS, [x16, sc16], dtype=gl.bfloat16, is_pure=True, pack=2
@@ -523,7 +524,7 @@ class Seg:
 @gluon.jit
 def _deq_store(x_u8, sc, kv_smem, off, cfg, fmt, AXIS: gl.constexpr):
     """Dequant one fp8 slab into kv_smem[:, off:off+W]. Dequant stays in f32
-    (gfx950 has no bf16 multiply). ``sc``: raw UE8M0 byte (dsv4), f32 scale
+    (gfx950 has no bf16 multiply). sc: raw UE8M0 byte (dsv4), f32 scale
     (uniform/dsmla), or unused ("tensor": bare fp8 -> bf16 convert)."""
     if fmt.ASM_DEQ:
         # x_u8 is the int16 view here (see _gather_full), so its column count is W8/2.
@@ -614,7 +615,7 @@ def _slots(
     """Index-list read -> (block, pos, valid), in whatever layout k_pos carries.
     A masked gl.load predicates on exec while a masked buffer_load folds the
     mask into the offset, so the unmasked paths clamp the read in-range and
-    mask the *score* instead (UNI_TILE); -1 sentinels are handled the same way."""
+    mask the score instead (UNI_TILE); -1 sentinels are handled the same way."""
     indices_ptr = seg.indices_ptr
     seg_start = seg.seg_start
     BLOCK_SIZE: gl.constexpr = seg.fmt.BLOCK_SIZE
@@ -680,8 +681,8 @@ def _gather_full(
     k_rng_rope,
 ):
     """Gather one full fp8 tile, split from the LDS-write/MFMA so it issues an
-    iteration early. The prefetch is carried in raw fp8 — dequantized here it
-    would double the loop-carried registers; the consumer dequants chunked.
+    iteration early. The prefetch stays in raw fp8: dequantizing here would
+    double the loop-carried registers, so the consumer dequants in chunks.
     Returns (x, sc, k_rope, valid); unused slots carry a duplicate DCE removes."""
     fmt = seg.fmt
     cs0 = seg.cs0
@@ -807,9 +808,9 @@ def _gather_full(
 @gluon.jit
 def _stage(cfg, seg, x_u8, sc, k_rope, kv_smem, rope_smem):
     """Write one prefetched tile into the LDS plane(s). Plane 0 is always the
-    full KV_DIM-wide dequant — "dsv4" gathers KV_DIM bytes too (the last 64 are
-    bf16 rope read as garbage fp8, overwritten by the slice-store below), which
-    keeps the gather pow-2 wide."""
+    full KV_DIM-wide dequant: "dsv4" gathers KV_DIM bytes too, the last 64 being
+    bf16 rope read as garbage fp8 and overwritten by the slice-store below, so
+    the gather stays pow-2 wide."""
     fmt = seg.fmt
     _deq_store_tile(x_u8, sc, kv_smem, cfg, fmt)
     if fmt.KIND == "dsv4":
@@ -855,7 +856,7 @@ def _qkpv(
         if COL_MASK:
             if cfg.UNI_TILE and not cfg.HAS_INVALID:
                 # Build the range mask directly in the MFMA layout; converting
-                # the slot-layout `valid` vector costs a cross-lane convert per
+                # the slot-layout valid vector costs a cross-lane convert per
                 # tile.
                 col_mask = (
                     k_start
@@ -880,8 +881,8 @@ def _qkpv(
         S = gl.where(col_mask, S, neg_inf)
     # Online softmax in the base-2 exponent domain; m_i carries qk_scale
     # (= scale * log2e [* k_scale for "tensor"]). max commutes with a positive
-    # scale, so scale the row max instead of every element — the remaining
-    # `S * qk_scale - m_new` lowers to FMA, and -inf columns stay -inf.
+    # scale, so scale the row max instead of every element of S; what is left,
+    # S * qk_scale - m_new, lowers to one FMA, and -inf columns stay -inf.
     m_block = _rmax(S, 1) * qk_scale
     m_new = _max2(m_i, m_block)
     m_new = gl.where(m_new > neg_inf, m_new, 0.0)
@@ -890,7 +891,7 @@ def _qkpv(
     l_new = l_i * alpha + gl.sum(p, axis=1)
     v = kv_smem.load(cfg.v_layout)
     # "tensor": V was staged as raw fp8 code points; apply the per-tensor scale
-    # on the small side (p), leaving l scale-free — out = sum(p*s*V)/l exactly.
+    # on the small side (p) and leave l scale-free: out = sum(p*s*V)/l exactly.
     if seg.fmt.KIND == "tensor":
         p = p * v_scale
     p_dot = gl.convert_layout(p.to(gl.bfloat16), cfg.p_layout)
@@ -1277,20 +1278,29 @@ _pa_decode_sparse_repr = make_kernel_repr(
 
 @gluon.jit(repr=_pa_decode_sparse_repr)
 def _pa_decode_sparse(
-    q_ptr,
-    main_cache_ptr,
-    main_cache_bf16_ptr,
-    main_indices_ptr,
-    main_indptr_ptr,
-    extra_cache_ptr,
+    # Shapes below: C = queries, H = num_heads, S = HEAD_SIZE (the V width),
+    # R = ROPE_DIM, nnz = total gathered tokens in a segment's index list.
+    q_ptr,                # [C, H, S (+R when ROPE_SEPARATE)] bf16
+    # One segment = a cache plus its index list. The cache is paged
+    # [num_blocks, BLOCK_SIZE, row] (BLOCK_SIZE = 1 for a flat pool), and
+    # indices[indptr[t]:indptr[t + 1]] are the rows query t attends to. The two
+    # cache pointers are the same allocation under different element types;
+    # which of them is live depends on the format (see Seg).
+    main_cache_ptr,       # main (SWA) cache, u8 view
+    main_cache_bf16_ptr,  # bf16 view of it, or the f32 scale pool ("uniform")
+    main_indices_ptr,     # [nnz_main] int32 row ids
+    main_indptr_ptr,      # [C + 1] int32
+    extra_cache_ptr,      # top-k segment; aliases main when HAS_EXTRA=False
     extra_cache_bf16_ptr,
-    extra_indices_ptr,
-    extra_indptr_ptr,
-    attn_sink_ptr,
-    out_ptr,
-    part_m_ptr,
-    part_l_ptr,
-    part_acc_ptr,
+    extra_indices_ptr,    # [nnz_extra] int32
+    extra_indptr_ptr,     # [C + 1] int32
+    attn_sink_ptr,        # [H] f32, HAS_SINK only
+    out_ptr,              # [C, H, S] bf16, written when NUM_SPLITS == 1
+    # Split-K partials, written instead of out_ptr when NUM_SPLITS > 1 (unused
+    # placeholders otherwise).
+    part_m_ptr,           # [C, NUM_SPLITS, H] f32 row max, base-2 domain
+    part_l_ptr,           # [C, NUM_SPLITS, H] f32 row sum
+    part_acc_ptr,         # [C, NUM_SPLITS, H, S] bf16 or f32, un-normalized
     # f32 side-channel per segment: scalar k_scale ("tensor") or f32 cache view
     # ("dsmla"). None elides the argument, keeping other formats' kernarg
     # layouts unchanged.
@@ -1437,10 +1447,10 @@ def _pa_decode_sparse(
         extra_len = 0
     main_len = main_end - main_start
 
-    # exp2 softmax: fold scale*log2(e) into the loop exponent; keep raw `scale`
+    # exp2 softmax: fold scale*log2(e) into the loop exponent; keep raw scale
     # for the sink (a scaled-score-space logit). For "tensor" the cache's
     # k_scale joins the per-segment fold (max/exp2 commute with a positive
-    # scale) and the V-side scale is applied to p in the loop — both exact.
+    # scale) and the V-side scale hits p in the loop. Both are exact.
     RCP_LN2: gl.constexpr = 1.4426950408889634
     qk_scale = scale * RCP_LN2
     main_qk_scale = qk_scale
@@ -1507,10 +1517,10 @@ def _pa_decode_sparse(
         rope_smem = kv_smem  # never read as plane 1 in this geometry
 
     # ADAPTIVE_SPLITS: the host split count is sized for batch averages; in a
-    # ragged batch surplus programs would each gather a mostly-masked tile and
-    # write a full partial. Recompute from this query's own lengths and let
-    # surplus programs write a neutral partial (m = -inf) and leave — the
-    # reduce skips those, so their part_acc is never read.
+    # ragged batch the surplus programs would each gather a mostly-masked tile
+    # and write a full partial. Recompute from this query's own lengths and let
+    # those programs write a neutral partial (m = -inf) and leave. The reduce
+    # skips them, so their part_acc never has to be written.
     if ADAPTIVE_SPLITS:
         m_tiles = (main_len + BLOCK_K - 1) // BLOCK_K
         e_tiles = (extra_len + BLOCK_K - 1) // BLOCK_K
@@ -1690,7 +1700,6 @@ def _pa_decode_sparse_reduce(
     NUM_SPLITS: gl.constexpr,
     HEAD_ALIGNED: gl.constexpr,
     ADAPTIVE_SPLITS: gl.constexpr,
-    PART_LOAD_CACHE: gl.constexpr,
 ):
     """Split-KV combine: merge per-split partials, fold the sink, write the
     output. Identical for both geometries (partials are HEAD_SIZE = V wide).
@@ -1728,14 +1737,14 @@ def _pa_decode_sparse_reduce(
         base = query_idx * pm_stride0 + s * pm_stride_s
         m_s = gl.amd.cdna4.buffer_load(
             ptr=part_m_ptr + base, offsets=h, mask=head_mask, other=neg_inf,
-            cache=PART_LOAD_CACHE,
         )
         m_final = _max2(m_final, m_s)  # m_s already in base-2 exponent domain
     if HAS_SINK:
         sink = gl.amd.cdna4.buffer_load(
-            ptr=attn_sink_ptr, offsets=h, mask=head_mask, other=neg_inf
+            ptr=attn_sink_ptr, offsets=h, mask=head_mask, other=neg_inf, cache=".cg",
         ).to(gl.float32)
-        m_final = _max2(m_final, sink * RCP_LN2)  # lift sink to base-2
+        scaled_sink = sink * RCP_LN2
+        m_final = _max2(m_final, scaled_sink)  # lift sink to base-2
 
     # pass 2: weighted sums
     l_final = gl.zeros([BLOCK_M], gl.float32, layout=row_l)
@@ -1744,33 +1753,30 @@ def _pa_decode_sparse_reduce(
         base = query_idx * pm_stride0 + s * pm_stride_s
         m_s = gl.amd.cdna4.buffer_load(
             ptr=part_m_ptr + base, offsets=h, mask=head_mask, other=neg_inf,
-            cache=PART_LOAD_CACHE,
+            cache=".cg",
         )
         l_s = gl.amd.cdna4.buffer_load(
             ptr=part_l_ptr + base, offsets=h, mask=head_mask, other=0.0,
-            cache=PART_LOAD_CACHE,
+            cache=".cg",
         )
         w = gl.exp2(m_s - m_final)
         l_final = l_final + w * l_s
         a_base = query_idx * pa_stride0 + s * pa_stride_s
         a_off = (a_base + h[:, None] * pa_stride_h + offs_d[None, :]).to(gl.int32)
-        # A bowed-out split's part_acc is uninitialized — mask the load rather
-        # than relying on w == 0 (0 * NaN is NaN).
+        # A bowed-out split's part_acc is uninitialized, so mask the load
+        # rather than relying on w == 0 (0 * NaN is NaN).
         if ADAPTIVE_SPLITS:
             acc_mask = head_mask[:, None] & (m_s > neg_inf)[:, None]
         else:
             acc_mask = head_mask[:, None]
         acc_s = gl.amd.cdna4.buffer_load(
             ptr=part_acc_ptr, offsets=a_off, mask=acc_mask, other=0.0,
-            cache=PART_LOAD_CACHE,
+            cache=".cg",
         )
         acc = acc + w[:, None] * acc_s.to(gl.float32)
 
     if HAS_SINK:
-        sink = gl.amd.cdna4.buffer_load(
-            ptr=attn_sink_ptr, offsets=h, mask=head_mask, other=neg_inf
-        ).to(gl.float32)
-        l_final = l_final + gl.exp2(sink * RCP_LN2 - m_final)
+        l_final = l_final + gl.exp2(scaled_sink - m_final)
 
     # One reciprocal per row instead of a per-element f32 divide.
     one_over_l = 1.0 / l_final

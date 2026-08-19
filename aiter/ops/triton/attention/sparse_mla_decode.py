@@ -323,7 +323,6 @@ def sparse_mla_decode_fwd(
         NUM_SPLITS=num_splits,
         HEAD_ALIGNED=True,
         ADAPTIVE_SPLITS=num_splits > 1,
-        PART_LOAD_CACHE="",
         num_warps=1,
     )
     return out
