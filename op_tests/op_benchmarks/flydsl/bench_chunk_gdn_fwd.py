@@ -862,7 +862,7 @@ _K5K6_BENCH_TITLE = "GDN K5+K6 fused forward"
 
 FUSED_PREFIX = "K5K6_flydsl_fused"
 COMBINED_KEY = "K5K6_combined"
-FUSED_VARIANTS = ("bv16", "bv32", "bv64", "bv64w8", "bv64w16")
+FUSED_VARIANTS = ("bv16", "bv32", "bv64", "bv64w8")
 
 _K5K6_IMPL_KEYS = (
     "K5_triton+K6_triton",

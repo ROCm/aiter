@@ -302,7 +302,6 @@ def compile_chunk_gated_delta_h_gfx942(
         )
     BT_STEPS_LOCAL = (BT // MFMA_K) // NR_SPLIT
 
-
     # -- Loop-carried gate/u prefetch --
     # g/gk/u for chunk i+1 depend on nothing produced by chunk i, so they are
     # issued a full iteration ahead. The carried values are RAW LOADS ONLY --
@@ -423,17 +422,13 @@ def compile_chunk_gated_delta_h_gfx942(
     #    divide BT by a rows-per-batch larger than BT and yield 0 batches.
     #
     # Both give W_THREADS_PER_ROW-consecutive tids one contiguous row segment, so
-    # global coalescing is equivalent. They are NOT interchangeable, though: this
-    # mapping decides which (row, grp) each thread writes to lds_w, and hence the
-    # bank pattern the XOR swizzle was tuned against. A "harmless" reindex here
-    # silently reintroduces bank conflicts (measured: forcing BV=64 onto the
-    # linear form cost ~19%). Re-check any change against the swizzle, not just
-    # the coalescing.
+    # global coalescing is equivalent.
     LOAD_VEC_WIDTH = 8
     THREADS_PER_ROW_64 = 64 // LOAD_VEC_WIDTH  # 8
     ROWS_PER_BATCH_64 = BLOCK_THREADS // THREADS_PER_ROW_64
     W_BATCHED = ROWS_PER_BATCH_64 <= BT and BT % ROWS_PER_BATCH_64 == 0
-    NUM_LOAD_BATCHES_64 = BT // ROWS_PER_BATCH_64 if W_BATCHED else 0
+    assert W_BATCHED, "Must have batched w-tensor load"
+    NUM_LOAD_BATCHES_64 = BT // ROWS_PER_BATCH_64
 
     STRIDE_W_C = K if WU_CONTIGUOUS else H * K
     STRIDE_Q_C = Hg * K
@@ -451,7 +446,6 @@ def compile_chunk_gated_delta_h_gfx942(
         NUM_K_BLOCKS * NUM_LOAD_BATCHES_64 if W_BATCHED else W_SLOTS // BLOCK_THREADS
     )
 
-    K_STEPS_PER_BLOCK = 64 // MFMA_K  # 4
     BT_STEPS = BT // MFMA_K  # 4
 
     # -- k store-transpose decomposition --
@@ -672,8 +666,6 @@ def compile_chunk_gated_delta_h_gfx942(
                     swz_A, fx.make_ordered_layout((BT, BT), (1, 0))
                 ),
             )
-
-        assert W_BATCHED, "Must have batched w-load"
 
         # -- Prologue: compute bos, T_local, NT, boh --
         # boh (the chunk-offset base) only addresses the h snapshot, so it -- and

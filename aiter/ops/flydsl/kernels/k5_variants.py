@@ -24,7 +24,7 @@ from __future__ import annotations
 # cannot hide HBM latency.
 _BV_CANDIDATES = [16, 32, 64]
 _DEFAULT_BV = 16
-_WAVE_CANDIDATES = (4, 8, 16)
+_WAVE_CANDIDATES = (4, 8)
 
 K5_VARIANTS: tuple[str, ...] = tuple(f"bv{b}" for b in _BV_CANDIDATES) + tuple(
     f"bv{b}w{w}"
