@@ -286,6 +286,65 @@ class TestTunePipeline(unittest.TestCase):
                 "timeout": 1800,
                 "timeout_mp1": 2400,
             },
+            "gdn_k5_mfma16_hip": {
+                "script": "csrc/gdn_k5/chunk_gdn_h_mfma16_hip_tune.py",
+                "header": [
+                    "arch",
+                    "dtype",
+                    "K",
+                    "V",
+                    "BT",
+                    "H",
+                    "Hg",
+                    "is_varlen",
+                    "use_h0",
+                    "store_fs",
+                ],
+                "shapes": [
+                    (
+                        "gfx942",
+                        "torch.bfloat16",
+                        128,
+                        128,
+                        64,
+                        8,
+                        2,
+                        True,
+                        True,
+                        True,
+                    ),
+                ],
+                "shapes_mp1": [
+                    (
+                        "gfx942",
+                        "torch.bfloat16",
+                        128,
+                        128,
+                        64,
+                        8,
+                        2,
+                        True,
+                        True,
+                        True,
+                    ),
+                ],
+                "keys": [
+                    "arch",
+                    "H",
+                    "Hg",
+                    "V",
+                    "BV",
+                    "us",
+                    "total_chunks",
+                    "max_seq_chunks",
+                ],
+                "extra_args": [
+                    "--case",
+                    "397b-ali-tp8-bf16snapshot.*mnbt8192",
+                ],
+                "timeout": 900,
+                "timeout_mp1": 900,
+            },
             "csrc_bf16": {
                 "script": "csrc/gemm_a16w16/gemm_a16w16_tune.py",
                 "header": [
@@ -549,65 +608,7 @@ class TestTunePipeline(unittest.TestCase):
         self._run_gradlib(mp=None)
 
     def test_gdn_k5_mfma16_hip_mp1(self):
-        """Smoke-test K5 BV tuning on one varlen 397B TP8 shape (no model column)."""
-        with tempfile.TemporaryDirectory() as tmp:
-            untuned = os.path.join(tmp, "untuned.csv")
-            tuned = os.path.join(tmp, "tuned.csv")
-            _write_csv(
-                untuned,
-                [
-                    "arch",
-                    "dtype",
-                    "K",
-                    "V",
-                    "BT",
-                    "H",
-                    "Hg",
-                    "is_varlen",
-                    "use_h0",
-                    "store_fs",
-                ],
-                [
-                    (
-                        "gfx942",
-                        "torch.bfloat16",
-                        128,
-                        128,
-                        64,
-                        8,
-                        2,
-                        True,
-                        True,
-                        True,
-                    )
-                ],
-            )
-            result = _run_tuner(
-                "csrc/gdn_k5/chunk_gdn_h_mfma16_hip_tune.py",
-                untuned,
-                tuned,
-                extra_args=[
-                    "--case",
-                    "397b-ali-tp8-bf16snapshot.*mnbt8192",
-                    "--warmup",
-                    "2",
-                    "--iters",
-                    "5",
-                ],
-                timeout=900,
-                mp=None,
-            )
-            if result.returncode != 0:
-                print(f"\n=== gdn_k5_mfma16_hip STDOUT ===\n{result.stdout[-2000:]}")
-                print(f"\n=== gdn_k5_mfma16_hip STDERR ===\n{result.stderr[-2000:]}")
-            self.assertEqual(result.returncode, 0, "gdn_k5_mfma16_hip tuner failed")
-            self.assertTrue(os.path.exists(tuned), "gdn_k5: tuned CSV not created")
-            df = pd.read_csv(tuned, comment="#")
-            df.columns = df.columns.str.strip()
-            self.assertGreaterEqual(len(df), 1, "gdn_k5: expected >= 1 tuned row")
-            for col in ("BV", "us", "total_chunks", "max_seq_chunks"):
-                self.assertIn(col, df.columns, f"gdn_k5: missing column {col}")
-            self.assertGreater(float(df.iloc[0]["us"]), 0)
+        self._run_one("gdn_k5_mfma16_hip", mp=1)
 
 
 @unittest.skipUnless(_gpu_available(), "No GPU available")

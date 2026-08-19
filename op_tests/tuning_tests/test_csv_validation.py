@@ -31,6 +31,7 @@ class TestCSVValidation(unittest.TestCase):
         "bf16": "bf16_tuned_gemm.csv",
         "bf16_batched": "bf16_tuned_batched_gemm.csv",
         "fmoe": "tuned_fmoe.csv",
+        "gdn_k5_mfma16_hip": "chunk_gdn_h_mfma16_hip_tuned.csv",
     }
 
     def _load_csv(self, name, comment="#"):
@@ -119,6 +120,24 @@ class TestCSVValidation(unittest.TestCase):
             ],
         )
 
+    def test_gdn_k5_no_duplicates(self):
+        self._check_no_duplicates(
+            "gdn_k5_mfma16_hip",
+            extra_keys=[
+                "arch",
+                "H",
+                "Hg",
+                "V",
+                "is_varlen",
+                "use_h0",
+                "store_fs",
+                "snapshot_bf16",
+                "state_bf16",
+                "total_chunks",
+                "max_seq_chunks",
+            ],
+        )
+
     def test_no_git_conflict_markers(self):
         for name, fname in self.TUNED_CSVS.items():
             with self.subTest(csv=name):
@@ -169,6 +188,7 @@ class TestCSVValidation(unittest.TestCase):
             "a8w8_blockscale_untuned_gemm.csv",
             "a8w8_untuned_batched_gemm.csv",
             "bf16_untuned_batched_gemm.csv",
+            "chunk_gdn_h_mfma16_hip_untuned.csv",
             "untuned_fmoe.csv",
         ]
         for f in untuned_files:

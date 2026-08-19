@@ -327,9 +327,6 @@ TUNER_FAMILIES = {
         "exclude_patterns": ["untuned"],
         "timeout": 1800,
         "config_property": "AITER_CONFIG_GDN_K5_MFMA16_HIP_FILE",
-        # Small tc=40 shapes have high run-to-run variance; keep this loose
-        # enough for CI drift checks (ERROR/no_case still fail hard).
-        "extra_args": ["--run_config_tol_pct", "40"],
     },
 }
 
