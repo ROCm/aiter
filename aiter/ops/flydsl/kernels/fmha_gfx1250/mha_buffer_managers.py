@@ -554,7 +554,7 @@ class QManager16b:
             offs.append(lds_q_base + self._lds_byte(row, klane + 2, slot))  # hi
         return offs
 
-    def load_q_to_vgpr(
+    def load_q_to_vgpr_part1(
         self,
         *,
         ptr_Q,
@@ -567,25 +567,16 @@ class QManager16b:
         warp_idx,
         lane_idx,
         ptr_lds,  # fx.Int32: base byte addr of the caller's Q allocation
-        scale,  # fx.Float32: softmax scale, folded into Q (HK MLA v4 style)
     ):
-        """Stage this warp's 16 x qk_hdim Q tile and return the WMMA A fragments.
-
-        Software-pipelined ``lds_tiles``-deep LDS ring: all address VALU is hoisted
-        up front, then a steady loop reads the oldest tile and refills its slot while
-        later tiles are still in flight, and a drain loop empties the ring. Async is
-        drained GRADUALLY (``s_wait_asynccnt`` per tile, assumes in-issue-order
-        completion) so a ds_load fires the moment ITS data lands. ``lds_tiles ==
-        k_tiles`` (the default) skips the steady loop = fully-resident drain-only.
-        Rows with seq >= q_len are clamped in-bounds and masked later in softmax.
-        """
-        k_tiles = self.k_tiles
-        lds_tiles = self.lds_tiles
+        """Part 1 of the Q load: compute all global/LDS offsets (stashed as members),
+        then issue the prime chunk of async global->LDS loads. A trailing
+        ``sched_barrier`` pins these above the caller's SALU so that work fills the
+        load's shadow. Call ``load_q_to_vgpr_part2`` after to drain + read."""
         lds_q_base = ptr_lds + warp_idx * self._warp_stride
         q_base_i64 = fx.Int64(fx.ptrtoint(fx.get_iter(ptr_Q)))
         warp_row0 = block_x * self.block_m + warp_idx * _WMMA_M
 
-        # Phase 1: all address VALU up front (2 async b128 + 2 ds_load per tile).
+        # All address VALU up front (2 async b128 + 2 ds_load per tile).
         g_offs, lds_wr_offs, imm_offs = self.global_load_params(
             lds_q_base=lds_q_base,
             warp_row0=warp_row0,
@@ -597,8 +588,33 @@ class QManager16b:
             lane_idx=lane_idx,
         )
         ds_offs = self.ds_load_params(lds_q_base=lds_q_base, lane_idx=lane_idx)
-        _sched2_va_vdst_fence()  # mode-2: retire phase-1 address VALU before the loads
+        _sched2_va_vdst_fence()  # mode-2: retire address VALU before the loads
 
+        # Prime: issue the first lds_tiles tiles (2 loads each).
+        n_prime = 2 * self.lds_tiles
+        self._async_load_vram_to_lds(
+            q_base_i64, g_offs[:n_prime], lds_wr_offs[:n_prime], imm_offs[:n_prime],
+            war=_COVER_GLUE_WAR_ASYNC,
+        )
+        rocdl.sched_barrier(0)  # pin the prime loads above the caller's SALU
+
+        # Stash for part 2 (drain + reads, and steady-loop refills when lds_tiles<k_tiles).
+        self._q_base_i64 = q_base_i64
+        self._q_g_offs = g_offs
+        self._q_lds_wr_offs = lds_wr_offs
+        self._q_imm_offs = imm_offs
+        self._q_ds_offs = ds_offs
+
+    def load_q_to_vgpr_part2(self, *, scale):
+        """Part 2 of the Q load: drain the async loads issued in part 1 and read the
+        tiles into WMMA A fragments (``scale`` folded in). A leading ``sched_barrier``
+        keeps the waits/reads below the caller's SALU so it stays in the load shadow.
+        Async is drained GRADUALLY (in-issue-order assumption); ``lds_tiles ==
+        k_tiles`` (default) skips the steady loop = fully-resident drain-only."""
+        rocdl.sched_barrier(0)  # keep waits/reads below the caller's SALU
+        k_tiles = self.k_tiles
+        lds_tiles = self.lds_tiles
+        ds_offs = self._q_ds_offs
         v8_ty = fx.Vector.make_type(_CHUNK_ELEMS, fx.BFloat16)
 
         def _read_tile(tile):
@@ -611,14 +627,10 @@ class QManager16b:
         def _refill(tile):
             lo = 2 * tile
             self._async_load_vram_to_lds(
-                q_base_i64, g_offs[lo:lo + 2], lds_wr_offs[lo:lo + 2], imm_offs[lo:lo + 2]
+                self._q_base_i64, self._q_g_offs[lo:lo + 2],
+                self._q_lds_wr_offs[lo:lo + 2], self._q_imm_offs[lo:lo + 2],
             )
 
-        # Prime: issue the first lds_tiles tiles (2 loads each).
-        n_prime = 2 * lds_tiles
-        self._async_load_vram_to_lds(
-            q_base_i64, g_offs[:n_prime], lds_wr_offs[:n_prime], imm_offs[:n_prime], war=_COVER_GLUE_WAR_ASYNC
-        )
         scale_bf16 = _wait_tie(scale.to(fx.BFloat16), "s_wait_alu depctr_va_vdst(0)")
 
         q_frags = []

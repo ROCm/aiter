@@ -504,7 +504,7 @@ def _core_attention(
     q_smem = smem.allocate(q_mgr.get_lds_size_in_byte())
     q_lds_base = fx.Int32(fx.ptrtoint(q_smem.peek().ptr))
 
-    q_frags = q_mgr.load_q_to_vgpr(
+    q_mgr.load_q_to_vgpr_part1(
         ptr_Q=ptr_Q,
         stride_q_seq=stride_q_seq,
         stride_q_head=stride_q_head,
@@ -515,7 +515,6 @@ def _core_attention(
         warp_idx=warp_idx,
         lane_idx=lane_idx,
         ptr_lds=q_lds_base,
-        scale=softmax_scale,
     )
 
     # ---- K/V staging: N_KV_PP ping-pong slots, K and V interleaved so each slot is a
@@ -583,6 +582,8 @@ def _core_attention(
         # harmless clamped load that is never consumed).
         rem = _max_i32(kv_len_wg - blk_row0, fx.Int32(0))
         return _min_i32(rem, fx.Int32(n_block))
+
+    q_frags = q_mgr.load_q_to_vgpr_part2(scale=softmax_scale)
 
     # Prologue: bulk-load the first tile (start_tile)'s K and V into its ping-pong
     # buffer — this is the ONLY use of the full-block ``async_load_vram_to_lds``
