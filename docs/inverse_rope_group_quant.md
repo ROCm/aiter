@@ -1755,7 +1755,41 @@ dispatch 序里拉更开。代价是**每一行 padding 就是一个空 block，
 **回归**：1120 项 `passed~`、0 失败（bf16+fp16 × 三档 group × 三种 layout）；非 2 的幂 S
 14 个值全过；graph capture/replay 全过。
 
-## 16.4 下一步
+## 16.4 A/B 回归扫：80 个 shape，无回退
+
+前面的回归只证了"不出错"，没证"不变慢"。补一轮真正的 A/B：把修复前的 `.cu` 单独 checkout
+出来重编一份二进制，两份跑同一组 80 个 shape（`(h,g)` = 16,2 / 16,8 / 16,16 / 8,1 × `S` =
+128 / 1024 / 4096 / 16384 × group 32、128 × row/mfma_tile/n32k4），再按 `after/before` 比。
+
+```bash
+git checkout HEAD~1 -- csrc/kernels/inverse_rope_group_quant.cu   # 记得之后 checkout HEAD 还回来
+rm -f aiter/jit/module_inverse_rope_group_quant.so && rm -rf aiter/jit/build/module_inverse_rope_group_quant
+python op_tests/test_inverse_rope_group_quant.py -d bf16 -b 16,2 16,8 16,16 8,1 \
+    -s 128 1024 4096 16384 --group-size 32 128 -l row mfma_tile n32k4 > /tmp/before.log
+```
+
+结果：56 个落在 ±5% 内，19 个提升（最大 0.74×），5 个被标成 >1.05× 的**全部是 `mfma_tile`**。
+而 `mfma_tile` 在代码上到不了这两处改动：`if constexpr(kMfmaTile)` 分支原样未动且优先于新的
+`else if`，`n_super` 只在 `super_major`（要求 `LAYOUT == kScaleN32K4`）时经 `s_extent` 起作用。
+同一批里 `mfma_tile` 还出现了 0.88× 和 0.92× 的"提升"，双向摆动即噪声。把这几个 shape 连测
+三遍，离散区完全盖住了两侧的值：
+
+| shape (mfma_tile, GS=32) | before | after | 连测三遍 |
+|---|--:|--:|---|
+| G=2 S=16384 | 50.0 | 53.4 | 53.1 / 53.8 / **47.5** |
+| G=8 S=16384 | 50.0 | 52.9 | 50.6 / 51.7 / **47.5** |
+| G=8 S=128 | 5.78 | 6.32 | 6.10 / 5.74 / 6.08 |
+| G=16 S=128 | 6.03 | 6.40 | 6.24 / 6.40 / 6.48 |
+
+所以这台机器上 `mfma_tile` 的 run 间离散度有 ±8–11%，单跑一次的差值读不出 5% 级别的结论——
+要判 mfma 路径的回归必须连测，或者干脆按代码路径排除。A/B 表只跑了 group 32 和 128，
+补一档 64（clamp 在小 `Ks` 上会触发的那档）：`G=8/16 × S=1024/4096/16384 × bf16/fp16`
+96 项 `passed~`、0 失败，`row` 在 `S=16384` 是 9.1–9.9 TB/s。
+
+**gfx950 未受影响**，两处改动各自被 `LAYOUT == kScaleN32K4`（gfx950 用的是 mfma tile）和
+`!wave64` 挡住；`git diff -w HEAD~1` 的功能改动就这两块。
+
+## 16.5 下一步
 
 §15.12 第 1 条（主路径 1.4×）仍是最大的一块，而这一轮**支持**它：两个 bug 修完 `row` 到了
 9.3–9.9 TB/s，说明之前那个"天花板"里有一部分其实是 launch 形状的浪费，不全是每字节代价。
