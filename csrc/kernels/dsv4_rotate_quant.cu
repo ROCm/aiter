@@ -475,8 +475,8 @@ void rotate_activation(aiter_tensor_t& out,
                         const aiter_tensor_t& input)
 {
     const int32_t dim = input.size(-1);
-    const int32_t stride     = input.stride(-2);
-    const int32_t out_stride = out.stride(-2);
+    const int32_t stride     = input.is_contiguous() ? dim : input.stride(-2);
+    const int32_t out_stride = out.is_contiguous() ? dim : out.stride(-2);
     const int32_t m = input.numel() / dim;
     const int32_t head_num = input.size(-2);
     const bool shuffle_scale = false;

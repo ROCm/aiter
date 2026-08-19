@@ -256,11 +256,13 @@ def test_mha_v4_fp8_quantization_matches_torch():
     get_gfx() not in ("gfx942", "gfx950"),
     reason="gfx942/gfx950 rotated FP8 quantization",
 )
-def test_mha_v4_rotated_fp8_quantization_matches_native_rotation():
+@pytest.mark.parametrize("sequence,heads", [(257, 3), (512, 1), (2048, 1)])
+def test_mha_v4_rotated_fp8_quantization_matches_native_rotation(sequence, heads):
     from aiter.ops.quant import rotate_activation
 
     torch.manual_seed(23)
-    value = torch.randn((1, 257, 3, 128), device="cuda", dtype=torch.bfloat16)
+    value = torch.randn((1, heads, sequence, 128), device="cuda", dtype=torch.bfloat16)
+    value = value.permute(0, 2, 1, 3).contiguous()
     rotated = torch.empty_like(value)
     rotate_activation(rotated, value)
     expected, expected_scale = quantize_fp8(rotated)
