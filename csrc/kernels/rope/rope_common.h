@@ -13,7 +13,7 @@
 #include <type_traits>
 
 #ifdef __HIP_DEVICE_COMPILE__
-#include "opus/opus.hpp"
+#include "aiter_opus_plus.h"
 #endif
 
 // =====================================================================================================================
@@ -7401,26 +7401,22 @@ struct alignas(sizeof(T) * vec_size) vec_t
             for(int i = 0; i < vec_size; ++i)
                 data[i] = src[i];
         }
-#if defined(__HIP_DEVICE_COMPILE__) && (defined(__HIP__MI300__) || defined(__gfx950__))
-        // Two f32 lanes convert and pack into one fp8 pair per instruction, so an
-        // even-length vector costs half as many converts as the scalar path below.
+#if defined(__HIP_DEVICE_COMPILE__) && (defined(__gfx942__) || defined(__gfx950__))
         else if constexpr((std::is_same_v<T, fp8e4m3fnuz> || std::is_same_v<T, fp8e4m3fn>) &&
                           (vec_size % 2 == 0))
         {
-            constexpr float FP8_MAX = std::is_same_v<T, fp8e4m3fnuz> ? 240.0f : 448.0f;
-            const float rcp_scale   = 1.0f / scale;
+            const float inverted_scale = 1.0f / scale;
 #pragma unroll
             for(int i = 0; i < vec_size; i += 2)
             {
-                // fmed3(x, hi, lo) is the median of three, i.e. a clamp to [lo, hi];
-                // the packed convert saturates differently, so clamp first.
-                float v0 = __builtin_amdgcn_fmed3f(
-                    static_cast<float>(src[i]) * rcp_scale, FP8_MAX, -FP8_MAX);
-                float v1 = __builtin_amdgcn_fmed3f(
-                    static_cast<float>(src[i + 1]) * rcp_scale, FP8_MAX, -FP8_MAX);
-                uint32_t packed = __builtin_amdgcn_cvt_pk_fp8_f32(v0, v1, 0u, false);
-                data[i]         = T(static_cast<uint8_t>(packed & 0xFF), T::from_bits());
-                data[i + 1]     = T(static_cast<uint8_t>((packed >> 8) & 0xFF), T::from_bits());
+                const opus::fp32x2_t values{static_cast<float>(src[i]),
+                                            static_cast<float>(src[i + 1])};
+                const auto converted =
+                    aiter::scaled_cast<opus::fp8_t>(values, inverted_scale);
+                const uint16_t packed = __builtin_bit_cast(uint16_t, converted);
+                data[i] = T(static_cast<uint8_t>(packed), T::from_bits());
+                data[i + 1] =
+                    T(static_cast<uint8_t>(packed >> 8), T::from_bits());
             }
         }
 #endif
