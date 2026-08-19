@@ -6,15 +6,6 @@ on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
     branches: [main]  # Triggers on PRs targeting `main`
-    paths:
-      - '**'
-      - '!**/*.md'
-      - '!docs/**'
-      - '!LICENSE'
-      - '!.gitignore'
-      - '!.github/workflows/**'
-      - '.github/workflows/aiter-test.yaml'
-      - '!.github/scripts/sglang_downstream.py'
 
   workflow_dispatch:
   schedule:
@@ -26,16 +17,92 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
-  DOCKER_IMAGE: "rocm/pytorch:latest"
   GPU_ARCH_LIST: "gfx942;gfx950"
   AITER_TEST: "op_tests"
   AITER_WHEEL_ARTIFACT_NAME: aiter-whl-${{ github.run_id }}
   AITER_PREBUILD_MAX_JOBS: "64"
-  TRITON_WHEEL_ARTIFACT_NAME: triton_wheelhouse
 
 jobs:
+  detect_aiter_test_scope:
+    name: Detect Aiter Test Scope
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      run_tests: ${{ steps.detect.outputs.run_tests }}
+      reason: ${{ steps.detect.outputs.reason }}
+    steps:
+      - name: Detect whether Aiter tests are required
+        id: detect
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_DRAFT: ${{ github.event.pull_request.draft }}
+        run: |
+          set -euo pipefail
+
+          if [ "${GITHUB_EVENT_NAME}" != "pull_request" ]; then
+            echo "run_tests=true" >> "$GITHUB_OUTPUT"
+            echo "reason=non_pull_request_event" >> "$GITHUB_OUTPUT"
+            echo "Aiter tests are required for ${GITHUB_EVENT_NAME}." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          if [ "${PR_DRAFT}" = "true" ]; then
+            echo "run_tests=false" >> "$GITHUB_OUTPUT"
+            echo "reason=draft_pull_request" >> "$GITHUB_OUTPUT"
+            echo "Aiter tests are skipped because this pull request is a draft." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          mapfile -t changed_files < <(
+            gh api --paginate \
+              "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/files" \
+              --jq '.[].filename'
+          )
+
+          run_tests=false
+          reason=only_ignored_changed_files
+          for file in "${changed_files[@]}"; do
+            case "${file}" in
+              .github/workflows/aiter-test.yaml)
+                run_tests=true
+                reason=matching_changed_files
+                break
+                ;;
+              *.md|docs/*|LICENSE|.gitignore|.github/scripts/sglang_downstream.py|.github/workflows/*)
+                ;;
+              *)
+                run_tests=true
+                reason=matching_changed_files
+                break
+                ;;
+            esac
+          done
+
+          echo "run_tests=${run_tests}" >> "$GITHUB_OUTPUT"
+          echo "reason=${reason}" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "## Aiter Test Scope"
+            echo
+            echo "- Changed files: ${#changed_files[@]}"
+            echo "- Aiter tests required: ${run_tests}"
+            echo "- Reason: ${reason}"
+            if [ "${run_tests}" = "true" ]; then
+              echo "Aiter tests are required because at least one changed file matches the Aiter test scope."
+            else
+              echo "Aiter tests are not required for this pull request."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  ci_config:
+    uses: ./.github/workflows/ci-config.yaml
+
   check-signal:
-    if: ${{ !github.event.pull_request || github.event.pull_request.draft == false }}
+    if: ${{ needs.detect_aiter_test_scope.outputs.run_tests == 'true' }}
+    needs: detect_aiter_test_scope
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -48,9 +115,9 @@ jobs:
           GITHUB_SHA: ${{ github.sha }}
 
   build_aiter_wheels:
-    if: ${{ !github.event.pull_request || github.event.pull_request.draft == false }}
+    if: ${{ needs.detect_aiter_test_scope.outputs.run_tests == 'true' }}
     runs-on: build-only-aiter
-    needs: check-signal
+    needs: [detect_aiter_test_scope, check-signal, ci_config]
     permissions:
       id-token: write
       contents: read
@@ -59,10 +126,10 @@ jobs:
       matrix:
         include:
           - python_version: "3.10"
-            docker_image: "rocm/pytorch:rocm7.2.4_ubuntu22.04_py3.10_pytorch_release_2.10.0"
+            docker_image: ${{ needs.ci_config.outputs.pytorch_py310_image }}
             build_enabled: ${{ github.ref == 'refs/heads/main' }}
           - python_version: "3.12"
-            docker_image: "rocm/pytorch:latest"
+            docker_image: ${{ needs.ci_config.outputs.pytorch_py312_image }}
             build_enabled: true
     steps:
       # ---- Common steps (fork and non-fork) ----
@@ -270,7 +337,8 @@ jobs:
           for WHL in all-wheels/amd_aiter*.whl; do
             WHL_NAME=$(basename "${WHL}")
             echo "Uploading ${WHL_NAME}..."
-            aws s3 cp "${WHL}" "${S3_STAGING}/${WHL_NAME}"
+            aws s3 cp "${WHL}" "${S3_STAGING}/${WHL_NAME}" \
+              --cache-control "public, max-age=31536000, immutable"
           done
 
           echo "=== Generating versioned manifest ==="
@@ -278,6 +346,7 @@ jobs:
 
           python3 - <<'PY'
           import json, glob, os, re, sys
+          from urllib.parse import quote
 
           s3_public = os.environ["S3_PUBLIC"]
           timestamp = os.environ["MANIFEST_TIMESTAMP"]
@@ -295,7 +364,7 @@ jobs:
 
           for whl_path in wheels:
               whl_name = os.path.basename(whl_path)
-              whl_url = f"{s3_public}/{whl_name}"
+              whl_url = f"{s3_public}/{quote(whl_name, safe='')}"
               match = re.search(r"-(cp3\d+)-", whl_name)
               if match:
                   tag = match.group(1)
@@ -320,17 +389,32 @@ jobs:
           PY
 
           aws s3 cp latest-main-wheel.json \
+            "${S3_STAGING}/commits/${GITHUB_SHA}/latest.json" \
+            --content-type application/json \
+            --cache-control "public, max-age=31536000, immutable"
+
+          aws s3 cp latest-main-wheel.json \
             "${S3_STAGING}/main/latest.json" \
-            --content-type application/json
+            --content-type application/json \
+            --cache-control "no-store, max-age=0, must-revalidate"
+
+          if [ -n "${CLOUDFRONT_DISTRIBUTION_ID:-}" ]; then
+            aws cloudfront create-invalidation \
+              --distribution-id "${CLOUDFRONT_DISTRIBUTION_ID}" \
+              --paths "/whl-staging/gfx942-gfx950/main/latest.json"
+          else
+            echo "::warning::CLOUDFRONT_DISTRIBUTION_ID is not set; skipping latest.json invalidation"
+          fi
 
           echo "Uploaded versioned manifest"
         env:
           S3_PUBLIC: "https://rocm.frameworks-nightlies.amd.com/whl-staging/gfx942-gfx950"
+          CLOUDFRONT_DISTRIBUTION_ID: ${{ vars.AITER_WHEEL_CLOUDFRONT_DISTRIBUTION_ID }}
 
   split_aiter_tests:
-    if: ${{ !github.event.pull_request || github.event.pull_request.draft == false }}
+    if: ${{ needs.detect_aiter_test_scope.outputs.run_tests == 'true' }}
     runs-on: ubuntu-latest
-    needs: [check-signal, build_aiter_wheels]
+    needs: [detect_aiter_test_scope, check-signal, build_aiter_wheels]
     outputs:
       shard_count: 8
     steps:
@@ -350,20 +434,23 @@ jobs:
           retention-days: 7
 
   prepare_triton_wheel:
-    if: ${{ !github.event.pull_request || github.event.pull_request.draft == false }}
-    needs: check-signal
+    if: ${{ needs.detect_aiter_test_scope.outputs.run_tests == 'true' }}
+    needs: [detect_aiter_test_scope, check-signal, ci_config]
     uses: ./.github/workflows/prepare-triton-wheel.yaml
     with:
-      docker-image: rocm/pytorch:latest
-      artifact-name: triton_wheelhouse
+      docker-image: ${{ needs.ci_config.outputs.pytorch_py312_image }}
+      artifact-name: ${{ needs.ci_config.outputs.triton_wheel_artifact_name }}
       retention-days: 3
 
   standard:
     if: >-
-      (!github.event.pull_request || github.event.pull_request.draft == false) &&
+      needs.detect_aiter_test_scope.outputs.run_tests == 'true' &&
       github.event.action != 'labeled'
     name: Standard Tests (1 GPU)
-    needs: [build_aiter_wheels, split_aiter_tests, prepare_triton_wheel]
+    needs: [detect_aiter_test_scope, build_aiter_wheels, split_aiter_tests, prepare_triton_wheel, ci_config]
+    env:
+      DOCKER_IMAGE: ${{ needs.ci_config.outputs.pytorch_py312_image }}
+      TRITON_WHEEL_ARTIFACT_NAME: ${{ needs.ci_config.outputs.triton_wheel_artifact_name }}
     strategy:
       fail-fast: false
       matrix:
@@ -440,7 +527,41 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
+      - name: Network preflight before Aiter test artifact downloads
+        if: ${{ startsWith(runner.name, 'linux-aiter-mi35x-1-') }}
+        continue-on-error: true
+        timeout-minutes: 5
+        run: |
+          set +e
+
+          echo "=== Runner info ==="
+          echo "RUNNER_NAME=${RUNNER_NAME}"
+          echo "RUNNER_OS=${RUNNER_OS}"
+          echo "hostname=$(hostname -f 2>/dev/null || hostname)"
+          date -u
+
+          echo "=== DNS check ==="
+          getent hosts github.com || true
+          getent hosts api.github.com || true
+          getent hosts productionresultssa4.blob.core.windows.net || true
+          getent hosts productionresultssa8.blob.core.windows.net || true
+
+          echo "=== GitHub and Azure Blob connectivity check ==="
+          for url in \
+            https://api.github.com/rate_limit \
+            https://github.com/ROCm/aiter \
+            https://productionresultssa4.blob.core.windows.net/ \
+            https://productionresultssa8.blob.core.windows.net/
+          do
+            curl -L -o /dev/null -sS \
+              --connect-timeout 10 \
+              --max-time 30 \
+              -w "url=${url} code=%{http_code} dns=%{time_namelookup}s connect=%{time_connect}s tls=%{time_appconnect}s ttfb=%{time_starttransfer}s total=%{time_total}s speed=%{speed_download}B/s\n" \
+              "$url" || true
+          done
+
       - name: Download test shard lists
+        id: download_aiter_shards
         uses: actions/download-artifact@v4
         timeout-minutes: 15
         with:
@@ -478,6 +599,7 @@ jobs:
 
       - name: Retry Download Aiter wheel artifact
         if: steps.restore_aiter_wheel.outputs.cache-hit != 'true' && steps.download_aiter_wheel.outcome == 'failure'
+        id: retry_aiter_wheel
         uses: actions/download-artifact@v4
         timeout-minutes: 30
         with:
@@ -485,12 +607,31 @@ jobs:
           path: aiter_wheels
 
       - name: Download Triton wheel artifact
+        id: download_triton_wheel
         uses: actions/download-artifact@v4
         timeout-minutes: 30
         continue-on-error: true
         with:
           name: ${{ env.TRITON_WHEEL_ARTIFACT_NAME }}
           path: triton_wheels
+
+      - name: Speedtest after Aiter test artifact download failure
+        if: ${{ always() && startsWith(runner.name, 'linux-aiter-mi35x-1-') && (steps.download_aiter_shards.outcome == 'failure' || steps.restore_aiter_wheel.outcome == 'failure' || steps.retry_aiter_wheel.outcome == 'failure' || steps.download_triton_wheel.outcome == 'failure') }}
+        continue-on-error: true
+        timeout-minutes: 5
+        run: |
+          set +e
+
+          echo "=== Runner info ==="
+          echo "RUNNER_NAME=${RUNNER_NAME}"
+          echo "RUNNER_OS=${RUNNER_OS}"
+          echo "hostname=$(hostname -f 2>/dev/null || hostname)"
+          date -u
+
+          echo "=== speedtest-cli ==="
+          python3 -m pip install --user --disable-pip-version-check speedtest-cli || true
+          speedtest_bin="$(python3 -m site --user-base)/bin/speedtest-cli"
+          timeout 120 "$speedtest_bin" --simple --secure || true
 
       - name: Docker login
         if: ${{ !github.event.pull_request || !github.event.pull_request.head.repo.fork }}
@@ -677,11 +818,11 @@ jobs:
 
   standard-test-finish:
     if: >-
-      !github.event.pull_request.draft &&
+      needs.detect_aiter_test_scope.outputs.run_tests == 'true' &&
       github.event.action != 'labeled'
     name: Standard Test Results
     runs-on: ubuntu-latest
-    needs: [standard]
+    needs: [detect_aiter_test_scope, standard]
     steps:
       - name: Download all test logs
         uses: actions/download-artifact@v4
@@ -718,7 +859,10 @@ jobs:
   multi-gpu:
     name: Multi-GPU Tests (8 GPU)
     if: github.ref == 'refs/heads/main'
-    needs: [build_aiter_wheels, prepare_triton_wheel]
+    needs: [build_aiter_wheels, prepare_triton_wheel, ci_config]
+    env:
+      DOCKER_IMAGE: ${{ needs.ci_config.outputs.pytorch_py312_image }}
+      TRITON_WHEEL_ARTIFACT_NAME: ${{ needs.ci_config.outputs.triton_wheel_artifact_name }}
     strategy:
       fail-fast: false
       matrix:
@@ -956,11 +1100,11 @@ jobs:
     if: >-
       always() &&
       !cancelled() &&
-      !github.event.pull_request.draft &&
+      needs.detect_aiter_test_scope.outputs.run_tests == 'true' &&
       github.event.action != 'labeled' &&
       github.event_name != 'schedule'
     runs-on: ubuntu-latest
-    needs: [standard]
+    needs: [detect_aiter_test_scope, standard]
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
@@ -1021,13 +1165,16 @@ jobs:
         if: steps.current.outputs.found == 'true' && github.event_name == 'pull_request'
         id: baseline_pinned
         continue-on-error: true
-        uses: dawidd6/action-download-artifact@v3
+        uses: dawidd6/action-download-artifact@v21
         timeout-minutes: 15
         with:
           workflow: aiter-test.yaml
           commit: ${{ github.event.pull_request.base.sha }}
           name: tuned-op-bench-${{ github.event.pull_request.base.sha }}
           path: /tmp/baseline_pinned/
+          # GHSA-5xr6-xhww-33m4: a fork run's artifact must never become a trusted
+          # baseline. false is v6+'s default, stated so a flip cannot undo it.
+          allow_forks: false
           if_no_artifact_found: warn
 
       - name: Fallback — fetch baseline from latest main
@@ -1036,7 +1183,7 @@ jobs:
           github.event_name == 'pull_request'
         id: baseline_main
         continue-on-error: true
-        uses: dawidd6/action-download-artifact@v3
+        uses: dawidd6/action-download-artifact@v21
         timeout-minutes: 15
         with:
           workflow: aiter-test.yaml
@@ -1044,6 +1191,7 @@ jobs:
           name_is_regexp: true
           name: ^tuned-op-bench-[a-f0-9]+$
           path: /tmp/baseline_main/
+          allow_forks: false
           if_no_artifact_found: warn
 
       - name: Compare
@@ -1121,3 +1269,73 @@ jobs:
           name: tuned-op-bench-${{ github.sha }}
           path: /tmp/publish/
           retention-days: 90
+
+  aiter-test-gate:
+    name: Aiter Test Gate
+    if: always()
+    runs-on: ubuntu-latest
+    needs:
+      - detect_aiter_test_scope
+      - check-signal
+      - build_aiter_wheels
+      - split_aiter_tests
+      - prepare_triton_wheel
+      - standard
+      - standard-test-finish
+    steps:
+      - name: Evaluate Aiter test gate
+        env:
+          RUN_TESTS: ${{ needs.detect_aiter_test_scope.outputs.run_tests }}
+          REASON: ${{ needs.detect_aiter_test_scope.outputs.reason }}
+          DETECT_RESULT: ${{ needs.detect_aiter_test_scope.result }}
+          CHECK_SIGNAL_RESULT: ${{ needs['check-signal'].result }}
+          BUILD_RESULT: ${{ needs.build_aiter_wheels.result }}
+          SPLIT_RESULT: ${{ needs.split_aiter_tests.result }}
+          TRITON_RESULT: ${{ needs.prepare_triton_wheel.result }}
+          STANDARD_RESULT: ${{ needs.standard.result }}
+          STANDARD_FINISH_RESULT: ${{ needs['standard-test-finish'].result }}
+        run: |
+          set -euo pipefail
+
+          {
+            echo "## Aiter Test Gate"
+            echo
+            echo "- Scope detection: ${DETECT_RESULT}"
+            echo "- Aiter tests required: ${RUN_TESTS:-unknown}"
+            echo "- Reason: ${REASON:-unknown}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "${DETECT_RESULT}" != "success" ]; then
+            echo "::error::Aiter test scope detection did not succeed: ${DETECT_RESULT}"
+            exit 1
+          fi
+
+          if [ "${RUN_TESTS}" != "true" ]; then
+            echo "Aiter tests are not required for this change." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          failed=()
+          for result in \
+            "check-signal=${CHECK_SIGNAL_RESULT}" \
+            "build_aiter_wheels=${BUILD_RESULT}" \
+            "split_aiter_tests=${SPLIT_RESULT}" \
+            "prepare_triton_wheel=${TRITON_RESULT}" \
+            "standard=${STANDARD_RESULT}" \
+            "standard-test-finish=${STANDARD_FINISH_RESULT}"
+          do
+            job="${result%%=*}"
+            status="${result#*=}"
+            echo "- ${job}: ${status}" >> "$GITHUB_STEP_SUMMARY"
+            if [ "${status}" != "success" ]; then
+              failed+=("${job}=${status}")
+            fi
+          done
+
+          if [ "${#failed[@]}" -gt 0 ]; then
+            printf 'Aiter test gate failed because required jobs did not pass:\n' >&2
+            printf '  %s\n' "${failed[@]}" >&2
+            exit 1
+          fi
+
+          echo "Aiter test gate passed." >> "$GITHUB_STEP_SUMMARY"

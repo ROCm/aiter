@@ -1,0 +1,255 @@
+name: FFM Triton Tests
+
+run-name: FFM Triton tests on ${{ inputs.runner || 'linux-aiter-do-mi350x-1' }}
+
+on:
+  pull_request:
+    types: [labeled]
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: Self-hosted runner label to use for the FFM Triton tests.
+        required: true
+        default: linux-aiter-do-mi350x-1
+        type: string
+      docker_image:
+        description: FFM image to pull and test.
+        required: true
+        default: rocm/ffm-dev:latest
+        type: string
+      test_ref:
+        description: Git branch containing the reduced FFM Triton test suite.
+        required: true
+        default: shared/reduced_tests_for_FFM_CI
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.runner || 'linux-aiter-do-mi350x-1' }}
+  cancel-in-progress: true
+
+env:
+  FFM_IMAGE: ${{ inputs.docker_image || 'rocm/ffm-dev:latest' }}
+  FFM_TEST_SOURCE_REF: ${{ inputs.test_ref || 'shared/reduced_tests_for_FFM_CI' }}
+  FFM_TEST: op_tests/triton_tests
+  FFM_SHARD_COUNT: 5
+  FFM_TRITON_COMMIT: 6cf030fe7bffce12a5712e20fb507a51d5123f10
+
+jobs:
+  ffm-triton-tests:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (
+        github.event.action == 'labeled' &&
+        github.event.label.name == 'ci:gfx1250-ffm-triton' &&
+        github.event.pull_request.head.repo.full_name == github.repository
+      )
+    name: FFM Triton Tests (${{ inputs.runner || 'linux-aiter-do-mi350x-1' }}) / Shard ${{ matrix.shard }}
+    runs-on: ${{ inputs.runner || 'linux-aiter-do-mi350x-1' }}
+    timeout-minutes: 7200
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4]
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+
+      - name: Load reduced FFM Triton test suite
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --depth=1 origin \
+            "refs/heads/${FFM_TEST_SOURCE_REF}:refs/remotes/origin/${FFM_TEST_SOURCE_REF}"
+          ffm_test_source_commit="$(git rev-parse "refs/remotes/origin/${FFM_TEST_SOURCE_REF}")"
+          echo "FFM test source commit: ${ffm_test_source_commit}"
+          rm -rf "${FFM_TEST}"
+          git checkout "refs/remotes/origin/${FFM_TEST_SOURCE_REF}" -- "${FFM_TEST}"
+          test_count="$(find "${FFM_TEST}" -type f -name 'test*.py' | wc -l | tr -d ' ')"
+          echo "Loaded ${test_count} FFM Triton test files from ${FFM_TEST_SOURCE_REF}/${FFM_TEST}"
+          if [ "${test_count}" -eq 0 ]; then
+            echo "::error::No FFM Triton test files found in ${FFM_TEST_SOURCE_REF}/${FFM_TEST}"
+            exit 1
+          fi
+
+      - name: Docker login
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "${DOCKER_PASSWORD}" ]; then
+            echo "::error::Missing DOCKER_PASSWORD secret required to pull ${FFM_IMAGE}"
+            exit 1
+          fi
+          DOCKER_USER="${DOCKERHUB_USERNAME:-rocmshared}"
+          for attempt in 1 2 3; do
+            if echo "${DOCKER_PASSWORD}" | docker login -u "${DOCKER_USER}" --password-stdin; then
+              echo "Docker login succeeded on attempt ${attempt}"
+              exit 0
+            fi
+            echo "Docker login attempt ${attempt} failed"
+            if [ "${attempt}" != 3 ]; then
+              sleep 10
+            fi
+          done
+          echo "::error::Docker login failed after 3 attempts"
+          exit 1
+
+      - name: Pull FFM image
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            for wait_attempt in $(seq 1 30); do
+              if docker info >/dev/null 2>&1; then
+                break
+              fi
+              echo "Waiting for Docker daemon (${wait_attempt}/30)"
+              sleep 2
+            done
+            if docker pull "${FFM_IMAGE}"; then
+              exit 0
+            fi
+            echo "Docker pull attempt ${attempt} failed"
+            if [ "${attempt}" != 3 ]; then
+              sleep 10
+            fi
+          done
+          echo "::error::Failed to pull ${FFM_IMAGE} after 3 attempts"
+          exit 1
+
+      - name: Run sharded FFM Triton tests
+        run: |
+          set -euo pipefail
+
+          docker run --rm -i \
+            --cap-add=SYS_PTRACE \
+            --security-opt seccomp=unconfined \
+            --shm-size=16gb \
+            -e FFM_TEST="${FFM_TEST}" \
+            -e FFM_SHARD_INDEX="${{ matrix.shard }}" \
+            -e FFM_SHARD_COUNT="${FFM_SHARD_COUNT}" \
+            -e FFM_TRITON_COMMIT="${FFM_TRITON_COMMIT}" \
+            -v "${GITHUB_WORKSPACE}:/workspace" \
+            -w /workspace \
+            "${FFM_IMAGE}" \
+            bash -l -s <<'FFM_DOCKER_SCRIPT'
+              set -euo pipefail
+              source /ffm/ffmlite_env.sh
+              cd /workspace
+              git config --global --add safe.directory /workspace
+
+              echo "==== Runtime context ===="
+              echo "pwd: $(pwd)"
+              echo "aiter checkout: $(git rev-parse HEAD)"
+              echo "FFM_TEST=${FFM_TEST}"
+              echo "FFM_SHARD_INDEX=${FFM_SHARD_INDEX}"
+              echo "FFM_SHARD_COUNT=${FFM_SHARD_COUNT}"
+              echo "PATH=${PATH}"
+              echo "PYTHONPATH=${PYTHONPATH:-}"
+
+              export ENABLE_CK=0
+              export AITER_TRITON_ONLY=0
+              export AITER_USE_SYSTEM_TRITON=1
+              export PIP_BREAK_SYSTEM_PACKAGES=1
+              echo "ENABLE_CK=${ENABLE_CK}"
+              echo "AITER_TRITON_ONLY=${AITER_TRITON_ONLY}"
+              echo "AITER_USE_SYSTEM_TRITON=${AITER_USE_SYSTEM_TRITON}"
+
+              echo "==== Build FFM Triton checkout ===="
+              TRITON_SOURCE_DIR=/root/triton
+              if ! git -C "${TRITON_SOURCE_DIR}" cat-file -e "${FFM_TRITON_COMMIT}^{commit}"; then
+                echo "::error::FFM image does not contain Triton commit ${FFM_TRITON_COMMIT}"
+                exit 1
+              fi
+              mapfile -t FFM_LLVM_DIRS < <(
+                find /root/.triton/llvm -mindepth 1 -maxdepth 1 -type d \
+                  -name 'llvm-*-ubuntu-x64-*' -print
+              )
+              if [ "${#FFM_LLVM_DIRS[@]}" -ne 1 ]; then
+                echo "::error::Expected one cached FFM LLVM toolchain, found ${#FFM_LLVM_DIRS[@]}"
+                printf "%s\n" "${FFM_LLVM_DIRS[@]}"
+                exit 1
+              fi
+              export LLVM_SYSPATH="${FFM_LLVM_DIRS[0]}"
+              git -C "${TRITON_SOURCE_DIR}" checkout --detach "${FFM_TRITON_COMMIT}"
+              MAX_JOBS=32 python3 -m pip install \
+                --break-system-packages --no-build-isolation -e "${TRITON_SOURCE_DIR}"
+              python3 -c 'import inspect; import triton; from triton.experimental.gluon.language.amd.gfx1250 import tdm; update_params = inspect.signature(tdm.update_tensor_descriptor).parameters; gather_params = inspect.signature(tdm.async_gather).parameters; assert "clamp_bounds" in update_params; assert list(gather_params)[:3] == ["desc", "src_row_indices", "dst"]; print(f"FFM Triton: {triton.__version__} ({triton.__file__})")'
+
+              echo "==== Python packages before reinstall ===="
+              python3 -m pip show torch triton amd-triton triton-kernels amd-aiter aiter || true
+
+              echo "==== Reinstall mounted aiter checkout ===="
+              python3 -m pip uninstall -y amd-aiter aiter || true
+              python3 -m pip install --break-system-packages --no-build-isolation -e .
+
+              echo "==== Python packages after reinstall ===="
+              python3 -m pip show torch triton amd-triton triton-kernels amd-aiter aiter || true
+              python3 -m pip uninstall -y pylama || true
+
+              echo "==== Build FFM Triton shard ===="
+              : > ffm_all_items.list
+              mapfile -t FFM_TEST_FILES < <(
+                find "${FFM_TEST}" -type f -name "test*.py" -print | sort
+              )
+              if [ "${#FFM_TEST_FILES[@]}" -eq 0 ]; then
+                echo "::error::No FFM Triton test files found in ${FFM_TEST}"
+                exit 1
+              fi
+
+              while IFS= read -r file; do
+                echo "Collecting FFM tests from: ${file}"
+                if ! python3 -m pytest --collect-only -q "${file}" > ffm_collect_one_file.txt 2>&1; then
+                  cat ffm_collect_one_file.txt
+                  echo "::error::Failed to collect ${file}"
+                  exit 1
+                fi
+                awk \
+                  -v prefix="${file}::" \
+                  'index($0, prefix) == 1 { print }' \
+                  ffm_collect_one_file.txt >> ffm_all_items.list
+              done < <(printf "%s\n" "${FFM_TEST_FILES[@]}")
+
+              awk \
+                -v shard="${FFM_SHARD_INDEX}" \
+                -v shards="${FFM_SHARD_COUNT}" \
+                'NF && !seen[$0]++ {
+                  item_count++
+                  if (((item_count - 1) % shards) == shard) print
+                }' \
+                ffm_all_items.list > ffm_shard_items.list
+              shard_count="$(wc -l < ffm_shard_items.list | tr -d " ")"
+              echo "Selected ${shard_count} FFM Triton item(s) for shard ${FFM_SHARD_INDEX}/${FFM_SHARD_COUNT}"
+              if [ "${shard_count}" -eq 0 ]; then
+                echo "No FFM Triton items selected for shard ${FFM_SHARD_INDEX}/${FFM_SHARD_COUNT}; exiting successfully."
+                exit 0
+              fi
+              cat ffm_shard_items.list
+              mapfile -t FFM_TEST_ITEMS < ffm_shard_items.list
+
+              echo "==== Run sharded FFM Triton tests ===="
+              set +e
+              python3 -m pytest -v -n 8 --dist load --cache-clear \
+                --tb=short --durations=50 "${FFM_TEST_ITEMS[@]}"
+              parallel_status=$?
+              set -e
+
+              if [ "${parallel_status}" -ne 0 ]; then
+                echo "::warning::Parallel FFM run failed; rerunning failed items serially"
+                python3 -m pytest -v --last-failed \
+                  --last-failed-no-failures=none --tb=short --durations=50 \
+                  "${FFM_TEST_ITEMS[@]}"
+              fi
+          FFM_DOCKER_SCRIPT
+
+      - name: Cleanup
+        if: always()
+        run: |
+          docker logout 2>/dev/null || true
+          docker rmi "${FFM_IMAGE}" 2>/dev/null || true
