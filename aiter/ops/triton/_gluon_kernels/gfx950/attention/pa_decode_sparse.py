@@ -345,6 +345,7 @@ def _slots(
     MASKED: gl.constexpr,
     HAS_INVALID: gl.constexpr,
     IDX_BUFFER_LOAD: gl.constexpr,
+    UNI_TILE: gl.constexpr = False,
 ):
     # Returns in whatever layout k_pos carries. Called once per gather layout: NoPE
     # and RoPE tile their warps differently, and re-loading this tiny broadcast
@@ -355,7 +356,23 @@ def _slots(
     # of exec-mask branching in the kernel (20 of 55 s_and_saveexec_b64 on the
     # buffer path, all from the masked tail), because a masked gl.load predicates
     # while a masked buffer_load folds the mask into the offset.
-    if MASKED:
+    if UNI_TILE:
+        # One body for full and partial tiles. Read a REAL index -- k_pos clamped into
+        # the segment -- instead of masking the load, and fold the range test into
+        # `valid`, which _qkpv_fp8 already turns into a -inf score mask. An
+        # out-of-range lane then gathers a genuine row whose score is -inf, which is
+        # exactly how -1 sentinels are already handled on the full-tile path.
+        in_range = k_pos < hi
+        kp = gl.minimum(k_pos, gl.maximum(hi - 1, 0))
+        if IDX_BUFFER_LOAD:
+            slot = gl.amd.cdna4.buffer_load(ptr=indices_ptr + seg_start, offsets=kp)
+        else:
+            slot = gl.load(indices_ptr + seg_start + kp)
+        valid = in_range
+        if HAS_INVALID:
+            valid = valid & (slot >= 0) & (slot < num_rows)
+        slot = gl.where(valid, slot, 0)
+    elif MASKED:
         in_range = k_pos < hi
         if IDX_BUFFER_LOAD:
             slot = gl.amd.cdna4.buffer_load(
@@ -633,6 +650,9 @@ def _gd_fp8(
     IDX_BUFFER_LOAD: gl.constexpr,
     HAS_INVALID: gl.constexpr,
     FP8_FNUZ: gl.constexpr,
+    UNI_TILE: gl.constexpr = False,
+    seg_hi=0,
+    num_rows=0,
 ):
     """Gather one full fp8 tile. Split from the LDS-write/MFMA so the gather issues
     an iteration early.
@@ -648,12 +668,13 @@ def _gd_fp8(
         indices_ptr,
         seg_start,
         k_start + k_rng_slot,
-        0,  # hi/num_rows: unused at MASKED=False
-        0,
+        seg_hi,  # hi/num_rows: unused unless UNI_TILE
+        num_rows,
         BLOCK_SIZE,
         False,
         HAS_INVALID,
         IDX_BUFFER_LOAD,
+        UNI_TILE,
     )
     if UNIFORM:
         NGRP: gl.constexpr = HEAD_SIZE // 64
@@ -697,12 +718,13 @@ def _gd_fp8(
             indices_ptr,
             seg_start,
             k_start + k_rng_rope,
-            0,
-            0,
+            seg_hi,
+            num_rows,
             BLOCK_SIZE,
             False,
             HAS_INVALID,
             IDX_BUFFER_LOAD,
+            UNI_TILE,
         )
         k_rope = _cache_load(
             cache_bf16_ptr, bgr * (cs0 // 2) + pgr * 288 + 224, offs_rope, USE_BUFFER_LOAD
@@ -741,6 +763,9 @@ def _qkpv_fp8(
     UNIFORM: gl.constexpr,
     FP8_FNUZ: gl.constexpr,
     HAS_INVALID: gl.constexpr,
+    UNI_TILE: gl.constexpr = False,
+    k_start=0,
+    seg_hi=0,
 ):
     """Dequant a prefetched fp8 tile into LDS, then QK -> softmax -> PV. UNIFORM
     skips the RoPE slice-store (the whole head is one fp8 tile). When HAS_INVALID,
@@ -753,10 +778,23 @@ def _qkpv_fp8(
     S = gl.amd.cdna4.mfma(
         q_dot, k, gl.zeros([BLOCK_M, BLOCK_K], gl.float32, layout=qk_layout)
     )
-    NEED_MASK: gl.constexpr = HAS_INVALID or (not HEAD_ALIGNED)
+    # UNI_TILE folds the tile's range test into `valid`, so the score mask is no
+    # longer only about -1 sentinels: it is what makes the partial last tile correct.
+    COL_MASK: gl.constexpr = HAS_INVALID or UNI_TILE
+    NEED_MASK: gl.constexpr = COL_MASK or (not HEAD_ALIGNED)
     if NEED_MASK:
-        if HAS_INVALID:
-            col_mask = gl.convert_layout(valid, gl.SliceLayout(0, qk_layout))[None, :]
+        if COL_MASK:
+            if UNI_TILE and not HAS_INVALID:
+                # Build the range mask directly in the MFMA layout. Converting the
+                # slot-layout `valid` vector instead costs a cross-lane layout change
+                # per tile, which at 16 tiles ate the whole saving.
+                col_mask = (
+                    k_start
+                    + gl.arange(0, BLOCK_K, layout=gl.SliceLayout(0, qk_layout))
+                    < seg_hi
+                )[None, :]
+            else:
+                col_mask = gl.convert_layout(valid, gl.SliceLayout(0, qk_layout))[None, :]
             if not HEAD_ALIGNED:
                 col_mask = (
                     gl.convert_layout(head_mask, gl.SliceLayout(1, qk_layout))[:, None]
@@ -784,6 +822,7 @@ def _qkpv_fp8(
 
 @gluon.jit
 def _process_segment(
+    UNI_TILE: gl.constexpr,
     q_dot,
     cache_ptr,
     cache_bf16_ptr,
@@ -839,7 +878,12 @@ def _process_segment(
     hi_full = lo + ((hi - lo) // BLOCK_K) * BLOCK_K
 
     if IS_FP8:
-        n_full = (hi_full - lo) // BLOCK_K
+        # UNI_TILE: the partial tile is just the last iteration -- no peeled masked
+        # copy of the body (RESULTS.md 19).
+        if UNI_TILE:
+            n_full = (hi - lo + BLOCK_K - 1) // BLOCK_K
+        else:
+            n_full = (hi_full - lo) // BLOCK_K
         if n_full > 0:
             kn, ks, kr, vld = _gd_fp8(
                 cache_ptr,
@@ -866,6 +910,9 @@ def _process_segment(
                 IDX_BUFFER_LOAD,
                 HAS_INVALID,
                 FP8_FNUZ,
+                UNI_TILE,
+                hi,
+                num_rows,
             )
             for i in range(1, n_full):
                 kn2, ks2, kr2, vld2 = _gd_fp8(
@@ -893,6 +940,9 @@ def _process_segment(
                     IDX_BUFFER_LOAD,
                     HAS_INVALID,
                     FP8_FNUZ,
+                    UNI_TILE,
+                    hi,
+                    num_rows,
                 )
                 m_i, l_i, acc = _qkpv_fp8(
                     kn,
@@ -924,6 +974,9 @@ def _process_segment(
                     UNIFORM,
                     FP8_FNUZ,
                     HAS_INVALID,
+                    UNI_TILE,
+                    lo + (i - 1) * BLOCK_K,
+                    hi,
                 )
                 kn, ks, kr, vld = kn2, ks2, kr2, vld2
             m_i, l_i, acc = _qkpv_fp8(
@@ -956,6 +1009,9 @@ def _process_segment(
                 UNIFORM,
                 FP8_FNUZ,
                 HAS_INVALID,
+                UNI_TILE,
+                lo + (n_full - 1) * BLOCK_K,
+                hi,
             )
     else:
         for k_start in range(lo, hi_full, BLOCK_K):
@@ -1007,9 +1063,13 @@ def _process_segment(
                 IDX_BUFFER_LOAD,
                 HAS_INVALID,
                 FP8_FNUZ,
+                UNI_TILE,
+                hi,
+                num_rows,
             )
 
-    if hi_full < hi:
+    if (not UNI_TILE) or (not IS_FP8):
+      if hi_full < hi:
         m_i, l_i, acc = _decode_tile(
             q_dot,
             cache_ptr,
@@ -1130,6 +1190,7 @@ def _pa_decode_sparse(
     # extra still wants the CTAs. MAIN_SPLITS <= NUM_SPLITS lets main stop at whole
     # tiles and extra keep going; programs with split_id >= MAIN_SPLITS get an
     # empty main range and contribute an extra-only partial.
+    UNI_TILE: gl.constexpr,
     GRID_ORDER: gl.constexpr,
     MAIN_SPLITS: gl.constexpr,
     # ADAPTIVE_SPLITS: re-decide the useful split count per query at runtime.
@@ -1361,6 +1422,7 @@ def _pa_decode_sparse(
     main_lo = gl.minimum(split_id * main_chunk, main_len)
     main_hi = gl.minimum(main_lo + main_chunk, main_len)
     m_i, l_i, acc = _process_segment(
+        UNI_TILE,
         q_dot,
         main_cache_ptr,
         main_cache_bf16_ptr,
@@ -1410,6 +1472,7 @@ def _pa_decode_sparse(
         extra_lo = split_id * extra_chunk
         extra_hi = gl.minimum(extra_lo + extra_chunk, extra_len)
         m_i, l_i, acc = _process_segment(
+            UNI_TILE,
             q_dot,
             extra_cache_ptr,
             extra_cache_bf16_ptr,

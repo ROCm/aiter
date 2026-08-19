@@ -865,6 +865,14 @@ def _pa_decode_sparse_gfx950_gluon(
     _go = _os.environ.get("AITER_PA_DECODE_GRID_ORDER", "qsh")
     _ax = {"q": num_queries, "s": num_splits, "h": heads_blocks}
     assert sorted(_go) == ["h", "q", "s"], f"bad AITER_PA_DECODE_GRID_ORDER {_go!r}"
+    # AITER_PA_DECODE_UNI_TILE: run the partial last tile through the same body as the
+    # full ones instead of peeling a masked copy of it. Gluon inlines, so the peeled
+    # copy is a second ~1000-instruction gather+dequant+MFMA body whose register demand
+    # spills the tile loop: worth 0.900-0.907x on the buffer path and 0.943-0.972x on
+    # the 64-bit path at >=2 tiles/split, scaling with tiles per split. 0 restores the
+    # peeled tail.
+    uni_tile = _os.environ.get("AITER_PA_DECODE_UNI_TILE", "1") == "1"
+
     grid = tuple(_ax[c] for c in _go)
     _pa_decode_sparse_gfx950[grid](
         q,
@@ -918,6 +926,7 @@ def _pa_decode_sparse_gfx950_gluon(
         CHUNK_AXIS=chunk_axis,
         PART_STORE_CACHE=_os.environ.get('AITER_PA_DECODE_PART_ST', ''),
         GRID_ORDER=_go,
+        UNI_TILE=uni_tile,
         MAIN_SPLITS=main_splits,
         ADAPTIVE_SPLITS=adaptive_splits,
         ASM_DEQ=asm_deq,
