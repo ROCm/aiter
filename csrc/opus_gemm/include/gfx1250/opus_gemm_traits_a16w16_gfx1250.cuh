@@ -218,10 +218,15 @@ struct opus_a16w16_4wave_compute_traits_gfx1250 {
     // 1-WG/CU enforcement via LDS padding, the same trick the split-K traits use
     // below. This pipeline is only correct at one workgroup per CU: every tile
     // whose A/B segments fit twice in the 320 KB budget (<= 160 KB) raced --
-    // non-deterministically wrong at large grids, all 50 B_N=64 variants and the
-    // smaller B_N=128 ones, in BOTH the reference and the wave-layout pipeline.
-    // Padding past 160 KB so a second workgroup cannot co-reside fixes it; the
-    // pad tail is never accessed. See gen_co/KNOWN_ISSUES.md.
+    // non-deterministically wrong at large grids, in BOTH this and the
+    // wave-layout pipeline. Padding past 160 KB so a second workgroup cannot
+    // co-reside fixes it; the pad tail is never accessed.
+    //
+    // That occupancy is the variable (rather than tile size or register
+    // pressure) is pinned down by a control group: 71 variants whose registers
+    // would admit two waves per SIMD but whose LDS does not are all correct,
+    // while the 61 where both admit two are all wrong. WHY 2 WG/CU breaks it is
+    // not established -- see gen_co/KNOWN_ISSUES.md before assuming a cause.
     static constexpr int kHalfLds     = 160 * 1024;
     static constexpr int LDS_BYTES    =
         (SEG_BYTES_AB <= kHalfLds) ? (kHalfLds + 1024) : SEG_BYTES_AB;

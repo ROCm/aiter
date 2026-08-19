@@ -21,12 +21,33 @@ kid 21182  64x64x128 w1x4 c4x1  @ 2048x2048x7168   (before the fix)
   rep0 nbad=25416   rep1 nbad=24602   rep2 nbad=33105
 ```
 
-**Cause.** This pipeline is only correct at one workgroup per CU. Any tile whose
-A/B LDS segments fit twice in the 320 KB budget (<= 160 KB) let a second
-workgroup co-reside, which oversubscribes the per-CU TDM request budget. The
-predicate separated the population exactly: of 203 variants, every one with
-LDS <= 160 KB raced and every one above it was clean — 50/50 at `B_N = 64`,
-10/51 at `B_N = 128`, 0/51 at `B_N >= 192`.
+**What is established.** This pipeline is only correct at one workgroup per CU.
+Any tile whose A/B LDS segments fit twice in the 320 KB budget (<= 160 KB) let a
+second workgroup co-reside, and every such variant raced.
+
+VGPR and LDS both scale with the tile, so the raw correlation cannot separate
+them — but the population contains the control group that does:
+
+| group | n | LDS admits 2 WG | VGPR admits 2 WG | occupancy | result |
+|---|--:|---|---|---|---|
+| A | 61 | yes (<= 160 KB) | yes (2x320..450 <= 1024) | 2 WG/CU | **all wrong** |
+| B | 71 | no (> 160 KB) | yes | 1 WG/CU | all correct |
+| C | 72 | no | no (2xVGPR > 1024) | 1 WG/CU | all correct |
+
+A and B differ **only** in the LDS-driven occupancy — both would allow two waves
+per SIMD on registers alone. A is entirely wrong and B entirely correct, so the
+variable is workgroups-per-CU, not tile size or register pressure.
+
+**What is NOT established: why 2 WG/CU breaks it.** Candidates, undistinguished:
+the per-CU TDM request budget (a limit documented for the *split-K* pipeline in
+`opus_gemm_common.py`, never measured for this one); or the cluster-scope
+`s_barrier_signal(-1)` / `s_barrier_wait(-1)` handshake when two workgroups from
+different clusters share a CU — the non-determinism and grid-size dependence fit
+a barrier released early better than they fit a dropped transfer. Separating
+these needs an ATT capture of a 2-WG/CU run; see `README.md` for the recipe.
+
+The fix does not rest on the mechanism — it rests on "correct at 1 WG/CU", which
+the A/B control establishes.
 
 **Fix.** Pad `LDS_BYTES` past 160 KB when the real footprint is below it, so a
 second workgroup cannot fit. The pad tail is never accessed. This is the same
