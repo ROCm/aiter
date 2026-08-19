@@ -15,7 +15,6 @@ from op_tests.triton_tests.quant.test_fused_fp8_quant import (
     upcast,
 )
 
-
 _TORCH_ACTIVATIONS = {
     "silu": F.silu,
     "gelu": F.gelu,
@@ -398,19 +397,26 @@ def test_fused_clamp_act_mul_activations(M, D, activation, dtype_quant, backend)
 
     if dtype_quant is not None:
         out_q, scale = fused_clamp_act_mul(
-            inp, swiglu_limit=0.0, activation=activation,
-            dtype_quant=dtype_quant, backend=backend,
+            inp,
+            swiglu_limit=0.0,
+            activation=activation,
+            dtype_quant=dtype_quant,
+            backend=backend,
         )
         ref_q, ref_s = _torch_reference(inp, 0.0, None, dtype_quant, activation)
         torch.testing.assert_close(
             upcast(out_q, scale, torch.bfloat16),
             upcast(ref_q, ref_s, torch.bfloat16),
-            atol=0.1, rtol=0.1,
+            atol=0.1,
+            rtol=0.1,
         )
     else:
         out = fused_clamp_act_mul(
-            inp, swiglu_limit=0.0, activation=activation,
-            dtype_quant=None, backend=backend,
+            inp,
+            swiglu_limit=0.0,
+            activation=activation,
+            dtype_quant=None,
+            backend=backend,
         )
         ref = _torch_reference(inp, 0.0, None, None, activation)
         torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
@@ -441,19 +447,26 @@ def test_fused_clamp_act_mul_large_n_configs(M, n_half, dtype_quant, backend):
 
     if dtype_quant is not None:
         out_q, scale = fused_clamp_act_mul(
-            inp, swiglu_limit=0.0, activation="silu",
-            dtype_quant=dtype_quant, backend=backend,
+            inp,
+            swiglu_limit=0.0,
+            activation="silu",
+            dtype_quant=dtype_quant,
+            backend=backend,
         )
         ref_q, ref_s = _torch_reference(inp, 0.0, None, dtype_quant)
         torch.testing.assert_close(
             upcast(out_q, scale, torch.bfloat16),
             upcast(ref_q, ref_s, torch.bfloat16),
-            atol=0.1, rtol=0.1,
+            atol=0.1,
+            rtol=0.1,
         )
     else:
         out = fused_clamp_act_mul(
-            inp, swiglu_limit=0.0, activation="silu",
-            dtype_quant=None, backend=backend,
+            inp,
+            swiglu_limit=0.0,
+            activation="silu",
+            dtype_quant=None,
+            backend=backend,
         )
         ref = _torch_reference(inp, 0.0, None, None)
         torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
@@ -469,19 +482,26 @@ def test_fused_clamp_act_mul_backend_auto(M, D, dtype_quant):
 
     if dtype_quant is not None:
         out_q, scale = fused_clamp_act_mul(
-            inp, swiglu_limit=0.0, activation="silu",
-            dtype_quant=dtype_quant, backend=None,
+            inp,
+            swiglu_limit=0.0,
+            activation="silu",
+            dtype_quant=dtype_quant,
+            backend=None,
         )
         ref_q, ref_s = _torch_reference(inp, 0.0, None, dtype_quant)
         torch.testing.assert_close(
             upcast(out_q, scale, torch.bfloat16),
             upcast(ref_q, ref_s, torch.bfloat16),
-            atol=0.1, rtol=0.1,
+            atol=0.1,
+            rtol=0.1,
         )
     else:
         out = fused_clamp_act_mul(
-            inp, swiglu_limit=0.0, activation="silu",
-            dtype_quant=None, backend=None,
+            inp,
+            swiglu_limit=0.0,
+            activation="silu",
+            dtype_quant=None,
+            backend=None,
         )
         ref = _torch_reference(inp, 0.0, None, None)
         torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
@@ -511,19 +531,26 @@ def test_fused_clamp_act_mul_odd_m_tail(M, n_half, dtype_quant, backend):
 
     if dtype_quant is not None:
         out_q, scale = fused_clamp_act_mul(
-            inp, swiglu_limit=0.0, activation="silu",
-            dtype_quant=dtype_quant, backend=backend,
+            inp,
+            swiglu_limit=0.0,
+            activation="silu",
+            dtype_quant=dtype_quant,
+            backend=backend,
         )
         ref_q, ref_s = _torch_reference(inp, 0.0, None, dtype_quant)
         torch.testing.assert_close(
             upcast(out_q, scale, torch.bfloat16),
             upcast(ref_q, ref_s, torch.bfloat16),
-            atol=0.1, rtol=0.1,
+            atol=0.1,
+            rtol=0.1,
         )
     else:
         out = fused_clamp_act_mul(
-            inp, swiglu_limit=0.0, activation="silu",
-            dtype_quant=None, backend=backend,
+            inp,
+            swiglu_limit=0.0,
+            activation="silu",
+            dtype_quant=None,
+            backend=backend,
         )
         ref = _torch_reference(inp, 0.0, None, None)
         torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
@@ -545,19 +572,26 @@ def test_fused_clamp_act_mul_float16_input(M, D, dtype_quant, backend):
 
     if dtype_quant is not None:
         out_q, scale = fused_clamp_act_mul(
-            inp, swiglu_limit=0.0, activation="silu",
-            dtype_quant=dtype_quant, backend=backend,
+            inp,
+            swiglu_limit=0.0,
+            activation="silu",
+            dtype_quant=dtype_quant,
+            backend=backend,
         )
         ref_q, ref_s = _torch_reference(inp, 0.0, None, dtype_quant)
         torch.testing.assert_close(
             upcast(out_q, scale, torch.bfloat16),
             upcast(ref_q, ref_s, torch.bfloat16),
-            atol=0.1, rtol=0.1,
+            atol=0.1,
+            rtol=0.1,
         )
     else:
         out = fused_clamp_act_mul(
-            inp, swiglu_limit=0.0, activation="silu",
-            dtype_quant=None, backend=backend,
+            inp,
+            swiglu_limit=0.0,
+            activation="silu",
+            dtype_quant=None,
+            backend=backend,
         )
         ref = _torch_reference(inp, 0.0, None, None)
         assert out.dtype == inp.dtype
