@@ -712,19 +712,19 @@ def _triton_gather_kv_b_proj_impl(
     k_head_base = kv_proj_weight + pid_head * (QkNopeHeadDim + VHeadDim) * KV_CDim
     v_head_base = k_head_base + QkNopeHeadDim * KV_CDim
 
+    k_scale_placeholder = tl.full((PaddedK,), 1.0, tl.float32)
+    v_scale_placeholder = tl.full((PaddedV,), 1.0, tl.float32)
     if NO_SCALE:
-        # Give the inlined chunk helper shape-compatible placeholders for scale
-        # arguments that its NO_SCALE specialization removes.
-        k_nope_scale_vec = tl.full((PaddedK,), 1.0, tl.float32)
-        v_nope_scale_vec = tl.full((PaddedV,), 1.0, tl.float32)
-        k_nope_scale_0 = tl.full((PaddedK,), 1.0, tl.float32)
-        k_nope_scale_1 = tl.full((PaddedK,), 1.0, tl.float32)
-        k_nope_scale_2 = tl.full((PaddedK,), 1.0, tl.float32)
-        k_nope_scale_3 = tl.full((PaddedK,), 1.0, tl.float32)
-        v_nope_scale_0 = tl.full((PaddedV,), 1.0, tl.float32)
-        v_nope_scale_1 = tl.full((PaddedV,), 1.0, tl.float32)
-        v_nope_scale_2 = tl.full((PaddedV,), 1.0, tl.float32)
-        v_nope_scale_3 = tl.full((PaddedV,), 1.0, tl.float32)
+        k_nope_scale_vec = k_scale_placeholder
+        v_nope_scale_vec = v_scale_placeholder
+        k_nope_scale_0 = k_scale_placeholder
+        k_nope_scale_1 = k_scale_placeholder
+        k_nope_scale_2 = k_scale_placeholder
+        k_nope_scale_3 = k_scale_placeholder
+        v_nope_scale_0 = v_scale_placeholder
+        v_nope_scale_1 = v_scale_placeholder
+        v_nope_scale_2 = v_scale_placeholder
+        v_nope_scale_3 = v_scale_placeholder
     elif PER_ROW_SCALE:
         k_row0 = pid_head * (QkNopeHeadDim + VHeadDim)
         k_nope_scale_vec = tl.load(
@@ -733,17 +733,17 @@ def _triton_gather_kv_b_proj_impl(
         v_nope_scale_vec = tl.load(
             kv_proj_scale + k_row0 + QkNopeHeadDim + offs_n_v, mask=mask_v, other=1.0
         ).to(tl.float32)
-        k_nope_scale_0 = tl.full((PaddedK,), 1.0, tl.float32)
-        k_nope_scale_1 = tl.full((PaddedK,), 1.0, tl.float32)
-        k_nope_scale_2 = tl.full((PaddedK,), 1.0, tl.float32)
-        k_nope_scale_3 = tl.full((PaddedK,), 1.0, tl.float32)
-        v_nope_scale_0 = tl.full((PaddedV,), 1.0, tl.float32)
-        v_nope_scale_1 = tl.full((PaddedV,), 1.0, tl.float32)
-        v_nope_scale_2 = tl.full((PaddedV,), 1.0, tl.float32)
-        v_nope_scale_3 = tl.full((PaddedV,), 1.0, tl.float32)
+        k_nope_scale_0 = k_scale_placeholder
+        k_nope_scale_1 = k_scale_placeholder
+        k_nope_scale_2 = k_scale_placeholder
+        k_nope_scale_3 = k_scale_placeholder
+        v_nope_scale_0 = v_scale_placeholder
+        v_nope_scale_1 = v_scale_placeholder
+        v_nope_scale_2 = v_scale_placeholder
+        v_nope_scale_3 = v_scale_placeholder
     else:
-        k_nope_scale_vec = tl.full((PaddedK,), 1.0, tl.float32)
-        v_nope_scale_vec = tl.full((PaddedV,), 1.0, tl.float32)
+        k_nope_scale_vec = k_scale_placeholder
+        v_nope_scale_vec = v_scale_placeholder
         num_scale_cols: tl.constexpr = KV_CDim // ScaleKGranularity
         k_abs_rows = pid_head * (QkNopeHeadDim + VHeadDim) + offs_n_k
         k_scale_n_idx = k_abs_rows // ScaleNGranularity
