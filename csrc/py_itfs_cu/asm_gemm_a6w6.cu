@@ -1,11 +1,21 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-#include "aiter_tensor.h"
 #include "aiter_ctypes_error.h"
+#include "aiter_tensor.h"
 #include "asm_f6gemm_configs.hpp"
 #include <cmath>
-#include <memory>
 #include <hip/hip_runtime.h>
+#include <memory>
+
+namespace {
+constexpr int kTileSize             = 256;
+constexpr int kKTileSize            = 128;
+constexpr int kScaleGroupSize       = 32;
+constexpr int kKPaddingTiles        = 2;
+constexpr size_t kPackedTileBytes   = 24576;
+constexpr size_t kScaleTileBytes    = 1024;
+constexpr char kPackLayout[]        = "mxfp6_c0c1_256_padk2";
+constexpr char kDefaultKernelName[] = "f6gemm_dmabig_kernel_func";
 
 // KernelArgs layout is identical to the a4w4 asm gemm ABI; the mxfp6 dmabig
 // kernel was assembled against the same kernarg struct (0x180 bytes). Fields
@@ -64,7 +74,7 @@ struct __attribute__((packed)) KernelArgs
 };
 static_assert(sizeof(KernelArgs) == 0x180, "a6w6 KernelArgs must be 0x180 bytes");
 
-static CFG* get_cfg(AiterDtype inp_dtype, AiterDtype out_dtype)
+CFG* get_cfg(AiterDtype inp_dtype, AiterDtype out_dtype)
 {
     if((inp_dtype == AITER_DTYPE_u8) && out_dtype == AITER_DTYPE_bf16)
     {
@@ -81,6 +91,7 @@ static CFG* get_cfg(AiterDtype inp_dtype, AiterDtype out_dtype)
         return nullptr;
     }
 }
+} // namespace
 
 // A6W6 (mxfp6, E2M3, per-1x32 blockscale) asm gemm kernel
 // D = A * B * alpha
@@ -88,20 +99,18 @@ AITER_CTYPES_ERROR_DEF
 
 AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     gemm_a6w6_asm,
-    (
-    aiter_tensor_t* A,       // A: packed mxfp6 blob (pack_big layout)
-    aiter_tensor_t* B,       // B: packed mxfp6 blob (pack_big layout)
-    aiter_tensor_t* A_scale, // A_scale: packed e8m0 blob (pack_scale layout)
-    aiter_tensor_t* B_scale, // B_scale: packed e8m0 blob (pack_scale layout)
-    aiter_tensor_t* out,     // Out:[M, N] bf16
-    int          K,          // padded contraction dim consumed by the packed layout
-    const char*  kernelName,
-    float        alpha,
-    hipStream_t  stream),
+    (aiter_tensor_t * A,      // A: packed mxfp6 blob (pack_big layout)
+     aiter_tensor_t* B,       // B: packed mxfp6 blob (pack_big layout)
+     aiter_tensor_t* A_scale, // A_scale: packed e8m0 blob (pack_scale layout)
+     aiter_tensor_t* B_scale, // B_scale: packed e8m0 blob (pack_scale layout)
+     aiter_tensor_t* out,     // Out:[M, N] bf16
+     int K,                   // padded contraction dim consumed by the packed layout
+     const char* kernelName,
+     float alpha,
+     hipStream_t stream),
     (A, B, A_scale, B_scale, out, K, kernelName, alpha, stream))
 {
-    AITER_CHECK(
-        out->dtype() == AITER_DTYPE_bf16, __func__, " only support BFloat16 output now!");
+    AITER_CHECK(out->dtype() == AITER_DTYPE_bf16, __func__, " only support BFloat16 output now!");
     AITER_CHECK(out->dim() == 2 && out->is_contiguous(),
                 __func__,
                 " output must be a contiguous 2D tensor");
@@ -117,21 +126,21 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     int Ndim = out->size(1);
     int Kdim = K;
     AITER_CHECK(
-        Mdim > 0 && (Mdim % 256) == 0, __func__, " M must be a positive multiple of 256!");
+        Mdim > 0 && (Mdim % kTileSize) == 0, __func__, " M must be a positive multiple of 256!");
     AITER_CHECK(
-        Ndim > 0 && (Ndim % 256) == 0, __func__, " N must be a positive multiple of 256!");
+        Ndim > 0 && (Ndim % kTileSize) == 0, __func__, " N must be a positive multiple of 256!");
     AITER_CHECK(
-        Kdim > 0 && (Kdim % 128) == 0, __func__, " K must be a positive multiple of 128!");
-    AITER_CHECK(B->dtype() == AITER_DTYPE_u8 && A_scale->dtype() == AITER_DTYPE_u8 &&
-                    B_scale->dtype() == AITER_DTYPE_u8,
+        Kdim > 0 && (Kdim % kKTileSize) == 0, __func__, " K must be a positive multiple of 128!");
+    AITER_CHECK(A->dtype() == AITER_DTYPE_u8 && B->dtype() == AITER_DTYPE_u8 &&
+                    A_scale->dtype() == AITER_DTYPE_u8 && B_scale->dtype() == AITER_DTYPE_u8,
                 __func__,
                 " packed operands and scales must use uint8");
 
-    const size_t nk_pad          = static_cast<size_t>(Kdim / 128 + 2);
-    const size_t expected_A      = static_cast<size_t>(Mdim / 256) * nk_pad * 24576;
-    const size_t expected_B      = static_cast<size_t>(Ndim / 256) * nk_pad * 24576;
-    const size_t expected_scaleA = static_cast<size_t>(Mdim / 256) * nk_pad * 1024;
-    const size_t expected_scaleB = static_cast<size_t>(Ndim / 256) * nk_pad * 1024;
+    const size_t nk_pad     = static_cast<size_t>(Kdim / kKTileSize + kKPaddingTiles);
+    const size_t expected_A = static_cast<size_t>(Mdim / kTileSize) * nk_pad * kPackedTileBytes;
+    const size_t expected_B = static_cast<size_t>(Ndim / kTileSize) * nk_pad * kPackedTileBytes;
+    const size_t expected_scaleA = static_cast<size_t>(Mdim / kTileSize) * nk_pad * kScaleTileBytes;
+    const size_t expected_scaleB = static_cast<size_t>(Ndim / kTileSize) * nk_pad * kScaleTileBytes;
     AITER_CHECK(A->numel() >= expected_A && B->numel() >= expected_B,
                 __func__,
                 " packed operand buffer is smaller than the launch requires");
@@ -139,9 +148,8 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
                 __func__,
                 " packed scale buffer is smaller than the launch requires");
 
-    KernelArgs args;
-    size_t arg_size = sizeof(args);
-    memset(&args, 0, arg_size);
+    KernelArgs args{};
+    size_t arg_size     = sizeof(args);
     args.ptr_D          = out->ptr;
     args.ptr_C          = nullptr;
     args.ptr_A          = A->ptr;
@@ -154,8 +162,8 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     args.K              = Kdim;
     args.ptr_ScaleA     = A_scale->ptr;
     args.ptr_ScaleB     = B_scale->ptr;
-    args.stride_ScaleA0 = Kdim / 32;
-    args.stride_ScaleB0 = Kdim / 32;
+    args.stride_ScaleA0 = Kdim / kScaleGroupSize;
+    args.stride_ScaleB0 = Kdim / kScaleGroupSize;
     args.log2_k_split   = 0;
 
     const HipDeviceGuard device_guard(A->device_id);
@@ -166,9 +174,8 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     static SynchronizedCache<std::string_view, AiterAsmKernel> impl_ptr_map;
 
     std::string arch_id = get_gpu_arch();
-    std::string kname   = (kernelName && kernelName[0] != 0)
-                              ? (arch_id + kernelName)
-                              : (arch_id + "f6gemm_dmabig_kernel_func");
+    std::string kname   = (kernelName && kernelName[0] != 0) ? (arch_id + kernelName)
+                                                             : (arch_id + kDefaultKernelName);
 
     AiterAsmKernel* impl_ptr = nullptr;
     int SUBM                 = 0;
@@ -184,11 +191,11 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
         const char* co_name = cfg.co_name.c_str();
         SUBM                = cfg.tile_M;
         SUBN                = cfg.tile_N;
-        bdx                  = cfg.block_size;
+        bdx                 = cfg.block_size;
         AITER_CHECK(SUBM > 0 && SUBN > 0, __func__, " invalid a6w6 tile dimensions");
         AITER_CHECK(bdx > 0, __func__, " invalid a6w6 workgroup size");
         AITER_CHECK(cfg.splitK == 0, __func__, " a6w6 split-K is not supported");
-        AITER_CHECK(cfg.pack_layout == "mxfp6_c0c1_256_padk2",
+        AITER_CHECK(cfg.pack_layout == kPackLayout,
                     __func__,
                     " unsupported a6w6 packed layout " + cfg.pack_layout);
         if(cfg.swizzle_max_K > 0 && Kdim <= cfg.swizzle_max_K)

@@ -73,19 +73,14 @@ def test_gemm(dtype, M, N, K, kernel_name=None):
 
 
 def _manifest_kernel_names(M, N, K):
-    manifest = os.path.join(
-        get_asm_dir(), "f6gemm", "f6gemm_bf16_per1x32Fp6.csv"
-    )
+    manifest = os.path.join(get_asm_dir(), "f6gemm", "f6gemm_bf16_per1x32Fp6.csv")
     configs = pd.read_csv(manifest)
     padM = (M + 255) // 256 * 256
     padN = (N + 255) // 256 * 256
     padK = (K + 127) // 128 * 128
     compatible = (configs["swizzle_max_K"] <= 0) | (
         (padK > configs["swizzle_max_K"])
-        | (
-            (padM <= configs["swizzle_max_M"])
-            & (padN <= configs["swizzle_max_N"])
-        )
+        | ((padM <= configs["swizzle_max_M"]) & (padN <= configs["swizzle_max_N"]))
     )
     return configs.loc[compatible, "knl_name"].astype(str).tolist()
 

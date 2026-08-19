@@ -7,41 +7,21 @@ import math
 import os
 import resource
 import statistics
-from typing import Any, ClassVar
+from typing import Any, Callable, ClassVar, TypedDict
 
 import pandas as pd
 import torch
 
 import aiter
-from aiter import dtypes
+from aiter import dtypes, logger
 from aiter.jit.core import AITER_CONFIG_GEMM_A6W6, get_asm_dir
 from aiter.utility.base_tuner import GemmCommonTuner
 from aiter.utility.mp_tuner import mp_tuner
 
 PACK_LAYOUT = "mxfp6_c0c1_256_padk2"
-
-
-def _disable_core_dumps() -> None:
-    """Prevent a failed GPU tuning worker from filling shared node storage."""
-    try:
-        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
-    except (OSError, ValueError):
-        pass
-
-
-_disable_core_dumps()
-
-
-def _ceil(value: int, multiple: int) -> int:
-    return (value + multiple - 1) // multiple * multiple
-
-
-def load_f6gemm_candidates() -> list[dict[str, Any]]:
-    manifest = os.path.join(
-        get_asm_dir(), "f6gemm", "f6gemm_bf16_per1x32Fp6.csv"
-    )
-    configs = pd.read_csv(manifest)
-    required = {
+_MANIFEST_NAME = "f6gemm_bf16_per1x32Fp6.csv"
+_MANIFEST_COLUMNS = frozenset(
+    {
         "tile_M",
         "tile_N",
         "block_size",
@@ -53,30 +33,69 @@ def load_f6gemm_candidates() -> list[dict[str, Any]]:
         "knl_name",
         "co_name",
     }
-    missing = required - set(configs.columns)
+)
+
+
+class F6GemmCandidate(TypedDict):
+    kernel_id: int
+    kernel_name: str
+    tile_m: int
+    tile_n: int
+    swizzle_max_m: int
+    swizzle_max_n: int
+    swizzle_max_k: int
+
+
+def _disable_core_dumps() -> None:
+    """Prevent a failed GPU tuning worker from filling shared node storage."""
+    try:
+        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    except (OSError, ValueError):
+        pass
+
+
+def _ceil(value: int, multiple: int) -> int:
+    return (value + multiple - 1) // multiple * multiple
+
+
+def _manifest_path() -> str:
+    return os.path.join(get_asm_dir(), "f6gemm", _MANIFEST_NAME)
+
+
+def load_f6gemm_candidates() -> list[F6GemmCandidate]:
+    manifest = _manifest_path()
+    configs = pd.read_csv(manifest)
+    missing = _MANIFEST_COLUMNS - set(configs.columns)
     if missing:
         raise ValueError(f"{manifest} is missing columns: {sorted(missing)}")
 
-    candidates = []
-    seen_names = set()
+    candidates: list[F6GemmCandidate] = []
+    seen_names: set[str] = set()
     for kernel_id, row in configs.iterrows():
         kernel_name = str(row["knl_name"]).strip()
         co_name = str(row["co_name"]).strip()
         if not kernel_name or kernel_name in seen_names:
             raise ValueError(f"invalid or duplicate A6W6 kernel name: {kernel_name!r}")
+        if not co_name:
+            raise ValueError(f"{kernel_name} has an empty code-object name")
         seen_names.add(kernel_name)
         if int(row["splitK"]) != 0:
             raise ValueError(f"{kernel_name} advertises unsupported split-K")
         if str(row["pack_layout"]).strip() != PACK_LAYOUT:
             continue
-        if int(row["block_size"]) <= 0:
+        tile_m = int(row["tile_M"])
+        tile_n = int(row["tile_N"])
+        block_size = int(row["block_size"])
+        if tile_m <= 0 or tile_n <= 0:
+            raise ValueError(f"{kernel_name} has invalid tile dimensions")
+        if block_size <= 0:
             raise ValueError(f"{kernel_name} has an invalid workgroup size")
         if not os.path.exists(os.path.join(os.path.dirname(manifest), co_name)):
             raise FileNotFoundError(f"missing A6W6 code object: {co_name}")
         swizzle_max_m = int(row["swizzle_max_M"])
         swizzle_max_n = int(row["swizzle_max_N"])
         swizzle_max_k = int(row["swizzle_max_K"])
-        if swizzle_max_k < 0 or (
+        if min(swizzle_max_m, swizzle_max_n, swizzle_max_k) < 0 or (
             swizzle_max_k > 0 and (swizzle_max_m <= 0 or swizzle_max_n <= 0)
         ):
             raise ValueError(f"{kernel_name} has invalid swizzle bounds")
@@ -84,8 +103,8 @@ def load_f6gemm_candidates() -> list[dict[str, Any]]:
             {
                 "kernel_id": int(kernel_id),
                 "kernel_name": kernel_name,
-                "tile_m": int(row["tile_M"]),
-                "tile_n": int(row["tile_N"]),
+                "tile_m": tile_m,
+                "tile_n": tile_n,
                 "swizzle_max_m": swizzle_max_m,
                 "swizzle_max_n": swizzle_max_n,
                 "swizzle_max_k": swizzle_max_k,
@@ -97,17 +116,14 @@ def load_f6gemm_candidates() -> list[dict[str, Any]]:
 
 
 def candidate_supports_shape(
-    candidate: dict[str, Any], M: int, N: int, K: int
+    candidate: F6GemmCandidate, M: int, N: int, K: int
 ) -> bool:
     """Return whether a kernel's compile-time swizzle bounds cover the launch."""
     padM, padN, padK = _ceil(M, 256), _ceil(N, 256), _ceil(K, 128)
     max_k = candidate["swizzle_max_k"]
     if max_k <= 0 or padK > max_k:
         return True
-    return (
-        padM <= candidate["swizzle_max_m"]
-        and padN <= candidate["swizzle_max_n"]
-    )
+    return padM <= candidate["swizzle_max_m"] and padN <= candidate["swizzle_max_n"]
 
 
 def generate_data(
@@ -124,9 +140,7 @@ def generate_data(
 
     x_packed, x_scales = aiter.quant_mxfp6_gemm(x)
     w_packed, w_scales = aiter.quant_mxfp6_gemm(w)
-    out = torch.empty(
-        (_ceil(M, 256), _ceil(N, 256)), dtype=dtype, device=device
-    )
+    out = torch.empty((_ceil(M, 256), _ceil(N, 256)), dtype=dtype, device=device)
     # Candidate kernels share the same quantized math. Use the safe production
     # fallback as the tuning reference so large diffusion sweeps do not allocate
     # multi-gigabyte fp32 dequantized operands/results. Independent numerical
@@ -191,11 +205,11 @@ def choose_guarded_kernel(
     """Keep a candidate only when paired validation clears the gain threshold."""
     if candidate_kernel == default_kernel:
         return default_kernel, 0.0
-    valid_speedups = [
-        float(value)
-        for value in paired_speedups
-        if math.isfinite(float(value)) and float(value) > 0
-    ]
+    valid_speedups = []
+    for value in paired_speedups:
+        speedup = float(value)
+        if math.isfinite(speedup) and speedup > 0:
+            valid_speedups.append(speedup)
     if (
         not exact_match
         or not valid_speedups
@@ -212,7 +226,7 @@ def choose_guarded_kernel(
     return selected, gain_pct
 
 
-def _event_time_us(launch, iters: int) -> float:
+def _event_time_us(launch: Callable[[], Any], iters: int) -> float:
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
     torch.cuda.synchronize()
@@ -277,9 +291,7 @@ def benchmark_candidate_gain(
     launch_default()
     launch_candidate()
     torch.cuda.synchronize()
-    exact_match = bool(
-        torch.equal(default_out[:M, :N], candidate_out[:M, :N])
-    )
+    exact_match = bool(torch.equal(default_out[:M, :N], candidate_out[:M, :N]))
 
     default_times = []
     candidate_times = []
@@ -319,7 +331,8 @@ class GemmA6W6Tuner(GemmCommonTuner):
         "gain_guard_reps": 7,
     }
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        _disable_core_dumps()
         self.candidates = load_f6gemm_candidates()
         self.candidates_by_id = {
             candidate["kernel_id"]: candidate for candidate in self.candidates
@@ -443,6 +456,11 @@ class GemmA6W6Tuner(GemmCommonTuner):
                     else validation["default_us"]
                 )
                 guarded.at[index, "us"] = round(selected_us, 4)
+                err_ratio = (
+                    float(row["errRatio"])
+                    if selected_kernel == candidate_kernel
+                    else 0.0
+                )
                 info = (
                     (
                         (
@@ -457,7 +475,7 @@ class GemmA6W6Tuner(GemmCommonTuner):
                         selected_kernel,
                     ),
                     selected_us,
-                    float(row["errRatio"]) if selected_kernel == candidate_kernel else 0.0,
+                    err_ratio,
                 )
                 tflops, bw = self.calculate(info)
                 guarded.at[index, "tflops"] = tflops
@@ -469,8 +487,7 @@ class GemmA6W6Tuner(GemmCommonTuner):
             all_pairs_win = bool(
                 validation is not None
                 and all(
-                    float(speedup) > 1.0
-                    for speedup in validation["paired_speedups"]
+                    float(speedup) > 1.0 for speedup in validation["paired_speedups"]
                 )
             )
             print(
