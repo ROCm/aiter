@@ -145,6 +145,55 @@ def _gather_scale_tile(
     return slab.gather(kg_idx[None, :] + zeros_row[:, None], 1)
 
 
+@gluon.jit
+def _gather_scale_vec(
+    flat_slab,
+    tile_idx,
+    zeros_tile,
+    offs_n,
+    offs_kg,
+    BLOCK_SIZE_K: gl.constexpr,
+    SCALE_K_GROUP: gl.constexpr,
+    SLAB_COLS: gl.constexpr,
+    N_GROUPS: gl.constexpr,
+):
+    """Read a (BLOCK_SIZE_N, BLOCK_SIZE_K // 32) B-scale tile from a COMPACT slab.
+
+    ``flat_slab`` is a 1-D view of an (N_GROUPS, SLAB_COLS) e8m0 slab -- only the
+    distinct scale bytes, one row per B_SCALE_N_GROUP columns of B. The tile that
+    wmma_scaled wants repeats each of those rows 128 times, so the repetition is
+    done here in registers instead of in LDS.
+
+    Per group: a 1-D gather returns the K-group vector in SliceLayout(0, layout),
+    where every lane reads the same bytes -- an LDS broadcast, which is
+    conflict-free and costs K_GROUPS ds_load_u8 per lane instead of the
+    2 * K_GROUPS the 2-D gather over a replicated slab cost. Widening that vector
+    to BLOCK_SIZE_N rows is a pure register copy: dim0 of the wmma scale layout is
+    carried by lanes, warps and one register bit, and every one of them wants the
+    same value.
+
+    For BLOCK_SIZE_N > 128 the groups differ, so each is gathered and selected by
+    the N coordinate. That is N_GROUPS gathers -- the same LDS traffic the old
+    replicated slab paid, for 1/128th of the footprint.
+
+    Index arithmetic and the clamp match _gather_scale_tile.
+    """
+    SCALE_GROUP_SIZE: gl.constexpr = 32
+
+    kg_idx = (tile_idx * BLOCK_SIZE_K + offs_kg * SCALE_GROUP_SIZE) // SCALE_K_GROUP
+    kg_idx = gl.minimum(kg_idx, SLAB_COLS - 1)
+
+    acc = zeros_tile
+    for g in gl.static_range(N_GROUPS):
+        vec = flat_slab.gather(kg_idx + g * SLAB_COLS, 0)
+        tile, _ = gl.broadcast(vec[None, :], zeros_tile)
+        if N_GROUPS == 1:
+            acc = tile
+        else:
+            acc = gl.where(offs_n[:, None] == g, tile, acc)
+    return acc
+
+
 @triton.heuristics(
     {
         "EVEN_K": lambda args: args["K"] % args["BLOCK_SIZE_K"] == 0,
@@ -236,11 +285,16 @@ def _gemm_mxfp8_preshuffle_bandwidth_bound_kernel(
     # tiles (K bytes at BLOCK_SIZE_M == A_SCALE_K_GROUP == 128, so 16 KiB at
     # K = 16384), so they are TDM'd into LDS once by the prologue and read back
     # with _gather_scale_tile instead of re-fetched from global every K tile.
+    # Unlike the B scales, every one of the BLOCK_SIZE_M rows here is distinct, so
+    # this slab carries no redundancy and cannot be compacted the way the B slab
+    # is -- the budget below is a real constraint.
     #
     # gfx1250 has 320 KiB of LDS and the operand buffers already take 260 KiB at
     # BLOCK 128x128x256 / NUM_BUFFERS 4, which rounds up to the full 5 x 64 KiB
-    # partitions -- so a 16 KiB slab is free in occupancy terms.
-    A_SCALE_SLAB_BYTES: gl.constexpr = 16384
+    # partitions -- so a 32 KiB slab still fits inside the same partitions and is
+    # free in occupancy terms. A K span that would overflow it (BLOCK_SIZE_M 256
+    # past K 16384) keeps the in-loop global path.
+    A_SCALE_SLAB_BYTES: gl.constexpr = 32768
     A_SCALE_CHUNK_K: gl.constexpr = (
         (A_SCALE_SLAB_BYTES * A_SCALE_K_GROUP // BLOCK_SIZE_M) // BLOCK_SIZE_K
     ) * BLOCK_SIZE_K
@@ -288,94 +342,35 @@ def _gemm_mxfp8_preshuffle_bandwidth_bound_kernel(
     # was worth 2.7 us on the same shape; the two are not additive because the
     # win is removing the LAST global load, not each one.
     #
-    # The slab is tiny in real terms -- B scales are one byte per 128(N) x 128(K)
-    # block, so a CTA needs only BLOCK_SIZE_N // 128 rows x K // 128 bytes (128
-    # bytes at BLOCK_SIZE_N 128, K 16384) for its whole K span. It is stored
-    # replicated to BLOCK_SIZE_N rows because memdesc.gather indexes along one
-    # dim only: row i of the result comes from row i of the slab, so the slab has
-    # to carry a row per N element even though only every 128th differs.
+    # The slab holds only the DISTINCT scale bytes: one source row per 128 N, so
+    # BLOCK_SIZE_N // 128 rows x (K span // 128) bytes -- 128 B at BLOCK_SIZE_N
+    # 128 / K 16384, 512 B at the widest config this kernel is tuned for. Small
+    # enough that the whole K span always fits and there is no budget to check.
+    #
+    # It did not used to be. memdesc.gather remaps only the gather axis
+    # (result[I] = src[I[0], .., indices[I], .., I[n]]), so a 2-D gather that
+    # returns BLOCK_SIZE_N rows reads BLOCK_SIZE_N slab rows -- the slab had to
+    # carry a physical row per N element even though only every 128th differed,
+    # 16 KiB of LDS for 128 B of data. A shared layout that aliases the duplicate
+    # rows onto one is not an option either: the compiler requires shared layouts
+    # to be surjective ("Layout is expected to be surjective ... but was not").
+    # So the replication moved out of LDS and into registers: gather a 1-D
+    # K-group VECTOR per source row, then broadcast it across BLOCK_SIZE_N. See
+    # _gather_scale_vec.
     B_SCALE_SPAN_K: gl.constexpr = (
         (SPLITK_BLOCK_SIZE + BLOCK_SIZE_K - 1) // BLOCK_SIZE_K
     ) * BLOCK_SIZE_K
     B_SCALE_COLS: gl.constexpr = triton.next_power_of_2(
         max(1, B_SCALE_SPAN_K // B_SCALE_K_GROUP)
     )
-    # Budget matches A_SCALE_SLAB_BYTES for the same reason: at BLOCK 128x128x256
-    # / NUM_BUFFERS 4 the operand buffers plus both slabs come to 299008 B, which
-    # still rounds into the same five 64 KiB LDS partitions as the 282624 B the
-    # kernel took before -- so the slab is free in occupancy terms. Configs that
-    # would exceed it (BLOCK_SIZE_N 256, or a K span past 16384 per split) keep
-    # the in-loop global path rather than risk an LDS overflow at launch.
-    B_SCALE_BUDGET: gl.constexpr = 16384
-    B_SCALE_FITS: gl.constexpr = (BLOCK_SIZE_N * B_SCALE_COLS) <= B_SCALE_BUDGET
-    # When the whole K span does not fit -- K per split past 16384 at
-    # BLOCK_SIZE_N 128 -- the slab is CHUNKED instead of giving up and going back
-    # to a global load per K tile. Two half-budget buffers, and the main loop
-    # prefetches chunk c+1 at the first tile of chunk c, so the DMA has a whole
-    # chunk of iterations to land and the boundary costs no wait. Total LDS is
-    # unchanged: 2 * BLOCK_SIZE_N * (BUDGET/2/BLOCK_SIZE_N) == BUDGET.
-    B_SCALE_CHUNK_COLS: gl.constexpr = (
-        B_SCALE_COLS if B_SCALE_FITS else (B_SCALE_BUDGET // 2) // BLOCK_SIZE_N
-    )
-    BS_TILES_PER_CHUNK: gl.constexpr = (
-        B_SCALE_CHUNK_COLS * B_SCALE_K_GROUP // BLOCK_SIZE_K
-    )
-    # One TDM per distinct source row, each with a ZERO row stride so the DMA
-    # re-reads that row for every block row it writes -- which is how a copy
-    # engine that cannot broadcast still fills a replicated slab. Verified on
-    # gfx1250 that stride 0 replicates rather than reading sequentially or
-    # zero-filling. BLOCK_SIZE_N below 128 still needs one group (a single source
-    # row covers the whole block), hence the min/// rather than a bare divide.
+    # BLOCK_SIZE_N below 128 still needs one group (a single source row covers the
+    # whole block), hence the min// rather than a bare divide.
     BS_ROWS_PER_GROUP: gl.constexpr = min(BLOCK_SIZE_N, B_SCALE_N_GROUP)
     BS_N_GROUPS: gl.constexpr = BLOCK_SIZE_N // BS_ROWS_PER_GROUP
-    # A multi-group slab (BLOCK_SIZE_N > 128, i.e. more than one source scale row)
-    # needs one zero-stride descriptor per group, each writing its own slice. Of
-    # the three ways to express that, only one works on this toolchain:
-    #   * `bs_slab.slice(g * rows, rows, dim=0)` on a 2-D allocation -- 99.6%
-    #     mismatch, the sliced destination does not preserve the swizzle;
-    #   * `.index(g)` on a 3-D allocation + `.reshape([BLOCK_SIZE_N, COLS])` for
-    #     the gather -- LLVM assert, reshape derives its own layout and indexes
-    #     order[2] of a rank-2 layout;
-    #   * a rank-3 layout on the 3-D allocation -- async_load rejects it,
-    #     "rank must be equal to or one less than the shape size".
-    # What does work: a 3-D allocation carrying the 2-D layout, so `.index(g)` is
-    # a valid TDM destination (the same addressing the chunk double-buffer uses),
-    # plus an explicit `reinterpret` for the flat view the gather needs.
-    # reinterpret succeeds where reshape fails because the layout is given
-    # rather than derived. Verified standalone: two source rows land group-major,
-    # each replicated across its 128 rows, all columns intact.
-    #
-    # Multi-group requires the whole span to fit, because chunking already spends
-    # the leading dim on double buffering and both at once would need rank 4.
-    B_SCALE_TDM_OK: gl.constexpr = BS_N_GROUPS == 1 or B_SCALE_FITS
-    # The config knob wins only where it is feasible. Which of the two fills is
-    # faster is shape-dependent -- the TDM fill removes the register staging and
-    # a barrier, but the global path's load is a plain dwordx4 stream that some
-    # shapes schedule better -- so this is tuned per shape rather than assumed.
-    USE_B_SCALE_TDM: gl.constexpr = B_SCALE_TDM and B_SCALE_TDM_OK
-    # Chunking is TDM-only: the register-staged fallback loads the whole span in
-    # one go and has no chunk index to slide. It also needs the prefetch to have
-    # retired before the chunk that consumes it starts -- the per-iteration
-    # async_wait leaves (NUM_BUFFERS - 2) * 2 ops outstanding, so an op retires
-    # once NUM_BUFFERS - 1 later iterations have each pushed two newer ones behind
-    # it. Requiring a chunk to be at least NUM_BUFFERS tiles wide covers that with
-    # room to spare, and also guarantees a chunk boundary never lands inside the
-    # epilogue without its prefetch having been issued by the main loop.
-    B_SCALE_CHUNKED: gl.constexpr = (
-        USE_B_SCALE_TDM and not B_SCALE_FITS and BS_TILES_PER_CHUNK >= NUM_BUFFERS
-    )
-    NUM_BS_BUFS: gl.constexpr = 2 if B_SCALE_CHUNKED else 1
-    B_SCALE_IN_LDS: gl.constexpr = B_SCALE_FITS or B_SCALE_CHUNKED
-    # Only the multi-group TDM path splits the leading dim by scale row; the
-    # chunked path splits it by buffer, and every other path keeps one slice of
-    # BLOCK_SIZE_N rows exactly as before.
-    B_SCALE_MULTIGROUP: gl.constexpr = USE_B_SCALE_TDM and BS_N_GROUPS > 1
-    BS_SLAB_SLICES: gl.constexpr = (
-        NUM_BS_BUFS if B_SCALE_CHUNKED else (BS_N_GROUPS if B_SCALE_MULTIGROUP else 1)
-    )
-    BS_SLICE_ROWS: gl.constexpr = (
-        BS_ROWS_PER_GROUP if B_SCALE_MULTIGROUP else BLOCK_SIZE_N
-    )
+    # With the slab compact, one plain descriptor with the REAL row stride fills
+    # it -- no zero-stride replication trick, no per-group descriptor, and no
+    # BLOCK_SIZE_N == 128 restriction on the TDM path.
+    USE_B_SCALE_TDM: gl.constexpr = B_SCALE_TDM
 
     # The wmma instruction shape is [16, 16, 128], so a K tile must be a whole
     # number of k-steps; 128 also keeps K_GROUPS aligned to the 32-element MX
@@ -441,7 +436,7 @@ def _gemm_mxfp8_preshuffle_bandwidth_bound_kernel(
     )
 
     tdm_shared_a: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
-        [[BLOCK_SIZE_K, 8]], [BLOCK_SIZE_M, BLOCK_SIZE_K], [1, 0]
+        [[BLOCK_SIZE_K, 16]], [BLOCK_SIZE_M, BLOCK_SIZE_K], [1, 0]
     )
     tdm_shared_b: gl.constexpr = gl.SwizzledSharedLayout(
         vec=1, per_phase=1, max_phase=1, order=[1, 0]
@@ -471,16 +466,21 @@ def _gemm_mxfp8_preshuffle_bandwidth_bound_kernel(
         [BLOCK_SIZE_M], dtype=gl.int32, layout=gl.SliceLayout(1, a_scale_layout)
     )
 
-    offs_bs_n = (
-        pid_n * BLOCK_SIZE_N
-        + gl.arange(0, BLOCK_SIZE_N, layout=gl.SliceLayout(1, b_scale_layout))
-    ) % N
     offs_bs_kg = gl.arange(0, K_GROUPS, layout=gl.SliceLayout(0, b_scale_layout))
-    bs_row_off = (offs_bs_n // B_SCALE_N_GROUP) * stride_bsn
-    # Zero column, same role as as_zeros_m: broadcasts the K-group vector to the
-    # full tile shape for memdesc.gather.
-    bs_zeros_n = gl.zeros(
-        [BLOCK_SIZE_N], dtype=gl.int32, layout=gl.SliceLayout(1, b_scale_layout)
+    # Which of the BS_N_GROUPS slab rows each N element reads. Block-relative --
+    # the block's first scale row is already folded into the slab fill -- and
+    # unwrapped by N, since a tail block's out-of-range rows are masked out of
+    # the C store anyway.
+    bs_grp_n = (
+        gl.arange(0, BLOCK_SIZE_N, layout=gl.SliceLayout(1, b_scale_layout))
+        // BS_ROWS_PER_GROUP
+    )
+    # Broadcast target and `where` seed for _gather_scale_vec, hoisted out of the
+    # loop so the constant is materialised once.
+    bs_zeros_tile = gl.zeros(
+        [BLOCK_SIZE_N, K_GROUPS],
+        dtype=b_scale_ptr.dtype.element_ty,
+        layout=b_scale_layout,
     )
 
     # ---- TDM descriptors ----
@@ -533,36 +533,30 @@ def _gemm_mxfp8_preshuffle_bandwidth_bound_kernel(
             as_desc.dtype, shape=[A_SCALE_COLS, BLOCK_SIZE_M], layout=as_shared
         )
 
-    # B-scale slab, TDM'd in like the A slab rather than staged through
-    # registers. TDM cannot broadcast, and the slab needs every source row
-    # replicated across B_SCALE_N_GROUP rows (see B_SCALE_IN_LDS) -- a zero row
-    # stride buys exactly that, since the DMA then resolves every block row to
-    # the same source row. One descriptor per distinct source row, each filling
-    # its own BS_ROWS_PER_GROUP-row slice of the slab, so BLOCK_SIZE_N 256 (two
-    # source rows) would stay correct -- except a sliced TDM destination does not
-    # preserve the swizzle, so that case falls back to the global load (see
-    # B_SCALE_TDM).
-    #
-    # The global load this replaces had to materialise the whole
-    # BLOCK_SIZE_N x B_SCALE_COLS slab in registers before storing it -- 16 KiB
-    # across the CTA at the budget ceiling, ~32 VGPRs per lane at num_warps 2 --
-    # and needed a barrier afterwards because the fill layout spread rows across
-    # waves while the gather reads them in the wmma scale layout. TDM writes LDS
-    # directly, so both the register staging and that barrier go away; the
-    # existing async_wait retires these as the oldest ops on the in-order
-    # tensorcnt, exactly as it already does for the A slab.
-    if B_SCALE_IN_LDS:
-        # Always buffer-indexed, even unchunked (NUM_BS_BUFS == 1), so the three
-        # gather sites read the same way on both paths.
-        bs_slab = gl.allocate_shared_memory(
-            b_scale_ptr.dtype.element_ty,
-            shape=[BS_SLAB_SLICES, BS_SLICE_ROWS, B_SCALE_CHUNK_COLS],
-            layout=as_shared,
-        )
-    # Register-staged fallback for the multi-group case TDM cannot fill. Issued
-    # here, as early as possible, and consumed after the prologue's async_wait so
-    # its latency sits under the operand fill instead of in front of the loop.
-    if B_SCALE_IN_LDS and not USE_B_SCALE_TDM:
+    # B-scale slab: BS_N_GROUPS x B_SCALE_COLS, the distinct bytes only. The
+    # 128x row replication wmma_scaled wants happens in registers at gather time
+    # (see _gather_scale_vec), which is what lets this be 128 B instead of 16 KiB
+    # and lifts the BLOCK_SIZE_N == 128 restriction the old TDM fill had.
+    bs_slab = gl.allocate_shared_memory(
+        b_scale_ptr.dtype.element_ty,
+        shape=[BS_N_GROUPS, B_SCALE_COLS],
+        layout=as_shared,
+    )
+    # Flat view for the 1-D gathers. reinterpret rather than reshape: reshape
+    # derives its own layout and asserts in LLVM on this allocation.
+    bs_flat_shared: gl.constexpr = gl.SwizzledSharedLayout(
+        vec=1, per_phase=1, max_phase=1, order=[0]
+    )
+    bs_flat = bs_slab.reinterpret(
+        dtype=b_scale_ptr.dtype.element_ty,
+        shape=[BS_N_GROUPS * B_SCALE_COLS],
+        layout=bs_flat_shared,
+    )
+    # Register-staged fallback, kept as the A/B alternative to the TDM fill.
+    # Issued here, as early as possible, and consumed after the prologue's
+    # async_wait so its latency sits under the operand fill instead of in front
+    # of the loop. It is a BS_N_GROUPS-row load now, not BLOCK_SIZE_N.
+    if not USE_B_SCALE_TDM:
         bs_fill_layout: gl.constexpr = gl.BlockedLayout(
             [1, B_SCALE_COLS], [32, 1], [num_warps, 1], [1, 0]
         )
@@ -575,14 +569,15 @@ def _gemm_mxfp8_preshuffle_bandwidth_bound_kernel(
             0, B_SCALE_COLS, layout=gl.SliceLayout(0, bs_fill_layout)
         )
         bs_fill_kg = gl.minimum(bs_fill_kg, gl.cdiv(K_local, B_SCALE_K_GROUP) - 1)
-        bs_fill_n = (
-            pid_n * BLOCK_SIZE_N
-            + gl.arange(0, BLOCK_SIZE_N, layout=gl.SliceLayout(1, bs_fill_layout))
-        ) % N
+        bs_fill_g = gl.minimum(
+            (pid_n * BLOCK_SIZE_N) // B_SCALE_N_GROUP
+            + gl.arange(0, BS_N_GROUPS, layout=gl.SliceLayout(1, bs_fill_layout)),
+            gl.cdiv(N, B_SCALE_N_GROUP) - 1,
+        )
         bs_fill = gl.load(
             b_scale_ptr
             + (k_split_offset // B_SCALE_K_GROUP) * stride_bsk
-            + ((bs_fill_n // B_SCALE_N_GROUP) * stride_bsn)[:, None]
+            + (bs_fill_g * stride_bsn)[:, None]
             + (bs_fill_kg * stride_bsk)[None, :]
         )
 
@@ -599,50 +594,23 @@ def _gemm_mxfp8_preshuffle_bandwidth_bound_kernel(
     if A_SCALE_IN_LDS:
         gl.amd.gfx1250.tdm.async_load(as_desc, [0, off_am_tdm], as_slab)
 
-    if B_SCALE_MULTIGROUP:
-        # One descriptor per source scale row, each replicating its row across its
-        # own BS_ROWS_PER_GROUP-row slice. No single kept descriptor here: chunking
-        # is excluded for this path, so nothing later needs to re-issue a load.
-        for g in gl.static_range(BS_N_GROUPS):
-            bs_row_g = gl.minimum(
-                (pid_n * BLOCK_SIZE_N) // B_SCALE_N_GROUP + g,
-                gl.cdiv(N, B_SCALE_N_GROUP) - 1,
-            )
-            bs_desc_g = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-                base=b_scale_ptr
-                + (k_split_offset // B_SCALE_K_GROUP) * stride_bsk
-                + bs_row_g * stride_bsn,
-                shape=(BS_SLICE_ROWS, gl.cdiv(K_local, B_SCALE_K_GROUP)),
-                strides=(0, stride_bsk),
-                block_shape=(BS_SLICE_ROWS, B_SCALE_CHUNK_COLS),
-                layout=as_shared,
-            )
-            gl.amd.gfx1250.tdm.async_load(bs_desc_g, [0, 0], bs_slab.index(g))
-    elif USE_B_SCALE_TDM:
-        # The row offset rides in the BASE pointer, not in async_load's offsets:
-        # with stride 0 a row offset resolves to the same row and would be a
-        # silent no-op. Clamped to the last real scale row so a tail block whose
-        # N range runs past the tensor still addresses in bounds -- those rows are
-        # masked out of the C store anyway, the same reasoning the K-column clamp
-        # already relies on.
-        bs_row = gl.minimum(
-            (pid_n * BLOCK_SIZE_N) // B_SCALE_N_GROUP,
-            gl.cdiv(N, B_SCALE_N_GROUP) - 1,
-        )
-        # One descriptor for every chunk: only the ROW stride is 0, so the K
-        # offset passed to async_load still slides the window. Columns past the
-        # real K extent are zero-filled by the descriptor bounds, and are only
-        # ever gathered for K tiles the loop does not reach.
+    if USE_B_SCALE_TDM:
+        # A plain descriptor over the scale tensor with its real strides -- the
+        # zero-row-stride replication trick the wide slab needed is gone with the
+        # slab it was replicating into. Rows and columns past the real extent are
+        # zero-filled by the descriptor bounds; the rows belong to N past the
+        # tensor (masked out of the C store) and the columns to K tiles the loop
+        # does not reach, so neither is ever consumed.
         bs_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-            base=b_scale_ptr
-            + (k_split_offset // B_SCALE_K_GROUP) * stride_bsk
-            + bs_row * stride_bsn,
-            shape=(BLOCK_SIZE_N, gl.cdiv(K_local, B_SCALE_K_GROUP)),
-            strides=(0, stride_bsk),
-            block_shape=(BLOCK_SIZE_N, B_SCALE_CHUNK_COLS),
+            base=b_scale_ptr + (k_split_offset // B_SCALE_K_GROUP) * stride_bsk,
+            shape=(gl.cdiv(N, B_SCALE_N_GROUP), gl.cdiv(K_local, B_SCALE_K_GROUP)),
+            strides=(stride_bsn, stride_bsk),
+            block_shape=(BS_N_GROUPS, B_SCALE_COLS),
             layout=as_shared,
         )
-        gl.amd.gfx1250.tdm.async_load(bs_desc, [0, 0], bs_slab.index(0))
+        gl.amd.gfx1250.tdm.async_load(
+            bs_desc, [(pid_n * BLOCK_SIZE_N) // B_SCALE_N_GROUP, 0], bs_slab
+        )
 
     for _ in gl.static_range(NUM_BUFFERS - 1):
         slot = num_loads % NUM_BUFFERS
@@ -660,29 +628,12 @@ def _gemm_mxfp8_preshuffle_bandwidth_bound_kernel(
     # across waves while the gather reads them in the wmma scale layout, so a
     # wave reads rows it did not write. The TDM path writes LDS directly and is
     # retired by the async_wait above, like the A slab.
-    if B_SCALE_IN_LDS and not USE_B_SCALE_TDM:
-        # .index(0): the slab is buffer-indexed even when unchunked, and this
-        # path is never chunked (NUM_BS_BUFS == 1).
-        bs_slab.index(0).store(bs_fill)
+    if not USE_B_SCALE_TDM:
+        bs_slab.store(bs_fill)
         gl.barrier()
 
     # ---------------- Main loop ----------------
     for _ in tl.range(0, NUM_K_ITER - (NUM_BUFFERS - 1), loop_unroll_factor=UNROLL):
-        # Chunk prefetch: at the first tile of chunk c, start chunk c+1 into the
-        # other buffer. Predicated rather than branched so the loop body stays a
-        # single basic block -- a branch here would defeat LOOP_UNROLL_FACTOR.
-        # No wait is needed: the DMA has BS_TILES_PER_CHUNK iterations to land,
-        # and the per-iteration async_wait retires it within NUM_BUFFERS - 1 of
-        # them (see B_SCALE_CHUNKED).
-        if B_SCALE_CHUNKED:
-            bs_next = num_computes // BS_TILES_PER_CHUNK + 1
-            gl.amd.gfx1250.tdm.async_load(
-                bs_desc,
-                [0, bs_next * B_SCALE_CHUNK_COLS],
-                bs_slab.index(bs_next % NUM_BS_BUFS),
-                pred=(num_computes % BS_TILES_PER_CHUNK) == 0,
-            )
-
         slot_c = num_computes % NUM_BUFFERS
         cur_a = tdm_smem_a.index(slot_c).load(layout=dot_a_layout)
         cur_b = depreshuffle_b(
@@ -713,40 +664,17 @@ def _gemm_mxfp8_preshuffle_bandwidth_bound_kernel(
                 SCALE_K_GROUP=A_SCALE_K_GROUP,
                 cache_modifier=cache_modifier,
             )
-        if B_SCALE_IN_LDS:
-            bs_chunk = num_computes // BS_TILES_PER_CHUNK if B_SCALE_CHUNKED else 0
-            # Multi-group needs the flat view across slices; reshape() asserts in
-            # LLVM on this allocation, so the layout is supplied explicitly.
-            if B_SCALE_MULTIGROUP:
-                bs_view = bs_slab.reinterpret(
-                    dtype=b_scale_ptr.dtype.element_ty,
-                    shape=[BLOCK_SIZE_N, B_SCALE_CHUNK_COLS],
-                    layout=as_shared,
-                )
-            else:
-                bs_view = bs_slab.index(bs_chunk % NUM_BS_BUFS)
-            cur_bs = _gather_scale_tile(
-                bs_view,
-                num_computes - bs_chunk * BS_TILES_PER_CHUNK,
-                bs_zeros_n,
-                offs_bs_kg,
-                BLOCK_SIZE_K=BLOCK_SIZE_K,
-                SCALE_K_GROUP=B_SCALE_K_GROUP,
-                SLAB_COLS=B_SCALE_CHUNK_COLS,
-            )
-        else:
-            cur_bs = _load_scale_tile(
-                b_scale_ptr,
-                num_computes,
-                k_split_offset,
-                K,
-                bs_row_off,
-                offs_bs_kg,
-                stride_bsk,
-                BLOCK_SIZE_K=BLOCK_SIZE_K,
-                SCALE_K_GROUP=B_SCALE_K_GROUP,
-                cache_modifier=cache_modifier,
-            )
+        cur_bs = _gather_scale_vec(
+            bs_flat,
+            num_computes,
+            bs_zeros_tile,
+            bs_grp_n,
+            offs_bs_kg,
+            BLOCK_SIZE_K=BLOCK_SIZE_K,
+            SCALE_K_GROUP=B_SCALE_K_GROUP,
+            SLAB_COLS=B_SCALE_COLS,
+            N_GROUPS=BS_N_GROUPS,
+        )
         acc = gl.amd.gfx1250.wmma_scaled(
             cur_a, cur_as, "e4m3", cur_b, cur_bs, "e4m3", acc
         )
@@ -801,40 +729,17 @@ def _gemm_mxfp8_preshuffle_bandwidth_bound_kernel(
                 SCALE_K_GROUP=A_SCALE_K_GROUP,
                 cache_modifier=cache_modifier,
             )
-        if B_SCALE_IN_LDS:
-            bs_chunk = num_computes // BS_TILES_PER_CHUNK if B_SCALE_CHUNKED else 0
-            # Multi-group needs the flat view across slices; reshape() asserts in
-            # LLVM on this allocation, so the layout is supplied explicitly.
-            if B_SCALE_MULTIGROUP:
-                bs_view = bs_slab.reinterpret(
-                    dtype=b_scale_ptr.dtype.element_ty,
-                    shape=[BLOCK_SIZE_N, B_SCALE_CHUNK_COLS],
-                    layout=as_shared,
-                )
-            else:
-                bs_view = bs_slab.index(bs_chunk % NUM_BS_BUFS)
-            cur_bs = _gather_scale_tile(
-                bs_view,
-                num_computes - bs_chunk * BS_TILES_PER_CHUNK,
-                bs_zeros_n,
-                offs_bs_kg,
-                BLOCK_SIZE_K=BLOCK_SIZE_K,
-                SCALE_K_GROUP=B_SCALE_K_GROUP,
-                SLAB_COLS=B_SCALE_CHUNK_COLS,
-            )
-        else:
-            cur_bs = _load_scale_tile(
-                b_scale_ptr,
-                num_computes,
-                k_split_offset,
-                K,
-                bs_row_off,
-                offs_bs_kg,
-                stride_bsk,
-                BLOCK_SIZE_K=BLOCK_SIZE_K,
-                SCALE_K_GROUP=B_SCALE_K_GROUP,
-                cache_modifier=cache_modifier,
-            )
+        cur_bs = _gather_scale_vec(
+            bs_flat,
+            num_computes,
+            bs_zeros_tile,
+            bs_grp_n,
+            offs_bs_kg,
+            BLOCK_SIZE_K=BLOCK_SIZE_K,
+            SCALE_K_GROUP=B_SCALE_K_GROUP,
+            SLAB_COLS=B_SCALE_COLS,
+            N_GROUPS=BS_N_GROUPS,
+        )
         acc = gl.amd.gfx1250.wmma_scaled(
             cur_a, cur_as, "e4m3", cur_b, cur_bs, "e4m3", acc
         )
@@ -874,40 +779,17 @@ def _gemm_mxfp8_preshuffle_bandwidth_bound_kernel(
             SCALE_K_GROUP=A_SCALE_K_GROUP,
             cache_modifier=cache_modifier,
         )
-    if B_SCALE_IN_LDS:
-        bs_chunk = num_computes // BS_TILES_PER_CHUNK if B_SCALE_CHUNKED else 0
-        # Multi-group needs the flat view across slices; reshape() asserts in
-        # LLVM on this allocation, so the layout is supplied explicitly.
-        if B_SCALE_MULTIGROUP:
-            bs_view = bs_slab.reinterpret(
-                dtype=b_scale_ptr.dtype.element_ty,
-                shape=[BLOCK_SIZE_N, B_SCALE_CHUNK_COLS],
-                layout=as_shared,
-            )
-        else:
-            bs_view = bs_slab.index(bs_chunk % NUM_BS_BUFS)
-        cur_bs = _gather_scale_tile(
-            bs_view,
-            num_computes - bs_chunk * BS_TILES_PER_CHUNK,
-            bs_zeros_n,
-            offs_bs_kg,
-            BLOCK_SIZE_K=BLOCK_SIZE_K,
-            SCALE_K_GROUP=B_SCALE_K_GROUP,
-            SLAB_COLS=B_SCALE_CHUNK_COLS,
-        )
-    else:
-        cur_bs = _load_scale_tile(
-            b_scale_ptr,
-            num_computes,
-            k_split_offset,
-            K,
-            bs_row_off,
-            offs_bs_kg,
-            stride_bsk,
-            BLOCK_SIZE_K=BLOCK_SIZE_K,
-            SCALE_K_GROUP=B_SCALE_K_GROUP,
-            cache_modifier=cache_modifier,
-        )
+    cur_bs = _gather_scale_vec(
+        bs_flat,
+        num_computes,
+        bs_zeros_tile,
+        bs_grp_n,
+        offs_bs_kg,
+        BLOCK_SIZE_K=BLOCK_SIZE_K,
+        SCALE_K_GROUP=B_SCALE_K_GROUP,
+        SLAB_COLS=B_SCALE_COLS,
+        N_GROUPS=BS_N_GROUPS,
+    )
     acc = gl.amd.gfx1250.wmma_scaled(cur_a, cur_as, "e4m3", cur_b, cur_bs, "e4m3", acc)
 
     # ---------------- Store ----------------

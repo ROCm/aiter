@@ -371,10 +371,10 @@ def gemm_afp8wfp8_preshuffle(
             # is a config bug and should fail loudly rather than silently tune
             # itself off. The kernel clamps it to the main-loop trip count.
             LOOP_UNROLL_FACTOR=config["LOOP_UNROLL_FACTOR"],
-            # Which B-scale fill to use where both are possible. Tuned per shape:
-            # the TDM fill drops the register staging and a barrier, but the
-            # global pre-load streams better on some shapes. Ignored (forced off)
-            # when BLOCK_SIZE_N > 128, where the TDM fill is not expressible.
+            # Which B-scale fill to use. Tuned per shape: the TDM fill drops the
+            # register staging and a barrier, but the global pre-load streams
+            # better on some shapes. Both fill the same compact slab and both
+            # work at any BLOCK_SIZE_N.
             B_SCALE_TDM=config["B_SCALE_TDM"],
             # Not read by the kernel: triton forwards it to the AMD backend as
             # the amdgpu-waves-per-eu occupancy hint. 0 emits no attribute.

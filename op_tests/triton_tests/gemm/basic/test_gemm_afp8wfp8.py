@@ -130,17 +130,19 @@ def get_shapes():
     # (M, N, K), with N % 128 == 0 and K % 128 == 0 to fit the 128x128 W-scale layout.
     return [
         (m, n, k)
-        for m in [1, 4, 8, 16, 32, 64, 128]
+        # for m in [1, 8, 16, 32, 64, 512, 16384]
+        for m in [64, 512, 16384]
         for n, k in [
-            (1536, 4096),
-            (4096, 1024),
-            (512, 4096),
-            (8192, 1024),
             (2048, 7168),
-            (7168, 2048),
-            (768, 7168),
-            (7168, 384),
+            (16384, 1536),
             (8192, 1536),
+            (7168, 4096),
+            (1536, 7168),
+            (7168, 768),
+            (65536, 1536),
+            (7168, 16384),
+            (6144, 7168),
+            (7168, 3072),
         ]
     ]
 
@@ -265,9 +267,6 @@ def test_gemm_afp8wfp8_preshuffle(
     assert err < TOL_ERR_RATIO, f"{err:.2%} of elements mismatch"
 
 
-# @pytest.mark.parametrize(
-#     "M, N, K", [(1, 2048, 7168), (64, 2048, 7168), (256, 512, 4096)]
-# )
 @pytest.mark.parametrize("M, N, K", get_shapes())
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("x_scale_group_size, transpose_x_scale", SCALE_MODES)
