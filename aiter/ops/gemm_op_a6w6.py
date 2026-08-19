@@ -132,13 +132,13 @@ if _HAS_TRITON:
     @triton.jit
     def _e2m3_dev(scaled):
         a = tl.minimum(tl.abs(scaled), 7.5)
-        isn = a >= 1.0
-        ex = tl.minimum(tl.floor(tl.log2(tl.maximum(a, 1.0))), 2.0)
-        base = tl.exp2(ex)
-        step = base / 8.0
-        mn = tl.floor((a - base) / step + 0.5)
-        ms = tl.floor(a * 8.0 + 0.5)
-        mag_code = tl.where(isn, (ex + 1.0) * 8.0 + mn, ms)
+        # Positive E2M3 levels are uniformly spaced within three regions:
+        # [0, 2): 1/8, [2, 4): 1/4, [4, 7.5]: 1/2.  Encoding them directly
+        # avoids per-element log2/exp2 while preserving the exact nearest-level
+        # result of the exponent/mantissa formulation.
+        quant_scale = tl.where(a < 2.0, 8.0, tl.where(a < 4.0, 4.0, 2.0))
+        code_bias = tl.where(a < 2.0, 0.0, tl.where(a < 4.0, 8.0, 16.0))
+        mag_code = tl.floor(a * quant_scale + 0.5) + code_bias
         return mag_code.to(tl.int32) + (scaled < 0.0).to(tl.int32) * 32
 
     @triton.jit
