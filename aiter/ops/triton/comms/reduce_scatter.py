@@ -169,6 +169,7 @@ def reduce_scatter(
     block_n: int = 64,
     group_size_m: int = 8,
     num_sms: int = 256,
+    output: Tensor | None = None,
 ) -> Tensor:
     """
     Perform reduce-scatter along the M (row) dimension.
@@ -185,6 +186,8 @@ def reduce_scatter(
         block_n (int): Block size for N dimension. Default: 64
         group_size_m (int): Group size for swizzling. Default: 8
         num_sms (int): Number of SMs to use (persistent kernel). Default: 256
+        output (Tensor, optional): Preallocated output. Use this argument during
+            graph capture to keep the output address stable.
 
     Returns:
         Tensor: Output shard of shape [M_shard, N] where M_shard = M // world_size
@@ -223,21 +226,37 @@ def reduce_scatter(
         f"Rank {cur_rank}/{world_size}: Reduce-scatter M={M}, N={N} -> M_shard={M_shard}"
     )
 
-    # Allocate output buffer in IRIS shared memory
-    output_shard = iris_ctx.zeros((M_shard, N), dtype=input_tensor.dtype)
+    if output is None:
+        output = iris_ctx.empty((M_shard, N), dtype=input_tensor.dtype)
+    elif output.shape != (M_shard, N):
+        raise ValueError(
+            f"output must have shape ({M_shard}, {N}), got {output.shape}"
+        )
+    elif output.dtype != input_tensor.dtype:
+        raise ValueError(
+            f"output dtype must be {input_tensor.dtype}, got {output.dtype}"
+        )
+    elif output.device != input_tensor.device:
+        raise ValueError(
+            f"output device must be {input_tensor.device}, got {output.device}"
+        )
+
+    # Wait until every rank finishes producing its local input tensor. The
+    # Iris device barrier uses system-scope atomics and is graph-capturable.
+    iris_ctx.device_barrier()
 
     # Launch kernel
     grid = (num_sms,)
     _reduce_scatter_kernel[grid](
         input_tensor,
-        output_shard,
+        output,
         M,
         M_shard,
         N,
         input_tensor.stride(0),
         input_tensor.stride(1),
-        output_shard.stride(0),
-        output_shard.stride(1),
+        output.stride(0),
+        output.stride(1),
         cur_rank,
         world_size,
         heap_bases,
@@ -250,11 +269,6 @@ def reduce_scatter(
         waves_per_eu=4,
     )
 
-    # Synchronize
-    iris_ctx.barrier()
+    logger.info(f"Rank {cur_rank}: Reduce-scatter complete, output shape: {output.shape}")
 
-    logger.info(
-        f"Rank {cur_rank}: Reduce-scatter complete, output_shard shape: {output_shard.shape}"
-    )
-
-    return output_shard
+    return output

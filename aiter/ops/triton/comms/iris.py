@@ -177,6 +177,9 @@ class IrisCommContext:
             self.cur_rank = self.iris_ctx.cur_rank
             self.num_ranks = self.iris_ctx.num_ranks
 
+            # Allocate the persistent device-barrier state before graph capture.
+            self.iris_ctx.device_barrier()
+
             logger.info(
                 f"Iris context initialized: rank {self.cur_rank}/{self.num_ranks}, heap_size={self.heap_size}"
             )

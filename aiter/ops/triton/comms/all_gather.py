@@ -12,7 +12,6 @@ import logging
 from typing import TYPE_CHECKING
 
 import iris
-import torch
 import triton
 import triton.language as tl
 from torch import Tensor
@@ -112,6 +111,67 @@ def _all_gather_impl(
 
 
 @triton.jit
+def _all_gather_pull_impl(
+    pid,
+    shard_ptr,
+    out_ptr,
+    M,
+    M_shard,
+    N,
+    stride_sm,
+    stride_sn,
+    stride_om,
+    stride_on,
+    cur_rank: tl.constexpr,
+    world_size: tl.constexpr,
+    heap_bases: tl.tensor,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    NUM_SMS: tl.constexpr,
+):
+    """Pull each remote shard into the local output."""
+    num_pid_m = tl.cdiv(M_shard, BLOCK_M)
+    num_pid_n = tl.cdiv(N, BLOCK_N)
+    total_tiles = num_pid_m * num_pid_n
+
+    for tile_id in range(pid, total_tiles, NUM_SMS):
+        num_pid_in_group = GROUP_SIZE_M * num_pid_n
+        group_id = tile_id // num_pid_in_group
+        first_pid_m = group_id * GROUP_SIZE_M
+        group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+        pid_m = first_pid_m + ((tile_id % num_pid_in_group) % group_size_m)
+        pid_n = (tile_id % num_pid_in_group) // group_size_m
+
+        rm_local = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        rm_local = tl.max_contiguous(tl.multiple_of(rm_local, BLOCK_M), BLOCK_M)
+        rn = tl.max_contiguous(tl.multiple_of(rn, BLOCK_N), BLOCK_N)
+        mask = (rm_local[:, None] < M_shard) & (rn[None, :] < N)
+        shard_ptrs = (
+            shard_ptr
+            + rm_local[:, None] * stride_sm
+            + rn[None, :] * stride_sn
+        )
+
+        for src_rank in tl.static_range(world_size):
+            shard_data = iris.load(
+                shard_ptrs,
+                cur_rank,
+                src_rank,
+                heap_bases,
+                mask=mask,
+            )
+            rm_global = src_rank * M_shard + rm_local
+            out_ptrs = (
+                out_ptr
+                + rm_global[:, None] * stride_om
+                + rn[None, :] * stride_on
+            )
+            tl.store(out_ptrs, shard_data, mask=mask & (rm_global[:, None] < M))
+
+
+@triton.jit
 def _all_gather_kernel(
     shard_ptr,  # *[M_shard, N]
     out_ptr,  # *[M, N]
@@ -133,10 +193,10 @@ def _all_gather_kernel(
     """
     All-gather kernel entry point.
 
-    This is a wrapper around _all_gather_impl that gets the program ID.
+    This is a wrapper around _all_gather_pull_impl that gets the program ID.
     """
     pid = tl.program_id(0)
-    _all_gather_impl(
+    _all_gather_pull_impl(
         pid,
         shard_ptr,
         out_ptr,
@@ -164,6 +224,7 @@ def all_gather(
     block_n: int = 64,
     group_size_m: int = 8,
     num_sms: int = 256,
+    output: Tensor | None = None,
 ) -> Tensor:
     """
     Perform all-gather along the M (row) dimension.
@@ -180,6 +241,8 @@ def all_gather(
         block_n (int): Block size for N dimension. Default: 64
         group_size_m (int): Group size for swizzling. Default: 8
         num_sms (int): Number of SMs to use (persistent kernel). Default: 256
+        output (Tensor, optional): Preallocated output. Use this argument during
+            graph capture to keep the output address stable.
 
     Returns:
         Tensor: Full tensor of shape [M, N] where M = M_shard * world_size
@@ -213,21 +276,35 @@ def all_gather(
         f"Rank {cur_rank}/{world_size}: All-gather M_shard={M_shard}, N={N} -> M={M}"
     )
 
-    # Allocate output buffer in IRIS shared memory
-    full_output = iris_ctx.zeros((M, N), dtype=input_shard.dtype)
+    if output is None:
+        output = iris_ctx.empty((M, N), dtype=input_shard.dtype)
+    elif output.shape != (M, N):
+        raise ValueError(f"output must have shape ({M}, {N}), got {output.shape}")
+    elif output.dtype != input_shard.dtype:
+        raise ValueError(
+            f"output dtype must be {input_shard.dtype}, got {output.dtype}"
+        )
+    elif output.device != input_shard.device:
+        raise ValueError(
+            f"output device must be {input_shard.device}, got {output.device}"
+        )
+
+    # Wait until every rank finishes producing its local input shard. The Iris
+    # device barrier uses system-scope atomics and is graph-capturable.
+    iris_ctx.device_barrier()
 
     # Launch kernel
     grid = (num_sms,)
     _all_gather_kernel[grid](
         input_shard,
-        full_output,
+        output,
         M,
         M_shard,
         N,
         input_shard.stride(0),
         input_shard.stride(1),
-        full_output.stride(0),
-        full_output.stride(1),
+        output.stride(0),
+        output.stride(1),
         cur_rank,
         world_size,
         heap_bases,
@@ -240,12 +317,6 @@ def all_gather(
         waves_per_eu=4,
     )
 
-    # Synchronize
-    torch.cuda.synchronize()
-    iris_ctx.barrier()
+    logger.info(f"Rank {cur_rank}: All-gather complete, output shape: {output.shape}")
 
-    logger.info(
-        f"Rank {cur_rank}: All-gather complete, output shape: {full_output.shape}"
-    )
-
-    return full_output
+    return output
