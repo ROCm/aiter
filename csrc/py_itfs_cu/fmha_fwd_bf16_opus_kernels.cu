@@ -14,11 +14,10 @@
 #define FMHA_FWD_HD192_V128_BF16_OPUS_IMPL
 #include "fmha_fwd_hd192_v128_bf16_opus.h"
 
-#include "fmha_fwd_bf16_opus.h"
+#include "torch/fmha_fwd_bf16_opus.h"
 #include "aiter_hip_common.h"
-#include "aiter_stream.h"
-#include "aiter_tensor.h"
 
+#include <ATen/hip/HIPContext.h>
 #include <cmath>
 #include <type_traits>
 
@@ -26,10 +25,10 @@ namespace {
 
 // ─── D_QK=128 / D_V=128 (symmetric) launch — logic unchanged from the original
 //     fmha_fwd_hd128_bf16_opus_fwd, only moved under the shared entry point. ───
-void launch_d128(aiter_tensor_t& q,
-                 aiter_tensor_t& k,
-                 aiter_tensor_t& v,
-                 aiter_tensor_t& out,
+void launch_d128(at::Tensor& q,
+                 at::Tensor& k,
+                 at::Tensor& v,
+                 at::Tensor& out,
                  bool causal,
                  float softmax_scale)
 {
@@ -89,8 +88,8 @@ void launch_d128(aiter_tensor_t& q,
     }
     kargs.softmax_scale = softmax_scale;  // kernel applies scale * log2(e) to Q
 
-    HipDeviceGuard guard(q.device_id);
-    const hipStream_t stream = aiter::getCurrentHIPStream();
+    HipDeviceGuard guard(q.device().index());
+    const hipStream_t stream = at::hip::getCurrentHIPStream(q.device().index());
 
     using TraitsCausal    = opus_gqa_traits<32, 64, 128, 8, true>;
     using TraitsNonCausal = opus_gqa_traits<32, 64, 128, 8, false>;
@@ -113,16 +112,16 @@ void launch_d128(aiter_tensor_t& q,
 }
 
 // ─── D_QK=192 / D_V=128 (asymmetric) launch — batch + group (varlen). ───
-void launch_d192_v128(aiter_tensor_t& q,
-                      aiter_tensor_t& k,
-                      aiter_tensor_t& v,
-                      aiter_tensor_t& out,
+void launch_d192_v128(at::Tensor& q,
+                      at::Tensor& k,
+                      at::Tensor& v,
+                      at::Tensor& out,
                       bool causal,
                       float softmax_scale,
-                      std::optional<aiter_tensor_t>& seqstart_q,
-                      std::optional<aiter_tensor_t>& seqstart_k,
-                      std::optional<aiter_tensor_t>& seqstart_q_pad,
-                      std::optional<aiter_tensor_t>& seqstart_k_pad,
+                      std::optional<at::Tensor>& seqstart_q,
+                      std::optional<at::Tensor>& seqstart_k,
+                      std::optional<at::Tensor>& seqstart_q_pad,
+                      std::optional<at::Tensor>& seqstart_k_pad,
                       int max_seqlen_q,
                       int max_seqlen_k)
 {
@@ -147,8 +146,8 @@ void launch_d192_v128(aiter_tensor_t& q,
     // Plumbed into the kernel via kargs; the kernel folds in log2(e) for its exp2 softmax.
     kargs.softmax_scale = softmax_scale;
 
-    HipDeviceGuard guard(q.device_id);
-    const hipStream_t stream = aiter::getCurrentHIPStream();
+    HipDeviceGuard guard(q.device().index());
+    const hipStream_t stream = at::hip::getCurrentHIPStream(q.device().index());
 
     int B, N, N_KV, H, H_KV;
     int num_q_blocks;   // for grid / merge decision
@@ -181,8 +180,8 @@ void launch_d192_v128(aiter_tensor_t& q,
         // Validate the cumulative-length arrays before reinterpreting their storage as
         // int32: a wrong dtype (e.g. int64), non-contiguous layout, or wrong length would
         // otherwise silently corrupt the per-group offsets or fault.
-        auto check_seqstart = [&](const aiter_tensor_t& s, const char* name) {
-            AITER_CHECK(s.dtype() == AITER_DTYPE_i32, name, " must be int32");
+        auto check_seqstart = [&](const at::Tensor& s, const char* name) {
+            AITER_CHECK(s.scalar_type() == at::kInt, name, " must be int32");
             AITER_CHECK(s.dim() == 1, name, " must be 1-D");
             AITER_CHECK(s.is_contiguous(), name, " must be contiguous");
             AITER_CHECK(static_cast<int>(s.numel()) == B + 1, name, " length must be num_groups+1");
@@ -294,22 +293,25 @@ void launch_d192_v128(aiter_tensor_t& q,
 
 } // namespace
 
-void fmha_fwd_bf16_opus_fwd(aiter_tensor_t& q,
-                            aiter_tensor_t& k,
-                            aiter_tensor_t& v,
-                            aiter_tensor_t& out,
+void fmha_fwd_bf16_opus_fwd(at::Tensor& q,
+                            at::Tensor& k,
+                            at::Tensor& v,
+                            at::Tensor& out,
                             bool causal,
                             float softmax_scale,
-                            std::optional<aiter_tensor_t> seqstart_q,
-                            std::optional<aiter_tensor_t> seqstart_k,
-                            std::optional<aiter_tensor_t> seqstart_q_pad,
-                            std::optional<aiter_tensor_t> seqstart_k_pad,
+                            std::optional<at::Tensor> seqstart_q,
+                            std::optional<at::Tensor> seqstart_k,
+                            std::optional<at::Tensor> seqstart_q_pad,
+                            std::optional<at::Tensor> seqstart_k_pad,
                             int max_seqlen_q,
                             int max_seqlen_k)
 {
-    AITER_CHECK(q.dtype() == k.dtype() && q.dtype() == v.dtype() && q.dtype() == out.dtype(),
+    AITER_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda() && out.is_cuda(),
+                "q/k/v/out must be GPU tensors");
+    AITER_CHECK(q.scalar_type() == k.scalar_type() && q.scalar_type() == v.scalar_type() &&
+                    q.scalar_type() == out.scalar_type(),
                 "q/k/v/out must share dtype");
-    AITER_CHECK(q.dtype() == AITER_DTYPE_bf16, "fmha_fwd_bf16_opus_fwd only supports bf16");
+    AITER_CHECK(q.scalar_type() == at::kBFloat16, "fmha_fwd_bf16_opus_fwd only supports bf16");
 
     const int D_QK = static_cast<int>(q.size(-1));
     const int D_V  = static_cast<int>(v.size(-1));
