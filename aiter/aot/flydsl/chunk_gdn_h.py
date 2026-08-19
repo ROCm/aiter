@@ -111,8 +111,8 @@ _TORCH_DTYPE = {
 
 # AOT untuned: canonical stub + ``model_configs/*_chunk_gdn_h_mfma16_hip_untuned.csv``.
 # Runtime BV: ``chunk_gdn_h_mfma16_hip_tuned.csv`` merged with model_configs via ``AITER_CONFIGS``.
-_DEFAULT_CSV_MFMA16_HIP = (
-    Path(f"{AITER_ROOT_DIR}/aiter/configs/chunk_gdn_h_mfma16_hip_untuned.csv")
+_DEFAULT_CSV_MFMA16_HIP = Path(
+    f"{AITER_ROOT_DIR}/aiter/configs/chunk_gdn_h_mfma16_hip_untuned.csv"
 )
 _MODEL_CONFIG_DIR = Path(f"{AITER_ROOT_DIR}/aiter/configs/model_configs")
 DEFAULT_CSVS_MFMA16_HIP = sorted(
