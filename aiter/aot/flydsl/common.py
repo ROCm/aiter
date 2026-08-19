@@ -12,7 +12,7 @@ import os
 import shutil
 import tempfile
 import time
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from multiprocessing.connection import wait as wait_for_sentinels
@@ -130,16 +130,12 @@ def override_env(var_name: str, value: str | None) -> Iterator[None]:
             os.environ[var_name] = prev
 
 
-def collect_aot_jobs_for(kind: OpKind) -> list[dict[str, Any]]:
-    """Return the package-default, deduplicated jobs for one operation kind.
-
-    Importing .gemm / .moe / .chunk_gdn_h here also runs their module-level
-    imports, which pull in FlyDSL (e.g. ``flydsl.expr``). Job collection is
-    therefore not free in the parent process, just shifted once out of every
-    child.
-    """
-    if not isinstance(kind, OpKind):
-        raise TypeError(f"kind must be an OpKind, got {kind!r}")
+def _collect_aot_jobs_for(kind: OpKind) -> list[dict[str, Any]]:
+    """Load DEFAULT_CSVS + parse_csv for the named kind and return its
+    job list. Note: importing .gemm / .moe / .chunk_gdn_h here also
+    runs their module-level imports, which pull in FlyDSL (e.g.
+    ``flydsl.expr``). Job collection is therefore not free in the
+    parent process, just shifted once out of every child."""
     if kind is OpKind.MOE:
         from .moe import DEFAULT_CSVS, parse_csv
     elif kind is OpKind.MXFP4_MOE:
@@ -416,23 +412,13 @@ def run_jobs_parallel(
     return out
 
 
-def run_aot(
-    cache_dir: str,
-    *,
-    kinds: Iterable[OpKind] | None = None,
-) -> None:
-    """Compile package AOT jobs, optionally restricted to public op kinds."""
+def run_aot(cache_dir: str) -> None:
     os.makedirs(cache_dir, exist_ok=True)
     os.environ["FLYDSL_RUNTIME_CACHE_DIR"] = cache_dir
-    selected_kinds = tuple(dict.fromkeys(OpKind if kinds is None else kinds))
-    if not selected_kinds or any(
-        not isinstance(kind, OpKind) for kind in selected_kinds
-    ):
-        raise ValueError("kinds must contain one or more OpKind values")
 
     all_jobs: list[tuple[OpKind, dict[str, Any]]] = []
-    for kind in selected_kinds:
-        for job in collect_aot_jobs_for(kind):
+    for kind in OpKind:
+        for job in _collect_aot_jobs_for(kind):
             all_jobs.append((kind, job))
 
     if not all_jobs:
@@ -450,7 +436,7 @@ def run_aot(
 
     print(
         f"[aiter] FlyDSL AOT: {len(all_jobs)} kernels "
-        f"({'+'.join(k.name for k in selected_kinds)}), "
+        f"({'+'.join(k.name for k in OpKind)}), "
         f"{max_workers} worker processes (cache: {cache_dir})"
     )
 
@@ -489,7 +475,7 @@ def run_aot(
                 fail_by_kind[kind] += 1
                 errors.append(f"FlyDSL {label} produced no kernel")
 
-        for kind in selected_kinds:
+        for kind in OpKind:
             print(
                 f"[aiter] FlyDSL {kind.name} AOT: "
                 f"compiled {ok_by_kind[kind]} ok, {fail_by_kind[kind]} failed"
@@ -503,9 +489,7 @@ def run_aot(
                 suffix = (
                     f"; ... ({len(unique_errors) - _MAX_ERRORS_IN_MSG} more unique)"
                 )
-            tally = ", ".join(
-                f"{k.name}: {fail_by_kind[k]} failed" for k in selected_kinds
-            )
+            tally = ", ".join(f"{k.name}: {fail_by_kind[k]} failed" for k in OpKind)
             raise AssertionError(
                 f"[aiter] FlyDSL AOT failures ({tally}): " + "; ".join(head) + suffix
             )

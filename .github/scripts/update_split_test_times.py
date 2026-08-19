@@ -21,10 +21,6 @@ ALLOWED_CONCLUSIONS = {"success", "failure"}
 LOG_TIME_RE = re.compile(r"Time elapsed of\s+([^:]+):\s*([0-9]+(?:\.[0-9]+)?)")
 ASSIGN_RE = re.compile(r"^\s*FILE_TIMES\[(?P<key>[^\]]+)\]=(?P<value>\d+)\s*$")
 DEFAULT_TIME = 15
-FLYDSL_GEMM_TESTS = (
-    "op_tests/flydsl_tests/test_flydsl_decode_gemm.py",
-    "op_tests/flydsl_tests/test_flydsl_small_m_hgemm.py",
-)
 
 
 @dataclass(frozen=True)
@@ -148,13 +144,6 @@ def list_test_files(repo_root: Path, test_type: str) -> list[str]:
         for p in repo_root.glob(glob_pattern)
         if p.is_file()
     )
-    if test_type == "aiter":
-        files.extend(
-            test_file
-            for test_file in FLYDSL_GEMM_TESTS
-            if (repo_root / test_file).is_file()
-        )
-        files.sort()
     return files
 
 

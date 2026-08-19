@@ -1026,8 +1026,6 @@ def validate_gemm_decode_tensors(
 
     if _overlaps(C, A) or _overlaps(C, B):
         raise ValueError("C must not overlap A or B")
-    if bias is not None and _overlaps(C, bias):
-        raise ValueError("C must not overlap bias")
     gfx = get_gfx_runtime() if arch is None else arch
     if gfx not in ("gfx942", "gfx950"):
         raise ValueError(f"decode GEMM requires gfx942 or gfx950, got {gfx}")

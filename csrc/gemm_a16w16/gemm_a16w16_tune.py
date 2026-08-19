@@ -11,10 +11,7 @@ hipblaslt is opt-in via --with-hipblaslt (imports from gradlib).
 
 import argparse
 import functools
-import hashlib
-import importlib
 import os
-import re
 import sys
 from functools import lru_cache
 from typing import Any, ClassVar
@@ -42,8 +39,6 @@ try:
     if is_flydsl_available():
         from aiter.ops.flydsl.gemm_kernels import (
             SPLIT_K_SEMAPHORE_MAX_LEN,
-            BlockMfmaDecodeConfig,
-            WaveDecodeConfig,
             flydsl_hgemm,
             gemm_decode_bf16,
             gemm_decode_kernel_name,
@@ -53,8 +48,6 @@ try:
     else:
         raise ImportError("flydsl package is not installed")
 except ImportError as exc:
-    BlockMfmaDecodeConfig = None
-    WaveDecodeConfig = None
     flydsl_hgemm = None
     SPLIT_K_SEMAPHORE_MAX_LEN = 256
     get_flydsl_splitk_hgemm_kernels = None
@@ -64,153 +57,23 @@ except ImportError as exc:
     FLYDSL_TUNE_ERROR = str(exc)
 
 
-def _sha256_file(path):
-    if not path or not os.path.isfile(path):
-        return None
-    digest = hashlib.sha256()
-    with open(path, "rb") as source:
-        for chunk in iter(lambda: source.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def _normalize_schema_type(type_text):
-    normalized = re.sub(r"\([^)]*\)", "", str(type_text)).replace(" ", "")
-    if normalized == "Optional[Tensor]":
-        return "Tensor?"
-    return normalized
-
-
-def _normalized_registered_schema(schema):
-    arguments = getattr(schema, "arguments", None)
-    returns = getattr(schema, "returns", None)
-    if arguments is not None and returns is not None:
-        return (
-            tuple(
-                (argument.name, _normalize_schema_type(argument.type))
-                for argument in arguments
-            ),
-            tuple(_normalize_schema_type(result.type) for result in returns),
+def _try_vllm_wvsplitk():
+    """Resolve wvSplitK only when the experimental tuner flag is on."""
+    try:
+        from vllm._custom_ops import wvSplitK as wrapper
+    except Exception:  # noqa: BLE001
+        wrapper = None
+    if callable(wrapper):
+        return lambda weight, activation, bias, cu_count: wrapper(
+            weight, activation, cu_count, bias
         )
-
-    schema_text = str(schema)
-    try:
-        argument_text = schema_text.split("(", 1)[1].rsplit(")", 1)[0]
-        return_text = schema_text.rsplit("->", 1)[1].strip()
-    except IndexError as error:
-        raise ValueError(f"unparseable schema: {schema_text}") from error
-
-    normalized_arguments = []
-    for declaration in argument_text.split(","):
-        declaration = declaration.strip().split("=", 1)[0].strip()
-        parts = declaration.rsplit(None, 1)
-        if len(parts) != 2:
-            raise ValueError(f"unparseable schema argument: {declaration!r}")
-        type_text, name = parts
-        normalized_arguments.append((name, _normalize_schema_type(type_text)))
-    return (
-        tuple(normalized_arguments),
-        tuple(_normalize_schema_type(item) for item in return_text.split(",")),
-    )
-
-
-def _registered_wvsplitk_schema(op):
-    overload = getattr(op, "default", op)
-    schema = getattr(overload, "_schema", None)
-    if schema is None:
-        raise ValueError("registered _rocm_C.wvSplitK op has no inspectable schema")
-    expected = (
-        (
-            ("in_a", "Tensor"),
-            ("in_b", "Tensor"),
-            ("in_bias", "Tensor?"),
-            ("CuCount", "int"),
-        ),
-        ("Tensor",),
-    )
-    try:
-        normalized = _normalized_registered_schema(schema)
-    except ValueError:
-        normalized = None
-    schema_text = str(schema)
-    if normalized != expected:
-        raise ValueError(f"unexpected _rocm_C.wvSplitK schema: {schema_text}")
-    return schema_text
-
-
-def resolve_vllm_wvsplitk(library=None):
-    """Resolve vLLM wvSplitK only for the explicit opt-in tuner path."""
-    metadata = {
-        "status": "unavailable",
-        "source": None,
-        "path": os.path.abspath(library) if library else None,
-        "sha256": _sha256_file(library),
-        "schema": None,
-        "reason": None,
-    }
-    if library:
-        if not os.path.isfile(library):
-            metadata["reason"] = f"library does not exist: {library}"
-            return None, metadata
-        try:
-            torch.ops.load_library(os.path.abspath(library))
-            op = torch.ops._rocm_C.wvSplitK
-            schema = _registered_wvsplitk_schema(op)
-            metadata.update(
-                status="callable",
-                source="torch.ops._rocm_C.wvSplitK",
-                schema=schema,
-            )
-            return (
-                lambda weight, activation, bias, cu_count: op(
-                    weight, activation, bias, cu_count
-                )
-            ), metadata
-        except Exception as error:  # noqa: BLE001
-            metadata["reason"] = f"{type(error).__name__}: {error}"
-            return None, metadata
-
-    try:
-        module = importlib.import_module("vllm._custom_ops")
-        wrapper = getattr(module, "wvSplitK", None)
-        if callable(wrapper):
-            module_path = getattr(module, "__file__", None)
-            metadata.update(
-                status="callable",
-                source="vllm._custom_ops.wvSplitK",
-                path=module_path,
-                sha256=_sha256_file(module_path),
-                schema="wvSplitK(weight, activation, cu_count, bias=None) -> Tensor",
-            )
-            return (
-                lambda weight, activation, bias, cu_count: wrapper(
-                    weight, activation, cu_count, bias
-                )
-            ), metadata
-    except Exception as error:  # noqa: BLE001
-        metadata["reason"] = (
-            f"public wrapper unavailable: {type(error).__name__}: {error}"
-        )
-
     try:
         op = torch.ops._rocm_C.wvSplitK
-        schema = _registered_wvsplitk_schema(op)
-        metadata.update(
-            status="callable",
-            source="torch.ops._rocm_C.wvSplitK",
-            schema=schema,
-            reason=None,
-        )
-        return (
-            lambda weight, activation, bias, cu_count: op(
-                weight, activation, bias, cu_count
-            )
-        ), metadata
-    except Exception as error:  # noqa: BLE001
-        metadata["reason"] = (
-            f"registered op unavailable: {type(error).__name__}: {error}"
-        )
-        return None, metadata
+    except Exception:  # noqa: BLE001
+        return None
+    return lambda weight, activation, bias, cu_count: op(
+        weight, activation, bias, cu_count
+    )
 
 
 OPUS_TUNE_ERROR = None
@@ -268,8 +131,6 @@ except Exception as _hipb_exc:  # noqa: BLE001
 
 
 _VLLM_WVSPLITK_OP = None
-_VLLM_WVSPLITK_METADATA = None
-_VLLM_WVSPLITK_FINITE_CHECKED = set()
 
 # ---------------------------------------------------------------------------
 # Tolerance helpers
@@ -474,68 +335,11 @@ def run_flydsl_gemm_bf16(input, weight, bias=None, otype=dtypes.bf16, config=Non
     )
 
 
-def vllm_wvsplitk_eligibility(
-    m,
-    n,
-    k,
-    indtype,
-    outdtype,
-    has_bias=False,
-    scaleAB=False,
-    is_shuffle=False,
-):
-    if indtype != dtypes.bf16 or outdtype != dtypes.bf16:
-        return False, "requires BF16 input, weight, and output"
-    if not 1 <= int(m) <= 5:
-        return False, "supports exact M=1..5"
-    if int(n) <= 0:
-        return False, "requires N > 0"
-    if int(k) <= 0 or int(k) % 8:
-        return False, "requires K > 0 and K divisible by 8"
-    if scaleAB:
-        return False, "does not support scaled tuner inputs"
-    if is_shuffle:
-        return False, "requires contiguous, non-preshuffled weights"
-    if has_bias:
-        return True, "eligible with contiguous BF16 row bias"
-    return True, "eligible"
-
-
 def run_vllm_wvsplitk_bf16(input, weight, bias=None, otype=dtypes.bf16):
+    del otype
     if _VLLM_WVSPLITK_OP is None:
         raise RuntimeError("vLLM wvSplitK was not resolved")
-    if not input.is_contiguous() or not weight.is_contiguous():
-        raise ValueError("vLLM wvSplitK requires contiguous activation and weight")
-    if bias is not None and (
-        bias.dtype != torch.bfloat16
-        or not bias.is_contiguous()
-        or bias.ndim != 1
-        or bias.numel() != weight.shape[0]
-    ):
-        raise ValueError("vLLM wvSplitK bias must be contiguous BF16 [N]")
-    out = _VLLM_WVSPLITK_OP(weight, input, bias, get_cu_num())
-    expected_shape = (input.shape[0], weight.shape[0])
-    if (
-        not isinstance(out, torch.Tensor)
-        or tuple(out.shape) != expected_shape
-        or out.dtype != (otype or input.dtype)
-    ):
-        raise RuntimeError(
-            "vLLM wvSplitK returned an invalid output; expected "
-            f"Tensor{expected_shape} dtype={otype or input.dtype}"
-        )
-    finite_key = (
-        input.data_ptr(),
-        weight.data_ptr(),
-        None if bias is None else bias.data_ptr(),
-        tuple(input.shape),
-        tuple(weight.shape),
-    )
-    if finite_key not in _VLLM_WVSPLITK_FINITE_CHECKED:
-        if not torch.isfinite(out).all():
-            raise RuntimeError("vLLM wvSplitK returned NaN or Inf")
-        _VLLM_WVSPLITK_FINITE_CHECKED.add(finite_key)
-    return out
+    return _VLLM_WVSPLITK_OP(weight, input, bias, get_cu_num())
 
 
 _flydsl_decode_graphs = {}
@@ -643,7 +447,6 @@ ALL_LIBTYPES = [
     "triton",
     "flydsl",
     "flydsl_decode",
-    "vllm_wvsplitk",
     "torch",
     "skinny",
     "opus",
@@ -658,69 +461,8 @@ def libtype_list(string):
     return values
 
 
-def _round_robin_representatives(items, *, limit, bucket_key, priority_key):
-    buckets = {}
-    for item in items:
-        buckets.setdefault(bucket_key(item), []).append(item)
-    for bucket in buckets.values():
-        bucket.sort(key=priority_key)
-
-    keys = sorted(buckets, key=str)
-    offsets = {key: 0 for key in keys}
-    selected = []
-    while keys and len(selected) < limit:
-        next_keys = []
-        for key in keys:
-            offset = offsets[key]
-            bucket = buckets[key]
-            if offset >= len(bucket):
-                continue
-            selected.append(bucket[offset])
-            offsets[key] = offset + 1
-            if offsets[key] < len(bucket):
-                next_keys.append(key)
-            if len(selected) >= limit:
-                break
-        keys = next_keys
-    return selected
-
-
-def _bounded_decode_configs(configs):
-    def bucket(config):
-        if isinstance(config, WaveDecodeConfig):
-            return ("wave", config.contraction.value)
-        return (
-            "block",
-            config.activation_source.value,
-            bool(config.persistent_n),
-        )
-
-    def priority(config):
-        if isinstance(config, WaveDecodeConfig):
-            return (
-                -config.m_per_wave,
-                config.n_per_wave != 1,
-                config.kvec != 8,
-                config.prefetch_depth != 1,
-                config.waves_per_eu != 2,
-                config.b_cache_modifier != 0,
-                config.reduction.value != "dpp",
-                repr(config),
-            )
-        return (
-            config.waves_per_workgroup != 8,
-            config.columns_per_wave != 1,
-            config.b_load_width != 8,
-            config.k_unroll != 2,
-            config.waves_per_eu != 2,
-            config.workgroups_per_cu != 1,
-            config.b_cache_modifier != 0,
-            repr(config),
-        )
-
-    return _round_robin_representatives(
-        configs, limit=12, bucket_key=bucket, priority_key=priority
-    )
+def _bounded_decode_configs(configs, limit=12):
+    return list(configs)[:limit]
 
 
 # ---------------------------------------------------------------------------
@@ -782,8 +524,8 @@ class GemmA16W16Tuner(GemmCommonTuner):
             default=["all"],
             required=False,
             help="choose libtype to tune: all, asm, hipblaslt, triton, flydsl, "
-            "flydsl_decode, vllm_wvsplitk, torch, skinny, opus. "
-            "hipblaslt and comparison-only vllm_wvsplitk require their opt-in flags.",
+            "flydsl_decode, torch, skinny, opus. "
+            "hipblaslt requires --with-hipblaslt; vLLM wvSplitK is a separate flag.",
         )
         self.parser.add_argument(
             "--with-hipblaslt",
@@ -797,23 +539,15 @@ class GemmA16W16Tuner(GemmCommonTuner):
             "--candidate-policy",
             choices=("bounded", "deep"),
             default="bounded",
-            help="Candidate breadth policy. 'bounded' is the normal deterministic "
-            "representative search; 'deep' enables the exhaustive Cartesian search.",
+            help="Decode candidate breadth. 'bounded' keeps a small default set; "
+            "'deep' times the full decode registry.",
         )
         self.parser.add_argument(
             "--with-vllm-wvsplitk",
             action="store_true",
             default=False,
             dest="with_vllm_wvsplitk",
-            help="Include comparison-only vLLM wvSplitK measurements. "
-            "These rows are written to --profile_file but never promoted.",
-        )
-        self.parser.add_argument(
-            "--vllm-wvsplitk-library",
-            type=str,
-            default=None,
-            dest="vllm_wvsplitk_library",
-            help="Optional shared library registering _rocm_C::wvSplitK.",
+            help="Optionally time vLLM wvSplitK. Comparison-only; never promoted.",
         )
 
     def _clear_op_caches(self):
@@ -1021,17 +755,6 @@ class GemmA16W16Tuner(GemmCommonTuner):
                         ("out_asm",),
                     )
                 )
-        if getattr(self, "candidate_policy", "bounded") == "bounded":
-            tasks = _round_robin_representatives(
-                tasks,
-                limit=4,
-                bucket_key=lambda task: min(int(task[0][2]), 4),
-                priority_key=lambda task: (
-                    int(task[0][2]) not in (1, 2, 4),
-                    int(task[0][1]),
-                    str(task[0][3]),
-                ),
-            )
         return tasks
 
     def _get_opus_tasks(
@@ -1150,23 +873,6 @@ class GemmA16W16Tuner(GemmCommonTuner):
                 )
             )
         logger.info(f"FlyDSL candidate count for M={M}, N={N}, K={K}: {len(tasks)}")
-        if getattr(self, "candidate_policy", "bounded") == "bounded":
-            tasks = [task for task in tasks if int(task[4][2]["split_k"]) in (1, 2, 4)]
-            tasks = _round_robin_representatives(
-                tasks,
-                limit=8,
-                bucket_key=lambda task: int(task[4][2]["split_k"]),
-                priority_key=lambda task: (
-                    int(task[4][2]["stages"]) != 2,
-                    int(task[4][2]["tile_m"]) not in (16, 32, 64),
-                    int(task[4][2]["tile_n"]) != 128,
-                    int(task[4][2]["tile_k"]) != 64,
-                    int(task[4][2]["block_m_warps"])
-                    * int(task[4][2]["block_n_warps"])
-                    * int(task[4][2]["block_k_warps"]),
-                    str(task[0][3]),
-                ),
-            )
         return tasks
 
     def _get_flydsl_decode_tasks(
@@ -1267,35 +973,16 @@ class GemmA16W16Tuner(GemmCommonTuner):
         self, info_keys, has_bias, indtype, outdtype, scaleAB, is_shuffle, run_kwargs
     ):
         M, N, K = map(int, info_keys[2:5])
-        eligible, reason = vllm_wvsplitk_eligibility(
-            M,
-            N,
-            K,
-            indtype,
-            outdtype,
-            has_bias,
-            scaleAB,
-            is_shuffle,
-        )
-        if not eligible:
-            logger.info(f"vLLM wvSplitK N/A for M={M}, N={N}, K={K}: {reason}")
+        if (
+            _VLLM_WVSPLITK_OP is None
+            or scaleAB
+            or is_shuffle
+            or indtype != dtypes.bf16
+            or outdtype != dtypes.bf16
+            or not 1 <= M <= 5
+        ):
             return []
-        if _VLLM_WVSPLITK_OP is None:
-            reason = (_VLLM_WVSPLITK_METADATA or {}).get(
-                "reason", "backend was not resolved"
-            )
-            logger.warning(f"vLLM wvSplitK unavailable: {reason}")
-            return []
-        info = (
-            info_keys,
-            0,
-            0,
-            "vllm_wvsplitk_compare_v1",
-            "vllm_wvsplitk",
-            False,
-        )
-        vllm_run_kwargs = dict(run_kwargs)
-        vllm_run_kwargs["use_cuda_event"] = True
+        info = (info_keys, 0, 0, "vllm_wvsplitk", "vllm_wvsplitk", False)
         return [
             (
                 info,
@@ -1303,7 +990,7 @@ class GemmA16W16Tuner(GemmCommonTuner):
                 (M, N, K, indtype, outdtype, False, False, 0, has_bias),
                 run_vllm_wvsplitk_bf16,
                 (["inp", "weights", "bias"], outdtype),
-                vllm_run_kwargs,
+                dict(run_kwargs),
                 get_gemm_ref,
                 (
                     ["inp", "weights", "bias", "x_scale", "w_scale"],
@@ -1457,30 +1144,12 @@ class GemmA16W16Tuner(GemmCommonTuner):
     # -------------------------------------------------------------------
 
     def tune(self, untunedf, tunedf, args):
-        global _VLLM_WVSPLITK_OP, _VLLM_WVSPLITK_METADATA
+        global _VLLM_WVSPLITK_OP
         libtype = args.libtype
         with_hipblaslt = getattr(args, "with_hipblaslt", False)
         with_vllm_wvsplitk = getattr(args, "with_vllm_wvsplitk", False)
         self.candidate_policy = getattr(args, "candidate_policy", "bounded")
-        _VLLM_WVSPLITK_FINITE_CHECKED.clear()
-        if "vllm_wvsplitk" in libtype and not with_vllm_wvsplitk:
-            logger.warning(
-                "vllm_wvsplitk requested without --with-vllm-wvsplitk; skipping"
-            )
-        if with_vllm_wvsplitk:
-            _VLLM_WVSPLITK_OP, _VLLM_WVSPLITK_METADATA = resolve_vllm_wvsplitk(
-                getattr(args, "vllm_wvsplitk_library", None)
-            )
-            meta = _VLLM_WVSPLITK_METADATA
-            logger.info(
-                "vLLM wvSplitK provenance: "
-                f"status={meta['status']} source={meta['source']} "
-                f"path={meta['path']} sha256={meta['sha256']} schema={meta['schema']} "
-                f"reason={meta['reason']}"
-            )
-        else:
-            _VLLM_WVSPLITK_OP = None
-            _VLLM_WVSPLITK_METADATA = None
+        _VLLM_WVSPLITK_OP = _try_vllm_wvsplitk() if with_vllm_wvsplitk else None
         gfx = self.get_gfx()
         cu_num = self.get_cu_num()
         # Direct HIP launches and several eager providers are not reliably
@@ -1535,7 +1204,7 @@ class GemmA16W16Tuner(GemmCommonTuner):
                 task.extend(self._get_flydsl_tasks(*common))
             if "all" in libtype or "flydsl_decode" in libtype:
                 task.extend(self._get_flydsl_decode_tasks(*common))
-            if with_vllm_wvsplitk and ("all" in libtype or "vllm_wvsplitk" in libtype):
+            if with_vllm_wvsplitk:
                 task.extend(self._get_vllm_wvsplitk_tasks(*common))
             if "all" in libtype or "skinny" in libtype:
                 task.extend(self._get_skinny_tasks(*common))
@@ -1543,9 +1212,7 @@ class GemmA16W16Tuner(GemmCommonTuner):
                 task.extend(self._get_torch_tasks(*common))
             if "all" in libtype or "triton" in libtype:
                 task.extend(self._get_triton_tasks(*common))
-            if (
-                "all" in libtype or "opus" in libtype
-            ) and self.candidate_policy == "deep":
+            if "all" in libtype or "opus" in libtype:
                 opus_tasks = self._get_opus_tasks(*common)
                 if opus_tasks and _opus_ensure_kids_compiled is not None:
                     opus_kids = {t[0][1] for t in opus_tasks}
@@ -1578,21 +1245,9 @@ class GemmA16W16Tuner(GemmCommonTuner):
         return ret + hipblaslt_rets
 
     def post_process(self, rets, args, topk=-1, fast_mode=False):
-        """Write comparison rows to profiles but never promote them to tuned CSV."""
-        rets = list(rets)
-        promotable = [result for result in rets if result[0][4] != "vllm_wvsplitk"]
-        profile_file = args.profile_file
-        if profile_file:
-            profiledf = self.result_to_df(sorted(rets, key=lambda result: result[0]))
-            if os.path.exists(profile_file):
-                old_df = pd.read_csv(profile_file)
-                profiledf = pd.concat([old_df, profiledf], ignore_index=True)
-            profiledf.to_csv(profile_file, index=False, na_rep="Null")
-            args.profile_file = ""
-        try:
-            return super().post_process(promotable, args, topk, fast_mode)
-        finally:
-            args.profile_file = profile_file
+        # Comparison-only vLLM rows must not win the tuned CSV.
+        rets = [result for result in rets if result[0][4] != "vllm_wvsplitk"]
+        return super().post_process(rets, args, topk, fast_mode)
 
     def result_to_df(self, results):
         resultdf = pd.DataFrame(columns=self.columns)

@@ -187,37 +187,3 @@ def test_block_mfma_persistent_n_multiple_turns_and_partial_group() -> None:
         ),
         with_bias=True,
     )
-
-
-def test_block_mfma_graph_replay_on_non_default_stream() -> None:
-    m, n, k = 3, 65, 257
-    config = _block_config(ActivationSource.GLOBAL, columns_per_wave=2)
-    a, b = _inputs(m, n, k)
-    output = _output(m, n)
-    reference = _reference(a, b)
-    side = torch.cuda.Stream()
-    side.wait_stream(torch.cuda.current_stream())
-
-    # Compile and warm the exact configured launch before graph capture.
-    gemm_decode_bf16(a, b, output, config, stream=side)
-    side.synchronize()
-
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph, stream=side):
-        gemm_decode_bf16(a, b, output, config, stream=side)
-    side.synchronize()
-
-    output.fill_(torch.nan)
-    side.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(side):
-        graph.replay()
-    side.synchronize()
-    _assert_output(output, reference)
-
-
-def test_output_must_not_overlap_bias() -> None:
-    m, n, k = 3, 64, 128
-    a, b = _inputs(m, n, k)
-    output = _output(m, n)
-    with pytest.raises(ValueError, match="overlap bias"):
-        gemm_decode_bf16(a, b, output, _wave_config(m, k), bias=output[0])

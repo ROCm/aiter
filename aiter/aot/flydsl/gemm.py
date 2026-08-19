@@ -96,20 +96,6 @@ _SHORT_DTYPE = {
     "B16": "bf16",
     "F16": "fp16",
 }
-_DECODE_REQUIRED_COLUMNS = {
-    "gfx",
-    "cu_num",
-    "M",
-    "N",
-    "K",
-    "bias",
-    "dtype",
-    "outdtype",
-    "scaleAB",
-    "bpreshuffle",
-    "libtype",
-    "kernelName",
-}
 
 
 def _parse_bool(value: str | None) -> bool:
@@ -156,21 +142,11 @@ def _parse_preshuffle_kernel_name(name: str) -> dict | None:
 
 
 def _parse_decode_row(row: dict[str, str | None], kernel_name: str) -> dict:
-    missing = sorted(
-        column
-        for column in _DECODE_REQUIRED_COLUMNS
-        if not (row.get(column) or "").strip()
-    )
-    if missing:
-        raise ValueError(
-            "FlyDSL decode CSV row is missing required values: " + ", ".join(missing)
-        )
-
     m = int(row["M"])
     n = int(row["N"])
     k = int(row["K"])
     cu_num = int(row["cu_num"])
-    csv_arch = row["gfx"].strip()
+    csv_arch = (row.get("gfx") or "").strip()
     name_arch, name_m, name_n, name_k, config, name_has_bias = (
         parse_gemm_decode_kernel_name(kernel_name)
     )
@@ -179,27 +155,20 @@ def _parse_decode_row(row: dict[str, str | None], kernel_name: str) -> dict:
             "FlyDSL decode kernel name shape does not match CSV row: "
             f"name={(name_m, name_n, name_k)}, row={(m, n, k)}"
         )
-
-    cu_arch = cu_num_to_arch(cu_num, default="")
-    if not cu_arch:
+    if csv_arch and csv_arch != name_arch:
         raise ValueError(
-            f"FlyDSL decode row has unrecognized cu_num metadata: {cu_num}"
+            f"FlyDSL decode architecture mismatch: name={name_arch}, csv={csv_arch}"
         )
-    if len({name_arch, csv_arch, cu_arch}) != 1:
-        raise ValueError(
-            "FlyDSL decode architecture metadata mismatch: "
-            f"name={name_arch}, csv={csv_arch}, cu_num={cu_num} ({cu_arch})"
-        )
-    has_bias = _parse_bool(row["bias"])
+    has_bias = _parse_bool(row.get("bias"))
     if name_has_bias != has_bias:
         raise ValueError("FlyDSL decode CSV bias metadata does not match kernel name")
-    if row["dtype"].strip() != "torch.bfloat16":
+    if (row.get("dtype") or "").strip() != "torch.bfloat16":
         raise ValueError("FlyDSL decode AOT requires BF16 input dtype")
-    if row["outdtype"].strip() != "torch.bfloat16":
+    if (row.get("outdtype") or "").strip() != "torch.bfloat16":
         raise ValueError("FlyDSL decode AOT requires BF16 output dtype")
-    if _parse_bool(row["scaleAB"]):
+    if _parse_bool(row.get("scaleAB")):
         raise ValueError("FlyDSL decode AOT does not support scaling")
-    if _parse_bool(row["bpreshuffle"]):
+    if _parse_bool(row.get("bpreshuffle")):
         raise ValueError("FlyDSL decode AOT does not support preshuffled weights")
 
     return {
@@ -209,7 +178,7 @@ def _parse_decode_row(row: dict[str, str | None], kernel_name: str) -> dict:
         "n": n,
         "k": k,
         "cu_num": cu_num,
-        "gfx": csv_arch,
+        "gfx": csv_arch or name_arch,
         "has_bias": has_bias,
     }
 
@@ -632,7 +601,6 @@ def job_arch(cu_num: int = 0, gfx: str = "") -> str:
 
 def _compile_decode_to_cache(
     *,
-    kernel_name: str,
     m: int,
     n: int,
     k: int,
@@ -642,7 +610,7 @@ def _compile_decode_to_cache(
     has_bias: bool = False,
     **kwargs,
 ) -> None:
-    del kwargs, kernel_name
+    del kwargs
     import torch
 
     device = torch.device("cpu")
@@ -664,7 +632,7 @@ def _compile_decode_to_cache(
         a,
         b,
         c,
-        bias if has_bias else None,
+        unused_tensor_arg(bias if has_bias else None, b),
         fx.Stream(0),
     )
 
@@ -682,20 +650,7 @@ def compile_one_config(
     """Compile one GEMM kernel configuration and save it to cache."""
     from torch._subclasses.fake_tensor import FakeTensorMode
 
-    requested_arch = kwargs.pop("arch", None)
-    aot_arch = requested_arch or job_arch(cu_num, gfx)
-    if kind == "decode":
-        cu_arch = cu_num_to_arch(cu_num, default="")
-        if not cu_arch:
-            raise ValueError(
-                f"FlyDSL {kind} AOT has unrecognized cu_num metadata: {cu_num}"
-            )
-        if aot_arch != cu_arch or (gfx and gfx != aot_arch):
-            raise ValueError(
-                f"FlyDSL {kind} AOT architecture metadata mismatch: "
-                f"arch={aot_arch}, gfx={gfx or '(unset)'}, "
-                f"cu_num={cu_num} ({cu_arch})"
-            )
+    aot_arch = job_arch(cu_num, gfx)
     shape_str = f"{kernel_name}  M={m} N={n} K={k}"
     result = {
         "kernel_name": kernel_name,
@@ -724,7 +679,6 @@ def compile_one_config(
                 _compile_ptpc_wmma_to_cache(m=m, n=n, k=k, **kwargs)
             elif kind == "decode":
                 _compile_decode_to_cache(
-                    kernel_name=kernel_name,
                     m=m,
                     n=n,
                     k=k,
