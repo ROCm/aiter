@@ -89,7 +89,7 @@ void launch_d128(at::Tensor& q,
     kargs.softmax_scale = softmax_scale;  // kernel applies scale * log2(e) to Q
 
     HipDeviceGuard guard(q.device().index());
-    const hipStream_t stream = at::hip::getCurrentHIPStream(q.device().index());
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
 
     using TraitsCausal    = opus_gqa_traits<32, 64, 128, 8, true>;
     using TraitsNonCausal = opus_gqa_traits<32, 64, 128, 8, false>;
@@ -147,7 +147,7 @@ void launch_d192_v128(at::Tensor& q,
     kargs.softmax_scale = softmax_scale;
 
     HipDeviceGuard guard(q.device().index());
-    const hipStream_t stream = at::hip::getCurrentHIPStream(q.device().index());
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
 
     int B, N, N_KV, H, H_KV;
     int num_q_blocks;   // for grid / merge decision
