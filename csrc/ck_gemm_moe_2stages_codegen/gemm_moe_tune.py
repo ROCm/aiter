@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import functools
+import math
 import os
 import sys
 import tempfile
@@ -22,6 +23,7 @@ from aiter import (
     dtypes,
 )
 from aiter.fused_moe import (
+    _flydsl_stage2_wrapper,
     _mxfp4_a4w4_stage1_fw,
     _mxfp4_a4w4_stage2_fw,
     asm_stage1,
@@ -6004,9 +6006,94 @@ class GroupedFmoeTuner(FmoeTuner):
         resultdf.to_csv(file, index=False)
 
 
+def _install_modern_gemm2_parser():
+    """Teach the MXMOE front-end about registered ``flydsl_moe2_*`` names.
+
+    ``parse_g2_kname_any`` only knows the native ``flydsl_mxmoe_g2_*`` family
+    and the ``flydsl_moe2_layout_*`` v2 family. The GEMM2 kernels the tuned
+    configs actually ship (``flydsl_moe2_afp4_wfp4_bf16_*`` /
+    ``flydsl_moe2_afp8_wfp4_bf16_*``) are only described by the kernel
+    registry, so route those through ``get_flydsl_kernel_params`` first.
+    Idempotent: re-installing over an installed shim is a no-op.
+    """
+
+    import aiter.ops.flydsl.mxfp4_kname as kname_module
+    from aiter import fused_moe
+    from aiter.ops.flydsl.moe_kernels import get_flydsl_kernel_params
+
+    original_v2 = kname_module.parse_flydsl_v2_gemm2_kernel
+    if getattr(original_v2, "_aiter_modern_gemm2", False):
+        parse_v2 = original_v2
+    else:
+
+        def parse_v2(name):
+            params = get_flydsl_kernel_params(name)
+            if params is not None and int(params.get("stage", 0)) == 2:
+                return {
+                    "a_dtype": str(params["a_dtype"]),
+                    "b_dtype": str(params["b_dtype"]),
+                    "out_dtype": str(params["out_dtype"]),
+                    "tile_m": int(params["tile_m"]),
+                    "tile_n": int(params["tile_n"]),
+                    "tile_k": int(params["tile_k"]),
+                    "epilog": str(params.get("mode", "atomic")),
+                    "persist": bool(params.get("persist", False)),
+                    "use_nt": int(params.get("b_nt", 0)) != 0,
+                    "sort_block_m": int(params.get("sort_block_m", 0)),
+                }
+            return original_v2(name)
+
+        parse_v2._aiter_modern_gemm2 = True
+        kname_module.parse_flydsl_v2_gemm2_kernel = parse_v2
+
+    original = kname_module.parse_g2_kname_any
+    if getattr(original, "_aiter_modern_gemm2", False):
+        parser = original
+    else:
+
+        def parser(name):
+            params = get_flydsl_kernel_params(name)
+            if params is not None and int(params.get("stage", 0)) == 2:
+                return {
+                    "v2": True,
+                    "BM": int(params["tile_m"]),
+                    "atomic": str(params.get("mode", "atomic")) == "atomic",
+                    "use_nt": int(params.get("b_nt", 0)) != 0,
+                    "mxfp4out": False,
+                    "cshuffle": False,
+                }
+            return original(name)
+
+        parser._aiter_modern_gemm2 = True
+        kname_module.parse_g2_kname_any = parser
+
+    fused_moe.parse_flydsl_v2_gemm2_kernel = parse_v2
+    fused_moe.parse_g2_kname_any = parser
+    # This module resolved both parsers at import time, so rebind its own
+    # globals as well.
+    globals()["parse_flydsl_v2_gemm2_kernel"] = parse_v2
+    globals()["parse_g2_kname_any"] = parser
+
+
 class Mxfp4FlydslTuner(FmoeTuner):
-    """Tune the FlyDSL mxfp4 a4w4 *port* (flydsl_mxmoe_g{1,2}_a4w4_*) as one coupled
-    unit.
+    """Tune new MXFP4 GEMM1 with mixed_moe_gemm_2stage GEMM2.
+
+    ``--tune-stage`` picks which half of the two-stage pipeline is swept:
+
+    ``both``
+        Joint tuning. Sweep the (GEMM1, GEMM2) product and rank by end-to-end
+        latency, so a pair that is only fast together still wins.
+    ``gemm1``
+        GEMM2 (and ``block_m``) are locked -- from the input CSV or from
+        ``--baseline-config`` -- and only GEMM1 is swept. Ranked by ``us1``.
+    ``gemm2``
+        GEMM1 (and ``block_m``) are locked the same way and only GEMM2 is
+        swept. Ranked by ``us2``.
+
+    ``auto`` (the default) is ``gemm1`` when the input already carries a
+    ``kernelName2`` for a replacement-pipeline shape, otherwise ``both``.
+    Both stage times come from the profiler kernel-time split, so a single-stage
+    sweep still reports the full ``us1``/``us2``/``us`` triple.
     """
 
     ARG_DEFAULTS: ClassVar[dict[str, Any]] = {
@@ -6015,20 +6102,214 @@ class Mxfp4FlydslTuner(FmoeTuner):
         "tune_file": f"{AITER_ROOT_DIR}/aiter/configs/model_configs/kimik2_fp4_tuned_fmoe.csv",
         "config_env_name": "AITER_CONFIG_FMOE",
     }
+    XCD_SWIZZLES: ClassVar[tuple[int, ...]] = (0, 2, 4)
+    A4W4_INTERLEAVE_BNS: ClassVar[tuple[int, ...]] = (128,)
+    STAGE1_KERNEL_MARKERS: ClassVar[tuple[str, ...]] = ("gemm1_a4w4_port_",)
+    STAGE2_KERNEL_MARKERS: ClassVar[tuple[str, ...]] = (
+        "mfma_moe2_",
+        "gemm2_a4w4_port_",
+    )
+    TUNE_STAGES: ClassVar[tuple[str, ...]] = ("auto", "both", "gemm1", "gemm2")
+    # Sweep the BN64 GEMM1 tile. Off by default: legal and correct, but slower
+    # on every shape measured so far -- see _g1_bns for the numbers.
+    G1_TRY_BN64: ClassVar[bool] = bool(int(os.environ.get("AITER_G1_TRY_BN64", "0")))
+    # Extra --timeout headroom for the first candidate of a shape, which pays the
+    # one-time MXFP4 JIT module build (240 aux instances) on a cold cache.
+    JIT_BUILD_GRACE_SECONDS: ClassVar[int] = 1800
+    # Columns a baseline CSV must supply to lock the stage that is not swept.
+    STAGE_LOCK_COLUMNS: ClassVar[dict[str, tuple[str, ...]]] = {
+        "gemm1": ("block_m", "kernelName2", "us2", "err2"),
+        "gemm2": ("block_m", "kernelName1", "us1", "err1"),
+    }
+
+    def _setup_specific_arguments(self):
+        super()._setup_specific_arguments()
+        self.parser.add_argument(
+            "--tune-stage",
+            choices=self.TUNE_STAGES,
+            default="auto",
+            help=(
+                "Which stage of the FlyDSL MoE 2-stage pipeline to sweep. "
+                "'both' tunes the (GEMM1, GEMM2) pair jointly; 'gemm1'/'gemm2' "
+                "lock the other stage and sweep one; 'auto' picks 'gemm1' when "
+                "the input already names a GEMM2 kernel."
+            ),
+        )
+        self.parser.add_argument(
+            "--baseline-config",
+            default="",
+            help=(
+                "Tuned CSV supplying the locked stage (and block_m) for a "
+                "shape-only input CSV under --tune-stage gemm1/gemm2."
+            ),
+        )
+
+    def run(self, args, fast_mode=False):
+        # get_untuned_gemm_list() takes no args, so the stage selection has to be
+        # visible on the instance before the input CSVs are read.
+        self._tune_stage = str(getattr(args, "tune_stage", "auto") or "auto")
+        self._baseline_config = str(getattr(args, "baseline_config", "") or "")
+        if self._baseline_config and self._tune_stage not in self.STAGE_LOCK_COLUMNS:
+            raise ValueError(
+                "--baseline-config requires --tune-stage gemm1 or --tune-stage gemm2"
+            )
+        return super().run(args, fast_mode)
+
+    # Columns --baseline-config adds to untunedf. They are not tuning keys, and
+    # TunerCommon.tune_summary indexes tunedf by untunedf's columns, so they have
+    # to be hidden from it.
+    BASELINE_COLUMNS: ClassVar[tuple[str, ...]] = (
+        "_baseline_kernelName1",
+        "_baseline_kernelName2",
+        "_baseline_us1",
+        "_baseline_us2",
+        "_baseline_err1",
+        "_baseline_err2",
+        "_source_index",
+    )
+
+    def tune_summary(self, tuning_status):
+        untuned = self.untunedf
+        if untuned is not None:
+            self.untunedf = untuned.drop(
+                columns=list(self.BASELINE_COLUMNS), errors="ignore"
+            )
+        try:
+            return super().tune_summary(tuning_status)
+        finally:
+            self.untunedf = untuned
+
+    def get_retune_gemm_list(self, args):
+        """Re-attach the locked-stage columns that retuning narrows away.
+
+        The retune path reduces ``untunedf`` to ``self.keys``, which would strip
+        the locked kernel a single-stage sweep needs. Merge them back by key.
+        """
+        merged = self.get_untuned_gemm_list(args.untune_file)
+        super().get_retune_gemm_list(args)
+        extra = [
+            column
+            for column in merged.columns
+            if column not in self.keys and column not in self.untunedf.columns
+        ]
+        if not extra:
+            return
+        self.untunedf = self.untunedf.merge(
+            merged[[*self.keys, *extra]].drop_duplicates(subset=self.keys),
+            on=self.keys,
+            how="left",
+        )
+
+    @classmethod
+    def _resolve_tune_stage(cls, row, args):
+        """Return the effective sweep stage for one shape."""
+        stage = str(getattr(args, "tune_stage", "auto") or "auto")
+        if stage not in cls.TUNE_STAGES:
+            raise ValueError(f"unknown --tune-stage {stage}")
+        if stage != "auto":
+            return stage
+        # Historical behaviour: an input row that already names a replacement
+        # GEMM2 is a GEMM1 sweep with that GEMM2 held fixed.
+        locked_g2 = str(row.get("kernelName2", "") or "").strip()
+        if locked_g2.startswith("flydsl_") and "block_m" in row:
+            return "gemm1"
+        return "both"
 
     @staticmethod
-    def _g1_kname(bm, use_nt, inline_quant):
-        # flydsl_mxmoe_g1_a4w4_<BM>x256x256[_f16in][_nt]; see mxfp4_kname.py.
-        name = f"flydsl_mxmoe_g1_a4w4_{bm}x256x256"
-        if inline_quant:
-            name += "_f16in"
-        if use_nt:
-            name += "_nt"
+    def _locked_kernel(row, column):
+        name = str(row.get(column, "") or "").strip()
+        if not name:
+            raise ValueError(
+                f"--tune-stage requires a locked {column}; supply it in the "
+                "input CSV or via --baseline-config"
+            )
         return name
 
     @staticmethod
+    def _g1_kname(
+        bm,
+        bn,
+        use_nt,
+        inline_quant,
+        xcd_swizzle=0,
+        *,
+        a_dtype="fp4",
+        out_dtype="fp4",
+        act="silu",
+        interleave=False,
+        enable_bias=False,
+        num_waves=4,
+        k_wave=1,
+    ):
+        # flydsl_mxmoe_g1_a4w4_<BM>x<BN>x256[_f16in][_nt]; see mxfp4_kname.py.
+        from aiter.ops.flydsl.mxfp4_kname import _make_mxfp4_g1_kname
+
+        return _make_mxfp4_g1_kname(
+            BM=bm,
+            BN=bn,
+            BK=256,
+            a_dtype=a_dtype,
+            out_dtype=out_dtype,
+            act=act,
+            inline_quant=inline_quant,
+            use_nt=use_nt,
+            interleave=interleave,
+            xcd_swizzle=xcd_swizzle,
+            enable_bias=enable_bias,
+            num_waves=num_waves,
+            k_wave=k_wave,
+        )
+
+    @classmethod
+    def _g1_bns(cls, row, bm, inline_quant, interleave):
+        """Legal ``BN`` values for one GEMM1 candidate.
+
+        BN64 is off by default. It is legal on the BM32 A4W4 non-inline
+        separated tile shape (and correct there -- validated on gfx950), but it
+        lost on every shape measured, monotonically with tile size:
+
+            minimax_m3 inter=384 tok=256   BN64 60.97  BN128 56.76  BN256 51.72
+            minimax_m3 inter=384 tok=512   BN64 61.10  BN128 59.04  BN256 52.75
+            minimax_m3 inter=768 tok=512   BN64 105.74 BN128 104.76 BN256 116.40
+
+        Note the first case runs ~120 workgroups on a 256-CU part and BN256
+        still wins by 15%, so this GEMM1 is not occupancy-limited at these
+        sizes -- bigger N tiles buy weight reuse, which dominates. The useful
+        crossover is between BN128 and BN256 (BN128 wins at inter=768), not
+        down at 64. Enable ``G1_TRY_BN64`` to sweep it on a shape where the
+        N-tile count really is the binding constraint.
+        """
+        bns = [128, 256]
+        n_out = 2 * int(row["inter_dim"])
+        if (
+            cls.G1_TRY_BN64
+            and bm == 32
+            and not inline_quant
+            and not interleave
+            and n_out % 64 == 0
+        ):
+            bns.insert(0, 64)
+        return tuple(bn for bn in bns if n_out % bn == 0)
+
+    @staticmethod
+    def _g1_k_waves(row, bm, inline_quant, interleave, bk=256):
+        """Legal ``k_wave`` values for one GEMM1 candidate.
+
+        k_wave splits the K loop across waves. Mirrors the kernel's guards in
+        mxfp4_gemm1_kernels._get_compiled_mxfp4_gemm1_port so the sweep does not
+        spend a launch on a combination that raises NotImplementedError.
+        """
+        if bm != 32 or inline_quant or interleave:
+            return (1,)
+        k_tiles = int(row["model_dim"]) // int(bk)
+        return tuple(
+            kw
+            for kw in (1, 2, 4)
+            if kw == 1 or (k_tiles % kw == 0 and k_tiles // kw >= 2 and 4 * kw <= 8)
+        )
+
+    @staticmethod
     def _g2_kname(bm, use_nt, epilog):
-        # flydsl_mxmoe_g2_a4w4_<BM>x256x256[_atomic[_nt] | _f4out | _cshuffle].
         name = f"flydsl_mxmoe_g2_a4w4_{bm}x256x256"
         if epilog == "atomic":
             name += "_atomic" + ("_nt" if use_nt else "")
@@ -6038,8 +6319,171 @@ class Mxfp4FlydslTuner(FmoeTuner):
             name += "_cshuffle"
         return name
 
+    @classmethod
+    def _a4w4_interleave_options(cls, bn):
+        return (False, True) if bn in cls.A4W4_INTERLEAVE_BNS else (False,)
+
+    @staticmethod
+    def _mixed_g2_knames(sort_block_m, g1_xcd_swizzle):
+        from aiter.ops.flydsl.moe_kernels import flydsl_kernel_name
+
+        g2_xcd_swizzle = g1_xcd_swizzle if g1_xcd_swizzle in (0, 4) else 0
+        names = []
+        for tile_n in (128, 256):
+            for mode, b_nt in (("reduce", 2), ("atomic", 0), ("atomic", 2)):
+                name = flydsl_kernel_name(
+                    2,
+                    "fp4",
+                    "fp4",
+                    "bf16",
+                    sort_block_m,
+                    tile_n,
+                    256,
+                    mode,
+                )
+                if b_nt:
+                    name += f"_bnt{b_nt}"
+                if g2_xcd_swizzle:
+                    name += f"_xcd{g2_xcd_swizzle}"
+                names.append(name)
+        return names
+
+    def get_untuned_gemm_list(self, untuned_gemm_file):
+        """Merge path-separated shape CSVs and discard pre-existing kernel choices."""
+        baseline_path = str(getattr(self, "_baseline_config", "") or "")
+        if baseline_path:
+            return self._untuned_from_baseline(untuned_gemm_file, baseline_path)
+
+        paths = [path for path in str(untuned_gemm_file).split(os.pathsep) if path]
+        if not paths:
+            raise ValueError("at least one MXFP4 tuning input is required")
+
+        frames = []
+        for path in paths:
+            if not os.path.exists(path):
+                raise FileNotFoundError(f"MXFP4 tuning input does not exist: {path}")
+            frame = pd.read_csv(path)
+            if "gfx" not in frame.columns:
+                frame["gfx"] = self.get_gfx()
+            if "cu_num" not in frame.columns:
+                frame["cu_num"] = self.get_cu_num()
+            missing = [key for key in self.keys if key not in frame.columns]
+            if missing:
+                raise ValueError(f"{path} is missing tuning keys: {missing}")
+            keep_columns = list(self.keys)
+            has_mxfp4_activation = (
+                frame["q_dtype_a"]
+                .astype(str)
+                .str.contains("float4|float8", regex=True)
+                .any()
+            )
+            if has_mxfp4_activation:
+                locked_columns = ["block_m", "kernelName2", "run_1stage"]
+                if str(getattr(self, "_tune_stage", "auto")) == "gemm2":
+                    locked_columns.append("kernelName1")
+                missing_locked = [
+                    column for column in locked_columns if column not in frame.columns
+                ]
+                if missing_locked:
+                    raise ValueError(
+                        f"{path} is missing locked MXFP4 columns: {missing_locked}"
+                    )
+                if "_tag" in frame.columns:
+                    locked_columns.append("_tag")
+                keep_columns.extend(locked_columns)
+            frames.append(frame[keep_columns])
+
+        return (
+            pd.concat(frames, ignore_index=True)
+            .drop_duplicates(subset=self.keys, keep="first")
+            .reset_index(drop=True)
+        )
+
+    def _untuned_from_baseline(self, untuned_gemm_file, baseline_path):
+        """Take shapes from the input CSVs and the locked stage from a tuned CSV.
+
+        This is what lets a raw shape-only CSV drive a single-stage sweep: the
+        stage that is not being tuned (plus ``block_m``, and its measured time so
+        the reported ``us`` stays an end-to-end number) is read from a previous
+        tuning run instead of being re-searched.
+        """
+        stage = str(getattr(self, "_tune_stage", "auto"))
+        if stage not in self.STAGE_LOCK_COLUMNS:
+            raise ValueError(
+                "--baseline-config only applies to --tune-stage gemm1 or gemm2"
+            )
+
+        paths = [path for path in str(untuned_gemm_file).split(os.pathsep) if path]
+        if not paths:
+            raise ValueError("at least one MXFP4 tuning input is required")
+        frames = []
+        for path in paths:
+            if not os.path.exists(path):
+                raise FileNotFoundError(f"MXFP4 tuning input does not exist: {path}")
+            frame = pd.read_csv(path)
+            if "gfx" not in frame.columns:
+                frame["gfx"] = self.get_gfx()
+            if "cu_num" not in frame.columns:
+                frame["cu_num"] = self.get_cu_num()
+            missing = [key for key in self.keys if key not in frame.columns]
+            if missing:
+                raise ValueError(f"{path} is missing tuning keys: {missing}")
+            frames.append(frame[list(self.keys)])
+        shapes = (
+            pd.concat(frames, ignore_index=True)
+            .drop_duplicates(subset=self.keys, keep="first")
+            .reset_index(drop=True)
+        )
+
+        baseline = pd.read_csv(baseline_path)
+        if "gfx" not in baseline.columns:
+            baseline["gfx"] = self.get_gfx()
+        if "cu_num" not in baseline.columns:
+            baseline["cu_num"] = self.get_cu_num()
+        lock_columns = [*self.STAGE_LOCK_COLUMNS[stage], "run_1stage"]
+        missing = [
+            column
+            for column in [*self.keys, *lock_columns]
+            if column not in baseline.columns
+        ]
+        if missing:
+            raise ValueError(f"{baseline_path} is missing baseline columns: {missing}")
+        locked_kernel = "kernelName2" if stage == "gemm1" else "kernelName1"
+        baseline = (
+            baseline[list(self.keys) + lock_columns]
+            .drop_duplicates(subset=self.keys, keep="first")
+            .rename(
+                columns={
+                    column: f"_baseline_{column}"
+                    for column in self.STAGE_LOCK_COLUMNS[stage]
+                    if column != "block_m"
+                }
+            )
+        )
+        merged = shapes.merge(baseline, on=self.keys, how="left", validate="one_to_one")
+        baseline_kernel = f"_baseline_{locked_kernel}"
+        uncovered = merged[
+            merged["block_m"].isna()
+            | merged[baseline_kernel].isna()
+            | (merged[baseline_kernel].astype(str).str.strip() == "")
+        ]
+        if not uncovered.empty:
+            sample = uncovered.iloc[0]
+            raise ValueError(
+                "baseline config does not cover input shape "
+                f"token={sample['token']} inter_dim={sample['inter_dim']}"
+            )
+        # The locked kernel is also exposed under its plain name so candidate
+        # generation and _port_e2e see it exactly as they would from a tuned CSV.
+        merged[locked_kernel] = merged[baseline_kernel]
+        merged["_source_index"] = range(len(merged))
+        return merged
+
     def _candidate_row(self, row, bm, kn1, kn2):
         cand = {k: row[k] for k in self.keys}
+        for column in ("_source_index", "_tag", "_source_hash"):
+            if column in row:
+                cand[column] = row[column]
         cand.update(
             {
                 "block_m": bm,
@@ -6060,42 +6504,328 @@ class Mxfp4FlydslTuner(FmoeTuner):
         )
         return cand
 
-    def _candidate_rows(self, row):
-        from aiter.ops.flydsl.mxfp4_gemm1_kernels import _SUPPORTED as G1
-        from aiter.ops.flydsl.mxfp4_gemm2_kernels import _SUPPORTED as G2
+    @staticmethod
+    def _row_activation_name(row):
+        act_type = str(row["act_type"])
+        if act_type.endswith("Situv2"):
+            return "situv2"
+        if act_type.endswith("Swiglu"):
+            return "swiglu"
+        return "silu"
 
-        g2_bms = {v[0] for v in G2}
-        cands = []
-        for bm in sorted({v[0] for v in G1}):
-            for _, n1, iq1 in sorted(v for v in G1 if v[0] == bm):
-                kn1 = self._g1_kname(bm, n1, iq1)
-                # (A) native mxmoe g2 candidates (flydsl_mxmoe_g2_a4w4_*).
-                if bm in g2_bms:
-                    for _, n2, ep in sorted(v for v in G2 if v[0] == bm):
-                        cands.append(
-                            self._candidate_row(
-                                row, bm, kn1, self._g2_kname(bm, n2, ep)
-                            )
-                        )
-                # (B) path B: flydsl_moe2_layout g2 candidates coupled with this
-                # mxmoe g1. Only the native SBM==tile_m==bm variants (verified
-                # correct for BM in {16,32,64,128} x {atomic,reduce}); re-tiling
-                # (tile_m<bm) is not enabled. Selected e2e-fastest by _tune_one_shape.
-                for kn2v, kp in get_flydsl_stage2_v2_kernels(
-                    "fp4",
-                    "fp4",
-                    "bf16",
-                    bm,
-                    model_dim=int(row["model_dim"]),
-                    inter_dim=int(row["inter_dim"]),
-                ).items():
-                    if kp["tile_m"] != bm:
-                        continue
-                    cands.append(self._candidate_row(row, bm, kn1, kn2v))
-        return cands
+    def _a8w4_gemm1_knames(self, row, bm):
+        from aiter.ops.flydsl.mxfp4_gemm1_kernels import _SUPPORTED_BY_DTYPE
+
+        act = self._row_activation_name(row)
+        # A8W4 GEMM1 consumes an already-quantized fp8 activation, so the
+        # inline-quant variants have nothing to quantize and are skipped.
+        return [
+            self._g1_kname(
+                bm,
+                256,
+                use_nt,
+                False,
+                xcd_swizzle,
+                a_dtype="fp8",
+                out_dtype="fp8",
+                act=act,
+                interleave=True,
+            )
+            for _, use_nt, inline_quant in sorted(
+                variant for variant in _SUPPORTED_BY_DTYPE["fp8"] if variant[0] == bm
+            )
+            if not inline_quant
+            for xcd_swizzle in self.XCD_SWIZZLES
+        ]
+
+    def _a4w4_gemm1_knames(self, row, bm):
+        from aiter.ops.flydsl.mxfp4_gemm1_kernels import _SUPPORTED_BY_DTYPE
+
+        act = self._row_activation_name(row)
+        return [
+            self._g1_kname(
+                bm,
+                bn,
+                use_nt,
+                inline_quant,
+                xcd_swizzle,
+                act=act,
+                interleave=interleave,
+                enable_bias=act == "swiglu",
+                k_wave=k_wave,
+            )
+            for _, use_nt, inline_quant in sorted(
+                variant for variant in _SUPPORTED_BY_DTYPE["fp4"] if variant[0] == bm
+            )
+            for bn in self._g1_bns(row, bm, inline_quant, False)
+            for interleave in self._a4w4_interleave_options(bn)
+            for xcd_swizzle in self.XCD_SWIZZLES
+            for k_wave in self._g1_k_waves(row, bm, inline_quant, interleave)
+        ]
 
     @staticmethod
-    def _prepare_case(token, model_dim, inter_dim, expert, topk, dtype):
+    def _registry_gemm2_params(kn2):
+        """Params for a registry ``flydsl_moe2_a<dtype>_w*`` GEMM2, else None.
+
+        These names are launched by ``_flydsl_stage2_wrapper``. The native
+        ``flydsl_mxmoe_g2_*`` and layout ``flydsl_moe2_layout_*`` families go
+        through ``_mxfp4_a4w4_stage2_fw`` instead, so they are excluded here even
+        though the registry can describe them.
+        """
+        name = str(kn2)
+        if not name.startswith("flydsl_moe2_a"):
+            return None
+        from aiter.ops.flydsl.moe_kernels import get_flydsl_kernel_params
+
+        params = get_flydsl_kernel_params(name)
+        if params is None or int(params.get("stage", 0)) != 2:
+            return None
+        return params
+
+    def _gemm2_knames(self, row, bm, a_dtype):
+        """GEMM2 kernels that pair with a ``bm``-blocked GEMM1 emitting ``a_dtype``.
+
+        Only ``tile_m == bm`` variants are produced: re-tiling GEMM2 below the
+        sort block is not supported by this GEMM1's intermediate layout.
+        """
+        from aiter.ops.flydsl.moe_kernels import get_flydsl_stage2_kernels
+
+        model_dim = int(row["model_dim"])
+        inter_dim = int(row["inter_dim"])
+
+        # (A) Registry GEMM2 kernels (flydsl_moe2_a{fp4,fp8}_wfp4_bf16_*). This
+        # is the family the tuned configs ship, for both A4W4 and A8W4.
+        names = [
+            name
+            for name, params in get_flydsl_stage2_kernels(
+                a_dtype, "fp4", "bf16"
+            ).items()
+            if params["tile_m"] == bm
+            and model_dim % params["tile_n"] == 0
+            and inter_dim % params["tile_k"] == 0
+        ]
+        if a_dtype == "fp8":
+            return names
+
+        from aiter.ops.flydsl.mxfp4_gemm2_kernels import _SUPPORTED as G2
+
+        # (B) native mxmoe GEMM2 candidates.
+        names.extend(
+            self._g2_kname(bm, use_nt, epilog)
+            for _, use_nt, epilog in sorted(v for v in G2 if v[0] == bm)
+        )
+        # (C) layout-API GEMM2 candidates.
+        names.extend(
+            name
+            for name, params in get_flydsl_stage2_v2_kernels(
+                "fp4",
+                "fp4",
+                "bf16",
+                bm,
+                model_dim=model_dim,
+                inter_dim=inter_dim,
+            ).items()
+            if params["tile_m"] == bm
+        )
+        return names
+
+    def _failure_row(self, row):
+        """A result row for a shape whose candidate set could not even be built."""
+        try:
+            candidates = self._candidate_rows(row)
+        except Exception:  # noqa: BLE001 - the failure row must always be produced
+            candidates = []
+        if candidates:
+            return candidates[0]
+        return self._candidate_row(
+            row,
+            int(row.get("block_m", 0) or 0),
+            str(row.get("kernelName1", "") or ""),
+            str(row.get("kernelName2", "") or ""),
+        )
+
+    def _gemm2_candidate_rows(self, row):
+        """GEMM2-only sweep: hold the tuned GEMM1 fixed and vary GEMM2."""
+        kn1 = self._locked_kernel(row, "kernelName1")
+        if not kn1.startswith("flydsl_mxmoe_g1_a"):
+            raise ValueError(
+                f"--tune-stage gemm2 needs a replacement GEMM1 kernel, got {kn1}"
+            )
+        parsed = _parse_mxfp4_g1_kname(kn1)
+        bm = int(row.get("block_m", 0) or 0) or int(parsed["BM"])
+        if int(parsed["BM"]) != bm:
+            raise ValueError(
+                f"locked GEMM1 {kn1} has BM={parsed['BM']} but block_m={bm}"
+            )
+        # GEMM2's activation dtype is whatever GEMM1 wrote out.
+        return [
+            self._candidate_row(row, bm, kn1, kn2)
+            for kn2 in self._gemm2_knames(row, bm, str(parsed["out_dtype"]))
+        ]
+
+    def _candidate_rows(self, row, stage="auto"):
+        from aiter.ops.flydsl.mxfp4_gemm1_kernels import _SUPPORTED as G1
+
+        if stage == "gemm2":
+            return self._gemm2_candidate_rows(row)
+
+        cands = []
+        is_a8w4 = "float8" in str(row["q_dtype_a"])
+        is_a4w4 = "float4" in str(row["q_dtype_a"]) and "float4" in str(
+            row["q_dtype_w"]
+        )
+        locked_g2 = str(row.get("kernelName2", ""))
+        if (is_a8w4 or is_a4w4) and locked_g2 and not locked_g2.startswith("flydsl_"):
+            return []
+        sweep_g2 = stage == "both"
+        if is_a8w4:
+            bm = int(row["block_m"])
+            g2_names = self._gemm2_knames(row, bm, "fp8") if sweep_g2 else [locked_g2]
+            return [
+                self._candidate_row(row, bm, kn1, kn2)
+                for kn1 in self._a8w4_gemm1_knames(row, bm)
+                for kn2 in g2_names
+            ]
+        if is_a4w4 and not sweep_g2 and "block_m" in row and "kernelName2" in row:
+            if (
+                int(row.get("run_1stage", 0) or 0) != 0
+                or not str(row["kernelName2"]).strip()
+            ):
+                return []
+            bm = int(row["block_m"])
+            return [
+                self._candidate_row(row, bm, kn1, locked_g2)
+                for kn1 in self._a4w4_gemm1_knames(row, bm)
+            ]
+
+        for bm in sorted({v[0] for v in G1}):
+            if int(row["token"]) == 1 and bm == 16:
+                continue
+            g2_names = self._gemm2_knames(row, bm, "fp4")
+            for _, n1, iq1 in sorted(v for v in G1 if v[0] == bm):
+                for bn in (128, 256):
+                    for interleave in self._a4w4_interleave_options(bn):
+                        for xcd_swizzle in self.XCD_SWIZZLES:
+                            kn1 = self._g1_kname(
+                                bm,
+                                bn,
+                                n1,
+                                iq1,
+                                xcd_swizzle,
+                                interleave=interleave,
+                            )
+                            cands.extend(
+                                self._candidate_row(row, bm, kn1, kn2)
+                                for kn2 in g2_names
+                            )
+        return cands
+
+    @classmethod
+    def _extract_stage_kernel_times(cls, kernel_times, require=("GEMM1", "GEMM2")):
+        """Split a profiler kernel-time map into (GEMM1, GEMM2) microseconds.
+
+        ``require`` names the stages that must have been observed. A single-stage
+        sweep only insists on the stage it ranks by, so an unrecognised partner
+        kernel degrades to ``us==0`` instead of discarding the candidate.
+        """
+
+        def stage_time(markers):
+            return sum(
+                float(us)
+                for name, us in kernel_times.items()
+                if any(marker in str(name) for marker in markers)
+            )
+
+        us1 = stage_time(cls.STAGE1_KERNEL_MARKERS)
+        us2 = stage_time(cls.STAGE2_KERNEL_MARKERS)
+        missing = []
+        if us1 <= 0 and "GEMM1" in require:
+            missing.append("GEMM1")
+        if us2 <= 0 and "GEMM2" in require:
+            missing.append("GEMM2")
+        if missing:
+            available = ", ".join(sorted(str(name) for name in kernel_times))
+            raise RuntimeError(
+                f"profiler did not report {'/'.join(missing)} target kernel time; "
+                f"available kernels: {available}"
+            )
+        return round(us1, 4), round(us2, 4)
+
+    @staticmethod
+    def _baseline_metric(row, column, default):
+        """Read a ``us``/``err`` metric carried over from --baseline-config."""
+        if column not in row:
+            return default
+        text = str(row[column]).strip()
+        if not text:
+            return default
+        try:
+            return float(text[:-1]) / 100.0 if text.endswith("%") else float(text)
+        except ValueError:
+            return default
+
+    @staticmethod
+    def _format_err(value):
+        """Render an error the way every other fmoe tuner writes err1/err2.
+
+        The rest of the CSV stores these as ``f"{x:.1%}"`` strings. Writing a
+        bare float here produced rows that looked like a different quantity and
+        could not be eyeballed against their neighbours.
+        """
+        return f"{float(value):.1%}"
+
+    def _candidate_errors(self, row, err, stage):
+        """Attribute the measured error to the stage that actually varied.
+
+        ``err`` is one end-to-end cosine diff over the final bf16 output, so on a
+        joint sweep it is the only number available and both columns carry it.
+        On a single-stage sweep the locked stage did not change, so its column
+        keeps whatever --baseline-config recorded for it rather than being
+        overwritten with an e2e figure that says nothing about that stage.
+        """
+        measured = self._format_err(err)
+        errors = {"err1": measured, "err2": measured}
+        if stage == "gemm1":
+            baseline = self._baseline_metric(row, "_baseline_err2", None)
+            if baseline is not None:
+                errors["err2"] = self._format_err(baseline)
+        elif stage == "gemm2":
+            baseline = self._baseline_metric(row, "_baseline_err1", None)
+            if baseline is not None:
+                errors["err1"] = self._format_err(baseline)
+        return errors
+
+    def _calculate_candidate_performance(self, row, candidate, us):
+        perf_key = []
+        for key in self.keys:
+            if key == "dtype":
+                perf_key.append(dtypes.bf16)
+            elif key in ("q_dtype_a", "q_dtype_w"):
+                perf_key.append(eval(str(row[key])))
+            else:
+                perf_key.append(row[key])
+        return self.calculate(
+            (
+                tuple(perf_key),
+                "",
+                candidate["kernelName1"],
+                candidate["block_m"],
+                us,
+                candidate["err1"],
+            )
+        )
+
+    @staticmethod
+    def _prepare_case(
+        token,
+        model_dim,
+        inter_dim,
+        expert,
+        topk,
+        dtype,
+        q_dtype_a=dtypes.fp4x2,
+        activation=ActivationType.Silu,
+    ):
         data = FmoeTuner.generate_data(
             token,
             model_dim,
@@ -6103,22 +6833,50 @@ class Mxfp4FlydslTuner(FmoeTuner):
             expert,
             topk,
             dtype,
-            dtypes.fp4x2,
+            q_dtype_a,
             dtypes.fp4x2,
             QuantType.per_1x32,
             True,
             16,
             device="cuda",
         )
-        # True a4w4 runs the SEPARATED gate/up layout (gemm1 interleave=False),
-        # so prepare weights/scales with is_guinterleave=False. The interleaved
-        # a16w4/a8w4 layout (is_guinterleave=True) fed to the separated port
-        # produces garbage. w2 (down-proj, no gate/up) is layout-invariant.
+        if activation == ActivationType.Swiglu:
+            data["bias1"] = torch.clamp(
+                torch.randn((expert, inter_dim * 2), dtype=dtypes.fp32, device="cuda"),
+                -1.0,
+                1.0,
+            )
+            data["bias2"] = torch.clamp(
+                torch.randn((expert, model_dim), dtype=dtypes.fp32, device="cuda"),
+                -1.0,
+                1.0,
+            )
+        else:
+            data["bias1"] = None
+            data["bias2"] = None
+        if q_dtype_a == dtypes.fp8:
+            data["w1_a16"] = shuffle_weight_a16w4(data["w1_qt"], 16, True)
+            data["w1s_a16"] = shuffle_scale_a16w4(data["w1_scale"], expert, True)
+            data["w2_mixed"] = shuffle_weight_a16w4(data["w2_qt"], 16, False)
+            data["w2s_mixed"] = shuffle_scale_a16w4(data["w2_scale"], expert, False)
+            data["w2_a16"] = data["w2_mixed"]
+            data["w2s_a16"] = data["w2s_mixed"]
+            return data
+
+        # Prepare both gate/up layouts. The candidate's ``interleave`` flag
+        # selects the matching pair at launch time. w2 has no gate/up mode and
+        # is layout-invariant.
         data["w1_a16"] = shuffle_weight(
             data["w1_qt"], (16, 16), is_guinterleave=False, gate_up=True
         )
         data["w1s_a16"] = shuffle_scale(
             data["w1_scale"], expert, is_guinterleave=False, gate_up=True
+        )
+        data["w1_a16_interleaved"] = shuffle_weight(
+            data["w1_qt"], (16, 16), is_guinterleave=True, gate_up=True
+        )
+        data["w1s_a16_interleaved"] = shuffle_scale(
+            data["w1_scale"], expert, is_guinterleave=True, gate_up=True
         )
         data["w2_a16"] = shuffle_weight(
             data["w2_qt"], (16, 16), is_guinterleave=False, gate_up=False
@@ -6126,16 +6884,104 @@ class Mxfp4FlydslTuner(FmoeTuner):
         data["w2s_a16"] = shuffle_scale(
             data["w2_scale"], expert, is_guinterleave=False, gate_up=False
         )
+        data["w2_scale_ck"] = fp4_utils.e8m0_shuffle(data["w2_scale"])
+        data["w2_mixed"] = shuffle_weight_a16w4(data["w2_qt"], 16, False)
+        data["w2s_mixed"] = shuffle_scale_a16w4(data["w2_scale"], expert, False)
         return data
 
     @staticmethod
-    def _port_e2e(data, kn1, kn2, topk, ne, h, dtype):
-        # kn2 may name either gemm2 family (path B or native mxmoe).
-        _g2 = parse_g2_kname_any(kn2)
-        BM = _g2["BM"]
-        atomic = _g2["atomic"]
-        BM1 = _parse_mxfp4_g1_kname(kn1)["BM"]
+    def _a4w4_stage1_inputs(data, interleave):
+        if interleave:
+            return data["w1_a16_interleaved"], data["w1s_a16_interleaved"]
+        return data["w1_a16"], data["w1s_a16"]
+
+    @staticmethod
+    def _port_e2e(data, kn1, kn2, topk, ne, h, dtype, model_dim_pad=0):
+        # Candidates include registry-only GEMM2 names, which the stock
+        # parsers cannot read. Installing the shim is idempotent and cheap.
+        _install_modern_gemm2_parser()
+        p1 = _parse_mxfp4_g1_kname(kn1)
+        BM1 = p1["BM"]
         M = data["input"].shape[0]
+
+        if p1["a_dtype"] == "fp8":
+            from aiter.ops.flydsl.moe_kernels import get_flydsl_kernel_params
+
+            g2_params = get_flydsl_kernel_params(kn2)
+            if g2_params is None or g2_params.get("stage") != 2:
+                raise ValueError(f"invalid mixed FlyDSL GEMM2 kernel: {kn2}")
+            atomic = g2_params.get("mode", "atomic") != "reduce"
+            sti, sw, sei, nvi, moe_buf = moe_sorting(
+                data["topk_ids"],
+                data["topk_weights"],
+                ne,
+                h,
+                dtype,
+                block_size=BM1,
+                accumulate=atomic,
+                output_aux=False,
+            )
+            m_indices = (sti & 0xFFFFFF).contiguous()
+            moe_out = moe_buf if moe_buf.numel() else torch.empty((M, h), dtype=dtype)
+            stage1_input, a1_scale = aiter.fused_dynamic_mxfp8_quant_moe_sort(
+                data["input"],
+                sti,
+                nvi,
+                M,
+                topk,
+                BM1,
+            )
+            inter_q, inter_s = _mxfp4_a4w4_stage1_fw(
+                stage1_input,
+                data["w1_a16"],
+                data["w2_a16"],
+                sti,
+                sei,
+                nvi,
+                None,
+                topk,
+                block_m=BM1,
+                a1_scale=a1_scale,
+                w1_scale=data["w1s_a16"],
+                kernelName1=kn1,
+                m_indices=m_indices,
+                moe_buf=moe_buf,
+                interleave=p1["interleave"],
+                situ_beta=DEFAULT_SITUV2_BETA if p1["act"] == "situv2" else 1.0,
+                situ_linear_beta=(
+                    DEFAULT_SITUV2_LINEAR_BETA if p1["act"] == "situv2" else 1.0
+                ),
+            )
+            return _flydsl_stage2_wrapper(
+                inter_q,
+                data["w1_a16"],
+                data["w2_mixed"],
+                sti,
+                sei,
+                nvi,
+                moe_out,
+                topk,
+                kernelName=kn2,
+                w2_scale=data["w2s_mixed"],
+                a2_scale=inter_s,
+                sorted_weights=sw,
+                model_dim_pad=model_dim_pad,
+                # The replacement GEMM1 writes the sorted [max_sorted, inter_dim]
+                # intermediate, not the dense [token, topk, inter_dim] one.
+                intermediate_sorted=True,
+                logical_token_num=M,
+            )
+
+        # A4W4 pairs the replacement GEMM1 with the native MXMOE GEMM2, the
+        # layout-API v2 GEMM2, or a registry GEMM2. Only the first two go through
+        # _mxfp4_a4w4_stage2_fw; the registry family is launched by
+        # _flydsl_stage2_wrapper against the a16w4-shuffled w2, exactly as
+        # fused_moe dispatches it in production.
+        registry_g2 = Mxfp4FlydslTuner._registry_gemm2_params(kn2)
+        g2 = parse_g2_kname_any(kn2)
+        BM = g2["BM"]
+        atomic = g2["atomic"]
+        w1_a16, w1s_a16 = Mxfp4FlydslTuner._a4w4_stage1_inputs(data, p1["interleave"])
         sti, sw, sei, nvi, moe_buf, m_indices, reverse_sorted = moe_sorting(
             data["topk_ids"],
             data["topk_weights"],
@@ -6149,7 +6995,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
         moe_out = moe_buf if moe_buf.numel() else torch.empty((M, h), dtype=dtype)
         inter_q, inter_s = _mxfp4_a4w4_stage1_fw(
             data["input"],
-            data["w1_a16"],
+            w1_a16,
             data["w2_a16"],
             sti,
             sei,
@@ -6157,14 +7003,41 @@ class Mxfp4FlydslTuner(FmoeTuner):
             None,
             topk,
             block_m=BM1,
-            w1_scale=data["w1s_a16"],
+            w1_scale=w1s_a16,
             kernelName1=kn1,
             m_indices=m_indices,
             moe_buf=moe_buf,
+            interleave=p1["interleave"],
+            bias1=data["bias1"],
+            swiglu_limit=7.0,
+            situ_beta=DEFAULT_SITUV2_BETA if p1["act"] == "situv2" else 1.0,
+            situ_linear_beta=(
+                DEFAULT_SITUV2_LINEAR_BETA if p1["act"] == "situv2" else 1.0
+            ),
         )
+        if registry_g2 is not None:
+            return _flydsl_stage2_wrapper(
+                inter_q,
+                w1_a16,
+                data["w2_mixed"],
+                sti,
+                sei,
+                nvi,
+                moe_out,
+                topk,
+                kernelName=kn2,
+                w2_scale=data["w2s_mixed"],
+                a2_scale=inter_s,
+                sorted_weights=sw,
+                model_dim_pad=model_dim_pad,
+                # The replacement GEMM1 writes the sorted [max_sorted, inter_dim]
+                # intermediate, not the dense [token, topk, inter_dim] one.
+                intermediate_sorted=True,
+                logical_token_num=M,
+            )
         return _mxfp4_a4w4_stage2_fw(
             inter_q,
-            data["w1_a16"],
+            w1_a16,
             data["w2_a16"],
             sti,
             sei,
@@ -6189,6 +7062,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
             data["topk_ids"],
             data["a1_scale"],
             data["w1_scale"],
+            w1_bias=data["bias1"],
             dtype=dtype,
             activation=activation,
             quant_type=QuantType.per_1x32,
@@ -6203,63 +7077,109 @@ class Mxfp4FlydslTuner(FmoeTuner):
             data["topk_ids"],
             a2_scale=None,
             w2_scale=data["w2_scale"],
+            w2_bias=data["bias2"],
             dtype=dtype,
             quant_type=QuantType.per_1x32,
             doweight_stage1=False,
         )
 
-    def _run_candidate(self, row, candidate, args):
+    def _run_candidate(
+        self, row, candidate, args, data=None, ref=None, model_dim_pad=0, stage="both"
+    ):
         from aiter.test_common import run_perftest
 
         ne, h, e = int(row["expert"]), int(row["model_dim"]), int(row["inter_dim"])
         token, topk = int(row["token"]), int(row["topk"])
         dtype = dtypes.bf16
+        q_dtype_a = eval(str(row["q_dtype_a"]))
         kn1, kn2 = candidate["kernelName1"], candidate["kernelName2"]
-        activation = (
-            ActivationType.Swiglu
-            if str(row["act_type"]).endswith("Swiglu")
-            else ActivationType.Silu
+        if str(row["act_type"]).endswith("Situv2"):
+            activation = ActivationType.Situv2
+        elif str(row["act_type"]).endswith("Swiglu"):
+            activation = ActivationType.Swiglu
+        else:
+            activation = ActivationType.Silu
+        if data is None:
+            data = self._prepare_case(
+                token, h, e, ne, topk, dtype, q_dtype_a, activation
+            )
+        if ref is None:
+            ref = self._torch_ref(data, topk, dtype, activation)
+        out = self._port_e2e(data, kn1, kn2, topk, ne, h, dtype, model_dim_pad)
+        if model_dim_pad > 0:
+            valid_h = h - int(model_dim_pad)
+            ref_for_compare = ref[..., :valid_h]
+            out_for_compare = out[..., :valid_h]
+        else:
+            ref_for_compare = ref
+            out_for_compare = out
+        err = cosine_diff_compare(
+            ref_for_compare,
+            out_for_compare,
+            msg=f"port[{kn1}+{kn2}]",
         )
-        data = self._prepare_case(token, h, e, ne, topk, dtype)
-        out = self._port_e2e(data, kn1, kn2, topk, ne, h, dtype)
-        ref = self._torch_ref(data, topk, dtype, activation)
-        err = cosine_diff_compare(ref, out, msg=f"port[{kn1}+{kn2}]")
-        if err is None or float(err) > args.errRatio:
+        if err is None or not math.isfinite(float(err)) or float(err) > args.errRatio:
             raise RuntimeError(f"cosine err_ratio {err} > {args.errRatio}")
-        _, us = run_perftest(
-            lambda: self._port_e2e(data, kn1, kn2, topk, ne, h, dtype),
+        _, e2e_us, kernel_times = run_perftest(
+            lambda: self._port_e2e(data, kn1, kn2, topk, ne, h, dtype, model_dim_pad),
             num_warmup=int(args.warmup),
             num_iters=int(args.iters),
+            return_kernel_times=True,
         )
-        us = round(float(us), 4)
+        e2e_us = round(float(e2e_us), 4)
+        # A single-stage sweep only needs the stage it ranks by to be visible in
+        # the profiler; the locked partner may be a kernel this tuner does not
+        # recognise, and its cost is constant across the sweep either way.
+        require = {
+            "gemm1": ("GEMM1",),
+            "gemm2": ("GEMM2",),
+        }.get(stage, ("GEMM1", "GEMM2"))
+        us1, us2 = self._extract_stage_kernel_times(kernel_times, require)
+        # Fall back to the baseline's measurement for a locked stage the profiler
+        # could not attribute, so the reported ``us`` stays end-to-end.
+        if us1 <= 0:
+            us1 = self._baseline_metric(row, "_baseline_us1", us1)
+        if us2 <= 0:
+            us2 = self._baseline_metric(row, "_baseline_us2", us2)
+        us = round(us1 + us2, 4)
         candidate.update(
             {
-                "us1": us,
+                "us1": us1,
+                "us2": us2,
                 "us": us,
-                "err1": round(float(err), 6),
-                "err2": round(float(err), 6),
+                **self._candidate_errors(row, float(err), stage),
             }
         )
-        return us
+        candidate["tflops"], candidate["bw"] = self._calculate_candidate_performance(
+            row, candidate, us
+        )
+        return e2e_us
 
     def _tune_one_shape(self, row, args):
-        """Sweep all (g1, g2) candidates for one shape; return the best row dict.
+        """Sweep one shape and return its best row plus all successful profiles.
 
         --timeout (if > 0) bounds each candidate via SIGALRM. This runs on the
         main thread of whichever process owns the shape, so it works for both the
         sequential path and each per-shape worker in the --mp parallel path. A
         true GPU hang only aborts once control returns to Python; slow/looping
         candidates are caught reliably.
+
+        The first candidate also pays the one-time JIT build of the MXFP4
+        modules, which easily outlasts a kernel-sized timeout. Interrupting
+        ninja mid-build leaves the build directory unusable and every later
+        candidate then fails to import it, so the first candidate gets
+        JIT_BUILD_GRACE_SECONDS of extra headroom.
         """
         import signal
 
         timeout = int(getattr(args, "timeout", 0) or 0)
+        candidate_timeout = timeout
 
         class _CandidateTimeout(Exception):
             pass
 
         def _on_alarm(signum, frame):
-            raise _CandidateTimeout(f"exceeded {timeout}s timeout")
+            raise _CandidateTimeout(f"exceeded {candidate_timeout}s timeout")
 
         if timeout > 0:
             try:
@@ -6267,19 +7187,83 @@ class Mxfp4FlydslTuner(FmoeTuner):
             except ValueError:
                 timeout = 0  # not on the main thread; cannot arm SIGALRM
 
-        best, failures = None, []
-        for candidate in self._candidate_rows(row):
+        ne = int(row["expert"])
+        model_dim = int(row["model_dim"])
+        inter_dim = int(row["inter_dim"])
+        token = int(row["token"])
+        topk = int(row["topk"])
+        dtype = dtypes.bf16
+        if str(row["act_type"]).endswith("Situv2"):
+            activation = ActivationType.Situv2
+        elif str(row["act_type"]).endswith("Swiglu"):
+            activation = ActivationType.Swiglu
+        else:
+            activation = ActivationType.Silu
+        q_dtype_a = eval(str(row["q_dtype_a"]))
+        model_dim_pad = 192 if ne == 896 and model_dim == 3584 and topk == 16 else 0
+        seed = (
+            token * 1000003 + model_dim * 1009 + inter_dim * 101 + ne * 17 + topk
+        ) & 0x7FFFFFFF
+        torch.manual_seed(seed)
+        data = self._prepare_case(
+            token,
+            model_dim,
+            inter_dim,
+            ne,
+            topk,
+            dtype,
+            q_dtype_a,
+            activation,
+        )
+        ref = self._torch_ref(data, topk, dtype, activation)
+
+        stage = self._resolve_tune_stage(row, args)
+        candidates = self._candidate_rows(row, stage)
+        print(
+            f"[mxfp4-port] token={row['token']} inter={row['inter_dim']} "
+            f"stage={stage} candidates={len(candidates)}",
+            flush=True,
+        )
+
+        best, best_score, failures, profiles = None, None, [], []
+        for index, candidate in enumerate(candidates):
             if timeout > 0:
-                signal.alarm(timeout)
+                candidate_timeout = timeout + (
+                    self.JIT_BUILD_GRACE_SECONDS if index == 0 else 0
+                )
+                signal.alarm(candidate_timeout)
             try:
-                us = self._run_candidate(row, candidate, args)
+                e2e_us = self._run_candidate(
+                    row,
+                    candidate,
+                    args,
+                    data=data,
+                    ref=ref,
+                    model_dim_pad=model_dim_pad,
+                    stage=stage,
+                )
+                profile_row = candidate.copy()
+                profile_row["e2e_us"] = e2e_us
+                profiles.append(profile_row)
                 print(
                     f"[mxfp4-port] token={row['token']} inter={row['inter_dim']} "
-                    f"{candidate['kernelName1']} + {candidate['kernelName2']} us={us}",
+                    f"{candidate['kernelName1']} + {candidate['kernelName2']} "
+                    f"us1={candidate['us1']} us2={candidate['us2']} "
+                    f"kernel_us={candidate['us']} e2e_us={e2e_us}",
                     flush=True,
                 )
-                if best is None or us < float(best["us"]):
+                # A single-stage sweep ranks by that stage's kernel time: the
+                # locked stage is common to every candidate, so folding it into
+                # the score only adds run-to-run noise.
+                if stage == "gemm1":
+                    score = float(candidate["us1"])
+                elif stage == "gemm2":
+                    score = float(candidate["us2"])
+                else:
+                    score = e2e_us
+                if best is None or score < best_score:
                     best = candidate
+                    best_score = score
             except Exception as exc:  # noqa: BLE001
                 failures.append(
                     f"{candidate['kernelName1']}/{candidate['kernelName2']}: {exc}"
@@ -6289,7 +7273,14 @@ class Mxfp4FlydslTuner(FmoeTuner):
                 if timeout > 0:
                     signal.alarm(0)
         if best is None:
-            best = self._candidate_rows(row)[0]
+            if not candidates:
+                raise RuntimeError(
+                    f"no legal {stage} candidates for "
+                    f"{tuple(row[k] for k in self.keys)}"
+                )
+            best = candidates[0]
+            best["us1"] = self.INVALID_TIME
+            best["us2"] = self.INVALID_TIME
             best["us"] = self.INVALID_TIME
             best["kernelName1"] = ("FAILED: " + "; ".join(failures))[:240]
             print(
@@ -6297,11 +7288,14 @@ class Mxfp4FlydslTuner(FmoeTuner):
                 f"{tuple(row[k] for k in self.keys)}",
                 flush=True,
             )
-        return best
+        return best, profiles
 
     def tune(self, untunedf, tunedf, args):
         del tunedf
         rows = [row.to_dict() for _, row in untunedf.iterrows()]
+        self._profile_rows = []
+        if not rows:
+            return []
 
         mp_num = int(getattr(args, "mp", 1) or 1)
         try:
@@ -6311,31 +7305,49 @@ class Mxfp4FlydslTuner(FmoeTuner):
         mp_num = max(1, min(mp_num, ngpu, len(rows)))
 
         if mp_num <= 1:
-            return [self._tune_one_shape(row, args) for row in rows]
+            shape_results = [self._tune_one_shape(row, args) for row in rows]
+        else:
+            # One fresh process per shape (memory fully released between shapes),
+            # spread across mp_num GPUs. A shared queue hands out distinct GPU ids so
+            # the mp_num concurrent workers never collide on the same device.
+            import multiprocessing as _mp
 
-        # One fresh process per shape (memory fully released between shapes),
-        # spread across mp_num GPUs. A shared queue hands out distinct GPU ids so
-        # the mp_num concurrent workers never collide on the same device.
-        import multiprocessing as _mp
+            print(
+                f"[mxfp4-port] tuning {len(rows)} shapes across {mp_num} GPUs",
+                flush=True,
+            )
+            ctx = _mp.get_context("spawn")
+            mgr = ctx.Manager()
+            gpu_q = mgr.Queue()
+            for g in range(mp_num):
+                gpu_q.put(g)
+            payloads = [(self.keys, row, args, gpu_q) for row in rows]
+            with ctx.Pool(processes=mp_num, maxtasksperchild=1) as pool:
+                # chunksize=1 so each shape is its own task: with maxtasksperchild=1
+                # the worker is torn down after every shape (memory fully released,
+                # and one process never spans multiple GPUs via the shared queue).
+                shape_results = pool.map(
+                    _mxfp4_tune_shape_worker, payloads, chunksize=1
+                )
 
-        print(
-            f"[mxfp4-port] tuning {len(rows)} shapes across {mp_num} GPUs", flush=True
-        )
-        ctx = _mp.get_context("spawn")
-        mgr = ctx.Manager()
-        gpu_q = mgr.Queue()
-        for g in range(mp_num):
-            gpu_q.put(g)
-        payloads = [(self.keys, row, args, gpu_q) for row in rows]
-        with ctx.Pool(processes=mp_num, maxtasksperchild=1) as pool:
-            # chunksize=1 so each shape is its own task: with maxtasksperchild=1
-            # the worker is torn down after every shape (memory fully released,
-            # and one process never spans multiple GPUs via the shared queue).
-            results = pool.map(_mxfp4_tune_shape_worker, payloads, chunksize=1)
-        return results
+        bests = []
+        for best, profiles in shape_results:
+            bests.append(best)
+            self._profile_rows.extend(profiles)
+        return bests
 
     def post_process(self, results, args, topk=-1, fast_mode=False):
-        del args, topk, fast_mode
+        del topk, fast_mode
+        profile_file = getattr(args, "profile_file", "")
+        profile_rows = getattr(self, "_profile_rows", [])
+        if profile_file and profile_rows:
+            profile_columns = self.columns + ["e2e_us"]
+            profile_df = pd.DataFrame(profile_rows, columns=profile_columns)
+            if os.path.exists(profile_file):
+                old_profile = self.get_tuned_gemm_list(profile_file, profile_columns)
+                profile_df = pd.concat([old_profile, profile_df], ignore_index=True)
+            profile_df.to_csv(profile_file, index=False)
+        self._profile_rows = []
         return pd.DataFrame(results, columns=self.columns)
 
     def result_to_csv(self, results, file, concat=False):
@@ -6350,6 +7362,17 @@ class Mxfp4FlydslTuner(FmoeTuner):
         valid = results[
             (results["us"] != self.INVALID_TIME) & (results["us"] != self.INF_TIME)
         ]
+        bad_names = valid[
+            ~valid["kernelName1"].astype(str).str.startswith("flydsl_mxmoe_g1_a")
+        ]
+        if not bad_names.empty:
+            raise RuntimeError(
+                "MXFP4 tuner produced kernels outside the replacement pipeline: "
+                + ", ".join(
+                    f"{row.kernelName1}/{row.kernelName2}"
+                    for row in bad_names.itertuples()
+                )
+            )
         invalid = results[
             (results["us"] == self.INVALID_TIME) | (results["us"] == self.INF_TIME)
         ]
@@ -6380,50 +7403,59 @@ def _mxfp4_tune_shape_worker(payload):
         # the pool keeps going instead of aborting the whole run.
         best = Mxfp4FlydslTuner.__new__(Mxfp4FlydslTuner)
         best.keys = keys
-        cand = best._candidate_rows(row)[0]
+        cand = best._failure_row(row)
+        cand["us1"] = Mxfp4FlydslTuner.INVALID_TIME
+        cand["us2"] = Mxfp4FlydslTuner.INVALID_TIME
         cand["us"] = Mxfp4FlydslTuner.INVALID_TIME
         cand["kernelName1"] = (f"FAILED(GPU{gpu}): {exc}")[:240]
         print(f"[mxfp4-port] shape failed on GPU{gpu}: {exc}", flush=True)
-        return cand
+        return cand, []
     finally:
         gpu_q.put(gpu)
 
 
+# Shared by the __main__ entrypoint and by out-of-tree tuner front-ends
+# (e.g. tune_mxfp4_flydsl_openai.py) so the two never drift apart.
+FMOE_KEY_COLUMNS = [
+    "gfx",
+    "cu_num",
+    "token",
+    "model_dim",
+    "inter_dim",
+    "expert",
+    "topk",
+    "act_type",
+    "dtype",
+    "q_dtype_a",
+    "q_dtype_w",
+    "q_type",
+    "use_g1u1",
+    "doweight_stage1",
+]
+
+FMOE_RESULT_COLUMNS = [
+    "block_m",
+    "ksplit",
+    "us1",
+    "kernelName1",
+    "err1",
+    "us2",
+    "kernelName2",
+    "err2",
+    "us",
+    "run_1stage",
+    "xbf16",
+    # 1 if FLAT 1stage (manifest flat); else 0.
+    "flat",
+    "tflops",
+    "bw",
+]
+
+
 if __name__ == "__main__":
-    key = [
-        "gfx",
-        "cu_num",
-        "token",
-        "model_dim",
-        "inter_dim",
-        "expert",
-        "topk",
-        "act_type",
-        "dtype",
-        "q_dtype_a",
-        "q_dtype_w",
-        "q_type",
-        "use_g1u1",
-        "doweight_stage1",
-    ]
+    key = FMOE_KEY_COLUMNS
     grouped_key = key + ["gate_mode"]
-    resultList = [
-        "block_m",
-        "ksplit",
-        "us1",
-        "kernelName1",
-        "err1",
-        "us2",
-        "kernelName2",
-        "err2",
-        "us",
-        "run_1stage",
-        "xbf16",
-        # 1 if FLAT 1stage (manifest flat); else 0.
-        "flat",
-        "tflops",
-        "bw",
-    ]
+    resultList = FMOE_RESULT_COLUMNS
     grouped_result_list = [
         "max_m",
         "tile_m",
