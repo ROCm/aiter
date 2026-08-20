@@ -307,6 +307,70 @@ PRESET_SHAPES: list[tuple] = [
     ("kda_tp4",  24,  24,  32768, 16, 128, 128, 64, "gk", "bimodal"),  # fill64=2.53
     ("kda_tp4",  24,  24,  32768, 16, 128, 128, 64, "gk", "skew"),  # fill64=2.53
     ("kda_tp4",  24,  24,  32768, 16, 128, 128, 64, "gk", "skew_last"),  # fill64=2.53
+    # -- fusion decision-boundary sweep (ACTUAL-fill axis) ------------------
+    # The simplified fuse rule keys on the ACTUAL grid fill of the best fused
+    # instance (⌈V/BV_best⌉·N·H / CU), not fill64. Near the boundary the best
+    # instance is bv16, so fill ≈ 8·H·N/304; the empirical split sits around
+    # 0.32. These densify actual-fill(bv16) in [0.21, 0.53] in ~0.05 steps to
+    # localize the threshold: both gates, H decorrelated from N (incl. synthetic
+    # H=6/10/14/18/20 with Hg=H/2 or H), and skew/ragged at the key fills (the
+    # second-order term the fill axis can't capture -- the only high-fill losses
+    # were H=4 skew/ragged). ``gdn_bnd_g`` / ``kda_bnd_gk`` are synthetic tags for
+    # these probes (not real model configs).
+    ("gdn_bnd_g",  10,   5,   8192, 1, 128, 128, 64, "g", "equal"),  # fill16=0.263
+    ("gdn_bnd_g",  10,   5,   8192, 1, 128, 128, 64, "g", "skew"),  # fill16=0.263
+    ("gdn_bnd_g",  10,   5,  32768, 1, 128, 128, 64, "g", "equal"),  # fill16=0.263
+    ("gdn_bnd_g",  10,   5,  32768, 1, 128, 128, 64, "g", "skew"),  # fill16=0.263
+    ("gdn_bnd_g",  14,   7,   8192, 1, 128, 128, 64, "g", "equal"),  # fill16=0.368
+    ("gdn_bnd_g",  14,   7,   8192, 1, 128, 128, 64, "g", "skew"),  # fill16=0.368
+    ("gdn_bnd_g",  14,   7,  32768, 1, 128, 128, 64, "g", "equal"),  # fill16=0.368
+    ("gdn_bnd_g",  14,   7,  32768, 1, 128, 128, 64, "g", "skew"),  # fill16=0.368
+    ("gdn_bnd_g",  18,   9,   8192, 1, 128, 128, 64, "g", "equal"),  # fill16=0.474
+    ("gdn_bnd_g",  18,   9,   8192, 1, 128, 128, 64, "g", "skew"),  # fill16=0.474
+    ("gdn_bnd_g",  18,   9,  32768, 1, 128, 128, 64, "g", "equal"),  # fill16=0.474
+    ("gdn_bnd_g",  18,   9,  32768, 1, 128, 128, 64, "g", "skew"),  # fill16=0.474
+    ("gdn_bnd_g",  20,  10,   8192, 1, 128, 128, 64, "g", "equal"),  # fill16=0.526
+    ("gdn_bnd_g",  20,  10,  32768, 1, 128, 128, 64, "g", "equal"),  # fill16=0.526
+    ("gdn_bnd_g",   6,   3,   8192, 2, 128, 128, 64, "g", "equal"),  # fill16=0.316
+    ("gdn_bnd_g",   6,   3,  32768, 2, 128, 128, 64, "g", "equal"),  # fill16=0.316
+    ("gdn_bnd_g",  10,   5,   8192, 2, 128, 128, 64, "g", "equal"),  # fill16=0.526
+    ("gdn_bnd_g",  10,   5,  32768, 2, 128, 128, 64, "g", "equal"),  # fill16=0.526
+    ("kda_bnd_gk",  10,  10,   8192, 1, 128, 128, 64, "gk", "equal"),  # fill16=0.263
+    ("kda_bnd_gk",  10,  10,   8192, 1, 128, 128, 64, "gk", "skew"),  # fill16=0.263
+    ("kda_bnd_gk",  10,  10,  32768, 1, 128, 128, 64, "gk", "equal"),  # fill16=0.263
+    ("kda_bnd_gk",  10,  10,  32768, 1, 128, 128, 64, "gk", "skew"),  # fill16=0.263
+    ("kda_bnd_gk",  14,  14,   8192, 1, 128, 128, 64, "gk", "equal"),  # fill16=0.368
+    ("kda_bnd_gk",  14,  14,   8192, 1, 128, 128, 64, "gk", "skew"),  # fill16=0.368
+    ("kda_bnd_gk",  14,  14,  32768, 1, 128, 128, 64, "gk", "equal"),  # fill16=0.368
+    ("kda_bnd_gk",  14,  14,  32768, 1, 128, 128, 64, "gk", "skew"),  # fill16=0.368
+    ("kda_bnd_gk",  18,  18,   8192, 1, 128, 128, 64, "gk", "equal"),  # fill16=0.474
+    ("kda_bnd_gk",  18,  18,   8192, 1, 128, 128, 64, "gk", "skew"),  # fill16=0.474
+    ("kda_bnd_gk",  18,  18,  32768, 1, 128, 128, 64, "gk", "equal"),  # fill16=0.474
+    ("kda_bnd_gk",  18,  18,  32768, 1, 128, 128, 64, "gk", "skew"),  # fill16=0.474
+    ("kda_bnd_gk",  20,  20,   8192, 1, 128, 128, 64, "gk", "equal"),  # fill16=0.526
+    ("kda_bnd_gk",  20,  20,  32768, 1, 128, 128, 64, "gk", "equal"),  # fill16=0.526
+    ("kda_bnd_gk",   8,   8,   8192, 1, 128, 128, 64, "gk", "equal"),  # fill16=0.211
+    ("kda_bnd_gk",   8,   8,  32768, 1, 128, 128, 64, "gk", "equal"),  # fill16=0.211
+    ("kda_bnd_gk",  16,  16,   8192, 1, 128, 128, 64, "gk", "equal"),  # fill16=0.421
+    ("kda_bnd_gk",  16,  16,  32768, 1, 128, 128, 64, "gk", "equal"),  # fill16=0.421
+    ("kda_tp8",  12,  12,   8192, 1, 128, 128, 64, "gk", "skew"),  # fill16=0.316
+    ("kda_tp8",  12,  12,   8192, 1, 128, 128, 64, "gk", "ragged"),  # fill16=0.316
+    ("kda_tp8",  12,  12,  32768, 1, 128, 128, 64, "gk", "skew"),  # fill16=0.316
+    ("kda_tp8",  12,  12,  32768, 1, 128, 128, 64, "gk", "ragged"),  # fill16=0.316
+    ("gdn_h8_g",   8,   4,   8192, 1, 128, 128, 64, "g", "skew"),  # fill16=0.211
+    ("gdn_h8_g",   8,   4,   8192, 1, 128, 128, 64, "g", "ragged"),  # fill16=0.211
+    ("gdn_h8_g",   8,   4,  32768, 1, 128, 128, 64, "g", "skew"),  # fill16=0.211
+    ("gdn_h8_g",   8,   4,  32768, 1, 128, 128, 64, "g", "ragged"),  # fill16=0.211
+    ("gdn_h16_g",  16,  16,   8192, 1, 128, 128, 64, "g", "skew"),  # fill16=0.421
+    ("gdn_h16_g",  16,  16,   8192, 1, 128, 128, 64, "g", "ragged"),  # fill16=0.421
+    ("gdn_h16_g",  16,  16,  32768, 1, 128, 128, 64, "g", "skew"),  # fill16=0.421
+    ("gdn_h16_g",  16,  16,  32768, 1, 128, 128, 64, "g", "ragged"),  # fill16=0.421
+    ("gdn_q3n_tp8",   4,   2,   8192, 3, 128, 128, 64, "g", "equal"),  # fill16=0.316
+    ("gdn_q3n_tp8",   4,   2,  32768, 3, 128, 128, 64, "g", "equal"),  # fill16=0.316
+    ("gdn_q3n_tp8",   4,   2,   8192, 4, 128, 128, 64, "g", "equal"),  # fill16=0.421
+    ("gdn_q3n_tp8",   4,   2,   8192, 4, 128, 128, 64, "g", "skew"),  # fill16=0.421
+    ("gdn_q3n_tp8",   4,   2,  32768, 4, 128, 128, 64, "g", "equal"),  # fill16=0.421
+    ("gdn_q3n_tp8",   4,   2,  32768, 4, 128, 128, 64, "g", "skew"),  # fill16=0.421
 ]
 
 # The bench builds gates (``g``/``gk``) in the natural-log domain and the fp32
@@ -912,7 +976,9 @@ def _combined_dispatch_label_for_shape(shape, cu) -> str | None:
             _auto_variant,
         )
         n = (cu.shape[0] - 1) if cu is not None else 1
-        if should_use_fused_gfx942(H=H, N=n, V=V):
+        if should_use_fused_gfx942(
+            H=H, N=n, V=V, gate=gate, is_varlen=cu is not None
+        ):
             bv, num_waves = _fused_bv_for_shape(
                 H=H, Hg=Hg, V=V, T_flat=T_flat, N=n,
                 is_varlen=cu is not None, gate=gate, variant=None,
