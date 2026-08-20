@@ -37,8 +37,8 @@ _COMBINE_CHUNK_BYTES = 272
 # since a taller tile amortizes the per-iteration TDM wait and barrier over
 # more tokens. T=16/C=1 is the largest tile that fits the 64KB LDS budget
 # while keeping the warp count a power of two.
-_COMBINE_TOKENS_PER_BLOCK = 2
-_COMBINE_CHUNKS_PER_ITER = 4
+_COMBINE_TOKENS_PER_BLOCK = 16
+_COMBINE_CHUNKS_PER_ITER = 1
 
 # mori's C++ EpArgs offset stems -> this package's arena region names. All eight
 # are bound when a plan is built even though mori's dispatch dereferences only the

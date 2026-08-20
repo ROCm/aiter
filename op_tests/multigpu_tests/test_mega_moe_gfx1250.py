@@ -720,44 +720,54 @@ def _event_device_us(e):
 
 
 def _aggregate_prof_table(prof, dist_ctx, per_layer_denom=1.0, row_limit=200):
-    """Aggregate the torch.profiler per-kernel table ACROSS ranks (collective;
-    call on every rank). Each rank contributes {name: (self_device_us_total,
-    count)}; rank 0 returns a formatted table of the per-kernel self device time
-    AVERAGED over ranks. Also prints the TOTAL over ALL kernels and the implied
-    device time per layer (total / per_layer_denom, where per_layer_denom =
-    replays * n_layers) so it can be compared against the measured per_layer wall
-    -- if they match, the GPU has no idle bubble. Non-zero ranks return None."""
+    """Collect the torch.profiler per-kernel table ACROSS ranks (collective; call
+    on every rank). Each rank contributes {name: (self_device_us_total, count)};
+    rank 0 returns a table of each kernel's per-call self device time with ONE
+    COLUMN PER RANK plus the cross-rank mean, so a straggler (a throttled GPU, an
+    unbalanced expert distribution) shows up as a row that disagrees across
+    columns instead of being averaged away. `-` means the kernel never ran there.
+
+    Rows are ordered by total self device time (mean over ranks), so the kernels
+    that dominate the budget come first regardless of their per-call cost. Also
+    prints the TOTAL over ALL kernels and the implied device time per layer
+    (total / per_layer_denom, where per_layer_denom = replays * n_layers) so it
+    can be compared against the measured per_layer wall -- if they match, the GPU
+    has no idle bubble. Non-zero ranks return None."""
     local = {}
     for e in prof.key_averages():
         local[e.key] = (_event_device_us(e), int(e.count))
     per_rank = dist_ctx.gather_objects(local)
     if dist_ctx.rank != 0:
         return None
-    agg = {}  # name -> [self_us_sum, count_sum, nranks]
-    for d in per_rank:
-        for name, (self_us, count) in d.items():
-            a = agg.setdefault(name, [0.0, 0, 0])
-            a[0] += self_us
-            a[1] += count
-            a[2] += 1
+    world = len(per_rank)
     rows = []
     total_self = 0.0
-    for name, (self_sum, count_sum, nranks) in agg.items():
-        avg_self = self_sum / nranks
-        avg_count = count_sum / nranks
-        per_call = avg_self / avg_count if avg_count else 0.0
+    for name in {n for d in per_rank for n in d}:
+        present = [d[name] for d in per_rank if name in d]
+        avg_self = sum(s for s, _ in present) / len(present)
+        avg_count = sum(c for _, c in present) / len(present)
         total_self += avg_self
-        rows.append((avg_self, name, per_call, avg_count))
-    rows.sort(reverse=True)
+        per_call = [
+            (d[name][0] / d[name][1] if d.get(name) and d[name][1] else None)
+            for d in per_rank
+        ]
+        seen = [v for v in per_call if v is not None]
+        pc_avg = sum(seen) / len(seen) if seen else 0.0
+        rows.append((avg_self, name, per_call, pc_avg, avg_count))
+    rows.sort(key=lambda r: (-r[0], r[1]))
     dev_per_layer = total_self / per_layer_denom if per_layer_denom else 0.0
     lines = [
-        f"# per-kernel avg over {dist_ctx.world} ranks (self device time):",
-        f"{'Name':<58}{'avg_self(us)':>14}{'per_call(us)':>14}{'calls':>8}",
+        f"# per-call self device time (us) by rank, {world} ranks "
+        f"(rows sorted by total self time):",
+        f"{'Name':<52}"
+        + "".join(f"{f'rank{r}':>11}" for r in range(world))
+        + f"{'avg':>11}{'calls':>8}",
     ]
-    for avg_self, name, per_call, avg_count in rows[:row_limit]:
-        lines.append(
-            f"{name[:58]:<58}{avg_self:>14.1f}{per_call:>14.3f}{avg_count:>8.1f}"
+    for avg_self, name, per_call, pc_avg, avg_count in rows[:row_limit]:
+        cells = "".join(
+            f"{v:>11.3f}" if v is not None else f"{'-':>11}" for v in per_call
         )
+        lines.append(f"{name[:52]:<52}{cells}{pc_avg:>11.3f}{avg_count:>8.1f}")
     lines.append(
         f"# TOTAL self device time over ALL {len(rows)} kernels = {total_self:.1f} us "
         f"-> {dev_per_layer:.1f} us/layer (device-busy; compare to per_layer wall)"
