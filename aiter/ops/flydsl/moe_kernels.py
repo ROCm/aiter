@@ -10,11 +10,27 @@ import re
 import torch
 
 from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
+from aiter.ops.flydsl.moe_stage1_ready import Stage1ReadyPlan
 
 _KERNEL_PARAMS: dict[str, dict] = {}
 
 # HIP limits grid.y/grid.z to 65535.
 _HIP_MAX_GRID_DIM_Y = 65535
+
+
+@functools.cache
+def _compile_ready_mixed_moe_gemm1(**kwargs):
+    """Cache the private ready-aware Stage1 specialization.
+
+    The ordinary mixed-MoE facade deliberately exposes only the plain kernel.
+    Keeping this cache here also keeps the compiled HIP module alive across
+    launches, which is required while capturing a graph.
+    """
+    from .kernels.mixed_moe_gemm_2stage_common import (
+        compile_mixed_moe_gemm1_common,
+    )
+
+    return compile_mixed_moe_gemm1_common(**kwargs)
 
 
 def _get_dtypes():
@@ -540,6 +556,30 @@ def _register_all_configs():
         _KERNEL_PARAMS.update(get_flydsl_stage1_kernels_int4_bf16(out))
         _KERNEL_PARAMS.update(get_flydsl_stage2_kernels_int4_bf16(out))
 
+    # Fixed production specialization validated by the TP/DP AllGather +
+    # Stage1 pipeline.  It is selected only by the structured backend, not the
+    # generic tuner.  The 384-wide GUGU tile covers the full DSV4 per-rank
+    # intermediate dimension in one N tile.
+    _KERNEL_PARAMS[
+        "flydsl_moe1_afp8_wfp4_bf16_t64x384x256_tpag_v2"
+    ] = {
+        "stage": 1,
+        "a_dtype": "fp8",
+        "b_dtype": "fp4",
+        "out_dtype": "fp8",
+        "tile_m": 64,
+        "tile_n": 384,
+        "tile_k": 256,
+        "MPerBlock": 64,
+        "waves_per_eu": 2,
+        "persist_m": 1,
+        "k_batch": 1,
+        "b_nt": 0,
+        "gate_mode": "interleave",
+        "xcd_swizzle": 0,
+        "k_wave": 1,
+    }
+
 
 _register_all_configs()
 
@@ -602,7 +642,7 @@ def compile_flydsl_moe_stage1(
     if b_dtype in ("fp4", "fp8"):
         from .kernels.mixed_moe_gemm_2stage import GateMode, compile_mixed_moe_gemm1
 
-        return compile_mixed_moe_gemm1(
+        kwargs = dict(
             model_dim=model_dim,
             inter_dim=inter_dim,
             experts=experts,
@@ -631,6 +671,7 @@ def compile_flydsl_moe_stage1(
             k_wave=k_wave,
             v2_output_layout=v2_output_layout,
         )
+        return compile_mixed_moe_gemm1(**kwargs)
     elif a_dtype == "bf16" and b_dtype == "int4":
         # a16wi4: bf16 activations, int4 weights with groupwise scale
         from .kernels.moe_gemm_2stage import compile_moe_gemm1
@@ -806,16 +847,27 @@ def _s1_args_fp4(
     n_in,
     k_in,
     size_expert_ids_in,
+    work_tiles,
     dev,
     bias=None,
     stream=None,
     swiglu_limit=float("inf"),
     pass_swiglu_limit: bool = True,
+    source_ready=None,
+    tile_source_masks=None,
+    source_work_queue=None,
 ):
     empty_f32 = torch.empty(0, device=dev, dtype=torch.float32)
     _bias = bias if bias is not None else empty_f32
     if stream is None:
         stream = torch.cuda.current_stream()
+    _source_ready = sorted_ids if source_ready is None else source_ready
+    _tile_source_masks = (
+        sorted_expert_ids if tile_source_masks is None else tile_source_masks
+    )
+    _source_work_queue = (
+        sorted_expert_ids if source_work_queue is None else source_work_queue
+    )
     args = (
         ptr_arg(out),
         ptr_arg(a),
@@ -832,6 +884,10 @@ def _s1_args_fp4(
         n_in,
         k_in,
         size_expert_ids_in,
+        work_tiles,
+        ptr_arg(_source_ready),
+        ptr_arg(_tile_source_masks),
+        ptr_arg(_source_work_queue),
     )
     if pass_swiglu_limit:
         return args + (float(swiglu_limit), stream)
@@ -1398,6 +1454,7 @@ def _flydsl_moe_stage1_impl(
     swiglu_limit: float | None = None,
     k_wave: int = 1,
     v2_output_layout: bool = False,
+    ready_plan: Stage1ReadyPlan | None = None,
     _compile_kernel=compile_flydsl_moe_stage1,
     _build_mx_args=_s1_args_fp4,
 ):
@@ -1453,6 +1510,32 @@ def _flydsl_moe_stage1_impl(
     _v2_output_layout = _fuse_any_quant and not _is_splitk and v2_output_layout
 
     dev = a.device
+    if ready_plan is None:
+        source_ready = tile_source_masks = source_work_queue = None
+        source_ready_source_count = source_ready_chunks_per_source = 1
+        source_work_count = source_ready_queue_workers = 0
+    else:
+        source_ready = ready_plan.ready
+        tile_source_masks = ready_plan.tile_source_masks
+        source_work_queue = ready_plan.expert_cursor
+        source_ready_source_count = ready_plan.source_count
+        source_ready_chunks_per_source = ready_plan.chunks_per_source
+        source_work_count = tile_source_masks.numel()
+        source_ready_queue_workers = ready_plan.queue_workers
+        if a_dtype != "fp8" or b_dtype != "fp4":
+            raise ValueError("source-ready wait currently supports only A8W4 stage1")
+        if (
+            source_ready.device != dev
+            or tile_source_masks.device != dev
+            or source_work_queue.device != dev
+        ):
+            raise ValueError("source-ready tensors must be on the GEMM device")
+        if tile_source_masks.numel() < sorted_expert_ids.numel():
+            raise ValueError("tile_source_masks must contain one mask per GEMM tile")
+        if persist_m != 1 or k_batch != 1:
+            raise ValueError(
+                "ready queue requires persist_m=1 and k_batch=1"
+            )
     _is_a16w4 = a_dtype == "bf16" and b_dtype == "fp4"
     if _is_a16w4:
         # a16w4 (bf16 A x fp4 W): ported gemm1 -> bf16 sorted intermediate,
@@ -1501,6 +1584,10 @@ def _flydsl_moe_stage1_impl(
     # (bf16 x mxfp4) and a8w4 (fp8 x mxfp4); a4w4 is unaffected.
     if b_dtype == "fp4" and a_dtype in ("bf16", "fp8"):
         tile_n = resolve_flydsl_stage1_tile_n(inter_dim, tile_n)
+    if source_ready_queue_workers and source_work_queue.numel() < (
+        (inter_dim + tile_n - 1) // tile_n
+    ):
+        raise ValueError("source_work_queue needs one head per N tile")
     _splitk_fp4 = _is_splitk and _need_fp4
     _gui_sk = gate_up_interleave and _is_splitk
     _gui_sk_fused = _gui_sk and _fuse_any_quant
@@ -1607,6 +1694,7 @@ def _flydsl_moe_stage1_impl(
             _n_in,
             _k_in,
             _grid_y,
+            source_work_count or _grid_y,
             dev,
             bias=(
                 kernel_bias.view(-1)
@@ -1614,6 +1702,9 @@ def _flydsl_moe_stage1_impl(
                 else torch.empty(0, device=dev)
             ),
             swiglu_limit=_swiglu_limit_val,
+            source_ready=source_ready,
+            tile_source_masks=tile_source_masks,
+            source_work_queue=source_work_queue,
         )
     else:
         args = _s1_args_std(
@@ -1660,10 +1751,28 @@ def _flydsl_moe_stage1_impl(
         "xcd_swizzle": xcd_swizzle,
         "k_wave": k_wave,
     }
+    compiler = _compile_kernel
+    if ready_plan is not None:
+        if _compile_kernel is not compile_flydsl_moe_stage1:
+            raise ValueError("ready-aware Stage1 does not support an injected compiler")
+        from aiter.ops.flydsl.moe_common import GateMode
+
+        compiler = _compile_ready_mixed_moe_gemm1
+        queue_rounds = (
+            source_work_count + source_ready_queue_workers - 1
+        ) // source_ready_queue_workers
+        compile_kwargs.update(
+            gate_mode=GateMode(gate_mode),
+            source_ready_wait=True,
+            source_ready_source_count=source_ready_source_count,
+            source_ready_chunks_per_source=source_ready_chunks_per_source,
+            source_ready_queue_workers=source_ready_queue_workers,
+            source_ready_queue_rounds=queue_rounds,
+        )
     # The injected FHMoE compiler does not implement the v2 sorted-row layout.
     if _v2_output_layout:
         compile_kwargs["v2_output_layout"] = True
-    exe = _compile_kernel(**compile_kwargs)
+    exe = compiler(**compile_kwargs)
     _run_compiled(exe, args)
 
     num_sorted_rows = sorted_token_ids.shape[0]
@@ -1838,6 +1947,7 @@ def flydsl_moe_stage1(
     swiglu_limit: float | None = None,
     k_wave: int = 1,
     v2_output_layout: bool = False,
+    ready_plan: Stage1ReadyPlan | None = None,
 ):
     """Fused gate+up GEMM (MOE stage1).
 
@@ -1895,6 +2005,7 @@ def flydsl_moe_stage1(
         swiglu_limit=swiglu_limit,
         k_wave=k_wave,
         v2_output_layout=v2_output_layout,
+        ready_plan=ready_plan,
     )
 
 

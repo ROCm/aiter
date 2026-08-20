@@ -45,6 +45,10 @@ except ImportError:
         return False
 
 
+from aiter.ops.flydsl.moe_stage1_ready import (
+    PreparedStage1Input,
+    Stage1ReadyPlan,
+)
 from aiter.ops.flydsl.mxfp4_kname import (
     _is_mxfp4_kname,
     _parse_mxfp4_g1_kname,
@@ -680,6 +684,7 @@ def _fused_moe_impl(
     *,
     _q_dtype_a: torch.dtype | None = None,
     _metadata_transform: Callable | None = None,
+    _prepare_stage1: Callable | None = None,
     _stage1_extra_args: dict | None = None,
     _stage2_extra_args: dict | None = None,
 ) -> torch.Tensor:
@@ -760,7 +765,7 @@ def _fused_moe_impl(
         q_dtype_a = _q_dtype_a
 
     grouped_a8w4_out = None
-    if is_flydsl_available():
+    if _prepare_stage1 is None and is_flydsl_available():
         try:
             from aiter.ops.flydsl.grouped_moe_gfx1250 import (
                 grouped_gemm_gfx1250_a8w4,
@@ -941,7 +946,23 @@ def _fused_moe_impl(
             local_topk_ids = None
     _opus_a8w4.check_route_bucket_metadata(metadata, sorted_expert_ids, logger)
 
+    prepared_stage1 = None
+    if _prepare_stage1 is not None:
+        prepared_stage1 = _prepare_stage1(
+            metadata=metadata,
+            sorted_ids=sorted_ids,
+            sorted_weights=sorted_weights,
+            sorted_expert_ids=sorted_expert_ids,
+            num_valid_ids=num_valid_ids,
+        )
+        if not isinstance(prepared_stage1, PreparedStage1Input):
+            raise TypeError(
+                "_prepare_stage1 must return PreparedStage1Input"
+            )
+
     if metadata.run_1stage:
+        if prepared_stage1 is not None:
+            raise ValueError("prepared Stage1 input requires a two-stage MoE kernel")
         _stage1_call = functools.partial(
             metadata.stage1,
             hidden_states,
@@ -1008,6 +1029,7 @@ def _fused_moe_impl(
             m_indices=sort_m_indices,
             reverse_sorted=sort_reverse_sorted,
             _metadata_transform=_metadata_transform,
+            _prepared_stage1=prepared_stage1,
             _stage1_extra_args=_stage1_extra_args,
             _stage2_extra_args=_stage2_extra_args,
         )
@@ -1403,6 +1425,7 @@ def _flydsl_stage1_wrapper(
     model_dim_pad: int = 0,
     out_dtype: str | None = None,
     v2_output_layout: bool = False,
+    ready_plan: Stage1ReadyPlan | None = None,
     **_kwargs,
 ):
     inter_dim_pad, model_dim_pad = _get_padding_for_flydsl(
@@ -1440,6 +1463,7 @@ def _flydsl_stage1_wrapper(
         w1_scale=w1_scale,
         a1_scale=a1_scale,
         sorted_weights=sorted_weights,
+        persist_m=parsed.get("persist_m", 0) if ready_plan is not None else 0,
         use_async_copy=True,
         k_batch=parsed.get("k_batch", 1),
         waves_per_eu=parsed.get("waves_per_eu", 3),
@@ -1454,6 +1478,7 @@ def _flydsl_stage1_wrapper(
         swiglu_limit=swiglu_limit,
         k_wave=parsed.get("k_wave", 1),
         v2_output_layout=v2_output_layout,
+        ready_plan=ready_plan,
     )
 
 
@@ -2926,15 +2951,24 @@ def fused_moe_2stages(
     m_indices=None,
     reverse_sorted=None,
     _metadata_transform: Callable | None = None,
+    _prepared_stage1: PreparedStage1Input | None = None,
     _stage1_extra_args: dict | None = None,
     _stage2_extra_args: dict | None = None,
 ):
     quant_func = get_quant(quant_type)
     gate_mode = GateMode(gate_mode)
-    token_num, _ = hidden_states.shape
+    token_num = (
+        _prepared_stage1.values.shape[0]
+        if _prepared_stage1 is not None
+        else hidden_states.shape[0]
+    )
     E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
     dtype = moe_out.dtype
-    device = hidden_states.device
+    device = (
+        _prepared_stage1.values.device
+        if _prepared_stage1 is not None
+        else hidden_states.device
+    )
     _sort_moe_buf = moe_out
     if moe_out.numel() == 0:
         moe_out = torch.empty((token_num, model_dim), dtype=dtype, device=device)
@@ -2963,7 +2997,40 @@ def fused_moe_2stages(
     )
     if _metadata_transform is not None:
         metadata = _metadata_transform(metadata)
-    if not metadata.prequant:
+    stage1_sorted_ids = sorted_ids
+    if _prepared_stage1 is not None:
+        if a1_scale is not None:
+            raise ValueError(
+                "a1_scale must be carried by PreparedStage1Input when it is provided"
+            )
+        if _prepared_stage1.values.shape[-1] != model_dim:
+            raise ValueError(
+                "prepared Stage1 values hidden dimension does not match model_dim"
+            )
+        if moe_out.shape[0] != _prepared_stage1.values.shape[0]:
+            raise ValueError(
+                "prepared Stage1 row count must match the logical MoE output rows"
+            )
+        if _prepared_stage1.scales.shape != (
+            _prepared_stage1.values.shape[0],
+            model_dim // 32,
+        ):
+            raise ValueError(
+                "prepared Stage1 scales must have shape "
+                "(physical_rows, model_dim // 32)"
+            )
+        if _prepared_stage1.load_sorted_ids.numel() < sorted_ids.numel():
+            raise ValueError(
+                "prepared Stage1 load_sorted_ids must cover every logical sorted row"
+            )
+        if q_dtype_a is not None and _prepared_stage1.values.dtype != q_dtype_a:
+            raise TypeError(
+                "prepared Stage1 values dtype does not match the selected activation dtype"
+            )
+        a1 = _prepared_stage1.values
+        a1_scale = _prepared_stage1.scales
+        stage1_sorted_ids = _prepared_stage1.load_sorted_ids
+    elif not metadata.prequant:
         a1 = hidden_states
         a1_scale = None
     elif (
@@ -3081,6 +3148,15 @@ def fused_moe_2stages(
     need_bias_support = _needs_swiglu_bias_support(dtype, quant_type)
     stage1_func = getattr(metadata.stage1, "func", metadata.stage1)
     stage2_func = getattr(metadata.stage2, "func", metadata.stage2)
+    if _prepared_stage1 is not None and _prepared_stage1.ready_plan is not None:
+        if stage1_func is not _flydsl_stage1_wrapper:
+            raise ValueError("Stage1ReadyPlan requires the FlyDSL Stage1 wrapper")
+        if "ready_plan" in extra_stage1_args:
+            raise ValueError(
+                "ready_plan must not be provided by both PreparedStage1Input "
+                "and _stage1_extra_args"
+            )
+        extra_stage1_args["ready_plan"] = _prepared_stage1.ready_plan
     if not metadata.run_1stage and need_bias_support:
         if metadata.has_bias:
             extra_stage1_args["bias1"] = _normalize_bias_for_kernel(bias1)
@@ -3126,7 +3202,7 @@ def fused_moe_2stages(
         a1,
         w1,
         w2,
-        sorted_ids,
+        stage1_sorted_ids,
         sorted_expert_ids,
         num_valid_ids,
         None if metadata.fuse_quant else a2,

@@ -47,6 +47,7 @@ from flydsl.expr.typing import T
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 
 from aiter.ops.flydsl.kernels import buffer_ops, vector
+from aiter.ops.flydsl.kernels import communication_ops_utils as comm_ops
 from aiter.ops.flydsl.kernels.kernels_common import default_f8_type
 from aiter.ops.flydsl.moe_common import GateMode
 
@@ -76,6 +77,35 @@ def _if_then(if_op):
             blk = if_op.then_block
             if (not blk.operations) or not isinstance(blk.operations[-1], scf.YieldOp):
                 scf.YieldOp([])
+
+
+def _load_i32_system_acquire(addr_i64):
+    ptr = llvm.IntToPtrOp(
+        llvm.PointerType.get(address_space=1), arith.unwrap(addr_i64)
+    ).result
+    return llvm.LoadOp(
+        ir.IntegerType.get_signless(32),
+        ptr,
+        alignment=4,
+        ordering=llvm.AtomicOrdering.acquire,
+        syncscope="one-as",
+    ).result
+
+
+def _try_claim_i32_agent(addr_i64, expected, desired):
+    ptr = llvm.IntToPtrOp(
+        llvm.PointerType.get(address_space=1), arith.unwrap(addr_i64)
+    ).result
+    result = llvm.AtomicCmpXchgOp(
+        ptr,
+        arith.unwrap(expected),
+        arith.unwrap(desired),
+        llvm.AtomicOrdering.monotonic,
+        llvm.AtomicOrdering.monotonic,
+        syncscope=fx.rocdl.SyncScope.Agent,
+        alignment=4,
+    ).res
+    return llvm.ExtractValueOp(ir.IntegerType.get_signless(1), result, [1]).res
 
 
 _VALID_A_DTYPES = frozenset(("fp8", "fp16", "bf16", "int8", "fp4"))
@@ -155,6 +185,11 @@ def compile_mixed_moe_gemm1_common(
     k_wave: int = 1,
     shared_expert_id: int | None = None,
     v2_output_layout: bool = False,
+    source_ready_wait: bool = False,
+    source_ready_source_count: int = 1,
+    source_ready_chunks_per_source: int = 1,
+    source_ready_queue_workers: int = 0,
+    source_ready_queue_rounds: int = 0,
 ):
     """Compile stage1 kernel: act(X @ W_gate.T, X @ W_up.T) -> [tokens*topk, inter_dim]."""
     heterogeneous_b = shared_expert_id is not None
@@ -175,6 +210,23 @@ def compile_mixed_moe_gemm1_common(
         raise ValueError(f"situ_beta must be > 0, got {situ_beta!r}")
     if situ_linear_beta <= 0.0:
         raise ValueError(f"situ_linear_beta must be > 0, got {situ_linear_beta!r}")
+    if source_ready_wait and (
+        source_ready_source_count <= 1
+        or source_ready_chunks_per_source <= 1
+        or source_ready_queue_workers <= 0
+        or source_ready_queue_rounds <= 0
+        or persist_m != 1
+        or xcd_swizzle
+        or k_batch != 1
+    ):
+        raise ValueError(
+            "ready-aware Stage1 requires multi-source chunks, positive queue "
+            "workers/rounds, persist_m=1, xcd_swizzle=0, and k_batch=1"
+        )
+    if not source_ready_wait and (
+        source_ready_queue_workers or source_ready_queue_rounds
+    ):
+        raise ValueError("ready queue parameters require source_ready_wait=True")
 
     is_f8_a = a_dtype == "fp8"
     is_f4_a = a_dtype == "fp4"
@@ -196,6 +248,10 @@ def compile_mixed_moe_gemm1_common(
     pack_N = min(2, n_per_wave // 16)
     pack_K = 2
     scale_mn_pack = 2
+    if source_ready_wait and a_scale_one:
+        raise ValueError(
+            "chunk-major raw A-scale requires chunk-major A and real A scales"
+        )
     elem_bytes = 1
     a_elem_bytes = 1
     b_elem_bytes = 1
@@ -301,10 +357,22 @@ def compile_mixed_moe_gemm1_common(
 
         act_tag += f"_sb{_beta_tag(situ_beta)}_slb{_beta_tag(situ_linear_beta)}"
     heterogeneous_tag = f"_shared_fp8_e{shared_expert_id}" if heterogeneous_b else ""
-    kernel_version = 33 if heterogeneous_b else 32
+    chunk_major_tag = (
+        f"_cm{source_ready_source_count}x{source_ready_chunks_per_source}"
+        if source_ready_wait
+        else ""
+    )
+    chunk_major_scale_tag = "_cmslds" if source_ready_wait else ""
+    ready_queue_tag = (
+        f"_dq{source_ready_queue_workers}x{source_ready_queue_rounds}"
+        if source_ready_queue_workers
+        else ""
+    )
+    queue_mode_tag = "_eqv2" if source_ready_wait else ""
+    kernel_version = 51 if source_ready_wait else 46
     module_name = (
         f"mfma_moe1_silu_mul_a{a_dtype}_w{b_dtype}_{out_s}"
-        f"_t{tile_m}x{tile_n}x{tile_k}_pm{persist_m}{fp4q_tag}{fp8q_tag}{sort_tag}{async_tag}{sk_tag}{kw_tag}{go_tag}{gui_tag}{as1_tag}{xcd_tag}{act_tag}{v2out_tag}{heterogeneous_tag}_v{kernel_version}"
+        f"_t{tile_m}x{tile_n}x{tile_k}_pm{persist_m}{fp4q_tag}{fp8q_tag}{sort_tag}{async_tag}{sk_tag}{kw_tag}{go_tag}{gui_tag}{as1_tag}{xcd_tag}{act_tag}{v2out_tag}{chunk_major_tag}{chunk_major_scale_tag}{ready_queue_tag}{queue_mode_tag}{heterogeneous_tag}_v{kernel_version}"
     ).replace("-", "_")
 
     cshuffle_elem_bytes = 4 if need_quant else (4 if out_is_f32 else 2)
@@ -314,11 +382,16 @@ def compile_mixed_moe_gemm1_common(
         cshuffle_elem_bytes * int(tile_m) * int(tile_n) if _use_cshuffle_epilog else 0
     )
     lds_tid_bytes = int(tile_m) * 4
+    raw_a_scale_lds_bytes = (
+        int(tile_m) * (int(model_dim) // 32)
+        if source_ready_wait
+        else 0
+    )
     input_elems = single_x_bytes if a_elem_bytes == 1 else (single_x_bytes // 2)
 
     GLOBAL_ALIGN = 1024
     std_pong = max(x_region_bytes, lds_out_bytes) + lds_tid_bytes
-    std_ping = x_region_bytes
+    std_ping = x_region_bytes + raw_a_scale_lds_bytes
     std_pong_aligned = allocator_pong._align(std_pong, 128)
     std_total = allocator_pong._align(
         std_pong_aligned, GLOBAL_ALIGN
@@ -351,6 +424,8 @@ def compile_mixed_moe_gemm1_common(
 
     lds_ping_offset = allocator_ping._align(allocator_ping.ptr, 16)
     allocator_ping.ptr = lds_ping_offset + ping_buffer_bytes
+    lds_a_scale_offset_ping = allocator_ping._align(allocator_ping.ptr, 16)
+    allocator_ping.ptr = lds_a_scale_offset_ping + raw_a_scale_lds_bytes
 
     if waves_per_eu is not None and waves_per_eu >= 1:
         total_cu_lds = 160 * 1024
@@ -372,6 +447,14 @@ def compile_mixed_moe_gemm1_common(
     e_vec_s1 = min(tile_n // 32, 8)
     if need_quant:
         e_vec_s1 = max(2, e_vec_s1)
+    if gate_up_interleave and not is_splitk:
+        gui_epilog_tile_n = tile_n // 2
+        gui_epilog_nlane = min(32, gui_epilog_tile_n // e_vec_s1)
+        if (
+            total_threads % gui_epilog_nlane
+            or gui_epilog_tile_n % (gui_epilog_nlane * e_vec_s1)
+        ):
+            e_vec_s1 = 2
     num_threads_per_quant_blk_s1 = 32 // e_vec_s1
     shuffle_dists_s1 = []
     sh_val = 1
@@ -473,6 +556,9 @@ def compile_mixed_moe_gemm1_common(
             i32_n_in: fx.Int32,
             i32_k_in: fx.Int32,
             i32_size_expert_ids_in: fx.Int32,
+            arg_source_ready: fx.Pointer,
+            arg_tile_source_masks: fx.Pointer,
+            arg_source_work_queue: fx.Pointer,
             f32_swiglu_limit: fx.Float32,
         ):
 
@@ -603,6 +689,21 @@ def compile_mixed_moe_gemm1_common(
             lds_x_ping = SmemPtr(
                 base_ptr_ping, lds_ping_offset, x_lds_elem(), shape=(input_elems,)
             ).get()
+            lds_a_scale_i32 = None
+            lds_a_scale_i8 = None
+            if const_expr(source_ready_wait):
+                lds_a_scale_i32 = SmemPtr(
+                    base_ptr_ping,
+                    lds_a_scale_offset_ping,
+                    T.i32,
+                    shape=(raw_a_scale_lds_bytes // 4,),
+                ).get()
+                lds_a_scale_i8 = SmemPtr(
+                    base_ptr_ping,
+                    lds_a_scale_offset_ping,
+                    T.i8,
+                    shape=(raw_a_scale_lds_bytes,),
+                ).get()
             lds_out_elem_type = (
                 T.f32 if need_quant else (T.bf16 if out_is_bf16 else T.f16)
             )
@@ -657,11 +758,14 @@ def compile_mixed_moe_gemm1_common(
             if const_expr(not a_scale_one):
                 c32 = arith.constant(32, index=True)
                 kblk = k_in // c32
-                scale_rows = (
-                    (sorted_m + arith.constant(31, index=True))
-                    // arith.constant(32, index=True)
-                    * arith.constant(32, index=True)
-                )
+                if const_expr(source_ready_wait):
+                    scale_rows = tokens_in
+                else:
+                    scale_rows = (
+                        (sorted_m + arith.constant(31, index=True))
+                        // arith.constant(32, index=True)
+                        * arith.constant(32, index=True)
+                    )
                 sx_nbytes_idx = scale_rows * kblk
                 sx_nbytes_i32 = arith.index_cast(T.i32, sx_nbytes_idx)
                 sx_rsrc = ptr_buffer_resource(arg_scale_x, sx_nbytes_i32)
@@ -695,6 +799,20 @@ def compile_mixed_moe_gemm1_common(
             eid_nbytes_idx = size_expert_ids_in * arith.constant(4, index=True)
             eid_nbytes_i32 = arith.index_cast(T.i32, eid_nbytes_idx)
             expert_rsrc = ptr_buffer_resource(arg_expert_ids, eid_nbytes_i32)
+            tile_source_mask_rsrc = None
+            source_work_queue_base = None
+            source_ready_base = None
+            if const_expr(source_ready_wait):
+                tile_source_mask_rsrc = ptr_buffer_resource(
+                    arg_tile_source_masks, eid_nbytes_i32
+                )
+                if const_expr(source_ready_queue_workers > 0):
+                    source_work_queue_base = arith.index_cast(
+                        T.i64, fx.ptrtoint(arg_source_work_queue)
+                    )
+                source_ready_base = arith.index_cast(
+                    T.i64, fx.ptrtoint(arg_source_ready)
+                )
             bias_rsrc = (
                 ptr_buffer_resource(arg_bias, bias_nbytes) if enable_bias else None
             )
@@ -725,16 +843,202 @@ def compile_mixed_moe_gemm1_common(
             PERSIST_M = persist_m
             c0_p = arith.constant(0, index=True)
             c1_p = arith.constant(1, index=True)
-            c_pm = arith.constant(PERSIST_M, index=True)
+            loop_rounds = (
+                source_ready_queue_rounds
+                if source_ready_queue_workers
+                else PERSIST_M
+            )
+            c_pm = arith.constant(loop_rounds, index=True)
             for_persist = scf.ForOp(c0_p, c_pm, c1_p)
             for_ip = ir.InsertionPoint(for_persist.body)
             for_ip.__enter__()
             mi_p = for_persist.induction_variable
             bx = bx_persist * c_pm + mi_p
+            work_valid = None
+            if const_expr(source_ready_queue_workers > 0):
+                is_leader = arith.cmpi(
+                    CmpIPredicate.eq, tx, arith.constant(0, index=True)
+                )
+                leader_if = scf.IfOp(is_leader)
+                with ir.InsertionPoint(leader_if.then_block):
+                    by_i32 = arith.index_cast(T.i32, by)
+                    if const_expr(source_ready_wait):
+                        i1 = ir.IntegerType.get_signless(1)
+                        queue_n_partitions = (
+                            2 * (inter_dim - inter_dim_pad) + tile_n - 1
+                        ) // tile_n
+                        total_work = arith.divui(
+                            arith.addi(
+                                num_valid_i32,
+                                arith.constant(sort_block_m - 1, type=T.i32),
+                            ),
+                            arith.constant(sort_block_m, type=T.i32),
+                        )
+                        invalid_position = arith.unwrap(i32_size_expert_ids_in)
+
+                        def queue_word_addr(word_index):
+                            return arith.addi(
+                                source_work_queue_base,
+                                arith.muli(
+                                    arith.extui(
+                                        T.i64, arith.unwrap(word_index)
+                                    ),
+                                    arith.constant(4, type=T.i64),
+                                ),
+                            )
+
+                        cursor_addr = queue_word_addr(by_i32)
+                        logical_slot = arith.addi(
+                            arith.muli(
+                                arith.index_cast(T.i32, mi_p),
+                                arith.constant(
+                                    source_ready_queue_workers, type=T.i32
+                                ),
+                            ),
+                            arith.index_cast(T.i32, bx_persist),
+                        )
+                        slot_active = arith.cmpi(
+                            CmpIPredicate.ult, logical_slot, total_work
+                        )
+                        memref.store(
+                            invalid_position,
+                            lds_tid,
+                            [arith.constant(0, index=True)],
+                        )
+                        search_loop = scf.WhileOp(
+                            [T.i32],
+                            [
+                                arith.select(
+                                    slot_active,
+                                    arith.constant(0, type=T.i32),
+                                    arith.constant(1, type=T.i32),
+                                )
+                            ],
+                        )
+                        search_before = ir.Block.create_at_start(
+                            search_loop.before, [T.i32]
+                        )
+                        search_after = ir.Block.create_at_start(
+                            search_loop.after, [T.i32]
+                        )
+                        with ir.InsertionPoint(search_before):
+                            found = search_before.arguments[0]
+                            keep_searching = arith.cmpi(
+                                CmpIPredicate.eq,
+                                found,
+                                arith.constant(0, type=T.i32),
+                            )
+                            scf.ConditionOp(keep_searching, [found])
+                        with ir.InsertionPoint(search_after):
+                            ticket = comm_ops.atomic_add_agent(
+                                cursor_addr,
+                                arith.constant(1, type=T.i32),
+                            )
+                            position = arith.remui(ticket, total_work)
+                            source_mask = buffer_ops.buffer_load(
+                                tile_source_mask_rsrc,
+                                arith.index_cast(
+                                    ir.IndexType.get(), position
+                                ),
+                                vec_width=1,
+                                dtype=T.i32,
+                            )
+                            ready = _load_i32_system_acquire(source_ready_base)
+                            visible = arith.andi(
+                                ready, arith.unwrap(source_mask)
+                            )
+                            dependency_ready = arith.cmpi(
+                                CmpIPredicate.eq,
+                                visible,
+                                arith.unwrap(source_mask),
+                            )
+                            claimed_word = arith.addi(
+                                arith.constant(
+                                    2 * queue_n_partitions, type=T.i32
+                                ),
+                                arith.addi(
+                                    arith.muli(
+                                        position,
+                                        arith.constant(
+                                            queue_n_partitions, type=T.i32
+                                        ),
+                                    ),
+                                    by_i32,
+                                ),
+                            )
+                            claimed_addr = queue_word_addr(claimed_word)
+                            claim_if = scf.IfOp(
+                                dependency_ready, [i1], has_else=True
+                            )
+                            with ir.InsertionPoint(claim_if.then_block):
+                                exchanged = _try_claim_i32_agent(
+                                    claimed_addr,
+                                    arith.constant(0, type=T.i32),
+                                    arith.constant(1, type=T.i32),
+                                )
+                                scf.YieldOp([exchanged])
+                            with ir.InsertionPoint(claim_if.else_block):
+                                scf.YieldOp(
+                                    [arith.constant(0, type=i1)]
+                                )
+                            claimed = claim_if.results[0]
+                            claimed_if = scf.IfOp(claimed)
+                            with ir.InsertionPoint(claimed_if.then_block):
+                                memref.store(
+                                    position,
+                                    lds_tid,
+                                    [arith.constant(0, index=True)],
+                                )
+                                scf.YieldOp([])
+                            wrapped = arith.cmpi(
+                                CmpIPredicate.eq,
+                                position,
+                                arith.subi(
+                                    total_work,
+                                    arith.constant(1, type=T.i32),
+                                ),
+                            )
+                            sleep_if = scf.IfOp(
+                                arith.andi(
+                                    wrapped,
+                                    arith.xori(
+                                        claimed,
+                                        arith.constant(1, type=i1),
+                                    ),
+                                )
+                            )
+                            with ir.InsertionPoint(sleep_if.then_block):
+                                fx.rocdl.s_sleep(fx.Int32(127))
+                                scf.YieldOp([])
+                            scf.YieldOp(
+                                [
+                                    arith.select(
+                                        claimed,
+                                        arith.constant(1, type=T.i32),
+                                        arith.constant(0, type=T.i32),
+                                    )
+                                ]
+                            )
+                    scf.YieldOp([])
+                gpu.barrier()
+                position = memref.load(
+                    lds_tid, [arith.constant(0, index=True)]
+                )
+                work_valid = arith.cmpi(
+                    CmpIPredicate.ult,
+                    position,
+                    arith.unwrap(i32_size_expert_ids_in),
+                )
+                safe_position = arith.select(
+                    work_valid, position, arith.constant(0, type=T.i32)
+                )
+                bx = arith.index_cast(ir.IndexType.get(), safe_position)
             bx_m = bx * arith.constant(sort_block_m, index=True)
 
             bx_m_i32 = arith.index_cast(T.i32, bx_m)
             blk_valid = arith.cmpi(CmpIPredicate.ult, bx_m_i32, num_valid_i32)
+            if const_expr(source_ready_queue_workers > 0):
+                blk_valid = arith.andi(blk_valid, work_valid)
             expert_i32 = buffer_ops.buffer_load(
                 expert_rsrc, bx, vec_width=1, dtype=T.i32
             )
@@ -868,10 +1172,149 @@ def compile_mixed_moe_gemm1_common(
                     s_valid = arith.cmpi(CmpIPredicate.ult, s_i32, topk_i32)
                     ts_valid = arith.andi(t_valid, s_valid)
                     t_safe = arith.select(ts_valid, t_i32, arith.constant(0))
+                    if const_expr(source_ready_wait):
+                        c_sources = arith.constant(
+                            source_ready_source_count, type=T.i32
+                        )
+                        c_chunks = arith.constant(
+                            source_ready_chunks_per_source, type=T.i32
+                        )
+                        tokens_per_source = arith.divui(
+                            arith.unwrap(tokens_i32), arith.unwrap(c_sources)
+                        )
+                        tokens_per_chunk = arith.divui(
+                            tokens_per_source, arith.unwrap(c_chunks)
+                        )
+                        source = arith.divui(
+                            arith.unwrap(t_safe), tokens_per_source
+                        )
+                        local = arith.remui(
+                            arith.unwrap(t_safe), tokens_per_source
+                        )
+                        chunk = arith.divui(local, tokens_per_chunk)
+                        chunk_offset = arith.remui(local, tokens_per_chunk)
+                        chunk_source = arith.addi(
+                            arith.muli(chunk, arith.unwrap(c_sources)), source
+                        )
+                        t_safe = arith.addi(
+                            arith.muli(chunk_source, tokens_per_chunk),
+                            chunk_offset,
+                        )
 
                     t_idx = arith.index_cast(ir.IndexType.get(), t_safe)
                     x_row_base_div4.append(t_idx * c_k_div4)
 
+                raw_scale_cols = model_dim // 32
+                raw_scale_segments_per_row = raw_scale_cols // 16
+                raw_scale_segments = tile_m * raw_scale_segments_per_row
+                raw_scale_loads_per_thread = (
+                    raw_scale_segments + total_threads - 1
+                ) // total_threads
+
+                def stage_raw_a_scale_to_lds():
+                    for load_i in range_constexpr(raw_scale_loads_per_thread):
+                        linear = tx + arith.constant(
+                            load_i * total_threads, index=True
+                        )
+                        in_range = arith.cmpi(
+                            CmpIPredicate.ult,
+                            linear,
+                            arith.constant(raw_scale_segments, index=True),
+                        )
+                        load_if = scf.IfOp(in_range)
+                        with ir.InsertionPoint(load_if.then_block):
+                            row_local = linear // arith.constant(
+                                raw_scale_segments_per_row, index=True
+                            )
+                            segment = linear % arith.constant(
+                                raw_scale_segments_per_row, index=True
+                            )
+                            fused = buffer_ops.buffer_load(
+                                sorted_rsrc,
+                                bx_m + row_local,
+                                vec_width=1,
+                                dtype=T.i32,
+                            )
+                            token = arith.andi(fused, mask24)
+                            valid = arith.cmpi(
+                                CmpIPredicate.ult, token, tokens_i32
+                            )
+                            token_safe = arith.select(
+                                valid, token, arith.constant(0, type=T.i32)
+                            )
+                            sources = arith.constant(
+                                source_ready_source_count, type=T.i32
+                            )
+                            chunks = arith.constant(
+                                source_ready_chunks_per_source, type=T.i32
+                            )
+                            tokens_per_source = arith.divui(
+                                arith.unwrap(tokens_i32), arith.unwrap(sources)
+                            )
+                            tokens_per_chunk = arith.divui(
+                                tokens_per_source, arith.unwrap(chunks)
+                            )
+                            source = arith.divui(
+                                arith.unwrap(token_safe), tokens_per_source
+                            )
+                            local = arith.remui(
+                                arith.unwrap(token_safe), tokens_per_source
+                            )
+                            chunk = arith.divui(local, tokens_per_chunk)
+                            chunk_offset = arith.remui(local, tokens_per_chunk)
+                            physical = arith.addi(
+                                arith.muli(
+                                    arith.addi(
+                                        arith.muli(chunk, arith.unwrap(sources)),
+                                        source,
+                                    ),
+                                    tokens_per_chunk,
+                                ),
+                                chunk_offset,
+                            )
+                            byte_offset = arith.addi(
+                                arith.muli(
+                                    physical,
+                                    arith.constant(raw_scale_cols, type=T.i32),
+                                ),
+                                arith.index_cast(
+                                    T.i32,
+                                    segment * arith.constant(16, index=True),
+                                ),
+                            )
+                            raw = buffer_ops.buffer_load(
+                                sx_rsrc,
+                                arith.divui(
+                                    arith.unwrap(byte_offset),
+                                    arith.constant(4, type=T.i32),
+                                ),
+                                vec_width=4,
+                                dtype=T.i32,
+                                cache_modifier=0,
+                            )
+                            raw_words = []
+                            for word_i in range_constexpr(4):
+                                raw_word = vector.extract(
+                                    raw,
+                                    static_position=[word_i],
+                                    dynamic_position=[],
+                                )
+                                raw_words.append(
+                                    arith.select(
+                                        valid,
+                                        raw_word,
+                                        arith.constant(0, type=T.i32),
+                                    )
+                                )
+                            raw_vec = vector.from_elements(
+                                T.vec(4, T.i32), raw_words
+                            )
+                            vector.store(
+                                raw_vec,
+                                lds_a_scale_i32,
+                                [linear * arith.constant(4, index=True)],
+                            )
+                            scf.YieldOp([])
                 def load_x_tile(base_k):
                     base_k_div4 = (
                         (base_k // c_a_pack)
@@ -1083,6 +1526,56 @@ def compile_mixed_moe_gemm1_common(
                     lane_div_16 * layout_b_scale.stride_klane + lane_mod_16
                 )
 
+                def load_raw_a_scale_word(mi_p: int, word_offset):
+                    word_idx = arith.index_cast(
+                        T.i32, scale_lane_elem + word_offset
+                    )
+                    row_lo = (
+                        arith.constant(mi_p * 32, type=T.i32)
+                        + arith.andi(word_idx, arith.constant(15, type=T.i32))
+                    )
+                    row_hi = row_lo + arith.constant(16, type=T.i32)
+                    tmp = arith.shrui(word_idx, arith.constant(4, type=T.i32))
+                    col_lo = arith.addi(
+                        arith.shli(
+                            arith.shrui(tmp, arith.constant(2, type=T.i32)),
+                            arith.constant(3, type=T.i32),
+                        ),
+                        arith.andi(tmp, arith.constant(3, type=T.i32)),
+                    )
+                    col_hi = col_lo + arith.constant(4, type=T.i32)
+
+                    def load_byte(row, col):
+                        offset = arith.addi(
+                            arith.muli(
+                                row,
+                                arith.constant(raw_scale_cols, type=T.i32),
+                            ),
+                            col,
+                        )
+                        return arith.extui(
+                            T.i32,
+                            memref.load(
+                                lds_a_scale_i8,
+                                [arith.index_cast(ir.IndexType.get(), offset)],
+                            ),
+                        )
+
+                    lo0 = load_byte(row_lo, col_lo)
+                    hi0 = load_byte(row_hi, col_lo)
+                    lo1 = load_byte(row_lo, col_hi)
+                    hi1 = load_byte(row_hi, col_hi)
+                    return arith.ori(
+                        arith.ori(
+                            lo0,
+                            arith.shli(hi0, arith.constant(8, type=T.i32)),
+                        ),
+                        arith.ori(
+                            arith.shli(lo1, arith.constant(16, type=T.i32)),
+                            arith.shli(hi1, arith.constant(24, type=T.i32)),
+                        ),
+                    )
+
                 gate_scale_bases = []
                 up_scale_bases = []
                 for ni in range_constexpr(num_acc_n_packed):
@@ -1177,13 +1670,16 @@ def compile_mixed_moe_gemm1_common(
                             if const_expr(a_scale_one):
                                 a_scale_tile.append(as1_vec)
                             else:
-                                s = buffer_ops.buffer_load(
-                                    sx_rsrc,
-                                    a_scale_bases[mi] + k_off,
-                                    vec_width=1,
-                                    dtype=T.i32,
-                                    cache_modifier=0,
-                                )
+                                if const_expr(source_ready_wait):
+                                    s = load_raw_a_scale_word(mi, k_off)
+                                else:
+                                    s = buffer_ops.buffer_load(
+                                        sx_rsrc,
+                                        a_scale_bases[mi] + k_off,
+                                        vec_width=1,
+                                        dtype=T.i32,
+                                        cache_modifier=0,
+                                    )
                                 s = rearrange_a_scale(s)
                                 a_scale_tile.append(
                                     vector.from_elements(T.vec(1, T.i32), [s])
@@ -1712,13 +2208,20 @@ def compile_mixed_moe_gemm1_common(
                                     if const_expr(a_scale_one):
                                         new_as_list.append(as1_const)
                                     else:
-                                        raw_as = buffer_ops.buffer_load(
-                                            sx_rsrc,
-                                            a_scale_bases[mi_p] + ku_off,
-                                            vec_width=1,
-                                            dtype=T.i32,
-                                            cache_modifier=0,
-                                        )
+                                        if const_expr(
+                                            source_ready_wait
+                                        ):
+                                            raw_as = load_raw_a_scale_word(
+                                                mi_p, ku_off
+                                            )
+                                        else:
+                                            raw_as = buffer_ops.buffer_load(
+                                                sx_rsrc,
+                                                a_scale_bases[mi_p] + ku_off,
+                                                vec_width=1,
+                                                dtype=T.i32,
+                                                cache_modifier=0,
+                                            )
                                         new_as_list.append(rearrange_a_scale(raw_as))
                                 for gs_ni in range_constexpr(num_acc_n_packed):
                                     gs_raw = buffer_ops.buffer_load(
@@ -1881,6 +2384,11 @@ def compile_mixed_moe_gemm1_common(
                     x_regs0 = load_x_tile(k0)
                     store_x_tile_to_lds(x_regs0, body_lds_x_pong)
                 rocdl.sched_barrier(0)
+                if const_expr(source_ready_wait):
+                    stage_raw_a_scale_to_lds()
+                    rocdl.s_waitcnt(0)
+                    barrier()
+                    rocdl.sched_barrier(0)
                 k0_scale = body_k_base_idx // arith.constant(pack_K * 128, index=True)
                 a_scale_pong, gate_bs_pong, up_bs_pong = prefetch_ab_scale_tile(
                     k0_scale
@@ -2489,6 +2997,9 @@ def compile_mixed_moe_gemm1_common(
 
                 e_vec = e_vec_s1
                 e_vec_sk = 2
+                epilog_store_alignment = (
+                    e_vec * out_elem_bytes
+                ) & -(e_vec * out_elem_bytes)
                 cshuffle_nlane = min(32, tile_n // e_vec)
                 cshuffle_nlane_sk = min(32, tile_n // e_vec_sk)
 
@@ -2765,7 +3276,7 @@ def compile_mixed_moe_gemm1_common(
                         llvm.StoreOp(
                             frag_v,
                             out_ptr_v,
-                            alignment=e_vec * out_elem_bytes,
+                            alignment=epilog_store_alignment,
                             nontemporal=True,
                         )
 
@@ -3116,6 +3627,10 @@ def compile_mixed_moe_gemm1_common(
                 i32_n_in,
                 i32_k_in,
                 i32_size_expert_ids_in,
+                arg_sorted_token_ids,
+                arg_expert_ids,
+                arg_expert_ids,
+                arg_expert_ids,
                 f32_swiglu_limit,
             )
 
@@ -3138,6 +3653,9 @@ def compile_mixed_moe_gemm1_common(
             i32_n_in: fx.Int32,
             i32_k_in: fx.Int32,
             i32_size_expert_ids_in: fx.Int32,
+            arg_source_ready: fx.Pointer,
+            arg_tile_source_masks: fx.Pointer,
+            arg_source_work_queue: fx.Pointer,
             f32_swiglu_limit: fx.Float32,
         ):
             _emit_moe_gemm1(
@@ -3158,6 +3676,9 @@ def compile_mixed_moe_gemm1_common(
                 i32_n_in,
                 i32_k_in,
                 i32_size_expert_ids_in,
+                arg_source_ready,
+                arg_tile_source_masks,
+                arg_source_work_queue,
                 f32_swiglu_limit,
             )
 
@@ -3185,6 +3706,11 @@ def compile_mixed_moe_gemm1_common(
         a_scale_one,
         xcd_swizzle,
         v2_output_layout,
+        source_ready_wait,
+        source_ready_source_count,
+        source_ready_chunks_per_source,
+        source_ready_queue_workers,
+        source_ready_queue_rounds,
     )
     if heterogeneous_b:
         cache_tag += (shared_expert_id,)
@@ -3207,6 +3733,10 @@ def compile_mixed_moe_gemm1_common(
         i32_inter_in: fx.Int32,
         i32_k_in: fx.Int32,
         i32_size_expert_ids_in: fx.Int32,
+        i32_work_tiles: fx.Int32,
+        arg_source_ready: fx.Pointer,
+        arg_tile_source_masks: fx.Pointer,
+        arg_source_work_queue: fx.Pointer,
         f32_swiglu_limit: fx.Float32,
         stream: fx.Stream,
     ):
@@ -3239,12 +3769,15 @@ def compile_mixed_moe_gemm1_common(
                 // arith.constant(2, index=True)
             )
 
-        c_pm_l = arith.constant(persist_m, index=True)
-        gy = (
-            arith.index_cast(ir.IndexType.get(), i32_size_expert_ids_in.ir_value())
-            + c_pm_l
-            - arith.constant(1, index=True)
-        ) // c_pm_l
+        if const_expr(source_ready_queue_workers > 0):
+            gy = arith.constant(source_ready_queue_workers, index=True)
+        else:
+            c_pm_l = arith.constant(persist_m, index=True)
+            gy = (
+                arith.index_cast(ir.IndexType.get(), i32_work_tiles.ir_value())
+                + c_pm_l
+                - arith.constant(1, index=True)
+            ) // c_pm_l
 
         if const_expr(heterogeneous_b):
             launcher = moe_gemm1(
@@ -3284,6 +3817,9 @@ def compile_mixed_moe_gemm1_common(
                 i32_inter_in,
                 i32_k_in,
                 i32_size_expert_ids_in,
+                arg_source_ready,
+                arg_tile_source_masks,
+                arg_source_work_queue,
                 f32_swiglu_limit,
             )
         if const_expr(heterogeneous_b and waves_per_eu is not None):
@@ -3316,6 +3852,7 @@ def compile_mixed_moe_gemm1_common(
             i32_inter_in: fx.Int32,
             i32_k_in: fx.Int32,
             i32_size_expert_ids_in: fx.Int32,
+            i32_work_tiles: fx.Int32,
             f32_swiglu_limit: fx.Float32,
             stream: fx.Stream,
         ):
@@ -3337,6 +3874,11 @@ def compile_mixed_moe_gemm1_common(
                 i32_inter_in,
                 i32_k_in,
                 i32_size_expert_ids_in,
+                i32_work_tiles,
+                arg_sorted_token_ids,
+                arg_expert_ids,
+                arg_expert_ids,
+                arg_expert_ids,
                 f32_swiglu_limit,
                 stream,
             )
@@ -3360,6 +3902,10 @@ def compile_mixed_moe_gemm1_common(
             i32_inter_in: fx.Int32,
             i32_k_in: fx.Int32,
             i32_size_expert_ids_in: fx.Int32,
+            i32_work_tiles: fx.Int32,
+            arg_source_ready: fx.Pointer,
+            arg_tile_source_masks: fx.Pointer,
+            arg_source_work_queue: fx.Pointer,
             f32_swiglu_limit: fx.Float32,
             stream: fx.Stream,
         ):
@@ -3381,6 +3927,10 @@ def compile_mixed_moe_gemm1_common(
                 i32_inter_in,
                 i32_k_in,
                 i32_size_expert_ids_in,
+                i32_work_tiles,
+                arg_source_ready,
+                arg_tile_source_masks,
+                arg_source_work_queue,
                 f32_swiglu_limit,
                 stream,
             )

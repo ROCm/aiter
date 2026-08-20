@@ -1727,6 +1727,10 @@ def init_distributed_environment(
         # Adjust the rank and world size for data parallel
         rank = data_parallel_rank * world_size + rank
         world_size = data_parallel_size * world_size
+    if os.environ.get("AITER_MOE_STAGE1_CCO", "0") == "1":
+        # CCO enables HIP fabric mappings; RCCL must use the matching AMD-SMI
+        # topology path when its process group is created.
+        os.environ.setdefault("RCCL_USE_AMD_SMI_LIB", "1")
     if not torch.distributed.is_initialized():
         assert distributed_init_method is not None, (
             "distributed_init_method must be provided when initializing "
@@ -1756,6 +1760,12 @@ def init_distributed_environment(
             local_rank = os.environ.get("LOCAL_RANK", rank)
         else:
             local_rank = rank
+    if os.environ.get("AITER_MOE_STAGE1_CCO", "0") == "1":
+        from aiter.ops.flydsl.moe_stage1_ag import (
+            preinitialize_tp_stage1_cco_world,
+        )
+
+        preinitialize_tp_stage1_cco_world()
     global _WORLD
     if _WORLD is None:
         ranks = list(range(torch.distributed.get_world_size()))
