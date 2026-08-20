@@ -460,42 +460,28 @@ def _top_k_per_row_decode(
 _TRUTHY_ENV = ("1", "true", "True", "yes", "YES")
 
 
-# Per-arch gates for the FlyDSL tiered decode kernel. Each arch carries its whole
-# admission window -- min padded width, max rows, the k set it has wins for, and any
-# individual rows it must exclude -- because the safe window does not transfer
-# between archs: the kernel's grid-trim, batch-cap, row-proportional and early-stop
-# tuning is gfx950-only, so gfx942 runs a frozen configuration and was measured
-# separately.
+# Per-arch admission windows: min padded width, max rows, the k set that wins, and
+# any row carved out by hand. A window does not transfer between archs, since the
+# grid-trim, batch-cap, row-proportional and early-stop tuning is gfx950-only and
+# gfx942 runs a frozen configuration measured separately.
 #
-# Note what the width gate can and cannot see. Callers hand us a score buffer sized
-# to the model's max context, not to the request's -- vLLM's sparse indexer builds
-# logits as (batch * next_n, max_model_len) -- and the real per-row lengths live in
-# seqLens, on the device, where reading them would cost a sync. Both kernels track
-# seqLens, so within one deployment the same width covers requests whose cost
-# differs several-fold. This gate therefore asks "is this a long-context model",
-# not "is this a long request", and it has to, because under CUDA-graph capture the
-# request length does not exist yet: one graph is recorded per batch size and
-# replayed at every sequence length.
+# The width gate asks "is this a long-context model", not "is this a long request",
+# and it has to: callers size the score buffer to the model's max context (vLLM's
+# sparse indexer builds logits as (batch * next_n, max_model_len)), the real per-row
+# lengths live in seqLens on the device where reading them would cost a sync, and
+# under CUDA-graph capture the request length does not exist yet -- one graph per
+# batch size, replayed at every length. One width therefore covers requests whose
+# cost differs several-fold, so each window is chosen to pay off across that whole
+# range rather than at one length.
 #
-# gfx950's window is the largest that loses no cell in the eager width-sweep, which
-# is the regime vLLM pays whenever a decode batch overflows its CUDA-graph capture
-# limit and falls back to eager submission; every captured cell only does better.
-# Below 131072 the host submit path (~19us) sinks short-context cells the kernel
-# would otherwise win; k=512 still carries losses at full width, so only k=2048
-# ships; and rows==2 is the one admitted row that stays behind at width even as
-# rows 1 and 4-16 pull ahead, so it is carved out by hand.
-#
-# gfx942 is set from a 1248-cell sweep on MI300X (k x rows x width x seq, eager and
-# graph replay). Its short-context cells are not the wash they are on gfx950 -- they
-# lose up to 3x, because HIP one-block is cheaper here (~10us at 4K vs gfx950's
-# ~17us) while FlyDSL's floor is dearer. Since the width the gate sees cannot
-# separate a 4K request from a 160K one, the window is chosen so the bet pays off
-# across the whole length range a captured graph will meet: at width >= 131072 and
-# rows <= 8 FlyDSL comes out ahead once ~13-33% of requests are long, which a
-# long-context deployment clears, and it is the only setting that stays positive in
-# both regimes (widening to rows 16 halves the eager margin; dropping to width
-# 98304 turns it negative). All four AOT-precompiled k behave alike, so all four
-# ship; rows >= 16 and width < 131072 do not.
+# gfx950 takes the widest window that loses no cell in the eager width-sweep, the
+# regime vLLM pays when a decode batch overflows its graph-capture limit; captured
+# cells only do better. Below 131072 the ~19us host submit sinks short-context
+# cells, k=512 still loses at full width, and rows==2 stays behind while rows 1 and
+# 4-16 pull ahead -- hence the carve-outs. gfx942 is narrower in rows and wider in
+# k, from a 1248-cell MI300X sweep where short-context cells lose up to 3x because
+# HIP one-block is cheaper there. See the SILOTIGER-699 gate investigation for the
+# per-cell numbers behind both.
 class _DecodeGate(NamedTuple):
     min_width: int
     max_rows: int

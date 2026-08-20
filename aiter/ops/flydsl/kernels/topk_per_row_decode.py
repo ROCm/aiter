@@ -217,23 +217,20 @@ def _create_topk_per_row_decode_radix_unordered(top_k: int):
             return cur
 
         def choose_threshold_parallel(target_k, above_slot, threshold_slot):
-            # AITER/hipcub-style hierarchical inclusive block scan over the
-            # 2048-bin histogram, replacing the 11-step Hillis-Steele suffix
-            # ping-pong (11 barriers + 11 LDS read/write rounds) with a
-            # wave-scan + cross-wave-totals scheme (3 barriers, the per-lane
-            # prefixes flowing through registers via ``ds_bpermute``).
+            # Hierarchical inclusive block scan over the 2048-bin histogram:
+            # wave-scan plus cross-wave totals, 3 barriers, per-lane prefixes
+            # flowing through registers via ``ds_bpermute``.
             #
-            # Each thread owns the contiguous bin pair ``(2*tid, 2*tid+1)`` so
-            # waves cover contiguous bin ranges and the block scan order matches
-            # ascending bin index. We compute the *forward* inclusive prefix
-            # ``incl[b] = sum_{i <= b} count[i]`` (and ``excl[b] = incl[b] -
-            # count[b]``); the kth-largest boundary is the first bucket whose
-            # inclusive prefix passes ``K' = total - target_k``:
-            #   ``excl[b] <= K'`` and ``incl[b] > K'``.
-            # This is algebraically identical to a suffix-count formulation
-            # (``suffix[b] = total - excl[b]``) but lets us reuse a standard
-            # ascending block scan. ``above = total - incl[b]`` is the count
-            # strictly above the boundary bucket, exactly as before.
+            # Each thread owns the contiguous bin pair ``(2*tid, 2*tid+1)``, so
+            # waves cover contiguous bin ranges and the scan order matches
+            # ascending bin index. The scan is a *forward* inclusive prefix
+            # ``incl[b] = sum_{i <= b} count[i]`` (with ``excl[b] = incl[b] -
+            # count[b]``) rather than the suffix count the selection is phrased
+            # in, so that a standard ascending block scan can be reused; the two
+            # are related by ``suffix[b] = total - excl[b]``. The kth-largest
+            # boundary is then the first bucket with ``excl[b] <= K'`` and
+            # ``incl[b] > K'`` for ``K' = total - target_k``, and
+            # ``above = total - incl[b]`` counts strictly above it.
             two_tid = tid * c_two
             c0 = fx.memref_load(s_hist, two_tid)
             c1 = fx.memref_load(s_hist, two_tid + c_one)

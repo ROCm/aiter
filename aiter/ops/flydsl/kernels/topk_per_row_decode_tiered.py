@@ -2,8 +2,8 @@
 
 Computes an unordered Top-K index set per decode row, fusing a single-workgroup and
 a multi-block radix-select into one persistent launch grid=(blocks_per_row, num_rows)
-that picks a per-row strategy by valid length. Which is required when decode batch's
-sequences differ in length. Each row derives how many of its blocks_per_row
+that picks a per-row strategy by valid length -- which is what a decode batch needs,
+since its sequences differ in length. Each row derives how many of its blocks_per_row
 workgroups cooperate (active_parts); the rest return immediately.
 
 Inputs/outputs:
@@ -34,10 +34,10 @@ Constraints:
   - workspace must be zeroed before any launch that enters a multi-block tier; its
     counters and histograms accumulate from zero (needs_workspace_zero reports when).
   - The row barrier spins (s_sleep), so a row's blocks_per_row workgroups must be
-    co-resident. This is a regular launch, not hipLaunchCooperativeKernel: it is safe
-    only because HIP flattens the grid x-fastest, so a row's parts launch contiguously
-    and drain in order — scheduler launch order, not a cooperative guarantee. Keep
-    num_rows * blocks_per_row co-resident; the wrapper's deadlock guard enforces this,
+    co-resident. This is a regular launch, not hipLaunchCooperativeKernel, and is safe
+    only because the grid is flattened x-fastest: a row's parts launch contiguously and
+    drain in order, which is scheduler launch order rather than a cooperative
+    guarantee. The wrapper's deadlock guard keeps num_rows * blocks_per_row co-resident,
     forcing larger batches onto the barrier-free short tier.
 """
 

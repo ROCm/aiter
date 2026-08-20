@@ -310,22 +310,19 @@ def _apply_deadlock_guard(
     arch: str | None = None,
 ) -> dict:
     """Clamp the tiered config so the mid/long-tier inter-workgroup barrier cannot
-    deadlock. The possibility of deadlock requires both a wide batch (num_rows > ~80-90)
-    and long rows (L > ~16-40K). Note: The HIP kernel also redirects to a
-    single-workgroup tier for large batch-sizes, but doesn't explicitly call out the
-    deadlock risk (see the should_use_mulblocks function).
+    deadlock. Reaching that state takes both a wide batch (num_rows > ~80-90) and
+    long rows (L > ~16-40K).
 
-    The tiered kernels spin on a barrier over a non-cooperative launch, which gives
-    no guarantee that a row's participating workgroups are all resident at the same
-    time. A workgroup spinning at the barrier holds its slot until every participant
-    of its row arrives. A deadlock can potentially happen once the barrier-blocked
-    workgroups exceeds the resident capacity. In this case, we cap the active
-    workgroups or force the barrier-free short tier (single workgroup/row).
+    The barrier spins over a non-cooperative launch, so a row's participating
+    workgroups are not guaranteed to be resident together, and one that arrives
+    early holds its slot until the rest of its row shows up. Once the workgroups
+    blocked that way outnumber the co-resident capacity nothing can drain, so the
+    guard caps the active workgroups per row or forces the barrier-free short tier.
 
-    Example for MI300X:
-    The deadlock guard is active around num_rows >= 87 with max_model_len > 32768
-    CUs * Occupancy = 304 * 2 = 608
-    8 cooperating workgroups, 87*7 >= 608
+    On MI300X with 8 cooperating workgroups per row: 304 CUs x occupancy 2 = 608
+    slots, and a row blocks only 8 - 1 of them because the last arriver never
+    waits, so the guard engages at 87 rows (87 x 7 = 609 > 608) once max_model_len
+    passes 32768.
     """
     if num_rows <= 0:
         return kernel_config
