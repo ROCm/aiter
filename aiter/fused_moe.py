@@ -2074,13 +2074,9 @@ def _flydsl_v2_stage2_wrapper(
         g2_bf16_lds=cfg["bf16_lds"],
         g2_spart=cfg["spart"],
         out_dtype="fp8" if _s2_fp8_inter else "bf16",
-        shared_w2_u8=(
-            _mxfp4_scale_u8(shared_w2) if shared_w2 is not None else None
-        ),
+        shared_w2_u8=(_mxfp4_scale_u8(shared_w2) if shared_w2 is not None else None),
         shared_w2_scale_u8=(
-            _mxfp4_scale_u8(shared_w2_scale)
-            if shared_w2_scale is not None
-            else None
+            _mxfp4_scale_u8(shared_w2_scale) if shared_w2_scale is not None else None
         ),
         shared_expert_id=shared_expert_id,
     )
@@ -2738,7 +2734,10 @@ def get_2stage_cfgs(
             kn1 = f"{kn1}_fp4"
         if get_flydsl_kernel_params(kn1) is None:
             kn1 = _base_kn1
-        if not kn2.startswith("flydsl_moe2_layout_") and get_flydsl_kernel_params(kn2) is None:
+        if (
+            not kn2.startswith("flydsl_moe2_layout_")
+            and get_flydsl_kernel_params(kn2) is None
+        ):
             kn2 = _base_kn2
 
         logger.warning(

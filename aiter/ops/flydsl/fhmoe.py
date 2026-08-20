@@ -109,8 +109,9 @@ def compile_flydsl_fhmoe_stage2(
     shared_expert_id: int = -1,
 ):
     """Compile the heterogeneous stage2 kernel."""
-    from .kernels.mxmoe_dispatcher import compile_gemm2_a4w4_port
     from aiter.jit.utils.chip_info import get_cu_num
+
+    from .kernels.mxmoe_dispatcher import compile_gemm2_a4w4_port
 
     if b_dtype != "fp4":
         raise ValueError(f"FHMoE stage2 requires routed MXFP4 weights, got {b_dtype}")

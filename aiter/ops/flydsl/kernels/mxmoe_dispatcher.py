@@ -228,7 +228,9 @@ def compile_gemm2_a4w4_port(
     sblk_tag = f"_sblk{g2_scale_blk}" if (route_out_fp8 and g2_scale_blk != 8) else ""
     out_tag = "_fp8out" if route_out_fp8 else ""
     tile_tag = "" if (BN, BK) == (256, 256) else f"_bn{BN}_bk{BK}"
-    shared_tag = f"_shared_fp8_e{shared_expert_id}" if shared_expert_id is not None else ""
+    shared_tag = (
+        f"_shared_fp8_e{shared_expert_id}" if shared_expert_id is not None else ""
+    )
     tag = f"hmax{HIDDEN_MAX}_imax{INTER_MAX}_bm{BM}{tile_tag}{'_nt' if use_nt else ''}_{etag}{atag}{btag}{sbm_tag}{persist_tag}{pad_tag}{bh_tag}{apf_tag}{spart_tag}{bf16lds_tag}{dw_tag}{kst_tag}{pitch_tag}{sblk_tag}{out_tag}{shared_tag}_v2"
     name = f"gemm2_a4w4_port_{tag}"
 
@@ -348,7 +350,9 @@ def compile_gemm2_a4w4_port(
                     T.i32, global_typed_ptr(arg_eids, T.i32)[m_block_idx]
                 )
                 if shared_e == fx.Int32(shared_expert_id):
-                    run_body(unit_bx, arg_shared_bq, arg_shared_bscale, "fp8", 0, mn_idx)
+                    run_body(
+                        unit_bx, arg_shared_bq, arg_shared_bscale, "fp8", 0, mn_idx
+                    )
                 else:
                     run_body(unit_bx, arg_bq, arg_bscale, b_dtype, mn_idx=mn_idx)
             else:

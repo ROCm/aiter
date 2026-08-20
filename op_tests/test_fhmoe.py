@@ -828,8 +828,8 @@ def test_heterogeneous_moe_uses_a_separate_custom_op_schema():
 
 
 def test_fhmoe_runtime_uses_layout_v2_stage2(monkeypatch: pytest.MonkeyPatch):
-    from aiter.ops.flydsl import fhmoe
     from aiter import fused_moe
+    from aiter.ops.flydsl import fhmoe
 
     tensor = torch.empty((1, 1, 1))
     compile_calls = []

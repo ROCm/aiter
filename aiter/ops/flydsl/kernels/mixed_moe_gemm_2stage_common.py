@@ -53,8 +53,6 @@ from .mfma_epilogues import c_shuffle_epilog, default_epilog
 from .mfma_preshuffle_pipeline import (
     _buffer_load_vec,
     buffer_copy_gmem16_dwordx4,
-    lds_store_4b_xor16,
-    lds_store_8b_xor16,
     lds_store_16b_xor16,
     make_preshuffle_b_layout,
     make_preshuffle_scale_layout,
