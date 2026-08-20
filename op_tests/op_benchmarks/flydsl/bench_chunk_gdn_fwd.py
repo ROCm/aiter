@@ -719,12 +719,12 @@ def _load_k5_ref():
         return _k5_ref_fn
     try:
         mod = importlib.import_module(
-            "op_tests.flydsl_tests.test_flydsl_linear_attention_prefill"
+            "op_tests.test_flydsl_linear_attention_prefill"
         )
     except Exception:
         test_path = (
             Path(_REPO_ROOT)
-            / "op_tests/flydsl_tests/test_flydsl_linear_attention_prefill.py"
+            / "op_tests/test_flydsl_linear_attention_prefill.py"
         )
         spec = importlib.util.spec_from_file_location("_test_prefill", test_path)
         mod = importlib.util.module_from_spec(spec)
