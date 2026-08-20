@@ -141,9 +141,7 @@ def prepack_nchw_to_cblocked(x: torch.Tensor, block_c: int = BLOCK_K):
     C_blocks = (C + Cb - 1) // Cb
     C_pad = C_blocks * Cb
 
-    x_blocked = torch.empty(
-        (N, C_blocks, H, W, Cb), device=x.device, dtype=x.dtype
-    )
+    x_blocked = torch.empty((N, C_blocks, H, W, Cb), device=x.device, dtype=x.dtype)
     _launch_nchw_to_cblocked(x, x_blocked, N, C, H, W, C_pad, Cb)
     return x_blocked, C_pad
 

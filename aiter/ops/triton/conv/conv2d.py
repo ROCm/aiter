@@ -165,9 +165,7 @@ def _resolve_route(
             return Route.WF4X3_CBLOCKED
         if method == "winograd_f4x3":
             return Route.WF4X3
-        if _nchw_direct_is_profitable(
-            N, C, H, W_in, K_out, stride, padding, dilation
-        ):
+        if _nchw_direct_is_profitable(N, C, H, W_in, K_out, stride, padding, dilation):
             return Route.DIRECT_NCHW_3X3
         return Route.CBLOCKED_NCHW
     return Route.GENERAL

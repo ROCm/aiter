@@ -11,9 +11,7 @@ from ..activation import _gelu_tanh, _relu, _relu6
 
 
 def _get_config(shape_key=None, M=None, variants=()):
-    return get_conv_config(
-        "CONV-GENERAL", shape_key=shape_key, M=M, variants=variants
-    )
+    return get_conv_config("CONV-GENERAL", shape_key=shape_key, M=M, variants=variants)
 
 
 _conv2d_general_kernel_repr = make_kernel_repr(

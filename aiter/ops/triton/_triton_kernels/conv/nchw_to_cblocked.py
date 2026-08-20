@@ -8,9 +8,7 @@ from aiter.ops.triton.utils.conv_config_utils import get_conv_config
 
 
 def _get_config(shape_key=None, M=None, variants=()):
-    return get_conv_config(
-        "CONV-PREPACK", shape_key=shape_key, M=M, variants=variants
-    )
+    return get_conv_config("CONV-PREPACK", shape_key=shape_key, M=M, variants=variants)
 
 
 @triton.jit

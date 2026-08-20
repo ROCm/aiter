@@ -11,9 +11,7 @@ from ..activation import _gelu_tanh, _relu, _relu6
 
 
 def _get_config_nhwc(shape_key=None, M=None, variants=()):
-    return get_conv_config(
-        "CONV-3X3-NHWC", shape_key=shape_key, M=M, variants=variants
-    )
+    return get_conv_config("CONV-3X3-NHWC", shape_key=shape_key, M=M, variants=variants)
 
 
 def _get_config_cblocked(shape_key=None, M=None, variants=()):
@@ -23,9 +21,7 @@ def _get_config_cblocked(shape_key=None, M=None, variants=()):
 
 
 def _get_config_nchw(shape_key=None, M=None, variants=()):
-    return get_conv_config(
-        "CONV-3X3-NCHW", shape_key=shape_key, M=M, variants=variants
-    )
+    return get_conv_config("CONV-3X3-NCHW", shape_key=shape_key, M=M, variants=variants)
 
 
 _conv2d_3x3_nhwc_kernel_repr = make_kernel_repr(
