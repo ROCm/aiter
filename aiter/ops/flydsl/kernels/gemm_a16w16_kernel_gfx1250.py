@@ -5,8 +5,6 @@ import math
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir import ir
-from flydsl._mlir.dialects import llvm as llvm_dialect
 from flydsl.compiler.protocol import dsl_size_of
 from flydsl.expr import const_expr, gpu, idx2crd, range_constexpr, rocdl, tdm_ops
 from flydsl.expr.typing import T
@@ -25,7 +23,7 @@ def _byte_off_i32(elem_off, elem_bytes):
 
 
 def _f32(x):
-    return fx.Float32(fx.Float32(x).ir_value())
+    return fx.Float32(x)
 
 
 def apply_activation_scalar(val, activation: str):
@@ -275,15 +273,15 @@ def compile_gemm_a16w16(
 
         def _imm64(k_tile, mul):
             if const_expr(not isinstance(mul, int)):
-                return fx.Int64(fx.Int64(k_tile) * mul)
+                return fx.Int64(k_tile) * mul
             if const_expr(isinstance(k_tile, int)):
                 return fx.Int64(k_tile * mul)
-            return fx.Int64(fx.Int32(k_tile) * mul)  # mul in i32, widen for TDM
+            return fx.Int64(k_tile * mul)
 
         def _slot_off(buf_idx, slot_elems):
             if const_expr(isinstance(buf_idx, int)):
                 return fx.Uint64(buf_idx * slot_elems)
-            return fx.Uint64(fx.Int32(buf_idx) * slot_elems)  # mul in i32, widen
+            return fx.Uint64(buf_idx * slot_elems)
 
         def _lane_bases(warp_base, reps, lds_stride, transpose):
             if const_expr(not transpose):
@@ -357,6 +355,12 @@ def compile_gemm_a16w16(
                     imm_offset=_imm64(k_tile, sd[IMM]),
                 )
 
+        lds_tr_ptr_ty = fx.PointerType.get(
+            elem_ty=_fx_elem.ir_type,
+            address_space=fx.AddressSpace.Shared,
+            alignment=elem_bytes,
+        )
+
         def _frag(sd, slot_off, ks, rep):
             vec8_ty = T.vec(8, elem_ty)
             halves = []
@@ -367,8 +371,8 @@ def compile_gemm_a16w16(
                         + slot_off
                         + (ks * WMMA_K + k_half * 16) * sd[STRIDE]
                     )
-                    addr = fx.Int32(sd[BASE] + off * elem_bytes).ir_value()
-                    ptr = llvm_dialect.inttoptr(ir.Type.parse("!llvm.ptr<3>"), addr)
+                    addr = fx.Int32(sd[BASE] + off * elem_bytes)
+                    ptr = fx.to_llvm_ptr(fx.inttoptr(lds_tr_ptr_ty, addr))
                     halves.append(fx.Vector(rocdl.ds_load_tr16_b128(vec8_ty, ptr)))
                 else:
                     off = sd[BASES][rep] + slot_off + (ks * WMMA_K + k_half * 16)
