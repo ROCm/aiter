@@ -37,7 +37,11 @@ def _inverse_rope_group_quant_kernel(
 
 
 def scale_shape(
-    s: int, num_groups: int, scale_groups: int, scale_layout: str = "row"
+    s: int,
+    num_groups: int,
+    scale_groups: int,
+    scale_layout: str = "row",
+    quant_group_size: int = 128,
 ) -> tuple[int, ...]:
     """Shape of the ``x_scale`` buffer a given layout wants.
 
@@ -45,7 +49,12 @@ def scale_shape(
     persistent workspace) does not have to restate the padding rules.
     """
     if scale_layout == "mfma_tile":
-        return (num_groups, ((s + 31) // 32) * 32, ((scale_groups + 7) // 8) * 8)
+        k_align = 2 if quant_group_size == 128 else 8
+        return (
+            num_groups,
+            ((s + 31) // 32) * 32,
+            ((scale_groups + k_align - 1) // k_align) * k_align,
+        )
     if scale_layout == "n32k4":
         return ((s + 31) // 32, num_groups, scale_groups * 32)
     return (s, num_groups, scale_groups)
@@ -79,7 +88,8 @@ def inverse_rope_group_quant(
               scaleB. Requires ``quant_group_size == 32``.
 
         The two padded layouts round ``S`` up to 32 (``mfma_tile`` also rounds
-        ``Ks`` up to 8), and **the bytes that padding adds are left undefined** --
+        ``Ks`` up to its chunk width, 2 at ``quant_group_size == 128`` and 8
+        otherwise), and **the bytes that padding adds are left undefined** --
         no consumer can act on them, so nothing pays to initialise them. Compare
         scale buffers over the logical ``[S, G, Ks]`` extent, not byte-for-byte.
 
@@ -127,7 +137,7 @@ def inverse_rope_group_quant(
             scale_groups % 4 == 0
         ), f"n32k4 scale needs Ks % 4 == 0, got Ks={scale_groups}"
     if x_scale is None:
-        shape = scale_shape(S, num_groups, scale_groups, scale_layout)
+        shape = scale_shape(S, num_groups, scale_groups, scale_layout, quant_group_size)
         # Never prefilled, for any layout: the slots the padded layouts add are
         # ones no consumer can act on, and a prefill is a whole extra dispatch
         # (~1.8us over torch.empty, near flat in buffer size).

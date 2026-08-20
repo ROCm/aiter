@@ -263,9 +263,11 @@ __global__ void inverse_rope_group_quant_kernel(
 
         auto rope_whole_slice = [&]()
         {
-            scalar_t cbuf[NCOS];
-            scalar_t sbuf[NCOS];
             using vec_c = opus::vector_t<scalar_t, CCHUNK>;
+            // Written a whole vec_c at a time, which at CCHUNK 8 of bf16 is a
+            // 16-byte access that scalar_t's own alignment would leave undefined.
+            __align__(alignof(vec_c)) scalar_t cbuf[NCOS];
+            __align__(alignof(vec_c)) scalar_t sbuf[NCOS];
             const int64_t crow = pos * (RD / 2) + (local0 >> 1);
 #pragma unroll
             for(int c = 0; c < NCOS / CCHUNK; ++c)
@@ -353,14 +355,24 @@ __global__ void inverse_rope_group_quant_kernel(
         {
             if constexpr(SCALE_LAYOUT == kScaleMfmaTile)
             {
-                // s-dependent, so loop-invariant; hoisted by the compiler.
-                const int tile_k = k_group >> 3;
-                const int64_t tile_base =
-                    (static_cast<int64_t>(s >> 5) * (Ks_pad >> 3) + tile_k) << 8;
-                const int lane_idx = (k_group & 3) * 16 + (s & 15);
-                const int iter = ((s >> 4) & 1) + (((k_group >> 2) & 1) << 1);
-                x_scale[scale_row_base + tile_base + lane_idx * 4 + iter] =
-                    s8.byte;
+                if constexpr(GROUP_SIZE == 128)
+                {
+                    const int64_t tile_base =
+                        static_cast<int64_t>(s >> 5) * Ks_pad * 32 +
+                        static_cast<int64_t>(k_group >> 1) * 64;
+                    const int tile_offset =
+                        (s & 15) * 4 + (k_group & 1) * 2 + ((s >> 4) & 1);
+                    x_scale[scale_row_base + tile_base + tile_offset] = s8.byte;
+                }
+                else
+                {
+                    const int tile_k = k_group >> 3;
+                    const int64_t tile_base =
+                        (static_cast<int64_t>(s >> 5) * (Ks_pad >> 3) + tile_k) << 8;
+                    const int lane_idx = (k_group & 3) * 16 + (s & 15);
+                    const int iter = ((s >> 4) & 1) + (((k_group >> 2) & 1) << 1);
+                    x_scale[scale_row_base + tile_base + lane_idx * 4 + iter] = s8.byte;
+                }
             }
             else if constexpr(SCALE_LAYOUT == kScaleN32K4)
             {
@@ -472,8 +484,11 @@ void inverse_rope_group_quant(
         AITER_CHECK(x_scale.size(0) == G, "mfma scale: x_scale dim0 must be G");
         AITER_CHECK(x_scale.size(1) >= S && x_scale.size(1) % 32 == 0,
                     "mfma scale: x_scale dim1 (S_pad) must be >= S and %32==0");
-        AITER_CHECK(x_scale.size(2) >= scale_n && x_scale.size(2) % 8 == 0,
-                    "mfma scale: x_scale dim2 (Ks_pad) must be >= Ks and %8==0");
+        const int k_pad_alignment = quant_group_size == 128 ? 2 : 8;
+        AITER_CHECK(x_scale.size(2) >= scale_n &&
+                    x_scale.size(2) % k_pad_alignment == 0,
+                    "mfma scale: x_scale dim2 (Ks_pad) must be >= Ks and %",
+                    k_pad_alignment, "==0");
     }
     else if(scale_layout == kScaleN32K4)
     {
@@ -507,9 +522,12 @@ void inverse_rope_group_quant(
     HipDeviceGuard device_guard(o.device_id);
     const hipStream_t stream = getCurrentHIPStream();
 
+    // Read the pitch off the buffer rather than recomputing the minimum: the
+    // checks above only bound the padding from below, and its alignment depends
+    // on the group size, so a caller that pads more would be addressed wrong.
     const bool mfma_tile = scale_layout == kScaleMfmaTile;
-    const int Ks_pad = mfma_tile ? ((scale_n + 7) / 8) * 8 : scale_n;
-    const int S_pad = mfma_tile ? ((S + 31) / 32) * 32 : S;
+    const int Ks_pad = mfma_tile ? static_cast<int>(x_scale.size(2)) : scale_n;
+    const int S_pad = mfma_tile ? static_cast<int>(x_scale.size(1)) : S;
     const int wave_size = static_cast<int>(get_warp_size_func());
     const int rows = S * G;
 

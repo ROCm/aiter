@@ -21,11 +21,18 @@ enum ScaleLayout : int64_t
     // Row-major [S, G, Ks], unit stride on Ks.
     kScaleRowMajor = 0,
     // MFMA tile-shuffled for V_MFMA_SCALE_F32_16x16x128_F8 (gfx950).
-    //   Storage [G, S_pad, Ks_pad] flat with 256-byte tiles of [32_M, 8_K].
-    //   Tile-internal: byte = lane*4 + iter, lane = (k%4)*16 + (m%16),
-    //   iter = ((m/16)&1) + ((k/4)&1)*2.  S_pad = ceil(S,32), Ks_pad = ceil(Ks,8).
-    //   Same byte permutation as mx_scale_shuffle_idx, but k means a quant group
-    //   here rather than a 32-element MX block, so the implementations stay separate.
+    //   Storage [G, S_pad, Ks_pad], S_pad = ceil(S,32). The chunk a row's scales
+    //   are interleaved into follows the quant group, so Ks_pad does too:
+    //     quant_group_size 128 -> 64-byte chunks of [32_M, 2_K], Ks_pad =
+    //       ceil(Ks,2), byte = (m/32)*Ks_pad*32 + (k/2)*64 + (m%16)*4 + (k%2)*2
+    //       + ((m/16)&1). One group already spans a whole K=128 step, so pairing
+    //       k keeps a thread's consecutive k two bytes apart instead of in
+    //       different chunks.
+    //     otherwise -> 256-byte tiles of [32_M, 8_K], Ks_pad = ceil(Ks,8),
+    //       byte = tile*256 + lane*4 + iter, lane = (k%4)*16 + (m%16),
+    //       iter = ((m/16)&1) + ((k/4)&1)*2. Same byte permutation as
+    //       mx_scale_shuffle_idx, but k means a quant group here rather than a
+    //       32-element MX block, so the implementations stay separate.
     kScaleMfmaTile = 1,
     // n32k4, the gfx1250 WMMA scale layout that aiter.ops.shuffle's
     // shuffle_scale_n32k4 produces for weights -- emitted here for the
