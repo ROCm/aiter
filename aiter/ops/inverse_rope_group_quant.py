@@ -81,6 +81,11 @@ def inverse_rope_group_quant(
               (``shuffle_scale_n32k4`` on weights). Needs ``quant_group_size == 32``
               and ``Ks % 4 == 0``; the ``n32`` is super-row height, not group size.
 
+        The two padded layouts round ``S`` up to 32 (``mfma_tile`` also rounds
+        ``Ks`` up to 8), and **the bytes that padding adds are left undefined** --
+        no consumer can act on them, so nothing pays to initialise them. Compare
+        scale buffers over the logical ``[S, G, Ks]`` extent, not byte-for-byte.
+
     Returns:
         ``(x_fp8, x_scale)``.
     """
@@ -126,13 +131,23 @@ def inverse_rope_group_quant(
         ), f"n32k4 scale needs Ks % 4 == 0, got Ks={scale_groups}"
     if x_scale is None:
         shape = scale_shape(S, num_groups, scale_groups, scale_layout)
-        if scale_layout == "row":
-            x_scale = torch.empty(shape, dtype=dtypes.fp8_e8m0, device=o.device)
-        else:
-            # Both padded layouts round S up to 32, and the tail rows are never
-            # written; 0x7F (exponent 127, dequant scale 1.0) keeps a GEMM that
-            # reads past S benign.
-            x_scale = torch.full(shape, 0x7F, dtype=dtypes.fp8_e8m0, device=o.device)
+        # Never prefilled, for any layout: the slots the padded layouts add are
+        # ones no consumer can act on, and a prefill is a whole extra dispatch
+        # (~1.8us over torch.empty, near flat in buffer size).
+        #
+        # The S padding is unreachable because an e8m0 scale is per row: rows
+        # past S can only scale output rows past M, which the consumer has to
+        # drop anyway. Measured on n32k4 against the ROCm/aiter#4626 GEMM --
+        # random bytes there, e8m0 NaN included, leave the output bit-identical
+        # over 36 shapes (md 20). mfma_tile's Ks padding is unreachable for a
+        # different reason: x_fp8 is [S, G, Ks*quant_group_size] exactly, so a
+        # scale past Ks has no payload to multiply and a consumer reaching for
+        # it is already off the end of x_fp8.
+        #
+        # Callers must therefore treat the padding as undefined; anything
+        # comparing whole scale buffers byte-for-byte has to mask it off (md
+        # 20.4.1 has the one place that did).
+        x_scale = torch.empty(shape, dtype=dtypes.fp8_e8m0, device=o.device)
 
     _inverse_rope_group_quant_kernel(
         o,

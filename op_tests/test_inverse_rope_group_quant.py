@@ -177,10 +177,10 @@ def _alloc_outputs(s, g, d, group_size, scale_layout="row"):
 
     x_fp8 = torch.empty((s, g, d), dtype=get_dtype_fp8())
     shape = scale_shape(s, g, d // group_size, scale_layout)
-    if scale_layout == "row":
-        x_scale = torch.empty(shape, dtype=dtypes.fp8_e8m0)
-    else:
-        x_scale = torch.full(shape, 0x7F, dtype=dtypes.fp8_e8m0)
+    # Unfilled like the wrapper, so the padded layouts leave their padding
+    # undefined here too and any check that reads it shows up as flaky rather
+    # than agreeing with itself by accident.
+    x_scale = torch.empty(shape, dtype=dtypes.fp8_e8m0)
     return x_fp8, x_scale
 
 
@@ -435,7 +435,14 @@ def check_graph(s, h, g, head_dim, rd, group_size, dtype, scale_layout):
     sin.copy_(sin2)
     graph.replay()
     torch.cuda.synchronize()
-    graph_fp8, graph_scale = x_fp8.clone(), _scale_bytes(x_scale).clone()
+    # Unshuffled, not raw bytes: the padded layouts round S up to 32 and the op
+    # leaves the tail slots untouched, so for n32k4 -- whose consumer cannot see
+    # them (md 20) -- the wrapper hands back an unfilled torch.empty and the two
+    # allocations disagree there. Comparing the [s, g, Ks] view compares exactly
+    # the bytes the op defines.
+    scale_n_chk = d // group_size
+    graph_fp8 = x_fp8.clone()
+    graph_scale = _unshuffle_scale(x_scale, s, g, scale_n_chk, scale_layout)
 
     eager_fp8, eager_scale = inverse_rope_group_quant_cpp(
         o,
@@ -449,7 +456,9 @@ def check_graph(s, h, g, head_dim, rd, group_size, dtype, scale_layout):
     torch.cuda.synchronize()
 
     fp8_match = torch.equal(graph_fp8.view(dtypes.u8), eager_fp8.view(dtypes.u8))
-    scale_match = torch.equal(graph_scale, _scale_bytes(eager_scale))
+    scale_match = torch.equal(
+        graph_scale, _unshuffle_scale(eager_scale, s, g, scale_n_chk, scale_layout)
+    )
     # Mirrors the host dispatch in csrc/kernels/inverse_rope_group_quant.cu.
     tds = 2 if s <= 4 else (4 if s <= 128 else 8)
     wave_size = torch.cuda.get_device_properties(o.device).warp_size
