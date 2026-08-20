@@ -23,14 +23,10 @@ def is_flydsl_available() -> bool:
     return _is_flydsl_available()
 
 
-# DEPRECATED: low-level binding kept for backward compatibility only.
-# Will be removed once all callers have migrated to topk_gating() below.
-# New code should use topk_gating(), which:
-#   - accepts an Optional[Tensor] correction_bias (None => no bias)
-#   - validates score_func string
-#   - exposes the same C++ kernel under a more accurate name
-@compile_ops("module_moe_topk", develop=True)
-def topk_softplus(
+# Raw binding: no argument validation, correction_bias must be a real tensor.
+# Callers should use topk_gating() below.
+@compile_ops("module_moe_topk", fc_name="topk_gating", develop=True)
+def topk_gating_fwd(
     topk_weights: torch.Tensor,
     topk_indices: torch.Tensor,
     gating_output: torch.Tensor,
@@ -42,6 +38,16 @@ def topk_softplus(
 
 
 _VALID_SCORE_FUNCS = {"sqrtsoftplus", "sigmoid", "softmax"}
+
+
+def _valid_bias_dtypes(gating_dtype: torch.dtype) -> tuple[torch.dtype, ...]:
+    """Bias dtypes instantiated for this gating dtype; see _AITER_TOPK_GATING_SLICE.
+
+    Checked in Python because the C++ side aborts rather than raising.
+    """
+    if gating_dtype is torch.float16:
+        return (torch.float32,)
+    return (torch.float32, torch.bfloat16)
 
 
 def topk_gating(
@@ -59,22 +65,23 @@ def topk_gating(
         score_func: one of {"sqrtsoftplus" (DeepSeek V4-Pro default),
                             "sigmoid" (Llama4),
                             "softmax" (DeepSeek V3 / classic MoE)}.
-        correction_bias: optional bias tensor, pass None for no bias.
-
-    Note: softmax is already normalized, so renorm is forced off.
+        correction_bias: optional bias tensor, pass None for no bias. Must be
+            float32, or bfloat16 when gating_output is not float16.
     """
     assert (
         score_func in _VALID_SCORE_FUNCS
     ), f"Unknown score_func '{score_func}', expected one of {_VALID_SCORE_FUNCS}"
     if correction_bias is None:
-        # Match gating dtype/device so dispatch picks DTYPE_B == DTYPE_I,
-        # avoiding extra kernel template instantiations.
         correction_bias = torch.empty(
-            0, dtype=gating_output.dtype, device=gating_output.device
+            0, dtype=torch.float32, device=gating_output.device
         )
-    if score_func == "softmax":
-        need_renorm = False
-    topk_softplus(
+    else:
+        valid = _valid_bias_dtypes(gating_output.dtype)
+        assert correction_bias.dtype in valid, (
+            f"correction_bias dtype {correction_bias.dtype} is not supported for "
+            f"{gating_output.dtype} gating_output, expected one of {valid}"
+        )
+    topk_gating_fwd(
         topk_weights,
         topk_indices,
         gating_output,
@@ -83,6 +90,11 @@ def topk_gating(
         routed_scaling_factor,
         score_func,
     )
+
+
+# DEPRECATED: the kernel routes sigmoid and softmax as well, so the name is now
+# topk_gating.  Kept until callers migrate.
+topk_softplus = topk_gating
 
 
 @compile_ops("module_moe_asm", fc_name="biased_grouped_topk", develop=True)
