@@ -135,6 +135,36 @@ def select_variant(
     return tag
 
 
+# --------------------------------------------------------------------------- #
+# Fused K5+K6 variant selection (gfx942)
+#
+# The measured-best fused BV/wave tile is a function of the grid-size product ``H*N``.
+# Larger tiles win as there is more parallel work to fill the device (measured empirically). 
+#   H*N <=32 -> bv16
+#   H*N <=64 -> bv32
+#   H*N >64 -> bv64w8
+# --------------------------------------------------------------------------- #
+_FUSED_HN_BV32 = 32  # H*N above this prefers bv32 over bv16
+_FUSED_HN_BV64W8 = 64  # H*N above this prefers bv64w8 (wave-widened BV=64)
+
+
+def select_fused_variant(
+    *, gate: str, H: int, N: int, V: int, is_varlen: bool
+) -> str | None:
+    """gfx942 best fused K5+K6 variant tag from the ``H*N`` grid-size rule.
+    """
+    hn = H * max(1, N)
+    if hn <= _FUSED_HN_BV32:
+        tag = "bv16"
+    elif hn <= _FUSED_HN_BV64W8:
+        tag = "bv32"
+    else:
+        tag = "bv64w8"
+    if _bv_of_variant(tag) not in _legal_bv_candidates(V):
+        return None
+    return tag
+
+
 def _make_fast_exp(g_is_log2_scaled: bool):
     """Return the ``exp`` helper, pre-specialised on the gate's log2 scaling.
 

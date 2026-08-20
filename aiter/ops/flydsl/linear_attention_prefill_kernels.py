@@ -37,6 +37,7 @@ from .kernels.chunk_gated_delta_h import compile_chunk_gated_delta_h
 from .kernels.chunk_gated_delta_h_gfx942 import (
     compile_chunk_gated_delta_h_gfx942,
     select_variant as _gfx942_select_variant,
+    select_fused_variant as _gfx942_select_fused_variant,
 )
 
 from .kernels.tensor_shim import _run_compiled
@@ -724,24 +725,37 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
 _compiled_fused_kernels: dict = {}
 
 
-# Fused-vs-unfused selection threshold. The fused K5+K6 kernel wins whenever its
-# BV=64 grid fills the device: fill64 = ceil(V/64)*N*H / CU >= 0.5. Established by
-# the 171-shape MI325X graph-mode sweep. Below 0.5 the result is mixed and the 
-# small-grid losses can be steep.
-_FUSED_MIN_FILL64 = 0.5
+# Fused-vs-unfused selection threshold. Fuse when the fused kernel's actual 
+# grid over-fills the device by at least this fraction.
+_FUSED_MIN_FILL = 0.45
 
-def should_use_fused_gfx942(*, H: int, N: int, V: int) -> bool:
+def should_use_fused_gfx942(
+    *, H: int, N: int, V: int, gate: str | None = None, is_varlen: bool | None = None
+) -> bool:
     """Heuristic: is the fused K5+K6 kernel the faster choice for this shape?
 
-    True on gfx942 when the BV=64 grid over-fills the device by at least
-    ``_FUSED_MIN_FILL64`` (fill64 = ceil(V/64)*N*H / CU_count). Callers that pass
-    an "auto" mode use this to route between the fused kernel and the separate
-    K5+K6 pipeline. Off-arch always returns False (fused kernel is tested only on gfx942).
+    Rule (gfx942): fuse iff the fused kernel's ACTUAL grid fill clears
+    ``_FUSED_MIN_FILL``:
+
+        fill = ceil(V / BV_run) * N * H / CU_count  >=  _FUSED_MIN_FILL
+
+    where ``BV_run`` is the BV the fused launcher will actually run for this
+    shape. ``gate``/``is_varlen`` are needed to resolve ``BV_run`` from the 
+    tuned table; without them BV=64 (conservative low-fill estimate) is assumed. 
+    Off-arch always returns False (the fused kernel is tested only on gfx942).
     """
     if _ARCH != "gfx942":
         return False
-    fill64 = _grid_ctas(H=H, V=V, N=N, BV=64) / max(_device_cu_count(), 1)
-    return fill64 >= _FUSED_MIN_FILL64
+    if gate is not None and is_varlen is not None:
+        # Hg/T_flat are unused by the fused BV heuristic; pass placeholders.
+        bv_run, _ = _fused_bv_for_shape(
+            H=H, Hg=H, V=V, T_flat=0, N=N, is_varlen=is_varlen,
+            gate=gate, variant=None,
+        )
+    else:
+        bv_run = 64
+    fill = _grid_ctas(H=H, V=V, N=N, BV=bv_run) / max(_device_cu_count(), 1)
+    return fill >= _FUSED_MIN_FILL
 
 
 # Fused wave-widening: auto uses num_waves=8 (NR_SPLIT=2) when it selects BV=64
@@ -783,6 +797,14 @@ def _fused_bv_for_shape(*, H, Hg, V, T_flat, N, is_varlen, gate, variant):
                 f"supported at BV=64 (needs N_REPEAT >= NR_SPLIT); use bv64w8."
             )
         return bv, num_waves
+    # Measured-best fused variant for this signature (gfx942 only); a miss falls
+    # through to the grid-fill heuristic below.
+    if _ARCH == "gfx942":
+        tuned = _gfx942_select_fused_variant(
+            gate=gate, H=H, N=N, V=V, is_varlen=is_varlen
+        )
+        if tuned is not None:
+            return _bv_waves_of_variant(tuned)
     bv = min(
         _select_bv_for_grid(
             H=H, V=V, N=N, target_ctas=int(_GFX942_MIN_FILL * _device_cu_count())
@@ -1073,10 +1095,17 @@ def chunk_gated_delta_rule_fwd_h_o_auto(
     H = w.shape[1]
     V = u.shape[-1]
     N = (cu_seqlens.shape[0] - 1) if cu_seqlens is not None else q.shape[0]
+    gate = _gate_of(g is not None, gk is not None)
+    is_varlen = cu_seqlens is not None
 
     use_fused = (
         resolved_fusion == K5K6Fusion.ALWAYS
-        or (resolved_fusion == K5K6Fusion.AUTO and should_use_fused_gfx942(H=H, N=N, V=V))
+        or (
+            resolved_fusion == K5K6Fusion.AUTO
+            and should_use_fused_gfx942(
+                H=H, N=N, V=V, gate=gate, is_varlen=is_varlen
+            )
+        )
     )
 
     if use_fused:
