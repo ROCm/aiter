@@ -1208,10 +1208,11 @@ def test_bm16_tiled_scale_boundary():
         return
 
     from aiter.ops.flydsl.moe_kernels import get_flydsl_kernel_params
+    from aiter.ops.flydsl.mxfp4_kname import parse_flydsl_v2_gemm2_kernel
 
     expected_kernels = (
         "flydsl_moe1_afp8_wfp4_bf16_t16x128x256_w3_gui_fp8",
-        "flydsl_moe2_afp8_wfp4_bf16_t16x256x256_atomic",
+        "flydsl_moe2_layout_afp8_wfp4_bf16_t16x256x256_atomic_sbm16",
     )
     for token in (32, 64):
         metadata = get_2stage_cfgs(
@@ -1237,14 +1238,14 @@ def test_bm16_tiled_scale_boundary():
         kernel_names = tuple(stage.keywords["kernelName"] for stage in stages)
         assert kernel_names == expected_kernels
         stage1_params = get_flydsl_kernel_params(kernel_names[0])
-        stage2_params = get_flydsl_kernel_params(kernel_names[1])
+        stage2_params = parse_flydsl_v2_gemm2_kernel(kernel_names[1])
         assert stage1_params is not None
         assert stage2_params is not None
         assert stage1_params["tile_m"] == 16
         assert stage1_params["waves_per_eu"] == 3
         assert stage2_params["tile_m"] == 16
         assert stage2_params["tile_n"] == 256
-        assert stage2_params.get("xcd_swizzle", 0) == 0
+        assert stage2_params["tile_k"] == 256
 
     old_moe_bound = os.environ.get("AITER_BF16_FP8_MOE_BOUND")
     os.environ["AITER_BF16_FP8_MOE_BOUND"] = "0"

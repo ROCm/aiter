@@ -11,7 +11,6 @@ from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
 
 from .moe_kernels import (
     _flydsl_moe_stage1_impl,
-    _flydsl_moe_stage2_impl,
 )
 
 
@@ -102,6 +101,7 @@ def compile_flydsl_fhmoe_stage2(
     use_async_copy: bool = False,
     cu_num_mul: int = 1,
     b_nt: int = 0,
+    use_nt: bool | None = None,
     model_dim_pad: int = 0,
     inter_dim_pad: int = 0,
     enable_bias: bool = False,
@@ -109,33 +109,28 @@ def compile_flydsl_fhmoe_stage2(
     shared_expert_id: int = -1,
 ):
     """Compile the heterogeneous stage2 kernel."""
-    from .kernels.fhmoe import compile_mixed_fhmoe_gemm2
+    from .kernels.mxmoe_dispatcher import compile_gemm2_a4w4_port
+    from aiter.jit.utils.chip_info import get_cu_num
 
     if b_dtype != "fp4":
         raise ValueError(f"FHMoE stage2 requires routed MXFP4 weights, got {b_dtype}")
-    return compile_mixed_fhmoe_gemm2(
-        model_dim=model_dim,
-        inter_dim=inter_dim,
-        experts=experts,
-        topk=topk,
-        tile_m=tile_m,
-        tile_n=tile_n,
-        tile_k=tile_k,
-        doweight_stage2=doweight_stage2,
+    use_persist = persist_m <= 0
+    return compile_gemm2_a4w4_port(
+        BM=tile_m,
+        BN=tile_n,
+        BK=tile_k,
+        use_nt=bool(b_nt) if use_nt is None else bool(use_nt),
+        HIDDEN_MAX=max(8192, model_dim),
+        epilog="atomic" if accumulate else "reduce",
+        INTER_MAX=max(8192, inter_dim),
         a_dtype=a_dtype,
         b_dtype=b_dtype,
+        topk=topk,
+        SBM=sort_block_m or tile_m,
+        persist=use_persist,
+        cu_num=get_cu_num() * max(1, int(cu_num_mul)) if use_persist else 0,
+        has_pad=bool(inter_dim_pad or model_dim_pad),
         out_dtype=out_dtype,
-        accumulate=accumulate,
-        persist_m=persist_m,
-        sort_block_m=sort_block_m,
-        waves_per_eu=waves_per_eu,
-        use_async_copy=use_async_copy,
-        cu_num_mul=cu_num_mul,
-        b_nt=b_nt,
-        model_dim_pad=model_dim_pad,
-        inter_dim_pad=inter_dim_pad,
-        enable_bias=enable_bias,
-        xcd_swizzle=xcd_swizzle,
         shared_expert_id=shared_expert_id,
     )
 
@@ -191,56 +186,6 @@ def _s1_args_fhmoe(
     if pass_swiglu_limit:
         return args + (float(swiglu_limit), stream)
     return args + (stream,)
-
-
-def _s2_args_fhmoe(
-    target,
-    a,
-    w,
-    a_scale,
-    w_scale,
-    sorted_ids,
-    sorted_expert_ids,
-    sorted_weights,
-    num_valid_ids,
-    token_num,
-    n_in,
-    k_in,
-    blocks,
-    dev,
-    bias=None,
-    stream=None,
-    *,
-    shared_w,
-    shared_w_scale,
-):
-    """Build the expanded heterogeneous stage2 launch ABI."""
-    kernel_bias = (
-        bias.view(-1)
-        if bias is not None
-        else torch.empty(0, device=dev, dtype=torch.float32)
-    )
-    if stream is None:
-        stream = torch.cuda.current_stream()
-    return (
-        ptr_arg(target),
-        ptr_arg(a),
-        ptr_arg(w),
-        ptr_arg(a_scale),
-        ptr_arg(w_scale),
-        ptr_arg(shared_w),
-        ptr_arg(shared_w_scale),
-        ptr_arg(sorted_ids),
-        ptr_arg(sorted_expert_ids),
-        ptr_arg(sorted_weights),
-        ptr_arg(num_valid_ids),
-        ptr_arg(kernel_bias),
-        token_num,
-        n_in,
-        k_in,
-        blocks,
-        stream,
-    )
 
 
 def flydsl_fhmoe_stage1(
@@ -337,6 +282,7 @@ def flydsl_fhmoe_stage2(
     num_valid_ids: torch.Tensor,
     out: torch.Tensor | None = None,
     topk: int = 1,
+    kernelName: str | None = None,
     *,
     tile_m: int = 32,
     tile_n: int = 128,
@@ -365,47 +311,46 @@ def flydsl_fhmoe_stage2(
     shared_w2_scale: torch.Tensor,
     shared_expert_id: int,
 ) -> torch.Tensor:
-    """Run stage2 with MXFP4 routed experts and one FP8 shared expert."""
-    compile_kernel = functools.partial(
-        compile_flydsl_fhmoe_stage2,
-        shared_expert_id=shared_expert_id,
-    )
-    build_mx_args = functools.partial(
-        _s2_args_fhmoe,
-        shared_w=shared_w2.view(-1),
-        shared_w_scale=shared_w2_scale.view(-1),
-    )
-    return _flydsl_moe_stage2_impl(
+    """Run layout-v2 stage2 with routed MXFP4 and one shared FP8 expert."""
+    if kernelName is None:
+        kernelName = (
+            f"flydsl_moe2_layout_a{a_dtype}_w{b_dtype}_{out_dtype}_"
+            f"t{tile_m}x{tile_n}x{tile_k}_{mode}"
+        )
+        if persist:
+            kernelName += "_persist"
+        if b_nt:
+            kernelName += "_nt"
+        if sort_block_m:
+            kernelName += f"_sbm{sort_block_m}"
+
+    from aiter.fused_moe import _flydsl_v2_stage2_wrapper
+
+    logical_inter_dim = int(inter_states.shape[1]) * (2 if a_dtype == "fp4" else 1)
+    return _flydsl_v2_stage2_wrapper(
         inter_states=inter_states,
+        w1=None,
         w2=w2,
         sorted_token_ids=sorted_token_ids,
         sorted_expert_ids=sorted_expert_ids,
         num_valid_ids=num_valid_ids,
         out=out,
         topk=topk,
-        tile_m=tile_m,
-        tile_n=tile_n,
-        tile_k=tile_k,
-        a_dtype=a_dtype,
-        b_dtype=b_dtype,
-        out_dtype=out_dtype,
-        mode=mode,
+        kernelName=kernelName,
+        model_dim=int(w2.shape[1]),
+        inter_dim=logical_inter_dim,
+        num_experts=int(w2.shape[0]),
         w2_scale=w2_scale,
         a2_scale=a2_scale,
         sorted_weights=sorted_weights,
-        sort_block_m=sort_block_m,
-        persist=persist,
-        waves_per_eu=waves_per_eu,
-        use_async_copy=use_async_copy,
-        cu_num_mul=cu_num_mul,
-        b_nt=b_nt,
-        model_dim_pad=model_dim_pad,
+        bias2=bias,
         inter_dim_pad=inter_dim_pad,
-        xcd_swizzle=xcd_swizzle,
-        bias=bias,
-        return_per_slot=return_per_slot,
+        model_dim_pad=model_dim_pad,
+        block_m=sort_block_m or tile_m,
         expert_mask=expert_mask,
         topk_ids=topk_ids,
-        _compile_kernel=compile_kernel,
-        _build_mx_args=build_mx_args,
+        topk_weights=None,
+        shared_w2=shared_w2,
+        shared_w2_scale=shared_w2_scale,
+        shared_expert_id=shared_expert_id,
     )

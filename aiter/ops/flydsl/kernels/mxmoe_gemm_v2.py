@@ -257,6 +257,7 @@ def gemm2_body_v2(
     g2_defer_weight=0,
     g2_out_pitch_align=0,
     g2_scale_blk=8,
+    expert_override=None,
 ):
     # GEMM2 double-buffers B weight and scale one tile ahead. bhoist issues that
     # prefetch above the LDS barrier; ascale_pf prefetches A-scale one tile ahead.
@@ -314,6 +315,8 @@ def gemm2_body_v2(
         e = rocdl.readfirstlane(T.i32, _raw(eids_ptr[m_block_idx]))
     else:
         e = rocdl.readfirstlane(T.i32, _raw(eids_ptr[_udiv(m_row, fx.Int32(SBM))]))
+    if const_expr(expert_override is not None):
+        e = fx.Int32(expert_override)
 
     lane_div_16 = lane // 16
     lane_mod_16 = lane % 16

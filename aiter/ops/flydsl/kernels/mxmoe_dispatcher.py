@@ -42,6 +42,7 @@ def _active_m_blocks_upper_bound(M_logical, topk, NE, BM, SBM):
 def _validate_v2_gemm2_dtypes(a_dtype: str, b_dtype: str) -> None:
     if (a_dtype, b_dtype) not in {
         ("fp4", "fp4"),
+        ("fp4", "fp8"),
         ("fp8", "fp4"),
         ("fp8", "fp8"),
     }:
@@ -115,6 +116,7 @@ def compile_gemm2_a4w4_port(
     g2_bf16_lds=None,
     g2_kstatic=False,
     out_dtype="bf16",
+    shared_expert_id=None,
 ):
     """Compile gemm2 a4w4 down-proj; epilog 'atomic' (weighted atomic-fadd) or 'reduce' (store into out[token_id*topk+slot]). inter_dim runtime; SBM None -> SBM==BM byte-identical."""
     SBM = _norm_sbm(SBM, BM)
@@ -164,6 +166,15 @@ def compile_gemm2_a4w4_port(
             f"g2_spart={g2_spart} must encode GroupNum>=1,M01>=1 as GroupNum*100+M01 (e.g. 402)"
         )
     _validate_v2_gemm2_dtypes(a_dtype, b_dtype)
+    if shared_expert_id is not None:
+        if b_dtype != "fp4" or a_dtype not in ("fp4", "fp8"):
+            raise AssertionError(
+                "FHMoE layout GEMM2 requires fp4 routed weights and fp4/fp8 activations"
+            )
+        if shared_expert_id < 0:
+            raise AssertionError(
+                f"shared_expert_id must be non-negative, got {shared_expert_id}"
+            )
     assert INTER_MAX % BK == 0, f"INTER_MAX must be a multiple of {BK}, got {INTER_MAX}"
     is_f8 = a_dtype == "fp8"
     if g2_bf16_lds is None:
@@ -217,7 +228,8 @@ def compile_gemm2_a4w4_port(
     sblk_tag = f"_sblk{g2_scale_blk}" if (route_out_fp8 and g2_scale_blk != 8) else ""
     out_tag = "_fp8out" if route_out_fp8 else ""
     tile_tag = "" if (BN, BK) == (256, 256) else f"_bn{BN}_bk{BK}"
-    tag = f"hmax{HIDDEN_MAX}_imax{INTER_MAX}_bm{BM}{tile_tag}{'_nt' if use_nt else ''}_{etag}{atag}{btag}{sbm_tag}{persist_tag}{pad_tag}{bh_tag}{apf_tag}{spart_tag}{bf16lds_tag}{dw_tag}{kst_tag}{pitch_tag}{sblk_tag}{out_tag}_v2"
+    shared_tag = f"_shared_fp8_e{shared_expert_id}" if shared_expert_id is not None else ""
+    tag = f"hmax{HIDDEN_MAX}_imax{INTER_MAX}_bm{BM}{tile_tag}{'_nt' if use_nt else ''}_{etag}{atag}{btag}{sbm_tag}{persist_tag}{pad_tag}{bh_tag}{apf_tag}{spart_tag}{bf16lds_tag}{dw_tag}{kst_tag}{pitch_tag}{sblk_tag}{out_tag}{shared_tag}_v2"
     name = f"gemm2_a4w4_port_{tag}"
 
     @fx.struct
@@ -230,6 +242,8 @@ def compile_gemm2_a4w4_port(
         arg_ascale,
         arg_bq,
         arg_bscale,
+        arg_shared_bq,
+        arg_shared_bscale,
         arg_eids,
         arg_cumsum,
         arg_stids,
@@ -271,12 +285,19 @@ def compile_gemm2_a4w4_port(
                 )
 
         # One (m_block, n_block) unit for a synthesized unit_bx; non-persist calls once, persist per m-tile.
-        def run_unit(unit_bx, mn_idx=None):
+        def run_body(
+            unit_bx,
+            body_bq,
+            body_bscale,
+            body_b_dtype,
+            expert_override=None,
+            mn_idx=None,
+        ):
             gemm2_body_v2(
                 lds_base_i32,
                 arg_ascale,
-                arg_bq,
-                arg_bscale,
+                body_bq,
+                body_bscale,
                 arg_eids,
                 arg_stids,
                 arg_sweights,
@@ -300,7 +321,7 @@ def compile_gemm2_a4w4_port(
                 aStages=aStages,
                 a_slot_alias=a_slot_alias,
                 a_dtype=a_dtype,
-                b_dtype=b_dtype,
+                b_dtype=body_b_dtype,
                 use_reduce=use_reduce,
                 topk=topk,
                 has_pad=has_pad,
@@ -312,8 +333,26 @@ def compile_gemm2_a4w4_port(
                 g2_out_pitch_align=g2_out_pitch_align,
                 g2_scale_blk=g2_scale_blk,
                 route_out_fp8=route_out_fp8,
+                expert_override=expert_override,
                 mn_idx=mn_idx,
             )
+
+        def run_unit(unit_bx, mn_idx=None):
+            if const_expr(shared_expert_id is not None):
+                m_block_idx = (
+                    mn_idx[0]
+                    if const_expr(mn_idx is not None)
+                    else _udiv(unit_bx, num_n_blocks)
+                )
+                shared_e = rocdl.readfirstlane(
+                    T.i32, global_typed_ptr(arg_eids, T.i32)[m_block_idx]
+                )
+                if shared_e == fx.Int32(shared_expert_id):
+                    run_body(unit_bx, arg_shared_bq, arg_shared_bscale, "fp8", 0, mn_idx)
+                else:
+                    run_body(unit_bx, arg_bq, arg_bscale, b_dtype, mn_idx=mn_idx)
+            else:
+                run_body(unit_bx, arg_bq, arg_bscale, b_dtype, mn_idx=mn_idx)
 
         if const_expr(not persist and g2_spart <= 0):
             # One-shot naive linear block->(m,n): issue A->LDS before the cumsum load (latency overlap).
@@ -375,6 +414,8 @@ def compile_gemm2_a4w4_port(
         arg_ascale: fx.Int64,
         arg_bq: fx.Int64,
         arg_bscale: fx.Int64,
+        arg_shared_bq: fx.Int64,
+        arg_shared_bscale: fx.Int64,
         arg_eids: fx.Int64,
         arg_cumsum: fx.Int64,
         arg_stids: fx.Int64,
@@ -400,6 +441,8 @@ def compile_gemm2_a4w4_port(
             arg_ascale,
             arg_bq,
             arg_bscale,
+            arg_shared_bq,
+            arg_shared_bscale,
             arg_eids,
             arg_cumsum,
             arg_stids,
@@ -423,6 +466,8 @@ def compile_gemm2_a4w4_port(
         arg_ascale: fx.Int64,
         arg_bq: fx.Int64,
         arg_bscale: fx.Int64,
+        arg_shared_bq: fx.Int64,
+        arg_shared_bscale: fx.Int64,
         arg_eids: fx.Int64,
         arg_cumsum: fx.Int64,
         arg_stids: fx.Int64,
@@ -446,6 +491,8 @@ def compile_gemm2_a4w4_port(
             arg_ascale,
             arg_bq,
             arg_bscale,
+            arg_shared_bq,
+            arg_shared_bscale,
             arg_eids,
             arg_cumsum,
             arg_stids,
@@ -487,6 +534,7 @@ def get_g2(
     g2_bf16_lds=None,
     g2_spart=None,
     g2_kstatic=False,
+    shared_expert_id=None,
 ):
     # Cache key uses compile-time buckets; runtime inter_dim/model_dim share a
     # launcher while remaining within their respective caps.
@@ -526,6 +574,7 @@ def get_g2(
         g2_bf16_lds,
         g2_kstatic,
         out_dtype,
+        shared_expert_id,
     )
     launch = G2_CACHE.get(key)
     if launch is None:
@@ -550,6 +599,7 @@ def get_g2(
             g2_bf16_lds=g2_bf16_lds,
             g2_kstatic=g2_kstatic,
             out_dtype=out_dtype,
+            shared_expert_id=shared_expert_id,
         )
         G2_CACHE[key] = launch
     return launch
@@ -591,11 +641,22 @@ def mxfp4_moe_gemm2(
     g2_bf16_lds=None,
     g2_spart=None,
     stream=None,
+    shared_w2_u8=None,
+    shared_w2_scale_u8=None,
+    shared_expert_id=None,
 ):
     """Stage-2 down-proj gemm; epilog 'atomic' (weighted atomic.fadd) or 'reduce' (store into out[token_id*topk+slot]). inter_dim_pad/model_dim_pad>0 enable has_pad pad-skip (both 0 -> byte-identical); persist = fixed cu_num m-slot grid (default OFF)."""
     import torch
 
     _validate_v2_gemm2_dtypes(a_dtype, b_dtype)
+    if (shared_w2_u8 is None) != (shared_w2_scale_u8 is None):
+        raise ValueError(
+            "shared_w2_u8 and shared_w2_scale_u8 must be provided together"
+        )
+    if shared_expert_id is not None and shared_w2_u8 is None:
+        raise ValueError(
+            "shared_expert_id requires shared_w2_u8 and shared_w2_scale_u8"
+        )
     if persist and cu_num <= 0:
         cu_num = get_cu_num()
     SBM = _norm_sbm(SBM, BM)
@@ -656,6 +717,7 @@ def mxfp4_moe_gemm2(
         out_dtype=out_dtype,
         g2_bf16_lds=g2_bf16_lds,
         g2_spart=g2_spart,
+        shared_expert_id=shared_expert_id,
     )
     max_m_blocks = (max_sorted + BM - 1) // BM
     if persist:
@@ -677,6 +739,8 @@ def mxfp4_moe_gemm2(
         inter_sorted_shuffled_scale.data_ptr(),
         w2_u8.data_ptr(),
         w2_scale_u8.data_ptr(),
+        0 if shared_w2_u8 is None else shared_w2_u8.data_ptr(),
+        0 if shared_w2_scale_u8 is None else shared_w2_scale_u8.data_ptr(),
         sorted_expert_ids.data_ptr(),
         cumsum_tensor.data_ptr(),
         sorted_token_ids.data_ptr(),

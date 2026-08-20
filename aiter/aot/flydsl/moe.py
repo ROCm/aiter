@@ -213,16 +213,15 @@ def _precompile_to_cache(
     out_dtype: str = "bf16",
     act: str = "silu",
     doweight_stage1: bool = False,
-    # Must match the runtime default of ``compile_mixed_moe_gemm2`` /
-    # ``compile_mixed_moe_gemm1`` (``Optional[int] = None``). A scalar default
-    # (e.g. ``3``) would make the AOT-side ``_cache_tag`` tuple disagree with
-    # the runtime-side tuple for any legacy kernel that does not explicitly
-    # pin ``waves_per_eu`` in ``get_flydsl_stage{1,2}_kernels`` (only the
-    # production-variant ``_persist_async_w4_cumul3`` does), causing
-    # ``AOT cache miss`` at runtime even though the .pkl is present on disk.
+    # Keep this optional to match the runtime's legacy stage1/a16w stage2
+    # defaults. A scalar default would make the AOT-side ``_cache_tag`` tuple
+    # disagree with the runtime-side tuple for kernels that do not explicitly
+    # pin ``waves_per_eu``, causing an ``AOT cache miss`` at runtime even
+    # though the .pkl is present on disk.
     waves_per_eu: int | None = None,
     k_batch: int = 1,
     b_nt: int = 2,
+    use_nt: bool | None = None,
     gate_mode: str = "separated",
     mode: str = "atomic",
     persist=None,
@@ -775,7 +774,7 @@ def _precompile_to_cache(
                 if _aot_backend is None
                 else _aot_backend.compile_stage2
             )
-            exe = compile_stage2(
+            stage2_compile_kwargs = dict(
                 model_dim=model_dim,
                 inter_dim=inter_dim,
                 experts=E,
@@ -797,6 +796,9 @@ def _precompile_to_cache(
                 xcd_swizzle=xcd_swizzle,
                 enable_bias=enable_bias,
             )
+            if _aot_backend is not None:
+                stage2_compile_kwargs["use_nt"] = use_nt
+            exe = compile_stage2(**stage2_compile_kwargs)
             _run_compiled(exe, args)
 
             # Reduce mode (accumulate=False) runs a separate topk reduction

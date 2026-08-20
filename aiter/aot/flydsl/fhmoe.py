@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from aiter.aot.flydsl.common import cu_num_to_arch, job_identity
+from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
 
 
 def _normalized_enum(value: str) -> str:
@@ -86,10 +87,12 @@ def extend_fhmoe_jobs(
 ) -> list[dict[str, Any]]:
     """Append FHMoE variants for eligible ordinary jobs in ``csv_path``."""
     eligible_keys: set[tuple[Any, ...]] = set()
+    eligible_rows = []
     with open(csv_path, newline="") as f:
         for row in csv.DictReader(f):
             if _is_dsv4_fhmoe_row(row):
                 eligible_keys.update(_row_job_keys(row))
+                eligible_rows.append(row)
 
     fhmoe_jobs = []
     for job in ordinary_jobs:
@@ -108,6 +111,65 @@ def extend_fhmoe_jobs(
             continue
         seen.add(key)
         fhmoe_jobs.append(fhmoe_job)
+
+    # Layout-v2 stage2 rows are compiled by mxfp4_moe.py for ordinary MoE, so
+    # they are intentionally absent from `ordinary_jobs`. FHMoE needs an AOT
+    # job for the same row because its shared-expert operands are part of the
+    # v2 launcher ABI.
+    from aiter.ops.flydsl.mxfp4_kname import parse_flydsl_v2_gemm2_kernel
+
+    for row in eligible_rows:
+        stage2_name = row.get("kernelName2", "").strip()
+        stage2_params = parse_flydsl_v2_gemm2_kernel(stage2_name)
+        if stage2_params is None:
+            continue
+        token = int(row["token"])
+        model_dim = int(row["model_dim"])
+        inter_dim = int(row["inter_dim"])
+        experts = int(row["expert"])
+        topk = int(row["topk"])
+        block_m = int(row.get("block_m", "0") or "0")
+        cu_num = int(row.get("cu_num", "0"))
+        act = _normalized_enum(row.get("act_type", ""))
+        base = next(
+            (
+                job
+                for job in fhmoe_jobs
+                if job.get("stage") == 1
+                and job["token_num"] == token
+                and job["model_dim"] == model_dim
+                and job["inter_dim"] == inter_dim
+                and job["experts"] == experts
+                and job["topk"] == topk
+                and job["block_m"] == block_m
+                and job["cu_num"] == cu_num
+                and job["act"] == act
+            ),
+            None,
+        )
+        if base is None:
+            continue
+        fhmoe_job = {
+            **base,
+            "stage": 2,
+            "kernel_name": stage2_name,
+            "stage1_fuse_quant": stage2_params["a_dtype"],
+            "a_dtype": stage2_params["a_dtype"],
+            "b_dtype": stage2_params["b_dtype"],
+            "out_dtype": stage2_params["out_dtype"],
+            "tile_m": stage2_params["tile_m"],
+            "tile_n": stage2_params["tile_n"],
+            "tile_k": stage2_params["tile_k"],
+            "mode": stage2_params["epilog"],
+            "persist": stage2_params["persist"],
+            "sort_block_m": stage2_params["sort_block_m"],
+            "use_nt": stage2_params["use_nt"],
+            "v2": True,
+        }
+        key = job_identity(fhmoe_job)
+        if key not in seen:
+            seen.add(key)
+            fhmoe_jobs.append(fhmoe_job)
 
     return [*ordinary_jobs, *fhmoe_jobs]
 
@@ -199,29 +261,29 @@ class _FHMoEAOTBackend:
         bias=None,
         stream=None,
     ):
-        from aiter.ops.flydsl.fhmoe import _s2_args_fhmoe
-
         shared_w = _shared_weight(dev, n_in, k_in)
         shared_w_scale = _shared_scale(dev, n_in, k_in)
-        return _s2_args_fhmoe(
-            target,
-            a,
-            w,
-            a_scale,
-            w_scale,
-            sorted_ids,
-            sorted_expert_ids,
-            sorted_weights,
-            num_valid_ids,
+        return (
+            ptr_arg(a),
+            ptr_arg(a_scale),
+            ptr_arg(w),
+            ptr_arg(w_scale),
+            ptr_arg(shared_w),
+            ptr_arg(shared_w_scale),
+            ptr_arg(sorted_expert_ids),
+            ptr_arg(num_valid_ids),
+            ptr_arg(sorted_ids),
+            ptr_arg(sorted_weights),
             token_num,
-            n_in,
-            k_in,
             blocks,
-            dev,
-            bias=bias,
-            stream=stream,
-            shared_w=shared_w,
-            shared_w_scale=shared_w_scale,
+            blocks,
+            k_in,
+            n_in,
+            0,
+            0,
+            ptr_arg(target),
+            ptr_arg(target),
+            stream,
         )
 
     def compile_stage1(self, **kwargs):

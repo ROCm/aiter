@@ -1970,6 +1970,9 @@ def _flydsl_v2_stage2_wrapper(
     expert_mask=None,
     topk_ids=None,
     topk_weights=None,
+    shared_w2=None,
+    shared_w2_scale=None,
+    shared_expert_id=None,
     **_kwargs,
 ):
     from aiter.ops.flydsl.kernels.mxmoe_dispatcher import (
@@ -1987,6 +1990,8 @@ def _flydsl_v2_stage2_wrapper(
     bk = cfg["tile_k"]
     sbm = cfg["sort_block_m"] or (int(block_m) if block_m else bm)
     epilog = cfg["epilog"]
+    if os.environ.get("AITER_FLYDSL_FORCE_REDUCE", "0") == "1":
+        epilog = "reduce"
     max_sorted = inter_states.shape[0]
 
     token_num = out.shape[0]
@@ -2069,6 +2074,15 @@ def _flydsl_v2_stage2_wrapper(
         g2_bf16_lds=cfg["bf16_lds"],
         g2_spart=cfg["spart"],
         out_dtype="fp8" if _s2_fp8_inter else "bf16",
+        shared_w2_u8=(
+            _mxfp4_scale_u8(shared_w2) if shared_w2 is not None else None
+        ),
+        shared_w2_scale_u8=(
+            _mxfp4_scale_u8(shared_w2_scale)
+            if shared_w2_scale is not None
+            else None
+        ),
+        shared_expert_id=shared_expert_id,
     )
     if epilog == "reduce":
         from aiter.ops.flydsl.moe_kernels import _run_moe_reduction
@@ -2701,21 +2715,30 @@ def get_2stage_cfgs(
         _base_kn1 = flydsl_kernel_name(
             1, _a_type, _w_type, _out_type, _tile_m, 128, 256
         )
-        _base_kn2 = flydsl_kernel_name(
-            2, _a_type, _w_type, _out_type, _tile_m, 128, _s2_tk, "atomic"
+        _base_kn2 = (
+            f"flydsl_moe2_layout_a{_a_type}_w{_w_type}_{_out_type}_"
+            f"t{_tile_m}x128x{_s2_tk}_atomic"
         )
+        if _tile_m in (16, 32) and token < 2048:
+            _base_kn2 += "_nt"
+        _base_kn2 += f"_sbm{_tile_m}"
         kn1 = f"{_base_kn1}{_s1_sfx}"
-        kn2 = f"{_base_kn2}{_s2_sfx}"
+        kn2 = (
+            _base_kn2
+            if _base_kn2.startswith("flydsl_moe2_layout_")
+            else f"{_base_kn2}{_s2_sfx}"
+        )
 
-        # fp8 stage1 kernel names always carry a "_gui" suffix
-        # (moe_kernels.py:114-115). Append it before the lookup so the fp8
-        # variants resolve; fp4 names are unchanged.
+        # Append the fused quantization suffixes before the lookup so the
+        # layout-v2 stage2 receives its required sorted quantized intermediate.
         if _a_type == "fp8":
-            kn1 = f"{kn1}_gui"
+            kn1 = f"{kn1}_gui_fp8"
             _base_kn1 = f"{_base_kn1}_gui"
+        elif _a_type == "fp4":
+            kn1 = f"{kn1}_fp4"
         if get_flydsl_kernel_params(kn1) is None:
             kn1 = _base_kn1
-        if get_flydsl_kernel_params(kn2) is None:
+        if not kn2.startswith("flydsl_moe2_layout_") and get_flydsl_kernel_params(kn2) is None:
             kn2 = _base_kn2
 
         logger.warning(
@@ -2732,8 +2755,11 @@ def get_2stage_cfgs(
                 model_dim_pad=hidden_pad,
             ),
             functools.partial(
-                _flydsl_stage2_wrapper,
+                _flydsl_v2_stage2_wrapper,
                 kernelName=kn2,
+                model_dim=model_dim,
+                inter_dim=inter_dim,
+                num_experts=expert,
                 inter_dim_pad=intermediate_pad,
                 model_dim_pad=hidden_pad,
             ),
@@ -2742,6 +2768,8 @@ def get_2stage_cfgs(
             False,
             has_bias=enable_bias,
             stage2_has_bias=enable_bias,
+            fuse_quant=_a_type,
+            skip_inter_quant=True,
         )
     if (
         dtype in [dtypes.bf16, dtypes.fp16]
