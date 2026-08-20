@@ -1,0 +1,120 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "validation_report",
+  "description": "Machine-readable output of validate-kernel-pr. review-pr consumes this as the evidence base for any finding that asserts runtime behaviour. Fields that describe coverage are required precisely so a report cannot overclaim by omission.",
+  "type": "object",
+  "required": ["label", "started_utc", "isolation", "stages", "findings", "verdict"],
+  "additionalProperties": true,
+  "properties": {
+    "label": { "type": "string", "description": "Run identifier, e.g. the PR number or a candidate name." },
+    "started_utc": { "type": "string", "description": "ISO-8601 UTC timestamp at run start." },
+    "finished_utc": { "type": "string" },
+
+    "isolation": {
+      "type": "object",
+      "description": "The isolation actually achieved, not the isolation intended.",
+      "required": ["level", "container"],
+      "properties": {
+        "level": { "type": "string", "examples": ["git-worktree + private caches", "container"] },
+        "container": { "type": "boolean" },
+        "reason": { "type": "string", "description": "Why the level is what it is, when it is not container-level." }
+      }
+    },
+
+    "arch_coverage": {
+      "type": "object",
+      "description": "Per-architecture coverage. 'runtime' means kernels were executed on that device; 'compile-only' means they were built for it and never run. A host without a device for an arch must report compile-only for it.",
+      "additionalProperties": { "type": "string", "enum": ["runtime", "compile-only", "not-covered"] },
+      "examples": [{ "gfx950": "runtime", "gfx942": "compile-only (no gfx942 device on this host)" }]
+    },
+
+    "degraded_mode": {
+      "type": ["string", "null"],
+      "enum": ["COMPILE_ONLY", null],
+      "description": "Set when no GPU could be claimed. Every downstream correctness/perf claim is then unbacked and must be read as [compile-only validation]."
+    },
+
+    "repo": {
+      "type": "object",
+      "properties": {
+        "worktree": { "type": "string" },
+        "head": { "type": "string", "description": "SHA the validation ran against." }
+      }
+    },
+
+    "stages": {
+      "type": "object",
+      "description": "One entry per stage. A stage that could not run reports 'skip' with a note; it never reports 'pass' for work it did not do.",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["status"],
+        "properties": {
+          "status": { "type": "string", "enum": ["pass", "fail", "skip", "info"] },
+          "note": { "type": "string" },
+          "log": { "type": "string", "description": "Path to the retained stage log." }
+        }
+      },
+      "properties": {
+        "merge_sim": { "description": "PR head applied onto the current base; conflict short-circuits the run." },
+        "gpu_claim": {
+          "description": "GPU claimed over a sampling window and held under flock for the whole run.",
+          "properties": {
+            "hip_index": { "type": "integer", "description": "Translated HIP index; amd-smi numbering can differ." },
+            "model": { "type": "string" },
+            "arch": { "type": "string" },
+            "bdf": { "type": "string" },
+            "gfx_activity_before_pct": { "type": "string" },
+            "host": { "type": "string" }
+          }
+        },
+        "runtime_compat": { "description": "Whether the checkout imports against the installed runtime. A mismatch is reported as such, not attributed to the PR." },
+        "test_policy": {
+          "description": "Checks run BEFORE the suite, because a suite that cannot fail still reports green.",
+          "properties": {
+            "tolerances_base": { "type": "array", "items": { "type": "number" } },
+            "tolerances_head": { "type": "array", "items": { "type": "number" } },
+            "loosened": { "type": "array", "description": "(base, head) pairs where this change widened a tolerance." },
+            "commented_out_shape_rows": { "type": "integer" }
+          }
+        },
+        "correctness_repo_tests": { "description": "The suite the PR itself ships." },
+        "correctness_s1_grid": {
+          "description": "A shape grid this skill owns, independent of what the PR chose to test: non-toy, boundary/odd, long-context. 'skip' with repo-default-only when the kernel exposes no shape override.",
+          "properties": { "grid": { "type": "string" } }
+        },
+        "index_width_scan": {
+          "description": "Structural candidates for 32-bit index/stride overflow. Informational: the reviewer judges each, the count does not move the verdict.",
+          "properties": { "candidates": { "type": "integer" } }
+        },
+        "perf": {
+          "description": "Median-of-N against baseline on the same locked GPU. Absent when not run.",
+          "properties": { "baseline": { "type": "string" }, "median_ratio": { "type": "number" } }
+        },
+        "claims": {
+          "description": "Reproduction of the performance numbers stated in the PR description. A number that does not reproduce is tagged [unreproducible] rather than dropped.",
+          "properties": { "unreproducible": { "type": "array", "items": { "type": "string" } } }
+        }
+      }
+    },
+
+    "findings": {
+      "type": "array",
+      "description": "Machine-generated findings from the stages above. These are evidence, not review prose; review-pr turns them into reviewer-facing findings.",
+      "items": {
+        "type": "object",
+        "required": ["severity", "stage", "detail"],
+        "properties": {
+          "severity": { "type": "string", "enum": ["blocker", "should-fix", "note"] },
+          "stage": { "type": "string" },
+          "detail": { "type": "string" }
+        }
+      }
+    },
+
+    "verdict": {
+      "type": "string",
+      "enum": ["PASS", "NEEDS WORK", "BLOCK"],
+      "description": "Covers only what ran. Read together with arch_coverage, isolation and degraded_mode: a PASS on a compile-only run asserts nothing about runtime behaviour."
+    }
+  }
+}
