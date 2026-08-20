@@ -1086,10 +1086,27 @@ def fused_moe_1stage(
             activation,
         )
     else:
+        # A FLAT MXFP4 kernel tuned with xbf16=0 wants X already quantized: one asm pass
+        # writes the packed fp4 rows plus the e8m0 scale tiles it addresses, and zeroes
+        # moe_buf, which it needs because it accumulates into those rows with atomics.
+        flat_mxfp4_prequant = bool(flat) and quant_type == QuantType.per_1x32 and not xbf16
         if xbf16:
             # xquant happens inside the asm kernel for per_1x128
             a1 = hidden_states
             a1_scale = torch.empty(0, device="cuda")
+        elif flat_mxfp4_prequant:
+            token_cnt, dim = hidden_states.shape
+            a1 = torch.empty(
+                (token_cnt, dim // 2), dtype=dtypes.fp4x2, device=hidden_states.device
+            )
+            # Token x owns scale tile x: 32 rows of dim/32 bytes, of which only row 0
+            # carries data. The rest is the pitch the GEMM's addressing assumes.
+            a1_scale = torch.empty(
+                (token_cnt * 32, dim // 32),
+                dtype=dtypes.fp8_e8m0,
+                device=hidden_states.device,
+            )
+            aiter.fmoe_mxfp4_xquant_prepass(moe_buf, a1, a1_scale, hidden_states)
         else:
             quant_func = get_quant(quant_type)
             if hidden_states.dtype != q_dtype_a:
@@ -1116,11 +1133,10 @@ def fused_moe_1stage(
         token_num = hidden_states.shape[0]
         E, model_dim, _inter_dim = get_inter_dim(w1.shape, w2.shape)
         if quant_type == QuantType.per_1x32:
-            # FLAT per_1x32 kernels are always xbf16: X stays bf16 and is
-            # dynamic-quantized to MXFP4 inside the kernel, so there is no host
-            # activation e8m0 scale to pack. Only the (not-yet-enabled) non-flat
-            # pre-quantized fp4 path carries a host scale that needs sorting.
-            if not xbf16:
+            # An xbf16 kernel quantizes X itself, and the FLAT pre-pass already emits
+            # the scale in the tile layout its GEMM addresses; neither has a host scale
+            # to sort. Only the non-flat pre-quantized fp4 path does.
+            if not xbf16 and not flat_mxfp4_prequant:
                 a1_scale = mxfp4_moe_sort_fwd(
                     a1_scale,
                     sorted_ids=sorted_ids,
