@@ -1323,15 +1323,11 @@ def test_mha_varlen_bwd_sink_variable_lengths(dtype):
     )
 
 
-# OPUS gfx950 group/varlen D_QK=192 / D_V=128, validated through the direct shared
-# wrapper (packed THD; exercises the group-mode host launch + kernel via the shared
-# pybind). Q and KV carry independent cu_seqlens, so entries where the two length lists
-# differ are packed cross-attention; causal is bottom-right aligned per group, meaning a
-# group with seqlen_q > seqlen_kv has leading rows that see no keys (O=0, LSE=-inf).
-# kv_pad > 0 selects the KV-padding variant: each group's K/V rows are aligned up to that
-# multiple, so seqstart_k (real lengths, drives masks / tile counts) and seqstart_k_pad
-# (physical row offsets) diverge. The gaps are NaN-filled, so any read past a group's real
-# seqlen_kv -- which the kernel must clamp away via num_records -- shows up as NaN in out.
+# OPUS gfx950 group/varlen D_QK=192 / D_V=128 via the direct wrapper (packed THD).
+# Q and KV take independent cu_seqlens, so entries whose length lists differ are packed
+# cross-attention. kv_pad > 0 aligns each group's K/V rows up to that multiple, making
+# seqstart_k (real lengths) and seqstart_k_pad (physical offsets) diverge; the gaps are
+# NaN-filled so a read past a group's real seqlen_kv surfaces as NaN.
 #   (q seqlens, kv seqlens, nheads, nheads_k, kv_pad)
 _OPUS_D192_GROUP_CASES = [
     ([64, 200, 500], [64, 200, 500], 8, 2, 0),  # varlen self-attn, GQA
@@ -1343,9 +1339,7 @@ _OPUS_D192_GROUP_CASES = [
     ([300, 77, 1024], [700, 200, 300], 4, 4, 0),  # cross, mixed + partial, MHA
     ([1024, 8], [1, 8], 2, 1, 0),  # 1024 queries vs a single key, MQA
     ([1, 1, 1], [256, 512, 64], 16, 4, 0),  # decode-shaped groups, GQA
-    # ceil(1024/256)*64*2 = 512 -> causal head/tail merge on, so the mirror Q block scans
-    # KV in reverse; group 0 is also sq > sk so that pass starts on a fully-masked tile.
-    ([1024, 1024], [640, 1024], 64, 8, 0),
+    ([1024, 1024], [640, 1024], 64, 8, 0),  # 4*64*2 = 512 -> head/tail merge, GQA
     ([200, 64, 700], [200, 64, 700], 8, 2, 256),  # KV padded to 256, GQA
     ([1, 300], [1024, 333], 16, 4, 64),  # KV padded + cross, GQA
 ]
@@ -1362,11 +1356,7 @@ _OPUS_D192_GROUP_CASES = [
 def test_fmha_fwd_bf16_opus_d192_v128_group(
     seqlens_q, seqlens_kv, nheads, nheads_k, kv_pad, causal
 ):
-    """OPUS D=192 group/varlen forward with LSE, per group against attention_ref.
-
-    Packed [total, H, D]. kv_pad=0 keeps physical == real cu_seqlens; kv_pad > 0
-    exercises the KV-padding variant (see the case list).
-    """
+    """OPUS D=192 group/varlen forward with LSE, per group against attention_ref."""
     if get_gfx() != "gfx950":
         pytest.skip("opus D=192 kernel requires gfx950")
     assert len(seqlens_q) == len(seqlens_kv)
@@ -1381,14 +1371,13 @@ def test_fmha_fwd_bf16_opus_d192_v128_group(
             device="cuda",
         )
 
-    # Physical KV rows per group (== real when kv_pad == 0).
     phys_kv = [
         ((s + kv_pad - 1) // kv_pad) * kv_pad if kv_pad else s for s in seqlens_kv
     ]
     total_q = sum(seqlens_q)
     cu_q = _cumsum(seqlens_q)
-    cu_k = _cumsum(seqlens_kv)  # real lengths -> masks / tile counts
-    cu_k_pad = _cumsum(phys_kv)  # physical row offsets
+    cu_k = _cumsum(seqlens_kv)
+    cu_k_pad = _cumsum(phys_kv)
 
     q = torch.randn(total_q, nheads, d_qk, device="cuda", dtype=dtypes.bf16)
     k = torch.randn(sum(phys_kv), nheads_k, d_qk, device="cuda", dtype=dtypes.bf16)
@@ -1415,8 +1404,8 @@ def test_fmha_fwd_bf16_opus_d192_v128_group(
         )
 
     assert tuple(lse.shape) == (nheads, total_q), f"lse shape {tuple(lse.shape)}"
-    assert not torch.isnan(out).any(), "read into the KV padding gap (NaN reached out)"
-    assert not torch.isnan(lse).any(), "read into the KV padding gap (NaN reached lse)"
+    assert not torch.isnan(out).any(), "read into the KV padding gap"
+    assert not torch.isnan(lse).any(), "read into the KV padding gap"
 
     max_diff = 0.0
     for g in range(len(seqlens_q)):

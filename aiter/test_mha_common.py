@@ -680,32 +680,41 @@ def attention_ref_with_tol(q, k, v, do, is_fp8=False, **kwargs):
     return out, (dq, dk, dv), fwd_tol, bwd_tols
 
 
-def opus_ref_lse(q, k, causal):
-    """fp32 logsumexp of the scaled scores (bottom-right causal aligned), GQA-aware.
+def opus_ref_lse(q, k, causal, budget=1 << 23):
+    """fp32 logsumexp of the scaled scores, bottom-right causal, GQA-aware.
 
-    attention_ref casts its lse back down to the input dtype, which at |lse| ~ 8 is
-    coarser than the OPUS kernels' own error, so their LSE is checked against this.
+    attention_ref downcasts its lse to the input dtype, too coarse to check against.
+    Chunked over query rows (`budget` score elements) to bound peak memory.
     """
-    seqlen_q, nheads = q.shape[1], q.shape[2]
+    batch, seqlen_q, nheads, d = q.shape
     seqlen_k, nheads_k = k.shape[1], k.shape[2]
-    k_rep = k.repeat_interleave(nheads // nheads_k, dim=2)
-    scores = torch.einsum("bthd,bshd->bhts", q.float(), k_rep.float()) * (
-        q.shape[-1] ** -0.5
-    )
-    if causal:
-        off = seqlen_k - seqlen_q
-        row = torch.arange(seqlen_q, device=q.device)[:, None]
-        col = torch.arange(seqlen_k, device=q.device)[None, :]
-        scores = scores.masked_fill(col > row + off, float("-inf"))
-    return torch.logsumexp(scores, dim=-1)
+    group = nheads // nheads_k
+    scale = d**-0.5
+
+    k_f = k.float()
+    lse = torch.empty((batch, nheads, seqlen_q), dtype=torch.float32, device=q.device)
+    col = torch.arange(seqlen_k, device=q.device)
+    off = seqlen_k - seqlen_q
+    rows = max(1, budget // max(1, batch * nheads * seqlen_k))
+
+    for lo in range(0, seqlen_q, rows):
+        hi = min(lo + rows, seqlen_q)
+        q_c = q[:, lo:hi].float().reshape(batch, hi - lo, nheads_k, group, d)
+        scores = torch.einsum("bthgd,bshd->bhgts", q_c, k_f) * scale
+        if causal:
+            row = torch.arange(lo, hi, device=q.device)[:, None]
+            scores = scores.masked_fill(col > row + off, float("-inf"))
+        lse[:, :, lo:hi] = torch.logsumexp(scores, dim=-1).reshape(
+            batch, nheads, hi - lo
+        )
+    return lse
 
 
 def opus_check_lse(tag, lse, lse_ref):
-    """Compare fp32 LSE against opus_ref_lse. 0.01 is the same floor the out checks use:
-    the D=128 kernel folds softmax_scale into Q and rounds back to bf16, so its scores
-    (and hence its LSE) sit ~4e-3 off an fp32 post-scale reference, while D=192 lands at
-    ~1e-6. Any real defect (stale softmax base, wrong layout, missing rescale) is off by
-    >= O(1).
+    """Compare fp32 LSE against opus_ref_lse.
+
+    0.01 accommodates D=128 folding softmax_scale into bf16 Q (~4e-3 off an fp32
+    post-scale reference); D=192 lands at ~1e-6.
     """
     assert lse.dtype == torch.float32, f"{tag}: lse dtype {lse.dtype}, expected float32"
     assert torch.equal(

@@ -1104,11 +1104,7 @@ def test_mha_bwd_sink_null_gives_same_as_no_sink(dtype):
 
 
 # OPUS gfx950 dense (batch) cases, shared by the D=128 and D_QK=192/D_V=128 tests.
-# seqlen_q == seqlen_kv entries cover the self-attention tile/Q-block geometry; the rest
-# are cross-attention. Causal is bottom-right aligned, so seqlen_q > seqlen_kv leaves the
-# leading (seqlen_q - seqlen_kv) rows seeing no keys: the kernel writes O=0 (l_inv guard)
-# and LSE=-inf there, and attention_ref agrees (it zeroes all-masked rows, and its
-# logsumexp is -inf).
+# Causal is bottom-right aligned, so seqlen_q > seqlen_kv gives O=0 / LSE=-inf rows.
 #   (batch, seqlen_q, seqlen_kv, nheads, nheads_k)
 _OPUS_BATCH_CASES = [
     (2, 64, 64, 8, 2),  # 1 KV tile, GQA
@@ -1121,17 +1117,11 @@ _OPUS_BATCH_CASES = [
     (1, 4096, 4096, 8, 2),  # large, GQA
     (4, 256, 256, 8, 8),  # larger batch, MHA
     (2, 128, 512, 8, 2),  # cross sq < sk, GQA
-    (2, 512, 128, 8, 2),  # cross sq > sk -> fully-masked leading rows when causal
-    (1, 300, 700, 4, 4),  # cross, partial tiles on both sides, MHA
+    (2, 512, 128, 8, 2),  # cross sq > sk, GQA
+    (1, 300, 700, 4, 4),  # cross, partial both sides, MHA
     (2, 256, 65, 16, 4),  # cross, sk under one KV tile, GQA
-    (2, 1, 1024, 8, 8),  # single query row (partial Q block), MHA
-    (
-        2,
-        1024,
-        640,
-        64,
-        8,
-    ),  # sq > sk large: ceil(1024/256)*64*2 = 512 -> head/tail merge
+    (2, 1, 1024, 8, 8),  # single query row, MHA
+    (2, 1024, 640, 64, 8),  # 4*64*2 = 512 -> causal head/tail merge
 ]
 
 _OPUS_BATCH_IDS = [
@@ -1142,8 +1132,7 @@ _OPUS_BATCH_IDS = [
 def _run_opus_batch_case(
     batch_size, seqlen_q, seqlen_kv, nheads, nheads_k, d_qk, d_v, causal
 ):
-    """Body shared by the two OPUS dense tests: run through flash_attn_func with LSE,
-    assert it actually routed to OPUS, then check out / LSE / fully-masked rows."""
+    """Shared body: flash_attn_func with LSE, assert it routed to OPUS, check results."""
     torch.manual_seed(0)
     q = torch.randn(
         batch_size, seqlen_q, nheads, d_qk, device="cuda", dtype=dtypes.bf16
@@ -1167,9 +1156,8 @@ def _run_opus_batch_case(
             return_lse=True,
             return_attn_probs=False,
         )
-        # Bitwise match against the direct wrapper: the dispatch chain tries several
-        # backends before OPUS, so without this the checks below could be validating
-        # some other kernel entirely.
+        # The dispatch chain tries several backends before OPUS; without this the
+        # checks below could be validating a different kernel.
         out_opus = fmha_fwd_bf16_opus_fwd(
             q, k, v, softmax_scale=d_qk**-0.5, causal=causal
         )
@@ -1189,8 +1177,7 @@ def _run_opus_batch_case(
     assert tuple(lse.shape) == (batch_size, nheads, seqlen_q), f"lse {tuple(lse.shape)}"
     opus_check_lse(tag, lse, lse_ref)
 
-    # Rows that see no keys must produce exactly 0 (not NaN) for O.
-    dead = torch.isneginf(lse_ref)  # [B, H, Sq]
+    dead = torch.isneginf(lse_ref)  # rows that see no keys -> O must be exactly 0
     if dead.any():
         dead_o = dead.permute(0, 2, 1).unsqueeze(-1).expand_as(out)
         assert (out[dead_o] == 0).all(), f"{tag}: fully-masked rows must produce O=0"
@@ -1208,9 +1195,8 @@ def test_flash_attn_func_opus(
 ):
     """OPUS gfx950 dense D=128 forward through flash_attn_func, with LSE.
 
-    This kernel is env-gated (AITER_ENABLE_FMHA_OPUS=1) on top of the shared gate
-    (gfx950, bf16, dense, no dropout/bias/swa/sink/quant). The env is monkeypatched
-    scoped to this test so every other case keeps exercising the default v3/CK dispatch.
+    Env-gated (AITER_ENABLE_FMHA_OPUS=1); monkeypatched scoped to this test so the
+    other cases keep exercising the default v3/CK dispatch.
     """
     if get_gfx() != "gfx950":
         pytest.skip("opus D=128 kernel requires gfx950")
@@ -1231,8 +1217,7 @@ def test_flash_attn_func_opus_d192_v128(
 ):
     """OPUS gfx950 dense D_QK=192/D_V=128 forward through flash_attn_func, with LSE.
 
-    Enabled by DEFAULT (no env), so flash_attn_func should route here for (192,128) bf16
-    on gfx950 without any monkeypatch.
+    Enabled by default (no env), so no monkeypatch.
     """
     if get_gfx() != "gfx950":
         pytest.skip("opus D=192 kernel requires gfx950")

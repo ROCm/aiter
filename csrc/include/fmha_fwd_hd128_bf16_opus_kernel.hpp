@@ -892,11 +892,6 @@ __device__ __attribute__((always_inline)) void gqa_d128_impl(opus_gqa_kargs karg
     __builtin_amdgcn_sched_barrier(0);
 
     // ──── Optional LSE (fp32, natural log) ────
-    // temperature_scale is folded into v_q in the prologue, so m_row is already in the
-    // log2 domain and lse = ln2 * (m_row + log2(l_row)). The selective max update leaves
-    // m_row below the true row max, but l_row is kept consistent with it and log-sum-exp
-    // is invariant to the base, so this is exact. W_M == 32 with a single permlane32
-    // reduction means lanes L and L+32 carry the same row, so only the low half stores.
     if (kargs.ptr_lse != nullptr && lane_id < T::W_M) {
         constexpr D_ACC LN2 = D_ACC(0.69314718055994531f);   // 1 / log2(e)
         const D_ACC lse = (l_row > D_ACC(0.0f))
