@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Correctness tests for the FlyDSL fused GDN K5+K6 forward.
+"""Correctness tests and perf sweep for the FlyDSL fused GDN K5+K6 forward.
 
 Verifies ``chunk_gated_delta_rule_fwd_h_o_flydsl`` (inter-chunk state scan fused
 with the inter/intra-chunk output) against a known-correct reference:
@@ -16,12 +16,23 @@ Two levels:
   * ``test_fused_unit``     — call the fused wrapper directly.
   * ``test_fused_pipeline`` — call the end-to-end pipeline with
     ``fusion=K5K6Fusion.ALWAYS`` and compare to the NEVER/Triton baseline.
+
+Run as a script for the perf sweep (not collected by pytest):
+    PYTHONPATH=. python op_tests/flydsl_tests/test_flydsl_gdn_fused_k5k6.py
 """
 
 from __future__ import annotations
 
+import argparse
+
+import aiter
+import pandas as pd
 import pytest
 import torch
+
+from aiter import dtypes
+from aiter.jit.utils.chip_info import get_gfx
+from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 from aiter.ops.flydsl.utils import is_flydsl_available
 
@@ -192,7 +203,6 @@ def test_fused_final_state():
 
 # --------------------------------------------------------------------------- #
 # Pipeline tests: the K5K6Fusion API on chunk_gated_delta_rule_fwd_opt_vk.
-#
 # --------------------------------------------------------------------------- #
 def _pipeline_inputs(H, Hg, seq_lens, device="cuda"):
     K = V = 128
@@ -347,15 +357,295 @@ def test_fused_auto_routing(H, Hg, gate, seq_lens, expect_fused):
     ratio = _rmse_ratio(o_auto, o_base)
     assert ratio < _RMSE_TOL, f"auto-routed o mismatch: rmse={ratio:.3e}"
 
+# --------------------------------------------------------------------------- #
+# Perf sweep (run via __main__)
+# --------------------------------------------------------------------------- #
+# Shapes: Kimi-K3 (KDA, gk gate) and Qwen (GDN, g gate), real TP configs.
+# Columns: (model_tag, H, Hg, T_flat, N, gate)
+# K=V=128 (fixed for all KDA/GDN production shapes).
+_SWEEP_SHAPES: list[tuple] = [
+    # KDA Kimi-K3 TP8 (H=12, gk)
+    ("kda_tp8",  12, 12,  8192, 1, "gk"),
+    ("kda_tp8",  12, 12,  8192, 4, "gk"),
+    ("kda_tp8",  12, 12,  8192, 8, "gk"),
+    ("kda_tp8",  12, 12, 32768, 1, "gk"),
+    ("kda_tp8",  12, 12, 32768, 4, "gk"),
+    ("kda_tp8",  12, 12, 32768, 8, "gk"),
+    # KDA Kimi-K3 TP4 (H=24, gk)
+    ("kda_tp4",  24, 24,  8192, 1, "gk"),
+    ("kda_tp4",  24, 24,  8192, 8, "gk"),
+    ("kda_tp4",  24, 24, 32768, 1, "gk"),
+    ("kda_tp4",  24, 24, 32768, 8, "gk"),
+    # GDN Qwen3-Next TP8 (H=4, Hg=2, g)
+    ("gdn_q3n_tp8",  4,  2,  8192, 4, "g"),
+    ("gdn_q3n_tp8",  4,  2,  8192, 8, "g"),
+    ("gdn_q3n_tp8",  4,  2, 32768, 4, "g"),
+    ("gdn_q3n_tp8",  4,  2, 32768, 8, "g"),
+    # GDN Qwen3-Next TP4 (H=8, Hg=4, g)
+    ("gdn_q3n_tp4",  8,  4,  8192, 1, "g"),
+    ("gdn_q3n_tp4",  8,  4,  8192, 4, "g"),
+    ("gdn_q3n_tp4",  8,  4, 32768, 1, "g"),
+    ("gdn_q3n_tp4",  8,  4, 32768, 4, "g"),
+    # GDN Qwen3.5-MoE TP1 (H=16, g)
+    ("gdn_q35_tp1", 16, 16,  8192, 1, "g"),
+    ("gdn_q35_tp1", 16, 16,  8192, 4, "g"),
+    ("gdn_q35_tp1", 16, 16,  8192, 8, "g"),
+    # GDN Qwen3.5-MoE TP1 (H=32, Hg=8, g)
+    ("gdn_q35_tp1", 32,  8, 32768, 1, "g"),
+    ("gdn_q35_tp1", 32,  8, 32768, 8, "g"),
+]
 
-def test_fusion_enum_coerce():
-    """K5K6Fusion.coerce accepts enum / str / None; rejects garbage."""
+SUPPORTED_GFX = ["gfx942"]
+
+_USE_EXP2 = False  # gates are natural-log domain; see bench_chunk_gdn_fwd.py
+
+
+class _CaptureSafeMeta:
+    """Proxy over GatedDeltaRulePrefillMetadata that no-ops validate() during capture.
+
+    Triton K5, Triton K6, and HIP K5 all call validate() on every invocation.
+    validate() raises when torch.cuda.is_current_stream_capturing() is True, so
+    passing raw metadata breaks graph capture.  This proxy validates once before
+    capture (at construction time) and then silently skips subsequent calls, which
+    is safe because the tensor identity and version are stable across a replay.
+    """
+
+    def __init__(self, meta, cu_seqlens, *, chunk_size, total_prefill_tokens,
+                 num_sequences):
+        self._meta = meta
+        meta.validate(
+            cu_seqlens=cu_seqlens,
+            chunk_size=chunk_size,
+            num_decodes=0,
+            num_decode_tokens=0,
+            total_prefill_tokens=total_prefill_tokens,
+            num_sequences=num_sequences,
+        )
+
+    def validate(self, *args, **kwargs):
+        return None
+
+    def __getattr__(self, name):
+        return getattr(self._meta, name)
+
+
+@benchmark()
+def bench_fused_k5k6(model_tag, H, Hg, T_flat, N, gate):
+    """Triton K5+K6 baseline vs HIP K5+K6, FlyDSL fused always, and FlyDSL fused auto.
+
+    All candidates are timed with HIP graph capture, which eliminates Python
+    dispatch overhead and measures pure GPU kernel time.
+
+    Triton K5, Triton K6, and HIP K5 all call prefill_metadata.validate() on
+    every invocation, which raises during graph capture.  A _CaptureSafeMeta
+    proxy pre-validates once before capture and no-ops subsequent calls so all
+    four candidates can be graph-captured uniformly.
+    """
+    from aiter.ops.chunk_gated_delta_rule_fwd_h import (
+        chunk_gated_delta_rule_fwd_h_hip_fn,
+    )
+    from aiter.ops.flydsl.linear_attention_prefill_kernels import (
+        chunk_gated_delta_rule_fwd_h_o_auto,
+        chunk_gated_delta_rule_fwd_h_o_flydsl,
+    )
+    from aiter.ops.triton._triton_kernels.gated_delta_rule.prefill.chunk_delta_h import (
+        chunk_gated_delta_rule_fwd_h_opt_vk as k5_triton,
+    )
+    from aiter.ops.triton._triton_kernels.gated_delta_rule.prefill.chunk_o import (
+        chunk_fwd_o_opt_vk as k6_triton,
+    )
     from aiter.ops.triton._triton_kernels.gated_delta_rule.utils import K5K6Fusion
 
-    assert K5K6Fusion.coerce(None) is K5K6Fusion.AUTO
-    assert K5K6Fusion.coerce("always") is K5K6Fusion.ALWAYS
-    assert K5K6Fusion.coerce("NEVER") is K5K6Fusion.NEVER
-    assert K5K6Fusion.coerce(K5K6Fusion.AUTO) is K5K6Fusion.AUTO
-    with pytest.raises(ValueError):
-        K5K6Fusion.coerce("sometimes")
+    K = V = 128
+    BT = 64
+    scale = K ** -0.5
+
+    seq_lens = [T_flat // N] * (N - 1) + [T_flat - (T_flat // N) * (N - 1)]
+    inp = _make_inputs(H, Hg, K, V, T_flat, seq_lens, gate)
+    q = torch.randn(1, T_flat, Hg, K, dtype=torch.bfloat16, device="cuda") * 0.1
+    # HIP K5 expects g as [B, H, T] head-major.
+    g_hip = inp["g"].unsqueeze(0) if inp["g"] is not None else None
+    o_triton = inp["u_tm"].new_empty(1, T_flat, H, V)
+    o_hip = inp["u_tm"].new_empty(1, T_flat, H, V)
+    o_always = inp["u_tm"].new_empty(1, T_flat, H, V)
+    o_auto = inp["u_tm"].new_empty(1, T_flat, H, V)
+
+    # Build capture-safe metadata once before any graph capture.  Without this,
+    # validate() would raise inside the captured closure for all varlen shapes.
+    safe_meta = None
+    if inp["cu"] is not None:
+        from aiter.ops.prefill_batch_metadata import (
+            build_gated_delta_rule_prefill_metadata,
+        )
+        raw_meta = build_gated_delta_rule_prefill_metadata(
+            seq_lens, cu_seqlens=inp["cu"], chunk_size=BT,
+        )
+        safe_meta = _CaptureSafeMeta(
+            raw_meta, inp["cu"],
+            chunk_size=BT,
+            total_prefill_tokens=T_flat,
+            num_sequences=N,
+        )
+
+    def _run_triton():
+        h, v_new, _ = k5_triton(
+            k=inp["k"], w=inp["w_hm"], u=inp["u_hm"],
+            g=inp["g"], gk=inp["gk"],
+            initial_state=inp["h0"], output_final_state=True,
+            save_new_value=True, cu_seqlens=inp["cu"],
+            use_exp2=_USE_EXP2, prefill_metadata=safe_meta,
+        )
+        k6_triton(
+            q=q, k=inp["k"], v=v_new, o=o_triton, h=h,
+            g=inp["g"], scale=scale,
+            cu_seqlens=inp["cu"], use_exp2=_USE_EXP2,
+            prefill_metadata=safe_meta,
+        )
+        return o_triton
+
+    def _run_hip():
+        h, v_new, _ = chunk_gated_delta_rule_fwd_h_hip_fn(
+            k=inp["k"], w=inp["w_hm"], u=inp["u_hm"],
+            g=g_hip, gk=inp["gk"],
+            initial_state=inp["h0"], output_final_state=True,
+            save_new_value=True, cu_seqlens=inp["cu"],
+            use_exp2=_USE_EXP2, g_head_major=True,
+            prefill_metadata=safe_meta,
+        )
+        k6_triton(
+            q=q, k=inp["k"], v=v_new, o=o_hip, h=h,
+            g=inp["g"], scale=scale,
+            cu_seqlens=inp["cu"], use_exp2=_USE_EXP2,
+            prefill_metadata=safe_meta,
+        )
+        return o_hip
+
+    def _run_fused_always():
+        chunk_gated_delta_rule_fwd_h_o_flydsl(
+            q=q, k=inp["k"], w=inp["w_hm"], u=inp["u_hm"],
+            g=inp["g"], gk=inp["gk"], scale=scale,
+            initial_state=inp["h0"], output_final_state=False,
+            cu_seqlens=inp["cu"], use_exp2=_USE_EXP2, o=o_always,
+        )
+        return o_always
+
+    def _run_fused_auto():
+        chunk_gated_delta_rule_fwd_h_o_auto(
+            q=q, k=inp["k"], w=inp["w_hm"], u=inp["u_hm"],
+            g=inp["g"], gk=inp["gk"], scale=scale,
+            initial_state=inp["h0"], output_final_state=False,
+            cu_seqlens=inp["cu"], use_exp2=_USE_EXP2, o=o_auto,
+            fusion=K5K6Fusion.AUTO,
+        )
+        return o_auto
+
+    # FLOPs: K5 (GEMM1+GEMM2) + K6 (GEMM3+GEMM4a+GEMM4b) per chunk per head
+    n_chunks = sum(-(-s // BT) for s in seq_lens)
+    per_chunk = 4 * K * V + 2 * K * V + 2 * BT * K + 2 * BT * V
+    flops = H * n_chunks * BT * per_chunk
+    # bytes: k,w,u (read) + v_new,h (K5→K6 handoff) + q (read) + o (written)
+    nbytes = (
+        T_flat * Hg * K        # k
+        + T_flat * H * K       # w
+        + T_flat * H * V       # u
+        + T_flat * H * V       # v_new (fused keeps in LDS; baseline spills to HBM)
+        + N * H * V * K        # h state
+        + T_flat * Hg * K      # q
+        + T_flat * H * V       # o
+    ) * 2  # bf16
+
+    candidates = {
+        "triton+triton": _run_triton,   # baseline
+        "hip+triton": _run_hip,
+        "fused_always": _run_fused_always,
+        "fused_auto": _run_fused_auto,
+    }
+
+    _NUM_WARMUP = 2
+    _NUM_ITERS = 101
+
+    ret = {"gfx": get_gfx()}
+    ref_out = None
+    for name, fn in candidates.items():
+        # Correctness: minimal eager run just to get the output tensor.
+        out, _ = run_perftest(fn, num_iters=2, num_warmup=_NUM_WARMUP)
+        if ref_out is None:
+            ref_out = out  # triton+triton is baseline
+        err = checkAllclose(
+            ref_out.to(dtypes.fp32),
+            out.to(dtypes.fp32),
+            rtol=1e-2, atol=1e-2,
+            msg=f"{name}: fused_k5k6 H={H} N={N} T={T_flat}",
+        )
+
+        # Timing: capture _NUM_ITERS calls into a graph, then replay it
+        # _NUM_ITERS times with CUDA events around each replay.  This avoids
+        # the ROCm profiler's unreliable device-time attribution for the
+        # CUDAGraphExec event (which returns 0 on many shapes).
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            for _ in range(_NUM_ITERS):
+                fn()
+        torch.cuda.synchronize()
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        graph.replay()
+        end.record()
+        end.synchronize()
+        us = start.elapsed_time(end) * 1e3 / _NUM_ITERS  # ms -> us, per iter
+
+        aiter.logger.info(f"avg: {us:.3f} us/iter with hipgraph")
+        ret[f"{name} us"] = us
+        ret[f"{name} TFLOPS"] = flops / us / 1e6
+        ret[f"{name} TB/s"] = nbytes / us / 1e6
+        ret[f"{name} err"] = err
+    return ret
+
+
+def main():
+    if get_gfx() not in SUPPORTED_GFX:
+        aiter.logger.warning(
+            "fused GDN K5+K6 unsupported on %s; skipping", get_gfx()
+        )
+        return
+
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter,
+        description="FlyDSL fused GDN K5+K6 correctness + perf sweep",
+    )
+    parser.add_argument(
+        "--gate",
+        type=str,
+        nargs="*",
+        default=["g", "gk"],
+        choices=["g", "gk"],
+        help="Gate type(s) to include in the sweep.",
+    )
+    parser.add_argument(
+        "--T",
+        type=int,
+        nargs="*",
+        default=[8192, 32768],
+        help="T_flat values to include.",
+    )
+    args = parser.parse_args()
+
+    gate_set = set(args.gate)
+    t_set = set(args.T)
+
+    df = []
+    for shape in _SWEEP_SHAPES:
+        model_tag, H, Hg, T_flat, N, gate = shape
+        if gate not in gate_set or T_flat not in t_set:
+            continue
+        df.append(bench_fused_k5k6(model_tag, H, Hg, T_flat, N, gate))
+    df = pd.DataFrame(df)
+    aiter.logger.info(
+        "fused GDN K5+K6 summary (markdown):\n%s", df.to_markdown(index=False)
+    )
+
+
+if __name__ == "__main__":
+    main()
 

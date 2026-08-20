@@ -84,11 +84,11 @@ _K5_TUNED_ROWS_GFX942: tuple[_K5TunedEntry, ...] = (
     _K5TunedEntry("g", 8, 1, False, "bv16"),
     _K5TunedEntry("g", 8, 2, True, "bv16"),
     _K5TunedEntry("g", 8, 4, True, "bv16"),
-    _K5TunedEntry("g", 8, 8, True, "bv32"), 
+    _K5TunedEntry("g", 8, 8, True, "bv32"),
     _K5TunedEntry("g", 16, 1, False, "bv16"),
     _K5TunedEntry("g", 16, 2, True, "bv16"),
     _K5TunedEntry("g", 16, 4, True, "bv32"),
-    _K5TunedEntry("g", 16, 8, True, "bv64w8"), 
+    _K5TunedEntry("g", 16, 8, True, "bv64w8"),
     _K5TunedEntry("g", 32, 1, False, "bv16"),
     _K5TunedEntry("g", 32, 2, True, "bv32"),
     _K5TunedEntry("g", 32, 4, True, "bv64w8"),
@@ -139,7 +139,7 @@ def select_variant(
 # Fused K5+K6 variant selection (gfx942)
 #
 # The measured-best fused BV/wave tile is a function of the grid-size product ``H*N``.
-# Larger tiles win as there is more parallel work to fill the device (measured empirically). 
+# Larger tiles win as there is more parallel work to fill the device (measured empirically).
 #   H*N <=32 -> bv16
 #   H*N <=64 -> bv32
 #   H*N >64 -> bv64w8
@@ -357,7 +357,7 @@ def compile_chunk_gated_delta_h_gfx942(
     #            NUM_K_BLOCKS x K_STEPS_PER_BLOCK vs NUM_K_BLOCKS x BT_TILES).
     #            Hence, store k as [BT, K] and GEMM2 takes the strided read instead.
     KT_TRANSPOSED = not COMPUTE_OUTPUT
-    # Groups per row of whichever logical layout is in use 
+    # Groups per row of whichever logical layout is in use
     # ([K,BT] -> BT/4; [BT,K] -> K/4).
     LDS_KT_NG = (BT // 4) if KT_TRANSPOSED else (K // 4)
     LDS_KT_COLS = BT if KT_TRANSPOSED else K
@@ -482,7 +482,7 @@ def compile_chunk_gated_delta_h_gfx942(
     K_ROW_QUADS = BT // 4
     K_XPOSE_SLOTS = K_ROW_QUADS * K_COL_GROUPS
     K_SLOTS_PER_THREAD = K_XPOSE_SLOTS // BLOCK_THREADS
-    # Row-quads covered per pass. 
+    # Row-quads covered per pass.
     K_ROW_QUAD_STRIDE = BLOCK_THREADS // K_COL_GROUPS
     STRIDE_K_C = Hg * K
 
@@ -720,7 +720,7 @@ def compile_chunk_gated_delta_h_gfx942(
         # -- C-fragment destinations --
         # An MFMA C fragment holds 4 consecutive M values at one N. For every
         # accumulator, the M axis is the fast axis of the destination buffer
-        # and the 4 values are one packed b64 transaction. 
+        # and the 4 values are one packed b64 transaction.
         # Hence, we need a view that presents the buffer in (M, N) order:
         #   h    (GEMM2, M=k-row) -> lds_h  is [BV, K]  -> swap strides -> (K, BV)
         #   vnt  (GEMM1, M=BT)    -> lds_vnt is [BV,BT] -> swap strides -> (BT, BV)
@@ -797,7 +797,7 @@ def compile_chunk_gated_delta_h_gfx942(
         u_base = v_base + i_v * fx.Int32(BV)
 
         # -- Tiled w staging: HBM [BT, K] tile -> lds_w --
-        # Two destination views: 
+        # Two destination views:
         # sW_hi is sW_lo composed with a + LDS_HALF offset, which addresses the hi group
         # from the LO tile coordinate.
         w_inner_layout = fx.make_ordered_layout((BT, K), (1, 0))
@@ -1102,13 +1102,9 @@ def compile_chunk_gated_delta_h_gfx942(
             return w_frag, u_frag, g_last, g_row, gk
 
         # -- Prologue: pre-load the first chunk --
-        i_t0_i32 = fx.Int32(0)
-        init_state = _stage_prefetch(i_t0_i32)
-        c_zero = fx.Int64(0)
-        c_one = fx.Int64(1)
-        nt_idx = fx.Int64(NT)
+        init_state = _stage_prefetch(fx.Int32(0))
 
-        for i_t, state in range(c_zero, nt_idx, c_one, init=init_state):
+        for i_t, state in range(fx.Int64(0), fx.Int64(NT), fx.Int64(1), init=init_state):
             (
                 w_frag,
                 u_frag,
@@ -1151,9 +1147,9 @@ def compile_chunk_gated_delta_h_gfx942(
                 gpu.barrier()
 
                 # -- LDS -> HBM h snapshot --
-                # 8 contiguous k per thread is one 16 B HBM store, 
+                # 8 contiguous k per thread is one 16 B HBM store,
                 # but two non-adjacent b64 LDS reads, because
-                # the XOR swizzle puts adjacent k-groups at non-adjacent slots. 
+                # the XOR swizzle puts adjacent k-groups at non-adjacent slots.
                 # The two 4-wide reads (lo/hi views) are reassembled into one
                 # 8-wide global store.
                 f_lo = fx.make_fragment_like(pS_h_lo)
@@ -1222,7 +1218,7 @@ def compile_chunk_gated_delta_h_gfx942(
             # -- g / gk: type this chunk's values, prefetched last iter --
             # They come off the loop-carried state as bare IR values.
             def _as_f32(v):
-                return fx.Float32(as_ir_value(v))
+                return fx.Float32(v)
 
             if const_expr(USE_G):
                 g_last_val = _as_f32(g_last_carried)
@@ -1344,7 +1340,7 @@ def compile_chunk_gated_delta_h_gfx942(
                 for kb in range_constexpr(NUM_K_BLOCKS):
                     # exp() applied here, not at load time, so the prefetch has
                     # no arithmetic depending on the loads.
-                    gk_q = fx.Vector(as_ir_value(gk_quads[kb]))
+                    gk_q = fx.Vector(gk_quads[kb])
                     # gk_vec is per-kb, same across V-tiles: tile it to whole width.
                     gk_vec = fx.Vector.from_elements(
                         [
@@ -1542,7 +1538,6 @@ def compile_chunk_gated_delta_h_gfx942(
                             g2_fk[None, None, bt_s], g2_fv[None, None, bt_s], h_accs_c[kb],
                         )
 
-
             # =============================================================== #
             # K6 output stage. h[t] is still resident in lds_h (the snapshot,
             # NOT the GEMM2-updated h_accs); lds_kt holds k^T; lds_vnt holds
@@ -1592,7 +1587,7 @@ def compile_chunk_gated_delta_h_gfx942(
 
                 # -- GEMM4a: A = q @ k^T  (contraction over K) --
                 # A[i,j] = sum_k q[i,k]*k[j,k]: M = query row, N = key row,
-                # contraction = K. 
+                # contraction = K.
                 #
                 # B wants k as (n=bt, contraction=k), and in the fused build
                 # that is exactly how lds_kt is stored.
@@ -1725,7 +1720,7 @@ def compile_chunk_gated_delta_h_gfx942(
                 def _emit_o_store(off, value):
                     o_buf[(off,)] = value
 
-                scale_vec = fx.full(4, fx.Float32(SCALE), fx.Float32)
+                scale_vec = fx.Vector.filled(4, SCALE, fx.Float32)
                 for nr in range_constexpr(N_REPEAT_LOCAL):
                     o_scaled = o_out[nr] * scale_vec
                     o_col = i_v * fx.Int32(BV) + _nr_v(nr) + lane_n
