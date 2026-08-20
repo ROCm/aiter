@@ -109,6 +109,18 @@ def _infer_cache_format(kv, d_qk, kv_lora_rank, qk_rope_head_dim, kv_scale):
     raise ValueError(f"unrecognized sparse-MLA kv cache: {tuple(kv.shape)} {kv.dtype}")
 
 
+def _lds_pad_for(fp8_mfma: bool) -> int:
+    """kv_smem row padding, in *elements* of the staged type.
+
+    The pad exists to offset which banks a transposed K read lands on, and that
+    is a byte property: _LDS_PAD is tuned for the bf16 staging, so an fp8 plane
+    needs twice as many elements to move the row pitch by the same bytes.
+    Measured at the GLM shape (C=64, topk=2048): carrying bf16's 8 over to fp8
+    costs 1.08x, and 16 / 32 / 64 all land at 0.86-0.89x.
+    """
+    return _LDS_PAD * 2 if fp8_mfma else _LDS_PAD
+
+
 def sparse_mla_decode_fwd(
     q: torch.Tensor,
     kv_buffer: torch.Tensor,
@@ -121,6 +133,7 @@ def sparse_mla_decode_fwd(
     kv_splits: int | None = None,
     skip_reduce: bool = False,
     has_invalid: bool = False,
+    fp8_mfma: bool = False,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Sparse (top-k gathered) MLA decode, separated-rope geometry.
@@ -140,6 +153,11 @@ def sparse_mla_decode_fwd(
             instead of launching the combine.
         has_invalid: index stream carries -1 sentinels (masked out). Default
             False: vLLM's index converter emits none (it maps -1 to slot 0).
+        fp8_mfma: keep the tile in fp8 through both dots instead of staging it
+            as bf16 -- flat per-tensor OCP fp8 cache only. q still arrives bf16
+            and is quantized to e4m3 in the kernel, per program, so its scale
+            folds into that program's qk_scale. Faster (0.75-0.96x) but drops
+            accuracy to the asm kernel's level, so it is a deliberate trade.
         out: optional ``[C, H, >= kv_lora_rank]`` bf16 destination.
 
     Returns:
@@ -160,6 +178,11 @@ def sparse_mla_decode_fwd(
     fmt, cache, alt, scl, block_size, fp8_fnuz = _infer_cache_format(
         kv_buffer, d_qk, kv_lora_rank, qk_rope_head_dim, kv_scale
     )
+    if fp8_mfma and (fmt != "tensor" or fp8_fnuz):
+        raise ValueError(
+            "fp8_mfma needs the flat per-tensor OCP fp8 cache (got "
+            f"fmt={fmt!r}, fp8_fnuz={fp8_fnuz})"
+        )
     kv_indices = _as_int32_contiguous_1d(kv_indices)
     kv_indptr = _as_int32_contiguous_1d(kv_indptr)
     assert kv_indptr.numel() == num_queries + 1
@@ -277,7 +300,7 @@ def sparse_mla_decode_fwd(
         HEAD_ALIGNED=head_aligned,
         MFMA_K=_MFMA_K,
         GATHER_TW1=_GATHER_TW1,
-        LDS_PAD=_LDS_PAD,
+        LDS_PAD=_lds_pad_for(fp8_mfma),
         NOPE_CHUNK=nope_chunk,
         CHUNK_AXIS=chunk_axis,
         PART_STORE_CACHE="",
@@ -291,6 +314,7 @@ def sparse_mla_decode_fwd(
         IDX_BUFFER_LOAD=idx_use_buffer_load,
         HAS_INVALID=has_invalid,
         FP8_FNUZ=fp8_fnuz,
+        FP8_MFMA=fp8_mfma,
         num_warps=num_warps,
         waves_per_eu=waves_per_eu,
     )

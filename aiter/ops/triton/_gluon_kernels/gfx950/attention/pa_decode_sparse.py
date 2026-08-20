@@ -252,6 +252,8 @@ class Cfg:
     HAS_INVALID: gl.constexpr
     HEAD_ALIGNED: gl.constexpr
     IDX_BUFFER_LOAD: gl.constexpr
+    FP8_MFMA: gl.constexpr    # "tensor" only: keep the tile fp8 all the way into
+                              # the matrix core instead of dequantizing to bf16
     # operator layouts
     qk_layout: gl.constexpr
     pv_layout: gl.constexpr
@@ -284,6 +286,7 @@ class Cfg:
         HAS_INVALID,
         HEAD_ALIGNED,
         IDX_BUFFER_LOAD,
+        FP8_MFMA=False,
     ):
         self.BLOCK_M = gl.constexpr(BLOCK_M)
         self.BLOCK_K = gl.constexpr(BLOCK_K)
@@ -291,7 +294,6 @@ class Cfg:
         self.ROPE_DIM = gl.constexpr(ROPE_DIM)
         self.ROPE_SEPARATE = gl.constexpr(ROPE_SEPARATE)
         self.QK_DIM = gl.constexpr(KV_DIM + (ROPE_DIM if ROPE_SEPARATE else 0))
-        self.MFMA_K = gl.constexpr(MFMA_K)
         self.NUM_WARPS = gl.constexpr(NUM_WARPS)
         self.GATHER_TW1 = gl.constexpr(GATHER_TW1)
         self.LDS_PAD = gl.constexpr(LDS_PAD)
@@ -299,6 +301,13 @@ class Cfg:
         self.HAS_INVALID = gl.constexpr(HAS_INVALID)
         self.HEAD_ALIGNED = gl.constexpr(HEAD_ALIGNED)
         self.IDX_BUFFER_LOAD = gl.constexpr(IDX_BUFFER_LOAD)
+        self.FP8_MFMA = gl.constexpr(FP8_MFMA)
+        # fp8 operands need v_mfma_f32_16x16x32_fp8_fp8: K=32 is the only shape
+        # the backend has for plain fp8, and it divides KV_DIM, ROPE_DIM and
+        # BLOCK_K alike, so one layout still covers both dots.
+        if FP8_MFMA:
+            MFMA_K = 32
+        self.MFMA_K = gl.constexpr(MFMA_K)
 
         self.qk_layout = gl.constexpr(
             gl.amd.AMDMFMALayout(
@@ -812,15 +821,23 @@ def _stage(cfg, seg, x_u8, sc, k_rope, kv_smem, rope_smem):
     bf16 rope read as garbage fp8 and overwritten by the slice-store below, so
     the gather stays pow-2 wide."""
     fmt = seg.fmt
-    _deq_store_tile(x_u8, sc, kv_smem, cfg, fmt)
-    if fmt.KIND == "dsv4":
-        kv_smem.slice(fmt.NOPE_DIM, cfg.ROPE_DIM, dim=1).store(k_rope)
-    elif fmt.KIND == "dsmla":
-        rope_smem.store(k_rope)
-    elif fmt.KIND == "tensor":
+    if cfg.FP8_MFMA:
+        # No dequant at all: the matrix core reads the cache's own code points.
+        # The per-tensor scale is folded outside the loop (qk_scale / the output),
+        # so what lands in LDS is exactly what the gather returned.
+        kv_smem.store(x_u8.to(gl.float8e4nv, bitcast=True))
         if cfg.ROPE_SEPARATE:
-            rope_smem.store(_fp8_to_bf16(k_rope, fmt.FP8_FNUZ))
-    # "uniform": the whole head is one fp8 tile; nothing else to store.
+            rope_smem.store(k_rope.to(gl.float8e4nv, bitcast=True))
+    else:
+        _deq_store_tile(x_u8, sc, kv_smem, cfg, fmt)
+        if fmt.KIND == "dsv4":
+            kv_smem.slice(fmt.NOPE_DIM, cfg.ROPE_DIM, dim=1).store(k_rope)
+        elif fmt.KIND == "dsmla":
+            rope_smem.store(k_rope)
+        elif fmt.KIND == "tensor":
+            if cfg.ROPE_SEPARATE:
+                rope_smem.store(_fp8_to_bf16(k_rope, fmt.FP8_FNUZ))
+        # "uniform": the whole head is one fp8 tile; nothing else to store.
 
 
 @gluon.jit
@@ -892,9 +909,17 @@ def _qkpv(
     v = kv_smem.load(cfg.v_layout)
     # "tensor": V was staged as raw fp8 code points; apply the per-tensor scale
     # on the small side (p) and leave l scale-free: out = sum(p*s*V)/l exactly.
-    if seg.fmt.KIND == "tensor":
+    if seg.fmt.KIND == "tensor" and not cfg.FP8_MFMA:
         p = p * v_scale
-    p_dot = gl.convert_layout(p.to(gl.bfloat16), cfg.p_layout)
+    if cfg.FP8_MFMA:
+        # p goes to e4m3 as-is. A power-of-two pre-scale to lift the small end out
+        # of e4m3's subnormals was measured and is worth nothing: the output error
+        # is set by the 3-bit mantissa on the p values near 1, and the subnormal
+        # tail contributes too little to register (1 / 16 / 256 agree to three
+        # digits, and 256 is already half of what saturates at p = 1).
+        p_dot = gl.convert_layout(p.to(gl.float8e4nv), cfg.p_layout)
+    else:
+        p_dot = gl.convert_layout(p.to(gl.bfloat16), cfg.p_layout)
     alpha_pv = gl.convert_layout(alpha, gl.SliceLayout(1, cfg.pv_layout))
     acc = acc * alpha_pv[:, None]
     acc = gl.amd.cdna4.mfma(p_dot, v, acc)
@@ -1360,6 +1385,7 @@ def _pa_decode_sparse(
     IDX_BUFFER_LOAD: gl.constexpr,
     HAS_INVALID: gl.constexpr,
     FP8_FNUZ: gl.constexpr,
+    FP8_MFMA: gl.constexpr = False,
 ):
     """One program = (query, split, head-block). Two-loop: main (SWA) then
     extra (top-k). NUM_SPLITS==1 writes the output directly; otherwise stores
@@ -1383,6 +1409,18 @@ def _pa_decode_sparse(
     )
     gl.static_assert((not ASM_DEQ) or MAIN_FMT == "dsv4" or EXTRA_FMT == "dsv4",
                      "ASM_DEQ is the dsv4 E8M0 dequant")
+    # FP8_MFMA keeps the tile in fp8 through both dots. That only works where the
+    # scale is a single positive scalar per cache (it folds outside the loop) and
+    # the code points are OCP e4m3, which is what the matrix core reads.
+    gl.static_assert(
+        (not FP8_MFMA) or (MAIN_FMT == "tensor" and (not HAS_EXTRA or EXTRA_FMT == "tensor")),
+        "FP8_MFMA requires the per-tensor fp8 format on every segment",
+    )
+    gl.static_assert(not (FP8_MFMA and FP8_FNUZ), "FP8_MFMA is OCP e4m3 only")
+    gl.static_assert(
+        not (FP8_MFMA and HAS_EXTRA),
+        "FP8_MFMA defers the V-side scale to the epilogue, so it needs one segment",
+    )
     # Row bases are block*cs0 + pos*TOK with runtime block/pos, so divisibility
     # analysis sees 1-byte alignment unless the driver vouches for cs0.
     if CS0_ALIGN > 1:
@@ -1408,6 +1446,7 @@ def _pa_decode_sparse(
         HAS_INVALID,
         HEAD_ALIGNED,
         IDX_BUFFER_LOAD,
+        FP8_MFMA,
     )
     main_fmt = Fmt(
         cfg,
@@ -1478,6 +1517,13 @@ def _pa_decode_sparse(
     q = gl.amd.cdna4.buffer_load(
         ptr=q_ptr, offsets=q_off, mask=h_mask_q[:, None], other=0.0
     )
+    if FP8_MFMA:
+        # One e4m3 scale for this program's whole Q tile (nope + rope), so the
+        # fold below is a single extra factor on qk_scale. Each program folds its
+        # own scale, and m/l stay in the true-score domain, so split-K programs
+        # remain comparable in the reduce.
+        E4M3_MAX: gl.constexpr = 448.0
+        q_amax = gl.max(gl.max(gl.abs(q).to(gl.float32), axis=1), axis=0)
     q_dot = gl.convert_layout(q, cfg.q_layout)
     if ROPE_SEPARATE:
         offs_d_qr = gl.arange(0, ROPE_DIM, layout=gl.SliceLayout(0, cfg.blocked_q))
@@ -1494,6 +1540,26 @@ def _pa_decode_sparse(
     else:
         q_rope_dot = q_dot  # unused (single-plane QK) -> DCE'd
 
+    if FP8_MFMA:
+        if ROPE_SEPARATE:
+            q_amax = gl.maximum(
+                q_amax, gl.max(gl.max(gl.abs(q_rope).to(gl.float32), axis=1), axis=0)
+            )
+        q_amax = gl.maximum(q_amax, 1e-30)
+        q_rcp = E4M3_MAX / q_amax
+        q_dot = gl.convert_layout(
+            (q.to(gl.float32) * q_rcp).to(gl.float8e4nv), cfg.q_layout
+        )
+        if ROPE_SEPARATE:
+            q_rope_dot = gl.convert_layout(
+                (q_rope.to(gl.float32) * q_rcp).to(gl.float8e4nv), cfg.q_layout
+            )
+        else:
+            q_rope_dot = q_dot
+        q_scale = q_amax / E4M3_MAX
+        main_qk_scale = main_qk_scale * q_scale
+        extra_qk_scale = extra_qk_scale * q_scale
+
     # head mask in pv-slice layout (for output / partial masking)
     offs_m_pv = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, cfg.pv_layout))
     h_pv = h_off + offs_m_pv
@@ -1506,12 +1572,14 @@ def _pa_decode_sparse(
     l_i = gl.zeros([BLOCK_M], gl.float32, layout=gl.SliceLayout(1, cfg.qk_layout))
     acc = gl.zeros([BLOCK_M, HEAD_SIZE], gl.float32, layout=cfg.pv_layout)
 
+    # fp8 planes are half the bytes of the bf16 staging they replace.
+    SMEM_DT: gl.constexpr = gl.float8e4nv if FP8_MFMA else gl.bfloat16
     kv_smem = gl.allocate_shared_memory(
-        gl.bfloat16, [BLOCK_K, HEAD_SIZE], cfg.kv_shared
+        SMEM_DT, [BLOCK_K, HEAD_SIZE], cfg.kv_shared
     )
     if ROPE_SEPARATE:
         rope_smem = gl.allocate_shared_memory(
-            gl.bfloat16, [BLOCK_K, ROPE_DIM], cfg.rope_shared
+            SMEM_DT, [BLOCK_K, ROPE_DIM], cfg.rope_shared
         )
     else:
         rope_smem = kv_smem  # never read as plane 1 in this geometry
@@ -1613,6 +1681,12 @@ def _pa_decode_sparse(
             kv_smem,
             rope_smem,
         )
+
+    if FP8_MFMA:
+        # The fp8 PV dot ran on the cache's raw code points, so the V-side
+        # per-tensor scale comes off here -- once per program instead of once per
+        # tile. l is untouched, so out = acc*s/l is what the bf16 path computes.
+        acc = acc * main_v_scale
 
     # Move the row reductions into pv-slice space for output/partials.
     m_pv = gl.convert_layout(m_i, gl.SliceLayout(1, cfg.pv_layout))
