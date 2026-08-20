@@ -8,18 +8,15 @@
 # and https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/mamba/ops/causal_conv1d.py
 # ==============================================================================
 # ruff: noqa
-# ^ Both kernels below are verbatim copies of upstream (see the docstring).
-# Linting them would mean editing them, and every edit is a place a copy can
-# silently drift from the kernel it is supposed to be measuring against. The
-# findings are upstream's own: `Optional[...]` rather than `X | None` in the
-# SGLang copy, a `col3` load that the width-5 path never consumes, and `E501`
-# directives of their own.
+# ^ Both kernels below are verbatim copies of upstream (see the docstring), and
+# every edit is a place a copy can silently drift from the kernel it is supposed
+# to be measuring against. The findings are upstream's own.
 """SGLang's and vLLM's Triton ``causal_conv1d_update``, vendored as references.
 
-These are **copies, not transcriptions**, and they are the oracles for
-correctness *and* the baselines for performance -- which is the whole reason
-they are here. A torch reference can say whether an answer is right, but it
-cannot say whether the port is faster than what it replaces.
+These are **copies, not transcriptions**: they are the oracles for correctness
+*and* the baselines for performance, which a torch reference cannot be -- it can
+say whether an answer is right, not whether the port is faster than what it
+replaces.
 
 * ``causal_conv1d_update_sglang`` -- lines 565-1207 of
   ``sglang/kernels/ops/mamba/causal_conv1d_triton.py`` at SGLang ``18107e38d2``.
@@ -31,17 +28,11 @@ Vendored rather than imported because the aiter test suite must not depend on
 SGLang or vLLM being installed, and because a live import would silently
 re-point the oracle whenever the installed version changed.
 
-Two copies rather than one kernel because they implement two different
-contracts, not two variants of one. SGLang carries the snapshot buffer
-(``intermediate_conv_window``) and the EAGLE tree (``retrieve_next_token`` /
-``retrieve_next_sibling`` / ``retrieve_parent_token``); vLLM carries the
-packed/varlen path (``query_start_loc`` / ``max_query_len``) and the
-prefix-caching block split (``block_idx_last_scheduled_token`` /
-``initial_state_idx``). Their bodies share barely a dozen lines. Neither is
-aiter's own Triton ``causal_conv1d_update`` either: that one is a fork of the
-SGLang kernel with the EAGLE tree path and PDL support stripped out and
-``intermediate_state_indices`` removed, so on the tree cases the two are
-genuinely different kernels.
+Two copies rather than one because they implement two different contracts, not
+two variants of one: SGLang carries the snapshot buffer and the EAGLE tree,
+vLLM the packed/varlen path and the prefix-caching block split. Neither is
+aiter's own Triton ``causal_conv1d_update``, which is a fork of the SGLang
+kernel with the tree path, PDL and ``intermediate_state_indices`` stripped out.
 
 Shims, and nothing else, separate each copy from its upstream:
 
@@ -55,15 +46,13 @@ Shims, and nothing else, separate each copy from its upstream:
 * ``from vllm.triton_utils import tl, triton`` -> plain ``triton`` imports, and
   SGLang's ``typing`` imports, both hoisted into this header.
 * ``causal_conv1d_update`` and ``_causal_conv1d_update_kernel`` -> suffixed
-  ``_sglang`` / ``_vllm``. Both upstreams use those same two names, so holding
-  both copies in one file means renaming them; nothing else about either body
-  changes.
+  ``_sglang`` / ``_vllm``, since both upstreams use those same two names and one
+  file cannot hold both. Nothing else about either body changes.
 
-The copies are otherwise unmodified except by this repo's ``black``, which CI
-runs over every file and which is semantics-preserving. So re-syncing stays
-mechanical and checkable: re-extract the line range, re-apply the shims above,
-run ``black``. A diff against an upstream checkout treated the same way should
-show the shims and nothing else.
+The copies are otherwise unmodified except by this repo's ``black``, which is
+semantics-preserving, so re-syncing stays mechanical: re-extract the line range,
+re-apply the shims above, run ``black``. A diff against an upstream checkout
+treated the same way should show the shims and nothing else.
 """
 
 from typing import List, Optional, Union  # noqa: F401  (upstream annotations)

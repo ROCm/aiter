@@ -3,67 +3,25 @@
 
 """FlyDSL causal-conv1d update host wrappers (decode + speculative verify).
 
-The ``torch``-facing entry points for the two decode-stage conv1d update
-kernels. They are the same algorithm behind two upstream interfaces, and both
-are maintained -- neither supersedes the other:
+One algorithm behind two upstream interfaces, both maintained:
+``causal_conv1d_update_flydsl`` is a drop-in for vLLM's (and aiter's Triton)
+``causal_conv1d_update``; ``causal_conv1d_update_sglang_flydsl`` is SGLang's,
+which adds per-step ``intermediate_conv_window`` snapshots and an EAGLE tree
+traversal. Both launch the same grid shape, so one tile/occupancy policy
+(``_pick_block_n`` / ``_pick_cpt``) serves both.
 
-* ``causal_conv1d_update_flydsl`` -- vLLM's interface, a drop-in for
-  ``aiter.ops.triton.conv.causal_conv1d.causal_conv1d_update``, covering that
-  kernel's decode, chain-verify, varlen-packing and prefix-caching modes.
-* ``causal_conv1d_update_sglang_flydsl`` -- SGLang's interface, which adds
-  per-step ``intermediate_conv_window`` snapshots and an EAGLE tree traversal.
+Neither is selected by default; the in-tree seam in
+``aiter.ops.triton.conv.causal_conv1d`` opts in via
+``AITER_CONV1D_UPDATE_FLYDSL=1`` and keeps Triton for anything outside the
+port's scope. The ``_..._supported`` predicates are private so that a caller
+which gets the scope wrong hits a ``NotImplementedError`` instead of silently
+mis-executing.
 
-Both kernels are built by ``kernels.causal_conv1d_update``.
-
-Both wrappers prepare tensors, resolve the launch shape, manage the
-compiled-kernel cache and hand the current stream to the launcher, keeping the
-kernel-compile module ``kernels.causal_conv1d_update`` free of any ``torch``
-dependency -- the same split as ``kernels.mla_reduce`` and this module's
-counterpart ``mla_reduce_kernels``.
-
-Neither is selected by default. The in-tree caller reaches the SGLang-shaped
-wrapper through the opt-in seam in
-``aiter.ops.triton.conv.causal_conv1d.causal_conv1d_update``
-(``AITER_CONV1D_UPDATE_FLYDSL=1``), which consults the module-private
-``_causal_conv1d_update_sglang_flydsl_supported`` and silently keeps Triton for
-anything outside the port's scope -- the same shape as the FlyDSL MLA-reduce seam
-in ``aiter/mla.py``. External callers (vLLM, SGLang) import a wrapper directly;
-the predicates are private because a caller that gets the scope wrong should hit
-the wrapper's own ``NotImplementedError`` rather than silently mis-execute.
-
-Launch policy
--------------
-Both kernels launch the same grid shape, so one tile/occupancy policy
-(``_pick_block_n`` / ``_pick_cpt``) serves both. It assumes CDNA: wavefronts are
-64 lanes, which is why the channel tile never goes below 64, as a narrower
-workgroup is a partial wave and wastes lanes outright. The CU count is always
-read from the live device and never assumed -- the supported parts differ by more
-than 3x (MI30X vs MI35X) and the same part reports fewer CUs when partitioned
-(CPX/NPS modes) -- so the policy is expressed as a *ratio* to the queried count
-and a new part needs no change here.
-
-The policy is deliberately coarse: the tile only has to be wide enough to keep
-the GPU busy. A sweep of the three candidates found them indistinguishable above
-the machine's noise floor -- the ranking even flipped between sessions -- while
-dropping below one wavefront was reproducibly bad. So the rule is "don't
-under-occupy, don't go sub-wave" and nothing finer; a lookup table at this
-granularity would be fitting noise. That verdict came from a ~20% noise floor on
-small grids, so it says what could be resolved rather than that the candidates
-are equal. Anyone revisiting it should re-measure with the two arms alternating
-inside one process: on these parts a process lands in a fast or slow state at
-startup that scales small-grid dispatch by ~1.2x for its whole lifetime, so
-separate-process A/B comparisons of a few percent measure the draw, not the
-change.
-
-Sentinel warning
-----------------
-The two upstreams spell the skip sentinel differently and the *values* differ,
-not just the names. vLLM main passes ``null_block_id``, whose value is ``0``
-because block 0 is the reserved null block; SGLang and the rest of aiter's
-conv1d modules pass ``pad_slot_id``, whose value is ``-1``. Each wrapper below
-follows its own upstream. Mixing them up does not raise: with
-``null_block_id=0``, ``conv_state_indices`` must start at 1, or sequence 0 is
-silently skipped and only shows up as wrong numerics.
+Warning: the two upstreams' skip sentinels differ in *value*, not just in name
+-- vLLM's ``null_block_id`` is ``0`` (a valid index, since block 0 is reserved)
+while SGLang's ``pad_slot_id`` is ``-1``. Mixing them up does not raise: under
+``null_block_id=0``, ``conv_state_indices`` must start at 1 or sequence 0 is
+silently skipped.
 """
 
 from __future__ import annotations
@@ -81,46 +39,37 @@ from .kernels.tensor_shim import _run_compiled
 #: SGLang's padded-slot sentinel (also aiter's Triton conv1d convention).
 PAD_SLOT_ID = -1
 
-#: vLLM's null cache block. Block 0 is reserved, so unlike ``PAD_SLOT_ID`` this
-#: sentinel is a *valid* index; see the module docstring.
+#: vLLM's null cache block, a *valid* index unlike ``PAD_SLOT_ID``.
 NULL_BLOCK_ID = 0
 
-#: Element types the kernels are specialized for. Anything else (notably fp32)
-#: would be silently reinterpreted as fp16 by the dtype dispatch below.
+#: Anything outside these (notably fp32) is reinterpreted as fp16 downstream.
 _SUPPORTED_DTYPES = (torch.bfloat16, torch.float16)
 
-#: Widths implemented by each kernel. SGLang's Triton kernel only covers 2/3/4,
-#: and the port matches it; the vLLM one generalizes.
+#: Implemented widths. The narrower SGLang range matches its own Triton kernel.
 _VLLM_WIDTHS = range(2, 7)
 _SGLANG_WIDTHS = range(2, 5)
 
-#: The launch policy assumes 64-lane wavefronts and the kernels address memory
-#: through buffer resources, so the supported parts are the CDNA (gfx9) family.
 _SUPPORTED_ARCH_PREFIX = "gfx9"
 
-#: Lanes per wavefront on CDNA. Also the channel-tile floor.
+#: Narrowest channel tile: below one wavefront a workgroup wastes lanes.
 _WAVEFRONT = 64
 
-#: Channel-tile widths to consider, widest first. The narrowest is one full
-#: wavefront; see the module docstring for why there is nothing below it.
+#: Widest first; :func:`_pick_block_n` scans in order.
 _BLOCK_N_CANDIDATES = (256, 128, _WAVEFRONT)
 
-#: Largest channels-per-thread the kernels implement.
 _CPT_MAX = 2
 
-#: Longest speculative window that still measured a gain from ``_CPT_MAX``. Past
-#: it the knob reverses sign, and the EAGLE tree path runs at S=8 by default.
+#: Longest speculative window that still gains from ``_CPT_MAX``.
 _CPT_MAX_SEQLEN = 4
 
-#: Workgroups per CU the launch aims for. Two gives the scheduler something to
-#: swap in while a workgroup is stalled on memory without over-subscribing.
+#: ``batch * dim`` at or below which :func:`_pick_block_n` inverts and takes the
+#: widest tile.
+_MIN_CHANNELS_TO_SPLIT = 1024
+
 #: A ratio, not a count, so it carries across parts unchanged.
 _TARGET_WG_PER_CU = 2
 
-#: ``None`` caches "this device could not be queried".
 _CU_COUNT_CACHE: dict[int, int | None] = {}
-
-#: ``None`` caches "this override is not set".
 _ENV_OVERRIDE_CACHE: dict[str, int | None] = {}
 
 
@@ -139,14 +88,8 @@ def _ceil_div(a: int, b: int) -> int:
 def _env_int(name: str | None) -> int | None:
     """Read an integer launch override, or ``None`` to keep the heuristic.
 
-    Unset, empty and ``"auto"`` all mean "no override". These overrides exist for
-    parameter sweeps, so a bogus value should be loud rather than silently
-    ignored -- only the clamp to a positive tile is applied.
-
-    Read once per name and cached: this sits on the per-launch path of a kernel
-    that completes in single-digit microseconds, and ``os.environ.get`` costs more
-    than the rest of the heuristic put together. The overrides are set before the
-    process starts, so changing one mid-process has no effect.
+    Unset, empty and ``"auto"`` all mean "no override"; anything unparseable
+    raises rather than being ignored. Cached, so a mid-process change is ignored.
     """
     if name is None:
         return None
@@ -157,12 +100,7 @@ def _env_int(name: str | None) -> int | None:
 
 
 def _n_cu(device: torch.device) -> int | None:
-    """Compute-unit count of ``device``, cached per device index.
-
-    ``None`` means the device could not be queried (no live GPU, a meta/CPU
-    tensor). Callers must degrade rather than substitute a guess: see
-    :func:`_target_wg`.
-    """
+    """Compute-unit count of ``device``, or ``None`` if it could not be queried."""
     key = device.index if device.index is not None else 0
     if key not in _CU_COUNT_CACHE:
         try:
@@ -176,13 +114,9 @@ def _n_cu(device: torch.device) -> int | None:
 def _target_wg(device: torch.device) -> int | None:
     """Workgroup count the launch should reach, or ``None`` if unknown.
 
-    An unknown CU count degrades to "assume the largest machine" rather than to
-    an invented mid-range constant, because the two failure directions are not
-    symmetric: guessing too high just over-decomposes (extra workgroups queue,
-    and the tile candidates measured as indistinguishable in noise), while
-    guessing too low under-occupies, which is the one effect that reproducibly
-    cost time. Callers spell that as taking the fall-through branch, which is the
-    same code path an unreachable target already takes.
+    Callers treat ``None`` as "assume the largest machine" rather than guessing a
+    mid-range CU count, since over-decomposing only queues extra workgroups while
+    under-occupying exposes memory latency.
     """
     count = _n_cu(device)
     return None if count is None else _TARGET_WG_PER_CU * count
@@ -196,30 +130,15 @@ def _pick_cpt(
     seqlen: int = 1,
     env: str | None = None,
 ) -> int:
-    """Pick channels-per-thread.
+    """Pick channels-per-thread, spending it only when the launch can spare it.
 
-    More channels per thread means more independent loads in flight per wave
-    (better latency hiding) but halves the workgroup count. That trade flips
-    around batch 16-32: below it the launch is occupancy-bound and the lost
-    workgroups cost more than the extra memory-level parallelism buys.
+    More channels per thread puts more loads in flight but halves the workgroup
+    count, so it only pays once the grid already reaches the occupancy target.
+    Long speculative windows are excluded outright: they hold more state per
+    thread, and past ``_CPT_MAX_SEQLEN`` the knob turns into a loss.
 
-    The crossover therefore tracks the queried CU count instead of sitting at a
-    fixed batch: a part with fewer CUs fills up sooner and starts preferring the
-    extra memory-level parallelism at a correspondingly smaller batch.
-
-    Occupancy is estimated at the widest span the tile search could pick, so this
-    stays consistent with :func:`_pick_block_n`.
-
-    ``seqlen`` gates the whole thing, because the knob's sign turns over with the
-    speculative window rather than with the batch: paired A/B measured +4.1% at
-    S=4 but -2.4% at S=8, and the same reversal at S=8 on the vLLM-shaped sibling.
-    The plausible reading is that a longer window already keeps more live
-    registers per thread, so doubling the channels costs occupancy that the extra
-    memory-level parallelism no longer repays -- plausible but unverified, it
-    needs a VGPR count to confirm. Windows of 5 to 7 were never measured, so they
-    take the conservative side of the reversal: giving up an unmeasured gain is
-    preferable to a default that may carry an unmeasured regression. The
-    ``AITER_FLYDSL_CONV1D_CPT`` override stays the way to re-tune any of this.
+    Occupancy is estimated at the widest span the tile search could pick, to stay
+    consistent with :func:`_pick_block_n`.
     """
     override = _env_int(env)
     if override is not None:
@@ -238,18 +157,21 @@ def _pick_block_n(
 ) -> int:
     """Pick the channel-tile width so the launch fills the GPU.
 
-    Grid size is ``batch * cdiv(dim, BLOCK_N * cpt)``. At large batch a wide tile
-    already yields plenty of workgroups and is the most efficient per workgroup.
-    At small batch that leaves the GPU under-occupied and memory latency is
-    exposed, so a narrower tile spawns more workgroups.
+    Grid size is ``batch * cdiv(dim, BLOCK_N * cpt)``, so a wide tile is cheapest
+    per workgroup but under-occupies at small batch. Returns the widest candidate
+    that still reaches the occupancy target, else the narrowest.
 
-    Returns the widest candidate whose workgroup count reaches the occupancy
-    target, else the narrowest. A bigger part raises the target and so shifts the
-    choice towards narrower tiles on its own.
+    Below ``_MIN_CHANNELS_TO_SPLIT`` channels the rule inverts and takes the
+    widest tile: splitting the axis buys parallelism to hide latency behind, and
+    once no tile can fill the part there is no latency left to hide, only the
+    per-workgroup cost paid more times. The threshold is on ``batch * dim``
+    because the choice does not care how that product factorizes.
     """
     override = _env_int(env)
     if override is not None:
         return override
+    if batch * dim <= _MIN_CHANNELS_TO_SPLIT:
+        return _BLOCK_N_CANDIDATES[0]
     target = _target_wg(device)
     if target is not None:
         for cand in _BLOCK_N_CANDIDATES:
@@ -288,7 +210,7 @@ def _shapes_supported(
         return False
 
     dim = x.size(1)
-    # Packed x carries no sequence axis, so the token budget comes from the caller.
+    # Packed x has no sequence axis, so the token budget comes from the caller.
     seqlen = max_query_len if is_varlen else (x.size(2) if x.dim() == 3 else 1)
     width = weight.size(1)
     if width not in widths:
@@ -313,9 +235,8 @@ def _causal_conv1d_update_flydsl_supported(
 ) -> bool:
     """Whether ``causal_conv1d_update_flydsl`` can serve this problem.
 
-    The kernel covers every mode of vLLM's Triton ``causal_conv1d_update`` --
-    decode, chain speculative-verify, varlen packing and Automatic-Prefix-Caching
-    copy-on-write -- so this only screens the shapes and dtypes.
+    Every mode of vLLM's Triton kernel is covered, so only shapes and dtypes are
+    screened.
     """
     del block_idx_last_scheduled_token, initial_state_idx  # supported
     return _shapes_supported(
@@ -339,9 +260,8 @@ def _causal_conv1d_update_sglang_flydsl_supported(
 ) -> bool:
     """Whether ``causal_conv1d_update_sglang_flydsl`` can serve this problem.
 
-    Covers SGLang's decode, chain-verify, ``SAVE_INTERMEDIATE`` and EAGLE tree
-    paths. ``cache_seqlens`` (circular conv_state buffer) is unimplemented here
-    exactly as it is in SGLang's own Triton kernel.
+    ``cache_seqlens`` (circular conv_state buffer) is unimplemented here exactly
+    as it is in SGLang's own Triton kernel.
     """
     if cache_seqlens is not None:
         return False
@@ -378,55 +298,45 @@ def causal_conv1d_update_flydsl(
 ):
     """FlyDSL decode / chain-verify causal_conv1d update (vLLM-aligned).
 
-    Drop-in for vLLM's ``causal_conv1d_update`` (same parameter names and
-    order), plus trailing FlyDSL-specific ``block_n`` (workgroup width along the
-    channel axis) and ``channels_per_thread`` knobs, both ``0`` = auto. Auto
-    ``block_n`` narrows the tile at small batch so more workgroups launch and
-    hide memory latency; auto ``channels_per_thread`` is 1, since measurement
-    did not support spending it (see the call site). Pass a positive value to
-    force either. Covers every mode of the upstream kernel -- decode, chain
-    speculative-verify, varlen packing and Automatic-Prefix-Caching
-    copy-on-write:
+    Drop-in for vLLM's ``causal_conv1d_update`` (same parameter names and order),
+    covering all of its modes, plus trailing FlyDSL ``block_n`` /
+    ``channels_per_thread`` knobs where ``0`` means auto.
 
-    - ``x``:                ``(batch, dim)`` (single-token decode),
-                            ``(batch, dim, seqlen)`` (multi-token / verify) or
-                            ``(cu_tokens, dim)`` (varlen packing).
-    - ``conv_state``:       ``(num_cache_lines, dim, state_len)``,
+    - ``x``:                ``(batch, dim)`` decode, ``(batch, dim, seqlen)``
+                            verify, or ``(cu_tokens, dim)`` varlen.
+    - ``conv_state``:       ``(num_cache_lines, dim, state_len)`` with
                             ``state_len >= width - 1 + (seqlen - 1)`` for verify.
-                            Updated **in place** (matches vLLM).
+                            Updated **in place**.
     - ``weight``:           ``(dim, width)``.
     - ``bias``:             ``(dim,)`` or ``None``.
-    - ``conv_state_indices``: ``(batch,)`` int32; selects the cache line per
-                            sequence. ``(batch, num_blocks)`` under APC. Defaults
-                            to ``arange(batch)``.
-    - ``num_accepted_tokens``: ``(batch,)`` int32. If given, enables the chain
-                            speculative rollback (``offset = num_accepted-1``).
-    - ``null_block_id``:    sequences whose cache line equals this id are skipped
-                            (null/padding block, **0** upstream, not ``-1``);
-                            pass ``None`` to disable the check.
+    - ``conv_state_indices``: ``(batch,)`` int32 cache line per sequence,
+                            ``(batch, num_blocks)`` under APC. Defaults to
+                            ``arange(batch)``.
+    - ``num_accepted_tokens``: ``(batch,)`` int32; enables the chain speculative
+                            rollback (``offset = num_accepted - 1``).
+    - ``null_block_id``:    sequences on this cache line are skipped (**0**
+                            upstream, not ``-1``); ``None`` disables the check.
     - ``query_start_loc`` / ``max_query_len``: ``(batch + 1,)`` int32 cumulative
-                            token counts, turning on the packed ``(cu_tokens,
-                            dim)`` layout. ``max_query_len`` is the compile-time
-                            token budget; each sequence's real count is
-                            ``query_start_loc[i+1] - query_start_loc[i]`` and may
-                            be anything from ``0`` to it.
+                            token counts, turning on the packed layout.
+                            ``max_query_len`` is the compile-time budget; a
+                            sequence's real count is the successive difference
+                            and may be anything from ``0`` up to it.
     - ``block_idx_last_scheduled_token`` / ``initial_state_idx``: ``(batch,)``
-                            int32 Automatic-Prefix-Caching copy-on-write. Giving
-                            the former turns it on: the history is read from
-                            ``conv_state_indices[i, initial_state_idx[i]]`` and
-                            the rolled window written to
-                            ``conv_state_indices[i, block_idx_last_scheduled_token[i]]``,
-                            so a shared prefix block is copied, not clobbered.
-    - ``out``:              optional output tensor shaped like ``x``. When
-                            omitted the input is overwritten, as upstream does.
+                            int32 enabling prefix-cache copy-on-write, which
+                            reads the history from one block of
+                            ``conv_state_indices[i]`` and writes the rolled
+                            window to another, so a shared prefix is copied
+                            rather than clobbered.
+    - ``out``:              optional, shaped like ``x``; omitted overwrites the
+                            input as upstream does.
 
     Returns an output tensor with the same shape as ``x``.
     """
     is_varlen = query_start_loc is not None
     if is_varlen:
         if conv_state_indices is None:
-            # batch is only recoverable from the index tensor here: x is packed
-            # and query_start_loc may be padded longer than the batch.
+            # The only source of batch here: x is packed and query_start_loc may
+            # be padded longer than the batch.
             raise ValueError(
                 "`conv_state_indices` is required when `query_start_loc` is given."
             )
@@ -437,9 +347,8 @@ def causal_conv1d_update_flydsl(
             )
     is_apc = block_idx_last_scheduled_token is not None
     if is_apc and initial_state_idx is None:
-        # Upstream keys the mode off block_idx_last_scheduled_token alone and then
-        # dereferences initial_state_idx unconditionally, so this combination is a
-        # null deref there; say so instead.
+        # A null deref upstream, which dereferences it unconditionally once the
+        # mode is on; say so instead.
         raise ValueError(
             "`initial_state_idx` is required when `block_idx_last_scheduled_token`"
             " is given."
@@ -461,11 +370,10 @@ def causal_conv1d_update_flydsl(
 
     unsqueeze = not is_varlen and x.dim() == 2
     if unsqueeze:
-        x = x.unsqueeze(-1)  # (batch, dim, 1)
+        x = x.unsqueeze(-1)
         out = out.unsqueeze(-1)
     if is_varlen:
-        # x is (cu_tokens, dim): the sequence axis is gone and the token axis is
-        # the outer one, so there is no per-sequence stride to walk.
+        # x is (cu_tokens, dim): no sequence axis, hence no sequence stride.
         batch = conv_state_indices.shape[0]
         seqlen = int(max_query_len)
         stride_x_tok, stride_x_dim = x.stride()
@@ -497,28 +405,17 @@ def causal_conv1d_update_flydsl(
     null_block_arg = null_block_id if has_null_block else -1
 
     if channels_per_thread <= 0:
-        # Deliberately NOT _pick_cpt(). The kernel supports CPT > 1, but a paired
-        # A/B (both arms alternating inside one loop, which is the only way to
-        # get a usable ratio on these parts) put it at a wash here: geomean
-        # 0.99x for decode, 1.01x at S=2 (the vLLM MTP shape), 1.02x for verify
-        # S=4, 0.98x for verify S=8. The SGLang sibling does gain on verify
-        # S=4, so the knob stays for re-tuning; this default just does not
-        # spend it.
+        # Deliberately not _pick_cpt(), unlike the SGLang sibling: CPT > 1 is a
+        # wash at these shapes, so the default leaves it unspent.
         channels_per_thread = 1
     if block_n <= 0:
         block_n = _pick_block_n(batch, dim, x.device, channels_per_thread)
 
-    # Vectorize the per-channel conv_state / output stores whenever the token
-    # axis is contiguous. Odd channel strides leave half the lanes' bases 2-byte
-    # (not dword) aligned, but MUBUF buffer stores tolerate unaligned addresses
-    # (verified bit-exact), and the measured cost of the split lanes stays below
-    # the win from halving the store-instruction count -- e.g. verify S=3
-    # (state_len=5, odd) sped up ~7-9% at batch >= 32 and decode (state_len=3)
-    # ~7% at batch 128. So an even channel stride is not required.
+    # Vectorize the per-channel stores when the token axis is contiguous. An odd
+    # channel stride misaligns half the lanes but still comes out ahead, so an
+    # even stride is not required.
     cs_vec = bool(conv_state.stride(2) == 1)
-    # Under varlen the packed layout puts the channel axis innermost, so one
-    # channel's tokens are dim apart and there is no run to vectorize; the
-    # per-slot store predication that path needs would rule it out anyway.
+    # Never under varlen: the packed layout leaves a channel's tokens dim apart.
     o_vec = bool(stride_o_tok == 1)
 
     dtype_str = "bf16" if x.dtype == torch.bfloat16 else "fp16"
@@ -592,18 +489,14 @@ def causal_conv1d_update_flydsl(
 def _is_dedup_conv_window(window: torch.Tensor, width: int) -> bool:
     """Whether ``window`` is SGLang's overlapping (deduplicated) snapshot view.
 
-    On the linear draft chain SGLang allocates the snapshot as a compact
-    ``(cache_lines, dim, seqlen+width-2)`` buffer and exposes it as an
-    ``as_strided`` view whose step axis advances by exactly one tap, so step
-    ``t``'s window is positions ``t .. t+width-2``. Consecutive windows then
-    alias, and writing them one at a time stores every element ``width-1``
-    times. The stride equality below is the tell -- for a dense snapshot the
-    step axis advances by a whole window (``dim*(width-1)`` elements), so it can
-    only coincide with the tap stride under aliasing.
+    On the linear draft chain the snapshot is an ``as_strided`` view over a
+    compact ``(cache_lines, dim, seqlen+width-2)`` buffer whose step axis
+    advances by one tap, so consecutive windows alias and writing them one at a
+    time stores every element ``width-1`` times. A dense snapshot instead
+    advances a whole window, so the strides can only coincide under aliasing.
 
-    Guarded on ``width > 2`` because a single-tap window has nothing to
-    deduplicate and its trailing stride is degenerate (size-1 axes carry an
-    arbitrary stride, which would make the comparison meaningless).
+    ``width > 2`` guards against a single-tap window, which has nothing to
+    deduplicate and whose size-1 trailing axis carries an arbitrary stride.
     """
     return width > 2 and window.stride(1) == window.stride(3)
 
@@ -632,36 +525,31 @@ def causal_conv1d_update_sglang_flydsl(
     """FlyDSL decode / verify causal_conv1d update (SGLang-aligned).
 
     Drop-in for SGLang's ``causal_conv1d_update`` (same parameter names and
-    order), plus trailing FlyDSL-specific ``block_n`` / ``channels_per_thread``
-    knobs. Both default to ``0`` (auto-select from the batch); pass a positive
-    value to force one, or set ``AITER_FLYDSL_CONV1D_BN`` /
+    order), plus trailing FlyDSL ``block_n`` / ``channels_per_thread`` knobs
+    where ``0`` means auto, overridable via ``AITER_FLYDSL_CONV1D_BN`` /
     ``AITER_FLYDSL_CONV1D_CPT``.
 
     - ``x``:                ``(batch, dim)`` or ``(batch, dim, seqlen)``.
-    - ``conv_state``:       ``(num_cache_lines, dim, state_len)``, updated
-                            in place; ``state_len >= width-1 + (seqlen-1)``
-                            when ``num_accept_tokens`` is given.
+    - ``conv_state``:       ``(num_cache_lines, dim, state_len)``, updated in
+                            place; ``state_len >= width-1 + (seqlen-1)`` when
+                            ``num_accept_tokens`` is given.
     - ``num_accept_tokens``: ``(batch,)`` int32; enables the speculative
                             rollback (``offset = num_accept_tokens - 1``).
     - ``intermediate_conv_window``: ``(cache_lines, seqlen, dim, width-1)``;
-                            when given, each step's convolution window is
-                            snapshotted so any accepted prefix can be restored.
-                            SGLang's linear draft chain hands us an overlapping
-                            ``as_strided`` view over a compact
-                            ``(cache_lines, dim, seqlen+width-2)`` buffer, which
-                            we detect and write once per element instead of
-                            once per window -- see ``_is_dedup_conv_window``.
+                            snapshots each step's window so an accepted prefix
+                            can be restored. An overlapping view is detected and
+                            written once per element -- see
+                            ``_is_dedup_conv_window``.
     - ``retrieve_next_token`` / ``retrieve_next_sibling``: ``(batch, seqlen)``
-                            int32 EAGLE tree links; when given, the
-                            convolution walks each token's parent chain and
+                            int32 EAGLE tree links; the convolution then walks
+                            each token's parent chain and
                             ``retrieve_parent_token`` receives the parent map.
 
     ``cache_seqlens`` (circular buffer) is not implemented, matching SGLang.
 
-    Returns ``out`` if given, else a freshly allocated tensor shaped like ``x``.
-    ``out`` is a trailing FlyDSL extension: SGLang always allocates, but aiter's
-    Triton ``causal_conv1d_update`` writes the output over ``x``, so its dispatch
-    seam passes ``out=x`` to keep that in-place contract.
+    Returns ``out`` if given, else a fresh tensor shaped like ``x``. ``out`` is a
+    FlyDSL extension: SGLang always allocates, but aiter's Triton kernel writes
+    over ``x``, so the dispatch seam passes ``out=x`` to keep that contract.
     """
     if cache_seqlens is not None:
         raise NotImplementedError(
@@ -680,7 +568,7 @@ def causal_conv1d_update_sglang_flydsl(
 
     unsqueeze = x.dim() == 2
     if unsqueeze:
-        x = x.unsqueeze(-1)  # (batch, dim, 1)
+        x = x.unsqueeze(-1)
     batch, dim, seqlen = x.shape
     _, width = weight.shape
     num_cache_lines, cs_dim, state_len_phys = conv_state.shape
@@ -689,9 +577,8 @@ def causal_conv1d_update_sglang_flydsl(
     state_len_eff = (width - 1 + (seqlen - 1)) if is_spec else (width - 1)
     save_inter = intermediate_conv_window is not None
     has_tree = retrieve_next_token is not None
-    # Same snapshot, same bytes, same destination addresses -- just written once
-    # each instead of once per overlapping window. Purely internal: the caller
-    # keeps passing (and reading back) intermediate_conv_window.
+    # Purely internal: same bytes at the same addresses, so the caller keeps
+    # passing (and reading back) intermediate_conv_window either way.
     save_stream = save_inter and _is_dedup_conv_window(intermediate_conv_window, width)
     save_window = save_inter and not save_stream
 
@@ -715,24 +602,17 @@ def causal_conv1d_update_sglang_flydsl(
     if conv_state_indices is None:
         conv_state_indices = torch.arange(batch, dtype=torch.int32, device=x.device)
     if save_inter and intermediate_state_indices is None:
-        # Reuse the cache lines rather than synthesising a fresh arange: aiter's
-        # Triton has no separate snapshot index and addresses both through
-        # conv_state_indices, and the dispatch seam forwards it for exactly that
-        # reason, so this is the convention a caller that omits it is asking for.
-        # An arange would instead silently write the snapshot to other rows
-        # whenever conv_state_indices is not itself an arange -- and it costs a
-        # device allocation on every call, which at decode shapes is a
-        # measurable fraction of the launch.
+        # aiter's Triton addresses both through conv_state_indices, so reuse it.
+        # An arange would silently write the snapshot to other rows whenever
+        # conv_state_indices is not itself an arange.
         intermediate_state_indices = conv_state_indices
 
     if out is None:
         out = torch.empty_like(x)  # SGLang allocates rather than overwriting x
     else:
-        # SGLang has no `out` parameter, so hold this extension to the contract
-        # vLLM defines for its own: same shape, dtype and device as the input.
-        # x has already been cast to the conv_state dtype, which is what the
-        # kernel writes, so that is what the buffer has to be.
-        # x is already unsqueezed here, so compare against the caller's shape.
+        # Held to the contract vLLM defines for its own `out`: same shape, dtype
+        # and device as the input. x is already cast and unsqueezed by now, so
+        # compare against the caller's shape.
         want_shape = x.shape[:-1] if unsqueeze else x.shape
         if out.shape != want_shape:
             raise ValueError(
@@ -758,15 +638,10 @@ def causal_conv1d_update_sglang_flydsl(
             batch, dim, x.device, channels_per_thread, env="AITER_FLYDSL_CONV1D_BN"
         )
 
-    # Vectorize the per-channel conv_state / output stores whenever the token
-    # axis is contiguous. Odd channel strides misalign half the lanes but MUBUF
-    # tolerates that and the win from halving the store count dominates; see the
-    # vLLM sibling above for the measured numbers.
+    # Vectorize the per-channel stores when the token axis is contiguous; see the
+    # vLLM sibling above. i_vec is the same for the snapshot's W-1 tap slots.
     cs_vec = bool(conv_state.stride(2) == 1)
     o_vec = bool(out.stride(2) == 1)
-    # The snapshot's width axis is the fastest-varying one, so its W-1 slots are
-    # adjacent and collapse into one vector store. Without this flag si_win stays
-    # a runtime value and every slot costs a dependent add+shift to re-address.
     i_vec = bool(save_inter and intermediate_conv_window.stride(3) == 1)
 
     dtype_str = "bf16" if x.dtype == torch.bfloat16 else "fp16"
@@ -798,9 +673,8 @@ def causal_conv1d_update_sglang_flydsl(
     stride_csi = conv_state_indices.stride(0)
 
     if save_inter:
-        # The stream path addresses the very same memory; it just walks the tap
-        # axis across the whole run instead of restarting it per step, so the
-        # step stride goes unused there.
+        # si_step goes unused on the stream path, which walks the tap axis across
+        # the whole run instead of restarting it per step.
         si_seq, si_step, si_dim, si_win = intermediate_conv_window.stride()
         sisi = intermediate_state_indices.stride(0)
     else:

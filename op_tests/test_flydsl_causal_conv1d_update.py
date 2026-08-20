@@ -3,8 +3,8 @@
 
 """Parity tests for the FlyDSL causal_conv1d update kernels (decode + verify).
 
-Two kernels are under test, one per upstream interface. They are the same
-algorithm behind two different shells, and both are maintained:
+Two kernels are under test, one per upstream interface -- the same algorithm
+behind two different shells:
 
 * ``causal_conv1d_update_flydsl`` -- vLLM's interface (skip sentinel
   ``null_block_id``, default ``0``).
@@ -16,105 +16,74 @@ algorithm behind two different shells, and both are maintained:
 
 The reference is the upstream kernel itself
 -------------------------------------------
-Each port is measured against **the kernel it claims to replace**: vLLM's own
+Each port is measured against the kernel it claims to replace: vLLM's own
 ``causal_conv1d_update`` and SGLang's own Triton one, vendored verbatim into
 ``op_tests/triton_tests/utils/causal_conv1d_update_refs.py`` and called from
-``_oracle_vllm`` and ``_oracle_sglang``. Nothing in this file re-derives what
-the convolution should do.
+``_oracle_vllm`` and ``_oracle_sglang``. Nothing here re-derives what the
+convolution should do, which lets the same code be the oracle for correctness
+and a candidate in the perf table.
 
-That is deliberate, and it replaces an earlier pair of hand-written torch
-references. A transcription can only ever encode one reading of a contract, and
-it is the same reading the port was written from, so the two agree on a
-misreading and the reference reports success. It also cannot be *timed*: the
-question "is the port faster than what ships today" needs the shipping kernel in
-the room, not a torch loop that is orders of magnitude slower. Vendoring answers
-both at once -- the same code is the oracle in the correctness tests and a
-candidate in the perf table.
+Nothing imports ``vllm`` or ``sglang``: the suite must not depend on either
+being installed, and a live import would re-point the oracle whenever the
+installed version moved. Both copies carry their upstream revision and line
+range and are re-synced mechanically; see that file's docstring.
 
-Nothing here imports ``vllm`` or ``sglang``: the suite must not depend on either
-being installed, and a live import would silently re-point the oracle whenever
-the installed version moved. Both copies carry their upstream revision and the
-exact line range they came from, and are re-synced mechanically; see that file's
-module docstring. This is how the rest of aiter treats upstream references
-(``op_tests/test_causal_conv1d_update.py`` carries Tri Dao's, and
-``op_tests/triton_tests/utils/mla_extend_ref.py`` SGLang's).
-
-Sharing a file does not make them one kernel, upstream or here. The contracts
-overlap but are not the same one: vLLM has the packed layout and no snapshots,
-SGLang has the EAGLE tree and the snapshots and no packing, and their bodies
-share barely a dozen lines. Note also that aiter's own Triton
-kernel is a *fork* of SGLang's with the tree path and PDL stripped out, so it is
-not interchangeable with either -- it appears in the perf table as the incumbent
-and at the dispatch seam, but never as the oracle.
+aiter's own Triton kernel is a *fork* of SGLang's with the tree path and PDL
+stripped out, so it is interchangeable with neither: it appears as the incumbent
+in the perf table and at the dispatch seam, but never as the oracle.
 
 How the numeric bound is set
 ----------------------------
-A bf16 result is *not* required to agree bit-for-bit with the upstream bf16
-kernel: they round differently, and the FlyDSL kernels are frequently the more
-accurate of the pair, so demanding agreement would pin the less accurate one's
-error. Instead each upstream kernel is run three times per case:
+A bf16 result is not required to agree bit-for-bit with the upstream bf16
+kernel: they round differently, and the ports are frequently the more accurate
+of the pair, so demanding agreement would pin the worse one's error. Each
+upstream kernel is therefore run three times per case:
 
-* at **bf16** -- the baseline. Its ``conv_state``, snapshots and parent map are
-  the bit-exact expectation, and its output is what the port must be no further
-  from the spec than.
-* at **fp32** -- the spec. The same code on the same inputs with ~16 more
-  mantissa bits. Against an fp64 torch evaluation this lands at ~1e-6 while the
-  bf16 answers land at ~4e-2, so as a yardstick for bf16 it is exact for free.
+* at **bf16** -- the baseline whose output the port must be no further from the
+  spec than.
+* at **fp32** -- the spec. The same code with ~16 more mantissa bits, which is
+  three orders of magnitude closer to an fp64 evaluation than either bf16
+  answer, so as a bf16 yardstick it is exact for free.
 * at **fp32 on absolute values**, bias absolute and activation off -- the
-  conditioning scale. The convolution is a dot product, so feeding ``|taps|`` and
-  ``|w|`` makes every term positive and the result is exactly
+  conditioning scale. The convolution is a dot product, so feeding ``|taps|``
+  and ``|w|`` makes every term positive and the result is exactly
   ``sum_j |tap_j * w_j|``.
 
 Each element then gets a budget of ``factor * 2**-8 * sum_j |tap_j * w_j|``,
-because the error of a dot product is bounded by the sum of the *term*
-magnitudes, not by the magnitude of the result: a budget scaled to the result
-would be vacuous where the taps cancel and the output lands near zero, which is
-exactly where a bf16 kernel is least accurate. Deriving the scale from upstream
-rather than from a hand-written gather is the point -- *which* taps a token has
-is the contract-dependent part (rollback offset, packed window revision, parent
-chain), and it is now not duplicated anywhere.
+since a dot product's error is bounded by the sum of the *term* magnitudes and
+not by the result's: a budget scaled to the result would be vacuous where the
+taps cancel and the output lands near zero, which is exactly where bf16 is least
+accurate.
 
 ``conv_state``, the snapshots and the tree's parent map are compared
-**bit-exactly** against the upstream bf16 run in every case: they are assembled
-from copies of ``x`` and of the previous state with no arithmetic applied, so any
-difference there is a state-management bug rather than rounding.
+**bit-exactly** against the upstream bf16 run: they are assembled from copies of
+``x`` and the previous state with no arithmetic applied, so any difference is a
+state-management bug rather than rounding.
 
-The perf table pairs each port with its own upstream on the same buffers, which
-is the comparison the port exists to win: ``flydsl`` next to ``vllm`` on the
-decode and varlen rows, next to ``sglang`` on the verify rows, and ``triton``
-(aiter's current kernel) wherever it can express the call at all.
+The perf table pairs each port with its own upstream on the same buffers:
+``flydsl`` next to ``vllm`` on the ``vllm_*`` rows, next to ``sglang`` on the
+``sglang_*`` ones, and ``triton`` wherever it can express the call at all.
 
-Sequence indices deliberately start at 1 in the vLLM cases: that wrapper's
-``null_block_id`` sentinel is ``0`` (block 0 is the reserved null block), so a
-plain ``arange(batch)`` would make sequence 0 a null block and silently skip it.
+Sequence indices deliberately start at 1 in the vLLM cases, because that
+wrapper's ``null_block_id`` is ``0`` and a plain ``arange(batch)`` would make
+sequence 0 a null block and silently skip it.
 ``test_vllm_skips_the_null_block`` covers that behavior on purpose.
 
-Scope: Qwen, and only Qwen
---------------------------
-This port serves Qwen's GDN linear attention, so the shapes, dtypes and memory
-layouts are taken from Qwen's own call sites and from nowhere else. See the block
-above ``_alloc_x`` for each layout and the line it comes from; both upstreams
-assert ``x.stride(1) == 1``, so the channel axis is always contiguous and what
-varies is the token stride.
+Scope
+-----
+Shapes, dtypes and layouts are the ones the linear-attention call sites produce;
+see the block above ``_alloc_x`` for each layout. Both upstreams assert
+``x.stride(1) == 1``, so the channel axis is always contiguous and only the token
+stride varies.
 
-The kernels are wider than that, and the difference is deliberately **not**
-covered here. Each of these is a real capability of the port with no Qwen caller,
-so the cost of leaving it out is that a regression in it would land silently:
+The kernels are wider than what is covered here. These have no caller and are
+deliberately left out, so a regression in one would land silently: Automatic
+Prefix Caching (2D ``conv_state_indices`` with separate read and write blocks),
+fp16, widths other than 4, ``cache_seqlens`` and the ``out=`` parameter.
 
-* **Automatic Prefix Caching** -- the 2D ``conv_state_indices`` with a separate
-  read and write block. No Qwen call site passes it.
-* **fp16** -- a separately compiled specialization; Qwen serves bf16.
-* **Widths other than 4** -- the port compiles 2-6 and Qwen's
-  ``linear_conv_kernel_dim`` is 4, its default and its only value.
-* **``cache_seqlens``** (the circular buffer) and the ``out=`` parameter, neither
-  of which any Qwen site passes.
-
-Upstream revisions vendored
----------------------------
-vLLM ``63a9a5010`` and SGLang ``18107e38d2``. Bumping either means re-extracting
-the copy, not editing it; the recipe is in each vendored file's docstring. A bump
-that changes an answer is upstream changing its contract, which is worth seeing
-as a test failure rather than absorbing into a hand-edited reference.
+Vendored from vLLM ``63a9a5010`` and SGLang ``18107e38d2``. Bumping either means
+re-extracting the copy, not editing it, so that an answer changing shows up as a
+test failure rather than being absorbed into a hand-edited reference.
 
 Usage:
     HIP_VISIBLE_DEVICES=7 pytest -sv op_tests/test_flydsl_causal_conv1d_update.py
@@ -125,7 +94,7 @@ Usage:
 
     # narrow the perf sweep:
     HIP_VISIBLE_DEVICES=7 python3 op_tests/test_flydsl_causal_conv1d_update.py \
-        --mode varlen -l qkvz_slice -b 128 -s 4
+        --mode vllm_verify -l qkvz_slice -b 128 -s 4
 """
 
 from __future__ import annotations
@@ -179,10 +148,9 @@ else:
     except ImportError as exc:
         _SKIP_REASON = f"the FlyDSL causal_conv1d update kernels do not import ({exc})"
 
-# Only pytest can be told to skip a module. CI shards op_tests with
-# `python3 <file>`, where a module-level skip raises Skipped with nobody to catch
-# it and the shard reports a failure instead of a skip, so main() handles that
-# case and this stays out of its way.
+# Only under pytest: CI also shards op_tests with `python3 <file>`, where a
+# module-level skip would raise Skipped with nobody to catch it and the shard
+# would report a failure. main() handles that case instead.
 if _SKIP_REASON is not None and __name__ != "__main__":
     pytest.skip(
         f"{_SKIP_REASON}. Skipping the FlyDSL causal_conv1d update tests.",
@@ -193,19 +161,17 @@ if _SKIP_REASON is not None and __name__ != "__main__":
 DEVICE = "cuda"
 DTYPE = torch.bfloat16
 
-#: The kernels are built for CDNA3/CDNA4 and the launch policy is tuned on them.
+#: Targets the kernels are built for; anything else skips.
 SUPPORTED_GFX = ("gfx942", "gfx950")
 
-#: One mantissa step of the storage dtype, the relative cost of storing any
-#: single value. Only bf16 appears here because that is what Qwen serves; the
-#: port also specializes fp16, which would need its own tighter step (2**-11) as
-#: well as its own cases, and is out of this file's scope.
+#: One mantissa step of the storage dtype. Only bf16 is exercised; fp16 would
+#: need its own tighter step and its own cases.
 _DTYPE_EPS = {torch.bfloat16: 2.0**-8}
 _DTYPE_NAME = {torch.bfloat16: "bf16"}
 
-#: How many of those steps a result may accumulate over the whole convolution,
-#: scaled per element by the conditioning (see the module docstring). Covers the
-#: width taps, the bias, the silu approximation and the store.
+#: How many of those steps a result may accumulate, scaled per element by the
+#: conditioning (see the module docstring). Covers the taps, the bias, the silu
+#: approximation and the store.
 _ERR_FACTOR = 8.0
 
 
@@ -259,31 +225,12 @@ def _eagle_tree_links(batch, seqlen):
 
 # -- the upstream kernels, as oracle and as baseline ----------------------
 #
-# Both references are vLLM's and SGLang's own kernels, vendored verbatim into
-# op_tests/triton_tests/utils/causal_conv1d_update_refs.py and called here.
-# Nothing in this file re-derives what the convolution should do.
+# Each is run three times per case -- at the tested dtype (baseline), at fp32
+# (spec) and at fp32 on absolute values (conditioning scale) -- which is what
+# lets one kernel serve as the whole yardstick. See the module docstring.
 #
-# Each is run three times per case, which is what lets one kernel serve as the
-# whole yardstick:
-#
-# 1. at the tested dtype -- the *baseline*. This is the number the port has to
-#    beat on speed and match on accuracy, and its conv_state / snapshots / parent
-#    map are the bit-exact expectation, since those are assembled from copies.
-# 2. at fp32 -- the *spec*. Same code, same inputs, ~16 more mantissa bits.
-#    Measured against an fp64 torch evaluation this lands at ~1e-6 while the bf16
-#    answers land at ~4e-2, so as a yardstick for bf16 it is exact for free.
-# 3. at fp32 on absolute values, bias absolute, activation off -- the
-#    *conditioning scale*. The convolution is a dot product, so feeding |taps|
-#    and |w| makes every term positive and the sum of products is exactly
-#    sum_j |tap_j * w_j|, which is what the error budget is scaled by. Taking it
-#    from upstream rather than from a hand-written gather matters: which taps a
-#    token even has is the contract-dependent part (rollback offset, packed
-#    window revision, parent chain), and it is now not duplicated anywhere.
-#
-# The two are deliberately not factored together. The contracts overlap but are
-# not the same one -- vLLM has the packed layout and no snapshots; SGLang has the
-# EAGLE tree and the snapshots and no packing -- and they are different files
-# upstream for that reason.
+# The two are deliberately not factored together: the contracts overlap but are
+# not the same one, which is why they are separate files upstream too.
 
 
 class _Oracle(NamedTuple):
@@ -477,20 +424,16 @@ def _assert_bit_exact(label, what, actual, expected):
 
 # -- vLLM interface -------------------------------------------------------
 
-# (batch, dim, width, seqlen, spec); spec=True enables the chain rollback.
-# Width is 4 throughout because that is Qwen's `linear_conv_kernel_dim`, its
-# default and its only value; the port compiles widths 2-6 but this file does not
-# reach for them (see the module docstring on what is deliberately not covered).
+# (batch, dim, width, seqlen, spec); spec=True enables the chain rollback. Width
+# is 4 throughout, the only one the call sites use; see the module docstring.
 _VLLM_CASES = [
     (1, 128, 4, 1, False),
     (4, 256, 4, 1, False),
     (64, 512, 4, 1, False),
     # Multi-token without a rollback point, in the one band where the slide
-    # length is observable: 1 < seqlen < width - 1 keeps part of the rolled
-    # window coming from conv_state, and it then slides by the chunk length
-    # rather than by one column. At seqlen >= width - 1 every slot comes from x
-    # and the distinction vanishes, so width 4 / seqlen 2 is the only cell of
-    # this kind reachable at Qwen's width.
+    # length is observable: at 1 < seqlen < width - 1 part of the rolled window
+    # still comes from conv_state and slides by the chunk length rather than by
+    # one column. Width 4 / seqlen 2 is the only such cell at that width.
     (4, 128, 4, 2, False),
     (8, 256, 4, 2, True),
     (32, 384, 4, 4, True),
@@ -504,10 +447,8 @@ def test_vllm_matches_upstream_vllm(batch, dim, width, seqlen, spec):
 
     Three things at once: the output stays inside its error budget, it is no
     further from the spec than vLLM's kernel is, and the ``conv_state`` roll-back
-    matches vLLM's bit-exactly. The baseline is upstream itself rather than
-    aiter's Triton fork, because it is vLLM's contract this entry point claims to
-    implement -- aiter's Triton is SGLang-shaped and is measured in the perf table
-    and at the dispatch seam instead.
+    matches vLLM's bit-exactly. The baseline is upstream rather than aiter's
+    Triton fork because it is vLLM's contract this entry point implements.
     """
     t = _make_inputs(batch, dim, width, seqlen, spec=spec, seed=batch * 100 + seqlen)
     indices = torch.arange(1, batch + 1, dtype=torch.int32, device=DEVICE)
@@ -542,7 +483,7 @@ def test_vllm_matches_upstream_vllm(batch, dim, width, seqlen, spec):
 
 @pytest.mark.parametrize("channels_per_thread", [1, 2])
 def test_vllm_channels_per_thread_agree(channels_per_thread):
-    """CPT is an occupancy knob only: both mappings must produce one answer."""
+    """CPT only changes the channel mapping: both must produce one answer."""
     t = _make_inputs(32, 512, 4, 4, spec=True, seed=99)
     indices = torch.arange(1, 33, dtype=torch.int32, device=DEVICE)
 
@@ -572,20 +513,19 @@ def test_vllm_channels_per_thread_agree(channels_per_thread):
 def test_cpt_policy_backs_off_for_long_speculative_windows():
     """The channels-per-thread default has to track S, not just the batch.
 
-    Paired A/B measured +4.1% at S=4 but -2.4% at S=8, and the EAGLE tree path
-    runs at S=8, so a policy that only looked at the batch would hand the tree a
-    knob setting known to cost it time. Pinned here because the reversal is not
-    something the code can derive.
+    The knob helps at short windows and hurts at long ones, and the tree path
+    runs at the long end, so a policy reading only the batch would hand it the
+    wrong setting. Pinned because the reversal is not derivable from the code.
     """
     from aiter.ops.flydsl.causal_conv1d_update_kernels import _CPT_MAX, _pick_cpt
 
     device = torch.device(DEVICE)
-    big_enough = 256  # batch past the occupancy target at dim=4096
+    big_enough = 256  # batch large enough for the policy to spend the knob
 
     assert _pick_cpt(big_enough, 4096, device, seqlen=4) == _CPT_MAX
     assert _pick_cpt(big_enough, 4096, device, seqlen=5) == 1
     assert _pick_cpt(big_enough, 4096, device, seqlen=8) == 1
-    # A small batch stays at 1 whatever the window: it is occupancy-bound first.
+    # A small batch stays at 1 whatever the window: too few workgroups to split.
     assert _pick_cpt(1, 256, device, seqlen=1) == 1
 
 
@@ -630,12 +570,10 @@ _SGLANG_CASES = [
     (8, 256, 4, 4, True, True, False),
     (8, 256, 4, 8, True, False, True),
     (4, 128, 4, 4, True, True, True),
-    # Tree links with `num_accept_tokens` left out. This is the shape SGLang's
-    # own target-verify sites send (gdn and kda both pass the tree and the
-    # snapshot but no accept count), and it is a distinct path: the accept count
-    # is what turns on the rollback and the wider state, so upstream and this
-    # port both fall to `offset = 0` and `state_len = width - 1` here and let the
-    # parent links carry the chain instead.
+    # Tree links with `num_accept_tokens` left out, which is what SGLang's own
+    # target-verify sites send and is a distinct path: without the accept count
+    # there is no rollback and no wider state, so both upstream and this port
+    # fall to `offset = 0` and let the parent links carry the chain.
     (8, 256, 4, 8, False, True, True),
     (4, 128, 4, 4, False, False, True),
 ]
@@ -725,11 +663,11 @@ def test_sglang_matches_upstream_sglang(
         _assert_bit_exact(label, "retrieve_parent_token map", parents, ref.parents)
 
 
-#: SGLang only enables its deduplicated snapshot layout for CUDA linear draft
-#: chains (see ``conv_window_dedup_enabled``): tree ancestors need independent
-#: windows, so an aliasing view would have siblings overwrite each other. The
-#: widths on either side of Qwen's 4 pin the collapse at more than one ratio,
-#: and width 2 pins the opposite -- a single-tap window has nothing to fold.
+#: SGLang only enables its deduplicated snapshot layout for linear draft chains
+#: (``conv_window_dedup_enabled``), since tree siblings need independent windows
+#: and would overwrite each other through an aliasing view. Widths 3 and 4 pin
+#: the collapse at more than one ratio; width 2 pins the opposite, having a
+#: single-tap window with nothing to fold.
 _DEDUP_CASES = [
     (8, 256, 4, 4),
     (8, 256, 4, 8),
@@ -743,14 +681,12 @@ _DEDUP_CASES = [
 def test_sglang_dedup_conv_window_matches_dense(batch, dim, width, seqlen):
     """SGLang's overlapping snapshot view gets the same bytes, written once.
 
-    On the linear draft chain SGLang does not allocate the dense
-    ``(lines, seqlen, dim, width-1)`` snapshot at all -- it allocates a compact
-    ``(lines, dim, seqlen+width-2)`` buffer and hands us an ``as_strided`` view
-    of it, so consecutive steps' windows alias and the dense store pattern
-    writes every element ``width-1`` times over. The kernel detects that view
-    and walks the run once instead. What has to hold is that the caller cannot
-    tell: reading the snapshot back through the view must give exactly what the
-    dense path would have left there.
+    On the linear draft chain SGLang allocates a compact
+    ``(lines, dim, seqlen+width-2)`` buffer instead of the dense
+    ``(lines, seqlen, dim, width-1)`` snapshot and hands us an ``as_strided``
+    view, so consecutive windows alias and the dense store pattern would write
+    every element ``width-1`` times. The kernel detects that and walks the run
+    once. What has to hold is that the caller cannot tell.
     """
     t = _sglang_problem(batch, dim, width, seqlen, True, True, False)
     label = f"dedup b{batch} d{dim} w{width} s{seqlen}"
@@ -854,10 +790,8 @@ def test_dispatch_seam_routes_to_flydsl(batch, dim, width, seqlen, spec, save_in
         "x after the call would silently see stale activations"
     )
 
-    # aiter's Triton entry point is SGLang-shaped -- it spells the sentinel
-    # `pad_slot_id`, takes `intermediate_conv_window` (which vLLM's kernel does
-    # not have at all) and falls through to the SGLang-interface port -- so
-    # SGLang's kernel is the one that describes it.
+    # aiter's Triton entry point is SGLang-shaped, down to the sentinel name and
+    # the snapshot buffer, so SGLang's kernel is the one that describes it.
     ref = _oracle_sglang(
         t["x"],
         t["conv_state"],
@@ -965,7 +899,7 @@ def test_dispatch_seam_is_off_by_default():
 
 
 def test_predicates_accept_what_the_port_covers():
-    """Everything Qwen sends must be in scope, or the seam silently falls back.
+    """Everything the call sites send must be in scope, or the seam falls back.
 
     A predicate that refuses a supported case is not a wrong answer, it is a
     wrong *kernel*: the dispatch seam hands the call back to Triton and the port
@@ -980,7 +914,7 @@ def test_predicates_accept_what_the_port_covers():
         t["x"], t["conv_state"], t["weight"], num_accept_tokens=t["num_accepted"]
     )
 
-    # The packed layout, which is what Qwen's MTP site sends.
+    # The packed layout, which is what the speculative site sends.
     flat = _make_inputs(4, 256, 4, 1, spec=False, seed=19)
     assert _causal_conv1d_update_flydsl_supported(
         flat["x"].squeeze(-1),
@@ -1056,11 +990,10 @@ _VARLEN_CASES = [
 ]
 
 
-#: The subset whose sequences are each equivalent to a dense problem. With a
-#: rollback point the window is history + accepted drafts, whose length tracks the
-#: sequence, and at max_query_len == 1 there is no padding to revise away. Without
-#: either, upstream narrows a short sequence's window below width - 1, which the
-#: dense entry point cannot express, so only the packed comparison reaches those.
+#: The subset whose sequences are each equivalent to a dense problem: either a
+#: rollback point makes the window track the sequence, or max_query_len == 1
+#: leaves no padding to revise away. Otherwise upstream narrows a short
+#: sequence's window below width - 1, which the dense entry point cannot express.
 _VARLEN_DENSE_EQUIVALENT = [c for c in _VARLEN_CASES if c[2] or c[1] == 1]
 
 
@@ -1194,48 +1127,39 @@ def test_vllm_varlen_matches_upstream_vllm(width, seqlen, spec, lens):
     _assert_no_worse_than(label, got, ref.out, ref.spec, ref.scale, "vLLM's own kernel")
 
 
-# -- the layouts Qwen hands the kernel ------------------------------------
+# -- the layouts the call sites hand the kernel ---------------------------
 #
-# Both upstreams assert ``x.stride(1) == 1`` under ``validate_data``
-# (vLLM ``causal_conv1d.py:1153``, SGLang ``causal_conv1d_triton.py``), and
-# Qwen's decode site passes ``validate_data=True``, so the channel axis is always
-# the contiguous one. What differs between call sites is the *token* stride, and
-# none of them is a fresh contiguous tensor of the shape the kernel sees -- every
-# one is a view into a buffer some projection wrote:
+# Both upstreams assert ``x.stride(1) == 1`` under ``validate_data``, so the
+# channel axis is always contiguous and only the *token* stride differs. None of
+# these is a fresh contiguous tensor either; each is a view into a buffer some
+# projection wrote:
 #
-# ``contiguous``   vLLM Qwen3-Next: ``mixed_qkv = torch.cat((query, key, value),
-#                  dim=-1)`` (``qwen_gdn_linear_attn.py:920``). The speculative
-#                  site's ``mixed_qkv.index_select(0, spec_token_indx)`` (:1320)
-#                  lands here too -- ``index_select`` materializes a fresh
+# ``contiguous``   ``torch.cat((query, key, value), dim=-1)``. The speculative
+#                  site's ``index_select`` lands here too, materializing a fresh
 #                  contiguous tensor whatever it was handed.
-# ``qkvz_slice``   vLLM Qwen3.5: ``mixed_qkv, z = mixed_qkvz.split([qkv_size,
-#                  z_size], dim=-1)`` (:925), the leading column window of the
-#                  fused qkvz projection. A token's channels stay adjacent, but
-#                  consecutive tokens are the whole projection apart.
-# ``verify_view``  SGLang GDN target-verify: ``mixed_qkv.view(batch, draft, -1)
-#                  .transpose(1, 2)`` (``gdn_backend.py:545``). The dense 3D
-#                  window is a transposed view -- a *contiguous* (batch, dim,
-#                  tokens) has ``stride(1) == tokens`` and so is the one shape
-#                  upstream's own assertion rejects.
+# ``qkvz_slice``   the qkv half of a fused ``qkvz`` projection, taken by
+#                  ``split``. A token's channels stay adjacent but consecutive
+#                  tokens are the whole projection apart.
+# ``verify_view``  target-verify's ``mixed_qkv.view(batch, draft, -1)
+#                  .transpose(1, 2)``. Transposed, and necessarily so: a
+#                  contiguous ``(batch, dim, tokens)`` has
+#                  ``stride(1) == tokens``, the one shape upstream rejects.
 #
-# A channel-major decode input is deliberately absent: no Qwen path produces it,
-# and with ``stride(1) == tokens`` it is outside the contract above.
+# A channel-major decode input is deliberately absent: no call site produces one.
 
-#: ``z_size / qkv_size`` for the qkvz slice. Qwen3-Next defaults to 16 key heads
-#: and 32 value heads of 128 (``configs/qwen3_next.py:205-208``), so the conv dim
-#: is ``2 * 2048 + 4096 = 8192`` and the trailing z is ``value_dim = 4096``.
+#: ``z_size / qkv_size`` for the qkvz slice, where the trailing z block matches
+#: the value projection and so is half the fused width.
 _QKVZ_Z_RATIO = 0.5
 
 
 def _alloc_x(layout, shape, gen, dtype=DTYPE):
     """Allocate ``x`` as a view into the buffer the projection would have written.
 
-    Not a contiguous tensor relaid out afterwards: the container is the real one
-    and the kernel gets a view into it, which is both what the model does and one
-    copy fewer. ``shape`` is the view's shape -- ``(tokens, dim)`` for the 2D
-    layouts, ``(batch, dim, tokens)`` for ``verify_view``. The columns outside the
-    view are randomized as well, so a kernel that strays past its window reads
-    plausible values instead of zeros and still fails the comparison.
+    The container is the real one and the kernel gets a view into it, as the
+    model does. ``shape`` is the view's -- ``(tokens, dim)`` for the 2D layouts,
+    ``(batch, dim, tokens)`` for ``verify_view``. Columns outside the view are
+    randomized too, so a kernel that strays past its window reads plausible
+    values rather than zeros and still fails the comparison.
     """
     kw = {"generator": gen, "device": DEVICE, "dtype": dtype}
     if layout == "contiguous":
@@ -1269,13 +1193,12 @@ def _assert_layout(layout, view):
 
 
 def test_vllm_reads_x_through_its_strides():
-    """Qwen3.5 slices ``x`` out of the fused projection, so strides must be read.
+    """A sliced ``x`` must be addressed through its strides, not assumed dense.
 
-    The kernel addresses ``x`` through the strides it is handed, and a wrong
-    assumption there is invisible on the contiguous tensor Qwen3-Next passes.
-    Same values at a different token stride, so this is bit-exact rather than a
-    tolerance -- only the addresses differ. Dense decode and packed varlen both,
-    because they take different paths to the same load.
+    A wrong assumption there is invisible on a contiguous tensor. Same values at
+    a different token stride, so this is bit-exact rather than a tolerance --
+    only the addresses differ. Dense decode and packed varlen both, because they
+    take different paths to the same load.
     """
     gen = torch.Generator(device=DEVICE).manual_seed(4242)
 
@@ -1364,54 +1287,61 @@ def test_sglang_reads_the_transposed_verify_window():
 
 # -- performance ----------------------------------------------------------
 
-#: Each mode is one upstream call site, reproduced as the model makes it.
+#: Each mode is one upstream call site, reproduced as the model makes it. The
+#: prefix is the framework whose interface the row is measured through, which
+#: also picks the oracle and which candidates the row can hold.
 #:
-#: ``decode``  vLLM Qwen GDN, one token per sequence, ``x`` as ``(batch, dim)``
-#:             and no accept count (``qwen_gdn_linear_attn.py:1366``, ``:1662``).
-#: ``varlen``  vLLM Qwen GDN speculative decode -- the MTP site. The draft window
-#:             is packed as ``(cu_tokens, dim)`` and comes with
-#:             ``query_start_loc`` + ``num_accepted_tokens`` (``:1332``, ``:1712``).
-#: ``verify``  SGLang GDN target-verify: the draft window as a transposed 3D view,
-#:             through SGLang's interface, with the per-step snapshot buffer and
-#:             *no* accept count -- that site passes neither ``num_accept_tokens``
-#:             nor ``cache_seqlens`` (``gdn_backend.py:549``).
-#: ``verify_tree``
-#:             The same site once ``speculative_eagle_topk > 1``: the draft is a
-#:             candidate *tree*, so the convolution walks each token's parent
-#:             chain instead of its linear predecessor and the kernel builds
-#:             ``retrieve_parent_token`` on the way (``gdn_backend.py:558``). Only
-#:             the ReplaySSM fast path is restricted to a linear chain
-#:             (``server_args.py:6315``); the tree falls back to this verify, so
-#:             it is a live path and gets its own rows.
-BENCH_MODES = ("decode", "verify", "verify_tree", "varlen")
+#: The two ``verify`` modes stay separate because the frameworks roll back by
+#: different means: vLLM lengthens the conv_state cache line and cuts it down to
+#: an accept count, SGLang keeps the line short and rewinds from a per-token
+#: snapshot. vLLM's own vocabulary is ``spec``/``non_spec``, not "verify"; the
+#: name here is for the job, so it reads against ``sglang_verify``.
+#:
+#: ``vllm_decode``  one token per sequence, ``x`` as ``(batch, dim)`` and no
+#:                  accept count.
+#: ``vllm_verify``  the speculative site: draft window packed as
+#:                  ``(cu_tokens, dim)`` with ``query_start_loc`` +
+#:                  ``num_accepted_tokens``.
+#: ``sglang_verify``
+#:                  target-verify: draft window as a transposed 3D view with the
+#:                  per-step snapshot and *no* accept count. No suffix means the
+#:                  linear chain.
+#: ``sglang_verify_tree``
+#:                  the same site at ``speculative_eagle_topk > 1``, where the
+#:                  draft is a *tree*, so the convolution walks parent chains and
+#:                  the kernel builds ``retrieve_parent_token`` on the way. A
+#:                  live path, since only the ReplaySSM fast path requires a
+#:                  linear chain and the tree falls back here.
+BENCH_MODES = ("vllm_decode", "vllm_verify", "sglang_verify", "sglang_verify_tree")
 
 #: The x layouts each call site can produce; see the block above `_alloc_x`.
-#: Both verify modes' windows are transposed views and cannot be anything else --
-#: a contiguous ``(batch, dim, tokens)`` is the one shape upstream rejects -- and
-#: the 2D sites are contiguous on Qwen3-Next and a qkvz column slice on Qwen3.5.
+#: Both SGLang windows are transposed views and cannot be anything else, a
+#: contiguous ``(batch, dim, tokens)`` being the one shape upstream rejects. The
+#: 2D sites produce either a contiguous tensor or a qkvz column slice.
 _MODE_LAYOUTS = {
-    "decode": ("contiguous", "qkvz_slice"),
-    "varlen": ("contiguous", "qkvz_slice"),
-    "verify": ("verify_view",),
-    "verify_tree": ("verify_view",),
+    "vllm_decode": ("contiguous", "qkvz_slice"),
+    "vllm_verify": ("contiguous", "qkvz_slice"),
+    "sglang_verify": ("verify_view",),
+    "sglang_verify_tree": ("verify_view",),
 }
 
-#: The two SGLang target-verify rows, which differ only by the tree links.
-_VERIFY_MODES = ("verify", "verify_tree")
+#: The rows measured through SGLang's interface, which differ only by the tree
+#: links. Not every mode with "verify" in its name: `vllm_verify` is the vLLM
+#: interface and takes the other branch throughout.
+_SGLANG_MODES = ("sglang_verify", "sglang_verify_tree")
 
 BENCH_LAYOUTS = ("contiguous", "qkvz_slice", "verify_view")
 
 
 def _bench_problem(batch, dim, width, seqlen, mode, layout, dtype):
-    """Inputs for one benchmark row: the call the model makes, and its dense form.
+    """Inputs for one benchmark row: the call as made, and its dense form.
 
-    ``x`` is allocated directly in the layout its call site produces rather than
-    built contiguous and relaid out afterwards, so the buffer behind it is the one
-    the projection would have written. The reference's dense
-    ``(batch, dim, seqlen)`` is then a *view* of that same storage: the timed call
-    and the checked values are one tensor, not a copy of one.
+    ``x`` is allocated directly in its call site's layout rather than built
+    contiguous and relaid out, so the buffer behind it is the real one. The
+    reference's dense ``(batch, dim, seqlen)`` is a *view* of that same storage,
+    so the timed call and the checked values are one tensor.
     """
-    spec = mode == "varlen"
+    spec = mode == "vllm_verify"
     t = _make_inputs(
         batch, dim, width, seqlen, spec=spec, seed=batch * 31 + seqlen, dtype=dtype
     )
@@ -1424,16 +1354,15 @@ def _bench_problem(batch, dim, width, seqlen, mode, layout, dtype):
         "conv_state_indices": t["indices"],
     }
 
-    if mode in _VERIFY_MODES:
+    if mode in _SGLANG_MODES:
         x = _alloc_x(layout, (batch, dim, seqlen), gen, dtype)
         dense = x
-        # GDN always hands target-verify a snapshot buffer. Its companion
-        # `intermediate_state_indices` is not in the shared call: aiter's Triton
-        # has no such parameter, so passing it to every candidate would drop that
-        # one. SGLang's own kernel dereferences it whenever a snapshot buffer is
-        # present, so it gets it as a per-candidate extra below; the port falls
-        # back to `conv_state_indices`. It selects a destination row and changes
-        # no work, so it cannot move the timing either way.
+        # Target-verify is always handed a snapshot buffer. Its companion
+        # `intermediate_state_indices` stays out of the shared call because
+        # aiter's Triton has no such parameter; SGLang's kernel dereferences it
+        # whenever a snapshot is present, so it gets it as a per-candidate extra
+        # below and the port falls back to `conv_state_indices`. It only selects
+        # a destination row, so it cannot move the timing.
         t["window"] = torch.randn(
             (t["conv_state"].shape[0], seqlen, dim, width - 1),
             generator=gen,
@@ -1441,11 +1370,11 @@ def _bench_problem(batch, dim, width, seqlen, mode, layout, dtype):
             dtype=dtype,
         )
         call["intermediate_conv_window"] = t["window"]
-        if mode == "verify_tree":
+        if mode == "sglang_verify_tree":
             t["next_token"], t["next_sibling"] = _eagle_tree_links(batch, seqlen)
             call["retrieve_next_token"] = t["next_token"]
             call["retrieve_next_sibling"] = t["next_sibling"]
-    elif mode == "decode":
+    elif mode == "vllm_decode":
         x = _alloc_x(layout, (batch, dim), gen, dtype)
         dense = x.unsqueeze(-1)
     else:
@@ -1478,12 +1407,11 @@ def _bench_problem(batch, dim, width, seqlen, mode, layout, dtype):
 def _bench_bytes(t, batch, dim, seqlen, width):
     """Bytes the kernel has to move, at best.
 
-    Every touched cache line is both read (the history taps) and written (the
-    rolled window), so ``conv_state`` counts twice. The weights and bias are one
-    row each and are reread by every workgroup, but they are counted once: what
-    this bounds is the traffic the kernel cannot avoid. The snapshot buffer is
-    write-only and only exists on the verify modes, where it is by far the
-    largest term -- ``width - 1`` values per token rather than one.
+    ``conv_state`` counts twice, being both read and written on every touched
+    line. The weights and bias are counted once even though every workgroup
+    rereads them, since this bounds the traffic the kernel cannot avoid. The
+    snapshot is write-only, exists only on the verify modes, and dominates there
+    at ``width - 1`` values per token.
     """
     esz = t["x"].element_size()
     state_len = t["conv_state"].shape[-1]
@@ -1500,7 +1428,7 @@ def test_causal_conv1d_update_perf(
     dim: int = 512,
     width: int = 4,
     seqlen: int = 1,
-    mode: str = "decode",
+    mode: str = "vllm_decode",
     layout: str = "contiguous",
     dtype: torch.dtype = torch.bfloat16,
 ) -> dict:
@@ -1512,14 +1440,26 @@ def test_causal_conv1d_update_perf(
     t, call, new_x = _bench_problem(batch, dim, width, seqlen, mode, layout, dtype)
     label = f"{mode}/{layout} b{batch} d{dim} w{width} s{seqlen}"
 
-    # Each mode is measured through the interface its own call site uses, and
-    # against the upstream that defines that interface -- which is the point of
-    # the table: `flydsl` in a decode or varlen row is the vLLM-shaped entry
-    # point and its neighbour is vLLM's own kernel, and in a verify row it is the
-    # SGLang-shaped one next to SGLang's. `triton` is aiter's current kernel, the
-    # incumbent both ports have to beat. Each candidate is timed on the same
-    # buffers, and a name absent from a row is a kernel that cannot express it.
-    if mode in _VERIFY_MODES:
+    # Each mode is measured through the interface its own call site uses, against
+    # the upstream defining that interface, with every candidate on the same
+    # buffers. A name absent from a row cannot express it:
+    #
+    #             vllm_decode  vllm_verify  sglang_verify  sglang_verify_tree
+    #   flydsl         y            y             y                y
+    #   vllm           y            y             -                -
+    #   sglang         -            -             y                y
+    #   triton         y            -             y                -
+    #
+    # `flydsl` spans all four through its two entry points. Each upstream covers
+    # only the half it defines, so those blanks are not gaps -- comparing across
+    # them would compare kernels handed different interfaces. `triton`'s two are
+    # real, and are much of the port's reason to exist: no packed entry point for
+    # `vllm_verify`, and no EAGLE tree path for `sglang_verify_tree`.
+    #
+    # Since a blank means "not applicable", the table is the union of every row's
+    # candidates, so a multi-mode run necessarily shows NaN; sweep a single mode
+    # for a table with none.
+    if mode in _SGLANG_MODES:
         candidates = {
             "flydsl": (causal_conv1d_update_sglang_flydsl, {}),
             "sglang": (
@@ -1527,7 +1467,7 @@ def test_causal_conv1d_update_perf(
                 {"intermediate_state_indices": t["indices"]},
             ),
         }
-        if mode == "verify":
+        if mode == "sglang_verify":
             # aiter's Triton is a fork of SGLang's with the tree path removed.
             candidates["triton"] = (causal_conv1d_update_triton, {})
         ref = _oracle_sglang(
@@ -1547,8 +1487,9 @@ def test_causal_conv1d_update_perf(
             "flydsl": (causal_conv1d_update_flydsl, {}),
             "vllm": (causal_conv1d_update_vllm_upstream, {}),
         }
-        if mode == "decode":
-            # aiter's Triton has no packed entry point, so it sits out varlen.
+        if mode == "vllm_decode":
+            # aiter's Triton has no packed entry point, so it sits out
+            # `vllm_verify`.
             candidates["triton"] = (causal_conv1d_update_triton, {})
         ref = _oracle_vllm(
             call["x"],
@@ -1562,10 +1503,9 @@ def test_causal_conv1d_update_perf(
         )
 
     # Every entry point overwrites x and conv_state, as upstream does, so each
-    # candidate gets its own copies. The answer comes from a clean call: over
-    # run_perftest's ~100 replays the input feeds on its own output and reaches
-    # inf, which costs nothing in time (measured at 0.99-1.00x against a pristine
-    # input) but is not what the spec describes.
+    # candidate gets its own copies. The answer comes from a separate clean call:
+    # across run_perftest's replays the input feeds on its own output and reaches
+    # inf, which is not what the spec describes.
     def fresh(extra):
         args = dict(call, x=new_x(), conv_state=t["conv_state"].clone(), **extra)
         if "intermediate_conv_window" in args:
@@ -1612,7 +1552,7 @@ def test_perf_row_agrees_with_the_spec(mode):
     """
     row = test_causal_conv1d_update_perf(
         mode=mode,
-        seqlen=1 if mode == "decode" else 2,
+        seqlen=1 if mode == "vllm_decode" else 2,
         # The strided layout, so the row that guards the harness is the one whose
         # addressing can actually go wrong.
         layout=_MODE_LAYOUTS[mode][-1],
@@ -1635,15 +1575,14 @@ def _parse_args():
         formatter_class=argparse.RawTextHelpFormatter,
         description="Correctness and perf for the FlyDSL causal_conv1d update kernels",
     )
-    parser.add_argument("-b", "--batch", type=int, nargs="*", default=[1, 32, 128, 512])
+    parser.add_argument("-b", "--batch", type=int, nargs="*", default=[1, 32, 128])
     parser.add_argument(
         "--dim",
         type=int,
         nargs="*",
         default=[1024, 2048, 4096, 8192],
-        help="""Conv channels. Qwen3-Next's GDN uses 16 key heads and 32 value
-        heads of 128, so the conv dim is 2 * 2048 + 4096 = 8192 at tp1; the
-        defaults are that divided by tp = 1, 2, 4, 8.""",
+        help="""Conv channels. The defaults are one call site's 8192 at tp1
+        divided by tp = 1, 2, 4, 8.""",
     )
     parser.add_argument("-w", "--width", type=int, nargs="*", default=[4])
     parser.add_argument(
@@ -1652,8 +1591,9 @@ def _parse_args():
         type=int,
         nargs="*",
         default=[1, 2, 4],
-        help="""Tokens per sequence. 1 is decode; the rest are the speculative
-        window, so they are skipped in decode mode and vice versa.""",
+        help="""Tokens per sequence. 1 is decode and is used only by
+        `vllm_decode`; the rest are the speculative draft window and are used
+        only by the other three modes.""",
     )
     parser.add_argument(
         "-d", "--dtype", type=str, nargs="*", default=["bf16"], choices=["bf16"]
@@ -1668,11 +1608,10 @@ def _parse_args():
         nargs="*",
         default=list(BENCH_LAYOUTS),
         choices=BENCH_LAYOUTS,
-        help="""How x is laid out. `contiguous` is what Qwen3-Next's torch.cat
-        produces and `qkvz_slice` what Qwen3.5 slices out of the fused qkvz
-        projection; `verify_view` is SGLang's transposed 3D window and is the only
-        layout its mode accepts. Combinations a call site cannot produce are
-        skipped.""",
+        help="""How x is laid out. `contiguous` is what a torch.cat produces and
+        `qkvz_slice` what a fused qkvz projection is sliced down to;
+        `verify_view` is SGLang's transposed 3D window and the only layout its
+        mode accepts. Combinations a call site cannot produce are skipped.""",
     )
     return parser.parse_args()
 
@@ -1689,8 +1628,9 @@ def _run_perf_sweep(args):
         args.dim,
         args.batch,
     ):
-        # A one-token speculative window is the decode row under another name.
-        if (seqlen == 1) != (mode == "decode"):
+        # A one-token speculative window is the `vllm_decode` row under another
+        # name.
+        if (seqlen == 1) != (mode == "vllm_decode"):
             continue
         # Only the layouts this call site can actually hand over.
         if layout not in _MODE_LAYOUTS[mode]:
@@ -1733,9 +1673,21 @@ def main():
         )
         return 0
 
-    failures = _run_correctness()
+    aiter.logger.info("causal_conv1d_update: running correctness checks...")
+    cases_run, failures = _run_correctness()
+    if failures:
+        for name, exc, tb in failures:
+            aiter.logger.error("FAILED %s: %r\n%s", name, exc, tb)
+        aiter.logger.error(
+            "causal_conv1d_update: %d of %d check(s) failed; skipping perf sweep",
+            len(failures),
+            cases_run,
+        )
+        return 1
+    aiter.logger.info("causal_conv1d_update: all %d checks passed", cases_run)
+
     _run_perf_sweep(args)
-    return 1 if failures else 0
+    return 0
 
 
 def _run_correctness():
@@ -1772,31 +1724,23 @@ def _run_correctness():
     )
     assert not unreached, f"never run by the CI entry point: {unreached}"
 
-    # Passing cases say nothing a reader needs -- the count and the exit code
-    # already do -- and there are enough of them to bury the perf table that is
-    # the point of a sweep run. AITER_LOG_MORE, which aiter's own perftest
-    # already honours, brings the roll call back for when a run dies partway and
-    # the question is which case it died on.
-    verbose = bool(int(os.environ.get("AITER_LOG_MORE", "0")))
-    failures = cases_run = 0
+    # Report nothing per case, the way test_flydsl_mla_reduce.py's run_checks
+    # does: a passing case tells the reader nothing the final count does not,
+    # and there are enough of them here to bury the perf table that is the
+    # point of a sweep run. Failures carry their traceback out to the caller so
+    # the whole report lands in one place rather than interleaved with the
+    # cases still running behind it.
+    cases_run = 0
+    failures = []
     for fn, arg_sets in cases:
         for args in arg_sets:
             name = f"{fn.__name__}{args if args else ''}"
             cases_run += 1
             try:
                 fn(*args)
-            except Exception:  # noqa: BLE001 - report and keep going
-                failures += 1
-                # Unbuffered: redirected to a file these would otherwise all
-                # land after the perf table, which logs to stderr.
-                print(f"FAIL {name}", flush=True)
-                traceback.print_exc()
-            else:
-                if verbose:
-                    print(f"ok   {name}", flush=True)
-
-    print(f"{cases_run} case(s), {failures} failure(s)", flush=True)
-    return failures
+            except Exception as exc:  # noqa: BLE001 - collect and keep going
+                failures.append((name, exc, traceback.format_exc()))
+    return cases_run, failures
 
 
 if __name__ == "__main__":
