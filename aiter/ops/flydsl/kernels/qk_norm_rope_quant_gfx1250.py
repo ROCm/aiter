@@ -426,7 +426,7 @@ def _build_kernel(
                 wbuf = fx.rocdl.make_buffer_tensor(weight_tensor)
                 wdiv = fx.logical_divide(wbuf, full_lay)
                 r = fx.make_rmem_tensor(full_lay, elem_dtype)
-                fx.copy_atom_call(full_atom, fx.slice(wdiv, (None, tid_val)), r)
+                fx.copy(full_atom, fx.slice(wdiv, (None, tid_val)), r)
                 return fx.memref_load_vec(r)
 
         else:
@@ -487,7 +487,7 @@ def _build_kernel(
         # access and no divergent bounds check on the hot path.
         tok = ArithValue(bid_t) * ROWS_PER_WG + ArithValue(tid_y)
         _nt_m1 = _to_raw(ArithValue(_to_raw(num_tokens)) - 1)
-        tok = ArithValue(arith.minsi(_to_raw(tok), _nt_m1))
+        tok = arith.minsi(_to_raw(tok), _nt_m1)
         bid_t = tok  # all downstream token offsets use the clamped token
         bid_t_idx = fx.Index(_to_raw(tok))
 
@@ -1400,7 +1400,7 @@ def _build_xhead_kernel(
 
         tok = ArithValue(bid_g) * R + ArithValue(tid_y)
         _nt_m1 = _to_raw(ArithValue(_to_raw(num_tokens)) - 1)
-        tok_c = ArithValue(arith.minsi(_to_raw(tok), _nt_m1))
+        tok_c = arith.minsi(_to_raw(tok), _nt_m1)
         tok_idx = fx.Index(_to_raw(tok_c))
 
         def _ptr_res(ptr):
@@ -1523,7 +1523,7 @@ def _build_xhead_kernel(
             raws = []
             heads = []
             for m in range_constexpr(MH):
-                head = ArithValue(arith.minsi(_to_raw(head_base + m), _to_raw(c_H1)))
+                head = arith.minsi(_to_raw(head_base + m), _to_raw(c_H1))
                 heads.append(head)
                 off_dw = (
                     ArithValue(tok_c) * (H * D)
@@ -1819,7 +1819,7 @@ def _build_tdm(
 
         def issue(buf, tile_idx):
             # this wave's row of tile_idx -> buf slot wave*D (clamped to valid row)
-            my_row = ArithValue(arith.minsi(_to_raw(tile_idx * RT + wave), _nr_m1))
+            my_row = arith.minsi(_to_raw(tile_idx * RT + wave), _nr_m1)
             desc = tdm_ops.make_tensor_descriptor_2d(
                 q_in,
                 buf,
@@ -1840,11 +1840,11 @@ def _build_tdm(
         def load_cs(tile_idx):
             # pos/cos/sin for the token of (tile_idx, this wave). Callers hoist
             # this across the GROUP tiles of one token (see the stream loop).
-            my_row = ArithValue(arith.minsi(_to_raw(tile_idx * RT + wave), _nr_m1))
+            my_row = arith.minsi(_to_raw(tile_idx * RT + wave), _nr_m1)
             if const_expr(log2H is not None):
                 tok = my_row >> log2H
             else:
-                tok = ArithValue(arith.divsi(_to_raw(my_row), _to_raw(fx.Int32(H))))
+                tok = arith.divsi(_to_raw(my_row), _to_raw(fx.Int32(H)))
             pos_i32 = buffer_ops.buffer_load(
                 pos_rsrc, _to_raw(tok), vec_width=1, dtype=T.i64
             ).trunci(i32)
@@ -1875,7 +1875,7 @@ def _build_tdm(
             return cos_v, sin_v
 
         def compute_store(buf, tile_idx, cos_v, sin_v):
-            my_row = ArithValue(arith.minsi(_to_raw(tile_idx * RT + wave), _nr_m1))
+            my_row = arith.minsi(_to_raw(tile_idx * RT + wave), _nr_m1)
             x = []
             for c in range_constexpr(VEC // 8):
                 off = row_elem + (c * 8)
@@ -2106,7 +2106,7 @@ def _build_tdm_kv(*, head_dim, rope_head_dim):
         tid = fx.thread_idx.x
         wave = fx.thread_idx.y
         g = fx.block_idx.x
-        tok = ArithValue(arith.minsi(_to_raw(g * R + wave), _to_raw(num_tokens - 1)))
+        tok = arith.minsi(_to_raw(g * R + wave), _to_raw(num_tokens - 1))
 
         cos_rsrc = buffer_ops.create_buffer_resource(cos_cache, max_size=True)
         sin_rsrc = buffer_ops.create_buffer_resource(sin_cache, max_size=True)
