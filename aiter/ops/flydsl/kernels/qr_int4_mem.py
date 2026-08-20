@@ -2,7 +2,7 @@
 # Copyright (c) 2025 FlyDSL Project Contributors
 # Modifications Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
 
-"""Low-level buffer / IPC pointer helpers used by ``qr_int4_quad_fanout``.
+"""Low-level buffer / IPC pointer helpers used by ``qr_int4``.
 
 Vendored subset of FlyDSL ``kernels/comm/custom_all_reduce_kernel.py``.
 The rest of that all-reduce kernel is not copied.

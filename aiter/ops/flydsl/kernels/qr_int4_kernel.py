@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Lockstep quad-fanout INT4 two-shot all-reduce (gfx942, TP8).
+"""INT4 two-shot all-reduce (gfx942, TP8).
+
+Store mapping is lockstep 16B NT quad-fanout.
 
 Same **256-thread Q4 FMA + last-sector map** as the 856.76 µs keeper:
 4 B INT4 / thread (``ds_write_b32``), 28 ``v_pk_fma_f16`` on consume,
@@ -587,7 +589,7 @@ class PackStorage:
     pack: fx.Array[fx.Int32, PACK_I32, 16]
 
 
-def make_qr_int4_quad_fanout_kernel(
+def make_qr_int4_kernel(
     *,
     world_size: int = WORLD,
     quant_dtype: str = "fp16",
@@ -624,7 +626,7 @@ def make_qr_int4_quad_fanout_kernel(
     flags_i32 = PHASES * GRID * WORLD
 
     @flyc.kernel(known_block_size=[BLOCK, 1, 1])
-    def qr_int4_quad_fanout(
+    def qr_int4(
         rank: Int32,
         nbytes: Int64,
         num_tiles: Int32,
@@ -922,7 +924,7 @@ def make_qr_int4_quad_fanout_kernel(
     flat_wg = f"{BLOCK},{BLOCK}"
 
     @flyc.jit
-    def launch_qr_int4_quad_fanout(
+    def launch_qr_int4(
         rank: Int32,
         nbytes: Int64,
         num_tiles: Int32,
@@ -933,7 +935,7 @@ def make_qr_int4_quad_fanout_kernel(
         grid_x: Int32,
         stream: Stream = Stream(None),  # noqa: B008
     ):
-        qr_int4_quad_fanout(
+        qr_int4(
             rank,
             nbytes,
             num_tiles,
@@ -948,15 +950,15 @@ def make_qr_int4_quad_fanout_kernel(
             stream=stream,
         )
 
-    launch_qr_int4_quad_fanout.func.__name__ = f"launch_qr_int4_quad_fanout_ws{world_size}_{codec}_{quant_dtype}_st{super_tile}"
+    launch_qr_int4.func.__name__ = (
+        f"launch_qr_int4_ws{world_size}_{codec}_{quant_dtype}_st{super_tile}"
+    )
     try:
-        qr_int4_quad_fanout.func.__name__ = (
-            f"qr_int4_quad_fanout_{codec}_{quant_dtype}_st{super_tile}"
-        )
+        qr_int4.func.__name__ = f"qr_int4_{codec}_{quant_dtype}_st{super_tile}"
     except AttributeError:
         pass
     return {
-        "launch": launch_qr_int4_quad_fanout,
+        "launch": launch_qr_int4,
         "flags_bytes": flags_i32 * 4,
         "data_bytes": PHASES * GRID * WORLD * wire_tile_bytes,
         "lds_bytes": LDS_BYTES,

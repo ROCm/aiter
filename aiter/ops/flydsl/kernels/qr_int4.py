@@ -1,19 +1,23 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Host launch for lockstep quad-fanout INT4 two-shot all-reduce."""
+"""Host launch for FlyDSL INT4 QuickReduce.
+
+Public type ``QRInt4``. Store mapping is lockstep 16B NT quad-fanout
+(implementation detail).
+"""
 
 from __future__ import annotations
 
 import torch
 
 from .qr_int4_ipc import UncachedIpcHeap
-from .qr_int4_quad_fanout_kernel import (
+from .qr_int4_kernel import (
     GRID,
     SUPER_TILES,
     TILE_BYTES,
     WORLD,
-    make_qr_int4_quad_fanout_kernel,
+    make_qr_int4_kernel,
 )
 
 
@@ -77,8 +81,8 @@ class _StEngine:
             self._buf_ptr = None
 
 
-class QRInt4QuadFanout:
-    """IPC inbox + flag buffer and launch wrapper for ``qr_int4_quad_fanout``.
+class QRInt4:
+    """IPC inbox + flag buffer and launch wrapper for ``qr_int4``.
 
     Compile-time ``super_tile`` ST∈{1,2,4,8}. When ST>1 a ST=1 engine is also
     built so ``num_tiles ≤ GRID`` (decode) does not 2×/4×-flag the inbox.
@@ -124,7 +128,7 @@ class QRInt4QuadFanout:
             sts.append(self.super_tile)
         self._by_st = {}
         for st in sts:
-            spec = make_qr_int4_quad_fanout_kernel(
+            spec = make_qr_int4_kernel(
                 world_size=self.world_size,
                 quant_dtype=quant_dtype,
                 codec=codec,
@@ -192,7 +196,7 @@ class QRInt4QuadFanout:
 
     def allreduce(self, inp: torch.Tensor, out: torch.Tensor, stream=None):
         if inp.dtype != torch.bfloat16 or out.dtype != torch.bfloat16:
-            raise ValueError("QRInt4QuadFanout supports bf16 input/output")
+            raise ValueError("QRInt4 supports bf16 input/output")
         live_bytes = int(inp.numel()) * int(inp.element_size())
         if live_bytes % 16 != 0:
             raise ValueError("byte size must be a multiple of 16 (8 bf16)")

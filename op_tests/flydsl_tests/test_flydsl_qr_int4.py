@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Runtime correctness for FlyDSL INT4 QuickReduce (``QRInt4QuadFanout``).
+"""Runtime correctness for FlyDSL INT4 QuickReduce (``QRInt4``).
 
 Pytest collects validity cases only (no timing). ``python3`` this file
 runs an aiter-op-test ``@benchmark`` / markdown sweep. The oracle is an
@@ -40,7 +40,7 @@ from aiter.test_common import benchmark
 
 pytest.importorskip("flydsl")
 
-from aiter.ops.flydsl.kernels.qr_int4_quad_fanout_kernel import (
+from aiter.ops.flydsl.kernels.qr_int4_kernel import (
     GRID,
     TILE_BYTES,
     WORLD,
@@ -55,7 +55,7 @@ TP = WORLD
 
 pytestmark = pytest.mark.skipif(
     ARCH not in SUPPORTED_ARCHS,
-    reason="QRInt4QuadFanout is gfx942-only",
+    reason="QRInt4 is gfx942-only",
 )
 
 # Distinct correctness branches, not a tokens x hidden product.
@@ -98,7 +98,7 @@ def _rel_mae(got: torch.Tensor, reference: torch.Tensor) -> float:
 def _run_rank(args) -> None:
     import torch.distributed as dist
 
-    from aiter.ops.flydsl import QRInt4QuadFanout
+    from aiter.ops.flydsl import QRInt4
 
     rank = args.rank
     device = torch.device(f"cuda:{rank}")
@@ -115,7 +115,7 @@ def _run_rank(args) -> None:
         gloo = dist.group.WORLD
     group = dist.group.WORLD
 
-    fly = QRInt4QuadFanout(
+    fly = QRInt4(
         group=gloo,
         device=device,
         rank=rank,
@@ -202,7 +202,7 @@ def _spawn_tp8(
 ) -> list[dict]:
     if torch.cuda.device_count() < TP:
         pytest.skip(
-            f"QRInt4QuadFanout needs {TP} GPUs, have {torch.cuda.device_count()}"
+            f"QRInt4 needs {TP} GPUs, have {torch.cuda.device_count()}"
         )
     port = 29600 + (os.getpid() % 1000)
     init_method = f"tcp://127.0.0.1:{port}"
@@ -263,7 +263,7 @@ def _spawn_tp8(
                     tails.append(f"===== rank {rank} =====\n{fh.read()[-4000:]}")
             except OSError:
                 pass
-        raise RuntimeError("QRInt4QuadFanout ranks failed\n" + "\n".join(tails))
+        raise RuntimeError("QRInt4 ranks failed\n" + "\n".join(tails))
     with open(out_path) as fh:
         payload = json.load(fh)
     return payload["ranks"][0]
@@ -325,11 +325,11 @@ test_qr_int4.__test__ = False
 
 def main():
     if ARCH not in SUPPORTED_ARCHS:
-        aiter.logger.warning("QRInt4QuadFanout unsupported on %s; skipping", ARCH)
+        aiter.logger.warning("QRInt4 unsupported on %s; skipping", ARCH)
         return
     if torch.cuda.device_count() < TP:
         aiter.logger.warning(
-            "QRInt4QuadFanout needs %s GPUs, have %s; skipping",
+            "QRInt4 needs %s GPUs, have %s; skipping",
             TP,
             torch.cuda.device_count(),
         )
@@ -374,7 +374,7 @@ def main():
 
     for dtype in args.dtype:
         if dtype != dtypes.bf16:
-            aiter.logger.warning("QRInt4QuadFanout payload is bf16; skipping %s", dtype)
+            aiter.logger.warning("QRInt4 payload is bf16; skipping %s", dtype)
             continue
         df = []
         for batch, mnk in itertools.product(args.batch, args.mnk):
