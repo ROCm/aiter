@@ -264,6 +264,7 @@ def build_flash_attn_fp8_module(
         c_exp2_bias = fx.Float32(
             float(SCHRAUDOLPH_C) + EXP2_SHIFT * float(SCHRAUDOLPH_2P23)
         )
+        c_sch_cap = fx.Float32(SCHRAUDOLPH_CAP)
 
         def _i32c(v):
             return fx.Int32(v - (1 << 32) if v >= (1 << 31) else v)
@@ -754,12 +755,28 @@ def build_flash_attn_fp8_module(
                 f32_vec_ty = Vec.make_type(C_F32_PER_LANE, fx.Float32)
                 for nt in range_constexpr(N_KV_TILES):
                     if const_expr(seeded):
-                        aff = _fmin(Vec(s_accs[nt]), cap_vec)
-                    elif const_expr(USE_QK_SCALE_FOLD):
-                        aff = _fadd(Vec(s_accs[nt]), mt_vec)
+                        # clamp to [0, cap] -- v_med3_f32 does both ends in
+                        # one instruction, halving the VALU here. FMED3 has no
+                        # vector pattern, so build the vector element-wise.
+                        _s = Vec(s_accs[nt])
+                        biased = Vec.from_elements(
+                            [
+                                rocdl.fmed3(
+                                    T.f32,
+                                    _raw(_s[r]),
+                                    _raw(c_zero_f),
+                                    _raw(c_sch_cap),
+                                )
+                                for r in range_constexpr(C_F32_PER_LANE)
+                            ],
+                            fx.Float32,
+                        )
                     else:
-                        aff = _fadd(_fmul(Vec(s_accs[nt]), sx_vec), mt_vec)
-                    biased = _fmax(aff, zero_vec)
+                        if const_expr(USE_QK_SCALE_FOLD):
+                            aff = _fadd(Vec(s_accs[nt]), mt_vec)
+                        else:
+                            aff = _fadd(_fmul(Vec(s_accs[nt]), sx_vec), mt_vec)
+                        biased = _fmax(aff, zero_vec)
                     ps_v = Vec(
                         arith.bitcast(
                             f32_vec_ty, arith.fptoui(i32_vec_ty, _raw(biased))
