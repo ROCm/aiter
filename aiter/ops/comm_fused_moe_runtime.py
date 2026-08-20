@@ -54,7 +54,7 @@ class CommFusedMoeRuntime:
             moe_args["topk_weight"] = padded_weight
             moe_args["topk_ids"] = padded_ids
 
-            padded_shared = runner.shared_output_buffer()
+            padded_shared = runner.output
             padded_shared[:raw_tokens].copy_(shared_partial)
             padded_shared[raw_tokens:].zero_()
             shared_partial = padded_shared
