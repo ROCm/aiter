@@ -16,6 +16,8 @@ Follows the ``aiter.mla.mla_decode_fwd`` calling convention as vLLM's
 kernel; <1% accuracy effect).
 """
 
+import math
+
 import torch
 
 from aiter.ops.triton._gluon_kernels.gfx950.attention.pa_decode_sparse import (
@@ -26,7 +28,6 @@ from aiter.ops.triton._gluon_kernels.gfx950.attention.pa_decode_sparse import (
 )
 from aiter.ops.triton.attention.pa_decode_sparse import (
     _as_int32_contiguous_1d,
-    _decode_num_splits_occ,
 )
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.common_utils import max_addressable_bytes
@@ -107,6 +108,37 @@ def _infer_cache_format(kv, d_qk, kv_lora_rank, qk_rope_head_dim, kv_scale):
             False,
         )
     raise ValueError(f"unrecognized sparse-MLA kv cache: {tuple(kv.shape)} {kv.dtype}")
+
+
+def _mla_num_splits(num_queries: int, heads_blocks: int, avg_topk: float) -> int:
+    """Split-K count for the sparse-MLA decode.
+
+    Separate from the DSv4 policy (_decode_num_splits_occ): that one is tuned for
+    a two-segment SWA + top-k launch and, measured here, over-splits badly at MLA
+    shapes -- at C=1, topk=2048 it asks for one split per tile, so 32 programs
+    each pay the full prologue and the reduce walks 32 partials, which costs
+    1.23-1.28x.
+
+    Two rules, both measured on MI355X over C in 1..256 x topk in {512, 2048} x
+    H in {8, 16}:
+
+      * Below one workgroup per CU, split to fill the machine but never past 8.
+        Splits beyond that stop buying parallelism and start paying prologue and
+        reduce traffic: 8 is optimal or within 10% in every cell measured, and
+        the 16 that topk=2048 prefers at C=8-16 is worth only 4-10%.
+      * At or above one workgroup per CU the launch is already full, so a split
+        only buys the second occupancy slot and has to earn its extra partial
+        round trip -- it takes ~16 tiles to do that. At C=256 this is the
+        difference between one split and two: topk=512 (8 tiles) wants none, and
+        splitting anyway costs 22%.
+    """
+    num_sms = get_num_sms()
+    base_wg = max(1, num_queries * heads_blocks)
+    cta_cap = max(1, (2 * num_sms) // base_wg)
+    tiles = max(1, math.ceil(avg_topk / _BLOCK_K))
+    if base_wg >= num_sms:
+        return max(1, min(cta_cap, tiles // 16))
+    return max(1, min(cta_cap, tiles, 8))
 
 
 def _lds_pad_for(fp8_mfma: bool) -> int:
@@ -230,9 +262,7 @@ def sparse_mla_decode_fwd(
     if kv_splits is not None:
         num_splits = max(1, int(kv_splits))
     else:
-        num_splits = _decode_num_splits_occ(
-            num_queries, heads_blocks, avg_topk, 0.0, _BLOCK_K
-        )
+        num_splits = _mla_num_splits(num_queries, heads_blocks, avg_topk)
 
     if num_splits > 1:
         part_m = torch.empty(
