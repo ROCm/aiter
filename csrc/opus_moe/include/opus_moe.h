@@ -17,6 +17,8 @@ void opus_moe_stage2_a8w4_decode_fwd(
     aiter_tensor_t& sorted_expert_ids,
     aiter_tensor_t& num_valid_ids,
     aiter_tensor_t& out,
+    int token_num,
+    int topk,
     int block_m,
     int kernel_id,
     int inter_dim_pad);
@@ -37,7 +39,11 @@ void opus_moe_stage1_a8w4_fwd(
     aiter_tensor_t& num_valid_ids,
     aiter_tensor_t& out,
     aiter_tensor_t& out_scale,
+    int topk,
     int block_m,
     const std::string& kernelName,
     int inter_dim_pad,
-    float swiglu_limit);
+    int activation,
+    float swiglu_limit,
+    float situ_beta,
+    float situ_linear_beta);

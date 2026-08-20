@@ -1,4 +1,4 @@
-"""Shared v2 gemm1/gemm2 data-prep helpers for dsv4 a8w4 / a4w4 (fp8/fp4 a, fp4 w).
+"""Shared v2 gemm1/gemm2 data-prep helpers for MXFP4/MXFP8 MoE.
 
 Extracted verbatim from bench_gemm12_v2_vs_baseline.py so both the launch-comparison
 bench and the fmoe tuner (csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py) can build
@@ -21,6 +21,11 @@ import aiter
 from aiter import ActivationType, QuantType, dtypes
 from aiter.fused_moe import fused_topk, moe_sorting, torch_moe_stage1, torch_moe_stage2
 from aiter.ops.flydsl.kernels.moe_sorting_kernel import moe_sorting_flydsl
+from aiter.ops.flydsl.moe_common import (
+    DEFAULT_SITUV2_BETA,
+    DEFAULT_SITUV2_LINEAR_BETA,
+    get_flydsl_activation_name,
+)
 from aiter.ops.flydsl.moe_kernels import (
     flydsl_kernel_name,
     flydsl_moe_stage1,
@@ -59,6 +64,22 @@ def quant_a(x, adtype):
 
 def quant_w_fp4(w):
     return per_1x32_f4_quant(w, quant_dtype=dtypes.fp4x2, shuffle=False)
+
+
+def quant_w(w, b_dtype):
+    if b_dtype == "fp8":
+        return per_1x32_f8_scale_f8_quant(
+            w, quant_dtype=dtypes.fp8, scale_type=dtypes.fp8_e8m0
+        )
+    return quant_w_fp4(w)
+
+
+def dequant_w(q, scale, b_dtype, rows, cols):
+    values = q.float() if b_dtype == "fp8" else fp4_utils.mxfp4_to_f32(q)
+    scale_f32 = fp4_utils.e8m0_to_f32(scale)
+    return (
+        values.view(rows, cols // 32, 32) * scale_f32.view(rows, cols // 32, 1)
+    ).view(rows, cols)
 
 
 def _a_deq(a1_qt, a1_scale, token, model_dim, adtype):
@@ -225,7 +246,10 @@ def gen(
     topk,
     block_m,
     adtype="fp8",
+    b_dtype="fp4",
     activation=ActivationType.Silu,
+    situ_beta=DEFAULT_SITUV2_BETA,
+    situ_linear_beta=DEFAULT_SITUV2_LINEAR_BETA,
 ):
     torch.manual_seed(0)
     inp = torch.randn((token, model_dim), dtype=dtypes.bf16) / 10
@@ -234,25 +258,19 @@ def gen(
     score = balanced_score(token, E, topk, dtypes.bf16)
     topk_weights, topk_ids = fused_topk(inp, score, topk, True)
 
-    w1_qt, w1_scale = quant_w_fp4(w1)  # fp4x2 weights + e8m0 scale
-    w2_qt, w2_scale = quant_w_fp4(w2)  # fp4x2 weights + e8m0 scale
+    w1_qt, w1_scale = quant_w(w1, b_dtype)
+    w2_qt, w2_scale = quant_w(w2, b_dtype)
     a1_qt, a1_scale = quant_a(inp, adtype)  # fp8 (a8w4) or fp4 (a4w4) activations
 
     # torch reference stage1 (dequant the SAME quantized operands the kernels read)
     a_deq = _a_deq(a1_qt, a1_scale, token, model_dim, adtype)
     w1_deq = (
-        (
-            fp4_utils.mxfp4_to_f32(w1_qt).view(E, inter_dim * 2, model_dim // 32, 32)
-            * fp4_utils.e8m0_to_f32(w1_scale).view(E, inter_dim * 2, model_dim // 32, 1)
-        )
+        dequant_w(w1_qt, w1_scale, b_dtype, E * inter_dim * 2, model_dim)
         .view(E, inter_dim * 2, model_dim)
         .to(dtypes.bf16)
     )
     w2_deq = (
-        (
-            fp4_utils.mxfp4_to_f32(w2_qt).view(E, model_dim, inter_dim // 32, 32)
-            * fp4_utils.e8m0_to_f32(w2_scale).view(E, model_dim, inter_dim // 32, 1)
-        )
+        dequant_w(w2_qt, w2_scale, b_dtype, E * model_dim, inter_dim)
         .view(E, model_dim, inter_dim)
         .to(dtypes.bf16)
     )
@@ -266,6 +284,8 @@ def gen(
         activation=activation,
         quant_type=QuantType.No,
         doweight=False,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
     )  # [token, topk, inter]
     ref2 = torch_moe_stage2(
         ref1,
@@ -277,6 +297,24 @@ def gen(
         quant_type=QuantType.No,
         doweight=True,
     )  # [token, hidden]
+    ref2_quantized = None
+    if b_dtype == "fp8":
+        a2_ref_q, a2_ref_scale = quant_a(
+            ref1.contiguous().view(token * topk, inter_dim), adtype
+        )
+        a2_ref_deq = _a_deq(
+            a2_ref_q, a2_ref_scale, token * topk, inter_dim, adtype
+        ).view(token, topk, inter_dim)
+        ref2_quantized = torch_moe_stage2(
+            a2_ref_deq,
+            w1_deq,
+            w2_deq,
+            topk_weights,
+            topk_ids,
+            dtype=dtypes.bf16,
+            quant_type=QuantType.No,
+            doweight=True,
+        )
 
     # ---- baseline (aiter mixed_moe stage1) prep ----
     sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, _ = moe_sorting(
@@ -284,14 +322,22 @@ def gen(
     )
     # w1/w1_scale preshuffle depends on the activation dtype (a8w4 vs a4w4);
     # see _baseline_w1_shuffle. w2 always uses the a16w4 down-proj layout.
-    w1_qt_shuf, w1_scale_shuf = _baseline_w1_shuffle(w1_qt, w1_scale, E, adtype)
+    if b_dtype == "fp8":
+        w1_qt_shuf = shuffle_weight_a16w4(w1_qt, 16, True)
+        w1_scale_shuf = shuffle_scale_a16w4(w1_scale, E, True)
+        w2_qt_shuf = shuffle_weight_a16w4(w2_qt, 16, False)
+        w2_scale_shuf = e8m0_shuffle(w2_scale)
+    else:
+        w1_qt_shuf, w1_scale_shuf = _baseline_w1_shuffle(w1_qt, w1_scale, E, adtype)
+        w2_qt_shuf = _mxfp4_shuffle_weight_a16w4(w2_qt, gate_up=False)
+        w2_scale_shuf = _mxfp4_shuffle_scale_a16w4(w2_scale, E, gate_up=False)
     base = {
         "a1_qt": a1_qt,
         "adtype": adtype,
         "w1_qt_shuf": w1_qt_shuf,
         "w1_scale_shuf": w1_scale_shuf,
-        "w2_qt_shuf": _mxfp4_shuffle_weight_a16w4(w2_qt, gate_up=False),
-        "w2_scale_shuf": _mxfp4_shuffle_scale_a16w4(w2_scale, E, gate_up=False),
+        "w2_qt_shuf": w2_qt_shuf,
+        "w2_scale_shuf": w2_scale_shuf,
         "a1_scale_sort": moe_mxfp4_sort(
             a1_scale[:token, :].view(token, 1, -1),
             sorted_ids=sorted_ids,
@@ -324,6 +370,7 @@ def gen(
     return {
         "ref1": ref1,
         "ref2": ref2,
+        "ref2_quantized": ref2_quantized,
         "topk_ids": topk_ids,
         "topk_weights": topk_weights,
         "w1_qt": w1_qt,
@@ -336,6 +383,7 @@ def gen(
         "base": base,
         "adtype": adtype,
         "stage2_adtype": adtype,
+        "b_dtype": b_dtype,
     }
 
 
@@ -344,10 +392,8 @@ def build_v2_inputs(d, token, model_dim, inter_dim, E, topk, BM_S1):
     device = "cuda"
     H, INTER, NE, TOPK = model_dim, inter_dim, E, topk
     SBM = BM_S1
-    w1u8 = _u8v(_mxfp4_shuffle_weight_a16w4(d["w1_qt"], gate_up=True))
-    w1sc = _u8v(_mxfp4_shuffle_scale_a16w4(d["w1_scale"], NE, gate_up=True))
-    w2u8 = _u8v(_mxfp4_shuffle_weight_a16w4(d["w2_qt"], gate_up=False))
-    w2sc = _u8v(_mxfp4_shuffle_scale_a16w4(d["w2_scale"], NE, gate_up=False))
+    w2u8 = _u8v(d["base"]["w2_qt_shuf"])
+    w2sc = _u8v(d["base"]["w2_scale_shuf"])
 
     topk_ids_i32 = d["topk_ids"].to(torch.int32)
     topk_w_f32 = d["topk_weights"].to(torch.float32)
@@ -383,8 +429,6 @@ def build_v2_inputs(d, token, model_dim, inter_dim, E, topk, BM_S1):
     return {
         "aq": aq,
         "assh": assh,
-        "w1u8": w1u8,
-        "w1sc": w1sc,
         "w2u8": w2u8,
         "w2sc": w2sc,
         "sei": sei,
@@ -470,7 +514,15 @@ def _v2_group_cosine(d, v, token, inter_dim, E, BM_S1, sample=64):
 
 
 def populate_baseline_v2_intermediate(
-    d, v, token, topk, params, BM_S1, activation=ActivationType.Silu
+    d,
+    v,
+    token,
+    topk,
+    params,
+    BM_S1,
+    activation=ActivationType.Silu,
+    situ_beta=DEFAULT_SITUV2_BETA,
+    situ_linear_beta=DEFAULT_SITUV2_LINEAR_BETA,
 ):
     """Run baseline gemm1 into v2's sorted-row fp8/fp4 buffers.
 
@@ -485,6 +537,7 @@ def populate_baseline_v2_intermediate(
         block_size=BM_S1,
     )
     adtype = d["base"].get("adtype", "fp8")
+    b_dtype = d.get("b_dtype", "fp4")
     stage2_adtype = d["base"].get("a2_dtype", adtype)
     default_gate = "interleave" if adtype == "fp8" else "separated"
     gate_mode = params.get("gate_mode", default_gate)
@@ -492,7 +545,7 @@ def populate_baseline_v2_intermediate(
         _kn1 = flydsl_kernel_name(
             1,
             adtype,
-            "fp4",
+            b_dtype,
             stage2_adtype,
             params["tile_m"],
             params["tile_n"],
@@ -502,7 +555,7 @@ def populate_baseline_v2_intermediate(
         _bnt = params.get("b_nt", 2)
         print(
             f"[gemm1 producer] baseline flydsl_moe_stage1 (v2 layout)  "
-            f"kernel={_kn1}  a_dtype={adtype} b_dtype=fp4 out={stage2_adtype}  "
+            f"kernel={_kn1}  a_dtype={adtype} b_dtype={b_dtype} out={stage2_adtype}  "
             f"gate={gate_mode} k_wave={_kw} b_nt={_bnt}  "
             f"tile=({params['tile_m']}x{params['tile_n']}x{params['tile_k']})"
         )
@@ -518,9 +571,11 @@ def populate_baseline_v2_intermediate(
         tile_n=params["tile_n"],
         tile_k=params["tile_k"],
         a_dtype=adtype,
-        b_dtype="fp4",
+        b_dtype=b_dtype,
         out_dtype=stage2_adtype,
-        act="swiglu" if activation == ActivationType.Swiglu else "silu",
+        act=get_flydsl_activation_name(activation),
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
         w1_scale=d["base"]["w1_scale_shuf"],
         a1_scale=a1_scale_sort,
         sorted_weights=None,
