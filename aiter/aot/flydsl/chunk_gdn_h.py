@@ -11,7 +11,8 @@ Runtime BV lookup uses ``AITER_CONFIG_GDN_K5_OPT`` (merged tuned CSV).
 
 Usage: ``python -m aiter.aot.flydsl.chunk_gdn_h [--kernel vk|opt|all]``
 
-Environment: ``FLYDSL_RUNTIME_CACHE_DIR``, ``ARCH``/``GPU_ARCHS``, ``FLYDSL_GPU_ARCH``.
+Environment: ``FLYDSL_RUNTIME_CACHE_DIR``, ``FLYDSL_GPU_ARCH``.
+``ARCH``/``GPU_ARCHS`` are banner-only for opt (compile arch comes from CSV ``cu_num``).
 """
 
 from __future__ import annotations
@@ -20,10 +21,8 @@ import argparse
 import csv
 import itertools
 import os
-import re
 import sys
 import time
-import warnings
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -34,6 +33,7 @@ import flydsl.expr as fx
 from aiter.aot.flydsl.common import (
     collect_aot_jobs,
     compile_only_env,
+    cu_num_to_arch,
     dedupe_jobs,
     job_identity,
     override_env,
@@ -75,9 +75,6 @@ _FIXED_SWITCHES: dict[str, bool] = {
     "g_log2_scaled": True,
     "bf16_convert_trunc": True,
 }
-
-_ARCH_SEP = re.compile(r"[;,\s]+")
-
 
 def _parse_bool(s: str) -> bool:
     """CSV-friendly bool parser. Tolerates ``"True"``/``"False"`` (Python
@@ -358,36 +355,12 @@ def compile_one_config(
 # --------------------------------------------------------------------------
 
 
-def _detected_arch() -> str | None:
-    try:
-        from flydsl.runtime.device import get_rocm_arch
-
-        arch = get_rocm_arch()
-    except Exception:  # noqa: BLE001 - no GPU / no ROCm on the build host
-        return None
-    return arch.split(":")[0] if arch else None
-
-
-def _resolve_archs(row_gfx: str | None) -> list[str]:
-    """Row ``gfx`` column, else ARCH/GPU_ARCHS, else host GPU, else ``_AOT_ARCH_DEFAULT``."""
-    for raw in (row_gfx, os.environ.get("ARCH"), os.environ.get("GPU_ARCHS")):
-        if not raw or not raw.strip():
-            continue
-        archs = [
-            tok.split(":")[0].lower() for tok in _ARCH_SEP.split(raw.strip()) if tok
-        ]
-        archs = [a for a in archs if a.startswith("gfx")]
-        if archs:
-            return list(dict.fromkeys(archs))
-    detected = _detected_arch()
-    if detected:
-        return [detected]
-    warnings.warn(
-        "No gfx in CSV row and ARCH/GPU_ARCHS unset; GPU detection failed, "
-        f"defaulting compile arch to {_AOT_ARCH_DEFAULT!r}.",
-        stacklevel=2,
-    )
-    return [_AOT_ARCH_DEFAULT]
+def _opt_job_arch(job: dict[str, Any]) -> str:
+    """Compile arch for an opt job (``--target-arch`` overrides CSV ``cu_num``)."""
+    arch = job.get("arch")
+    if arch:
+        return str(arch)
+    return cu_num_to_arch(int(job.get("cu_num") or 0), default=_AOT_ARCH_DEFAULT)
 
 
 def parse_csv_opt(csv_path: str) -> list[dict[str, Any]]:
@@ -411,18 +384,18 @@ def parse_csv_opt(csv_path: str) -> list[dict[str, Any]]:
                 is_varlen = _parse_bool(row.get("is_varlen") or "True")
                 use_h0 = _parse_bool(row.get("use_h0") or "True")
                 store_fs = _parse_bool(row.get("store_fs") or "True")
+                cu_num = int(row.get("cu_num") or 0)
             except (KeyError, TypeError, ValueError) as e:
                 print(f"  [WARN] malformed row in {csv_path}: {e}")
                 continue
 
-            for arch in _resolve_archs(row.get("gfx")):
-                shapes[(arch, dtype, K, V, BT, H, Hg, is_varlen, use_h0, store_fs)] = (
-                    None
-                )
+            shapes[
+                (cu_num, dtype, K, V, BT, H, Hg, is_varlen, use_h0, store_fs)
+            ] = None
 
     jobs: list[dict[str, Any]] = []
     seen: set[tuple] = set()
-    for arch, dtype, K, V, BT, H, Hg, is_varlen, use_h0, store_fs in shapes:
+    for cu_num, dtype, K, V, BT, H, Hg, is_varlen, use_h0, store_fs in shapes:
         bvs = [bv for bv in _BV_CANDIDATES if bv <= V and V % bv == 0]
         if not bvs:
             print(f"  [WARN] no legal BV for V={V}, skipping shape in {csv_path}")
@@ -440,7 +413,7 @@ def parse_csv_opt(csv_path: str) -> list[dict[str, Any]]:
             job = {
                 "kernel_name": _OPT_KERNEL_NAME,
                 "dtype": dtype,
-                "arch": arch,
+                "cu_num": cu_num,
                 "K": K,
                 "V": V,
                 "BT": BT,
@@ -595,9 +568,9 @@ def _format_shape_str_opt(job: dict) -> str:
     )
 
 
-def compile_one_config_opt(*, arch: str, **kwargs) -> dict:
+def compile_one_config_opt(*, cu_num: int = 0, arch: str = "", **kwargs) -> dict:
     """Compile one opt configuration and save it to cache."""
-    aot_arch = arch or _AOT_ARCH_DEFAULT
+    aot_arch = arch or cu_num_to_arch(cu_num, default=_AOT_ARCH_DEFAULT)
     kwargs.pop("kernel_name", None)
     shape_str = _format_shape_str_opt(kwargs)
     result = {
@@ -709,11 +682,13 @@ def main():
     cache_dir = os.path.expanduser(
         os.environ.get("FLYDSL_RUNTIME_CACHE_DIR", "~/.flydsl/cache")
     )
+    target_arch = os.environ.get("ARCH") or os.environ.get("GPU_ARCHS") or "(from cu_num)"
 
     print("=" * 72)
     print("FlyDSL chunk-gated-delta-h AOT Pre-compilation")
     print("=" * 72)
     print(f"  Cache dir:        {cache_dir}")
+    print(f"  Target arch:      {target_arch}")
 
     plans: list[tuple[_KernelSpec, list[dict[str, Any]]]] = []
     for name in kernels:
@@ -740,20 +715,29 @@ def main():
             jobs = spec.expand_jobs(jobs)
         plans.append((spec, jobs))
 
-        archs = sorted({j["arch"] for j in jobs})
+        if name == "opt":
+            archs = sorted({_opt_job_arch(j) for j in jobs})
+            compile_arch_note = " (from cu_num)"
+        else:
+            archs = sorted({j["arch"] for j in jobs})
+            compile_arch_note = ""
         arch_note = " (overridden by --target-arch)" if args.target_arch else ""
         print("-" * 72)
         print(f"  {spec.title}")
         for csv_path in csv_paths:
             print(f"    csv:            {csv_path}")
         print(f"    jobs:           {len(jobs)}")
-        print(f"    compile arch:   {', '.join(archs) or '-'}{arch_note}")
+        print(
+            f"    compile arch:   {', '.join(archs) or '-'}"
+            f"{compile_arch_note}{arch_note}"
+        )
     print("=" * 72)
 
     if args.dry_run:
         for spec, jobs in plans:
             for job in jobs:
-                print(f"  {job['arch']}  {spec.format_shape(job)}")
+                arch = _opt_job_arch(job) if job.get("cu_num") is not None else job["arch"]
+                print(f"  {arch}  {spec.format_shape(job)}")
         sys.exit(0)
 
     total_t0 = time.time()
