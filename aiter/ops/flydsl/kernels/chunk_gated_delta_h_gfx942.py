@@ -315,6 +315,18 @@ def compile_chunk_gated_delta_h_gfx942(
         f"{[s for s in (1, 2, 4, 8) if N_REPEAT % s == 0]}"
     )
     N_REPEAT_LOCAL = N_REPEAT // NR_SPLIT
+
+    # Splitting V so finely that a wave owns a single 16-wide tile is broken.
+    # One of the legal configurations, BV=32 across 8 waves, 
+    # nondeterministically drains stale LDS into the h snapshot. 
+    # It is the lds_h -> HBM drain, where this shape degenerates: 
+    # H_DRAIN_ROWS lands on BV and the drain collapses to a single rest pass. 
+    # Hence, we assert here that we don't build such variants.
+    assert not (NR_SPLIT > 1 and N_REPEAT_LOCAL == 1), (
+        f"BV={BV} across {M_WAVES * NR_SPLIT} waves (NR_SPLIT={NR_SPLIT}) leaves "
+        f"one 16-wide V tile per wave (N_REPEAT_LOCAL=1), which corrupts the h "
+        f"snapshot; use NR_SPLIT=1 or a BV with N_REPEAT // NR_SPLIT >= 2."
+    )
     NUM_WARPS = M_WAVES * NR_SPLIT
     BLOCK_THREADS = NUM_WARPS * WARP_SIZE
     assert BLOCK_THREADS <= 1024, (

@@ -21,18 +21,22 @@ from __future__ import annotations
 # workgroup. The default (4) is the historical kernel. Wider workgroups split
 # the N_REPEAT (V) axis across waves, which multiplies resident waves per CU --
 # LDS pins gfx942 to one workgroup per CU, so a 4-wave block is 1 wave/SIMD and
-# cannot hide HBM latency.
+# cannot hide HBM latency. A ``bv<B>w<W>`` tag is only well-formed when the wave
+# split NR_SPLIT = W/4 divides the V-tile count N_REPEAT = B/16.
 _BV_CANDIDATES = [16, 32, 64]
 _DEFAULT_BV = 16
-_WAVE_CANDIDATES = (4, 8)
 
-K5_VARIANTS: tuple[str, ...] = tuple(f"bv{b}" for b in _BV_CANDIDATES) + tuple(
-    f"bv{b}w{w}"
-    for b in _BV_CANDIDATES
-    for w in _WAVE_CANDIDATES
-    # NR_SPLIT = w/4 must divide N_REPEAT = b/16
-    if w > 4 and (b // 16) % (w // 4) == 0
-)
+# The registered tags, listed rather than generated: there are only four, and the
+# grammar admits combinations we do not ship.
+#
+# ``bv32w8`` is  well-formed by the rule above
+# (NR_SPLIT = 8/4 = 2 divides N_REPEAT = 32/16 = 2) but nondeterministically
+# corrupts the ``h`` snapshot on gfx942. The kernel builder currently asserts 
+# that this configuration is not compiled.
+#
+# The 16-wave variants are also well-formed for BV=64, but they are always slower than
+# the 8-wave variant, so we do not ship them either.
+K5_VARIANTS: tuple[str, ...] = ("bv16", "bv32", "bv64", "bv64w8")
 K5_DEFAULT_VARIANT = "auto"
 
 
