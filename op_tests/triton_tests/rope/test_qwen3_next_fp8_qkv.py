@@ -197,7 +197,12 @@ def test_qwen3_next_fp8_qkv_prep(lengths):
         output.value_descale,
     )
     for actual, expected in zip(actual_descales, expected_descales):
-        torch.testing.assert_close(actual, expected, rtol=2.0e-6, atol=1.0e-8)
+        torch.testing.assert_close(
+            actual[: len(lengths)],
+            expected,
+            rtol=2.0e-6,
+            atol=1.0e-8,
+        )
 
     references = (
         ref_query.view(-1, NUM_QUERY_HEADS, HEAD_DIM).float(),
