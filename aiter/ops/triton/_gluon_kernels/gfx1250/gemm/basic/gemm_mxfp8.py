@@ -1113,20 +1113,6 @@ def _gemm_mxfp8_preshuffle_compute_bound_kernel(
     gl.static_assert(NUM_BUFFERS >= 2)
     gl.static_assert(A_SCALE_K_GROUP % SCALE_GROUP_SIZE == 0)
 
-    # ---- main-loop unroll ----
-    # Unrolling gives the scheduler several K tiles in one basic block so the
-    # next tile's ds_loads can issue into the shadow of this tile's wmma; within
-    # a single-tile body those loads sit behind the loop back-edge.
-    #
-    # Clamped to the trip count. LLVM guards the unrolled body with a runtime
-    # trip check, so an oversized factor is *correct* but emits a multi-tile body
-    # that never executes -- dead I-cache and compile time. The bound is exact
-    # rather than conservative: K_local is SPLITK_BLOCK_SIZE for NUM_KSPLIT > 1,
-    # and equals it for NUM_KSPLIT == 1 too since the wrapper sets
-    # SPLITK_BLOCK_SIZE = cdiv(K, 1) = K.
-    STATIC_K_ITER: gl.constexpr = (SPLITK_BLOCK_SIZE + BLOCK_SIZE_K - 1) // BLOCK_SIZE_K
-    STATIC_MAIN_ITERS: gl.constexpr = STATIC_K_ITER - (NUM_BUFFERS - 1)
-
     # ---- program setup: split-K decomposition ----
     pid_unified = gl.program_id(axis=0)
     num_pid_m = gl.cdiv(M, BLOCK_SIZE_M)
