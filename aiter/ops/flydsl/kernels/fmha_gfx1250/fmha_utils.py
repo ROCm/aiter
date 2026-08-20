@@ -1458,13 +1458,12 @@ def _dispatch_lds_tok(
             )
             lds_idx += 1
             ds_issued += 1
-    elif const_expr(13 <= _tok <= 16):
-        if lds_idx < LDS_V_INST_COUNT:
-            kv_tiles_next = Pipeline.emit_lds_load(
-                ty, lds_schedule[lds_idx], kv_lds_addrs, kv_tiles_next
-            )
-            lds_idx += 1
-            ds_issued += 1
+    elif const_expr(13 <= _tok <= 16) and lds_idx < LDS_V_INST_COUNT:
+        kv_tiles_next = Pipeline.emit_lds_load(
+            ty, lds_schedule[lds_idx], kv_lds_addrs, kv_tiles_next
+        )
+        lds_idx += 1
+        ds_issued += 1
     return kv_tiles_next, lds_idx, ds_issued
 
 

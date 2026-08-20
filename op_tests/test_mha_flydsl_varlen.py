@@ -80,7 +80,13 @@ def _ref_mha_varlen(q, k, v, cu_q, cu_k, scale, causal=False, return_lse=False):
 
 
 def run_varlen_test(
-    cu_q_list, cu_k_list, H=1, causal=False, return_lse=False, warmup=1, repeat=5,
+    cu_q_list,
+    cu_k_list,
+    H=1,
+    causal=False,
+    return_lse=False,
+    warmup=1,
+    repeat=5,
     random_value=True,
 ):
     device = torch.device("cuda")
@@ -97,9 +103,15 @@ def run_varlen_test(
         k = torch.randn(total_k, H, HEAD_DIM_QK, dtype=torch.bfloat16, device=device)
         v = torch.randn(total_k, H, HEAD_DIM_V, dtype=torch.bfloat16, device=device)
     else:
-        q = torch.full((total_q, H, HEAD_DIM_QK), 0.25, dtype=torch.bfloat16, device=device)
-        k = torch.full((total_k, H, HEAD_DIM_QK), 0.25, dtype=torch.bfloat16, device=device)
-        v = torch.full((total_k, H, HEAD_DIM_V), 0.25, dtype=torch.bfloat16, device=device)
+        q = torch.full(
+            (total_q, H, HEAD_DIM_QK), 0.25, dtype=torch.bfloat16, device=device
+        )
+        k = torch.full(
+            (total_k, H, HEAD_DIM_QK), 0.25, dtype=torch.bfloat16, device=device
+        )
+        v = torch.full(
+            (total_k, H, HEAD_DIM_V), 0.25, dtype=torch.bfloat16, device=device
+        )
 
     scale = 1.0 / math.sqrt(HEAD_DIM_QK)
 

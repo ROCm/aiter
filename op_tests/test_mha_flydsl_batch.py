@@ -21,10 +21,8 @@ import pandas as pd
 import torch
 
 import aiter
-from aiter.ops.mha import flash_attn_func
 from aiter.ops.flydsl.fmha_kernels import flydsl_flash_attn_batch_func
 from aiter.test_common import checkAllclose
-from aiter.utility import dtypes
 
 if aiter.get_gfx() != "gfx1250":
     print("Skipping: test requires gfx1250 " f"(current: {aiter.get_gfx()})")
@@ -57,7 +55,7 @@ def _ref_mha_batch(q, k, v, scale, causal=False, return_lse=False):
     k: [B, S_k, H, D_qk]
     v: [B, S_k, H, D_v]
     """
-    B, S_q, H, D_qk = q.shape
+    _B, S_q, _H, _D_qk = q.shape
     S_k = k.shape[1]
 
     # [B, S, H, D] -> [B, H, S, D]
@@ -105,7 +103,14 @@ def _tflops(flop, ms):
 
 
 def run_batch_test(
-    B, S_q, S_k, H, causal=False, return_lse=False, warmup=1, repeat=5,
+    B,
+    S_q,
+    S_k,
+    H,
+    causal=False,
+    return_lse=False,
+    warmup=1,
+    repeat=5,
     random_value=True,
 ):
     device = torch.device("cuda")
@@ -116,9 +121,15 @@ def run_batch_test(
         k = torch.randn(B, S_k, H, HEAD_DIM_QK, dtype=torch.bfloat16, device=device)
         v = torch.randn(B, S_k, H, HEAD_DIM_V, dtype=torch.bfloat16, device=device)
     else:
-        q = torch.full((B, S_q, H, HEAD_DIM_QK), 0.25, dtype=torch.bfloat16, device=device)
-        k = torch.full((B, S_k, H, HEAD_DIM_QK), 0.25, dtype=torch.bfloat16, device=device)
-        v = torch.full((B, S_k, H, HEAD_DIM_V), 0.25, dtype=torch.bfloat16, device=device)
+        q = torch.full(
+            (B, S_q, H, HEAD_DIM_QK), 0.25, dtype=torch.bfloat16, device=device
+        )
+        k = torch.full(
+            (B, S_k, H, HEAD_DIM_QK), 0.25, dtype=torch.bfloat16, device=device
+        )
+        v = torch.full(
+            (B, S_k, H, HEAD_DIM_V), 0.25, dtype=torch.bfloat16, device=device
+        )
 
     scale = 1.0 / math.sqrt(HEAD_DIM_QK)
 
@@ -148,7 +159,12 @@ def run_batch_test(
     print(f"  [{tag}] avg: {avg_ms:.3f}ms ({avg_us:.1f} us)  {fwd_tflops:.1f} TFLOPS")
 
     ref_result = _ref_mha_batch(
-        q, k, v, scale, causal=causal, return_lse=return_lse,
+        q,
+        k,
+        v,
+        scale,
+        causal=causal,
+        return_lse=return_lse,
     )
     if return_lse:
         ref, ref_lse = ref_result
@@ -179,9 +195,7 @@ def run_batch_test(
             bad = (~isC).sum().item()
             if bad > 0:
                 delta = (ob[~isC] - rb[~isC]).abs()
-                print(
-                    f"    batch {b}: {bad} bad, max_err={delta.max():.6f}"
-                )
+                print(f"    batch {b}: {bad} bad, max_err={delta.max():.6f}")
 
     passed = err < 0.05
     ret = {
@@ -205,39 +219,62 @@ if __name__ == "__main__":
         "(gfx1250, D_qk=192, D_v=128, bf16, BSHD layout)",
     )
     parser.add_argument(
-        "-b", "--batch_size", type=int, default=None,
+        "-b",
+        "--batch_size",
+        type=int,
+        default=None,
         help="Batch size. When set with -nh/-sq/-sk, runs a single shape.\ne.g.: -b 2",
     )
     parser.add_argument(
-        "-nh", "--nheads", type=int, default=None,
+        "-nh",
+        "--nheads",
+        type=int,
+        default=None,
         help="Number of attention heads.\ne.g.: -nh 128",
     )
     parser.add_argument(
-        "-sq", "--seqlen_q", type=int, default=None,
+        "-sq",
+        "--seqlen_q",
+        type=int,
+        default=None,
         help="Sequence length of query.\ne.g.: -sq 256",
     )
     parser.add_argument(
-        "-sk", "--seqlen_k", type=int, default=None,
+        "-sk",
+        "--seqlen_k",
+        type=int,
+        default=None,
         help="Sequence length of key.\ne.g.: -sk 512",
     )
     parser.add_argument(
-        "-c", "--causal", type=str, default=None,
+        "-c",
+        "--causal",
+        type=str,
+        default=None,
         help="Causal mode: true/false. Default runs both.\ne.g.: -c true",
     )
     parser.add_argument(
-        "-l", "--return_lse", type=str, default=None,
+        "-l",
+        "--return_lse",
+        type=str,
+        default=None,
         help="Return LSE: true/false. Default runs both.\ne.g.: -l false",
     )
     parser.add_argument(
-        "--warmup", type=int, default=2,
+        "--warmup",
+        type=int,
+        default=2,
         help="Warmup iterations for benchmark (default 2).",
     )
     parser.add_argument(
-        "--repeat", type=int, default=5,
+        "--repeat",
+        type=int,
+        default=5,
         help="Repeat iterations for benchmark (default 5).",
     )
     parser.add_argument(
-        "--cmp-triton", action="store_true",
+        "--cmp-triton",
+        action="store_true",
         help="Also time Triton for each case and print speedup.",
     )
     parser.add_argument(
@@ -319,7 +356,10 @@ if __name__ == "__main__":
     for B, S_q, S_k, H, causal, return_lse in tests:
         try:
             ok, ret = run_batch_test(
-                B, S_q, S_k, H,
+                B,
+                S_q,
+                S_k,
+                H,
                 causal=causal,
                 return_lse=return_lse,
                 warmup=args.warmup,
@@ -330,14 +370,22 @@ if __name__ == "__main__":
                 device = torch.device("cuda")
                 scale = 1.0 / math.sqrt(HEAD_DIM_QK)
                 torch.manual_seed(42)
-                q = torch.randn(B, S_q, H, HEAD_DIM_QK, dtype=torch.bfloat16, device=device)
-                k = torch.randn(B, S_k, H, HEAD_DIM_QK, dtype=torch.bfloat16, device=device)
-                v = torch.randn(B, S_k, H, HEAD_DIM_V, dtype=torch.bfloat16, device=device)
+                q = torch.randn(
+                    B, S_q, H, HEAD_DIM_QK, dtype=torch.bfloat16, device=device
+                )
+                k = torch.randn(
+                    B, S_k, H, HEAD_DIM_QK, dtype=torch.bfloat16, device=device
+                )
+                v = torch.randn(
+                    B, S_k, H, HEAD_DIM_V, dtype=torch.bfloat16, device=device
+                )
                 tri_ms = _time_fn(
-                    lambda: triton_flash_attn_func(
-                        q=q, k=k, v=v,
-                        softmax_scale=scale,
-                        causal=causal,
+                    lambda _q=q, _k=k, _v=v, _s=scale, _c=causal: triton_flash_attn_func(
+                        q=_q,
+                        k=_k,
+                        v=_v,
+                        softmax_scale=_s,
+                        causal=_c,
                     ),
                     args.warmup,
                     args.repeat,
@@ -349,9 +397,12 @@ if __name__ == "__main__":
             collected.append(ret)
             if ok:
                 n_pass += 1
-        except Exception as e:
-            print(f"  [B={B} Sq={S_q} Sk={S_k} H={H} causal={causal} lse={return_lse}] ERROR: {e}")
+        except (RuntimeError, ValueError, TypeError) as e:
+            print(
+                f"  [B={B} Sq={S_q} Sk={S_k} H={H} causal={causal} lse={return_lse}] ERROR: {e}"
+            )
             import traceback
+
             traceback.print_exc()
 
     print(f"\n{'='*60}")
