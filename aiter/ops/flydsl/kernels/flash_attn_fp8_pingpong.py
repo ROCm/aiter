@@ -131,11 +131,29 @@ def build_flash_attn_fp8_module(
     USE_SCHRAUDOLPH = True
     USE_ROLLBACK = False
 
+    # USE_QK_SCALE_FOLD (Trick 1): the QK GEMM's output multiplier
+    #   A = q_descale * k_descale * softmax_scale * log2(e) * 2^23
+    # is loop-invariant, so instead of paying one multiply per accumulator
+    # element per tile we split A = 2^E * m and push each half somewhere free:
+    # 2^E into the scaled-MFMA's E8M0 per-operand exponent (verified on gfx950:
+    # byte b applies an exact 2^(b-127)), m into Q once in the prologue.  S then
+    # emerges from the GEMM already in Schraudolph units and the exp2's FMA
+    # multiplier degenerates to 1.0.
+    #
+    # Note A ~ 1e6, so the fallback of folding *all* of A into Q is not open to
+    # us here: Q is fp8 E4M3 with a max of 448.  The exponent split is required,
+    # not a refinement.
+    USE_QK_SCALE_FOLD = True
+
     # ---- Appendix A constants ----
     SCHRAUDOLPH_2P23 = 1 << 23  # 8388608
     # C = 127*2^23 - 486411; the offset minimizes worst-case relative error of
     # the linear-mantissa interpolation over one octave.
     SCHRAUDOLPH_C = 127 * SCHRAUDOLPH_2P23 - 486411  # 1064866805
+    E8M0_ONE = 0x7F7F7F7F  # identity operand scale (four E8M0 bytes of 2^0)
+
+    if USE_QK_SCALE_FOLD:
+        assert USE_SCHRAUDOLPH, "the 2^23 in A only makes sense for Schraudolph"
     # EXP2_SHIFT: scale all Schraudolph P up by 2^SHIFT.  A global P scale cancels
     # in the softmax normalization (O and L both scale), so this only repositions
     # P (range [2^-9,1]) within fp8 E4M3 -- a few bits up lifts small P out of the
@@ -256,11 +274,68 @@ def build_flash_attn_fp8_module(
         # worst case from ~6% to ~3% -- well under the ~6% fp8 E4M3 floor that P
         # is quantized to immediately afterwards.
         c_2p23 = fx.Float32(float(SCHRAUDOLPH_2P23))
+        c_inv_2p23 = fx.Float32(2.0**-23)
         # EXP2_SHIFT lifts all P up by 2^SHIFT (global scale cancels in softmax
         # normalization; only repositions P within fp8 E4M3, out of subnormals).
         c_exp2_bias = fx.Float32(
             float(SCHRAUDOLPH_C) + EXP2_SHIFT * float(SCHRAUDOLPH_2P23)
         )
+
+        def _i32c(v):
+            # fx.Int32 wants a signed value; wrap bit patterns with bit 31 set.
+            return fx.Int32(v - (1 << 32) if v >= (1 << 31) else v)
+
+        e8m0_ident = _i32c(E8M0_ONE)
+        qk_scale_e8m0 = e8m0_ident
+        q_mant = None
+        if const_expr(USE_QK_SCALE_FOLD):
+            # Trick 1.  A = q_descale*k_descale*softmax_scale*log2(e)*2^23 is
+            # loop-invariant; split A = 2^E * m and pay neither factor in the
+            # loop.  Following the reference kernel we normalize m into [0.5,1)
+            # by forcing the fp32 exponent field to 0x3F000000 and compensating
+            # with +1 on the E8M0 byte -- so 2^(e+1-127) * 0.5*(1+f) == A
+            # exactly, with no rounding in the power-of-two half.
+            #
+            # A ~ 1e6 puts e ~ 146, nowhere near the E8M0 edges (0x00 is a zero
+            # sentinel, 0xFF saturates), so the +1 is always safe here.
+            a_full = _fmul(scale_log2e, c_2p23)
+            a_bits = arith.bitcast(T.i32, _raw(a_full))
+            e_byte = arith.addi(
+                arith.andi(
+                    arith.shrui(_raw(a_bits), _raw(fx.Int32(23))),
+                    _raw(fx.Int32(0xFF)),
+                ),
+                _raw(fx.Int32(1)),
+            )
+            # One E8M0 byte per 32-element scale block; broadcast to all four.
+            qk_scale_e8m0 = arith.muli(_raw(e_byte), _raw(fx.Int32(0x01010101)))
+            q_mant = arith.bitcast(
+                T.f32,
+                arith.ori(
+                    arith.andi(_raw(a_bits), _raw(_i32c(0x807FFFFF))),
+                    _raw(fx.Int32(0x3F000000)),
+                ),
+            )
+
+        def qk_mfma(a, b, c):
+            # QK GEMM only.  The PV and ones-column MFMAs keep the atom wrapper
+            # (identity scales); only this one carries Trick 1's 2^E.  A = K,
+            # B = Q, and the mantissa half of A lives in Q, so the exponent
+            # rides on scaleB to keep the two halves on the same operand.
+            if const_expr(not USE_QK_SCALE_FOLD):
+                return mfma.call(a, b, c)
+            return rocdl.mfma_scale_f32_32x32x64_f8f6f4_(
+                res=mfma.accum_type,
+                a=_raw(a),
+                b=_raw(b),
+                c=_raw(c),
+                cbsz=0,
+                blgp=0,
+                opsel_a=0,
+                scale_a=_raw(e8m0_ident),
+                opsel_b=0,
+                scale_b=_raw(qk_scale_e8m0),
+            )
 
         def _schraudolph(s, scale_x2p23, m_term):
             # 2^(s*scale_log2e - m_new*scale_log2e) via the Schraudolph bit trick,
@@ -396,7 +471,34 @@ def build_flash_attn_fp8_module(
             )
             raw = _pointer_load(v_i8x32, gep)
             raw = ArithValue(q_in_bounds).select(raw, zero_qpack.ir_value())
-            q_packs.append(Vec(raw).bitcast(fx.Int32))  # vec<8xi32>
+            qw = Vec(raw).bitcast(fx.Int32)  # vec<8xi32>
+            if const_expr(USE_QK_SCALE_FOLD):
+                # Trick 1, mantissa half: Q *= m once, here, instead of S *= A
+                # on 64 accumulator elements per tile forever.  Round-trips
+                # through f32 because there is no fp8 multiply; the re-quantize
+                # costs at most one E4M3 ULP, far below the format's own ~6%.
+                scaled = []
+                for w in range_constexpr(A_FP8_PER_LANE // 4):
+                    word = qw[w]
+                    lo2 = Vec(
+                        rocdl.cvt_pk_f32_fp8(
+                            Vec.make_type(2, fx.Float32), _raw(word), False
+                        )
+                    )
+                    hi2 = Vec(
+                        rocdl.cvt_pk_f32_fp8(
+                            Vec.make_type(2, fx.Float32), _raw(word), True
+                        )
+                    )
+                    f = [
+                        _fmul(lo2[0], q_mant),
+                        _fmul(lo2[1], q_mant),
+                        _fmul(hi2[0], q_mant),
+                        _fmul(hi2[1], q_mant),
+                    ]
+                    scaled.append(_f32x4_to_fp8_word(*f))
+                qw = Vec.from_elements(scaled, fx.Int32)
+            q_packs.append(qw)
 
         # ===================================================================
         # Online-softmax loop carried state, per wave (one 32-wide tile of q).
@@ -573,7 +675,7 @@ def build_flash_attn_fp8_module(
                     vi = u - (QK_UNITS - PREFETCH_DEPTH)
                     vw_prime[vi] = read_v_pack(v_off, vi // PV_K_STEPS, vi % PV_K_STEPS)
                 _sched_barrier()
-                s_accs[nt] = mfma.call(kw[u % 4], q_packs[ks], s_accs[nt])
+                s_accs[nt] = qk_mfma(kw[u % 4], q_packs[ks], s_accs[nt])
                 # rocdl.sched_group_barrier(rocdl.mask_mfma, 1, 0)
             return s_accs, vw_prime
 
@@ -591,9 +693,15 @@ def build_flash_attn_fp8_module(
             )
             row_max_int = _fmax(local_max, peer_max)
             m_new = _fmax(m_running, row_max_int)
-            corr = rocdl.exp2(T.f32, _raw(_fmul(_fsub(m_running, m_new), scale_log2e)))
+            # With Trick 1 the accumulator already carries A = scale*log2e*2^23,
+            # so m is tracked in those same units and the two conversions back
+            # out are the reciprocals of A's halves rather than scale_log2e.
+            if const_expr(USE_QK_SCALE_FOLD):
+                to_log2 = c_inv_2p23  # accumulator units -> log2 units
+            else:
+                to_log2 = scale_log2e
+            corr = rocdl.exp2(T.f32, _raw(_fmul(_fsub(m_running, m_new), to_log2)))
 
-            neg_scaled_m_new = _fsub(c_zero_f, _fmul(scale_log2e, m_new))
             n_groups = C_F32_PER_LANE // 4
 
             p_words = []
@@ -603,11 +711,19 @@ def build_flash_attn_fp8_module(
                 # Done packed over the whole vec<16xf32> (v_pk_fma / v_pk_max), so
                 # the per-element cost is half a VALU slot for the affine plus one
                 # convert -- vs the packed affine + quarter-rate v_exp_f32 before.
-                scale_x2p23 = _fmul(scale_log2e, c_2p23)
-                m_term = _fadd(_fmul(neg_scaled_m_new, c_2p23), c_exp2_bias)
-                sx_vec = Vec.from_elements([scale_x2p23], fx.Float32).broadcast_to(
-                    C_F32_PER_LANE
-                )
+                if const_expr(USE_QK_SCALE_FOLD):
+                    # Trick 1 has already applied A to S inside the GEMM, so the
+                    # FMA's multiplier is literally 1.0 and drops out: the exp2
+                    # is now add + max + cvt_u32.
+                    m_term = _fadd(_fsub(c_zero_f, m_new), c_exp2_bias)
+                    sx_vec = None
+                else:
+                    neg_scaled_m_new = _fsub(c_zero_f, _fmul(scale_log2e, m_new))
+                    scale_x2p23 = _fmul(scale_log2e, c_2p23)
+                    m_term = _fadd(_fmul(neg_scaled_m_new, c_2p23), c_exp2_bias)
+                    sx_vec = Vec.from_elements([scale_x2p23], fx.Float32).broadcast_to(
+                        C_F32_PER_LANE
+                    )
                 mt_vec = Vec.from_elements([m_term], fx.Float32).broadcast_to(
                     C_F32_PER_LANE
                 )
@@ -615,9 +731,12 @@ def build_flash_attn_fp8_module(
                 i32_vec_ty = Vec.make_type(C_F32_PER_LANE, fx.Int32)
                 f32_vec_ty = Vec.make_type(C_F32_PER_LANE, fx.Float32)
                 for nt in range_constexpr(N_KV_TILES):
-                    biased = _fmax(
-                        _fadd(_fmul(Vec(s_accs[nt]), sx_vec), mt_vec), zero_vec
+                    aff = (
+                        _fadd(Vec(s_accs[nt]), mt_vec)
+                        if const_expr(USE_QK_SCALE_FOLD)
+                        else _fadd(_fmul(Vec(s_accs[nt]), sx_vec), mt_vec)
                     )
+                    biased = _fmax(aff, zero_vec)
                     ps_v = Vec(
                         arith.bitcast(
                             f32_vec_ty, arith.fptoui(i32_vec_ty, _raw(biased))
@@ -633,6 +752,8 @@ def build_flash_attn_fp8_module(
                 # Affine scale*S - scale*m computed packed (vector mulf/addf ->
                 # v_pk_*) over the whole vec<16xf32>; exp2 stays per-scalar
                 # (quarter-rate v_exp_f32, exact).
+                # (unreachable with USE_QK_SCALE_FOLD, which asserts Schraudolph)
+                neg_scaled_m_new = _fsub(c_zero_f, _fmul(scale_log2e, m_new))
                 scale_vec = Vec.from_elements([scale_log2e], fx.Float32).broadcast_to(
                     C_F32_PER_LANE
                 )
