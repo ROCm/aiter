@@ -523,10 +523,10 @@ __global__ void radix_kernel_persistent(T const* in,
                 __atomic_store_n(reinterpret_cast<volatile unsigned int*>(&counter->pass_done),
                                  static_cast<unsigned int>(pass + 1), __ATOMIC_RELEASE);
             }
-            // Waiting blocks acquire pass_done and invalidate their cache before
-            // reloading the global histogram. The elected block does not take
-            // that path, so give it equivalent device-scope visibility here.
-            __threadfence();
+            // Every wave in the elected block must acquire device-scope
+            // visibility before reloading the global histogram. Unlike
+            // __threadfence(), this omits the unnecessary release side.
+            __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
             __syncthreads();
         }
         else
