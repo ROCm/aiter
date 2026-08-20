@@ -237,12 +237,13 @@ def _build_paged_kernel(
             col0 = fx.Int32(arith.index_cast(T.i32, iv))
             wave_ni_base = wave * N_TILES_PER_WAVE
 
-            def _col_for(abs_ni):
-                return col0 + abs_ni * MFMA_N + lane_mod_N
+            # Helpers close over this chunk's SSA values; default args silence B023.
+            def _col_for(abs_ni, _col0=col0):
+                return _col0 + abs_ni * MFMA_N + lane_mod_N
 
-            def _col_c_for(abs_ni):
+            def _col_c_for(abs_ni, _ctx_m1=ctx_m1):
                 return fx.Int32(
-                    arith.minsi(_to_raw(_col_for(abs_ni)), _to_raw(ctx_m1))
+                    arith.minsi(_to_raw(_col_for(abs_ni)), _to_raw(_ctx_m1))
                 )
 
             def _ind_off_for(abs_ni):
