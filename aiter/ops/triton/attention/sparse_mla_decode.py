@@ -68,7 +68,7 @@ def _check_out(out, q, kv_lora_rank):
 def _infer_cache_format(kv, d_qk, kv_lora_rank, qk_rope_head_dim, kv_scale):
     """-> (fmt, cache, alt_ptr, scl_ptr, block_size, fp8_fnuz). Pointer roles
     follow the kernel's Seg contract (see its docstring)."""
-    if kv.ndim == 4:  # [slots, 1, 1, R] -- the asm mla_decode_fwd view
+    if kv.ndim == 4:  # [slots, 1, 1, R], the asm mla_decode_fwd view
         assert kv.shape[1] == 1 and kv.shape[2] == 1
         kv = kv.reshape(kv.shape[0], kv.shape[3])
     elif kv.ndim == 3 and kv.shape[2] == d_qk:
@@ -113,24 +113,17 @@ def _infer_cache_format(kv, d_qk, kv_lora_rank, qk_rope_head_dim, kv_scale):
 def _mla_num_splits(num_queries: int, heads_blocks: int, avg_topk: float) -> int:
     """Split-K count for the sparse-MLA decode.
 
-    Separate from the DSv4 policy (_decode_num_splits_occ): that one is tuned for
-    a two-segment SWA + top-k launch and, measured here, over-splits badly at MLA
-    shapes -- at C=1, topk=2048 it asks for one split per tile, so 32 programs
-    each pay the full prologue and the reduce walks 32 partials, which costs
-    1.23-1.28x.
+    Separate from the DSv4 policy in _decode_num_splits_occ, which is tuned for a
+    two-segment SWA + top-k launch and over-splits here: at C=1 topk=2048 it asks
+    for one split per tile, so 32 programs each pay the full prologue and the
+    reduce walks 32 partials, costing 1.23-1.28x.
 
-    Two rules, both measured on MI355X over C in 1..256 x topk in {512, 2048} x
-    H in {8, 16}:
-
-      * Below one workgroup per CU, split to fill the machine but never past 8.
-        Splits beyond that stop buying parallelism and start paying prologue and
-        reduce traffic: 8 is optimal or within 10% in every cell measured, and
-        the 16 that topk=2048 prefers at C=8-16 is worth only 4-10%.
-      * At or above one workgroup per CU the launch is already full, so a split
-        only buys the second occupancy slot and has to earn its extra partial
-        round trip -- it takes ~16 tiles to do that. At C=256 this is the
-        difference between one split and two: topk=512 (8 tiles) wants none, and
-        splitting anyway costs 22%.
+    Below one workgroup per CU, split to fill the machine but never past 8. Past
+    that, splits stop buying parallelism and start paying prologue and reduce
+    traffic; 8 is optimal or within 10% everywhere measured. At or above one
+    workgroup per CU the launch is already full, so a split only buys the second
+    occupancy slot and needs ~16 tiles to earn its extra partial round trip. At
+    C=256 that decides one split versus two, and topk=512 wants none.
     """
     num_sms = get_num_sms()
     base_wg = max(1, num_queries * heads_blocks)
@@ -141,16 +134,54 @@ def _mla_num_splits(num_queries: int, heads_blocks: int, avg_topk: float) -> int
     return max(1, min(cta_cap, tiles, 8))
 
 
-def _lds_pad_for(fp8_mfma: bool) -> int:
-    """kv_smem row padding, in *elements* of the staged type.
+_E4M3_MAX = 448.0
 
-    The pad exists to offset which banks a transposed K read lands on, and that
-    is a byte property: _LDS_PAD is tuned for the bf16 staging, so an fp8 plane
-    needs twice as many elements to move the row pitch by the same bytes.
-    Measured at the GLM shape (C=64, topk=2048): carrying bf16's 8 over to fp8
-    costs 1.08x, and 16 / 32 / 64 all land at 0.86-0.89x.
+
+def _resolve_dot_precision(dot_precision: str, fmt: str, fp8_fnuz: bool) -> bool:
+    """True for the fp8 matrix-core path.
+
+    Every rejection below is the same constraint: the fp8 path needs the cache
+    scale to be one positive scalar, because that is what folds outside the tile
+    loop (K-side into qk_scale, V-side onto the accumulator). A scale that varies
+    along a dot's contraction axis cannot be folded out at all.
     """
-    return _LDS_PAD * 2 if fp8_mfma else _LDS_PAD
+    if dot_precision not in ("bf16", "fp8"):
+        raise ValueError(
+            f"dot_precision must be 'bf16' or 'fp8', got {dot_precision!r}"
+        )
+    if dot_precision == "bf16":
+        return False
+    if fmt == "dsmla":
+        raise ValueError(
+            "dot_precision='fp8' does not support the fp8_ds_mla cache. Its "
+            "scale varies per 128 elements along the head dim, the QK "
+            "contraction axis, so it cannot fold outside the tile loop, and "
+            "scaled MFMA cannot express the PV side either (one scale per 32 "
+            "contraction elements, where this needs one per token). "
+            "Use dot_precision='bf16'."
+        )
+    if fmt == "bf16":
+        raise ValueError(
+            "dot_precision='fp8' needs an fp8 cache; this one is bf16, and "
+            "quantizing the pool per call would cost more than the dots save."
+        )
+    if fp8_fnuz:
+        raise ValueError(
+            "dot_precision='fp8' is OCP e4m3 only; this cache is fnuz, a "
+            "different encoding from what the matrix core reads."
+        )
+    return True
+
+
+def _lds_pad_for(fp8_dots: bool) -> int:
+    """kv_smem row padding, in elements of the staged type.
+
+    The pad shifts which banks a transposed K read lands on, which is a byte
+    property, so an fp8 plane needs twice the elements to move the row pitch by
+    the same bytes. Carrying bf16's value over to fp8 costs 1.08x at C=64
+    topk=2048; 16, 32 and 64 all land at 0.86-0.89x.
+    """
+    return _LDS_PAD * 2 if fp8_dots else _LDS_PAD
 
 
 def sparse_mla_decode_fwd(
@@ -165,7 +196,7 @@ def sparse_mla_decode_fwd(
     kv_splits: int | None = None,
     skip_reduce: bool = False,
     has_invalid: bool = False,
-    fp8_mfma: bool = False,
+    dot_precision: str = "bf16",
     q_scale: torch.Tensor | None = None,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
@@ -186,14 +217,25 @@ def sparse_mla_decode_fwd(
             instead of launching the combine.
         has_invalid: index stream carries -1 sentinels (masked out). Default
             False: vLLM's index converter emits none (it maps -1 to slot 0).
-        fp8_mfma: keep the tile in fp8 through both dots instead of staging it
-            as bf16 -- flat per-tensor OCP fp8 cache only. q still arrives bf16
-            and is quantized to e4m3 in the kernel, per program, so its scale
-            folds into that program's qk_scale. Faster (0.75-0.96x) but drops
-            accuracy to the asm kernel's level, so it is a deliberate trade.
-        q_scale: scalar f32 scale q was quantized with. Required when q is
-            fp8, unused otherwise. Matches aiter's asm mla_decode_fwd, where
-            vLLM passes the layer's calibrated ``_q_scale``.
+        dot_precision: what the QK and PV matrix-core ops run in.
+
+            "bf16" (default): the KV tile is dequantized to bf16 on its way
+                into LDS and both dots are bf16. Works with every cache format.
+            "fp8": the cache's own code points go to the fp8 matrix core with no
+                dequant, and the per-tensor scale folds outside the tile loop.
+                0.75-0.96x of "bf16", but q and p both round-trip through e4m3,
+                so accuracy lands at roughly the asm kernel's level. Needs the
+                flat per-tensor OCP fp8 cache; see _resolve_dot_precision.
+
+            q is adapted to the choice. bf16 q is quantized here when "fp8" is
+            asked for, fp8 q is passed straight through, and fp8 q under "bf16"
+            dots is widened in-kernel, which is exact.
+        q_scale: scalar f32. Required when q arrives already fp8 (the scale it
+            was quantized with; the aiter asm convention, where vLLM passes
+            the layer's calibrated ``_q_scale``). Optional when q is bf16 and
+            dot_precision="fp8": given, it is used as the static quantization
+            scale, matching production's scaled_fp8_quant(q, layer._q_scale);
+            omitted, a per-tensor amax is taken here.
         out: optional ``[C, H, >= kv_lora_rank]`` bf16 destination.
 
     Returns:
@@ -202,9 +244,12 @@ def sparse_mla_decode_fwd(
     assert q.ndim == 3, f"expected q=[b,h,d], got {q.shape}"
     assert arch_info.get_arch() == "gfx950", "sparse_mla_decode_fwd is gfx950-only"
     q_is_fp8 = q.dtype == torch.float8_e4m3fn
-    assert q.dtype == torch.bfloat16 or q_is_fp8, (
-        f"q must be bf16 or float8_e4m3fn, got {q.dtype}"
-    )
+    if q.dtype not in (torch.bfloat16, torch.float8_e4m3fn):
+        raise ValueError(
+            f"q must be bf16 or float8_e4m3fn, got {q.dtype}"
+            + (" (fnuz is a different encoding from what the matrix core reads)"
+               if "fnuz" in str(q.dtype) else "")
+        )
     if q_is_fp8:
         # Caller-quantized q, the asm calling convention: one scaled_fp8_quant
         # over [C, H*d_qk] with the layer's scale. The kernel folds the scale
@@ -226,10 +271,27 @@ def sparse_mla_decode_fwd(
     fmt, cache, alt, scl, block_size, fp8_fnuz = _infer_cache_format(
         kv_buffer, d_qk, kv_lora_rank, qk_rope_head_dim, kv_scale
     )
-    if fp8_mfma and (fmt != "tensor" or fp8_fnuz):
+    fp8_dots = _resolve_dot_precision(dot_precision, fmt, fp8_fnuz)
+    if fp8_dots and not q_is_fp8:
+        # Quantize the way production does, one scaled_fp8_quant over
+        # [C, H*d_qk]. A caller-supplied q_scale is the layer's calibrated
+        # static scale; without one, take a per-tensor amax.
+        if q_scale is None:
+            q_scale = (
+                (q.detach().float().abs().amax() / _E4M3_MAX)
+                .clamp_min(torch.finfo(torch.float32).tiny)
+                .reshape(1)
+            )
+        q = (
+            (q.float() / q_scale).clamp(-_E4M3_MAX, _E4M3_MAX)
+            .to(torch.float8_e4m3fn)
+            .contiguous()
+        )
+        q_is_fp8 = True
+    elif q_scale is not None and not q_is_fp8:
         raise ValueError(
-            "fp8_mfma needs the flat per-tensor OCP fp8 cache (got "
-            f"fmt={fmt!r}, fp8_fnuz={fp8_fnuz})"
+            "q_scale was given but q is bf16 and dot_precision='bf16', so "
+            "nothing would use it"
         )
     kv_indices = _as_int32_contiguous_1d(kv_indices)
     kv_indptr = _as_int32_contiguous_1d(kv_indptr)
@@ -346,7 +408,7 @@ def sparse_mla_decode_fwd(
         HEAD_ALIGNED=head_aligned,
         MFMA_K=_MFMA_K,
         GATHER_TW1=_GATHER_TW1,
-        LDS_PAD=_lds_pad_for(fp8_mfma),
+        LDS_PAD=_lds_pad_for(fp8_dots),
         NOPE_CHUNK=nope_chunk,
         CHUNK_AXIS=chunk_axis,
         PART_STORE_CACHE="",
@@ -360,7 +422,7 @@ def sparse_mla_decode_fwd(
         IDX_BUFFER_LOAD=idx_use_buffer_load,
         HAS_INVALID=has_invalid,
         FP8_FNUZ=fp8_fnuz,
-        FP8_MFMA=fp8_mfma,
+        FP8_MFMA=fp8_dots,
         q_scl_ptr=q_scale,
         Q_FP8=q_is_fp8,
         num_warps=num_warps,
