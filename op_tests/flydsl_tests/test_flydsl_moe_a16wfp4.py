@@ -129,6 +129,135 @@ def test_flydsl_a16wfp4_situv2_e2e(
     assert ld < 1e-2, f"a16w4 SiTUv2 cos/logits_diff too large: {ld:.3e}"
 
 
+@_SKIP
+@pytest.mark.parametrize("model_dim,inter_dim", [(3584, 512)])
+@pytest.mark.parametrize("token", [8, 32])
+def test_flydsl_a16wfp4_situv2_expert_parallel(
+    model_dim, inter_dim, token, monkeypatch
+):
+    """a16w4 SiTUv2 with expert_mask (EP): local weights, global topk ids.
+
+    moe_sorting remaps global expert ids to this rank's local ids and drops
+    remote/fake routes; gemm2 atomically scatters the rest. Same contract as
+    a16wi4. Tuned CSVs are keyed on local E, so this path uses the heuristic
+    unless an EP-shaped CSV is loaded.
+    """
+    # Single CSV so the model_configs glob-merge cannot pick up backup
+    # *tuned_fmoe*.csv files that collide with cartesian winners.
+    from pathlib import Path
+
+    from aiter.jit.core import AITER_CONFIGS
+
+    _csv = (
+        Path(__file__).resolve().parents[2]
+        / "aiter/configs/model_configs/kimik3_fp4_tuned_fmoe_gfx942.csv"
+    )
+    monkeypatch.setenv("AITER_CONFIG_FMOE", str(_csv))
+    AITER_CONFIGS.get_config_file.cache_clear()
+
+    E, ep, topk = 16, 4, 4
+    ep_id = 0
+    local_E = E // ep
+    local_start = ep_id * local_E
+    local_end = local_start + local_E
+    fake_id = E
+    dtype = dtypes.bf16
+    situ_beta, situ_linear_beta = 4.0, 25.0
+    torch.manual_seed(1)
+    torch.cuda.manual_seed(1)
+
+    expert_mask = torch.zeros((E + 1,), dtype=dtypes.i32, device="cuda")
+    expert_mask[local_start:local_end] = 1
+    expert_mask[fake_id] = 0
+
+    inp = torch.randn((token, model_dim), dtype=dtype, device="cuda")
+    w1 = torch.randn(
+        (local_E, inter_dim * 2, model_dim), dtype=dtype, device="cuda"
+    )
+    w2 = torch.randn((local_E, model_dim, inter_dim), dtype=dtype, device="cuda")
+    score = torch.randn((token, E), dtype=dtype, device="cuda")
+    # (E, topk)=(16, 4) is not in the fused_topk asm table; torch.topk is
+    # enough — this test is the EP gemm path, not the router.
+    vals, ids = torch.topk(score.float(), topk, dim=-1)
+    topk_weights = torch.softmax(vals, dim=-1)
+    topk_ids = ids.to(dtypes.i32)
+    # EP convention: extra always-masked fake-expert column (fused_moe
+    # strips it from the CSV lookup key via is_ep).
+    fake_ids = torch.full((token, 1), fake_id, dtype=topk_ids.dtype, device="cuda")
+    fake_wts = torch.zeros((token, 1), dtype=topk_weights.dtype, device="cuda")
+    topk_ids_ep = torch.cat([topk_ids, fake_ids], dim=1)
+    topk_weights_ep = torch.cat([topk_weights, fake_wts], dim=1)
+
+    tq = aiter.get_torch_quant(QuantType.per_1x32)
+    w1_qt, w1_scale = tq(w1, quant_dtype=dtypes.fp4x2)
+    w2_qt, w2_scale = tq(w2, quant_dtype=dtypes.fp4x2)
+    w1_qt = w1_qt.view(local_E, inter_dim * 2, model_dim // 2)
+    w2_qt = w2_qt.view(local_E, model_dim, inter_dim // 2)
+    w1_scale_e = w1_scale.view(local_E, inter_dim * 2, model_dim // 32)
+    w2_scale_e = w2_scale.view(local_E, model_dim, inter_dim // 32)
+
+    local_hash = expert_mask.cumsum(0, dtype=dtypes.i32) - 1
+    local_hash[expert_mask == 0] = -1
+    local_ids = local_hash[topk_ids_ep]
+
+    o1 = torch_moe_stage1(
+        inp.to(dtype),
+        w1_qt.view(dtypes.fp4x2),
+        w2_qt.view(dtypes.fp4x2),
+        topk_weights_ep,
+        local_ids,
+        dtype=dtype,
+        activation=ActivationType.Situv2,
+        quant_type=QuantType.per_1x32,
+        a1_scale=None,
+        w1_scale=w1_scale_e,
+        doweight=False,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
+    )
+    ref = torch_moe_stage2(
+        o1.view(token, topk + 1, inter_dim),
+        w1_qt.view(dtypes.fp4x2),
+        w2_qt.view(dtypes.fp4x2),
+        topk_weights_ep,
+        local_ids,
+        dtype=dtype,
+        quant_type=QuantType.per_1x32,
+        w2_scale=w2_scale_e,
+        a2_scale=None,
+        doweight=True,
+    )
+
+    w1_gui = shuffle_weight_a16w4(w1_qt, 16, False)
+    w2_gui = shuffle_weight_a16w4(w2_qt, 16, False)
+    w1_scale_gui = shuffle_scale_a16w4(w1_scale, local_E, False)
+    w2_scale_gui = shuffle_scale_a16w4(w2_scale, local_E, False)
+
+    out = fused_moe(
+        inp,
+        w1_gui,
+        w2_gui,
+        topk_weights_ep,
+        topk_ids_ep,
+        expert_mask=expert_mask,
+        w1_scale=w1_scale_gui,
+        w2_scale=w2_scale_gui,
+        quant_type=QuantType.per_1x32,
+        activation=ActivationType.Situv2,
+        doweight_stage1=False,
+        gate_mode=GateMode.SEPARATED.value,
+        beta=situ_beta,
+        linear_beta=situ_linear_beta,
+    )
+
+    assert not out.isnan().any().item(), "a16w4 SiTUv2 EP output contains NaN"
+    # At least one remote route so we are not testing an all-local degenerate case.
+    n_remote = int((local_ids < 0).sum().item())
+    assert n_remote > 0, "EP test constructed no remote/fake routes to mask"
+    ld = _cos_diff(ref.float(), out.float())
+    assert ld < 1e-2, f"a16w4 SiTUv2 EP cos/logits_diff too large: {ld:.3e}"
+
+
 def test_a16w4_lds_budget_math():
     """a16w-mix LDS / num_acc_n gates, independent of the live GPU."""
     from aiter.ops.flydsl.moe_kernels import a16w4_config_fits_device

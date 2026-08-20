@@ -814,6 +814,9 @@ def _fused_moe_impl(
         and activation == ActivationType.Situv2
     )
     if _is_a16w4_situv2:
+        # EP (`expert_mask`) uses the same moe_sorting remap + atomic stage2
+        # scatter as a16wi4 (`stage2_uses_route_reduce` is False for bf16xfp4).
+        # The a4w4 output_aux path still has its own EP guard below.
         for _bad, _why in (
             (
                 get_gfx() not in ("gfx942", "gfx950") or not is_flydsl_available(),
@@ -823,7 +826,6 @@ def _fused_moe_impl(
                 ),
             ),
             (bias1 is not None or bias2 is not None, "per-expert bias"),
-            (expert_mask is not None, "expert-parallel masking"),
             (
                 not (isShuffled and isG1U1 and not doweight_stage1),
                 "non-preshuffled / non-g1u1 weights or doweight_stage1=True",
