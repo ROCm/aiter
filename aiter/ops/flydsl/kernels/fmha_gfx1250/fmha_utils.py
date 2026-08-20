@@ -1,20 +1,22 @@
 from __future__ import annotations
 
-import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
+from flydsl._mlir.dialects import fly as fly_d
 from flydsl._mlir.dialects import llvm as llvm_dialect
 from flydsl._mlir.dialects import rocdl as rocdl_dialect
 from flydsl._mlir.dialects import scf
 from flydsl.expr import arith, rocdl
-from aiter.ops.flydsl.kernels import vector
 from flydsl.expr.primitive import const_expr, range_constexpr
 from flydsl.expr.rocdl import tdm_ops
-from flydsl.expr.typing import T, Float32, Vector as Vec
+from flydsl.expr.typing import Float32, T
+from flydsl.expr.typing import Vector as Vec
 from flydsl.utils.smem_allocator import SmemAllocator
 
-from flydsl._mlir.dialects import fly as fly_d
-from ..layout_utils import idx2crd as idx2crd
+from aiter.ops.flydsl.kernels import vector
+
+from ..layout_utils import idx2crd
+
 
 def glb_ptr_ty():
     return ir.Type.parse("!llvm.ptr<1>")
@@ -1725,11 +1727,6 @@ def tile_iteration(ctx, tile_idx, iter_args, causal_n_start=None):
     ]
     ia_local_max = [set_vgpr_bank(iter_args[_OFF_LOCAL_MAX + i], i) for i in fx.range_constexpr(NUM_MSB)]
     ia_delta = [set_vgpr_bank(iter_args[_OFF_DELTA + i], i) for i in fx.range_constexpr(NUM_MSB)]
-    ia_sp_flat = [iter_args[_OFF_SP + i] for i in fx.range_constexpr(CNT_SU * NUM_MSB)]
-    prev_su_sp_tiles = [
-        [[set_vgpr_bank(ia_sp_flat[su * NUM_MSB + msb], msb)] for msb in fx.range_constexpr(NUM_MSB)]
-        for su in fx.range_constexpr(CNT_SU)
-    ]
     ia_k_cur_base, ia_v_cur_base = iter_args[_OFF_PP], iter_args[_OFF_PP + 1]
     ia_k_next_base, ia_v_next_base = iter_args[_OFF_PP + 2], iter_args[_OFF_PP + 3]
     kv_lds_addrs_cur = build_kv_lds_addrs(lane_id, ia_k_cur_base, ia_v_cur_base)
@@ -1766,7 +1763,7 @@ def tile_iteration(ctx, tile_idx, iter_args, causal_n_start=None):
     loop_k_oob_dg1 = TDM.build_oob_dg1_list(
         _loop_K_CFG_OOB, QK_HDIM, _loop_stride_k_elems,
         actual_kv_len - next_tile * tile_n_const, wave_id, dim0_stride=200)
-    (sp_out, kv_out, o_tiles, su_sp_tiles_out,
+    (_sp_out, kv_out, o_tiles, su_sp_tiles_out,
      partial_sp_lo_out, partial_sp_hi_out, partial_ed_out,
     ) = fmha_pipeline_ctx(
         ctx, ty, False, q_frags, kv_tiles, sp_tiles, o_tiles,
@@ -1835,7 +1832,6 @@ def _ep_finish(
         lse_vals[msb] = rocdl.log(ty["f32"], rsf[msb]) * l2e + lmf[msb] * scalar_f
     if const_expr(RETURN_LSE):
         glbpt_lse = glb_ptr_ty()
-        lse_base_i64 = ptr_base_i64(ptr_LSE)
         wv_lse = rocdl.wave_id()
         lane_lo_lse = lane_id & 15
         lse_base_row = bx * 128 + wv_lse * WV_SUBQD

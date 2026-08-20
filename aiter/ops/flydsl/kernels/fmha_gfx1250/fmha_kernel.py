@@ -6,21 +6,18 @@ Causal mask always on. num_tiles = bx + 1 (triangular).
 
 from __future__ import annotations
 
-import torch
-
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+import torch
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as llvm_dialect
 from flydsl._mlir.dialects import scf
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import arith, rocdl
-from aiter.ops.flydsl.kernels import buffer_ops
-from flydsl.expr.primitive import const_expr, range_constexpr
-from flydsl.expr.typing import T, Vector as Vec
+from flydsl.expr.primitive import const_expr
+from flydsl.expr.typing import T
 
 from ..tensor_shim import _run_compiled
-
 from .fmha_utils import *  # constants, classes, prologue helpers
 
 
@@ -197,6 +194,7 @@ launch_fns = {}  # {(is_causal, return_lse): launch_fn}
 
 def patch_reusable_slot_specs():
     import ctypes
+
     from flydsl.expr.numeric import Float32, Float64
     for Cls, cty in [(Float32, ctypes.c_float), (Float64, ctypes.c_double)]:
         if not hasattr(Cls, "_reusable_slot_spec"):
