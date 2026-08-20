@@ -36,7 +36,9 @@ from .tensor_shim import (
     AITER_FLYDSL_MOE_EXPERT_SCHEDULING_MODE,
 )
 
-TDM_DESCRIPTOR_VERSION = 1
+TDM_DESCRIPTOR_VERSION = 3
+# cache_policy[4:3] selects device scope; TH[2:0]=1 selects non-temporal.
+TDM_LOAD_CACHE_POLICY = (2 << 3) | 1
 
 
 @flyc.jit
@@ -394,6 +396,7 @@ def launch_gemm_a8w4_tdm(
             pad=None,
             wg_mask=0,
             split_inner=False,
+            cache_modifier=0,
         ):
             split_i = split_inner and len(wv) > 1
             if const_expr(len(wv) > 1):
@@ -418,6 +421,7 @@ def launch_gemm_a8w4_tdm(
                 [ext, None],
                 strides=[g_stride, None],
                 num_warps=nw,
+                cache_modifier=cache_modifier,
                 # Descriptor bit 21: release to the peers already present and
                 # re-broadcast later, so early arrivals are not held for a merge.
                 early_timeout=bool(wg_mask),
@@ -468,6 +472,7 @@ def launch_gemm_a8w4_tdm(
             lds_row=B_LDS_ROW,
             k_adv=PACK_TK * 16,
             wv=waves[1],
+            cache_modifier=TDM_LOAD_CACHE_POLICY,
         )
         add_tdm_loads(
             gSA_base,
@@ -495,6 +500,7 @@ def launch_gemm_a8w4_tdm(
             lds_row=SC_INNER,
             k_adv=SC_INNER * 4,
             wv=waves[3],
+            cache_modifier=TDM_LOAD_CACHE_POLICY,
         )
 
         # Wave ids are runtime, so one stream serves every wave and one test per
