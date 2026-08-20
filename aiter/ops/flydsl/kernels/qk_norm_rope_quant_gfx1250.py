@@ -144,9 +144,7 @@ XHEAD_HEADS_PER_WAVE = 8
 
 # TDM deep-prefetch prefill: a further ~14% over cross-head on the BF16 prefill
 # fast path (per-wave s_wait_dscnt fence + K=6 deep prefetch + cos/sin hoist;
-# ~514us / 8.4 TB/s vs cross-head ~599us at H=128/D=512). Kernel is inlined at
-# the end of this file (flydsl_qk_norm_rope_tdm_prefill); see
-# ../temp-doc/aiter/qk_norm_rope_tdm_handoff.md. Requires VEC=D/32 divisible by 8
+# Requires VEC=D/32 divisible by 8
 # (D % 256 == 0) and power-of-two H. Set False to fall back to the cross-head kernel.
 USE_TDM_PREFILL = True
 
@@ -177,10 +175,6 @@ def _fp8_const():
         "inv_max_sqrt2": _SQRT2 / fp8_max,  # stored-scale coefficient
     }
 
-
-# --- supported quant-group sizes (1 x group_size block-scales) --------------
-# group_size == head_dim -> per-row scale (single scale per token-head).
-GROUP_SIZE_OPTIONS = (32, 64, 128)
 
 # --- scale-dtype constants --------------------------------------------------
 SCALE_DTYPE_FP32 = "fp32"
@@ -213,7 +207,6 @@ def _store_bf16_vec(vals_list, out_rsrc, row_base_bytes, idx, vec):
     f32v = vector.from_elements(vec_f32, raw)
     bf16v = f32v.truncf(vec_bf16)
 
-    # bf16 -> i32 dwords: VEC bf16 = VEC/2 dwords
     dwords = vec // 2
     bf16_as_i32 = vector.bitcast(T.vec(dwords, i32), bf16v)
     off_bytes = row_base_bytes + ArithValue(idx) * (vec * 2)
@@ -250,7 +243,6 @@ def _store_fp8_packed(
     unnecessary.  Pass ``skip_fnuz_clamp=True`` to elide it and save ~4
     ALU ops per element.
     """
-    f32 = T.f32
     i32 = T.i32
 
     if skip_fnuz_clamp:
@@ -264,7 +256,6 @@ def _store_fp8_packed(
             is_tn = (vv < c0) & (vv > c_neg_uf)
             safe.append(is_tn.select(c0, vv))
 
-    # Pack each group of 4 fp32 into one i32 dword via cvt_pk_fp8_f32.
     n_dwords = vec // 4
     assert n_dwords in (2, 4), f"VEC={vec} -> n_dwords={n_dwords} unsupported"
     dword_list = []
@@ -486,7 +477,7 @@ def _build_kernel(
         # and write byte-identical results (idempotent), so there is no OOB
         # access and no divergent bounds check on the hot path.
         tok = ArithValue(bid_t) * ROWS_PER_WG + ArithValue(tid_y)
-        _nt_m1 = _to_raw(ArithValue(_to_raw(num_tokens)) - 1)
+        _nt_m1 = _to_raw(num_tokens - 1)
         tok = arith.minsi(_to_raw(tok), _nt_m1)
         bid_t = tok  # all downstream token offsets use the clamped token
         bid_t_idx = fx.Index(_to_raw(tok))
@@ -500,7 +491,6 @@ def _build_kernel(
                 addr_i64, num_records_bytes=num_records_bytes
             )
 
-        # --- shared: load position (i64 -> i32) ---
         pos_rsrc = _ptr_buffer_resource(positions)
         pos_val_i64 = buffer_ops.buffer_load(pos_rsrc, bid_t, vec_width=1, dtype=T.i64)
         pos_i32 = pos_val_i64.trunci(i32)
@@ -620,7 +610,6 @@ def _build_kernel(
                     else:
                         buffer_ops.buffer_store(scale_val, scale_rsrc, my_scale_off)
 
-            # ---- Scale-multiply ----
             scaled = []
             for vi in range_constexpr(VEC):
                 xi = x_f32_vec[vi]
@@ -694,7 +683,6 @@ def _build_kernel(
             head_idx = bid_x
             # Q load: use raw buffer_load to handle VEC=16 correctly.
             q_in_rsrc = _ptr_buffer_resource(q_in)
-            # Per-token byte offset → dword offset for Q input.
             q_row_off_elems = bid_t * (H * D) + head_idx * D + tid * VEC
             q_off_dw = q_row_off_elems >> 1
             q_f32_list = _load_bf16_raw(q_in_rsrc, q_off_dw)
@@ -703,7 +691,6 @@ def _build_kernel(
             fx.memref_store_vec(q_f32_fly_vec, q_rmem)
             x_f32 = fx.memref_load_vec(q_rmem)
 
-            # Optional per-channel Q weight.
             if const_expr(q_weighted):
                 qw_vec = _load_weight_tensor(q_weight, tid)
                 qw_f32 = qw_vec.to(fx.Float32)
@@ -930,8 +917,6 @@ def _build_kernel(
         num_tokens: fx.Int32,
         stream: fx.Stream,
     ):
-        # grid.y = ceil(num_tokens / ROWS_PER_WG): each workgroup covers
-        # ROWS_PER_WG tokens (one per wave via thread_idx.y).
         _gy_i32 = arith.divsi(
             _to_raw(num_tokens + ROWS_PER_WG - 1),
             _to_raw(fx.Int32(ROWS_PER_WG)),
@@ -1399,7 +1384,7 @@ def _build_xhead_kernel(
         bid_g = fx.block_idx.y
 
         tok = ArithValue(bid_g) * R + ArithValue(tid_y)
-        _nt_m1 = _to_raw(ArithValue(_to_raw(num_tokens)) - 1)
+        _nt_m1 = _to_raw(num_tokens - 1)
         tok_c = arith.minsi(_to_raw(tok), _nt_m1)
         tok_idx = fx.Index(_to_raw(tok_c))
 
@@ -1575,7 +1560,7 @@ def _build_xhead_kernel(
         num_tokens: fx.Int32,
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
-        _nt = ArithValue(_to_raw(num_tokens))
+        _nt = num_tokens
         gy = arith.divsi(_to_raw(_nt + (R - 1)), _to_raw(fx.Int32(R)))
         k = kernel(
             q_in,
@@ -1929,7 +1914,6 @@ def _build_tdm(
         GROUP = (H // RT) if (log2H is not None and H % RT == 0) else 1
         do_hoist = hoist_cs and GROUP > 1 and (CT % GROUP == 0)
 
-        # --- prologue: fill K buffers ---
         for k in range_constexpr(K):
             issue(bufs[k], tile_base + k)
         # --- stream: keep K-1 loads in flight; overlap load with compute ---
@@ -1942,7 +1926,7 @@ def _build_tdm(
                 cos_v, sin_v = cs_cache[0], cs_cache[1]
             else:
                 cos_v, sin_v = load_cs(tile_base + i)
-            compute_store(bufs[i % K], tile_base + i, cos_v, sin_v)  # reads buf i%K
+            compute_store(bufs[i % K], tile_base + i, cos_v, sin_v)
             if const_expr(i + K < CT):
                 issue(bufs[i % K], tile_base + i + K)  # reuse buf i%K (after read)
 
@@ -2123,7 +2107,6 @@ def _build_tdm_kv(*, head_dim, rope_head_dim):
         kv_out_rsrc = _ptr_res(kv_out)
         kw_rsrc = buffer_ops.create_buffer_resource(kv_weight, max_size=True)
 
-        # this token's D-vector (VEC per thread), direct global load in vec8 chunks
         row_base = tok * D + tid * VEC
         x = []
         w = []
