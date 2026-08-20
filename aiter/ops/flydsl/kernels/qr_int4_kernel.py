@@ -1,54 +1,26 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""INT4 two-shot all-reduce (gfx942, TP8).
+"""gfx942 TP8 INT4 two-shot all-reduce.
 
-Store mapping is lockstep 16B NT quad-fanout.
-
-Same **256-thread Q4 FMA + last-sector map** as the 856.76 µs keeper:
-4 B INT4 / thread (``ds_write_b32``), 28 ``v_pk_fma_f16`` on consume,
-8-peer ``global_store_dwordx4 nt``, 4 B flags. Compile-time
-``codec='c16q4'`` replaces only the scale:
-
-- Two consecutive Q4 threads (16 fp16) share one signed E4M3 of the
-  CodecQ4 extremum. Packed nibble path stays INT4.
-- Four such bytes pack into the same i32 scale slot eight Q4 threads
-  already owned (``SCALE_I32_OFF + tid//8``). Still 128 B of scales,
-  1024 B INT4, rank-tile **1152 B**. Not 64-writer 16 B ownership,
-  not E8M0, not 1536 B B-scales.
-
-``quant_dtype``: ``'fp16'`` (packed ``v_pk_*_f16`` after in-kernel
-bf16 to fp16; default) or ``'bf16'`` (fp32 codec math). Payload HBM
-is GEMM bf16.
-Pack into slim LDS (8 × 1152 B = 9216 B). Sequential 1-deep inbox.
-Grid ``min(tiles, 1216)``, 256 threads. Last-sector 64 B seq pad
-(IPC stride 1216 B at ``super_tile=1``). Compile-time ``super_tile``
-``ST∈{1,2,4,8}`` concatenates ST rank-tiles under **one** last-sector
-(RS and AG): stride ``ST*1152+64`` B, fewer RTTs, same two-shot.
-Host keeps ST=1 when ``num_tiles ≤ GRID`` (decode / tile-limited).
-Parameterized by ``nbytes``.
+INT4 nibble: [-8,+7], −1/8, 4 B/thread, 1152 B rank-tile. Scale is
+group-16 signed E4M3 in the 128 B region. Super-tile ST∈{1,8}; host
+uses ST=1 when ``num_tiles ≤ GRID``. Payload HBM is bf16; in-kernel
+math is packed fp16.
 """
+
+from typing import ClassVar
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm, rocdl, scf
+from flydsl.compiler.ast_rewriter import ASTRewriter
 from flydsl.expr import gpu, range_constexpr
 from flydsl.expr import rocdl as fly_rocdl
 from flydsl.expr.typing import Int32, Int64, Stream, T
 
 from . import buffer_ops
-from .qr_int4_mem import (
-    _CM_NT,
-    _dsl_if_only,
-    _extract_i64,
-    _invalidate_l1,
-    _load_device_ptr,
-    _load_i32_uncached,
-    _make_rsrc,
-    _pack_i64_vec,
-    _raw,
-)
 
 WORLD = 8
 BLOCK = 256
@@ -62,15 +34,10 @@ PHASE_RS = 0
 PHASE_AG = 1
 RANK_TILE_BYTES = 1152
 RANK_TILE_I32 = RANK_TILE_BYTES // 4
-# Last-sector release: one extra 64 B line after CodecQ4 so seq does
-# not clobber scales. Stride of the IPC rank-tile is 1216 B.
-SUPER_TILES = (1, 2, 4, 8)
-RELEASE_I32_OFF = RANK_TILE_I32
-WIRE_TILE_I32 = RANK_TILE_I32 + 16
-WIRE_TILE_BYTES = WIRE_TILE_I32 * 4
+SUPER_TILES = (1, 8)
+# 1024 B INT4 (256 i32) then 128 B group-16 E4M3 (32 i32). Rank-tile 1152 B.
 SCALE_I32_OFF = 256
-# Q4 map: 8 threads still share one i32 scale *slot*. c16q4 puts four
-# E4M3 bytes in that slot (one per pair of threads / 16 fp16).
+# Two threads (PAIR) share one E4M3; GROUP threads share the i32 slot.
 GROUP = 8
 PAIR = 2
 WAVE = 64
@@ -81,9 +48,11 @@ N_SECTORS = RANK_TILE_BYTES // 64
 PACK_I32 = WORLD * RANK_TILE_I32
 LDS_BYTES = PACK_I32 * 4
 
-# CodecQ4<half> constants (two packed fp16 lanes per i32).
-_K_SCALE_FACTOR = 0xB000B000  # -1/8
-_K_SCALE_EPS = 0x00010001
+# gfx942 buffer aux: bit 1 = sc1 (bypass L2), bit 2 = NT.
+_CM_SC1 = 2
+_CM_NT = 4
+
+# INT4 nibble range [-8,+7] as packed fp16; bias +8 as i16x2.
 _K_RANGE_MIN = 0xC800C800  # -8
 _K_RANGE_MAX = 0x47004700  # +7
 _K_RANGE_BIAS = 0x00080008  # +8 as i16x2
@@ -91,22 +60,15 @@ _K_MASK_000F = 0x000F000F
 _K_HALF2_1024 = 0x64006400
 _K_HALF2_1032 = 0xE408E408  # -1032.0 fp16x2
 
-# CodecQ4 bf16 path: scale math in fp32. HIP's bf16 CodecQ4 uses the same
-# -1/8 / [-8, +7] map; gfx942 has no v_pk_*_bf16, so f32 is the native ALU.
 
-
-def _i32_ty():
-    return ir.IntegerType.get_signless(32)
-
-
-def _f32_ty():
-    return ir.F32Type.get()
+def _raw(v):
+    return v.ir_value() if hasattr(v, "ir_value") else v
 
 
 def _pk2(op, a, b):
     return fx.Int32(
         llvm.inline_asm(
-            _i32_ty(),
+            ir.IntegerType.get_signless(32),
             [_raw(a), _raw(b)],
             f"{op} $0, $1, $2",
             "=v,v,v",
@@ -132,14 +94,12 @@ def _pk_add_f16(a, b):
 
 
 def _pk_fma_f16(a, b, c):
-    """Packed fp16 FMA: ``a * b + c`` as ``v_pk_fma_f16`` (both halves).
-
-    ``_pk_mul`` / ``_pk_add_f16`` are inline asm, so LLVM cannot contract
-    them. gfx942 has no packed bf16 FMA; this is the fp16 CodecQ4 path.
+    """``v_pk_fma_f16``: LLVM cannot contract the ``_pk_mul`` / ``_pk_add_f16``
+    inline asm. gfx942 has no packed bf16 FMA.
     """
     return fx.Int32(
         llvm.inline_asm(
-            _i32_ty(),
+            ir.IntegerType.get_signless(32),
             [_raw(a), _raw(b), _raw(c)],
             "v_pk_fma_f16 $0, $1, $2, $3",
             "=v,v,v,v",
@@ -152,37 +112,10 @@ def _pk_add_i16(a, b):
     return _pk2("v_pk_add_i16", a, b)
 
 
-def _shrui(v, n):
-    return v.shrui(fx.Int32(n))
-
-
-def _pk_rcp(a):
-    lo = fx.Int32(
-        llvm.inline_asm(
-            _i32_ty(),
-            [_raw(a)],
-            "v_rcp_f16 $0, $1",
-            "=v,v",
-            has_side_effects=False,
-        )
-    )
-    hi_src = _shrui(a, 16)
-    hi = fx.Int32(
-        llvm.inline_asm(
-            _i32_ty(),
-            [_raw(hi_src)],
-            "v_rcp_f16 $0, $1",
-            "=v,v",
-            has_side_effects=False,
-        )
-    )
-    return (lo & fx.Int32(0xFFFF)) | (hi << fx.Int32(16))
-
-
 def _cvt_f16_f32(f):
     return fx.Int32(
         llvm.inline_asm(
-            _i32_ty(),
+            ir.IntegerType.get_signless(32),
             [_raw(f)],
             "v_cvt_f16_f32 $0, $1",
             "=v,v",
@@ -200,7 +133,7 @@ def _cvt_pk_f16_f32(a, b):
 def _cvt_f32_f16(bits):
     return fx.Float32(
         llvm.inline_asm(
-            _f32_ty(),
+            ir.F32Type.get(),
             [_raw(bits)],
             "v_cvt_f32_f16 $0, $1",
             "=v,v",
@@ -228,7 +161,7 @@ def _fabs(x):
 
 
 def _unpack_f16x2(packed):
-    return _cvt_f32_f16(packed), _cvt_f32_f16(_shrui(packed, 16))
+    return _cvt_f32_f16(packed), _cvt_f32_f16(packed.shrui(fx.Int32(16)))
 
 
 def _packed_abs_max(wmax, wmin):
@@ -240,7 +173,7 @@ def _packed_abs_max(wmax, wmin):
 
 
 def _pair_signed_ext_f16(atom):
-    """Signed CodecQ4 extremum of 16 fp16: this thread's 8 + neighbor (xor 1)."""
+    """Signed extremum of 16 fp16 (this thread's 8 + xor-1 neighbor)."""
     wmax = _pk_max(_pk_max(atom[0], atom[1]), _pk_max(atom[2], atom[3]))
     wmin = _pk_min(_pk_min(atom[0], atom[1]), _pk_min(atom[2], atom[3]))
     wmax = _pk_max(wmax, gpu.shuffle_xor(wmax, 1, WAVE))
@@ -255,15 +188,15 @@ def _atom_bf16_to_f16(atom):
     for i in range_constexpr(4):
         pair = atom[i]
         lo = (pair & fx.Int32(0xFFFF)) << fx.Int32(16)
-        hi = _shrui(pair, 16) << fx.Int32(16)
+        hi = pair.shrui(fx.Int32(16)) << fx.Int32(16)
         out.append(_cvt_pk_f16_f32(lo.bitcast(fx.Float32), hi.bitcast(fx.Float32)))
     return fx.Vector.from_elements(out, fx.Int32)
 
 
 def _f32_to_bf16_bits(f):
     u = f.bitcast(fx.Int32)
-    u = u + fx.Int32(0x7FFF) + (_shrui(u, 16) & fx.Int32(1))
-    return _shrui(u, 16) & fx.Int32(0xFFFF)
+    u = u + fx.Int32(0x7FFF) + (u.shrui(fx.Int32(16)) & fx.Int32(1))
+    return u.shrui(fx.Int32(16)) & fx.Int32(0xFFFF)
 
 
 def _atom_f16_to_bf16(atom):
@@ -276,80 +209,6 @@ def _atom_f16_to_bf16(atom):
     return fx.Vector.from_elements(out, fx.Int32)
 
 
-def _unpack_bf16x2(packed):
-    """bf16x2 → two f32. Lossless: bf16 is the top 16 bits of f32."""
-    lo = (packed & fx.Int32(0xFFFF)) << fx.Int32(16)
-    hi = _shrui(packed, 16) << fx.Int32(16)
-    return lo.bitcast(fx.Float32), hi.bitcast(fx.Float32)
-
-
-def _pack_bf16x2(a, b):
-    """Pack two f32 into bf16x2. gfx942 has no v_cvt_pk_bf16_f32 (CDNA4)."""
-    lo = _f32_to_bf16_bits(a)
-    hi = _f32_to_bf16_bits(b)
-    return (lo & fx.Int32(0xFFFF)) | (hi << fx.Int32(16))
-
-
-def _fma_f32(a, b, c):
-    """``a * b + c`` as ``v_fma_f32``. gfx942 has no packed bf16 FMA."""
-    return fx.Float32(
-        llvm.inline_asm(
-            _f32_ty(),
-            [_raw(a), _raw(b), _raw(c)],
-            "v_fma_f32 $0, $1, $2, $3",
-            "=v,v,v,v",
-            has_side_effects=False,
-        )
-    )
-
-
-def _max_f32(a, b):
-    return (a > b).select(a, b)
-
-
-def _min_f32(a, b):
-    return (a < b).select(a, b)
-
-
-def _shuf_f32(x, delta):
-    return fx.Int32(gpu.shuffle_down(x.bitcast(fx.Int32), delta, WAVE)).bitcast(
-        fx.Float32
-    )
-
-
-def _bcast_f32(x, lane):
-    return fx.Int32(gpu.shuffle_idx(x.bitcast(fx.Int32), lane, WAVE)).bitcast(
-        fx.Float32
-    )
-
-
-def _xor1_f32(x):
-    return fx.Int32(gpu.shuffle_xor(x.bitcast(fx.Int32), 1, WAVE)).bitcast(fx.Float32)
-
-
-def _pair_signed_ext_bf16(atom):
-    """Signed CodecQ4 extremum of 16 bf16: this thread's 8 + neighbor (xor 1)."""
-    lo_max, hi_max = _unpack_bf16x2(atom[0])
-    lo_min, hi_min = lo_max, hi_max
-    for i in range_constexpr(4):
-        a, b = _unpack_bf16x2(atom[i])
-        lo_max = _max_f32(lo_max, a)
-        hi_max = _max_f32(hi_max, b)
-        lo_min = _min_f32(lo_min, a)
-        hi_min = _min_f32(hi_min, b)
-    lo_max = _max_f32(lo_max, _xor1_f32(lo_max))
-    hi_max = _max_f32(hi_max, _xor1_f32(hi_max))
-    lo_min = _min_f32(lo_min, _xor1_f32(lo_min))
-    hi_min = _min_f32(hi_min, _xor1_f32(hi_min))
-    lo = (_fabs(lo_max) > _fabs(lo_min)).select(lo_max, lo_min)
-    hi = (_fabs(hi_max) > _fabs(hi_min)).select(hi_max, hi_min)
-    return (_fabs(lo) > _fabs(hi)).select(lo, hi)
-
-
-def _clamp_q4(x):
-    return _min_f32(_max_f32(x, fx.Float32(-8.0)), fx.Float32(7.0))
-
-
 def _clamp_i32(x, lo, hi):
     return (x < lo).select(lo, (x > hi).select(hi, x))
 
@@ -358,16 +217,16 @@ def _f32_to_e4m3(x):
     """Signed E4M3 of a f32: 1 sign + 4 exp (bias 7, e=0 still implicit 1) + 3 mant.
 
     Group-16 wire scale. Not IEEE OCP E4M3 denorms: e=0 still encodes
-    ``(1+m/8)*2^-7`` so typical CodecQ4 extrema (~0.1) stay in range after
-    the later ×−1/8. Byte 0 is +0.
+    ``(1+m/8)*2^-7`` so typical INT4 extrema (~0.1) stay in range after
+    ×−1/8. Byte 0 is +0.
     """
     zero = fx.Float32(0.0)
     is_z = x == zero
     sign = (x < zero).select(fx.Int32(0x80), fx.Int32(0))
     bits = _fabs(x).bitcast(fx.Int32)
-    e = (_shrui(bits, 23) & fx.Int32(255)) - fx.Int32(127)
+    e = (bits.shrui(fx.Int32(23)) & fx.Int32(255)) - fx.Int32(127)
     mant = bits & fx.Int32(0x7FFFFF)
-    m3 = _shrui(mant + fx.Int32(1 << 19), 20)
+    m3 = (mant + fx.Int32(1 << 19)).shrui(fx.Int32(20))
     carry = m3 == fx.Int32(8)
     e = e + carry.select(fx.Int32(1), fx.Int32(0))
     m3 = carry.select(fx.Int32(0), m3)
@@ -379,7 +238,7 @@ def _f32_to_e4m3(x):
 def _e4m3_to_f32(b):
     is_z = b == fx.Int32(0)
     sign = (b & fx.Int32(0x80)) != fx.Int32(0)
-    e4 = _shrui(b, 3) & fx.Int32(15)
+    e4 = b.shrui(fx.Int32(3)) & fx.Int32(15)
     m3 = b & fx.Int32(7)
     mag_bits = ((e4 + fx.Int32(120)) << fx.Int32(23)) | (m3 << fx.Int32(20))
     mag = mag_bits.bitcast(fx.Float32)
@@ -388,7 +247,7 @@ def _e4m3_to_f32(b):
 
 
 def _pack_e4m3_word(e, lane):
-    """Four pair-E4M3 bytes into the Q4 i32 scale slot (lanes 0,2,4,6 of GROUP)."""
+    """Four pair-E4M3 bytes into the i32 scale slot (lanes 0,2,4,6 of GROUP)."""
     base = (lane // GROUP) * GROUP
     e0 = fx.Int32(gpu.shuffle_idx(e, base, WAVE))
     e1 = fx.Int32(gpu.shuffle_idx(e, base + fx.Int32(2), WAVE))
@@ -403,70 +262,9 @@ def _pack_e4m3_word(e, lane):
     )
 
 
-def _e4m3_decoding_scale_fp16(e):
+def _e4m3_decoding_scale(e):
     d = _e4m3_to_f32(e) * fx.Float32(-0.125)
     return _cvt_pk_f16_f32(d, d)
-
-
-def _e4m3_decoding_scale_bf16(e):
-    d = _e4m3_to_f32(e) * fx.Float32(-0.125)
-    return _pack_bf16x2(d, d)
-
-
-def _e4m3_from_scale_word(word, tid):
-    """Byte ``(tid % 8)//2`` of the packed E4M3 i32."""
-    pair_in_slot = (tid % GROUP) // PAIR
-    return word.shrui(pair_in_slot * fx.Int32(8)) & fx.Int32(0xFF)
-
-
-def _quant_atom_bf16(atom, elo, ehi):
-    q = []
-    for i in range_constexpr(4):
-        a, b = _unpack_bf16x2(atom[i])
-        i0 = fx.Int32(fx.roundeven(_clamp_q4(a * elo))) + fx.Int32(8)
-        i1 = fx.Int32(fx.roundeven(_clamp_q4(b * ehi))) + fx.Int32(8)
-        q.append((i0 & fx.Int32(0xFFFF)) | (i1 << fx.Int32(16)))
-    return q[0] | (q[1] << fx.Int32(4)) | (q[2] << fx.Int32(8)) | (q[3] << fx.Int32(12))
-
-
-def _codec_quant_bf16(atom, lane, tid):
-    ext = _pair_signed_ext_bf16(atom)
-    e = _f32_to_e4m3(ext)
-    d = _e4m3_to_f32(e) * fx.Float32(-0.125)
-    enc = fx.Float32(1.0) / (d + fx.Float32(1e-7))
-    packed = _quant_atom_bf16(atom, enc, enc)
-    is_leader = (tid % GROUP) == 0
-    return packed, _pack_e4m3_word(e, lane), is_leader
-
-
-def _codec_dequant_bf16(packed, scale):
-    slo, shi = _unpack_bf16x2(scale)
-    out = []
-    mask = fx.Int32(_K_MASK_000F)
-    eight = fx.Float32(8.0)
-    for i in range_constexpr(4):
-        q4 = _shrui(packed, i * 4) & mask
-        flo = (fx.Float32(q4 & fx.Int32(0xFFFF)) - eight) * slo
-        fhi = (fx.Float32(_shrui(q4, 16)) - eight) * shi
-        out.append(_pack_bf16x2(flo, fhi))
-    return fx.Vector.from_elements(out, fx.Int32)
-
-
-def _codec_dequant_acc_bf16(packed, scale, acc):
-    """``(q-8)*scale + acc`` as ``v_fma_f32`` per bf16 lane."""
-    slo, shi = _unpack_bf16x2(scale)
-    out = []
-    mask = fx.Int32(_K_MASK_000F)
-    eight = fx.Float32(8.0)
-    for i in range_constexpr(4):
-        q4 = _shrui(packed, i * 4) & mask
-        recon_lo = fx.Float32(q4 & fx.Int32(0xFFFF)) - eight
-        recon_hi = fx.Float32(_shrui(q4, 16)) - eight
-        a0, a1 = _unpack_bf16x2(acc[i])
-        out.append(
-            _pack_bf16x2(_fma_f32(recon_lo, slo, a0), _fma_f32(recon_hi, shi, a1))
-        )
-    return fx.Vector.from_elements(out, fx.Int32)
 
 
 def _rint_i16_pair(packed_f16):
@@ -505,7 +303,7 @@ def _codec_dequant(packed, scale):
     bias_hi = fx.Int32(_K_HALF2_1024)
     bias_lo = fx.Int32(_K_HALF2_1032)
     for i in range_constexpr(4):
-        q4 = (_shrui(packed, i * 4) & mask) | bias_hi
+        q4 = (packed.shrui(fx.Int32(i * 4)) & mask) | bias_hi
         w = _pk_add_f16(q4, bias_lo)
         out.append(_pk_mul(w, scale))
     return fx.Vector.from_elements(out, fx.Int32)
@@ -522,14 +320,10 @@ def _codec_dequant_acc(packed, scale, acc):
     bias_hi = fx.Int32(_K_HALF2_1024)
     bias_lo = fx.Int32(_K_HALF2_1032)
     for i in range_constexpr(4):
-        q4 = (_shrui(packed, i * 4) & mask) | bias_hi
+        q4 = (packed.shrui(fx.Int32(i * 4)) & mask) | bias_hi
         w = _pk_add_f16(q4, bias_lo)
         out.append(_pk_fma_f16(w, scale, acc[i]))
     return fx.Vector.from_elements(out, fx.Int32)
-
-
-def _store_v4i32_nt_nowait(rsrc, elem_off, data):
-    buffer_ops.buffer_store(data, rsrc, elem_off, cache_modifier=_CM_NT)
 
 
 def _uniform_i64(addr):
@@ -540,8 +334,7 @@ def _uniform_i64(addr):
     uses that rsrc (``v_readfirstlane`` + exec mask per load). One
     ``readfirstlane`` here moves the descriptor to SGPRs for the whole kernel.
     """
-    raw = addr.ir_value() if hasattr(addr, "ir_value") else _raw(addr)
-    return fx.Int64(rocdl.readfirstlane(ir.IntegerType.get_signless(64), raw))
+    return fx.Int64(rocdl.readfirstlane(ir.IntegerType.get_signless(64), _raw(addr)))
 
 
 def _store_v4i32_nt_global(addr_i64, data):
@@ -567,6 +360,35 @@ def _load_i32_nt(rsrc, elem_off):
     )
 
 
+def _load_i32_uncached(rsrc):
+    val = buffer_ops.buffer_load(
+        rsrc, 0, vec_width=1, dtype=T.i32, cache_modifier=_CM_SC1
+    )
+    rocdl.s_waitcnt(0)
+    return val
+
+
+def _invalidate_l1():
+    llvm.InlineAsmOp(None, [], "buffer_inv sc1", "", has_side_effects=True)
+
+
+class _IfOnlyASTRewriter(ASTRewriter):
+    """AST rewriter variant that lowers Python if, keeps while untouched."""
+
+    transformers: ClassVar[list] = [
+        t for t in ASTRewriter.transformers if t.__name__ != "CanonicalizeWhile"
+    ]
+    rewrite_globals: ClassVar[dict] = {
+        name: value
+        for name, value in ASTRewriter.rewrite_globals.items()
+        if name not in {"scf_while_gen", "scf_while_init"}
+    }
+
+
+def _dsl_if_only(func):
+    return _IfOnlyASTRewriter.transform(func)
+
+
 @_dsl_if_only
 def _wait_flag(flag_rsrc, color):
     i32 = T.i32
@@ -589,39 +411,15 @@ class PackStorage:
     pack: fx.Array[fx.Int32, PACK_I32, 16]
 
 
-def make_qr_int4_kernel(
-    *,
-    world_size: int = WORLD,
-    quant_dtype: str = "fp16",
-    codec: str = "c16q4",
-    super_tile: int = 1,
-):
-    """Compile a TP8 INT4 two-shot with lockstep 64 B sector stores.
-
-    ``codec`` is compile-time ``'c16q4'``: 256-thread Q4 FMA map with
-    group-16 E4M3 scales. ``quant_dtype`` is ``'fp16'`` (packed FMA) or
-    ``'bf16'`` (fp32 ALU); payload HBM is still GEMM bf16. ``super_tile``
-    ST in {1,2,4,8} concatenates ST rank-tiles under one last-sector per
-    phase. Release join is workgroup barrier (tid<8 poll); payload fanout
-    is lockstep 8-peer across the WG. Last-sector store is wave 0
-    (``linear < 8``).
-    """
+def make_qr_int4_kernel(*, world_size: int = WORLD, super_tile: int = 1):
     if world_size != WORLD:
         raise ValueError(f"only world_size={WORLD} is implemented, got {world_size}")
-    if quant_dtype not in ("bf16", "fp16"):
-        raise ValueError(f"quant_dtype must be 'bf16' or 'fp16', got {quant_dtype!r}")
-    if codec != "c16q4":
-        raise ValueError(f"this worktree only implements codec='c16q4', got {codec!r}")
     if super_tile not in SUPER_TILES:
         raise ValueError(f"super_tile must be one of {SUPER_TILES}, got {super_tile!r}")
-    use_bf16 = quant_dtype == "bf16"
+    # Last-sector pad is ST * RANK_TILE_I32 after the ST tiles, not a fake mode.
     release_i32_off = super_tile * RANK_TILE_I32
     wire_tile_i32 = release_i32_off + 16
     wire_tile_bytes = wire_tile_i32 * 4
-    quant_fn = _codec_quant_bf16 if use_bf16 else _codec_quant
-    dequant_fn = _codec_dequant_bf16 if use_bf16 else _codec_dequant
-    dequant_acc_fn = _codec_dequant_acc_bf16 if use_bf16 else _codec_dequant_acc
-    e4m3_scale_fn = _e4m3_decoding_scale_bf16 if use_bf16 else _e4m3_decoding_scale_fp16
 
     flags_i32 = PHASES * GRID * WORLD
 
@@ -635,8 +433,7 @@ def make_qr_int4_kernel(
         peer_ptrs: Int64,
         colors_ptr: Int64,
     ):
-        if not use_bf16:
-            _enable_fp16_ovfl()
+        _enable_fp16_ovfl()
         tid = fx.Int32(gpu.thread_id("x"))
         bid = fx.Int32(gpu.block_id("x"))
 
@@ -650,8 +447,7 @@ def make_qr_int4_kernel(
         # 64 B NT sectors of one 1152 B rank-tile: (sector, lane-in-quad)
         # -> i32 start of the dwordx4. Isolated NT store stays explicit.
         nt_own_layout = fx.make_layout((N_SECTORS, QUAD_LANES), (16, 4))
-        # Local HBM payload: (tile, atom, i32) with 16 B / thread. Remote
-        # NT fanout stays explicit global_store_dwordx4 nt.
+        # Remote NT fanout stays explicit global_store_dwordx4 nt.
         hbm_layout = fx.make_layout(
             (num_tiles, ATOMS, BLOCK * 4),
             (TILE_I32, BLOCK * 4, 1),
@@ -663,8 +459,7 @@ def make_qr_int4_kernel(
             fx.make_layout((1, BLOCK), (1, 1)),
             fx.make_layout((1, 4), (1, 1)),
         ).get_slice(tid)
-        # tid -> (scale_slot, pair_in_slot, lane_in_pair). Four E4M3 bytes
-        # live in the same i32 eight Q4 threads already stored.
+        # Four group-16 E4M3 bytes share the i32 slot eight threads already own.
         scale_own_layout = fx.make_layout(
             (BLOCK // GROUP, GROUP // PAIR, PAIR), (GROUP, PAIR, 1)
         )
@@ -674,9 +469,6 @@ def make_qr_int4_kernel(
         fanout_s8 = fx.make_layout((WORLD, 8), (1, WORLD))
         fanout_s2 = fx.make_layout((WORLD, 2), (1, WORLD))
         color_layout = fx.make_layout((GRID,), (1,))
-        # Inbox: (phase, bid, src, sub) -> i32 base of that rank-tile.
-        # Last-sector pad is ST * RANK_TILE_I32 after the ST tiles, not a
-        # fake tensor mode.
         wire_slot_layout = fx.make_layout(
             (PHASES, GRID, WORLD, super_tile),
             (
@@ -691,9 +483,15 @@ def make_qr_int4_kernel(
         pack = lds.pack.view(pack_layout)
         smem_ptr = lds.pack.ptr
 
-        peers = [_load_device_ptr(peer_ptrs, i) for i in range(WORLD)]
-        peer_vec = _pack_i64_vec(peers)
-        self_rsrc = _make_rsrc(_uniform_i64(_extract_i64(peer_vec, rank)))
+        peer_rsrc = buffer_ops.create_buffer_resource_from_addr(peer_ptrs)
+        peers = [
+            buffer_ops.buffer_load(peer_rsrc, i, vec_width=1, dtype=T.i64)
+            for i in range(WORLD)
+        ]
+        peer_vec = fx.Vector.from_elements(peers, dtype=fx.Int64)
+        self_rsrc = buffer_ops.create_buffer_resource_from_addr(
+            _uniform_i64(peer_vec[rank])
+        )
         hbm_i32_ptr = fx.PointerType.get(
             T.i32, address_space=fx.AddressSpace.Global, alignment=16
         )
@@ -706,7 +504,7 @@ def make_qr_int4_kernel(
 
         in_buf = _hbm_buf(inp_ptr)
         out_buf = _hbm_buf(out_ptr)
-        color_rsrc = _make_rsrc(colors_ptr)
+        color_rsrc = buffer_ops.create_buffer_resource_from_addr(colors_ptr)
 
         def _pack_off(peer, i32_idx):
             return fx.get_scalar(fx.crd2idx((peer, i32_idx), pack_layout))
@@ -716,9 +514,6 @@ def make_qr_int4_kernel(
                 fx.crd2idx((fx.Int32(phase), bid, src, sub), wire_slot_layout)
             )
             return fx.Int32(flags_i32) + slot
-
-        def _rank_tile_i32(phase, src):
-            return _sub_tile_i32(phase, src, fx.Int32(0))
 
         def _hbm_atom_row(buf, tile, atom):
             return fx.make_view(
@@ -743,13 +538,12 @@ def make_qr_int4_kernel(
                 src = hbm_copy.partition_S(_hbm_atom_row(in_buf, tile, atom))
                 frag = fx.make_fragment_like(src)
                 fx.copy(hbm_copy_atom, src, frag)
-                raw = fx.Vector(frag.load())
-                atoms.append(raw if use_bf16 else _atom_bf16_to_f16(raw))
+                atoms.append(_atom_bf16_to_f16(fx.Vector(frag.load())))
             return atoms
 
         def _store_tile_atoms(tile, atoms):
             for atom in range_constexpr(ATOMS):
-                packed = atoms[atom] if use_bf16 else _atom_f16_to_bf16(atoms[atom])
+                packed = _atom_f16_to_bf16(atoms[atom])
                 dst = hbm_copy.partition_D(_hbm_atom_row(out_buf, tile, atom))
                 frag = fx.make_fragment_like(dst)
                 frag.store(packed)
@@ -764,11 +558,11 @@ def make_qr_int4_kernel(
 
         def _pack_rs(atoms):
             for dest in range_constexpr(WORLD):
-                packed, scale, is_leader = quant_fn(atoms[dest], lane, tid)
+                packed, scale, is_leader = _codec_quant(atoms[dest], lane, tid)
                 _lds_write_packet(fx.Int32(dest), packed, scale, is_leader)
 
         def _pack_ag(acc):
-            packed, scale, is_leader = quant_fn(acc, lane, tid)
+            packed, scale, is_leader = _codec_quant(acc, lane, tid)
             for dest in range_constexpr(WORLD):
                 _lds_write_packet(fx.Int32(dest), packed, scale, is_leader)
 
@@ -791,7 +585,7 @@ def make_qr_int4_kernel(
                             smem_ptr + _pack_off(peer, vec_idx),
                             result_type=fx.Vector.make_type(4, fx.Int32),
                         )
-                        dest = _extract_i64(peer_vec, peer)
+                        dest = peer_vec[peer]
                         byte_off = fx.Int64(
                             _sub_tile_i32(phase, inbox_src, sub) + vec_idx
                         ) * fx.Int64(4)
@@ -806,9 +600,9 @@ def make_qr_int4_kernel(
             if linear < limit:
                 vec_idx = fx.Int32(release_i32_off) + liq * fx.Int32(4)
                 v4 = fx.Vector.from_elements([color, color, color, color], fx.Int32)
-                dest = _extract_i64(peer_vec, safe)
+                dest = peer_vec[safe]
                 byte_off = fx.Int64(
-                    _rank_tile_i32(phase, inbox_src) + vec_idx
+                    _sub_tile_i32(phase, inbox_src, fx.Int32(0)) + vec_idx
                 ) * fx.Int64(4)
                 _store_v4i32_nt_global(dest + byte_off, v4)
 
@@ -819,10 +613,12 @@ def make_qr_int4_kernel(
 
         def _wait_release(phase, color):
             if tid < WORLD:
-                elem = _rank_tile_i32(phase, tid) + fx.Int32(release_i32_off)
+                elem = _sub_tile_i32(phase, tid, fx.Int32(0)) + fx.Int32(
+                    release_i32_off
+                )
                 _wait_flag(
-                    _make_rsrc(
-                        _extract_i64(peer_vec, rank) + fx.Int64(elem) * fx.Int64(4)
+                    buffer_ops.create_buffer_resource_from_addr(
+                        peer_vec[rank] + fx.Int64(elem) * fx.Int64(4)
                     ),
                     color,
                 )
@@ -833,27 +629,23 @@ def make_qr_int4_kernel(
             packed = _load_i32_nt(self_rsrc, base + tid)
             word = _load_i32_nt(self_rsrc, base + fx.Int32(SCALE_I32_OFF) + scale_slot)
             e = word.shrui(pair_in_slot * fx.Int32(8)) & fx.Int32(0xFF)
-            scale = e4m3_scale_fn(e)
-            return packed, scale
-
-        def _recv_atom(phase, src, sub):
-            packed, scale = _recv_q4(phase, src, sub)
-            return dequant_fn(packed, scale)
+            return packed, _e4m3_decoding_scale(e)
 
         def _reduce_rs(sub):
             acc = None
             for src in range_constexpr(WORLD):
                 packed, scale = _recv_q4(PHASE_RS, fx.Int32(src), sub)
                 if acc is None:
-                    acc = dequant_fn(packed, scale)
+                    acc = _codec_dequant(packed, scale)
                 else:
-                    acc = dequant_acc_fn(packed, scale, acc)
+                    acc = _codec_dequant_acc(packed, scale, acc)
             return acc
 
         def _recv_ag(sub):
             gathered = []
             for src in range_constexpr(WORLD):
-                gathered.append(_recv_atom(PHASE_AG, fx.Int32(src), sub))
+                packed, scale = _recv_q4(PHASE_AG, fx.Int32(src), sub)
+                gathered.append(_codec_dequant(packed, scale))
             return gathered
 
         n_block_tiles = (num_tiles - bid + fx.Int32(GRID - 1)) // fx.Int32(GRID)
@@ -950,11 +742,9 @@ def make_qr_int4_kernel(
             stream=stream,
         )
 
-    launch_qr_int4.func.__name__ = (
-        f"launch_qr_int4_ws{world_size}_{codec}_{quant_dtype}_st{super_tile}"
-    )
+    launch_qr_int4.func.__name__ = f"launch_qr_int4_ws{world_size}_st{super_tile}"
     try:
-        qr_int4.func.__name__ = f"qr_int4_{codec}_{quant_dtype}_st{super_tile}"
+        qr_int4.func.__name__ = f"qr_int4_st{super_tile}"
     except AttributeError:
         pass
     return {
@@ -969,6 +759,4 @@ def make_qr_int4_kernel(
         "super_tile": super_tile,
         "grid": GRID,
         "block": BLOCK,
-        "quant_dtype": quant_dtype,
-        "codec": codec,
     }

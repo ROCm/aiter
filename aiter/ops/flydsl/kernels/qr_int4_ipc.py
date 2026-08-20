@@ -2,12 +2,7 @@
 # Copyright (c) 2025 FlyDSL Project Contributors
 # Modifications Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
 
-"""Uncached HIP IPC helpers for the FlyDSL INT4 QuickReduce inbox.
-
-Extracted from FlyDSL ``kernels/comm/custom_all_reduce.py`` (the HIP
-``hipDeviceMallocUncached`` + IPC handle path). Only the methods the QR
-host uses are vendored; the rest of that all-reduce kernel is not.
-"""
+"""Uncached HIP IPC helpers for the FlyDSL INT4 QuickReduce inbox."""
 
 from __future__ import annotations
 

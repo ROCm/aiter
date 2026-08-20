@@ -1,15 +1,17 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Host launch for FlyDSL INT4 QuickReduce.
+"""Host launch for gfx942 TP8 INT4 two-shot all-reduce.
 
-Public type ``QRInt4``. Store mapping is lockstep 16B NT quad-fanout
-(implementation detail).
+Public type ``QRInt4``. Super-tile ST∈{1,8}; ST=1 when ``num_tiles ≤ GRID``.
+INT4 nibble + group-16 E4M3. Payload HBM is bf16.
 """
 
 from __future__ import annotations
 
+import flydsl.compiler as flyc
 import torch
+from flydsl.expr.typing import Int32, Int64
 
 from .qr_int4_ipc import UncachedIpcHeap
 from .qr_int4_kernel import (
@@ -21,21 +23,13 @@ from .qr_int4_kernel import (
 )
 
 
-def padded_nbytes(nbytes: int) -> int:
-    """Round user payload up to the CodecQ4 tile quantum (32 KiB / 16384 fp16)."""
-    if nbytes < 0:
-        raise ValueError("nbytes must be >= 0")
-    if nbytes == 0:
-        return TILE_BYTES
-    return ((nbytes + TILE_BYTES - 1) // TILE_BYTES) * TILE_BYTES
-
-
 class _StEngine:
     """One compile-time SUPER inbox + launch."""
 
     def __init__(self, *, spec, group, device, rank: int, world_size: int):
         self.spec = spec
         self.launch = spec["launch"]
+        self.compiled = None
         self.super_tile = spec["super_tile"]
         self.buf_bytes = spec["flags_bytes"] + spec["data_bytes"]
         self.lds_bytes = spec["lds_bytes"]
@@ -59,8 +53,6 @@ class _StEngine:
                 base = int(UncachedIpcHeap.open_mem_handle(bytes(handle)))
                 self._peer_bases[r] = base
                 peer_ptrs[r] = base + off
-        for r in range(world_size, WORLD):
-            peer_ptrs[r] = peer_ptrs[0]
 
         self._gpu_peer_ptrs = torch.tensor(peer_ptrs, dtype=torch.int64, device=device)
         self._colors = torch.ones(GRID, dtype=torch.int32, device=device)
@@ -82,12 +74,7 @@ class _StEngine:
 
 
 class QRInt4:
-    """IPC inbox + flag buffer and launch wrapper for ``qr_int4``.
-
-    Compile-time ``super_tile`` ST∈{1,2,4,8}. When ST>1 a ST=1 engine is also
-    built so ``num_tiles ≤ GRID`` (decode) does not 2×/4×-flag the inbox.
-    Pass ``force_super=True`` to glance the fat stride on small collectives.
-    """
+    """IPC inbox + flag buffer and launch wrapper for ``qr_int4``."""
 
     def __init__(
         self,
@@ -96,10 +83,7 @@ class QRInt4:
         device,
         rank: int,
         world_size: int = WORLD,
-        quant_dtype: str = "fp16",
-        codec: str = "c16q4",
-        super_tile: int = 1,
-        force_super: bool = False,
+        super_tile: int = 8,
     ):
         if world_size != WORLD:
             raise ValueError(
@@ -109,19 +93,11 @@ class QRInt4:
             raise ValueError(
                 f"super_tile must be one of {SUPER_TILES}, got {super_tile!r}"
             )
-        if quant_dtype not in ("bf16", "fp16"):
-            raise ValueError(
-                f"quant_dtype must be 'bf16' or 'fp16', got {quant_dtype!r}"
-            )
         self.group = group
         self.device = device
         self.rank = int(rank)
         self.world_size = int(world_size)
-        self.quant_dtype = quant_dtype
-        self.codec = codec
         self.super_tile = int(super_tile)
-        self.force_super = bool(force_super)
-        self._compiled = False
 
         sts = [1]
         if self.super_tile != 1:
@@ -130,8 +106,6 @@ class QRInt4:
         for st in sts:
             spec = make_qr_int4_kernel(
                 world_size=self.world_size,
-                quant_dtype=quant_dtype,
-                codec=codec,
                 super_tile=st,
             )
             self._by_st[st] = _StEngine(
@@ -149,25 +123,21 @@ class QRInt4:
         self.tile_fp16 = primary.tile_fp16
         self.rank_tile_bytes = primary.rank_tile_bytes
         self.wire_tile_bytes = primary.wire_tile_bytes
-        self.quant_dtype = primary.spec["quant_dtype"]
-        self.codec = primary.spec["codec"]
 
     def _pick_st(self, num_tiles: int) -> int:
-        if self.force_super or self.super_tile == 1 or num_tiles > GRID:
+        if self.super_tile == 1 or num_tiles > GRID:
             return self.super_tile
         return 1
 
     def _launch_eng(
         self, eng: _StEngine, inp: torch.Tensor, out: torch.Tensor, stream
     ) -> None:
-        from flydsl.expr.typing import Int32, Int64
-
         live_bytes = int(inp.numel()) * int(inp.element_size())
         num_tiles = max(1, (live_bytes + TILE_BYTES - 1) // TILE_BYTES)
         grid_x = min(num_tiles, GRID)
         if stream is None:
             stream = torch.cuda.current_stream()
-        eng.launch(
+        args = (
             Int32(self.rank),
             Int64(live_bytes),
             Int32(num_tiles),
@@ -176,8 +146,12 @@ class QRInt4:
             Int64(int(eng._gpu_peer_ptrs.data_ptr())),
             Int64(int(eng._colors.data_ptr())),
             Int32(grid_x),
-            stream=stream,
+            stream,
         )
+        if eng.compiled is None:
+            eng.compiled = flyc.compile(eng.launch, *args)
+        else:
+            eng.compiled(*args)
 
     def compile(self, inp: torch.Tensor, out: torch.Tensor, stream=None) -> None:
         """Launch every ST engine so JIT finishes before the first wait.
@@ -187,7 +161,6 @@ class QRInt4:
         """
         for eng in self._by_st.values():
             self._launch_eng(eng, inp, out, stream)
-        self._compiled = True
 
     def close(self):
         for eng in self._by_st.values():

@@ -49,7 +49,6 @@ from aiter.ops.flydsl.kernels.qr_int4_kernel import (
 ARCH = get_gfx_runtime()
 SUPPORTED_ARCHS = ("gfx942",)
 SQNR_MIN_DB = 18.0
-QUANT_DTYPE = "fp16"
 SUPER_TILE = 8
 TP = WORLD
 
@@ -120,8 +119,6 @@ def _run_rank(args) -> None:
         device=device,
         rank=rank,
         world_size=args.tp,
-        quant_dtype=args.quant_dtype,
-        codec="c16q4",
         super_tile=args.super_tile,
     )
     compile_tokens = min(512, max(args.tokens))
@@ -197,7 +194,6 @@ def _spawn_tp8(
     pairs: list[tuple[int, int]],
     *,
     time_it: bool,
-    quant_dtype: str = QUANT_DTYPE,
     super_tile: int = SUPER_TILE,
 ) -> list[dict]:
     if torch.cuda.device_count() < TP:
@@ -230,8 +226,6 @@ def _spawn_tp8(
             tokens,
             "--hiddens",
             hiddens,
-            "--quant-dtype",
-            quant_dtype,
             "--super-tile",
             str(super_tile),
         ]
@@ -279,19 +273,6 @@ def test_qr_int4_sqnr_vs_fp32_allreduce(tokens, hidden, label):
     ), f"{label}: host picked ST={row['st_used']}, expected {expected_st}"
     assert row["sqnr_db"] >= SQNR_MIN_DB, (
         f"{label} tokens={tokens} hidden={hidden} ST={row['st_used']}: "
-        f"SQNR {row['sqnr_db']:.2f} dB < {SQNR_MIN_DB} (rel MAE {row['rel_mae']:.3e})"
-    )
-
-
-def test_qr_int4_bf16_codec_st1():
-    """bf16 codec is a distinct compile (v_fma_f32); keep one ST=1 case."""
-    tokens, hidden = 8, 1024
-    rows = _spawn_tp8([(tokens, hidden)], time_it=False, quant_dtype="bf16")
-    row = rows[0]
-    expected_st = _pick_st(tokens, hidden)
-    assert row["st_used"] == expected_st
-    assert row["sqnr_db"] >= SQNR_MIN_DB, (
-        f"bf16 tokens={tokens} hidden={hidden} ST={row['st_used']}: "
         f"SQNR {row['sqnr_db']:.2f} dB < {SQNR_MIN_DB} (rel MAE {row['rel_mae']:.3e})"
     )
 
@@ -399,7 +380,6 @@ if __name__ == "__main__":
     parser.add_argument("--tp", type=int, default=TP)
     parser.add_argument("--tokens", default="")
     parser.add_argument("--hiddens", default="")
-    parser.add_argument("--quant-dtype", default=QUANT_DTYPE)
     parser.add_argument("--super-tile", type=int, default=SUPER_TILE)
     parser.add_argument("--time-it", action="store_true")
     parser.add_argument("--out", default=None)
