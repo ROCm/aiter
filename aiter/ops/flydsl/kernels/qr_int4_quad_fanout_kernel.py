@@ -44,17 +44,16 @@ from .qr_int4_mem import (
     _invalidate_l1,
     _load_device_ptr,
     _load_i32_uncached,
-    _load_v4i32,
     _make_rsrc,
     _pack_i64_vec,
     _raw,
-    _store_v4i32,
 )
 
 WORLD = 8
 BLOCK = 256
 ATOMS = 8
 TILE_BYTES = BLOCK * ATOMS * 16
+TILE_I32 = TILE_BYTES // 4
 TILE_FP16 = TILE_BYTES // 2
 GRID = 304 * 4
 PHASES = 2
@@ -650,7 +649,19 @@ def make_qr_int4_quad_fanout_kernel(
         # 64 B NT sectors of one 1152 B rank-tile: (sector, lane-in-quad)
         # -> i32 start of the dwordx4. Isolated NT store stays explicit.
         nt_own_layout = fx.make_layout((N_SECTORS, QUAD_LANES), (16, 4))
-        atom_i32_layout = fx.make_layout((ATOMS, BLOCK), (BLOCK * 4, 4))
+        # Local HBM payload: (tile, atom, i32) with 16 B / thread. Remote
+        # NT fanout stays explicit global_store_dwordx4 nt.
+        hbm_layout = fx.make_layout(
+            (num_tiles, ATOMS, BLOCK * 4),
+            (TILE_I32, BLOCK * 4, 1),
+        )
+        hbm_row_layout = fx.make_layout((1, BLOCK * 4), (BLOCK * 4, 1))
+        hbm_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Int32)
+        hbm_copy = fx.make_tiled_copy_tv(
+            hbm_copy_atom,
+            fx.make_layout((1, BLOCK), (1, 1)),
+            fx.make_layout((1, 4), (1, 1)),
+        ).get_slice(tid)
         # tid -> (scale_slot, pair_in_slot, lane_in_pair). Four E4M3 bytes
         # live in the same i32 eight Q4 threads already stored.
         scale_own_layout = fx.make_layout(
@@ -682,12 +693,18 @@ def make_qr_int4_quad_fanout_kernel(
         peers = [_load_device_ptr(peer_ptrs, i) for i in range(WORLD)]
         peer_vec = _pack_i64_vec(peers)
         self_rsrc = _make_rsrc(_uniform_i64(_extract_i64(peer_vec, rank)))
-        in_rsrc = buffer_ops.create_buffer_resource_from_addr(
-            inp_ptr, num_records_bytes=nbytes
+        hbm_i32_ptr = fx.PointerType.get(
+            T.i32, address_space=fx.AddressSpace.Global, alignment=16
         )
-        out_rsrc = buffer_ops.create_buffer_resource_from_addr(
-            out_ptr, num_records_bytes=nbytes
-        )
+
+        def _hbm_buf(ptr):
+            view = fx.make_view(fx.inttoptr(hbm_i32_ptr, ptr), hbm_layout)
+            return fx.rocdl.make_buffer_tensor(
+                view, max_size=False, num_records_bytes=nbytes
+            )
+
+        in_buf = _hbm_buf(inp_ptr)
+        out_buf = _hbm_buf(out_ptr)
         color_rsrc = _make_rsrc(colors_ptr)
 
         def _pack_off(peer, i32_idx):
@@ -702,9 +719,11 @@ def make_qr_int4_quad_fanout_kernel(
         def _rank_tile_i32(phase, src):
             return _sub_tile_i32(phase, src, fx.Int32(0))
 
-        def _hbm_i32(tile, atom):
-            slot = fx.get_scalar(fx.crd2idx((atom, tid), atom_i32_layout))
-            return tile * fx.Int32(TILE_BYTES // 4) + slot
+        def _hbm_atom_row(buf, tile, atom):
+            return fx.make_view(
+                fx.get_iter(fx.slice(buf, (tile, atom, None))),
+                hbm_row_layout,
+            )
 
         def _load_color():
             off = fx.get_scalar(fx.crd2idx((bid,), color_layout))
@@ -720,14 +739,20 @@ def make_qr_int4_quad_fanout_kernel(
         def _load_tile_atoms(tile):
             atoms = []
             for atom in range_constexpr(ATOMS):
-                raw = _load_v4i32(in_rsrc, _hbm_i32(tile, atom))
+                src = hbm_copy.partition_S(_hbm_atom_row(in_buf, tile, atom))
+                frag = fx.make_fragment_like(src)
+                fx.copy(hbm_copy_atom, src, frag)
+                raw = fx.Vector(frag.load())
                 atoms.append(raw if use_bf16 else _atom_bf16_to_f16(raw))
             return atoms
 
         def _store_tile_atoms(tile, atoms):
             for atom in range_constexpr(ATOMS):
                 packed = atoms[atom] if use_bf16 else _atom_f16_to_bf16(atoms[atom])
-                _store_v4i32(out_rsrc, _hbm_i32(tile, atom), packed)
+                dst = hbm_copy.partition_D(_hbm_atom_row(out_buf, tile, atom))
+                frag = fx.make_fragment_like(dst)
+                frag.store(packed)
+                fx.copy(hbm_copy_atom, frag, dst)
 
         def _lds_write_packet(peer, packed, scale, is_leader):
             fx.memref_store(packed, pack, (peer, tid))
