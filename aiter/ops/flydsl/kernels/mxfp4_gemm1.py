@@ -4,7 +4,7 @@
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
+from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T, as_ir_value
 
 from . import dpp_utils
@@ -1738,20 +1738,13 @@ def compile_gemm1_a4w4_port(
 
         def _xcd(pid):
             xc = _umod(pid, NXCD)
-            wgid = (
-                xc * xq
-                + fx.Int32(arith.minsi(as_ir_value(xc), as_ir_value(xr)))
-                + _udiv(pid, NXCD)
-            )
+            wgid = xc * xq + (xc < xr).select(xc, xr) + _udiv(pid, NXCD)
             ng = fx.Int32(xcd_swizzle * NUM_N_BLOCKS)
             group_id = wgid // ng
             first_pid_m = group_id * fx.Int32(xcd_swizzle)
             remaining_m = total_m_blocks - first_pid_m
-            group_size_m = fx.Int32(
-                arith.minsi(
-                    as_ir_value(remaining_m), as_ir_value(fx.Int32(xcd_swizzle))
-                )
-            )
+            sw = fx.Int32(xcd_swizzle)
+            group_size_m = (remaining_m < sw).select(remaining_m, sw)
             wig = wgid % ng
             m_block = first_pid_m + (wig % group_size_m)
             n_block = wig // group_size_m
