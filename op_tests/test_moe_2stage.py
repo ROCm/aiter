@@ -6,14 +6,14 @@ import gc
 import itertools
 import logging
 import os
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
 
 import pandas as pd
 import torch
 
 import aiter
 from aiter import dtypes
-from aiter.aot.flydsl.common import run_only_env
+from aiter.aot.flydsl.common import override_env, run_only_env
 from aiter.fused_moe import (
     fused_moe,
     fused_topk,
@@ -266,9 +266,19 @@ def test_fmoe(
     # bias dtype convert
     if (
         qType == aiter.QuantType.per_1x32
+        and reference_aq_dtype == dtypes.bf16
+        and WQDType == dtypes.fp4x2
+        and actType == aiter.ActivationType.Situv2
+    ):  # a16w4 SiTUv2: served by the ported FlyDSL kernel (no per-expert bias).
+        # Key on reference_aq_dtype (runtime dispatch), not the declared AQDType:
+        # a SiTUv2 case declared a8w4/a4w4 still runs as a16w4 without the env opt-in.
+        exp_bias1 = exp_bias2 = None
+        exp_bias1_aiter = exp_bias2_aiter = None
+    elif (
+        qType == aiter.QuantType.per_1x32
         and (AQDType in [dtypes.bf16, dtypes.fp16, dtypes.fp8])
         and (WQDType == dtypes.fp4x2)
-    ):  # a16w4
+    ):  # a8w4 (fp8 A) mxfp4
         exp_bias1_aiter = None if exp_bias1 is None else exp_bias1.to(dtypes.fp32)
         exp_bias2_aiter = None if exp_bias2 is None else exp_bias2.to(dtypes.fp32)
     elif (
@@ -321,8 +331,11 @@ def test_fmoe(
         and (AQDType in [dtypes.bf16, dtypes.fp16, dtypes.fp8])
         and (WQDType == dtypes.fp4x2)
     ):  # a16w4 / a8w4
-        w1_qt_aiter = shuffle_weight_a16w4(w1_qt_aiter, 16, True)
-        w1_scale_aiter = shuffle_scale_a16w4(w1_scale, E, True)
+        # a16w4 (bf16/fp16 act) uses standard GGUU (gate_up=False), matching main;
+        # a8w4 (fp8 act) keeps the gate/up-interleaved GUGU (gate_up=True).
+        _w1_gu = AQDType == dtypes.fp8
+        w1_qt_aiter = shuffle_weight_a16w4(w1_qt_aiter, 16, _w1_gu)
+        w1_scale_aiter = shuffle_scale_a16w4(w1_scale, E, _w1_gu)
         w2_qt_aiter = shuffle_weight_a16w4(w2_qt_aiter, 16, False)
         w2_scale_aiter = shuffle_scale_a16w4(w2_scale, E, False)
     elif is_mxfp8:  # mxfp8 (a8w8): gate-up interleaved fp8 weight + e8m0 scale
@@ -739,11 +752,6 @@ parser.add_argument(
     "Only affects SiTUv2.",
 )
 parser.add_argument(
-    "--no-situv2",
-    action="store_true",
-    help="Skip the default SiTUv2 (per_1x32 fp4/fp8) FlyDSL cases.",
-)
-parser.add_argument(
     "--kernel",
     action="store_true",
     help="""Time the stage1 / stage2 kernels in isolation (loop each launch
@@ -903,9 +911,11 @@ def _iter_csv_cases():
             )
             continue
         kwargs["strict_accuracy"] = True
-        # In targeted --csv-filter validation runs, skip the AOT-cache gate (new
-        # configs have no pre-registered AOT cache entry).
-        kwargs["check_aot_cache"] = args.csv_filter is None
+        # Targeted configs and env-selected SiTUv2 modes have no pre-registered
+        # AOT cache entry, so let those cases compile on demand.
+        kwargs["check_aot_cache"] = (
+            args.csv_filter is None and kwargs["actType"] != aiter.ActivationType.Situv2
+        )
         kwargs["disable_stage2_bias"] = kernel_name2.startswith("opus_")
         yield kwargs, {
             "kernelName1": kernel_name1,
@@ -933,10 +943,15 @@ def _situv2_beta_kwargs(act_type):
 
 
 def _effective_gate_mode(aq_dtype, wq_dtype):
-    # a16w4/a8w4 mxfp4 weights run the gate/up-interleaved (guinterleave) layout,
+    # a16w4 (bf16 A x mxfp4 W) SiTUv2 is served by the ported FlyDSL kernel via
+    # fused_moe_'s SEPARATED dispatch; keep it in SEPARATED (bf16 activation) so
+    # the abf16_wfp4 rows exercise that kernel instead of downgrading to a8w4/fp8.
+    if aq_dtype == dtypes.bf16 and wq_dtype == dtypes.fp4x2:
+        return GateMode.SEPARATED.value
+    # a8w4 mxfp4 weights run the gate/up-interleaved (guinterleave) layout,
     # matching serving's ATOM_MOE_GU_ITLV=1. gate_mode is a runtime weight-layout
     # property (not a tuned-config key); request INTERLEAVE here for them.
-    if aq_dtype in [dtypes.fp8, dtypes.bf16] and wq_dtype == dtypes.fp4x2:
+    if aq_dtype == dtypes.fp8 and wq_dtype == dtypes.fp4x2:
         return GateMode.INTERLEAVE.value
     # mxfp8 (a8w8) uses the gate-up interleave stage1 path as well.
     if aq_dtype == dtypes.fp8 and wq_dtype == dtypes.fp8:
@@ -1129,58 +1144,6 @@ def _iter_legacy_cases():
                     ), extras
 
 
-def _iter_situv2_default_cases():
-    """Yield (kwargs, extras) exercising the SiTUv2 activation by default.
-
-    SiTUv2 only routes to the FlyDSL MXFP4 kernel for per_1x32 + fp4/fp8, so we
-    hardcode the supported quant family instead of relying on the -a list:
-      * a8w4 (fp8 activation, fp4 weight) at a 256-aligned inter_dim shape
-    beta / linear_beta come from --beta / --linear-beta (None -> kernel 1.0).
-    Non-gfx950 runs are skipped inside test_fmoe's per_1x32 gfx guard.
-
-    Notes on cases intentionally kept out of this DEFAULT auto-run:
-      * The real DSV4 customer shape uses inter_dim=640, which is not 256-aligned.
-        shuffle_scale_a16w4 requires inter_dim % 256 == 0 on this branch; the
-        non-256 inter_dim fix lives on fix/shuffle-scale-a16w4-kdim. Verify the
-        640 shape once that branch is combined with this one. We default to a
-        256-aligned inter_dim (512) here so the a8w4 case runs on this branch.
-      * a4w4 (fp4 act, fp4 weight) full 2-stage is omitted because CK stage2
-        codegen (gen_instances.py) has no 'situv2' activation instance
-        (only silu/gelu), so the full a4w4 2-stage path can't be built here.
-        -a situv2 -q 4 remains reachable via explicit CLI.
-    """
-    extras = {"model": "situv2"}
-    dtype = args.dtype[0]
-    model_dim = 3072
-    tokens = [16, 128]
-    # ((quant_type, aq_dtype, wq_dtype), inter_dim)
-    situv2_cases = [
-        (_PER1X32_FP8_FP4, 512),  # a8w4: fp8 act, fp4 weight (256-aligned inter_dim)
-    ]
-    for (quant_type, aq_dtype, wq_dtype), inter_dim in situv2_cases:
-        for m in tokens:
-            yield {
-                "dtype": dtype,
-                "token": m,
-                "model_dim": model_dim,
-                "inter_dim": inter_dim,
-                "E": args.expert,
-                "topk": args.topk,
-                "actType": aiter.ActivationType.Situv2,
-                "gateMode": _effective_gate_mode(aq_dtype, wq_dtype),
-                "qType": quant_type,
-                "AQDType": aq_dtype,
-                "WQDType": wq_dtype,
-                "use_g1u1": True,
-                "doweight_stage1": False,
-                "strict_accuracy": False,
-                "check_aot_cache": False,
-                "swiglu_limit": None,
-                "beta": args.beta,
-                "linear_beta": args.linear_beta,
-            }, extras
-
-
 def test_bm16_tiled_scale_boundary():
     """Validate tuned BM16 dispatch and the 33-row scale boundary."""
     if get_gfx() != "gfx950":
@@ -1256,18 +1219,28 @@ def test_bm16_tiled_scale_boundary():
 # ---------------------------------------------------------------------------
 # Run
 # ---------------------------------------------------------------------------
+def _iter_with_env(case_iter, **env_overrides):
+    """Keep temporary environment overrides active while cases are consumed."""
+    with ExitStack() as stack:
+        for name, value in env_overrides.items():
+            stack.enter_context(override_env(name, value))
+        yield from case_iter
+
+
 _case_iters = []
 if args.bm16_scale_boundary:
     test_bm16_tiled_scale_boundary()
 else:
     if not args.no_flydsl_csv:
-        _case_iters.append(_iter_csv_cases())
+        _case_iters.append(
+            _iter_with_env(
+                _iter_csv_cases(),
+                AITER_SITUV2_A8W4="1",
+                AITER_SITUV2_A4W4=None,
+            )
+        )
     if not args.no_legacy:
         _case_iters.append(_iter_legacy_cases())
-    # SiTUv2 default coverage runs only in a full default sweep (no explicit -q),
-    # so an explicit quant selection is never silently overridden.
-    if not args.no_situv2 and args.quant is None:
-        _case_iters.append(_iter_situv2_default_cases())
 case_iter = itertools.chain(*_case_iters)
 
 _csv_out = os.environ.get("AITER_TUNED_OP_BENCH_CSV", "tuned_op_bench.csv")

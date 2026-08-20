@@ -190,9 +190,7 @@ int select_bf16_kernel_id(int requested_kernel_id)
     return selected_kernel_id;
 }
 
-int select_a8w4_kernel_id(int requested_kernel_id,
-                          int block_m,
-                          int effective_inter_dim)
+int select_a8w4_kernel_id(int requested_kernel_id, int block_m)
 {
     int selected_kernel_id = requested_kernel_id;
     if(selected_kernel_id == opus_moe::kStage2KidAuto)
@@ -200,8 +198,8 @@ int select_a8w4_kernel_id(int requested_kernel_id,
         // Auto selects a direct-atomic kernel by sort block_m. Route-out kernels
         // must be requested explicitly because they require a different output
         // layout and follow-up reduce.
-        selected_kernel_id = opus_moe::stage2_a8w4_auto_direct_atomic_kid(
-            effective_inter_dim, block_m);
+        selected_kernel_id =
+            opus_moe::stage2_a8w4_auto_direct_atomic_kid(block_m);
     }
     AITER_CHECK(opus_moe::stage2_a8w4_kid_is_valid(selected_kernel_id),
                 "opus_moe_stage2_a8w4_decode_fwd got unsupported kernel_id=",
@@ -209,8 +207,8 @@ int select_a8w4_kernel_id(int requested_kernel_id,
                 " (",
                 opus_moe::stage2_a8w4_kid_name(selected_kernel_id),
                 ")");
-    // Validate that the caller sorted with the block_m required by the selected kid.
-    const int sort_block_m = opus_moe::stage2_a8w4_kid_sort_block_m(selected_kernel_id);
+    const int sort_block_m =
+        opus_moe::stage2_a8w4_kid_sort_block_m(selected_kernel_id);
     AITER_CHECK(sort_block_m == block_m,
                 "kernel_id=",
                 selected_kernel_id,
@@ -400,14 +398,18 @@ void opus_moe_stage2_a8w4_decode_fwd(
     aiter_tensor_t& sorted_expert_ids,
     aiter_tensor_t& num_valid_ids,
     aiter_tensor_t& out,
+    int token_num,
+    int actual_topk,
     int block_m,
     int kernel_id,
     int inter_dim_pad)
 {
+    const bool inter_states_sorted = inter_states.dim() == 2;
     check_tensor(inter_states,
                  "inter_states",
-                 3,
-                 "[token, topk, packed_inter_dim]",
+                 inter_states_sorted ? 2 : 3,
+                 inter_states_sorted ? "[sorted_row, inter_dim]" :
+                                       "[token, topk, packed_inter_dim]",
                  AITER_DTYPE_fp8,
                  "fp8");
     check_tensor(
@@ -434,9 +436,8 @@ void opus_moe_stage2_a8w4_decode_fwd(
     if(sorted_weights.has_value())
         check_same_device(inter_states, "inter_states", *sorted_weights, "sorted_weights");
 
-    const int token_num = static_cast<int>(inter_states.size(0));
-    const int actual_topk = static_cast<int>(inter_states.size(1));
-    const int logical_inter_dim = static_cast<int>(inter_states.size(2));
+    const int logical_inter_dim = static_cast<int>(
+        inter_states_sorted ? inter_states.size(1) : inter_states.size(2));
     const int effective_inter_dim = logical_inter_dim - inter_dim_pad;
     const int num_experts = static_cast<int>(w2.size(0));
     const int model_dim = static_cast<int>(w2.size(1));
@@ -462,17 +463,15 @@ void opus_moe_stage2_a8w4_decode_fwd(
                 logical_inter_dim,
                 " inter_dim_pad=",
                 inter_dim_pad);
-    AITER_CHECK(effective_inter_dim % packed_k_tile_width == 0,
-                "Opus A8W4 stage2 effective_inter_dim must be divisible by ",
+    AITER_CHECK(opus_moe::stage2_a8w4_effective_inter_dim_is_supported(effective_inter_dim),
+                "Opus A8W4 stage2 effective_inter_dim must be at least ",
+                2 * packed_k_tile_width,
+                " and divisible by ",
                 packed_k_tile_width,
                 ", got ",
                 effective_inter_dim);
-    AITER_CHECK(opus_moe::stage2_a8w4_effective_inter_dim_is_supported(effective_inter_dim),
-                "Opus A8W4 stage2 effective_inter_dim is not compiled: ",
-                effective_inter_dim);
 
-    const int selected_kernel_id =
-        select_a8w4_kernel_id(kernel_id, block_m, effective_inter_dim);
+    const int selected_kernel_id = select_a8w4_kernel_id(kernel_id, block_m);
     const int kernel_block_n = opus_moe::stage2_a8w4_kid_block_n(selected_kernel_id);
     const int expected_scale_cols =
         (((effective_inter_dim / packed_k_tile_width) + 1) / 2) *
@@ -529,17 +528,25 @@ void opus_moe_stage2_a8w4_decode_fwd(
     kargs.num_valid_ids = reinterpret_cast<const int32_t*>(num_valid_ids.data_ptr());
     kargs.out_bf16 = reinterpret_cast<hip_bfloat16*>(out.data_ptr());
     kargs.stride_a_t = inter_states.stride(0);
-    kargs.stride_a_k = inter_states.stride(1);
+    kargs.stride_a_k = inter_states_sorted ? 0 : inter_states.stride(1);
     kargs.stride_w_e = w2.stride(0);
     kargs.stride_w_h = w2.stride(1);
     kargs.stride_a_scale_route = a2_scale.stride(0);
     kargs.stride_w_scale_row = w2_scale.stride(0);
     kargs.stride_o_t = route_out_fp8 ? 0 : out.stride(0);
+    kargs.k_tiles = effective_inter_dim / packed_k_tile_width;
+    kargs.a_scale_words_per_row_pack = static_cast<int>(
+        kargs.stride_a_scale_route *
+        (2 * opus_moe::kStage2A8W4DecodeMfmaM) / sizeof(uint32_t));
+    kargs.w_scale_words_per_row_pack = static_cast<int>(
+        kargs.stride_w_scale_row *
+        (2 * opus_moe::kStage2A8W4DecodeMfmaM) / sizeof(uint32_t));
     kargs.token_num = token_num;
     kargs.topk = actual_topk;
     kargs.num_experts = num_experts;
     kargs.model_dim = model_dim;
     kargs.sorted_blocks = sorted_blocks;
+    kargs.sort_block_m = block_m;
     kargs.a_scale_rows = static_cast<int>(a2_scale.size(0));
     // Keep a runtime route-out guard: the MXFP8 path codegen is measurably more
     // stable than making route-out a pure compile-time else branch.
@@ -550,7 +557,7 @@ void opus_moe_stage2_a8w4_decode_fwd(
     const hipStream_t stream = aiter::getCurrentHIPStream();
 
     opus_moe_stage2_a8w4_decode_dispatch_gfx950(
-        selected_kernel_id, effective_inter_dim, kargs, stream);
+        selected_kernel_id, kargs, stream);
     HIP_CALL_LAUNCH(hipGetLastError());
 }
 
@@ -642,6 +649,7 @@ void opus_moe_stage1_a8w4_fwd(
     aiter_tensor_t& num_valid_ids,
     aiter_tensor_t& out,
     aiter_tensor_t& out_scale,
+    int topk,
     int block_m,
     const std::string& kernelName,
     int inter_dim_pad,
@@ -672,7 +680,13 @@ void opus_moe_stage1_a8w4_fwd(
                  "fp8_e8m0");
     if(bias.has_value())
         check_tensor(*bias, "bias", 2, "[expert, 2 * inter_dim]", AITER_DTYPE_fp32, "fp32");
-    check_tensor(out, "out", 3, "[token, topk, inter_dim]", AITER_DTYPE_fp8, "fp8");
+    const bool output_sorted = out.dim() == 2;
+    check_tensor(out,
+                 "out",
+                 output_sorted ? 2 : 3,
+                 output_sorted ? "[sorted_row, inter_dim]" : "[token, topk, inter_dim]",
+                 AITER_DTYPE_fp8,
+                 "fp8");
     check_tensor(out_scale,
                  "out_scale",
                  2,
@@ -690,8 +704,8 @@ void opus_moe_stage1_a8w4_fwd(
     const int num_experts = static_cast<int>(w1.size(0));
     const int gate_up_dim = static_cast<int>(w1.size(1));
     const int packed_model_dim = static_cast<int>(w1.size(2));
-    const int topk = static_cast<int>(out.size(1));
-    const int inter_dim = static_cast<int>(out.size(2));
+    const int inter_dim =
+        static_cast<int>(output_sorted ? out.size(1) : out.size(2));
     const int sorted_blocks =
         active_sorted_block_upper_bound(sorted_expert_ids, token_num, topk);
     const int effective_inter_dim = inter_dim - inter_dim_pad;
@@ -703,19 +717,11 @@ void opus_moe_stage1_a8w4_fwd(
                 "Opus A8W4 stage1 activation must be Silu (0), Swiglu (2), or "
                 "Situv2 (3), got ",
                 activation);
+    AITER_CHECK(swiglu_limit > 0.0f, "swiglu_limit must be positive");
     if(activation_type == ActivationType::Situv2)
     {
-        // Situv2 must not be SwiGLU-clamped; the non-sparse stage1 kernel clamps
-        // every activation, so pass +inf (no-op) if a stray non-positive limit
-        // reaches this path from warmup (Python passes +inf).
-        if(!(swiglu_limit > 0.0f))
-            swiglu_limit = std::numeric_limits<float>::infinity();
         AITER_CHECK(situ_beta > 0.0f, "situ_beta must be positive");
         AITER_CHECK(situ_linear_beta > 0.0f, "situ_linear_beta must be positive");
-    }
-    else
-    {
-        AITER_CHECK(swiglu_limit > 0.0f, "swiglu_limit must be positive");
     }
     AITER_CHECK(kernel_id != opus_moe::kStage1A8W4KidInvalid,
                 "Invalid Opus A8W4 stage1 kernel name: ",
@@ -760,8 +766,9 @@ void opus_moe_stage1_a8w4_fwd(
                 model_dim / opus_moe::stage1_a8w4::kFp4ValuesPerByte,
                 ", got ",
                 packed_model_dim);
-    AITER_CHECK(out.size(0) == token_num,
-                "out token dimension must match hidden_states token dimension");
+    if(!output_sorted)
+        AITER_CHECK(out.size(0) == token_num,
+                    "out token dimension must match hidden_states token dimension");
     AITER_CHECK(hidden_scale.size(1) >= hidden_scale_cols,
                 "hidden_scale second dimension must cover model_dim / ",
                 scale_group);
@@ -798,7 +805,7 @@ void opus_moe_stage1_a8w4_fwd(
     kargs.stride_w1_e = w1.stride(0);
     kargs.stride_w1_bias_e = bias.has_value() ? bias->stride(0) : 0;
     kargs.stride_out_t = out.stride(0);
-    kargs.stride_out_k = out.stride(1);
+    kargs.stride_out_k = output_sorted ? 0 : out.stride(1);
     kargs.stride_out_scale_route = out_scale.stride(0);
     kargs.token_num = token_num;
     kargs.topk = topk;

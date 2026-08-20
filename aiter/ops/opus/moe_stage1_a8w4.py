@@ -12,6 +12,20 @@ from ..enum import ActivationType
 _OPUS_MOE_STAGE1_A8W4_SCALE_GROUP = 32
 
 
+def _opus_runtime_swiglu_limit(
+    swiglu_limit: float | None,
+    activation: int,
+) -> float:
+    """Normalize the clamp bound passed to Opus stage1 kernels.
+
+    ``None`` and ``0.0`` mean no configured clamp. SwiGLU retains its 7.0
+    default; Silu and Situv2 encode no clamp as positive infinity.
+    """
+    if activation == ActivationType.Swiglu.value:
+        return float(swiglu_limit) if swiglu_limit else 7.0
+    return float(swiglu_limit) if swiglu_limit else float("inf")
+
+
 def _contiguous(tensor: Tensor) -> Tensor:
     return tensor if tensor.is_contiguous() else tensor.contiguous()
 
@@ -48,6 +62,7 @@ def _opus_moe_stage1_a8w4_fwd_raw(
     num_valid_ids: Tensor,
     out: Tensor,
     out_scale: Tensor,
+    topk: int,
     block_m: int,
     kernelName: str,
     inter_dim_pad: int,
@@ -96,6 +111,7 @@ def opus_moe_stage1_a8w4_fwd(
     bias: Tensor | None = None,
     out: Tensor | None = None,
     out_scale: Tensor | None = None,
+    output_sorted: bool = False,
     swiglu_limit: float | None = None,
     situ_beta: float = 4.0,
     situ_linear_beta: float = 25.0,
@@ -103,14 +119,22 @@ def opus_moe_stage1_a8w4_fwd(
     block_m = int(block_m)
     kernelName = str(kernelName)
     activation = int(getattr(activation, "value", activation))
-    if swiglu_limit is None:
-        swiglu_limit = (
-            7.0 if activation == ActivationType.Swiglu.value else float("inf")
-        )
+    swiglu_limit = _opus_runtime_swiglu_limit(swiglu_limit, activation)
     inter_dim = int(w1.shape[1]) // 2
     if out is None:
+        out_shape = (
+            (
+                max(
+                    int(sorted_token_ids.numel()),
+                    int(sorted_expert_ids.numel()) * block_m,
+                ),
+                inter_dim,
+            )
+            if output_sorted
+            else (hidden_states.shape[0], int(topk), inter_dim)
+        )
         out = torch.empty(
-            (hidden_states.shape[0], int(topk), inter_dim),
+            out_shape,
             dtype=torch.float8_e4m3fn,
             device=hidden_states.device,
         )
@@ -133,6 +157,7 @@ def opus_moe_stage1_a8w4_fwd(
         _contiguous(num_valid_ids),
         _contiguous(out),
         _contiguous(out_scale),
+        int(topk),
         int(block_m),
         kernelName,
         int(inter_dim_pad),
@@ -144,6 +169,61 @@ def opus_moe_stage1_a8w4_fwd(
     return out, out_scale
 
 
+def opus_a8w4_stage1_wrapper(
+    hidden_states,
+    w1,
+    w2,
+    sorted_token_ids,
+    sorted_expert_ids,
+    num_valid_ids,
+    out,
+    topk,
+    activation,
+    kernelName="",
+    block_m: int = 0,
+    w1_scale=None,
+    a1_scale=None,
+    sorted_weights=None,
+    bias1=None,
+    swiglu_limit: float | None = None,
+    situ_beta: float = 4.0,
+    situ_linear_beta: float = 25.0,
+    inter_dim_pad: int = 0,
+    output_sorted: bool = False,
+    **_kwargs,
+):
+    """Adapt the common fused-MoE Stage1 ABI to the Opus runtime API."""
+
+    del w2, _kwargs
+    if sorted_weights is not None:
+        raise NotImplementedError(
+            "Opus A8W4 stage1 does not support routed-weight multiplication"
+        )
+    if bias1 is not None and bias1.dtype != torch.float32:
+        raise TypeError(f"MoE bias must be fp32, got {bias1.dtype}")
+    return opus_moe_stage1_a8w4_fwd(
+        hidden_states,
+        w1,
+        a1_scale,
+        w1_scale,
+        sorted_token_ids,
+        sorted_expert_ids,
+        num_valid_ids,
+        topk=int(topk),
+        inter_dim_pad=int(inter_dim_pad),
+        bias=bias1,
+        out=out,
+        output_sorted=output_sorted,
+        block_m=int(block_m),
+        kernelName=str(kernelName),
+        activation=activation,
+        swiglu_limit=swiglu_limit,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
+    )
+
+
 __all__ = [
+    "opus_a8w4_stage1_wrapper",
     "opus_moe_stage1_a8w4_fwd",
 ]
