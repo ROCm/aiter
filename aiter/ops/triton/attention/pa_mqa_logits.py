@@ -77,6 +77,13 @@ else:
     enable_jit_gluon_pa_mqa_logits_kernel = False
 
 
+_GLUON_PA_MQA_LOGITS_ARCHS = frozenset(("gfx942", "gfx950", "gfx1250"))
+
+
+def _is_gluon_pa_mqa_logits_supported(gfx: str) -> bool:
+    return gfx in _GLUON_PA_MQA_LOGITS_ARCHS
+
+
 def deepgemm_fp8_paged_mqa_logits_ragged_k(
     q_fp8: torch.Tensor,  # dtype = float8
     kv_cache_fp8: torch.Tensor,  # dtype = float8
@@ -265,7 +272,7 @@ def _compile_deepgemm_fp8_paged_mqa_logits(
     VarCtxOpt: bool = False,
 ):
     gfx_version = get_gfx()
-    assert gfx_version in ("gfx942", "gfx950", "gfx1250")
+    assert _is_gluon_pa_mqa_logits_supported(gfx_version)
     is_gfx1250 = gfx_version == "gfx1250"
     if is_gfx1250:
         if Preshuffle:
@@ -509,14 +516,21 @@ def deepgemm_fp8_paged_mqa_logits(
     kv_cache_fp8 = kv_cache_fp8.view(dtypes.fp8)
     kv_cache_scale = kv_cache_scale.view(torch.float32)
 
-    if VarCtxSchedule is not None and get_gfx() == "gfx1250":
+    gfx_version = get_gfx()
+    use_gluon = enable_gluon_pa_mqa_logits and _is_gluon_pa_mqa_logits_supported(
+        gfx_version
+    )
+    if VarCtxSchedule is not None and (not use_gluon or gfx_version == "gfx1250"):
         import warnings
 
         warnings.warn(
-            "VarCtx schedule is not implemented on gfx1250 yet; ignoring it and "
-            "falling back to the non-varctx preshuffle path."
+            "VarCtx schedule is unavailable on this kernel path; ignoring it and "
+            "falling back to the non-varctx schedule.",
+            stacklevel=2,
         )
         VarCtxSchedule = None
+    if VarCtxSchedule is not None:
+        assert Preshuffle, "VarCtx schedule requires Preshuffle=True."
 
     VarCtxOpt = VarCtxSchedule is not None
     if VarCtxOpt:
@@ -524,7 +538,7 @@ def deepgemm_fp8_paged_mqa_logits(
     else:
         grid = (batch_size * next_n * SplitKV, 1, 1)
 
-    if enable_gluon_pa_mqa_logits:
+    if use_gluon:
         is_padded_mode = kv_cache_fp8.stride(0) % 16 == 0
         kernel = _compile_deepgemm_fp8_paged_mqa_logits(
             ChunkQ=heads,
@@ -605,6 +619,7 @@ def deepgemm_fp8_paged_mqa_logits(
                 hidden_dim,
             )
     else:
+        assert not VarCtxOpt, "VarCtx schedule is only supported on the Gluon path."
         assert KVBlockSize == 1
         assert not Preshuffle, "Preshuffle mode is only supported on gluon kernel."
         kernel = _deepgemm_fp8_paged_mqa_logits[grid](
