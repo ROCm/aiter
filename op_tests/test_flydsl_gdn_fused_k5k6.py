@@ -18,7 +18,10 @@ Two levels:
     ``fusion=K5K6Fusion.ALWAYS`` and compare to the NEVER/Triton baseline.
 
 Run as a script for the perf sweep (not collected by pytest):
-    PYTHONPATH=. python op_tests/flydsl_tests/test_flydsl_gdn_fused_k5k6.py
+    PYTHONPATH=. python op_tests/test_flydsl_gdn_fused_k5k6.py                  # fused
+    PYTHONPATH=. python op_tests/test_flydsl_gdn_fused_k5k6.py --kernel k5      # state scan
+    PYTHONPATH=. python op_tests/test_flydsl_gdn_fused_k5k6.py \
+        --kernel k5 --k5-variants all                                # per-variant K5
 """
 
 from __future__ import annotations
@@ -46,6 +49,7 @@ if not is_flydsl_available():
 
 try:
     from aiter.ops.flydsl.linear_attention_prefill_kernels import (
+        K5_VARIANTS,
         chunk_gated_delta_rule_fwd_h_o_flydsl,
     )
     from aiter.ops.triton._triton_kernels.gated_delta_rule.prefill.chunk_o import (
@@ -418,6 +422,69 @@ class _CaptureSafeMeta:
         return getattr(self._meta, name)
 
 
+_NUM_WARMUP = 2
+_NUM_ITERS = 101
+
+
+def _graph_time_us(fn) -> float:
+    """Per-iteration device time, via HIP graph capture of ``_NUM_ITERS`` calls.
+
+    Capturing the calls (rather than replaying one captured call N times) keeps
+    the ROCm profiler out of the loop: its device-time attribution for the
+    CUDAGraphExec event is unreliable and returns 0 on many shapes.
+
+    Kernels that allocate their outputs internally -- K5 allocates the h
+    snapshots, ~537 MB/call at T=32768/H=32 -- do not blow up the capture: the
+    caching allocator reuses blocks freed within the capture, so the graph pool
+    holds ~1 iteration's worth, not ``_NUM_ITERS``.
+    """
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        for _ in range(_NUM_ITERS):
+            fn()
+    torch.cuda.synchronize()
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    graph.replay()
+    end.record()
+    end.synchronize()
+    return start.elapsed_time(end) * 1e3 / _NUM_ITERS  # ms -> us, per iter
+
+
+def _bench_candidates(
+    candidates, *, flops, nbytes, label, out_of=lambda o: o, extra=None
+):
+    """Time each candidate, check it against the first (baseline), collect a row.
+
+    ``out_of`` maps a candidate's return value to the tensor to compare; K5
+    returns ``(h, v_new, final_state)`` while the fused path returns ``o``.
+    ``extra`` is merged into the row first (e.g. the resolved variant tag).
+    """
+    ret = {"gfx": get_gfx(), **(extra or {})}
+    ref_out = None
+    for name, fn in candidates.items():
+        # Correctness: minimal eager run just to get the output tensor.
+        out, _ = run_perftest(fn, num_iters=2, num_warmup=_NUM_WARMUP)
+        out = out_of(out)
+        if ref_out is None:
+            ref_out = out  # the first candidate is the baseline
+        err = checkAllclose(
+            ref_out.to(dtypes.fp32),
+            out.to(dtypes.fp32),
+            rtol=1e-2, atol=1e-2,
+            msg=f"{name}: {label}",
+        )
+
+        us = _graph_time_us(fn)
+        aiter.logger.info(f"avg: {us:.3f} us/iter with hipgraph")
+        ret[f"{name} us"] = us
+        ret[f"{name} TFLOPS"] = flops / us / 1e6
+        ret[f"{name} TB/s"] = nbytes / us / 1e6
+        ret[f"{name} err"] = err
+    return ret
+
+
 @benchmark()
 def bench_fused_k5k6(model_tag, H, Hg, T_flat, N, gate):
     """Triton K5+K6 baseline vs HIP K5+K6, FlyDSL fused always, and FlyDSL fused auto.
@@ -549,47 +616,139 @@ def bench_fused_k5k6(model_tag, H, Hg, T_flat, N, gate):
         "fused_always": _run_fused_always,
         "fused_auto": _run_fused_auto,
     }
+    # What the fused candidates will actually run: the H*N tile that
+    # fused_always launches, and whether fused_auto routes to it at all.
+    from aiter.ops.flydsl.linear_attention_prefill_kernels import (
+        _fused_bv_for_shape,
+        should_use_fused_gfx942,
+    )
 
-    _NUM_WARMUP = 2
-    _NUM_ITERS = 101
+    bv, num_waves = _fused_bv_for_shape(H=H, V=V, N=N, variant=None)
+    fused_tag = f"bv{bv}w{num_waves}" if num_waves > 4 else f"bv{bv}"
 
-    ret = {"gfx": get_gfx()}
-    ref_out = None
-    for name, fn in candidates.items():
-        # Correctness: minimal eager run just to get the output tensor.
-        out, _ = run_perftest(fn, num_iters=2, num_warmup=_NUM_WARMUP)
-        if ref_out is None:
-            ref_out = out  # triton+triton is baseline
-        err = checkAllclose(
-            ref_out.to(dtypes.fp32),
-            out.to(dtypes.fp32),
-            rtol=1e-2, atol=1e-2,
-            msg=f"{name}: fused_k5k6 H={H} N={N} T={T_flat}",
+    return _bench_candidates(
+        candidates,
+        flops=flops,
+        nbytes=nbytes,
+        label=f"fused_k5k6 H={H} N={N} T={T_flat}",
+        extra={
+            "HxN": H * N,
+            "fused variant": fused_tag,
+            "auto routes": (
+                "fused" if should_use_fused_gfx942(H=H, N=N, V=V) else "separate"
+            ),
+        },
+    )
+
+
+@benchmark()
+def bench_k5(model_tag, H, Hg, T_flat, N, gate, variants=None):
+    """Triton K5 baseline vs HIP K5 and FlyDSL K5 -- the state scan in isolation.
+
+    The K5-only counterpart of ``bench_fused_k5k6``, mirroring the ``k5``
+    subcommand of ``op_tests/op_benchmarks/flydsl/bench_chunk_gdn_fwd.py``: no K6
+    output, so the h snapshots and v_new are drained to HBM as the separate
+    pipeline requires. That HBM traffic is exactly what fusing K6 removes, so
+    these numbers are the baseline the fused path is trying to beat -- they are
+    NOT comparable to the fused rows (different work, different byte counts).
+
+    ``variants`` adds explicit FlyDSL variant tags (e.g. ``["bv16", "bv64w8"]``)
+    as extra candidates alongside the auto-selected one; useful for re-checking
+    the H*N selection rule. Default: auto only.
+    """
+    from aiter.ops.chunk_gated_delta_rule_fwd_h import (
+        chunk_gated_delta_rule_fwd_h_hip_fn,
+    )
+    from aiter.ops.flydsl.linear_attention_prefill_kernels import (
+        chunk_gated_delta_rule_fwd_h_flydsl,
+    )
+    from aiter.ops.triton._triton_kernels.gated_delta_rule.prefill.chunk_delta_h import (
+        chunk_gated_delta_rule_fwd_h_opt_vk as k5_triton,
+    )
+
+    K = V = 128
+    BT = 64
+
+    seq_lens = [T_flat // N] * (N - 1) + [T_flat - (T_flat // N) * (N - 1)]
+    inp = _make_inputs(H, Hg, K, V, T_flat, seq_lens, gate)
+    # HIP K5 expects g as [B, H, T] head-major.
+    g_hip = inp["g"].unsqueeze(0) if inp["g"] is not None else None
+
+    safe_meta = None
+    if inp["cu"] is not None:
+        from aiter.ops.prefill_batch_metadata import (
+            build_gated_delta_rule_prefill_metadata,
+        )
+        raw_meta = build_gated_delta_rule_prefill_metadata(
+            seq_lens, cu_seqlens=inp["cu"], chunk_size=BT,
+        )
+        safe_meta = _CaptureSafeMeta(
+            raw_meta, inp["cu"],
+            chunk_size=BT,
+            total_prefill_tokens=T_flat,
+            num_sequences=N,
         )
 
-        # Timing: capture _NUM_ITERS calls into a graph, then replay it
-        # _NUM_ITERS times with CUDA events around each replay.  This avoids
-        # the ROCm profiler's unreliable device-time attribution for the
-        # CUDAGraphExec event (which returns 0 on many shapes).
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            for _ in range(_NUM_ITERS):
-                fn()
-        torch.cuda.synchronize()
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        start.record()
-        graph.replay()
-        end.record()
-        end.synchronize()
-        us = start.elapsed_time(end) * 1e3 / _NUM_ITERS  # ms -> us, per iter
+    common = {
+        "k": inp["k"], "w": inp["w_hm"], "u": inp["u_hm"], "gk": inp["gk"],
+        "initial_state": inp["h0"], "output_final_state": True,
+        "save_new_value": True, "cu_seqlens": inp["cu"],
+        "use_exp2": _USE_EXP2, "prefill_metadata": safe_meta,
+    }
 
-        aiter.logger.info(f"avg: {us:.3f} us/iter with hipgraph")
-        ret[f"{name} us"] = us
-        ret[f"{name} TFLOPS"] = flops / us / 1e6
-        ret[f"{name} TB/s"] = nbytes / us / 1e6
-        ret[f"{name} err"] = err
-    return ret
+    def _run_triton():
+        return k5_triton(g=inp["g"], **common)
+
+    def _run_hip():
+        return chunk_gated_delta_rule_fwd_h_hip_fn(
+            g=g_hip, g_head_major=True, **common
+        )
+
+    def _make_flydsl(tag):
+        def _run():
+            return chunk_gated_delta_rule_fwd_h_flydsl(
+                g=inp["g"], variant=tag, **common
+            )
+        return _run
+
+    candidates = {
+        "triton": _run_triton,   # baseline
+        "hip": _run_hip,
+        "flydsl": _make_flydsl(None),  # None -> the auto (H*N rule) selection
+    }
+    for tag in variants or ():
+        candidates[f"flydsl:{tag}"] = _make_flydsl(tag)
+
+    # FLOPs: K5 only = GEMM1 (w@h^T) + GEMM2 (k^T@v_new) = 4*BT*K*V per chunk/head.
+    n_chunks = sum(-(-s // BT) for s in seq_lens)
+    flops = 4 * H * n_chunks * BT * K * V
+    # bytes: k, w, u read; v_new and the h snapshots written out to HBM.
+    nbytes = (
+        T_flat * Hg * K        # k
+        + T_flat * H * K       # w
+        + T_flat * H * V       # u
+        + T_flat * H * V       # v_new
+        + n_chunks * H * V * K  # h snapshots (one per chunk, not per sequence)
+    ) * 2  # bf16
+
+    # Record what the "flydsl" (auto) candidate will ACTUALLY run. _resolve_variant
+    # is the same chain the launcher uses, so this also exposes an
+    # FLYDSL_GDN_K5_VARIANT env override -- which silently outranks the H*N rule
+    # and would otherwise make a pinned tile look like the heuristic's pick.
+    from aiter.ops.flydsl.linear_attention_prefill_kernels import _resolve_variant
+
+    auto_tag = _resolve_variant(
+        None, H=H, Hg=Hg, V=V, T_flat=T_flat, N=N, is_varlen=inp["cu"] is not None
+    )
+
+    return _bench_candidates(
+        candidates,
+        flops=flops,
+        nbytes=nbytes,
+        label=f"k5 H={H} N={N} T={T_flat}",
+        out_of=lambda ret: ret[0],  # (h, v_new, final_state) -> compare h
+        extra={"HxN": H * N, "flydsl variant": auto_tag},
+    )
 
 
 def main():
@@ -618,21 +777,65 @@ def main():
         default=[8192, 32768],
         help="T_flat values to include.",
     )
+    parser.add_argument(
+        "--kernel",
+        type=str,
+        nargs="*",
+        default=["fused"],
+        choices=["fused", "k5"],
+        help=(
+            "Which kernel(s) to sweep. 'fused' (default) = K5+K6 fused vs the\n"
+            "Triton/HIP two-kernel baselines. 'k5' = the state scan alone\n"
+            "(Triton vs HIP vs FlyDSL). Pass both to run both sweeps; their\n"
+            "rows are NOT comparable (k5 does less work and writes h to HBM)."
+        ),
+    )
+    parser.add_argument(
+        "--k5-variants",
+        type=str,
+        nargs="*",
+        default=None,
+        help=(
+            f"Extra explicit FlyDSL K5 variant tags to time alongside the\n"
+            f"auto-selected one, or 'all'. Choices: {list(K5_VARIANTS)}.\n"
+            "Only affects --kernel k5."
+        ),
+    )
     args = parser.parse_args()
 
     gate_set = set(args.gate)
     t_set = set(args.T)
 
-    df = []
-    for shape in _SWEEP_SHAPES:
-        model_tag, H, Hg, T_flat, N, gate = shape
-        if gate not in gate_set or T_flat not in t_set:
-            continue
-        df.append(bench_fused_k5k6(model_tag, H, Hg, T_flat, N, gate))
-    df = pd.DataFrame(df)
-    aiter.logger.info(
-        "fused GDN K5+K6 summary (markdown):\n%s", df.to_markdown(index=False)
-    )
+    k5_variants = args.k5_variants
+    if k5_variants == ["all"]:
+        k5_variants = list(K5_VARIANTS)
+    for tag in k5_variants or ():
+        if tag not in K5_VARIANTS:
+            parser.error(
+                f"unknown FlyDSL K5 variant {tag!r}; choices: {list(K5_VARIANTS)}"
+            )
+
+    shapes = [
+        s for s in _SWEEP_SHAPES if s[5] in gate_set and s[3] in t_set
+    ]
+
+    for kernel in args.kernel:
+        rows = []
+        for model_tag, H, Hg, T_flat, N, gate in shapes:
+            if kernel == "fused":
+                rows.append(bench_fused_k5k6(model_tag, H, Hg, T_flat, N, gate))
+            else:
+                rows.append(
+                    bench_k5(
+                        model_tag, H, Hg, T_flat, N, gate, variants=k5_variants
+                    )
+                )
+        title = "fused GDN K5+K6" if kernel == "fused" else "GDN K5 (state scan)"
+        aiter.logger.info(
+            "%s summary (markdown):\n%s",
+            title,
+            pd.DataFrame(rows).to_markdown(index=False),
+        )
 
 
 if __name__ == "__main__":
