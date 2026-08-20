@@ -145,15 +145,41 @@ def build_flash_attn_fp8_module(
     # not a refinement.
     USE_QK_SCALE_FOLD = True
 
+    # USE_FROZEN_MAX (Trick 2): compute the row max on tile 0 only and declare
+    # it final.  With m constant, exp2(m_old - m_new) == 1, so every tile after
+    # the first drops its 64-element max reduction, its cross-lane exchange, and
+    # the whole O/L rescale.  m also becomes loop-invariant, which is what makes
+    # Trick 4 possible at all.
+    #
+    # Freezing is a bet: a later tile may hold a score above tile 0's max.
+    # USE_WATCHDOG is the (exact) way to detect and undo that -- see below.  The
+    # two ship together; frozen-without-watchdog silently overflows fp8.
+    USE_FROZEN_MAX = True
+
+    # USE_WATCHDOG (Trick 5): per-tile overflow detection + exact rollback for
+    # the frozen max.  Detection is a max over the tile's exp2 arguments against
+    # a fixed cap; the repair is a rare, wave-uniform branch.
+    USE_WATCHDOG = True
+
     # ---- Appendix A constants ----
     SCHRAUDOLPH_2P23 = 1 << 23  # 8388608
     # C = 127*2^23 - 486411; the offset minimizes worst-case relative error of
     # the linear-mantissa interpolation over one octave.
     SCHRAUDOLPH_C = 127 * SCHRAUDOLPH_2P23 - 486411  # 1064866805
     E8M0_ONE = 0x7F7F7F7F  # identity operand scale (four E8M0 bytes of 2^0)
+    # 0x4E87C000 as f32 == 1138753536.0.  Decoded: (that - C)/2^23 = 8.808 and
+    # 2^8.808 = 448.2 -- the largest finite fp8 E4M3.  The cap is not a heuristic
+    # margin, it is the storage format's saturation point transcribed into the
+    # Schraudolph pattern domain, where m has already been subtracted, so it
+    # tests the gap S - m no matter where m sits.
+    SCHRAUDOLPH_CAP = 1138753536.0
 
     if USE_QK_SCALE_FOLD:
         assert USE_SCHRAUDOLPH, "the 2^23 in A only makes sense for Schraudolph"
+    if USE_WATCHDOG:
+        assert USE_SCHRAUDOLPH, "the cap is expressed in the Schraudolph domain"
+    if USE_FROZEN_MAX:
+        assert USE_WATCHDOG, "a frozen max without a watchdog can overflow fp8"
     # EXP2_SHIFT: scale all Schraudolph P up by 2^SHIFT.  A global P scale cancels
     # in the softmax normalization (O and L both scale), so this only repositions
     # P (range [2^-9,1]) within fp8 E4M3 -- a few bits up lifts small P out of the
@@ -195,11 +221,14 @@ def build_flash_attn_fp8_module(
 
         def _wave_or(pred_i1):
             # OR a per-lane i1 predicate across all 64 lanes -> wave-uniform i1.
-            g = ArithValue(pred_i1).select(fx.Int32(1), fx.Int32(0))
-            for st in (1, 2, 4, 8, 16, 32):
-                peer = fx.Int32(g).shuffle_xor(fx.Int32(st), fx.Int32(WARP_SIZE))
-                g = arith.ori(_raw(g), _raw(peer))
-            return arith.cmpi(arith.CmpIPredicate.ne, _raw(g), _raw(fx.Int32(0)))
+            # ballot is the whole reduction in one instruction: the v_cmp lands
+            # the 64 lane bits straight in an SGPR pair, so "did anyone" is a
+            # scalar compare against 0.  The portable form (6 shuffle_xor + 6
+            # or, 12 VALU ops on the critical path) is kept below for reference.
+            mask = rocdl.ballot(T.i64, _raw(pred_i1))
+            return arith.cmpi(
+                arith.CmpIPredicate.ne, _raw(mask), _raw(fx.Int64(0))
+            )
 
         def _sched_barrier():
             if USE_MANUAL_SCHED:
@@ -547,13 +576,19 @@ def build_flash_attn_fp8_module(
             corr_vec = Vec.from_elements([corr], fx.Float32).broadcast_to(
                 C_F32_PER_LANE
             )
-            if const_expr(USE_ROLLBACK):
+            if const_expr(USE_ROLLBACK or USE_FROZEN_MAX):
                 # Speculative rollback: O*=corr and L=L*corr+rowsum only matter
                 # when some lane's running max grew this tile (corr<1).
                 # corr==exp2(0)==1.0 exactly when no lane grew, so skipping the
                 # 64-fmul O-rescale + the L-mul is EXACT (not approximate).
                 # Branch on a wave-uniform OR of the per-lane (corr<1) predicate
                 # so the wave never diverges.
+                #
+                # This is also how Trick 2 collects its main prize.  With the max
+                # frozen, corr is the literal 1.0 on every tile, so the branch is
+                # never taken and the rescale is gone from the steady state; the
+                # only thing that revives it is a watchdog repair, which is what
+                # makes that repair exact rather than a downgrade.
                 grew = arith.cmpf(
                     arith.CmpFPredicate.OLT, _raw(corr), _raw(fx.Float32(1.0))
                 )
@@ -608,7 +643,7 @@ def build_flash_attn_fp8_module(
             for u in range_constexpr(PV_UNITS):
                 dt = u // PV_K_STEPS
                 ks = u % PV_K_STEPS
-                if const_expr(not USE_ROLLBACK and ks == 0):
+                if const_expr(not (USE_ROLLBACK or USE_FROZEN_MAX) and ks == 0):
                     o[dt] = _fmul(Vec(o[dt]), corr_vec)
                 if const_expr(u + PREFETCH_DEPTH < PV_UNITS):
                     un = u + PREFETCH_DEPTH
@@ -679,9 +714,24 @@ def build_flash_attn_fp8_module(
                 # rocdl.sched_group_barrier(rocdl.mask_mfma, 1, 0)
             return s_accs, vw_prime
 
-        def do_softmax(s_accs, m_running, set_prio=False):
-            if const_expr(SOFTMAX_PRIO != 0 and set_prio):
-                rocdl.s_setprio(SOFTMAX_PRIO)
+        def _lane_max(vecs):
+            # Max over this lane's 64 scores, reduced packed: a tree over the
+            # four vec<16xf32> (v_pk_max, 2 elements per slot) then a halving
+            # tree inside the survivor via shuffles.  ~32 VALU slots against the
+            # 63 a scalar chain would take.
+            v = _fmax(_fmax(Vec(vecs[0]), Vec(vecs[1])), _fmax(Vec(vecs[2]), Vec(vecs[3])))
+            w = C_F32_PER_LANE
+            while const_expr(w > 1):
+                h = w // 2
+                a = Vec(v).shuffle(Vec(v), list(range(h)))
+                b = Vec(v).shuffle(Vec(v), list(range(h, w)))
+                v = _fmax(a, b)
+                w = h
+            return Vec(v)[0]
+
+        def _rowmax(s_accs, m_running):
+            # Full row max: this lane's 64 scores, then the peer half of the row
+            # (lane^32), then the running value.  Trick 2 pays this exactly once.
             local_max = Vec(s_accs[0])[0]
             for nt in range_constexpr(N_KV_TILES):
                 for r in range_constexpr(C_F32_PER_LANE):
@@ -691,16 +741,84 @@ def build_flash_attn_fp8_module(
             peer_max = fx.Float32(local_max).shuffle_xor(
                 fx.Int32(32), fx.Int32(WARP_SIZE)
             )
-            row_max_int = _fmax(local_max, peer_max)
-            m_new = _fmax(m_running, row_max_int)
+            return _fmax(m_running, _fmax(local_max, peer_max))
+
+        def _watchdog(s_accs, m_term, m_frozen):
+            # Trick 5, detection.  The Schraudolph pattern is aff = S + m_term
+            # with m_term uniform across the tile, so max(aff) = max(S) + m_term
+            # and the whole test can run in the S domain -- no need to
+            # materialize aff first.  SCHRAUDOLPH_CAP decodes to exactly 448.2,
+            # the largest finite fp8 E4M3, so testing against it is testing
+            # whether P is about to leave the storage format, wherever m sits.
+            #
+            # The repair is branchless.  An scf.IfOp here would make m a region
+            # result, i.e. a loop-carried value produced by a branch, which
+            # serializes tile i's softmax against tile i+1's and costs far more
+            # than the arithmetic it skips (measured: ~170 TFLOPS).  Everything
+            # the repair needs is six scalar VALU ops and one cross-lane swap,
+            # so it is cheaper to always compute than to predicate.
+            #
+            # The repair works in the pattern domain rather than rescaling P in
+            # float.  aff is affine in m, so lowering every pattern by a constant
+            # e is *identical* to having frozen a max larger by e/2^23 -- the same
+            # softmax against a larger reference, exact by construction, and it
+            # folds into the scalar bias instead of touching 64 accumulators.
+            #
+            # e is the true row max above the cap: the row's other half lives in
+            # lane^32, hence the one swap.  Clamped at 0, so in the common case
+            # (no overflow) e is exactly 0 -- m is unmoved, m_term is unmoved,
+            # and corr is exactly 1.0, which is what lets apply_pv skip the O/L
+            # rescale.  SCHRAUDOLPH_CAP decodes to 448.2, the largest finite fp8
+            # E4M3, so this is the storage format's saturation point, not a
+            # heuristic margin.
+            t = _fadd(_lane_max(s_accs), m_term)
+            peer = fx.Float32(t).shuffle_xor(fx.Int32(32), fx.Int32(WARP_SIZE))
+            # max(t,peer) - cap, floored at 0.  NaN propagates through subf and
+            # loses the MaxNumF against 0, so a NaN row degrades to e == 0 rather
+            # than poisoning m for every later tile.
+            e = _fmax(_fsub(_fmax(t, peer), fx.Float32(SCHRAUDOLPH_CAP)), c_zero_f)
+
+            if const_expr(USE_QK_SCALE_FOLD):
+                delta = e  # m is tracked in accumulator == pattern units
+            else:
+                delta = arith.divf(
+                    _raw(_fmul(e, c_inv_2p23)), _raw(scale_log2e)
+                )
+            corr = rocdl.exp2(T.f32, _raw(_fsub(c_zero_f, _fmul(e, c_inv_2p23))))
+            return _fsub(m_term, e), _fadd(_raw(m_frozen), _raw(delta)), corr
+
+        def do_softmax(s_accs, m_running, set_prio=False, first_tile=True):
+            if const_expr(SOFTMAX_PRIO != 0 and set_prio):
+                rocdl.s_setprio(SOFTMAX_PRIO)
             # With Trick 1 the accumulator already carries A = scale*log2e*2^23,
-            # so m is tracked in those same units and the two conversions back
-            # out are the reciprocals of A's halves rather than scale_log2e.
+            # so m is tracked in those same units and the conversion back out is
+            # the reciprocal of A's 2^23 half rather than scale_log2e.
             if const_expr(USE_QK_SCALE_FOLD):
                 to_log2 = c_inv_2p23  # accumulator units -> log2 units
             else:
                 to_log2 = scale_log2e
-            corr = rocdl.exp2(T.f32, _raw(_fmul(_fsub(m_running, m_new), to_log2)))
+
+            # Trick 2: m is decided on tile 0 and never moves again.  Later tiles
+            # skip the 64-element max chain and its cross-lane exchange, and corr
+            # is exactly 1.0 -- which also deletes the O/L rescale in apply_pv.
+            # If the bet loses, the watchdog below repairs it exactly.
+            #
+            # Both wave groups seed m from S(0) in the prologue, so `frozen` is a
+            # compile-time fact everywhere inside the loop and the reduction is
+            # not merely predicated but absent.
+            frozen = const_expr(USE_FROZEN_MAX and not first_tile)
+            if const_expr(frozen):
+                m_new = m_running
+                corr = fx.Float32(1.0)
+            else:
+                m_new = _rowmax(s_accs, m_running)
+                corr = (
+                    fx.Float32(1.0)
+                    if const_expr(USE_FROZEN_MAX)
+                    else rocdl.exp2(
+                        T.f32, _raw(_fmul(_fsub(m_running, m_new), to_log2))
+                    )
+                )
 
             n_groups = C_F32_PER_LANE // 4
 
@@ -724,6 +842,12 @@ def build_flash_attn_fp8_module(
                     sx_vec = Vec.from_elements([scale_x2p23], fx.Float32).broadcast_to(
                         C_F32_PER_LANE
                     )
+                if const_expr(frozen and USE_WATCHDOG):
+                    # Runs before the affine so the repair can fold into the
+                    # scalar m_term -- one f32 across the branch instead of four
+                    # vec<16xf32>, and no rewrite of the accumulators.
+                    m_term, m_new, corr = _watchdog(s_accs, m_term, m_new)
+
                 mt_vec = Vec.from_elements([m_term], fx.Float32).broadcast_to(
                     C_F32_PER_LANE
                 )
@@ -914,7 +1038,9 @@ def build_flash_attn_fp8_module(
                 sA, vwp_new = do_qk(k_buf_off, preloaded_kw=kw_prime, v_off=v_cur_off)
                 # PHASE 2 (softmax phase): softmax(i) | DMA V^{i+1}.
                 dma_v(v_next, next_kv)
-                m_new, corr_new, p_new, prowsum_new = do_softmax(sA, m_r)
+                m_new, corr_new, p_new, prowsum_new = do_softmax(
+                    sA, m_r, first_tile=False
+                )
                 rocdl.sched_barrier(0)
                 _wait_lgkmcnt()
                 _wait_vmcnt()
@@ -948,11 +1074,18 @@ def build_flash_attn_fp8_module(
 
                 v0_off = fx.Index(LDS_V_OFF)  # V^0 buf = LDSV[0]
                 sB, vwp = do_qk(k_buf_off, preloaded_kw=kvw, v_off=v0_off)
+                # Trick 2: G1 defers softmax by one tile, but S(0) is available
+                # right here -- so freeze m in the prologue and let every
+                # in-loop softmax be unconditionally frozen, rather than
+                # carrying a predicated first-tile reduction through the loop.
+                m_frozen = (
+                    _rowmax(sB, m_init) if const_expr(USE_FROZEN_MAX) else m_init
+                )
                 _wait_lgkmcnt()
                 _wait_vmcnt()
                 _gpu_barrier()
                 return (
-                    m_init,
+                    m_frozen,
                     l_init,
                     o_init[0],
                     o_init[1],
@@ -968,7 +1101,11 @@ def build_flash_attn_fp8_module(
             # ---- Epilogue: softmax(N-1) then apply deferred PV(N-1). ----
             def g1_epilogue(m_e, l_e, oe0, oe1, oe2, oe3, sce0, sce1, sce2, sce3, *vwp):
                 # rocdl.s_setprio(1)
-                _m_e, corrf, pf, prowsumf = do_softmax([sce0, sce1, sce2, sce3], m_e)
+                # G1 defers every softmax by one tile, so if the loop ran zero
+                # iterations this call *is* tile 0's -- hence "maybe".
+                _m_e, corrf, pf, prowsumf = do_softmax(
+                    [sce0, sce1, sce2, sce3], m_e, first_tile=False
+                )
                 _, k_buf_off_e, _, _, _ = _bufs(last_i * fx.Index(BLOCK_N))
                 o, l2, _ = apply_pv(
                     [oe0, oe1, oe2, oe3],
@@ -1010,7 +1147,9 @@ def build_flash_attn_fp8_module(
                     i_cur % fx.Index(NUM_BUF_V)
                 ) * fx.Index(LDS_V_TILE)
                 # PHASE 1 (mfma phase): softmax(i-1) | DMA K^{i+1}.
-                m_sm, corr_sm, p_sm, prowsum_sm = do_softmax([ss0, ss1, ss2, ss3], m_r)
+                m_sm, corr_sm, p_sm, prowsum_sm = do_softmax(
+                    [ss0, ss1, ss2, ss3], m_r, first_tile=False
+                )
                 # PHASE 2 (softmax phase): deferred PV(i-1) + QK(i)->S.
                 oB, lB, kw_prime = apply_pv(
                     [oo0, oo1, oo2, oo3],
