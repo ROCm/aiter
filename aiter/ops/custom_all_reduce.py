@@ -134,6 +134,7 @@ def fused_allreduce_rmsnorm_quant_per_group(
     reg_bytes: int,
     use_1stage: bool,
     bf16_out_ptr: int = 0,
+    transpose_scale: bool = False,
 ) -> None: ...
 
 
@@ -224,6 +225,10 @@ def register_graph_buffers(
 
 @compile_ops("module_custom_all_reduce", develop=True)
 def allocate_meta_buffer(size: int) -> int: ...
+
+
+@compile_ops("module_custom_all_reduce", develop=True)
+def allocate_data_buffer(size: int) -> int: ...
 
 
 @compile_ops("module_custom_all_reduce", develop=True)
@@ -371,7 +376,7 @@ def end_sync_latency_gfx1250(_fa: int, blocks: int) -> None: ...
 def two_sync_latency_gfx1250(_fa: int, blocks: int) -> None: ...
 
 
-@compile_ops(FUSED_AR_MHC_MD_NAME)
+@compile_ops(FUSED_AR_MHC_MD_NAME, develop=True)
 def fused_allreduce_mhc_post_only(
     _fa: int,
     inp: torch.Tensor,
@@ -386,7 +391,7 @@ def fused_allreduce_mhc_post_only(
 ) -> None: ...
 
 
-@compile_ops(FUSED_AR_MHC_MD_NAME)
+@compile_ops(FUSED_AR_MHC_MD_NAME, develop=True)
 def fused_allreduce_mhc_post_one_stage(
     _fa: int,
     inp: torch.Tensor,
@@ -401,7 +406,7 @@ def fused_allreduce_mhc_post_one_stage(
 ) -> None: ...
 
 
-@compile_ops(FUSED_AR_MHC_MD_NAME)
+@compile_ops(FUSED_AR_MHC_MD_NAME, develop=True)
 def fused_allreduce_mhc_post_split(
     _fa: int,
     inp: torch.Tensor,

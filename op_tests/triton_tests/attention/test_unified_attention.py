@@ -180,7 +180,6 @@ def generate_data(
     )
     query_scales = None
     if q_dtype == torch.uint8:
-        # NVFP4 query: the kernel consumes packed fp4 + scales, the reference uses e4m3.
         query = query / 10
         maybe_quant_query = query.view(-1, head_size)
         maybe_quant_query, query_scales = torch_dynamic_mxfp4_quant(
@@ -204,7 +203,6 @@ def generate_data(
     )
     value_cache = torch.randn_like(key_cache)
     if kv_dtype == torch.uint8:
-        # NVFP4 KV cache: kernel consumes packed+shuffled cache, reference uses e4m3.
         key_cache_orig = key_cache.to(e4m3_dtype)
         value_cache_orig = value_cache.to(e4m3_dtype)
         key_cache, value_cache = dynamic_nvfp4_quant_kv_cache(
@@ -384,9 +382,8 @@ def ref_paged_attn(
         (torch.bfloat16, e4m3_dtype, torch.bfloat16, 128, False),
         (e4m3_dtype, e4m3_dtype, torch.bfloat16, 128, False),
         (e4m3_dtype, e4m3_dtype, e4m3_dtype, 128, True),
-        # skip NVFP4 KV cache for now as ds_load_tr4 is not yet supported
-        # (e4m3_dtype, torch.uint8, torch.bfloat16, 128, False),
-        # (torch.uint8, torch.uint8, torch.bfloat16, 128, False),
+        (e4m3_dtype, torch.uint8, torch.bfloat16, 128, False),
+        (torch.uint8, torch.uint8, torch.bfloat16, 128, False),
     ],
 )
 @pytest.mark.parametrize("soft_cap", [None])
@@ -556,7 +553,7 @@ def test_triton_unified_attn_3d(
     ],
 )
 @pytest.mark.parametrize("num_heads", [(8, 8), (8, 1)])
-@pytest.mark.parametrize("head_size", [64, 128])
+@pytest.mark.parametrize("head_size", [64, 128, 256, 512])
 @pytest.mark.parametrize("block_size", [16, 64])
 @pytest.mark.parametrize("sliding_window", [None, 256])
 @pytest.mark.parametrize(

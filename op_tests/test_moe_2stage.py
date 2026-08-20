@@ -6,14 +6,14 @@ import gc
 import itertools
 import logging
 import os
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
 
 import pandas as pd
 import torch
 
 import aiter
 from aiter import dtypes
-from aiter.aot.flydsl.common import run_only_env
+from aiter.aot.flydsl.common import override_env, run_only_env
 from aiter.fused_moe import (
     fused_moe,
     fused_topk,
@@ -98,7 +98,6 @@ def test_fmoe(
     linear_beta=None,
     kernel_bench=False,
     disable_stage2_bias=False,
-    reference_intermediate_pad=0,
     ref_dtype="bf16",
 ):
     if get_gfx() not in ["gfx950"] and qType in [aiter.QuantType.per_1x32]:
@@ -230,9 +229,7 @@ def test_fmoe(
     # a16w4 by the caller but dispatched as a8w4 on gfx950.
     reference_aq_dtype = AQDType
     if actType == aiter.ActivationType.Situv2:
-        runtime_aq_dtype = _runtime_situv2_mxfp4_q_dtype_a(
-            token, gateMode, qType, WQDType
-        )
+        runtime_aq_dtype = _runtime_situv2_mxfp4_q_dtype_a(qType, WQDType)
         if runtime_aq_dtype is not None:
             reference_aq_dtype = runtime_aq_dtype
 
@@ -269,9 +266,19 @@ def test_fmoe(
     # bias dtype convert
     if (
         qType == aiter.QuantType.per_1x32
+        and reference_aq_dtype == dtypes.bf16
+        and WQDType == dtypes.fp4x2
+        and actType == aiter.ActivationType.Situv2
+    ):  # a16w4 SiTUv2: served by the ported FlyDSL kernel (no per-expert bias).
+        # Key on reference_aq_dtype (runtime dispatch), not the declared AQDType:
+        # a SiTUv2 case declared a8w4/a4w4 still runs as a16w4 without the env opt-in.
+        exp_bias1 = exp_bias2 = None
+        exp_bias1_aiter = exp_bias2_aiter = None
+    elif (
+        qType == aiter.QuantType.per_1x32
         and (AQDType in [dtypes.bf16, dtypes.fp16, dtypes.fp8])
         and (WQDType == dtypes.fp4x2)
-    ):  # a16w4
+    ):  # a8w4 (fp8 A) mxfp4
         exp_bias1_aiter = None if exp_bias1 is None else exp_bias1.to(dtypes.fp32)
         exp_bias2_aiter = None if exp_bias2 is None else exp_bias2.to(dtypes.fp32)
     elif (
@@ -324,8 +331,11 @@ def test_fmoe(
         and (AQDType in [dtypes.bf16, dtypes.fp16, dtypes.fp8])
         and (WQDType == dtypes.fp4x2)
     ):  # a16w4 / a8w4
-        w1_qt_aiter = shuffle_weight_a16w4(w1_qt_aiter, 16, True)
-        w1_scale_aiter = shuffle_scale_a16w4(w1_scale, E, True)
+        # a16w4 (bf16/fp16 act) uses standard GGUU (gate_up=False), matching main;
+        # a8w4 (fp8 act) keeps the gate/up-interleaved GUGU (gate_up=True).
+        _w1_gu = AQDType == dtypes.fp8
+        w1_qt_aiter = shuffle_weight_a16w4(w1_qt_aiter, 16, _w1_gu)
+        w1_scale_aiter = shuffle_scale_a16w4(w1_scale, E, _w1_gu)
         w2_qt_aiter = shuffle_weight_a16w4(w2_qt_aiter, 16, False)
         w2_scale_aiter = shuffle_scale_a16w4(w2_scale, E, False)
     elif is_mxfp8:  # mxfp8 (a8w8): gate-up interleaved fp8 weight + e8m0 scale
@@ -435,27 +445,15 @@ def test_fmoe(
         a2_qt, a2_scale = torch_quant(out1_ref, quant_dtype=AQDType)
     a2_qt = a2_qt.view(token, topk, -1)
 
-    ref_a2_qt = a2_qt
-    ref_w2_qt = w2_qt
-    ref_w2_scale = w2_scale
-    if reference_intermediate_pad:
-        effective_inter_dim = inter_dim - int(reference_intermediate_pad)
-        ref_a2_qt = a2_qt[..., :effective_inter_dim].contiguous()
-        if qType == aiter.QuantType.per_1x32 and WQDType == dtypes.fp4x2:
-            ref_w2_qt = w2_qt[..., : effective_inter_dim // 2].contiguous()
-            ref_w2_scale = w2_scale[..., : effective_inter_dim // 32].contiguous()
-        else:
-            ref_w2_qt = w2_qt[..., :effective_inter_dim].contiguous()
-
     out2_ref = torch_moe_stage2(
-        ref_a2_qt,
+        a2_qt,
         w1_qt,  # E, inter_dim*2, model_dim
-        ref_w2_qt,  # E, model_dim, inter_dim
+        w2_qt,  # E, model_dim, inter_dim
         topk_weights,
         topk_ids,
         dtype=dtype,
         quant_type=qType,
-        w2_scale=ref_w2_scale,
+        w2_scale=w2_scale,
         a2_scale=a2_scale,
         w2_bias=exp_bias2,
         doweight=not doweight_stage1,
@@ -714,7 +712,7 @@ parser.add_argument(
 parser.add_argument(
     "--no-flydsl-csv",
     action="store_true",
-    help="Skip validating flydsl shapes from tuned fmoe CSVs.",
+    help="Skip validating FlyDSL/Opus shapes from tuned fmoe CSVs.",
 )
 parser.add_argument(
     "--csv-filter",
@@ -727,6 +725,11 @@ parser.add_argument(
     "--no-legacy",
     action="store_true",
     help="Skip the original hardcoded shape sweep and skinny tests.",
+)
+parser.add_argument(
+    "--bm16-scale-boundary",
+    action="store_true",
+    help="Run only the deterministic BM16 tiled-scale boundary regression.",
 )
 parser.add_argument(
     "--swiglu-limit",
@@ -747,11 +750,6 @@ parser.add_argument(
     default=None,
     help="SiTUv2 up (linear) scale param (linear_beta). Default None -> 1.0. "
     "Only affects SiTUv2.",
-)
-parser.add_argument(
-    "--no-situv2",
-    action="store_true",
-    help="Skip the default SiTUv2 (per_1x32 fp4/fp8) FlyDSL cases.",
 )
 parser.add_argument(
     "--kernel",
@@ -813,21 +811,6 @@ def _row_to_kwargs(row):
     wq_dtype = _str2dtype(row["q_dtype_w"])
     act_type = _str2enum(row["act_type"], aiter.ActivationType)
     inter_dim = int(row["inter_dim"])
-    reference_intermediate_pad = 0
-    kernel_name2 = str(row.get("kernelName2", "") or "")
-    if kernel_name2.startswith("opus_"):
-        from aiter.ops.opus.moe_stage2_a8w4_meta import (
-            opus_a8w4_shape_family_for_shape,
-        )
-
-        shape_family = opus_a8w4_shape_family_for_shape(
-            model_dim=int(row["model_dim"]),
-            inter_dim=inter_dim,
-            expert=int(row["expert"]),
-            topk=int(row["topk"]),
-        )
-        if shape_family is not None:
-            reference_intermediate_pad = int(shape_family.inter_dim_pad)
     # Tuned CSV rows do not carry gate mode explicitly. Infer the runtime mode
     # from the selected activation/weight dtype layout used by fused_moe.
     gate_mode = _effective_gate_mode(aq_dtype, wq_dtype)
@@ -848,7 +831,6 @@ def _row_to_kwargs(row):
         "hidden_pad": 0,
         "intermediate_pad": 0,
         "preshuffle": True,
-        "reference_intermediate_pad": reference_intermediate_pad,
         "swiglu_limit": _effective_swiglu_limit(
             q_type, aq_dtype, wq_dtype, args.swiglu_limit
         ),
@@ -856,7 +838,7 @@ def _row_to_kwargs(row):
 
 
 def _iter_csv_cases():
-    """Yield (kwargs, extras) for every row of every selected model csv."""
+    """Yield FlyDSL/Opus cases from every selected model CSV."""
     cu = get_cu_num()
     merged_csv = AITER_CONFIGS.AITER_CONFIG_FMOE_FILE
     df_csv = pd.read_csv(merged_csv)
@@ -867,7 +849,11 @@ def _iter_csv_cases():
             continue
         kernel_name1 = str(row.get("kernelName1", "") or "")
         kernel_name2 = str(row.get("kernelName2", "") or "")
-        if "flydsl_" not in kernel_name1 and "flydsl_" not in kernel_name2:
+        if (
+            "flydsl_" not in kernel_name1
+            and "flydsl_" not in kernel_name2
+            and not kernel_name1.startswith("opus_moe1_")
+        ):
             continue
         if args.csv_filter:
             _kn = kernel_name1 + " " + kernel_name2
@@ -884,33 +870,52 @@ def _iter_csv_cases():
                 e,
             )
             continue
+        if kwargs["actType"] == aiter.ActivationType.Situv2:
+            kwargs["beta"] = 4.0 if args.beta is None else float(args.beta)
+            kwargs["linear_beta"] = (
+                25.0 if args.linear_beta is None else float(args.linear_beta)
+            )
         # The reference path below uses the CSV q_dtype_a directly, while
-        # fused_moe selects q_dtype_a from the current Swiglu MXFP4 runtime mode.
-        # Skip CSV rows that are tuned for a different mode to avoid comparing
-        # e.g. an fp4x2 reference against a bf16/fp8 runtime dispatch.
-        expected_aq_dtype = _runtime_swiglu_mxfp4_q_dtype_a(
-            kwargs["token"],
-            kwargs["actType"],
-            kwargs["gateMode"],
-            kwargs["qType"],
-            kwargs["AQDType"],
-            kwargs["WQDType"],
-        )
+        # fused_moe selects q_dtype_a from the current runtime mode. Skip CSV
+        # rows tuned for a different mode (e.g. a4w4/a8w4 without the opt-in env).
+        if kwargs["actType"] == aiter.ActivationType.Situv2:
+            expected_aq_dtype = _runtime_situv2_mxfp4_q_dtype_a(
+                kwargs["qType"], kwargs["WQDType"]
+            )
+            runtime_mode = "SiTUv2 MXFP4"
+            # SiTUv2 a16w4 never ran before this ordering fix and every row
+            # fails: _effective_gate_mode asks for INTERLEAVE while stage1 binds
+            # gate_mode="separated" for non-fp8 activations.
+            if kwargs["AQDType"] == dtypes.bf16 and kwargs["WQDType"] == dtypes.fp4x2:
+                continue
+        else:
+            expected_aq_dtype = _runtime_swiglu_mxfp4_q_dtype_a(
+                kwargs["token"],
+                kwargs["actType"],
+                kwargs["gateMode"],
+                kwargs["qType"],
+                kwargs["AQDType"],
+                kwargs["WQDType"],
+            )
+            runtime_mode = "Swiglu MXFP4"
         if expected_aq_dtype is not None and kwargs["AQDType"] != expected_aq_dtype:
             aiter.logger.info(
                 "skip row token=%s dim=(%s,%s): q_dtype_a=%s does not match "
-                "current Swiglu MXFP4 runtime mode (expected %s)",
+                "current %s runtime mode (expected %s)",
                 row.get("token"),
                 row.get("model_dim"),
                 row.get("inter_dim"),
                 kwargs["AQDType"],
+                runtime_mode,
                 expected_aq_dtype,
             )
             continue
         kwargs["strict_accuracy"] = True
-        # In targeted --csv-filter validation runs, skip the AOT-cache gate (new
-        # configs have no pre-registered AOT cache entry).
-        kwargs["check_aot_cache"] = args.csv_filter is None
+        # Targeted configs and env-selected SiTUv2 modes have no pre-registered
+        # AOT cache entry, so let those cases compile on demand.
+        kwargs["check_aot_cache"] = (
+            args.csv_filter is None and kwargs["actType"] != aiter.ActivationType.Situv2
+        )
         kwargs["disable_stage2_bias"] = kernel_name2.startswith("opus_")
         yield kwargs, {
             "kernelName1": kernel_name1,
@@ -938,10 +943,15 @@ def _situv2_beta_kwargs(act_type):
 
 
 def _effective_gate_mode(aq_dtype, wq_dtype):
-    # a16w4/a8w4 mxfp4 weights run the gate/up-interleaved (guinterleave) layout,
+    # a16w4 (bf16 A x mxfp4 W) SiTUv2 is served by the ported FlyDSL kernel via
+    # fused_moe_'s SEPARATED dispatch; keep it in SEPARATED (bf16 activation) so
+    # the abf16_wfp4 rows exercise that kernel instead of downgrading to a8w4/fp8.
+    if aq_dtype == dtypes.bf16 and wq_dtype == dtypes.fp4x2:
+        return GateMode.SEPARATED.value
+    # a8w4 mxfp4 weights run the gate/up-interleaved (guinterleave) layout,
     # matching serving's ATOM_MOE_GU_ITLV=1. gate_mode is a runtime weight-layout
     # property (not a tuned-config key); request INTERLEAVE here for them.
-    if aq_dtype in [dtypes.fp8, dtypes.bf16] and wq_dtype == dtypes.fp4x2:
+    if aq_dtype == dtypes.fp8 and wq_dtype == dtypes.fp4x2:
         return GateMode.INTERLEAVE.value
     # mxfp8 (a8w8) uses the gate-up interleave stage1 path as well.
     if aq_dtype == dtypes.fp8 and wq_dtype == dtypes.fp8:
@@ -955,7 +965,7 @@ def _effective_swiglu_limit(quant_type, aq_dtype, wq_dtype, swiglu_limit):
     return None
 
 
-def _runtime_situv2_mxfp4_q_dtype_a(token, gate_mode, q_type, wq_dtype):
+def _runtime_situv2_mxfp4_q_dtype_a(q_type, wq_dtype):
     """Mirror fused_moe's SiTUv2 MXFP4 activation-dtype routing."""
     if q_type != aiter.QuantType.per_1x32 or wq_dtype != dtypes.fp4x2:
         return None
@@ -967,13 +977,15 @@ def _runtime_situv2_mxfp4_q_dtype_a(token, gate_mode, q_type, wq_dtype):
             else dtypes.fp4x2
         )
 
-    if GateMode(gate_mode) == GateMode.INTERLEAVE:
-        bound = int(os.environ.get("AITER_BF16_FP8_MOE_BOUND", "256"))
-        return dtypes.bf16 if get_gfx() != "gfx950" or token < bound else dtypes.fp8
-
-    return (
-        dtypes.fp8 if os.environ.get("AITER_SITUV2_A8W4", "0") == "1" else dtypes.bf16
-    )
+    # fused_moe tests SiTUv2 ahead of the Swiglu/INTERLEAVE branch, so gate mode
+    # and token count do not enter into it -- mirror that order here, otherwise
+    # a4w4/a8w4 rows are skipped as "mode mismatch" under gate_mode=INTERLEAVE
+    # and the opt-in paths go untested.
+    if os.environ.get("AITER_SITUV2_A8W4", "0") == "1":
+        return dtypes.fp8
+    if os.environ.get("AITER_SITUV2_A4W4", "0") == "1":
+        return dtypes.fp4x2
+    return dtypes.bf16
 
 
 def _runtime_swiglu_mxfp4_q_dtype_a(
@@ -1132,70 +1144,103 @@ def _iter_legacy_cases():
                     ), extras
 
 
-def _iter_situv2_default_cases():
-    """Yield (kwargs, extras) exercising the SiTUv2 activation by default.
+def test_bm16_tiled_scale_boundary():
+    """Validate tuned BM16 dispatch and the 33-row scale boundary."""
+    if get_gfx() != "gfx950":
+        aiter.logger.info("skip BM16 tiled-scale boundary test on %s", get_gfx())
+        return
 
-    SiTUv2 only routes to the FlyDSL MXFP4 kernel for per_1x32 + fp4/fp8, so we
-    hardcode the supported quant family instead of relying on the -a list:
-      * a8w4 (fp8 activation, fp4 weight) at a 256-aligned inter_dim shape
-    beta / linear_beta come from --beta / --linear-beta (None -> kernel 1.0).
-    Non-gfx950 runs are skipped inside test_fmoe's per_1x32 gfx guard.
+    from aiter.ops.flydsl.moe_kernels import get_flydsl_kernel_params
 
-    Notes on cases intentionally kept out of this DEFAULT auto-run:
-      * The real DSV4 customer shape uses inter_dim=640, which is not 256-aligned.
-        shuffle_scale_a16w4 requires inter_dim % 256 == 0 on this branch; the
-        non-256 inter_dim fix lives on fix/shuffle-scale-a16w4-kdim. Verify the
-        640 shape once that branch is combined with this one. We default to a
-        256-aligned inter_dim (512) here so the a8w4 case runs on this branch.
-      * a4w4 (fp4 act, fp4 weight) full 2-stage is omitted because CK stage2
-        codegen (gen_instances.py) has no 'situv2' activation instance
-        (only silu/gelu), so the full a4w4 2-stage path can't be built here.
-        -a situv2 -q 4 remains reachable via explicit CLI.
-    """
-    extras = {"model": "situv2"}
-    dtype = args.dtype[0]
-    model_dim = 3072
-    tokens = [16, 128]
-    # ((quant_type, aq_dtype, wq_dtype), inter_dim)
-    situv2_cases = [
-        (_PER1X32_FP8_FP4, 512),  # a8w4: fp8 act, fp4 weight (256-aligned inter_dim)
-    ]
-    for (quant_type, aq_dtype, wq_dtype), inter_dim in situv2_cases:
-        for m in tokens:
-            yield {
-                "dtype": dtype,
-                "token": m,
-                "model_dim": model_dim,
-                "inter_dim": inter_dim,
-                "E": args.expert,
-                "topk": args.topk,
-                "actType": aiter.ActivationType.Situv2,
-                "gateMode": _effective_gate_mode(aq_dtype, wq_dtype),
-                "qType": quant_type,
-                "AQDType": aq_dtype,
-                "WQDType": wq_dtype,
-                "use_g1u1": True,
-                "doweight_stage1": False,
-                "strict_accuracy": False,
-                "check_aot_cache": False,
-                "swiglu_limit": None,
-                "beta": args.beta,
-                "linear_beta": args.linear_beta,
-            }, extras
+    expected_kernels = (
+        "flydsl_moe1_afp8_wfp4_bf16_t16x128x256_w3_gui_fp8",
+        "flydsl_moe2_afp8_wfp4_bf16_t16x256x256_atomic",
+    )
+    for token in (32, 64):
+        metadata = get_2stage_cfgs(
+            get_padded_M(token),
+            7168,
+            512,
+            385,
+            7,
+            torch.bfloat16,
+            dtypes.fp8,
+            dtypes.fp4x2,
+            aiter.QuantType.per_1x32,
+            True,
+            aiter.ActivationType.Silu,
+            False,
+            0,
+            0,
+            True,
+            GateMode.INTERLEAVE.value,
+        )
+        assert metadata.block_m == 16
+        stages = (metadata.stage1, metadata.stage2)
+        kernel_names = tuple(stage.keywords["kernelName"] for stage in stages)
+        assert kernel_names == expected_kernels
+        stage1_params = get_flydsl_kernel_params(kernel_names[0])
+        stage2_params = get_flydsl_kernel_params(kernel_names[1])
+        assert stage1_params is not None
+        assert stage2_params is not None
+        assert stage1_params["tile_m"] == 16
+        assert stage1_params["waves_per_eu"] == 3
+        assert stage2_params["tile_m"] == 16
+        assert stage2_params["tile_n"] == 256
+        assert stage2_params.get("xcd_swizzle", 0) == 0
+
+    old_moe_bound = os.environ.get("AITER_BF16_FP8_MOE_BOUND")
+    os.environ["AITER_BF16_FP8_MOE_BOUND"] = "0"
+    torch.manual_seed(0)
+    try:
+        test_fmoe(
+            dtype=torch.bfloat16,
+            token=33,
+            model_dim=7168,
+            inter_dim=512,
+            E=385,
+            topk=7,
+            actType=aiter.ActivationType.Silu,
+            gateMode=GateMode.INTERLEAVE.value,
+            qType=aiter.QuantType.per_1x32,
+            AQDType=dtypes.fp8,
+            WQDType=dtypes.fp4x2,
+            use_g1u1=True,
+            strict_accuracy=True,
+            check_aot_cache=False,
+        )
+    finally:
+        if old_moe_bound is None:
+            os.environ.pop("AITER_BF16_FP8_MOE_BOUND", None)
+        else:
+            os.environ["AITER_BF16_FP8_MOE_BOUND"] = old_moe_bound
 
 
 # ---------------------------------------------------------------------------
 # Run
 # ---------------------------------------------------------------------------
+def _iter_with_env(case_iter, **env_overrides):
+    """Keep temporary environment overrides active while cases are consumed."""
+    with ExitStack() as stack:
+        for name, value in env_overrides.items():
+            stack.enter_context(override_env(name, value))
+        yield from case_iter
+
+
 _case_iters = []
-if not args.no_flydsl_csv:
-    _case_iters.append(_iter_csv_cases())
-if not args.no_legacy:
-    _case_iters.append(_iter_legacy_cases())
-# SiTUv2 default coverage runs only in a full default sweep (no explicit -q),
-# so an explicit quant selection is never silently overridden.
-if not args.no_situv2 and args.quant is None:
-    _case_iters.append(_iter_situv2_default_cases())
+if args.bm16_scale_boundary:
+    test_bm16_tiled_scale_boundary()
+else:
+    if not args.no_flydsl_csv:
+        _case_iters.append(
+            _iter_with_env(
+                _iter_csv_cases(),
+                AITER_SITUV2_A8W4="1",
+                AITER_SITUV2_A4W4=None,
+            )
+        )
+    if not args.no_legacy:
+        _case_iters.append(_iter_legacy_cases())
 case_iter = itertools.chain(*_case_iters)
 
 _csv_out = os.environ.get("AITER_TUNED_OP_BENCH_CSV", "tuned_op_bench.csv")
