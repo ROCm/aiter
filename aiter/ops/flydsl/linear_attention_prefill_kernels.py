@@ -730,12 +730,13 @@ def _tuned_bv(
 ) -> int | None:
     """Measured BV for this batch shape, or None to use the rule.
 
-    Lookup requires an exact ``(gfx, cu_num, shape)`` match so binned SKUs
-    (e.g. MI308X with cu_num=80) do not reuse rows tuned on MI300X (304).
+    Lookup requires an exact ``(gfx, cu_num, shape)`` match on the current GPU,
+    same as MoE tuned-config lookup. Binned SKUs (e.g. MI308X cu_num=80) never
+    reuse rows tuned on a sibling card (e.g. MI300X cu_num=304).
     """
     if not _BV_TUNED_TABLE:
         return None
-    from aiter.jit.utils.chip_info import get_cu_num
+    from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
 
     shape_key = (
         H,
@@ -749,12 +750,9 @@ def _tuned_bv(
         total_chunks,
         max_seq_chunks,
     )
-    cu_num = get_cu_num()
-    for arch in dict.fromkeys((_GFX_ARCH, "gfx942", "gfx950")):
-        hit = _BV_TUNED_TABLE.get((arch, cu_num, *shape_key))
-        if hit is not None:
-            return hit
-    return None
+    return _BV_TUNED_TABLE.get(
+        (get_gfx_runtime(), get_cu_num(), *shape_key)
+    )
 
 
 _INT32_ATTR = "_flydsl_int32_view"
