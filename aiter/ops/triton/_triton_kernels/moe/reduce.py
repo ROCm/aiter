@@ -56,8 +56,11 @@ def _reduce_grouped(
         for i in tl.static_range(0, K):
             indxs = indxs + (tl.load(InIndx + start + i),)
     if HAS_INDX_VALID:
-        # Clamp masked slots to row 0 so the load stays in bounds; their value is
-        # discarded below. Cheaper than a branch and keeps the loop uniform.
+        # Clamp masked slots to row 0 so the pointer stays in bounds even on the
+        # path that skips the load. The skip itself is the point: under expert
+        # parallelism only ~n_local/n_global of a token's K slots are live (1.5 of
+        # 6 for DeepSeek-V4 at ep8), so loading every slot and zeroing it after
+        # issues 4x the row reads this kernel actually needs.
         valids = ()
         for i in tl.static_range(0, K):
             valids = valids + (tl.load(InIndxValid + start + i) != 0,)
@@ -77,23 +80,30 @@ def _reduce_grouped(
     # accumulate contributions for this tile
     for i in tl.static_range(0, K):
         curr = tl.zeros([BLOCK_N], dtype=tl.float32)
-        # iterate over split_k partial values
-        for b in tl.range(0, B):
-            if USE_TDM and EVEN_N:
-                row = b * M + indxs[i]
-                vals = tl.reshape(x_desc.load([row, pid_n * BLOCK_N]), (BLOCK_N,))
-            else:
-                x_row_ptr = XPtrs + indxs[i] * stride_xm + b * stride_xb
-                if EVEN_N:
-                    vals = tl.load(x_row_ptr)
+        # `valids[i]` comes from a scalar load, so it is CTA-uniform and this is a
+        # uniform branch, not a divergent one -- the whole workgroup skips the row
+        # together. A dead slot leaves `curr` at zero, which is what the
+        # `tl.where` used to produce after paying for the load.
+        if (not HAS_INDX_VALID) or valids[i]:
+            # iterate over split_k partial values
+            for b in tl.range(0, B):
+                if USE_TDM and EVEN_N:
+                    row = b * M + indxs[i]
+                    vals = tl.reshape(x_desc.load([row, pid_n * BLOCK_N]), (BLOCK_N,))
                 else:
-                    vals = tl.load(x_row_ptr, mask=x_n_mask, other=0.0)
-            vals = vals.to(tl.float32)
-            curr += vals
+                    x_row_ptr = XPtrs + indxs[i] * stride_xm + b * stride_xb
+                    if EVEN_N:
+                        vals = tl.load(x_row_ptr)
+                    else:
+                        vals = tl.load(x_row_ptr, mask=x_n_mask, other=0.0)
+                vals = vals.to(tl.float32)
+                curr += vals
 
         if HAS_INDX_VALID:
-            # Drop the clamped row's value. Done before the activation so a
-            # masked slot contributes exactly 0, not swiglu(0).
+            # Redundant now that the load is skipped -- kept because it also
+            # holds the invariant the activation below depends on: a masked slot
+            # must contribute exactly 0, not swiglu(0), which is not the same
+            # value once SWIGLU_ADD_RESIDUAL is on.
             curr = tl.where(valids[i], curr, 0.0)
 
         # apply nonlinearity to split-k output
