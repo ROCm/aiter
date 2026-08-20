@@ -23,6 +23,7 @@ import os
 import re
 import sys
 import time
+import warnings
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -381,7 +382,15 @@ def _resolve_archs(row_gfx: str | None) -> list[str]:
         archs = [a for a in archs if a.startswith("gfx")]
         if archs:
             return list(dict.fromkeys(archs))
-    return [_detected_arch() or _AOT_ARCH_DEFAULT]
+    detected = _detected_arch()
+    if detected:
+        return [detected]
+    warnings.warn(
+        "No gfx in CSV row and ARCH/GPU_ARCHS unset; GPU detection failed, "
+        f"defaulting compile arch to {_AOT_ARCH_DEFAULT!r}.",
+        stacklevel=2,
+    )
+    return [_AOT_ARCH_DEFAULT]
 
 
 def parse_csv_opt(csv_path: str) -> list[dict[str, Any]]:

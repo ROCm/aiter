@@ -700,6 +700,12 @@ def _load_tuned_bv_table() -> dict[tuple, int]:
     return table
 
 
+def reload_tuned_bv_table() -> None:
+    """Reload BV lookup after ``AITER_CONFIG_GDN_K5_OPT`` changes."""
+    global _BV_TUNED_TABLE
+    _BV_TUNED_TABLE = _load_tuned_bv_table()
+
+
 _BV_TUNED_TABLE = _load_tuned_bv_table()
 
 

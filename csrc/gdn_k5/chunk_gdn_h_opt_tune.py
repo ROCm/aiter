@@ -344,6 +344,13 @@ class K5BvTuner(TunerCommon):
         self._case_by_id: dict[str, Any] = {}
         self.run_config_failed = False
 
+    def _clear_op_caches(self):
+        from aiter.ops.flydsl import linear_attention_prefill_kernels as _op
+
+        _op.reload_tuned_bv_table()
+        _op._get_or_compile_opt.cache_clear()
+        _op._compiled_kernels.clear()
+
     def _setup_specific_arguments(self):
         self.parser.add_argument(
             "--case",
