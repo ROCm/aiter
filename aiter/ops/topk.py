@@ -691,8 +691,9 @@ def top_k_per_row_decode(
     stride0: int,
     stride1: int,
     k: int = 2048,
-    workspace: torch.Tensor | None = None,
     stable: bool = False,
+    *,
+    workspace: torch.Tensor | None = None,
 ) -> None:
     """Per-row top-k (decode), writing k indices per row.
 
@@ -715,6 +716,13 @@ def top_k_per_row_decode(
     a different size, and a layout it computes itself -- so a shape that falls
     back drops the caller's buffer and gets a freshly sized one rather than
     misreading it.
+
+    Keyword-only on purpose. ``stable`` has been the ninth positional parameter
+    since before a workspace existed, and the C++ entry orders it the other way
+    (k, workspace, stable), so admitting ``workspace`` positionally here would let
+    ``(..., k, True)`` bind True to the buffer and silently drop the stable
+    request -- on the HIP path, which ignores ``workspace`` entirely, with nothing
+    to raise on.
     """
     if not stable and _should_use_flydsl_decode(
         logits, next_n, numRows, stride0, stride1, k
