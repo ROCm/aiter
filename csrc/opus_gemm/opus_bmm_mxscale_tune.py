@@ -65,7 +65,7 @@ import torch
 
 from aiter import dtypes, logger
 from aiter.ops.opus.bmm_op import _opus_bmm_a8w8_mxscale_raw
-from aiter.ops.shuffle import shuffle_weight
+from aiter.ops.shuffle import shuffle_scale_a, shuffle_scale_b, shuffle_weight
 from aiter.utility.base_tuner import GemmCommonTuner, TunerCommon
 from aiter.utility.mp_tuner import mp_tuner
 
@@ -83,6 +83,7 @@ for _p in (_HERE, _OPTESTS):
 # table here does not pull in the build.
 from opus_gemm_common import (
     _BMM_MXSCALE_BPRESHUFFLE_BLDS_TWIN_OF,
+    _opus_sf_shuf_sub,
     a8w8_mxscale_bmm_kernel_lists,
 )
 from test_opus_a8w8_bmm import (
@@ -209,6 +210,12 @@ _TUNE_POLICY = {
     336: [1],
     338: [1],
     342: [1],
+    # bdirect_tilen (kid388/389/390): RETIRED from the pool, measured, not guessed
+    # -- 0 wins on 133 shapes, medians 1.289 / 1.068 / 1.256 against their plain
+    # twins. Leaving three known-slower kids in the dispatch pool only costs
+    # tuning time. The TILE_N_ traits parameter, the codegen tag and the kids
+    # themselves stay: they are inert and they are the harness if the T_M=1 grid
+    # is ever worth re-testing.
     # kid158's pipeline with only B's layout flipped -- the direct A/B comparison
     # for what preshuffling B is worth at the tile the shipped table leans on.
     196: [1],
@@ -364,6 +371,104 @@ assert not (set(_TUNE_POLICY) & set(_RELAYOUT_KIDS)), (
     "scale relayout and cannot be tuned against plain scales"
 )
 
+
+# ---------------------------------------------------------------------------
+# The shuffled twins, as an opt-in pool rather than as policy.
+# ---------------------------------------------------------------------------
+# The assert above guards the *shipped* table: a shuffled kid in _TUNE_POLICY
+# would be a dispatchable row no deployment can serve until a quantize kernel
+# emits shuffle_scale_a. _SHUF_POLICY is a separate dict reachable only through
+# the shuf* pools, which is the shape the answer has -- the switch is
+# all-or-nothing, so what is measured is one whole table against another.
+#
+# The twin is matched structurally rather than listed, on
+# (family, BLOCK_SIZE, tile, WG_PER_CU, xcd_wgm), so "same kernel, different
+# scale layout" is the definition rather than a hand-written list that can drift
+# (an earlier sweep had kid210 down as kid205's twin while it was still a
+# different sub). A shuffled kid whose plain twin is not a candidate is not one
+# either: if the plain tile cannot win the cell, its twin winning says nothing.
+def _plain_twin_key(inst):
+    # WG_PER_CU, not wg_per_cu. The lowercase field is the gfx1250 cluster-TDM
+    # co-residency knob and is the dataclass default (2) for every kid in this
+    # file, so keying on it is blind to occupancy and pairs a wg1 kid with a wg2
+    # one -- which is the one comparison this table exists to make.
+    return (
+        inst.kernel_tag,
+        inst.BLOCK_SIZE,
+        inst.B_M,
+        inst.B_N,
+        inst.B_K,
+        inst.WG_PER_CU,
+        inst.xcd_wgm,
+    )
+
+
+_PLAIN_BY_TILE = {}
+for _kid in _TUNE_POLICY:
+    _inst = _CODEGEN_BMM[_kid]
+    if _inst.needs_shuffle_scale is None and _inst.needs_mpacked_sfa is None:
+        _PLAIN_BY_TILE.setdefault(_plain_twin_key(_inst), _kid)
+
+# shuffled kid -> the plain kid it is the twin of. Both directions are used: the
+# twin supplies the splitK sweep, and reporting a shuf result next to its twin's
+# is the only comparison that isolates the layout.
+_SHUF_TWIN_OF = {}
+for _kid, _inst in _CODEGEN_BMM.items():
+    if _inst.needs_shuffle_scale is None:
+        continue
+    _plain = _PLAIN_BY_TILE.get(_plain_twin_key(_inst))
+    if _plain is not None:
+        _SHUF_TWIN_OF[_kid] = _plain
+
+_SHUF_POLICY = {kid: _TUNE_POLICY[plain] for kid, plain in _SHUF_TWIN_OF.items()}
+
+# What the tune loop iterates. _applicable is what decides which pool sees which,
+# so a shuffled kid is invisible to "all"/"preb"/"rowb"/"subok".
+_CANDIDATE_KIDS = tuple(_TUNE_POLICY) + tuple(_SHUF_POLICY)
+assert len(set(_CANDIDATE_KIDS)) == len(_CANDIDATE_KIDS), (
+    "a kid is in both _TUNE_POLICY and _SHUF_POLICY; it would be benched twice "
+    "per shape, once against each scale layout, under one kid id"
+)
+
+
+def _shuf_arm(inst):
+    """ "reg" or "lds" -- which form of the shuffled scale read this kid is.
+
+    This is a real per-kid axis only as of sf_shuf_in_lds. Before it, every
+    shuffled kid was named `_sfshuf` and optCompilerConfig.json compiled all of
+    them with -DOPUS_SFSHUF_LDS=1, so the panel was a file-scope macro decided
+    once for the whole family -- and it only *requested* the panel, since
+    SF_SHUF_FITS silently degraded it back to registers wherever the panel did
+    not fit, which was everywhere except kid215. Both published verdicts on this
+    layout are therefore single-arm: the 2025 "buys nothing" sweep was reg with
+    no panel anywhere, and the later "-0.32%" sweep was reg wearing an lds name.
+
+    MEASURED, once the axis existed -- 133 shipped rows, four pools back to back,
+    --mp 8 --shape_grouped, judged on the >= 22 us band (58 shapes, 93.7% of the
+    time, null 0.988/1.000/1.014):
+
+        preb      10920.3 us      --              --
+        shuf_reg  10925.2 us      med 0.999       20/58 wins
+        shuf_lds  10698.7 us      med 0.976       45/58 wins
+
+    So the panel is the whole effect and reg is a wash -- which is not a
+    contradiction of the two old verdicts but a reproduction of them, since both
+    measured reg. Given both arms the tuner takes lds on 53 of 58 big shapes.
+    Full table: shuf 11534.3 vs preb 11651.6 = -1.01%, with p95 0.999 against a
+    null p95 of 1.014, i.e. no large shape regresses.
+
+    The mechanism is the K amortisation the 2025 note already named: lds goes
+    0.978 -> 0.974 median from K=1024 to K=4096 while reg is flat at 0.991 ->
+    1.000. The fixed panel fill is paid once and read from LDS; the reg arm's
+    cost is per K tile.
+
+    What the totals still under-count is coverage, not layout: 42 small shapes
+    whose plain winner is kid179/243/226/173/236 have no shuffled twin at all
+    (blocked by 2a-ii's B_M <= 32 and 2b's B_K = 512) and cost +77.9 us.
+    """
+    return "lds" if inst.sf_shuf_in_lds else "reg"
+
+
 # A policy entry for a kid the codegen no longer emits used to KeyError inside
 # _applicable on the first shape, i.e. after the data was built. kid165, kid174
 # and kid192 sat here that way. Fail at import instead.
@@ -383,7 +488,74 @@ for _kid, _sks in _TUNE_POLICY.items():
         )
 
 
-POOLS = ("all", "preb", "rowb")
+# Families whose kernel implements the SHUFFLE_SCALE template bool at all. The
+# other BMM families (pipeline, pipeline_bpreshuffle, minterleave, mouter,
+# wave4m2_selfload, ...) never see the flag, so no tile of theirs can read the
+# layout however it is shaped.
+_SHUF_FAMILIES = frozenset(
+    {
+        "a8w8_mxscale_bmm_bpreshuffle_wave8n4",
+        "a8w8_mxscale_bmm_bpreshuffle_wavetm1",
+        "a8w8_mxscale_bmm_bpreshuffle_bdirect",
+        "a8w8_mxscale_bmm_bpreshuffle_bdirect_tilen",
+        "a8w8_mxscale_bmm_bpreshuffle_blds",
+        "a8w8_mxscale_bmm_flatmm_splitk",
+    }
+)
+
+
+# The A-scale layout's `sub`, read from the traits header rather than restated:
+# host, kernel and tuner disagreeing about it is a silent wrong-answer bug, not a
+# build failure. See opus_gemm_common._opus_sf_shuf_sub.
+SHUF_SUB = _opus_sf_shuf_sub()
+
+
+def _shuf_sub(inst):
+    """``SHUF_SUB`` if this kid's tile can read the shipped layout, else None.
+
+    ``sub`` is a property of the *layout*, which the quantize kernel emits once
+    per launch, so a deployment holds exactly one -- the same all-or-nothing
+    property `pool` already encodes for B's layout, one axis over. What is
+    per-tile is only the *capability*, and this function is a transcription of
+    ``opus_sf_shuf_geom``'s ``OK`` / ``KD``.
+
+    Keep the two in step. A predicate looser than the header's turns a pool entry
+    into a build error; one tighter silently under-reports what the layout can
+    do, which is what this did before 2a-ii by two separate clauses. Note the
+    B_K clause is {1,2,4} rather than "any even" only because op_sel is two bits
+    -- the index algebra itself generalises -- so the tight direction is here.
+
+    kid388/389/390 (bdirect_tilen, B_M=64 at T_M=1) are the one geometry this
+    admits that no *shuffled* kid exercises: A_SLOTS=2 on the flatmm pipeline.
+    They are plain-scale, so returning a sub for them is correct -- that is what
+    the subok pool is -- but a shuffled tilen kid would need the traits geometry
+    and twin bit-exactness gates before this answer is trusted for it.
+    """
+    if inst.kernel_tag not in _SHUF_FAMILIES:
+        return None
+    com_rep_k = inst.B_K // inst.GROUP_K
+    if com_rep_k not in (1, 2, 4):
+        return None
+    kd = com_rep_k // 2 if com_rep_k >= 2 else 1
+    assert kd * 2 >= com_rep_k, "SFG::KD must cover every K block the tile owns"
+    sf_mb = inst.T_M * inst.W_M
+    paired = sf_mb <= SHUF_SUB and SHUF_SUB % sf_mb == 0
+    wide = sf_mb == 2 * SHUF_SUB
+    if not (paired or wide) or inst.B_M % sf_mb:
+        return None
+    if SHUF_SUB < inst.B_M < 2 * SHUF_SUB:
+        return None
+    return SHUF_SUB
+
+
+# subok holds the plain-scale kids whose tiles could read the layout, so it
+# prices the tile restriction alone; shuf_reg / shuf_lds / shuf hold the shuffled
+# kids and price the layout itself. The two numbers add. `shuf` lets the tuner
+# see both arms and pick, which is the only one of the four that answers the
+# shipping question -- the reg/lds split just says which mechanism earned it.
+# (There is one layout, at whatever OPUS_SF_SHUF_SUB_VALUE says; there is no
+# per-pool sub any more.)
+POOLS = ("all", "preb", "rowb", "subok", "shuf", "shuf_reg", "shuf_lds")
 
 
 def _applicable(kid, g, m, n, k, pool="all"):
@@ -397,15 +569,46 @@ def _applicable(kid, g, m, n, k, pool="all"):
     rows are exactly the ones a preshuffled deployment cannot dispatch. Tuning the
     two pools separately over one shape set is also how the layouts get compared
     at all: per shape, best row-major against best preshuffled.
+
+    "subok" is the same argument applied to the A *scale* layout, which acquires
+    the property the moment a quantize kernel emits shuffle_scale_a directly
+    (inverse_rope_group_quant). It implies preb, since that is what the
+    bpreshuffle table is. The pool holds the *plain-scale* kids whose tiles are
+    shuffle-compatible, not the shuffle_scale kids themselves -- the point is to
+    price the tile restriction alone, against plain scales, with no new kernel and
+    no producer. Whatever a shuffled twin then wins or loses rides on top of it.
+
+    That makes it the regression harness for the tile work: each stage that lifts
+    a restriction should close part of the gap from `subok` to `preb`, by the
+    amount the profile CSV predicts. Measured on the shipped 133 rows: 11698.0 us
+    before 2a-i (+2.59% over preb), 11472.3 after (+0.61%), 11422.5 after 2a-ii,
+    11404.4 after 2b, against preb's 11403.1.
     """
     k_inst = _CODEGEN_BMM[kid]
+    shuf = kid in _SHUF_POLICY
+    # A shuffled kid is a candidate only where the pool asked for one, and a
+    # plain-scale kid only where it did not. The two cannot be mixed in one table
+    # for the same reason preb and rowb cannot: the quantize kernel emits one A
+    # scale layout per launch, so a table is all one form or it is undispatchable.
+    if pool in ("shuf", "shuf_reg", "shuf_lds"):
+        if not shuf:
+            return []
+        if pool != "shuf" and _shuf_arm(k_inst) != pool.split("_")[1]:
+            return []
+    elif shuf:
+        return []
     if pool == "preb" and not k_inst.needs_preshuffled_b:
         return []
     if pool == "rowb" and k_inst.needs_preshuffled_b:
         return []
+    if pool == "subok":
+        if not k_inst.needs_preshuffled_b:
+            return []
+        if _shuf_sub(k_inst) is None:
+            return []
     if n % k_inst.B_N or k % k_inst.B_K or m % k_inst.m_align:
         return []
-    return _TUNE_POLICY[kid]
+    return _SHUF_POLICY[kid] if shuf else _TUNE_POLICY[kid]
 
 
 SHIPPED_CSV = os.path.join(
@@ -510,7 +713,7 @@ def _gen_varied(shape, k, device):
 
 
 def gen_bmm_mxscale_data(batch, m, n, k, seed, out_dtype, device="cuda"):
-    """Return the 7-tuple mp_tuner indexes into:
+    """Return the 9-tuple mp_tuner indexes into:
 
     0 O_in   [m,g,k]     fp8 (mmajor transposed view, K contiguous)
     1 W_mx   [g,n,k]     fp8 (batch-major)
@@ -519,6 +722,21 @@ def gen_bmm_mxscale_data(batch, m, n, k, seed, out_dtype, device="cuda"):
     4 ws_mx  [g,n/128,k/128] uint8 e8m0 128x128-block scale
     5 ref     [m,g,n]     out_dtype dequant fp32 einsum reference
     6 W_sh   [g,n,k]     the same B in the (16,16) preshuffled layout
+    7 xs_sh  [m,g,W]     the same A scale in the shuffle_scale_a layout
+    8 ws_sh  [g,n/128,*] the same B scale in the shuffle_scale_b layout
+
+    Slots 7/8 are built here for the same reason 6 is: they are a permutation of
+    what is already in 3/4, so the slot-5 reference covers them, and building
+    them in the generator keeps the relayout out of what is timed.
+
+    They are also built here rather than closed over, which is the whole point.
+    run_perftest deep-copies the *arguments* it is handed into rotate_args sets
+    and cycles them, so the timed kernel reads a scale slab it did not just read.
+    Operands captured in a closure are not arguments, and every iteration then
+    hits one cache-resident copy -- and a hot scale cache is precisely the regime
+    in which the shuffled layout's only claim (16 lanes covering one 64B line
+    where the plain layout touches 16) cannot show up. A closure here would bias
+    the answer toward "shuffle buys nothing" by construction.
     """
     torch.manual_seed(seed)
     O_bf16 = _gen_varied((batch, m, k), k, device)
@@ -534,19 +752,41 @@ def gen_bmm_mxscale_data(batch, m, n, k, seed, out_dtype, device="cuda"):
     # reference above covers both forms. Building it here rather than in the bench
     # keeps it out of what is timed.
     W_sh = shuffle_weight(W_mx, layout=(16, 16))
-    return (O_in, W_mx, Y, xs_in, ws_mx, ref, W_sh)
+    # stride(0) zeroed: the shuffled layout folds the row into its own addressing,
+    # so the kernel takes only the per-batch slab from stride(1) and would
+    # otherwise add a bogus row offset. Tensor.__deepcopy__ copies the storage and
+    # restores size/stride/offset, so this view survives run_perftest's rotation
+    # without materialising m copies of the slab.
+    _slab = shuffle_scale_a(xs_mx, k, SHUF_SUB)
+    xs_sh = _slab.as_strided((m, batch, _slab.shape[1]), (0, _slab.shape[1], 1))
+    # Kept 3-D with the N-block axis in the middle so stride(0) is the per-batch
+    # slab, the only term the shuffled path reads.
+    ws_sh = shuffle_scale_b(ws_mx, n, k).view(batch, n // 128, -1)
+    return (O_in, W_mx, Y, xs_in, ws_mx, ref, W_sh, xs_sh, ws_sh)
 
 
-def run_bmm_mxscale_bench(O_in, W_mx, Y, xs_in, ws_mx, W_sh, kernelId, splitK):
+def run_bmm_mxscale_bench(
+    O_in, W_mx, Y, xs_in, ws_mx, W_sh, xs_sh, ws_sh, kernelId, splitK
+):
     """Tuner bench func: run the kid in-place, return Y for checkAllclose.
 
     B's layout is per kid, so it is selected here rather than by the caller: a
     preshuffled-B kid handed row-major B reads the right bytes in the wrong order
     and fails the gate, which is how three of these kids sat in _TUNE_POLICY
     without ever being able to win a shape.
+
+    The A/B *scale* layout is per kid for the same reason and is worse to get
+    wrong: a shuffled kid handed the plain panels reads the wrong elements and
+    returns a plausible wrong number rather than faulting. Both forms are already
+    materialised in the data tuple, so this only picks.
     """
-    Wb = W_sh if _CODEGEN_BMM[kernelId].needs_preshuffled_b else W_mx
-    _opus_bmm_a8w8_mxscale_raw(O_in, Wb, Y, xs_in, ws_mx, splitK, kernelId)
+    inst = _CODEGEN_BMM[kernelId]
+    Wb = W_sh if inst.needs_preshuffled_b else W_mx
+    if inst.needs_shuffle_scale:
+        sfa, sfb = xs_sh, ws_sh
+    else:
+        sfa, sfb = xs_in, ws_mx
+    _opus_bmm_a8w8_mxscale_raw(O_in, Wb, Y, sfa, sfb, splitK, kernelId)
     return Y
 
 
@@ -695,6 +935,22 @@ class OpusBmmMxscaleTuner(GemmCommonTuner):
             default="all",
             help="restrict candidates by B layout (--bpreshuffle implies preb)",
         )
+        self.parser.add_argument(
+            "--graph_m_max",
+            type=int,
+            default=0,
+            help=(
+                "time rows with m <= this through a captured hipgraph instead of "
+                "eager launches (0 = never). Eager carries a per-dispatch floor "
+                "that is worth 14-16%% of an m=1 kernel and 7-8%% at m=16, and -- "
+                "the part that biases a comparison rather than merely inflating "
+                "it -- the floor differs by ~0.16 us between kids on the same "
+                "shape, i.e. ~2%% of the kernel, which is the size of the effects "
+                "being ranked down there. Above ~m=64 the graph is 1-3%% SLOWER "
+                "than eager, so this must stay gated rather than become the "
+                "default for the whole table."
+            ),
+        )
 
     # --- shape sourcing -----------------------------------------------------
     def _shapes_from_shipped(self):
@@ -760,7 +1016,8 @@ class OpusBmmMxscaleTuner(GemmCommonTuner):
     def tune(self, untunedf, tunedf, args):
         gfx = self.get_gfx()
         out_dtype = dtypes.bf16
-        perf_kwargs = {"num_warmup": args.warmup, "num_iters": args.iters}
+        base_perf_kwargs = {"num_warmup": args.warmup, "num_iters": args.iters}
+        graph_m_max = int(getattr(args, "graph_m_max", 0) or 0)
 
         task = []
         tasks_data = []
@@ -770,9 +1027,19 @@ class OpusBmmMxscaleTuner(GemmCommonTuner):
             n = int(untunedf.loc[i, "n"])
             k = int(untunedf.loc[i, "k"])
             info_keys = (gfx, b, m, n, k)
+            # Per shape, not per sweep: the graph is a win only where the
+            # eager per-dispatch floor is a material fraction of the kernel.
+            # Whatever this resolves to, it is the same for every candidate on
+            # this shape, so a shape's ranking is never taken across two
+            # different measurement modes.
+            perf_kwargs = (
+                {**base_perf_kwargs, "testGraph": True}
+                if graph_m_max and m <= graph_m_max
+                else base_perf_kwargs
+            )
 
             n_cand = 0
-            for kid in _TUNE_POLICY:
+            for kid in _CANDIDATE_KIDS:
                 for sk in _applicable(kid, b, m, n, k, args.pool):
                     info = (info_keys, kid, sk, "")
                     task.append(
@@ -781,7 +1048,10 @@ class OpusBmmMxscaleTuner(GemmCommonTuner):
                             gen_bmm_mxscale_data,
                             (b, m, n, k, seed, out_dtype),
                             run_bmm_mxscale_bench,
-                            ([0, 1, 2, 3, 4, 6], kid, sk),
+                            # Every buffer a kid might read is passed as an
+                            # argument, never closed over, so run_perftest
+                            # rotates all of them; the bench picks per kid.
+                            ([0, 1, 2, 3, 4, 6, 7, 8], kid, sk),
                             perf_kwargs,
                             _bmm_ref_passthrough,
                             ([5],),

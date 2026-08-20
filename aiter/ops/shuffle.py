@@ -491,26 +491,36 @@ def _shuf_kblock_pairs(s: torch.Tensor, K: int) -> tuple[torch.Tensor, int]:
     return s, K1
 
 
-def shuffle_scale_a(a_scale: torch.Tensor, K: int, sub: int = 16) -> torch.Tensor:
+def shuffle_scale_a(a_scale: torch.Tensor, K: int, sub: int = 32) -> torch.Tensor:
     """A-side e8m0 scales in the reference (FlyDSL) blockscale layout.
 
-    One dword holds four scales -- two adjacent M subtiles crossed with two
-    consecutive 128-blocks of K -- and the row-within-a-subtile axis sits outside
-    it at a stride of exactly one dword. That is the point of the layout: 16 lanes
-    read 16 adjacent dwords, so a wave's scale load is one 64B line per (subtile
-    pair, K block pair) instead of the 16 lines shuffle_scale_mxsk_mpack's row
-    stride spreads it over. The MFMA picks its byte with scale_op_sel =
-    (kp << 1) | (im & 1), one immediate for both operands.
+    One dword holds four scales -- two M subtiles ``sub`` rows apart crossed with
+    two consecutive 128-blocks of K -- and the row-within-a-subtile axis sits
+    outside it at a stride of exactly one dword. That is the point of the layout:
+    16 lanes read 16 adjacent dwords, so a wave's scale load is one 64B line per
+    (subtile pair, K block pair) instead of the 16 lines
+    shuffle_scale_mxsk_mpack's row stride spreads it over. The MFMA picks its byte
+    with scale_op_sel = (kp << 1) | ((m / sub) & 1), one immediate for both
+    operands -- B duplicates each byte, so it spends the low bit on nothing.
 
-    ``sub`` is the row distance between adjacent M subtiles, i.e. the kernel's
-    T_M*W_M. FlyDSL's own layout is sub=16, which is the T_M=1 case; a T_M=2 grid
-    pairs rows 32 apart instead. Take it from the kid's needs_shuffle_scale.
+    ``sub`` is the row distance between the two M subtiles sharing a dword. It is
+    a property of *the layout*, not of any one kernel's wave grid: the model holds
+    one scale slab, so every consumer reads the same ``sub``. Consumers pair their
+    rows two-for-one while T_M*W_M <= sub and stop above it, which is why 32 is
+    the shipped value -- it is native for both the T_M=2 and T_M=1 grids, where 16
+    doubles the A-scale dwords for every T_M=2 tile and equals it nowhere. The
+    kernel-side constant is OPUS_SF_SHUF_SUB; take it from a kid's
+    needs_shuffle_scale rather than from T_M*W_M.
 
         row = n1*(2*sub) + np*sub + nl,  kblock = k1*2 + kp
         byte index = (((n1*K1 + k1)*sub + nl)*2 + kp)*2 + np
 
     Leading dims are kept, so a batched (G, M, K//128) comes back as (G, -1) and
     the launcher takes the per-batch slab from stride(1).
+
+    Enumerated against the consumer's index arithmetic by
+    check_shuffle_scale_index / check_shuffle_scale_bytes in
+    op_tests/test_opus_a8w8_bmm.py.
     """
     s = a_scale.view(torch.uint8)
     *lead, rows, ksc = s.shape

@@ -8,6 +8,124 @@
 #include "../opus_gemm_utils.cuh"
 #include "opus_gemm_traits_a16w16_gfx950.cuh"  // opus_splitk_ws_handle
 
+// The `sub` of the one shuffle_scale_a layout every SHUFFLE_SCALE kid reads: the
+// row distance between the two M subtiles that share a dword. A property of the
+// *layout*, not of a tile's wave grid.
+//
+// Not overridable, deliberately: _opus_sf_shuf_sub() in opus_gemm_common.py parses
+// this line to pick which shuffle_scale_a(sub) the host feeds a kid, so a -D would
+// compile a kernel that disagrees with its own producer -- which does not fault,
+// it returns plausible wrong numbers.
+#define OPUS_SF_SHUF_SUB_VALUE 16
+static constexpr int OPUS_SF_SHUF_SUB = OPUS_SF_SHUF_SUB_VALUE;
+
+// ---- shuffle_scale A-scale geometry, shared by every pipeline that reads it ---
+// MB is the tile's subtile stride (subtile im starts at row im*MB); SUB is the
+// layout's pair distance. Keeping them apart is what lets one layout serve both
+// wave grids. A lane's row is `row + im*MB + r_lane`, and the layout splits a row
+// into (n1, np, nl) = (m/(2*SUB), (m/SUB)&1, m%SUB): n1 picks a register slot, np
+// is op_sel's low bit (an MFMA immediate, so free), nl is r_lane plus a
+// compile-time offset. Everything below is that decomposition as constants.
+//
+// COM_REP_K_ is deliberately not defaulted: a site that forgot to pass it would
+// get KD == 1 and a silently truncated K index -- wrong numbers, not a build
+// failure. WAVE_PAIR_ is a *request*, not a fact -- only a pipeline that
+// implements the remapped thread -> row map may pass true. Everything derived
+// below reads WAVE_PAIR, never the request.
+template<int B_M_, int T_M_, int W_M_, int COM_REP_M_, int COM_REP_K_,
+         bool WAVE_PAIR_ = false>
+struct opus_sf_shuf_geom {
+    static constexpr int SUB = OPUS_SF_SHUF_SUB;
+    static constexpr int MB  = T_M_ * W_M_;
+    // PAIRED: the dword's two rows belong to one thread, so it is fully used.
+    // WIDE: MB == 2*SUB, the partner row sits in the neighbouring *wave*, and the
+    // byte is (r_lane/SUB)&1 -- wave-uniform, so the wave index moves out of the
+    // address and into a shift on the loaded word. No branch, no extra load. It is
+    // the only way a T_M=2 tile reads a sub=16 layout.
+    //
+    // MB == 4*SUB (T_M=4, pipeline_bpreshuffle) is deliberately NOT admitted: a
+    // lane's rows straddle two n1 blocks, so the word index does depend on the
+    // wave and that fold does not exist. A real bound, not an inherited one.
+    static constexpr bool PAIRED = MB <= SUB && SUB % MB == 0;
+    static constexpr bool WIDE   = MB == 2 * SUB;
+    // The wave M remap: a wave takes 2*W_M contiguous rows instead of W_M, so
+    // subtiles im and im^1 sit SUB rows apart inside one thread and a WIDE dword is
+    // whole again.
+    // Only WIDE has anything to gain, and the tile needs an even number of 2*SUB
+    // row blocks to hand each of the T_M waves whole ones; COM_REP_M_ is that count
+    // at WIDE (B_M/MB == N1_BLOCKS).
+    static constexpr bool WAVE_PAIR = WAVE_PAIR_ && WIDE && COM_REP_M_ % 2 == 0;
+    // WIDE as a *regime*: dword split across two waves, one M byte given up. The
+    // remap is the escape from it, so the two are mutually exclusive and every
+    // WIDE-only cost below keys off this, not off WIDE.
+    static constexpr bool WIDE_SPLIT = WIDE && !WAVE_PAIR;
+    // Guarded rather than asserted: a non-shuffled kid is free to violate it, and
+    // the pipeline turns this into a static_assert under SHUFFLE_SCALE.
+    static constexpr bool OK = (PAIRED || WIDE) && B_M_ % MB == 0;
+    static constexpr int NL_SLOTS =
+        (!OK || WIDE) ? 1 : ((SUB / MB) < COM_REP_M_ ? (SUB / MB) : COM_REP_M_);
+    // At WIDE this is B_M/MB == COM_REP_M, so A_SLOTS lands on "one dword per row
+    // the thread covers" without a second formula.
+    static constexpr int N1_BLOCKS = (B_M_ + 2 * SUB - 1) / (2 * SUB);
+    // N1_BLOCKS is the *tile's* row blocks and does not move under the remap -- the
+    // LDS panel still stages all of them. What moves is how many a lane owns: the
+    // T_M waves take alternate blocks, so a lane holds half and steps two per slot.
+    static constexpr int N1_STEP = WAVE_PAIR ? 2 : 1;
+    static constexpr int A_SLOTS = WAVE_PAIR ? N1_BLOCKS / 2 : N1_BLOCKS * NL_SLOTS;
+    static_assert(A_SLOTS >= 1);
+    // A tile narrower than a subtile pair: MP is runtime, MB_BIT is identically 0.
+    static constexpr bool SUBTILE_TILE = B_M_ < 2 * SUB;
+    // The two runtime-byte cases are disjoint, which is what lets one shift serve
+    // both: WIDE needs B_M >= MB == 2*SUB, which is exactly !SUBTILE_TILE.
+    static_assert(!(SUBTILE_TILE && WIDE), "a tile cannot be both narrower than a "
+                  "subtile pair and wider than a subtile");
+    static constexpr bool MP_RUNTIME = SUBTILE_TILE || WIDE_SPLIT;
+    static_assert(!OK || !SUBTILE_TILE || B_M_ <= SUB,
+                  "a tile below 2*SUB rows must fit inside one subtile, or np needs "
+                  "both a runtime MP and a per-im compile-time bit at once");
+    // Register slot and op_sel's compile-time M bit for subtile im. Under the remap
+    // the lane's row is (im/2)*2*MB + w*MB + (im%2)*SUB + lane%SUB, which gives
+    // n1 = base + 2*(im/2) + w, np = im&1 and nl = lane%SUB: the wave leaves the
+    // *byte* and enters the *word* as a whole n1 block, the exact inverse of WIDE.
+    static constexpr int N1_OF(int im)     { return (im * MB) / (2 * SUB); }
+    static constexpr int NL_OF(int im)     { return ((im * MB) % SUB) / MB; }
+    static constexpr int SLOT_OF(int im) {
+        return WAVE_PAIR ? (im >> 1) : (N1_OF(im) * NL_SLOTS + NL_OF(im));
+    }
+    static constexpr int MB_BIT_OF(int im) {
+        return WAVE_PAIR ? (im & 1) : (((im * MB) / SUB) & 1);
+    }
+
+    // ---- K axis, exactly the M axis one dimension over -------------------------
+    // A dword holds two *consecutive* 128-blocks of K as well as two M subtiles, so
+    // KD is the K-side A_SLOTS. ik splits into op_sel's high bit and the register
+    // index; nothing here is runtime, unlike M's np:
+    //
+    //   COM_REP_K   KD   K_BIT_OF(ik)   KD_OF(ik)   what the tile owns
+    //       1        1        0             0       half a dword (one K block)
+    //       2        1       ik             0       one whole dword
+    //       4        2      ik&1          ik>>1     two whole dwords
+    static constexpr int KD = COM_REP_K_ >= 2 ? COM_REP_K_ / 2 : 1;
+    static constexpr int K_BIT_OF(int ik) { return ik & 1; }
+    static constexpr int KD_OF(int ik)    { return ik >> 1; }
+    // Full register index for (subtile im, K group ik). The loader must pack in
+    // this order; see load_scale_regs.
+    static constexpr int SLOT_OF_K(int im, int ik) { return SLOT_OF(im) * KD + KD_OF(ik); }
+    static constexpr int A_SLOTS_K = A_SLOTS * KD;
+    static_assert(COM_REP_K_ == 1 || COM_REP_K_ == 2 || COM_REP_K_ == 4,
+                  "a dword pairs K blocks two-for-one, so COM_REP_K must be 1, 2 or 4");
+
+    // Register index and op_sel's A byte for (subtile im, K byte kp). kp is passed
+    // rather than derived from ik because the two pipelines disagree on where it
+    // comes from: at COM_REP_K == 2 it is ik's low bit, at COM_REP_K == 1 the wave8
+    // pipeline unrolls the K-tile pair and passes its parity as a template
+    // argument, and the flatmm pipeline selects the half at load time, leaving kp 0.
+    static constexpr int REG_OF(int im, int ik) { return SLOT_OF_K(im, ik); }
+    static constexpr int OPSEL_A(int im, int kp) {
+        return (kp << 1) | MB_BIT_OF(im);
+    }
+};
+
 template<int BLOCK_SIZE_,
         typename BLOCK_,
         typename DTYPE_,
@@ -220,7 +338,13 @@ template<int BLOCK_SIZE_,
         // Drop the producer/consumer split: all four waves stage and compute.
         // Changes the wave mapping (T_M) and how many waves share each async
         // copy, so it has to be visible to the geometry below.
-        bool ALL_WAVE_ = false>
+        bool ALL_WAVE_ = false,
+        // Select the tileN consumer grid (T_M=1, T_N=2) at B_M > 16. It used to be
+        // inferred from B_M == 16 alone, that being the only tile that wanted it;
+        // a parameter now for the same reason as ALL_WAVE_, since it moves
+        // LOAD_GROUP_M and the LDS geometry below is derived from that. Kept
+        // although the kids that asked for it lost.
+        bool TILE_N_ = false>
 struct opus_gemm_a8w8_mxscale_flatmm_splitk_traits_gfx950 {
     using BLOCK = opus::remove_cvref_t<BLOCK_>;
     using DTYPE = opus::remove_cvref_t<DTYPE_>;
@@ -268,7 +392,9 @@ struct opus_gemm_a8w8_mxscale_flatmm_splitk_traits_gfx950 {
     // hands each wave 8 rows where the MFMA needs 16 and the upper two waves
     // read misaligned fragments.
     static constexpr bool ALL_WAVE = ALL_WAVE_;
-    static constexpr bool IS_TILE_N = (B_M == 16);
+    // B_M == 16 still selects tileN on its own -- it has no other legal grid, and
+    // keeping the implication makes TILE_N_ inert for every kid built before it.
+    static constexpr bool IS_TILE_N = (B_M == 16) || TILE_N_;
     static constexpr int T_M = (ALL_WAVE || !IS_TILE_N) ? 2 : 1;
     static constexpr int T_N = (ALL_WAVE || IS_TILE_N) ? 2 : 1;
     static constexpr int T_K = 1;
@@ -324,6 +450,9 @@ struct opus_gemm_a8w8_mxscale_flatmm_splitk_traits_gfx950 {
     static constexpr int COM_REP_K = B_K / (W_K * T_K);
     static_assert(COM_REP_M == 1 || COM_REP_M == 2 || COM_REP_M == 4,
                   "mxscale flatmm splitK supports 16 (tileN) / 32 / 64 / 128 rows per tile");
+    // shuffle_scale A-scale geometry; same derivation the wave8 traits alias, so
+    // the two pipelines index the layout identically. See opus_sf_shuf_geom.
+    using SF_GEOM = opus_sf_shuf_geom<B_M, T_M, W_M, COM_REP_M, COM_REP_K>;
     static_assert(COM_REP_N >= 1, "B_N must be a multiple of W_N*T_N");
     // tileN splits B_N across two consumer waves, so B_N must contain 2*W_N cols
     // and every N scale group must be wave-splittable without straddling.
@@ -389,6 +518,42 @@ struct opus_gemm_a8w8_mxscale_flatmm_splitk_traits_gfx950 {
     static_assert(prefetch_k_iter >= 3,
                   "flatmm splitK pipeline requires at least 3 LDS prefetch slots");
 
+    // ---- SHUFFLE_SCALE LDS panel (sf_shuf_in_lds) ----------------------------
+    // The flatmm twin of the wave8 traits' block, and the two must stay in step:
+    // the panel's *contents* are the layout, not the pipeline. What differs is the
+    // ring it fits beside -- per_block_iter_lds_size here already drops B under
+    // B_DIRECT_REG.
+    static constexpr int SF_N1_BLOCKS = SF_GEOM::N1_BLOCKS;
+    // One K1 costs the A panel N1_BLOCKS*SUB words and the B panel one word per
+    // scale group. B's dword stores each K byte twice (shuffle_scale_b), which
+    // is what lets one scale_op_sel immediate serve both operands.
+    static constexpr int SF_SHUF_WORDS_PER_K1 = SF_N1_BLOCKS * SF_GEOM::SUB + N_SCALE_GROUPS;
+    static constexpr int SF_SHUF_RING_LDS = prefetch_k_iter * per_block_iter_lds_size;
+    static constexpr int SF_PANEL_LDS_RESERVE = 256;
+    static constexpr int SF_SHUF_BUDGET =
+        max_lds_size_per_wg - SF_SHUF_RING_LDS - SF_PANEL_LDS_RESERVE;
+    static constexpr int SF_SHUF_K1_FIT =
+        SF_SHUF_BUDGET > 0 ? SF_SHUF_BUDGET / (4 * SF_SHUF_WORDS_PER_K1) : 0;
+    // K1 counts 128-block *pairs*: a COM_REP_K>=2 tile spends SF_GEOM::KD per K
+    // tile (1 at B_K=256, 2 at B_K=512), a COM_REP_K==1 tile one per two tiles.
+    // The general form, not the COM_REP_K==2 dichotomy: this pipeline is the one
+    // with B_K=512 kids, and a bound that under-counted would overflow the panel
+    // rather than fail to compile.
+    static constexpr int SF_SHUF_K1_CAP =
+        COM_REP_K >= 2 ? (SF_PRELOAD_K_MAX / B_K) * SF_GEOM::KD
+                       : (SF_PRELOAD_K_MAX / B_K + 1) / 2;
+    static constexpr int SF_SHUF_K1_MAX =
+        SF_SHUF_K1_FIT < SF_SHUF_K1_CAP ? SF_SHUF_K1_FIT : SF_SHUF_K1_CAP;
+    // What the launcher must bound iters_full by, in K tiles.
+    static constexpr int SF_SHUF_K_TILES_MAX =
+        COM_REP_K >= 2 ? SF_SHUF_K1_MAX / SF_GEOM::KD : 2 * SF_SHUF_K1_MAX;
+    static constexpr int SF_SHUF_K_MAX = SF_SHUF_K_TILES_MAX * B_K;
+    // Guarded, not asserted: every flatmm kid instantiates this traits, and a
+    // tile that cannot host a panel is free to say so as long as no kid asks it
+    // for one. The pipeline turns SF_SHUF_IN_LDS into a static_assert on this.
+    static constexpr bool SF_SHUF_PANEL_OK =
+        SF_GEOM::OK && SF_SHUF_K1_MAX > 0 && SF_SHUF_K_MAX >= 8192;
+
     // Per-wave async-copy instruction counts: each load group is split across
     // LOAD_WAVES waves (repeat_m/repeat_n in the group-load layouts is
     // slots/LOAD_WAVES), and these drive the vmcnt bookkeeping in the pipeline.
@@ -434,11 +599,12 @@ template<int BLOCK_SIZE_,
         typename GROUP_,
         int WG_PER_CU_,
         bool B_DIRECT_REG_ = false,
-        bool ALL_WAVE_ = false>
+        bool ALL_WAVE_ = false,
+        bool TILE_N_ = false>
 struct opus_gemm_a8w8_mxscale_flatmm_splitk_bpreshuffle_traits_gfx950
-    : opus_gemm_a8w8_mxscale_flatmm_splitk_traits_gfx950<BLOCK_SIZE_, BLOCK_, DTYPE_, VEC_, GROUP_, WG_PER_CU_, B_DIRECT_REG_, ALL_WAVE_> {
+    : opus_gemm_a8w8_mxscale_flatmm_splitk_traits_gfx950<BLOCK_SIZE_, BLOCK_, DTYPE_, VEC_, GROUP_, WG_PER_CU_, B_DIRECT_REG_, ALL_WAVE_, TILE_N_> {
     using base = opus_gemm_a8w8_mxscale_flatmm_splitk_traits_gfx950<
-        BLOCK_SIZE_, BLOCK_, DTYPE_, VEC_, GROUP_, WG_PER_CU_, B_DIRECT_REG_, ALL_WAVE_>;
+        BLOCK_SIZE_, BLOCK_, DTYPE_, VEC_, GROUP_, WG_PER_CU_, B_DIRECT_REG_, ALL_WAVE_, TILE_N_>;
 
     static constexpr bool B_PRESHUFFLE = true;
     static constexpr bool SCALE_OPSEL  = true;
@@ -468,11 +634,12 @@ template<int BLOCK_SIZE_,
         typename GROUP_,
         int WG_PER_CU_,
         bool B_DIRECT_REG_ = false,
-        bool ALL_WAVE_ = false>
+        bool ALL_WAVE_ = false,
+        bool TILE_N_ = false>
 struct opus_gemm_a8w8_mxscale_flatmm_splitk_bpreshuffle_bcast_traits_gfx950
-    : opus_gemm_a8w8_mxscale_flatmm_splitk_traits_gfx950<BLOCK_SIZE_, BLOCK_, DTYPE_, VEC_, GROUP_, WG_PER_CU_, B_DIRECT_REG_, ALL_WAVE_> {
+    : opus_gemm_a8w8_mxscale_flatmm_splitk_traits_gfx950<BLOCK_SIZE_, BLOCK_, DTYPE_, VEC_, GROUP_, WG_PER_CU_, B_DIRECT_REG_, ALL_WAVE_, TILE_N_> {
     using base = opus_gemm_a8w8_mxscale_flatmm_splitk_traits_gfx950<
-        BLOCK_SIZE_, BLOCK_, DTYPE_, VEC_, GROUP_, WG_PER_CU_, B_DIRECT_REG_, ALL_WAVE_>;
+        BLOCK_SIZE_, BLOCK_, DTYPE_, VEC_, GROUP_, WG_PER_CU_, B_DIRECT_REG_, ALL_WAVE_, TILE_N_>;
 
     static constexpr bool B_PRESHUFFLE = true;
     // SCALE_OPSEL stays false, i.e. the base's MXSCALE_ACCUM_MODE pack.
@@ -504,11 +671,12 @@ template<int BLOCK_SIZE_,
         typename DTYPE_,
         typename VEC_,
         typename GROUP_,
-        int WG_PER_CU_>
+        int WG_PER_CU_,
+        bool TILE_N_ = false>
 struct opus_gemm_a8w8_mxscale_flatmm_splitk_bpreshuffle_bdirect_traits_gfx950
-    : opus_gemm_a8w8_mxscale_flatmm_splitk_bpreshuffle_traits_gfx950<BLOCK_SIZE_, BLOCK_, DTYPE_, VEC_, GROUP_, WG_PER_CU_, true> {
+    : opus_gemm_a8w8_mxscale_flatmm_splitk_bpreshuffle_traits_gfx950<BLOCK_SIZE_, BLOCK_, DTYPE_, VEC_, GROUP_, WG_PER_CU_, true, false, TILE_N_> {
     using base = opus_gemm_a8w8_mxscale_flatmm_splitk_bpreshuffle_traits_gfx950<
-        BLOCK_SIZE_, BLOCK_, DTYPE_, VEC_, GROUP_, WG_PER_CU_, true>;
+        BLOCK_SIZE_, BLOCK_, DTYPE_, VEC_, GROUP_, WG_PER_CU_, true, false, TILE_N_>;
 
     // buffer_loads per consumer per K tile: one dwordx4 per (n-rep, k-rep, half).
     static constexpr int b_direct_load_insts = base::COM_REP_N * base::COM_REP_K * 2;
@@ -522,6 +690,26 @@ struct opus_gemm_a8w8_mxscale_flatmm_splitk_bpreshuffle_bdirect_traits_gfx950
                   "direct B layout folds away the tile_k mma p-dim");
     static_assert(base::W_N == 16 && base::W_K == 128,
                   "direct B addressing is derived from the 16x16x128 fragment order");
+};
+
+// Direct-B sibling forced onto the tileN consumer grid at B_M > 16. Exists for the
+// same reason the bdirect struct does: the traits alias emitter passes through
+// BLOCK_SIZE..WG_PER_CU only, so a flag reaches a kid by being baked into a named
+// traits struct.
+template<int BLOCK_SIZE_,
+        typename BLOCK_,
+        typename DTYPE_,
+        typename VEC_,
+        typename GROUP_,
+        int WG_PER_CU_>
+struct opus_gemm_a8w8_mxscale_flatmm_splitk_bpreshuffle_bdirect_tilen_traits_gfx950
+    : opus_gemm_a8w8_mxscale_flatmm_splitk_bpreshuffle_bdirect_traits_gfx950<
+          BLOCK_SIZE_, BLOCK_, DTYPE_, VEC_, GROUP_, WG_PER_CU_, true> {
+    using base = opus_gemm_a8w8_mxscale_flatmm_splitk_bpreshuffle_bdirect_traits_gfx950<
+        BLOCK_SIZE_, BLOCK_, DTYPE_, VEC_, GROUP_, WG_PER_CU_, true>;
+
+    static_assert(base::IS_TILE_N && base::T_M == 1 && base::T_N == 2,
+                  "tilen traits must land on the T_M=1 consumer grid");
 };
 
 // 8-wave all-compute traits for direct-to-register preshuffled B.
@@ -645,6 +833,26 @@ struct opus_gemm_a8w8_mxscale_bpreshuffle_wave8_traits_gfx950 {
     static constexpr int SFA_WORDS = COM_REP_M / 4;
     static_assert(COM_REP_M % 4 == 0 && SFA_WORDS >= 1,
                   "the M-packed scale bytes must fill whole op_sel dwords");
+
+    // ---- shuffle_scale A-scale geometry --------------------------------------
+    // Aliased from opus_sf_shuf_geom rather than restated, so this pipeline and
+    // flatmm_splitk cannot drift apart on the index arithmetic.
+    // WAVE_PAIR_ = true: this pipeline implements the remapped thread -> row map
+    // (the A fragment layout, the C store and the scale address all follow it);
+    // flatmm_splitk does not and passes the default false.
+    using SF_GEOM = opus_sf_shuf_geom<B_M, T_M, W_M, COM_REP_M, COM_REP_K, true>;
+    static constexpr int  SF_SUB       = SF_GEOM::SUB;
+    static constexpr int  SF_MB        = SF_GEOM::MB;
+    static constexpr bool SF_SHUF_OK   = SF_GEOM::OK;
+    static constexpr int  SF_NL_SLOTS  = SF_GEOM::NL_SLOTS;
+    static constexpr int  SF_N1_BLOCKS = SF_GEOM::N1_BLOCKS;
+    static constexpr int  SF_A_SLOTS   = SF_GEOM::A_SLOTS;
+    static constexpr bool SF_WAVE_PAIR = SF_GEOM::WAVE_PAIR;
+    // What a lane loads, and what it holds across the MFMA block. They differ only
+    // along K: A_SLOTS counts M slots, A_SLOTS_K gives each of them its KD dwords.
+    // This pipeline is COM_REP_K <= 2, hence KD == 1, so the two are equal here --
+    // the distinction is kept because the flatmm pipeline's B_K=512 kids need it.
+    static constexpr int  SF_A_SLOTS_K = SF_GEOM::A_SLOTS_K;
     static_assert(COM_REP_N >= 1 && B_N % (W_N * T_N) == 0);
     static_assert(COM_REP_K == NUM_LOAD_GROUPS_PER_BK);
     static_assert(B_N <= 2 * GROUP_N);
@@ -759,6 +967,37 @@ struct opus_gemm_a8w8_mxscale_bpreshuffle_wave8_traits_gfx950 {
     static_assert(SF_PRELOAD_K_MAX >= 8192,
                   "the scale panel no longer reaches the 8192 of per-split K the "
                   "flat SF_PRELOAD_K_MAX promised; the staging above grew");
+
+    // The SHUFFLE_SCALE panel's own K reach: it cannot borrow SF_PRELOAD_K_MAX,
+    // which overshoots by exactly the duplicated B side.
+    static constexpr int SF_SHUF_WORDS_PER_K1 = SF_N1_BLOCKS * SF_SUB + N_SCALE_GROUPS;
+    static constexpr int SF_SHUF_RING_LDS = prefetch_k_iter * NUM_LOAD_GROUPS_PER_BM
+                                          * NUM_LOAD_GROUPS_PER_BK
+                                          * smem_per_group_load_size;
+    static constexpr int SF_SHUF_BUDGET =
+        SF_PANEL_LDS_CEILING - SF_SHUF_RING_LDS - SF_PANEL_LDS_RESERVE;
+    // K1 counts 128-block *pairs*: a COM_REP_K>=2 tile spends SF_GEOM::KD per K
+    // tile (1 at B_K=256, 2 at B_K=512), a COM_REP_K==1 tile one per two tiles.
+    // Written as the general form rather than the COM_REP_K==2 dichotomy it had,
+    // because at B_K=512 the panel must be twice as deep per tile and a bound that
+    // silently under-counted would overflow the ring, not fail to compile.
+    static constexpr int SF_SHUF_K1_FIT = SF_SHUF_BUDGET / (4 * SF_SHUF_WORDS_PER_K1);
+    static constexpr int SF_SHUF_K1_CAP =
+        COM_REP_K >= 2 ? (SF_PRELOAD_K_MAX / B_K) * SF_GEOM::KD
+                       : (SF_PRELOAD_K_MAX / B_K + 1) / 2;
+    static constexpr int SF_SHUF_K1_MAX =
+        SF_SHUF_K1_FIT < SF_SHUF_K1_CAP ? SF_SHUF_K1_FIT : SF_SHUF_K1_CAP;
+    // What the launcher must bound iters_full by, in K tiles.
+    static constexpr int SF_SHUF_K_TILES_MAX =
+        COM_REP_K >= 2 ? SF_SHUF_K1_MAX / SF_GEOM::KD : 2 * SF_SHUF_K1_MAX;
+    static constexpr int SF_SHUF_K_MAX = SF_SHUF_K_TILES_MAX * B_K;
+    static_assert(SF_SHUF_RING_LDS + SF_SHUF_K1_MAX * SF_SHUF_WORDS_PER_K1 * 4
+                          + SF_PANEL_LDS_RESERVE
+                      <= SF_PANEL_LDS_CEILING,
+                  "the shuffled scale panel overflows the LDS share that keeps this "
+                  "kernel's workgroups resident");
+    static_assert(SF_SHUF_K_MAX >= 8192,
+                  "the shuffled scale panel no longer reaches 8192 of per-split K");
     static_assert(SF_PANEL_STAGING_LDS
                       + (long)SF_PANEL_ROWS * SF_PRELOAD_K_MAX / GROUP_K
                   <= SF_PANEL_LDS_CEILING,
@@ -847,8 +1086,8 @@ struct opus_gemm_a8w8_mxscale_bpreshuffle_wave8n4_traits_gfx950
 // schedule that took is this one.
 //
 // WAVES follows BLOCK_SIZE, so this alias covers both grids that T_M=1 admits:
-// 512 threads give 1x8, 256 give the 1x4 that the 4-wave allwave_bdirect family
-// cannot express (its traits fix the grid at 2x2).
+// 512 threads give 1x8, 256 give the 1x4 that no ALL_WAVE family can express,
+// since ALL_WAVE derives its own 2x2 grid (see the assert on IS_TILE_N above).
 template<int BLOCK_SIZE_,
         typename BLOCK_,
         typename DTYPE_,
@@ -898,60 +1137,9 @@ struct opus_gemm_a8w8_mxscale_flatmm_splitk_bpreshuffle_allwave_traits_gfx950
     // until that is understood.
     static_assert(base::B_N <= base::GROUP_N,
                   "all-wave B_N>128 is unresolved under split_k>1");
+    // The shared pipeline derives one vmcnt bound per tile, and that single bound
+    // cannot serve an A lead of prefetch_k_iter-1 tiles and a one-tile B lead at
+    // the same time -- which is what direct-B would ask for here.
     static_assert(!base::B_DIRECT_REG,
                   "all-wave stages B through LDS so one vmcnt stream serves both operands");
-};
-
-// All-wave 2x2 with B read straight into registers. The LDS-staged all-wave
-// traits above forbid this pairing because the shared pipeline derives one
-// vmcnt bound per tile and it cannot serve an A lead of prefetch_k_iter-1
-// tiles and a one-tile B lead at the same time; the dedicated
-// allwave_bdirect kernel carries its own two immediates instead, so the
-// combination is allowed here.
-//
-// The pairing was aimed at occupancy: dropping B out of LDS leaves only the A
-// double buffer (32 KiB), and the 2x2 grid quarters the tile so the fp32
-// accumulator is 64 registers instead of the 128 that a 2x1 grid over a doubled
-// M range needs -- both of which the wave4m2 direct-B kid runs out of at
-// WG_PER_CU=2. The footprint did come down (120 VGPRs, no spill) and it bought
-// nothing, because the smaller tile re-reads B twice as often; the kernel it
-// feeds is kept as that control. See the kid 189/197 notes in
-// opus_gemm_common.py.
-template<int BLOCK_SIZE_,
-        typename BLOCK_,
-        typename DTYPE_,
-        typename VEC_,
-        typename GROUP_,
-        int WG_PER_CU_>
-struct opus_gemm_a8w8_mxscale_flatmm_splitk_bpreshuffle_allwave_bdirect_traits_gfx950
-    : opus_gemm_a8w8_mxscale_flatmm_splitk_bpreshuffle_traits_gfx950<BLOCK_SIZE_, BLOCK_, DTYPE_, VEC_, GROUP_, WG_PER_CU_, true, true> {
-    using base = opus_gemm_a8w8_mxscale_flatmm_splitk_bpreshuffle_traits_gfx950<
-        BLOCK_SIZE_, BLOCK_, DTYPE_, VEC_, GROUP_, WG_PER_CU_, true, true>;
-
-    static constexpr int b_direct_load_insts = base::COM_REP_N * base::COM_REP_K * 2;
-    static_assert(b_direct_load_insts == base::b_ds_read_insts,
-                  "direct B must fetch exactly what the LDS path used to ds_read");
-
-    static_assert(base::ALL_WAVE && base::T_M == 2 && base::T_N == 2);
-    // At 128 columns both N-waves sit inside one B scale group, so
-    // SFB_GROUP_STRIDE is 0 and every wave reads group 0. At 256 an N-wave is
-    // exactly GROUP_N wide, so the stride is 1 and wave_id_n indexes the group
-    // directly -- the same per-wave base the LDS all-wave path carries.
-    static_assert(base::B_N <= 2 * base::GROUP_N,
-                  "all-wave direct-B spans at most two B scale groups");
-    static_assert(base::slots % base::LOAD_WAVES == 0,
-                  "each A load group must split evenly across the four staging waves");
-
-    // Accumulator, one A fragment, and the B buffers the schedule alternates --
-    // the headroom left is what addressing and the scales get inside a
-    // 256-register wave. Doubling B_N doubles both the accumulator and a B
-    // buffer, which at 256 columns puts the double-buffered form at 288 and out
-    // of the file; that tile runs one B buffer instead (see B_REG_BUFS in the
-    // kernel) and lands at exactly 224.
-    static constexpr int B_REG_BUFS = base::B_N > base::GROUP_N ? 1 : 2;
-    static constexpr int est_acc_vgpr = base::COM_REP_M * base::COM_REP_N * 4;
-    static constexpr int est_a_vgpr = base::a_ds_read_insts * 4;
-    static constexpr int est_b_vgpr = B_REG_BUFS * b_direct_load_insts * 4;
-    static_assert(est_acc_vgpr + est_a_vgpr + est_b_vgpr <= 224,
-                  "no room left for addressing inside the 256-register wave");
 };

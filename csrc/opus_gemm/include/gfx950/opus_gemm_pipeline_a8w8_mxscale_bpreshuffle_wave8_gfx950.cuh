@@ -57,6 +57,14 @@
 // are shared verbatim.
 #include "opus_gemm_pipeline_a8w8_mxscale_flatmm_splitk_gfx950.cuh"
 
+// SF_SHUF_IN_LDS (the kernel's trailing template bool, per kid) stages the
+// shuffle_scale words through the LDS panel instead of reading them from global
+// on every K tile. The two do not buy the same thing -- the panel gets the scale
+// load off the vmcnt critical path, the layout fills op_sel at COM_REP_M < 4 --
+// and the panel holds the shuffled dwords verbatim, so only where the word comes
+// from moves. SF_PREFETCH turns off with it, existing to hide a load that no
+// longer happens. Per-kid rather than a macro.
+
 #ifdef __HIP_DEVICE_COMPILE__
 
 // Scaled MFMA over the register tile with M-packed A scales and staged B waits.
@@ -75,13 +83,13 @@
 // issued after this tile's B (the next A tile's async copies), which the caller
 // knows and this loop cannot.
 //
-// SHUFFLE_SCALE takes the scale words already packed, in the reference kernel's
-// layout: one dword per (subtile pair, K tile pair), holding two M subtiles 16
-// rows apart crossed with two consecutive K tiles. Nothing is packed here, and
-// the MFMA picks its byte with scale_op_sel = (KP << 1) | (im & 1) -- one
-// immediate for both operands, since B's dword doubles each byte and spends no
-// bit on M. KP is the K tile's parity within its pair, so it is a template
-// parameter and the caller unrolls K by two.
+// SHUFFLE_SCALE takes the scale words already packed, so
+// nothing is packed here: the MFMA picks its byte with
+// scale_op_sel = (KP << 1) | (M subtile parity), one immediate for both operands
+// since B's dword doubles each byte and spends no bit on M. KP is the K tile's
+// parity within its pair, hence a template parameter, and the caller unrolls K
+// by two. The M half is (m / SF_SUB) & 1, not im & 1 -- sf_slot/sf_mbit below
+// apply SF_GEOM's decomposition of it.
 template<typename T, typename Mma, int B_TRAIL, bool B_STAGED_WAIT,
          bool SHUFFLE_SCALE = false, int KP = 0,
          typename VA, typename VB, typename VSFA, typename VSFB, typename VC>
@@ -93,8 +101,20 @@ OPUS_D void mma_mxscale_wave8_accum(const VA& v_a, const VB& v_b,
     static_assert(!SHUFFLE_SCALE || T::COM_REP_K <= 2,
                   "the shuffle_scale layout's dword holds two K blocks, so a tile covers "
                   "one of them (paired across tiles) or both");
-    static_assert(!SHUFFLE_SCALE || T::COM_REP_M % 2 == 0,
-                  "the shuffle_scale layout pairs M subtiles inside the dword");
+    static_assert(!SHUFFLE_SCALE || T::SF_SHUF_OK,
+                  "the tile cannot index this layout: SF_MB must divide into SF_SUB "
+                  "(paired) or be exactly 2*SF_SUB (wide, one M byte per dword given "
+                  "up to the neighbouring wave). SF_MB == 4*SF_SUB straddles two n1 "
+                  "blocks and has no wave-uniform fold");
+    static_assert(!SHUFFLE_SCALE || T::B_M % (2 * T::SF_SUB) == 0,
+                  "the M-subtile parity is compile-time only while the tile's rows block "
+                  "evenly by 2*SF_SUB; a narrower tile needs the runtime MP branch");
+    // The wave M remap reorders the A fragment and nothing else: make_layout_ra_mxsk
+    // splits the m-repeat into a pair-block index and a within-block half, so the y
+    // dims flatten as [im/T_M][ik][im%T_M] instead of [im][ik]. Same fragment, same
+    // load, same register count -- only i_tile_a below moves. Read off SF_GEOM
+    // rather than a template argument so it cannot disagree with the layout call.
+    constexpr bool SF_WPAIR = SHUFFLE_SCALE && T::SF_GEOM::WAVE_PAIR;
     using MMA = typename Mma::MMA;
     constexpr int a_len = Mma::mma_a_len;
     constexpr int b_len = Mma::mma_b_len;
@@ -145,20 +165,33 @@ OPUS_D void mma_mxscale_wave8_accum(const VA& v_a, const VB& v_b,
             constexpr int im = decltype(im_c)::value;
             opus::static_for<T::COM_REP_K>([&](auto ik_c) {
                 constexpr int ik = decltype(ik_c)::value;
+                // Subtile im's place in the layout. Both regimes live in
+                // opus_sf_shuf_geom's SLOT_OF/MB_BIT_OF, so this and
+                // read_scales_shuf cannot drift apart on the register order.
+                //
+                // At COM_REP_K == 2 the dword's two K blocks are both inside this
+                // tile, so its op_sel bit is the K repeat, not the caller's parity.
+                constexpr int shuf_kp = T::COM_REP_K == 2 ? ik : KP;
+                constexpr int sf_reg  = T::SF_GEOM::REG_OF(im, ik);
                 int scale_a, scale_b;
                 if constexpr (SHUFFLE_SCALE) {
-                    scale_a = v_sfa[im / 2];
+                    scale_a = v_sfa[sf_reg];
                     scale_b = v_sfb[in / rep_n_per_scale];
                 } else {
                     scale_a = packed_sfa[ik * T::SFA_WORDS + im / 4];
                     scale_b = packed_sfb[(in / rep_n_per_scale) * T::COM_REP_K + ik];
                 }
-                // At COM_REP_K == 2 the dword's two K blocks are both inside this
-                // tile, so its op_sel bit is the K repeat and needs no unrolled
-                // parity from the caller.
-                constexpr int shuf_kp = T::COM_REP_K == 2 ? ik : KP;
-                constexpr int op_sel = SHUFFLE_SCALE ? ((shuf_kp << 1) | (im & 1)) : (im % 4);
-                constexpr int i_tile_a = im * T::COM_REP_K + ik;
+                constexpr int op_sel =
+                    SHUFFLE_SCALE ? T::SF_GEOM::OPSEL_A(im, shuf_kp) : (im % 4);
+                // B's dword stores each K byte twice, so only the K bit matters
+                // there and the low bit is free. It carries A's M bit anyway, purely
+                // so the emitted immediate does not move.
+                constexpr int op_sel_b =
+                    SHUFFLE_SCALE ? ((shuf_kp << 1) | T::SF_GEOM::MB_BIT_OF(im)) : 0;
+                constexpr int i_tile_a =
+                    SF_WPAIR ? ((im / T::T_M) * T::COM_REP_K + ik) * T::T_M
+                                   + (im % T::T_M)
+                             : (im * T::COM_REP_K + ik);
                 constexpr int i_tile_b = in * T::COM_REP_K + ik;
                 constexpr int i_tile_c = im * T::COM_REP_N + in;
                 auto s_a = opus::slice(v_a,
@@ -172,7 +205,7 @@ OPUS_D void mma_mxscale_wave8_accum(const VA& v_a, const VB& v_b,
                     opus::number<i_tile_c * c_len + c_len>{});
                 s_c = MMA{}(s_a, s_b, s_c, scale_a, scale_b,
                             opus::number<op_sel>{},
-                            opus::number<SHUFFLE_SCALE ? op_sel : 0>{});
+                            opus::number<op_sel_b>{});
                 opus::set_slice(v_c, s_c,
                     opus::number<i_tile_c * c_len>{},
                     opus::number<i_tile_c * c_len + c_len>{});
@@ -209,9 +242,14 @@ OPUS_D void mma_mxscale_wave8_accum(const VA& v_a, const VB& v_b,
 // same instruction count, but the row axis now sits at a stride of one dword, so
 // 16 lanes hit one 64B line instead of 16. It implies its own K unroll of two,
 // and so needs K % (2*B_K) == 0.
+//
+// SF_SHUF_IN_LDS stages those shuffled words through the LDS panel instead; see the
+// note at the top of this file. It requires SHUFFLE_SCALE and it requires the
+// panel to fit, and both are static_asserts rather than a silent downgrade.
 template<typename Traits, typename D_OUT = void, bool DIRECT_ONLY = false,
          bool PREFETCH_SCALE = false, bool PRELOAD_SF_LDS = true,
-         bool SFA_MPACK_GLOBAL = false, int XCD_WGM = 0, bool SHUFFLE_SCALE = false>
+         bool SFA_MPACK_GLOBAL = false, int XCD_WGM = 0, bool SHUFFLE_SCALE = false,
+         bool SF_SHUF_IN_LDS = false>
 __global__ __launch_bounds__(Traits::BLOCK_SIZE, Traits::WG_PER_CU)
 void gemm_a8w8_mxscale_bpreshuffle_wave8_kernel(opus_gemm_scale_splitk_kargs_gfx950 kargs)
 {
@@ -244,7 +282,28 @@ void gemm_a8w8_mxscale_bpreshuffle_wave8_kernel(opus_gemm_scale_splitk_kargs_gfx
     // at the first MFMA regardless, which is what the conservative wait does.
     // Global scale reads add vmcnt entries this loop's piecewise waits do not
     // account for, so they turn the staged B wait off.
-    constexpr bool B_STAGED_WAIT = !SFA_MPACK_GLOBAL && !SHUFFLE_SCALE;
+    // Shuffled words staged in LDS. Declared here because it decides whether the
+    // loop still has a scale load in its vmcnt stream, which B_STAGED_WAIT answers.
+    // The test is residency, not capacity. SF_SHUF_K1_MAX
+    // makes it fit by construction; the check is for a future edit.
+    constexpr int SF_SHUF_LDS_BYTES =
+        T::SF_SHUF_RING_LDS + T::SF_SHUF_K1_MAX * T::SF_SHUF_WORDS_PER_K1 * 4 + 256;
+    constexpr bool SF_SHUF_FITS = SF_SHUF_LDS_BYTES <= T::SF_PANEL_LDS_CEILING;
+    // Hard errors, not downgrades. `&&`-ed into SF_SHUF_IN_LDS, as they used to be, a
+    // kid that did not fit compiled as the reg variant under an _lds name --
+    // present in the matrix, mislabelled, and reporting "the panel changes
+    // nothing", which is how the kid210 regression nearly shipped.
+    static_assert(!SF_SHUF_IN_LDS || SHUFFLE_SCALE,
+                  "SF_SHUF_IN_LDS stages the shuffled scale words; it means nothing "
+                  "without SHUFFLE_SCALE");
+    static_assert(!SF_SHUF_IN_LDS || SF_SHUF_FITS,
+                  "the shuffled scale panel does not fit under SF_PANEL_LDS_CEILING "
+                  "for this tile: emit this kid without SF_SHUF_IN_LDS rather than "
+                  "letting it degrade to the register path under an _lds name");
+    // With the words in LDS the loop issues no scale load at all, so the plain
+    // staged B wait applies again -- there is nothing left for the KP=1 staging to
+    // account for.
+    constexpr bool B_STAGED_WAIT = !SFA_MPACK_GLOBAL && (!SHUFFLE_SCALE || SF_SHUF_IN_LDS);
 
     const int split_id = opus::block_id_x() % kargs.split_k;
     const int wgid     = opus::block_id_x() / kargs.split_k;
@@ -364,11 +423,16 @@ void gemm_a8w8_mxscale_bpreshuffle_wave8_kernel(opus_gemm_scale_splitk_kargs_gfx
     // prefetched build down to 8 spills. Nothing in the traits separates the two
     // 32-tile shapes -- they agree on every REP -- so the bound carries B_M:
     // past 128 rows per workgroup the wave has no room left.
-    constexpr bool SF_PREFETCH = SHUFFLE_SCALE && T::COM_REP_K == 1
+    constexpr bool SF_PREFETCH = !SF_SHUF_IN_LDS && SHUFFLE_SCALE && T::COM_REP_K == 1
                                  && (T::COM_REP_M * T::COM_REP_N <= 16
                                      || (T::COM_REP_M * T::COM_REP_N <= 32
                                          && T::B_M <= 128));
-    constexpr int SF_PF = SF_PREFETCH ? T::COM_REP_M / 2 + T::SFB_GROUPS : 0;
+    // Loads in flight, not registers held. On a WIDE kid this over-counts: the
+    // `>> 8*np` fold is a *use* of the loaded word, so it drains vmcnt where it
+    // sits and every wait below becomes a no-op -- over-synchronised rather than
+    // under-. It also means the prefetch buys a WIDE kid nothing unless the
+    // compiler sinks the fold past the rotate; read the ISA before assuming.
+    constexpr int SF_PF = SF_PREFETCH ? T::SF_A_SLOTS + T::SFB_GROUPS : 0;
 
     // B never lands in LDS here, so only A is staged.
     __shared__ char smem_a[PF * T::NUM_LOAD_GROUPS_PER_BM
@@ -387,6 +451,18 @@ void gemm_a8w8_mxscale_bpreshuffle_wave8_kernel(opus_gemm_scale_splitk_kargs_gfx
     // the high part of the panel row and the lane-dependent part is the low part.
     constexpr int SFA_MB = T::T_M * T::W_M;
     static_assert(SFA_ROWS == SFA_MB * T::COM_REP_M);
+    // The shuffled layout's row-pair distance. Equal to SFA_MB only at T_M=2:
+    // everything shuffled indexes off SF_SUB, everything M-packed off SFA_MB.
+    constexpr int SF_SUB   = T::SF_SUB;
+    constexpr int NL_SLOTS = T::SF_NL_SLOTS;
+    using SFG = typename T::SF_GEOM;
+    // SF_WPAIR is the only thing here that renumbers a row; the A fragment layout,
+    // the C store and the shuffled scale address all follow it, and nothing else
+    // in the kernel knows a row number (A staging is per load group, the M edge is
+    // masked by num_records). Gated on SHUFFLE_SCALE: the M-packed scale panel
+    // uses the default map and would have to be re-packed.
+    constexpr bool SF_WPAIR = SHUFFLE_SCALE && SFG::WAVE_PAIR;
+    constexpr bool SF_WIDE = SFG::WIDE_SPLIT;
     // A read from global needs no panel, which also gives back the SFA_ROWS/
     // N_SCALE_GROUPS share of this array -- at B_M=256 against 2 scale groups
     // that is all but 128 bytes of it. The shuffle_scale layout reads both panels from
@@ -396,6 +472,29 @@ void gemm_a8w8_mxscale_bpreshuffle_wave8_kernel(opus_gemm_scale_splitk_kargs_gfx
     constexpr int SF_LDS_ELEMS =
         ((SF_LDS_A ? SFA_ROWS : 0) + (SF_LDS_B ? T::N_SCALE_GROUPS : 0)) * SF_SCALES_MAX;
     alignas(16) __shared__ D_SF smem_sf[SF_LDS_ELEMS > 0 ? SF_LDS_ELEMS : 1];
+
+    // Shuffled-word panel, in dwords, holding what read_scales_shuf would
+    // otherwise fetch from global over the whole split:
+    //
+    //   A  [block b][k1][nl] -- b < SF_N1_BLOCKS, nl < SF_SUB, k1 < K1
+    //   B  [group g][k1]     -- g < N_SCALE_GROUPS, covering every wave's sfb_group0
+    //
+    // For A the run over (k1, nl) is contiguous in the global layout too, which is
+    // what makes the fill a straight copy. K1 counts 128-block *pairs*, and the
+    // depth is the shuffled panel's own K bound.
+    constexpr int SHUF_K1_MAX = T::SF_SHUF_K1_MAX;
+    // shuf_a_word0 and shuf_r_word have no row % SF_SUB term on any arm, so a tile
+    // narrower than a subtile pair would read the block's first rows rather than
+    // its own -- on the global arm as well as the panel arm. Inert by inventory
+    // (every tile here is B_M >= 128); flatmm_splitk carries the term and so hosts
+    // the B_M = 16 panel without this restriction.
+    static_assert(!SHUFFLE_SCALE || !SFG::SUBTILE_TILE,
+                  "a tile narrower than 2*SF_SUB cannot read the shuffled layout here: "
+                  "shuf_a_word0 omits its row % SF_SUB offset on every arm");
+    constexpr int SHUF_A_WORDS = SF_SHUF_IN_LDS ? T::SF_N1_BLOCKS * SHUF_K1_MAX * SF_SUB : 0;
+    constexpr int SHUF_B_WORDS = SF_SHUF_IN_LDS ? T::N_SCALE_GROUPS * SHUF_K1_MAX : 0;
+    constexpr int SHUF_WORDS   = SHUF_A_WORDS + SHUF_B_WORDS;
+    alignas(16) __shared__ int smem_sf_shuf[SHUF_WORDS > 0 ? SHUF_WORDS : 1];
 
     auto smem_a_at = [&](int slot_k, int m_block, int k_group) -> D_A* {
         return reinterpret_cast<D_A*>(smem_a
@@ -521,7 +620,7 @@ void gemm_a8w8_mxscale_bpreshuffle_wave8_kernel(opus_gemm_scale_splitk_kargs_gfx
         lane_id, wave_id_load, kargs.stride_a);
     auto u_sa = make_layout_smem_group_load_mxsk<T, T::LOAD_WAVES>(lane_id, wave_id_load);
 
-    auto u_ra = make_layout_ra_mxsk<T>(lane_id, wave_id_m);
+    auto u_ra = make_layout_ra_mxsk<T, T::COM_REP_M, SF_WPAIR>(lane_id, wave_id_m);
     // Each N-wave owns COM_REP_N contiguous 16-column blocks of the tile.
     auto u_gb_direct = make_layout_gmem_b_direct_mxsk<T>(
         lane_id, kargs.stride_b, wave_id_n * T::COM_REP_N);
@@ -537,22 +636,18 @@ void gemm_a8w8_mxscale_bpreshuffle_wave8_kernel(opus_gemm_scale_splitk_kargs_gfx
     // GROUP_N makes consecutive N-waves share a group rather than step one.
     const int sfb_group0 = wave_id_n * T::SFB_WAVE_COLS / T::GROUP_N;
 
-    // Shuffled scale addressing, counted in dwords. A lane's row is base + im*SFA_MB +
-    // r_lane with r_lane < SFA_MB, and the dword pairs subtiles im and im+1, so
-    // splitting the row over blocks of 2*SFA_MB puts the pair index in the high
-    // part, op_sel's M bit in the middle and the lane in the low part:
+    // Shuffled scale addressing, counted in dwords. Splitting a row over blocks of
+    // 2*SF_SUB puts the block index high, op_sel's M bit in the middle and the row
+    // within the subtile low:
     //
-    //     word = ((base/(2*SFA_MB) + p)*K1 + k1)*SFA_MB + r_lane
+    //     word = ((base/(2*SF_SUB) + b)*K1 + k1)*SF_SUB + nl*SFA_MB + r_lane
     //
-    // The lane axis therefore has stride one dword and a wave's 16 lanes cover a
-    // single 64B line. Both operands index off K1, the 128-block pair count over
-    // the whole of K, which is what the host padded the panels out to.
-    //
-    // op_sel's M bit is the subtile parity, which is compile-time at any T_M --
-    // r_lane absorbs wave_id_m. SFA_MB=16 is FlyDSL's own layout; T_M=2 pairs
-    // rows 32 apart, which is what the shuffle's `sub` argument selects.
-    static_assert(!SHUFFLE_SCALE || T::B_M % (2 * SFA_MB) == 0,
-                  "the shuffle_scale layout blocks the tile's rows by adjacent subtile pairs");
+    // The lane axis has stride one dword, so a wave's 16 lanes cover one 64B line.
+    // `nl` is the second slot axis, live only at T_M=1, where the tile holds two
+    // subtiles in one SF_SUB row range as separate dwords rather than bytes of one.
+    static_assert(!SHUFFLE_SCALE || T::B_M % (2 * SF_SUB) == 0,
+                  "the shuffle_scale layout blocks the tile's rows by 2*SF_SUB, and a "
+                  "narrower tile makes op_sel's M bit runtime (needs the MP branch)");
     // K1 counts 128-block pairs over the whole of K, which is the pitch the host
     // padded the panels to -- not the tile count, since a tile covers one block
     // or two depending on B_K.
@@ -565,9 +660,73 @@ void gemm_a8w8_mxscale_bpreshuffle_wave8_kernel(opus_gemm_scale_splitk_kargs_gfx
     auto g_sfb_shuf = make_gmem(
         reinterpret_cast<const int*>(reinterpret_cast<const D_SF*>(kargs.ptr_sfb)
                                      + (size_t)batch_id * kargs.stride_sfb_batch));
-    const int shuf_a_word0 = (row / (2 * SFA_MB)) * shuf_k1 * SFA_MB
-                          + wave_id_m * T::W_M + lane_id % T::W_M;
+    // Three arms for where wave_id_m goes: below SF_WIDE it
+    // stays in the word's low part; at SF_WIDE two waves share a word and differ
+    // only in which M *byte* they read, so it leaves the address and reappears as
+    // sf_wave_shift; under the remap it owns whole 2*SF_SUB row blocks and so
+    // multiplies the block pitch instead. Spelled as whole expressions rather than
+    // one with a substituted term -- the expression-tree trap, md ?9.
+    const int shuf_a_word0 =
+        SF_WPAIR ? (row / (2 * SF_SUB) + wave_id_m) * shuf_k1 * SF_SUB
+                       + lane_id % T::W_M
+        : SF_WIDE ? (row / (2 * SF_SUB)) * shuf_k1 * SF_SUB
+                      + (wave_id_m * T::W_M + lane_id % T::W_M) % SF_SUB
+                : (row / (2 * SF_SUB)) * shuf_k1 * SF_SUB
+                      + wave_id_m * T::W_M + lane_id % T::W_M;
     const int shuf_b_word0 = (col / T::GROUP_N + sfb_group0) * shuf_k1;
+
+    // Fill the shuffled panel. Both operands are copied for the whole workgroup,
+    // not per wave: sfb_group0 is a per-wave offset into the WG's N_SCALE_GROUPS,
+    // and the A run spans the layout's whole SF_SUB row range. Copied global -> LDS
+    // directly, no word through a register.
+    constexpr int SF_FILL_VEC  = (SF_SUB % 4 == 0) ? 4 : 1;   // dwords per lane
+    constexpr int SF_FILL_WAVE = 64 * SF_FILL_VEC;            // dwords per instruction
+    constexpr int SF_FILL_NW   = T::BLOCK_SIZE / 64;
+    if constexpr (SF_SHUF_IN_LDS) {
+        // This panel's own bound, smaller than the plain panel's. The launcher
+        // checks it with AITER_CHECK, so reaching this return means a caller went
+        // around it -- while sf_shuf_in_lds was a bare macro, codegen could not see
+        // the panel and emitted no check, and this return handed back zeros.
+        if (loops > T::SF_SHUF_K_TILES_MAX) return;
+        const int k1n = T::COM_REP_K == 2 ? loops : (loops + 1) / 2;
+        const int a_run = k1n * SF_SUB;
+        // dst is M0 and must stay wave-uniform; the per-lane part is the source
+        // offset only. Lanes past the run are masked off rather than clamped, so
+        // no word outside the panel is written.
+        opus::static_for<T::SF_N1_BLOCKS>([&](auto b_c) {
+            constexpr int b = decltype(b_c)::value;
+            const int gbase = ((row / (2 * SF_SUB) + b) * shuf_k1 + shuf_k1_start) * SF_SUB;
+            const int dbase = b * (SHUF_K1_MAX * SF_SUB);
+            for (int off = wave_id * SF_FILL_WAVE; off < a_run;
+                 off += SF_FILL_NW * SF_FILL_WAVE) {
+                const int lane_off = off + lane_id * SF_FILL_VEC;
+                if (lane_off < a_run) {
+                    g_sfa_shuf.template async_load<SF_FILL_VEC>(
+                        smem_sf_shuf + dbase + lane_off, gbase + lane_off);
+                }
+            }
+        });
+        // B is N_SCALE_GROUPS runs of k1n dwords, and k1n carries no alignment, so
+        // this one copies a dword per lane. It is tiny next to A.
+        for (int g = 0; g < T::N_SCALE_GROUPS; ++g) {
+            const int gbase = (col / T::GROUP_N + g) * shuf_k1 + shuf_k1_start;
+            const int dbase = SHUF_A_WORDS + g * SHUF_K1_MAX;
+            for (int off = wave_id * 64; off < k1n; off += SF_FILL_NW * 64) {
+                const int lane_off = off + lane_id;
+                if (lane_off < k1n) {
+                    g_sfb_shuf.template async_load<1>(
+                        smem_sf_shuf + dbase + lane_off, gbase + lane_off);
+                }
+            }
+        }
+        // vmcnt alone. buffer_load ... offen lds is VMEM and its counter only
+        // drops once the data is in LDS, so this covers the whole DMA -- same
+        // budget the A ring buffer's async_loads sit in (A_MB below). The plain
+        // panel needs lgkmcnt too because it fills through ds_write; this path
+        // has no ds_write to wait on.
+        s_waitcnt_vmcnt(0_I);
+        __builtin_amdgcn_s_barrier();
+    }
 
     // A tile issue, always a whole tile: an index past the end re-reads the last
     // tile's bytes into the slot it would have used -- one nobody reads again.
@@ -612,26 +771,74 @@ void gemm_a8w8_mxscale_bpreshuffle_wave8_kernel(opus_gemm_scale_splitk_kargs_gfx
     //
     // Under SF_PREFETCH there are two sets: the pair being computed reads _shuf
     // while the next pair's words land in _shuf_nx, and the KP=1 tile rotates them
-    // down once its staged wait has retired the load. The rotate is COM_REP_M/2 +
+    // down once its staged wait has retired the load. The rotate is SF_A_SLOTS +
     // SFB_GROUPS v_movs per pair, which buys a compile-time register index -- a
     // runtime parity would index the vector and force it to scratch.
-    vector_t<int, SHUFFLE_SCALE ? T::COM_REP_M / 2 : 1> v_sfa_shuf;
+    //
+    // SF_A_SLOTS_K is A_SLOTS times KD, and KD is 1 throughout this pipeline
+    // (COM_REP_K <= 2), so it is the same count the loops below use.
+    vector_t<int, SHUFFLE_SCALE ? T::SF_A_SLOTS_K : 1> v_sfa_shuf;
     vector_t<int, SHUFFLE_SCALE ? T::SFB_GROUPS : 1> v_sfb_shuf;
-    vector_t<int, SF_PREFETCH ? T::COM_REP_M / 2 : 1> v_sfa_shuf_nx;
+    vector_t<int, SF_PREFETCH ? T::SF_A_SLOTS_K : 1> v_sfa_shuf_nx;
     vector_t<int, SF_PREFETCH ? T::SFB_GROUPS : 1> v_sfb_shuf_nx;
+
+    // The lane's row within the subtile pair, which is the low part of the A word
+    // index in both the global layout and the panel.
+    const int shuf_r_lane = wave_id_m * T::W_M + lane_id % T::W_M;
+    // The M byte this lane's wave owns. op_sel is an MFMA immediate and this bit is
+    // runtime, but wave-uniform, so it rides in a plain `word >> 8*bit` -- nothing
+    // below SF_WIDE. Under the remap the wave is not in the row at all, so both
+    // byte-side terms are dead. shuf_r_word is the panel's low part only (the
+    // global side folds the same terms into shuf_a_word0).
+    const int shuf_r_word   = SF_WPAIR ? lane_id % T::W_M
+                                             + wave_id_m * (SHUF_K1_MAX * SF_SUB)
+                            : SF_WIDE  ? (shuf_r_lane % SF_SUB) : shuf_r_lane;
+    const int sf_wave_shift = SF_WIDE ? (((shuf_r_lane / SF_SUB) & 1) << 3) : 0;
 
     auto read_scales_shuf = [&](int k, auto& dst_a, auto& dst_b) {
         const int k1 = T::COM_REP_K == 2 ? k : (k >> 1);
-        opus::static_for<T::COM_REP_M / 2>([&](auto p_c) {
-            constexpr int p = decltype(p_c)::value;
-            dst_a[p] = load<1>(
-                g_sfa_shuf, shuf_a_word0 + (p * shuf_k1 + shuf_k1_start + k1) * SFA_MB)[0];
-        });
-        opus::static_for<T::SFB_GROUPS>([&](auto ng_c) {
-            constexpr int ng = decltype(ng_c)::value;
-            dst_b[ng] = load<1>(
-                g_sfb_shuf, shuf_b_word0 + ng * shuf_k1 + shuf_k1_start + k1)[0];
-        });
+        if constexpr (SF_SHUF_IN_LDS) {
+            // Same words, same op_sel, staged base instead of the global one.
+            opus::static_for<T::SF_A_SLOTS>([&](auto s_c) {
+                constexpr int s  = decltype(s_c)::value;
+                // which 2*SF_SUB row block; the remap's slots step two of them,
+                // the lane's own, and the wave's offset rides in shuf_r_word
+                constexpr int b  = SF_WPAIR ? s * SFG::N1_STEP : s / NL_SLOTS;
+                constexpr int nl = s % NL_SLOTS;   // which subtile-wide slot in it
+                int w = smem_sf_shuf[b * (SHUF_K1_MAX * SF_SUB) + k1 * SF_SUB
+                                     + nl * SFA_MB + shuf_r_word];
+                if constexpr (SF_WIDE) w >>= sf_wave_shift;
+                dst_a[s] = w;
+            });
+        } else {
+            opus::static_for<T::SF_A_SLOTS>([&](auto s_c) {
+                constexpr int s  = decltype(s_c)::value;
+                // As in the LDS arm: two blocks per slot under the remap, and the
+                // wave's own block is already inside shuf_a_word0.
+                constexpr int b  = SF_WPAIR ? s * SFG::N1_STEP : s / NL_SLOTS;
+                constexpr int nl = s % NL_SLOTS;
+                int w = load<1>(
+                    g_sfa_shuf, shuf_a_word0 + (b * shuf_k1 + shuf_k1_start + k1) * SF_SUB
+                                             + nl * SFA_MB)[0];
+                if constexpr (SF_WIDE) w >>= sf_wave_shift;
+                dst_a[s] = w;
+            });
+        }
+        // B needs no M fold at all: its dword stores each K byte twice, so it never
+        // spends a byte on M.
+        if constexpr (SF_SHUF_IN_LDS) {
+            opus::static_for<T::SFB_GROUPS>([&](auto ng_c) {
+                constexpr int ng = decltype(ng_c)::value;
+                dst_b[ng] = smem_sf_shuf[SHUF_A_WORDS
+                                         + (sfb_group0 + ng) * SHUF_K1_MAX + k1];
+            });
+        } else {
+            opus::static_for<T::SFB_GROUPS>([&](auto ng_c) {
+                constexpr int ng = decltype(ng_c)::value;
+                dst_b[ng] = load<1>(
+                    g_sfb_shuf, shuf_b_word0 + ng * shuf_k1 + shuf_k1_start + k1)[0];
+            });
+        }
     };
 
     // Prefetch target for the pair after the one at k. Past the last pair it
@@ -743,8 +950,8 @@ void gemm_a8w8_mxscale_bpreshuffle_wave8_kernel(opus_gemm_scale_splitk_kargs_gfx
         // Safe here and only here: the staged wait above retired the prefetch, so
         // the source registers hold landed words rather than a load in flight.
         if constexpr (SF_PREFETCH && KP == 1) {
-            opus::static_for<T::COM_REP_M / 2>([&](auto p_c) {
-                v_sfa_shuf[decltype(p_c)::value] = v_sfa_shuf_nx[decltype(p_c)::value];
+            opus::static_for<T::SF_A_SLOTS_K>([&](auto s_c) {
+                v_sfa_shuf[decltype(s_c)::value] = v_sfa_shuf_nx[decltype(s_c)::value];
             });
             opus::static_for<T::SFB_GROUPS>([&](auto ng_c) {
                 v_sfb_shuf[decltype(ng_c)::value] = v_sfb_shuf_nx[decltype(ng_c)::value];
@@ -832,6 +1039,10 @@ void gemm_a8w8_mxscale_bpreshuffle_wave8_kernel(opus_gemm_scale_splitk_kargs_gfx
         // buffer soffset: only the layout's offset reaches the bounds-checked
         // voffset, so a row offset passed as soffset addresses past num_records
         // instead of being dropped, and faults on any tile the M bound clips.
+        //
+        // Under the wave M remap the C store follows the same renumbering: u_gc2's
+        // p-coord already moves by W_M, so the layout carries the extra
+        // (T_M-1)*W_M.
         opus::static_for<T::COM_REP_M>([&](auto im_c) {
             constexpr int im = decltype(im_c)::value;
             opus::static_for<T::COM_REP_N>([&](auto j_c) {
@@ -841,9 +1052,22 @@ void gemm_a8w8_mxscale_bpreshuffle_wave8_kernel(opus_gemm_scale_splitk_kargs_gfx
                     constexpr int e = decltype(e_c)::value;
                     vj[e] = v_c[(im * T::COM_REP_N + j) * C_LEN + e];
                 });
-                store<T::VEC_C>(g, vj,
-                                u_gc2 + im * T::T_M * T::W_M * stride_c_main,
-                                (wave_id_n * T::COM_REP_N + j) * T::W_N);
+                // Both arms spelled out whole rather than sharing a named offset
+                // term.
+                if constexpr (SF_WPAIR) {
+                    constexpr int wp_im_row =
+                        (im / T::T_M) * T::T_M * T::T_M * T::W_M
+                        + (im % T::T_M) * T::W_M;
+                    store<T::VEC_C>(g, vj,
+                                    u_gc2 + (wp_im_row
+                                             + wave_id_m * (T::T_M - 1) * T::W_M)
+                                                * stride_c_main,
+                                    (wave_id_n * T::COM_REP_N + j) * T::W_N);
+                } else {
+                    store<T::VEC_C>(g, vj,
+                                    u_gc2 + im * T::T_M * T::W_M * stride_c_main,
+                                    (wave_id_n * T::COM_REP_N + j) * T::W_N);
+                }
             });
         });
     };

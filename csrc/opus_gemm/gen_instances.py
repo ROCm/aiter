@@ -144,6 +144,7 @@ INPUT_DTYPE_MAP = {
     "a8w8_mxscale_bmm_bpreshuffle": ("fp8_t", "fp8_t"),
     "a8w8_mxscale_bmm_bpreshuffle_bcast": ("fp8_t", "fp8_t"),
     "a8w8_mxscale_bmm_bpreshuffle_bdirect": ("fp8_t", "fp8_t"),
+    "a8w8_mxscale_bmm_bpreshuffle_bdirect_tilen": ("fp8_t", "fp8_t"),
     "a8w8_mxscale_bmm_bpreshuffle_blds": ("fp8_t", "fp8_t"),
     "a8w8_mxscale_bmm_bpreshuffle_allwave": ("fp8_t", "fp8_t"),
     "a8w8_mxscale_bmm_bpreshuffle_sfmpack": ("fp8_t", "fp8_t"),
@@ -157,8 +158,6 @@ INPUT_DTYPE_MAP = {
     "a8w8_mxscale_bmm_pipeline_bpreshuffle": ("fp8_t", "fp8_t"),
     "a8w8_mxscale_bmm_wave8n2": ("fp8_t", "fp8_t"),
     "a8w8_mxscale_bmm_wave4m2_selfload": ("fp8_t", "fp8_t"),
-    "a8w8_mxscale_bmm_bpreshuffle_wave4m2_bdirect": ("fp8_t", "fp8_t"),
-    "a8w8_mxscale_bmm_bpreshuffle_allwave_bdirect": ("fp8_t", "fp8_t"),
     "a8w8": ("fp8_t", "fp8_t"),
     "a8w8_blockscale_bpreshuffle_singlebuf": ("fp8_t", "fp8_t"),
     **{tag: ("bf16_t", "bf16_t") for tag in _A16W16_TAGS},
@@ -198,20 +197,23 @@ def _kargs_template_vars(kernel_tag, kargs_name):
     # host TU must forward-declare all four template params so the launcher body
     # (which launches gemm_a8w8_mxscale_flatmm_splitk_kernel<Traits, D_OUT, dir,
     # pfk>) compiles without pulling in the device pipeline header.
-    # The three tags sharing gemm_a8w8_mxscale_flatmm_splitk_kernel carry a 6th
-    # parameter, SHUFFLE_SCALE, which the others' kernels do not declare -- so this list
-    # tracks the KERNEL_FUNC_MAP grouping and not the parameter count.
+    # The tags sharing gemm_a8w8_mxscale_flatmm_splitk_kernel carry a 6th and 7th
+    # parameter, SHUFFLE_SCALE and SF_SHUF_IN_LDS, which the others' kernels do not
+    # declare -- so this list tracks the KERNEL_FUNC_MAP grouping and not the
+    # parameter count. No defaults, deliberately: a missing site must be a
+    # compile error rather than a silent link against the non-panel kernel.
     if kernel_tag in (
         "a8w8_mxscale_bmm_flatmm_splitk",
         "a8w8_mxscale_bmm_fused",
         "a8w8_mxscale_bmm_bpreshuffle_bdirect",
+        "a8w8_mxscale_bmm_bpreshuffle_bdirect_tilen",
         "a8w8_mxscale_bmm_bpreshuffle_blds",
     ):
         return (
             "",
             (
                 ", typename D_OUT, bool DIRECT_ONLY, bool PREFETCH_SCALE,"
-                " bool PRELOAD_SF_LDS, bool SHUFFLE_SCALE"
+                " bool PRELOAD_SF_LDS, bool SHUFFLE_SCALE, bool SF_SHUF_IN_LDS"
             ),
             kargs_name,
         )
@@ -226,10 +228,10 @@ def _kargs_template_vars(kernel_tag, kargs_name):
             ", typename D_OUT, bool DIRECT_ONLY, bool PREFETCH_SCALE, bool PRELOAD_SF_LDS",
             kargs_name,
         )
-    # The wave8 family shares one kernel that carries a 6th, 7th and 8th
-    # parameter: SFA_MPACK_GLOBAL, XCD_WGM and SHUFFLE_SCALE. No defaults here: the
-    # fused host TU pulls in one of these decls per kid, and a default argument
-    # may only appear once per TU. The launchers pass all three explicitly.
+    # The wave8 family shares one kernel that carries a 6th through 9th
+    # parameter: SFA_MPACK_GLOBAL, XCD_WGM, SHUFFLE_SCALE and SF_SHUF_IN_LDS. No
+    # defaults here either -- the fused host TU pulls in one decl per kid and a
+    # default argument may appear only once per TU. The launchers pass all four.
     if kernel_tag in (
         "a8w8_mxscale_bmm_bpreshuffle_wave8n4",
         "a8w8_mxscale_bmm_bpreshuffle_wavetm1",
@@ -239,7 +241,7 @@ def _kargs_template_vars(kernel_tag, kargs_name):
             (
                 ", typename D_OUT, bool DIRECT_ONLY, bool PREFETCH_SCALE,"
                 " bool PRELOAD_SF_LDS, bool SFA_MPACK_GLOBAL, int XCD_WGM,"
-                " bool SHUFFLE_SCALE"
+                " bool SHUFFLE_SCALE, bool SF_SHUF_IN_LDS"
             ),
             kargs_name,
         )
@@ -265,11 +267,7 @@ def _kargs_template_vars(kernel_tag, kargs_name):
         return "", ", typename D_OUT, bool SKIP_SCALE_WAIT", kargs_name
     if kernel_tag == "a8w8_mxscale_bmm_wave8n2":
         return "", ", typename D_OUT", kargs_name
-    if kernel_tag in (
-        "a8w8_mxscale_bmm_wave4m2_selfload",
-        "a8w8_mxscale_bmm_bpreshuffle_wave4m2_bdirect",
-        "a8w8_mxscale_bmm_bpreshuffle_allwave_bdirect",
-    ):
+    if kernel_tag == "a8w8_mxscale_bmm_wave4m2_selfload":
         return (
             "",
             ", typename D_OUT, bool SKIP_SCALE_WAIT, bool PACK_SCALE_ON_DEMAND",
@@ -858,6 +856,7 @@ void
                     "a8w8_mxscale_bmm_bpreshuffle",
                     "a8w8_mxscale_bmm_bpreshuffle_bcast",
                     "a8w8_mxscale_bmm_bpreshuffle_bdirect",
+                    "a8w8_mxscale_bmm_bpreshuffle_bdirect_tilen",
                     "a8w8_mxscale_bmm_bpreshuffle_blds",
                     "a8w8_mxscale_bmm_bpreshuffle_allwave",
                     "a8w8_mxscale_bmm_bpreshuffle_sfmpack",
@@ -871,8 +870,6 @@ void
                     "a8w8_mxscale_bmm_pipeline_bpreshuffle",
                     "a8w8_mxscale_bmm_wave8n2",
                     "a8w8_mxscale_bmm_wave4m2_selfload",
-                    "a8w8_mxscale_bmm_bpreshuffle_wave4m2_bdirect",
-                    "a8w8_mxscale_bmm_bpreshuffle_allwave_bdirect",
                 ):
                     f.write(MANIFEST_BMM_MXSCALE_SPLITK.format(kernel_name=k.name))
                 elif k.kernel_tag in A16W16_TUNE_TAGS:
