@@ -12,7 +12,6 @@ from dataclasses import dataclass
 from typing import Any
 
 from aiter.aot.flydsl.common import cu_num_to_arch, job_identity
-from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
 
 
 def _normalized_enum(value: str) -> str:
@@ -261,19 +260,21 @@ class _FHMoEAOTBackend:
         bias=None,
         stream=None,
     ):
-        shared_w = _shared_weight(dev, n_in, k_in)
-        shared_w_scale = _shared_scale(dev, n_in, k_in)
+        # The v2 launcher ABI declares all buffer arguments as Int64. AOT
+        # compilation never launches or dereferences these buffers, so integer
+        # address placeholders are required here; ptr_arg() creates Pointer
+        # values, which fail in v2's global_typed_ptr() during MLIR emission.
         return (
-            ptr_arg(a),
-            ptr_arg(a_scale),
-            ptr_arg(w),
-            ptr_arg(w_scale),
-            ptr_arg(shared_w),
-            ptr_arg(shared_w_scale),
-            ptr_arg(sorted_expert_ids),
-            ptr_arg(num_valid_ids),
-            ptr_arg(sorted_ids),
-            ptr_arg(sorted_weights),
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
             token_num,
             blocks,
             blocks,
@@ -281,8 +282,8 @@ class _FHMoEAOTBackend:
             n_in,
             0,
             0,
-            ptr_arg(target),
-            ptr_arg(target),
+            0,
+            0,
             stream,
         )
 
