@@ -474,16 +474,16 @@ def _parse_flydsl_gfx1250_kname(name: str) -> dict:
     m = _FLY1250_NAME_RE.match(name)
     assert m is not None, f"unrecognized flydsl_gfx1250 kernel name: {name!r}"
     tm, tn, tk, mw, nw, nb, sk, un = (int(g) for g in m.groups())
-    return dict(
-        tile_m=tm,
-        tile_n=tn,
-        tile_k=tk,
-        m_warp=mw,
-        n_warp=nw,
-        num_buffers=nb,
-        split_k=sk,
-        main_loop_unroll=bool(un),
-    )
+    return {
+        "tile_m": tm,
+        "tile_n": tn,
+        "tile_k": tk,
+        "m_warp": mw,
+        "n_warp": nw,
+        "num_buffers": nb,
+        "split_k": sk,
+        "main_loop_unroll": bool(un),
+    }
 
 
 def flydsl_gfx1250_gemm(
