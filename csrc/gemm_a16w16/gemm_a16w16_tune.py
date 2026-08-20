@@ -231,13 +231,13 @@ def run_opus_gemm_bf16(inp, weight, out, bias=None, kid=0, splitK=0):
     )
     if cache_key in _opus_max_delta_checked:
         return out
-    ref_fp32 = torch.bmm(inp3.float(), weight3.float().transpose(-1, -2))
+    # ``opus_gemm`` is the strict logical-2D public entry point.  Keep this
+    # catastrophic-error guard in the same shape domain instead of referring
+    # to the pre-split adapter's removed 3D views.
+    ref_fp32 = F.linear(inp.float(), weight.float())
     if bias is not None:
-        if bias.dim() == 1:
-            ref_fp32 = ref_fp32 + bias.float().view(1, 1, -1)
-        else:
-            ref_fp32 = ref_fp32 + bias.float().unsqueeze(1)
-    max_delta = (out3.float() - ref_fp32).abs().max().item()
+        ref_fp32 = ref_fp32 + bias.float()
+    max_delta = (out.float() - ref_fp32).abs().max().item()
     max_ref = ref_fp32.abs().max().item()
     bound = max(max_ref * 0.1, 1.0)
     if max_delta > bound:

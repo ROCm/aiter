@@ -21,6 +21,10 @@ Runtime schema (what the tuner emits, and what the runtime reads back):
 the batch-first ``opus_bmm`` entry, so
 those columns must match exactly.
 
+The shipped schema has no output-dtype key. This tuner deliberately measures
+the production BF16 route; FP32 production calls can execute the selected kid,
+but do not have an independently tuned winner in this CSV format.
+
 Verification (the part that catches column-transpose / scale defects):
   * inputs are *signed* and have *per-128-K-block varied magnitude*
     (``randn * 2**randint(-4,4)`` per block) so the e8m0 128-block scales span
@@ -28,6 +32,10 @@ Verification (the part that catches column-transpose / scale defects):
     column permutation (kid312/313 measured ~0.007 there but ~0.7-1.0 on real
     signed data) -- see the opus_bmm.md root-cause note.
   * reference is a dequantized fp32 einsum.
+  * output is allocated as contiguous ``[M,G,N]`` exactly like production and
+    passed to the batch-first public API through a transpose view. The existing
+    batch-first activation/scale storage is retained, matching the canonical
+    production transpose-view inputs.
   * gate: ``mp_tuner`` runs ``checkAllclose(rtol=1e-2, atol=1e-2)`` and
     ``post_process`` keeps the fastest candidate whose mismatch fraction is
     ``<= --errRatio`` (default 0.02). A still-broken tileN COM_REP_N>1 kernel
@@ -38,10 +46,11 @@ tree wins over any installed aiter):
     cd <repo> && PYTHONPATH=$PWD \\
         python3 csrc/opus_gemm/opus_bmm_mxscale_tune.py -g 16 -m 1,16,64 -n 1024 -k 4096
 
-    # re-tune every shape already in the shipped CSV, write a diffable copy:
+    # tune shipped shapes not already present in the diffable output copy;
+    # add --all to force every shipped shape to be measured again:
     ... opus_bmm_mxscale_tune.py
 
-    # overwrite the shipped tuned CSV in place:
+    # overwrite the shipped tuned CSV in place (--apply implies --all):
     ... opus_bmm_mxscale_tune.py --apply
 
     # from an untuned CSV (columns: b,m,n,k -- or g,m,n,k), 8-way parallel:
@@ -197,6 +206,59 @@ SHIPPED_CSV = os.path.join(
 DEFAULT_OUT = os.path.join(_REPO, "dsv4_bmm_mxscale_retuned.csv")
 
 
+def _read_shape_csv(path):
+    """Read ``b/g,m,n,k`` shape rows with a clear schema error."""
+    try:
+        df = pd.read_csv(path)
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(f"MXFP8 BMM shape CSV does not exist: {path}") from exc
+
+    df.columns = [str(column).strip().lower() for column in df.columns]
+    bcol = "b" if "b" in df.columns else "g" if "g" in df.columns else None
+    required = {"m", "n", "k"}
+    missing = sorted(required.difference(df.columns))
+    if bcol is None or missing:
+        expected = "b,m,n,k (or g,m,n,k)"
+        raise ValueError(
+            f"MXFP8 BMM shape CSV {path!r} must contain {expected}; "
+            f"got columns {list(df.columns)}"
+        )
+    return [
+        (int(row[bcol]), int(row["m"]), int(row["n"]), int(row["k"]))
+        for _, row in df.iterrows()
+    ]
+
+
+def _validate_tune_shapes(shapes):
+    """Normalize, deduplicate and enforce the global MXFP8 BMM contract."""
+    valid = []
+    seen = set()
+    for raw_shape in shapes:
+        try:
+            g, m, n, k = map(int, raw_shape)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"MXFP8 BMM shape must be (G,M,N,K), got {raw_shape!r}"
+            ) from exc
+        shape = (g, m, n, k)
+        if min(shape) <= 0:
+            raise ValueError(
+                "MXFP8 BMM requires positive G, M, N and K; "
+                f"got G={g}, M={m}, N={n}, K={k}"
+            )
+        if n % GROUP or k % GROUP:
+            raise ValueError(
+                f"MXFP8 BMM requires N and K to be multiples of {GROUP}; "
+                f"got G={g}, M={m}, N={n}, K={k}"
+            )
+        if shape not in seen:
+            seen.add(shape)
+            valid.append(shape)
+    if not valid:
+        raise ValueError("no MXFP8 BMM shapes were provided for tuning")
+    return valid
+
+
 # ---------------------------------------------------------------------------
 # mp_tuner hooks (module-level so the spawn workers can import them by name).
 # ---------------------------------------------------------------------------
@@ -236,27 +298,28 @@ def gen_bmm_mxscale_data(
 ):
     """Return the 7-tuple mp_tuner indexes into:
 
-    0 O_mx   [g,m,k]     fp8 (batch-first, K contiguous)
+    0 O_mx   [g,m,k]     fp8 batch-first contiguous input
     1 W_mx   [g,n,k]     fp8 (batch-major)
-    2 Y       [g,m,n]     out_dtype output buffer
-    3 xs_mx  [g,m,k/128] uint8 e8m0 per-token scale
+    2 Y       [m,g,n]     contiguous production-layout output buffer
+    3 xs_mx  [g,m,k/128] uint8 e8m0 batch-first contiguous scale
     4 ws_mx  [g,n/128,k/128] uint8 e8m0 128x128-block scale
     5 workspace optional caller-owned FP32 split-K buffer
-    6 ref     [g,m,n]     out_dtype dequant fp32 einsum reference
+    6 ref     [m,g,n]     out_dtype dequant fp32 einsum reference
     """
     torch.manual_seed(seed)
     O_bf16 = _gen_varied((batch, m, k), k, device)
     W_bf16 = _gen_varied((batch, n, k), k, device)
     O_mx, xs_mx, xs_fp32 = _quant_per_token_e8m0(O_bf16)
     W_mx, ws_mx, ws_fp32 = _quant_block_e8m0(W_bf16)
-    Y = torch.empty((batch, m, n), dtype=out_dtype, device=device)
+    Y = torch.empty((m, batch, n), dtype=out_dtype, device=device)
+
     workspace_numel = _workspace_numel(kernel_id, split_k, batch, m, n)
     workspace = (
         torch.empty(workspace_numel, dtype=torch.float32, device=device)
         if workspace_numel
         else None
     )
-    ref = run_torch(O_mx, W_mx, xs_fp32, ws_fp32).to(out_dtype)
+    ref = run_torch(O_mx, W_mx, xs_fp32, ws_fp32).transpose(0, 1).to(out_dtype)
     return (O_mx, W_mx, Y, xs_mx, ws_mx, workspace, ref)
 
 
@@ -264,10 +327,12 @@ def run_bmm_mxscale_bench(
     O_mx, W_mx, Y, xs_mx, ws_mx, workspace, kernelId, splitK
 ):
     """Tuner bench func: run the kid in-place, return Y for checkAllclose."""
-    return opus_bmm(
+    # Production owns contiguous token-major Y. Expose its batch-first view to
+    # the public API; the adapter transposes it back before the raw launch.
+    opus_bmm(
         O_mx,
         W_mx,
-        Y,
+        Y.transpose(0, 1),
         kid=int(kernelId),
         layout="mxscale_bmm",
         x_scale=xs_mx,
@@ -275,6 +340,7 @@ def run_bmm_mxscale_bench(
         split_k=int(splitK),
         workspace=workspace,
     )
+    return Y
 
 
 def _bmm_ref_passthrough(ref):
@@ -408,25 +474,45 @@ class OpusBmmMxscaleTuner(GemmCommonTuner):
             "--apply",
             action="store_true",
             default=False,
-            help="overwrite the shipped tuned CSV in place",
+            help="overwrite the shipped tuned CSV in place (implies --all)",
         )
+
+    def parse_args(self):
+        args = super().parse_args()
+        if args.run_config or args.compare:
+            self.parser.error(
+                "MXFP8 BMM tuner does not implement --run_config/--compare; "
+                "use ordinary offline tuning"
+            )
+        return args
 
     # --- shape sourcing -----------------------------------------------------
     def _shapes_from_shipped(self):
-        try:
-            df = pd.read_csv(SHIPPED_CSV)
-        except FileNotFoundError:
-            return []
-        return sorted(
-            {(int(r.b), int(r.m), int(r.n), int(r.k)) for _, r in df.iterrows()}
-        )
+        return sorted(set(_read_shape_csv(SHIPPED_CSV)))
 
     def pre_process(self, args):
+        if getattr(args, "run_config", False) or getattr(args, "compare", False):
+            raise ValueError(
+                "MXFP8 BMM tuner does not implement --run_config/--compare"
+            )
         if args.apply:
             args.tune_file = SHIPPED_CSV
+            # Reading and writing the shipped CSV otherwise makes every source
+            # shape look already tuned and silently produces zero tasks.
+            args.all = True
 
         gfx = self.get_gfx()
-        if args.batch_g and args.M:
+        if gfx != "gfx950":
+            raise RuntimeError(
+                f"MXFP8 BMM tuning is gfx950-only; detected {gfx!r}"
+            )
+
+        manual_g = args.batch_g is not None
+        manual_m = args.M is not None
+        if manual_g != manual_m:
+            raise ValueError("-g/--batch_g and -m/--M must be provided together")
+
+        if manual_g:
             shapes = [
                 (g, m, n, k)
                 for g in args.batch_g
@@ -434,19 +520,14 @@ class OpusBmmMxscaleTuner(GemmCommonTuner):
                 for n in args.N
                 for k in args.K
             ]
-        elif args.untune_file and os.path.exists(args.untune_file):
-            df = pd.read_csv(args.untune_file)
-            df.columns = [c.strip().lower() for c in df.columns]
-            bcol = "b" if "b" in df.columns else "g"
-            shapes = [
-                (int(r[bcol]), int(r["m"]), int(r["n"]), int(r["k"]))
-                for _, r in df.iterrows()
-            ]
+        elif args.untune_file:
+            shapes = _read_shape_csv(args.untune_file)
         else:
             logger.info(
                 "no -g/-m and no untune_file; re-tuning shapes from %s", SHIPPED_CSV
             )
             shapes = self._shapes_from_shipped()
+        shapes = _validate_tune_shapes(shapes)
 
         self.untunedf = pd.DataFrame(
             [{"gfx": gfx, "b": g, "m": m, "n": n, "k": k} for (g, m, n, k) in shapes],

@@ -31,7 +31,7 @@ validates tuned CSV candidates and otherwise continues to its normal skinny
 or PyTorch fallback. It does not automatically enter an OPUS heuristic on a
 tuned miss. A successful tuned result is reduced to one final integer kid
 before the public Python router and this C++ layer are entered. Reusable
-candidate/heuristic policy helpers live in `aiter/ops/opus/a16w16_policy.py`;
+candidate/heuristic policy helpers live in `aiter/ops/opus/policy.py`;
 the A16 family module keeps only exact execution and workspace
 responsibilities.
 
@@ -105,6 +105,11 @@ contains 706 final ids. The MXFP8 BMM ids are
 preserving family-local tuning/debug correlation. Historical child-dictionary
 collisions are resolved by the final merge; runtime routing always follows the
 resulting `kernels_list[kid]` instance and never a numeric interval.
+
+The gfx942 BF16-workspace A16 exact kids (`10210`, `10213`, `10216`) are the
+one workspace-output exception: their current exact-N reducer requires BF16
+`Y`. The canonical Python registry rejects FP32 `Y` before launch, matching the
+generated host guard.
 
 ## Generated tables
 

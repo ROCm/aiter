@@ -358,43 +358,35 @@ class PairedRunner:
         return x, w, x_scale, w_scale
 
     def run_a8_noscale(self, x: Tensor, w: Tensor) -> None:
+        launch_x = x[0]
+        launch_w = w[0]
         golden = x[0].float() @ w[0].float().T
-        for operation in ("opus_bmm", "opus_gemm"):
-            is_bmm = operation == "opus_bmm"
-            launch_x = x if is_bmm else x[0]
-            launch_w = w if is_bmm else w[0]
-            y_shape = (1, A8_M, A8_N) if is_bmm else (A8_M, A8_N)
-            y = torch.empty(y_shape, device="cuda", dtype=torch.float32)
+        y = torch.empty((A8_M, A8_N), device="cuda", dtype=torch.float32)
 
-            def private_call() -> Tensor:
-                launch = a8._launch_a8w8_bmm if is_bmm else a8._launch_a8w8_gemm
-                return launch(launch_x, launch_w, y, kid=2)
-
-            def public_call() -> Tensor:
-                launch = opus_bmm if is_bmm else opus_gemm
-                return launch(launch_x, launch_w, y, kid=2)
-
-            def check() -> None:
-                torch.cuda.synchronize()
-                actual = y[0] if is_bmm else y
-                torch.testing.assert_close(actual, golden, rtol=0, atol=0)
-
-            self.emit_pair(
-                case=f"a8_noscale_{'bmm' if is_bmm else 'gemm'}",
-                operation=operation,
-                family="a8w8",
-                output_dtype="fp32",
-                shape=(
-                    [1, A8_M, A8_N, A8_K]
-                    if is_bmm
-                    else [A8_M, A8_N, A8_K]
-                ),
-                kid=2,
-                split_k=None,
-                private_call=private_call,
-                public_call=public_call,
-                check=check,
+        def private_call() -> Tensor:
+            return a8._launch_a8w8_gemm(
+                launch_x, launch_w, y, kid=2
             )
+
+        def public_call() -> Tensor:
+            return opus_gemm(launch_x, launch_w, y, kid=2)
+
+        def check() -> None:
+            torch.cuda.synchronize()
+            torch.testing.assert_close(y, golden, rtol=0, atol=0)
+
+        self.emit_pair(
+            case="a8_noscale_gemm",
+            operation="opus_gemm",
+            family="a8w8",
+            output_dtype="fp32",
+            shape=[A8_M, A8_N, A8_K],
+            kid=2,
+            split_k=None,
+            private_call=private_call,
+            public_call=public_call,
+            check=check,
+        )
 
     def run_a8_blockscale(
         self, x: Tensor, w: Tensor, x_scale: Tensor, w_scale: Tensor
@@ -410,62 +402,48 @@ class PairedRunner:
                 * w_scale[0, :, block_k].repeat_interleave(128).unsqueeze(0)
             )
 
-        for operation in ("opus_bmm", "opus_gemm"):
-            is_bmm = operation == "opus_bmm"
-            launch_x = x if is_bmm else x[0]
-            launch_w = w if is_bmm else w[0]
-            launch_x_scale = x_scale if is_bmm else x_scale[0]
-            launch_w_scale = w_scale if is_bmm else w_scale[0]
-            y_shape = (1, A8_M, A8_N) if is_bmm else (A8_M, A8_N)
-            y = torch.empty(y_shape, device="cuda", dtype=torch.float32)
+        launch_x = x[0]
+        launch_w = w[0]
+        launch_x_scale = x_scale[0]
+        launch_w_scale = w_scale[0]
+        y = torch.empty((A8_M, A8_N), device="cuda", dtype=torch.float32)
 
-            def private_call() -> Tensor:
-                launch = (
-                    a8._launch_a8w8_blockscale_bmm
-                    if is_bmm
-                    else a8._launch_a8w8_blockscale_gemm
-                )
-                return launch(
-                    launch_x,
-                    launch_w,
-                    y,
-                    launch_x_scale,
-                    launch_w_scale,
-                    kid=1,
-                )
-
-            def public_call() -> Tensor:
-                launch = opus_bmm if is_bmm else opus_gemm
-                return launch(
-                    launch_x,
-                    launch_w,
-                    y,
-                    kid=1,
-                    x_scale=launch_x_scale,
-                    w_scale=launch_w_scale,
-                )
-
-            def check() -> None:
-                torch.cuda.synchronize()
-                actual = y[0] if is_bmm else y
-                torch.testing.assert_close(actual, golden, rtol=0, atol=0)
-
-            self.emit_pair(
-                case=f"a8_blockscale_{'bmm' if is_bmm else 'gemm'}",
-                operation=operation,
-                family="a8w8_blockscale",
-                output_dtype="fp32",
-                shape=(
-                    [1, A8_M, A8_N, A8_K]
-                    if is_bmm
-                    else [A8_M, A8_N, A8_K]
-                ),
+        def private_call() -> Tensor:
+            return a8._launch_a8w8_blockscale_gemm(
+                launch_x,
+                launch_w,
+                y,
+                launch_x_scale,
+                launch_w_scale,
                 kid=1,
-                split_k=None,
-                private_call=private_call,
-                public_call=public_call,
-                check=check,
             )
+
+        def public_call() -> Tensor:
+            return opus_gemm(
+                launch_x,
+                launch_w,
+                y,
+                kid=1,
+                x_scale=launch_x_scale,
+                w_scale=launch_w_scale,
+            )
+
+        def check() -> None:
+            torch.cuda.synchronize()
+            torch.testing.assert_close(y, golden, rtol=0, atol=0)
+
+        self.emit_pair(
+            case="a8_blockscale_gemm",
+            operation="opus_gemm",
+            family="a8w8_blockscale",
+            output_dtype="fp32",
+            shape=[A8_M, A8_N, A8_K],
+            kid=1,
+            split_k=None,
+            private_call=private_call,
+            public_call=public_call,
+            check=check,
+        )
 
     def run(self) -> None:
         props = torch.cuda.get_device_properties(0)

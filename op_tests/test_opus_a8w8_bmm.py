@@ -30,8 +30,8 @@ import torch
 import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.batched_gemm_op_a8w8 import lookup_mxscale_bmm_config
 from aiter.ops.opus import opus_bmm
+from aiter.ops.opus.policy import lookup_mxscale_bmm_config
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 SUPPORTED_GFX = ["gfx950"]  # fp8 e8m0 mxscale flatmm is gfx950-only
@@ -151,9 +151,8 @@ def test_mxscale_bmm(g, m, n, k, dtype):
     candidates = {"kid8000_k32_fused": (lambda: _call(8000), ref)}
 
     # Public backend-neutral entry: per-(g,m,n,k) tuned-CSV lookup + heuristic
-    # final-kid resolution + libtype backend routing. Exercises the whole
-    # aiter.batched_gemm_a8w8_mxscale -> public opus_bmm path end to end
-    # (not the raw binding).
+    # final-kid resolution + libtype backend routing. Split-one uses the
+    # checked raw fast path; a future split-K tuned row uses public opus_bmm.
     candidates["auto (batched_gemm_a8w8_mxscale)"] = (
         lambda: aiter.batched_gemm_a8w8_mxscale(O_in, W_mx, xs_in, ws_mx, dtype=ydt),
         ref,

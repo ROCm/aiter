@@ -15,11 +15,13 @@ from torch import Tensor
 
 from aiter.jit.core import compile_ops
 from aiter.ops.opus import gemm_op_a16w16 as gemm, opus_bmm
+from aiter.ops.opus.launch_plan import _get_cached_a16w16_launch_plan
 from csrc.opus_gemm.opus_gemm_common import (
     get_kernel_instance,
     kernel_needs_external_workspace,
     kernels_list,
 )
+from op_tests.opus_a16w16_test_utils import _init_a16w16_workspace
 
 
 _ENABLED = os.getenv("OPUS_GFX942_EXHAUSTIVE", "0") == "1"
@@ -136,20 +138,20 @@ def _make_problem(case: _Case):
     return XQ, WQ, golden
 
 
-def _config(case: _Case, XQ: Tensor, out_dtype: torch.dtype):
+def _plan(case: _Case, XQ: Tensor, out_dtype: torch.dtype):
     props = torch.cuda.get_device_properties(XQ.device)
-    return gemm._resolve_exact_a16w16_config(
-        arch="gfx942",
-        M=int(case.instance.B_M),
-        N=int(case.instance.B_N),
-        K=int(XQ.shape[-1]),
-        batch=1,
-        cu_num=int(props.multi_processor_count),
-        has_bias=False,
-        input_dtype=torch.bfloat16,
-        output_dtype=out_dtype,
-        kid=case.kid,
-        split_k=2 if case.needs_workspace else 0,
+    return _get_cached_a16w16_launch_plan(
+        "gfx942",
+        int(case.instance.B_M),
+        int(case.instance.B_N),
+        int(XQ.shape[-1]),
+        1,
+        int(props.multi_processor_count),
+        False,
+        torch.bfloat16,
+        out_dtype,
+        case.kid,
+        2 if case.needs_workspace else 0,
     )
 
 
@@ -209,11 +211,10 @@ def test_every_gfx942_workspace_kid(case: _Case):
         )
         return
 
-    config = _config(case, XQ, torch.bfloat16)
-    assert config.actual_kid == case.kid
-    assert config.allocation_split_k == 2
-    probe_y = torch.empty((1, M, N), device=XQ.device, dtype=torch.bfloat16)
-    workspace = gemm._init_a16w16_workspace(config, XQ, probe_y)
+    plan = _plan(case, XQ, torch.bfloat16)
+    assert plan.resolved_kid == case.kid
+    assert plan.workspace_capacity_split_k == 2
+    workspace = _init_a16w16_workspace(plan, XQ)
     assert workspace is not None
     assert tuple(workspace.shape) == (2, 1, M, N)
     assert workspace.dtype == expected_workspace_dtype
@@ -324,9 +325,9 @@ def test_every_gfx942_non_workspace_kid(case: _Case):
         for dtype in output_dtypes
     }
     for out_dtype, Y in outputs.items():
-        config = _config(case, XQ, out_dtype)
-        assert config.actual_kid == case.kid
-        assert gemm._init_a16w16_workspace(config, XQ, Y) is None
+        plan = _plan(case, XQ, out_dtype)
+        assert plan.resolved_kid == case.kid
+        assert _init_a16w16_workspace(plan, XQ) is None
 
     original_empty = gemm.torch.empty
 

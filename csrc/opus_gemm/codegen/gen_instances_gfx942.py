@@ -5,7 +5,14 @@
 import os
 from pathlib import Path
 
-from opus_gemm_common import GFX942_BF16WS_EXACT_N, OpusGemmInstance
+from opus_gemm_common import (
+    GFX942_BF16WS_EXACT_N,
+    GFX942_EVEN_LOOP_SPLITK_TAGS,
+    GFX942_MAX_AUTO_SPLIT_K,
+    GFX942_MIN_ITERS_PER_SPLIT,
+    GFX942_QUAD_MFMA32_SPLITK_TAG,
+    OpusGemmInstance,
+)
 
 from codegen.common import (
     _GFX942_A16W16_TAGS,
@@ -42,13 +49,7 @@ GFX942_SPLITK_TRAITS_OVERRIDES = {
     },
 }
 
-GFX942_QUAD_MFMA32_SPLITK_TAG = "a16w16_quad_mfma32_kbuf1_sk"
 GFX942_SPLITK_TAGS = _SPLITK + ("a16w16_em3en4_lds1_pgr2_sk",)
-GFX942_EVEN_LOOP_SPLITK_TAGS = (
-    "a16w16_kbuf2v_sk",
-    "a16w16_kbuf2v_bk128_sk",
-    GFX942_QUAD_MFMA32_SPLITK_TAG,
-)
 _GFX942_A8W8_TAGS = ("a8w8_blockscale_bpreshuffle_singlebuf",)
 
 
@@ -448,7 +449,8 @@ void
     split_k = static_cast<int>(
         1 + (static_cast<size_t>(target_wg_dbuf2) - 1) / tiles_mn);
     if (split_k < 1)  split_k = 1;
-    if (split_k > 16) split_k = 16;  // matches tuner enumeration ceiling
+    if (split_k > {GFX942_MAX_AUTO_SPLIT_K})
+        split_k = {GFX942_MAX_AUTO_SPLIT_K};  // tuner enumeration ceiling
     }}}}
 
     // Host-side auto-clamp: split-barrier pipeline requires at least 2
@@ -456,7 +458,7 @@ void
     // both caller-pinned and auto-picked split_k. P1 (depth=2 K-dbuf) additionally
     // requires loops even per split.
     int total_iters = (K + {k.B_K} - 1) / {k.B_K};
-    constexpr int min_iters_per_split = 2;
+    constexpr int min_iters_per_split = {GFX942_MIN_ITERS_PER_SPLIT};
     constexpr bool require_even_loops_dbuf2 = {"true" if k.kernel_tag in GFX942_EVEN_LOOP_SPLITK_TAGS else "false"};
     while (split_k > 1) {{{{
     int iters_full = (total_iters + split_k - 1) / split_k;

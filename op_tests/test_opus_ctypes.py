@@ -2,9 +2,10 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """C ABI/ctypes tests for the private OPUS A16W16 exact-kid backend.
 
-The ctypes raw remains private, while both public exact-kid entries use it
-after scalar validation and workspace planning. The original pybind raw
-remains available as an A/B endpoint.
+The single ``_launch_a16w16_backend`` entry remains private. Both public
+exact-kid operations use it after scalar validation and workspace planning;
+the original pybind raw remains available as its first-call primer and an A/B
+endpoint.
 """
 
 from __future__ import annotations
@@ -16,6 +17,9 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+
+from aiter.ops.opus.launch_plan import _get_cached_a16w16_launch_plan
+from op_tests.opus_a16w16_test_utils import _init_a16w16_workspace
 
 
 _ROOT = Path(__file__).resolve().parents[1]
@@ -33,7 +37,7 @@ def _gfx950_case(*, output_dtype: torch.dtype = torch.bfloat16):
         pytest.skip("requires idle gfx950 hardware; a skip is not a pass")
     gemm = importlib.import_module("aiter.ops.opus.gemm_op_a16w16")
     device = torch.device("cuda", torch.cuda.current_device())
-    config = gemm._resolve_exact_a16w16_config(
+    plan = _get_cached_a16w16_launch_plan(
         arch="gfx950",
         M=64,
         N=64,
@@ -49,20 +53,20 @@ def _gfx950_case(*, output_dtype: torch.dtype = torch.bfloat16):
     XQ = torch.randn((1, 64, 512), device=device, dtype=torch.bfloat16)
     WQ = torch.randn((1, 64, 512), device=device, dtype=torch.bfloat16)
     Y = torch.empty((1, 64, 64), device=device, dtype=output_dtype)
-    workspace = gemm._init_a16w16_workspace(config, XQ, Y)
+    workspace = _init_a16w16_workspace(plan, XQ)
     assert workspace is not None
-    return gemm, config, XQ, WQ, Y, workspace
+    return gemm, plan, XQ, WQ, Y, workspace
 
 
-def _ctypes_launch(gemm, config, XQ, WQ, Y, workspace) -> None:
-    gemm._opus_gemm_a16w16_launch_ctypes_raw(
+def _ctypes_launch(gemm, plan, XQ, WQ, Y, workspace) -> None:
+    gemm._launch_a16w16_backend(
         XQ,
         WQ,
         Y,
         None,
         workspace,
-        config.actual_kid,
-        config.launch_split_k,
+        plan.resolved_kid,
+        plan.abi_split_k,
     )
 
 
@@ -74,10 +78,11 @@ def test_ctypes_phase1_surface_is_private_production_backend():
     gemm = importlib.import_module("aiter.ops.opus.gemm_op_a16w16")
     expected_raw = ("XQ", "WQ", "Y", "bias", "workspace", "kid", "split_k")
     assert tuple(
-        inspect.signature(gemm._opus_gemm_a16w16_launch_ctypes_raw).parameters
+        inspect.signature(gemm._launch_a16w16_backend).parameters
     ) == expected_raw
     assert callable(gemm._opus_gemm_a16w16_launch_raw)
-    assert "_opus_gemm_a16w16_launch_ctypes_raw" not in gemm.__all__
+    assert "_launch_a16w16_backend" not in gemm.__all__
+    assert not hasattr(gemm, "_opus_gemm_a16w16_launch_ctypes_raw")
     assert not hasattr(gemm, "_experimental_opus_gemm_a16w16_launch_ctypes")
 
     python_source = (
@@ -88,8 +93,8 @@ def test_ctypes_phase1_surface_is_private_production_backend():
     assert "def _invoke_opus_a16w16_cabi(" in python_source
     assert 'ffi_type="ctypes"' not in python_source
     assert "ctypes_force_torch_exclude" not in python_source
-    assert "_opus_gemm_a16w16_launch_ctypes_raw" in inspect.getsource(
-        gemm._launch_a16w16_exact
+    assert "_launch_a16w16_backend" in inspect.getsource(
+        gemm._execute_a16w16
     )
     assert gemm.__all__ == []
 
@@ -141,7 +146,7 @@ def test_ctypes_raw_fake_registration_is_torch_compile_visible():
         workspace = torch.empty((2, 1, 64, 64), dtype=torch.float32)
 
         def raw_call(XQ, WQ, Y, workspace):
-            gemm._opus_gemm_a16w16_launch_ctypes_raw(
+            gemm._launch_a16w16_backend(
                 XQ, WQ, Y, None, workspace, 200, 2
             )
             return Y
@@ -157,7 +162,7 @@ def test_ctypes_raw_fake_registration_is_torch_compile_visible():
 
 def test_ctypes_first_launch_primes_on_input_device(monkeypatch):
     gemm = importlib.import_module("aiter.ops.opus.gemm_op_a16w16")
-    launch = inspect.unwrap(gemm._opus_gemm_a16w16_launch_ctypes_raw)
+    launch = inspect.unwrap(gemm._launch_a16w16_backend)
     target = torch.device("cuda", 1)
     events = []
 
@@ -203,7 +208,7 @@ def test_ctypes_first_launch_primes_on_input_device(monkeypatch):
 
 @pytest.mark.parametrize("output_dtype", [torch.bfloat16, torch.float32])
 def test_gfx950_ctypes_matches_pybind_and_golden(output_dtype):
-    gemm, config, XQ, WQ, Y_ctypes, workspace = _gfx950_case(
+    gemm, plan, XQ, WQ, Y_ctypes, workspace = _gfx950_case(
         output_dtype=output_dtype
     )
     Y_pybind = torch.empty_like(Y_ctypes)
@@ -213,10 +218,10 @@ def test_gfx950_ctypes_matches_pybind_and_golden(output_dtype):
         Y_pybind,
         None,
         workspace,
-        config.actual_kid,
-        config.launch_split_k,
+        plan.resolved_kid,
+        plan.abi_split_k,
     )
-    _ctypes_launch(gemm, config, XQ, WQ, Y_ctypes, workspace)
+    _ctypes_launch(gemm, plan, XQ, WQ, Y_ctypes, workspace)
     torch.cuda.synchronize(Y_ctypes.device)
 
     expected = _golden(XQ, WQ)
@@ -237,12 +242,12 @@ def test_gfx950_ctypes_matches_pybind_and_golden(output_dtype):
     ],
 )
 def test_gfx950_ctypes_errors_cross_cabi_safely(failure, message):
-    gemm, config, XQ, WQ, Y, allocated = _gfx950_case()
+    gemm, plan, XQ, WQ, Y, allocated = _gfx950_case()
     # The local adapter intentionally lets the existing pybind wrapper own the
     # first lazy JIT build, then uses the C ABI. Prime with a valid launch so
     # this test exercises exception transport across the C ABI itself even
     # when selected in isolation.
-    _ctypes_launch(gemm, config, XQ, WQ, Y, allocated)
+    _ctypes_launch(gemm, plan, XQ, WQ, Y, allocated)
     if failure == "missing":
         workspace = None
     elif failure == "dtype":
@@ -265,34 +270,34 @@ def test_gfx950_ctypes_errors_cross_cabi_safely(failure, message):
         assert workspace.data_ptr() % 16 != 0
 
     with pytest.raises(RuntimeError) as error:
-        _ctypes_launch(gemm, config, XQ, WQ, Y, workspace)
+        _ctypes_launch(gemm, plan, XQ, WQ, Y, workspace)
     text = str(error.value)
     assert "opus_gemm_a16w16_launch_cabi failed:" in text
     assert message in text
 
 
 def test_gfx950_ctypes_uses_live_nondefault_stream():
-    gemm, config, XQ, WQ, Y, workspace = _gfx950_case()
+    gemm, plan, XQ, WQ, Y, workspace = _gfx950_case()
     stream = torch.cuda.Stream(device=Y.device)
     producer = torch.cuda.current_stream(Y.device)
     stream.wait_stream(producer)
     with torch.cuda.stream(stream):
-        _ctypes_launch(gemm, config, XQ, WQ, Y, workspace)
+        _ctypes_launch(gemm, plan, XQ, WQ, Y, workspace)
     producer.wait_stream(stream)
     torch.cuda.synchronize(Y.device)
     torch.testing.assert_close(Y.float(), _golden(XQ, WQ), rtol=0.03, atol=0.5)
 
 
 def test_gfx950_ctypes_graph_capture_and_replay():
-    gemm, config, XQ, WQ, Y, workspace = _gfx950_case()
+    gemm, plan, XQ, WQ, Y, workspace = _gfx950_case()
     # Build/load and validate once before capture; capture itself still invokes
     # the exact same raw C ABI with the graph's live stream.
-    _ctypes_launch(gemm, config, XQ, WQ, Y, workspace)
+    _ctypes_launch(gemm, plan, XQ, WQ, Y, workspace)
     torch.cuda.synchronize(Y.device)
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        _ctypes_launch(gemm, config, XQ, WQ, Y, workspace)
+        _ctypes_launch(gemm, plan, XQ, WQ, Y, workspace)
 
     for seed in (17, 29):
         generator = torch.Generator(device=Y.device).manual_seed(seed)
@@ -315,10 +320,10 @@ def test_gfx950_ctypes_two_streams_keep_workspace_ownership_external():
     producer = torch.cuda.current_stream(cases[0][4].device)
 
     for stream, case in zip(streams, cases, strict=True):
-        gemm, config, XQ, WQ, Y, workspace = case
+        gemm, plan, XQ, WQ, Y, workspace = case
         stream.wait_stream(producer)
         with torch.cuda.stream(stream):
-            _ctypes_launch(gemm, config, XQ, WQ, Y, workspace)
+            _ctypes_launch(gemm, plan, XQ, WQ, Y, workspace)
 
     for stream in streams:
         producer.wait_stream(stream)
@@ -327,7 +332,7 @@ def test_gfx950_ctypes_two_streams_keep_workspace_ownership_external():
     workspaces = [case[5] for case in cases]
     assert workspaces[0] is not workspaces[1]
     assert workspaces[0].data_ptr() != workspaces[1].data_ptr()
-    for _gemm, _config, XQ, WQ, Y, _workspace in cases:
+    for _gemm, _plan, XQ, WQ, Y, _workspace in cases:
         torch.testing.assert_close(
             Y.float(), _golden(XQ, WQ), rtol=0.03, atol=0.5
         )
@@ -379,8 +384,8 @@ def test_gfx950_ctypes_switches_and_restores_current_device(workspace_mode):
     reason="requires two devices for the C ABI mixed-device rejection",
 )
 def test_gfx950_ctypes_rejects_mixed_input_devices_before_launch():
-    gemm, config, XQ, valid_WQ, Y, workspace = _gfx950_case()
-    _ctypes_launch(gemm, config, XQ, valid_WQ, Y, workspace)
+    gemm, plan, XQ, valid_WQ, Y, workspace = _gfx950_case()
+    _ctypes_launch(gemm, plan, XQ, valid_WQ, Y, workspace)
     other_index = (XQ.device.index + 1) % torch.cuda.device_count()
     other_arch = str(
         getattr(torch.cuda.get_device_properties(other_index), "gcnArchName", "")
@@ -394,4 +399,4 @@ def test_gfx950_ctypes_rejects_mixed_input_devices_before_launch():
     )
 
     with pytest.raises(RuntimeError, match="XQ/WQ/Y device ids must match"):
-        _ctypes_launch(gemm, config, XQ, WQ, Y, workspace)
+        _ctypes_launch(gemm, plan, XQ, WQ, Y, workspace)

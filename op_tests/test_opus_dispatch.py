@@ -14,6 +14,7 @@ import torch
 
 from csrc.opus_gemm.opus_gemm_common import (
     GFX942_BF16WS_EXACT_N,
+    GFX942_EVEN_LOOP_SPLITK_TAGS,
     get_kernel_instance,
     kernel_needs_external_workspace,
     kernels_list,
@@ -22,20 +23,29 @@ from csrc.opus_gemm.opus_gemm_common import (
 _ROOT = Path(__file__).resolve().parents[1]
 
 
-def _a16_config(arch: str, kid: int, *, N=128, K=4096, split_k=2, batch=1):
-    gemm = importlib.import_module("aiter.ops.opus.gemm_op_a16w16")
-    return gemm._resolve_exact_a16w16_config(
-        arch=arch,
-        M=128,
-        N=N,
-        K=K,
-        batch=batch,
-        cu_num=304,
-        has_bias=False,
-        input_dtype=torch.bfloat16,
-        output_dtype=torch.bfloat16,
-        kid=kid,
-        split_k=split_k,
+def _a16_plan(
+    arch: str,
+    kid: int,
+    *,
+    N=128,
+    K=4096,
+    split_k=2,
+    batch=1,
+    output_dtype=torch.bfloat16,
+):
+    plan_module = importlib.import_module("aiter.ops.opus.launch_plan")
+    return plan_module._get_cached_a16w16_launch_plan(
+        arch,
+        128,
+        N,
+        K,
+        batch,
+        304,
+        False,
+        torch.bfloat16,
+        output_dtype,
+        kid,
+        split_k,
     )
 
 
@@ -76,6 +86,15 @@ def test_common_queries_remain_arch_family_and_output_scoped():
         kernels_list[2]
     )
     assert get_kernel_instance("gfx950", "a8w8", 2, torch.bfloat16) is None
+    assert get_kernel_instance(
+        "gfx942", "a16w16", 10210, torch.bfloat16
+    ) is kernels_list[10210]
+    assert get_kernel_instance(
+        "gfx942", "a16w16", 10210, torch.float32
+    ) is None
+    assert get_kernel_instance(
+        "gfx1250", "a16w16", 20000, torch.float32
+    ) is kernels_list[20000]
 
     assert kernel_needs_external_workspace("gfx942", "a16w16", 10200)
     assert not kernel_needs_external_workspace("gfx950", "a16w16", 300)
@@ -85,19 +104,30 @@ def test_common_queries_remain_arch_family_and_output_scoped():
 
 def test_a16_caller_policy_is_isolated_from_exact_execution():
     opus_dir = _ROOT / "aiter/ops/opus"
-    policy_source = (opus_dir / "a16w16_policy.py").read_text()
+    policy_source = (opus_dir / "policy.py").read_text()
+    plan_source = (opus_dir / "launch_plan.py").read_text()
     execution_source = (opus_dir / "gemm_op_a16w16.py").read_text()
     tuned_source = (_ROOT / "aiter/tuned_gemm.py").read_text()
 
+    assert not (opus_dir / "a16w16_policy.py").exists()
+    assert not (opus_dir / "a8w8_mxscale_policy.py").exists()
     assert "_A16W16_HEURISTICS" in policy_source
     assert "def select_a16w16_heuristic_kid(" in policy_source
     assert "def resolve_a16w16_tuned_candidate(" in policy_source
     assert "def resolve_a16w16_heuristic_candidate(" in policy_source
     assert "def resolve_a16w16_caller_candidate(" in policy_source
+    assert "def resolve_a8w8_mxscale_bmm_plan(" in policy_source
     assert "def _heuristic_a16w16_kid_gfx950(" not in execution_source
     assert "def _select_a16w16_heuristic_kid(" not in execution_source
     assert "def _resolve_a16w16_caller_candidate(" not in execution_source
-    assert "aiter.ops.opus.a16w16_policy" in tuned_source
+    assert "from .policy" not in execution_source
+    assert "def _build_a16w16_launch_plan(" in plan_source
+    assert "def _get_cached_a16w16_launch_plan(" in plan_source
+    assert "gemm_op_a16w16" not in plan_source
+    assert "from .gemm_op_a16w16" not in policy_source
+    assert "_get_cached_a16w16_launch_plan" in policy_source
+    assert "_get_cached_a16w16_launch_plan" in execution_source
+    assert "aiter.ops.opus.policy" in tuned_source
     assert "resolve_a16w16_tuned_candidate" in tuned_source
     assert "resolve_a16w16_heuristic_candidate" not in tuned_source
     assert "resolve_a16w16_caller_candidate" not in tuned_source
@@ -105,14 +135,24 @@ def test_a16_caller_policy_is_isolated_from_exact_execution():
         tuned_source
     )
 
-    policy = importlib.import_module("aiter.ops.opus.a16w16_policy")
+    policy = importlib.import_module("aiter.ops.opus.policy")
     execution = importlib.import_module("aiter.ops.opus.gemm_op_a16w16")
-    assert execution._select_a16w16_heuristic_kid is (
-        policy.select_a16w16_heuristic_kid
+    assert callable(policy.select_a16w16_heuristic_kid)
+    assert callable(policy.resolve_a16w16_caller_candidate)
+    removed_compat_names = (
+        "_heuristic_a16w16_kid_gfx950",
+        "_heuristic_a16w16_kid_gfx1250",
+        "_gfx942_heuristic_symbol_to_kid",
+        "_gfx942_heuristic_kid_for_symbol",
+        "_gfx942_heuristic_split_barrier_ok",
+        "_gfx942_heuristic_bf16ws_band",
+        "_gfx942_heuristic_bf16_symbol",
+        "_heuristic_a16w16_kid_gfx942",
+        "_A16W16_HEURISTICS",
+        "_select_a16w16_heuristic_kid",
+        "_resolve_a16w16_caller_candidate",
     )
-    assert execution._resolve_a16w16_caller_candidate is (
-        policy.resolve_a16w16_caller_candidate
-    )
+    assert all(not hasattr(execution, name) for name in removed_compat_names)
 
 
 def _gfx950_heuristic_golden(M, N, K, has_bias):
@@ -144,7 +184,7 @@ def _gfx1250_heuristic_golden(M, N):
 
 
 def test_gfx950_caller_heuristic_matches_baseline_boundary_policy():
-    policy = importlib.import_module("aiter.ops.opus.a16w16_policy")
+    policy = importlib.import_module("aiter.ops.opus.policy")
     for M in (1, 4, 5, 63, 64, 65, 127, 128, 129, 192, 255, 256, 257):
         for N in (31, 32, 63, 64, 65, 240, 256, 257):
             for K in (64, 127, 128, 192, 256):
@@ -155,7 +195,7 @@ def test_gfx950_caller_heuristic_matches_baseline_boundary_policy():
 
 
 def test_gfx1250_caller_heuristic_matches_baseline_boundary_policy():
-    policy = importlib.import_module("aiter.ops.opus.a16w16_policy")
+    policy = importlib.import_module("aiter.ops.opus.policy")
     for M in (1, 15, 16, 17, 31, 32, 33, 63, 64, 65):
         for N in (31, 32, 33, 63, 64, 65, 127, 128, 129, 256):
             assert policy._heuristic_a16w16_kid_gfx1250(
@@ -189,7 +229,7 @@ def test_gfx1250_caller_heuristic_matches_baseline_boundary_policy():
 def test_gfx942_caller_heuristic_matches_baseline_policy(
     M, N, K, output_dtype, has_bias, expected
 ):
-    policy = importlib.import_module("aiter.ops.opus.a16w16_policy")
+    policy = importlib.import_module("aiter.ops.opus.policy")
     assert policy._heuristic_a16w16_kid_gfx942(
         M,
         N,
@@ -200,7 +240,7 @@ def test_gfx942_caller_heuristic_matches_baseline_policy(
 
 
 def test_caller_heuristic_kids_are_in_default_compiled_floor():
-    policy = importlib.import_module("aiter.ops.opus.a16w16_policy")
+    policy = importlib.import_module("aiter.ops.opus.policy")
     from csrc.opus_gemm.opus_gemm_common import DEFAULT_COMPILED_KIDS_BY_ARCH
 
     cases = {
@@ -221,8 +261,68 @@ def test_caller_heuristic_kids_are_in_default_compiled_floor():
         assert kid in DEFAULT_COMPILED_KIDS_BY_ARCH[arch]
 
 
+@pytest.mark.parametrize(
+    ("arch", "cu_num", "M", "N", "K", "output_dtype", "expected_kid"),
+    [
+        ("gfx950", 256, 256, 256, 512, torch.bfloat16, 1300),
+        ("gfx950", 256, 256, 256, 512, torch.float32, 1300),
+        ("gfx942", 304, 256, 1024, 7168, torch.bfloat16, 10210),
+        ("gfx942", 304, 256, 1024, 7168, torch.float32, 10200),
+        ("gfx1250", 256, 32, 128, 4096, torch.bfloat16, 20007),
+        ("gfx1250", 256, 32, 128, 4096, torch.float32, 20007),
+    ],
+)
+def test_a16_policy_resolves_all_supported_arches_and_output_dtypes(
+    arch, cu_num, M, N, K, output_dtype, expected_kid
+):
+    policy = importlib.import_module("aiter.ops.opus.policy")
+    assert set(policy._A16W16_HEURISTICS) == {"gfx942", "gfx950", "gfx1250"}
+
+    plan = policy.resolve_a16w16_heuristic_candidate(
+        arch=arch,
+        M=M,
+        N=N,
+        K=K,
+        batch=1,
+        cu_num=cu_num,
+        has_bias=False,
+        input_dtype=torch.bfloat16,
+        output_dtype=output_dtype,
+    )
+    assert plan is not None
+    assert plan.registry_arch == arch
+    assert plan.resolved_kid == expected_kid
+
+
+def test_a16_policy_preserves_arch_specific_bias_and_batch_boundaries():
+    policy = importlib.import_module("aiter.ops.opus.policy")
+    common = dict(
+        M=32,
+        N=128,
+        K=4096,
+        batch=1,
+        has_bias=True,
+        input_dtype=torch.bfloat16,
+        output_dtype=torch.bfloat16,
+    )
+    assert policy.resolve_a16w16_heuristic_candidate(
+        arch="gfx950", cu_num=256, **common
+    ) is not None
+    assert policy.resolve_a16w16_heuristic_candidate(
+        arch="gfx942", cu_num=304, **common
+    ) is None
+    assert policy.resolve_a16w16_heuristic_candidate(
+        arch="gfx1250", cu_num=256, **common
+    ) is not None
+
+    gfx1250_batched = dict(common, batch=2, has_bias=False)
+    assert policy.resolve_a16w16_heuristic_candidate(
+        arch="gfx1250", cu_num=256, **gfx1250_batched
+    ) is None
+
+
 def test_caller_candidate_resolves_before_exact_public_launch():
-    policy = importlib.import_module("aiter.ops.opus.a16w16_policy")
+    policy = importlib.import_module("aiter.ops.opus.policy")
     common = dict(
         arch="gfx942",
         M=256,
@@ -238,14 +338,14 @@ def test_caller_candidate_resolves_before_exact_public_launch():
         **common, requested_kid=10210, requested_split_k=7
     )
     assert tuned is not None
-    assert tuned.actual_kid == 10200
-    assert tuned.allocation_split_k == 7
+    assert tuned.resolved_kid == 10200
+    assert tuned.workspace_capacity_split_k == 7
 
     heuristic = policy.resolve_a16w16_heuristic_candidate(
         **common, requested_split_k=0
     )
     assert heuristic is not None
-    assert heuristic.actual_kid == 10200
+    assert heuristic.resolved_kid == 10200
 
     assert (
         policy.resolve_a16w16_tuned_candidate(
@@ -262,6 +362,72 @@ def test_caller_candidate_resolves_before_exact_public_launch():
     assert policy.resolve_a16w16_caller_candidate(
         **common, requested_kid=None, requested_split_k=0
     ) == heuristic
+
+
+def test_policy_and_executor_share_one_cached_immutable_plan(monkeypatch):
+    plan_module = importlib.import_module("aiter.ops.opus.launch_plan")
+    policy = importlib.import_module("aiter.ops.opus.policy")
+    execution = importlib.import_module("aiter.ops.opus.gemm_op_a16w16")
+    plan_module._get_cached_a16w16_launch_plan.cache_clear()
+    real_build = plan_module._build_a16w16_launch_plan
+    real_lookup = plan_module.get_kernel_instance
+    build_calls = 0
+    registry_lookups = 0
+
+    def counted_build(**kwargs):
+        nonlocal build_calls
+        build_calls += 1
+        return real_build(**kwargs)
+
+    def counted_lookup(*args, **kwargs):
+        nonlocal registry_lookups
+        registry_lookups += 1
+        return real_lookup(*args, **kwargs)
+
+    monkeypatch.setattr(plan_module, "_build_a16w16_launch_plan", counted_build)
+    monkeypatch.setattr(plan_module, "get_kernel_instance", counted_lookup)
+    monkeypatch.setattr(
+        execution, "_device_arch_and_cu", lambda _device: ("gfx950", 256)
+    )
+    launches = []
+    monkeypatch.setattr(
+        execution,
+        "_launch_a16w16_backend",
+        lambda *args: launches.append(args),
+    )
+
+    plan = policy.resolve_a16w16_tuned_candidate(
+        arch="gfx950",
+        M=64,
+        N=64,
+        K=512,
+        batch=1,
+        cu_num=256,
+        has_bias=False,
+        input_dtype=torch.bfloat16,
+        output_dtype=torch.bfloat16,
+        requested_kid=200,
+        requested_split_k=2,
+    )
+    assert plan is not None
+
+    XQ = torch.empty((1, 64, 512), dtype=torch.bfloat16)
+    WQ = torch.empty((1, 64, 512), dtype=torch.bfloat16)
+    Y = torch.empty((1, 64, 64), dtype=torch.bfloat16)
+    assert execution._execute_a16w16(XQ, WQ, Y, kid=200, split_k=2) is Y
+
+    assert policy._get_cached_a16w16_launch_plan is (
+        plan_module._get_cached_a16w16_launch_plan
+    )
+    assert execution._get_cached_a16w16_launch_plan is (
+        plan_module._get_cached_a16w16_launch_plan
+    )
+    assert build_calls == 1
+    assert registry_lookups == 1
+    assert len(launches) == 1
+    assert launches[0][4].shape == plan.workspace_spec.shape
+    assert launches[0][5:] == (plan.resolved_kid, plan.abi_split_k)
+    plan_module._get_cached_a16w16_launch_plan.cache_clear()
 
 
 def _tuned_row_key(gfx, cu_num, M, N, K, *, bias=False):
@@ -281,7 +447,7 @@ def _tuned_row_key(gfx, cu_num, M, N, K, *, bias=False):
 
 def test_tuned_a16_row_does_not_invoke_heuristic(monkeypatch):
     tuned = importlib.import_module("aiter.tuned_gemm")
-    policy = importlib.import_module("aiter.ops.opus.a16w16_policy")
+    policy = importlib.import_module("aiter.ops.opus.policy")
     row = {
         "libtype": "opus",
         "solidx": 200,
@@ -373,29 +539,27 @@ def test_tuned_adapter_passes_resolved_final_kid_to_public(monkeypatch):
     ]
 
 
-def test_mxscale_bmm_final_launch_plan_is_scalar_cached(monkeypatch):
-    batched = importlib.import_module("aiter.ops.batched_gemm_op_a8w8")
+def test_mxscale_bmm_policy_resolves_usable_tuned_row_without_second_cache(
+    monkeypatch,
+):
+    policy = importlib.import_module("aiter.ops.opus.policy")
     lookups = []
     row = {"libtype": "opus", "kernelId": 8311, "splitK": 1}
 
     monkeypatch.setattr(
-        batched,
+        policy,
         "lookup_mxscale_bmm_config",
         lambda *shape: lookups.append(shape) or row,
     )
     monkeypatch.setattr(
-        batched,
+        policy,
         "_mxscale_bmm_kid_runs_m",
         lambda kid, m: (kid, m) == (8311, 1),
     )
-    batched._resolve_mxscale_bmm_launch.cache_clear()
-
-    assert batched._resolve_mxscale_bmm_launch(2, 1, 1024, 4096) == (8311, 1)
-    assert batched._resolve_mxscale_bmm_launch(2, 1, 1024, 4096) == (8311, 1)
+    resolve = policy.resolve_a8w8_mxscale_bmm_plan
+    assert resolve(2, 1, 1024, 4096) == (8311, 1)
     assert lookups == [(2, 1, 1024, 4096)]
-    assert batched._resolve_mxscale_bmm_launch.cache_info().hits == 1
-    assert batched._resolve_mxscale_bmm_launch.cache_info().maxsize == 1024
-    batched._resolve_mxscale_bmm_launch.cache_clear()
+    assert not hasattr(resolve, "cache_info")
 
 
 def test_mxscale_bmm_high_level_split1_uses_checked_raw_launcher(monkeypatch):
@@ -419,7 +583,9 @@ def test_mxscale_bmm_high_level_split1_uses_checked_raw_launcher(monkeypatch):
         batched, "_get_mxscale_bmm_launchers", lambda: (fake_raw, fake_public)
     )
     monkeypatch.setattr(
-        batched, "_resolve_mxscale_bmm_launch", lambda *_shape: (8311, 1)
+        batched,
+        "_resolve_a8w8_mxscale_bmm_plan",
+        lambda *_shape: (8311, 1),
     )
     batched._MXSCALE_BMM_LAUNCH_PLANS.clear()
 
@@ -452,7 +618,9 @@ def test_mxscale_bmm_high_level_workspace_keeps_unified_planner(monkeypatch):
         lambda: (lambda *args: raw_calls.append(args), fake_public),
     )
     monkeypatch.setattr(
-        batched, "_resolve_mxscale_bmm_launch", lambda *_shape: (8000, 2)
+        batched,
+        "_resolve_a8w8_mxscale_bmm_plan",
+        lambda *_shape: (8000, 2),
     )
     batched._MXSCALE_BMM_LAUNCH_PLANS.clear()
 
@@ -495,7 +663,7 @@ def test_mxscale_bmm_high_level_reuses_one_scalar_launch_plan(monkeypatch):
     )
     monkeypatch.setattr(
         batched,
-        "_resolve_mxscale_bmm_launch",
+        "_resolve_a8w8_mxscale_bmm_plan",
         lambda *shape: plan_lookups.append(shape) or (8311, 1),
     )
     batched._MXSCALE_BMM_LAUNCH_PLANS.clear()
@@ -529,7 +697,7 @@ def test_no_tuned_row_uses_skinny_then_torch_without_heuristic(
     monkeypatch, gfx, cu_num, M, N, K, bias, otype, expected_backend
 ):
     tuned = importlib.import_module("aiter.tuned_gemm")
-    policy = importlib.import_module("aiter.ops.opus.a16w16_policy")
+    policy = importlib.import_module("aiter.ops.opus.policy")
     monkeypatch.setattr(tuned, "get_GEMM_A16W16_config_", lambda: {})
     monkeypatch.setattr(tuned, "get_gfx", lambda: gfx)
     monkeypatch.setattr(tuned, "get_cu_num", lambda: cu_num)
@@ -561,10 +729,10 @@ def test_gfx942_exact_n_is_shared_and_contains_384():
 @pytest.mark.parametrize("requested", [0, 1, 3, 17])
 @pytest.mark.parametrize("kid", [10200, 10201, 10203, 10204, 10210, 10213, 10216])
 def test_gfx942_split_resolution_matches_launcher_constraints(kid, requested):
-    gemm = importlib.import_module("aiter.ops.opus.gemm_op_a16w16")
+    plan_module = importlib.import_module("aiter.ops.opus.launch_plan")
     instance = get_kernel_instance("gfx942", "a16w16", kid)
     assert instance is not None
-    allocation, effective = gemm._resolve_gfx942_split_k(
+    workspace_capacity, abi_split_k = plan_module._plan_gfx942_split_k(
         instance,
         M=257,
         N=769,
@@ -573,42 +741,52 @@ def test_gfx942_split_resolution_matches_launcher_constraints(kid, requested):
         cu_num=304,
         requested=requested,
     )
-    assert allocation >= 1
-    assert 1 <= effective <= allocation
+    assert workspace_capacity >= 1
+    assert 1 <= abi_split_k <= workspace_capacity
     total_iters = (4096 + instance.B_K - 1) // instance.B_K
-    iters_full = (total_iters + effective - 1) // effective
-    last_loops = total_iters - (effective - 1) * iters_full
+    iters_full = (total_iters + abi_split_k - 1) // abi_split_k
+    last_loops = total_iters - (abi_split_k - 1) * iters_full
     assert iters_full >= 2 and last_loops >= 2
-    if instance.kernel_tag in gemm._EVEN_LOOP_SPLITK_TAGS:
+    if instance.kernel_tag in GFX942_EVEN_LOOP_SPLITK_TAGS:
         assert iters_full % 2 == last_loops % 2 == 0
 
 
-def test_gfx942_auto_and_explicit_split_k_keep_allocation_contract():
-    gemm = importlib.import_module("aiter.ops.opus.gemm_op_a16w16")
+def test_gfx942_auto_and_explicit_split_k_distinguish_capacity_from_abi():
+    plan_module = importlib.import_module("aiter.ops.opus.launch_plan")
     p1 = get_kernel_instance("gfx942", "a16w16", 10201)
     legacy = get_kernel_instance("gfx942", "a16w16", 10200)
     assert p1 is not None and legacy is not None
-    assert gemm._resolve_gfx942_split_k(
+    assert plan_module._plan_gfx942_split_k(
         p1, M=512, N=512, K=2048, batch=1, cu_num=304, requested=0
     ) == (5, 4)
-    assert gemm._resolve_gfx942_split_k(
+    assert plan_module._plan_gfx942_split_k(
         legacy, M=128, N=128, K=4096, batch=1, cu_num=304, requested=17
     ) == (17, 16)
+
+    plan = _a16_plan("gfx942", 10200, N=128, K=4096, split_k=17)
+    assert plan.workspace_capacity_split_k == 17
+    assert plan.abi_split_k == 16
+    assert plan.workspace_spec is not None
+    assert plan.workspace_spec.shape[0] == 17
 
 
 @pytest.mark.parametrize("kid", [10210, 10213, 10216])
 def test_gfx942_bf16_workspace_kid_is_exact_not_redirected(kid):
     with pytest.raises(ValueError, match="exact kid.*requires N"):
-        _a16_config("gfx942", kid, N=768)
-    config = _a16_config("gfx942", kid, N=384)
-    assert config.actual_kid == kid
+        _a16_plan("gfx942", kid, N=768)
+    plan = _a16_plan("gfx942", kid, N=384)
+    assert plan.resolved_kid == kid
+    with pytest.raises(ValueError, match="does not support output dtype"):
+        _a16_plan(
+            "gfx942", kid, N=384, output_dtype=torch.float32
+        )
 
 
-def test_exact_a16_config_rejects_wrong_arch_and_batched_gfx1250():
+def test_exact_a16_plan_rejects_wrong_arch_and_batched_gfx1250():
     with pytest.raises(ValueError, match="not an a16w16 kernel"):
-        _a16_config("gfx942", 200)
-    with pytest.raises(ValueError, match="incompatible with shape"):
-        _a16_config("gfx1250", 20000, batch=2)
+        _a16_plan("gfx942", 200)
+    with pytest.raises(ValueError, match="require batch=1"):
+        _a16_plan("gfx1250", 20000, batch=2)
 
 
 def test_unified_dispatch_routes_a16_by_final_kid(monkeypatch):
@@ -659,17 +837,31 @@ def test_unified_dispatch_routes_logical_a16_gemm_without_public_batch_axis(
     assert calls[0][4]["instance"] is kernels_list[200]
 
 
-def test_public_gemm_and_bmm_reject_the_other_operation_rank():
+def test_public_gemm_and_bmm_reject_wrong_rank_without_assuming_family_support():
     opus = importlib.import_module("aiter.ops.opus")
     gemm_tensor = torch.empty((64, 512), dtype=torch.bfloat16)
     bmm_tensor = torch.empty((1, 64, 512), dtype=torch.bfloat16)
 
-    with pytest.raises(ValueError, match="opus_gemm expects logical 2D.*opus_bmm"):
+    with pytest.raises(
+        ValueError,
+        match="opus_gemm expects logical 2D.*family must also support",
+    ):
         opus.opus_gemm(bmm_tensor, bmm_tensor, bmm_tensor, kid=200)
     with pytest.raises(
-        ValueError, match="opus_bmm expects batch-first 3D.*opus_gemm"
+        ValueError,
+        match="opus_bmm expects batch-first 3D.*family must also support",
     ):
         opus.opus_bmm(gemm_tensor, gemm_tensor, gemm_tensor, kid=200)
+
+
+def test_public_dispatch_rejects_non_tensor_before_rank_check():
+    opus = importlib.import_module("aiter.ops.opus")
+    tensor = torch.empty((64, 512), dtype=torch.bfloat16)
+
+    with pytest.raises(TypeError, match="opus_gemm: WQ must be a Tensor"):
+        opus.opus_gemm(tensor, object(), tensor, kid=200)
+    with pytest.raises(TypeError, match="opus_gemm: x_scale must be a Tensor"):
+        opus.opus_gemm(tensor, tensor, tensor, kid=200, x_scale=object())
 
 
 def test_unified_gfx950_a16_caller_workspace_uses_checked_cabi(monkeypatch):
@@ -677,15 +869,15 @@ def test_unified_gfx950_a16_caller_workspace_uses_checked_cabi(monkeypatch):
     a16 = importlib.import_module("aiter.ops.opus.gemm_op_a16w16")
     calls = []
 
-    def fail_generic_planner(*_args, **_kwargs):
-        raise AssertionError("caller-workspace fast path re-entered planner")
+    def fail_device_metadata(*_args, **_kwargs):
+        raise AssertionError("caller-workspace fast path queried device metadata")
 
     def fake_raw(XQ, WQ, Y, bias, workspace, kid, split_k):
         calls.append((XQ, WQ, Y, bias, workspace, kid, split_k))
 
-    monkeypatch.setattr(a16, "_explicit_a16w16_launch", fail_generic_planner)
-    monkeypatch.setattr(a16, "_opus_gemm_a16w16_launch_ctypes_raw", fake_raw)
-    a16._cached_explicit_a16w16_plan.cache_clear()
+    monkeypatch.setattr(a16, "_device_arch_and_cu", fail_device_metadata)
+    monkeypatch.setattr(a16, "_launch_a16w16_backend", fake_raw)
+    a16._get_cached_a16w16_launch_plan.cache_clear()
 
     XQ = torch.empty((1, 64, 512), dtype=torch.bfloat16)
     WQ = torch.empty((1, 64, 512), dtype=torch.bfloat16)
@@ -700,6 +892,7 @@ def test_unified_gfx950_a16_caller_workspace_uses_checked_cabi(monkeypatch):
         workspace=workspace,
     ) is Y
     assert calls == [(XQ, WQ, Y, None, workspace, 200, 2)]
+    assert calls[0][4] is workspace
 
 
 def test_explicit_public_a16_kid_bypasses_tuned_and_heuristic_policy(monkeypatch):
@@ -738,7 +931,7 @@ def test_public_contract_cache_is_scalar_only(monkeypatch):
     monkeypatch.setattr(
         a16, "_launch_a16w16_bmm", lambda XQ, WQ, Y, *_a, **_k: Y
     )
-    opus._cached_public_contract.cache_clear()
+    opus._resolve_contract.cache_clear()
 
     XQ = torch.empty((1, 64, 512), dtype=torch.bfloat16)
     WQ = torch.empty((1, 64, 512), dtype=torch.bfloat16)
@@ -747,13 +940,13 @@ def test_public_contract_cache_is_scalar_only(monkeypatch):
     assert opus.opus_bmm(XQ, WQ, Y, kid=200, split_k=2) is Y
     assert opus.opus_bmm(XQ, WQ, Y, kid=200, split_k=2) is Y
     assert registry.lookups == 1
-    assert opus._cached_public_contract.cache_info().maxsize == 4096
-    assert opus._cached_public_contract.cache_info().hits == 1
+    assert opus._resolve_contract.cache_info().maxsize == 4096
+    assert opus._resolve_contract.cache_info().hits == 1
 
     del XQ, WQ, Y
     gc.collect()
     assert all(reference() is None for reference in references)
-    opus._cached_public_contract.cache_clear()
+    opus._resolve_contract.cache_clear()
 
 
 @pytest.mark.parametrize(
@@ -786,7 +979,6 @@ def test_unified_dispatch_routes_a8_by_final_kid(
     def fake(*args, **kwargs):
         calls.append((args, kwargs))
 
-    monkeypatch.setattr(opus, "_require_gpu_tensor", lambda _tensor: None)
     monkeypatch.setattr(a8, raw_name, fake)
     fp8 = getattr(torch, "float8_e4m3fnuz")
     XQ = torch.empty((128, 256), dtype=fp8)
@@ -814,40 +1006,59 @@ def test_unified_dispatch_routes_a8_by_final_kid(
     assert raw_y.data_ptr() == Y.data_ptr()
 
 
-def test_unified_dispatch_routes_gfx942_bpreshuffle_batch_one_bmm(monkeypatch):
+@pytest.mark.parametrize(
+    ("kid", "family", "layout", "output_dtype", "raw_name", "with_scale"),
+    [
+        (
+            2,
+            "a8w8",
+            "plain",
+            torch.float32,
+            "_opus_gemm_a8w8_launch_raw",
+            False,
+        ),
+        (
+            1,
+            "a8w8_blockscale",
+            "plain",
+            torch.float32,
+            "_opus_gemm_a8w8_blockscale_launch_raw",
+            True,
+        ),
+        (
+            11000,
+            "a8w8_blockscale_bpreshuffle",
+            "bpreshuffle",
+            torch.bfloat16,
+            "_opus_gemm_a8w8_blockscale_bpreshuffle_launch_raw",
+            True,
+        ),
+    ],
+)
+def test_unified_dispatch_rejects_non_mx_a8_bmm(
+    monkeypatch, kid, family, layout, output_dtype, raw_name, with_scale
+):
     opus = importlib.import_module("aiter.ops.opus")
     a8 = importlib.import_module("aiter.ops.opus.gemm_op_a8w8")
     calls = []
-    monkeypatch.setattr(opus, "_require_gpu_tensor", lambda _tensor: None)
-    monkeypatch.setattr(
-        a8,
-        "_opus_gemm_a8w8_blockscale_bpreshuffle_launch_raw",
-        lambda *args: calls.append(args),
-    )
+    monkeypatch.setattr(a8, raw_name, lambda *args: calls.append(args))
     fp8 = getattr(torch, "float8_e4m3fnuz")
     XQ = torch.empty((1, 128, 256), dtype=fp8)
     WQ = torch.empty((1, 128, 256), dtype=fp8)
-    Y = torch.empty((1, 128, 128), dtype=torch.bfloat16)
-    x_scale = torch.empty((1, 128, 2), dtype=torch.float32)
-    w_scale = torch.empty((1, 1, 2), dtype=torch.float32)
+    Y = torch.empty((1, 128, 128), dtype=output_dtype)
+    kwargs = {"kid": kid, "layout": layout}
+    if with_scale:
+        kwargs.update(
+            x_scale=torch.empty((1, 128, 2), dtype=torch.float32),
+            w_scale=torch.empty((1, 1, 2), dtype=torch.float32),
+        )
 
-    assert opus.opus_bmm(
-        XQ,
-        WQ,
-        Y,
-        kid=11000,
-        layout="bpreshuffle",
-        x_scale=x_scale,
-        w_scale=w_scale,
-    ) is Y
-    assert len(calls) == 1
-    raw_x, raw_w, raw_x_scale, raw_w_scale, raw_y, raw_kid = calls[0]
-    assert raw_x is XQ and raw_w is WQ and raw_y is Y
-    assert raw_x_scale.shape == (128, 2)
-    assert raw_x_scale.data_ptr() == x_scale.data_ptr()
-    assert raw_w_scale.shape == (1, 2)
-    assert raw_w_scale.data_ptr() == w_scale.data_ptr()
-    assert raw_kid == 11000
+    with pytest.raises(
+        ValueError,
+        match=rf"OPUS family {family} is GEMM-only; use opus_gemm",
+    ):
+        opus.opus_bmm(XQ, WQ, Y, **kwargs)
+    assert calls == []
 
 
 def test_unified_dispatch_routes_mxscale_bmm_by_global_exact_kid(monkeypatch):
@@ -859,7 +1070,6 @@ def test_unified_dispatch_routes_mxscale_bmm_by_global_exact_kid(monkeypatch):
         calls.append((XQ, WQ, Y, x_scale, w_scale, kwargs))
         return Y
 
-    monkeypatch.setattr(opus, "_require_gpu_tensor", lambda _tensor: None)
     monkeypatch.setattr(a8, "_launch_a8w8_mxscale_bmm", fake)
     fp8 = getattr(torch, "float8_e4m3fnuz")
     XQ = torch.empty((2, 17, 256), dtype=fp8)
@@ -872,7 +1082,7 @@ def test_unified_dispatch_routes_mxscale_bmm_by_global_exact_kid(monkeypatch):
         WQ,
         Y,
         kid=8312,
-        layout="mxfp8_bmm",
+        layout="mxscale_bmm",
         x_scale=x_scale,
         w_scale=w_scale,
         split_k=2,
@@ -908,7 +1118,6 @@ def test_unified_dispatch_uses_checked_raw_mxscale_bmm_split1_hot_path(
     w_scale = torch.empty((2, 1, 1), dtype=torch.uint8)
     calls = []
 
-    monkeypatch.setattr(opus, "_require_gpu_tensor", lambda _tensor: None)
     monkeypatch.setattr(
         a8,
         "_opus_gemm_a8w8_mxscale_bmm_launch_raw",
@@ -937,32 +1146,40 @@ def test_unified_dispatch_uses_checked_raw_mxscale_bmm_split1_hot_path(
 
 
 def test_mxscale_bmm_plan_uses_registry_and_torch_workspace_sizes():
-    a8 = importlib.import_module("aiter.ops.opus.gemm_op_a8w8")
-    a8._cached_a8w8_mxscale_bmm_plan.cache_clear()
-    assert a8._cached_a8w8_mxscale_bmm_plan(
+    plan_module = importlib.import_module("aiter.ops.opus.launch_plan")
+    plan_module._get_cached_a8w8_mxscale_bmm_plan.cache_clear()
+    plan = plan_module._get_cached_a8w8_mxscale_bmm_plan(
         "gfx950", 8000, torch.bfloat16, 17, 2, 128, 2048, 2
-    ) == (2, 2 * 2 * 32 * 128)
+    )
+    assert plan.abi_split_k == 2
+    assert plan.workspace_spec is not None
+    assert plan.workspace_spec.shape == (2 * 2 * 32 * 128,)
+    assert plan.workspace_spec.dtype == torch.float32
     # fused kid adds one aligned counter region after the FP32 partials.
-    split, fused_numel = a8._cached_a8w8_mxscale_bmm_plan(
+    fused_plan = plan_module._get_cached_a8w8_mxscale_bmm_plan(
         "gfx950", 8100, torch.float32, 17, 2, 128, 2048, 2
     )
-    assert split == 2
-    assert fused_numel > 2 * 2 * 32 * 128
+    assert fused_plan.abi_split_k == 2
+    assert fused_plan.workspace_spec is not None
+    assert fused_plan.workspace_spec.shape[0] > 2 * 2 * 32 * 128
     with pytest.raises(ValueError, match="requires split_k <= 1"):
-        a8._cached_a8w8_mxscale_bmm_plan(
+        plan_module._get_cached_a8w8_mxscale_bmm_plan(
             "gfx950", 8646, torch.bfloat16, 17, 2, 128, 2048, 2
         )
-    assert a8._cached_a8w8_mxscale_bmm_plan.cache_info().maxsize == 4096
-    a8._cached_a8w8_mxscale_bmm_plan.cache_clear()
+    assert (
+        plan_module._get_cached_a8w8_mxscale_bmm_plan.cache_info().maxsize
+        == 4096
+    )
+    plan_module._get_cached_a8w8_mxscale_bmm_plan.cache_clear()
 
 
 def test_mxscale_bmm_split1_hot_path_defers_tensor_contract_to_cpp(monkeypatch):
     a8 = importlib.import_module("aiter.ops.opus.gemm_op_a8w8")
     fp8 = getattr(torch, "float8_e4m3fnuz")
-    XQ = torch.empty((1, 2, 128), dtype=fp8)
+    XQ = torch.empty((2, 1, 128), dtype=fp8)
     WQ = torch.empty((2, 128, 128), dtype=fp8)
-    Y = torch.empty((1, 2, 128), dtype=torch.bfloat16)
-    x_scale = torch.empty((1, 2, 1), dtype=torch.uint8)
+    Y = torch.empty((2, 1, 128), dtype=torch.bfloat16)
+    x_scale = torch.empty((2, 1, 1), dtype=torch.uint8)
     w_scale = torch.empty((2, 1, 1), dtype=torch.uint8)
     calls = []
 
@@ -980,7 +1197,7 @@ def test_mxscale_bmm_split1_hot_path_defers_tensor_contract_to_cpp(monkeypatch):
     )
     monkeypatch.setattr(a8, "_opus_gemm_a8w8_mxscale_bmm_launch_raw", fake_raw)
 
-    assert a8._launch_a8w8_mxscale_bmm_exact(
+    assert a8._launch_a8w8_mxscale_bmm(
         XQ,
         WQ,
         Y,
@@ -990,16 +1207,25 @@ def test_mxscale_bmm_split1_hot_path_defers_tensor_contract_to_cpp(monkeypatch):
         split_k=1,
         workspace=None,
     ) is Y
-    assert calls == [(XQ, WQ, Y, x_scale, w_scale, None, 8311, 1)]
+    assert len(calls) == 1
+    raw_x, raw_w, raw_y, raw_x_scale, raw_w_scale, workspace, kid, split = calls[0]
+    assert raw_x.shape == (1, 2, 128) and raw_x.data_ptr() == XQ.data_ptr()
+    assert raw_w is WQ
+    assert raw_y.shape == (1, 2, 128) and raw_y.data_ptr() == Y.data_ptr()
+    assert raw_x_scale.shape == (1, 2, 1)
+    assert raw_x_scale.data_ptr() == x_scale.data_ptr()
+    assert raw_w_scale is w_scale
+    assert workspace is None
+    assert (kid, split) == (8311, 1)
 
 
 def test_mxscale_bmm_workspace_path_retains_python_contract_validation(monkeypatch):
     a8 = importlib.import_module("aiter.ops.opus.gemm_op_a8w8")
     fp8 = getattr(torch, "float8_e4m3fnuz")
-    XQ = torch.empty((17, 2, 128), dtype=fp8)
+    XQ = torch.empty((2, 17, 128), dtype=fp8)
     WQ = torch.empty((2, 128, 128), dtype=fp8)
-    Y = torch.empty((17, 2, 128), dtype=torch.bfloat16)
-    x_scale = torch.empty((17, 2, 1), dtype=torch.uint8)
+    Y = torch.empty((2, 17, 128), dtype=torch.bfloat16)
+    x_scale = torch.empty((2, 17, 1), dtype=torch.uint8)
     w_scale = torch.empty((2, 1, 1), dtype=torch.uint8)
     validation_calls = []
     raw_calls = []
@@ -1021,7 +1247,7 @@ def test_mxscale_bmm_workspace_path_retains_python_contract_validation(monkeypat
         lambda *args: raw_calls.append(args),
     )
 
-    assert a8._launch_a8w8_mxscale_bmm_exact(
+    assert a8._launch_a8w8_mxscale_bmm(
         XQ,
         WQ,
         Y,
@@ -1031,19 +1257,42 @@ def test_mxscale_bmm_workspace_path_retains_python_contract_validation(monkeypat
         split_k=2,
         workspace=None,
     ) is Y
-    assert validation_calls == [(XQ, WQ, Y, x_scale, w_scale)]
+    assert len(validation_calls) == 1
+    checked_x, checked_w, checked_y, checked_x_scale, checked_w_scale = (
+        validation_calls[0]
+    )
+    assert checked_x.shape == (17, 2, 128)
+    assert checked_x.data_ptr() == XQ.data_ptr()
+    assert checked_w is WQ
+    assert checked_y.shape == (17, 2, 128)
+    assert checked_y.data_ptr() == Y.data_ptr()
+    assert checked_x_scale.shape == (17, 2, 1)
+    assert checked_x_scale.data_ptr() == x_scale.data_ptr()
+    assert checked_w_scale is w_scale
     assert len(raw_calls) == 1
     workspace = raw_calls[0][5]
     assert workspace.dtype == torch.float32
     assert workspace.numel() == 2 * 2 * 32 * 128
 
 
-def test_mxscale_bmm_malformed_input_rank_still_fails_before_plan():
+def test_mxscale_bmm_malformed_input_rank_still_fails_before_plan(monkeypatch):
     a8 = importlib.import_module("aiter.ops.opus.gemm_op_a8w8")
-    with pytest.raises(ValueError, match="XQ and WQ must be 3D"):
-        a8._mxscale_bmm_shape_for_plan(
-            torch.empty((2, 128)),
-            torch.empty((2, 128, 128)),
+    fp8 = getattr(torch, "float8_e4m3fnuz")
+
+    def fail_plan(*_args, **_kwargs):
+        raise AssertionError("rank validation must run before launch planning")
+
+    monkeypatch.setattr(a8, "_get_cached_a8w8_mxscale_bmm_plan", fail_plan)
+    with pytest.raises(ValueError, match="expects batch-first 3D"):
+        a8._launch_a8w8_mxscale_bmm(
+            torch.empty((2, 128), dtype=fp8),
+            torch.empty((2, 128, 128), dtype=fp8),
+            torch.empty((2, 1, 128), dtype=torch.bfloat16),
+            torch.empty((2, 1, 1), dtype=torch.uint8),
+            torch.empty((2, 1, 1), dtype=torch.uint8),
+            kid=8311,
+            split_k=1,
+            workspace=None,
         )
 
 
@@ -1059,6 +1308,8 @@ def test_unified_dispatch_rejects_contract_mismatches_before_launch(monkeypatch)
         opus.opus_gemm(bf16, bf16, bf16, kid=-1)
     with pytest.raises(ValueError, match="kid must be an integer"):
         opus.opus_gemm(bf16, bf16, bf16, kid=200.5)
+    with pytest.raises(ValueError, match="unsupported OPUS weight layout"):
+        opus.opus_gemm(X8, W8, fp32, kid=2, layout="normal")
     with pytest.raises(ValueError, match="split_k must be non-negative"):
         opus.opus_gemm(bf16, bf16, bf16, kid=200, split_k=-1)
     with pytest.raises(ValueError, match="does not support Y.dtype"):
@@ -1092,7 +1343,7 @@ def test_unified_dispatch_rejects_cross_arch_kid(monkeypatch):
     monkeypatch.setattr(
         a16, "_device_arch_and_cu", lambda _device: ("gfx942", 304)
     )
-    a16._cached_explicit_a16w16_plan.cache_clear()
+    a16._get_cached_a16w16_launch_plan.cache_clear()
     XQ = torch.empty((1, 64, 512), dtype=torch.bfloat16)
     WQ = torch.empty((1, 64, 512), dtype=torch.bfloat16)
     Y = torch.empty((1, 64, 64), dtype=torch.bfloat16)

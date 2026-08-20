@@ -11,7 +11,10 @@ import weakref
 import pytest
 import torch
 
-from aiter.ops.opus.gemm_op_a16w16 import LaunchConfig
+from aiter.ops.opus.launch_plan import _get_cached_a16w16_launch_plan
+from op_tests.opus_a16w16_test_utils import (
+    _launch_a16w16_with_torch_workspace,
+)
 
 
 _GRAPH_CASES = {
@@ -41,7 +44,7 @@ def _load_raw_binding_without_workspace_launch(gemm) -> None:
     WQ = torch.empty((1, 1, 2), device=device, dtype=torch.bfloat16)
     Y = torch.empty((1, 1, 1), device=device, dtype=torch.bfloat16)
     with pytest.raises(RuntimeError, match="unknown kid -999"):
-        gemm._opus_gemm_a16w16_launch_ctypes_raw(
+        gemm._launch_a16w16_backend(
             XQ, WQ, Y, None, None, -999, 0
         )
 
@@ -50,26 +53,26 @@ def _golden(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     return A.float() @ B.float().transpose(-1, -2)
 
 
-def _make_gfx950_a8_case(seed: int, batch: int = 1):
+def _make_gfx950_a8_case(seed: int):
     from aiter import dtypes
 
     generator = torch.Generator(device="cuda").manual_seed(seed)
-    shape = (batch, 256, 256)
+    shape = (256, 256)
     XQ = torch.randint(
         -2, 3, shape, generator=generator, device="cuda", dtype=torch.int32
     ).to(dtypes.fp8)
     WQ = torch.randint(
         -3, 4, shape, generator=generator, device="cuda", dtype=torch.int32
     ).to(dtypes.fp8)
-    x_scale = torch.ones((batch, 256, 2), device="cuda", dtype=torch.float32)
-    w_scale = torch.ones((batch, 2, 2), device="cuda", dtype=torch.float32)
+    x_scale = torch.ones((256, 2), device="cuda", dtype=torch.float32)
+    w_scale = torch.ones((2, 2), device="cuda", dtype=torch.float32)
     return XQ, WQ, x_scale, w_scale
 
 
 def _launch_gfx950_a8_family(family, opus, XQ, WQ, Y, x_scale, w_scale):
     if family == "noscale":
-        return opus.opus_bmm(XQ, WQ, Y, kid=2)
-    return opus.opus_bmm(
+        return opus.opus_gemm(XQ, WQ, Y, kid=2)
+    return opus.opus_gemm(
         XQ,
         WQ,
         Y,
@@ -84,8 +87,7 @@ def test_gfx950_a8_logical_2d_gemm_adapter(family):
     if _runtime_arch() != "gfx950":
         pytest.skip("requires gfx950 hardware; a skip is not a pass")
     opus = importlib.import_module("aiter.ops.opus")
-    XQ3, WQ3, x_scale3, w_scale3 = _make_gfx950_a8_case(0x2DA8)
-    XQ, WQ = XQ3[0], WQ3[0]
+    XQ, WQ, x_scale, w_scale = _make_gfx950_a8_case(0x2DA8)
     Y = torch.empty((256, 256), device="cuda", dtype=torch.float32)
     if family == "noscale":
         returned = opus.opus_gemm(XQ, WQ, Y, kid=2)
@@ -95,24 +97,9 @@ def test_gfx950_a8_logical_2d_gemm_adapter(family):
             WQ,
             Y,
             kid=1,
-            x_scale=x_scale3[0],
-            w_scale=w_scale3[0],
+            x_scale=x_scale,
+            w_scale=w_scale,
         )
-    torch.cuda.synchronize()
-    assert returned is Y
-    torch.testing.assert_close(Y, _golden(XQ, WQ), rtol=0, atol=0)
-
-
-@pytest.mark.parametrize("family", ["noscale", "blockscale"])
-def test_gfx950_a8_batch_first_bmm_adapter(family):
-    if _runtime_arch() != "gfx950":
-        pytest.skip("requires gfx950 hardware; a skip is not a pass")
-    opus = importlib.import_module("aiter.ops.opus")
-    XQ, WQ, x_scale, w_scale = _make_gfx950_a8_case(0xB2A8, batch=2)
-    Y = torch.empty((2, 256, 256), device="cuda", dtype=torch.float32)
-    returned = _launch_gfx950_a8_family(
-        family, opus, XQ, WQ, Y, x_scale, w_scale
-    )
     torch.cuda.synchronize()
     assert returned is Y
     torch.testing.assert_close(Y, _golden(XQ, WQ), rtol=0, atol=0)
@@ -125,7 +112,7 @@ def test_graph_capture_replay_allocates_in_capture_without_prewarm(monkeypatch, 
     opus = importlib.import_module("aiter.ops.opus")
     _load_raw_binding_without_workspace_launch(gemm)
     assert not hasattr(gemm, "opus_gemm_workspace_init")
-    real_raw = gemm._opus_gemm_a16w16_launch_ctypes_raw
+    real_raw = gemm._launch_a16w16_backend
     allocation_ptrs = []
 
     def record_raw(XQ, WQ, Y, bias, workspace, kid, split_k):
@@ -133,7 +120,7 @@ def test_graph_capture_replay_allocates_in_capture_without_prewarm(monkeypatch, 
         return real_raw(XQ, WQ, Y, bias, workspace, kid, split_k)
 
     monkeypatch.setattr(
-        gemm, "_opus_gemm_a16w16_launch_ctypes_raw", record_raw
+        gemm, "_launch_a16w16_backend", record_raw
     )
     A = torch.randn((1, spec["M"], spec["K"]), device="cuda", dtype=torch.bfloat16)
     B = torch.randn((1, spec["N"], spec["K"]), device="cuda", dtype=torch.bfloat16)
@@ -177,7 +164,7 @@ def test_two_streams_hold_distinct_call_scoped_workspaces(monkeypatch, arch):
     gemm = importlib.import_module("aiter.ops.opus.gemm_op_a16w16")
     opus = importlib.import_module("aiter.ops.opus")
     _load_raw_binding_without_workspace_launch(gemm)
-    real_raw = gemm._opus_gemm_a16w16_launch_ctypes_raw
+    real_raw = gemm._launch_a16w16_backend
     held_workspaces = []
 
     def record_raw(XQ, WQ, Y, bias, workspace, kid, split_k):
@@ -185,7 +172,7 @@ def test_two_streams_hold_distinct_call_scoped_workspaces(monkeypatch, arch):
         return real_raw(XQ, WQ, Y, bias, workspace, kid, split_k)
 
     monkeypatch.setattr(
-        gemm, "_opus_gemm_a16w16_launch_ctypes_raw", record_raw
+        gemm, "_launch_a16w16_backend", record_raw
     )
     streams = (torch.cuda.Stream(), torch.cuda.Stream())
     inputs = [
@@ -238,7 +225,7 @@ def test_gfx950_a8_graph_capture_replay(family):
     _load_raw_binding_without_workspace_launch(gemm)
     opus = importlib.import_module("aiter.ops.opus")
     XQ, WQ, x_scale, w_scale = _make_gfx950_a8_case(0x950A8)
-    Y = torch.empty((1, 256, 256), device="cuda", dtype=torch.float32)
+    Y = torch.empty((256, 256), device="cuda", dtype=torch.float32)
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
@@ -266,7 +253,7 @@ def test_gfx950_a8_two_streams(family):
     streams = (torch.cuda.Stream(), torch.cuda.Stream())
     cases = [_make_gfx950_a8_case(seed) for seed in (0x95051, 0x95052)]
     outputs = [
-        torch.empty((1, 256, 256), device="cuda", dtype=torch.float32)
+        torch.empty((256, 256), device="cuda", dtype=torch.float32)
         for _ in streams
     ]
     producer = torch.cuda.current_stream()
@@ -293,12 +280,18 @@ def test_many_shapes_leave_no_python_workspace_tensor_cache():
     dead_refs = []
 
     for M, N in ((33, 17), (64, 64), (65, 97), (129, 33)):
-        config = LaunchConfig(
-            arch="gfx950",
-            family="a16w16",
-            actual_kid=200,
-            allocation_split_k=2,
-            launch_split_k=2,
+        plan = _get_cached_a16w16_launch_plan(
+            "gfx950",
+            M,
+            N,
+            512,
+            1,
+            256,
+            False,
+            torch.bfloat16,
+            torch.bfloat16,
+            200,
+            2,
         )
         XQ = torch.empty((1, M, 512), dtype=torch.bfloat16)
         WQ = torch.empty((1, N, 512), dtype=torch.bfloat16)
@@ -307,8 +300,8 @@ def test_many_shapes_leave_no_python_workspace_tensor_cache():
         def fake_raw(_XQ, _WQ, _Y, _bias, workspace, _kid, _split_k):
             dead_refs.append(weakref.ref(workspace))
 
-        gemm._launch_a16w16_with_torch_workspace(
-            fake_raw, XQ, WQ, Y, None, config
+        _launch_a16w16_with_torch_workspace(
+            fake_raw, XQ, WQ, Y, None, plan
         )
 
     del XQ, WQ, Y
@@ -323,45 +316,51 @@ def test_many_shapes_leave_no_python_workspace_tensor_cache():
 
 def test_explicit_scalar_plan_cache_does_not_retain_tensors(monkeypatch):
     gemm = importlib.import_module("aiter.ops.opus.gemm_op_a16w16")
-    gemm._cached_explicit_a16w16_plan.cache_clear()
+    plan_module = importlib.import_module("aiter.ops.opus.launch_plan")
+    plan_module._get_cached_a16w16_launch_plan.cache_clear()
     monkeypatch.setattr(
         gemm, "_device_arch_and_cu", lambda _device: ("gfx950", 256)
     )
-    real_resolve = gemm._resolve_exact_a16w16_config
-    resolver_calls = 0
+    real_build = plan_module._build_a16w16_launch_plan
+    builder_calls = 0
     dead_refs = []
 
-    def counted_resolve(**kwargs):
-        nonlocal resolver_calls
-        resolver_calls += 1
-        return real_resolve(**kwargs)
+    def counted_build(**kwargs):
+        nonlocal builder_calls
+        builder_calls += 1
+        return real_build(**kwargs)
 
-    monkeypatch.setattr(gemm, "_resolve_exact_a16w16_config", counted_resolve)
+    monkeypatch.setattr(plan_module, "_build_a16w16_launch_plan", counted_build)
 
     def fake_raw(XQ, WQ, Y, _bias, workspace, _kid, _split_k):
         dead_refs.extend(weakref.ref(tensor) for tensor in (XQ, WQ, Y, workspace))
 
+    monkeypatch.setattr(
+        gemm, "_launch_a16w16_backend", fake_raw
+    )
     for _ in range(2):
         XQ = torch.empty((1, 64, 512), dtype=torch.bfloat16)
         WQ = torch.empty((1, 64, 512), dtype=torch.bfloat16)
         Y = torch.empty((1, 64, 64), dtype=torch.bfloat16)
         workspace = torch.empty((2, 1, 64, 64), dtype=torch.float32)
-        gemm._explicit_a16w16_launch(
-            fake_raw, XQ, WQ, Y, None, 200, 2, workspace=workspace
+        gemm._execute_a16w16(
+            XQ, WQ, Y, kid=200, split_k=2, workspace=workspace
         )
 
     del XQ, WQ, Y, workspace
     gc.collect()
-    assert resolver_calls == 1
-    assert gemm._cached_explicit_a16w16_plan.cache_info().maxsize == 256
+    assert builder_calls == 1
+    assert plan_module._get_cached_a16w16_launch_plan.cache_info().maxsize == 256
     assert dead_refs and all(reference() is None for reference in dead_refs)
-    gemm._cached_explicit_a16w16_plan.cache_clear()
+    plan_module._get_cached_a16w16_launch_plan.cache_clear()
 
 
 def test_workspace_module_keeps_only_private_exact_kid_entry():
     gemm = importlib.import_module("aiter.ops.opus.gemm_op_a16w16")
     opus = importlib.import_module("aiter.ops.opus")
     assert gemm.__all__ == []
+    assert not hasattr(gemm, "_init_a16w16_workspace")
+    assert not hasattr(gemm, "_launch_a16w16_with_torch_workspace")
     assert not hasattr(gemm, "opus_gemm_workspace_init")
     assert not hasattr(gemm, "gemm_a16w16_opus")
     assert opus.__all__ == ["opus_gemm", "opus_bmm"]

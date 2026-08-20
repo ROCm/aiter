@@ -1,4 +1,4 @@
-# CK Batched GEMM BF16 Tune
+# CK/OPUS Batched GEMM BF16 Tune
 
 1. Install aiter:
 `cd $aiter_path`
@@ -9,15 +9,24 @@
     |-----|-----|-----|-----|
     |16   |128  |1536 |7168 |
 
-3. Start tuning:
-Run the following cmd to start tuning, please wait a few minutes as it will build batched_gemm_bf16_tune via jit:
-`python3 csrc/ck_batched_gemm_bf16/batched_gemm_bf16_tune.py -i aiter/configs/bf16_untuned_batched_gemm.csv -o aiter/configs/bf16_tuned_batched_gemm.csv`
-You can find the results of the tuning in `aiter/configs/bf16_tuned_batched_gemm.csv`, like this:
-    |**gfx**  |**cu_num**|**B**|**M**|**N**|**K**|**kernelId**|**splitK**|**us**|**kernelName**|**tflops**|**bw**|**errRatio**|
-    |---------|----------|-----|-----|-----|-----|------------|----------|------|--------------|----------|------|------------|
-    |gfx942   |80        |16   |128  |1536 |7168 |23          |0         |32.99 |xxxxxxxx      |125.4     |89.5  |0.01        |
+3. Start tuning. The default remains CK-only for backward compatibility:
 
-    `gfx` identifies the GPU architecture (e.g. `gfx942`, `gfx950`). `cu_num` is the number of compute units and distinguishes partitioned or binned variants of the same architecture (e.g. MI308X vs MI300X both use `gfx942`).
+`python3 csrc/ck_batched_gemm_bf16/batched_gemm_bf16_tune.py -i aiter/configs/bf16_untuned_batched_gemm.csv -o aiter/configs/bf16_tuned_batched_gemm.csv --libtype ck`
+
+Use `--libtype opus` to tune only OPUS A16W16 exact kids, or
+`--libtype all` to benchmark CK and OPUS together and retain the fastest valid
+backend for every `(gfx, cu_num, B, M, N, K)` shape. OPUS candidates call the
+public exact-kid `opus_bmm`; no separate tune binding is required.
+
+You can find the results of the tuning in `aiter/configs/bf16_tuned_batched_gemm.csv`, like this:
+    |**gfx**  |**cu_num**|**B**|**M**|**N**|**K**|**libtype**|**kernelId**|**splitK**|**us**|**kernelName**|**tflops**|**bw**|**errRatio**|
+    |---------|----------|-----|-----|-----|-----|-------------|------------|----------|------|--------------|----------|------|------------|
+    |gfx942   |304       |16   |128  |1536 |7168 |opus        |10200       |2         |30.12 |opus_...      |137.1     |98.0  |0.01        |
+
+    `kernelId` is a CK-local id for `libtype=ck` and the canonical global OPUS
+    kid for `libtype=opus`. Legacy rows without `libtype` continue to mean CK.
+    `gfx` identifies the GPU architecture (e.g. `gfx942`, `gfx950`). `cu_num`
+    distinguishes partitioned or binned variants of the same architecture.
 
 4. Build tuned kernels and test:
 Test the performance, modify the test instance in `op_tests/test_batched_gemm_bf16.py` and run it, please wait a few minutes as it will build batched_gemm_bf16 tuned kernels in `aiter/configs/bf16_tuned_batched_gemm.csv` via jit:
@@ -51,6 +60,14 @@ If you have built batched_gemm_bf16 kernels before tuning new GEMM shapes, pleas
 ```
 
 ### Tuning Configuration
+
+#### `--libtype`
+- **Choices**: `ck`, `opus`, `all`
+- **Default**: `ck`
+- **Description**: Select CK candidates, OPUS A16W16 candidates, or both.
+  With `all`, candidates share one shape group and the fastest valid row is
+  written with its backend tag. OPUS split-K candidates include their normal
+  Torch-managed workspace cost.
 
 #### `--errRatio`
 - **Type**: Float

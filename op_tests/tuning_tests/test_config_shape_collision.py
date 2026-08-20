@@ -204,12 +204,12 @@ class TestConfigShapeCollision(unittest.TestCase):
         self._check_family("AITER_CONFIG_BF16_BATCHED_GEMM", "bf16_tuned_batched_gemm")
 
     def test_batched_gemm_a8w8_blockscale_mxscale(self):
-        # This family deliberately resolves in the existing A8W8 module so
+        # This family deliberately resolves in its dedicated caller policy so
         # adding PR #4320 does not modify generic jit/core.py.
-        from aiter.ops import batched_gemm_op_a8w8 as bmm
+        from aiter.ops.opus import policy
 
-        bmm._load_mxscale_bmm_tuned.cache_clear()
-        rows = bmm._load_mxscale_bmm_tuned("opus")
+        policy._load_mxscale_bmm_tuned.cache_clear()
+        rows = policy._load_mxscale_bmm_tuned("opus")
         self.assertTrue(rows)
         self.assertEqual(len(rows), len(set(rows)))
         self.assertEqual(
@@ -222,12 +222,12 @@ class TestConfigShapeCollision(unittest.TestCase):
             8653,
             "legacy local OPUS kid 653 must become public global kid 8653",
         )
-        bmm._load_mxscale_bmm_tuned.cache_clear()
+        policy._load_mxscale_bmm_tuned.cache_clear()
 
     def test_mxscale_kid_translation_does_not_touch_other_backends(self):
-        from aiter.ops import batched_gemm_op_a8w8 as bmm
+        from aiter.ops.opus import policy
 
-        env_name = bmm._MXSCALE_BMM_CONFIG_ENV
+        env_name = policy._MXSCALE_BMM_CONFIG_ENV
         old_value = os.environ.get(env_name)
         with tempfile.TemporaryDirectory(prefix="aiter_mxscale_kid_") as tmp:
             config_path = os.path.join(tmp, "mixed.csv")
@@ -238,8 +238,8 @@ class TestConfigShapeCollision(unittest.TestCase):
 
             try:
                 os.environ[env_name] = config_path
-                bmm._load_mxscale_bmm_tuned.cache_clear()
-                rows = bmm._load_mxscale_bmm_tuned()
+                policy._load_mxscale_bmm_tuned.cache_clear()
+                rows = policy._load_mxscale_bmm_tuned()
                 self.assertEqual(rows[("gfx950", 2, 1, 1024, 4096)]["kernelId"], 8311)
                 self.assertEqual(rows[("gfx950", 3, 1, 1024, 4096)]["kernelId"], 42)
             finally:
@@ -247,7 +247,7 @@ class TestConfigShapeCollision(unittest.TestCase):
                     os.environ.pop(env_name, None)
                 else:
                     os.environ[env_name] = old_value
-                bmm._load_mxscale_bmm_tuned.cache_clear()
+                policy._load_mxscale_bmm_tuned.cache_clear()
 
     def test_bf16(self):
         self._check_family("AITER_CONFIG_GEMM_BF16", "bf16_tuned_gemm")

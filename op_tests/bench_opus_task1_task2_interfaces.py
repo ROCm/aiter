@@ -44,8 +44,12 @@ from aiter.ops.opus import opus_bmm as current_opus_bmm
 from aiter.ops.opus import opus_gemm as current_opus_gemm
 from aiter.ops.opus import gemm_op_a16w16 as a16
 from aiter.ops.opus import gemm_op_a8w8 as a8
+from aiter.ops.opus.launch_plan import _get_cached_a16w16_launch_plan
 from aiter.ops.shuffle import shuffle_weight
 from aiter.utility.dtypes import torch_to_aiter_pybind
+from op_tests.opus_a16w16_test_utils import (
+    _launch_a16w16_with_torch_workspace,
+)
 
 
 A16_KID = 200
@@ -253,28 +257,28 @@ def _task1_explicit(
     batch, M, K = XQ.shape
     N = Y.shape[2]
     arch, cu_num = a16._device_arch_and_cu(XQ.device)
-    config = a16._resolve_exact_a16w16_config(
-        arch=arch,
-        M=M,
-        N=N,
-        K=K,
-        batch=batch,
-        cu_num=cu_num,
-        has_bias=False,
-        input_dtype=XQ.dtype,
-        output_dtype=Y.dtype,
-        kid=kid,
-        split_k=split_k,
+    plan = _get_cached_a16w16_launch_plan(
+        arch,
+        M,
+        N,
+        K,
+        batch,
+        cu_num,
+        False,
+        XQ.dtype,
+        Y.dtype,
+        kid,
+        split_k,
     )
-    if config.actual_kid != kid:
-        raise RuntimeError(f"Task1 explicit kid resolved to {config.actual_kid}")
-    return a16._launch_a16w16_with_torch_workspace(
+    if plan.resolved_kid != kid:
+        raise RuntimeError(f"Task1 explicit kid resolved to {plan.resolved_kid}")
+    return _launch_a16w16_with_torch_workspace(
         raw,
         XQ,
         WQ,
         Y,
         None,
-        config,
+        plan,
         workspace=workspace,
     )
 
@@ -352,13 +356,13 @@ class Runner:
         raw = (
             _task1_a16_raw
             if self.args.endpoint == "task1"
-            else a16._opus_gemm_a16w16_launch_ctypes_raw
+            else a16._launch_a16w16_backend
         )
         if self.args.endpoint == "task1":
             # The frozen Task1 module predates the C ABI symbol. Inject its
             # pybind binding into the current production-backend slot so the
             # otherwise unchanged shape-driven adapter remains benchmarkable.
-            a16._opus_gemm_a16w16_launch_ctypes_raw = raw
+            a16._launch_a16w16_backend = raw
 
         for dtype_name, dtype, rtol, atol in (
             ("bf16", torch.bfloat16, 0.03, 0.5),
@@ -397,26 +401,22 @@ class Runner:
                             split_k=A16_SPLIT_K,
                             workspace=workspace,
                         )
-                    return a16._explicit_a16w16_launch(
-                        raw,
+                    return a16._execute_a16w16(
                         XQ,
                         WQ,
                         Y,
-                        None,
-                        A16_KID,
-                        A16_SPLIT_K,
+                        kid=A16_KID,
+                        split_k=A16_SPLIT_K,
                         workspace=workspace,
                     )
 
                 def explicit() -> Tensor:
-                    return a16._explicit_a16w16_launch(
-                        raw,
+                    return a16._execute_a16w16(
                         XQ,
                         WQ,
                         Y,
-                        None,
-                        A16_KID,
-                        A16_SPLIT_K,
+                        kid=A16_KID,
+                        split_k=A16_SPLIT_K,
                         workspace=workspace,
                     )
 
@@ -609,7 +609,7 @@ class Runner:
             raw = (
                 _task1_a16_raw
                 if self.args.endpoint == "task1"
-                else a16._opus_gemm_a16w16_launch_ctypes_raw
+                else a16._launch_a16w16_backend
             )
 
             def check() -> None:
@@ -899,9 +899,9 @@ class Runner:
         else:
 
             def public() -> Tensor:
-                if self.args.endpoint == "current":
-                    return current_opus_bmm(XQ, WQ, Y, kid=2)
-                return a8._launch_a8w8_bmm(XQ, WQ, Y, kid=2)
+                return a8._launch_a8w8_gemm(
+                    XQ[0], WQ[0], Y[0], kid=2
+                )
 
             def raw_call() -> object:
                 return a8._opus_gemm_a8w8_launch_raw(XQ, WQ, Y, 2)
@@ -994,17 +994,13 @@ class Runner:
         else:
 
             def public() -> Tensor:
-                if self.args.endpoint == "current":
-                    return current_opus_bmm(
-                        XQ,
-                        WQ,
-                        Y,
-                        kid=1,
-                        x_scale=x_scale,
-                        w_scale=w_scale,
-                    )
-                return a8._launch_a8w8_blockscale_bmm(
-                    XQ, WQ, Y, x_scale, w_scale, kid=1
+                return a8._launch_a8w8_blockscale_gemm(
+                    XQ[0],
+                    WQ[0],
+                    Y[0],
+                    x_scale[0],
+                    w_scale[0],
+                    kid=1,
                 )
 
             def raw_call() -> object:
@@ -1078,7 +1074,7 @@ class Runner:
         x_scale: Tensor,
         w_scale: Tensor,
     ) -> None:
-        """Cover both logical 2D A8 routes added by the GEMM/BMM split."""
+        """Cover the two logical 2D ordinary A8 GEMM routes."""
         if self.args.endpoint == "task1":
             return
 

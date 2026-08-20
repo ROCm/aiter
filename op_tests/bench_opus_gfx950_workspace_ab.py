@@ -121,7 +121,7 @@ def _launch(endpoint, xq, wq, y, workspace, kid):
     elif endpoint == "current":
         gemm._opus_gemm_a16w16_launch_raw(xq, wq, y, None, workspace, kid, 2)
     elif endpoint == "ctypes":
-        gemm._opus_gemm_a16w16_launch_ctypes_raw(
+        gemm._launch_a16w16_backend(
             xq, wq, y, None, workspace, kid, 2
         )
     elif endpoint == "family":
@@ -135,14 +135,12 @@ def _launch(endpoint, xq, wq, y, workspace, kid):
             workspace=workspace,
         )
     elif endpoint == "public-pybind":
-        gemm._explicit_a16w16_launch(
-            gemm._opus_gemm_a16w16_launch_raw,
+        gemm._execute_a16w16(
             xq,
             wq,
             y,
-            None,
-            kid,
-            2,
+            kid=kid,
+            split_k=2,
             workspace=workspace,
         )
     else:
@@ -194,6 +192,12 @@ def _stats(samples: list[float]) -> dict[str, object]:
 
 def main() -> None:
     args = _parse_args()
+    if args.endpoint == "public-pybind":
+        # This benchmark endpoint intentionally keeps the shared executor but
+        # swaps its production backend once per isolated process for pybind A/B.
+        gemm._launch_a16w16_backend = (
+            gemm._opus_gemm_a16w16_launch_raw
+        )
     props = torch.cuda.get_device_properties(0)
     arch = str(getattr(props, "gcnArchName", "")).split(":", 1)[0].lower()
     if arch != args.arch:

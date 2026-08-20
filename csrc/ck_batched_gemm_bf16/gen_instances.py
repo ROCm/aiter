@@ -245,8 +245,25 @@ torch::Tensor
 
 def get_tune_dict(tune_dict_csv):
     if os.path.exists(tune_dict_csv):
+        tune_df = pd.read_csv(tune_dict_csv)
+        # The BF16 BMM CSV is now allowed to contain an OPUS winner.  CK
+        # codegen must compile only CK rows; legacy rows with no backend tag
+        # retain their historical CK meaning.
+        if "libtype" not in tune_df.columns:
+            tune_df["libtype"] = "ck"
+        else:
+            legacy = tune_df["libtype"].isna() | tune_df["libtype"].astype(
+                str
+            ).str.strip().str.lower().isin(("", "0", "nan", "none", "null"))
+            tune_df.loc[legacy, "libtype"] = "ck"
+            tune_df["libtype"] = (
+                tune_df["libtype"].astype(str).str.strip().str.lower()
+            )
         return build_tune_dict_batched(
-            pd.read_csv(tune_dict_csv), default_kernels_dict, kernels_list
+            tune_df,
+            default_kernels_dict,
+            kernels_list,
+            libtype="ck",
         )
     return default_kernels_dict
 

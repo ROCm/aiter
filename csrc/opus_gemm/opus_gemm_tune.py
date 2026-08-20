@@ -67,6 +67,7 @@ from opus_gemm_common import (
     NON_SPLITK_KIDS,
     SPLITK_KIDS,
     _opus_sidecar_path,
+    a16w16_flatmm_prefetch_k_iter,
     a16w16_flatmm_kernels_list,
     a16w16_flatmm_splitk_kernels_list,
     a16w16_flatmm_splitk_kernels_list_nooob,
@@ -148,27 +149,8 @@ def _kid_rejects_outdtype(k_inst, out_dtype):
 
 
 def _flatmm_splitk_pfk(k) -> int:
-    """Host-side computation of Traits::prefetch_k_iter for a splitk instance.
-
-    Mirrors opus_flatmm_splitk_traits_gfx950's formula so the host can
-    pre-compute the per-split iter budget without a device call. Hardcodes
-    LDS=163840 (gfx950), same convention as the traits struct.
-    """
-    sizeof_da = 2  # bf16
-    LOAD_GROUP_M = 64 if k.W_M >= 32 else 32
-    LOAD_GROUP_N = 64 if k.W_N >= 32 else 32
-    LOAD_GROUP_K = k.W_K * 2
-    num_m = k.B_M // LOAD_GROUP_M
-    num_n = k.B_N // LOAD_GROUP_N
-    num_k = k.B_K // LOAD_GROUP_K
-    smem_linear = 64 * 16 // sizeof_da  # WARP_SIZE=64
-    smem_sub = smem_linear // LOAD_GROUP_K
-    slots = LOAD_GROUP_M // smem_sub
-    padding = 16 // sizeof_da if k.W_M >= 32 else 2 * 16 // sizeof_da
-    per_glsz = slots * (smem_linear + padding) * sizeof_da
-    per_iter = (num_m + num_n) * num_k * per_glsz
-    lds_total = 163840
-    return max(1, (lds_total // max(k.WG_PER_CU, 1)) // max(per_iter, 1))
+    """Backward-compatible name for the canonical metadata calculation."""
+    return a16w16_flatmm_prefetch_k_iter(k)
 
 
 def _gfx1250_occ_cost(total_wg: int, cu_num: int) -> float:

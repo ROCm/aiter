@@ -3,8 +3,6 @@
 """A16W16 exact launch and Torch workspace support."""
 
 import ctypes
-from collections.abc import Callable
-from dataclasses import dataclass
 from functools import lru_cache, wraps
 from threading import local
 
@@ -13,345 +11,13 @@ import torch
 from ...jit.core import compile_ops, get_module
 from ...jit.utils.torch_guard import torch_compile_guard
 from ...utility.dtypes import aiter_tensor_t, torch_to_aiter
-from csrc.opus_gemm.opus_gemm_common import (
-    BIAS_AWARE_KIDS,
-    GFX942_BF16WS_EXACT_N,
-    OpusGemmInstance,
-    get_kernel_instance,
-    kernel_needs_external_workspace,
-)
+from csrc.opus_gemm.opus_gemm_common import OpusGemmInstance
 
-from . import a16w16_policy as _a16w16_policy
 from ._arch import _device_arch_and_cu
-
-_WORKSPACE_DTYPES = {
-    "bf16_t": torch.bfloat16,
-    "fp32_t": torch.float32,
-}
-_MAX_AUTO_SPLIT_K = 16
-_MIN_ITERS_PER_SPLIT = 2
-_EVEN_LOOP_SPLITK_TAGS = frozenset(
-    {
-        "a16w16_kbuf2v_sk",
-        "a16w16_kbuf2v_bk128_sk",
-        "a16w16_quad_mfma32_kbuf1_sk",
-    }
-)
+from .launch_plan import _get_cached_a16w16_launch_plan
 
 
-def _validate_a16w16_public_contract(
-    *,
-    kid: int,
-    instance: OpusGemmInstance,
-    input_dtype: torch.dtype,
-    weight_dtype: torch.dtype,
-    output_dtype: torch.dtype,
-    layout: str,
-    has_x_scale: bool,
-    has_w_scale: bool,
-) -> None:
-    """Validate A16W16-only options shared by both public routers."""
-    if input_dtype != weight_dtype:
-        raise ValueError(
-            f"OPUS requires matching XQ/WQ dtypes; got "
-            f"{input_dtype}/{weight_dtype}"
-        )
-    if input_dtype != torch.bfloat16:
-        raise ValueError(
-            f"OPUS kid {kid} requires bf16 XQ/WQ; got {input_dtype}"
-        )
-    if layout != "plain":
-        raise ValueError(
-            f"OPUS kid {kid} belongs to family a16w16 and requires "
-            f"layout='plain'; got {layout!r}"
-        )
-    if has_x_scale != has_w_scale:
-        raise ValueError("OPUS requires x_scale and w_scale together")
-    if has_x_scale:
-        raise ValueError("OPUS a16w16 does not accept x_scale/w_scale")
-    if not _instance_output_compatible(
-        instance,
-        needs_workspace=instance.splitk_workspace_dtype is not None,
-        output_dtype=output_dtype,
-    ):
-        raise ValueError(
-            f"OPUS kid {kid} does not support Y.dtype={output_dtype}"
-        )
-
-
-@dataclass(frozen=True)
-class LaunchConfig:
-    """One exact A16W16 kid after split-K resolution."""
-
-    arch: str
-    family: str
-    actual_kid: int
-    allocation_split_k: int
-    launch_split_k: int
-
-    @property
-    def kid(self) -> int:
-        return self.actual_kid
-
-    @property
-    def split_k(self) -> int:
-        return self.launch_split_k
-
-
-def _output_dtype_name(dtype) -> str:
-    value = str(dtype).lower()
-    if value in {"bf16", "bfloat16", "bf16_t", "torch.bfloat16"}:
-        return "bf16"
-    if value in {"fp32", "float", "float32", "fp32_t", "torch.float32"}:
-        return "fp32"
-    return value
-
-
-def _instance_output_compatible(
-    instance: OpusGemmInstance,
-    *,
-    needs_workspace: bool,
-    output_dtype,
-) -> bool:
-    # Workspace reducers cast output; direct kernels use registered dtypes.
-    if needs_workspace:
-        return _output_dtype_name(output_dtype) in {"bf16", "fp32"}
-    return f"{_output_dtype_name(output_dtype)}_t" in instance.output_dtypes
-
-
-def _instance_shape_compatible(
-    instance: OpusGemmInstance,
-    *,
-    arch: str,
-    M: int,
-    N: int,
-    K: int,
-    batch: int,
-) -> bool:
-    if arch == "gfx1250" and batch != 1:
-        return False
-
-    if instance.kernel_tag == "a16w16_clusterlaunch_tdm_splitk_fuse":
-        split_k = int(instance.fuse_split_k)
-        n_cluster = int(instance.fuse_m_cluster)
-        if K % 2 != 0 or N % instance.B_N != 0:
-            return False
-        if split_k < 2 or split_k * n_cluster > 16:
-            return False
-        num_tiles_n = N // instance.B_N
-        if num_tiles_n % n_cluster != 0:
-            return False
-        return split_k <= (K + instance.B_K - 1) // instance.B_K
-
-    if instance.kernel_tag == "a16w16_mono_tile":
-        return N % instance.B_N == 0 and K % instance.B_K == 0
-
-    if not instance.has_oob:
-        return M % instance.B_M == 0 and N % instance.B_N == 0
-    return True
-
-
-def _resolve_gfx942_split_k(
-    instance: OpusGemmInstance,
-    *,
-    M: int,
-    N: int,
-    K: int,
-    batch: int,
-    cu_num: int,
-    requested: int,
-) -> tuple[int, int]:
-    """Return allocation/effective split-K matching the gfx942 launcher."""
-    if requested > 0:
-        allocation = requested
-    else:
-        tiles_mn = (
-            (M + instance.B_M - 1)
-            // instance.B_M
-            * ((N + instance.B_N - 1) // instance.B_N)
-            * batch
-        )
-        tiles_mn = max(1, tiles_mn)
-        target_wg = (2 * cu_num) if instance.kernel_tag.endswith("_p1") else cu_num
-        allocation = (target_wg + tiles_mn - 1) // tiles_mn
-        allocation = min(_MAX_AUTO_SPLIT_K, max(1, allocation))
-
-    total_iters = (K + instance.B_K - 1) // instance.B_K
-    if total_iters < _MIN_ITERS_PER_SPLIT:
-        raise ValueError(
-            f"K={K} is too small for gfx942 kid B_K={instance.B_K}; "
-            f"need at least {instance.B_K * _MIN_ITERS_PER_SPLIT}"
-        )
-
-    effective = allocation
-    require_even = instance.kernel_tag in _EVEN_LOOP_SPLITK_TAGS
-    while effective > 1:
-        iters_full = (total_iters + effective - 1) // effective
-        last_loops = total_iters - (effective - 1) * iters_full
-        parity_ok = not require_even or (
-            iters_full % 2 == 0 and last_loops % 2 == 0
-        )
-        if (
-            iters_full >= _MIN_ITERS_PER_SPLIT
-            and last_loops >= _MIN_ITERS_PER_SPLIT
-            and parity_ok
-        ):
-            break
-        effective -= 1
-
-    if require_even:
-        iters_full = (total_iters + effective - 1) // effective
-        last_loops = total_iters - (effective - 1) * iters_full
-        if iters_full % 2 != 0 or last_loops % 2 != 0:
-            raise ValueError(
-                f"gfx942 kid {instance.name} needs even loops per split; "
-                f"K={K}, split_k={effective}, loops=({iters_full},{last_loops})"
-            )
-    return allocation, effective
-
-
-def _resolve_exact_a16w16_config(
-    *,
-    arch: str,
-    M: int,
-    N: int,
-    K: int,
-    batch: int,
-    cu_num: int,
-    has_bias: bool,
-    input_dtype,
-    output_dtype,
-    kid: int,
-    split_k: int,
-) -> LaunchConfig:
-    """Validate one caller-provided kid without tuned or heuristic selection."""
-    arch = str(arch).lower().split(":", 1)[0]
-    M, N, K, batch, cu_num = map(int, (M, N, K, batch, cu_num))
-    if min(M, N, K, batch, cu_num) <= 0:
-        raise ValueError("M, N, K, batch, and cu_num must all be positive")
-    try:
-        kid = int(kid)
-        split_k = int(split_k)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(
-            f"OPUS a16w16 kid/split_k must be integers, got {kid!r}/{split_k!r}"
-        ) from exc
-    if split_k < 0:
-        raise ValueError(
-            f"OPUS a16w16 split_k must be non-negative, got {split_k}"
-        )
-    if input_dtype != torch.bfloat16:
-        raise ValueError(
-            f"OPUS a16w16 requires bf16 XQ/WQ, got input dtype {input_dtype}"
-        )
-
-    instance = get_kernel_instance(arch, "a16w16", kid)
-    if instance is None:
-        raise ValueError(
-            f"OPUS kid {kid} is not an a16w16 kernel for runtime arch {arch}"
-        )
-    needs_workspace = kernel_needs_external_workspace(arch, "a16w16", kid)
-    if (
-        arch == "gfx942"
-        and needs_workspace
-        and instance.splitk_workspace_dtype == "bf16_t"
-        and N not in GFX942_BF16WS_EXACT_N
-    ):
-        raise ValueError(
-            f"gfx942 exact kid {kid} requires N in "
-            f"{sorted(GFX942_BF16WS_EXACT_N)}; got N={N}"
-        )
-    if not _instance_shape_compatible(
-        instance, arch=arch, M=M, N=N, K=K, batch=batch
-    ):
-        raise ValueError(
-            f"OPUS kid {kid} is incompatible with "
-            f"shape (batch={batch}, M={M}, N={N}, K={K})"
-        )
-    if not _instance_output_compatible(
-        instance,
-        needs_workspace=needs_workspace,
-        output_dtype=output_dtype,
-    ):
-        raise ValueError(
-            f"OPUS kid {kid} does not support output dtype {output_dtype}"
-        )
-    if has_bias and kid not in BIAS_AWARE_KIDS:
-        raise ValueError(f"OPUS kid {kid} does not support bias")
-    if (
-        has_bias
-        and instance.kernel_tag == "a16w16_clusterlaunch_tdm_splitk_fuse"
-    ):
-        raise ValueError(
-            "gfx1250 splitk_fuse has a narrower bf16 [N] bias contract than "
-            "the public OPUS interfaces can represent"
-        )
-    if has_bias and arch == "gfx942" and needs_workspace:
-        raise ValueError(
-            "the current gfx942 a16w16 launch rejects bias on split-K kernels"
-        )
-
-    allocation_split_k = 1
-    launch_split_k = split_k
-    if needs_workspace:
-        allocation_split_k = max(1, split_k)
-        if instance.kernel_tag == "a16w16_clusterlaunch_tdm_splitk_fuse":
-            allocation_split_k = int(instance.fuse_split_k)
-            launch_split_k = allocation_split_k
-        elif arch == "gfx942":
-            allocation_split_k, launch_split_k = _resolve_gfx942_split_k(
-                instance,
-                M=M,
-                N=N,
-                K=K,
-                batch=batch,
-                cu_num=cu_num,
-                requested=split_k,
-            )
-
-    return LaunchConfig(
-        arch=arch,
-        family="a16w16",
-        actual_kid=kid,
-        allocation_split_k=allocation_split_k,
-        launch_split_k=launch_split_k,
-    )
-
-
-# Temporary private-name compatibility for existing in-tree and external
-# callers.  New policy callers should import the explicit APIs from
-# a16w16_policy instead of reaching through the execution module.
-_heuristic_a16w16_kid_gfx950 = (
-    _a16w16_policy._heuristic_a16w16_kid_gfx950
-)
-_heuristic_a16w16_kid_gfx1250 = (
-    _a16w16_policy._heuristic_a16w16_kid_gfx1250
-)
-_gfx942_heuristic_symbol_to_kid = (
-    _a16w16_policy._gfx942_heuristic_symbol_to_kid
-)
-_gfx942_heuristic_kid_for_symbol = (
-    _a16w16_policy._gfx942_heuristic_kid_for_symbol
-)
-_gfx942_heuristic_split_barrier_ok = (
-    _a16w16_policy._gfx942_heuristic_split_barrier_ok
-)
-_gfx942_heuristic_bf16ws_band = (
-    _a16w16_policy._gfx942_heuristic_bf16ws_band
-)
-_gfx942_heuristic_bf16_symbol = (
-    _a16w16_policy._gfx942_heuristic_bf16_symbol
-)
-_heuristic_a16w16_kid_gfx942 = (
-    _a16w16_policy._heuristic_a16w16_kid_gfx942
-)
-_A16W16_HEURISTICS = _a16w16_policy._A16W16_HEURISTICS
-_select_a16w16_heuristic_kid = _a16w16_policy.select_a16w16_heuristic_kid
-_resolve_a16w16_caller_candidate = (
-    _a16w16_policy.resolve_a16w16_caller_candidate
-)
-
-# ---- Low-level bindings ---------------------------------------------------
+# ---- Low-level A16W16 backend --------------------------------------------
 
 
 def _gen_opus_gemm_a16w16_launch_fake_tensors(
@@ -506,7 +172,7 @@ def _invoke_opus_a16w16_cabi(
         raise RuntimeError(f"opus_gemm_a16w16_launch_cabi failed: {message}")
 
 
-def _gen_opus_gemm_a16w16_cabi_fake(
+def _gen_a16w16_backend_fake(
     XQ: torch.Tensor,
     WQ: torch.Tensor,
     Y: torch.Tensor,
@@ -518,7 +184,17 @@ def _gen_opus_gemm_a16w16_cabi_fake(
     return None
 
 
-def _opus_gemm_a16w16_launch_ctypes_raw(
+def _register_a16w16_backend_op(func):
+    """Expose the unified private backend as a Torch compile-visible op."""
+    guarded = torch_compile_guard(
+        device="cuda",
+        gen_fake=_gen_a16w16_backend_fake,
+    )(func)
+    return wraps(func)(guarded)
+
+
+@_register_a16w16_backend_op
+def _launch_a16w16_backend(
     XQ: torch.Tensor,
     WQ: torch.Tensor,
     Y: torch.Tensor,
@@ -527,7 +203,7 @@ def _opus_gemm_a16w16_launch_ctypes_raw(
     kid: int,
     split_k: int,
 ) -> None:
-    """Launch through the private C ABI without modifying generic JIT code.
+    """Launch through the unified pybind-primed, C ABI-backed backend.
 
     The first call uses the existing pybind wrapper so its normal lazy-build,
     rebuild and architecture checks remain authoritative.  Run that priming
@@ -558,308 +234,99 @@ def _opus_gemm_a16w16_launch_ctypes_raw(
     return None
 
 
-_opus_gemm_a16w16_launch_ctypes_raw = wraps(
-    _opus_gemm_a16w16_launch_ctypes_raw
-)(
-    torch_compile_guard(
-        device="cuda",
-        calling_func_=_opus_gemm_a16w16_launch_ctypes_raw,
-        gen_fake=_gen_opus_gemm_a16w16_cabi_fake,
-    )(_opus_gemm_a16w16_launch_ctypes_raw)
-)
-
-
-def _raise_a16w16_bad_dim(name: str, tensor: torch.Tensor) -> None:
-    raise ValueError(
-        f"opus_gemm_a16w16_launch: {name} must be 3D (got "
-        f"{name}.shape={tuple(tensor.shape)}). The C++ launcher reads "
-        f"`{name}.size(0)` as batch and indexes with hardcoded "
-        f"stride_*_batch == size(1)*size(2)."
-    )
-
-
-def _raise_a16w16_bad_input_stride(
-    name: str, tensor: torch.Tensor, inner_k: int
+def _check_a16w16_launch_layout(
+    XQ: torch.Tensor,
+    WQ: torch.Tensor,
+    Y: torch.Tensor,
 ) -> None:
-    raise NotImplementedError(
-        f"opus_gemm_a16w16_launch: {name} must be K-contiguous with an "
-        f"optional padded leading dim -- need stride[2]==1, "
-        f"stride[1]>={inner_k}, and stride[0]==size(1)*stride[1] (or "
-        f"batch==1). Got {name}.stride()={tuple(tensor.stride())}, "
-        f"{name}.shape={tuple(tensor.shape)}. Broadcast / transpose / "
-        f"non-K-contiguous slices are not supported; materialize with "
-        f"`{name} = {name}.contiguous()` before calling."
-    )
-
-
-def _check_a16w16_launch_layout(XQ: torch.Tensor, WQ: torch.Tensor, Y: torch.Tensor):
-    """Validate launcher-required 3D shapes and strides."""
-    if XQ.dim() != 3:
-        _raise_a16w16_bad_dim("XQ", XQ)
-    if WQ.dim() != 3:
-        _raise_a16w16_bad_dim("WQ", WQ)
-    if Y.dim() != 3:
-        _raise_a16w16_bad_dim("Y", Y)
+    """Validate launcher-required 3D shapes and physical strides."""
+    for name, tensor in (("XQ", XQ), ("WQ", WQ), ("Y", Y)):
+        if tensor.dim() != 3:
+            raise ValueError(
+                f"opus_gemm_a16w16_launch: {name} must be 3D "
+                f"(got {name}.shape={tuple(tensor.shape)}). "
+                "The C++ launcher reads size(0) as batch and uses "
+                "hardcoded dense batch strides."
+            )
 
     batch, M, K = XQ.shape
     b_w, N, K_w = WQ.shape
-    b_y, M_y, N_y = Y.shape
+    expected_wq = (batch, N, K)
+    expected_y = (batch, M, N)
     if (b_w, K_w) != (batch, K):
         raise ValueError(
-            f"opus_gemm_a16w16_launch: WQ shape mismatch (got "
-            f"WQ.shape={tuple(WQ.shape)}, expected "
-            f"({batch}, N, {K})); XQ.shape={tuple(XQ.shape)}"
+            "opus_gemm_a16w16_launch: WQ shape mismatch "
+            f"(got {tuple(WQ.shape)}, expected {expected_wq}); "
+            f"XQ.shape={tuple(XQ.shape)}"
         )
-    if (b_y, M_y, N_y) != (batch, M, N):
+    if tuple(Y.shape) != expected_y:
         raise ValueError(
-            f"opus_gemm_a16w16_launch: Y shape mismatch (got "
-            f"Y.shape={tuple(Y.shape)}, expected ({batch}, {M}, {N}))"
+            "opus_gemm_a16w16_launch: Y shape mismatch "
+            f"(got {tuple(Y.shape)}, expected {expected_y})"
         )
 
     # XQ/WQ allow padded rows but require contiguous K and dense batches.
-    x_stride = XQ.stride()
-    if (
-        x_stride[2] != 1
-        or x_stride[1] < K
-        or (batch != 1 and x_stride[0] != M * x_stride[1])
-    ):
-        _raise_a16w16_bad_input_stride("XQ", XQ, K)
-    w_stride = WQ.stride()
-    if (
-        w_stride[2] != 1
-        or w_stride[1] < K
-        or (batch != 1 and w_stride[0] != N * w_stride[1])
-    ):
-        _raise_a16w16_bad_input_stride("WQ", WQ, K)
+    for name, tensor, rows in (("XQ", XQ, M), ("WQ", WQ, N)):
+        stride_batch, stride_row, stride_k = tensor.stride()
+        if (
+            stride_k != 1
+            or stride_row < K
+            or (batch != 1 and stride_batch != rows * stride_row)
+        ):
+            raise NotImplementedError(
+                f"opus_gemm_a16w16_launch: {name} must be K-contiguous "
+                "with an optional padded leading dimension; need "
+                "stride[2]==1, stride[1]>=K, and "
+                "stride[0]==size(1)*stride[1] when batch>1. "
+                f"Got {name}.stride()={tuple(tensor.stride())}, "
+                f"{name}.shape={tuple(tensor.shape)}. "
+                f"Materialize with `{name} = {name}.contiguous()`."
+            )
+
     # Y must match the launcher's contiguous output strides.
-    y_want = (M * N, N, 1)
-    if Y.stride() != y_want:
+    expected_y_stride = (M * N, N, 1)
+    if Y.stride() != expected_y_stride:
         raise NotImplementedError(
-            f"opus_gemm_a16w16_launch: Y must have contiguous strides {y_want} "
-            f"(got Y.stride()={tuple(Y.stride())}, Y.shape={tuple(Y.shape)}). "
-            f"The launcher hardcodes stride_c == N and stride_c_batch == M*N; "
-            f"materialize with `Y = Y.contiguous()` before calling."
+            "opus_gemm_a16w16_launch: Y must have contiguous strides "
+            f"{expected_y_stride} (got {tuple(Y.stride())}, "
+            f"Y.shape={tuple(Y.shape)}). "
+            "Materialize with `Y = Y.contiguous()`."
         )
 
 
-def _plan_a16w16_workspace(
-    config: LaunchConfig,
-    *,
-    batch: int,
-    M: int,
-    N: int,
-    K: int,
-) -> tuple[tuple[int, ...], torch.dtype] | None:
-    """Validate and return the immutable workspace shape/dtype plan."""
-    instance = get_kernel_instance(config.arch, config.family, config.actual_kid)
-    if instance is None:
-        raise RuntimeError(
-            "opus_gemm_a16w16_launch: resolved launch has no canonical "
-            "instance: "
-            f"({config.arch}, {config.family}, {config.actual_kid})"
-        )
-
-    if not kernel_needs_external_workspace(
-        config.arch, config.family, config.actual_kid
-    ):
-        return None
-
-    is_fused = (
-        instance.kernel_tag == "a16w16_clusterlaunch_tdm_splitk_fuse"
-    )
-    # Fused split-K comes from the kernel entry; other kernels use exact-id resolution.
-    split_k = (
-        int(instance.fuse_split_k)
-        if is_fused
-        else int(config.allocation_split_k)
-    )
-    if split_k <= 0:
-        raise ValueError(
-            "opus_gemm_a16w16_launch: allocation split_k must be positive, "
-            f"got {split_k}"
-        )
-
-    block_m = int(instance.B_M)
-    block_n = int(instance.B_N)
-    block_k = int(instance.B_K)
-    max_useful_split_k = (K + block_k - 1) // block_k
-    if split_k > max_useful_split_k:
-        raise ValueError(
-            "opus_gemm_a16w16_launch: "
-            f"allocation split_k={split_k} exceeds the per-kid K-tile limit "
-            f"{max_useful_split_k} for K={K}, B_K={block_k}"
-        )
-
-    if config.arch == "gfx1250":
-        if batch != 1:
-            raise ValueError(
-                "opus_gemm_a16w16_launch: gfx1250 workspace kids require "
-                "batch=1; "
-                f"got batch={batch}"
-            )
-        num_tiles_m = (M + block_m - 1) // block_m
-        num_tiles_n = (N + block_n - 1) // block_n
-        if is_fused:
-            if split_k < 2:
-                raise ValueError(
-                    "opus_gemm_a16w16_launch: "
-                    f"gfx1250 fused kid {config.actual_kid} must declare "
-                    f"compile-time SplitK >= 2, got {split_k}"
-                )
-            # Fused layout: M tile, N tile, published partial,
-            # M element, N element.
-            shape = (
-                num_tiles_m,
-                num_tiles_n,
-                split_k - 1,
-                block_m,
-                block_n,
-            )
-        else:
-            padded_m = num_tiles_m * block_m
-            padded_n = num_tiles_n * block_n
-            shape = (split_k, padded_m, padded_n)
-    else:
-        padded_m = ((M + block_m - 1) // block_m) * block_m
-        padded_n = ((N + block_n - 1) // block_n) * block_n
-        shape = (split_k, batch, padded_m, padded_n)
-
-    dtype_token = instance.splitk_workspace_dtype
-    try:
-        dtype = _WORKSPACE_DTYPES[dtype_token]
-    except KeyError as exc:
-        raise ValueError(
-            "opus_gemm_a16w16_launch: "
-            f"workspace kid {config.actual_kid} must declare "
-            f"bf16_t or fp32_t storage, got {dtype_token!r}"
-        ) from exc
-
-    required_numel = 1
-    max_numel = (2**63 - 1) // int(dtype.itemsize)
-    for extent in shape:
-        if extent <= 0 or required_numel > max_numel // extent:
-            raise OverflowError(
-                "opus_gemm_a16w16_launch: "
-                f"workspace shape {shape} exceeds the supported tensor size "
-                f"for dtype {dtype}"
-            )
-        required_numel *= extent
-
-    return shape, dtype
-
-
-def _init_a16w16_workspace(
-    config: LaunchConfig,
-    XQ: torch.Tensor,
-    Y: torch.Tensor,
-    workspace: torch.Tensor | None = None,
-) -> torch.Tensor | None:
-    """Prepare workspace for ``config.actual_kid``."""
-    batch, M, K = map(int, XQ.shape)
-    N = int(Y.shape[2])
-    plan = _plan_a16w16_workspace(
-        config,
-        batch=batch,
-        M=M,
-        N=N,
-        K=K,
-    )
-    if plan is None:
-        if workspace is not None:
-            raise ValueError(
-                f"opus_gemm_a16w16_launch: kid {config.actual_kid} does not use an "
-                "external workspace"
-            )
-        return None
-
-    if workspace is not None:
-        return workspace
-    shape, dtype = plan
-    return torch.empty(shape, dtype=dtype, device=XQ.device)
-
-
-@lru_cache(maxsize=256)
-def _cached_explicit_a16w16_plan(
-    arch: str,
-    M: int,
-    N: int,
-    K: int,
-    batch: int,
-    cu_num: int,
-    has_bias: bool,
-    input_dtype: torch.dtype,
-    output_dtype: torch.dtype,
-    kid: int,
-    split_k: int,
-) -> tuple[int, int, tuple[tuple[int, ...], torch.dtype] | None]:
-    """Cache only immutable scalar exact-kid and workspace-plan results."""
-    config = _resolve_exact_a16w16_config(
-        arch=arch,
-        M=M,
-        N=N,
-        K=K,
-        batch=batch,
-        cu_num=cu_num,
-        has_bias=has_bias,
-        input_dtype=input_dtype,
-        output_dtype=output_dtype,
-        kid=kid,
-        split_k=split_k,
-    )
-    workspace_plan = _plan_a16w16_workspace(
-        config,
-        batch=batch,
-        M=M,
-        N=N,
-        K=K,
-    )
-    return int(config.actual_kid), int(config.launch_split_k), workspace_plan
-
-
-def _launch_a16w16_with_torch_workspace(
-    raw_launch: Callable[..., object],
+def _execute_a16w16(
     XQ: torch.Tensor,
     WQ: torch.Tensor,
     Y: torch.Tensor,
-    bias: torch.Tensor | None,
-    config: LaunchConfig,
+    bias: torch.Tensor | None = None,
     *,
-    workspace: torch.Tensor | None = None,
-    _layout_checked: bool = False,
-) -> torch.Tensor:
-    """Prepare workspace and launch the resolved kid."""
-    if not _layout_checked:
-        _check_a16w16_launch_layout(XQ, WQ, Y)
-    workspace = _init_a16w16_workspace(config, XQ, Y, workspace)
-    raw_launch(
-        XQ,
-        WQ,
-        Y,
-        bias,
-        workspace,
-        config.actual_kid,
-        config.launch_split_k,
-    )
-    return Y
-
-
-def _explicit_a16w16_launch(
-    raw_launch: Callable[..., object],
-    XQ: torch.Tensor,
-    WQ: torch.Tensor,
-    Y: torch.Tensor,
-    bias: torch.Tensor | None,
     kid: int,
-    split_k: int,
-    *,
+    split_k: int = 0,
     workspace: torch.Tensor | None = None,
+    route_arch: str | None = None,
+    instance: OpusGemmInstance | None = None,
 ) -> torch.Tensor:
-    """Resolve and launch an explicit kid."""
+    """Validate, plan, and launch one exact 3D A16W16 operation."""
     _check_a16w16_launch_layout(XQ, WQ, Y)
     batch, M, K = XQ.shape
     N = Y.shape[2]
-    arch, cu_num = _device_arch_and_cu(XQ.device)
-    actual_kid, launch_split_k, workspace_plan = _cached_explicit_a16w16_plan(
+
+    use_gfx950_caller_workspace_fast_path = (
+        route_arch == "gfx950"
+        and workspace is not None
+        and split_k > 0
+        and instance is not None
+        and instance.splitk_workspace_dtype is not None
+    )
+    if use_gfx950_caller_workspace_fast_path:
+        # A caller-owned gfx950 workspace and the public registry route avoid
+        # re-reading device metadata. Explicit gfx950 plans do not consult the
+        # CU count, so one is a safe cache-key placeholder here.
+        arch, cu_num = route_arch, 1
+    else:
+        arch, cu_num = _device_arch_and_cu(XQ.device)
+
+    plan = _get_cached_a16w16_launch_plan(
         arch,
         M,
         N,
@@ -872,94 +339,35 @@ def _explicit_a16w16_launch(
         int(kid),
         int(split_k),
     )
-    if workspace_plan is None:
+    workspace_spec = plan.workspace_spec
+    if use_gfx950_caller_workspace_fast_path and workspace_spec is None:
+        raise RuntimeError(
+            f"OPUS gfx950 kid {plan.resolved_kid} unexpectedly has no "
+            "caller-workspace plan"
+        )
+    if workspace_spec is None:
         if workspace is not None:
             raise ValueError(
-                f"opus_gemm_a16w16_launch: kid {actual_kid} does not use an "
-                "external workspace"
+                "opus_gemm_a16w16_launch: "
+                f"kid {plan.resolved_kid} does not use an external workspace"
             )
     elif workspace is None:
-        shape, workspace_dtype = workspace_plan
-        workspace = torch.empty(shape, dtype=workspace_dtype, device=XQ.device)
+        workspace = torch.empty(
+            workspace_spec.shape,
+            dtype=workspace_spec.dtype,
+            device=XQ.device,
+        )
 
-    raw_launch(
+    _launch_a16w16_backend(
         XQ,
         WQ,
         Y,
         bias,
         workspace,
-        actual_kid,
-        launch_split_k,
+        plan.resolved_kid,
+        plan.abi_split_k,
     )
     return Y
-
-
-def _launch_a16w16_exact(
-    XQ: torch.Tensor,
-    WQ: torch.Tensor,
-    Y: torch.Tensor,
-    bias: torch.Tensor | None = None,
-    *,
-    kid: int,
-    split_k: int = 0,
-    workspace: torch.Tensor | None = None,
-    route_arch: str | None = None,
-    instance: OpusGemmInstance | None = None,
-) -> torch.Tensor:
-    """Launch one exact A16W16 kid shared by the GEMM and BMM adapters."""
-    if (
-        route_arch == "gfx950"
-        and workspace is not None
-        and split_k > 0
-        and instance is not None
-        and instance.splitk_workspace_dtype is not None
-    ):
-        # A caller-owned gfx950 workspace already gives this exact-kid path
-        # everything it needs.  Preserve the checked C ABI fast path without
-        # re-reading device metadata or re-entering the generic planner.
-        _check_a16w16_launch_layout(XQ, WQ, Y)
-        batch, M, K = XQ.shape
-        N = Y.shape[2]
-        actual_kid, launch_split_k, workspace_plan = (
-            _cached_explicit_a16w16_plan(
-                route_arch,
-                M,
-                N,
-                K,
-                batch,
-                1,  # Explicit gfx950 plans do not consult the CU count.
-                bias is not None,
-                XQ.dtype,
-                Y.dtype,
-                kid,
-                split_k,
-            )
-        )
-        if workspace_plan is None:
-            raise RuntimeError(
-                f"OPUS gfx950 kid {actual_kid} unexpectedly has no "
-                "caller-workspace plan"
-            )
-        _opus_gemm_a16w16_launch_ctypes_raw(
-            XQ,
-            WQ,
-            Y,
-            bias,
-            workspace,
-            actual_kid,
-            launch_split_k,
-        )
-        return Y
-    return _explicit_a16w16_launch(
-        _opus_gemm_a16w16_launch_ctypes_raw,
-        XQ,
-        WQ,
-        Y,
-        bias,
-        kid,
-        split_k,
-        workspace=workspace,
-    )
 
 
 def _launch_a16w16_gemm(
@@ -980,7 +388,7 @@ def _launch_a16w16_gemm(
             "opus_gemm A16W16 expects 2D XQ/WQ/Y; use opus_bmm for "
             "batch-first 3D tensors"
         )
-    _launch_a16w16_exact(
+    _execute_a16w16(
         XQ.unsqueeze(0),
         WQ.unsqueeze(0),
         Y.unsqueeze(0),
@@ -1012,7 +420,7 @@ def _launch_a16w16_bmm(
             "opus_bmm A16W16 expects batch-first 3D XQ/WQ/Y; use "
             "opus_gemm for logical 2D tensors"
         )
-    return _launch_a16w16_exact(
+    return _execute_a16w16(
         XQ,
         WQ,
         Y,

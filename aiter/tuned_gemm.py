@@ -129,7 +129,7 @@ def _resolve_opus_a16w16_tuned_candidate(
     """Validate one tuned OPUS row before the exact public call."""
     if _opus_launch is None:
         return None
-    from aiter.ops.opus.a16w16_policy import (
+    from aiter.ops.opus.policy import (
         resolve_a16w16_tuned_candidate,
     )
 
@@ -216,7 +216,7 @@ def get_GEMM_A16W16_config(
                     config = None
                     continue
                 config = dict(config)
-                config["solidx"] = int(resolved.actual_kid)
+                config["solidx"] = int(resolved.resolved_kid)
             if AITER_LOG_TUNED_CONFIG:
                 kernelName = (
                     config["kernelName"] if config["libtype"] != "hipblaslt" else ""

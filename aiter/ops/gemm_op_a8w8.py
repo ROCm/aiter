@@ -41,6 +41,12 @@ _BLOCKSCALE_HIP_PREBUILT_ARCHES = frozenset(
     {"gfx940", "gfx941", "gfx942", "gfx950", "gfx1250"}
 )
 
+# The two plain-layout OPUS A8 families each expose one exact gfx950 kernel.
+# Keep the final ids at this high-level policy boundary; the OPUS adapters only
+# validate and launch the caller-resolved id.
+_OPUS_A8W8_NOSCALE_KID = 2
+_OPUS_A8W8_BLOCKSCALE_KID = 1
+
 
 def _hip_blockscale_supported() -> bool:
     """True if the prebuilt HIP CK blockscale module covers the running arch (else triton)."""
@@ -556,8 +562,8 @@ def get_GEMM_config_with_quant_type(
 def gemm_a8w8_fake(
     XQ: Tensor,
     WQ: Tensor,
-    x_scale: Tensor,
-    w_scale: Tensor,
+    x_scale: Tensor | None = None,
+    w_scale: Tensor | None = None,
     bias: Tensor | None = None,
     dtype: torch.dtype = dtypes.bf16,
     splitK: int | None = None,
@@ -569,12 +575,48 @@ def gemm_a8w8_fake(
 def gemm_a8w8(
     XQ: Tensor,
     WQ: Tensor,
-    x_scale: Tensor,
-    w_scale: Tensor,
+    x_scale: Tensor | None = None,
+    w_scale: Tensor | None = None,
     bias: Tensor | None = None,
     dtype: torch.dtype = dtypes.bf16,
     splitK: int | None = None,
 ) -> Tensor:
+    """Run plain-layout A8W8 GEMM.
+
+    With two scale tensors this preserves the historical row-scale CK/Triton
+    operation.  With both scales omitted it selects the OPUS no-scale FP8 to
+    FP32 kernel.  The two modes are deliberately disjoint so scale or bias
+    information can never be silently discarded.
+    """
+    has_x_scale = x_scale is not None
+    has_w_scale = w_scale is not None
+    if has_x_scale != has_w_scale:
+        raise ValueError("gemm_a8w8 requires x_scale and w_scale together")
+
+    if not has_x_scale:
+        if bias is not None:
+            raise ValueError("OPUS no-scale gemm_a8w8 does not support bias")
+        if dtype != dtypes.fp32:
+            raise ValueError(
+                "OPUS no-scale gemm_a8w8 requires dtype=torch.float32"
+            )
+        if splitK not in (None, 0):
+            raise ValueError("OPUS no-scale gemm_a8w8 does not support splitK")
+
+        from aiter.ops.opus import opus_gemm
+
+        Y = torch.empty(
+            XQ.shape[0], WQ.shape[0], dtype=dtypes.fp32, device=XQ.device
+        )
+        return opus_gemm(
+            XQ,
+            WQ,
+            Y,
+            kid=_OPUS_A8W8_NOSCALE_KID,
+            layout="plain",
+        )
+
+    assert x_scale is not None and w_scale is not None
     # assert dtype in [
     #     dtypes.bf16,
     #     dtypes.fp16,
@@ -810,14 +852,43 @@ def gemm_a8w8_blockscale(
     dtype: torch.dtype = dtypes.bf16,
     isBpreshuffled: bool = False,
 ) -> torch.Tensor:
+    """Run blockscale A8W8 with the backend matching layout and output dtype.
+
+    FP32 with plain WQ selects the exact OPUS gfx950 kernel.  Existing
+    BF16/FP16 calls retain their CK, CKTile, ASM, or Triton dispatch.
+    """
     assert dtype in [
         dtypes.bf16,
         dtypes.fp16,
+        dtypes.fp32,
     ], f"Output {dtype=} is currently not supported in gemm_a8w8"
     m = XQ.shape[0]
     n = WQ.shape[0]
     k = XQ.shape[1]
     Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
+
+    # The current plain-layout OPUS blockscale instance is gfx950 kid 1 and
+    # produces FP32.  Dtype therefore selects it without changing the existing
+    # BF16/FP16 CK, CKTile, ASM, or Triton dispatch policy.
+    if dtype == dtypes.fp32:
+        if isBpreshuffled:
+            raise ValueError(
+                "FP32 gemm_a8w8_blockscale uses the OPUS plain-W layout; "
+                "use gemm_a8w8_blockscale_bpreshuffle for preshuffled WQ"
+            )
+
+        from aiter.ops.opus import opus_gemm
+
+        return opus_gemm(
+            XQ,
+            WQ,
+            Y,
+            kid=_OPUS_A8W8_BLOCKSCALE_KID,
+            layout="plain",
+            x_scale=x_scale,
+            w_scale=w_scale,
+        )
+
     if isBpreshuffled:
         if get_gfx() in ["gfx950"] and m >= 16 and k >= 512 and dtype == dtypes.bf16:
             return gfx950_a8w8_blockscale_ASM(XQ, WQ, x_scale, w_scale, Y)
@@ -903,6 +974,19 @@ def gemm_a8w8_blockscale_bpreshuffle_fake(
     if out is not None:
         return out
     return torch.empty(XQ.shape[0], WQ.shape[0], dtype=dtype, device=XQ.device)
+
+
+def _filter_blockscale_bpreshuffle_config_for_dtype(config, dtype):
+    """Drop a shape-only tuned row when its backend cannot write this dtype."""
+    # The tuned CSV has no output-dtype key.  OPUS bpreshuffle currently writes
+    # BF16 only, so its BF16 winner must not capture an FP16 production call.
+    if (
+        config is not None
+        and config["libtype"] == "opus"
+        and dtype != dtypes.bf16
+    ):
+        return None
+    return config
 
 
 @torch_compile_guard(gen_fake=gemm_a8w8_blockscale_bpreshuffle_fake)
@@ -1019,8 +1103,14 @@ def gemm_a8w8_blockscale_bpreshuffle(
             config=_fallback_cfg,
             is_x_scale_tranposed=x_scale.stride(0) != 1,
         )
-    config = get_CKGEMM_config(
-        m, n, k, AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE
+    config = _filter_blockscale_bpreshuffle_config_for_dtype(
+        get_CKGEMM_config(
+            m,
+            n,
+            k,
+            AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE,
+        ),
+        dtype,
     )
     # Triton path first: it allocates its own output, so skip the Y buffer the
     # ck/asm paths below need.

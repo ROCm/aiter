@@ -13,6 +13,7 @@ import re
 import subprocess
 import sys
 from collections import Counter
+from dataclasses import FrozenInstanceError, is_dataclass
 from pathlib import Path
 
 import pytest
@@ -153,20 +154,36 @@ def test_public_gemm_and_bmm_entries_keep_one_exact_kid_contract():
 def test_family_modules_keep_only_private_exact_kid_adapters():
     a16 = importlib.import_module("aiter.ops.opus.gemm_op_a16w16")
     a8 = importlib.import_module("aiter.ops.opus.gemm_op_a8w8")
+    plan_module = importlib.import_module("aiter.ops.opus.launch_plan")
 
-    assert callable(a16._launch_a16w16_exact)
+    assert callable(a16._execute_a16w16)
+    assert callable(a16._launch_a16w16_backend)
     assert callable(a16._launch_a16w16_gemm)
     assert callable(a16._launch_a16w16_bmm)
-    assert callable(a16._resolve_exact_a16w16_config)
-    assert callable(a8._launch_a8w8_exact)
+    assert callable(plan_module._get_cached_a16w16_launch_plan)
+    assert not hasattr(a16, "LaunchConfig")
+    assert not hasattr(a16, "_resolve_exact_a16w16_config")
+    assert not hasattr(a16, "_launch_a16w16_exact")
+    assert not hasattr(a16, "_explicit_a16w16_launch")
+    assert not hasattr(a16, "_opus_gemm_a16w16_launch_ctypes_raw")
+    assert callable(a8._launch_a8w8_backend)
     assert callable(a8._launch_a8w8_gemm)
-    assert callable(a8._launch_a8w8_bmm)
     assert callable(a8._launch_a8w8_blockscale_gemm)
-    assert callable(a8._launch_a8w8_blockscale_bmm)
     assert callable(a8._launch_a8w8_blockscale_bpreshuffle_gemm)
-    assert callable(a8._launch_a8w8_blockscale_bpreshuffle_bmm)
-    assert callable(a8._launch_a8w8_mxscale_bmm_exact)
     assert callable(a8._launch_a8w8_mxscale_bmm)
+    assert callable(plan_module._get_cached_a8w8_mxscale_bmm_plan)
+    assert not hasattr(a8, "_launch_a8w8_exact")
+    assert not hasattr(a8, "_launch_a8w8_blockscale_exact")
+    assert not hasattr(a8, "_launch_a8w8_blockscale_bpreshuffle_exact")
+    assert not hasattr(a8, "_launch_a8w8_mxscale_bmm_exact")
+    assert not hasattr(a8, "_launch_a8w8_noscale_gemm")
+    assert not hasattr(a8, "_launch_a8w8_noscale_bmm")
+    assert not hasattr(a8, "_launch_a8w8_bmm")
+    assert not hasattr(a8, "_launch_a8w8_blockscale_bmm")
+    assert not hasattr(a8, "_launch_a8w8_blockscale_bpreshuffle_bmm")
+    assert not hasattr(a8, "_check_same_device")
+    assert not hasattr(a8, "_require_logical_rank")
+    assert not hasattr(a8, "_mxscale_bmm_shape_for_plan")
     assert _parameter_names(a16._launch_a16w16_gemm) == (
         "XQ",
         "WQ",
@@ -189,9 +206,120 @@ def test_family_modules_keep_only_private_exact_kid_adapters():
         "route_arch",
         "instance",
     )
-    assert _parameter_names(a8._launch_a8w8_bmm) == _parameter_names(
-        a8._launch_a8w8_gemm
+
+
+def test_a8w8_adapters_use_one_pybind_backend_boundary():
+    source_path = _ROOT / "aiter/ops/opus/gemm_op_a8w8.py"
+    tree = ast.parse(source_path.read_text())
+    definitions = {
+        node.name: node
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    raw_names = {
+        "_opus_gemm_a8w8_launch_raw",
+        "_opus_gemm_a8w8_blockscale_launch_raw",
+        "_opus_gemm_a8w8_blockscale_bpreshuffle_launch_raw",
+        "_opus_gemm_a8w8_mxscale_bmm_launch_raw",
+    }
+
+    raw_call_owners = {name: set() for name in raw_names}
+    for owner, definition in definitions.items():
+        for call in (
+            node for node in ast.walk(definition) if isinstance(node, ast.Call)
+        ):
+            if isinstance(call.func, ast.Name) and call.func.id in raw_names:
+                raw_call_owners[call.func.id].add(owner)
+
+    assert all(
+        owners == {"_launch_a8w8_backend"}
+        for owners in raw_call_owners.values()
     )
+    for adapter in (
+        "_launch_a8w8_gemm",
+        "_launch_a8w8_blockscale_gemm",
+        "_launch_a8w8_blockscale_bpreshuffle_gemm",
+        "_launch_a8w8_mxscale_bmm",
+    ):
+        calls = {
+            call.func.id
+            for call in ast.walk(definitions[adapter])
+            if isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
+        }
+        assert "_launch_a8w8_backend" in calls
+        assert calls.isdisjoint(raw_names)
+
+    imports = [node for node in tree.body if isinstance(node, (ast.Import, ast.ImportFrom))]
+    assert all(
+        not (
+            isinstance(node, ast.Import)
+            and any(alias.name == "ctypes" for alias in node.names)
+        )
+        for node in imports
+    )
+
+
+def test_a8w8_mxscale_caller_policy_is_isolated_from_hot_execution():
+    policy = importlib.import_module("aiter.ops.opus.policy")
+    caller = importlib.import_module("aiter.ops.batched_gemm_op_a8w8")
+    policy_source = inspect.getsource(policy)
+    caller_source = inspect.getsource(caller)
+
+    assert callable(policy.lookup_mxscale_bmm_config)
+    assert callable(policy.resolve_a8w8_mxscale_bmm_plan)
+    assert not hasattr(policy.resolve_a8w8_mxscale_bmm_plan, "cache_info")
+    assert caller.lookup_mxscale_bmm_config is policy.lookup_mxscale_bmm_config
+    assert "def _load_mxscale_bmm_tuned(" in policy_source
+    assert "def _heuristic_mxscale_bmm_kid(" in policy_source
+    assert "def resolve_a8w8_mxscale_bmm_plan(" in policy_source
+    assert "def _load_mxscale_bmm_tuned(" not in caller_source
+    assert "def _heuristic_mxscale_bmm_kid(" not in caller_source
+    assert "def _resolve_mxscale_bmm_launch(" not in caller_source
+    assert "_MXSCALE_BMM_LAUNCH_PLANS" in caller_source
+    assert "_resolve_a8w8_mxscale_bmm_plan" in caller_source
+
+
+def test_a16w16_launch_plan_is_immutable_metadata():
+    plan_module = importlib.import_module("aiter.ops.opus.launch_plan")
+    spec = plan_module.WorkspaceSpec(shape=(2, 1, 64, 64), dtype=torch.float32)
+    plan = plan_module.A16W16LaunchPlan(
+        registry_arch="gfx950",
+        resolved_kid=200,
+        workspace_capacity_split_k=2,
+        abi_split_k=2,
+        workspace_spec=spec,
+    )
+
+    assert is_dataclass(spec) and spec.__dataclass_params__.frozen
+    assert is_dataclass(plan) and plan.__dataclass_params__.frozen
+    assert plan_module.__all__ == [
+        "A16W16LaunchPlan",
+        "A8W8MxscaleBMMPlan",
+        "WorkspaceSpec",
+    ]
+    with pytest.raises(FrozenInstanceError):
+        plan.abi_split_k = 3
+
+
+def test_a8w8_launch_plan_is_immutable_metadata():
+    plan_module = importlib.import_module("aiter.ops.opus.launch_plan")
+    spec = plan_module.WorkspaceSpec(shape=(32768,), dtype=torch.float32)
+    plan = plan_module.A8W8MxscaleBMMPlan(
+        registry_arch="gfx950",
+        resolved_kid=8000,
+        abi_split_k=2,
+        workspace_spec=spec,
+    )
+
+    assert is_dataclass(spec) and spec.__dataclass_params__.frozen
+    assert is_dataclass(plan) and plan.__dataclass_params__.frozen
+    assert plan_module.__all__ == [
+        "A16W16LaunchPlan",
+        "A8W8MxscaleBMMPlan",
+        "WorkspaceSpec",
+    ]
+    with pytest.raises(FrozenInstanceError):
+        plan.abi_split_k = 3
 
 
 def test_cpp_pybind_family_abis_remain_exact_kid_and_policy_free():
@@ -282,7 +410,7 @@ def test_public_module_uses_lazy_family_imports():
         node
         for node in tree.body
         if isinstance(node, ast.FunctionDef)
-        and node.name == "_cached_public_contract"
+        and node.name == "_resolve_contract"
     )
     contract_imports = {
         alias.name
@@ -290,7 +418,11 @@ def test_public_module_uses_lazy_family_imports():
         if isinstance(node, ast.ImportFrom) and node.module is None
         for alias in node.names
     }
-    assert contract_imports == {"gemm_op_a16w16", "gemm_op_a8w8"}
+    assert contract_imports == {
+        "gemm_op_a16w16",
+        "gemm_op_a8w8",
+        "launch_plan",
+    }
 
     public_function = next(
         node
@@ -310,22 +442,32 @@ def test_public_module_uses_lazy_family_imports():
     assert "_launch_a8w8_mxscale_bmm" in public_source
     assert "_FP8_DTYPES" not in public_source
     assert "_A8W8_FAMILY_LAYOUT" not in public_source
-    assert "def _validate_a16w16_public_contract(" in (
+    assert "def _validate_a16w16_public_contract(" in public_source
+    assert "def _validate_a16w16_public_contract(" not in (
         _ROOT / "aiter/ops/opus/gemm_op_a16w16.py"
     ).read_text()
-    assert "def _validate_a8w8_public_contract(" in (
+    assert "def _validate_a8w8_public_contract(" not in (
         _ROOT / "aiter/ops/opus/gemm_op_a8w8.py"
     ).read_text()
+    assert "def _validate_a8w8_public_contract(" in (
+        _ROOT / "aiter/ops/opus/launch_plan.py"
+    ).read_text()
+
+    opus_dir = _ROOT / "aiter/ops/opus"
+    assert not (opus_dir / "a16w16_plan.py").exists()
+    assert not (opus_dir / "a8w8_plan.py").exists()
 
 
 def test_production_callers_use_operation_specific_entry_not_family_wrappers():
     callers = {
         "aiter/tuned_gemm.py": "opus_gemm",
         "aiter/ops/gemm_op_a8w8.py": "opus_gemm",
+        "aiter/ops/batched_gemm_op_bf16.py": "opus_bmm",
         "aiter/ops/batched_gemm_op_a8w8.py": "opus_bmm",
         "csrc/opus_gemm/opus_gemm_tune.py": "opus_bmm",
         "csrc/opus_gemm/opus_bmm_mxscale_tune.py": "opus_bmm",
         "csrc/gemm_a16w16/gemm_a16w16_tune.py": "opus_gemm",
+        "csrc/ck_batched_gemm_bf16/batched_gemm_bf16_tune.py": "opus_bmm",
         "csrc/ck_gemm_a8w8_blockscale/gemm_a8w8_blockscale_tune.py": "opus_gemm",
     }
     removed_names = {
@@ -406,15 +548,15 @@ def test_device_info_cache_is_scoped_by_explicit_device(monkeypatch):
 
 
 def test_failed_a8_registry_lookup_is_not_cached(monkeypatch):
-    a8 = importlib.import_module("aiter.ops.opus.gemm_op_a8w8")
-    a8._require_registered_kid_cached.cache_clear()
+    plan_module = importlib.import_module("aiter.ops.opus.launch_plan")
+    plan_module._require_registered_kid_cached.cache_clear()
     calls = []
 
     def lookup(arch, family, kid, output_dtype):
         calls.append((arch, family, kid, output_dtype))
         return None if len(calls) == 1 else object()
 
-    monkeypatch.setattr(a8, "get_kernel_instance", lookup)
+    monkeypatch.setattr(plan_module, "get_kernel_instance", lookup)
     kwargs = dict(
         arch="gfx950",
         family="a8w8",
@@ -422,11 +564,10 @@ def test_failed_a8_registry_lookup_is_not_cached(monkeypatch):
         output_dtype=torch.float32,
     )
     with pytest.raises(ValueError, match="no registered OPUS kernel"):
-        a8._require_registered_kid(**kwargs)
-    assert a8._require_registered_kid(**kwargs) == 2
-    assert a8._require_registered_kid(**kwargs) == 2
+        plan_module._require_registered_kid(**kwargs)
+    assert plan_module._require_registered_kid(**kwargs) == 2
     assert len(calls) == 2
-    a8._require_registered_kid_cached.cache_clear()
+    plan_module._require_registered_kid_cached.cache_clear()
 
 
 def test_registry_counts_routes_and_a8_contracts_are_stable():

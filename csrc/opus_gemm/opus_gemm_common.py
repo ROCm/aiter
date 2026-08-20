@@ -225,7 +225,6 @@ class OpusGemmInstance:
         ):
             parts.append(f"cA{self.cachectl_a}cB{self.cachectl_b}")
         return "_".join(parts)
-
     @property
     def m_align(self) -> int:
         """M multiple enforced by the generated launcher (1 means tail-safe)."""
@@ -233,6 +232,34 @@ class OpusGemmInstance:
         if mult is not None:
             return self.B_M * mult if mult else 1
         return 1 if self.has_oob else self.B_M
+
+
+def a16w16_flatmm_prefetch_k_iter(instance: OpusGemmInstance) -> int:
+    """Mirror gfx950 ``Traits::prefetch_k_iter`` for host-side planning.
+
+    The exact launcher and both GEMM/BMM tuning paths must agree on the
+    minimum number of K tiles a flatmm instance can consume. Keep this
+    scalar-only calculation next to the canonical instance metadata so the
+    runtime launch plan and tuner do not drift.
+    """
+    sizeof_da = 2  # BF16
+    load_group_m = 64 if instance.W_M >= 32 else 32
+    load_group_n = 64 if instance.W_N >= 32 else 32
+    load_group_k = instance.W_K * 2
+    num_m = instance.B_M // load_group_m
+    num_n = instance.B_N // load_group_n
+    num_k = instance.B_K // load_group_k
+    smem_linear = 64 * 16 // sizeof_da  # WARP_SIZE=64
+    smem_sub = smem_linear // load_group_k
+    slots = load_group_m // smem_sub
+    padding = 16 // sizeof_da if instance.W_M >= 32 else 2 * 16 // sizeof_da
+    per_group_load = slots * (smem_linear + padding) * sizeof_da
+    per_iter = (num_m + num_n) * num_k * per_group_load
+    lds_total = 163840
+    return max(
+        1,
+        (lds_total // max(instance.WG_PER_CU, 1)) // max(per_iter, 1),
+    )
 
 
 _BMM_M_ALIGN_TILES = {
@@ -805,6 +832,20 @@ a16w16_mono_tile_kernels_list_4g_safe = {
 
 # -- gfx942 kernel lists ------------------------------------------------ Kid offset: gfx942
 GFX942_KID_OFFSET = 10000
+
+# Split-K launch policy is consumed by both the Python Torch-workspace planner
+# and the generated host launcher.  Keep it beside the canonical instances so
+# the two sides cannot silently drift and disagree about workspace capacity.
+GFX942_MAX_AUTO_SPLIT_K = 16
+GFX942_MIN_ITERS_PER_SPLIT = 2
+GFX942_QUAD_MFMA32_SPLITK_TAG = "a16w16_quad_mfma32_kbuf1_sk"
+GFX942_EVEN_LOOP_SPLITK_TAGS = frozenset(
+    {
+        "a16w16_kbuf2v_sk",
+        "a16w16_kbuf2v_bk128_sk",
+        GFX942_QUAD_MFMA32_SPLITK_TAG,
+    }
+)
 
 # gfx942 bf16-workspace launchers can use the exact-N row-block reducer only
 # for these output widths.  Keep the *set* here beside the instance source so
@@ -1693,7 +1734,7 @@ OPUS_MANDATORY_A8_KIDS = {
 }
 
 
-def _canonical_output_dtype(output_dtype) -> str | None:
+def canonical_output_dtype(output_dtype) -> str | None:
     """Normalize supported output dtype names for registry lookup."""
     if output_dtype is None:
         return None
@@ -1737,19 +1778,25 @@ def get_kernel_instance(
     if instance_arch != arch:
         return None
 
-    dtype = _canonical_output_dtype(output_dtype)
-    if dtype is not None and dtype not in instance.output_dtypes:
-        # Workspace reducers cast Y; direct kernels use their registered dtype.
-        workspace_a16_output = (
-            family == "a16w16"
-            and kid in SPLITK_KIDS
-            and dtype in {"bf16_t", "fp32_t"}
-        )
-        runtime_typed_bmm_output = (
-            family == "a8w8_mxscale_bmm"
-            and dtype in {"bf16_t", "fp32_t"}
-        )
-        if not (workspace_a16_output or runtime_typed_bmm_output):
+    dtype = canonical_output_dtype(output_dtype)
+    if dtype is not None:
+        # Workspace reducers own the final cast, so their host dispatch
+        # specialization in ``output_dtypes`` is not the Y dtype contract.
+        if family == "a16w16" and kid in SPLITK_KIDS:
+            # The current gfx942 BF16-workspace reducer is exact-N and writes
+            # BF16 only.  Other A16 workspace reducers support BF16/FP32 Y.
+            allowed = (
+                {"bf16_t"}
+                if arch == "gfx942"
+                and instance.splitk_workspace_dtype == "bf16_t"
+                else {"bf16_t", "fp32_t"}
+            )
+            output_compatible = dtype in allowed
+        elif family == "a8w8_mxscale_bmm":
+            output_compatible = dtype in {"bf16_t", "fp32_t"}
+        else:
+            output_compatible = dtype in instance.output_dtypes
+        if not output_compatible:
             return None
     return instance
 
