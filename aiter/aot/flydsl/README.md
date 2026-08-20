@@ -69,10 +69,12 @@ python -m aiter.aot.flydsl.chunk_gdn_h --target-arch gfx942
 | --- | --- | --- |
 | `AITER_AOT_IMPORT` | Set to `1` so `import aiter` only loads the lightweight JIT core and skips the full top-level op namespace — faster and avoids heavy import side effects during AOT compilation (this is what `setup.py` sets while pre-compiling). | `0` |
 | `FLYDSL_RUNTIME_CACHE_DIR` | Cache directory | `~/.flydsl/cache` |
-| `FLYDSL_AOT_WORKERS` | Max concurrent worker processes. Set explicitly to honor it verbatim (bypasses the memory cap below); `0`/negative clamps to 1. Each worker uses ~1.5–2.5 GB RSS. | `min(affinity-aware CPUs, 64)`, then capped by available memory |
-| `FLYDSL_AOT_MEM_PER_WORKER_GB` | Assumed GiB/worker for the **auto memory cap** that keeps the OOM-killer from firing. Only applies when `FLYDSL_AOT_WORKERS` is **not** set; non-positive disables the cap. Automatic detection requires FlyDSL's runtime `psutil` dependency and fails explicitly if memory cannot be queried. | `2.0` |
+| `FLYDSL_AOT_WORKERS` | Max concurrent worker processes. A positive value is honored verbatim and bypasses the memory cap below; unset, empty, zero, or negative selects the automatic CPU/memory limit. Each worker uses ~1.5–2.5 GB RSS. | `min(affinity-aware CPUs, 64)`, then capped by available memory |
+| `FLYDSL_AOT_MEM_PER_WORKER_GB` | Assumed GiB/worker for the **auto memory cap** that keeps the OOM-killer from firing. Applies whenever `FLYDSL_AOT_WORKERS` is not a positive explicit limit; non-positive disables the cap. Automatic detection requires FlyDSL's runtime `psutil` dependency and fails explicitly if memory cannot be queried. | `2.0` |
 | `FLYDSL_AOT_TIMEOUT` | Per-kernel wall-clock cap (seconds). A worker stuck *alive* past this is killed (and retried); non-positive disables. | `1200` |
-| `FLYDSL_AOT_MAX_RETRIES` | Retries for a worker that **died abnormally** (OOM-kill / segfault / timeout-kill). A possible OOM kill first halves the worker limit and is not retried once that limit reaches one. A clean compile error is never retried; negative values clamp to `0`. | `2` |
+| `FLYDSL_AOT_MAX_RETRIES` | Retries for a worker that **died abnormally** (OOM-kill / segfault / timeout-kill). Retries wait behind jobs that have not started. A possible OOM kill first halves the worker limit and is not retried once that limit reaches one. A clean compile error is never retried; negative values clamp to `0`. | `2` |
+| `FLYDSL_DEBUG_LOG_TO_CONSOLE` | Emit FlyDSL scheduler messages to stderr. | `0` |
+| `FLYDSL_DEBUG_LOG_LEVEL` | Scheduler log verbosity; use `INFO` for progress and final summaries. | `WARNING` |
 | `AITER_CONFIGS` | Resolves the default CSV lookup path (same as the runtime JIT) | repo built-in |
 | `ARCH` / `GPU_ARCHS` | **Banner/logging only** — printed as the "Target arch" line. Does **not** control the compiled target. | auto-detect |
 
