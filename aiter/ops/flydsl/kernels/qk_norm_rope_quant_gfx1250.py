@@ -54,17 +54,15 @@ from functools import lru_cache
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm, rocdl
-from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import arith, const_expr, range_constexpr
 from flydsl.expr import math as fmath
 from flydsl.expr.arith import ArithValue
 from flydsl.expr.rocdl import tdm_ops
 from flydsl.expr.typing import Int32, ReductionOp, Stream, T
-from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 
 from aiter.ops.flydsl.kernels import buffer_ops, vector
+from aiter.ops.flydsl.kernels.gemm_common_gfx1250 import make_lds_copy_ops
 
 # JIT-free MX-format mode/dtype int mirrors. ``aiter.utility.mx_types``'s
 # pybind11 ``MxScaleRoundMode`` / ``MxDtype`` lazy-load on first attribute
@@ -1308,11 +1306,7 @@ def _build_tdm(
     ODD = list(range(1, VEC, 2))
     ILV = [(i // 2) if i % 2 == 0 else (PAIRS + i // 2) for i in range(VEC)]
     tile_bytes = RT * D * eb
-
-    lds = SmemAllocator(
-        None, arch="gfx1250", global_sym_name=f"qknorm_tdm_H{H}_D{D}_K{K}"
-    )
-    lds.ptr = K * tile_bytes
+    ARENA = K * tile_bytes  # K rotating tile buffers
 
     name = f"qk_norm_rope_tdm_H{H}_D{D}_RD{RD}_k{K}_ct{CT}"
     if hoist_cs:
@@ -1336,11 +1330,19 @@ def _build_tdm(
         wave = fx.thread_idx.y
         g = fx.block_idx.x
 
-        base = lds.get_base()
-        bufs = [
-            SmemPtr(base, k * tile_bytes, T.bf16, shape=(RT * D,)).get()
-            for k in range(K)
-        ]
+        # K rotating tile buffers in one arena; `bufs` are per-buffer byte
+        # offsets from the arena base (the TDM dst view and the LDS read below
+        # both address off lds_idx + offset).
+        lds_ptr = fx.SharedAllocator(static=False).allocate(ARENA)._ptr
+        lds_idx = fx.index_cast(T.index, fx.ptrtoint(lds_ptr))
+        lds_i32 = fx.index_cast(T.i32, lds_idx)  # i32 form for pointer math
+        bufs = [k * tile_bytes for k in range(K)]
+        lds_load_b128, _ = make_lds_copy_ops(128)
+        lds_bf16_ptr_ty = fx.PointerType.get(
+            elem_ty=fx.BFloat16.ir_type,
+            address_space=fx.AddressSpace.Shared,
+            alignment=16,
+        )
 
         cos_rsrc = buffer_ops.create_buffer_resource(cos_cache, max_size=True)
         sin_rsrc = buffer_ops.create_buffer_resource(sin_cache, max_size=True)
@@ -1375,31 +1377,31 @@ def _build_tdm(
 
         pos_rsrc = _ptr_res(positions)
         q_out_rsrc = _ptr_res(q_out)
-        _BIG = 1 << 24
         _nr_m1 = _to_raw(num_rows - 1)
         tile_base = g * CT  # first tile index this WG owns
-        lds_off = fx.Index(_to_raw(wave)) * arith.index(D * eb)
-        row_elem = wave * D + tid * VEC  # LDS read pos (this wave)
+        wave_lds_off = wave * (D * eb)  # this wave's slot within a tile buffer
+        row_elem = tid * VEC  # LDS read pos within this wave's slot
+
+        # One (1, D) row tile per wave. The atom carries the row extent so the
+        # hardware zero-fills OOB rows; the row itself is picked per issue by
+        # advancing the global operand.
+        q_row0 = fx.Tensor(
+            fx.make_view(fx.get_iter(q_in), fx.make_layout((1, D), (D, 1)))
+        )
+        tdm_atom = fx.rocdl.make_tdm_atom(
+            q_row0, [num_rows, None], strides=[D, None], num_warps=1
+        )
 
         def issue(buf, tile_idx):
             # this wave's row of tile_idx -> buf slot wave*D (clamped to valid row)
             my_row = arith.minsi(_to_raw(tile_idx * RT + wave), _nr_m1)
-            desc = tdm_ops.make_tensor_descriptor_2d(
-                q_in,
-                buf,
-                global_offset=(
-                    fx.Index(_to_raw(my_row)) * arith.index(1),
-                    arith.index(0),
-                ),
-                tensor_shape=(_BIG, D),
-                strides=(D, 1),
-                tile_shape=(1, D),
-                elem_bytes=eb,
-                num_warps=1,
-                lds_byte_offset=lds_off,
-                oob_outer_bound=_to_raw(num_rows),
+            dst = fx.Tensor(
+                fx.make_view(
+                    fx.inttoptr(lds_bf16_ptr_ty, lds_i32 + (wave_lds_off + buf)),
+                    fx.make_layout((1, D), (D, 1)),
+                )
             )
-            tdm_ops.tensor_load_2d(desc)
+            fx.copy(tdm_atom, q_row0, dst, imm_offset=fx.Int64(my_row) * (D * eb))
 
         def load_cs(tile_idx):
             # pos/cos/sin for the token of (tile_idx, this wave). Callers hoist
@@ -1442,14 +1444,11 @@ def _build_tdm(
 
         def compute_store(buf, tile_idx, cosv, sinv):
             my_row = arith.minsi(_to_raw(tile_idx * RT + wave), _nr_m1)
+            # 128-bit LDS reads: 4 i32 lanes == 8 bf16.
             chunks = [
                 fx.Vector(
-                    vector.load_op(
-                        T.vec(8, T.bf16),
-                        buf,
-                        [_to_raw(fx.Index(_to_raw(row_elem + (c * 8))))],
-                    )
-                )
+                    lds_load_b128(lds_idx, buf + wave_lds_off + (row_elem + c * 8) * eb)
+                ).bitcast(fx.BFloat16)
                 for c in range(VEC // 8)
             ]
             xv = chunks[0]
@@ -1509,10 +1508,6 @@ def _build_tdm(
         num_rows: fx.Int32,
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
-        ctx = CompilationContext.get_current()
-        with ir.InsertionPoint(ctx.gpu_module_body):
-            lds.finalized = False
-            lds.finalize()
         per_wg = RT * CT
         gx = arith.divsi(_to_raw(num_rows + (per_wg - 1)), _to_raw(fx.Int32(per_wg)))
         k = kernel(q_in, cos_cache, sin_cache, positions, q_out, q_weight, num_rows)
