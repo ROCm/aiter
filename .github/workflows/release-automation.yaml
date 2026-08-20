@@ -324,15 +324,15 @@ jobs:
             done
           done
 
-      - name: Create release notes
+      - name: Generate changelog
         run: |
           set -euo pipefail
 
-          generated_body="$(gh api --method POST "repos/${GITHUB_REPOSITORY}/releases/generate-notes" \
+          gh api --method POST "repos/${GITHUB_REPOSITORY}/releases/generate-notes" \
             -f tag_name="${RELEASE_TAG}" \
             -f previous_tag_name="${PREVIOUS_TAG}" \
             -f target_commitish="${RELEASE_BRANCH}" \
-            --jq .body)"
+            --jq .body > generated-notes.md
 
           if [ "${RELEASE_KIND}" = "post" ]; then
             heading="AITER ${RELEASE_TAG} - post release"
@@ -354,7 +354,9 @@ jobs:
             echo "Prebuilt manylinux_2_28 wheels, \`GPU_ARCHS=gfx942;gfx950\`:"
             echo "- ROCm 7.0 / 7.1 / 7.2 x cp310 / cp312 (${EXPECTED_WHEEL_COUNT} wheels)"
             echo
-            echo "${generated_body}"
+            echo "Wheel assets are uploaded after the release page is created."
+            echo
+            cat generated-notes.md
           } > release-notes.md
 
       - name: Create or update GitHub Release
@@ -376,6 +378,111 @@ jobs:
             echo "Uploading ${wheel}"
             gh release upload "${RELEASE_TAG}" "${wheel}" --clobber
           done < <(find release-wheels -type f -name '*.whl' | sort)
+
+      - name: Update release notes with asset links
+        run: |
+          set -euo pipefail
+
+          gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}" > release.json
+
+          python3 <<'PY'
+          import json
+          import os
+          import re
+          from pathlib import Path
+
+          release_tag = os.environ["RELEASE_TAG"]
+          release_version = os.environ["RELEASE_VERSION"]
+          release_kind = os.environ["RELEASE_KIND"]
+          release_branch = os.environ["RELEASE_BRANCH"]
+          previous_tag = os.environ["PREVIOUS_TAG"]
+          expected_wheel_count = int(os.environ["EXPECTED_WHEEL_COUNT"])
+
+          release = json.loads(Path("release.json").read_text())
+          wheels = [
+              asset
+              for asset in release.get("assets", [])
+              if asset.get("name", "").endswith(".whl")
+          ]
+          if len(wheels) != expected_wheel_count:
+              raise SystemExit(
+                  f"Expected {expected_wheel_count} wheel assets on the release, found {len(wheels)}."
+              )
+
+          rows = []
+          seen = set()
+          pattern = re.compile(
+              rf"{re.escape(release_version)}\\+rocm(?P<rocm>7\\.[0-2])\\.manylinux\\.2\\.28-"
+              r"(?P<py>cp3(?:10|12))-(?P=py)-"
+          )
+          for asset in wheels:
+              name = asset["name"]
+              match = pattern.search(name)
+              if not match:
+                  raise SystemExit(f"Unexpected wheel asset name: {name}")
+              combo = (match.group("rocm"), match.group("py"))
+              if combo in seen:
+                  raise SystemExit(f"Duplicate wheel asset for ROCm {combo[0]} / {combo[1]}")
+              seen.add(combo)
+              rows.append((combo[0], combo[1], name, asset["browser_download_url"]))
+
+          expected = {
+              (rocm, py)
+              for rocm in ("7.0", "7.1", "7.2")
+              for py in ("cp310", "cp312")
+          }
+          missing = expected - seen
+          if missing:
+              raise SystemExit(f"Missing wheel assets: {sorted(missing)}")
+
+          rows.sort(key=lambda row: (row[0], row[1]))
+
+          generated = Path("generated-notes.md").read_text().strip()
+          generated = generated.replace("## What's Changed", "## Changes", 1)
+
+          if release_kind == "post":
+              heading = f"AITER {release_tag} - post release"
+              scope = f"Post release on top of the `{release_branch}` release line."
+          else:
+              heading = f"AITER {release_tag} - bi-weekly release"
+              scope = f"Scheduled release from `{release_branch}`."
+
+          lines = [
+              heading,
+              "",
+              scope,
+              "",
+              f"Diff base: `{previous_tag}`",
+              "",
+              "## Wheels",
+              "",
+              "Prebuilt manylinux_2_28 wheels, `GPU_ARCHS=gfx942;gfx950`:",
+              "",
+              "| ROCm | Python | Wheel |",
+              "|---|---|---|",
+          ]
+          for rocm, py, name, url in rows:
+              lines.append(f"| ROCm {rocm} | {py} | [{name}]({url}) |")
+
+          lines.extend(
+              [
+                  "",
+                  "<details>",
+                  "<summary>What's Changed</summary>",
+                  "",
+                  generated,
+                  "",
+                  "</details>",
+                  "",
+              ]
+          )
+
+          Path("release-notes.md").write_text("\n".join(lines))
+          PY
+
+          gh release edit "${RELEASE_TAG}" \
+            --title "AITER ${RELEASE_TAG}" \
+            --notes-file release-notes.md
 
           {
             echo "## Published Release"
