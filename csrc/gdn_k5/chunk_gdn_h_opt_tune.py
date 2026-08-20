@@ -18,11 +18,14 @@ import pandas as pd
 import torch
 
 from aiter import logger
-from aiter.jit.core import AITER_ROOT_DIR
-from aiter.ops.flydsl.linear_attention_prefill_kernels import (
-    _GFX_ARCH,
-    _hipeq_select_bv,
+from aiter.jit.core import (
+    AITER_CONFIG_GDN_K5_OPT,
+    AITER_CONFIG_GDN_K5_OPT_UNTUNED,
+    AITER_CONFIGS,
+    AITER_ROOT_DIR,
 )
+from aiter.jit.utils.chip_info import get_gfx_runtime
+from aiter.ops.flydsl.linear_attention_prefill_kernels import _hipeq_select_bv
 from aiter.ops.flydsl.linear_attention_prefill_kernels import (
     chunk_gated_delta_rule_fwd_h_flydsl_opt as k5,
 )
@@ -52,11 +55,25 @@ LOOKUP_KEYS = (
 TUNED_EXTRA_COLS = ("dtype", "K", "V", "BT", "T_flat", "N", "BV", "us")
 TUNED_COLUMNS = LOOKUP_KEYS + TUNED_EXTRA_COLS
 
-_MODEL_CONFIG_DIR = f"{AITER_ROOT_DIR}/aiter/configs/model_configs"
-_DEFAULT_UNTUNED = f"{_MODEL_CONFIG_DIR}/qwen3_5_35b_chunk_gdn_h_opt_untuned.csv"
-_DEFAULT_TUNED = f"{_MODEL_CONFIG_DIR}/qwen3_5_35b_chunk_gdn_h_opt_tuned.csv"
 _RUN_CONFIG_TOL_PCT = 5.0
 _RESULT_COLS = [c for c in TUNED_COLUMNS if c not in LOOKUP_KEYS]
+
+
+def _resolve_untuned_config(path: str) -> str:
+    """Default untuned path uses merged CSV from ``AITER_CONFIGS`` (Fmoe-style)."""
+    if (
+        os.getenv("AITER_CONFIG_GDN_K5_OPT_UNTUNED")
+        or path != f"{AITER_CONFIG_GDN_K5_OPT_UNTUNED}"
+    ):
+        return path
+    return AITER_CONFIGS.AITER_CONFIG_GDN_K5_OPT_UNTUNED_FILE
+
+
+def _resolve_tuned_config_for_read(path: str) -> str:
+    """Default tuned path reads the merged runtime table; writes stay on ``-o``."""
+    if os.getenv("AITER_CONFIG_GDN_K5_OPT") or path != f"{AITER_CONFIG_GDN_K5_OPT}":
+        return path
+    return AITER_CONFIGS.AITER_CONFIG_GDN_K5_OPT_FILE
 
 
 def load_k5_cases():
@@ -181,9 +198,11 @@ def bench_us(args, bv: int, warmup: int, iters: int) -> float:
         os.environ.pop("FLYDSL_K5_OPT_BV", None)
 
 
-def lookup_key_from_case(case, snapshot_dtype, total_chunks, max_seq_chunks) -> tuple:
+def lookup_key_from_case(
+    case, snapshot_dtype, total_chunks, max_seq_chunks, *, gfx: str
+) -> tuple:
     return (
-        _GFX_ARCH,
+        gfx,
         case.H,
         case.Hg,
         case.V,
@@ -206,9 +225,11 @@ def case_to_tuned_row(
     max_seq_chunks,
     bv,
     us,
+    *,
+    gfx: str,
 ) -> dict[str, Any]:
     return {
-        "gfx": _GFX_ARCH,
+        "gfx": gfx,
         "dtype": str(case.dtype),
         "K": int(case.K),
         "V": int(case.V),
@@ -234,6 +255,8 @@ def sweep_case_row(
     case,
     warmup: int,
     iters: int,
+    *,
+    gfx: str,
 ) -> dict[str, Any] | None:
     if case.K != 128 or case.V != 128 or case.BT != 64:
         print(f"{case_id:58s} skipped (kernel supports K=V=128, BT=64 only)")
@@ -270,6 +293,7 @@ def sweep_case_row(
         max_seq_chunks,
         best,
         times[best],
+        gfx=gfx,
     )
 
 
@@ -298,7 +322,7 @@ def find_case_for_row(cases, row: dict[str, Any]):
     return None
 
 
-def dataframe_from_cases(selected: list[tuple[str, Any]]) -> pd.DataFrame:
+def dataframe_from_cases(selected: list[tuple[str, Any]], *, gfx: str) -> pd.DataFrame:
     rows = []
     for case_id, case in selected:
         snapshot_dtype = case_snapshot_dtype(case)
@@ -313,6 +337,7 @@ def dataframe_from_cases(selected: list[tuple[str, Any]]) -> pd.DataFrame:
             max_seq_chunks,
             bv=0,
             us=0.0,
+            gfx=gfx,
         )
         row["_case_id"] = case_id
         row["BV"] = pd.NA
@@ -324,8 +349,8 @@ def dataframe_from_cases(selected: list[tuple[str, Any]]) -> pd.DataFrame:
 class K5BvTuner(TunerCommon):
     ARG_DEFAULTS: ClassVar[dict[str, Any]] = {
         **TunerCommon.ARG_DEFAULTS,
-        "untune_file": _DEFAULT_UNTUNED,
-        "tune_file": _DEFAULT_TUNED,
+        "untune_file": f"{AITER_CONFIG_GDN_K5_OPT_UNTUNED}",
+        "tune_file": f"{AITER_CONFIG_GDN_K5_OPT}",
         "config_env_name": "AITER_CONFIG_GDN_K5_OPT",
         "warmup": 5,
         "iters": 20,
@@ -365,21 +390,23 @@ class K5BvTuner(TunerCommon):
         )
 
     def pre_process(self, args):
+        self._gfx = get_gfx_runtime()
         if args.all:
             self.get_retune_gemm_list(args)
             return
 
-        untuned_rows = read_csv_rows(args.untune_file)
+        untuned_rows = read_csv_rows(_resolve_untuned_config(args.untune_file))
         self._cases = select_cases(load_k5_cases(), untuned_rows, args.case)
         self._case_by_id = {case_id: case for case_id, case in self._cases}
+        tuned_read = _resolve_tuned_config_for_read(args.tune_file)
 
         if not self._cases:
             self.untunedf = pd.DataFrame(columns=list(TUNED_COLUMNS) + ["_case_id"])
-            self.tunedf = self.get_tuned_gemm_list(self.get_out_file(args.tune_file))
+            self.tunedf = self.get_tuned_gemm_list(tuned_read)
             return
 
-        self.untunedf = dataframe_from_cases(self._cases)
-        self.tunedf = self.get_tuned_gemm_list(self.get_out_file(args.tune_file))
+        self.untunedf = dataframe_from_cases(self._cases, gfx=self._gfx)
+        self.tunedf = self.get_tuned_gemm_list(tuned_read)
 
         if self.tunedf is not None and not self.tunedf.empty:
             dedup_cols = [c for c in self.keys if c in self.tunedf.columns]
@@ -411,7 +438,9 @@ class K5BvTuner(TunerCommon):
         for _, row in untunedf.iterrows():
             case_id = row["_case_id"]
             case = self._case_by_id[case_id]
-            tuned_row = sweep_case_row(case_id, case, args.warmup, args.iters)
+            tuned_row = sweep_case_row(
+                case_id, case, args.warmup, args.iters, gfx=self._gfx
+            )
             if tuned_row is None:
                 continue
             snapshot_dtype = case_snapshot_dtype(case)
@@ -420,7 +449,7 @@ class K5BvTuner(TunerCommon):
                 case.resolve_context_lens(), batch
             )
             key = lookup_key_from_case(
-                case, snapshot_dtype, total_chunks, max_seq_chunks
+                case, snapshot_dtype, total_chunks, max_seq_chunks, gfx=self._gfx
             )
             emitted[key] = tuned_row
             torch.cuda.empty_cache()
