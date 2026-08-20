@@ -1169,32 +1169,20 @@ class TestCorrectness:
         return k, w, u
 
     @pytest.mark.parametrize("args", PREFILL_PARAMS, ids=PREFILL_TEST_IDS)
-    def test_correctness_flydsl(self, args: PrefillArgs, request):
+    def test_correctness_flydsl(self, args: PrefillArgs):
         """Baseline FlyDSL K5 wrapper -- the target of ``use_chunk_flydsl``.
 
         On gfx942 this selects the tuned gfx942 build via ``_auto_variant``;
         elsewhere it selects the arch-generic build.
+
+        The ``novarlen_B2`` shapes are the regression guard for the dense
+        multi-batch ``g`` addressing: ``g`` is head-major [B, H, T_flat], so
+        its batch stride is H*T_flat and cannot be folded into ``bos``.
         """
         context_lens = args.resolve_context_lens()
         k, w_orig, u_orig, w_c, u_c, g, h0, cu, _ = _make_inputs(
             context_lens, args=args
         )
-
-        # KNOWN BUG (pre-existing, not merge-induced): in dense (non-varlen)
-        # mode the baseline wrapper computes batch 0 correctly but produces
-        # wrong ``h`` for every i_n>0 batch -- the batch-stride branch. On
-        # Qwen3.5-397B B=2/T=1024 the per-batch max abs error is 7.4e-4 for
-        # batch 0 vs 6.7e-2 for batch 1. ``mfma16_hip`` handles the same shape
-        # correctly, so this is specific to the baseline/gfx942 build. Marked
-        # strict so this flips to a hard failure the moment it is fixed.
-        if cu is None and k.shape[0] > 1:
-            request.node.add_marker(
-                pytest.mark.xfail(
-                    strict=True,
-                    reason="baseline FlyDSL K5: wrong h for i_n>0 in dense "
-                    "(non-varlen) multi-batch mode",
-                )
-            )
 
         # This wrapper's ``g`` contract is fixed to contiguous head-major
         # [B, H, T]; ``_make_inputs`` emits token-major [B, T, H] by default.

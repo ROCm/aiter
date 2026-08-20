@@ -514,12 +514,10 @@ def compile_chunk_gated_delta_h_gfx942(
             return fx.Tensor(fx.make_view(fx.get_iter(buf), fx.make_layout((n,), (1,))))
 
         if const_expr(USE_G):
-            g_buf = fx.Tensor(
-                fx.make_view(
-                    fx.get_iter(fx.rocdl.make_buffer_tensor(g_tensor, max_size=False)),
-                    fx.make_layout((fx.Int32(H) * T_flat,), (1,)),
-                )
-            )
+            # ``g`` is head-major [B, H, T_flat]. The view must span the whole
+            # tensor (B*H*T_flat): a bound of H*T_flat would read a hardware
+            # zero for every i_n>0 batch in dense mode.
+            g_buf = _flat_buffer(g_tensor)
         if const_expr(USE_GK):
             # [n/4, 4]: one row is gk's 4-wide contiguous quad. The element
             # offset is always 4-aligned -- K % 4 == 0 (asserted above) and
@@ -707,6 +705,16 @@ def compile_chunk_gated_delta_h_gfx942(
             w_base = (bos * fx.Int32(H) + i_h) * fx.Int32(K)
             stride_v = fx.Int32(H * V)
             stride_w = fx.Int32(H * K)
+
+        if const_expr(USE_G):
+            # ``g`` is head-major [B, H, T_flat], so its batch stride is
+            # H*T_flat -- unlike the token-major tensors, ``bos`` cannot be
+            # folded into the row index. Indexing is ``g_base + row`` where the
+            # row is sequence-relative.
+            if const_expr(IS_VARLEN):
+                g_base = i_h * T_flat + bos
+            else:
+                g_base = (i_n * fx.Int32(H) + i_h) * T_flat
 
         # This CTA owns the [i_v*BV, (i_v+1)*BV) column window of u, so the
         # column offset folds into the base and gU is a [BT, BV] view.
@@ -972,14 +980,14 @@ def compile_chunk_gated_delta_h_gfx942(
                 it_i32 * fx.Int32(BT) + wid_m * fx.Int32(16) + lane_m_base * fx.Int32(4)
             )
             if const_expr(USE_G):
-                out.append(g_buf[(i_h * T_flat + (bos + last_idx),)])
+                out.append(g_buf[(g_base + last_idx,)])
                 for elem_i in range_constexpr(4):
                     # No address clamp: g_buf is bounds-checked, so a row past
                     # the tensor reads a hardware zero, and both use sites
                     # already discard out-of-range rows (K5 masks the gate via
                     # in_bounds.select, the fused path guards the o store).
                     abs_row = row_base + fx.Int32(elem_i)
-                    out.append(g_buf[(i_h * T_flat + (bos + abs_row),)])
+                    out.append(g_buf[(g_base + abs_row,)])
             if const_expr(USE_GK):
                 gk_chunk_base = (bos + last_idx) * fx.Int32(H * K) + i_h * fx.Int32(K)
                 for kb in range_constexpr(NUM_K_BLOCKS):
