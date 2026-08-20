@@ -3,6 +3,8 @@
 from collections import namedtuple
 
 import flydsl.expr as fx
+from flydsl._mlir import ir
+from flydsl._mlir.dialects import llvm as llvm_dialect
 from flydsl.expr import arith, gpu, rocdl, tdm_ops
 from flydsl.expr.arith import _to_raw as _raw
 from flydsl.expr.rocdl import cluster
@@ -38,6 +40,29 @@ def make_lds_copy_ops(bits):
         fx.copy_atom_call(atom, rmem, _view(lds_base_idx, byte_offset))
 
     return load, store
+
+
+def make_sgpr_opaque(val_i32):
+    """Return ``val_i32`` unchanged but hidden from constant folding.
+
+    A constexpr-unrolled region turns an LDS stage base (``base_ptr + s*PITCH``,
+    where ``base_ptr`` is LDS offset 0) into a literal, so the backend folds it
+    into every ds_load address and emits one v_add per load instead of one base
+    register plus 16-bit ``offset:`` immediates -- the shape a rolled loop gets
+    for free by keeping the stage in an SGPR. Routing the base through an
+    "=s,s" asm gives the result no known definition, so the fold cannot happen.
+
+    Emits no instruction.
+    """
+    op = llvm_dialect.InlineAsmOp(
+        res=ir.IntegerType.get_signless(32),
+        operands_=[_raw(val_i32)],
+        asm_string="",
+        constraints="=s,s",
+        has_side_effects=False,
+        is_align_stack=False,
+    )
+    return op.res
 
 
 def workgroup_barrier(use_cluster=False):
