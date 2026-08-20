@@ -52,7 +52,10 @@ from aiter.ops.flydsl.mxfp4_kname import (
     parse_flydsl_v2_gemm2_kernel,
     parse_g2_kname_any,
 )
-from aiter.ops.opus import moe_stage2_a8w4_fused_adapter as _opus_a8w4
+from aiter.ops.opus import moe_stage2_a8w4 as _opus_a8w4
+from aiter.ops.opus.moe_stage1_a8w4 import (
+    opus_a8w4_stage1_wrapper as _opus_a8w4_stage1_wrapper,
+)
 
 BLOCK_SIZE_M = 32
 
@@ -582,6 +585,8 @@ def fused_moe_fake(
     bias1: torch.Tensor | None = None,
     bias2: torch.Tensor | None = None,
     swiglu_limit: float | None = None,
+    beta: float | None = None,
+    linear_beta: float | None = None,
     gate_mode: str = GateMode.SEPARATED.value,
 ) -> torch.Tensor:
     device = topk_ids.device
@@ -1328,57 +1333,6 @@ def _normalize_bias_for_kernel(
     return bias
 
 
-def _opus_a8w4_stage1_wrapper(
-    hidden_states,
-    w1,
-    w2,
-    sorted_token_ids,
-    sorted_expert_ids,
-    num_valid_ids,
-    out,
-    topk,
-    activation,
-    kernelName="",
-    block_m: int = 0,
-    w1_scale=None,
-    a1_scale=None,
-    sorted_weights=None,
-    bias1=None,
-    swiglu_limit: float | None = None,
-    situ_beta: float = 4.0,
-    situ_linear_beta: float = 25.0,
-    inter_dim_pad: int = 0,
-    output_sorted: bool = False,
-    **_kwargs,
-):
-    if sorted_weights is not None:
-        raise NotImplementedError(
-            "Opus A8W4 stage1 does not support routed-weight multiplication"
-        )
-    from aiter.ops.opus.moe_stage1_a8w4 import opus_moe_stage1_a8w4_fwd
-
-    return opus_moe_stage1_a8w4_fwd(
-        hidden_states,
-        w1,
-        a1_scale,
-        w1_scale,
-        sorted_token_ids,
-        sorted_expert_ids,
-        num_valid_ids,
-        topk=int(topk),
-        inter_dim_pad=int(inter_dim_pad),
-        bias=_normalize_bias_for_kernel(bias1),
-        out=out,
-        output_sorted=output_sorted,
-        block_m=int(block_m),
-        kernelName=str(kernelName),
-        activation=activation,
-        swiglu_limit=swiglu_limit,
-        situ_beta=situ_beta,
-        situ_linear_beta=situ_linear_beta,
-    )
-
-
 # TODO: remove this function once kernel handles padding in the runtime
 def _get_padding_for_flydsl(
     inter_dim_pad,
@@ -2064,11 +2018,15 @@ def _flydsl_v2_stage2_wrapper(
     topk_weights=None,
     **_kwargs,
 ):
-    from aiter.ops.flydsl.kernels.mxmoe_dispatcher import mxfp4_moe_gemm2
+    from aiter.ops.flydsl.kernels.mxmoe_dispatcher import (
+        _validate_v2_gemm2_dtypes,
+        mxfp4_moe_gemm2,
+    )
 
     cfg = parse_flydsl_v2_gemm2_kernel(kernelName)
     if cfg is None:
         raise ValueError(f"Invalid FlyDSL v2 GEMM2 kernel name: {kernelName}")
+    _validate_v2_gemm2_dtypes(cfg["a_dtype"], cfg["b_dtype"])
 
     bm = cfg["tile_m"]
     bn = cfg["tile_n"]
@@ -2148,6 +2106,7 @@ def _flydsl_v2_stage2_wrapper(
         BK=bk,
         use_nt=cfg["use_nt"],
         a_dtype=cfg["a_dtype"],
+        b_dtype=cfg["b_dtype"],
         epilog=epilog,
         SBM=sbm,
         persist=cfg["persist"],
@@ -2503,8 +2462,8 @@ def get_2stage_cfgs(
         cfg.get("kernelName2", "")
     )
     route_bucket_metadata = _opus_a8w4.route_bucket_metadata(cfg) if is_opus_cfg else {}
-    opus_stage2_cfg_values = (
-        _opus_a8w4.stage2_cfg_values(cfg, block_m) if is_opus_cfg else {}
+    opus_stage2_launch = (
+        _opus_a8w4.parse_stage2_config(cfg, block_m) if is_opus_cfg else None
     )
 
     tag = f"({kernelName1=}, {kernelName2=})"
@@ -2677,7 +2636,7 @@ def get_2stage_cfgs(
                 kernelName=kernelName2,
                 inter_dim_pad=intermediate_pad,
                 model_dim_pad=hidden_pad,
-                **opus_stage2_cfg_values,
+                launch=opus_stage2_launch,
             )
         elif is_cktile2:
             stage2_func = functools.partial(
@@ -2996,7 +2955,7 @@ def get_2stage_cfgs(
                 kernelName=kernelName2,
                 inter_dim_pad=intermediate_pad,
                 model_dim_pad=hidden_pad,
-                **opus_stage2_cfg_values,
+                launch=opus_stage2_launch,
             )
         elif kernelName2 and kernelName2.startswith("cktile_"):
             stage2_func = functools.partial(
@@ -3042,7 +3001,7 @@ def get_2stage_cfgs(
             kernelName=kernelName2,
             inter_dim_pad=intermediate_pad,
             model_dim_pad=hidden_pad,
-            **opus_stage2_cfg_values,
+            launch=opus_stage2_launch,
         )
     elif kernelName2 and kernelName2.startswith("cktile_"):
         stage2_func = functools.partial(
@@ -3285,9 +3244,10 @@ def fused_moe_2stages(
     if stage1_func in (_flydsl_stage1_wrapper, _mxfp4_a4w4_stage1_fw):
         if stage1_func is _flydsl_stage1_wrapper and metadata.skip_inter_quant:
             extra_stage1_args["v2_output_layout"] = True
-        # SiTUv2 beta/linear_beta are compile-time constants baked into the
-        # FlyDSL kernel (see compile_mixed_moe_gemm1). Thread them through as the
-        # kernel's situ_beta/situ_linear_beta params; None -> 1.0 (plain tanh).
+        # SiTUv2 beta/linear_beta -> the stage1 situ_beta/situ_linear_beta params;
+        # None -> 1.0 (plain tanh). _flydsl_stage1_wrapper takes them as runtime
+        # f32 scalars; the mxfp4 a4w4 GEMM1 replacement bakes them into the
+        # compiled kernel (they are keys of _get_compiled_mxfp4_gemm1_port).
         extra_stage1_args["situ_beta"] = 1.0 if beta is None else float(beta)
         extra_stage1_args["situ_linear_beta"] = (
             1.0 if linear_beta is None else float(linear_beta)
@@ -3713,9 +3673,8 @@ def torch_moe_stage1(
         num_groups = model_dim // group_size
         w1_shape = w1.shape
         # w1: [E, N, K] -> apply scale per group of K
-        w1 = w1.reshape(E, N, num_groups, group_size) * w1_scale.reshape(
-            E, num_groups, N
-        ).permute(0, 2, 1).unsqueeze(-1)
+        w1 = w1.reshape(E, N, num_groups, group_size)
+        w1.mul_(w1_scale.reshape(E, num_groups, N).permute(0, 2, 1).unsqueeze(-1))
         w1 = w1.reshape(w1_shape)
         # activations are bf16, no scaling needed
     elif quant_type == QuantType.per_1x32:
@@ -3841,9 +3800,10 @@ def torch_moe_stage2(
         num_groups = inter_dim // group_size
         w2_shape = w2.shape
         # w2: [E, model_dim, inter_dim] -> apply scale per group of inter_dim
-        w2 = w2.reshape(E, model_dim, num_groups, group_size) * w2_scale.reshape(
-            E, num_groups, model_dim
-        ).permute(0, 2, 1).unsqueeze(-1)
+        w2 = w2.reshape(E, model_dim, num_groups, group_size)
+        w2.mul_(
+            w2_scale.reshape(E, num_groups, model_dim).permute(0, 2, 1).unsqueeze(-1)
+        )
         w2 = w2.reshape(w2_shape)
         # activations are bf16, no scaling
     elif quant_type == QuantType.per_1x32:

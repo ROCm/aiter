@@ -30,6 +30,25 @@ ATOL_fp8 = 3.0e-1
 RTOL_fp8 = 2.5e-1
 
 
+def test_block_attn_mask_to_ragged_lut_metadata_dtype():
+    block_attn_mask = torch.tensor(
+        [[[[True, False, True], [False, True, True]]]],
+        dtype=torch.bool,
+        device="cuda",
+    )
+
+    _, lut_start, lut_count = block_attn_mask_to_ragged_lut(block_attn_mask)
+
+    assert lut_start.dtype == torch.int32
+    assert lut_count.dtype == torch.int32
+    torch.testing.assert_close(
+        lut_start, torch.tensor([0, 2], device="cuda", dtype=torch.int32)
+    )
+    torch.testing.assert_close(
+        lut_count, torch.tensor([2, 2], device="cuda", dtype=torch.int32)
+    )
+
+
 def compare_accuracy(current, reference):
     """Print quick statistics comparing FP8 and SageAttn tensors."""
     current_f = current.float()
@@ -56,6 +75,18 @@ def compare_accuracy(current, reference):
         ref_flat.unsqueeze(0), test_flat.unsqueeze(0)
     )
     print(f"  Cosine Similarity: {cos_sim.item():.8f}")
+    # Per-row (per-query) cosine over the head-dim D (last axis). Robust to a few outlier
+    # rows: the global flatten cosine is dominated by the largest-magnitude elements, so an
+    # aligned kernel with a handful of blown-up rows still reports a low global cosine. The
+    # median over rows is the alignment gate we trust.
+    rc = torch.nn.functional.cosine_similarity(current_f, reference_f, dim=-1).reshape(
+        -1
+    )
+    print(
+        f"  Per-row cosine (over D): mean={rc.mean().item():.6f} "
+        f"median={rc.median().item():.6f} p10={rc.quantile(0.10).item():.6f} "
+        f"frac>0.99={(rc > 0.99).float().mean().item():.4f}"
+    )
 
 
 def pad_rearrange_dropout_mask(
@@ -113,7 +144,8 @@ def fp8_assert_close(
     max_abs_idx = torch.argmax(abs_diff).item()
     max_rel_idx = torch.argmax(rel_diff).item()
 
-    flat_to_idx = lambda flat_idx, shape: np.unravel_index(flat_idx, shape)
+    def flat_to_idx(flat_idx, shape):
+        return np.unravel_index(flat_idx, shape)
 
     max_abs_pos = flat_to_idx(max_abs_idx, tensor_a.shape)
     max_rel_pos = flat_to_idx(max_rel_idx, tensor_a.shape)
@@ -175,7 +207,6 @@ def input_helper(
     dtype,
     layout,
 ):
-    # Generate base inputs in BHSD layout which is the layout used in wan model.
     # Set up tensor shapes based on layout
     if layout == "bhsd":
         q_shape = (BATCH, HQ, N_CTX_Q, D_HEAD)
