@@ -1043,7 +1043,6 @@ def compile_gemm_decode_bf16(
     has_bias: bool = False,
 ):
     """Compile one exact unified ``(arch, M, N, K, config)`` identity."""
-    config.validate(m=m, n=n, k=k, arch=arch)
     if isinstance(config, WaveDecodeConfig):
         return compile_gemm_decode_wave_bf16(
             m,

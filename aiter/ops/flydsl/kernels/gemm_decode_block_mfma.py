@@ -19,6 +19,7 @@ from .gemm_decode_common import (
     BlockMfmaDecodeConfig,
     add_bias_f32,
     bf16x4_slice,
+    block_mfma_persistent_grid,
     block_mfma_staged_k,
     convert_bf16,
     gemm_decode_kernel_name,
@@ -32,7 +33,6 @@ from .gemm_decode_common import (
     padded_row_coordinates,
     raw,
     reduce_mfma_scalar,
-    validate_block_mfma_grid_i32,
     wave_lane_coordinates,
 )
 from .tensor_shim import _run_compiled, unused_tensor_arg
@@ -599,7 +599,7 @@ def compile_gemm_decode_block_mfma_bf16(
     if config.persistent_n:
         if num_cus is None or num_cus <= 0:
             raise ValueError("N-persistent BlockMFMA requires a positive num_cus")
-        grid_workgroups, persistent_turns, _ = validate_block_mfma_grid_i32(
+        grid_workgroups, persistent_turns = block_mfma_persistent_grid(
             n,
             config,
             num_cus=num_cus,

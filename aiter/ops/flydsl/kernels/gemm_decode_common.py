@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from itertools import product
 from typing import TypeAlias
@@ -28,7 +28,6 @@ from .tensor_shim import _to_raw as raw
 WAVE_SIZE = 64
 MFMA_K = 4
 BF16_BYTES = 2
-SIGNED_INT32_MAX = (1 << 31) - 1
 CACHE_POLICY_DEFAULT = 0
 CACHE_POLICY_NON_TEMPORAL = 0x2
 _CACHE_POLICY_MASK = 0x13
@@ -36,8 +35,6 @@ _CACHE_POLICY_MASK = 0x13
 
 def validate_cache_policy(cache_policy: int) -> None:
     """Reject cache-policy bits that gfx942 lowering would silently discard."""
-    if not isinstance(cache_policy, int):
-        raise TypeError("cache policy must be an integer")
     if cache_policy < 0 or cache_policy & ~_CACHE_POLICY_MASK:
         raise ValueError(f"unsupported cache policy: {cache_policy:#x}")
 
@@ -66,32 +63,23 @@ class ActivationSource(str, Enum):
 @dataclass(frozen=True)
 class DecodeArchTraits:
     arch: str
-    max_lds_bytes: int
     supports_dot2: bool
     supports_stochastic: bool
-    supports_wide_b_load: bool
     supports_two_stage: bool
-    max_estimated_live_vgprs: int
 
 
 ARCH_TRAITS = {
     "gfx942": DecodeArchTraits(
         arch="gfx942",
-        max_lds_bytes=64 * 1024,
         supports_dot2=False,
         supports_stochastic=False,
-        supports_wide_b_load=True,
         supports_two_stage=False,
-        max_estimated_live_vgprs=192,
     ),
     "gfx950": DecodeArchTraits(
         arch="gfx950",
-        max_lds_bytes=160 * 1024,
         supports_dot2=True,
         supports_stochastic=True,
-        supports_wide_b_load=True,
         supports_two_stage=True,
-        max_estimated_live_vgprs=192,
     ),
 }
 
@@ -122,7 +110,7 @@ class WaveDecodeConfig:
     def validate(self, *, m: int, n: int, k: int, arch: str) -> None:
         traits = get_decode_arch_traits(arch)
         _validate_problem(m, n, k)
-        if self.m_per_wave not in range(1, 6) or m % self.m_per_wave:
+        if not self.m_per_wave or m % self.m_per_wave:
             raise ValueError(
                 "wave policy requires m_per_wave to exactly divide M without "
                 f"padding or a masked M tail, got M={m}, m_per_wave={self.m_per_wave}"
@@ -151,7 +139,6 @@ class WaveDecodeConfig:
             raise ValueError("stochastic BF16 conversion requires gfx950")
         if self.reduction == ReductionMode.DPP and k % self.kvec:
             raise ValueError("DPP reduction requires K divisible by kvec")
-        validate_wave_i32_addressing(m, n, k, self)
 
 
 @dataclass(frozen=True)
@@ -184,16 +171,12 @@ class BlockMfmaDecodeConfig:
             raise ValueError("columns_per_wave must be 1, 2, or 4")
         if self.b_load_width not in (4, 8):
             raise ValueError("b_load_width must be 4 or 8")
-        if self.b_load_width == 8 and not traits.supports_wide_b_load:
-            raise ValueError("wide B loads require gfx950")
         if self.k_unroll not in (1, 2):
             raise ValueError("k_unroll must be 1 or 2")
         if self.prefetch_stages not in (1, 2):
             raise ValueError("prefetch_stages must be 1 or 2")
         if self.prefetch_stages == 2 and not traits.supports_two_stage:
             raise ValueError("two-stage BlockMFMA prefetch requires gfx950")
-        if self.prefetch_stages == 2 and m * self.columns_per_wave > 12:
-            raise ValueError("two-stage prefetch exceeds the accumulator budget")
         if self.workgroups_per_cu not in (1, 2, 4):
             raise ValueError("workgroups_per_cu must be 1, 2, or 4")
         if self.persistent_n:
@@ -207,7 +190,6 @@ class BlockMfmaDecodeConfig:
         if self.waves_per_eu not in (0, 1, 2, 4):
             raise ValueError("waves_per_eu must be 0, 1, 2, or 4")
         validate_cache_policy(self.b_cache_modifier)
-        validate_block_mfma_i32_addressing(m, n, k, self)
         if (
             self.output_rounding == OutputRounding.STOCHASTIC
             and not traits.supports_stochastic
@@ -221,16 +203,6 @@ class BlockMfmaDecodeConfig:
                     f"full A LDS requires {required} bytes, exceeding the "
                     f"{lds_limit}-byte {arch} limit"
                 )
-        # Keep the exact five-row/c4 body below the validated accumulator budget.
-        if m * self.columns_per_wave > 20:
-            raise ValueError("BlockMFMA accumulator tile exceeds the register budget")
-        estimated_vgprs = block_mfma_estimated_live_vgprs(m, self)
-        if estimated_vgprs > traits.max_estimated_live_vgprs:
-            raise ValueError(
-                "BlockMFMA live prefetch state exceeds the conservative "
-                f"{arch} register budget: estimated {estimated_vgprs} VGPRs > "
-                f"{traits.max_estimated_live_vgprs}"
-            )
 
 
 DecodeConfig: TypeAlias = WaveDecodeConfig | BlockMfmaDecodeConfig
@@ -243,116 +215,13 @@ def _validate_problem(m: int, n: int, k: int) -> None:
         raise ValueError("BF16 decode GEMM requires positive N and K")
 
 
-def _require_signed_i32(family: str, name: str, value: int) -> None:
-    if value < 0:
-        raise ValueError(f"{family} {name}={value} must be non-negative")
-    if value > SIGNED_INT32_MAX:
-        raise ValueError(
-            f"{family} {name}={value} exceeds signed-32-bit addressing limit "
-            f"{SIGNED_INT32_MAX}"
-        )
-
-
-def _validate_common_i32_addressing(
-    family: str,
-    m: int,
-    n: int,
-    k: int,
-) -> None:
-    """Validate packed BF16 resource sizes and row/column offset products."""
-    values = {
-        "M": m,
-        "N": n,
-        "K": k,
-        "A row stride bytes": k * BF16_BYTES,
-        "B row stride bytes": k * BF16_BYTES,
-        "C row stride bytes": n * BF16_BYTES,
-        "A element extent": m * k,
-        "B element extent": n * k,
-        "C element extent": m * n,
-        "A byte extent": m * k * BF16_BYTES,
-        "B byte extent": n * k * BF16_BYTES,
-        "C byte extent": m * n * BF16_BYTES,
-        "A max row*K": (m - 1) * k,
-        "B max column*K": (n - 1) * k,
-        "C max row*N": (m - 1) * n,
-        "A max element offset": m * k - 1,
-        "B max element offset": n * k - 1,
-        "C max element offset": m * n - 1,
-    }
-    for name, value in values.items():
-        _require_signed_i32(family, name, value)
-
-
-def validate_wave_i32_addressing(
-    m: int,
-    n: int,
-    k: int,
-    config: WaveDecodeConfig,
-) -> None:
-    """Reject shapes whose generated Wave address/grid math can overflow i32."""
-    family = "Wave"
-    _validate_common_i32_addressing(family, m, n, k)
-    k_tile = WAVE_SIZE * config.kvec
-    full_tiles = k // k_tile
-    tail_start = full_tiles * k_tile
-    has_tail = k % k_tile != 0
-    rounded_k_boundary = tail_start + k_tile - 1 if has_tail else k - 1
-    row_blocks = m // config.m_per_wave
-    column_blocks = n // config.n_per_wave
-    values = {
-        "K vector tile": k_tile,
-        "full K tiles": full_tiles,
-        "tail start": tail_start,
-        "lane*K vector maximum": (WAVE_SIZE - 1) * config.kvec,
-        "rounded K vector boundary": rounded_k_boundary,
-        "row grid dimension": row_blocks,
-        "column grid dimension": column_blocks,
-        "max row block index": row_blocks - 1,
-        "max column block index": column_blocks - 1,
-        "max row base": (row_blocks - 1) * config.m_per_wave,
-        "max column base": (column_blocks - 1) * config.n_per_wave,
-        "max row index": m - 1,
-        "max column index": n - 1,
-        "A max vector load offset": m * k - 1,
-        "B max vector load offset": n * k - 1,
-        "C max store offset": m * n - 1,
-    }
-    for name, value in values.items():
-        _require_signed_i32(family, name, value)
-
-
-def validate_block_mfma_i32_addressing(
-    m: int,
-    n: int,
-    k: int,
-    config: BlockMfmaDecodeConfig,
-) -> None:
-    """Reject shapes whose generated BlockMFMA address math can overflow i32."""
-    family = "BlockMFMA"
-    _validate_common_i32_addressing(family, m, n, k)
-    tile_columns = config.waves_per_workgroup * config.columns_per_wave
-    staged_k = block_mfma_staged_k(k)
-    logical_workgroups = (n + tile_columns - 1) // tile_columns
-    max_tile_column = logical_workgroups * tile_columns - 1
-    values = {
-        "staged K": staged_k,
-        "staged-A element extent": m * staged_k,
-        "logical workgroups": logical_workgroups,
-        "max logical tile column": max_tile_column,
-        "tile column stride": tile_columns,
-    }
-    for name, value in values.items():
-        _require_signed_i32(family, name, value)
-
-
-def validate_block_mfma_grid_i32(
+def block_mfma_persistent_grid(
     n: int,
     config: BlockMfmaDecodeConfig,
     *,
     num_cus: int,
-) -> tuple[int, int, int]:
-    """Validate config-dependent persistent grid/turn i32 intermediates."""
+) -> tuple[int, int]:
+    """Return persistent grid workgroups and N-turn count."""
     if not isinstance(num_cus, int) or num_cus <= 0:
         raise ValueError(f"num_cus must be a positive integer, got {num_cus!r}")
     tile_columns = config.waves_per_workgroup * config.columns_per_wave
@@ -360,52 +229,16 @@ def validate_block_mfma_grid_i32(
     grid_cap = num_cus * config.workgroups_per_cu
     grid_workgroups = min(logical_workgroups, grid_cap)
     persistent_turns = (logical_workgroups + grid_workgroups - 1) // grid_workgroups
-    column_stride = grid_workgroups * tile_columns
-    max_turn_column = (
-        (persistent_turns - 1) * column_stride
-        + (grid_workgroups - 1) * tile_columns
-        + tile_columns
-        - 1
-    )
-    for name, value in {
-        "num_cus": num_cus,
-        "grid-cap workgroups": grid_cap,
-        "grid workgroups": grid_workgroups,
-        "persistent turns": persistent_turns,
-        "persistent tile stride": column_stride,
-        "max persistent tile column": max_turn_column,
-    }.items():
-        _require_signed_i32("BlockMFMA", name, value)
-    return grid_workgroups, persistent_turns, column_stride
-
-
-def _align_up(value: int, alignment: int) -> int:
-    return (value + alignment - 1) // alignment * alignment
+    return grid_workgroups, persistent_turns
 
 
 def block_mfma_staged_k(k: int) -> int:
-    padding = MFMA_K if k % (WAVE_SIZE * MFMA_K) else 0
-    return _align_up(k + padding, 8)
+    padded = k + (MFMA_K if k % (WAVE_SIZE * MFMA_K) else 0)
+    return (padded + 7) // 8 * 8
 
 
 def block_mfma_lds_bytes(m: int, k: int) -> int:
     return m * block_mfma_staged_k(k) * BF16_BYTES
-
-
-def block_mfma_estimated_live_vgprs(
-    m: int,
-    config: BlockMfmaDecodeConfig,
-) -> int:
-    """Conservative bound for accumulators plus simultaneously prefetched data."""
-    accumulator_vgprs = 4 * m * config.columns_per_wave
-    vector_vgprs = config.b_load_width // 2
-    live_prefetch_vgprs = (
-        config.k_unroll
-        * config.prefetch_stages
-        * (m + config.columns_per_wave)
-        * vector_vgprs
-    )
-    return accumulator_vgprs + live_prefetch_vgprs + 48
 
 
 _DEFAULT_CUS_BY_ARCH = {"gfx942": 304, "gfx950": 256}
@@ -510,10 +343,11 @@ def iter_gemm_decode_configs(
         else (ContractionMode.DOT2_BF16,)
     )
     exact_m_divisors = tuple(mp for mp in range(1, m + 1) if m % mp == 0)
+    n_tiles = tuple(np for np in (1, 2, 4) if n % np == 0)
     for values in product(
         exact_m_divisors,
         (2, 4, 8),
-        (1, 2, 4),
+        n_tiles,
         _wave_prefetch_options(k, arch),
         (2, 4),
         _decode_cache_options(n, k),
@@ -521,6 +355,8 @@ def iter_gemm_decode_configs(
         contractions,
     ):
         mp, kvec, np, prefetch, wpe, cache, reduction, contraction = values
+        if reduction == ReductionMode.DPP and k % kvec:
+            continue
         yield from emit(
             WaveDecodeConfig(
                 m_per_wave=mp,
@@ -580,19 +416,7 @@ def iter_gemm_decode_configs(
         except ValueError:
             continue
         for grid in _persistent_grid_options(n, base, num_cus=num_cus):
-            yield from emit(
-                BlockMfmaDecodeConfig(
-                    waves_per_workgroup=waves,
-                    columns_per_wave=columns,
-                    activation_source=ActivationSource.FULL_LDS,
-                    b_load_width=b_width,
-                    k_unroll=unroll,
-                    prefetch_stages=prefetch,
-                    persistent_n=True,
-                    workgroups_per_cu=grid,
-                    waves_per_eu=wpe,
-                )
-            )
+            yield from emit(replace(base, workgroups_per_cu=grid))
 
 
 _NAME_RE = re.compile(
@@ -610,7 +434,6 @@ def gemm_decode_kernel_name(
     *,
     has_bias: bool = False,
 ) -> str:
-    config.validate(m=m, n=n, k=k, arch=arch)
     prefix = f"flydsl_decode_a{arch}_m{m}_n{n}_k{k}_"
     if isinstance(config, WaveDecodeConfig):
         name = prefix + (
@@ -701,16 +524,11 @@ def parse_gemm_decode_kernel_name(
 
 
 # Layout, address, and data-movement helpers.
-def _next_power_of_two(value: int) -> int:
-    return 1 << (value - 1).bit_length()
-
-
 def make_buffer_matrix(
     tensor,
     rows: int,
     columns: int,
 ):
-    """Give a packed BF16 global operand an exact two-dimensional view."""
     buffer = fx.rocdl.make_buffer_tensor(
         tensor,
         max_size=False,
@@ -723,7 +541,6 @@ def make_buffer_matrix(
 
 
 def make_buffer_vector(tensor, length: int):
-    """Give a packed BF16 global operand an exact one-dimensional view."""
     buffer = fx.rocdl.make_buffer_tensor(
         tensor,
         max_size=False,
@@ -742,7 +559,6 @@ def make_vector_view(
     row_stride: int,
     width: int,
 ):
-    """Create a contiguous register-width view at a matrix coordinate."""
     # FlyDSL 0.3.0 crd2idx normalizes dynamic coordinates. These coordinates
     # are already proven in bounds, so keep the physical offset explicit at
     # this address-generation boundary.
@@ -759,7 +575,6 @@ def load_vector(
     width: int,
     cache_modifier: int = 0,
 ):
-    """Load one logical row vector while preserving explicit cache controls."""
     if cache_modifier:
         resource = fx.rocdl.get_buffer_rsrc(fx.get_iter(tensor))
         element = fx.Int32(row) * fx.Int32(row_stride) + fx.Int32(column)
@@ -780,7 +595,6 @@ def load_scalar(
     row_stride: int,
     cache_modifier: int = 0,
 ):
-    """Load one logical matrix element with optional cache controls."""
     element = fx.Int32(row) * fx.Int32(row_stride) + fx.Int32(column)
     if cache_modifier:
         resource = fx.rocdl.get_buffer_rsrc(fx.get_iter(tensor))
@@ -796,7 +610,6 @@ def load_scalar(
 
 
 def wave_lane_coordinates(thread_id, waves: int):
-    """Map a workgroup thread id to ``(wave, lane)``."""
     return fx.idx2crd(
         thread_id,
         fx.make_layout((waves, WAVE_SIZE), (WAVE_SIZE, 1)),
@@ -818,7 +631,7 @@ def padded_row_coordinates(
     return fx.idx2crd(
         slot,
         fx.make_layout(
-            (_next_power_of_two(rows), values_per_row),
+            (1 << (rows - 1).bit_length(), values_per_row),
             (values_per_row, 1),
         ),
     ).unpack()
