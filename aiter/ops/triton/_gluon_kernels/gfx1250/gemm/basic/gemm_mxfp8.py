@@ -1126,7 +1126,6 @@ def _gemm_mxfp8_preshuffle_compute_bound_kernel(
     # SPLITK_BLOCK_SIZE = cdiv(K, 1) = K.
     STATIC_K_ITER: gl.constexpr = (SPLITK_BLOCK_SIZE + BLOCK_SIZE_K - 1) // BLOCK_SIZE_K
     STATIC_MAIN_ITERS: gl.constexpr = STATIC_K_ITER - (NUM_BUFFERS - 1)
-    UNROLL: gl.constexpr = max(1, min(LOOP_UNROLL_FACTOR, STATIC_MAIN_ITERS))
 
     # ---- program setup: split-K decomposition ----
     pid_unified = gl.program_id(axis=0)
@@ -1431,7 +1430,7 @@ def _gemm_mxfp8_preshuffle_compute_bound_kernel(
         cache_modifier=cache_modifier,
     )
 
-    for _ in range(0, NUM_K_ITER - (NUM_BUFFERS - 1)):
+    for _ in range(NUM_K_ITER - (NUM_BUFFERS - 1)):
         acc = gl.amd.gfx1250.wmma_scaled(
             cur_a, cur_as, "e4m3", cur_b, cur_bs, "e4m3", acc
         )
