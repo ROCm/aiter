@@ -31,7 +31,7 @@ import torch
 from flydsl.expr import arith, const_expr, gpu, range_constexpr
 from flydsl.expr import math as fmath
 from flydsl.expr.arith import CmpFPredicate
-from flydsl.expr.typing import ReductionOp, Stream
+from flydsl.expr.typing import ReductionOp, Stream, T
 
 from . import dpp_utils
 from .tensor_shim import _run_compiled
@@ -116,6 +116,30 @@ def _wave_reduce_add_f32(value, mode: str, fastmath):
     return reduced
 
 
+def _narrow_dpp_reduce_add_f32(value, red_slots: int, fastmath):
+    """Sum the first ``red_slots`` lanes (rest already zero) and broadcast lane 0.
+
+    Offsets 32/16/8 of a wave64 butterfly add zeros when ``red_slots <= 8``.
+    The remaining tree (span/2 .. 1) fits DPP; ``v_readfirstlane`` replaces
+    the zero-add copy that used to spread the total across the wave.
+    """
+    if red_slots <= 1:
+        return value
+    if red_slots > 8:
+        raise ValueError(
+            "DPP finish reduce only covers red_slots in 2..8, " f"got {red_slots}"
+        )
+    span = 1 << math.ceil(math.log2(red_slots))
+    reduced = value
+    for shift_exp in range_constexpr(int(math.log2(span))):
+        offset = span // (2 << shift_exp)
+        peer = _dpp_xor_f32(reduced, offset)
+        reduced = reduced.addf(peer, fastmath=fastmath)
+    bits = reduced.bitcast(fx.Int32)
+    broadcast = fx.Int32(fx.rocdl.readfirstlane(T.i32, bits))
+    return broadcast.bitcast(fx.Float32)
+
+
 def _block_threads_for(num_vec: int) -> int:
     """Return a wave-aligned thread count that prefers two vector tiles per thread."""
     if num_vec <= 0:
@@ -195,6 +219,10 @@ def _build_attn_res(
             f"_WAVE_REDUCE_MODE must be 'auto', 'swizzle', or 'dpp', "
             f"got {_WAVE_REDUCE_MODE!r}"
         )
+    # Multi-wave finish is 3-step DPP + readfirstlane. DPP XOR only reaches
+    # offsets 1/2/4/8, so more than 8 waves still uses the wave64 butterfly.
+    # Production is 7 (D=7168) or 1 (D=1024, which never enters finish).
+    use_dpp_finish = 1 < red_slots <= 8
     kernel_name = (
         f"{KERNEL_NAME}_d{hidden_size}_k{num_sources}_bt{block_threads}"
         f"_r{rows_per_wg}_v{_VEC_WIDTH}_delta{int(has_delta)}_write{int(write_block)}"
@@ -242,6 +270,11 @@ def _build_attn_res(
         def wave_reduce_add(value):
             return _wave_reduce_add_f32(value, wave_reduce_mode, fm_fast)
 
+        def finish_reduce(value):
+            if const_expr(use_dpp_finish):
+                return _narrow_dpp_reduce_add_f32(value, red_slots, fm_fast)
+            return wave_reduce_add(value)
+
         def store_pair_partials(sumsq_local, dot_local, slot, buf):
             """Wave-reduce and write LDS partials. No barrier."""
             s_sumsq = fx.slice(s_sumsq_all, (buf, slot, None))
@@ -265,7 +298,7 @@ def _build_attn_res(
             dot_partial = fx.memref_load(s_dot, lane_safe)
             sumsq_partial = in_range.select(sumsq_partial, zero)
             dot_partial = in_range.select(dot_partial, zero)
-            return wave_reduce_add(sumsq_partial), wave_reduce_add(dot_partial)
+            return finish_reduce(sumsq_partial), finish_reduce(dot_partial)
 
         def block_reduce_add2(sumsq_local, dot_local, buf, slot):
             if const_expr(red_slots == 1):
@@ -294,7 +327,7 @@ def _build_attn_res(
             lane_safe = in_range.select(lane, 0)
             partial = fx.memref_load(s_sumsq, lane_safe)
             partial = in_range.select(partial, zero)
-            return wave_reduce_add(partial)
+            return finish_reduce(partial)
 
         copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), 16)
         vector_layout = fx.make_layout(_VEC_WIDTH, 1)
