@@ -150,6 +150,9 @@ AITER_CONFIG_GEMM_BF16 = os.getenv(
     f"{AITER_ROOT_DIR}/aiter/configs/bf16_tuned_gemm.csv",
 )
 
+# K5 opt BV tuned config. Per-model tuned rows live under model_configs/
+# (qwen3_5_*_chunk_gdn_h_opt_tuned.csv), merged at runtime by get_config_file;
+# this canonical path may not exist on disk.
 AITER_CONFIG_GDN_K5_OPT = os.getenv(
     "AITER_CONFIG_GDN_K5_OPT",
     f"{AITER_ROOT_DIR}/aiter/configs/chunk_gdn_h_opt_tuned.csv",
