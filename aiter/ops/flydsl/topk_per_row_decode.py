@@ -80,7 +80,8 @@ def _environ_kernel_config() -> dict:
         "tiered_mid_max": _env_int("FLYDSL_TOPK_TIERED_MID_MAX"),
         "tiered_long_cap": _env_int("FLYDSL_TOPK_TIERED_LONG_CAP"),
         "bits_per_pass": _env_int("FLYDSL_TOPK_TIERED_BPP"),
-        # 0/1 override for the non-finite mask (default on); set 0 to disable.
+        # 0/1 override for the non-finite mask (default off, matching torch.topk
+        # and HIP); set 1 to mask +inf/NaN out of the selection instead.
         "mask_non_finite": _env_int("FLYDSL_TOPK_TIERED_MASK_NONFINITE"),
         # Force a single tier for every row (auto/short/mid/long)
         "tier_mode": os.environ.get("FLYDSL_TOPK_TIERED_OVERRIDE"),

@@ -592,8 +592,16 @@ def _should_use_flydsl_decode(
 
     # HIP drops stride1 entirely and never validates next_n, so a call that works
     # there today can violate FlyDSL's contract, which raises rather than falling
-    # back. Screen those here so the fallback stays a routing decision.
-    if stride1 != 1 or next_n < 1 or stride0 != logits.stride(0):
+    # back. Screen those here so the fallback stays a routing decision. Both
+    # strides are checked against the tensor as well as against the contract,
+    # since a caller that claims stride1 == 1 for a column-strided buffer is one
+    # HIP accepts and FlyDSL rejects.
+    if (
+        stride1 != 1
+        or next_n < 1
+        or stride0 != logits.stride(0)
+        or logits.stride(1) != 1
+    ):
         return False
 
     return is_flydsl_available()

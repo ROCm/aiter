@@ -25,7 +25,17 @@ import torch
 from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops import topk as topk_mod
 
+# AITER_FLYDSL_TOPK_MIN_WIDTH / _MAX_ROWS rewrite the shipped table at import
+# time, which is a legitimate thing to do while benchmarking. Pinning the shipped
+# values is only meaningful against the shipped table, so stand down when the
+# window has deliberately been moved.
+gate_is_overridden = pytest.mark.skipif(
+    bool(topk_mod._FLYDSL_TOPK_MIN_WIDTH_ENV or topk_mod._FLYDSL_TOPK_MAX_ROWS_ENV),
+    reason="decode gate overridden via AITER_FLYDSL_TOPK_MIN_WIDTH/_MAX_ROWS",
+)
 
+
+@gate_is_overridden
 def test_shipped_gfx950_gate():
     """Pin the real gfx950 window to the SILOTIGER-699 conclusion so a silent edit
     to the table trips here."""
@@ -36,6 +46,7 @@ def test_shipped_gfx950_gate():
     assert gate.excluded_rows == frozenset({2})
 
 
+@gate_is_overridden
 def test_shipped_gfx942_gate():
     """Same pin for gfx942, set from the MI300X sweep. Narrower in rows than gfx950
     because that arch runs the frozen kernel config, wider in k because all four
@@ -94,10 +105,13 @@ def test_both_branches_match_torch_topk(rows, width, seq_len, k):
 
 
 @pytestmark_gpu
-def test_column_strided_input_falls_back_instead_of_raising():
-    """A column-strided buffer sits inside the gate's width window, so the screen
-    for ``stride1 != 1`` is the only thing keeping it away from FlyDSL, which
-    raises on it. HIP ignores stride1, so the call has to simply come back."""
+@pytest.mark.parametrize("claimed_stride1", [2, 1], ids=["honest", "claims_one"])
+def test_column_strided_input_falls_back_instead_of_raising(claimed_stride1):
+    """A column-strided buffer sits inside the gate's width window, so the stride1
+    screen is the only thing keeping it away from FlyDSL, which raises on it. HIP
+    ignores stride1, so the call has to simply come back either way -- including
+    when the caller claims 1, which HIP accepts and the gate must not take at its
+    word."""
     if get_gfx_runtime() not in topk_mod._FLYDSL_TOPK_DECODE_GATES:
         pytest.skip("no FlyDSL gates for this arch")
     rows, width, k = 1, 131072, 512
@@ -108,7 +122,7 @@ def test_column_strided_input_falls_back_instead_of_raising():
     indices = torch.empty((rows, k), dtype=torch.int32, device="cuda")
 
     topk_mod.top_k_per_row_decode(
-        logits, 1, seq_lens, indices, rows, logits.stride(0), logits.stride(1), k
+        logits, 1, seq_lens, indices, rows, logits.stride(0), claimed_stride1, k
     )
     torch.cuda.synchronize()
 
