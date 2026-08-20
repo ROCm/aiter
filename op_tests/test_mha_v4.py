@@ -1,10 +1,13 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import os
+
 import pytest
 import torch
 
 from aiter import dtypes
+from aiter.jit.core import AITER_ROOT_DIR
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.mha_v4 import (
     MHA_V4_LOG2E,
@@ -943,3 +946,87 @@ def test_mha_v4_raw_mxfp4_v_supports_unaligned_sequence(q_format):
 
     assert torch.equal(eager, compiled)
     assert torch.isfinite(compiled).all()
+
+
+def _mha_v4_sparse_co_available() -> bool:
+    asm_dir = os.environ.get("AITER_ASM_DIR", os.path.join(AITER_ROOT_DIR, "hsa"))
+    return os.path.isfile(
+        os.path.join(asm_dir, "gfx950", "fmha_v4_fwd", "fwd_hd128_fp8_sparse.co")
+    )
+
+
+def test_mha_v4_packed_rejects_partial_lut():
+    dummy = torch.empty(0)
+    with pytest.raises(ValueError, match="all be set or all omitted"):
+        mha_v4_packed(
+            dummy,
+            dummy,
+            dummy,
+            dummy,
+            dummy,
+            dummy,
+            AttentionFormat.INT8,
+            AttentionFormat.INT8,
+            AttentionFormat.FP8,
+            AttentionScaleMode.F32_PER_TENSOR,
+            AttentionScaleMode.F32_PER_TENSOR,
+            AttentionScaleMode.F32_PER_TENSOR,
+            kv_block_indices=dummy,
+        )
+
+
+def test_mha_v4_rejects_wrong_block_mask_shape():
+    q = torch.zeros((1, 256, 2, 128), dtype=torch.bfloat16)
+    mask = torch.ones((1, 2, 1, 1), dtype=torch.bool)
+    with pytest.raises(ValueError, match="block_mask must have shape"):
+        mha_v4(
+            q,
+            q,
+            q,
+            AttentionFormat.FP8,
+            AttentionFormat.FP8,
+            AttentionFormat.FP8,
+            block_mask=mask,
+        )
+
+
+@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 six-format validation")
+def test_mha_v4_sparse_schema_mutates_only_out():
+    dense = str(torch.ops.aiter.mha_v4_fwd_launch.default._schema)
+    assert "Tensor kv_block_indices" not in dense
+    assert "Tensor(a6!) out" in dense
+
+    sparse = str(torch.ops.aiter.mha_v4_fwd_sparse_launch.default._schema)
+    assert "Tensor kv_block_indices" in sparse
+    assert "Tensor lut_start" in sparse
+    assert "Tensor lut_count" in sparse
+    assert "Tensor(a6!) out" in sparse
+    assert sparse.endswith("-> ()")
+
+
+@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 sparse validation")
+@pytest.mark.skipif(
+    not _mha_v4_sparse_co_available(),
+    reason="sorted-sparse MHA v4 code object is not deployed",
+)
+def test_mha_v4_sparse_fp8_all_true_mask_matches_dense():
+    torch.manual_seed(41)
+    q = torch.randn((1, 256, 2, 128), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((1, 256, 2, 128), device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    mask = torch.ones((1, 2, 1, 2), device="cuda", dtype=torch.bool)
+    dense = mha_v4(
+        q, k, v, AttentionFormat.FP8, AttentionFormat.FP8, AttentionFormat.FP8
+    )
+    sparse = mha_v4(
+        q,
+        k,
+        v,
+        AttentionFormat.FP8,
+        AttentionFormat.FP8,
+        AttentionFormat.FP8,
+        block_mask=mask,
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(dense, sparse)
+    assert torch.isfinite(sparse).all()

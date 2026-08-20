@@ -5,6 +5,7 @@
 #include <torch/all.h>
 
 #include <cstddef>
+#include <cstdint>
 #include <cstring>
 
 #include "aiter_hip_common.h"
@@ -128,6 +129,29 @@ static_assert(offsetof(FmhaV4Kernarg, ptr_q_descale) == 0x200);
 static_assert(offsetof(FmhaV4Kernarg, ptr_k_descale) == 0x210);
 static_assert(offsetof(FmhaV4Kernarg, ptr_v_descale) == 0x220);
 
+// Sorted-sparse kernarg: dense 656-byte prefix, LUT pointers at 0x290/0x2A0/0x2B0,
+// unused freeze slot at 0x2C0, work_table at 0x2D0, padded to 752.
+struct __attribute__((packed)) FmhaV4SparseSortedKernarg
+{
+    FmhaV4Kernarg dense;
+    ConstPointerSlot ptr_kv_block_indices;
+    ConstPointerSlot ptr_lut_start;
+    ConstPointerSlot ptr_lut_count;
+    ConstPointerSlot ptr_lut_freeze;
+    ConstPointerSlot ptr_work_table;
+    uint32_t s_num_wgs;
+    uint32_t s_total_tiles;
+    uint64_t tail_pad;
+};
+
+static_assert(sizeof(FmhaV4SparseSortedKernarg) == 752,
+              "MHA v4 sorted-sparse kernarg ABI must remain 752 bytes");
+static_assert(offsetof(FmhaV4SparseSortedKernarg, ptr_kv_block_indices) == 0x290);
+static_assert(offsetof(FmhaV4SparseSortedKernarg, ptr_lut_start) == 0x2A0);
+static_assert(offsetof(FmhaV4SparseSortedKernarg, ptr_lut_count) == 0x2B0);
+static_assert(offsetof(FmhaV4SparseSortedKernarg, ptr_lut_freeze) == 0x2C0);
+static_assert(offsetof(FmhaV4SparseSortedKernarg, ptr_work_table) == 0x2D0);
+
 void check_format_tensor(const at::Tensor& tensor, int64_t format, const char* name)
 {
     if(format == format_id(AttentionFormat::Bf16))
@@ -169,7 +193,8 @@ const fmha_v4_fwdConfig& find_config(const std::string& arch,
                                      int64_t v_format,
                                      int64_t q_scale_mode,
                                      int64_t k_scale_mode,
-                                     int64_t v_scale_mode)
+                                     int64_t v_scale_mode,
+                                     int64_t mode)
 {
     for(const auto& entry : cfg_fmha_v4_fwd)
     {
@@ -179,7 +204,7 @@ const fmha_v4_fwdConfig& find_config(const std::string& arch,
                cfg.k_scale_mode == k_scale_mode && cfg.v_scale_mode == v_scale_mode &&
                cfg.o_format == format_id(AttentionFormat::Bf16) &&
                cfg.o_scale_mode == scale_mode_id(AttentionScaleMode::None) &&
-           cfg.hdim_q == kHeadDim && cfg.hdim_v == kHeadDim && cfg.mask == 0 && cfg.mode == 0)
+           cfg.hdim_q == kHeadDim && cfg.hdim_v == kHeadDim && cfg.mask == 0 && cfg.mode == mode)
             return cfg;
     }
     TORCH_CHECK(false,
@@ -197,7 +222,9 @@ const fmha_v4_fwdConfig& find_config(const std::string& arch,
                 k_scale_mode,
                 ", v_scale_mode=",
                 v_scale_mode,
-                ", output=BF16, head_dim=128, dense non-causal MHA");
+                ", output=BF16, head_dim=128, mode=",
+                mode,
+                " (0=dense, 1=sorted-sparse)");
 }
 
 void set_descale_strides(const at::Tensor& tensor,
@@ -212,22 +239,120 @@ void set_descale_strides(const at::Tensor& tensor,
     }
 }
 
-} // namespace
+at::Tensor build_sorted_work_table(const at::Tensor& lut_count,
+                                   int64_t batch,
+                                   int64_t nhead,
+                                   int64_t q_tiles)
+{
+    auto flat             = lut_count.reshape({-1}).contiguous();
+    const int64_t total   = batch * nhead * q_tiles;
+    TORCH_CHECK(flat.numel() == total,
+                "lut_count.numel() must equal batch * heads * query_tiles");
+    TORCH_CHECK(batch < 256 && nhead < 256 && q_tiles < 65536,
+                "sorted work table packing requires batch<256, heads<256, query_tiles<65536");
+    TORCH_CHECK(flat.scalar_type() == at::ScalarType::Int, "lut_count must be int32");
 
-void fmha_v4_fwd(const at::Tensor& q,
-                 const at::Tensor& k,
-                 const at::Tensor& v,
-                 const at::Tensor& q_descale,
-                 const at::Tensor& k_descale,
-                 const at::Tensor& v_descale,
-                 at::Tensor out,
-                 int64_t q_format,
-                 int64_t k_format,
-                 int64_t v_format,
-                 int64_t q_scale_mode,
-                 int64_t k_scale_mode,
-                 int64_t v_scale_mode,
-                 double softmax_scale)
+    // Policy B: identity raster when every tile has the same LUT length (top-k / uniform
+    // sparsity) so we preserve spatial locality. Otherwise LPT-sort by lut_count descending.
+    const auto mn = flat.min();
+    const auto mx = flat.max();
+    at::Tensor order;
+    if(mn.item<int32_t>() == mx.item<int32_t>())
+    {
+        order = at::arange(total, flat.options().dtype(at::kLong));
+    }
+    else
+    {
+        order = at::argsort(flat, /*dim=*/0, /*descending=*/true);
+    }
+    const auto q_idx = at::remainder(order, q_tiles);
+    const auto h_idx = at::remainder(at::div(order, q_tiles, "trunc"), nhead);
+    const auto b_idx = at::div(order, q_tiles * nhead, "trunc");
+    auto packed      = at::bitwise_or(
+        at::bitwise_or(at::bitwise_and(q_idx, static_cast<int64_t>(0xFFFF)),
+                       at::bitwise_left_shift(at::bitwise_and(h_idx, static_cast<int64_t>(0xFF)), 16)),
+        at::bitwise_left_shift(at::bitwise_and(b_idx, static_cast<int64_t>(0xFF)), 24));
+    return packed.to(at::kInt).contiguous();
+}
+
+void populate_dense_kernarg(FmhaV4Kernarg& args,
+                            const at::Tensor& q,
+                            const at::Tensor& k,
+                            const at::Tensor& v,
+                            const at::Tensor& q_descale,
+                            const at::Tensor& k_descale,
+                            const at::Tensor& v_descale,
+                            const at::Tensor& out,
+                            const fmha_v4_fwdConfig& cfg,
+                            int64_t seqlen_q,
+                            int64_t seqlen_k,
+                            int64_t nhead_q,
+                            double softmax_scale)
+{
+    args.ptr_o.value         = out.data_ptr();
+    args.ptr_q.value         = q.data_ptr();
+    args.ptr_k.value         = k.data_ptr();
+    args.ptr_v.value         = v.data_ptr();
+    args.ptr_q_descale.value = q_descale.data_ptr();
+    args.ptr_k_descale.value = k_descale.data_ptr();
+    args.ptr_v_descale.value = v_descale.data_ptr();
+    static_assert(sizeof(float) == sizeof(uint32_t));
+    const float scale = static_cast<float>(softmax_scale);
+    std::memcpy(&args.scalar.value, &scale, sizeof(scale));
+    args.s_seq_len.value     = seqlen_q;
+    args.s_Seqs.value        = q.stride(1);
+    args.s_Ts.value          = cfg.ts_qo * q.stride(1);
+    args.s_Hs.value          = q.stride(2);
+    args.s_Bs.value          = q.stride(0);
+    args.s_gqa.value         = 1;
+    args.s_k_Seqs.value      = k.stride(1);
+    args.s_k_Hs.value        = k.stride(2);
+    args.s_k_Bs.value        = k.stride(0);
+    args.s_opt.value         = 5;
+    args.s_lse.value         = 0;
+    args.s_kv_seq_len.value  = seqlen_k;
+    args.s_qk_head_dim.value = kHeadDim;
+    args.s_v_head_dim.value  = kHeadDim;
+    args.s_q_head_num.value  = nhead_q;
+    args.s_v_Seqs.value      = v.stride(1);
+    args.s_v_Hs.value        = v.stride(2);
+    args.s_v_Bs.value        = v.stride(0);
+    args.s_o_Seqs.value      = out.stride(1) * 2;
+    args.s_o_Hs.value        = out.stride(2) * 2;
+    args.s_o_Bs.value        = out.stride(0) * 2;
+    set_descale_strides(q_descale,
+                        q_descale.dim() >= 3 ? 2 : 1,
+                        args.s_descale_q_Bs.value,
+                        args.s_descale_q_Hs.value);
+    set_descale_strides(k_descale,
+                        k_descale.dim() >= 3 ? 2 : 1,
+                        args.s_descale_k_Bs.value,
+                        args.s_descale_k_Hs.value);
+    set_descale_strides(v_descale, 1, args.s_descale_v_Bs.value, args.s_descale_v_Hs.value);
+}
+
+struct PackedMhaV4Shapes
+{
+    int64_t batch;
+    int64_t seqlen_q;
+    int64_t nhead_q;
+    int64_t seqlen_k;
+    int64_t nhead_k;
+};
+
+PackedMhaV4Shapes validate_packed_mha_v4(const at::Tensor& q,
+                                         const at::Tensor& k,
+                                         const at::Tensor& v,
+                                         const at::Tensor& q_descale,
+                                         const at::Tensor& k_descale,
+                                         const at::Tensor& v_descale,
+                                         const at::Tensor& out,
+                                         int64_t q_format,
+                                         int64_t k_format,
+                                         int64_t v_format,
+                                         int64_t q_scale_mode,
+                                         int64_t k_scale_mode,
+                                         int64_t v_scale_mode)
 {
     TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda() && out.is_cuda(),
                 "Q, K, V, and out must be GPU tensors");
@@ -248,22 +373,24 @@ void fmha_v4_fwd(const at::Tensor& q,
                     out.stride(-1) == 1,
                 "Q, K, V, and out must have contiguous last dimensions");
 
-    const int64_t batch        = q.size(0);
-    const int64_t seqlen_q     = q.size(1);
-    const int64_t nhead_q      = q.size(2);
-    const int64_t seqlen_k     = k.size(1);
-    const int64_t nhead_k      = k.size(2);
+    PackedMhaV4Shapes shapes{};
+    shapes.batch        = q.size(0);
+    shapes.seqlen_q     = q.size(1);
+    shapes.nhead_q      = q.size(2);
+    shapes.seqlen_k     = k.size(1);
+    shapes.nhead_k      = k.size(2);
     const int64_t packed_width = q_format == format_id(AttentionFormat::Fp6E2M3) ? 96 :
                                  q_format == format_id(AttentionFormat::Fp4E2M1) ? 64 : 128;
 
-    TORCH_CHECK(batch > 0 && seqlen_q > 0 && seqlen_k > 0 && nhead_q > 0,
+    TORCH_CHECK(shapes.batch > 0 && shapes.seqlen_q > 0 && shapes.seqlen_k > 0 &&
+                    shapes.nhead_q > 0,
                 "MHA v4 requires non-empty inputs");
-    TORCH_CHECK(k.size(0) == batch && v.size(0) == batch, "Q, K, and V batch sizes must match");
-    TORCH_CHECK(nhead_k > 0 && v.size(2) == nhead_k,
+    TORCH_CHECK(k.size(0) == shapes.batch && v.size(0) == shapes.batch, "Q, K, and V batch sizes must match");
+    TORCH_CHECK(shapes.nhead_k > 0 && v.size(2) == shapes.nhead_k,
                 "MHA v4 requires matching non-empty K and V head dimensions");
-    TORCH_CHECK(nhead_q % nhead_k == 0,
+    TORCH_CHECK(shapes.nhead_q % shapes.nhead_k == 0,
                 "MHA v4 requires query heads to be divisible by KV heads");
-    const int64_t gqa_ratio = nhead_q / nhead_k;
+    const int64_t gqa_ratio = shapes.nhead_q / shapes.nhead_k;
     TORCH_CHECK(gqa_ratio <= 16 && (gqa_ratio & (gqa_ratio - 1)) == 0,
                 "MHA v4 supports power-of-two GQA ratios up to 16");
     TORCH_CHECK(k.size(1) == v.size(1), "K and V sequence lengths must match");
@@ -272,15 +399,16 @@ void fmha_v4_fwd(const at::Tensor& q,
     TORCH_CHECK(v.size(3) == kHeadDim, "V must have logical head dimension 128");
     if(q_format == format_id(AttentionFormat::Fp4E2M1))
     {
-        const int64_t tiles       = (seqlen_k + 127) / 128;
+        const int64_t tiles       = (shapes.seqlen_k + 127) / 128;
         const int64_t head_stride = tiles * 8192;
-        TORCH_CHECK(k.stride(0) == nhead_k * head_stride && k.stride(1) == 64 &&
+        TORCH_CHECK(k.stride(0) == shapes.nhead_k * head_stride && k.stride(1) == 64 &&
                         k.stride(2) == head_stride,
                     "MXFP4 K must use the coalesced MHA v4 tile layout");
     }
     TORCH_CHECK(out.scalar_type() == at::ScalarType::BFloat16,
                 "MHA v4 currently supports BF16 output only");
-    TORCH_CHECK(out.sizes() == torch::IntArrayRef({batch, seqlen_q, nhead_q, kHeadDim}),
+    TORCH_CHECK(out.sizes() == torch::IntArrayRef(
+                    {shapes.batch, shapes.seqlen_q, shapes.nhead_q, kHeadDim}),
                 "out must have shape [batch, query_length, query_heads, 128]");
 
     const bool mx_qk_format = q_format == format_id(AttentionFormat::Fp6E2M3) ||
@@ -301,9 +429,11 @@ void fmha_v4_fwd(const at::Tensor& q,
         TORCH_CHECK(q_descale.scalar_type() == at::ScalarType::Byte &&
                         k_descale.scalar_type() == at::ScalarType::Byte,
                     "MX Q/K descales must be uint8 E8M0 tensors");
-        TORCH_CHECK(q_descale.sizes() == torch::IntArrayRef({batch, seqlen_q, nhead_q, 4}),
+        TORCH_CHECK(q_descale.sizes() == torch::IntArrayRef(
+                        {shapes.batch, shapes.seqlen_q, shapes.nhead_q, 4}),
                     "MX Q descale must have shape [batch, query_length, query_heads, 4]");
-        TORCH_CHECK(k_descale.sizes() == torch::IntArrayRef({batch, seqlen_k, nhead_k, 4}),
+        TORCH_CHECK(k_descale.sizes() == torch::IntArrayRef(
+                        {shapes.batch, shapes.seqlen_k, shapes.nhead_k, 4}),
                     "MX K descale must have shape [batch, key_length, key_heads, 4]");
     }
     else
@@ -322,17 +452,19 @@ void fmha_v4_fwd(const at::Tensor& q,
     }
     else if(mx_v)
     {
-        const int64_t tiles = (seqlen_k + 127) / 128;
+        const int64_t tiles = (shapes.seqlen_k + 127) / 128;
         TORCH_CHECK(v_scale_mode == 5 && v_descale.scalar_type() == at::ScalarType::Byte,
                     "MX V descale must use uint8 E8M0 per-1x32 scales");
-        TORCH_CHECK(v_descale.sizes() == torch::IntArrayRef({batch, nhead_k, tiles * 512}),
+        TORCH_CHECK(v_descale.sizes() == torch::IntArrayRef(
+                        {shapes.batch, shapes.nhead_k, tiles * 512}),
                     "MX V descale must have shape [batch, key_heads, tiles * 512]");
     }
     else if(mx_qk_format)
     {
         TORCH_CHECK(v_descale.scalar_type() == at::ScalarType::Float,
                     "MX FP8 V descale must be a float32 tensor");
-        TORCH_CHECK(v_descale.sizes() == torch::IntArrayRef({batch, nhead_k, kHeadDim}),
+        TORCH_CHECK(v_descale.sizes() == torch::IntArrayRef(
+                        {shapes.batch, shapes.nhead_k, kHeadDim}),
                     "MX V descale must have shape [batch, key_heads, 128]");
     }
     else
@@ -341,10 +473,43 @@ void fmha_v4_fwd(const at::Tensor& q,
                     "INT8/FP8 V descale must be a float32 tensor");
         TORCH_CHECK(v_descale.numel() == 1, "INT8/FP8 V descale must be a scalar tensor");
     }
+    return shapes;
+}
+
+} // namespace
+
+void fmha_v4_fwd(const at::Tensor& q,
+                 const at::Tensor& k,
+                 const at::Tensor& v,
+                 const at::Tensor& q_descale,
+                 const at::Tensor& k_descale,
+                 const at::Tensor& v_descale,
+                 at::Tensor out,
+                 int64_t q_format,
+                 int64_t k_format,
+                 int64_t v_format,
+                 int64_t q_scale_mode,
+                 int64_t k_scale_mode,
+                 int64_t v_scale_mode,
+                 double softmax_scale)
+{
+    const auto shapes = validate_packed_mha_v4(q,
+                                               k,
+                                               v,
+                                               q_descale,
+                                               k_descale,
+                                               v_descale,
+                                               out,
+                                               q_format,
+                                               k_format,
+                                               v_format,
+                                               q_scale_mode,
+                                               k_scale_mode,
+                                               v_scale_mode);
 
     const auto arch = get_gpu_arch();
     const auto& cfg = find_config(
-        arch, q_format, k_format, v_format, q_scale_mode, k_scale_mode, v_scale_mode);
+        arch, q_format, k_format, v_format, q_scale_mode, k_scale_mode, v_scale_mode, /*mode=*/0);
 
     FmhaV4Kernarg args{};
     args.ptr_o.value         = out.data_ptr();
@@ -405,12 +570,117 @@ void fmha_v4_fwd(const at::Tensor& q,
     });
 
     size_t arg_size = sizeof(args);
-    const int gdx   = (seqlen_q + cfg.ts_qo - 1) / cfg.ts_qo;
-    const int gdy   = nhead_q;
-    const int gdz   = batch;
+    const int gdx   = (shapes.seqlen_q + cfg.ts_qo - 1) / cfg.ts_qo;
+    const int gdy   = shapes.nhead_q;
+    const int gdz   = shapes.batch;
     const HipDeviceGuard device_guard{q.get_device()};
     const hipStream_t stream = at::hip::getCurrentHIPStream();
     kernel.launch_kernel({&args, &arg_size, gdx, gdy, gdz, 512, 1, 1, stream});
+}
+
+void fmha_v4_fwd_sparse(const at::Tensor& q,
+                        const at::Tensor& k,
+                        const at::Tensor& v,
+                        const at::Tensor& q_descale,
+                        const at::Tensor& k_descale,
+                        const at::Tensor& v_descale,
+                        at::Tensor out,
+                        int64_t q_format,
+                        int64_t k_format,
+                        int64_t v_format,
+                        int64_t q_scale_mode,
+                        int64_t k_scale_mode,
+                        int64_t v_scale_mode,
+                        double softmax_scale,
+                        const at::Tensor& kv_block_indices,
+                        const at::Tensor& lut_start,
+                        const at::Tensor& lut_count)
+{
+    const auto shapes = validate_packed_mha_v4(q,
+                                               k,
+                                               v,
+                                               q_descale,
+                                               k_descale,
+                                               v_descale,
+                                               out,
+                                               q_format,
+                                               k_format,
+                                               v_format,
+                                               q_scale_mode,
+                                               k_scale_mode,
+                                               v_scale_mode);
+    TORCH_CHECK(shapes.seqlen_k % 128 == 0,
+                "sorted-sparse MHA v4 requires key length padded to a multiple of 128");
+
+    const auto arch = get_gpu_arch();
+    const auto& cfg = find_config(
+        arch, q_format, k_format, v_format, q_scale_mode, k_scale_mode, v_scale_mode, /*mode=*/1);
+
+    const int64_t q_tiles  = (shapes.seqlen_q + cfg.ts_qo - 1) / cfg.ts_qo;
+    const int64_t kv_tiles = (shapes.seqlen_k + cfg.ts_kv - 1) / cfg.ts_kv;
+    const int64_t lut_rows = shapes.batch * shapes.nhead_q * q_tiles;
+    TORCH_CHECK(kv_block_indices.is_cuda() && lut_start.is_cuda() && lut_count.is_cuda(),
+                "LUT tensors must be GPU tensors");
+    TORCH_CHECK(kv_block_indices.device() == q.device() && lut_start.device() == q.device() &&
+                    lut_count.device() == q.device(),
+                "LUT tensors must be on the same GPU as Q");
+    TORCH_CHECK(kv_block_indices.scalar_type() == at::ScalarType::Int &&
+                    lut_start.scalar_type() == at::ScalarType::Int &&
+                    lut_count.scalar_type() == at::ScalarType::Int,
+                "LUT tensors must be int32");
+    TORCH_CHECK(lut_start.numel() == lut_rows && lut_count.numel() == lut_rows,
+                "lut_start and lut_count must have one entry per (batch, head, query tile); "
+                "expected ",
+                lut_rows,
+                " for tile geometry ",
+                cfg.ts_qo,
+                "x",
+                cfg.ts_kv,
+                " (",
+                q_tiles,
+                " x ",
+                kv_tiles,
+                ")");
+    TORCH_CHECK(kv_block_indices.dim() == 1 && lut_start.dim() == 1 && lut_count.dim() == 1,
+                "LUT tensors must be 1-D");
+
+    const auto kv_idx = kv_block_indices.contiguous();
+    const auto start  = lut_start.contiguous();
+    const auto count  = lut_count.contiguous();
+    auto work_table   = build_sorted_work_table(count, shapes.batch, shapes.nhead_q, q_tiles);
+
+    FmhaV4SparseSortedKernarg args{};
+    populate_dense_kernarg(args.dense,
+                           q,
+                           k,
+                           v,
+                           q_descale,
+                           k_descale,
+                           v_descale,
+                           out,
+                           cfg,
+                           shapes.seqlen_q,
+                           shapes.seqlen_k,
+                           shapes.nhead_q,
+                           softmax_scale);
+    args.ptr_kv_block_indices.value = kv_idx.data_ptr();
+    args.ptr_lut_start.value        = start.data_ptr();
+    args.ptr_lut_count.value        = count.data_ptr();
+    args.ptr_work_table.value       = work_table.data_ptr();
+    args.s_num_wgs                  = static_cast<uint32_t>(lut_rows);
+    args.s_total_tiles              = static_cast<uint32_t>(lut_rows);
+
+    static SynchronizedCache<std::string, AiterAsmKernel> kernels;
+    const std::string cache_key = arch + "|" + cfg.knl_name + "|" + cfg.co_name;
+    auto& kernel = kernels.get_or_create(cache_key, [&]() {
+        return AiterAsmKernel(cfg.knl_name.c_str(), cfg.co_name.c_str());
+    });
+
+    size_t arg_size              = sizeof(args);
+    const HipDeviceGuard device_guard{q.get_device()};
+    const hipStream_t stream     = at::hip::getCurrentHIPStream();
+    kernel.launch_kernel(
+        {&args, &arg_size, static_cast<int>(lut_rows), 1, 1, 512, 1, 1, stream});
 }
 
 } // namespace torch_itfs
