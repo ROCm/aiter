@@ -214,6 +214,21 @@ def flydsl_mxscale_preshuffle_gemm(
 _TUNED_CACHE = {}
 
 
+def _padded_m(M: int, gl: int) -> int:
+    """The M bucket the tuner sweeps at, for granularity level ``gl``.
+    gl=0 is the fine-grained bucket; gl=1 rounds to the next power of two.
+    """
+    if gl == 0:
+        if M <= 256:
+            return (M + 15) // 16 * 16
+        if M <= 1024:
+            return (M + 31) // 32 * 32
+        if M <= 4096:
+            return (M + 63) // 64 * 64
+        return (M + 127) // 128 * 128
+    return 1 << (M - 1).bit_length() if M > 1 else 1
+
+
 def _lookup_tuned(M, N, K, a_dtype, b_dtype, tuned_file=None):
     """Look up a tuned row keyed by (gfx, cu_num, M, N, K, a_dtype, b_dtype)."""
     import pandas as pd
@@ -235,20 +250,56 @@ def _lookup_tuned(M, N, K, a_dtype, b_dtype, tuned_file=None):
     tbl = _TUNED_CACHE[tf]
     if not tbl:
         return None
-    return tbl.get((get_gfx(), get_cu_num(), M, N, K, a_dtype, b_dtype))
+    gfx, cu_num = get_gfx(), get_cu_num()
+    for gl in (None, 0, 1):
+        m = M if gl is None else _padded_m(M, gl)
+        cfg = tbl.get((gfx, cu_num, m, N, K, a_dtype, b_dtype))
+        if cfg is not None:
+            return cfg
+    return None
+
+
+_HEURISTIC_MIN_TILE_N = 32
+
+
+@functools.lru_cache(maxsize=1024)
+def _warn_untuned(M, N, K, a_dtype, b_dtype, kernel_name):
+    from aiter import logger
+
+    logger.warning(
+        f"[flydsl mxpsh] no tuned row for M={M} N={N} K={K} {a_dtype}/{b_dtype}; "
+        f"falling back to the heuristic tile '{kernel_name}'. It picks a grid that "
+        f"fills the CUs, but nothing about this shape was measured -- tune it with "
+        f"aiter/ops/flydsl/gemm_tune/tune_mxscale_preshuffle.py."
+    )
 
 
 @functools.lru_cache(maxsize=1024)
 def _heuristic_tile(a_dtype, b_dtype, M, N, K):
+    from aiter.jit.utils.chip_info import get_cu_num
+
     from .gemm_tune.flydsl_gemm_mxscale_preshuffle_common import candidates_for
 
     cands = [ki for _, ki in candidates_for(a_dtype, b_dtype, M, N, K, "gfx950")]
     if not cands:
         return None
+
+    def _wg(ki):
+        return -(-M // ki.tile_m) * (N // ki.tile_n) * ki.split_k
+
+    pool = [ki for ki in cands if ki.tile_n >= _HEURISTIC_MIN_TILE_N] or cands
+    filled = [ki for ki in pool if _wg(ki) >= get_cu_num()]
+    if filled:
+        pool = filled
+    else:  # N too narrow, or split-K legality leaves nothing that fills the CUs
+        best_wg = max(_wg(ki) for ki in pool)
+        pool = [ki for ki in pool if _wg(ki) == best_wg]
+
     target_m = min(max((M + 31) // 32 * 32, 32), 128)
     return max(
-        cands,
+        pool,
         key=lambda ki: (
+            -ki.split_k,
             ki.tile_k,
             ki.tile_n,
             -abs(ki.tile_m - target_m),
@@ -319,6 +370,7 @@ def gemm_mxscale_preshuffle(
                 raise ValueError(
                     f"no legal tile for M={M} N={N} K={K} {a_dtype}/{b_dtype}; pass tile_m/n/k explicitly"
                 )
+            _warn_untuned(M, N, K, a_dtype, b_dtype, ki.name)
             tile_m, tile_n, tile_k = ki.tile_m, ki.tile_n, ki.tile_k
             if waves_per_eu is None:
                 waves_per_eu = ki.waves_per_eu
