@@ -750,9 +750,7 @@ def _tuned_bv(
         total_chunks,
         max_seq_chunks,
     )
-    return _BV_TUNED_TABLE.get(
-        (get_gfx_runtime(), get_cu_num(), *shape_key)
-    )
+    return _BV_TUNED_TABLE.get((get_gfx_runtime(), get_cu_num(), *shape_key))
 
 
 _INT32_ATTR = "_flydsl_int32_view"
