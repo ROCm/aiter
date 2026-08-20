@@ -286,6 +286,13 @@ class TestTunePipeline(unittest.TestCase):
                 "timeout": 1800,
                 "timeout_mp1": 2400,
             },
+            "a6w6_blockscale": {
+                "script": "csrc/gemm_a6w6/gemm_a6w6_tune.py",
+                "header": ["M", "N", "K"],
+                "shapes": [(512, 5120, 5120)],
+                "keys": ["M", "N", "K"],
+                "timeout": 300,
+            },
             "csrc_bf16": {
                 "script": "csrc/gemm_a16w16/gemm_a16w16_tune.py",
                 "header": [
@@ -503,6 +510,12 @@ class TestTunePipeline(unittest.TestCase):
 
     def test_fmoe_mp_default(self):
         self._run_one("fmoe", mp=None)
+
+    def test_a6w6_blockscale_mp1(self):
+        self._run_one("a6w6_blockscale", mp=1)
+
+    def test_a6w6_blockscale_mp_default(self):
+        self._run_one("a6w6_blockscale", mp=None)
 
     def test_csrc_bf16_mp1(self):
         self._run_one("csrc_bf16", mp=1)

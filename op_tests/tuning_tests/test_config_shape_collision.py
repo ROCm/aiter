@@ -53,6 +53,7 @@ AITER_ROOT = os.path.dirname(
 # runtime; the merge set and dedup key are resolved entirely by get_config_file.
 FAMILIES = [
     ("AITER_CONFIG_GEMM_A4W4", "a4w4_blockscale_tuned_gemm"),
+    ("AITER_CONFIG_GEMM_A6W6", "a6w6_blockscale_tuned_gemm"),
     ("AITER_CONFIG_GEMM_A8W8", "a8w8_tuned_gemm"),
     ("AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE", "a8w8_bpreshuffle_tuned_gemm"),
     ("AITER_CONFIG_GEMM_A8W8_BLOCKSCALE", "a8w8_blockscale_tuned_gemm"),
@@ -180,6 +181,9 @@ class TestConfigShapeCollision(unittest.TestCase):
 
     def test_a4w4_blockscale(self):
         self._check_family("AITER_CONFIG_GEMM_A4W4", "a4w4_blockscale_tuned_gemm")
+
+    def test_a6w6_blockscale(self):
+        self._check_family("AITER_CONFIG_GEMM_A6W6", "a6w6_blockscale_tuned_gemm")
 
     def test_a8w8(self):
         self._check_family("AITER_CONFIG_GEMM_A8W8", "a8w8_tuned_gemm")
