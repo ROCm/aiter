@@ -237,38 +237,83 @@ def test_fused_pipeline(H, Hg, seq_lens):
 
 
 # --------------------------------------------------------------------------- #
-# Fusion-selection heuristic (fill64 >= 0.5)
+# Fused selection rules (both closed-form): H*N variant rule + fill>=0.45 routing
 # --------------------------------------------------------------------------- #
+def test_fused_variant_hn_rule():
+    """``select_fused_variant`` is the H*N tile rule: <=32 bv16, <=64 bv32, else
+    bv64w8 (gate/is_varlen do not affect the pick); None only if BV illegal."""
+    from aiter.ops.flydsl.kernels.chunk_gated_delta_h_gfx942 import (
+        select_fused_variant,
+    )
+
+    V = 128  # all BVs legal
+    # (H, N, expected tag) spanning both sides of the 32 and 64 boundaries.
+    cases = [
+        (4, 1, "bv16"), (32, 1, "bv16"), (8, 4, "bv16"),   # H*N <= 32
+        (8, 8, "bv32"), (16, 4, "bv32"), (12, 4, "bv32"),  # 32 < H*N <= 64
+        (16, 8, "bv64w8"), (96, 1, "bv64w8"), (24, 4, "bv64w8"),  # H*N > 64
+    ]
+    for H, N, exp in cases:
+        for gate in ("g", "gk"):  # gate must not change the pick
+            got = select_fused_variant(
+                gate=gate, H=H, N=N, V=V, is_varlen=(N > 1)
+            )
+            assert got == exp, (
+                f"H={H} N={N} H*N={H * N} gate={gate}: got {got}, want {exp}"
+            )
+    # Legality fallback: bv64w8 needs a legal BV=64; V=16 makes it illegal.
+    assert select_fused_variant(gate="g", H=96, N=8, V=16, is_varlen=True) is None
+
+
 def test_fused_selection_heuristic():
-    """``should_use_fused_gfx942`` matches the fill64 = 2*N*H/CU >= 0.5 rule."""
+    """``should_use_fused_gfx942`` fuses iff ceil(V/BV_run)*N*H/CU >= 0.45, with
+    BV_run from the same H*N variant rule the launcher uses."""
+    import math
     from aiter.ops.flydsl.linear_attention_prefill_kernels import (
         should_use_fused_gfx942,
         _device_cu_count,
-        _FUSED_MIN_FILL64,
+        _FUSED_MIN_FILL,
         _ARCH,
     )
+    from aiter.ops.flydsl.kernels.chunk_gated_delta_h_gfx942 import (
+        select_fused_variant,
+    )
+    from aiter.ops.flydsl.kernels.k5_variants import _bv_of_variant
 
     if _ARCH != "gfx942":
         pytest.skip(f"fusion heuristic is gfx942-only; arch={_ARCH}")
 
+    # Pin the calibrated threshold: a silent change here would reroute shapes.
+    assert _FUSED_MIN_FILL == 0.45
+
     cu = _device_cu_count()
-    for H, N in [(24, 8), (12, 8), (24, 4), (12, 4), (4, 8), (96, 1), (12, 1)]:
-        fill64 = 2 * N * H / cu  # V=128 -> ceil(V/64)=2
-        expect = fill64 >= _FUSED_MIN_FILL64
-        got = should_use_fused_gfx942(H=H, N=N, V=128)
+    V = 128
+    # (H, N, gate); is_varlen == (N > 1).
+    for H, N, gate in [
+        (24, 8, "gk"), (12, 8, "gk"), (24, 4, "gk"), (12, 4, "gk"),
+        (4, 8, "g"), (96, 1, "gk"), (12, 1, "gk"), (8, 1, "g"),
+    ]:
+        is_varlen = N > 1
+        tag = select_fused_variant(gate=gate, H=H, N=N, V=V, is_varlen=is_varlen)
+        bv = _bv_of_variant(tag) if tag else 64
+        fill = math.ceil(V / bv) * N * H / cu
+        expect = fill >= _FUSED_MIN_FILL
+        got = should_use_fused_gfx942(
+            H=H, N=N, V=V, gate=gate, is_varlen=is_varlen
+        )
         assert got == expect, (
-            f"H={H} N={N} fill64={fill64:.2f}: got {got}, want {expect}"
+            f"H={H} N={N} {gate} bv={bv} fill={fill:.2f}: got {got}, want {expect}"
         )
 
 
 @pytest.mark.parametrize(
-    "H,Hg,seq_lens,expect_fused",
+    "H,Hg,gate,seq_lens,expect_fused",
     [
-        (24, 24, [512] * 8, True),    # fill64=1.26 -> heuristic picks fused
-        (8, 4, [512] * 4, False),     # fill64=0.21 -> heuristic picks separate
+        (24, 24, "g", [512] * 8, True),   # bv64w8 fill=2.53 -> fused
+        (8, 4, "g", [512] * 1, False),    # bv16 N=1 fill=0.21 -> separate
     ],
 )
-def test_fused_auto_routing(H, Hg, seq_lens, expect_fused):
+def test_fused_auto_routing(H, Hg, gate, seq_lens, expect_fused):
     """fusion=AUTO (with use_chunk_flydsl) routes by the heuristic, stays correct.
 
     High-fill routes to the fused kernel (matches the pure-Triton baseline within
@@ -286,8 +331,11 @@ def test_fused_auto_routing(H, Hg, seq_lens, expect_fused):
     )
 
     N = len(seq_lens)
+    is_varlen = N > 1
     if _ARCH == "gfx942":
-        assert should_use_fused_gfx942(H=H, N=N, V=128) is expect_fused, (
+        assert should_use_fused_gfx942(
+            H=H, N=N, V=128, gate=gate, is_varlen=is_varlen
+        ) is expect_fused, (
             "heuristic prediction changed; update the test expectation"
         )
 
