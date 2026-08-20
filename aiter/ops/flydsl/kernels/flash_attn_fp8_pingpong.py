@@ -181,6 +181,47 @@ def build_flash_attn_fp8_module(
     # convert instead -- see SCALED_CVT below.
     USE_BIAS_FOLD = True
 
+    # L_SPLIT_TILES (Trick 6): how many of the four 32-KV blocks have their
+    # contribution to the denominator L summed on the VALU in fp32, before the
+    # fp8 pack, instead of by a ones-column MFMA after it.  The remaining blocks
+    # keep the MFMA.  0 = all matrix (the pre-trick behaviour), 4 = all vector.
+    #
+    # Only multiples of 2 are meaningful: each ones-column MFMA contracts a
+    # K=64 slab, which is exactly two blocks (p_words[r*8:(r+1)*8] covers
+    # nt = 2r, 2r+1), so a split that is not slab-aligned would have to keep the
+    # MFMA it was trying to remove.  This is pure pipe rebalancing -- MFMA issue
+    # slots against VALU slots -- so the best value is schedule-dependent and was
+    # picked by measurement, not derivation.
+    #
+    # Measured on this schedule (B=1 S=65536 H=5 D=128, 3 runs each, median):
+    #   L_SPLIT_TILES = 0  ->  1880 TFLOPS   (all matrix)
+    #   L_SPLIT_TILES = 2  ->  1819 TFLOPS
+    #   L_SPLIT_TILES = 4  ->  1760 TFLOPS   (all vector)
+    # Monotonically worse, which is the opposite of the ASM's result (it uses
+    # 44 of 64 elements on the VALU).  The reason is the ping-pong structure:
+    # the two wave groups already interleave so that one group's ones-column
+    # MFMA issues under the other group's softmax, so those MFMAs are not on
+    # anyone's critical path and there is no MFMA pressure to relieve -- while
+    # the VALU, which the Schraudolph convert already saturates, is exactly the
+    # pipe that is contended.  The trick moves work from a free pipe to a busy
+    # one.  In a single-role schedule (the ASM's) the same move is a win.
+    #
+    # Kept in and defaulted to the best-measured split rather than removed: the
+    # accuracy side is a genuine (if small) improvement -- the vector half is
+    # taken pre-pack, so its share of L never sees the E4M3 rounding -- and the
+    # right value is a property of the schedule, so a future retune of the
+    # ping-pong phases can revisit it by changing one integer.
+    #
+    # The two partials are NOT symmetric, which is the trick's one real trap.
+    # The matrix partial is already contracted across the whole row by the MFMA.
+    # The vector partial covers only this lane's 16 KV positions; the row's other
+    # half lives in lane^32 (the accumulator's row index is hi*4 + ..., hi =
+    # lane//32), so it needs one cross-lane exchange to complete.  Shuffling the
+    # matrix partial would double-count; not shuffling the vector partial would
+    # halve L.  Both mistakes produce plausible output, so the disjointness is
+    # asserted structurally below rather than trusted.
+    L_SPLIT_TILES = 2
+
     # ---- Appendix A constants ----
     SCHRAUDOLPH_2P23 = 1 << 23  # 8388608
     # C = 127*2^23 - 486411; the offset minimizes worst-case relative error of
@@ -200,6 +241,9 @@ def build_flash_attn_fp8_module(
         assert USE_SCHRAUDOLPH, "the cap is expressed in the Schraudolph domain"
     if USE_FROZEN_MAX:
         assert USE_WATCHDOG, "a frozen max without a watchdog can overflow fp8"
+    assert L_SPLIT_TILES in (0, 2, 4), "the ones-column MFMA contracts two blocks"
+    if L_SPLIT_TILES:
+        assert USE_SCHRAUDOLPH, "the vector partial reads the Schraudolph pattern"
     if USE_BIAS_FOLD:
         # The seed *is* the Schraudolph bias, and it has to be loop-invariant to
         # be seeded before the GEMM that determines it -- see the circularity
@@ -790,6 +834,18 @@ def build_flash_attn_fp8_module(
                 w = h
             return Vec(v)[0]
 
+        def _lane_sum(v):
+            # Sum a vec<16xf32> to a scalar by a halving shuffle tree: 4 packed
+            # v_pk_add steps rather than the 15 scalar adds a chain would take.
+            w = C_F32_PER_LANE
+            while const_expr(w > 1):
+                h = w // 2
+                a = Vec(v).shuffle(Vec(v), list(range(h)))
+                b = Vec(v).shuffle(Vec(v), list(range(h, w)))
+                v = _fadd(a, b)
+                w = h
+            return Vec(v)[0]
+
         def _rowmax(s_accs, m_running):
             # Full row max: this lane's 64 scores, then the peer half of the row
             # (lane^32), then the running value.  Trick 2 pays this exactly once.
@@ -923,6 +979,8 @@ def build_flash_attn_fp8_module(
             n_groups = C_F32_PER_LANE // 4
 
             p_words = []
+            v_partial = None  # Trick 6's VALU-side partial denominator
+            rscale = None
             if const_expr(USE_SCHRAUDOLPH):
                 # Fold scale_log2e and the 2^23 / C affine into per-tile coeffs so
                 # each element's exp2 is one FMA + max + cvt_u32 (all full-rate).
@@ -942,7 +1000,6 @@ def build_flash_attn_fp8_module(
                     sx_vec = Vec.from_elements([scale_x2p23], fx.Float32).broadcast_to(
                         C_F32_PER_LANE
                     )
-                rscale = None
                 if const_expr(seeded):
                     # Trick 4: the GEMM already added (C - m), so S *is* the
                     # pattern.  The affine collapses to nothing and the softmax
@@ -987,6 +1044,16 @@ def build_flash_attn_fp8_module(
                             f32_vec_ty, arith.fptoui(i32_vec_ty, _raw(biased))
                         )
                     )
+                    if const_expr(nt < L_SPLIT_TILES):
+                        # Trick 6, vector half.  Taken pre-pack, off the f32
+                        # pattern rather than the fp8 bytes the MFMA would have
+                        # read -- so this half of L skips the E4M3 quantization
+                        # error entirely, on top of moving off the MFMA pipe.
+                        v_partial = (
+                            Vec(ps_v)
+                            if const_expr(v_partial is None)
+                            else _fadd(Vec(v_partial), Vec(ps_v))
+                        )
                     for rg in range_constexpr(n_groups):
                         p_words.append(
                             _f32x4_to_fp8_word(
@@ -1015,14 +1082,47 @@ def build_flash_attn_fp8_module(
                         ]
                         p_words.append(_f32x4_to_fp8_word(*ps))
             p_pack = Vec.from_elements(p_words, fx.Int32)
+            # Trick 6: ones-column MFMA r contracts p_words[r*8:(r+1)*8], which
+            # is exactly blocks nt = 2r and 2r+1.  So the slabs the vector half
+            # already covered are the ones with 2r < L_SPLIT_TILES, and dropping
+            # precisely those keeps the two partials disjoint and covering.
+            m_first_slab = const_expr(L_SPLIT_TILES // 2)
             p_ks_list = [
                 Vec(p_pack).shuffle(Vec(p_pack), list(range(r * 8, r * 8 + 8)))
                 for r in range_constexpr(PV_K_STEPS)
             ]
-            lr = mfma.zero_value
-            for ks in range_constexpr(PV_K_STEPS):
-                lr = mfma.call(ones_pack, p_ks_list[ks], lr)
-            p_rowsum = Vec(lr)[0]
+            m_partial = None
+            for ks in range_constexpr(m_first_slab, PV_K_STEPS):
+                m_partial = mfma.call(
+                    ones_pack,
+                    p_ks_list[ks],
+                    mfma.zero_value if const_expr(m_partial is None) else m_partial,
+                )
+
+            if const_expr(v_partial is None):
+                p_rowsum = Vec(m_partial)[0]
+            else:
+                # The asymmetry the doc warns about: the vector partial holds
+                # only this lane's KV positions, so it needs the lane^32 exchange
+                # to complete the row; the matrix partial was already contracted
+                # across lanes by the MFMA and must NOT be shuffled.
+                v_sum = _lane_sum(v_partial)
+                v_sum = _fadd(
+                    v_sum,
+                    fx.Float32(v_sum).shuffle_xor(fx.Int32(32), fx.Int32(WARP_SIZE)),
+                )
+                if const_expr(rscale is not None):
+                    # The vector half is read before the convert, so it has not
+                    # seen the watchdog's rscale division that the fp8 P (and
+                    # hence the matrix half and PV) did.  corr == 1/rscale, and
+                    # it is exactly 1.0 whenever no overflow fired, so the common
+                    # path is one fmul the scheduler can hoist away.
+                    v_sum = _fmul(v_sum, corr)
+                p_rowsum = (
+                    v_sum
+                    if const_expr(m_partial is None)
+                    else _fadd(v_sum, Vec(m_partial)[0])
+                )
             if const_expr(SOFTMAX_PRIO != 0 and set_prio):
                 rocdl.s_setprio(0)
             return m_new, corr, p_pack, p_rowsum
