@@ -179,20 +179,19 @@ _TORCH_DTYPE_FOR_SCALE = {
 # ============================================================================
 
 
-def _store_bf16_vec(vals_list, out_rsrc, row_base_bytes, idx, vec):
-    """Convert VEC fp32 values to bf16, reinterpret as i32 dwords, and store
-    via raw buffer_store. Handles VEC>8 by splitting into dwordx4 chunks.
+def _store_bf16_vec(vals, out_rsrc, row_base_bytes, idx, vec):
+    """Convert `vec` fp32 lanes to bf16, reinterpret as i32 dwords, and store
+    via raw buffer_store. Handles vec>8 by splitting into dwordx4 chunks.
 
-    ``row_base_bytes`` is byte offset to the start of this head's row within
-    the token (already token-shifted). ``idx`` is the lane id (tid).
+    ``vals`` is an fx.Vector of `vec` f32 lanes (a list of scalars is also
+    accepted). ``row_base_bytes`` is the byte offset to the start of this head's
+    row within the token (already token-shifted). ``idx`` is the lane id (tid).
     """
     i32 = T.i32
-    f32 = T.f32
-    vec_f32 = T.vec(vec, f32)
-    vec_bf16 = T.vec(vec, T.bf16)
-    raw = [v.ir_value() if hasattr(v, "ir_value") else v for v in vals_list]
-    f32v = vector.from_elements(vec_f32, raw)
-    bf16v = f32v.truncf(vec_bf16)
+    if isinstance(vals, (list, tuple)):
+        raw = [v.ir_value() if hasattr(v, "ir_value") else v for v in vals]
+        vals = fx.Vector(vector.from_elements(T.vec(vec, T.f32), raw))
+    bf16v = vals.to(fx.BFloat16)
 
     dwords = vec // 2
     bf16_as_i32 = vector.bitcast(T.vec(dwords, i32), bf16v)
@@ -1303,6 +1302,11 @@ def _build_tdm(
     eb = 2
     log2b = int(math.log2(BLOCK_THREADS))
     log2H = int(math.log2(H)) if (H & (H - 1)) == 0 else None
+    # GPT-J RoPE lane shuffles: split the VEC lanes into even/odd halves, rotate
+    # them as PAIRS-wide vectors, then interleave back ([e0,o0,e1,o1,...]).
+    EVEN = list(range(0, VEC, 2))
+    ODD = list(range(1, VEC, 2))
+    ILV = [(i // 2) if i % 2 == 0 else (PAIRS + i // 2) for i in range(VEC)]
     tile_bytes = RT * D * eb
 
     lds = SmemAllocator(
@@ -1327,7 +1331,6 @@ def _build_tdm(
         q_weight: fx.Tensor,  # [D] bf16 (dummy when not q_weighted)
         num_rows: Int32,  # T*H
     ):
-        f32 = T.f32
         i32 = T.i32
         tid = fx.thread_idx.x
         wave = fx.thread_idx.y
@@ -1348,18 +1351,20 @@ def _build_tdm(
         # this wave's VEC channels once (tid-indexed), reuse for every tile.
         def _load_qw():
             # 256-bit (v16bf16) buffer_load isn't selectable; load in 128-bit
-            # (vec8) chunks. Nested def so the AST rewriter doesn't treat the
-            # accumulator list as a loop-carried scf.for var.
+            # (vec8) chunks and concatenate.
             qw_rsrc = buffer_ops.create_buffer_resource(q_weight, max_size=True)
-            out = []
-            for c in range_constexpr(VEC // 8):
-                base_off = _to_raw(tid * VEC + (c * 8))
-                qwraw = fx.Vector(
-                    buffer_ops.buffer_load(qw_rsrc, base_off, vec_width=8, dtype=T.bf16)
+            chunks = [
+                fx.Vector(
+                    buffer_ops.buffer_load(
+                        qw_rsrc, _to_raw(tid * VEC + (c * 8)), vec_width=8, dtype=T.bf16
+                    )
                 )
-                for i in range_constexpr(8):
-                    out.append(qwraw[i].to(fx.Float32))
-            return out
+                for c in range(VEC // 8)
+            ]
+            v = chunks[0]
+            for c in range_constexpr(len(chunks) - 1):
+                v = v.shuffle(chunks[c + 1], list(range(8 * (c + 2))))
+            return v.to(fx.Float32)
 
         qw = _load_qw() if const_expr(q_weighted) else None
 
@@ -1410,16 +1415,22 @@ def _build_tdm(
             cs = pos_i32 * (RD // 2) + rope_rel * PAIRS
             if const_expr(PAIRS == 1):
                 return (
-                    [
-                        buffer_ops.buffer_load(
-                            cos_rsrc, cs, vec_width=1, dtype=T.bf16
-                        ).extf(f32)
-                    ],
-                    [
-                        buffer_ops.buffer_load(
-                            sin_rsrc, cs, vec_width=1, dtype=T.bf16
-                        ).extf(f32)
-                    ],
+                    fx.Vector.from_elements(
+                        [
+                            buffer_ops.buffer_load(
+                                cos_rsrc, cs, vec_width=1, dtype=T.bf16
+                            )
+                        ],
+                        fx.BFloat16,
+                    ).to(fx.Float32),
+                    fx.Vector.from_elements(
+                        [
+                            buffer_ops.buffer_load(
+                                sin_rsrc, cs, vec_width=1, dtype=T.bf16
+                            )
+                        ],
+                        fx.BFloat16,
+                    ).to(fx.Float32),
                 )
             craw = fx.Vector(
                 buffer_ops.buffer_load(cos_rsrc, cs, vec_width=PAIRS, dtype=T.bf16)
@@ -1427,49 +1438,37 @@ def _build_tdm(
             sraw = fx.Vector(
                 buffer_ops.buffer_load(sin_rsrc, cs, vec_width=PAIRS, dtype=T.bf16)
             )
-            cos_v = [craw[i].to(fx.Float32) for i in range(PAIRS)]
-            sin_v = [sraw[i].to(fx.Float32) for i in range(PAIRS)]
-            return cos_v, sin_v
+            return craw.to(fx.Float32), sraw.to(fx.Float32)
 
-        def compute_store(buf, tile_idx, cos_v, sin_v):
+        def compute_store(buf, tile_idx, cosv, sinv):
             my_row = arith.minsi(_to_raw(tile_idx * RT + wave), _nr_m1)
-            x = []
-            for c in range_constexpr(VEC // 8):
-                off = row_elem + (c * 8)
-                v = fx.Vector(
+            chunks = [
+                fx.Vector(
                     vector.load_op(
                         T.vec(8, T.bf16),
                         buf,
-                        [_to_raw(fx.Index(_to_raw(off)))],
+                        [_to_raw(fx.Index(_to_raw(row_elem + (c * 8))))],
                     )
                 )
-                for i in range_constexpr(8):
-                    x.append(v[i].to(fx.Float32))
-            sq = fx.Float32(0.0)
-            for vi in range_constexpr(VEC):
-                sq = sq + x[vi] * x[vi]
+                for c in range(VEC // 8)
+            ]
+            xv = chunks[0]
+            for c in range_constexpr(len(chunks) - 1):
+                xv = xv.shuffle(chunks[c + 1], list(range(8 * (c + 2))))
+            xv = xv.to(fx.Float32)
+
+            sq = (xv * xv).reduce(ReductionOp.ADD)
             for sh in range_constexpr(log2b):
                 o = BLOCK_THREADS // (2 << sh)
                 sq = sq + sq.shuffle_xor(o, BLOCK_THREADS)
             rstd = fmath.rsqrt(sq * (1.0 / D) + 1e-6)
             # RMSNorm (+ optional per-channel q_weight): (x * w) * rstd. rstd is
             # from unweighted x^2 (matches stock kernel semantics); mul commutes.
-            if const_expr(q_weighted):
-                scaled = [_to_raw(x[vi] * qw[vi] * rstd) for vi in range_constexpr(VEC)]
-            else:
-                scaled = [_to_raw(x[vi] * rstd) for vi in range_constexpr(VEC)]
-            rot = list(scaled)
-            for kk in range_constexpr(PAIRS):
-                e = scaled[2 * kk]
-                o = scaled[2 * kk + 1]
-                c = cos_v[kk]
-                s = sin_v[kk]
-                rot[2 * kk] = _to_raw(ArithValue(e) * c - ArithValue(o) * s)
-                rot[2 * kk + 1] = _to_raw(ArithValue(e) * s + ArithValue(o) * c)
-            final = [
-                ArithValue(is_rope).select(rot[i], scaled[i])
-                for i in range_constexpr(VEC)
-            ]
+            scaled = (xv * qw * rstd) if const_expr(q_weighted) else (xv * rstd)
+            ev = scaled.shuffle(scaled, EVEN)
+            od = scaled.shuffle(scaled, ODD)
+            rot = (ev * cosv - od * sinv).shuffle(ev * sinv + od * cosv, ILV)
+            final = fx.Boolean(is_rope).select(rot, scaled)
             _store_bf16_vec(final, q_out_rsrc, ArithValue(my_row) * (D * 2), tid, VEC)
 
         def fence():
@@ -1638,6 +1637,11 @@ def _build_tdm_kv(*, head_dim, rope_head_dim):
     PAIRS = VEC // 2
     R = KV_ROWS_PER_WG
     log2b = int(math.log2(BLOCK_THREADS))
+    # GPT-J RoPE lane shuffles: split the VEC lanes into even/odd halves, rotate
+    # them as PAIRS-wide vectors, then interleave back ([e0,o0,e1,o1,...]).
+    EVEN = list(range(0, VEC, 2))
+    ODD = list(range(1, VEC, 2))
+    ILV = [(i // 2) if i % 2 == 0 else (PAIRS + i // 2) for i in range(VEC)]
     name = f"qk_norm_rope_tdm_kv_D{D}_RD{RD}_w32_flydsl"
 
     @flyc.kernel(name=name, known_block_size=[BLOCK_THREADS, R, 1])
@@ -1650,7 +1654,6 @@ def _build_tdm_kv(*, head_dim, rope_head_dim):
         kv_weight: fx.Tensor,  # [D] bf16
         num_tokens: Int32,
     ):
-        f32 = T.f32
         i32 = T.i32
         tid = fx.thread_idx.x
         wave = fx.thread_idx.y
@@ -1672,71 +1675,60 @@ def _build_tdm_kv(*, head_dim, rope_head_dim):
         kv_out_rsrc = _ptr_res(kv_out)
         kw_rsrc = buffer_ops.create_buffer_resource(kv_weight, max_size=True)
 
-        row_base = tok * D + tid * VEC
-        x = []
-        w = []
-        for c in range_constexpr(VEC // 8):
-            xr = fx.Vector(
-                buffer_ops.buffer_load(
-                    kv_in_rsrc, _to_raw(row_base + (c * 8)), vec_width=8, dtype=T.bf16
+        def _load_vec(rsrc, base_elem):
+            """`VEC` bf16 -> Vector[VEC] f32. A 256-bit (v16bf16) load isn't
+            selectable, so read 128-bit (8-lane) chunks and concatenate."""
+            chunks = [
+                fx.Vector(
+                    buffer_ops.buffer_load(
+                        rsrc, _to_raw(base_elem + (c * 8)), vec_width=8, dtype=T.bf16
+                    )
                 )
-            )
-            wr = fx.Vector(
-                buffer_ops.buffer_load(
-                    kw_rsrc,
-                    _to_raw(tid * VEC + (c * 8)),
-                    vec_width=8,
-                    dtype=T.bf16,
-                )
-            )
-            for i in range_constexpr(8):
-                x.append(xr[i].to(fx.Float32))
-                w.append(wr[i].to(fx.Float32))
+                for c in range(VEC // 8)
+            ]
+            v = chunks[0]
+            # range_constexpr, not range: a bare `for` over range() in a kernel
+            # body is rewritten into a runtime scf.for, which cannot index the
+            # compile-time `chunks` list.
+            for c in range_constexpr(len(chunks) - 1):
+                v = v.shuffle(chunks[c + 1], list(range(8 * (c + 2))))
+            return v.to(fx.Float32)
+
+        xv = _load_vec(kv_in_rsrc, tok * D + tid * VEC)
+        wv = _load_vec(kw_rsrc, tid * VEC)
 
         pos_i32 = buffer_ops.buffer_load(
             pos_rsrc, _to_raw(tok), vec_width=1, dtype=T.i64
         ).trunci(i32)
         cs = pos_i32 * (RD // 2) + rope_rel * PAIRS
         if const_expr(PAIRS == 1):
-            cos_v = [
-                buffer_ops.buffer_load(cos_rsrc, cs, vec_width=1, dtype=T.bf16).extf(
-                    f32
-                )
-            ]
-            sin_v = [
-                buffer_ops.buffer_load(sin_rsrc, cs, vec_width=1, dtype=T.bf16).extf(
-                    f32
-                )
-            ]
+            cosv = fx.Vector.from_elements(
+                [buffer_ops.buffer_load(cos_rsrc, cs, vec_width=1, dtype=T.bf16)],
+                fx.BFloat16,
+            ).to(fx.Float32)
+            sinv = fx.Vector.from_elements(
+                [buffer_ops.buffer_load(sin_rsrc, cs, vec_width=1, dtype=T.bf16)],
+                fx.BFloat16,
+            ).to(fx.Float32)
         else:
-            craw = fx.Vector(
+            cosv = fx.Vector(
                 buffer_ops.buffer_load(cos_rsrc, cs, vec_width=PAIRS, dtype=T.bf16)
-            )
-            sraw = fx.Vector(
+            ).to(fx.Float32)
+            sinv = fx.Vector(
                 buffer_ops.buffer_load(sin_rsrc, cs, vec_width=PAIRS, dtype=T.bf16)
-            )
-            cos_v = [craw[i].to(fx.Float32) for i in range(PAIRS)]
-            sin_v = [sraw[i].to(fx.Float32) for i in range(PAIRS)]
+            ).to(fx.Float32)
 
-        sq = fx.Float32(0.0)
-        for vi in range_constexpr(VEC):
-            sq = sq + x[vi] * x[vi]
+        sq = (xv * xv).reduce(ReductionOp.ADD)
         for sh in range_constexpr(log2b):
             o = BLOCK_THREADS // (2 << sh)
             sq = sq + sq.shuffle_xor(o, BLOCK_THREADS)
         rstd = fmath.rsqrt(sq * (1.0 / D) + 1e-6)
-        scaled = [_to_raw(x[vi] * w[vi] * rstd) for vi in range_constexpr(VEC)]
-        rot = list(scaled)
-        for kk in range_constexpr(PAIRS):
-            e = scaled[2 * kk]
-            o = scaled[2 * kk + 1]
-            c = cos_v[kk]
-            s = sin_v[kk]
-            rot[2 * kk] = _to_raw(ArithValue(e) * c - ArithValue(o) * s)
-            rot[2 * kk + 1] = _to_raw(ArithValue(e) * s + ArithValue(o) * c)
-        final = [
-            ArithValue(is_rope).select(rot[i], scaled[i]) for i in range_constexpr(VEC)
-        ]
+
+        scaled = xv * wv * rstd
+        ev = scaled.shuffle(scaled, EVEN)
+        od = scaled.shuffle(scaled, ODD)
+        rot = (ev * cosv - od * sinv).shuffle(ev * sinv + od * cosv, ILV)
+        final = fx.Boolean(is_rope).select(rot, scaled)
         _store_bf16_vec(final, kv_out_rsrc, ArithValue(tok) * (D * 2), tid, VEC)
 
     @flyc.jit
