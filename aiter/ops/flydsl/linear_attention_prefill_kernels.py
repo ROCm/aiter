@@ -15,10 +15,7 @@ import functools
 import math
 import os
 
-# NOTE (mfma16_hip fork): ``get_rocm_arch`` is imported here for the additive
-# HIP-aligned fork below. It is side-effect-free (``flydsl`` is already a hard
-# dependency of the baseline ``compile_chunk_gated_delta_h``) and does NOT raise
-# on flydsl <0.2.0 -- the mfma16_hip-only ``>=0.2.0`` requirement is enforced
+# NOTE (mfma16_hip fork): the fork's ``>=0.2.0`` flydsl requirement is enforced
 # lazily in ``_get_or_compile_mfma16_hip`` so the baseline path keeps its
 # original ``>=0.1.8`` compatibility.
 import torch
@@ -812,7 +809,7 @@ _MFMA16_HIP_MIN_FLYDSL_VERSION = "0.2.0"
 # gfx942 gate: only the mfma16_hip fork toggles the gfx942 GEMM1 ds-scheduling
 # (SCHED_GFX942). ``get_rocm_arch()`` may return a feature-suffixed string like
 # ``gfx942:sramecc+:xnack-``; normalize before matching.
-_IS_GFX942 = get_rocm_arch().split(":")[0].startswith("gfx942")
+_IS_GFX942 = _ARCH.split(":")[0].startswith("gfx942")
 
 _INT32_ATTR = "_flydsl_int32_view"
 _PROLOGUE_ATTR = "_flydsl_prologue_cache"

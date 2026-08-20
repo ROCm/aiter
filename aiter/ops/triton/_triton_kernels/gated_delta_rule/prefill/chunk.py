@@ -328,28 +328,6 @@ def chunk_gated_delta_rule_fwd_opt_vk(
         )
     fusion = K5K6Fusion.coerce(fusion)
 
-    # Using fusion requires that we have opted for the FlyDSL chunk backend.
-    if use_chunk_flydsl:
-        if fusion is K5K6Fusion.ALWAYS:
-            use_chunk_flydsl_fused = True
-        elif fusion is K5K6Fusion.AUTO:
-            from aiter.ops.flydsl.linear_attention_prefill_kernels import (
-                should_use_fused_gfx942,
-            )
-
-            _N = (
-                len(cu_seqlens) - 1 - num_decodes
-                if cu_seqlens is not None
-                else v.shape[0]
-            )
-            use_chunk_flydsl_fused = should_use_fused_gfx942(
-                H=v.shape[2], N=_N, V=v.shape[-1]
-            )
-        else:
-            use_chunk_flydsl_fused = False
-    else:
-        use_chunk_flydsl_fused = False
-
     if cu_seqlens is None:
         if seq_lens_cpu is not None or prefill_metadata is not None:
             raise ValueError(
@@ -377,6 +355,29 @@ def chunk_gated_delta_rule_fwd_opt_vk(
                 "use_chunk_flydsl requires bfloat16 inputs with K=128 and V=128; "
                 f"got dtype={k.dtype}, K={k.shape[-1]}, V={v.shape[-1]}."
             )
+
+    # Fusion is resolved *after* the fallbacks above so that an arch that turned
+    # ``use_chunk_flydsl`` off cannot leave the fused flag stranded at True.
+    if use_chunk_flydsl:
+        if fusion is K5K6Fusion.ALWAYS:
+            use_chunk_flydsl_fused = True
+        elif fusion is K5K6Fusion.AUTO:
+            from aiter.ops.flydsl.linear_attention_prefill_kernels import (
+                should_use_fused_gfx942,
+            )
+
+            _N = (
+                len(cu_seqlens) - 1 - num_decodes
+                if cu_seqlens is not None
+                else v.shape[0]
+            )
+            use_chunk_flydsl_fused = should_use_fused_gfx942(
+                H=v.shape[2], N=_N, V=v.shape[-1]
+            )
+        else:
+            use_chunk_flydsl_fused = False
+    else:
+        use_chunk_flydsl_fused = False
 
     if use_prepare_flydsl:
         from aiter.ops.flydsl.linear_attention_prefill_kernels import (
@@ -497,12 +498,16 @@ def chunk_gated_delta_rule_fwd_opt_vk(
                 "FlyDSL K5 does not support overriding `snapshot_dtype`; "
                 "omit it or pass `k.dtype`."
             )
-        # Prepare emits head-major ``g_cumsum``.
+        # FlyDSL K5 wrapper expects ``g`` in head-major [B, H, T] layout
+        # (matches Triton VK / HIP). ``g_cumsum`` from K1+K2 (or from the fused
+        # FlyDSL prepare) is already head-major, so pass it through directly.
+        # The wrapper accepts ``use_exp2`` as a kwarg and pre-scales ``gk``
+        # internally, and selects the tuned gfx942 K5 build on gfx942.
         from aiter.ops.flydsl.linear_attention_prefill_kernels import (
-            chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip,
+            chunk_gated_delta_rule_fwd_h_flydsl,
         )
 
-        h, v_new, final_state = chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(
+        h, v_new, final_state = chunk_gated_delta_rule_fwd_h_flydsl(
             k=k,
             w=w,
             u=u,
@@ -514,7 +519,6 @@ def chunk_gated_delta_rule_fwd_opt_vk(
             use_exp2=use_exp2,
             num_decodes=num_decodes,
             num_decode_tokens=num_decode_tokens,
-            g_head_major=True,
             prefill_metadata=prefill_metadata,
         )
     else:
