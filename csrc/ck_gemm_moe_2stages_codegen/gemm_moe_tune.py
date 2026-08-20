@@ -6110,9 +6110,15 @@ class Mxfp4FlydslTuner(FmoeTuner):
         "gemm2_a4w4_port_",
     )
     TUNE_STAGES: ClassVar[tuple[str, ...]] = ("auto", "both", "gemm1", "gemm2")
-    # Sweep the BN64 GEMM1 tile. Off by default: legal and correct, but slower
-    # on every shape measured so far -- see _g1_bns for the numbers.
+    # Sweep the BN64 GEMM1 tile above the decode tail. Off by default there:
+    # legal and correct, but slower on every large shape measured -- see
+    # _g1_bns for the numbers.
     G1_TRY_BN64: ClassVar[bool] = bool(int(os.environ.get("AITER_G1_TRY_BN64", "0")))
+    # ...but always swept below this token count, where BN64 is the only tile
+    # that reaches the two-wave specialization and measurably wins.
+    G1_BN64_TOKEN_BOUND: ClassVar[int] = int(
+        os.environ.get("AITER_G1_BN64_TOKEN_BOUND", "8")
+    )
     # Extra --timeout headroom for the first candidate of a shape, which pays the
     # one-time MXFP4 JIT module build (240 aux instances) on a cold cache.
     JIT_BUILD_GRACE_SECONDS: ClassVar[int] = 1800
@@ -6278,11 +6284,28 @@ class Mxfp4FlydslTuner(FmoeTuner):
         crossover is between BN128 and BN256 (BN128 wins at inter=768), not
         down at 64. Enable ``G1_TRY_BN64`` to sweep it on a shape where the
         N-tile count really is the binding constraint.
+
+        Those numbers are all tok>=256 at the four-wave default, and they do
+        not carry to the decode tail. BN64 is the only tile that unlocks the
+        two-wave specialization (see ``_g1_num_waves``), and within BN64 the
+        wave count dominates the tile choice. minimax_m3 on gfx950, GEMM1 us,
+        median of 2x20 rocprofv3 dispatches:
+
+            inter=384 tok=1  w4+kw2 10.44  w2+kw2 8.78  w2+kw4 6.92
+            inter=384 tok=2  w4+kw2 10.06  w2+kw2 8.73  w2+kw4 7.33
+            inter=768 tok=1  w4+kw2 10.17  w2+kw2 8.54  w2+kw4 7.47
+
+        w2+kw4 is 1.36-1.51x over the best candidate the sweep could reach
+        before, and takes GEMM1 from 2.31x to 1.53x of the registry kernel at
+        inter=384 tok=1. A full 32-shape sweep picked BN64 only at tok<8 and
+        BN128/BN256 everywhere above, so BN64 is swept unconditionally below
+        that bound and stays behind the flag above it.
         """
         bns = [128, 256]
         n_out = 2 * int(row["inter_dim"])
+        small_token = int(row["token"]) < cls.G1_BN64_TOKEN_BOUND
         if (
-            cls.G1_TRY_BN64
+            (cls.G1_TRY_BN64 or small_token)
             and bm == 32
             and not inline_quant
             and not interleave
@@ -6292,12 +6315,37 @@ class Mxfp4FlydslTuner(FmoeTuner):
         return tuple(bn for bn in bns if n_out % bn == 0)
 
     @staticmethod
-    def _g1_k_waves(row, bm, inline_quant, interleave, bk=256):
+    def _g1_num_waves(bm, bn, inline_quant, interleave):
+        """Legal ``num_waves`` values for one GEMM1 candidate.
+
+        Mirrors ``mxfp4_gemm1_kernels._assert_supported``: the kernel takes
+        num_waves in (2, 4) and restricts the two-wave specialization to the
+        effective BN64 tile, which is itself BM32 A4W4 non-inline separated.
+
+        The axis matters because ``N_REPS = BN // (num_waves * 16)``. At BN64
+        the four-wave form leaves every wave a single 16-column MFMA slice and
+        still spends 8 waves per workgroup (num_waves * k_wave); two waves give
+        each wave 32 columns and halve the workgroup, which is what the
+        decode-sized shapes want. It also raises the k_wave ceiling, since the
+        kernel's real bound is num_waves * k_wave <= 8.
+        """
+        if bn == 64 and bm == 32 and not inline_quant and not interleave:
+            return (2, 4)
+        return (4,)
+
+    @staticmethod
+    def _g1_k_waves(row, bm, inline_quant, interleave, bk=256, num_waves=4):
         """Legal ``k_wave`` values for one GEMM1 candidate.
 
         k_wave splits the K loop across waves. Mirrors the kernel's guards in
         mxfp4_gemm1_kernels._get_compiled_mxfp4_gemm1_port so the sweep does not
         spend a launch on a combination that raises NotImplementedError.
+
+        The wave budget is ``num_waves * k_wave <= 8``, so k_wave=4 is only
+        reachable from the two-wave specialization. This used to be hardcoded
+        as ``4 * kw <= 8``, which silently capped every candidate at k_wave=2
+        and made the (num_waves=2, k_wave=4) combination unreachable -- the one
+        that wins the decode tail.
         """
         if bm != 32 or inline_quant or interleave:
             return (1,)
@@ -6305,7 +6353,8 @@ class Mxfp4FlydslTuner(FmoeTuner):
         return tuple(
             kw
             for kw in (1, 2, 4)
-            if kw == 1 or (k_tiles % kw == 0 and k_tiles // kw >= 2 and 4 * kw <= 8)
+            if kw == 1
+            or (k_tiles % kw == 0 and k_tiles // kw >= 2 and num_waves * kw <= 8)
         )
 
     @staticmethod
@@ -6552,6 +6601,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
                 act=act,
                 interleave=interleave,
                 enable_bias=act == "swiglu",
+                num_waves=num_waves,
                 k_wave=k_wave,
             )
             for _, use_nt, inline_quant in sorted(
@@ -6560,7 +6610,11 @@ class Mxfp4FlydslTuner(FmoeTuner):
             for bn in self._g1_bns(row, bm, inline_quant, False)
             for interleave in self._a4w4_interleave_options(bn)
             for xcd_swizzle in self.XCD_SWIZZLES
-            for k_wave in self._g1_k_waves(row, bm, inline_quant, interleave)
+            # num_waves gates the k_wave ceiling, so it has to bind first.
+            for num_waves in self._g1_num_waves(bm, bn, inline_quant, interleave)
+            for k_wave in self._g1_k_waves(
+                row, bm, inline_quant, interleave, num_waves=num_waves
+            )
         ]
 
     @staticmethod
