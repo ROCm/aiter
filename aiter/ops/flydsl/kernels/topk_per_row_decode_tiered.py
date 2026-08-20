@@ -142,7 +142,7 @@ def create_topk_per_row_decode_tiered_kernel(
     tiered_mid_cap: int = 16,
     tiered_mid_max: int = 65536,
     tiered_long_cap: int = 32,
-    mask_non_finite: bool = True,
+    mask_non_finite: bool = False,
     row_proportional_parts: bool = False,
     early_stop: bool = False,
 ) -> Any:
@@ -162,7 +162,9 @@ def create_topk_per_row_decode_tiered_kernel(
     tiered_mid_max: short_max < row_len <= this -> mid tier; longer -> long tier.
     tiered_mid_cap / tiered_long_cap: max cooperating workgroups per row in the mid /
         long tier (clamped to blocks_per_row).
-    mask_non_finite: clamp inf/NaN to -inf so they never rank into the top-k.
+    mask_non_finite: clamp inf/NaN to -inf so they never rank into the top-k. Off
+        by default, which ranks them by their raw twiddled bits the way torch.topk
+        and the HIP kernel do; a direct caller has to ask for the divergence.
     """
     short_max = tiered_short_max
     mid_cap = tiered_mid_cap
