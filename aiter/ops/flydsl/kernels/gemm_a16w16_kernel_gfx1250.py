@@ -18,6 +18,15 @@ KERNARG_PRELOAD_COUNT = 8
 SCOPE_DEV = 16
 
 
+def _flydsl_aux_is_attr() -> bool:
+    from importlib.metadata import version
+
+    return tuple(int(x) for x in version("flydsl").split(".")[:3]) >= (0, 3, 1)
+
+
+_AUX_IS_ATTR = _flydsl_aux_is_attr()
+
+
 def _byte_off_i32(elem_off, elem_bytes):
     return (fx.Int32(elem_off) * elem_bytes).ir_value()
 
@@ -507,21 +516,38 @@ def compile_gemm_a16w16(
                                     ],
                                     _out_num,
                                 ).ir_value()
-                                rocdl.raw_ptr_buffer_atomic_fadd(
-                                    pair_vec,
-                                    y_rsrc,
-                                    fx.Int32(c_off_bytes + pair * 4).ir_value(),
-                                    zero_i32,
-                                    dev_scope,
-                                )
+                                if const_expr(_AUX_IS_ATTR):
+                                    rocdl.raw_ptr_buffer_atomic_fadd(
+                                        pair_vec,
+                                        y_rsrc,
+                                        fx.Int32(c_off_bytes + pair * 4).ir_value(),
+                                        zero_i32,
+                                        aux=SCOPE_DEV,
+                                    )
+                                else:
+                                    rocdl.raw_ptr_buffer_atomic_fadd(
+                                        pair_vec,
+                                        y_rsrc,
+                                        fx.Int32(c_off_bytes + pair * 4).ir_value(),
+                                        zero_i32,
+                                        dev_scope,
+                                    )
                         else:
-                            rocdl.raw_ptr_buffer_store(
-                                h_vec.bitcast(fx.Int32).ir_value(),
-                                y_rsrc,
-                                fx.Int32(c_off_bytes).ir_value(),
-                                zero_off,
-                                zero_off,
-                            )
+                            if const_expr(_AUX_IS_ATTR):
+                                rocdl.raw_ptr_buffer_store(
+                                    h_vec.bitcast(fx.Int32).ir_value(),
+                                    y_rsrc,
+                                    fx.Int32(c_off_bytes).ir_value(),
+                                    zero_off,
+                                )
+                            else:
+                                rocdl.raw_ptr_buffer_store(
+                                    h_vec.bitcast(fx.Int32).ir_value(),
+                                    y_rsrc,
+                                    fx.Int32(c_off_bytes).ir_value(),
+                                    zero_off,
+                                    zero_off,
+                                )
                     elif const_expr(split_k > 1):
                         for e in range_constexpr(8):
                             fx.ptr_store(
@@ -532,20 +558,27 @@ def compile_gemm_a16w16(
                         t_col = blk_n + warp_n_base + wn * WMMA_N + lane16
                         for e in range_constexpr(8):
                             if t_base + 2 * e < m_idx:
-                                rocdl.raw_ptr_buffer_atomic_fadd(
-                                    fx.ptr_load(
-                                        fx.add_offset(
-                                            xt, (lane_kgrp + 2 * e) * WMMA_N + lane16
-                                        )
-                                    ).ir_value(),
-                                    y_rsrc,
-                                    _byte_off_i32(
-                                        (t_base + lane_kgrp + 2 * e) * n_stride + t_col,
-                                        4,
-                                    ),
-                                    zero_i32,
-                                    dev_scope,
+                                _xt_val = fx.ptr_load(
+                                    fx.add_offset(
+                                        xt, (lane_kgrp + 2 * e) * WMMA_N + lane16
+                                    )
+                                ).ir_value()
+                                _xt_off = _byte_off_i32(
+                                    (t_base + lane_kgrp + 2 * e) * n_stride + t_col,
+                                    4,
                                 )
+                                if const_expr(_AUX_IS_ATTR):
+                                    rocdl.raw_ptr_buffer_atomic_fadd(
+                                        _xt_val,
+                                        y_rsrc,
+                                        _xt_off,
+                                        zero_i32,
+                                        aux=SCOPE_DEV,
+                                    )
+                                else:
+                                    rocdl.raw_ptr_buffer_atomic_fadd(
+                                        _xt_val, y_rsrc, _xt_off, zero_i32, dev_scope
+                                    )
                     else:
                         for half in range_constexpr(2):
                             vec4 = fx.Vector.from_elements(
@@ -556,13 +589,15 @@ def compile_gemm_a16w16(
                                 fx.Float32,
                             ).ir_value()
                             col = col_base + half * 4
-                            rocdl.raw_ptr_buffer_store(
-                                vec4,
-                                y_rsrc,
-                                _byte_off_i32(row * n_stride + col, 4),
-                                zero_off,
-                                zero_off,
-                            )
+                            _f32_off = _byte_off_i32(row * n_stride + col, 4)
+                            if const_expr(_AUX_IS_ATTR):
+                                rocdl.raw_ptr_buffer_store(
+                                    vec4, y_rsrc, _f32_off, zero_off
+                                )
+                            else:
+                                rocdl.raw_ptr_buffer_store(
+                                    vec4, y_rsrc, _f32_off, zero_off, zero_off
+                                )
 
         def _pack_state(accs_, a_, b_):
             return list(accs_) + list(a_) + list(b_)
