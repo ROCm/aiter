@@ -448,7 +448,7 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
         last two dims).
 
     BV-tile selection is rule-based on this entry; the opt entry reads
-    ``AITER_CONFIG_GDN_K5_OPT`` first. ``chunk_gdn_h_tuned.csv`` is AOT-only.
+    ``AITER_CONFIG_GDN_K5_OPT`` first.
     """
     # Layout is fixed to head-major contiguous (matches Triton VK wrapper).
     wu_contiguous = True
