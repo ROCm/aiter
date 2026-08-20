@@ -236,39 +236,78 @@ def _build_paged_kernel(
         ):
             col0 = fx.Int32(arith.index_cast(T.i32, iv))
             wave_ni_base = wave * N_TILES_PER_WAVE
-            for ni in range_constexpr(N_TILES_PER_WAVE):
-                abs_ni = wave_ni_base + ni
-                col = col0 + abs_ni * MFMA_N + lane_mod_N
-                # Clamp the gather index to a valid token (mask handles the rest).
-                col_c = fx.Int32(arith.minsi(_to_raw(col), _to_raw(ctx_m1)))
-                # KVB is a compile-time constant, so at KVB==1 the div/mod/mul
-                # fold away on their own. Deliberately no Python `if` for that
-                # case: the FlyDSL AST rewriter would turn it into a runtime
-                # scf.if and drop the branch-local addresses.
-                tok_in_block = umod(col_c, KVB)
-                ind_off = pid_batch * max_block_len + udiv(col_c, KVB)
-                physical = fx.Int32(ind_t[ind_off])
 
-                b_col = [
-                    load_pack_kv(kv_key, physical, tok_in_block, kk, lane_div_N)
-                    for kk in range_constexpr(K_STEPS)
+            def _col_for(abs_ni):
+                return col0 + abs_ni * MFMA_N + lane_mod_N
+
+            def _col_c_for(abs_ni):
+                return fx.Int32(
+                    arith.minsi(_to_raw(_col_for(abs_ni)), _to_raw(ctx_m1))
+                )
+
+            def _ind_off_for(abs_ni):
+                return pid_batch * max_block_len + udiv(_col_c_for(abs_ni), KVB)
+
+            def _tok_in_block_for(abs_ni):
+                return umod(_col_c_for(abs_ni), KVB)
+
+            def _load_physical(ind_off):
+                return fx.Int32(ind_t[ind_off])
+
+            def _prefetch_physical(physical_cur, ind_off_cur, ind_off_next):
+                same = _to_raw(ind_off_next) == _to_raw(ind_off_cur)
+                phys_raw = _to_raw(physical_cur)
+                if_op = scf.IfOp(same, results_=[T.i32], has_else=True)
+                with ir.InsertionPoint(if_op.then_block):
+                    scf.YieldOp([phys_raw])
+                with ir.InsertionPoint(if_op.else_block):
+                    scf.YieldOp([_to_raw(_load_physical(ind_off_next))])
+                return fx.Int32(if_op.results[0])
+
+            def _b_col_for_tile(physical, tok_in_block, b0_carried):
+                return [
+                    b0_carried,
+                    load_pack_kv(kv_key, physical, tok_in_block, 1, lane_div_N),
                 ]
+
+            def _process_tile_with_b0(abs_ni, physical, b0_carried):
+                col = _col_for(abs_ni)
+                tok_in_block = _tok_in_block_for(abs_ni)
+                b_col = _b_col_for_tile(physical, tok_in_block, b0_carried)
                 kv_scale = _to_raw(fx.Float32(kv_scale_v[physical, tok_in_block]))
                 if scale_mul != 1.0:
                     kv_scale = arith.MulFOp(
                         kv_scale, scale_mul_c, fastmath=fm_fast
                     ).result
-
                 col_sum = mfma_head_reduce(
                     a_pack, b_col, w_frag, kv_scale, m_tiles=M_TILES, k_steps=K_STEPS
                 )
-
-                # Only lane_div_N==0 lanes hold the MFMA_N distinct columns.
-                # Masked positions keep the caller's -inf prefill.
                 is_writer = _to_raw((lane_div_N == 0) & (col <= q_limit))
                 with ir.InsertionPoint(scf.IfOp(is_writer).then_block):
                     out_row_t[col] = fx.Float32(col_sum)
                     scf.YieldOp([])
+
+            def _prefetch_k0(abs_ni, physical):
+                return load_pack_kv(
+                    kv_key, physical, _tok_in_block_for(abs_ni), 0, lane_div_N
+                )
+
+            physical_carry = _load_physical(_ind_off_for(wave_ni_base + 0))
+            b0_carry = _prefetch_k0(wave_ni_base + 0, physical_carry)
+            for ni in range_constexpr(N_TILES_PER_WAVE):
+                abs_ni = wave_ni_base + ni
+                physical = physical_carry
+                if ni + 1 < N_TILES_PER_WAVE:
+                    abs_ni_next = wave_ni_base + ni + 1
+                    physical_carry = _prefetch_physical(
+                        physical,
+                        _ind_off_for(abs_ni),
+                        _ind_off_for(abs_ni_next),
+                    )
+                _process_tile_with_b0(abs_ni, physical, b0_carry)
+                if ni + 1 < N_TILES_PER_WAVE:
+                    abs_ni_next = wave_ni_base + ni + 1
+                    b0_carry = _prefetch_k0(abs_ni_next, physical_carry)
 
     @flyc.jit
     def launch_fp8_paged_mqa_logits(
