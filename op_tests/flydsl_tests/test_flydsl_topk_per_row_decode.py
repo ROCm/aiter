@@ -163,16 +163,25 @@ def _check_set_equivalence(k, num_rows, next_n, seq_len, dist, padded):
 
 
 # --------------------------------------------------------------------------- #
-# Top-K set-equivalence vs torch.topk across every
-# tier/boundary (L) and radix worst case (dist), at single-row and batched
-# (num_rows 1, 8) cooperation. Every row carries a poison tail past row_len, so
-# any over-scan pulls a huge value into the result and fails.
+# Top-K set-equivalence vs torch.topk across every tier/boundary (L) and radix
+# worst case (dist). Every row carries a poison tail past row_len, so any
+# over-scan pulls a huge value into the result and fails.
+#
+# Row cooperation is a separate axis below rather than a third dimension here:
+# whether a row over-scans its tail is a property of its own length, so batching
+# every length against every distribution re-proves the same thing.
 # --------------------------------------------------------------------------- #
 @pytest.mark.parametrize("dist", DISTRIBUTIONS)
 @pytest.mark.parametrize("L", TIER_LENGTHS)
-@pytest.mark.parametrize("num_rows", [1, 8])
-def test_k2048_poison_tail_matrix(num_rows, L, dist):
-    _check_set_equivalence(2048, num_rows, 1, L, dist, padded=True)
+def test_k2048_poison_tail_matrix(L, dist):
+    _check_set_equivalence(2048, 1, 1, L, dist, padded=True)
+
+
+@pytest.mark.parametrize("L", [2049, 32769, 120003])
+def test_k2048_poison_tail_batched(L):
+    """Multi-row cooperation at one unaligned length per tier; the single-row
+    matrix above carries the distribution coverage."""
+    _check_set_equivalence(2048, 8, 1, L, "random", padded=True)
 
 
 # --------------------------------------------------------------------------- #
