@@ -19,7 +19,9 @@ from dataclasses import dataclass, field
 import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as _llvm_d
+from flydsl._mlir.dialects import scf
 from flydsl.expr import arith
+from flydsl.expr.typing import T
 
 __all__ = [
     "GeometryTuningTable",
@@ -35,6 +37,7 @@ __all__ = [
     "load_i64_global",
     "store_i32_system",
     "store_i64_global_system",
+    "wait_i64_system_until_at_least",
 ]
 
 
@@ -115,6 +118,33 @@ def load_i64_global(addr_i64):
     ptr = _to_ptr_global(addr_i64)
     _i64 = ir.IntegerType.get_signless(64)
     return _llvm_d.LoadOp(_i64, ptr, alignment=8).result
+
+
+def wait_i64_system_until_at_least(addr_i64, expected):
+    """Poll a CCO-visible monotonic i64 epoch until it reaches ``expected``."""
+
+    def load():
+        return _llvm_d.LoadOp(
+            ir.IntegerType.get_signless(64),
+            _to_ptr_global(addr_i64),
+            alignment=8,
+            volatile_=True,
+            ordering=_llvm_d.AtomicOrdering.monotonic,
+            syncscope="one-as",
+        ).result
+
+    loop = scf.WhileOp([T.i64], [load()])
+    before = ir.Block.create_at_start(loop.before, [T.i64])
+    after = ir.Block.create_at_start(loop.after, [T.i64])
+    with ir.InsertionPoint(before):
+        current = before.arguments[0]
+        keep_waiting = arith.CmpIOp(
+            arith.CmpIPredicate.slt, current, arith.unwrap(expected)
+        ).result
+        scf.ConditionOp(keep_waiting, [current])
+    with ir.InsertionPoint(after):
+        scf.YieldOp([load()])
+    return loop.results[0]
 
 
 def atomic_add_global_at(addr_i64, val, syncscope="one-as"):
