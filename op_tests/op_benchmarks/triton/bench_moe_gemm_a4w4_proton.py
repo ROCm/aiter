@@ -11,15 +11,16 @@ from pathlib import Path
 import torch
 import triton.profiler as proton
 
+from aiter.ops.shuffle import moe_shuffle_scale, moe_shuffle_weight
 from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16
 from aiter.ops.triton.moe.moe_op_gemm_a4w4 import (
     moe_gemm_a4w4,
     mxfp4_quant,
 )
-from aiter.ops.triton.moe.moe_routing.routing import routing
+from aiter.ops.triton.moe.moe_routing.routing import _USE_HERD, routing
 from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
 from aiter.ops.triton.utils._triton.arch_info import get_arch
-from aiter.ops.triton.utils.shuffle import shuffle_scale_moe
+from aiter.ops.triton.utils.shuffle import moe_weight_decode_view, shuffle_scale_moe
 
 
 def parse_profile(profile_path, useful_op_regex, reps):
@@ -33,7 +34,7 @@ def parse_profile(profile_path, useful_op_regex, reps):
     useful = gf.filter(
         f"MATCH ('*', c) WHERE c.'name' =~ '{useful_op_regex}' AND c IS LEAF"
     ).dataframe
-    bytes = int(useful["bytes"].sum())
+    bytes_ = int(useful["bytes"].sum())
     flops = int(
         sum(useful[[c for c in ["flops8", "flops16"] if c in useful.columns]].sum())
     )
@@ -45,7 +46,7 @@ def parse_profile(profile_path, useful_op_regex, reps):
         "total_time_ns": total_time_ns,
         "kernel_time_ns": kernel_time_ns,
         "flops": flops,
-        "bytes": bytes,
+        "bytes": bytes_,
         "reps": reps,
     }
 
@@ -58,6 +59,7 @@ def compute_roofline(
         raise TypeError(
             "intensity_proxy must be a string naming a parameter in target_fn"
         )
+
     # determine position of intensity_proxy in target_fn signature
     sig = inspect.signature(bench_fn)
     params = list(sig.parameters.values())
@@ -68,75 +70,99 @@ def compute_roofline(
     pos_index = [p.name for p in params].index(intensity_proxy_name)
 
     # wrapper to inject intensity proxy into target_fn and call it
-    def inject_proxy_and_call(val, args, kwargs):
-        args_list = list(args)
+    def inject_proxy_and_call(val, args_, kwargs_):
+        args_list = list(args_)
         args_list.insert(pos_index, val)
-        return bench_fn(*args_list, **kwargs)
+        return bench_fn(*args_list, **kwargs_)
+
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
 
     # collect performance data
-    perfs = []
+    results: list[tuple[str, dict[str, int | float]]] = []
     print("=========================================")
     print(f"{out_path}...")
     print("=========================================")
 
     for val in intensity_proxy_values:
         perf = inject_proxy_and_call(val, args, kwargs)
-        perfs.append((val, perf))
+        results.append((val, perf))
 
         tflops = perf["flops"] / perf["kernel_time_ns"] * 1e-3
         tbps = perf["bytes"] / perf["kernel_time_ns"] * 1e-3
-        total_latency = perf["total_time_ns"] / 1e3 / perf["reps"]
-        kernel_latency = perf["kernel_time_ns"] / 1e3 / perf["reps"]
+        total_latency_us = perf["total_time_ns"] / 1e3 / perf["reps"]
+        kernel_latency_us = perf["kernel_time_ns"] / 1e3 / perf["reps"]
         print(
             f"{intensity_proxy_name}: {val:5d} | "
-            f"Total latency (us): {total_latency:.2f} | "
-            f"Kernel latency (us): {kernel_latency:.2f} | "
+            f"Total latency (us): {total_latency_us:.2f} | "
+            f"Kernel latency (us): {kernel_latency_us:.2f} | "
             f"TFLOPS: {tflops:#.4g} | "
             f"TBPS: {tbps:.2f}"
         )
 
-    out_path = Path(out_path)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-
+    # write CSV
     fieldnames = [
         intensity_proxy_name,  # e.g. "batch"
         "total_latency_us",
         "kernel_latency_us",
         "tflops",
         "tbps",
-        # raw counters from proton:
         "total_time_ns",
         "kernel_time_ns",
         "flops",
         "bytes",
         "reps",
     ]
-
     with out_path.open("w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=fieldnames)
         w.writeheader()
-        for val, perf in perfs:
-            row = {
-                intensity_proxy_name: val,
-                "total_latency_us": perf["total_time_ns"] / 1e3 / perf["reps"],
-                "kernel_latency_us": perf["kernel_time_ns"] / 1e3 / perf["reps"],
-                "tflops": perf["flops"] / perf["kernel_time_ns"] * 1e-3,
-                "tbps": perf["bytes"] / perf["kernel_time_ns"] * 1e-3,
-                "total_time_ns": perf["total_time_ns"],
-                "kernel_time_ns": perf["kernel_time_ns"],
-                "flops": perf["flops"],
-                "bytes": perf["bytes"],
-                "reps": perf["reps"],
-            }
-            w.writerow(row)
+        for val, perf in results:
+            w.writerow(
+                {
+                    intensity_proxy_name: val,
+                    "total_latency_us": perf["total_time_ns"] / 1e3 / perf["reps"],
+                    "kernel_latency_us": perf["kernel_time_ns"] / 1e3 / perf["reps"],
+                    "tflops": perf["flops"] / perf["kernel_time_ns"] * 1e-3,
+                    "tbps": perf["bytes"] / perf["kernel_time_ns"] * 1e-3,
+                    "total_time_ns": perf["total_time_ns"],
+                    "kernel_time_ns": perf["kernel_time_ns"],
+                    "flops": perf["flops"],
+                    "bytes": perf["bytes"],
+                    "reps": perf["reps"],
+                }
+            )
+
+
+def preshuffle_moe_weight(w: torch.Tensor) -> torch.Tensor:
+    """``(E, K, N)`` -> the gfx1250 WMMA TDM view ``(E, K*16, N//16)``.
+
+    ``moe_shuffle_weight`` takes the ``(E, N, K)`` MoE weight orientation and
+    returns the shuffled buffer in that same shape; ``moe_weight_decode_view``
+    then reinterprets it (zero-copy) as the flattened view the kernel loads.
+    """
+    return moe_weight_decode_view(moe_shuffle_weight(w.transpose(-1, -2)))
+
+
+def preshuffle_moe_wscale(s: torch.Tensor) -> torch.Tensor:
+    """``(E, K//32, N)`` B-scale -> gfx1250 n32k4 layout, same orientation back.
+
+    ``moe_shuffle_scale`` is the n32k4 tile (preshuffle 32, scale kwidth 4) and
+    takes the ``(E, N, K//32)`` orientation, so transpose in and back out. Must
+    stay in step with ``SCALE_KWIDTH`` in the gfx1250 gluon kernels.
+    """
+    return moe_shuffle_scale(s.transpose(-1, -2)).transpose(-1, -2)
 
 
 def check_and_shuffle_scales(scale, N, K):
-    if N % 32 == 0 and K % (32 * 8) == 0:
+    if get_arch() == "gfx950" and N % 32 == 0 and K % (32 * 8) == 0:
         scale = shuffle_scale_moe(
             scale, arch="gfx950", preshuffle_factor=32, scale_kwidth=8
         )
         return scale, "CDNA4_SCALE"
+    elif get_arch() == "gfx1250" and N % 32 == 0 and K % (32 * 4) == 0:
+        # n32k4 layout (scale kwidth 4), so K//32 only needs to divide by 4.
+        scale = preshuffle_moe_wscale(scale)
+        return scale, "GFX1250_SCALE"
     else:
         return scale, None
 
@@ -164,8 +190,50 @@ def quantize(x, dtype):
         return x, scale
 
 
+def pin_routed_experts_mask(n_tokens, n_expts_tot, n_routed, n_expts_act, dev):
+    """Bool mask that pins routing to exactly `n_routed` experts.
+
+    Masking the logits down to a random pool of `n_routed` experts only caps
+    the routed count: nothing makes top-k cover the pool, so a small batch
+    lands on fewer. Pick each token's expert set directly instead -- every pool
+    expert is claimed by at least one token, the remaining slots are filled at
+    random from the pool -- and mask everything else to -inf, the same sentinel
+    `_topk` uses for its own out-of-range lanes, so top-k has to return that
+    set. A histogram with zeros in it is the normal case, so hist /
+    block_pid_map stay consistent.
+
+    True marks the experts a token must not route to, so the profiled loop only
+    pays `logits.masked_fill_(mask, -inf)` per rep.
+
+    `n_tokens * n_expts_act` routed rows cannot reach more experts than there
+    are rows, so the pool shrinks to fit a tiny batch; the second return value
+    is what was actually pinned.
+    """
+    n_pinned = min(n_routed, n_tokens * n_expts_act)
+    pool = torch.randperm(n_expts_tot, device=dev)[:n_pinned]
+
+    slot = torch.arange(n_pinned, device=dev)
+    score = torch.rand((n_tokens, n_pinned), device=dev)
+    score[slot % n_tokens, slot] += 1.0
+    keep = pool[score.topk(n_expts_act, dim=-1).indices]
+
+    drop = torch.ones((n_tokens, n_expts_tot), dtype=torch.bool, device=dev)
+    drop.scatter_(1, keep, False)
+    return drop, n_pinned
+
+
 def bench_mlp_single_weight_init(
-    batch, dim1, dim2, n_expts_tot, n_expts_act, x_dtype, w_dtype, TP, op_regex
+    batch,
+    dim1,
+    dim2,
+    n_expts_tot,
+    n_expts_act,
+    x_dtype,
+    w_dtype,
+    TP,
+    op_regex,
+    routed_experts=None,
+    preshuffle=False,
 ):
     rank = 0
     dev = f"cuda:{rank}"
@@ -173,6 +241,22 @@ def bench_mlp_single_weight_init(
     assert dim2 % TP == 0, f"{dim2=}, {TP=}, dim2 must be divisible by TP"
     assert x_dtype == "mx4", f"FP4 (E2M1) is disabled for x_dtype, got {x_dtype}"
     assert w_dtype == "mx4", f"FP4 (E2M1) is disabled for x_dtype, got {w_dtype}"
+    if preshuffle:
+        assert (
+            get_arch() == "gfx1250"
+        ), f"--preshuffle needs the gfx1250 gluon kernel, got {get_arch()}"
+    if routed_experts is not None:
+        # every token needs n_expts_act distinct experts, so the pool can't be smaller
+        assert n_expts_act <= routed_experts <= n_expts_tot, (
+            f"--routed-experts must be between top-k ({n_expts_act}) and the total "
+            f"expert count ({n_expts_tot}), got {routed_experts}"
+        )
+        # HERD routes top-(k+1) then drops the least batch-popular expert, which
+        # shrinks the routed set out from under the pin.
+        assert not _USE_HERD, (
+            "--routed-experts pins the routed expert set, which HERD routing "
+            "undoes; unset AITER_TRITON_USE_HERD"
+        )
 
     # -- init data --
     # weights
@@ -188,23 +272,38 @@ def bench_mlp_single_weight_init(
     wg, _ = quantize(wg, "bf16")
     w1, w1_scale = quantize(w1, w_dtype)
     w2, w2_scale = quantize(w2, w_dtype)
-    w1_scale, _swizzle_mx_scale1 = check_and_shuffle_scales(w1_scale, dim2 // TP, dim1)
-    w2_scale, _swizzle_mx_scale2 = check_and_shuffle_scales(
+    w1_scale, swizzle_mx_scale1 = check_and_shuffle_scales(w1_scale, dim2 // TP, dim1)
+    w2_scale, swizzle_mx_scale2 = check_and_shuffle_scales(
         w2_scale, dim1, dim2 // TP // 2
     )
+    if preshuffle:
+        w1 = preshuffle_moe_weight(w1)
+        w2 = preshuffle_moe_weight(w2)
 
     # -- benchmark --
     x_dtype_str = x_dtype
-    x_dtype = torch.float8_e4m3fn
 
     reps = 100
     x = torch.randn((batch, dim1), dtype=torch.bfloat16, device=dev)
     xg = x
+    pin_mask = None
+    if routed_experts is not None:
+        pin_mask, n_pinned = pin_routed_experts_mask(
+            batch, n_expts_tot, routed_experts, n_expts_act, dev
+        )
+        if n_pinned < routed_experts:
+            print(
+                f"  batch={batch}: pinned {n_pinned} experts, not {routed_experts} "
+                f"-- batch * top-k is only {batch * n_expts_act} routed rows"
+            )
+
     # run layer
     fpath = Path(tempfile.mktemp())
     proton.start(str(fpath), hook="triton")
-    for i in range(reps):
+    for _ in range(reps):
         logits = gemm_a16w16(xg, wg.T, bg)
+        if pin_mask is not None:
+            logits.masked_fill_(pin_mask, float("-inf"))
         rdata, gather_indx, scatter_indx = routing(logits, n_expts_act)
         assert x_dtype_str == "mx4"
         x, x_scale = mxfp4_quant(x)
@@ -213,12 +312,11 @@ def bench_mlp_single_weight_init(
             w1,
             x_scale,
             w1_scale,
-            None,
-            None,
             b1,
             rdata,
             gather_indx=gather_indx,
-            swizzle_mx_scale="CDNA4_SCALE",
+            swizzle_mx_scale=swizzle_mx_scale1,
+            preshuffle_weights=preshuffle,
             apply_swiglu=True,
         )
         x, x_scale = mxfp4_quant(x)
@@ -227,12 +325,11 @@ def bench_mlp_single_weight_init(
             w2,
             x_scale,
             w2_scale,
-            None,
-            None,
             b2,
             rdata,
             scatter_indx=scatter_indx,
-            swizzle_mx_scale="CDNA4_SCALE",
+            swizzle_mx_scale=swizzle_mx_scale2,
+            preshuffle_weights=preshuffle,
         )
     proton.finalize()
     return parse_profile(
@@ -250,12 +347,24 @@ def bench_mlp(
     w_dtype,
     TP,
     op_regex,
+    routed_experts=None,
     num_weight_inits=1,
+    preshuffle=False,
 ):
     all_results = []
-    for i in range(num_weight_inits):
+    for _ in range(num_weight_inits):
         result = bench_mlp_single_weight_init(
-            batch, dim1, dim2, n_expts_tot, n_expts_act, x_dtype, w_dtype, TP, op_regex
+            batch,
+            dim1,
+            dim2,
+            n_expts_tot,
+            n_expts_act,
+            x_dtype,
+            w_dtype,
+            TP,
+            op_regex,
+            routed_experts=routed_experts,
+            preshuffle=preshuffle,
         )
         all_results.append(result)
 
@@ -281,14 +390,24 @@ def roofline_mlp(
     w_dtype,
     TP,
     op_regex,
-    num_weight_inits=1,
+    routed_experts=None,
     name="",
+    num_weight_inits=1,
+    preshuffle=False,
 ):
     # Put all outputs under logs/<name>/ and write a CSV file (not a directory-as-stem).
     out_dir = Path("logs") / name
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    out_csv = out_dir / f"{x_dtype}x-{w_dtype}w-TP{TP}.csv"
+    stem = (
+        f"{x_dtype}x-{w_dtype}w-TP{TP}-dim1={dim1}-dim2={dim2}"
+        f"-E={n_expts_tot}-topk={n_expts_act}"
+    )
+    if routed_experts is not None:
+        stem += f"-routed={routed_experts}"
+    if preshuffle:
+        stem += "-preshuffled"
+    out_csv = out_dir / f"{stem}.csv"
 
     compute_roofline(
         dim1,
@@ -298,12 +417,14 @@ def roofline_mlp(
         x_dtype,
         w_dtype,
         TP,
-        op_regex,  # fixed args
+        op_regex,
+        routed_experts,  # fixed args
         num_weight_inits,
+        preshuffle,
         bench_fn=bench_mlp,  # function to benchmark
         intensity_proxy_name="batch",  # intensity proxy name
         intensity_proxy_values=batch_sizes,  # intensity proxy values to sweep
-        out_path=out_csv,  # output path
+        out_path=out_csv,
     )
 
 
@@ -339,14 +460,30 @@ def parse_args(args: list[str] | None = None):
         help="Regex to find perf for specific operation by its kernel name.",
     )
     parser.add_argument(
+        "--routed-experts",
+        type=int,
+        default=None,
+        help="Pin the number of experts that receive tokens, holding the expert "
+        "weight bytes read fixed across the batch sweep. Not to be confused with "
+        "the second value of --experts, which is top-k per token. batch * top-k "
+        "routed rows cannot reach more experts than there are rows, so a batch "
+        "that small pins fewer. Default: unset, i.e. random routing over all "
+        "experts.",
+    )
+    parser.add_argument(
         "--num-weight-inits",
         type=int,
         default=1,
         help="Number of different weight initializations to run for more stable results (default: 1). "
         "Each initialization runs 100 iterations. Use higher values (e.g., 10) for more stable benchmarks.",
     )
-    args = parser.parse_args(args=args)
-    return args
+    parser.add_argument(
+        "--preshuffle",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Preshuffle the mxfp4 weights for the gfx1250 gluon kernel (default: False).",
+    )
+    return parser.parse_args(args=args)
 
 
 def main(args: list[str] | None = None) -> None:
@@ -367,6 +504,7 @@ def main(args: list[str] | None = None) -> None:
         batch_sizes_moe = list(chain(*[range(*r) for r in batch_ranges_moe]))
     else:
         batch_sizes_moe = parsed_args.M
+
     quantized_dtypes = ["mx4", "mx4"]
 
     roofline_mlp(
@@ -379,8 +517,10 @@ def main(args: list[str] | None = None) -> None:
         quantized_dtypes[1],
         TP=1,
         op_regex=parsed_args.op_regex,
-        num_weight_inits=parsed_args.num_weight_inits,
+        routed_experts=parsed_args.routed_experts,
         name="gpt-oss-x2",
+        num_weight_inits=parsed_args.num_weight_inits,
+        preshuffle=parsed_args.preshuffle,
     )
 
 

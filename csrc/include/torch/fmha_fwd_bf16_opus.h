@@ -9,7 +9,7 @@
 // This replaces the former per-hd `fmha_fwd_hd128_bf16_opus_fwd`. The kernel/launch
 // logic for D=128 is unchanged (only moved under this shared entry point).
 #pragma once
-#include "aiter_tensor.h"
+#include <torch/extension.h>
 #include <optional>
 
 // Dense (batch) & varlen (group) GQA/MHA scaled-dot-product attention, bf16, gfx950.
@@ -31,15 +31,15 @@
 //   seqstart_q_pad / seqstart_k_pad  : cumulative PHYSICAL row offsets (KV-padding variant;
 //                                      equal to the non-pad arrays when there is no padding)
 //   max_seqlen_q / max_seqlen_k      : upper bounds driving the grid (group mode only)
-void fmha_fwd_bf16_opus_fwd(aiter_tensor_t& q,
-                            aiter_tensor_t& k,
-                            aiter_tensor_t& v,
-                            aiter_tensor_t& out,
+void fmha_fwd_bf16_opus_fwd(at::Tensor& q,
+                            at::Tensor& k,
+                            at::Tensor& v,
+                            at::Tensor& out,
                             bool causal,
                             float softmax_scale,
-                            std::optional<aiter_tensor_t> seqstart_q     = std::nullopt,
-                            std::optional<aiter_tensor_t> seqstart_k     = std::nullopt,
-                            std::optional<aiter_tensor_t> seqstart_q_pad = std::nullopt,
-                            std::optional<aiter_tensor_t> seqstart_k_pad = std::nullopt,
+                            std::optional<at::Tensor> seqstart_q     = std::nullopt,
+                            std::optional<at::Tensor> seqstart_k     = std::nullopt,
+                            std::optional<at::Tensor> seqstart_q_pad = std::nullopt,
+                            std::optional<at::Tensor> seqstart_k_pad = std::nullopt,
                             int max_seqlen_q = 0,
                             int max_seqlen_k = 0);

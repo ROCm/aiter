@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+from aiter.ops.triton._triton_kernels.fusions.attn_res import (
+    attnres_fwd_kernel,
+)
 from aiter.ops.triton._triton_kernels.fusions.mhc import (
     _mhc_fused_kernel,
     _mhc_fused_split_kernel,
@@ -17,4 +20,5 @@ __all__ = [
     "_mhc_post_pre_reduce_apply_kernel",
     "_mhc_post_pre_split_kernel",
     "_mhc_reduce_apply_kernel",
+    "attnres_fwd_kernel",
 ]

@@ -813,13 +813,13 @@ def _mock_grouped_gemm() -> None:
     The library imports all these names at call time, so patching the source
     modules is enough -- no library edits required.
     """
-    import aiter.ops.flydsl.batched_gemm_mxfp4 as bg
+    import aiter.ops.flydsl.grouped_gemm_mxfp4 as grouped_gemm
     import aiter.ops.quant as q
 
     def _noop_gemm(*_a, **_k):
         return None
 
-    bg.flydsl_grouped_gemm_a8w4_masked = _noop_gemm
+    grouped_gemm.flydsl_grouped_gemm_a8w4_masked = _noop_gemm
 
     q.per_1x32_f4_quant_hip = q.per_1x32_f4_quant_triton
 

@@ -190,9 +190,7 @@ int select_bf16_kernel_id(int requested_kernel_id)
     return selected_kernel_id;
 }
 
-int select_a8w4_kernel_id(int requested_kernel_id,
-                          int block_m,
-                          int effective_inter_dim)
+int select_a8w4_kernel_id(int requested_kernel_id, int block_m)
 {
     int selected_kernel_id = requested_kernel_id;
     if(selected_kernel_id == opus_moe::kStage2KidAuto)
@@ -200,8 +198,8 @@ int select_a8w4_kernel_id(int requested_kernel_id,
         // Auto selects a direct-atomic kernel by sort block_m. Route-out kernels
         // must be requested explicitly because they require a different output
         // layout and follow-up reduce.
-        selected_kernel_id = opus_moe::stage2_a8w4_auto_direct_atomic_kid(
-            effective_inter_dim, block_m);
+        selected_kernel_id =
+            opus_moe::stage2_a8w4_auto_direct_atomic_kid(block_m);
     }
     AITER_CHECK(opus_moe::stage2_a8w4_kid_is_valid(selected_kernel_id),
                 "opus_moe_stage2_a8w4_decode_fwd got unsupported kernel_id=",
@@ -209,8 +207,8 @@ int select_a8w4_kernel_id(int requested_kernel_id,
                 " (",
                 opus_moe::stage2_a8w4_kid_name(selected_kernel_id),
                 ")");
-    // Validate that the caller sorted with the block_m required by the selected kid.
-    const int sort_block_m = opus_moe::stage2_a8w4_kid_sort_block_m(selected_kernel_id);
+    const int sort_block_m =
+        opus_moe::stage2_a8w4_kid_sort_block_m(selected_kernel_id);
     AITER_CHECK(sort_block_m == block_m,
                 "kernel_id=",
                 selected_kernel_id,
@@ -465,17 +463,15 @@ void opus_moe_stage2_a8w4_decode_fwd(
                 logical_inter_dim,
                 " inter_dim_pad=",
                 inter_dim_pad);
-    AITER_CHECK(effective_inter_dim % packed_k_tile_width == 0,
-                "Opus A8W4 stage2 effective_inter_dim must be divisible by ",
+    AITER_CHECK(opus_moe::stage2_a8w4_effective_inter_dim_is_supported(effective_inter_dim),
+                "Opus A8W4 stage2 effective_inter_dim must be at least ",
+                2 * packed_k_tile_width,
+                " and divisible by ",
                 packed_k_tile_width,
                 ", got ",
                 effective_inter_dim);
-    AITER_CHECK(opus_moe::stage2_a8w4_effective_inter_dim_is_supported(effective_inter_dim),
-                "Opus A8W4 stage2 effective_inter_dim is not compiled: ",
-                effective_inter_dim);
 
-    const int selected_kernel_id =
-        select_a8w4_kernel_id(kernel_id, block_m, effective_inter_dim);
+    const int selected_kernel_id = select_a8w4_kernel_id(kernel_id, block_m);
     const int kernel_block_n = opus_moe::stage2_a8w4_kid_block_n(selected_kernel_id);
     const int expected_scale_cols =
         (((effective_inter_dim / packed_k_tile_width) + 1) / 2) *
@@ -538,11 +534,19 @@ void opus_moe_stage2_a8w4_decode_fwd(
     kargs.stride_a_scale_route = a2_scale.stride(0);
     kargs.stride_w_scale_row = w2_scale.stride(0);
     kargs.stride_o_t = route_out_fp8 ? 0 : out.stride(0);
+    kargs.k_tiles = effective_inter_dim / packed_k_tile_width;
+    kargs.a_scale_words_per_row_pack = static_cast<int>(
+        kargs.stride_a_scale_route *
+        (2 * opus_moe::kStage2A8W4DecodeMfmaM) / sizeof(uint32_t));
+    kargs.w_scale_words_per_row_pack = static_cast<int>(
+        kargs.stride_w_scale_row *
+        (2 * opus_moe::kStage2A8W4DecodeMfmaM) / sizeof(uint32_t));
     kargs.token_num = token_num;
     kargs.topk = actual_topk;
     kargs.num_experts = num_experts;
     kargs.model_dim = model_dim;
     kargs.sorted_blocks = sorted_blocks;
+    kargs.sort_block_m = block_m;
     kargs.a_scale_rows = static_cast<int>(a2_scale.size(0));
     // Keep a runtime route-out guard: the MXFP8 path codegen is measurably more
     // stable than making route-out a pure compile-time else branch.
@@ -553,7 +557,7 @@ void opus_moe_stage2_a8w4_decode_fwd(
     const hipStream_t stream = aiter::getCurrentHIPStream();
 
     opus_moe_stage2_a8w4_decode_dispatch_gfx950(
-        selected_kernel_id, effective_inter_dim, kargs, stream);
+        selected_kernel_id, kargs, stream);
     HIP_CALL_LAUNCH(hipGetLastError());
 }
 
@@ -713,19 +717,11 @@ void opus_moe_stage1_a8w4_fwd(
                 "Opus A8W4 stage1 activation must be Silu (0), Swiglu (2), or "
                 "Situv2 (3), got ",
                 activation);
+    AITER_CHECK(swiglu_limit > 0.0f, "swiglu_limit must be positive");
     if(activation_type == ActivationType::Situv2)
     {
-        // Situv2 must not be SwiGLU-clamped; the non-sparse stage1 kernel clamps
-        // every activation, so pass +inf (no-op) if a stray non-positive limit
-        // reaches this path from warmup (Python passes +inf).
-        if(!(swiglu_limit > 0.0f))
-            swiglu_limit = std::numeric_limits<float>::infinity();
         AITER_CHECK(situ_beta > 0.0f, "situ_beta must be positive");
         AITER_CHECK(situ_linear_beta > 0.0f, "situ_linear_beta must be positive");
-    }
-    else
-    {
-        AITER_CHECK(swiglu_limit > 0.0f, "swiglu_limit must be positive");
     }
     AITER_CHECK(kernel_id != opus_moe::kStage1A8W4KidInvalid,
                 "Invalid Opus A8W4 stage1 kernel name: ",

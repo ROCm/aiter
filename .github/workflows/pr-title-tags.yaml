@@ -1,0 +1,138 @@
+name: PR Title Tags
+
+# Keeps PR-title component tags uniform ([Triton/Gluon], [HIP], [ASM], [CK],
+# ...) and always in sync with the PR's changed files.
+#
+# The diff is the source of truth: on every push, bracket tags in the
+# component namespace (any variant — [TRITON], [Gluon], [CK_TILE],
+# [Triton-Gluon-MLA-GFX950], ...) are recomputed from the changed files, so
+# dropped components disappear and new ones appear. Tags outside the
+# component namespace ([fix], [Perf], [MLA], [gfx1250], ...) are never
+# touched. To opt a PR out entirely, add the 'no-auto-title' label — it takes
+# effect immediately, and removing it re-syncs the title on the spot.
+#
+# The tag set is documented in CONTRIBUTE.md ("PR Title Format") — keep the
+# two in sync when adding or renaming tags.
+#
+# pull_request_target is used so the default token can edit titles on fork
+# PRs as well. This is safe here because the job never checks out or executes
+# PR code — it only reads the changed-file list from the API.
+
+on:
+  pull_request_target:
+    types: [opened, ready_for_review, synchronize, reopened, labeled, unlabeled]
+    branches: [main]
+
+permissions:
+  pull-requests: write
+
+concurrency:
+  group: pr-title-tags-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  tag-title:
+    if: ${{ !github.event.pull_request.draft }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Sync component tags in PR title
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const action = context.payload.action;
+            if ((action === 'labeled' || action === 'unlabeled')
+                && context.payload.label?.name !== 'no-auto-title') {
+              core.info(`Label '${context.payload.label?.name}' is not title-related — skipping.`);
+              return;
+            }
+            const pr = context.payload.pull_request;
+            if (pr.labels.some(l => l.name === 'no-auto-title')) {
+              core.info("Label 'no-auto-title' set — skipping.");
+              return;
+            }
+
+            // ---- changed files (paginated) ----
+            const files = (await github.paginate(github.rest.pulls.listFiles, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: pr.number,
+              per_page: 100,
+            })).map(f => f.filename);
+
+            // ---- path predicates ----
+            const isDoc    = f => f.startsWith('docs/') || f.endsWith('.md');
+            const isTriton = f => f.startsWith('aiter/ops/triton/')
+                               || f.startsWith('aiter/aot/triton/')
+                               || f.startsWith('aiter/utility/triton/')
+                               || f.startsWith('op_tests/triton_tests/')
+                               || f.startsWith('op_tests/op_benchmarks/triton/');
+            const isAsm    = f => f.startsWith('hsa/') || /_asm\.py$/.test(f);
+            const isCk     = f => /^csrc\/(ck_|cktile_|py_itfs_ck\/|include\/ck_tile\/)/.test(f)
+                               || f.startsWith('3rdparty/composable_kernel');
+            const isOpus   = f => f.startsWith('aiter/ops/opus/')
+                               || f.startsWith('csrc/opus_gemm/')
+                               || f.startsWith('csrc/opus_moe/')
+                               || f.startsWith('csrc/include/opus/')
+                               || f.startsWith('op_tests/opus/')
+                               || /^aiter\/ops\/[^/]*opus[^/]*\.py$/.test(f)
+                               || /^op_tests\/[^/]*opus[^/]*\.py$/.test(f);
+            const isHip    = f => (f.startsWith('csrc/') && !isCk(f) && !isOpus(f))
+                               || f.startsWith('op_tests/op_benchmarks/hip/');
+            const isFlyDsl = f => f.startsWith('aiter/ops/flydsl/')
+                               || f.startsWith('aiter/aot/flydsl/')
+                               || f.startsWith('op_tests/flydsl_tests/')
+                               || /^op_tests\/[^/]*flydsl[^/]*\.py$/.test(f);
+            const isCi     = f => f.startsWith('.github/');
+            const isJit    = f => f.startsWith('aiter/jit/');
+            const isBuild  = f => ['setup.py', 'pyproject.toml', 'MANIFEST.in'].includes(f)
+                               || /^requirements[^/]*\.txt$/.test(f);
+            const isConfig = f => f.startsWith('aiter/configs/')
+                               || f.startsWith('aiter/ops/triton/configs/');
+
+            // Doc files never contribute component tags: a docs-only PR gets
+            // [Docs], and a code PR that also touches a README is tagged by
+            // its code only.
+            const code = files.filter(f => !isDoc(f));
+
+            // ---- compute canonical tags from the diff, priority order ----
+            const tags = [];
+            if (code.some(isTriton))           tags.push('Triton/Gluon');
+            if (code.some(isAsm))              tags.push('ASM');
+            if (code.some(isHip))              tags.push('HIP');
+            if (code.some(isCk))               tags.push('CK');
+            if (code.some(isOpus))             tags.push('OPUS');
+            if (code.some(isFlyDsl))           tags.push('FlyDSL');
+            if (code.some(isCi))               tags.push('CI');
+            if (code.some(isJit))              tags.push('JIT');
+            if (code.some(isBuild))            tags.push('Build');
+            if (code.length && code.every(isConfig)) tags.push('Config');
+            if (files.length && files.every(isDoc))  tags.push('Docs');
+            const MAX_TAGS = 3;
+            const add = tags.slice(0, MAX_TAGS);
+
+            // ---- rebuild the title: computed tags own the component space ----
+            // Strip every bracket token containing a component word (any
+            // variant or compound), keep all other tokens and text, then
+            // prepend the computed canonical set.
+            const COMPONENT_WORDS = new Set([
+              'triton', 'gluon', 'ck', 'cktile', 'asm', 'hip', 'opus',
+              'flydsl', 'ci', 'jit', 'build', 'config', 'docs', 'doc',
+            ]);
+            const tokenWords = t => t.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+            const original = pr.title;
+            const stripped = original.replace(/\s*\[[^\]]+\]/g, (m) =>
+              tokenWords(m).some(w => COMPONENT_WORDS.has(w)) ? '' : m
+            ).replace(/\s{2,}/g, ' ').trim();
+
+            const newTitle = (add.map(t => `[${t}]`).join(' ') + ' ' + stripped).trim();
+            if (newTitle === original) {
+              core.info(`Title already in sync (computed: ${JSON.stringify(tags)})`);
+              return;
+            }
+            core.info(`Retitling: "${original}" -> "${newTitle}"`);
+            await github.rest.pulls.update({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: pr.number,
+              title: newTitle,
+            });

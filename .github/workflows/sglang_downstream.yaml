@@ -20,6 +20,14 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
+  ci_config:
+    if: >-
+      github.event_name != 'pull_request' ||
+      (github.event.pull_request.draft == false &&
+      (contains(github.event.pull_request.labels.*.name, 'ci:sglang') ||
+      contains(github.event.pull_request.labels.*.name, 'ci:all')))
+    uses: ./.github/workflows/ci-config.yaml
+
   check-signal:
     if: >-
       github.event_name != 'pull_request' ||
@@ -61,7 +69,7 @@ jobs:
   sglang:
     if: needs.select-sglang-tests.outputs.has_tests == 'true'
     name: Sglang ${{ matrix.model }} ${{ matrix.test_type }} (8 GPU)
-    needs: [check-signal, select-sglang-tests]
+    needs: [check-signal, select-sglang-tests, ci_config]
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -93,10 +101,11 @@ jobs:
       - name: Docker login
         if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork }}
         env:
-          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+          DOCKER_USERNAME: ${{ secrets[needs.ci_config.outputs.docker_username_secret] }}
+          DOCKER_PASSWORD: ${{ secrets[needs.ci_config.outputs.docker_password_secret] }}
         run: |
           for attempt in 1 2 3; do
-            if echo "$DOCKER_PASSWORD" | docker login -u rocmshared --password-stdin; then
+            if echo "$DOCKER_PASSWORD" | docker login -u "$DOCKER_USERNAME" --password-stdin; then
               echo "Docker login succeeded on attempt ${attempt}"
               exit 0
             fi

@@ -7,10 +7,9 @@
 #include "custom_all_reduce.cuh"
 #include "mla.h"
 #include "opus/opus.hpp"
-#include <ATen/hip/HIPContext.h>
-#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
+#include <cstdio>
+#include <optional>
 #include <sstream>
-#include <torch/python.h>
 
 template <int32_t kSizeDV_, int32_t kNumHeadQ_, int32_t kNumThreadGroupPerBh_>
 struct MlaReduceKernelV1Traits
@@ -929,9 +928,11 @@ __launch_bounds__(Traits::kNumThreads, Traits::kOccupancy) __global__
     MLA_REDUCE_CASE_EF(NUM_HEAD, 10, HEAD_DIM, 128, NUM_WG_PER_BH, NAME, __VA_ARGS__)  \
     MLA_REDUCE_CASE_EF(NUM_HEAD, 16, HEAD_DIM, 128, NUM_WG_PER_BH, NAME, __VA_ARGS__)  \
     MLA_REDUCE_CASE_EF(NUM_HEAD, 16, HEAD_DIM, 512, NUM_WG_PER_BH, NAME, __VA_ARGS__)  \
+    MLA_REDUCE_CASE_EF(NUM_HEAD, 24, HEAD_DIM, 512, NUM_WG_PER_BH, NAME, __VA_ARGS__)  \
     MLA_REDUCE_CASE_EF(NUM_HEAD, 32, HEAD_DIM, 128, NUM_WG_PER_BH, NAME, __VA_ARGS__)  \
     MLA_REDUCE_CASE_EF(NUM_HEAD, 32, HEAD_DIM, 512, NUM_WG_PER_BH, NAME, __VA_ARGS__)  \
     MLA_REDUCE_CASE_EF(NUM_HEAD, 40, HEAD_DIM, 128, NUM_WG_PER_BH, NAME, __VA_ARGS__)  \
+    MLA_REDUCE_CASE_EF(NUM_HEAD, 48, HEAD_DIM, 128, NUM_WG_PER_BH, NAME, __VA_ARGS__)  \
     MLA_REDUCE_CASE_EF(NUM_HEAD, 64, HEAD_DIM, 64, NUM_WG_PER_BH, NAME, __VA_ARGS__)   \
     MLA_REDUCE_CASE_EF(NUM_HEAD, 64, HEAD_DIM, 128, NUM_WG_PER_BH, NAME, __VA_ARGS__)  \
     MLA_REDUCE_CASE_EF(NUM_HEAD, 64, HEAD_DIM, 512, NUM_WG_PER_BH, NAME, __VA_ARGS__)  \
@@ -1120,9 +1121,9 @@ void dispatch_mla_reduce_v1(const MlaReduceKernelV1Params& params,
         {
             if(lds_size > (dev_prop.maxSharedMemoryPerMultiProcessor / Traits::kOccupancy))
             {
-                TORCH_WARN(
-                    "kn_mla_reduce_v1: The number of splits is too high, adversely affecting "
-                    "occupancy.");
+                fprintf(stderr,
+                        "[aiter] kn_mla_reduce_v1: The number of splits is too high, "
+                        "adversely affecting occupancy.\n");
             }
 
             const int32_t ps_grid_size = num_cu * Traits::kOccupancy * 2;

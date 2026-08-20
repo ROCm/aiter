@@ -422,11 +422,6 @@ def _qk_wmma_64_flydsl(k_frags, q_frags):
                         k_frags[k_bank][k_frag_idx],
                         q_frags[q_bank][q_frag],
                         c_operand,
-                        signA=False,
-                        signB=False,
-                        modC=0,
-                        reuseA=False,
-                        reuseB=False,
                     )
                     accs[key] = set_vgpr_bank(result.result, acc_bank)
                 rocdl.sched_barrier(0)

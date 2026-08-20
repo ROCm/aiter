@@ -4,12 +4,15 @@
 
 """Shared utilities for chunk_delta_attn kernels."""
 
+import functools
 import inspect
 import math
 import os
 
 import torch
 import triton
+
+from aiter.ops.triton.utils.tuned_config_utils import get_tuned_kernel_config
 
 SUPPORTS_AUTOTUNE_CACHE = (
     "cache_results" in inspect.signature(triton.autotune).parameters
@@ -34,7 +37,53 @@ def chunk_delta_attn_autotune_configs(
     return [default_config if default_config is not None else configs[0]]
 
 
+def chunk_delta_attn_tuned_config(
+    kernel_name: str, fallback: triton.Config
+) -> triton.Config:
+    """This family's tile for the current device, from its published config."""
+    return get_tuned_kernel_config(
+        "attention", "CHUNK_DELTA_ATTN", kernel_name, fallback
+    )
+
+
 RCP_LN2: float = math.log2(math.e)  # 1/ln(2), for log2-space gate arithmetic
+
+
+def _same_arg(a, b) -> bool:
+    if isinstance(a, torch.Tensor) or isinstance(b, torch.Tensor):
+        return a is b
+    return type(a) is type(b) and a == b
+
+
+def _same_call(prev_args, prev_kwargs, args, kwargs) -> bool:
+    return (
+        len(args) == len(prev_args)
+        and kwargs.keys() == prev_kwargs.keys()
+        and all(_same_arg(a, b) for a, b in zip(args, prev_args, strict=True))
+        and all(_same_arg(v, prev_kwargs[k]) for k, v in kwargs.items())
+    )
+
+
+def tensor_cache(fn):
+    """Cache the single most recent result of a function taking tensors.
+
+    Tensor arguments match on identity, not contents: reading contents would
+    need the device-to-host copy this exists to avoid. A caller that rebuilds
+    an equal tensor therefore misses, which is fine for the hit that matters --
+    one ``cu_seqlens`` shared by every layer of a forward pass. Mutating a
+    cached tensor in place is not detected.
+    """
+    last: list = []
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        if last and _same_call(last[0], last[1], args, kwargs):
+            return last[2]
+        result = fn(*args, **kwargs)
+        last[:] = [args, kwargs, result]
+        return result
+
+    return wrapper
 
 
 def _get_available_device() -> str:
@@ -68,7 +117,6 @@ def check_shared_mem(arch: str = "none", tensor_idx: int = 0) -> bool:
         return False
 
 
-import functools
 import os
 from collections.abc import Callable
 from typing import Any

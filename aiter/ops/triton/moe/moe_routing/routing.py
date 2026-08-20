@@ -343,7 +343,14 @@ def routing(
         ) = sort_fn(expt_scal, expt_indx, n_expts_tot, bitmatrix, block_m, HIST_BLOCK_M)
         expt_data = ExptData(hist, token_offs_raw, token_offs_pad, block_pid_map)
         return (
-            RoutingData(block_m, gate_scal, hist, n_expts_tot, n_expts_act, expt_data),
+            RoutingData(
+                block_m,
+                gate_scal,
+                hist,
+                n_expts_tot,
+                n_expts_act,
+                expt_data,
+            ),
             topk_indx,
             gate_indx,
         )

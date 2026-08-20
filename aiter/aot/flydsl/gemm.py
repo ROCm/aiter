@@ -13,6 +13,7 @@ way as runtime JIT config lookup.
 Supported kernel families:
   - ``flydsl_gemm2_*``                        split-K HGEMM kernels
   - ``flydsl_bpreshuflle_*``                  a8w8 preshuffle GEMM kernels
+  - ``flydsl_bpreshuffle_8w_*``               gfx950 8-wave a8w8 ptpc GEMM kernels
   - ``flydsl_bpreshuffle_wmma_*``             gfx1250 a8w8 ptpc GEMM kernels
   - ``flydsl_mxfp8_128_bpreshuffle_wmma_*``   gfx1250 mxfp8_128 GEMM kernels
 
@@ -50,6 +51,10 @@ from aiter.aot.flydsl.common import (
 from aiter.jit.core import AITER_CONFIGS
 from aiter.ops.flydsl.bpreshuffle_gemm_gfx1250 import (
     parse_wmma_kernel_name as parse_ptpc_wmma_kernel_name,
+)
+from aiter.ops.flydsl.gemm_a8w8_bpreshuffle_8wave import (
+    compile_8wave_gemm,
+    parse_8wave_kernel_name,
 )
 from aiter.ops.flydsl.gemm_kernels import (
     SPLIT_K_SEMAPHORE_MAX_LEN,
@@ -153,6 +158,11 @@ def parse_csv(csv_path: str):
 
             if kernel_name.startswith("flydsl_bpreshuflle_"):
                 params = _parse_preshuffle_kernel_name(kernel_name)
+            elif kernel_name.startswith("flydsl_bpreshuffle_8w_"):
+                params = parse_8wave_kernel_name(kernel_name)
+                if params is not None:
+                    params = dict(params)
+                    params["kind"] = "8wave"
             elif kernel_name.startswith("flydsl_mxfp8_128_bpreshuffle_wmma_"):
                 params = parse_mxfp8_128_wmma_kernel_name(kernel_name)
                 if params is not None:
@@ -376,6 +386,40 @@ def _compile_preshuffle_to_cache(
     )
 
 
+def _compile_8wave_to_cache(
+    *,
+    m: int,
+    n: int,
+    k: int,
+    block_m: int,
+    block_n: int,
+    waves_per_eu: int,
+    xcd_swizzle: int,
+    **kwargs,
+):
+    del kwargs
+
+    import torch
+
+    dev = torch.device("cpu")
+    a = torch.empty((m * k,), device=dev, dtype=torch.int8)
+    b = torch.empty((n * k,), device=dev, dtype=torch.int8)
+    out = torch.empty((m * n,), device=dev, dtype=torch.bfloat16)
+    scale_a = torch.empty((max(m, 1),), device=dev, dtype=torch.float32)
+    scale_b = torch.empty((max(n, 1),), device=dev, dtype=torch.float32)
+
+    exe = compile_8wave_gemm(
+        K=k,
+        block_m=block_m,
+        block_n=block_n,
+        waves_per_eu=waves_per_eu,
+        xcd_swizzle=int(xcd_swizzle),
+    )
+    # NOTE: the 8-wave launcher takes (A, B, C, ...), not the preshuffle
+    # launcher's (C, A, B, ...).
+    _compile_executable_to_cache(exe, a, b, out, scale_a, scale_b, m, n, fx.Stream(0))
+
+
 def _compile_mxfp8_128_wmma_to_cache(
     *,
     m: int,
@@ -531,6 +575,8 @@ def compile_one_config(
                 _compile_hgemm_to_cache(m=m, n=n, k=k, **hgemm_kwargs)
             elif kind == "preshuffle":
                 _compile_preshuffle_to_cache(m=m, n=n, k=k, **kwargs)
+            elif kind == "8wave":
+                _compile_8wave_to_cache(m=m, n=n, k=k, **kwargs)
             elif kind == "mxfp8_128_wmma":
                 _compile_mxfp8_128_wmma_to_cache(m=m, n=n, k=k, **kwargs)
             elif kind == "ptpc_wmma":
@@ -583,6 +629,7 @@ def main():
 
     hgemm_jobs = [j for j in all_jobs if j["kind"] == "hgemm"]
     preshuffle_jobs = [j for j in all_jobs if j["kind"] == "preshuffle"]
+    eightwave_jobs = [j for j in all_jobs if j["kind"] == "8wave"]
     mxfp8_128_wmma_jobs = [j for j in all_jobs if j["kind"] == "mxfp8_128_wmma"]
     ptpc_wmma_jobs = [j for j in all_jobs if j["kind"] == "ptpc_wmma"]
 
@@ -593,6 +640,7 @@ def main():
         print(f"  CSV:              {csv_path}")
     print(f"  HGEMM jobs:       {len(hgemm_jobs)}")
     print(f"  Preshuffle jobs:  {len(preshuffle_jobs)}")
+    print(f"  8wave jobs:       {len(eightwave_jobs)}")
     print(f"  MXFP8_128 wmma jobs: {len(mxfp8_128_wmma_jobs)}")
     print(f"  PTPC wmma jobs:   {len(ptpc_wmma_jobs)}")
     print(f"  Total jobs:       {len(all_jobs)}")
@@ -607,7 +655,11 @@ def main():
     print(f"\n--- Compiling {len(all_jobs)} kernels ---")
     results = run_jobs_parallel(
         compile_one_config,
-        hgemm_jobs + preshuffle_jobs + mxfp8_128_wmma_jobs + ptpc_wmma_jobs,
+        hgemm_jobs
+        + preshuffle_jobs
+        + eightwave_jobs
+        + mxfp8_128_wmma_jobs
+        + ptpc_wmma_jobs,
     )
 
     total_elapsed = time.time() - total_t0

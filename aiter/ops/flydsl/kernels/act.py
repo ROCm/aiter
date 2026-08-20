@@ -4,12 +4,15 @@
 """Shared device-side SiLU / SiTUv2 activation helpers for FlyDSL MoE kernels.
 
 Elementwise f32-register helpers (exp2/rcp-based sigmoid, sign-restored tanh, and the
-gate*up batch forms) usable by any FlyDSL gemm1 fused gate+up epilog. Leaf module:
-depends only on flydsl and ``tensor_shim._to_raw``.
+gate*up batch forms) usable by any FlyDSL gemm1 fused gate+up epilog, plus
+:func:`gate_up_act`, which picks between them so kernels carry no ``act`` branch.
+Leaf module: depends only on flydsl and ``tensor_shim._to_raw``.
 """
 
+from typing import NamedTuple
+
 import flydsl.expr as fx
-from flydsl.expr import arith, rocdl
+from flydsl.expr import arith, const_expr, rocdl
 from flydsl.expr.typing import T
 
 from aiter.ops.flydsl.kernels.tensor_shim import _to_raw as _raw
@@ -17,7 +20,7 @@ from aiter.ops.flydsl.kernels.tensor_shim import _to_raw as _raw
 LOG2E = 1.4426950408889634
 
 
-def _silu_mul_batch(gs, us):
+def silu_mul_batch(gs, us):
     e = [fx.Float32(rocdl.exp2(T.f32, _raw(g * fx.Float32(-LOG2E)))) for g in gs]
     sig = [fx.Float32(rocdl.rcp(T.f32, _raw(fx.Float32(1.0) + ei))) for ei in e]
     return [gs[i] * sig[i] * us[i] for i in range(len(gs))]
@@ -40,7 +43,7 @@ def _tanh_f32(x):
     return fx.Float32(arith.select(is_pos, _raw(tanh_abs), _raw(-tanh_abs)))
 
 
-def _situ_mul_batch(gs, us, beta, beta_rcp, lbeta, lbeta_rcp, neg_clamp_limit):
+def situ_mul_batch(gs, us, beta, beta_rcp, lbeta, lbeta_rcp, neg_clamp_limit):
     """SiTUv2 activation (aiter mixed_moe situ_mul_vec4):
         situ(g)    = beta * tanh(g / beta) * sigmoid(g)
         situ_up(u) = linear_beta * tanh(u / linear_beta)
@@ -63,3 +66,33 @@ def _situ_mul_batch(gs, us, beta, beta_rcp, lbeta, lbeta_rcp, neg_clamp_limit):
         situ_u = lbeta * _tanh_f32(u * lbeta_rcp)
         out.append(situ_g * situ_u)
     return out
+
+
+class SituParams(NamedTuple):
+    """Runtime SiTUv2 scalars, as :func:`situ_mul_batch` wants them.
+
+    Built by :func:`situ_params` so the ``-swiglu_limit`` negation happens once, next
+    to the reason for it, instead of inside every caller's epilogue loop.
+    """
+
+    beta: object
+    beta_rcp: object
+    linear_beta: object
+    linear_beta_rcp: object
+    neg_clamp_limit: object
+
+
+def situ_params(beta, beta_rcp, linear_beta, linear_beta_rcp, swiglu_limit):
+    """Bundle the five runtime SiTUv2 f32 scalars (all fx.Float32, nothing baked)."""
+    return SituParams(beta, beta_rcp, linear_beta, linear_beta_rcp, -swiglu_limit)
+
+
+def gate_up_act(act, gs, us, situ=None):
+    """Fused gate+up epilogue activation: ``act(gate) * up``.
+
+    ``act`` is a compile-time string ("silu" or "situv2"); ``situ`` is the
+    :class:`SituParams` bundle, required only by "situv2".
+    """
+    if const_expr(act == "situv2"):
+        return situ_mul_batch(gs, us, *situ)
+    return silu_mul_batch(gs, us)

@@ -1,0 +1,2 @@
+q_format,k_format,v_format,o_format,q_scale_mode,k_scale_mode,v_scale_mode,o_scale_mode,hdim_q,hdim_v,mask,mode,ts_qo,ts_kv,knl_name,co_name
+10,10,4,2,1,1,1,0,128,128,0,0,256,64,_ZN5aiter20fmha_fwd_hd128_i8fp8E,MI300/fwd_hd128_i8fp8.co

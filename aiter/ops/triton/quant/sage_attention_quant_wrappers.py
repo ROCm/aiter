@@ -3,7 +3,6 @@ import functools
 import torch
 import triton
 
-import aiter
 from aiter.ops.triton._triton_kernels.attention.fav3_sage_attention import (
     map_dims,
 )
@@ -15,94 +14,19 @@ from aiter.ops.triton._triton_kernels.quant.sage_attention_quant import (
     _rotate_quantize_k_kernel,
     _rotate_quantize_q_kernel,
     sage_quant_kernel,
+    sage_quant_v_fp4_colmajor_kernel,
     sage_quant_v_kernel,
+    sage_quant_v_mxfp4_colmajor_kernel,
 )
 from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
 
 
-def fused_sage_quant_mxfp4(
-    q,
-    k,
-    v,
-    BLOCK_M,
-    hadamard_rotation=False,
-    R=None,
-    BLOCK_R=None,
-    q_smoothing=False,
-    layout="bshd",
-):
+def _bshd_order(layout):
+    if layout == "bshd":
+        return [0, 1, 2, 3]
     if layout == "bhsd":
-        b, _h_qo, _qo_len, head_dim = q.shape
-        _, h_kv, kv_len, _ = v.shape
-
-        stride_bz_v, stride_h_v, stride_seq_v, stride_d_v = (
-            v.stride(0),
-            v.stride(1),
-            v.stride(2),
-            v.stride(3),
-        )
-
-    elif layout == "bshd":
-        b, _qo_len, _h_qo, head_dim = q.shape
-        _, kv_len, h_kv, _ = v.shape
-
-        stride_bz_v, stride_h_v, stride_seq_v, stride_d_v = (
-            v.stride(0),
-            v.stride(2),
-            v.stride(1),
-            v.stride(3),
-        )
-    else:
-        raise ValueError(f"Unknown tensor layout: {layout}")
-
-    # padded_head_dim = max(16, 1 << (head_dim - 1).bit_length())
-    sm_scale = head_dim**-0.5
-
-    q_fp4, q_scale, k_fp4, k_scale, delta_s = smooth_rotate_downcast_qk(
-        q,
-        k,
-        BLOCK_SIZE_M=BLOCK_M,
-        hadamard_rotation=hadamard_rotation,
-        R=R,
-        BLOCK_R=BLOCK_R,
-        q_smoothing=q_smoothing,
-        layout=layout,
-        sm_scale=(sm_scale * 1.4426950408889634),
-    )
-
-    FP8_TYPE = aiter.dtypes.fp8
-    FP8_MAX = torch.finfo(FP8_TYPE).max
-    v_fp8 = torch.empty_like(v, dtype=FP8_TYPE, device=v.device)
-
-    BLOCK_K = 1024
-    K_NUM_BLKS = (kv_len + BLOCK_K - 1) // BLOCK_K
-
-    # V tensor per channel quantization
-    v_scale = v.abs().amax(dim=1 if layout == "bshd" else 2).to(torch.float32) / FP8_MAX
-
-    v_task_count = b * h_kv * K_NUM_BLKS
-    grid = (v_task_count,)
-    sage_quant_v_kernel[grid](
-        v,
-        v_fp8,
-        v_scale,
-        stride_bz_v,
-        stride_h_v,
-        stride_seq_v,
-        stride_d_v,
-        v_scale.stride(0),
-        v_scale.stride(1),
-        b,
-        h_kv,
-        K_NUM_BLKS,
-        kv_len,
-        D=head_dim,
-        BLK_K=BLOCK_K,
-        num_stages=5,
-        num_warps=8,
-    )
-
-    return q_fp4, q_scale, k_fp4, k_scale, v_fp8, v_scale, delta_s
+        return [0, 2, 1, 3]
+    raise ValueError(f"Unknown tensor layout: {layout}")
 
 
 def sage_quant_mxfp4(
@@ -123,39 +47,16 @@ def sage_quant_mxfp4(
     return_lse=False,
 ):
     v_fp8 = torch.empty_like(v, dtype=FP8_TYPE, device=v.device)
-
-    if layout == "bhsd":
-        b, h_qo, qo_len, head_dim = q.shape
-        _, h_kv, kv_len, _ = v.shape
-
-        stride_bz_v, stride_h_v, stride_seq_v, stride_d_v = (
-            v.stride(0),
-            v.stride(1),
-            v.stride(2),
-            v.stride(3),
-        )
-
-    elif layout == "bshd":
-        b, qo_len, h_qo, head_dim = q.shape
-        _, kv_len, h_kv, _ = v.shape
-
-        stride_bz_v, stride_h_v, stride_seq_v, stride_d_v = (
-            v.stride(0),
-            v.stride(2),
-            v.stride(1),
-            v.stride(3),
-        )
-    else:
-        raise ValueError(f"Unknown tensor layout: {layout}")
+    order = _bshd_order(layout)
+    b, qo_len, h_qo, head_dim = map_dims(q.shape, order)
+    _, kv_len, h_kv, _ = map_dims(v.shape, order)
+    stride_bz_v, stride_seq_v, stride_h_v, stride_d_v = map_dims(v.stride(), order)
     K_NUM_BLKS = (kv_len + BLKK - 1) // BLKK
 
-    # Apply K tensor smoothing following SageAttention approach
     v_scale = v.abs().amax(dim=1 if layout == "bshd" else 2).to(torch.float32) / FP8_MAX
 
     v_task_count = b * h_kv * K_NUM_BLKS
     grid = (v_task_count,)
-
-    # padded_head_dim = max(16, 1 << (head_dim - 1).bit_length())
 
     if sm_scale is None:
         sm_scale = head_dim**-0.5
@@ -237,9 +138,9 @@ def sage_quant_mxfp4(
 
 def _apply_int8_q_smoothing(q, k, BLKQ, layout, sm_scale):
     """Center Q per block and compute delta_s bias for INT8 Sage v1 (no Hadamard)."""
-    bshd = [0, 1, 2, 3] if layout == "bshd" else [0, 2, 1, 3]
-    b, s_q, h_q, d = map_dims(q.shape, bshd)
-    _, s_k, h_k, _ = map_dims(k.shape, bshd)
+    order = _bshd_order(layout)
+    b, s_q, h_q, d = map_dims(q.shape, order)
+    _, s_k, h_k, _ = map_dims(k.shape, order)
 
     Q_NUM_BLKS = (s_q + BLKQ - 1) // BLKQ
     K_NUM_BLKS = (s_k + BLKQ - 1) // BLKQ
@@ -250,9 +151,9 @@ def _apply_int8_q_smoothing(q, k, BLKQ, layout, sm_scale):
     )
     q_out = torch.empty_like(q)
 
-    stride_qb, stride_qm, stride_qh, stride_qd = map_dims(q.stride(), bshd)
-    stride_qob, stride_qom, stride_qoh, stride_qod = map_dims(q_out.stride(), bshd)
-    stride_kb, stride_kn, stride_kh, stride_kd = map_dims(k.stride(), bshd)
+    stride_qb, stride_qm, stride_qh, stride_qd = map_dims(q.stride(), order)
+    stride_qob, stride_qom, stride_qoh, stride_qod = map_dims(q_out.stride(), order)
+    stride_kb, stride_kn, stride_kh, stride_kd = map_dims(k.stride(), order)
 
     sm_scale_log2 = sm_scale * 1.4426950408889634
     grid_q = (b * h_q, Q_NUM_BLKS, triton.cdiv(d, 32))
@@ -306,6 +207,324 @@ def _apply_int8_q_smoothing(q, k, BLKQ, layout, sm_scale):
     return q_out, delta_s
 
 
+_F4F4_V_KPERM_CACHE = {}
+
+
+def _f4f4_v_kperm(device):
+    """Cached int32 [64] 'meas' kv-column permutation for the f4f4 col-major V pack
+    (col c holds kv-token kperm[c]). Built once per device so it is not recreated per
+    call (and stays out of any CUDA-graph capture region)."""
+    kp = _F4F4_V_KPERM_CACHE.get(device)
+    if kp is None:
+        s = torch.arange(64, device=device)
+        j = s % 32
+        pi = 4 * (j // 8) + 16 * ((j // 4) % 2) + (j % 4)
+        tau64 = 32 * (s // 32) + pi
+        kperm = torch.empty(64, dtype=torch.long, device=device)
+        kperm[tau64] = s  # kperm[col] = tau64^{-1}(col)
+        kp = kperm.to(torch.int32).contiguous()
+        _F4F4_V_KPERM_CACHE[device] = kp
+    return kp
+
+
+FP4_V_TILE_TOKENS = 128
+FP4_V_PACKED_BYTES_PER_TOKEN = 64
+FP4_V_BUFFER_SLACK_BYTES = 64
+
+
+def fp4_v_padded_sequence(sequence):
+    """Round a V sequence length up to the 128-token FP4 packing tile."""
+    return ((sequence + FP4_V_TILE_TOKENS - 1) // FP4_V_TILE_TOKENS) * FP4_V_TILE_TOKENS
+
+
+def fp4_v_raw_buffer_size(batch, sequence, heads):
+    """Return bytes for the packed FP4 V backing buffer, including view slack."""
+    return (
+        batch * fp4_v_padded_sequence(sequence) * heads * FP4_V_PACKED_BYTES_PER_TOKEN
+        + FP4_V_BUFFER_SLACK_BYTES
+    )
+
+
+def sage_quant_v_f4f4(v, layout="bshd"):
+    """Pack per-channel FP4 V into a padded, slack-backed col-major LDS layout."""
+    if layout == "bshd":
+        b, kv_len, h_kv, head_dim = v.shape
+        v_tok = v.permute(0, 2, 1, 3)
+    elif layout == "bhsd":
+        b, h_kv, kv_len, head_dim = v.shape
+        v_tok = v
+    else:
+        raise ValueError(f"Unknown tensor layout: {layout}")
+
+    tile = FP4_V_TILE_TOKENS
+    assert head_dim == 128, f"f4f4 requires head_dim=128, got {head_dim}"
+    padded_kv_len = fp4_v_padded_sequence(kv_len)
+    nT = padded_kv_len // tile
+    amax = v_tok.abs().amax(dim=-2).to(torch.float32)
+    v_descale = torch.where(amax > 0, amax / 6.0, torch.ones_like(amax)).contiguous()
+    kperm = _f4f4_v_kperm(v.device)
+    buf = torch.empty(
+        fp4_v_raw_buffer_size(b, kv_len, h_kv),
+        dtype=torch.uint8,
+        device=v.device,
+    )
+    packed = buf[: b * h_kv * padded_kv_len * FP4_V_PACKED_BYTES_PER_TOKEN].view(
+        b, h_kv, nT * tile * FP4_V_PACKED_BYTES_PER_TOKEN
+    )
+    sage_quant_v_fp4_colmajor_kernel[(b * h_kv * nT * 8,)](
+        v_tok,
+        packed,
+        v_descale,
+        kperm,
+        v_tok.stride(0),
+        v_tok.stride(1),
+        v_tok.stride(2),
+        v_tok.stride(3),
+        packed.stride(0),
+        packed.stride(1),
+        v_descale.stride(0),
+        v_descale.stride(1),
+        h_kv,
+        nT,
+        kv_len,
+    )
+    v_fp4_view = torch.as_strided(
+        buf,
+        (b, kv_len, h_kv, 128),
+        (
+            h_kv * padded_kv_len * FP4_V_PACKED_BYTES_PER_TOKEN,
+            FP4_V_PACKED_BYTES_PER_TOKEN,
+            padded_kv_len * FP4_V_PACKED_BYTES_PER_TOKEN,
+            1,
+        ),
+    )
+    return v_fp4_view, v_descale
+
+
+@torch.library.custom_op("aiter::pack_v_mxfp4_colmajor_raw", mutates_args=())
+def pack_v_mxfp4_colmajor_raw(
+    value: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pack V into contiguous payload and ASM-order E8M0 scale buffers.
+
+    Each 128-token tile contributes 512 scale bytes: four 32-token blocks times
+    128 channels, arranged in the gather order consumed by the F4F4/F6F4 kernels.
+    """
+    batch, sequence, heads, head_dim = value.shape
+    if head_dim != 128 or not value.is_contiguous():
+        raise ValueError("MXFP4 V packing requires contiguous hd128 BSHD input")
+    padded_sequence = fp4_v_padded_sequence(sequence)
+    tiles = padded_sequence // FP4_V_TILE_TOKENS
+    raw = torch.empty(
+        fp4_v_raw_buffer_size(batch, sequence, heads),
+        dtype=torch.uint8,
+        device=value.device,
+    )
+    scale = torch.empty(
+        (batch, heads, tiles * 512), dtype=torch.uint8, device=value.device
+    )
+    value_bhsd = value.permute(0, 2, 1, 3)
+    payload = raw[: batch * heads * tiles * 8192].view(batch, heads, tiles * 8192)
+    kperm = _f4f4_v_kperm(value.device)
+    sage_quant_v_mxfp4_colmajor_kernel[(batch * heads * tiles * 16,)](
+        value_bhsd,
+        payload,
+        scale,
+        kperm,
+        value_bhsd.stride(0),
+        value_bhsd.stride(1),
+        value_bhsd.stride(2),
+        value_bhsd.stride(3),
+        payload.stride(0),
+        payload.stride(1),
+        scale.stride(0),
+        scale.stride(1),
+        heads,
+        tiles,
+        sequence,
+        num_warps=1,
+        num_stages=1,
+    )
+    return raw, scale
+
+
+@pack_v_mxfp4_colmajor_raw.register_fake
+def _pack_v_mxfp4_colmajor_raw_fake(value):
+    batch, sequence, heads, _ = value.shape
+    tiles = fp4_v_padded_sequence(sequence) // FP4_V_TILE_TOKENS
+    return (
+        value.new_empty(
+            (fp4_v_raw_buffer_size(batch, sequence, heads),), dtype=torch.uint8
+        ),
+        value.new_empty((batch, heads, tiles * 512), dtype=torch.uint8),
+    )
+
+
+def sage_quant_v_mxfp4(value):
+    """Return true-MXFP4 V data view and kernel-ready E8M0 block-scale image."""
+    batch, sequence, heads, _ = value.shape
+    padded_sequence = fp4_v_padded_sequence(sequence)
+    raw, scale = pack_v_mxfp4_colmajor_raw(value)
+    view = torch.as_strided(
+        raw,
+        (batch, sequence, heads, 128),
+        (heads * padded_sequence * 64, 64, padded_sequence * 64, 1),
+    )
+    return view, scale
+
+
+def sage_quant_f4f4(
+    q,
+    k,
+    v,
+    FP8_TYPE,
+    FP8_MAX,
+    BLKQ,
+    BLKK,
+    sm_scale=None,
+    q_smoothing=False,
+    layout="bshd",
+    USE_RNE=False,
+    R=None,
+    BLOCK_R=32,
+):
+    """Quantize rotated MXFP4 Q/K plus true-MXFP4 V for the F4F4 ASM kernel."""
+    del FP8_TYPE, FP8_MAX, BLKK, USE_RNE
+    if layout != "bshd":
+        raise ValueError(f"f4f4 requires bshd layout, got {layout}")
+    _, _, _, head_dim = q.shape
+    _, kv_len, _, _ = v.shape
+
+    tile = 128
+    assert head_dim == 128, f"f4f4 requires head_dim=128, got {head_dim}"
+    assert (
+        kv_len % tile == 0
+    ), f"f4f4 col-major V pack requires kv_len % {tile} == 0, got {kv_len}"
+
+    if sm_scale is None:
+        sm_scale = head_dim**-0.5
+
+    # Q/K: identical to sage_quant_mxfp4 (hadamard rotation + smoothing -> mxfp4).
+    q, k, delta_s = rotation_smooth_qk(
+        q,
+        k,
+        BLKQ,
+        R=R,
+        BLOCK_R=BLOCK_R,
+        q_smoothing=q_smoothing,
+        layout=layout,
+        sm_scale=(sm_scale * 1.4426950408889634),
+    )
+    q_fp4, q_scale = downcast_to_mxfp(q, torch.uint8, axis=-1)
+    k_fp4, k_scale = downcast_to_mxfp(k, torch.uint8, axis=-1)
+
+    v_fp4_view, v_descale = sage_quant_v_mxfp4(v)
+    return q_fp4, q_scale, k_fp4, k_scale, v_fp4_view, v_descale, delta_s
+
+
+def sage_quant_mxfp6(
+    q,
+    k,
+    v,
+    FP8_TYPE,
+    FP8_MAX,
+    BLKQ,
+    BLKK,
+    sm_scale=None,
+    q_smoothing=False,
+    layout="bshd",
+    R=None,
+    BLOCK_R=32,
+    f6f4=False,
+    q_packer=None,
+    k_packer=None,
+):
+    """MXFP6-E2M3 QK quantize (+ V) for the aiter mxfp6 (f6f8) / f6f4 fmha kernels.
+
+    Rotates/smooths Q,K (Hadamard R, folding sm_scale*log2e into Q) then packs both to
+    MXFP6-E2M3: Q -> [...,96] data + E8M0 scale; K -> kernel-ready LDS-order view with the
+    E8M0 K-scale in the per-tile tail. By default Q/K are packed with the in-tree Triton
+    packers (quantize_fp6_lastdim_triton / quantize_fp6_k_lds_order_triton); pass q_packer /
+    k_packer callables to override (e.g. a bench that swaps the packer via AITER_MXFP6_PACK
+    or forces the numpy path). The V operand is selected by f6f4:
+      * f6f4=False (f6f8): raw fp8 V via sage_quant_v_kernel (per-channel descale).
+            * f6f4=True: true-MXFP4 V with per-(channel, 32-token) E8M0 scales.
+    Only the selected V operand is computed (no wasted fp8 quant on the f6f4 path).
+    Returns (q_fp6, q_scale, k_view, k_scale, v_quantized, v_scale, delta_s). bshd only.
+    """
+    if q_packer is None or k_packer is None:
+        import os as _os
+
+        from aiter.ops.triton.quant import mxfp6_fmha_pack as _hp
+
+        # Default to the fused TRITON packers (single in-graph kernels; hide the all-to-all far
+        # better under torch.compile than the many-kernel torch packs). Set AITER_MXFP6_QK_TRITON=0
+        # for the pure-torch (traceable ATen) packers.
+        _use_triton_qk = _os.environ.get("AITER_MXFP6_QK_TRITON", "1") != "0"
+        if _use_triton_qk:
+            _default_q_packer = _hp.quantize_fp6_lastdim_triton
+
+            def _default_k_packer(_k):
+                return _hp.quantize_fp6_k_lds_order_triton(_k, tile=128)
+
+        else:
+            _default_q_packer = _hp.quantize_fp6_lastdim_torch
+
+            def _default_k_packer(_k):
+                return _hp.quantize_fp6_k_lds_order_torch(_k, tile=128)
+
+    assert layout == "bshd", f"sage_quant_mxfp6 expects bshd, got {layout}"
+    b, _qo_len, _h_qo, head_dim = q.shape
+    _, kv_len, h_kv, _ = v.shape
+    if sm_scale is None:
+        sm_scale = head_dim**-0.5
+
+    q, k, delta_s = rotation_smooth_qk(
+        q,
+        k,
+        BLKQ,
+        R=R,
+        BLOCK_R=BLOCK_R,
+        q_smoothing=q_smoothing,
+        layout=layout,
+        sm_scale=(sm_scale * 1.4426950408889634),
+    )
+
+    # V operand: true-MXFP4 (f6f4) or raw fp8 (f6f8) -- only the selected one.
+    if f6f4:
+        v_quantized, v_scale = sage_quant_v_mxfp4(v)
+    else:
+        v_quantized = torch.empty_like(v, dtype=FP8_TYPE, device=v.device)
+        K_NUM_BLKS = (kv_len + BLKK - 1) // BLKK
+        v_scale = v.abs().amax(dim=1).to(torch.float32) / FP8_MAX
+        grid = (b * h_kv * K_NUM_BLKS,)
+        sage_quant_v_kernel[grid](
+            v,
+            v_quantized,
+            v_scale,
+            v.stride(0),
+            v.stride(2),
+            v.stride(1),
+            v.stride(3),
+            v_scale.stride(0),
+            v_scale.stride(1),
+            b,
+            h_kv,
+            K_NUM_BLKS,
+            kv_len,
+            D=head_dim,
+            BLK_K=BLKK,
+            num_stages=3,
+            num_warps=8,
+        )
+
+    # Q -> base fp6 pack; K -> coalesced LDS-order pack (E8M0 K-scale in the tile tail).
+    # Use caller-supplied packers when given (overridable), else the in-tree Triton packers.
+    q_fp6, q_scale = q_packer(q) if q_packer is not None else _default_q_packer(q)
+    k_view, k_scale = k_packer(k) if k_packer is not None else _default_k_packer(k)
+    return q_fp6, q_scale, k_view, k_scale, v_quantized, v_scale, delta_s
+
+
 def sage_quant(
     q,
     k,
@@ -357,21 +576,11 @@ def sage_quant(
     k_int8 = torch.empty_like(k, dtype=torch.int8, device=k.device)
     v_fp8 = torch.empty_like(v, dtype=FP8_TYPE, device=v.device)
 
-    if layout == "bhsd":
-        b, h_qo, qo_len, head_dim = q.shape
-        _, h_kv, kv_len, _ = k.shape
-
-        stride_bz_q, stride_h_q, stride_seq_q = q.stride(0), q.stride(1), q.stride(2)
-        stride_bz_k, stride_h_k, stride_seq_k = k.stride(0), k.stride(1), k.stride(2)
-
-    elif layout == "bshd":
-        b, qo_len, h_qo, head_dim = q.shape
-        _, kv_len, h_kv, _ = k.shape
-
-        stride_bz_q, stride_h_q, stride_seq_q = q.stride(0), q.stride(2), q.stride(1)
-        stride_bz_k, stride_h_k, stride_seq_k = k.stride(0), k.stride(2), k.stride(1)
-    else:
-        raise ValueError(f"Unknown tensor layout: {layout}")
+    order = _bshd_order(layout)
+    b, qo_len, h_qo, head_dim = map_dims(q.shape, order)
+    _, kv_len, h_kv, _ = map_dims(k.shape, order)
+    stride_bz_q, stride_seq_q, stride_h_q, _ = map_dims(q.stride(), order)
+    stride_bz_k, stride_seq_k, stride_h_k, _ = map_dims(k.stride(), order)
     Q_NUM_BLKS = (qo_len + BLKQ - 1) // BLKQ
     K_NUM_BLKS = (kv_len + BLKK - 1) // BLKK
 
@@ -802,8 +1011,6 @@ def smooth_rotate_downcast_qk(
     )
 
     if q_smoothing:
-        # 3. Compute Smoothing Delta S
-        # Grid: Each Q-block x Each K-block
         grid_delta = (b * h_q, Q_NUM_BLKS, K_NUM_BLKS)
         _compute_delta_s_kernel[grid_delta](
             q_mean,
@@ -833,21 +1040,14 @@ def smooth_rotate_downcast_qk(
 
 @functools.lru_cache(maxsize=16)
 def create_hadamard_matrix(block_size, device="cuda", dtype=torch.bfloat16):
-    """
-    Returns a Hadamard matrix of size block_size x block_size. Remember to normalize with sqrt(block_size) for it to be orthogonal.
-    """
+    """Return an unnormalized Sylvester Hadamard matrix."""
     assert (block_size & (block_size - 1)) == 0, "block_size must be power of 2"
     assert block_size > 0, "block_size must be positive"
 
-    # Base case: H_1 = [1]
     if block_size == 1:
         return torch.ones(1, 1, device=device, dtype=dtype)
 
-    # Recursive construction: H_{2n} = [H_n   H_n  ]
-    #                                   [H_n  -H_n ]
     H_half = create_hadamard_matrix(block_size // 2, device=device, dtype=dtype)
-
-    # Build the full matrix (unnormalized)
     H = torch.zeros(block_size, block_size, device=device, dtype=dtype)
     half = block_size // 2
     H[:half, :half] = H_half
@@ -855,22 +1055,4 @@ def create_hadamard_matrix(block_size, device="cuda", dtype=torch.bfloat16):
     H[half:, :half] = H_half
     H[half:, half:] = -H_half
 
-    # The unnormalized matrix satisfies H_unnorm @ H_unnorm.T = block_size * I
-    # remember to divide by sqrt(block_size) to get orthogonal matrix
     return H
-
-
-def create_random_hadamard_matrix(block_size, device="cuda", dtype=torch.float32):
-    # 1. Generate the deterministic Hadamard matrix (H)
-    H = create_hadamard_matrix(block_size, device=device, dtype=dtype) / (
-        block_size**0.5
-    )
-    # 2. Create the random diagonal matrix D (represented as a vector for efficiency)
-    # This generates random +1 or -1 for each column
-    random_signs = (
-        torch.randint(0, 2, (block_size,), device=device, dtype=torch.int) * 2 - 1
-    )
-    # 3. Apply the random signs (H @ D)
-    # Multiplying by a diagonal matrix on the right is equivalent to scaling columns
-    H_tilde = H * random_signs
-    return H_tilde

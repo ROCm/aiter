@@ -31,6 +31,9 @@ from aiter.ops.triton._triton_kernels.gated_delta_rule.prefill import (
     fused_chunk_local_cumsum_scaled_dot_kkt_fwd,
     fused_solve_tril_recompute_w_u,
 )
+from aiter.ops.triton._triton_kernels.gated_delta_rule.prefill import (
+    fused_solve_tril_recompute as fused_solve_module,
+)
 from aiter.ops.triton.gated_delta_net import (
     chunk_gated_delta_rule,
     chunk_gated_delta_rule_opt,
@@ -69,6 +72,42 @@ def test_chunk_opt_vk_unsupported_gfx12_runtime_allowlist(
     monkeypatch.setattr(torch.cuda, "get_device_properties", lambda device: props)
 
     assert chunk_module._is_unsupported_gfx12_runtime(torch.device("cuda")) is expected
+
+
+@pytest.mark.parametrize(
+    ("execution_mode", "process_mode", "expected"),
+    [("fused", "split", False), ("split", "fused", True)],
+)
+def test_solve_tril_recompute_explicit_dispatch_overrides_auto_threshold(
+    execution_mode: str,
+    process_mode: str,
+    expected: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(fused_solve_module, "_SOLVE_TRIL_RECOMPUTE_FORCE", process_mode)
+    monkeypatch.setattr(fused_solve_module, "_SOLVE_TRIL_RECOMPUTE_FUSE_NT_MAX", 32)
+    assert (
+        fused_solve_module._should_use_split_path(
+            execution_mode=execution_mode,
+            nt=128,
+            is_varlen=False,
+        )
+        is expected
+    )
+
+
+def test_solve_tril_recompute_auto_dispatch_is_backward_compatible(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(fused_solve_module, "_SOLVE_TRIL_RECOMPUTE_FORCE", "")
+    monkeypatch.setattr(fused_solve_module, "_SOLVE_TRIL_RECOMPUTE_FUSE_NT_MAX", 32)
+    assert not fused_solve_module._should_use_split_path("auto", 32, False)
+    assert fused_solve_module._should_use_split_path("auto", 33, False)
+
+
+def test_solve_tril_recompute_rejects_unknown_execution_mode() -> None:
+    with pytest.raises(ValueError, match="execution_mode"):
+        fused_solve_module._should_use_split_path("invalid", 128, False)
 
 
 def recurrent_gated_delta_rule_ref(
@@ -722,6 +761,13 @@ def test_chunk_opt(
         pytest.param(torch.bfloat16, id="state_bf16"),
     ],
 )
+@pytest.mark.parametrize(
+    "snapshot_dtype",
+    [
+        pytest.param(torch.bfloat16, id="snapshot_bf16"),
+        pytest.param(torch.float32, id="snapshot_fp32"),
+    ],
+)
 @pytest.mark.skipif(not IS_AMD, reason="Skipping HIP-only test on non-AMD backend")
 def test_chunk_opt_hip(
     B: int,
@@ -734,6 +780,7 @@ def test_chunk_opt_hip(
     use_qk_l2norm_in_kernel: bool,
     dtype: torch.dtype,
     state_dtype: torch.dtype,
+    snapshot_dtype: torch.dtype,
 ):
     torch.manual_seed(42)
     if D != 128 or dtype != torch.bfloat16:
@@ -772,6 +819,7 @@ def test_chunk_opt_hip(
         use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
         use_chunk_hip=True,
         state_dtype=state_dtype,
+        snapshot_dtype=snapshot_dtype,
     )
 
     ref, ref_ht = recurrent_gated_delta_rule_ref(
@@ -1007,6 +1055,13 @@ def test_chunk_opt_varlen_hip(
         pytest.param(torch.bfloat16, id="state_bf16"),
     ],
 )
+@pytest.mark.parametrize(
+    "snapshot_dtype",
+    [
+        pytest.param(torch.bfloat16, id="snapshot_bf16"),
+        pytest.param(torch.float32, id="snapshot_fp32"),
+    ],
+)
 @pytest.mark.skipif(
     os.getenv("SKIP_TEST_CHUNK_VARLEN") == "1",
     reason="Skipping test_chunk_opt_vk_indice because SKIP_TEST_CHUNK_VARLEN is set",
@@ -1018,6 +1073,7 @@ def test_chunk_opt_vk_indice(
     mask_p: float,
     cu_seqlens: list[int],
     state_dtype: torch.dtype,
+    snapshot_dtype: torch.dtype,
 ):
     """Functional test for the indexed state-pool fwd_h on both backends.
 
@@ -1078,8 +1134,11 @@ def test_chunk_opt_vk_indice(
         output_final_state=True,
         cu_seqlens=cu_seqlens,
         state_dtype=state_dtype,
+        snapshot_dtype=snapshot_dtype,
         **extra_kwargs,
     )
+    assert h_ref.dtype == snapshot_dtype
+    assert ht_ref.dtype == state_dtype
 
     # --- indexed pool: scatter the N states into a larger pool at unique,
     # non-identity slots to prove the gather honours initial_state_indices ---
@@ -1102,8 +1161,10 @@ def test_chunk_opt_vk_indice(
         output_final_state=True,
         cu_seqlens=cu_seqlens,
         state_dtype=state_dtype,
+        snapshot_dtype=snapshot_dtype,
         **extra_kwargs,
     )
+    assert h_idx.dtype == snapshot_dtype
     assert ht_idx is pool  # in-place: final state aliases the pool buffer
 
     # 1. snapshots + recomputed values are bit-identical to the dense path
@@ -1122,6 +1183,212 @@ def test_chunk_opt_vk_indice(
     assert torch.equal(
         pool[untouched], pool_before[untouched]
     ), "non-indexed pool slots were modified by the kernel"
+
+
+@pytest.mark.parametrize(
+    "backend",
+    [
+        pytest.param("triton", id="triton"),
+        pytest.param(
+            "hip",
+            id="hip",
+            marks=[
+                pytest.mark.skipif(
+                    not IS_AMD, reason="HIP backend requires an AMD device"
+                ),
+                pytest.mark.skipif(
+                    _is_gfx12_runtime(),
+                    reason="chunk_gated_delta_rule_fwd_h_hip_fn does not support gfx12!",
+                ),
+            ],
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    "input_dtype",
+    [
+        pytest.param(torch.float16, id="input_fp16"),
+        pytest.param(torch.bfloat16, id="input_bf16"),
+    ],
+)
+def test_chunk_snapshot_dtype_defaults_to_k_dtype(
+    backend: str, input_dtype: torch.dtype
+):
+    """Persistent-state dtype must not change the default snapshot policy."""
+    if backend == "hip" and input_dtype != torch.bfloat16:
+        pytest.skip("HIP K5 supports only BF16 inputs")
+
+    torch.manual_seed(42)
+    B, T, H, D = 1, 128, 2, 128
+    k = torch.randn(B, T, H, D, dtype=input_dtype, device=device)
+    w = torch.randn(B, H, T, D, dtype=input_dtype, device=device)
+    u = torch.randn(B, H, T, D, dtype=input_dtype, device=device)
+    g = F.logsigmoid(torch.rand(B, H, T, dtype=torch.float32, device=device))
+    initial_state = torch.randn(B, H, D, D, dtype=torch.float32, device=device)
+
+    if backend == "hip":
+        fwd_h = chunk_gated_delta_rule_fwd_h_hip_fn
+        extra_kwargs = {"g_head_major": True}
+    else:
+        fwd_h = chunk_gated_delta_rule_fwd_h_opt_vk
+        extra_kwargs = {}
+
+    h, _, final_state = fwd_h(
+        k=k,
+        w=w,
+        u=u,
+        g=g,
+        initial_state=initial_state,
+        output_final_state=True,
+        state_dtype=torch.float32,
+        **extra_kwargs,
+    )
+
+    assert h.dtype == k.dtype == input_dtype
+    assert final_state.dtype == torch.float32
+
+
+@pytest.mark.parametrize(
+    "input_dtype",
+    [
+        pytest.param(torch.float16, id="input_fp16"),
+        pytest.param(torch.bfloat16, id="input_bf16"),
+    ],
+)
+@pytest.mark.parametrize(
+    "state_dtype",
+    [
+        pytest.param(torch.float32, id="state_fp32"),
+        pytest.param(torch.bfloat16, id="state_bf16"),
+    ],
+)
+@pytest.mark.parametrize(
+    "snapshot_dtype",
+    [
+        pytest.param(torch.bfloat16, id="snapshot_bf16"),
+        pytest.param(torch.float32, id="snapshot_fp32"),
+    ],
+)
+def test_chunk_opt_vk_dtype_combinations(
+    input_dtype: torch.dtype,
+    state_dtype: torch.dtype,
+    snapshot_dtype: torch.dtype,
+):
+    """Exercise Triton K5/K6 across independent input, state and snapshot dtypes."""
+    torch.manual_seed(42)
+    B, T, H, D = 1, 128, 2, 128
+    q = torch.randn(B, T, H, D, dtype=input_dtype, device=device)
+    k = F.normalize(
+        torch.randn(B, T, H, D, dtype=torch.float32, device=device),
+        p=2,
+        dim=-1,
+    ).to(input_dtype)
+    v = torch.randn(B, T, H, D, dtype=input_dtype, device=device)
+    beta = torch.rand(B, T, H, dtype=input_dtype, device=device).sigmoid()
+    g = F.logsigmoid(torch.rand(B, T, H, dtype=torch.float32, device=device))
+    # Quantize the reference initial state to the selected persistent dtype so
+    # comparisons isolate kernel behavior rather than input quantization.
+    initial_state_ref = (
+        torch.randn(B, H, D, D, dtype=torch.float32, device=device)
+        .to(state_dtype)
+        .float()
+    )
+    initial_state = initial_state_ref.transpose(-1, -2).to(state_dtype).contiguous()
+
+    out, final_state = chunk_gated_delta_rule_opt_vk(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        initial_state=initial_state,
+        output_final_state=True,
+        state_dtype=state_dtype,
+        snapshot_dtype=snapshot_dtype,
+    )
+    ref, ref_final_state = recurrent_gated_delta_rule_ref(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        initial_state=initial_state_ref,
+        output_final_state=True,
+    )
+
+    tol = 0.005 if state_dtype == torch.float32 else 0.02
+    assert out.dtype == input_dtype
+    assert final_state.dtype == state_dtype
+    assert_close("o", ref.float(), out.float(), tol)
+    assert_close(
+        "ht",
+        ref_final_state.float(),
+        final_state.transpose(-1, -2).float(),
+        tol,
+    )
+
+
+def test_chunk_opt_vk_preserves_legacy_positional_optional_arguments():
+    """The pre-snapshot positional API must keep binding use_exp2 correctly."""
+    torch.manual_seed(42)
+    B, T, H, D = 1, 64, 1, 64
+    dtype = torch.bfloat16
+    q = F.normalize(
+        torch.randn(B, T, H, D, dtype=torch.float32, device=device),
+        p=2,
+        dim=-1,
+    ).to(dtype)
+    k = F.normalize(
+        torch.randn(B, T, H, D, dtype=torch.float32, device=device),
+        p=2,
+        dim=-1,
+    ).to(dtype)
+    v = torch.randn(B, T, H, D, dtype=dtype, device=device)
+    beta = torch.rand(B, T, H, dtype=dtype, device=device).sigmoid()
+    g = F.logsigmoid(torch.rand(B, T, H, dtype=torch.float32, device=device))
+    initial_state_ref = torch.randn(B, H, D, D, dtype=torch.float32, device=device)
+    initial_state = initial_state_ref.transpose(-1, -2).contiguous()
+
+    # Keep this call positional through num_decode_tokens. On the base API,
+    # False is use_exp2; inserting snapshot_dtype before it binds False to a
+    # dtype and raises ValueError.
+    out, final_state = chunk_gated_delta_rule_opt_vk(
+        q,
+        k,
+        v,
+        None,
+        g,
+        beta,
+        None,
+        initial_state,
+        True,
+        False,
+        None,
+        False,
+        False,
+        torch.float32,
+        False,
+        0,
+        0,
+    )
+    ref, ref_final_state = recurrent_gated_delta_rule_ref(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        initial_state=initial_state_ref,
+        output_final_state=True,
+    )
+
+    assert final_state.dtype == torch.float32
+    assert_close("o", ref.float(), out.float(), 0.005)
+    assert_close(
+        "ht",
+        ref_final_state.float(),
+        final_state.transpose(-1, -2).float(),
+        0.005,
+    )
 
 
 @pytest.mark.parametrize(

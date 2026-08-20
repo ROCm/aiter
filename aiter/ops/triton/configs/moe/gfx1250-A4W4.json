@@ -1,0 +1,2120 @@
+{
+    "bm16_n4096_k7168_tiny": {
+        "block_n": 256,
+        "block_k": 512,
+        "num_buffers": 3,
+        "num_warps": 4
+    },
+    "bm16_n4096_k7168_small": {
+        "block_n": 256,
+        "block_k": 512,
+        "num_buffers": 3,
+        "num_warps": 4
+    },
+    "bm16_n4096_k7168_medium": {
+        "block_n": 256,
+        "block_k": 512,
+        "num_buffers": 3,
+        "num_warps": 4
+    },
+    "bm16_n4096_k7168_medium2": {
+        "block_n": 256,
+        "block_k": 512,
+        "num_buffers": 3,
+        "num_warps": 4
+    },
+    "bm16_n4096_k7168_large": {
+        "block_n": 256,
+        "block_k": 512,
+        "num_buffers": 3,
+        "num_warps": 4
+    },
+    "bm16_n4096_k7168_xlarge": {
+        "block_n": 256,
+        "block_k": 512,
+        "num_buffers": 3,
+        "num_warps": 4
+    },
+    "bm16_n2048_k7168_tiny": {
+        "block_n": 256,
+        "block_k": 512,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm16_n2048_k7168_small": {
+        "block_n": 256,
+        "block_k": 512,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm16_n2048_k7168_medium": {
+        "block_n": 256,
+        "block_k": 512,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm16_n2048_k7168_medium2": {
+        "block_n": 256,
+        "block_k": 512,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm16_n2048_k7168_large": {
+        "block_n": 256,
+        "block_k": 512,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm16_n2048_k7168_xlarge": {
+        "block_n": 256,
+        "block_k": 512,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm16_n1024_k7168_tiny": {
+        "block_n": 128,
+        "block_k": 512,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm16_n1024_k7168_small": {
+        "block_n": 128,
+        "block_k": 512,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm16_n1024_k7168_medium": {
+        "block_n": 128,
+        "block_k": 512,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm16_n1024_k7168_medium2": {
+        "block_n": 128,
+        "block_k": 512,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm16_n1024_k7168_large": {
+        "block_n": 128,
+        "block_k": 512,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm16_n1024_k7168_xlarge": {
+        "block_n": 128,
+        "block_k": 512,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm16_n512_k7168_tiny": {
+        "block_n": 512,
+        "block_k": 512,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm16_n512_k7168_small": {
+        "block_n": 512,
+        "block_k": 512,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm16_n512_k7168_medium": {
+        "block_n": 512,
+        "block_k": 512,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm16_n512_k7168_medium2": {
+        "block_n": 512,
+        "block_k": 512,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm16_n512_k7168_large": {
+        "block_n": 512,
+        "block_k": 512,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm16_n512_k7168_xlarge": {
+        "block_n": 512,
+        "block_k": 512,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm16_n7168_k2048_tiny": {
+        "block_n": 128,
+        "block_k": 512,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm16_n7168_k2048_small": {
+        "block_n": 128,
+        "block_k": 512,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm16_n7168_k2048_medium": {
+        "block_n": 128,
+        "block_k": 512,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm16_n7168_k2048_medium2": {
+        "block_n": 128,
+        "block_k": 512,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm16_n7168_k2048_large": {
+        "block_n": 128,
+        "block_k": 512,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm16_n7168_k2048_xlarge": {
+        "block_n": 128,
+        "block_k": 512,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm16_n7168_k1024_tiny": {
+        "block_n": 128,
+        "block_k": 512,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm16_n7168_k1024_small": {
+        "block_n": 128,
+        "block_k": 512,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm16_n7168_k1024_medium": {
+        "block_n": 128,
+        "block_k": 512,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm16_n7168_k1024_medium2": {
+        "block_n": 128,
+        "block_k": 512,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm16_n7168_k1024_large": {
+        "block_n": 128,
+        "block_k": 512,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm16_n7168_k1024_xlarge": {
+        "block_n": 128,
+        "block_k": 512,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm16_n7168_k512_tiny": {
+        "block_n": 128,
+        "block_k": 512,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm16_n7168_k512_small": {
+        "block_n": 128,
+        "block_k": 512,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm16_n7168_k512_medium": {
+        "block_n": 128,
+        "block_k": 512,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm16_n7168_k512_medium2": {
+        "block_n": 128,
+        "block_k": 512,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm16_n7168_k512_large": {
+        "block_n": 128,
+        "block_k": 512,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm16_n7168_k512_xlarge": {
+        "block_n": 128,
+        "block_k": 512,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm16_n7168_k256_tiny": {
+        "block_n": 512,
+        "block_k": 512,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm16_n7168_k256_small": {
+        "block_n": 512,
+        "block_k": 512,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm16_n7168_k256_medium": {
+        "block_n": 512,
+        "block_k": 512,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm16_n7168_k256_medium2": {
+        "block_n": 512,
+        "block_k": 512,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm16_n7168_k256_large": {
+        "block_n": 512,
+        "block_k": 512,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm16_n7168_k256_xlarge": {
+        "block_n": 512,
+        "block_k": 512,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm16_n704_k800_tiny": {
+        "block_n": 128,
+        "block_k": 512,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm16_n704_k800_small": {
+        "block_n": 128,
+        "block_k": 512,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm16_n704_k800_medium": {
+        "block_n": 128,
+        "block_k": 512,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm16_n704_k800_medium2": {
+        "block_n": 128,
+        "block_k": 512,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm16_n704_k800_large": {
+        "block_n": 128,
+        "block_k": 512,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm16_n704_k800_xlarge": {
+        "block_n": 128,
+        "block_k": 512,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm16_n400_k800_tiny": {
+        "block_n": 512,
+        "block_k": 512,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm16_n400_k800_small": {
+        "block_n": 512,
+        "block_k": 512,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm16_n400_k800_medium": {
+        "block_n": 512,
+        "block_k": 512,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm16_n400_k800_medium2": {
+        "block_n": 512,
+        "block_k": 512,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm16_n400_k800_large": {
+        "block_n": 512,
+        "block_k": 512,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm16_n400_k800_xlarge": {
+        "block_n": 512,
+        "block_k": 512,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm16_n1024_k1024_tiny": {
+        "block_n": 128,
+        "block_k": 512,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm16_n1024_k1024_small": {
+        "block_n": 128,
+        "block_k": 512,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm16_n1024_k1024_medium": {
+        "block_n": 128,
+        "block_k": 512,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm16_n1024_k1024_medium2": {
+        "block_n": 128,
+        "block_k": 512,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm16_n1024_k1024_large": {
+        "block_n": 128,
+        "block_k": 512,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm16_n1024_k1024_xlarge": {
+        "block_n": 128,
+        "block_k": 512,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm16_n6144_k3072_tiny": {
+        "block_n": 128,
+        "block_k": 512,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm16_n6144_k3072_small": {
+        "block_n": 128,
+        "block_k": 512,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm16_n6144_k3072_medium": {
+        "block_n": 128,
+        "block_k": 512,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm16_n6144_k3072_medium2": {
+        "block_n": 128,
+        "block_k": 512,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm16_n6144_k3072_large": {
+        "block_n": 128,
+        "block_k": 512,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm16_n6144_k3072_xlarge": {
+        "block_n": 128,
+        "block_k": 512,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm16_n3072_k3072_tiny": {
+        "block_n": 256,
+        "block_k": 512,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm16_n3072_k3072_small": {
+        "block_n": 256,
+        "block_k": 512,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm16_n3072_k3072_medium": {
+        "block_n": 256,
+        "block_k": 512,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm16_n3072_k3072_medium2": {
+        "block_n": 256,
+        "block_k": 512,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm16_n3072_k3072_large": {
+        "block_n": 256,
+        "block_k": 512,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm16_n3072_k3072_xlarge": {
+        "block_n": 256,
+        "block_k": 512,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm16_n7168_k4096_tiny": {
+        "block_n": 128,
+        "block_k": 512,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm16_n7168_k4096_small": {
+        "block_n": 128,
+        "block_k": 512,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm16_n7168_k4096_medium": {
+        "block_n": 128,
+        "block_k": 512,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm16_n7168_k4096_medium2": {
+        "block_n": 128,
+        "block_k": 512,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm16_n7168_k4096_large": {
+        "block_n": 128,
+        "block_k": 512,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm16_n7168_k4096_xlarge": {
+        "block_n": 128,
+        "block_k": 512,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm16_n6144_k7168_tiny": {
+        "block_n": 256,
+        "block_k": 512,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm16_n6144_k7168_small": {
+        "block_n": 256,
+        "block_k": 512,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm16_n6144_k7168_medium": {
+        "block_n": 256,
+        "block_k": 512,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm16_n6144_k7168_medium2": {
+        "block_n": 256,
+        "block_k": 512,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm16_n6144_k7168_large": {
+        "block_n": 256,
+        "block_k": 512,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm16_n6144_k7168_xlarge": {
+        "block_n": 256,
+        "block_k": 512,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm16_n6144_k3584_tiny": {
+        "block_n": 512,
+        "block_k": 512,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm16_n6144_k3584_small": {
+        "block_n": 512,
+        "block_k": 512,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm16_n6144_k3584_medium": {
+        "block_n": 512,
+        "block_k": 512,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm16_n6144_k3584_medium2": {
+        "block_n": 512,
+        "block_k": 512,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm16_n6144_k3584_large": {
+        "block_n": 512,
+        "block_k": 512,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm16_n6144_k3584_xlarge": {
+        "block_n": 512,
+        "block_k": 512,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm32_n4096_k7168_tiny": {
+        "block_n": 256,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm32_n4096_k7168_small": {
+        "block_n": 256,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm32_n4096_k7168_medium": {
+        "block_n": 256,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm32_n4096_k7168_medium2": {
+        "block_n": 256,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm32_n4096_k7168_large": {
+        "block_n": 256,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm32_n4096_k7168_xlarge": {
+        "block_n": 256,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm32_n2048_k7168_tiny": {
+        "block_n": 256,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm32_n2048_k7168_small": {
+        "block_n": 256,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm32_n2048_k7168_medium": {
+        "block_n": 256,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm32_n2048_k7168_medium2": {
+        "block_n": 256,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm32_n2048_k7168_large": {
+        "block_n": 256,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm32_n2048_k7168_xlarge": {
+        "block_n": 256,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm32_n1024_k7168_tiny": {
+        "block_n": 128,
+        "block_k": 512,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm32_n1024_k7168_small": {
+        "block_n": 128,
+        "block_k": 512,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm32_n1024_k7168_medium": {
+        "block_n": 128,
+        "block_k": 512,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm32_n1024_k7168_medium2": {
+        "block_n": 128,
+        "block_k": 512,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm32_n1024_k7168_large": {
+        "block_n": 128,
+        "block_k": 512,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm32_n1024_k7168_xlarge": {
+        "block_n": 128,
+        "block_k": 512,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm32_n512_k7168_tiny": {
+        "block_n": 256,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm32_n512_k7168_small": {
+        "block_n": 256,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm32_n512_k7168_medium": {
+        "block_n": 256,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm32_n512_k7168_medium2": {
+        "block_n": 256,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm32_n512_k7168_large": {
+        "block_n": 256,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm32_n512_k7168_xlarge": {
+        "block_n": 256,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm32_n7168_k2048_tiny": {
+        "block_n": 128,
+        "block_k": 512,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm32_n7168_k2048_small": {
+        "block_n": 128,
+        "block_k": 512,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm32_n7168_k2048_medium": {
+        "block_n": 128,
+        "block_k": 512,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm32_n7168_k2048_medium2": {
+        "block_n": 128,
+        "block_k": 512,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm32_n7168_k2048_large": {
+        "block_n": 128,
+        "block_k": 512,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm32_n7168_k2048_xlarge": {
+        "block_n": 128,
+        "block_k": 512,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm32_n7168_k1024_tiny": {
+        "block_n": 512,
+        "block_k": 512,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm32_n7168_k1024_small": {
+        "block_n": 512,
+        "block_k": 512,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm32_n7168_k1024_medium": {
+        "block_n": 512,
+        "block_k": 512,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm32_n7168_k1024_medium2": {
+        "block_n": 512,
+        "block_k": 512,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm32_n7168_k1024_large": {
+        "block_n": 512,
+        "block_k": 512,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm32_n7168_k1024_xlarge": {
+        "block_n": 512,
+        "block_k": 512,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm32_n7168_k512_tiny": {
+        "block_n": 512,
+        "block_k": 512,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm32_n7168_k512_small": {
+        "block_n": 512,
+        "block_k": 512,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm32_n7168_k512_medium": {
+        "block_n": 512,
+        "block_k": 512,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm32_n7168_k512_medium2": {
+        "block_n": 512,
+        "block_k": 512,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm32_n7168_k512_large": {
+        "block_n": 512,
+        "block_k": 512,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm32_n7168_k512_xlarge": {
+        "block_n": 512,
+        "block_k": 512,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm32_n7168_k256_tiny": {
+        "block_n": 512,
+        "block_k": 512,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm32_n7168_k256_small": {
+        "block_n": 512,
+        "block_k": 512,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm32_n7168_k256_medium": {
+        "block_n": 512,
+        "block_k": 512,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm32_n7168_k256_medium2": {
+        "block_n": 512,
+        "block_k": 512,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm32_n7168_k256_large": {
+        "block_n": 512,
+        "block_k": 512,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm32_n7168_k256_xlarge": {
+        "block_n": 512,
+        "block_k": 512,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm32_n704_k800_tiny": {
+        "block_n": 128,
+        "block_k": 512,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm32_n704_k800_small": {
+        "block_n": 128,
+        "block_k": 512,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm32_n704_k800_medium": {
+        "block_n": 128,
+        "block_k": 512,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm32_n704_k800_medium2": {
+        "block_n": 128,
+        "block_k": 512,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm32_n704_k800_large": {
+        "block_n": 128,
+        "block_k": 512,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm32_n704_k800_xlarge": {
+        "block_n": 128,
+        "block_k": 512,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm32_n400_k800_tiny": {
+        "block_n": 256,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm32_n400_k800_small": {
+        "block_n": 256,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm32_n400_k800_medium": {
+        "block_n": 256,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm32_n400_k800_medium2": {
+        "block_n": 256,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm32_n400_k800_large": {
+        "block_n": 256,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm32_n400_k800_xlarge": {
+        "block_n": 256,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm32_n1024_k1024_tiny": {
+        "block_n": 128,
+        "block_k": 512,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm32_n1024_k1024_small": {
+        "block_n": 128,
+        "block_k": 512,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm32_n1024_k1024_medium": {
+        "block_n": 128,
+        "block_k": 512,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm32_n1024_k1024_medium2": {
+        "block_n": 128,
+        "block_k": 512,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm32_n1024_k1024_large": {
+        "block_n": 128,
+        "block_k": 512,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm32_n1024_k1024_xlarge": {
+        "block_n": 128,
+        "block_k": 512,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm32_n6144_k3072_tiny": {
+        "block_n": 128,
+        "block_k": 512,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm32_n6144_k3072_small": {
+        "block_n": 128,
+        "block_k": 512,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm32_n6144_k3072_medium": {
+        "block_n": 128,
+        "block_k": 512,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm32_n6144_k3072_medium2": {
+        "block_n": 128,
+        "block_k": 512,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm32_n6144_k3072_large": {
+        "block_n": 128,
+        "block_k": 512,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm32_n6144_k3072_xlarge": {
+        "block_n": 128,
+        "block_k": 512,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm32_n3072_k3072_tiny": {
+        "block_n": 256,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm32_n3072_k3072_small": {
+        "block_n": 256,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm32_n3072_k3072_medium": {
+        "block_n": 256,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm32_n3072_k3072_medium2": {
+        "block_n": 256,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm32_n3072_k3072_large": {
+        "block_n": 256,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm32_n3072_k3072_xlarge": {
+        "block_n": 256,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm32_n7168_k4096_tiny": {
+        "block_n": 128,
+        "block_k": 512,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm32_n7168_k4096_small": {
+        "block_n": 128,
+        "block_k": 512,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm32_n7168_k4096_medium": {
+        "block_n": 128,
+        "block_k": 512,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm32_n7168_k4096_medium2": {
+        "block_n": 128,
+        "block_k": 512,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm32_n7168_k4096_large": {
+        "block_n": 128,
+        "block_k": 512,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm32_n7168_k4096_xlarge": {
+        "block_n": 128,
+        "block_k": 512,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm64_n4096_k7168_tiny": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm64_n4096_k7168_small": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm64_n4096_k7168_medium": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm64_n4096_k7168_medium2": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm64_n4096_k7168_large": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm64_n4096_k7168_xlarge": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm64_n2048_k7168_tiny": {
+        "block_n": 256,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm64_n2048_k7168_small": {
+        "block_n": 256,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm64_n2048_k7168_medium": {
+        "block_n": 256,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm64_n2048_k7168_medium2": {
+        "block_n": 256,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm64_n2048_k7168_large": {
+        "block_n": 256,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm64_n2048_k7168_xlarge": {
+        "block_n": 256,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm64_n1024_k7168_tiny": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm64_n1024_k7168_small": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm64_n1024_k7168_medium": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm64_n1024_k7168_medium2": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm64_n1024_k7168_large": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm64_n1024_k7168_xlarge": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm64_n512_k7168_tiny": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm64_n512_k7168_small": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm64_n512_k7168_medium": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm64_n512_k7168_medium2": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm64_n512_k7168_large": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm64_n512_k7168_xlarge": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm64_n7168_k2048_tiny": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm64_n7168_k2048_small": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm64_n7168_k2048_medium": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm64_n7168_k2048_medium2": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm64_n7168_k2048_large": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm64_n7168_k2048_xlarge": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm64_n7168_k1024_tiny": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm64_n7168_k1024_small": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm64_n7168_k1024_medium": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm64_n7168_k1024_medium2": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm64_n7168_k1024_large": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm64_n7168_k1024_xlarge": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm64_n7168_k512_tiny": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm64_n7168_k512_small": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm64_n7168_k512_medium": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm64_n7168_k512_medium2": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm64_n7168_k512_large": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm64_n7168_k512_xlarge": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm64_n7168_k256_tiny": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm64_n7168_k256_small": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm64_n7168_k256_medium": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm64_n7168_k256_medium2": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm64_n7168_k256_large": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm64_n7168_k256_xlarge": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm64_n704_k800_tiny": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm64_n704_k800_small": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm64_n704_k800_medium": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm64_n704_k800_medium2": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm64_n704_k800_large": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm64_n704_k800_xlarge": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm64_n400_k800_tiny": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm64_n400_k800_small": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm64_n400_k800_medium": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm64_n400_k800_medium2": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm64_n400_k800_large": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm64_n400_k800_xlarge": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm64_n1024_k1024_tiny": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm64_n1024_k1024_small": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm64_n1024_k1024_medium": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm64_n1024_k1024_medium2": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm64_n1024_k1024_large": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm64_n1024_k1024_xlarge": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm64_n6144_k3072_tiny": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm64_n6144_k3072_small": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm64_n6144_k3072_medium": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm64_n6144_k3072_medium2": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm64_n6144_k3072_large": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm64_n6144_k3072_xlarge": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm64_n3072_k3072_tiny": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm64_n3072_k3072_small": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm64_n3072_k3072_medium": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm64_n3072_k3072_medium2": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm64_n3072_k3072_large": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm64_n3072_k3072_xlarge": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm64_n7168_k4096_tiny": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm64_n7168_k4096_small": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm64_n7168_k4096_medium": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm64_n7168_k4096_medium2": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm64_n7168_k4096_large": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm64_n7168_k4096_xlarge": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm128_n4096_k7168_tiny": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm128_n4096_k7168_small": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm128_n4096_k7168_medium": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm128_n4096_k7168_medium2": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm128_n4096_k7168_large": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm128_n4096_k7168_xlarge": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm128_n2048_k7168_tiny": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm128_n2048_k7168_small": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm128_n2048_k7168_medium": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm128_n2048_k7168_medium2": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm128_n2048_k7168_large": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm128_n2048_k7168_xlarge": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm128_n1024_k7168_tiny": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm128_n1024_k7168_small": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm128_n1024_k7168_medium": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm128_n1024_k7168_medium2": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm128_n1024_k7168_large": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm128_n1024_k7168_xlarge": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm128_n512_k7168_tiny": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm128_n512_k7168_small": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm128_n512_k7168_medium": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm128_n512_k7168_medium2": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm128_n512_k7168_large": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm128_n512_k7168_xlarge": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm128_n7168_k2048_tiny": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm128_n7168_k2048_small": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm128_n7168_k2048_medium": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm128_n7168_k2048_medium2": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm128_n7168_k2048_large": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm128_n7168_k2048_xlarge": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm128_n7168_k1024_tiny": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm128_n7168_k1024_small": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm128_n7168_k1024_medium": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm128_n7168_k1024_medium2": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm128_n7168_k1024_large": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm128_n7168_k1024_xlarge": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm128_n7168_k512_tiny": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm128_n7168_k512_small": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm128_n7168_k512_medium": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm128_n7168_k512_medium2": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm128_n7168_k512_large": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm128_n7168_k512_xlarge": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm128_n7168_k256_tiny": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm128_n7168_k256_small": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm128_n7168_k256_medium": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm128_n7168_k256_medium2": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm128_n7168_k256_large": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm128_n7168_k256_xlarge": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm128_n704_k800_tiny": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm128_n704_k800_small": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm128_n704_k800_medium": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm128_n704_k800_medium2": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm128_n704_k800_large": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm128_n704_k800_xlarge": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm128_n400_k800_tiny": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm128_n400_k800_small": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm128_n400_k800_medium": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm128_n400_k800_medium2": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm128_n400_k800_large": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm128_n400_k800_xlarge": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm128_n1024_k1024_tiny": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm128_n1024_k1024_small": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm128_n1024_k1024_medium": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm128_n1024_k1024_medium2": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm128_n1024_k1024_large": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm128_n1024_k1024_xlarge": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm128_n6144_k3072_tiny": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm128_n6144_k3072_small": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm128_n6144_k3072_medium": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm128_n6144_k3072_medium2": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm128_n6144_k3072_large": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm128_n6144_k3072_xlarge": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm128_n3072_k3072_tiny": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm128_n3072_k3072_small": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm128_n3072_k3072_medium": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm128_n3072_k3072_medium2": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm128_n3072_k3072_large": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm128_n3072_k3072_xlarge": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm128_n7168_k4096_tiny": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm128_n7168_k4096_small": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm128_n7168_k4096_medium": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm128_n7168_k4096_medium2": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm128_n7168_k4096_large": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm128_n7168_k4096_xlarge": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm16_any": {
+        "block_n": 128,
+        "block_k": 512,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm32_any": {
+        "block_n": 128,
+        "block_k": 512,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm64_any": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm128_any": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm256_any": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 1,
+        "num_warps": 4
+    }
+}

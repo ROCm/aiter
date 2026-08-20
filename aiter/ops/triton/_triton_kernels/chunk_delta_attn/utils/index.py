@@ -7,7 +7,12 @@
 import torch
 import triton
 
+from aiter.ops.triton._triton_kernels.chunk_delta_attn.chunk_delta_attn_utils import (
+    tensor_cache,
+)
 
+
+@tensor_cache
 def prepare_chunk_indices(
     cu_seqlens: torch.LongTensor,
     chunk_size: int,
@@ -22,6 +27,9 @@ def prepare_chunk_indices(
     Returns:
         Tensor of shape [num_chunks, 2] where each row is
         [sequence_id, chunk_idx_in_seq]
+
+    Building this reads ``cu_seqlens`` back to the host and ships a new tensor
+    out, so it is cached on the argument identity; see ``tensor_cache``.
     """
     lens = torch.diff(cu_seqlens)
     indices = torch.cat(

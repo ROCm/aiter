@@ -59,7 +59,7 @@ def chunk_kimi_delta_attn(
     lower_bound: float | None = None,
     state_v_first: bool = False,
     disable_recompute: bool = False,
-    chunk_size: int = 64,
+    chunk_size: int | None = None,
     cu_seqlens: torch.LongTensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     r"""
@@ -120,8 +120,21 @@ def chunk_kimi_delta_attn(
             Ignored. In fla this keeps the gated query `qg` alive for the
             backward pass; this path is forward-only and returns no scratch,
             so the flag is accepted for signature parity only.
-        chunk_size (int):
-            Chunk size, either 32 or 64. Default: `64`.
+        chunk_size (int, optional):
+            Chunk size, either 32 or 64. Default: `None`, which lets the
+            library choose. fla has no counterpart and pins 64 internally, so
+            nothing on the shared surface sets this.
+
+            The choice is really which kernel runs. 32 is the two-kernel
+            FlashKDA path's entry ticket, and it is picked when the rest of the
+            call also qualifies for it: the fused gate, in-kernel l2norm and
+            beta sigmoid, `safe_gate`, and `K = V = 128` without GVA. Anything
+            else gets 64, which is the faster of the two inside the default
+            pipeline. Passing 32 or 64 explicitly is honoured as given.
+
+            FlashKDA agrees with the default pipeline to bf16 rather than
+            exactly, as does 32 against 64 within the default pipeline itself.
+            Set `CHUNK_DELTA_ATTN_USE_FLASH_KDA=0` to pin the default pipeline.
         cu_seqlens (torch.LongTensor, optional):
             Cumulative sequence lengths of shape `[N+1]` for variable-length
             inputs, consistent with the FlashAttention API. Default: `None`.
@@ -209,7 +222,7 @@ def chunk_kimi_delta_attn(
 
     _LOGGER.info(
         f"CHUNK_KIMI_DELTA_ATTN: q={tuple(q.shape)}, v={tuple(v.shape)}, "
-        f"scale={scale}, chunk_size={chunk_size}, safe_gate={safe_gate}, "
+        f"scale={scale}, chunk_size={chunk_size or 'auto'}, safe_gate={safe_gate}, "
         f"lower_bound={lower_bound}, state_v_first={state_v_first}, "
         f"varlen={cu_seqlens is not None}"
     )

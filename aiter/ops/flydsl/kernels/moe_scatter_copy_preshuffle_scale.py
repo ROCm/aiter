@@ -15,11 +15,11 @@ WMMA layout the masked grouped GEMM consumes. Previously this was two passes:
 where ``preshuffle`` (``_grouped_a8w4_preshuffle_e8m0_scale``) is the reshape::
 
     g = scale.view(E, -1, wmma_rep, 16, k_groups, k_wmma_steps, 4)
-    g = g.permute(0, 1, 3, 4, 5, 2, 6).contiguous()
+    g = g.permute(0, 1, 4, 5, 2, 3, 6).contiguous()
     grouped = g.reshape(E, max_m // wmma_rep, k_scale * wmma_rep)
 
 i.e. for a source byte at ``(w, lane, kg, ks, kw)`` inside one row-tile of
-``(wmma_rep, 16)`` rows it lands at ``(lane, kg, ks, w, kw)``. The permute is
+``(wmma_rep, 16)`` rows it lands at ``(kg, ks, w, lane, kw)``. The permute is
 *tile-local*: nothing crosses a ``wmma_rep*16`` row boundary.
 
 This kernel fuses the two passes: it gathers each token's scale row and writes
@@ -33,25 +33,18 @@ as dword (4-byte) units: ``src_dwords = Ws // 4 = k_groups * k_wmma_steps``,
 where the innermost 4 (``kw``) is exactly one dword and is contiguous in *both*
 source and destination.
 
-The permute only relocates the ``wmma_rep`` axis next to the trailing ``4``, so
-in the output the innermost ``(wmma_rep, 4)`` is a *contiguous* ``wmma_rep*4``-
-byte block (``wmma_rep`` dwords). We give that whole block to one thread: it
-gathers the ``wmma_rep`` source dwords (one per source token-row, the only
-scattered part) into a register vector and issues a single ``dwordx{wmma_rep}``
-store (a 16B ``dwordx4`` when ``wmma_rep == 4`` -- the widest/fastest op). The
-permute is thus done in registers; the store is fully vectorized.
+The output's innermost ``(16, 4)`` is one contiguous M16 scale block. Adjacent
+threads write adjacent row dwords, so stores are coalesced and the GEMM can load
+two adjacent M16 blocks with one full-wave LDS instruction.
 
 One thread-block handles one row-tile (``wmma_rep*16`` grouped rows) of one
-expert -- a 2D grid ``(tiles_per_expert, E)``. One work item == one
-``(lane, sd)`` with ``sd = kg*k_wmma_steps + ks`` in ``[0, src_dwords)``:
+expert -- a 2D grid ``(tiles_per_expert, E)``. One work item is one
+``(sd, w, lane)`` destination dword:
 
-    out_row   = tile*16 + lane
-    dst_dword = e*(max_m*src_dwords) + out_row*(src_dwords*wmma_rep) + sd*wmma_rep
-    for w in range(wmma_rep):                      # the contiguous wmma_rep axis
-        grow  = e*max_m + tile*(wmma_rep*16) + w*16 + lane
-        srow  = rows_to_tokens[grow]               # source token (-1 => padding)
-        vec[w] = (srow >= 0) ? src[srow, sd] : 0   # 0 for padding lanes
-    store vec  (wmma_rep dwords) at dst_dword
+    grow      = e*max_m + tile*(wmma_rep*16) + w*16 + lane
+    srow      = rows_to_tokens[grow]               # source token (-1 => padding)
+    value     = (srow >= 0) ? src[srow, sd] : 0    # 0 for padding lanes
+    dst_dword = tile_base + (sd*wmma_rep + w)*16 + lane
 
 Padding lanes are written as 0 (matching the zero-init reference / harmless to
 the masked GEMM, which never reads padding rows). The whole output is written
@@ -70,7 +63,7 @@ from flydsl.expr import arith, range_constexpr
 from flydsl.expr.arith import ArithValue, CmpIPredicate
 from flydsl.expr.typing import Int32, T
 
-from aiter.ops.flydsl.kernels import buffer_ops, vector
+from aiter.ops.flydsl.kernels import buffer_ops
 from aiter.ops.flydsl.kernels.tensor_shim import (
     AITER_FLYDSL_KERNARG_PRELOAD,
     AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
@@ -137,20 +130,7 @@ def build_moe_scatter_copy_preshuffle_scale_module(
     # Compile-time tile geometry (mirrors _grouped_a8w4_preshuffle_e8m0_scale).
     src_dwords = row_bytes // 4  # k_groups * k_wmma_steps (dwords/row)
     rows_per_tile = wmma_rep * 16  # grouped rows per row-tile
-    dpr = src_dwords * wmma_rep  # dst dwords per output row
-    # The contiguous (wmma_rep, 4) dst block is wmma_rep dwords. Buffer ops cap at
-    # dwordx4 (128b), so store it in chunks of `store_vw` (largest of {4,2,1}
-    # dividing wmma_rep); wmma_rep in {1,2,4} is a single chunk, 8 -> two dwordx4.
-    if wmma_rep % 4 == 0:
-        store_vw = 4
-    elif wmma_rep % 2 == 0:
-        store_vw = 2
-    else:
-        store_vw = 1
-    n_chunks = wmma_rep // store_vw
-    # One work item == one (lane, sd, chunk): it writes `store_vw` contiguous dst
-    # dwords as one dwordx{store_vw} store.
-    units_per_tile = 16 * src_dwords * n_chunks
+    units_per_tile = 16 * src_dwords * wmma_rep
 
     _g = "g" if gather else "p"
     module_name = f"moe_scatter_preshuffle_scale_b{row_bytes}_r{wmma_rep}_k{scale_k_per_tile}_{_g}"
@@ -162,9 +142,8 @@ def build_moe_scatter_copy_preshuffle_scale_module(
         rows_to_tokens: fx.Pointer,  # (E*max_m,) int32  -- -1 = skip (gather only)
         max_m: Int32,
     ):
+        """Write scales as ``(E, M//(wmma_rep*16), K//128, wmma_rep, 16, 4)``."""
         i32 = T.i32
-        vec_ty = ir.VectorType.get([store_vw], i32) if store_vw > 1 else None
-
         tile = ArithValue(fx.block_idx.x)
         e = ArithValue(fx.block_idx.y)
         tid = ArithValue(fx.thread_idx.x)
@@ -172,10 +151,7 @@ def build_moe_scatter_copy_preshuffle_scale_module(
 
         c_rows_per_tile = arith.constant(rows_per_tile, type=i32)
         c_src_dwords = arith.constant(src_dwords, type=i32)
-        c_dpr = arith.constant(dpr, type=i32)
         c_wmma_rep = arith.constant(wmma_rep, type=i32)
-        c_n_chunks = arith.constant(n_chunks, type=i32)
-        c_store_vw = arith.constant(store_vw, type=i32)
         c_units = arith.constant(units_per_tile, type=i32)
         c16 = arith.constant(16, type=i32)
         c0 = arith.constant(0, type=i32)
@@ -201,36 +177,17 @@ def build_moe_scatter_copy_preshuffle_scale_module(
             u_ok = arith.cmpi(CmpIPredicate.ult, unit, c_units)
             _if_u = scf.IfOp(u_ok)
             with ir.InsertionPoint(_if_u.then_block):
-                # Decode (lane, sd, chunk) with chunk innermost so consecutive
-                # threads write consecutive dst dwords (coalesced).
-                chunk = unit % c_n_chunks
-                t2 = unit // c_n_chunks
-                sd = t2 % c_src_dwords
-                lane = t2 // c_src_dwords
-                out_row = tile_out_row0 + lane
-                w_base = chunk * c_store_vw  # first wmma_rep row of this chunk
-                # col = sd*wmma_rep + chunk*store_vw  (+ j for j in [0, store_vw))
-                dst_off = expert_dword_base + out_row * c_dpr + sd * c_wmma_rep + w_base
-
-                # Collect this chunk's store_vw dwords (one per wmma_rep row). The
-                # gather/identity choice is resolved in the plain helper, so no
-                # build-time `if` appears inside this rewritten kernel body.
-                elems = []
-                for j in range_constexpr(store_vw):
-                    grow = (
-                        row_base + (w_base + arith.constant(j, type=i32)) * c16 + lane
-                    )
-                    elems.append(
-                        _emit_preshuffle_dword(
-                            gather, map_rsrc, src_rsrc, grow, sd, c_src_dwords, c0
-                        )
-                    )
-
-                if store_vw == 1:
-                    buffer_ops.buffer_store(elems[0], dst_rsrc, dst_off)
-                else:
-                    vec = vector.from_elements(vec_ty, elems)
-                    buffer_ops.buffer_store(vec, dst_rsrc, dst_off)
+                lane = unit % c16
+                t2 = unit // c16
+                w = t2 % c_wmma_rep
+                sd = t2 // c_wmma_rep
+                grow = row_base + w * c16 + lane
+                value = _emit_preshuffle_dword(
+                    gather, map_rsrc, src_rsrc, grow, sd, c_src_dwords, c0
+                )
+                tile_dword_base = expert_dword_base + tile_out_row0 * c_src_dwords
+                dst_off = tile_dword_base + (sd * c_wmma_rep + w) * c16 + lane
+                buffer_ops.buffer_store(value, dst_rsrc, dst_off)
                 scf.YieldOp([])
 
     if gather:
