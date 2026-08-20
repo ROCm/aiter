@@ -654,12 +654,10 @@ void inverse_rope_group_quant(
         // gfx950 a resident wave, its register file being half as deep per lane.
         const bool wave64 = wave_size == 64;
 
-        // The wide slice needs fewer reduction steps and wins while waves are
-        // scarce; once enough waves are in flight to hide that reduction, the
-        // narrow slice plus a second group per thread pulls ahead. The crossover
-        // is a wave count that depends on the group size -- bracketed per tier
-        // in md 17.4 and 17.10, and the three values are not interchangeable
-        // (forcing GS=32 to the wider tier cost 31%, md 17.3).
+        // Selects a second group per thread once enough waves are in flight to
+        // hide the reduction. This no longer narrows the slice as well: the
+        // §15.11 super-major remap moved the crossover past every shape we run,
+        // and letting it pick the 32B slice cost s=16384 up to 9% (md 16.1).
         constexpr int kNarrowCrossoverWavesPerSimd =
             GS >= 128 ? 56 : (GS >= 64 ? 40 : 24);
         const int64_t simds = static_cast<int64_t>(get_num_cu_func()) * 4;
@@ -669,7 +667,7 @@ void inverse_rope_group_quant(
             wide_waves >= simds * kNarrowCrossoverWavesPerSimd;
 
         // Bytes per thread at bf16/fp16: 16B on wave64, else 32B or 64B.
-        int tds = wave64 ? 8 : (narrow_slice ? 16 : 32);
+        int tds = wave64 ? 8 : 32;
         if(wave64 && !kMfmaTile)
         {
             // A launch too small to cover the GPU is wave-starved rather than
