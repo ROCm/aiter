@@ -23,10 +23,7 @@ Cache formats (Fmt.KIND), per segment:
     "dsmla"    vLLM fp8_ds_mla: 512 fp8 | 4 f32 per-128 scales | 64 bf16 rope
                (656 B rows); requires ROPE_SEPARATE.
 
-Compile-time state is bundled into aggregates instead of long parameter lists:
-Cfg (geometry, layouts, behavior knobs), Fmt (per-segment cache format), Seg
-(runtime pointers/bounds). Two-loop (SWA + top-k) or a single segment; 2D and
-3D (split-K + reduce) share one kernel. Launchers:
+Launchers:
 aiter/ops/triton/attention/pa_decode_sparse.py (DSv4 / uniform pool) and
 aiter/ops/triton/attention/sparse_mla_decode.py (separated-rope MLA).
 """
@@ -187,17 +184,6 @@ def _split_ax(x, AXIS: gl.constexpr):
     return a, b
 
 
-# fp8 (e4m3 OCP) x E8M0 -> bf16, one instruction per 2 elements. Emitted as two
-# single-output asm calls, not one two-output blob: a single instruction reads
-# all its sources before writing dst, so no output needs early clobber. The
-# blob form does, and that forced =&v liveness spills a kernel with no headroom.
-_DEQ_LO: gl.constexpr = gl.constexpr("v_cvt_scalef32_pk_bf16_fp8 $0, $1, $2")
-_DEQ_HI: gl.constexpr = gl.constexpr(
-    "v_cvt_scalef32_pk_bf16_fp8 $0, $1, $2 op_sel:[1,0,0]"
-)
-_DEQ_CONS: gl.constexpr = gl.constexpr("=v,v,v")
-
-
 @gluon.jit
 def _deq_asm(x16, e_u8, W8: gl.constexpr, out_l: gl.constexpr):
     """[BLOCK_K, W8/2] int16 (4 packed fp8) + raw E8M0 byte -> [BLOCK_K, W8] bf16.
@@ -206,6 +192,12 @@ def _deq_asm(x16, e_u8, W8: gl.constexpr, out_l: gl.constexpr):
     of its high half, so a 16-bit e << 7 lands the exponent where an f32
     e << 23 would and costs one register instead of two. The scale is a power of
     two, so this stays bit-identical to the unfused convert + multiply."""
+
+    _DEQ_LO: gl.constexpr = gl.constexpr("v_cvt_scalef32_pk_bf16_fp8 $0, $1, $2")
+    _DEQ_HI: gl.constexpr = gl.constexpr(
+        "v_cvt_scalef32_pk_bf16_fp8 $0, $1, $2 op_sel:[1,0,0]"
+    )
+    _DEQ_CONS: gl.constexpr = gl.constexpr("=v,v,v")
     sc16 = e_u8.to(gl.uint16) << 7
     lo = gl.inline_asm_elementwise(
         _DEQ_LO, _DEQ_CONS, [x16, sc16], dtype=gl.bfloat16, is_pure=True, pack=2
@@ -221,12 +213,6 @@ def _deq_asm(x16, e_u8, W8: gl.constexpr, out_l: gl.constexpr):
     both = gl.join(lo3, hi3).permute(0, 1, 3, 2).reshape(lo.shape[0], W8)
     # Back to the gather layout, or the kv_smem store lowers to narrow ds_writes.
     return gl.convert_layout(both, out_l, assert_trivial=True)
-
-
-# ---------------------------------------------------------------------------
-# Aggregates: Cfg (shared compile-time), Fmt (per-segment compile-time),
-# Seg (per-segment runtime). Built once at the kernel entry.
-# ---------------------------------------------------------------------------
 
 
 @aggregate
