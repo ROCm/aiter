@@ -16,6 +16,7 @@ import torch
 
 from ..utils import (
     GatedDeltaRulePrefillMetadata,
+    K5K6Fusion,
     build_gated_delta_rule_prefill_metadata,
     chunk_local_cumsum,
     chunk_scaled_dot_kkt_fwd,
@@ -240,6 +241,7 @@ def chunk_gated_delta_rule_fwd_opt_vk(
     use_chunk_hip: bool = False,
     use_chunk_flydsl: bool = False,
     use_prepare_flydsl: bool = False,
+    fusion: K5K6Fusion = K5K6Fusion.AUTO,
     state_dtype: torch.dtype | None = None,
     use_exp2: bool = True,
     o: torch.Tensor | None = None,
@@ -275,11 +277,19 @@ def chunk_gated_delta_rule_fwd_opt_vk(
         initial_state: optional [N, H, V, K] — note transposed h layout
         output_final_state: bool
         cu_seqlens: [N+1] optional
-        use_chunk_hip: bool — use HIP kernel for hidden state
-        use_chunk_flydsl: bool — use FlyDSL kernel for hidden state
+        use_chunk_hip: bool — use HIP kernel for hidden state (K5)
+        use_chunk_flydsl: bool — use the FlyDSL backend for the K5+K6 stage.
         use_prepare_flydsl: bool — use the fused prepare kernel when supported.
             Variable-length input also requires a prefill schedule; otherwise
             the function warns and falls back to Triton.
+        fusion: K5K6Fusion — whether to run the fused FlyDSL K5+K6 kernel (one
+            dispatch producing both the hidden state and the output ``o``) or the
+            separate K5 + K6 pipeline. ``AUTO`` (default) lets the shape heuristic
+            decide (gfx942 and BV=64 grid fill ``ceil(V/64)*N*H / CU >= 0.5``);
+            ``ALWAYS`` forces the fused kernel; ``NEVER`` forces the separate
+            path. When the fused kernel runs it skips the separate K6 call and
+            returns early. ``fusion`` is dependent on the ``use_chunk_flydsl``
+            flag and requires it to be set to True.
         state_dtype: optional initial/final state dtype (`fp32` or `bf16`),
             supported by both the HIP and Triton hidden-state paths
         use_exp2: bool — use exp2 instead of exp for gate computation
@@ -316,6 +326,8 @@ def chunk_gated_delta_rule_fwd_opt_vk(
             "Indexed state pools and in-place final-state write-back are not "
             "supported by the FlyDSL K5 path."
         )
+    fusion = K5K6Fusion.coerce(fusion)
+
     if cu_seqlens is None:
         if seq_lens_cpu is not None or prefill_metadata is not None:
             raise ValueError(
@@ -343,6 +355,29 @@ def chunk_gated_delta_rule_fwd_opt_vk(
                 "use_chunk_flydsl requires bfloat16 inputs with K=128 and V=128; "
                 f"got dtype={k.dtype}, K={k.shape[-1]}, V={v.shape[-1]}."
             )
+
+    # Fusion is resolved *after* the fallbacks above so that an arch that turned
+    # ``use_chunk_flydsl`` off cannot leave the fused flag stranded at True.
+    if use_chunk_flydsl:
+        if fusion is K5K6Fusion.ALWAYS:
+            use_chunk_flydsl_fused = True
+        elif fusion is K5K6Fusion.AUTO:
+            from aiter.ops.flydsl.linear_attention_prefill_kernels import (
+                should_use_fused_gfx942,
+            )
+
+            _N = (
+                len(cu_seqlens) - 1 - num_decodes
+                if cu_seqlens is not None
+                else v.shape[0]
+            )
+            use_chunk_flydsl_fused = should_use_fused_gfx942(
+                H=v.shape[2], N=_N, V=v.shape[-1]
+            )
+        else:
+            use_chunk_flydsl_fused = False
+    else:
+        use_chunk_flydsl_fused = False
 
     if use_prepare_flydsl:
         from aiter.ops.flydsl.linear_attention_prefill_kernels import (
@@ -403,6 +438,37 @@ def chunk_gated_delta_rule_fwd_opt_vk(
             prefill_metadata=prefill_metadata,
         )
 
+    if use_chunk_flydsl_fused:
+        # Fused K5+K6: hidden-state scan and output ``o`` in one dispatch.
+        # ``g_cumsum`` from K1+K2 is head-major [B, H, T] (same convention as
+        # the K5 wrapper). K6 gating uses scalar ``g`` only; the KDA (gk) path
+        # folds its decay into K5 and is not routed through this scalar pipeline.
+        from aiter.ops.flydsl.linear_attention_prefill_kernels import (
+            chunk_gated_delta_rule_fwd_h_o_flydsl,
+        )
+
+        if o is None:
+            o = v.new_empty(v.shape)
+
+        o, final_state = chunk_gated_delta_rule_fwd_h_o_flydsl(
+            q=q,
+            k=k,
+            w=w,
+            u=u,
+            g=g_cumsum,
+            scale=scale,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            cu_seqlens=cu_seqlens,
+            state_dtype=state_dtype,
+            use_exp2=use_exp2,
+            num_decodes=num_decodes,
+            num_decode_tokens=num_decode_tokens,
+            prefill_metadata=prefill_metadata,
+            o=o,
+        )
+        return g_cumsum, o, final_state
+
     if use_chunk_hip:
         from aiter.ops.chunk_gated_delta_rule_fwd_h import (
             chunk_gated_delta_rule_fwd_h_hip_fn,
@@ -432,12 +498,16 @@ def chunk_gated_delta_rule_fwd_opt_vk(
                 "FlyDSL K5 does not support overriding `snapshot_dtype`; "
                 "omit it or pass `k.dtype`."
             )
-        # Prepare emits head-major ``g_cumsum``.
+        # FlyDSL K5 wrapper expects ``g`` in head-major [B, H, T] layout
+        # (matches Triton VK / HIP). ``g_cumsum`` from K1+K2 (or from the fused
+        # FlyDSL prepare) is already head-major, so pass it through directly.
+        # The wrapper accepts ``use_exp2`` as a kwarg and pre-scales ``gk``
+        # internally, and selects the tuned gfx942 K5 build on gfx942.
         from aiter.ops.flydsl.linear_attention_prefill_kernels import (
-            chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip,
+            chunk_gated_delta_rule_fwd_h_flydsl,
         )
 
-        h, v_new, final_state = chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(
+        h, v_new, final_state = chunk_gated_delta_rule_fwd_h_flydsl(
             k=k,
             w=w,
             u=u,
@@ -449,7 +519,6 @@ def chunk_gated_delta_rule_fwd_opt_vk(
             use_exp2=use_exp2,
             num_decodes=num_decodes,
             num_decode_tokens=num_decode_tokens,
-            g_head_major=True,
             prefill_metadata=prefill_metadata,
         )
     else:

@@ -32,6 +32,7 @@ if not is_flydsl_available():
 
 try:
     from aiter.ops.flydsl.linear_attention_prefill_kernels import (
+        chunk_gated_delta_rule_fwd_h_flydsl,
         chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip,
     )
     from aiter.ops.triton._triton_kernels.gated_delta_rule.prefill.chunk import (
@@ -568,6 +569,73 @@ STATE_BF16_PARAMS = [
 STATE_BF16_TEST_IDS = [repr(p) for p in STATE_BF16_PARAMS]
 
 
+# -- KDA (Kimi-K3) per-channel gate shapes ----------------
+# These exercise the USE_GK code path with ``gk`` instead of ``g``.
+KDA_PARAMS = [
+    PrefillArgs(
+        K=128,
+        V=128,
+        Hk=96,
+        Hv=96,
+        tp=8,
+        full_prompt_len=8192,
+        model_name="KDA-kimi-k3-tp8-T8k",
+        is_varlen=True,
+        output_final_state=True,
+        max_num_batched_tokens=8192,
+    ),
+    PrefillArgs(
+        K=128,
+        V=128,
+        Hk=96,
+        Hv=96,
+        tp=8,
+        full_prompt_len=32768,
+        model_name="KDA-kimi-k3-tp8-T32k",
+        is_varlen=True,
+        output_final_state=True,
+        max_num_batched_tokens=32768,
+    ),
+    PrefillArgs(
+        K=128,
+        V=128,
+        Hk=96,
+        Hv=96,
+        tp=4,
+        full_prompt_len=8192,
+        model_name="KDA-kimi-k3-tp4-T8k",
+        is_varlen=True,
+        output_final_state=True,
+        max_num_batched_tokens=8192,
+    ),
+]
+KDA_TEST_IDS = [repr(p) for p in KDA_PARAMS]
+
+
+def _make_inputs_kda(args: PrefillArgs):
+    """Build K5 inputs for the KDA (per-channel gate) path.
+
+    Returns the same tuple as ``_make_inputs`` but replaces ``g`` (scalar
+    cumsum gate) with ``gk`` ([T_total, H, K] per-channel cumsum gate).
+    ``w`` and ``u`` are returned in both token-major and head-major layouts.
+    """
+    context_lens = args.resolve_context_lens()
+    k, w_orig, u_orig, w_c, u_c, _g, h0, cu, scheduled_q_lens = _make_inputs(
+        context_lens, args=args
+    )
+    H = args.Hv // args.tp
+    T_total = k.shape[1]
+    # Per-channel cumulative gate [T_total, H, K], non-positive (decay).
+    gk = (
+        torch.randn(T_total, H, args.K, dtype=torch.float32, device=k.device)
+        .abs()
+        .mul(-0.1)
+        .cumsum(dim=0)
+        .contiguous()
+    )
+    return k, w_orig, u_orig, w_c, u_c, gk, h0, cu, scheduled_q_lens
+
+
 # -- Helper functions ---------------------------------------------------
 
 
@@ -678,14 +746,34 @@ def ref_chunk_gated_delta_rule_fwd_h(
     k,
     w,
     u,
-    g,
+    g=None,
+    gk=None,
     initial_state=None,
     output_final_state=False,
     chunk_size=64,
     cu_seqlens=None,
     g_head_major=False,
 ):
-    """Reference in FP32 for correctness checking."""
+    """Reference in FP32 for correctness checking.
+
+    Supports both gate variants:
+      * Scalar gate (``g`` is not None, USE_G path, GDN/Qwen3-Next):
+          b_v[t] = u[t] - w[t] @ h^T
+          gate[t] = exp(g_last - g_cumsum[t])   # scalar, broadcast over V
+          h = h * exp(g_last) + (b_v * gate)^T @ k[t]
+
+      * Per-channel gate (``gk`` is not None, USE_GK path, KDA/Kimi-K3):
+          b_v[t] = u[t] - w[t] @ h^T            # same delta correction
+          h[:, k] *= exp(gk_last[k])             # per-K decay; no v_new gating
+          h = h + b_v^T @ k[t]
+          (k is pre-gated by the pipeline; v_new is not gated here)
+
+    ``w`` and ``u`` are expected in token-major layout ``[B, T, H, *]``.
+    """
+    # At most one gate: ``g`` scalar (USE_G) or ``gk`` per-channel (USE_GK).
+    # Both None is valid and means no gate decay (USE_G=False), matching the
+    # kernel's pure padding-mask behaviour.
+    assert g is None or gk is None, "g and gk are mutually exclusive"
     B, T, Hg_dim, K_dim = k.shape
     H_dim, V_dim = u.shape[-2], u.shape[-1]
     BT_dim = chunk_size
@@ -739,38 +827,47 @@ def ref_chunk_gated_delta_rule_fwd_h(
                     b_v = u_chunk - w_chunk @ h_state.T
                     v_new_out[b_idx, bos + t_start : bos + t_end, i_h] = b_v
 
-                    # g sequence for (batch b_idx, head i_h): g is always 3-D
-                    # (or None). head-major [B,H,T] -> g[b_idx, i_h];
-                    # token-major [B,T,H] -> g[b_idx, :, i_h].
-                    if g is None:
-                        g_seq = None
-                    elif g_head_major:
-                        g_seq = g[b_idx, i_h]
-                    else:
-                        g_seq = g[b_idx, :, i_h]
-
-                    mask = torch.zeros(BT_dim, device=k.device)
-                    mask[:actual_bt] = 1.0
-                    if g_seq is None:
-                        # No g: no gate decay; valid rows have gate=1 and padding
-                        # rows are not in the chunk slice at all. Matches the
-                        # kernel's pure padding masking under USE_G=False.
-                        gate = mask[:actual_bt]
-                    else:
-                        last_idx = bos + t_end - 1
-                        g_last = g_seq[last_idx].float()
-                        g_chunk = g_seq[bos + t_start : bos + t_end].float()
-                        gate = torch.where(
-                            mask[:actual_bt].bool(),
-                            torch.exp(g_last - g_chunk),
-                            torch.zeros_like(g_chunk),
-                        )
-                        h_state = h_state * torch.exp(g_last)
-                    b_v_gated = b_v * gate.unsqueeze(-1)
-
                     k_chunk = k[b_idx, bos + t_start : bos + t_end, i_hg].float()
-                    b_v_gated_cast = b_v_gated.to(k.dtype).float()
-                    h_state = h_state + b_v_gated_cast.T @ k_chunk
+
+                    if gk is not None:
+                        # USE_GK: per-K-dim h decay, no v_new gating.
+                        last_idx = bos + t_end - 1
+                        gk_last = gk[last_idx, i_h].float()  # [K]
+                        h_state = h_state * torch.exp(gk_last).unsqueeze(0)
+                        h_state = h_state + b_v.T @ k_chunk
+                    else:
+                        # USE_G: scalar h decay + v_new gating.
+                        # g sequence for (batch b_idx, head i_h): g is always
+                        # 3-D (or None). head-major [B,H,T] -> g[b_idx, i_h];
+                        # token-major [B,T,H] -> g[b_idx, :, i_h].
+                        if g is None:
+                            g_seq = None
+                        elif g_head_major:
+                            g_seq = g[b_idx, i_h]
+                        else:
+                            g_seq = g[b_idx, :, i_h]
+
+                        mask = torch.zeros(BT_dim, device=k.device)
+                        mask[:actual_bt] = 1.0
+                        if g_seq is None:
+                            # No g: no gate decay; valid rows have gate=1 and
+                            # padding rows are not in the chunk slice at all.
+                            # Matches the kernel's pure padding masking under
+                            # USE_G=False.
+                            gate = mask[:actual_bt]
+                        else:
+                            last_idx = bos + t_end - 1
+                            g_last = g_seq[last_idx].float()
+                            g_chunk = g_seq[bos + t_start : bos + t_end].float()
+                            gate = torch.where(
+                                mask[:actual_bt].bool(),
+                                torch.exp(g_last - g_chunk),
+                                torch.zeros_like(g_chunk),
+                            )
+                            h_state = h_state * torch.exp(g_last)
+                        b_v_gated = b_v * gate.unsqueeze(-1)
+                        b_v_gated_cast = b_v_gated.to(k.dtype).float()
+                        h_state = h_state + b_v_gated_cast.T @ k_chunk
 
                 if output_final_state:
                     final_state[seq_idx, i_h] = h_state
@@ -1070,6 +1167,63 @@ class TestCorrectness:
         w = torch.zeros(B, H, T, K, dtype=torch.bfloat16, device=device)
         u = torch.zeros(B, H, T, V, dtype=torch.bfloat16, device=device)
         return k, w, u
+
+    @pytest.mark.parametrize("args", PREFILL_PARAMS, ids=PREFILL_TEST_IDS)
+    def test_correctness_flydsl(self, args: PrefillArgs):
+        """Baseline FlyDSL K5 wrapper -- the target of ``use_chunk_flydsl``.
+
+        On gfx942 this selects the tuned gfx942 build via ``_auto_variant``;
+        elsewhere it selects the arch-generic build.
+
+        The ``novarlen_B2`` shapes are the regression guard for the dense
+        multi-batch ``g`` addressing: ``g`` is head-major [B, H, T_flat], so
+        its batch stride is H*T_flat and cannot be folded into ``bos``.
+        """
+        context_lens = args.resolve_context_lens()
+        k, w_orig, u_orig, w_c, u_c, g, h0, cu, _ = _make_inputs(
+            context_lens, args=args
+        )
+
+        # This wrapper's ``g`` contract is fixed to contiguous head-major
+        # [B, H, T]; ``_make_inputs`` emits token-major [B, T, H] by default.
+        g_hm = g
+        if g is not None and not args.g_head_major:
+            g_hm = g.transpose(1, 2).contiguous()
+
+        h_fly, vn_fly, fs_fly = chunk_gated_delta_rule_fwd_h_flydsl(
+            k,
+            w_c,
+            u_c,
+            g=g_hm,
+            initial_state=h0,
+            output_final_state=args.output_final_state,
+            cu_seqlens=cu,
+            # ``g`` is natural-log space (see ``_make_inputs``) and the
+            # reference decays with ``exp``; ``use_exp2=False`` makes the
+            # kernel apply the LOG2E scale so both sides use one formula.
+            use_exp2=False,
+        )
+        h_ref, vn_ref, fs_ref = ref_chunk_gated_delta_rule_fwd_h(
+            k,
+            w_orig,
+            u_orig,
+            g=g_hm,
+            initial_state=h0,
+            output_final_state=args.output_final_state,
+            cu_seqlens=cu,
+            g_head_major=True,
+        )
+
+        _assert_k5_outputs_match_ref(
+            h_fly,
+            vn_fly,
+            fs_fly,
+            h_ref,
+            vn_ref,
+            fs_ref,
+            output_final_state=args.output_final_state,
+            label="flydsl",
+        )
 
     @pytest.mark.parametrize("args", PREFILL_PARAMS, ids=PREFILL_TEST_IDS)
     def test_correctness_flydsl_mfma16_hip(self, args: PrefillArgs):
@@ -1484,6 +1638,99 @@ class TestCorrectness:
         # Non-empty segment must have been updated (differs from h0).
         assert not torch.equal(fs[0], h0[0]), "non-empty segment was not updated"
 
+    @pytest.mark.parametrize("args", KDA_PARAMS, ids=KDA_TEST_IDS)
+    def test_correctness_flydsl_kda(self, args: PrefillArgs):
+        """FlyDSL K5 with per-channel gate (USE_GK, KDA/Kimi-K3 path)."""
+        k, w_orig, u_orig, w_c, u_c, gk, h0, cu, _ = _make_inputs_kda(args)
+
+        h_fly, vn_fly, fs_fly = chunk_gated_delta_rule_fwd_h_flydsl(
+            k,
+            w_c,
+            u_c,
+            gk=gk,
+            initial_state=h0,
+            output_final_state=args.output_final_state,
+            cu_seqlens=cu,
+        )
+        h_ref, vn_ref, fs_ref = ref_chunk_gated_delta_rule_fwd_h(
+            k,
+            w_orig,
+            u_orig,
+            gk=gk,
+            initial_state=h0,
+            output_final_state=args.output_final_state,
+            cu_seqlens=cu,
+        )
+
+        _assert_k5_outputs_match_ref(
+            h_fly,
+            vn_fly,
+            fs_fly,
+            h_ref,
+            vn_ref,
+            fs_ref,
+            output_final_state=args.output_final_state,
+            label="flydsl_kda",
+        )
+
+    def test_non_multiple_of_64(self):
+        """FlyDSL K5 with sequence length not a multiple of BT=64.
+
+        Regression guard: tail-chunk final_state corruption
+        when the sequence length is not a multiple of the chunk size.
+        Uses the KDA (gk) path.
+        """
+        H, Hg, K, V, BT = 12, 12, 128, 128, 64
+        seq_len = 8192 + 37  # not a multiple of 64
+        cu_seqlens = torch.tensor([0, seq_len], dtype=torch.int32, device="cuda")
+        k = torch.randn(1, seq_len, Hg, K, dtype=torch.bfloat16, device="cuda") * 0.1
+        w_orig = (
+            torch.randn(1, seq_len, H, K, dtype=torch.bfloat16, device="cuda") * 0.1
+        )
+        u_orig = (
+            torch.randn(1, seq_len, H, V, dtype=torch.bfloat16, device="cuda") * 0.1
+        )
+        w_c = w_orig.permute(0, 2, 1, 3).contiguous()
+        u_c = u_orig.permute(0, 2, 1, 3).contiguous()
+        gk = (
+            torch.randn(seq_len, H, K, dtype=torch.float32, device="cuda")
+            .abs()
+            .mul(-0.1)
+            .cumsum(dim=0)
+            .contiguous()
+        )
+        h0 = torch.randn(1, H, V, K, dtype=torch.float32, device="cuda") * 0.01
+
+        h_fly, vn_fly, fs_fly = chunk_gated_delta_rule_fwd_h_flydsl(
+            k,
+            w_c,
+            u_c,
+            gk=gk,
+            initial_state=h0,
+            output_final_state=True,
+            cu_seqlens=cu_seqlens,
+        )
+        h_ref, vn_ref, fs_ref = ref_chunk_gated_delta_rule_fwd_h(
+            k,
+            w_orig,
+            u_orig,
+            gk=gk,
+            initial_state=h0,
+            output_final_state=True,
+            cu_seqlens=cu_seqlens,
+        )
+
+        _assert_k5_outputs_match_ref(
+            h_fly,
+            vn_fly,
+            fs_fly,
+            h_ref,
+            vn_ref,
+            fs_ref,
+            output_final_state=True,
+            label="flydsl_non_mul64",
+        )
+
 
 # -- Performance benchmark (flydsl-hip vs hip vs triton) -----------------
 
@@ -1623,6 +1870,275 @@ def _print_summary_table(request):
     """Print the perf summary table after all tests in the session finish."""
     yield
     _print_perf_table()
+
+
+# -- bf16 SSM-state correctness ----------------------------------------
+
+
+class TestStateDtypeBF16:
+    """Validate that ``state_dtype=bfloat16`` matches the ``float32`` path.
+
+    The bf16-state kernel keeps the f32 accumulator unchanged and only
+    rounds h0 (extf) and final_state (truncf) at the HBM boundary, so its
+    output should agree with the f32-state kernel up to one bf16 trunc
+    error on the SSM state plus accumulated round-off through the chunk
+    loop. We compare against the *flydsl f32-state* path on the exact same
+    shape rather than the PyTorch reference, which gives the tightest
+    regression signal for this specific feature.
+    """
+
+    @pytest.mark.parametrize("args", STATE_BF16_PARAMS, ids=STATE_BF16_TEST_IDS)
+    def test_state_bf16_matches_state_f32(self, args: PrefillArgs):
+        context_lens = args.resolve_context_lens()
+        k, _, _, w_c, u_c, g, h0_f32, cu, _ = _make_inputs(context_lens, args=args)
+        h0_bf16 = h0_f32.to(torch.bfloat16)
+
+        h_f32, vn_f32, fs_f32 = chunk_gated_delta_rule_fwd_h_flydsl(
+            k,
+            w_c,
+            u_c,
+            g=g,
+            initial_state=h0_f32,
+            output_final_state=args.output_final_state,
+            cu_seqlens=cu,
+        )
+        h_bf16, vn_bf16, fs_bf16 = chunk_gated_delta_rule_fwd_h_flydsl(
+            k,
+            w_c,
+            u_c,
+            g=g,
+            initial_state=h0_bf16,
+            output_final_state=args.output_final_state,
+            cu_seqlens=cu,
+        )
+
+        # final_state dtype must follow the input dtype.
+        if args.output_final_state:
+            assert (
+                fs_f32 is not None and fs_f32.dtype == torch.float32
+            ), f"f32 path produced {fs_f32.dtype} final_state"
+            assert (
+                fs_bf16 is not None and fs_bf16.dtype == torch.bfloat16
+            ), f"bf16 path produced {fs_bf16.dtype} final_state"
+        else:
+            assert fs_f32 is None and fs_bf16 is None
+
+        # h and v_new are bf16 in both paths (decoupled from state dtype).
+        assert h_f32.dtype == h_bf16.dtype == k.dtype
+        if vn_f32 is not None:
+            assert vn_f32.dtype == vn_bf16.dtype == u_c.dtype
+
+        # The two paths diverge only by the rounding applied to h0/ht. With
+        # f32 accumulation this stays well within bf16 ULP * (1 + chunk
+        # length) for sane inputs.
+        atol = 5e-2
+        rtol = 5e-2
+        torch.testing.assert_close(
+            h_bf16.float(),
+            h_f32.float(),
+            atol=atol,
+            rtol=rtol,
+            msg="bf16-state vs f32-state: h mismatch",
+        )
+        if vn_f32 is not None:
+            torch.testing.assert_close(
+                vn_bf16.float(),
+                vn_f32.float(),
+                atol=atol,
+                rtol=rtol,
+                msg="bf16-state vs f32-state: v_new mismatch",
+            )
+        if args.output_final_state:
+            torch.testing.assert_close(
+                fs_bf16.float(),
+                fs_f32.float(),
+                atol=atol,
+                rtol=rtol,
+                msg="bf16-state vs f32-state: final_state mismatch",
+            )
+
+    @pytest.mark.parametrize("args", STATE_BF16_PARAMS, ids=STATE_BF16_TEST_IDS)
+    def test_state_dtype_kwarg_no_initial_state(self, args: PrefillArgs):
+        """``state_dtype`` kwarg controls final_state dtype when h0 is None."""
+        if not args.output_final_state:
+            pytest.skip("kwarg only meaningful when final_state is requested")
+        context_lens = args.resolve_context_lens()
+        k, _, _, w_c, u_c, g, _, cu, _ = _make_inputs(
+            context_lens, args=args, with_initial_state=False
+        )
+
+        _, _, fs_f32 = chunk_gated_delta_rule_fwd_h_flydsl(
+            k,
+            w_c,
+            u_c,
+            g=g,
+            initial_state=None,
+            output_final_state=True,
+            cu_seqlens=cu,
+            # default -> f32
+        )
+        assert fs_f32 is not None and fs_f32.dtype == torch.float32
+
+        _, _, fs_bf16 = chunk_gated_delta_rule_fwd_h_flydsl(
+            k,
+            w_c,
+            u_c,
+            g=g,
+            initial_state=None,
+            output_final_state=True,
+            cu_seqlens=cu,
+            state_dtype=torch.bfloat16,
+        )
+        assert fs_bf16 is not None and fs_bf16.dtype == torch.bfloat16
+
+    def test_state_dtype_conflict_raises(self):
+        """Mismatched ``state_dtype`` and ``initial_state.dtype`` must raise."""
+        args = STATE_BF16_PARAMS[0]
+        context_lens = args.resolve_context_lens()
+        k, _, _, w_c, u_c, g, h0, cu, _ = _make_inputs(context_lens, args=args)
+        with pytest.raises(ValueError):
+            chunk_gated_delta_rule_fwd_h_flydsl(
+                k,
+                w_c,
+                u_c,
+                g=g,
+                initial_state=h0,  # f32
+                output_final_state=args.output_final_state,
+                cu_seqlens=cu,
+                state_dtype=torch.bfloat16,  # conflict
+            )
+
+    def test_state_dtype_unsupported_raises(self):
+        """Unsupported state dtypes must raise (e.g. fp16)."""
+        args = STATE_BF16_PARAMS[0]
+        context_lens = args.resolve_context_lens()
+        k, _, _, w_c, u_c, g, _, cu, _ = _make_inputs(
+            context_lens, args=args, with_initial_state=False
+        )
+        with pytest.raises(ValueError):
+            chunk_gated_delta_rule_fwd_h_flydsl(
+                k,
+                w_c,
+                u_c,
+                g=g,
+                initial_state=None,
+                output_final_state=True,
+                cu_seqlens=cu,
+                state_dtype=torch.float16,
+            )
+
+
+# -- Variant auto-selection (pure function; no GPU launch) --------------------
+#
+_SELECT_CASES = [
+    # KDA (gk)
+    (12, 12, 8192, 1, "gk", "bv16"),
+    (12, 12, 8192, 4, "gk", "bv32"),
+    (12, 12, 8192, 8, "gk", "bv64w8"),
+    (24, 24, 8192, 1, "gk", "bv16"),
+    (24, 24, 8192, 4, "gk", "bv64w8"),
+    (24, 24, 8192, 8, "gk", "bv64w8"),
+    (48, 48, 8192, 1, "gk", "bv32"),
+    (48, 48, 8192, 4, "gk", "bv64w8"),
+    (48, 48, 8192, 8, "gk", "bv64w8"),
+    (96, 96, 8192, 1, "gk", "bv64w8"),
+    (96, 96, 8192, 4, "gk", "bv64w8"),
+    (96, 96, 8192, 8, "gk", "bv64w8"),
+    # GDN (g)
+    (4, 2, 8192, 1, "g", "bv16"),
+    (4, 2, 8192, 4, "g", "bv16"),
+    (4, 2, 8192, 8, "g", "bv16"),
+    (8, 4, 8192, 1, "g", "bv16"),
+    (8, 4, 8192, 4, "g", "bv16"),
+    (8, 4, 8192, 8, "g", "bv32"),
+    (16, 16, 8192, 1, "g", "bv16"),
+    (16, 16, 8192, 4, "g", "bv32"),
+    (
+        16,
+        16,
+        8192,
+        8,
+        "g",
+        "bv64w8",
+    ),  # min-mean: favors common equal case over rare skew
+    (32, 8, 8192, 1, "g", "bv16"),
+    (32, 8, 8192, 4, "g", "bv64w8"),
+    (32, 8, 8192, 8, "g", "bv64w8"),
+    # N=2 bucket: one tile below N=4 for mid-H, flat at the extremes.
+    (4, 2, 8192, 2, "g", "bv16"),
+    (8, 4, 8192, 2, "g", "bv16"),
+    (16, 16, 8192, 2, "g", "bv16"),  # vs N4->bv32
+    (32, 8, 8192, 2, "g", "bv32"),  # vs N4->bv64w8
+    (12, 12, 8192, 2, "gk", "bv16"),  # vs N4->bv32
+    (24, 24, 8192, 2, "gk", "bv32"),  # vs N4->bv64w8
+    (48, 48, 8192, 2, "gk", "bv64w8"),
+    (96, 96, 8192, 2, "gk", "bv64w8"),
+    # T-invariance spot-check (same signature at T=32768)
+    (12, 12, 32768, 8, "gk", "bv64w8"),
+    (32, 8, 32768, 8, "g", "bv64w8"),
+    (16, 16, 32768, 2, "g", "bv16"),
+    # Odd/mid N (the old table bucketed N>=5 together and mispicked these)
+    (4, 2, 8192, 3, "g", "bv16"),
+    (4, 2, 8192, 5, "g", "bv16"),
+    (4, 2, 8192, 7, "g", "bv16"),
+    (12, 12, 32768, 5, "gk", "bv32"),
+    (12, 12, 32768, 6, "gk", "bv32"),
+    # Shapes with no table row at all -- they used to fall through to the
+    # cross-arch grid-fill heuristic; the rule covers them.
+    (20, 20, 8192, 1, "gk", "bv16"),
+    (18, 9, 8192, 1, "g", "bv16"),
+    (10, 5, 8192, 2, "g", "bv16"),
+    (14, 14, 32768, 1, "gk", "bv16"),
+    # Exact cut points: the last H*N of each band and the first of the next.
+    (32, 8, 8192, 1, "g", "bv16"),  # H*N = 32
+    (12, 12, 8192, 4, "gk", "bv32"),  # H*N = 48
+    (16, 16, 8192, 5, "g", "bv32"),  # H*N = 80
+    (16, 16, 8192, 6, "g", "bv64w8"),  # H*N = 96
+]
+
+
+class TestVariantSelection:
+    """Pure-function checks on ``_auto_variant`` -- no kernel launch."""
+
+    @pytest.mark.parametrize("H,Hg,T_flat,N,gate,expected", _SELECT_CASES)
+    def test_auto_variant_gfx942_matches_measured_optimum(
+        self, monkeypatch, H, Hg, T_flat, N, gate, expected
+    ):
+        import aiter.ops.flydsl.linear_attention_prefill_kernels as k5
+
+        monkeypatch.setattr(k5, "_ARCH", "gfx942")
+        is_varlen = N > 1
+        got = k5._auto_variant(
+            H=H, Hg=Hg, V=128, T_flat=T_flat, N=N, is_varlen=is_varlen
+        )
+        assert got == expected, (
+            f"gate={gate} H={H} N={N} varlen={is_varlen}: "
+            f"expected {expected}, got {got}"
+        )
+        # Whatever is emitted must be a legal variant for this V.
+        assert k5._bv_of_variant(got) in k5._legal_bv_candidates(128)
+
+    @pytest.mark.parametrize("H,Hg,T_flat,N,gate,expected", _SELECT_CASES)
+    def test_auto_variant_gfx950_never_wave_widened(
+        self, monkeypatch, H, Hg, T_flat, N, gate, expected
+    ):
+        """gfx950 uses the no-wave builder (asserts num_waves==4), so the selector
+        must never emit a ``w``-tag there -- the H*N rule is gfx942-only."""
+        import aiter.ops.flydsl.linear_attention_prefill_kernels as k5
+
+        monkeypatch.setattr(k5, "_ARCH", "gfx950")
+        got = k5._auto_variant(H=H, Hg=Hg, V=128, T_flat=T_flat, N=N, is_varlen=N > 1)
+        assert "w" not in got, f"gfx950 must not wave-widen; got {got}"
+
+    def test_explicit_variant_overrides_auto(self, monkeypatch):
+        import aiter.ops.flydsl.linear_attention_prefill_kernels as k5
+
+        monkeypatch.setattr(k5, "_ARCH", "gfx942")
+        # A KDA N8 shape that auto-selects bv64w8; explicit bv32 must win.
+        tag = k5._resolve_variant(
+            "bv32", H=12, Hg=12, V=128, T_flat=8192, N=8, is_varlen=True
+        )
+        assert tag == "bv32"
 
 
 class TestPerformance:
