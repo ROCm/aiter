@@ -555,7 +555,7 @@ def test_tune_one_shape_keeps_e2e_selection_metric():
         e2e_by_kernel={"g1_a": 100.0, "g1_b": 50.0},
     )
 
-    best, profiles = tuner._tune_one_shape(row, SimpleNamespace(timeout=0))
+    best, profiles, _rejects = tuner._tune_one_shape(row, SimpleNamespace(timeout=0))
 
     # Joint tuning ranks by end-to-end latency, not by either stage alone.
     assert best["kernelName1"] == "g1_b"
@@ -623,7 +623,7 @@ def test_tune_one_shape_gemm1_stage_ranks_by_us1():
         e2e_by_kernel={"g1_a": 100.0, "g1_b": 50.0},
     )
 
-    best, _profiles = tuner._tune_one_shape(
+    best, _profiles, _rejects = tuner._tune_one_shape(
         row, SimpleNamespace(timeout=0, tune_stage="gemm1")
     )
 
@@ -639,7 +639,7 @@ def test_tune_one_shape_gemm2_stage_ranks_by_us2():
         e2e_by_kernel={"g1_a": 100.0, "g1_b": 50.0},
     )
 
-    best, _profiles = tuner._tune_one_shape(
+    best, _profiles, _rejects = tuner._tune_one_shape(
         row, SimpleNamespace(timeout=0, tune_stage="gemm2")
     )
 
@@ -735,3 +735,57 @@ def test_decode_tail_sweeps_bn64_two_wave_candidates():
     large = _shape(2048)
     assert Mxfp4FlydslTuner._g1_bns(large, 32, False, False) == (128, 256)
     assert not any(name.endswith("_w2") for name in tuner._a4w4_gemm1_knames(large, 32))
+
+
+def test_classify_reject_separates_accuracy_from_infrastructure():
+    classify = Mxfp4FlydslTuner._classify_reject
+    assert classify("cosine err_ratio 0.9798986913317104 > 0.1") == "accuracy"
+    assert classify("candidate timed out after 900s") == "timeout"
+    assert classify("no legal gemm1 candidates for (...)") == "no_candidates"
+    assert classify("list index out of range") == "error"
+
+
+def test_rejected_file_defaults_next_to_the_tuned_file():
+    tuner = _tuner()
+    assert (
+        tuner._rejected_file(SimpleNamespace(tune_file="/tmp/tuned.csv"))
+        == "/tmp/tuned_rejected.csv"
+    )
+    # An explicit path wins, and with no tuned file there is nowhere to put it.
+    assert (
+        tuner._rejected_file(
+            SimpleNamespace(tune_file="/tmp/tuned.csv", rejected_file="/tmp/r.csv")
+        )
+        == "/tmp/r.csv"
+    )
+    assert tuner._rejected_file(SimpleNamespace(tune_file="")) == ""
+
+
+def test_rejected_candidates_are_written_with_a_reason(tmp_path):
+    tuner = _tuner()
+    row = _shape(16384)
+    candidate = {
+        "block_m": 128,
+        "kernelName1": "flydsl_mxmoe_g1_a4w4_128x256x256_swiglu_bias",
+        "kernelName2": "flydsl_moe2_afp4_wfp4_bf16_t64x256x128_reduce",
+    }
+    tuner._reject_rows = [
+        tuner._reject_row(
+            row, candidate, "gemm1", "cosine err_ratio 0.9798986913317104 > 0.1"
+        ),
+        tuner._reject_row(row, None, "shape", "no legal gemm1 candidates"),
+    ]
+    out = tmp_path / "tuned.csv"
+    tuner._write_rejected(SimpleNamespace(tune_file=str(out)))
+
+    written = pd.read_csv(tmp_path / "tuned_rejected.csv")
+    assert list(written["reject_kind"]) == ["accuracy", "no_candidates"]
+    assert written.loc[0, "kernelName1"] == candidate["kernelName1"]
+    assert written.loc[0, "block_m"] == 128
+    assert "0.979898" in str(written.loc[0, "reason"])
+    # The shape keys travel with the rejection so a sweep can be post-mortemed
+    # from the CSV alone.
+    assert int(written.loc[0, "token"]) == 16384
+    # Consumed rows are not re-emitted on a second call.
+    tuner._write_rejected(SimpleNamespace(tune_file=str(out)))
+    assert len(pd.read_csv(tmp_path / "tuned_rejected.csv")) == 2

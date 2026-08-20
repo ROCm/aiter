@@ -1050,13 +1050,13 @@ class OpenAIMxfp4FlydslTuner(Mxfp4FlydslTuner):
         self._openai_stage1_only = stage1_only
         self._openai_active_candidates = [dict(candidate) for candidate in selected]
         try:
-            best, profiles = super()._tune_one_shape(row, args)
+            best, profiles, rejects = super()._tune_one_shape(row, args)
         finally:
             self._openai_active_candidates = None
             self._openai_stage1_only = False
 
         if not self._invalid_result(best):
-            return best, profiles
+            return best, profiles, rejects
 
         selected_ids = {_candidate_id(candidate) for candidate in selected}
         remaining = [
@@ -1065,7 +1065,7 @@ class OpenAIMxfp4FlydslTuner(Mxfp4FlydslTuner):
             if _candidate_id(candidate) not in selected_ids
         ]
         if not remaining:
-            return best, profiles
+            return best, profiles, rejects
 
         print(
             "[openai-mxfp4] selected candidates all failed; "
@@ -1075,11 +1075,19 @@ class OpenAIMxfp4FlydslTuner(Mxfp4FlydslTuner):
         self._openai_stage1_only = stage1_only
         self._openai_active_candidates = remaining
         try:
-            retry_best, retry_profiles = super()._tune_one_shape(row, args)
+            retry_best, retry_profiles, retry_rejects = super()._tune_one_shape(
+                row, args
+            )
         finally:
             self._openai_active_candidates = None
             self._openai_stage1_only = False
-        return retry_best, [*profiles, *retry_profiles]
+        # Keep the rejects from the preselected pass too: "the model's picks
+        # all failed" is exactly what a post-mortem needs to see.
+        return (
+            retry_best,
+            [*profiles, *retry_profiles],
+            [*rejects, *retry_rejects],
+        )
 
     def _failure_candidate(self, row, candidates, exc):
         if candidates:
@@ -1105,12 +1113,17 @@ class OpenAIMxfp4FlydslTuner(Mxfp4FlydslTuner):
                 "[openai-mxfp4] shape failed: " f"{type(exc).__name__}: {exc!s}",
                 flush=True,
             )
-            return self._failure_candidate(row, full or selected, exc), []
+            return (
+                self._failure_candidate(row, full or selected, exc),
+                [],
+                [self._reject_row(row, None, stage, exc)],
+            )
 
     def tune(self, untunedf, tunedf, args):
         del tunedf
         rows = [row.to_dict() for _, row in untunedf.iterrows()]
         self._profile_rows = []
+        self._reject_rows = []
         if not rows:
             return []
 
@@ -1148,9 +1161,10 @@ class OpenAIMxfp4FlydslTuner(Mxfp4FlydslTuner):
                     )
 
         bests = []
-        for best, profiles in shape_results:
+        for best, profiles, rejects in shape_results:
             bests.append(best)
             self._profile_rows.extend(profiles)
+            self._reject_rows.extend(rejects)
         return bests
 
 
@@ -1173,7 +1187,11 @@ def _openai_mxfp4_shape_worker(payload):
             f"{type(exc).__name__}: {exc!s}",
             flush=True,
         )
-        return tuner._failure_candidate(row, full or selected, exc), []
+        return (
+            tuner._failure_candidate(row, full or selected, exc),
+            [],
+            [tuner._reject_row(row, None, stage, exc)],
+        )
     finally:
         gpu_queue.put(gpu)
 

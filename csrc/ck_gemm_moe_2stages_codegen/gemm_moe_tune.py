@@ -6205,6 +6205,17 @@ class Mxfp4FlydslTuner(FmoeTuner):
             ),
         )
         self.parser.add_argument(
+            "--rejected_file",
+            "-o3",
+            default="",
+            help=(
+                "output: candidates rejected during tuning (accuracy, timeout, "
+                "build error), with a reason per row. Neither the tuned CSV nor "
+                "--profile_file records these. Defaults to "
+                "<tune_file>_rejected.csv."
+            ),
+        )
+        self.parser.add_argument(
             "--baseline-config",
             default="",
             help=(
@@ -7272,8 +7283,52 @@ class Mxfp4FlydslTuner(FmoeTuner):
         )
         return e2e_us
 
+    # Columns of the rejected-candidate CSV, appended to self.keys. Not
+    # self.columns: a rejected candidate has no timings, only an identity and
+    # a reason.
+    REJECT_EXTRA_COLUMNS: ClassVar[tuple[str, ...]] = (
+        "block_m",
+        "kernelName1",
+        "kernelName2",
+        "stage",
+        "reject_kind",
+        "reason",
+    )
+
+    @staticmethod
+    def _classify_reject(text):
+        low = str(text).lower()
+        if "cosine" in low or "err_ratio" in low:
+            return "accuracy"
+        if "timed out" in low or "timeout" in low or "alarm" in low:
+            return "timeout"
+        if "no legal" in low:
+            return "no_candidates"
+        return "error"
+
+    def _reject_row(self, row, candidate, stage, exc):
+        """One rejected candidate, for the --rejected_file CSV.
+
+        Rejections used to exist only as a stdout ``print``: neither the tuned
+        CSV nor --profile_file records them, so a sweep that dropped a shape
+        left no machine-readable trace of why. That makes an accuracy collapse
+        (cosine err_ratio over errRatio) indistinguishable from a build error
+        or a candidate-generation bug without grepping the log -- and under
+        --mp the logs of every worker are interleaved on one stdout.
+        """
+        out = {key: row.get(key, "") for key in self.keys}
+        candidate = candidate or {}
+        out["block_m"] = candidate.get("block_m", row.get("block_m", ""))
+        out["kernelName1"] = candidate.get("kernelName1", "")
+        out["kernelName2"] = candidate.get("kernelName2", "")
+        out["stage"] = stage
+        out["reject_kind"] = self._classify_reject(exc)
+        out["reason"] = " ".join(str(exc).split())[:400]
+        return out
+
     def _tune_one_shape(self, row, args):
-        """Sweep one shape and return its best row plus all successful profiles.
+        """Sweep one shape and return its best row, its successful profiles,
+        and every rejected candidate.
 
         --timeout (if > 0) bounds each candidate via SIGALRM. This runs on the
         main thread of whichever process owns the shape, so it works for both the
@@ -7342,7 +7397,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
             flush=True,
         )
 
-        best, best_score, failures, profiles = None, None, [], []
+        best, best_score, failures, profiles, rejects = None, None, [], [], []
         for index, candidate in enumerate(candidates):
             if timeout > 0:
                 candidate_timeout = timeout + (
@@ -7385,6 +7440,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
                 failures.append(
                     f"{candidate['kernelName1']}/{candidate['kernelName2']}: {exc}"
                 )
+                rejects.append(self._reject_row(row, candidate, stage, exc))
                 print(f"[mxfp4-port] candidate failed: {failures[-1]}", flush=True)
             finally:
                 if timeout > 0:
@@ -7405,12 +7461,13 @@ class Mxfp4FlydslTuner(FmoeTuner):
                 f"{tuple(row[k] for k in self.keys)}",
                 flush=True,
             )
-        return best, profiles
+        return best, profiles, rejects
 
     def tune(self, untunedf, tunedf, args):
         del tunedf
         rows = [row.to_dict() for _, row in untunedf.iterrows()]
         self._profile_rows = []
+        self._reject_rows = []
         if not rows:
             return []
 
@@ -7448,13 +7505,15 @@ class Mxfp4FlydslTuner(FmoeTuner):
                 )
 
         bests = []
-        for best, profiles in shape_results:
+        for best, profiles, rejects in shape_results:
             bests.append(best)
             self._profile_rows.extend(profiles)
+            self._reject_rows.extend(rejects)
         return bests
 
     def post_process(self, results, args, topk=-1, fast_mode=False):
         del topk, fast_mode
+        self._write_rejected(args)
         profile_file = getattr(args, "profile_file", "")
         profile_rows = getattr(self, "_profile_rows", [])
         if profile_file and profile_rows:
@@ -7466,6 +7525,39 @@ class Mxfp4FlydslTuner(FmoeTuner):
             profile_df.to_csv(profile_file, index=False)
         self._profile_rows = []
         return pd.DataFrame(results, columns=self.columns)
+
+    def _rejected_file(self, args):
+        """Path for the rejected-candidate CSV.
+
+        Defaults next to the tuned file rather than to "off", because the whole
+        point is that a dropped shape must not be silently unexplained.
+        """
+        explicit = str(getattr(args, "rejected_file", "") or "").strip()
+        if explicit:
+            return explicit
+        tune_file = str(getattr(args, "tune_file", "") or "").strip()
+        if not tune_file:
+            return ""
+        base, ext = os.path.splitext(tune_file)
+        return f"{base}_rejected{ext or '.csv'}"
+
+    def _write_rejected(self, args):
+        rows = getattr(self, "_reject_rows", [])
+        self._reject_rows = []
+        path = self._rejected_file(args)
+        if not path or not rows:
+            return
+        columns = list(self.keys) + list(self.REJECT_EXTRA_COLUMNS)
+        df = pd.DataFrame(rows, columns=columns)
+        if os.path.exists(path):
+            df = pd.concat([pd.read_csv(path), df], ignore_index=True)
+        df.to_csv(path, index=False)
+        kinds = df["reject_kind"].value_counts().to_dict()
+        print(
+            f"[mxfp4-port] wrote {len(rows)} rejected candidate(s) to {path} "
+            f"({kinds})",
+            flush=True,
+        )
 
     def result_to_csv(self, results, file, concat=False):
         del concat
@@ -7526,7 +7618,10 @@ def _mxfp4_tune_shape_worker(payload):
         cand["us"] = Mxfp4FlydslTuner.INVALID_TIME
         cand["kernelName1"] = (f"FAILED(GPU{gpu}): {exc}")[:240]
         print(f"[mxfp4-port] shape failed on GPU{gpu}: {exc}", flush=True)
-        return cand, []
+        # No per-candidate context here -- this is the whole shape dying (e.g.
+        # "no legal candidates"), which is exactly the case that previously
+        # left nothing behind but an interleaved line of worker stdout.
+        return cand, [], [best._reject_row(row, None, "shape", exc)]
     finally:
         gpu_q.put(gpu)
 
