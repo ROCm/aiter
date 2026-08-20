@@ -2,7 +2,9 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 from __future__ import annotations
+
 from enum import Enum
+
 
 class K5K6Fusion(Enum):
     """How to choose between the fused K5+K6 kernel and the separate pipeline.
@@ -19,7 +21,7 @@ class K5K6Fusion(Enum):
     NEVER = "never"
 
     @classmethod
-    def coerce(cls, value) -> "K5K6Fusion":
+    def coerce(cls, value) -> K5K6Fusion:
         """Accept a K5K6Fusion, or a case-insensitive string alias, or None.
 
         ``None`` maps to ``AUTO`` so callers can pass through an unset option.

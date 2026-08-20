@@ -35,15 +35,18 @@ _own_dir = str(Path(__file__).parent)
 _patched = _own_dir in sys.path
 if _patched:
     sys.path.remove(_own_dir)
-import argparse as _argparse_stdlib  # noqa: E402 — must follow path patch
+import argparse as _argparse_stdlib
+
 if _patched:
     sys.path.insert(0, _own_dir)
 
 # Matplotlib optional — only required when actually generating a plot.
 try:
     import matplotlib
+
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+
     _HAS_MPL = True
 except ImportError:
     _HAS_MPL = False
@@ -57,19 +60,21 @@ except ImportError:
 _DEFAULT_CATEGORIES: dict[str, str] = {
     "triton": "Triton",
     "flydsl": "FlyDSL",
-    "hip":    "HIP",
+    "hip": "HIP",
 }
 
 _DEFAULT_COLORS: dict[str, str] = {
-    "Triton": "#4878CF",   # blue
-    "FlyDSL": "#2CA02C",   # green
-    "HIP":    "#E89C3A",   # orange
+    "Triton": "#4878CF",  # blue
+    "FlyDSL": "#2CA02C",  # green
+    "HIP": "#E89C3A",  # orange
 }
 
 _DEFAULT_BASELINE = "Triton"
 
 
-def category_label(impl_name: str, impl_categories: dict[str, str] | None = None) -> str:
+def category_label(
+    impl_name: str, impl_categories: dict[str, str] | None = None
+) -> str:
     """Category label for an impl name, e.g. ``"hip"`` -> ``"HIP"``.
 
     Use this rather than ``str.capitalize()`` to derive a ``baseline_label``:
@@ -87,7 +92,9 @@ def category_label(impl_name: str, impl_categories: dict[str, str] | None = None
 # --------------------------------------------------------------------------- #
 # Markdown parser
 # --------------------------------------------------------------------------- #
-def parse_bench_md(path: str, impl_categories: dict[str, str] | None = None) -> list[dict]:
+def parse_bench_md(
+    path: str, impl_categories: dict[str, str] | None = None
+) -> list[dict]:
     """Parse a bench Markdown report into a list of per-shape result dicts.
 
     Each dict has:
@@ -270,15 +277,25 @@ def make_bar_chart(
             continue
 
         xs = [i + (ci - n_cats / 2 + 0.5) * bar_w for i in range(n_shapes)]
-        bars = ax.bar(xs, tflops_vals, width=bar_w * 0.9, label=label,
-                      color=colors[label], alpha=0.85)
+        bars = ax.bar(
+            xs,
+            tflops_vals,
+            width=bar_w * 0.9,
+            label=label,
+            color=colors[label],
+            alpha=0.85,
+        )
         for bar, lbl in zip(bars, bar_labels):
             h = bar.get_height()
             if lbl and not math.isnan(h):
                 ax.text(
                     bar.get_x() + bar.get_width() / 2,
                     h + 0.01 * max(ax.get_ylim()[1], 1),
-                    lbl, ha="center", va="bottom", fontsize=7, rotation=45,
+                    lbl,
+                    ha="center",
+                    va="bottom",
+                    fontsize=7,
+                    rotation=45,
                 )
 
     ax.set_xticks(range(n_shapes))
@@ -330,25 +347,34 @@ def make_fill_scatter(
         print("matplotlib not available; skipping fill scatter.")
         return
 
-    WIN = "#2a78d6"; LOSS = "#eb6834"          # validated categorical slots 1 & 6
-    INK = "#0b0b0b"; SEC = "#52514e"; MUT = "#8a887f"; GRID = "#e5e4df"
+    WIN = "#2a78d6"
+    LOSS = "#eb6834"  # validated categorical slots 1 & 6
+    INK = "#0b0b0b"
+    SEC = "#52514e"
+    MUT = "#8a887f"
+    GRID = "#e5e4df"
 
     # Marker per sequence pattern (shape encodes the input length distribution);
     # colour encodes fusion faster/slower. "equal" is the default when a shape's
     # heading carries no ``seqs=`` tag.
     PAT_MARKER = {
-        "equal": "o", "ragged": "s", "bimodal": "D",
-        "skew": "^", "skew_last": "v",
+        "equal": "o",
+        "ragged": "s",
+        "bimodal": "D",
+        "skew": "^",
+        "skew_last": "v",
     }
 
     pts = []
     for r in results:
         head = r["shape"]
-        mh = re.search(r"H=(\d+)", head); mn = re.search(r"N=(\d+)", head)
+        mh = re.search(r"H=(\d+)", head)
+        mn = re.search(r"N=(\d+)", head)
         mv = re.search(r"V=(\d+)", head)
         if not (mh and mn):
             continue
-        H = int(mh.group(1)); N = int(mn.group(1))
+        H = int(mh.group(1))
+        N = int(mn.group(1))
         V = int(mv.group(1)) if mv else 128
         mp = re.search(r"seqs=(\w+)", head)
         pat = mp.group(1) if mp else "equal"
@@ -381,12 +407,14 @@ def make_fill_scatter(
     loss = [p for p in pts if p["sp"] < 1.0]
 
     fig, ax = plt.subplots(figsize=(9.8, 5.9), dpi=130)
-    fig.patch.set_facecolor("#fcfcfb"); ax.set_facecolor("#fcfcfb")
+    fig.patch.set_facecolor("#fcfcfb")
+    ax.set_facecolor("#fcfcfb")
     ax.axhspan(0.0, 1.0, color=LOSS, alpha=0.05, zorder=0)
     ax.axhline(1.0, color=SEC, lw=1.5, ls=(0, (5, 4)), zorder=2)
 
     # jitter identical (fill, side) groups so overlapping points stay visible
     from collections import defaultdict
+
     seen: dict = defaultdict(int)
 
     # Plot per (win/loss colour) x (pattern marker); legends are built separately
@@ -395,30 +423,59 @@ def make_fill_scatter(
         key = (round(p["fill"], 3), p["sp"] < 1.0)
         seen[key] += 1
         j = seen[key] - 1
-        x = p["fill"] if j == 0 else p["fill"] * (
-            1.0 + ((1 if j % 2 else -1) * ((j + 1) // 2) * 0.02)
+        x = (
+            p["fill"]
+            if j == 0
+            else p["fill"] * (1.0 + ((1 if j % 2 else -1) * ((j + 1) // 2) * 0.02))
         )
         color = WIN if p["sp"] >= 1.0 else LOSS
         marker = PAT_MARKER.get(p["pat"], "o")
-        ax.scatter([x], [p["sp"]], s=52, c=color, marker=marker,
-                   edgecolors="#fcfcfb", linewidths=1.1, zorder=3)
+        ax.scatter(
+            [x],
+            [p["sp"]],
+            s=52,
+            c=color,
+            marker=marker,
+            edgecolors="#fcfcfb",
+            linewidths=1.1,
+            zorder=3,
+        )
 
     # Two legends: colour = outcome, shape = seq pattern.
     import matplotlib.lines as _mlines
+
     outcome_handles = [
-        _mlines.Line2D([], [], marker="o", ls="", ms=8, mfc=WIN, mec="#fcfcfb",
-                       label=f"fusion faster ({len(win)})"),
-        _mlines.Line2D([], [], marker="o", ls="", ms=8, mfc=LOSS, mec="#fcfcfb",
-                       label=f"fusion slower ({len(loss)})"),
+        _mlines.Line2D(
+            [],
+            [],
+            marker="o",
+            ls="",
+            ms=8,
+            mfc=WIN,
+            mec="#fcfcfb",
+            label=f"fusion faster ({len(win)})",
+        ),
+        _mlines.Line2D(
+            [],
+            [],
+            marker="o",
+            ls="",
+            ms=8,
+            mfc=LOSS,
+            mec="#fcfcfb",
+            label=f"fusion slower ({len(loss)})",
+        ),
     ]
     pats_present = [p for p in PAT_MARKER if any(x["pat"] == p for x in pts)]
     pat_handles = [
-        _mlines.Line2D([], [], marker=PAT_MARKER[p], ls="", ms=8, mfc=SEC,
-                       mec="#fcfcfb", label=p)
+        _mlines.Line2D(
+            [], [], marker=PAT_MARKER[p], ls="", ms=8, mfc=SEC, mec="#fcfcfb", label=p
+        )
         for p in pats_present
     ]
 
-    allfill = [p["fill"] for p in pts]; allsp = [p["sp"] for p in pts]
+    allfill = [p["fill"] for p in pts]
+    allsp = [p["sp"] for p in pts]
     ax.set_xscale("log")
     xlo, xhi = min(allfill) * 0.7, max(allfill) * 1.3
     ax.set_xlim(xlo, xhi)
@@ -431,46 +488,82 @@ def make_fill_scatter(
     if xlo < thr < xhi:
         ax.axvspan(thr, xhi, color=MUT, alpha=0.06, zorder=0)
         ax.axvline(thr, color=SEC, lw=1, ls=":", zorder=1)
-        ax.text(thr * 1.05, max(allsp) + 0.02,
-                f"fill ≥ {thr:g} → fusion wins",
-                fontsize=9.5, color=SEC, va="top")
+        ax.text(
+            thr * 1.05,
+            max(allsp) + 0.02,
+            f"fill ≥ {thr:g} → fusion wins",
+            fontsize=9.5,
+            color=SEC,
+            va="top",
+        )
     bvlab = "2·N·H" if fill_bv == 64 else f"⌈V/{fill_bv}⌉·N·H"
     ax.set_xlabel(
         f"grid fill factor at BV={fill_bv}  (CTAs / CUs = {bvlab} / "
         f"{cu_count};  shape-intrinsic, log scale)",
-        fontsize=11.5, color=INK, fontweight="bold",
+        fontsize=11.5,
+        color=INK,
+        fontweight="bold",
     )
-    ax.set_ylabel(f"fused speedup vs baseline ({mode})",
-                  fontsize=12, color=INK, fontweight="bold")
+    ax.set_ylabel(
+        f"fused speedup vs baseline ({mode})", fontsize=12, color=INK, fontweight="bold"
+    )
     ax.set_title(title, fontsize=13, color=INK, fontweight="bold", pad=12)
     # break-even label at the LEFT end of the dashed line (the pattern legend
     # occupies the lower-right).
-    ax.text(xlo * 1.05, 1.02, "break-even 1.00×",
-            fontsize=9.5, color=SEC, ha="left", va="bottom")
+    ax.text(
+        xlo * 1.05,
+        1.02,
+        "break-even 1.00×",
+        fontsize=9.5,
+        color=SEC,
+        ha="left",
+        va="bottom",
+    )
     ax.grid(True, which="major", color=GRID, lw=0.8, zorder=0)
     for s in ("top", "right"):
         ax.spines[s].set_visible(False)
     for s in ("left", "bottom"):
         ax.spines[s].set_color("#c3c2bb")
     ax.tick_params(colors=SEC, labelsize=10.5)
-    leg1 = ax.legend(handles=outcome_handles, loc="upper left", frameon=False,
-                     fontsize=10.5, labelcolor=INK, title="outcome (colour)")
-    leg1.get_title().set_color(SEC); leg1.get_title().set_fontsize(9.5)
+    leg1 = ax.legend(
+        handles=outcome_handles,
+        loc="upper left",
+        frameon=False,
+        fontsize=10.5,
+        labelcolor=INK,
+        title="outcome (colour)",
+    )
+    leg1.get_title().set_color(SEC)
+    leg1.get_title().set_fontsize(9.5)
     ax.add_artist(leg1)
-    leg2 = ax.legend(handles=pat_handles, loc="lower right", frameon=False,
-                     fontsize=9.5, labelcolor=INK, title="seq pattern (shape)",
-                     ncol=1, borderpad=0.3, handletextpad=0.4)
-    leg2.get_title().set_color(SEC); leg2.get_title().set_fontsize(9.5)
+    leg2 = ax.legend(
+        handles=pat_handles,
+        loc="lower right",
+        frameon=False,
+        fontsize=9.5,
+        labelcolor=INK,
+        title="seq pattern (shape)",
+        ncol=1,
+        borderpad=0.3,
+        handletextpad=0.4,
+    )
+    leg2.get_title().set_color(SEC)
+    leg2.get_title().set_fontsize(9.5)
 
     import statistics as _st
+
     if win:
         wsp = [p["sp"] for p in win]
-        foot = (f"Fusion faster: median {_st.median(wsp):.2f}× · "
-                f"max {max(wsp):.2f}× ({len(win)}).")
+        foot = (
+            f"Fusion faster: median {_st.median(wsp):.2f}× · "
+            f"max {max(wsp):.2f}× ({len(win)})."
+        )
         if loss:
             lsp = [p["sp"] for p in loss]
-            foot += (f"   Fusion slower: worst {min(lsp):.2f}× · "
-                     f"best {max(lsp):.2f}× ({len(loss)}).")
+            foot += (
+                f"   Fusion slower: worst {min(lsp):.2f}× · "
+                f"best {max(lsp):.2f}× ({len(loss)})."
+            )
         fig.text(0.06, -0.02, foot, fontsize=9, color=MUT)
 
     fig.savefig(out_png, dpi=130, bbox_inches="tight", facecolor="#fcfcfb")
@@ -590,7 +683,7 @@ def main(argv=None):
     stem = Path(src).stem
     out_dir = str(Path(src).parent)
     out_png = args.out_png or os.path.join(out_dir, f"{stem}-plot.png")
-    out_md  = args.out_md  or os.path.join(out_dir, f"{stem}-summary.md")
+    out_md = args.out_md or os.path.join(out_dir, f"{stem}-summary.md")
 
     impl_categories = None
     if args.categories:
@@ -605,10 +698,24 @@ def main(argv=None):
         print("No shape sections found in the Markdown file.", file=sys.stderr)
         sys.exit(1)
 
-    make_bar_chart(results, out_png, title=args.title, mode=args.mode,
-                   baseline_label=args.baseline, impl_categories=impl_categories)
-    make_summary_md(results, out_md, out_png, src, title=args.title, mode=args.mode,
-                    baseline_label=args.baseline, impl_categories=impl_categories)
+    make_bar_chart(
+        results,
+        out_png,
+        title=args.title,
+        mode=args.mode,
+        baseline_label=args.baseline,
+        impl_categories=impl_categories,
+    )
+    make_summary_md(
+        results,
+        out_md,
+        out_png,
+        src,
+        title=args.title,
+        mode=args.mode,
+        baseline_label=args.baseline,
+        impl_categories=impl_categories,
+    )
 
 
 if __name__ == "__main__":

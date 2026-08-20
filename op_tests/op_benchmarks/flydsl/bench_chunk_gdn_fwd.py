@@ -58,7 +58,8 @@ if _REPO_ROOT not in sys.path:
 
 _BENCH_DIR = str(Path(__file__).parent)
 sys.path.insert(0, _BENCH_DIR)
-from utils._bench_timing import EmptyGraphCaptureError, MeasureConfig, measure as _time_measure
+from utils._bench_timing import EmptyGraphCaptureError, MeasureConfig
+from utils._bench_timing import measure as _time_measure
 from utils.bench_common import (
     add_output_args,
     add_timing_args,
@@ -88,49 +89,93 @@ from utils.plot_perf import (
 # Under 1 CTA/CU the makespan is set by the longest sequence.
 PRESET_SHAPES: list[tuple] = [
     # KDA Kimi-K3 TP8  (H=12 is the primary serving shape from the ticket)
-    ("kda_tp8",     12, 12,  8192, 1, 128, 128, 64, "gk", "equal"),
-    ("kda_tp8",     12, 12, 32768, 1, 128, 128, 64, "gk", "equal"),
-    ("kda_tp8",     12, 12,  8192, 4, 128, 128, 64, "gk", "equal"),
-    ("kda_tp8",     12, 12, 32768, 4, 128, 128, 64, "gk", "equal"),
-    ("kda_tp8",     12, 12,  8192, 8, 128, 128, 64, "gk", "equal"),
-    ("kda_tp8",     12, 12, 32768, 8, 128, 128, 64, "gk", "equal"),
+    ("kda_tp8", 12, 12, 8192, 1, 128, 128, 64, "gk", "equal"),
+    ("kda_tp8", 12, 12, 32768, 1, 128, 128, 64, "gk", "equal"),
+    ("kda_tp8", 12, 12, 8192, 4, 128, 128, 64, "gk", "equal"),
+    ("kda_tp8", 12, 12, 32768, 4, 128, 128, 64, "gk", "equal"),
+    ("kda_tp8", 12, 12, 8192, 8, 128, 128, 64, "gk", "equal"),
+    ("kda_tp8", 12, 12, 32768, 8, 128, 128, 64, "gk", "equal"),
     # KDA Kimi-K3 TP4
-    ("kda_tp4",     24, 24,  8192, 1, 128, 128, 64, "gk", "equal"),
-    ("kda_tp4",     24, 24, 32768, 1, 128, 128, 64, "gk", "equal"),
-    ("kda_tp4",     24, 24,  8192, 8, 128, 128, 64, "gk", "equal"),
-    ("kda_tp4",     24, 24, 32768, 8, 128, 128, 64, "gk", "equal"),
+    ("kda_tp4", 24, 24, 8192, 1, 128, 128, 64, "gk", "equal"),
+    ("kda_tp4", 24, 24, 32768, 1, 128, 128, 64, "gk", "equal"),
+    ("kda_tp4", 24, 24, 8192, 8, 128, 128, 64, "gk", "equal"),
+    ("kda_tp4", 24, 24, 32768, 8, 128, 128, 64, "gk", "equal"),
     # GDN Qwen3-Next TP8
-    ("gdn_q3n_tp8",  4,  2,  8192, 8, 128, 128, 64, "g", "equal"),
-    ("gdn_q3n_tp8",  4,  2, 32768, 8, 128, 128, 64, "g", "equal"),
+    ("gdn_q3n_tp8", 4, 2, 8192, 8, 128, 128, 64, "g", "equal"),
+    ("gdn_q3n_tp8", 4, 2, 32768, 8, 128, 128, 64, "g", "equal"),
     # GDN Qwen3-Next TP4
-    ("gdn_q3n_tp4",  8,  4,  8192, 4, 128, 128, 64, "g", "equal"),
-    ("gdn_q3n_tp4",  8,  4, 32768, 4, 128, 128, 64, "g", "equal"),
+    ("gdn_q3n_tp4", 8, 4, 8192, 4, 128, 128, 64, "g", "equal"),
+    ("gdn_q3n_tp4", 8, 4, 32768, 4, 128, 128, 64, "g", "equal"),
     # GDN Qwen3.5-MoE TP1
-    ("gdn_q35_tp1", 16, 16,  8192, 1, 128, 128, 64, "g", "equal"),
-    ("gdn_q35_tp1", 32,  8,  8192, 1, 128, 128, 64, "g", "equal"),
-    ("gdn_q35_tp1", 32,  8, 32768, 1, 128, 128, 64, "g", "equal"),
+    ("gdn_q35_tp1", 16, 16, 8192, 1, 128, 128, 64, "g", "equal"),
+    ("gdn_q35_tp1", 32, 8, 8192, 1, 128, 128, 64, "g", "equal"),
+    ("gdn_q35_tp1", 32, 8, 32768, 1, 128, 128, 64, "g", "equal"),
     # -- varlen / ragged batches -------------------------------------------
     # Same (H, Hg, T_flat, N) as shapes 10 and 12, so the only difference from
     # their "equal" counterparts is the sequence-length distribution; any delta
     # is attributable to load imbalance rather than to shape.
-    ("kda_tp4",     24, 24, 32768, 8, 128, 128, 64, "gk", "ragged"),
-    ("kda_tp4",     24, 24, 32768, 8, 128, 128, 64, "gk", "bimodal"),
-    ("kda_tp4",     24, 24, 32768, 8, 128, 128, 64, "gk", "skew"),
-    ("gdn_q3n_tp8",  4,  2, 32768, 8, 128, 128, 64, "g",  "ragged"),
-    ("gdn_q3n_tp8",  4,  2, 32768, 8, 128, 128, 64, "g",  "skew"),
+    ("kda_tp4", 24, 24, 32768, 8, 128, 128, 64, "gk", "ragged"),
+    ("kda_tp4", 24, 24, 32768, 8, 128, 128, 64, "gk", "bimodal"),
+    ("kda_tp4", 24, 24, 32768, 8, 128, 128, 64, "gk", "skew"),
+    ("gdn_q3n_tp8", 4, 2, 32768, 8, 128, 128, 64, "g", "ragged"),
+    ("gdn_q3n_tp8", 4, 2, 32768, 8, 128, 128, 64, "g", "skew"),
     # Control for dispatch order: identical length multiset to shape 20, but the
     # long sequence is last. Only affects shapes whose grid exceeds the CU count.
-    ("kda_tp4",     24, 24, 32768, 8, 128, 128, 64, "gk", "skew_last"),
+    ("kda_tp4", 24, 24, 32768, 8, 128, 128, 64, "gk", "skew_last"),
     # -- chiplet-remap partial-grid stress cases ---------------------------
     # grid_nh = N*H is NOT a multiple of nXCD=8, so the XCD remap co-locates
     # each head's V-tiles only for the full nXCD*GRID_V cycles; the tail passes
     # through as the round-robin identity. These verify the partial case still
     # benefits (majority of heads co-located) and never regresses (tail == base).
     # H=4 (real Qwen3-Next TP8 head count); N chosen to break divisibility.
-    ("gdn_q3n_rmp",  4,  2,  8192, 1, 128, 128, 64, "g", "equal"),  # grid_nh=4  (<nXCD: identity)
-    ("gdn_q3n_rmp",  4,  2,  8192, 3, 128, 128, 64, "g", "equal"),  # grid_nh=12 (67% clean)
-    ("gdn_q3n_rmp",  4,  2,  8192, 5, 128, 128, 64, "g", "equal"),  # grid_nh=20 (80% clean)
-    ("gdn_q3n_rmp",  4,  2,  8192, 7, 128, 128, 64, "g", "equal"),  # grid_nh=28 (86% clean)
+    (
+        "gdn_q3n_rmp",
+        4,
+        2,
+        8192,
+        1,
+        128,
+        128,
+        64,
+        "g",
+        "equal",
+    ),  # grid_nh=4  (<nXCD: identity)
+    (
+        "gdn_q3n_rmp",
+        4,
+        2,
+        8192,
+        3,
+        128,
+        128,
+        64,
+        "g",
+        "equal",
+    ),  # grid_nh=12 (67% clean)
+    (
+        "gdn_q3n_rmp",
+        4,
+        2,
+        8192,
+        5,
+        128,
+        128,
+        64,
+        "g",
+        "equal",
+    ),  # grid_nh=20 (80% clean)
+    (
+        "gdn_q3n_rmp",
+        4,
+        2,
+        8192,
+        7,
+        128,
+        128,
+        64,
+        "g",
+        "equal",
+    ),  # grid_nh=28 (86% clean)
     # -- variant-autoselect gap-fill sweep ---------------------------------
     # Signatures the tuned table (gate,H,N-bucket,is_varlen) did not yet cover.
     # skew / skew_last share a SELECTION signature with equal (seq_pattern is
@@ -138,55 +183,55 @@ PRESET_SHAPES: list[tuple] = [
     # for the varlen KDA groups. Each new signature runs at T=8192 AND 32768 to
     # confirm the table's T-invariance holds for these (previously untested) groups.
     # Tier 1: interior N-bucket fills for gate+H already in the table.
-    ("kda_tp4_g",   24, 24,  8192, 4, 128, 128, 64, "gk", "equal"),
-    ("kda_tp4_g",   24, 24, 32768, 4, 128, 128, 64, "gk", "equal"),
-    ("gdn_h8_g",     8,  4,  8192, 1, 128, 128, 64, "g",  "equal"),
-    ("gdn_h8_g",     8,  4,  8192, 8, 128, 128, 64, "g",  "equal"),
-    ("gdn_h8_g",     8,  4,  8192, 8, 128, 128, 64, "g",  "skew"),
-    ("gdn_h8_g",     8,  4, 32768, 1, 128, 128, 64, "g",  "equal"),
-    ("gdn_h8_g",     8,  4, 32768, 8, 128, 128, 64, "g",  "equal"),
-    ("gdn_h8_g",     8,  4, 32768, 8, 128, 128, 64, "g",  "skew"),
-    ("gdn_h16_g",   16, 16,  8192, 4, 128, 128, 64, "g",  "equal"),
-    ("gdn_h16_g",   16, 16,  8192, 8, 128, 128, 64, "g",  "equal"),
-    ("gdn_h16_g",   16, 16,  8192, 8, 128, 128, 64, "g",  "skew"),
-    ("gdn_h16_g",   16, 16, 32768, 4, 128, 128, 64, "g",  "equal"),
-    ("gdn_h16_g",   16, 16, 32768, 8, 128, 128, 64, "g",  "equal"),
-    ("gdn_h16_g",   16, 16, 32768, 8, 128, 128, 64, "g",  "skew"),
-    ("gdn_h32_g",   32,  8,  8192, 4, 128, 128, 64, "g",  "equal"),
-    ("gdn_h32_g",   32,  8,  8192, 8, 128, 128, 64, "g",  "equal"),
-    ("gdn_h32_g",   32,  8,  8192, 8, 128, 128, 64, "g",  "skew"),
-    ("gdn_h32_g",   32,  8, 32768, 4, 128, 128, 64, "g",  "equal"),
-    ("gdn_h32_g",   32,  8, 32768, 8, 128, 128, 64, "g",  "equal"),
-    ("gdn_h32_g",   32,  8, 32768, 8, 128, 128, 64, "g",  "skew"),
+    ("kda_tp4_g", 24, 24, 8192, 4, 128, 128, 64, "gk", "equal"),
+    ("kda_tp4_g", 24, 24, 32768, 4, 128, 128, 64, "gk", "equal"),
+    ("gdn_h8_g", 8, 4, 8192, 1, 128, 128, 64, "g", "equal"),
+    ("gdn_h8_g", 8, 4, 8192, 8, 128, 128, 64, "g", "equal"),
+    ("gdn_h8_g", 8, 4, 8192, 8, 128, 128, 64, "g", "skew"),
+    ("gdn_h8_g", 8, 4, 32768, 1, 128, 128, 64, "g", "equal"),
+    ("gdn_h8_g", 8, 4, 32768, 8, 128, 128, 64, "g", "equal"),
+    ("gdn_h8_g", 8, 4, 32768, 8, 128, 128, 64, "g", "skew"),
+    ("gdn_h16_g", 16, 16, 8192, 4, 128, 128, 64, "g", "equal"),
+    ("gdn_h16_g", 16, 16, 8192, 8, 128, 128, 64, "g", "equal"),
+    ("gdn_h16_g", 16, 16, 8192, 8, 128, 128, 64, "g", "skew"),
+    ("gdn_h16_g", 16, 16, 32768, 4, 128, 128, 64, "g", "equal"),
+    ("gdn_h16_g", 16, 16, 32768, 8, 128, 128, 64, "g", "equal"),
+    ("gdn_h16_g", 16, 16, 32768, 8, 128, 128, 64, "g", "skew"),
+    ("gdn_h32_g", 32, 8, 8192, 4, 128, 128, 64, "g", "equal"),
+    ("gdn_h32_g", 32, 8, 8192, 8, 128, 128, 64, "g", "equal"),
+    ("gdn_h32_g", 32, 8, 8192, 8, 128, 128, 64, "g", "skew"),
+    ("gdn_h32_g", 32, 8, 32768, 4, 128, 128, 64, "g", "equal"),
+    ("gdn_h32_g", 32, 8, 32768, 8, 128, 128, 64, "g", "equal"),
+    ("gdn_h32_g", 32, 8, 32768, 8, 128, 128, 64, "g", "skew"),
     # Tier 2: KDA TP2 (H48) and TP1 (H96), all N-buckets, both T.
-    ("kda_tp2",     48, 48,  8192, 1, 128, 128, 64, "gk", "equal"),
-    ("kda_tp2",     48, 48,  8192, 4, 128, 128, 64, "gk", "equal"),
-    ("kda_tp2",     48, 48,  8192, 4, 128, 128, 64, "gk", "skew"),
-    ("kda_tp2",     48, 48,  8192, 4, 128, 128, 64, "gk", "skew_last"),
-    ("kda_tp2",     48, 48,  8192, 8, 128, 128, 64, "gk", "equal"),
-    ("kda_tp2",     48, 48,  8192, 8, 128, 128, 64, "gk", "skew"),
-    ("kda_tp2",     48, 48,  8192, 8, 128, 128, 64, "gk", "skew_last"),
-    ("kda_tp2",     48, 48, 32768, 1, 128, 128, 64, "gk", "equal"),
-    ("kda_tp2",     48, 48, 32768, 4, 128, 128, 64, "gk", "equal"),
-    ("kda_tp2",     48, 48, 32768, 4, 128, 128, 64, "gk", "skew"),
-    ("kda_tp2",     48, 48, 32768, 4, 128, 128, 64, "gk", "skew_last"),
-    ("kda_tp2",     48, 48, 32768, 8, 128, 128, 64, "gk", "equal"),
-    ("kda_tp2",     48, 48, 32768, 8, 128, 128, 64, "gk", "skew"),
-    ("kda_tp2",     48, 48, 32768, 8, 128, 128, 64, "gk", "skew_last"),
-    ("kda_tp1",     96, 96,  8192, 1, 128, 128, 64, "gk", "equal"),
-    ("kda_tp1",     96, 96,  8192, 4, 128, 128, 64, "gk", "equal"),
-    ("kda_tp1",     96, 96,  8192, 4, 128, 128, 64, "gk", "skew"),
-    ("kda_tp1",     96, 96,  8192, 4, 128, 128, 64, "gk", "skew_last"),
-    ("kda_tp1",     96, 96,  8192, 8, 128, 128, 64, "gk", "equal"),
-    ("kda_tp1",     96, 96,  8192, 8, 128, 128, 64, "gk", "skew"),
-    ("kda_tp1",     96, 96,  8192, 8, 128, 128, 64, "gk", "skew_last"),
-    ("kda_tp1",     96, 96, 32768, 1, 128, 128, 64, "gk", "equal"),
-    ("kda_tp1",     96, 96, 32768, 4, 128, 128, 64, "gk", "equal"),
-    ("kda_tp1",     96, 96, 32768, 4, 128, 128, 64, "gk", "skew"),
-    ("kda_tp1",     96, 96, 32768, 4, 128, 128, 64, "gk", "skew_last"),
-    ("kda_tp1",     96, 96, 32768, 8, 128, 128, 64, "gk", "equal"),
-    ("kda_tp1",     96, 96, 32768, 8, 128, 128, 64, "gk", "skew"),
-    ("kda_tp1",     96, 96, 32768, 8, 128, 128, 64, "gk", "skew_last"),
+    ("kda_tp2", 48, 48, 8192, 1, 128, 128, 64, "gk", "equal"),
+    ("kda_tp2", 48, 48, 8192, 4, 128, 128, 64, "gk", "equal"),
+    ("kda_tp2", 48, 48, 8192, 4, 128, 128, 64, "gk", "skew"),
+    ("kda_tp2", 48, 48, 8192, 4, 128, 128, 64, "gk", "skew_last"),
+    ("kda_tp2", 48, 48, 8192, 8, 128, 128, 64, "gk", "equal"),
+    ("kda_tp2", 48, 48, 8192, 8, 128, 128, 64, "gk", "skew"),
+    ("kda_tp2", 48, 48, 8192, 8, 128, 128, 64, "gk", "skew_last"),
+    ("kda_tp2", 48, 48, 32768, 1, 128, 128, 64, "gk", "equal"),
+    ("kda_tp2", 48, 48, 32768, 4, 128, 128, 64, "gk", "equal"),
+    ("kda_tp2", 48, 48, 32768, 4, 128, 128, 64, "gk", "skew"),
+    ("kda_tp2", 48, 48, 32768, 4, 128, 128, 64, "gk", "skew_last"),
+    ("kda_tp2", 48, 48, 32768, 8, 128, 128, 64, "gk", "equal"),
+    ("kda_tp2", 48, 48, 32768, 8, 128, 128, 64, "gk", "skew"),
+    ("kda_tp2", 48, 48, 32768, 8, 128, 128, 64, "gk", "skew_last"),
+    ("kda_tp1", 96, 96, 8192, 1, 128, 128, 64, "gk", "equal"),
+    ("kda_tp1", 96, 96, 8192, 4, 128, 128, 64, "gk", "equal"),
+    ("kda_tp1", 96, 96, 8192, 4, 128, 128, 64, "gk", "skew"),
+    ("kda_tp1", 96, 96, 8192, 4, 128, 128, 64, "gk", "skew_last"),
+    ("kda_tp1", 96, 96, 8192, 8, 128, 128, 64, "gk", "equal"),
+    ("kda_tp1", 96, 96, 8192, 8, 128, 128, 64, "gk", "skew"),
+    ("kda_tp1", 96, 96, 8192, 8, 128, 128, 64, "gk", "skew_last"),
+    ("kda_tp1", 96, 96, 32768, 1, 128, 128, 64, "gk", "equal"),
+    ("kda_tp1", 96, 96, 32768, 4, 128, 128, 64, "gk", "equal"),
+    ("kda_tp1", 96, 96, 32768, 4, 128, 128, 64, "gk", "skew"),
+    ("kda_tp1", 96, 96, 32768, 4, 128, 128, 64, "gk", "skew_last"),
+    ("kda_tp1", 96, 96, 32768, 8, 128, 128, 64, "gk", "equal"),
+    ("kda_tp1", 96, 96, 32768, 8, 128, 128, 64, "gk", "skew"),
+    ("kda_tp1", 96, 96, 32768, 8, 128, 128, 64, "gk", "skew_last"),
     # -- N-bucket disambiguation (equal only) ------------------------------
     # The auto-selector buckets N as {1, <=4, >=5}, and the >=5 bucket for these
     # (gate,H) groups is currently anchored only at N=8. The scalar-g equal optimum
@@ -194,44 +239,44 @@ PRESET_SHAPES: list[tuple] = [
     # the >=5 bucket may not be flat. These probe N inside the bucket (6,12,16) and
     # the <=4 / >=5 boundary (N=2) to confirm the bucketing or justify a finer split.
     # Skew omitted -- undetectable at selection time, so it can't inform the key.
-    ("gdn_h16_g",   16, 16,  8192,  2, 128, 128, 64, "g",  "equal"),
-    ("gdn_h16_g",   16, 16,  8192,  6, 128, 128, 64, "g",  "equal"),
-    ("gdn_h16_g",   16, 16,  8192, 12, 128, 128, 64, "g",  "equal"),
-    ("gdn_h16_g",   16, 16,  8192, 16, 128, 128, 64, "g",  "equal"),
-    ("gdn_h16_g",   16, 16, 32768,  2, 128, 128, 64, "g",  "equal"),
-    ("gdn_h16_g",   16, 16, 32768,  6, 128, 128, 64, "g",  "equal"),
-    ("gdn_h16_g",   16, 16, 32768, 12, 128, 128, 64, "g",  "equal"),
-    ("gdn_h16_g",   16, 16, 32768, 16, 128, 128, 64, "g",  "equal"),
-    ("gdn_h32_g",   32,  8,  8192,  2, 128, 128, 64, "g",  "equal"),
-    ("gdn_h32_g",   32,  8,  8192,  6, 128, 128, 64, "g",  "equal"),
-    ("gdn_h32_g",   32,  8,  8192, 12, 128, 128, 64, "g",  "equal"),
-    ("gdn_h32_g",   32,  8,  8192, 16, 128, 128, 64, "g",  "equal"),
-    ("gdn_h32_g",   32,  8, 32768,  2, 128, 128, 64, "g",  "equal"),
-    ("gdn_h32_g",   32,  8, 32768,  6, 128, 128, 64, "g",  "equal"),
-    ("gdn_h32_g",   32,  8, 32768, 12, 128, 128, 64, "g",  "equal"),
-    ("gdn_h32_g",   32,  8, 32768, 16, 128, 128, 64, "g",  "equal"),
-    ("kda_tp4_g",   24, 24,  8192,  6, 128, 128, 64, "gk", "equal"),
-    ("kda_tp4_g",   24, 24,  8192, 16, 128, 128, 64, "gk", "equal"),
-    ("kda_tp4_g",   24, 24, 32768,  6, 128, 128, 64, "gk", "equal"),
-    ("kda_tp4_g",   24, 24, 32768, 16, 128, 128, 64, "gk", "equal"),
+    ("gdn_h16_g", 16, 16, 8192, 2, 128, 128, 64, "g", "equal"),
+    ("gdn_h16_g", 16, 16, 8192, 6, 128, 128, 64, "g", "equal"),
+    ("gdn_h16_g", 16, 16, 8192, 12, 128, 128, 64, "g", "equal"),
+    ("gdn_h16_g", 16, 16, 8192, 16, 128, 128, 64, "g", "equal"),
+    ("gdn_h16_g", 16, 16, 32768, 2, 128, 128, 64, "g", "equal"),
+    ("gdn_h16_g", 16, 16, 32768, 6, 128, 128, 64, "g", "equal"),
+    ("gdn_h16_g", 16, 16, 32768, 12, 128, 128, 64, "g", "equal"),
+    ("gdn_h16_g", 16, 16, 32768, 16, 128, 128, 64, "g", "equal"),
+    ("gdn_h32_g", 32, 8, 8192, 2, 128, 128, 64, "g", "equal"),
+    ("gdn_h32_g", 32, 8, 8192, 6, 128, 128, 64, "g", "equal"),
+    ("gdn_h32_g", 32, 8, 8192, 12, 128, 128, 64, "g", "equal"),
+    ("gdn_h32_g", 32, 8, 8192, 16, 128, 128, 64, "g", "equal"),
+    ("gdn_h32_g", 32, 8, 32768, 2, 128, 128, 64, "g", "equal"),
+    ("gdn_h32_g", 32, 8, 32768, 6, 128, 128, 64, "g", "equal"),
+    ("gdn_h32_g", 32, 8, 32768, 12, 128, 128, 64, "g", "equal"),
+    ("gdn_h32_g", 32, 8, 32768, 16, 128, 128, 64, "g", "equal"),
+    ("kda_tp4_g", 24, 24, 8192, 6, 128, 128, 64, "gk", "equal"),
+    ("kda_tp4_g", 24, 24, 8192, 16, 128, 128, 64, "gk", "equal"),
+    ("kda_tp4_g", 24, 24, 32768, 6, 128, 128, 64, "gk", "equal"),
+    ("kda_tp4_g", 24, 24, 32768, 16, 128, 128, 64, "gk", "equal"),
     # -- N=2 boundary coverage (equal only) --------------------------------
     # The <=4 N-bucket is not flat: N=2 halves the grid and drops the optimal tile
     # one regime below N=4 (measured: g H16 N2->bv16 vs N4->bv32; g H32 N2->bv32 vs
     # N4->bv64w8). N=2 was previously measured only for g H16/H32; these add it for
     # the remaining (gate,H) groups so a <=2 sub-bucket can be populated with data
     # rather than extrapolation.
-    ("gdn_q3n_tp8",  4,  2,  8192, 2, 128, 128, 64, "g",  "equal"),
-    ("gdn_q3n_tp8",  4,  2, 32768, 2, 128, 128, 64, "g",  "equal"),
-    ("gdn_h8_g",     8,  4,  8192, 2, 128, 128, 64, "g",  "equal"),
-    ("gdn_h8_g",     8,  4, 32768, 2, 128, 128, 64, "g",  "equal"),
-    ("kda_tp8",     12, 12,  8192, 2, 128, 128, 64, "gk", "equal"),
-    ("kda_tp8",     12, 12, 32768, 2, 128, 128, 64, "gk", "equal"),
-    ("kda_tp4",     24, 24,  8192, 2, 128, 128, 64, "gk", "equal"),
-    ("kda_tp4",     24, 24, 32768, 2, 128, 128, 64, "gk", "equal"),
-    ("kda_tp2",     48, 48,  8192, 2, 128, 128, 64, "gk", "equal"),
-    ("kda_tp2",     48, 48, 32768, 2, 128, 128, 64, "gk", "equal"),
-    ("kda_tp1",     96, 96,  8192, 2, 128, 128, 64, "gk", "equal"),
-    ("kda_tp1",     96, 96, 32768, 2, 128, 128, 64, "gk", "equal"),
+    ("gdn_q3n_tp8", 4, 2, 8192, 2, 128, 128, 64, "g", "equal"),
+    ("gdn_q3n_tp8", 4, 2, 32768, 2, 128, 128, 64, "g", "equal"),
+    ("gdn_h8_g", 8, 4, 8192, 2, 128, 128, 64, "g", "equal"),
+    ("gdn_h8_g", 8, 4, 32768, 2, 128, 128, 64, "g", "equal"),
+    ("kda_tp8", 12, 12, 8192, 2, 128, 128, 64, "gk", "equal"),
+    ("kda_tp8", 12, 12, 32768, 2, 128, 128, 64, "gk", "equal"),
+    ("kda_tp4", 24, 24, 8192, 2, 128, 128, 64, "gk", "equal"),
+    ("kda_tp4", 24, 24, 32768, 2, 128, 128, 64, "gk", "equal"),
+    ("kda_tp2", 48, 48, 8192, 2, 128, 128, 64, "gk", "equal"),
+    ("kda_tp2", 48, 48, 32768, 2, 128, 128, 64, "gk", "equal"),
+    ("kda_tp1", 96, 96, 8192, 2, 128, 128, 64, "gk", "equal"),
+    ("kda_tp1", 96, 96, 32768, 2, 128, 128, 64, "gk", "equal"),
     # -- ragged/bimodal/skew/skew_last sampling for the fusion-selection
     # heuristic (added for the final heuristics sweep). Existing non-equal
     # coverage was concentrated at high fill and mostly on KDA; these add the
@@ -241,72 +286,72 @@ PRESET_SHAPES: list[tuple] = [
     # these quantify how much the input distribution shifts fused-vs-unfused at a
     # given nominal fill -- the second-order term the fill axis cannot capture.
     # ---- near the ~0.5 boundary (fill64 0.39-0.63): the critical band ----
-    ("gdn_h16_g",  16,  16,  32768,  4, 128, 128, 64, "g", "ragged"),  # fill64=0.42
-    ("gdn_h16_g",  16,  16,  32768,  4, 128, 128, 64, "g", "bimodal"),  # fill64=0.42
-    ("gdn_h16_g",  16,  16,  32768,  4, 128, 128, 64, "g", "skew"),  # fill64=0.42
-    ("gdn_h16_g",  16,  16,  32768,  4, 128, 128, 64, "g", "skew_last"),  # fill64=0.42
-    ("gdn_h32_g",  32,   8,  32768,  2, 128, 128, 64, "g", "ragged"),  # fill64=0.42
-    ("gdn_h32_g",  32,   8,  32768,  2, 128, 128, 64, "g", "bimodal"),  # fill64=0.42
-    ("gdn_h32_g",  32,   8,  32768,  2, 128, 128, 64, "g", "skew"),  # fill64=0.42
-    ("gdn_h32_g",  32,   8,  32768,  2, 128, 128, 64, "g", "skew_last"),  # fill64=0.42
-    ("kda_tp8",  12,  12,  32768,  5, 128, 128, 64, "gk", "ragged"),  # fill64=0.39
-    ("kda_tp8",  12,  12,  32768,  5, 128, 128, 64, "gk", "bimodal"),  # fill64=0.39
-    ("kda_tp8",  12,  12,  32768,  5, 128, 128, 64, "gk", "skew"),  # fill64=0.39
-    ("kda_tp8",  12,  12,  32768,  5, 128, 128, 64, "gk", "skew_last"),  # fill64=0.39
-    ("kda_tp8",  12,  12,  32768,  6, 128, 128, 64, "gk", "ragged"),  # fill64=0.47
-    ("kda_tp8",  12,  12,  32768,  6, 128, 128, 64, "gk", "bimodal"),  # fill64=0.47
-    ("kda_tp8",  12,  12,  32768,  6, 128, 128, 64, "gk", "skew"),  # fill64=0.47
-    ("kda_tp8",  12,  12,  32768,  6, 128, 128, 64, "gk", "skew_last"),  # fill64=0.47
-    ("kda_tp4",  24,  24,  32768,  4, 128, 128, 64, "gk", "ragged"),  # fill64=0.63
-    ("kda_tp4",  24,  24,  32768,  4, 128, 128, 64, "gk", "bimodal"),  # fill64=0.63
-    ("kda_tp4",  24,  24,  32768,  4, 128, 128, 64, "gk", "skew"),  # fill64=0.63
-    ("kda_tp4",  24,  24,  32768,  4, 128, 128, 64, "gk", "skew_last"),  # fill64=0.63
-    ("gdn_h16_g",  16,  16,  32768,  6, 128, 128, 64, "g", "ragged"),  # fill64=0.63
-    ("gdn_h16_g",  16,  16,  32768,  6, 128, 128, 64, "g", "bimodal"),  # fill64=0.63
-    ("gdn_h16_g",  16,  16,  32768,  6, 128, 128, 64, "g", "skew"),  # fill64=0.63
-    ("gdn_h16_g",  16,  16,  32768,  6, 128, 128, 64, "g", "skew_last"),  # fill64=0.63
-    ("kda_tp2",  48,  48,  32768,  2, 128, 128, 64, "gk", "ragged"),  # fill64=0.63
-    ("kda_tp2",  48,  48,  32768,  2, 128, 128, 64, "gk", "bimodal"),  # fill64=0.63
-    ("kda_tp2",  48,  48,  32768,  2, 128, 128, 64, "gk", "skew"),  # fill64=0.63
-    ("kda_tp2",  48,  48,  32768,  2, 128, 128, 64, "gk", "skew_last"),  # fill64=0.63
-    ("gdn_h16_g",  16,  16,   8192,  4, 128, 128, 64, "g", "ragged"),  # fill64=0.42
-    ("gdn_h16_g",  16,  16,   8192,  4, 128, 128, 64, "g", "bimodal"),  # fill64=0.42
-    ("gdn_h16_g",  16,  16,   8192,  4, 128, 128, 64, "g", "skew"),  # fill64=0.42
-    ("gdn_h16_g",  16,  16,   8192,  4, 128, 128, 64, "g", "skew_last"),  # fill64=0.42
-    ("kda_tp4",  24,  24,   8192,  4, 128, 128, 64, "gk", "ragged"),  # fill64=0.63
-    ("kda_tp4",  24,  24,   8192,  4, 128, 128, 64, "gk", "bimodal"),  # fill64=0.63
-    ("kda_tp4",  24,  24,   8192,  4, 128, 128, 64, "gk", "skew"),  # fill64=0.63
-    ("kda_tp4",  24,  24,   8192,  4, 128, 128, 64, "gk", "skew_last"),  # fill64=0.63
+    ("gdn_h16_g", 16, 16, 32768, 4, 128, 128, 64, "g", "ragged"),  # fill64=0.42
+    ("gdn_h16_g", 16, 16, 32768, 4, 128, 128, 64, "g", "bimodal"),  # fill64=0.42
+    ("gdn_h16_g", 16, 16, 32768, 4, 128, 128, 64, "g", "skew"),  # fill64=0.42
+    ("gdn_h16_g", 16, 16, 32768, 4, 128, 128, 64, "g", "skew_last"),  # fill64=0.42
+    ("gdn_h32_g", 32, 8, 32768, 2, 128, 128, 64, "g", "ragged"),  # fill64=0.42
+    ("gdn_h32_g", 32, 8, 32768, 2, 128, 128, 64, "g", "bimodal"),  # fill64=0.42
+    ("gdn_h32_g", 32, 8, 32768, 2, 128, 128, 64, "g", "skew"),  # fill64=0.42
+    ("gdn_h32_g", 32, 8, 32768, 2, 128, 128, 64, "g", "skew_last"),  # fill64=0.42
+    ("kda_tp8", 12, 12, 32768, 5, 128, 128, 64, "gk", "ragged"),  # fill64=0.39
+    ("kda_tp8", 12, 12, 32768, 5, 128, 128, 64, "gk", "bimodal"),  # fill64=0.39
+    ("kda_tp8", 12, 12, 32768, 5, 128, 128, 64, "gk", "skew"),  # fill64=0.39
+    ("kda_tp8", 12, 12, 32768, 5, 128, 128, 64, "gk", "skew_last"),  # fill64=0.39
+    ("kda_tp8", 12, 12, 32768, 6, 128, 128, 64, "gk", "ragged"),  # fill64=0.47
+    ("kda_tp8", 12, 12, 32768, 6, 128, 128, 64, "gk", "bimodal"),  # fill64=0.47
+    ("kda_tp8", 12, 12, 32768, 6, 128, 128, 64, "gk", "skew"),  # fill64=0.47
+    ("kda_tp8", 12, 12, 32768, 6, 128, 128, 64, "gk", "skew_last"),  # fill64=0.47
+    ("kda_tp4", 24, 24, 32768, 4, 128, 128, 64, "gk", "ragged"),  # fill64=0.63
+    ("kda_tp4", 24, 24, 32768, 4, 128, 128, 64, "gk", "bimodal"),  # fill64=0.63
+    ("kda_tp4", 24, 24, 32768, 4, 128, 128, 64, "gk", "skew"),  # fill64=0.63
+    ("kda_tp4", 24, 24, 32768, 4, 128, 128, 64, "gk", "skew_last"),  # fill64=0.63
+    ("gdn_h16_g", 16, 16, 32768, 6, 128, 128, 64, "g", "ragged"),  # fill64=0.63
+    ("gdn_h16_g", 16, 16, 32768, 6, 128, 128, 64, "g", "bimodal"),  # fill64=0.63
+    ("gdn_h16_g", 16, 16, 32768, 6, 128, 128, 64, "g", "skew"),  # fill64=0.63
+    ("gdn_h16_g", 16, 16, 32768, 6, 128, 128, 64, "g", "skew_last"),  # fill64=0.63
+    ("kda_tp2", 48, 48, 32768, 2, 128, 128, 64, "gk", "ragged"),  # fill64=0.63
+    ("kda_tp2", 48, 48, 32768, 2, 128, 128, 64, "gk", "bimodal"),  # fill64=0.63
+    ("kda_tp2", 48, 48, 32768, 2, 128, 128, 64, "gk", "skew"),  # fill64=0.63
+    ("kda_tp2", 48, 48, 32768, 2, 128, 128, 64, "gk", "skew_last"),  # fill64=0.63
+    ("gdn_h16_g", 16, 16, 8192, 4, 128, 128, 64, "g", "ragged"),  # fill64=0.42
+    ("gdn_h16_g", 16, 16, 8192, 4, 128, 128, 64, "g", "bimodal"),  # fill64=0.42
+    ("gdn_h16_g", 16, 16, 8192, 4, 128, 128, 64, "g", "skew"),  # fill64=0.42
+    ("gdn_h16_g", 16, 16, 8192, 4, 128, 128, 64, "g", "skew_last"),  # fill64=0.42
+    ("kda_tp4", 24, 24, 8192, 4, 128, 128, 64, "gk", "ragged"),  # fill64=0.63
+    ("kda_tp4", 24, 24, 8192, 4, 128, 128, 64, "gk", "bimodal"),  # fill64=0.63
+    ("kda_tp4", 24, 24, 8192, 4, 128, 128, 64, "gk", "skew"),  # fill64=0.63
+    ("kda_tp4", 24, 24, 8192, 4, 128, 128, 64, "gk", "skew_last"),  # fill64=0.63
     # ---- low-fill tail (fill64 <= 0.32) ----
-    ("gdn_h8_g",   8,   4,  32768,  4, 128, 128, 64, "g", "ragged"),  # fill64=0.21
-    ("gdn_h8_g",   8,   4,  32768,  4, 128, 128, 64, "g", "bimodal"),  # fill64=0.21
-    ("gdn_h8_g",   8,   4,  32768,  4, 128, 128, 64, "g", "skew"),  # fill64=0.21
-    ("gdn_h8_g",   8,   4,  32768,  4, 128, 128, 64, "g", "skew_last"),  # fill64=0.21
-    ("kda_tp8",  12,  12,  32768,  4, 128, 128, 64, "gk", "ragged"),  # fill64=0.32
-    ("kda_tp8",  12,  12,  32768,  4, 128, 128, 64, "gk", "bimodal"),  # fill64=0.32
-    ("kda_tp8",  12,  12,  32768,  4, 128, 128, 64, "gk", "skew"),  # fill64=0.32
-    ("kda_tp8",  12,  12,  32768,  4, 128, 128, 64, "gk", "skew_last"),  # fill64=0.32
-    ("kda_tp4",  24,  24,  32768,  2, 128, 128, 64, "gk", "ragged"),  # fill64=0.32
-    ("kda_tp4",  24,  24,  32768,  2, 128, 128, 64, "gk", "bimodal"),  # fill64=0.32
-    ("kda_tp4",  24,  24,  32768,  2, 128, 128, 64, "gk", "skew"),  # fill64=0.32
-    ("kda_tp4",  24,  24,  32768,  2, 128, 128, 64, "gk", "skew_last"),  # fill64=0.32
+    ("gdn_h8_g", 8, 4, 32768, 4, 128, 128, 64, "g", "ragged"),  # fill64=0.21
+    ("gdn_h8_g", 8, 4, 32768, 4, 128, 128, 64, "g", "bimodal"),  # fill64=0.21
+    ("gdn_h8_g", 8, 4, 32768, 4, 128, 128, 64, "g", "skew"),  # fill64=0.21
+    ("gdn_h8_g", 8, 4, 32768, 4, 128, 128, 64, "g", "skew_last"),  # fill64=0.21
+    ("kda_tp8", 12, 12, 32768, 4, 128, 128, 64, "gk", "ragged"),  # fill64=0.32
+    ("kda_tp8", 12, 12, 32768, 4, 128, 128, 64, "gk", "bimodal"),  # fill64=0.32
+    ("kda_tp8", 12, 12, 32768, 4, 128, 128, 64, "gk", "skew"),  # fill64=0.32
+    ("kda_tp8", 12, 12, 32768, 4, 128, 128, 64, "gk", "skew_last"),  # fill64=0.32
+    ("kda_tp4", 24, 24, 32768, 2, 128, 128, 64, "gk", "ragged"),  # fill64=0.32
+    ("kda_tp4", 24, 24, 32768, 2, 128, 128, 64, "gk", "bimodal"),  # fill64=0.32
+    ("kda_tp4", 24, 24, 32768, 2, 128, 128, 64, "gk", "skew"),  # fill64=0.32
+    ("kda_tp4", 24, 24, 32768, 2, 128, 128, 64, "gk", "skew_last"),  # fill64=0.32
     # ---- high-fill tail (fill64 >= 1.26), esp. GDN scalar-g ----
-    ("gdn_h16_g",  16,  16,  32768, 12, 128, 128, 64, "g", "ragged"),  # fill64=1.26
-    ("gdn_h16_g",  16,  16,  32768, 12, 128, 128, 64, "g", "bimodal"),  # fill64=1.26
-    ("gdn_h16_g",  16,  16,  32768, 12, 128, 128, 64, "g", "skew"),  # fill64=1.26
-    ("gdn_h16_g",  16,  16,  32768, 12, 128, 128, 64, "g", "skew_last"),  # fill64=1.26
-    ("gdn_h32_g",  32,   8,  32768,  6, 128, 128, 64, "g", "ragged"),  # fill64=1.26
-    ("gdn_h32_g",  32,   8,  32768,  6, 128, 128, 64, "g", "bimodal"),  # fill64=1.26
-    ("gdn_h32_g",  32,   8,  32768,  6, 128, 128, 64, "g", "skew"),  # fill64=1.26
-    ("gdn_h32_g",  32,   8,  32768,  6, 128, 128, 64, "g", "skew_last"),  # fill64=1.26
-    ("gdn_h32_g",  32,   8,  32768, 12, 128, 128, 64, "g", "ragged"),  # fill64=2.53
-    ("gdn_h32_g",  32,   8,  32768, 12, 128, 128, 64, "g", "bimodal"),  # fill64=2.53
-    ("gdn_h32_g",  32,   8,  32768, 12, 128, 128, 64, "g", "skew"),  # fill64=2.53
-    ("gdn_h32_g",  32,   8,  32768, 12, 128, 128, 64, "g", "skew_last"),  # fill64=2.53
-    ("kda_tp4",  24,  24,  32768, 16, 128, 128, 64, "gk", "ragged"),  # fill64=2.53
-    ("kda_tp4",  24,  24,  32768, 16, 128, 128, 64, "gk", "bimodal"),  # fill64=2.53
-    ("kda_tp4",  24,  24,  32768, 16, 128, 128, 64, "gk", "skew"),  # fill64=2.53
-    ("kda_tp4",  24,  24,  32768, 16, 128, 128, 64, "gk", "skew_last"),  # fill64=2.53
+    ("gdn_h16_g", 16, 16, 32768, 12, 128, 128, 64, "g", "ragged"),  # fill64=1.26
+    ("gdn_h16_g", 16, 16, 32768, 12, 128, 128, 64, "g", "bimodal"),  # fill64=1.26
+    ("gdn_h16_g", 16, 16, 32768, 12, 128, 128, 64, "g", "skew"),  # fill64=1.26
+    ("gdn_h16_g", 16, 16, 32768, 12, 128, 128, 64, "g", "skew_last"),  # fill64=1.26
+    ("gdn_h32_g", 32, 8, 32768, 6, 128, 128, 64, "g", "ragged"),  # fill64=1.26
+    ("gdn_h32_g", 32, 8, 32768, 6, 128, 128, 64, "g", "bimodal"),  # fill64=1.26
+    ("gdn_h32_g", 32, 8, 32768, 6, 128, 128, 64, "g", "skew"),  # fill64=1.26
+    ("gdn_h32_g", 32, 8, 32768, 6, 128, 128, 64, "g", "skew_last"),  # fill64=1.26
+    ("gdn_h32_g", 32, 8, 32768, 12, 128, 128, 64, "g", "ragged"),  # fill64=2.53
+    ("gdn_h32_g", 32, 8, 32768, 12, 128, 128, 64, "g", "bimodal"),  # fill64=2.53
+    ("gdn_h32_g", 32, 8, 32768, 12, 128, 128, 64, "g", "skew"),  # fill64=2.53
+    ("gdn_h32_g", 32, 8, 32768, 12, 128, 128, 64, "g", "skew_last"),  # fill64=2.53
+    ("kda_tp4", 24, 24, 32768, 16, 128, 128, 64, "gk", "ragged"),  # fill64=2.53
+    ("kda_tp4", 24, 24, 32768, 16, 128, 128, 64, "gk", "bimodal"),  # fill64=2.53
+    ("kda_tp4", 24, 24, 32768, 16, 128, 128, 64, "gk", "skew"),  # fill64=2.53
+    ("kda_tp4", 24, 24, 32768, 16, 128, 128, 64, "gk", "skew_last"),  # fill64=2.53
     # -- fusion decision-boundary sweep (ACTUAL-fill axis) ------------------
     # The simplified fuse rule keys on the ACTUAL grid fill of the best fused
     # instance (⌈V/BV_best⌉·N·H / CU), not fill64. Near the boundary the best
@@ -317,60 +362,60 @@ PRESET_SHAPES: list[tuple] = [
     # second-order term the fill axis can't capture -- the only high-fill losses
     # were H=4 skew/ragged). ``gdn_bnd_g`` / ``kda_bnd_gk`` are synthetic tags for
     # these probes (not real model configs).
-    ("gdn_bnd_g",  10,   5,   8192, 1, 128, 128, 64, "g", "equal"),  # fill16=0.263
-    ("gdn_bnd_g",  10,   5,   8192, 1, 128, 128, 64, "g", "skew"),  # fill16=0.263
-    ("gdn_bnd_g",  10,   5,  32768, 1, 128, 128, 64, "g", "equal"),  # fill16=0.263
-    ("gdn_bnd_g",  10,   5,  32768, 1, 128, 128, 64, "g", "skew"),  # fill16=0.263
-    ("gdn_bnd_g",  14,   7,   8192, 1, 128, 128, 64, "g", "equal"),  # fill16=0.368
-    ("gdn_bnd_g",  14,   7,   8192, 1, 128, 128, 64, "g", "skew"),  # fill16=0.368
-    ("gdn_bnd_g",  14,   7,  32768, 1, 128, 128, 64, "g", "equal"),  # fill16=0.368
-    ("gdn_bnd_g",  14,   7,  32768, 1, 128, 128, 64, "g", "skew"),  # fill16=0.368
-    ("gdn_bnd_g",  18,   9,   8192, 1, 128, 128, 64, "g", "equal"),  # fill16=0.474
-    ("gdn_bnd_g",  18,   9,   8192, 1, 128, 128, 64, "g", "skew"),  # fill16=0.474
-    ("gdn_bnd_g",  18,   9,  32768, 1, 128, 128, 64, "g", "equal"),  # fill16=0.474
-    ("gdn_bnd_g",  18,   9,  32768, 1, 128, 128, 64, "g", "skew"),  # fill16=0.474
-    ("gdn_bnd_g",  20,  10,   8192, 1, 128, 128, 64, "g", "equal"),  # fill16=0.526
-    ("gdn_bnd_g",  20,  10,  32768, 1, 128, 128, 64, "g", "equal"),  # fill16=0.526
-    ("gdn_bnd_g",   6,   3,   8192, 2, 128, 128, 64, "g", "equal"),  # fill16=0.316
-    ("gdn_bnd_g",   6,   3,  32768, 2, 128, 128, 64, "g", "equal"),  # fill16=0.316
-    ("gdn_bnd_g",  10,   5,   8192, 2, 128, 128, 64, "g", "equal"),  # fill16=0.526
-    ("gdn_bnd_g",  10,   5,  32768, 2, 128, 128, 64, "g", "equal"),  # fill16=0.526
-    ("kda_bnd_gk",  10,  10,   8192, 1, 128, 128, 64, "gk", "equal"),  # fill16=0.263
-    ("kda_bnd_gk",  10,  10,   8192, 1, 128, 128, 64, "gk", "skew"),  # fill16=0.263
-    ("kda_bnd_gk",  10,  10,  32768, 1, 128, 128, 64, "gk", "equal"),  # fill16=0.263
-    ("kda_bnd_gk",  10,  10,  32768, 1, 128, 128, 64, "gk", "skew"),  # fill16=0.263
-    ("kda_bnd_gk",  14,  14,   8192, 1, 128, 128, 64, "gk", "equal"),  # fill16=0.368
-    ("kda_bnd_gk",  14,  14,   8192, 1, 128, 128, 64, "gk", "skew"),  # fill16=0.368
-    ("kda_bnd_gk",  14,  14,  32768, 1, 128, 128, 64, "gk", "equal"),  # fill16=0.368
-    ("kda_bnd_gk",  14,  14,  32768, 1, 128, 128, 64, "gk", "skew"),  # fill16=0.368
-    ("kda_bnd_gk",  18,  18,   8192, 1, 128, 128, 64, "gk", "equal"),  # fill16=0.474
-    ("kda_bnd_gk",  18,  18,   8192, 1, 128, 128, 64, "gk", "skew"),  # fill16=0.474
-    ("kda_bnd_gk",  18,  18,  32768, 1, 128, 128, 64, "gk", "equal"),  # fill16=0.474
-    ("kda_bnd_gk",  18,  18,  32768, 1, 128, 128, 64, "gk", "skew"),  # fill16=0.474
-    ("kda_bnd_gk",  20,  20,   8192, 1, 128, 128, 64, "gk", "equal"),  # fill16=0.526
-    ("kda_bnd_gk",  20,  20,  32768, 1, 128, 128, 64, "gk", "equal"),  # fill16=0.526
-    ("kda_bnd_gk",   8,   8,   8192, 1, 128, 128, 64, "gk", "equal"),  # fill16=0.211
-    ("kda_bnd_gk",   8,   8,  32768, 1, 128, 128, 64, "gk", "equal"),  # fill16=0.211
-    ("kda_bnd_gk",  16,  16,   8192, 1, 128, 128, 64, "gk", "equal"),  # fill16=0.421
-    ("kda_bnd_gk",  16,  16,  32768, 1, 128, 128, 64, "gk", "equal"),  # fill16=0.421
-    ("kda_tp8",  12,  12,   8192, 1, 128, 128, 64, "gk", "skew"),  # fill16=0.316
-    ("kda_tp8",  12,  12,   8192, 1, 128, 128, 64, "gk", "ragged"),  # fill16=0.316
-    ("kda_tp8",  12,  12,  32768, 1, 128, 128, 64, "gk", "skew"),  # fill16=0.316
-    ("kda_tp8",  12,  12,  32768, 1, 128, 128, 64, "gk", "ragged"),  # fill16=0.316
-    ("gdn_h8_g",   8,   4,   8192, 1, 128, 128, 64, "g", "skew"),  # fill16=0.211
-    ("gdn_h8_g",   8,   4,   8192, 1, 128, 128, 64, "g", "ragged"),  # fill16=0.211
-    ("gdn_h8_g",   8,   4,  32768, 1, 128, 128, 64, "g", "skew"),  # fill16=0.211
-    ("gdn_h8_g",   8,   4,  32768, 1, 128, 128, 64, "g", "ragged"),  # fill16=0.211
-    ("gdn_h16_g",  16,  16,   8192, 1, 128, 128, 64, "g", "skew"),  # fill16=0.421
-    ("gdn_h16_g",  16,  16,   8192, 1, 128, 128, 64, "g", "ragged"),  # fill16=0.421
-    ("gdn_h16_g",  16,  16,  32768, 1, 128, 128, 64, "g", "skew"),  # fill16=0.421
-    ("gdn_h16_g",  16,  16,  32768, 1, 128, 128, 64, "g", "ragged"),  # fill16=0.421
-    ("gdn_q3n_tp8",   4,   2,   8192, 3, 128, 128, 64, "g", "equal"),  # fill16=0.316
-    ("gdn_q3n_tp8",   4,   2,  32768, 3, 128, 128, 64, "g", "equal"),  # fill16=0.316
-    ("gdn_q3n_tp8",   4,   2,   8192, 4, 128, 128, 64, "g", "equal"),  # fill16=0.421
-    ("gdn_q3n_tp8",   4,   2,   8192, 4, 128, 128, 64, "g", "skew"),  # fill16=0.421
-    ("gdn_q3n_tp8",   4,   2,  32768, 4, 128, 128, 64, "g", "equal"),  # fill16=0.421
-    ("gdn_q3n_tp8",   4,   2,  32768, 4, 128, 128, 64, "g", "skew"),  # fill16=0.421
+    ("gdn_bnd_g", 10, 5, 8192, 1, 128, 128, 64, "g", "equal"),  # fill16=0.263
+    ("gdn_bnd_g", 10, 5, 8192, 1, 128, 128, 64, "g", "skew"),  # fill16=0.263
+    ("gdn_bnd_g", 10, 5, 32768, 1, 128, 128, 64, "g", "equal"),  # fill16=0.263
+    ("gdn_bnd_g", 10, 5, 32768, 1, 128, 128, 64, "g", "skew"),  # fill16=0.263
+    ("gdn_bnd_g", 14, 7, 8192, 1, 128, 128, 64, "g", "equal"),  # fill16=0.368
+    ("gdn_bnd_g", 14, 7, 8192, 1, 128, 128, 64, "g", "skew"),  # fill16=0.368
+    ("gdn_bnd_g", 14, 7, 32768, 1, 128, 128, 64, "g", "equal"),  # fill16=0.368
+    ("gdn_bnd_g", 14, 7, 32768, 1, 128, 128, 64, "g", "skew"),  # fill16=0.368
+    ("gdn_bnd_g", 18, 9, 8192, 1, 128, 128, 64, "g", "equal"),  # fill16=0.474
+    ("gdn_bnd_g", 18, 9, 8192, 1, 128, 128, 64, "g", "skew"),  # fill16=0.474
+    ("gdn_bnd_g", 18, 9, 32768, 1, 128, 128, 64, "g", "equal"),  # fill16=0.474
+    ("gdn_bnd_g", 18, 9, 32768, 1, 128, 128, 64, "g", "skew"),  # fill16=0.474
+    ("gdn_bnd_g", 20, 10, 8192, 1, 128, 128, 64, "g", "equal"),  # fill16=0.526
+    ("gdn_bnd_g", 20, 10, 32768, 1, 128, 128, 64, "g", "equal"),  # fill16=0.526
+    ("gdn_bnd_g", 6, 3, 8192, 2, 128, 128, 64, "g", "equal"),  # fill16=0.316
+    ("gdn_bnd_g", 6, 3, 32768, 2, 128, 128, 64, "g", "equal"),  # fill16=0.316
+    ("gdn_bnd_g", 10, 5, 8192, 2, 128, 128, 64, "g", "equal"),  # fill16=0.526
+    ("gdn_bnd_g", 10, 5, 32768, 2, 128, 128, 64, "g", "equal"),  # fill16=0.526
+    ("kda_bnd_gk", 10, 10, 8192, 1, 128, 128, 64, "gk", "equal"),  # fill16=0.263
+    ("kda_bnd_gk", 10, 10, 8192, 1, 128, 128, 64, "gk", "skew"),  # fill16=0.263
+    ("kda_bnd_gk", 10, 10, 32768, 1, 128, 128, 64, "gk", "equal"),  # fill16=0.263
+    ("kda_bnd_gk", 10, 10, 32768, 1, 128, 128, 64, "gk", "skew"),  # fill16=0.263
+    ("kda_bnd_gk", 14, 14, 8192, 1, 128, 128, 64, "gk", "equal"),  # fill16=0.368
+    ("kda_bnd_gk", 14, 14, 8192, 1, 128, 128, 64, "gk", "skew"),  # fill16=0.368
+    ("kda_bnd_gk", 14, 14, 32768, 1, 128, 128, 64, "gk", "equal"),  # fill16=0.368
+    ("kda_bnd_gk", 14, 14, 32768, 1, 128, 128, 64, "gk", "skew"),  # fill16=0.368
+    ("kda_bnd_gk", 18, 18, 8192, 1, 128, 128, 64, "gk", "equal"),  # fill16=0.474
+    ("kda_bnd_gk", 18, 18, 8192, 1, 128, 128, 64, "gk", "skew"),  # fill16=0.474
+    ("kda_bnd_gk", 18, 18, 32768, 1, 128, 128, 64, "gk", "equal"),  # fill16=0.474
+    ("kda_bnd_gk", 18, 18, 32768, 1, 128, 128, 64, "gk", "skew"),  # fill16=0.474
+    ("kda_bnd_gk", 20, 20, 8192, 1, 128, 128, 64, "gk", "equal"),  # fill16=0.526
+    ("kda_bnd_gk", 20, 20, 32768, 1, 128, 128, 64, "gk", "equal"),  # fill16=0.526
+    ("kda_bnd_gk", 8, 8, 8192, 1, 128, 128, 64, "gk", "equal"),  # fill16=0.211
+    ("kda_bnd_gk", 8, 8, 32768, 1, 128, 128, 64, "gk", "equal"),  # fill16=0.211
+    ("kda_bnd_gk", 16, 16, 8192, 1, 128, 128, 64, "gk", "equal"),  # fill16=0.421
+    ("kda_bnd_gk", 16, 16, 32768, 1, 128, 128, 64, "gk", "equal"),  # fill16=0.421
+    ("kda_tp8", 12, 12, 8192, 1, 128, 128, 64, "gk", "skew"),  # fill16=0.316
+    ("kda_tp8", 12, 12, 8192, 1, 128, 128, 64, "gk", "ragged"),  # fill16=0.316
+    ("kda_tp8", 12, 12, 32768, 1, 128, 128, 64, "gk", "skew"),  # fill16=0.316
+    ("kda_tp8", 12, 12, 32768, 1, 128, 128, 64, "gk", "ragged"),  # fill16=0.316
+    ("gdn_h8_g", 8, 4, 8192, 1, 128, 128, 64, "g", "skew"),  # fill16=0.211
+    ("gdn_h8_g", 8, 4, 8192, 1, 128, 128, 64, "g", "ragged"),  # fill16=0.211
+    ("gdn_h8_g", 8, 4, 32768, 1, 128, 128, 64, "g", "skew"),  # fill16=0.211
+    ("gdn_h8_g", 8, 4, 32768, 1, 128, 128, 64, "g", "ragged"),  # fill16=0.211
+    ("gdn_h16_g", 16, 16, 8192, 1, 128, 128, 64, "g", "skew"),  # fill16=0.421
+    ("gdn_h16_g", 16, 16, 8192, 1, 128, 128, 64, "g", "ragged"),  # fill16=0.421
+    ("gdn_h16_g", 16, 16, 32768, 1, 128, 128, 64, "g", "skew"),  # fill16=0.421
+    ("gdn_h16_g", 16, 16, 32768, 1, 128, 128, 64, "g", "ragged"),  # fill16=0.421
+    ("gdn_q3n_tp8", 4, 2, 8192, 3, 128, 128, 64, "g", "equal"),  # fill16=0.316
+    ("gdn_q3n_tp8", 4, 2, 32768, 3, 128, 128, 64, "g", "equal"),  # fill16=0.316
+    ("gdn_q3n_tp8", 4, 2, 8192, 4, 128, 128, 64, "g", "equal"),  # fill16=0.421
+    ("gdn_q3n_tp8", 4, 2, 8192, 4, 128, 128, 64, "g", "skew"),  # fill16=0.421
+    ("gdn_q3n_tp8", 4, 2, 32768, 4, 128, 128, 64, "g", "equal"),  # fill16=0.421
+    ("gdn_q3n_tp8", 4, 2, 32768, 4, 128, 128, 64, "g", "skew"),  # fill16=0.421
 ]
 
 # The bench builds gates (``g``/``gk``) in the natural-log domain and the fp32
@@ -421,8 +466,10 @@ def _make_seqlens(pattern: str, T_flat: int, N: int, BT: int = 64) -> list[int]:
 def _shape_label(idx: int, shape: tuple) -> str:
     model_tag, H, Hg, T_flat, N, K, V, BT, gate, seq_pattern = shape
     varlen = "" if seq_pattern == "equal" else f" seqs={seq_pattern}"
-    return (f"Shape {idx}: {model_tag} H={H} Hg={Hg} T={T_flat} N={N} "
-            f"gate={gate}{varlen}")
+    return (
+        f"Shape {idx}: {model_tag} H={H} Hg={Hg} T={T_flat} N={N} "
+        f"gate={gate}{varlen}"
+    )
 
 
 def _make_inputs(shape: tuple, device="cuda"):
@@ -437,19 +484,25 @@ def _make_inputs(shape: tuple, device="cuda"):
     B = 1
     dtype = torch.bfloat16
 
-    k    = torch.randn(B, T_flat, Hg, K, dtype=dtype, device=device) * 0.1
-    w_tm = torch.randn(B, T_flat, H,  K, dtype=dtype, device=device) * 0.1
-    u_tm = torch.randn(B, T_flat, H,  V, dtype=dtype, device=device) * 0.1
+    k = torch.randn(B, T_flat, Hg, K, dtype=dtype, device=device) * 0.1
+    w_tm = torch.randn(B, T_flat, H, K, dtype=dtype, device=device) * 0.1
+    u_tm = torch.randn(B, T_flat, H, V, dtype=dtype, device=device) * 0.1
     w_hm = w_tm.permute(0, 2, 1, 3).contiguous()
     u_hm = u_tm.permute(0, 2, 1, 3).contiguous()
 
     g, gk = None, None
     if gate_mode == "g":
-        g = (torch.randn(H, T_flat, dtype=torch.float32, device=device).abs() * -0.5
-             ).cumsum(dim=1).contiguous()
+        g = (
+            (torch.randn(H, T_flat, dtype=torch.float32, device=device).abs() * -0.5)
+            .cumsum(dim=1)
+            .contiguous()
+        )
     elif gate_mode == "gk":
-        gk = (torch.randn(T_flat, H, K, dtype=torch.float32, device=device).abs() * -0.1
-              ).cumsum(dim=0).contiguous()
+        gk = (
+            (torch.randn(T_flat, H, K, dtype=torch.float32, device=device).abs() * -0.1)
+            .cumsum(dim=0)
+            .contiguous()
+        )
 
     h0 = torch.randn(N, H, V, K, dtype=torch.float32, device=device) * 0.01
 
@@ -484,8 +537,9 @@ class _CaptureSafeMeta:
     the metadata once before capture, so the in-capture no-op is sound.
     """
 
-    def __init__(self, meta, cu_seqlens, *, chunk_size, total_prefill_tokens,
-                 num_sequences):
+    def __init__(
+        self, meta, cu_seqlens, *, chunk_size, total_prefill_tokens, num_sequences
+    ):
         self._meta = meta
         meta.validate(
             cu_seqlens=cu_seqlens,
@@ -510,6 +564,7 @@ def _adapt_hip(hip_fn):
     and sets ``g_head_major=True``. Looks up reusable prefill metadata from
     ``_hip_meta_cache`` so graph capture doesn't trigger a device-to-host read.
     """
+
     @functools.wraps(hip_fn)
     def _wrapped(*, k, w, u, g=None, gk=None, cu_seqlens=None, **kwargs):
         g_hip = g.unsqueeze(0) if (g is not None and g.dim() == 2) else g
@@ -517,25 +572,37 @@ def _adapt_hip(hip_fn):
             id(cu_seqlens) if cu_seqlens is not None else None
         )
         return hip_fn(
-            k=k, w=w, u=u, g=g_hip, gk=gk,
-            cu_seqlens=cu_seqlens, g_head_major=True,
+            k=k,
+            w=w,
+            u=u,
+            g=g_hip,
+            gk=gk,
+            cu_seqlens=cu_seqlens,
+            g_head_major=True,
             prefill_metadata=prefill_metadata,
             **kwargs,
         )
+
     return _wrapped
 
 
 def _build_hip_meta(cu, T_flat, BT):
     """Build and cache a capture-safe prefill metadata object for the given cu."""
     try:
-        from aiter.ops.prefill_batch_metadata import build_gated_delta_rule_prefill_metadata
+        from aiter.ops.prefill_batch_metadata import (
+            build_gated_delta_rule_prefill_metadata,
+        )
+
         bounds = cu.detach().to("cpu", torch.int64)
         seq_lens = (bounds[1:] - bounds[:-1]).tolist()
         meta = build_gated_delta_rule_prefill_metadata(
-            seq_lens, cu_seqlens=cu, chunk_size=BT,
+            seq_lens,
+            cu_seqlens=cu,
+            chunk_size=BT,
         )
         _hip_meta_cache[id(cu)] = _CaptureSafeMeta(
-            meta, cu,
+            meta,
+            cu,
             chunk_size=BT,
             total_prefill_tokens=int(T_flat),
             num_sequences=len(seq_lens),
@@ -555,11 +622,14 @@ def _filter_shapes(shapes_all, gate_filter, shape_index, shape_range):
     if shape_range is not None:
         lo, hi = shape_range
         if not (1 <= lo <= hi <= n):
-            print(f"--shape-range must satisfy 1 <= START <= END <= {n}", file=sys.stderr)
+            print(
+                f"--shape-range must satisfy 1 <= START <= END <= {n}", file=sys.stderr
+            )
             sys.exit(1)
         return [(i, shapes_all[i - 1]) for i in range(lo, hi + 1)]
     return [
-        (i + 1, s) for i, s in enumerate(shapes_all)
+        (i + 1, s)
+        for i, s in enumerate(shapes_all)
         if gate_filter == "all" or s[8] == gate_filter
     ]
 
@@ -583,15 +653,22 @@ def _shape_range_type(s: str) -> tuple[int, int]:
 def _add_shape_args(parser):
     grp = parser.add_mutually_exclusive_group()
     grp.add_argument(
-        "--shape-index", type=int, default=None, metavar="N",
+        "--shape-index",
+        type=int,
+        default=None,
+        metavar="N",
         help="Run one preset shape by 1-based index (see --list).",
     )
     grp.add_argument(
-        "--shape-range", type=_shape_range_type, default=None, metavar="START-END",
+        "--shape-range",
+        type=_shape_range_type,
+        default=None,
+        metavar="START-END",
         help="Run a 1-based inclusive range of shapes, e.g. '5-8' or a single 'N'.",
     )
     grp.add_argument(
-        "--list", action="store_true",
+        "--list",
+        action="store_true",
         help="List all preset shapes with indices and exit.",
     )
 
@@ -641,8 +718,10 @@ def _auto_variant_for_shape(shape, cu) -> str | None:
     _tag, H, Hg, T_flat, N, _K, V, _BT, _gate, _pat = shape
     try:
         from aiter.ops.flydsl.linear_attention_prefill_kernels import _auto_variant
-        return _auto_variant(H=H, Hg=Hg, V=V, T_flat=T_flat, N=N,
-                             is_varlen=cu is not None)
+
+        return _auto_variant(
+            H=H, Hg=Hg, V=V, T_flat=T_flat, N=N, is_varlen=cu is not None
+        )
     except Exception:
         return None
 
@@ -662,6 +741,7 @@ def _load_k5_impls(which: str, flydsl_variants: list[str] | None = None) -> dict
             from aiter.ops.triton._triton_kernels.gated_delta_rule.prefill.chunk_delta_h import (
                 chunk_gated_delta_rule_fwd_h_opt_vk,
             )
+
             impls["triton"] = chunk_gated_delta_rule_fwd_h_opt_vk
         except ImportError as e:
             warnings.warn(f"Triton K5 not available: {e}")
@@ -671,13 +751,16 @@ def _load_k5_impls(which: str, flydsl_variants: list[str] | None = None) -> dict
             from aiter.ops.flydsl.linear_attention_prefill_kernels import (
                 chunk_gated_delta_rule_fwd_h_flydsl,
             )
+
             available, _default = _available_k5_variants()
             tags = list(flydsl_variants)
             if tags == ["all"]:
                 tags = list(available or ())
             for tag in tags:
                 if tag == AUTO_VARIANT:
-                    impls[FLYDSL_PREFIX + AUTO_VARIANT] = chunk_gated_delta_rule_fwd_h_flydsl
+                    impls[FLYDSL_PREFIX + AUTO_VARIANT] = (
+                        chunk_gated_delta_rule_fwd_h_flydsl
+                    )
                     continue
                 if available is not None and tag not in available:
                     raise SystemExit(
@@ -695,6 +778,7 @@ def _load_k5_impls(which: str, flydsl_variants: list[str] | None = None) -> dict
             from aiter.ops.chunk_gated_delta_rule_fwd_h import (
                 chunk_gated_delta_rule_fwd_h_hip_fn,
             )
+
             impls["hip"] = _adapt_hip(chunk_gated_delta_rule_fwd_h_hip_fn)
         except ImportError as e:
             warnings.warn(f"HIP K5 not available: {e}")
@@ -704,9 +788,19 @@ def _load_k5_impls(which: str, flydsl_variants: list[str] | None = None) -> dict
 
 def _make_k5_closure(fn, k, w_hm, u_hm, g, gk, h0, cu):
     def _run():
-        fn(k=k, w=w_hm, u=u_hm, g=g, gk=gk,
-           initial_state=h0, output_final_state=True, save_new_value=True,
-           cu_seqlens=cu, use_exp2=_USE_EXP2)
+        fn(
+            k=k,
+            w=w_hm,
+            u=u_hm,
+            g=g,
+            gk=gk,
+            initial_state=h0,
+            output_final_state=True,
+            save_new_value=True,
+            cu_seqlens=cu,
+            use_exp2=_USE_EXP2,
+        )
+
     return _run
 
 
@@ -718,13 +812,10 @@ def _load_k5_ref():
     if _k5_ref_fn is not None:
         return _k5_ref_fn
     try:
-        mod = importlib.import_module(
-            "op_tests.test_flydsl_linear_attention_prefill"
-        )
+        mod = importlib.import_module("op_tests.test_flydsl_linear_attention_prefill")
     except Exception:
         test_path = (
-            Path(_REPO_ROOT)
-            / "op_tests/test_flydsl_linear_attention_prefill.py"
+            Path(_REPO_ROOT) / "op_tests/test_flydsl_linear_attention_prefill.py"
         )
         spec = importlib.util.spec_from_file_location("_test_prefill", test_path)
         mod = importlib.util.module_from_spec(spec)
@@ -746,38 +837,62 @@ def _verdict(got, want) -> str:
     max_rel = (err.max() / b.abs().max().clamp_min(1e-6)).item()
     ok = ratio < _RMSE_TOL and max_rel < _MAXREL_TOL
     return (
-        f"{'PASS' if ok else 'FAIL'}"
-        f"(rmse_ratio={ratio:.2e},max_rel={max_rel:.2e})"
+        f"{'PASS' if ok else 'FAIL'}" f"(rmse_ratio={ratio:.2e},max_rel={max_rel:.2e})"
     )
 
 
-def _verify_k5_impl(fn, k, w_hm, u_hm, w_tm, g, gk, h0, cu, verification,
-                    baseline_fn=None) -> str:
+def _verify_k5_impl(
+    fn, k, w_hm, u_hm, w_tm, g, gk, h0, cu, verification, baseline_fn=None
+) -> str:
     if verification == "none":
         return "N/A"
     try:
-        h, v_new, fs = fn(k=k, w=w_hm, u=u_hm, g=g, gk=gk,
-                          initial_state=h0, output_final_state=True,
-                          save_new_value=True, cu_seqlens=cu, use_exp2=_USE_EXP2)
+        h, v_new, fs = fn(
+            k=k,
+            w=w_hm,
+            u=u_hm,
+            g=g,
+            gk=gk,
+            initial_state=h0,
+            output_final_state=True,
+            save_new_value=True,
+            cu_seqlens=cu,
+            use_exp2=_USE_EXP2,
+        )
     except Exception as e:
         return f"ERROR({type(e).__name__})"
 
     if verification == "reference":
         try:
             ref = _load_k5_ref()
-            h_ref, _, _ = ref(k=k, w=w_tm, u=u_hm.permute(0, 2, 1, 3),
-                               g=g, gk=gk, initial_state=h0,
-                               output_final_state=True, cu_seqlens=cu)
+            h_ref, _, _ = ref(
+                k=k,
+                w=w_tm,
+                u=u_hm.permute(0, 2, 1, 3),
+                g=g,
+                gk=gk,
+                initial_state=h0,
+                output_final_state=True,
+                cu_seqlens=cu,
+            )
         except Exception as e:
             return f"REF-ERROR({e})"
         return _verdict(h, h_ref)
 
     if verification == "baseline" and baseline_fn is not None:
         try:
-            h_base, _, _ = baseline_fn(k=k, w=w_hm, u=u_hm, g=g, gk=gk,
-                                        initial_state=h0, output_final_state=True,
-                                        save_new_value=False, cu_seqlens=cu,
-                                        use_exp2=_USE_EXP2)
+            h_base, _, _ = baseline_fn(
+                k=k,
+                w=w_hm,
+                u=u_hm,
+                g=g,
+                gk=gk,
+                initial_state=h0,
+                output_final_state=True,
+                save_new_value=False,
+                cu_seqlens=cu,
+                use_exp2=_USE_EXP2,
+            )
         except Exception as e:
             return f"BASELINE-ERROR({e})"
         return _verdict(h, h_base)
@@ -812,7 +927,9 @@ def _run_one_k5(idx, impls, shape, args, cfg: MeasureConfig) -> dict:
         if resolved:
             auto_label = FLYDSL_PREFIX + resolved
             if auto_label in impls:
-                print(f"  [skip] {auto_key} resolves to {auto_label}, already requested")
+                print(
+                    f"  [skip] {auto_key} resolves to {auto_label}, already requested"
+                )
                 impls = {k2: v for k2, v in impls.items() if k2 != auto_key}
 
     for impl_name, fn in impls.items():
@@ -852,13 +969,23 @@ def _run_one_k5(idx, impls, shape, args, cfg: MeasureConfig) -> dict:
         verify_str = "N/A"
         if args.verification != "none":
             verify_str = _verify_k5_impl(
-                fn, k, w_hm, u_hm, w_tm, g, gk, h0, cu,
+                fn,
+                k,
+                w_hm,
+                u_hm,
+                w_tm,
+                g,
+                gk,
+                h0,
+                cu,
                 verification=args.verification,
                 baseline_fn=baseline_fn if impl_name != baseline_name else None,
             )
 
         results_by_impl[impl_name] = {
-            "timing": timing, "tflops": tflops_d, "verify": verify_str,
+            "timing": timing,
+            "tflops": tflops_d,
+            "verify": verify_str,
         }
 
         if impl_name == baseline_name:
@@ -872,8 +999,11 @@ def _run_one_k5(idx, impls, shape, args, cfg: MeasureConfig) -> dict:
             tf = tflops_d.get(mode)
             if hasattr(t, "median_us"):
                 base = baseline_times.get(mode)
-                sp = (f"  ×{base / t.median_us:.2f}"
-                      if (base and impl_name != baseline_name and t.median_us > 0) else "")
+                sp = (
+                    f"  ×{base / t.median_us:.2f}"
+                    if (base and impl_name != baseline_name and t.median_us > 0)
+                    else ""
+                )
                 tf_s = f"{tf:.3f}" if tf is not None else "—"
                 print(f"[{mode}] {t.median_us:.1f} us  {tf_s} TFLOPs{sp}", end="  ")
             else:
@@ -881,9 +1011,17 @@ def _run_one_k5(idx, impls, shape, args, cfg: MeasureConfig) -> dict:
         print(f"  verify={verify_str}")
 
     return {
-        "label": label, "shape": shape, "impls": results_by_impl,
-        "baseline_times": baseline_times, "baseline_name": baseline_name,
-        "modes": modes, "N": N, "H": H, "T_flat": T_flat, "K": K, "V": V,
+        "label": label,
+        "shape": shape,
+        "impls": results_by_impl,
+        "baseline_times": baseline_times,
+        "baseline_name": baseline_name,
+        "modes": modes,
+        "N": N,
+        "H": H,
+        "T_flat": T_flat,
+        "K": K,
+        "V": V,
     }
 
 
@@ -911,7 +1049,10 @@ def run_k5(args):
     if args.output:
         env = collect_env_info()
         write_bench_markdown(
-            args.output, _K5_BENCH_TITLE, all_rows, env,
+            args.output,
+            _K5_BENCH_TITLE,
+            all_rows,
+            env,
             baseline_name=args.baseline,
         )
         print(f"\nMarkdown report written to {args.output}")
@@ -921,12 +1062,23 @@ def run_k5(args):
             out_dir = Path(args.output).parent
             png_path = str(out_dir / f"{stem}-plot.png")
             modes_plot = ["eager", "graph"] if args.mode == "all" else [args.mode]
-            make_bar_chart(results, png_path, title=_K5_BENCH_TITLE,
-                           mode=modes_plot[0], baseline_label=category_label(args.baseline))
+            make_bar_chart(
+                results,
+                png_path,
+                title=_K5_BENCH_TITLE,
+                mode=modes_plot[0],
+                baseline_label=category_label(args.baseline),
+            )
             summary_md = str(out_dir / f"{stem}-summary.md")
-            make_summary_md(results, summary_md, png_path, args.output,
-                            title=_K5_BENCH_TITLE, mode=modes_plot[0],
-                            baseline_label=category_label(args.baseline))
+            make_summary_md(
+                results,
+                summary_md,
+                png_path,
+                args.output,
+                title=_K5_BENCH_TITLE,
+                mode=modes_plot[0],
+                baseline_label=category_label(args.baseline),
+            )
         except Exception as e:
             warnings.warn(f"Plot/summary generation failed: {e}")
 
@@ -956,10 +1108,10 @@ def _calculate_tflops_k5k6(N, H, T_flat, K, V, time_us, BT=64, seq_lens=None):
     lens = list(seq_lens) if seq_lens else [T_flat]
     n_chunks = sum(-(-length // BT) for length in lens)
     per_chunk = (
-        4 * K * V        # K5: GEMM1 (w@h) + GEMM2 (k^T@v_new)
-        + 2 * K * V      # K6 GEMM3: q@h
-        + 2 * BT * K     # K6 GEMM4a: q@k^T
-        + 2 * BT * V     # K6 GEMM4b: A@v_new
+        4 * K * V  # K5: GEMM1 (w@h) + GEMM2 (k^T@v_new)
+        + 2 * K * V  # K6 GEMM3: q@h
+        + 2 * BT * K  # K6 GEMM4a: q@k^T
+        + 2 * BT * V  # K6 GEMM4b: A@v_new
     )
     return H * n_chunks * BT * per_chunk / (time_us * 1e-6) / 1e12
 
@@ -969,7 +1121,10 @@ def _fused_auto_variant_for_shape(shape, cu) -> str | None:
     _tag, H, _Hg, _T_flat, N, _K, V, _BT, _gate, _pat = shape
     del cu
     try:
-        from aiter.ops.flydsl.linear_attention_prefill_kernels import _fused_bv_for_shape
+        from aiter.ops.flydsl.linear_attention_prefill_kernels import (
+            _fused_bv_for_shape,
+        )
+
         bv, num_waves = _fused_bv_for_shape(H=H, V=V, N=N, variant=None)
         return f"bv{bv}w{num_waves}" if num_waves > 4 else f"bv{bv}"
     except Exception:
@@ -981,18 +1136,20 @@ def _combined_dispatch_label_for_shape(shape, cu) -> str | None:
     _tag, H, Hg, T_flat, N, _K, V, _BT, _gate, _pat = shape
     try:
         from aiter.ops.flydsl.linear_attention_prefill_kernels import (
-            should_use_fused_gfx942,
-            _fused_bv_for_shape,
             _auto_variant,
+            _fused_bv_for_shape,
+            should_use_fused_gfx942,
         )
+
         n = (cu.shape[0] - 1) if cu is not None else 1
         if should_use_fused_gfx942(H=H, N=n, V=V):
             bv, num_waves = _fused_bv_for_shape(H=H, V=V, N=n, variant=None)
             tag = f"bv{bv}w{num_waves}" if num_waves > 4 else f"bv{bv}"
             return f"fused:{tag}"
         else:
-            tag = _auto_variant(H=H, Hg=Hg, V=V, T_flat=T_flat, N=n,
-                                is_varlen=cu is not None)
+            tag = _auto_variant(
+                H=H, Hg=Hg, V=V, T_flat=T_flat, N=n, is_varlen=cu is not None
+            )
             return f"separate:{tag}"
     except Exception:
         return None
@@ -1005,46 +1162,86 @@ def _make_q(shape, device="cuda"):
 
 def _separate_runner(k5_fn, k6_fn):
     """Closure running a separate K5 then Triton K6, returning o."""
+
     def _run(*, q, k, w, u, g, gk, h0, cu, scale, o):
         meta = _hip_meta_cache.get(id(cu)) if cu is not None else None
         h, v_new, _ = k5_fn(
-            k=k, w=w, u=u, g=g, gk=gk, initial_state=h0,
-            output_final_state=True, save_new_value=True,
-            cu_seqlens=cu, use_exp2=_USE_EXP2,
+            k=k,
+            w=w,
+            u=u,
+            g=g,
+            gk=gk,
+            initial_state=h0,
+            output_final_state=True,
+            save_new_value=True,
+            cu_seqlens=cu,
+            use_exp2=_USE_EXP2,
         )
         k6_fn(
-            q=q, k=k, v=v_new, o=o, h=h, g=g, scale=scale,
-            cu_seqlens=cu, use_exp2=_USE_EXP2, prefill_metadata=meta,
+            q=q,
+            k=k,
+            v=v_new,
+            o=o,
+            h=h,
+            g=g,
+            scale=scale,
+            cu_seqlens=cu,
+            use_exp2=_USE_EXP2,
+            prefill_metadata=meta,
         )
         return o
+
     return _run
 
 
 def _make_fused_runner(fused_fn, variant):
     """Closure running the fused K5+K6 kernel with a fixed variant (or None for auto)."""
+
     def _run(*, q, k, w, u, g, gk, h0, cu, scale, o):
         meta = _hip_meta_cache.get(id(cu)) if cu is not None else None
         fused_fn(
-            q=q, k=k, w=w, u=u, g=g, gk=gk, scale=scale,
-            initial_state=h0, output_final_state=True,
-            cu_seqlens=cu, use_exp2=_USE_EXP2, o=o,
-            prefill_metadata=meta, variant=variant,
+            q=q,
+            k=k,
+            w=w,
+            u=u,
+            g=g,
+            gk=gk,
+            scale=scale,
+            initial_state=h0,
+            output_final_state=True,
+            cu_seqlens=cu,
+            use_exp2=_USE_EXP2,
+            o=o,
+            prefill_metadata=meta,
+            variant=variant,
         )
         return o
+
     return _run
 
 
 def _make_combined_runner(combined_fn):
     """Closure running the auto-dispatch combined wrapper."""
+
     def _run(*, q, k, w, u, g, gk, h0, cu, scale, o):
         meta = _hip_meta_cache.get(id(cu)) if cu is not None else None
         combined_fn(
-            q=q, k=k, w=w, u=u, g=g, gk=gk, scale=scale,
-            initial_state=h0, output_final_state=True,
-            cu_seqlens=cu, use_exp2=_USE_EXP2, o=o,
+            q=q,
+            k=k,
+            w=w,
+            u=u,
+            g=g,
+            gk=gk,
+            scale=scale,
+            initial_state=h0,
+            output_final_state=True,
+            cu_seqlens=cu,
+            use_exp2=_USE_EXP2,
+            o=o,
             prefill_metadata=meta,
         )
         return o
+
     return _run
 
 
@@ -1063,6 +1260,7 @@ def _load_k5k6_impls(which: str, fused_variants: list[str] | None = None) -> dic
         from aiter.ops.triton._triton_kernels.gated_delta_rule.prefill.chunk_o import (
             chunk_fwd_o_opt_vk,
         )
+
         k6_triton = chunk_fwd_o_opt_vk
     except ImportError as e:
         warnings.warn(f"Triton K6 not available: {e}")
@@ -1072,6 +1270,7 @@ def _load_k5k6_impls(which: str, fused_variants: list[str] | None = None) -> dic
             from aiter.ops.triton._triton_kernels.gated_delta_rule.prefill.chunk_delta_h import (
                 chunk_gated_delta_rule_fwd_h_opt_vk,
             )
+
             impls["K5_triton+K6_triton"] = _separate_runner(
                 chunk_gated_delta_rule_fwd_h_opt_vk, k6_triton
             )
@@ -1083,6 +1282,7 @@ def _load_k5k6_impls(which: str, fused_variants: list[str] | None = None) -> dic
             from aiter.ops.chunk_gated_delta_rule_fwd_h import (
                 chunk_gated_delta_rule_fwd_h_hip_fn,
             )
+
             impls["K5_hip+K6_triton"] = _separate_runner(
                 _adapt_hip(chunk_gated_delta_rule_fwd_h_hip_fn), k6_triton
             )
@@ -1094,6 +1294,7 @@ def _load_k5k6_impls(which: str, fused_variants: list[str] | None = None) -> dic
             from aiter.ops.flydsl.linear_attention_prefill_kernels import (
                 chunk_gated_delta_rule_fwd_h_flydsl,
             )
+
             impls["K5_flydsl+K6_triton"] = _separate_runner(
                 chunk_gated_delta_rule_fwd_h_flydsl, k6_triton
             )
@@ -1105,6 +1306,7 @@ def _load_k5k6_impls(which: str, fused_variants: list[str] | None = None) -> dic
             from aiter.ops.flydsl.linear_attention_prefill_kernels import (
                 chunk_gated_delta_rule_fwd_h_o_flydsl,
             )
+
             tags = list(fused_variants)
             if tags == ["all"]:
                 tags = list(FUSED_VARIANTS)
@@ -1130,7 +1332,10 @@ def _load_k5k6_impls(which: str, fused_variants: list[str] | None = None) -> dic
             from aiter.ops.flydsl.linear_attention_prefill_kernels import (
                 chunk_gated_delta_rule_fwd_h_o_auto,
             )
-            impls[COMBINED_KEY] = _make_combined_runner(chunk_gated_delta_rule_fwd_h_o_auto)
+
+            impls[COMBINED_KEY] = _make_combined_runner(
+                chunk_gated_delta_rule_fwd_h_o_auto
+            )
         except ImportError as e:
             warnings.warn(f"FlyDSL combined K5+K6 not available: {e}")
 
@@ -1140,6 +1345,7 @@ def _load_k5k6_impls(which: str, fused_variants: list[str] | None = None) -> dic
 def _make_k5k6_closure(fn, q, k, w_hm, u_hm, g, gk, h0, cu, scale, o):
     def _run():
         fn(q=q, k=k, w=w_hm, u=u_hm, g=g, gk=gk, h0=h0, cu=cu, scale=scale, o=o)
+
     return _run
 
 
@@ -1154,7 +1360,7 @@ def _run_one_k5k6(idx, impls, shape, args, cfg) -> dict:
     except Exception as e:
         return {"label": label, "error": str(e)}
 
-    scale = K ** -0.5
+    scale = K**-0.5
     o = u_hm.new_empty(1, T_flat, H, V)
 
     if cu is not None:
@@ -1228,7 +1434,9 @@ def _run_one_k5k6(idx, impls, shape, args, cfg) -> dict:
                 tflops_d[mode] = None
 
         results_by_impl[display_name] = {
-            "timing": timing, "tflops": tflops_d, "verify": verify_str,
+            "timing": timing,
+            "tflops": tflops_d,
+            "verify": verify_str,
         }
         if impl_name == baseline_name:
             for mode in modes:
@@ -1241,8 +1449,11 @@ def _run_one_k5k6(idx, impls, shape, args, cfg) -> dict:
             tf = tflops_d.get(mode)
             if hasattr(t, "median_us"):
                 base = baseline_times.get(mode)
-                sp = (f"  ×{base / t.median_us:.2f}"
-                      if (base and impl_name != baseline_name and t.median_us > 0) else "")
+                sp = (
+                    f"  ×{base / t.median_us:.2f}"
+                    if (base and impl_name != baseline_name and t.median_us > 0)
+                    else ""
+                )
                 tf_s = f"{tf:.3f}" if tf is not None else "—"
                 print(f"[{mode}] {t.median_us:.1f} us  {tf_s} TFLOPs{sp}", end="  ")
             else:
@@ -1250,9 +1461,17 @@ def _run_one_k5k6(idx, impls, shape, args, cfg) -> dict:
         print(f"  verify={verify_str}")
 
     return {
-        "label": label, "shape": shape, "impls": results_by_impl,
-        "baseline_times": baseline_times, "baseline_name": baseline_name,
-        "modes": modes, "N": N, "H": H, "T_flat": T_flat, "K": K, "V": V,
+        "label": label,
+        "shape": shape,
+        "impls": results_by_impl,
+        "baseline_times": baseline_times,
+        "baseline_name": baseline_name,
+        "modes": modes,
+        "N": N,
+        "H": H,
+        "T_flat": T_flat,
+        "K": K,
+        "V": V,
     }
 
 
@@ -1280,7 +1499,10 @@ def run_k5k6(args):
     if args.output:
         env = collect_env_info()
         write_bench_markdown(
-            args.output, _K5K6_BENCH_TITLE, all_rows, env,
+            args.output,
+            _K5K6_BENCH_TITLE,
+            all_rows,
+            env,
             baseline_name=args.baseline,
         )
         print(f"\nMarkdown report written to {args.output}")
@@ -1290,7 +1512,8 @@ def run_k5k6(args):
             results = parse_bench_md(args.output)
             png = str(Path(args.output).with_suffix("")) + "-fill-scatter.png"
             make_fill_scatter(
-                results, png,
+                results,
+                png,
                 title=f"{_K5K6_BENCH_TITLE}: speedup vs grid fill ({plot_mode})",
                 mode=plot_mode,
             )
@@ -1309,15 +1532,22 @@ def _build_k5_parser(sub):
     )
     _add_shape_args(p)
     p.add_argument(
-        "--impl", default="all", metavar="IMPLS",
+        "--impl",
+        default="all",
+        metavar="IMPLS",
         help="Comma-separated: triton, flydsl, hip. Default: all.",
     )
     p.add_argument(
-        "--baseline", default="triton", choices=("triton", "hip"),
+        "--baseline",
+        default="triton",
+        choices=("triton", "hip"),
         help="Speedup baseline (default: triton).",
     )
     p.add_argument(
-        "--flydsl-variants", type=str, default=AUTO_VARIANT, metavar="V1,V2,...",
+        "--flydsl-variants",
+        type=str,
+        default=AUTO_VARIANT,
+        metavar="V1,V2,...",
         help=(
             "Comma-separated FlyDSL K5 variant tags: bv16, bv32, bv64, bv64w8, … "
             "'all' runs every registered variant; 'auto' (default) uses the "
@@ -1325,11 +1555,14 @@ def _build_k5_parser(sub):
         ),
     )
     p.add_argument(
-        "--list-variants", action="store_true",
+        "--list-variants",
+        action="store_true",
         help="List the registered FlyDSL K5 variants and exit.",
     )
     p.add_argument(
-        "--gate", default="all", choices=("g", "gk", "all"),
+        "--gate",
+        default="all",
+        choices=("g", "gk", "all"),
         help="Filter shapes by gate type: g (GDN), gk (KDA), all (default).",
     )
     add_timing_args(p)
@@ -1346,7 +1579,9 @@ def _build_k5k6_parser(sub):
     )
     _add_shape_args(p)
     p.add_argument(
-        "--impl", default="all", metavar="IMPLS",
+        "--impl",
+        default="all",
+        metavar="IMPLS",
         help=(
             f"Comma-separated impls: {', '.join(_K5K6_IMPL_KEYS)}. "
             "Default: all. "
@@ -1354,12 +1589,16 @@ def _build_k5k6_parser(sub):
         ),
     )
     p.add_argument(
-        "--baseline", default="K5_flydsl+K6_triton",
+        "--baseline",
+        default="K5_flydsl+K6_triton",
         choices=_K5K6_IMPL_KEYS,
         help="Speedup baseline (default: K5_flydsl+K6_triton).",
     )
     p.add_argument(
-        "--fused-variants", type=str, default=AUTO_VARIANT, metavar="V1,V2,...",
+        "--fused-variants",
+        type=str,
+        default=AUTO_VARIANT,
+        metavar="V1,V2,...",
         help=(
             "Comma-separated fused-kernel BV variant tags (bv16, bv32, bv64, bv64w8, …). "
             "'all' runs every variant; 'auto' (default) uses shape-adaptive selection. "
@@ -1368,11 +1607,14 @@ def _build_k5k6_parser(sub):
         ),
     )
     p.add_argument(
-        "--list-fused-variants", action="store_true",
+        "--list-fused-variants",
+        action="store_true",
         help="List the fused-kernel BV variants and exit.",
     )
     p.add_argument(
-        "--gate", default="all", choices=("g", "gk", "all"),
+        "--gate",
+        default="all",
+        choices=("g", "gk", "all"),
         help="Filter shapes by gate type.",
     )
     add_timing_args(p)
@@ -1386,9 +1628,12 @@ def main():
         description="Unified GDN K5 / K5+K6 benchmark.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    sub = top.add_subparsers(dest="bench_mode", required=True,
-                             title="subcommands",
-                             description="Choose which benchmark to run.")
+    sub = top.add_subparsers(
+        dest="bench_mode",
+        required=True,
+        title="subcommands",
+        description="Choose which benchmark to run.",
+    )
     _build_k5_parser(sub)
     _build_k5k6_parser(sub)
 

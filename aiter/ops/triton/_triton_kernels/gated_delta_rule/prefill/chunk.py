@@ -264,7 +264,7 @@ def chunk_gated_delta_rule_fwd_opt_vk(
             decide (gfx942 and BV=64 grid fill ``ceil(V/64)*N*H / CU >= 0.5``);
             ``ALWAYS`` forces the fused kernel; ``NEVER`` forces the separate
             path. When the fused kernel runs it skips the separate K6 call and
-            returns early. ``fusion`` is dependent on the ``use_chunk_flydsl`` 
+            returns early. ``fusion`` is dependent on the ``use_chunk_flydsl``
             flag and requires it to be set to True.
         state_dtype: optional initial/final state dtype (`fp32` or `bf16`),
             supported by both the HIP and Triton hidden-state paths
@@ -310,7 +310,9 @@ def chunk_gated_delta_rule_fwd_opt_vk(
                 if cu_seqlens is not None
                 else v.shape[0]
             )
-            use_chunk_flydsl_fused = should_use_fused_gfx942(H=v.shape[2], N=_N, V=v.shape[-1])
+            use_chunk_flydsl_fused = should_use_fused_gfx942(
+                H=v.shape[2], N=_N, V=v.shape[-1]
+            )
         else:
             use_chunk_flydsl_fused = False
     else:

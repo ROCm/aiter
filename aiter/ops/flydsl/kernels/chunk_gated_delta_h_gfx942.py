@@ -24,10 +24,10 @@ import math
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import as_ir_value, const_expr, gpu, range_constexpr, rocdl
-from flydsl.expr.typing import T
 from flydsl._mlir.dialects import arith as _arith
 from flydsl._mlir.dialects import vector as _vector
+from flydsl.expr import as_ir_value, const_expr, gpu, range_constexpr, rocdl
+from flydsl.expr.typing import T
 
 from .k5_variants import _bv_of_variant, _legal_bv_candidates, _variant_tag
 
@@ -39,7 +39,7 @@ _LOG2E = math.log2(math.e)  # 1.4426950408889634
 # K5+K6 kernel.
 #
 # The measured-best BV/wave tile is a function of the grid-size product ``H*N``:
-# larger tiles win as there is more parallel work to fill the device. 
+# larger tiles win as there is more parallel work to fill the device.
 #
 #     H*N        K5 winner     fused K5+K6 winner
 #     4..32      bv16          bv16
@@ -65,7 +65,6 @@ def _hn_variant(*, H: int, N: int, V: int) -> str | None:
     if _bv_of_variant(tag) not in _legal_bv_candidates(V):
         return None
     return tag
-
 
 
 def select_variant(*, H: int, N: int, V: int) -> str | None:
@@ -99,6 +98,7 @@ def _make_fast_exp(g_is_log2_scaled: bool):
             return rocdl.exp2(T.f32, as_ir_value(x * _LOG2E))
 
     return _fast_exp
+
 
 def _to_bf16_fast(val, n=1):
     """f32 -> bf16 as ``(bitcast<u32>(x) + 0x8000) >> 16`` (round-half-away).
@@ -234,10 +234,10 @@ def compile_chunk_gated_delta_h_gfx942(
     N_REPEAT_LOCAL = N_REPEAT // NR_SPLIT
 
     # Splitting V so finely that a wave owns a single 16-wide tile is broken.
-    # One of the legal configurations, BV=32 across 8 waves, 
-    # nondeterministically drains stale LDS into the h snapshot. 
-    # It is the lds_h -> HBM drain, where this shape degenerates: 
-    # H_DRAIN_ROWS lands on BV and the drain collapses to a single rest pass. 
+    # One of the legal configurations, BV=32 across 8 waves,
+    # nondeterministically drains stale LDS into the h snapshot.
+    # It is the lds_h -> HBM drain, where this shape degenerates:
+    # H_DRAIN_ROWS lands on BV and the drain collapses to a single rest pass.
     # Hence, we assert here that we don't build such variants.
     assert not (NR_SPLIT > 1 and N_REPEAT_LOCAL == 1), (
         f"BV={BV} across {M_WAVES * NR_SPLIT} waves (NR_SPLIT={NR_SPLIT}) leaves "
@@ -319,8 +319,10 @@ def compile_chunk_gated_delta_h_gfx942(
     # total does overflow. Aliasing needs lds_A (BT*BT) <= lds_h (BV*K), i.e.
     # BV >= 32; BV=16 never overflows, so it keeps the buffers distinct.
     _lds_total_kib = (
-        LDS_W_ELEMS + LDS_KT_ELEMS + LDS_VNT_ELEMS + LDS_H_ELEMS + LDS_A_ELEMS
-    ) * 2 / 1024
+        (LDS_W_ELEMS + LDS_KT_ELEMS + LDS_VNT_ELEMS + LDS_H_ELEMS + LDS_A_ELEMS)
+        * 2
+        / 1024
+    )
     ALIAS_A_ONTO_H = (
         COMPUTE_OUTPUT and _lds_total_kib > 64.0 and LDS_A_ELEMS <= LDS_H_ELEMS
     )
@@ -424,18 +426,17 @@ def compile_chunk_gated_delta_h_gfx942(
         f"k transpose slots ({K_XPOSE_SLOTS}) must tile "
         f"BLOCK_THREADS={BLOCK_THREADS}"
     )
-    assert 4 * K_ROW_QUAD_STRIDE <= BT and BT % (4 * K_ROW_QUAD_STRIDE) == 0, (
-        f"k transpose store tile ({4 * K_ROW_QUAD_STRIDE} rows) must tile BT={BT}"
-    )
+    assert (
+        4 * K_ROW_QUAD_STRIDE <= BT and BT % (4 * K_ROW_QUAD_STRIDE) == 0
+    ), f"k transpose store tile ({4 * K_ROW_QUAD_STRIDE} rows) must tile BT={BT}"
 
     _kernel_deco_kwargs = (
         {} if BLOCK_THREADS == 256 else {"known_block_size": [BLOCK_THREADS, 1, 1]}
     )
 
     _kernel_name = (
-        ("chunk_gdn_fwd_h_o_flydsl_vk" if COMPUTE_OUTPUT else "chunk_gdn_fwd_h_flydsl_vk")
-        + f"_{_variant_tag(BV, NUM_WARPS)}"
-    )
+        "chunk_gdn_fwd_h_o_flydsl_vk" if COMPUTE_OUTPUT else "chunk_gdn_fwd_h_flydsl_vk"
+    ) + f"_{_variant_tag(BV, NUM_WARPS)}"
 
     @flyc.kernel(name=_kernel_name, **_kernel_deco_kwargs)
     def gdn_h_kernel(
@@ -507,20 +508,15 @@ def compile_chunk_gated_delta_h_gfx942(
             return (fx.Int32(nr_local * NR_SPLIT) + wid_n) * fx.Int32(16)
 
         def _flat_buffer(tensor):
-            """1-D bounds-checked view over ``tensor``'s whole footprint.
-            """
+            """1-D bounds-checked view over ``tensor``'s whole footprint."""
             buf = fx.rocdl.make_buffer_tensor(tensor, max_size=False)
             n = fx.get_scalar(fx.cosize(fx.get_layout(buf)))
-            return fx.Tensor(
-                fx.make_view(fx.get_iter(buf), fx.make_layout((n,), (1,)))
-            )
+            return fx.Tensor(fx.make_view(fx.get_iter(buf), fx.make_layout((n,), (1,))))
 
         if const_expr(USE_G):
             g_buf = fx.Tensor(
                 fx.make_view(
-                    fx.get_iter(
-                        fx.rocdl.make_buffer_tensor(g_tensor, max_size=False)
-                    ),
+                    fx.get_iter(fx.rocdl.make_buffer_tensor(g_tensor, max_size=False)),
                     fx.make_layout((fx.Int32(H) * T_flat,), (1,)),
                 )
             )
@@ -531,9 +527,7 @@ def compile_chunk_gated_delta_h_gfx942(
             # multiple of 4 -- so quad // 4 is exact.
             gk_buf = fx.Tensor(
                 fx.make_view(
-                    fx.get_iter(
-                        fx.rocdl.make_buffer_tensor(gk_tensor, max_size=False)
-                    ),
+                    fx.get_iter(fx.rocdl.make_buffer_tensor(gk_tensor, max_size=False)),
                     fx.make_layout((T_flat * fx.Int32(H * K // 4), 4), (4, 1)),
                 )
             )
@@ -571,13 +565,9 @@ def compile_chunk_gated_delta_h_gfx942(
         tc_c_x4 = fx.make_tiled_copy_C(cp_lds_x4, mma_16x16x16_mnk).get_slice(tid)
         if const_expr(USE_INITIAL_STATE or STORE_FINAL_STATE):
             if const_expr(STATE_DTYPE_BF16):
-                cp_state = fx.make_copy_atom(
-                    fx.rocdl.BufferCopy64b(), fx.BFloat16
-                )
+                cp_state = fx.make_copy_atom(fx.rocdl.BufferCopy64b(), fx.BFloat16)
             else:
-                cp_state = fx.make_copy_atom(
-                    fx.rocdl.BufferCopy128b(), fx.Float32
-                )
+                cp_state = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Float32)
             tc_c_state = fx.make_tiled_copy_C(cp_state, mma_16x16x16_mnk).get_slice(tid)
         if const_expr(COMPUTE_OUTPUT):
             tc_c_x1 = fx.make_tiled_copy_C(cp_lds_x1, mma_16x16x16_mnk).get_slice(tid)
@@ -590,8 +580,7 @@ def compile_chunk_gated_delta_h_gfx942(
         tc_c_u = fx.make_tiled_copy_C(cp_u_g2r, mma_16x16x16_mnk).get_slice(tid)
 
         def _cfrag_to_lds(atom, tc, dst_view, acc_vec, n):
-            """Convert an f32 accumulator to bf16 and copy it into ``dst_view``.
-            """
+            """Convert an f32 accumulator to bf16 and copy it into ``dst_view``."""
             pD = tc.partition_D(dst_view)
             frag = fx.make_fragment_like(pD)
             frag.store(_to_bf16_fast(acc_vec, n))
@@ -615,9 +604,7 @@ def compile_chunk_gated_delta_h_gfx942(
         # Every LDS buffer is a group-major [R][C/4][4] tile whose group index is
         # XOR-swizzled by the row, so an MFMA fragment's 16 lanes cover all 32 banks.
         def _single_xor_swz(cols, ng):
-            return fx.SwizzleType.get(
-                int(math.log2(ng)), 2, int(math.log2(cols)) - 2
-            )
+            return fx.SwizzleType.get(int(math.log2(ng)), 2, int(math.log2(cols)) - 2)
 
         # -- Hand-addressed group-major + XOR (K5 k^T / v_new^T only) --
         # The composed-layout swizzle above expresses only a single XOR fold
@@ -731,17 +718,13 @@ def compile_chunk_gated_delta_h_gfx942(
         # from the LO tile coordinate.
         w_inner_layout = fx.make_ordered_layout((BT, K), (1, 0))
         w_swz = fx.static(_single_xor_swz(K, LDS_W_NG))
-        sW_lo = fx.make_view(
-            lds_w_ptr, fx.make_composed_layout(w_swz, w_inner_layout)
-        )
+        sW_lo = fx.make_view(lds_w_ptr, fx.make_composed_layout(w_swz, w_inner_layout))
         sW_hi = fx.make_view(
             lds_w_ptr, fx.make_composed_layout(w_swz, LDS_HALF, w_inner_layout)
         )
 
         # General tiled copy definitions.
-        copy_tile = fx.make_tile(
-            ROWS_PER_BATCH_64, LOAD_VEC_WIDTH * THREADS_PER_ROW_64
-        )
+        copy_tile = fx.make_tile(ROWS_PER_BATCH_64, LOAD_VEC_WIDTH * THREADS_PER_ROW_64)
         _tv_thr = (THREADS_PER_ROW_64, ROWS_PER_BATCH_64)
         _tv_thr_stride = (ROWS_PER_BATCH_64 * LOAD_VEC_WIDTH, 1)
         tv_load = fx.make_layout(
@@ -754,12 +737,20 @@ def compile_chunk_gated_delta_h_gfx942(
         )
         buf_cp_g2r_128b_bf16 = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.BFloat16)
         univ_cp_r2s_64b_bf16 = fx.make_copy_atom(fx.UniversalCopy64b(), fx.BFloat16)
-        tiled_cp_g2r = fx.make_tiled_copy(buf_cp_g2r_128b_bf16, tv_load, copy_tile).get_slice(tid)
-        tiled_cp_r2s = fx.make_tiled_copy(univ_cp_r2s_64b_bf16, tv_store, copy_tile).get_slice(tid)
+        tiled_cp_g2r = fx.make_tiled_copy(
+            buf_cp_g2r_128b_bf16, tv_load, copy_tile
+        ).get_slice(tid)
+        tiled_cp_r2s = fx.make_tiled_copy(
+            univ_cp_r2s_64b_bf16, tv_store, copy_tile
+        ).get_slice(tid)
 
         # WU decomposition layout definitions.
-        w_buf_tensor = fx.get_iter(fx.rocdl.make_buffer_tensor(w_tensor, max_size=False))
-        u_buf_tensor = fx.get_iter(fx.rocdl.make_buffer_tensor(u_tensor, max_size=False))
+        w_buf_tensor = fx.get_iter(
+            fx.rocdl.make_buffer_tensor(w_tensor, max_size=False)
+        )
+        u_buf_tensor = fx.get_iter(
+            fx.rocdl.make_buffer_tensor(u_tensor, max_size=False)
+        )
         gW = fx.Tensor(
             fx.make_view(w_buf_tensor, fx.make_layout((BT, K), (STRIDE_W_C, 1)))
         )
@@ -774,9 +765,7 @@ def compile_chunk_gated_delta_h_gfx942(
         pD_w_hi = tiled_cp_r2s.partition_D(sW_hi)
 
         if const_expr(COMPUTE_OUTPUT):
-            q_git = fx.get_iter(
-                fx.rocdl.make_buffer_tensor(q_tensor, max_size=False)
-            )
+            q_git = fx.get_iter(fx.rocdl.make_buffer_tensor(q_tensor, max_size=False))
             gQ = fx.Tensor(
                 fx.make_view(q_git, fx.make_layout((BT, K), (STRIDE_Q_C, 1)))
             )
@@ -784,9 +773,7 @@ def compile_chunk_gated_delta_h_gfx942(
 
         # -- Tiled k staging --
         swz_kt = fx.static(_single_xor_swz(LDS_KT_COLS, LDS_KT_NG))
-        k_git = fx.get_iter(
-            fx.rocdl.make_buffer_tensor(k_tensor, max_size=False)
-        )
+        k_git = fx.get_iter(fx.rocdl.make_buffer_tensor(k_tensor, max_size=False))
         if const_expr(KT_TRANSPOSED):
             # HBM [BT, K] -> lds_kt [K, BT]. This is a genuine transpose and its
             # LDS write is hand-addressed (see _grp_idx above): the composed
@@ -846,20 +833,20 @@ def compile_chunk_gated_delta_h_gfx942(
             )
             _h_tile = fx.make_tile(H_DRAIN_ROWS, K)
             _h_inner = fx.make_ordered_layout((BV, K), (1, 0))
-            sH_lo = fx.make_view(
-                lds_h_ptr, fx.make_composed_layout(swz_h, _h_inner)
-            )
+            sH_lo = fx.make_view(lds_h_ptr, fx.make_composed_layout(swz_h, _h_inner))
             sH_hi = fx.make_view(
                 lds_h_ptr, fx.make_composed_layout(swz_h, LDS_HALF, _h_inner)
             )
-            tc_h_s2r = fx.make_tiled_copy(cp_lds_x4, _h_tv(LDS_HALF), _h_tile).get_slice(tid)
+            tc_h_s2r = fx.make_tiled_copy(
+                cp_lds_x4, _h_tv(LDS_HALF), _h_tile
+            ).get_slice(tid)
             cp_h_r2g = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.BFloat16)
-            tc_h_r2g = fx.make_tiled_copy(cp_h_r2g, _h_tv(LOAD_VEC_WIDTH), _h_tile).get_slice(tid)
+            tc_h_r2g = fx.make_tiled_copy(
+                cp_h_r2g, _h_tv(LOAD_VEC_WIDTH), _h_tile
+            ).get_slice(tid)
             pS_h_lo = tc_h_s2r.partition_S(sH_lo)
             pS_h_hi = tc_h_s2r.partition_S(sH_hi)
-            h_git = fx.get_iter(
-                fx.rocdl.make_buffer_tensor(h_tensor, max_size=False)
-            )
+            h_git = fx.get_iter(fx.rocdl.make_buffer_tensor(h_tensor, max_size=False))
             pD_h_g = tc_h_r2g.partition_D(
                 fx.Tensor(fx.make_view(h_git, fx.make_layout((BV, K), (K, 1))))
             )
@@ -924,7 +911,9 @@ def compile_chunk_gated_delta_h_gfx942(
         # -- Initialize h accumulators  --
         h_accs_c = [
             fx.make_rmem_tensor(
-                fx.tiled_mma_partition_shape(fx.MmaOperand.C, mma_16x16x16_mnk, (64, BV)),
+                fx.tiled_mma_partition_shape(
+                    fx.MmaOperand.C, mma_16x16x16_mnk, (64, BV)
+                ),
                 fx.Float32,
             )
             for _ in range_constexpr(NUM_K_BLOCKS)
@@ -932,16 +921,13 @@ def compile_chunk_gated_delta_h_gfx942(
         for frag in h_accs_c:
             frag.store(fx.Vector.filled(N_REPEAT_LOCAL * 4, 0.0, fx.Float32))
 
-
         # -- Load initial state if provided --
         # h0 is [V, K] with k contiguous, and the C fragment's 4 values run along k.
         # The (n, h) slice and this CTA's V window ride soffset.
         if const_expr(USE_INITIAL_STATE):
             gH0 = fx.Tensor(
                 fx.make_view(
-                    fx.get_iter(
-                        fx.rocdl.make_buffer_tensor(h0_tensor, max_size=False)
-                    ),
+                    fx.get_iter(fx.rocdl.make_buffer_tensor(h0_tensor, max_size=False)),
                     fx.make_layout((K, BV), (1, K)),
                 )
             )
@@ -959,9 +945,7 @@ def compile_chunk_gated_delta_h_gfx942(
                 add_whole = fx.Vector(f_h0.load())
                 if const_expr(STATE_DTYPE_BF16):
                     add_whole = add_whole.to(fx.Float32)
-                cur = fx.Vector(
-                    h_accs_c[kb].load(), (N_REPEAT_LOCAL * 4,), fx.Float32
-                )
+                cur = fx.Vector(h_accs_c[kb].load(), (N_REPEAT_LOCAL * 4,), fx.Float32)
                 h_accs_c[kb].store(cur + add_whole)
 
         # -- Loop-carried prefetch --
@@ -983,13 +967,9 @@ def compile_chunk_gated_delta_h_gfx942(
                 _stage_g2r(cp_u_g2r, pS_u, u_base, stride_v, it_i32),
             ]
             next_end = (it_i32 + fx.Int32(1)) * fx.Int32(BT)
-            last_idx = (next_end < T_local).select(
-                next_end, T_local
-            ) - fx.Int32(1)
+            last_idx = (next_end < T_local).select(next_end, T_local) - fx.Int32(1)
             row_base = (
-                it_i32 * fx.Int32(BT)
-                + wid_m * fx.Int32(16)
-                + lane_m_base * fx.Int32(4)
+                it_i32 * fx.Int32(BT) + wid_m * fx.Int32(16) + lane_m_base * fx.Int32(4)
             )
             if const_expr(USE_G):
                 out.append(g_buf[(i_h * T_flat + (bos + last_idx),)])
@@ -1019,9 +999,7 @@ def compile_chunk_gated_delta_h_gfx942(
             u_frag = next(vals)
             g_last = next(vals) if const_expr(USE_G) else None
             g_row = (
-                [next(vals) for _ in range_constexpr(4)]
-                if const_expr(USE_G)
-                else None
+                [next(vals) for _ in range_constexpr(4)] if const_expr(USE_G) else None
             )
             gk = (
                 [next(vals) for _ in range_constexpr(NUM_K_BLOCKS)]
@@ -1033,7 +1011,9 @@ def compile_chunk_gated_delta_h_gfx942(
         # -- Prologue: pre-load the first chunk --
         init_state = _stage_prefetch(fx.Int32(0))
 
-        for i_t, state in range(fx.Int64(0), fx.Int64(NT), fx.Int64(1), init=init_state):
+        for i_t, state in range(
+            fx.Int64(0), fx.Int64(NT), fx.Int64(1), init=init_state
+        ):
             (
                 w_frag,
                 u_frag,
@@ -1063,9 +1043,7 @@ def compile_chunk_gated_delta_h_gfx942(
                     cp_lds_x4,
                     tc_c_x4,
                     fx.slice(fx.zipped_divide(sH_C, (64, BV)), (None, (kb, 0))),
-                    fx.Vector(
-                        h_accs_c[kb].load(), (N_REPEAT_LOCAL * 4,), fx.Float32
-                    ),
+                    fx.Vector(h_accs_c[kb].load(), (N_REPEAT_LOCAL * 4,), fx.Float32),
                     N_REPEAT_LOCAL * 4,
                 )
 
@@ -1101,7 +1079,12 @@ def compile_chunk_gated_delta_h_gfx942(
                     )
                 )
                 offset = h_base + i_t_i32 * stride_h + i_v * fx.Int32(BV * K)
-                fx.copy(cp_h_r2g, f_g, pD_h_g, soffset=offset,)
+                fx.copy(
+                    cp_h_r2g,
+                    f_g,
+                    pD_h_g,
+                    soffset=offset,
+                )
 
             # -- Store prefetched w to LDS (two b64 halves per bf16x8) --
             _stage_r2s(w_frag, pD_w_lo, pD_w_hi)
@@ -1124,17 +1107,11 @@ def compile_chunk_gated_delta_h_gfx942(
                     for j in range_constexpr(4):
                         row = row_quad * fx.Int32(4) + fx.Int32(j)
                         abs_row = i_t_i32 * fx.Int32(BT) + row
-                        safe_row = (abs_row < T_local).select(
-                            abs_row, fx.Int32(0)
-                        )
-                        k_off = (
-                            k_base + safe_row * stride_k + kx_col_base
-                        )
+                        safe_row = (abs_row < T_local).select(abs_row, fx.Int32(0))
+                        k_off = k_base + safe_row * stride_k + kx_col_base
                         quad_rows.append(
                             fx.Vector(
-                                k_kt_buf[
-                                    (k_off // fx.Int32(K_VEC_WIDTH), None)
-                                ].load()
+                                k_kt_buf[(k_off // fx.Int32(K_VEC_WIDTH), None)].load()
                             )
                         )
                     k_prefetch.append(quad_rows)
@@ -1173,7 +1150,9 @@ def compile_chunk_gated_delta_h_gfx942(
             g1_fw_rt = g1_cp_a.retile(g1_fw)
             g1_fh_rt = g1_cp_b.retile(g1_fh)
             frag_bv = fx.make_rmem_tensor(
-                fx.tiled_mma_partition_shape(fx.MmaOperand.C, mma_16x16x16_mnk, (BT, BV)),
+                fx.tiled_mma_partition_shape(
+                    fx.MmaOperand.C, mma_16x16x16_mnk, (BT, BV)
+                ),
                 fx.Float32,
             )
             frag_bv.fill(0.0)
@@ -1183,8 +1162,11 @@ def compile_chunk_gated_delta_h_gfx942(
                 fx.copy(cp_lds_x4, g1_pS_w[None, None, kt], g1_fw_rt[None, None, kt])
                 fx.copy(cp_lds_x4, g1_pS_h[None, None, kt], g1_fh_rt[None, None, kt])
                 fx.gemm(
-                    mma_16x16x16_mnk, frag_bv,
-                    g1_fw[None, None, kt], g1_fh[None, None, kt], frag_bv,
+                    mma_16x16x16_mnk,
+                    frag_bv,
+                    g1_fw[None, None, kt],
+                    g1_fh[None, None, kt],
+                    frag_bv,
                 )
 
             # -- v_new = u - bv --
@@ -1206,10 +1188,7 @@ def compile_chunk_gated_delta_h_gfx942(
             # zeroed in v_new before the k^T @ v_new state update or
             # final_state is corrupted.
             row_mask_vec = fx.Vector.from_elements(
-                [
-                    ok.select(fx.Float32(1.0), fx.Float32(0.0))
-                    for ok in frag_row_ok
-                ],
+                [ok.select(fx.Float32(1.0), fx.Float32(0.0)) for ok in frag_row_ok],
                 dtype=fx.Float32,
             )
             for nr in range_constexpr(N_REPEAT_LOCAL):
@@ -1230,11 +1209,7 @@ def compile_chunk_gated_delta_h_gfx942(
                         if frag_row_ok[elem_i].ir_value():
                             f32_v = vn_val[elem_i]
                             bf16_v = _to_bf16_fast(f32_v)
-                            vn_off = (
-                                vn_base
-                                + frag_row[elem_i] * fx.Int32(V)
-                                + vn_col
-                            )
+                            vn_off = vn_base + frag_row[elem_i] * fx.Int32(V) + vn_col
                             _emit_vn_store(vn_off, bf16_v)
 
             # -- 3. Gating --
@@ -1249,9 +1224,7 @@ def compile_chunk_gated_delta_h_gfx942(
                 gate_elems = []
                 for elem_i in range_constexpr(4):
                     gate = _fast_exp(g_last_val - g_row_raw[elem_i])
-                    gate_elems.append(
-                        frag_row_ok[elem_i].select(gate, fx.Float32(0.0))
-                    )
+                    gate_elems.append(frag_row_ok[elem_i].select(gate, fx.Float32(0.0)))
                 gate_vec = fx.Vector.from_elements(gate_elems, dtype=fx.Float32)
                 for nr in range_constexpr(N_REPEAT_LOCAL):
                     vn_frags[nr] = vn_frags[nr] * gate_vec
@@ -1356,7 +1329,9 @@ def compile_chunk_gated_delta_h_gfx942(
                 # Issue q's HBM loads before GEMM2 so their latency hides behind
                 # GEMM2's MFMA chain. q is independent of GEMM2; only the lds_q
                 # store must wait for GEMM1's lds_w readers.
-                q_prefetch = _stage_g2r(buf_cp_g2r_128b_bf16, pS_q, q_base, stride_q, i_t_i32)
+                q_prefetch = _stage_g2r(
+                    buf_cp_g2r_128b_bf16, pS_q, q_base, stride_q, i_t_i32
+                )
 
             # -- GEMM2: h += k^T @ v_new  (contraction over BT) --
             # Output h is [K, V], contraction BT.
@@ -1425,8 +1400,10 @@ def compile_chunk_gated_delta_h_gfx942(
                             )
                         )
                         fx.gemm(
-                            mma_16x16x16_mnk, h_accs_c[kb],
-                            g2_fk[None, None, bt_s], g2_fv[None, None, bt_s],
+                            mma_16x16x16_mnk,
+                            h_accs_c[kb],
+                            g2_fk[None, None, bt_s],
+                            g2_fv[None, None, bt_s],
                             h_accs_c[kb],
                         )
             else:
@@ -1442,7 +1419,9 @@ def compile_chunk_gated_delta_h_gfx942(
                         fx.make_ordered_layout((BV, BT), (1, 0)),
                     ),
                 )
-                g2_cp_b = fx.make_tiled_copy_B(cp_lds_x4, mma_16x16x16_mnk).get_slice(tid)
+                g2_cp_b = fx.make_tiled_copy_B(cp_lds_x4, mma_16x16x16_mnk).get_slice(
+                    tid
+                )
                 g2_pS_v = g2_cp_b.partition_S(sVNT)
                 g2_fv = mma_16x16x16_mnk.make_fragment_B(sVNT)
                 g2_fv_rt = g2_cp_b.retile(g2_fv)
@@ -1460,11 +1439,22 @@ def compile_chunk_gated_delta_h_gfx942(
                     sKT_kb = fx.slice(fx.zipped_divide(sKT, (64, BT)), (None, (kb, 0)))
                     g2_pS_k = g2_cp_a.partition_S(sKT_kb)
                     for bt_s in range_constexpr(BT_TILES):
-                        fx.copy(cp_g2_a, g2_pS_k[None, None, bt_s], g2_fk_rt[None, None, bt_s])
-                        fx.copy(cp_lds_x4, g2_pS_v[None, None, bt_s], g2_fv_rt[None, None, bt_s])
+                        fx.copy(
+                            cp_g2_a,
+                            g2_pS_k[None, None, bt_s],
+                            g2_fk_rt[None, None, bt_s],
+                        )
+                        fx.copy(
+                            cp_lds_x4,
+                            g2_pS_v[None, None, bt_s],
+                            g2_fv_rt[None, None, bt_s],
+                        )
                         fx.gemm(
-                            mma_16x16x16_mnk, h_accs_c[kb],
-                            g2_fk[None, None, bt_s], g2_fv[None, None, bt_s], h_accs_c[kb],
+                            mma_16x16x16_mnk,
+                            h_accs_c[kb],
+                            g2_fk[None, None, bt_s],
+                            g2_fv[None, None, bt_s],
+                            h_accs_c[kb],
                         )
 
             # =============================================================== #
@@ -1488,8 +1478,12 @@ def compile_chunk_gated_delta_h_gfx942(
                         fx.make_ordered_layout((BV, K), (1, 0)),
                     ),
                 )
-                g3_cp_a = fx.make_tiled_copy_A(cp_lds_x4, mma_16x16x16_mnk).get_slice(tid)
-                g3_cp_b = fx.make_tiled_copy_B(cp_lds_x4, mma_16x16x16_mnk).get_slice(tid)
+                g3_cp_a = fx.make_tiled_copy_A(cp_lds_x4, mma_16x16x16_mnk).get_slice(
+                    tid
+                )
+                g3_cp_b = fx.make_tiled_copy_B(cp_lds_x4, mma_16x16x16_mnk).get_slice(
+                    tid
+                )
                 g3_pS_q = g3_cp_a.partition_S(sQ)
                 g3_pS_h = g3_cp_b.partition_S(sH3)
                 g3_fq = mma_16x16x16_mnk.make_fragment_A(sQ)
@@ -1497,16 +1491,25 @@ def compile_chunk_gated_delta_h_gfx942(
                 g3_fq_rt = g3_cp_a.retile(g3_fq)
                 g3_fh_rt = g3_cp_b.retile(g3_fh)
                 frag_o = fx.make_rmem_tensor(
-                    fx.tiled_mma_partition_shape(fx.MmaOperand.C, mma_16x16x16_mnk, (BT, BV)),
+                    fx.tiled_mma_partition_shape(
+                        fx.MmaOperand.C, mma_16x16x16_mnk, (BT, BV)
+                    ),
                     fx.Float32,
                 )
                 frag_o.fill(0.0)
                 for kt in range_constexpr(K // MFMA_K):
-                    fx.copy(cp_lds_x4, g3_pS_q[None, None, kt], g3_fq_rt[None, None, kt])
-                    fx.copy(cp_lds_x4, g3_pS_h[None, None, kt], g3_fh_rt[None, None, kt])
+                    fx.copy(
+                        cp_lds_x4, g3_pS_q[None, None, kt], g3_fq_rt[None, None, kt]
+                    )
+                    fx.copy(
+                        cp_lds_x4, g3_pS_h[None, None, kt], g3_fh_rt[None, None, kt]
+                    )
                     fx.gemm(
-                        mma_16x16x16_mnk, frag_o,
-                        g3_fq[None, None, kt], g3_fh[None, None, kt], frag_o,
+                        mma_16x16x16_mnk,
+                        frag_o,
+                        g3_fq[None, None, kt],
+                        g3_fh[None, None, kt],
+                        frag_o,
                     )
 
                 # When lds_A aliases lds_h, all waves must finish reading lds_h
@@ -1525,8 +1528,12 @@ def compile_chunk_gated_delta_h_gfx942(
                 # owns BT_STEPS_LOCAL of the BT_STEPS key-column tiles and writes
                 # its slice into the shared lds_A -- no redundant compute. A
                 # barrier below precedes GEMM4b's full read.
-                g4_cp_a = fx.make_tiled_copy_A(cp_lds_x4, mma_16x16x16_mnk).get_slice(tid)
-                g4_cp_b = fx.make_tiled_copy_B(cp_lds_x4, mma_16x16x16_mnk).get_slice(tid)
+                g4_cp_a = fx.make_tiled_copy_A(cp_lds_x4, mma_16x16x16_mnk).get_slice(
+                    tid
+                )
+                g4_cp_b = fx.make_tiled_copy_B(cp_lds_x4, mma_16x16x16_mnk).get_slice(
+                    tid
+                )
                 g4_pS_q = g4_cp_a.partition_S(sQ)
                 g4_pS_k = g4_cp_b.partition_S(sK_lo)
                 g4_fq = mma_16x16x16_mnk.make_fragment_A(sQ)
@@ -1541,11 +1548,18 @@ def compile_chunk_gated_delta_h_gfx942(
                 )
                 frag_a.fill(0.0)
                 for kt in range_constexpr(K_TILES):
-                    fx.copy(cp_lds_x4, g4_pS_q[None, None, kt], g4_fq_rt[None, None, kt])
-                    fx.copy(cp_lds_x4, g4_pS_k[None, None, kt], g4_fk_rt[None, None, kt])
+                    fx.copy(
+                        cp_lds_x4, g4_pS_q[None, None, kt], g4_fq_rt[None, None, kt]
+                    )
+                    fx.copy(
+                        cp_lds_x4, g4_pS_k[None, None, kt], g4_fk_rt[None, None, kt]
+                    )
                     fx.gemm(
-                        mma_16x16x16_mnk, frag_a,
-                        g4_fq[None, None, kt], g4_fk[None, None, kt], frag_a,
+                        mma_16x16x16_mnk,
+                        frag_a,
+                        g4_fq[None, None, kt],
+                        g4_fk[None, None, kt],
+                        frag_a,
                     )
 
                 # Causal mask only (no per-column gate).
@@ -1563,8 +1577,7 @@ def compile_chunk_gated_delta_h_gfx942(
                             & (col_abs < T_local)
                         )
                         masked.append(
-                            a_acc[e]
-                            * causal.select(fx.Float32(1.0), fx.Float32(0.0))
+                            a_acc[e] * causal.select(fx.Float32(1.0), fx.Float32(0.0))
                         )
                 # lds_A's 4 C values are BT apart so this is goes out through the scalar copy atom.
                 _cfrag_to_lds(
@@ -1590,8 +1603,12 @@ def compile_chunk_gated_delta_h_gfx942(
                         fx.make_ordered_layout((BV, BT), (1, 0)),
                     ),
                 )
-                g4_cp_a = fx.make_tiled_copy_A(cp_lds_x4, mma_16x16x16_mnk).get_slice(tid)
-                g4_cp_b = fx.make_tiled_copy_B(cp_lds_x4, mma_16x16x16_mnk).get_slice(tid)
+                g4_cp_a = fx.make_tiled_copy_A(cp_lds_x4, mma_16x16x16_mnk).get_slice(
+                    tid
+                )
+                g4_cp_b = fx.make_tiled_copy_B(cp_lds_x4, mma_16x16x16_mnk).get_slice(
+                    tid
+                )
                 g4_pS_a = g4_cp_a.partition_S(sA)
                 g4_pS_v = g4_cp_b.partition_S(sVN4)
                 g4_fa = mma_16x16x16_mnk.make_fragment_A(sA)
@@ -1599,16 +1616,25 @@ def compile_chunk_gated_delta_h_gfx942(
                 g4_fa_rt = g4_cp_a.retile(g4_fa)
                 g4_fv_rt = g4_cp_b.retile(g4_fv)
                 frag_oi = fx.make_rmem_tensor(
-                    fx.tiled_mma_partition_shape(fx.MmaOperand.C, mma_16x16x16_mnk, (BT, BV)),
+                    fx.tiled_mma_partition_shape(
+                        fx.MmaOperand.C, mma_16x16x16_mnk, (BT, BV)
+                    ),
                     fx.Float32,
                 )
                 frag_oi.fill(0.0)
                 for bt_s in range_constexpr(BT_STEPS):
-                    fx.copy(cp_lds_x4, g4_pS_a[None, None, bt_s], g4_fa_rt[None, None, bt_s])
-                    fx.copy(cp_lds_x4, g4_pS_v[None, None, bt_s], g4_fv_rt[None, None, bt_s])
+                    fx.copy(
+                        cp_lds_x4, g4_pS_a[None, None, bt_s], g4_fa_rt[None, None, bt_s]
+                    )
+                    fx.copy(
+                        cp_lds_x4, g4_pS_v[None, None, bt_s], g4_fv_rt[None, None, bt_s]
+                    )
                     fx.gemm(
-                        mma_16x16x16_mnk, frag_oi,
-                        g4_fa[None, None, bt_s], g4_fv[None, None, bt_s], frag_oi,
+                        mma_16x16x16_mnk,
+                        frag_oi,
+                        g4_fa[None, None, bt_s],
+                        g4_fv[None, None, bt_s],
+                        frag_oi,
                     )
                 # frag_oi consumed directly at the combine below (no bridge).
 
@@ -1624,12 +1650,9 @@ def compile_chunk_gated_delta_h_gfx942(
                     exp_gi = [_fast_exp(g_row_raw[e]) for e in range_constexpr(4)]
                     exp_gi_vec = fx.Vector.from_elements(exp_gi, dtype=fx.Float32)
                     exp_gi_gl = [
-                        _fast_exp(g_row_raw[e] - g_last_val)
-                        for e in range_constexpr(4)
+                        _fast_exp(g_row_raw[e] - g_last_val) for e in range_constexpr(4)
                     ]
-                    exp_gi_gl_vec = fx.Vector.from_elements(
-                        exp_gi_gl, dtype=fx.Float32
-                    )
+                    exp_gi_gl_vec = fx.Vector.from_elements(exp_gi_gl, dtype=fx.Float32)
                     for nr in range_constexpr(N_REPEAT_LOCAL):
                         o_out[nr] = (
                             fx.Vector(frag_o[None, None, nr].load()) * exp_gi_vec
@@ -1637,10 +1660,9 @@ def compile_chunk_gated_delta_h_gfx942(
                         )
                 else:
                     for nr in range_constexpr(N_REPEAT_LOCAL):
-                        o_out[nr] = (
-                            fx.Vector(frag_o[None, None, nr].load())
-                            + fx.Vector(frag_oi[None, None, nr].load())
-                        )
+                        o_out[nr] = fx.Vector(
+                            frag_o[None, None, nr].load()
+                        ) + fx.Vector(frag_oi[None, None, nr].load())
 
                 # -- Scale and store o -> HBM [T_flat, H, V] token-major --
                 # The store must go through a helper: a bare ``o_buf[off] = ...``
@@ -1655,9 +1677,7 @@ def compile_chunk_gated_delta_h_gfx942(
                     o_col = i_v * fx.Int32(BV) + _nr_v(nr) + lane_n
                     for elem_i in range_constexpr(4):
                         if frag_row_ok[elem_i].ir_value():
-                            o_off = (
-                                o_base + frag_row[elem_i] * stride_o + o_col
-                            )
+                            o_off = o_base + frag_row[elem_i] * stride_o + o_col
                             _emit_o_store(o_off, _to_bf16_fast(o_scaled[elem_i]))
 
                 next_prefetch = _stage_prefetch(i_t_i32 + fx.Int32(1))
@@ -1668,9 +1688,7 @@ def compile_chunk_gated_delta_h_gfx942(
         if const_expr(STORE_FINAL_STATE):
             gHT = fx.Tensor(
                 fx.make_view(
-                    fx.get_iter(
-                        fx.rocdl.make_buffer_tensor(ht_tensor, max_size=False)
-                    ),
+                    fx.get_iter(fx.rocdl.make_buffer_tensor(ht_tensor, max_size=False)),
                     fx.make_layout((K, BV), (1, K)),
                 )
             )

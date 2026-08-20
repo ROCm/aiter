@@ -116,6 +116,7 @@ def collect_env_info() -> dict:
         info["gpu_name"] = props.name
         try:
             from flydsl.runtime.device import get_rocm_arch
+
             info["gpu_arch"] = get_rocm_arch()
         except Exception:
             info["gpu_arch"] = "unknown"
@@ -129,6 +130,7 @@ def collect_env_info() -> dict:
     # Triton
     try:
         import triton
+
         info["triton_version"] = triton.__version__
     except Exception:
         info["triton_version"] = "N/A"
@@ -136,6 +138,7 @@ def collect_env_info() -> dict:
     # FlyDSL
     try:
         import flydsl
+
         info["flydsl_version"] = flydsl.__version__
     except Exception:
         info["flydsl_version"] = "N/A"
@@ -182,13 +185,14 @@ def format_env_section(env: dict) -> str:
 @dataclass
 class BenchRow:
     """One row of bench results (one shape x one impl x one mode)."""
+
     shape_label: str
     impl: str
     mode: str
-    time_us: float | None      # median latency
+    time_us: float | None  # median latency
     tflops: float | None
-    verify: str                # "PASS", "FAIL(...)", "N/A", "OOM", ...
-    vs_baseline: str           # "1.23x" or "-" for the baseline itself
+    verify: str  # "PASS", "FAIL(...)", "N/A", "OOM", ...
+    vs_baseline: str  # "1.23x" or "-" for the baseline itself
 
 
 def write_markdown_report(
@@ -236,17 +240,19 @@ def _md_table(rows: list[BenchRow]) -> list[str]:
         return []
     has_tflops = any(r.tflops is not None for r in rows)
     header = "| impl | mode | time_us | verify | vs_baseline |"
-    sep    = "|------|------|---------|--------|-------------|"
+    sep = "|------|------|---------|--------|-------------|"
     if has_tflops:
         header = "| impl | mode | time_us | TFLOPs | verify | vs_baseline |"
-        sep    = "|------|------|---------|--------|--------|-------------|"
+        sep = "|------|------|---------|--------|--------|-------------|"
 
     out = [header, sep]
     for r in rows:
         t = f"{r.time_us:.1f}" if r.time_us is not None else "—"
         tf = f"{r.tflops:.3f}" if (has_tflops and r.tflops is not None) else "—"
         if has_tflops:
-            out.append(f"| {r.impl} | {r.mode} | {t} | {tf} | {r.verify} | {r.vs_baseline} |")
+            out.append(
+                f"| {r.impl} | {r.mode} | {t} | {tf} | {r.verify} | {r.vs_baseline} |"
+            )
         else:
             out.append(f"| {r.impl} | {r.mode} | {t} | {r.verify} | {r.vs_baseline} |")
     return out
@@ -272,9 +278,9 @@ def _md_table(rows: list[BenchRow]) -> list[str]:
 #   }
 # --------------------------------------------------------------------------- #
 
+
 def print_result_table(row: dict) -> None:
     """Print a per-shape result dict to stdout as a fixed-width console table."""
-    import sys
 
     if "error" in row:
         print(f"  ERROR: {row['error']}")
@@ -314,9 +320,14 @@ def print_result_table(row: dict) -> None:
             t = timing.get(mode)
             tf = tflops_d.get(mode)
             base = baseline_times.get(mode)
-            t_str  = f"{t.median_us:>14.1f}" if hasattr(t, "median_us") else f"{'—':>14}"
+            t_str = f"{t.median_us:>14.1f}" if hasattr(t, "median_us") else f"{'—':>14}"
             tf_str = f"{tf:>8.3f}" if tf is not None else f"{'—':>8}"
-            if hasattr(t, "median_us") and base and impl_name != baseline_name and t.median_us > 0:
+            if (
+                hasattr(t, "median_us")
+                and base
+                and impl_name != baseline_name
+                and t.median_us > 0
+            ):
                 sp_str = f"×{base / t.median_us:.2f}"
             elif impl_name == baseline_name:
                 sp_str = "baseline"
@@ -437,7 +448,9 @@ def write_bench_markdown(
                 cells = [impl]
                 for mode in modes_seen:
                     t = timing.get(mode)
-                    cells.append(f"{t.median_us:.1f}" if hasattr(t, "median_us") else "—")
+                    cells.append(
+                        f"{t.median_us:.1f}" if hasattr(t, "median_us") else "—"
+                    )
                 for mode in modes_seen:
                     tf = tflops_d.get(mode)
                     cells.append(f"{tf:.3f}" if tf is not None else "—")
@@ -445,7 +458,12 @@ def write_bench_markdown(
                 for mode in modes_seen:
                     t = timing.get(mode)
                     base = baseline_times.get(mode)
-                    if hasattr(t, "median_us") and base and impl != baseline_name and t.median_us > 0:
+                    if (
+                        hasattr(t, "median_us")
+                        and base
+                        and impl != baseline_name
+                        and t.median_us > 0
+                    ):
                         cells.append(f"×{base / t.median_us:.2f}")
                     elif impl == baseline_name:
                         cells.append("baseline")

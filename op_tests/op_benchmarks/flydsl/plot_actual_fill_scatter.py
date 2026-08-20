@@ -21,6 +21,7 @@ Usage:
     PYTHONPATH=. python3 op_tests/op_benchmarks/flydsl/plot_actual_fill_scatter.py \
         op_tests/dump_data/<sweep>.md [-o out.png] [--mode graph] [--cu 304]
 """
+
 from __future__ import annotations
 
 import argparse
@@ -31,7 +32,7 @@ from pathlib import Path
 
 _HERE = Path(__file__).parent
 sys.path.insert(0, str(_HERE))
-from utils.plot_perf import parse_bench_md, _bv_of_impl  # noqa: E402
+from utils.plot_perf import _bv_of_impl, parse_bench_md
 
 # Match the existing fill scatter's validated palette/markers for consistency.
 WIN = "#2a78d6"
@@ -40,7 +41,11 @@ INK = "#0b0b0b"
 SEC = "#52514e"
 MUT = "#8a887f"
 PAT_MARKER = {
-    "equal": "o", "ragged": "s", "bimodal": "D", "skew": "^", "skew_last": "v",
+    "equal": "o",
+    "ragged": "s",
+    "bimodal": "D",
+    "skew": "^",
+    "skew_last": "v",
 }
 _FUSED_PREFIX = "K5K6_flydsl_fused"
 
@@ -82,7 +87,9 @@ def main():
     ap.add_argument("--mode", default="graph", choices=["graph", "eager"])
     ap.add_argument("--cu", type=int, default=304, help="CU count (gfx942=304)")
     ap.add_argument(
-        "--fill-bv", default="selected", choices=["selected", "best"],
+        "--fill-bv",
+        default="selected",
+        choices=["selected", "best"],
         help="Which BV sets the x-axis fill. 'selected' (default) = the BV the "
         "runtime routing actually picks (select_fused_variant), matching "
         "should_use_fused_gfx942. 'best' = the empirically fastest variant's BV.",
@@ -91,9 +98,10 @@ def main():
 
     try:
         import matplotlib
+
         matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
         import matplotlib.lines as mlines
+        import matplotlib.pyplot as plt
     except ImportError:
         print("matplotlib not available.")
         return
@@ -162,13 +170,23 @@ def main():
         key = (round(p["fill"], 3), p["sp"] < 1.0)
         seen[key] += 1
         j = seen[key] - 1
-        x = p["fill"] if j == 0 else p["fill"] * (
-            1.0 + ((1 if j % 2 else -1) * ((j + 1) // 2) * 0.02)
+        x = (
+            p["fill"]
+            if j == 0
+            else p["fill"] * (1.0 + ((1 if j % 2 else -1) * ((j + 1) // 2) * 0.02))
         )
         color = WIN if p["sp"] >= 1.0 else LOSS
         marker = PAT_MARKER.get(p["pat"], "o")
-        ax.scatter([x], [p["sp"]], s=52, c=color, marker=marker,
-                   edgecolors="#fcfcfb", linewidths=1.1, zorder=3)
+        ax.scatter(
+            [x],
+            [p["sp"]],
+            s=52,
+            c=color,
+            marker=marker,
+            edgecolors="#fcfcfb",
+            linewidths=1.1,
+            zorder=3,
+        )
 
     allfill = [p["fill"] for p in pts]
     allsp = [p["sp"] for p in pts]
@@ -181,42 +199,80 @@ def main():
     thr = 0.45
     if xlo < thr < xhi:
         ax.axvline(thr, color=SEC, lw=1, ls=":", zorder=1)
-        ax.text(thr * 1.03, max(allsp) + 0.02, "fill = 0.45",
-                fontsize=9.5, color=SEC, va="top")
+        ax.text(
+            thr * 1.03,
+            max(allsp) + 0.02,
+            "fill = 0.45",
+            fontsize=9.5,
+            color=SEC,
+            va="top",
+        )
 
     if args.fill_bv == "selected":
         variant_word = "heuristic-selected"
     else:
         variant_word = "best"
     ax.set_xlabel(
-        f"grid fill of {variant_word} variant  "
-        f"(⌈V/BV⌉·N·H / {args.cu}; log scale)",
-        fontsize=11.5, color=INK, fontweight="bold",
+        f"grid fill of {variant_word} variant  " f"(⌈V/BV⌉·N·H / {args.cu}; log scale)",
+        fontsize=11.5,
+        color=INK,
+        fontweight="bold",
     )
-    ax.set_ylabel("fused speedup vs baseline",
-                  fontsize=12, color=INK, fontweight="bold")
+    ax.set_ylabel(
+        "fused speedup vs baseline", fontsize=12, color=INK, fontweight="bold"
+    )
     ax.set_title(
         f"GDN K5 + K6 fused ({variant_word} variant)",
-        fontsize=13, color=INK, fontweight="bold", pad=12,
+        fontsize=13,
+        color=INK,
+        fontweight="bold",
+        pad=12,
     )
 
     outcome_handles = [
-        mlines.Line2D([], [], marker="o", ls="", ms=8, mfc=WIN, mec="#fcfcfb",
-                      label=f"fusion faster ({len(win)})"),
-        mlines.Line2D([], [], marker="o", ls="", ms=8, mfc=LOSS, mec="#fcfcfb",
-                      label=f"fusion slower ({len(loss)})"),
+        mlines.Line2D(
+            [],
+            [],
+            marker="o",
+            ls="",
+            ms=8,
+            mfc=WIN,
+            mec="#fcfcfb",
+            label=f"fusion faster ({len(win)})",
+        ),
+        mlines.Line2D(
+            [],
+            [],
+            marker="o",
+            ls="",
+            ms=8,
+            mfc=LOSS,
+            mec="#fcfcfb",
+            label=f"fusion slower ({len(loss)})",
+        ),
     ]
     pats_present = [p for p in PAT_MARKER if any(x["pat"] == p for x in pts)]
     pat_handles = [
-        mlines.Line2D([], [], marker=PAT_MARKER[p], ls="", ms=8, mfc=SEC,
-                      mec="#fcfcfb", label=p)
+        mlines.Line2D(
+            [], [], marker=PAT_MARKER[p], ls="", ms=8, mfc=SEC, mec="#fcfcfb", label=p
+        )
         for p in pats_present
     ]
-    leg1 = ax.legend(handles=outcome_handles, title="outcome (colour)",
-                     loc="upper left", frameon=False, fontsize=10)
+    leg1 = ax.legend(
+        handles=outcome_handles,
+        title="outcome (colour)",
+        loc="upper left",
+        frameon=False,
+        fontsize=10,
+    )
     ax.add_artist(leg1)
-    ax.legend(handles=pat_handles, title="seq pattern (shape)",
-              loc="lower right", frameon=False, fontsize=9.5)
+    ax.legend(
+        handles=pat_handles,
+        title="seq pattern (shape)",
+        loc="lower right",
+        frameon=False,
+        fontsize=9.5,
+    )
 
     for sp in ("top", "right"):
         ax.spines[sp].set_visible(False)
@@ -226,12 +282,11 @@ def main():
     ax.grid(True, which="major", color="#e5e4df", lw=0.8, zorder=0)
 
     suffix = (
-        "-actual-fill-scatter.png" if args.fill_bv == "best"
+        "-actual-fill-scatter.png"
+        if args.fill_bv == "best"
         else "-selected-fill-scatter.png"
     )
-    out = args.out or str(
-        Path(args.sweep).with_name(Path(args.sweep).stem + suffix)
-    )
+    out = args.out or str(Path(args.sweep).with_name(Path(args.sweep).stem + suffix))
     fig.tight_layout()
     fig.savefig(out, facecolor=fig.get_facecolor())
     print(f"wrote {out}")
@@ -239,8 +294,10 @@ def main():
     if loss:
         print("\nfusion-slower points (shape actual-fill, bv_best, speedup):")
         for p in sorted(loss, key=lambda x: x["fill"]):
-            print(f"  H={p['H']:<3} N={p['N']:<2} {p['pat']:<9} "
-                  f"fill={p['fill']:.3f} bv={p['bv']:<3} sp={p['sp']:.2f}")
+            print(
+                f"  H={p['H']:<3} N={p['N']:<2} {p['pat']:<9} "
+                f"fill={p['fill']:.3f} bv={p['bv']:<3} sp={p['sp']:.2f}"
+            )
 
 
 if __name__ == "__main__":

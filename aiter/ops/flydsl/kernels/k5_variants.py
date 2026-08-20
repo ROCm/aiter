@@ -31,7 +31,7 @@ _DEFAULT_BV = 16
 #
 # ``bv32w8`` is  well-formed by the rule above
 # (NR_SPLIT = 8/4 = 2 divides N_REPEAT = 32/16 = 2) but nondeterministically
-# corrupts the ``h`` snapshot on gfx942. The kernel builder currently asserts 
+# corrupts the ``h`` snapshot on gfx942. The kernel builder currently asserts
 # that this configuration is not compiled.
 #
 # The 16-wave variants are also well-formed for BV=64, but they are always slower than
