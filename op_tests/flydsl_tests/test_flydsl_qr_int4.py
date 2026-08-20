@@ -11,7 +11,8 @@ INT4 is lossy, so the gate is SQNR vs that oracle, not bit-identity or
 tight ``checkAllclose``.
 
 5120 is a measured calibration width, not an ABI requirement. The kernel
-is gfx942 TP8 only; other archs skip.
+is gfx942 TP∈{2,4,8}; other archs skip. Pytest skips a world size when
+fewer GPUs are visible than TP.
 """
 
 from __future__ import annotations
@@ -44,6 +45,7 @@ pytest.importorskip("flydsl")
 
 from aiter.ops.flydsl.kernels.qr_int4_kernel import (
     GRID,
+    SUPPORTED_WORLDS,
     TILE_BYTES,
     WORLD,
 )
@@ -62,11 +64,14 @@ pytestmark = pytest.mark.skipif(
 # Distinct correctness branches, not a tokens x hidden product.
 # hidden=5120 is calibration; 4096 proves the map is not width-locked.
 # (8, 1024) is a half-tile tail (TILE_BYTES = 32 KiB).
+# TP2/4: one calib case each; skip when fewer GPUs than TP.
 _PYTEST_CASES = (
-    (8, 1024, "partial-tile"),
-    (512, 5120, "st1-auto-calib"),
-    (9216, 4096, "st8-alt-hidden"),
-    (32768, 5120, "st8-calib-prefill"),
+    (8, 8, 1024, "partial-tile"),
+    (8, 512, 5120, "st1-auto-calib"),
+    (8, 9216, 4096, "st8-alt-hidden"),
+    (8, 32768, 5120, "st8-calib-prefill"),
+    (4, 512, 5120, "tp4-st1-auto-calib"),
+    (2, 512, 5120, "tp2-st1-auto-calib"),
 )
 
 
@@ -184,7 +189,8 @@ def _run_rank(args) -> None:
     dist.destroy_process_group()
 
 
-def _spawn_tp8(
+def _spawn(
+    world_size: int,
     pairs: list[tuple[int, int]],
     *,
     time_it: bool,
@@ -194,8 +200,11 @@ def _spawn_tp8(
     # This file is also collected by pytest, and FlyDSL JIT needs a fresh
     # interpreter per rank, so ranks are Popen of this file with --rank
     # (not Pool / torchrun). Init method matches the HIP QR helpers.
-    if torch.cuda.device_count() < TP:
-        pytest.skip(f"QRInt4 needs {TP} GPUs, have {torch.cuda.device_count()}")
+    if world_size not in SUPPORTED_WORLDS:
+        raise ValueError(f"unsupported world_size={world_size}")
+    n_gpu = torch.cuda.device_count()
+    if n_gpu < world_size:
+        pytest.skip(f"QRInt4 needs {world_size} GPUs, have {n_gpu}")
     init_method = get_distributed_init_method(get_ip(), get_open_port())
     out_path = os.path.join(tempfile.mkdtemp(prefix="flydsl_qr_int4_"), "rank0.json")
     env = dict(os.environ)
@@ -204,12 +213,11 @@ def _spawn_tp8(
     )
     env["PYTHONUNBUFFERED"] = "1"
     env.setdefault("FLYDSL_GPU_ARCH", "gfx942")
-    env.pop("HIP_VISIBLE_DEVICES", None)
     tokens = ",".join(str(t) for t, _ in pairs)
     hiddens = ",".join(str(h) for _, h in pairs)
     procs = []
     logs = []
-    for rank in range(TP):
+    for rank in range(world_size):
         cmd = [
             sys.executable,
             os.path.abspath(__file__),
@@ -217,6 +225,8 @@ def _spawn_tp8(
             str(rank),
             "--init-method",
             init_method,
+            "--tp",
+            str(world_size),
             "--tokens",
             tokens,
             "--hiddens",
@@ -228,7 +238,10 @@ def _spawn_tp8(
             cmd.append("--time-it")
         if rank == 0:
             cmd += ["--out", out_path]
-        log = open(f"/tmp/flydsl_qr_int4_rank{rank}.log", "w")  # noqa: SIM115
+        log = open(  # noqa: SIM115
+            f"/tmp/flydsl_qr_int4_tp{world_size}_rank{rank}.log",
+            "w",
+        )
         procs.append(
             subprocess.Popen(cmd, env=env, stdout=log, stderr=subprocess.STDOUT)
         )
@@ -245,8 +258,8 @@ def _spawn_tp8(
         log.close()
     if rc != 0:
         tails = []
-        for rank in range(TP):
-            path = f"/tmp/flydsl_qr_int4_rank{rank}.log"
+        for rank in range(world_size):
+            path = f"/tmp/flydsl_qr_int4_tp{world_size}_rank{rank}.log"
             try:
                 with open(path) as fh:
                     tails.append(f"===== rank {rank} =====\n{fh.read()[-4000:]}")
@@ -258,35 +271,37 @@ def _spawn_tp8(
     return payload["ranks"][0]
 
 
-@pytest.mark.parametrize("tokens,hidden,label", _PYTEST_CASES)
-def test_qr_int4_sqnr_vs_fp32_allreduce(tokens, hidden, label):
-    rows = _spawn_tp8([(tokens, hidden)], time_it=False)
+@pytest.mark.parametrize("world_size,tokens,hidden,label", _PYTEST_CASES)
+def test_qr_int4_sqnr_vs_fp32_allreduce(world_size, tokens, hidden, label):
+    rows = _spawn(world_size, [(tokens, hidden)], time_it=False)
     row = rows[0]
     expected_st = _pick_st(tokens, hidden)
     assert (
         row["st_used"] == expected_st
     ), f"{label}: host picked ST={row['st_used']}, expected {expected_st}"
     assert row["sqnr_db"] >= SQNR_MIN_DB, (
-        f"{label} tokens={tokens} hidden={hidden} ST={row['st_used']}: "
-        f"SQNR {row['sqnr_db']:.2f} dB < {SQNR_MIN_DB} (rel MAE {row['rel_mae']:.3e})"
+        f"{label} tp={world_size} tokens={tokens} hidden={hidden} "
+        f"ST={row['st_used']}: SQNR {row['sqnr_db']:.2f} dB < {SQNR_MIN_DB} "
+        f"(rel MAE {row['rel_mae']:.3e})"
     )
 
 
 @benchmark()
-def test_qr_int4(tokens, hidden, dtype):
-    rows = _spawn_tp8([(tokens, hidden)], time_it=True)
+def test_qr_int4(tokens, hidden, dtype, tp):
+    rows = _spawn(tp, [(tokens, hidden)], time_it=True)
     row = rows[0]
     nbytes = tokens * hidden * 2
-    # Reduce of 8 ranks: (world-1) adds per element, plus INT4 codec ALU.
-    flops = tokens * hidden * (TP - 1)
+    # Reduce of tp ranks: (world-1) adds per element, plus INT4 codec ALU.
+    flops = tokens * hidden * (tp - 1)
     if row["sqnr_db"] < SQNR_MIN_DB:
         raise AssertionError(
             f"SQNR {row['sqnr_db']:.2f} dB < {SQNR_MIN_DB} "
-            f"for {tokens}x{hidden} ST={row['st_used']}"
+            f"for tp={tp} {tokens}x{hidden} ST={row['st_used']}"
         )
     us = row["us"] or 0.0
     return {
         "gfx": ARCH,
+        "tp": tp,
         "st_used": row["st_used"],
         "flydsl us": us,
         "flydsl TFLOPS": (flops / us / 1e6) if us else 0.0,
@@ -303,13 +318,7 @@ def main():
     if ARCH not in SUPPORTED_ARCHS:
         aiter.logger.warning("QRInt4 unsupported on %s; skipping", ARCH)
         return
-    if torch.cuda.device_count() < TP:
-        aiter.logger.warning(
-            "QRInt4 needs %s GPUs, have %s; skipping",
-            TP,
-            torch.cuda.device_count(),
-        )
-        return
+    n_gpu = torch.cuda.device_count()
 
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawTextHelpFormatter,
@@ -329,7 +338,14 @@ def main():
         type=int,
         nargs="*",
         default=[1],
-        help="Unused (world size is 8). Values other than 1 are skipped.",
+        help="Unused (not batch). Values other than 1 are skipped.",
+    )
+    parser.add_argument(
+        "--tp",
+        type=int,
+        nargs="*",
+        default=[TP],
+        help="World sizes to sweep (2, 4, or 8). Default 8.\n    e.g.: --tp 8",
     )
     parser.add_argument(
         "-s",
@@ -353,13 +369,24 @@ def main():
             aiter.logger.warning("QRInt4 payload is bf16; skipping %s", dtype)
             continue
         df = []
-        for batch, mnk in itertools.product(args.batch, args.mnk):
+        for tp, batch, mnk in itertools.product(args.tp, args.batch, args.mnk):
             if batch != 1:
+                continue
+            if tp not in SUPPORTED_WORLDS:
+                aiter.logger.warning("QRInt4 unsupported world_size=%s; skipping", tp)
+                continue
+            if n_gpu < tp:
+                aiter.logger.warning(
+                    "QRInt4 needs %s GPUs, have %s; skipping tp=%s",
+                    tp,
+                    n_gpu,
+                    tp,
+                )
                 continue
             if not isinstance(mnk, tuple) or len(mnk) < 2:
                 raise ValueError(f"-s expects tokens,hidden; got {mnk!r}")
             tokens, hidden = int(mnk[0]), int(mnk[1])
-            df.append(test_qr_int4(tokens, hidden, dtype))
+            df.append(test_qr_int4(tokens, hidden, dtype, tp))
         if df:
             table = pd.DataFrame(df)
             aiter.logger.info(
@@ -372,7 +399,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--rank", type=int, default=None)
     parser.add_argument("--init-method", default=None)
-    parser.add_argument("--tp", type=int, default=TP)
     parser.add_argument("--tokens", default="")
     parser.add_argument("--hiddens", default="")
     parser.add_argument("--super-tile", type=int, default=SUPER_TILE)
@@ -380,6 +406,10 @@ if __name__ == "__main__":
     parser.add_argument("--out", default=None)
     known, rest = parser.parse_known_args()
     if known.rank is not None:
+        rank_parser = argparse.ArgumentParser()
+        rank_parser.add_argument("--tp", type=int, default=TP)
+        rank_args, _ = rank_parser.parse_known_args(rest)
+        known.tp = rank_args.tp
         known.tokens = [int(t) for t in known.tokens.split(",") if t]
         known.hiddens = [int(h) for h in known.hiddens.split(",") if h]
         if len(known.tokens) != len(known.hiddens):

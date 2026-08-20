@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Host launch for gfx942 TP8 INT4 two-shot all-reduce.
+"""Host launch for gfx942 TP∈{2,4,8} INT4 two-shot all-reduce.
 
 Public type ``QRInt4``. Super-tile ST∈{1,8}; ST=1 when ``num_tiles ≤ GRID``.
 INT4 nibble + group-16 E4M3. Payload HBM is bf16.
@@ -17,6 +17,7 @@ from .qr_int4_ipc import UncachedIpcHeap
 from .qr_int4_kernel import (
     GRID,
     SUPER_TILES,
+    SUPPORTED_WORLDS,
     TILE_BYTES,
     WORLD,
     make_qr_int4_kernel,
@@ -44,7 +45,7 @@ class _StEngine:
             group, (my_handle, 0)
         )
 
-        peer_ptrs = [0] * WORLD
+        peer_ptrs = [0] * world_size
         for r in range(world_size):
             handle, off = all_meta[r]
             if r == rank:
@@ -85,9 +86,9 @@ class QRInt4:
         world_size: int = WORLD,
         super_tile: int = 8,
     ):
-        if world_size != WORLD:
+        if world_size not in SUPPORTED_WORLDS:
             raise ValueError(
-                f"only world_size={WORLD} is implemented, got {world_size}"
+                f"world_size must be one of {SUPPORTED_WORLDS}, got {world_size}"
             )
         if super_tile not in SUPER_TILES:
             raise ValueError(
