@@ -1,6 +1,5 @@
-# SPDX-License-Identifier: Apache-2.0
-# Copyright (c) 2025 FlyDSL Project Contributors
-# Modifications Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
 """Host launch for lockstep quad-fanout INT4 two-shot all-reduce."""
 
