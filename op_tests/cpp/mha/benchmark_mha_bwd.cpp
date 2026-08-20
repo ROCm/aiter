@@ -335,6 +335,11 @@ bool run(const ck_tile::ArgParser& arg_parser)
                                  sizeof(VGradDataType) * real_seqlen_k * hdim_v +
                                  sizeof(LSEDataType) * real_seqlen_q);
         }
+        // a masked run only computes roughly half the tiles
+        if(mask.type != mask_enum::no_mask)
+        {
+            flop /= 2;
+        }
     }
 
     auto get_lengths = [&](bool permute,
