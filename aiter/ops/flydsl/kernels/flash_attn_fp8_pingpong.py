@@ -750,33 +750,23 @@ def build_flash_attn_fp8_module(
                     C_F32_PER_LANE
                 )
                 zero_vec = Vec.filled(C_F32_PER_LANE, 0.0, fx.Float32)
-                cap_vec = Vec.filled(C_F32_PER_LANE, SCHRAUDOLPH_CAP, fx.Float32)
                 i32_vec_ty = Vec.make_type(C_F32_PER_LANE, fx.Int32)
                 f32_vec_ty = Vec.make_type(C_F32_PER_LANE, fx.Float32)
                 for nt in range_constexpr(N_KV_TILES):
                     if const_expr(seeded):
-                        # clamp to [0, cap] -- v_med3_f32 does both ends in
-                        # one instruction, halving the VALU here. FMED3 has no
-                        # vector pattern, so build the vector element-wise.
-                        _s = Vec(s_accs[nt])
-                        biased = Vec.from_elements(
-                            [
-                                rocdl.fmed3(
-                                    T.f32,
-                                    _raw(_s[r]),
-                                    _raw(c_zero_f),
-                                    _raw(c_sch_cap),
-                                )
-                                for r in range_constexpr(C_F32_PER_LANE)
-                            ],
-                            fx.Float32,
-                        )
+                        # No clamp at all. v_cvt_u32_f32 saturates negative
+                        # inputs to 0 in hardware, so the lower end is free,
+                        # and the watchdog already guarantees the upper end by
+                        # folding the excess into rscale. This is the same
+                        # one-VALU-per-element P path the asm kernel uses.
+                        biased = Vec(s_accs[nt])
                     else:
                         if const_expr(USE_QK_SCALE_FOLD):
-                            aff = _fadd(Vec(s_accs[nt]), mt_vec)
+                            biased = _fadd(Vec(s_accs[nt]), mt_vec)
                         else:
-                            aff = _fadd(_fmul(Vec(s_accs[nt]), sx_vec), mt_vec)
-                        biased = _fmax(aff, zero_vec)
+                            biased = _fadd(
+                                _fmul(Vec(s_accs[nt]), sx_vec), mt_vec
+                            )
                     ps_v = Vec(
                         arith.bitcast(
                             f32_vec_ty, arith.fptoui(i32_vec_ty, _raw(biased))
