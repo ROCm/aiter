@@ -433,10 +433,10 @@ def moe_gemm_a16w4(
                 config = get_kernel_config_triton(M, N, K, routing_data)
             else:
                 if use_v2:
-                    print(f"v2 swizzle kernel")
+                    #print(f"v2 swizzle kernel")
                     config = get_kernel_config_gluon_v2_swizzle(M, N, K, routing_data)       
                 else:
-                    print(f"v1 kernel")
+                    #print(f"v1 kernel")
                     config = get_kernel_config_gluon_v1_swizzle(M, N, K, routing_data)
 
     else:
