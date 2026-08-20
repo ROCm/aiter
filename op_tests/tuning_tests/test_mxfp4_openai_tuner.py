@@ -515,16 +515,16 @@ def test_all_selected_failures_retry_unselected_candidates(monkeypatch):
         active = self._candidate_rows(_row)
         calls.append([_candidate_id(candidate) for candidate in active])
         if len(calls) == 1:
-            return {"us": self.INVALID_TIME}, []
+            return {"us": self.INVALID_TIME}, [], []
         best = dict(active[0])
         best["us"] = 5.0
-        return best, [{"kernelName1": best["kernelName1"]}]
+        return best, [{"kernelName1": best["kernelName1"]}], []
 
     monkeypatch.setattr(Mxfp4FlydslTuner, "_tune_one_shape", fake_tune_one_shape)
     tuner = OpenAIMxfp4FlydslTuner.__new__(OpenAIMxfp4FlydslTuner)
     tuner.keys = KEY_COLUMNS
 
-    best, profiles = tuner._tune_preselected_shape(
+    best, profiles, _rejects = tuner._tune_preselected_shape(
         row, SimpleNamespace(), selected, full
     )
 
@@ -567,11 +567,11 @@ def test_worker_receives_preselected_candidates_without_api(
         observed["selected"] = worker_selected
         observed["full"] = worker_full
         observed["stage"] = worker_stage
-        return worker_selected[0], []
+        return worker_selected[0], [], []
 
     monkeypatch.setattr(OpenAIMxfp4FlydslTuner, "_run_shape_safely", fake_run)
 
-    best, profiles = _openai_mxfp4_shape_worker(
+    best, profiles, _rejects = _openai_mxfp4_shape_worker(
         (
             KEY_COLUMNS,
             row,
@@ -616,7 +616,7 @@ def test_worker_gpu_failure_returns_failed_shape_and_releases_gpu(monkeypatch):
         raise RuntimeError("GPU unavailable")
 
     monkeypatch.setattr(openai_tuner.torch.cuda, "set_device", fail_set_device)
-    best, profiles = _openai_mxfp4_shape_worker(
+    best, profiles, _rejects = _openai_mxfp4_shape_worker(
         (
             KEY_COLUMNS,
             row,
