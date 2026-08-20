@@ -128,24 +128,11 @@ ROWS_PER_WG_SMALL = 4
 # memory contention under arg-rotation / changing data_ptr scenarios.
 SMALL_T_THRESHOLD = 96
 
-# BF16 prefill fast path: route large-T plain-BF16 launches to the
-# cross-head-contiguous kernel (qk_norm_rope_xhead_gfx1250), where each wave
-# processes XHEAD_HEADS_PER_WAVE consecutive heads of one token. Two wins over
-# the one-row-per-wave stock kernel: (1) the MH heads are contiguous in memory
-# (q[t, h:h+MH, :]) so loads form large contiguous bursts with good DRAM
-# locality; (2) all MH heads share the token's position, so cos/sin/pos load
-# once per wave. All MH loads issue up front (deferred bf16->f32) for
-# memory-level parallelism. ~20% faster than stock (and ~6% over the earlier
-# multi-token-per-wave variant) on the H=128/D=512 prefill shape.
-# MH=8 is the tuned sweet spot (MH=16 spills registers). Set
-# USE_MROW_PREFILL=False to fall back to the stock kernel everywhere.
-USE_MROW_PREFILL = True
-XHEAD_HEADS_PER_WAVE = 8
-
-# TDM deep-prefetch prefill: a further ~14% over cross-head on the BF16 prefill
-# fast path (per-wave s_wait_dscnt fence + K=6 deep prefetch + cos/sin hoist;
-# Requires VEC=D/32 divisible by 8
-# (D % 256 == 0) and power-of-two H. Set False to fall back to the cross-head kernel.
+# BF16 prefill fast path: route large-T plain-BF16 launches to the TDM
+# deep-prefetch kernel (per-wave s_wait_dscnt fence + K=6 deep prefetch +
+# cos/sin hoist). Requires D % 256 == 0 and power-of-two H (all known MLA
+# models satisfy this). When the constraints aren't met, falls back to the
+# stock kernel.
 USE_TDM_PREFILL = True
 
 # SQRT2 has no aiter dependency, so it stays at module level.
@@ -314,9 +301,9 @@ def _build_kernel(
     # value (adaptive: R=32 for prefill, R=16 for small-T decode).
     ROWS_PER_WG = rows_per_wg
 
-    assert (
-        D % BLOCK_THREADS == 0
-    ), f"D={D} must be divisible by BLOCK_THREADS={BLOCK_THREADS}"
+    assert D % BLOCK_THREADS == 0, (
+        f"D={D} must be divisible by BLOCK_THREADS={BLOCK_THREADS}"
+    )
     assert NOPE % VEC == 0, f"NOPE={NOPE} must be divisible by VEC={VEC}"
     assert RD % 2 == 0, "rope_head_dim must be even (GPT-J pair layout)"
     assert RD % VEC == 0, f"RD={RD} must be divisible by VEC={VEC}"
@@ -329,20 +316,20 @@ def _build_kernel(
     # --- quant-group layout ------------------------------------------------
     # group_size must divide D evenly AND be a multiple of VEC (so a single
     # thread's VEC-wide slice never crosses a group boundary).
-    assert (
-        group_size > 0 and D % group_size == 0
-    ), f"group_size {group_size} must divide head_dim {D}"
-    assert (
-        group_size % VEC == 0
-    ), f"group_size {group_size} must be a multiple of VEC {VEC}"
+    assert group_size > 0 and D % group_size == 0, (
+        f"group_size {group_size} must divide head_dim {D}"
+    )
+    assert group_size % VEC == 0, (
+        f"group_size {group_size} must be a multiple of VEC {VEC}"
+    )
     TPG = group_size // VEC  # threads per group
     NG = D // group_size  # number of groups per row
-    assert (
-        TPG > 0 and (TPG & (TPG - 1)) == 0
-    ), f"TPG {TPG} must be a power of 2 (for butterfly reduce)"
-    assert (
-        scale_dtype in SCALE_DTYPE_OPTIONS
-    ), f"scale_dtype {scale_dtype!r} must be one of {SCALE_DTYPE_OPTIONS}"
+    assert TPG > 0 and (TPG & (TPG - 1)) == 0, (
+        f"TPG {TPG} must be a power of 2 (for butterfly reduce)"
+    )
+    assert scale_dtype in SCALE_DTYPE_OPTIONS, (
+        f"scale_dtype {scale_dtype!r} must be one of {SCALE_DTYPE_OPTIONS}"
+    )
 
     log2_block = int(math.log2(BLOCK_THREADS))
     log2_tpg = int(math.log2(TPG))
@@ -917,11 +904,12 @@ def _build_kernel(
         num_tokens: fx.Int32,
         stream: fx.Stream,
     ):
-        _gy_i32 = arith.divsi(
-            _to_raw(num_tokens + ROWS_PER_WG - 1),
-            _to_raw(fx.Int32(ROWS_PER_WG)),
+        grid_y = fx.Index(
+            arith.divsi(
+                _to_raw(num_tokens + ROWS_PER_WG - 1),
+                _to_raw(fx.Int32(ROWS_PER_WG)),
+            )
         )
-        idx_grid_y = fx.Index(_gy_i32)
         k = kernel(
             q_in,
             kv_in,
@@ -945,7 +933,7 @@ def _build_kernel(
             num_tokens,
         )
         k.launch(
-            grid=(H + 1, idx_grid_y, 1),
+            grid=(H + 1, grid_y, 1),
             block=(BLOCK_THREADS, ROWS_PER_WG, 1),
             stream=stream,
         )
@@ -1191,44 +1179,17 @@ def flydsl_qk_norm_rope_quant_gfx1250(
         ssm_arg = q.new_empty(1, dtype=torch.int32)
         bid_arg = q.new_empty(1, dtype=torch.int32)
 
-    # ---- BF16 prefill fast path (cross-head-contiguous) ----
-    # The stock kernel gives each wave one row, so it stalls on s_wait_loadcnt
-    # (ATT: ~85% of stall is global-load wait; ~28% of the ~20 TB/s HBM peak --
-    # memory-LATENCY starved). For the plain BF16 large-T case, route to the
-    # cross-head kernel (MH consecutive heads/wave: contiguous bursts + shared
-    # cos/sin/pos + up-front loads for memory-level parallelism), ~20% faster.
-    # Scoped to exactly the measured regime: BF16 (no quant), no SWA cache-write
-    # / paged, and T > threshold. Decode (small-T) and all quant/kv_write paths
-    # keep the stock kernel.
+    # ---- BF16 prefill fast path (TDM deep-prefetch) ----
     if (
-        USE_MROW_PREFILL
+        USE_TDM_PREFILL
         and not quant
         and not kv_write
         and not paged
         and T_tok > SMALL_T_THRESHOLD
+        and (D % 256 == 0)
+        and (H & (H - 1) == 0)
     ):
-        # TDM deep-prefetch is a further ~15% over cross-head, but needs
-        # VEC=D/32 divisible by 8 (D % 256 == 0) and power-of-two H. Fall back to
-        # the cross-head kernel when those don't hold.
-        if USE_TDM_PREFILL and (D % 256 == 0) and (H & (H - 1) == 0):
-            q_out, kv_out = flydsl_qk_norm_rope_tdm_prefill(
-                q,
-                kv,
-                kv_weight,
-                cos_cache,
-                sin_cache,
-                positions,
-                num_q_heads=H,
-                head_dim=D,
-                rope_head_dim=RD,
-                q_weight=q_weight if q_weighted else None,
-                q_out=q_out,
-                kv_out=kv_out,
-                stream=stream,
-            )
-            return q_out, kv_out, None, None
-
-        q_out, kv_out = flydsl_qk_norm_rope_xhead(
+        q_out, kv_out = flydsl_qk_norm_rope_tdm_prefill(
             q,
             kv,
             kv_weight,
@@ -1241,7 +1202,6 @@ def flydsl_qk_norm_rope_quant_gfx1250(
             q_weight=q_weight if q_weighted else None,
             q_out=q_out,
             kv_out=kv_out,
-            heads_per_wave=XHEAD_HEADS_PER_WAVE,
             stream=stream,
         )
         return q_out, kv_out, None, None
@@ -1321,374 +1281,8 @@ def flydsl_qk_norm_rope_quant_gfx1250(
     return q_out, kv_out, (q_scale if quant else None), (kv_scale if quant else None)
 
 
-# ============================================================================
-# Cross-head-contiguous BF16 prefill fast path
-# ============================================================================
-# Selected by the dispatch above for plain BF16 large-T launches. Each wave
-# processes XHEAD_HEADS_PER_WAVE consecutive heads of one token:
-#   1. Contiguity: q[t, h:h+MH, :] is a contiguous MH*D block, so the wave's MH
-#      row loads form one large contiguous burst (good DRAM row-buffer locality)
-#      vs the stock kernel's token-strided loads (stride H*D = 128 KB).
-#   2. Shared cos/sin/pos: all MH heads of a token share the position, so RoPE
-#      cos/sin and the position load happen once per wave, not per row.
-# All MH loads issue up front (deferred bf16->f32) for memory-level parallelism.
-# BF16 only, Q + KV, optional q_weight; no quant / kv_write / paged. ~20% faster
-# than the one-row-per-wave stock kernel on the H=128/D=512 prefill shape;
-# MH=8 is the tuned sweet spot (MH=16 spills registers).
-
-
-def _build_xhead_kernel(
-    *,
-    num_q_heads,
-    head_dim,
-    rope_head_dim,
-    q_weighted,
-    rows_per_wg=ROWS_PER_WG,
-    heads_per_wave=XHEAD_HEADS_PER_WAVE,
-):
-    H, D, RD = num_q_heads, head_dim, rope_head_dim
-    NOPE = D - RD
-    VEC = D // BLOCK_THREADS
-    ROPE_THREAD_LO = NOPE // VEC
-    PAIRS = VEC // 2
-    R = rows_per_wg
-    MH = heads_per_wave
-    HB = (H + MH - 1) // MH  # Q head-blocks
-    log2_block = int(math.log2(BLOCK_THREADS))
-
-    name = f"qk_norm_rope_xhead_H{H}_D{D}_RD{RD}"
-    if q_weighted:
-        name += "_qw"
-    name += f"_r{R}_mh{MH}_w32_flydsl"
-
-    @flyc.kernel(name=name, known_block_size=[BLOCK_THREADS, R, 1])
-    def kernel(
-        q_in: fx.Pointer,
-        kv_in: fx.Pointer,
-        q_weight: fx.Tensor,
-        kv_weight: fx.Tensor,
-        cos_cache: fx.Tensor,
-        sin_cache: fx.Tensor,
-        positions: fx.Pointer,
-        q_out: fx.Pointer,
-        kv_out: fx.Pointer,
-        kv_in_row_stride: Int32,
-        num_tokens: Int32,
-    ):
-        f32 = T.f32
-        i32 = T.i32
-
-        tid = fx.thread_idx.x
-        tid_y = fx.thread_idx.y
-        bid_x = fx.block_idx.x  # 0..HB-1 = Q head-block; HB = KV
-        bid_g = fx.block_idx.y
-
-        tok = ArithValue(bid_g) * R + ArithValue(tid_y)
-        _nt_m1 = _to_raw(num_tokens - 1)
-        tok_c = arith.minsi(_to_raw(tok), _nt_m1)
-        tok_idx = fx.Index(_to_raw(tok_c))
-
-        def _ptr_res(ptr):
-            addr = fx.Int64(fx.ptrtoint(ptr))
-            return buffer_ops.create_buffer_resource_from_addr(addr)
-
-        # --- position + cos/sin: shared across all heads of this token ---
-        pos_rsrc = _ptr_res(positions)
-        pos_i64 = buffer_ops.buffer_load(
-            pos_rsrc, _to_raw(tok_c), vec_width=1, dtype=T.i64
-        )
-        pos_i32 = pos_i64.trunci(i32)
-        cos_rsrc = buffer_ops.create_buffer_resource(cos_cache, max_size=True)
-        sin_rsrc = buffer_ops.create_buffer_resource(sin_cache, max_size=True)
-        c_half = fx.Int32(RD // 2)
-        is_rope_t = _to_raw(tid) >= fx.Int32(ROPE_THREAD_LO)
-        rope_rel = arith.maxsi(
-            _to_raw(ArithValue(tid) - fx.Int32(ROPE_THREAD_LO)),
-            fx.Int32(0),
-        )
-        cs_off = ArithValue(pos_i32) * c_half + ArithValue(rope_rel) * fx.Int32(PAIRS)
-        if const_expr(PAIRS == 1):
-            cos_raw = buffer_ops.buffer_load(
-                cos_rsrc, cs_off, vec_width=1, dtype=T.bf16
-            )
-            sin_raw = buffer_ops.buffer_load(
-                sin_rsrc, cs_off, vec_width=1, dtype=T.bf16
-            )
-            cos_vals = [cos_raw.extf(f32)]
-            sin_vals = [sin_raw.extf(f32)]
-        else:
-            cos_raw = buffer_ops.buffer_load(
-                cos_rsrc, cs_off, vec_width=PAIRS, dtype=T.bf16
-            )
-            sin_raw = buffer_ops.buffer_load(
-                sin_rsrc, cs_off, vec_width=PAIRS, dtype=T.bf16
-            )
-            cos_vals = [
-                vector.extract(cos_raw, static_position=[i], dynamic_position=[]).extf(
-                    f32
-                )
-                for i in range(PAIRS)
-            ]
-            sin_vals = [
-                vector.extract(sin_raw, static_position=[i], dynamic_position=[]).extf(
-                    f32
-                )
-                for i in range(PAIRS)
-            ]
-
-        def _issue(rsrc, off_dw):
-            dwords = VEC // 2
-            if const_expr(dwords <= 4):
-                return [
-                    buffer_ops.buffer_load(rsrc, off_dw, vec_width=dwords, dtype=i32)
-                ]
-            chunks = []
-            for c in range_constexpr(dwords // 4):
-                chunks.append(
-                    buffer_ops.buffer_load(
-                        rsrc, ArithValue(off_dw) + (c * 4), vec_width=4, dtype=i32
-                    )
-                )
-            return chunks
-
-        def _extf(chunks):
-            out = []
-            for ch in chunks:
-                nbf = VEC if const_expr(VEC // 2 <= 4) else 8
-                vb = vector.bitcast(T.vec(nbf, T.bf16), ch)
-                for i in range_constexpr(nbf):
-                    out.append(
-                        vector.extract(
-                            vb, static_position=[i], dynamic_position=[]
-                        ).extf(f32)
-                    )
-            return out
-
-        def _load_weight(wtensor):
-            wrsrc = buffer_ops.create_buffer_resource(wtensor, max_size=True)
-            return _extf(_issue(wrsrc, (ArithValue(tid) * VEC) >> 1))
-
-        def wave_reduce(x):
-            w = _to_raw(x)
-            for sh in range_constexpr(log2_block):
-                o = BLOCK_THREADS // (2 << sh)
-                peer = _to_raw(ArithValue(w).shuffle_xor(o, BLOCK_THREADS))
-                w = _to_raw(ArithValue(w) + peer)
-            return w
-
-        def compute_store(x_f32, w_f32, out_rsrc, row_base):
-            sq = fx.Float32(0.0)
-            for vi in range_constexpr(VEC):
-                sq = _to_raw(ArithValue(sq) + ArithValue(x_f32[vi]) * x_f32[vi])
-            rstd = fmath.rsqrt(wave_reduce(sq) * (1.0 / D) + 1e-6)
-            scaled = []
-            for vi in range_constexpr(VEC):
-                xi = x_f32[vi]
-                if const_expr(w_f32 is not None):
-                    xi = _to_raw(ArithValue(xi) * w_f32[vi])
-                scaled.append(_to_raw(ArithValue(xi) * rstd))
-            rot = list(scaled)
-            for k in range_constexpr(PAIRS):
-                e = scaled[2 * k]
-                o = scaled[2 * k + 1]
-                c = cos_vals[k]
-                s = sin_vals[k]
-                rot[2 * k] = _to_raw(ArithValue(e) * c - ArithValue(o) * s)
-                rot[2 * k + 1] = _to_raw(ArithValue(e) * s + ArithValue(o) * c)
-            final = [
-                arith.select(is_rope_t, rot[i], scaled[i]) for i in range_constexpr(VEC)
-            ]
-            _store_bf16_vec(final, out_rsrc, row_base, tid, VEC)
-
-        def emit_q():
-            head_base = ArithValue(bid_x) * MH
-            q_rsrc = _ptr_res(q_in)
-            c_H1 = fx.Int32(H - 1)
-            # Phase A: issue MH contiguous row loads (heads head_base..+MH).
-            raws = []
-            heads = []
-            for m in range_constexpr(MH):
-                head = arith.minsi(_to_raw(head_base + m), _to_raw(c_H1))
-                heads.append(head)
-                off_dw = (
-                    ArithValue(tok_c) * (H * D)
-                    + ArithValue(head) * D
-                    + ArithValue(tid) * VEC
-                ) >> 1
-                raws.append(_issue(q_rsrc, off_dw))
-            qw = _load_weight(q_weight) if const_expr(q_weighted) else None
-            # Phase B: compute + store each head (loads still in flight).
-            for m in range_constexpr(MH):
-                x = _extf(raws[m])
-                tok_off = _to_raw(ArithValue(tok_idx) * fx.Index(H * D * 2))
-                out_rsrc = GTensor(
-                    q_out, dtype=T.bf16, shape=(H, D), static_bytes_offset_i64=tok_off
-                ).rsrc
-                row_base = ArithValue(heads[m]) * (D * 2)
-                compute_store(x, qw, out_rsrc, row_base)
-
-        def emit_kv():
-            kv_rsrc = _ptr_res(kv_in)
-            off_dw = (
-                ArithValue(tok_c) * ArithValue(kv_in_row_stride) + ArithValue(tid) * VEC
-            ) >> 1
-            x = _extf(_issue(kv_rsrc, off_dw))
-            w = _load_weight(kv_weight)
-            tok_off = _to_raw(ArithValue(tok_idx) * fx.Index(D * 2))
-            out_rsrc = GTensor(
-                kv_out, dtype=T.bf16, shape=(D,), static_bytes_offset_i64=tok_off
-            ).rsrc
-            compute_store(x, w, out_rsrc, fx.Int32(0))
-
-        if bid_x < HB:
-            emit_q()
-        else:
-            emit_kv()
-
-    @flyc.jit
-    def launch(
-        q_in: fx.Pointer,
-        kv_in: fx.Pointer,
-        q_weight: fx.Tensor,
-        kv_weight: fx.Tensor,
-        cos_cache: fx.Tensor,
-        sin_cache: fx.Tensor,
-        positions: fx.Pointer,
-        q_out: fx.Pointer,
-        kv_out: fx.Pointer,
-        kv_in_row_stride: fx.Int32,
-        num_tokens: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),  # noqa: B008
-    ):
-        _nt = num_tokens
-        gy = arith.divsi(_to_raw(_nt + (R - 1)), _to_raw(fx.Int32(R)))
-        k = kernel(
-            q_in,
-            kv_in,
-            q_weight,
-            kv_weight,
-            cos_cache,
-            sin_cache,
-            positions,
-            q_out,
-            kv_out,
-            kv_in_row_stride,
-            num_tokens,
-        )
-        k.launch(
-            grid=(HB + 1, fx.Index(gy), 1),
-            block=(BLOCK_THREADS, R, 1),
-            stream=stream,
-        )
-
-    return launch
-
-
-@lru_cache(maxsize=32)
-def _compile_xhead(
-    *,
-    num_q_heads,
-    head_dim,
-    rope_head_dim,
-    q_weighted,
-    rows_per_wg=ROWS_PER_WG,
-    heads_per_wave=XHEAD_HEADS_PER_WAVE,
-):
-    launcher = _build_xhead_kernel(
-        num_q_heads=num_q_heads,
-        head_dim=head_dim,
-        rope_head_dim=rope_head_dim,
-        q_weighted=q_weighted,
-        rows_per_wg=rows_per_wg,
-        heads_per_wave=heads_per_wave,
-    )
-    launcher.compile_hints = dict(_DEFAULT_COMPILE_HINTS)
-    return launcher
-
-
-def flydsl_qk_norm_rope_xhead(
-    q,
-    kv,
-    kv_weight,
-    cos_cache,
-    sin_cache,
-    positions,
-    *,
-    num_q_heads,
-    head_dim,
-    rope_head_dim,
-    q_weight=None,
-    q_out=None,
-    kv_out=None,
-    rows_per_wg=ROWS_PER_WG,
-    heads_per_wave=XHEAD_HEADS_PER_WAVE,
-    stream=None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    H, D, RD = num_q_heads, head_dim, rope_head_dim
-    T_tok = q.shape[0]
-    q_weighted = q_weight is not None
-    q_weight_arg = q_weight if q_weighted else kv_weight
-    q_view = q.view(T_tok, H, D) if q.dim() == 2 else q
-    cos_2d = cos_cache.reshape(-1, RD // 2)
-    sin_2d = sin_cache.reshape(-1, RD // 2)
-    if q_out is None:
-        q_out = torch.empty((T_tok, H, D), dtype=torch.bfloat16, device=q.device)
-    if kv_out is None:
-        kv_out = torch.empty((T_tok, D), dtype=torch.bfloat16, device=q.device)
-
-    launcher = _compile_xhead(
-        num_q_heads=H,
-        head_dim=D,
-        rope_head_dim=RD,
-        q_weighted=q_weighted,
-        rows_per_wg=rows_per_wg,
-        heads_per_wave=heads_per_wave,
-    )
-    if stream is None:
-        stream = torch.cuda.current_stream()
-
-    def _has_ds():
-        return getattr(launcher, "_direct_call_state", None) is not None
-
-    def _ptr(t):
-        return (
-            int(t.data_ptr())
-            if _has_ds()
-            else flyc.from_c_void_p(fx.Uint8, t.data_ptr())
-        )
-
-    def _stm():
-        return stream if _has_ds() else Stream(stream)
-
-    qw_s = _cached_from_dlpack(q_weight_arg)
-    kw_s = _cached_from_dlpack(kv_weight)
-    cos_s = _cached_from_dlpack(cos_2d)
-    sin_s = _cached_from_dlpack(sin_2d)
-
-    MAX_GY = 65535 * rows_per_wg
-    for start in range(0, T_tok, MAX_GY):
-        n = min(MAX_GY, T_tok - start)
-        end = start + n
-        args = (
-            _ptr(q_view[start:end]),
-            _ptr(kv[start:end]),
-            qw_s,
-            kw_s,
-            cos_s,
-            sin_s,
-            _ptr(positions[start:end]),
-            _ptr(q_out[start:end]),
-            _ptr(kv_out[start:end]),
-            kv.stride(0),
-            n,
-            _stm(),
-        )
-        _run_compiled(launcher, *args)
-    return q_out, kv_out
-
-
 # ===========================================================================
-# TDM deep-prefetch BF16 prefill (fastest path; ~14% over cross-head).
+# TDM deep-prefetch BF16 prefill.
 # Dispatched above behind USE_TDM_PREFILL. Q via per-wave s_wait_dscnt fence +
 # K=6 deep prefetch + cos/sin hoist; KV via a direct-load row-per-wave kernel.
 # See ../temp-doc/aiter/qk_norm_rope_tdm_handoff.md for the full derivation.
@@ -1884,7 +1478,7 @@ def _build_tdm(
                 w = _to_raw(ArithValue(w) + ArithValue(w).shuffle_xor(o, BLOCK_THREADS))
             rstd = fmath.rsqrt(ArithValue(w) * (1.0 / D) + 1e-6)
             # RMSNorm (+ optional per-channel q_weight): (x * w) * rstd. rstd is
-            # from unweighted x^2 (matches stock/xhead semantics); mul commutes.
+            # from unweighted x^2 (matches stock kernel semantics); mul commutes.
             if const_expr(q_weighted):
                 scaled = [_to_raw(x[vi] * qw[vi] * rstd) for vi in range_constexpr(VEC)]
             else:
@@ -1977,11 +1571,7 @@ def _compile_tdm(
         hoist_cs=hoist_cs,
         q_weighted=q_weighted,
     )
-    launcher.compile_hints = {
-        "waves_per_eu": 8,
-        "fast_fp_math": True,
-        "unsafe_fp_math": True,
-    }
+    launcher.compile_hints = dict(_DEFAULT_COMPILE_HINTS)
     return launcher
 
 
@@ -2210,11 +1800,7 @@ def _build_tdm_kv(*, head_dim, rope_head_dim):
 @lru_cache(maxsize=16)
 def _compile_tdm_kv(*, head_dim, rope_head_dim):
     launcher = _build_tdm_kv(head_dim=head_dim, rope_head_dim=rope_head_dim)
-    launcher.compile_hints = {
-        "waves_per_eu": 8,
-        "fast_fp_math": True,
-        "unsafe_fp_math": True,
-    }
+    launcher.compile_hints = dict(_DEFAULT_COMPILE_HINTS)
     return launcher
 
 
@@ -2271,7 +1857,7 @@ def flydsl_qk_norm_rope_kv_direct(
 
 
 # ---------------------------------------------------------------------------
-# Combined prefill entry (drop-in for flydsl_qk_norm_rope_xhead)
+# Combined prefill entry (Q via TDM deep-prefetch, KV via direct-load)
 # ---------------------------------------------------------------------------
 
 
