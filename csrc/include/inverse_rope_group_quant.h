@@ -24,6 +24,8 @@ enum ScaleLayout : int64_t
     //   Storage [G, S_pad, Ks_pad] flat with 256-byte tiles of [32_M, 8_K].
     //   Tile-internal: byte = lane*4 + iter, lane = (k%4)*16 + (m%16),
     //   iter = ((m/16)&1) + ((k/4)&1)*2.  S_pad = ceil(S,32), Ks_pad = ceil(Ks,8).
+    //   Same byte permutation as mx_scale_shuffle_idx, but k means a quant group
+    //   here rather than a 32-element MX block, so the implementations stay separate.
     kScaleMfmaTile = 1,
     // n32k4, the gfx1250 WMMA scale layout that aiter.ops.shuffle's
     // shuffle_scale_n32k4 produces for weights -- emitted here for the

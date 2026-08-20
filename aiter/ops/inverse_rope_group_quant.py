@@ -15,8 +15,7 @@ from ..jit.core import compile_ops
 from ..utility.dtypes import get_dtype_fp8
 
 # Mirrors aiter::ScaleLayout in csrc/include/inverse_rope_group_quant.h.
-# "mfma" is a legacy alias for mfma_tile (gfx950 V_MFMA_SCALE_16x16x128 tile).
-SCALE_LAYOUTS = {"row": 0, "mfma": 1, "mfma_tile": 1, "n32k4": 2}
+SCALE_LAYOUTS = {"row": 0, "mfma_tile": 1, "n32k4": 2}
 
 
 @compile_ops(
@@ -45,7 +44,7 @@ def scale_shape(
     Exposed so a caller pre-allocating its own scale (a HIP graph capture, or a
     persistent workspace) does not have to restate the padding rules.
     """
-    if scale_layout in ("mfma", "mfma_tile"):
+    if scale_layout == "mfma_tile":
         return (num_groups, ((s + 31) // 32) * 32, ((scale_groups + 7) // 8) * 8)
     if scale_layout == "n32k4":
         return ((s + 31) // 32, num_groups, scale_groups * 32)
@@ -71,15 +70,13 @@ def inverse_rope_group_quant(
         cos_cache/sin_cache: ``[max_pos, rd//2]``.
         num_groups: output-LoRA local groups ``G``.
         quant_group_size: quant block along ``D``; V4 wo_a path uses 128.
-        scale_layout: e8m0 scale storage, one of
+        scale_layout: e8m0 scale storage:
 
-            * ``"row"``: row-major ``[S, G, Ks]``.
-            * ``"mfma_tile"`` (``"mfma"`` alias): gfx950
-              ``V_MFMA_SCALE_F32_16x16x128_F8`` 256B tile layout
-              ``[G, S_pad, Ks_pad]``. Not the gfx1250 WMMA layout.
-            * ``"n32k4"``: gfx1250 WMMA scaleB layout ``[ceil(S,32)/32, G, Ks*32]``
-              (``shuffle_scale_n32k4`` on weights). Needs ``quant_group_size == 32``
-              and ``Ks % 4 == 0``; the ``n32`` is super-row height, not group size.
+            * ``"row"``: ``[S, G, Ks]``.
+            * ``"mfma_tile"``: ``[G, S_pad, Ks_pad]``, for gfx950's
+              ``V_MFMA_SCALE_F32_16x16x128_F8``.
+            * ``"n32k4"``: ``[ceil(S,32)/32, G, Ks*32]``, for gfx1250's WMMA
+              scaleB. Requires ``quant_group_size == 32``.
 
         The two padded layouts round ``S`` up to 32 (``mfma_tile`` also rounds
         ``Ks`` up to 8), and **the bytes that padding adds are left undefined** --

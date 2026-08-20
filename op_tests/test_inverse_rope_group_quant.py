@@ -21,10 +21,11 @@ import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.inverse_rope_group_quant import (
-    inverse_rope_group_quant as inverse_rope_group_quant_cpp,
+    SCALE_LAYOUTS,
+    scale_shape,
 )
 from aiter.ops.inverse_rope_group_quant import (
-    scale_shape,
+    inverse_rope_group_quant as inverse_rope_group_quant_cpp,
 )
 from aiter.ops.quant import dynamic_per_group_scaled_quant
 from aiter.ops.triton.rope.rope import RotateStyle, _rope_cached_bwd
@@ -129,7 +130,7 @@ def _unshuffle_n32k4_scale(scale_n32k4, S, G, Ks):
 
 def _unshuffle_scale(scale, s, g, ks, scale_layout):
     """Scale buffer in `scale_layout` -> logical [s, g, ks] uint8."""
-    if scale_layout in ("mfma", "mfma_tile"):
+    if scale_layout == "mfma_tile":
         return _unshuffle_mfma_scale(scale, s, g, ks)
     if scale_layout == "n32k4":
         return _unshuffle_n32k4_scale(scale, s, g, ks)
@@ -574,14 +575,14 @@ def main():
         "-l",
         "--scale-layout",
         type=str,
-        choices=["row", "mfma", "mfma_tile", "n32k4"],
+        choices=list(SCALE_LAYOUTS),
         nargs="*",
-        default=["row", "mfma_tile", "n32k4"],
+        default=list(SCALE_LAYOUTS),
         help="""e8m0 scale storage:
-        row = contiguous [s, g, ks],
-        mfma_tile (mfma) = gfx950 V_MFMA_SCALE tile [g, s_pad, ks_pad],
-        n32k4 = gfx1250 WMMA scaleB [s_pad/32, g, ks*32]
-                (group size must be 32, and ks %% 4 == 0).
+        row = [s, g, ks],
+        mfma_tile = [g, s_pad, ks_pad] for gfx950 V_MFMA_SCALE,
+        n32k4 = [s_pad/32, g, ks*32] for gfx1250 WMMA scaleB
+                (needs group size 32).
         e.g.: -l n32k4""",
     )
     parser.add_argument(
