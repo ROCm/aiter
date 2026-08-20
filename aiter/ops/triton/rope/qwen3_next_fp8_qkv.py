@@ -62,6 +62,15 @@ def qwen3_next_fp8_qkv_prep(
     head_dim: int,
     rotary_dim: int,
     eps: float = 1.0e-6,
+    query_out: torch.Tensor | None = None,
+    key_out: torch.Tensor | None = None,
+    gate_out: torch.Tensor | None = None,
+    query_fp8_out: torch.Tensor | None = None,
+    key_fp8_out: torch.Tensor | None = None,
+    value_fp8_out: torch.Tensor | None = None,
+    query_descale_out: torch.Tensor | None = None,
+    key_descale_out: torch.Tensor | None = None,
+    value_descale_out: torch.Tensor | None = None,
 ) -> Qwen3NextFp8QKVPrepOutput:
     """Prepare Qwen3.8 full-attention Q/K/V for dynamic FP8 FMHA.
 
@@ -151,40 +160,75 @@ def qwen3_next_fp8_qkv_prep(
     if any(tensor.device != q_gate.device for tensor in tensors):
         raise ValueError("all inputs must be on the same device")
 
-    query = torch.empty(
-        (total_tokens, num_query_heads * head_dim),
-        dtype=q_gate.dtype,
-        device=q_gate.device,
+    provided_outputs = (
+        query_out,
+        key_out,
+        gate_out,
+        query_fp8_out,
+        key_fp8_out,
+        value_fp8_out,
+        query_descale_out,
+        key_descale_out,
+        value_descale_out,
     )
-    output_key = torch.empty(
-        (total_tokens, num_kv_heads * head_dim),
-        dtype=key.dtype,
-        device=key.device,
-    )
-    gate = torch.empty_like(query)
-    fp8_dtype = aiter.dtypes.fp8
-    query_fp8 = torch.empty(
-        (total_tokens, num_query_heads, head_dim),
-        dtype=fp8_dtype,
-        device=q_gate.device,
-    )
-    key_fp8 = torch.empty(
-        (total_tokens, num_kv_heads, head_dim),
-        dtype=fp8_dtype,
-        device=key.device,
-    )
-    value_fp8 = torch.empty(
-        (total_tokens, num_kv_heads, head_dim),
-        dtype=fp8_dtype,
-        device=value.device,
-    )
-    query_descale = torch.empty(
-        (MAX_SEQUENCES, num_kv_heads),
-        dtype=torch.float32,
-        device=q_gate.device,
-    )
-    key_descale = torch.empty_like(query_descale)
-    value_descale = torch.empty_like(query_descale)
+    if any(output is not None for output in provided_outputs):
+        if not all(output is not None for output in provided_outputs):
+            raise ValueError(
+                "Qwen3 FP8 QKV output buffers must be all set or all unset"
+            )
+        query = query_out
+        output_key = key_out
+        gate = gate_out
+        query_fp8 = query_fp8_out
+        key_fp8 = key_fp8_out
+        value_fp8 = value_fp8_out
+        query_descale = query_descale_out
+        key_descale = key_descale_out
+        value_descale = value_descale_out
+        assert query is not None
+        assert output_key is not None
+        assert gate is not None
+        assert query_fp8 is not None
+        assert key_fp8 is not None
+        assert value_fp8 is not None
+        assert query_descale is not None
+        assert key_descale is not None
+        assert value_descale is not None
+    else:
+        query = torch.empty(
+            (total_tokens, num_query_heads * head_dim),
+            dtype=q_gate.dtype,
+            device=q_gate.device,
+        )
+        output_key = torch.empty(
+            (total_tokens, num_kv_heads * head_dim),
+            dtype=key.dtype,
+            device=key.device,
+        )
+        gate = torch.empty_like(query)
+        fp8_dtype = aiter.dtypes.fp8
+        query_fp8 = torch.empty(
+            (total_tokens, num_query_heads, head_dim),
+            dtype=fp8_dtype,
+            device=q_gate.device,
+        )
+        key_fp8 = torch.empty(
+            (total_tokens, num_kv_heads, head_dim),
+            dtype=fp8_dtype,
+            device=key.device,
+        )
+        value_fp8 = torch.empty(
+            (total_tokens, num_kv_heads, head_dim),
+            dtype=fp8_dtype,
+            device=value.device,
+        )
+        query_descale = torch.empty(
+            (MAX_SEQUENCES, num_kv_heads),
+            dtype=torch.float32,
+            device=q_gate.device,
+        )
+        key_descale = torch.empty_like(query_descale)
+        value_descale = torch.empty_like(query_descale)
 
     query_token_amax = torch.empty(
         (total_tokens, num_query_heads),
