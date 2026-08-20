@@ -161,6 +161,26 @@ def build_flash_attn_fp8_module(
     # a fixed cap; the repair is a rare, wave-uniform branch.
     USE_WATCHDOG = True
 
+    # USE_BIAS_FOLD (Trick 4): seed the QK accumulator with the Schraudolph bias
+    # (C - m) instead of zero, so the GEMM performs the subtraction as part of
+    # work it was doing anyway and S emerges already *being* the exp2 pattern.
+    # Removes 4x vec<16xf32> of adds per tile.
+    #
+    # Two of the doc's three complications do not arise in this layout.  The
+    # accumulator fragment is C_frag[L][v] = C[row, col=lo], so a lane's 16 slots
+    # all belong to one query row and the bias it needs is already a per-lane
+    # scalar -- no rank-1 outer product to broadcast it, and hence no bf16
+    # residual split (the seed stays fp32-exact).  Complication 3 does apply and
+    # is handled the doc's way: one materialized bias tile is routed as the C
+    # operand of all four blocks' first MFMA rather than materialized four times.
+    #
+    # What this *does* cost is the watchdog's repair route.  Tile i's seed is
+    # fixed before tile i's overflow is known, so the correction can no longer
+    # ride on the scalar m_term; subtracting it from the accumulators instead
+    # would cost back exactly the adds this trick removes.  It goes on the fp8
+    # convert instead -- see SCALED_CVT below.
+    USE_BIAS_FOLD = True
+
     # ---- Appendix A constants ----
     SCHRAUDOLPH_2P23 = 1 << 23  # 8388608
     # C = 127*2^23 - 486411; the offset minimizes worst-case relative error of
@@ -180,6 +200,12 @@ def build_flash_attn_fp8_module(
         assert USE_SCHRAUDOLPH, "the cap is expressed in the Schraudolph domain"
     if USE_FROZEN_MAX:
         assert USE_WATCHDOG, "a frozen max without a watchdog can overflow fp8"
+    if USE_BIAS_FOLD:
+        # The seed *is* the Schraudolph bias, and it has to be loop-invariant to
+        # be seeded before the GEMM that determines it -- see the circularity
+        # note in Trick 4.
+        assert USE_SCHRAUDOLPH, "the seed is the Schraudolph bias"
+        assert USE_FROZEN_MAX, "an unfrozen m cannot be seeded before its own GEMM"
     # EXP2_SHIFT: scale all Schraudolph P up by 2^SHIFT.  A global P scale cancels
     # in the softmax normalization (O and L both scale), so this only repositions
     # P (range [2^-9,1]) within fp8 E4M3 -- a few bits up lifts small P out of the
@@ -219,6 +245,9 @@ def build_flash_attn_fp8_module(
         def _fmax(a, b):
             return arith.MaxNumFOp(_raw(a), _raw(b), fastmath=fm_fast).result
 
+        def _fmin(a, b):
+            return arith.MinNumFOp(_raw(a), _raw(b), fastmath=fm_fast).result
+
         def _wave_or(pred_i1):
             # OR a per-lane i1 predicate across all 64 lanes -> wave-uniform i1.
             # ballot is the whole reduction in one instruction: the v_cmp lands
@@ -246,13 +275,37 @@ def build_flash_attn_fp8_module(
             )
             return arith.trunci(T.i8, _raw(packed))
 
-        def _f32x4_to_fp8_word(f0, f1, f2, f3):
+        v2i16_ty = Vec.make_type(2, fx.Int16)
+        _zero_2xi16 = Vec.filled(2, 0, fx.Int16)
+
+        def _f32x4_to_fp8_word(f0, f1, f2, f3, rscale=None):
             # Pack 4 f32 -> one i32 (4 contiguous fp8 bytes [f0,f1,f2,f3]) using
             # two cvt_pk_fp8_f32: low word = (f0,f1), high word = (f2,f3).
             # Halves both the cvt count and the LDS store count vs per-byte.
-            w0 = rocdl.cvt_pk_fp8_f32(T.i32, _raw(f0), _raw(f1), fx.Int32(0), False)
-            w1 = rocdl.cvt_pk_fp8_f32(T.i32, _raw(f2), _raw(f3), _raw(w0), True)
-            return w1
+            #
+            # rscale (Trick 4 + Trick 5): the scaled form of the same convert
+            # divides by a runtime f32 before rounding, at no extra instruction.
+            # Verified on gfx950: dst == fp8(src / scale), and scale == 1.0 is
+            # bit-identical to the unscaled op -- so the watchdog's repair is
+            # free on the overwhelmingly common no-overflow path, which is what
+            # lets Trick 4 coexist with a frozen max whose bias is already baked
+            # into the GEMM seed and can no longer absorb a correction.
+            if const_expr(rscale is None):
+                w0 = rocdl.cvt_pk_fp8_f32(T.i32, _raw(f0), _raw(f1), fx.Int32(0), False)
+                w1 = rocdl.cvt_pk_fp8_f32(T.i32, _raw(f2), _raw(f3), _raw(w0), True)
+                return w1
+            lo = rocdl.cvt_scalef32_pk_fp8_f32(
+                v2i16_ty, _raw(_zero_2xi16), _raw(f0), _raw(f1), _raw(rscale), False
+            )
+            hi = rocdl.cvt_scalef32_pk_fp8_f32(
+                v2i16_ty, _raw(_zero_2xi16), _raw(f2), _raw(f3), _raw(rscale), False
+            )
+            lo32 = Vec(Vec(lo).bitcast(fx.Int32))[0]
+            hi32 = Vec(Vec(hi).bitcast(fx.Int32))[0]
+            return arith.ori(
+                _raw(arith.andi(_raw(lo32), _raw(fx.Int32(0xFFFF)))),
+                _raw(arith.shli(_raw(hi32), _raw(fx.Int32(16)))),
+            )
 
         mfma = Mfma32x32x64()
 
@@ -691,12 +744,20 @@ def build_flash_attn_fp8_module(
             raw = ArithValue(k_in_b).select(raw, zero_qpack.ir_value())
             return Vec(raw).bitcast(fx.Int32)
 
-        def do_qk(k_buf_off, preloaded_kw, v_off):
+        def do_qk(k_buf_off, preloaded_kw, v_off, seed=None):
             kw = [None] * 4
             vw_prime = [None] * PREFETCH_DEPTH
             for u in range_constexpr(PREFETCH_DEPTH):
                 kw[u] = preloaded_kw[u]
-            s_accs = [mfma.zero_value for _ in range_constexpr(N_KV_TILES)]
+            # Trick 4: seeding C with the bias makes the GEMM do the subtraction.
+            # One bias tile feeds all four blocks (the doc's complication 3): D
+            # and C need not alias, so the same value is simply the C operand of
+            # each block's first MFMA -- no copies, and it also replaces the 4x16
+            # accumulator clears the zero seed would have needed.
+            s_accs = [
+                (mfma.zero_value if const_expr(seed is None) else seed)
+                for _ in range_constexpr(N_KV_TILES)
+            ]
             for u in range_constexpr(QK_UNITS):
                 nt = u // K_STEPS
                 ks = u % K_STEPS
@@ -743,6 +804,45 @@ def build_flash_attn_fp8_module(
             )
             return _fmax(m_running, _fmax(local_max, peer_max))
 
+        def _bias_seed(m):
+            # Trick 4's accumulator seed: the Schraudolph bias C - m, which in
+            # this fragment layout is a per-lane scalar splatted over the lane's
+            # 16 slots (all one query row).  Recomputed per tile rather than
+            # carried: it is two scalar ops off a value already in the loop's
+            # carry, against 16 extra VGPRs of carry pressure.
+            return Vec.from_elements(
+                [_fadd(_fsub(c_zero_f, m), c_exp2_bias)], fx.Float32
+            ).broadcast_to(C_F32_PER_LANE)
+
+        def _watchdog_seeded(s_accs, m_frozen):
+            # Trick 5 against a folded bias.  Detection is unchanged in spirit
+            # but cheaper: S is already the pattern (the GEMM subtracted m), so
+            # the m_term add before the compare is gone too.
+            #
+            # The repair cannot move the bias any more -- tile i's seed was fixed
+            # before tile i's overflow was known -- so instead of lowering the
+            # pattern it divides P down on the fp8 convert, which takes a runtime
+            # scale operand for free.  Equivalent by construction: scaling P by
+            # 2^(-e/2^23) is what lowering every pattern by e would have done.
+            # m still rises by e so later tiles seed against the corrected
+            # reference (the doc's step 7, "recompute the cached bias from m",
+            # falls out of _bias_seed being recomputed per tile).
+            t = _lane_max(s_accs)
+            peer = fx.Float32(t).shuffle_xor(fx.Int32(32), fx.Int32(WARP_SIZE))
+            e = _fmax(_fsub(_fmax(t, peer), fx.Float32(SCHRAUDOLPH_CAP)), c_zero_f)
+            eu = _fmul(e, c_inv_2p23)
+            # cvt_scalef32 divides by its scale operand (verified on gfx950), so
+            # the reciprocal direction is the one that shrinks P.  e == 0 gives
+            # exactly 1.0, which the same probe showed is bit-identical to the
+            # unscaled convert -- the common path pays nothing at all.
+            rscale = rocdl.exp2(T.f32, _raw(eu))
+            corr = rocdl.exp2(T.f32, _raw(_fsub(c_zero_f, eu)))
+            if const_expr(USE_QK_SCALE_FOLD):
+                delta = e  # m is tracked in accumulator == pattern units
+            else:
+                delta = arith.divf(_raw(eu), _raw(scale_log2e))
+            return _fadd(_raw(m_frozen), _raw(delta)), corr, rscale
+
         def _watchdog(s_accs, m_term, m_frozen):
             # Trick 5, detection.  The Schraudolph pattern is aff = S + m_term
             # with m_term uniform across the tile, so max(aff) = max(S) + m_term
@@ -787,7 +887,7 @@ def build_flash_attn_fp8_module(
             corr = rocdl.exp2(T.f32, _raw(_fsub(c_zero_f, _fmul(e, c_inv_2p23))))
             return _fsub(m_term, e), _fadd(_raw(m_frozen), _raw(delta)), corr
 
-        def do_softmax(s_accs, m_running, set_prio=False, first_tile=True):
+        def do_softmax(s_accs, m_running, set_prio=False, first_tile=True, seeded=False):
             if const_expr(SOFTMAX_PRIO != 0 and set_prio):
                 rocdl.s_setprio(SOFTMAX_PRIO)
             # With Trick 1 the accumulator already carries A = scale*log2e*2^23,
@@ -842,7 +942,14 @@ def build_flash_attn_fp8_module(
                     sx_vec = Vec.from_elements([scale_x2p23], fx.Float32).broadcast_to(
                         C_F32_PER_LANE
                     )
-                if const_expr(frozen and USE_WATCHDOG):
+                rscale = None
+                if const_expr(seeded):
+                    # Trick 4: the GEMM already added (C - m), so S *is* the
+                    # pattern.  The affine collapses to nothing and the softmax
+                    # is down to max + convert.
+                    if const_expr(USE_WATCHDOG):
+                        m_new, corr, rscale = _watchdog_seeded(s_accs, m_new)
+                elif const_expr(frozen and USE_WATCHDOG):
                     # Runs before the affine so the repair can fold into the
                     # scalar m_term -- one f32 across the branch instead of four
                     # vec<16xf32>, and no rewrite of the accumulators.
@@ -852,14 +959,28 @@ def build_flash_attn_fp8_module(
                     C_F32_PER_LANE
                 )
                 zero_vec = Vec.filled(C_F32_PER_LANE, 0.0, fx.Float32)
+                cap_vec = Vec.filled(C_F32_PER_LANE, SCHRAUDOLPH_CAP, fx.Float32)
                 i32_vec_ty = Vec.make_type(C_F32_PER_LANE, fx.Int32)
                 f32_vec_ty = Vec.make_type(C_F32_PER_LANE, fx.Float32)
                 for nt in range_constexpr(N_KV_TILES):
-                    aff = (
-                        _fadd(Vec(s_accs[nt]), mt_vec)
-                        if const_expr(USE_QK_SCALE_FOLD)
-                        else _fadd(_fmul(Vec(s_accs[nt]), sx_vec), mt_vec)
-                    )
+                    if const_expr(seeded):
+                        # Trick 4 leaves the pattern in the accumulator, so the
+                        # watchdog's repair rides on the convert (rscale) and
+                        # cannot lower aff itself the way the unseeded path
+                        # lowers m_term.  But the bitcast below reinterprets the
+                        # *pattern* as f32: once aff reaches 0x7F800000 the
+                        # result is an Inf/NaN bit pattern, and rscale -- applied
+                        # after, at the convert -- can no longer rescue it.
+                        # So clamp here, exactly as the ASM's v_min_u32 does.
+                        # The ceiling is the cap itself: the watchdog has already
+                        # guaranteed 2^(-e/2^23) brings the true row max back to
+                        # it, so this only bites on the elements the repair was
+                        # going to squash anyway.
+                        aff = _fmin(Vec(s_accs[nt]), cap_vec)
+                    elif const_expr(USE_QK_SCALE_FOLD):
+                        aff = _fadd(Vec(s_accs[nt]), mt_vec)
+                    else:
+                        aff = _fadd(_fmul(Vec(s_accs[nt]), sx_vec), mt_vec)
                     biased = _fmax(aff, zero_vec)
                     ps_v = Vec(
                         arith.bitcast(
@@ -869,7 +990,8 @@ def build_flash_attn_fp8_module(
                     for rg in range_constexpr(n_groups):
                         p_words.append(
                             _f32x4_to_fp8_word(
-                                *[ps_v[rg * 4 + i] for i in range_constexpr(4)]
+                                *[ps_v[rg * 4 + i] for i in range_constexpr(4)],
+                                rscale=rscale,
                             )
                         )
             else:
@@ -1035,11 +1157,16 @@ def build_flash_attn_fp8_module(
                     preloaded_vw=vwp,
                     k_buf_off=k_buf_off,
                 )
-                sA, vwp_new = do_qk(k_buf_off, preloaded_kw=kw_prime, v_off=v_cur_off)
+                sA, vwp_new = do_qk(
+                    k_buf_off,
+                    preloaded_kw=kw_prime,
+                    v_off=v_cur_off,
+                    seed=(_bias_seed(m_r) if const_expr(USE_BIAS_FOLD) else None),
+                )
                 # PHASE 2 (softmax phase): softmax(i) | DMA V^{i+1}.
                 dma_v(v_next, next_kv)
                 m_new, corr_new, p_new, prowsum_new = do_softmax(
-                    sA, m_r, first_tile=False
+                    sA, m_r, first_tile=False, seeded=const_expr(USE_BIAS_FOLD)
                 )
                 rocdl.sched_barrier(0)
                 _wait_lgkmcnt()
@@ -1081,6 +1208,14 @@ def build_flash_attn_fp8_module(
                 m_frozen = (
                     _rowmax(sB, m_init) if const_expr(USE_FROZEN_MAX) else m_init
                 )
+                if const_expr(USE_BIAS_FOLD):
+                    # Tile 0's GEMM could not be seeded -- it is the GEMM that
+                    # decides m.  So apply the bias here instead, once, in the
+                    # prologue, and hand the loop an S in the same seeded form
+                    # every later tile produces.  Without this the first
+                    # iteration's softmax reads a raw S as if it were a pattern.
+                    bseed = _bias_seed(m_frozen)
+                    sB = [_fadd(Vec(x), bseed) for x in sB]
                 _wait_lgkmcnt()
                 _wait_vmcnt()
                 _gpu_barrier()
@@ -1104,7 +1239,10 @@ def build_flash_attn_fp8_module(
                 # G1 defers every softmax by one tile, so if the loop ran zero
                 # iterations this call *is* tile 0's -- hence "maybe".
                 _m_e, corrf, pf, prowsumf = do_softmax(
-                    [sce0, sce1, sce2, sce3], m_e, first_tile=False
+                    [sce0, sce1, sce2, sce3],
+                    m_e,
+                    first_tile=False,
+                    seeded=const_expr(USE_BIAS_FOLD),
                 )
                 _, k_buf_off_e, _, _, _ = _bufs(last_i * fx.Index(BLOCK_N))
                 o, l2, _ = apply_pv(
@@ -1148,7 +1286,10 @@ def build_flash_attn_fp8_module(
                 ) * fx.Index(LDS_V_TILE)
                 # PHASE 1 (mfma phase): softmax(i-1) | DMA K^{i+1}.
                 m_sm, corr_sm, p_sm, prowsum_sm = do_softmax(
-                    [ss0, ss1, ss2, ss3], m_r, first_tile=False
+                    [ss0, ss1, ss2, ss3],
+                    m_r,
+                    first_tile=False,
+                    seeded=const_expr(USE_BIAS_FOLD),
                 )
                 # PHASE 2 (softmax phase): deferred PV(i-1) + QK(i)->S.
                 oB, lB, kw_prime = apply_pv(
@@ -1162,7 +1303,14 @@ def build_flash_attn_fp8_module(
                     k_buf_off=k_buf_off,
                 )
                 rocdl.s_setprio(0)
-                sB, vwp_new = do_qk(k_buf_off, preloaded_kw=kw_prime, v_off=v_cur_off)
+                sB, vwp_new = do_qk(
+                    k_buf_off,
+                    preloaded_kw=kw_prime,
+                    v_off=v_cur_off,
+                    # m_sm, not m_r: if this tile's softmax just repaired an
+                    # overflow, the seed must carry the raised reference.
+                    seed=(_bias_seed(m_sm) if const_expr(USE_BIAS_FOLD) else None),
+                )
                 rocdl.sched_barrier(0)
                 _wait_lgkmcnt()
                 _wait_vmcnt()
