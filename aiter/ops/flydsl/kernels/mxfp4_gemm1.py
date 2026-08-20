@@ -846,7 +846,11 @@ def _gemm1_body(
         v = ((lane_div_16 * fx.Int32(16)) + lane_mod_16) * fx.Int32(4)
         K_C_HI = K_C // 16
         imm = (K_C - K_C_HI * 16) * (kBS_stride_k0_dw * 4)
-        for mw in range_constexpr(2):
+        # Bound by B_SCALE_REPS, not a hard 2: interleave+BN128 builds a single
+        # b_scale_s_base entry (mfma_cluster's scale_slot is J//2, and N_REPS==2
+        # there, so only slot 0 is ever read). A hard 2 indexed past the end and
+        # made every interleaved candidate die with IndexError at trace time.
+        for mw in range_constexpr(B_SCALE_REPS):
             s_off = b_scale_s_base[mw] if K_C_HI == 0 else b_scale_s_base_hi[mw]
             idx = (v + fx.Int32(imm)) // fx.Int32(4)
             r = fx.make_rmem_tensor(mem_1x1, fx.Int32)
