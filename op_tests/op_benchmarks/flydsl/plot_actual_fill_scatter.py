@@ -129,10 +129,7 @@ def main():
         if args.fill_bv == "selected":
             # What the heuristic actually delivers: the variant it PICKS sets
             # both the fill (x) and the speedup (y).
-            gate = "gk" if "gate=gk" in head else "g"
-            tag = _select_fused_variant(
-                gate=gate, H=H, N=N, V=V, is_varlen=(N > 1)
-            )
+            tag = _select_fused_variant(H=H, N=N, V=V)
             if tag is not None:
                 bv = _bv_of_variant(tag)
                 sp = _variant_speedup(r["impls"], args.mode, tag)

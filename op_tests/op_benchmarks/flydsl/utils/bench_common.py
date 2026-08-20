@@ -327,6 +327,19 @@ def print_result_table(row: dict) -> None:
         print(line)
 
 
+def _verify_ok(verify) -> bool:
+    """Is this impl's verification result good enough to be picked as "best"?
+
+    Anything that did not actually verify -- "N/A" when verification is off,
+    "REF" for the impl that defined the reference -- counts as eligible; only an
+    outright FAIL or an error while verifying disqualifies it. Without this the
+    summary happily recommends a kernel that the detail table marks as wrong.
+    """
+    if not verify:
+        return True
+    return not (verify.startswith("FAIL") or "ERROR" in verify)
+
+
 def write_bench_markdown(
     path: str,
     title: str,
@@ -377,6 +390,8 @@ def write_bench_markdown(
             for mode in modes_seen:
                 best_impl, best_t = None, math.inf
                 for impl, data in row.get("impls", {}).items():
+                    if not _verify_ok(data.get("verify")):
+                        continue
                     t = data.get("timing", {}).get(mode)
                     if hasattr(t, "median_us") and t.median_us < best_t:
                         best_t, best_impl = t.median_us, impl
