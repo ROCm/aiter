@@ -6,8 +6,6 @@
 
 from __future__ import annotations
 
-import os
-
 import torch
 
 from .qr_int4_ipc import UncachedIpcHeap
@@ -179,13 +177,13 @@ class QRInt4QuadFanout:
         )
 
     def compile(self, inp: torch.Tensor, out: torch.Tensor, stream=None) -> None:
-        """JIT every ST engine so ranks can barrier before the first wait."""
-        os.environ["COMPILE_ONLY"] = "1"
-        try:
-            for eng in self._by_st.values():
-                self._launch_eng(eng, inp, out, stream)
-        finally:
-            os.environ.pop("COMPILE_ONLY", None)
+        """Launch every ST engine so JIT finishes before the first wait.
+
+        All ranks must participate. Compile-only / cache warming belongs in
+        developer scripts, not this host or pytest.
+        """
+        for eng in self._by_st.values():
+            self._launch_eng(eng, inp, out, stream)
         self._compiled = True
 
     def close(self):

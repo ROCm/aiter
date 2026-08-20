@@ -214,7 +214,6 @@ def _spawn_tp8(
     env["PYTHONUNBUFFERED"] = "1"
     env.setdefault("FLYDSL_GPU_ARCH", "gfx942")
     env.pop("HIP_VISIBLE_DEVICES", None)
-    env.pop("COMPILE_ONLY", None)
     tokens = ",".join(str(t) for t, _ in pairs)
     hiddens = ",".join(str(h) for _, h in pairs)
     procs = []
