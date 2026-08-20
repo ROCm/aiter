@@ -818,7 +818,7 @@ def _row_to_kwargs(row):
     inter_dim = int(row["inter_dim"])
     # Tuned CSV rows do not carry gate mode explicitly. Infer the runtime mode
     # from the selected activation/weight dtype layout used by fused_moe.
-    gate_mode = _effective_gate_mode(aq_dtype, wq_dtype)
+    gate_mode = _effective_gate_mode(aq_dtype, wq_dtype, q_type)
     return {
         "dtype": _str2dtype(row["dtype"]),
         "token": int(row["token"]),
@@ -947,7 +947,7 @@ def _situv2_beta_kwargs(act_type):
     return {}
 
 
-def _effective_gate_mode(aq_dtype, wq_dtype):
+def _effective_gate_mode(aq_dtype, wq_dtype, q_type=None):
     # a16w4 (bf16 A x mxfp4 W) SiTUv2 is served by the ported FlyDSL kernel via
     # fused_moe_'s SEPARATED dispatch; keep it in SEPARATED (bf16 activation) so
     # the abf16_wfp4 rows exercise that kernel instead of downgrading to a8w4/fp8.
@@ -958,8 +958,13 @@ def _effective_gate_mode(aq_dtype, wq_dtype):
     # property (not a tuned-config key); request INTERLEAVE here for them.
     if aq_dtype == dtypes.fp8 and wq_dtype == dtypes.fp4x2:
         return GateMode.INTERLEAVE.value
-    # mxfp8 (a8w8) uses the gate-up interleave stage1 path as well.
-    if aq_dtype == dtypes.fp8 and wq_dtype == dtypes.fp8:
+    # Per-token FP8 W8A8 keeps gate and up in separate halves. MXFP8
+    # (per-1x32) uses the gate/up-interleaved stage1 path.
+    if (
+        aq_dtype == dtypes.fp8
+        and wq_dtype == dtypes.fp8
+        and q_type == aiter.QuantType.per_1x32
+    ):
         return GateMode.INTERLEAVE.value
     return GateMode.SEPARATED.value
 
@@ -1037,7 +1042,7 @@ def _iter_legacy_cases():
             E=args.expert,
             topk=args.topk,
             actType=act_type,
-            gateMode=_effective_gate_mode(aq_dtype, wq_dtype),
+            gateMode=_effective_gate_mode(aq_dtype, wq_dtype, quant_type),
             qType=quant_type,
             AQDType=aq_dtype,
             WQDType=wq_dtype,
@@ -1187,7 +1192,7 @@ def _iter_situv2_default_cases():
                 "E": args.expert,
                 "topk": args.topk,
                 "actType": aiter.ActivationType.Situv2,
-                "gateMode": _effective_gate_mode(aq_dtype, wq_dtype),
+                "gateMode": _effective_gate_mode(aq_dtype, wq_dtype, quant_type),
                 "qType": quant_type,
                 "AQDType": aq_dtype,
                 "WQDType": wq_dtype,

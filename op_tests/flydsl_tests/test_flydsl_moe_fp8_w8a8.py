@@ -31,7 +31,7 @@ def test_fp8_w8a8_registry_is_limited_to_validated_tiles():
     stage1 = get_flydsl_stage1_kernels_fp8_w8a8("bf16")
     stage2 = get_flydsl_stage2_kernels_fp8_w8a8("bf16")
 
-    assert len(stage1) == 9
+    assert len(stage1) == 20
     assert len(stage2) == 8
     assert all(params["k_batch"] == 1 for params in stage1.values())
     assert all(params["out_dtype"] == "bf16" for params in stage1.values())
@@ -69,13 +69,16 @@ def test_minimax_config_matches_aiter_token_buckets_and_registry():
         16384,
         32768,
     ]
-    assert tuned["token"].tolist() == expected_tokens
-    assert untuned["token"].tolist() == expected_tokens
+    for inter_dim in (384, 768):
+        tuned_shape = tuned[tuned["inter_dim"] == inter_dim]
+        untuned_shape = untuned[untuned["inter_dim"] == inter_dim]
+        assert tuned_shape["token"].tolist() == expected_tokens
+        assert untuned_shape["token"].tolist() == expected_tokens
 
     assert set(tuned["gfx"]) == {"gfx942"}
     assert set(tuned["cu_num"]) == {304}
     assert set(tuned["model_dim"]) == {6144}
-    assert set(tuned["inter_dim"]) == {768}
+    assert set(tuned["inter_dim"]) == {384, 768}
     assert set(tuned["expert"]) == {129}
     assert set(tuned["topk"]) == {5}
     assert set(tuned["q_type"]) == {"QuantType.per_Token"}
@@ -86,19 +89,21 @@ def test_minimax_config_matches_aiter_token_buckets_and_registry():
     for name in tuned["kernelName2"]:
         assert get_flydsl_kernel_params(name) is not None
 
-    # The measured 32K custom-image configuration requires independent sorting:
-    # stage 1 uses tile-M 96 while stage 2 uses tile-M 64. Do not replace stage 2
-    # with an unmeasured tile-M 96 kernel merely to share the first sort.
-    largest = tuned.iloc[-1]
-    assert largest["kernelName1"].endswith("t96x128x128")
-    assert largest["kernelName2"].endswith("t64x256x256_atomic")
+    # TP4 uses independent stage-2 sorting at 32K. TP8's selected stage-2
+    # tile-M is also independent from its stage-1 tile-M across the large-M tail.
+    largest_tp4 = tuned[tuned["inter_dim"] == 768].iloc[-1]
+    assert largest_tp4["kernelName1"].endswith("t96x128x128")
+    assert largest_tp4["kernelName2"].endswith("t64x256x256_atomic")
+    largest_tp8 = tuned[tuned["inter_dim"] == 384].iloc[-1]
+    assert largest_tp8["kernelName1"].endswith("t64x192x128")
+    assert largest_tp8["kernelName2"].endswith("t32x256x128_atomic")
 
 
 def test_minimax_config_produces_stage1_and_stage2_aot_jobs():
     from aiter.aot.flydsl.moe import parse_csv
 
     jobs = parse_csv(str(TUNED_CONFIG))
-    assert len(jobs) == 32
+    assert len(jobs) == 64
     assert {job["stage"] for job in jobs} == {1, 2}
     assert all(job["a_dtype"] == "fp8_w8a8" for job in jobs)
     assert all(job["b_dtype"] == "fp8_w8a8" for job in jobs)
@@ -117,6 +122,38 @@ def test_stage2_uses_independent_sort_for_measured_32k_tile():
 
     assert _stage2_sort_block_size(independent, stage1_block_size=96) == 64
     assert _stage2_sort_block_size(shared, stage1_block_size=96) == 96
+
+
+def test_minimax_tp8_dispatch_selects_measured_tiles():
+    from aiter import QuantType, dtypes
+    from aiter.fused_moe import get_2stage_cfgs
+    from aiter.ops.flydsl.moe_common import GateMode
+
+    tuned = pd.read_csv(TUNED_CONFIG)
+    tp8 = tuned[tuned["inter_dim"] == 384]
+    for _, row in tp8.iterrows():
+        metadata = get_2stage_cfgs(
+            int(row["token"]),
+            6144,
+            384,
+            129,
+            5,
+            dtypes.bf16,
+            dtypes.fp8,
+            dtypes.fp8,
+            QuantType.per_Token,
+            True,
+            getattr(__import__("aiter").ActivationType, "Swiglu"),
+            False,
+            0,
+            0,
+            True,
+            GateMode.SEPARATED.value,
+            opus_weights_shuffled=True,
+            swiglu_limit=7.0,
+        )
+        assert metadata.stage1.keywords["kernelName"] == row["kernelName1"]
+        assert metadata.stage2.keywords["kernelName"] == row["kernelName2"]
 
 
 @pytest.mark.parametrize("act", ["silu", "swiglu"])

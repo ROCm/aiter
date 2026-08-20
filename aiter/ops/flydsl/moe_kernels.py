@@ -583,15 +583,26 @@ def get_flydsl_stage1_kernels_fp8_w8a8(out_dtype: str) -> dict[str, dict]:
     """Return validated per-token activation / per-channel weight FP8 configs."""
     kernels = {}
     tiles = (
+        (16, 64, 128),
+        (16, 64, 256),
         (16, 64, 512),
+        (16, 128, 256),
         (16, 128, 512),
+        (16, 192, 256),
+        (16, 192, 512),
         (32, 128, 512),
+        (32, 192, 64),
+        (32, 192, 128),
         (32, 256, 64),
         (32, 256, 128),
+        (64, 192, 128),
         (64, 256, 256),
         (96, 128, 128),
+        (96, 192, 256),
         (96, 256, 64),
+        (96, 384, 64),
         (128, 64, 128),
+        (128, 128, 64),
     )
     for tm, tn, tk in tiles:
         name = flydsl_kernel_name(1, "fp8", "fp8_w8a8", out_dtype, tm, tn, tk)
