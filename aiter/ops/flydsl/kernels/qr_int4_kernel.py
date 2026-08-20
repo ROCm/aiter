@@ -674,6 +674,8 @@ def make_qr_int4_kernel(*, world_size: int = WORLD, super_tile: int = 1):
                 _store_tile_atoms(tile, gathered)
 
                 color = color + one
+                if color == 0:  # 0 is unset sentinel
+                    color = one
         else:
             st_i = fx.Int32(super_tile)
             for i in range(zero, n_block_tiles, st_i):
@@ -709,6 +711,8 @@ def make_qr_int4_kernel(*, world_size: int = WORLD, super_tile: int = 1):
                     _store_tile_atoms(tile, gathered)
 
                 color = color + one
+                if color == 0:  # 0 is unset sentinel
+                    color = one
         if tid == 0:
             _store_color(color)
         gpu.barrier()

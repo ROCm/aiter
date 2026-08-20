@@ -4,10 +4,11 @@
 """Runtime correctness for FlyDSL INT4 QuickReduce (``QRInt4``).
 
 Pytest collects validity cases only (no timing). ``python3`` this file
-runs an aiter-op-test ``@benchmark`` / markdown sweep. The oracle is an
-untimed fp32 NCCL all-reduce of the same per-rank inputs. INT4 is lossy,
-so the gate is SQNR vs that oracle, not bit-identity or tight
-``checkAllclose``.
+runs an aiter-op-test ``@benchmark`` / markdown sweep. Each rank times
+``fly.allreduce`` with default ``run_perftest`` after ``compile()``. The
+oracle is an untimed fp32 NCCL all-reduce of the same per-rank inputs.
+INT4 is lossy, so the gate is SQNR vs that oracle, not bit-identity or
+tight ``checkAllclose``.
 
 5120 is a measured calibration width, not an ABI requirement. The kernel
 is gfx942 TP8 only; other archs skip.
@@ -35,8 +36,9 @@ import torch
 
 import aiter
 from aiter import dtypes
+from aiter.dist.utils import get_distributed_init_method, get_ip, get_open_port
 from aiter.jit.utils.chip_info import get_gfx_runtime
-from aiter.test_common import benchmark
+from aiter.test_common import benchmark, run_perftest
 
 pytest.importorskip("flydsl")
 
@@ -159,23 +161,15 @@ def _run_rank(args) -> None:
             "us": None,
         }
         if args.time_it:
-            warmup, iters, reps = 2, 20, 3
-            for _ in range(warmup):
-                fly.allreduce(inp, out)
+            dist.barrier(group=group)
             torch.cuda.synchronize()
-            start = torch.cuda.Event(enable_timing=True)
-            end = torch.cuda.Event(enable_timing=True)
-            best = float("inf")
-            for _ in range(reps):
-                dist.barrier(group=group)
-                torch.cuda.synchronize()
-                start.record()
-                for _ in range(iters):
-                    fly.allreduce(inp, out)
-                end.record()
-                end.synchronize()
-                best = min(best, start.elapsed_time(end) * 1e3 / iters)
-            row["us"] = best
+
+            def _allreduce(eng=fly, src=inp, dst=out):
+                eng.allreduce(src, dst)
+                return dst
+
+            _, us = run_perftest(_allreduce)
+            row["us"] = us
         rows.append(row)
         del inp, out, ref, got
         torch.cuda.empty_cache()
@@ -196,12 +190,13 @@ def _spawn_tp8(
     time_it: bool,
     super_tile: int = SUPER_TILE,
 ) -> list[dict]:
+    # HIP QR/fused-AR use multiprocessing.Pool from ``python3`` __main__.
+    # This file is also collected by pytest, and FlyDSL JIT needs a fresh
+    # interpreter per rank, so ranks are Popen of this file with --rank
+    # (not Pool / torchrun). Init method matches the HIP QR helpers.
     if torch.cuda.device_count() < TP:
-        pytest.skip(
-            f"QRInt4 needs {TP} GPUs, have {torch.cuda.device_count()}"
-        )
-    port = 29600 + (os.getpid() % 1000)
-    init_method = f"tcp://127.0.0.1:{port}"
+        pytest.skip(f"QRInt4 needs {TP} GPUs, have {torch.cuda.device_count()}")
+    init_method = get_distributed_init_method(get_ip(), get_open_port())
     out_path = os.path.join(tempfile.mkdtemp(prefix="flydsl_qr_int4_"), "rank0.json")
     env = dict(os.environ)
     env["PYTHONPATH"] = (
