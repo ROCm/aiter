@@ -334,6 +334,31 @@ def _build_attn_res(
                 delta_row = fx.slice(delta_buf, (token, None))
                 delta_div = fx.logical_divide(delta_row, vector_layout)
 
+            def issue_block_source(source_idx):
+                block_row = fx.slice(blocks_buf, (token, source_idx, None))
+                block_div = fx.logical_divide(block_row, vector_layout)
+                handles = []
+                for tile in range_constexpr(tiles_per_thread):
+                    handles.append(
+                        issue_bf16_vec(block_div, local_tid + tile * row_threads)
+                    )
+                return handles
+
+            def load_issued_source(handles):
+                source_local = []
+                for tile in range_constexpr(tiles_per_thread):
+                    source_local.append(fx.memref_load_vec(handles[tile]))
+                return source_local
+
+            # Prime `prefetch_in_flight` extra block sources above the
+            # prefix/delta/snapshot prologue so their latency overlaps it.
+            # Prefix is already resident. `block_write_idx == num_blocks` is a
+            # build-time invariant, so these sources are disjoint from the
+            # snapshot slot and the kernel never reads an invalid block slot.
+            in_flight = []
+            for source in range_constexpr(min(prefetch_in_flight, num_blocks)):
+                in_flight.append(issue_block_source(source))
+
             # q = gamma * w is invariant over all depth sources.  Keep q and the
             # live prefix in registers so the final source requires no global load.
             q_local = []
@@ -416,28 +441,6 @@ def _build_attn_res(
                 return update_softmax(
                     values_local, sumsq, dot, old_max, old_denominator, old_mixed
                 )
-
-            def issue_block_source(source_idx):
-                block_row = fx.slice(blocks_buf, (token, source_idx, None))
-                block_div = fx.logical_divide(block_row, vector_layout)
-                handles = []
-                for tile in range_constexpr(tiles_per_thread):
-                    handles.append(
-                        issue_bf16_vec(block_div, local_tid + tile * row_threads)
-                    )
-                return handles
-
-            def load_issued_source(handles):
-                source_local = []
-                for tile in range_constexpr(tiles_per_thread):
-                    source_local.append(fx.memref_load_vec(handles[tile]))
-                return source_local
-
-            # Prime `prefetch_in_flight` extra block sources. Prefix is already
-            # resident. The kernel never reads an invalid block slot.
-            in_flight = []
-            for source in range_constexpr(min(prefetch_in_flight, num_blocks)):
-                in_flight.append(issue_block_source(source))
 
             if const_expr(red_slots == 1 or num_sources == 1):
                 for source in range_constexpr(num_blocks):
