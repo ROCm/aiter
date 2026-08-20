@@ -21,7 +21,6 @@ elide the two HBM drains that only the separate K6 kernel consumes.
 """
 
 import math
-from dataclasses import dataclass
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -35,134 +34,58 @@ from .k5_variants import _bv_of_variant, _legal_bv_candidates, _variant_tag
 _LOG2E = math.log2(math.e)  # 1.4426950408889634
 
 
-# -- gfx942 tuned variant table ------------------------------------------
-# Measured-best K5 variant per shape signature, from a gfx942 sweep. Consulted
-# before the host wrapper's grid-fill heuristic, which cannot emit wave-widened
-# tags and mispicks BV for many shapes; a table miss falls back to it.
-#
-# Key = (gate, H, _n_bucket(N), is_varlen). gate x H x N together decide the
-# tile -- larger tiles win as H*N (i.e. grid fill) grows. T_flat is NOT in the
-# key: it never changed the pick. Ties are broken by min MEAN loss across the
-# shapes sharing a signature, so the adversarial varlen "skew" distribution
-# (invisible here -- only cu_seqlens reaches dispatch) is allowed to degrade in
-# favour of the common equal/ragged/bimodal batches.
-
-
-@dataclass(frozen=True)
-class _K5TunedEntry:
-    gate: str  # "g" (scalar) | "gk" (per-channel)
-    H: int
-    n_bucket: int  # output of _n_bucket(N): 1 | 2 | 4 | 8
-    is_varlen: bool
-    variant: str  # registered K5 variant tag, e.g. "bv64w8"
-
-
-# is_varlen is exactly (N > 1) -- the host builds cu_seqlens for every N>1 batch
-# -- so it is redundant with n_bucket, but kept explicit to mirror the selection
-# signature the wrapper passes in.
-_K5_TUNED_ROWS_GFX942: tuple[_K5TunedEntry, ...] = (
-    _K5TunedEntry("gk", 12, 1, False, "bv16"),
-    _K5TunedEntry("gk", 12, 2, True, "bv16"),
-    _K5TunedEntry("gk", 12, 4, True, "bv32"),
-    _K5TunedEntry("gk", 12, 8, True, "bv64w8"),
-    _K5TunedEntry("gk", 24, 1, False, "bv16"),
-    _K5TunedEntry("gk", 24, 2, True, "bv32"),
-    _K5TunedEntry("gk", 24, 4, True, "bv64w8"),
-    _K5TunedEntry("gk", 24, 8, True, "bv64w8"),
-    _K5TunedEntry("gk", 48, 1, False, "bv32"),
-    _K5TunedEntry("gk", 48, 2, True, "bv64w8"),
-    _K5TunedEntry("gk", 48, 4, True, "bv64w8"),
-    _K5TunedEntry("gk", 48, 8, True, "bv64w8"),
-    _K5TunedEntry("gk", 96, 1, False, "bv64w8"),
-    _K5TunedEntry("gk", 96, 2, True, "bv64w8"),
-    _K5TunedEntry("gk", 96, 4, True, "bv64w8"),
-    _K5TunedEntry("gk", 96, 8, True, "bv64w8"),
-    _K5TunedEntry("g", 4, 1, False, "bv16"),
-    _K5TunedEntry("g", 4, 2, True, "bv16"),
-    _K5TunedEntry("g", 4, 4, True, "bv16"),
-    _K5TunedEntry("g", 4, 8, True, "bv16"),
-    _K5TunedEntry("g", 8, 1, False, "bv16"),
-    _K5TunedEntry("g", 8, 2, True, "bv16"),
-    _K5TunedEntry("g", 8, 4, True, "bv16"),
-    _K5TunedEntry("g", 8, 8, True, "bv32"),
-    _K5TunedEntry("g", 16, 1, False, "bv16"),
-    _K5TunedEntry("g", 16, 2, True, "bv16"),
-    _K5TunedEntry("g", 16, 4, True, "bv32"),
-    _K5TunedEntry("g", 16, 8, True, "bv64w8"),
-    _K5TunedEntry("g", 32, 1, False, "bv16"),
-    _K5TunedEntry("g", 32, 2, True, "bv32"),
-    _K5TunedEntry("g", 32, 4, True, "bv64w8"),
-    _K5TunedEntry("g", 32, 8, True, "bv64w8"),
-)
-
-_K5_TUNED_TABLE_GFX942: dict[tuple, str] = {
-    (e.gate, e.H, e.n_bucket, e.is_varlen): e.variant for e in _K5_TUNED_ROWS_GFX942
-}
-
-
-def _n_bucket(N: int) -> int:
-    """Bucket the sequence count into the measured grid-size regimes.
-
-    {1: N==1, 2: N==2, 4: 3<=N<=4, 8: N>=5}. N=2 is its own bucket because
-    halving the grid drops the optimal tile one regime for mid-H shapes. N=3 is
-    unmeasured and folds into bucket 4 (the larger-tile side); the >=5 bucket is
-    flat.
-    """
-    if N <= 1:
-        return 1
-    if N == 2:
-        return 2
-    if N <= 4:
-        return 4
-    return 8
-
-
-def select_variant(
-    *, gate: str, H: int, N: int, V: int, is_varlen: bool
-) -> str | None:
-    """gfx942 measured-best K5 variant tag for this shape, or None on a miss.
-
-    Returns a ``K5_VARIANTS`` tag (e.g. ``"bv64w8"``) when the
-    ``(gate, H, _n_bucket(N), is_varlen)`` signature is tabled and its BV is
-    legal for ``V``; otherwise None, and the caller falls back to its grid-fill
-    heuristic.
-    """
-    tag = _K5_TUNED_TABLE_GFX942.get((gate, H, _n_bucket(N), is_varlen))
-    if tag is None:
-        return None
-    if _bv_of_variant(tag) not in _legal_bv_candidates(V):
-        return None
-    return tag
-
-
 # --------------------------------------------------------------------------- #
-# Fused K5+K6 variant selection (gfx942)
+# gfx942 variant selection -- one H*N rule for both the K5-only and the fused
+# K5+K6 kernel.
 #
-# The measured-best fused BV/wave tile is a function of the grid-size product ``H*N``.
-# Larger tiles win as there is more parallel work to fill the device (measured empirically).
-#   H*N <=32 -> bv16
-#   H*N <=64 -> bv32
-#   H*N >64 -> bv64w8
+# The measured-best BV/wave tile is a function of the grid-size product ``H*N``:
+# larger tiles win as there is more parallel work to fill the device. 
+#
+#     H*N        K5 winner     fused K5+K6 winner
+#     4..32      bv16          bv16
+#     48..72     bv32          bv32
+#     96..768    bv64w8        bv64w8
+#
+# Caveat: every sweep shape has V=128. ``H*N`` is a proxy for the CTA count
+# ``H*N*ceil(V/BV)``; a future V!=128 workload may need the fill formulation.
 # --------------------------------------------------------------------------- #
-_FUSED_HN_BV32 = 32  # H*N above this prefers bv32 over bv16
-_FUSED_HN_BV64W8 = 64  # H*N above this prefers bv64w8 (wave-widened BV=64)
+_HN_BV32 = 32  # H*N above this prefers bv32 over bv16
+_HN_BV64W8 = 80  # H*N above this prefers bv64w8 (wave-widened BV=64)
 
 
-def select_fused_variant(
-    *, gate: str, H: int, N: int, V: int, is_varlen: bool
-) -> str | None:
-    """gfx942 best fused K5+K6 variant tag from the ``H*N`` grid-size rule.
-    """
+def _hn_variant(*, H: int, N: int, V: int) -> str | None:
+    """The ``H*N`` tile rule, or None when its BV is illegal for ``V``."""
     hn = H * max(1, N)
-    if hn <= _FUSED_HN_BV32:
+    if hn <= _HN_BV32:
         tag = "bv16"
-    elif hn <= _FUSED_HN_BV64W8:
+    elif hn <= _HN_BV64W8:
         tag = "bv32"
     else:
         tag = "bv64w8"
     if _bv_of_variant(tag) not in _legal_bv_candidates(V):
         return None
     return tag
+
+
+def select_variant(
+    *, gate: str, H: int, N: int, V: int, is_varlen: bool
+) -> str | None:
+    """gfx942 best K5 variant tag from the ``H*N`` grid-size rule.
+
+    ``gate`` and ``is_varlen`` are accepted but do not affect the pick. 
+    Returns None only when the rule's BV is illegal for ``V``, and the caller 
+    falls back to its cross-arch grid-fill heuristic.
+    """
+    del gate, is_varlen
+    return _hn_variant(H=H, N=N, V=V)
+
+
+def select_fused_variant(
+    *, gate: str, H: int, N: int, V: int, is_varlen: bool
+) -> str | None:
+    """gfx942 best fused K5+K6 variant tag from the ``H*N`` grid-size rule."""
+    del gate, is_varlen
+    return _hn_variant(H=H, N=N, V=V)
 
 
 def _make_fast_exp(g_is_log2_scaled: bool):

@@ -123,14 +123,12 @@ _K5_VARIANT_ENV = "FLYDSL_GDN_K5_VARIANT"
 def _auto_variant(*, gate: str | None = None, **kw) -> str:
     """The shape-adaptive choice, as a variant tag.
 
-    Arch dispatcher: on gfx942 with a known gate rank, defer to the gfx942 kernel
-    module's measured tuned table (``select_variant``) -- the only path that emits
-    wave-widened tags and corrects the scalar-gate BV bias. On a table miss (or any
-    other arch, or ``gate`` unknown) fall back to ``_heuristic_bv``, the cross-arch
-    grid-fill heuristic. ``gate`` defaults to None so callers that do not supply it
-    transparently keep the historical behaviour.
+    Arch dispatcher: on gfx942, defer to the gfx942 kernel module's measured
+    ``H*N`` rule (``select_variant``). On any other arch (or
+    when the rule's BV is illegal for this V) fall back to ``_heuristic_bv``,
+    the cross-arch grid-fill heuristic. 
     """
-    if _ARCH == "gfx942" and gate is not None:
+    if _ARCH == "gfx942":
         tuned = _gfx942_select_variant(
             gate=gate, H=kw["H"], N=kw["N"], V=kw["V"], is_varlen=kw["is_varlen"]
         )
@@ -739,21 +737,17 @@ def should_use_fused_gfx942(
 
         fill = ceil(V / BV_run) * N * H / CU_count  >=  _FUSED_MIN_FILL
 
-    where ``BV_run`` is the BV the fused launcher will actually run for this
-    shape. ``gate``/``is_varlen`` are needed to resolve ``BV_run`` from the 
-    tuned table; without them BV=64 (conservative low-fill estimate) is assumed. 
+    where ``BV_run`` comes from ``_fused_bv_for_shape``. ``gate`` and
+    ``is_varlen`` are accepted for signature compatibility but do not affect ``BV_run`.
     Off-arch always returns False (the fused kernel is tested only on gfx942).
     """
     if _ARCH != "gfx942":
         return False
-    if gate is not None and is_varlen is not None:
-        # Hg/T_flat are unused by the fused BV heuristic; pass placeholders.
-        bv_run, _ = _fused_bv_for_shape(
-            H=H, Hg=H, V=V, T_flat=0, N=N, is_varlen=is_varlen,
-            gate=gate, variant=None,
-        )
-    else:
-        bv_run = 64
+    # Hg/T_flat/gate/is_varlen are unused by the fused BV rule; pass placeholders.
+    bv_run, _ = _fused_bv_for_shape(
+        H=H, Hg=H, V=V, T_flat=0, N=N, is_varlen=bool(is_varlen),
+        gate=gate, variant=None,
+    )
     fill = _grid_ctas(H=H, V=V, N=N, BV=bv_run) / max(_device_cu_count(), 1)
     return fill >= _FUSED_MIN_FILL
 
