@@ -5,6 +5,7 @@ import pytest
 import torch
 
 from aiter.ops.triton.fusions.attn_res import attn_res_fwd, attn_res_gate
+from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
 
 # (dtype -> (atol, rtol)) for comparing against the fp32 torch reference.
 _TOL = {
@@ -405,6 +406,138 @@ def test_attn_res_gate_close_block_composes_with_add2_and_onorm(B, dtype):
     torch.testing.assert_close(prefix_out.float(), prefix_ref.float(), atol=0, rtol=0)
     expected_block = torch.cat([block_residual, prefix_out.unsqueeze(-2)], dim=-2)
     torch.testing.assert_close(block_out, expected_block, atol=0, rtol=0)
+
+
+def _dequant_per_token(y_fp8, y_scale):
+    return y_fp8.float() * y_scale.float()
+
+
+def run_torch_per_token_quant(x, fp8_dtype):
+    """Reference for the fused per-token FP8 quant, in aiter's convention
+    (``_dynamic_per_token_quant_fp8_i8_kernel``): one fp32 scale per row, taken
+    as ``amax / finfo(dtype).max``, applied as a reciprocal multiply."""
+    scale = x.float().abs().amax(-1, keepdim=True) / torch.finfo(fp8_dtype).max
+    return (x.float() * (1.0 / scale)).to(fp8_dtype), scale
+
+
+@pytest.mark.parametrize("B", [1, 3, 7])
+@pytest.mark.parametrize("with_add", [False, True])
+@pytest.mark.parametrize("close_block", [False, True])
+def test_attn_res_gate_out_quant(B, with_add, close_block):
+    """out_quant_dtype folds the per-token FP8 quant of the output RMSNorm into
+    the kernel; dequantizing must recover the BF16 result, and the block-banking
+    cat must stay unquantized and byte-identical to torch.cat."""
+    N, D = 128, 512
+    eps, dtype = 1e-6, torch.bfloat16
+    fp8_dtype = get_fp8_e4m3_dtype()
+    prefix, block_residual, score_weight, add_hidden, _ = generate_attn_res_gate_inputs(
+        N, D, B, dtype, with_add
+    )
+    output_rms_weight = torch.randn(D, dtype=dtype, device="cuda")
+
+    out_bf16 = attn_res_gate(
+        prefix,
+        block_residual,
+        score_weight,
+        eps,
+        add_hidden,
+        output_rms_weight=output_rms_weight,
+        close_block=close_block,
+    )
+    out_quant = attn_res_gate(
+        prefix,
+        block_residual,
+        score_weight,
+        eps,
+        add_hidden,
+        output_rms_weight=output_rms_weight,
+        close_block=close_block,
+        out_quant_dtype=fp8_dtype,
+    )
+    y_bf16, prefix_bf16 = out_bf16[0], out_bf16[1]
+    (y_fp8, y_scale), prefix_quant = out_quant[0], out_quant[1]
+
+    assert y_fp8.dtype == fp8_dtype
+    assert y_fp8.shape == (N, D)
+    assert y_scale.shape == (N, 1) and y_scale.dtype == torch.float32
+
+    # e4m3 keeps 3 mantissa bits, so a value survives to one relative step of
+    # 2^-3, plus a floor of one scale unit for the fp8-subnormal elements.
+    ref = y_bf16.float()
+    err = (_dequant_per_token(y_fp8, y_scale) - ref).abs()
+    assert (err <= ref.abs() * 2**-3 + y_scale.float()).all()
+    # The scale is the row amax, which pins the convention (not just closeness).
+    torch.testing.assert_close(
+        y_scale, ref.abs().amax(-1, keepdim=True) / torch.finfo(fp8_dtype).max,
+        atol=0.0, rtol=2e-2,
+    )
+    torch.testing.assert_close(
+        prefix_quant.float(), prefix_bf16.float(), atol=0, rtol=0
+    )
+
+    if close_block:
+        block_out = out_quant[2]
+        assert block_out.dtype == dtype
+        expected = torch.cat([block_residual, prefix_quant.unsqueeze(-2)], dim=-2)
+        torch.testing.assert_close(block_out, expected, atol=0, rtol=0)
+
+
+def test_attn_res_gate_out_quant_matches_unfused_quant():
+    """The fused quant is bit-identical to gate() followed by a separate
+    per-token FP8 quant of its output.
+
+    Run in fp32 so the unfused leg's intermediate is the kernel's own fp32
+    result rather than a bf16 rounding of it; the two then have to agree
+    exactly, which pins scale derivation and rounding, not just closeness.
+    """
+    N, D, B = 64, 512, 3
+    eps, dtype = 1e-6, torch.float32
+    fp8_dtype = get_fp8_e4m3_dtype()
+    prefix, block_residual, score_weight, _, _ = generate_attn_res_gate_inputs(
+        N, D, B, dtype, with_add=False
+    )
+    output_rms_weight = torch.randn(D, dtype=dtype, device="cuda")
+
+    y_fp32, _ = attn_res_gate(
+        prefix,
+        block_residual,
+        score_weight,
+        eps,
+        output_rms_weight=output_rms_weight,
+    )
+    (y_fp8, y_scale), _ = attn_res_gate(
+        prefix,
+        block_residual,
+        score_weight,
+        eps,
+        output_rms_weight=output_rms_weight,
+        out_quant_dtype=fp8_dtype,
+    )
+
+    _qx, scale = run_torch_per_token_quant(y_fp32, fp8_dtype)
+
+    # The scale agrees to within one fp32 ulp rather than bit-exactly: Triton
+    # lowers the fp32 divide to a reciprocal plus refinement on AMD.
+    torch.testing.assert_close(y_scale, scale, atol=0.0, rtol=1e-6)
+    # Quantizing with the kernel's own scale takes that divide out of the
+    # comparison, leaving the rounding itself, which must match exactly.
+    qx = (y_fp32.float() * (1.0 / y_scale)).to(fp8_dtype)
+    torch.testing.assert_close(y_fp8.float(), qx.float(), atol=0, rtol=0)
+
+
+def test_attn_res_gate_out_quant_requires_output_rms_weight():
+    """Quantizing without an output RMSNorm has no defined input, so it's rejected."""
+    prefix, block_residual, score_weight, _, _ = generate_attn_res_gate_inputs(
+        32, 256, 2, torch.bfloat16, with_add=False
+    )
+    with pytest.raises(ValueError, match="out_quant_dtype requires output_rms_weight"):
+        attn_res_gate(
+            prefix,
+            block_residual,
+            score_weight,
+            1e-6,
+            out_quant_dtype=get_fp8_e4m3_dtype(),
+        )
 
 
 def test_attn_res_sequence_requires_d_multiple_of_16():

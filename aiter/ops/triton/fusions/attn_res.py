@@ -32,7 +32,9 @@ separate ``prefix`` row, and the caller's ``prefix += hidden [+ hidden2]`` add c
 be folded into the kernel) -- this mirrors ATOM's ``apply_attn_res``, including its
 two-addend fold (``add_hidden``/``add_hidden2``, for an MoE layer's routed and
 shared expert outputs) and its independently-epsilon'd output RMSNorm
-(``output_rms_eps``, distinct from the per-candidate ``eps``).
+(``output_rms_eps``, distinct from the per-candidate ``eps``). That output
+RMSNorm can also emit a per-token FP8 activation directly (``out_quant_dtype``),
+which is what lets several consumers of the same normed row share one quant.
 """
 
 import logging
@@ -46,6 +48,7 @@ from aiter.ops.triton._triton_kernels.fusions.attn_res import (
     attnres_fwd_kernel,
 )
 from aiter.ops.triton.utils.logger import AiterTritonLogger
+from aiter.ops.triton.utils.types import get_dtype_max
 
 _LOGGER = AiterTritonLogger()
 
@@ -248,6 +251,7 @@ def _run_sequence(q_flat, residuals, w_flat, ow_flat, rms_eps, scale, has_onorm)
         add_hidden2=None,
         prefix_out=None,
         block_out=None,
+        o_scale=None,
         N=N,
         L=L,
         stride_res_n=0,
@@ -270,6 +274,8 @@ def _run_sequence(q_flat, residuals, w_flat, ow_flat, rms_eps, scale, has_onorm)
         WRITE_PREF=False,
         WRITE_BLOCK_CAT=False,
         HAS_W=True,
+        QUANT_FP8=False,
+        FP8_MAX=1.0,
         **_launch_tune_kwargs(num_warps, num_stages, L2),
     )
     return o.view(output_shape)
@@ -313,6 +319,7 @@ def _run_packed(q_flat, residuals, w_flat, ow_flat, rms_eps, scale, has_onorm):
         add_hidden2=None,
         prefix_out=None,
         block_out=None,
+        o_scale=None,
         N=N,
         L=L,
         stride_res_n=packed.stride(0),
@@ -335,6 +342,8 @@ def _run_packed(q_flat, residuals, w_flat, ow_flat, rms_eps, scale, has_onorm):
         WRITE_PREF=False,
         WRITE_BLOCK_CAT=False,
         HAS_W=True,
+        QUANT_FP8=False,
+        FP8_MAX=1.0,
         **_launch_tune_kwargs(num_warps, num_stages, bl),
     )
     return o.view(output_shape)
@@ -352,8 +361,7 @@ def attn_res_gate(
     output_rms_eps: float = 1e-6,
     scale: float = 1.0,
     close_block: bool = False,
-) -> (
-    tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+    out_quant_dtype: torch.dtype | None = None,
 ):
     """Inference-shaped attention-residual gate over ``B + 1`` candidates.
 
@@ -383,6 +391,15 @@ def attn_res_gate(
       this same kernel pass (mirrors ATOM's ``AttnRes.maybe_close_block``
       block-banking step) instead of a separate ``torch.cat`` that would
       re-read ``block_residual`` from HBM. See ``block_out`` below.
+    - out_quant_dtype: optional FP8 dtype; folds the per-token activation quant
+      of the output RMSNorm result into this same kernel, so ``y`` comes back as
+      an ``(fp8, scale)`` pair a GEMM can consume directly instead of a BF16
+      tensor that each consumer quantizes for itself. Requires
+      ``output_rms_weight`` (the quant input is that norm's result). The scale is
+      ``[.., 1]`` fp32, one per token, derived as ``amax / finfo(dtype).max`` --
+      the same convention as aiter's standalone ``dynamic_per_token_quant``.
+      ``block_out`` stays unquantized regardless: those rows return as scoring
+      candidates, which need the unquantized values.
 
     Returns:
     - ``close_block=False`` (default): ``(y, prefix_out)``, unchanged for
@@ -391,6 +408,8 @@ def attn_res_gate(
     - ``close_block=True``: ``(y, prefix_out, block_out)`` where ``block_out``
       is ``cat([block_residual, prefix_out.unsqueeze(-2)], dim=-2)``,
       ``[.., B + 1, D]``.
+    - ``out_quant_dtype`` set: ``y`` above becomes the tuple
+      ``(y_fp8, y_scale)``; the rest of the contract is unchanged.
     """
     if not prefix.is_cuda:
         raise ValueError("Triton attn_res requires CUDA/ROCm tensors")
@@ -401,6 +420,8 @@ def attn_res_gate(
         )
     if add_hidden2 is not None and add_hidden is None:
         raise ValueError("add_hidden2 requires add_hidden")
+    if out_quant_dtype is not None and output_rms_weight is None:
+        raise ValueError("out_quant_dtype requires output_rms_weight")
 
     if _LOGGER.get_logger().isEnabledFor(logging.INFO):
         _LOGGER.info(
@@ -426,7 +447,11 @@ def attn_res_gate(
     has_onorm = output_rms_weight is not None
     ow = _fast_flatten1d(output_rms_weight) if has_onorm else sw
 
-    y = torch.empty((N, D), device=pf.device, dtype=pf.dtype)
+    quant = out_quant_dtype is not None
+    y = torch.empty((N, D), device=pf.device, dtype=out_quant_dtype or pf.dtype)
+    y_scale = (
+        torch.empty((N, 1), device=pf.device, dtype=torch.float32) if quant else None
+    )
     do_add = add_hidden is not None
     do_add2 = add_hidden2 is not None
     if do_add:
@@ -466,6 +491,7 @@ def attn_res_gate(
         add_hidden2=hs2,
         prefix_out=prefix_out,
         block_out=bo,
+        o_scale=y_scale,
         N=N,
         L=L,
         stride_res_n=br.stride(0),
@@ -488,9 +514,11 @@ def attn_res_gate(
         WRITE_PREF=do_add,
         WRITE_BLOCK_CAT=close_block,
         HAS_W=False,
+        QUANT_FP8=quant,
+        FP8_MAX=get_dtype_max(out_quant_dtype) if quant else 1.0,
         **_launch_tune_kwargs(num_warps, num_stages, bl),
     )
-    y_out = y.view(output_shape)
+    y_out = (y.view(output_shape), y_scale) if quant else y.view(output_shape)
     prefix_result = prefix_out.view(output_shape) if do_add else prefix
     if not close_block:
         return y_out, prefix_result

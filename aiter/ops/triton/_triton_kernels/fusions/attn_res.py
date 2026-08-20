@@ -36,6 +36,7 @@ def attnres_fwd_kernel(
     add_hidden2,
     prefix_out,
     block_out,
+    o_scale,
     N,
     L,
     stride_res_n,
@@ -59,6 +60,8 @@ def attnres_fwd_kernel(
     WRITE_PREF: tl.constexpr,
     WRITE_BLOCK_CAT: tl.constexpr,
     HAS_W: tl.constexpr,
+    QUANT_FP8: tl.constexpr,
+    FP8_MAX: tl.constexpr,
 ):
     """AttnRes forward, ported from fla 0.5.2 ``attnres_fwd_kernel``.
 
@@ -94,6 +97,17 @@ def attnres_fwd_kernel(
     block-banking step, done here without a second HBM read of
     ``block_residual`` or a second kernel launch (see ``attn_res_gate``'s
     ``close_block``).
+
+    ``QUANT_FP8`` (requires ``HAS_ONORM``) quantizes the output RMSNorm result
+    per token before storing it: ``o`` holds FP8 values and ``o_scale`` one fp32
+    scale per row, so a consuming GEMM takes ``(o, o_scale)`` directly instead of
+    re-reading a BF16 ``o`` through a standalone quant kernel -- and when several
+    GEMMs consume the same row (Kimi-K3's ``fused_qkv_a_proj`` + ``g_proj`` both
+    read the attention input) that quant runs once here rather than once per
+    consumer. The scale derivation matches aiter's standalone per-token quant
+    (``_dynamic_per_token_quant_fp8_i8_kernel``). ``block_out`` is deliberately
+    left unquantized: those rows come back as scoring candidates on a later call,
+    where the per-candidate RMSNorm needs the full-precision values.
 
     ``o_pre`` / ``rstd`` / ``logit`` / ``lse`` are the fla backward checkpoint; this
     is a forward-only port, so ``SAVE_OPRE`` / ``SAVE_STATS`` are off and those
@@ -229,6 +243,13 @@ def attnres_fwd_kernel(
         b_o_rstd = tl.rsqrt(tl.sum(tl.where(m_d, b_o * b_o, 0.0), axis=0) / D + out_eps)
         b_ow = tl.load(ow + o_d, mask=m_d, other=0.0).to(tl.float32)
         b_o = b_o * b_o_rstd * b_ow
+    if QUANT_FP8:
+        b_amax = tl.max(tl.abs(tl.where(m_d, b_o, 0.0)), axis=0)
+        # An all-zero row has no scale to derive; 1.0 keeps its quantized values
+        # at zero instead of dividing by zero.
+        b_oscale = tl.where(b_amax > 0.0, b_amax / FP8_MAX, 1.0)
+        tl.store(o_scale + i_n, b_oscale.to(o_scale.dtype.element_ty))
+        b_o = b_o * (1.0 / b_oscale)
     tl.store(o + i_n * D + o_d, b_o.to(o.dtype.element_ty), mask=m_d)
 
 
@@ -269,6 +290,7 @@ if ATTN_RES_TRITON_AUTOTUNE:
             "IS_PACKED",
             "HAS_PREFIX",
             "WRITE_BLOCK_CAT",
+            "QUANT_FP8",
         ],
         warmup=10,
         rep=20,
