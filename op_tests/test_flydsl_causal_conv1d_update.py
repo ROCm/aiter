@@ -1772,10 +1772,17 @@ def _run_correctness():
     )
     assert not unreached, f"never run by the CI entry point: {unreached}"
 
-    failures = 0
+    # Passing cases say nothing a reader needs -- the count and the exit code
+    # already do -- and there are enough of them to bury the perf table that is
+    # the point of a sweep run. AITER_LOG_MORE, which aiter's own perftest
+    # already honours, brings the roll call back for when a run dies partway and
+    # the question is which case it died on.
+    verbose = bool(int(os.environ.get("AITER_LOG_MORE", "0")))
+    failures = cases_run = 0
     for fn, arg_sets in cases:
         for args in arg_sets:
             name = f"{fn.__name__}{args if args else ''}"
+            cases_run += 1
             try:
                 fn(*args)
             except Exception:  # noqa: BLE001 - report and keep going
@@ -1785,9 +1792,10 @@ def _run_correctness():
                 print(f"FAIL {name}", flush=True)
                 traceback.print_exc()
             else:
-                print(f"ok   {name}", flush=True)
+                if verbose:
+                    print(f"ok   {name}", flush=True)
 
-    print(f"\n{failures} failure(s)", flush=True)
+    print(f"{cases_run} case(s), {failures} failure(s)", flush=True)
     return failures
 
 
