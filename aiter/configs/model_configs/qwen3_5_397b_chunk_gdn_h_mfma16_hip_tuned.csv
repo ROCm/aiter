@@ -1,4 +1,4 @@
-arch,dtype,K,V,BT,H,Hg,is_varlen,use_h0,store_fs,snapshot_bf16,state_bf16,T_flat,N,total_chunks,max_seq_chunks,BV,us
+gfx,dtype,K,V,BT,H,Hg,is_varlen,use_h0,store_fs,snapshot_bf16,state_bf16,T_flat,N,total_chunks,max_seq_chunks,BV,us
 gfx942,torch.bfloat16,128,128,64,8,2,True,True,True,False,False,16384,2,256,128,32,298.4
 gfx942,torch.bfloat16,128,128,64,8,2,True,True,True,False,False,32768,4,512,128,64,507.5
 gfx942,torch.bfloat16,128,128,64,8,2,True,True,True,False,False,65536,8,1024,128,64,998.6

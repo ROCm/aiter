@@ -289,7 +289,7 @@ class TestTunePipeline(unittest.TestCase):
             "gdn_k5_mfma16_hip": {
                 "script": "csrc/gdn_k5/chunk_gdn_h_mfma16_hip_tune.py",
                 "header": [
-                    "arch",
+                    "gfx",
                     "dtype",
                     "K",
                     "V",
@@ -329,7 +329,7 @@ class TestTunePipeline(unittest.TestCase):
                     ),
                 ],
                 "keys": [
-                    "arch",
+                    "gfx",
                     "H",
                     "Hg",
                     "V",

@@ -136,7 +136,7 @@ def parse_csv(csv_path: str) -> list[dict[str, Any]]:
             try:
                 job = {
                     "dtype": dtype,
-                    "arch": row.get("arch") or _AOT_ARCH_DEFAULT,
+                    "arch": row.get("gfx") or _AOT_ARCH_DEFAULT,
                     "K": k,
                     "V": v,
                     "BT": int(row.get("BT") or 64),
@@ -370,9 +370,9 @@ def _detected_arch() -> str | None:
     return arch.split(":")[0] if arch else None
 
 
-def _resolve_archs(row_arch: str | None) -> list[str]:
-    """Row arch column, else ARCH/GPU_ARCHS, else host GPU, else ``_AOT_ARCH_DEFAULT``."""
-    for raw in (row_arch, os.environ.get("ARCH"), os.environ.get("GPU_ARCHS")):
+def _resolve_archs(row_gfx: str | None) -> list[str]:
+    """Row ``gfx`` column, else ARCH/GPU_ARCHS, else host GPU, else ``_AOT_ARCH_DEFAULT``."""
+    for raw in (row_gfx, os.environ.get("ARCH"), os.environ.get("GPU_ARCHS")):
         if not raw or not raw.strip():
             continue
         archs = [
@@ -409,7 +409,7 @@ def parse_csv_mfma16_hip(csv_path: str) -> list[dict[str, Any]]:
                 print(f"  [WARN] malformed row in {csv_path}: {e}")
                 continue
 
-            for arch in _resolve_archs(row.get("arch")):
+            for arch in _resolve_archs(row.get("gfx")):
                 shapes[(arch, dtype, K, V, BT, H, Hg, is_varlen, use_h0, store_fs)] = (
                     None
                 )

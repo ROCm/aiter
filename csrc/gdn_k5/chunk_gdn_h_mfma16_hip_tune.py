@@ -37,7 +37,7 @@ _K5_TEST_PATH = (
     / "test_flydsl_linear_attention_prefill.py"
 )
 LOOKUP_KEYS = (
-    "arch",
+    "gfx",
     "H",
     "Hg",
     "V",
@@ -208,7 +208,7 @@ def case_to_tuned_row(
     us,
 ) -> dict[str, Any]:
     return {
-        "arch": _GFX_ARCH,
+        "gfx": _GFX_ARCH,
         "dtype": str(case.dtype),
         "K": int(case.K),
         "V": int(case.V),

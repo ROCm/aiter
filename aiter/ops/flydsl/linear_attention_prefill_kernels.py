@@ -671,8 +671,9 @@ def _load_tuned_bv_table() -> dict[tuple, int]:
                 bv = (row.get("BV") or "").strip()
                 if not bv:
                     continue  # tuned rows must carry a measured BV
+                gfx = (row.get("gfx") or "").strip()
                 key = (
-                    (row["arch"] or "").strip(),
+                    gfx,
                     int(row["H"]),
                     int(row["Hg"]),
                     int(row["V"]),
