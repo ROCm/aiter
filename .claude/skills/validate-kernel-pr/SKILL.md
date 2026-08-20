@@ -1,7 +1,7 @@
 ---
 name: validate-kernel-pr
 description: Deterministic validation layer for kernel PRs. Builds and runs the PR in an isolated worktree on a claimed GPU, runs a shape grid the PR's own tests may not cover, policy-checks the test diff, and emits validation_report.json. Use before review-pr on any kernel PR; review-pr consumes the report as evidence.
-argument-hint: <PR number> [--repo ROCm/aiter]
+argument-hint: --repo <worktree> --tests <pytest target>
 ---
 
 # validate-kernel-pr
@@ -23,20 +23,35 @@ written without it must mark itself `[static-only review]`.
 
 ## Invocation
 
-```bash
-# validate a PR (fetches the head, merges latest main, builds, runs)
-.claude/skills/validate-kernel-pr/validate_pr.sh --pr 4394
+The caller supplies the checkout and the test target; this script does not fetch PRs itself
+(see [Not implemented yet](#not-implemented-yet)).
 
-# validate a local worktree, optionally with a patch applied first
+```bash
+# 1. put the PR head in its own worktree
+git worktree add --detach /tmp/pr-4394 origin/main
+git -C /tmp/pr-4394 fetch origin pull/4394/head && git -C /tmp/pr-4394 checkout FETCH_HEAD
+
+# 2. validate it
 .claude/skills/validate-kernel-pr/validate_pr.sh \
-    --repo /path/to/worktree \
+    --repo /tmp/pr-4394 \
     --tests op_tests/test_moe_2stage.py \
-    --patch /tmp/candidate.patch \
     --shape-env AITER_TEST_SHAPES \
     --grid "1,4096,f32;7,2000,bf16;16384,8192,bf16" \
     --tol-table "f32=1e-5,f16=2e-3,bf16=1e-2" \
     --out validation_report.json
 ```
+
+To validate a candidate patch against a fixed base instead, add `--patch /tmp/candidate.patch`;
+the `merge_sim` stage applies it and blocks on conflict.
+
+| flag | meaning |
+|---|---|
+| `--repo` | worktree to validate (required) |
+| `--tests` | pytest target the PR ships |
+| `--patch` | patch to apply first; conflict is a blocker |
+| `--shape-env` `--grid` | env var and shape list for the S1-owned grid |
+| `--tol-table` | reference tolerances, e.g. `f32=1e-5,f16=2e-3,bf16=1e-2` |
+| `--label` `--out` | run name and report path (default `./validation_report.json`) |
 
 Environment knobs: `PYLIB` (prepended to `PYTHONPATH` when the runtime lives outside the
 checkout), `PICKER` (path to `pick-idle-gpu.py`), `TIMEOUT` (per-pytest budget, default 1800s).
@@ -156,6 +171,19 @@ dismissed costs one line of reasoning; a missed one costs silent wrong output.
 ```
 
 ---
+
+## Not implemented yet
+
+Deliberately absent rather than half-built — everything shipped here has been observed failing on
+a seeded defect, and these have not been:
+
+- **PR fetch orchestration.** There is no `--pr N`. The caller creates the worktree, as above.
+  Choosing the right `--tests` target from a diff is the unsolved part; a wrong target produces a
+  confident green.
+- **`perf` and `claims` stages.** The schema reserves both — median-of-N against a baseline on the
+  same locked GPU, and reproducing the numbers in the PR description — and the script emits
+  neither. A report today carries no performance evidence, and a review must not read the absence
+  of a `perf` stage as "no regression".
 
 ## What this skill does not do
 
