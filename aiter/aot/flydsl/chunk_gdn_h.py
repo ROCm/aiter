@@ -3,13 +3,13 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""AOT pre-compile FlyDSL chunk_gdn_h kernels (vk baseline + mfma16_hip fork).
+"""AOT pre-compile FlyDSL chunk_gdn_h kernels (vk baseline + opt fork).
 
-``vk`` reads ``aiter/ops/flydsl/chunk_gdn_h_tuned.csv``; ``mfma16_hip`` reads
-``model_configs/*_chunk_gdn_h_mfma16_hip_untuned.csv``. Runtime BV lookup uses
-``AITER_CONFIG_GDN_K5_MFMA16_HIP`` (``model_configs/*_tuned.csv`` merge).
+``vk`` reads ``aiter/ops/flydsl/chunk_gdn_h_tuned.csv``; ``opt`` reads
+``model_configs/*_chunk_gdn_h_opt_untuned.csv``. Runtime BV lookup uses
+``AITER_CONFIG_GDN_K5_OPT`` (``model_configs/*_tuned.csv`` merge).
 
-Usage: ``python -m aiter.aot.flydsl.chunk_gdn_h [--kernel vk|mfma16_hip|all]``
+Usage: ``python -m aiter.aot.flydsl.chunk_gdn_h [--kernel vk|opt|all]``
 
 Environment: ``FLYDSL_RUNTIME_CACHE_DIR``, ``ARCH``/``GPU_ARCHS``, ``FLYDSL_GPU_ARCH``.
 """
@@ -40,8 +40,8 @@ from aiter.aot.flydsl.common import (
 )
 from aiter.jit.core import AITER_ROOT_DIR
 from aiter.ops.flydsl.kernels.chunk_gated_delta_h import compile_chunk_gated_delta_h
-from aiter.ops.flydsl.kernels.chunk_gated_delta_h_mfma16x16x16 import (
-    compile_chunk_gated_delta_h_mfma16_hip,
+from aiter.ops.flydsl.kernels.chunk_gated_delta_h_opt import (
+    compile_chunk_gated_delta_h_opt,
 )
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
@@ -58,12 +58,12 @@ _TORCH_DTYPE = {
 }
 
 _MODEL_CONFIG_DIR = Path(f"{AITER_ROOT_DIR}/aiter/configs/model_configs")
-DEFAULT_CSVS_MFMA16_HIP = sorted(
+DEFAULT_CSVS_OPT = sorted(
     str(p)
-    for p in _MODEL_CONFIG_DIR.glob("*_chunk_gdn_h_mfma16_hip_untuned.csv")
+    for p in _MODEL_CONFIG_DIR.glob("*_chunk_gdn_h_opt_untuned.csv")
     if p.is_file()
 )
-_MFMA16_HIP_KERNEL_NAME = "chunk_gdn_fwd_h_flydsl_mfma16_hip"
+_OPT_KERNEL_NAME = "chunk_gdn_fwd_h_flydsl_opt"
 _BV_CANDIDATES = (64, 32, 16)
 _SNAPSHOT_BF16 = (True, False)
 _STATE_BF16 = (False, True)
@@ -356,7 +356,7 @@ def compile_one_config(
 
 
 # --------------------------------------------------------------------------
-# mfma16_hip fork (chunk_gdn_fwd_h_flydsl_mfma16_hip)
+# opt fork (chunk_gdn_fwd_h_flydsl_opt)
 # --------------------------------------------------------------------------
 
 
@@ -384,8 +384,8 @@ def _resolve_archs(row_gfx: str | None) -> list[str]:
     return [_detected_arch() or _AOT_ARCH_DEFAULT]
 
 
-def parse_csv_mfma16_hip(csv_path: str) -> list[dict[str, Any]]:
-    """Expand mfma16_hip untuned rows into compile jobs (BV/dtype/layout fan-out)."""
+def parse_csv_opt(csv_path: str) -> list[dict[str, Any]]:
+    """Expand opt untuned rows into compile jobs (BV/dtype/layout fan-out)."""
     shapes: dict[tuple, None] = {}
 
     with open(csv_path, "r", encoding="utf-8", newline="") as f:
@@ -432,7 +432,7 @@ def parse_csv_mfma16_hip(csv_path: str) -> list[dict[str, Any]]:
             bvs, _SNAPSHOT_BF16, _STATE_BF16, _G_HEAD_MAJOR, indices
         ):
             job = {
-                "kernel_name": _MFMA16_HIP_KERNEL_NAME,
+                "kernel_name": _OPT_KERNEL_NAME,
                 "dtype": dtype,
                 "arch": arch,
                 "K": K,
@@ -459,7 +459,7 @@ def parse_csv_mfma16_hip(csv_path: str) -> list[dict[str, Any]]:
     return jobs
 
 
-def _compile_mfma16_hip_to_cache(
+def _compile_opt_to_cache(
     *,
     dtype: str,
     arch: str,
@@ -529,7 +529,7 @@ def _compile_mfma16_hip_to_cache(
         else int32_dummy
     )
 
-    launch_fn = compile_chunk_gated_delta_h_mfma16_hip(
+    launch_fn = compile_chunk_gated_delta_h_opt(
         K=K,
         V=V,
         BT=BT,
@@ -576,9 +576,9 @@ def _compile_mfma16_hip_to_cache(
         )
 
 
-def _format_shape_str_mfma16_hip(job: dict) -> str:
+def _format_shape_str_opt(job: dict) -> str:
     return (
-        f"chunk_gdn_h_mfma16_hip  "
+        f"chunk_gdn_h_opt  "
         f"K={job.get('K')} V={job.get('V')} BT={job.get('BT')} "
         f"BV={job.get('BV')} H={job.get('H')} Hg={job.get('Hg')} "
         f"dtype={job.get('dtype')} "
@@ -589,13 +589,13 @@ def _format_shape_str_mfma16_hip(job: dict) -> str:
     )
 
 
-def compile_one_config_mfma16_hip(*, arch: str, **kwargs) -> dict:
-    """Compile one mfma16_hip configuration and save it to cache."""
+def compile_one_config_opt(*, arch: str, **kwargs) -> dict:
+    """Compile one opt configuration and save it to cache."""
     aot_arch = arch or _AOT_ARCH_DEFAULT
     kwargs.pop("kernel_name", None)
-    shape_str = _format_shape_str_mfma16_hip(kwargs)
+    shape_str = _format_shape_str_opt(kwargs)
     result = {
-        "kernel_name": _MFMA16_HIP_KERNEL_NAME,
+        "kernel_name": _OPT_KERNEL_NAME,
         "shape": shape_str,
         "compile_time": None,
         "compile_arch": aot_arch,
@@ -609,7 +609,7 @@ def compile_one_config_mfma16_hip(*, arch: str, **kwargs) -> dict:
             override_env("FLYDSL_GPU_ARCH", aot_arch),
             FakeTensorMode(),
         ):
-            _compile_mfma16_hip_to_cache(arch=aot_arch, **kwargs)
+            _compile_opt_to_cache(arch=aot_arch, **kwargs)
         result["compile_time"] = time.time() - t0
     except Exception as e:  # noqa: BLE001
         print(f"  [FAIL] compile  {shape_str}  arch={aot_arch}: {e}")
@@ -648,12 +648,12 @@ _KERNEL_SPECS: dict[str, _KernelSpec] = {
         format_shape=_format_shape_str,
         expand_jobs=_fanout_state_dtype,
     ),
-    "mfma16_hip": _KernelSpec(
-        title=f"mfma16_hip  ({_MFMA16_HIP_KERNEL_NAME})",
-        default_csvs=DEFAULT_CSVS_MFMA16_HIP,
-        parse_csv=parse_csv_mfma16_hip,
-        compile_one_config=compile_one_config_mfma16_hip,
-        format_shape=_format_shape_str_mfma16_hip,
+    "opt": _KernelSpec(
+        title=f"opt  ({_OPT_KERNEL_NAME})",
+        default_csvs=DEFAULT_CSVS_OPT,
+        parse_csv=parse_csv_opt,
+        compile_one_config=compile_one_config_opt,
+        format_shape=_format_shape_str_opt,
     ),
 }
 

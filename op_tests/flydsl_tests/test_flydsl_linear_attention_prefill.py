@@ -40,7 +40,7 @@ if not is_flydsl_available():
 
 try:
     from aiter.ops.flydsl.linear_attention_prefill_kernels import (
-        chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip,
+        chunk_gated_delta_rule_fwd_h_flydsl_opt,
     )
     from aiter.ops.triton._triton_kernels.gated_delta_rule.prefill.chunk import (
         chunk_gated_delta_rule_fwd_opt_vk,
@@ -541,7 +541,7 @@ PREFILL_TEST_IDS = [repr(p) for p in PREFILL_PARAMS]
 
 def pytest_generate_tests(metafunc):
     if metafunc.function.__name__ not in (
-        "test_correctness_flydsl_mfma16_hip",
+        "test_correctness_flydsl_opt",
         "test_perf_comparison",
     ):
         return
@@ -826,7 +826,7 @@ def _is_gfx950() -> bool:
     ``mfma_f32_32x32x16_bf16`` -- both are gfx950-only instructions. On gfx942
     (CDNA3 / MI300) they fail to compile with an LLVM ``Cannot select``
     abort, so the perf harness skips them there. The remaining forks
-    (``kv`` / ``mfma16_hip`` / ``mfma16_2wave_opt1`` / ``mfma16_3wave_opt2``)
+    (``kv`` / ``opt`` / ``mfma16_2wave_opt1`` / ``mfma16_3wave_opt2``)
     use the K=16 ``mfma_f32_16x16x16bf16_1k`` and run on both.
     """
     try:
@@ -1077,8 +1077,8 @@ def _assert_k5_outputs_match_ref(
 class TestCorrectness:
     """Correctness and integration coverage for the FlyDSL mfma16 K5 backend."""
 
-    def test_correctness_flydsl_mfma16_hip(self, args: PrefillArgs):
-        """mfma16 / HIP-aligned FlyDSL K5 impl (formerly the "vk" fork): 16x16x16
+    def test_correctness_flydsl_opt(self, args: PrefillArgs):
+        """K5 opt FlyDSL K5 impl (formerly the "vk" fork): 16x16x16
         MFMA + HIP warp partition. Same VK public outputs as the baseline flydsl
         path; only the BV==64 configs exercise the kernel, others fall back."""
         context_lens = args.resolve_context_lens()
@@ -1086,7 +1086,7 @@ class TestCorrectness:
             context_lens, args=args
         )
 
-        h_fly, vn_fly, fs_fly = chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(
+        h_fly, vn_fly, fs_fly = chunk_gated_delta_rule_fwd_h_flydsl_opt(
             k,
             w_c,
             u_c,
@@ -1124,7 +1124,7 @@ class TestCorrectness:
             vn_ref,
             fs_ref,
             output_final_state=args.output_final_state,
-            label="flydsl_mfma16_hip",
+            label="flydsl_opt",
         )
 
     @pytest.mark.parametrize("args", STATE_BF16_PARAMS, ids=STATE_BF16_TEST_IDS)
@@ -1135,7 +1135,7 @@ class TestCorrectness:
             context_lens, args=args
         )
 
-        h_fly, vn_fly, fs_fly = chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(
+        h_fly, vn_fly, fs_fly = chunk_gated_delta_rule_fwd_h_flydsl_opt(
             k,
             w_c,
             u_c,
@@ -1166,7 +1166,7 @@ class TestCorrectness:
             vn_ref,
             fs_ref,
             output_final_state=True,
-            label="flydsl_mfma16_hip_bf16_state",
+            label="flydsl_opt_bf16_state",
         )
 
     @pytest.mark.parametrize("args", SNAPSHOT_DTYPE_PARAMS, ids=SNAPSHOT_DTYPE_TEST_IDS)
@@ -1185,7 +1185,7 @@ class TestCorrectness:
         )
 
         def run(snapshot_dtype):
-            return chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(
+            return chunk_gated_delta_rule_fwd_h_flydsl_opt(
                 k,
                 w_c,
                 u_c,
@@ -1229,7 +1229,7 @@ class TestCorrectness:
             vn_ref,
             fs_ref,
             output_final_state=True,
-            label="flydsl_mfma16_hip_fp32_snapshot",
+            label="flydsl_opt_fp32_snapshot",
         )
 
     def test_e2e_dispatch_matches_triton(self):
@@ -1342,7 +1342,7 @@ class TestCorrectness:
         w_c = w.permute(0, 2, 1, 3).contiguous()
         u_c = u.permute(0, 2, 1, 3).contiguous()
 
-        _, _, fs_fly = chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(
+        _, _, fs_fly = chunk_gated_delta_rule_fwd_h_flydsl_opt(
             k,
             w_c,
             u_c,
@@ -1410,7 +1410,7 @@ def _run_perf_comparison(args: PrefillArgs):
     metadata = _build_prefill_metadata(context_lens, cu)
 
     us_fly = _bench_fn(
-        chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip,
+        chunk_gated_delta_rule_fwd_h_flydsl_opt,
         k,
         w_c,
         u_c,
@@ -1510,7 +1510,7 @@ def _print_perf_table():
         "",
         border,
         (
-            "K5 Prefill Perf Summary (mfma16_hip vs hip vs triton; K5 device kernel us via "
+            "K5 Prefill Perf Summary (opt vs hip vs triton; K5 device kernel us via "
             "torch.profiler; fly/hip & tri/hip = speedup vs hip, >1 faster / <1 slower)"
         ),
         border,

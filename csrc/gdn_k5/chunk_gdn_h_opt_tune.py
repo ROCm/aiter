@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""FlyDSL K5 mfma16_hip BV tuner (TunerCommon). See ``csrc/gdn_k5/README.md``."""
+"""FlyDSL K5 opt BV tuner (TunerCommon). See ``csrc/gdn_k5/README.md``."""
 
 from __future__ import annotations
 
@@ -24,7 +24,7 @@ from aiter.ops.flydsl.linear_attention_prefill_kernels import (
     _hipeq_select_bv,
 )
 from aiter.ops.flydsl.linear_attention_prefill_kernels import (
-    chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip as k5,
+    chunk_gated_delta_rule_fwd_h_flydsl_opt as k5,
 )
 from aiter.utility.base_tuner import TunerCommon, _read_csv
 
@@ -53,8 +53,8 @@ TUNED_EXTRA_COLS = ("dtype", "K", "V", "BT", "T_flat", "N", "BV", "us")
 TUNED_COLUMNS = LOOKUP_KEYS + TUNED_EXTRA_COLS
 
 _MODEL_CONFIG_DIR = f"{AITER_ROOT_DIR}/aiter/configs/model_configs"
-_DEFAULT_UNTUNED = f"{_MODEL_CONFIG_DIR}/qwen3_5_35b_chunk_gdn_h_mfma16_hip_untuned.csv"
-_DEFAULT_TUNED = f"{_MODEL_CONFIG_DIR}/qwen3_5_35b_chunk_gdn_h_mfma16_hip_tuned.csv"
+_DEFAULT_UNTUNED = f"{_MODEL_CONFIG_DIR}/qwen3_5_35b_chunk_gdn_h_opt_untuned.csv"
+_DEFAULT_TUNED = f"{_MODEL_CONFIG_DIR}/qwen3_5_35b_chunk_gdn_h_opt_tuned.csv"
 _RUN_CONFIG_TOL_PCT = 5.0
 _RESULT_COLS = [c for c in TUNED_COLUMNS if c not in LOOKUP_KEYS]
 
@@ -164,7 +164,7 @@ def build_k5_inputs(case, snapshot_dtype, seed=0):
 
 
 def bench_us(args, bv: int, warmup: int, iters: int) -> float:
-    os.environ["FLYDSL_K5_MFMA16HIP_BV"] = str(bv)
+    os.environ["FLYDSL_K5_OPT_BV"] = str(bv)
     try:
         for _ in range(warmup):
             k5(**args)
@@ -178,7 +178,7 @@ def bench_us(args, bv: int, warmup: int, iters: int) -> float:
         torch.cuda.synchronize()
         return statistics.median(s.elapsed_time(e) * 1e3 for s, e in zip(starts, ends))
     finally:
-        os.environ.pop("FLYDSL_K5_MFMA16HIP_BV", None)
+        os.environ.pop("FLYDSL_K5_OPT_BV", None)
 
 
 def lookup_key_from_case(case, snapshot_dtype, total_chunks, max_seq_chunks) -> tuple:
@@ -326,7 +326,7 @@ class K5BvTuner(TunerCommon):
         **TunerCommon.ARG_DEFAULTS,
         "untune_file": _DEFAULT_UNTUNED,
         "tune_file": _DEFAULT_TUNED,
-        "config_env_name": "AITER_CONFIG_GDN_K5_MFMA16_HIP",
+        "config_env_name": "AITER_CONFIG_GDN_K5_OPT",
         "warmup": 5,
         "iters": 20,
         "batch": 100,
@@ -335,10 +335,10 @@ class K5BvTuner(TunerCommon):
 
     def __init__(self):
         super().__init__(
-            "chunk_gdn_h_mfma16_hip_tuned",
+            "chunk_gdn_h_opt_tuned",
             list(LOOKUP_KEYS),
             _RESULT_COLS,
-            "FlyDSL K5 mfma16_hip BV tuner",
+            "FlyDSL K5 opt BV tuner",
         )
         self._cases: list[tuple[str, Any]] = []
         self._case_by_id: dict[str, Any] = {}

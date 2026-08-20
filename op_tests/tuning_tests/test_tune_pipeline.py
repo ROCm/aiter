@@ -286,8 +286,8 @@ class TestTunePipeline(unittest.TestCase):
                 "timeout": 1800,
                 "timeout_mp1": 2400,
             },
-            "gdn_k5_mfma16_hip": {
-                "script": "csrc/gdn_k5/chunk_gdn_h_mfma16_hip_tune.py",
+            "gdn_k5_opt": {
+                "script": "csrc/gdn_k5/chunk_gdn_h_opt_tune.py",
                 "header": [
                     "gfx",
                     "dtype",
@@ -607,8 +607,8 @@ class TestTunePipeline(unittest.TestCase):
     def test_gradlib_bf16_mp_default(self):
         self._run_gradlib(mp=None)
 
-    def test_gdn_k5_mfma16_hip_mp1(self):
-        self._run_one("gdn_k5_mfma16_hip", mp=1)
+    def test_gdn_k5_opt_mp1(self):
+        self._run_one("gdn_k5_opt", mp=1)
 
 
 @unittest.skipUnless(_gpu_available(), "No GPU available")

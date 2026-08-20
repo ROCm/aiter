@@ -321,12 +321,12 @@ TUNER_FAMILIES = {
         "exclude_patterns": ["batched"],
         "config_property": "AITER_CONFIG_GEMM_BF16_FILE",
     },
-    "gdn_k5_mfma16_hip": {
-        "script": "csrc/gdn_k5/chunk_gdn_h_mfma16_hip_tune.py",
-        "csv_pattern": "chunk_gdn_h_mfma16_hip_tuned",
+    "gdn_k5_opt": {
+        "script": "csrc/gdn_k5/chunk_gdn_h_opt_tune.py",
+        "csv_pattern": "chunk_gdn_h_opt_tuned",
         "exclude_patterns": ["untuned"],
         "timeout": 1800,
-        "config_property": "AITER_CONFIG_GDN_K5_MFMA16_HIP_FILE",
+        "config_property": "AITER_CONFIG_GDN_K5_OPT_FILE",
     },
 }
 
@@ -423,8 +423,8 @@ class TestRunConfig(unittest.TestCase):
     def test_csrc_bf16(self):
         self._test_family("csrc_bf16")
 
-    def test_gdn_k5_mfma16_hip(self):
-        self._test_family("gdn_k5_mfma16_hip")
+    def test_gdn_k5_opt(self):
+        self._test_family("gdn_k5_opt")
 
 
 @unittest.skipUnless(_gpu_available(), "No GPU available")

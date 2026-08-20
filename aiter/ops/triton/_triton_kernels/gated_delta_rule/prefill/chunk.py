@@ -424,10 +424,10 @@ def chunk_gated_delta_rule_fwd_opt_vk(
         )
     elif use_chunk_flydsl:
         from aiter.ops.flydsl.linear_attention_prefill_kernels import (
-            chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip,
+            chunk_gated_delta_rule_fwd_h_flydsl_opt,
         )
 
-        h, v_new, final_state = chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(
+        h, v_new, final_state = chunk_gated_delta_rule_fwd_h_flydsl_opt(
             k=k,
             w=w,
             u=u,

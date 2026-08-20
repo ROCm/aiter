@@ -73,7 +73,7 @@ def _make_bf16_converter(trunc: bool):
     return lambda v: v.to(fx.BFloat16)
 
 
-def compile_chunk_gated_delta_h_mfma16_hip(
+def compile_chunk_gated_delta_h_opt(
     *,
     K: int,
     V: int,
@@ -105,8 +105,8 @@ def compile_chunk_gated_delta_h_mfma16_hip(
     """
     # BT=64 is baked into the wave mapping / load batching / BT_STEPS, gated_v
     # alias-reuses h_state panel 1, and the LDS layout is validated at K=V=128.
-    assert BT == 64, f"chunk_gated_delta_h_mfma16_hip only supports BT=64, got BT={BT}"
-    assert K == 128, f"chunk_gated_delta_h_mfma16_hip only supports K=128, got K={K}"
+    assert BT == 64, f"chunk_gated_delta_h_opt only supports BT=64, got BT={BT}"
+    assert K == 128, f"chunk_gated_delta_h_opt only supports K=128, got K={K}"
     assert BV % 16 == 0, f"BV must be a multiple of the MFMA N of 16, got BV={BV}"
     NUM_K_BLOCKS = K // 64
 
@@ -177,7 +177,7 @@ def compile_chunk_gated_delta_h_mfma16_hip(
 
     K_STEPS_PER_BLOCK = 64 // K_STEP
 
-    @flyc.kernel(name="chunk_gdn_fwd_h_flydsl_mfma16_hip")
+    @flyc.kernel(name="chunk_gdn_fwd_h_flydsl_opt")
     def gdn_h_kernel(
         k_tensor: fx.Tensor,
         v_tensor: fx.Tensor,
@@ -967,5 +967,5 @@ def compile_chunk_gated_delta_h_mfma16_hip(
 
 
 __all__ = [
-    "compile_chunk_gated_delta_h_mfma16_hip",
+    "compile_chunk_gated_delta_h_opt",
 ]
