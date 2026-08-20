@@ -232,107 +232,18 @@ def _flydsl_fhmoe_stage1_wrapper(
     )
 
 
-def _flydsl_fhmoe_stage2_wrapper(
-    inter_states,
-    w1,
-    w2,
-    sorted_token_ids,
-    sorted_expert_ids,
-    num_valid_ids,
-    out,
-    topk,
-    kernelName="",
-    w2_scale=None,
-    a2_scale=None,
-    sorted_weights=None,
-    bias2=None,
-    inter_dim_pad: int = 0,
-    model_dim_pad: int = 0,
-    expert_mask=None,
-    topk_ids=None,
-    shared_w2=None,
-    shared_w2_scale=None,
-    shared_expert_id: int = -1,
-    **_kwargs,
-):
-    from aiter.ops.flydsl import moe_kernels
-    from aiter.ops.flydsl.fhmoe import flydsl_fhmoe_stage2
-    from aiter.ops.flydsl.mxfp4_kname import parse_flydsl_v2_gemm2_kernel
-
-    parsed_v2 = parse_flydsl_v2_gemm2_kernel(kernelName)
-    if parsed_v2 is not None:
-        parsed = {
-            "tile_m": parsed_v2["tile_m"],
-            "tile_n": parsed_v2["tile_n"],
-            "tile_k": parsed_v2["tile_k"],
-            "a_dtype": parsed_v2["a_dtype"],
-            "b_dtype": parsed_v2["b_dtype"],
-            "out_dtype": parsed_v2["out_dtype"],
-            "mode": parsed_v2["epilog"],
-            "persist": parsed_v2["persist"],
-            "sort_block_m": parsed_v2["sort_block_m"],
-            "use_nt": parsed_v2["use_nt"],
-        }
-    else:
-        parsed = moe_kernels.get_flydsl_kernel_params(kernelName)
-    if parsed is None:
-        raise ValueError(f"Invalid FlyDSL kernel name: {kernelName}")
-    return flydsl_fhmoe_stage2(
-        inter_states=inter_states,
-        w2=w2,
-        shared_w2=shared_w2,
-        sorted_token_ids=sorted_token_ids,
-        sorted_expert_ids=sorted_expert_ids,
-        num_valid_ids=num_valid_ids,
-        out=out,
-        topk=topk,
-        kernelName=kernelName,
-        tile_m=parsed["tile_m"],
-        tile_n=parsed["tile_n"],
-        tile_k=parsed["tile_k"],
-        a_dtype=parsed["a_dtype"],
-        b_dtype=parsed["b_dtype"],
-        out_dtype=parsed["out_dtype"],
-        mode=parsed.get("mode", "atomic"),
-        w2_scale=w2_scale,
-        shared_w2_scale=shared_w2_scale,
-        a2_scale=a2_scale,
-        sorted_weights=sorted_weights,
-        sort_block_m=parsed.get("sort_block_m", 0),
-        waves_per_eu=parsed.get("waves_per_eu", None),
-        use_async_copy=parsed.get("use_async_copy", False),
-        cu_num_mul=parsed.get("cu_num_mul", 1),
-        b_nt=parsed.get("b_nt", 0),
-        persist=parsed.get("persist", None),
-        inter_dim_pad=inter_dim_pad,
-        model_dim_pad=model_dim_pad,
-        xcd_swizzle=parsed.get("xcd_swizzle", 0),
-        bias=bias2,
-        expert_mask=expert_mask,
-        topk_ids=topk_ids,
-        shared_expert_id=shared_expert_id,
-    )
-
-
-_flydsl_fhmoe_stage2_wrapper._is_flydsl_stage2 = True
-
-
 def _use_fhmoe_wrappers(metadata):
-    from aiter.fused_moe import (
-        _flydsl_stage1_wrapper,
-        _flydsl_stage2_wrapper,
-        _flydsl_v2_stage2_wrapper,
-    )
+    from aiter.fused_moe import _flydsl_stage1_wrapper, _flydsl_v2_stage2_wrapper
 
     stage1_func = getattr(metadata.stage1, "func", metadata.stage1)
     stage2_func = getattr(metadata.stage2, "func", metadata.stage2)
     if (
         metadata.run_1stage
         or stage1_func is not _flydsl_stage1_wrapper
-        or stage2_func not in (_flydsl_stage2_wrapper, _flydsl_v2_stage2_wrapper)
+        or stage2_func is not _flydsl_v2_stage2_wrapper
     ):
         raise NotImplementedError(
-            "Heterogeneous MXFP4/FP8 experts require the two-stage FlyDSL path"
+            "Heterogeneous MXFP4/FP8 experts require layout-v2 FlyDSL stage2"
         )
     stage1_keywords = dict(metadata.stage1.keywords)
     if metadata.skip_inter_quant:
@@ -342,12 +253,7 @@ def _use_fhmoe_wrappers(metadata):
         *metadata.stage1.args,
         **stage1_keywords,
     )
-    stage2 = functools.partial(
-        _flydsl_fhmoe_stage2_wrapper,
-        *metadata.stage2.args,
-        **metadata.stage2.keywords,
-    )
-    return replace(metadata, stage1=stage1, stage2=stage2)
+    return replace(metadata, stage1=stage1)
 
 
 def fhmoe_fake(

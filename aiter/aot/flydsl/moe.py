@@ -774,31 +774,29 @@ def _precompile_to_cache(
                 if _aot_backend is None
                 else _aot_backend.compile_stage2
             )
-            stage2_compile_kwargs = {
-                "model_dim": model_dim,
-                "inter_dim": inter_dim,
-                "experts": E,
-                "topk": topk,
-                "tile_m": tile_m,
-                "tile_n": tile_n,
-                "tile_k": tile_k,
-                "doweight_stage2": sw is not None,
-                "a_dtype": a_dtype,
-                "b_dtype": b_dtype,
-                "out_dtype": out_dtype,
-                "accumulate": accumulate,
-                "persist_m": _persist_m,
-                "sort_block_m": sort_block_m,
-                "waves_per_eu": waves_per_eu,
-                "use_async_copy": use_async_copy,
-                "cu_num_mul": cu_num_mul,
-                "b_nt": b_nt,
-                "xcd_swizzle": xcd_swizzle,
-                "enable_bias": enable_bias,
-            }
-            if _aot_backend is not None:
-                stage2_compile_kwargs["use_nt"] = use_nt
-            exe = compile_stage2(**stage2_compile_kwargs)
+            exe = compile_stage2(
+                model_dim=model_dim,
+                inter_dim=inter_dim,
+                experts=E,
+                topk=topk,
+                tile_m=tile_m,
+                tile_n=tile_n,
+                tile_k=tile_k,
+                doweight_stage2=sw is not None,
+                a_dtype=a_dtype,
+                b_dtype=b_dtype,
+                out_dtype=out_dtype,
+                accumulate=accumulate,
+                persist_m=_persist_m,
+                sort_block_m=sort_block_m,
+                waves_per_eu=waves_per_eu,
+                use_async_copy=use_async_copy,
+                cu_num_mul=cu_num_mul,
+                b_nt=b_nt,
+                use_nt=use_nt,
+                xcd_swizzle=xcd_swizzle,
+                enable_bias=enable_bias,
+            )
             _run_compiled(exe, args)
 
             # Reduce mode (accumulate=False) runs a separate topk reduction

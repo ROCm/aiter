@@ -2680,6 +2680,7 @@ def get_2stage_cfgs(
     )
     if use_mxfp4_flydsl:
         from aiter.ops.flydsl.moe_kernels import (
+            build_flydslv2_gemm2_name,
             flydsl_kernel_name,
             get_flydsl_kernel_params,
             pick_flydsl_stage2_tile_k,
@@ -2699,31 +2700,31 @@ def get_2stage_cfgs(
         # w-dtype "fp4" => mxfp4 weight; "fp8" => mxfp8 weight (a8w8).
         _w_type = "fp8" if q_dtype_w == dtypes.fp8 else "fp4"
         _s2_tk = pick_flydsl_stage2_tile_k(inter_dim)
-        # Per token tier: (tile_m, stage1 suffix, stage2 suffix).
+        # Per token tier: (tile_m, stage1 suffix).
         if token < 2048:
-            _tile_m, _s1_sfx, _s2_sfx = 32, "_w2", "_bnt2"
+            _tile_m, _s1_sfx = 32, "_w2"
         elif token < 4096:
-            _tile_m, _s1_sfx, _s2_sfx = 64, "_w3_bnt0", ""
+            _tile_m, _s1_sfx = 64, "_w3_bnt0"
         elif token < 16384:
-            _tile_m, _s1_sfx, _s2_sfx = 128, "_w2_bnt0", ""
+            _tile_m, _s1_sfx = 128, "_w2_bnt0"
         else:
-            _tile_m, _s1_sfx, _s2_sfx = 64, "_w4_bnt0", ""
+            _tile_m, _s1_sfx = 64, "_w4_bnt0"
         _base_kn1 = flydsl_kernel_name(
             1, _a_type, _w_type, _out_type, _tile_m, 128, 256
         )
-        _base_kn2 = (
-            f"flydsl_moe2_layout_a{_a_type}_w{_w_type}_{_out_type}_"
-            f"t{_tile_m}x128x{_s2_tk}_atomic"
+        kn2 = build_flydslv2_gemm2_name(
+            _a_type,
+            _w_type,
+            _out_type,
+            tm=_tile_m,
+            tn=128,
+            tk=_s2_tk,
+            epilog="atomic",
+            persist=False,
+            use_nt=token < 2048,
+            sbm=_tile_m,
         )
-        if _tile_m in (16, 32) and token < 2048:
-            _base_kn2 += "_nt"
-        _base_kn2 += f"_sbm{_tile_m}"
         kn1 = f"{_base_kn1}{_s1_sfx}"
-        kn2 = (
-            _base_kn2
-            if _base_kn2.startswith("flydsl_moe2_layout_")
-            else f"{_base_kn2}{_s2_sfx}"
-        )
 
         # Append the fused quantization suffixes before the lookup so the
         # layout-v2 stage2 receives its required sorted quantized intermediate.
@@ -2734,11 +2735,6 @@ def get_2stage_cfgs(
             kn1 = f"{kn1}_fp4"
         if get_flydsl_kernel_params(kn1) is None:
             kn1 = _base_kn1
-        if (
-            not kn2.startswith("flydsl_moe2_layout_")
-            and get_flydsl_kernel_params(kn2) is None
-        ):
-            kn2 = _base_kn2
 
         logger.warning(
             f"[fused_moe] no tuned FlyDSL config for {keys}, "

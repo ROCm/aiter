@@ -55,8 +55,9 @@ def compile_mixed_moe_gemm1(
     xcd_swizzle: int = 0,
     k_wave: int = 1,
     v2_output_layout: bool = False,
+    _shared_expert_id: int | None = None,
 ):
-    """Compile an ordinary stage1 MoE kernel."""
+    """Compile a stage1 MoE kernel."""
     return compile_mixed_moe_gemm1_common(
         model_dim=model_dim,
         inter_dim=inter_dim,
@@ -86,4 +87,5 @@ def compile_mixed_moe_gemm1(
         xcd_swizzle=xcd_swizzle,
         k_wave=k_wave,
         v2_output_layout=v2_output_layout,
+        shared_expert_id=_shared_expert_id,
     )

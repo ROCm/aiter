@@ -770,7 +770,6 @@ def test_heterogeneous_moe_uses_a_separate_custom_op_schema():
     from aiter.ops.flydsl.fhmoe import (
         compile_flydsl_fhmoe_stage2,
         flydsl_fhmoe_stage1,
-        flydsl_fhmoe_stage2,
     )
     from aiter.ops.flydsl.kernels.fhmoe import compile_mixed_fhmoe_gemm1
     from aiter.ops.flydsl.kernels.mixed_moe_gemm_2stage import compile_mixed_moe_gemm1
@@ -807,9 +806,6 @@ def test_heterogeneous_moe_uses_a_separate_custom_op_schema():
     assert {"shared_w1", "shared_w1_scale", "shared_expert_id"} <= set(
         inspect.signature(flydsl_fhmoe_stage1).parameters
     )
-    assert {"shared_w2", "shared_w2_scale", "shared_expert_id"} <= set(
-        inspect.signature(flydsl_fhmoe_stage2).parameters
-    )
     assert all(
         "shared_expert_id" in inspect.signature(api).parameters
         for api in (compile_mixed_fhmoe_gemm1, compile_flydsl_fhmoe_stage2)
@@ -820,20 +816,17 @@ def test_heterogeneous_moe_uses_a_separate_custom_op_schema():
     )
     fhmoe_apis = (
         flydsl_fhmoe_stage1,
-        flydsl_fhmoe_stage2,
         compile_mixed_fhmoe_gemm1,
         compile_flydsl_fhmoe_stage2,
     )
     assert all("xcd_swizzle" in inspect.signature(api).parameters for api in fhmoe_apis)
 
 
-def test_fhmoe_runtime_uses_layout_v2_stage2(monkeypatch: pytest.MonkeyPatch):
-    from aiter import fused_moe
+def test_fhmoe_runtime_uses_shared_stage1_compiler(monkeypatch: pytest.MonkeyPatch):
     from aiter.ops.flydsl import fhmoe
 
     tensor = torch.empty((1, 1, 1))
     compile_calls = []
-    stage2_calls = []
 
     def invoke_compiler(**kwargs):
         compile_kwargs = {"xcd_swizzle": kwargs["xcd_swizzle"]}
@@ -845,13 +838,8 @@ def test_fhmoe_runtime_uses_layout_v2_stage2(monkeypatch: pytest.MonkeyPatch):
         compile_calls.append((1, kwargs))
         return 1
 
-    def run_v2_stage2(**kwargs):
-        stage2_calls.append(kwargs)
-        return 2
-
     monkeypatch.setattr(fhmoe, "_flydsl_moe_stage1_impl", invoke_compiler)
     monkeypatch.setattr(fhmoe, "compile_flydsl_fhmoe_stage1", compile_stage1)
-    monkeypatch.setattr(fused_moe, "_flydsl_v2_stage2_wrapper", run_v2_stage2)
 
     assert (
         fhmoe.flydsl_fhmoe_stage1(
@@ -868,21 +856,6 @@ def test_fhmoe_runtime_uses_layout_v2_stage2(monkeypatch: pytest.MonkeyPatch):
         )
         == 1
     )
-    assert (
-        fhmoe.flydsl_fhmoe_stage2(
-            tensor,
-            tensor,
-            tensor,
-            tensor,
-            tensor,
-            shared_w2=tensor,
-            shared_w2_scale=tensor,
-            shared_expert_id=8,
-            xcd_swizzle=4,
-            kernelName="flydsl_moe2_layout_afp8_wfp4_bf16_t32x256x256_atomic_sbm32",
-        )
-        == 2
-    )
     assert compile_calls == [
         (
             1,
@@ -893,8 +866,6 @@ def test_fhmoe_runtime_uses_layout_v2_stage2(monkeypatch: pytest.MonkeyPatch):
             },
         ),
     ]
-    assert stage2_calls[0]["shared_expert_id"] == 8
-    assert stage2_calls[0]["kernelName"].startswith("flydsl_moe2_layout_")
 
 
 def test_fhmoe_aot_jobs_preserve_xcd_swizzling():

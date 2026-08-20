@@ -117,32 +117,19 @@ def extend_fhmoe_jobs(
     # v2 launcher ABI.
     from aiter.ops.flydsl.mxfp4_kname import parse_flydsl_v2_gemm2_kernel
 
+    stage1_by_shape = {
+        _job_key(job)[:9]: job for job in fhmoe_jobs if job.get("stage") == 1
+    }
     for row in eligible_rows:
         stage2_name = row.get("kernelName2", "").strip()
         stage2_params = parse_flydsl_v2_gemm2_kernel(stage2_name)
         if stage2_params is None:
             continue
-        token = int(row["token"])
-        model_dim = int(row["model_dim"])
-        inter_dim = int(row["inter_dim"])
-        experts = int(row["expert"])
-        topk = int(row["topk"])
-        block_m = int(row.get("block_m", "0") or "0")
-        cu_num = int(row.get("cu_num", "0"))
-        act = _normalized_enum(row.get("act_type", ""))
         base = next(
             (
-                job
-                for job in fhmoe_jobs
-                if job.get("stage") == 1
-                and job["token_num"] == token
-                and job["model_dim"] == model_dim
-                and job["inter_dim"] == inter_dim
-                and job["experts"] == experts
-                and job["topk"] == topk
-                and job["block_m"] == block_m
-                and job["cu_num"] == cu_num
-                and job["act"] == act
+                stage1_by_shape.get(key[:9])
+                for key in _row_job_keys(row)
+                if key[9] == stage2_name
             ),
             None,
         )
@@ -150,19 +137,15 @@ def extend_fhmoe_jobs(
             continue
         fhmoe_job = {
             **base,
+            **{
+                key: value
+                for key, value in stage2_params.items()
+                if key not in ("epilog", "bf16_lds", "spart")
+            },
             "stage": 2,
             "kernel_name": stage2_name,
             "stage1_fuse_quant": stage2_params["a_dtype"],
-            "a_dtype": stage2_params["a_dtype"],
-            "b_dtype": stage2_params["b_dtype"],
-            "out_dtype": stage2_params["out_dtype"],
-            "tile_m": stage2_params["tile_m"],
-            "tile_n": stage2_params["tile_n"],
-            "tile_k": stage2_params["tile_k"],
             "mode": stage2_params["epilog"],
-            "persist": stage2_params["persist"],
-            "sort_block_m": stage2_params["sort_block_m"],
-            "use_nt": stage2_params["use_nt"],
             "v2": True,
         }
         key = job_identity(fhmoe_job)
@@ -264,17 +247,7 @@ class _FHMoEAOTBackend:
         # compilation never launches or dereferences these buffers, so integer
         # address placeholders are required here; ptr_arg() creates Pointer
         # values, which fail in v2's global_typed_ptr() during MLIR emission.
-        return (
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
+        return (0,) * 10 + (
             token_num,
             blocks,
             blocks,

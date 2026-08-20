@@ -642,6 +642,7 @@ def compile_flydsl_moe_stage1(
     xcd_swizzle: int = 0,
     k_wave: int = 1,
     v2_output_layout: bool = False,
+    _shared_expert_id: int | None = None,
 ):
     """Compile stage1 kernel (cached via underlying lru_cache)."""
     # a16w-mix (bf16 A x {fp4 mxfp4, int4} W): build the ported gemm1
@@ -704,6 +705,7 @@ def compile_flydsl_moe_stage1(
             xcd_swizzle=xcd_swizzle,
             k_wave=k_wave,
             v2_output_layout=v2_output_layout,
+            _shared_expert_id=_shared_expert_id,
         )
     else:
         raise ValueError(
@@ -730,6 +732,7 @@ def compile_flydsl_moe_stage2(
     use_async_copy: bool = False,
     cu_num_mul: int = 1,
     b_nt: int = 0,
+    use_nt: bool | None = None,
     model_dim_pad: int = 0,
     inter_dim_pad: int = 0,
     xcd_swizzle: int = 0,
@@ -1707,7 +1710,6 @@ def _flydsl_moe_stage1_impl(
         "xcd_swizzle": xcd_swizzle,
         "k_wave": k_wave,
     }
-    # The injected FHMoE compiler does not implement the v2 sorted-row layout.
     if _v2_output_layout:
         compile_kwargs["v2_output_layout"] = True
     exe = _compile_kernel(**compile_kwargs)
