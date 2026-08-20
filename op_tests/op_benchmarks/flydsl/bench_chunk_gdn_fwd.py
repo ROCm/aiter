@@ -642,7 +642,7 @@ def _auto_variant_for_shape(shape, cu) -> str | None:
     try:
         from aiter.ops.flydsl.linear_attention_prefill_kernels import _auto_variant
         return _auto_variant(H=H, Hg=Hg, V=V, T_flat=T_flat, N=N,
-                             is_varlen=cu is not None, gate=_gate)
+                             is_varlen=cu is not None)
     except Exception:
         return None
 
@@ -733,6 +733,24 @@ def _load_k5_ref():
     return _k5_ref_fn
 
 
+# Verification thresholds.
+_RMSE_TOL = 0.05
+_MAXREL_TOL = 0.25
+
+
+def _verdict(got, want) -> str:
+    """PASS/FAIL string comparing ``got`` to ``want`` on both error measures."""
+    a, b = got.float(), want.float()
+    err = (a - b).abs()
+    ratio = (err.pow(2).mean().sqrt() / (b.pow(2).mean().sqrt() + 1e-8)).item()
+    max_rel = (err.max() / b.abs().max().clamp_min(1e-6)).item()
+    ok = ratio < _RMSE_TOL and max_rel < _MAXREL_TOL
+    return (
+        f"{'PASS' if ok else 'FAIL'}"
+        f"(rmse_ratio={ratio:.2e},max_rel={max_rel:.2e})"
+    )
+
+
 def _verify_k5_impl(fn, k, w_hm, u_hm, w_tm, g, gk, h0, cu, verification,
                     baseline_fn=None) -> str:
     if verification == "none":
@@ -744,10 +762,6 @@ def _verify_k5_impl(fn, k, w_hm, u_hm, w_tm, g, gk, h0, cu, verification,
     except Exception as e:
         return f"ERROR({type(e).__name__})"
 
-    def _rmse_ratio(a, b):
-        diff = (a.float() - b.float()).pow(2).mean().sqrt()
-        return (diff / (b.float().pow(2).mean().sqrt() + 1e-8)).item()
-
     if verification == "reference":
         try:
             ref = _load_k5_ref()
@@ -756,8 +770,7 @@ def _verify_k5_impl(fn, k, w_hm, u_hm, w_tm, g, gk, h0, cu, verification,
                                output_final_state=True, cu_seqlens=cu)
         except Exception as e:
             return f"REF-ERROR({e})"
-        ratio = _rmse_ratio(h, h_ref)
-        return f"{'PASS' if ratio < 0.05 else 'FAIL'}(rmse_ratio={ratio:.2e})"
+        return _verdict(h, h_ref)
 
     if verification == "baseline" and baseline_fn is not None:
         try:
@@ -767,8 +780,7 @@ def _verify_k5_impl(fn, k, w_hm, u_hm, w_tm, g, gk, h0, cu, verification,
                                         use_exp2=_USE_EXP2)
         except Exception as e:
             return f"BASELINE-ERROR({e})"
-        ratio = _rmse_ratio(h, h_base)
-        return f"{'PASS' if ratio < 0.05 else 'FAIL'}(rmse_ratio={ratio:.2e})"
+        return _verdict(h, h_base)
 
     return "N/A"
 
@@ -954,13 +966,11 @@ def _calculate_tflops_k5k6(N, H, T_flat, K, V, time_us, BT=64, seq_lens=None):
 
 def _fused_auto_variant_for_shape(shape, cu) -> str | None:
     """The BV tag the fused kernel's auto selection picks for this shape."""
-    _tag, H, Hg, T_flat, N, _K, V, _BT, gate, _pat = shape
+    _tag, H, _Hg, _T_flat, N, _K, V, _BT, _gate, _pat = shape
+    del cu
     try:
         from aiter.ops.flydsl.linear_attention_prefill_kernels import _fused_bv_for_shape
-        bv, num_waves = _fused_bv_for_shape(
-            H=H, Hg=Hg, V=V, T_flat=T_flat, N=N,
-            is_varlen=cu is not None, gate=gate, variant=None,
-        )
+        bv, num_waves = _fused_bv_for_shape(H=H, V=V, N=N, variant=None)
         return f"bv{bv}w{num_waves}" if num_waves > 4 else f"bv{bv}"
     except Exception:
         return None
@@ -968,7 +978,7 @@ def _fused_auto_variant_for_shape(shape, cu) -> str | None:
 
 def _combined_dispatch_label_for_shape(shape, cu) -> str | None:
     """Show whether the combined wrapper would pick fused or separate for this shape."""
-    _tag, H, Hg, T_flat, N, _K, V, _BT, gate, _pat = shape
+    _tag, H, Hg, T_flat, N, _K, V, _BT, _gate, _pat = shape
     try:
         from aiter.ops.flydsl.linear_attention_prefill_kernels import (
             should_use_fused_gfx942,
@@ -976,18 +986,13 @@ def _combined_dispatch_label_for_shape(shape, cu) -> str | None:
             _auto_variant,
         )
         n = (cu.shape[0] - 1) if cu is not None else 1
-        if should_use_fused_gfx942(
-            H=H, N=n, V=V, gate=gate, is_varlen=cu is not None
-        ):
-            bv, num_waves = _fused_bv_for_shape(
-                H=H, Hg=Hg, V=V, T_flat=T_flat, N=n,
-                is_varlen=cu is not None, gate=gate, variant=None,
-            )
+        if should_use_fused_gfx942(H=H, N=n, V=V):
+            bv, num_waves = _fused_bv_for_shape(H=H, V=V, N=n, variant=None)
             tag = f"bv{bv}w{num_waves}" if num_waves > 4 else f"bv{bv}"
             return f"fused:{tag}"
         else:
             tag = _auto_variant(H=H, Hg=Hg, V=V, T_flat=T_flat, N=n,
-                                is_varlen=cu is not None, gate=gate)
+                                is_varlen=cu is not None)
             return f"separate:{tag}"
     except Exception:
         return None
@@ -1204,10 +1209,7 @@ def _run_one_k5k6(idx, impls, shape, args, cfg) -> dict:
                 o_ref = o_now
                 verify_str = "REF"
             else:
-                diff = (o_now.float() - o_ref.float()).pow(2).mean().sqrt()
-                denom = o_ref.float().pow(2).mean().sqrt() + 1e-8
-                ratio = (diff / denom).item()
-                verify_str = f"{'PASS' if ratio < 5e-2 else 'FAIL'}(rmse={ratio:.2e})"
+                verify_str = _verdict(o_now, o_ref)
 
         timing: dict = {}
         tflops_d: dict = {}

@@ -67,24 +67,18 @@ def _hn_variant(*, H: int, N: int, V: int) -> str | None:
     return tag
 
 
-def select_variant(
-    *, gate: str, H: int, N: int, V: int, is_varlen: bool
-) -> str | None:
+
+def select_variant(*, H: int, N: int, V: int) -> str | None:
     """gfx942 best K5 variant tag from the ``H*N`` grid-size rule.
 
-    ``gate`` and ``is_varlen`` are accepted but do not affect the pick. 
-    Returns None only when the rule's BV is illegal for ``V``, and the caller 
+    Returns None only when the rule's BV is illegal for ``V``, and the caller
     falls back to its cross-arch grid-fill heuristic.
     """
-    del gate, is_varlen
     return _hn_variant(H=H, N=N, V=V)
 
 
-def select_fused_variant(
-    *, gate: str, H: int, N: int, V: int, is_varlen: bool
-) -> str | None:
+def select_fused_variant(*, H: int, N: int, V: int) -> str | None:
     """gfx942 best fused K5+K6 variant tag from the ``H*N`` grid-size rule."""
-    del gate, is_varlen
     return _hn_variant(H=H, N=N, V=V)
 
 

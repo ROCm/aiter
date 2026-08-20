@@ -78,11 +78,6 @@ __all__ = [
 _compiled_kernels = {}
 
 
-def _gate_of(use_g: bool, use_gk: bool) -> str:
-    """Gate rank as used by the tuned table ("gk" dominates when both set)."""
-    return "gk" if use_gk else "g"
-
-
 def _grid_ctas(*, H: int, V: int, N: int, BV: int) -> int:
     return max(1, N) * H * ((V + BV - 1) // BV)
 
@@ -120,31 +115,28 @@ _GFX942_MIN_FILL = 0.37
 _K5_VARIANT_ENV = "FLYDSL_GDN_K5_VARIANT"
 
 
-def _auto_variant(*, gate: str | None = None, **kw) -> str:
+def _auto_variant(**kw) -> str:
     """The shape-adaptive choice, as a variant tag.
 
     Arch dispatcher: on gfx942, defer to the gfx942 kernel module's measured
-    ``H*N`` rule (``select_variant``). On any other arch (or
-    when the rule's BV is illegal for this V) fall back to ``_heuristic_bv``,
-    the cross-arch grid-fill heuristic. 
+    ``H*N`` rule (``select_variant``). On any other arch (or when the rule's BV
+    is illegal for this V) fall back to ``_heuristic_bv``.
     """
     if _ARCH == "gfx942":
-        tuned = _gfx942_select_variant(
-            gate=gate, H=kw["H"], N=kw["N"], V=kw["V"], is_varlen=kw["is_varlen"]
-        )
+        tuned = _gfx942_select_variant(H=kw["H"], N=kw["N"], V=kw["V"])
         if tuned is not None:
             return tuned
     return f"bv{_heuristic_bv(**kw)}"
 
 
-def _resolve_variant(variant: str | None, *, gate: str | None = None, **kw) -> str:
+def _resolve_variant(variant: str | None, **kw) -> str:
     """Effective variant tag: explicit arg > env var > shape-adaptive.
 
     Mirrors the resolution chain used by the fp8_mqa_logits kernel.
     """
-    tag = variant or os.environ.get(_K5_VARIANT_ENV) or _auto_variant(gate=gate, **kw)
+    tag = variant or os.environ.get(_K5_VARIANT_ENV) or _auto_variant(**kw)
     if tag == K5_DEFAULT_VARIANT:  # env var may legitimately say "auto"
-        tag = _auto_variant(gate=gate, **kw)
+        tag = _auto_variant(**kw)
     bv = _bv_of_variant(tag)
     legal = _legal_bv_candidates(kw["V"])
     if bv not in legal:
@@ -667,7 +659,6 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
             T_flat=T_flat,
             N=N,
             is_varlen=is_varlen,
-            gate=_gate_of(use_g, use_gk),
         )
     )
 
@@ -727,9 +718,7 @@ _compiled_fused_kernels: dict = {}
 # grid over-fills the device by at least this fraction.
 _FUSED_MIN_FILL = 0.45
 
-def should_use_fused_gfx942(
-    *, H: int, N: int, V: int, gate: str | None = None, is_varlen: bool | None = None
-) -> bool:
+def should_use_fused_gfx942(*, H: int, N: int, V: int) -> bool:
     """Heuristic: is the fused K5+K6 kernel the faster choice for this shape?
 
     Rule (gfx942): fuse iff the fused kernel's ACTUAL grid fill clears
@@ -737,17 +726,11 @@ def should_use_fused_gfx942(
 
         fill = ceil(V / BV_run) * N * H / CU_count  >=  _FUSED_MIN_FILL
 
-    where ``BV_run`` comes from ``_fused_bv_for_shape``. ``gate`` and
-    ``is_varlen`` are accepted for signature compatibility but do not affect ``BV_run`.
-    Off-arch always returns False (the fused kernel is tested only on gfx942).
+    where ``BV_run`` comes from ``_fused_bv_for_shape``.
     """
     if _ARCH != "gfx942":
         return False
-    # Hg/T_flat/gate/is_varlen are unused by the fused BV rule; pass placeholders.
-    bv_run, _ = _fused_bv_for_shape(
-        H=H, Hg=H, V=V, T_flat=0, N=N, is_varlen=bool(is_varlen),
-        gate=gate, variant=None,
-    )
+    bv_run, _ = _fused_bv_for_shape(H=H, V=V, N=N, variant=None)
     fill = _grid_ctas(H=H, V=V, N=N, BV=bv_run) / max(_device_cu_count(), 1)
     return fill >= _FUSED_MIN_FILL
 
@@ -758,7 +741,7 @@ def should_use_fused_gfx942(
 _FUSED_W8_MIN_FILL = 0.55
 
 
-def _fused_bv_for_shape(*, H, Hg, V, T_flat, N, is_varlen, gate, variant):
+def _fused_bv_for_shape(*, H, V, N, variant):
     """Return ``(BV, num_waves)`` for the fused kernel.
 
     An explicit ``variant`` is honoured (incl. ``bv64w8``); 
@@ -791,12 +774,9 @@ def _fused_bv_for_shape(*, H, Hg, V, T_flat, N, is_varlen, gate, variant):
                 f"supported at BV=64 (needs N_REPEAT >= NR_SPLIT); use bv64w8."
             )
         return bv, num_waves
-    # Measured-best fused variant for this signature (gfx942 only); a miss falls
-    # through to the grid-fill heuristic below.
+    
     if _ARCH == "gfx942":
-        tuned = _gfx942_select_fused_variant(
-            gate=gate, H=H, N=N, V=V, is_varlen=is_varlen
-        )
+        tuned = _gfx942_select_fused_variant(H=H, N=N, V=V)
         if tuned is not None:
             return _bv_waves_of_variant(tuned)
     bv = min(
@@ -911,10 +891,7 @@ def _run_fused_gfx942(
     )
     stream = torch.cuda.current_stream()
 
-    BV, num_waves = _fused_bv_for_shape(
-        H=H, Hg=Hg, V=V, T_flat=T_flat, N=N, is_varlen=is_varlen,
-        gate=_gate_of(use_g, use_gk), variant=variant,
-    )
+    BV, num_waves = _fused_bv_for_shape(H=H, V=V, N=N, variant=variant)
     NR_SPLIT = num_waves // (BT // 16)
 
     cache_key = (
@@ -1089,16 +1066,12 @@ def chunk_gated_delta_rule_fwd_h_o_auto(
     H = w.shape[1]
     V = u.shape[-1]
     N = (cu_seqlens.shape[0] - 1) if cu_seqlens is not None else q.shape[0]
-    gate = _gate_of(g is not None, gk is not None)
-    is_varlen = cu_seqlens is not None
 
     use_fused = (
         resolved_fusion == K5K6Fusion.ALWAYS
         or (
             resolved_fusion == K5K6Fusion.AUTO
-            and should_use_fused_gfx942(
-                H=H, N=N, V=V, gate=gate, is_varlen=is_varlen
-            )
+            and should_use_fused_gfx942(H=H, N=N, V=V)
         )
     )
 
