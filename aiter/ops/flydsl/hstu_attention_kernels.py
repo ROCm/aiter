@@ -460,6 +460,7 @@ def _validate_bwd_inputs(
     dout: torch.Tensor,
     seq_offsets: torch.Tensor,
     num_targets: torch.Tensor | None,
+    max_seq_len: int,
 ) -> tuple[int, int, int, int, str]:
     """Validate backward inputs, reusing the forward's q/k/v checks.
 
@@ -472,6 +473,7 @@ def _validate_bwd_inputs(
         v=v,
         seq_offsets=seq_offsets,
         num_targets=num_targets,
+        max_seq_len=max_seq_len,
     )
 
     if not dout.is_cuda:
@@ -782,6 +784,7 @@ def flydsl_hstu_attention_bwd(
         dout=dout,
         seq_offsets=seq_offsets,
         num_targets=num_targets,
+        max_seq_len=N,
     )
 
     # Two single-writer kernels (no atomics): the fused dV+dK kernel reduces over
@@ -894,6 +897,7 @@ def _make_bwd_kernel_runners(
         dout=dout,
         seq_offsets=seq_offsets,
         num_targets=num_targets,
+        max_seq_len=N,
     )
     dvdk_launcher, dq_launcher = _compile_bwd_launcher(
         batch=batch,

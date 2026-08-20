@@ -193,7 +193,7 @@ def test_reference_oracle_runs():
         (0, 64, 0),  # contextual prefix
         (64, 0, 20),  # window + targets
         # semi_local_fig: window well below seq_len + targets. Exercises the
-        # dV/dK targets-aware n_q_tiles cap — KV tiles far from the target tail get
+        # dV/dK targets-aware n_q_tiles cap -- KV tiles far from the target tail get
         # their query sweep capped, while tiles inside the window of max_id must
         # reopen to seq_len so the (raw-position-distant, id-clamped) target queries
         # still contribute. A raw-position-only cap would drop them.
@@ -280,7 +280,7 @@ def _qkv_do(batch=2, tokens=8, heads=4, attn_dim=128, hidden_dim=128, device="cu
 @requires_cuda
 def test_validate_bwd_inputs_ok():
     q, k, v, dout, seq_offsets = _qkv_do(batch=2, heads=4, attn_dim=128, hidden_dim=96)
-    actual = _validate_bwd_inputs(q, k, v, dout, seq_offsets, None)
+    actual = _validate_bwd_inputs(q, k, v, dout, seq_offsets, None, max_seq_len=8)
     assert actual == (2, 4, 128, 96, "bf16")
 
 
@@ -291,7 +291,7 @@ def test_validate_bwd_inputs_rejects_dout_shape_mismatch():
         (v.shape[0], v.shape[1], v.shape[2] + 16), dtype=v.dtype, device=v.device
     )
     with pytest.raises(ValueError):
-        _validate_bwd_inputs(q, k, v, dout, seq_offsets, None)
+        _validate_bwd_inputs(q, k, v, dout, seq_offsets, None, max_seq_len=8)
 
 
 @requires_cuda
@@ -299,13 +299,13 @@ def test_validate_bwd_inputs_rejects_dout_dtype_mismatch():
     q, k, v, dout, seq_offsets = _qkv_do()
     dout = dout.to(torch.float16)
     with pytest.raises(ValueError):
-        _validate_bwd_inputs(q, k, v, dout, seq_offsets, None)
+        _validate_bwd_inputs(q, k, v, dout, seq_offsets, None, max_seq_len=8)
 
 
 def test_validate_bwd_inputs_rejects_cpu_tensors():
     q, k, v, dout, seq_offsets = _qkv_do(device="cpu")
     with pytest.raises(ValueError):
-        _validate_bwd_inputs(q, k, v, dout, seq_offsets, None)
+        _validate_bwd_inputs(q, k, v, dout, seq_offsets, None, max_seq_len=8)
 
 
 # --------------------------------------------------------------------------- #

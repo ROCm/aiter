@@ -195,10 +195,19 @@ def run_benchmark(args):
             )
 
             if mode == "fwd":
+
                 def run_fwd():
                     return flydsl_hstu_attention_fwd(
-                        max_seq_len, alpha, q, k, v, seq_offsets, causal,
-                        num_targets, 0, 0,
+                        max_seq_len,
+                        alpha,
+                        q,
+                        k,
+                        v,
+                        seq_offsets,
+                        causal,
+                        num_targets,
+                        0,
+                        0,
                     )
 
                 ms = triton.testing.do_bench(run_fwd, warmup=25, rep=100)
@@ -207,8 +216,18 @@ def run_benchmark(args):
 
                 def run_bwd():
                     return flydsl_hstu_attention_bwd(
-                        max_seq_len, alpha, q, k, v, do, seq_offsets, causal,
-                        num_targets, 0, 0, sort_by_length=args.sort_by_length,
+                        max_seq_len,
+                        alpha,
+                        q,
+                        k,
+                        v,
+                        do,
+                        seq_offsets,
+                        causal,
+                        num_targets,
+                        0,
+                        0,
+                        sort_by_length=args.sort_by_length,
                     )
 
                 ms = triton.testing.do_bench(run_bwd, warmup=25, rep=100)
@@ -389,7 +408,10 @@ def main():
     args = parse_args()
     if args.print_vgpr:
         print("Retrieving VGPR usage for Triton kernels...")
-        fun = lambda: run_benchmark(args)
+
+        def fun():
+            run_benchmark(args)
+
         print_vgpr(fun, get_caller_name_no_ext())
         return 0
     run_benchmark(args)
