@@ -19,6 +19,15 @@ from aiter.test_common import (
     tensor_load,
 )
 
+# gfx950-only: aiter.pa_decode_opus raises on anything else, so the arch has to
+# gate the call. Mirrors the op's own check so the two cannot disagree.
+try:
+    from aiter.jit.utils.chip_info import get_gfx_runtime
+
+    HAS_OPUS_PA_DECODE = torch.cuda.is_available() and get_gfx_runtime() == "gfx950"
+except Exception:  # noqa: BLE001
+    HAS_OPUS_PA_DECODE = False
+
 uniform_range = (-1, 1)
 STR_DTYPE_TO_TORCH_DTYPE = {
     "half": torch.half,
@@ -710,11 +719,12 @@ def test_paged_attention(
         time_aiter_asm_bf16 = time_aiter_asm
         # tensor_dump(out_aiter, 'out_aiter')
 
-    # OPUS decode kernel: bf16 / head_size 128 / page 16 / GQA <= 16 only, and it
-    # has no alibi path, so everything outside that envelope is skipped.
+    # OPUS decode kernel: gfx950, bf16, head_size 128, page 16, GQA <= 16, no
+    # alibi -- everything outside that envelope is skipped.
     time_aiter_opus = None
     if (
-        dtype == dtypes.bf16
+        HAS_OPUS_PA_DECODE
+        and dtype == dtypes.bf16
         and kv_cache_dtype == "auto"
         and head_size == 128
         and block_size == 16

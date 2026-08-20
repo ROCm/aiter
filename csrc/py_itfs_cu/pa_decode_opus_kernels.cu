@@ -8,6 +8,18 @@
 #define PA_DECODE_OPUS_IMPL
 #include "pa_decode_opus.h"
 
+// Smallest run of KV tiles a split may own. On a short context this, not the CU
+// count, is what caps the split count. Tune with op_tests/sweep_min_tiles_per_split.sh.
+#ifndef PA_DECODE_MIN_TILES_PER_SPLIT
+#define PA_DECODE_MIN_TILES_PER_SPLIT 4
+#endif
+
+// Resident workgroups per CU the split heuristic aims for. Also bounds the split
+// scratch below, which is why it is one constant and not two.
+#ifndef PA_DECODE_WGS_PER_CU
+#define PA_DECODE_WGS_PER_CU 1
+#endif
+
 #include "aiter_hip_common.h"
 #include "aiter_stream.h"
 #include "aiter_tensor.h"
@@ -15,22 +27,14 @@
 #include <mutex>
 #include <unordered_map>
 
-// Split-KV scratch, allocated once per stream and kept for the process.
+// Split-KV scratch, allocated once per stream and kept for the process: at small
+// batch the kernel runs in a few microseconds, so a per-call allocate/free pair
+// would sit on the critical path of every decode step.
 //
-// A per-call hipMallocAsync/hipFreeAsync pair is not affordable here. At small
-// batch the kernel itself takes only a few microseconds, so the launch path --
-// two stream-ordered allocator calls on top of the launch itself -- is what the
-// benchmark actually measures. Even against a primed pool, the two API calls
-// stay on the critical path of every decode step.
-//
-// A fixed buffer works because the slot count is structurally bounded: splits
-// are chosen so that base_wgs * num_splits <= num_cu, so no batch shape can ask
-// for more slots than the device has CUs. That caps the scratch at a couple of
-// MB, which is worth holding onto permanently. Since it never grows, there is
-// also no allocation to trip over during HIP graph capture.
-//
-// Keyed by stream, like the opus_gemm splitk workspace: concurrent streams must
-// not share one buffer or their partials would overwrite each other.
+// A fixed buffer works because the slot count is bounded -- splits are chosen so
+// that base_wgs * num_splits <= num_cu * PA_DECODE_WGS_PER_CU -- which caps the
+// scratch at a few MB and leaves no allocation to trip over during graph capture.
+// Keyed by stream: concurrent streams must not share one buffer.
 namespace {
 struct SplitScratchRegistry
 {
@@ -60,16 +64,13 @@ static void* split_scratch_get(hipStream_t stream, size_t bytes)
                 "eagerly on this stream before capturing.");
 
     void* ptr = nullptr;
-    // Uncached, so the partials are visible device-wide as soon as the stores
-    // retire. This buffer is the one place the split workgroups hand data to
-    // each other, and on a multi-XCD part the L2s are not coherent between them,
-    // so the alternative is a __threadfence() in every split -- which writes back
-    // the whole L2 and measured at 28us of the 41us kernel. Bypassing the cache
-    // for these few KB is far cheaper than flushing it for everything else.
+            // Uncached, so the partials are visible device-wide as soon as the stores
+            // retire. This is the one place the split workgroups hand data to each
+            // other, and a multi-XCD part's L2s are not coherent; the alternative is
+            // a __threadfence() per split, which writes back the whole L2.
     HIP_CALL(hipExtMallocWithFlags(&ptr, bytes, hipDeviceMallocUncached));
-    // The arrival counters at the tail have to start at zero. This is the only
-    // time they are cleared: the kernel's last split resets its own counter, so
-    // the buffer comes back clean after every launch.
+        // The arrival counters at the tail start at zero and are cleared only here:
+        // the kernel's last split resets its own counter after every launch.
     HIP_CALL(hipMemset(ptr, 0, bytes));
     reg.map[stream] = ptr;
     return ptr;
@@ -173,27 +174,22 @@ void pa_decode_opus_fwd(aiter_tensor_t& q,
 
     // ---- Pick a split count --------------------------------------------------
     //
-    // The natural grid is one workgroup per (kv head, batch), which leaves the
-    // GPU mostly idle at small batch: a single sequence with 8 kv heads occupies 8
-    // of 256 CUs. Splitting the KV axis buys back that parallelism, at the cost of
-    // a second pass to merge the per-split softmax partials. Large batches already
-    // fill the machine, so they keep the single-pass path.
-    //
-    // The second pass is not free: even fused into the last arriving workgroup it
-    // costs a workspace allocation and a round trip through global memory. Short
-    // contexts have to be kept off this path or the merge outweighs the parallelism
-    // it buys, so every split is required to carry a few tiles of its own.
-    constexpr int min_tiles_per_split = 4;
+    // One workgroup per (kv head, batch) leaves the GPU mostly idle at small batch,
+    // so the KV axis is split and the per-split partials merged afterwards. Large
+    // batches already fill the machine and keep the single-pass path; short contexts
+    // are kept off it by requiring min_tiles_per_split tiles per split.
+    constexpr int min_tiles_per_split = PA_DECODE_MIN_TILES_PER_SPLIT;
     int num_cu = 0;
     HIP_CALL(hipDeviceGetAttribute(&num_cu, hipDeviceAttributeMultiprocessorCount, q.device_id));
 
     const int base_wgs  = num_kv_heads * batch; //base workgroups
+    const int wg_budget = num_cu * PA_DECODE_WGS_PER_CU;
     const int max_tiles = (kargs.max_blocks_per_batch_row * Traits::PAGE_SIZE + Traits::KV_TILE - 1)
                             / Traits::KV_TILE;
     int num_splits = 1;
-    if(base_wgs < num_cu && max_tiles >= 2 * min_tiles_per_split)
+    if(base_wgs < wg_budget && max_tiles >= 2 * min_tiles_per_split)
     {
-        num_splits = num_cu / base_wgs;
+        num_splits = wg_budget / base_wgs;
         if(num_splits > max_tiles / min_tiles_per_split) num_splits = max_tiles / min_tiles_per_split;
         if(num_splits > Traits::MAX_SPLITS) num_splits = Traits::MAX_SPLITS;
         if(num_splits < 1) num_splits = 1;
@@ -210,11 +206,10 @@ void pa_decode_opus_fwd(aiter_tensor_t& q,
         return;
     }
 
-    // One slot holds a split's partial O plus its (m, l) pair. The buffer is
-    // cached per stream and never resized, so it is sized for the widest launch
-    // the heuristic can ask for rather than for this one: num_splits is capped at
-    // num_cu / base_wgs, which bounds the slot count by num_cu.
-    const size_t slot_max  = static_cast<size_t>(num_cu);
+    // One slot holds a split's partial O plus its (m, l) pair. Never resized, so it
+    // is sized for the widest launch the heuristic can ask for: num_splits is capped
+    // at wg_budget / base_wgs, which bounds the slot count by wg_budget.
+    const size_t slot_max  = static_cast<size_t>(wg_budget);
     const size_t slots     = static_cast<size_t>(batch) * num_kv_heads * num_splits;
     const size_t o_bytes   = slots * Traits::Q_TILE * Traits::D_HEAD * sizeof(float);
     const size_t ml_bytes  = slot_max * Traits::Q_TILE * 2 * sizeof(float);
@@ -229,9 +224,8 @@ void pa_decode_opus_fwd(aiter_tensor_t& q,
     kargs.partial_ml       = reinterpret_cast<float*>(scratch + o_bytes);
     kargs.split_counters   = reinterpret_cast<unsigned int*>(scratch + o_max + ml_bytes);
 
-    // One launch: the split that arrives last merges the partials in place,
-    // rather than a second grid being stood up to do it. That pass measured
-    // 4-5us on every shape it ran for, essentially all of it dispatch cost.
+        // One launch: the split that arrives last merges the partials in place,
+        // rather than a second grid being stood up to do it.
     pa_decode_opus_kernel<Traits>
         <<<dim3(num_kv_heads, batch, num_splits), block, 0, stream>>>(kargs);
     HIP_CALL_LAUNCH(hipGetLastError());

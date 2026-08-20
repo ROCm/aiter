@@ -41,16 +41,9 @@ void pa_decode_opus_fwd(aiter_tensor_t& q,
 
 using bf16_t = __bf16;
 
-// KV tile depth: how many KV tokens one main-loop iteration consumes.
-//
-// K and V go straight from the cache into the matrix-core fragments, so the tile
-// is paid for in registers, not LDS, and occupancy tracks it directly. On gfx950
-// (VGPR+AGPR, waves/SIMD): 64 -> 89+8, 4;  128 -> 129+8, 3;  256 -> 217+16, 2;
-// 512 -> 256+161, 1; LDS stays under 17KB throughout and never binds. HBM
-// streaming is flat over 64..256 (two waves already saturate it) while a
-// cache-resident working set follows occupancy, so 128 is the compromise:
-// fastest of the four streaming, within 2.5% of the best cache-resident.
-// Re-measure with op_tests/sweep_kv_tile.sh and op_tests/kv_tile_resources.sh.
+// KV tile depth: how many KV tokens one main-loop iteration consumes. K and V go
+// straight into the MFMA fragments, so the tile is paid for in registers and sets
+// occupancy directly. Tune with op_tests/sweep_kv_tile.sh.
 #ifndef PA_DECODE_KV_TILE
 #define PA_DECODE_KV_TILE 128
 #endif
@@ -67,8 +60,8 @@ struct pa_decode_kargs
     // Split-KV scratch, only used when num_splits > 1.
     float* __restrict__ partial_o;  // [batch][num_kv_heads][num_splits][Q_TILE][D]
     float* __restrict__ partial_ml; // [batch][num_kv_heads][num_splits][2][Q_TILE]
-    // One arrival counter per (batch, kv-head). Zeroed at allocation, and left
-    // zeroed by whichever split arrives last, so no per-call memset is needed.
+    // One arrival counter per (batch, kv-head), left zeroed by whichever split
+    // arrives last, so no per-call memset is needed.
     unsigned int* __restrict__ split_counters;
     int num_splits;
     int batch;
@@ -99,12 +92,6 @@ struct pa_decode_kargs
 // Q is loaded once and O accumulates across tiles, so only K and V stream. Q_TILE
 // is the MFMA's M and also the largest GQA ratio supported, so one tile carries
 // every query head that shares this kv-head.
-//
-// The `16mx1_16nx4` namespace names GEMM0's wave tiling: `16mx1` = W_M=16 query
-// rows by T_M=1 wave, the whole Q_TILE; `16nx4` = W_N=16 tokens by T_N=4 waves,
-// one 64-token step along KV repeated GEMM0_E_N = KV_TILE/(W_N*T_N) times. The
-// name is thus independent of KV_TILE, unlike sp3's `64nx4`, which counts a
-// wave's KV columns.
 template<int D_HEAD_ = 128, int KV_TILE_ = 128, int PAGE_SIZE_ = 16, int NUM_WARPS_ = 4>
 struct pa_decode_traits
 {
@@ -119,10 +106,8 @@ struct pa_decode_traits
     static constexpr int BLOCK_SIZE = NUM_WARPS * WARP_SIZE;
     static constexpr int Q_TILE     = 16; // MFMA M, also the max supported GQA ratio
 
-    // Upper bound on KV splits: num_splits is a runtime value, but the fused
-    // merge indexes LDS by split, so this statically sizes that buffer. Raising
-    // it past the point where smem_reduce_bytes() overtakes the attention side
-    // grows LDS for every shape, including the ones that never split.
+    // Upper bound on KV splits: the fused merge indexes LDS by split, so this
+    // statically sizes that buffer.
     static constexpr int MAX_SPLITS = 64;
 
     // Wave tiling: 1 wave along M, all waves along N.
@@ -154,30 +139,24 @@ struct pa_decode_traits
     static constexpr int K_PACK = 16 / sizeof(D_ATTN);
     static constexpr int VEC    = 16 / sizeof(D_ATTN); // widest global vector, 8 bf16
 
-    // Lane counts, not thread groups: GRP is opus's name for the dims of an MFMA
-    // operand spread across lanes (the <p> dims of
-    // `B:[(grpn_b<p>), (rept_b, grpk_b<p>, pack_b)]` in opus.hpp). These restate
-    // mfma_adaptor::grpn_b/::grpk_b, unreachable here because the static_asserts
-    // below run before any mma object exists. The 64 lanes form a GRP_K by GRP_N
-    // grid: lane % GRP_N picks the N position, lane / GRP_N the contraction
-    // slice, VEC elements each, so the slices span W_K.
+    // Lane counts, not thread groups. The 64 lanes form a GRP_K by GRP_N grid:
+    // lane % GRP_N picks the N position, lane / GRP_N the contraction slice of VEC
+    // elements. Restates mfma_adaptor::grpn_b/::grpk_b, which the static_asserts
+    // below cannot reach because they run before any mma object exists.
     static constexpr int GRP_N = W_N;             // == mfma_adaptor::grpn_b
     static constexpr int GRP_K = WARP_SIZE / W_N; // == mfma_adaptor::grpk_b
     // How many lane groups share one page when walking V along tokens.
     static constexpr int KGRP_PER_PAGE = PAGE_SIZE / VEC;
 
-    // Only P is staged through LDS: K and V go straight from global into the
-    // matrix-core fragments and S never leaves registers, so LDS is needed only
-    // where a wave reads what another wave produced -- for P that is every
-    // element, since GEMM1 contracts the token dim that splits the waves. The
-    // tile is [Q_TILE][KV_TILE]; PAD staggers rows off each other's banks.
+    // Only P is staged through LDS: GEMM1 contracts the token dim that splits the
+    // waves, so every element crosses lanes. K, V and S never leave registers.
+    // The tile is [Q_TILE][KV_TILE]; PAD staggers rows off each other's banks.
     static constexpr int PAD          = 8;
     static constexpr int P_ROW_STRIDE = KV_TILE + PAD;
 
     static constexpr int smem_p_elems = Q_TILE * P_ROW_STRIDE;
-    // Cross-wave row reduction scratch, laid out [row][wave] so a row's T_N
-    // contributions fold with one 16B LDS read. Used twice at the same
-    // addresses: each tile's max fold, then the final l sum.
+    // Cross-wave row reduction scratch, [row][wave] so a row's T_N values fold in
+    // one 16B LDS read: each tile's max fold, then the final l sum.
     static constexpr int smem_row_reduce_elems = Q_TILE * T_N;
 
     static_assert(Q_TILE == W_M, "one MFMA tile along M");
@@ -186,9 +165,9 @@ struct pa_decode_traits
     static_assert(D_HEAD % (W_N * T_N) == 0);
     static_assert(KV_TILE % W_K == 0);
     static_assert(D_HEAD % W_K == 0);
-    // Softmax runs on the GEMM0 C fragment, where a query row is spread over the
-    // lanes {r, r+16, r+32, r+48} of each wave. That is exactly the reach of a
-    // permlane32/permlane16 swap pair, which is what lets S stay in registers.
+    // A query row lands on lanes {r, r+16, r+32, r+48} of the GEMM0 C fragment,
+    // exactly the reach of a permlane32/permlane16 pair -- what lets S stay in
+    // registers.
     static_assert(W_M == 16, "a C fragment row must span four 16-lane groups");
     static_assert(WARP_SIZE == 64);
 
@@ -204,12 +183,12 @@ struct pa_decode_traits
     static_assert(GEMM1_E_K * (GRP_K / KGRP_PER_PAGE) == PAGES_PER_TILE,
                   "V's K steps must walk exactly the tile's pages");
 
-    // The split-KV merge reuses this allocation -- the P tile and the row-reduce
-    // scratch are both dead by the time it runs -- so the union costs it no LDS.
-    // At KV_TILE=128 the attention side is the larger.
+    // Reused by the split-KV merge -- the P tile and row-reduce scratch are dead by
+    // then. Holds every split's (m, l) plus one reciprocal per query row; the
+    // per-split scale overwrites m in place.
     static constexpr size_t smem_reduce_bytes()
     {
-        return static_cast<size_t>(MAX_SPLITS * Q_TILE + Q_TILE) * sizeof(D_ACC);
+        return static_cast<size_t>(2 * MAX_SPLITS * Q_TILE + Q_TILE) * sizeof(D_ACC);
     }
 
     static constexpr size_t smem_size_bytes()
@@ -258,18 +237,12 @@ __device__ inline float* partial_o_ptr(const pa_decode_kargs& kargs, int b, int 
     return kargs.partial_o + partial_slot<T>(kargs, b, kvh, split) * T::Q_TILE * T::D_HEAD;
 }
 
-// Where this lane's K and V fragments sit inside a page. Only the page base
-// moves per tile, so this is computed once.
-//
-// The cache layouts hand the matrix cores exactly what they want: a B fragment
-// needs lane l to hold column l%16 and 8 consecutive contraction positions, and
-// both caches store those 8 values in 16 contiguous bytes (K is
-// [D/K_PACK][PAGE][K_PACK], a lane walks one token's head dims; V is [D][PAGE],
-// a lane walks 8 tokens of one head dim). Every fragment is one dwordx4 straight
-// from the cache, and the KV tile never goes through LDS. K lines one MFMA tile
-// up with one page (GRP_N == PAGE_SIZE) so its page index is wave-uniform; V
-// spans PAGE_SIZE/VEC lane groups per page, so its index alternates on the upper
-// half of the wave.
+// Where this lane's K and V fragments sit inside a page; only the page base moves
+// per tile, so this is computed once. Both caches already store a lane's 8
+// contraction values in 16 contiguous bytes (K is [D/K_PACK][PAGE][K_PACK], a lane
+// walks one token's head dims; V is [D][PAGE], a lane walks 8 tokens of one head
+// dim), so every fragment is one dwordx4 and the KV tile never goes through LDS.
+// K's page index is wave-uniform; V's alternates on the upper half of the wave.
 template<class T>
 struct kv_frag_slice
 {
@@ -290,27 +263,17 @@ struct kv_frag_slice
     }
 };
 
-// Page indices for one KV tile, kept in registers a full iteration ahead of the
-// KV loads that consume them.
+// Page indices for one KV tile, kept in registers an iteration ahead of the loads.
 template<class T>
 struct page_ids_t
 {
     int id[T::PAGES_PER_TILE];
 };
 
-// Read one tile's worth of block-table entries.
-//
-// The buffer's num_records stops at this split's last page, so a slot past the
-// end reads 0 with no bounds check in the instruction stream. Page 0 is a valid
-// index, but the tokens it stands in for sit past the context length, so the
-// tail tile masks their scores anyway. The buffer (rather than a raw pointer) is
-// what keeps the reads wide: an explicit guard -- branch or clamp -- makes every
-// slot its own expression, costing a dword load plus a 64-bit address chain per
-// page against two dwordx4 for the whole tile here.
-//
-// Hoisting the wave-uniform ids into SGPRs with readfirstlane measured as a wash:
-// readfirstlane has to wait on the load, which anchors the block-table round trip
-// in front of GEMM0 instead of letting the address math sink in among the MFMAs.
+// Read one tile's worth of block-table entries. The buffer's num_records stops at
+// this split's last page, so a slot past the end reads 0 with no bounds check in
+// the instruction stream; page 0 is a valid index, but the tail tile masks the
+// scores of the tokens it stands in for. Two dwordx4 cover the whole tile.
 template<class T, class G>
 __device__ inline page_ids_t<T> load_page_ids(G& g_bt, int tile_idx)
 {
@@ -324,10 +287,9 @@ __device__ inline page_ids_t<T> load_page_ids(G& g_bt, int tile_idx)
     return pid;
 }
 
-// Page indices for the K fragments of one wave. A K MFMA tile is exactly one
-// page, so wave w only ever reads pages {i_n * T_N + w}. Reading just those
-// keeps the array indices compile-time constant; indexing the whole-tile array
-// by a runtime wave id becomes an s_cselect chain or spills to scratch.
+// Page indices for the K fragments of one wave. A K MFMA tile is exactly one page,
+// so wave w only ever reads pages {i_n * T_N + w}; reading just those keeps the
+// array indices compile-time constant instead of an s_cselect chain.
 template<class T>
 struct k_page_ids_t
 {
@@ -346,16 +308,11 @@ __device__ inline k_page_ids_t<T> load_k_page_ids(G& g_bt, int tile_idx, int war
     return pid;
 }
 
-// Read one tile's K fragments straight from the cache into the matrix-core
-// operand. Deliberately does not wait on the results: the caller issues these
-// right after the GEMM that consumed the previous tile, so the latency hides
-// behind the rest of the loop body.
-//
-// Addressed by pointer, not buffer: a buffer offset is 32-bit and would cap the
-// cache at 4GiB, and no scalar base can lift that since V's page index varies
-// per lane (the halves of a wave read adjacent pages). Buffer addressing measured
-// identical where it fits -- the widening multiply and 64-bit add per page
-// disappear into the memory latency.
+// Read one tile's K fragments straight from the cache into the matrix-core operand.
+// Deliberately does not wait on the results: the caller issues these right after the
+// GEMM that consumed the previous tile, so the latency hides in the loop body.
+// Pointer-addressed, not buffer: a buffer offset is 32-bit and would cap the cache
+// at 4GiB, and V's per-lane page index leaves no scalar base to lift it.
 template<class T, class VB>
 __device__ inline void load_k_frags(const typename T::D_ATTN* __restrict__ p_k,
                                     const k_page_ids_t<T>& pid,
@@ -414,24 +371,18 @@ __device__ inline void load_v_frags(const typename T::D_ATTN* __restrict__ p_v,
     });
 }
 
-// All-reduce a query row inside one wave.
-//
-// After swap_ab the C fragment puts query row r on lanes {r, r+16, r+32, r+48},
-// so folding a row is a pair swap at distance 32 then one at distance 16 -- two
-// gfx950 VALU ops, no LDS and no barrier, which is what lets the score tile stay
-// in registers. A lane covers only a quarter of a row, so every row-wide
-// quantity has to pass through here to mean anything.
+// All-reduce a query row inside one wave: a swap at distance 32 then one at 16,
+// which reaches the whole row since it sits on lanes {r, r+16, r+32, r+48}. A lane
+// covers only a quarter of a row, so every row-wide quantity passes through here.
 //
 // Must be inline asm, not __builtin_amdgcn_permlane*_swap: the intrinsic returns
 // both halves as one vector, and when both operands hold the same value -- how an
-// all-reduce uses it -- the compiler folds them into one register. The second
-// half is lost and the fold collapses to op(v, v): invisible for max, badly
-// wrong for a sum.
+// all-reduce uses it -- the compiler folds them into one register, collapsing the
+// fold to op(v, v). Invisible for max, wrong for a sum.
 //
-// Inline asm also costs us the hazard recognizer, so the wait states are supplied
-// here. Per LLVM's GCNHazardRecognizer for gfx950 a VALU write to an operand
-// needs 2 wait states before the swap reads it and a v_cmpx writing exec needs 4;
-// s_nop 3 covers both. Reading the result afterwards needs none.
+// Inline asm also loses the hazard recognizer. Per LLVM's GCNHazardRecognizer for
+// gfx950, a VALU write needs 2 wait states before the swap reads it and a v_cmpx
+// writing exec needs 4; s_nop 3 covers both.
 #define PA_SWAP_HAZARD "s_nop 3\n\t"
 
 __device__ inline void permlane32_swap(float& a, float& b)
@@ -455,14 +406,12 @@ __device__ inline float wave_row_fold(float v, OP op)
     return op(a, b);
 }
 
-// Publish this wave's row value and fold the T_N of them, through LDS. Each wave
-// holds a partial for every query row, so the exchange is T_N contiguous floats
-// per row -- one 16B read. This barrier is the only one the whole softmax needs.
+// Publish this wave's row value and fold the T_N of them through LDS -- T_N
+// contiguous floats per row, one 16B read, and the only barrier softmax needs.
 //
-// s_row_reduce is deliberately not __restrict__, and the barrier is the fenced
-// __syncthreads rather than a bare s_barrier: every wave writes and reads this
-// scratch, twice per kernel at the same addresses, and a plain s_barrier only
-// orders execution -- the compiler would be free to carry the first fold's
+// s_row_reduce is deliberately not __restrict__ and the barrier is the fenced
+// __syncthreads, not a bare s_barrier: both call sites hit the same addresses, and
+// s_barrier only orders execution, so the compiler could carry the first fold's
 // loaded values across it and reuse them for the second.
 template<class T, class OP>
 __device__ inline typename T::D_ACC
@@ -482,20 +431,14 @@ fold_across_waves(typename T::D_ACC* s_row_reduce,
 }
 
 // Masked online softmax over the GEMM0 C fragment, in registers. Returns the
-// rescale factor for the caller's O accumulator.
-//
-// S never reaches LDS: lane l of wave w owns query row l % W_M and, per N
-// fragment, ELEM_C consecutive tokens, so folding a row is a permlane pair
-// inside the wave plus one float between waves -- against a full
-// [Q_TILE][KV_TILE] fp32 round trip if the tile went through LDS.
+// rescale factor for the caller's O accumulator. Lane l of wave w owns query row
+// l % W_M and, per N fragment, ELEM_C consecutive tokens.
 //
 // m_run must stay identical across waves, since the P they all write feeds one
 // GEMM and needs one common scale. l_run needs no such agreement, so it stays an
 // unfolded per-lane partial, reduced once after the last tile.
 //
-// MASKED is false for every tile but the last, the only one that can run past the
-// context. The check is 3 VALU per C fragment element, worth specialising rather
-// than covering with a uniform branch.
+// MASKED is true only for the last tile, the only one that can run past the context.
 template<class T, bool MASKED, class VC>
 __device__ inline typename T::D_ACC
 online_softmax_frag(VC& v_s,
@@ -552,22 +495,18 @@ online_softmax_frag(VC& v_s,
     return rescale;
 }
 
-// Announce that this split is done, and report whether it was the last one.
-//
-// The merge is fused rather than a second kernel: that launch cost 4-5us of
-// almost pure dispatch, more than the split-KV path was buying back. Nothing
-// ever waits on the counter -- it only tells the last arrival, which already
-// has the machine, that every partial is in memory.
+// Announce that this split is done, and report whether it was the last one. Nothing
+// ever waits on the counter -- it only tells that last arrival, which already has
+// the machine, that every partial is in memory.
 template<class T>
 __device__ inline bool split_arrive_is_last(const pa_decode_kargs& kargs, int b, int kvh, int tid)
 {
     __shared__ int s_last;
 
-    // Release for the whole block: the barrier orders every thread's partial
-    // stores ahead of the counter bump, the waitcnt makes sure they retired.
-    // The textbook __threadfence() cost 28us of a 41us kernel -- on a multi-XCD
-    // part an agent-scope release writes back all of L2, evicting the KV stream.
-    // Uncached scratch removes the need: the stores retire at the coherence point.
+    // Release for the whole block: the barrier orders every thread's partial stores
+    // ahead of the counter bump, the waitcnt makes sure they retired. An agent-scope
+    // release (__threadfence) would write back all of L2 on a multi-XCD part; the
+    // scratch is uncached instead, so the stores retire at the coherence point.
     __syncthreads();
     __builtin_amdgcn_s_waitcnt(0);
 
@@ -576,8 +515,7 @@ __device__ inline bool split_arrive_is_last(const pa_decode_kargs& kargs, int b,
         unsigned int* slot = kargs.split_counters + b * kargs.num_kv_heads + kvh;
         const unsigned int prev = atomicAdd(slot, 1u);
         const bool last = prev + 1u == static_cast<unsigned int>(kargs.num_splits);
-        // The buffer is zeroed once at allocation and never again, so the last
-        // arrival is what leaves it clean for the next launch.
+        // Zeroed once at allocation; the last arrival leaves it clean for the next.
         if(last) atomicExch(slot, 0u);
         s_last = last ? 1 : 0;
     }
@@ -597,16 +535,24 @@ __device__ inline void reduce_splits(const pa_decode_kargs& kargs, int b, int kv
     const D_ACC* p_ml = partial_ml_ptr<T>(kargs, b, kvh, 0);
     const D_ACC* p_o  = partial_o_ptr<T>(kargs, b, kvh, 0);
 
-    // Carved out of the attention body's buffer, which is dead by now.
-    auto* s_scale = reinterpret_cast<D_ACC*>(smem);
-    auto* s_inv_l = s_scale + T::MAX_SPLITS * T::Q_TILE;
+    // Carved out of the attention body's buffer, dead by now. Mirrors the scratch
+    // layout [split][2][Q_TILE], so the staging below is a straight copy.
+    auto* s_ml    = reinterpret_cast<D_ACC*>(smem);
+    auto* s_inv_l = s_ml + 2 * T::MAX_SPLITS * T::Q_TILE;
+
+    // Stage with the whole block: read straight out of global this would be a
+    // quarter wave walking 2*splits dependent loads through uncached scratch.
+    const int ml_elems = splits * 2 * T::Q_TILE;
+    for(int i = tid; i < ml_elems; i += T::BLOCK_SIZE)
+        s_ml[i] = p_ml[i];
+    __syncthreads();
 
     if(tid < T::Q_TILE)
     {
         D_ACC m_max = -opus::numeric_limits<D_ACC>::max();
         for(int i = 0; i < splits; ++i)
         {
-            const D_ACC m = p_ml[static_cast<int64_t>(i) * 2 * T::Q_TILE + tid];
+            const D_ACC m = s_ml[i * 2 * T::Q_TILE + tid];
             if(m > m_max) m_max = m;
         }
 
@@ -614,10 +560,10 @@ __device__ inline void reduce_splits(const pa_decode_kargs& kargs, int b, int kv
         D_ACC l_sum = 0.0f;
         for(int i = 0; i < splits; ++i)
         {
-            const int64_t base = static_cast<int64_t>(i) * 2 * T::Q_TILE;
-            const D_ACC c      = __builtin_amdgcn_exp2f(p_ml[base + tid] - m_max);
-            s_scale[i * T::Q_TILE + tid] = c;
-            l_sum += p_ml[base + T::Q_TILE + tid] * c;
+            const int base   = i * 2 * T::Q_TILE;
+            const D_ACC c    = __builtin_amdgcn_exp2f(s_ml[base + tid] - m_max);
+            l_sum           += s_ml[base + T::Q_TILE + tid] * c;
+            s_ml[base + tid] = c; // only this thread owns the slot
         }
         s_inv_l[tid] = l_sum > D_ACC(0.0f) ? D_ACC(1.0f) / l_sum : D_ACC(0.0f);
     }
@@ -627,9 +573,8 @@ __device__ inline void reduce_splits(const pa_decode_kargs& kargs, int b, int kv
                 + static_cast<int64_t>(b) * kargs.stride_o_b
                 + static_cast<int64_t>(kvh) * kargs.gqa_ratio * kargs.stride_o_h;
 
-    // Four dims per thread, over only the rows the GQA group has: the partials are
-    // contiguous along the head dim, and bounding by gqa_ratio keeps gqa<16 from
-    // spending iterations on rows it would then discard.
+    // Four dims per thread, bounded by gqa_ratio so gqa<16 spends no iterations on
+    // rows it would discard. The partials are contiguous along the head dim.
     constexpr int VEC      = 4;
     constexpr int ROW_VECS = T::D_HEAD / VEC;
     const int vec_total    = kargs.gqa_ratio * ROW_VECS;
@@ -640,12 +585,30 @@ __device__ inline void reduce_splits(const pa_decode_kargs& kargs, int b, int kv
         const int dim       = (idx - row * ROW_VECS) * VEC;
         const int64_t o_row = static_cast<int64_t>(row) * T::D_HEAD + dim;
 
-        D_ACC acc[VEC] = {0.0f, 0.0f, 0.0f, 0.0f};
-        for(int i = 0; i < splits; ++i)
-        {
-            const D_ACC c = s_scale[i * T::Q_TILE + row];
-            const auto v  = *reinterpret_cast<const opus::vector_t<D_ACC, VEC>*>(
+        using vec_t = opus::vector_t<D_ACC, VEC>;
+        auto slice  = [&](int i) {
+            return reinterpret_cast<const vec_t*>(
                 p_o + static_cast<int64_t>(i) * T::Q_TILE * T::D_HEAD + o_row);
+        };
+
+        // Unrolled so several splits' loads are in flight: the trip count is a
+        // runtime value, and the accumulate chain otherwise lets only one issue.
+        constexpr int UNROLL = 4;
+        D_ACC acc[VEC]       = {0.0f, 0.0f, 0.0f, 0.0f};
+        int i                = 0;
+        for(; i + UNROLL <= splits; i += UNROLL)
+        {
+            vec_t v[UNROLL];
+            opus::static_for<UNROLL>([&](auto u) { v[u.value] = *slice(i + u.value); });
+            opus::static_for<UNROLL>([&](auto u) {
+                const D_ACC c = s_ml[(i + u.value) * 2 * T::Q_TILE + row];
+                opus::static_for<VEC>([&](auto j) { acc[j.value] += v[u.value][j.value] * c; });
+            });
+        }
+        for(; i < splits; ++i)
+        {
+            const D_ACC c = s_ml[i * 2 * T::Q_TILE + row];
+            const vec_t v = *slice(i);
             opus::static_for<VEC>([&](auto j) { acc[j.value] += v[j.value] * c; });
         }
 
@@ -676,18 +639,14 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 1) void pa_decode_opus_kernel(p
     const int lane_id = tid % T::WARP_SIZE;
     const int warp_id = __builtin_amdgcn_readfirstlane(tid / T::WARP_SIZE);
 
-    // ── LDS layout: bf16 P | cross-wave reduction scratch ──
-    //
-    // Everything else stays in registers. P is the one operand that genuinely has
-    // to cross lanes: GEMM0 produces it in the C layout, GEMM1 consumes it in the
-    // A layout, and it contracts the token dim -- exactly the dim split across
-    // the waves. Declared this early because the split-KV merge borrows it too,
-    // and an empty split can reach the merge without running the attention body.
+    // LDS layout: bf16 P | cross-wave reduction scratch. Everything else stays in
+    // registers. Declared this early because the split-KV merge borrows the same
+    // allocation, and an empty split reaches the merge without running the body.
     __shared__ __align__(16) char smem[T::smem_size_bytes()];
 
-    // Split-KV: each workgroup owns a contiguous run of whole tiles. Splitting on
-    // tile (not token) boundaries keeps kv_start page-aligned, so the block table
-    // can simply be re-based and the rest of the kernel stays split-agnostic.
+    // Split-KV: each workgroup owns a contiguous run of whole tiles. Tile-aligned
+    // splits keep kv_start page-aligned, so the block table is simply re-based and
+    // the rest of the kernel stays split-agnostic.
     const int context_len = kargs.context_lens[batch_idx];
     const int tiles_total = (context_len + T::KV_TILE - 1) / T::KV_TILE;
     const int tiles_per_split = (tiles_total + kargs.num_splits - 1) / kargs.num_splits;
@@ -705,8 +664,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 1) void pa_decode_opus_kernel(p
                 p_ml[tid]             = -opus::numeric_limits<float>::max();
                 p_ml[T::Q_TILE + tid] = 0.0f;
             }
-            // Still has to arrive, or the split that does finish last would be
-            // waiting on a count that never completes.
+            // Still has to arrive, or the last split waits on a count that never completes.
             if(split_arrive_is_last<T>(kargs, batch_idx, kv_head_idx, tid))
                 reduce_splits<T>(kargs, batch_idx, kv_head_idx, tid, smem);
         }
@@ -737,14 +695,12 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 1) void pa_decode_opus_kernel(p
         seq<T::W_M, T::W_N, T::W_K>{},
         mfma_adaptor_swap_ab{});
 
-    // Every operand is a plain row-major matrix, so the register fragment layout
-    // comes straight from the mma adaptor instead of being hand-derived.
+    // Every operand is plain row-major, so the fragment layouts come from the adaptor.
     const int q_head_base = kv_head_idx * kargs.gqa_ratio;
     auto u_q  = partition_layout_a<T::ELEM_A>(
         mma0, opus::make_tuple(kargs.stride_q_h, 1_I),
         opus::make_tuple(0_I, lane_id % mma0.grpm_a, 0_I, lane_id / mma0.grpm_a));
-    // Writes P out of the C fragment: the mapping the score tile used to be stored
-    // with, now applied once, to bf16, after softmax has run in registers.
+    // Writes P out of the C fragment, to bf16, after softmax has run in registers.
     auto u_p  = partition_layout_c(
         mma0, opus::make_tuple(number<T::P_ROW_STRIDE>{}, 1_I),
         opus::make_tuple(0_I, lane_id % mma0.grpn_c, warp_id, lane_id / mma0.grpn_c));
@@ -786,27 +742,19 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 1) void pa_decode_opus_kernel(p
                               + kv_start / T::PAGE_SIZE,
                           num_pages * static_cast<unsigned int>(sizeof(int)));
 
-    // Single-buffered KV and page ids, both prefetched one tile ahead. Each KV
-    // operand is refetched right after the GEMM that consumed it, so its load
-    // stays in flight for the rest of the body: K hides behind softmax and GEMM1,
-    // V behind the next tile's GEMM0. A fragment dies as its GEMM issues, so
-    // deeper buffering only buys occupancy loss -- prefetch distance two
-    // (+64 VGPRs) and double-buffered ids (+53, from unrolling by two, not from
-    // the 10 the ids need) both drop 3 waves/SIMD to 2 and measured slower.
-    //
-    // The last tile is peeled out: only it can run past the context, so the
-    // interior body needs neither the per-token mask nor a `has_next` guard. The
-    // guard cost more -- with the loads on one path only, the compiler cannot know
-    // how many are in flight at the loop header, and fell back to vmcnt(0) before
-    // the last GEMM0 MFMA, draining V's prefetch.
+    // Single-buffered KV and page ids, prefetched one tile ahead. Each KV operand is
+    // refetched right after the GEMM that consumed it, so its load stays in flight
+    // for the rest of the body: K hides behind softmax and GEMM1, V behind the next
+    // tile's GEMM0. The last tile is peeled out -- only it can run past the context,
+    // so the interior body needs neither the mask nor a `has_next` guard.
     const kv_frag_slice<T> kv_slice(lane_id, warp_id);
     k_page_ids_t<T> k_pid = load_k_page_ids<T>(g_bt, 0, warp_id);
     page_ids_t<T>   v_pid = load_page_ids<T>(g_bt, 0);
     load_k_frags<T>(p_k, k_pid, kargs.stride_k_blk, kv_slice, v_k);
     load_v_frags<T>(p_v, v_pid, kargs.stride_v_blk, kv_slice, v_v);
 
-    // MASKED and PREFETCH are compile time, so the tail instantiation shares no
-    // code with the loop body and neither branch survives into either.
+    // MASKED and PREFETCH are compile time, so neither branch survives into either
+    // instantiation.
     auto run_tile = [&](int tile_idx, auto masked, auto prefetch) {
         constexpr bool MASKED   = decltype(masked)::value != 0;
         constexpr bool PREFETCH = decltype(prefetch)::value != 0;
@@ -816,10 +764,9 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 1) void pa_decode_opus_kernel(p
             k_pid = load_k_page_ids<T>(g_bt, tile_idx + 1, warp_id);
             v_pid = load_page_ids<T>(g_bt, tile_idx + 1);
         }
-        // Keep the block-table reads ahead of GEMM0 instead of letting the
-        // scheduler sink them among the MFMAs: every KV address for the next tile
-        // depends on them, and left alone the first address computation lands a
-        // dozen instructions behind the load and stalls on it.
+        // Keep the block-table reads ahead of GEMM0: every KV address for the next
+        // tile depends on them, so letting the scheduler sink them among the MFMAs
+        // puts the first address computation right behind the load.
         __builtin_amdgcn_sched_barrier(0);
 
         v_s = mma0(v_q, v_k);
@@ -852,10 +799,10 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 1) void pa_decode_opus_kernel(p
         run_tile(tile_idx, 0_I, 1_I);
     run_tile(num_tiles - 1, 1_I, 0_I);
 
-    // l is still a per-lane partial: a lane summed only its own quarter of the row
-    // and only its own wave's tokens. Both folds can wait until here because
-    // summing is linear and a row's rescale is common to all its lanes. Reusing
-    // s_row_reduce is safe -- the last tile read it before that tile's P barrier.
+    // l is still a per-lane partial: a lane summed only its own quarter of the row,
+    // and only its own wave's tokens. Both folds can wait until here because summing
+    // is linear. Reusing s_row_reduce is safe -- the last tile read it before that
+    // tile's P barrier.
     const D_ACC l_final = fold_across_waves<T>(
         s_row_reduce,
         wave_row_fold(l_run, [](D_ACC a, D_ACC b) { return a + b; }),
