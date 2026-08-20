@@ -7,7 +7,6 @@ import sys
 import torch
 import torch.nn.functional as F
 import triton
-from aiter.ops.triton._triton_kernels.kda import fused_recurrent_kda_triton
 
 from aiter.ops.triton.attention.kda import fused_recurrent_kda
 from aiter.ops.triton.utils._triton import arch_info
@@ -23,7 +22,6 @@ except ImportError:
 
 BACKENDS = {
     "gluon": "aiter gluon",
-    "triton": "aiter triton",
     "fla": "fla triton",
 }
 
@@ -97,23 +95,7 @@ def traffic_bytes(B, T, H, D, dtype, paged):
 
 
 def _time(fn, args):
-    """One timing measurement, in ms.
-
-    do_bench brackets each iteration with a stream-ordered event pair.  Those are
-    markers on the GPU timeline, not CPU timestamps, so when the host cannot enqueue
-    faster than the GPU drains (this wrapper costs ~41 us/call against 12-26 us
-    kernels at small batch) the GPU idles *between* the start event and the launch,
-    and that stall lands inside the measured span.  Small-batch rows then report host
-    cost rather than kernel cost.
-
-    cudagraph mode captures rep/estimate unrolled calls and times one replay, so no
-    host work happens inside the measurement at all.  The trade is that it drops
-    do_bench's 256 MB L2 flush between iterations (upstream notes this), so a working
-    set that fits in cache is measured warm -- for KDA that is the state pool, which
-    at 24 heads is ~6 MB at B=4 but ~400 MB at B=256.  Small-batch cudagraph numbers
-    are therefore optimistic relative to a real decode step, where 68 other layers
-    run between two touches of the same state.
-    """
+    """One measurement in ms; cudagraph keeps host launch cost out of the span."""
     if args.timing == "cudagraph":
         return _bench_graph(fn, args.graph_ms, args.n_replays)
     return triton.testing.do_bench(
@@ -122,19 +104,7 @@ def _time(fn, args):
 
 
 def _bench_graph(fn, graph_ms, n_replays):
-    """HIP-graph replay, same shape as the a8w8 blockscale preshuffle bench: probe
-    with events, capture `graph_ms` worth of launches, replay `n_replays` times.
-
-    Each replay is timed separately rather than lumped into one wall-clock span, so
-    the spread across replays is visible instead of being averaged away.  Returns
-    (median, p20, p80) of the per-iteration time in ms.
-
-    Caveat worth knowing before trusting a small delta: all replays run one captured
-    graph in one process, so they sample the kernel but not JIT state, clocks, or
-    allocation.  Measured process-to-process spread at B<=16 reached 71% while
-    within-run spread was ~2%, so raising this alone will not make small shapes
-    reproducible -- that needs repeated invocations of the whole benchmark.
-    """
+    """Replay a graph of ~graph_ms of launches; returns (median, p20, p80) ms."""
     for _ in range(5):
         fn()
     torch.cuda.synchronize()
@@ -230,8 +200,6 @@ def benchmark(args):
 
     @triton.testing.perf_report(configs)
     def bench_kda(H, B, T, provider):
-        # Reseed per measurement so every backend sees byte-identical inputs, and
-        # hand in `out` -- otherwise each timed iteration allocates and zeroes it.
         torch.manual_seed(0)
         inputs = make_inputs(
             B, T, H, D, dtype, args.device, args.paged, args.gate, args.num_accepted
@@ -253,20 +221,17 @@ def benchmark(args):
             def fn():
                 fused_recurrent_kda(
                     **shared,
-                    BV=bv,
-                    SK=sk,
-                    num_warps=nw,
-                    num_buffers=nb,
-                    use_tdm_store=bool(ts),
-                    use_tdm_load=bool(tl),
                     cache_state_updates=bool(csu),
-                    use_tdm_fused_load=bool(tf),
+                    config={
+                        "BV": bv,
+                        "SK": sk,
+                        "num_warps": nw,
+                        "num_buffers": nb,
+                        "use_tdm_store": bool(ts),
+                        "use_tdm_load": bool(tl),
+                        "use_tdm_fused_load": bool(tf),
+                    },
                 )
-
-        elif provider == "triton":
-
-            def fn():
-                fused_recurrent_kda_triton(**shared)
 
         else:
 
@@ -289,8 +254,6 @@ def benchmark(args):
 
 
 def report_spread(spread, line_vals, line_names, args):
-    """perf_report drops the quantile columns before printing, so surface them here:
-    without them a 5% delta is unreadable against a noise floor we never measured."""
     name = dict(zip(line_vals, line_names))
     flush = "no L2 flush, cache-warm" if args.timing == "cudagraph" else "L2 flushed"
     print(
@@ -387,7 +350,7 @@ def parse_args():
         "--backends",
         type=str,
         nargs="+",
-        default=["gluon", "triton"],
+        default=["gluon"],
         choices=list(BACKENDS),
     )
     parser.add_argument("--warmup", type=int, default=25)

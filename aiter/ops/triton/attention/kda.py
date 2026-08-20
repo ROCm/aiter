@@ -3,13 +3,13 @@
 
 import logging
 import math
-import warnings
 
 import torch
 import triton
 from packaging.version import Version
 
 from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH, load_config_json
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
@@ -48,15 +48,8 @@ def fused_recurrent_kda(
     lower_bound: float | None = None,
     out: torch.Tensor | None = None,
     state_out: torch.Tensor | None = None,
-    BV: int = 32,
-    SK: int | None = None,
-    num_warps: int | None = None,
-    num_buffers: int = 2,
-    use_tdm_store: bool = False,
-    use_tdm_load: bool = False,
     cache_state_updates: bool = False,
-    use_tdm_fused_load: bool = False,
-    **kwargs,
+    config: dict | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
 
     if fused_recurrent_kda_packed_decode_kernel is None:
@@ -69,20 +62,6 @@ def fused_recurrent_kda(
             "allow_neg_eigval=True requires use_beta_sigmoid_in_kernel=True"
         )
 
-    if "transpose_state_layout" in kwargs:
-        if state_v_first is not None:
-            raise ValueError(
-                "Cannot pass both `state_v_first` and the deprecated "
-                "`transpose_state_layout`."
-            )
-        warnings.warn(
-            "`transpose_state_layout` is deprecated and renamed to `state_v_first`.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        state_v_first = kwargs.pop("transpose_state_layout")
-    if kwargs:
-        raise TypeError(f"unexpected keyword arguments: {sorted(kwargs)}")
     if state_v_first is None:
         state_v_first = True
 
@@ -129,6 +108,29 @@ def fused_recurrent_kda(
         avg_T = max(1, T // max(1, N))
     else:
         avg_T = T
+    if config is None:
+        # Tuned buckets from the config file; keys a bucket omits fall back to
+        # the legacy derivation below.
+        tuned = load_config_json(
+            f"{AITER_TRITON_CONFIGS_PATH}/{_ARCH}-KDA_DECODE-DEFAULT.json"
+        )
+        num_seq_heads = N * HV
+        config = tuned["default"]
+        if K % 32 == 0 and V % 32 == 0:
+            if avg_T > 1:
+                if num_seq_heads >= 3072 and V % 128 == 0:
+                    config = tuned["t_gt1_seq_heads_geq_3072"]
+                elif num_seq_heads >= 384:
+                    config = tuned["t_gt1_seq_heads_geq_384"]
+            elif 256 <= num_seq_heads <= 512:
+                config = tuned["t1_seq_heads_256_to_512"]
+    BV = config.get("BV", 32)
+    SK = config.get("SK")
+    num_warps = config.get("num_warps")
+    num_buffers = config.get("num_buffers", 2)
+    use_tdm_store = config.get("use_tdm_store", False)
+    use_tdm_load = config.get("use_tdm_load", False)
+    use_tdm_fused_load = config.get("use_tdm_fused_load", False)
     if SK is None:
         if avg_T > 1 and K % 16 == 0 and BV * 16 >= 64:
             SK = 8 if (V // BV) * N * HV <= 8192 else 16

@@ -55,12 +55,6 @@ def naive_kda_lowerbound_gate(g, A_log, dt_bias=None, lower_bound=-5.0):
 
 
 def naive_recurrent_kda(q, k, v, g, beta, scale=None, initial_state=None):
-    """fla.ops.kda.naive.naive_recurrent_kda. State is [B, HV, K, V].
-
-    `g` is log-space. Headwise beta (``[B, T, HV, V]``) scales the error term
-    rather than k -- equivalent for the scalar case, since the update is an
-    outer product.
-    """
     B, T, H, K = q.shape
     HV, V = v.shape[2], v.shape[-1]
     G = HV // H
@@ -99,9 +93,6 @@ def to_vk(h_kv):
 
 
 def make_pool(B, T, H, D, seed=42):
-    """Oversized slot pool with a random disjoint assignment; every slot the
-    kernel must not touch is poisoned so a stray access blows up visibly.
-    Returns (pool as [slots, H, K, V], indices [B, T], untouched mask)."""
     torch.manual_seed(seed)
     max_slots = B * T * 3
     pool_kv = torch.randn(max_slots, H, D, D, dtype=torch.float32, device=DEVICE)
@@ -136,12 +127,7 @@ def _seq_lens(kw, n_seq):
 
 
 def _replay_into_snapshots(pool, indices, lens, BV=32):
-    """Rebuild the per-token snapshot states a cached-update launch elided:
-    replay each sequence's updates over its base state and write the results
-    where snapshot mode would have put them (torch replay is ULP-close, not
-    bitwise -- callers compare with assert_close). Records are replicated per
-    i_v tile in chunks of 2*K + BV; a/k are read from tile 0, err assembled
-    across tiles."""
+    """Replay (a, k, err) records into snapshots; ULP-close, use assert_close."""
     K, V = pool.shape[-1], pool.shape[-2]
     H = pool.shape[1]
     ch = 2 * K + BV
@@ -162,11 +148,7 @@ def _replay_into_snapshots(pool, indices, lens, BV=32):
 
 @pytest.fixture(autouse=True, params=["snapshots", "cache_state_updates"])
 def kda_store_mode(request, monkeypatch):
-    """Run the whole suite twice: once as-is, once routing every compatible
-    kernel call through the cached-update store path. Non-paged calls are
-    transparently rewritten onto a slot pool; the snapshots each test expects
-    are then reconstructed from the updates, so every existing assertion also
-    validates the record contents."""
+    """Run the suite twice: as-is, then routed through the cached-update path."""
     if request.param == "snapshots":
         yield request.param
         return
@@ -176,10 +158,11 @@ def kda_store_mode(request, monkeypatch):
     def wrapped(**kw):
         state = kw.get("initial_state")
         idx = kw.get("ssm_state_indices")
+        cfg = kw.get("config") or {}
         if (
             "cache_state_updates" in kw
             or kw.get("num_accepted_tokens") is not None
-            or kw.get("use_tdm_store")
+            or cfg.get("use_tdm_store")
             or kw.get("state_v_first") is False
             or not kw.get("inplace_final_state", True)
             or state is None
@@ -190,18 +173,16 @@ def kda_store_mode(request, monkeypatch):
         if idx is not None:  # already paged: just flip the store path
             o, pool = real(**kw, cache_state_updates=True)
             _replay_into_snapshots(
-                pool, idx, _seq_lens(kw, idx.shape[0]), kw.get("BV", 32)
+                pool, idx, _seq_lens(kw, idx.shape[0]), cfg.get("BV", 32)
             )
             return o, pool
 
-        # non-paged: emulate on a pool where slot n is the caller's state row
-        # (the seed and base slot), with scratch slots for the token updates
+        # non-paged: emulate on a pool (slot n = caller's row, plus scratch slots)
         N = state.shape[0]
         lens = _seq_lens(kw, N)
         maxlen = max(lens)
         if len(lens) != N or maxlen > 64:
-            # malformed calls stay on the real path so guards still fire;
-            # training-length tests stay off the B*T scratch pool
+            # malformed or training-length calls stay on the real path
             return real(**kw)
         scratch = N * max(0, maxlen - 1)
         pool = torch.cat([state, state.new_empty(scratch, *state.shape[1:])])
@@ -215,7 +196,7 @@ def kda_store_mode(request, monkeypatch):
             ssm_state_indices=indices,
             cache_state_updates=True,
         )
-        _replay_into_snapshots(pool, indices, lens, kw.get("BV", 32))
+        _replay_into_snapshots(pool, indices, lens, cfg.get("BV", 32))
         for n, ln in enumerate(lens):
             if ln:
                 state[n] = pool[int(indices[n, ln - 1])]
@@ -460,8 +441,6 @@ def test_fused_recurrent_vllm_decode(B, T, spec):
             initial_state=pool_kv[seed : seed + 1],
         )
         assert_close(f"o[{n}]", ref, tri[:, b:e])
-        # only the last token's snapshot is checked against the closed recurrence;
-        # earlier slots hold intermediate states by construction
         assert_close(f"ht[{n}]", ref_ht[0], tri_pool[int(indices[n, T - 1])])
 
     assert torch.equal(
@@ -499,10 +478,7 @@ def _spec_inputs(total_T, H, HV, D, seed, gate=False, beta_headwise=False, dtype
 
 
 def _cached_vs_snapshot(B, T, H, HV, D, accepted_rounds, **kw):
-    """Run the same launch chain in snapshot and cached-update mode: every launch
-    output and the token-0 base state must be bitwise identical, and poisoned
-    slots must stay untouched. Round 0 has no verifier seed; each later round
-    seeds from its `accepted_rounds` entry against the previous round's pool."""
+    """Snapshot vs cached-update chains must match bitwise, poison untouched."""
     gate = kw.pop("gate", False)
     beta_headwise = kw.pop("beta_headwise", False)
     dtype = kw.pop("dtype", None)
@@ -553,9 +529,7 @@ def _cached_vs_snapshot(B, T, H, HV, D, accepted_rounds, **kw):
 @pytest.mark.parametrize("T", [1, 4, 8])
 @pytest.mark.parametrize("pattern", ["one", "all", "perseq"])
 def test_cache_state_updates_matches_snapshots(T, pattern):
-    """Spec-decode two-launch round trip: replaying the (a, k, err) updates must
-    reconstruct the seed state bitwise identically to loading the full snapshot,
-    for every acceptance count the verifier can produce."""
+    """Replayed updates must rebuild the seed state bitwise for every acceptance."""
     B = 4
     acc = {
         "one": torch.ones(B, device=DEVICE, dtype=torch.int32),
@@ -566,8 +540,7 @@ def test_cache_state_updates_matches_snapshots(T, pattern):
 
 
 def test_cache_state_updates_multi_round():
-    """Four chained verifier rounds with random per-sequence acceptance: updates
-    are overwritten in place every round and must never drift from snapshots."""
+    """Four chained verifier rounds must never drift from snapshot mode."""
     B, T = 3, 6
     torch.manual_seed(123)
     rounds = [
@@ -587,8 +560,7 @@ def test_cache_state_updates_multi_round():
     ],
 )
 def test_cache_state_updates_variants(gate, beta_headwise, dtype, H, HV):
-    """Cached state updates across the K3 math flags: in-kernel gate + dt_bias +
-    lower bound, headwise beta, bf16 inputs, and grouped heads (HV != H)."""
+    """Cached updates across the K3 math flags, headwise beta, bf16, HV != H."""
     acc = torch.tensor([1, 2, 4, 3], device=DEVICE, dtype=torch.int32)
     _cached_vs_snapshot(
         4, 4, H, HV, 128, [acc], gate=gate, beta_headwise=beta_headwise, dtype=dtype
@@ -610,8 +582,7 @@ def test_cache_state_updates_variants(gate, beta_headwise, dtype, H, HV):
 def test_cache_state_updates_tiling(
     BV, num_warps, SK, num_buffers, use_tdm_load, use_tdm_fused_load
 ):
-    """Update loads/stores are layout-parameterized: every tiling and load path
-    must reconstruct bitwise identically to snapshots under the same tiling."""
+    """Every tiling and load path must reconstruct bitwise vs snapshots."""
     acc = torch.tensor([2, 4, 1, 3], device=DEVICE, dtype=torch.int32)
     _cached_vs_snapshot(
         4,
@@ -620,28 +591,35 @@ def test_cache_state_updates_tiling(
         4,
         128,
         [acc],
-        BV=BV,
-        num_warps=num_warps,
-        SK=SK,
-        num_buffers=num_buffers,
-        use_tdm_load=use_tdm_load,
-        use_tdm_fused_load=use_tdm_fused_load,
+        config={
+            "BV": BV,
+            "num_warps": num_warps,
+            "SK": SK,
+            "num_buffers": num_buffers,
+            "use_tdm_load": use_tdm_load,
+            "use_tdm_fused_load": use_tdm_fused_load,
+        },
     )
 
 
 @pytest.mark.parametrize("BV, num_warps", [(32, 4), (32, 2), (64, 2), (128, 4)])
 def test_cache_state_updates_k_first(BV, num_warps):
-    """The [K, V] layout mirrors the replay's broadcast axes; the update offsets
-    themselves are layout-neutral. Must still be bitwise-exact vs snapshots."""
+    """[K, V] layout must still be bitwise-exact vs snapshots."""
     acc = torch.tensor([1, 4, 2, 3], device=DEVICE, dtype=torch.int32)
     _cached_vs_snapshot(
-        4, 4, 4, 4, 128, [acc], BV=BV, num_warps=num_warps, state_v_first=False
+        4,
+        4,
+        4,
+        4,
+        128,
+        [acc],
+        config={"BV": BV, "num_warps": num_warps},
+        state_v_first=False,
     )
 
 
 def test_cache_state_updates_vs_reference():
-    """Two cached-update launches checked against the pure-torch recurrence: seq n's
-    second launch must continue from the state after its accepted[n] tokens."""
+    """Two cached-update launches checked against the pure-torch recurrence."""
     B, T, H, D = 4, 6, 4, 128
     total_T = B * T
     pool_kv, indices, untouched = make_pool(B, T, H, D)
@@ -758,7 +736,11 @@ def test_cache_state_updates_guards():
             state_out=torch.empty_like(state),
         )
     with pytest.raises(AssertionError, match="tdm_store"):
-        fused_recurrent_kda(**shared, ssm_state_indices=indices, use_tdm_store=True)
+        fused_recurrent_kda(
+            **shared,
+            ssm_state_indices=indices,
+            config={"use_tdm_store": True},
+        )
 
 
 @pytest.mark.parametrize("BV, num_warps", [(32, 1), (64, 2), (128, 4), (64, 1)])
@@ -772,7 +754,9 @@ def test_tiling_equivalence(BV, num_warps):
     h0 = torch.randn(B, H, D, D, dtype=torch.float32, device=DEVICE)
 
     ref, ref_ht = naive_recurrent_kda(q, k, v, g, beta, initial_state=h0)
-    tri, tri_ht = run(q, k, v, g, beta, h0.clone(), BV=BV, num_warps=num_warps)
+    tri, tri_ht = run(
+        q, k, v, g, beta, h0.clone(), config={"BV": BV, "num_warps": num_warps}
+    )
     assert_close("o", ref, tri)
     assert_close("ht", ref_ht, tri_ht)
 
@@ -789,10 +773,10 @@ def test_guards():
         fused_recurrent_kda(**args, allow_neg_eigval=True)
 
     with pytest.raises(AssertionError):  # BV must divide V
-        fused_recurrent_kda(**args, BV=48)
+        fused_recurrent_kda(**args, config={"BV": 48})
 
     with pytest.raises(AssertionError):  # BV*SK must cover 32*num_warps lanes
-        fused_recurrent_kda(**args, BV=32, num_warps=4, SK=1)
+        fused_recurrent_kda(**args, config={"BV": 32, "num_warps": 4, "SK": 1})
 
     with pytest.raises(AssertionError):  # gate chain needs A_log
         fused_recurrent_kda(**args, use_gate_in_kernel=True)
@@ -838,8 +822,7 @@ def test_not_inplace_leaves_initial_state_untouched():
 
 
 def test_inplace_matches_not_inplace():
-    # pinned to snapshot mode: the bit-for-bit contract between the two paths
-    # only exists when both actually store full states
+    # pinned to snapshot mode: the bitwise contract needs real full-state stores
     q, k, v, g, beta, h0 = _small()
     _, ht_out = fused_recurrent_kda(
         q=q,
@@ -961,9 +944,11 @@ def test_num_buffers(num_buffers, use_tdm_store, use_tdm_fused_load):
         output_final_state=True,
         cu_seqlens=cu,
         ssm_state_indices=indices,
-        num_buffers=num_buffers,
-        use_tdm_store=use_tdm_store,
-        use_tdm_fused_load=use_tdm_fused_load,
+        config={
+            "num_buffers": num_buffers,
+            "use_tdm_store": use_tdm_store,
+            "use_tdm_fused_load": use_tdm_fused_load,
+        },
     )
     pool_out = state.transpose(-1, -2)
     for n in range(B):
@@ -982,8 +967,7 @@ def test_num_buffers(num_buffers, use_tdm_store, use_tdm_fused_load):
 
 
 def test_paged_state_out():
-    """Paged + inplace_final_state=False: snapshots go to state_out by token,
-    and the slot pool stays read-only."""
+    """inplace_final_state=False: snapshots go to state_out, pool is read-only."""
     B, T, H, D = 2, 3, 8, 128
     pool_kv, indices, _ = make_pool(B, T, H, D)
     total_T = B * T
@@ -1044,7 +1028,7 @@ def test_state_v_first_matches_k_first(T, BV):
         initial_state=h0_kv.clone(),
         output_final_state=True,
         state_v_first=False,
-        BV=BV,
+        config={"BV": BV},
     )
     o_vk, ht_vk = fused_recurrent_kda(
         q=q,
@@ -1055,7 +1039,7 @@ def test_state_v_first_matches_k_first(T, BV):
         initial_state=to_vk(h0_kv),
         output_final_state=True,
         state_v_first=True,
-        BV=BV,
+        config={"BV": BV},
     )
     assert_close("o", o_kv, o_vk, 1e-4)
     assert_close("ht", ht_kv, ht_vk.transpose(-1, -2), 1e-4)
@@ -1131,10 +1115,6 @@ def test_reference_guards():
         "initial_state": to_vk(h0),
     }
 
-    with pytest.warns(DeprecationWarning):
-        fused_recurrent_kda(**args, transpose_state_layout=True)
-    with pytest.raises(ValueError):
-        fused_recurrent_kda(**args, state_v_first=True, transpose_state_layout=True)
     with pytest.raises(TypeError):
         fused_recurrent_kda(**args, bogus_kwarg=1)
     with pytest.raises(ValueError):
@@ -1203,9 +1183,7 @@ def test_sk_equivalence(BV, SK, num_warps, state_v_first):
         initial_state=state,
         output_final_state=True,
         state_v_first=state_v_first,
-        BV=BV,
-        SK=SK,
-        num_warps=num_warps,
+        config={"BV": BV, "SK": SK, "num_warps": num_warps},
     )
     assert_close("o", ref, o)
     assert_close("ht", ref_ht, ht.transpose(-1, -2) if state_v_first else ht)
@@ -1233,9 +1211,7 @@ def test_sk_paged(SK):
         output_final_state=True,
         cu_seqlens=cu,
         ssm_state_indices=indices,
-        BV=32,
-        SK=SK,
-        num_warps=SK,
+        config={"BV": 32, "SK": SK, "num_warps": SK},
     )
     pool_out = state.transpose(-1, -2)
     for n in range(B):
@@ -1265,6 +1241,6 @@ def test_sk_guards():
         "initial_state": to_vk(h0),
     }
     with pytest.raises(AssertionError):  # SK must divide the wave
-        fused_recurrent_kda(**args, SK=3)
+        fused_recurrent_kda(**args, config={"SK": 3})
     with pytest.raises(AssertionError):  # BV*SK must cover 32*num_warps
-        fused_recurrent_kda(**args, BV=32, SK=2, num_warps=4)
+        fused_recurrent_kda(**args, config={"BV": 32, "SK": 2, "num_warps": 4})

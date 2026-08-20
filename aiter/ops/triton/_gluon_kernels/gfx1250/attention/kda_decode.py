@@ -165,7 +165,7 @@ def _process_token(
     raw,
     a_exp,
     b_bias,
-    lower_bound,
+    gate_c,
     scale: gl.constexpr,
     USE_QK_L2NORM_IN_KERNEL: gl.constexpr,
     USE_GATE_IN_KERNEL: gl.constexpr,
@@ -179,17 +179,22 @@ def _process_token(
     kv = kr.to(gl.float32)
     vv = vr.to(gl.float32)
     if USE_QK_L2NORM_IN_KERNEL:
-        qv = qv * gl.rsqrt(gl.sum(qv * qv, axis=0) + 1e-6)
+        qv = qv * (gl.rsqrt(gl.sum(qv * qv, axis=0) + 1e-6) * scale)
         kv = kv * gl.rsqrt(gl.sum(kv * kv, axis=0) + 1e-6)
-    qv = qv * scale
+    else:
+        qv = qv * scale
 
     g = gr.to(gl.float32)
     if USE_GATE_IN_KERNEL:
-        if HAS_DT_BIAS:
-            g = g + b_bias
         if USE_LOWER_BOUND:
-            a = _exp_scaled(lower_bound, _sigmoid(a_exp * g))
+            if HAS_DT_BIAS:
+                th = libdevice.tanh(g * a_exp + b_bias)
+            else:
+                th = libdevice.tanh(g * a_exp)
+            a = gl.exp2(th * gate_c + gate_c)
         else:
+            if HAS_DT_BIAS:
+                g = g + b_bias
             a = _exp_scaled(-a_exp, _softplus(g))
     else:
         a = gl.exp(g)
@@ -308,9 +313,17 @@ def fused_recurrent_kda_packed_decode_kernel(
             )
         else:
             b_bias = 0.0
+        if USE_LOWER_BOUND:
+            a_exp = 0.5 * a_exp
+            if HAS_DT_BIAS:
+                b_bias = a_exp * b_bias
+            gate_c = lower_bound * 0.7213475204444817
+        else:
+            gate_c = 0.0
     else:
         a_exp = 0.0
         b_bias = 0.0
+        gate_c = 0.0
 
     tok0 = bos.to(gl.int64)
     q_p = q_ptr + (tok0 * H + i_h) * K
@@ -471,6 +484,14 @@ def fused_recurrent_kda_packed_decode_kernel(
     PHASES: gl.constexpr = 1 if PREFETCH_DEPTH == 0 else 2
     n_steady = gl.where(n_tok > PREFETCH_DEPTH, n_tok - PREFETCH_DEPTH, 0)
 
+    if IS_CONTINUOUS_BATCHING and INPLACE_FINAL_STATE and PREFETCH_DEPTH == 1:
+        if USE_INITIAL_STATE and not IS_SPEC_DECODING:
+            slot_nxt = slot
+        else:
+            slot_nxt = gl.load(state_indices_ptr + i_n * stride_indices_seq).to(
+                gl.int32
+            )
+
     for PHASE in gl.static_range(PHASES):
         if PHASE == 0:
             t_lo = 0
@@ -522,7 +543,7 @@ def fused_recurrent_kda_packed_decode_kernel(
                     raw,
                     a_exp,
                     b_bias,
-                    lower_bound,
+                    gate_c,
                     scale,
                     USE_QK_L2NORM_IN_KERNEL,
                     USE_GATE_IN_KERNEL,
@@ -536,7 +557,7 @@ def fused_recurrent_kda_packed_decode_kernel(
                     nxt,
                     a_exp,
                     b_bias,
-                    lower_bound,
+                    gate_c,
                     scale,
                     USE_QK_L2NORM_IN_KERNEL,
                     USE_GATE_IN_KERNEL,
@@ -567,7 +588,7 @@ def fused_recurrent_kda_packed_decode_kernel(
                     raw,
                     a_exp,
                     b_bias,
-                    lower_bound,
+                    gate_c,
                     scale,
                     USE_QK_L2NORM_IN_KERNEL,
                     USE_GATE_IN_KERNEL,
@@ -577,27 +598,28 @@ def fused_recurrent_kda_packed_decode_kernel(
                     ALLOW_NEG_EIGVAL,
                 )
 
-            kq = gl.sum(kv * qv, axis=0)
             if STATE_V_FIRST:
                 S = S * a[None, :]  # decay:  Diag(alpha) S
                 stored = gl.sum(S * kv[None, :], axis=1)  # read:   S^T k
-                odec = gl.sum(S * qv[None, :], axis=1)  # output: S^T q, pre-write
                 err = (vv - stored) * b  # error:  beta * (v - S^T k)
                 S = S + err[:, None] * kv[None, :]  # write:  S += beta * k (x) err
             else:
                 S = S * a[:, None]  # decay:  Diag(alpha) S
                 stored = gl.sum(S * kv[:, None], axis=0)  # read:   S^T k
-                odec = gl.sum(S * qv[:, None], axis=0)  # output: S^T q, pre-write
                 err = (vv - stored) * b  # error:  beta * (v - S^T k)
                 S = S + kv[:, None] * err[None, :]  # write:  S += beta * k (x) err
-            o = odec + err * kq
-            gl.amd.gfx1250.buffer_store(o.to(o_ptr.dtype.element_ty), o_p, off_v)
 
             if IS_CONTINUOUS_BATCHING:
                 if INPLACE_FINAL_STATE:
-                    out_slot = gl.load(
-                        state_indices_ptr + i_n * stride_indices_seq + t
-                    ).to(gl.int32)
+                    if PREFETCH_DEPTH == 1 and PHASE == 0:
+                        out_slot = slot_nxt
+                        slot_nxt = gl.load(
+                            state_indices_ptr + i_n * stride_indices_seq + t + 1
+                        ).to(gl.int32)
+                    else:
+                        out_slot = gl.load(
+                            state_indices_ptr + i_n * stride_indices_seq + t
+                        ).to(gl.int32)
                 else:
                     out_slot = bos + t
                 row_out = _state_row(
@@ -641,6 +663,11 @@ def fused_recurrent_kda_packed_decode_kernel(
                         off_s,
                     )
 
+            if STATE_V_FIRST:
+                o = gl.sum(S * qv[None, :], axis=1)  # output: S^T q, post-write
+            else:
+                o = gl.sum(S * qv[:, None], axis=0)  # output: S^T q, post-write
+            gl.amd.gfx1250.buffer_store(o.to(o_ptr.dtype.element_ty), o_p, off_v)
             o_p += HV * V
 
     if USE_TDM_FUSED_LOAD:
