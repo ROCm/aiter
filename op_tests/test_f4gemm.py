@@ -355,13 +355,17 @@ def test_gemm(
     # Dispatch mode. Default (knl_name=None) is heuristic: kernelName="" lets the
     # aiter op pick the .co from f4gemm.csv by (intype, a_preshuffle, outtype), so
     # the test validates the op's dispatch. Explicit is opt-in via --knl-name:
-    # "auto" uses the per-config derived name below; any other value is used verbatim.
+    # "auto" uses the per-config derived name below; a readable co_name stem (e.g.
+    # f4gemm_..._ps_low-eff) is mangled the same way; an already-mangled _ZN...E
+    # symbol is used verbatim.
     if knl_name is None:
         knl = ""
     elif knl_name == "auto":
         knl = f"_ZN5aiter{len(base)}{base}E"
-    else:
+    elif knl_name.startswith("_ZN"):
         knl = knl_name
+    else:
+        knl = f"_ZN5aiter{len(knl_name)}{knl_name}E"
 
     # Pass inputs as ARGS so run_perftest can rotate them (defeats the L2 hot-cache).
     if intype == "nvfp4":
@@ -627,8 +631,10 @@ def main():
         default=None,
         help="dispatch mode. Default (unset) = heuristic: the aiter op picks the "
         ".co from f4gemm.csv by (intype, a_preshuffle, outtype), validating dispatch. "
-        "'auto' = force the per-config derived knl_name (explicit). Any other value "
-        "= use that exact mangled knl_name for all runs (developer experiment/debug).",
+        "'auto' = force the per-config derived knl_name (explicit). A readable co_name "
+        "stem (e.g. f4gemm_bf16_mxfp4_ABpreShuffle_256x256_4x4_ps_low-eff) is mangled "
+        "automatically; an already-mangled _ZN...E symbol is used verbatim (developer "
+        "experiment/debug).",
     )
     parser.add_argument(
         "-s",
