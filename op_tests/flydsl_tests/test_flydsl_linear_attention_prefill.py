@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import zlib
 from dataclasses import dataclass, replace
 
 import pytest
@@ -624,6 +625,17 @@ def _build_cu_seqlens(context_lens, device="cuda"):
     return scheduled_q_lens, cu_seqlens
 
 
+def _case_seed(context_lens, args: PrefillArgs = None) -> int:
+    """Per-case seed derived from the case identity.
+
+    ``crc32`` (not the builtin ``hash``) so the value is stable across
+    processes regardless of ``PYTHONHASHSEED``, and derived per case so a
+    shape's inputs no longer depend on how many other cases ran before it.
+    """
+    tag = f"{args!r}|{list(context_lens)}"
+    return zlib.crc32(tag.encode()) & 0x7FFFFFFF
+
+
 def _make_inputs(
     context_lens,
     args: PrefillArgs = None,
@@ -641,7 +653,9 @@ def _make_inputs(
     dense_batch=1,
     use_g=True,
     g_head_major=False,
+    seed=None,
 ):
+    torch.manual_seed(_case_seed(context_lens, args) if seed is None else seed)
     if args is not None:
         tp = args.tp
         K_dim = args.K
