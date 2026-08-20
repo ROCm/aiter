@@ -49,7 +49,7 @@
         "matrix_instr_nonkdim": 16,
         "cache_modifier": ".cg"
     },
-    "M_GEQ_512": {
+    "M_GEQ_1024": {
         "BLOCK_SIZE_M": 64,
         "BLOCK_SIZE_N": 256,
         "GROUP_SIZE_M": 1,
