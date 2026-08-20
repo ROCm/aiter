@@ -3448,6 +3448,8 @@ def compile_mixed_moe_gemm2_common(
     b_nt: int = 0,
     xcd_swizzle: int = 0,
     shared_expert_id: int | None = None,
+    _n_tile_range: tuple[int, int] | None = None,
+    _compose_entry=None,
 ):
     """Compile stage2 kernel (moe_gemm2): A2 @ W2.T -> [tokens, model_dim], atomic-add."""
     heterogeneous_b = shared_expert_id is not None
@@ -3549,6 +3551,14 @@ def compile_mixed_moe_gemm2_common(
     out_is_f32 = out_s in ("f32", "fp32", "float")
     need_fp8_out = out_s == "fp8"
     out_is_bf16 = out_s in ("bf16", "bfloat16") or need_fp8_out
+    total_n_tiles = (model_dim - model_dim_pad + tile_n - 1) // tile_n
+    n_tile_start, n_tile_end = (
+        (0, total_n_tiles) if _n_tile_range is None else _n_tile_range
+    )
+    n_tile_count = n_tile_end - n_tile_start
+    route_columns = (
+        model_dim if _n_tile_range is None else n_tile_count * tile_n
+    )
     if const_expr(need_fp8_out and bool(accumulate)):
         raise ValueError(
             "compile_mixed_moe_gemm2 fp8 output requires accumulate=False (reduce path)"
@@ -3638,6 +3648,8 @@ def compile_mixed_moe_gemm2_common(
             f"_vscale_fix3_fp4opt_v1{pm_tag}{sbm_tag}{wpe_tag}{async_tag}"
             f"{cumul_tag}{xcd_tag}{acc_tag}"
         )
+        if _n_tile_range is not None:
+            variant_tags += f"_nr{n_tile_start}x{n_tile_end}"
     module_name = (
         f"mfma_moe2_a{a_dtype}_w{b_dtype}_{out_s}_{epilog_tag}"
         f"_t{tile_m}x{tile_n}x{tile_k}{variant_tags}"
@@ -3675,6 +3687,7 @@ def compile_mixed_moe_gemm2_common(
             i32_n_in: fx.Int32,
             i32_k_in: fx.Int32,
             i32_size_expert_ids_in: fx.Int32,
+            block_id=None,
         ):
 
             tokens_in = arith.index_cast(ir.IndexType.get(), i32_tokens_in.ir_value())
@@ -3735,8 +3748,14 @@ def compile_mixed_moe_gemm2_common(
             layout_lds = fx.make_layout(shape_lds, stride_lds)
 
             tx = gpu.thread_id("x")
-            by_outer = gpu.block_id("x")
-            bx_persist = gpu.block_id("y")
+            if block_id is None:
+                by_outer = gpu.block_id("x")
+                bx_persist = gpu.block_id("y")
+            else:
+                by_outer = block_id % arith.constant(n_tile_count, index=True)
+                bx_persist = block_id // arith.constant(n_tile_count, index=True)
+            if n_tile_start:
+                by_outer = by_outer + arith.constant(n_tile_start, index=True)
 
             if const_expr(xcd_swizzle > 0):
                 num_xcds = 8
@@ -3829,8 +3848,8 @@ def compile_mixed_moe_gemm2_common(
 
             out_elem_bytes = 1 if need_fp8_out else (4 if out_is_f32 else 2)
             # fp8 route-out row = [N fp8 value bytes | N/8 e8m0 scale bytes].
-            scale_bytes_per_row = (int(model_dim) // 8) if need_fp8_out else 0
-            out_row_bytes_const = int(model_dim) * int(out_elem_bytes) + int(
+            scale_bytes_per_row = (int(route_columns) // 8) if need_fp8_out else 0
+            out_row_bytes_const = int(route_columns) * int(out_elem_bytes) + int(
                 scale_bytes_per_row
             )
             out_nbytes_idx = (
@@ -5296,7 +5315,12 @@ def compile_mixed_moe_gemm2_common(
                         scaled_vals = []
                         for i in range_constexpr(e_vec):
                             scaled_vals.append(frag_vals[i] * quant_scale)
-                        ptr_addr_idx = row_byte_base + col_g0
+                        col_out = col_g0
+                        if const_expr(_n_tile_range is not None):
+                            col_out = col_out - arith.constant(
+                                n_tile_start * tile_n, index=True
+                            )
+                        ptr_addr_idx = row_byte_base + col_out
                         for wg in range_constexpr(e_vec // 4):
                             b = wg * 4
                             packed_w = c0_i32_q
@@ -5320,11 +5344,11 @@ def compile_mixed_moe_gemm2_common(
                             llvm.StoreOp(
                                 packed_raw, out_ptr_v, alignment=4, nontemporal=True
                             )
-                        # e8m0 scale byte at [model_dim + col_g0/8].
+                        # e8m0 scale byte follows this route row's fp8 values.
                         scale_byte_idx = (
                             row_byte_base
-                            + arith.constant(model_dim, index=True)
-                            + (col_g0 // arith.constant(8, index=True))
+                            + arith.constant(route_columns, index=True)
+                            + (col_out // arith.constant(8, index=True))
                         )
                         scale_ptr_v = idx_to_llvm_ptr(scale_byte_idx)
                         e8m0_raw = fx.Int8(E).ir_value()
@@ -5441,6 +5465,13 @@ def compile_mixed_moe_gemm2_common(
                 gpu.barrier()
                 scf.YieldOp([expert_i32, expert_b_base])
             for_ip.__exit__(None, None, None)
+
+    if _compose_entry is not None:
+        return _compose_entry(
+            module_name=module_name,
+            emit_gemm2=_emit_moe_gemm2,
+            allocator=allocator,
+        )
 
     if heterogeneous_b:
 
@@ -5573,8 +5604,16 @@ def compile_mixed_moe_gemm2_common(
         tile_n_idx = arith.constant(tile_n, index=True)
         model_dim_pad_idx = arith.constant(model_dim_pad, index=True)
         gx = (
-            n_in - model_dim_pad_idx + tile_n_idx - arith.constant(1, index=True)
-        ) // tile_n_idx
+            arith.constant(n_tile_count, index=True)
+            if const_expr(_n_tile_range is not None)
+            else (
+                n_in
+                - model_dim_pad_idx
+                + tile_n_idx
+                - arith.constant(1, index=True)
+            )
+            // tile_n_idx
+        )
         if const_expr(persistent):
             gy = arith.constant(cu_num, index=True)
         else:

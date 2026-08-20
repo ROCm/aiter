@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Full-width TP8 communication-fused Stage2 kernels."""
+"""Full-width communication-fused Stage2 kernels."""
 
 import functools
 
@@ -12,8 +12,18 @@ from flydsl.expr import arith, gpu, ptrtoint, range_constexpr
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import ReductionOp, T
 
-from .. import buffer_ops, communication_ops_utils as comm_ops
+from .. import buffer_ops
 from ..mixed_moe_gemm_2stage_common import compile_mixed_moe_gemm2_common
+from .collectives import (
+    decode_scaled_fp8_f32,
+    e8m0_scale,
+    emit_tp_all_gather,
+    emit_tp_reduce_scatter,
+    load_e8m0_scale,
+    load_fp8_words,
+    pack_fp8_words,
+    store_fp8_words,
+)
 
 
 M = 2048
@@ -22,25 +32,25 @@ I = 384
 E = 384
 TOPK = 6
 TP = 8
-FLAT_VA_RANK_STRIDE = 1 << 32
 TILE_M = 32
 TILE_N = 256
 TILE_K = 128
 SORT_BLOCK_M = 64
-OWNER_ROWS = M // TP
+SHARD_ROWS = M // TP
 BLOCK = 256
-PEER_GRID = 128
-FANOUT_GRID = 126
-LOCAL_WORKERS = 640
+REDUCE_SCATTER_GRID = 128
+ALL_GATHER_GRID = 126
 VECTOR_WIDTH = 8
 GROUPS_PER_ROW = H // 32
-FANOUT_BLOCKS_PER_SOURCE = FANOUT_GRID // (TP - 1)
 LOCAL_COLUMN_TILES = (H + BLOCK * VECTOR_WIDTH - 1) // (
     BLOCK * VECTOR_WIDTH
 )
+LOCAL_WORKERS = M * LOCAL_COLUMN_TILES
 
 
-def _compile_compute():
+@functools.cache
+def compile_stage2_compute():
+    """Compile the full-width compact Stage2 producer."""
     return compile_mixed_moe_gemm2_common(
         model_dim=H,
         inter_dim=I,
@@ -59,12 +69,6 @@ def _compile_compute():
     )
 
 
-@functools.cache
-def compile_stage2_compute():
-    """Compile the full-width compact Stage2 producer."""
-    return _compile_compute()
-
-
 def _emit_local_reduce(route, partial, shared, token, column_base):
     """Reduce six routed rows plus the local shared partial into MXFP8."""
     route_row_bytes = H + H // 8
@@ -80,37 +84,22 @@ def _emit_local_reduce(route, partial, shared, token, column_base):
         )
         acc = fx.Vector.filled(VECTOR_WIDTH, 0.0, fx.Float32)
         for route_slot in range_constexpr(TOPK):
-            raw = fx.Vector(
-                buffer_ops.buffer_load(
-                    route_row,
-                    fx.Int32(route_slot * (route_row_bytes // 4))
-                    + column // fx.Int32(4),
-                    vec_width=2,
-                    dtype=T.i32,
-                    cache_modifier=2,
-                )
+            words = load_fp8_words(
+                route_row,
+                fx.Int32(route_slot * (route_row_bytes // 4))
+                + column // fx.Int32(4),
+                word_count=2,
+                load_width=2,
+                cache_modifier=2,
             )
-            values = []
-            for word in range_constexpr(2):
-                for half in range_constexpr(2):
-                    pair = fx.Vector(
-                        fx.rocdl.cvt_pk_f32_fp8(T.f32x2, raw[word], bool(half))
-                    )
-                    values.extend((pair[0], pair[1]))
-            scale_raw = buffer_ops.buffer_load(
+            scale = load_e8m0_scale(
                 route_row,
                 fx.Int32(route_slot * route_row_bytes + H)
                 + column // fx.Int32(8),
-                vec_width=1,
-                dtype=T.i8,
-                cache_modifier=2,
+                2,
             )
-            scale = (
-                fx.Uint32(fx.Uint8(scale_raw)) << fx.Uint32(23)
-            ).bitcast(fx.Float32)
-            acc = acc + fx.Vector.from_elements(
-                [value * scale for value in values], fx.Float32
-            )
+            values = decode_scaled_fp8_f32(words, scale)
+            acc = acc + fx.Vector.from_elements(values, fx.Float32)
 
         shared_addr = fx.Int64(ptrtoint(shared)) + fx.Int64(token) * fx.Int64(
             H * 2
@@ -144,36 +133,8 @@ def _emit_local_reduce(route, partial, shared, token, column_base):
                 fx.Int32(remote_bits).bitcast(fx.Float32)
             )
             max_bits = local_max.bitcast(fx.Int32)
-        working = (
-            local_max * fx.Int32(0x3B124925).bitcast(fx.Float32)
-        ).bitcast(fx.Int32)
-        mantissa = working & fx.Int32(0x7FFFFF)
-        exponent = (working >> fx.Int32(23)) & fx.Int32(0xFF)
-        e8m0 = (mantissa != fx.Int32(0)).select(exponent + fx.Int32(1), exponent)
-        e8m0 = (e8m0 > fx.Int32(0xFF)).select(fx.Int32(0xFF), e8m0)
-        quant_scale = ((fx.Int32(254) - e8m0) << fx.Int32(23)).bitcast(
-            fx.Float32
-        )
-
-        packed_words = []
-        for word in range_constexpr(2):
-            base = word * 4
-            packed = fx.rocdl.cvt_pk_fp8_f32(
-                T.i32,
-                acc[base] * quant_scale,
-                acc[base + 1] * quant_scale,
-                fx.Int32(0),
-                0,
-            )
-            packed_words.append(
-                fx.rocdl.cvt_pk_fp8_f32(
-                    T.i32,
-                    acc[base + 2] * quant_scale,
-                    acc[base + 3] * quant_scale,
-                    packed,
-                    1,
-                )
-            )
+        e8m0, quant_scale = e8m0_scale(local_max)
+        packed_words = pack_fp8_words(acc, quant_scale, 2)
 
         payload_addr = fx.Int64(ptrtoint(partial)) + fx.Int64(token) * fx.Int64(
             H
@@ -181,12 +142,7 @@ def _emit_local_reduce(route, partial, shared, token, column_base):
         payload_row = buffer_ops.create_buffer_resource_from_addr(
             payload_addr, num_records_bytes=H
         )
-        buffer_ops.buffer_store(
-            fx.Vector.from_elements(packed_words, fx.Int32),
-            payload_row,
-            column,
-            offset_is_bytes=True,
-        )
+        store_fp8_words(payload_row, column, packed_words, 2)
 
         scale_leader = scf.IfOp(
             arith.cmpi(
@@ -234,263 +190,6 @@ def _emit_local_worker(route, partial, shared, worker):
         scf.YieldOp([])
 
 
-def _quantize_group32(acc):
-    local_max = fx.Float32(1e-10).maximumf(
-        fmath.absf(acc).reduce(ReductionOp.MAX)
-    )
-    working = (
-        local_max * fx.Int32(0x3B124925).bitcast(fx.Float32)
-    ).bitcast(fx.Int32)
-    mantissa = working & fx.Int32(0x7FFFFF)
-    exponent = (working >> fx.Int32(23)) & fx.Int32(0xFF)
-    e8m0 = (mantissa != fx.Int32(0)).select(exponent + fx.Int32(1), exponent)
-    e8m0 = (e8m0 > fx.Int32(0xFF)).select(fx.Int32(0xFF), e8m0)
-    quant_scale = ((fx.Int32(254) - e8m0) << fx.Int32(23)).bitcast(fx.Float32)
-    packed_words = []
-    for word in range_constexpr(8):
-        base = word * 4
-        packed = fx.rocdl.cvt_pk_fp8_f32(
-            T.i32,
-            acc[base] * quant_scale,
-            acc[base + 1] * quant_scale,
-            fx.Int32(0),
-            0,
-        )
-        packed_words.append(
-            fx.rocdl.cvt_pk_fp8_f32(
-                T.i32,
-                acc[base + 2] * quant_scale,
-                acc[base + 3] * quant_scale,
-                packed,
-                1,
-            )
-        )
-    return e8m0, packed_words
-
-
-def _decode_group32(e8m0, packed_words):
-    scale = (fx.Uint32(e8m0) << fx.Uint32(23)).bitcast(fx.Float32)
-    values = []
-    for word in range_constexpr(8):
-        for half in range_constexpr(2):
-            pair = fx.Vector(
-                fx.rocdl.cvt_scalef32_pk_bf16_fp8(
-                    T.vec(2, T.bf16),
-                    arith.unwrap(packed_words[word]),
-                    arith.unwrap(scale),
-                    bool(half),
-                )
-            )
-            values.extend((pair[0], pair[1]))
-    return values
-
-
-def _peer_base(flat_base, peer):
-    return flat_base + fx.Int64(peer) * fx.Int64(FLAT_VA_RANK_STRIDE)
-
-
-def _reduce_pack(flat_base, output, payload, scales, rank, pack):
-    local_token = pack // fx.Int32(GROUPS_PER_ROW)
-    pack_in_row = pack - local_token * fx.Int32(GROUPS_PER_ROW)
-    column = pack_in_row * fx.Int32(32)
-    global_token = rank * fx.Int32(OWNER_ROWS) + local_token
-    acc = fx.Vector.filled(32, 0.0, fx.Float32)
-
-    for source_round in range_constexpr(TP):
-        source = (rank + local_token + fx.Int32(source_round)) % fx.Int32(TP)
-        peer_base = _peer_base(flat_base, source)
-        source_row = buffer_ops.create_buffer_resource_from_addr(
-            peer_base + fx.Int64(global_token) * fx.Int64(H),
-            num_records_bytes=H,
-        )
-        raw_words = []
-        for half in range_constexpr(2):
-            raw = fx.Vector(
-                buffer_ops.buffer_load(
-                    source_row,
-                    column // fx.Int32(4) + fx.Int32(half * 4),
-                    vec_width=4,
-                    dtype=T.i32,
-                    cache_modifier=2,
-                )
-            )
-            for word in range_constexpr(4):
-                raw_words.append(raw[word])
-        scale_row = buffer_ops.create_buffer_resource_from_addr(
-            peer_base
-            + fx.Int64(M * H)
-            + fx.Int64(global_token) * fx.Int64(GROUPS_PER_ROW),
-            num_records_bytes=GROUPS_PER_ROW,
-        )
-        scale_raw = buffer_ops.buffer_load(
-            scale_row,
-            column // fx.Int32(32),
-            vec_width=1,
-            dtype=T.i8,
-            cache_modifier=2,
-        )
-        scale = (
-            fx.Uint32(fx.Uint8(scale_raw)) << fx.Uint32(23)
-        ).bitcast(fx.Float32)
-        values = []
-        for word in range_constexpr(8):
-            for half in range_constexpr(2):
-                pair = fx.Vector(
-                    fx.rocdl.cvt_pk_f32_fp8(
-                        T.f32x2, raw_words[word], bool(half)
-                    )
-                )
-                values.extend((pair[0] * scale, pair[1] * scale))
-        acc = acc + fx.Vector.from_elements(values, fx.Float32)
-
-    e8m0, packed_words = _quantize_group32(acc)
-    payload_row = buffer_ops.create_buffer_resource_from_addr(
-        fx.Int64(ptrtoint(payload)) + fx.Int64(local_token) * fx.Int64(H),
-        num_records_bytes=H,
-    )
-    for chunk in range_constexpr(2):
-        buffer_ops.buffer_store(
-            fx.Vector.from_elements(
-                packed_words[chunk * 4 : chunk * 4 + 4], fx.Int32
-            ),
-            payload_row,
-            column + fx.Int32(chunk * 16),
-            offset_is_bytes=True,
-        )
-    scale_row = buffer_ops.create_buffer_resource_from_addr(
-        fx.Int64(ptrtoint(scales))
-        + fx.Int64(local_token) * fx.Int64(GROUPS_PER_ROW),
-        num_records_bytes=GROUPS_PER_ROW,
-    )
-    buffer_ops.buffer_store(
-        e8m0.to(fx.Int8),
-        scale_row,
-        column // fx.Int32(32),
-        offset_is_bytes=True,
-    )
-
-    output_values = _decode_group32(e8m0, packed_words)
-    output_row = buffer_ops.create_buffer_resource_from_addr(
-        fx.Int64(ptrtoint(output)) + fx.Int64(local_token) * fx.Int64(H * 2),
-        num_records_bytes=H * 2,
-    )
-    for chunk in range_constexpr(4):
-        buffer_ops.buffer_store(
-            fx.Vector.from_elements(
-                [
-                    output_values[chunk * 8 + element]
-                    for element in range_constexpr(8)
-                ],
-                fx.BFloat16,
-            ),
-            output_row,
-            column + fx.Int32(chunk * 8),
-        )
-
-
-def _emit_peer_reduce(flat_base, output, payload, scales, rank, worker):
-    """Reduce owner packs from all TP ranks and publish MXFP8 owner data."""
-    start = arith.index_cast(
-        T.index, worker * fx.Int32(BLOCK) + fx.Int32(gpu.thread_idx.x)
-    )
-    loop = scf.ForOp(
-        start,
-        arith.constant(OWNER_ROWS * GROUPS_PER_ROW, index=True),
-        arith.constant(PEER_GRID * BLOCK, index=True),
-    )
-    with ir.InsertionPoint(loop.body):
-        _reduce_pack(
-            flat_base,
-            output,
-            payload,
-            scales,
-            rank,
-            arith.index_cast(T.i32, loop.induction_variable),
-        )
-        scf.YieldOp([])
-
-
-def _emit_fanout(payload_flat_base, scale_flat_base, output, rank, worker):
-    """Pull one source-owned token partition into the replicated output."""
-    tid = fx.Int32(gpu.thread_idx.x)
-    source_slot = worker % fx.Int32(TP - 1)
-    source_block = worker // fx.Int32(TP - 1)
-    source = (rank + fx.Int32(1) + source_slot) % fx.Int32(TP)
-    payload = buffer_ops.create_buffer_resource_from_addr(
-        _peer_base(payload_flat_base, source), num_records_bytes=0xFFFFFFFF
-    )
-    scales = buffer_ops.create_buffer_resource_from_addr(
-        _peer_base(scale_flat_base, source), num_records_bytes=0xFFFFFFFF
-    )
-    output_rsrc = buffer_ops.create_buffer_resource_from_addr(
-        fx.Int64(ptrtoint(output)), num_records_bytes=0xFFFFFFFF
-    )
-
-    start = arith.index_cast(T.index, source_block * fx.Int32(BLOCK) + tid)
-    loop = scf.ForOp(
-        start,
-        arith.constant(OWNER_ROWS * GROUPS_PER_ROW, index=True),
-        arith.constant(FANOUT_BLOCKS_PER_SOURCE * BLOCK, index=True),
-    )
-    with ir.InsertionPoint(loop.body):
-        group = arith.index_cast(T.i32, loop.induction_variable)
-        raw_words = []
-        for half in range_constexpr(2):
-            raw = fx.Vector(
-                buffer_ops.buffer_load(
-                    payload,
-                    group * fx.Int32(8) + fx.Int32(half * 4),
-                    vec_width=4,
-                    dtype=T.i32,
-                    cache_modifier=1,
-                )
-            )
-            for word in range_constexpr(4):
-                raw_words.append(raw[word])
-        scale_raw = buffer_ops.buffer_load(
-            scales,
-            group,
-            vec_width=1,
-            dtype=T.i8,
-            cache_modifier=1,
-        )
-        scale = (
-            fx.Uint32(fx.Uint8(scale_raw)) << fx.Uint32(23)
-        ).bitcast(fx.Float32)
-        values = []
-        for word in range_constexpr(8):
-            for half in range_constexpr(2):
-                pair = fx.Vector(
-                    fx.rocdl.cvt_scalef32_pk_bf16_fp8(
-                        T.vec(2, T.bf16),
-                        raw_words[word].ir_value(),
-                        scale.ir_value(),
-                        bool(half),
-                    )
-                )
-                values.extend((pair[0], pair[1]))
-        owner_row = group // fx.Int32(GROUPS_PER_ROW)
-        group_in_row = group - owner_row * fx.Int32(GROUPS_PER_ROW)
-        output_column = (
-            source * fx.Int32(OWNER_ROWS * H)
-            + owner_row * fx.Int32(H)
-            + group_in_row * fx.Int32(32)
-        )
-        for chunk in range_constexpr(4):
-            buffer_ops.buffer_store(
-                fx.Vector.from_elements(
-                    [
-                        values[chunk * 8 + element]
-                        for element in range_constexpr(8)
-                    ],
-                    fx.BFloat16,
-                ),
-                output_rsrc,
-                output_column + fx.Int32(chunk * 8),
-            )
-        scf.YieldOp([])
-
-
 @functools.cache
 def compile_stage2_local_reduce():
     """Compile the local route/shared reduction."""
@@ -515,10 +214,13 @@ def compile_stage2_local_reduce():
 
 
 @functools.cache
-def compile_stage2_peer_reduce():
-    """Compile the TP peer reduction and owner MXFP8 publication."""
+def compile_stage2_tp_reduce_scatter():
+    """Compile the TP reduce-scatter and reduced MXFP8 publication."""
 
-    @flyc.kernel(name="comm_fused_moe_peer", known_block_size=[BLOCK, 1, 1])
+    @flyc.kernel(
+        name="comm_fused_moe_tp_reduce_scatter",
+        known_block_size=[BLOCK, 1, 1],
+    )
     def kernel(
         flat_base: fx.Int64,
         output: fx.Pointer,
@@ -526,91 +228,67 @@ def compile_stage2_peer_reduce():
         scales: fx.Pointer,
         rank: fx.Int32,
     ):
-        _emit_peer_reduce(
+        emit_tp_reduce_scatter(
             flat_base,
             output,
             payload,
             scales,
             rank,
             fx.Int32(gpu.block_idx.x),
+            tokens=M,
+            output_width=H,
+            payload_width=H,
+            shard_rows=SHARD_ROWS,
+            tp=TP,
+            block=BLOCK,
+            reduce_scatter_grid=REDUCE_SCATTER_GRID,
         )
 
     @flyc.jit
     def launch(flat_base, output, payload, scales, rank, stream):
         kernel(flat_base, output, payload, scales, rank).launch(
-            grid=(PEER_GRID, 1, 1), block=(BLOCK, 1, 1), stream=stream
+            grid=(REDUCE_SCATTER_GRID, 1, 1),
+            block=(BLOCK, 1, 1),
+            stream=stream,
         )
 
     return launch
 
 
 @functools.cache
-def compile_stage2_fanout():
-    """Compile the replicated owner fanout."""
+def compile_stage2_tp_all_gather():
+    """Compile the TP all-gather of reduced shards."""
 
-    @flyc.kernel(name="comm_fused_moe_fanout", known_block_size=[BLOCK, 1, 1])
+    @flyc.kernel(
+        name="comm_fused_moe_tp_all_gather",
+        known_block_size=[BLOCK, 1, 1],
+    )
     def kernel(
         payload_flat_base: fx.Int64,
         scale_flat_base: fx.Int64,
         output: fx.Pointer,
         rank: fx.Int32,
     ):
-        _emit_fanout(
+        emit_tp_all_gather(
             payload_flat_base,
             scale_flat_base,
             output,
             rank,
             fx.Int32(gpu.block_idx.x),
+            output_width=H,
+            payload_width=H,
+            shard_rows=SHARD_ROWS,
+            tp=TP,
+            block=BLOCK,
+            all_gather_grid=ALL_GATHER_GRID,
         )
 
     @flyc.jit
     def launch(payload_flat_base, scale_flat_base, output, rank, stream):
         kernel(payload_flat_base, scale_flat_base, output, rank).launch(
-            grid=(FANOUT_GRID, 1, 1), block=(BLOCK, 1, 1), stream=stream
+            grid=(ALL_GATHER_GRID, 1, 1),
+            block=(BLOCK, 1, 1),
+            stream=stream,
         )
 
     return launch
-
-
-@functools.cache
-def compile_epoch_barrier():
-    """Publish one symmetric workspace epoch and acquire all TP peers."""
-
-    @flyc.kernel(name="comm_fused_moe_epoch_tp8", known_block_size=[64, 1, 1])
-    def kernel(
-        workspace: fx.Pointer,
-        flat_base: fx.Int64,
-        ready_offset: fx.Int64,
-    ):
-        tid = fx.Int32(gpu.thread_idx.x)
-        local_base = fx.Int64(ptrtoint(workspace))
-        expected = fx.Int64(
-            comm_ops.load_i64_global(local_base + ready_offset)
-        ) + fx.Int64(1)
-        if tid == fx.Int32(0):
-            comm_ops.store_i64_global_system(local_base + ready_offset, expected)
-        gpu.barrier()
-        if tid < fx.Int32(TP):
-            peer_base = _peer_base(flat_base, tid)
-            comm_ops.wait_i64_system_until_at_least(
-                peer_base + ready_offset, expected
-            )
-            comm_ops.fence_system_acquire()
-
-    @flyc.jit
-    def launch(workspace, flat_base, ready_offset, stream):
-        kernel(workspace, flat_base, ready_offset).launch(
-            grid=(1, 1, 1), block=(64, 1, 1), stream=stream
-        )
-
-    return launch
-
-
-__all__ = [
-    "FLAT_VA_RANK_STRIDE",
-    "compile_epoch_barrier",
-    "compile_stage2_compute",
-    "compile_stage2_fanout",
-    "compile_stage2_local_reduce",
-    "compile_stage2_peer_reduce",
-]
