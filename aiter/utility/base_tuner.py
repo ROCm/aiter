@@ -625,10 +625,8 @@ class TunerCommon:
             from aiter.jit import core as jit_core
 
             jit_core.AITER_REBUILD = old_rebuild
-            jit_core.AITER_CONFIGS.get_config_file.cache_clear()
         except ImportError:
             pass
-        self._clear_op_caches()
 
     def _emit_report_lines(self, lines, report_file=None):
         if report_file:

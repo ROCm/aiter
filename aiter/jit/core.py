@@ -152,7 +152,7 @@ AITER_CONFIG_GEMM_BF16 = os.getenv(
 
 AITER_CONFIG_GDN_K5_OPT = os.getenv(
     "AITER_CONFIG_GDN_K5_OPT",
-    f"{AITER_ROOT_DIR}/aiter/configs/model_configs/qwen3_5_35b_chunk_gdn_h_opt_tuned.csv",
+    f"{AITER_ROOT_DIR}/aiter/configs/chunk_gdn_h_opt_tuned.csv",
 )
 
 
@@ -403,22 +403,12 @@ class AITER_CONFIG:
             if not op_tuned_file_list:
                 config_file = default_file
             else:
-                merge_paths: list[str] = []
-                seen_paths: set[str] = set()
-                for path in (default_file, *(str(p) for p in op_tuned_file_list)):
-                    abs_path = os.path.abspath(path)
-                    if abs_path in seen_paths:
-                        continue
-                    seen_paths.add(abs_path)
-                    merge_paths.append(path)
-                if len(merge_paths) == 1:
-                    config_file = merge_paths[0]
-                else:
-                    tuned_files = ":".join(merge_paths)
-                    logger.info(
-                        f"merge tuned file under model_configs/ and configs/ {tuned_files}"
-                    )
-                    config_file = self.update_config_files(tuned_files, tuned_file_name)
+                tuned_files = ":".join(str(p) for p in op_tuned_file_list)
+                tuned_files = default_file + ":" + tuned_files
+                logger.info(
+                    f"merge tuned file under model_configs/ and configs/ {tuned_files}"
+                )
+                config_file = self.update_config_files(tuned_files, tuned_file_name)
         else:
             config_file = self.update_config_files(config_env_file, tuned_file_name)
             # print(f"get config file from environment ", config_file)
