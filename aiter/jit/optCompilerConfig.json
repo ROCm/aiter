@@ -932,7 +932,8 @@
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/quant_pybind.cu'",
             "f'{AITER_CSRC_DIR}/kernels/quant_kernels.cu'",
-            "f'{AITER_CSRC_DIR}/kernels/quant_mxfp4.cu'"
+            "f'{AITER_CSRC_DIR}/kernels/quant_mxfp4.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/quant_mxfp6_gemm.cu'"
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [

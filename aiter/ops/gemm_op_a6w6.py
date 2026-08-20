@@ -31,6 +31,19 @@ _PACK_LAYOUT = "mxfp6_c0c1_256_padk2"
 _SHORT_K_SWIZZLE_LIMIT = 48 * _K_TILE
 _GROUPED_SWIZZLE_MAX_M = 16 * 32 * _TILE
 _GROUPED_SWIZZLE_MAX_N = 64 * _TILE
+_BATCHED_PACK_MIN_ELEMENTS = 32 * 1024 * 1024
+_BATCHED_PACK_BLOCK_M = 64
+_BATCHED_PACK_K_BLOCKS = _K_TILE // _SCALE_GROUP_SIZE
+_QUANT_BACKEND = os.environ.get("AITER_MXFP6_QUANT_BACKEND", "auto").lower()
+if _QUANT_BACKEND not in {"auto", "hip", "triton"}:
+    raise ValueError(
+        "AITER_MXFP6_QUANT_BACKEND must be one of auto, hip, or triton, "
+        f"got {_QUANT_BACKEND!r}"
+    )
+try:
+    _IS_GFX950 = torch.cuda.is_available() and get_gfx() == "gfx950"
+except (KeyError, RuntimeError):
+    _IS_GFX950 = False
 _TUNED_CONFIG_KEY_COLUMNS = ("gfx", "cu_num", "M", "N", "K")
 _TUNED_CONFIG_NUMERIC_COLUMNS = ("cu_num", "M", "N", "K", "splitK")
 _TUNED_CONFIG_COLUMNS = frozenset(
@@ -44,6 +57,12 @@ _TUNED_CONFIG_COLUMNS = frozenset(
         "splitK",
     }
 )
+
+
+@compile_ops("module_quant", fc_name="quant_mxfp6_gemm_hip", develop=True)
+def quant_mxfp6_gemm_hip_out(
+    input: Tensor, packed: Tensor, packed_scale: Tensor
+) -> None: ...
 
 
 # ---------------------------------------------------------------------------
@@ -197,6 +216,90 @@ if _HAS_TRITON:
         base = (t * NK_PAD + step) * 24576
         c0base = (base + blk * 16)[:, None]
         c1base = (base + 16384 + blk * 8)[:, None]
+        p0 = 3 * g8 + 0
+        p1 = 3 * g8 + 1
+        p2 = 3 * g8 + 2
+        tl.store(
+            a_ptr + tl.where(p0 < 16, c0base + p0, c1base + (p0 - 16)),
+            b0.to(tl.uint8),
+            mask=rm[:, None],
+        )
+        tl.store(
+            a_ptr + tl.where(p1 < 16, c0base + p1, c1base + (p1 - 16)),
+            b1.to(tl.uint8),
+            mask=rm[:, None],
+        )
+        tl.store(
+            a_ptr + tl.where(p2 < 16, c0base + p2, c1base + (p2 - 16)),
+            b2.to(tl.uint8),
+            mask=rm[:, None],
+        )
+        su = rem // 128
+        sub = (rem % 128) // 16
+        scaddr = (t * NK_PAD + step) * 1024 + su * 512 + kg * 128 + r16 * 8 + sub
+        tl.store(s_ptr + scaddr, e8, mask=rm)
+
+    @triton.jit
+    def _quant_pack_4block_kernel(
+        x_ptr,
+        a_ptr,
+        s_ptr,
+        M,
+        NSTEP,
+        NK_PAD,
+        stride_xm,
+        h_ptr,
+        BLOCK_M: tl.constexpr,
+    ):
+        """Pack four adjacent 32-value blocks per program.
+
+        Flattening [row, K-block] makes each row's full 128-value K tile
+        contiguous in the load stream.  It also halves the program count versus
+        the single-block kernel while retaining the exact same dot, quantization,
+        and physical C0/C1 stores for every block.
+        """
+        pid = tl.program_id(0)
+        step = pid % NSTEP
+        rblk = pid // NSTEP
+        flat = tl.arange(0, BLOCK_M * 4)
+        rows = rblk * BLOCK_M + flat // 4
+        kg = flat % 4
+        rm = rows < M
+        xall = tl.load(
+            x_ptr
+            + rows[:, None] * stride_xm
+            + step * 128
+            + kg[:, None] * 32
+            + tl.arange(0, 32)[None, :],
+            mask=rm[:, None],
+            other=0.0,
+        )
+        h = tl.load(
+            h_ptr + tl.arange(0, 32)[:, None] * 32 + tl.arange(0, 32)[None, :]
+        ).to(tl.bfloat16)
+        xall = tl.dot(xall.to(tl.bfloat16), h)
+        amax = tl.max(tl.abs(xall), 1)
+        safe = tl.maximum(amax, 1e-30)
+        se = tl.minimum(tl.maximum(tl.floor(tl.log2(safe)) - 2.0, -127.0), 127.0)
+        se = tl.where(amax > 0.0, se, 0.0)
+        e8 = (se + 127.0).to(tl.uint8)
+        codes = _e2m3_dev(xall * tl.exp2(-se)[:, None])
+        cc = tl.reshape(codes, [BLOCK_M * 4, 8, 2, 2])
+        lo, hi = tl.split(cc)
+        c0, c2 = tl.split(lo)
+        c1, c3 = tl.split(hi)
+        b0 = (c0 | (c1 << 6)) & 0xFF
+        b1 = ((c1 >> 2) | (c2 << 4)) & 0xFF
+        b2 = ((c2 >> 4) | (c3 << 2)) & 0xFF
+        t = rows // 256
+        rem = rows % 256
+        rb = rem // 16
+        r16 = rem % 16
+        blk = rb * 64 + (kg * 16 + r16)
+        base = (t * NK_PAD + step) * 24576
+        c0base = (base + blk * 16)[:, None]
+        c1base = (base + 16384 + blk * 8)[:, None]
+        g8 = tl.arange(0, 8)[None, :]
         p0 = 3 * g8 + 0
         p1 = 3 * g8 + 1
         p2 = 3 * g8 + 2
@@ -591,6 +694,17 @@ def quant_mxfp6_gemm_out(
             f"expected ({expected_packed}, {expected_scale})"
         )
     w = w.detach()
+    hip_supported = (
+        w.is_cuda and w.dtype in {torch.bfloat16, torch.float16} and _IS_GFX950
+    )
+    use_hip = hip_supported and _QUANT_BACKEND in {"auto", "hip"}
+    if use_hip:
+        quant_mxfp6_gemm_hip_out(w.contiguous(), packed, packed_scale)
+        return packed, packed_scale
+    if _QUANT_BACKEND == "hip":
+        raise RuntimeError(
+            "AITER_MXFP6_QUANT_BACKEND=hip requires a bf16/fp16 gfx950 CUDA/HIP tensor"
+        )
     if _HAS_TRITON and w.is_cuda:
         x = w
         if padK != K:
@@ -600,19 +714,36 @@ def quant_mxfp6_gemm_out(
         )  # rotation is fused inside the kernel (no fp32 [M,K] pre-pass)
         NB = padK // _SCALE_GROUP_SIZE
         NK_PAD = padK // _K_TILE + _PADK
-        BM = 128
-        grid = ((rows + BM - 1) // BM * NB,)
-        _quant_pack_kernel[grid](
-            x,
-            packed,
-            packed_scale,
-            rows,
-            NB,
-            NK_PAD,
-            x.stride(0),
-            _had32_t(x.device),
-            BLOCK_M=BM,
-        )
+        if _IS_GFX950 and rows * padK >= _BATCHED_PACK_MIN_ELEMENTS:
+            BM = _BATCHED_PACK_BLOCK_M
+            NSTEP = NB // _BATCHED_PACK_K_BLOCKS
+            grid = ((rows + BM - 1) // BM * NSTEP,)
+            _quant_pack_4block_kernel[grid](
+                x,
+                packed,
+                packed_scale,
+                rows,
+                NSTEP,
+                NK_PAD,
+                x.stride(0),
+                _had32_t(x.device),
+                BLOCK_M=BM,
+                num_warps=4,
+            )
+        else:
+            BM = 128
+            grid = ((rows + BM - 1) // BM * NB,)
+            _quant_pack_kernel[grid](
+                x,
+                packed,
+                packed_scale,
+                rows,
+                NB,
+                NK_PAD,
+                x.stride(0),
+                _had32_t(x.device),
+                BLOCK_M=BM,
+            )
         return packed, packed_scale
 
     tmp_packed, tmp_scale = quant_mxfp6_gemm(w)
@@ -635,11 +766,15 @@ def quant_mxfp6_gemm(w: Tensor) -> tuple[Tensor, Tensor]:
     rows, K = w.shape
     padR, padK = _ceil(rows, _TILE), _ceil(K, _K_TILE)
     w = w.detach()
-    if _HAS_TRITON and w.is_cuda:
-        x = w
-        if padK != K:
-            x = torch.nn.functional.pad(x, (0, padK - K))
-        x = x.contiguous()
+    has_gpu_packer = w.is_cuda and (
+        _HAS_TRITON
+        or (
+            _IS_GFX950
+            and w.dtype in {torch.bfloat16, torch.float16}
+            and _QUANT_BACKEND in {"auto", "hip"}
+        )
+    )
+    if has_gpu_packer:
         NK_PAD = padK // _K_TILE + _PADK
         nt = padR // _TILE
         # The Triton packer writes every logical K tile.  The ASM bounds

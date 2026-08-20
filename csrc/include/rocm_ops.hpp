@@ -1679,7 +1679,12 @@ namespace py = pybind11;
           py::arg("e8m0_shuffle")   = false,                             \
           py::arg("a16w4_shuffle")  = false,                             \
           py::arg("gate_up")        = false,                             \
-          py::arg("shuffle_weight") = false);
+          py::arg("shuffle_weight") = false);                             \
+    m.def("quant_mxfp6_gemm_hip",                                        \
+          &aiter::quant_mxfp6_gemm_hip,                                  \
+          py::arg("input"),                                              \
+          py::arg("packed"),                                             \
+          py::arg("packed_scale"));
 
 #define DSV4_ROTATE_QUANT_PYBIND                                                             \
     m.def("rotate_activation_fp4quant",                                                      \
