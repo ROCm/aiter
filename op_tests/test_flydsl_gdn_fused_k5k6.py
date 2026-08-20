@@ -28,16 +28,15 @@ from __future__ import annotations
 
 import argparse
 
-import aiter
 import pandas as pd
 import pytest
 import torch
 
+import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.test_common import benchmark, checkAllclose, run_perftest
-
 from aiter.ops.flydsl.utils import is_flydsl_available
+from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 if not torch.cuda.is_available():
     pytest.skip("ROCm not available. Skipping GPU tests.", allow_module_level=True)
@@ -106,19 +105,36 @@ def _make_inputs(H, Hg, K, V, T_flat, seq_lens, gate, *, device="cuda"):
     g = gk = None
     if gate == "g":
         g = (
-            torch.randn(H, T_flat, dtype=torch.float32, device=device).abs() * -0.5
-        ).cumsum(dim=1).contiguous()
+            (torch.randn(H, T_flat, dtype=torch.float32, device=device).abs() * -0.5)
+            .cumsum(dim=1)
+            .contiguous()
+        )
     else:  # "gk"
         gk = (
-            torch.randn(T_flat, H, K, dtype=torch.float32, device=device).abs() * -0.1
-        ).cumsum(dim=0).contiguous()
+            (torch.randn(T_flat, H, K, dtype=torch.float32, device=device).abs() * -0.1)
+            .cumsum(dim=0)
+            .contiguous()
+        )
 
     h0 = torch.randn(N, H, V, K, dtype=torch.float32, device=device) * 0.01
 
     return {
-        "q": q, "k": k, "w_tm": w_tm, "u_tm": u_tm, "w_hm": w_hm, "u_hm": u_hm,
-        "g": g, "gk": gk, "h0": h0, "cu": cu, "N": N,
-        "H": H, "Hg": Hg, "K": K, "V": V, "T_flat": T_flat,
+        "q": q,
+        "k": k,
+        "w_tm": w_tm,
+        "u_tm": u_tm,
+        "w_hm": w_hm,
+        "u_hm": u_hm,
+        "g": g,
+        "gk": gk,
+        "h0": h0,
+        "cu": cu,
+        "N": N,
+        "H": H,
+        "Hg": Hg,
+        "K": K,
+        "V": V,
+        "T_flat": T_flat,
     }
 
 
@@ -130,16 +146,28 @@ def _reference_o(inp, *, scale, use_exp2):
     is scalar-``g`` only (KDA folds gk into K5), so pass g through and gk=None.
     """
     h_ref, v_new_ref, _ = ref_chunk_gated_delta_rule_fwd_h(
-        k=inp["k"], w=inp["w_tm"], u=inp["u_tm"],
-        g=inp["g"], gk=inp["gk"], initial_state=inp["h0"],
-        output_final_state=False, cu_seqlens=inp["cu"],
+        k=inp["k"],
+        w=inp["w_tm"],
+        u=inp["u_tm"],
+        g=inp["g"],
+        gk=inp["gk"],
+        initial_state=inp["h0"],
+        output_final_state=False,
+        cu_seqlens=inp["cu"],
     )
     # token-major [B, T, H, V] -> head-major [B, H, T, V]
     v_hm = v_new_ref.permute(0, 2, 1, 3).contiguous().to(inp["u_tm"].dtype)
     o = inp["u_tm"].new_empty(inp["u_tm"].shape)  # [B, T, H, V]
     chunk_fwd_o_opt_vk(
-        q=inp["q"], k=inp["k"], v=v_hm, o=o, h=h_ref.to(inp["u_tm"].dtype),
-        g=inp["g"], scale=scale, cu_seqlens=inp["cu"], use_exp2=use_exp2,
+        q=inp["q"],
+        k=inp["k"],
+        v=v_hm,
+        o=o,
+        h=h_ref.to(inp["u_tm"].dtype),
+        g=inp["g"],
+        scale=scale,
+        cu_seqlens=inp["cu"],
+        use_exp2=use_exp2,
     )
     return o
 
@@ -160,7 +188,7 @@ def test_fused_unit(gate, H, Hg, seq_lens, variant):
     """Fused wrapper output matches pure-PyTorch K5 ref + Triton K6."""
     K = V = 128
     T_flat = sum(seq_lens)
-    scale = K ** -0.5
+    scale = K**-0.5
     use_exp2 = False  # inputs are natural-log gates (see K5 bench rationale)
 
     inp = _make_inputs(H, Hg, K, V, T_flat, seq_lens, gate)
@@ -168,10 +196,18 @@ def test_fused_unit(gate, H, Hg, seq_lens, variant):
     o_ref = _reference_o(inp, scale=scale, use_exp2=use_exp2)
 
     o_fused, _ = chunk_gated_delta_rule_fwd_h_o_flydsl(
-        q=inp["q"], k=inp["k"], w=inp["w_hm"], u=inp["u_hm"],
-        g=inp["g"], gk=inp["gk"], scale=scale,
-        initial_state=inp["h0"], output_final_state=False,
-        cu_seqlens=inp["cu"], use_exp2=use_exp2, variant=variant,
+        q=inp["q"],
+        k=inp["k"],
+        w=inp["w_hm"],
+        u=inp["u_hm"],
+        g=inp["g"],
+        gk=inp["gk"],
+        scale=scale,
+        initial_state=inp["h0"],
+        output_final_state=False,
+        cu_seqlens=inp["cu"],
+        use_exp2=use_exp2,
+        variant=variant,
     )
 
     ratio = _rmse_ratio(o_fused, o_ref)
@@ -187,18 +223,34 @@ def test_fused_final_state():
     K = V = 128
     seq_lens = [512, 512]
     T_flat = sum(seq_lens)
-    scale = K ** -0.5
+    scale = K**-0.5
     inp = _make_inputs(H, Hg, K, V, T_flat, seq_lens, "g")
 
-    _, fs_ref, = ref_chunk_gated_delta_rule_fwd_h(
-        k=inp["k"], w=inp["w_tm"], u=inp["u_tm"], g=inp["g"], gk=inp["gk"],
-        initial_state=inp["h0"], output_final_state=True, cu_seqlens=inp["cu"],
+    (
+        _,
+        fs_ref,
+    ) = ref_chunk_gated_delta_rule_fwd_h(
+        k=inp["k"],
+        w=inp["w_tm"],
+        u=inp["u_tm"],
+        g=inp["g"],
+        gk=inp["gk"],
+        initial_state=inp["h0"],
+        output_final_state=True,
+        cu_seqlens=inp["cu"],
     )[0::2]
 
     _, fs_fused = chunk_gated_delta_rule_fwd_h_o_flydsl(
-        q=inp["q"], k=inp["k"], w=inp["w_hm"], u=inp["u_hm"],
-        g=inp["g"], scale=scale, initial_state=inp["h0"],
-        output_final_state=True, cu_seqlens=inp["cu"], use_exp2=False,
+        q=inp["q"],
+        k=inp["k"],
+        w=inp["w_hm"],
+        u=inp["u_hm"],
+        g=inp["g"],
+        scale=scale,
+        initial_state=inp["h0"],
+        output_final_state=True,
+        cu_seqlens=inp["cu"],
+        use_exp2=False,
     )
     assert fs_fused is not None
     ratio = _rmse_ratio(fs_fused, fs_ref)
@@ -221,8 +273,15 @@ def _pipeline_inputs(H, Hg, seq_lens, device="cuda"):
     beta = torch.randn(1, T_flat, H, dtype=torch.float32, device=device).sigmoid()
     h0 = torch.randn(N, H, V, K, dtype=torch.float32, device=device) * 0.01
     return dict(
-        q=q, k=k, v=v, g=g, beta=beta, scale=K ** -0.5,
-        initial_state=h0, output_final_state=True, cu_seqlens=cu,
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        scale=K**-0.5,
+        initial_state=h0,
+        output_final_state=True,
+        cu_seqlens=cu,
     )
 
 
@@ -263,10 +322,17 @@ def test_fused_variant_hn_rule():
     V = 128  # all BVs legal
     # (H, N, expected tag) spanning both sides of the 32 and 80 boundaries.
     cases = [
-        (4, 1, "bv16"), (32, 1, "bv16"), (8, 4, "bv16"),   # H*N <= 32
-        (8, 8, "bv32"), (16, 4, "bv32"), (12, 4, "bv32"),  # 32 < H*N <= 80
-        (12, 6, "bv32"), (16, 5, "bv32"),  # H*N = 72 / 80: bv32, not bv64w8
-        (16, 8, "bv64w8"), (96, 1, "bv64w8"), (24, 4, "bv64w8"),  # H*N > 80
+        (4, 1, "bv16"),
+        (32, 1, "bv16"),
+        (8, 4, "bv16"),  # H*N <= 32
+        (8, 8, "bv32"),
+        (16, 4, "bv32"),
+        (12, 4, "bv32"),  # 32 < H*N <= 80
+        (12, 6, "bv32"),
+        (16, 5, "bv32"),  # H*N = 72 / 80: bv32, not bv64w8
+        (16, 8, "bv64w8"),
+        (96, 1, "bv64w8"),
+        (24, 4, "bv64w8"),  # H*N > 80
     ]
     for H, N, exp in cases:
         got = select_fused_variant(H=H, N=N, V=V)
@@ -279,16 +345,17 @@ def test_fused_selection_heuristic():
     """``should_use_fused_gfx942`` fuses iff ceil(V/BV_run)*N*H/CU >= 0.45, with
     BV_run from the same H*N variant rule the launcher uses."""
     import math
-    from aiter.ops.flydsl.linear_attention_prefill_kernels import (
-        should_use_fused_gfx942,
-        _device_cu_count,
-        _FUSED_MIN_FILL,
-        _ARCH,
-    )
+
     from aiter.ops.flydsl.kernels.chunk_gated_delta_h_gfx942 import (
         select_fused_variant,
     )
     from aiter.ops.flydsl.kernels.k5_variants import _bv_of_variant
+    from aiter.ops.flydsl.linear_attention_prefill_kernels import (
+        _ARCH,
+        _FUSED_MIN_FILL,
+        _device_cu_count,
+        should_use_fused_gfx942,
+    )
 
     if _ARCH != "gfx942":
         pytest.skip(f"fusion heuristic is gfx942-only; arch={_ARCH}")
@@ -299,24 +366,30 @@ def test_fused_selection_heuristic():
     cu = _device_cu_count()
     V = 128
     for H, N in [
-        (24, 8), (12, 8), (24, 4), (12, 4),
-        (4, 8), (96, 1), (12, 1), (8, 1),
+        (24, 8),
+        (12, 8),
+        (24, 4),
+        (12, 4),
+        (4, 8),
+        (96, 1),
+        (12, 1),
+        (8, 1),
     ]:
         tag = select_fused_variant(H=H, N=N, V=V)
         bv = _bv_of_variant(tag) if tag else 64
         fill = math.ceil(V / bv) * N * H / cu
         expect = fill >= _FUSED_MIN_FILL
         got = should_use_fused_gfx942(H=H, N=N, V=V)
-        assert got == expect, (
-            f"H={H} N={N} bv={bv} fill={fill:.2f}: got {got}, want {expect}"
-        )
+        assert (
+            got == expect
+        ), f"H={H} N={N} bv={bv} fill={fill:.2f}: got {got}, want {expect}"
 
 
 @pytest.mark.parametrize(
     "H,Hg,seq_lens,expect_fused",
     [
-        (24, 24, [512] * 8, True),   # bv64w8 fill=2.53 -> fused
-        (8, 4, [512] * 1, False),    # bv16 N=1 fill=0.21 -> separate
+        (24, 24, [512] * 8, True),  # bv64w8 fill=2.53 -> fused
+        (8, 4, [512] * 1, False),  # bv16 N=1 fill=0.21 -> separate
     ],
 )
 def test_fused_auto_routing(H, Hg, seq_lens, expect_fused):
@@ -327,20 +400,20 @@ def test_fused_auto_routing(H, Hg, seq_lens, expect_fused):
     differs from pure Triton only in the K5 backend -- still within tolerance.
     Both must match; the routing itself is asserted via should_use_fused_gfx942.
     """
+    from aiter.ops.flydsl.linear_attention_prefill_kernels import (
+        _ARCH,
+        should_use_fused_gfx942,
+    )
     from aiter.ops.triton._triton_kernels.gated_delta_rule.prefill.chunk import (
         chunk_gated_delta_rule_fwd_opt_vk,
     )
     from aiter.ops.triton._triton_kernels.gated_delta_rule.utils import K5K6Fusion
-    from aiter.ops.flydsl.linear_attention_prefill_kernels import (
-        should_use_fused_gfx942,
-        _ARCH,
-    )
 
     N = len(seq_lens)
     if _ARCH == "gfx942":
-        assert should_use_fused_gfx942(H=H, N=N, V=128) is expect_fused, (
-            "heuristic prediction changed; update the test expectation"
-        )
+        assert (
+            should_use_fused_gfx942(H=H, N=N, V=128) is expect_fused
+        ), "heuristic prediction changed; update the test expectation"
 
     common = _pipeline_inputs(H, Hg, seq_lens)
     _, o_base, _ = chunk_gated_delta_rule_fwd_opt_vk(**common)  # pure Triton
@@ -350,6 +423,7 @@ def test_fused_auto_routing(H, Hg, seq_lens, expect_fused):
     ratio = _rmse_ratio(o_auto, o_base)
     assert ratio < _RMSE_TOL, f"auto-routed o mismatch: rmse={ratio:.3e}"
 
+
 # --------------------------------------------------------------------------- #
 # Perf sweep (run via __main__)
 # --------------------------------------------------------------------------- #
@@ -358,34 +432,34 @@ def test_fused_auto_routing(H, Hg, seq_lens, expect_fused):
 # K=V=128 (fixed for all KDA/GDN production shapes).
 _SWEEP_SHAPES: list[tuple] = [
     # KDA Kimi-K3 TP8 (H=12, gk)
-    ("kda_tp8",  12, 12,  8192, 1, "gk"),
-    ("kda_tp8",  12, 12,  8192, 4, "gk"),
-    ("kda_tp8",  12, 12,  8192, 8, "gk"),
-    ("kda_tp8",  12, 12, 32768, 1, "gk"),
-    ("kda_tp8",  12, 12, 32768, 4, "gk"),
-    ("kda_tp8",  12, 12, 32768, 8, "gk"),
+    ("kda_tp8", 12, 12, 8192, 1, "gk"),
+    ("kda_tp8", 12, 12, 8192, 4, "gk"),
+    ("kda_tp8", 12, 12, 8192, 8, "gk"),
+    ("kda_tp8", 12, 12, 32768, 1, "gk"),
+    ("kda_tp8", 12, 12, 32768, 4, "gk"),
+    ("kda_tp8", 12, 12, 32768, 8, "gk"),
     # KDA Kimi-K3 TP4 (H=24, gk)
-    ("kda_tp4",  24, 24,  8192, 1, "gk"),
-    ("kda_tp4",  24, 24,  8192, 8, "gk"),
-    ("kda_tp4",  24, 24, 32768, 1, "gk"),
-    ("kda_tp4",  24, 24, 32768, 8, "gk"),
+    ("kda_tp4", 24, 24, 8192, 1, "gk"),
+    ("kda_tp4", 24, 24, 8192, 8, "gk"),
+    ("kda_tp4", 24, 24, 32768, 1, "gk"),
+    ("kda_tp4", 24, 24, 32768, 8, "gk"),
     # GDN Qwen3-Next TP8 (H=4, Hg=2, g)
-    ("gdn_q3n_tp8",  4,  2,  8192, 4, "g"),
-    ("gdn_q3n_tp8",  4,  2,  8192, 8, "g"),
-    ("gdn_q3n_tp8",  4,  2, 32768, 4, "g"),
-    ("gdn_q3n_tp8",  4,  2, 32768, 8, "g"),
+    ("gdn_q3n_tp8", 4, 2, 8192, 4, "g"),
+    ("gdn_q3n_tp8", 4, 2, 8192, 8, "g"),
+    ("gdn_q3n_tp8", 4, 2, 32768, 4, "g"),
+    ("gdn_q3n_tp8", 4, 2, 32768, 8, "g"),
     # GDN Qwen3-Next TP4 (H=8, Hg=4, g)
-    ("gdn_q3n_tp4",  8,  4,  8192, 1, "g"),
-    ("gdn_q3n_tp4",  8,  4,  8192, 4, "g"),
-    ("gdn_q3n_tp4",  8,  4, 32768, 1, "g"),
-    ("gdn_q3n_tp4",  8,  4, 32768, 4, "g"),
+    ("gdn_q3n_tp4", 8, 4, 8192, 1, "g"),
+    ("gdn_q3n_tp4", 8, 4, 8192, 4, "g"),
+    ("gdn_q3n_tp4", 8, 4, 32768, 1, "g"),
+    ("gdn_q3n_tp4", 8, 4, 32768, 4, "g"),
     # GDN Qwen3.5-MoE TP1 (H=16, g)
-    ("gdn_q35_tp1", 16, 16,  8192, 1, "g"),
-    ("gdn_q35_tp1", 16, 16,  8192, 4, "g"),
-    ("gdn_q35_tp1", 16, 16,  8192, 8, "g"),
+    ("gdn_q35_tp1", 16, 16, 8192, 1, "g"),
+    ("gdn_q35_tp1", 16, 16, 8192, 4, "g"),
+    ("gdn_q35_tp1", 16, 16, 8192, 8, "g"),
     # GDN Qwen3.5-MoE TP1 (H=32, Hg=8, g)
-    ("gdn_q35_tp1", 32,  8, 32768, 1, "g"),
-    ("gdn_q35_tp1", 32,  8, 32768, 8, "g"),
+    ("gdn_q35_tp1", 32, 8, 32768, 1, "g"),
+    ("gdn_q35_tp1", 32, 8, 32768, 8, "g"),
 ]
 
 SUPPORTED_GFX = ["gfx942"]
@@ -403,8 +477,9 @@ class _CaptureSafeMeta:
     is safe because the tensor identity and version are stable across a replay.
     """
 
-    def __init__(self, meta, cu_seqlens, *, chunk_size, total_prefill_tokens,
-                 num_sequences):
+    def __init__(
+        self, meta, cu_seqlens, *, chunk_size, total_prefill_tokens, num_sequences
+    ):
         self._meta = meta
         meta.validate(
             cu_seqlens=cu_seqlens,
@@ -472,7 +547,8 @@ def _bench_candidates(
         err = checkAllclose(
             ref_out.to(dtypes.fp32),
             out.to(dtypes.fp32),
-            rtol=1e-2, atol=1e-2,
+            rtol=1e-2,
+            atol=1e-2,
             msg=f"{name}: {label}",
         )
 
@@ -514,7 +590,7 @@ def bench_fused_k5k6(model_tag, H, Hg, T_flat, N, gate):
 
     K = V = 128
     BT = 64
-    scale = K ** -0.5
+    scale = K**-0.5
 
     seq_lens = [T_flat // N] * (N - 1) + [T_flat - (T_flat // N) * (N - 1)]
     inp = _make_inputs(H, Hg, K, V, T_flat, seq_lens, gate)
@@ -533,11 +609,15 @@ def bench_fused_k5k6(model_tag, H, Hg, T_flat, N, gate):
         from aiter.ops.prefill_batch_metadata import (
             build_gated_delta_rule_prefill_metadata,
         )
+
         raw_meta = build_gated_delta_rule_prefill_metadata(
-            seq_lens, cu_seqlens=inp["cu"], chunk_size=BT,
+            seq_lens,
+            cu_seqlens=inp["cu"],
+            chunk_size=BT,
         )
         safe_meta = _CaptureSafeMeta(
-            raw_meta, inp["cu"],
+            raw_meta,
+            inp["cu"],
             chunk_size=BT,
             total_prefill_tokens=T_flat,
             num_sequences=N,
@@ -545,52 +625,92 @@ def bench_fused_k5k6(model_tag, H, Hg, T_flat, N, gate):
 
     def _run_triton():
         h, v_new, _ = k5_triton(
-            k=inp["k"], w=inp["w_hm"], u=inp["u_hm"],
-            g=inp["g"], gk=inp["gk"],
-            initial_state=inp["h0"], output_final_state=True,
-            save_new_value=True, cu_seqlens=inp["cu"],
-            use_exp2=_USE_EXP2, prefill_metadata=safe_meta,
+            k=inp["k"],
+            w=inp["w_hm"],
+            u=inp["u_hm"],
+            g=inp["g"],
+            gk=inp["gk"],
+            initial_state=inp["h0"],
+            output_final_state=True,
+            save_new_value=True,
+            cu_seqlens=inp["cu"],
+            use_exp2=_USE_EXP2,
+            prefill_metadata=safe_meta,
         )
         k6_triton(
-            q=q, k=inp["k"], v=v_new, o=o_triton, h=h,
-            g=inp["g"], scale=scale,
-            cu_seqlens=inp["cu"], use_exp2=_USE_EXP2,
+            q=q,
+            k=inp["k"],
+            v=v_new,
+            o=o_triton,
+            h=h,
+            g=inp["g"],
+            scale=scale,
+            cu_seqlens=inp["cu"],
+            use_exp2=_USE_EXP2,
             prefill_metadata=safe_meta,
         )
         return o_triton
 
     def _run_hip():
         h, v_new, _ = chunk_gated_delta_rule_fwd_h_hip_fn(
-            k=inp["k"], w=inp["w_hm"], u=inp["u_hm"],
-            g=g_hip, gk=inp["gk"],
-            initial_state=inp["h0"], output_final_state=True,
-            save_new_value=True, cu_seqlens=inp["cu"],
-            use_exp2=_USE_EXP2, g_head_major=True,
+            k=inp["k"],
+            w=inp["w_hm"],
+            u=inp["u_hm"],
+            g=g_hip,
+            gk=inp["gk"],
+            initial_state=inp["h0"],
+            output_final_state=True,
+            save_new_value=True,
+            cu_seqlens=inp["cu"],
+            use_exp2=_USE_EXP2,
+            g_head_major=True,
             prefill_metadata=safe_meta,
         )
         k6_triton(
-            q=q, k=inp["k"], v=v_new, o=o_hip, h=h,
-            g=inp["g"], scale=scale,
-            cu_seqlens=inp["cu"], use_exp2=_USE_EXP2,
+            q=q,
+            k=inp["k"],
+            v=v_new,
+            o=o_hip,
+            h=h,
+            g=inp["g"],
+            scale=scale,
+            cu_seqlens=inp["cu"],
+            use_exp2=_USE_EXP2,
             prefill_metadata=safe_meta,
         )
         return o_hip
 
     def _run_fused_always():
         chunk_gated_delta_rule_fwd_h_o_flydsl(
-            q=q, k=inp["k"], w=inp["w_hm"], u=inp["u_hm"],
-            g=inp["g"], gk=inp["gk"], scale=scale,
-            initial_state=inp["h0"], output_final_state=False,
-            cu_seqlens=inp["cu"], use_exp2=_USE_EXP2, o=o_always,
+            q=q,
+            k=inp["k"],
+            w=inp["w_hm"],
+            u=inp["u_hm"],
+            g=inp["g"],
+            gk=inp["gk"],
+            scale=scale,
+            initial_state=inp["h0"],
+            output_final_state=False,
+            cu_seqlens=inp["cu"],
+            use_exp2=_USE_EXP2,
+            o=o_always,
         )
         return o_always
 
     def _run_fused_auto():
         chunk_gated_delta_rule_fwd_h_o_auto(
-            q=q, k=inp["k"], w=inp["w_hm"], u=inp["u_hm"],
-            g=inp["g"], gk=inp["gk"], scale=scale,
-            initial_state=inp["h0"], output_final_state=False,
-            cu_seqlens=inp["cu"], use_exp2=_USE_EXP2, o=o_auto,
+            q=q,
+            k=inp["k"],
+            w=inp["w_hm"],
+            u=inp["u_hm"],
+            g=inp["g"],
+            gk=inp["gk"],
+            scale=scale,
+            initial_state=inp["h0"],
+            output_final_state=False,
+            cu_seqlens=inp["cu"],
+            use_exp2=_USE_EXP2,
+            o=o_auto,
             fusion=K5K6Fusion.AUTO,
         )
         return o_auto
@@ -601,17 +721,17 @@ def bench_fused_k5k6(model_tag, H, Hg, T_flat, N, gate):
     flops = H * n_chunks * BT * per_chunk
     # bytes: k,w,u (read) + v_new,h (K5→K6 handoff) + q (read) + o (written)
     nbytes = (
-        T_flat * Hg * K        # k
-        + T_flat * H * K       # w
-        + T_flat * H * V       # u
-        + T_flat * H * V       # v_new (fused keeps in LDS; baseline spills to HBM)
-        + N * H * V * K        # h state
-        + T_flat * Hg * K      # q
-        + T_flat * H * V       # o
+        T_flat * Hg * K  # k
+        + T_flat * H * K  # w
+        + T_flat * H * V  # u
+        + T_flat * H * V  # v_new (fused keeps in LDS; baseline spills to HBM)
+        + N * H * V * K  # h state
+        + T_flat * Hg * K  # q
+        + T_flat * H * V  # o
     ) * 2  # bf16
 
     candidates = {
-        "triton+triton": _run_triton,   # baseline
+        "triton+triton": _run_triton,  # baseline
         "hip+triton": _run_hip,
         "fused_always": _run_fused_always,
         "fused_auto": _run_fused_auto,
@@ -679,40 +799,49 @@ def bench_k5(model_tag, H, Hg, T_flat, N, gate, variants=None):
         from aiter.ops.prefill_batch_metadata import (
             build_gated_delta_rule_prefill_metadata,
         )
+
         raw_meta = build_gated_delta_rule_prefill_metadata(
-            seq_lens, cu_seqlens=inp["cu"], chunk_size=BT,
+            seq_lens,
+            cu_seqlens=inp["cu"],
+            chunk_size=BT,
         )
         safe_meta = _CaptureSafeMeta(
-            raw_meta, inp["cu"],
+            raw_meta,
+            inp["cu"],
             chunk_size=BT,
             total_prefill_tokens=T_flat,
             num_sequences=N,
         )
 
     common = {
-        "k": inp["k"], "w": inp["w_hm"], "u": inp["u_hm"], "gk": inp["gk"],
-        "initial_state": inp["h0"], "output_final_state": True,
-        "save_new_value": True, "cu_seqlens": inp["cu"],
-        "use_exp2": _USE_EXP2, "prefill_metadata": safe_meta,
+        "k": inp["k"],
+        "w": inp["w_hm"],
+        "u": inp["u_hm"],
+        "gk": inp["gk"],
+        "initial_state": inp["h0"],
+        "output_final_state": True,
+        "save_new_value": True,
+        "cu_seqlens": inp["cu"],
+        "use_exp2": _USE_EXP2,
+        "prefill_metadata": safe_meta,
     }
 
     def _run_triton():
         return k5_triton(g=inp["g"], **common)
 
     def _run_hip():
-        return chunk_gated_delta_rule_fwd_h_hip_fn(
-            g=g_hip, g_head_major=True, **common
-        )
+        return chunk_gated_delta_rule_fwd_h_hip_fn(g=g_hip, g_head_major=True, **common)
 
     def _make_flydsl(tag):
         def _run():
             return chunk_gated_delta_rule_fwd_h_flydsl(
                 g=inp["g"], variant=tag, **common
             )
+
         return _run
 
     candidates = {
-        "triton": _run_triton,   # baseline
+        "triton": _run_triton,  # baseline
         "hip": _run_hip,
         "flydsl": _make_flydsl(None),  # None -> the auto (H*N rule) selection
     }
@@ -724,10 +853,10 @@ def bench_k5(model_tag, H, Hg, T_flat, N, gate, variants=None):
     flops = 4 * H * n_chunks * BT * K * V
     # bytes: k, w, u read; v_new and the h snapshots written out to HBM.
     nbytes = (
-        T_flat * Hg * K        # k
-        + T_flat * H * K       # w
-        + T_flat * H * V       # u
-        + T_flat * H * V       # v_new
+        T_flat * Hg * K  # k
+        + T_flat * H * K  # w
+        + T_flat * H * V  # u
+        + T_flat * H * V  # v_new
         + n_chunks * H * V * K  # h snapshots (one per chunk, not per sequence)
     ) * 2  # bf16
 
@@ -753,9 +882,7 @@ def bench_k5(model_tag, H, Hg, T_flat, N, gate, variants=None):
 
 def main():
     if get_gfx() not in SUPPORTED_GFX:
-        aiter.logger.warning(
-            "fused GDN K5+K6 unsupported on %s; skipping", get_gfx()
-        )
+        aiter.logger.warning("fused GDN K5+K6 unsupported on %s; skipping", get_gfx())
         return
 
     parser = argparse.ArgumentParser(
@@ -815,9 +942,7 @@ def main():
                 f"unknown FlyDSL K5 variant {tag!r}; choices: {list(K5_VARIANTS)}"
             )
 
-    shapes = [
-        s for s in _SWEEP_SHAPES if s[5] in gate_set and s[3] in t_set
-    ]
+    shapes = [s for s in _SWEEP_SHAPES if s[5] in gate_set and s[3] in t_set]
 
     for kernel in args.kernel:
         rows = []
@@ -826,9 +951,7 @@ def main():
                 rows.append(bench_fused_k5k6(model_tag, H, Hg, T_flat, N, gate))
             else:
                 rows.append(
-                    bench_k5(
-                        model_tag, H, Hg, T_flat, N, gate, variants=k5_variants
-                    )
+                    bench_k5(model_tag, H, Hg, T_flat, N, gate, variants=k5_variants)
                 )
         title = "fused GDN K5+K6" if kernel == "fused" else "GDN K5 (state scan)"
         aiter.logger.info(
@@ -840,4 +963,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

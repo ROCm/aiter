@@ -335,7 +335,11 @@ STATE_BF16_TEST_IDS = [repr(p) for p in STATE_BF16_PARAMS]
 # These exercise the USE_GK code path with ``gk`` instead of ``g``.
 KDA_PARAMS = [
     PrefillArgs(
-        K=128, V=128, Hk=96, Hv=96, tp=8,
+        K=128,
+        V=128,
+        Hk=96,
+        Hv=96,
+        tp=8,
         full_prompt_len=8192,
         model_name="KDA-kimi-k3-tp8-T8k",
         is_varlen=True,
@@ -343,7 +347,11 @@ KDA_PARAMS = [
         max_num_batched_tokens=8192,
     ),
     PrefillArgs(
-        K=128, V=128, Hk=96, Hv=96, tp=8,
+        K=128,
+        V=128,
+        Hk=96,
+        Hv=96,
+        tp=8,
         full_prompt_len=32768,
         model_name="KDA-kimi-k3-tp8-T32k",
         is_varlen=True,
@@ -351,7 +359,11 @@ KDA_PARAMS = [
         max_num_batched_tokens=32768,
     ),
     PrefillArgs(
-        K=128, V=128, Hk=96, Hv=96, tp=4,
+        K=128,
+        V=128,
+        Hk=96,
+        Hv=96,
+        tp=4,
         full_prompt_len=8192,
         model_name="KDA-kimi-k3-tp4-T8k",
         is_varlen=True,
@@ -938,8 +950,7 @@ class TestCorrectness:
 
     @pytest.mark.parametrize("args", KDA_PARAMS, ids=KDA_TEST_IDS)
     def test_correctness_flydsl_kda(self, args: PrefillArgs):
-        """FlyDSL K5 with per-channel gate (USE_GK, KDA/Kimi-K3 path).
-        """
+        """FlyDSL K5 with per-channel gate (USE_GK, KDA/Kimi-K3 path)."""
         k, w_orig, u_orig, w_c, u_c, gk, h0, cu, _ = _make_inputs_kda(args)
 
         h_fly, vn_fly, fs_fly = chunk_gated_delta_rule_fwd_h_flydsl(
@@ -983,8 +994,12 @@ class TestCorrectness:
         seq_len = 8192 + 37  # not a multiple of 64
         cu_seqlens = torch.tensor([0, seq_len], dtype=torch.int32, device="cuda")
         k = torch.randn(1, seq_len, Hg, K, dtype=torch.bfloat16, device="cuda") * 0.1
-        w_orig = torch.randn(1, seq_len, H, K, dtype=torch.bfloat16, device="cuda") * 0.1
-        u_orig = torch.randn(1, seq_len, H, V, dtype=torch.bfloat16, device="cuda") * 0.1
+        w_orig = (
+            torch.randn(1, seq_len, H, K, dtype=torch.bfloat16, device="cuda") * 0.1
+        )
+        u_orig = (
+            torch.randn(1, seq_len, H, V, dtype=torch.bfloat16, device="cuda") * 0.1
+        )
         w_c = w_orig.permute(0, 2, 1, 3).contiguous()
         u_c = u_orig.permute(0, 2, 1, 3).contiguous()
         gk = (
@@ -997,17 +1012,31 @@ class TestCorrectness:
         h0 = torch.randn(1, H, V, K, dtype=torch.float32, device="cuda") * 0.01
 
         h_fly, vn_fly, fs_fly = chunk_gated_delta_rule_fwd_h_flydsl(
-            k, w_c, u_c, gk=gk, initial_state=h0,
-            output_final_state=True, cu_seqlens=cu_seqlens,
+            k,
+            w_c,
+            u_c,
+            gk=gk,
+            initial_state=h0,
+            output_final_state=True,
+            cu_seqlens=cu_seqlens,
         )
         h_ref, vn_ref, fs_ref = ref_chunk_gated_delta_rule_fwd_h(
-            k, w_orig, u_orig, gk=gk, initial_state=h0,
-            output_final_state=True, cu_seqlens=cu_seqlens,
+            k,
+            w_orig,
+            u_orig,
+            gk=gk,
+            initial_state=h0,
+            output_final_state=True,
+            cu_seqlens=cu_seqlens,
         )
 
         _assert_k5_outputs_match_ref(
-            h_fly, vn_fly, fs_fly,
-            h_ref, vn_ref, fs_ref,
+            h_fly,
+            vn_fly,
+            fs_fly,
+            h_ref,
+            vn_ref,
+            fs_ref,
             output_final_state=True,
             label="flydsl_non_mul64",
         )
@@ -1898,15 +1927,22 @@ _SELECT_CASES = [
     (8, 4, 8192, 8, "g", "bv32"),
     (16, 16, 8192, 1, "g", "bv16"),
     (16, 16, 8192, 4, "g", "bv32"),
-    (16, 16, 8192, 8, "g", "bv64w8"),  # min-mean: favors common equal case over rare skew
+    (
+        16,
+        16,
+        8192,
+        8,
+        "g",
+        "bv64w8",
+    ),  # min-mean: favors common equal case over rare skew
     (32, 8, 8192, 1, "g", "bv16"),
     (32, 8, 8192, 4, "g", "bv64w8"),
     (32, 8, 8192, 8, "g", "bv64w8"),
     # N=2 bucket: one tile below N=4 for mid-H, flat at the extremes.
     (4, 2, 8192, 2, "g", "bv16"),
     (8, 4, 8192, 2, "g", "bv16"),
-    (16, 16, 8192, 2, "g", "bv16"),   # vs N4->bv32
-    (32, 8, 8192, 2, "g", "bv32"),    # vs N4->bv64w8
+    (16, 16, 8192, 2, "g", "bv16"),  # vs N4->bv32
+    (32, 8, 8192, 2, "g", "bv32"),  # vs N4->bv64w8
     (12, 12, 8192, 2, "gk", "bv16"),  # vs N4->bv32
     (24, 24, 8192, 2, "gk", "bv32"),  # vs N4->bv64w8
     (48, 48, 8192, 2, "gk", "bv64w8"),
@@ -1965,9 +2001,7 @@ class TestVariantSelection:
         import aiter.ops.flydsl.linear_attention_prefill_kernels as k5
 
         monkeypatch.setattr(k5, "_ARCH", "gfx950")
-        got = k5._auto_variant(
-            H=H, Hg=Hg, V=128, T_flat=T_flat, N=N, is_varlen=N > 1
-        )
+        got = k5._auto_variant(H=H, Hg=Hg, V=128, T_flat=T_flat, N=N, is_varlen=N > 1)
         assert "w" not in got, f"gfx950 must not wave-widen; got {got}"
 
     def test_explicit_variant_overrides_auto(self, monkeypatch):
