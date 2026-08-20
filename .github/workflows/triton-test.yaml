@@ -66,8 +66,26 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Select Triton tests from PR diff
+        env:
+          FULL_LABEL: ${{ contains(github.event.pull_request.labels.*.name, 'ci:triton-full') }}
+        run: |
+          set -ex
+          # PRs run diff-based selection by OP category (see the script's
+          # docstring). main pushes, nightly, manual runs, and PRs labeled
+          # ci:triton-full always run the full suite.
+          if [ "${{ github.event_name }}" = "pull_request" ] && [ "$FULL_LABEL" != "true" ]; then
+            git fetch --no-tags --depth=2 origin \
+              "pull/${{ github.event.pull_request.number }}/merge:pr-merge"
+            python3 .github/scripts/select_triton_tests.py \
+              --merge-ref pr-merge --output selected_triton_tests.list
+          else
+            python3 .github/scripts/select_triton_tests.py \
+              --all --output selected_triton_tests.list
+          fi
+
       - name: Split Triton Tests (8 shards)
-        run: ./.github/scripts/split_tests.sh --shards 8 --test-type triton
+        run: ./.github/scripts/split_tests.sh --shards 8 --test-type triton --select-file selected_triton_tests.list
 
       - name: Upload test shard lists as artifact
         uses: actions/upload-artifact@v4
@@ -233,37 +251,21 @@ jobs:
           echo "Setting up Aiter and Triton..."
           docker exec -w /workspace triton_test ./.github/scripts/build_aiter_triton.sh
 
-      # TODO: Uncomment [docker exec -w /workspace triton_test cat "${ENV_FILE}" >> "${GITHUB_ENV}"]
-      #       command to enable test selection.
-      # - name: Triton Test Selection Script
-      #   # main branch should always run the full test suite.
-      #   if: ${{ github.ref != 'refs/heads/main' }}
-      #   run: |
-      #     set -ex
-      #     git fetch --no-tags origin --depth=1 \
-      #       "pull/${{ github.event.pull_request.number }}/merge:pr-merge"
-      #     git fetch --no-tags origin --depth=1 \
-      #       "refs/heads/${{ github.event.pull_request.base.ref }}:target"
-      #     ENV_FILE=$(docker exec -w /workspace triton_test \
-      #       mktemp /workspace/github_env.XXXXXXXXXX.tmp)
-      #     docker exec -w /workspace triton_test \
-      #       git config --global --add safe.directory /workspace
-      #     docker exec -w /workspace triton_test \
-      #       python .github/scripts/select_triton_tests.py \
-      #         --source pr-merge --target target \
-      #         --env-var TRITON_TEST --env-file "${ENV_FILE}"
-      #     # docker exec -w /workspace triton_test cat "${ENV_FILE}" >> "${GITHUB_ENV}"
-      #     docker exec -w /workspace triton_test rm "${ENV_FILE}"
-
       - name: Triton Tests
         run: |
           set -ex
           echo "Running Triton Tests..."
           docker exec -w /workspace triton_test mkdir -p test-reports
-          # MI35X: skip the MHA-PE backward test that fails an accuracy check on gfx950 with the coming Triton release.
-          docker exec -w /workspace triton_test pytest -v ${TRITON_TEST} \
-            --deselect "op_tests/triton_tests/attention/test_mha_with_pe.py::test_mha_backward_with_pe" \
-            --junitxml=test-reports/triton.xml
+          if [ -z "${TRITON_TEST// /}" ]; then
+            # Diff-based selection picked no tests for this shard.
+            echo "No tests selected for this shard — writing an empty report."
+            docker exec -w /workspace triton_test bash -c "echo '<testsuites/>' > test-reports/triton.xml"
+          else
+            # MI35X: skip the MHA-PE backward test that fails an accuracy check on gfx950 with the coming Triton release.
+            docker exec -w /workspace triton_test pytest -v ${TRITON_TEST} \
+              --deselect "op_tests/triton_tests/attention/test_mha_with_pe.py::test_mha_backward_with_pe" \
+              --junitxml=test-reports/triton.xml
+          fi
 
       - name: Upload test logs
         uses: actions/upload-artifact@v4
@@ -379,7 +381,13 @@ jobs:
           set -ex
           echo "Running Triton Tests..."
           docker exec -w /workspace triton_test mkdir -p test-reports
-          docker exec -w /workspace triton_test pytest -v ${TRITON_TEST} --junitxml=test-reports/triton.xml
+          if [ -z "${TRITON_TEST// /}" ]; then
+            # Diff-based selection picked no tests for this shard.
+            echo "No tests selected for this shard — writing an empty report."
+            docker exec -w /workspace triton_test bash -c "echo '<testsuites/>' > test-reports/triton.xml"
+          else
+            docker exec -w /workspace triton_test pytest -v ${TRITON_TEST} --junitxml=test-reports/triton.xml
+          fi
 
       - name: Upload test logs
         uses: actions/upload-artifact@v4

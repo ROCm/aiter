@@ -8,6 +8,8 @@
 # Parameters:
 #   --shards N     number of shards (required)
 #   --test-type TYPE test type, default aiter
+#   --select-file F  only shard test files listed (one per line) in F;
+#                    an empty selection writes empty shard lists and exits 0
 #   --dry-run      only output allocation plan, do not execute
 #   -v             Pytest's -v option, no effect
 # Exit code: always 0
@@ -17,11 +19,13 @@ set -euo pipefail
 SHARDS=0
 TEST_TYPE="aiter"
 DRY_RUN=0
+SELECT_FILE=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --shards) SHARDS="$2"; shift 2 ;;
         --test-type) TEST_TYPE="$2"; shift 2 ;;
+        --select-file) SELECT_FILE="$2"; shift 2 ;;
         --dry-run) DRY_RUN=1; shift ;;
         -v|--verbose) shift ;; # compatibility, ignore
         *)
@@ -57,6 +61,37 @@ fi
 if [[ ${#ALL_FILES[@]} -eq 0 ]]; then
     echo "No test files found: $TEST_DIR/test_*.py" >&2
     exit 1
+fi
+
+# ------------------------------
+# optional test selection (diff-based, see select_triton_tests.py)
+# ------------------------------
+if [[ -n "$SELECT_FILE" ]]; then
+    if [[ ! -f "$SELECT_FILE" ]]; then
+        echo "Selection file not found: $SELECT_FILE" >&2
+        exit 1
+    fi
+    declare -A SELECTED
+    while IFS= read -r line; do
+        [[ -n "$line" ]] && SELECTED["$line"]=1
+    done < "$SELECT_FILE"
+    FILTERED=()
+    for f in "${ALL_FILES[@]}"; do
+        if [[ -n "${SELECTED[$f]:-}" ]]; then
+            FILTERED+=("$f")
+        fi
+    done
+    echo "Test selection: ${#FILTERED[@]} of ${#ALL_FILES[@]} test files selected."
+    if [[ ${#FILTERED[@]} -eq 0 ]]; then
+        echo "Selection is empty — writing ${SHARDS} empty shard lists."
+        if [[ $DRY_RUN -eq 0 ]]; then
+            for ((s=0; s < SHARDS; s++)); do
+                : > "${TEST_TYPE}_shard_${s}.list"
+            done
+        fi
+        exit 0
+    fi
+    ALL_FILES=("${FILTERED[@]}")
 fi
 
 # ------------------------------
