@@ -54,14 +54,14 @@ from functools import lru_cache
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
+from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm, rocdl
+from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import arith, const_expr, range_constexpr
 from flydsl.expr import math as fmath
 from flydsl.expr.arith import ArithValue
-from flydsl.expr.typing import Int32, ReductionOp, Stream, T
 from flydsl.expr.rocdl import tdm_ops
-from flydsl._mlir import ir
-from flydsl.compiler.kernel_function import CompilationContext
+from flydsl.expr.typing import Int32, ReductionOp, Stream, T
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 
 from aiter.ops.flydsl.kernels import buffer_ops, vector
@@ -1573,7 +1573,7 @@ def _build_xhead_kernel(
         kv_out: fx.Pointer,
         kv_in_row_stride: fx.Int32,
         num_tokens: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         _nt = ArithValue(_to_raw(num_tokens))
         gy = arith.divsi(_to_raw(_nt + (R - 1)), _to_raw(fx.Int32(R)))
@@ -1955,7 +1955,7 @@ def _build_tdm(
         q_out: fx.Pointer,
         q_weight: fx.Tensor,
         num_rows: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         ctx = CompilationContext.get_current()
         with ir.InsertionPoint(ctx.gpu_module_body):
@@ -2209,7 +2209,7 @@ def _build_tdm_kv(*, head_dim, rope_head_dim):
         kv_out: fx.Pointer,
         kv_weight: fx.Tensor,
         num_tokens: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         gx = arith.divsi(_to_raw(num_tokens + (R - 1)), _to_raw(fx.Int32(R)))
         k = kernel(
