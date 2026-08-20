@@ -248,7 +248,7 @@ def _store_fp8_packed(
     dword_list = []
     for dw_idx in range_constexpr(n_dwords):
         base = dw_idx * 4
-        pk = fx.Int32(0)
+        pk = fx.Int32(0).ir_value()
         pk = rocdl.cvt_pk_fp8_f32(i32, safe[base + 0], safe[base + 1], pk, 0)
         pk = rocdl.cvt_pk_fp8_f32(i32, safe[base + 2], safe[base + 3], pk, 1)
         dword_list.append(pk)
@@ -429,12 +429,9 @@ def _build_kernel(
             out = []
             if const_expr(dwords <= 4):
                 raw = buffer_ops.buffer_load(rsrc, off_dw, vec_width=dwords, dtype=i32)
-                vec_bf16 = vector.bitcast(T.vec(VEC, T.bf16), raw)
+                vec_bf16 = fx.Vector(vector.bitcast(T.vec(VEC, T.bf16), raw))
                 for i in range_constexpr(VEC):
-                    bf16_v = vector.extract(
-                        vec_bf16, static_position=[i], dynamic_position=[]
-                    )
-                    out.append(bf16_v.extf(f32))
+                    out.append(vec_bf16[i].to(fx.Float32))
             else:
                 half_dw = 4
                 half_bf16 = half_dw * 2  # 8 bf16 per chunk
@@ -445,12 +442,9 @@ def _build_kernel(
                         vec_width=half_dw,
                         dtype=i32,
                     )
-                    vbf16 = vector.bitcast(T.vec(half_bf16, T.bf16), r)
+                    vbf16 = fx.Vector(vector.bitcast(T.vec(half_bf16, T.bf16), r))
                     for i in range_constexpr(half_bf16):
-                        bf16_v = vector.extract(
-                            vbf16, static_position=[i], dynamic_position=[]
-                        )
-                        out.append(bf16_v.extf(f32))
+                        out.append(vbf16[i].to(fx.Float32))
             return out
 
         bid_x = fx.block_idx.x  # 0..H-1 (Q head) or H (KV)
@@ -490,11 +484,10 @@ def _build_kernel(
         cos_sin_row_base = ArithValue(pos_i32) * c_half_rd
 
         def wave_reduce_add(x):
-            w = _to_raw(x)
-            for sh_exp in range_constexpr(int(math.log2(BLOCK_THREADS))):
+            w = fx.Float32(_to_raw(x))
+            for sh_exp in range_constexpr(log2_block):
                 off = BLOCK_THREADS // (2 << sh_exp)
-                peer = _to_raw(ArithValue(w).shuffle_xor(off, BLOCK_THREADS))
-                w = _to_raw(ArithValue(w) + ArithValue(peer))
+                w = w + w.shuffle_xor(off, BLOCK_THREADS)
             return w
 
         def emit_body(
@@ -548,17 +541,13 @@ def _build_kernel(
                 else:
                     am_local = fmath.absf(x_f32_vec).reduce(ReductionOp.MAX)
 
-                w_sq = _to_raw(sq_local)
-                w_am = _to_raw(am_local)
+                w_sq = fx.Float32(_to_raw(sq_local))
+                w_am = fx.Float32(_to_raw(am_local))
                 for sh_exp in range_constexpr(log2_block):
                     off = BLOCK_THREADS // (2 << sh_exp)
-                    peer_sq = _to_raw(ArithValue(w_sq).shuffle_xor(off, BLOCK_THREADS))
-                    w_sq = _to_raw(ArithValue(w_sq) + ArithValue(peer_sq))
+                    w_sq = w_sq + w_sq.shuffle_xor(off, BLOCK_THREADS)
                     if const_expr(sh_exp >= amax_start_step):
-                        peer_am = _to_raw(
-                            ArithValue(w_am).shuffle_xor(off, BLOCK_THREADS)
-                        )
-                        w_am = arith.maximumf(w_am, peer_am)
+                        w_am = w_am.maximumf(w_am.shuffle_xor(off, BLOCK_THREADS))
                 sq_block = w_sq
                 am_group = w_am
             else:
@@ -567,35 +556,39 @@ def _build_kernel(
             rstd = fmath.rsqrt(sq_block * (1.0 / D) + 1e-6)
 
             if const_expr(quant):
-                am_safe = arith.maximumf(am_group, _to_raw(fx.Float32(1e-12)))
+                am_safe = am_group.maximumf(fx.Float32(1e-12))
 
+                # Both the norm factor and the stored scale are computed here,
+                # unconditionally. The runtime lane guard below must contain only
+                # the store: a value produced inside an scf.if has to be yielded,
+                # and a const_expr-only branch leaves it undefined on the other
+                # path, which the AST rewriter rejects.
                 if const_expr(is_e8m0):
-                    c_sqrt2 = fx.Float32(_SQRT2)
-                    amax_post = am_safe * rstd * c_sqrt2
-
+                    # emit_mx_e8m0_scale is shared with the compress-attn kernels
+                    # and still takes the raw/ArithValue contract (it calls
+                    # .bitcast(T.i32) internally), so hand it a raw value.
+                    amax_post = ArithValue(_to_raw(am_safe * rstd * fx.Float32(_SQRT2)))
                     e8m0_biased = emit_mx_e8m0_scale(
                         amax_post, mode=_DEFAULT_MODE, dtype=_fp8_mx_dtype
                     )
-                    quant_exp = fx.Int32(254) - e8m0_biased
-                    quant_scale = (quant_exp << 23).bitcast(T.f32)
+                    quant_scale = ((fx.Int32(254) - e8m0_biased) << 23).bitcast(
+                        fx.Float32
+                    )
                     factor = rstd * quant_scale
+                    scale_store = e8m0_biased.trunci(T.i8)
                 else:
                     rcp_am = llvm.call_intrinsic(
-                        f32, "llvm.amdgcn.rcp.f32", [am_safe], [], []
+                        f32, "llvm.amdgcn.rcp.f32", [am_safe.ir_value()], [], []
                     )
                     _fc = _fp8_const()
                     factor = fx.Float32(_fc["max_over_sqrt2"]) * rcp_am
-                    scale_val = am_safe * rstd * fx.Float32(_fc["inv_max_sqrt2"])
+                    scale_store = am_safe * rstd * fx.Float32(_fc["inv_max_sqrt2"])
 
                 group_idx = tid >> log2_tpg
-                lane_in_group = tid & (TPG - 1)
-                if lane_in_group == 0:
-                    my_scale_off = scale_base_off + ArithValue(group_idx)
-                    if const_expr(is_e8m0):
-                        e8m0_i8 = e8m0_biased.trunci(T.i8)
-                        buffer_ops.buffer_store(e8m0_i8, scale_rsrc, my_scale_off)
-                    else:
-                        buffer_ops.buffer_store(scale_val, scale_rsrc, my_scale_off)
+                if (tid & (TPG - 1)) == 0:
+                    buffer_ops.buffer_store(
+                        scale_store, scale_rsrc, scale_base_off + group_idx
+                    )
 
             scaled = []
             for vi in range_constexpr(VEC):
@@ -612,18 +605,9 @@ def _build_kernel(
                 cos_vals = [cos_raw.extf(f32)]
                 sin_vals = [sin_raw.extf(f32)]
             else:
-                cos_vals = [
-                    vector.extract(
-                        cos_raw, static_position=[i], dynamic_position=[]
-                    ).extf(f32)
-                    for i in range(PAIRS_PER_THREAD)
-                ]
-                sin_vals = [
-                    vector.extract(
-                        sin_raw, static_position=[i], dynamic_position=[]
-                    ).extf(f32)
-                    for i in range(PAIRS_PER_THREAD)
-                ]
+                cos_v, sin_v = fx.Vector(cos_raw), fx.Vector(sin_raw)
+                cos_vals = [cos_v[i].to(fx.Float32) for i in range(PAIRS_PER_THREAD)]
+                sin_vals = [sin_v[i].to(fx.Float32) for i in range(PAIRS_PER_THREAD)]
 
             scaled_raw = [_to_raw(s) for s in scaled]
             rotated = list(scaled_raw)
@@ -1370,15 +1354,11 @@ def _build_tdm(
             out = []
             for c in range_constexpr(VEC // 8):
                 base_off = _to_raw(tid * VEC + (c * 8))
-                qwraw = buffer_ops.buffer_load(
-                    qw_rsrc, base_off, vec_width=8, dtype=T.bf16
+                qwraw = fx.Vector(
+                    buffer_ops.buffer_load(qw_rsrc, base_off, vec_width=8, dtype=T.bf16)
                 )
                 for i in range_constexpr(8):
-                    out.append(
-                        vector.extract(
-                            qwraw, static_position=[i], dynamic_position=[]
-                        ).extf(f32)
-                    )
+                    out.append(qwraw[i].to(fx.Float32))
             return out
 
         qw = _load_qw() if const_expr(q_weighted) else None
@@ -1441,16 +1421,14 @@ def _build_tdm(
                         ).extf(f32)
                     ],
                 )
-            craw = buffer_ops.buffer_load(cos_rsrc, cs, vec_width=PAIRS, dtype=T.bf16)
-            sraw = buffer_ops.buffer_load(sin_rsrc, cs, vec_width=PAIRS, dtype=T.bf16)
-            cos_v = [
-                vector.extract(craw, static_position=[i], dynamic_position=[]).extf(f32)
-                for i in range(PAIRS)
-            ]
-            sin_v = [
-                vector.extract(sraw, static_position=[i], dynamic_position=[]).extf(f32)
-                for i in range(PAIRS)
-            ]
+            craw = fx.Vector(
+                buffer_ops.buffer_load(cos_rsrc, cs, vec_width=PAIRS, dtype=T.bf16)
+            )
+            sraw = fx.Vector(
+                buffer_ops.buffer_load(sin_rsrc, cs, vec_width=PAIRS, dtype=T.bf16)
+            )
+            cos_v = [craw[i].to(fx.Float32) for i in range(PAIRS)]
+            sin_v = [sraw[i].to(fx.Float32) for i in range(PAIRS)]
             return cos_v, sin_v
 
         def compute_store(buf, tile_idx, cos_v, sin_v):
@@ -1458,25 +1436,22 @@ def _build_tdm(
             x = []
             for c in range_constexpr(VEC // 8):
                 off = row_elem + (c * 8)
-                v = vector.load_op(
-                    T.vec(8, T.bf16),
-                    buf,
-                    [_to_raw(fx.Index(_to_raw(off)))],
+                v = fx.Vector(
+                    vector.load_op(
+                        T.vec(8, T.bf16),
+                        buf,
+                        [_to_raw(fx.Index(_to_raw(off)))],
+                    )
                 )
                 for i in range_constexpr(8):
-                    x.append(
-                        vector.extract(
-                            v, static_position=[i], dynamic_position=[]
-                        ).extf(f32)
-                    )
+                    x.append(v[i].to(fx.Float32))
             sq = fx.Float32(0.0)
             for vi in range_constexpr(VEC):
                 sq = sq + x[vi] * x[vi]
-            w = _to_raw(sq)
             for sh in range_constexpr(log2b):
                 o = BLOCK_THREADS // (2 << sh)
-                w = _to_raw(ArithValue(w) + ArithValue(w).shuffle_xor(o, BLOCK_THREADS))
-            rstd = fmath.rsqrt(ArithValue(w) * (1.0 / D) + 1e-6)
+                sq = sq + sq.shuffle_xor(o, BLOCK_THREADS)
+            rstd = fmath.rsqrt(sq * (1.0 / D) + 1e-6)
             # RMSNorm (+ optional per-channel q_weight): (x * w) * rstd. rstd is
             # from unweighted x^2 (matches stock kernel semantics); mul commutes.
             if const_expr(q_weighted):
@@ -1701,26 +1676,22 @@ def _build_tdm_kv(*, head_dim, rope_head_dim):
         x = []
         w = []
         for c in range_constexpr(VEC // 8):
-            xr = buffer_ops.buffer_load(
-                kv_in_rsrc, _to_raw(row_base + (c * 8)), vec_width=8, dtype=T.bf16
+            xr = fx.Vector(
+                buffer_ops.buffer_load(
+                    kv_in_rsrc, _to_raw(row_base + (c * 8)), vec_width=8, dtype=T.bf16
+                )
             )
-            wr = buffer_ops.buffer_load(
-                kw_rsrc,
-                _to_raw(tid * VEC + (c * 8)),
-                vec_width=8,
-                dtype=T.bf16,
+            wr = fx.Vector(
+                buffer_ops.buffer_load(
+                    kw_rsrc,
+                    _to_raw(tid * VEC + (c * 8)),
+                    vec_width=8,
+                    dtype=T.bf16,
+                )
             )
             for i in range_constexpr(8):
-                x.append(
-                    vector.extract(xr, static_position=[i], dynamic_position=[]).extf(
-                        f32
-                    )
-                )
-                w.append(
-                    vector.extract(wr, static_position=[i], dynamic_position=[]).extf(
-                        f32
-                    )
-                )
+                x.append(xr[i].to(fx.Float32))
+                w.append(wr[i].to(fx.Float32))
 
         pos_i32 = buffer_ops.buffer_load(
             pos_rsrc, _to_raw(tok), vec_width=1, dtype=T.i64
@@ -1738,27 +1709,22 @@ def _build_tdm_kv(*, head_dim, rope_head_dim):
                 )
             ]
         else:
-            craw = buffer_ops.buffer_load(cos_rsrc, cs, vec_width=PAIRS, dtype=T.bf16)
-            sraw = buffer_ops.buffer_load(sin_rsrc, cs, vec_width=PAIRS, dtype=T.bf16)
-            cos_v = [
-                vector.extract(craw, static_position=[i], dynamic_position=[]).extf(f32)
-                for i in range(PAIRS)
-            ]
-            sin_v = [
-                vector.extract(sraw, static_position=[i], dynamic_position=[]).extf(f32)
-                for i in range(PAIRS)
-            ]
+            craw = fx.Vector(
+                buffer_ops.buffer_load(cos_rsrc, cs, vec_width=PAIRS, dtype=T.bf16)
+            )
+            sraw = fx.Vector(
+                buffer_ops.buffer_load(sin_rsrc, cs, vec_width=PAIRS, dtype=T.bf16)
+            )
+            cos_v = [craw[i].to(fx.Float32) for i in range(PAIRS)]
+            sin_v = [sraw[i].to(fx.Float32) for i in range(PAIRS)]
 
         sq = fx.Float32(0.0)
         for vi in range_constexpr(VEC):
             sq = sq + x[vi] * x[vi]
-        red = _to_raw(sq)
         for sh in range_constexpr(log2b):
             o = BLOCK_THREADS // (2 << sh)
-            red = _to_raw(
-                ArithValue(red) + ArithValue(red).shuffle_xor(o, BLOCK_THREADS)
-            )
-        rstd = fmath.rsqrt(ArithValue(red) * (1.0 / D) + 1e-6)
+            sq = sq + sq.shuffle_xor(o, BLOCK_THREADS)
+        rstd = fmath.rsqrt(sq * (1.0 / D) + 1e-6)
         scaled = [_to_raw(x[vi] * w[vi] * rstd) for vi in range_constexpr(VEC)]
         rot = list(scaled)
         for kk in range_constexpr(PAIRS):
