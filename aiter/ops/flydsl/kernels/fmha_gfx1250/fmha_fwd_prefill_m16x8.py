@@ -60,9 +60,10 @@ scf_if_dispatch = ReplaceIfWithDispatch.scf_if_dispatch
 from .mha_buffer_managers import QManager16b, KManager16b, VManager16b, OManager16b
 
 # Single source of truth for gfx1250 Expert Scheduling Mode 2 (DEP_MODE=2). Lives
-# in mha_buffer_managers (where the s_wait_alu 0 covers are emitted) so the setreg
-# below and the covers flip in lockstep. See _set_sched_mode / _wait_alu0.
-from .mha_buffer_managers import ENABLE_SCHED_MODE2, _wait_alu0, _wait_va_vdst
+# in mha_buffer_managers (where the _mem_* helpers emit the depctr covers) so the
+# setreg below and the covers flip in lockstep. See _set_sched_mode / _mem_asm.
+from .mha_buffer_managers import ENABLE_SCHED_MODE2, _wait_va_vdst
+from .mha_buffer_managers import _mem_global_load_b32, _mem_buffer_store
 
 # ============================================================================
 # Threadgroup / arch constants
@@ -142,9 +143,8 @@ def _load_sink_logit(ptr_sink, q_head_idx, num_heads_q):
     del num_heads_q  # in-bounds by construction; no buffer bounds check needed
     sink_base_i64 = fx.Int64(fx.ptrtoint(fx.get_iter(ptr_sink)))
     byte_off = fx.Int64(q_head_idx) * fx.Int64(4)
-    gptr = buffer_ops.create_llvm_ptr(sink_base_i64 + byte_off, address_space=1)
-    gptr = _wait_alu0(gptr)  # mode-2 cover (tied): RAW into the flat sink load
-    return fx.Float32(llvm_dialect.load(ir.F32Type.get(), gptr))
+    addr = sink_base_i64 + byte_off
+    return fx.Float32(_mem_global_load_b32(addr, ir.F32Type.get()))
 
 
 def _packed_tile_indices(gqa_ratio, warp_idx, lane_idx):
@@ -210,8 +210,18 @@ def _wmma_bf16(a, b, c):
     a/b: v16 bf16 fragments; c: v8 f32 accumulator; returns the v8 f32 result
     (raw MLIR value, feed straight back as ``c`` to accumulate)."""
     v8f32 = fx.Vector.make_type(8, fx.Float32)
+    # mode-2 (DEP_MODE=2): the VA_VDST HW interlock that makes the wmma stall until the
+    # VALU producers of its operands retire is gone. The compiler still emits only an
+    # s_delay_alu HINT (calibrated assuming the interlock backstops it), so the wmma can
+    # read a half-written accumulator (o_resc = o_acc*corr) or P frag (cvt_pk_bf16) ->
+    # one 16x16 output fragment corrupts (per-d-tile band, finite or wild). Tie every
+    # operand through s_wait_alu depctr_va_vdst(0) (no-op unless mode 2). NOTE: a full
+    # s_wait_alu 0 drain here is NO better than va_vdst (measured 3/10 both @16384c) ->
+    # the residual is NOT a wmma-INPUT dep; it's a WAR on the wmma source regs (next V
+    # ds_load hoisted above the wmma overwrites its A-operand mid-read) -> covered
+    # structurally in _pv_gemm, not here.
     return rocdl_dialect.wmma_f32_16x16x32_bf16(
-        v8f32, _raw(a), _raw(b), _raw(c),
+        v8f32, _wait_va_vdst(a), _wait_va_vdst(b), _wait_va_vdst(c),
         signA=False, signB=False, modC=0, reuseA=False, reuseB=False,
     ).result
 
@@ -429,6 +439,12 @@ def _pv_gemm(*, v_mgr, v_lds, p, v_hdim, n_block, lane_idx, o_acc=None):
             # B-operand: P^T frag = two consecutive softmax kv-tiles -> v16 bf16.
             p_frag = p[2 * kt].shuffle(p[2 * kt + 1], list(range(16)))
             acc = _wmma_bf16(v_frag, p_frag, acc)
+            # NOTE (mode-2): a rocdl.sched_barrier(0) here (to stop the compiler
+            # software-pipelining the NEXT ds_load_tr16 above this wmma -> a V-frag WAR
+            # that corrupts a full 16x16 fragment) was tried. It roughly halves the
+            # catastrophic-garbage class at 8192nc but provides NO help at scale
+            # (16384c stays ~55% defective) while serializing PV loads (perf cost).
+            # Removed per the "minimize covers" directive -- see mode-2 memory note.
         out.append(acc)
     return out
 
@@ -717,8 +733,12 @@ def _core_attention(
         )
 
         # ---- Rescale the running O by corr, then GEMM2 accumulates this tile. ----
+        # mode-2: o_acc[dt] is the PREVIOUS tile's PV-wmma output (iter_arg). The rescale
+        # mul is a wmma-writeback -> VALU RAW; DEP_MODE=2 has no VA_VDST interlock so the
+        # mul can read a half-written accumulator -> per-d-tile O corruption. Tie o_acc
+        # through va_vdst so the prior wmma writeback lands first (no-op unless mode 2).
         corr_vec = fx.Vector.from_elements([corr], fx.Float32).broadcast_to(8)
-        o_resc = [o_acc[dt] * corr_vec for dt in range(d_tiles)]
+        o_resc = [fx.Vector(_wait_va_vdst(o_acc[dt])) * corr_vec for dt in range(d_tiles)]
         o_new = _pv_gemm(
             v_mgr=v_mgr,
             v_lds=v_cur,
@@ -781,6 +801,10 @@ def _core_attention(
         fx.Vector.from_elements([fx.Float32(1.0) / d_final], fx.Float32)
         .broadcast_to(8)
     )
+    # NOTE (mode-2): tying o_final through va_vdst here (to cover the final PV-wmma
+    # writeback -> this normalize mul) was MEASURED HARMFUL: 8192nc 1/80 -> 9/80 with
+    # the same PV fence present. Either va_vdst doesn't reliably track the wmma
+    # writeback or the added drain reshuffles RA into a new race. Left uncovered.
     o_norm = [o_final[dt] * inv_vec for dt in range(d_tiles)]
 
     # O staging reuses the NON-CURRENT K|V slot n_tiles%N_KV_PP. With the last
@@ -840,19 +864,13 @@ def _core_attention(
         lse_rsrc = buffer_ops.create_buffer_resource(
             ptr_LSE, num_records_bytes=lse_num_records_bytes
         )
-        # mode-2 cover (tied): buffer_store lowers `mask=lse_mask` to an INTERNAL
+        # mode-2: buffer_store lowers `mask=lse_mask` to an INTERNAL
         # select(mask, off, 0x7fffffff) that lands right before the store, below any
-        # external tie. Replicate the select here, tie its RESULT, and pass mask=None
-        # so the cover sits immediately before the store (drains the lse_val VALU too).
+        # external cover. Replicate the select here and pass it to _mem_buffer_store
+        # with mask=None, so the RAW cover inside the asm block drains this select
+        # (and the lse_val VALU) immediately before the store.
         lse_off_masked = lse_mask.select(lse_off_el * fx.Int32(4), fx.Int32(0x7FFFFFFF))
-        lse_off_masked = _wait_alu0(lse_off_masked)
-        buffer_ops.buffer_store(
-            lse_val,
-            lse_rsrc,
-            lse_off_masked,
-            mask=None,
-            offset_is_bytes=True,
-        )
+        _mem_buffer_store(lse_val, lse_rsrc, lse_off_masked, width=32)
 
     del q_head_idx, seq_idx
 
