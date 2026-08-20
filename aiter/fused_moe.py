@@ -1089,7 +1089,9 @@ def fused_moe_1stage(
         # A FLAT MXFP4 kernel tuned with xbf16=0 wants X already quantized: one asm pass
         # writes the packed fp4 rows plus the e8m0 scale tiles it addresses, and zeroes
         # moe_buf, which it needs because it accumulates into those rows with atomics.
-        flat_mxfp4_prequant = bool(flat) and quant_type == QuantType.per_1x32 and not xbf16
+        flat_mxfp4_prequant = (
+            bool(flat) and quant_type == QuantType.per_1x32 and not xbf16
+        )
         if xbf16:
             # xquant happens inside the asm kernel for per_1x128
             a1 = hidden_states
