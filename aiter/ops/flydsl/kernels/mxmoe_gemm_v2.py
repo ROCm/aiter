@@ -4,6 +4,7 @@
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+from flydsl._mlir.dialects import arith as _arith_d
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import (
     BFloat16,
@@ -17,7 +18,6 @@ from flydsl.expr.typing import (
 )
 from flydsl.expr.typing import Vector as Vec
 from flydsl.expr.typing import as_ir_value as _raw
-from flydsl._mlir.dialects import arith as _arith_d
 
 from .mxfp4_gemm_common import _fabs_f32 as fabs_f32
 from .mxfp4_gemm_common import (
@@ -972,7 +972,7 @@ def atomic_bf16_epilog(
                         else Vec(accm[i][J])
                     )
 
-                    def _scaled(v):
+                    def _scaled(v, vec=vec):
                         f = fx.Float32(vec[v])
                         return f if const_expr(defer_w) else f * fx.Float32(w_row[v])
 
@@ -1105,7 +1105,12 @@ def atomic_bf16_epilog(
                                 )
                             else:
                                 w = rocdl.cvt_scalef32_pk_fp8_f32(
-                                    pk_ty, w, _raw(vals[e]), _raw(vals[e + 1]), bs_raw, h
+                                    pk_ty,
+                                    w,
+                                    _raw(vals[e]),
+                                    _raw(vals[e + 1]),
+                                    bs_raw,
+                                    h,
                                 )
                         words.append(w)
                     emit_stores(col_g0, words, e8m0)
