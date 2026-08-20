@@ -728,7 +728,11 @@ def _tuned_bv(
     total_chunks: int,
     max_seq_chunks: int,
 ) -> int | None:
-    """Measured BV for this batch shape, or None to use the rule."""
+    """Measured BV for this batch shape, or None to use the rule.
+
+    Lookup requires an exact ``(gfx, cu_num, shape)`` match so binned SKUs
+    (e.g. MI308X with cu_num=80) do not reuse rows tuned on MI300X (304).
+    """
     if not _BV_TUNED_TABLE:
         return None
     from aiter.jit.utils.chip_info import get_cu_num
@@ -750,14 +754,6 @@ def _tuned_bv(
         hit = _BV_TUNED_TABLE.get((arch, cu_num, *shape_key))
         if hit is not None:
             return hit
-        # Same arch, sibling cu_num (e.g. 80 vs 304 on gfx942).
-        for key, bv in _BV_TUNED_TABLE.items():
-            if key[0] != arch:
-                continue
-            if len(key) == 2 + len(shape_key) and key[2:] == shape_key:
-                return bv
-            if len(key) == 1 + len(shape_key) and key[1:] == shape_key:
-                return bv
     return None
 
 
