@@ -122,7 +122,11 @@ def build_flash_attn_fp8_module(
 
     USE_BIAS_FOLD = True
 
-    L_SPLIT_TILES = 2
+    # How many of the four KV tiles reduce their L denominator on the VALU
+    # pipe; the rest go through the ones-column MFMA. VALU is the bottleneck
+    # in this kernel, so 0 (everything on the MFMA pipe) wins -- see the
+    # commit that changed this from 2.
+    L_SPLIT_TILES = 0
 
     SCHRAUDOLPH_2P23 = 1 << 23
     SCHRAUDOLPH_C = 127 * SCHRAUDOLPH_2P23 - 486411
