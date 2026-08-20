@@ -24,6 +24,11 @@ class CommFusedMoeRuntime:
     ) -> None:
         self.runners = runners
 
+    def supports(self, tokens: int) -> bool:
+        from aiter.fused_moe import get_padded_M
+
+        return int(get_padded_M(tokens)) in self.runners
+
     def run(
         self,
         *,
