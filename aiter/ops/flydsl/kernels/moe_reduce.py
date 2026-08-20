@@ -29,7 +29,8 @@ BLOCK = 256
 FP8_VEC = 8  # fp8 values per 64b buffer load (also the store granularity)
 
 
-def _moe_reduction_body(
+@flyc.kernel
+def moe_reduction_kernel(
     X: fx.Pointer,
     Y: fx.Pointer,
     expert_mask: fx.Pointer,
@@ -193,11 +194,6 @@ def _moe_reduction_body(
         _reduce_tile()
 
 
-@functools.lru_cache(maxsize=8)
-def _reduction_kernel_for(block: int):
-    return flyc.kernel(known_block_size=[block, 1, 1])(_moe_reduction_body)
-
-
 def _pick_reduce_block(model_dim: int, V: int) -> int:
     need = -(-model_dim // V)
     block = BLOCK
@@ -251,7 +247,7 @@ def compile_moe_reduction(
         i32_m_tokens: fx.Int32,
         stream: fx.Stream,
     ):
-        _reduction_kernel_for(block)(
+        moe_reduction_kernel(
             X,
             Y,
             expert_mask,
