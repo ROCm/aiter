@@ -957,8 +957,7 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
     constexpr int qk_rope_end = T::D_HEAD_SIZE * T::W_M / T::WARP_SIZE;         // 144
     constexpr int qk_pad_end  = T::D_HEAD_SIZE_PADDING * T::W_M / T::WARP_SIZE; // 160
 
-    constexpr index_t s_len      = vector_traits<typename decltype(mma0)::vtype_c>::size();
-    constexpr index_t s_half_len = s_len / 2;
+    constexpr index_t s_len = vector_traits<typename decltype(mma0)::vtype_c>::size();
 
     // Online softmax: skip the O rescale entirely while every lane's new row max is within
     // this much of the running one, so exp2(m_row - row_max) stays well inside fp32 range.
@@ -1076,16 +1075,20 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
     s_waitcnt_lgkmcnt(0_I);
     stage_end();
 
+    // Scores, mask, row max: the head of tile_begin's softmax, which no phase runs since a
+    // phase's stage3 only heads its own tile. m_row starts at -inf and O and l at zero, so
+    // the rescale the head would do is a no-op and drops out. The tail rides the first
+    // phase's QK, like every other tile's.
     v_s[0] = mma0(v_q, v_k, 0, 0);
+    clear(v_o);
     mask_oob_scores(v_s[0], tile_begin);
     m_row = max(m_row, temperature_scale * attn_row_max<T>(v_s[0], s_m, warp_id, lane_id));
-    attn_scale_sub_row<T>(v_s[0], temperature_scale, m_row);
-    attn_exp2_slice<T, 0, s_half_len>(v_s[0]);
     asm volatile("" : "+v"(v_s[0])::);
     stage_end();
 
     v_v[0] = tr_load<T::VEC_TR_V>(s_kv[0], u_rv);
     s_waitcnt_lgkmcnt(0_I);
+
     async_load_kv(s_kv[0].ptr, cur_page);
     s_waitcnt_vmcnt(number<T::kv_buffer_load_insts>{});
     stage_end_barrier();
@@ -1097,10 +1100,21 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
         s_waitcnt_lgkmcnt(0_I);
         stage_end();
 
-        // stage1 [compute]: gemm0 QK(t) [12 MFMA]; softmax-tail(t-1) [4 EXP + ~18 VALU].
+        // stage1 [compute]: gemm0 QK(t) [12 MFMA] || softmax-tail(t-1), the whole exp side of
+        // it -- scale-sub, both halves of the exp, and the row sum. QK is 12 MFMA against
+        // PV's 4, and it neither reads nor writes tile t-1's scores, so this is the shadow
+        // worth filling. m_row already covers tile t-1: its head ran in the last stage3.
         __builtin_amdgcn_s_setprio(1);
         vs_cur = mma0(v_q, v_k, 0, 0);
-        attn_exp2_slice<T, s_half_len, s_half_len>(vs_prev);
+        attn_scale_sub_row<T>(vs_prev, temperature_scale, m_row);
+        attn_exp2_slice<T, 0, s_len>(vs_prev);
+        // Ask the scheduler to spread tile t-1's softmax tail (4 EXP + the scale-sub VALU,
+        // all independent of the QK MFMA writing vs_cur) into the GEMM0 MFMA shadows. The
+        // MFMA accumulate into one score buffer and stall on nothing, so program order is
+        // kept unless asked. Emitted BEFORE attn_row_sum: that reduction ends the MFMA's
+        // scheduling region with its cross-wave s_barrier, so a hint after it would land in
+        // the post-barrier merge and be dropped.
+        sched_pv<T::GEMM0_E_M * T::GEMM0_E_N * T::GEMM0_E_K, 1, 2, 1>();
         l_row += attn_row_sum<T>(vs_prev, s_l, warp_id, lane_id);
         stage_end();
 
@@ -1109,30 +1123,34 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
         s_waitcnt_lgkmcnt(0_I);
         stage_end_barrier();
 
+        // stage2 [mem]: P(t-1) and V(t-1); mask S(t) before stage3's softmax head folds it in.
         load_p(v_p);
-        // Capture V(t) into registers before the slot is recycled. Prefetch is tile t+2
-        // (nxt_page), the next occupant of this same slot -- cur_page is t+1 and already
-        // lives in the other slot (or is in flight into it from the previous phase).
         v_v[cur_slot] = tr_load<T::VEC_TR_V>(s_kv[cur_slot], u_rv);
         mask_oob_scores(vs_cur, t);
         s_waitcnt_lgkmcnt(0_I);
 
         async_load_kv(s_kv[cur_slot].ptr, nxt_page);
-        // Leave the just-issued tile in flight: the next phase reads the *other* slot, and
-        // that phase's identical waitcnt is what drains this one before any wave needs it.
         s_waitcnt_vmcnt(number<T::kv_buffer_load_insts>{});
         stage_end_barrier();
 
-        // stage3 [compute]: gemm1 PV(t-1) [4 MFMA] || softmax-head(t) [scale-sub + exp2 first half].
+        // stage3 [compute]: gemm1 PV(t-1) [4 MFMA] || softmax-head(t) -- the row max of the
+        // scores stage2 has just masked, and the rebase of O and l that follows from it.
+        // This is the only part of the softmax that can sit here at all: it reads tile t,
+        // which only becomes readable in stage2, and everything after it needs its result.
+        // Leaving PV bare would waste 4 MFMA outright.
         __builtin_amdgcn_s_setprio(1);
         v_o = mma1(v_p, v_v[prev_slot], v_o, 0, 0);
 
+        // Spread tile t's softmax head (the row-max reduction over vs_cur, which the PV
+        // accumulator chain never touches) into the GEMM1 MFMA shadows. A preference is
+        // safe in this region only because V was transpose-read a whole stage earlier
+        // (stage2): the region holds no tr_load whose inline-asm ds_read the scheduler
+        // cannot see. Emitted before attn_row_max for the same barrier reason as stage1.
+        sched_pv<T::GEMM1_E_M * T::GEMM1_E_N * T::GEMM1_E_K, 0, 2, 2>();
         row_max      = temperature_scale * attn_row_max<T>(vs_cur, s_m, warp_id, lane_id);
         below_thresh = ((row_max - m_row) <= RESCALE_THRESHOLD);
         all_below    = (__builtin_amdgcn_ballot_w64(below_thresh) == __builtin_amdgcn_read_exec());
         row_max      = all_below ? m_row : max(m_row, row_max);
-        attn_scale_sub_row<T>(vs_cur, temperature_scale, row_max);
-        attn_exp2_slice<T, 0, s_half_len>(vs_cur);
         asm volatile("" : "+v"(vs_cur)::);
         __builtin_amdgcn_sched_barrier(0);
 
@@ -1179,11 +1197,14 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
     // its mask were already handled by the phase (or by the prologue, for a one-tile
     // request).
     //
-    // stage0 [compute]: finish the softmax tail; the head exp already ran in the phase.
-    // Only this part is under the parity branch. Keeping the V read and the PV outside it
-    // is what keeps the 128-VGPR v_o off scratch: keep the V read and PV outside the branch.
+    // stage0 [compute]: the last tile's softmax-tail -- its head ran in the last phase's
+    // stage3 (or in the prologue, for a one-tile request), but no phase runs its tail, since
+    // a phase only tails the tile before its own. There is no QK left to hide it under.
+    // Only this part is under the parity branch; keeping the V read and the PV outside it
+    // is what keeps v_o off scratch.
     auto epilogue_tail = [&](auto& vs_last, int last_slot) {
-        attn_exp2_slice<T, s_half_len, s_half_len>(vs_last);
+        attn_scale_sub_row<T>(vs_last, temperature_scale, m_row);
+        attn_exp2_slice<T, 0, s_len>(vs_last);
         l_row += attn_row_sum<T>(vs_last, s_l, warp_id, lane_id);
         store<T::VEC_WRITE_P>(s_p, cast<D_K>(vs_last), u_sp);
         s_waitcnt_lgkmcnt(0_I);
@@ -1208,10 +1229,10 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
 
 
     // Stagger: the group that skipped the prologue barrier does its extra one here.
-    if constexpr(!STAGGER)
-    {
-        __builtin_amdgcn_s_barrier();
-    }
+    // if constexpr(!STAGGER)
+    // {
+    //     __builtin_amdgcn_s_barrier();
+    // }
 }
 
 // --- One work item: load Q, run the tile range, normalize and store O (+ LSE) ---
@@ -1266,7 +1287,6 @@ mla_decode_fwd_one_req(mla_kargs kargs, int w, char* smem_buffer, float temperat
     const float qk_scale = readfirstlane_f32(temperature_scale * descale_q * descale_k);
 
     vector_t<D_ACC, T::Q_TILE_SIZE * T::D_NOPE_SIZE / (T::T_N * T::WARP_SIZE)> v_o;
-    clear(v_o);
     D_ACC m_row = opus::numeric_limits<D_ACC>::lowest();
     D_ACC l_row = 0.0f;
     mla_decode_fwd_pipelined<Traits, STAGGER>(kargs,
@@ -1348,9 +1368,13 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE,
 
     const int work_id = block_id_x();
 
-    // 4 LDS slots: with a distance-2 prefetch a phase keeps tile t-1 (PV pending), t (QK
-    // now), t+1 (landed) and t+2 (in flight) resident at once. 4 * ~18.6 KB = ~74.5 KB,
-    // which still fits gfx950's LDS at 2 blocks/CU. The alignment is load-bearing:
+    // 2 KV slots, and 2 is the ceiling, not a choice: a slot is a whole 128-token tile at
+    // d = 576, i.e. 74.25 KB, and two of them plus Q already come to 157.5 KB of gfx950's
+    // 160. Nor can the tile shrink to buy a third -- GEMM1 contracts a wave's tokens over
+    // W_K = 128, which pins KV_TILE_SIZE * NUM_WARPS at exactly 128. What stands in for the
+    // missing slots is v_v: V is pulled into registers in its own phase, so a slot's life
+    // is one phase and tile t+2 can be issued into it right after. The alignment is
+    // load-bearing:
     // make_layout_rv folds the bank swizzle's XOR into a +/- SWZ_D_BYTES stride, which is
     // only equivalent to the XOR while bit 4 of the block's base address is zero.
     __shared__ __align__(128) char smem_buffer[T::smem_bytes()];
