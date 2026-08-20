@@ -979,7 +979,12 @@ def build_flash_attn_fp8_module(
                 )
                 rocdl.sched_barrier(0)
                 _wait_lgkmcnt()
-                _wait_vmcnt()
+                # g0 runs its V DMA two tiles ahead: the tile written here is
+                # not read until iteration i+2, so the barrier only has to see
+                # the *previous* tile's DMA retired. Leaving this pass's four
+                # loads outstanding (vmcnt(DMA_PASSES)) buys a full tile of
+                # memory latency that the drain to zero was throwing away.
+                _wait_vmcnt(DMA_PASSES)
                 _gpu_barrier()
                 scf.YieldOp(
                     [
