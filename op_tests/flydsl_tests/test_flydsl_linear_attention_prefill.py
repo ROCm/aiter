@@ -922,7 +922,7 @@ def chunk_gated_delta_rule_fwd_h_hip_k5(
 _K5_KERNEL_PREFIXES = [
     "chunk_gdn_fwd_h_flydsl_vk",
     "chunk_gdn_fwd_h_flydsl_kv",
-    "chunk_gdn_fwd_h_flydsl_mfma16",
+    "chunk_gdn_fwd_h_flydsl_opt",
     "chunk_gdn_fwd_h_flydsl_naive",
     "chunk_gated_delta_rule_fwd_kernel_h",
 ]
