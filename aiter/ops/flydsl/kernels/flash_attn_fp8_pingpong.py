@@ -904,8 +904,14 @@ def build_flash_attn_fp8_module(
         # L is the scalar VALU row-sum normalizer for this lane (q = lo).
         l_final = lf
 
+        # Appendix D: guard 1/L.  A row that saw no in-bounds kv (or whose every
+        # score underflowed) has L == 0; rcp would yield +inf and inf*0 -> NaN.
+        # Substitute 0 so the row stores zeros.  v_descale is folded into the
+        # reciprocal so the dequant costs one scalar mul, not 64 vector muls.
         inv_l = rocdl.rcp(T.f32, l_final)
         inv_l_v = _fmul(inv_l, v_descale)
+        l_is_zero = arith.cmpf(arith.CmpFPredicate.OEQ, _raw(l_final), _raw(c_zero_f))
+        inv_l_v = ArithValue(l_is_zero).select(c_zero_f, fx.Float32(inv_l_v))
         inv_l_vec = Vec.from_elements([inv_l_v], fx.Float32).broadcast_to(
             C_F32_PER_LANE
         )
@@ -913,17 +919,29 @@ def build_flash_attn_fp8_module(
         if q_in_bounds:
             for dt in range_constexpr(D_TILES):
                 o_norm = Vec(o_finals[dt]) * inv_l_vec
-                for r in range_constexpr(C_F32_PER_LANE):
-                    o_val = Vec(o_norm)[r]
-                    o_bf16 = fx.Float32(o_val).to(bf16_dtype)
-                    # O C-layout: row = d = hi*4 + (r%4) + 8*(r//4) (+ dt*32);
-                    # col = q = lo.  But this wave's q = q_row (= lo-based).
-                    d_row = hi * 4 + (r % 4) + 8 * (r // 4) + dt * 32
+                # O C-layout: row = d = hi*4 + (r%4) + 8*(r//4) (+ dt*32);
+                # col = q = lo.  But this wave's q = q_row (= lo-based).
+                # For fixed rg = r//4 the four r%4 lanes are contiguous in d, so
+                # a group of 4 packs into one 8-byte bf16x4 store (16 stores per
+                # wave instead of 64 scalar ones).
+                for rg in range_constexpr(C_F32_PER_LANE // 4):
+                    w0 = rocdl.cvt_pk_bf16_f32(
+                        _raw(Vec(o_norm)[rg * 4 + 0]), _raw(Vec(o_norm)[rg * 4 + 1])
+                    )
+                    w1 = rocdl.cvt_pk_bf16_f32(
+                        _raw(Vec(o_norm)[rg * 4 + 2]), _raw(Vec(o_norm)[rg * 4 + 3])
+                    )
+                    packed = Vec.from_elements([w0, w1], fx.Int32).bitcast(bf16_dtype)
+                    d_row = hi * 4 + 8 * rg + dt * 32
                     o_global = global_idx(q_row, fx.Index(d_row))
                     gep = fx.buffer_ops.get_element_ptr(
                         o_ptr, fx.Int64(o_global), elem_type=bf16_type
                     )
-                    _pointer_store(o_bf16, gep)
+                    llvm.StoreOp(
+                        _llvm_value(packed.ir_value()),
+                        _llvm_value(gep),
+                        alignment=8,
+                    )
 
     @flyc.jit
     def launch_fp8_attn(
