@@ -113,6 +113,7 @@ else:
     from .ops.moe_sorting_opus import *
     from .ops.moe_mxfp4_aux import *
     from .ops.pa_sparse_prefill_opus import *
+    from .ops.minimax_m3_fused_qknorm_rope import *
     from .ops.pos_encoding import *
     from .ops.cache import *
     from .ops.rmsnorm import *
