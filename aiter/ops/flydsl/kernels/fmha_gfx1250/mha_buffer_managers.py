@@ -103,17 +103,19 @@ def _assert_multiple(name, val, mult):
 
 
 # ---- gfx1250 Expert Scheduling Mode 2 covers -------------------------------
-# When the kernel enables DEP_MODE=2 (see fmha_fwd_prefill_m16x8._set_sched_mode)
-# the HW VA_VDST/VM_VSRC issue interlocks are OFF. LLVM has no model of the mode
-# and emits ZERO covers, so a VALU-produced load address can be read stale. We
-# restore mode-0-equivalent correctness by emitting an explicit `s_wait_alu 0`
-# (== s_waitcnt_depctr 0, BF880000: drain ALL depctr counters) immediately before
-# every memory op that may consume a VALU-produced address/value. This is the
-# conservative baseline; covers are removed selectively once proven false.
+# DEP_MODE=2 turns the HW VA_VDST/VM_VSRC issue interlocks OFF. It is enabled via
+# the `amdgpu-expert-scheduling-mode` LLVM hint the kernel passes at jit time (see
+# _ensure_*_kernel); LLVM then emits the DEP_MODE=2 setreg AND covers the SSA-visible
+# producer RAW hazards (WMMA->consumer, VALU-address->load) with its own post-RA
+# depctr waits. What LLVM does NOT cover: WAR hazards (register reuse after a memory
+# op) and anything around the opaque inline-asm memory ops it won't schedule into.
+# Those we still cover explicitly here -- `s_wait_alu 0` (drain ALL depctr counters)
+# plus field-targeted vm_vsrc/xcnt/dscnt -- immediately before/after the memory op
+# that reuses a VALU-produced address/value.
 #
 # This flag is the single source of truth and is imported by the kernel module,
-# which flips DEP_MODE in lockstep. Default False -> the _mem_* helpers emit the
-# plain flydsl intrinsic and the kernel runs in normal mode 0 (bit-identical).
+# which flips the LLVM hint in lockstep. Default False -> the _mem_* helpers emit
+# the plain flydsl intrinsic and the kernel runs in normal mode 0 (bit-identical).
 ENABLE_SCHED_MODE2 = True
 
 # Field-targeted depctr cover reference (mnemonics + encodings verified via llvm-mc
@@ -205,7 +207,7 @@ _COV_DS_VMVSRC = True    # vm_vsrc(0) fused BACK-TO-BACK after EVERY ds op (load
 _COV_DSLOAD_WAR = True   # dscnt(0) after every ds_load / ds_load_tr16 (known-good)
 _COV_DSSTORE_WAR = False # dscnt(0) after ds_store (good config had none)
 _COV_BUF_VMVSRC = True   # vm_vsrc(0) after buffer_store
-_COV_BUF_XCNT = True     # xcnt(0) after buffer_store
+_COV_BUF_XCNT = True      # xcnt(0) after buffer_store
 _COV_GLOAD_WAR = False   # vm_vsrc(0) after global_load (good config had none)
 
 
@@ -312,23 +314,6 @@ def _mem_global_load_b32(addr_i64, out_ty):
     )
 
 
-def _wait_va_vdst(val):
-    """Mode-2 WMMA/VALU-dest -> VALU-consumer cover. DEP_MODE=2 drops the VA_VDST HW
-    interlock that (in mode 0) makes a VALU stall until the long-latency producer that
-    wrote its source VGPR has retired. A ``v_wmma`` accumulator read by softmax/cvt
-    before the wmma writeback lands => the consumer sees a STALE/partial accumulator ->
-    garbage bf16 into the next gemm -> per-tile O corruption (finite or wild). Tie ``val``
-    (the accumulator) through ``s_wait_alu depctr_va_vdst(0)`` so the drain is pinned
-    between the producer and the first consumer of THIS register. Returns the tied raw
-    value; wrap it back into fx.Vector at the call site. No-op unless mode 2."""
-    raw = val.ir_value() if hasattr(val, "ir_value") else val
-    if not ENABLE_SCHED_MODE2:
-        return raw
-    return llvm_dialect.inline_asm(
-        raw.type, [raw], "s_wait_alu depctr_va_vdst(0)", "=v,0", has_side_effects=True
-    )
-
-
 # --- Mode-2 async-load ASM GLUE (THE fix for the large-seqlen WAR NaN) --------
 # A frontend-placed cover (any counter, tied or not) cannot fix the async-load
 # address-VGPR WAR: post-RA, the register allocator inserts the next-chunk offset
@@ -361,7 +346,6 @@ def _wait_va_vdst(val):
 #       (full data-arrival) and is NOT needed -- the latch, not the write, is the
 #       dependency. Measured 0-clean across 512..16384, causal + non-causal.
 # Costs: vm_vsrc/xcnt ~<=10 cyc each, s_nop 8 ~9 cyc (vs asynccnt 0 ~100s).
-_COVER_GLUE_RAW = "s_wait_alu depctr_va_vdst(0)"  # RAW: addr VALU retired before load
 _COVER_GLUE_WAR = "s_wait_alu depctr_vm_vsrc(0)\ns_wait_xcnt 0x0"  # buffer_store WAR
 # Async-load WAR: drop s_wait_xcnt 0 (measured ~155 cyc in the hot loop; the global
 # source-address WAR it guarded is instead held by vm_vsrc alone, re-validate @scale).
@@ -369,17 +353,6 @@ _COVER_GLUE_WAR = "s_wait_alu depctr_vm_vsrc(0)\ns_wait_xcnt 0x0"  # buffer_stor
 # s_wait_asynccnt culminates in asynccnt(0) before any address-VGPR reuse, which
 # already covers the WAR; K/V keep vm_vsrc.
 _COVER_GLUE_WAR_ASYNC = "s_wait_alu depctr_vm_vsrc(0)"
-
-
-def _sched2_va_vdst_fence():
-    """Mode-2 RAW drain (``va_vdst(0)``) pinned by a full ``sched_barrier(0)`` so the
-    bare cover can't migrate off the param-VALU -> async-issue boundary. No-op in mode 0."""
-    if not ENABLE_SCHED_MODE2:
-        return
-    llvm_dialect.inline_asm(
-        None, [], "s_wait_alu depctr_va_vdst(0)", "", has_side_effects=True
-    )
-    rocdl.sched_barrier(0)
 
 
 def _ir(x):
@@ -463,7 +436,7 @@ def _async_load_to_lds(
     base_r = _ir(base_i64)
     operands = lds_rs + off_rs + [base_r]
     constraints = ",".join(["v"] * (2 * n) + ["s"])
-    lines = [_COVER_GLUE_RAW]
+    lines = []
     for i, imm in enumerate(imm_offs):
         off_field = f" offset:{imm}" if imm else ""
         lines.append(f"\t{mnem} ${i}, ${n + i}, ${2 * n}{off_field}")
@@ -639,7 +612,6 @@ class QManager16b:
             lane_idx=lane_idx,
         )
         ds_offs = self.ds_load_params(lds_q_base=lds_q_base, lane_idx=lane_idx)
-        _sched2_va_vdst_fence()  # mode-2: retire address VALU before the loads
 
         # Prime: issue the first lds_tiles tiles (2 loads each).
         n_prime = 2 * self.lds_tiles
