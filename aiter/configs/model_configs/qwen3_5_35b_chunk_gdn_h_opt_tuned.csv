@@ -23,3 +23,5 @@ gfx942,80,torch.bfloat16,128,128,64,32,16,True,True,True,False,False,65536,8,102
 gfx942,80,torch.bfloat16,128,128,64,32,16,True,True,True,True,False,16384,2,256,128,64,949.1
 gfx942,80,torch.bfloat16,128,128,64,32,16,True,True,True,True,False,32768,4,512,128,64,1908.4
 gfx942,80,torch.bfloat16,128,128,64,32,16,True,True,True,True,False,65536,8,1024,128,64,3399.4
+gfx942,80,torch.bfloat16,128,128,64,32,16,True,True,True,True,False,8192,1,128,128,64,497.2
+gfx942,80,torch.bfloat16,128,128,64,32,16,True,True,True,False,False,8192,1,128,128,64,533.4

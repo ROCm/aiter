@@ -54,6 +54,30 @@ LOOKUP_KEYS = (
 )
 TUNED_EXTRA_COLS = ("dtype", "K", "V", "BT", "T_flat", "N", "BV", "us")
 TUNED_COLUMNS = LOOKUP_KEYS + TUNED_EXTRA_COLS
+# On-disk column order matches shipped model_configs CSVs (dtype/shape before
+# lookup tail). ``self.columns`` keeps LOOKUP_KEYS order for dedup; exports use
+# ``_CSV_COLUMN_ORDER`` so ``result_to_csv`` does not scramble headers.
+_CSV_COLUMN_ORDER = (
+    "gfx",
+    "cu_num",
+    "dtype",
+    "K",
+    "V",
+    "BT",
+    "H",
+    "Hg",
+    "is_varlen",
+    "use_h0",
+    "store_fs",
+    "snapshot_bf16",
+    "state_bf16",
+    "T_flat",
+    "N",
+    "total_chunks",
+    "max_seq_chunks",
+    "BV",
+    "us",
+)
 
 _RUN_CONFIG_TOL_PCT = 5.0
 _RESULT_COLS = [c for c in TUNED_COLUMNS if c not in LOOKUP_KEYS]
@@ -509,7 +533,7 @@ class K5BvTuner(TunerCommon):
             resultdf = resultdf.astype(str).drop_duplicates(
                 subset=self.keys, keep="last"
             )
-        ordered_cols = [c for c in self.columns if c in resultdf.columns]
+        ordered_cols = [c for c in _CSV_COLUMN_ORDER if c in resultdf.columns]
         ordered_cols.extend(c for c in resultdf.columns if c not in ordered_cols)
         resultdf = resultdf[ordered_cols]
         resultdf.to_csv(file, index=False)
