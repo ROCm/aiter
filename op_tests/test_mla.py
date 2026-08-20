@@ -486,7 +486,7 @@ def test_mla(
         return err, us_asm_decode
 
     def test_absorb_decode_gluon():
-        from aiter.ops.triton._gluon_kernels.gfx950.attention.mla import mla_gluon
+        from aiter.ops.triton.gluon.mla_gluon import mla_gluon
 
         out_gluon = torch.empty((total_q, nhead, v_head_dim), dtype=out_dtype).fill_(-1)
 
@@ -539,7 +539,7 @@ def test_mla(
         # Shared bh16bn{64,128} runner. The wrapper dispatches on
         # (nhead, kv dtype): name='bh16bn128' -> cast kv to fp8;
         # name='bh16bn64' -> keep bf16. -lse also validates the returned lse.
-        from aiter.ops.triton._gluon_kernels.gfx950.attention.mla import mla_gluon
+        from aiter.ops.triton.gluon.mla_gluon import mla_gluon
 
         out_gluon = torch.empty((total_q, nhead, v_head_dim), dtype=out_dtype).fill_(-1)
         # MTP (decode_qlen>1): q is [total_q=batch*qlen, nhead, qk]; reshape to
@@ -685,14 +685,14 @@ def test_mla(
             ret["decode:gluon_Mtok/s"] = total_q / us_gluon_decode
 
     # Gluon MLA bh16bn128 decode test
-    # Example: -c 10000000 -b 1 -n 16,1 -d bf16 -kvd fp8
+    # Example: -c 10000000 -b 1 3 4 -n 16,1 -d bf16 -kvd fp8
     if (
         get_gfx() == "gfx950"
         and dtype == torch.bfloat16
         and kvtype == dtypes.fp8
         and nhead <= 16
         and decode_qlen == 1
-        and batch_size == 1
+        and 1 <= batch_size <= 256
         and v_head_dim == 512
         and (qk_head_dim - v_head_dim) == 64
         and page_size == 1

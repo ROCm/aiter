@@ -1317,6 +1317,17 @@ def _ctypes_call(func, fc_name, md_name):
 
     from ..utility.dtypes import aiter_tensor_t, torch_to_aiter
 
+    # Avoid constructing a Python Stream object on every ctypes invocation.
+    # Keep the public API fallback for torch versions without the private raw
+    # stream getter, and preserve the first tensor's device selection.
+    raw_stream = getattr(torch._C, "_cuda_getCurrentRawStream", None)
+    if raw_stream is None:
+
+        def raw_stream(device_index):
+            return torch.cuda.current_stream(device_index).cuda_stream
+
+    current_device = torch.cuda.current_device
+
     _cache = {}
     _arg_checked = False
     _sig = inspect.signature(func)
@@ -1547,14 +1558,14 @@ def _ctypes_call(func, fc_name, md_name):
                 add_arg(value)
             elif kind == _ARG_TENSOR:
                 if tensor_device is None:
-                    tensor_device = value.device
+                    tensor_device = value.get_device()
                 at = torch_to_aiter(value)
                 keep_alive(at)
                 add_arg(ctypes.byref(at))
             elif kind == _ARG_OPT_TENSOR:
                 if value is not None:
                     if tensor_device is None:
-                        tensor_device = value.device
+                        tensor_device = value.get_device()
                     at = torch_to_aiter(value)
                     keep_alive(at)
                     add_arg(ctypes.byref(at))
@@ -1569,9 +1580,9 @@ def _ctypes_call(func, fc_name, md_name):
             else:  # _ARG_BOOL
                 add_arg(1 if value else 0)
 
-        c_args.append(
-            ctypes.c_void_p(torch.cuda.current_stream(tensor_device).cuda_stream)
-        )
+        if tensor_device is None:
+            tensor_device = current_device()
+        c_args.append(ctypes.c_void_p(raw_stream(tensor_device)))
         if err_clear is not None:
             err_clear()
         ret = c_func(*c_args)
@@ -1595,6 +1606,41 @@ def _ctypes_call(func, fc_name, md_name):
         return ret
 
     return caller
+
+
+_pybind_develop_hooks_cache = None
+
+
+def _pybind_develop_hooks():
+    """Everything the develop=True pybind path needs, resolved once.
+
+    All four are per-call on that path -- the converter runs once per tensor
+    argument -- and importing them inside the wrapper meant a sys.modules round
+    trip each time for names that never change. aiter.utility.dtypes imports back
+    into this module, so binding them at import time is not an option either.
+    """
+    global _pybind_develop_hooks_cache
+    if _pybind_develop_hooks_cache is None:
+        import torch
+
+        from ..utility.dtypes import torch_to_aiter_pybind
+
+        # Hands back the same handle as current_stream().cuda_stream without
+        # building the Python Stream object to carry it. Private, so fall back to
+        # the public spelling rather than assume a torch version floor.
+        raw_stream = getattr(torch._C, "_cuda_getCurrentRawStream", None)
+        if raw_stream is None:
+
+            def raw_stream(_device_index):
+                return torch.cuda.current_stream().cuda_stream
+
+        _pybind_develop_hooks_cache = (
+            torch_to_aiter_pybind,
+            torch.Tensor,
+            raw_stream,
+            torch.cuda.current_device,
+        )
+    return _pybind_develop_hooks_cache
 
 
 def compile_ops(
@@ -1881,27 +1927,20 @@ def compile_ops(
                     log_args(func, *args, **kwargs)
                 # develop=True: torch.Tensor -> pybind aiter_tensor_t before C++ (activation, CAR, ...).
                 if develop:
-                    import torch
-
-                    from ..utility.dtypes import torch_to_aiter_pybind
+                    convert, tensor_cls, raw_stream, current_device = (
+                        _pybind_develop_hooks()
+                    )
 
                     args = tuple(
-                        torch_to_aiter_pybind(a) if isinstance(a, torch.Tensor) else a
-                        for a in args
+                        convert(a) if isinstance(a, tensor_cls) else a for a in args
                     )
-                    kwargs = {
-                        k: (
-                            torch_to_aiter_pybind(v)
-                            if isinstance(v, torch.Tensor)
-                            else v
-                        )
-                        for k, v in kwargs.items()
-                    }
+                    if kwargs:
+                        kwargs = {
+                            k: convert(v) if isinstance(v, tensor_cls) else v
+                            for k, v in kwargs.items()
+                        }
 
-                if develop:
-                    module._set_current_hip_stream(
-                        torch.cuda.current_stream().cuda_stream
-                    )
+                    module._set_current_hip_stream(raw_stream(current_device()))
                 return op(*args, **kwargs)
 
             @torch_compile_guard(device="cuda", gen_fake=gen_fake, calling_func_=func)
