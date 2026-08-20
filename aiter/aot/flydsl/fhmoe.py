@@ -12,27 +12,63 @@ from dataclasses import dataclass
 from typing import Any
 
 from aiter.aot.flydsl.common import cu_num_to_arch, job_identity
+from aiter.fhmoe_config import DSV4_I384_FHMOE_MAX_TOKENS
+
+_DSV4_MODEL_DIM = 7168
+_DSV4_NATIVE_INTER_DIM = 384
+_DSV4_TUNED_INTER_DIM = 512
+_DSV4_EXPERTS = 385
+_DSV4_TOPK = 7
+_DSV4_SHARED_EXPERT_ID = 384
+_DSV4_I384_2048_HEURISTIC_KERNELS = (
+    "flydsl_moe1_afp8_wfp4_bf16_t64x128x256_w3_bnt0_gui",
+    "flydsl_moe2_afp8_wfp4_bf16_t64x128x128_atomic",
+)
 
 
 def _normalized_enum(value: str) -> str:
     return value.strip().split(".")[-1].lower()
 
 
-def _is_dsv4_fhmoe_row(row: dict[str, str]) -> bool:
-    """Return whether a tuned row describes the supported DSV4 FHMoE path."""
+def _is_dsv4_profile_row(row: dict[str, str]) -> bool:
     return (
-        int(row["model_dim"]) == 7168
-        and int(row["inter_dim"]) == 512
-        and int(row["expert"]) == 385
-        and int(row["topk"]) == 7
+        row.get("gfx", "") == "gfx950"
+        and int(row["cu_num"]) == 256
+        and int(row["model_dim"]) == _DSV4_MODEL_DIM
+        and int(row["expert"]) == _DSV4_EXPERTS
+        and int(row["topk"]) == _DSV4_TOPK
         and _normalized_enum(row.get("act_type", "")) == "silu"
         and row.get("dtype", "") == "torch.bfloat16"
         and row.get("use_g1u1", "") == "1"
-        and "_gui" in row.get("kernelName1", "")
+        and row.get("doweight_stage1", "") == "0"
         and _normalized_enum(row.get("q_type", "")) == "per_1x32"
         and "float8_e4m3fn" in row.get("q_dtype_a", "")
         and "float4_e2m1fn_x2" in row.get("q_dtype_w", "")
     )
+
+
+def _is_dsv4_fhmoe_row(row: dict[str, str]) -> bool:
+    """Return whether a tuned row can supply DSV4 FHMoE kernels."""
+    return (
+        _is_dsv4_profile_row(row)
+        and int(row["inter_dim"]) in (_DSV4_NATIVE_INTER_DIM, _DSV4_TUNED_INTER_DIM)
+        and "_gui" in row.get("kernelName1", "")
+    )
+
+
+def _target_inter_dims(row: dict[str, str]) -> tuple[int, ...]:
+    """Return physical FHMoE dimensions covered by a tuned config row."""
+    if not _is_dsv4_fhmoe_row(row):
+        return ()
+    inter_dim = int(row["inter_dim"])
+    token_num = int(row["token"])
+    if inter_dim == _DSV4_TUNED_INTER_DIM:
+        if 1 <= token_num <= DSV4_I384_FHMOE_MAX_TOKENS:
+            return (_DSV4_TUNED_INTER_DIM, _DSV4_NATIVE_INTER_DIM)
+        return (_DSV4_TUNED_INTER_DIM,)
+    if 1 <= token_num <= DSV4_I384_FHMOE_MAX_TOKENS:
+        return (_DSV4_NATIVE_INTER_DIM,)
+    return ()
 
 
 def _row_job_keys(row: dict[str, str]) -> set[tuple[Any, ...]]:
@@ -79,35 +115,86 @@ def _job_key(job: dict[str, Any]) -> tuple[Any, ...]:
     )
 
 
+def _dsv4_i384_2048_heuristic_jobs() -> list[dict[str, Any]]:
+    """Cover the native-I384 metadata heuristic used at the 2048 bucket."""
+    from aiter.ops.flydsl.moe_kernels import get_flydsl_kernel_params
+
+    stage1_params = get_flydsl_kernel_params(_DSV4_I384_2048_HEURISTIC_KERNELS[0])
+    if stage1_params is None:
+        raise ValueError("Missing DSV4 I384 FHMoE stage-1 heuristic kernel")
+    stage1_fuse_quant = stage1_params.get("out_dtype")
+    if stage1_fuse_quant not in ("fp4", "fp8"):
+        stage1_fuse_quant = None
+
+    jobs = []
+    for kernel_name in _DSV4_I384_2048_HEURISTIC_KERNELS:
+        params = get_flydsl_kernel_params(kernel_name)
+        if params is None:
+            raise ValueError(f"Missing DSV4 I384 FHMoE heuristic {kernel_name}")
+        job = {
+            "kernel_name": kernel_name,
+            "model_dim": _DSV4_MODEL_DIM,
+            "inter_dim": _DSV4_NATIVE_INTER_DIM,
+            "experts": _DSV4_EXPERTS,
+            "topk": _DSV4_TOPK,
+            "doweight_stage1": False,
+            "cu_num": 256,
+            "act": "silu",
+            "enable_bias": False,
+            "token_num": DSV4_I384_FHMOE_MAX_TOKENS,
+            "block_m": 64,
+            "shared_expert_id": _DSV4_SHARED_EXPERT_ID,
+            **params,
+        }
+        if params["stage"] == 2:
+            job["stage1_fuse_quant"] = stage1_fuse_quant
+        jobs.append(job)
+    return jobs
+
+
 def extend_fhmoe_jobs(
     csv_path: str,
     ordinary_jobs: list[dict[str, Any]],
     seen: set[tuple[Any, ...]],
 ) -> list[dict[str, Any]]:
     """Append FHMoE variants for eligible ordinary jobs in ``csv_path``."""
-    eligible_keys: set[tuple[Any, ...]] = set()
+    eligible_targets: dict[tuple[Any, ...], set[int]] = {}
+    has_native_i384_2048 = False
     with open(csv_path, newline="") as f:
         for row in csv.DictReader(f):
-            if _is_dsv4_fhmoe_row(row):
-                eligible_keys.update(_row_job_keys(row))
+            target_inter_dims = _target_inter_dims(row)
+            for key in _row_job_keys(row) if target_inter_dims else ():
+                eligible_targets.setdefault(key, set()).update(target_inter_dims)
+            has_native_i384_2048 |= (
+                _is_dsv4_profile_row(row)
+                and int(row["inter_dim"]) == _DSV4_NATIVE_INTER_DIM
+                and int(row["token"]) == DSV4_I384_FHMOE_MAX_TOKENS
+            )
 
     fhmoe_jobs = []
     for job in ordinary_jobs:
-        if (
-            job.get("stage") not in (1, 2)
-            or job.get("enable_bias", False)
-            or _job_key(job) not in eligible_keys
-        ):
+        if job.get("stage") not in (1, 2) or job.get("enable_bias", False):
             continue
-        fhmoe_job = {
-            **job,
-            "shared_expert_id": job["experts"] - 1,
-        }
-        key = job_identity(fhmoe_job)
-        if key in seen:
-            continue
-        seen.add(key)
-        fhmoe_jobs.append(fhmoe_job)
+        target_inter_dims = eligible_targets.get(_job_key(job), ())
+        for inter_dim in target_inter_dims:
+            fhmoe_job = {
+                **job,
+                "inter_dim": inter_dim,
+                "shared_expert_id": job["experts"] - 1,
+            }
+            key = job_identity(fhmoe_job)
+            if key in seen:
+                continue
+            seen.add(key)
+            fhmoe_jobs.append(fhmoe_job)
+
+    if has_native_i384_2048:
+        for fhmoe_job in _dsv4_i384_2048_heuristic_jobs():
+            key = job_identity(fhmoe_job)
+            if key in seen:
+                continue
+            seen.add(key)
+            fhmoe_jobs.append(fhmoe_job)
 
     return [*ordinary_jobs, *fhmoe_jobs]
 

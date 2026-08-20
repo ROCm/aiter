@@ -9,6 +9,7 @@ from dataclasses import replace
 import torch
 
 from aiter import ActivationType, QuantType, dtypes
+from aiter.fhmoe_config import DSV4_I384_FHMOE_MAX_TOKENS
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.flydsl.moe_common import GateMode
@@ -300,11 +301,19 @@ def _flydsl_fhmoe_stage2_wrapper(
 _flydsl_fhmoe_stage2_wrapper._is_flydsl_stage2 = True
 
 
-def _use_fhmoe_wrappers(metadata):
+def _use_fhmoe_wrappers(metadata, fallback_metadata=None):
     from aiter.fused_moe import _flydsl_stage1_wrapper, _flydsl_stage2_wrapper
 
     stage1_func = getattr(metadata.stage1, "func", metadata.stage1)
     stage2_func = getattr(metadata.stage2, "func", metadata.stage2)
+    if fallback_metadata is not None and (
+        metadata.run_1stage
+        or stage1_func is not _flydsl_stage1_wrapper
+        or stage2_func is not _flydsl_stage2_wrapper
+    ):
+        metadata = fallback_metadata()
+        stage1_func = getattr(metadata.stage1, "func", metadata.stage1)
+        stage2_func = getattr(metadata.stage2, "func", metadata.stage2)
     if (
         metadata.run_1stage
         or stage1_func is not _flydsl_stage1_wrapper
@@ -324,6 +333,28 @@ def _use_fhmoe_wrappers(metadata):
         **metadata.stage2.keywords,
     )
     return replace(metadata, stage1=stage1, stage2=stage2)
+
+
+def _supports_dsv4_i384_fallback(
+    token_num: int,
+    model_dim: int,
+    inter_dim: int,
+    experts: int,
+    topk: int,
+    hidden_pad: int,
+    intermediate_pad: int,
+    gate_mode: GateMode,
+    doweight_stage1: bool,
+) -> bool:
+    """Return whether I512 metadata may select kernels for physical I384."""
+    return (
+        1 <= token_num <= DSV4_I384_FHMOE_MAX_TOKENS
+        and (model_dim, inter_dim, experts, topk) == (7168, 384, 385, 7)
+        and hidden_pad == 0
+        and intermediate_pad == 0
+        and gate_mode == GateMode.INTERLEAVE
+        and not doweight_stage1
+    )
 
 
 def fhmoe_fake(
@@ -421,7 +452,7 @@ def fhmoe_(
     shared_w2_scale: torch.Tensor | None = None,
     shared_expert_id: int = -1,
 ) -> torch.Tensor:
-    from aiter.fused_moe import _fused_moe_impl
+    from aiter.fused_moe import _fused_moe_impl, get_2stage_cfgs, get_padded_M
 
     activation_enum = ActivationType(activation)
     quant_type_enum = QuantType(quant_type)
@@ -445,6 +476,43 @@ def fhmoe_(
         bias2,
     )
     q_dtype_a = dtypes.fp8 if gate_mode_enum == GateMode.INTERLEAVE else dtypes.fp4x2
+    experts = w1.shape[0]
+    model_dim = w2.shape[1]
+    inter_dim = w2.shape[2] * (model_dim // w1.shape[-1])
+    topk = topk_ids.shape[1]
+    fallback_metadata = None
+    if _supports_dsv4_i384_fallback(
+        hidden_states.shape[0],
+        model_dim,
+        inter_dim,
+        experts,
+        topk,
+        hidden_pad,
+        intermediate_pad,
+        gate_mode_enum,
+        doweight_stage1,
+    ):
+        fallback_metadata = functools.partial(
+            get_2stage_cfgs,
+            get_padded_M(hidden_states.shape[0]),
+            model_dim,
+            512,
+            experts,
+            topk,
+            hidden_states.dtype if dtype is None else dtype,
+            q_dtype_a,
+            w1.dtype,
+            quant_type_enum,
+            w1.shape[1] == 2 * inter_dim,
+            activation_enum,
+            doweight_stage1,
+            hidden_pad,
+            intermediate_pad,
+            getattr(w1, "is_shuffled", False) or getattr(w2, "is_shuffled", False),
+            gate_mode_enum,
+            opus_weights_shuffled=getattr(w1, "is_shuffled", False)
+            and getattr(w2, "is_shuffled", False),
+        )
     return _fused_moe_impl(
         hidden_states=hidden_states,
         w1=w1,
@@ -470,7 +538,10 @@ def fhmoe_(
         swiglu_limit=swiglu_limit,
         gate_mode=gate_mode,
         _q_dtype_a=q_dtype_a,
-        _metadata_transform=_use_fhmoe_wrappers,
+        _metadata_transform=functools.partial(
+            _use_fhmoe_wrappers,
+            fallback_metadata=fallback_metadata,
+        ),
         _stage1_extra_args={
             "shared_w1": shared_w1,
             "shared_w1_scale": shared_w1_scale,

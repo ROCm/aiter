@@ -5,13 +5,14 @@
 
 The default case is deliberately small. Set AITER_HETERO_MOE_DSV4=1 to use
 the exact DeepSeek-V4-Pro TP8 dimensions; that profile allocates several GiB.
-Set AITER_HETERO_MOE_FULL_SWEEP=1 to cover M=4,8,16,32,64 and
+Set AITER_HETERO_MOE_FULL_SWEEP=1 to cover M=1,4,8,16,24,32,40,64 and
 AITER_HETERO_MOE_STRESS_REPEATS=500 to stress both stage-2 epilogues and
 bound the default atomic path's run-to-run variation.
 """
 
 from __future__ import annotations
 
+import functools
 import inspect
 import os
 from dataclasses import dataclass
@@ -80,13 +81,13 @@ class _Weights:
 
 def _profile() -> _Profile:
     if os.environ.get("AITER_HETERO_MOE_DSV4", "0") == "1":
-        return _Profile(7168, 512, 384, 385, 6)
+        return _Profile(7168, 384, 384, 385, 6)
     return _Profile(256, 128, 128, 9, 2)
 
 
 def _m_values() -> list[int]:
     if os.environ.get("AITER_HETERO_MOE_FULL_SWEEP", "0") == "1":
-        return [4, 8, 16, 32, 64]
+        return [1, 4, 8, 16, 24, 32, 40, 64]
     return [4]
 
 
@@ -900,9 +901,85 @@ def test_fhmoe_runtime_compile_bridge_forwards_xcd(monkeypatch: pytest.MonkeyPat
     ]
 
 
-def test_fhmoe_aot_jobs_preserve_xcd_swizzling():
+@pytest.mark.parametrize(
+    ("overrides", "expected"),
+    (
+        ({}, True),
+        ({"token_num": 2048}, True),
+        ({"token_num": 0}, False),
+        ({"token_num": 2049}, False),
+        ({"model_dim": 7169}, False),
+        ({"inter_dim": 512}, False),
+        ({"experts": 384}, False),
+        ({"topk": 6}, False),
+        ({"hidden_pad": 128}, False),
+        ({"intermediate_pad": 128}, False),
+        ({"gate_mode": GateMode.SEPARATED}, False),
+        ({"doweight_stage1": True}, False),
+    ),
+)
+def test_dsv4_i384_fhmoe_fallback_scope(overrides, expected):
+    from aiter.fhmoe import (
+        DSV4_I384_FHMOE_MAX_TOKENS,
+        _supports_dsv4_i384_fallback,
+    )
+
+    args = {
+        "token_num": 1,
+        "model_dim": 7168,
+        "inter_dim": 384,
+        "experts": 385,
+        "topk": 7,
+        "hidden_pad": 0,
+        "intermediate_pad": 0,
+        "gate_mode": GateMode.INTERLEAVE,
+        "doweight_stage1": False,
+    }
+    args.update(overrides)
+
+    assert DSV4_I384_FHMOE_MAX_TOKENS == 2048
+    assert _supports_dsv4_i384_fallback(**args) is expected
+
+
+def test_fhmoe_retries_dsv4_metadata_with_flydsl():
+    from aiter import fhmoe
+    from aiter.fused_moe import (
+        MOEMetadata,
+        _flydsl_stage1_wrapper,
+        _flydsl_stage2_wrapper,
+    )
+
+    invalid = MOEMetadata(lambda: None, lambda: None, 32, 0)
+    fallback = MOEMetadata(
+        functools.partial(_flydsl_stage1_wrapper, kernelName="stage1"),
+        functools.partial(_flydsl_stage2_wrapper, kernelName="stage2"),
+        32,
+        0,
+    )
+    calls = 0
+
+    def fallback_metadata():
+        nonlocal calls
+        calls += 1
+        return fallback
+
+    result = fhmoe._use_fhmoe_wrappers(invalid, fallback_metadata)
+
+    assert calls == 1
+    assert result.stage1.func is fhmoe._flydsl_fhmoe_stage1_wrapper
+    assert result.stage1.keywords["kernelName"] == "stage1"
+    assert result.stage2.func is fhmoe._flydsl_fhmoe_stage2_wrapper
+    assert result.stage2.keywords["kernelName"] == "stage2"
+
+
+def test_fhmoe_aot_manifest_covers_native_i384():
+    from aiter.aot.flydsl.common import job_identity
     from aiter.aot.flydsl.moe import parse_csv
-    from aiter.ops.flydsl.moe_kernels import get_flydsl_kernel_params
+    from aiter.ops.flydsl.moe_kernels import (
+        get_flydsl_kernel_params,
+        resolve_flydsl_stage1_tile_n,
+        resolve_flydsl_stage2_tile_k,
+    )
 
     csv_path = (
         Path(__file__).resolve().parents[1]
@@ -910,13 +987,73 @@ def test_fhmoe_aot_jobs_preserve_xcd_swizzling():
     )
     jobs = parse_csv(str(csv_path))
     fhmoe_jobs = [job for job in jobs if job.get("shared_expert_id", -1) >= 0]
+    i512_jobs = [job for job in fhmoe_jobs if job["inter_dim"] == 512]
+    i384_jobs = [job for job in fhmoe_jobs if job["inter_dim"] == 384]
 
-    assert len(fhmoe_jobs) == 32
+    assert len(i512_jobs) == 32
     assert any(job.get("xcd_swizzle", 0) > 0 for job in fhmoe_jobs)
     for job in fhmoe_jobs:
         params = get_flydsl_kernel_params(job["kernel_name"])
         assert params is not None
         assert job.get("xcd_swizzle", 0) == params.get("xcd_swizzle", 0)
+    assert i384_jobs
+    assert all(job["shared_expert_id"] == 384 for job in i384_jobs)
+    assert all(1 <= job["token_num"] <= 2048 for job in i384_jobs)
+    for job in i384_jobs:
+        if job["stage"] == 1:
+            tile = resolve_flydsl_stage1_tile_n(384, job["tile_n"])
+        else:
+            tile = resolve_flydsl_stage2_tile_k(384, job["tile_k"])
+        assert 384 % tile == 0
+
+    i384_identities = {job_identity(job) for job in i384_jobs}
+    for i512_job in i512_jobs:
+        if i512_job["token_num"] <= 2048:
+            assert job_identity({**i512_job, "inter_dim": 384}) in i384_identities
+
+    selected_native_manifest = {
+        (2, "flydsl_moe1_afp8_wfp4_bf16_t32x64x256_bnt0_gui_kw4"),
+        (2, "flydsl_moe2_afp8_wfp4_bf16_t32x128x256_atomic"),
+        (4, "flydsl_moe1_afp8_wfp4_bf16_t32x64x256_w4_gui_kw2"),
+        (4, "flydsl_moe2_afp8_wfp4_bf16_t32x128x256_reduce_persist"),
+        (8, "flydsl_moe1_afp8_wfp4_bf16_t32x64x256_w3_gui"),
+        (
+            8,
+            "flydsl_moe2_afp8_wfp4_bf16_t32x256x128_reduce_bnt2_persist",
+        ),
+        (2048, "flydsl_moe1_afp8_wfp4_bf16_t64x128x256_w3_bnt0_gui"),
+        (2048, "flydsl_moe2_afp8_wfp4_bf16_t64x128x128_atomic"),
+    }
+    manifest = {
+        (job["token_num"], job["kernel_name"])
+        for job in i384_jobs
+        if not job.get("enable_bias", False)
+    }
+    assert selected_native_manifest <= manifest
+
+
+def test_fhmoe_aot_precompile_keeps_native_i384(monkeypatch: pytest.MonkeyPatch):
+    from aiter.aot.flydsl import fhmoe as aot_fhmoe
+    from aiter.aot.flydsl import moe as aot_moe
+
+    forwarded = {}
+
+    def precompile(**kwargs):
+        forwarded.update(kwargs)
+
+    monkeypatch.setattr(aot_moe, "_precompile_to_cache", precompile)
+    aot_fhmoe.precompile_fhmoe_to_cache(
+        experts=385,
+        shared_expert_id=384,
+        cu_num=256,
+        stage=2,
+        model_dim=7168,
+        inter_dim=384,
+        topk=7,
+    )
+
+    assert forwarded["inter_dim"] == 384
+    assert forwarded["_aot_backend"].shared_expert_id == 384
 
 
 def test_fhmoe_aot_stage1_forwards_optional_swiglu_abi(
