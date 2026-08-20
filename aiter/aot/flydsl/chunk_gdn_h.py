@@ -6,8 +6,11 @@
 """AOT pre-compile FlyDSL chunk_gdn_h opt (K5) kernels from tuned CSV configs.
 
 Resolves its CSV through ``AITER_CONFIGS.AITER_CONFIG_GDN_K5_OPT_FILE`` -- the
-same merged tuned table the runtime BV lookup reads, so AOT coverage tracks
-whatever has been tuned (including per-model tables under ``model_configs/``).
+same merged tuned table the runtime BV lookup reads, so the shapes AOT covers
+track whatever has been tuned (including per-model tables under
+``model_configs/``). ``BV`` is the exception: all candidates are compiled for
+every shape, so sequence lengths the table never measured stay off the JIT
+path.
 
 Usage:
     python -m aiter.aot.flydsl.chunk_gdn_h
@@ -54,6 +57,9 @@ _TORCH_DTYPE = {
 
 # Keep the default AOT coverage aligned with runtime config resolution.
 DEFAULT_CSVS = [AITER_CONFIGS.AITER_CONFIG_GDN_K5_OPT_FILE]
+# Runtime picks BV per batch shape from total_chunks/max_seq_chunks, so a seqlen
+# the tuned table never measured can resolve to any of these.
+_BV_CANDIDATES = (16, 32, 64)
 _G_HEAD_MAJOR = (True, False)
 _USE_STATE_INDICES = (False, True)
 _FIXED_SWITCHES: dict[str, bool] = {
@@ -92,12 +98,14 @@ def _torch_dtype_for_kernel(dtype_str: str):
 def parse_csv(csv_path: str) -> list[dict[str, Any]]:
     """Expand opt tuned rows into compile jobs.
 
-    Every compile-time switch comes straight from the row -- including the
-    tuned ``BV`` and the ``cu_num`` the row was measured on -- so AOT compiles
-    exactly what the runtime lookup will pick. ``g_head_major`` and
-    ``use_state_indices`` are the exception: they do not affect kernel timing
-    and so are not tuned dimensions, but they do fork the compiled artifact,
-    so both values are emitted to keep either runtime layout off the JIT path.
+    Shapes and layout switches come straight from the row -- including the
+    ``cu_num`` it was measured on. ``BV`` does not: the runtime resolves it per
+    batch shape (tuned lookup, else the CU heuristic), so a sequence length the
+    table never measured can resolve to any candidate. Emitting all of them
+    keeps arbitrary ``T``/seqlens off the JIT path, and costs only compile time
+    because a row's own tuned ``BV`` is always among them. ``g_head_major`` and
+    ``use_state_indices`` are fanned out for a related reason: they are not
+    tuned dimensions, but they do fork the compiled artifact.
     """
     jobs: list[dict[str, Any]] = []
     seen: set[tuple] = set()
@@ -114,7 +122,6 @@ def parse_csv(csv_path: str) -> list[dict[str, Any]]:
                 K = int(row["K"])
                 V = int(row["V"])
                 BT = int(row.get("BT") or 64)
-                BV = int(row["BV"])
                 H = int(row["H"])
                 Hg = int(row["Hg"])
                 cu_num = int(row.get("cu_num") or 0)
@@ -127,16 +134,17 @@ def parse_csv(csv_path: str) -> list[dict[str, Any]]:
                 print(f"  [WARN] malformed row in {csv_path}: {e}")
                 continue
 
-            if BV > V or V % BV:
+            bvs = tuple(bv for bv in _BV_CANDIDATES if bv <= V and V % bv == 0)
+            if not bvs:
                 print(
-                    f"  [WARN] BV={BV} does not divide V={V}, skipping row "
-                    f"in {csv_path}"
+                    f"  [WARN] no BV in {_BV_CANDIDATES} divides V={V}, "
+                    f"skipping row in {csv_path}"
                 )
                 continue
 
             indices = _USE_STATE_INDICES if (use_h0 and store_fs) else (False,)
-            for g_head_major, use_state_indices in itertools.product(
-                _G_HEAD_MAJOR, indices
+            for BV, g_head_major, use_state_indices in itertools.product(
+                bvs, _G_HEAD_MAJOR, indices
             ):
                 job = {
                     "kernel_name": _KERNEL_NAME,
