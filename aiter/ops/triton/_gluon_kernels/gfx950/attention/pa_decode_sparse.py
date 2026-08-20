@@ -1386,6 +1386,11 @@ def _pa_decode_sparse(
     HAS_INVALID: gl.constexpr,
     FP8_FNUZ: gl.constexpr,
     FP8_MFMA: gl.constexpr = False,
+    # q already quantized to e4m3 by the caller, with the scalar f32 scale it
+    # was quantized with -- the calling convention aiter's asm mla_decode_fwd
+    # uses, where vLLM passes layer._q_scale.
+    q_scl_ptr=None,
+    Q_FP8: gl.constexpr = False,
 ):
     """One program = (query, split, head-block). Two-loop: main (SWA) then
     extra (top-k). NUM_SPLITS==1 writes the output directly; otherwise stores
@@ -1517,11 +1522,11 @@ def _pa_decode_sparse(
     q = gl.amd.cdna4.buffer_load(
         ptr=q_ptr, offsets=q_off, mask=h_mask_q[:, None], other=0.0
     )
-    if FP8_MFMA:
-        # One e4m3 scale for this program's whole Q tile (nope + rope), so the
-        # fold below is a single extra factor on qk_scale. Each program folds its
-        # own scale, and m/l stay in the true-score domain, so split-K programs
-        # remain comparable in the reduce.
+    if FP8_MFMA and not Q_FP8:
+        # bf16 q: quantize it here, one e4m3 scale for this program's whole Q
+        # tile (nope + rope), so the fold below is a single extra factor on
+        # qk_scale. Each program folds its own scale and m/l stay in the
+        # true-score domain, so split-K programs remain comparable in the reduce.
         E4M3_MAX: gl.constexpr = 448.0
         q_amax = gl.max(gl.max(gl.abs(q).to(gl.float32), axis=1), axis=0)
     q_dot = gl.convert_layout(q, cfg.q_layout)
@@ -1540,7 +1545,21 @@ def _pa_decode_sparse(
     else:
         q_rope_dot = q_dot  # unused (single-plane QK) -> DCE'd
 
-    if FP8_MFMA:
+    if Q_FP8:
+        # Nothing to quantize; pick up the caller's scale and fold it exactly
+        # the way the cache's k_scale is folded.
+        q_scale = gl.load(q_scl_ptr)
+        if not FP8_MFMA:
+            # bf16 dots want bf16 operands, and fp8 -> bf16 is exact (3 mantissa
+            # bits into 8), so a quantized q costs nothing extra on this path.
+            q_dot = gl.convert_layout(q.to(gl.bfloat16), cfg.q_layout)
+            if ROPE_SEPARATE:
+                q_rope_dot = gl.convert_layout(q_rope.to(gl.bfloat16), cfg.q_layout)
+            else:
+                q_rope_dot = q_dot
+        main_qk_scale = main_qk_scale * q_scale
+        extra_qk_scale = extra_qk_scale * q_scale
+    elif FP8_MFMA:
         if ROPE_SEPARATE:
             q_amax = gl.maximum(
                 q_amax, gl.max(gl.max(gl.abs(q_rope).to(gl.float32), axis=1), axis=0)

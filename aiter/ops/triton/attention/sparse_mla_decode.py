@@ -134,6 +134,7 @@ def sparse_mla_decode_fwd(
     skip_reduce: bool = False,
     has_invalid: bool = False,
     fp8_mfma: bool = False,
+    q_scale: torch.Tensor | None = None,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Sparse (top-k gathered) MLA decode, separated-rope geometry.
@@ -158,6 +159,9 @@ def sparse_mla_decode_fwd(
             and is quantized to e4m3 in the kernel, per program, so its scale
             folds into that program's qk_scale. Faster (0.75-0.96x) but drops
             accuracy to the asm kernel's level, so it is a deliberate trade.
+        q_scale: scalar f32 scale q was quantized with. Required when q is
+            fp8, unused otherwise. Matches aiter's asm mla_decode_fwd, where
+            vLLM passes the layer's calibrated ``_q_scale``.
         out: optional ``[C, H, >= kv_lora_rank]`` bf16 destination.
 
     Returns:
@@ -165,7 +169,19 @@ def sparse_mla_decode_fwd(
     """
     assert q.ndim == 3, f"expected q=[b,h,d], got {q.shape}"
     assert arch_info.get_arch() == "gfx950", "sparse_mla_decode_fwd is gfx950-only"
-    assert q.dtype == torch.bfloat16
+    q_is_fp8 = q.dtype == torch.float8_e4m3fn
+    assert q.dtype == torch.bfloat16 or q_is_fp8, (
+        f"q must be bf16 or float8_e4m3fn, got {q.dtype}"
+    )
+    if q_is_fp8:
+        # Caller-quantized q, the asm calling convention: one scaled_fp8_quant
+        # over [C, H*d_qk] with the layer's scale. The kernel folds the scale
+        # into qk_scale, so nothing per-tile changes.
+        if q_scale is None:
+            raise ValueError("fp8 q needs q_scale (the scale it was quantized with)")
+        if q_scale.numel() != 1:
+            raise ValueError(f"q_scale must be a scalar, got {tuple(q_scale.shape)}")
+        q_scale = q_scale.reshape(1).to(torch.float32).contiguous()
     num_queries, num_heads, d_qk = q.shape
     assert d_qk == kv_lora_rank + qk_rope_head_dim, (
         f"q last dim {d_qk} != {kv_lora_rank} + {qk_rope_head_dim}"
@@ -315,6 +331,8 @@ def sparse_mla_decode_fwd(
         HAS_INVALID=has_invalid,
         FP8_FNUZ=fp8_fnuz,
         FP8_MFMA=fp8_mfma,
+        q_scl_ptr=q_scale,
+        Q_FP8=q_is_fp8,
         num_warps=num_warps,
         waves_per_eu=waves_per_eu,
     )
