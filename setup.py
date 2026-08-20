@@ -371,7 +371,12 @@ if PREBUILD_KERNELS != 0:
                 flags_extra_hip=flags_hip,
                 blob_gen_cmd=one_opt_args["blob_gen_cmd"],
                 extra_include=one_opt_args["extra_include"],
-                extra_ldflags=None,
+                # Honor per-module extra_ldflags from optCompilerConfig (e.g. gradlib
+                # gemm modules need -lhipblaslt/-lhipblas/-lrocblas): a de-torched .so
+                # references no torch symbols, so --as-needed drops libtorch_hip and its
+                # transitive libhipblaslt; without these the prebuilt wheel .so fails to
+                # load with "undefined symbol: getAllAlgos".
+                extra_ldflags=one_opt_args.get("extra_ldflags"),
                 verbose=False,
                 is_python_module=True,
                 is_standalone=False,

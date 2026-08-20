@@ -1221,6 +1221,11 @@ def get_args_of_build(ops_name: str, exclude=None):
                         "srcs": single_ops["srcs"],
                         "flags_extra_cc": single_ops["flags_extra_cc"],
                         "flags_extra_hip": single_ops["flags_extra_hip"],
+                        # Carry per-module link flags through the "all" (wheel prebuild)
+                        # path too -- gradlib gemm modules set -lhipblaslt/-lhipblas/
+                        # -lrocblas here; without this the prebuilt .so misses them and
+                        # fails to load ("undefined symbol: getAllAlgos").
+                        "extra_ldflags": single_ops["extra_ldflags"],
                         "extra_include": single_ops["extra_include"],
                         "blob_gen_cmd": single_ops["blob_gen_cmd"],
                         "third_party": single_ops["third_party"],
