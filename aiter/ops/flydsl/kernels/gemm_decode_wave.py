@@ -13,7 +13,6 @@ from flydsl.expr import const_expr, gpu, range_constexpr
 from .gemm_decode_common import (
     ReductionMode,
     WaveDecodeConfig,
-    add_bias_f32,
     contract_pair,
     gemm_decode_kernel_name,
     k_element,
@@ -280,10 +279,8 @@ def compile_gemm_decode_wave_bf16(
                 for column in range_constexpr(np):
                     value = reduced[row][column]
                     if const_expr(has_bias):
-                        value = add_bias_f32(
-                            value,
-                            bias_global,
-                            columns[column],
+                        value = fx.Float32(value) + bias_global[columns[column]].to(
+                            fx.Float32
                         )
                     store_bf16(
                         value,

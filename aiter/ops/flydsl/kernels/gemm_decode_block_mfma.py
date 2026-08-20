@@ -17,7 +17,6 @@ from .gemm_decode_common import (
     WAVE_SIZE,
     ActivationSource,
     BlockMfmaDecodeConfig,
-    add_bias_f32,
     bf16x4_slice,
     block_mfma_persistent_grid,
     block_mfma_staged_k,
@@ -395,10 +394,7 @@ def _make_block_kernel(
                             m,
                             shared_padding_per_row,
                         )
-                        a_smem_padding[row, row_padding] = arith.constant(
-                            0.0,
-                            type=T.bf16,
-                        )
+                        a_smem_padding[row, row_padding] = fx.BFloat16(0.0)
                 gpu.barrier()
             reduced, logical_columns = _compute_column_tile(
                 config=config,
@@ -416,10 +412,8 @@ def _make_block_kernel(
                         element = fx.Int32(row) * fx.Int32(n) + fx.Int32(column_coord)
                         value = reduced[row][column]
                         if const_expr(has_bias):
-                            value = add_bias_f32(
-                                value,
-                                bias_global,
-                                column_coord,
+                            value = fx.Float32(value) + bias_global[column_coord].to(
+                                fx.Float32
                             )
                         output = convert_bf16(
                             value,
@@ -517,10 +511,7 @@ def _make_block_kernel(
                             m,
                             shared_padding_per_row,
                         )
-                        a_smem_padding[row, row_padding] = arith.constant(
-                            0.0,
-                            type=T.bf16,
-                        )
+                        a_smem_padding[row, row_padding] = fx.BFloat16(0.0)
                 gpu.barrier()
             column_stride = runtime_grid_workgroups * fx.Int32(waves * columns)
             turn = fx.Int32(0)
@@ -555,11 +546,9 @@ def _make_block_kernel(
                                 )
                                 value = reduced[row][column]
                                 if const_expr(has_bias):
-                                    value = add_bias_f32(
-                                        value,
-                                        bias_global,
-                                        column_coord,
-                                    )
+                                    value = fx.Float32(value) + bias_global[
+                                        column_coord
+                                    ].to(fx.Float32)
                                 output = convert_bf16(
                                     value,
                                     element,

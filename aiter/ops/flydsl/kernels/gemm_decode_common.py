@@ -13,7 +13,6 @@ from typing import TypeAlias
 
 import flydsl.expr as fx
 from flydsl._mlir import ir
-from flydsl._mlir.dialects import arith as arith_dialect
 from flydsl._mlir.dialects import llvm
 from flydsl.expr import arith, range_constexpr
 from flydsl.expr.arith import ArithValue
@@ -658,30 +657,6 @@ def k_element(
 
 
 # Compiler-sensitive numeric, MFMA, DPP, and tail helpers.
-def const_bf16(value: float = 0.0):
-    return arith_dialect.ConstantOp(
-        ir.BF16Type.get(),
-        ir.FloatAttr.get(ir.BF16Type.get(), value),
-    ).result
-
-
-def const_f32(value: float = 0.0):
-    return arith_dialect.ConstantOp(
-        ir.F32Type.get(),
-        ir.FloatAttr.get(ir.F32Type.get(), value),
-    ).result
-
-
-def add_f32(lhs, rhs):
-    return arith_dialect.AddFOp(raw(lhs), raw(rhs)).result
-
-
-def add_bias_f32(value, bias_tensor, column):
-    """Add one BF16 column bias to an FP32 accumulator before conversion."""
-    bias_f32 = arith_dialect.ExtFOp(T.f32, raw(bias_tensor[column])).result
-    return add_f32(value, bias_f32)
-
-
 def pack_bf16x2(lo, hi):
     lo_i16 = ArithValue(raw(lo)).bitcast(T.i16)
     hi_i16 = ArithValue(raw(hi)).bitcast(T.i16)
@@ -712,7 +687,7 @@ def prepare_pair(packed, contraction: ContractionMode):
 def zero_wave_accumulator(contraction: ContractionMode):
     if contraction == ContractionMode.PACKED_F32:
         return arith.constant_vector(0.0, T.vec(2, T.f32))
-    return const_f32()
+    return fx.Float32(0.0)
 
 
 def contract_pair(accumulator, a_pair, b_pair, contraction: ContractionMode):
@@ -769,7 +744,7 @@ def bpermute_reduce_sum_f32(value, lane):
             partner * fx.Int32(4),
             value_i32,
         )
-        value = add_f32(value, ArithValue(peer_i32).bitcast(T.f32))
+        value = fx.Float32(value) + fx.Float32(ArithValue(peer_i32).bitcast(T.f32))
     return value
 
 
@@ -797,12 +772,14 @@ def reduce_wave_accumulator(accumulator, lane, contraction, reduction):
     else:
         lo = bpermute_reduce_sum_f32(lo, lane)
         hi = bpermute_reduce_sum_f32(hi, lane)
-    return add_f32(lo, hi)
+    return fx.Float32(lo) + fx.Float32(hi)
 
 
 def convert_bf16(value, element, rounding: OutputRounding):
     if rounding == OutputRounding.RNE:
-        return arith_dialect.TruncFOp(T.bf16, raw(value)).result
+        # Explicit rounding_mode lowers to constrained.fptrunc, which aborts
+        # AMDGPU ISA translation on FlyDSL 0.3.1. Default .to() is already RNE.
+        return fx.Float32(value).to(fx.BFloat16)
     seed = (
         (ArithValue(raw(element)) * fx.Int32(0x45D9F3B))
         ^ (ArithValue(raw(element)) << fx.Int32(16))
@@ -873,15 +850,15 @@ def reduce_mfma_scalar(accumulator):
         vector.extract(accumulator, static_position=[i], dynamic_position=[])
         for i in range_constexpr(4)
     ]
-    result = components[0]
-    result = add_f32(result, dpp_move_f32(components[1], 0x101))
-    result = add_f32(result, dpp_move_f32(components[2], 0x102))
-    result = add_f32(result, dpp_move_f32(components[3], 0x103))
-    result = add_f32(result, dpp_move_f32(result, 0x104))
-    result = add_f32(result, dpp_move_f32(result, 0x108))
+    result = fx.Float32(components[0])
+    result = result + fx.Float32(dpp_move_f32(components[1], 0x101))
+    result = result + fx.Float32(dpp_move_f32(components[2], 0x102))
+    result = result + fx.Float32(dpp_move_f32(components[3], 0x103))
+    result = result + fx.Float32(dpp_move_f32(result, 0x104))
+    result = result + fx.Float32(dpp_move_f32(result, 0x108))
     result = dpp_move_f32(result, 0x11F)
-    result = add_f32(result, dpp_move_f32(result, 0x142))
-    return add_f32(result, dpp_move_f32(result, 0x143))
+    result = fx.Float32(result) + fx.Float32(dpp_move_f32(result, 0x142))
+    return result + fx.Float32(dpp_move_f32(result, 0x143))
 
 
 def masked_bf16_vector(
@@ -893,7 +870,7 @@ def masked_bf16_vector(
     cache_modifier: int = 0,
 ):
     """Load a compile-time BF16 vector with safe N/K tail masking."""
-    zero = const_bf16()
+    zero = fx.BFloat16(0.0)
     values = []
     for offset in range_constexpr(width):
         column = column_base + fx.Int32(offset)
