@@ -752,11 +752,6 @@ parser.add_argument(
     "Only affects SiTUv2.",
 )
 parser.add_argument(
-    "--no-situv2",
-    action="store_true",
-    help="Skip the default SiTUv2 (per_1x32 fp4/fp8) FlyDSL cases.",
-)
-parser.add_argument(
     "--kernel",
     action="store_true",
     help="""Time the stage1 / stage2 kernels in isolation (loop each launch
@@ -1149,58 +1144,6 @@ def _iter_legacy_cases():
                     ), extras
 
 
-def _iter_situv2_default_cases():
-    """Yield (kwargs, extras) exercising the SiTUv2 activation by default.
-
-    SiTUv2 only routes to the FlyDSL MXFP4 kernel for per_1x32 + fp4/fp8, so we
-    hardcode the supported quant family instead of relying on the -a list:
-      * a8w4 (fp8 activation, fp4 weight) at a 256-aligned inter_dim shape
-    beta / linear_beta come from --beta / --linear-beta (None -> kernel 1.0).
-    Non-gfx950 runs are skipped inside test_fmoe's per_1x32 gfx guard.
-
-    Notes on cases intentionally kept out of this DEFAULT auto-run:
-      * The real DSV4 customer shape uses inter_dim=640, which is not 256-aligned.
-        shuffle_scale_a16w4 requires inter_dim % 256 == 0 on this branch; the
-        non-256 inter_dim fix lives on fix/shuffle-scale-a16w4-kdim. Verify the
-        640 shape once that branch is combined with this one. We default to a
-        256-aligned inter_dim (512) here so the a8w4 case runs on this branch.
-      * a4w4 (fp4 act, fp4 weight) full 2-stage is omitted because CK stage2
-        codegen (gen_instances.py) has no 'situv2' activation instance
-        (only silu/gelu), so the full a4w4 2-stage path can't be built here.
-        -a situv2 -q 4 remains reachable via explicit CLI.
-    """
-    extras = {"model": "situv2"}
-    dtype = args.dtype[0]
-    model_dim = 3072
-    tokens = [16, 128]
-    # ((quant_type, aq_dtype, wq_dtype), inter_dim)
-    situv2_cases = [
-        (_PER1X32_FP8_FP4, 512),  # a8w4: fp8 act, fp4 weight (256-aligned inter_dim)
-    ]
-    for (quant_type, aq_dtype, wq_dtype), inter_dim in situv2_cases:
-        for m in tokens:
-            yield {
-                "dtype": dtype,
-                "token": m,
-                "model_dim": model_dim,
-                "inter_dim": inter_dim,
-                "E": args.expert,
-                "topk": args.topk,
-                "actType": aiter.ActivationType.Situv2,
-                "gateMode": _effective_gate_mode(aq_dtype, wq_dtype),
-                "qType": quant_type,
-                "AQDType": aq_dtype,
-                "WQDType": wq_dtype,
-                "use_g1u1": True,
-                "doweight_stage1": False,
-                "strict_accuracy": False,
-                "check_aot_cache": False,
-                "swiglu_limit": None,
-                "beta": args.beta,
-                "linear_beta": args.linear_beta,
-            }, extras
-
-
 def test_bm16_tiled_scale_boundary():
     """Validate tuned BM16 dispatch and the 33-row scale boundary."""
     if get_gfx() != "gfx950":
@@ -1299,10 +1242,6 @@ else:
         )
     if not args.no_legacy:
         _case_iters.append(_iter_legacy_cases())
-    # SiTUv2 default coverage runs only in a full default sweep (no explicit -q),
-    # so an explicit quant selection is never silently overridden.
-    if not args.no_situv2 and args.quant is None:
-        _case_iters.append(_iter_situv2_default_cases())
 case_iter = itertools.chain(*_case_iters)
 
 _csv_out = os.environ.get("AITER_TUNED_OP_BENCH_CSV", "tuned_op_bench.csv")

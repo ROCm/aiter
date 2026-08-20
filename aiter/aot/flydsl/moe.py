@@ -647,6 +647,10 @@ def _precompile_to_cache(
                         _ptr_view_safe(torch.empty(0, device=dev, dtype=torch.float32)),
                         tokens,
                         sorted_token_ids.shape[0],
+                        1.0,
+                        1.0,
+                        1.0,
+                        1.0,
                         runtime_swiglu_limit(None, act),
                         0,
                     ),
@@ -955,7 +959,7 @@ def _precompile_epilogue_to_cache(act: str, inter_dim: int, topk: int):
             return
 
         exe = _get_compiled_silu_fused(
-            inter_dim, topk, quant_mode="none", gui_layout=True, act="silu"
+            inter_dim, topk, quant_mode="none", gui_layout=True, act=act
         )
         x = torch.zeros((rows, inter_dim * 2), dtype=torch.bfloat16, device=dev)
         out = torch.zeros((rows, inter_dim), dtype=torch.bfloat16, device=dev)
@@ -976,6 +980,10 @@ def _precompile_epilogue_to_cache(act: str, inter_dim: int, topk: int):
                 _ptr_view_safe(empty_f32),
                 rows,
                 sorted_token_ids.shape[0],
+                1.0,  # situ_beta
+                1.0,  # 1 / situ_beta
+                1.0,  # situ_linear_beta
+                1.0,  # 1 / situ_linear_beta
                 float("inf"),  # swiglu_limit (unused for silu)
                 0,  # stream: null/default (compile-only, kernel is never launched)
             ),

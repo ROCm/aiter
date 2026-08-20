@@ -107,6 +107,8 @@ def _s1_args_fhmoe(
     bias=None,
     stream=None,
     swiglu_limit=float("inf"),
+    situ_beta=1.0,
+    situ_linear_beta=1.0,
     pass_swiglu_limit: bool = True,
     *,
     shared_w,
@@ -137,7 +139,16 @@ def _s1_args_fhmoe(
         size_expert_ids_in,
     )
     if pass_swiglu_limit:
-        return args + (float(swiglu_limit), stream)
+        beta = float(situ_beta)
+        linear_beta = float(situ_linear_beta)
+        return args + (
+            beta,
+            1.0 / beta,
+            linear_beta,
+            1.0 / linear_beta,
+            float(swiglu_limit),
+            stream,
+        )
     return args + (stream,)
 
 

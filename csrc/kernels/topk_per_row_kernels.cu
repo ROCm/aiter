@@ -4,11 +4,13 @@
 #include "aiter_hip_common.h"
 #include "aiter_tensor.h"
 #include "aiter_stream.h"
+#include "hip_reduce.h"
 #include <hipcub/hipcub.hpp>
 #include <hipcub/util_type.hpp>
 
 #include <algorithm>
 #include <limits>
+#include <optional>
 #include <type_traits>
 #include <vector>
 
@@ -102,36 +104,16 @@ __device__ constexpr unsigned calc_mask(int pass)
  * whose sign bit is 1 but compares equal to +0.0f under IEEE 754.
  */
 template <typename T>
-__device__ typename hipcub::Traits<T>::UnsignedBits twiddle_in(T key, bool select_min)
+__device__ typename aiter::radix_traits<T>::UnsignedBits twiddle_in(T key, bool select_min)
 {
-    auto bits = reinterpret_cast<typename hipcub::Traits<T>::UnsignedBits&>(key);
-    if constexpr(std::is_same_v<T, float>)
-    {
-        uint32_t mask = (bits >> 31) ? 0 : 0x7fffffff;
-        return bits ^ mask;
-    }
-    else
-    {
-        bits = hipcub::Traits<T>::TwiddleIn(bits);
-        if(!select_min)
-        {
-            bits = ~bits;
-        }
-        return bits;
-    }
+    static_assert(std::is_same_v<T, float>, "radix top-k only supports fp32");
+    // select_min never mattered for float: the mask below is symmetric, so the
+    // ordering flip is handled by the comparison direction at the call sites.
+    (void)select_min;
+    auto bits     = reinterpret_cast<typename aiter::radix_traits<T>::UnsignedBits&>(key);
+    uint32_t mask = (bits >> 31) ? 0 : 0x7fffffff;
+    return bits ^ mask;
 }
-
-// // twiddle_out: convert sorted bits back to the original value type.
-// template <typename T>
-// __device__ T twiddle_out(typename hipcub::Traits<T>::UnsignedBits bits, bool select_min)
-// {
-//     if(!select_min)
-//     {
-//         bits = ~bits;
-//     }
-//     bits = hipcub::Traits<T>::TwiddleOut(bits);
-//     return reinterpret_cast<T&>(bits);
-// }
 
 // Compute bucket index using v_bfe_u32 (single-instruction bit field extract).
 // `mask` is unused: __builtin_amdgcn_ubfe extracts a fixed BitsPerPass-wide
@@ -276,7 +258,7 @@ struct alignas(128) Counter
     IdxT k;
     IdxT len;
     IdxT previous_len;
-    typename hipcub::Traits<T>::UnsignedBits kth_value_bits;
+    typename aiter::radix_traits<T>::UnsignedBits kth_value_bits;
     alignas(128) IdxT filter_cnt;
     alignas(128) unsigned int finished_block_cnt;
     alignas(128) IdxT out_cnt;
@@ -401,7 +383,7 @@ __global__ void radix_kernel_persistent(T const* in,
     const size_t total_threads = static_cast<size_t>(blockDim.x) * gridDim.x;
 
     __shared__ IdxT histogram_smem[num_buckets];
-    __shared__ typename hipcub::Traits<T>::UnsignedBits local_kth_value_bits;
+    __shared__ typename aiter::radix_traits<T>::UnsignedBits local_kth_value_bits;
     __shared__ IdxT local_k;
     __shared__ IdxT local_len;
 
@@ -557,7 +539,7 @@ __global__ void radix_kernel_persistent(T const* in,
                 {
                     local_k = current_k - prev;
                     local_len = cur - prev;
-                    typename hipcub::Traits<T>::UnsignedBits bucket = i;
+                    typename aiter::radix_traits<T>::UnsignedBits bucket = i;
                     local_kth_value_bits |= bucket << start_bit;
                 }
             }
@@ -968,23 +950,15 @@ __device__ constexpr unsigned calc_mask(int pass)
 
 // Map value to order-preserving unsigned bits; uses (bits >> 31) for correct -0.0f handling.
 template <typename T>
-__device__ typename hipcub::Traits<T>::UnsignedBits twiddle_in(T key, bool select_min)
+__device__ typename aiter::radix_traits<T>::UnsignedBits twiddle_in(T key, bool select_min)
 {
-    auto bits = reinterpret_cast<typename hipcub::Traits<T>::UnsignedBits&>(key);
-    if constexpr(std::is_same_v<T, float>)
-    {
-        uint32_t mask = (bits >> 31) ? 0 : 0x7fffffff;
-        return bits ^ mask;
-    }
-    else
-    {
-        bits = hipcub::Traits<T>::TwiddleIn(bits);
-        if(!select_min)
-        {
-            bits = ~bits;
-        }
-        return bits;
-    }
+    static_assert(std::is_same_v<T, float>, "radix top-k only supports fp32");
+    // select_min never mattered for float: the mask below is symmetric, so the
+    // ordering flip is handled by the comparison direction at the call sites.
+    (void)select_min;
+    auto bits     = reinterpret_cast<typename aiter::radix_traits<T>::UnsignedBits&>(key);
+    uint32_t mask = (bits >> 31) ? 0 : 0x7fffffff;
+    return bits ^ mask;
 }
 
 // Compute bucket index using v_bfe_u32.
@@ -1130,7 +1104,7 @@ struct alignas(128) Counter
     IdxT k;
     IdxT len;
     IdxT previous_len;
-    typename hipcub::Traits<T>::UnsignedBits kth_value_bits;
+    typename aiter::radix_traits<T>::UnsignedBits kth_value_bits;
     alignas(128) IdxT filter_cnt;
     alignas(128) unsigned int finished_block_cnt;
     alignas(128) IdxT out_cnt;
@@ -1319,8 +1293,8 @@ choose_bucket(Counter<T, IdxT>* counter, IdxT const* histogram, const IdxT k, in
         {
             counter->k   = k - prev;
             counter->len = cur - prev;
-            typename hipcub::Traits<T>::UnsignedBits bucket = i;
-            int start_bit                                   = calc_start_bit<T, BitsPerPass>(pass);
+            typename aiter::radix_traits<T>::UnsignedBits bucket = i;
+            int start_bit = calc_start_bit<T, BitsPerPass>(pass);
             counter->kth_value_bits |= bucket << start_bit;
         }
     }
