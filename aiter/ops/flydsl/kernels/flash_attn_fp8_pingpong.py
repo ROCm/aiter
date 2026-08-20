@@ -209,18 +209,17 @@ def build_flash_attn_fp8_module(
                 w0 = rocdl.cvt_pk_fp8_f32(T.i32, _raw(f0), _raw(f1), fx.Int32(0), False)
                 w1 = rocdl.cvt_pk_fp8_f32(T.i32, _raw(f2), _raw(f3), _raw(w0), True)
                 return w1
+            # Chain through the `old` operand with opsel, exactly as the
+            # unscaled path above: the second convert writes the high half of
+            # the register the first one produced, so the word needs no
+            # and/or/shl to assemble.
             lo = rocdl.cvt_scalef32_pk_fp8_f32(
                 v2i16_ty, _raw(_zero_2xi16), _raw(f0), _raw(f1), _raw(rscale), False
             )
             hi = rocdl.cvt_scalef32_pk_fp8_f32(
-                v2i16_ty, _raw(_zero_2xi16), _raw(f2), _raw(f3), _raw(rscale), False
+                v2i16_ty, _raw(lo), _raw(f2), _raw(f3), _raw(rscale), True
             )
-            lo32 = Vec(Vec(lo).bitcast(fx.Int32))[0]
-            hi32 = Vec(Vec(hi).bitcast(fx.Int32))[0]
-            return arith.ori(
-                _raw(arith.andi(_raw(lo32), _raw(fx.Int32(0xFFFF)))),
-                _raw(arith.shli(_raw(hi32), _raw(fx.Int32(16)))),
-            )
+            return Vec(Vec(hi).bitcast(fx.Int32))[0]
 
         mfma = Mfma32x32x64()
 
