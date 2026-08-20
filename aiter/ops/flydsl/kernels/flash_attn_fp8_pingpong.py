@@ -448,18 +448,26 @@ def build_flash_attn_fp8_module(
         v_tr8_ty = Vec.make_type(2, fx.Int32)
         lo_in_grp = lo % fx.Index(16)
 
+        def _v_base_ptr(v_off):
+            byte_off = (
+                fx.Index(lds_offset)
+                + v_off
+                + (lo // fx.Index(16)) * fx.Index(V_DBLOCK_STRIDE)
+                + hi * fx.Index(16 * V_KV_STRIDE)
+                + lo_in_grp * fx.Index(8)
+            )
+            return fx.buffer_ops.create_llvm_ptr(fx.Int64(byte_off), address_space=3)
+
         def read_v_pack(v_off, dt, ks):
-            d_block = (lo // fx.Index(16)) + fx.Index(2 * dt)
-            grp_db = fx.Index(lds_offset) + v_off + d_block * fx.Index(V_DBLOCK_STRIDE)
+            base = _v_base_ptr(v_off)
             reads = []
             for kc in range_constexpr(4):
-                kv0 = hi * fx.Index(16) + fx.Index(
+                imm = (2 * dt) * V_DBLOCK_STRIDE + (
                     ks * 64 + (kc // 2) * 32 + (kc % 2) * 8
+                ) * V_KV_STRIDE
+                ptr = fx.buffer_ops.get_element_ptr(
+                    base, static_byte_offset=imm, elem_type=i8_type
                 )
-                byte_off = (
-                    grp_db + kv0 * fx.Index(V_KV_STRIDE) + lo_in_grp * fx.Index(8)
-                )
-                ptr = fx.buffer_ops.create_llvm_ptr(fx.Int64(byte_off), address_space=3)
                 reads.append(Vec(rocdl.ds_read_tr8_b64(v_tr8_ty, ptr).result))
             ab = reads[0].shuffle(reads[1], list(range(4)))
             cd = reads[2].shuffle(reads[3], list(range(4)))
@@ -551,17 +559,25 @@ def build_flash_attn_fp8_module(
 
         PREFETCH_DEPTH = 1
 
-        def _load_k_unit(k_buf_off, nt, ks):
-            kv_row = lo + fx.Index(nt * 32)
-            d_base = fx.Index(ks * MFMA_K) + hi * 32
-            row_off = kv_row * K_STRIDE + (kv_row // fx.Index(K_UNIT_ROWS)) * fx.Index(
-                PAD_K
+        K_NT_STRIDE = 32 * K_STRIDE + (32 // K_UNIT_ROWS) * PAD_K
+
+        def _k_base_row(k_buf_off):
+            return (
+                k_buf_off
+                + lo * K_STRIDE
+                + (lo // fx.Index(K_UNIT_ROWS)) * fx.Index(PAD_K)
+                + hi * 32
             )
+
+        def _load_k_unit(k_buf_off, nt, ks, base=None):
+            if const_expr(base is None):
+                base = _k_base_row(k_buf_off)
+            imm = nt * K_NT_STRIDE + ks * MFMA_K
             blk_lo = Vec(
-                Vec.load(v_i8x16, lds, [k_buf_off + row_off + d_base])
+                Vec.load(v_i8x16, lds, [base + fx.Index(imm)])
             ).bitcast(fx.Int32)
             blk_hi = Vec(
-                Vec.load(v_i8x16, lds, [k_buf_off + row_off + d_base + fx.Index(16)])
+                Vec.load(v_i8x16, lds, [base + fx.Index(imm + 16)])
             ).bitcast(fx.Int32)
             return blk_lo.shuffle(blk_hi, list(range(8)))
 
