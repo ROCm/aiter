@@ -5,15 +5,16 @@
 
 """AOT pre-compile FlyDSL chunk_gdn_h kernels (vk baseline + opt fork).
 
-``vk`` reads ``aiter/ops/flydsl/chunk_gdn_h_tuned.csv``; ``opt`` reads
-``model_configs/*_chunk_gdn_h_opt_untuned.csv`` (shape-only). Runtime BV lookup uses
-``AITER_CONFIG_GDN_K5_OPT`` (merged tuned CSV via ``AITER_CONFIGS``; carries ``cu_num``).
+``vk`` reads ``aiter/ops/flydsl/chunk_gdn_h_tuned.csv``; ``opt`` resolves its CSV
+through ``AITER_CONFIGS.AITER_CONFIG_GDN_K5_OPT_FILE``, the same merged tuned table
+the runtime BV lookup reads, so AOT coverage tracks whatever has been tuned.
 
 Usage: ``python -m aiter.aot.flydsl.chunk_gdn_h [--kernel vk|opt|all]``
 
-Environment: ``FLYDSL_RUNTIME_CACHE_DIR``, ``FLYDSL_GPU_ARCH``.
-``ARCH``/``GPU_ARCHS`` are banner-only for opt (compile arch comes from host ``cu_num``
-or ``--target-arch``).
+Environment: ``FLYDSL_RUNTIME_CACHE_DIR``, ``FLYDSL_GPU_ARCH``,
+``AITER_CONFIG_GDN_K5_OPT`` (overrides the opt CSV set).
+``ARCH``/``GPU_ARCHS`` are banner-only for opt (compile arch comes from the row's
+``cu_num`` or ``--target-arch``).
 """
 
 from __future__ import annotations
@@ -40,8 +41,7 @@ from aiter.aot.flydsl.common import (
     override_env,
     run_jobs_parallel,
 )
-from aiter.jit.core import AITER_ROOT_DIR
-from aiter.jit.utils.chip_info import get_cu_num
+from aiter.jit.core import AITER_CONFIGS
 from aiter.ops.flydsl.kernels.chunk_gated_delta_h import compile_chunk_gated_delta_h
 from aiter.ops.flydsl.kernels.chunk_gated_delta_h_opt import (
     compile_chunk_gated_delta_h_opt,
@@ -60,16 +60,9 @@ _TORCH_DTYPE = {
     "torch.float16": "float16",
 }
 
-_MODEL_CONFIG_DIR = Path(f"{AITER_ROOT_DIR}/aiter/configs/model_configs")
-DEFAULT_CSVS_OPT = sorted(
-    str(p)
-    for p in _MODEL_CONFIG_DIR.glob("*_chunk_gdn_h_opt_untuned.csv")
-    if p.is_file()
-)
+# Keep the default AOT coverage aligned with runtime config resolution.
+DEFAULT_CSVS_OPT = [AITER_CONFIGS.AITER_CONFIG_GDN_K5_OPT_FILE]
 _OPT_KERNEL_NAME = "chunk_gdn_fwd_h_flydsl_opt"
-_BV_CANDIDATES = (64, 32, 16)
-_SNAPSHOT_BF16 = (True, False)
-_STATE_BF16 = (False, True)
 _G_HEAD_MAJOR = (True, False)
 _USE_STATE_INDICES = (False, True)
 _FIXED_SWITCHES: dict[str, bool] = {
@@ -370,13 +363,17 @@ def _opt_job_arch(job: dict[str, Any]) -> str:
 
 
 def parse_csv_opt(csv_path: str) -> list[dict[str, Any]]:
-    """Expand opt untuned rows into compile jobs (BV/dtype/layout fan-out).
+    """Expand opt tuned rows into compile jobs.
 
-    Untuned CSVs are shape-only; compile arch is taken from the host ``cu_num``
-    (or ``--target-arch`` override), not from the CSV.
+    Every compile-time switch comes straight from the row -- including the
+    tuned ``BV`` and the ``cu_num`` the row was measured on -- so AOT compiles
+    exactly what the runtime lookup will pick. ``g_head_major`` and
+    ``use_state_indices`` are the exception: they do not affect kernel timing
+    and so are not tuned dimensions, but they do fork the compiled artifact,
+    so both values are emitted to keep either runtime layout off the JIT path.
     """
-    shapes: dict[tuple, None] = {}
-    cu_num = get_cu_num()
+    jobs: list[dict[str, Any]] = []
+    seen: set[tuple] = set()
 
     with open(csv_path, "r", encoding="utf-8", newline="") as f:
         rows = csv.DictReader(line for line in f if not line.lstrip().startswith("#"))
@@ -390,58 +387,54 @@ def parse_csv_opt(csv_path: str) -> list[dict[str, Any]]:
                 K = int(row["K"])
                 V = int(row["V"])
                 BT = int(row.get("BT") or 64)
+                BV = int(row["BV"])
                 H = int(row["H"])
                 Hg = int(row["Hg"])
+                cu_num = int(row.get("cu_num") or 0)
                 is_varlen = _parse_bool(row.get("is_varlen") or "True")
                 use_h0 = _parse_bool(row.get("use_h0") or "True")
                 store_fs = _parse_bool(row.get("store_fs") or "True")
+                snapshot_bf16 = _parse_bool(row.get("snapshot_bf16") or "True")
+                state_bf16 = _parse_bool(row.get("state_bf16") or "False")
             except (KeyError, TypeError, ValueError) as e:
                 print(f"  [WARN] malformed row in {csv_path}: {e}")
                 continue
 
-            shapes[(dtype, K, V, BT, H, Hg, is_varlen, use_h0, store_fs)] = None
-
-    jobs: list[dict[str, Any]] = []
-    seen: set[tuple] = set()
-    for dtype, K, V, BT, H, Hg, is_varlen, use_h0, store_fs in shapes:
-        bvs = [bv for bv in _BV_CANDIDATES if bv <= V and V % bv == 0]
-        if not bvs:
-            print(f"  [WARN] no legal BV for V={V}, skipping shape in {csv_path}")
-            continue
-        indices = _USE_STATE_INDICES if (use_h0 and store_fs) else (False,)
-        for (
-            bv,
-            snapshot_bf16,
-            state_bf16,
-            g_head_major,
-            use_state_indices,
-        ) in itertools.product(
-            bvs, _SNAPSHOT_BF16, _STATE_BF16, _G_HEAD_MAJOR, indices
-        ):
-            job = {
-                "kernel_name": _OPT_KERNEL_NAME,
-                "dtype": dtype,
-                "cu_num": cu_num,
-                "K": K,
-                "V": V,
-                "BT": BT,
-                "BV": bv,
-                "H": H,
-                "Hg": Hg,
-                "is_varlen": is_varlen,
-                "use_h0": use_h0,
-                "store_fs": store_fs,
-                "snapshot_bf16": snapshot_bf16,
-                "state_bf16": state_bf16,
-                "g_head_major": g_head_major,
-                "use_state_indices": use_state_indices,
-                **_FIXED_SWITCHES,
-            }
-            key = job_identity(job)
-            if key in seen:
+            if BV > V or V % BV:
+                print(
+                    f"  [WARN] BV={BV} does not divide V={V}, skipping row "
+                    f"in {csv_path}"
+                )
                 continue
-            seen.add(key)
-            jobs.append(job)
+
+            indices = _USE_STATE_INDICES if (use_h0 and store_fs) else (False,)
+            for g_head_major, use_state_indices in itertools.product(
+                _G_HEAD_MAJOR, indices
+            ):
+                job = {
+                    "kernel_name": _OPT_KERNEL_NAME,
+                    "dtype": dtype,
+                    "cu_num": cu_num,
+                    "K": K,
+                    "V": V,
+                    "BT": BT,
+                    "BV": BV,
+                    "H": H,
+                    "Hg": Hg,
+                    "is_varlen": is_varlen,
+                    "use_h0": use_h0,
+                    "store_fs": store_fs,
+                    "snapshot_bf16": snapshot_bf16,
+                    "state_bf16": state_bf16,
+                    "g_head_major": g_head_major,
+                    "use_state_indices": use_state_indices,
+                    **_FIXED_SWITCHES,
+                }
+                key = job_identity(job)
+                if key in seen:
+                    continue
+                seen.add(key)
+                jobs.append(job)
 
     return jobs
 
@@ -706,7 +699,7 @@ def main():
         csv_paths = [os.path.abspath(p) for p in (args.csv or spec.default_csvs)]
         if not csv_paths:
             print(
-                f"Error: no untuned csv files for {name} "
+                f"Error: no tuned csv files for {name} "
                 f"(expected {spec.default_csvs!r})"
             )
             sys.exit(1)
@@ -727,7 +720,7 @@ def main():
 
         if name == "opt":
             archs = sorted({_opt_job_arch(j) for j in jobs})
-            compile_arch_note = " (from cu_num)"
+            compile_arch_note = " (from csv cu_num)"
         else:
             archs = sorted({j["arch"] for j in jobs})
             compile_arch_note = ""
