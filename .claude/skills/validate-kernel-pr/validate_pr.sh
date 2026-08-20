@@ -168,9 +168,29 @@ if ! ( cd "$REPO_WT" && PYTHONPATH="$PYLIB" python -m pytest --version ) >/dev/n
   PICK=""
 fi
 if [ -n "${PICK:-}" ]; then
+  # Baseline control: with a patch applied, a failure only belongs to the PR if the SAME
+  # target passes without it. Without this the harness charges pre-existing red to the
+  # author -- the exact misattribution this skill exists to prevent. Learned from an
+  # end-to-end run where base and head failed the same unrelated shape.
+  BASE_RC=""
+  if [ -n "$PATCHF" ]; then
+    git -C "$REPO_WT" stash -q 2>/dev/null
+    R0=$(run_pytest base ""); BASE_RC=${R0%%|*}; BASE_LOG=${R0##*|}
+    git -C "$REPO_WT" stash pop -q 2>/dev/null
+    jset "stages.baseline_control" "{\"status\":\"$([ "$BASE_RC" -eq 0 ] && echo clean || echo "pre-existing-failures")\",\"exit\":$BASE_RC,\"log\":\"$BASE_LOG\"}"
+  else
+    jset "stages.baseline_control" '"'"'{"status":"skip","note":"no patch: this run IS a base measurement, failures are not attributable to any PR"}'"'"'
+  fi
+
   R=$(run_pytest repo ""); RC=${R%%|*}; LOG=${R##*|}
   jset "stages.correctness_repo_tests" "{\"status\":\"$([ $RC -eq 0 ] && echo pass || echo fail)\",\"exit\":$RC,\"log\":\"$LOG\"}"
-  [ $RC -ne 0 ] && finding "blocker" "correctness" "the PR's own test target fails: $(tail -3 "$LOG" | tr -d '"' | tr '\n' ' ' | cut -c1-200)"
+  if [ $RC -ne 0 ]; then
+    if [ -n "$PATCHF" ] && [ "${BASE_RC:-0}" -ne 0 ]; then
+      finding "note" "correctness" "test target is red BOTH with and without this change -- pre-existing, not attributable to the PR: $(tail -3 "$LOG" | tr -d '"' | tr '\n' ' ' | cut -c1-150)"
+    else
+      finding "blocker" "correctness" "the PR's own test target fails (base is clean): $(tail -3 "$LOG" | tr -d '"' | tr '\n' ' ' | cut -c1-180)"
+    fi
+  fi
 
   # S1-owned shape grid: non-toy, boundary/odd, large-M. Independent of what the PR chose to test.
   if [ -n "$SHAPE_ENV" ] && [ -n "$GRID" ]; then

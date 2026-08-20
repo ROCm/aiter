@@ -51,6 +51,9 @@ for c in d.get('comments',[]):
 # list in context before the rule pass instead of relying on the reviewer to remember it.
 SCAN=.claude/skills/validate-kernel-pr/scan_index_width.py
 [ -x "$SCAN" ] && "$SCAN" --diff /tmp/pr.diff
+# The candidates above cannot be judged without deployment scale, and the scale facts are
+# useless 400 lines away from them -- print both together.
+cat .claude/skills/validate-kernel-pr/production_scale.md 2>/dev/null
 
 # Inline review comments (line-level code comments — often more specific than top-level)
 gh api "repos/$REPO/pulls/$PR/comments" | python3 -c "
@@ -392,6 +395,8 @@ C++ kernel launcher or Python wrapper computes a buffer offset, record count, or
 Common patterns: `token_id * (num_heads * head_dim)` overflows at token_id > 16M with H=32, D=128; `seq_start * K` overflows for long-context at seq_start > 256K with K=8192; gfx1250 TDM block descriptor count fields computed as Python int default to int64 — a missing `.to(torch.int32)` cast silently produces wrong offsets.
 Trigger (structural, NOT a name list): any **index-shaped value multiplied by a stride-shaped value** that produces a buffer address, record count, or array index, on a line carrying no explicit 64-bit widening (`tl.int64` / `gl.int64` annotation, `.to(tl.int64)`, `Int64(...)`, `int64_t`, `static_cast<int64_t>`). Index-shaped covers anything ending in `_id`/`_idx`/`pid`, or naming a block, row, token, slot, page, or sequence position; stride-shaped covers `stride_*`, `*_pitch`, and per-element/per-row extents. Also fires on a TDM descriptor field feeding block offset computation without an explicit int32 cast.
 **Why the trigger is structural:** an earlier version of this rule listed the names `token_id`, `seq_start`, `batch_offset`, `total_tokens`. Three real defects used none of them — `stride_out_batch`, `block_id`, `physical_block`, `context_kv_idx` — and the rule stayed silent on all three (aiter#1674 ×2, aiter#3541). Do not narrow it back to a name list.
+**Production scale.** Step 1 printed `validate-kernel-pr/production_scale.md` directly beneath the candidate list: pool sizes, batch limits and stride semantics that the diff does not contain. Use those numbers to name the triggering case the 🔴 gate requires; if none of them puts the product past 2^31, clear the candidate and say so.
+
 **The candidate list is already in context.** Step 1 ran `scan_index_width.py` over the diff and printed every index×stride site with no 64-bit widening, plus every stride-like kernel param with no width annotation. Work that list: clear each candidate, and fire D9 only where you can name the production scale at which the product exceeds 2^31. If the list is empty, say so rather than skipping the category silently.
 Real examples: `out_base = token_id * num_heads * head_dim` in int32 overflows at scale (PR#3844); forward kernel uses `Int32(seq_start) * Int32(K)` while the backward kernel correctly uses int64 (PR#4113).
 → `🔴 D9: [index expr] in int32 — widen [index operand] to int64 before multiplying by [stride], overflows at [concrete production scale]`
