@@ -155,11 +155,6 @@ AITER_CONFIG_GDN_K5_OPT = os.getenv(
     f"{AITER_ROOT_DIR}/aiter/configs/model_configs/qwen3_5_35b_chunk_gdn_h_opt_tuned.csv",
 )
 
-AITER_CONFIG_GDN_K5_OPT_UNTUNED = os.getenv(
-    "AITER_CONFIG_GDN_K5_OPT_UNTUNED",
-    f"{AITER_ROOT_DIR}/aiter/configs/model_configs/qwen3_5_35b_chunk_gdn_h_opt_untuned.csv",
-)
-
 
 class AITER_CONFIG:
     @property
@@ -245,15 +240,6 @@ class AITER_CONFIG:
         )
 
     @property
-    def AITER_CONFIG_GDN_K5_OPT_UNTUNED_FILE(self):
-        return self.get_config_file(
-            "AITER_CONFIG_GDN_K5_OPT_UNTUNED",
-            AITER_CONFIG_GDN_K5_OPT_UNTUNED,
-            "chunk_gdn_h_opt_untuned",
-            untuned_only=True,
-        )
-
-    @property
     def AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE_FILE(self):
         return self.get_config_file(
             "AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE",
@@ -319,12 +305,9 @@ class AITER_CONFIG:
         # Turn the tuned-file base name into its untuned sibling by rewriting the
         # LAST "tuned" token (handles both mid-string names like
         # "a8w8_tuned_gemm" and trailing ones like "..._mxscale_tuned").
-        if merge_name.endswith("_untuned"):
-            untuned_path = None
-        else:
-            untuned_name = "untuned".join(merge_name.rsplit("tuned", 1))
-            untuned_path = f"{AITER_ROOT_DIR}/aiter/configs/{untuned_name}.csv"
-        if untuned_path and os.path.exists(untuned_path):
+        untuned_name = "untuned".join(merge_name.rsplit("tuned", 1))
+        untuned_path = f"{AITER_ROOT_DIR}/aiter/configs/{untuned_name}.csv"
+        if os.path.exists(untuned_path):
             untunedf = pd.read_csv(untuned_path)
             keys = untunedf.columns.to_list()
             if "cu_num" not in keys:
@@ -380,7 +363,7 @@ class AITER_CONFIG:
                     f"Duplicate rows:\n{dup_rows.to_string(index=False)}\n"
                     f"Updated files:\n{saved_info}"
                 )
-        elif untuned_path:
+        else:
             logger.warning(
                 f"Untuned config file not found: {untuned_path}. Using all columns for deduplication."
             )
@@ -404,34 +387,25 @@ class AITER_CONFIG:
     # Cache is keyed on (self, env_name, ...); this object is a
     # process-lifetime singleton, so the retained reference is not a leak.
     @functools.lru_cache(maxsize=20)  # noqa: B019
-    def get_config_file(
-        self, env_name, default_file, config_file_name, untuned_only=False
-    ):
+    def get_config_file(self, env_name, default_file, tuned_file_name):
         config_env_file = os.getenv(env_name)
-        # default_file = f"{AITER_ROOT_DIR}/aiter/configs/{config_file_name}.csv"
+        # default_file = f"{AITER_ROOT_DIR}/aiter/configs/{tuned_file_name}.csv"
         from pathlib import Path
 
         if not config_env_file:
             model_config_dir = Path(f"{AITER_ROOT_DIR}/aiter/configs/model_configs/")
-            if untuned_only:
-                op_config_file_list = [
-                    p
-                    for p in model_config_dir.glob(f"*{config_file_name}*.csv")
-                    if (p.is_file() and "untuned" in p.name)
-                ]
-            else:
-                op_config_file_list = [
-                    p
-                    for p in model_config_dir.glob(f"*{config_file_name}*.csv")
-                    if (p.is_file() and "untuned" not in p.name)
-                ]
+            op_tuned_file_list = [
+                p
+                for p in model_config_dir.glob(f"*{tuned_file_name}*.csv")
+                if (p.is_file() and "untuned" not in p.name)
+            ]
 
-            if not op_config_file_list:
+            if not op_tuned_file_list:
                 config_file = default_file
             else:
                 merge_paths: list[str] = []
                 seen_paths: set[str] = set()
-                for path in (default_file, *(str(p) for p in op_config_file_list)):
+                for path in (default_file, *(str(p) for p in op_tuned_file_list)):
                     abs_path = os.path.abspath(path)
                     if abs_path in seen_paths:
                         continue
@@ -440,15 +414,13 @@ class AITER_CONFIG:
                 if len(merge_paths) == 1:
                     config_file = merge_paths[0]
                 else:
-                    config_files = ":".join(merge_paths)
+                    tuned_files = ":".join(merge_paths)
                     logger.info(
-                        f"merge config file under model_configs/ and configs/ {config_files}"
+                        f"merge tuned file under model_configs/ and configs/ {tuned_files}"
                     )
-                    config_file = self.update_config_files(
-                        config_files, config_file_name
-                    )
+                    config_file = self.update_config_files(tuned_files, tuned_file_name)
         else:
-            config_file = self.update_config_files(config_env_file, config_file_name)
+            config_file = self.update_config_files(config_env_file, tuned_file_name)
             # print(f"get config file from environment ", config_file)
         return config_file
 

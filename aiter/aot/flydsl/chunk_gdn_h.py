@@ -6,8 +6,8 @@
 """AOT pre-compile FlyDSL chunk_gdn_h kernels (vk baseline + opt fork).
 
 ``vk`` reads ``aiter/ops/flydsl/chunk_gdn_h_tuned.csv``; ``opt`` reads
-``AITER_CONFIG_GDN_K5_OPT_UNTUNED`` (merged untuned CSV via ``AITER_CONFIGS``).
-Runtime BV lookup uses ``AITER_CONFIG_GDN_K5_OPT`` (merged tuned CSV).
+``model_configs/*_chunk_gdn_h_opt_untuned.csv``. Runtime BV lookup uses
+``AITER_CONFIG_GDN_K5_OPT`` (merged tuned CSV via ``AITER_CONFIGS``).
 
 Usage: ``python -m aiter.aot.flydsl.chunk_gdn_h [--kernel vk|opt|all]``
 
@@ -39,7 +39,7 @@ from aiter.aot.flydsl.common import (
     override_env,
     run_jobs_parallel,
 )
-from aiter.jit.core import AITER_CONFIGS
+from aiter.jit.core import AITER_ROOT_DIR
 from aiter.ops.flydsl.kernels.chunk_gated_delta_h import compile_chunk_gated_delta_h
 from aiter.ops.flydsl.kernels.chunk_gated_delta_h_opt import (
     compile_chunk_gated_delta_h_opt,
@@ -58,9 +58,12 @@ _TORCH_DTYPE = {
     "torch.float16": "float16",
 }
 
-DEFAULT_CSVS_OPT = [
-    AITER_CONFIGS.AITER_CONFIG_GDN_K5_OPT_UNTUNED_FILE,
-]
+_MODEL_CONFIG_DIR = Path(f"{AITER_ROOT_DIR}/aiter/configs/model_configs")
+DEFAULT_CSVS_OPT = sorted(
+    str(p)
+    for p in _MODEL_CONFIG_DIR.glob("*_chunk_gdn_h_opt_untuned.csv")
+    if p.is_file()
+)
 _OPT_KERNEL_NAME = "chunk_gdn_fwd_h_flydsl_opt"
 _BV_CANDIDATES = (64, 32, 16)
 _SNAPSHOT_BF16 = (True, False)

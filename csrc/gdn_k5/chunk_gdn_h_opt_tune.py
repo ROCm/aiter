@@ -20,7 +20,6 @@ import torch
 from aiter import logger
 from aiter.jit.core import (
     AITER_CONFIG_GDN_K5_OPT,
-    AITER_CONFIG_GDN_K5_OPT_UNTUNED,
     AITER_CONFIGS,
     AITER_ROOT_DIR,
 )
@@ -57,16 +56,10 @@ TUNED_COLUMNS = LOOKUP_KEYS + TUNED_EXTRA_COLS
 
 _RUN_CONFIG_TOL_PCT = 5.0
 _RESULT_COLS = [c for c in TUNED_COLUMNS if c not in LOOKUP_KEYS]
-
-
-def _resolve_untuned_config(path: str) -> str:
-    """Default untuned path uses merged CSV from ``AITER_CONFIGS`` (Fmoe-style)."""
-    if (
-        os.getenv("AITER_CONFIG_GDN_K5_OPT_UNTUNED")
-        or path != f"{AITER_CONFIG_GDN_K5_OPT_UNTUNED}"
-    ):
-        return path
-    return AITER_CONFIGS.AITER_CONFIG_GDN_K5_OPT_UNTUNED_FILE
+_DEFAULT_UNTUNED = (
+    f"{AITER_ROOT_DIR}/aiter/configs/model_configs/"
+    "qwen3_5_35b_chunk_gdn_h_opt_untuned.csv"
+)
 
 
 def _resolve_tuned_config_for_read(path: str) -> str:
@@ -349,7 +342,7 @@ def dataframe_from_cases(selected: list[tuple[str, Any]], *, gfx: str) -> pd.Dat
 class K5BvTuner(TunerCommon):
     ARG_DEFAULTS: ClassVar[dict[str, Any]] = {
         **TunerCommon.ARG_DEFAULTS,
-        "untune_file": f"{AITER_CONFIG_GDN_K5_OPT_UNTUNED}",
+        "untune_file": _DEFAULT_UNTUNED,
         "tune_file": f"{AITER_CONFIG_GDN_K5_OPT}",
         "config_env_name": "AITER_CONFIG_GDN_K5_OPT",
         "warmup": 5,
@@ -395,7 +388,7 @@ class K5BvTuner(TunerCommon):
             self.get_retune_gemm_list(args)
             return
 
-        untuned_rows = read_csv_rows(_resolve_untuned_config(args.untune_file))
+        untuned_rows = read_csv_rows(args.untune_file)
         self._cases = select_cases(load_k5_cases(), untuned_rows, args.case)
         self._case_by_id = {case_id: case for case_id, case in self._cases}
         tuned_read = _resolve_tuned_config_for_read(args.tune_file)
