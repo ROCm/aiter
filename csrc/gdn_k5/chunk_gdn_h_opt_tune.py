@@ -23,7 +23,7 @@ from aiter.jit.core import (
     AITER_CONFIGS,
     AITER_ROOT_DIR,
 )
-from aiter.jit.utils.chip_info import get_gfx_runtime
+from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
 from aiter.ops.flydsl.linear_attention_prefill_kernels import _hipeq_select_bv
 from aiter.ops.flydsl.linear_attention_prefill_kernels import (
     chunk_gated_delta_rule_fwd_h_flydsl_opt as k5,
@@ -40,6 +40,7 @@ _K5_TEST_PATH = (
 )
 LOOKUP_KEYS = (
     "gfx",
+    "cu_num",
     "H",
     "Hg",
     "V",
@@ -192,10 +193,11 @@ def bench_us(args, bv: int, warmup: int, iters: int) -> float:
 
 
 def lookup_key_from_case(
-    case, snapshot_dtype, total_chunks, max_seq_chunks, *, gfx: str
+    case, snapshot_dtype, total_chunks, max_seq_chunks, *, gfx: str, cu_num: int
 ) -> tuple:
     return (
         gfx,
+        cu_num,
         case.H,
         case.Hg,
         case.V,
@@ -220,9 +222,11 @@ def case_to_tuned_row(
     us,
     *,
     gfx: str,
+    cu_num: int,
 ) -> dict[str, Any]:
     return {
         "gfx": gfx,
+        "cu_num": int(cu_num),
         "dtype": str(case.dtype),
         "K": int(case.K),
         "V": int(case.V),
@@ -250,6 +254,7 @@ def sweep_case_row(
     iters: int,
     *,
     gfx: str,
+    cu_num: int,
 ) -> dict[str, Any] | None:
     if case.K != 128 or case.V != 128 or case.BT != 64:
         print(f"{case_id:58s} skipped (kernel supports K=V=128, BT=64 only)")
@@ -287,6 +292,7 @@ def sweep_case_row(
         best,
         times[best],
         gfx=gfx,
+        cu_num=cu_num,
     )
 
 
@@ -315,7 +321,9 @@ def find_case_for_row(cases, row: dict[str, Any]):
     return None
 
 
-def dataframe_from_cases(selected: list[tuple[str, Any]], *, gfx: str) -> pd.DataFrame:
+def dataframe_from_cases(
+    selected: list[tuple[str, Any]], *, gfx: str, cu_num: int
+) -> pd.DataFrame:
     rows = []
     for case_id, case in selected:
         snapshot_dtype = case_snapshot_dtype(case)
@@ -331,6 +339,7 @@ def dataframe_from_cases(selected: list[tuple[str, Any]], *, gfx: str) -> pd.Dat
             bv=0,
             us=0.0,
             gfx=gfx,
+            cu_num=cu_num,
         )
         row["_case_id"] = case_id
         row["BV"] = pd.NA
@@ -394,6 +403,7 @@ class K5BvTuner(TunerCommon):
 
     def pre_process(self, args):
         self._gfx = get_gfx_runtime()
+        self._cu_num = get_cu_num()
         if args.all:
             self.get_retune_gemm_list(args)
             return
@@ -408,7 +418,9 @@ class K5BvTuner(TunerCommon):
             self.tunedf = self.get_tuned_gemm_list(tuned_read)
             return
 
-        self.untunedf = dataframe_from_cases(self._cases, gfx=self._gfx)
+        self.untunedf = dataframe_from_cases(
+            self._cases, gfx=self._gfx, cu_num=self._cu_num
+        )
         self.tunedf = self.get_tuned_gemm_list(tuned_read)
 
         if self.tunedf is not None and not self.tunedf.empty:
@@ -442,7 +454,12 @@ class K5BvTuner(TunerCommon):
             case_id = row["_case_id"]
             case = self._case_by_id[case_id]
             tuned_row = sweep_case_row(
-                case_id, case, args.warmup, args.iters, gfx=self._gfx
+                case_id,
+                case,
+                args.warmup,
+                args.iters,
+                gfx=self._gfx,
+                cu_num=self._cu_num,
             )
             if tuned_row is None:
                 continue
@@ -452,7 +469,12 @@ class K5BvTuner(TunerCommon):
                 case.resolve_context_lens(), batch
             )
             key = lookup_key_from_case(
-                case, snapshot_dtype, total_chunks, max_seq_chunks, gfx=self._gfx
+                case,
+                snapshot_dtype,
+                total_chunks,
+                max_seq_chunks,
+                gfx=self._gfx,
+                cu_num=self._cu_num,
             )
             emitted[key] = tuned_row
             torch.cuda.empty_cache()

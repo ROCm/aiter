@@ -672,8 +672,9 @@ def _load_tuned_bv_table() -> dict[tuple, int]:
                 if not bv:
                     continue  # tuned rows must carry a measured BV
                 gfx = (row.get("gfx") or "").strip()
-                key = (
-                    gfx,
+                cu_raw = (row.get("cu_num") or "").strip()
+                cu_num = int(cu_raw) if cu_raw else None
+                shape_tail = (
                     int(row["H"]),
                     int(row["Hg"]),
                     int(row["V"]),
@@ -685,6 +686,7 @@ def _load_tuned_bv_table() -> dict[tuple, int]:
                     int(row["total_chunks"]),
                     int(row["max_seq_chunks"]),
                 )
+                key = (gfx, cu_num, *shape_tail) if cu_num is not None else (gfx, *shape_tail)
                 bv_int = int(bv)
                 if table.get(key, bv_int) != bv_int:
                     warnings.warn(
@@ -725,6 +727,8 @@ def _tuned_bv(
     """Measured BV for this batch shape, or None to use the rule."""
     if not _BV_TUNED_TABLE:
         return None
+    from aiter.jit.utils.chip_info import get_cu_num
+
     shape_key = (
         H,
         Hg,
@@ -737,10 +741,19 @@ def _tuned_bv(
         total_chunks,
         max_seq_chunks,
     )
+    cu_num = get_cu_num()
     for arch in dict.fromkeys((_GFX_ARCH, "gfx942", "gfx950")):
-        hit = _BV_TUNED_TABLE.get((arch, *shape_key))
+        hit = _BV_TUNED_TABLE.get((arch, cu_num, *shape_key))
         if hit is not None:
             return hit
+        # Same arch, sibling cu_num (e.g. 80 vs 304 on gfx942).
+        for key, bv in _BV_TUNED_TABLE.items():
+            if key[0] != arch:
+                continue
+            if len(key) == 2 + len(shape_key) and key[2:] == shape_key:
+                return bv
+            if len(key) == 1 + len(shape_key) and key[1:] == shape_key:
+                return bv
     return None
 
 

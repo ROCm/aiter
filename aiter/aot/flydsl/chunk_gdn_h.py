@@ -6,13 +6,14 @@
 """AOT pre-compile FlyDSL chunk_gdn_h kernels (vk baseline + opt fork).
 
 ``vk`` reads ``aiter/ops/flydsl/chunk_gdn_h_tuned.csv``; ``opt`` reads
-``model_configs/*_chunk_gdn_h_opt_untuned.csv``. Runtime BV lookup uses
-``AITER_CONFIG_GDN_K5_OPT`` (merged tuned CSV via ``AITER_CONFIGS``).
+``model_configs/*_chunk_gdn_h_opt_untuned.csv`` (shape-only). Runtime BV lookup uses
+``AITER_CONFIG_GDN_K5_OPT`` (merged tuned CSV via ``AITER_CONFIGS``; carries ``cu_num``).
 
 Usage: ``python -m aiter.aot.flydsl.chunk_gdn_h [--kernel vk|opt|all]``
 
 Environment: ``FLYDSL_RUNTIME_CACHE_DIR``, ``FLYDSL_GPU_ARCH``.
-``ARCH``/``GPU_ARCHS`` are banner-only for opt (compile arch comes from CSV ``cu_num``).
+``ARCH``/``GPU_ARCHS`` are banner-only for opt (compile arch comes from host ``cu_num``
+or ``--target-arch``).
 """
 
 from __future__ import annotations
@@ -40,6 +41,7 @@ from aiter.aot.flydsl.common import (
     run_jobs_parallel,
 )
 from aiter.jit.core import AITER_ROOT_DIR
+from aiter.jit.utils.chip_info import get_cu_num
 from aiter.ops.flydsl.kernels.chunk_gated_delta_h import compile_chunk_gated_delta_h
 from aiter.ops.flydsl.kernels.chunk_gated_delta_h_opt import (
     compile_chunk_gated_delta_h_opt,
@@ -368,8 +370,13 @@ def _opt_job_arch(job: dict[str, Any]) -> str:
 
 
 def parse_csv_opt(csv_path: str) -> list[dict[str, Any]]:
-    """Expand opt untuned rows into compile jobs (BV/dtype/layout fan-out)."""
+    """Expand opt untuned rows into compile jobs (BV/dtype/layout fan-out).
+
+    Untuned CSVs are shape-only; compile arch is taken from the host ``cu_num``
+    (or ``--target-arch`` override), not from the CSV.
+    """
     shapes: dict[tuple, None] = {}
+    cu_num = get_cu_num()
 
     with open(csv_path, "r", encoding="utf-8", newline="") as f:
         rows = csv.DictReader(line for line in f if not line.lstrip().startswith("#"))
@@ -388,16 +395,15 @@ def parse_csv_opt(csv_path: str) -> list[dict[str, Any]]:
                 is_varlen = _parse_bool(row.get("is_varlen") or "True")
                 use_h0 = _parse_bool(row.get("use_h0") or "True")
                 store_fs = _parse_bool(row.get("store_fs") or "True")
-                cu_num = int(row.get("cu_num") or 0)
             except (KeyError, TypeError, ValueError) as e:
                 print(f"  [WARN] malformed row in {csv_path}: {e}")
                 continue
 
-            shapes[(cu_num, dtype, K, V, BT, H, Hg, is_varlen, use_h0, store_fs)] = None
+            shapes[(dtype, K, V, BT, H, Hg, is_varlen, use_h0, store_fs)] = None
 
     jobs: list[dict[str, Any]] = []
     seen: set[tuple] = set()
-    for cu_num, dtype, K, V, BT, H, Hg, is_varlen, use_h0, store_fs in shapes:
+    for dtype, K, V, BT, H, Hg, is_varlen, use_h0, store_fs in shapes:
         bvs = [bv for bv in _BV_CANDIDATES if bv <= V and V % bv == 0]
         if not bvs:
             print(f"  [WARN] no legal BV for V={V}, skipping shape in {csv_path}")
