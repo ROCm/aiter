@@ -57,6 +57,9 @@ class Stage2ScatterContext:
     max_tokens_per_rank: int
     world_size: int
     source_token_map: torch.Tensor
+    # MXFP8 combine wire: the gemm2 epilogue quantizes per 1x32 e8m0 before the
+    # P2P write, and ep_combine_fused dequantizes on the way out.
+    combine_quant_fp8: bool = False
 
     def __post_init__(self):
         if self.arena_handle < 0:

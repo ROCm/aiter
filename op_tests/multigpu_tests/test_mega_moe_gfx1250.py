@@ -27,7 +27,7 @@ Launch (4x gfx1250, must build CK-free on gfx1250 -> ENABLE_CK=0):
       -q a8w4_mxfp4 -e 384 -k 6 -hd 7168 -id 3072 --layers 61
     # Set MORI_CCO_BC to a prebuilt libmori_cco_device.bc to skip CCO JIT.
 
-Env / CLI: --layers --logits_tol --acc_verify --dispatch_commu_dtype -tpr -hd -id -e -k --shared_E -q
+Env / CLI: --layers --logits_tol --acc_verify --dispatch_commu_dtype --combine_quant -tpr -hd -id -e -k --shared_E -q
 """
 
 import argparse
@@ -341,6 +341,23 @@ def _rmsnorm(x, eps=1e-6):
     return n.to(x.dtype)
 
 
+def _mxfp8_wire_roundtrip(y, block=32):
+    """Per-32 MXFP8 (e8m0 scale + e4m3) round-trip on one expert's weighted
+    contribution, mirroring what the mxfp8 combine wire does on device: the
+    GEMM2 epilogue quantizes after applying the route weight, and the combine
+    kernel dequantizes before summing. Lets the reference isolate wire-format
+    loss from kernel bugs -- see --ref_combine_quant."""
+    shp = y.shape
+    v = y.reshape(-1, block).float()
+    amax = v.abs().amax(dim=1, keepdim=True)
+    e8m0 = fp4_utils.f32_to_mx_e8m0_scale(
+        amax, dtype=fp4_utils.MxDtypeInt.FP8_E4M3
+    )
+    s = fp4_utils.e8m0_to_f32(e8m0).float()
+    q = (v / s).to(torch.float8_e4m3fn).float() * s
+    return q.reshape(shp).to(y.dtype)
+
+
 def _calc_diff(x, y):
     """1 - cosine similarity (fp64), mirrors test_moe_ep.py::_calc_diff."""
     x, y = x.double(), y.double()
@@ -395,11 +412,12 @@ class RefModel:
     residual. Uses only torch + fp4_utils -- NO mori/cco/fused_moe. Runs in fp32
     on `dev`; for tractable memory/time use a modest token count for --check."""
 
-    def __init__(self, w1_bf, w2_bf, sw1, sw2, spec, dev):
+    def __init__(self, w1_bf, w2_bf, sw1, sw2, spec, dev, wire_quant="none"):
         self.w1_bf, self.w2_bf = w1_bf, w2_bf
         self.sw1, self.sw2 = sw1, sw2
         self.spec = spec
         self.dev = dev
+        self.wire_quant = wire_quant
         self._cache = {}
 
     def _expert(self, g):
@@ -443,7 +461,10 @@ class RefModel:
             rows = sel.any(dim=1)
             w = (wts * sel).sum(dim=1)
             w1d, w2d = self._expert(int(g))
-            out[rows] += w[rows, None] * self._ffn(xn[rows], w1d, w2d)
+            contrib = w[rows, None] * self._ffn(xn[rows], w1d, w2d)
+            if self.wire_quant == "mxfp8":
+                contrib = _mxfp8_wire_roundtrip(contrib)
+            out[rows] += contrib
         return out + self._shared(xn)
 
     def run(self, x0, routings):
@@ -477,6 +498,7 @@ class DeviceMoEPipeline:
         routings,
         ct,
         combine_mode="gather",
+        combine_quant="none",
     ):
         self.dist_ctx = dist_ctx
         self.E, self.hdim, self.idim, self.topk = E, hdim, idim, topk
@@ -487,6 +509,7 @@ class DeviceMoEPipeline:
         self.routings = routings
         self.ct = ct
         self.combine_mode = combine_mode
+        self.combine_quant = combine_quant
         self.EPR = E // dist_ctx.world
         self.dev = torch.device("cuda", dist_ctx.local_rank)
         self.comm = None
@@ -542,6 +565,7 @@ class DeviceMoEPipeline:
                 activation=self.spec["activation"],
                 gate_mode=self.spec["gate_mode"].value,
                 quant_type=self.spec["aiter_qtype"],
+                combine_quant=self.combine_quant,
             )
         else:
             EpDispatchCombineConfig, EpDispatchCombineOp = _import_mori_v2()
@@ -824,6 +848,7 @@ def main():
         routings,
         ct,
         combine_mode=args.combine,
+        combine_quant=args.combine_quant,
     )
     pipe.setup(x0)
     pipe.capture(x0)
@@ -874,7 +899,9 @@ def main():
     accuracy_failure = None
     if args.acc_verify:
         out_dev = pipe.final_output().float()
-        ref = RefModel(w1_bf, w2_bf, sw1, sw2, spec, dev)
+        ref = RefModel(
+            w1_bf, w2_bf, sw1, sw2, spec, dev, wire_quant=args.ref_combine_quant
+        )
         ref_out = ref.run(x0, routings).float()
         logits_diff = _calc_diff(ref_out, out_dev)
         errs = dist_ctx.allreduce_sum(0 if logits_diff < args.logits_tol else 1)
@@ -955,6 +982,23 @@ def _parse_args():
         default=os.environ.get("COMBINE", "gather"),
         help="EP combine mode: gather | scatter | scatter_fused "
         "(gemm2-fused P2P scatter; a8w4 only). Falls back to $COMBINE.",
+    )
+    p.add_argument(
+        "--combine_quant",
+        type=str,
+        choices=["none", "mxfp8"],
+        default=os.environ.get("COMBINE_QUANT", "none"),
+        help="combine wire dtype for scatter_fused: none (bf16) | mxfp8 "
+        "(fp8 e4m3 payload + per-1x32 e8m0 scale). Falls back to $COMBINE_QUANT.",
+    )
+    p.add_argument(
+        "--ref_combine_quant",
+        type=str,
+        choices=["none", "mxfp8"],
+        default="none",
+        help="apply the same combine wire quantization inside the fp32 reference. "
+        "Diagnostic only: with --combine_quant mxfp8 it separates wire-format "
+        "loss (expected) from kernel bugs (not expected).",
     )
     return p.parse_args()
 
