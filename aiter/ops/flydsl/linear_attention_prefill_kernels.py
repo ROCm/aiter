@@ -686,7 +686,11 @@ def _load_tuned_bv_table() -> dict[tuple, int]:
                     int(row["total_chunks"]),
                     int(row["max_seq_chunks"]),
                 )
-                key = (gfx, cu_num, *shape_tail) if cu_num is not None else (gfx, *shape_tail)
+                key = (
+                    (gfx, cu_num, *shape_tail)
+                    if cu_num is not None
+                    else (gfx, *shape_tail)
+                )
                 bv_int = int(bv)
                 if table.get(key, bv_int) != bv_int:
                     warnings.warn(
