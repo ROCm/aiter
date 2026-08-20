@@ -44,6 +44,14 @@ for c in d.get('comments',[]):
     if b: print(f'[COMMENT {c[\"author\"][\"login\"]}] {b[:200]}')
 "
 
+# Mechanical pre-filter for rule D9 (index x stride with no 64-bit widening).
+# It runs HERE, inside the fetch step, and not where D9 is described in Step 5. A scan that
+# Step 5 asks for mid-checklist does not happen: in a 14-PR controlled run the revised D9 text
+# caught 0 of 3 known overflow defects and no run invoked the scanner at all. Put the candidate
+# list in context before the rule pass instead of relying on the reviewer to remember it.
+SCAN=.claude/skills/validate-kernel-pr/scan_index_width.py
+[ -x "$SCAN" ] && "$SCAN" --diff /tmp/pr.diff
+
 # Inline review comments (line-level code comments — often more specific than top-level)
 gh api "repos/$REPO/pulls/$PR/comments" | python3 -c "
 import json,sys
@@ -384,11 +392,7 @@ C++ kernel launcher or Python wrapper computes a buffer offset, record count, or
 Common patterns: `token_id * (num_heads * head_dim)` overflows at token_id > 16M with H=32, D=128; `seq_start * K` overflows for long-context at seq_start > 256K with K=8192; gfx1250 TDM block descriptor count fields computed as Python int default to int64 — a missing `.to(torch.int32)` cast silently produces wrong offsets.
 Trigger (structural, NOT a name list): any **index-shaped value multiplied by a stride-shaped value** that produces a buffer address, record count, or array index, on a line carrying no explicit 64-bit widening (`tl.int64` / `gl.int64` annotation, `.to(tl.int64)`, `Int64(...)`, `int64_t`, `static_cast<int64_t>`). Index-shaped covers anything ending in `_id`/`_idx`/`pid`, or naming a block, row, token, slot, page, or sequence position; stride-shaped covers `stride_*`, `*_pitch`, and per-element/per-row extents. Also fires on a TDM descriptor field feeding block offset computation without an explicit int32 cast.
 **Why the trigger is structural:** an earlier version of this rule listed the names `token_id`, `seq_start`, `batch_offset`, `total_tokens`. Three real defects used none of them — `stride_out_batch`, `block_id`, `physical_block`, `context_kv_idx` — and the rule stayed silent on all three (aiter#1674 ×2, aiter#3541). Do not narrow it back to a name list.
-**Mechanical pre-filter (run it, do not rely on recall):**
-```bash
-.claude/skills/validate-kernel-pr/scan_index_width.py <owner/repo> <PR>
-```
-It lists index×stride sites with no widening and stride-like kernel params with no width annotation. The list is candidates, not findings — clear each one, and fire D9 only where you can name the production scale at which the product exceeds 2^31.
+**The candidate list is already in context.** Step 1 ran `scan_index_width.py` over the diff and printed every index×stride site with no 64-bit widening, plus every stride-like kernel param with no width annotation. Work that list: clear each candidate, and fire D9 only where you can name the production scale at which the product exceeds 2^31. If the list is empty, say so rather than skipping the category silently.
 Real examples: `out_base = token_id * num_heads * head_dim` in int32 overflows at scale (PR#3844); forward kernel uses `Int32(seq_start) * Int32(K)` while the backward kernel correctly uses int64 (PR#4113).
 → `🔴 D9: [index expr] in int32 — widen [index operand] to int64 before multiplying by [stride], overflows at [concrete production scale]`
 
