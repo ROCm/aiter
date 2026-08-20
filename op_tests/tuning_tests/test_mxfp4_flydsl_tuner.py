@@ -695,3 +695,43 @@ def test_post_process_writes_candidate_performance_profile(tmp_path):
     assert profile.loc[0, "us2"] == 16.2901
     assert profile.loc[0, "us"] == 42.2957
     assert profile.loc[0, "e2e_us"] == 145.8825
+
+
+def test_two_wave_specialization_is_restricted_to_bn64():
+    # Mirrors mxfp4_gemm1_kernels._assert_supported: num_waves==2 needs the
+    # effective BN64 tile, which is BM32 A4W4 non-inline separated.
+    assert Mxfp4FlydslTuner._g1_num_waves(32, 64, False, False) == (2, 4)
+    assert Mxfp4FlydslTuner._g1_num_waves(32, 128, False, False) == (4,)
+    assert Mxfp4FlydslTuner._g1_num_waves(32, 256, False, False) == (4,)
+    assert Mxfp4FlydslTuner._g1_num_waves(128, 64, False, False) == (4,)
+    assert Mxfp4FlydslTuner._g1_num_waves(32, 64, True, False) == (4,)
+    assert Mxfp4FlydslTuner._g1_num_waves(32, 64, False, True) == (4,)
+
+
+def test_k_wave_ceiling_follows_the_wave_budget():
+    # The kernel bound is num_waves * k_wave <= 8, so k_wave=4 is reachable
+    # only from the two-wave form. A hardcoded 4 * kw <= 8 used to cap every
+    # candidate at k_wave=2.
+    row = _shape(1)
+    assert Mxfp4FlydslTuner._g1_k_waves(row, 32, False, False, num_waves=4) == (1, 2)
+    assert Mxfp4FlydslTuner._g1_k_waves(row, 32, False, False, num_waves=2) == (
+        1,
+        2,
+        4,
+    )
+
+
+def test_decode_tail_sweeps_bn64_two_wave_candidates():
+    tuner = _tuner()
+    small = _shape(1)
+    names = tuner._a4w4_gemm1_knames(small, 32)
+
+    # (num_waves=2, k_wave=4) measured fastest of every BN64 form at tok<8.
+    assert "flydsl_mxmoe_g1_a4w4_32x64x256_kw4_w2" in names
+    assert any(name.endswith("_w2") for name in names)
+
+    # Above the bound BN64 stays behind G1_TRY_BN64, so the candidate set is
+    # unchanged and the extra axis costs nothing.
+    large = _shape(2048)
+    assert Mxfp4FlydslTuner._g1_bns(large, 32, False, False) == (128, 256)
+    assert not any(name.endswith("_w2") for name in tuner._a4w4_gemm1_knames(large, 32))
