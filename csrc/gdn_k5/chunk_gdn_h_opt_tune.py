@@ -556,7 +556,19 @@ class K5BvTuner(TunerCommon):
             if self.untunedf.empty:
                 print("No shapes to benchmark, nothing to run")
                 return pd.DataFrame()
-            results = self.run_config(args)
+
+            env_name = self.get_arg_defaults().get("config_env_name")
+            if run_config_file:
+                old_val, old_rebuild = self._set_config_env_for_run_config(
+                    args, config_file=run_config_file
+                )
+                try:
+                    results = self.run_config(args)
+                finally:
+                    self._restore_config_env(env_name, old_val, old_rebuild)
+            else:
+                results = self.run_config(args)
+
             self.run_config_failed = any(
                 not str(r.get("status", "")).startswith("ok") for r in results
             )
