@@ -352,7 +352,6 @@ def gen_fmha_fwd_bf16_opus_fwd_fake(
     "module_fmha_fwd_bf16_opus",
     fc_name="fmha_fwd_bf16_opus_fwd",
     gen_fake=gen_fmha_fwd_bf16_opus_fwd_fake,
-    develop=True,
 )
 def _fmha_fwd_bf16_opus_fwd(
     q: Tensor,
