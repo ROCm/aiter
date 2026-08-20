@@ -351,10 +351,8 @@ def tensor_store_gather(
 ) -> None:
     """Issue one TDM gather store (LDS -> Global) for the descriptor's rows."""
     dg4 = _raw(_zero_dgroup_v8i32())
-    cache_policy_attr = (
-        ir.IntegerAttr.get(ir.IntegerType.get_signless(32), cache_policy)
-        if cache_policy
-        else None
+    cache_policy_attr = ir.IntegerAttr.get(
+        ir.IntegerType.get_signless(32), int(cache_policy)
     )
     rocdl.tensor_store_from_lds(
         _raw(desc.dgroup0),
