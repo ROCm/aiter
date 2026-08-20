@@ -30,7 +30,8 @@ void launch_d128(at::Tensor& q,
                  at::Tensor& v,
                  at::Tensor& out,
                  bool causal,
-                 float softmax_scale)
+                 float softmax_scale,
+                 std::optional<at::Tensor>& lse)
 {
     TORCH_CHECK(q.dim() == 4, "q must be 4-D [B, N, H, D], got ndim=", q.dim());
     TORCH_CHECK(k.dim() == 4, "k must be 4-D [B, N, H_KV, D], got ndim=", k.dim());
@@ -88,6 +89,21 @@ void launch_d128(at::Tensor& q,
     }
     kargs.softmax_scale = softmax_scale;  // kernel applies scale * log2(e) to Q
 
+    // Optional LSE (fp32, natural log; one value per (head, query row)). Left as nullptr
+    // when absent, which the kernel reads as "skip the store".
+    if (lse.has_value()) {
+        const at::Tensor& l = *lse;
+        TORCH_CHECK(l.device() == q.device(), "lse must be on the same device as q");
+        TORCH_CHECK(l.scalar_type() == at::kFloat, "lse must be float32");
+        TORCH_CHECK(l.stride(-1) == 1, "lse must be contiguous along the query dim");
+        TORCH_CHECK(l.dim() == 3 && static_cast<int>(l.size(0)) == B &&
+                        static_cast<int>(l.size(1)) == H && static_cast<int>(l.size(2)) == N,
+                    "lse must be [B, H, N]");
+        kargs.ptr_lse      = l.data_ptr();
+        kargs.stride_lse_b = static_cast<int>(l.stride(0));
+        kargs.stride_lse_h = static_cast<int>(l.stride(1));
+    }
+
     HipDeviceGuard guard(q.device().index());
     const hipStream_t stream = at::hip::getCurrentHIPStream();
 
@@ -118,6 +134,7 @@ void launch_d192_v128(at::Tensor& q,
                       at::Tensor& out,
                       bool causal,
                       float softmax_scale,
+                      std::optional<at::Tensor>& lse,
                       std::optional<at::Tensor>& seqstart_q,
                       std::optional<at::Tensor>& seqstart_k,
                       std::optional<at::Tensor>& seqstart_q_pad,
@@ -241,6 +258,29 @@ void launch_d192_v128(at::Tensor& q,
 
     kargs.B = B; kargs.N = N; kargs.N_KV = N_KV; kargs.H = H; kargs.H_KV = H_KV;
 
+    // Optional LSE (fp32, natural log; one value per (head, query row)). Left as
+    // nullptr when absent, which the kernel reads as "skip the store".
+    if (lse.has_value()) {
+        const at::Tensor& l = *lse;
+        TORCH_CHECK(l.device() == q.device(), "lse must be on the same device as q");
+        TORCH_CHECK(l.scalar_type() == at::kFloat, "lse must be float32");
+        TORCH_CHECK(l.stride(-1) == 1, "lse must be contiguous along the query dim");
+        if (is_group) {
+            TORCH_CHECK(l.dim() == 2 && static_cast<int>(l.size(0)) == H &&
+                            l.size(1) == q.size(0),
+                        "group mode lse must be [H, total_q]");
+            kargs.stride_lse_b = 0;
+            kargs.stride_lse_h = static_cast<int>(l.stride(0));
+        } else {
+            TORCH_CHECK(l.dim() == 3 && static_cast<int>(l.size(0)) == B &&
+                            static_cast<int>(l.size(1)) == H && static_cast<int>(l.size(2)) == N,
+                        "batch mode lse must be [B, H, N]");
+            kargs.stride_lse_b = static_cast<int>(l.stride(0));
+            kargs.stride_lse_h = static_cast<int>(l.stride(1));
+        }
+        kargs.ptr_lse = l.data_ptr();
+    }
+
     // Head/tail merge (causal load balance): host is the single source of truth; the
     // kernel reads the OPT_MERGE_HEADTAIL bit and never recomputes it.
     const bool small_shape = (long long)num_q_blocks * H * B < (long long)HEADTAIL_MIN_WG;
@@ -301,6 +341,7 @@ void fmha_fwd_bf16_opus_fwd(at::Tensor& q,
                             at::Tensor& out,
                             bool causal,
                             float softmax_scale,
+                            std::optional<at::Tensor> lse,
                             std::optional<at::Tensor> seqstart_q,
                             std::optional<at::Tensor> seqstart_k,
                             std::optional<at::Tensor> seqstart_q_pad,
@@ -323,9 +364,9 @@ void fmha_fwd_bf16_opus_fwd(at::Tensor& q,
 
     if (D_QK == 128 && D_V == 128) {
         TORCH_CHECK(!is_group, "OPUS D=128 kernel supports batch mode only (no varlen)");
-        launch_d128(q, k, v, out, causal, softmax_scale);
+        launch_d128(q, k, v, out, causal, softmax_scale, lse);
     } else if (D_QK == 192 && D_V == 128) {
-        launch_d192_v128(q, k, v, out, causal, softmax_scale,
+        launch_d192_v128(q, k, v, out, causal, softmax_scale, lse,
                          seqstart_q, seqstart_k, seqstart_q_pad, seqstart_k_pad,
                          max_seqlen_q, max_seqlen_k);
     } else {

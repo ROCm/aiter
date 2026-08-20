@@ -22,6 +22,11 @@ struct opus_gqa_kargs {
     int stride_kv_n;
     int stride_kv_h;
     float softmax_scale;  // QK^T scale (host passes 1/sqrt(D) by default)
+    // Optional fp32 log-sum-exp (natural log) output, [B, H, N] with unit stride along
+    // the query dim. nullptr => not produced (the kernel skips the store).
+    void* __restrict__ ptr_lse;
+    int stride_lse_b;
+    int stride_lse_h;
 };
 
 // Configuration traits for the GQA kernel (tile sizes, data types, vector lengths,

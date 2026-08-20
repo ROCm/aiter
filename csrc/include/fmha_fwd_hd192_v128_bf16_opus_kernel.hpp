@@ -479,6 +479,7 @@ __device__ __attribute__((always_inline)) void gqa_d192_v128_impl(opus_gqa_d192_
     int seqlen_q, seqlen_kv;                 // effective Q / KV lengths for this WG
     int64_t q_batch_base, o_batch_base;      // Q/O base offset (excludes q_block_start & head)
     int64_t k_batch_base, v_batch_base;      // K/V base offset (excludes head)
+    int64_t lse_batch_base;                  // LSE base offset (excludes q_block_start & head)
     int q_block_idx, h;
     if constexpr (T::GROUP_MODE) {
         // Rotated axis order (matches production asm GROUP_MODE): head=x, group=y,
@@ -498,6 +499,7 @@ __device__ __attribute__((always_inline)) void gqa_d192_v128_impl(opus_gqa_d192_
         o_batch_base = qpad * kargs.stride_o_n;
         k_batch_base = kpad * kargs.stride_k_n;
         v_batch_base = kpad * kargs.stride_v_n;
+        lse_batch_base = qpad;                    // [H, total_q]: unit stride along the packed row
         h           = block_id_x();          // head    ← hw x
         q_block_idx = block_id_z();          // Q-block ← hw z (empty tail blocks on slowest axis)
         // short-circuit: drop workgroups past this group's real Q-block count (the
@@ -513,6 +515,7 @@ __device__ __attribute__((always_inline)) void gqa_d192_v128_impl(opus_gqa_d192_
         o_batch_base = (int64_t)b * kargs.stride_o_b;
         k_batch_base = (int64_t)b * kargs.stride_k_b;
         v_batch_base = (int64_t)b * kargs.stride_v_b;
+        lse_batch_base = (int64_t)b * kargs.stride_lse_b;
         q_block_idx = block_id_x();          // config A: q-block=x, head=y, batch=z
         h = block_id_y();
     }
@@ -530,6 +533,11 @@ __device__ __attribute__((always_inline)) void gqa_d192_v128_impl(opus_gqa_d192_
     // fixed up to -inf by the border mask after QK. Capped to the 32-bit descriptor.
     auto rec_bytes = [](int64_t elems) -> unsigned int {
         const int64_t bytes = elems * (int64_t)sizeof(D_ATTN);
+        return bytes >= (int64_t)0xffffffffu ? 0xffffffffu : (unsigned int)bytes;
+    };
+    // Same bound for the fp32 LSE buffer (different element size than D_ATTN).
+    auto rec_bytes_lse = [](int64_t elems) -> unsigned int {
+        const int64_t bytes = elems * (int64_t)sizeof(D_ACC);
         return bytes >= (int64_t)0xffffffffu ? 0xffffffffu : (unsigned int)bytes;
     };
 
@@ -642,12 +650,6 @@ __device__ __attribute__((always_inline)) void gqa_d192_v128_impl(opus_gqa_d192_
 
     // Two full S tiles (ping/pong) so gemm0 of tile t overlaps the softmax of
     // tile t-1, and one full O accumulator (2 super units along D).
-    // P shares storage with the S tile it is cast from (-4 VGPR at the stage2/stage3
-    // peak): stage3 casts vs_prev to P, after which that S tile is dead until the
-    // *next* phase's gemm0 rewrites it at stage1, and gemm1 consumes P at stage5/
-    // stage7 — strictly inside that window. bf16 P is 16 dwords, the low half of the
-    // 32-dword fp32 S tile. Invariant to preserve: never read vs_prev.s once its .p
-    // has been written.
     union s_frag_t {
         vector_t<D_ACC, T::GEMM0_E_N * (T::W_M * T::W_N / T::WARP_SIZE)> s;
         typename decltype(mma1)::vtype_a p;           // full P (spans KV_TILE)
@@ -1031,6 +1033,18 @@ __device__ __attribute__((always_inline)) void gqa_d192_v128_impl(opus_gqa_d192_
 
     // Stagger: the group that skipped the prologue barrier does its extra one here.
     if (!stagger) { __builtin_amdgcn_s_barrier(); }
+
+    // ─── Optional LSE (fp32, natural log) ───
+    if (kargs.ptr_lse != nullptr && lane_id < T::W_M) {
+        constexpr D_ACC LN2 = D_ACC(0.69314718055994531f);   // 1 / log2(e)
+        const D_ACC lse = (l_row > D_ACC(0.0f))
+                              ? ((m_row + __builtin_amdgcn_logf(l_row)) * LN2)
+                              : -opus::numeric_limits<D_ACC>::infinity();
+        auto g_lse = make_gmem(reinterpret_cast<D_ACC*>(kargs.ptr_lse) + lse_batch_base +
+                                   (int64_t)h * kargs.stride_lse_h + q_block_start,
+                               rec_bytes_lse(seqlen_q - q_block_start));
+        g_lse.store(lse, warp_id * T::Q_TILE_SIZE + lane_id);
+    }
 
     // ─── Normalize O and store to gmem ───
     D_ACC l_inv = (l_row > D_ACC(0.0f)) ? (D_ACC(1.0f) / l_row) : D_ACC(0.0f);

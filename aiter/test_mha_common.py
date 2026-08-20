@@ -678,3 +678,40 @@ def attention_ref_with_tol(q, k, v, do, is_fp8=False, **kwargs):
     bwd_tols = [_tol(dq, dq_pt), _tol(dk, dk_pt), _tol(dv, dv_pt)]
 
     return out, (dq, dk, dv), fwd_tol, bwd_tols
+
+
+def opus_ref_lse(q, k, causal):
+    """fp32 logsumexp of the scaled scores (bottom-right causal aligned), GQA-aware.
+
+    attention_ref casts its lse back down to the input dtype, which at |lse| ~ 8 is
+    coarser than the OPUS kernels' own error, so their LSE is checked against this.
+    """
+    seqlen_q, nheads = q.shape[1], q.shape[2]
+    seqlen_k, nheads_k = k.shape[1], k.shape[2]
+    k_rep = k.repeat_interleave(nheads // nheads_k, dim=2)
+    scores = torch.einsum("bthd,bshd->bhts", q.float(), k_rep.float()) * (
+        q.shape[-1] ** -0.5
+    )
+    if causal:
+        off = seqlen_k - seqlen_q
+        row = torch.arange(seqlen_q, device=q.device)[:, None]
+        col = torch.arange(seqlen_k, device=q.device)[None, :]
+        scores = scores.masked_fill(col > row + off, float("-inf"))
+    return torch.logsumexp(scores, dim=-1)
+
+
+def opus_check_lse(tag, lse, lse_ref):
+    """Compare fp32 LSE against opus_ref_lse. 0.01 is the same floor the out checks use:
+    the D=128 kernel folds softmax_scale into Q and rounds back to bf16, so its scores
+    (and hence its LSE) sit ~4e-3 off an fp32 post-scale reference, while D=192 lands at
+    ~1e-6. Any real defect (stale softmax base, wrong layout, missing rescale) is off by
+    >= O(1).
+    """
+    assert lse.dtype == torch.float32, f"{tag}: lse dtype {lse.dtype}, expected float32"
+    assert torch.equal(
+        torch.isneginf(lse), torch.isneginf(lse_ref)
+    ), f"{tag}: -inf (fully-masked row) pattern differs from the reference"
+    finite = ~torch.isneginf(lse_ref)
+    diff = (lse[finite] - lse_ref[finite]).abs().max().item() if finite.any() else 0.0
+    print(f"[{tag}] lse max diff: {diff}")
+    assert diff <= 0.01, f"{tag}: lse diff {diff} > 0.01"

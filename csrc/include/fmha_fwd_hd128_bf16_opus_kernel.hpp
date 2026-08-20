@@ -559,6 +559,9 @@ __device__ __attribute__((always_inline)) void gqa_d128_impl(opus_gqa_kargs karg
     };
     const unsigned int kv_num_records = rec_bytes((int64_t)kargs.N_KV * kargs.stride_kv_n);
     const unsigned int qo_num_records = rec_bytes((int64_t)(kargs.N - q_block_start) * kargs.stride_q_n);
+    // Same bound for the fp32 LSE buffer (different element size than D_ATTN).
+    const unsigned int lse_num_records =
+        (unsigned int)((int64_t)(kargs.N - q_block_start) * (int64_t)sizeof(D_ACC));
 
     // Global memory tensors
     auto g_q = make_gmem(reinterpret_cast<const D_ATTN*>(kargs.ptr_q) + qo_gmem_offset, qo_num_records);
@@ -888,6 +891,23 @@ __device__ __attribute__((always_inline)) void gqa_d128_impl(opus_gqa_kargs karg
     else                          do_epilogue(v_s0, 0);
     __builtin_amdgcn_sched_barrier(0);
 
+    // ──── Optional LSE (fp32, natural log) ────
+    // temperature_scale is folded into v_q in the prologue, so m_row is already in the
+    // log2 domain and lse = ln2 * (m_row + log2(l_row)). The selective max update leaves
+    // m_row below the true row max, but l_row is kept consistent with it and log-sum-exp
+    // is invariant to the base, so this is exact. W_M == 32 with a single permlane32
+    // reduction means lanes L and L+32 carry the same row, so only the low half stores.
+    if (kargs.ptr_lse != nullptr && lane_id < T::W_M) {
+        constexpr D_ACC LN2 = D_ACC(0.69314718055994531f);   // 1 / log2(e)
+        const D_ACC lse = (l_row > D_ACC(0.0f))
+                              ? ((m_row + __builtin_amdgcn_logf(l_row)) * LN2)
+                              : -opus::numeric_limits<D_ACC>::infinity();
+        auto g_lse = make_gmem(reinterpret_cast<D_ACC*>(kargs.ptr_lse) +
+                                   (int64_t)b * kargs.stride_lse_b +
+                                   (int64_t)h * kargs.stride_lse_h + q_block_start,
+                               lse_num_records);
+        g_lse.store(lse, warp_id * T::Q_TILE_SIZE + lane_id);
+    }
 
     // ──── Normalize O and store to gmem ────
     D_ACC l_inv = (l_row > D_ACC(0.0f)) ? (D_ACC(1.0f) / l_row) : D_ACC(0.0f);
