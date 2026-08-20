@@ -3673,7 +3673,9 @@ def torch_moe_stage2(
             # w2: [E, model_dim, inter_dim] -> apply scale per group of inter_dim
             w2 = w2.reshape(E, model_dim, num_groups, group_size)
             w2.mul_(
-                w2_scale.reshape(E, num_groups, model_dim).permute(0, 2, 1).unsqueeze(-1)
+                w2_scale.reshape(E, num_groups, model_dim)
+                .permute(0, 2, 1)
+                .unsqueeze(-1)
             )
             w2 = w2.reshape(w2_shape)
         # activations are bf16, no scaling
