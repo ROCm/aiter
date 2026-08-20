@@ -3507,9 +3507,8 @@ def torch_moe_stage1(
         num_groups = model_dim // group_size
         w1_shape = w1.shape
         # w1: [E, N, K] -> apply scale per group of K
-        w1 = w1.reshape(E, N, num_groups, group_size) * w1_scale.reshape(
-            E, num_groups, N
-        ).permute(0, 2, 1).unsqueeze(-1)
+        w1 = w1.reshape(E, N, num_groups, group_size)
+        w1.mul_(w1_scale.reshape(E, num_groups, N).permute(0, 2, 1).unsqueeze(-1))
         w1 = w1.reshape(w1_shape)
         # activations are bf16, no scaling needed
     elif quant_type == QuantType.per_1x32:
@@ -3635,9 +3634,10 @@ def torch_moe_stage2(
         num_groups = inter_dim // group_size
         w2_shape = w2.shape
         # w2: [E, model_dim, inter_dim] -> apply scale per group of inter_dim
-        w2 = w2.reshape(E, model_dim, num_groups, group_size) * w2_scale.reshape(
-            E, num_groups, model_dim
-        ).permute(0, 2, 1).unsqueeze(-1)
+        w2 = w2.reshape(E, model_dim, num_groups, group_size)
+        w2.mul_(
+            w2_scale.reshape(E, num_groups, model_dim).permute(0, 2, 1).unsqueeze(-1)
+        )
         w2 = w2.reshape(w2_shape)
         # activations are bf16, no scaling
     elif quant_type == QuantType.per_1x32:

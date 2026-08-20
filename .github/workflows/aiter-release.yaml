@@ -117,7 +117,11 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' && !startsWith(github.ref, 'refs/tags/v') }}
 
 jobs:
+  ci_config:
+    uses: ./.github/workflows/ci-config.yaml
+
   build_whl_package:
+    needs: ci_config
     runs-on: ${{ inputs.runner || github.event.inputs.runner }}
     permissions:
       id-token: write
@@ -143,8 +147,8 @@ jobs:
       USE_MANYLINUX: ${{ inputs.use_manylinux || github.event.inputs.use_manylinux || (startsWith(matrix.docker_image, 'pytorch/manylinux') && 'true') || 'false' }}
       TORCH_PIN: ${{ inputs.torch_pin || '' }}
       TORCH_INDEX_URL: ${{ inputs.torch_index_url || '' }}
-      DOCKER_PASSWORD_SECRET: ${{ github.event_name == 'workflow_dispatch' && 'DOCKER_PASSWORD' || '' }}
-      DOCKER_USERNAME: ${{ github.event_name == 'workflow_dispatch' && 'rocmshared' || '' }}
+      DOCKER_USERNAME_SECRET: ${{ github.event_name == 'workflow_dispatch' && needs.ci_config.outputs.docker_username_secret || '' }}
+      DOCKER_PASSWORD_SECRET: ${{ github.event_name == 'workflow_dispatch' && needs.ci_config.outputs.docker_password_secret || '' }}
 
     steps:
       - name: Checkout aiter repo
@@ -174,10 +178,17 @@ jobs:
           git submodule update --init --recursive --depth 1 --jobs 4
 
       - name: Docker login
-        if: ${{ matrix.build_enabled && env.DOCKER_PASSWORD_SECRET != '' }}
+        if: ${{ matrix.build_enabled && env.DOCKER_USERNAME_SECRET != '' && env.DOCKER_PASSWORD_SECRET != '' }}
+        env:
+          DOCKER_USERNAME: ${{ secrets[env.DOCKER_USERNAME_SECRET] }}
+          DOCKER_PASSWORD: ${{ secrets[env.DOCKER_PASSWORD_SECRET] }}
         run: |
-          set -ex
-          echo "${{ secrets[env.DOCKER_PASSWORD_SECRET] }}" | docker login -u "${{ env.DOCKER_USERNAME }}" --password-stdin
+          set -euo pipefail
+          if [ -z "${DOCKER_USERNAME}" ] || [ -z "${DOCKER_PASSWORD}" ]; then
+            echo "::error::Missing Docker Hub credentials"
+            exit 1
+          fi
+          echo "${DOCKER_PASSWORD}" | docker login -u "${DOCKER_USERNAME}" --password-stdin
 
       - name: Generate version with date stamp
         if: ${{ matrix.build_enabled && env.ADD_DATE_STAMP == 'true' }}
