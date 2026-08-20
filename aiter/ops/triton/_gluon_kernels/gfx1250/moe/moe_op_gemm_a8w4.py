@@ -136,8 +136,8 @@ def _moe_gemm_a8w4_decode_persistent(
     grid_m,
     num_blocks_n,
     APPLY_SWIGLU: gl.constexpr,
-    alpha,
-    limit,
+    alpha: gl.constexpr,
+    limit: gl.constexpr,
     ACTIVATION_REDUCTION_N: gl.constexpr,
     SWIGLU_ADD_RESIDUAL: gl.constexpr,
     N_EXPTS_ACT: gl.constexpr,
@@ -223,21 +223,38 @@ def _moe_gemm_a8w4_decode_persistent(
         K_MX = tl.cdiv(K, MX_PACK_DIVISOR)
     SCALE_BLOCK_N_PERSISTENT: gl.constexpr = SCALE_BLOCK_N * N_ITERS
 
-    # -- WMMA layouts (decode uses warp_bases [[0,1],[0,2]]) --
-    WMMA_LAYOUT: gl.constexpr = gl.amd.AMDWMMALayout(
-        3,
-        transposed=True,
-        warp_bases=[[0, 1], [0, 2]],
-        reg_bases=[],
-        instr_shape=[16, 16, 128],
-    )
-    WMMA_LAYOUT_PACKED: gl.constexpr = gl.amd.AMDWMMALayout(
-        3,
-        transposed=True,
-        warp_bases=[[0, 1], [0, 2]],
-        reg_bases=[],
-        instr_shape=[16, 16, 64],
-    )
+    # -- WMMA layouts --
+    if num_warps == 2:
+        WMMA_LAYOUT: gl.constexpr = gl.amd.AMDWMMALayout(
+            3,
+            transposed=True,
+            warp_bases=[[0, 1]],
+            reg_bases=[],
+            instr_shape=[16, 16, 128],
+        )
+        WMMA_LAYOUT_PACKED: gl.constexpr = gl.amd.AMDWMMALayout(
+            3,
+            transposed=True,
+            warp_bases=[[0, 1]],
+            reg_bases=[],
+            instr_shape=[16, 16, 64],
+        )
+    else:
+        WMMA_LAYOUT: gl.constexpr = gl.amd.AMDWMMALayout(
+            3,
+            transposed=True,
+            warp_bases=[[0, 1], [0, 2]],
+            reg_bases=[],
+            instr_shape=[16, 16, 128],
+        )
+        WMMA_LAYOUT_PACKED: gl.constexpr = gl.amd.AMDWMMALayout(
+            3,
+            transposed=True,
+            warp_bases=[[0, 1], [0, 2]],
+            reg_bases=[],
+            instr_shape=[16, 16, 64],
+        )
+
     DOT_LAYOUT_X: gl.constexpr = gl.DotOperandLayout(0, WMMA_LAYOUT, k_width=16)
     DOT_LAYOUT_W: gl.constexpr = gl.DotOperandLayout(1, WMMA_LAYOUT_PACKED, k_width=16)
     DOT_LAYOUT_W_SCALES: gl.constexpr = gl.amd.gfx1250.get_wmma_scale_layout(
@@ -883,8 +900,8 @@ def _moe_gemm_a8w4_decode(
     grid_n,
     # fused activation function
     APPLY_SWIGLU: gl.constexpr,
-    alpha,
-    limit,
+    alpha: gl.constexpr,
+    limit: gl.constexpr,
     ACTIVATION_REDUCTION_N: gl.constexpr,
     SWIGLU_ADD_RESIDUAL: gl.constexpr,
     # MoE config
@@ -1844,8 +1861,8 @@ def _moe_gemm_a8w4_prefill(
     grid_n,
     # fused activation function
     APPLY_SWIGLU: gl.constexpr,
-    alpha,
-    limit,
+    alpha: gl.constexpr,
+    limit: gl.constexpr,
     ACTIVATION_REDUCTION_N: gl.constexpr,
     SWIGLU_ADD_RESIDUAL: gl.constexpr,
     # MoE config

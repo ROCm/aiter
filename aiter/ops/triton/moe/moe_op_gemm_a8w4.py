@@ -284,24 +284,18 @@ def get_kernel_config_gluon(m, n, k, routing_data, out_mx_quant=False):
     w_cache_modifier = ".cg" if block_m <= 32 else None
     split_k = 1
 
-    if block_m == 16 and k <= 768:
-        use_persistent = True
-        persistent_iters = 3
-    else:
-        use_persistent = False
-        persistent_iters = 0
-
     bucket = m2bucket(m)
     tuned = _get_a8w4_dispatch(get_arch())
     key = f"bm{block_m}_n{n}_k{k}_{bucket}"
     if key not in tuned:
         key = f"bm{block_m}_any"
     cfg = tuned[key]
-    block_n, block_k, num_buffers, num_warps = (
+    block_n, block_k, num_buffers, num_warps, persistent_iters = (
         cfg["block_n"],
         cfg["block_k"],
         cfg["num_buffers"],
         cfg["num_warps"],
+        cfg["persistent_iters"],
     )
 
     num_buffers = min(num_buffers, triton.cdiv(k, block_k))
@@ -318,7 +312,6 @@ def get_kernel_config_gluon(m, n, k, routing_data, out_mx_quant=False):
         "split_k": split_k,
         "w_cache_modifier": w_cache_modifier,
         "waves_per_eu": 0,
-        "use_persistent": use_persistent,
         "persistent_iters": persistent_iters,
         "num_ctas": num_ctas,
         "ctas_per_cga": ctas_per_cga,
@@ -479,12 +472,12 @@ def moe_gemm_a8w4(
     # pid grid
     grid_m = routing_data.n_blocks(M, config["block_m"])
     grid_n = triton.cdiv(N, config["block_n"])
-    if use_gluon and config["use_persistent"]:
+    if use_gluon and config["persistent_iters"] > 1:
         num_blocks_n = grid_n
         grid_n = triton.cdiv(num_blocks_n, config["persistent_iters"])
     grid = grid_m * grid_n * config["split_k"]
     # launch kernel
-    if use_gluon and config["use_persistent"]:
+    if use_gluon and config["persistent_iters"] > 1:
         _moe_gemm_a8w4_decode_persistent_gluon[(grid,)](
             y,
             y.stride(1),
