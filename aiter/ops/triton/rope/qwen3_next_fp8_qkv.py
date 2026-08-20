@@ -74,9 +74,10 @@ def qwen3_next_fp8_qkv_prep(
     ``quant_token_start`` is quantized. ``quant_sequence_start`` identifies the
     corresponding first suffix sequence in ``cu_seqlens``.
 
-    The returned descales have shape ``[num_sequences, num_kv_heads]``.
-    Rows before ``quant_sequence_start`` are unspecified and must not be
-    consumed.
+    The returned descales have fixed shape
+    ``[MAX_SEQUENCES, num_kv_heads]`` for compile/CUDA-graph stability. Rows
+    before ``quant_sequence_start`` and rows at or after ``num_sequences`` are
+    unspecified and must not be consumed.
     """
     total_tokens = q_gate.shape[0]
     num_sequences = cu_seqlens.numel() - 1
@@ -178,7 +179,7 @@ def qwen3_next_fp8_qkv_prep(
         device=value.device,
     )
     query_descale = torch.empty(
-        (num_sequences, num_kv_heads),
+        (MAX_SEQUENCES, num_kv_heads),
         dtype=torch.float32,
         device=q_gate.device,
     )
@@ -201,7 +202,7 @@ def qwen3_next_fp8_qkv_prep(
         device=q_gate.device,
     )
     partial_amax = torch.empty(
-        (num_sequences, num_kv_heads, SCALE_NUM_BLOCKS, 3),
+        (MAX_SEQUENCES, num_kv_heads, SCALE_NUM_BLOCKS, 3),
         dtype=torch.float32,
         device=q_gate.device,
     )
