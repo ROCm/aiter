@@ -28,6 +28,9 @@ Example:
 
 from __future__ import annotations
 
+import inspect
+from functools import cache
+
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import arith as std_arith
 from flydsl._mlir.dialects import llvm, rocdl
@@ -118,6 +121,28 @@ def _create_i32_constant(value: int) -> ir.Value:
     attr = ir.IntegerAttr.get(i32_type, value)
     op = std_arith.ConstantOp(i32_type, attr)
     return _unwrap_value(op.result)
+
+
+@cache
+def _aux_is_operand(op_class: type) -> bool:
+    """Whether the op takes ``aux`` as an SSA operand rather than an attribute."""
+    aux = inspect.signature(op_class.__init__).parameters.get("aux")
+    return aux is not None and aux.kind is not inspect.Parameter.KEYWORD_ONLY
+
+
+def _aux_flags(op_class: type, cache_modifier: int):
+    """Build the cache modifier in whichever form ``op_class`` accepts.
+
+    ``rocdl.raw.ptr.buffer.load``/``store`` carry aux as an operand through
+    flydsl 0.3.0 and as a keyword-only attribute from 0.3.1, and aiter builds
+    against both: the wheel image pins a newer flydsl than a working checkout
+    usually has. Handing over the wrong form fails at op construction, so read
+    it off the generated signature. Either form is passed by keyword, which both
+    versions accept.
+    """
+    if _aux_is_operand(op_class):
+        return _create_i32_constant(cache_modifier)
+    return ir.IntegerAttr.get(ir.IntegerType.get_signless(32), cache_modifier)
 
 
 def _to_i32_offset(offset: ir.Value) -> ir.Value:
@@ -585,7 +610,7 @@ def buffer_load(
             [],
         )
 
-    # Create instruction offset and aux flags
+    # Create instruction offset
     if soffset_bytes is None:
         soffset = _create_i32_constant(0)
     else:
@@ -593,9 +618,6 @@ def buffer_load(
             soffset = _create_i32_constant(soffset_bytes)
         else:
             soffset = _to_i32_offset(_unwrap_value(soffset_bytes))
-    # rocdl.raw.ptr.buffer.load takes aux as an operand, not an attribute, so the
-    # cache modifier has to be materialized as an i32 constant.
-    aux_flags = _create_i32_constant(cache_modifier)
 
     # Emit buffer load
     load_op = rocdl.RawPtrBufferLoadOp(
@@ -603,7 +625,7 @@ def buffer_load(
         rsrc,
         offset,
         soffset,
-        aux_flags,
+        aux=_aux_flags(rocdl.RawPtrBufferLoadOp, cache_modifier),
     )
 
     return load_op.result
@@ -673,7 +695,7 @@ def buffer_store(
         op = std_arith.SelectOp(mask, offset, max_offset)
         offset = _unwrap_value(op.result)
 
-    # Create instruction offset (soffset) and aux flags
+    # Create instruction offset (soffset)
     if soffset_bytes is None:
         soffset = _create_i32_constant(0)
     else:
@@ -681,8 +703,6 @@ def buffer_store(
             soffset = _create_i32_constant(int(soffset_bytes))
         else:
             soffset = _to_i32_offset(_unwrap_value(soffset_bytes))
-    # aux is an operand on rocdl.raw.ptr.buffer.store, same as on the load.
-    aux_flags = _create_i32_constant(cache_modifier)
 
     # Emit buffer store
     rocdl.RawPtrBufferStoreOp(
@@ -690,5 +710,5 @@ def buffer_store(
         rsrc,
         offset,
         soffset,
-        aux_flags,
+        aux=_aux_flags(rocdl.RawPtrBufferStoreOp, cache_modifier),
     )
