@@ -2,6 +2,7 @@
 """Windowed communication-fused Stage2 kernels."""
 
 import functools
+from dataclasses import dataclass
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -27,68 +28,86 @@ from .collectives import (
 )
 
 
-M = 32768
 H = 7168
 I = 384
 E = 384
 TOPK = 6
 TP = 8
-TILE_M = 64
-TILE_N = 256
-TILE_K = 128
-WINDOW = 1024
 SLOTS = 2
-TILES_PER_WINDOW = WINDOW // TILE_N
 BLOCK = 256
-LOCAL_WORKERS = 2048
-REDUCE_SCATTER_GRID = 92
-ALL_GATHER_GRID = 91
-SHARD_ROWS = M // TP
-GROUPS_PER_ROW = WINDOW // 32
 
 
-def _compile_compute(window: int, compose=None):
+@dataclass(frozen=True)
+class Config:
+    m: int
+    tile_m: int
+    tile_n: int
+    tile_k: int
+    sort_block_m: int
+    window: int
+    local_workers: int
+    reduce_scatter_grid: int
+    all_gather_grid: int
+
+    @property
+    def shard_rows(self) -> int:
+        return self.m // TP
+
+    @property
+    def tiles_per_window(self) -> int:
+        return self.window // self.tile_n
+
+    @property
+    def groups_per_row(self) -> int:
+        return self.window // 32
+
+
+def _compile_compute(config: Config, window: int, compose=None):
     return compile_mixed_moe_gemm2_common(
         model_dim=H,
         inter_dim=I,
         experts=E,
         topk=TOPK,
-        tile_m=TILE_M,
-        tile_n=TILE_N,
-        tile_k=TILE_K,
+        tile_m=config.tile_m,
+        tile_n=config.tile_n,
+        tile_k=config.tile_k,
         doweight_stage2=True,
         a_dtype="fp8",
         b_dtype="fp4",
         out_dtype="fp8",
         accumulate=False,
         persist_m=1,
+        sort_block_m=config.sort_block_m,
         _n_tile_range=(
-            window * TILES_PER_WINDOW,
-            (window + 1) * TILES_PER_WINDOW,
+            window * config.tiles_per_window,
+            (window + 1) * config.tiles_per_window,
         ),
         _compose_entry=compose,
     )
 
 
 @functools.cache
-def compile_stage2_compute(window: int):
-    """Compile one compact 1024-column Stage2 producer."""
-    return _compile_compute(window)
+def compile_stage2_compute(config: Config, window: int):
+    """Compile one compact Stage2 window."""
+    return _compile_compute(config, window)
 
 
-def _emit_local(route, partial, shared, worker):
+def _emit_local(config: Config, route, partial, shared, worker):
+    m = config.m
+    window = config.window
+    groups_per_row = config.groups_per_row
     work = scf.ForOp(
         arith.index_cast(T.index, worker),
-        arith.constant(M, index=True),
-        arith.constant(LOCAL_WORKERS, index=True),
+        arith.constant(m, index=True),
+        arith.constant(config.local_workers, index=True),
     )
     with ir.InsertionPoint(work.body):
         token = arith.index_cast(T.i32, work.induction_variable)
         tid = fx.Int32(gpu.thread_idx.x)
         column = tid * fx.Int32(8)
-        active = scf.IfOp(arith.cmpi(CmpIPredicate.ult, column, fx.Int32(WINDOW)))
+        active = scf.IfOp(arith.cmpi(CmpIPredicate.ult, column, fx.Int32(window)))
         with ir.InsertionPoint(active.then_block):
-            route_row_bytes = WINDOW + WINDOW // 8
+            route_row_bytes = window + window // 8
             route_row = buffer_ops.create_buffer_resource_from_addr(
                 fx.Int64(ptrtoint(route))
                 + fx.Int64(token) * fx.Int64(TOPK * route_row_bytes),
@@ -106,7 +125,7 @@ def _emit_local(route, partial, shared, worker):
                 )
                 scale = load_e8m0_scale(
                     route_row,
-                    fx.Int32(slot * route_row_bytes + WINDOW)
+                    fx.Int32(slot * route_row_bytes + window)
                     + column // fx.Int32(8),
                     2,
                 )
@@ -146,8 +165,8 @@ def _emit_local(route, partial, shared, worker):
             e8m0, quant_scale = e8m0_scale(local_max)
             packed = pack_fp8_words(acc, quant_scale, 2)
             payload_row = buffer_ops.create_buffer_resource_from_addr(
-                fx.Int64(ptrtoint(partial)) + fx.Int64(token) * fx.Int64(WINDOW),
-                num_records_bytes=WINDOW,
+                fx.Int64(ptrtoint(partial)) + fx.Int64(token) * fx.Int64(window),
+                num_records_bytes=window,
             )
             store_fp8_words(payload_row, column, packed, 2)
             scale_leader = scf.IfOp(
@@ -156,9 +175,9 @@ def _emit_local(route, partial, shared, worker):
             with ir.InsertionPoint(scale_leader.then_block):
                 scale_row = buffer_ops.create_buffer_resource_from_addr(
                     fx.Int64(ptrtoint(partial))
-                    + fx.Int64(M * WINDOW)
-                    + fx.Int64(token) * fx.Int64(GROUPS_PER_ROW),
-                    num_records_bytes=GROUPS_PER_ROW,
+                    + fx.Int64(m * window)
+                    + fx.Int64(token) * fx.Int64(groups_per_row),
+                    num_records_bytes=groups_per_row,
                 )
                 buffer_ops.buffer_store(
                     e8m0.to(fx.Int8),
@@ -171,7 +190,17 @@ def _emit_local(route, partial, shared, worker):
         scf.YieldOp([])
 
 
-def _compose_cycle(*, has_reduce_scatter: bool, has_all_gather: bool):
+def _compose_cycle(
+    config: Config, *, has_reduce_scatter: bool, has_all_gather: bool
+):
+    m = config.m
+    shard_rows = config.shard_rows
+    window = config.window
+    local_workers = config.local_workers
+    reduce_scatter_grid = config.reduce_scatter_grid
+    all_gather_grid = config.all_gather_grid
+    tiles_per_window = config.tiles_per_window
+
     def compose(
         *,
         module_name,
@@ -180,8 +209,9 @@ def _compose_cycle(*, has_reduce_scatter: bool, has_all_gather: bool):
     ):
         @flyc.kernel(
             name=(
-                f"{module_name}_comm_cycle_rs{int(has_reduce_scatter)}"
-                f"ag{int(has_all_gather)}"
+                f"{module_name}_comm_m{m}_w{window}_lw{local_workers}"
+                f"_rs{reduce_scatter_grid}_ag{all_gather_grid}"
+                f"_cycle_rs{int(has_reduce_scatter)}ag{int(has_all_gather)}"
             ),
             known_block_size=[BLOCK, 1, 1],
         )
@@ -239,7 +269,7 @@ def _compose_cycle(*, has_reduce_scatter: bool, has_all_gather: bool):
                 paired = arith.cmpi(
                     CmpIPredicate.ult,
                     linear,
-                    fx.Int32(REDUCE_SCATTER_GRID * 3),
+                    fx.Int32(reduce_scatter_grid * 3),
                 )
                 slot = linear % fx.Int32(3)
                 is_service = arith.andi(
@@ -249,7 +279,7 @@ def _compose_cycle(*, has_reduce_scatter: bool, has_all_gather: bool):
                     arith.cmpi(
                         CmpIPredicate.uge,
                         linear,
-                        fx.Int32(REDUCE_SCATTER_GRID * 3),
+                        fx.Int32(reduce_scatter_grid * 3),
                     ),
                     arith.andi(
                         paired,
@@ -259,7 +289,7 @@ def _compose_cycle(*, has_reduce_scatter: bool, has_all_gather: bool):
                 raw_compute = arith.select(
                     paired,
                     (linear // fx.Int32(3)) * fx.Int32(2) + slot - fx.Int32(1),
-                    linear - fx.Int32(REDUCE_SCATTER_GRID),
+                    linear - fx.Int32(reduce_scatter_grid),
                 )
                 compute_worker = arith.select(is_compute, raw_compute, fx.Int32(0))
                 service_worker = linear // fx.Int32(3)
@@ -275,13 +305,19 @@ def _compose_cycle(*, has_reduce_scatter: bool, has_all_gather: bool):
                 emit_compute(compute_worker)
 
             local_active = arith.cmpi(
-                CmpIPredicate.ult, compute_worker, fx.Int32(LOCAL_WORKERS)
+                CmpIPredicate.ult, compute_worker, fx.Int32(local_workers)
             )
             if const_expr(has_reduce_scatter):
                 local_active = arith.andi(is_compute, local_active)
             local_if = scf.IfOp(local_active)
             with ir.InsertionPoint(local_if.then_block):
-                _emit_local(local_route, local_partial, local_shared, compute_worker)
+                _emit_local(
+                    config,
+                    local_route,
+                    local_partial,
+                    local_shared,
+                    compute_worker,
+                )
                 scf.YieldOp([])
 
             if const_expr(has_reduce_scatter):
@@ -294,20 +330,20 @@ def _compose_cycle(*, has_reduce_scatter: bool, has_all_gather: bool):
                         reduced_scale,
                         rank,
                         service_worker,
-                        tokens=M,
+                        tokens=m,
                         output_width=H,
-                        payload_width=WINDOW,
-                        shard_rows=SHARD_ROWS,
+                        payload_width=window,
+                        shard_rows=shard_rows,
                         tp=TP,
                         block=BLOCK,
-                        reduce_scatter_grid=REDUCE_SCATTER_GRID,
+                        reduce_scatter_grid=reduce_scatter_grid,
                     )
                     if const_expr(has_all_gather):
                         all_gather_if = scf.IfOp(
                             arith.cmpi(
                                 CmpIPredicate.ult,
                                 service_worker,
-                                fx.Int32(ALL_GATHER_GRID),
+                                fx.Int32(all_gather_grid),
                             )
                         )
                         with ir.InsertionPoint(all_gather_if.then_block):
@@ -318,11 +354,11 @@ def _compose_cycle(*, has_reduce_scatter: bool, has_all_gather: bool):
                                 rank,
                                 service_worker,
                                 output_width=H,
-                                payload_width=WINDOW,
-                                shard_rows=SHARD_ROWS,
+                                payload_width=window,
+                                shard_rows=shard_rows,
                                 tp=TP,
                                 block=BLOCK,
-                                all_gather_grid=ALL_GATHER_GRID,
+                                all_gather_grid=all_gather_grid,
                             )
                             scf.YieldOp([])
                     scf.YieldOp([])
@@ -361,10 +397,10 @@ def _compose_cycle(*, has_reduce_scatter: bool, has_all_gather: bool):
             with ir.InsertionPoint(ctx.gpu_module_body):
                 allocator.finalize()
             compute_workers = arith.index_cast(T.index, size_expert_ids) * arith.constant(
-                TILES_PER_WINDOW, index=True
+                tiles_per_window, index=True
             )
             grid = compute_workers + arith.constant(
-                REDUCE_SCATTER_GRID if has_reduce_scatter else 0,
+                reduce_scatter_grid if has_reduce_scatter else 0,
                 index=True,
             )
             kernel(
@@ -402,14 +438,17 @@ def _compose_cycle(*, has_reduce_scatter: bool, has_all_gather: bool):
 
 @functools.cache
 def compile_stage2_cycle(
+    config: Config,
     window: int,
     has_reduce_scatter: bool,
     has_all_gather: bool,
 ):
     """Compile G/L with optional TP reduce-scatter/all-gather service CTAs."""
     return _compile_compute(
+        config,
         window,
         _compose_cycle(
+            config,
             has_reduce_scatter=has_reduce_scatter,
             has_all_gather=has_all_gather,
         ),
@@ -418,15 +457,24 @@ def compile_stage2_cycle(
 
 @functools.cache
 def compile_stage2_drain(
+    config: Config,
     has_local: bool,
     has_reduce_scatter: bool,
     has_all_gather: bool,
 ):
     """Compile the fixed pipeline tail without reserving GEMM LDS."""
+    m = config.m
+    shard_rows = config.shard_rows
+    window = config.window
+    local_workers = config.local_workers
+    reduce_scatter_grid = config.reduce_scatter_grid
+    all_gather_grid = config.all_gather_grid
 
     @flyc.kernel(
         name=(
-            f"comm_fused_moe_window_drain_l{int(has_local)}"
+            f"comm_fused_moe_m{m}_w{window}_lw{local_workers}"
+            f"_rs{reduce_scatter_grid}_ag{all_gather_grid}"
+            f"_drain_l{int(has_local)}"
             f"rs{int(has_reduce_scatter)}ag{int(has_all_gather)}"
         ),
         known_block_size=[BLOCK, 1, 1],
@@ -450,7 +498,7 @@ def compile_stage2_drain(
                 arith.cmpi(
                     CmpIPredicate.ult,
                     worker,
-                    fx.Int32(REDUCE_SCATTER_GRID),
+                    fx.Int32(reduce_scatter_grid),
                 )
             )
             with ir.InsertionPoint(reduce_scatter_if.then_block):
@@ -461,20 +509,20 @@ def compile_stage2_drain(
                     reduced_scale,
                     rank,
                     worker,
-                    tokens=M,
+                    tokens=m,
                     output_width=H,
-                    payload_width=WINDOW,
-                    shard_rows=SHARD_ROWS,
+                    payload_width=window,
+                    shard_rows=shard_rows,
                     tp=TP,
                     block=BLOCK,
-                    reduce_scatter_grid=REDUCE_SCATTER_GRID,
+                    reduce_scatter_grid=reduce_scatter_grid,
                 )
                 if const_expr(has_all_gather):
                     all_gather_if = scf.IfOp(
                         arith.cmpi(
                             CmpIPredicate.ult,
                             worker,
-                            fx.Int32(ALL_GATHER_GRID),
+                            fx.Int32(all_gather_grid),
                         )
                     )
                     with ir.InsertionPoint(all_gather_if.then_block):
@@ -485,11 +533,11 @@ def compile_stage2_drain(
                             rank,
                             worker,
                             output_width=H,
-                            payload_width=WINDOW,
-                            shard_rows=SHARD_ROWS,
+                            payload_width=window,
+                            shard_rows=shard_rows,
                             tp=TP,
                             block=BLOCK,
-                            all_gather_grid=ALL_GATHER_GRID,
+                            all_gather_grid=all_gather_grid,
                         )
                         scf.YieldOp([])
                 scf.YieldOp([])
@@ -501,28 +549,28 @@ def compile_stage2_drain(
                 rank,
                 worker,
                 output_width=H,
-                payload_width=WINDOW,
-                shard_rows=SHARD_ROWS,
+                payload_width=window,
+                shard_rows=shard_rows,
                 tp=TP,
                 block=BLOCK,
-                all_gather_grid=ALL_GATHER_GRID,
+                all_gather_grid=all_gather_grid,
             )
 
         if const_expr(has_local):
             local_worker = worker - fx.Int32(
-                REDUCE_SCATTER_GRID if has_reduce_scatter else 0
+                reduce_scatter_grid if has_reduce_scatter else 0
             )
             local_if = scf.IfOp(
                 arith.cmpi(
                     CmpIPredicate.uge,
                     worker,
                     fx.Int32(
-                        REDUCE_SCATTER_GRID if has_reduce_scatter else 0
+                        reduce_scatter_grid if has_reduce_scatter else 0
                     ),
                 )
             )
             with ir.InsertionPoint(local_if.then_block):
-                _emit_local(route, partial, shared, local_worker)
+                _emit_local(config, route, partial, shared, local_worker)
                 scf.YieldOp([])
 
     @flyc.jit
@@ -541,9 +589,9 @@ def compile_stage2_drain(
         stream,
     ):
         service_grid = (
-            REDUCE_SCATTER_GRID
+            reduce_scatter_grid
             if has_reduce_scatter
-            else ALL_GATHER_GRID
+            else all_gather_grid
             if has_all_gather
             else 0
         )
@@ -560,7 +608,7 @@ def compile_stage2_drain(
             gathered_output,
             rank,
         ).launch(
-            grid=(service_grid + (LOCAL_WORKERS if has_local else 0), 1, 1),
+            grid=(service_grid + (local_workers if has_local else 0), 1, 1),
             block=(BLOCK, 1, 1),
             stream=stream,
         )

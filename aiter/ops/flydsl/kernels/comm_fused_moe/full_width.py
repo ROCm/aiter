@@ -2,6 +2,7 @@
 """Full-width communication-fused Stage2 kernels."""
 
 import functools
+from dataclasses import dataclass
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -26,50 +27,60 @@ from .collectives import (
 )
 
 
-M = 2048
 H = 7168
 I = 384
 E = 384
 TOPK = 6
 TP = 8
-TILE_M = 32
-TILE_N = 256
-TILE_K = 128
-SORT_BLOCK_M = 64
-SHARD_ROWS = M // TP
 BLOCK = 256
-REDUCE_SCATTER_GRID = 128
-ALL_GATHER_GRID = 126
 VECTOR_WIDTH = 8
 GROUPS_PER_ROW = H // 32
 LOCAL_COLUMN_TILES = (H + BLOCK * VECTOR_WIDTH - 1) // (
     BLOCK * VECTOR_WIDTH
 )
-LOCAL_WORKERS = M * LOCAL_COLUMN_TILES
+
+
+@dataclass(frozen=True)
+class Config:
+    m: int
+    tile_m: int
+    tile_n: int
+    tile_k: int
+    sort_block_m: int
+    reduce_scatter_grid: int
+    all_gather_grid: int
+
+    @property
+    def shard_rows(self) -> int:
+        return self.m // TP
+
+    @property
+    def local_workers(self) -> int:
+        return self.m * LOCAL_COLUMN_TILES
 
 
 @functools.cache
-def compile_stage2_compute():
+def compile_stage2_compute(config: Config):
     """Compile the full-width compact Stage2 producer."""
     return compile_mixed_moe_gemm2_common(
         model_dim=H,
         inter_dim=I,
         experts=E,
         topk=TOPK,
-        tile_m=TILE_M,
-        tile_n=TILE_N,
-        tile_k=TILE_K,
+        tile_m=config.tile_m,
+        tile_n=config.tile_n,
+        tile_k=config.tile_k,
         doweight_stage2=True,
         a_dtype="fp8",
         b_dtype="fp4",
         out_dtype="fp8",
         accumulate=False,
         persist_m=1,
-        sort_block_m=SORT_BLOCK_M,
+        sort_block_m=config.sort_block_m,
     )
 
 
-def _emit_local_reduce(route, partial, shared, token, column_base):
+def _emit_local_reduce(m, route, partial, shared, token, column_base):
     """Reduce six routed rows plus the local shared partial into MXFP8."""
     route_row_bytes = H + H // 8
     tid = fx.Int32(gpu.thread_idx.x)
@@ -154,7 +165,7 @@ def _emit_local_reduce(route, partial, shared, token, column_base):
         with ir.InsertionPoint(scale_leader.then_block):
             scale_addr = (
                 fx.Int64(ptrtoint(partial))
-                + fx.Int64(M * H)
+                + fx.Int64(m * H)
                 + fx.Int64(token) * fx.Int64(GROUPS_PER_ROW)
             )
             scale_row = buffer_ops.create_buffer_resource_from_addr(
@@ -170,17 +181,18 @@ def _emit_local_reduce(route, partial, shared, token, column_base):
         scf.YieldOp([])
 
 
-def _emit_local_worker(route, partial, shared, worker):
+def _emit_local_worker(m, local_workers, route, partial, shared, worker):
     work = scf.ForOp(
         arith.index_cast(T.index, worker),
-        arith.constant(M * LOCAL_COLUMN_TILES, index=True),
-        arith.constant(LOCAL_WORKERS, index=True),
+        arith.constant(m * LOCAL_COLUMN_TILES, index=True),
+        arith.constant(local_workers, index=True),
     )
     with ir.InsertionPoint(work.body):
         item = arith.index_cast(T.i32, work.induction_variable)
         token = item // fx.Int32(LOCAL_COLUMN_TILES)
         tile = item - token * fx.Int32(LOCAL_COLUMN_TILES)
         _emit_local_reduce(
+            m,
             route,
             partial,
             shared,
@@ -191,21 +203,28 @@ def _emit_local_worker(route, partial, shared, worker):
 
 
 @functools.cache
-def compile_stage2_local_reduce():
+def compile_stage2_local_reduce(config: Config):
     """Compile the local route/shared reduction."""
+    m = config.m
+    local_workers = config.local_workers
 
-    @flyc.kernel(name="comm_fused_moe_local", known_block_size=[BLOCK, 1, 1])
+    @flyc.kernel(
+        name=f"comm_fused_moe_m{m}_local",
+        known_block_size=[BLOCK, 1, 1],
+    )
     def kernel(
         route: fx.Pointer,
         partial: fx.Pointer,
         shared: fx.Pointer,
     ):
-        _emit_local_worker(route, partial, shared, fx.Int32(gpu.block_idx.x))
+        _emit_local_worker(
+            m, local_workers, route, partial, shared, fx.Int32(gpu.block_idx.x)
+        )
 
     @flyc.jit
     def launch(route, partial, shared, stream):
         kernel(route, partial, shared).launch(
-            grid=(LOCAL_WORKERS, 1, 1),
+            grid=(local_workers, 1, 1),
             block=(BLOCK, 1, 1),
             stream=stream,
         )
@@ -214,11 +233,13 @@ def compile_stage2_local_reduce():
 
 
 @functools.cache
-def compile_stage2_tp_reduce_scatter():
+def compile_stage2_tp_reduce_scatter(config: Config):
     """Compile the TP reduce-scatter and reduced MXFP8 publication."""
+    m = config.m
+    shard_rows = config.shard_rows
 
     @flyc.kernel(
-        name="comm_fused_moe_tp_reduce_scatter",
+        name=f"comm_fused_moe_m{m}_rs{config.reduce_scatter_grid}",
         known_block_size=[BLOCK, 1, 1],
     )
     def kernel(
@@ -235,19 +256,19 @@ def compile_stage2_tp_reduce_scatter():
             scales,
             rank,
             fx.Int32(gpu.block_idx.x),
-            tokens=M,
+            tokens=m,
             output_width=H,
             payload_width=H,
-            shard_rows=SHARD_ROWS,
+            shard_rows=shard_rows,
             tp=TP,
             block=BLOCK,
-            reduce_scatter_grid=REDUCE_SCATTER_GRID,
+            reduce_scatter_grid=config.reduce_scatter_grid,
         )
 
     @flyc.jit
     def launch(flat_base, output, payload, scales, rank, stream):
         kernel(flat_base, output, payload, scales, rank).launch(
-            grid=(REDUCE_SCATTER_GRID, 1, 1),
+            grid=(config.reduce_scatter_grid, 1, 1),
             block=(BLOCK, 1, 1),
             stream=stream,
         )
@@ -256,11 +277,13 @@ def compile_stage2_tp_reduce_scatter():
 
 
 @functools.cache
-def compile_stage2_tp_all_gather():
+def compile_stage2_tp_all_gather(config: Config):
     """Compile the TP all-gather of reduced shards."""
+    m = config.m
+    shard_rows = config.shard_rows
 
     @flyc.kernel(
-        name="comm_fused_moe_tp_all_gather",
+        name=f"comm_fused_moe_m{m}_ag{config.all_gather_grid}",
         known_block_size=[BLOCK, 1, 1],
     )
     def kernel(
@@ -277,16 +300,16 @@ def compile_stage2_tp_all_gather():
             fx.Int32(gpu.block_idx.x),
             output_width=H,
             payload_width=H,
-            shard_rows=SHARD_ROWS,
+            shard_rows=shard_rows,
             tp=TP,
             block=BLOCK,
-            all_gather_grid=ALL_GATHER_GRID,
+            all_gather_grid=config.all_gather_grid,
         )
 
     @flyc.jit
     def launch(payload_flat_base, scale_flat_base, output, rank, stream):
         kernel(payload_flat_base, scale_flat_base, output, rank).launch(
-            grid=(ALL_GATHER_GRID, 1, 1),
+            grid=(config.all_gather_grid, 1, 1),
             block=(BLOCK, 1, 1),
             stream=stream,
         )

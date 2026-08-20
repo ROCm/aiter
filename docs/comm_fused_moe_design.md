@@ -1,472 +1,240 @@
-# 通算融合 MoE：轻量设计与实现计划
+# 通算融合 MoE：轻量生产架构与离线 Tuner
 
-## 1. 一句话目标
+## 1. 目标
 
-保留普通 MoE 已经成熟的 routing、sort、Stage1、量化和权重布局，只替换：
+普通 MoE 已经有成熟的 routing、sort、Stage1、量化和权重布局。通算融合只替换：
 
 ```text
-Stage2 GEMM + shared partial + TP AllReduce
+Stage2 GEMM + shared partial + TP communication
 ```
 
-模型初始化时直接选择普通 `FusedMoE` 或 `CommFusedMoe`。普通路径不经过新
-selector，也不承担额外开销。
+第一版必须同时满足：
 
-## 2. 第一版只保留三层
+- 现有 M=256～32768 的精度和性能不回退；
+- forward 中不调优、不 fallback、不查复杂配置；
+- 新增 M 只增加 winner 数据，不增加一套新代码；
+- 新模型、新 shape、Opus 或 ASM 后端可以沿用同一接入边界。
+
+## 2. 三层边界
 
 ```text
-模型层（ATOM）
-  选择 FusedMoE / CommFusedMoe
-          │
+ATOM
+  初始化时选择普通 FusedMoE 或 CommFusedMoe
+        ↓
 AITer 公共层
-  复用普通 MoE 到 Stage1，调用一个 _stage2_override
-          │
-后端层
-  FlyDSL runner；以后可增加 Opus / ASM runner
+  复用普通 MoE 到 Stage1，通过 _stage2_override 接管 Stage2
+        ↓
+后端 runner
+  FlyDSL full-width / windowed / persistent-window
+  以后可以增加 Opus / ASM
 ```
 
-公共层不理解 FlyDSL tile、Opus kernel id 或 ASM 参数。后端只需准备按 token
-bucket 索引的 runner，并返回完整 `[M, H]` 结果。
+普通模型没有传 `_stage2_override`，执行路径不变。选择 `comm_fused` 后缺少 exact
+shape 或 M winner 直接报错，不在融合路径里静默回退普通 Stage2。
 
-## 3. 核心接口
+本轮只重构 AITer FlyDSL backend，不修改 ATOM 接口和模型适配。
 
-`aiter/fused_moe.py` 只增加一个内部参数：
+## 3. 当前文件职责
 
-```python
-_stage2_override: Callable | None = None
-```
-
-- `None`：完全执行原 Stage2，返回原 `moe_out`。
-- 非 `None`：把 Stage2 参数交给 override；override 直接返回完成通信后的
-  `[M, H]`。
-
-不再保留 `_stage2_transform`、`_stage2_returns_output` 两个开关。
-
-公共 `CommFusedMoeRuntime` 只做两件事：
-
-1. 按 token bucket 找已经准备好的 runner。
-2. 必要时补齐输入并执行融合 Stage2。
-
-选择 `comm_fused` 后不再静默回退。缺少 runner 说明该模型或 shape 尚未接入，
-直接报错。
-
-没有 Protocol、全局 backend registry、在线 tuner、通用 manifest 解析或复杂
-运行时校验。
-
-## 4. 为什么普通 MoE 仍需一个小改动
-
-通算融合只替换 Stage2，前面的 routing、sort、Stage1 和中间量化仍属于普通
-MoE。复制这些逻辑会产生两套实现，精度和性能配置容易漂移。
-
-因此模型层负责“选哪条路”，`fused_moe.py` 的单一 seam 负责“在哪一行接管
-Stage2”。普通模型没有传 `_stage2_override`，执行路径与原来一致。
-
-## 5. 文件边界
-
-### AITer
-
-| 文件 | 作用 |
+| 文件 | 唯一职责 |
 | --- | --- |
-| `aiter/fused_moe.py` | 单一 `_stage2_override` seam |
-| `aiter/ops/comm_fused_moe_runtime.py` | 轻量 runner 选择、padding 和调用 |
-| `aiter/ops/flydsl/comm_fused_moe_host.py` | FlyDSL workspace、MORI 资源和 runner launch |
-| `aiter/ops/flydsl/kernels/comm_fused_moe/full_width.py` | 当前 full-width winner 的 G/L/RS/AG kernel |
-| `aiter/configs/model_configs/...` | 只保存离线确认过的 winner |
+| `aiter/ops/flydsl/comm_fused_moe_host.py` | CSV exact lookup、通信资源、三种真实 pipeline 和 lazy runner cache |
+| `op_tests/multigpu_tests/tune_comm_fused_moe.py` | 离线候选、完整 pipeline 测量、精度 gate 和 CSV 输出 |
+| `aiter/configs/comm_fused_moe.csv` | 所有 production winner |
+| `aiter/ops/flydsl/kernels/comm_fused_moe/*.py` | 三种 GPU 算法，不保存 production bucket 表 |
 
-当前 FlyDSL runner 只依赖两类已有基础设施：
+生产包只保留 host、winner CSV 和 kernel。离线 tuner 位于 `op_tests`，不会被生产路径导入。
+没有独立 runners package，也不再为 spec、factory、common 和每个 runner 建文件。GPU 算法
+仍按 full/window/persistent 分成三个 kernel 文件。
 
-- `torch.symm_mem` 提供 cached VMM workspace，MORI CCO external window 提供 peer 地址；
-- FlyDSL 增加 system-scope epoch wait，`buffer_ops` 适配当前 ROCDL cache operand。
+这里没有为了压低 `host.py` 行数把代码搬到别处。buffer 注册、launch 顺序、barrier 和三种
+pipeline 都是真实 host runtime，因此保留在一个文件中；新增 shape/M 不会继续增加这些代码。
 
-MORI 和 custom AR 都不需要为融合算子新增接口。FlyDSL 改动由真实 GPU 失败或性能结果
-证明是必需项，不属于线上 tuner 或通用框架。
+## 4. Production winner 数据
 
-### ATOM
-
-| 文件 | 作用 |
-| --- | --- |
-| `atom/model_ops/fused_moe/comm_fused_moe.py` | 模型 adapter，复用 routing 和权重 |
-| `atom/models/deepseek_v4.py` | 初始化时选类；融合 shared partial；跳过外层 AR |
-| `atom/config.py`、`arg_utils.py` | 暴露 `moe_backend=comm_fused` |
-
-## 6. 新模型或新 shape 如何接入
-
-不要修改公共运行时。只做下面四步：
-
-1. 记录模型契约：`H、I/TP、E、topk、dtype、quant、TP、activation`。
-2. 为需要的 token buckets 离线测试候选 kernel。
-3. 只把精度和性能通过的 winner 做成 prepared runner。
-4. 模型初始化时构造 `CommFusedMoe`，把这些 runners 交给公共层。
-
-只有 runner 覆盖完整服务 token buckets 后才启用 `comm_fused`。缺少 winner 的
-模型或 shape 继续在模型配置层选择普通 `FusedMoE`，不会在融合路径里静默回退。
-
-## 7. Tuner 流程
-
-Tuner 不进入线上推理，也不决定模型走哪条路。
+生产路径只做两层 exact 映射：
 
 ```text
-生成候选参数
-  → 与普通 Stage2 + AR 做精度比较
-  → 测完整输出耗时
-  → 选择稳定胜出的 winner
-  → 写入后端配置
-  → 启动时准备 runner
+ShapeKey
+  gfx
+  H
+  I_per_tp
+  experts
+  topk
+  TP
+  activation dtype
+  weight dtype
+       ↓
+padded M → winner row → kernel Config
 ```
 
-第一版 tuner 只需要：shape 输入、候选枚举、正确性比较、计时和 winner 输出。
-promotion report、lower-bound 报告、复杂 schema、在线搜索等以后确有需要再加。
+winner 直接保存在一个 CSV 中，每行对应一个 exact ShapeKey/M：
 
-FlyDSL、Opus、ASM 各自维护候选参数和 runner 构造；公共层只接收最终 runner。
+```csv
+gfx,...,m,kid,family,tile_m,tile_n,tile_k,sort_block_m,window,...
+gfx950,...,256,full_tm32_...,full,32,256,128,32,,...
+gfx950,...,8192,window_tm64_...,window,64,256,128,64,1024,...
+gfx950,...,32768,persistent_tm64_...,persistent,64,256,128,64,1024,...
+```
 
-## 8. Shared expert
-
-DeepSeek-V4 的 shared expert 保持独立计算：
+KID 只保存独立调优参数：
 
 ```text
-shared W2 partial ─┐
-                   ├─ 融合 Stage2 + TP 通信 → 完整输出
-routed Stage2 ─────┘
+family
+tile_m / tile_n / tile_k
+sort_block_m
+window
+local_workers
+reduce-scatter grid
+all-gather grid
+service grid
 ```
 
-shared W2 先生成普通 partial。融合 runner 提供固定 buffer，AITer 公共层在
-Stage2 前完成 padding 和复制，再由 runner 完成融合计算与通信。
-
-## 9. 实现步骤
-
-### 第一步：公共 seam 和模型选路
-
-- AITer 分支统一为 `yifehuan/comm_fused_moe`。
-- 385 行旧公共文件改为轻量 `comm_fused_moe_runtime.py`。
-- 双开关收敛为 `_stage2_override`。
-- ATOM 在 DeepSeek-V4 初始化时直接选择 `FusedMoE` 或 `CommFusedMoe`。
-- shared expert 保持原 Linear 调用，不修改通用 LinearBase。
-
-状态：已完成公共 seam 和严格模型选路；安装融合 runner 前不会启用
-`comm_fused` 执行。
-
-### 第二步：重新实现 FlyDSL backend
-
-- 只读参考备份分支中的 kernel 行为、shape 和已验证参数。
-- 不整文件恢复旧 `moe_tp_stage2.py`、旧 tuner 或旧低层文件。
-- 新建轻量 FlyDSL runner，将已准备 runner 交给公共层。
-- 第一版只接入 DeepSeek-V4 TP8 的 M=2048 winner：
+下面这些值必须由代码推导，不能写进 winner：
 
 ```text
-G：完整 H 的 Stage2 GEMM
-  → L：本 rank route reduce + shared partial + MXFP8
-  → epoch
-  → RS：TP reduce-scatter + reduced BF16/MXFP8 shard
-  → epoch
-  → AG：all-gather reduced shard 到各 TP rank
+shard_rows
+tiles_per_window
+phases
+workspace bytes
+payload / scale stride
+epoch / gate / ready offset
 ```
 
-- 固定契约：`M=2048, H=7168, I/TP=384, E=384, topk=6, TP=8`。
-- 固定已测调度：`32x256x128, REDUCE_SCATTER_GRID=128, ALL_GATHER_GRID=126,
-  LOCAL_WORKERS=640`。
-- cached `torch.symm_mem` tensor 通过已有 MORI CCO external window 映射到 flat VA；kernel
-  直接按固定 rank stride 计算 peer 地址，不使用 MORI symmetric heap，也不扩展 custom AR。
-- 没有动态 window、service kind、persistent/XCD 分支、在线 fallback、planner 或 tuner。
+初始化时使用标准库 `csv` 读取一次并缓存。CSV 行直接构造对应 kernel 文件定义的
+`Config`；KID 只是可读、可追踪的参数标识，不再额外维护一套 `Spec`。forward 只访问已经
+构造好的 runner，不解析 CSV。新增 M 只增加一行 winner。
 
-状态：第一版 production bucket 已完成。runner 只保留 workspace、peer 映射和固定
-launch；kernel 的主体是 FP8/MXFP8 解码、归约、量化和 all-gather 的实际 GPU 算法，不是
-通用框架代码。
+## 5. 为什么不用现有重型 tuner
 
-GPU 结果（MI355X TP8）：
+普通 FMoE 的 `TunerCommon` 解决 CSV 合并、pandas、多进程、在线补调、fallback 和多算子
+兼容，远大于当前需要。MegaMoE 的大量 shape 启发式也不适合作为 exact production
+winner。
+
+本设计只借鉴三点：
+
+- Opus：torch-free、结构化 KID metadata；
+- FlyDSL：显式 `kernel name -> compile params` 候选；
+- Triton：winner 数据和算法代码分离，启动时缓存。
+
+不恢复旧 `moe_tp_stage2_tuner.py`，生产路径也不 import tuner。
+
+## 6. 轻量离线 tuner
+
+`op_tests/multigpu_tests/tune_comm_fused_moe.py` 提供四类能力：
+
+1. `full_width_candidates(...)`
+2. `windowed_candidates(...)`
+3. `persistent_window_candidates(...)`
+4. `benchmark(...) / select_winner(...) / winner_row(...) / write_winner(...)`
+
+候选生成器只做独立参数的笛卡尔积，不把派生 layout 值暴露给调参脚本。tuner 和生产端
+直接复用 `full_width.Config`、`windowed.Config`、`persistent_window.Config`，不存在重复的
+tuner spec 数据模型。
+
+单个 candidate 的测量流程固定为：
 
 ```text
-精度：max_abs=0.75, rel_l2=0.029969
-eager：310.360 us → 271.384 us，1.1436x
-CUDA Graph：293.277 us → 269.107 us，1.0898x
+用 production create_runner 创建 runner
+  → 运行完整 Stage2 + shared partial + TP communication
+  → 对比普通 Stage2 + shared + BF16 AllReduce reference
+  → max_abs / rel_l2 精度 gate
+  → 用 TP graph_capture 捕获完整 pipeline
+  → 多轮计时并取 TP8 rank-max median
+  → 输出 TuningResult
 ```
 
-普通 Opus、普通 FlyDSL A8W4 Stage2 和 MegaMoE TP8 回归均通过。更多 token bucket
-不在运行时猜参数，按第三步流程逐个离线加入。
-
-### 第三步：轻量离线 tuner
-
-- 从一个明确 shape 开始枚举。
-- 比较完整 `Stage2 + shared + AR` 输出和耗时。
-- 配置文件只保存 winner，不保存运行时不需要的报告字段。
-- 每增加一个 bucket，只新增经过验证的 workspace 尺寸、kernel 编译参数和 runner
-  映射；不修改公共 runtime，也不让未覆盖 bucket 静默走普通路径。
-
-### 第四步：整网验证
-
-- 普通 backend 精度与性能回归。
-- `comm_fused` eager、CUDA Graph、随机 M、hash routing 和 shared expert 精度。
-- 各 TP 下逐 bucket 对比备份版本的性能，确认没有回退。
-
-### 第五步：扩展 Opus / ASM
-
-- 新后端实现相同 runner 调用契约。
-- 模型层和 `fused_moe.py` 不再修改。
-- 同一 shape 可离线比较多个后端，只部署最终 winner。
-
-## 10. 第一版明确不做
-
-- 不在线调优。
-- 不建设通用插件框架。
-- 不恢复旧的重型 tuner 和生产报告体系。
-- 不让普通 MoE 经过新 selector。
-- 不为尚未出现的后端提前增加抽象层。
-
-判断标准很简单：一行代码如果既不服务当前正确性、当前性能，也不直接支持
-下一个 backend runner，就暂时不进入第一版。
-
-## 11. M=32768 独立 KID 实现计划
-
-### 11.1 结论与性能基线
-
-M=32768 不在当前 M=2048 单窗口 kernel 内增加运行时分支，而是新增一个独立的
-pipeline KID。KID 代表完整的 `G/L/RS/AG` winner，不只代表 Stage2 GEMM 的 tile 参数。
-
-现有数据：
-
-| 路径 | ordinary Graph | fused Graph | speedup |
-| --- | ---: | ---: | ---: |
-| 清理前 7-window winner | 3581.112 us | 2272.528 us | 1.5758x |
-| 当前 full-H 单窗口 | 3590.766 us | 2688.808 us | 1.3354x |
-| 轻量 CCO 7-window KID | 3588.911 us | 2224.386 us | 1.6134x |
-
-baseline 基本一致，当前约 18.3% 的回退来自窗口间 overlap 消失。因此不能只修改
-`grid`、worker 数量或在现有 kernel 外连续 launch 七次；必须恢复同一次 launch 内的
-GEMM worker 与 L/RS/AG service worker 并发。
-
-### 11.2 KID 选择
-
-第一版只有两个 production winner，直接使用 `bucket -> prepared runner`，不额外引入
-KID 字符串、builder registry、CSV parser 或在线 tuner：
-
-```python
-return {
-    2048: FullWidthWorkspace(tp_group),
-    32768: WindowedWorkspace(tp_group),
-}
-```
-
-外层先固定校验当前模型 shape：
+`winner_row()` 使用和 production 完全相同的 CSV schema，`write_winner()` 按
+ShapeKey/M 更新目标 CSV。production CSV 只包含：
 
 ```text
-(H, I_per_tp, experts, topk, TP) = (7168, 384, 384, 6, 8)
+M
+KID
+family
+独立 kernel Config 参数
 ```
 
-运行时只做现有的 `self.runners[bucket]` 查找，GPU kernel 内不判断 M，也不在线选择
-算法。实现方式由文件边界直接表达：M=2048 对应 `full_width.py`，M=32768 对应
-`windowed.py`。
+`latency_us / max_abs / rel_l2` 保留在 `TuningResult` 和仓外 sweep 报告，不写入生产 CSV。
+promotion 时把 tuner 生成的一行 winner 合入 production CSV，不再人工改 Python
+KIDS/BUCKETS。
 
-以后增加 Opus 或 ASM pipeline 时，先增加独立 runner；只有同一个 shape 真正出现多个
-需要离线切换的 production winner 时，才增加显式 KID 映射，例如：
+为了避免非法 candidate 造成 GPU context poisoning，正式大 sweep 推荐由仓外 driver
+以“一个 candidate 一个 TP8 进程组”运行。这个故障隔离不进入 production，也不需要在
+AITer 内再建设一套多进程 tuner framework。
 
-```text
-opus_comm_tp8_m32768_v1
-asm_comm_tp8_m32768_v1
-```
+## 7. 新 shape 的接入流程
 
-这类 KID 不复用普通 MoE 的 `kernelName2` 字段，因为它描述的是完整 pipeline，而不是
-一个 Stage2 计算 kernel。
+1. 定义 exact `ShapeKey`。
+2. 列出需要覆盖的 padded M。
+3. 为每个 M 生成 full/window/persistent 候选。
+4. 使用相同输入建立普通路径 reference。
+5. 每个 candidate 跑完整 pipeline 精度和 Graph rank-max。
+6. 选择无精度问题的最快结果。
+7. tuner 生成或更新一行 winner CSV。
+8. 初始化时 exact lookup 该 ShapeKey/M。
+9. 跑全 bucket、uniform/skew、eager/Graph 和整网验证。
 
-kernel 文件按实现方式命名，不按 token bucket 命名：
+没有 winner 的 shape 继续在模型配置层选择普通 MoE。融合 backend 内不做最近邻、向上
+取 bucket、自动 family 切换或普通路径 fallback。
 
-```text
-kernels/comm_fused_moe/full_width.py
-kernels/comm_fused_moe/windowed.py
-```
+## 8. 当前验证结果
 
-当前 M=2048 使用 full-width 实现；历史 production winner 曾使用两个 hidden windows，约
-`268.713 us`，当前 full-width direct-LSA 约 `266.319 us`，因此暂不回退到旧 window
-配置。`windowed.py` 完成后仍需为 M=2048 离线比较 2-window 和必要时 7-window 候选；
-只有完整 Graph 至少稳定快约 1% 才替换现有 full-width 实现，不增加运行时算法分支。
+MI355X/gfx950、TP8，同一节点完成结构重构后的全量验证：
 
-### 11.3 固定的大 M winner
+| M | uniform Graph us | skew Graph us | max_abs | rel_l2 约值 |
+| ---: | ---: | ---: | ---: | ---: |
+| 256 | 136.63 | 102.96 | 0.8125 | 0.0313 |
+| 512 | 151.17 | 148.75 | 0.8125 | 0.0313 |
+| 1024 | 181.43 | 184.76 | 0.7500 | 0.0313 |
+| 2048 | 245.45 | 251.79 | 0.7500 | 0.0300 |
+| 4096 | 373.69 | 384.46 | 0.7500 | 0.0300 |
+| 8192 | 615.26 | 626.23 | 0.8125 | 0.0301 |
+| 16384 | 1044.12 | 1087.08 | 0.8750 | 0.0301 |
+| 32768 | 1953.16 | 1985.58 | 0.8125 | 0.0301 |
 
-第一版固化同一 TP8 节点上重新 A/B 后的 CCO winner：
+16 组 uniform/skew、eager/Graph 和精度检查全部通过。tuner API 也用 M=256 production
+winner 做了 smoke，Graph rank-max 约 `138.91 us`，精度 `0.7500 / 0.031323`。另外，
+256/512/8192/16384/32768 在同一 TP8 进程组内依次 lazy 创建 runner 的验证也已通过。
+uniform M=8192/32768 另用 7 轮、每轮 50 次 Graph replay 复测，分别为
+`615.26 / 1953.16 us`，确认首轮不到 1% 的波动是测量噪声。
 
-```text
-M=32768
-H=7168
-I/TP=384
-E=384
-topk=6
-TP=8
+MORI SDMA、CU push 等实验未超过当前 compressed direct-pull 完整 pipeline，因此不进入
+production。MORI 只在初始化时注册 external window，热路径没有 MORI host 调用。
 
-window_dim=1024
-hidden_windows=7
-tile_m=64
-tile_n=256
-tile_k=128
+## 9. 扩展 Opus / ASM
 
-local_workers=2048
-local_vector_width=32
-reduce_scatter_grid=92
-all_gather_grid=91
-all_gather_load_cache_modifier=1
-service_stride=3
-```
+新 backend 只需要：
 
-固定流水：
+1. 定义自己的 kernel `Config`；
+2. 实现相同 runner 调用契约；
+3. 在 host 的显式 `Config type -> runner` 映射中注册；
+4. 在离线 tuner 中增加候选生成器和 CSV family；
+5. promotion 最终 winner 行。
 
-```text
-G0
-G1 + L0
-G2 + L1 + R0
-G3 + L2 + R1 + F0
-...
-drain L / R / F
-```
+模型层、`fused_moe.py` seam、公共 runtime 和已有 FlyDSL runner 不需要随之修改。
 
-不保留 `service_kind`、dynamic window、persistent、XCD、early/after-compute、动态
-worker 数量或其他实验开关。已验证 winner 中的参数直接成为编译期常量。
+只有真实接入 Opus/ASM 时才增加对应 Config 和 runner 条目；第一版不提前建设通用 plugin
+registry。
 
-### 11.4 文件改动边界
+## 10. 明确不做
 
-| 文件 | 计划改动 |
-| --- | --- |
-| `aiter/ops/flydsl/comm_fused_moe_host.py` | 增加 M=32768 workspace，并直接加入 bucket runner 字典 |
-| `aiter/ops/flydsl/kernels/comm_fused_moe/full_width.py` | 保持当前 full-width production KID，不加入 window 分支 |
-| `aiter/ops/flydsl/kernels/comm_fused_moe/windowed.py` | 新增固定 TP8、7-window 的组合 kernel |
-| `aiter/ops/flydsl/kernels/mixed_moe_gemm_2stage_common.py` | 只增加组合 kernel 必需的三个私有编译期 hook |
+- 不在线调优；
+- 不在 forward 解析 CSV；
+- 不保留实验分支或运行时参数开关；
+- 不做模糊 shape 匹配和 fallback；
+- 不把 workspace stride、epoch offset 等派生值写入 winner；
+- 不让 kernel 文件维护 production bucket；
+- 不为尚未接入的 backend 增加抽象。
 
-下面这些文件原则上不再修改：
+判断标准：代码必须直接服务当前正确性、当前性能、离线 winner 生成，或下一个已经确定
+要接入的 backend。
 
-```text
-aiter/fused_moe.py
-aiter/ops/comm_fused_moe_runtime.py
-ATOM 模型 adapter
-```
+## 11. 下一步
 
-这样大 M 接入不会改变公共 seam、模型选路和已经验证的 M=2048 热路径。
+1. review 当前未提交结构 diff，不 amend。
+2. 用 tuner 跑一组小范围已知参数 sweep，验证 winner 选择和输出格式。
+3. 将仓外历史 sweep driver 改为直接构造 kernel Config，不再 monkey-patch kernel 全局常量。
+4. AITer review 通过后，再做 ATOM 整网验证；本轮不改 ATOM。
+5. 后续按独立计划继续优化 persistent-window 的跨 phase RS/AG overlap。
 
-### 11.5 GEMM2 common 的最小 hook
-
-只增加以下两个私有能力：
-
-```python
-_n_tile_range=None
-_compose_entry=None
-```
-
-两项能力分别用于：
-
-1. 只计算当前 1024 列窗口对应的四个 N tiles，并将 route 输出写成紧凑的
-   `[M, topk, 1024 + 1024/8]` 布局。
-2. 把现有 GEMM2 work-item emitter 嵌入 G/L/RS/AG 组合 kernel。
-
-内部 emitter 只额外接受一个可选线性 `block_id`，由 common 自己拆分 N tile 和 expert
-block。service CTA 是否执行 GEMM 由组合 kernel 在调用 emitter 前判断，不进入 common。
-
-最终 common diff 为 49 行新增、10 行替换/删除；没有 tuner、persistent 特判、active
-mask、独立 compact 开关或非 FP8 输出泛化。
-
-普通调用保持默认值时必须满足：
-
-- 原 kernel 名不变；
-- 原 launch ABI 不变；
-- 原 cache key 不变；
-- 原 grid 计算不变；
-- 生成的普通 MoE IR/HSACO 不变。
-
-不恢复旧实现中的 `Gemm2OutputPolicy` Enum、`kernel_namespace`、transport 参数、
-service 配置和通用校验。drain 阶段使用新文件中的固定 L/RS/AG kernel，不要求 common
-为 service-only 路径预留额外抽象。
-
-### 11.6 Workspace 布局
-
-M=32768 runner 固定持有：
-
-- 两个 compact route buffer，供相邻 G/L 窗口交替使用；
-- 七个 partial window workspace 和 readiness epoch；
-- 七个 reduced payload workspace、reduced scale 和 readiness epoch；
-- 一个完整 BF16 输出；
-- 一个完整 shared partial buffer。
-
-partial、reduced payload 和 reduced scale 使用 cached `torch.symm_mem`，通过已有 MORI CCO
-external window 映射到 flat VA，kernel 直接计算 peer 地址。无需新增 IPC manager、MORI
-接口、custom AR 接口或另一套通信 runtime。
-
-不能用两个 full-H route buffer 替代 compact route：M=32768 时两个 full-H route
-约占 3.16 GB，而两个 1024-window compact route 约占 452 MB；历史 winner 也使用
-compact window 布局。
-
-### 11.7 实施顺序与 review 点
-
-1. 在当前分支基础上创建短期大 M 开发分支，保留现有备份分支不动。
-2. 增加 GEMM2 common 的最小 hook，暂不接入通算融合调用。
-3. 对普通 Opus/FlyDSL Stage2 比较修改前后的 IR、HSACO 和单算子性能；不一致则先停。
-4. 新增固定 `kernels/comm_fused_moe/windowed.py`，只实现已验证的 G/L/RS/AG worker 和静态调度。
-5. 新增 M=32768 workspace 与 host 侧七窗口 launch/drain 顺序。
-6. 将新 workspace 直接加入 `32768 -> runner` 字典。
-7. 先跑单算子 uniform/skew correctness，再跑 CUDA Graph 性能。
-8. 回归 M=2048、普通 Opus、普通 FlyDSL A8W4 Stage2 和 MegaMoE。
-9. 单算子全部通过后再进行 ATOM 整网验证。
-
-每个阶段保留独立 diff 供 review，不 amend 到已有提交；临时测试和候选脚本继续放在
-仓外。
-
-### 11.8 准入门槛
-
-M=32768 使用与历史 gate 相同的 TP8 节点、输入和 rank-max 统计方式：
-
-- uniform routing 与 skew routing 都通过；
-- eager 与 CUDA Graph 输出一致；
-- `max_abs=0.8125`、`rel_l2` 约 `0.030132`；
-- 七轮 CUDA Graph rank-max median 目标不高于 `2272.528 us`；
-- 考虑机器噪声，promotion 判断最多允许约 1% 波动，不接受稳定回退；
-- M=2048 的现有约 `266.319 us` Graph 性能不能回退；
-- 普通 backend 的生成代码、精度和性能不能回退。
-
-只有满足这些门槛，M=32768 KID 才进入正式 shape 映射。
-
-最终收缩后的七轮 Graph rank-max median 为：M=32768 uniform `2224.386 us`、skew
-`2221.514 us`。M=2048 最终复跑为 uniform `266.702 us`、skew `271.788 us`，相对
-同一路径 amend commit 即时 A/B 的 `266.734 us` / `272.374 us` 均未回退，且
-`full_width.py` 保持零 diff，没有稳定回退。同节点重跑清理前 M=32768 实现为
-`2399.803 us`，说明轻量实现达到约 2200 us 目标，并消除了环境漂移后仍存在的实现回退。
-
-### 11.9 MORI SDMA 后续实验
-
-SDMA 不是 M=32768 第一版恢复项。先完成并验证固定七窗口 direct-LSA KID，再把 SDMA
-作为独立候选做 A/B。原因是 MORI host 注册只发生在初始化阶段，替换 host 接口不会减少
-每轮 Stage2 时间；只有 MORI device-side SDMA 搬运可能改变热路径。
-
-第一优先级实验只替换 reduced-shard all-gather：
-
-```text
-RS 生成一个压缩 reduced MXFP8 chunk
-  → MORI SDMA put 到各 peer 的本地接收槽
-  → 与下一个 R chunk 重叠
-  → peer 从本地槽解码并写 BF16 output
-```
-
-暂不优先用 SDMA 搬运 partial reduce 输入。R 阶段仍要执行 MXFP8 解码、跨 rank 求和和
-再量化；先把 partial 搬到本地会增加一次 HBM 写入和读取，未必优于当前直接 remote load。
-
-实现约束：
-
-- 只使用 MORI 已有的 `create_dev_comm` 和 FlyDSL `Sdma.put/commit/quiet`，不先修改
-  MORI 仓或增加新接口；
-- SDMA 候选使用独立 KID，例如 `flydsl_comm_tp8_m32768_win7_sdma_v1`，不在 direct-LSA
-  kernel 中增加运行时分支；
-- M=2048 不创建 DevComm、SDMA queue、signal 或接收 workspace，继续使用当前 direct
-  flat-VA 路径；
-- 所有 queue、signal 和接收槽在 runner 初始化时一次性准备，每轮不得出现 MORI host
-  调用或动态分配；
-- 不用 `Window.lsa_ptr()` 替换当前固定 flat-VA 地址计算。该接口更通用，但不会减少
-  数据搬运，并可能增加 device-side window 字段读取；
-- 不增加在线 tuner、fallback 或 transport 开关，仓外 benchmark 只输出 direct 或 SDMA
-  两个完整 pipeline KID 中的 winner。
-
-SDMA 会增加本地接收 workspace、queue/signal 同步以及一次额外 HBM 落地，因此只在大块
-数据和 copy/compute 能稳定重叠时可能获益。验收时必须在同一次 TP8 运行中比较
-七窗口 direct-LSA 与 SDMA KID，并同时记录 R、F 和完整 Graph：
-
-- uniform、skew、eager 和 CUDA Graph 精度与 direct-LSA 一致；
-- 完整 Graph rank-max median 至少稳定快约 1%，否则删除 SDMA 候选；
-- 最终性能仍以不高于历史 `2272.528 us` 为目标，不能用 SDMA 的局部 F 提升掩盖完整
-  pipeline 回退；
-- M=2048 保持当前约 `266.319 us` Graph 性能，普通 backend 和其他 shape 不受影响。
-
-### 11.10 第一版不增加 production tuner
-
-第一版使用仓外 benchmark 脚本复现历史 winner并验证固定实现，不恢复
-`moe_tp_stage2_tuner.py`。后续接入新模型或新 shape 时，离线枚举候选并输出一个 KID；
-生产代码只保存通过精度与性能 gate 的 winner。
+Persistent 的结构性优化记录见 `docs/comm_fused_moe_persistent_kernel_plan.md`。
