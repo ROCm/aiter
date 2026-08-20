@@ -76,6 +76,7 @@ _FIXED_SWITCHES: dict[str, bool] = {
     "bf16_convert_trunc": True,
 }
 
+
 def _parse_bool(s: str) -> bool:
     """CSV-friendly bool parser. Tolerates ``"True"``/``"False"`` (Python
     ``str(bool)`` style, used by gdr_decode_tuned.csv) plus the more
@@ -389,9 +390,7 @@ def parse_csv_opt(csv_path: str) -> list[dict[str, Any]]:
                 print(f"  [WARN] malformed row in {csv_path}: {e}")
                 continue
 
-            shapes[
-                (cu_num, dtype, K, V, BT, H, Hg, is_varlen, use_h0, store_fs)
-            ] = None
+            shapes[(cu_num, dtype, K, V, BT, H, Hg, is_varlen, use_h0, store_fs)] = None
 
     jobs: list[dict[str, Any]] = []
     seen: set[tuple] = set()
@@ -682,7 +681,9 @@ def main():
     cache_dir = os.path.expanduser(
         os.environ.get("FLYDSL_RUNTIME_CACHE_DIR", "~/.flydsl/cache")
     )
-    target_arch = os.environ.get("ARCH") or os.environ.get("GPU_ARCHS") or "(from cu_num)"
+    target_arch = (
+        os.environ.get("ARCH") or os.environ.get("GPU_ARCHS") or "(from cu_num)"
+    )
 
     print("=" * 72)
     print("FlyDSL chunk-gated-delta-h AOT Pre-compilation")
@@ -736,7 +737,9 @@ def main():
     if args.dry_run:
         for spec, jobs in plans:
             for job in jobs:
-                arch = _opt_job_arch(job) if job.get("cu_num") is not None else job["arch"]
+                arch = (
+                    _opt_job_arch(job) if job.get("cu_num") is not None else job["arch"]
+                )
                 print(f"  {arch}  {spec.format_shape(job)}")
         sys.exit(0)
 

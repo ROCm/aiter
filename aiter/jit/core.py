@@ -404,7 +404,9 @@ class AITER_CONFIG:
     # Cache is keyed on (self, env_name, ...); this object is a
     # process-lifetime singleton, so the retained reference is not a leak.
     @functools.lru_cache(maxsize=20)  # noqa: B019
-    def get_config_file(self, env_name, default_file, config_file_name, untuned_only=False):
+    def get_config_file(
+        self, env_name, default_file, config_file_name, untuned_only=False
+    ):
         config_env_file = os.getenv(env_name)
         # default_file = f"{AITER_ROOT_DIR}/aiter/configs/{config_file_name}.csv"
         from pathlib import Path
