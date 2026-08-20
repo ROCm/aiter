@@ -7073,6 +7073,19 @@ class Mxfp4FlydslTuner(FmoeTuner):
             m_indices=m_indices,
             moe_buf=moe_buf,
             interleave=p1["interleave"],
+            # Mirror the production gate in fused_moe: a BM16 GEMM1 feeding a
+            # native mxmoe GEMM2 must emit the intermediate scales in that
+            # GEMM2's native layout. Omitting it leaves GEMM1 writing the other
+            # layout, so GEMM2 reads mis-strided scales and the whole shape
+            # looks accuracy-broken (cosine ~0.47) even though production is
+            # fine -- which silently dropped every block_m=16 shape from a sweep.
+            native_scale_layout=(
+                BM1 == 16
+                and BM == 16
+                and p1["out_dtype"] == "fp4"
+                and isinstance(kn2, str)
+                and kn2.startswith("flydsl_mxmoe_g2_")
+            ),
             bias1=data["bias1"],
             swiglu_limit=7.0,
             situ_beta=DEFAULT_SITUV2_BETA if p1["act"] == "situv2" else 1.0,
