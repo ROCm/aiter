@@ -7,6 +7,7 @@ import flydsl.expr as fx
 from mori.cco import Communicator
 
 from aiter.ops.flydsl.kernels.comm_fused_moe import full_width as full_width_kernels
+from aiter.ops.flydsl.kernels.comm_fused_moe import persistent as persistent_kernels
 from aiter.ops.flydsl.kernels.comm_fused_moe import windowed as windowed_kernels
 from aiter.ops.flydsl.kernels.comm_fused_moe.sync import (
     FLAT_VA_RANK_STRIDE,
@@ -65,7 +66,7 @@ def _stage2_args(stage2_args, stage2_kwargs, kernels):
         kernels.M,
         kernels.H,
         kernels.I,
-        int(sorted_expert_ids.shape[0]) * 2,
+        int(sorted_expert_ids.shape[0]) * kernels.SORT_BLOCK_M // kernels.TILE_M,
     )
 
 
@@ -144,171 +145,123 @@ class _FullWidthRunner:
         return self.output
 
 
-class _WindowedRunner:
+class _PersistentRunner:
     def __init__(self, tp_group) -> None:
-        kernels = windowed_kernels
+        k = windowed_kernels
         self.rank = int(tp_group.rank_in_group)
         self.device = torch.device(tp_group.device)
         self.routes = tuple(
             torch.empty(
-                (kernels.M, kernels.TOPK, kernels.WINDOW + kernels.WINDOW // 8),
+                (k.M, k.TOPK, k.WINDOW + k.WINDOW // 8),
                 dtype=torch.uint8,
                 device=self.device,
             )
-            for _ in range(kernels.SLOTS)
+            for _ in range(k.SLOTS)
         )
-        self.partial_ready = kernels.M * (
-            kernels.WINDOW + kernels.WINDOW // 32
+        self.state = _symmetric(self.device, (k.STATE_BYTES,))
+        self.partials = _symmetric(
+            self.device, (k.PHASES * persistent_kernels.PARTIAL_STRIDE,)
         )
-        self.partials = tuple(
-            _workspace(self.device, self.partial_ready)
-            for _ in range(kernels.SLOTS)
+        self.reduced_payloads = _symmetric(
+            self.device,
+            (k.PHASES * persistent_kernels.REDUCED_PAYLOAD_STRIDE,),
         )
-        self.reduced_ready = kernels.SHARD_ROWS * kernels.WINDOW
-        self.reduced_payloads = tuple(
-            _workspace(self.device, self.reduced_ready)
-            for _ in range(kernels.SLOTS)
-        )
-        self.reduced_scales = tuple(
-            _symmetric(self.device, (kernels.SHARD_ROWS, kernels.WINDOW // 32))
-            for _ in range(kernels.SLOTS)
+        self.reduced_scales = _symmetric(
+            self.device,
+            (k.PHASES * persistent_kernels.REDUCED_SCALE_STRIDE,),
         )
         self.output = torch.empty(
-            (kernels.M, kernels.H), dtype=torch.bfloat16, device=self.device
+            (k.M, k.H), dtype=torch.bfloat16, device=self.device
         )
+        self.state.zero_()
 
         self.comm, self.windows, bases = _register(
             tp_group,
             self.rank,
-            kernels.TP,
-            (*self.partials, *self.reduced_payloads, *self.reduced_scales),
-        )
-        self.partial_bases = bases[: kernels.SLOTS]
-        self.reduced_payload_bases = bases[kernels.SLOTS : 2 * kernels.SLOTS]
-        self.reduced_scale_bases = bases[2 * kernels.SLOTS :]
-        shard_begin = self.rank * kernels.SHARD_ROWS
-        self.reduced_shards = tuple(
-            self.output[
-                shard_begin : shard_begin + kernels.SHARD_ROWS,
-                window * kernels.WINDOW : (window + 1) * kernels.WINDOW,
-            ]
-            for window in range(kernels.H // kernels.WINDOW)
-        )
-        self.all_gather_outputs = tuple(
-            self.output[
-                :, window * kernels.WINDOW : (window + 1) * kernels.WINDOW
-            ]
-            for window in range(kernels.H // kernels.WINDOW)
-        )
-
-    def _local_args(self, window, shared_partial):
-        slot = window % windowed_kernels.SLOTS
-        shared = shared_partial[:, window * windowed_kernels.WINDOW :]
-        return ptr_arg(self.routes[slot]), ptr_arg(self.partials[slot]), ptr_arg(shared)
-
-    def _collective_args(self, reduce_scatter, all_gather):
-        reduce_scatter_slot = reduce_scatter % windowed_kernels.SLOTS
-        all_gather_slot = all_gather % windowed_kernels.SLOTS
-        return (
-            fx.Int64(self.partial_bases[reduce_scatter_slot]),
-            ptr_arg(self.reduced_shards[reduce_scatter]),
-            ptr_arg(self.reduced_payloads[reduce_scatter_slot]),
-            ptr_arg(self.reduced_scales[reduce_scatter_slot]),
-            fx.Int64(self.reduced_payload_bases[all_gather_slot]),
-            fx.Int64(self.reduced_scale_bases[all_gather_slot]),
-            ptr_arg(self.all_gather_outputs[all_gather]),
-        )
-
-    def _drain(
-        self,
-        local,
-        reduce_scatter,
-        all_gather,
-        shared_partial,
-        stream,
-    ) -> None:
-        kernels = windowed_kernels
-        local_window = 0 if local is None else local
-        reduce_window = 0 if reduce_scatter is None else reduce_scatter
-        gather_window = 0 if all_gather is None else all_gather
-        _run_compiled(
-            kernels.compile_stage2_drain(
-                local is not None,
-                reduce_scatter is not None,
-                all_gather is not None,
-            ),
+            k.TP,
             (
-                *self._local_args(local_window, shared_partial),
-                *self._collective_args(reduce_window, gather_window),
+                self.state,
+                self.partials,
+                self.reduced_payloads,
+                self.reduced_scales,
+            ),
+        )
+        (
+            self.state_flat_base,
+            self.partial_flat_base,
+            self.reduced_payload_flat_base,
+            self.reduced_scale_flat_base,
+        ) = bases
+        self.service = persistent_kernels.compile_stage2_service()
+        self.service_stream = torch.cuda.Stream(device=self.device)
+        self.start_event = torch.cuda.Event()
+        self.done_event = torch.cuda.Event()
+
+    def _local_args(self, phase, shared_partial):
+        k = windowed_kernels
+        begin = phase * persistent_kernels.PARTIAL_STRIDE
+        partial = self.partials[
+            begin : begin + persistent_kernels.PARTIAL_STRIDE
+        ]
+        shared = shared_partial[:, phase * k.WINDOW :]
+        return ptr_arg(self.routes[phase % k.SLOTS]), ptr_arg(partial), ptr_arg(shared)
+
+    def _launch_service(self):
+        _run_compiled(
+            self.service,
+            (
+                ptr_arg(self.state),
+                fx.Int64(self.state_flat_base),
+                fx.Int64(self.partial_flat_base),
+                fx.Int64(self.reduced_payload_flat_base),
+                fx.Int64(self.reduced_scale_flat_base),
+                ptr_arg(self.output),
+                ptr_arg(self.reduced_payloads),
+                ptr_arg(self.reduced_scales),
                 self.rank,
-                stream,
+                self.service_stream,
             ),
         )
 
     def __call__(self, *, stage2_args, stage2_kwargs, shared_partial):
         k = windowed_kernels
-        stream = torch.cuda.current_stream(self.device)
+        producer = torch.cuda.current_stream(self.device)
         common = _stage2_args(stage2_args, stage2_kwargs, k)
         _run_compiled(
-            k.compile_stage2_compute(0), (ptr_arg(self.routes[0]), *common, stream)
+            k.compile_stage2_compute(0),
+            (ptr_arg(self.routes[0]), *common, producer),
         )
-        for local in range(len(self.reduced_shards) - 1):
-            has_reduce_scatter = local > 0
-            has_all_gather = local > 1
-            reduce_scatter = local - 1 if has_reduce_scatter else 0
-            all_gather = local - 2 if has_all_gather else 0
+        for phase in range(k.PHASES - 1):
             _run_compiled(
-                k.compile_stage2_cycle(
-                    local + 1,
-                    has_reduce_scatter,
-                    has_all_gather,
-                ),
+                k.compile_persistent_cycle(phase),
                 (
-                    ptr_arg(self.routes[(local + 1) % k.SLOTS]),
+                    ptr_arg(self.routes[(phase + 1) % k.SLOTS]),
                     *common,
-                    *self._local_args(local, shared_partial),
-                    *self._collective_args(reduce_scatter, all_gather),
-                    self.rank,
-                    stream,
+                    *self._local_args(phase, shared_partial),
+                    ptr_arg(self.state),
+                    producer,
                 ),
             )
-            local_slot = local % k.SLOTS
-            _barrier(
-                self.partials[local_slot],
-                self.partial_bases[local_slot],
-                self.partial_ready,
-                stream,
-            )
-            if has_reduce_scatter:
-                reduce_slot = reduce_scatter % k.SLOTS
-                _barrier(
-                    self.reduced_payloads[reduce_slot],
-                    self.reduced_payload_bases[reduce_slot],
-                    self.reduced_ready,
-                    stream,
-                )
+            if phase == 0:
+                self.start_event.record(producer)
+                self.service_stream.wait_event(self.start_event)
+                self._launch_service()
 
-        last = len(self.reduced_shards) - 1
-        self._drain(last, last - 1, last - 2, shared_partial, stream)
-        last_slot = last % k.SLOTS
-        reduce_slot = (last - 1) % k.SLOTS
-        _barrier(
-            self.partials[last_slot], self.partial_bases[last_slot], self.partial_ready, stream
+        last = k.PHASES - 1
+        _run_compiled(
+            k.compile_persistent_drain(),
+            (
+                *self._local_args(last, shared_partial),
+                ptr_arg(self.state),
+                producer,
+            ),
         )
-        _barrier(
-            self.reduced_payloads[reduce_slot],
-            self.reduced_payload_bases[reduce_slot],
-            self.reduced_ready,
-            stream,
+        _run_compiled(
+            k.compile_persistent_final_publish(),
+            (ptr_arg(self.state), producer),
         )
-        self._drain(None, last, last - 1, shared_partial, stream)
-        _barrier(
-            self.reduced_payloads[last_slot],
-            self.reduced_payload_bases[last_slot],
-            self.reduced_ready,
-            stream,
-        )
-        self._drain(None, None, last, shared_partial, stream)
+        self.done_event.record(self.service_stream)
+        producer.wait_event(self.done_event)
         return self.output
 
 
@@ -321,6 +274,6 @@ def create_flydsl_comm_fused_runners(*, tp_group, model_dim, inter_dim, experts,
     if _RUNNERS is None:
         _RUNNERS = {
             full_width_kernels.M: _FullWidthRunner(tp_group),
-            windowed_kernels.M: _WindowedRunner(tp_group),
+            windowed_kernels.M: _PersistentRunner(tp_group),
         }
     return _RUNNERS

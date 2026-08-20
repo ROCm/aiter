@@ -1,347 +1,252 @@
-# Comm-Fused MoE Persistent Kernel 实现计划
+# Comm-fused MoE persistent kernel：最终方案与门禁
 
-## 1. 一句话结论
+## 1. 目标
 
-当前 M=32768 `windowed.py` 已经达到约 2.2 ms，它是可用的 production
-baseline，不应被直接重写。下一个候选方案是新增独立的
-**persistent communication KID**：G/L 仍由窗口 producer kernel 计算，一个
-persistent service kernel 在一次 Stage2 内持续处理七个窗口的 RS/AG，用
-device-side epoch 代替每个窗口的 host-launched barrier kernel。
+为 DeepSeek-V4-Pro 的 TP8 Stage2 提供轻量、可维护的通算融合路径：
 
-它只有在同场 A/B 中稳定快于当前 `windowed.py`、整网也无回退时，才会
-替换 M=32768 的 shape 映射。
+- M=2048 保留已验证的 full-width kernel。
+- M=32768 使用 windowed producer + persistent collective service。
+- 未支持的 token bucket 在模型层选择普通 MoE，不在 AITer runtime 内回退。
+- M=512～32768 的既有路径不因本实现回退。
+- 只保留 production winner，不保留实验开关、备用 runner 或失败分支。
 
-## 2. 为什么现在值得做
-
-最新 TP8 Graph rank-max median：
-
-| shape / route | 当前 production KID |
-| --- | ---: |
-| M=2048 uniform | 261.511 us |
-| M=2048 skew | 266.215 us |
-| M=32768 uniform | 2215.401 us |
-| M=32768 skew | 2221.662 us |
-
-M=32768 已经达到原定约 2200 us 的目标，所以 persistent 不是功能修复，而是
-降低调度和同步成本的下一个性能 KID。
-
-当前 M=32768 有七个 1024-column 窗口，host 调度是：
+当前固定模型 shape：
 
 ```text
-1 x G0
-6 x (G[n] + L[n-1] + optional RS/AG)
-3 x drain
-7 x partial epoch barrier
-7 x reduced payload epoch barrier
+H=7168, I=384, E=384, TOPK=6, TP=8
 ```
 
-一共是：
+shape 与 token bucket 是否支持，由 runtime 的 runner 表决定；这不是“任意 shape
+都能正确且高效”的假泛化。新 shape 应增加独立配置并通过完整门禁后再映射。
+
+## 2. 最终路径
+
+### 2.1 M=2048：full-width
+
+执行顺序：
 
 ```text
-10 个工作 kernel + 14 个 barrier kernel = 24 次 device launch / Stage2
+Stage2 GEMM
+→ local top-k/shared reduce
+→ TP epoch barrier
+→ TP reduce-scatter + owner MXFP8 publication
+→ TP epoch barrier
+→ TP all-gather + BF16 output
 ```
 
-CUDA Graph 可以避免 Python 逐次提交，但不会消除 24 个 device graph node 的
-dispatch、14 次 system-scope epoch 同步和窗口间 CTA 重调度。
+这条路径已经适合小 M。persistent 方案不替换它，避免额外 stream、event、状态轮询
+和大 workspace 成本。
 
-M=2048 的粗粒度窗口实验也说明，仅增加 overlap 但不减少 launch/barrier
-不足以提速。最佳两窗口候选仍为 uniform `273.418 us`、skew
-`275.915 us`，慢于当前 full-width KID。
+### 2.2 M=32768：persistent window pipeline
 
-## 3. 第一版的准确边界
+H=7168 按 1024 列切成 7 个 phase。producer stream 负责窗口 GEMM 和 local reduce；
+service stream 上常驻一组 CTA，依次完成每个 phase 的 TP reduce-scatter 和
+all-gather。
 
-### 要做
-
-- 只针对当前已验证的 TP8、M=32768、H=7168、I/TP=384、E=384、topk=6。
-- 一次 Stage2 启动一个 persistent RS/AG service kernel，在 kernel 内处理七个窗口。
-- G/L 保留现有 FlyDSL GEMM emitter 和窗口 compact-route 布局。
-- 用单调 device epoch 发布 partial/reduced readiness，不再为每个窗口 launch
-  `compile_epoch_barrier()`。
-- persistent service 和 G/L producer 使用两条固定 GPU stream 并发，runner
-  初始化时创建所有 stream/event/workspace。
-- 通过仓外 benchmark 做 KID A/B，production 代码最终只保留 winner。
-
-### 第一版不做
-
-- 不把 G/L/RS/AG 全部塞进一个大而全的 persistent kernel。
-- 不做跨多次 Stage2 常驻、无限循环的 daemon kernel。persistent 只在一次
-  Stage2 内跨七个窗口存活。
-- 不增加 runtime planner、Protocol、registry、在线 tuner、fallback 或 transport
-  开关。
-- 不改 M=2048 `full_width.py`、普通 MoE、ATOM adapter 和 Stage2 runtime seam。
-- 不同时引入 SDMA。SDMA 仍是另一个独立 KID，不与 persistent 实验混在一起。
-- 不为“未来可能会有”的 shape 提前加入动态分支。
-
-## 4. 目标架构
+逻辑流水：
 
 ```text
-current/model stream                         persistent service stream
-
-record start event ------------------------> wait start event
-G0                                          launch persistent RS/AG once
-G1 + L0 -- publish partial_ready[0] -------> wait all ranks partial[0]
-G2 + L1 -- publish partial_ready[1]          RS0 -> publish reduced_ready[0]
-G3 + L2 -- publish partial_ready[2]          wait all reduced[0] -> AG0
-G4 + L3 -- publish partial_ready[3]          RS1 -> AG1
-G5 + L4 -- publish partial_ready[4]          RS2 -> AG2
-G6 + L5 -- publish partial_ready[5]          ...
-     L6 -- publish partial_ready[6]          RS6 -> AG6 -> record done event
-
-main stream <------------------------------- record done event
-wait done event, then return BF16 output
+producer: G0 → (G1+L0) → ... → (G6+L5) → L6 → publish6
+service:             RS0+AG0 → RS1+AG1 → ... → RS6+AG6
 ```
 
-在保留现有 G/L 分窗口计算的前提下，目标 launch 数是：
+device kernel launch 共 10 次：
 
 ```text
-1 x G0
-6 x (G[n] + L[n-1])
-1 x L6
-1 x persistent RS/AG
-= 9 个 kernel launch / Stage2
+1 × G0
+6 × producer cycle
+1 × L6 drain
+1 × final 1-CTA publication
+1 × persistent service
 ```
 
-与当前 24 次相比，去掉全部 14 个 epoch barrier kernel，工作 kernel 从 10 个
-减为 9 个。多 stream event 会成为 Graph 依赖节点，但不会变成每窗口的 GPU
-barrier kernel。
+service 在 phase 0 producer 完成后启动，随后通过 device-side epoch 协议等待后续
+phase，不再为每个窗口发起 host barrier、RS 和 AG kernel。
 
-## 5. Device-side 同步协议
+## 3. 为什么采用 phase-private workspace
 
-### 5.1 计数器
-
-第一版只使用固定数量的 `uint64` 单调计数器：
-
-| counter | 作用 | 可见范围 |
-| --- | --- | --- |
-| `local_done[7]` | 统计本 rank 每个 L 的 producer CTA 完成数 | agent |
-| `partial_ready[7]` | 宣布本 rank 的 partial window 可被 peer 读取 | system |
-| `service_arrive` | persistent CTA 在 rank 内做 phase barrier | agent |
-| `reduced_ready[7]` | 宣布本 rank reduced payload/scale 可被 peer all-gather | system |
-| `service_epoch` | 完成一整次 Stage2，为下一轮提供 expected epoch | agent |
-
-计数器不在每轮 host `zero_()`。它们只单调增长，因此同一 CUDA/HIP Graph
-可重复 replay，也不依赖 CPU 下发当前 epoch。
-
-### 5.2 L 完成后发布 partial
-
-每个参与 L(window) 的 CTA 完成写入后：
-
-1. 执行 agent release。
-2. 原子增加 `local_done[window]`。
-3. 本轮最后一个 producer CTA 执行 system release。
-4. 将 `partial_ready[window]` 增加到当前 invocation epoch。
-
-persistent service 在 RS(window) 前由一个控制 CTA 等待所有 TP rank 的
-`partial_ready[window] >= expected`，然后执行 system acquire，再放行本 rank 其他
-service CTA。
-
-### 5.3 RS 完成后发布 reduced shard
-
-1. service CTA 并行执行 RS(window)。
-2. 使用 `service_arrive` 完成 rank 内 grid phase barrier。
-3. 控制 CTA 执行 system release，发布 `reduced_ready[window]`。
-4. 控制 CTA 等待所有 peer 的 reduced epoch，执行 system acquire。
-5. 放行 all-gather CTA 读取 peer reduced payload/scale 并写入完整 BF16 output。
-
-### 5.4 不能依赖的假设
-
-- 不能假设 G/L 一定比 RS/AG 慢。
-- 不能依赖 HIP stream 的偶然调度顺序。
-- 不能让 persistent CTA 占满所有 CU，否则 producer 无法发布 partial，会死锁。
-- 不能在缺少 release/acquire 的情况下，只因 counter 数值正确就读取 payload。
-- 不能让 Graph replay 依赖 host 重置 counter。
-
-## 6. Workspace 策略
-
-### 6.1 功能原型：每个逻辑窗口一份 workspace
-
-第一个仓外原型使用七份 partial/reduced-payload/reduced-scale，不复用
-2-slot ring。这样可以先
-独立验证：
-
-- persistent grid 是否能与 G/L 稳定并发；
-- device epoch 和跨 rank 可见性是否正确；
-- 减少 launch/barrier 后是否存在足够性能收益。
-
-这会比当前 2-slot ring 多约 186 MiB/GPU 的 temporary workspace，所以只是原型，
-不是 production 接入形态。原型脚本和 runner 放仓外。
-
-### 6.2 production 候选：恢复 2-slot ring
-
-只有七 workspace 原型已经证明稳定快于当前 KID，才增加两个 slot 的
-backpressure：
+每个 phase 使用独立的 partial、reduced payload 和 scale 区域：
 
 ```text
-producer 写 slot s 前，等待 partial_consumed[s]
-service 完成 RS(window) 后，发布 partial_consumed[s]
-service 完成 AG(window) 后，reduced slot s 才可复用
+7 × partial
+7 × reduced MXFP8 payload
+7 × reduced E8M0 scale
 ```
 
-不允许用“实测上 service 跟得上”代替 backpressure。如果 2-slot 的等待使 producer
-占据剩余 CU 并影响性能，则比较 3-slot 和七窗口 workspace，最终仅固化一个
-winner，不在 production 中保留 slot 参数。
+相对 2-slot ring 约多占 186 MiB/GPU，但这是当前实测 winner：
 
-## 7. Persistent grid 规则
+- producer 不需要等待 slot 回收，不会让持有 GEMM LDS 的 CTA 自旋。
+- service CTA 可以稳定驻留，不形成 producer/service 互相等待。
+- 同步关系只沿 phase 单向推进，容易验证和复用。
 
-persistent service 的 CTA 会在等待 partial 时保持 resident，因此 grid 不能直接照搬
-当前短命 RS/AG kernel 的 `REDUCE_SCATTER_GRID=92` 并当作必然 winner。
+2-slot、3-slot ring 已实测约 2655～3313 us，并出现驻留死锁风险，已淘汰。生产
+代码中不保留 ring 参数或分支。
 
-约束：
+## 4. Device-side 同步协议
 
-- 先根据编译后的 VGPR/SGPR/LDS 确认每 CU residency。
-- persistent grid 必须可以一次全部 resident，不允许 grid barrier 等待尚未调度的 CTA。
-- 必须为 G/L producer 保留足够 CU，否则 persistent 只是用调度节点减少换取
-  GEMM 降速。
-- service CTA 使用 grid-stride loop 覆盖全部 RS/AG work，因此可以少于当前
-  92/91 个 CTA。
+状态区是 symmetric memory，并注册为 MORI external window，使所有 rank 可以用固定
+flat-VA 直接访问 peer 状态和通信 payload。
 
-仓外只测少量有意义的固定候选，例如 32、64、92 CTA。这些是离线 KID
-候选，不是最终代码中的实验参数或运行时分支。
+每次调用由递增 epoch 区分，不需要每轮清零大 workspace。核心状态为：
 
-## 8. 文件边界
+- `SERVICE_EPOCH`：本次 service invocation。
+- `WORKER_EPOCH[service_cta]`：每个 service CTA 的调用进度。
+- `PARTIAL_READY[phase]`：本 rank 的 local partial 已发布。
+- `PHASE_DONE[phase]`：本 rank 完成 RS 的 service CTA 数。
+- `REDUCED_READY[phase]`：本 rank 的 reduced shard 已发布。
+- `PHASE_GATE[phase]`：rank 内所有 service CTA 的 phase gate。
 
-### 实验阶段
-
-| 位置 | 作用 |
-| --- | --- |
-| 仓外 `comm_fused_moe_tests/` | candidate runner、A/B 脚本、grid/workspace 候选 |
-| `kernels/comm_fused_moe/persistent.py` | 仅放 producer publication 和 persistent RS/AG KID |
-
-实验阶段不修改 M=32768 的 production shape 映射。
-
-### 候选胜出后
-
-| 文件 | 最小改动 |
-| --- | --- |
-| `aiter/ops/flydsl/kernels/comm_fused_moe/persistent.py` | 保留唯一 winner 的固定常量和 kernel |
-| `aiter/ops/flydsl/comm_fused_moe_host.py` | 新增/替换 M=32768 runner，初始化固定 stream/event/workspace |
-| `aiter/ops/flydsl/kernels/comm_fused_moe/windowed.py` | 保留为 A/B baseline；不在其中增加 persistent 开关 |
-| `aiter/ops/flydsl/kernels/comm_fused_moe/sync.py` | 原则上不改；persistent-only 同步逻辑留在新 KID 内 |
-
-如果 persistent 最终替换 production M=32768，在完成整网验证前不删除
-`windowed.py`。验证完成后再决定是否将旧 KID 移到备份分支，避免 production
-同时维护两套 M=32768 路径。
-
-### 明确不改
+每个 phase 的顺序：
 
 ```text
-aiter/fused_moe.py
-aiter/ops/comm_fused_moe_runtime.py
-aiter/ops/flydsl/kernels/mixed_moe_gemm_2stage_common.py
-ATOM model adapter
-MORI repository
-custom_all_reduce.py
+producer release + PARTIAL_READY
+→ rank 0 service CTA 等待所有 TP rank
+→ rank 内 partial gate
+→ 所有 service CTA 执行 TP reduce-scatter
+→ 最后完成的 CTA release + REDUCED_READY
+→ rank 0 service CTA 等待所有 TP rank
+→ rank 内 reduced gate
+→ 所有 service CTA 执行 TP all-gather
 ```
 
-如果实现中发现必须改上述文件，先停止并单独 review 原因，不把改动顺手
-混入 persistent KID。
+轮询使用 `s_sleep 1`，避免等待 wave 持续占满指令发射。system scope 用于跨 GPU
+可见性，agent scope 用于同一 GPU 的 service CTA 协调。
 
-## 9. 实现顺序
+## 5. 文件职责
 
-### Step 0：冻结 baseline
+### AITer
 
-- 完成当前 kernel 结构清理的 review 和 A/B。
-- 记录 commit、容器、节点、JIT cache、uniform/skew 精度与七轮 Graph 数据。
-- 保存当前 `windowed.py` 作为同进程 A/B baseline。
+- `aiter/ops/comm_fused_moe_runtime.py`
+  - 持有 token bucket → runner 映射。
+  - `supports(tokens)` 只查询能力，不执行 fallback。
 
-### Step 1：只做 persistent 同步骨架
+- `aiter/ops/flydsl/comm_fused_moe_host.py`
+  - 创建 symmetric workspace、MORI window、stream 和 event。
+  - M=2048 映射 `_FullWidthRunner`。
+  - M=32768 映射 `_PersistentRunner`。
+  - 只负责编排已编译 kernel，不实现实验调度策略。
 
-- 启动固定 service grid，在 kernel 内循环七个窗口。
-- 暂不执行 RS/AG，只测 device epoch、rank 内 grid phase barrier 和多 stream Graph capture。
-- 连续 eager 1000 轮和 Graph replay 1000 轮，不允许 hang、counter 错位或前一轮泄漏。
+- `aiter/ops/flydsl/kernels/comm_fused_moe/windowed.py`
+  - 1024-column Stage2 GEMM producer。
+  - local top-k/shared reduce。
+  - producer phase publication。
 
-### Step 2：让 G/L producer 直接发布 partial
+- `aiter/ops/flydsl/kernels/comm_fused_moe/persistent.py`
+  - 单 persistent TP reduce-scatter/all-gather service。
+  - 跨 rank 和 rank 内 epoch 协议。
 
-- 生成独立 candidate producer compose，不给 production `windowed.py` 加 optional 开关。
-- 保持现有 GEMM tile、compact route 和 local reducer 不变。
-- 仅在 L 完成后增加 last-CTA publication。
-- 比较生成 IR/HSACO，确认 GEMM 主体没有意外改变。
+- `aiter/ops/flydsl/kernels/comm_fused_moe/collectives.py`
+  - 公共 MXFP8 TP reduce-scatter/all-gather primitive。
+  - 本轮不引入 persistent 特例。
 
-### Step 3：接入 RS/AG
+### ATOM
 
-- 直接复用 `collectives.py` 的 `emit_tp_reduce_scatter()` 和
-  `emit_tp_all_gather()`。
-- 先使用七份 logical-window workspace 验证正确性与性能上限。
-- 确认 reduced-shard rank 与 peer rank 仍从同一份 MXFP8 reduced payload 解码为 BF16。
+- `atom/model_ops/fused_moe/comm_fused_moe.py`
+  - 暴露 `supports_comm_fused(tokens)` 和 fused forward。
 
-### Step 4：离线选择唯一 service grid
+- `atom/models/deepseek_v4.py`
+  - 模型调用层按 token bucket 选择 comm-fused 或普通 MoE。
+  - prefill M=32768 走 comm-fused，decode M=1 走普通路径。
 
-- 同一节点、同一进程交替运行 current windowed 和 persistent candidate。
-- 只测少量可完全 resident 的 grid，记录 R、F、G/L 和完整 Graph。
-- 删除 loser 配置，文件中只留一组编译期常量。
+- `atom/plugin/vllm/moe.py`
+  - lazy wrapper 必须保留子类实例，避免 `CommFusedMoe` 被构造成基类。
 
-### Step 5：恢复可接入的 workspace
+## 6. 已修复的接入问题
 
-- 实现 2-slot backpressure，或用实测证明更多 slot 对性能/内存更合理。
-- 重跑精度、长时间 Graph replay 和内存占用。
-- 只保留最终 slot 布局，不把原型 workspace 分支留在 production。
+### 6.1 Windowed GEMM grid 越界
 
-### Step 6：host 最小接入
+full-width 的 `sort_block_m=64, tile_m=32`，每个 sorted expert block 对应 2 个
+GEMM M tile；windowed 的 `tile_m=64`，只对应 1 个。host 现在统一计算：
 
-- runner 初始化时一次性创建 workspace、MORI external windows、service stream
-  以及 start/done event。
-- `__call__()` 只做固定参数组装、9 次 kernel launch/event 依赖和返回 output。
-- 不为 current/persistent 加运行时布尔分支；仓外 A/B 用显式 runner 完成。
+```python
+sorted_expert_blocks * SORT_BLOCK_M // TILE_M
+```
 
-### Step 7：回归和整网
+不能再写死 `* 2`。旧写法会让 M=32768 多 launch 一倍 block，并在整网中产生越界。
 
-- M=32768 uniform/skew，eager/Graph，output/shared alias。
-- M=2048 full-width 原路径。
-- 普通 Opus/FlyDSL Stage2、MegaMoE 和其他已接入 shape。
-- ATOM 整网 prefill/decode，记录端到端 latency/throughput 和显存。
+### 6.2 Decode 不应进入 fused runtime
 
-## 10. 验收门槛
+AITer runtime 不做普通 MoE fallback。ATOM 在模型层调用 `supports_comm_fused`，未映射
+bucket 直接走原普通 MoE。这保证 decode M=1 不会触发 `KeyError`，也不会把普通路径
+逻辑重新塞进 fused host。
 
-### 正确性
+### 6.3 Fused 方法不能覆盖普通 forward
 
-- uniform/skew 都通过。
-- eager 和 Graph 输出一致。
-- M=32768 精度与当前 KID 一致：`max_abs` 约 `0.8125`、`rel_l2`
-  约 `0.03013`。
-- local reduced shard 与 remote gathered shard 输出一致，shared-output alias 通过。
-- eager 和 Graph 各连续 1000 轮无 hang、无偶发 stale payload、无 epoch 错位。
+comm-fused 三参数实现使用 `forward_comm_fused_impl`；普通两参数 `forward_impl` 继续
+继承基类，保证同一个模块可以在 prefill/decode 间选择路径。
 
-### 性能
+## 7. 已验证结果
 
-- 在同一 TP8 进程中交替测量，使用 rank-max 七轮 median。
-- M=32768 uniform 和 skew 都必须至少稳定快约 1%，即以当前数据为参考
-  需达到约 `<= 2190 us`，否则不值得增加 production 复杂度。
-- M=2048 保持当前 full-width 性能，不接受稳定回退。
-- 不能用 RS/AG 局部变快掩盖 G/L 因 CU 被占用而变慢，最终只看完整 Stage2
-  Graph 和整网。
-- 整网没有 latency、throughput 或显存的不可接受回退。
+### 7.1 最终单算子 TP8 gate
 
-### 代码
+清理 loser 后的交替 graph A/B：
 
-- production 中不保留 loser grid、workspace 方案、debug counter 和实验分支。
-- 新 kernel 文件只包含 persistent candidate 必需的 producer publication、phase
-  synchronization 和 RS/AG loop。
-- host 不变成 planner，shape 到 runner 仍是一次字典查找。
-- 所有仓内修改都在 review 和 A/B 后再单独 commit，不直接 amend。
+| M | route | ordinary | comm-fused | speedup | max_abs | rel_l2 |
+|---:|:---|---:|---:|---:|---:|---:|
+| 2048 | uniform | 286.090 us | 256.953 us | 1.1134x | 0.7500 | 0.029969 |
+| 2048 | skew | 299.097 us | 262.957 us | 1.1374x | 0.7500 | 0.029988 |
+| 32768 | uniform | 3569.349 us | 1953.705 us | 1.8270x | 0.8125 | 0.030132 |
+| 32768 | skew | 3580.094 us | 1950.825 us | 1.8352x | 0.8125 | 0.030131 |
 
-## 11. 应立即停止的情况
+M=512/1024/4096/8192/16384 没有 runner 映射，模型层继续走原普通 MoE，因此
+persistent 接入不会让这些 bucket 回退。旧离线 probe 也证明 M=512 强行走 full-width
+graph 会慢约 2.6%～4.3%，所以不应为了“覆盖更多 shape”错误放开。
 
-出现下列任一情况，不继续向 production 堆叠保护逻辑：
+同一 persistent epoch 协议已完成 uniform、skew 各 10000 次 graph replay，无 hang、
+fault 或串轮，结果保持 bitwise 一致。
 
-- 多 stream HIP Graph 不能稳定 capture/replay。
-- 服务 CTA 保留导致 G/L 回退大于 launch/barrier 节省。
-- 只有占用过多 workspace 才能达到小于 1% 的不稳定收益。
-- 需要修改公共 GEMM emitter、MORI 或 runtime seam 才能勉强运行。
-- 长时间 replay 出现任何偶发 hang 或 stale data。
+### 7.2 DeepSeek-V4-Pro 整网
 
-这时保留当前约 2.2 ms 的 `windowed.py`，删除 persistent 候选即可，不影响
-已经完成的 production 接入。
+TP8、M=32768 prefill、output=1、concurrency=1、6 requests + 2 warmups：
 
-## 12. 后续方向，不属于第一版
+```text
+standard median TTFT     1162.724 ms
+comm_fused median TTFT   1059.366 ms
+median speedup           1.097566x
+TTFT reduction           8.889%
+completed                6/6
+```
 
-只有 persistent communication 已经稳定胜出后，才依次评估：
+结果：
 
-1. 将多个 G/L 窗口收缩成更少 producer launch。
-2. 让 persistent RS/AG 与 MORI SDMA all-gather 作为新的完整 KID 单独 A/B。
-3. 为新 model shape 离线生成固定 KID 记录，而不是把当前 kernel 改成动态万能
-   kernel。
-4. 只在 Opus/ASM 真正出现可替换 winner 时，增加显式 backend/KID 映射。
+```text
+/home/yifehuan/data/comm_fused_moe_full_model_m32768_ab_20260820
+```
 
-全 persistent G/L/RS/AG 仍是更后面的实验，因为它会让 service CTA 承担 GEMM 的
-LDS/寄存器配额，还需要将当前编译期 N-tile window 改成 kernel 内工作队列。
-这不符合第一版的轻量化和低回归风险目标。
+该测试同时覆盖 M=32768 persistent prefill、M=1 普通 decode、无 memory fault、无
+unsupported bucket 错误。
+
+## 8. 最终门禁状态
+
+- Python AST、`git diff --check`、旧 windowed 符号搜索：通过。
+- ATOM adapter：7/7 通过。
+- AITer runtime：3/3 通过。
+- M=2048 uniform/skew：通过。
+- M=32768 uniform/skew：通过。
+- persistent graph replay 10000 × uniform + 10000 × skew：通过。
+- DeepSeek-V4-Pro 整网 prefill/decode A/B：通过。
+- 仓内无临时测试、gpucore 或 production loser。
+
+精度门槛：
+
+```text
+M=32768: max_abs <= 1.0, rel_l2 <= 0.05
+其他 shape: 不差于各自清理前 production baseline
+```
+
+性能判断使用同节点、同容器、同输入、交替 A/B。单个 primitive 变快但完整 Stage2
+变慢时，按完整 Stage2 结果淘汰。
+
+## 9. 新 shape 的接入流程
+
+1. 从模型真实调用采集 `(M bucket, H, I, E, TOPK, TP)`。
+2. 先复用 collectives 和 host 生命周期，不复制 runtime/fallback。
+3. 为该 shape 选择 full-width 或 windowed producer，并离线搜索少量结构参数：
+   `WINDOW`、tile、local worker 数、service grid。
+4. 用完整 Stage2 而非单 primitive 选 winner。
+5. 通过 uniform、skew、spectrum、graph replay、整网门禁。
+6. 只把 winner 加入 runner 映射；删除 probe 和 loser。
+
+后续 Opus 或 ASM kernel 也遵循同一边界：模型层做能力选择，runtime 只查表，host 管
+资源与调度，kernel 文件实现 producer/service。不要为了预留后端重新引入 Protocol、
+多重开关或 runtime fallback。
