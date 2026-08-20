@@ -5,15 +5,16 @@ import functools
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+from flydsl._mlir.dialects import llvm
 from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
 from .utils import (
-    _buffer_scalar,
-    _global_flat_buffer,
+    _gep,
+    _global_base_ptr1,
     _global_i32_at,
-    _lds_f32_tiles,
+    _lds_ptr3,
     _mma_bf16,
     _raw,
     _udiv,
@@ -27,8 +28,12 @@ from .utils import (
 NUM_CU = 256
 
 
+# @flyc.jit is LOAD-BEARING: it AST-rewrites ``if token_id < i32_M`` into an scf.if.
+# Without it the guard runs as a plain Python if (dropped at trace), so the atomic-fadd
+# scatter fires on padded/OOB rows -- ~13x s2 regression (39us -> ~490us at E896).
+@flyc.jit
 def _atomic_bf16_epilog(
-    lds_raw_ptr,
+    lds_acc_base_i32,
     accm,
     arg_out,
     arg_stids,
@@ -50,34 +55,28 @@ def _atomic_bf16_epilog(
     _s_count = BN // 64  # each s-iter covers 64 cols (32 lanes x vec2)
     lane_div_16 = lane // fx.Int32(16)
     lane_mod_16 = lane % fx.Int32(16)
+    lds_base = _lds_ptr3(lds_acc_base_i32, fx.Int32(0))
 
     tx_i32 = fx.Int32(gpu.thread_id("x"))
     m_lane = tx_i32 // fx.Int32(32)
     n_lane = tx_i32 % fx.Int32(32)
     col_start = n_lane * fx.Int32(2)
-
-    # f32 C staging reuses the A-LDS region: scalar writes from the accumulators,
-    # then f32x2 reads along a row.
-    c_slab1 = _lds_f32_tiles(lds_raw_ptr, BM * BN, 1)
-    c_slab2 = _lds_f32_tiles(lds_raw_ptr, BM * BN, 2)
-    lds_store = fx.make_copy_atom(fx.UniversalCopy32b(), fx.Float32)
-    lds_load = fx.make_copy_atom(fx.UniversalCopy64b(), fx.Float32)
-
-    stids = _global_flat_buffer(arg_stids, T.i32)
-    sweights = _global_flat_buffer(arg_sweights, T.f32)
-    out_bf16 = _global_flat_buffer(arg_out, T.bf16)
-    load_i32 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Int32)
-    load_f32 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32)
-    atomic_bf16x2 = fx.make_copy_atom(
-        fx.rocdl.BufferAtomicPkAdd(fx.BFloat16), fx.BFloat16
-    )
+    stids_base = _global_base_ptr1(arg_stids)
+    sweights_base = _global_base_ptr1(arg_sweights)
+    out_base = _global_base_ptr1(arg_out)
 
     packed = []
     weight = []
     for mr in range_constexpr(M_REPS):
         sorted_pos = m_row + fx.Int32(mr * 8) + m_lane
-        packed.append(_buffer_scalar(load_i32, stids, sorted_pos, fx.Int32))
-        weight.append(_buffer_scalar(load_f32, sweights, sorted_pos, fx.Float32))
+        packed.append(
+            llvm.load(T.i32, _gep(stids_base, sorted_pos * fx.Int32(4)), invariant=True)
+        )
+        weight.append(
+            llvm.load(
+                T.f32, _gep(sweights_base, sorted_pos * fx.Int32(4)), invariant=True
+            )
+        )
 
     for i in range_constexpr(_kMChunks):
         row_base = fx.Int32(i * 16) + lane_div_16 * fx.Int32(4)
@@ -86,43 +85,33 @@ def _atomic_bf16_epilog(
             vec = Vec(accm[i][J])
             for v in range_constexpr(4):
                 idx = (row_base + fx.Int32(v)) * fx.Int32(BN) + col
-                frag = fx.make_rmem_tensor(1, fx.Float32)
-                frag.store(fx.Vector.from_elements([_raw(vec[v])], fx.Float32))
-                fx.copy(lds_store, frag, fx.slice(c_slab1, (None, idx)))
+                llvm.StoreOp(_raw(vec[v]), _gep(lds_base, idx * fx.Int32(4)))
 
     gpu.barrier()
 
-    def scatter_one(mr, token_id):
-        row_in_block = fx.Int32(mr * 8) + m_lane
-        row_base_addr = (
-            token_id * fx.Int32(N_OUT) + n_block_idx * fx.Int32(BN) + col_start
-        )
-        for s in range_constexpr(_s_count):
-            idx0 = row_in_block * fx.Int32(BN) + col_start + fx.Int32(s * 64)
-            v2_frag = fx.make_rmem_tensor(2, fx.Float32)
-            fx.copy(lds_load, fx.slice(c_slab2, (None, idx0 // fx.Int32(2))), v2_frag)
-            v2 = Vec(v2_frag.load())
-            pk = Vec.from_elements(
-                [v2[0] * weight[mr], v2[1] * weight[mr]], fx.Float32
-            ).to(fx.BFloat16)
-            out_frag = fx.make_rmem_tensor(2, fx.BFloat16)
-            out_frag.store(pk)
-            out_off = row_base_addr + fx.Int32(s * 64)
-            fx.copy(atomic_bf16x2, out_frag, out_bf16[None, out_off])
-
     for mr in range_constexpr(M_REPS):
+        row_in_block = fx.Int32(mr * 8) + m_lane
         token_id = packed[mr] & fx.Int32(0x00FFFFFF)
-
-        # @flyc.jit is LOAD-BEARING: it AST-rewrites ``if token_id < i32_M`` into an
-        # scf.if. Without it the guard runs as a plain Python if (dropped at trace),
-        # so the atomic-fadd scatter fires on padded/OOB rows -- ~13x s2 regression
-        # (39us -> ~490us at E896).
-        @flyc.jit
-        def scatter_if_valid(token_id, mr):
-            if token_id < i32_M:
-                scatter_one(mr, token_id)
-
-        scatter_if_valid(token_id, mr)
+        if token_id < i32_M:
+            row_base_addr = (
+                token_id * fx.Int32(N_OUT) + n_block_idx * fx.Int32(BN) + col_start
+            )
+            for s in range_constexpr(_s_count):
+                idx0 = row_in_block * fx.Int32(BN) + col_start + fx.Int32(s * 64)
+                v2 = Vec(llvm.load(T.vec(2, T.f32), _gep(lds_base, idx0 * fx.Int32(4))))
+                pk = Vec.from_elements(
+                    [v2[0] * weight[mr], v2[1] * weight[mr]], fx.Float32
+                ).to(fx.BFloat16)
+                off = (row_base_addr + fx.Int32(s * 64)) * fx.Int32(2)
+                out_ptr = _gep(out_base, off)
+                llvm.AtomicRMWOp(
+                    llvm.AtomicBinOp.fadd,
+                    out_ptr,
+                    _raw(pk),
+                    llvm.AtomicOrdering.monotonic,
+                    syncscope="agent",
+                    alignment=4,
+                )
 
 
 def _gemm2_body_a16w4(
@@ -261,12 +250,13 @@ def _gemm2_body_a16w4(
     # ---- epilogue: atomic bf16 scatter (routing-weighted). K-loop done, so the A-LDS
     # region (offset 0) is reused for the epilog's f32 acc staging.
     gpu.barrier()
+    lds_acc_base_i32 = fx.Int32(fx.ptrtoint(lds_raw_ptr))
     accm_v = [
         [accm[i][J].load().ir_value() for J in range(num_acc_n)]
         for i in range(m_repeat)
     ]
     _atomic_bf16_epilog(
-        lds_raw_ptr,
+        lds_acc_base_i32,
         accm_v,
         arg_out,
         arg_stids,

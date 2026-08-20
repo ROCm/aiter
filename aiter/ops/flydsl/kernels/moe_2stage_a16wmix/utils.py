@@ -82,35 +82,6 @@ def _buffer_i32_scalar_read(tiles1, idx, atom):
     return fx.Int32(fx.Vector(fx.memref_load_vec(r))[0])
 
 
-def _global_flat_buffer(addr_i64, elem_ty, *, alignment=4):
-    """Whole-tensor buffer resource addressed as ``buf[None, i]``, i in ELEMENTS.
-
-    The buffer descriptor clamps out-of-range indices, so callers do not need their
-    own bounds check the way a raw pointer + GEP would.
-    """
-    ptr_ty = fx.PointerType.get(
-        elem_ty, address_space=fx.AddressSpace.Global, alignment=alignment
-    )
-    ptr = fx.inttoptr(ptr_ty, fx.Int64(addr_i64))
-    view = fx.Tensor(fx.make_view(ptr, fx.make_layout((1, 1), (1, 1))))
-    return fx.rocdl.make_buffer_tensor(view, max_size=True)
-
-
-def _buffer_scalar(atom, buf, idx, elem):
-    """Read one ``elem`` at element offset ``idx`` from a :func:`_global_flat_buffer`."""
-    frag = fx.make_rmem_tensor(1, elem)
-    fx.copy(atom, buf[None, idx], frag)
-    return fx.Vector(frag.load())[0]
-
-
-def _lds_f32_tiles(lds_raw_ptr, num_f32, tile_elems):
-    """``tile_elems``-wide f32 tiles over the LDS region, for ``fx.copy`` staging."""
-    flat = fx.make_view(
-        fx.recast_iter(fx.Float32, lds_raw_ptr), fx.make_layout(num_f32, 1)
-    )
-    return fx.logical_divide(flat, fx.make_layout(tile_elems, 1))
-
-
 def _int_to_llvm_ptr(addr, address_space):
     # int addr -> raw !llvm.ptr; to_llvm_ptr maps the semantic AS to the backend AS.
     ptr_ty = fx.PointerType.get(T.i8, address_space=address_space)

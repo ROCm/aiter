@@ -1092,27 +1092,7 @@ def _run_moe_reduction(
         stream = torch.cuda.current_stream()
     # expert_mask is sized by the global expert count (≠ w2.shape[0] under EP).
     num_experts = int(expert_mask.numel()) if use_mask else 0
-    # Tuning is passed as arguments, not read inside compile_moe_reduction: that
-    # is lru_cache'd on its arguments, so an env read there would escape the key.
-    _tpw = int(os.environ.get("MOE_REDUCE_TPW", "1"))
-    # fp8 elements per thread. Must divide the e8m0 scale block so a thread's
-    # span stays inside one block. 16 widens the load but halves the block the
-    # tile rule picks, leaving too few waves to hide latency; 8 measures faster.
-    _fp8_vec = int(os.environ.get("MOE_REDUCE_FP8VEC", "8"))
-    # Smallest power of two that still covers a whole row in one tile, so each
-    # workgroup reads its topk route rows as contiguous runs rather than strided
-    # halves. Only just big enough, to avoid idling threads past model_dim.
-    _reduce_block = int(os.environ.get("MOE_REDUCE_BLOCK", "0")) or None
-    if _reduce_block is None:
-        _vec = _fp8_vec if is_fp8 else (128 // (32 if out.dtype == torch.float32 else 16))
-        _need = -(-model_dim // _vec)
-        _reduce_block = 256
-        while _reduce_block < _need and _reduce_block < 1024:
-            _reduce_block *= 2
     reduce_exe = compile_moe_reduction(
-        fp8_vec=_fp8_vec,
-        tokens_per_wg=_tpw,
-        block=_reduce_block,
         topk=topk,
         model_dim=model_dim,
         dtype_str=_reduce_dtype_str,
