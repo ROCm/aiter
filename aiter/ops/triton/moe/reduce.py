@@ -16,6 +16,42 @@ except (ImportError, ModuleNotFoundError):
     _reduce_grouped_gluon_num_warps = None
 
 
+def validate_reduce_out(out, shape, dtype, device):
+    """Accept a caller-provided `out` buffer for reduce_grouped, or allocate one.
+
+    Lets a caller hand in a *slice* of a larger tensor so the reduction writes
+    its final rows in place, instead of writing a fresh buffer that the caller
+    then copies. The reduction reads `out.stride(0)` / `out.stride(1)`, so any
+    row-major-rows layout works -- `stride(0)` need not equal the row width, and
+    that is exactly what a `big[:n]` view gives when `big` is wider in rows only.
+
+    Asserts rather than silently allocating on a mismatch: a wrong shape means
+    the caller's model of the kernel's output geometry has broken, and taking
+    the fresh buffer would hide that behind a missing in-place write.
+    """
+    if out is None:
+        return torch.empty(shape, device=device, dtype=dtype)
+    assert tuple(out.shape) == tuple(shape), (
+        f"provided output buffer has shape {tuple(out.shape)}, "
+        f"but this call produces {tuple(shape)}"
+    )
+    assert out.dtype == dtype, (
+        f"provided output buffer has dtype {out.dtype}, but this call "
+        f"produces {dtype}"
+    )
+    assert out.device == torch.device(device), (
+        f"provided output buffer is on {out.device}, but this call runs on "
+        f"{device}"
+    )
+    # Only the trailing dim must be packed; stride(0) is free (slice of a
+    # taller tensor).
+    assert out.stride(-1) == 1, (
+        f"provided output buffer must be contiguous along its last dim, "
+        f"got strides {tuple(out.stride())}"
+    )
+    return out
+
+
 def reduce_grouped(
     x: torch.Tensor,
     indx: torch.Tensor,

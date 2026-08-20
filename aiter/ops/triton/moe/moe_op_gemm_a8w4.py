@@ -22,7 +22,7 @@ from aiter.ops.triton._triton_kernels.moe.moe_op_gemm_a8w4 import (
     _moe_gemm_a8w4 as _moe_gemm_a8w4_triton,
 )
 from aiter.ops.triton.moe.moe_routing.routing import RoutingData
-from aiter.ops.triton.moe.reduce import reduce_grouped
+from aiter.ops.triton.moe.reduce import reduce_grouped, validate_reduce_out
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH, load_config_json
 from aiter.ops.triton.utils.device_info import get_num_sms
@@ -63,6 +63,7 @@ def allocate_output(
     block_m,
     split_k,
     device,
+    y_out=None,
 ):
     # if the activations are gathered, then M is number of gather indices
     if gather_indx is not None:
@@ -78,8 +79,16 @@ def allocate_output(
     final_shape = (y_rows, N // reduction_n_matmul // reduction_n_reduction)
     matmul_output = torch.empty(matmul_shape, device=device, dtype=out_dtype)
     if scatter_indx is not None or split_k > 1:
-        final_output = torch.empty(final_shape, device=device, dtype=out_dtype)
+        final_output = validate_reduce_out(y_out, final_shape, out_dtype, device)
     else:
+        # No reduction runs: reduce_grouped early-returns the matmul buffer
+        # itself (indx is None and split_k == 1), so a caller-provided buffer
+        # would be silently dropped. Say so instead of writing nowhere.
+        assert y_out is None, (
+            "y_out was provided but this call has no grouped reduction "
+            "(scatter_indx is None and split_k == 1), so nothing would write "
+            "into it -- the result comes straight out of the matmul buffer."
+        )
         final_output = None
     return matmul_output, final_output
 
@@ -364,6 +373,12 @@ def moe_gemm_a8w4(
     # expert parallelism, where the other slots belong to another rank and are
     # never written, so the reduce must not sum them.
     gate_valid=None,
+    # Destination for the grouped reduction's result, instead of a freshly
+    # allocated buffer. May be a slice of a taller tensor -- the reduce writes
+    # through `out`'s strides -- which lets a caller whose consumer wants more
+    # rows than this GEMM produces skip a full-width copy. Requires a grouped
+    # reduction to actually run, i.e. scatter_indx is not None or split_k > 1.
+    y_out=None,
 ):
     """
     Y[:, :] = 0.
@@ -461,6 +476,7 @@ def moe_gemm_a8w4(
         config["block_m"],
         config["split_k"],
         x.device,
+        y_out=y_out,
     )
     # Companion ue8m0 scale buffer for the MXFP8 emit path.
     if out_mx_quant:
