@@ -128,8 +128,14 @@ def build_flash_attn_fp8_module(
     # running max grew this tile (corr==exp2(0)==1.0 exactly).  Wave-uniform
     # scf.if predicate (64-lane OR of corr<1) so the wave never diverges; EXACT,
     # not approximate.  After softmax warmup most tiles skip the rescale.
-    USE_SCHRAUDOLPH = False
+    USE_SCHRAUDOLPH = True
     USE_ROLLBACK = False
+
+    # ---- Appendix A constants ----
+    SCHRAUDOLPH_2P23 = 1 << 23  # 8388608
+    # C = 127*2^23 - 486411; the offset minimizes worst-case relative error of
+    # the linear-mantissa interpolation over one octave.
+    SCHRAUDOLPH_C = 127 * SCHRAUDOLPH_2P23 - 486411  # 1064866805
     # EXP2_SHIFT: scale all Schraudolph P up by 2^SHIFT.  A global P scale cancels
     # in the softmax normalization (O and L both scale), so this only repositions
     # P (range [2^-9,1]) within fp8 E4M3 -- a few bits up lifts small P out of the
@@ -243,23 +249,30 @@ def build_flash_attn_fp8_module(
         c_neg_inf = fx.Float32(float("-inf"))
         c_zero_f = fx.Float32(0.0)
 
-        # Schraudolph base-2 exp constants: 2^y ~= bitcast_f32(floor(2^23*y + B))
-        # with B = (127 - c)*2^23.  c ~= 0.0426 centers the linear-mantissa
-        # interpolation error of 2^frac around 0 (peak |err| ~2%).
-        c_2p23 = fx.Float32(float(1 << 23))
+        # Schraudolph base-2 exp constants (Appendix A): reading the bits of
+        # N = x*2^23 + C as an fp32 decodes to 2^E * (1+f) where x = E+f, i.e.
+        # the exponent is exact and only the mantissa is linearly interpolated.
+        # C = 127*2^23 - 486411 re-centers that interpolation error, halving the
+        # worst case from ~6% to ~3% -- well under the ~6% fp8 E4M3 floor that P
+        # is quantized to immediately afterwards.
+        c_2p23 = fx.Float32(float(SCHRAUDOLPH_2P23))
         # EXP2_SHIFT lifts all P up by 2^SHIFT (global scale cancels in softmax
         # normalization; only repositions P within fp8 E4M3, out of subnormals).
-        c_exp2_bias = fx.Float32((127.0 - 0.0426 + EXP2_SHIFT) * float(1 << 23))
+        c_exp2_bias = fx.Float32(
+            float(SCHRAUDOLPH_C) + EXP2_SHIFT * float(SCHRAUDOLPH_2P23)
+        )
 
         def _schraudolph(s, scale_x2p23, m_term):
             # 2^(s*scale_log2e - m_new*scale_log2e) via the Schraudolph bit trick,
-            # fused: biased = s*(scale_log2e*2^23) + (-m_new*scale_log2e*2^23 + B).
+            # fused: biased = s*(scale_log2e*2^23) + (-m_new*scale_log2e*2^23 + C).
             # The mul+add contracts to a single FMA under fastmath, so the whole
-            # exp2 is FMA + max + fptosi + (free) bitcast == 3 full-rate ops,
+            # exp2 is FMA + max + cvt_u32 + (free) bitcast == 3 full-rate ops,
             # vs the original mul+add+v_exp_f32 (~6 incl. the quarter-rate exp).
-            # Clamp >= 0 so deep-negative exponents (P underflow) map to 0.0.
+            # The convert is *unsigned* (v_cvt_u32_f32) to match the bit layout;
+            # the max clamps deep-negative exponents (P underflow) to +0.0 rather
+            # than relying on fptoui's poison-on-negative semantics.
             biased = _fmax(_fadd(_fmul(s, scale_x2p23), m_term), c_zero_f)
-            return arith.bitcast(T.f32, arith.fptosi(T.i32, _raw(biased)))
+            return arith.bitcast(T.f32, arith.fptoui(T.i32, _raw(biased)))
 
         DMA_BYTES = 16
         DMA_LANES = (NUM_WAVES // 2) * WARP_SIZE  # 256 (one 4-wave group)
@@ -585,19 +598,37 @@ def build_flash_attn_fp8_module(
 
             p_words = []
             if const_expr(USE_SCHRAUDOLPH):
-                # Fold scale_log2e and the 2^23 / bias affine into per-tile coeffs
-                # so each element's exp2 is one FMA + max + fptosi (full-rate).
+                # Fold scale_log2e and the 2^23 / C affine into per-tile coeffs so
+                # each element's exp2 is one FMA + max + cvt_u32 (all full-rate).
+                # Done packed over the whole vec<16xf32> (v_pk_fma / v_pk_max), so
+                # the per-element cost is half a VALU slot for the affine plus one
+                # convert -- vs the packed affine + quarter-rate v_exp_f32 before.
                 scale_x2p23 = _fmul(scale_log2e, c_2p23)
                 m_term = _fadd(_fmul(neg_scaled_m_new, c_2p23), c_exp2_bias)
+                sx_vec = Vec.from_elements([scale_x2p23], fx.Float32).broadcast_to(
+                    C_F32_PER_LANE
+                )
+                mt_vec = Vec.from_elements([m_term], fx.Float32).broadcast_to(
+                    C_F32_PER_LANE
+                )
+                zero_vec = Vec.filled(C_F32_PER_LANE, 0.0, fx.Float32)
+                i32_vec_ty = Vec.make_type(C_F32_PER_LANE, fx.Int32)
+                f32_vec_ty = Vec.make_type(C_F32_PER_LANE, fx.Float32)
                 for nt in range_constexpr(N_KV_TILES):
+                    biased = _fmax(
+                        _fadd(_fmul(Vec(s_accs[nt]), sx_vec), mt_vec), zero_vec
+                    )
+                    ps_v = Vec(
+                        arith.bitcast(
+                            f32_vec_ty, arith.fptoui(i32_vec_ty, _raw(biased))
+                        )
+                    )
                     for rg in range_constexpr(n_groups):
-                        ps = [
-                            _schraudolph(
-                                Vec(s_accs[nt])[rg * 4 + i], scale_x2p23, m_term
+                        p_words.append(
+                            _f32x4_to_fp8_word(
+                                *[ps_v[rg * 4 + i] for i in range_constexpr(4)]
                             )
-                            for i in range_constexpr(4)
-                        ]
-                        p_words.append(_f32x4_to_fp8_word(*ps))
+                        )
             else:
                 # Affine scale*S - scale*m computed packed (vector mulf/addf ->
                 # v_pk_*) over the whole vec<16xf32>; exp2 stays per-scalar
