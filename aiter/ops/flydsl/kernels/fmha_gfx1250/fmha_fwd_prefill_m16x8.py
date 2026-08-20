@@ -61,8 +61,9 @@ from .mha_buffer_managers import QManager16b, KManager16b, VManager16b, OManager
 
 # Single source of truth for gfx1250 Expert Scheduling Mode 2 (DEP_MODE=2). Lives
 # in mha_buffer_managers (where the _mem_* helpers emit the depctr covers) so the
-# setreg below and the covers flip in lockstep. See _set_sched_mode / _mem_asm.
-from .mha_buffer_managers import ENABLE_SCHED_MODE2, _wait_va_vdst
+# LLVM setreg (via the amdgpu-expert-scheduling-mode hint) and the covers flip in
+# lockstep. See _mem_asm.
+from .mha_buffer_managers import ENABLE_SCHED_MODE2, _ir
 from .mha_buffer_managers import _mem_global_load_b32, _mem_buffer_store
 
 # ============================================================================
@@ -175,27 +176,6 @@ def _max_i32(a, b):  # signed 32-bit max of two fx.Int32
     return fx.Int32(arith.maxsi(arith.unwrap(a), arith.unwrap(b)))
 
 
-# ---- gfx1250 Expert Scheduling Mode (SCHED_MODE, hwreg 26) ------------------
-# DEP_MODE=2 disables the conservative VA_VDST / VM_VSRC issue interlocks, so an
-# LDS/VMEM op no longer stalls until every outstanding VALU/WMMA has written back
-# -- the source of the ~24-cyc wmma->ds_load issue bubble (see
-# /jruan/notes/gfx1250_issue_bubble.md; mirrors fmha_kernel.py's _setreg(2074,2)).
-# hwreg enc = id | ((size-1)<<11) = 26 | (1<<11) = 2074 (offset 0, width 2);
-# value 2 = DEP_MODE bits[1:0]. CAUTION: LLVM has no model of this mode and will
-# NOT emit the s_wait_alu depctr_va_vdst cover a VALU->VGPR->ds_load RAW needs ->
-# silent wrong results if a load address is produced by a VALU op right before it.
-# ENABLE_SCHED_MODE2 is imported from mha_buffer_managers (single source of truth,
-# paired with the s_wait_alu 0 covers). Flip it there to toggle mode 2 + covers.
-_WAVE_SCHED_MODE_ENC = 26 | ((2 - 1) << 11)  # = 2074
-
-
-def _set_sched_mode(dep_mode):
-    """s_setreg_imm32_b32 hwreg(WAVE_SCHED_MODE, 0, 2), dep_mode."""
-    imm = arith.unwrap(arith.constant(_WAVE_SCHED_MODE_ENC, type=T.i32))
-    val = arith.unwrap(arith.constant(int(dep_mode), type=T.i32))
-    llvm_dialect.call_intrinsic(None, "llvm.amdgcn.s.setreg", [imm, val], [], [])
-
-
 # ============================================================================
 # Compute stages — EMPTY, unwired. Implemented and tested one at a time; the KV
 # streaming driver below lands (and is tested) first with these left inert.
@@ -210,18 +190,8 @@ def _wmma_bf16(a, b, c):
     a/b: v16 bf16 fragments; c: v8 f32 accumulator; returns the v8 f32 result
     (raw MLIR value, feed straight back as ``c`` to accumulate)."""
     v8f32 = fx.Vector.make_type(8, fx.Float32)
-    # mode-2 (DEP_MODE=2): the VA_VDST HW interlock that makes the wmma stall until the
-    # VALU producers of its operands retire is gone. The compiler still emits only an
-    # s_delay_alu HINT (calibrated assuming the interlock backstops it), so the wmma can
-    # read a half-written accumulator (o_resc = o_acc*corr) or P frag (cvt_pk_bf16) ->
-    # one 16x16 output fragment corrupts (per-d-tile band, finite or wild). Tie every
-    # operand through s_wait_alu depctr_va_vdst(0) (no-op unless mode 2). NOTE: a full
-    # s_wait_alu 0 drain here is NO better than va_vdst (measured 3/10 both @16384c) ->
-    # the residual is NOT a wmma-INPUT dep; it's a WAR on the wmma source regs (next V
-    # ds_load hoisted above the wmma overwrites its A-operand mid-read) -> covered
-    # structurally in _pv_gemm, not here.
     return rocdl_dialect.wmma_f32_16x16x32_bf16(
-        v8f32, _wait_va_vdst(a), _wait_va_vdst(b), _wait_va_vdst(c),
+        v8f32, _ir(a), _ir(b), _ir(c),
         signA=False, signB=False, modC=0, reuseA=False, reuseB=False,
     ).result
 
@@ -350,9 +320,7 @@ def _softmax(*, s, m_prev, d_prev, lane_idx, n_block,
     # ---- Pass 1: masked S values + running row max ----
     s_masked = []  # flattened (kvt, i) order
     for kvt in range(NKV):
-        # mode-2: drain va_vdst so the QK wmma writeback into s[kvt] has landed before
-        # this VALU (extract/mask/max) reads it (no HW interlock under DEP_MODE=2).
-        svec = fx.Vector(_wait_va_vdst(s[kvt]))
+        svec = fx.Vector(_ir(s[kvt]))
         for i in range(8):
             sval = fx.Float32(svec[i])
             if q_max is not None or q_min is not None or kv_len is not None:
@@ -501,11 +469,6 @@ def _core_attention(
     token ranges (``q_start``/``q_len`` and ``kv_start``/``kv_len``) — the only
     part that differs between varlen and batched layouts — and passes them here.
     """
-    # gfx1250 Expert Scheduling Mode 2: drop the VA_VDST/VM_VSRC issue interlocks
-    # for the whole compute (kills the wmma->ds_load bubble). See _set_sched_mode.
-    if ENABLE_SCHED_MODE2:
-        _set_sched_mode(2)
-
     warp_idx = _warp_id()
     lane_idx = _lane_id()
     kv_head, q_head_idx, seq_idx = _packed_tile_indices(gqa_ratio, warp_idx, lane_idx)
@@ -733,12 +696,8 @@ def _core_attention(
         )
 
         # ---- Rescale the running O by corr, then GEMM2 accumulates this tile. ----
-        # mode-2: o_acc[dt] is the PREVIOUS tile's PV-wmma output (iter_arg). The rescale
-        # mul is a wmma-writeback -> VALU RAW; DEP_MODE=2 has no VA_VDST interlock so the
-        # mul can read a half-written accumulator -> per-d-tile O corruption. Tie o_acc
-        # through va_vdst so the prior wmma writeback lands first (no-op unless mode 2).
         corr_vec = fx.Vector.from_elements([corr], fx.Float32).broadcast_to(8)
-        o_resc = [fx.Vector(_wait_va_vdst(o_acc[dt])) * corr_vec for dt in range(d_tiles)]
+        o_resc = [fx.Vector(_ir(o_acc[dt])) * corr_vec for dt in range(d_tiles)]
         o_new = _pv_gemm(
             v_mgr=v_mgr,
             v_lds=v_cur,
@@ -1179,6 +1138,7 @@ def _ensure_thd_kernel(
             stream=stream,
         )
 
+    _launch.compile_hints["llvm_options"] = {"amdgpu-expert-scheduling-mode": ENABLE_SCHED_MODE2}
     _launch_fns[key] = _launch
 
 
@@ -1266,6 +1226,7 @@ def _ensure_bshd_kernel(
             stream=stream,
         )
 
+    _launch.compile_hints["llvm_options"] = {"amdgpu-expert-scheduling-mode": ENABLE_SCHED_MODE2}
     _launch_fns[key] = _launch
 
 
