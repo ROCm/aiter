@@ -16,8 +16,9 @@ Same **256-thread Q4 FMA + last-sector map** as the 856.76 µs keeper:
   1024 B INT4, rank-tile **1152 B**. Not 64-writer 16 B ownership,
   not E8M0, not 1536 B B-scales.
 
-``quant_dtype``: ``'bf16'`` (fp32 codec math) or ``'fp16'`` (packed
-``v_pk_*_f16`` after in-kernel bf16→fp16). Payload HBM is GEMM bf16.
+``quant_dtype``: ``'fp16'`` (packed ``v_pk_*_f16`` after in-kernel
+bf16 to fp16; default) or ``'bf16'`` (fp32 codec math). Payload HBM
+is GEMM bf16.
 Pack into slim LDS (8 × 1152 B = 9216 B). Sequential 1-deep inbox.
 Grid ``min(tiles, 1216)``, 256 threads. Last-sector 64 B seq pad
 (IPC stride 1216 B at ``super_tile=1``). Compile-time ``super_tile``
@@ -64,8 +65,6 @@ RANK_TILE_I32 = RANK_TILE_BYTES // 4
 # Last-sector release: one extra 64 B line after CodecQ4 so seq does
 # not clobber scales. Stride of the IPC rank-tile is 1216 B.
 SUPER_TILES = (1, 2, 4, 8)
-RELEASE_JOINS = ("barrier", "wave")
-PAYLOAD_WAVES = (1, 4)
 RELEASE_I32_OFF = RANK_TILE_I32
 WIRE_TILE_I32 = RANK_TILE_I32 + 16
 WIRE_TILE_BYTES = WIRE_TILE_I32 * 4
@@ -593,23 +592,19 @@ class PackStorage:
 def make_qr_int4_quad_fanout_kernel(
     *,
     world_size: int = WORLD,
-    quant_dtype: str = "bf16",
+    quant_dtype: str = "fp16",
     codec: str = "c16q4",
     super_tile: int = 1,
-    release_join: str = "barrier",
-    payload_waves: int = 4,
 ):
     """Compile a TP8 INT4 two-shot with lockstep 64 B sector stores.
 
-    ``codec`` is compile-time ``'c16q4'`` (this worktree): 256-thread Q4
-    FMA map with group-16 E4M3 scales. ``quant_dtype`` is ``'bf16'`` or
-    ``'fp16'`` (payload HBM is still GEMM bf16). ``super_tile`` ST∈{1,2,4,8}
-    concatenates ST rank-tiles under one last-sector per phase.
-    ``release_join``: ``'barrier'`` (tid<8 poll + WG ``s_barrier``) or
-    ``'wave'`` (each wave's lanes 0–7 poll; SIMT reconverge, no WG join).
-    ``payload_waves``: 4 (lockstep 8-peer fanout across the WG) or 1
-    (wave 0 issues all NT payload + last-sector; no pre-publish WG barrier).
-    Last-sector store is already wave 0 (``linear < 8``).
+    ``codec`` is compile-time ``'c16q4'``: 256-thread Q4 FMA map with
+    group-16 E4M3 scales. ``quant_dtype`` is ``'fp16'`` (packed FMA) or
+    ``'bf16'`` (fp32 ALU); payload HBM is still GEMM bf16. ``super_tile``
+    ST in {1,2,4,8} concatenates ST rank-tiles under one last-sector per
+    phase. Release join is workgroup barrier (tid<8 poll); payload fanout
+    is lockstep 8-peer across the WG. Last-sector store is wave 0
+    (``linear < 8``).
     """
     if world_size != WORLD:
         raise ValueError(f"only world_size={WORLD} is implemented, got {world_size}")
@@ -619,14 +614,6 @@ def make_qr_int4_quad_fanout_kernel(
         raise ValueError(f"this worktree only implements codec='c16q4', got {codec!r}")
     if super_tile not in SUPER_TILES:
         raise ValueError(f"super_tile must be one of {SUPER_TILES}, got {super_tile!r}")
-    if release_join not in RELEASE_JOINS:
-        raise ValueError(
-            f"release_join must be one of {RELEASE_JOINS}, got {release_join!r}"
-        )
-    if payload_waves not in PAYLOAD_WAVES:
-        raise ValueError(
-            f"payload_waves must be one of {PAYLOAD_WAVES}, got {payload_waves!r}"
-        )
     use_bf16 = quant_dtype == "bf16"
     release_i32_off = super_tile * RANK_TILE_I32
     wire_tile_i32 = release_i32_off + 16
@@ -660,8 +647,11 @@ def make_qr_int4_quad_fanout_kernel(
         linear = wave * fx.Int32(QUADS_PER_WAVE) + quad
 
         pack_layout = fx.make_layout((WORLD, RANK_TILE_I32), (RANK_TILE_I32, 1))
+        # 64 B NT sectors of one 1152 B rank-tile: (sector, lane-in-quad)
+        # -> i32 start of the dwordx4. Isolated NT store stays explicit.
+        nt_own_layout = fx.make_layout((N_SECTORS, QUAD_LANES), (16, 4))
         atom_i32_layout = fx.make_layout((ATOMS, BLOCK), (BLOCK * 4, 4))
-        # tid → (scale_slot, pair_in_slot, lane_in_pair). Four E4M3 bytes
+        # tid -> (scale_slot, pair_in_slot, lane_in_pair). Four E4M3 bytes
         # live in the same i32 eight Q4 threads already stored.
         scale_own_layout = fx.make_layout(
             (BLOCK // GROUP, GROUP // PAIR, PAIR), (GROUP, PAIR, 1)
@@ -672,14 +662,21 @@ def make_qr_int4_quad_fanout_kernel(
         fanout_s8 = fx.make_layout((WORLD, 8), (1, WORLD))
         fanout_s2 = fx.make_layout((WORLD, 2), (1, WORLD))
         color_layout = fx.make_layout((GRID,), (1,))
-        # Inbox super-slot: (phase, bid, src) → i32 base. Sub-tile s is
-        # + s * RANK_TILE_I32 inside that slot; 64 B seq pad follows ST tiles.
+        # Inbox: (phase, bid, src, sub) -> i32 base of that rank-tile.
+        # Last-sector pad is ST * RANK_TILE_I32 after the ST tiles, not a
+        # fake tensor mode.
         wire_slot_layout = fx.make_layout(
-            (PHASES, GRID, WORLD),
-            (GRID * WORLD * wire_tile_i32, WORLD * wire_tile_i32, wire_tile_i32),
+            (PHASES, GRID, WORLD, super_tile),
+            (
+                GRID * WORLD * wire_tile_i32,
+                WORLD * wire_tile_i32,
+                wire_tile_i32,
+                RANK_TILE_I32,
+            ),
         )
 
         lds = fx.SharedAllocator().allocate(PackStorage).peek()
+        pack = lds.pack.view(pack_layout)
         smem_ptr = lds.pack.ptr
 
         peers = [_load_device_ptr(peer_ptrs, i) for i in range(WORLD)]
@@ -696,14 +693,14 @@ def make_qr_int4_quad_fanout_kernel(
         def _pack_off(peer, i32_idx):
             return fx.get_scalar(fx.crd2idx((peer, i32_idx), pack_layout))
 
-        def _rank_tile_i32(phase, src):
+        def _sub_tile_i32(phase, src, sub):
             slot = fx.get_scalar(
-                fx.crd2idx((fx.Int32(phase), bid, src), wire_slot_layout)
+                fx.crd2idx((fx.Int32(phase), bid, src, sub), wire_slot_layout)
             )
             return fx.Int32(flags_i32) + slot
 
-        def _sub_tile_i32(phase, src, sub):
-            return _rank_tile_i32(phase, src) + sub * fx.Int32(RANK_TILE_I32)
+        def _rank_tile_i32(phase, src):
+            return _sub_tile_i32(phase, src, fx.Int32(0))
 
         def _hbm_i32(tile, atom):
             slot = fx.get_scalar(fx.crd2idx((atom, tid), atom_i32_layout))
@@ -733,11 +730,10 @@ def make_qr_int4_quad_fanout_kernel(
                 _store_v4i32(out_rsrc, _hbm_i32(tile, atom), packed)
 
         def _lds_write_packet(peer, packed, scale, is_leader):
-            fx.ptr_store(packed, smem_ptr + _pack_off(peer, tid))
+            fx.memref_store(packed, pack, (peer, tid))
             if is_leader:
-                fx.ptr_store(
-                    scale,
-                    smem_ptr + _pack_off(peer, fx.Int32(SCALE_I32_OFF) + scale_slot),
+                fx.memref_store(
+                    scale, pack, (peer, fx.Int32(SCALE_I32_OFF) + scale_slot)
                 )
 
         def _pack_rs(atoms):
@@ -761,7 +757,10 @@ def make_qr_int4_quad_fanout_kernel(
                     peer, sec_in = fx.idx2crd(safe, fanout).unpack()
                     sector = fx.Int32(stripe * 8) + sec_in
                     if lin < limit:
-                        vec_idx = sector * fx.Int32(16) + liq * fx.Int32(4)
+                        vec_idx = fx.get_scalar(
+                            fx.crd2idx((sector, liq), nt_own_layout)
+                        )
+                        # 4xi32 NT vector cannot go through the i32 pack view.
                         v4 = fx.ptr_load(
                             smem_ptr + _pack_off(peer, vec_idx),
                             result_type=fx.Vector.make_type(4, fx.Int32),
@@ -772,12 +771,7 @@ def make_qr_int4_quad_fanout_kernel(
                         ) * fx.Int64(4)
                         _store_v4i32_nt_global(dest + byte_off, v4)
 
-                if payload_waves == 1:
-                    if wave == 0:
-                        for k in range_constexpr(WAVES):
-                            _emit(quad + fx.Int32(k * QUADS_PER_WAVE))
-                else:
-                    _emit(linear)
+                _emit(linear)
 
         def _fanout_release(phase, inbox_src, color):
             """Last 64 B after ST rank-tiles: seq=color on all 16 i32."""
@@ -794,22 +788,19 @@ def make_qr_int4_quad_fanout_kernel(
 
         def _publish(phase, inbox_src, color):
             _wait_vmem()
-            if payload_waves != 1:
-                gpu.barrier()
+            gpu.barrier()
             _fanout_release(phase, inbox_src, color)
 
         def _wait_release(phase, color):
-            poll_id = lane if release_join == "wave" else tid
-            if poll_id < WORLD:
-                elem = _rank_tile_i32(phase, poll_id) + fx.Int32(release_i32_off)
+            if tid < WORLD:
+                elem = _rank_tile_i32(phase, tid) + fx.Int32(release_i32_off)
                 _wait_flag(
                     _make_rsrc(
                         _extract_i64(peer_vec, rank) + fx.Int64(elem) * fx.Int64(4)
                     ),
                     color,
                 )
-            if release_join == "barrier":
-                gpu.barrier()
+            gpu.barrier()
 
         def _recv_q4(phase, src, sub):
             base = _sub_tile_i32(phase, src, sub)
@@ -933,9 +924,11 @@ def make_qr_int4_quad_fanout_kernel(
             stream=stream,
         )
 
-    launch_qr_int4_quad_fanout.func.__name__ = f"launch_qr_int4_quad_fanout_ws{world_size}_{codec}_{quant_dtype}_st{super_tile}_{release_join}_pw{payload_waves}"
+    launch_qr_int4_quad_fanout.func.__name__ = f"launch_qr_int4_quad_fanout_ws{world_size}_{codec}_{quant_dtype}_st{super_tile}"
     try:
-        qr_int4_quad_fanout.func.__name__ = f"qr_int4_quad_fanout_{codec}_{quant_dtype}_st{super_tile}_{release_join}_pw{payload_waves}"
+        qr_int4_quad_fanout.func.__name__ = (
+            f"qr_int4_quad_fanout_{codec}_{quant_dtype}_st{super_tile}"
+        )
     except AttributeError:
         pass
     return {
@@ -948,8 +941,6 @@ def make_qr_int4_quad_fanout_kernel(
         "rank_tile_bytes": RANK_TILE_BYTES,
         "wire_tile_bytes": wire_tile_bytes,
         "super_tile": super_tile,
-        "release_join": release_join,
-        "payload_waves": payload_waves,
         "grid": GRID,
         "block": BLOCK,
         "quant_dtype": quant_dtype,

@@ -123,8 +123,6 @@ def _run_rank(args) -> None:
         quant_dtype=args.quant_dtype,
         codec="c16q4",
         super_tile=args.super_tile,
-        release_join="barrier",
-        payload_waves=4,
     )
     compile_tokens = min(512, max(args.tokens))
     compile_hidden = max(args.hiddens)
@@ -277,11 +275,24 @@ def test_qr_int4_sqnr_vs_fp32_allreduce(tokens, hidden, label):
     rows = _spawn_tp8([(tokens, hidden)], time_it=False)
     row = rows[0]
     expected_st = _pick_st(tokens, hidden)
-    assert row["st_used"] == expected_st, (
-        f"{label}: host picked ST={row['st_used']}, expected {expected_st}"
-    )
+    assert (
+        row["st_used"] == expected_st
+    ), f"{label}: host picked ST={row['st_used']}, expected {expected_st}"
     assert row["sqnr_db"] >= SQNR_MIN_DB, (
         f"{label} tokens={tokens} hidden={hidden} ST={row['st_used']}: "
+        f"SQNR {row['sqnr_db']:.2f} dB < {SQNR_MIN_DB} (rel MAE {row['rel_mae']:.3e})"
+    )
+
+
+def test_qr_int4_bf16_codec_st1():
+    """bf16 codec is a distinct compile (v_fma_f32); keep one ST=1 case."""
+    tokens, hidden = 8, 1024
+    rows = _spawn_tp8([(tokens, hidden)], time_it=False, quant_dtype="bf16")
+    row = rows[0]
+    expected_st = _pick_st(tokens, hidden)
+    assert row["st_used"] == expected_st
+    assert row["sqnr_db"] >= SQNR_MIN_DB, (
+        f"bf16 tokens={tokens} hidden={hidden} ST={row['st_used']}: "
         f"SQNR {row['sqnr_db']:.2f} dB < {SQNR_MIN_DB} (rel MAE {row['rel_mae']:.3e})"
     )
 

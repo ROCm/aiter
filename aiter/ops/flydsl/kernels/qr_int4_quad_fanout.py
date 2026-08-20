@@ -13,8 +13,6 @@ import torch
 from .qr_int4_ipc import UncachedIpcHeap
 from .qr_int4_quad_fanout_kernel import (
     GRID,
-    PAYLOAD_WAVES,
-    RELEASE_JOINS,
     SUPER_TILES,
     TILE_BYTES,
     WORLD,
@@ -97,12 +95,10 @@ class QRInt4QuadFanout:
         device,
         rank: int,
         world_size: int = WORLD,
-        quant_dtype: str = "bf16",
+        quant_dtype: str = "fp16",
         codec: str = "c16q4",
         super_tile: int = 1,
         force_super: bool = False,
-        release_join: str = "barrier",
-        payload_waves: int = 4,
     ):
         if world_size != WORLD:
             raise ValueError(
@@ -112,13 +108,9 @@ class QRInt4QuadFanout:
             raise ValueError(
                 f"super_tile must be one of {SUPER_TILES}, got {super_tile!r}"
             )
-        if release_join not in RELEASE_JOINS:
+        if quant_dtype not in ("bf16", "fp16"):
             raise ValueError(
-                f"release_join must be one of {RELEASE_JOINS}, got {release_join!r}"
-            )
-        if payload_waves not in PAYLOAD_WAVES:
-            raise ValueError(
-                f"payload_waves must be one of {PAYLOAD_WAVES}, got {payload_waves!r}"
+                f"quant_dtype must be 'bf16' or 'fp16', got {quant_dtype!r}"
             )
         self.group = group
         self.device = device
@@ -128,8 +120,6 @@ class QRInt4QuadFanout:
         self.codec = codec
         self.super_tile = int(super_tile)
         self.force_super = bool(force_super)
-        self.release_join = release_join
-        self.payload_waves = int(payload_waves)
         self._compiled = False
 
         sts = [1]
@@ -142,8 +132,6 @@ class QRInt4QuadFanout:
                 quant_dtype=quant_dtype,
                 codec=codec,
                 super_tile=st,
-                release_join=self.release_join,
-                payload_waves=self.payload_waves,
             )
             self._by_st[st] = _StEngine(
                 spec=spec,
@@ -162,8 +150,6 @@ class QRInt4QuadFanout:
         self.wire_tile_bytes = primary.wire_tile_bytes
         self.quant_dtype = primary.spec["quant_dtype"]
         self.codec = primary.spec["codec"]
-        self.release_join = primary.spec["release_join"]
-        self.payload_waves = primary.spec["payload_waves"]
 
     def _pick_st(self, num_tiles: int) -> int:
         if self.force_super or self.super_tile == 1 or num_tiles > GRID:
