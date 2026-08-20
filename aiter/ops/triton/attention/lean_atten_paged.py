@@ -11,7 +11,10 @@ TO be added features:
 - Add GQA support
 - Misc
     - N_CTX with non-integer number of BLOCK_N (pad zeros or add mask)
-    -
+
+
+UPDATE:
+`lean Attention + Paged Attention` enhanced kernel is a candidate for deprecation from AITER repo in 2026/09
 """
 
 import torch
