@@ -70,10 +70,10 @@ def pa_decode(
     sliding_window: int = 0,
     ps: bool = True,
 ) -> None:
-    """FlyDSL replacement for ``pa_decode_gluon``.
+    """FlyDSL paged-attention fp8 decode.
 
-    The call signature and intermediate-buffer layouts match
-    ``pa_decode_gluon``. This kernel currently supports FP8 K/V caches,
+    The call signature and intermediate-buffer layouts follow the shared
+    aiter paged-attention decode API. This kernel currently supports FP8 K/V caches,
     BF16/FP16 queries, a 256-token context partition, and block sizes 16/64.
     ALiBi, attention sinks, sliding-window attention, and externally quantized
     FP8 queries are not supported.
@@ -133,6 +133,15 @@ def pa_decode(
     _, num_kv_heads, num_hgroups, block_size, hgroup_width = key_cache.shape
 
     assert num_hgroups == head_dim // 16 and hgroup_width == 16
+    # Q staging loads each lane's head_dim//16 elements in <=8-wide pieces, so a
+    # chunk wider than 8 that isn't a multiple of 8 would silently drop its tail
+    # (head_dim 192/320/448/...). Reject those rather than return wrong results.
+    q_chunk = head_dim // 16
+    if q_chunk > 8 and q_chunk % 8 != 0:
+        raise NotImplementedError(
+            f"pa_decode does not support head_dim={head_dim}: head_dim//16 "
+            f"({q_chunk}) must be <=8 or a multiple of 8"
+        )
     assert block_size in (
         16,
         64,
@@ -265,6 +274,12 @@ def pa_decode(
     psum = exp_sums
     pout = temporary_output
 
+    # An i32 element offset wraps once a single cache tensor passes 2^31
+    # elements (2 GiB at fp8). The wider math costs ~18% at block_size=64, so
+    # pay it only where it is needed. Both caches share the code path, so widen
+    # if either does.
+    wide_kv_addressing = max(key_cache.numel(), value_cache.numel()) >= 2**31
+
     with torch.cuda.device(dev):
         compiled = compile_pa_decode_tile(
             head_dim=head_dim,
@@ -276,7 +291,7 @@ def pa_decode(
             per_token_kv=per_token_kv,
             query_length=query_length,
             trans_v=trans_v,
-            device_index=dev.index,
+            wide_kv_addressing=wide_kv_addressing,
         )
 
     if num_partitions == 1:
