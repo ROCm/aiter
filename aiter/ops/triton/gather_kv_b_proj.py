@@ -6,8 +6,10 @@ import torch
 from aiter.ops.triton._triton_kernels.gather_kv_b_proj import (
     _next_pow2,
     _triton_gather_kv_b_proj,
+    _triton_gather_kv_b_proj_flat,
 )
 from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.device_info import get_num_sms
 
 
 def gather_kv_b_proj(
@@ -117,23 +119,40 @@ def gather_kv_b_proj(
     if arch_info.get_arch() in ("gfx942",) and ChunkK > 64:
         num_stages = 1
 
-    # Both impls partition (batch, head, KV chunk). The chunk axis is sized
-    # from `k_prefix`'s row count -- the batch's total output tokens -- rather
-    # than from `kv_indices`, whose length is a capacity in serving paths that
-    # pass a preallocated buffer far larger than the valid range `kv_indptr`
-    # describes. The per-sequence maximum would be tighter still, but the only
-    # thing that knows it is `kv_indptr`, which is on device and reading it
-    # here would cost a sync. So the axis is an upper bound: with B sequences
-    # in the batch it launches up to B x more programs than have work, and
-    # each of the extras loads two indptr entries and returns.
-    #
-    # Also the bound cannot be too *small*: a sequence's chunk count is
-    # computed in the kernel from its block span, and `ChunkK % block_size == 0`
-    # above makes ceil(blocks * block_size / ChunkK) == ceil(tokens / ChunkK),
-    # so no sequence ever asks for a chunk id this grid does not cover.
     max_kv_chunks = max(1, (total_kv_k + ChunkK - 1) // ChunkK)
-    grid = (batch_size * tp_k_head_num_k * max_kv_chunks,)
+    flat_token_grid = block_size == 1 and not is_fp4_weight
+    if flat_token_grid:
+        chunk_workers = min(
+            max_kv_chunks,
+            max(1, (get_num_sms() * 6 + tp_k_head_num_k - 1) // tp_k_head_num_k),
+        )
+        _triton_gather_kv_b_proj_flat[(tp_k_head_num_k * chunk_workers,)](
+            total_kv_k,
+            k_buffer,
+            k_scale,
+            kv_indices,
+            kv_proj_weight,
+            kv_proj_scale,
+            k_prefix,
+            v_prefix,
+            TpNumHeads=tp_k_head_num_k,
+            QkNopeHeadDim=qk_nope_head_dim,
+            VHeadDim=v_head_dim,
+            KV_CDim=weight_k,
+            KV_PeDim=qk_nope_pe_dim - qk_nope_head_dim,
+            ChunkK=ChunkK,
+            PaddedK=padded_k,
+            PaddedV=padded_v,
+            WEIGHT_PRESHUFFLE=weight_preshuffle,
+            PER_ROW_SCALE=per_row_scale,
+            NO_SCALE=no_scale,
+            GRID_STRIDE=chunk_workers < max_kv_chunks,
+            num_stages=num_stages,
+        )
+        return
+
     if is_fp4_weight:
+        grid = (batch_size * tp_k_head_num_k * max_kv_chunks,)
         fp4_scale_k_granularity = 32 if weight_preshuffle else 128
         _triton_gather_kv_b_proj[grid](
             batch_size,
@@ -164,6 +183,7 @@ def gather_kv_b_proj(
         )
         return
 
+    grid = (batch_size * tp_k_head_num_k,)
     _triton_gather_kv_b_proj[grid](
         batch_size,
         k_buffer,
