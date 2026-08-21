@@ -1086,30 +1086,18 @@ def fused_moe_1stage(
             activation,
         )
     else:
-        # A FLAT MXFP4 kernel tuned with xbf16=0 wants X already quantized: one asm pass
-        # writes the packed fp4 rows plus the e8m0 scale tiles it addresses, and zeroes
-        # moe_buf, which it needs because it accumulates into those rows with atomics.
-        flat_mxfp4_prequant = (
-            bool(flat) and quant_type == QuantType.per_1x32 and not xbf16
-        )
         if xbf16:
             # xquant happens inside the asm kernel for per_1x128
             a1 = hidden_states
             a1_scale = torch.empty(0, device="cuda")
-        elif flat_mxfp4_prequant:
-            token_cnt, dim = hidden_states.shape
-            a1 = torch.empty(
-                (token_cnt, dim // 2), dtype=dtypes.fp4x2, device=hidden_states.device
-            )
-            # Token x owns scale tile x: 32 rows of dim/32 bytes, of which only row 0
-            # carries data. The rest is the pitch the GEMM's addressing assumes.
-            a1_scale = torch.empty(
-                (token_cnt * 32, dim // 32),
-                dtype=dtypes.fp8_e8m0,
-                device=hidden_states.device,
-            )
-            aiter.fmoe_mxfp4_xquant_prepass(moe_buf, a1, a1_scale, hidden_states)
         else:
+            # The FLAT MXFP4 kernels all quantize X in-kernel (bf16=1) now, so the standalone
+            # activation pre-pass that used to serve a bf16=0 FLAT entry is gone. Such an entry
+            # must not fall through to the generic quantizer: it produces neither the scale-tile
+            # layout those kernels address nor the zeroed moe_buf their atomics require.
+            assert not (
+                bool(flat) and quant_type == QuantType.per_1x32
+            ), "FLAT MXFP4 entry published bf16=0, but the activation pre-pass was removed"
             quant_func = get_quant(quant_type)
             if hidden_states.dtype != q_dtype_a:
                 if quant_type == QuantType.per_1x128:
