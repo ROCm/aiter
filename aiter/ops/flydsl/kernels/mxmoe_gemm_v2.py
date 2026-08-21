@@ -1078,7 +1078,12 @@ def atomic_bf16_epilog(
                     e8m0 = ax_e - fx.Int32(_FP8_E8M0_SHIFT)
                     e8m0 = (e8m0 < fx.Int32(1)).select(fx.Int32(1), e8m0)
                     e8m0 = (amax_bits == fx.Int32(0)).select(fx.Int32(0), e8m0)
-                    block_scale = fx.Float32(_raw(e8m0 << fx.Int32(23)).bitcast(T.f32))
+                    # OPUS parity: store e8m0=0 for zero blocks, but cvt_scalef32 needs
+                    # scale=1.0 (not 0.0) or all-zero 32-col routes produce NaN fp8.
+                    block_scale = (amax_bits == fx.Int32(0)).select(
+                        fx.Float32(1.0),
+                        fx.Float32(_raw(e8m0 << fx.Int32(23)).bitcast(T.f32)),
+                    )
                     bs_raw = _raw(block_scale)
                     pk_ty = T.vec(2, T.i16)
 
