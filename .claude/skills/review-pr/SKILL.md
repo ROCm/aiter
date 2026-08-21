@@ -11,6 +11,11 @@ argument-hint: <PR number> [owner/repo]
 ## Step 1 — Fetch
 
 ```bash
+# Per-invocation scratch dir. Fixed /tmp paths collide: two reviews running at once
+# overwrite each other's pr.diff between the write and the read, and the second review
+# silently analyses the first one's diff under its own PR number. Observed.
+WORK=$(mktemp -d /tmp/review-pr-XXXXXX)
+
 PR=$1  # PR number from skill argument
 # Second argument, or a PR given as owner/repo#N, selects the repository. FlyDSL kernels
 # are reviewed from their own repo, so this must not be hard-coded to aiter.
@@ -18,22 +23,22 @@ REPO="${2:-ROCm/aiter}"
 case "$1" in */*#*) REPO="${1%#*}"; PR="${1##*#}";; esac
 
 # Full metadata
-gh pr view $PR --repo $REPO --json title,body,number,labels,files,author,reviews,comments > /tmp/pr_meta.json
+gh pr view $PR --repo $REPO --json title,body,number,labels,files,author,reviews,comments > "$WORK/pr_meta.json"
 
 # Diff
-gh pr diff $PR --repo $REPO > /tmp/pr.diff
+gh pr diff $PR --repo $REPO > "$WORK/pr.diff"
 
 # Linked issue (extract from body "fix: #NNN" or "close #NNN")
-ISSUE=$(cat /tmp/pr_meta.json | python3 -c "
+ISSUE=$(cat "$WORK/pr_meta.json" | python3 -c "
 import json,re,sys
 body = json.load(sys.stdin).get('body','') or ''
 m = re.search(r'(?:fix|close|resolve)[s]?[: ]*#(\d+)', body, re.I)
 print(m.group(1) if m else '')
 ")
-[ -n "$ISSUE" ] && gh issue view $ISSUE --repo $REPO --json title,body > /tmp/pr_issue.json
+[ -n "$ISSUE" ] && gh issue view $ISSUE --repo $REPO --json title,body > "$WORK/pr_issue.json"
 
 # Prior reviewer comments (top-level)
-cat /tmp/pr_meta.json | python3 -c "
+cat "$WORK/pr_meta.json" | python3 -c "
 import json,sys
 d = json.load(sys.stdin)
 for r in d.get('reviews',[]):
@@ -50,10 +55,19 @@ for c in d.get('comments',[]):
 # caught 0 of 3 known overflow defects and no run invoked the scanner at all. Put the candidate
 # list in context before the rule pass instead of relying on the reviewer to remember it.
 SCAN=.claude/skills/validate-kernel-pr/scan_index_width.py
-[ -x "$SCAN" ] && "$SCAN" --diff /tmp/pr.diff
+[ -x "$SCAN" ] && "$SCAN" --diff "$WORK/pr.diff"
 # The candidates above cannot be judged without deployment scale, and the scale facts are
 # useless 400 lines away from them -- print both together.
 cat .claude/skills/validate-kernel-pr/production_scale.md 2>/dev/null
+# FlyDSL repos only: legacy spellings, and tests this PR adds that `python3 <file>` never runs.
+S3=.claude/skills/downstream-impact-check/scan_downstream_consumers.py
+[ -x "$S3" ] && "$S3" --diff "$WORK/pr.diff" --aiter . 2>/dev/null
+
+for S2 in .claude/skills/review-flydsl-kernel/scan_legacy_spelling.py \
+          .claude/skills/review-flydsl-kernel/scan_unreachable_tests.py; do
+  [ -x "$S2" ] || continue
+  case "$S2" in *unreachable*) "$S2" --diff "$WORK/pr.diff" . ;; *) "$S2" --diff "$WORK/pr.diff" ;; esac
+done
 
 # Inline review comments (line-level code comments — often more specific than top-level)
 gh api "repos/$REPO/pulls/$PR/comments" | python3 -c "
