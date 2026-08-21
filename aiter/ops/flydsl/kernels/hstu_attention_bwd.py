@@ -390,7 +390,7 @@ def build_hstu_attention_bwd_dvdk(
         ) * fx.Int64(2)
         do_lds_byte_base = buffer_ops.extract_base_index(do_view, address_space=3)
 
-        # ── Copy-atom global->LDS DMA (buffer_load_lds via fx.copy) ──
+        # -- Copy-atom global->LDS DMA (buffer_load_lds via fx.copy) --
         # Mirrors flash_attn_gfx950's _buffer_load_lds helper: a BufferCopyLDS atom
         # drives the same buffer_load_lds instruction the raw ROCDL path did, but
         # through the FlyDSL copy-atom API (rebased buffer view + fx.copy). The atom
@@ -478,25 +478,22 @@ def build_hstu_attention_bwd_dvdk(
         c_neg_one_f = fx.Float32(-1.0)
         c_zero_f = fx.Float32(0.0)
 
+        def _exp2(x):
+            return fx.Float32(fx.rocdl.exp2(compute_type, x.ir_value()))
+
+        def _rcp(x):
+            return fx.Float32(fx.rocdl.rcp(compute_type, x.ir_value()))
+
         def silu_and_grad_batch(s_list):
             # Fast (non-IEEE) SiLU + derivative on fp32 lanes. The fastmath context
             # gives every add/mul the `fast` flag (matches the compile hints). exp2
-            # and rcp stay on the amdgcn approximate hardware ops: exp2 is emitted as
-            # the v_exp_f32 intrinsic directly because math.exp2 lowers to a slower
-            # expansion here (~1.6% on the dV/dK kernel); rcp uses the rocdl builder.
+            # and rcp use the rocdl builders (same path as hstu_attention_fwd).
             with arith.fastmath(arith.FastMathFlags.fast):
                 sc = [s * c_alpha for s in s_list]
                 tt = [s * c_neg_log2e for s in sc]
-                emu = [
-                    fx.Float32(
-                        llvm.call_intrinsic(
-                            compute_type, "llvm.amdgcn.exp2.f32", [t.ir_value()], [], []
-                        )
-                    )
-                    for t in tt
-                ]
+                emu = [_exp2(t) for t in tt]
                 den = [c_one_f + e for e in emu]
-                sig = [fx.Float32(rocdl.rcp(compute_type, d)) for d in den]
+                sig = [_rcp(d) for d in den]
                 silu = [sc[i] * sig[i] for i in range(len(s_list))]
                 grad = [
                     sig[i] * (c_one_f + sc[i] * (c_one_f + c_neg_one_f * sig[i]))
@@ -530,7 +527,7 @@ def build_hstu_attention_bwd_dvdk(
         # sweep at the tile's own row (contextual row-0 opener needs the full range).
         # Window: a KV row is seen only by queries within `max_attn_len` *ahead* of it
         # (KV-owned mirror of the dq window *lower* bound), so the causal `seq_len`
-        # upper bound can be capped at `kv_end + max_attn_len` — the beyond-window
+        # upper bound can be capped at `kv_end + max_attn_len` -- the beyond-window
         # query tiles were iterated and masked to zero before (see the opt log).
         # Targets clamp to the shared id `max_id`, so a target query's raw position
         # (up to seq_len) is unrelated to its effective id: if this KV tile lies
@@ -589,7 +586,7 @@ def build_hstu_attention_bwd_dvdk(
 
         # Direct dO global->LDS DMA, row-major [q, d].
         # OOB q rows fetch token 0's dO (finite); their P/dS are masked to 0 so the
-        # value is multiplied out — same safe-garbage contract as the Q DMA.
+        # value is multiplied out -- same safe-garbage contract as the Q DMA.
         c_stride_do_n = fx.Int32(stride_do_n)
         wave_lds_base_do = fx.Int64(do_lds_byte_base) + fx.Int64(wave_id) * fx.Int64(
             WARP_SIZE * DMA_BYTES
@@ -754,7 +751,7 @@ def build_hstu_attention_bwd_dvdk(
         def _dk_gather(c):
             # Q B-operand packs (4 adjacent q at a fixed hc) for output chunk c,
             # scalar-gathered from the *streamed* swizzled Q LDS view (col ->
-            # group col//MFMA_LANE_K, lane col%MFMA_LANE_K), reusing GEMM1's Q — no
+            # group col//MFMA_LANE_K, lane col%MFMA_LANE_K), reusing GEMM1's Q -- no
             # separate preshuffled q_t load.
             qb_packs = []
             for ng in range_constexpr(Q_STREAM_SUBTILES):

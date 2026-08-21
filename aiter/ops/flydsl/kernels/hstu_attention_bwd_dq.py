@@ -26,7 +26,7 @@ import functools
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir.dialects import fly, llvm
+from flydsl._mlir.dialects import fly
 from flydsl._mlir.dialects.fly_rocdl import TargetAddressSpace as _TargetAddressSpace
 from flydsl.expr import arith, buffer_ops, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Vector as Vec
@@ -253,7 +253,7 @@ def build_hstu_attention_bwd_dq(
         )
         k_lds_byte_base = buffer_ops.extract_base_index(k_view, address_space=3)
 
-        # ── Copy-atom global->LDS DMA (buffer_load_lds via fx.copy) ──
+        # -- Copy-atom global->LDS DMA (buffer_load_lds via fx.copy) --
         # Same idiom as the dvdk kernel / flash_attn_gfx950: a BufferCopyLDS atom
         # drives the buffer_load_lds instruction through the FlyDSL copy-atom API
         # (rebased buffer view + fx.copy). The atom hardcodes the cache-policy/aux
@@ -339,26 +339,23 @@ def build_hstu_attention_bwd_dq(
         c_neg_one_f = fx.Float32(-1.0)
         c_zero_f = fx.Float32(0.0)
 
+        def _exp2(x):
+            return fx.Float32(fx.rocdl.exp2(compute_type, x.ir_value()))
+
+        def _rcp(x):
+            return fx.Float32(fx.rocdl.rcp(compute_type, x.ir_value()))
+
         def silu_grad_batch(s_list):
             """silu'(alpha*s) = sigma*(1 + alpha*s*(1-sigma)); same fast sigmoid as forward.
 
-            The fastmath context gives every add/mul the `fast` flag; exp2 and rcp stay
-            on the amdgcn approximate hardware ops (exp2 emitted as the v_exp_f32
-            intrinsic directly since math.exp2 lowers to a slower expansion; rcp via the
-            rocdl builder)."""
+            The fastmath context gives every add/mul the `fast` flag; exp2 and rcp use
+            the rocdl builders (same path as hstu_attention_fwd)."""
             with arith.fastmath(arith.FastMathFlags.fast):
                 sc = [s * c_alpha for s in s_list]
                 tt = [s * c_neg_log2e for s in sc]
-                emu = [
-                    fx.Float32(
-                        llvm.call_intrinsic(
-                            compute_type, "llvm.amdgcn.exp2.f32", [t.ir_value()], [], []
-                        )
-                    )
-                    for t in tt
-                ]
+                emu = [_exp2(t) for t in tt]
                 den = [c_one_f + e for e in emu]
-                sig = [fx.Float32(rocdl.rcp(compute_type, d)) for d in den]
+                sig = [_rcp(d) for d in den]
                 return [
                     sig[i] * (c_one_f + sc[i] * (c_one_f + c_neg_one_f * sig[i]))
                     for i in range(len(s_list))
