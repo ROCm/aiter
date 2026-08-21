@@ -18,6 +18,11 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+def _strided_int_vector(values):
+    interleaved = [item for value in values for item in (value, 99)]
+    return torch.tensor(interleaved, device="cuda", dtype=torch.int32)[::2]
+
+
 def _mqa_reference(q, cache, page_table, token_to_request, visible_groups):
     pages = page_table.index_select(0, token_to_request.long()).long()
     keys = cache[pages, :, 0, :].flatten(1, 2)
@@ -206,6 +211,90 @@ def test_qsa_selection_pipeline_matches_reference():
         torch.testing.assert_close(
             torch.sort(actual_valid).values,
             torch.sort(expected_valid).values,
+        )
+
+
+@pytest.mark.parametrize(
+    ("name", "values"),
+    (
+        ("token_to_request", [0, 1]),
+        ("query_positions", [4, 1]),
+        ("context_lens", [8, 2]),
+    ),
+)
+def test_qsa_paged_mqa_logits_rejects_strided_metadata(name, values):
+    q = torch.randn(2, 4, 16, device="cuda", dtype=torch.bfloat16)
+    cache = torch.randn(2, 4, 1, 16, device="cuda", dtype=torch.bfloat16)
+    arguments = {
+        "token_to_request": torch.tensor([0, 1], device="cuda", dtype=torch.int32),
+        "query_positions": torch.tensor([4, 1], device="cuda", dtype=torch.int32),
+        "context_lens": torch.tensor([8, 2], device="cuda", dtype=torch.int32),
+    }
+    arguments[name] = _strided_int_vector(values)
+
+    with pytest.raises(ValueError, match=rf"{name} must be contiguous"):
+        qsa_paged_mqa_logits(
+            q,
+            cache,
+            torch.tensor([[0], [1]], device="cuda", dtype=torch.int32),
+            **arguments,
+        )
+
+
+@pytest.mark.parametrize(
+    ("name", "values"),
+    (
+        ("token_to_request", [0, 1]),
+        ("query_positions", [5, 10]),
+        ("context_lens", [6, 11]),
+    ),
+)
+def test_qsa_expand_block_indices_rejects_strided_metadata(name, values):
+    arguments = {
+        "query_positions": torch.tensor([5, 10], device="cuda", dtype=torch.int32),
+        "context_lens": torch.tensor([6, 11], device="cuda", dtype=torch.int32),
+        "token_to_request": torch.tensor([0, 1], device="cuda", dtype=torch.int32),
+    }
+    arguments[name] = _strided_int_vector(values)
+
+    with pytest.raises(ValueError, match=rf"{name} must be contiguous"):
+        qsa_expand_block_indices(
+            torch.tensor([[0, -1], [1, 0]], device="cuda", dtype=torch.int32),
+            compress_ratio=4,
+            token_topk=8,
+            **arguments,
+        )
+
+
+def test_qsa_select_paged_tokens_rejects_strided_metadata():
+    q = torch.randn(2, 4, 16, device="cuda", dtype=torch.bfloat16)
+    cache = torch.randn(2, 4, 1, 16, device="cuda", dtype=torch.bfloat16)
+
+    with pytest.raises(ValueError, match="query_positions must be contiguous"):
+        qsa_select_paged_tokens(
+            q,
+            cache,
+            torch.tensor([[0], [1]], device="cuda", dtype=torch.int32),
+            torch.tensor([0, 1], device="cuda", dtype=torch.int32),
+            _strided_int_vector([4, 1]),
+            torch.tensor([8, 2], device="cuda", dtype=torch.int32),
+            token_topk=2,
+            compress_ratio=1,
+        )
+
+
+def test_qsa_sparse_paged_gqa_rejects_strided_metadata():
+    q = torch.randn(2, 4, 16, device="cuda", dtype=torch.bfloat16)
+    cache = torch.randn(2, 4, 2, 16, device="cuda", dtype=torch.bfloat16)
+
+    with pytest.raises(ValueError, match="token_to_request must be contiguous"):
+        qsa_sparse_paged_gqa(
+            q,
+            cache,
+            cache,
+            torch.tensor([[0], [1]], device="cuda", dtype=torch.int32),
+            torch.tensor([[0], [1]], device="cuda", dtype=torch.int32),
+            _strided_int_vector([0, 1]),
         )
 
 

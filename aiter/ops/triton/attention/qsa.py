@@ -83,6 +83,13 @@ def _require_hip_tensor(name: str, tensor: torch.Tensor) -> None:
         raise RuntimeError(f"{name} must be a CUDA/HIP tensor")
 
 
+def _validate_positive_integer(name: str, value: int) -> None:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{name} must be an int, got {value!r}")
+    if value <= 0:
+        raise ValueError(f"{name} must be positive, got {value}")
+
+
 def _validate_integer_vector(
     name: str,
     tensor: torch.Tensor,
@@ -93,6 +100,8 @@ def _validate_integer_vector(
         raise ValueError(f"{name} must be a one-dimensional int32/int64 tensor")
     if length is not None and tensor.shape[0] != length:
         raise ValueError(f"{name} must contain {length} entries")
+    if tensor.stride(0) != 1:
+        raise ValueError(f"{name} must be contiguous")
 
 
 def qsa_paged_mqa_logits(
@@ -114,6 +123,7 @@ def qsa_paged_mqa_logits(
     ``[pages, page_size, 1, head_dim]``. The result contains FP32 logits and the
     number of causally visible complete compression groups for every token.
     """
+    _validate_positive_integer("compress_ratio", compress_ratio)
     _require_hip_tensor("q", q)
     if q.ndim != 3 or q.shape[1] <= 0 or q.shape[2] <= 0:
         raise ValueError("q must have shape [tokens, heads, head_dim]")
@@ -140,9 +150,6 @@ def qsa_paged_mqa_logits(
         not all(compressed_k_cache.shape[:2]) or not all(page_table.shape)
     ):
         raise ValueError("paged QSA cache and page_table must be nonempty")
-    if compress_ratio <= 0:
-        raise ValueError("compress_ratio must be positive")
-
     divisor = math.sqrt(q.shape[2]) if score_divisor is None else score_divisor
     if divisor <= 0:
         raise ValueError("score_divisor must be positive")
@@ -260,6 +267,8 @@ def qsa_expand_block_indices(
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Expand compressed group indices and append each query's causal tail."""
+    _validate_positive_integer("compress_ratio", compress_ratio)
+    _validate_positive_integer("token_topk", token_topk)
     _require_hip_tensor("block_indices", block_indices)
     if block_indices.ndim != 2 or block_indices.dtype != torch.int32:
         raise ValueError("block_indices must be a two-dimensional int32 tensor")
@@ -270,8 +279,6 @@ def qsa_expand_block_indices(
     _validate_integer_vector("context_lens", context_lens)
     if context_lens.shape[0] == 0:
         raise ValueError("context_lens must be nonempty")
-    if compress_ratio <= 0 or token_topk <= 0:
-        raise ValueError("compress_ratio and token_topk must be positive")
     if token_topk % compress_ratio:
         raise ValueError("token_topk must be divisible by compress_ratio")
 
@@ -332,10 +339,11 @@ def qsa_select_paged_tokens(
     backend: str | None = None,
 ) -> torch.Tensor:
     """Run paged scoring, AITER radix top-k, and group-to-token expansion."""
-    if token_topk <= 0 or token_topk % compress_ratio:
-        raise ValueError("token_topk must be positive and divisible by compress_ratio")
-    if logits_workspace_bytes <= 0:
-        raise ValueError("logits_workspace_bytes must be positive")
+    _validate_positive_integer("token_topk", token_topk)
+    _validate_positive_integer("compress_ratio", compress_ratio)
+    _validate_positive_integer("logits_workspace_bytes", logits_workspace_bytes)
+    if token_topk % compress_ratio:
+        raise ValueError("token_topk must be divisible by compress_ratio")
     selected_backend = _normalize_backend(backend)
 
     rows = q.shape[0]
