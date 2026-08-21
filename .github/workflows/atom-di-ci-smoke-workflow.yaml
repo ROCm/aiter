@@ -216,7 +216,7 @@ jobs:
           special_nodelist_block = "\n".join(
               [
                   r'  if [[ -n "${NODE_LIST}" ]]; then',
-                  r"    printf '#SBATCH --nodelist=%s\n' \"${NODE_LIST}\" >> \"${SUBMIT_SCRIPT}\"",
+                  r'''    printf '#SBATCH --nodelist=%s\n' "${NODE_LIST}" >> "${SUBMIT_SCRIPT}"''',
                   r"  fi",
                   "",
               ]
@@ -224,9 +224,9 @@ jobs:
           special_pool_block = "\n".join(
               [
                   r'  if [[ -n "${NODE_LIST}" ]]; then',
-                  r"    printf '#SBATCH --nodelist=%s\n' \"${NODE_LIST}\" >> \"${SUBMIT_SCRIPT}\"",
+                  r'''    printf '#SBATCH --nodelist=%s\n' "${NODE_LIST}" >> "${SUBMIT_SCRIPT}"''',
                   r'  elif [[ -n "${SPUR_NODE_EXCLUDE:-}" ]]; then',
-                  r"    printf '#SBATCH --exclude=%s\n' \"${SPUR_NODE_EXCLUDE}\" >> \"${SUBMIT_SCRIPT}\"",
+                  r'''    printf '#SBATCH --exclude=%s\n' "${SPUR_NODE_EXCLUDE}" >> "${SUBMIT_SCRIPT}"''',
                   r"  fi",
                   "",
               ]
@@ -249,22 +249,44 @@ jobs:
                   "",
               ]
           )
-          patched_pool = False
+          patched_pool = 0
           for old_block, new_block in (
               (special_nodelist_block, special_pool_block),
               (standard_nodelist_block, standard_pool_block),
           ):
               if new_block in text:
-                  patched_pool = True
+                  patched_pool += 1
               elif old_block in text:
                   text = text.replace(old_block, new_block, 1)
-                  patched_pool = True
-          if not patched_pool:
-              raise SystemExit("Failed to find any Slurm nodelist submit block")
+                  patched_pool += 1
+          if patched_pool != 2:
+              raise SystemExit(
+                  f"Expected two Slurm nodelist submit blocks, found {patched_pool}"
+              )
 
           submit_path.write_text(text, encoding="utf-8")
           print(f"{submit_path}: patched explicit Spur Slurm task count")
           print(f"{submit_path}: patched dynamic Spur node-pool exclusion")
+
+          helper_path = Path(".github/scripts/atomesh/slurm_submit_helpers.sh")
+          text = helper_path.read_text(encoding="utf-8")
+          old_sacct = (
+              'sacct --accounting "${SPUR_ACCOUNTING_ADDR}" --brief --noheader '
+              '2>/dev/null | awk -v job_id="${job_id}" '
+              "'$1 == job_id { print $2 \"|\" $3; exit }' || true"
+          )
+          new_sacct = (
+              'sacct --controller "${SPUR_CONTROLLER_ADDR}" -j "${job_id}" '
+              '-n -o JobID,State,ExitCode 2>/dev/null | '
+              'awk -v job_id="${job_id}" '
+              "'$1 == job_id { print $2 \"|\" $3; exit }' || true"
+          )
+          if new_sacct not in text:
+              if old_sacct not in text:
+                  raise SystemExit("Failed to find Spur sacct exit-code query")
+              text = text.replace(old_sacct, new_sacct, 1)
+          helper_path.write_text(text, encoding="utf-8")
+          print(f"{helper_path}: patched Spur sacct exit-code query")
           models_path = Path(".github/benchmark/models_atomesh.yaml")
           text = models_path.read_text(encoding="utf-8")
           if "  GLM-5.2-FP8:" not in text:
@@ -620,29 +642,6 @@ jobs:
 
             cd "${shared_workspace}"
             chmod +x .github/scripts/atomesh/*.sh .github/scripts/atomesh/*.py
-            # Spur sacct compatibility: ATOM pd_submit.sh reads the Slurm exit
-            # code with flags Spur's sacct rejects (--accounting on the primary
-            # branch, -X/-P on the fallback) and without --controller, so the
-            # query returns empty and the job RC defaults to 1 -- marking runs
-            # that actually succeeded (gsm8k + benchmark) as failed. The "Patch
-            # ATOMesh smoke config" step rewrites the runner label so the FIRST
-            # (--accounting) branch is the one that runs here. Rewrite both
-            # branches to a Spur-compatible query: --controller + -j/-n/-o,
-            # awk-filtered by JobID to State|ExitCode.
-            patched=0
-            if grep -q -- '--accounting "${SPUR_ACCOUNTING_ADDR}" --brief --noheader' .github/scripts/atomesh/pd_submit.sh; then
-              sed -i "s@sacct --accounting \"\${SPUR_ACCOUNTING_ADDR}\" --brief --noheader@sacct --controller \"\${SPUR_CONTROLLER_ADDR}\" -j \"\${job_id}\" -n -o JobID,State,ExitCode@" .github/scripts/atomesh/pd_submit.sh
-              patched=1
-            fi
-            if grep -q -- '-X -n -P -o State,ExitCode' .github/scripts/atomesh/pd_submit.sh; then
-              sed -i "/-X -n -P -o State,ExitCode/c\\sacct_line=\"\$(sacct --controller \"\${SPUR_CONTROLLER_ADDR}\" -j \"\${job_id}\" -n -o JobID,State,ExitCode 2>/dev/null | awk -v job_id=\"\${job_id}\" '\$1==job_id { print \$2 \"|\" \$3; exit }' || true)\"" .github/scripts/atomesh/pd_submit.sh
-              patched=1
-            fi
-            if [ "$patched" = 1 ]; then
-              echo "[patch] pd_submit.sh sacct exit-code read made Spur-compatible"
-            else
-              echo "[patch] WARNING: no sacct anchor found in pd_submit.sh (ATOM_REF changed?); exit-code may be misread" >&2
-            fi
             cancel_helper="${result_dir}/${cell_id}.slurm-cancel.sh"
             rm -rf "${result_dir}/${cell_id}" \
                    "${result_dir}/${cell_id}-summary.md" \
