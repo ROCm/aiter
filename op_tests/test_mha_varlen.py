@@ -1328,6 +1328,7 @@ def test_mha_varlen_bwd_sink_variable_lengths(dtype):
 # cross-attention. kv_pad > 0 aligns each group's K/V rows up to that multiple, making
 # seqstart_k (real lengths) and seqstart_k_pad (physical offsets) diverge; the gaps are
 # NaN-filled so a read past a group's real seqlen_kv surfaces as NaN.
+# A kv seqlen of 0 is a group with no keys: out == 0 / lse == -inf exactly.
 #   (q seqlens, kv seqlens, nheads, nheads_k, kv_pad)
 _OPUS_D192_GROUP_CASES = [
     ([64, 200, 500], [64, 200, 500], 8, 2, 0),  # varlen self-attn, GQA
@@ -1342,6 +1343,10 @@ _OPUS_D192_GROUP_CASES = [
     ([1024, 1024], [640, 1024], 64, 8, 0),  # 4*64*2 = 512 -> head/tail merge, GQA
     ([200, 64, 700], [200, 64, 700], 8, 2, 256),  # KV padded to 256, GQA
     ([1, 300], [1024, 333], 16, 4, 64),  # KV padded + cross, GQA
+    ([256, 256], [0, 256], 8, 2, 0),  # no keys in the first group, GQA
+    ([128, 96, 300], [256, 0, 128], 8, 8, 0),  # no keys in a middle group, MHA
+    ([600, 100], [0, 33], 4, 1, 0),  # empty group spanning 3 Q blocks, MQA
+    ([100, 100], [0, 300], 8, 2, 64),  # empty group + KV padding, GQA
 ]
 
 
@@ -1350,7 +1355,8 @@ _OPUS_D192_GROUP_CASES = [
     "seqlens_q,seqlens_kv,nheads,nheads_k,kv_pad",
     _OPUS_D192_GROUP_CASES,
     ids=[
-        f"g{len(a)}_h{h}_hkv{hk}_pad{p}" for (a, _b, h, hk, p) in _OPUS_D192_GROUP_CASES
+        f"g{len(a)}_h{h}_hkv{hk}_pad{p}" + ("_emptykv" if 0 in b else "")
+        for (a, b, h, hk, p) in _OPUS_D192_GROUP_CASES
     ],
 )
 def test_fmha_fwd_bf16_opus_d192_v128_group(
@@ -1412,6 +1418,16 @@ def test_fmha_fwd_bf16_opus_d192_v128_group(
         ql, qh = int(cu_q[g]), int(cu_q[g + 1])
         kl = int(cu_k_pad[g])  # physical start, real length
         kh = kl + seqlens_kv[g]
+        if seqlens_kv[g] == 0:
+            # Assert the contract exactly rather than through attention_ref, whose
+            # degenerate-shape behaviour is its own question.
+            assert torch.equal(
+                out[ql:qh], torch.zeros_like(out[ql:qh])
+            ), f"group {g} has no keys, out must be exactly 0"
+            assert torch.isneginf(
+                lse[:, ql:qh]
+            ).all(), f"group {g} has no keys, lse must be -inf"
+            continue
         qg = q[ql:qh].unsqueeze(0)
         kg = k[kl:kh].unsqueeze(0)
         vg = v[kl:kh].unsqueeze(0)

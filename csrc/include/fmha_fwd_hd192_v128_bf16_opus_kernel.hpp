@@ -769,6 +769,60 @@ __device__ __attribute__((always_inline)) void gqa_d192_v128_impl(opus_gqa_d192_
         auto u_rk = make_layout_rk_su<T>(lane_id);
         auto u_rv = make_layout_rv_su<T>(lane_id);
 
+        // Result store, in its own lambda so the no-keys exit below can jump straight
+        // here, mirroring the production asm's `s_cmp_le_u32 s_KV_seq_len, 0 /
+        // s_cbranch_scc1 label_write_out`.
+        auto store_result = [&]() {
+            if (kargs.ptr_lse != nullptr && lane_id < T::W_M) {
+                constexpr D_ACC LN2 = D_ACC(0.69314718055994531f);   // 1 / log2(e)
+                const D_ACC lse = (l_row > D_ACC(0.0f))
+                                      ? ((m_row + __builtin_amdgcn_logf(l_row)) * LN2)
+                                      : -opus::numeric_limits<D_ACC>::infinity();
+                auto g_lse = make_gmem(reinterpret_cast<D_ACC*>(kargs.ptr_lse) + lse_batch_base +
+                                           (int64_t)h * kargs.stride_lse_h + q_block_start,
+                                       rec_bytes_lse(seqlen_q - q_block_start));
+                g_lse.store(lse, warp_id * T::Q_TILE_SIZE + lane_id);
+            }
+
+            D_ACC l_inv = (l_row > D_ACC(0.0f)) ? (D_ACC(1.0f) / l_row) : D_ACC(0.0f);
+            static_for<o_len>([&](auto i) { v_o[i.value] *= l_inv; });
+
+            // Widened store: each dwordx4 (VEC_O_X4) group is packed and stored one group
+            // at a time so store(g) overlaps the cvt/permlane of group g+1 (a monolithic
+            // pack would serialize that). group g owns v_o [g*VEC_O_X4, (g+1)*VEC_O_X4).
+            constexpr index_t VEC_X4    = T::VEC_O_X4;                                  // bf16 / dwordx4
+            constexpr index_t NUM_GROUP = o_len / VEC_X4;                               // store groups / lane
+            constexpr index_t GRP_U32   = VEC_X4 * sizeof(D_ATTN) / sizeof(opus::u32_t); // u32 regs / group
+            constexpr index_t GRP_HALF  = GRP_U32 / 2;                                  // permlane swap pairs
+            auto u_o  = make_layout_o_x4<T>(warp_id, lane_id, kargs.stride_o_n);
+            auto offs = opus::layout_to_offsets<VEC_X4>(u_o);
+            auto g_o  = make_gmem(reinterpret_cast<D_ATTN*>(kargs.ptr_o) + o_gmem_offset, o_num_records);
+            opus::static_for<NUM_GROUP>([&](auto g) {
+                auto grp_f  = slice(v_o, number<g.value * VEC_X4>{}, number<g.value * VEC_X4 + VEC_X4>{});
+                auto grp_bf = opus::cast<D_ATTN>(grp_f);
+                auto gu = __builtin_bit_cast(opus::vector_t<opus::u32_t, GRP_U32>, grp_bf);
+                // Swap this lane's high head_dim half [GRP_HALF, GRP_U32) with the lane±32
+                // partner's low half so each half ends up holding VEC_O contiguous head_dim
+                // → together VEC_O_X4 contiguous per lane.
+                opus::static_for<GRP_HALF>([&](auto i) {
+                    opus::vector_t<opus::u32_t, 2> s =
+                        __builtin_amdgcn_permlane32_swap(gu[i.value], gu[i.value + GRP_HALF], false, true);
+                    gu[i.value] = s.x; gu[i.value + GRP_HALF] = s.y;
+                });
+                auto out = __builtin_bit_cast(opus::vector_t<D_ATTN, VEC_X4>, gu);
+                store<VEC_X4>(g_o, out, offs[g.value]);
+            });
+        };
+
+        // No keys at all: nothing to accumulate, and l_row == 0 already makes the store
+        // emit lse = -inf and O = 0. seqlen_kv is workgroup-uniform, so both wave groups
+        // exit together — neither reaches the stagger balancing barrier below.
+        if (num_kv_tiles == 0) {
+            clear(v_o);
+            store_result();
+            return;
+        }
+
         // ─── One pipelined phase (8 stages): gemm0+softmax-head of tile t into vs_cur
         //     while finishing softmax-tail + gemm1 of t-1 from vs_prev. cur/prev = smem
         //     buffer parity for t / t-1. ───
@@ -1034,47 +1088,7 @@ __device__ __attribute__((always_inline)) void gqa_d192_v128_impl(opus_gqa_d192_
     // Stagger: the group that skipped the prologue barrier does its extra one here.
     if (!stagger) { __builtin_amdgcn_s_barrier(); }
 
-    // ─── Optional LSE (fp32, natural log) ───
-    if (kargs.ptr_lse != nullptr && lane_id < T::W_M) {
-        constexpr D_ACC LN2 = D_ACC(0.69314718055994531f);   // 1 / log2(e)
-        const D_ACC lse = (l_row > D_ACC(0.0f))
-                              ? ((m_row + __builtin_amdgcn_logf(l_row)) * LN2)
-                              : -opus::numeric_limits<D_ACC>::infinity();
-        auto g_lse = make_gmem(reinterpret_cast<D_ACC*>(kargs.ptr_lse) + lse_batch_base +
-                                   (int64_t)h * kargs.stride_lse_h + q_block_start,
-                               rec_bytes_lse(seqlen_q - q_block_start));
-        g_lse.store(lse, warp_id * T::Q_TILE_SIZE + lane_id);
-    }
-
-    // ─── Normalize O and store to gmem ───
-    D_ACC l_inv = (l_row > D_ACC(0.0f)) ? (D_ACC(1.0f) / l_row) : D_ACC(0.0f);
-    static_for<o_len>([&](auto i) { v_o[i.value] *= l_inv; });
-
-    // Widened store: each dwordx4 (VEC_O_X4) group is packed and stored one group at a
-    // time so store(g) overlaps the cvt/permlane of group g+1 (a monolithic pack would
-    // serialize that). group g owns v_o elements [g*VEC_O_X4, (g+1)*VEC_O_X4).
-    constexpr index_t VEC_X4    = T::VEC_O_X4;                                  // bf16 / dwordx4
-    constexpr index_t NUM_GROUP = o_len / VEC_X4;                               // store groups / lane
-    constexpr index_t GRP_U32   = VEC_X4 * sizeof(D_ATTN) / sizeof(opus::u32_t); // u32 regs / group
-    constexpr index_t GRP_HALF  = GRP_U32 / 2;                                  // permlane swap pairs
-    auto u_o  = make_layout_o_x4<T>(warp_id, lane_id, kargs.stride_o_n);
-    auto offs = opus::layout_to_offsets<VEC_X4>(u_o);
-    auto g_o  = make_gmem(reinterpret_cast<D_ATTN*>(kargs.ptr_o) + o_gmem_offset, o_num_records);
-    opus::static_for<NUM_GROUP>([&](auto g) {
-        auto grp_f  = slice(v_o, number<g.value * VEC_X4>{}, number<g.value * VEC_X4 + VEC_X4>{});
-        auto grp_bf = opus::cast<D_ATTN>(grp_f);
-        auto gu = __builtin_bit_cast(opus::vector_t<opus::u32_t, GRP_U32>, grp_bf);
-        // Swap this lane's high head_dim half [GRP_HALF, GRP_U32) with the lane±32
-        // partner's low half so each half ends up holding VEC_O contiguous head_dim →
-        // together VEC_O_X4 contiguous per lane.
-        opus::static_for<GRP_HALF>([&](auto i) {
-            opus::vector_t<opus::u32_t, 2> s =
-                __builtin_amdgcn_permlane32_swap(gu[i.value], gu[i.value + GRP_HALF], false, true);
-            gu[i.value] = s.x; gu[i.value + GRP_HALF] = s.y;
-        });
-        auto out = __builtin_bit_cast(opus::vector_t<D_ATTN, VEC_X4>, gu);
-        store<VEC_X4>(g_o, out, offs[g.value]);
-    });
+    store_result();
     };   // end run_pass lambda
 
     reverse = false;

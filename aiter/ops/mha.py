@@ -1973,7 +1973,8 @@ def _flash_attn_forward(
             return False
         # KV byte extent >= 2^32 wraps the kernel's 32-bit async-load soffset; fall back to
         # v3/CK. Actual seqlen stride (layout-aware, matches the C++ guard).
-        return not seqlen_k * k.stride(1) * k.element_size() >= 1 << 32
+        kv_stride = max(k.stride(1), v.stride(1))
+        return not seqlen_k * kv_stride * k.element_size() >= 1 << 32
 
     def _can_impl_fmha_fwd_hd192_v128_bf16_opus():
         # OPUS gfx950 dense D_QK=192 / D_V=128 bf16 forward. Enabled by DEFAULT (no env)
@@ -2943,6 +2944,7 @@ def _flash_attn_varlen_forward(
         ret = ret and (q_descale is None and k_descale is None and v_descale is None)
         ret = ret and (block_table is None)
         ret = ret and (not return_softmax)
+        ret = ret and (max_seqlen_q > 0 and max_seqlen_k > 0)
         return ret
 
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]

@@ -59,7 +59,8 @@ void launch_d128(at::Tensor& q,
 
     // 32-bit KV buffer-offset guard: extent >= 2^32 wraps the async-load soffset (silent
     // wrong output), reject instead.
-    const long long kv_slice_bytes = (long long)N_KV * (long long)k.stride(1) * 2LL;  // bf16
+    const long long kv_slice_bytes =
+        (long long)N_KV * std::max(k.stride(1), v.stride(1)) * 2LL;  // bf16
     TORCH_CHECK(kv_slice_bytes < (1LL << 32),
                 "OPUS D=128: KV byte extent ", kv_slice_bytes,
                 " reaches the 32-bit buffer-offset limit (2^32); reduce seqlen_kv or use another backend");
@@ -80,9 +81,15 @@ void launch_d128(at::Tensor& q,
     kargs.stride_q_b  = static_cast<int>(q.stride(0));
     kargs.stride_q_n  = static_cast<int>(q.stride(1));
     kargs.stride_q_h  = static_cast<int>(q.stride(2));
-    kargs.stride_kv_b = static_cast<int>(k.stride(0));
-    kargs.stride_kv_n = static_cast<int>(k.stride(1));
-    kargs.stride_kv_h = static_cast<int>(k.stride(2));
+    kargs.stride_o_b  = static_cast<int>(out.stride(0));
+    kargs.stride_o_n  = static_cast<int>(out.stride(1));
+    kargs.stride_o_h  = static_cast<int>(out.stride(2));
+    kargs.stride_k_b  = static_cast<int>(k.stride(0));
+    kargs.stride_k_n  = static_cast<int>(k.stride(1));
+    kargs.stride_k_h  = static_cast<int>(k.stride(2));
+    kargs.stride_v_b  = static_cast<int>(v.stride(0));
+    kargs.stride_v_n  = static_cast<int>(v.stride(1));
+    kargs.stride_v_h  = static_cast<int>(v.stride(2));
 
     if (softmax_scale <= 0.0f) {
         softmax_scale = 1.0f / std::sqrt(static_cast<float>(D));
@@ -254,7 +261,7 @@ void launch_d192_v128(at::Tensor& q,
     TORCH_CHECK(H_KV > 0 && (H % H_KV) == 0, "H must be divisible by H_KV (GQA group)");
     TORCH_CHECK(q.stride(-1) == 1 && k.stride(-1) == 1 && v.stride(-1) == 1 && out.stride(-1) == 1,
                 "q/k/v/out must be contiguous along the head dim");
-    if (B == 0 || H == 0) return;
+    if (B == 0 || H == 0 || num_q_blocks == 0) return;
 
     kargs.B = B; kargs.N = N; kargs.N_KV = N_KV; kargs.H = H; kargs.H_KV = H_KV;
 

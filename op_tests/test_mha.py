@@ -1122,6 +1122,7 @@ _OPUS_BATCH_CASES = [
     (2, 256, 65, 16, 4),  # cross, sk under one KV tile, GQA
     (2, 1, 1024, 8, 8),  # single query row, MHA
     (2, 1024, 640, 64, 8),  # 4*64*2 = 512 -> causal head/tail merge
+    (2, 300, 0, 8, 2),  # no keys at all -> zero KV tiles, every row fully masked
 ]
 
 _OPUS_BATCH_IDS = [
