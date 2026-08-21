@@ -13,7 +13,7 @@ this_dir = os.path.dirname(os.path.abspath(__file__))
 OPT_COMPILER_CONFIG = os.path.join(this_dir, "aiter", "jit", "optCompilerConfig.json")
 PACKAGE_NAME = "amd-aiter"
 
-FLYDSL_VERSION = "flydsl==0.3.2"
+FLYDSL_VERSION = "flydsl==0.3.1"
 
 BUILD_TARGET = os.environ.get("BUILD_TARGET", "auto")
 PREBUILD_KERNELS = int(os.environ.get("PREBUILD_KERNELS", "0"))
@@ -387,7 +387,8 @@ if PREBUILD_KERNELS != 0:
             prebuid_thread_num = min(prebuid_thread_num, getMaxJobs())
         os.environ["PREBUILD_THREAD_NUM"] = str(prebuid_thread_num)
 
-        # --- FlyDSL AOT pre-compilation (MOE + GEMM, before CK) ---
+        # FlyDSL AOT pre-compilation for all registered op kinds.
+        # Keep this before the CK ThreadPoolExecutor: the scheduler uses Linux fork.
         _prev_aot_import = os.environ.get("AITER_AOT_IMPORT")
         os.environ["AITER_AOT_IMPORT"] = "1"
         try:
