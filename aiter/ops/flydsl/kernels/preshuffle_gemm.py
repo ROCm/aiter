@@ -316,6 +316,10 @@ def compile_preshuffle_gemm(
     num_tiles = (K // tile_k) // k_split
     m_repeat = tile_m // 16
     num_waves = 4
+    # Warp grid for the tiled MMA: num_waves waves along N. The launcher and the
+    # in-kernel MFMA_Scale rebuild must build the *same* grid -- get_slice(tid) is
+    # indexed by the real thread count, so a mismatch partitions past the end.
+    warp_grid, warp_grid_stride = (1, num_waves, 1), (0, 1, 0)
     n_per_wave = tile_n // num_waves
     num_acc_n = n_per_wave // 16
     acc_size = m_repeat * num_acc_n * 4
@@ -393,7 +397,7 @@ def compile_preshuffle_gemm(
             )
             tiled_mma = fx.make_tiled_mma(
                 _scale_atom,
-                fx.make_layout((1, 4, 1), (0, 1, 0)),
+                fx.make_layout(warp_grid, warp_grid_stride),
                 fx.make_tile(None, None, fx.make_layout((32, 4), (1, 32))),
             )
         else:
@@ -932,7 +936,7 @@ def compile_preshuffle_gemm(
 
         tiled_mma = fx.make_tiled_mma(
             mma_atom,
-            fx.make_layout((1, 4, 1), (0, 1, 0)),
+            fx.make_layout(warp_grid, warp_grid_stride),
             fx.make_tile(None, None, k_perm),
         )
 
