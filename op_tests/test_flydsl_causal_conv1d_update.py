@@ -525,6 +525,21 @@ def test_vllm_matches_upstream_across_widths_and_dtypes(width, dtype, seqlen, sp
     _check_vllm_case(4, 256, width, seqlen, spec, seed=width * 17 + seqlen, dtype=dtype)
 
 
+def _skip_unless_free_hbm(need, what):
+    """Skip unless a buffer of ``need`` bytes fits with room to work in.
+
+    The wrap tests below are the only ones that have to allocate at production
+    scale. Half again the buffer covers the small-buffer comparison run and the
+    allocator's own slack.
+    """
+    free, _ = torch.cuda.mem_get_info(DEVICE)
+    if free < need * 3 // 2:
+        pytest.skip(
+            f"needs ~{need / 2**30:.1f} GiB free to place {what} past 4 GiB, "
+            f"{free / 2**30:.1f} GiB available"
+        )
+
+
 def test_vllm_addresses_a_conv_state_line_past_4gib():
     """A cache line beyond the 32-bit byte offset must still read its own history.
 
@@ -545,14 +560,7 @@ def test_vllm_addresses_a_conv_state_line_past_4gib():
     # Enough lines that the last ones are addressed past the 32-bit wrap, plus a
     # margin so it is the line itself and not a rounding of the boundary.
     num_cache_lines = (1 << 32) // line_bytes + 4096
-    need = num_cache_lines * line_bytes
-
-    free, _ = torch.cuda.mem_get_info(DEVICE)
-    if free < need * 3 // 2:
-        pytest.skip(
-            f"needs ~{need / 2**30:.1f} GiB free to place a cache line past 4 GiB, "
-            f"{free / 2**30:.1f} GiB available"
-        )
+    _skip_unless_free_hbm(num_cache_lines * line_bytes, "a conv_state line")
 
     gen = torch.Generator(device=DEVICE).manual_seed(4096)
     x = torch.randn((batch, dim, seqlen), generator=gen, device=DEVICE, dtype=DTYPE)
@@ -810,6 +818,154 @@ def test_sglang_matches_upstream_across_widths_and_dtypes(width, dtype, seqlen, 
     assert width in _SGLANG_WIDTHS and dtype in _SUPPORTED_DTYPES
     _check_sglang_case(
         4, 256, width, seqlen, spec, save_inter=spec, tree=False, dtype=dtype
+    )
+
+
+def test_sglang_addresses_a_conv_state_line_past_4gib():
+    """The vLLM-shaped kernel's 32-bit wrap, pinned on its sibling.
+
+    Both kernels index a cache that production sizes past the 32-bit buffer
+    offset, and both therefore need the cache-line term in the descriptor's
+    64-bit base. The two build their addresses separately, so the guarantee has
+    to be pinned separately: this kernel had the term back in the 32-bit offset
+    while every test still passed, because none of the others allocates a cache
+    big enough to reach the wrap.
+    """
+    batch, dim, width, seqlen = 2, 128, 4, 1
+    state_len = width - 1
+    line_bytes = dim * state_len * torch.finfo(DTYPE).bits // 8
+    num_cache_lines = (1 << 32) // line_bytes + 4096
+    _skip_unless_free_hbm(num_cache_lines * line_bytes, "a conv_state line")
+
+    gen = torch.Generator(device=DEVICE).manual_seed(8192)
+    x = torch.randn((batch, dim, seqlen), generator=gen, device=DEVICE, dtype=DTYPE)
+    weight = torch.randn((dim, width), generator=gen, device=DEVICE, dtype=DTYPE)
+    bias = torch.randn((dim,), generator=gen, device=DEVICE, dtype=DTYPE)
+    live = torch.randn(
+        (batch, dim, state_len), generator=gen, device=DEVICE, dtype=DTYPE
+    )
+
+    big = torch.zeros((num_cache_lines, dim, state_len), device=DEVICE, dtype=DTYPE)
+    indices = torch.arange(
+        num_cache_lines - batch, num_cache_lines, dtype=torch.int32, device=DEVICE
+    )
+    assert int(indices[0]) * line_bytes > (1 << 32), "the live lines are below the wrap"
+    big[indices[0] :] = live
+
+    out_fly = causal_conv1d_update_sglang_flydsl(
+        x.clone(),
+        big,
+        weight,
+        bias=bias,
+        activation="silu",
+        conv_state_indices=indices,
+    )
+    state_fly = big[indices[0] :].clone()
+    del big
+
+    # The same problem addressed well inside 32 bits. This interface skips on
+    # ``pad_slot_id``, which is -1, so line 0 is usable and the indices need no
+    # spare line ahead of them.
+    small = live.clone()
+    ref = _oracle_sglang(
+        x,
+        small,
+        weight,
+        bias,
+        torch.arange(batch, dtype=torch.int32, device=DEVICE),
+        None,
+    )
+
+    label = f"sglang >4GiB line {int(indices[0])}"
+    _assert_tracks_spec(label, out_fly, ref.spec, ref.scale)
+    _assert_no_worse_than(
+        label, out_fly, ref.out, ref.spec, ref.scale, "SGLang's own kernel"
+    )
+    _assert_bit_exact(label, "conv_state roll-back", state_fly, ref.state)
+
+
+def test_sglang_addresses_a_snapshot_line_past_4gib():
+    """The snapshot reaches the wrap sooner than conv_state, and it is a store.
+
+    Each snapshot line holds ``seqlen * (width - 1)`` windows where conv_state
+    holds one, so the same cache count crosses 2**31 elements at a fraction of
+    the slots -- and wrapping here writes, so it corrupts a line belonging to
+    another sequence instead of returning a wrong answer for its own.
+    """
+    batch, dim, width, seqlen = 2, 128, 4, 4
+    state_len = width - 1 + (seqlen - 1)
+    win_line_bytes = seqlen * dim * (width - 1) * torch.finfo(DTYPE).bits // 8
+    num_win_lines = (1 << 32) // win_line_bytes + 4096
+    _skip_unless_free_hbm(num_win_lines * win_line_bytes, "a snapshot line")
+
+    gen = torch.Generator(device=DEVICE).manual_seed(16384)
+    x = torch.randn((batch, dim, seqlen), generator=gen, device=DEVICE, dtype=DTYPE)
+    weight = torch.randn((dim, width), generator=gen, device=DEVICE, dtype=DTYPE)
+    bias = torch.randn((dim,), generator=gen, device=DEVICE, dtype=DTYPE)
+    conv_state = torch.randn(
+        (batch, dim, state_len), generator=gen, device=DEVICE, dtype=DTYPE
+    )
+    num_accepted = torch.randint(
+        1, seqlen + 1, (batch,), dtype=torch.int32, device=DEVICE, generator=gen
+    )
+    live_win = torch.randn(
+        (batch, seqlen, dim, width - 1), generator=gen, device=DEVICE, dtype=DTYPE
+    )
+
+    # conv_state stays small: what is being placed past the wrap is the
+    # snapshot, which carries its own index buffer.
+    cs_indices = torch.arange(batch, dtype=torch.int32, device=DEVICE)
+    win_indices = torch.arange(
+        num_win_lines - batch, num_win_lines, dtype=torch.int32, device=DEVICE
+    )
+    assert int(win_indices[0]) * win_line_bytes > (1 << 32), "lines below the wrap"
+
+    big = torch.zeros(
+        (num_win_lines, seqlen, dim, width - 1), device=DEVICE, dtype=DTYPE
+    )
+    big[win_indices[0] :] = live_win
+    state_fly = conv_state.clone()
+    out_fly = causal_conv1d_update_sglang_flydsl(
+        x.clone(),
+        state_fly,
+        weight,
+        bias=bias,
+        activation="silu",
+        conv_state_indices=cs_indices,
+        num_accept_tokens=num_accepted,
+        intermediate_conv_window=big,
+        intermediate_state_indices=win_indices,
+    )
+    win_fly = big[win_indices[0] :].clone()
+    # A wrapped store lands somewhere in the low lines, which the oracle's
+    # comparison cannot see, so check directly that nothing outside the slots
+    # this call owns was touched.
+    untouched = big[: win_indices[0]].count_nonzero().item()
+    del big
+
+    ref = _oracle_sglang(
+        x,
+        conv_state,
+        weight,
+        bias,
+        cs_indices,
+        num_accepted,
+        intermediate_conv_window=live_win,
+        intermediate_state_indices=torch.arange(
+            batch, dtype=torch.int32, device=DEVICE
+        ),
+    )
+
+    label = f"sglang >4GiB snapshot line {int(win_indices[0])}"
+    _assert_tracks_spec(label, out_fly, ref.spec, ref.scale)
+    _assert_no_worse_than(
+        label, out_fly, ref.out, ref.spec, ref.scale, "SGLang's own kernel"
+    )
+    _assert_bit_exact(label, "conv_state roll-back", state_fly, ref.state)
+    _assert_bit_exact(label, "intermediate_conv_window", win_fly, ref.window)
+    assert untouched == 0, (
+        f"{label}: {untouched} elements written below the sequences' own snapshot "
+        "lines, so a store wrapped"
     )
 
 
@@ -1888,6 +2044,8 @@ def _run_correctness():
             test_sglang_matches_upstream_across_widths_and_dtypes,
             _SGLANG_WIDTH_DTYPE_CASES,
         ),
+        (test_sglang_addresses_a_conv_state_line_past_4gib, [()]),
+        (test_sglang_addresses_a_snapshot_line_past_4gib, [()]),
         (test_sglang_dedup_conv_window_matches_dense, _DEDUP_CASES),
         (test_dispatch_seam_routes_to_flydsl, _SEAM_CASES),
         (test_dispatch_seam_falls_through_when_out_of_scope, [()]),

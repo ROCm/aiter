@@ -29,12 +29,13 @@ Design (shared by both)
   are ``tl.constexpr`` upstream, so every loop is unrolled.
 * Channel-independent work -- the cache-line index, the rollback offset, the
   tree parent chain -- is computed once and shared by the ``C`` channels.
-* Addressing splits the way vLLM's does: terms scaling with the batch or the
-  cache size (the ones vLLM casts to ``tl.int64``) are folded into the 64-bit
-  descriptor base, leaving the per-channel and per-token remainder in the 32-bit
-  offset. Without the split a conv_state or packed ``x`` above 4 GiB wraps and
-  reads the wrong lines with no fault. A descriptor base must be uniform, so the
-  indices feeding one are loaded scalar (see ``_cache_line``).
+* Addressing splits the way vLLM's does, in both kernels: terms scaling with the
+  batch or the cache size (the ones vLLM casts to ``tl.int64``) are folded into
+  the 64-bit descriptor base, leaving the per-channel and per-token remainder in
+  the 32-bit offset. Without the split a conv_state, packed ``x`` or snapshot
+  above 4 GiB wraps and reads or writes the wrong lines with no fault. A
+  descriptor base must be uniform, so the indices feeding one are loaded scalar
+  (see ``_cache_line`` and ``cs_line``).
 
 The upstream STEP 1-5 map across directly: read the ``width-1`` history columns
 at the rollback point (1), slide the conv_state window by ``1 if spec else
@@ -643,6 +644,7 @@ def build_causal_conv1d_update_sglang_module(
     W = width
     S = seqlen
     BN = block_n
+    ELEM_BYTES = 2  # bf16 / fp16 are the only element types this kernel takes
     CPT = int(channels_per_thread)
     HAS_BIAS = bool(has_bias)
     SILU = bool(silu)
@@ -733,6 +735,21 @@ def build_causal_conv1d_update_sglang_module(
         def _rsrc(ptr):
             return buffer_ops.create_buffer_resource_from_addr(ptr)
 
+        def _rsrc_at(ptr, index, stride):
+            """Descriptor whose base already includes ``index * stride`` elements.
+
+            The same 64/32 split the vLLM-shaped kernel makes: the hardware
+            buffer offset is 32 bits, so a term scaling with the cache size
+            cannot live there. conv_state and the snapshot both cross that line
+            at realistic cache sizes, the snapshot first because each of its
+            lines is ``seqlen * (width - 1)`` times larger. The two factors are
+            widened separately: their product is what overflows.
+            """
+            byte_offset = (
+                index.to(fx.Int64) * stride.to(fx.Int64) * fx.Int64(ELEM_BYTES)
+            )
+            return buffer_ops.create_buffer_resource_from_addr(ptr + byte_offset)
+
         def _load_i32(rsrc, off, is_scalar=False):
             return fx.Int32(
                 buffer_ops.buffer_load(
@@ -745,15 +762,13 @@ def build_causal_conv1d_update_sglang_module(
                 buffer_ops.buffer_load(rsrc, off, vec_width=1, dtype=elem_dtype)
             )
 
-        # Only the descriptors actually used; the rest are dummy pointers.
-        x_r = _rsrc(x_ptr)
+        # Only the descriptors actually used; the rest are dummy pointers. The
+        # index buffers come first: the data descriptors below are based off the
+        # cache lines these carry.
         w_r = _rsrc(w_ptr)
         b_r = _rsrc(bias_ptr) if fx.const_expr(HAS_BIAS) else None
-        cs_r = _rsrc(cs_ptr)
         csi_r = _rsrc(csi_ptr)
         nacc_r = _rsrc(nacc_ptr) if fx.const_expr(IS_SPEC) else None
-        o_r = _rsrc(o_ptr)
-        inter_r = _rsrc(inter_ptr) if fx.const_expr(SAVE_ANY) else None
         isi_r = _rsrc(isi_ptr) if fx.const_expr(SAVE_ANY) else None
         rnt_r = _rsrc(rnt_ptr) if fx.const_expr(TREE) else None
         rns_r = _rsrc(rns_ptr) if fx.const_expr(TREE) else None
@@ -773,6 +788,18 @@ def build_causal_conv1d_update_sglang_module(
         if fx.const_expr(HAS_NULL_BLOCK):
             seq_ok = seq_ok & (in_coord != null_block_id)
 
+        # A descriptor base must be uniform, and verify's per-lane copy above
+        # cannot feed one. Take a scalar copy for the base and leave the
+        # predicate reading the per-lane value the pipeline was tuned around.
+        cs_line = (
+            _load_i32(csi_r, idx_seq * scsi, is_scalar=True)
+            if fx.const_expr(IS_SPEC)
+            else in_coord
+        )
+        x_r = _rsrc_at(x_ptr, idx_seq, sx_seq)
+        o_r = _rsrc_at(o_ptr, idx_seq, so_seq)
+        cs_r = _rsrc_at(cs_ptr, cs_line, scs_seq)
+
         # rollback point: spec -> num_accept_tokens - 1, decode -> 0.
         if fx.const_expr(IS_SPEC):
             offset_dyn = _load_i32(nacc_r, idx_seq) - fx.Int32(1)
@@ -780,7 +807,9 @@ def build_causal_conv1d_update_sglang_module(
             offset_dyn = fx.Int32(0)
 
         if fx.const_expr(SAVE_ANY):
-            inter_coord = _load_i32(isi_r, idx_seq * sisi)
+            # Scalar because its only use is a descriptor base.
+            inter_coord = _load_i32(isi_r, idx_seq * sisi, is_scalar=True)
+            inter_r = _rsrc_at(inter_ptr, inter_coord, si_seq)
 
         # ---- EAGLE tree: parent map + per-token tap chain -------------------
         # Channel-independent, so built once here; the per-channel loop below only
@@ -844,9 +873,9 @@ def build_causal_conv1d_update_sglang_module(
         def _channel(gfeat):
             active = (gfeat < dim) & seq_ok
 
-            cs_base = in_coord * scs_seq + gfeat * scs_dim
-            x_base = idx_seq * sx_seq + gfeat * sx_dim
-            o_base = idx_seq * so_seq + gfeat * so_dim
+            cs_base = gfeat * scs_dim
+            x_base = gfeat * sx_dim
+            o_base = gfeat * so_dim
 
             # ============ PHASE 1: issue ALL loads up front ==================
             # All loads before any compute, so they stay in flight together. The
@@ -1017,14 +1046,14 @@ def build_causal_conv1d_update_sglang_module(
                     _store_run(
                         [col_raw[k] for k in fx.range_constexpr(1, W - 1)] + x_raw,
                         inter_r,
-                        inter_coord * si_seq + gfeat * si_dim,
+                        gfeat * si_dim,
                         si_win,
                         STREAM_LEN,
                         I_VEC,
                     )
 
                 if fx.const_expr(SAVE_INTER):
-                    i_base = inter_coord * si_seq + gfeat * si_dim
+                    i_base = gfeat * si_dim
                     for t in fx.range_constexpr(S):
                         row = i_base + fx.Int32(t) * si_step
                         _store_run(
