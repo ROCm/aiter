@@ -10,6 +10,7 @@ import torch
 
 _DTYPE_INFO = {
     torch.int8: ("|i1", 1, None),
+    torch.uint8: ("|u1", 1, None),
     torch.int16: ("<i2", 2, None),
     torch.int32: ("<i4", 4, None),
     torch.float32: ("<f4", 4, None),
@@ -76,3 +77,55 @@ class Stage2ScatterContext:
             or not self.source_token_map.is_contiguous()
         ):
             raise ValueError("source_token_map must be contiguous int32")
+
+
+@dataclass(frozen=True, slots=True)
+class FusedGatherContext:
+    """Resources the persistent GEMM's fused gather prologue reads.
+
+    Carries what the standalone ``moe_wire_gather_preshuffle`` launch would
+    have taken, so folding that pass into the GEMM is a matter of handing this
+    object over instead of running a kernel.
+
+    The destinations are not listed here: the prologue scatters into the GEMM's
+    own ``a`` and ``a_scales``, writing the scales through the very argument the
+    mainloop reads them from, because two pointer arguments onto one buffer
+    would be noalias to each other.
+
+    ``num_valid_routes`` must be a real (1,) int32 tensor or an empty one --
+    the prologue reads a null data pointer as "no dead tail to skip", so a
+    stand-in buffer would be mistaken for a survivor count. ``grid_bar`` is the
+    zeroed grid-barrier counter, which the launch path resets every time
+    because the barrier leaves it at its end value.
+    """
+
+    wire: torch.Tensor
+    topids_to_rows: torch.Tensor
+    num_valid_routes: torch.Tensor
+    grid_bar: torch.Tensor
+    numel: int
+    feat_dim: int
+    wmma_rep: int
+    source_topk: int = 0
+    row_starts: torch.Tensor | None = None
+    route_max_m: int = 0
+
+    def __post_init__(self):
+        if self.numel <= 0:
+            raise ValueError("numel must be positive")
+        if self.feat_dim <= 0 or self.feat_dim % 32:
+            raise ValueError("feat_dim must be a positive multiple of 32")
+        if self.wmma_rep < 1:
+            raise ValueError("wmma_rep must be >= 1")
+        if self.source_topk < 0:
+            raise ValueError("source_topk must be non-negative")
+        if self.num_valid_routes.dtype != torch.int32:
+            raise ValueError("num_valid_routes must be int32")
+        if self.grid_bar.dtype != torch.int32 or self.grid_bar.numel() < 1:
+            raise ValueError("grid_bar must be a non-empty int32 counter")
+        if self.remap_rows and self.route_max_m <= 0:
+            raise ValueError("route_max_m must be positive when remapping rows")
+
+    @property
+    def remap_rows(self) -> bool:
+        return self.row_starts is not None

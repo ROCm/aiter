@@ -1953,3 +1953,419 @@ def build_moe_fused_route_psum_quant_scatter_module(
     }
 
     return launch_fused
+
+
+def wire_row_nbytes(feat_dim: int, quant_mode: str = "fp8") -> int:
+    """Bytes one EP dispatch row occupies when the payload is pre-quantized.
+
+    Layout is ``[payload | e8m0 scales]``: ``feat_dim`` bytes of e4m3 (or
+    ``feat_dim//2`` of e2m1) followed by one scale byte per 32-element MX block.
+    Mirrors ``MegaMoEStage2Config.dispatch_wire_nbytes``.
+    """
+    payload = feat_dim if quant_mode == "fp8" else feat_dim // 2
+    return payload + feat_dim // 32
+
+
+def build_moe_quant_wire_pack_module(
+    feat_dim: int,
+    quant_mode: str = "fp8",
+    ksplit: bool = True,
+):
+    """Quantize a rank's own activations into the EP dispatch wire rows.
+
+    Send-side half of the pre-quantized dispatch: each token is quantized once,
+    on the rank that owns it, into the ``[payload | e8m0]`` row the all-to-all
+    then ships verbatim. The receiver no longer quantizes at all, so the work
+    drops from ``token_num*topk`` routed rows to ``token_num`` local rows and
+    the wire carries roughly half the bytes of the bf16 format.
+
+    Scales are written in plain MX-block order. Preshuffling them into the WMMA
+    layout needs the destination's contiguous row index, which does not exist
+    until the receiver has routed, so that half lives in
+    ``build_moe_wire_gather_preshuffle_module``.
+
+    Grid : (ceil(num_tokens / warps_per_block), block_iters if ksplit else 1)
+    """
+    L = _quant_layout(feat_dim, quant_mode, 1)
+    if not L.use_pk8:
+        raise NotImplementedError(
+            "pre-quantized dispatch is currently enabled only for gfx1250 pk8"
+        )
+
+    payload_bytes_per_row = L.payload_bytes_per_row
+    wire_bytes_per_row = payload_bytes_per_row + L.scale_bytes_per_row
+    # The e8m0 bytes of a row are addressed as whole dwords inside the wire row,
+    # so both the row stride and the payload span must be dword aligned.
+    if payload_bytes_per_row % 4 or wire_bytes_per_row % 4:
+        raise NotImplementedError(
+            f"wire row must be dword aligned (payload={payload_bytes_per_row}B, "
+            f"row={wire_bytes_per_row}B)"
+        )
+    wire_dwords_per_row = wire_bytes_per_row // 4
+    payload_dwords_per_row = payload_bytes_per_row // 4
+
+    warps_per_block = L.warps_per_block
+    block_iters = L.block_iters
+    ksplit_tag = "" if ksplit else "_noKS"
+    module_name = (
+        f"moe_quant_wire_pack_fd{feat_dim}_{quant_mode}_{L.native_tag}{ksplit_tag}"
+    )
+
+    @flyc.kernel(name=module_name, known_block_size=[BLOCK_THREADS, 1, 1])
+    def wire_pack_kernel(
+        hidden: fx.Pointer,  # (num_tokens, feat_dim) bf16
+        wire: fx.Pointer,  # (num_tokens, wire_bytes_per_row) uint8
+        num_tokens: Int32,  # static bound the grid was sized for
+        num_tokens_ptr: fx.Pointer,  # (1,) int32 dynamic count, or null
+    ):
+        i32 = T.i32
+        f32 = T.f32
+
+        c0_i32 = arith.constant(0, type=i32)
+        c1_i32 = arith.constant(1, type=i32)
+        c4_i32 = arith.constant(4, type=i32)
+        c23_i32 = arith.constant(23, type=i32)
+        c254_i32 = arith.constant(254, type=i32)
+        c0_f32 = arith.constant(0.0, type=f32)
+
+        c_wave = arith.constant(L.wave_size, type=i32)
+        c_wire_dwords = arith.constant(wire_dwords_per_row, type=i32)
+        c_payload_dwords = arith.constant(payload_dwords_per_row, type=i32)
+        c_payload_bytes_per_block = arith.constant(L.payload_bytes_per_block, type=i32)
+        c_payload_bytes_per_lane = arith.constant(L.payload_bytes_per_lane, type=i32)
+        c_lanes_per_block = arith.constant(L.lanes_per_mx_block, type=i32)
+        c_elems_per_lane = arith.constant(L.elems_per_lane, type=i32)
+        c_wmma_rep = arith.constant(1, type=i32)
+
+        tid = fx.Uint32(fx.thread_idx.x)
+        bid = fx.Uint32(fx.block_idx.x)
+        warp_in_block = tid // c_wave
+        lane = tid - warp_in_block * c_wave
+        token = bid * arith.constant(warps_per_block, type=i32) + warp_in_block
+
+        # EP token counts are only known on device (capture-safe, no host sync):
+        # the grid covers the static bound and the tail warps drop out here. A
+        # null pointer means the caller has an exact static count.
+        count_is_dynamic = fx.Int64(ptrtoint(num_tokens_ptr)) != 0
+        token_count = fx.Uint32(num_tokens)
+        if count_is_dynamic:
+            token_count = fx.Uint32(
+                buffer_ops.buffer_load(
+                    ptr_rsrc(num_tokens_ptr), c0_i32, vec_width=1, dtype=i32
+                )
+            )
+
+        if fx.Uint32(token) < fx.Uint32(token_count):
+            # wmma_rep == 1 collapses the emitter's preshuffle stride to 1, so
+            # MX block b lands at row_base + b: the plain order the wire wants.
+            scale_row_dword_base = token * c_wire_dwords + c_payload_dwords
+
+            block_in_wave = fx.Uint32(lane) // fx.Uint32(c_lanes_per_block)
+            lane_in_block = lane - block_in_wave * c_lanes_per_block
+
+            qc = SimpleNamespace(
+                i32=i32,
+                f32=f32,
+                block_iters=1 if ksplit else block_iters,
+                payload_base=fx.Int64(ptrtoint(wire)),
+                payload_bytes_per_row=wire_bytes_per_row,
+                hidden_base=fx.Int64(ptrtoint(hidden)),
+                feat_bytes_per_row=feat_dim * 2,
+                feat_row_i32=token,
+                mx_blocks_per_wave_iter=L.mx_blocks_per_wave_iter,
+                mx_blocks_per_row=L.mx_blocks_per_row,
+                amax_shuffle_dists=L.amax_shuffle_dists,
+                is_fp8=L.is_fp8,
+                use_native=L.use_native,
+                use_pk8=L.use_pk8,
+                mx_dtype=L.mx_dtype,
+                c0_i32=c0_i32,
+                c1_i32=c1_i32,
+                c4_i32=c4_i32,
+                c23_i32=c23_i32,
+                c254_i32=c254_i32,
+                c0_f32=c0_f32,
+                c_wave=c_wave,
+                c_elems_per_lane=c_elems_per_lane,
+                c_payload_bytes_per_block=c_payload_bytes_per_block,
+                c_payload_bytes_per_lane=c_payload_bytes_per_lane,
+                c_wmma_rep=c_wmma_rep,
+                block_in_wave=block_in_wave,
+                lane_in_block=lane_in_block,
+                is_block_lead=lane_in_block == c0_i32,
+                dests=[
+                    SimpleNamespace(
+                        payload_row_i32=token,
+                        scale_row_dword_base=scale_row_dword_base,
+                    )
+                ],
+                scale_rsrc=ptr_rsrc(wire),
+            )
+            if const_expr(ksplit):
+                _emit_quant_one_k_group(qc, fx.Uint32(fx.block_idx.y))
+            else:
+                _emit_quant_block_loop(qc)
+
+    _grid_y_dim = block_iters if ksplit else 1
+
+    @flyc.jit
+    def launch_wire_pack(
+        hidden: fx.Pointer,
+        wire: fx.Pointer,
+        num_tokens: fx.Int32,
+        num_tokens_ptr: fx.Pointer,
+        grid_token_blocks: fx.Int32,
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
+    ):
+        grid_x = arith.index_cast(T.index, grid_token_blocks)
+        grid_y = arith.index_cast(T.index, arith.constant(_grid_y_dim, type=T.i32))
+        wire_pack_kernel(hidden, wire, num_tokens, num_tokens_ptr).launch(
+            grid=(grid_x, grid_y, 1),
+            block=(BLOCK_THREADS, 1, 1),
+            stream=stream,
+        )
+
+    launch_wire_pack.compile_hints = {
+        "llvm_options": {
+            "amdgpu-kernarg-preload": AITER_FLYDSL_KERNARG_PRELOAD,
+            "amdgpu-kernarg-preload-count": AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
+        },
+    }
+    launch_wire_pack.wire_bytes_per_row = wire_bytes_per_row
+    launch_wire_pack.warps_per_block = warps_per_block
+    return launch_wire_pack
+
+
+def build_moe_wire_gather_preshuffle_module(
+    feat_dim: int,
+    wmma_rep: int,
+    quant_mode: str = "fp8",
+    source_topk: int = 0,
+    remap_rows: bool = False,
+):
+    """Scatter pre-quantized wire rows into gemm1's A operand.
+
+    Receive-side counterpart of ``build_moe_quant_wire_pack_module``. Because
+    dispatch already delivered e4m3 payload plus e8m0 scales, this replaces the
+    old gather+quant pass with a copy: the payload moves verbatim into the
+    contiguous-M buffer and the scales are preshuffled into the WMMA layout,
+    which is only possible here because the destination row is what determines
+    the shuffle.
+
+    That preshuffle is a pure dword permutation. Source scale dword ``d`` holds
+    blocks ``4d..4d+3`` and the quant emitter's byte address
+    ``(row_base + d*wmma_rep)*4 + (b & 3)`` keeps those four bytes contiguous in
+    one destination dword, so a row moves as ``scale_dwords_per_row`` dword
+    copies at stride ``wmma_rep`` instead of per-byte scatters.
+
+    Grid : (ceil(numel / warps_per_block), 1, 1)
+    """
+    L = _quant_layout(feat_dim, quant_mode, wmma_rep)
+
+    payload_bytes_per_row = L.payload_bytes_per_row
+    wire_bytes_per_row = payload_bytes_per_row + L.scale_bytes_per_row
+    if payload_bytes_per_row % 4 or wire_bytes_per_row % 4:
+        raise NotImplementedError(
+            f"wire row must be dword aligned (payload={payload_bytes_per_row}B, "
+            f"row={wire_bytes_per_row}B)"
+        )
+    payload_dwords_per_row = payload_bytes_per_row // 4
+    scale_dwords_per_row = L.scale_dwords_per_row
+
+    wave_size = L.wave_size
+    warps_per_block = L.warps_per_block
+
+    # Widest dword-vector copy that divides the payload row evenly; the
+    # predicated tail only kicks in for feat_dims that are not a multiple of
+    # wave_size*copy_vec dwords.
+    copy_vec = 1
+    for cand in (4, 2, 1):
+        if payload_dwords_per_row % (wave_size * cand) == 0:
+            copy_vec = cand
+            break
+    copy_dwords_per_wave_iter = wave_size * copy_vec
+    copy_iters = (
+        payload_dwords_per_row + copy_dwords_per_wave_iter - 1
+    ) // copy_dwords_per_wave_iter
+    copy_has_tail = payload_dwords_per_row % copy_dwords_per_wave_iter != 0
+    scale_iters = (scale_dwords_per_row + wave_size - 1) // wave_size
+    scale_has_tail = scale_dwords_per_row % wave_size != 0
+
+    source_tag = f"srctk{source_topk}" if source_topk > 0 else "srcrow"
+    remap_tag = "_remap" if remap_rows else ""
+    source_topk_is_pow2 = source_topk > 0 and (source_topk & (source_topk - 1)) == 0
+    source_topk_shift = source_topk.bit_length() - 1 if source_topk_is_pow2 else 0
+
+    module_name = (
+        f"moe_wire_gather_preshuffle_fd{feat_dim}_r{wmma_rep}"
+        f"_{quant_mode}_{source_tag}{remap_tag}"
+    )
+
+    @flyc.kernel(name=module_name, known_block_size=[BLOCK_THREADS, 1, 1])
+    def gather_kernel(
+        wire: fx.Pointer,  # (recv_rows, wire_bytes_per_row) uint8
+        grouped_payload: fx.Pointer,
+        grouped_scale: fx.Pointer,
+        topids_to_rows: fx.Pointer,  # (numel,) int32 global rows
+        row_starts: fx.Pointer,  # (E,) int32, read iff remap_rows
+        route_max_m: Int32,  # masked route stride, read iff remap_rows
+        numel: Int32,
+        num_valid_routes: fx.Pointer,  # (1,) int32, or null
+    ):
+        i32 = T.i32
+
+        c0_i32 = arith.constant(0, type=i32)
+        c16_i32 = arith.constant(16, type=i32)
+
+        c_wave = arith.constant(wave_size, type=i32)
+        c_copy_vec = arith.constant(copy_vec, type=i32)
+        c_payload_dwords = arith.constant(payload_dwords_per_row, type=i32)
+        c_scale_dwords = arith.constant(scale_dwords_per_row, type=i32)
+        c_dst_scale_dwords_per_row = arith.constant(
+            L.dst_scale_dwords_per_row, type=i32
+        )
+        c_wmma_rep = arith.constant(wmma_rep, type=i32)
+        c_rows_per_tile = arith.constant(L.rows_per_tile, type=i32)
+        c_source_topk = arith.constant(source_topk, type=i32)
+        c_source_topk_shift = arith.constant(source_topk_shift, type=i32)
+
+        tid = fx.Uint32(fx.thread_idx.x)
+        bid = fx.Uint32(fx.block_idx.x)
+        warp_in_block = tid // c_wave
+        lane = tid - warp_in_block * c_wave
+        route = bid * arith.constant(warps_per_block, type=i32) + warp_in_block
+
+        num_valid_routes_is_set = fx.Int64(ptrtoint(num_valid_routes)) != 0
+        valid_route_count = fx.Uint32(numel)
+        if num_valid_routes_is_set:
+            valid_route_count = fx.Uint32(
+                buffer_ops.buffer_load(
+                    ptr_rsrc(num_valid_routes), c0_i32, vec_width=1, dtype=i32
+                )
+            )
+        route_in_range = fx.Uint32(route) < fx.Uint32(valid_route_count)
+        rows_rsrc = ptr_rsrc(topids_to_rows)
+        # The negative sentinel covers both dropped EP routes and the dead tail;
+        # a row derived from either would clobber a live route's payload.
+        row_raw = fx.Int32(DROPPED_ROUTE_ROW)
+        if route_in_range:
+            row_raw = fx.Int32(
+                buffer_ops.buffer_load(rows_rsrc, route, vec_width=1, dtype=i32)
+            )
+        row_is_mapped = row_raw >= fx.Int32(0)
+        if row_is_mapped:
+            row = fx.Uint32(row_raw)
+            if const_expr(remap_rows):
+                m = fx.Uint32(route_max_m)
+                expert = fx.Uint32(row) // m
+                slot = row - expert * m
+                row = (
+                    fx.Uint32(
+                        buffer_ops.buffer_load(
+                            ptr_rsrc(row_starts), expert, vec_width=1, dtype=i32
+                        )
+                    )
+                    + slot
+                )
+                if lane == c0_i32:
+                    buffer_ops.buffer_store(row, rows_rsrc, route)
+
+            scale_tile = fx.Uint32(row) // fx.Uint32(c_rows_per_tile)
+            row_in_tile = row - scale_tile * c_rows_per_tile
+            wmma_row = fx.Uint32(row_in_tile) // fx.Uint32(c16_i32)
+            row_lane16 = row_in_tile - wmma_row * c16_i32
+            out_row = scale_tile * c16_i32 + row_lane16
+            scale_row_dword_base = out_row * c_dst_scale_dwords_per_row + wmma_row
+
+            if const_expr(source_topk > 0):
+                if const_expr(source_topk_is_pow2):
+                    src_row = route >> c_source_topk_shift
+                else:
+                    src_row = fx.Uint32(route) // fx.Uint32(c_source_topk)
+            else:
+                src_row = row
+
+            src_rsrc = buffer_ops.create_buffer_resource_from_addr(
+                fx.Int64(ptrtoint(wire)) + fx.Uint64(src_row) * wire_bytes_per_row,
+                num_records_bytes=wire_bytes_per_row,
+            )
+            dst_rsrc = buffer_ops.create_buffer_resource_from_addr(
+                fx.Int64(ptrtoint(grouped_payload))
+                + fx.Uint64(row) * payload_bytes_per_row,
+                num_records_bytes=payload_bytes_per_row,
+            )
+
+            for it in range_constexpr(copy_iters):
+                dw = (
+                    arith.constant(it * copy_dwords_per_wave_iter, type=i32)
+                    + lane * c_copy_vec
+                )
+                if const_expr(copy_has_tail):
+                    if fx.Uint32(dw) < fx.Uint32(c_payload_dwords):
+                        chunk = buffer_ops.buffer_load(
+                            src_rsrc, dw, vec_width=copy_vec, dtype=i32
+                        )
+                        buffer_ops.buffer_store(chunk, dst_rsrc, dw)
+                else:
+                    chunk = buffer_ops.buffer_load(
+                        src_rsrc, dw, vec_width=copy_vec, dtype=i32
+                    )
+                    buffer_ops.buffer_store(chunk, dst_rsrc, dw)
+
+            scale_rsrc = ptr_rsrc(grouped_scale)
+            for it in range_constexpr(scale_iters):
+                sd = arith.constant(it * wave_size, type=i32) + lane
+                if const_expr(scale_has_tail):
+                    if fx.Uint32(sd) < fx.Uint32(c_scale_dwords):
+                        sval = buffer_ops.buffer_load(
+                            src_rsrc, c_payload_dwords + sd, vec_width=1, dtype=i32
+                        )
+                        buffer_ops.buffer_store(
+                            sval, scale_rsrc, scale_row_dword_base + sd * c_wmma_rep
+                        )
+                else:
+                    sval = buffer_ops.buffer_load(
+                        src_rsrc, c_payload_dwords + sd, vec_width=1, dtype=i32
+                    )
+                    buffer_ops.buffer_store(
+                        sval, scale_rsrc, scale_row_dword_base + sd * c_wmma_rep
+                    )
+
+    @flyc.jit
+    def launch_gather(
+        wire: fx.Pointer,
+        grouped_payload: fx.Pointer,
+        grouped_scale: fx.Pointer,
+        topids_to_rows: fx.Pointer,
+        row_starts: fx.Pointer,
+        route_max_m: fx.Int32,
+        numel: fx.Int32,
+        num_valid_routes: fx.Pointer,
+        grid_route_blocks: fx.Int32,
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
+    ):
+        grid_x = arith.index_cast(T.index, grid_route_blocks)
+        gather_kernel(
+            wire,
+            grouped_payload,
+            grouped_scale,
+            topids_to_rows,
+            row_starts,
+            route_max_m,
+            numel,
+            num_valid_routes,
+        ).launch(
+            grid=(grid_x, 1, 1),
+            block=(BLOCK_THREADS, 1, 1),
+            stream=stream,
+        )
+
+    launch_gather.compile_hints = {
+        "llvm_options": {
+            "amdgpu-kernarg-preload": AITER_FLYDSL_KERNARG_PRELOAD,
+            "amdgpu-kernarg-preload-count": AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
+        },
+    }
+    launch_gather.wire_bytes_per_row = wire_bytes_per_row
+    launch_gather.warps_per_block = warps_per_block
+    return launch_gather

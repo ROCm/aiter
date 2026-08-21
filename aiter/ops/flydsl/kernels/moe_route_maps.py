@@ -51,6 +51,23 @@ class _RouteCntStorage:
 
 
 @fx.struct
+class _RoutePsumStorage:
+    """LDS for the single-block g2l + route + psum + remap kernel.
+
+    ``lds0``/``lds1`` ping-pong twice: first for the Hillis-Steele scan over the
+    expert mask, then for the tile-aligned prefix sum over the route counts,
+    with the spare buffer left holding the exclusive per-expert starts. ``lut``
+    holds the global->local map and ``cnt`` the per-bucket route counter, both
+    live across the route loop, so neither can share the ping-pong pair.
+    """
+
+    lds0: fx.Array[fx.Int32, MAX_G2L_EXPERTS, 16]
+    lds1: fx.Array[fx.Int32, MAX_G2L_EXPERTS, 16]
+    lut: fx.Array[fx.Int32, MAX_G2L_EXPERTS, 16]
+    cnt: fx.Array[fx.Int32, MAX_ROUTE_BUCKETS, 16]
+
+
+@fx.struct
 class _RouteG2LStorage:
     """LDS for the fused global->local LUT + route kernel.
 
@@ -537,6 +554,286 @@ def build_moe_route_g2l_lds_module(weight_dtype="bf16"):
         },
     }
     return launch_route_g2l_lds
+
+
+def build_moe_ep_route_psum_fused_module(weight_dtype="bf16", ep_scatter=False):
+    """One launch for the whole EP route->contiguous-row pipeline.
+
+    Replaces the ``moe_g2l_lut`` -> ``moe_route_g2l*`` ->
+    ``moe_contiguous_psum_remap[_ep]`` chain with a single block that does all
+    four phases back to back:
+
+      A. Hillis-Steele scan over ``expert_mask`` -> global->local LUT in LDS.
+      B. one pass over the routes: LUT lookup, weight cast/mask into
+         ``gather_w``, and a *workgroup-scope* LDS atomic per kept route giving
+         its masked row ``slot + expert*max_m``.
+      C. tile-aligned prefix sum over the per-expert counts -> ``starts``
+         (kept in LDS) and ``psum``, plus ``masked_m``/``contiguous_m``.
+      D. a second pass over the routes rewriting each masked row into its
+         contiguous row ``starts[expert] + slot``, and, with ``ep_scatter``,
+         scattering the gemm2 P2P descriptor into ``ep_rowmap``.
+
+    Splitting these across kernels was what forced the counters through global
+    memory: the route counts are only final once every route has been seen, and
+    the starts only once every count is final. Inside one block those two
+    hazards are ``s_barrier``s, so the counter lives in LDS instead of taking a
+    device atomic per route, and ``starts`` never round-trips through global at
+    all.
+
+    B and D grid-stride the routes with the *same* stride, so a thread re-reads
+    only the ``topids_to_rows`` entries it wrote itself and the masked row needs
+    no cross-thread visibility. The per-expert counts do cross threads, which is
+    what the barrier between B and C is for.
+
+    Single workgroup: correct for any size, but it serialises the route passes,
+    so the caller keeps the multi-kernel path for large route counts. Requires
+    ``E_global <= MAX_G2L_EXPERTS`` and ``E <= MAX_ROUTE_BUCKETS``.
+    """
+
+    @flyc.kernel(
+        name=f"moe_ep_route_psum_fused{'_scat' if ep_scatter else ''}",
+        known_block_size=[MAX_G2L_EXPERTS, 1, 1],
+    )
+    def route_psum_kernel(
+        expert_mask: fx.Pointer,  # (n,) int32 0/1 global expert mask
+        topk_ids: fx.Pointer,  # (numel,) int32 GLOBAL expert ids
+        weight_in: fx.Pointer,  # (numel,) f32 route weights
+        masked_m: fx.Pointer,  # (E,) int32 out: kept routes per expert
+        topids_to_rows: fx.Pointer,  # (numel,) int32 out: contiguous rows
+        gather_w: fx.Pointer,  # (numel,) weight_dtype out
+        psum: fx.Pointer,  # (E,) int32 out: starts[e] + masked_m[e]
+        num_valid_routes: fx.Pointer,  # (1,) int32 in
+        tis: fx.Pointer,  # (recv_cap,) int32 recv slot -> origin enc
+        ep_rowmap: fx.Pointer,  # (cap_rows+1, 2) int32 flat out
+        n: Int32,  # E_global (mask length)
+        max_m: Int32,  # masked route stride
+        E: Int32,  # local bucket count / drop sentinel
+        tile_m: Int32,
+        topk: Int32,
+        max_tok: Int32,
+        slot_stride: Int32,
+    ):
+        i32 = T.i32
+        f32 = T.f32
+        wdt = {"bf16": T.bf16, "f16": T.f16}[weight_dtype]
+        c0 = arith.constant(0, type=i32)
+        c1 = arith.constant(1, type=i32)
+        dropped_row = arith.constant(DROPPED_ROUTE_ROW, type=i32)
+        tid = fx.Uint32(fx.thread_idx.x)
+        e_count = fx.Uint32(E)
+        max_m_u = fx.Uint32(max_m)
+        tile_u = fx.Uint32(tile_m)
+
+        lds = fx.SharedAllocator().allocate(_RoutePsumStorage).peek()
+        lds0 = lds.lds0.ptr
+        lds1 = lds.lds1.ptr
+        lds_lut = lds.lut.ptr
+        lds_cnt = lds.cnt.ptr
+        cnt_base_i64 = fx.Int64(fx.ptrtoint(lds_cnt))
+
+        m_rsrc = ptr_rsrc(expert_mask)
+        tk_rsrc = ptr_rsrc(topk_ids)
+        wi_rsrc = ptr_rsrc(weight_in)
+        w_rsrc = ptr_rsrc(gather_w)
+        out_rsrc = ptr_rsrc(topids_to_rows)
+        mm_rsrc = ptr_rsrc(masked_m)
+        p_rsrc = ptr_rsrc(psum)
+
+        nvr = buffer_ops.buffer_load(
+            ptr_rsrc(num_valid_routes), c0, vec_width=1, dtype=i32
+        )
+        nvr_i32 = fx.Uint32(nvr)
+
+        # ── Phase A: expert_mask -> global->local LUT ──
+        in_bucket = tid < e_count
+        if in_bucket:
+            _lds_store(lds_cnt, fx.Int32(0), tid)
+
+        in_range = tid < fx.Uint32(n)
+        if in_range:
+            m = buffer_ops.buffer_load(m_rsrc, tid, vec_width=1, dtype=i32)
+            nz = m != c0
+            _lds_store(lds0, fx.Int32(nz.select(c1, c0)), tid)
+
+        gpu.barrier()
+
+        src = lds0
+        dst = lds1
+        for offset in range_constexpr(1, MAX_G2L_EXPERTS):
+            if const_expr((offset & (offset - 1)) != 0):
+                continue
+            if in_range:
+                val = _lds_load(src, tid)
+                has_prev = tid >= offset
+                prev = fx.Int32(0)
+                if has_prev:
+                    prev = _lds_load(src, tid - offset)
+                _lds_store(dst, val + prev, tid)
+            gpu.barrier()
+            src, dst = dst, src
+
+        if in_range:
+            incl = _lds_load(src, tid)
+            m2 = buffer_ops.buffer_load(m_rsrc, tid, vec_width=1, dtype=i32)
+            nz2 = m2 != c0
+            _lds_store(lds_lut, nz2.select(fx.Uint32(incl) - 1, e_count), tid)
+
+        gpu.barrier()
+
+        # ── Phase B: route -> masked row, via LDS atomics ──
+        for route in range(tid, nvr_i32, MAX_G2L_EXPERTS):
+            ge = fx.Uint32(
+                buffer_ops.buffer_load(tk_rsrc, route, vec_width=1, dtype=i32)
+            )
+            le = fx.Uint32(_lds_load(lds_lut, ge))
+            is_drop = le == e_count
+            eff_e = is_drop.select(fx.Uint32(0), le)
+
+            w_f32 = buffer_ops.buffer_load(wi_rsrc, route, vec_width=1, dtype=f32)
+            w_cast = arith.trunc_f(wdt, w_f32)
+            w_out = is_drop.select(arith.constant(0.0, type=wdt), w_cast)
+            buffer_ops.buffer_store(w_out, w_rsrc, route)
+
+            # A dropped route must claim no slot: counting it would inflate
+            # masked_m into GEMM rows that only fold away via gather_w == 0.
+            slot = fx.Uint32(0)
+            if ~is_drop:
+                slot = fx.Uint32(
+                    llvm.AtomicRMWOp(
+                        llvm.AtomicBinOp.add,
+                        _slot_ptr(cnt_base_i64, eff_e, address_space=3),
+                        c1,
+                        llvm.AtomicOrdering.monotonic,
+                        syncscope="workgroup",
+                        alignment=4,
+                    ).result
+                )
+            row = slot + eff_e * max_m_u
+            row_out = arith.select(_raw(is_drop), dropped_row, _raw(row))
+            buffer_ops.buffer_store(row_out, out_rsrc, route)
+
+        gpu.barrier()
+
+        # ── Phase C: tile-aligned prefix sum over the per-expert counts ──
+        my_cnt = fx.Int32(0)
+        if in_bucket:
+            my_cnt = _lds_load(lds_cnt, tid)
+            buffer_ops.buffer_store(my_cnt, mm_rsrc, tid)
+            aligned = ((fx.Uint32(my_cnt) + tile_u - 1) // tile_u) * tile_u
+            _lds_store(lds0, fx.Int32(aligned), tid)
+
+        gpu.barrier()
+
+        src = lds0
+        dst = lds1
+        for offset in range_constexpr(1, MAX_ROUTE_BUCKETS):
+            if const_expr((offset & (offset - 1)) != 0):
+                continue
+            if in_bucket:
+                val = _lds_load(src, tid)
+                has_prev = tid >= offset
+                prev = fx.Int32(0)
+                if has_prev:
+                    prev = _lds_load(src, tid - offset)
+                _lds_store(dst, val + prev, tid)
+            gpu.barrier()
+            src, dst = dst, src
+
+        # ``dst`` is the spare half of the ping-pong, so the exclusive starts can
+        # land there without a fifth LDS array.
+        lds_starts = dst
+        if in_bucket:
+            excl = fx.Int32(0)
+            if tid != fx.Uint32(0):
+                excl = _lds_load(src, tid - 1)
+            _lds_store(lds_starts, excl, tid)
+            buffer_ops.buffer_store(excl + my_cnt, p_rsrc, tid)
+
+        gpu.barrier()
+
+        # ── Phase D: masked row -> contiguous row (+ gemm2 scatter descriptor) ──
+        for route in range(tid, nvr_i32, MAX_G2L_EXPERTS):
+            row = fx.Int32(
+                buffer_ops.buffer_load(out_rsrc, route, vec_width=1, dtype=i32)
+            )
+            if row >= fx.Int32(0):
+                expert = fx.Uint32(row) // max_m_u
+                slot = fx.Uint32(row) - expert * max_m_u
+                final_row = fx.Uint32(_lds_load(lds_starts, expert)) + slot
+                buffer_ops.buffer_store(final_row, out_rsrc, route)
+                if const_expr(ep_scatter):
+                    w_bf = buffer_ops.buffer_load(
+                        w_rsrc, route, vec_width=1, dtype=wdt
+                    )
+                    w_bits = w_bf.extf(f32).bitcast(i32)
+                    topk_u = fx.Uint32(topk)
+                    t = fx.Uint32(route) // topk_u
+                    k = fx.Uint32(route) - t * topk_u
+                    enc = fx.Uint32(
+                        buffer_ops.buffer_load(
+                            ptr_rsrc(tis), t, vec_width=1, dtype=i32
+                        )
+                    )
+                    max_tok_u = fx.Uint32(max_tok)
+                    origin_pe = enc // max_tok_u
+                    origin_lid = enc - origin_pe * max_tok_u
+                    packed = (
+                        origin_pe * fx.Uint32(slot_stride) + origin_lid * topk_u + k
+                    )
+                    ep_rsrc = ptr_rsrc(ep_rowmap)
+                    ep_base = final_row * fx.Uint32(2)
+                    buffer_ops.buffer_store(packed, ep_rsrc, ep_base)
+                    buffer_ops.buffer_store(w_bits, ep_rsrc, ep_base + 1)
+
+    @flyc.jit
+    def launch_route_psum_fused(
+        expert_mask: fx.Pointer,
+        topk_ids: fx.Pointer,
+        weight_in: fx.Pointer,
+        masked_m: fx.Pointer,
+        topids_to_rows: fx.Pointer,
+        gather_w: fx.Pointer,
+        psum: fx.Pointer,
+        num_valid_routes: fx.Pointer,
+        tis: fx.Pointer,
+        ep_rowmap: fx.Pointer,
+        n: fx.Int32,
+        max_m: fx.Int32,
+        E: fx.Int32,
+        tile_m: fx.Int32,
+        topk: fx.Int32,
+        max_tok: fx.Int32,
+        slot_stride: fx.Int32,
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
+    ):
+        route_psum_kernel(
+            expert_mask,
+            topk_ids,
+            weight_in,
+            masked_m,
+            topids_to_rows,
+            gather_w,
+            psum,
+            num_valid_routes,
+            tis,
+            ep_rowmap,
+            n,
+            max_m,
+            E,
+            tile_m,
+            topk,
+            max_tok,
+            slot_stride,
+        ).launch(
+            grid=(arith.index(1), 1, 1),
+            block=(MAX_G2L_EXPERTS, 1, 1),
+            stream=stream,
+        )
+
+    # No kernarg preload: 10 pointers plus 7 scalars overrun the user-SGPR
+    # budget the preload hint implies, and a kernel launched once per layer with
+    # one block has nothing to gain from it anyway.
+    return launch_route_psum_fused
 
 
 def build_moe_route_g2l_fused_module(weight_dtype="bf16"):

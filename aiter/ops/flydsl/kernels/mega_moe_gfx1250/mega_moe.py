@@ -23,6 +23,7 @@ __all__ = ["MegaMoEGfx1250"]
 
 _DISPATCH_BACKENDS = ("flydsl", "mori")
 _DISPATCH_TRANSPORTS = ("auto", "vector", "tdm")
+_DISPATCH_QUANT_MODES = ("auto", "none", "fp8")
 _TDM_STAGE_POOLS: dict[tuple[int, int, int, int], tuple] = {}
 _MAX_WORLD_SIZE = 72
 _MAX_EXPERTS_PER_RANK = 512
@@ -99,6 +100,19 @@ def _resolve_dispatch_transport(value: str) -> str:
     return "vector"
 
 
+def _resolve_dispatch_quant(value: str, transport: str) -> str:
+    """Resolve ``auto``. Opt-in only, and never against a bf16-only transport."""
+    if value not in _DISPATCH_QUANT_MODES:
+        raise ValueError(
+            f"dispatch_quant must be one of {_DISPATCH_QUANT_MODES}, got {value!r}"
+        )
+    if value != "auto":
+        return value
+    if transport == "tdm" and os.environ.get("MEGA_MOE_DISPATCH_FP8") == "1":
+        return "fp8"
+    return "none"
+
+
 class SymmetricArena:
     _ALIGNMENT = 256
 
@@ -152,6 +166,10 @@ class MegaMoEStage2Config:
     schedule: tuple | None = None
     dispatch_backend: str = "flydsl"
     dispatch_transport: str = "auto"
+    # "none" ships bf16 activations and quantizes on the receiving rank; "fp8"
+    # quantizes at the source and ships the GEMM's A operand. TDM-only, so the
+    # vector and mori transports keep a byte-identical arena and stay A/B-able.
+    dispatch_quant: str = "auto"
 
     def __post_init__(self):
         if self.dispatch_backend not in _DISPATCH_BACKENDS:
@@ -185,6 +203,25 @@ class MegaMoEStage2Config:
                 f"bf16 token bytes must be 16-byte aligned, "
                 f"got hidden_dim={self.hidden_dim}"
             )
+        self.dispatch_quant = _resolve_dispatch_quant(
+            self.dispatch_quant, self.dispatch_transport
+        )
+        if self.dispatch_quant == "fp8":
+            if self.dispatch_transport != "tdm":
+                raise ValueError(
+                    "dispatch_quant='fp8' requires dispatch_transport='tdm'; the "
+                    "vector and mori transports ship bf16"
+                )
+            if self.hidden_dim % 32:
+                raise ValueError(
+                    f"one e8m0 scale covers 32 elements, so dispatch_quant='fp8' "
+                    f"needs hidden_dim to be a multiple of 32, got {self.hidden_dim}"
+                )
+            if (self.hidden_dim + self.hidden_dim // 32) % 4:
+                raise ValueError(
+                    f"the fp8 wire row must be a whole number of dwords, got "
+                    f"{self.hidden_dim + self.hidden_dim // 32}B"
+                )
         tuned = _select_dispatch_config(
             self.world_size,
             self.hidden_dim,
@@ -205,6 +242,25 @@ class MegaMoEStage2Config:
     @property
     def token_nbytes(self) -> int:
         return self.hidden_dim * 2
+
+    @property
+    def dispatch_scale_nbytes(self) -> int:
+        """e8m0 bytes per token, one per 32-element MX block. 0 on the bf16 wire."""
+        return self.hidden_dim // 32 if self.dispatch_quant == "fp8" else 0
+
+    @property
+    def dispatch_wire_nbytes(self) -> int:
+        """On-wire bytes per token.
+
+        On the fp8 wire the sending rank quantizes, so this carries gemm1's A
+        operand -- fp8 payload followed by its e8m0 scales -- rather than bf16
+        activations. The scales ride in the same row to keep one TDM descriptor
+        per token; the receiver splits them apart when it gathers. Combine is
+        unaffected and stays on ``token_nbytes``: it ships bf16 expert output.
+        """
+        if self.dispatch_quant == "fp8":
+            return self.hidden_dim + self.dispatch_scale_nbytes
+        return self.token_nbytes
 
     @property
     def combine_slot_stride_bytes(self) -> int:
@@ -515,7 +571,7 @@ class MegaMoEGfx1250:
                 ("recv_to_src_token", max_recv * 4),
                 ("out_idx", max_recv * config.topk * 4),
                 ("out_wts", max_recv * config.topk * 4),
-                ("disp_out", max_recv * config.token_nbytes),
+                ("disp_out", max_recv * config.dispatch_wire_nbytes),
                 ("cross_device_barrier", config.world_size * 8),
                 (
                     "comb_inp",
@@ -543,6 +599,18 @@ class MegaMoEGfx1250:
             config.max_tokens_per_rank * config.hidden_dim,
             dtype=torch.int16,
             device=device,
+        )
+        # Send-side staging for the pre-quantized wire: dispatch reads whole
+        # rows straight out of it, so it is sized for the rank's own tokens
+        # rather than max_recv.
+        self._wire_send = (
+            torch.empty(
+                (config.max_tokens_per_rank, config.dispatch_wire_nbytes),
+                dtype=torch.uint8,
+                device=device,
+            )
+            if config.dispatch_quant == "fp8"
+            else None
         )
 
         if config.dispatch_backend == "mori":
@@ -573,8 +641,10 @@ class MegaMoEGfx1250:
                 npes=config.world_size,
                 experts_per_rank=config.experts_per_rank,
                 experts_per_token=config.topk,
-                hidden_dim=config.hidden_dim,
-                hidden_elem_size=2,
+                # The wire row is opaque bytes to the transport: it moves
+                # dispatch_wire_nbytes per token and never interprets them.
+                hidden_dim=config.dispatch_wire_nbytes,
+                hidden_elem_size=1,
                 max_tok_per_rank=config.max_tokens_per_rank,
                 max_recv=config.max_recv,
                 off_tok_off=self._arena.offset("tok_off"),
@@ -585,8 +655,8 @@ class MegaMoEGfx1250:
                 off_out_tok=self._arena.offset("disp_out"),
             )
             max_warps = tdm_max_warps(
-                hidden_dim=config.hidden_dim,
-                hidden_elem_size=2,
+                hidden_dim=config.dispatch_wire_nbytes,
+                hidden_elem_size=1,
                 npes=config.world_size,
             )
             tdm_geom = {
@@ -745,9 +815,23 @@ class MegaMoEGfx1250:
         return self._dispatch_specs[-1]
 
     def _recv_tokens(self) -> torch.Tensor:
+        """bf16 activations, or packed [fp8 payload | e8m0 scales] rows.
+
+        The fp8 wire has no meaningful element type -- the payload and the
+        scales share a row -- so it comes back as raw bytes. uint8 is what marks
+        it as pre-quantized: the grouped GEMM keys off that dtype to gather the
+        rows instead of quantizing them, and the bf16 wire is never uint8.
+        """
+        config = self._config
+        if config.dispatch_quant == "fp8":
+            return _from_gpu_ptr(
+                self._arena.local_ptr("disp_out"),
+                (config.max_recv, config.dispatch_wire_nbytes),
+                torch.uint8,
+            )
         return _from_gpu_ptr(
             self._arena.local_ptr("disp_out"),
-            (self._config.max_recv, self._config.hidden_dim),
+            (config.max_recv, config.hidden_dim),
             torch.bfloat16,
         )
 
@@ -765,6 +849,25 @@ class MegaMoEGfx1250:
             torch.int32,
         )
 
+    def _pack_wire(self, hidden_states: torch.Tensor, token_count: int) -> int:
+        """Device pointer dispatch should ship, quantizing first on the fp8 wire.
+
+        Each token is quantized once here, on the rank that owns it, so the
+        all-to-all carries gemm1's A operand instead of bf16 activations that
+        every destination would have to re-quantize.
+        """
+        if self._wire_send is None:
+            return hidden_states.data_ptr()
+
+        from aiter.ops.flydsl.moe_kernels import flydsl_moe_quant_wire_pack
+
+        flydsl_moe_quant_wire_pack(
+            hidden_states[:token_count],
+            quant_mode="fp8",
+            out_wire=self._wire_send[:token_count],
+        )
+        return self._wire_send.data_ptr()
+
     def _dispatch(
         self,
         hidden_states: torch.Tensor,
@@ -774,11 +877,12 @@ class MegaMoEGfx1250:
         token_count = hidden_states.shape[0]
         spec = self._select_dispatch(token_count)
         stream = fx.Stream(torch.cuda.current_stream())
+        send_ptr = self._pack_wire(hidden_states, token_count)
         if self._dispatch_transport == "tdm":
             stg_idx, stg_wt, stg_src = self._tdm_stage
             self._dispatch_variants[spec](
                 self._arena.handle,
-                hidden_states.data_ptr(),
+                send_ptr,
                 topk_ids.data_ptr(),
                 topk_weights.data_ptr(),
                 self._token_destination_map.data_ptr(),
@@ -795,7 +899,7 @@ class MegaMoEGfx1250:
         else:
             self._dispatch_variants[spec](
                 self._arena.handle,
-                hidden_states.data_ptr(),
+                send_ptr,
                 topk_ids.data_ptr(),
                 topk_weights.data_ptr(),
                 self._token_destination_map.data_ptr(),

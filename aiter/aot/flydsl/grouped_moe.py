@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import os
 import sys
 import time
 import traceback
@@ -163,6 +164,8 @@ def _compile_grouped_moe_aux_kernels(job, *, dtype, quant_mode, wmma_rep, contig
         build_moe_fused_quant_preshuffle_route_ksplit_module,
         build_moe_fused_route_quant_scatter_module,
         build_moe_fused_route_quant_scatter_st_ksplit_module,
+        build_moe_quant_wire_pack_module,
+        build_moe_wire_gather_preshuffle_module,
     )
     from aiter.ops.flydsl.kernels.moe_gather_reduce import (
         build_moe_gather_reduce_module,
@@ -232,6 +235,49 @@ def _compile_grouped_moe_aux_kernels(job, *, dtype, quant_mode, wmma_rep, contig
             stream=0,
         )
 
+    def _wire_pair(feat_dim, source_topk):
+        """Precompile the pre-quantized EP dispatch pair, when it is enabled.
+
+        Gated on the same env var MegaMoE resolves ``dispatch_quant='auto'``
+        with, so a default AOT build stays byte-identical; without it the pair
+        would simply JIT on first use.
+        """
+        if quant_mode != "fp8" or os.environ.get("MEGA_MOE_DISPATCH_FP8") != "1":
+            return
+        for ks in (True, False):
+            launch = build_moe_quant_wire_pack_module(
+                feat_dim=feat_dim,
+                quant_mode=quant_mode,
+                ksplit=ks,
+            )
+            launch(
+                ptr_arg(torch.empty(0, dtype=bf16, device=dev)),
+                ptr_arg(torch.empty(0, dtype=u8, device=dev)),
+                token_num,
+                ptr_arg(torch.empty(0, dtype=i32, device=dev)),
+                grid,
+                stream=0,
+            )
+        launch = build_moe_wire_gather_preshuffle_module(
+            feat_dim=feat_dim,
+            wmma_rep=wmma_rep,
+            quant_mode=quant_mode,
+            source_topk=source_topk,
+            remap_rows=False,
+        )
+        launch(
+            ptr_arg(torch.empty(0, dtype=u8, device=dev)),
+            ptr_arg(torch.empty(0, dtype=u8, device=dev)),
+            ptr_arg(torch.empty(0, dtype=u8, device=dev)),
+            ptr_arg(torch.empty(0, dtype=i32, device=dev)),
+            ptr_arg(torch.empty(0, dtype=i32, device=dev)),
+            1,
+            numel,
+            ptr_arg(torch.empty(0, dtype=i32, device=dev)),
+            grid,
+            stream=0,
+        )
+
     def _topids_to_rows():
         launch = build_moe_topids_to_rows_module()
         launch(
@@ -274,6 +320,7 @@ def _compile_grouped_moe_aux_kernels(job, *, dtype, quant_mode, wmma_rep, contig
             out_e=1,
             out_m=contiguous_m,
         )
+        _wire_pair(feat_dim=model_dim, source_topk=topk)
         a2_out_e, a2_out_m = 1, contiguous_m
     else:
         # Dense masked layout (one (E, max_m, *) bucket per expert).

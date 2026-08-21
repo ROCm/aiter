@@ -15,6 +15,7 @@ import torch
 
 from aiter.jit.utils.chip_info import get_gfx
 
+from .kernels.mega_moe_gfx1250.types import FusedGatherContext, Stage2ScatterContext
 from .kernels.tensor_shim import ptr_arg
 
 SCALE_GROUP_SIZE = 32
@@ -22,6 +23,181 @@ WMMA_K_GFX1250 = 128
 
 # a_dtype -> A bytes per code (fp4 = 2 codes/byte; fp6/fp8 = 1 byte/code).
 _A_CODES_PER_BYTE = {"fp4": 2, "fp6": 1, "fp8": 1}
+
+
+def flydsl_grouped_gemm_a8w4_masked(
+    out,
+    a,
+    w,
+    a_scales,
+    w_scales,
+    m_tile_map,
+    *,
+    n_experts,
+    contiguous_m,
+    N,
+    K,
+    tile_m=64,
+    tile_n=256,
+    tile_k=256,
+    m_warp=1,
+    n_warp=4,
+    num_buffers=3,
+    out_is_f16=0,
+    a_is_fp4=0,
+    stage1_act=0,
+    bias=None,
+    swiglu_limit=7.0,
+    stream=None,
+    stage1_quant_out=0,
+    quant_scale=None,
+    quant_wmma_rep=1,
+    stage2_scatter: Stage2ScatterContext | None = None,
+    ep_destination_stride=0,
+    ep_row_map=None,
+    situ_beta=1.0,
+    situ_linear_beta=1.0,
+    persistent=False,
+    grid_blocks=0,
+    fused_gather: FusedGatherContext | None = None,
+):
+    """Contiguous-M grouped a8w4 GEMM on the batched TDM kernel.
+
+    Mirrors the MoE grouped-gemm contiguous-M scheduling: a compact grid over the
+    (1, contiguous_m, *) buffers, with a per-M-tile expert id (``tile_expert``)
+    selecting the per-expert B / B-scale slab. Only valid M tiles launch.
+      out          (1, contiguous_m, N)  bf16/f16  (or fp8 payload when stage1_quant_out)
+      a            (1, contiguous_m, K)  uint8 (fp8 payload)
+      w            (E, N, K//2) uint8 (moe_shuffle_weight == cat_e shuffle_weight_gfx1250)
+      a_scales     grouped A-scale (1, contiguous_m//wmma_rep, (K//32)*wmma_rep) viewed int32
+      w_scales     n32k4 B-scale (E, N//32, (K//32)*32) viewed int32
+      m_tile_map   (n_experts,) int32 psum (per-expert exclusive end-row)
+    contiguous_m must be a multiple of tile_m (holds by construction).
+
+    ``stage1_act`` selects the stage1 epilogue: 0 none, 1 silu, 2 swiglu,
+    3 SiTUv2 (``situ_beta`` / ``situ_linear_beta``, the Kimi-K3 activation).
+    The betas are runtime kernel arguments, so all SiTUv2 shapes share one
+    compiled kernel.
+
+    When ``stage1_quant_out=1`` (fp8), the epilogue fuses the activation + MX
+    fp8 quantization + e8m0 scale preshuffle into the kernel.  ``out`` receives
+    the fp8 payload (uint8, 1 byte/elem) and ``quant_scale`` receives the
+    preshuffled e8m0 scale (uint8).      ``quant_wmma_rep`` is gemm2's
+    ``warp_tile_m // 16``, controlling the scale preshuffle tile geometry.
+
+    ``persistent`` swaps in the persistent-grid kernel: the grid is sized to the
+    co-residency ceiling and each block walks a strided slice of the tiles. It
+    is a prerequisite for ``fused_gather``, which additionally runs the
+    dispatch-wire scatter into ``a`` / ``a_scales`` as a grid-wide prologue
+    closed by a device barrier, replacing a separate gather launch.
+    """
+    if fused_gather is not None and not persistent:
+        raise ValueError("fused_gather requires persistent=True")
+    if persistent:
+        from .kernels.mxfp4_preshuffle_gfx1250_tdm_persistent import (
+            launch_gemm_a8w4_tdm_persistent as launch_gemm_a8w4_tdm,
+        )
+    else:
+        from .kernels.mxfp4_preshuffle_gfx1250_tdm import launch_gemm_a8w4_tdm
+
+    if stream is None:
+        stream = torch.cuda.current_stream()
+    # Only meaningful for SiTUv2; the betas are ignored by every other epilogue,
+    # so do not let them reject a silu/swiglu launch.
+    if stage1_act == 3:
+        if float(situ_beta) <= 0.0:
+            raise ValueError(f"situ_beta must be > 0, got {situ_beta!r}")
+        if float(situ_linear_beta) <= 0.0:
+            raise ValueError(f"situ_linear_beta must be > 0, got {situ_linear_beta!r}")
+    nb = min(num_buffers, max(1, K // tile_k))
+    has_bias = 1 if bias is not None else 0
+    bias_ptr = ptr_arg(bias) if bias is not None else ptr_arg(a)
+    # When quant is off, pass a dummy tensor for arg_quant_scale (unused).
+    if quant_scale is None:
+        quant_scale_tensor = out  # dummy, never written
+    else:
+        quant_scale_tensor = quant_scale.view(torch.uint8)
+    enable_ep_scatter = stage2_scatter is not None
+    ep_row_map_tensor = ep_row_map if ep_row_map is not None else out
+    if persistent:
+        # The jit derives its cache key from the bound arguments, so every
+        # pointer parameter has to be a real one even on the paths that compile
+        # the prologue out; A stands in for the unused ones.
+        extra = {
+            "grid_blocks": int(grid_blocks),
+            "arg_wire": ptr_arg(a),
+            "arg_topids_to_rows": ptr_arg(a),
+            "arg_route_starts": ptr_arg(a),
+            "arg_num_valid_routes": ptr_arg(a),
+            "arg_grid_bar": ptr_arg(a),
+        }
+        if fused_gather is not None:
+            # The barrier counter is monotonic within a launch, so it has to
+            # start at zero on every one of them.
+            fused_gather.grid_bar.zero_()
+            extra.update(
+                fuse_gather=1,
+                gather_feat_dim=int(fused_gather.feat_dim),
+                gather_wmma_rep=int(fused_gather.wmma_rep),
+                gather_source_topk=int(fused_gather.source_topk),
+                gather_remap_rows=int(fused_gather.remap_rows),
+                arg_wire=ptr_arg(fused_gather.wire),
+                arg_topids_to_rows=ptr_arg(fused_gather.topids_to_rows),
+                arg_route_starts=(
+                    ptr_arg(fused_gather.row_starts)
+                    if fused_gather.remap_rows
+                    else ptr_arg(a)
+                ),
+                arg_num_valid_routes=ptr_arg(fused_gather.num_valid_routes),
+                arg_grid_bar=ptr_arg(fused_gather.grid_bar),
+                i32_route_max_m=int(fused_gather.route_max_m),
+                i32_numel=int(fused_gather.numel),
+            )
+    else:
+        extra = {}
+    launch_gemm_a8w4_tdm(
+        out,
+        ptr_arg(a),
+        ptr_arg(w),
+        a_scales.view(torch.int32),
+        w_scales.view(torch.int32),
+        contiguous_m,
+        stream,
+        N,
+        K,
+        tile_m,
+        tile_n,
+        tile_k,
+        m_warp,
+        n_warp,
+        out_is_f16,
+        nb,
+        a_is_fp4,
+        ptr_arg(m_tile_map),
+        n_experts,
+        stage1_act,
+        has_bias,
+        bias_ptr,
+        float(swiglu_limit),
+        stage1_quant_out,
+        quant_wmma_rep,
+        quant_scale_tensor,
+        f32_situ_beta=float(situ_beta),
+        f32_situ_linear_beta=float(situ_linear_beta),
+        enable_ep_scatter=int(enable_ep_scatter),
+        ep_arena_handle=(int(stage2_scatter.arena_handle) if enable_ep_scatter else 0),
+        ep_combine_input_offset=(
+            int(stage2_scatter.combine_input_offset) if enable_ep_scatter else 0
+        ),
+        ep_slot_stride_bytes=(
+            int(stage2_scatter.slot_stride_bytes) if enable_ep_scatter else 0
+        ),
+        ep_destination_stride=int(ep_destination_stride),
+        ep_world_size=int(stage2_scatter.world_size) if enable_ep_scatter else 0,
+        arg_ep_row_map=ep_row_map_tensor,
+        **extra,
+    )
+    return out
 
 
 def flydsl_batched_gemm_mxfp4(

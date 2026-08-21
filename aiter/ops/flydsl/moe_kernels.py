@@ -2973,6 +2973,217 @@ def _get_compiled_fused_quant_preshuffle_route_ksplit(
     )
 
 
+@functools.cache
+def _get_compiled_quant_wire_pack(
+    feat_dim: int,
+    quant_mode: str = "fp8",
+    ksplit: bool = True,
+):
+    from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
+        build_moe_quant_wire_pack_module,
+    )
+
+    return build_moe_quant_wire_pack_module(
+        feat_dim=feat_dim,
+        quant_mode=quant_mode,
+        ksplit=ksplit,
+    )
+
+
+@functools.cache
+def _get_compiled_wire_gather_preshuffle(
+    feat_dim: int,
+    wmma_rep: int,
+    quant_mode: str = "fp8",
+    source_topk: int = 0,
+    remap_rows: bool = False,
+):
+    from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
+        build_moe_wire_gather_preshuffle_module,
+    )
+
+    return build_moe_wire_gather_preshuffle_module(
+        feat_dim=feat_dim,
+        wmma_rep=wmma_rep,
+        quant_mode=quant_mode,
+        source_topk=source_topk,
+        remap_rows=remap_rows,
+    )
+
+
+def flydsl_moe_dispatch_wire_nbytes(feat_dim: int, quant_mode: str = "fp8") -> int:
+    """Row size of the pre-quantized EP dispatch wire format, in bytes."""
+    from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import wire_row_nbytes
+
+    return wire_row_nbytes(feat_dim, quant_mode)
+
+
+def flydsl_moe_quant_wire_pack(
+    hidden: torch.Tensor,  # (token_num, feat_dim) bf16
+    *,
+    quant_mode: str = "fp8",
+    out_wire: torch.Tensor | None = None,  # (token_num, wire_nbytes) uint8
+    num_tokens: torch.Tensor | None = None,  # (1,) int32 dynamic count
+) -> torch.Tensor:
+    """Quantize a rank's own tokens into EP dispatch wire rows.
+
+    Send-side pre-quant: one ``[e4m3 payload | e8m0 scales]`` row per local
+    token, which dispatch then ships as opaque bytes. Costs ``token_num`` rows
+    of quant work instead of the ``token_num*topk`` the receive side used to
+    pay, and halves the bytes on the wire.
+    """
+    assert (
+        hidden.dtype == torch.bfloat16
+    ), f"wire pack requires bf16 input (got {hidden.dtype})"
+    hidden_2d = hidden.reshape(-1, hidden.shape[-1])
+    token_num, feat_dim = hidden_2d.shape
+    wire_nbytes = flydsl_moe_dispatch_wire_nbytes(feat_dim, quant_mode)
+
+    if out_wire is None:
+        out_wire = torch.empty(
+            (token_num, wire_nbytes), dtype=torch.uint8, device=hidden.device
+        )
+    else:
+        assert out_wire.shape[-1] == wire_nbytes, (
+            f"out_wire row is {out_wire.shape[-1]}B, expected {wire_nbytes}B "
+            f"for feat_dim={feat_dim} {quant_mode}"
+        )
+
+    from aiter.ops.flydsl.kernels.kernels_common import get_warp_size
+
+    warps_per_block = 256 // get_warp_size()
+    grid_blocks = (token_num + warps_per_block - 1) // warps_per_block
+    # Same rationale as the route kernel: at small token counts grid.x alone
+    # cannot fill the GPU, so split K across grid.y instead.
+    use_ksplit = grid_blocks < _ROUTEKS_KSPLIT_GRID_THRESHOLD
+
+    if num_tokens is None:
+        num_tokens_i32 = torch.empty(0, dtype=torch.int32, device=hidden.device)
+        assert num_tokens_i32.data_ptr() == 0, "expected a null data_ptr"
+    else:
+        num_tokens_i32 = (
+            num_tokens.reshape(-1)[:1].to(device=hidden.device, dtype=torch.int32)
+        ).contiguous()
+
+    launch = _get_compiled_quant_wire_pack(
+        feat_dim=feat_dim,
+        quant_mode=quant_mode,
+        ksplit=use_ksplit,
+    )
+    launch(
+        ptr_arg(hidden_2d.contiguous().view(-1)),
+        ptr_arg(out_wire.view(-1)),
+        token_num,
+        ptr_arg(num_tokens_i32),
+        grid_blocks,
+        stream=torch.cuda.current_stream(),
+    )
+    return out_wire
+
+
+def flydsl_moe_wire_gather_preshuffle(
+    wire: torch.Tensor,  # (recv_rows, wire_nbytes) uint8
+    E: int,
+    max_m: int,
+    *,
+    wmma_rep: int,
+    quant_mode: str = "fp8",
+    topids_to_rows: torch.Tensor,  # route -> global row
+    source_topk: int = 0,
+    row_starts: torch.Tensor | None = None,
+    route_max_m: int = 0,
+    feat_dim: int = 0,
+    out_payload: torch.Tensor | None = None,
+    out_scale: torch.Tensor | None = None,
+    num_valid_routes: torch.Tensor | None = None,
+):
+    """Scatter pre-quantized wire rows into gemm1's A operand.
+
+    Receive-side counterpart of :func:`flydsl_moe_quant_wire_pack`, and a drop-in
+    replacement for :func:`flydsl_moe_fused_quant_preshuffle` on the route branch
+    when dispatch already delivered fp8. Returns ``(payload, scale_preshuffle)``.
+    """
+    device = wire.device
+    wire_nbytes = int(wire.shape[-1])
+    if feat_dim <= 0:
+        # payload + payload//32 for fp8; the wire row size pins feat_dim down.
+        feat_dim = (wire_nbytes * 32) // 33 if quant_mode == "fp8" else 0
+        if feat_dim <= 0 or flydsl_moe_dispatch_wire_nbytes(feat_dim, quant_mode) != (
+            wire_nbytes
+        ):
+            raise ValueError(
+                f"cannot infer feat_dim from a {wire_nbytes}B {quant_mode} wire row; "
+                "pass feat_dim explicitly"
+            )
+    else:
+        expect = flydsl_moe_dispatch_wire_nbytes(feat_dim, quant_mode)
+        if expect != wire_nbytes:
+            raise ValueError(
+                f"wire row is {wire_nbytes}B but feat_dim={feat_dim} {quant_mode} "
+                f"needs {expect}B"
+            )
+
+    rows_per_tile = wmma_rep * 16
+    assert (
+        max_m % rows_per_tile == 0
+    ), f"max_m ({max_m}) must be a multiple of wmma_rep*16 ({rows_per_tile})"
+
+    Pb = feat_dim if quant_mode == "fp8" else feat_dim // 2
+    Ws = feat_dim // 32
+    if out_payload is None:
+        out_payload = torch.empty((E, max_m, Pb), dtype=torch.uint8, device=device)
+    if out_scale is None:
+        out_scale = torch.empty(
+            (E, max_m // wmma_rep, Ws * wmma_rep), dtype=torch.uint8, device=device
+        )
+
+    from aiter.ops.flydsl.kernels.kernels_common import get_warp_size
+
+    warps_per_block = 256 // get_warp_size()
+    topids_to_rows_i32 = topids_to_rows.to(device=device, dtype=torch.int32).reshape(-1)
+    numel = int(topids_to_rows_i32.numel())
+    grid_blocks = (numel + warps_per_block - 1) // warps_per_block
+
+    remap_rows = row_starts is not None
+    if remap_rows:
+        row_starts_i32 = row_starts.to(device=device, dtype=torch.int32).reshape(-1)
+        route_max_m_arg = int(route_max_m)
+        if route_max_m_arg <= 0:
+            raise ValueError("route_max_m must be positive when row_starts is provided")
+    else:
+        row_starts_i32 = torch.empty(max(E, 1), dtype=torch.int32, device=device)
+        route_max_m_arg = 1
+
+    if num_valid_routes is None:
+        num_valid_routes_i32 = torch.empty(0, dtype=torch.int32, device=device)
+        assert num_valid_routes_i32.data_ptr() == 0, "expected a null data_ptr"
+    else:
+        num_valid_routes_i32 = (
+            num_valid_routes.reshape(-1)[:1].to(device=device, dtype=torch.int32)
+        ).contiguous()
+
+    launch = _get_compiled_wire_gather_preshuffle(
+        feat_dim=feat_dim,
+        wmma_rep=wmma_rep,
+        quant_mode=quant_mode,
+        source_topk=source_topk,
+        remap_rows=remap_rows,
+    )
+    launch(
+        ptr_arg(wire.contiguous().view(-1)),
+        ptr_arg(out_payload.view(-1)),
+        ptr_arg(out_scale.view(-1)),
+        ptr_arg(topids_to_rows_i32),
+        ptr_arg(row_starts_i32),
+        route_max_m_arg,
+        numel,
+        ptr_arg(num_valid_routes_i32),
+        grid_blocks,
+        stream=torch.cuda.current_stream(),
+    )
+    return out_payload, out_scale
+
+
 def flydsl_moe_fused_quant_preshuffle(
     grouped_in: torch.Tensor,  # (E, max_m, feat_dim) or (E*max_m, feat_dim) bf16
     E: int,
