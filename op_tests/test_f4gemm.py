@@ -194,6 +194,26 @@ def _e4m3_to_f32(s: torch.Tensor) -> torch.Tensor:
     return s.view(torch.float8_e4m3fn).to(torch.float32)
 
 
+def _bare_run(fn, fn_args, num_iters, num_warmup=2):
+    """Drive the kernel with NO torch.profiler active.
+
+    Under an external profiler (rocprofv3), torch's own profiler in
+    run_perftest contends for the same roctracer/rocprofiler dispatch-intercept
+    layer -> the inner profiler gets partial/garbled device-time records and the
+    reported us collapses to a meaningless few-us floor. This path just launches
+    the kernel (warmup + num_iters) so rocprofv3 can capture the real dispatch;
+    timing is read back from rocprof output (see op_tests/att_freq.py), not here.
+    """
+    out = None
+    for _ in range(num_warmup):
+        out = fn(*fn_args)
+    torch.cuda.synchronize()
+    for _ in range(num_iters):
+        out = fn(*fn_args)
+    torch.cuda.synchronize()
+    return out
+
+
 def run_torch_mxfp4(xq, wq, xs, ws, noscale=False):
     # Reference only: fp32 math. Returns fp32; the caller casts to bf16 or
     # quantizes to packed fp4 per outtype. Not timed, not in the table.
@@ -295,6 +315,7 @@ def test_gemm(
     seed=0,
     mode="perf",
     knl_name=None,
+    under_rocprof=False,
 ):
     # Skip unsupported combos up front (before prep/shuffle) so they show as
     # "not support" rather than crashing on a shape assert.
@@ -431,9 +452,15 @@ def test_gemm(
     )
     for name, (fn, fn_args) in candidates.items():
         try:
-            out, us = run_perftest(
-                fn, *fn_args, num_iters=num_iters, needTrace=needTrace
-            )
+            if under_rocprof:
+                # External profiler owns the timing; run bare (no torch.profiler)
+                # so it doesn't collide, and mark our timing columns N/A below.
+                out = _bare_run(fn, fn_args, num_iters)
+                us = float("nan")
+            else:
+                out, us = run_perftest(
+                    fn, *fn_args, num_iters=num_iters, needTrace=needTrace
+                )
         except Exception as e:
             if not any(m in str(e) for m in _NOT_SUPPORTED_MARKERS):
                 raise
@@ -532,6 +559,16 @@ def test_gemm(
                 atol=1.0,
                 msg=f"{intype} {name}",
             )
+        if under_rocprof:
+            # Timing is meaningless from inside an external profiler; blank the
+            # timing columns so the summary table is not mistaken for real perf.
+            # Real dispatch time / cycles / freq come from rocprof (att_freq.py).
+            ret[f"{name} us"] = "N/A"
+            ret[f"{name} TFLOPS"] = "N/A"
+            ret[f"{name} TB/s"] = "N/A"
+            ret[f"{name} err"] = err
+            ret[f"{name} result"] = "profiled (see rocprof)"
+            continue
         ret[f"{name} us"] = round(us, 2)
         ret[f"{name} TFLOPS"] = round(flops / us / 1e6, 1)
         ret[f"{name} TB/s"] = round(nbytes / us / 1e6, 2)
@@ -637,6 +674,17 @@ def main():
         "experiment/debug).",
     )
     parser.add_argument(
+        "--under-rocprof",
+        dest="under_rocprof",
+        action="store_true",
+        help="run under an external profiler (rocprofv3): disable the internal "
+        "torch.profiler (it collides with rocprof's roctracer/rocprofiler layer "
+        "and yields a garbage few-us floor), drive the kernel bare so rocprof can "
+        "capture the real dispatch, and blank the summary's timing columns "
+        "(us/TFLOPS/TB-s -> N/A). Read real time/cycles/freq from rocprof output "
+        "via op_tests/att_freq.py.",
+    )
+    parser.add_argument(
         "-s",
         "-mnk",
         "--shape",
@@ -694,6 +742,7 @@ def main():
             seed=args.seed,
             mode=args.mode,
             knl_name=args.knl_name,
+            under_rocprof=args.under_rocprof,
         )
         for (di, si), intype, outtype, apre, (M, N, K) in itertools.product(
             init_pairs, args.intype, args.outtype, args.apre, shapes
