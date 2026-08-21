@@ -3,7 +3,6 @@
 
 
 import functools
-import os
 
 import torch
 
@@ -60,8 +59,6 @@ def _get_compiled_mxfp4_gemm1_port(
     enable_bias=False,
     v2_output_layout=True,
     native_scale_layout=False,
-    wide_mfma=False,
-    wide_accumulators=1,
     num_waves=4,
     k_wave=1,
 ):
@@ -88,8 +85,6 @@ def _get_compiled_mxfp4_gemm1_port(
         enable_bias=enable_bias,
         v2_output_layout=v2_output_layout,
         native_scale_layout=native_scale_layout,
-        wide_mfma=wide_mfma,
-        wide_accumulators=wide_accumulators,
         num_waves=num_waves,
         k_wave=k_wave,
     )
@@ -247,19 +242,10 @@ def flydsl_mxfp4_gemm1(
     swiglu_limit=7.0,
     bias=None,
     stream=None,
-    wide_mfma=None,
-    wide_accumulators=1,
     num_waves=4,
     k_wave=1,
 ):
     """Launch GEMM1; v2 output keeps payload rows in expert-sorted order."""
-    if wide_mfma is None:
-        wide_mode = int(os.environ.get("AITER_MXFP4_G1_WIDE", "0"))
-        if wide_mode not in (0, 1, 2):
-            raise ValueError(f"AITER_MXFP4_G1_WIDE must be 0, 1, or 2, got {wide_mode}")
-        wide_mfma = wide_mode != 0
-        if wide_mfma:
-            wide_accumulators = wide_mode
     use_nt = _effective_use_nt(
         n_tokens=n_tokens,
         topk=topk,
@@ -316,8 +302,6 @@ def flydsl_mxfp4_gemm1(
         bias is not None,
         v2_output_layout,
         native_scale_layout,
-        wide_mfma,
-        wide_accumulators,
         num_waves,
         k_wave,
     )

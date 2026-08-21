@@ -56,26 +56,6 @@ def _scale_mma_atoms(a_dtype):
     }
 
 
-def _wide_scale_mma_atom():
-    """Build the native gfx950 FP4 32x32x64 scaled-MFMA atom.
-
-    Wide GEMM1 normalizes each lane's selected E8M0 byte into byte zero, so the
-    atom can use fixed opsel values while retaining the existing K256-grouped
-    activation and weight scale layouts.
-    """
-    return fx.make_mma_atom(
-        fx.rocdl.cdna4.MFMA_Scale(
-            32,
-            32,
-            64,
-            Float4E2M1FN,
-            Float4E2M1FN,
-            opsel_a=0,
-            opsel_b=0,
-        )
-    )
-
-
 def _global_i32_buffer_view(addr_i64, num_bytes):
     num_bytes_i64 = fx.Int64(num_bytes)
     ptr_ty = fx.PointerType.get(
