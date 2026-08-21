@@ -133,6 +133,18 @@ AITER_CONFIG_BF16_BATCHED_GEMM = os.getenv(
     f"{AITER_ROOT_DIR}/aiter/configs/bf16_tuned_batched_gemm.csv",
 )
 
+# fp8 e8m0 mxscale (block-scale) batched-GEMM tuned config. Its own family
+# (scale type baked into the filename, matching the a8w8_/bf16_ split) so a
+# future fp32 rowwise-scale variant lands in a separate CSV and never collides
+# on key. The scale type is identified by the filename alone. The
+# per-model tuned data currently lives under model_configs/ (e.g.
+# dsv4_batched_gemm_a8w8_blockscale_mxscale_tuned.csv), merged in at runtime by
+# get_config_file; this canonical path may not exist on disk.
+AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE = os.getenv(
+    "AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE",
+    f"{AITER_ROOT_DIR}/aiter/configs/batched_gemm_a8w8_blockscale_mxscale_tuned.csv",
+)
+
 AITER_CONFIG_GEMM_BF16 = os.getenv(
     "AITER_CONFIG_GEMM_BF16",
     f"{AITER_ROOT_DIR}/aiter/configs/bf16_tuned_gemm.csv",
@@ -222,6 +234,14 @@ class AITER_CONFIG:
     def AITER_CONFIG_GEMM_BF16_FILE(self):
         return self.get_config_file(
             "AITER_CONFIG_GEMM_BF16", AITER_CONFIG_GEMM_BF16, "bf16_tuned_gemm"
+        )
+
+    @property
+    def AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE",
+            AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE,
+            "batched_gemm_a8w8_blockscale_mxscale_tuned",
         )
 
     def update_config_files(self, file_path: str, merge_name: str):

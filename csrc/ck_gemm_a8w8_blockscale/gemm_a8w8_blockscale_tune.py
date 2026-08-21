@@ -34,7 +34,7 @@ from gemm_a8w8_blockscale_cktile_instance import (
     candidate_kernels_cktile_dict,
 )
 from gemm_a8w8_blockscale_instance import candidate_kernels_dict
-from opus_gemm.opus_gemm_common import get_kernel_instance, kernels_list
+from opus_gemm.opus_gemm_common import gfx942_a8w8_kernels_list
 
 block_shape = (128, 128)
 
@@ -159,7 +159,9 @@ def run_gemm_a8w8_blockscale_opus(
     out,
     kernel_id,
 ):
-    """Launch one OPUS bpreshuffle kid with a pre-shuffled weight tensor."""
+    """
+    Run gfx942 Opus a8w8 blockscale bpreshuffle tuned kernel.
+    """
     return opus_gemm(
         x,
         weight,
@@ -210,77 +212,23 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
         "profile_file": "",  # for both results
         "config_env_name": "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE",
     }
-    _PRESHUFFLE_DEFAULTS: ClassVar[dict[str, str]] = {
-        "tune_file": f"{AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE}",
-        "untune_file": "aiter/configs/a8w8_blockscale_bpreshuffle_untuned_gemm.csv",
-        "config_env_name": "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE",
-    }
 
     def __init__(self, name, keys, resultList, description=""):
         """
         Initialize the Gemm A8W8 BlockScale Tuner.
         """
 
-        # TunerCommon builds its parser from get_arg_defaults(), so initialize
-        # the instance mode before entering the base constructor.  The mode is
-        # deliberately per-instance: mutating ARG_DEFAULTS here would leak a
-        # preshuffle run into later plain tuner instances in the same process.
-        self._preshuffle_mode = False
         super().__init__(name, keys, resultList, description)
 
-        # Defer these two defaults until after --preshuffle has been parsed.
-        # None is only an internal "not supplied on the CLI" sentinel; public
-        # parse_args() and run() always resolve it to a concrete path.
-        self.parser.set_defaults(tune_file=None, untune_file=None)
-
-    def get_arg_defaults(self):
-        defaults = super().get_arg_defaults()
-        if getattr(self, "_preshuffle_mode", False):
-            defaults.update(self._PRESHUFFLE_DEFAULTS)
-        return defaults
-
-    def _configure_mode(self, args):
-        self._preshuffle_mode = bool(getattr(args, "preshuffle", False))
-        defaults = self.get_arg_defaults()
-        if getattr(args, "tune_file", None) is None:
-            args.tune_file = defaults["tune_file"]
-        if getattr(args, "untune_file", None) is None:
-            args.untune_file = defaults["untune_file"]
-        return args
-
-    def parse_args(self):
-        return self._configure_mode(super().parse_args())
-
     def run(self, args, fast_mode=False):
-        # Also configure hand-built Namespaces used by programmatic callers.
-        self._configure_mode(args)
+        if getattr(args, "preshuffle", False):
+            self.ARG_DEFAULTS["config_env_name"] = (
+                "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE"
+            )
+            self.ARG_DEFAULTS["tune_file"] = (
+                f"{AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE}"
+            )
         return super().run(args, fast_mode)
-
-    @staticmethod
-    def _validate_opus_route(libtype, preshuffle, gfx):
-        """Fail early for OPUS-only routes that cannot produce any task."""
-        if libtype != "opus":
-            return
-        if not preshuffle:
-            raise ValueError(
-                "--libtype opus in the A8W8 blockscale tuner requires --preshuffle"
-            )
-        has_registered_kernel = any(
-            get_kernel_instance(
-                gfx,
-                "a8w8_blockscale_bpreshuffle",
-                kernel_id,
-                "bf16_t",
-            )
-            is kernel
-            for kernel_id, kernel in kernels_list.items()
-        )
-        if not has_registered_kernel:
-            raise ValueError(
-                "--libtype opus --preshuffle has no registered BF16 OPUS "
-                f"kernel for {gfx}; use --libtype all, ck, cktile, or asm "
-                "on this architecture"
-            )
 
     def _clear_op_caches(self):
         from aiter.ops import gemm_op_a8w8 as _op
@@ -306,7 +254,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
         self.parser.add_argument(
             "--preshuffle",
             action="store_true",
-            help="Enable the B-matrix preshuffle tune route",
+            help="Enable B-matrix preshuffle for CK gemm a8w8 blockscale",
         )
 
         self.parser.add_argument(
@@ -523,24 +471,14 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
         run_kwargs,
     ):
         gfx, _, M, N, K = info_keys
-        if not preshuffleB:
+        if not preshuffleB or gfx != "gfx942":
             return []
 
         gemm_keys = ["x", "weight_shuffle", "x_scale_t", "w_scale", "out"]
         ref_keys = ["x", "weight", "x_scale", "w_scale"]
         ref_args = (ref_keys, None, dtypes.bf16)
         tasks_opus = []
-        for kernel_id, kernel in kernels_list.items():
-            if (
-                get_kernel_instance(
-                    gfx,
-                    "a8w8_blockscale_bpreshuffle",
-                    kernel_id,
-                    "bf16_t",
-                )
-                is not kernel
-            ):
-                continue
+        for kernel_id, kernel in gfx942_a8w8_kernels_list.items():
             if N % kernel.B_N != 0 or K % kernel.B_K != 0:
                 continue
             if not kernel.has_oob and M % kernel.B_M != 0:
@@ -724,7 +662,6 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
         block_per_cu = args.blockPerCu
         cu_num = self.get_cu_num()
         gfx = self.get_gfx()
-        self._validate_opus_route(args.libtype, isPreshuffleB, gfx)
         run_kwargs = {
             "num_warmup": args.warmup,
             "num_iters": args.iters,
@@ -780,11 +717,6 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
                     )
                 )
             shape_kernel_nums = len(task) - prev_task_count
-            if lib == "opus" and shape_kernel_nums == 0:
-                raise ValueError(
-                    "No OPUS A8W8 blockscale bpreshuffle kernel supports "
-                    f"shape M={M}, N={N}, K={K} on {gfx}"
-                )
 
             tasks_data.append((shape_kernel_nums, ()))
         ret = []
@@ -864,7 +796,7 @@ if __name__ == "__main__":
         "GemmA8W8BlockScaleTuner",
         key,
         resultList,
-        description="Tune a8w8 blockscale GEMM (CK, CKTile, ASM, OPUS backends)",
+        description="Tune a8w8 blockscale GEMM (CK, CKTile, ASM backends)",
     )
 
     args = tuner.parse_args()

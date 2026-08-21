@@ -462,12 +462,10 @@ def test_production_callers_use_operation_specific_entry_not_family_wrappers():
     callers = {
         "aiter/tuned_gemm.py": "opus_gemm",
         "aiter/ops/gemm_op_a8w8.py": "opus_gemm",
-        "aiter/ops/batched_gemm_op_bf16.py": "opus_bmm",
         "aiter/ops/batched_gemm_op_a8w8.py": "opus_bmm",
         "csrc/opus_gemm/opus_gemm_tune.py": "opus_bmm",
         "csrc/opus_gemm/opus_bmm_mxscale_tune.py": "opus_bmm",
         "csrc/gemm_a16w16/gemm_a16w16_tune.py": "opus_gemm",
-        "csrc/ck_batched_gemm_bf16/batched_gemm_bf16_tune.py": "opus_bmm",
         "csrc/ck_gemm_a8w8_blockscale/gemm_a8w8_blockscale_tune.py": "opus_gemm",
     }
     removed_names = {
@@ -493,7 +491,29 @@ def test_production_callers_use_operation_specific_entry_not_family_wrappers():
         ), relative_path
 
     deepgemm = (_ROOT / "aiter/ops/deepgemm.py").read_text()
-    assert "opus_gemm_a16w16_tune" not in deepgemm
+    assert "from .opus.gemm_op_a16w16 import" not in deepgemm
+
+
+def test_deepgemm_legacy_a16_entry_forwards_to_current_exact_gemm(monkeypatch):
+    import aiter
+
+    deepgemm = importlib.import_module("aiter.ops.deepgemm")
+    opus = importlib.import_module("aiter.ops.opus")
+    calls = []
+    sentinel = object()
+
+    def fake_opus_gemm(XQ, WQ, Y, **kwargs):
+        calls.append((XQ, WQ, Y, kwargs))
+        return sentinel
+
+    monkeypatch.setattr(opus, "opus_gemm", fake_opus_gemm)
+    XQ, WQ, Y = object(), object(), object()
+    with pytest.warns(DeprecationWarning, match="opus_gemm"):
+        result = deepgemm.opus_gemm_a16w16_tune(XQ, WQ, Y, 200, 3)
+
+    assert result is sentinel
+    assert calls == [(XQ, WQ, Y, {"kid": 200, "split_k": 3})]
+    assert aiter.opus_gemm_a16w16_tune is deepgemm.opus_gemm_a16w16_tune
 
 
 def test_a8_raw_bindings_do_not_register_dummy_tensor_arguments():

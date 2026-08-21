@@ -98,9 +98,7 @@ def torch_to_aiter_pybind(tensor: torch.Tensor):
     )
 
 
-def torch_to_aiter(
-    tensor: torch.Tensor, out: aiter_tensor_t | None = None
-) -> aiter_tensor_t:
+def torch_to_aiter(tensor: torch.Tensor) -> aiter_tensor_t:
     """This is for ctypes binding.
     torch.Tensor -> aiter_tensor_t, zero-copy, points to the same GPU memory.
 
@@ -119,7 +117,7 @@ def torch_to_aiter(
     # -1 is the C-side "not on a GPU" sentinel.
     index = tensor.device.index
 
-    at = aiter_tensor_t() if out is None else out
+    at = aiter_tensor_t()
     at.ptr = tensor.data_ptr()
     at.numel_ = tensor.numel()
     at.ndim = ndim

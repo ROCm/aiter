@@ -62,6 +62,10 @@ FAMILIES = [
     ),
     ("AITER_CONFIG_A8W8_BATCHED_GEMM", "a8w8_tuned_batched_gemm"),
     ("AITER_CONFIG_BF16_BATCHED_GEMM", "bf16_tuned_batched_gemm"),
+    (
+        "AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE",
+        "batched_gemm_a8w8_blockscale_mxscale_tuned",
+    ),
     ("AITER_CONFIG_GEMM_BF16", "bf16_tuned_gemm"),
     ("AITER_CONFIG_FMOE", "tuned_fmoe"),
     ("AITER_CONFIG_GROUPED_FMOE", "tuned_grouped_fmoe"),
@@ -204,8 +208,13 @@ class TestConfigShapeCollision(unittest.TestCase):
         self._check_family("AITER_CONFIG_BF16_BATCHED_GEMM", "bf16_tuned_batched_gemm")
 
     def test_batched_gemm_a8w8_blockscale_mxscale(self):
-        # This family deliberately resolves in its dedicated caller policy so
-        # adding PR #4320 does not modify generic jit/core.py.
+        self._check_family(
+            "AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE",
+            "batched_gemm_a8w8_blockscale_mxscale_tuned",
+        )
+
+        # The generic config registry owns file discovery and merging; the
+        # dedicated caller policy still owns public-kid normalization.
         from aiter.ops.opus import policy
 
         policy._load_mxscale_bmm_tuned.cache_clear()
@@ -227,7 +236,7 @@ class TestConfigShapeCollision(unittest.TestCase):
     def test_mxscale_kid_translation_does_not_touch_other_backends(self):
         from aiter.ops.opus import policy
 
-        env_name = policy._MXSCALE_BMM_CONFIG_ENV
+        env_name = "AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE"
         old_value = os.environ.get(env_name)
         with tempfile.TemporaryDirectory(prefix="aiter_mxscale_kid_") as tmp:
             config_path = os.path.join(tmp, "mixed.csv")
@@ -238,6 +247,7 @@ class TestConfigShapeCollision(unittest.TestCase):
 
             try:
                 os.environ[env_name] = config_path
+                _cache_clear()
                 policy._load_mxscale_bmm_tuned.cache_clear()
                 rows = policy._load_mxscale_bmm_tuned()
                 self.assertEqual(rows[("gfx950", 2, 1, 1024, 4096)]["kernelId"], 8311)
@@ -247,6 +257,7 @@ class TestConfigShapeCollision(unittest.TestCase):
                     os.environ.pop(env_name, None)
                 else:
                     os.environ[env_name] = old_value
+                _cache_clear()
                 policy._load_mxscale_bmm_tuned.cache_clear()
 
     def test_bf16(self):

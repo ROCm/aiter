@@ -10,7 +10,7 @@ import torch
 
 from ...jit.core import compile_ops, get_module
 from ...jit.utils.torch_guard import torch_compile_guard
-from ...utility.dtypes import aiter_tensor_t, torch_to_aiter
+from ...utility.dtypes import _aiter_dtype_id, aiter_tensor_t
 from csrc.opus_gemm.opus_gemm_common import OpusGemmInstance
 
 from ._arch import _device_arch_and_cu
@@ -67,6 +67,26 @@ class _OpusA16DescriptorPool(local):
 
 
 _OPUS_A16_DESCRIPTOR_POOL = _OpusA16DescriptorPool()
+
+
+def _fill_aiter_tensor_descriptor(
+    tensor: torch.Tensor, out: aiter_tensor_t
+) -> aiter_tensor_t:
+    """Refresh one OPUS-local reusable C descriptor without allocating it."""
+    shape = tensor.shape
+    strides = tensor.stride()
+    ndim = len(shape)
+    assert ndim <= 8, f"aiter_tensor_t supports at most 8 dims, got {ndim}"
+    index = tensor.device.index
+
+    out.ptr = tensor.data_ptr()
+    out.numel_ = tensor.numel()
+    out.ndim = ndim
+    out.shape[:ndim] = shape
+    out.strides[:ndim] = strides
+    out.dtype_ = _aiter_dtype_id(tensor.dtype)
+    out.device_id = -1 if index is None else index
+    return out
 
 
 @lru_cache(maxsize=1)
@@ -127,14 +147,16 @@ def _invoke_opus_a16w16_cabi(
 ) -> None:
     _library, launch, get_error, clear_error = _load_opus_a16w16_cabi()
     pool = _OPUS_A16_DESCRIPTOR_POOL
-    xq_descriptor = torch_to_aiter(XQ, pool.xq)
-    wq_descriptor = torch_to_aiter(WQ, pool.wq)
-    y_descriptor = torch_to_aiter(Y, pool.y)
-    bias_descriptor = None if bias is None else torch_to_aiter(bias, pool.bias)
+    xq_descriptor = _fill_aiter_tensor_descriptor(XQ, pool.xq)
+    wq_descriptor = _fill_aiter_tensor_descriptor(WQ, pool.wq)
+    y_descriptor = _fill_aiter_tensor_descriptor(Y, pool.y)
+    bias_descriptor = (
+        None if bias is None else _fill_aiter_tensor_descriptor(bias, pool.bias)
+    )
     workspace_descriptor = (
         None
         if workspace is None
-        else torch_to_aiter(workspace, pool.workspace)
+        else _fill_aiter_tensor_descriptor(workspace, pool.workspace)
     )
     bias_arg = (
         _NULL_AITER_TENSOR

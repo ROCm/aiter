@@ -13,9 +13,7 @@ launcher.
 
 from __future__ import annotations
 
-import os
 from functools import lru_cache
-from pathlib import Path
 
 import pandas as pd
 
@@ -29,7 +27,7 @@ from csrc.opus_gemm.opus_gemm_common import (
     get_kernel_instance,
 )
 
-from ...jit.core import AITER_LOG_TUNED_CONFIG
+from ...jit.core import AITER_CONFIGS, AITER_LOG_TUNED_CONFIG
 from ...jit.utils.chip_info import get_gfx_runtime as get_gfx
 from ..gemm_op_common import get_padded_m
 
@@ -488,44 +486,21 @@ def resolve_a16w16_caller_candidate(
 
 # ---- gfx950 MXFP8 BMM tuned-row and heuristic policy ---------------------
 
-_MXSCALE_BMM_CONFIG_ENV = "AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE"
-_MXSCALE_BMM_CONFIG_STEM = "batched_gemm_a8w8_blockscale_mxscale_tuned"
 _MXSCALE_BMM_KID_OFFSET = 8000
 _MXSCALE_BMM_LOCAL_KID_MAX = 653
 _MXSCALE_BMM_GLOBAL_KID_MAX = _MXSCALE_BMM_KID_OFFSET + _MXSCALE_BMM_LOCAL_KID_MAX
 _TUNED_PERF_COLUMNS = ("us", "tflops", "bw", "errRatio")
 
 
-def _mxscale_bmm_config_paths() -> tuple[Path, ...]:
-    configured = os.getenv(_MXSCALE_BMM_CONFIG_ENV)
-    if configured:
-        return tuple(
-            Path(token).expanduser()
-            for token in configured.split(os.pathsep)
-            if token.strip()
-        )
-
-    config_dir = Path(__file__).resolve().parents[2] / "configs"
-    candidates = [config_dir / f"{_MXSCALE_BMM_CONFIG_STEM}.csv"]
-    candidates.extend(
-        sorted(
-            (config_dir / "model_configs").glob(
-                f"*_{_MXSCALE_BMM_CONFIG_STEM}.csv"
-            )
-        )
-    )
-    return tuple(path for path in candidates if path.is_file())
-
-
 @lru_cache(maxsize=None)
 def _load_mxscale_bmm_tuned(libtype: str | None = None) -> dict:
-    paths = _mxscale_bmm_config_paths()
-    if not paths:
-        logger.warning("no MXFP8 BMM tuned CSV was found")
+    path = AITER_CONFIGS.AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE_FILE
+    try:
+        df = pd.read_csv(path).drop_duplicates()
+    except FileNotFoundError:
+        logger.warning("MXFP8 BMM tuned CSV was not found at %s", path)
         return {}
 
-    frames = [pd.read_csv(path) for path in paths]
-    df = pd.concat(frames, ignore_index=True).drop_duplicates()
     required = {"gfx", "b", "m", "n", "k", "kernelId", "splitK"}
     missing = required.difference(df.columns)
     if missing:
