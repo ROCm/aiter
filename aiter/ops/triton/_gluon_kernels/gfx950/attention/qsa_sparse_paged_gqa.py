@@ -123,9 +123,7 @@ def _sparse_tile(
     valid = valid & (physical_page >= 0) & (physical_page < num_cache_pages)
     safe_physical_page = gl.maximum(physical_page, 0)
 
-    page_g = gl.convert_layout(
-        safe_physical_page, gl.SliceLayout(1, gather_layout)
-    )
+    page_g = gl.convert_layout(safe_physical_page, gl.SliceLayout(1, gather_layout))
     offset_g = gl.convert_layout(page_offset, gl.SliceLayout(1, gather_layout))
     valid_g = gl.convert_layout(valid, gl.SliceLayout(1, gather_layout))
     dim_offsets = gl.arange(0, HEAD_DIM, layout=gl.SliceLayout(0, gather_layout))
@@ -165,9 +163,7 @@ def _sparse_tile(
         gl.zeros([BLOCK_M, BLOCK_N], gl.float32, layout=qk_layout),
     )
     valid_qk = gl.convert_layout(valid, gl.SliceLayout(0, qk_layout))[None, :]
-    head_mask_qk = gl.convert_layout(head_mask, gl.SliceLayout(1, qk_layout))[
-        :, None
-    ]
+    head_mask_qk = gl.convert_layout(head_mask, gl.SliceLayout(1, qk_layout))[:, None]
     scores = gl.where(valid_qk & head_mask_qk, scores, float("-inf"))
 
     tile_max = gl.max(scores, axis=1)
@@ -183,9 +179,7 @@ def _sparse_tile(
 
     v_smem.store(values)
     values_dot = v_smem.load(v_layout)
-    probabilities_dot = gl.convert_layout(
-        probabilities.to(gl.bfloat16), p_layout
-    )
+    probabilities_dot = gl.convert_layout(probabilities.to(gl.bfloat16), p_layout)
     alpha_pv = gl.convert_layout(alpha, gl.SliceLayout(1, pv_layout))
     tile_accumulator = gl.amd.cdna4.mfma(
         probabilities_dot,
@@ -313,9 +307,7 @@ def _qsa_sparse_paged_gqa_kernel(
     running_max = gl.full(
         [BLOCK_M], float("-inf"), gl.float32, layout=gl.SliceLayout(1, qk_layout)
     )
-    running_sum = gl.zeros(
-        [BLOCK_M], gl.float32, layout=gl.SliceLayout(1, qk_layout)
-    )
+    running_sum = gl.zeros([BLOCK_M], gl.float32, layout=gl.SliceLayout(1, qk_layout))
     accumulator = gl.zeros([BLOCK_M, HEAD_DIM], gl.float32, layout=pv_layout)
     kv_smem = gl.allocate_shared_memory(
         gl.bfloat16, [BLOCK_N, HEAD_DIM], kv_shared_layout

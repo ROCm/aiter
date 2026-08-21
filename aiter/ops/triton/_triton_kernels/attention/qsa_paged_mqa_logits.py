@@ -84,10 +84,7 @@ def _qsa_paged_mqa_logits_kernel(
     score = tl.zeros((BLOCK_N,), dtype=tl.float32)
     for head in tl.static_range(0, NUM_HEADS):
         query = tl.load(
-            q_ptr
-            + token * stride_q_token
-            + head * stride_q_head
-            + dims * stride_q_dim,
+            q_ptr + token * stride_q_token + head * stride_q_head + dims * stride_q_dim,
             mask=dims < HEAD_DIM,
             other=0.0,
         ).to(tl.float32)

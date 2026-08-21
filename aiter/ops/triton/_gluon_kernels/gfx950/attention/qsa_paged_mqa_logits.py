@@ -7,7 +7,6 @@ from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 from triton.language.core import PropagateNan
 
-
 _MAX_PROPAGATE_NAN_ALL = gl.constexpr(PropagateNan.ALL)
 
 
@@ -99,9 +98,7 @@ def _gluon_qsa_paged_mqa_logits_kernel(
     request_valid = (request >= 0) & (request < num_requests)
     safe_request = gl.minimum(gl.maximum(request, 0), num_requests - 1)
     query_position = gl.load(query_positions_ptr + token)
-    context_len = gl.load(
-        context_lens_ptr + safe_request, mask=request_valid, other=0
-    )
+    context_len = gl.load(context_lens_ptr + safe_request, mask=request_valid, other=0)
     visible_groups = gl.maximum(
         0,
         gl.minimum(
@@ -169,12 +166,8 @@ def _gluon_qsa_paged_mqa_logits_kernel(
     )
     scores = gl.sum(_relu_f32(scores), axis=0) / score_divisor
 
-    score_columns = gl.arange(
-        0, BLOCK_N, layout=gl.SliceLayout(0, mfma_layout)
-    )
-    score_valid = gl.convert_layout(
-        column_valid, gl.SliceLayout(0, mfma_layout)
-    )
+    score_columns = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, mfma_layout))
+    score_valid = gl.convert_layout(column_valid, gl.SliceLayout(0, mfma_layout))
     gl.amd.cdna4.buffer_store(
         gl.where(score_valid, scores, -float("inf")),
         ptr=logits_ptr + token * stride_logits_token,

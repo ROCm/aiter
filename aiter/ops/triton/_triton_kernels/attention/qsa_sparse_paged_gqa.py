@@ -61,8 +61,7 @@ def _qsa_sparse_paged_gqa_kernel(
         + token * stride_q_token
         + (first_q_head + head_offsets[:, None]) * stride_q_head
         + dim_offsets[None, :] * stride_q_dim,
-        mask=(head_offsets[:, None] < GROUP_SIZE)
-        & (dim_offsets[None, :] < HEAD_DIM),
+        mask=(head_offsets[:, None] < GROUP_SIZE) & (dim_offsets[None, :] < HEAD_DIM),
         other=0.0,
     )
     query = (query * softmax_scale * 1.4426950408889634).to(query.dtype)

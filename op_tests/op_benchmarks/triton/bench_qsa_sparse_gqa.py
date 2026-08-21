@@ -20,9 +20,7 @@ def _inputs(index_order: str):
         pages, page_size, kv_heads, head_dim, device="cuda", dtype=torch.bfloat16
     )
     v = torch.randn_like(k)
-    block_table = torch.arange(pages, device="cuda", dtype=torch.int32).repeat(
-        rows, 1
-    )
+    block_table = torch.arange(pages, device="cuda", dtype=torch.int32).repeat(rows, 1)
     token_to_request = torch.arange(rows, device="cuda", dtype=torch.int32)
     valid = torch.arange(2048, device="cuda", dtype=torch.int32)
     if index_order == "ordered":
@@ -50,9 +48,7 @@ def main():
     inputs = _inputs(args.order)
     outputs = {}
     for backend in ("triton", "gluon"):
-        fn = lambda backend=backend: qsa_sparse_paged_gqa(
-            *inputs, backend=backend
-        )
+        fn = lambda backend=backend: qsa_sparse_paged_gqa(*inputs, backend=backend)
         outputs[backend] = fn()
         p50, p20, p80 = triton.testing.do_bench(
             fn, warmup=args.warmup, rep=args.rep, quantiles=[0.5, 0.2, 0.8]

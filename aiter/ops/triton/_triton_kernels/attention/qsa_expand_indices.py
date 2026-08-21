@@ -82,9 +82,7 @@ def _qsa_expand_block_indices_kernel(
         & (logical_token < context_len)
     )
     tl.store(
-        output_ptr
-        + token_id * stride_output_token
-        + columns * stride_output_column,
+        output_ptr + token_id * stride_output_token + columns * stride_output_column,
         tl.where(valid, logical_token, -1),
         mask=(token_id < num_tokens) & (columns < OUTPUT_WIDTH),
     )

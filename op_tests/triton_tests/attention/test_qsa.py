@@ -88,9 +88,9 @@ def _attention_reference(
         values = v_cache[pages, offsets].repeat_interleave(repeats, dim=1)
         scores = torch.einsum("hd,khd->hk", q[row].float(), keys.float())
         probabilities = torch.softmax(scores * scale, dim=-1)
-        output[row] = torch.einsum(
-            "hk,khd->hd", probabilities, values.float()
-        ).to(q.dtype)
+        output[row] = torch.einsum("hk,khd->hd", probabilities, values.float()).to(
+            q.dtype
+        )
     return output
 
 
@@ -113,9 +113,7 @@ def test_qsa_paged_mqa_logits_matches_reference():
         context_lens,
         compress_ratio=1,
     )
-    expected = _mqa_reference(
-        q, cache, page_table, token_to_request, expected_visible
-    )
+    expected = _mqa_reference(q, cache, page_table, token_to_request, expected_visible)
 
     torch.testing.assert_close(actual, expected, rtol=1e-3, atol=1e-3)
     torch.testing.assert_close(visible, expected_visible)
@@ -199,9 +197,7 @@ def test_qsa_selection_pipeline_matches_reference():
     logits = _mqa_reference(q, cache, page_table, token_to_request, visible)
     selected = torch.topk(logits, 4, dim=1).indices.to(torch.int32)
     row_context_lens = context_lens.index_select(0, token_to_request.long())
-    expected = _expand_reference(
-        selected, query_positions, row_context_lens, 2, 8
-    )
+    expected = _expand_reference(selected, query_positions, row_context_lens, 2, 8)
 
     # Selection order is implementation-defined; attention is order-invariant.
     for row in range(expected.shape[0]):
@@ -216,9 +212,7 @@ def test_qsa_selection_pipeline_matches_reference():
 def test_qsa_gfx950_representative_head_dim_128():
     torch.manual_seed(4)
     q_index = torch.randn(2, 8, 128, device="cuda", dtype=torch.bfloat16)
-    compressed_cache = torch.randn(
-        16, 4, 1, 128, device="cuda", dtype=torch.bfloat16
-    )
+    compressed_cache = torch.randn(16, 4, 1, 128, device="cuda", dtype=torch.bfloat16)
     page_table = torch.arange(16, device="cuda", dtype=torch.int32).reshape(2, 8)
     token_to_request = torch.tensor([0, 1], device="cuda", dtype=torch.int32)
     query_positions = torch.tensor([23, 27], device="cuda", dtype=torch.int32)
@@ -286,15 +280,11 @@ def test_qsa_sparse_paged_gqa_qwen_air_selection_width():
         num_pages, page_size, 1, 128, device="cuda", dtype=torch.bfloat16
     )
     v_cache = torch.randn_like(k_cache)
-    block_table = torch.arange(
-        num_pages, device="cuda", dtype=torch.int32
-    ).unsqueeze(0)
+    block_table = torch.arange(num_pages, device="cuda", dtype=torch.int32).unsqueeze(0)
     token_to_request = torch.zeros(1, device="cuda", dtype=torch.int32)
     logical_indices = torch.cat(
         (
-            torch.randperm(
-                num_pages * page_size, device="cuda", dtype=torch.int32
-            ),
+            torch.randperm(num_pages * page_size, device="cuda", dtype=torch.int32),
             torch.full((3,), -1, device="cuda", dtype=torch.int32),
         )
     ).unsqueeze(0)
@@ -359,9 +349,7 @@ def test_qsa_forced_gluon_mqa_matches_triton_across_pages_and_requests():
         compress_ratio=4,
         backend="gluon",
     )
-    expected = _mqa_reference(
-        q, cache, page_table, token_to_request, expected_visible
-    )
+    expected = _mqa_reference(q, cache, page_table, token_to_request, expected_visible)
 
     torch.testing.assert_close(triton_visible, expected_visible)
     torch.testing.assert_close(gluon_visible, expected_visible)
@@ -379,16 +367,12 @@ def test_qsa_forced_gluon_sparse_gqa_qwen_geometry_and_width():
         pages_per_request, page_size, 2, 128, device="cuda", dtype=torch.bfloat16
     )
     v_cache = torch.randn_like(k_cache)
-    ascending = torch.arange(
-        pages_per_request, device="cuda", dtype=torch.int32
-    )
+    ascending = torch.arange(pages_per_request, device="cuda", dtype=torch.int32)
     block_table = torch.stack(
         (ascending, ascending.roll(17), torch.flip(ascending, dims=(0,)))
     )
     token_to_request = torch.tensor([2, 0, 1], device="cuda", dtype=torch.int32)
-    logical_indices = torch.full(
-        (rows, 2051), -1, device="cuda", dtype=torch.int32
-    )
+    logical_indices = torch.full((rows, 2051), -1, device="cuda", dtype=torch.int32)
     boundary_indices = torch.tensor(
         [0, 15, 16, 17, 31, 32, 2047, 2048, 2050],
         device="cuda",

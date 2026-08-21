@@ -71,8 +71,7 @@ def _has_safe_buffer_offsets(*tensors: torch.Tensor) -> bool:
         if any(stride < 0 for stride in tensor.stride()):
             return False
         max_element_offset = sum(
-            (size - 1) * stride
-            for size, stride in zip(tensor.shape, tensor.stride())
+            (size - 1) * stride for size, stride in zip(tensor.shape, tensor.stride())
         )
         if max_element_offset > _MAX_INT32 // tensor.element_size():
             return False
@@ -211,15 +210,12 @@ def qsa_paged_mqa_logits(
                 num_warps=4,
             )
             return logits, visible_groups
-        except Exception:  # noqa: BLE001
+        except Exception:
             if selected_backend == "gluon":
                 raise
             # Gluon JIT/compiler failures must not take down the portable path.
-            pass
 
-    _qsa_paged_mqa_logits_kernel[
-        (q.shape[0], triton.cdiv(columns, block_n))
-    ](
+    _qsa_paged_mqa_logits_kernel[(q.shape[0], triton.cdiv(columns, block_n))](
         q,
         compressed_k_cache,
         page_table,
@@ -267,9 +263,7 @@ def qsa_expand_block_indices(
     _require_hip_tensor("block_indices", block_indices)
     if block_indices.ndim != 2 or block_indices.dtype != torch.int32:
         raise ValueError("block_indices must be a two-dimensional int32 tensor")
-    _validate_integer_vector(
-        "query_positions", query_positions, block_indices.shape[0]
-    )
+    _validate_integer_vector("query_positions", query_positions, block_indices.shape[0])
     _validate_integer_vector(
         "token_to_request", token_to_request, block_indices.shape[0]
     )
@@ -480,9 +474,7 @@ def qsa_sparse_paged_gqa(
     )
     if use_gluon:
         try:
-            _gluon_qsa_sparse_paged_gqa_kernel[
-                (q.shape[0], k_cache.shape[2])
-            ](
+            _gluon_qsa_sparse_paged_gqa_kernel[(q.shape[0], k_cache.shape[2])](
                 q,
                 k_cache,
                 v_cache,
@@ -526,11 +518,10 @@ def qsa_sparse_paged_gqa(
                 num_warps=4,
             )
             return out
-        except Exception:  # noqa: BLE001
+        except Exception:
             if selected_backend == "gluon":
                 raise
             # Gluon JIT/compiler failures must not take down the portable path.
-            pass
 
     _qsa_sparse_paged_gqa_kernel[(q.shape[0], k_cache.shape[2])](
         q,
