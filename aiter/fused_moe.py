@@ -489,6 +489,7 @@ def fused_moe(
     shared_w1_scale: torch.Tensor | None = None,
     shared_w2_scale: torch.Tensor | None = None,
     shared_expert_id: int = -1,
+    extern_moe_output: torch.Tensor | None = None,
 ):
     if (
         any(
@@ -528,6 +529,7 @@ def fused_moe(
             shared_w1_scale=shared_w1_scale,
             shared_w2_scale=shared_w2_scale,
             shared_expert_id=shared_expert_id,
+            extern_moe_output=extern_moe_output,
         )
     if not block_size_M:
         block_size_M = -1
@@ -557,6 +559,7 @@ def fused_moe(
         beta=beta,
         linear_beta=linear_beta,
         gate_mode=gate_mode,
+        extern_moe_output=extern_moe_output,
     )
 
 
@@ -588,7 +591,10 @@ def fused_moe_fake(
     beta: float | None = None,
     linear_beta: float | None = None,
     gate_mode: str = GateMode.SEPARATED.value,
+    extern_moe_output: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    if extern_moe_output is not None:
+        return extern_moe_output
     device = topk_ids.device
     M, _topk = topk_ids.shape
     dtype = hidden_states.dtype if dtype is None else dtype
@@ -626,6 +632,7 @@ def fused_moe_(
     beta: float | None = None,
     linear_beta: float | None = None,
     gate_mode: str = GateMode.SEPARATED.value,
+    extern_moe_output: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return _fused_moe_impl(
         hidden_states=hidden_states,
@@ -653,6 +660,7 @@ def fused_moe_(
         beta=beta,
         linear_beta=linear_beta,
         gate_mode=gate_mode,
+        extern_moe_output=extern_moe_output,
     )
 
 
@@ -687,6 +695,7 @@ def _fused_moe_impl(
     _metadata_transform: Callable | None = None,
     _stage1_extra_args: dict | None = None,
     _stage2_extra_args: dict | None = None,
+    extern_moe_output: torch.Tensor | None = None,
 ) -> torch.Tensor:
     # We do such convert since custom_op schema restriction on block_size_M, and Enum type
     activation = ActivationType(activation)
@@ -713,6 +722,14 @@ def _fused_moe_impl(
         dtypes.fp16,
         dtypes.bf16,
     ], f"Fused_moe unsupported out dtype: {dtype}"
+    if extern_moe_output is not None:
+        assert (
+            extern_moe_output.shape == (M, model_dim)
+            and extern_moe_output.dtype == dtype
+        ), (
+            f"moe_output must be ({M}, {model_dim}) {dtype}, "
+            f"got {tuple(extern_moe_output.shape)} {extern_moe_output.dtype}"
+        )
     quant_type = quant_remap.get(quant_type, quant_type)
     q_dtype_w = w1.dtype
     q_dtype_a = w1.dtype if w1.dtype != torch.uint32 else dtypes.fp8
@@ -804,6 +821,7 @@ def _fused_moe_impl(
                 num_local_tokens=num_local_tokens,
                 situ_beta=1.0 if beta is None else float(beta),
                 situ_linear_beta=1.0 if linear_beta is None else float(linear_beta),
+                extern_moe_output=extern_moe_output,
             )
 
     if grouped_a8w4_out is not None:
@@ -896,6 +914,7 @@ def _fused_moe_impl(
             )
         _kn2 = metadata.stage2.keywords.get("kernelName2", "")
         _atomic = parse_g2_kname_any(_kn2)["atomic"]
+        _use_accumulate = _atomic
         (
             sorted_ids,
             sorted_weights,
@@ -916,6 +935,7 @@ def _fused_moe_impl(
         )
         local_topk_ids = None
     else:
+        _use_accumulate = not stage2_uses_route_reduce(metadata.stage2)
         sorting_ret = moe_sorting(
             topk_ids,
             topk_weight,
@@ -927,7 +947,7 @@ def _fused_moe_impl(
             num_local_tokens,
             moe_sorting_dispatch_policy,
             return_local_topk_ids=need_local_topk_ids,
-            accumulate=not stage2_uses_route_reduce(metadata.stage2),
+            accumulate=_use_accumulate,
             flat=metadata.flat,
         )
         if need_local_topk_ids:
@@ -945,6 +965,12 @@ def _fused_moe_impl(
             )
             local_topk_ids = None
     _opus_a8w4.check_route_bucket_metadata(metadata, sorted_expert_ids, logger)
+
+    _use_external_output = extern_moe_output is not None and not metadata.flat
+    if _use_external_output:
+        if _use_accumulate:
+            extern_moe_output.zero_()
+        moe_buf = extern_moe_output
 
     if metadata.run_1stage:
         _stage1_call = functools.partial(
@@ -973,9 +999,9 @@ def _fused_moe_impl(
         )
         if kernel_bench_callable is not None:
             kernel_bench_callable.append(("stage1", _stage1_call))
-        return _stage1_call()
+        result = _stage1_call()
     else:
-        return fused_moe_2stages(
+        result = fused_moe_2stages(
             hidden_states,
             w1,
             w2,
@@ -1016,6 +1042,15 @@ def _fused_moe_impl(
             _stage1_extra_args=_stage1_extra_args,
             _stage2_extra_args=_stage2_extra_args,
         )
+
+    # FLAT mode cannot use external buffer (kernel needs 8-byte tail),
+    # so result lives in internal moe_buf; copy back to caller's buffer.
+    if (
+        extern_moe_output is not None
+        and result.data_ptr() != extern_moe_output.data_ptr()
+    ):
+        extern_moe_output.copy_(result)
+    return result
 
 
 def fused_moe_1stage(
