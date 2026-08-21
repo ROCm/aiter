@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (c) 2025 FlyDSL Project Contributors
+# Copyright (C) 2025-2026 FlyDSL Project Contributors
 
 """MoE topk-reduction kernel (FlyDSL, layout API).
 
@@ -39,6 +39,7 @@ def moe_reduction_kernel(
     i32_m_tokens: fx.Int32,
     topk: fx.Constexpr[int],
     model_dim: fx.Constexpr[int],
+    model_dim_pad: fx.Constexpr[int],
     dtype_str: fx.Constexpr[str],
     use_mask: fx.Constexpr[bool],
     num_experts: fx.Constexpr[int],
@@ -178,12 +179,23 @@ def moe_reduction_kernel(
                     vk, fx.Vector.filled(V, 0.0, fx.Float32)
                 )
             acc = acc + vk
+        if const_expr(model_dim_pad > 0):
+            col0 = fx.Int32(tile) * fx.Int32(TILE) + fx.Int32(tid) * fx.Int32(V)
+            valid_model_dim = fx.Int32(model_dim - model_dim_pad)
+            zero = fx.Float32(0.0)
+            acc = fx.Vector.from_elements(
+                [
+                    (col0 + fx.Int32(i) < valid_model_dim).select(acc[i], zero)
+                    for i in range_constexpr(V)
+                ],
+                fx.Float32,
+            )
         ofrag = fx.make_fragment_like(p_dst)
         fx.memref_store_vec(acc.truncf(vec_out) if is_16b else acc, ofrag)
         fx.copy(store_atom, ofrag, p_dst)
 
     # Skip threads whose column group starts past model_dim (their loads would
-    # read the next row -- in-descriptor, wasted BW); only needed when TILE ∤ md.
+    # read the next row -- in-descriptor, wasted BW); only needed when TILE ? md.
     if const_expr(model_dim % TILE != 0):
         if fx.Int32(tile) * fx.Int32(TILE) + fx.Int32(tid) * fx.Int32(V) < fx.Int32(
             model_dim
@@ -198,6 +210,7 @@ def compile_moe_reduction(
     *,
     topk: int,
     model_dim: int,
+    model_dim_pad: int = 0,
     dtype_str: str = "f16",
     use_mask: bool = False,
     num_experts: int = 0,
@@ -213,6 +226,10 @@ def compile_moe_reduction(
     launcher is a distinct object per shape, so the shim's per-exe ``_cf`` cache
     stays correct.
     """
+    if not 0 <= model_dim_pad < model_dim:
+        raise ValueError(
+            f"model_dim_pad must be in [0, {model_dim}), got {model_dim_pad}"
+        )
     V = FP8_VEC if dtype_str == "fp8" else 128 // (32 if dtype_str == "f32" else 16)
     gy = (model_dim + BLOCK * V - 1) // (BLOCK * V)
     out_tag = out_dtype_str or dtype_str
@@ -246,6 +263,7 @@ def compile_moe_reduction(
             i32_m_tokens,
             topk,
             model_dim,
+            model_dim_pad,
             dtype_str,
             use_mask,
             num_experts,

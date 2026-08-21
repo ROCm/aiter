@@ -38,7 +38,7 @@ def _warn_tile_override(axis: str, inter_dim: int, requested: int, resolved: int
         logger = logging.getLogger("aiter")
     logger.warning(
         "FlyDSL MoE: %s=%d does not divide inter_dim=%d (not 256-aligned); "
-        "forcing %s=%d. tile=%d is NOT usable/tunable for this shape — any tuned "
+        "forcing %s=%d. tile=%d is NOT usable/tunable for this shape -- any tuned "
         "config naming tile=%d here actually runs %d.",
         axis,
         requested,
@@ -720,6 +720,7 @@ def compile_flydsl_moe_stage2(
     inter_dim_pad: int = 0,
     xcd_swizzle: int = 0,
     enable_bias: bool = False,
+    a_sorted: bool = False,
 ):
     """Compile stage2 kernel (cached via underlying lru_cache)."""
     # a16w-mix (bf16 A x {fp4 mxfp4, int4} W) down-proj: build the ported gemm2
@@ -775,6 +776,7 @@ def compile_flydsl_moe_stage2(
             model_dim_pad=model_dim_pad,
             inter_dim_pad=inter_dim_pad,
             enable_bias=enable_bias,
+            a_sorted=a_sorted,
         )
     else:
         raise ValueError(
@@ -915,6 +917,7 @@ def _s2_args_fp4(
     sorted_weights,
     num_valid_ids,
     token_num,
+    x_rows,
     n_in,
     k_in,
     blocks,
@@ -941,6 +944,7 @@ def _s2_args_fp4(
         ptr_arg(num_valid_ids),
         ptr_arg(_bias),
         token_num,
+        x_rows,
         n_in,
         k_in,
         blocks,
@@ -998,7 +1002,7 @@ def _run_compiled(exe, args):
     except Exception:
         # JitFunction.__call__ leaks ir.Context on compilation failure,
         # causing all subsequent JitFunction calls to take a wrong code path
-        # (self.func(*args) without CompilationContext → gpu_module_body error).
+        # (self.func(*args) without CompilationContext -> gpu_module_body error).
         # Clean up leaked contexts to isolate failures.
         try:
             from flydsl._mlir import ir
@@ -1020,6 +1024,7 @@ def _run_moe_reduction(
     token_num,
     topk,
     model_dim,
+    model_dim_pad=0,
     expert_mask=None,
     topk_ids=None,
     stream=None,
@@ -1045,7 +1050,7 @@ def _run_moe_reduction(
         _reduce_dtype_str = None
 
     if _reduce_dtype_str is None:
-        # Unsupported dtype for the masked kernel — fall back to torch.sum.
+        # Unsupported dtype for the masked kernel -- fall back to torch.sum.
         # This drops the EP mask, so only valid for non-EP runs.
         if use_mask:
             raise NotImplementedError(
@@ -1090,11 +1095,12 @@ def _run_moe_reduction(
     )
     if stream is None:
         stream = torch.cuda.current_stream()
-    # expert_mask is sized by the global expert count (≠ w2.shape[0] under EP).
+    # expert_mask is sized by the global expert count (!= w2.shape[0] under EP).
     num_experts = int(expert_mask.numel()) if use_mask else 0
     reduce_exe = compile_moe_reduction(
         topk=topk,
         model_dim=model_dim,
+        model_dim_pad=model_dim_pad,
         dtype_str=_reduce_dtype_str,
         use_mask=use_mask,
         num_experts=num_experts,
@@ -1131,7 +1137,7 @@ def _run_moe_reduction(
 # largest legal tile_n that divides the required N dims, and (b) zero-pad
 # activations, weights and scales on the K dim to the next multiple of
 # tile_k. Zero padding is algebraically safe for mx-quantized GEMM (the
-# extra K-slice contributes 0·anything = 0), and is cheap relative to the
+# extra K-slice contributes 0 * anything = 0), and is cheap relative to the
 # kernel cost (~2% for 2944 vs 2880).
 # ---------------------------------------------------------------------------
 
@@ -2010,6 +2016,8 @@ def _flydsl_moe_stage2_impl(
     return_per_slot: bool = False,
     expert_mask: torch.Tensor | None = None,
     topk_ids: torch.Tensor | None = None,
+    intermediate_sorted: bool = False,
+    logical_token_num: int | None = None,
     _compile_kernel=compile_flydsl_moe_stage2,
     _build_mx_args=_s2_args_fp4,
 ) -> torch.Tensor:
@@ -2074,10 +2082,38 @@ def _flydsl_moe_stage2_impl(
         )
         return out
 
-    token_num = inter_states.shape[0]
+    if intermediate_sorted:
+        if inter_states.ndim != 2:
+            raise ValueError(
+                "sorted stage2 intermediate must be 2D "
+                f"[sorted_rows, packed_inter_dim], got shape={tuple(inter_states.shape)}"
+            )
+        if logical_token_num is None:
+            if out is None:
+                raise ValueError(
+                    "logical_token_num or out is required for a sorted stage2 intermediate"
+                )
+            logical_token_num = out.shape[0]
+        token_num = int(logical_token_num)
+        x_rows = inter_states.shape[0]
+        if x_rows < sorted_token_ids.numel():
+            raise ValueError(
+                f"sorted intermediate has {x_rows} rows, but sorted_token_ids "
+                f"contains {sorted_token_ids.numel()} rows"
+            )
+        if a_dtype in ("fp4", "fp8") and a2_scale is None:
+            raise ValueError("sorted MX stage2 intermediate requires a2_scale")
+    else:
+        if inter_states.ndim != 3:
+            raise ValueError(
+                "dense stage2 intermediate must be 3D "
+                f"[token_num, topk, inter_dim], got shape={tuple(inter_states.shape)}"
+            )
+        token_num = inter_states.shape[0]
+        x_rows = inter_states.shape[0] * inter_states.shape[1]
     E = w2.shape[0]
     model_dim = w2.shape[1]
-    inter_dim = inter_states.shape[2]
+    inter_dim = inter_states.shape[-1]
 
     # Debug: force stage2 to use the masked reduce epilogue instead of atomic
     # accumulate. Enabled by default; set AITER_FLYDSL_FORCE_REDUCE=0 to opt out.
@@ -2203,6 +2239,7 @@ def _flydsl_moe_stage2_impl(
             sw,
             num_valid_ids,
             token_num,
+            x_rows,
             _n_in,
             _k_in,
             m_blocks,
@@ -2249,6 +2286,7 @@ def _flydsl_moe_stage2_impl(
         inter_dim_pad=inter_dim_pad,
         xcd_swizzle=xcd_swizzle,
         enable_bias=(bias is not None),
+        a_sorted=intermediate_sorted,
     )
     _run_compiled(exe, args)
 
@@ -2265,12 +2303,17 @@ def _flydsl_moe_stage2_impl(
             token_num,
             topk,
             model_dim,
+            model_dim_pad,
             expert_mask,
             topk_ids,
             is_fp8=_s2_fp8_inter,
             fp8_scale_blk=_S2_LEGACY_FP8_SCALE_BLK,
             fp8_pitch_align=_S2_LEGACY_FP8_PITCH_ALIGN,
         )
+    if return_per_slot and model_dim_pad > 0:
+        # No reduction kernel runs in this debug/raw-output mode, so normalize
+        # its unlaunched padded tiles here.
+        out.view(-1, model_dim)[:, model_dim - model_dim_pad :].zero_()
     return out
 
 
@@ -2306,6 +2349,8 @@ def flydsl_moe_stage2(
     return_per_slot: bool = False,
     expert_mask: torch.Tensor | None = None,
     topk_ids: torch.Tensor | None = None,
+    intermediate_sorted: bool = False,
+    logical_token_num: int | None = None,
 ) -> torch.Tensor:
     """Down-projection GEMM (MOE stage2). Supports atomic/reduce modes.
 
@@ -2359,6 +2404,8 @@ def flydsl_moe_stage2(
         return_per_slot=return_per_slot,
         expert_mask=expert_mask,
         topk_ids=topk_ids,
+        intermediate_sorted=intermediate_sorted,
+        logical_token_num=logical_token_num,
     )
 
 
