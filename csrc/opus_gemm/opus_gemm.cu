@@ -261,8 +261,6 @@ static bool opus_a16w16_has_workspace_kernel(int kid)
     }
   }
 }
-#endif // OPUS_BUILD_HAS_GFX950 || OPUS_BUILD_HAS_GFX942
-
 static OpusA16W16WorkspaceKernel
 opus_a16w16_workspace_dispatch(int kid)
 {
@@ -533,75 +531,6 @@ void opus_gemm_a8w8_blockscale_bpreshuffle_launch(
                 entry, ": unsupported Y dtype ",
                 AiterDtype_to_str(Y.dtype()), "; expected bf16 or fp32");
   }
-}
-
-// Free everything a single Owner holds: the GPU workspace data buffer (owned via
-// the host handle's `ptr`), the host coherent handle itself, and the device
-// mirror. Caller must hold the registry mutex and must have synchronized any
-// in-flight work that could still reference the buffer.
-static void opus_splitk_ws_free_owner_locked(SplitkWsRegistry::Owner* owner)
-{
-  if (owner == nullptr) return;
-  if (owner->host != nullptr)
-  {
-    if (owner->host->ptr != nullptr)
-    {
-      HIP_CALL(hipFree(owner->host->ptr));
-      owner->host->ptr   = nullptr;
-      owner->host->bytes = 0;
-    }
-#ifdef OPUS_BUILD_HAS_GFX950
-    HIP_CALL(hipHostFree(owner->host));  // paired with hipHostMalloc above
-#else
-    delete owner->host;  // paired with plain `new` for the gfx942/gfx1250 path
-#endif
-    owner->host = nullptr;
-  }
-  if (owner->device != nullptr)
-  {
-    HIP_CALL(hipFree(owner->device));
-    owner->device = nullptr;
-  }
-  delete owner;
-}
-
-// Release the splitk workspace (buffer + handles + registry entry) for the
-// CURRENT stream. Safe to call when the stream was never registered (no-op).
-// Must run in eager mode; frees are stream-capture-illegal.
-void opus_gemm_workspace_release()
-{
-  hipStream_t s = aiter::getCurrentHIPStream();
-  hipStreamCaptureStatus cap = hipStreamCaptureStatusNone;
-  HIP_CALL(hipStreamIsCapturing(s, &cap));
-  AITER_CHECK(cap == hipStreamCaptureStatusNone,
-              "opus_gemm_workspace_release must be called in eager mode "
-              "(not inside HIP graph capture).");
-  // Drain the stream so no in-flight kernel references the buffer being freed.
-  HIP_CALL(hipStreamSynchronize(s));
-  auto& R = splitk_ws_registry();
-  std::lock_guard<std::mutex> g(R.mu);
-  auto it = R.map.find(s);
-  if (it == R.map.end()) return;
-  opus_splitk_ws_free_owner_locked(it->second);
-  R.map.erase(it);
-}
-
-// Release the splitk workspace for ALL registered streams and clear the
-// registry. Intended for explicit teardown (e.g. before a framework tears down
-// its stream pool). Must run in eager mode.
-void opus_gemm_workspace_release_all()
-{
-  auto& R = splitk_ws_registry();
-  std::lock_guard<std::mutex> g(R.mu);
-  if (R.map.empty()) return;
-  // Drain all device work before freeing any buffer (buffers belong to many
-  // streams; a single device sync covers them all).
-  HIP_CALL(hipDeviceSynchronize());
-  for (auto& kv : R.map)
-  {
-    opus_splitk_ws_free_owner_locked(kv.second);
-  }
-  R.map.clear();
 }
 
 #endif // !__HIP_DEVICE_COMPILE__

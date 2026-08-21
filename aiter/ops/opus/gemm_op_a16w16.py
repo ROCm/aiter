@@ -55,6 +55,10 @@ def _opus_gemm_a16w16_launch_raw(
 _OPUS_A16W16_MODULE = "module_deepgemm_opus"
 _opus_a16w16_cabi_primed = False
 _NULL_AITER_TENSOR = ctypes.POINTER(aiter_tensor_t)()
+_RAW_CURRENT_STREAM = getattr(torch._C, "_cuda_getCurrentRawStream", None)
+_TORCH_IS_COMPILING = getattr(
+    getattr(torch, "compiler", None), "is_compiling", lambda: False
+)
 
 
 class _OpusA16DescriptorPool(local):
@@ -77,15 +81,15 @@ def _fill_aiter_tensor_descriptor(
     strides = tensor.stride()
     ndim = len(shape)
     assert ndim <= 8, f"aiter_tensor_t supports at most 8 dims, got {ndim}"
-    index = tensor.device.index
-
     out.ptr = tensor.data_ptr()
     out.numel_ = tensor.numel()
     out.ndim = ndim
     out.shape[:ndim] = shape
     out.strides[:ndim] = strides
     out.dtype_ = _aiter_dtype_id(tensor.dtype)
-    out.device_id = -1 if index is None else index
+    # get_device() returns the ordinal directly and -1 for a CPU tensor.  It
+    # avoids materializing tensor.device on every hot-path descriptor refresh.
+    out.device_id = tensor.get_device()
     return out
 
 
@@ -169,7 +173,13 @@ def _invoke_opus_a16w16_cabi(
         else ctypes.byref(workspace_descriptor)
     )
 
-    stream = ctypes.c_void_p(torch.cuda.current_stream(XQ.device).cuda_stream)
+    device_index = XQ.get_device()
+    stream_handle = (
+        _RAW_CURRENT_STREAM(device_index)
+        if _RAW_CURRENT_STREAM is not None
+        else torch.cuda.current_stream(device_index).cuda_stream
+    )
+    stream = ctypes.c_void_p(stream_handle)
     status = launch(
         ctypes.byref(xq_descriptor),
         ctypes.byref(wq_descriptor),
@@ -207,12 +217,42 @@ def _gen_a16w16_backend_fake(
 
 
 def _register_a16w16_backend_op(func):
-    """Expose the unified private backend as a Torch compile-visible op."""
+    """Use a registered op for compilation and a direct call for eager.
+
+    ``torch_compile_guard`` must remain the Dynamo/FakeTensor boundary, but its
+    eager ``torch.ops`` dispatcher costs a measurable fixed amount on the very
+    short gfx950 split-K kernels.  Manual CUDA graph capture also executes the
+    real call once while capturing, so it needs no dispatcher.  Keep eager and
+    capture on the direct backend body while routing compilation, fake and meta
+    tensors through the registered operator and its fake implementation.
+    """
     guarded = torch_compile_guard(
         device="cuda",
         gen_fake=_gen_a16w16_backend_fake,
     )(func)
-    return wraps(func)(guarded)
+
+    @wraps(func)
+    def eager_or_compiled(
+        XQ: torch.Tensor,
+        WQ: torch.Tensor,
+        Y: torch.Tensor,
+        bias: torch.Tensor | None,
+        workspace: torch.Tensor | None,
+        kid: int,
+        split_k: int,
+    ) -> None:
+        if (
+            _TORCH_IS_COMPILING()
+            or XQ.is_meta
+            or getattr(XQ, "fake_mode", None) is not None
+        ):
+            return guarded(XQ, WQ, Y, bias, workspace, kid, split_k)
+        return func(XQ, WQ, Y, bias, workspace, kid, split_k)
+
+    # Tests and diagnostics can verify the compile boundary without making the
+    # registered operator part of the public module surface.
+    eager_or_compiled._torch_compile_guarded = guarded
+    return eager_or_compiled
 
 
 @_register_a16w16_backend_op
