@@ -126,12 +126,17 @@ ROWS_PER_WG_SMALL = 4
 # memory contention under arg-rotation / changing data_ptr scenarios.
 SMALL_T_THRESHOLD = 96
 
-# BF16 prefill fast path: route large-T plain-BF16 launches to the TDM
+# BF16 prefill fast path: route large plain-BF16 launches to the TDM
 # deep-prefetch kernel (per-wave s_wait_dscnt fence + K=6 deep prefetch +
 # cos/sin hoist). Requires D % 256 == 0 and power-of-two H (all known MLA
 # models satisfy this). When the constraints aren't met, falls back to the
 # stock kernel.
 USE_TDM_PREFILL = True
+# Both kernels parallelise over rows = T*H, so the switch is on the row count,
+# not the token count. Measured crossover (bench-tdm-vs-stock.py, D=512): TDM
+# first wins at 32768 rows for every H tried -- H=128 T=256, H=64 T=512,
+# H=16 T=2048 -- and loses by 1.4-2.3x below it.
+TDM_MIN_ROWS = 32768
 
 # SQRT2 has no aiter dependency, so it stays at module level.
 _SQRT2 = math.sqrt(2.0)
@@ -1166,7 +1171,7 @@ def flydsl_qk_norm_rope_quant_gfx1250(
         and not quant
         and not kv_write
         and not paged
-        and T_tok > SMALL_T_THRESHOLD
+        and T_tok * H >= TDM_MIN_ROWS
         and (D % 256 == 0)
         and (H & (H - 1) == 0)
     ):
@@ -1272,6 +1277,28 @@ def flydsl_qk_norm_rope_quant_gfx1250(
 ROWS_PER_TILE = 32  # = waves per WG (1024-thread WG)
 NUM_BUFFERS = 6  # K: rotating LDS buffers (1 WG at K=6: 6*32KB=192KB LDS)
 TILES_PER_WG = 40  # CT: tiles streamed per WG (unrolled; CT % (H/RT) == 0)
+
+
+def _tdm_tiles_per_wg(num_rows):
+    """Pick CT (tiles per workgroup) for a row count.
+
+    CT sets how many RT-row tiles one workgroup drains, i.e. it trades deep
+    prefetch (large CT, few workgroups) against occupancy (small CT, many
+    workgroups). grid = ceil(num_rows / (RT*CT)), so the default CT=40 leaves
+    most of the 256 CUs idle just above the dispatch threshold: at 32768 rows
+    it launches 26 workgroups and runs 2.9x slower than CT=8.
+
+    The steps below are where CT=8/16 beat CT=40 by 1.9-2.9x, reproduced at
+    H=16/64/128 (bench-tdm-vs-stock.py). Past 131072 rows the spread across
+    CT collapses to <15% and stops being monotonic -- CT=40 is not optimal
+    everywhere up there (28 is ~10% better at 524288 rows), but the ordering
+    flips between shapes, so leave the default rather than fit the noise.
+    """
+    if num_rows <= 65536:
+        return 8
+    if num_rows <= 131072:
+        return 16
+    return TILES_PER_WG
 
 
 # ---------------------------------------------------------------------------
@@ -1639,7 +1666,7 @@ def flydsl_qk_norm_rope_tdm_prefill(
     q_out=None,
     kv_out=None,
     num_buffers=NUM_BUFFERS,
-    tiles_per_wg=TILES_PER_WG,
+    tiles_per_wg=None,
     stream=None,
 ):
     """Fused RMSNorm + GPT-J RoPE prefill (BF16, gfx1250), one launch. Q rows
@@ -1658,6 +1685,8 @@ def flydsl_qk_norm_rope_tdm_prefill(
         kv_out = torch.empty((T_tok, D), dtype=torch.bfloat16, device=kv.device)
 
     q_weighted = q_weight is not None
+    if tiles_per_wg is None:
+        tiles_per_wg = _tdm_tiles_per_wg(T_tok * H)
     launcher = _compile_tdm_fused(
         num_q_heads=H,
         head_dim=D,
