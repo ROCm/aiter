@@ -1106,11 +1106,17 @@ def test_out_of_scope_is_refused_rather_than_mishandled():
     assert not _causal_conv1d_update_flydsl_supported(
         t["x"].float(), t["conv_state"].float(), t["weight"].float()
     )
-    # SGLang's kernel covers widths 2/3/4 only; the vLLM one goes to 6.
+    # Each interface stops where its own upstream stops computing correctly:
+    # SGLang's tap loop branches on 2/3/4, vLLM's goes to 6. Past either, the
+    # upstream returns a wrong answer rather than refusing, so the port is the
+    # one that has to say no.
     wide = torch.randn((256, 5), device=DEVICE, dtype=DTYPE)
     state_wide = torch.randn((5, 256, 4), device=DEVICE, dtype=DTYPE)
     assert _causal_conv1d_update_flydsl_supported(t["x"], state_wide, wide)
     assert not _causal_conv1d_update_sglang_flydsl_supported(t["x"], state_wide, wide)
+    wider = torch.randn((256, 7), device=DEVICE, dtype=DTYPE)
+    state_wider = torch.randn((5, 256, 6), device=DEVICE, dtype=DTYPE)
+    assert not _causal_conv1d_update_flydsl_supported(t["x"], state_wider, wider)
     # A conv_state too short for the requested window.
     short = torch.randn((5, 256, 1), device=DEVICE, dtype=DTYPE)
     assert not _causal_conv1d_update_flydsl_supported(t["x"], short, t["weight"])
@@ -1120,8 +1126,12 @@ def test_out_of_scope_is_refused_rather_than_mishandled():
     )
 
     # -- refused by raising: the call cannot be completed at all --
+    # Both entry points, so neither leaves an out-of-range width to the builder's
+    # own assertion deep inside the kernel.
     with pytest.raises(NotImplementedError):
         causal_conv1d_update_sglang_flydsl(t["x"], state_wide, wide)
+    with pytest.raises(NotImplementedError):
+        causal_conv1d_update_flydsl(t["x"], state_wider, wider)
     # Packed x hides both the batch and the per-sequence budget, so dropping
     # either one leaves the kernel with no way to size the launch.
     with pytest.raises(ValueError):

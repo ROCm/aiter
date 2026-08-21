@@ -353,6 +353,11 @@ def causal_conv1d_update_flydsl(
 
     Returns an output tensor with the same shape as ``x``.
     """
+    if weight.size(1) not in _VLLM_WIDTHS:
+        raise NotImplementedError(
+            f"causal_conv1d_update_flydsl: width={weight.size(1)} is outside "
+            f"vLLM's implemented {list(_VLLM_WIDTHS)}"
+        )
     is_varlen = query_start_loc is not None
     if is_varlen:
         if conv_state_indices is None:
