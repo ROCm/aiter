@@ -973,10 +973,7 @@ def test_dsv4_i384_fhmoe_uses_dedicated_config(
 
     fused_moe_module = importlib.import_module("aiter.fused_moe")
 
-    config_path = (
-        Path(__file__).resolve().parents[1]
-        / "aiter/configs/model_configs/dsv4_fp8fp4_tuned_fhmoe.csv"
-    )
+    config_path = Path(__file__).resolve().parents[1] / "aiter/configs/tuned_fhmoe.csv"
     monkeypatch.setattr(fused_moe_module, "get_cu_num", lambda: 256)
     monkeypatch.setattr(fused_moe_module, "get_gfx_runtime", lambda: "gfx950")
     monkeypatch.setattr(fused_moe_module, "is_flydsl_available", lambda: True)
@@ -1010,10 +1007,7 @@ def test_dsv4_i384_fhmoe_uses_dedicated_config(
 def test_dsv4_i384_fhmoe_config_has_true_shapes():
     import csv
 
-    config_path = (
-        Path(__file__).resolve().parents[1]
-        / "aiter/configs/model_configs/dsv4_fp8fp4_tuned_fhmoe.csv"
-    )
+    config_path = Path(__file__).resolve().parents[1] / "aiter/configs/tuned_fhmoe.csv"
     ordinary_path = (
         Path(__file__).resolve().parents[1]
         / "aiter/configs/model_configs/dsv4_fp8fp4_tuned_fmoe.csv"
@@ -1064,10 +1058,7 @@ def test_fhmoe_aot_manifest_covers_native_i384():
         Path(__file__).resolve().parents[1]
         / "aiter/configs/model_configs/dsv4_fp8fp4_tuned_fmoe.csv"
     )
-    config_path = (
-        Path(__file__).resolve().parents[1]
-        / "aiter/configs/model_configs/dsv4_fp8fp4_tuned_fhmoe.csv"
-    )
+    config_path = Path(__file__).resolve().parents[1] / "aiter/configs/tuned_fhmoe.csv"
     ordinary_jobs = parse_csv(str(ordinary_path))
     dedicated_jobs = parse_csv(str(config_path))
     ordinary_fhmoe_jobs = [
