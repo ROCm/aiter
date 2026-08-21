@@ -98,6 +98,27 @@ jobs:
             fi
           fi
 
+          if [ "${should_run}" != "true" ]; then
+            {
+              echo "should_run=${should_run}"
+              echo "skip_reason=${skip_reason}"
+              echo "release_tag="
+              echo "release_branch="
+              echo "release_version="
+              echo "release_kind="
+              echo "previous_tag="
+              echo "expected_wheel_count=${EXPECTED_WHEEL_COUNT}"
+            } >> "${GITHUB_OUTPUT}"
+
+            {
+              echo "## Release Target"
+              echo "- Should run: ${should_run}"
+              echo "- Skip reason: ${skip_reason}"
+            } >> "${GITHUB_STEP_SUMMARY}"
+
+            exit 0
+          fi
+
           git fetch --force --tags origin
           git fetch --force origin '+refs/heads/*:refs/remotes/origin/*'
 
@@ -412,7 +433,7 @@ jobs:
           rows = []
           seen = set()
           pattern = re.compile(
-              rf"{re.escape(release_version)}\\+rocm(?P<rocm>7\\.[0-2])\\.manylinux\\.2\\.28-"
+              rf"{re.escape(release_version)}\+rocm(?P<rocm>7\.[0-2])\.manylinux\.2\.28-"
               r"(?P<py>cp3(?:10|12))-(?P=py)-"
           )
           for asset in wheels:
