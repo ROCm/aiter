@@ -182,6 +182,31 @@ def _store_bf16_tiled(vals_list, p_dst, copy, vec):
     fx.copy(copy, frag, p_dst)
 
 
+def _store_bf16_vec(vals, out_rsrc, row_base_bytes, idx, vec):
+    """Convert VEC fp32 → bf16 dwords and raw buffer_store (split for VEC>8)."""
+    i32 = T.i32
+    if isinstance(vals, (list, tuple)):
+        raw = [v.ir_value() if hasattr(v, "ir_value") else v for v in vals]
+        vals = fx.Vector(vector.from_elements(T.vec(vec, T.f32), raw))
+    bf16v = vals.to(fx.BFloat16)
+
+    dwords = vec // 2
+    bf16_as_i32 = vector.bitcast(T.vec(dwords, i32), bf16v)
+    off_bytes = row_base_bytes + idx * (vec * 2)
+
+    if const_expr(dwords <= 4):
+        buffer_ops.buffer_store(bf16_as_i32, out_rsrc, off_bytes, offset_is_bytes=True)
+    else:
+        lo = vector.extract_strided_slice(
+            T.vec(4, i32), bf16_as_i32, offsets=[0], sizes=[4], strides=[1]
+        )
+        hi = vector.extract_strided_slice(
+            T.vec(4, i32), bf16_as_i32, offsets=[4], sizes=[4], strides=[1]
+        )
+        buffer_ops.buffer_store(lo, out_rsrc, off_bytes, offset_is_bytes=True)
+        buffer_ops.buffer_store(hi, out_rsrc, off_bytes + 16, offset_is_bytes=True)
+
+
 def _store_fp8_packed_w64(
     vals_list, out_base_i64, row_base_bytes, idx, vec, *, skip_fnuz_clamp=False
 ):
@@ -210,31 +235,6 @@ def _store_fp8_packed_w64(
     base = out_base_i64 + fx.Int64(row_base_bytes)
     packed_i64 = fx.Vector.from_elements([p0, p1], dtype=fx.Int32).bitcast(fx.Int64)[0]
     _scalar_store(base, idx, fx.Int64(packed_i64), fx.Int64, 64)
-
-
-def _store_bf16_vec(vals, out_rsrc, row_base_bytes, idx, vec):
-    """Convert VEC fp32 → bf16 dwords and raw buffer_store (split for VEC>8)."""
-    i32 = T.i32
-    if isinstance(vals, (list, tuple)):
-        raw = [v.ir_value() if hasattr(v, "ir_value") else v for v in vals]
-        vals = fx.Vector(vector.from_elements(T.vec(vec, T.f32), raw))
-    bf16v = vals.to(fx.BFloat16)
-
-    dwords = vec // 2
-    bf16_as_i32 = vector.bitcast(T.vec(dwords, i32), bf16v)
-    off_bytes = row_base_bytes + idx * (vec * 2)
-
-    if const_expr(dwords <= 4):
-        buffer_ops.buffer_store(bf16_as_i32, out_rsrc, off_bytes, offset_is_bytes=True)
-    else:
-        lo = vector.extract_strided_slice(
-            T.vec(4, i32), bf16_as_i32, offsets=[0], sizes=[4], strides=[1]
-        )
-        hi = vector.extract_strided_slice(
-            T.vec(4, i32), bf16_as_i32, offsets=[4], sizes=[4], strides=[1]
-        )
-        buffer_ops.buffer_store(lo, out_rsrc, off_bytes, offset_is_bytes=True)
-        buffer_ops.buffer_store(hi, out_rsrc, off_bytes + 16, offset_is_bytes=True)
 
 
 def _store_fp8_packed_w32(
@@ -270,6 +270,7 @@ def _store_fp8_packed_w32(
     buffer_ops.buffer_store(store_vec, out_rsrc, off_bytes, offset_is_bytes=True)
 
 
+@lru_cache(maxsize=32)
 def _build_kernel_w64(
     *,
     num_q_heads: int,
@@ -282,7 +283,6 @@ def _build_kernel_w64(
     kv_write: bool = False,
     paged: bool = False,
 ):
-    """Build the wave64 @flyc.kernel + @flyc.jit launcher for a given config."""
     BLOCK_THREADS = BLOCK_THREADS_W64  # 1 wave64
     H = num_q_heads
     D = head_dim
@@ -782,9 +782,11 @@ def _build_kernel_w64(
             stream=stream,
         )
 
+    launch_qk_norm_rope_quant.compile_hints = dict(_DEFAULT_COMPILE_HINTS)
     return launch_qk_norm_rope_quant
 
 
+@lru_cache(maxsize=32)
 def _build_kernel_w32(
     *,
     num_q_heads: int,
@@ -1363,65 +1365,8 @@ def _build_kernel_w32(
             stream=stream,
         )
 
+    launch_qk_norm_rope_quant.compile_hints = dict(_DEFAULT_COMPILE_HINTS)
     return launch_qk_norm_rope_quant
-
-
-@lru_cache(maxsize=32)
-def _compile_w64(
-    *,
-    num_q_heads,
-    head_dim,
-    rope_head_dim,
-    quant,
-    group_size,
-    scale_dtype,
-    q_weighted,
-    kv_write=False,
-    paged=False,
-):
-    launcher = _build_kernel_w64(
-        num_q_heads=num_q_heads,
-        head_dim=head_dim,
-        rope_head_dim=rope_head_dim,
-        quant=quant,
-        group_size=group_size,
-        scale_dtype=scale_dtype,
-        q_weighted=q_weighted,
-        paged=paged,
-        kv_write=kv_write,
-    )
-    launcher.compile_hints = dict(_DEFAULT_COMPILE_HINTS)
-    return launcher
-
-
-@lru_cache(maxsize=32)
-def _compile_gfx1250(
-    *,
-    num_q_heads,
-    head_dim,
-    rope_head_dim,
-    quant,
-    group_size,
-    scale_dtype,
-    q_weighted,
-    kv_write=False,
-    paged=False,
-    rows_per_wg=ROWS_PER_WG,
-):
-    launcher = _build_kernel_w32(
-        num_q_heads=num_q_heads,
-        head_dim=head_dim,
-        rope_head_dim=rope_head_dim,
-        quant=quant,
-        group_size=group_size,
-        scale_dtype=scale_dtype,
-        q_weighted=q_weighted,
-        kv_write=kv_write,
-        paged=paged,
-        rows_per_wg=rows_per_wg,
-    )
-    launcher.compile_hints = dict(_DEFAULT_COMPILE_HINTS)
-    return launcher
 
 
 def flydsl_qk_norm_rope_quant(
@@ -1659,7 +1604,7 @@ def flydsl_qk_norm_rope_quant(
             return q_out, kv_out, None, None
 
         rows_per_wg = ROWS_PER_WG_SMALL if T_tok <= SMALL_T_THRESHOLD else ROWS_PER_WG
-        launcher = _compile_gfx1250(
+        launcher = _build_kernel_w32(
             num_q_heads=H,
             head_dim=D,
             rope_head_dim=RD,
@@ -1672,7 +1617,7 @@ def flydsl_qk_norm_rope_quant(
             rows_per_wg=rows_per_wg,
         )
     else:
-        launcher = _compile_w64(
+        launcher = _build_kernel_w64(
             num_q_heads=H,
             head_dim=D,
             rope_head_dim=RD,
@@ -1762,6 +1707,7 @@ def _tdm_tiles_per_wg(num_rows):
     return TILES_PER_WG
 
 
+@lru_cache(maxsize=16)
 def _build_tdm_fused(
     *,
     num_q_heads,
@@ -2047,31 +1993,8 @@ def _build_tdm_fused(
             stream=stream,
         )
 
+    launch.compile_hints = dict(_DEFAULT_COMPILE_HINTS)
     return launch
-
-
-@lru_cache(maxsize=16)
-def _compile_tdm_fused(
-    *,
-    num_q_heads,
-    head_dim,
-    rope_head_dim,
-    num_buffers=NUM_BUFFERS,
-    tiles_per_wg=TILES_PER_WG,
-    hoist_cs=True,
-    q_weighted=False,
-):
-    launcher = _build_tdm_fused(
-        num_q_heads=num_q_heads,
-        head_dim=head_dim,
-        rope_head_dim=rope_head_dim,
-        num_buffers=num_buffers,
-        tiles_per_wg=tiles_per_wg,
-        hoist_cs=hoist_cs,
-        q_weighted=q_weighted,
-    )
-    launcher.compile_hints = dict(_DEFAULT_COMPILE_HINTS)
-    return launcher
 
 
 def flydsl_qk_norm_rope_tdm_prefill(
@@ -2110,7 +2033,7 @@ def flydsl_qk_norm_rope_tdm_prefill(
     q_weighted = q_weight is not None
     if tiles_per_wg is None:
         tiles_per_wg = _tdm_tiles_per_wg(T_tok * H)
-    launcher = _compile_tdm_fused(
+    launcher = _build_tdm_fused(
         num_q_heads=H,
         head_dim=D,
         rope_head_dim=RD,
