@@ -478,7 +478,7 @@ __launch_bounds__(opus::get_warp_size(), 1) __global__
                                     1;
                             }
                         }
-                        batch_tail       = opus::max(batch_tail, 0);
+                        batch_tail       = params.is_causal ? opus::max(batch_tail, 0) : 0;
                         work_info.kv_end = opus::min(work_info.kv_start +
                                                          (remain_kv_blocks * params.kv_granularity),
                                                      curr_kv_end - batch_tail);
@@ -631,7 +631,7 @@ __launch_bounds__(opus::get_warp_size(), 1) __global__
                                                  1;
                                 }
                             }
-                            batch_tail       = opus::max(batch_tail, 0);
+                            batch_tail       = params.is_causal ? opus::max(batch_tail, 0) : 0;
                             work_info.kv_end = opus::min(
                                 work_info.kv_start + (consuming_blks * params.kv_granularity),
                                 curr_kv_end - batch_tail);
@@ -761,15 +761,13 @@ static inline int32_t mla_metadata_cluster_multiplier(const std::string& arch_id
                                                       const int32_t num_heads,
                                                       const int32_t max_seqlen_qo,
                                                       const MlaVersion mla_version,
-                                                      const at::ScalarType q_nope_dtype,
-                                                      const at::ScalarType q_rope_dtype,
-                                                      const at::ScalarType kv_nope_dtype,
-                                                      const at::ScalarType kv_rope_dtype)
+                                                      const AiterDtype q_nope_dtype,
+                                                      const AiterDtype q_rope_dtype,
+                                                      const AiterDtype kv_nope_dtype,
+                                                      const AiterDtype kv_rope_dtype)
 {
-    auto is_fp8 = [](const at::ScalarType dtype) {
-        return dtype == at::ScalarType::Float8_e4m3fnuz || dtype == at::ScalarType::Float8_e4m3fn;
-    };
-    auto is_bf16 = [](const at::ScalarType dtype) { return dtype == at::ScalarType::BFloat16; };
+    auto is_fp8  = [](const AiterDtype dtype) { return dtype == AITER_DTYPE_fp8; };
+    auto is_bf16 = [](const AiterDtype dtype) { return dtype == AITER_DTYPE_bf16; };
 
     const bool dtype_ok =
         ((mla_version == MlaVersion::V32) && is_fp8(q_nope_dtype) && is_fp8(q_rope_dtype) &&
@@ -783,9 +781,9 @@ static inline int32_t mla_metadata_cluster_multiplier(const std::string& arch_id
     return is_hk_m16x4 ? 2 : 1;
 }
 
-void get_mla_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [batch size + 1]
-                                  const torch::Tensor& seqlens_kv_indptr, // [batch size + 1]
-                                  const torch::Tensor& kv_last_page_lens, // [batch size]
+void get_mla_metadata_v1_2_device(const aiter_tensor_t& seqlens_qo_indptr, // [batch size + 1]
+                                  const aiter_tensor_t& seqlens_kv_indptr, // [batch size + 1]
+                                  const aiter_tensor_t& kv_last_page_lens, // [batch size]
                                   const int32_t num_heads_per_head_k,
                                   const int32_t num_heads_k,
                                   const bool is_causal,
@@ -795,20 +793,20 @@ void get_mla_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [ba
                                   const int32_t ori_uni_seqlen_qo,
                                   const int32_t topk,
                                   const int32_t max_split_per_batch,
-                                  const at::ScalarType q_dtype,
-                                  const at::ScalarType kv_dtype,
-                                  const at::ScalarType q_rope_dtype,
-                                  const at::ScalarType kv_rope_dtype,
+                                  const AiterDtype q_dtype,
+                                  const AiterDtype kv_dtype,
+                                  const AiterDtype q_rope_dtype,
+                                  const AiterDtype kv_rope_dtype,
                                   const bool is_cp_round_robin,
                                   const MlaVersion mla_version,
-                                  torch::Tensor& work_metadata_ptrs,
-                                  torch::Tensor& work_info_set,
-                                  torch::Tensor& work_indptr,
-                                  torch::Tensor& reduce_indptr,
-                                  torch::Tensor& reduce_final_map,
-                                  torch::Tensor& reduce_partial_map)
+                                  aiter_tensor_t& work_metadata_ptrs,
+                                  aiter_tensor_t& work_info_set,
+                                  aiter_tensor_t& work_indptr,
+                                  aiter_tensor_t& reduce_indptr,
+                                  aiter_tensor_t& reduce_final_map,
+                                  aiter_tensor_t& reduce_partial_map)
 {
-    const hipStream_t stream = at::hip::getCurrentHIPStream();
+    const hipStream_t stream = aiter::getCurrentHIPStream();
 
     hipDevice_t dev;
     hipDeviceProp_t dev_prop;
@@ -827,10 +825,8 @@ void get_mla_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [ba
 
     // In the following cases, we use #head=16 to simulate cases which is not natively supported by
     // mla main kernel.
-    const bool q_is_fp8 =
-        (q_dtype == at::ScalarType::Float8_e4m3fnuz || q_dtype == at::ScalarType::Float8_e4m3fn);
-    const bool kv_is_fp8 =
-        (kv_dtype == at::ScalarType::Float8_e4m3fnuz || kv_dtype == at::ScalarType::Float8_e4m3fn);
+    const bool q_is_fp8  = (q_dtype == AITER_DTYPE_fp8);
+    const bool kv_is_fp8 = (kv_dtype == AITER_DTYPE_fp8);
 
     const bool enable_experimental = std::getenv("AITER_ENABLE_EXPERIMENTAL") != nullptr &&
                                      std::atoi(std::getenv("AITER_ENABLE_EXPERIMENTAL")) != 0;
@@ -873,7 +869,7 @@ void get_mla_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [ba
         num_batches *= qk_batch_ratio;
     }
 
-    TORCH_CHECK(
+    AITER_CHECK(
         natively_supported || (num_heads == 16) || (num_heads == 128) ||
             ((num_heads == 32) && q_is_fp8 && kv_is_fp8) ||
             ((num_heads == 64) && q_is_fp8 && kv_is_fp8 && (max_seqlen_qo == 1)) ||
@@ -889,22 +885,22 @@ void get_mla_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [ba
         __func__,
         ": only supports #heads in [16, 64, 128], or (#head, uni_seqlen_qo) = (16*N, 1) where "
         "N is in [2, 8), or (#head, max_seqlen_qo) = (8, 4) where q and kv are fp8, "
-        "or q and kv are bf16 on gfx950")
+        "or q and kv are bf16 on gfx950");
 
     int32_t num_splits = max_split_per_batch < 0
                              ? num_clusters
                              : min(num_clusters, max_split_per_batch * num_batches);
 
     MlaMetadataV1KernelParameter params = {};
-    params.p_work_metadata_ptrs         = work_metadata_ptrs.data_ptr<uint64_t>();
-    params.p_work_indptr                = work_indptr.data_ptr<int32_t>();
-    params.p_work_info_set_raw          = work_info_set.data_ptr<int32_t>();
-    params.p_reduce_indptr              = reduce_indptr.data_ptr<int32_t>();
-    params.p_reduce_final_map           = reduce_final_map.data_ptr<int32_t>();
-    params.p_reduce_partial_map         = reduce_partial_map.data_ptr<int32_t>();
-    params.p_seqlens_qo_indptr          = seqlens_qo_indptr.data_ptr<int32_t>();
-    params.p_seqlens_kv_indptr          = seqlens_kv_indptr.data_ptr<int32_t>();
-    params.p_kv_last_page_lens          = kv_last_page_lens.data_ptr<int32_t>();
+    params.p_work_metadata_ptrs         = static_cast<uint64_t*>(work_metadata_ptrs.data_ptr());
+    params.p_work_indptr                = static_cast<int32_t*>(work_indptr.data_ptr());
+    params.p_work_info_set_raw          = static_cast<int32_t*>(work_info_set.data_ptr());
+    params.p_reduce_indptr              = static_cast<int32_t*>(reduce_indptr.data_ptr());
+    params.p_reduce_final_map           = static_cast<int32_t*>(reduce_final_map.data_ptr());
+    params.p_reduce_partial_map         = static_cast<int32_t*>(reduce_partial_map.data_ptr());
+    params.p_seqlens_qo_indptr          = static_cast<int32_t*>(seqlens_qo_indptr.data_ptr());
+    params.p_seqlens_kv_indptr          = static_cast<int32_t*>(seqlens_kv_indptr.data_ptr());
+    params.p_kv_last_page_lens          = static_cast<int32_t*>(kv_last_page_lens.data_ptr());
     params.num_batches                  = num_batches;
     params.num_heads                    = num_heads;
     params.num_cu                       = num_clusters;

@@ -62,9 +62,14 @@ FAMILIES = [
     ),
     ("AITER_CONFIG_A8W8_BATCHED_GEMM", "a8w8_tuned_batched_gemm"),
     ("AITER_CONFIG_BF16_BATCHED_GEMM", "bf16_tuned_batched_gemm"),
+    (
+        "AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE",
+        "batched_gemm_a8w8_blockscale_mxscale_tuned",
+    ),
     ("AITER_CONFIG_GEMM_BF16", "bf16_tuned_gemm"),
     ("AITER_CONFIG_FMOE", "tuned_fmoe"),
     ("AITER_CONFIG_GROUPED_FMOE", "tuned_grouped_fmoe"),
+    ("AITER_CONFIG_GDN_K5_OPT", "chunk_gdn_h_opt_tuned"),
 ]
 
 
@@ -202,6 +207,12 @@ class TestConfigShapeCollision(unittest.TestCase):
     def test_bf16_batched(self):
         self._check_family("AITER_CONFIG_BF16_BATCHED_GEMM", "bf16_tuned_batched_gemm")
 
+    def test_batched_gemm_a8w8_blockscale_mxscale(self):
+        self._check_family(
+            "AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE",
+            "batched_gemm_a8w8_blockscale_mxscale_tuned",
+        )
+
     def test_bf16(self):
         self._check_family("AITER_CONFIG_GEMM_BF16", "bf16_tuned_gemm")
 
@@ -210,6 +221,9 @@ class TestConfigShapeCollision(unittest.TestCase):
 
     def test_grouped_fmoe(self):
         self._check_family("AITER_CONFIG_GROUPED_FMOE", "tuned_grouped_fmoe")
+
+    def test_gdn_k5_opt(self):
+        self._check_family("AITER_CONFIG_GDN_K5_OPT", "chunk_gdn_h_opt_tuned")
 
 
 def _fix_real_tree():
