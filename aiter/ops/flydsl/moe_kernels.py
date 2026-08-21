@@ -287,8 +287,18 @@ def get_flydsl_stage1_kernels(
 def get_flydsl_stage2_kernels(
     a_dtype: str, b_dtype: str, out_dtype: str
 ) -> dict[str, dict]:
-    """Return {kernelName: params} for all supported stage2 configs."""
+    """Return legacy stage2 configs for the remaining non-layout path.
+
+    Quantized activations no longer use the ordinary ``flydsl_moe2_*`` builder.
+    Their stage2 candidates are generated exclusively by
+    :func:`get_flydsl_stage2_v2_kernels`, whose names carry the
+    ``flydsl_moe2_layout_`` marker.
+
+    The only remaining caller is the separate bf16-A a16w-mix port.
+    """
     kernels = {}
+    if a_dtype != "bf16":
+        return kernels
     is_fp4 = b_dtype == "fp4"
     is_fp8 = b_dtype == "fp8"
     tile_ns = [128, 256] if is_fp4 else [128]
@@ -630,6 +640,7 @@ def compile_flydsl_moe_stage1(
     xcd_swizzle: int = 0,
     k_wave: int = 1,
     v2_output_layout: bool = False,
+    _shared_expert_id: int | None = None,
 ):
     """Compile stage1 kernel (cached via underlying lru_cache)."""
     # a16w-mix (bf16 A x {fp4 mxfp4, int4} W): build the ported gemm1
@@ -690,6 +701,7 @@ def compile_flydsl_moe_stage1(
             xcd_swizzle=xcd_swizzle,
             k_wave=k_wave,
             v2_output_layout=v2_output_layout,
+            _shared_expert_id=_shared_expert_id,
         )
     else:
         raise ValueError(
@@ -716,6 +728,7 @@ def compile_flydsl_moe_stage2(
     use_async_copy: bool = False,
     cu_num_mul: int = 1,
     b_nt: int = 0,
+    use_nt: bool | None = None,
     model_dim_pad: int = 0,
     inter_dim_pad: int = 0,
     xcd_swizzle: int = 0,
@@ -745,36 +758,9 @@ def compile_flydsl_moe_stage2(
             use_k16="gfx95" not in str(get_rocm_arch()),
         )
     if b_dtype in ("fp4", "fp8"):
-        from .kernels.mixed_moe_gemm_2stage import compile_mixed_moe_gemm2
-
-        return compile_mixed_moe_gemm2(
-            model_dim=model_dim,
-            inter_dim=inter_dim,
-            experts=experts,
-            topk=topk,
-            tile_m=tile_m,
-            tile_n=tile_n,
-            tile_k=tile_k,
-            doweight_stage2=doweight_stage2,
-            a_dtype=a_dtype,
-            b_dtype=b_dtype,
-            out_dtype=out_dtype,
-            accumulate=accumulate,
-            persist_m=persist_m,
-            sort_block_m=sort_block_m,
-            waves_per_eu=waves_per_eu,
-            use_async_copy=use_async_copy,
-            cu_num_mul=cu_num_mul,
-            # API parity (reviewer #3): forward `b_nt` and `xcd_swizzle`
-            # from the kernel-name parser. They are accepted as ignored
-            # kwargs on the fp4xfp4 path so callers parsing the
-            # `_bnt{N}` / `_xcd{N}` registry suffixes don't need
-            # per-dtype special cases.
-            b_nt=b_nt,
-            xcd_swizzle=xcd_swizzle,
-            model_dim_pad=model_dim_pad,
-            inter_dim_pad=inter_dim_pad,
-            enable_bias=enable_bias,
+        raise ValueError(
+            "ordinary FlyDSL stage2 was removed for MXFP4/FP8 activations; "
+            "use a flydsl_moe2_layout kernel name"
         )
     else:
         raise ValueError(
@@ -1734,7 +1720,6 @@ def _flydsl_moe_stage1_impl(
         "xcd_swizzle": xcd_swizzle,
         "k_wave": k_wave,
     }
-    # The injected FHMoE compiler does not implement the v2 sorted-row layout.
     if _v2_output_layout:
         compile_kwargs["v2_output_layout"] = True
     exe = _compile_kernel(**compile_kwargs)

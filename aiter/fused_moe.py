@@ -1942,6 +1942,9 @@ def _flydsl_v2_stage2_wrapper(
     expert_mask=None,
     topk_ids=None,
     topk_weights=None,
+    shared_w2=None,
+    shared_w2_scale=None,
+    shared_expert_id=None,
     **_kwargs,
 ):
     from aiter.ops.flydsl.kernels.mxmoe_dispatcher import (
@@ -1959,6 +1962,8 @@ def _flydsl_v2_stage2_wrapper(
     bk = cfg["tile_k"]
     sbm = cfg["sort_block_m"] or (int(block_m) if block_m else bm)
     epilog = cfg["epilog"]
+    if os.environ.get("AITER_FLYDSL_FORCE_REDUCE", "0") == "1":
+        epilog = "reduce"
     max_sorted = inter_states.shape[0]
 
     token_num = out.shape[0]
@@ -2041,6 +2046,11 @@ def _flydsl_v2_stage2_wrapper(
         g2_bf16_lds=cfg["bf16_lds"],
         g2_spart=cfg["spart"],
         out_dtype="fp8" if _s2_fp8_inter else "bf16",
+        shared_w2_u8=(_mxfp4_scale_u8(shared_w2) if shared_w2 is not None else None),
+        shared_w2_scale_u8=(
+            _mxfp4_scale_u8(shared_w2_scale) if shared_w2_scale is not None else None
+        ),
+        shared_expert_id=shared_expert_id,
     )
     if epilog == "reduce":
         from aiter.ops.flydsl.moe_kernels import _run_moe_reduction
@@ -2642,6 +2652,7 @@ def get_2stage_cfgs(
     )
     if use_mxfp4_flydsl:
         from aiter.ops.flydsl.moe_kernels import (
+            build_flydslv2_gemm2_name,
             flydsl_kernel_name,
             get_flydsl_kernel_params,
             pick_flydsl_stage2_tile_k,
@@ -2661,34 +2672,41 @@ def get_2stage_cfgs(
         # w-dtype "fp4" => mxfp4 weight; "fp8" => mxfp8 weight (a8w8).
         _w_type = "fp8" if q_dtype_w == dtypes.fp8 else "fp4"
         _s2_tk = pick_flydsl_stage2_tile_k(inter_dim)
-        # Per token tier: (tile_m, stage1 suffix, stage2 suffix).
+        # Per token tier: (tile_m, stage1 suffix).
         if token < 2048:
-            _tile_m, _s1_sfx, _s2_sfx = 32, "_w2", "_bnt2"
+            _tile_m, _s1_sfx = 32, "_w2"
         elif token < 4096:
-            _tile_m, _s1_sfx, _s2_sfx = 64, "_w3_bnt0", ""
+            _tile_m, _s1_sfx = 64, "_w3_bnt0"
         elif token < 16384:
-            _tile_m, _s1_sfx, _s2_sfx = 128, "_w2_bnt0", ""
+            _tile_m, _s1_sfx = 128, "_w2_bnt0"
         else:
-            _tile_m, _s1_sfx, _s2_sfx = 64, "_w4_bnt0", ""
+            _tile_m, _s1_sfx = 64, "_w4_bnt0"
         _base_kn1 = flydsl_kernel_name(
             1, _a_type, _w_type, _out_type, _tile_m, 128, 256
         )
-        _base_kn2 = flydsl_kernel_name(
-            2, _a_type, _w_type, _out_type, _tile_m, 128, _s2_tk, "atomic"
+        kn2 = build_flydslv2_gemm2_name(
+            _a_type,
+            _w_type,
+            _out_type,
+            tm=_tile_m,
+            tn=128,
+            tk=_s2_tk,
+            epilog="atomic",
+            persist=False,
+            use_nt=token < 2048,
+            sbm=_tile_m,
         )
         kn1 = f"{_base_kn1}{_s1_sfx}"
-        kn2 = f"{_base_kn2}{_s2_sfx}"
 
-        # fp8 stage1 kernel names always carry a "_gui" suffix
-        # (moe_kernels.py:114-115). Append it before the lookup so the fp8
-        # variants resolve; fp4 names are unchanged.
+        # Append the fused quantization suffixes before the lookup so the
+        # layout-v2 stage2 receives its required sorted quantized intermediate.
         if _a_type == "fp8":
-            kn1 = f"{kn1}_gui"
+            kn1 = f"{kn1}_gui_fp8"
             _base_kn1 = f"{_base_kn1}_gui"
+        elif _a_type == "fp4":
+            kn1 = f"{kn1}_fp4"
         if get_flydsl_kernel_params(kn1) is None:
             kn1 = _base_kn1
-        if get_flydsl_kernel_params(kn2) is None:
-            kn2 = _base_kn2
 
         logger.warning(
             f"[fused_moe] no tuned FlyDSL config for {keys}, "
@@ -2704,8 +2722,11 @@ def get_2stage_cfgs(
                 model_dim_pad=hidden_pad,
             ),
             functools.partial(
-                _flydsl_stage2_wrapper,
+                _flydsl_v2_stage2_wrapper,
                 kernelName=kn2,
+                model_dim=model_dim,
+                inter_dim=inter_dim,
+                num_experts=expert,
                 inter_dim_pad=intermediate_pad,
                 model_dim_pad=hidden_pad,
             ),
@@ -2714,6 +2735,8 @@ def get_2stage_cfgs(
             False,
             has_bias=enable_bias,
             stage2_has_bias=enable_bias,
+            fuse_quant=_a_type,
+            skip_inter_quant=True,
         )
     if (
         dtype in [dtypes.bf16, dtypes.fp16]

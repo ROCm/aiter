@@ -768,17 +768,11 @@ def test_no_shared_explicit_defaults_preserve_old_api_output(
 def test_heterogeneous_moe_uses_a_separate_custom_op_schema():
     from aiter.fhmoe import fhmoe_
     from aiter.ops.flydsl.fhmoe import (
+        compile_flydsl_fhmoe_stage2,
         flydsl_fhmoe_stage1,
-        flydsl_fhmoe_stage2,
     )
-    from aiter.ops.flydsl.kernels.fhmoe import (
-        compile_mixed_fhmoe_gemm1,
-        compile_mixed_fhmoe_gemm2,
-    )
-    from aiter.ops.flydsl.kernels.mixed_moe_gemm_2stage import (
-        compile_mixed_moe_gemm1,
-        compile_mixed_moe_gemm2,
-    )
+    from aiter.ops.flydsl.kernels.fhmoe import compile_mixed_fhmoe_gemm1
+    from aiter.ops.flydsl.kernels.mixed_moe_gemm_2stage import compile_mixed_moe_gemm1
     from aiter.ops.flydsl.moe_kernels import flydsl_moe_stage1, flydsl_moe_stage2
 
     assert callable(fhmoe_)
@@ -801,7 +795,6 @@ def test_heterogeneous_moe_uses_a_separate_custom_op_schema():
         flydsl_moe_stage1,
         flydsl_moe_stage2,
         compile_mixed_moe_gemm1,
-        compile_mixed_moe_gemm2,
     )
     assert all(
         fhmoe_fields.isdisjoint(inspect.signature(api).parameters)
@@ -813,12 +806,9 @@ def test_heterogeneous_moe_uses_a_separate_custom_op_schema():
     assert {"shared_w1", "shared_w1_scale", "shared_expert_id"} <= set(
         inspect.signature(flydsl_fhmoe_stage1).parameters
     )
-    assert {"shared_w2", "shared_w2_scale", "shared_expert_id"} <= set(
-        inspect.signature(flydsl_fhmoe_stage2).parameters
-    )
     assert all(
         "shared_expert_id" in inspect.signature(api).parameters
-        for api in (compile_mixed_fhmoe_gemm1, compile_mixed_fhmoe_gemm2)
+        for api in (compile_mixed_fhmoe_gemm1, compile_flydsl_fhmoe_stage2)
     )
     assert all(
         "v2_output_layout" in inspect.signature(api).parameters
@@ -826,17 +816,16 @@ def test_heterogeneous_moe_uses_a_separate_custom_op_schema():
     )
     fhmoe_apis = (
         flydsl_fhmoe_stage1,
-        flydsl_fhmoe_stage2,
         compile_mixed_fhmoe_gemm1,
-        compile_mixed_fhmoe_gemm2,
+        compile_flydsl_fhmoe_stage2,
     )
     assert all("xcd_swizzle" in inspect.signature(api).parameters for api in fhmoe_apis)
 
 
-def test_fhmoe_runtime_compile_bridge_forwards_xcd(monkeypatch: pytest.MonkeyPatch):
+def test_fhmoe_runtime_uses_shared_stage1_compiler(monkeypatch: pytest.MonkeyPatch):
     from aiter.ops.flydsl import fhmoe
 
-    tensor = torch.empty(0)
+    tensor = torch.empty((1, 1, 1))
     compile_calls = []
 
     def invoke_compiler(**kwargs):
@@ -849,14 +838,8 @@ def test_fhmoe_runtime_compile_bridge_forwards_xcd(monkeypatch: pytest.MonkeyPat
         compile_calls.append((1, kwargs))
         return 1
 
-    def compile_stage2(**kwargs):
-        compile_calls.append((2, kwargs))
-        return 2
-
     monkeypatch.setattr(fhmoe, "_flydsl_moe_stage1_impl", invoke_compiler)
-    monkeypatch.setattr(fhmoe, "_flydsl_moe_stage2_impl", invoke_compiler)
     monkeypatch.setattr(fhmoe, "compile_flydsl_fhmoe_stage1", compile_stage1)
-    monkeypatch.setattr(fhmoe, "compile_flydsl_fhmoe_stage2", compile_stage2)
 
     assert (
         fhmoe.flydsl_fhmoe_stage1(
@@ -873,20 +856,6 @@ def test_fhmoe_runtime_compile_bridge_forwards_xcd(monkeypatch: pytest.MonkeyPat
         )
         == 1
     )
-    assert (
-        fhmoe.flydsl_fhmoe_stage2(
-            tensor,
-            tensor,
-            tensor,
-            tensor,
-            tensor,
-            shared_w2=tensor,
-            shared_w2_scale=tensor,
-            shared_expert_id=8,
-            xcd_swizzle=4,
-        )
-        == 2
-    )
     assert compile_calls == [
         (
             1,
@@ -896,13 +865,13 @@ def test_fhmoe_runtime_compile_bridge_forwards_xcd(monkeypatch: pytest.MonkeyPat
                 "v2_output_layout": True,
             },
         ),
-        (2, {"shared_expert_id": 8, "xcd_swizzle": 4}),
     ]
 
 
 def test_fhmoe_aot_jobs_preserve_xcd_swizzling():
     from aiter.aot.flydsl.moe import parse_csv
     from aiter.ops.flydsl.moe_kernels import get_flydsl_kernel_params
+    from aiter.ops.flydsl.mxfp4_kname import parse_flydsl_v2_gemm2_kernel
 
     csv_path = (
         Path(__file__).resolve().parents[1]
@@ -915,8 +884,11 @@ def test_fhmoe_aot_jobs_preserve_xcd_swizzling():
     assert any(job.get("xcd_swizzle", 0) > 0 for job in fhmoe_jobs)
     for job in fhmoe_jobs:
         params = get_flydsl_kernel_params(job["kernel_name"])
+        if params is None:
+            params = parse_flydsl_v2_gemm2_kernel(job["kernel_name"])
         assert params is not None
-        assert job.get("xcd_swizzle", 0) == params.get("xcd_swizzle", 0)
+        if "xcd_swizzle" in params:
+            assert job.get("xcd_swizzle", 0) == params.get("xcd_swizzle", 0)
 
 
 def test_fhmoe_aot_stage1_forwards_optional_swiglu_abi(

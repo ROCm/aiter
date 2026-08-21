@@ -86,10 +86,12 @@ def extend_fhmoe_jobs(
 ) -> list[dict[str, Any]]:
     """Append FHMoE variants for eligible ordinary jobs in ``csv_path``."""
     eligible_keys: set[tuple[Any, ...]] = set()
+    eligible_rows = []
     with open(csv_path, newline="") as f:
         for row in csv.DictReader(f):
             if _is_dsv4_fhmoe_row(row):
                 eligible_keys.update(_row_job_keys(row))
+                eligible_rows.append(row)
 
     fhmoe_jobs = []
     for job in ordinary_jobs:
@@ -108,6 +110,48 @@ def extend_fhmoe_jobs(
             continue
         seen.add(key)
         fhmoe_jobs.append(fhmoe_job)
+
+    # Layout-v2 stage2 rows are compiled by mxfp4_moe.py for ordinary MoE, so
+    # they are intentionally absent from `ordinary_jobs`. FHMoE needs an AOT
+    # job for the same row because its shared-expert operands are part of the
+    # v2 launcher ABI.
+    from aiter.ops.flydsl.mxfp4_kname import parse_flydsl_v2_gemm2_kernel
+
+    stage1_by_shape = {
+        _job_key(job)[:9]: job for job in fhmoe_jobs if job.get("stage") == 1
+    }
+    for row in eligible_rows:
+        stage2_name = row.get("kernelName2", "").strip()
+        stage2_params = parse_flydsl_v2_gemm2_kernel(stage2_name)
+        if stage2_params is None:
+            continue
+        base = next(
+            (
+                stage1_by_shape.get(key[:9])
+                for key in _row_job_keys(row)
+                if key[9] == stage2_name
+            ),
+            None,
+        )
+        if base is None:
+            continue
+        fhmoe_job = {
+            **base,
+            **{
+                key: value
+                for key, value in stage2_params.items()
+                if key not in ("epilog", "bf16_lds", "spart")
+            },
+            "stage": 2,
+            "kernel_name": stage2_name,
+            "stage1_fuse_quant": stage2_params["a_dtype"],
+            "mode": stage2_params["epilog"],
+            "v2": True,
+        }
+        key = job_identity(fhmoe_job)
+        if key not in seen:
+            seen.add(key)
+            fhmoe_jobs.append(fhmoe_job)
 
     return [*ordinary_jobs, *fhmoe_jobs]
 
@@ -199,29 +243,21 @@ class _FHMoEAOTBackend:
         bias=None,
         stream=None,
     ):
-        from aiter.ops.flydsl.fhmoe import _s2_args_fhmoe
-
-        shared_w = _shared_weight(dev, n_in, k_in)
-        shared_w_scale = _shared_scale(dev, n_in, k_in)
-        return _s2_args_fhmoe(
-            target,
-            a,
-            w,
-            a_scale,
-            w_scale,
-            sorted_ids,
-            sorted_expert_ids,
-            sorted_weights,
-            num_valid_ids,
+        # The v2 launcher ABI declares all buffer arguments as Int64. AOT
+        # compilation never launches or dereferences these buffers, so integer
+        # address placeholders are required here; ptr_arg() creates Pointer
+        # values, which fail in v2's global_typed_ptr() during MLIR emission.
+        return (0,) * 10 + (
             token_num,
-            n_in,
-            k_in,
             blocks,
-            dev,
-            bias=bias,
-            stream=stream,
-            shared_w=shared_w,
-            shared_w_scale=shared_w_scale,
+            blocks,
+            k_in,
+            n_in,
+            0,
+            0,
+            0,
+            0,
+            stream,
         )
 
     def compile_stage1(self, **kwargs):
