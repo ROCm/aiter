@@ -1022,10 +1022,28 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
         }
     };
 
+    auto softmax_tile = [&](auto& vs) {
+        row_max      = temperature_scale * attn_row_max<T>(vs, s_m, warp_id, lane_id);
+        below_thresh = ((row_max - m_row) <= RESCALE_THRESHOLD);
+        all_below    = (__builtin_amdgcn_ballot_w64(below_thresh) == __builtin_amdgcn_read_exec());
+        row_max      = all_below ? m_row : max(m_row, row_max);
+        attn_scale_sub_row<T>(vs, temperature_scale, row_max);
+        if(!all_below)
+        {
+            rescale_m = __builtin_amdgcn_exp2f(m_row - row_max);
+            l_row *= rescale_m;
+            m_row = row_max;
+            scale_output_tile<T>(v_o, rescale_m);
+        }
+        attn_exp2_slice<T, 0, s_len>(vs);
+        asm volatile("" : "+v"(vs)::);
+        l_row += attn_row_sum<T>(vs, s_l, warp_id, lane_id);
+    };
+
     auto stage_end = [&]() {
         __builtin_amdgcn_sched_barrier(0);
-        // __builtin_amdgcn_s_barrier();
-        // __builtin_amdgcn_sched_barrier(0);
+        __builtin_amdgcn_s_barrier();
+        __builtin_amdgcn_sched_barrier(0);
     };
 
     auto stage_end_barrier = [&]() {
@@ -1072,7 +1090,11 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
     int nxt_page      = cur_page;
 
     set_slice(v_k, load<T::VEC_KV>(s_kv[0], u_rk), 0_I, number<qk_rope_end>{});
+    v_v[0] = tr_load<T::VEC_TR_V>(s_kv[0], u_rv);
     s_waitcnt_lgkmcnt(0_I);
+
+    async_load_kv(s_kv[0].ptr, cur_page);
+    s_waitcnt_vmcnt(number<T::kv_buffer_load_insts>{});
     stage_end();
 
     // Scores, mask, row max: the head of tile_begin's softmax, which no phase runs since a
@@ -1082,22 +1104,15 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
     v_s[0] = mma0(v_q, v_k, 0, 0);
     clear(v_o);
     mask_oob_scores(v_s[0], tile_begin);
-    m_row = max(m_row, temperature_scale * attn_row_max<T>(v_s[0], s_m, warp_id, lane_id));
     asm volatile("" : "+v"(v_s[0])::);
     stage_end();
-
-    v_v[0] = tr_load<T::VEC_TR_V>(s_kv[0], u_rv);
-    s_waitcnt_lgkmcnt(0_I);
-
-    async_load_kv(s_kv[0].ptr, cur_page);
-    s_waitcnt_vmcnt(number<T::kv_buffer_load_insts>{});
-    stage_end_barrier();
 
     auto run_phase = [&](auto& vs_cur, auto& vs_prev, int cur_slot, int prev_slot, int t) {
         // stage0 [mem]: load k.
         set_slice(v_k, load<T::VEC_KV>(s_kv[cur_slot], u_rk), 0_I, number<qk_rope_end>{});
+        v_v[cur_slot] = tr_load<T::VEC_TR_V>(s_kv[cur_slot], u_rv);
         nxt_page = load_kv_page(t + 2);
-        s_waitcnt_lgkmcnt(0_I);
+        s_waitcnt_lgkmcnt(number<T::v_ds_read_insts>{});
         stage_end();
 
         // stage1 [compute]: gemm0 QK(t) [12 MFMA] || softmax-tail(t-1), the whole exp side of
@@ -1106,30 +1121,24 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
         // worth filling. m_row already covers tile t-1: its head ran in the last stage3.
         __builtin_amdgcn_s_setprio(1);
         vs_cur = mma0(v_q, v_k, 0, 0);
-        attn_scale_sub_row<T>(vs_prev, temperature_scale, m_row);
-        attn_exp2_slice<T, 0, s_len>(vs_prev);
-        // Ask the scheduler to spread tile t-1's softmax tail (4 EXP + the scale-sub VALU,
-        // all independent of the QK MFMA writing vs_cur) into the GEMM0 MFMA shadows. The
-        // MFMA accumulate into one score buffer and stall on nothing, so program order is
-        // kept unless asked. Emitted BEFORE attn_row_sum: that reduction ends the MFMA's
-        // scheduling region with its cross-wave s_barrier, so a hint after it would land in
-        // the post-barrier merge and be dropped.
-        sched_pv<T::GEMM0_E_M * T::GEMM0_E_N * T::GEMM0_E_K, 1, 2, 1>();
-        l_row += attn_row_sum<T>(vs_prev, s_l, warp_id, lane_id);
-        stage_end();
-
-        // stage2 [mem]: P(t-1) and V(t-1); mask S(t) before stage4's softmax head folds it in.
-        store<T::VEC_WRITE_P>(s_p, cast<D_K>(vs_prev), u_sp);
+        if constexpr(!STAGGER)
+        {
+            stage_end();
+        }
+        softmax_tile(vs_prev);
+        auto p_prev = cast<D_K>(vs_prev);
+        store<T::VEC_WRITE_P>(s_p, p_prev, u_sp);
         s_waitcnt_lgkmcnt(0_I);
         stage_end_barrier();
 
-        // stage2 [mem]: P(t-1) and V(t-1); mask S(t) before stage3's softmax head folds it in.
+        // stage2 [mem]: V(t-1); mask S(t) before stage4's softmax head folds it in.
+        if constexpr(STAGGER)
+        {
+            stage_end();
+        }
         load_p(v_p);
-        v_v[cur_slot] = tr_load<T::VEC_TR_V>(s_kv[cur_slot], u_rv);
-        mask_oob_scores(vs_cur, t);
-        s_waitcnt_lgkmcnt(0_I);
-
         async_load_kv(s_kv[cur_slot].ptr, nxt_page);
+        s_waitcnt_lgkmcnt(0_I);
         s_waitcnt_vmcnt(number<T::kv_buffer_load_insts>{});
         stage_end_barrier();
 
@@ -1140,29 +1149,8 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
         // Leaving PV bare would waste 4 MFMA outright.
         __builtin_amdgcn_s_setprio(1);
         v_o = mma1(v_p, v_v[prev_slot], v_o, 0, 0);
-
-        // Spread tile t's softmax head (the row-max reduction over vs_cur, which the PV
-        // accumulator chain never touches) into the GEMM1 MFMA shadows. A preference is
-        // safe in this region only because V was transpose-read a whole stage earlier
-        // (stage2): the region holds no tr_load whose inline-asm ds_read the scheduler
-        // cannot see. Emitted before attn_row_max for the same barrier reason as stage1.
-        sched_pv<T::GEMM1_E_M * T::GEMM1_E_N * T::GEMM1_E_K, 0, 2, 2>();
-        row_max      = temperature_scale * attn_row_max<T>(vs_cur, s_m, warp_id, lane_id);
-        below_thresh = ((row_max - m_row) <= RESCALE_THRESHOLD);
-        all_below    = (__builtin_amdgcn_ballot_w64(below_thresh) == __builtin_amdgcn_read_exec());
-        row_max      = all_below ? m_row : max(m_row, row_max);
-        asm volatile("" : "+v"(vs_cur)::);
-        __builtin_amdgcn_sched_barrier(0);
-
-        if(!all_below)
-        {
-            rescale_m = __builtin_amdgcn_exp2f(m_row - row_max);
-            l_row *= rescale_m;
-            m_row = row_max;
-            scale_output_tile<T>(v_o, rescale_m);
-        }
+        mask_oob_scores(vs_cur, t);
         __builtin_amdgcn_s_setprio(0);
-
         stage_end();
         // nxt_page was the tile just issued into cur_slot; unused after that -- next phase
         // recomputes its own from t+2.
@@ -1203,16 +1191,16 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
     // Only this part is under the parity branch; keeping the V read and the PV outside it
     // is what keeps v_o off scratch.
     auto epilogue_tail = [&](auto& vs_last, int last_slot) {
-        attn_scale_sub_row<T>(vs_last, temperature_scale, m_row);
-        attn_exp2_slice<T, 0, s_len>(vs_last);
-        l_row += attn_row_sum<T>(vs_last, s_l, warp_id, lane_id);
+        if constexpr(!STAGGER)
+        {
+            stage_end();
+        }
+        softmax_tile(vs_last);
         store<T::VEC_WRITE_P>(s_p, cast<D_K>(vs_last), u_sp);
         s_waitcnt_lgkmcnt(0_I);
         stage_end_barrier();
-
         load_p(v_p);
         s_waitcnt_lgkmcnt(0_I);
-        stage_end();
 
         v_o = mma1(v_p, v_v[last_slot], v_o, 0, 0);
         __builtin_amdgcn_sched_barrier(0);
@@ -1396,7 +1384,13 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE,
         // cross-wave (attn_row_max / attn_row_sum swap through s_m / s_l), so all NUM_WARPS
         // waves have to sit on the same tile. Skewing two wave groups by a stage would pair
         // their barriers across different tiles and merge unrelated rows.
-        mla_decode_fwd_one_req<Traits, false>(kargs, w, smem_buffer, temperature_scale);
+        // mla_decode_fwd_one_req<Traits, false>(kargs, w, smem_buffer, temperature_scale);
+
+        if(warp_id / 4)
+            mla_decode_fwd_one_req<Traits, true>(kargs, w, smem_buffer, temperature_scale);
+        __builtin_amdgcn_sched_barrier(0);
+        if(!(warp_id / 4))
+            mla_decode_fwd_one_req<Traits, false>(kargs, w, smem_buffer, temperature_scale);
     }
 }
 
