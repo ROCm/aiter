@@ -307,21 +307,17 @@ def _gfx1250_select_candidates(
     *,
     include_fused=True,
 ):
-    """gfx1250 candidate kid set for shape (M,N,K): top-N tiles x {plain + cluster
-    dims}.
+    """gfx1250 candidate kid set for shape (M,N,K): top-N tiles x {plain + top-N
+    square cluster dims}.
 
     1. Tile (top-8): score each plain tile by its best grid-occupancy fit over
        splitK in [1, min(16, k_steps)] (occ cost + tiny splitK bias). Smallest
        score wins; take top GFX1250_TOP_TILES.
     2. For each selected tile, always include its plain (P=3) kid.
-    3. Cluster: any (cwm, cwn) in [1, GFX1250_MAX_CLUSTER_SIDE]^2 except (1,1) can
-       run this shape -- the clusterlaunch pipeline rounds the grid up to whole
-       clusters and the tile-less workgroups leave at their cluster barrier, so
-       cluster-fill divisibility is no longer a constraint. What the round-up costs
-       is workgroups, so the sweep is bounded by _gfx1250_cluster_dims_for_grid:
-       drop a cluster side wider than the grid it rides on, drop anything past the
-       GFX1250_MAX_CLUSTER_WASTE tile-less budget, then rank by (waste bucket,
-       widest multicast group, grid-aspect match) and keep top_clusters.
+    3. Cluster (top-3): among cluster dims that satisfy cluster-fill for this
+       shape (ceil(M/B_M)%cwm==0 && ceil(N/B_N)%cwn==0), rank by
+       (|cwm*cwn - nearest(8,16)|, |cwm-cwn|) -- prefer products near 8/16 and
+       SQUARE clusters -- take top GFX1250_TOP_CLUSTERS clusterlaunch kids.
     """
 
     def _tile_score(bm, bn, bk):
@@ -334,6 +330,10 @@ def _gfx1250_select_candidates(
             best = c if best is None else min(best, c)
         return best if best is not None else float("inf")
 
+    # A winner tuned at M is reused down to M // 2, so an M-cluster must stay
+    # full across that whole runtime reuse bucket.
+    prev_m = max(1, M // 2)
+
     tiles = sorted(GFX1250_PLAIN_KID_OF.keys(), key=lambda t: _tile_score(*t))
     sel = set()
     for t in tiles[:top_tiles]:
@@ -341,10 +341,11 @@ def _gfx1250_select_candidates(
         bm, bn, _bk = t
         gx = _ceil_div(M, bm)
         gy = _ceil_div(N, bn)
-        # The kid table also carries cwn==5 dims (TDM multicast fans out to 5 WGs);
-        # they are left out of the sweep by the [1, MAX_CLUSTER_SIDE]^2 bound.
-        avail = {
-            (cwm, cwn): kid
+        # Keep the branch's conservative admission policy: 2D clusters are
+        # excluded because they can hang on gfx1250, and M-direction clusters
+        # must stay fully occupied throughout the runtime reuse bucket.
+        feas = [
+            (cwm, cwn, kid)
             for (tbm, tbn, tbk, cwm, cwn), kid in GFX1250_CLUSTERLAUNCH_KID_OF.items()
             if (tbm, tbn, tbk) == t
             and gx % cwm == 0

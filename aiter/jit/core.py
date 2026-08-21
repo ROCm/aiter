@@ -237,6 +237,14 @@ class AITER_CONFIG:
         )
 
     @property
+    def AITER_CONFIG_GDN_K5_OPT_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_GDN_K5_OPT",
+            AITER_CONFIG_GDN_K5_OPT,
+            "chunk_gdn_h_opt_tuned",
+        )
+
+    @property
     def AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE_FILE(self):
         return self.get_config_file(
             "AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE",
