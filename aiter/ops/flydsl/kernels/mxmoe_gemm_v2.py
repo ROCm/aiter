@@ -4,7 +4,7 @@
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir.dialects import arith as _arith_d
+from flydsl.expr import arith as _arith
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import (
     BFloat16,
@@ -543,7 +543,8 @@ def gemm2_body_v2(
 
     def mfma_cluster(bqf, bsf, sa, kt_rt, interleave=None):
         # opsel (no gate/up split): mni=J//2, in_b=J%2; sa is a per-32-row-chunk list.
-        _thunks = list(interleave) if interleave else []
+        # interleave: one epilogue thunk per accN slot (len == numAccN); thunk J-1
+        # is emitted right after MFMA J so its ds_writes overlap the next MFMA.
         sa = [
             shift_scale_word(sa[sub], kt_rt) for sub in range_constexpr(kScaleSubBlocks)
         ]
@@ -568,25 +569,24 @@ def gemm2_body_v2(
                     single_rg=True,
                     k_halves=kHalves,
                 )
-                continue
-            for sub in range_constexpr(kScaleSubBlocks):
-                mma_one_j(
-                    J,
-                    in_b,
-                    sa[sub],
-                    sb,
-                    bqf,
-                    a_frags,
-                    c_frags,
-                    mma_atoms,
-                    i0=2 * sub,
-                    k_halves=kHalves,
-                )
-            _t = J - 1
-            if const_expr(0 <= _t < len(_thunks)):
-                _thunks[_t]()
-        for _t in range_constexpr(max(0, numAccN - 1), len(_thunks)):
-            _thunks[_t]()
+            else:
+                for sub in range_constexpr(kScaleSubBlocks):
+                    mma_one_j(
+                        J,
+                        in_b,
+                        sa[sub],
+                        sb,
+                        bqf,
+                        a_frags,
+                        c_frags,
+                        mma_atoms,
+                        i0=2 * sub,
+                        k_halves=kHalves,
+                    )
+            if const_expr(interleave is not None and J > 0):
+                interleave[J - 1]()
+        if const_expr(interleave is not None):
+            interleave[numAccN - 1]()
 
     # C accumulator: register fragments, zeroed then accumulated in place; (un)packed to K-loop carry.
     zero4 = Vec.filled(4, 0.0, Float32)
@@ -639,10 +639,13 @@ def gemm2_body_v2(
             **kw,
         )
 
+    # Interleave: hand the epilogue's acc->LDS writes to mfma_cluster as one
+    # thunk per accN slot, so the last K-tile's MFMAs cover their ds_write
+    # latency instead of stalling on it after the K loop.
     g2_interleave = const_expr(g2_kstatic and g2_bf16_lds)
-    _epi_thunks = [] if const_expr(g2_interleave) else None
+    epi_thunks = [] if const_expr(g2_interleave) else None
     if const_expr(g2_interleave):
-        _epilog(c_frags, epi_thunks=_epi_thunks, c_frags_lazy=c_frags, phase="write")
+        _epilog(c_frags, emit_thunks=epi_thunks)
 
     if const_expr(g2_kstatic):
         KT = K_TILES_MAX
@@ -680,6 +683,8 @@ def gemm2_body_v2(
         _ks_issue_scales(0)
         rocdl.sched_barrier(0)
 
+        # g2_apre preloaded all KT tiles into the aStages slots -> no in-loop
+        # barrier/prefetch at all; otherwise only kStages are resident up front.
         a_all_resident = const_expr((aStages if g2_apre else kStages) >= KT)
         if const_expr(a_all_resident):
             gpu.barrier()
@@ -708,7 +713,7 @@ def gemm2_body_v2(
                 sa = load_a_scale_tile(kt_rt)
             if const_expr(not g2_bhoist) and const_expr(kt + 1 < KT):
                 _ks_prefetch(kt + 1)
-            _il = _epi_thunks if const_expr(kt == KT - 1) else None
+            _il = epi_thunks if const_expr(kt == KT - 1) else None
             if const_expr(g2_interleave and kt == KT - 1):
                 rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0)
                 gpu.barrier()
@@ -831,11 +836,12 @@ def gemm2_body_v2(
 
     if const_expr(g2_interleave):
         rocdl.s_waitcnt(lgkmcnt=0)
-        gpu.barrier()
-    accm_vecs = [
-        [c_frags[i][J].load() for J in range(numAccN)] for i in range(kMChunks)
-    ]
-    _epilog(accm_vecs, phase=("read" if g2_interleave else "all"))
+        gpu.barrier()  # thunked ds_writes visible to every lane
+        _epilog(None, lds_ready=True)
+    else:
+        _epilog(
+            [[c_frags[i][J].load() for J in range(numAccN)] for i in range(kMChunks)]
+        )
 
 
 # ---- Atomic bf16 epilogue (shared store path; gemm2 down-proj) ----
@@ -863,10 +869,16 @@ def atomic_bf16_epilog(
     g2_out_pitch_align=0,
     g2_scale_blk=8,
     g2_epi_lanes=None,
-    epi_thunks=None,
-    c_frags_lazy=None,
-    phase="all",
+    emit_thunks=None,
+    lds_ready=False,
 ):
+    """Stage2 epilogue: acc -> LDS -> weighted global store.
+
+    emit_thunks: a list to fill with one acc->LDS-write thunk per accN slot
+    (``accm`` must then be the C *fragments*); the function returns right after,
+    leaving the caller to emit the thunks and the read-back separately.
+    lds_ready: LDS already holds the tile (thunks ran), so skip the write half.
+    """
     if SBM is None:
         SBM = BM
     EPI_LANES = _G2_EPI_LANES if g2_epi_lanes is None else int(g2_epi_lanes)
@@ -874,13 +886,18 @@ def atomic_bf16_epilog(
     M_REPS = BM // EPI_ROWS
     ROUTE_VEC = BN // EPI_LANES
     if const_expr(use_reduce and route_out_fp8):
-        assert EPI_ROWS >= 1 and BM % EPI_ROWS == 0, (EPI_LANES, EPI_ROWS, BM)
+        # M_REPS rows per lane-group, ROUTE_VEC fp8 per lane packed 4-per-dword,
+        # and one e8m0 scale per 1/2/4 lane-groups (see _pick_epi_lanes).
+        assert BM % EPI_ROWS == 0, (EPI_LANES, EPI_ROWS, BM)
+        assert ROUTE_VEC % 4 == 0, (EPI_LANES, BN, ROUTE_VEC)
         assert g2_scale_blk in (ROUTE_VEC, 2 * ROUTE_VEC, 4 * ROUTE_VEC), (
             EPI_LANES,
             ROUTE_VEC,
             g2_scale_blk,
         )
-    USE_PK8 = const_expr(bool(g2_bf16_lds) and bool(route_out_fp8))
+    # bf16 LDS + fp8 route-out: the epilogue can read the tile as raw bf16 bit
+    # patterns and do both the amax and the fp8 cvt without materialising f32.
+    bf16_src = const_expr(bool(g2_bf16_lds) and bool(route_out_fp8))
     numAccN = (BN // 4) // 16  # 16-column MFMA subblocks per wave
     lane_div_16 = lane // 16
     lane_mod_16 = lane % 16
@@ -906,6 +923,11 @@ def atomic_bf16_epilog(
             return fx.rocdl.make_buffer_tensor(view, num_records_bytes=nrec)
         return fx.rocdl.make_buffer_tensor(view, max_size=True)
 
+    # reduce path: size out's V# to the real M*topk rows so the padding rows
+    # (moe_sort_quant.fill_padding_gaps writes token_id == M there, so their
+    # first byte lands at or past num_records) are dropped by the buffer HW
+    # instead of by a per-row s_cbranch_execz. Only valid because that sentinel
+    # is exactly M; the atomic path has no such bound and stays gated below.
     _out_nrec = None
     if const_expr(use_reduce):
         if const_expr(route_out_fp8):
@@ -939,6 +961,7 @@ def atomic_bf16_epilog(
     defer_w = bool(g2_defer_weight)
 
     # Prefetch sorted_token_ids / sorted_weights (invariant); latency overlaps stores+barriers.
+    # Also issued in the thunk-build call, before the K loop, to warm these lines early.
     packed = []
     weight = []
     for mr in range_constexpr(M_REPS):
@@ -947,8 +970,8 @@ def atomic_bf16_epilog(
         if const_expr(not defer_w):
             weight.append(load_scalar(load_f32, sweights, sorted_pos, Float32))
 
-    if const_expr(phase != "read"):
-        if const_expr(epi_thunks is None):
+    if const_expr(not lds_ready):
+        if const_expr(emit_thunks is None):
             gpu.barrier()
         if const_expr(g2_bf16_lds):
 
@@ -966,9 +989,11 @@ def atomic_bf16_epilog(
                     if const_expr(only_j is not None and J != only_j):
                         continue
                     col = wave * wave_n + J * 16 + lane_mod_16
+                    # In thunk mode accm is the C fragments: load at emit time so
+                    # the acc registers stay live in the MFMA cluster, not before it.
                     vec = (
-                        Vec(c_frags_lazy[i][J].load())
-                        if const_expr(c_frags_lazy is not None)
+                        Vec(accm[i][J].load())
+                        if const_expr(emit_thunks is not None)
                         else Vec(accm[i][J])
                     )
 
@@ -983,9 +1008,9 @@ def atomic_bf16_epilog(
                         for h in range_constexpr(2):
                             lds_base_bf16[(row_base + v0 + h) * BN + col] = pk[h]
 
-            if const_expr(epi_thunks is not None):
+            if const_expr(emit_thunks is not None):
                 for J in range_constexpr(numAccN):
-                    epi_thunks.append(
+                    emit_thunks.append(
                         lambda J=J: [_write_i(i, J) for i in range_constexpr(BM // 16)]
                     )
             else:
@@ -1000,17 +1025,17 @@ def atomic_bf16_epilog(
                     for v in range_constexpr(4):
                         idx = (row_base + v) * BN + col
                         lds_base_fptr[idx] = fx.Float32(vec[v])
-    if const_expr(phase == "all"):
+        if const_expr(emit_thunks is not None):
+            return  # caller emits the thunks, then barriers before reading back
         gpu.barrier()
-    if const_expr(phase == "write"):
-        return
 
     # read back + weighted store (atomic: fadd out[token_id]; reduce: store out[token_id*topk+slot]);
     # token_id<i32_M gates padding at runtime. At small/mid M the block-sparse sort floor is
     # ~97% padding rows (M64: 12288 pad vs 384 real); ungated, every padding row (token_id==M) issues
     # a weighted atomic-fadd into an OOB out-row -> 77x wasted atomics + L2 RMW serialization
-    # (rocprof M64: TCC_ATOMIC 7.3M->95K, 932us->107us). Always gate; reduce already gated via
-    # use_reduce. (fp4-atomic families are gated too -> strictly correct OOB-skip, kernel IR changes.)
+    # (rocprof M64: TCC_ATOMIC 7.3M->95K, 932us->107us). reduce is instead bounded by the
+    # V# above, which drops the same rows without the branch.
+    # (fp4-atomic families are gated too -> strictly correct OOB-skip, kernel IR changes.)
 
     def store_one_mr(mr):
         row_in_block = fx.Int32(mr * EPI_ROWS) + m_lane
@@ -1040,35 +1065,37 @@ def atomic_bf16_epilog(
 
                 def store_route_group(col_lane8, rg=rg):
                     col_g0 = n_block_idx * BN + col_lane8
-                    vals = []
                     bvals = []
+                    vals = []
                     for q in range_constexpr(route_vec):
                         idx_q = row_in_block * BN + col_lane8 + fx.Int32(q)
-                        if const_expr(g2_bf16_lds):
-                            _b = lds_base_bf16[idx_q]
-                            bvals.append(_b)
-                            vals.append(fx.Float32(_b))
+                        if const_expr(bf16_src):
+                            bvals.append(lds_base_bf16[idx_q])
+                        elif const_expr(g2_bf16_lds):
+                            vals.append(fx.Float32(lds_base_bf16[idx_q]))
                         elif const_expr(defer_w):
                             vals.append(fx.Float32(lds_base_fptr[idx_q]))
                         else:
                             vals.append(fx.Float32(lds_base_fptr[idx_q]) * weight[mr])
-                    if const_expr(USE_PK8):
-                        _msk = Vec.filled([2], 0x7FFF, Int16)
-                        _acc = None
-                        for _k in range_constexpr(route_vec // 2):
-                            _p = (
+                    if const_expr(bf16_src):
+                        # |x| of a bf16 is its bit pattern with the sign cleared, and
+                        # for non-negative IEEE floats the bit pattern orders like the
+                        # magnitude -- so an unsigned 16-bit max IS an fp max. Two bf16
+                        # live in one dword, so route_vec/2 v_pk_max_u16 replace
+                        # route_vec (v_and + v_max_f32) pairs; the 2 surviving lanes are
+                        # reduced scalar and <<16 rebuilds an f32 from the bf16.
+                        msk = Vec.filled([2], 0x7FFF, Int16)
+                        acc = None
+                        for h in range_constexpr(route_vec // 2):
+                            p = (
                                 Vec.from_elements(
-                                    [bvals[2 * _k], bvals[2 * _k + 1]], BFloat16
+                                    [bvals[2 * h], bvals[2 * h + 1]], BFloat16
                                 ).bitcast(Int16)
-                                & _msk
+                                & msk
                             )
-                            _acc = (
-                                _p
-                                if _k == 0
-                                else Vec(_arith_d.MaxUIOp(_raw(_acc), _raw(_p)).result)
-                            )
-                        _a0, _a1 = fx.Int32(_acc[0]), fx.Int32(_acc[1])
-                        amax_bits = (_a0 > _a1).select(_a0, _a1) << fx.Int32(16)
+                            acc = p if h == 0 else Vec(_arith.maxui(_raw(acc), _raw(p)))
+                        a0, a1 = fx.Int32(acc[0]), fx.Int32(acc[1])
+                        amax_bits = (a0 > a1).select(a0, a1) << fx.Int32(16)
                     else:
                         local_max = fabs_f32(vals[0])
                         for q in range_constexpr(1, route_vec):
@@ -1091,12 +1118,13 @@ def atomic_bf16_epilog(
                     def pk_seed():
                         return _raw(Vec.filled([2], 0, fx.Int16))
 
+                    # One dword (4 fp8) per cvt pair; route_vec is a multiple of 4.
                     words = []
                     for d in range_constexpr(route_vec // 4):
                         w = pk_seed()
                         for h in range_constexpr(2):
                             e = 4 * d + 2 * h
-                            if const_expr(USE_PK8):
+                            if const_expr(bf16_src):
                                 src2 = Vec.from_elements(
                                     [bvals[e], bvals[e + 1]], BFloat16
                                 )
@@ -1105,12 +1133,7 @@ def atomic_bf16_epilog(
                                 )
                             else:
                                 w = rocdl.cvt_scalef32_pk_fp8_f32(
-                                    pk_ty,
-                                    w,
-                                    _raw(vals[e]),
-                                    _raw(vals[e + 1]),
-                                    bs_raw,
-                                    h,
+                                    pk_ty, w, _raw(vals[e]), _raw(vals[e + 1]), bs_raw, h
                                 )
                         words.append(w)
                     emit_stores(col_g0, words, e8m0)
