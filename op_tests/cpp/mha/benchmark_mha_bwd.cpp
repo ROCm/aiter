@@ -335,7 +335,7 @@ bool run(const ck_tile::ArgParser& arg_parser)
                                  sizeof(VGradDataType) * real_seqlen_k * hdim_v +
                                  sizeof(LSEDataType) * real_seqlen_q);
         }
-        // a masked run only computes roughly half the tiles
+        // For TFLOPS reporting, treat any masked run as ~0.5x the dense FLOP count (convention).
         if(mask.type != mask_enum::no_mask)
         {
             flop /= 2;

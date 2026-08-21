@@ -937,7 +937,7 @@ bool run_bench(const ArgParser& arg)
                      sizeof(DK) * sk * hdim_q + sizeof(DV) * sk * hdim_v +
                      sizeof(LSE) * sq);
     }
-    // a masked run only computes roughly half the tiles
+    // For TFLOPS reporting, treat any masked run as ~0.5x the dense FLOP count (convention).
     if(mask.type != mask_enum::no_mask)
     {
         flop /= 2;
