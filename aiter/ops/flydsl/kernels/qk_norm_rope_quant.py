@@ -904,17 +904,23 @@ def _build_kernel_w32(
                 return fx.memref_load_vec(r)
 
         else:
+            half_lay = fx.make_layout(VEC // 2, 1)
+            half_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), 16)
 
             def _load_weight_tensor(weight_tensor, tid_val):
-                """Load VEC bf16 from a 1D weight fx.Tensor via raw buffer_load.
-                Splits into dwordx4 chunks for VEC=16."""
-                wrsrc = buffer_ops.create_buffer_resource(weight_tensor, max_size=True)
-                tid_x_vec = tid_val * VEC
-                off_dw = tid_x_vec >> 1
-                f32_list = _load_bf16_raw(wrsrc, off_dw)
-                f32_vec = fx.Vector.from_elements(f32_list, dtype=fx.Float32)
+                wbuf = fx.rocdl.make_buffer_tensor(weight_tensor)
+                wdiv = fx.logical_divide(wbuf, half_lay)
+                r0 = fx.make_rmem_tensor(half_lay, elem_dtype)
+                r1 = fx.make_rmem_tensor(half_lay, elem_dtype)
+                fx.copy_atom_call(half_atom, fx.slice(wdiv, (None, tid_val * 2)), r0)
+                fx.copy_atom_call(
+                    half_atom, fx.slice(wdiv, (None, tid_val * 2 + 1)), r1
+                )
+                v0 = fx.memref_load_vec(r0).to(fx.Float32)
+                v1 = fx.memref_load_vec(r1).to(fx.Float32)
+                combined = v0.shuffle(v1, list(range(VEC)))
                 rmem = fx.make_rmem_tensor(full_lay, fx.Float32)
-                fx.memref_store_vec(f32_vec, rmem)
+                fx.memref_store_vec(combined, rmem)
                 return fx.memref_load_vec(rmem)
 
         def _load_bf16_raw(rsrc, off_dw):
@@ -1811,23 +1817,20 @@ def _build_kernel_w32_tdm(
         pos_rsrc = _ptr_res(positions)
 
         def _concat(chunks):
-            """Fold 8-lane chunks into one VEC-lane vector. range_constexpr, not
-            range: a bare `for` over range() in a kernel body becomes a runtime
-            scf.for, which cannot index the compile-time `chunks` list."""
             v = chunks[0]
             for c in range_constexpr(len(chunks) - 1):
                 v = v.shuffle(chunks[c + 1], list(range(8 * (c + 2))))
             return v.to(fx.Float32)
 
-        def load_vec_global(rsrc, base_elem):
-            """`VEC` bf16 from a buffer resource -> Vector[VEC] f32. A 256-bit
-            (v16bf16) load isn't selectable, so read 128-bit (8-lane) chunks."""
+        def _load_tensor_vec(tensor, tid_val):
+            """Load VEC bf16 from a 1D fx.Tensor via buffer_load chunks."""
+            rsrc = buffer_ops.create_buffer_resource(tensor, max_size=True)
             return _concat(
                 [
                     fx.Vector(
                         buffer_ops.buffer_load(
                             rsrc,
-                            base_elem + (c * 8),
+                            tid_val * VEC + (c * 8),
                             vec_width=8,
                             dtype=T.bf16,
                         )
@@ -1882,14 +1885,7 @@ def _build_kernel_w32_tdm(
             wave_lds_off = wave * (D * eb)  # this wave's slot in a tile buffer
             row_elem = tid * VEC  # LDS read pos within that slot
 
-            qw = (
-                load_vec_global(
-                    buffer_ops.create_buffer_resource(q_weight, max_size=True),
-                    tid * VEC,
-                )
-                if const_expr(q_weighted)
-                else None
-            )
+            qw = _load_tensor_vec(q_weight, tid) if const_expr(q_weighted) else None
 
             q_row0 = fx.Tensor(
                 fx.make_view(fx.get_iter(q_in), fx.make_layout((1, D), (D, 1)))
@@ -1967,10 +1963,21 @@ def _build_kernel_w32_tdm(
         def emit_kv():
             gk = g - gx_q
             tok = _imin(gk * RT + wave, num_tokens - 1)
-            xv = load_vec_global(_ptr_res(kv_in), tok * D + tid * VEC)
-            wv = load_vec_global(
-                buffer_ops.create_buffer_resource(kv_weight, max_size=True), tid * VEC
+            kv_rsrc = _ptr_res(kv_in)
+            xv = _concat(
+                [
+                    fx.Vector(
+                        buffer_ops.buffer_load(
+                            kv_rsrc,
+                            tok * D + tid * VEC + (c * 8),
+                            vec_width=8,
+                            dtype=T.bf16,
+                        )
+                    )
+                    for c in range(VEC // 8)
+                ]
             )
+            wv = _load_tensor_vec(kv_weight, tid)
             cosv, sinv = load_cs(tok)
             norm_rope_store(xv, wv, cosv, sinv, _ptr_res(kv_out), tok * (D * 2))
 
