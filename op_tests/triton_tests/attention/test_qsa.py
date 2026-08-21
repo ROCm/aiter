@@ -319,3 +319,117 @@ def test_qsa_sparse_paged_gqa_qwen_air_selection_width():
         scale,
     )
     torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+
+
+def test_qsa_forced_gluon_mqa_matches_triton_across_pages_and_requests():
+    torch.manual_seed(6)
+    q = torch.randn(4, 8, 128, device="cuda", dtype=torch.bfloat16)
+    cache = torch.randn(9, 4, 1, 128, device="cuda", dtype=torch.bfloat16)
+    page_table = torch.tensor(
+        [
+            [5, -1, -1, -1],
+            [2, 6, 0, -1],
+            [7, 3, 4, 8],
+        ],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    token_to_request = torch.tensor([2, 0, 1, 2], device="cuda", dtype=torch.int32)
+    query_positions = torch.tensor([0, 7, 35, 24], device="cuda", dtype=torch.int32)
+    context_lens = torch.tensor([7, 40, 64], device="cuda", dtype=torch.int32)
+    expected_visible = torch.tensor([0, 1, 9, 6], device="cuda", dtype=torch.int32)
+
+    triton_logits, triton_visible = qsa_paged_mqa_logits(
+        q,
+        cache,
+        page_table,
+        token_to_request,
+        query_positions,
+        context_lens,
+        compress_ratio=4,
+        backend="triton",
+    )
+    gluon_logits, gluon_visible = qsa_paged_mqa_logits(
+        q,
+        cache,
+        page_table,
+        token_to_request,
+        query_positions,
+        context_lens,
+        compress_ratio=4,
+        backend="gluon",
+    )
+    expected = _mqa_reference(
+        q, cache, page_table, token_to_request, expected_visible
+    )
+
+    torch.testing.assert_close(triton_visible, expected_visible)
+    torch.testing.assert_close(gluon_visible, expected_visible)
+    torch.testing.assert_close(triton_logits, expected, rtol=2e-3, atol=2e-3)
+    torch.testing.assert_close(gluon_logits, triton_logits, rtol=2e-3, atol=2e-3)
+
+
+def test_qsa_forced_gluon_sparse_gqa_qwen_geometry_and_width():
+    torch.manual_seed(7)
+    rows = 3
+    page_size = 16
+    pages_per_request = 129
+    q = torch.randn(rows, 10, 128, device="cuda", dtype=torch.bfloat16)
+    k_cache = torch.randn(
+        pages_per_request, page_size, 2, 128, device="cuda", dtype=torch.bfloat16
+    )
+    v_cache = torch.randn_like(k_cache)
+    ascending = torch.arange(
+        pages_per_request, device="cuda", dtype=torch.int32
+    )
+    block_table = torch.stack(
+        (ascending, ascending.roll(17), torch.flip(ascending, dims=(0,)))
+    )
+    token_to_request = torch.tensor([2, 0, 1], device="cuda", dtype=torch.int32)
+    logical_indices = torch.full(
+        (rows, 2051), -1, device="cuda", dtype=torch.int32
+    )
+    boundary_indices = torch.tensor(
+        [0, 15, 16, 17, 31, 32, 2047, 2048, 2050],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    logical_indices[0, : boundary_indices.numel()] = boundary_indices
+    logical_indices[1, : boundary_indices.numel()] = boundary_indices.flip(0)
+    logical_indices[2, :5] = torch.tensor(
+        [1, 14, 1023, 1024, 2049], device="cuda", dtype=torch.int32
+    )
+    scale = 128**-0.5
+
+    triton_output = qsa_sparse_paged_gqa(
+        q,
+        k_cache,
+        v_cache,
+        logical_indices,
+        block_table,
+        token_to_request,
+        scale,
+        backend="triton",
+    )
+    gluon_output = qsa_sparse_paged_gqa(
+        q,
+        k_cache,
+        v_cache,
+        logical_indices,
+        block_table,
+        token_to_request,
+        scale,
+        backend="gluon",
+    )
+    expected = _attention_reference(
+        q,
+        k_cache,
+        v_cache,
+        logical_indices,
+        block_table,
+        token_to_request,
+        scale,
+    )
+
+    torch.testing.assert_close(triton_output, expected, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(gluon_output, triton_output, rtol=2e-2, atol=2e-2)

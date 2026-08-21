@@ -1,7 +1,8 @@
 # Qwen Sparse Attention
 
-AITER provides a correctness-first Triton implementation of the Qwen-Air QSA
-path in `aiter.ops.triton.attention.qsa`.
+AITER provides portable Triton implementations of the Qwen-Air QSA path in
+`aiter.ops.triton.attention.qsa`, plus validated gfx950 Gluon specializations
+for paged MQA scoring and sparse paged GQA.
 
 ## Operators
 
@@ -28,9 +29,55 @@ replace:
    `qsa_select_paged_tokens`.
 2. `qsa_sparse_paged_attention` with `qsa_sparse_paged_gqa`.
 
-Keep the existing Triton implementation as a fallback until representative
-prefill and decode shapes have passed performance gates. The first AITER
-version is portable Triton; a gfx950 Gluon specialization is not included yet.
+The portable Triton kernels remain available on every supported architecture
+and are the fallback for unsupported Gluon shapes and failures.
+
+## gfx950 Gluon dispatch
+
+The public operators accept `backend=None`, `"auto"`, `"triton"`, or
+`"gluon"`. `None` is equivalent to `"auto"`.
+
+Paged MQA scoring auto-selects Gluon only when all of the following hold:
+
+- the device architecture is gfx950 and the Gluon kernels imported
+  successfully with Triton 3.6 or newer;
+- the query is BF16 with shape `[tokens, 8, 128]`;
+- `compress_ratio` is 4; and
+- the query, compressed K cache, and output can use signed 32-bit buffer
+  offsets.
+
+All other scoring cases use Triton. In `"auto"` mode, a Gluon JIT, compiler, or
+launch failure is caught and retried with Triton. `"triton"` always selects the
+portable kernel. `"gluon"` requires the exact supported shape and environment;
+an unsupported configuration raises an error, and runtime failures are
+reported instead of being hidden by fallback. `qsa_select_paged_tokens` passes
+the same backend choice through to its scoring stage.
+
+Sparse GQA Gluon is deliberately forced-only: `"auto"` and `"triton"` both use
+Triton. `"gluon"` requires gfx950, Triton 3.6 or newer, BF16 queries and caches,
+head dimension 128, GQA group size 5, selection width 2051, and signed 32-bit
+buffer offsets for the query, K/V caches, and output. Unsupported forced
+configurations and forced Gluon runtime failures raise an error. Large-address
+cases therefore remain on Triton.
+
+## Validation and performance
+
+On gfx950, the eight QSA tests passed, including forced Triton/Gluon parity for
+page boundaries, causal masking, invalid indices, multiple request page
+tables, head dimension 128, Qwen-Air grouped-query geometry, and selection
+width 2051. The vLLM QSA integration tests passed (3 passed, 5 deselected), and
+a TP=8 completion smoke test returned HTTP 200 while exercising both AITER QSA
+integration paths.
+
+Representative median kernel times were:
+
+- paged MQA scorer, query shape `(32, 8, 128)` with 4096 columns: Triton
+  0.0229 ms, Gluon 0.0164 ms (28% faster);
+- sparse GQA, query shape `(16, 10, 128)` with selection width 2051: Triton
+  0.1186 ms, Gluon 0.1876 ms (58% slower).
+
+Consequently, only the scorer auto-selects Gluon. Sparse Gluon remains
+available for explicit validation and tuning through `backend="gluon"`.
 
 ## Current constraints
 
