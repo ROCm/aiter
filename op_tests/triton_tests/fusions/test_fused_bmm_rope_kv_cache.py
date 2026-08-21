@@ -14,7 +14,7 @@ from aiter.ops.triton.gemm.batched.batched_gemm_a8w8_a_per_token_group_prequant_
 from aiter.ops.triton.gemm.batched.batched_gemm_a16wfp4 import (
     batched_gemm_a16wfp4,
 )
-from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils import arch_info
 from op_tests.test_rope import RotateStyle
 from op_tests.triton_tests.gemm.batched.test_batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (
     generate_batched_gemm_a16w8_inputs,

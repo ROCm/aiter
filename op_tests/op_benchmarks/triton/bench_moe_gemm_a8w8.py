@@ -21,7 +21,7 @@ from aiter.ops.triton.moe.quant_moe import (
     downcast_to_static_fp8,
     downcast_to_static_fp8_3d,
 )
-from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton.utils.arch_info import get_arch
 from aiter.ops.triton.utils.shuffle import shuffle_scale_moe
 
 

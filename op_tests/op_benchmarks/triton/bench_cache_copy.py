@@ -6,7 +6,7 @@ import triton
 import triton.experimental.gluon.language as gl
 from triton.experimental import gluon
 
-from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils import arch_info
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_caller_name_no_ext,
 )

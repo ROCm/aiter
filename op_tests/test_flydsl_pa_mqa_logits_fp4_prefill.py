@@ -34,7 +34,7 @@ import argparse
 import torch
 
 from aiter.ops.flydsl import is_flydsl_available
-from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton.utils.arch_info import get_arch
 from aiter.test_common import run_perftest
 
 dev = "cuda"

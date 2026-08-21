@@ -28,7 +28,7 @@ except:  # noqa: E722
     gluon_fused_qk_rope_reshape_and_cache_kernel = None
 
 from aiter.jit.utils.torch_guard import torch_compile_guard
-from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils import arch_info
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.types import e4m3_dtype
 

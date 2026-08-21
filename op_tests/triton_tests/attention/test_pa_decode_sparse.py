@@ -8,7 +8,7 @@ import torch
 import triton
 
 from aiter.ops.triton.attention.pa_decode_sparse import pa_decode_sparse
-from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils import arch_info
 from aiter.test_common import checkAllclose
 
 

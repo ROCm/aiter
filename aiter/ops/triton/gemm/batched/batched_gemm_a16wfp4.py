@@ -13,7 +13,7 @@ from aiter.ops.triton._triton_kernels.gemm.batched.batched_gemm_a16wfp4 import (
 from aiter.ops.triton.gemm.basic.gemm_a16wfp4 import (
     get_splitk,
 )
-from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils import arch_info
 from aiter.ops.triton.utils.common_utils import deserialize_str, serialize_dict
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 

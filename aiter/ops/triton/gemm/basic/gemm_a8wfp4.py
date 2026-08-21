@@ -11,7 +11,7 @@ from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a8wfp4 import (
     _gemm_a8wfp4_kernel,
     _get_config,
 )
-from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils import arch_info
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()

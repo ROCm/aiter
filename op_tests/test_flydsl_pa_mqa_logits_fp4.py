@@ -14,7 +14,7 @@ import random
 import torch
 
 from aiter.ops.flydsl import flydsl_pa_mqa_logits_fp4, is_flydsl_available
-from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton.utils.arch_info import get_arch
 from aiter.test_common import checkAllclose, run_perftest
 
 dev = "cuda"

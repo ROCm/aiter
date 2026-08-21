@@ -20,7 +20,7 @@ from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a8w8_blockscale import (
 from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a8w8_blockscale import (
     _get_config,
 )
-from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton.utils.arch_info import get_arch
 from aiter.ops.triton.utils.gemm_config_utils import compute_splitk_params
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 

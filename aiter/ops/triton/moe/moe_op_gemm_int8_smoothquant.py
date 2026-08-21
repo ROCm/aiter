@@ -14,8 +14,8 @@ from aiter.ops.triton._triton_kernels.moe.moe_op_gemm_int8_smoothquant import (
 )
 from aiter.ops.triton.moe.moe_routing.routing import RoutingData
 from aiter.ops.triton.moe.reduce import reduce_grouped
-from aiter.ops.triton.utils._triton import arch_info
-from aiter.ops.triton.utils.device_info import get_num_sms
+from aiter.ops.triton.utils import arch_info
+from aiter.ops.triton.utils.arch_info import get_num_sms
 from aiter.ops.triton.utils.shuffle import shuffle_weight
 
 # -----------------------------------------------------------------------------

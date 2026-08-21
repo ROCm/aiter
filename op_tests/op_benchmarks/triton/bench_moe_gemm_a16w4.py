@@ -17,7 +17,7 @@ from aiter.ops.triton.moe.moe_op_gemm_a16w4 import (
 )
 from aiter.ops.triton.moe.moe_routing.routing import routing
 from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
-from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton.utils.arch_info import get_arch
 from aiter.ops.triton.utils.shuffle import shuffle_scale_moe
 
 

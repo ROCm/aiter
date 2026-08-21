@@ -24,7 +24,7 @@ from aiter.ops.triton.moe.quant_moe import (
 )
 
 # target-specific utilities
-from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils import arch_info
 from aiter.ops.triton.utils.shuffle import shuffle_scale_moe
 from aiter.ops.triton.utils.types import str_to_torch_dtype
 

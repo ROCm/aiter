@@ -13,7 +13,7 @@ from aiter.ops.triton.gluon.gemm_a8w8 import (
 from aiter.ops.triton.gluon.gemm_a8w8 import (
     gemm_a8w8_preshuffle as gluon_gemm_a8w8_preshuffle,
 )
-from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils import arch_info
 from aiter.ops.triton.utils.gemm_config_utils import (
     compute_splitk_params,
     get_gemm_config,

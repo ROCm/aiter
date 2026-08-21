@@ -6,7 +6,7 @@ import functools
 import triton
 import triton.language as tl
 
-from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils import arch_info
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH, load_config_json
 

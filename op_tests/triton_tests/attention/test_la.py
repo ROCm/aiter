@@ -12,7 +12,7 @@ from aiter.ops.triton.attention.lean_atten import (
     _persistent_lean_attention,
     persistent_lean_attention,
 )
-from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils import arch_info
 
 DEBUG_MODE = False
 

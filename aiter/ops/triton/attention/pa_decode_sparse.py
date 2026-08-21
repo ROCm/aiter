@@ -39,9 +39,9 @@ from aiter.ops.triton._triton_kernels.attention.pa_decode_sparse import (
 from aiter.ops.triton._triton_kernels.attention.pa_decode_sparse import (
     _pa_decode_sparse_reduce as triton_pa_decode_sparse_reduce,
 )
-from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils import arch_info
+from aiter.ops.triton.utils.arch_info import get_num_sms
 from aiter.ops.triton.utils.common_utils import max_addressable_bytes
-from aiter.ops.triton.utils.device_info import get_num_sms
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 DEVICE_ARCH = arch_info.get_arch()
@@ -284,7 +284,7 @@ def pa_decode_sparse(
         kv_splits = triton.next_power_of_2(kv_splits)
 
     if use_gluon:
-        _lds_budget = arch_info._LDS_CAP_BYTES.get(DEVICE_ARCH)
+        _lds_budget = arch_info.get_lds_cap_bytes(DEVICE_ARCH)
         _lds_cap = max(1, _lds_budget // (block_d * 4))
         kv_splits = min(kv_splits, 1 << (_lds_cap.bit_length() - 1))
         if kv_splits > 8:

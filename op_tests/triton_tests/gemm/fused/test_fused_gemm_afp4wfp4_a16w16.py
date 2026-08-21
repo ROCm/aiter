@@ -9,7 +9,7 @@ import triton
 from aiter.ops.triton.gemm.fused.fused_gemm_afp4wfp4_a16w16 import (
     fused_gemm_afp4wfp4_a16w16,
 )
-from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils import arch_info
 from op_tests.triton_tests.gemm.basic.test_gemm_a16w16 import (
     generate_gemm_a16w16_inputs,
 )

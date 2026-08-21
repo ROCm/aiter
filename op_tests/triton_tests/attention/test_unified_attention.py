@@ -9,7 +9,7 @@ from aiter.ops.triton.attention.unified_attention import (
     is_2d_gluon_available,
     unified_attention,
 )
-from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils import arch_info
 from aiter.ops.triton.utils.shuffle import shuffle_scale_batched, shuffle_weight
 from aiter.ops.triton.utils.types import e4m3_dtype
 from aiter.test_common import checkAllclose

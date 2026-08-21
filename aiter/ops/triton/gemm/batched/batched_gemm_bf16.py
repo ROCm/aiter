@@ -11,7 +11,7 @@ from aiter.ops.triton._triton_kernels.gemm.batched.batched_gemm_bf16 import (
     _batched_gemm_bf16_kernel,
     _get_config,
 )
-from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton.utils.arch_info import get_arch
 from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 

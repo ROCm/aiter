@@ -9,7 +9,7 @@ import torch
 from aiter import dtypes
 from aiter.ops.shuffle import shuffle_scale, shuffle_weight
 from aiter.ops.triton.gather_kv_b_proj import gather_kv_b_proj
-from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils import arch_info
 from aiter.test_common import checkAllclose, run_perftest
 from aiter.utility.fp4_utils import e8m0_to_f32, mxfp4_to_f32
 from op_tests.triton_tests.attention.test_mla import shuffle_kv_buffer

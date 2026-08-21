@@ -7,7 +7,7 @@ import triton
 from aiter.ops.triton.gemm.batched.batched_gemm_a16wfp4 import (
     batched_gemm_a16wfp4,
 )
-from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils import arch_info
 from op_tests.op_benchmarks.triton.utils.argparse import (
     add_argparse_ff,
     get_ff_args,

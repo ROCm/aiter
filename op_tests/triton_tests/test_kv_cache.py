@@ -3,7 +3,7 @@ import torch
 import triton
 
 from aiter.ops.triton.kv_cache import cat_and_cache_mla
-from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils import arch_info
 from aiter.ops.triton.utils.types import e4m3_dtype
 from aiter.test_common import checkAllclose
 from op_tests.triton_tests.attention.test_mla import (

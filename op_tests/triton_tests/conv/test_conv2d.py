@@ -33,7 +33,7 @@ shapes, in op_benchmarks/triton/model_benchmarking_tool/bench_models.py).
 import pytest
 import torch
 
-from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton.utils.arch_info import get_arch
 
 from ._helpers import (
     ALL_SUPPORTED_ARCHS,

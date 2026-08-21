@@ -10,7 +10,7 @@ from aiter.ops.triton.quant.fused_mxfp4_quant import (
     fused_reduce_rms_mxfp4_quant,
     fused_rms_mxfp4_quant,
 )
-from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils import arch_info
 from aiter.ops.triton.utils.shuffle import shuffle_scale_gemm, unshuffle_scale_gemm
 from aiter.utility.fp4_utils import dynamic_mxfp4_quant, moe_mxfp4_sort
 from op_tests.triton_tests.gemm.basic.test_gemm_afp4wfp4 import (

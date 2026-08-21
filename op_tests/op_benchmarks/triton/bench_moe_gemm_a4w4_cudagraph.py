@@ -55,7 +55,7 @@ from aiter.ops.triton.moe.moe_op_gemm_a4w4 import (
 )
 from aiter.ops.triton.moe.moe_routing.routing import _USE_HERD, routing
 from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
-from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton.utils.arch_info import get_arch
 from aiter.ops.triton.utils.shuffle import moe_weight_decode_view, shuffle_scale_moe
 
 # measurable layers, in report order; see the module docstring

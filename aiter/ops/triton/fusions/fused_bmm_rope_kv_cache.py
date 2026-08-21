@@ -17,7 +17,7 @@ from aiter.ops.triton._triton_kernels.gemm.batched.batched_gemm_a16wfp4 import (
     _get_config as _get_fp4_config,
 )
 from aiter.ops.triton.gemm.basic.gemm_a16wfp4 import get_splitk
-from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils import arch_info
 from aiter.ops.triton.utils.common_utils import deserialize_str
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 

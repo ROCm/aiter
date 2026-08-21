@@ -10,7 +10,7 @@ import torch
 import triton
 
 from aiter.ops.triton.attention.mla import mla_decode_fwd, mla_prefill_fwd
-from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils import arch_info
 from aiter.ops.triton.utils.types import e4m3_dtype
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_caller_name_no_ext,

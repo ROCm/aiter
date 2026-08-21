@@ -17,7 +17,7 @@ from aiter.ops.triton.attention.fav3_sage_attention_mxfp4_wrapper import (
 )
 from aiter.ops.triton.attention.utils import block_attn_mask_to_ragged_lut
 from aiter.ops.triton.quant.sage_attention_quant_wrappers import create_hadamard_matrix
-from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils import arch_info
 from aiter.test_mha_common import (
     attention_ref,
     attention_ref_block_sparse,

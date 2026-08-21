@@ -137,7 +137,6 @@ _BACKWARD_COMPAT_MAP = {
     "gmm_common": "utils.gmm_common",
     "la_kernel_utils": "utils.la_kernel_utils",
     "logger": "utils.logger",
-    "mha_kernel_utils": "utils.mha_kernel_utils",
     "moe_common": "utils.moe_common",
     "moe_config_utils": "utils.moe_config_utils",
     "types": "utils.types",

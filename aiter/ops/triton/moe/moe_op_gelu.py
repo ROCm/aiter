@@ -12,7 +12,7 @@ from aiter.ops.triton._triton_kernels.moe.moe_op_gelu import (
     _fused_moe_persistent_kernel,
 )
 from aiter.ops.triton.quant import dynamic_per_tensor_quant_fp8_i8
-from aiter.ops.triton.utils.device_info import get_num_xcds
+from aiter.ops.triton.utils.arch_info import get_num_xcds
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()

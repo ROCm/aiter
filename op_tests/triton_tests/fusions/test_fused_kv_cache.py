@@ -7,7 +7,7 @@ from aiter.ops.triton.fusions.fused_kv_cache import (
     fused_qk_rope_cosine_cache_llama,
     fused_qk_rope_reshape_and_cache,
 )
-from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils import arch_info
 from aiter.ops.triton.utils.types import e4m3_dtype
 from aiter.test_common import checkAllclose
 from op_tests.test_rope import RotateStyle, ref_rope_sbhd_fwd

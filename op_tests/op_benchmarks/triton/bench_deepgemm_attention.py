@@ -13,7 +13,7 @@ from aiter.ops.triton.attention.pa_mqa_logits import (
     deepgemm_fp8_paged_mqa_logits,
     deepgemm_fp8_paged_mqa_logits_schedule,
 )
-from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils import arch_info
 from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
 from aiter.test_common import run_perftest
 

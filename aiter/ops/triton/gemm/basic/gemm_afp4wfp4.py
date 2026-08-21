@@ -20,7 +20,7 @@ from aiter.ops.triton._triton_kernels.gemm.basic.gemm_afp4wfp4 import (
 from aiter.ops.triton._triton_kernels.gemm.basic.gemm_afp4wfp4 import (
     _get_config,
 )
-from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils import arch_info
 from aiter.ops.triton.utils.common_utils import deserialize_str, serialize_dict
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 

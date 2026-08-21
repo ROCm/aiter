@@ -14,7 +14,7 @@ import matplotlib.pyplot as plt
 import pandas as pd
 from triton.runtime.errors import OutOfResources
 
-from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils import arch_info
 from op_tests.op_benchmarks.triton.bench_batched_gemm_a8w8 import (
     main as bench_batched_gemm_a8w8_main,
 )

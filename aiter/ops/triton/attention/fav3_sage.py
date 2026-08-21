@@ -12,7 +12,7 @@ from aiter.ops.triton._triton_kernels.attention.fav3_sage_attention import (
     sage_fwd,
 )
 from aiter.ops.triton.quant.sage_attention_quant_wrappers import sage_quant
-from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils import arch_info
 
 
 def get_sage_fwd_configs(

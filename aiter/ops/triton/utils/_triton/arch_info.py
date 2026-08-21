@@ -1,35 +1,23 @@
-import triton
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-try:
-    _CACHED_ARCH = triton.runtime.driver.active.get_current_target().arch
-except RuntimeError:
-    from jax._src.lib import gpu_triton as triton_kernel_call_lib
+# Moved to aiter.ops.triton.utils.arch_info; this module is kept so the old
+# import path keeps working for out-of-tree callers.
+import warnings
 
-    _CACHED_ARCH = triton_kernel_call_lib.get_arch_details("0").split(":")[0]
+from aiter.ops.triton.utils.arch_info import (  # noqa: F401
+    _LDS_CAP_BYTES,
+    get_arch,
+    is_fp4_avail,
+    is_fp8_avail,
+    is_mx_scale_preshuffling_avail,
+    is_tdm_avail,
+)
 
-
-def get_arch():
-    return _CACHED_ARCH
-
-
-def is_gluon_avail():
-    return get_arch() in ("gfx950", "gfx1250")
-
-
-def is_fp4_avail():
-    return get_arch() in ("gfx950", "gfx1250")
-
-
-def is_fp8_avail():
-    return get_arch() in ("gfx942", "gfx950", "gfx1250", "gfx1200", "gfx1201")
-
-
-def is_mx_scale_preshuffling_avail():
-    return get_arch() in ("gfx950", "gfx1250")
-
-
-def is_tdm_avail():
-    return get_arch() in ("gfx1250",)
-
-
-_LDS_CAP_BYTES = {"gfx1250": 327680, "gfx950": 163840, "gfx942": 65536}
+warnings.warn(
+    "aiter.ops.triton.utils._triton.arch_info has moved to "
+    "aiter.ops.triton.utils.arch_info; this shim will be removed in a future "
+    "AITER release.",
+    DeprecationWarning,
+    stacklevel=2,
+)

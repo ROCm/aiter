@@ -20,7 +20,7 @@ def _skip_if_triton_on_gfx1250(backend):
     no usable config there; skip the triton backend on gfx1250."""
     if backend != "triton":
         return
-    from aiter.ops.triton.utils._triton.arch_info import get_arch
+    from aiter.ops.triton.utils.arch_info import get_arch
 
     if "gfx1250" in (get_arch() or ""):
         pytest.skip("triton backend has no gfx1250 a16w16 config (gluon-only arch)")

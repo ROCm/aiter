@@ -30,7 +30,7 @@ from aiter.ops.triton._triton_kernels.attention.sparse_attention_dsv4 import (
 from aiter.ops.triton.gluon.mla_gluon import (
     mla_gluon as gluon_mla_sparse_prefill,
 )
-from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils import arch_info
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 DEVICE_ARCH = arch_info.get_arch()

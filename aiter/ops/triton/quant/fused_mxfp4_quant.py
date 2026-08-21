@@ -17,7 +17,7 @@ from aiter.ops.triton._triton_kernels.quant.fused_mxfp4_quant import (
     _fused_reduce_rms_mxfp4_quant_kernel,
     _fused_rms_mxfp4_quant_kernel,
 )
-from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton.utils.arch_info import get_arch
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.utility import dtypes
 

@@ -10,7 +10,7 @@ from aiter.ops.triton.gemm.fused.fused_gemm_a8w8_blockscale_split_cat import (
     fused_gemm_a8w8_blockscale_preshuffle_split_cat,
     fused_gemm_a8w8_blockscale_split_cat,
 )
-from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils import arch_info
 from aiter.ops.triton.utils.types import get_fp8_dtypes, str_to_torch_dtype
 
 block_shape = (128, 128)

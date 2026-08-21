@@ -16,7 +16,7 @@ from aiter.ops.triton.moe.moe_op_gemm_a8w8_blockscale import (
     moe_gemm_a8w8_blockscale,
 )
 from aiter.ops.triton.moe.moe_routing.routing import routing
-from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton.utils.arch_info import get_arch
 from aiter.ops.triton.utils.gemm_config_utils import (
     compute_splitk_params,
     get_gemm_config,

@@ -13,7 +13,7 @@ from aiter.ops.triton._triton_kernels.normalization.rmsnorm import (
     _rmsnorm_bwd_triton,
     _rmsnorm_kernel_large_m_small_n,
 )
-from aiter.ops.triton.utils.device_info import get_num_sms
+from aiter.ops.triton.utils.arch_info import get_num_sms
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.types import get_dtype_max
 

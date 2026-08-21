@@ -5,7 +5,7 @@ import os
 
 import triton
 
-from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils import arch_info
 from aiter.ops.triton.utils.core import (
     AITER_TRITON_CONFIGS_PATH,
     USE_LRU_CACHE,
@@ -298,8 +298,10 @@ def pick_gemm_num_stages(
     # bits_a / bits_b: element bit-widths (8 for fp8, 4 for mxfp4).
     # use_async_padding: True when the kernel lowers to async direct-to-LDS
     # with padded shared encoding (e.g. a4w4 on gfx950).
-    cap = arch_info._LDS_CAP_BYTES.get(arch)
-    if cap is None:
+    # An arch with no known LDS capacity gets the conservative num_stages.
+    try:
+        cap = arch_info.get_lds_cap_bytes(arch)
+    except ValueError:
         return 2
     lds = _gemm_lds_bytes(
         block_m, block_n, block_k, bits_a, bits_b, 2, use_async_padding

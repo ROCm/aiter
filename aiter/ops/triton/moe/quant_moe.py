@@ -10,7 +10,7 @@ from aiter.ops.triton._triton_kernels.moe.quant_moe import (
     _smoothquant_fuse_quant_kernel_single_pass,
     _upcast_from_mxfp,
 )
-from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton.utils.arch_info import get_arch
 
 
 def downcast_to_static_fp8_3d(x: torch.Tensor, scale: torch.Tensor):

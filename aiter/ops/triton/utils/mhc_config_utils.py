@@ -6,7 +6,7 @@ import glob
 import os
 import re
 
-from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils import arch_info
 from aiter.ops.triton.utils.core import (
     AITER_TRITON_CONFIGS_PATH,
     USE_LRU_CACHE,

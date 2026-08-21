@@ -9,7 +9,7 @@ from aiter.ops.triton.moe.moe_routing.routing import (
     _compute_expt_data_internal,
 )
 from aiter.ops.triton.moe.moe_routing.topk import topk
-from aiter.ops.triton.utils._triton.arch_info import is_tdm_avail
+from aiter.ops.triton.utils.arch_info import is_tdm_avail
 
 
 def keepk_sort0(

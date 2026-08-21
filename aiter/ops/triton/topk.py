@@ -18,7 +18,7 @@ from aiter.ops.triton._triton_kernels.topk import (
     topk_stage1_kernel,
     topk_stage2_kernel,
 )
-from aiter.ops.triton.utils._triton.arch_info import is_tdm_avail
+from aiter.ops.triton.utils.arch_info import is_tdm_avail
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()

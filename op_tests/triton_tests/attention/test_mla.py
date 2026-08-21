@@ -10,7 +10,7 @@ from aiter.ops.triton.attention.mla import (
     mla_decode_fwd,
     mla_prefill_fwd,
 )
-from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils import arch_info
 from aiter.ops.triton.utils.shuffle import shuffle_scale_batched, shuffle_weight
 from aiter.ops.triton.utils.types import e4m3_dtype
 from aiter.test_common import checkAllclose

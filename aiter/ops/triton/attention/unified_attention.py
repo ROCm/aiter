@@ -10,7 +10,7 @@ from aiter.ops.triton._triton_kernels.attention.unified_attention import (
     kernel_unified_attention_3d,
     reduce_segments,
 )
-from aiter.ops.triton.utils.device_info import get_num_sms
+from aiter.ops.triton.utils.arch_info import get_num_sms
 
 try:
     from aiter.ops.triton._gluon_kernels.gfx1250.attention.unified_attention_3d import (
@@ -33,8 +33,7 @@ try:
 except:  # noqa: E722
     _reduce_segments_gluon = None
 
-from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import get_arch
-from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils import arch_info
 from aiter.ops.triton.utils.types import e4m3_dtype
 
 # Max NUM_SEGMENTS the gluon reduce holds in-thread; larger split counts fall back to the Triton reduce_segments.
@@ -42,6 +41,7 @@ _GLUON_REDUCE_MAX_SEGMENTS = 8
 
 DEVICE_ARCH = arch_info.get_arch()
 IS_DEVICE_ARCH_GFX12 = DEVICE_ARCH in ("gfx1250",)
+IS_DEVICE_ARCH_RDNA = arch_info.is_rdna()
 WARP_SIZE = 32 if IS_DEVICE_ARCH_GFX12 else 64
 WAPR_SIZE_LOG2 = int(math.log2(WARP_SIZE))
 
@@ -75,29 +75,27 @@ def select_2d_config(
     kv_cache_dtype,
     shuffled_kv_cache,
 ):
-    arch = get_arch()
-
     BLOCK_M = (
         16 if num_queries_per_kv <= 16 else triton.next_power_of_2(num_queries_per_kv)
     )
 
-    TILE_SIZE = 32 if arch.name == "gfx1201" else 16 if arch.is_rdna else 64
-    waves_per_eu = 8 if arch.name == "gfx1151" else 6 if arch.is_rdna else 2
+    TILE_SIZE = 32 if DEVICE_ARCH == "gfx1201" else 16 if IS_DEVICE_ARCH_RDNA else 64
+    waves_per_eu = 8 if DEVICE_ARCH == "gfx1151" else 6 if IS_DEVICE_ARCH_RDNA else 2
 
     max_num_stages_2d = 2 if head_size > 128 else 4
 
     # base prefill, for short cases
     if not all_decode:
-        if head_size >= 512 and not arch.is_rdna:
+        if head_size >= 512 and not IS_DEVICE_ARCH_RDNA:
             num_warps, num_stages_2d = 4, 2
             TILE_SIZE = 16
-        elif head_size >= 256 and not arch.is_rdna:
+        elif head_size >= 256 and not IS_DEVICE_ARCH_RDNA:
             num_warps, num_stages_2d = 2, 2
             TILE_SIZE = 32
         else:
             # large prefill config
             if max_seqlen_q >= 256:
-                BLOCK_M = 64 if arch.is_rdna else 128
+                BLOCK_M = 64 if IS_DEVICE_ARCH_RDNA else 128
                 num_stages_2d, num_warps = 1, 4
             else:
                 num_stages_2d, num_warps = 1, 2
@@ -106,7 +104,7 @@ def select_2d_config(
     else:
         # to not have masking when loading KV
         TILE_SIZE = min(64, triton.next_power_of_2(block_size))
-        if arch.is_rdna:
+        if IS_DEVICE_ARCH_RDNA:
             num_stages_2d, num_warps = 1, 4
         else:
             if head_size >= 512:
@@ -149,7 +147,6 @@ def select_3d_config(
     NUM_BLOCKS_GATHER_PER_TILE: int = 1,
     SLIDING_WINDOW: int | None = None,
 ):
-    arch = get_arch()
     reduce_num_warps = 2
     attn_warps = 2
     waves_per_eu = 2
@@ -210,7 +207,7 @@ def select_3d_config(
             e4m3_dtype,
         ), f"kv_cache_dtype only supports F16 ({torch.float16}) BF16 ({torch.bfloat16}), FP8 ({e4m3_dtype}) in arch = {DEVICE_ARCH}"
 
-        if head_size >= 512 and not arch.is_rdna:
+        if head_size >= 512 and not IS_DEVICE_ARCH_RDNA:
             attn_warps, attn_stages = 4, 1
         occ = waves_per_eu * 4 // attn_warps
         target_num_prgms = target_num_prgms * occ
@@ -219,7 +216,7 @@ def select_3d_config(
 
         MAX_SEGMENTS = min(128, math.ceil(max_seqlen_k / TILE_SIZE))
         MIN_SEGMENTS = min(8, MAX_SEGMENTS)
-        if head_size >= 512 and not arch.is_rdna:
+        if head_size >= 512 and not IS_DEVICE_ARCH_RDNA:
             MIN_SEGMENTS = min(16, MAX_SEGMENTS)
         if num_segments == 0:
             num_segments = math.ceil(target_num_prgms / num_2d_prgms)
@@ -294,7 +291,7 @@ def use_2d_kernel(
     if IS_DEVICE_ARCH_GFX12:
         return (sliding_window > 0) or (not all_decode)
 
-    if head_size >= 512 and not get_arch().is_rdna and not all_decode:
+    if head_size >= 512 and not IS_DEVICE_ARCH_RDNA and not all_decode:
         return True
 
     return (

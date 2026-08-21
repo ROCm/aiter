@@ -7,7 +7,7 @@ from aiter.ops.triton.gemm.fused.fused_gemm_afp4wfp4_mul_add import (
     fused_gemm_afp4wfp4_mul_add,
     fused_gemm_afp4wfp4_preshuffle_add_mul,
 )
-from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils import arch_info
 from op_tests.triton_tests.fusions.test_fused_mul_add import (
     generate_fused_mul_add_inputs,
 )

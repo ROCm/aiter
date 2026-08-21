@@ -7,7 +7,7 @@ from typing import Any
 
 import torch
 
-from ._triton import arch_info
+from . import arch_info
 from .core import AITER_TRITON_CONFIGS_PATH, USE_LRU_CACHE, load_config_json
 
 M_THRESHOLD_SMALL = 256

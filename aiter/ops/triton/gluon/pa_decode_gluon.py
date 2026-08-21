@@ -9,7 +9,7 @@ import triton.language as tl
 from triton.language.extra.hip import libdevice as hip_libdevice
 
 import aiter
-from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils import arch_info
 
 CXX_PS_REDUCE_AVAILABLE = True
 try:

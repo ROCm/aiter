@@ -10,7 +10,7 @@ from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 from triton.runtime.jit import constexpr_function
 
-from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils import arch_info
 from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
 from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH, load_config_json
 from aiter.ops.triton.utils.logger import AiterTritonLogger
@@ -985,12 +985,11 @@ def _get_config_cached(
     N: int,
     K: int,
 ):
-    if not arch_info.is_gluon_avail():
-        raise ValueError(
-            "Gluon implementation is not supported on this device (requires CDNA4)."
-        )
-
     dev = arch_info.get_arch()
+    if dev not in ("gfx950", "gfx1250"):
+        raise ValueError(
+            f"Gluon implementation is not supported on this device (arch = {dev})."
+        )
 
     # Try specialized config first.
     config_dict = load_config_json(

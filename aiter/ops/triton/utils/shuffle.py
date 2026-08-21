@@ -1,7 +1,7 @@
 import torch
 
 from aiter.ops.shuffle import shuffle_weight as _shuffle_weight_base
-from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton.utils.arch_info import get_arch
 
 # =============================================================================
 # WEIGHTS

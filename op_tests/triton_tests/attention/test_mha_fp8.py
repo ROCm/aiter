@@ -14,7 +14,7 @@ from aiter.ops.triton.attention.mha_v3 import (
     flash_attn_fp8_func,
     flash_attn_varlen_fp8_func,
 )
-from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton.utils.arch_info import get_arch
 from aiter.test_mha_common import (
     attention_ref,
     attention_ref_with_tol,

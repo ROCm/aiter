@@ -13,7 +13,7 @@ from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import (
 from aiter.ops.triton.gluon.gemm_afp4wfp4 import (
     gemm_afp4wfp4 as gluon_gemm_afp4wfp4_CDNA4,
 )
-from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils import arch_info
 from aiter.ops.triton.utils.shuffle import shuffle_scale_gemm, shuffle_weight
 from aiter.ops.triton.utils.types import str_to_torch_dtype
 
@@ -203,7 +203,7 @@ def test_gemm_afp4_wfp4(
     skip_reduce,
     impl,
 ):
-    if impl == "gluon" and not arch_info.is_gluon_avail():
+    if impl == "gluon" and arch_info.get_arch() not in ("gfx950", "gfx1250"):
         pytest.skip("Gluon implementation is not supported on this GPU.")
     dtype = torch.bfloat16
     # TODO(brunomazzotti): Fix gluon instr shape then enable gluon tests conditionally on 950

@@ -13,7 +13,7 @@ from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_2
 from aiter.ops.triton.attention.mha_fused_bwd import flash_attn_fused_backward
 from aiter.ops.triton.attention.mha_onekernel_bwd import flash_attn_onekernel_backward
 from aiter.ops.triton.utils import types
-from aiter.ops.triton.utils.device_info import get_num_xcds
+from aiter.ops.triton.utils.arch_info import get_num_xcds
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()

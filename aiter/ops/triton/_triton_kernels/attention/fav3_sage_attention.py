@@ -1,8 +1,8 @@
 import triton
 import triton.language as tl
 
-from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.common import (
-    compute_alibi_block,
+from aiter.ops.triton._triton_kernels.attention.mha_kernel_utils import (
+    _compute_alibi_block,
 )
 
 
@@ -104,7 +104,7 @@ def _sage_fwd_no_mask(
 
             if USE_ALIBI:
                 q_offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
-                alibi_block = compute_alibi_block(
+                alibi_block = _compute_alibi_block(
                     alibi_slope, seqlen_q, seqlen_k, q_offs_m, kv_offs_n
                 )
                 qk += alibi_block
@@ -303,7 +303,7 @@ def _sage_fwd_blocksparse_nomask(
             qk_scaled = qk_int.to(ACCUMULATOR_TYPE) * scale
             if USE_ALIBI:
                 q_offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
-                alibi_block = compute_alibi_block(
+                alibi_block = _compute_alibi_block(
                     alibi_slope, seqlen_q, seqlen_k, q_offs_m, kv_offs_n
                 )
                 qk_scaled += alibi_block
@@ -477,7 +477,7 @@ def _sage_fwd_blocksparse_mask(
             qk_scaled = qk_int.to(ACCUMULATOR_TYPE) * scale
             if USE_ALIBI:
                 q_offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
-                alibi_block = compute_alibi_block(
+                alibi_block = _compute_alibi_block(
                     alibi_slope, seqlen_q, seqlen_k, q_offs_m, kv_offs_n
                 )
                 qk_scaled += alibi_block
@@ -674,7 +674,7 @@ def _sage_fwd_mask(
         if USE_ALIBI:
             # compute the global position of each token within the sequence
             q_offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
-            alibi_block = compute_alibi_block(
+            alibi_block = _compute_alibi_block(
                 alibi_slope, seqlen_q, seqlen_k, q_offs_m, kv_offs_n
             )
             qk += alibi_block

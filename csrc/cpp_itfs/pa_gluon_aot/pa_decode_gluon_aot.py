@@ -11,7 +11,7 @@ from jinja2 import Template
 
 import aiter
 from aiter.ops.triton.gluon.pa_decode_gluon import get_cdna_version
-from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils import arch_info
 from aiter.ops.triton.utils.types import torch_to_triton_dtype
 from csrc.cpp_itfs.gluon_aot_tools.compile import (
     CompileArgs,

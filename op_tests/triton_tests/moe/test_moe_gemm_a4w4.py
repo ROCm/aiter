@@ -26,7 +26,7 @@ from aiter.ops.triton.moe.quant_moe import (
 )
 
 # target-specific utilities
-from aiter.ops.triton.utils._triton.arch_info import get_arch, is_fp4_avail
+from aiter.ops.triton.utils.arch_info import get_arch, is_fp4_avail
 from aiter.ops.triton.utils.shuffle import moe_weight_decode_view, shuffle_scale_moe
 
 

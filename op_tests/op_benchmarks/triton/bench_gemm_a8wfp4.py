@@ -136,7 +136,7 @@ def parse_args():
 
 
 def main():
-    from aiter.ops.triton.utils._triton import arch_info
+    from aiter.ops.triton.utils import arch_info
 
     if not (arch_info.is_fp4_avail()):
         print("MXFP4 is not available on this architecture")

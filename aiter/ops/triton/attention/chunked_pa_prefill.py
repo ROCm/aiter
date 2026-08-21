@@ -16,7 +16,7 @@ from aiter.ops.triton._triton_kernels.attention.chunked_pa_prefill import (
     _kernel_paged_attention_2d,
 )
 from aiter.ops.triton.attention.pa_prefill import context_attention_fwd
-from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils import arch_info
 
 # gfx942 and gfx1250 keep Triton's defaults
 # For gfx950: tuned launch for the decode kernel.

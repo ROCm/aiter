@@ -9,7 +9,7 @@ from aiter.ops.triton.gemm.fused.fused_gemm_afp4wfp4_split_cat import (
     fused_gemm_afp4wfp4_preshuffle_split_cat,
     fused_gemm_afp4wfp4_split_cat,
 )
-from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils import arch_info
 from aiter.ops.triton.utils.shuffle import shuffle_scale_gemm
 from aiter.ops.triton.utils.types import str_to_torch_dtype
 from op_tests.triton_tests.gemm.batched.test_batched_gemm_afp4wfp4 import (

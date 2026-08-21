@@ -20,7 +20,7 @@ from aiter.ops.triton.gluon.pa_decode_gluon import (
     paged_attention_decode_v2_gluon_dot_kernel,
     paged_attention_decode_v2_gluon_large_block_dot_kernel,
 )
-from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils import arch_info
 from aiter.test_common import perftest
 from csrc.cpp_itfs.gluon_aot_tools.compile_gluon import (
     CompileGluonArgs,

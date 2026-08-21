@@ -9,7 +9,7 @@ import triton.language as tl
 from triton.backends.compiler import GPUTarget
 from triton.tools.compile import CompileArgs, compile_kernel
 
-from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton.utils.arch_info import get_arch
 from aiter.utility.triton.triton_metadata_redirect import (
     AOTMetadataContext,
     with_custom_metadata_path,

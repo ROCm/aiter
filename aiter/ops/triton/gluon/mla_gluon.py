@@ -52,8 +52,8 @@ import triton.language as tl
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
-from aiter.ops.triton.utils._triton import arch_info
-from aiter.ops.triton.utils.device_info import get_num_xcds
+from aiter.ops.triton.utils import arch_info
+from aiter.ops.triton.utils.arch_info import get_num_xcds
 
 # fmt: off
 @gluon.jit

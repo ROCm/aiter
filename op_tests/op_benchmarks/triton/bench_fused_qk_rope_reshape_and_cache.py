@@ -27,7 +27,7 @@ import torch
 import triton
 
 from aiter.ops.triton.fusions.fused_kv_cache import fused_qk_rope_reshape_and_cache
-from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils import arch_info
 from aiter.ops.triton.utils.types import e4m3_dtype
 from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (

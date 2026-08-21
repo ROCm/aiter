@@ -10,7 +10,7 @@ from aiter.ops.triton._triton_kernels.attention.mha_fused_bwd import (
     _bwd_preprocess,
     _get_config,
 )
-from aiter.ops.triton.utils.device_info import get_num_xcds
+from aiter.ops.triton.utils.arch_info import get_num_xcds
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.types import _is_fp8
 

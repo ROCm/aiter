@@ -7,7 +7,7 @@ from _utils import (
     read_screen_file,
 )
 
-from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils import arch_info
 
 DEVICE_ARCH = arch_info.get_arch()
 

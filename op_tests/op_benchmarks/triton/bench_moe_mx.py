@@ -5,7 +5,7 @@ import triton
 
 from aiter.ops.triton.moe.moe_op_mxfp4 import fused_moe_mxfp4
 from aiter.ops.triton.moe.moe_op_mxfp4_silu_fused import fused_moe_mxfp4_silu
-from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils import arch_info
 from aiter.ops.triton.utils.types import torch_to_triton_dtype
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_available_models,

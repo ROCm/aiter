@@ -14,7 +14,7 @@ from aiter.ops.triton._triton_kernels.attention.mla import (
 from aiter.ops.triton._triton_kernels.attention.mla import (
     _mla_prefill_fwd_kernel as triton_mla_prefill_fwd_kernel,
 )
-from aiter.ops.triton.utils.device_info import get_num_sms
+from aiter.ops.triton.utils.arch_info import get_num_sms
 
 try:
     from aiter.ops.triton._gluon_kernels.gfx1250.attention.mla import (
@@ -35,7 +35,7 @@ except:  # noqa: E722
     gluon_mla_decode_fwd_kernel = None
     gluon_mla_decode_fwd_reduce_kernel = None
 
-from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils import arch_info
 from aiter.ops.triton.utils.types import e4m3_dtype
 
 DEVICE_ARCH = arch_info.get_arch()

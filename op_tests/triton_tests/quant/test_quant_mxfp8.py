@@ -13,7 +13,7 @@ from aiter.ops.triton.quant.quant import (
     dynamic_mxfp8_quant,
     fp8_legacy_to_mxfp8,
 )
-from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils import arch_info
 
 QUANT_BLOCK_SIZE = 32
 LEGACY_BLOCK_SIZE = 128

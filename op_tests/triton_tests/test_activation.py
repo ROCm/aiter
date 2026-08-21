@@ -3,7 +3,7 @@ import torch
 import torch.nn.functional as F
 
 from aiter.ops.triton.activation import act_mul_and_mxfp4_quant
-from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils import arch_info
 from aiter.ops.triton.utils.shuffle import shuffle_scale_gemm, unshuffle_scale_gemm
 from op_tests.triton_tests.quant.test_quant_mxfp4 import torch_dynamic_mxfp4_quant
 

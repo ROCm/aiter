@@ -15,7 +15,7 @@ from aiter.ops.triton.attention.mha_v3 import (
     flash_attn_varlen_func,
     flash_attn_with_kvcache,
 )
-from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton.utils.arch_info import get_arch
 from aiter.test_mha_common import (
     attention_ref as _mha_common_attention_ref,
 )

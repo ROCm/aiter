@@ -11,7 +11,7 @@ from aiter.ops.triton.moe.moe_routing.routing import (
     routing_torch,
 )
 from aiter.ops.triton.moe.moe_routing.topk import grouped_topk, topk
-from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton.utils.arch_info import get_arch
 
 
 def _routing_block_m(n_tokens, n_expts_act, n_expts_tot):
