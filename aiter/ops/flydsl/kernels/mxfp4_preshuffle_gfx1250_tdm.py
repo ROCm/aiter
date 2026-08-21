@@ -21,7 +21,6 @@ from .gemm_common_gfx1250 import (
     fused_silu_swiglu_elem,
     fused_situv2_elem,
     make_lds_copy_ops,
-    make_sgpr_opaque,
     pipeline_fence,
     situv2_consts,
     workgroup_barrier,
@@ -340,31 +339,6 @@ def launch_gemm_a8w4_tdm(
 
         def buf_ptr(s):
             return base_ptr + s * PITCH
-
-        def buf_ptr_opaque(s):
-            """``buf_ptr(s)`` as an index the backend cannot constant-fold.
-
-            In the constexpr-unrolled drain tail ``s`` is a literal and
-            ``base_ptr`` is LDS offset 0, so the stage base is a constant and the
-            backend re-associates ``(base + lane) + off`` into ``(base + off) +
-            lane``: one v_add and one depctr wait per ds_load instead of one
-            shared base register plus 16-bit ``offset:`` immediates. Hiding the
-            base restores the shape the rolled loop gets for free -- 63 address
-            registers down to 12, matching the main loop's 8.
-
-            Only ever apply this to the *carry target*. Making the buffer a tile
-            computes from opaque returns wrong results (logits_diff 0.039 against
-            0.001 with random activations); the cause is not understood, and
-            neither a matching "=s,0" constraint nor a real s_mov_b32 body
-            changes it. Note --const-init 0 hides this: zero activations make a
-            wrong LDS address read zeros, so it must be checked on random data.
-            """
-            return fx.index_cast(
-                T.index,
-                fx.Int32(
-                    make_sgpr_opaque(fx.index_cast(T.i32, ptr_to_idx(buf_ptr(s))))
-                ),
-            )
 
         def global_view(base, off, shape, stride):
             return fx.Tensor(fx.make_view(base + off, fx.make_layout(shape, stride)))
@@ -1043,10 +1017,8 @@ def launch_gemm_a8w4_tdm(
                         # rowmap inside a carry's tensor_wait window, so the wait
                         # would block on it instead of overlapping it.
                         fx.copy(_rm_atom, _rm_gt, _rm_dst)
-                    # Carry target only -- see buf_ptr_opaque; ``buf`` itself
-                    # must stay foldable or the tile reads wrong LDS.
                     next_stage_buf = (
-                        buf_ptr_opaque((kt + 1) % num_buffers)
+                        ptr_to_idx(buf_ptr((kt + 1) % num_buffers))
                         if const_expr(has_next)
                         else None
                     )
