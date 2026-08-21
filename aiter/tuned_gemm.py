@@ -277,6 +277,7 @@ def gen_gemm_a16w16_fake_tensor(
     scale_a: Tensor | None = None,
     scale_b: Tensor | None = None,
     scale_c: Tensor | None = None,
+    bpreshuffle: bool | None = None,
 ) -> Tensor:
     return torch.empty(
         *A.shape[:-1],
@@ -295,10 +296,18 @@ def gemm_a16w16(
     scale_a: Tensor | None = None,
     scale_b: Tensor | None = None,
     scale_c: Tensor | None = None,
+    # Layout of B. None infers it from the `is_shuffled` attribute that
+    # shuffle_weight() leaves on its result. That attribute is only attached to
+    # that Python object, not managed or propagated by PyTorch's TensorImpl or
+    # dispatcher, so clone() / to() / nn.Parameter() drop it and B would then be
+    # read back with the wrong layout. Pass it explicitly if B was copied.
+    bpreshuffle: bool | None = None,
 ) -> Tensor:
-    bpreshuffle = False
-    if hasattr(B, "is_shuffled") and B.is_shuffled is True:
-        bpreshuffle = True
+    bpreshuffle = (
+        bool(getattr(B, "is_shuffled", False))
+        if bpreshuffle is None
+        else bool(bpreshuffle)
+    )
     if A.dim() >= 3:
         try:
             inp_view = A.view(-1, A.size(-1))
@@ -646,6 +655,7 @@ class TunedGemm:
         scale_a: Tensor | None = None,
         scale_b: Tensor | None = None,
         scale_c: Tensor | None = None,
+        bpreshuffle: bool | None = None,
     ):
 
         out = gemm_a16w16(
@@ -656,6 +666,7 @@ class TunedGemm:
             scale_a=scale_a,
             scale_b=scale_b,
             scale_c=scale_c,
+            bpreshuffle=bpreshuffle,
         )
         return out
 
