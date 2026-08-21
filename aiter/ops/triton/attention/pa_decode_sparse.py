@@ -637,7 +637,7 @@ def _pa_decode_sparse_gfx950_gluon(
         avg_main = indices.numel() / max(1, num_queries)
         avg_extra = extra_indices.numel() / max(1, num_queries) if has_extra else 0.0
 
-    # Kernel-side cache-format tags (kernel shared with sparse_mla_decode.py).
+    # Kernel-side cache-format tags (kernel shared with sparse_mla.py).
     if UNIFORM:
         main_fmt = "uniform" if main_is_fp8 else "bf16"
         extra_fmt = main_fmt

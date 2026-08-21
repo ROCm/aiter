@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Tests for ``sparse_mla_decode_fwd`` (gfx950 gluon, separated-rope MLA).
+"""Tests for ``sparse_mla_fwd`` (gfx950 gluon, separated-rope MLA).
 
 Target-oriented: the production formats (bf16 and flat per-tensor fp8) get the
-shape matrix; fp8_ds_mla gets a single smoke case. Index streams are uniform or
-ragged with no -1 sentinels, matching what vLLM's converter emits.
+shape matrix, in both dot precisions and at decode and prefill launch shapes;
+fp8_ds_mla gets a single smoke case. Index streams are uniform or ragged with no
+-1 sentinels, matching what vLLM's converter emits.
 """
 
 import pytest
@@ -14,8 +15,8 @@ import torch
 from aiter.ops.triton.utils._triton import arch_info
 
 if arch_info.get_arch() == "gfx950":
-    import aiter.ops.triton.attention.sparse_mla_decode as smd
-    from aiter.ops.triton.attention.sparse_mla_decode import sparse_mla_decode_fwd
+    import aiter.ops.triton.attention.sparse_mla as smd
+    from aiter.ops.triton.attention.sparse_mla import sparse_mla_fwd
 
 FP8_MAX = 448.0
 KV_LORA, ROPE = 512, 64
@@ -24,7 +25,7 @@ D_QK = KV_LORA + ROPE
 
 def _skip_unless_gfx950():
     if arch_info.get_arch() != "gfx950":
-        pytest.skip("sparse_mla_decode_fwd is gfx950-only")
+        pytest.skip("sparse_mla_fwd is gfx950-only")
 
 
 def quantize_flat_fp8(kv):
@@ -113,19 +114,31 @@ def _run_and_check(fmt, C, H, topk, ragged, tol=2e-2, pool=1 << 16, **kwargs):
     sm = D_QK**-0.5
     q, cache, ks, idx, ptr, truth = _build(fmt, C, H, topk, pool, ragged)
     ref = reference(q, truth.to(torch.bfloat16), idx, ptr, sm)
-    out = sparse_mla_decode_fwd(q, cache, ptr, idx, sm, kv_scale=ks, **kwargs)
+    out = sparse_mla_fwd(q, cache, ptr, idx, sm, kv_scale=ks, **kwargs)
     e = rel_err(out, ref)
     assert e < tol, f"{fmt} C={C} H={H} topk={topk} ragged={ragged}: rel-err {e:.3e}"
 
 
-@pytest.mark.parametrize("fmt", ["bf16", "tensor"])
+@pytest.mark.parametrize(
+    "fmt,dots,tol",
+    [("bf16", "bf16", 2e-2), ("tensor", "bf16", 2e-2), ("tensor", "fp8", 7e-2)],
+    ids=["bf16", "tensor", "tensor_fp8"],
+)
 @pytest.mark.parametrize("H", [8, 16])
 @pytest.mark.parametrize(
-    "topk,ragged", [(2048, False), (500, True)], ids=["topk2048", "ragged500"]
+    "C,topk,ragged,pool",
+    [(8, 2048, False, 1 << 16), (8, 500, True, 1 << 16), (2048, 256, True, 1 << 13)],
+    ids=["topk2048", "ragged500", "prefill"],
 )
-def test_sparse_mla_decode(fmt, H, topk, ragged):
+def test_sparse_mla(fmt, dots, tol, H, C, topk, ragged, pool):
+    """The prefill row is the same operator vLLM runs for prefill: one program per
+    query token over its own ragged prefix, so the launch is sized by the grid
+    rather than by split-K, and the launcher picks a different tile for it. fp8
+    dots get a looser tolerance because q and p both round-trip through e4m3.
+    """
     _skip_unless_gfx950()
-    _run_and_check(fmt, C=8, H=H, topk=topk, ragged=ragged)
+    _run_and_check(fmt, C=C, H=H, topk=topk, ragged=ragged, pool=pool, tol=tol,
+                   dot_precision=dots)
 
 
 def test_ds_mla_format():
@@ -134,10 +147,12 @@ def test_ds_mla_format():
 
 
 @pytest.mark.parametrize("kv_splits", [1, None], ids=["splits1", "splitsauto"])
-def test_split_k(kv_splits):
+@pytest.mark.parametrize("dots", ["bf16", "fp8"])
+def test_split_k(kv_splits, dots):
     _skip_unless_gfx950()
-    _run_and_check("tensor", C=4, H=16, topk=2048, ragged=False,
-                   pool=1 << 15, kv_splits=kv_splits)
+    _run_and_check("tensor", C=4, H=16, topk=2048, ragged=False, pool=1 << 15,
+                   tol=7e-2 if dots == "fp8" else 2e-2,
+                   kv_splits=kv_splits, dot_precision=dots)
 
 
 def test_per_tensor_scale_folding_bitwise():
@@ -152,8 +167,8 @@ def test_per_tensor_scale_folding_bitwise():
     ks = torch.ones(1, dtype=torch.float32, device="cuda")
     q = torch.randn(C, H, D_QK, dtype=torch.bfloat16, device="cuda") * 0.125
     idx, ptr = make_indices(C, pool, topk, "cuda", 11, ragged=True)
-    o_t = sparse_mla_decode_fwd(q, exact.view(torch.uint8), ptr, idx, sm, kv_scale=ks)
-    o_b = sparse_mla_decode_fwd(q, exact.to(torch.bfloat16), ptr, idx, sm)
+    o_t = sparse_mla_fwd(q, exact.view(torch.uint8), ptr, idx, sm, kv_scale=ks)
+    o_b = sparse_mla_fwd(q, exact.to(torch.bfloat16), ptr, idx, sm)
     assert torch.equal(o_t.view(torch.int16), o_b.view(torch.int16))
 
 
@@ -164,11 +179,11 @@ def test_vllm_cache_shapes():
     C, pool, topk = 4, 1 << 14, 512
     sm = D_QK**-0.5
     q, cache, ks, idx, ptr, _ = _build("tensor", C, 16, topk, pool, ragged=False)
-    o_flat = sparse_mla_decode_fwd(q, cache, ptr, idx, sm, kv_scale=ks)
-    o_4d = sparse_mla_decode_fwd(
+    o_flat = sparse_mla_fwd(q, cache, ptr, idx, sm, kv_scale=ks)
+    o_4d = sparse_mla_fwd(
         q, cache.view(pool, 1, 1, D_QK), ptr, idx, sm, kv_scale=ks
     )
-    o_paged = sparse_mla_decode_fwd(
+    o_paged = sparse_mla_fwd(
         q, cache.view(pool // 64, 64, D_QK), ptr, idx, sm, kv_scale=ks
     )
     assert torch.equal(o_flat, o_4d) and torch.equal(o_flat, o_paged)

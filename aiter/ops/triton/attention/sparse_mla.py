@@ -1,8 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Sparse MLA decode (gfx950 gluon): ``kv_lora_rank`` latent + appended
+"""Sparse MLA attention (gfx950 gluon): ``kv_lora_rank`` latent + appended
 decoupled rope, token-granular top-k gather.
+
+Prefill and decode are the same MQA operator on this path, one program per query
+token over that token's own gathered KV, so this serves both phases; the launcher
+picks the tile from what the grid supplies.
 
 Separated-rope sibling of ``pa_decode_sparse`` — both drive the same gluon
 kernel, but the calling structures differ enough to warrant separate APIs:
@@ -113,17 +117,7 @@ def _infer_cache_format(kv, d_qk, kv_lora_rank, qk_rope_head_dim, kv_scale):
 def _mla_num_splits(num_queries: int, heads_blocks: int, avg_topk: float) -> int:
     """Split-K count for the sparse-MLA decode.
 
-    Separate from the DSv4 policy in _decode_num_splits_occ, which is tuned for a
-    two-segment SWA + top-k launch and over-splits here: at C=1 topk=2048 it asks
-    for one split per tile, so 32 programs each pay the full prologue and the
-    reduce walks 32 partials, costing 1.23-1.28x.
-
-    Below one workgroup per CU, split to fill the machine but never past 8. Past
-    that, splits stop buying parallelism and start paying prologue and reduce
-    traffic; 8 is optimal or within 10% everywhere measured. At or above one
-    workgroup per CU the launch is already full, so a split only buys the second
-    occupancy slot and needs ~16 tiles to earn its extra partial round trip. At
-    C=256 that decides one split versus two, and topk=512 wants none.
+    Below one workgroup per CU, split to fill the machine but never past 8.
     """
     num_sms = get_num_sms()
     base_wg = max(1, num_queries * heads_blocks)
@@ -132,6 +126,51 @@ def _mla_num_splits(num_queries: int, heads_blocks: int, avg_topk: float) -> int
     if base_wg >= num_sms:
         return max(1, min(cta_cap, tiles // 16))
     return max(1, min(cta_cap, tiles, 8))
+
+
+# Direct-to-LDS tile pipeline; wins wherever the launch gives a CU more than one
+# workgroup to hide the copy behind.
+_ASYNC_LDS_DEFAULT = True
+_ASYNC_ROPE_VEC = 16    # bytes/lane in the rope copy
+
+
+def _async_launch_config(
+    fp8_dots: bool,
+    has_invalid: bool,
+    num_queries: int,
+    heads_blocks: int,
+    num_splits: int,
+    avg_topk: float,
+    use_buffer_load: bool,
+    uni_tile: bool = True,
+    has_extra: bool = False,
+) -> tuple[bool, int, int]:
+    """-> (ASYNC_LDS, BLOCK_K, waves_per_eu) for this launch.
+
+    BLOCK_K follows what the grid supplies, not the token count: given enough
+    workgroups to fill four waves/SIMD (prefill) the small tile takes that
+    occupancy; otherwise (decode, where split-K caps the grid near two
+    workgroups/CU) the large tile wins instead, by halving the cross-warp softmax
+    exchange rate per token. Keying on tokens-per-program misclassifies
+    high-concurrency decode, where the split policy backs off to a couple of splits.
+
+    Async is weakest at exactly one workgroup per CU, having then neither a second
+    workgroup to hide the copy nor the register path's in-wave prefetch; it stays on
+    because the surrounding shapes are parity.
+    """
+    enabled = _ASYNC_LDS_DEFAULT
+    # The kernel static_asserts these; fall back rather than fail to trace. fp8 dots
+    # because the DMA can only deliver the cache's own code points; the rest because
+    # the async body has no masked variant and no per-tile validity vector.
+    enabled = enabled and fp8_dots and uni_tile and not has_invalid and not has_extra
+    workgroups = num_queries * heads_blocks * max(1, num_splits)
+    num_sms = get_num_sms()
+    if enabled and workgroups >= 4 * num_sms:
+        return True, 64, 4
+    waves_per_eu = 2
+    if use_buffer_load and workgroups <= num_sms:
+        waves_per_eu = 1
+    return enabled, (128 if enabled else _BLOCK_K), waves_per_eu
 
 
 _E4M3_MAX = 448.0
@@ -153,38 +192,21 @@ def _resolve_dot_precision(dot_precision: str, fmt: str, fp8_fnuz: bool) -> bool
         return False
     if fmt == "dsmla":
         raise ValueError(
-            "dot_precision='fp8' does not support the fp8_ds_mla cache. Its "
-            "scale varies per 128 elements along the head dim, the QK "
-            "contraction axis, so it cannot fold outside the tile loop, and "
-            "scaled MFMA cannot express the PV side either (one scale per 32 "
-            "contraction elements, where this needs one per token). "
+            "dot_precision='fp8' does not support the fp8_ds_mla cache."
             "Use dot_precision='bf16'."
         )
     if fmt == "bf16":
         raise ValueError(
-            "dot_precision='fp8' needs an fp8 cache; this one is bf16, and "
-            "quantizing the pool per call would cost more than the dots save."
+            "dot_precision='fp8' needs an fp8 cache."
         )
     if fp8_fnuz:
         raise ValueError(
-            "dot_precision='fp8' is OCP e4m3 only; this cache is fnuz, a "
-            "different encoding from what the matrix core reads."
+            "dot_precision='fp8' is OCP e4m3 only."
         )
     return True
 
 
-def _lds_pad_for(fp8_dots: bool) -> int:
-    """kv_smem row padding, in elements of the staged type.
-
-    The pad shifts which banks a transposed K read lands on, which is a byte
-    property, so an fp8 plane needs twice the elements to move the row pitch by
-    the same bytes. Carrying bf16's value over to fp8 costs 1.08x at C=64
-    topk=2048; 16, 32 and 64 all land at 0.86-0.89x.
-    """
-    return _LDS_PAD * 2 if fp8_dots else _LDS_PAD
-
-
-def sparse_mla_decode_fwd(
+def sparse_mla_fwd(
     q: torch.Tensor,
     kv_buffer: torch.Tensor,
     kv_indptr: torch.Tensor,
@@ -200,10 +222,11 @@ def sparse_mla_decode_fwd(
     q_scale: torch.Tensor | None = None,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Sparse (top-k gathered) MLA decode, separated-rope geometry.
+    """Sparse (top-k gathered) MLA attention, separated-rope geometry.
 
     Args:
-        q: ``[C, H, kv_lora_rank + qk_rope_head_dim]`` bf16 decode queries.
+        q: ``[C, H, kv_lora_rank + qk_rope_head_dim]`` queries, one row per
+            query token (prefill and decode alike).
         kv_buffer: the KV pool — ``[nb, block, R]`` / ``[slots, 1, 1, R]`` /
             ``[slots, R]`` in bf16, the same shapes in fp8 (+ scalar
             ``kv_scale``), or ``[nb, block, 656]`` uint8 (vLLM ``fp8_ds_mla``).
@@ -216,16 +239,13 @@ def sparse_mla_decode_fwd(
         skip_reduce: with split-K active, return ``(part_acc, part_m, part_l)``
             instead of launching the combine.
         has_invalid: index stream carries -1 sentinels (masked out). Default
-            False: vLLM's index converter emits none (it maps -1 to slot 0).
+            False.
         dot_precision: what the QK and PV matrix-core ops run in.
 
             "bf16" (default): the KV tile is dequantized to bf16 on its way
                 into LDS and both dots are bf16. Works with every cache format.
             "fp8": the cache's own code points go to the fp8 matrix core with no
                 dequant, and the per-tensor scale folds outside the tile loop.
-                0.75-0.96x of "bf16", but q and p both round-trip through e4m3,
-                so accuracy lands at roughly the asm kernel's level. Needs the
-                flat per-tensor OCP fp8 cache; see _resolve_dot_precision.
 
             q is adapted to the choice. bf16 q is quantized here when "fp8" is
             asked for, fp8 q is passed straight through, and fp8 q under "bf16"
@@ -242,7 +262,7 @@ def sparse_mla_decode_fwd(
         ``[C, H, kv_lora_rank]`` bf16 attention output (the latent V).
     """
     assert q.ndim == 3, f"expected q=[b,h,d], got {q.shape}"
-    assert arch_info.get_arch() == "gfx950", "sparse_mla_decode_fwd is gfx950-only"
+    assert arch_info.get_arch() == "gfx950", "sparse_mla_fwd is gfx950-only"
     q_is_fp8 = q.dtype == torch.float8_e4m3fn
     if q.dtype not in (torch.bfloat16, torch.float8_e4m3fn):
         raise ValueError(
@@ -264,7 +284,7 @@ def sparse_mla_decode_fwd(
         f"q last dim {d_qk} != {kv_lora_rank} + {qk_rope_head_dim}"
     )
     _LOGGER.info(
-        f"SPARSE_MLA_DECODE C={num_queries} H={num_heads} d_qk={d_qk} "
+        f"SPARSE_MLA C={num_queries} H={num_heads} d_qk={d_qk} "
         f"nnz={kv_indices.shape[0]}"
     )
 
@@ -354,9 +374,14 @@ def sparse_mla_decode_fwd(
     col_reps = kv_lora_rank // (_GATHER_TW1 * 16)
     chunk_axis = 1 if col_reps >= 4 else 0
     nope_chunk = max(1, _BLOCK_K // 4) if chunk_axis == 0 else min(128, kv_lora_rank)
-    waves_per_eu = 2
-    if use_buffer_load and num_queries * heads_blocks * num_splits <= get_num_sms():
-        waves_per_eu = 1
+    # UNI_TILE / HAS_EXTRA are literals at the launch below; passed so the policy
+    # owns every condition the kernel asserts on.
+    async_lds_on, block_k, waves_per_eu = _async_launch_config(
+        fp8_dots, has_invalid, num_queries, heads_blocks, num_splits, avg_topk,
+        use_buffer_load, uni_tile=True, has_extra=False,
+    )
+    # num_warps stays 4: warps tile the dot's N (MFMA N=16), so a larger BLOCK_K just
+    # gives each warp two N tiles.
 
     grid = (num_queries, num_splits, heads_blocks)
     _pa_decode_sparse_gfx950[grid](
@@ -403,12 +428,12 @@ def sparse_mla_decode_fwd(
         HEAD_SIZE=kv_lora_rank,
         ROPE_SEPARATE=True,
         BLOCK_M=block_m,
-        BLOCK_K=_BLOCK_K,
+        BLOCK_K=block_k,
         NUM_SPLITS=num_splits,
         HEAD_ALIGNED=head_aligned,
         MFMA_K=_MFMA_K,
         GATHER_TW1=_GATHER_TW1,
-        LDS_PAD=_lds_pad_for(fp8_dots),
+        LDS_PAD=(_LDS_PAD * 2 if fp8_dots else _LDS_PAD),
         NOPE_CHUNK=nope_chunk,
         CHUNK_AXIS=chunk_axis,
         PART_STORE_CACHE="",
@@ -423,6 +448,12 @@ def sparse_mla_decode_fwd(
         HAS_INVALID=has_invalid,
         FP8_FNUZ=fp8_fnuz,
         FP8_MFMA=fp8_dots,
+        ASYNC_LDS=async_lds_on,
+        ROPE_VEC=_ASYNC_ROPE_VEC,
+        # A 576 B row is not 128 B aligned: it spans five lines and shares its end
+        # line with its own rope read. ".cg" (sc0 nt) marks that evict-first and
+        # throws the sharing away, so this gather wants a plain cached load.
+        GATHER_CACHE="",
         q_scl_ptr=q_scale,
         Q_FP8=q_is_fp8,
         num_warps=num_warps,

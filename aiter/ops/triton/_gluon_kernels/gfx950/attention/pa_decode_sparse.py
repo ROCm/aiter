@@ -25,7 +25,7 @@ Cache formats (Fmt.KIND), per segment:
 
 Launchers:
 aiter/ops/triton/attention/pa_decode_sparse.py (DSv4 / uniform pool) and
-aiter/ops/triton/attention/sparse_mla_decode.py (separated-rope MLA).
+aiter/ops/triton/attention/sparse_mla.py (separated-rope MLA).
 """
 
 from triton.experimental import gluon
@@ -53,25 +53,31 @@ def _rmax(x, axis):
 
 
 @gluon.jit
-def _cache_load(ptr, row, col, USE_BUFFER_LOAD: gl.constexpr, mask=None, other=None):
+def _cache_load(ptr, row, col, USE_BUFFER_LOAD: gl.constexpr, mask=None, other=None,
+                CACHE: gl.constexpr = ".cg"):
     """Gather rows[i] + col[j]. row is the per-token offset in ptr's element
     units; col a small compile-time arange. Keeping them apart resolves one
     pointer per token on the 64-bit path (the column offset folds into the
-    load's immediate) instead of a 64-bit add per element."""
+    load's immediate) instead of a 64-bit add per element.
+
+    CACHE is the gather's cache policy. ".cg" lowers to `sc0 nt` (evict-first), which
+    is wrong for a KV gather: a 576/584 B row spans five cache lines and shares its end
+    line with the rope read of the same row, so evict-first turns one line fill into
+    two. The MLA launcher passes an empty modifier (a plain cached load) instead."""
     if USE_BUFFER_LOAD:
         return gl.amd.cdna4.buffer_load(
             ptr=ptr,
             offsets=row.to(gl.int32)[:, None] + col.to(gl.int32)[None, :],
             mask=mask,
             other=other,
-            cache=".cg",
+            cache=CACHE,
         )
     row_ptr = ptr + row.to(gl.int64)
     return gl.load(
         row_ptr[:, None] + col[None, :],
         mask=mask,
         other=other,
-        cache_modifier=".cg",
+        cache_modifier=CACHE,
     )
 
 
@@ -240,6 +246,18 @@ class Cfg:
     IDX_BUFFER_LOAD: gl.constexpr
     FP8_MFMA: gl.constexpr    # "tensor" only: feed the matrix core the cache's
                               # own fp8 instead of dequantizing to bf16
+    # Cache policy per load site. The KV gather wants to be cached (its lines are
+    # shared between neighbouring rows and between a row's latent and rope
+    # halves); the index list is read exactly once per program, so it is the
+    # stream that actually wants ".cg" (sc0 nt).
+    GATHER_CACHE: gl.constexpr
+    IDX_CACHE: gl.constexpr
+    # Gather straight into LDS (no register staging). FP8_MFMA only: the bf16 path
+    # stages dequantized values, which pass through registers by definition.
+    # Single-buffered; the launcher decides when it is on.
+    ASYNC_LDS: gl.constexpr
+    RELAXED_LOAD: gl.constexpr   # read LDS with the syncedViaAsyncWait hint
+    ROPE_VEC: gl.constexpr       # bytes per lane in the rope plane's copy
     # operator layouts
     qk_layout: gl.constexpr
     pv_layout: gl.constexpr
@@ -249,6 +267,10 @@ class Cfg:
     v_layout: gl.constexpr
     # memory layouts
     gather_l: gl.constexpr
+    async_l: gl.constexpr
+    async_rope_l: gl.constexpr
+    slot_a_l: gl.constexpr
+    slot_rope_a_l: gl.constexpr
     gather_rope_l: gl.constexpr
     gather16_l: gl.constexpr
     slot_l: gl.constexpr
@@ -273,6 +295,12 @@ class Cfg:
         HEAD_ALIGNED,
         IDX_BUFFER_LOAD,
         FP8_MFMA=False,
+        GATHER_CACHE=".cg",
+        IDX_CACHE="",
+        ASYNC_LDS=False,
+        RELAXED_LOAD=True,
+        ROPE_VEC=16,
+        PAD_INTERVAL=1024,
     ):
         self.BLOCK_M = gl.constexpr(BLOCK_M)
         self.BLOCK_K = gl.constexpr(BLOCK_K)
@@ -288,6 +316,11 @@ class Cfg:
         self.HEAD_ALIGNED = gl.constexpr(HEAD_ALIGNED)
         self.IDX_BUFFER_LOAD = gl.constexpr(IDX_BUFFER_LOAD)
         self.FP8_MFMA = gl.constexpr(FP8_MFMA)
+        self.GATHER_CACHE = gl.constexpr(GATHER_CACHE)
+        self.IDX_CACHE = gl.constexpr(IDX_CACHE)
+        self.ASYNC_LDS = gl.constexpr(ASYNC_LDS)
+        self.RELAXED_LOAD = gl.constexpr(RELAXED_LOAD)
+        self.ROPE_VEC = gl.constexpr(ROPE_VEC)
         # K=32 is the only shape the backend offers for plain fp8 operands, and
         # it divides KV_DIM, ROPE_DIM and BLOCK_K alike, so one layout still
         # covers both dots.
@@ -373,6 +406,47 @@ class Cfg:
                 [[ROPE_DIM, LDS_PAD]], [BLOCK_K, ROPE_DIM], [1, 0]
             )
         )
+
+        # LDS-DMA takes one local address per warp (lane i writes warp_base +
+        # i*VEC), so the source layout must map lane i to LDS offset i*VEC: that
+        # pins threads_per_warp and makes a warp cover 64*VEC contiguous bytes.
+        # Padding therefore cannot sit inside a row; the interval must be a multiple
+        # of the warp's run so a pad only shifts whole runs.
+        AVEC = 16               # 128-bit LDS-DMA
+        ATW = KV_DIM // AVEC
+        self.async_l = gl.constexpr(
+            gl.BlockedLayout(
+                size_per_thread=[1, AVEC],
+                threads_per_warp=[64 // ATW, ATW],
+                warps_per_cta=[NUM_WARPS, 1],
+                order=[1, 0],
+            )
+        )
+        RTW = ROPE_DIM // ROPE_VEC
+        self.async_rope_l = gl.constexpr(
+            gl.BlockedLayout(
+                size_per_thread=[1, ROPE_VEC],
+                threads_per_warp=[64 // RTW, RTW],
+                warps_per_cta=[NUM_WARPS, 1],
+                order=[1, 0],
+            )
+        )
+        self.slot_a_l = gl.constexpr(gl.SliceLayout(1, self.async_l.value))
+        self.slot_rope_a_l = gl.constexpr(
+            gl.SliceLayout(1, self.async_rope_l.value)
+        )
+        if ASYNC_LDS:
+            self.kv_shared = gl.constexpr(
+                gl.PaddedSharedLayout.with_identity_for(
+                    [[PAD_INTERVAL, LDS_PAD]], [BLOCK_K, KV_DIM], [1, 0]
+                )
+            )
+            # 64 * ROPE_VEC is this plane's warp run: the smallest legal interval.
+            self.rope_shared = gl.constexpr(
+                gl.PaddedSharedLayout.with_identity_for(
+                    [[64 * ROPE_VEC, LDS_PAD]], [BLOCK_K, ROPE_DIM], [1, 0]
+                )
+            )
 
 
 @aggregate
@@ -620,19 +694,23 @@ def _slots(
         in_range = k_pos < hi
         if IDX_BUFFER_LOAD:
             slot = gl.amd.cdna4.buffer_load(
-                ptr=indices_ptr + seg_start, offsets=k_pos, mask=in_range, other=-1
+                ptr=indices_ptr + seg_start, offsets=k_pos, mask=in_range, other=-1,
+                cache=cfg.IDX_CACHE,
             )
         else:
-            slot = gl.load(indices_ptr + seg_start + k_pos, mask=in_range, other=-1)
+            slot = gl.load(indices_ptr + seg_start + k_pos, mask=in_range, other=-1,
+                           cache_modifier=cfg.IDX_CACHE)
         valid = in_range & (slot >= 0) & (slot < num_rows)
         slot = gl.where(valid, slot, 0)
     else:
         # hi >= 1 whenever UNI_TILE runs (guarded by n_full > 0).
         off = gl.minimum(k_pos, hi - 1) if UNI_TILE else k_pos
         if IDX_BUFFER_LOAD:
-            slot = gl.amd.cdna4.buffer_load(ptr=indices_ptr + seg_start, offsets=off)
+            slot = gl.amd.cdna4.buffer_load(ptr=indices_ptr + seg_start, offsets=off,
+                                            cache=cfg.IDX_CACHE)
         else:
-            slot = gl.load(indices_ptr + seg_start + off)
+            slot = gl.load(indices_ptr + seg_start + off,
+                           cache_modifier=cfg.IDX_CACHE)
         valid = (k_pos < hi) if UNI_TILE else (slot >= 0)
         if HAS_INVALID:
             if UNI_TILE:
@@ -645,16 +723,121 @@ def _slots(
 def _qk_scores(cfg, q_dot, q_rope_dot, kv_smem, rope_smem):
     """QK scores for one tile; ROPE_SEPARATE chains a second MFMA over the rope
     plane (MFMA accumulates natively, so KV_DIM + ROPE_DIM is two dots)."""
-    k = kv_smem.permute([1, 0]).load(cfg.k_layout)  # [KV_DIM, BLOCK_K]
+    if cfg.ASYNC_LDS and cfg.RELAXED_LOAD:
+        # the async_wait already ordered the copy; stops the backend re-inserting
+        # a conservative vmcnt(0) before every LDS read
+        k = gl.amd.cdna4.async_copy.load_shared_relaxed(
+            kv_smem.permute([1, 0]), cfg.k_layout
+        )
+    else:
+        k = kv_smem.permute([1, 0]).load(cfg.k_layout)  # [KV_DIM, BLOCK_K]
+    if cfg.ASYNC_LDS:
+        k = k.to(gl.float8e4nv, bitcast=True)   # raw cache bytes; layout-preserving
     S = gl.amd.cdna4.mfma(
         q_dot,
         k,
         gl.zeros([cfg.BLOCK_M, cfg.BLOCK_K], gl.float32, layout=cfg.qk_layout),
     )
     if cfg.ROPE_SEPARATE:
-        k_rope = rope_smem.permute([1, 0]).load(cfg.k_layout)  # [ROPE_DIM, BLOCK_K]
+        if cfg.ASYNC_LDS and cfg.RELAXED_LOAD:
+            k_rope = gl.amd.cdna4.async_copy.load_shared_relaxed(
+                rope_smem.permute([1, 0]), cfg.k_layout
+            )
+        else:
+            k_rope = rope_smem.permute([1, 0]).load(cfg.k_layout)
+        if cfg.ASYNC_LDS:
+            k_rope = k_rope.to(gl.float8e4nv, bitcast=True)
         S = gl.amd.cdna4.mfma(q_rope_dot, k_rope, S)
     return S
+
+
+@gluon.jit
+def _tile_rows(cfg, seg, k_start, seg_hi, k_rng, ROPE: gl.constexpr):
+    """Per-token row offsets for one tile, in k_rng's layout. Clamped like UNI_TILE
+    (the score mask kills the duplicate), so an over-fetched tile is addressable."""
+    fmt = seg.fmt
+    cs0 = seg.cs0
+    if not fmt.USE_BUFFER_LOAD:
+        cs0 = cs0.to(gl.int64)  # >2 GB cache: 64-bit gather offsets
+    bg, pg, _ = _slots(cfg, seg, k_start + k_rng, seg_hi, 0, False, cfg.UNI_TILE)
+    row = bg * cs0 + pg * fmt.TOK_EL
+    if ROPE:
+        row = row + cfg.KV_DIM
+    return row
+
+
+@gluon.jit
+def _copy_plane(seg, dst, row, col, USE_BUFFER_LOAD: gl.constexpr,
+                CACHE: gl.constexpr):
+    """One plane of one tile, global -> LDS, no register staging."""
+    if USE_BUFFER_LOAD:
+        gl.amd.cdna4.async_copy.buffer_load_to_shared(
+            dst,
+            seg.cache_ptr,
+            row.to(gl.int32)[:, None] + col.to(gl.int32)[None, :],
+            cache_modifier=CACHE,
+        )
+    else:
+        row_ptr = seg.cache_ptr + row.to(gl.int64)
+        gl.amd.cdna4.async_copy.global_load_to_shared(
+            dst, row_ptr[:, None] + col[None, :], cache_modifier=CACHE
+        )
+
+
+@gluon.jit
+def _copy_tile(cfg, seg, kv_smem, rope_smem, row_l, row_r, offs_l, offs_r):
+    """One commit group = one tile (both planes), so wait_group counts tiles."""
+    _copy_plane(seg, kv_smem, row_l, offs_l, seg.fmt.USE_BUFFER_LOAD,
+                cfg.GATHER_CACHE)
+    if cfg.ROPE_SEPARATE:
+        _copy_plane(seg, rope_smem, row_r, offs_r, seg.fmt.USE_BUFFER_LOAD,
+                    cfg.GATHER_CACHE)
+    gl.amd.cdna4.async_copy.commit_group()
+
+
+@gluon.jit
+def _async_segment(
+    cfg,
+    seg,
+    q_dot,
+    q_rope_dot,
+    lo,
+    hi,
+    m_i,
+    l_i,
+    acc,
+    head_mask,
+    qk_scale,
+    v_scale,
+    kv_smem,
+    rope_smem,
+):
+    """Direct-to-LDS tile walk, one LDS buffer.
+
+    vmcnt is one in-order FIFO, so the wait goes before any plain load in the body: a
+    plain load outstanding past the newest copy group would drag `wait_group` into
+    waiting for that copy too. The body has no masked variant: the slot read is
+    clamped and the partial tail falls out of the score mask (UNI_TILE).
+    """
+    BK: gl.constexpr = cfg.BLOCK_K
+    offs_l = gl.arange(0, cfg.KV_DIM, layout=gl.SliceLayout(0, cfg.async_l))
+    offs_r = gl.arange(0, cfg.ROPE_DIM, layout=gl.SliceLayout(0, cfg.async_rope_l))
+    rng_l = gl.arange(0, BK, layout=cfg.slot_a_l)
+    rng_r = gl.arange(0, BK, layout=cfg.slot_rope_a_l)
+    n_full = (hi - lo + BK - 1) // BK
+    for i in range(n_full):
+        _copy_tile(
+            cfg, seg, kv_smem, rope_smem,
+            _tile_rows(cfg, seg, lo + i * BK, hi, rng_l, False),
+            _tile_rows(cfg, seg, lo + i * BK, hi, rng_r, True),
+            offs_l, offs_r,
+        )
+        gl.amd.cdna4.async_copy.wait_group(0)
+        m_i, l_i, acc = _qkpv_lds(
+            cfg, seg, None, q_dot, q_rope_dot, m_i, l_i, acc, head_mask,
+            qk_scale, v_scale, kv_smem, rope_smem, lo + i * BK, hi,
+        )
+    return m_i, l_i, acc
 
 
 # ---------------------------------------------------------------------------
@@ -705,7 +888,8 @@ def _gather_full(
         # Per-tensor scale is folded outside the loop (qk_scale / p), so this
         # is a bare gather; the K-only rope tail follows when separated.
         x_u8 = _cache_load(
-            seg.cache_ptr, bg * cs0 + pg * fmt.TOK_EL, offs_full, fmt.USE_BUFFER_LOAD
+            seg.cache_ptr, bg * cs0 + pg * fmt.TOK_EL, offs_full,
+            fmt.USE_BUFFER_LOAD, CACHE=cfg.GATHER_CACHE,
         )
         sc = x_u8  # no scale vector -> DCE'd
         if cfg.ROPE_SEPARATE:
@@ -723,6 +907,7 @@ def _gather_full(
                 bgr * cs0 + pgr * fmt.TOK_EL + cfg.KV_DIM,
                 offs_rope,
                 fmt.USE_BUFFER_LOAD,
+                CACHE=cfg.GATHER_CACHE,
             )
         else:
             k_rope = x_u8  # rope lives inside plane 0 -> DCE'd
@@ -848,8 +1033,33 @@ def _qkpv(
     seg_hi=0,
 ):
     """Stage a prefetched fp8 tile into LDS, then QK -> softmax -> PV."""
-    neg_inf = float("-inf")
     _stage(cfg, seg, x_u8, sc, k_rope, kv_smem, rope_smem)
+    return _qkpv_lds(
+        cfg, seg, valid, q_dot, q_rope_dot, m_i, l_i, acc, head_mask,
+        qk_scale, v_scale, kv_smem, rope_smem, k_start, seg_hi,
+    )
+
+
+@gluon.jit
+def _qkpv_lds(
+    cfg,
+    seg,
+    valid,
+    q_dot,
+    q_rope_dot,
+    m_i,
+    l_i,
+    acc,
+    head_mask,
+    qk_scale,
+    v_scale,
+    kv_smem,
+    rope_smem,
+    k_start=0,
+    seg_hi=0,
+):
+    """QK -> softmax -> PV over a tile already resident in LDS."""
+    neg_inf = float("-inf")
     S = _qk_scores(cfg, q_dot, q_rope_dot, kv_smem, rope_smem)
     # UNI_TILE folds the tile's range test into the score mask, which is what
     # makes the partial last tile correct without a peeled masked body.
@@ -892,15 +1102,17 @@ def _qkpv(
     p = gl.exp2(S * qk_scale - m_new[:, None])
     alpha = gl.exp2(m_i - m_new)
     l_new = l_i * alpha + gl.sum(p, axis=1)
-    v = kv_smem.load(cfg.v_layout)
+    if cfg.ASYNC_LDS and cfg.RELAXED_LOAD:
+        v = gl.amd.cdna4.async_copy.load_shared_relaxed(kv_smem, cfg.v_layout)
+    else:
+        v = kv_smem.load(cfg.v_layout)
+    if cfg.ASYNC_LDS:
+        v = v.to(gl.float8e4nv, bitcast=True)
     # "tensor": V was staged as raw fp8 code points; apply the per-tensor scale
     # on the small side (p) and leave l scale-free: out = sum(p*s*V)/l exactly.
     if seg.fmt.KIND == "tensor" and not cfg.FP8_MFMA:
         p = p * v_scale
     if cfg.FP8_MFMA:
-        # p goes to e4m3 as it is. Pre-scaling it by a power of two to lift the
-        # small end out of e4m3's subnormals is worth nothing: the error is set
-        # by the p values near 1, and 1 / 16 / 256 agree to three digits.
         p_dot = gl.convert_layout(p.to(gl.float8e4nv), cfg.p_layout)
     else:
         p_dot = gl.convert_layout(p.to(gl.bfloat16), cfg.p_layout)
@@ -1375,6 +1587,13 @@ def _pa_decode_sparse(
     # mla_decode_fwd uses, where vLLM passes layer._q_scale.
     q_scl_ptr=None,
     Q_FP8: gl.constexpr = False,
+    # Defaults keep every existing launch byte-identical; the MLA launcher opts in.
+    GATHER_CACHE: gl.constexpr = ".cg",
+    IDX_CACHE: gl.constexpr = "",
+    ASYNC_LDS: gl.constexpr = False,
+    RELAXED_LOAD: gl.constexpr = True,
+    ROPE_VEC: gl.constexpr = 16,
+    PAD_INTERVAL: gl.constexpr = 1024,
 ):
     """One program = (query, split, head-block). Two-loop: main (SWA) then
     extra (top-k). NUM_SPLITS==1 writes the output directly; otherwise stores
@@ -1406,6 +1625,13 @@ def _pa_decode_sparse(
         "FP8_MFMA requires the per-tensor fp8 format on every segment",
     )
     gl.static_assert(not (FP8_MFMA and FP8_FNUZ), "FP8_MFMA is OCP e4m3 only")
+    # The direct-to-LDS path stages raw code points, needs the clamped (branch-free)
+    # tail, and carries no per-tile validity vector.
+    gl.static_assert(
+        (not ASYNC_LDS) or (FP8_MFMA and UNI_TILE and not HAS_INVALID
+                            and not HAS_EXTRA),
+        "ASYNC_LDS requires FP8_MFMA + UNI_TILE, no -1 sentinels, one segment",
+    )
     gl.static_assert(
         not (FP8_MFMA and HAS_EXTRA),
         "FP8_MFMA defers the V-side scale to the epilogue, so it needs one segment",
@@ -1436,6 +1662,12 @@ def _pa_decode_sparse(
         HEAD_ALIGNED,
         IDX_BUFFER_LOAD,
         FP8_MFMA,
+        GATHER_CACHE,
+        IDX_CACHE,
+        ASYNC_LDS,
+        RELAXED_LOAD,
+        ROPE_VEC,
+        PAD_INTERVAL,
     )
     main_fmt = Fmt(
         cfg,
@@ -1577,12 +1809,15 @@ def _pa_decode_sparse(
 
     # An fp8 plane is half the bytes of the bf16 staging it replaces.
     SMEM_DT: gl.constexpr = gl.float8e4nv if FP8_MFMA else gl.bfloat16
+    # The LDS-DMA converts nothing, so an async plane's element type has to be the
+    # cache's own u8; the dot operands bitcast on read (free, layout-preserving).
+    PLANE_DT: gl.constexpr = gl.uint8 if ASYNC_LDS else SMEM_DT
     kv_smem = gl.allocate_shared_memory(
-        SMEM_DT, [BLOCK_K, HEAD_SIZE], cfg.kv_shared
+        PLANE_DT, [BLOCK_K, HEAD_SIZE], cfg.kv_shared
     )
     if ROPE_SEPARATE:
         rope_smem = gl.allocate_shared_memory(
-            SMEM_DT, [BLOCK_K, ROPE_DIM], cfg.rope_shared
+            PLANE_DT, [BLOCK_K, ROPE_DIM], cfg.rope_shared
         )
     else:
         rope_smem = kv_smem  # never read as plane 1 in this geometry
@@ -1637,22 +1872,40 @@ def _pa_decode_sparse(
     main_chunk = (main_len + main_splits - 1) // main_splits
     main_lo = gl.minimum(split_id * main_chunk, main_len)
     main_hi = gl.minimum(main_lo + main_chunk, main_len)
-    m_i, l_i, acc = _process_segment(
-        cfg,
-        main_seg,
-        q_dot,
-        q_rope_dot,
-        main_lo,
-        main_hi,
-        m_i,
-        l_i,
-        acc,
-        head_mask_pv,
-        main_qk_scale,
-        main_v_scale,
-        kv_smem,
-        rope_smem,
-    )
+    if ASYNC_LDS:
+        m_i, l_i, acc = _async_segment(
+            cfg,
+            main_seg,
+            q_dot,
+            q_rope_dot,
+            main_lo,
+            main_hi,
+            m_i,
+            l_i,
+            acc,
+            head_mask_pv,
+            main_qk_scale,
+            main_v_scale,
+            kv_smem,
+            rope_smem,
+        )
+    else:
+        m_i, l_i, acc = _process_segment(
+            cfg,
+            main_seg,
+            q_dot,
+            q_rope_dot,
+            main_lo,
+            main_hi,
+            m_i,
+            l_i,
+            acc,
+            head_mask_pv,
+            main_qk_scale,
+            main_v_scale,
+            kv_smem,
+            rope_smem,
+        )
 
     if HAS_EXTRA:
         extra_seg = Seg(
