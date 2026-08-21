@@ -14,7 +14,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x128x128_4x1_16x16x32_0x0x0_c1x1_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x128x128_4x1_16x16x32_0x0x0_c1x1_p3_v1024w1.s"
       },
-      "asm_lines": 3447,
+      "asm_lines": 3422,
       "asm_va_vdst0": 16,
       "asm_wmma": 384,
       "asm_wmma_dst_hi": 384,
@@ -28,7 +28,7 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "dis_lines": 2365,
+      "dis_lines": 2332,
       "dis_va_vdst0": 16,
       "dis_wmma": 384,
       "dis_wmma_dst_hi": 384,
@@ -58,7 +58,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x128x128_4x1_16x16x32_0x0x0_c1x2_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x128x128_4x1_16x16x32_0x0x0_c1x2_p3_v1024w1.s"
       },
-      "asm_lines": 3445,
+      "asm_lines": 3420,
       "asm_va_vdst0": 16,
       "asm_wmma": 384,
       "asm_wmma_dst_hi": 384,
@@ -72,7 +72,7 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "dis_lines": 2365,
+      "dis_lines": 2332,
       "dis_va_vdst0": 16,
       "dis_wmma": 384,
       "dis_wmma_dst_hi": 384,
@@ -102,7 +102,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x128x128_4x1_16x16x32_0x0x0_c1x3_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x128x128_4x1_16x16x32_0x0x0_c1x3_p3_v1024w1.s"
       },
-      "asm_lines": 3445,
+      "asm_lines": 3420,
       "asm_va_vdst0": 16,
       "asm_wmma": 384,
       "asm_wmma_dst_hi": 384,
@@ -116,7 +116,7 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "dis_lines": 2365,
+      "dis_lines": 2332,
       "dis_va_vdst0": 16,
       "dis_wmma": 384,
       "dis_wmma_dst_hi": 384,
@@ -146,7 +146,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x128x128_4x1_16x16x32_0x0x0_c1x4_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x128x128_4x1_16x16x32_0x0x0_c1x4_p3_v1024w1.s"
       },
-      "asm_lines": 3445,
+      "asm_lines": 3420,
       "asm_va_vdst0": 16,
       "asm_wmma": 384,
       "asm_wmma_dst_hi": 384,
@@ -160,7 +160,7 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "dis_lines": 2365,
+      "dis_lines": 2332,
       "dis_va_vdst0": 16,
       "dis_wmma": 384,
       "dis_wmma_dst_hi": 384,
@@ -190,7 +190,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x128x128_4x1_16x16x32_0x0x0_c2x1_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x128x128_4x1_16x16x32_0x0x0_c2x1_p3_v1024w1.s"
       },
-      "asm_lines": 3445,
+      "asm_lines": 3420,
       "asm_va_vdst0": 16,
       "asm_wmma": 384,
       "asm_wmma_dst_hi": 384,
@@ -204,7 +204,7 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "dis_lines": 2366,
+      "dis_lines": 2333,
       "dis_va_vdst0": 16,
       "dis_wmma": 384,
       "dis_wmma_dst_hi": 384,
@@ -234,7 +234,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x128x128_4x1_16x16x32_0x0x0_c2x2_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x128x128_4x1_16x16x32_0x0x0_c2x2_p3_v1024w1.s"
       },
-      "asm_lines": 3452,
+      "asm_lines": 3427,
       "asm_va_vdst0": 16,
       "asm_wmma": 384,
       "asm_wmma_dst_hi": 384,
@@ -248,7 +248,7 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "dis_lines": 2365,
+      "dis_lines": 2332,
       "dis_va_vdst0": 16,
       "dis_wmma": 384,
       "dis_wmma_dst_hi": 384,
@@ -278,7 +278,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x128x128_4x1_16x16x32_0x0x0_c2x3_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x128x128_4x1_16x16x32_0x0x0_c2x3_p3_v1024w1.s"
       },
-      "asm_lines": 3452,
+      "asm_lines": 3427,
       "asm_va_vdst0": 16,
       "asm_wmma": 384,
       "asm_wmma_dst_hi": 384,
@@ -292,7 +292,7 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "dis_lines": 2365,
+      "dis_lines": 2332,
       "dis_va_vdst0": 16,
       "dis_wmma": 384,
       "dis_wmma_dst_hi": 384,
@@ -322,7 +322,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x128x128_4x1_16x16x32_0x0x0_c2x4_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x128x128_4x1_16x16x32_0x0x0_c2x4_p3_v1024w1.s"
       },
-      "asm_lines": 3452,
+      "asm_lines": 3427,
       "asm_va_vdst0": 16,
       "asm_wmma": 384,
       "asm_wmma_dst_hi": 384,
@@ -336,7 +336,7 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "dis_lines": 2364,
+      "dis_lines": 2331,
       "dis_va_vdst0": 16,
       "dis_wmma": 384,
       "dis_wmma_dst_hi": 384,
@@ -366,7 +366,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x128x128_4x1_16x16x32_0x0x0_c3x1_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x128x128_4x1_16x16x32_0x0x0_c3x1_p3_v1024w1.s"
       },
-      "asm_lines": 3445,
+      "asm_lines": 3420,
       "asm_va_vdst0": 16,
       "asm_wmma": 384,
       "asm_wmma_dst_hi": 384,
@@ -380,7 +380,7 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "dis_lines": 2366,
+      "dis_lines": 2333,
       "dis_va_vdst0": 16,
       "dis_wmma": 384,
       "dis_wmma_dst_hi": 384,
@@ -410,7 +410,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x128x128_4x1_16x16x32_0x0x0_c3x2_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x128x128_4x1_16x16x32_0x0x0_c3x2_p3_v1024w1.s"
       },
-      "asm_lines": 3452,
+      "asm_lines": 3427,
       "asm_va_vdst0": 16,
       "asm_wmma": 384,
       "asm_wmma_dst_hi": 384,
@@ -424,7 +424,7 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "dis_lines": 2365,
+      "dis_lines": 2332,
       "dis_va_vdst0": 16,
       "dis_wmma": 384,
       "dis_wmma_dst_hi": 384,
@@ -454,7 +454,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x128x128_4x1_16x16x32_0x0x0_c3x3_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x128x128_4x1_16x16x32_0x0x0_c3x3_p3_v1024w1.s"
       },
-      "asm_lines": 3452,
+      "asm_lines": 3427,
       "asm_va_vdst0": 16,
       "asm_wmma": 384,
       "asm_wmma_dst_hi": 384,
@@ -468,7 +468,7 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "dis_lines": 2364,
+      "dis_lines": 2331,
       "dis_va_vdst0": 16,
       "dis_wmma": 384,
       "dis_wmma_dst_hi": 384,
@@ -498,7 +498,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x128x128_4x1_16x16x32_0x0x0_c3x4_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x128x128_4x1_16x16x32_0x0x0_c3x4_p3_v1024w1.s"
       },
-      "asm_lines": 3452,
+      "asm_lines": 3427,
       "asm_va_vdst0": 16,
       "asm_wmma": 384,
       "asm_wmma_dst_hi": 384,
@@ -512,7 +512,7 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "dis_lines": 2364,
+      "dis_lines": 2331,
       "dis_va_vdst0": 16,
       "dis_wmma": 384,
       "dis_wmma_dst_hi": 384,
@@ -542,7 +542,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x128x128_4x1_16x16x32_0x0x0_c4x1_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x128x128_4x1_16x16x32_0x0x0_c4x1_p3_v1024w1.s"
       },
-      "asm_lines": 3445,
+      "asm_lines": 3420,
       "asm_va_vdst0": 16,
       "asm_wmma": 384,
       "asm_wmma_dst_hi": 384,
@@ -556,7 +556,7 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "dis_lines": 2366,
+      "dis_lines": 2333,
       "dis_va_vdst0": 16,
       "dis_wmma": 384,
       "dis_wmma_dst_hi": 384,
@@ -586,7 +586,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x128x128_4x1_16x16x32_0x0x0_c4x2_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x128x128_4x1_16x16x32_0x0x0_c4x2_p3_v1024w1.s"
       },
-      "asm_lines": 3452,
+      "asm_lines": 3427,
       "asm_va_vdst0": 16,
       "asm_wmma": 384,
       "asm_wmma_dst_hi": 384,
@@ -600,7 +600,7 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "dis_lines": 2365,
+      "dis_lines": 2332,
       "dis_va_vdst0": 16,
       "dis_wmma": 384,
       "dis_wmma_dst_hi": 384,
@@ -630,7 +630,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x128x128_4x1_16x16x32_0x0x0_c4x3_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x128x128_4x1_16x16x32_0x0x0_c4x3_p3_v1024w1.s"
       },
-      "asm_lines": 3452,
+      "asm_lines": 3427,
       "asm_va_vdst0": 16,
       "asm_wmma": 384,
       "asm_wmma_dst_hi": 384,
@@ -644,7 +644,7 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "dis_lines": 2364,
+      "dis_lines": 2331,
       "dis_va_vdst0": 16,
       "dis_wmma": 384,
       "dis_wmma_dst_hi": 384,
@@ -674,7 +674,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x128x128_4x1_16x16x32_0x0x0_c4x4_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x128x128_4x1_16x16x32_0x0x0_c4x4_p3_v1024w1.s"
       },
-      "asm_lines": 3452,
+      "asm_lines": 3427,
       "asm_va_vdst0": 16,
       "asm_wmma": 384,
       "asm_wmma_dst_hi": 384,
@@ -688,7 +688,7 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "dis_lines": 2364,
+      "dis_lines": 2331,
       "dis_va_vdst0": 16,
       "dis_wmma": 384,
       "dis_wmma_dst_hi": 384,
@@ -718,7 +718,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x192x128_4x1_16x16x32_0x0x0_c1x1_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x192x128_4x1_16x16x32_0x0x0_c1x1_p3_v1024w1.s"
       },
-      "asm_lines": 4958,
+      "asm_lines": 4933,
       "asm_va_vdst0": 19,
       "asm_wmma": 576,
       "asm_wmma_dst_hi": 576,
@@ -732,7 +732,7 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "dis_lines": 3391,
+      "dis_lines": 3358,
       "dis_va_vdst0": 19,
       "dis_wmma": 576,
       "dis_wmma_dst_hi": 576,
@@ -762,7 +762,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x192x128_4x1_16x16x32_0x0x0_c1x2_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x192x128_4x1_16x16x32_0x0x0_c1x2_p3_v1024w1.s"
       },
-      "asm_lines": 4953,
+      "asm_lines": 4928,
       "asm_va_vdst0": 19,
       "asm_wmma": 576,
       "asm_wmma_dst_hi": 576,
@@ -776,7 +776,7 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "dis_lines": 3391,
+      "dis_lines": 3358,
       "dis_va_vdst0": 19,
       "dis_wmma": 576,
       "dis_wmma_dst_hi": 576,
@@ -806,7 +806,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x192x128_4x1_16x16x32_0x0x0_c1x3_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x192x128_4x1_16x16x32_0x0x0_c1x3_p3_v1024w1.s"
       },
-      "asm_lines": 4954,
+      "asm_lines": 4929,
       "asm_va_vdst0": 19,
       "asm_wmma": 576,
       "asm_wmma_dst_hi": 576,
@@ -820,7 +820,7 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "dis_lines": 3391,
+      "dis_lines": 3358,
       "dis_va_vdst0": 19,
       "dis_wmma": 576,
       "dis_wmma_dst_hi": 576,
@@ -850,7 +850,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x192x128_4x1_16x16x32_0x0x0_c1x4_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x192x128_4x1_16x16x32_0x0x0_c1x4_p3_v1024w1.s"
       },
-      "asm_lines": 4953,
+      "asm_lines": 4928,
       "asm_va_vdst0": 19,
       "asm_wmma": 576,
       "asm_wmma_dst_hi": 576,
@@ -864,7 +864,7 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "dis_lines": 3391,
+      "dis_lines": 3358,
       "dis_va_vdst0": 19,
       "dis_wmma": 576,
       "dis_wmma_dst_hi": 576,
@@ -894,7 +894,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x192x128_4x1_16x16x32_0x0x0_c2x1_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x192x128_4x1_16x16x32_0x0x0_c2x1_p3_v1024w1.s"
       },
-      "asm_lines": 4954,
+      "asm_lines": 4929,
       "asm_va_vdst0": 19,
       "asm_wmma": 576,
       "asm_wmma_dst_hi": 576,
@@ -908,7 +908,7 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "dis_lines": 3393,
+      "dis_lines": 3360,
       "dis_va_vdst0": 19,
       "dis_wmma": 576,
       "dis_wmma_dst_hi": 576,
@@ -938,7 +938,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x192x128_4x1_16x16x32_0x0x0_c2x2_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x192x128_4x1_16x16x32_0x0x0_c2x2_p3_v1024w1.s"
       },
-      "asm_lines": 4960,
+      "asm_lines": 4935,
       "asm_va_vdst0": 19,
       "asm_wmma": 576,
       "asm_wmma_dst_hi": 576,
@@ -952,7 +952,7 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "dis_lines": 3391,
+      "dis_lines": 3358,
       "dis_va_vdst0": 19,
       "dis_wmma": 576,
       "dis_wmma_dst_hi": 576,
@@ -982,7 +982,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x192x128_4x1_16x16x32_0x0x0_c2x3_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x192x128_4x1_16x16x32_0x0x0_c2x3_p3_v1024w1.s"
       },
-      "asm_lines": 4961,
+      "asm_lines": 4936,
       "asm_va_vdst0": 19,
       "asm_wmma": 576,
       "asm_wmma_dst_hi": 576,
@@ -996,7 +996,7 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "dis_lines": 3391,
+      "dis_lines": 3358,
       "dis_va_vdst0": 19,
       "dis_wmma": 576,
       "dis_wmma_dst_hi": 576,
@@ -1026,7 +1026,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x192x128_4x1_16x16x32_0x0x0_c2x4_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x192x128_4x1_16x16x32_0x0x0_c2x4_p3_v1024w1.s"
       },
-      "asm_lines": 4960,
+      "asm_lines": 4935,
       "asm_va_vdst0": 19,
       "asm_wmma": 576,
       "asm_wmma_dst_hi": 576,
@@ -1040,7 +1040,7 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "dis_lines": 3390,
+      "dis_lines": 3357,
       "dis_va_vdst0": 19,
       "dis_wmma": 576,
       "dis_wmma_dst_hi": 576,
@@ -1070,7 +1070,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x192x128_4x1_16x16x32_0x0x0_c3x1_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x192x128_4x1_16x16x32_0x0x0_c3x1_p3_v1024w1.s"
       },
-      "asm_lines": 4954,
+      "asm_lines": 4929,
       "asm_va_vdst0": 19,
       "asm_wmma": 576,
       "asm_wmma_dst_hi": 576,
@@ -1084,7 +1084,7 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "dis_lines": 3392,
+      "dis_lines": 3359,
       "dis_va_vdst0": 19,
       "dis_wmma": 576,
       "dis_wmma_dst_hi": 576,
@@ -1114,7 +1114,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x192x128_4x1_16x16x32_0x0x0_c3x2_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x192x128_4x1_16x16x32_0x0x0_c3x2_p3_v1024w1.s"
       },
-      "asm_lines": 4960,
+      "asm_lines": 4935,
       "asm_va_vdst0": 19,
       "asm_wmma": 576,
       "asm_wmma_dst_hi": 576,
@@ -1128,7 +1128,7 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "dis_lines": 3392,
+      "dis_lines": 3359,
       "dis_va_vdst0": 19,
       "dis_wmma": 576,
       "dis_wmma_dst_hi": 576,
@@ -1158,7 +1158,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x192x128_4x1_16x16x32_0x0x0_c3x3_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x192x128_4x1_16x16x32_0x0x0_c3x3_p3_v1024w1.s"
       },
-      "asm_lines": 4961,
+      "asm_lines": 4936,
       "asm_va_vdst0": 19,
       "asm_wmma": 576,
       "asm_wmma_dst_hi": 576,
@@ -1172,7 +1172,7 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "dis_lines": 3390,
+      "dis_lines": 3357,
       "dis_va_vdst0": 19,
       "dis_wmma": 576,
       "dis_wmma_dst_hi": 576,
@@ -1202,7 +1202,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x192x128_4x1_16x16x32_0x0x0_c3x4_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x192x128_4x1_16x16x32_0x0x0_c3x4_p3_v1024w1.s"
       },
-      "asm_lines": 4960,
+      "asm_lines": 4935,
       "asm_va_vdst0": 19,
       "asm_wmma": 576,
       "asm_wmma_dst_hi": 576,
@@ -1216,7 +1216,7 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "dis_lines": 3391,
+      "dis_lines": 3358,
       "dis_va_vdst0": 19,
       "dis_wmma": 576,
       "dis_wmma_dst_hi": 576,
@@ -1246,7 +1246,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x192x128_4x1_16x16x32_0x0x0_c4x1_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x192x128_4x1_16x16x32_0x0x0_c4x1_p3_v1024w1.s"
       },
-      "asm_lines": 4954,
+      "asm_lines": 4929,
       "asm_va_vdst0": 19,
       "asm_wmma": 576,
       "asm_wmma_dst_hi": 576,
@@ -1260,7 +1260,7 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "dis_lines": 3393,
+      "dis_lines": 3360,
       "dis_va_vdst0": 19,
       "dis_wmma": 576,
       "dis_wmma_dst_hi": 576,
@@ -1290,7 +1290,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x192x128_4x1_16x16x32_0x0x0_c4x2_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x192x128_4x1_16x16x32_0x0x0_c4x2_p3_v1024w1.s"
       },
-      "asm_lines": 4960,
+      "asm_lines": 4935,
       "asm_va_vdst0": 19,
       "asm_wmma": 576,
       "asm_wmma_dst_hi": 576,
@@ -1304,7 +1304,7 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "dis_lines": 3391,
+      "dis_lines": 3358,
       "dis_va_vdst0": 19,
       "dis_wmma": 576,
       "dis_wmma_dst_hi": 576,
@@ -1334,7 +1334,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x192x128_4x1_16x16x32_0x0x0_c4x3_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x192x128_4x1_16x16x32_0x0x0_c4x3_p3_v1024w1.s"
       },
-      "asm_lines": 4961,
+      "asm_lines": 4936,
       "asm_va_vdst0": 19,
       "asm_wmma": 576,
       "asm_wmma_dst_hi": 576,
@@ -1348,7 +1348,7 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "dis_lines": 3390,
+      "dis_lines": 3357,
       "dis_va_vdst0": 19,
       "dis_wmma": 576,
       "dis_wmma_dst_hi": 576,
@@ -1378,7 +1378,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x192x128_4x1_16x16x32_0x0x0_c4x4_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x192x128_4x1_16x16x32_0x0x0_c4x4_p3_v1024w1.s"
       },
-      "asm_lines": 4960,
+      "asm_lines": 4935,
       "asm_va_vdst0": 19,
       "asm_wmma": 576,
       "asm_wmma_dst_hi": 576,
@@ -1392,7 +1392,7 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "dis_lines": 3390,
+      "dis_lines": 3357,
       "dis_va_vdst0": 19,
       "dis_wmma": 576,
       "dis_wmma_dst_hi": 576,
@@ -1422,7 +1422,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x256x128_4x1_16x16x32_0x0x0_c1x1_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x256x128_4x1_16x16x32_0x0x0_c1x1_p3_v1024w1.s"
       },
-      "asm_lines": 6392,
+      "asm_lines": 6367,
       "asm_va_vdst0": 21,
       "asm_wmma": 768,
       "asm_wmma_dst_hi": 768,
@@ -1436,7 +1436,7 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "dis_lines": 4324,
+      "dis_lines": 4323,
       "dis_va_vdst0": 21,
       "dis_wmma": 768,
       "dis_wmma_dst_hi": 768,
@@ -1466,7 +1466,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x256x128_4x1_16x16x32_0x0x0_c1x2_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x256x128_4x1_16x16x32_0x0x0_c1x2_p3_v1024w1.s"
       },
-      "asm_lines": 6388,
+      "asm_lines": 6363,
       "asm_va_vdst0": 21,
       "asm_wmma": 768,
       "asm_wmma_dst_hi": 768,
@@ -1480,7 +1480,7 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "dis_lines": 4324,
+      "dis_lines": 4291,
       "dis_va_vdst0": 21,
       "dis_wmma": 768,
       "dis_wmma_dst_hi": 768,
@@ -1510,7 +1510,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x256x128_4x1_16x16x32_0x0x0_c1x3_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x256x128_4x1_16x16x32_0x0x0_c1x3_p3_v1024w1.s"
       },
-      "asm_lines": 6388,
+      "asm_lines": 6363,
       "asm_va_vdst0": 21,
       "asm_wmma": 768,
       "asm_wmma_dst_hi": 768,
@@ -1524,7 +1524,7 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "dis_lines": 4324,
+      "dis_lines": 4291,
       "dis_va_vdst0": 21,
       "dis_wmma": 768,
       "dis_wmma_dst_hi": 768,
@@ -1554,7 +1554,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x256x128_4x1_16x16x32_0x0x0_c1x4_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x256x128_4x1_16x16x32_0x0x0_c1x4_p3_v1024w1.s"
       },
-      "asm_lines": 6388,
+      "asm_lines": 6363,
       "asm_va_vdst0": 21,
       "asm_wmma": 768,
       "asm_wmma_dst_hi": 768,
@@ -1568,7 +1568,7 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "dis_lines": 4324,
+      "dis_lines": 4291,
       "dis_va_vdst0": 21,
       "dis_wmma": 768,
       "dis_wmma_dst_hi": 768,
@@ -1598,7 +1598,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x256x128_4x1_16x16x32_0x0x0_c2x1_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x256x128_4x1_16x16x32_0x0x0_c2x1_p3_v1024w1.s"
       },
-      "asm_lines": 6388,
+      "asm_lines": 6363,
       "asm_va_vdst0": 21,
       "asm_wmma": 768,
       "asm_wmma_dst_hi": 768,
@@ -1612,7 +1612,7 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "dis_lines": 4325,
+      "dis_lines": 4292,
       "dis_va_vdst0": 21,
       "dis_wmma": 768,
       "dis_wmma_dst_hi": 768,
@@ -1642,7 +1642,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x256x128_4x1_16x16x32_0x0x0_c2x2_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x256x128_4x1_16x16x32_0x0x0_c2x2_p3_v1024w1.s"
       },
-      "asm_lines": 6395,
+      "asm_lines": 6370,
       "asm_va_vdst0": 21,
       "asm_wmma": 768,
       "asm_wmma_dst_hi": 768,
@@ -1656,7 +1656,7 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "dis_lines": 4326,
+      "dis_lines": 4325,
       "dis_va_vdst0": 21,
       "dis_wmma": 768,
       "dis_wmma_dst_hi": 768,
@@ -1686,7 +1686,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x256x128_4x1_16x16x32_0x0x0_c2x3_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x256x128_4x1_16x16x32_0x0x0_c2x3_p3_v1024w1.s"
       },
-      "asm_lines": 6395,
+      "asm_lines": 6370,
       "asm_va_vdst0": 21,
       "asm_wmma": 768,
       "asm_wmma_dst_hi": 768,
@@ -1700,7 +1700,7 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "dis_lines": 4326,
+      "dis_lines": 4325,
       "dis_va_vdst0": 21,
       "dis_wmma": 768,
       "dis_wmma_dst_hi": 768,
@@ -1730,7 +1730,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x256x128_4x1_16x16x32_0x0x0_c2x4_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x256x128_4x1_16x16x32_0x0x0_c2x4_p3_v1024w1.s"
       },
-      "asm_lines": 6395,
+      "asm_lines": 6370,
       "asm_va_vdst0": 21,
       "asm_wmma": 768,
       "asm_wmma_dst_hi": 768,
@@ -1744,7 +1744,7 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "dis_lines": 4325,
+      "dis_lines": 4324,
       "dis_va_vdst0": 21,
       "dis_wmma": 768,
       "dis_wmma_dst_hi": 768,
@@ -1774,7 +1774,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x256x128_4x1_16x16x32_0x0x0_c3x1_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x256x128_4x1_16x16x32_0x0x0_c3x1_p3_v1024w1.s"
       },
-      "asm_lines": 6388,
+      "asm_lines": 6363,
       "asm_va_vdst0": 21,
       "asm_wmma": 768,
       "asm_wmma_dst_hi": 768,
@@ -1788,7 +1788,7 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "dis_lines": 4325,
+      "dis_lines": 4292,
       "dis_va_vdst0": 21,
       "dis_wmma": 768,
       "dis_wmma_dst_hi": 768,
@@ -1818,7 +1818,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x256x128_4x1_16x16x32_0x0x0_c3x2_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x256x128_4x1_16x16x32_0x0x0_c3x2_p3_v1024w1.s"
       },
-      "asm_lines": 6395,
+      "asm_lines": 6370,
       "asm_va_vdst0": 21,
       "asm_wmma": 768,
       "asm_wmma_dst_hi": 768,
@@ -1832,7 +1832,7 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "dis_lines": 4324,
+      "dis_lines": 4323,
       "dis_va_vdst0": 21,
       "dis_wmma": 768,
       "dis_wmma_dst_hi": 768,
@@ -1862,7 +1862,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x256x128_4x1_16x16x32_0x0x0_c3x3_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x256x128_4x1_16x16x32_0x0x0_c3x3_p3_v1024w1.s"
       },
-      "asm_lines": 6395,
+      "asm_lines": 6370,
       "asm_va_vdst0": 21,
       "asm_wmma": 768,
       "asm_wmma_dst_hi": 768,
@@ -1876,7 +1876,7 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "dis_lines": 4323,
+      "dis_lines": 4322,
       "dis_va_vdst0": 21,
       "dis_wmma": 768,
       "dis_wmma_dst_hi": 768,
@@ -1906,7 +1906,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x256x128_4x1_16x16x32_0x0x0_c3x4_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x256x128_4x1_16x16x32_0x0x0_c3x4_p3_v1024w1.s"
       },
-      "asm_lines": 6395,
+      "asm_lines": 6370,
       "asm_va_vdst0": 21,
       "asm_wmma": 768,
       "asm_wmma_dst_hi": 768,
@@ -1920,7 +1920,7 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "dis_lines": 4323,
+      "dis_lines": 4322,
       "dis_va_vdst0": 21,
       "dis_wmma": 768,
       "dis_wmma_dst_hi": 768,
@@ -1950,7 +1950,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x256x128_4x1_16x16x32_0x0x0_c4x1_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x256x128_4x1_16x16x32_0x0x0_c4x1_p3_v1024w1.s"
       },
-      "asm_lines": 6388,
+      "asm_lines": 6363,
       "asm_va_vdst0": 21,
       "asm_wmma": 768,
       "asm_wmma_dst_hi": 768,
@@ -1964,7 +1964,7 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "dis_lines": 4325,
+      "dis_lines": 4292,
       "dis_va_vdst0": 21,
       "dis_wmma": 768,
       "dis_wmma_dst_hi": 768,
@@ -1994,7 +1994,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x256x128_4x1_16x16x32_0x0x0_c4x2_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x256x128_4x1_16x16x32_0x0x0_c4x2_p3_v1024w1.s"
       },
-      "asm_lines": 6395,
+      "asm_lines": 6370,
       "asm_va_vdst0": 21,
       "asm_wmma": 768,
       "asm_wmma_dst_hi": 768,
@@ -2008,7 +2008,7 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "dis_lines": 4324,
+      "dis_lines": 4323,
       "dis_va_vdst0": 21,
       "dis_wmma": 768,
       "dis_wmma_dst_hi": 768,
@@ -2038,7 +2038,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x256x128_4x1_16x16x32_0x0x0_c4x3_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x256x128_4x1_16x16x32_0x0x0_c4x3_p3_v1024w1.s"
       },
-      "asm_lines": 6395,
+      "asm_lines": 6370,
       "asm_va_vdst0": 21,
       "asm_wmma": 768,
       "asm_wmma_dst_hi": 768,
@@ -2052,7 +2052,7 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "dis_lines": 4323,
+      "dis_lines": 4322,
       "dis_va_vdst0": 21,
       "dis_wmma": 768,
       "dis_wmma_dst_hi": 768,
@@ -2082,7 +2082,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x256x128_4x1_16x16x32_0x0x0_c4x4_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x256x128_4x1_16x16x32_0x0x0_c4x4_p3_v1024w1.s"
       },
-      "asm_lines": 6395,
+      "asm_lines": 6370,
       "asm_va_vdst0": 21,
       "asm_wmma": 768,
       "asm_wmma_dst_hi": 768,
@@ -2096,7 +2096,7 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "dis_lines": 4323,
+      "dis_lines": 4322,
       "dis_va_vdst0": 21,
       "dis_wmma": 768,
       "dis_wmma_dst_hi": 768,
@@ -2126,7 +2126,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x128x128_4x1_16x16x32_0x0x0_w4x1_c1x1_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x128x128_4x1_16x16x32_0x0x0_w4x1_c1x1_p3_v1024w1.s"
       },
-      "asm_lines": 3543,
+      "asm_lines": 3529,
       "asm_va_vdst0": 20,
       "asm_wmma": 384,
       "asm_wmma_dst_hi": 384,
@@ -2140,7 +2140,7 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "dis_lines": 2466,
+      "dis_lines": 2434,
       "dis_va_vdst0": 20,
       "dis_wmma": 384,
       "dis_wmma_dst_hi": 384,
@@ -2170,7 +2170,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x128x128_4x1_16x16x32_0x0x0_w4x1_c1x4_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x128x128_4x1_16x16x32_0x0x0_w4x1_c1x4_p3_v1024w1.s"
       },
-      "asm_lines": 3544,
+      "asm_lines": 3530,
       "asm_va_vdst0": 21,
       "asm_wmma": 384,
       "asm_wmma_dst_hi": 384,
@@ -2184,7 +2184,7 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "dis_lines": 2465,
+      "dis_lines": 2433,
       "dis_va_vdst0": 21,
       "dis_wmma": 384,
       "dis_wmma_dst_hi": 384,
@@ -2214,7 +2214,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x128x128_4x1_16x16x32_0x0x0_w4x1_c4x1_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x128x128_4x1_16x16x32_0x0x0_w4x1_c4x1_p3_v1024w1.s"
       },
-      "asm_lines": 3544,
+      "asm_lines": 3530,
       "asm_va_vdst0": 21,
       "asm_wmma": 384,
       "asm_wmma_dst_hi": 384,
@@ -2228,7 +2228,7 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "dis_lines": 2466,
+      "dis_lines": 2434,
       "dis_va_vdst0": 21,
       "dis_wmma": 384,
       "dis_wmma_dst_hi": 384,
@@ -2258,7 +2258,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x128x128_4x1_16x16x32_0x0x0_w4x1_c2x2_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x128x128_4x1_16x16x32_0x0x0_w4x1_c2x2_p3_v1024w1.s"
       },
-      "asm_lines": 3551,
+      "asm_lines": 3537,
       "asm_va_vdst0": 21,
       "asm_wmma": 384,
       "asm_wmma_dst_hi": 384,
@@ -2302,7 +2302,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x128x128_4x1_16x16x32_0x0x0_w4x1_c4x4_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x128x128_4x1_16x16x32_0x0x0_w4x1_c4x4_p3_v1024w1.s"
       },
-      "asm_lines": 3551,
+      "asm_lines": 3537,
       "asm_va_vdst0": 21,
       "asm_wmma": 384,
       "asm_wmma_dst_hi": 384,
@@ -2346,8 +2346,8 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x192x128_4x1_16x16x32_0x0x0_w4x1_c1x1_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x192x128_4x1_16x16x32_0x0x0_w4x1_c1x1_p3_v1024w1.s"
       },
-      "asm_lines": 5283,
-      "asm_va_vdst0": 55,
+      "asm_lines": 5259,
+      "asm_va_vdst0": 56,
       "asm_wmma": 576,
       "asm_wmma_dst_hi": 576,
       "cluster": [
@@ -2360,8 +2360,8 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "dis_lines": 3718,
-      "dis_va_vdst0": 55,
+      "dis_lines": 3685,
+      "dis_va_vdst0": 56,
       "dis_wmma": 576,
       "dis_wmma_dst_hi": 576,
       "group_segment_fixed_size": 261120,
@@ -2390,8 +2390,8 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x192x128_4x1_16x16x32_0x0x0_w4x1_c1x4_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x192x128_4x1_16x16x32_0x0x0_w4x1_c1x4_p3_v1024w1.s"
       },
-      "asm_lines": 5281,
-      "asm_va_vdst0": 56,
+      "asm_lines": 5257,
+      "asm_va_vdst0": 57,
       "asm_wmma": 576,
       "asm_wmma_dst_hi": 576,
       "cluster": [
@@ -2404,8 +2404,8 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "dis_lines": 3717,
-      "dis_va_vdst0": 56,
+      "dis_lines": 3684,
+      "dis_va_vdst0": 57,
       "dis_wmma": 576,
       "dis_wmma_dst_hi": 576,
       "group_segment_fixed_size": 261120,
@@ -2434,8 +2434,8 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x192x128_4x1_16x16x32_0x0x0_w4x1_c4x1_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x192x128_4x1_16x16x32_0x0x0_w4x1_c4x1_p3_v1024w1.s"
       },
-      "asm_lines": 5282,
-      "asm_va_vdst0": 56,
+      "asm_lines": 5258,
+      "asm_va_vdst0": 57,
       "asm_wmma": 576,
       "asm_wmma_dst_hi": 576,
       "cluster": [
@@ -2448,8 +2448,8 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "dis_lines": 3719,
-      "dis_va_vdst0": 56,
+      "dis_lines": 3686,
+      "dis_va_vdst0": 57,
       "dis_wmma": 576,
       "dis_wmma_dst_hi": 576,
       "group_segment_fixed_size": 261120,
@@ -2478,8 +2478,8 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x192x128_4x1_16x16x32_0x0x0_w4x1_c2x2_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x192x128_4x1_16x16x32_0x0x0_w4x1_c2x2_p3_v1024w1.s"
       },
-      "asm_lines": 5288,
-      "asm_va_vdst0": 56,
+      "asm_lines": 5264,
+      "asm_va_vdst0": 57,
       "asm_wmma": 576,
       "asm_wmma_dst_hi": 576,
       "cluster": [
@@ -2492,8 +2492,8 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "dis_lines": 3717,
-      "dis_va_vdst0": 56,
+      "dis_lines": 3684,
+      "dis_va_vdst0": 57,
       "dis_wmma": 576,
       "dis_wmma_dst_hi": 576,
       "group_segment_fixed_size": 261120,
@@ -2522,8 +2522,8 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x192x128_4x1_16x16x32_0x0x0_w4x1_c4x4_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x192x128_4x1_16x16x32_0x0x0_w4x1_c4x4_p3_v1024w1.s"
       },
-      "asm_lines": 5288,
-      "asm_va_vdst0": 56,
+      "asm_lines": 5264,
+      "asm_va_vdst0": 57,
       "asm_wmma": 576,
       "asm_wmma_dst_hi": 576,
       "cluster": [
@@ -2536,8 +2536,8 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "dis_lines": 3716,
-      "dis_va_vdst0": 56,
+      "dis_lines": 3683,
+      "dis_va_vdst0": 57,
       "dis_wmma": 576,
       "dis_wmma_dst_hi": 576,
       "group_segment_fixed_size": 261120,
@@ -2566,8 +2566,8 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x256x128_4x1_16x16x32_0x0x0_w4x1_c1x1_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x256x128_4x1_16x16x32_0x0x0_w4x1_c1x1_p3_v1024w1.s"
       },
-      "asm_lines": 6886,
-      "asm_va_vdst0": 81,
+      "asm_lines": 6862,
+      "asm_va_vdst0": 82,
       "asm_wmma": 768,
       "asm_wmma_dst_hi": 768,
       "cluster": [
@@ -2580,8 +2580,8 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "dis_lines": 4827,
-      "dis_va_vdst0": 81,
+      "dis_lines": 4794,
+      "dis_va_vdst0": 82,
       "dis_wmma": 768,
       "dis_wmma_dst_hi": 768,
       "group_segment_fixed_size": 313344,
@@ -2610,8 +2610,8 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x256x128_4x1_16x16x32_0x0x0_w4x1_c1x4_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x256x128_4x1_16x16x32_0x0x0_w4x1_c1x4_p3_v1024w1.s"
       },
-      "asm_lines": 6885,
-      "asm_va_vdst0": 82,
+      "asm_lines": 6861,
+      "asm_va_vdst0": 83,
       "asm_wmma": 768,
       "asm_wmma_dst_hi": 768,
       "cluster": [
@@ -2624,8 +2624,8 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "dis_lines": 4826,
-      "dis_va_vdst0": 82,
+      "dis_lines": 4793,
+      "dis_va_vdst0": 83,
       "dis_wmma": 768,
       "dis_wmma_dst_hi": 768,
       "group_segment_fixed_size": 313344,
@@ -2654,8 +2654,8 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x256x128_4x1_16x16x32_0x0x0_w4x1_c4x1_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x256x128_4x1_16x16x32_0x0x0_w4x1_c4x1_p3_v1024w1.s"
       },
-      "asm_lines": 6885,
-      "asm_va_vdst0": 82,
+      "asm_lines": 6861,
+      "asm_va_vdst0": 83,
       "asm_wmma": 768,
       "asm_wmma_dst_hi": 768,
       "cluster": [
@@ -2668,8 +2668,8 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "dis_lines": 4827,
-      "dis_va_vdst0": 82,
+      "dis_lines": 4794,
+      "dis_va_vdst0": 83,
       "dis_wmma": 768,
       "dis_wmma_dst_hi": 768,
       "group_segment_fixed_size": 313344,
@@ -2698,8 +2698,8 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x256x128_4x1_16x16x32_0x0x0_w4x1_c2x2_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x256x128_4x1_16x16x32_0x0x0_w4x1_c2x2_p3_v1024w1.s"
       },
-      "asm_lines": 6892,
-      "asm_va_vdst0": 82,
+      "asm_lines": 6868,
+      "asm_va_vdst0": 83,
       "asm_wmma": 768,
       "asm_wmma_dst_hi": 768,
       "cluster": [
@@ -2712,8 +2712,8 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "dis_lines": 4828,
-      "dis_va_vdst0": 82,
+      "dis_lines": 4795,
+      "dis_va_vdst0": 83,
       "dis_wmma": 768,
       "dis_wmma_dst_hi": 768,
       "group_segment_fixed_size": 313344,
@@ -2742,8 +2742,8 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x256x128_4x1_16x16x32_0x0x0_w4x1_c4x4_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x256x128_4x1_16x16x32_0x0x0_w4x1_c4x4_p3_v1024w1.s"
       },
-      "asm_lines": 6892,
-      "asm_va_vdst0": 82,
+      "asm_lines": 6868,
+      "asm_va_vdst0": 83,
       "asm_wmma": 768,
       "asm_wmma_dst_hi": 768,
       "cluster": [
@@ -2756,8 +2756,8 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "dis_lines": 4825,
-      "dis_va_vdst0": 82,
+      "dis_lines": 4824,
+      "dis_va_vdst0": 83,
       "dis_wmma": 768,
       "dis_wmma_dst_hi": 768,
       "group_segment_fixed_size": 313344,
@@ -3006,8 +3006,8 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x256x128_4x1_16x16x32_0x0x0_w2x2_c1x1_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x256x128_4x1_16x16x32_0x0x0_w2x2_c1x1_p3_v1024w1.s"
       },
-      "asm_lines": 3729,
-      "asm_va_vdst0": 45,
+      "asm_lines": 3715,
+      "asm_va_vdst0": 43,
       "asm_wmma": 384,
       "asm_wmma_dst_hi": 384,
       "cluster": [
@@ -3021,7 +3021,7 @@
         "-amdgpu-expert-scheduling-mode"
       ],
       "dis_lines": 2646,
-      "dis_va_vdst0": 45,
+      "dis_va_vdst0": 43,
       "dis_wmma": 384,
       "dis_wmma_dst_hi": 384,
       "group_segment_fixed_size": 261120,
@@ -3050,8 +3050,8 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x256x128_4x1_16x16x32_0x0x0_w2x2_c1x4_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x256x128_4x1_16x16x32_0x0x0_w2x2_c1x4_p3_v1024w1.s"
       },
-      "asm_lines": 3728,
-      "asm_va_vdst0": 46,
+      "asm_lines": 3714,
+      "asm_va_vdst0": 44,
       "asm_wmma": 384,
       "asm_wmma_dst_hi": 384,
       "cluster": [
@@ -3065,7 +3065,7 @@
         "-amdgpu-expert-scheduling-mode"
       ],
       "dis_lines": 2645,
-      "dis_va_vdst0": 46,
+      "dis_va_vdst0": 44,
       "dis_wmma": 384,
       "dis_wmma_dst_hi": 384,
       "group_segment_fixed_size": 261120,
@@ -3094,8 +3094,8 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x256x128_4x1_16x16x32_0x0x0_w2x2_c4x1_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x256x128_4x1_16x16x32_0x0x0_w2x2_c4x1_p3_v1024w1.s"
       },
-      "asm_lines": 3728,
-      "asm_va_vdst0": 46,
+      "asm_lines": 3714,
+      "asm_va_vdst0": 44,
       "asm_wmma": 384,
       "asm_wmma_dst_hi": 384,
       "cluster": [
@@ -3109,7 +3109,7 @@
         "-amdgpu-expert-scheduling-mode"
       ],
       "dis_lines": 2646,
-      "dis_va_vdst0": 46,
+      "dis_va_vdst0": 44,
       "dis_wmma": 384,
       "dis_wmma_dst_hi": 384,
       "group_segment_fixed_size": 261120,
@@ -3138,8 +3138,8 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x256x128_4x1_16x16x32_0x0x0_w2x2_c2x2_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x256x128_4x1_16x16x32_0x0x0_w2x2_c2x2_p3_v1024w1.s"
       },
-      "asm_lines": 3735,
-      "asm_va_vdst0": 46,
+      "asm_lines": 3721,
+      "asm_va_vdst0": 44,
       "asm_wmma": 384,
       "asm_wmma_dst_hi": 384,
       "cluster": [
@@ -3153,7 +3153,7 @@
         "-amdgpu-expert-scheduling-mode"
       ],
       "dis_lines": 2646,
-      "dis_va_vdst0": 46,
+      "dis_va_vdst0": 44,
       "dis_wmma": 384,
       "dis_wmma_dst_hi": 384,
       "group_segment_fixed_size": 261120,
@@ -3182,8 +3182,8 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x256x128_4x1_16x16x32_0x0x0_w2x2_c4x4_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x256x128_4x1_16x16x32_0x0x0_w2x2_c4x4_p3_v1024w1.s"
       },
-      "asm_lines": 3735,
-      "asm_va_vdst0": 46,
+      "asm_lines": 3721,
+      "asm_va_vdst0": 44,
       "asm_wmma": 384,
       "asm_wmma_dst_hi": 384,
       "cluster": [
@@ -3197,7 +3197,7 @@
         "-amdgpu-expert-scheduling-mode"
       ],
       "dis_lines": 2644,
-      "dis_va_vdst0": 46,
+      "dis_va_vdst0": 44,
       "dis_wmma": 384,
       "dis_wmma_dst_hi": 384,
       "group_segment_fixed_size": 261120,
@@ -3226,8 +3226,8 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x128x128_4x1_16x16x32_0x0x0_w2x2_c1x1_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x128x128_4x1_16x16x32_0x0x0_w2x2_c1x1_p3_v1024w1.s"
       },
-      "asm_lines": 2502,
-      "asm_va_vdst0": 16,
+      "asm_lines": 2489,
+      "asm_va_vdst0": 15,
       "asm_wmma": 288,
       "asm_wmma_dst_hi": 288,
       "cluster": [
@@ -3240,8 +3240,8 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "dis_lines": 1738,
-      "dis_va_vdst0": 16,
+      "dis_lines": 1710,
+      "dis_va_vdst0": 15,
       "dis_wmma": 288,
       "dis_wmma_dst_hi": 288,
       "group_segment_fixed_size": 182784,
@@ -3270,7 +3270,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x128x128_4x1_16x16x32_0x0x0_w2x2_c1x4_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x128x128_4x1_16x16x32_0x0x0_w2x2_c1x4_p3_v1024w1.s"
       },
-      "asm_lines": 2501,
+      "asm_lines": 2488,
       "asm_va_vdst0": 17,
       "asm_wmma": 288,
       "asm_wmma_dst_hi": 288,
@@ -3284,7 +3284,7 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "dis_lines": 1737,
+      "dis_lines": 1707,
       "dis_va_vdst0": 17,
       "dis_wmma": 288,
       "dis_wmma_dst_hi": 288,
@@ -3314,7 +3314,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x128x128_4x1_16x16x32_0x0x0_w2x2_c4x1_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x128x128_4x1_16x16x32_0x0x0_w2x2_c4x1_p3_v1024w1.s"
       },
-      "asm_lines": 2500,
+      "asm_lines": 2487,
       "asm_va_vdst0": 17,
       "asm_wmma": 288,
       "asm_wmma_dst_hi": 288,
@@ -3328,7 +3328,7 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "dis_lines": 1739,
+      "dis_lines": 1709,
       "dis_va_vdst0": 17,
       "dis_wmma": 288,
       "dis_wmma_dst_hi": 288,
@@ -3358,7 +3358,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x128x128_4x1_16x16x32_0x0x0_w2x2_c2x2_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x128x128_4x1_16x16x32_0x0x0_w2x2_c2x2_p3_v1024w1.s"
       },
-      "asm_lines": 2507,
+      "asm_lines": 2494,
       "asm_va_vdst0": 17,
       "asm_wmma": 288,
       "asm_wmma_dst_hi": 288,
@@ -3372,7 +3372,7 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "dis_lines": 1738,
+      "dis_lines": 1740,
       "dis_va_vdst0": 17,
       "dis_wmma": 288,
       "dis_wmma_dst_hi": 288,
@@ -3402,7 +3402,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x128x128_4x1_16x16x32_0x0x0_w2x2_c4x4_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x128x128_4x1_16x16x32_0x0x0_w2x2_c4x4_p3_v1024w1.s"
       },
-      "asm_lines": 2507,
+      "asm_lines": 2494,
       "asm_va_vdst0": 17,
       "asm_wmma": 288,
       "asm_wmma_dst_hi": 288,
@@ -3416,7 +3416,7 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "dis_lines": 1737,
+      "dis_lines": 1739,
       "dis_va_vdst0": 17,
       "dis_wmma": 288,
       "dis_wmma_dst_hi": 288,
@@ -3666,7 +3666,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x256x128_4x1_16x16x32_0x0x0_w2x2_c1x1_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x256x128_4x1_16x16x32_0x0x0_w2x2_c1x1_p3_v1024w1.s"
       },
-      "asm_lines": 4606,
+      "asm_lines": 4579,
       "asm_va_vdst0": 44,
       "asm_wmma": 576,
       "asm_wmma_dst_hi": 576,
@@ -3680,7 +3680,7 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "dis_lines": 3117,
+      "dis_lines": 3119,
       "dis_va_vdst0": 44,
       "dis_wmma": 576,
       "dis_wmma_dst_hi": 576,
@@ -3710,8 +3710,8 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x256x128_4x1_16x16x32_0x0x0_w2x2_c1x4_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x256x128_4x1_16x16x32_0x0x0_w2x2_c1x4_p3_v1024w1.s"
       },
-      "asm_lines": 4605,
-      "asm_va_vdst0": 45,
+      "asm_lines": 4578,
+      "asm_va_vdst0": 46,
       "asm_wmma": 576,
       "asm_wmma_dst_hi": 576,
       "cluster": [
@@ -3725,7 +3725,7 @@
         "-amdgpu-expert-scheduling-mode"
       ],
       "dis_lines": 3116,
-      "dis_va_vdst0": 45,
+      "dis_va_vdst0": 46,
       "dis_wmma": 576,
       "dis_wmma_dst_hi": 576,
       "group_segment_fixed_size": 287232,
@@ -3754,8 +3754,8 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x256x128_4x1_16x16x32_0x0x0_w2x2_c4x1_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x256x128_4x1_16x16x32_0x0x0_w2x2_c4x1_p3_v1024w1.s"
       },
-      "asm_lines": 4604,
-      "asm_va_vdst0": 45,
+      "asm_lines": 4577,
+      "asm_va_vdst0": 46,
       "asm_wmma": 576,
       "asm_wmma_dst_hi": 576,
       "cluster": [
@@ -3769,7 +3769,7 @@
         "-amdgpu-expert-scheduling-mode"
       ],
       "dis_lines": 3118,
-      "dis_va_vdst0": 45,
+      "dis_va_vdst0": 46,
       "dis_wmma": 576,
       "dis_wmma_dst_hi": 576,
       "group_segment_fixed_size": 287232,
@@ -3798,8 +3798,8 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x256x128_4x1_16x16x32_0x0x0_w2x2_c2x2_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x256x128_4x1_16x16x32_0x0x0_w2x2_c2x2_p3_v1024w1.s"
       },
-      "asm_lines": 4611,
-      "asm_va_vdst0": 45,
+      "asm_lines": 4584,
+      "asm_va_vdst0": 46,
       "asm_wmma": 576,
       "asm_wmma_dst_hi": 576,
       "cluster": [
@@ -3812,8 +3812,8 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "dis_lines": 3149,
-      "dis_va_vdst0": 45,
+      "dis_lines": 3117,
+      "dis_va_vdst0": 46,
       "dis_wmma": 576,
       "dis_wmma_dst_hi": 576,
       "group_segment_fixed_size": 287232,
@@ -3842,8 +3842,8 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x256x128_4x1_16x16x32_0x0x0_w2x2_c4x4_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x256x128_4x1_16x16x32_0x0x0_w2x2_c4x4_p3_v1024w1.s"
       },
-      "asm_lines": 4611,
-      "asm_va_vdst0": 45,
+      "asm_lines": 4584,
+      "asm_va_vdst0": 46,
       "asm_wmma": 576,
       "asm_wmma_dst_hi": 576,
       "cluster": [
@@ -3856,8 +3856,8 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "dis_lines": 3148,
-      "dis_va_vdst0": 45,
+      "dis_lines": 3116,
+      "dis_va_vdst0": 46,
       "dis_wmma": 576,
       "dis_wmma_dst_hi": 576,
       "group_segment_fixed_size": 287232,
@@ -3886,8 +3886,8 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x128x128_4x1_16x16x32_0x0x0_w2x2_c1x1_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x128x128_4x1_16x16x32_0x0x0_w2x2_c1x1_p3_v1024w1.s"
       },
-      "asm_lines": 2977,
-      "asm_va_vdst0": 20,
+      "asm_lines": 2975,
+      "asm_va_vdst0": 18,
       "asm_wmma": 384,
       "asm_wmma_dst_hi": 384,
       "cluster": [
@@ -3900,8 +3900,8 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "dis_lines": 2027,
-      "dis_va_vdst0": 20,
+      "dis_lines": 2029,
+      "dis_va_vdst0": 18,
       "dis_wmma": 384,
       "dis_wmma_dst_hi": 384,
       "group_segment_fixed_size": 208896,
@@ -3930,8 +3930,8 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x128x128_4x1_16x16x32_0x0x0_w2x2_c1x4_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x128x128_4x1_16x16x32_0x0x0_w2x2_c1x4_p3_v1024w1.s"
       },
-      "asm_lines": 2981,
-      "asm_va_vdst0": 21,
+      "asm_lines": 2979,
+      "asm_va_vdst0": 20,
       "asm_wmma": 384,
       "asm_wmma_dst_hi": 384,
       "cluster": [
@@ -3945,7 +3945,7 @@
         "-amdgpu-expert-scheduling-mode"
       ],
       "dis_lines": 2026,
-      "dis_va_vdst0": 21,
+      "dis_va_vdst0": 20,
       "dis_wmma": 384,
       "dis_wmma_dst_hi": 384,
       "group_segment_fixed_size": 208896,
@@ -3974,8 +3974,8 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x128x128_4x1_16x16x32_0x0x0_w2x2_c4x1_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x128x128_4x1_16x16x32_0x0x0_w2x2_c4x1_p3_v1024w1.s"
       },
-      "asm_lines": 2981,
-      "asm_va_vdst0": 21,
+      "asm_lines": 2979,
+      "asm_va_vdst0": 20,
       "asm_wmma": 384,
       "asm_wmma_dst_hi": 384,
       "cluster": [
@@ -3989,7 +3989,7 @@
         "-amdgpu-expert-scheduling-mode"
       ],
       "dis_lines": 2027,
-      "dis_va_vdst0": 21,
+      "dis_va_vdst0": 20,
       "dis_wmma": 384,
       "dis_wmma_dst_hi": 384,
       "group_segment_fixed_size": 208896,
@@ -4018,8 +4018,8 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x128x128_4x1_16x16x32_0x0x0_w2x2_c2x2_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x128x128_4x1_16x16x32_0x0x0_w2x2_c2x2_p3_v1024w1.s"
       },
-      "asm_lines": 2988,
-      "asm_va_vdst0": 21,
+      "asm_lines": 2986,
+      "asm_va_vdst0": 20,
       "asm_wmma": 384,
       "asm_wmma_dst_hi": 384,
       "cluster": [
@@ -4033,7 +4033,7 @@
         "-amdgpu-expert-scheduling-mode"
       ],
       "dis_lines": 2026,
-      "dis_va_vdst0": 21,
+      "dis_va_vdst0": 20,
       "dis_wmma": 384,
       "dis_wmma_dst_hi": 384,
       "group_segment_fixed_size": 208896,
@@ -4062,8 +4062,8 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x128x128_4x1_16x16x32_0x0x0_w2x2_c4x4_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x128x128_4x1_16x16x32_0x0x0_w2x2_c4x4_p3_v1024w1.s"
       },
-      "asm_lines": 2988,
-      "asm_va_vdst0": 21,
+      "asm_lines": 2986,
+      "asm_va_vdst0": 20,
       "asm_wmma": 384,
       "asm_wmma_dst_hi": 384,
       "cluster": [
@@ -4077,7 +4077,7 @@
         "-amdgpu-expert-scheduling-mode"
       ],
       "dis_lines": 2025,
-      "dis_va_vdst0": 21,
+      "dis_va_vdst0": 20,
       "dis_wmma": 384,
       "dis_wmma_dst_hi": 384,
       "group_segment_fixed_size": 208896,
@@ -4326,8 +4326,8 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x256x128_4x1_16x16x32_0x0x0_w2x2_c1x1_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x256x128_4x1_16x16x32_0x0x0_w2x2_c1x1_p3_v1024w1.s"
       },
-      "asm_lines": 5468,
-      "asm_va_vdst0": 48,
+      "asm_lines": 5448,
+      "asm_va_vdst0": 47,
       "asm_wmma": 768,
       "asm_wmma_dst_hi": 768,
       "cluster": [
@@ -4340,8 +4340,8 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "dis_lines": 3592,
-      "dis_va_vdst0": 48,
+      "dis_lines": 3591,
+      "dis_va_vdst0": 47,
       "dis_wmma": 768,
       "dis_wmma_dst_hi": 768,
       "group_segment_fixed_size": 313344,
@@ -4370,8 +4370,8 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x256x128_4x1_16x16x32_0x0x0_w2x2_c1x4_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x256x128_4x1_16x16x32_0x0x0_w2x2_c1x4_p3_v1024w1.s"
       },
-      "asm_lines": 5467,
-      "asm_va_vdst0": 49,
+      "asm_lines": 5447,
+      "asm_va_vdst0": 47,
       "asm_wmma": 768,
       "asm_wmma_dst_hi": 768,
       "cluster": [
@@ -4384,8 +4384,8 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "dis_lines": 3591,
-      "dis_va_vdst0": 49,
+      "dis_lines": 3592,
+      "dis_va_vdst0": 47,
       "dis_wmma": 768,
       "dis_wmma_dst_hi": 768,
       "group_segment_fixed_size": 313344,
@@ -4414,8 +4414,8 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x256x128_4x1_16x16x32_0x0x0_w2x2_c4x1_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x256x128_4x1_16x16x32_0x0x0_w2x2_c4x1_p3_v1024w1.s"
       },
-      "asm_lines": 5467,
-      "asm_va_vdst0": 49,
+      "asm_lines": 5447,
+      "asm_va_vdst0": 47,
       "asm_wmma": 768,
       "asm_wmma_dst_hi": 768,
       "cluster": [
@@ -4428,8 +4428,8 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "dis_lines": 3592,
-      "dis_va_vdst0": 49,
+      "dis_lines": 3593,
+      "dis_va_vdst0": 47,
       "dis_wmma": 768,
       "dis_wmma_dst_hi": 768,
       "group_segment_fixed_size": 313344,
@@ -4458,8 +4458,8 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x256x128_4x1_16x16x32_0x0x0_w2x2_c2x2_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x256x128_4x1_16x16x32_0x0x0_w2x2_c2x2_p3_v1024w1.s"
       },
-      "asm_lines": 5474,
-      "asm_va_vdst0": 49,
+      "asm_lines": 5454,
+      "asm_va_vdst0": 47,
       "asm_wmma": 768,
       "asm_wmma_dst_hi": 768,
       "cluster": [
@@ -4472,8 +4472,8 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "dis_lines": 3624,
-      "dis_va_vdst0": 49,
+      "dis_lines": 3593,
+      "dis_va_vdst0": 47,
       "dis_wmma": 768,
       "dis_wmma_dst_hi": 768,
       "group_segment_fixed_size": 313344,
@@ -4502,8 +4502,8 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x256x128_4x1_16x16x32_0x0x0_w2x2_c4x4_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x256x128_4x1_16x16x32_0x0x0_w2x2_c4x4_p3_v1024w1.s"
       },
-      "asm_lines": 5474,
-      "asm_va_vdst0": 49,
+      "asm_lines": 5454,
+      "asm_va_vdst0": 47,
       "asm_wmma": 768,
       "asm_wmma_dst_hi": 768,
       "cluster": [
@@ -4516,8 +4516,8 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "dis_lines": 3622,
-      "dis_va_vdst0": 49,
+      "dis_lines": 3591,
+      "dis_va_vdst0": 47,
       "dis_wmma": 768,
       "dis_wmma_dst_hi": 768,
       "group_segment_fixed_size": 313344,
@@ -4546,8 +4546,8 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x192x128_4x1_16x16x32_0x0x0_w1x4_c1x1_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x192x128_4x1_16x16x32_0x0x0_w1x4_c1x1_p3_v1024w1.s"
       },
-      "asm_lines": 2551,
-      "asm_va_vdst0": 26,
+      "asm_lines": 2553,
+      "asm_va_vdst0": 29,
       "asm_wmma": 288,
       "asm_wmma_dst_hi": 288,
       "cluster": [
@@ -4561,7 +4561,7 @@
         "-amdgpu-expert-scheduling-mode"
       ],
       "dis_lines": 1682,
-      "dis_va_vdst0": 26,
+      "dis_va_vdst0": 29,
       "dis_wmma": 288,
       "dis_wmma_dst_hi": 288,
       "group_segment_fixed_size": 208896,
@@ -4590,8 +4590,8 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x192x128_4x1_16x16x32_0x0x0_w1x4_c1x4_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x192x128_4x1_16x16x32_0x0x0_w1x4_c1x4_p3_v1024w1.s"
       },
-      "asm_lines": 2547,
-      "asm_va_vdst0": 26,
+      "asm_lines": 2549,
+      "asm_va_vdst0": 29,
       "asm_wmma": 288,
       "asm_wmma_dst_hi": 288,
       "cluster": [
@@ -4604,8 +4604,8 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "dis_lines": 1649,
-      "dis_va_vdst0": 26,
+      "dis_lines": 1681,
+      "dis_va_vdst0": 29,
       "dis_wmma": 288,
       "dis_wmma_dst_hi": 288,
       "group_segment_fixed_size": 208896,
@@ -4634,8 +4634,8 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x192x128_4x1_16x16x32_0x0x0_w1x4_c4x1_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x192x128_4x1_16x16x32_0x0x0_w1x4_c4x1_p3_v1024w1.s"
       },
-      "asm_lines": 2548,
-      "asm_va_vdst0": 26,
+      "asm_lines": 2550,
+      "asm_va_vdst0": 29,
       "asm_wmma": 288,
       "asm_wmma_dst_hi": 288,
       "cluster": [
@@ -4649,7 +4649,7 @@
         "-amdgpu-expert-scheduling-mode"
       ],
       "dis_lines": 1651,
-      "dis_va_vdst0": 26,
+      "dis_va_vdst0": 29,
       "dis_wmma": 288,
       "dis_wmma_dst_hi": 288,
       "group_segment_fixed_size": 208896,
@@ -4678,8 +4678,8 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x192x128_4x1_16x16x32_0x0x0_w1x4_c2x2_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x192x128_4x1_16x16x32_0x0x0_w1x4_c2x2_p3_v1024w1.s"
       },
-      "asm_lines": 2554,
-      "asm_va_vdst0": 26,
+      "asm_lines": 2556,
+      "asm_va_vdst0": 29,
       "asm_wmma": 288,
       "asm_wmma_dst_hi": 288,
       "cluster": [
@@ -4693,7 +4693,7 @@
         "-amdgpu-expert-scheduling-mode"
       ],
       "dis_lines": 1681,
-      "dis_va_vdst0": 26,
+      "dis_va_vdst0": 29,
       "dis_wmma": 288,
       "dis_wmma_dst_hi": 288,
       "group_segment_fixed_size": 208896,
@@ -4722,8 +4722,8 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x192x128_4x1_16x16x32_0x0x0_w1x4_c4x4_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x192x128_4x1_16x16x32_0x0x0_w1x4_c4x4_p3_v1024w1.s"
       },
-      "asm_lines": 2554,
-      "asm_va_vdst0": 26,
+      "asm_lines": 2556,
+      "asm_va_vdst0": 29,
       "asm_wmma": 288,
       "asm_wmma_dst_hi": 288,
       "cluster": [
@@ -4737,7 +4737,7 @@
         "-amdgpu-expert-scheduling-mode"
       ],
       "dis_lines": 1680,
-      "dis_va_vdst0": 26,
+      "dis_va_vdst0": 29,
       "dis_wmma": 288,
       "dis_wmma_dst_hi": 288,
       "group_segment_fixed_size": 208896,
@@ -4766,7 +4766,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x256x128_4x1_16x16x32_0x0x0_w1x4_c1x1_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x256x128_4x1_16x16x32_0x0x0_w1x4_c1x1_p3_v1024w1.s"
       },
-      "asm_lines": 3000,
+      "asm_lines": 2989,
       "asm_va_vdst0": 24,
       "asm_wmma": 384,
       "asm_wmma_dst_hi": 384,
@@ -4810,7 +4810,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x256x128_4x1_16x16x32_0x0x0_w1x4_c1x4_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x256x128_4x1_16x16x32_0x0x0_w1x4_c1x4_p3_v1024w1.s"
       },
-      "asm_lines": 2999,
+      "asm_lines": 2988,
       "asm_va_vdst0": 25,
       "asm_wmma": 384,
       "asm_wmma_dst_hi": 384,
@@ -4854,7 +4854,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x256x128_4x1_16x16x32_0x0x0_w1x4_c4x1_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x256x128_4x1_16x16x32_0x0x0_w1x4_c4x1_p3_v1024w1.s"
       },
-      "asm_lines": 2999,
+      "asm_lines": 2988,
       "asm_va_vdst0": 25,
       "asm_wmma": 384,
       "asm_wmma_dst_hi": 384,
@@ -4898,7 +4898,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x256x128_4x1_16x16x32_0x0x0_w1x4_c2x2_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x256x128_4x1_16x16x32_0x0x0_w1x4_c2x2_p3_v1024w1.s"
       },
-      "asm_lines": 3006,
+      "asm_lines": 2995,
       "asm_va_vdst0": 25,
       "asm_wmma": 384,
       "asm_wmma_dst_hi": 384,
@@ -4942,7 +4942,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x256x128_4x1_16x16x32_0x0x0_w1x4_c4x4_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x256x128_4x1_16x16x32_0x0x0_w1x4_c4x4_p3_v1024w1.s"
       },
-      "asm_lines": 3006,
+      "asm_lines": 2995,
       "asm_va_vdst0": 25,
       "asm_wmma": 384,
       "asm_wmma_dst_hi": 384,
@@ -4986,7 +4986,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x128x128_4x1_16x16x32_0x0x0_w1x4_c1x1_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x128x128_4x1_16x16x32_0x0x0_w1x4_c1x1_p3_v1024w1.s"
       },
-      "asm_lines": 2403,
+      "asm_lines": 2405,
       "asm_va_vdst0": 18,
       "asm_wmma": 288,
       "asm_wmma_dst_hi": 288,
@@ -5030,7 +5030,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x128x128_4x1_16x16x32_0x0x0_w1x4_c1x4_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x128x128_4x1_16x16x32_0x0x0_w1x4_c1x4_p3_v1024w1.s"
       },
-      "asm_lines": 2400,
+      "asm_lines": 2402,
       "asm_va_vdst0": 18,
       "asm_wmma": 288,
       "asm_wmma_dst_hi": 288,
@@ -5074,7 +5074,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x128x128_4x1_16x16x32_0x0x0_w1x4_c4x1_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x128x128_4x1_16x16x32_0x0x0_w1x4_c4x1_p3_v1024w1.s"
       },
-      "asm_lines": 2399,
+      "asm_lines": 2401,
       "asm_va_vdst0": 18,
       "asm_wmma": 288,
       "asm_wmma_dst_hi": 288,
@@ -5118,7 +5118,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x128x128_4x1_16x16x32_0x0x0_w1x4_c2x2_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x128x128_4x1_16x16x32_0x0x0_w1x4_c2x2_p3_v1024w1.s"
       },
-      "asm_lines": 2406,
+      "asm_lines": 2408,
       "asm_va_vdst0": 18,
       "asm_wmma": 288,
       "asm_wmma_dst_hi": 288,
@@ -5162,7 +5162,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x128x128_4x1_16x16x32_0x0x0_w1x4_c4x4_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x128x128_4x1_16x16x32_0x0x0_w1x4_c4x4_p3_v1024w1.s"
       },
-      "asm_lines": 2406,
+      "asm_lines": 2408,
       "asm_va_vdst0": 18,
       "asm_wmma": 288,
       "asm_wmma_dst_hi": 288,
@@ -5206,8 +5206,8 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x192x128_4x1_16x16x32_0x0x0_w1x4_c1x1_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x192x128_4x1_16x16x32_0x0x0_w1x4_c1x1_p3_v1024w1.s"
       },
-      "asm_lines": 3298,
-      "asm_va_vdst0": 26,
+      "asm_lines": 3296,
+      "asm_va_vdst0": 27,
       "asm_wmma": 432,
       "asm_wmma_dst_hi": 432,
       "cluster": [
@@ -5221,7 +5221,7 @@
         "-amdgpu-expert-scheduling-mode"
       ],
       "dis_lines": 2059,
-      "dis_va_vdst0": 26,
+      "dis_va_vdst0": 27,
       "dis_wmma": 432,
       "dis_wmma_dst_hi": 432,
       "group_segment_fixed_size": 235008,
@@ -5242,7 +5242,7 @@
         128
       ],
       "traits_args": "128, 96, 192, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 1, 1, 1, 4",
-      "vgpr_count": 482,
+      "vgpr_count": 498,
       "vgpr_spill_count": 0
     },
     {
@@ -5250,8 +5250,8 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x192x128_4x1_16x16x32_0x0x0_w1x4_c1x4_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x192x128_4x1_16x16x32_0x0x0_w1x4_c1x4_p3_v1024w1.s"
       },
-      "asm_lines": 3294,
-      "asm_va_vdst0": 26,
+      "asm_lines": 3292,
+      "asm_va_vdst0": 27,
       "asm_wmma": 432,
       "asm_wmma_dst_hi": 432,
       "cluster": [
@@ -5265,7 +5265,7 @@
         "-amdgpu-expert-scheduling-mode"
       ],
       "dis_lines": 2058,
-      "dis_va_vdst0": 26,
+      "dis_va_vdst0": 27,
       "dis_wmma": 432,
       "dis_wmma_dst_hi": 432,
       "group_segment_fixed_size": 235008,
@@ -5286,7 +5286,7 @@
         128
       ],
       "traits_args": "128, 96, 192, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 1, 4, 1, 4",
-      "vgpr_count": 482,
+      "vgpr_count": 498,
       "vgpr_spill_count": 0
     },
     {
@@ -5294,8 +5294,8 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x192x128_4x1_16x16x32_0x0x0_w1x4_c4x1_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x192x128_4x1_16x16x32_0x0x0_w1x4_c4x1_p3_v1024w1.s"
       },
-      "asm_lines": 3294,
-      "asm_va_vdst0": 26,
+      "asm_lines": 3292,
+      "asm_va_vdst0": 27,
       "asm_wmma": 432,
       "asm_wmma_dst_hi": 432,
       "cluster": [
@@ -5309,7 +5309,7 @@
         "-amdgpu-expert-scheduling-mode"
       ],
       "dis_lines": 2061,
-      "dis_va_vdst0": 26,
+      "dis_va_vdst0": 27,
       "dis_wmma": 432,
       "dis_wmma_dst_hi": 432,
       "group_segment_fixed_size": 235008,
@@ -5330,7 +5330,7 @@
         128
       ],
       "traits_args": "128, 96, 192, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 4, 1, 1, 4",
-      "vgpr_count": 482,
+      "vgpr_count": 498,
       "vgpr_spill_count": 0
     },
     {
@@ -5338,8 +5338,8 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x192x128_4x1_16x16x32_0x0x0_w1x4_c2x2_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x192x128_4x1_16x16x32_0x0x0_w1x4_c2x2_p3_v1024w1.s"
       },
-      "asm_lines": 3300,
-      "asm_va_vdst0": 26,
+      "asm_lines": 3298,
+      "asm_va_vdst0": 27,
       "asm_wmma": 432,
       "asm_wmma_dst_hi": 432,
       "cluster": [
@@ -5353,7 +5353,7 @@
         "-amdgpu-expert-scheduling-mode"
       ],
       "dis_lines": 2059,
-      "dis_va_vdst0": 26,
+      "dis_va_vdst0": 27,
       "dis_wmma": 432,
       "dis_wmma_dst_hi": 432,
       "group_segment_fixed_size": 235008,
@@ -5374,7 +5374,7 @@
         128
       ],
       "traits_args": "128, 96, 192, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 2, 2, 1, 4",
-      "vgpr_count": 482,
+      "vgpr_count": 498,
       "vgpr_spill_count": 0
     },
     {
@@ -5382,8 +5382,8 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x192x128_4x1_16x16x32_0x0x0_w1x4_c4x4_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x192x128_4x1_16x16x32_0x0x0_w1x4_c4x4_p3_v1024w1.s"
       },
-      "asm_lines": 3300,
-      "asm_va_vdst0": 26,
+      "asm_lines": 3298,
+      "asm_va_vdst0": 27,
       "asm_wmma": 432,
       "asm_wmma_dst_hi": 432,
       "cluster": [
@@ -5397,7 +5397,7 @@
         "-amdgpu-expert-scheduling-mode"
       ],
       "dis_lines": 2059,
-      "dis_va_vdst0": 26,
+      "dis_va_vdst0": 27,
       "dis_wmma": 432,
       "dis_wmma_dst_hi": 432,
       "group_segment_fixed_size": 235008,
@@ -5418,7 +5418,7 @@
         128
       ],
       "traits_args": "128, 96, 192, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 4, 4, 1, 4",
-      "vgpr_count": 482,
+      "vgpr_count": 498,
       "vgpr_spill_count": 0
     },
     {
@@ -5426,8 +5426,8 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x256x128_4x1_16x16x32_0x0x0_w1x4_c1x1_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x256x128_4x1_16x16x32_0x0x0_w1x4_c1x1_p3_v1024w1.s"
       },
-      "asm_lines": 3881,
-      "asm_va_vdst0": 30,
+      "asm_lines": 3860,
+      "asm_va_vdst0": 24,
       "asm_wmma": 576,
       "asm_wmma_dst_hi": 576,
       "cluster": [
@@ -5440,8 +5440,8 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "dis_lines": 2549,
-      "dis_va_vdst0": 30,
+      "dis_lines": 2519,
+      "dis_va_vdst0": 24,
       "dis_wmma": 576,
       "dis_wmma_dst_hi": 576,
       "group_segment_fixed_size": 287232,
@@ -5462,7 +5462,7 @@
         128
       ],
       "traits_args": "128, 96, 256, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 1, 1, 1, 4",
-      "vgpr_count": 646,
+      "vgpr_count": 630,
       "vgpr_spill_count": 0
     },
     {
@@ -5470,8 +5470,8 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x256x128_4x1_16x16x32_0x0x0_w1x4_c1x4_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x256x128_4x1_16x16x32_0x0x0_w1x4_c1x4_p3_v1024w1.s"
       },
-      "asm_lines": 3880,
-      "asm_va_vdst0": 31,
+      "asm_lines": 3859,
+      "asm_va_vdst0": 26,
       "asm_wmma": 576,
       "asm_wmma_dst_hi": 576,
       "cluster": [
@@ -5484,8 +5484,8 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "dis_lines": 2548,
-      "dis_va_vdst0": 31,
+      "dis_lines": 2516,
+      "dis_va_vdst0": 26,
       "dis_wmma": 576,
       "dis_wmma_dst_hi": 576,
       "group_segment_fixed_size": 287232,
@@ -5506,7 +5506,7 @@
         128
       ],
       "traits_args": "128, 96, 256, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 1, 4, 1, 4",
-      "vgpr_count": 646,
+      "vgpr_count": 630,
       "vgpr_spill_count": 0
     },
     {
@@ -5514,8 +5514,8 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x256x128_4x1_16x16x32_0x0x0_w1x4_c4x1_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x256x128_4x1_16x16x32_0x0x0_w1x4_c4x1_p3_v1024w1.s"
       },
-      "asm_lines": 3879,
-      "asm_va_vdst0": 31,
+      "asm_lines": 3858,
+      "asm_va_vdst0": 26,
       "asm_wmma": 576,
       "asm_wmma_dst_hi": 576,
       "cluster": [
@@ -5528,8 +5528,8 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "dis_lines": 2550,
-      "dis_va_vdst0": 31,
+      "dis_lines": 2518,
+      "dis_va_vdst0": 26,
       "dis_wmma": 576,
       "dis_wmma_dst_hi": 576,
       "group_segment_fixed_size": 287232,
@@ -5550,7 +5550,7 @@
         128
       ],
       "traits_args": "128, 96, 256, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 4, 1, 1, 4",
-      "vgpr_count": 646,
+      "vgpr_count": 630,
       "vgpr_spill_count": 0
     },
     {
@@ -5558,8 +5558,8 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x256x128_4x1_16x16x32_0x0x0_w1x4_c2x2_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x256x128_4x1_16x16x32_0x0x0_w1x4_c2x2_p3_v1024w1.s"
       },
-      "asm_lines": 3886,
-      "asm_va_vdst0": 31,
+      "asm_lines": 3865,
+      "asm_va_vdst0": 26,
       "asm_wmma": 576,
       "asm_wmma_dst_hi": 576,
       "cluster": [
@@ -5573,7 +5573,7 @@
         "-amdgpu-expert-scheduling-mode"
       ],
       "dis_lines": 2549,
-      "dis_va_vdst0": 31,
+      "dis_va_vdst0": 26,
       "dis_wmma": 576,
       "dis_wmma_dst_hi": 576,
       "group_segment_fixed_size": 287232,
@@ -5594,7 +5594,7 @@
         128
       ],
       "traits_args": "128, 96, 256, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 2, 2, 1, 4",
-      "vgpr_count": 646,
+      "vgpr_count": 630,
       "vgpr_spill_count": 0
     },
     {
@@ -5602,8 +5602,8 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x256x128_4x1_16x16x32_0x0x0_w1x4_c4x4_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x256x128_4x1_16x16x32_0x0x0_w1x4_c4x4_p3_v1024w1.s"
       },
-      "asm_lines": 3886,
-      "asm_va_vdst0": 31,
+      "asm_lines": 3865,
+      "asm_va_vdst0": 26,
       "asm_wmma": 576,
       "asm_wmma_dst_hi": 576,
       "cluster": [
@@ -5617,7 +5617,7 @@
         "-amdgpu-expert-scheduling-mode"
       ],
       "dis_lines": 2548,
-      "dis_va_vdst0": 31,
+      "dis_va_vdst0": 26,
       "dis_wmma": 576,
       "dis_wmma_dst_hi": 576,
       "group_segment_fixed_size": 287232,
@@ -5638,7 +5638,7 @@
         128
       ],
       "traits_args": "128, 96, 256, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 4, 4, 1, 4",
-      "vgpr_count": 646,
+      "vgpr_count": 630,
       "vgpr_spill_count": 0
     },
     {
@@ -5646,7 +5646,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x128x128_4x1_16x16x32_0x0x0_w1x4_c1x1_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x128x128_4x1_16x16x32_0x0x0_w1x4_c1x1_p3_v1024w1.s"
       },
-      "asm_lines": 2996,
+      "asm_lines": 2998,
       "asm_va_vdst0": 31,
       "asm_wmma": 384,
       "asm_wmma_dst_hi": 384,
@@ -5690,7 +5690,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x128x128_4x1_16x16x32_0x0x0_w1x4_c1x4_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x128x128_4x1_16x16x32_0x0x0_w1x4_c1x4_p3_v1024w1.s"
       },
-      "asm_lines": 2995,
+      "asm_lines": 2997,
       "asm_va_vdst0": 31,
       "asm_wmma": 384,
       "asm_wmma_dst_hi": 384,
@@ -5734,7 +5734,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x128x128_4x1_16x16x32_0x0x0_w1x4_c4x1_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x128x128_4x1_16x16x32_0x0x0_w1x4_c4x1_p3_v1024w1.s"
       },
-      "asm_lines": 2995,
+      "asm_lines": 2997,
       "asm_va_vdst0": 31,
       "asm_wmma": 384,
       "asm_wmma_dst_hi": 384,
@@ -5778,7 +5778,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x128x128_4x1_16x16x32_0x0x0_w1x4_c2x2_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x128x128_4x1_16x16x32_0x0x0_w1x4_c2x2_p3_v1024w1.s"
       },
-      "asm_lines": 3002,
+      "asm_lines": 3004,
       "asm_va_vdst0": 31,
       "asm_wmma": 384,
       "asm_wmma_dst_hi": 384,
@@ -5822,7 +5822,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x128x128_4x1_16x16x32_0x0x0_w1x4_c4x4_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x128x128_4x1_16x16x32_0x0x0_w1x4_c4x4_p3_v1024w1.s"
       },
-      "asm_lines": 3002,
+      "asm_lines": 3004,
       "asm_va_vdst0": 31,
       "asm_wmma": 384,
       "asm_wmma_dst_hi": 384,
@@ -5866,8 +5866,8 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x192x128_4x1_16x16x32_0x0x0_w1x4_c1x1_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x192x128_4x1_16x16x32_0x0x0_w1x4_c1x1_p3_v1024w1.s"
       },
-      "asm_lines": 4101,
-      "asm_va_vdst0": 36,
+      "asm_lines": 4116,
+      "asm_va_vdst0": 48,
       "asm_wmma": 576,
       "asm_wmma_dst_hi": 576,
       "cluster": [
@@ -5880,8 +5880,8 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "dis_lines": 2501,
-      "dis_va_vdst0": 36,
+      "dis_lines": 2533,
+      "dis_va_vdst0": 48,
       "dis_wmma": 576,
       "dis_wmma_dst_hi": 576,
       "group_segment_fixed_size": 261120,
@@ -5902,7 +5902,7 @@
         128
       ],
       "traits_args": "128, 128, 192, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 1, 1, 1, 4",
-      "vgpr_count": 618,
+      "vgpr_count": 610,
       "vgpr_spill_count": 0
     },
     {
@@ -5910,8 +5910,8 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x192x128_4x1_16x16x32_0x0x0_w1x4_c1x4_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x192x128_4x1_16x16x32_0x0x0_w1x4_c1x4_p3_v1024w1.s"
       },
-      "asm_lines": 4097,
-      "asm_va_vdst0": 36,
+      "asm_lines": 4112,
+      "asm_va_vdst0": 48,
       "asm_wmma": 576,
       "asm_wmma_dst_hi": 576,
       "cluster": [
@@ -5924,8 +5924,8 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "dis_lines": 2500,
-      "dis_va_vdst0": 36,
+      "dis_lines": 2532,
+      "dis_va_vdst0": 48,
       "dis_wmma": 576,
       "dis_wmma_dst_hi": 576,
       "group_segment_fixed_size": 261120,
@@ -5946,7 +5946,7 @@
         128
       ],
       "traits_args": "128, 128, 192, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 1, 4, 1, 4",
-      "vgpr_count": 618,
+      "vgpr_count": 610,
       "vgpr_spill_count": 0
     },
     {
@@ -5954,8 +5954,8 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x192x128_4x1_16x16x32_0x0x0_w1x4_c4x1_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x192x128_4x1_16x16x32_0x0x0_w1x4_c4x1_p3_v1024w1.s"
       },
-      "asm_lines": 4098,
-      "asm_va_vdst0": 36,
+      "asm_lines": 4113,
+      "asm_va_vdst0": 48,
       "asm_wmma": 576,
       "asm_wmma_dst_hi": 576,
       "cluster": [
@@ -5968,8 +5968,8 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "dis_lines": 2502,
-      "dis_va_vdst0": 36,
+      "dis_lines": 2534,
+      "dis_va_vdst0": 48,
       "dis_wmma": 576,
       "dis_wmma_dst_hi": 576,
       "group_segment_fixed_size": 261120,
@@ -5990,7 +5990,7 @@
         128
       ],
       "traits_args": "128, 128, 192, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 4, 1, 1, 4",
-      "vgpr_count": 618,
+      "vgpr_count": 610,
       "vgpr_spill_count": 0
     },
     {
@@ -5998,8 +5998,8 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x192x128_4x1_16x16x32_0x0x0_w1x4_c2x2_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x192x128_4x1_16x16x32_0x0x0_w1x4_c2x2_p3_v1024w1.s"
       },
-      "asm_lines": 4104,
-      "asm_va_vdst0": 36,
+      "asm_lines": 4119,
+      "asm_va_vdst0": 48,
       "asm_wmma": 576,
       "asm_wmma_dst_hi": 576,
       "cluster": [
@@ -6013,7 +6013,7 @@
         "-amdgpu-expert-scheduling-mode"
       ],
       "dis_lines": 2532,
-      "dis_va_vdst0": 36,
+      "dis_va_vdst0": 48,
       "dis_wmma": 576,
       "dis_wmma_dst_hi": 576,
       "group_segment_fixed_size": 261120,
@@ -6034,7 +6034,7 @@
         128
       ],
       "traits_args": "128, 128, 192, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 2, 2, 1, 4",
-      "vgpr_count": 618,
+      "vgpr_count": 610,
       "vgpr_spill_count": 0
     },
     {
@@ -6042,8 +6042,8 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x192x128_4x1_16x16x32_0x0x0_w1x4_c4x4_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x192x128_4x1_16x16x32_0x0x0_w1x4_c4x4_p3_v1024w1.s"
       },
-      "asm_lines": 4104,
-      "asm_va_vdst0": 36,
+      "asm_lines": 4119,
+      "asm_va_vdst0": 48,
       "asm_wmma": 576,
       "asm_wmma_dst_hi": 576,
       "cluster": [
@@ -6057,7 +6057,7 @@
         "-amdgpu-expert-scheduling-mode"
       ],
       "dis_lines": 2531,
-      "dis_va_vdst0": 36,
+      "dis_va_vdst0": 48,
       "dis_wmma": 576,
       "dis_wmma_dst_hi": 576,
       "group_segment_fixed_size": 261120,
@@ -6078,7 +6078,7 @@
         128
       ],
       "traits_args": "128, 128, 192, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 4, 4, 1, 4",
-      "vgpr_count": 618,
+      "vgpr_count": 610,
       "vgpr_spill_count": 0
     },
     {
@@ -6086,8 +6086,8 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x256x128_4x1_16x16x32_0x0x0_w1x4_c1x1_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x256x128_4x1_16x16x32_0x0x0_w1x4_c1x1_p3_v1024w1.s"
       },
-      "asm_lines": 4915,
-      "asm_va_vdst0": 45,
+      "asm_lines": 4886,
+      "asm_va_vdst0": 43,
       "asm_wmma": 768,
       "asm_wmma_dst_hi": 768,
       "cluster": [
@@ -6101,7 +6101,7 @@
         "-amdgpu-expert-scheduling-mode"
       ],
       "dis_lines": 3194,
-      "dis_va_vdst0": 45,
+      "dis_va_vdst0": 43,
       "dis_wmma": 768,
       "dis_wmma_dst_hi": 768,
       "group_segment_fixed_size": 313344,
@@ -6130,8 +6130,8 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x256x128_4x1_16x16x32_0x0x0_w1x4_c1x4_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x256x128_4x1_16x16x32_0x0x0_w1x4_c1x4_p3_v1024w1.s"
       },
-      "asm_lines": 4914,
-      "asm_va_vdst0": 46,
+      "asm_lines": 4885,
+      "asm_va_vdst0": 44,
       "asm_wmma": 768,
       "asm_wmma_dst_hi": 768,
       "cluster": [
@@ -6145,7 +6145,7 @@
         "-amdgpu-expert-scheduling-mode"
       ],
       "dis_lines": 3193,
-      "dis_va_vdst0": 46,
+      "dis_va_vdst0": 44,
       "dis_wmma": 768,
       "dis_wmma_dst_hi": 768,
       "group_segment_fixed_size": 313344,
@@ -6174,8 +6174,8 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x256x128_4x1_16x16x32_0x0x0_w1x4_c4x1_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x256x128_4x1_16x16x32_0x0x0_w1x4_c4x1_p3_v1024w1.s"
       },
-      "asm_lines": 4914,
-      "asm_va_vdst0": 46,
+      "asm_lines": 4885,
+      "asm_va_vdst0": 44,
       "asm_wmma": 768,
       "asm_wmma_dst_hi": 768,
       "cluster": [
@@ -6189,7 +6189,7 @@
         "-amdgpu-expert-scheduling-mode"
       ],
       "dis_lines": 3194,
-      "dis_va_vdst0": 46,
+      "dis_va_vdst0": 44,
       "dis_wmma": 768,
       "dis_wmma_dst_hi": 768,
       "group_segment_fixed_size": 313344,
@@ -6218,8 +6218,8 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x256x128_4x1_16x16x32_0x0x0_w1x4_c2x2_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x256x128_4x1_16x16x32_0x0x0_w1x4_c2x2_p3_v1024w1.s"
       },
-      "asm_lines": 4921,
-      "asm_va_vdst0": 46,
+      "asm_lines": 4892,
+      "asm_va_vdst0": 44,
       "asm_wmma": 768,
       "asm_wmma_dst_hi": 768,
       "cluster": [
@@ -6232,8 +6232,8 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "dis_lines": 3226,
-      "dis_va_vdst0": 46,
+      "dis_lines": 3194,
+      "dis_va_vdst0": 44,
       "dis_wmma": 768,
       "dis_wmma_dst_hi": 768,
       "group_segment_fixed_size": 313344,
@@ -6262,8 +6262,8 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x256x128_4x1_16x16x32_0x0x0_w1x4_c4x4_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x256x128_4x1_16x16x32_0x0x0_w1x4_c4x4_p3_v1024w1.s"
       },
-      "asm_lines": 4921,
-      "asm_va_vdst0": 46,
+      "asm_lines": 4892,
+      "asm_va_vdst0": 44,
       "asm_wmma": 768,
       "asm_wmma_dst_hi": 768,
       "cluster": [
@@ -6276,8 +6276,8 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "dis_lines": 3224,
-      "dis_va_vdst0": 46,
+      "dis_lines": 3192,
+      "dis_va_vdst0": 44,
       "dis_wmma": 768,
       "dis_wmma_dst_hi": 768,
       "group_segment_fixed_size": 313344,
@@ -6306,7 +6306,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x64x128_4x1_16x16x32_0x0x0_c1x1_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x64x128_4x1_16x16x32_0x0x0_c1x1_p3_v1024w1.s"
       },
-      "asm_lines": 2044,
+      "asm_lines": 2026,
       "asm_va_vdst0": 14,
       "asm_wmma": 192,
       "asm_wmma_dst_hi": 192,
@@ -6320,7 +6320,7 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "dis_lines": 1478,
+      "dis_lines": 1446,
       "dis_va_vdst0": 14,
       "dis_wmma": 192,
       "dis_wmma_dst_hi": 192,
@@ -6350,7 +6350,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x64x128_4x1_16x16x32_0x0x0_c1x2_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x64x128_4x1_16x16x32_0x0x0_c1x2_p3_v1024w1.s"
       },
-      "asm_lines": 2040,
+      "asm_lines": 2022,
       "asm_va_vdst0": 14,
       "asm_wmma": 192,
       "asm_wmma_dst_hi": 192,
@@ -6394,7 +6394,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x64x128_4x1_16x16x32_0x0x0_c1x3_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x64x128_4x1_16x16x32_0x0x0_c1x3_p3_v1024w1.s"
       },
-      "asm_lines": 2040,
+      "asm_lines": 2022,
       "asm_va_vdst0": 14,
       "asm_wmma": 192,
       "asm_wmma_dst_hi": 192,
@@ -6438,7 +6438,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x64x128_4x1_16x16x32_0x0x0_c1x4_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x64x128_4x1_16x16x32_0x0x0_c1x4_p3_v1024w1.s"
       },
-      "asm_lines": 2040,
+      "asm_lines": 2022,
       "asm_va_vdst0": 14,
       "asm_wmma": 192,
       "asm_wmma_dst_hi": 192,
@@ -6482,7 +6482,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x64x128_4x1_16x16x32_0x0x0_c2x1_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x64x128_4x1_16x16x32_0x0x0_c2x1_p3_v1024w1.s"
       },
-      "asm_lines": 2040,
+      "asm_lines": 2022,
       "asm_va_vdst0": 14,
       "asm_wmma": 192,
       "asm_wmma_dst_hi": 192,
@@ -6526,7 +6526,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x64x128_4x1_16x16x32_0x0x0_c2x2_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x64x128_4x1_16x16x32_0x0x0_c2x2_p3_v1024w1.s"
       },
-      "asm_lines": 2047,
+      "asm_lines": 2029,
       "asm_va_vdst0": 14,
       "asm_wmma": 192,
       "asm_wmma_dst_hi": 192,
@@ -6540,7 +6540,7 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "dis_lines": 1478,
+      "dis_lines": 1446,
       "dis_va_vdst0": 14,
       "dis_wmma": 192,
       "dis_wmma_dst_hi": 192,
@@ -6570,7 +6570,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x64x128_4x1_16x16x32_0x0x0_c2x3_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x64x128_4x1_16x16x32_0x0x0_c2x3_p3_v1024w1.s"
       },
-      "asm_lines": 2047,
+      "asm_lines": 2029,
       "asm_va_vdst0": 14,
       "asm_wmma": 192,
       "asm_wmma_dst_hi": 192,
@@ -6584,7 +6584,7 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "dis_lines": 1478,
+      "dis_lines": 1446,
       "dis_va_vdst0": 14,
       "dis_wmma": 192,
       "dis_wmma_dst_hi": 192,
@@ -6614,7 +6614,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x64x128_4x1_16x16x32_0x0x0_c2x4_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x64x128_4x1_16x16x32_0x0x0_c2x4_p3_v1024w1.s"
       },
-      "asm_lines": 2047,
+      "asm_lines": 2029,
       "asm_va_vdst0": 14,
       "asm_wmma": 192,
       "asm_wmma_dst_hi": 192,
@@ -6628,7 +6628,7 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "dis_lines": 1477,
+      "dis_lines": 1445,
       "dis_va_vdst0": 14,
       "dis_wmma": 192,
       "dis_wmma_dst_hi": 192,
@@ -6658,7 +6658,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x64x128_4x1_16x16x32_0x0x0_c3x1_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x64x128_4x1_16x16x32_0x0x0_c3x1_p3_v1024w1.s"
       },
-      "asm_lines": 2040,
+      "asm_lines": 2022,
       "asm_va_vdst0": 14,
       "asm_wmma": 192,
       "asm_wmma_dst_hi": 192,
@@ -6702,7 +6702,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x64x128_4x1_16x16x32_0x0x0_c3x2_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x64x128_4x1_16x16x32_0x0x0_c3x2_p3_v1024w1.s"
       },
-      "asm_lines": 2047,
+      "asm_lines": 2029,
       "asm_va_vdst0": 14,
       "asm_wmma": 192,
       "asm_wmma_dst_hi": 192,
@@ -6716,7 +6716,7 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "dis_lines": 1478,
+      "dis_lines": 1446,
       "dis_va_vdst0": 14,
       "dis_wmma": 192,
       "dis_wmma_dst_hi": 192,
@@ -6746,7 +6746,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x64x128_4x1_16x16x32_0x0x0_c3x3_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x64x128_4x1_16x16x32_0x0x0_c3x3_p3_v1024w1.s"
       },
-      "asm_lines": 2047,
+      "asm_lines": 2029,
       "asm_va_vdst0": 14,
       "asm_wmma": 192,
       "asm_wmma_dst_hi": 192,
@@ -6760,7 +6760,7 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "dis_lines": 1477,
+      "dis_lines": 1445,
       "dis_va_vdst0": 14,
       "dis_wmma": 192,
       "dis_wmma_dst_hi": 192,
@@ -6790,7 +6790,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x64x128_4x1_16x16x32_0x0x0_c3x4_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x64x128_4x1_16x16x32_0x0x0_c3x4_p3_v1024w1.s"
       },
-      "asm_lines": 2047,
+      "asm_lines": 2029,
       "asm_va_vdst0": 14,
       "asm_wmma": 192,
       "asm_wmma_dst_hi": 192,
@@ -6804,7 +6804,7 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "dis_lines": 1477,
+      "dis_lines": 1445,
       "dis_va_vdst0": 14,
       "dis_wmma": 192,
       "dis_wmma_dst_hi": 192,
@@ -6834,7 +6834,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x64x128_4x1_16x16x32_0x0x0_c4x1_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x64x128_4x1_16x16x32_0x0x0_c4x1_p3_v1024w1.s"
       },
-      "asm_lines": 2040,
+      "asm_lines": 2022,
       "asm_va_vdst0": 14,
       "asm_wmma": 192,
       "asm_wmma_dst_hi": 192,
@@ -6878,7 +6878,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x64x128_4x1_16x16x32_0x0x0_c4x2_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x64x128_4x1_16x16x32_0x0x0_c4x2_p3_v1024w1.s"
       },
-      "asm_lines": 2047,
+      "asm_lines": 2029,
       "asm_va_vdst0": 14,
       "asm_wmma": 192,
       "asm_wmma_dst_hi": 192,
@@ -6892,7 +6892,7 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "dis_lines": 1478,
+      "dis_lines": 1446,
       "dis_va_vdst0": 14,
       "dis_wmma": 192,
       "dis_wmma_dst_hi": 192,
@@ -6922,7 +6922,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x64x128_4x1_16x16x32_0x0x0_c4x3_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x64x128_4x1_16x16x32_0x0x0_c4x3_p3_v1024w1.s"
       },
-      "asm_lines": 2047,
+      "asm_lines": 2029,
       "asm_va_vdst0": 14,
       "asm_wmma": 192,
       "asm_wmma_dst_hi": 192,
@@ -6936,7 +6936,7 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "dis_lines": 1477,
+      "dis_lines": 1445,
       "dis_va_vdst0": 14,
       "dis_wmma": 192,
       "dis_wmma_dst_hi": 192,
@@ -6966,7 +6966,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_co_128x128x64x128_4x1_16x16x32_0x0x0_c4x4_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_co_128x128x64x128_4x1_16x16x32_0x0x0_c4x4_p3_v1024w1.s"
       },
-      "asm_lines": 2047,
+      "asm_lines": 2029,
       "asm_va_vdst0": 14,
       "asm_wmma": 192,
       "asm_wmma_dst_hi": 192,
@@ -6980,7 +6980,7 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "dis_lines": 1477,
+      "dis_lines": 1445,
       "dis_va_vdst0": 14,
       "dis_wmma": 192,
       "dis_wmma_dst_hi": 192,
@@ -7010,8 +7010,8 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x64x128_4x1_16x16x32_0x0x0_w4x1_c1x1_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x64x128_4x1_16x16x32_0x0x0_w4x1_c1x1_p3_v1024w1.s"
       },
-      "asm_lines": 2067,
-      "asm_va_vdst0": 15,
+      "asm_lines": 2041,
+      "asm_va_vdst0": 16,
       "asm_wmma": 192,
       "asm_wmma_dst_hi": 192,
       "cluster": [
@@ -7024,8 +7024,8 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "dis_lines": 1501,
-      "dis_va_vdst0": 15,
+      "dis_lines": 1469,
+      "dis_va_vdst0": 16,
       "dis_wmma": 192,
       "dis_wmma_dst_hi": 192,
       "group_segment_fixed_size": 164864,
@@ -7054,8 +7054,8 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x64x128_4x1_16x16x32_0x0x0_w4x1_c1x4_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x64x128_4x1_16x16x32_0x0x0_w4x1_c1x4_p3_v1024w1.s"
       },
-      "asm_lines": 2064,
-      "asm_va_vdst0": 15,
+      "asm_lines": 2038,
+      "asm_va_vdst0": 16,
       "asm_wmma": 192,
       "asm_wmma_dst_hi": 192,
       "cluster": [
@@ -7068,8 +7068,8 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "dis_lines": 1500,
-      "dis_va_vdst0": 15,
+      "dis_lines": 1468,
+      "dis_va_vdst0": 16,
       "dis_wmma": 192,
       "dis_wmma_dst_hi": 192,
       "group_segment_fixed_size": 164864,
@@ -7098,8 +7098,8 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x64x128_4x1_16x16x32_0x0x0_w4x1_c4x1_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x64x128_4x1_16x16x32_0x0x0_w4x1_c4x1_p3_v1024w1.s"
       },
-      "asm_lines": 2064,
-      "asm_va_vdst0": 15,
+      "asm_lines": 2038,
+      "asm_va_vdst0": 16,
       "asm_wmma": 192,
       "asm_wmma_dst_hi": 192,
       "cluster": [
@@ -7112,8 +7112,8 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "dis_lines": 1501,
-      "dis_va_vdst0": 15,
+      "dis_lines": 1469,
+      "dis_va_vdst0": 16,
       "dis_wmma": 192,
       "dis_wmma_dst_hi": 192,
       "group_segment_fixed_size": 164864,
@@ -7142,8 +7142,8 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x64x128_4x1_16x16x32_0x0x0_w4x1_c2x2_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x64x128_4x1_16x16x32_0x0x0_w4x1_c2x2_p3_v1024w1.s"
       },
-      "asm_lines": 2071,
-      "asm_va_vdst0": 15,
+      "asm_lines": 2045,
+      "asm_va_vdst0": 16,
       "asm_wmma": 192,
       "asm_wmma_dst_hi": 192,
       "cluster": [
@@ -7156,8 +7156,8 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "dis_lines": 1500,
-      "dis_va_vdst0": 15,
+      "dis_lines": 1468,
+      "dis_va_vdst0": 16,
       "dis_wmma": 192,
       "dis_wmma_dst_hi": 192,
       "group_segment_fixed_size": 164864,
@@ -7186,8 +7186,8 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x64x128_4x1_16x16x32_0x0x0_w4x1_c4x4_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x64x128_4x1_16x16x32_0x0x0_w4x1_c4x4_p3_v1024w1.s"
       },
-      "asm_lines": 2071,
-      "asm_va_vdst0": 15,
+      "asm_lines": 2045,
+      "asm_va_vdst0": 16,
       "asm_wmma": 192,
       "asm_wmma_dst_hi": 192,
       "cluster": [
@@ -7200,8 +7200,8 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "dis_lines": 1499,
-      "dis_va_vdst0": 15,
+      "dis_lines": 1467,
+      "dis_va_vdst0": 16,
       "dis_wmma": 192,
       "dis_wmma_dst_hi": 192,
       "group_segment_fixed_size": 164864,
@@ -7230,7 +7230,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x64x128_4x1_16x16x32_0x0x0_w2x2_c1x1_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x64x128_4x1_16x16x32_0x0x0_w2x2_c1x1_p3_v1024w1.s"
       },
-      "asm_lines": 1343,
+      "asm_lines": 1345,
       "asm_va_vdst0": 10,
       "asm_wmma": 96,
       "asm_wmma_dst_hi": 96,
@@ -7274,7 +7274,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x64x128_4x1_16x16x32_0x0x0_w2x2_c1x4_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x64x128_4x1_16x16x32_0x0x0_w2x2_c1x4_p3_v1024w1.s"
       },
-      "asm_lines": 1342,
+      "asm_lines": 1344,
       "asm_va_vdst0": 10,
       "asm_wmma": 96,
       "asm_wmma_dst_hi": 96,
@@ -7318,7 +7318,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x64x128_4x1_16x16x32_0x0x0_w2x2_c4x1_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x64x128_4x1_16x16x32_0x0x0_w2x2_c4x1_p3_v1024w1.s"
       },
-      "asm_lines": 1342,
+      "asm_lines": 1344,
       "asm_va_vdst0": 10,
       "asm_wmma": 96,
       "asm_wmma_dst_hi": 96,
@@ -7362,7 +7362,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x64x128_4x1_16x16x32_0x0x0_w2x2_c2x2_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x64x128_4x1_16x16x32_0x0x0_w2x2_c2x2_p3_v1024w1.s"
       },
-      "asm_lines": 1349,
+      "asm_lines": 1351,
       "asm_va_vdst0": 10,
       "asm_wmma": 96,
       "asm_wmma_dst_hi": 96,
@@ -7406,7 +7406,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x64x128_4x1_16x16x32_0x0x0_w2x2_c4x4_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x64x128_4x1_16x16x32_0x0x0_w2x2_c4x4_p3_v1024w1.s"
       },
-      "asm_lines": 1349,
+      "asm_lines": 1351,
       "asm_va_vdst0": 10,
       "asm_wmma": 96,
       "asm_wmma_dst_hi": 96,
@@ -7420,7 +7420,7 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "dis_lines": 977,
+      "dis_lines": 1009,
       "dis_va_vdst0": 10,
       "dis_wmma": 96,
       "dis_wmma_dst_hi": 96,
@@ -7450,8 +7450,8 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x128x128_4x1_16x16x32_0x0x0_w2x2_c1x1_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x128x128_4x1_16x16x32_0x0x0_w2x2_c1x1_p3_v1024w1.s"
       },
-      "asm_lines": 2059,
-      "asm_va_vdst0": 18,
+      "asm_lines": 2045,
+      "asm_va_vdst0": 17,
       "asm_wmma": 192,
       "asm_wmma_dst_hi": 192,
       "cluster": [
@@ -7464,8 +7464,8 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "dis_lines": 1484,
-      "dis_va_vdst0": 18,
+      "dis_lines": 1452,
+      "dis_va_vdst0": 17,
       "dis_wmma": 192,
       "dis_wmma_dst_hi": 192,
       "group_segment_fixed_size": 164864,
@@ -7494,8 +7494,8 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x128x128_4x1_16x16x32_0x0x0_w2x2_c1x4_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x128x128_4x1_16x16x32_0x0x0_w2x2_c1x4_p3_v1024w1.s"
       },
-      "asm_lines": 2058,
-      "asm_va_vdst0": 19,
+      "asm_lines": 2044,
+      "asm_va_vdst0": 18,
       "asm_wmma": 192,
       "asm_wmma_dst_hi": 192,
       "cluster": [
@@ -7508,8 +7508,8 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "dis_lines": 1483,
-      "dis_va_vdst0": 19,
+      "dis_lines": 1451,
+      "dis_va_vdst0": 18,
       "dis_wmma": 192,
       "dis_wmma_dst_hi": 192,
       "group_segment_fixed_size": 164864,
@@ -7538,8 +7538,8 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x128x128_4x1_16x16x32_0x0x0_w2x2_c4x1_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x128x128_4x1_16x16x32_0x0x0_w2x2_c4x1_p3_v1024w1.s"
       },
-      "asm_lines": 2058,
-      "asm_va_vdst0": 19,
+      "asm_lines": 2044,
+      "asm_va_vdst0": 18,
       "asm_wmma": 192,
       "asm_wmma_dst_hi": 192,
       "cluster": [
@@ -7552,8 +7552,8 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "dis_lines": 1484,
-      "dis_va_vdst0": 19,
+      "dis_lines": 1452,
+      "dis_va_vdst0": 18,
       "dis_wmma": 192,
       "dis_wmma_dst_hi": 192,
       "group_segment_fixed_size": 164864,
@@ -7582,8 +7582,8 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x128x128_4x1_16x16x32_0x0x0_w2x2_c2x2_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x128x128_4x1_16x16x32_0x0x0_w2x2_c2x2_p3_v1024w1.s"
       },
-      "asm_lines": 2065,
-      "asm_va_vdst0": 19,
+      "asm_lines": 2051,
+      "asm_va_vdst0": 18,
       "asm_wmma": 192,
       "asm_wmma_dst_hi": 192,
       "cluster": [
@@ -7597,7 +7597,7 @@
         "-amdgpu-expert-scheduling-mode"
       ],
       "dis_lines": 1484,
-      "dis_va_vdst0": 19,
+      "dis_va_vdst0": 18,
       "dis_wmma": 192,
       "dis_wmma_dst_hi": 192,
       "group_segment_fixed_size": 164864,
@@ -7626,8 +7626,8 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x128x128_4x1_16x16x32_0x0x0_w2x2_c4x4_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x128x128_4x1_16x16x32_0x0x0_w2x2_c4x4_p3_v1024w1.s"
       },
-      "asm_lines": 2065,
-      "asm_va_vdst0": 19,
+      "asm_lines": 2051,
+      "asm_va_vdst0": 18,
       "asm_wmma": 192,
       "asm_wmma_dst_hi": 192,
       "cluster": [
@@ -7641,7 +7641,7 @@
         "-amdgpu-expert-scheduling-mode"
       ],
       "dis_lines": 1482,
-      "dis_va_vdst0": 19,
+      "dis_va_vdst0": 18,
       "dis_wmma": 192,
       "dis_wmma_dst_hi": 192,
       "group_segment_fixed_size": 164864,
@@ -7670,7 +7670,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x64x128_4x1_16x16x32_0x0x0_w2x2_c1x1_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x64x128_4x1_16x16x32_0x0x0_w2x2_c1x1_p3_v1024w1.s"
       },
-      "asm_lines": 1638,
+      "asm_lines": 1640,
       "asm_va_vdst0": 13,
       "asm_wmma": 144,
       "asm_wmma_dst_hi": 144,
@@ -7714,7 +7714,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x64x128_4x1_16x16x32_0x0x0_w2x2_c1x4_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x64x128_4x1_16x16x32_0x0x0_w2x2_c1x4_p3_v1024w1.s"
       },
-      "asm_lines": 1635,
+      "asm_lines": 1637,
       "asm_va_vdst0": 13,
       "asm_wmma": 144,
       "asm_wmma_dst_hi": 144,
@@ -7758,7 +7758,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x64x128_4x1_16x16x32_0x0x0_w2x2_c4x1_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x64x128_4x1_16x16x32_0x0x0_w2x2_c4x1_p3_v1024w1.s"
       },
-      "asm_lines": 1634,
+      "asm_lines": 1636,
       "asm_va_vdst0": 13,
       "asm_wmma": 144,
       "asm_wmma_dst_hi": 144,
@@ -7802,7 +7802,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x64x128_4x1_16x16x32_0x0x0_w2x2_c2x2_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x64x128_4x1_16x16x32_0x0x0_w2x2_c2x2_p3_v1024w1.s"
       },
-      "asm_lines": 1641,
+      "asm_lines": 1643,
       "asm_va_vdst0": 13,
       "asm_wmma": 144,
       "asm_wmma_dst_hi": 144,
@@ -7846,7 +7846,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x64x128_4x1_16x16x32_0x0x0_w2x2_c4x4_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x64x128_4x1_16x16x32_0x0x0_w2x2_c4x4_p3_v1024w1.s"
       },
-      "asm_lines": 1641,
+      "asm_lines": 1643,
       "asm_va_vdst0": 13,
       "asm_wmma": 144,
       "asm_wmma_dst_hi": 144,
@@ -7890,7 +7890,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x64x128_4x1_16x16x32_0x0x0_w2x2_c1x1_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x64x128_4x1_16x16x32_0x0x0_w2x2_c1x1_p3_v1024w1.s"
       },
-      "asm_lines": 1977,
+      "asm_lines": 1979,
       "asm_va_vdst0": 20,
       "asm_wmma": 192,
       "asm_wmma_dst_hi": 192,
@@ -7934,7 +7934,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x64x128_4x1_16x16x32_0x0x0_w2x2_c1x4_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x64x128_4x1_16x16x32_0x0x0_w2x2_c1x4_p3_v1024w1.s"
       },
-      "asm_lines": 1974,
+      "asm_lines": 1976,
       "asm_va_vdst0": 20,
       "asm_wmma": 192,
       "asm_wmma_dst_hi": 192,
@@ -7978,7 +7978,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x64x128_4x1_16x16x32_0x0x0_w2x2_c4x1_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x64x128_4x1_16x16x32_0x0x0_w2x2_c4x1_p3_v1024w1.s"
       },
-      "asm_lines": 1974,
+      "asm_lines": 1976,
       "asm_va_vdst0": 20,
       "asm_wmma": 192,
       "asm_wmma_dst_hi": 192,
@@ -8022,7 +8022,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x64x128_4x1_16x16x32_0x0x0_w2x2_c2x2_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x64x128_4x1_16x16x32_0x0x0_w2x2_c2x2_p3_v1024w1.s"
       },
-      "asm_lines": 1981,
+      "asm_lines": 1983,
       "asm_va_vdst0": 20,
       "asm_wmma": 192,
       "asm_wmma_dst_hi": 192,
@@ -8036,7 +8036,7 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "dis_lines": 1408,
+      "dis_lines": 1440,
       "dis_va_vdst0": 20,
       "dis_wmma": 192,
       "dis_wmma_dst_hi": 192,
@@ -8066,7 +8066,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x64x128_4x1_16x16x32_0x0x0_w2x2_c4x4_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x64x128_4x1_16x16x32_0x0x0_w2x2_c4x4_p3_v1024w1.s"
       },
-      "asm_lines": 1981,
+      "asm_lines": 1983,
       "asm_va_vdst0": 20,
       "asm_wmma": 192,
       "asm_wmma_dst_hi": 192,
@@ -8110,8 +8110,8 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x64x128_4x1_16x16x32_0x0x0_w1x4_c1x1_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x64x128_4x1_16x16x32_0x0x0_w1x4_c1x1_p3_v1024w1.s"
       },
-      "asm_lines": 1340,
-      "asm_va_vdst0": 11,
+      "asm_lines": 1337,
+      "asm_va_vdst0": 13,
       "asm_wmma": 96,
       "asm_wmma_dst_hi": 96,
       "cluster": [
@@ -8125,7 +8125,7 @@
         "-amdgpu-expert-scheduling-mode"
       ],
       "dis_lines": 983,
-      "dis_va_vdst0": 11,
+      "dis_va_vdst0": 13,
       "dis_wmma": 96,
       "dis_wmma_dst_hi": 96,
       "group_segment_fixed_size": 164864,
@@ -8154,8 +8154,8 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x64x128_4x1_16x16x32_0x0x0_w1x4_c1x4_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x64x128_4x1_16x16x32_0x0x0_w1x4_c1x4_p3_v1024w1.s"
       },
-      "asm_lines": 1339,
-      "asm_va_vdst0": 11,
+      "asm_lines": 1336,
+      "asm_va_vdst0": 13,
       "asm_wmma": 96,
       "asm_wmma_dst_hi": 96,
       "cluster": [
@@ -8169,7 +8169,7 @@
         "-amdgpu-expert-scheduling-mode"
       ],
       "dis_lines": 982,
-      "dis_va_vdst0": 11,
+      "dis_va_vdst0": 13,
       "dis_wmma": 96,
       "dis_wmma_dst_hi": 96,
       "group_segment_fixed_size": 164864,
@@ -8198,8 +8198,8 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x64x128_4x1_16x16x32_0x0x0_w1x4_c4x1_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x64x128_4x1_16x16x32_0x0x0_w1x4_c4x1_p3_v1024w1.s"
       },
-      "asm_lines": 1339,
-      "asm_va_vdst0": 11,
+      "asm_lines": 1336,
+      "asm_va_vdst0": 13,
       "asm_wmma": 96,
       "asm_wmma_dst_hi": 96,
       "cluster": [
@@ -8213,7 +8213,7 @@
         "-amdgpu-expert-scheduling-mode"
       ],
       "dis_lines": 983,
-      "dis_va_vdst0": 11,
+      "dis_va_vdst0": 13,
       "dis_wmma": 96,
       "dis_wmma_dst_hi": 96,
       "group_segment_fixed_size": 164864,
@@ -8242,8 +8242,8 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x64x128_4x1_16x16x32_0x0x0_w1x4_c2x2_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x64x128_4x1_16x16x32_0x0x0_w1x4_c2x2_p3_v1024w1.s"
       },
-      "asm_lines": 1346,
-      "asm_va_vdst0": 11,
+      "asm_lines": 1343,
+      "asm_va_vdst0": 13,
       "asm_wmma": 96,
       "asm_wmma_dst_hi": 96,
       "cluster": [
@@ -8257,7 +8257,7 @@
         "-amdgpu-expert-scheduling-mode"
       ],
       "dis_lines": 982,
-      "dis_va_vdst0": 11,
+      "dis_va_vdst0": 13,
       "dis_wmma": 96,
       "dis_wmma_dst_hi": 96,
       "group_segment_fixed_size": 164864,
@@ -8286,8 +8286,8 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x64x128_4x1_16x16x32_0x0x0_w1x4_c4x4_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x64x128_4x1_16x16x32_0x0x0_w1x4_c4x4_p3_v1024w1.s"
       },
-      "asm_lines": 1346,
-      "asm_va_vdst0": 11,
+      "asm_lines": 1343,
+      "asm_va_vdst0": 13,
       "asm_wmma": 96,
       "asm_wmma_dst_hi": 96,
       "cluster": [
@@ -8301,7 +8301,7 @@
         "-amdgpu-expert-scheduling-mode"
       ],
       "dis_lines": 981,
-      "dis_va_vdst0": 11,
+      "dis_va_vdst0": 13,
       "dis_wmma": 96,
       "dis_wmma_dst_hi": 96,
       "group_segment_fixed_size": 164864,
@@ -8330,7 +8330,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x128x128_4x1_16x16x32_0x0x0_w1x4_c1x1_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x128x128_4x1_16x16x32_0x0x0_w1x4_c1x1_p3_v1024w1.s"
       },
-      "asm_lines": 1898,
+      "asm_lines": 1900,
       "asm_va_vdst0": 16,
       "asm_wmma": 192,
       "asm_wmma_dst_hi": 192,
@@ -8374,7 +8374,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x128x128_4x1_16x16x32_0x0x0_w1x4_c1x4_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x128x128_4x1_16x16x32_0x0x0_w1x4_c1x4_p3_v1024w1.s"
       },
-      "asm_lines": 1895,
+      "asm_lines": 1897,
       "asm_va_vdst0": 16,
       "asm_wmma": 192,
       "asm_wmma_dst_hi": 192,
@@ -8418,7 +8418,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x128x128_4x1_16x16x32_0x0x0_w1x4_c4x1_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x128x128_4x1_16x16x32_0x0x0_w1x4_c4x1_p3_v1024w1.s"
       },
-      "asm_lines": 1895,
+      "asm_lines": 1897,
       "asm_va_vdst0": 16,
       "asm_wmma": 192,
       "asm_wmma_dst_hi": 192,
@@ -8462,7 +8462,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x128x128_4x1_16x16x32_0x0x0_w1x4_c2x2_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x128x128_4x1_16x16x32_0x0x0_w1x4_c2x2_p3_v1024w1.s"
       },
-      "asm_lines": 1902,
+      "asm_lines": 1904,
       "asm_va_vdst0": 16,
       "asm_wmma": 192,
       "asm_wmma_dst_hi": 192,
@@ -8506,7 +8506,7 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x128x128_4x1_16x16x32_0x0x0_w1x4_c4x4_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x64x128x128_4x1_16x16x32_0x0x0_w1x4_c4x4_p3_v1024w1.s"
       },
-      "asm_lines": 1902,
+      "asm_lines": 1904,
       "asm_va_vdst0": 16,
       "asm_wmma": 192,
       "asm_wmma_dst_hi": 192,
@@ -8550,8 +8550,8 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x64x128_4x1_16x16x32_0x0x0_w1x4_c1x1_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x64x128_4x1_16x16x32_0x0x0_w1x4_c1x1_p3_v1024w1.s"
       },
-      "asm_lines": 1709,
-      "asm_va_vdst0": 13,
+      "asm_lines": 1713,
+      "asm_va_vdst0": 15,
       "asm_wmma": 144,
       "asm_wmma_dst_hi": 144,
       "cluster": [
@@ -8565,7 +8565,7 @@
         "-amdgpu-expert-scheduling-mode"
       ],
       "dis_lines": 1232,
-      "dis_va_vdst0": 13,
+      "dis_va_vdst0": 15,
       "dis_wmma": 144,
       "dis_wmma_dst_hi": 144,
       "group_segment_fixed_size": 164864,
@@ -8586,7 +8586,7 @@
         128
       ],
       "traits_args": "128, 96, 64, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 1, 1, 1, 4",
-      "vgpr_count": 336,
+      "vgpr_count": 344,
       "vgpr_spill_count": 0
     },
     {
@@ -8594,8 +8594,8 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x64x128_4x1_16x16x32_0x0x0_w1x4_c1x4_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x64x128_4x1_16x16x32_0x0x0_w1x4_c1x4_p3_v1024w1.s"
       },
-      "asm_lines": 1706,
-      "asm_va_vdst0": 13,
+      "asm_lines": 1710,
+      "asm_va_vdst0": 15,
       "asm_wmma": 144,
       "asm_wmma_dst_hi": 144,
       "cluster": [
@@ -8609,7 +8609,7 @@
         "-amdgpu-expert-scheduling-mode"
       ],
       "dis_lines": 1231,
-      "dis_va_vdst0": 13,
+      "dis_va_vdst0": 15,
       "dis_wmma": 144,
       "dis_wmma_dst_hi": 144,
       "group_segment_fixed_size": 164864,
@@ -8630,7 +8630,7 @@
         128
       ],
       "traits_args": "128, 96, 64, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 1, 4, 1, 4",
-      "vgpr_count": 336,
+      "vgpr_count": 344,
       "vgpr_spill_count": 0
     },
     {
@@ -8638,8 +8638,8 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x64x128_4x1_16x16x32_0x0x0_w1x4_c4x1_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x64x128_4x1_16x16x32_0x0x0_w1x4_c4x1_p3_v1024w1.s"
       },
-      "asm_lines": 1705,
-      "asm_va_vdst0": 13,
+      "asm_lines": 1709,
+      "asm_va_vdst0": 15,
       "asm_wmma": 144,
       "asm_wmma_dst_hi": 144,
       "cluster": [
@@ -8653,7 +8653,7 @@
         "-amdgpu-expert-scheduling-mode"
       ],
       "dis_lines": 1233,
-      "dis_va_vdst0": 13,
+      "dis_va_vdst0": 15,
       "dis_wmma": 144,
       "dis_wmma_dst_hi": 144,
       "group_segment_fixed_size": 164864,
@@ -8674,7 +8674,7 @@
         128
       ],
       "traits_args": "128, 96, 64, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 4, 1, 1, 4",
-      "vgpr_count": 336,
+      "vgpr_count": 344,
       "vgpr_spill_count": 0
     },
     {
@@ -8682,8 +8682,8 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x64x128_4x1_16x16x32_0x0x0_w1x4_c2x2_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x64x128_4x1_16x16x32_0x0x0_w1x4_c2x2_p3_v1024w1.s"
       },
-      "asm_lines": 1712,
-      "asm_va_vdst0": 13,
+      "asm_lines": 1716,
+      "asm_va_vdst0": 15,
       "asm_wmma": 144,
       "asm_wmma_dst_hi": 144,
       "cluster": [
@@ -8697,7 +8697,7 @@
         "-amdgpu-expert-scheduling-mode"
       ],
       "dis_lines": 1232,
-      "dis_va_vdst0": 13,
+      "dis_va_vdst0": 15,
       "dis_wmma": 144,
       "dis_wmma_dst_hi": 144,
       "group_segment_fixed_size": 164864,
@@ -8718,7 +8718,7 @@
         128
       ],
       "traits_args": "128, 96, 64, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 2, 2, 1, 4",
-      "vgpr_count": 336,
+      "vgpr_count": 344,
       "vgpr_spill_count": 0
     },
     {
@@ -8726,8 +8726,8 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x64x128_4x1_16x16x32_0x0x0_w1x4_c4x4_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x96x64x128_4x1_16x16x32_0x0x0_w1x4_c4x4_p3_v1024w1.s"
       },
-      "asm_lines": 1712,
-      "asm_va_vdst0": 13,
+      "asm_lines": 1716,
+      "asm_va_vdst0": 15,
       "asm_wmma": 144,
       "asm_wmma_dst_hi": 144,
       "cluster": [
@@ -8741,7 +8741,7 @@
         "-amdgpu-expert-scheduling-mode"
       ],
       "dis_lines": 1231,
-      "dis_va_vdst0": 13,
+      "dis_va_vdst0": 15,
       "dis_wmma": 144,
       "dis_wmma_dst_hi": 144,
       "group_segment_fixed_size": 164864,
@@ -8762,7 +8762,7 @@
         128
       ],
       "traits_args": "128, 96, 64, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 4, 4, 1, 4",
-      "vgpr_count": 336,
+      "vgpr_count": 344,
       "vgpr_spill_count": 0
     },
     {
@@ -8770,8 +8770,8 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x64x128_4x1_16x16x32_0x0x0_w1x4_c1x1_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x64x128_4x1_16x16x32_0x0x0_w1x4_c1x1_p3_v1024w1.s"
       },
-      "asm_lines": 2174,
-      "asm_va_vdst0": 23,
+      "asm_lines": 2175,
+      "asm_va_vdst0": 28,
       "asm_wmma": 192,
       "asm_wmma_dst_hi": 192,
       "cluster": [
@@ -8785,7 +8785,7 @@
         "-amdgpu-expert-scheduling-mode"
       ],
       "dis_lines": 1584,
-      "dis_va_vdst0": 23,
+      "dis_va_vdst0": 28,
       "dis_wmma": 192,
       "dis_wmma_dst_hi": 192,
       "group_segment_fixed_size": 164864,
@@ -8806,7 +8806,7 @@
         128
       ],
       "traits_args": "128, 128, 64, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 1, 1, 1, 4",
-      "vgpr_count": 450,
+      "vgpr_count": 466,
       "vgpr_spill_count": 0
     },
     {
@@ -8814,8 +8814,8 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x64x128_4x1_16x16x32_0x0x0_w1x4_c1x4_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x64x128_4x1_16x16x32_0x0x0_w1x4_c1x4_p3_v1024w1.s"
       },
-      "asm_lines": 2171,
-      "asm_va_vdst0": 23,
+      "asm_lines": 2172,
+      "asm_va_vdst0": 28,
       "asm_wmma": 192,
       "asm_wmma_dst_hi": 192,
       "cluster": [
@@ -8829,7 +8829,7 @@
         "-amdgpu-expert-scheduling-mode"
       ],
       "dis_lines": 1583,
-      "dis_va_vdst0": 23,
+      "dis_va_vdst0": 28,
       "dis_wmma": 192,
       "dis_wmma_dst_hi": 192,
       "group_segment_fixed_size": 164864,
@@ -8850,7 +8850,7 @@
         128
       ],
       "traits_args": "128, 128, 64, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 1, 4, 1, 4",
-      "vgpr_count": 450,
+      "vgpr_count": 466,
       "vgpr_spill_count": 0
     },
     {
@@ -8858,8 +8858,8 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x64x128_4x1_16x16x32_0x0x0_w1x4_c4x1_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x64x128_4x1_16x16x32_0x0x0_w1x4_c4x1_p3_v1024w1.s"
       },
-      "asm_lines": 2171,
-      "asm_va_vdst0": 23,
+      "asm_lines": 2172,
+      "asm_va_vdst0": 28,
       "asm_wmma": 192,
       "asm_wmma_dst_hi": 192,
       "cluster": [
@@ -8873,7 +8873,7 @@
         "-amdgpu-expert-scheduling-mode"
       ],
       "dis_lines": 1584,
-      "dis_va_vdst0": 23,
+      "dis_va_vdst0": 28,
       "dis_wmma": 192,
       "dis_wmma_dst_hi": 192,
       "group_segment_fixed_size": 164864,
@@ -8894,7 +8894,7 @@
         128
       ],
       "traits_args": "128, 128, 64, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 4, 1, 1, 4",
-      "vgpr_count": 450,
+      "vgpr_count": 466,
       "vgpr_spill_count": 0
     },
     {
@@ -8902,8 +8902,8 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x64x128_4x1_16x16x32_0x0x0_w1x4_c2x2_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x64x128_4x1_16x16x32_0x0x0_w1x4_c2x2_p3_v1024w1.s"
       },
-      "asm_lines": 2178,
-      "asm_va_vdst0": 23,
+      "asm_lines": 2179,
+      "asm_va_vdst0": 28,
       "asm_wmma": 192,
       "asm_wmma_dst_hi": 192,
       "cluster": [
@@ -8917,7 +8917,7 @@
         "-amdgpu-expert-scheduling-mode"
       ],
       "dis_lines": 1584,
-      "dis_va_vdst0": 23,
+      "dis_va_vdst0": 28,
       "dis_wmma": 192,
       "dis_wmma_dst_hi": 192,
       "group_segment_fixed_size": 164864,
@@ -8938,7 +8938,7 @@
         128
       ],
       "traits_args": "128, 128, 64, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 2, 2, 1, 4",
-      "vgpr_count": 450,
+      "vgpr_count": 466,
       "vgpr_spill_count": 0
     },
     {
@@ -8946,8 +8946,8 @@
         "dis": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x64x128_4x1_16x16x32_0x0x0_w1x4_c4x4_p3_v1024w1.dis",
         "s": "asm/opus_gemm_gfx1250_4wave_wl_co_128x128x64x128_4x1_16x16x32_0x0x0_w1x4_c4x4_p3_v1024w1.s"
       },
-      "asm_lines": 2178,
-      "asm_va_vdst0": 23,
+      "asm_lines": 2179,
+      "asm_va_vdst0": 28,
       "asm_wmma": 192,
       "asm_wmma_dst_hi": 192,
       "cluster": [
@@ -8961,7 +8961,7 @@
         "-amdgpu-expert-scheduling-mode"
       ],
       "dis_lines": 1582,
-      "dis_va_vdst0": 23,
+      "dis_va_vdst0": 28,
       "dis_wmma": 192,
       "dis_wmma_dst_hi": 192,
       "group_segment_fixed_size": 164864,
@@ -8982,7 +8982,7 @@
         128
       ],
       "traits_args": "128, 128, 64, 128, 3, bf16_t, bf16_t, bf16_t, fp32_t, 4, 4, 1, 4",
-      "vgpr_count": 450,
+      "vgpr_count": 466,
       "vgpr_spill_count": 0
     }
   ]

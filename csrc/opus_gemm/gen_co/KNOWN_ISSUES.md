@@ -8,10 +8,13 @@ Applies to `a16w16_4wave_co` (reference, `..._4wave_compute_...cuh`) and
 
 ---
 
-## 1. Narrow `B_N` raced at large shapes — FIXED
+## 1. Narrow `B_N` raced at large shapes — CAUSED BY TWO BUGS, BOTH FOUND
 
-**Status:** fixed by forcing 1 workgroup per CU. Kept here because the symptom
-was subtle and the diagnosis is worth not repeating.
+**Status:** two independent bugs, both found and both **fixed in the pipelines**
+(see "The two bugs"). With the pad off and the fixes in, all 204 variants are
+clean at 2–3 WG/CU over 400 repeats. The 1-WG/CU pad is still applied on top:
+the fixes cost 1–2%, but dropping the pad is a separate, shape-dependent
+performance question that has not been decided.
 
 Non-deterministic wrong results: same seed, same data, the wrong-element count
 changed every run, including runs that came out clean.
@@ -38,42 +41,176 @@ A and B differ **only** in the LDS-driven occupancy — both would allow two wav
 per SIMD on registers alone. A is entirely wrong and B entirely correct, so the
 variable is workgroups-per-CU, not tile size or register pressure.
 
-**It is NOT a synchronization bug.** Occupancy alone cannot break a correct
-kernel — two workgroups have separate LDS and should not interact — so the
-obvious reading is that 2 WG/CU merely exposes a latent sync hole. Two
-experiments say otherwise, both run with the pad disabled so the kernel really
-is at 2 WG/CU:
+**It IS a synchronization bug, and the damage geometry says which edge.** An
+earlier reading in this file said it was not, on the strength of a "maximal
+sync" experiment recorded as not helping. Re-run against the current tree,
+maximal sync (`s_wait_tensorcnt(0)` + `s_wait_dscnt(0)` + a full barrier at
+every tile) gives 0/61 on both shapes.
 
-| experiment | `c1x1` nbad/rep | `c4x4` nbad/rep |
+What the wrong elements look like is what localises it. With the pad off, at
+`2048x2048x7168`, `tol = 4` against a noise floor of 1.0, across four variants
+and twelve failing runs, every single one:
+
+* touches exactly **one tile**, i.e. one workgroup;
+* spans **all** of that tile's M rows;
+* is confined in N to `[B_N/2, B_N/2 + a few)` — a short **prefix of wave 3's
+  half of B**, never wave 2's half, never A;
+* carries an error of ~7.6 against a `|ref|` of ~54 at those positions, where
+  one whole K step contributes ~60 — so roughly an eighth of one step, about 16
+  of the 128 K elements in a row.
+
+Read that back into the pipeline. Wave 2 and wave 3 load the two halves of B's
+`B_N` rows; the tile walk takes the N sub-groups in order, so wave 3's half is
+the **last** region read in a K step.
+
+Fill order decides what that means, and it is measured, not assumed: a
+standalone probe that samples LDS mid-transfer (`s_sleep` instead of
+`s_wait_tensorcnt`, sweeping the delay) shows the engine filling **rows in
+ascending order** — at one delay step, rows 0..21 of a 32-row tile had landed
+and 22..31 had not. So a reader that is too early misses the **tail** of a
+region, while a writer that is too early clobbers its **head**.
+
+The damage is at the head, sub-row, in the last-read region. That is a
+write-after-read: the step refills the very slot it is reading (slot g%P is
+consumed by step g and reloaded at its end for step g+P), and the refill lands
+while a `ds_read` of that slot is still in flight.
+
+### The two bugs
+
+**(a) Write-after-read on the ring.** The handshake in the last msb-tile has to
+carry this WAR as well as the fill it was written for, and the split pair gave
+it neither half:
+
+* this wave's reads of `cur` are ISSUED by then but not RETIRED, and a barrier
+  orders waves, not their in-flight LDS traffic — the same distinction the
+  epilogue's `ds_writes` already call out;
+* `s_barrier_signal(-1)` and `s_barrier_wait(-1)` sit `kBarrierAhead` WMMAs
+  apart, so a wave that is ahead can signal for the NEXT step into this step's
+  count.
+
+The fix retires first (`s_wait_dscnt(0)`) and moves the signal down to the wait,
+so arrive-and-wait is one barrier. Failure rate scales with `k_steps`, which is
+what says it is per-K-step.
+
+**(b) A "zero-extent" TDM zero-fills LDS.** Affects the 108 of 204 variants
+whose peeled step actually fuses C staging (`kFusedMsb = kNSub - 1 > 0`); the
+`kNSub == 1` variants stage everything in the epilogue, after the drain, and
+were never exposed. The pipeline
+over-issues `kSlots` transfers past the last K step and relies on them writing
+nothing: *"past K the D#'s tensor_dim0 saturates to 0, so a step beyond the last
+is a zero-extent DMA that only bumps tensorcnt"*, which is also what let the
+epilogue stage C in a ring slot one of them is aimed at, with no barrier in
+front. **Measured on gfx1250, that is false.** A standalone probe pre-fills LDS
+with a sentinel and issues a transfer whose origin is at or past either extent:
+every one of the 2048 dwords of the tile comes back **zeroed**, not untouched —
+for `origin0` at the extent, past it, and for `origin1` likewise. So the trailing
+transfer zero-fills the slot C was just staged into. The drain that was supposed
+to cover this sat *after* the peeled step, i.e. after the staging; the fix moves
+it before. Failure rate is flat in `k_steps` at fixed grid (7/12/18/8 bad runs at
+`k_steps` 8/16/32/64), which is what says it is per-workgroup.
+
+They are independent, and each fix only closes its own (61 variants, 200
+repeats, pad off):
+
+| | 2048x2048x7168 | 4096x4096x2048 | 4096x4096x1024 |
+|---|---|---|---|
+| neither fix | 11/61 | 15/61 | 8/61 |
+| (a) alone | 1/61 | 10/61 | 3/61 |
+| (b) alone | 12/61 | 7/61 | 1/61 |
+| **both** | **0/61** | **0/61** | **0/61** |
+
+All 204 variants with both fixes and the pad off: 0 wrong over 100 repeats at
+`2048x2048x7168`, `4096x4096x1024`, `2048x2048x8192`, `512x512x512`,
+`129x257x384`, and 0 over 400 repeats at `4096x4096x2048`. (One isolated event
+appeared in an earlier 100-repeat pass at that shape and did not reproduce in
+400, so "zero" here is a bound, not a proof.)
+
+Both are latent at 1 WG/CU: the shipped padded build is clean over 204 variants
+x 200 repeats at `4096x4096x1024` and `4096x4096x2048`. Without a co-resident
+workgroup the trailing transfer lands long before the staging, and the ring's
+refill lands long after the reads.
+
+### What the fixes cost
+
+Measure this box's A/B by **interleaving** the two builds and taking a median
+per kid, not by timing one build and then the other: a sequential pass puts all
+the clock and thermal drift on one side. Timing the same pair sequentially first
+said the fixes were 5.2% *faster* at `2048x2048x7168`; interleaved, on a shape
+whose trial-to-trial spread is 6%, they are 2% slower. Constant inputs
+(`--init const`) also drop the data distribution out of it — absolute latency
+moves a lot (511 vs 715 us at `8192^3`) but the A/B ratio does not, which is
+what makes it a usable control.
+
+Shipped build, before the fixes vs after, median of 5 interleaved trials over
+the 61 variants:
+
+| shape | before | after | |
+|---|---|---|---|
+| `2048x2048x7168` | 49.3 us | 50.3 us | +2.1% |
+| `4096x4096x2048` | 56.5 us | 57.6 us | +1.8% |
+| `4096x4096x1024` | 33.5 us | 34.5 us | +2.9% |
+| `8192x8192x8192`, 16 `128x256x128` kids | 511.4 us | 516.7 us | +1.0% |
+
+So about 2%, uniformly, for two real races.
+
+### Should the pad go?
+
+Separate question, and the answer is per kid rather than per shape. No pad +
+fixes against the shipped padded build, same interleaved method:
+
+| shape | mean | per-kid p10 / median / p90 |
 |---|---|---|
-| baseline (no pad) | 17338 / 49742 / 84135 | 12954 / 0 / 3654 |
-| skip the `-3` cluster barrier when cluster is 1x1 | 41856 / 45148 / 30532 | 9354 / 0 / 2638 |
-| **maximal sync**: `s_wait_tensorcnt(0)` + `s_wait_dscnt(0)` + full `s_barrier()` at **every tile** | 52352 / 45527 / 58925 | 9585 / 1896 / 8387 |
+| `2048x2048x7168` | +9.2% | -11.5% / +9.5% / +39.6% |
+| `4096x4096x2048` | +5.8% | -15.3% / +4.3% / +40.9% |
+| `4096x4096x1024` | **-15.6%** | -26.4% / -12.9% / +1.2% |
 
-Draining every outstanding TDM and LDS read and taking a full workgroup barrier
-before every single tile does not help at all. No amount of synchronisation
-inside the workgroup closes it, so the fault is not ordering between this
-workgroup's own waves.
+A spread from -26% to +41% within one shape is exactly what the kid table plus
+the tuner exist for: add the 61 entries a second time carrying
+`-DOPUS_CO_NO_1WG_PAD` and a `variant` suffix, and let tuning pick. Note that
+`build_co.py`'s `_expected_lds` reads the no-pad flag from the command line
+rather than from the entry, which would have to follow.
 
-**What is left, unresolved.** Something in the TDM path that is shared per CU
-and not covered by barriers. The leading suspect is the LDS address in the TDM
-descriptor: `make_tdm` is handed
-`reinterpret_cast<uintptr_t>(smem_a)`, which is a *workgroup-relative* LDS
-offset, and if the TDM engine does not add the workgroup's LDS base then a
-second co-resident workgroup aims its transfers at the first one's LDS. That
-would be immune to barriers, would corrupt both workgroups, and would vanish at
-1 WG/CU where the base is zero — which is everything observed. It is a
-hypothesis: confirming it needs an ATT capture of a 2-WG/CU run (recipe in
-`README.md`) or the gfx1250 TDM ISA description.
+The contrast that pins it: waiting one short of what the slot needs
+(`s_wait_tensorcnt(kSlots - 1)`), so the step genuinely reads a fill still in
+flight, produces ~3.2 M wrong elements across 1020 of 1024 tiles, whole tiles,
+both operands, every run — nothing like the failure being diagnosed. So it was
+never the counted `s_wait_tensorcnt` failing to cover its slot.
 
-If that hypothesis holds, 1 WG/CU is not a workaround for this pipeline but a
-correctness requirement of it, and the pad is the right fix rather than a mask.
-Until it is confirmed, treat the pad as load-bearing and do not remove it.
+### Dead ends, so they are not walked twice
 
-**Fix.** Pad `LDS_BYTES` past 160 KB when the real footprint is below it, so a
-second workgroup cannot fit. The pad tail is never accessed. This is the same
-trick `opus_cluster_tdm_splitk_ws_traits_gfx1250` already uses in this header
-for the same reason. All 61 affected variants verify after the change.
+* **The TDM descriptor's LDS base.** `make_tdm` is handed
+  `reinterpret_cast<uintptr_t>(smem_a)`, a *workgroup-relative* offset, so if the
+  engine did not add the workgroup's LDS base a co-resident workgroup would aim
+  at its neighbour's LDS. It fits every symptom and it is wrong: the engine adds
+  the base. `HW_REG_LDS_ALLOC` decodes as `base_KB` in [11:0] and `size_KB` in
+  [31:12] (calibrated over 32/96/153/160/200 KB allocations, base + size landing
+  on the 320 KB budget every time), and it places **half** the workgroups at a
+  non-zero base — all of which read back their own transfer at their own base.
+  Adding the base in software makes it catastrophically worse (61/61 variants,
+  ~2.6 M of 4.19 M elements wrong), the double-add signature.
+* **Anything that only adds delay.** At `2048x2048x16384`, a bare `s_sleep`,
+  which orders nothing, reaches 0/61 at +5.0% while `s_wait_tensorcnt(0)` needs
+  +15.6% for the same result — so the full drain was never a principled fix
+  either, just a poorly-priced delay. If a candidate fix is on that same
+  cost-versus-correctness curve, it is a window-widener, not a fix.
+* **A fixed tolerance at large K.** bf16's own output rounding grows with
+  `sqrt(K)`: the whole population reports max-abs-err 1.000 at `K = 8192`, 1.997
+  at `K = 16384`, 2.001 at `K = 32768`, bit-identical across kids. So `tol = 2`
+  reads as "everything fails" at `K = 32768` and sits on the cliff at
+  `K = 16384`. Measure at `K <= 8192` or scale the tolerance, and check the
+  population agrees before believing any single kid.
+
+An earlier reading in this file said the failure was **not** a synchronization
+bug, on the strength of a "maximal sync" experiment recorded as not helping.
+Re-run against the current tree, maximal sync gives 0/61.
+
+**Reproducing.** `build_co.py --device-flag=-DOPUS_CO_NO_1WG_PAD` drops the pad
+and puts the 61 affected variants back at 2–3 WG/CU; point `OPUS_GEN_CO_DIR` at
+that output tree to run them without rebuilding the module. With the fixes in
+they stay clean; to see the original failure, revert the two edits described
+above. Expect a handful of variants wrong on a handful of runs out of 100 —
+rare enough that a single repeat proves nothing, and that 20 repeats can come
+out clean by luck.
 
 Two traps this hit:
 

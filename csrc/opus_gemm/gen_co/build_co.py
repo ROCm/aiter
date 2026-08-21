@@ -207,17 +207,22 @@ def _kernel_metadata(readelf, path, symbol):
     return fields
 
 
-def _expected_lds(k):
+def _expected_lds(k, no_pad=False):
     """Mirror of the traits LDS formula (kLdsTotalBytes).
 
     Including the 1-WG/CU pad: a tile whose A/B segments fit twice in the
     320 KB budget is padded past 160 KB so a second workgroup cannot co-reside.
     Keep this in step with LDS_BYTES in the traits -- the check below compares
     the two and is the reason the drift was caught rather than shipped.
+
+    ``no_pad`` mirrors -DOPUS_CO_NO_1WG_PAD, the debug switch that puts the
+    padded variants back at 2 WG/CU.
     """
     pitch = k.B_K + 16 // 2          # + PAD_ELEMS for bf16
     seg = k.num_slots * (k.B_M + k.B_N) * pitch * 2
     half = 160 * 1024
+    if no_pad:
+        return seg
     return (half + 1024) if seg <= half else seg
 
 
@@ -259,6 +264,7 @@ def _asm_stats(text, prefix):
 
 def build_one(k, args, llvm_bin, workdir):
     symbol = k.name
+    no_pad = "-DOPUS_CO_NO_1WG_PAD" in args.device_flag
     stub_path = os.path.join(workdir, f"{symbol}.cc")
     with open(stub_path, "w") as f:
         f.write(
@@ -279,7 +285,7 @@ def build_one(k, args, llvm_bin, workdir):
         )
 
     out_path = os.path.join(args.out_dir, f"{symbol}.co")
-    device_flags = list(k.co_device_flags)
+    device_flags = list(k.co_device_flags) + list(args.device_flag)
     # Everything except the output mode and the input, so the -S pass below is
     # byte-for-byte the same compilation.
     common = [
@@ -326,7 +332,7 @@ def build_one(k, args, llvm_bin, workdir):
     # Self-checks. Only the two that would make the HOST wrong are fatal; see
     # --fail-on-spill and _asm_stats() for the ones that merely describe the
     # code generated.
-    want_lds = _expected_lds(k)
+    want_lds = _expected_lds(k, no_pad)
     if md["group_segment_fixed_size"] != want_lds:
         raise SystemExit(
             f"build_co: {symbol} LDS mismatch: .co says "
@@ -410,6 +416,17 @@ def main():
              "Defaults to $OPUS_CO_LLVM_BIN, then $PIN.",
     )
     p.add_argument("--arch", default="gfx1250")
+    p.add_argument(
+        "--device-flag",
+        action="append",
+        default=[],
+        metavar="FLAG",
+        help="extra device-pass flag appended to EVERY entry, repeatable. For "
+             "investigations that need the whole family rebuilt one way, e.g. "
+             "--device-flag=-DOPUS_CO_NO_1WG_PAD to drop the 1-WG/CU pad and "
+             "put the affected variants back at 2 WG/CU. Recorded per entry in "
+             "build_info.json, so an artifact never hides which one built it.",
+    )
     p.add_argument(
         "--out-dir",
         default="",

@@ -688,7 +688,13 @@ __device__ void gemm_a16w16_4wave_wl_body_gfx1250(
                 // only at P == 3 -- at P == 2 a literal 1 lets the loop read a slot
                 // whose DMA has not landed, which is silent garbage, not a fault.
                 __builtin_amdgcn_s_wait_tensorcnt(PT::kSlots - 2);
-                __builtin_amdgcn_s_barrier_signal(-1);
+                // The step refills the slot it is reading -- slot g%P is consumed
+                // by step g and reloaded at its end for step g+P -- so this
+                // handshake carries a write-after-read as well as the fill it was
+                // written for, and that needs the reads RETIRED rather than
+                // merely issued: a barrier orders waves, not their in-flight LDS
+                // traffic. Same distinction the epilogue's ds_writes call out.
+                opus::s_wait_dscnt(opus::number<0>{});
             }
             opus::static_for<PT::kWmmaPerTile>([&](auto wmmaN) __attribute__((always_inline)) {
                 // A tile's WMMAs run sub-tile by sub-tile, each ordered [k][m][n].
@@ -718,7 +724,10 @@ __device__ void gemm_a16w16_4wave_wl_body_gfx1250(
                 constexpr bool do_hs   = is_last && wmma == PT::kBarrierAhead - 1;
 
                 if constexpr (do_hs) {
-                    __builtin_amdgcn_s_barrier_wait(-1);
+                    // Arrive and wait together. Split, the kBarrierAhead WMMAs
+                    // between the two let a wave that is ahead signal for the
+                    // NEXT step into this step's count.
+                    __builtin_amdgcn_s_barrier();
                     load_A(next, 0, 0);
                 }
                 // All eight in this tile's first 32x32x64 sub-tile: spreading them
@@ -784,9 +793,12 @@ __device__ void gemm_a16w16_4wave_wl_body_gfx1250(
             peel_slot = cur + 1;
         }
     });
-    // The slot after peel_slot is free -- the only TDM aimed there is for a step
-    // past the last, which the D# zero-extents. That is what lets a wave stage C
-    // mid-step with no barrier in front of it.
+    // A step past the last is NOT a no-op transfer: measured on gfx1250, one
+    // whose origin is at or past either extent zero-fills its whole tile in LDS.
+    // C stages in the slot one of those is aimed at, so they have to be retired
+    // BEFORE the staging -- which the peeled step below already begins whenever
+    // it fuses any msb (kFusedMsb > 0).
+    __builtin_amdgcn_s_wait_tensorcnt(0);
     smem_c = reinterpret_cast<DataC*>(
         smem_b + (size_t)((peel_slot + 1 == PT::kSlots) ? 0 : (peel_slot + 1)) * T::kSlotElemsB);
 
@@ -838,9 +850,6 @@ __device__ void gemm_a16w16_4wave_wl_body_gfx1250(
             if constexpr (in_sub == PT::kWmmaPerSub - 1) __builtin_amdgcn_sched_barrier(0);
         });
     });
-    // Retire the trailing zero-extent DMAs before the store reuses the SGPRs.
-    __builtin_amdgcn_s_wait_tensorcnt(0);
-
     // Epilogue: the B_M x B_N tile goes out through the A/B ring -- dead once the
     // last DMA retired -- as one TDM per wave. It moves whole B_N rows, so the
     // ragged tile needs no guard: the D# clamps origin against the extents.

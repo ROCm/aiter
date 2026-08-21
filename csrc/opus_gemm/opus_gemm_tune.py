@@ -250,6 +250,15 @@ def gfx1250_splitK_window(M, N, K, cu_num, k_inst, base_candidates):
     return [min(nz, key=_dist)]
 
 
+# Pre-compiled (.co) candidate filter. The family is 12 tiles x up to 16 cluster
+# dims x 3 wave layouts = 204 kids, and it used to go into every sweep whole.
+# Scored against measured per-kid latency on 18 shapes (square, wide-N, narrow-N,
+# M=1, ragged, K-tail), the knee is at 5 cluster dims and 4 tiles; one step of
+# headroom on each keeps the measured winner for 17 of the 18 and costs 0.16% on
+# the last, while cutting the sweep 3.2x.
+GFX1250_CO_TOP_TILES = 6
+GFX1250_CO_TOP_CLUSTERS = 6
+
 GFX1250_FUSE_TOP_SPLITK = 3  # best-N split_k (by grid-occupancy fit) per fuse tile
 
 
@@ -332,7 +341,7 @@ def _gfx1250_cluster_waste(gx: int, gy: int, cwm: int, cwn: int) -> float:
     return (launched - gx * gy) / launched
 
 
-def _gfx1250_cluster_dims_for_grid(gx, gy, avail, top_clusters):
+def _gfx1250_cluster_dims_for_grid(gx, gy, avail, top_clusters, cu_num=0):
     """Rank the (cwm, cwn) worth benchmarking for a gx x gy tile grid.
 
     ``avail`` maps (cwm, cwn) -> kid for one tile. Returns the selected dims,
@@ -346,6 +355,14 @@ def _gfx1250_cluster_dims_for_grid(gx, gy, avail, top_clusters):
     nothing does, only the tightest-fitting dims stay, so a shape that cannot
     fill any cluster still gets its least-wasteful candidate benchmarked.
 
+    Both of those read the surplus workgroups as cost, which holds only once the
+    launch is big enough for them to displace real work. Pass ``cu_num`` to lift
+    them while the whole launch still fits one machine's worth: there the dead
+    workgroups displace nothing and the wider multicast is free. Measured on the
+    .co family, 129x257x384 on a 64x64 tile is a 3x5 grid whose fastest kid is
+    c4x4 -- vetoed without this, for 4.9%. Left off (0) by default so the
+    clusterlaunch sweep keeps the behaviour it was tuned with.
+
     Ranking is by waste first (bucketed, so a fit within a bucket does not
     outrank a bigger multicast group over a rounding crumb), then by the size of
     the multicast group, then by how well the cluster's aspect matches the tile
@@ -357,14 +374,18 @@ def _gfx1250_cluster_dims_for_grid(gx, gy, avail, top_clusters):
     11.2 us against 13.3 us for 4x2, and 1x4 (11.4 us) beats both 2x2 (13.9 us)
     and 4x1 (20.1 us).
     """
+    def _free(cwm, cwn):
+        return cu_num > 0 and _round_up(gx, cwm) * _round_up(gy, cwn) <= cu_num
+
     feas = [
         (_gfx1250_cluster_waste(gx, gy, cwm, cwn), cwm, cwn)
         for (cwm, cwn) in avail
-        if cwm <= gx and cwn <= gy
+        if (cwm <= gx and cwn <= gy) or _free(cwm, cwn)
     ]
     if not feas:
         return []
-    within = [f for f in feas if f[0] <= GFX1250_MAX_CLUSTER_WASTE]
+    max_waste = 1.0 if _free(1, 1) else GFX1250_MAX_CLUSTER_WASTE
+    within = [f for f in feas if f[0] <= max_waste]
     if not within:
         tightest = min(f[0] for f in feas)
         within = [f for f in feas if f[0] <= tightest]
@@ -378,6 +399,45 @@ def _gfx1250_cluster_dims_for_grid(gx, gy, avail, top_clusters):
         )
     )
     return [(cwm, cwn) for _w, cwm, cwn in within[:top_clusters]]
+
+
+# tile -> cluster dims -> [kid]. Built once; the wave layouts (and any future
+# VGPR budgets) of one (tile, cluster) stay together because nothing host-side
+# can rank them -- which of them wins is exactly what the sweep is for.
+_GFX1250_CO_BY_TILE: dict = {}
+for _kid, _k in gfx1250_4wave_co_kernels_list.items():
+    _GFX1250_CO_BY_TILE.setdefault((_k.B_M, _k.B_N, _k.B_K), {}).setdefault(
+        (_k.cluster_wg_m, _k.cluster_wg_n), []
+    ).append(_kid)
+
+
+def _gfx1250_co_candidates(M, N, K, cu_num,
+                           top_tiles=GFX1250_CO_TOP_TILES,
+                           top_clusters=GFX1250_CO_TOP_CLUSTERS):
+    """Pre-compiled (.co) kids worth benchmarking for this shape.
+
+    Same shape as the plain/clusterlaunch selection -- top-N tiles by
+    grid-occupancy fit, then top-N cluster dims per tile -- with one difference
+    that matters: this family has NO split-K, so its grid is exactly
+    ceil(M/B_M) * ceil(N/B_N) and the tile score has nothing to minimise over.
+
+    Every tile carries a c1x1 entry and c1x1 is feasible for any non-empty grid,
+    so a selected tile always contributes at least one kid.
+    """
+    def _tile_score(t):
+        bm, bn, _bk = t
+        return _gfx1250_occ_cost(_ceil_div(M, bm) * _ceil_div(N, bn), cu_num)
+
+    tiles = sorted(_GFX1250_CO_BY_TILE, key=lambda t: (_tile_score(t), t))
+    out: set[int] = set()
+    for t in tiles[:top_tiles]:
+        bm, bn, _bk = t
+        gx, gy = _ceil_div(M, bm), _ceil_div(N, bn)
+        avail = _GFX1250_CO_BY_TILE[t]
+        for dims in _gfx1250_cluster_dims_for_grid(gx, gy, avail, top_clusters,
+                                                   cu_num=cu_num):
+            out.update(avail[dims])
+    return out
 
 
 def _gfx1250_select_candidates(
@@ -438,12 +498,11 @@ def _gfx1250_select_candidates(
     if GFX1250_SPLITK_FUSE_ENABLED:
         sel |= _gfx1250_fuse_candidates(M, N, K, cu_num)
 
-    # Pre-compiled (.co) kids. Added wholesale rather than scored: the family is
-    # a handful of hand-picked variants from gen_co/co_kernels.json (not a swept
-    # tile space), each one already the answer to "which tile/cluster/VGPR combo
-    # do we want to try", so there is nothing for the tile ranking above to pick
-    # between. kid_rejects_shape drops the ones this shape cannot run.
-    sel |= set(GFX1250_4WAVE_CO_KIDS)
+    # Pre-compiled (.co) kids. These used to go in wholesale, on the reading that
+    # the family was a handful of hand-picked variants with nothing for a tile
+    # ranking to choose between. It is now a swept 12-tile x 16-cluster x
+    # 3-layout space, so it gets the same treatment as the rest.
+    sel |= _gfx1250_co_candidates(M, N, K, cu_num)
     return frozenset(sel)
 
 
@@ -581,7 +640,13 @@ def kid_rejects_shape(k_inst, M, N, K):
     # D#'s per-dimension saturating clamp, so no M/N/K alignment is required
     # either. What IS required: the batch strides are int64 but m/n/k are int,
     # and the traits assert the tile it was compiled for.
-    if k_inst.kernel_tag == "a16w16_4wave_co":
+    # Both .co families, not just the compute one: they share the launcher and
+    # the no-buffer-resource pipeline, so the same reasoning applies. Naming only
+    # a16w16_4wave_co let a16w16_4wave_wl_co fall through to the rules below,
+    # where the gfx942 bf16-workspace whitelist rejected all 140 of its kids at
+    # any N outside that table (384, 32320, 129280) -- silently, since a missing
+    # candidate looks the same as a candidate that lost.
+    if k_inst.kernel_tag in _A16W16_CO_TAGS:
         return M < 1 or N < 1 or K < 1
 
     # 4 GiB buffer-resource filter. Legacy a16w16 kids build a single
@@ -612,9 +677,9 @@ def kid_rejects_shape(k_inst, M, N, K):
     # equivalent to "is a gfx942 bf16-ws kid" only while every gfx1250 _ws kid
     # declared an fp32 partial. Once those switched to bf16 the rule started
     # rejecting them too, and since the table is all powers of two it wiped out
-    # the whole _ws family at N=384 / 32320 / 129280. The gfx1250 _ws reduce
-    # handles a ragged N through its tail path, so scope the rule to the family
-    # it was written for.
+    # the whole _ws family at N=384 / 32320 / 129280 -- at N=384 that left 6 of
+    # 106 candidates, all one tile. The gfx1250 _ws reduce handles a ragged N
+    # through its tail path, so scope the rule to the family it was written for.
     if _kid_uses_bf16_workspace(k_inst) and k_inst.kernel_tag not in _WS_SPLITK_TAGS:
         padded_N = _ceil_div(N, k_inst.B_N) * k_inst.B_N
         if loops < 2 or K % B_K != 0 or padded_N != N:
@@ -954,6 +1019,9 @@ def _drop_fp32_ws_kids(cands):
 _WS_SPLITK_TAGS = frozenset(
     {"a16w16_cluster_tdm_splitk_ws", "a16w16_clusterlaunch_tdm_splitk_ws"}
 )
+
+# The pre-compiled (.co) families. Mirrors codegen/common.py:_A16W16_CO_TAGS.
+_A16W16_CO_TAGS = frozenset({"a16w16_4wave_co", "a16w16_4wave_wl_co"})
 
 
 def _ensure_kids_compiled(candidate_kids):
