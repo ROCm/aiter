@@ -19,8 +19,14 @@ TS=$(date +%Y%m%d_%H%M%S)
 OUT_DIR="f4gemm_${TS}"
 DEST="${HOME}/${OUT_DIR}_results"
 
-# 1) Launch the container (skip if it is already running).
-if ! docker ps --format '{{.Names}}' | grep -qx "${CONTAINER}"; then
+# 1) Ensure the container is running: reuse if up, start if stopped, else create.
+if docker ps --format '{{.Names}}' | grep -qx "${CONTAINER}"; then
+  echo "container ${CONTAINER} already running"
+elif docker ps -a --format '{{.Names}}' | grep -qx "${CONTAINER}"; then
+  echo "container ${CONTAINER} exists but stopped; starting it"
+  docker start "${CONTAINER}"
+else
+  echo "creating container ${CONTAINER}"
   docker run -d --name "${CONTAINER}" --network=host \
     --device=/dev/kfd --device=/dev/dri --group-add video \
     --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \

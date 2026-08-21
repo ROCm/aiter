@@ -83,7 +83,7 @@ def _dispatch_time_ns(con, kd_tab, ks_tab, dispatch_id, kernel_substr):
     return (end - start, did, name)
 
 
-def report(prof_dir, kernel_substr="f4gemm"):
+def report(prof_dir, kernel_substr="f4gemm", mnk=(16384, 16384, 16384)):
     dbs = glob.glob(os.path.join(prof_dir, "*.db"))
     if not dbs:
         print(f"[att_freq] no *.db in {prof_dir}; nothing to read")
@@ -111,8 +111,13 @@ def report(prof_dir, kernel_substr="f4gemm"):
         # Print each quantity that is available; freq needs both.
         if t is not None:
             time_ns, did, name = t
+            us = time_ns / 1e3
+            # Same formula as the UT: flops / us / 1e6, flops = 2*M*N*K.
+            flops = 2 * mnk[0] * mnk[1] * mnk[2]
+            tflops = round(flops / us / 1e6, 1)
             print(f"  kernel        : {name}")
-            print(f"  dispatch time : {time_ns / 1e3:.3f} us      (rocpd end-start, dispatch_id={did})")
+            print(f"  dispatch time : {us:.3f} us      (rocpd end-start, dispatch_id={did})")
+            print(f"  TFLOPS        : {tflops}      (2*M*N*K/time, M,N,K={mnk[0]},{mnk[1]},{mnk[2]})")
         else:
             print(
                 "  dispatch time : N/A  -- rocpd_kernel_dispatch has no matching "
@@ -138,8 +143,16 @@ def main():
         default="f4gemm",
         help="substring to match the traced kernel name (default: f4gemm)",
     )
+    ap.add_argument(
+        "--mnk",
+        default="16384,16384,16384",
+        help="problem size M,N,K for the TFLOPS calc (default: 16384,16384,16384)",
+    )
     args = ap.parse_args()
-    report(args.prof_dir, args.kernel_substr)
+    mnk = tuple(int(x) for x in args.mnk.split(","))
+    if len(mnk) != 3:
+        ap.error("--mnk must be three comma-separated ints, e.g. 16384,16384,16384")
+    report(args.prof_dir, args.kernel_substr, mnk)
 
 
 if __name__ == "__main__":
