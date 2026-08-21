@@ -15,16 +15,6 @@ WMMA_M, WMMA_N, WMMA_K = 16, 16, 32
 WAVE_SIZE, LDS_PAD_A, LDS_PAD_B = 32, 8, 8
 _SCHED_ALLOW_SALU = 1 << 2
 KERNARG_PRELOAD_COUNT = 8
-SCOPE_DEV = 16
-
-
-def _flydsl_aux_is_attr() -> bool:
-    from importlib.metadata import version
-
-    return tuple(int(x) for x in version("flydsl").split(".")[:3]) >= (0, 3, 1)
-
-
-_AUX_IS_ATTR = _flydsl_aux_is_attr()
 
 
 def _byte_off_i32(elem_off, elem_bytes):
@@ -214,8 +204,11 @@ def compile_gemm_a16w16(
 
         warp_m_base, warp_n_base = wave_m_idx * warp_tile_m, wave_n_idx * warp_tile_n
         m_idx, n_stride = fx.Uint64(i32_m), fx.Uint64(i32_n)
-        y_rsrc = fx.rocdl.get_buffer_rsrc(
-            fx.rocdl.make_buffer_ptr(arg_y, m_idx * n_stride * elem_bytes_d)
+        gYp = fx.Tensor(fx.make_view(arg_y, fx.make_layout((1, 1), (1, 1))))
+        gY = fx.rocdl.make_buffer_tensor(
+            fx.Tensor(fx.make_view(arg_y, fx.make_layout((1, 1), (1, 1)))),
+            max_size=False,
+            num_records_bytes=m_idx * n_stride * elem_bytes_d,
         )
 
         lds = fx.SharedAllocator(static=True).allocate(SharedStorage).peek()
@@ -461,10 +454,13 @@ def compile_gemm_a16w16(
                 return r.load()
 
         def epilogue_stores(final_accs):
-            zero_off = fx.Int32(0).ir_value()
+            _acc_ty = _out_num if _half_out else fx.Float32
+            st_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), _acc_ty)
             if const_expr(split_k > 1):
-                zero_i32 = zero_off
-                dev_scope = fx.Int32(SCOPE_DEV).ir_value()
+                add_atom = fx.make_copy_atom(
+                    fx.UniversalAtomicAdd(_acc_ty, syncscope=fx.rocdl.SyncScope.Agent),
+                    _acc_ty,
+                )
             if const_expr(_USE_XT):
                 xt = fx.add_offset(
                     lds.xt.ptr,
@@ -506,7 +502,7 @@ def compile_gemm_a16w16(
 
                     if const_expr(_half_out):
                         h_vec = fx.Vector(acc).to(_out_num)
-                        c_off_bytes = (row * n_stride + col_base) * elem_bytes_d
+                        c_off = row * n_stride + col_base
                         if const_expr(split_k > 1):
                             for pair in range_constexpr(4):
                                 pair_vec = fx.Vector.from_elements(
@@ -515,39 +511,19 @@ def compile_gemm_a16w16(
                                         h_vec[pair * 2 + 1].ir_value(),
                                     ],
                                     _out_num,
-                                ).ir_value()
-                                if const_expr(_AUX_IS_ATTR):
-                                    rocdl.raw_ptr_buffer_atomic_fadd(
-                                        pair_vec,
-                                        y_rsrc,
-                                        fx.Int32(c_off_bytes + pair * 4).ir_value(),
-                                        zero_i32,
-                                        aux=SCOPE_DEV,
-                                    )
-                                else:
-                                    rocdl.raw_ptr_buffer_atomic_fadd(
-                                        pair_vec,
-                                        y_rsrc,
-                                        fx.Int32(c_off_bytes + pair * 4).ir_value(),
-                                        zero_i32,
-                                        dev_scope,
+                                )
+                                if row < m_idx:
+                                    fx.copy(
+                                        add_atom,
+                                        _rmem_vec(pair_vec, 2, _out_num),
+                                        gYp[None, c_off + pair * 2],
                                     )
                         else:
-                            if const_expr(_AUX_IS_ATTR):
-                                rocdl.raw_ptr_buffer_store(
-                                    h_vec.bitcast(fx.Int32).ir_value(),
-                                    y_rsrc,
-                                    fx.Int32(c_off_bytes).ir_value(),
-                                    zero_off,
-                                )
-                            else:
-                                rocdl.raw_ptr_buffer_store(
-                                    h_vec.bitcast(fx.Int32).ir_value(),
-                                    y_rsrc,
-                                    fx.Int32(c_off_bytes).ir_value(),
-                                    zero_off,
-                                    zero_off,
-                                )
+                            fx.copy(
+                                st_atom,
+                                _rmem_vec(h_vec, 8, _out_num),
+                                gY[None, c_off],
+                            )
                     elif const_expr(split_k > 1):
                         for e in range_constexpr(8):
                             fx.ptr_store(
@@ -557,28 +533,24 @@ def compile_gemm_a16w16(
                         t_base = blk_m + warp_m_base + wm * WMMA_M
                         t_col = blk_n + warp_n_base + wn * WMMA_N + lane16
                         for e in range_constexpr(8):
-                            if t_base + 2 * e < m_idx:
-                                _xt_val = fx.ptr_load(
-                                    fx.add_offset(
-                                        xt, (lane_kgrp + 2 * e) * WMMA_N + lane16
-                                    )
-                                ).ir_value()
-                                _xt_off = _byte_off_i32(
-                                    (t_base + lane_kgrp + 2 * e) * n_stride + t_col,
-                                    4,
+                            xt_row = t_base + lane_kgrp + 2 * e
+                            if xt_row < m_idx:
+                                xt_val = fx.Vector.from_elements(
+                                    [
+                                        fx.ptr_load(
+                                            fx.add_offset(
+                                                xt,
+                                                (lane_kgrp + 2 * e) * WMMA_N + lane16,
+                                            )
+                                        ).ir_value()
+                                    ],
+                                    fx.Float32,
                                 )
-                                if const_expr(_AUX_IS_ATTR):
-                                    rocdl.raw_ptr_buffer_atomic_fadd(
-                                        _xt_val,
-                                        y_rsrc,
-                                        _xt_off,
-                                        zero_i32,
-                                        aux=SCOPE_DEV,
-                                    )
-                                else:
-                                    rocdl.raw_ptr_buffer_atomic_fadd(
-                                        _xt_val, y_rsrc, _xt_off, zero_i32, dev_scope
-                                    )
+                                fx.copy(
+                                    add_atom,
+                                    _rmem_vec(xt_val, 1, fx.Float32),
+                                    gYp[None, xt_row * n_stride + t_col],
+                                )
                     else:
                         for half in range_constexpr(2):
                             vec4 = fx.Vector.from_elements(
@@ -587,17 +559,13 @@ def compile_gemm_a16w16(
                                     for vi in range_constexpr(4)
                                 ],
                                 fx.Float32,
-                            ).ir_value()
+                            )
                             col = col_base + half * 4
-                            _f32_off = _byte_off_i32(row * n_stride + col, 4)
-                            if const_expr(_AUX_IS_ATTR):
-                                rocdl.raw_ptr_buffer_store(
-                                    vec4, y_rsrc, _f32_off, zero_off
-                                )
-                            else:
-                                rocdl.raw_ptr_buffer_store(
-                                    vec4, y_rsrc, _f32_off, zero_off, zero_off
-                                )
+                            fx.copy(
+                                st_atom,
+                                _rmem_vec(vec4, 4, fx.Float32),
+                                gY[None, row * n_stride + col],
+                            )
 
         def _pack_state(accs_, a_, b_):
             return list(accs_) + list(a_) + list(b_)
