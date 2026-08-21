@@ -128,13 +128,17 @@ def compile_mega_moe_stage1(
                 raise ValueError("fanout mask must contain at least two experts")
     preplanned_compact = not fixed_slot_dispatch
     ready_tile_queue = preplanned_compact
-    static_consumer_schedule = preplanned_compact
+    # Assign roles by first-arrival ticket rather than block ID.  The launch
+    # deliberately oversubscribes the device so producer CTAs can retire and
+    # queued consumers can backfill them.  Hardware does not guarantee block
+    # residency order, while tickets guarantee that every required producer
+    # belongs to the first resident cohort.
     if preplanned_compact and (not payload_tile_ready or payload_chunk_rows <= 0):
         raise ValueError("compact dispatch requires preplanned tile-ready payloads")
     debug_role_mode = int(debug_role_mode)
     if debug_role_mode not in (0, 1, 2, 3, 4, 5, 6):
         raise ValueError("debug_role_mode must be in [0, 6]")
-    planner_blocks = 0 if static_consumer_schedule else 1
+    planner_blocks = 0 if preplanned_compact else 1
     consumer_ticket_base = dispatch_blocks + planner_blocks
     # Compact external-counting overwrites every source-owned histogram row
     # and publishes COUNT_DONE with the invocation generation.  That exchange
@@ -224,7 +228,6 @@ def compile_mega_moe_stage1(
         f"_erh{int(cross_rank_entry_handshake)}"
         f"_prep{int(preplanned_compact)}"
         f"_rtq{int(ready_tile_queue)}"
-        f"_scs{int(static_consumer_schedule)}"
         f"_drm{debug_role_mode}"
         f"{fanout_suffix}"
         f"{swiglu_suffix}"
@@ -275,35 +278,25 @@ def compile_mega_moe_stage1(
         if const_expr(ready_tile_queue):
             a_max_expert_tiles = _disp_ptr(DispatchSlot.MAX_EXPERT_TILES)
 
-        if const_expr(static_consumer_schedule):
-            ticket = fx.block_idx.x
-            generation = fx.Int64(0)
-        else:
-            ticket_scratch = fx.recast_iter(fx.Int64, a_buf.ptr)
-            ticket_view = fx.make_view(ticket_scratch, fx.make_layout(1, 1))
-            if tid == fx.Int32(0):
-                ticket64 = fx.Int64(
-                    comm_ops.atomic_add_agent(
-                        a_entry_count + fx.Int64(grid_epoch_slot * 8), fx.Int64(1)
-                    )
+        ticket_scratch = fx.recast_iter(fx.Int64, a_buf.ptr)
+        ticket_view = fx.make_view(ticket_scratch, fx.make_layout(1, 1))
+        if tid == fx.Int32(0):
+            ticket64 = fx.Int64(
+                comm_ops.atomic_add_agent(
+                    a_entry_count + fx.Int64(grid_epoch_slot * 8), fx.Int64(1)
                 )
-                fx.ptr_store(Vec.from_elements([ticket64], fx.Int64), ticket_scratch)
-            fx.barrier()
-            ticket64 = Vec(ticket_view.load())[0]
-            generation = ticket64 // fx.Int64(launch_grid_x)
-            ticket = fx.Int32(ticket64 - generation * fx.Int64(launch_grid_x))
+            )
+            fx.ptr_store(Vec.from_elements([ticket64], fx.Int64), ticket_scratch)
+        fx.barrier()
+        ticket64 = Vec(ticket_view.load())[0]
+        generation = ticket64 // fx.Int64(launch_grid_x)
+        ticket = fx.Int32(ticket64 - generation * fx.Int64(launch_grid_x))
         gate_addr = a_epoch_gate + fx.Int64(grid_epoch_slot * 4)
         gate_epoch = fx.Int32(generation + fx.Int64(1))
         if const_expr(preplanned_compact):
             compact_owner = fx.Int32(0) == fx.Int32(1)
-            if const_expr(static_consumer_schedule):
-                compact_producer = ticket < fx.Int32(dispatch_blocks)
-                producer_slot = ticket
-            else:
-                compact_producer = (ticket > fx.Int32(0)) & (
-                    ticket <= fx.Int32(dispatch_blocks)
-                )
-                producer_slot = ticket - fx.Int32(1)
+            compact_producer = ticket < fx.Int32(dispatch_blocks)
+            producer_slot = ticket
         else:
             compact_owner = ticket == fx.Int32(0)
             compact_producer = (ticket > fx.Int32(0)) & (
@@ -608,16 +601,10 @@ def compile_mega_moe_stage1(
                     addr_payload_ready + fx.Int64(pe_index) * fx.Int64(4), payload_expected
                 )
 
-        # Retired producer CTAs never enter GEMM.  The static-role path gives
-        # producers fixed low block IDs so queued consumer CTAs naturally
-        # backfill released CUs.  Consumers still claim completion-order work
-        # dynamically because severe expert skew requires load balancing.
-        if const_expr(static_consumer_schedule):
-            consumer_id = ticket - fx.Int32(dispatch_blocks)
-            consumer_base = fx.Int32(dispatch_blocks)
-        else:
-            consumer_id = ticket - fx.Int32(consumer_ticket_base)
-            consumer_base = fx.Int32(consumer_ticket_base)
+        # Retired planner/producer CTAs never enter GEMM.  Queued consumers
+        # backfill released CUs and claim completion-order work dynamically.
+        consumer_id = ticket - fx.Int32(consumer_ticket_base)
+        consumer_base = fx.Int32(consumer_ticket_base)
         consumer_active = (ticket >= consumer_base) & (
             consumer_id < total_work
         )
