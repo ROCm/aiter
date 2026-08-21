@@ -12,6 +12,8 @@ bake into the graph correctly.
 
 import argparse
 import itertools
+import os
+import sys
 from collections import namedtuple
 
 import pandas as pd
@@ -140,6 +142,143 @@ def _unshuffle_scale(scale, s, g, ks, scale_layout, group_size):
     if scale_layout == "n32k4":
         return _unshuffle_n32k4_scale(scale, s, g, ks)
     return _scale_bytes(scale)
+
+
+# --- cross-tree drift gate for the mfma_tile layout at group_size 128 ---------
+#
+# At group_size 128 the buffer this op emits *is* opus's `shuffle_scale_a(x, K,
+# OPUS_SF_SHUF_SUB)`: one dword pairs two M subtiles `sub` rows apart crossed
+# with two consecutive 128-blocks of K. `_unshuffle_mfma_scale` above is a
+# hand-written inverse of that layout rather than a call into opus, because
+# `shuffle_scale_a` does not exist in this tree -- so the two can drift silently
+# and the failure mode is plausible wrong numbers, not an exception.
+#
+# The gate closes that by round-tripping a plain scale through opus's own
+# forward and this file's inverse. It has to run opus in a **subprocess**: both
+# trees ship a package named `aiter`, so a path insert here would resolve
+# `aiter.ops.shuffle` out of whichever one is already in sys.modules -- this
+# one, which has no shuffle_scale_a.
+#
+# `sub` is read from the opus traits header via its own single-source-of-truth
+# accessor rather than hardcoded. Hardcoding it would make this gate a third
+# copy of the constant it exists to police, and it is exactly the constant that
+# moved once already (32 -> 16 when the producer's layout was made the shipped
+# one).
+_OPUS_REF_SNIPPET = r"""
+import json, sys, torch
+tree = sys.argv[1]
+sys.path.insert(0, tree)
+sys.path.insert(0, tree + "/csrc/opus_gemm")
+from aiter.ops.shuffle import shuffle_scale_a
+try:
+    from opus_gemm_common import _opus_sf_shuf_sub
+    sub = _opus_sf_shuf_sub()
+except Exception as exc:                                  # header moved or renamed
+    raise SystemExit(f"cannot read OPUS_SF_SHUF_SUB from {tree}: {exc}")
+cases, out = json.loads(sys.argv[2]), {}
+for g, s, ks in cases:
+    torch.manual_seed(g * 1000 + s * 10 + ks)
+    plain = torch.randint(0, 255, (g, s, ks), dtype=torch.uint8)
+    out[f"{g},{s},{ks}"] = (plain, shuffle_scale_a(plain, ks * 128, sub),
+                            shuffle_scale_a(plain, ks * 128, sub * 2))
+torch.save({"sub": sub, "cases": out}, sys.argv[3])
+"""
+
+
+def check_opus_layout_identity(opus_tree, verbose=True):
+    """mfma_tile @ group 128 == opus `shuffle_scale_a`; raises on drift.
+
+    Returns the `sub` the opus tree is built with, so the caller can log which
+    layout was actually checked.
+    """
+    import json
+    import math
+    import subprocess
+    import tempfile
+
+    # Ragged s on both sides of the 2*sub row block and an odd ks, because the
+    # padding is where a layout disagreement hides: s=17 and s=129 pad, s=8 is a
+    # whole block short, and ks=3 exercises the odd-K half-dword.
+    cases = [(1, 32, 2), (2, 64, 8), (4, 17, 2), (1, 96, 6), (3, 8, 32), (2, 129, 4)]
+
+    with tempfile.TemporaryDirectory() as td:
+        ref_path = f"{td}/ref.pt"
+        proc = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                _OPUS_REF_SNIPPET,
+                opus_tree,
+                json.dumps(cases),
+                ref_path,
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"opus reference subprocess failed (rc={proc.returncode}):\n"
+                f"{proc.stdout}\n{proc.stderr}"
+            )
+        blob = torch.load(ref_path, weights_only=False)
+
+    sub, ran, neg_fired, neg_comparable = blob["sub"], 0, 0, 0
+    for g, s, ks in cases:
+        plain, ref, ref_wrong_sub = blob["cases"][f"{g},{s},{ks}"]
+        s_pad, ks_pad = math.ceil(s / (2 * sub)) * (2 * sub), ((ks + 1) // 2) * 2
+        expect = scale_shape(s, g, ks, "mfma_tile", 128)
+        if (s_pad, ks_pad) != tuple(expect[1:]):
+            raise AssertionError(
+                f"g={g} s={s} ks={ks}: this tree pads to {tuple(expect[1:])}, "
+                f"opus's sub={sub} layout wants ({s_pad}, {ks_pad})"
+            )
+        back = _unshuffle_mfma_scale(ref.view(g, s_pad, ks_pad), s, g, ks, 128)
+        got = back.permute(1, 0, 2).contiguous()
+        if not torch.equal(got, plain.to(got.device)):
+            raise AssertionError(
+                f"mfma_tile layout has drifted from opus shuffle_scale_a "
+                f"(sub={sub}) at g={g} s={s} ks={ks}: "
+                f"{(got != plain.to(got.device)).sum().item()} of {plain.numel()} "
+                f"scales differ"
+            )
+        ran += 1
+
+        # Built-in negative control. A gate that cannot fail proves nothing, and
+        # this one is cheap: the same round trip against the *other* sub must
+        # disagree, else the inverse is ignoring the byte the layout turns on.
+        # Only the cases whose row count is a whole 2*(2*sub) block are
+        # comparable -- elsewhere the two subs pad to different sizes, which the
+        # s_pad assertion above already catches, so they are not controls.
+        if ref_wrong_sub.numel() == ref.numel():
+            neg_comparable += 1
+            bad = (
+                _unshuffle_mfma_scale(
+                    ref_wrong_sub.view(g, s_pad, ks_pad), s, g, ks, 128
+                )
+                .permute(1, 0, 2)
+                .contiguous()
+            )
+            neg_fired += not torch.equal(bad, plain.to(bad.device))
+
+    assert ran == len(cases), f"gate was vacuous: ran {ran} of {len(cases)}"
+    assert neg_fired == neg_comparable and neg_fired, (
+        f"negative control: {neg_comparable - neg_fired} of {neg_comparable} "
+        f"size-comparable cases failed to distinguish sub={sub} from "
+        f"sub={2 * sub}, so the inverse is not reading the M-pairing byte"
+    )
+    if verbose:
+        aiter.logger.info(
+            "mfma_tile @ group 128 == opus shuffle_scale_a(sub=%d): %d/%d cases; "
+            "negative control distinguished sub=%d in %d/%d size-comparable cases",
+            sub,
+            ran,
+            len(cases),
+            2 * sub,
+            neg_fired,
+            neg_comparable,
+        )
+    return sub
 
 
 def _check_scale_layout(scale, s, g, ks, scale_layout, group_size, name):
@@ -601,7 +740,19 @@ def main():
         help="""Also run the HIP-graph capture/replay check over the same sweep.
         e.g.: --graph -s 1 4 32 128 300 512 700 2048""",
     )
+    parser.add_argument(
+        "--opus-tree",
+        default=os.environ.get("AITER_OPUS_TREE"),
+        help="""Path to the opus aiter checkout. Round-trips this op's
+        mfma_tile scale through opus's own shuffle_scale_a, which is the only
+        thing keeping _unshuffle_mfma_scale from drifting away from the consumer
+        (the two live in different trees). CPU only, ~2s. Also settable via
+        AITER_OPUS_TREE.""",
+    )
     args = parser.parse_args()
+
+    if args.opus_tree:
+        check_opus_layout_identity(args.opus_tree)
 
     for dtype in args.dtype:
         df = []
