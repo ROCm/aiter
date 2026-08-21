@@ -53,12 +53,15 @@ an unsupported configuration raises an error, and runtime failures are
 reported instead of being hidden by fallback. `qsa_select_paged_tokens` passes
 the same backend choice through to its scoring stage.
 
-Sparse GQA Gluon is deliberately forced-only: `"auto"` and `"triton"` both use
-Triton. `"gluon"` requires gfx950, Triton 3.6 or newer, BF16 queries and caches,
-head dimension 128, GQA group size 5, selection width 2051, and signed 32-bit
-buffer offsets for the query, K/V caches, and output. Unsupported forced
-configurations and forced Gluon runtime failures raise an error. Large-address
-cases therefore remain on Triton.
+Sparse GQA auto-selects Gluon for the validated Qwen-Air geometry: gfx950,
+Triton 3.6 or newer, BF16 queries and caches, head dimension 128, GQA group
+size 5, selection width 2051, and signed 32-bit buffer offsets for the query,
+K/V caches, and output. The specialization uses a 64-column/four-warp tile,
+cache-all buffer loads, and separate handling for the three-entry tail after
+the 2048 full columns. `"triton"` remains a portable override. Unsupported
+automatic configurations and automatic Gluon failures fall back to Triton;
+unsupported forced configurations and forced Gluon runtime failures raise an
+error. Large-address cases therefore remain on Triton.
 
 ## Validation and performance
 
@@ -73,11 +76,16 @@ Representative median kernel times were:
 
 - paged MQA scorer, query shape `(32, 8, 128)` with 4096 columns: Triton
   0.0229 ms, Gluon 0.0164 ms (28% faster);
-- sparse GQA, query shape `(16, 10, 128)` with selection width 2051: Triton
-  0.1186 ms, Gluon 0.1876 ms (58% slower).
+- sparse GQA, query shape `(16, 10, 128)` with selection width 2051 and ordered
+  indices: Triton 0.123241 ms, Gluon 0.103560 ms (16.0% lower latency, 1.190x);
+- the same sparse GQA shape with randomized production-like indices: Triton
+  0.120121 ms, Gluon 0.104321 ms (13.2% lower latency, 1.151x).
 
-Consequently, only the scorer auto-selects Gluon. Sparse Gluon remains
-available for explicit validation and tuning through `backend="gluon"`.
+The sparse GQA figures are p50 results independently reproduced from clean
+caches across seven alternating-order runs; p50 coefficient of variation was
+0.015--0.025%.
+
+Consequently, both validated gfx950 specializations auto-select Gluon.
 
 ## Current constraints
 

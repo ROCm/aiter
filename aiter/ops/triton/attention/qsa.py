@@ -28,7 +28,7 @@ _GLUON_MQA_HEADS = 8
 _GLUON_HEAD_DIM = 128
 _GLUON_GQA_GROUP_SIZE = 5
 _GLUON_SPARSE_WIDTH = 2051
-_GLUON_SPARSE_AUTO_ENABLED = False
+_GLUON_SPARSE_AUTO_ENABLED = True
 
 _gluon_qsa_paged_mqa_logits_kernel = None
 _gluon_qsa_sparse_paged_gqa_kernel = None
@@ -520,10 +520,10 @@ def qsa_sparse_paged_gqa(
                 GROUP_SIZE=group_size,
                 HEAD_DIM=q.shape[2],
                 BLOCK_M=block_m,
-                BLOCK_N=16,
+                BLOCK_N=64,
                 BLOCK_D=block_d,
                 USE_BUFFER_LOAD=True,
-                num_warps=2,
+                num_warps=4,
             )
             return out
         except Exception:  # noqa: BLE001

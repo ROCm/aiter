@@ -23,7 +23,7 @@ def _cache_load(ptr, offsets, USE_BUFFER_LOAD: gl.constexpr, mask=None, other=No
             offsets=offsets.to(gl.int32),
             mask=mask,
             other=other,
-            cache=".cg",
+            cache=".ca",
         )
     return gl.load(
         ptr + offsets.to(gl.int64),
@@ -48,7 +48,6 @@ def _sparse_tile(
     running_sum,
     accumulator,
     head_mask,
-    qk_scale,
     k_smem,
     v_smem,
     stride_k_page,
@@ -81,17 +80,25 @@ def _sparse_tile(
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,
     USE_BUFFER_LOAD: gl.constexpr,
+    FULL_TILE: gl.constexpr,
 ):
     """Gather one sparse K/V tile and update FP32 online-softmax state."""
     columns = start + gl.arange(0, BLOCK_N, layout=column_layout)
-    in_selection = columns < TOPK
-    logical_token = gl.load(
-        logical_indices_ptr
-        + token * stride_indices_token
-        + columns * stride_indices_column,
-        mask=in_selection,
-        other=-1,
-    )
+    if FULL_TILE:
+        logical_token = gl.load(
+            logical_indices_ptr
+            + token * stride_indices_token
+            + columns * stride_indices_column,
+        )
+    else:
+        in_selection = columns < TOPK
+        logical_token = gl.load(
+            logical_indices_ptr
+            + token * stride_indices_token
+            + columns * stride_indices_column,
+            mask=in_selection,
+            other=-1,
+        )
 
     request_valid = (request >= 0) & (request < num_requests)
     safe_request = gl.minimum(gl.maximum(request, 0), num_requests - 1)
@@ -101,10 +108,11 @@ def _sparse_tile(
     valid = (
         (token < num_tokens)
         & request_valid
-        & in_selection
         & (logical_token >= 0)
         & (logical_page < PAGE_TABLE_WIDTH)
     )
+    if not FULL_TILE:
+        valid = valid & in_selection
     physical_page = gl.load(
         block_table_ptr
         + safe_request * stride_table_request
@@ -128,18 +136,18 @@ def _sparse_tile(
         + kv_head * stride_k_head
         + dim_offsets[None, :] * stride_k_dim
     )
-    v_offsets = (
-        page_g[:, None] * stride_v_page
-        + offset_g[:, None] * stride_v_token
-        + kv_head * stride_v_head
-        + dim_offsets[None, :] * stride_v_dim
-    )
     keys = _cache_load(
         k_cache_ptr,
         k_offsets,
         USE_BUFFER_LOAD,
         mask=valid_g[:, None],
         other=0.0,
+    )
+    v_offsets = (
+        page_g[:, None] * stride_v_page
+        + offset_g[:, None] * stride_v_token
+        + kv_head * stride_v_head
+        + dim_offsets[None, :] * stride_v_dim
     )
     values = _cache_load(
         v_cache_ptr,
@@ -165,11 +173,10 @@ def _sparse_tile(
     tile_max = gl.max(scores, axis=1)
     next_max = gl.maximum(running_max, tile_max)
     safe_next_max = gl.where(next_max > float("-inf"), next_max, 0.0)
-    safe_next_scaled = safe_next_max * qk_scale
-    probabilities = gl.exp2(scores * qk_scale - safe_next_scaled[:, None])
+    probabilities = gl.exp2(scores - safe_next_max[:, None])
     alpha = gl.where(
         running_max > float("-inf"),
-        gl.exp2(running_max * qk_scale - safe_next_scaled),
+        gl.exp2(running_max - safe_next_max),
         0.0,
     )
     next_sum = running_sum * alpha + gl.sum(probabilities, axis=1)
@@ -242,7 +249,7 @@ def _qsa_sparse_paged_gqa_kernel(
     gl.static_assert(BLOCK_M >= GROUP_SIZE, "BLOCK_M must cover GROUP_SIZE")
     gl.static_assert(BLOCK_M % 16 == 0, "BLOCK_M must be a multiple of 16")
     gl.static_assert(BLOCK_D == HEAD_DIM, "BLOCK_D must equal HEAD_DIM")
-    gl.static_assert(BLOCK_N == 16, "gfx950 sparse GQA currently requires BLOCK_N=16")
+    gl.static_assert(TOPK == 2051, "gfx950 sparse GQA requires TOPK=2051")
     gl.static_assert(HEAD_DIM % 16 == 0, "HEAD_DIM must be a multiple of 16")
 
     token = gl.program_id(0)
@@ -300,7 +307,8 @@ def _qsa_sparse_paged_gqa_kernel(
         other=0.0,
         cache=".cg",
     )
-    q_dot = gl.convert_layout(query, q_layout)
+    qk_scale: gl.constexpr = softmax_scale * 1.4426950408889634
+    q_dot = gl.convert_layout((query * qk_scale).to(query.dtype), q_layout)
 
     running_max = gl.full(
         [BLOCK_M], float("-inf"), gl.float32, layout=gl.SliceLayout(1, qk_layout)
@@ -313,8 +321,7 @@ def _qsa_sparse_paged_gqa_kernel(
         gl.bfloat16, [BLOCK_N, HEAD_DIM], kv_shared_layout
     )
 
-    qk_scale: gl.constexpr = softmax_scale * 1.4426950408889634
-    for start in range(0, selection_width, BLOCK_N):
+    for start in range(0, 2048, BLOCK_N):
         running_max, running_sum, accumulator = _sparse_tile(
             q_dot,
             k_cache_ptr,
@@ -329,7 +336,6 @@ def _qsa_sparse_paged_gqa_kernel(
             running_sum,
             accumulator,
             head_mask,
-            qk_scale,
             kv_smem,
             kv_smem,
             stride_k_page,
@@ -362,7 +368,56 @@ def _qsa_sparse_paged_gqa_kernel(
             BLOCK_M,
             BLOCK_N,
             USE_BUFFER_LOAD,
+            True,
         )
+    running_max, running_sum, accumulator = _sparse_tile(
+        q_dot,
+        k_cache_ptr,
+        v_cache_ptr,
+        logical_indices_ptr,
+        block_table_ptr,
+        token,
+        request,
+        2048,
+        kv_head,
+        running_max,
+        running_sum,
+        accumulator,
+        head_mask,
+        kv_smem,
+        kv_smem,
+        stride_k_page,
+        stride_k_token,
+        stride_k_head,
+        stride_k_dim,
+        stride_v_page,
+        stride_v_token,
+        stride_v_head,
+        stride_v_dim,
+        stride_indices_token,
+        stride_indices_column,
+        stride_table_request,
+        stride_table_page,
+        num_tokens,
+        num_cache_pages,
+        num_requests,
+        qk_layout,
+        pv_layout,
+        k_layout,
+        v_layout,
+        p_layout,
+        gather_layout,
+        column_layout,
+        TOPK,
+        PAGE_SIZE,
+        PAGE_TABLE_WIDTH,
+        GROUP_SIZE,
+        HEAD_DIM,
+        BLOCK_M,
+        BLOCK_N,
+        USE_BUFFER_LOAD,
+        False,
+    )
 
     sum_pv = gl.convert_layout(running_sum, gl.SliceLayout(1, pv_layout))
     output = gl.where(
