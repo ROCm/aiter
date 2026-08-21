@@ -15,11 +15,21 @@ import torch
 import aiter
 from aiter import dtypes, per_tensor_quant
 from aiter.jit.utils.chip_info import get_gfx_runtime
-from aiter.ops.attention import pa_decode_gluon as public_pa_decode
+from aiter.ops.attention import pa_decode_flydsl as public_pa_decode
 from aiter.ops.triton.gluon.pa_decode_gluon import pa_decode_gluon
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
-torch.set_default_device("cuda")
+
+@pytest.fixture(autouse=True)
+def _default_cuda_device():
+    # Scoped rather than set at import time: this module now runs in the shared
+    # Standard Tests shard, where a global default-device switch would follow
+    # every later test in the session.
+    previous = torch.get_default_device()
+    torch.set_default_device("cuda")
+    yield
+    torch.set_default_device(previous)
+
 
 SUPPORTED_GFX = ["gfx942", "gfx950"]
 KV_COMPUTE_BLOCK = 256
@@ -130,27 +140,6 @@ def test_pa_decode_maps_gluon_buffers_and_scale_layout(monkeypatch):
     exp_sums = torch.empty_like(max_logits)
     temporary_output = torch.empty(1, 1, 2, 8, 128, dtype=query.dtype)
 
-    assert attention_module._can_use_flydsl_pa_decode(
-        output,
-        query,
-        key_cache,
-        value_cache,
-        context_lengths,
-        block_tables,
-        1,
-        2,
-        256,
-        key_cache.dtype,
-        None,
-        key_scale,
-        value_scale,
-        exp_sums,
-        max_logits,
-        temporary_output,
-        None,
-        None,
-        0,
-    )
     pa_decode(
         output,
         query,
@@ -181,18 +170,6 @@ def test_pa_decode_maps_gluon_buffers_and_scale_layout(monkeypatch):
         "_pa_decode_flydsl",
         lambda *args, **kwargs: dispatches.append("flydsl"),
     )
-    monkeypatch.setattr(
-        attention_module,
-        "_pa_decode_gluon_fallback",
-        lambda *args, **kwargs: dispatches.append("gluon"),
-    )
-    common_kwargs = {
-        "key_scale": key_scale,
-        "value_scale": value_scale,
-        "exp_sums": exp_sums,
-        "max_logits": max_logits,
-        "temporary_output": temporary_output,
-    }
     public_pa_decode(
         output,
         query,
@@ -204,23 +181,13 @@ def test_pa_decode_maps_gluon_buffers_and_scale_layout(monkeypatch):
         1,
         2,
         compute_type=key_cache.dtype,
-        **common_kwargs,
+        key_scale=key_scale,
+        value_scale=value_scale,
+        exp_sums=exp_sums,
+        max_logits=max_logits,
+        temporary_output=temporary_output,
     )
-    public_pa_decode(
-        output,
-        query,
-        key_cache,
-        value_cache,
-        context_lengths,
-        block_tables,
-        128**-0.5,
-        1,
-        2,
-        compute_type=key_cache.dtype,
-        query_scale=torch.ones(1, dtype=torch.float32),
-        **common_kwargs,
-    )
-    assert dispatches == ["flydsl", "gluon"]
+    assert dispatches == ["flydsl"]
 
 
 def run_torch(
@@ -278,7 +245,7 @@ def _run_flydsl(
     psum,
     pout,
 ):
-    torch.ops.aiter.pa_decode_gluon(
+    torch.ops.aiter.pa_decode_flydsl(
         output,
         query,
         key_cache,
@@ -465,7 +432,207 @@ def test_pa_decode_tile(block_size):
     assert result["flydsl err"] == 0
 
 
+def _require_gpu():
+    if not torch.cuda.is_available():
+        pytest.skip("ROCm is not available")
+    if pa_decode is None:
+        pytest.skip("FlyDSL is not available")
+    if get_gfx_runtime() not in SUPPORTED_GFX:
+        pytest.skip(f"pa_decode is unsupported on {get_gfx_runtime()}")
+
+
+def _adversarial_case(
+    head_dim=128,
+    context_length=257,
+    block_size=16,
+    query_group_size=8,
+    query_length=1,
+    per_token=False,
+    zero_query=False,
+    poison_padding_blocks=False,
+    tail_value_scale=None,
+    seed=0,
+):
+    """Build one case plus its torch reference over the same dequantised fp8 KV.
+
+    ``poison_padding_blocks`` fills every block past the sequence's real extent
+    with NaN and pads the block table out to reach them -- the entries a caller
+    leaves behind, which the kernel must resolve to block 0 rather than follow.
+    """
+    quant_dtype = _quant_dtype()
+    generator = torch.Generator(device="cuda").manual_seed(seed)
+    owned = (context_length + block_size - 1) // block_size
+    # A 256-token tile always walks 256/block_size pages, so pad past `owned` to
+    # give the block table entries that must not be dereferenced.
+    blocks = owned + 256 // block_size if poison_padding_blocks else owned
+    tokens = blocks * block_size
+
+    def rand(*shape):
+        return torch.rand(*shape, generator=generator, device="cuda") - 0.5
+
+    query = (
+        torch.zeros(query_length, query_group_size, head_dim, dtype=dtypes.bf16)
+        if zero_query
+        else rand(query_length, query_group_size, head_dim).to(dtypes.bf16)
+    )
+    key = rand(blocks, 1, block_size, head_dim).to(quant_dtype)
+    value = rand(blocks, 1, block_size, head_dim).to(quant_dtype)
+
+    invalid = (torch.arange(tokens, device="cuda") >= context_length).view(
+        blocks, 1, block_size, 1
+    )
+    if poison_padding_blocks:
+        padding = (torch.arange(tokens, device="cuda") >= owned * block_size).view(
+            blocks, 1, block_size, 1
+        )
+        poison = torch.full_like(value, float("nan"), dtype=dtypes.fp32).to(quant_dtype)
+        value = torch.where(padding.expand_as(value), poison, value)
+        key = torch.where(padding.expand_as(key), poison, key)
+
+    if per_token:
+        key_scale = (
+            torch.rand(blocks, 1, block_size, 1, generator=generator, device="cuda")
+            * 0.5
+            + 0.75
+        )
+        value_scale = (
+            torch.rand(blocks, 1, block_size, 1, generator=generator, device="cuda")
+            * 0.5
+            + 0.75
+        )
+        if tail_value_scale is not None:
+            value_scale = torch.where(
+                invalid, torch.full_like(value_scale, tail_value_scale), value_scale
+            )
+    else:
+        key_scale = torch.ones(1, dtype=dtypes.fp32)
+        value_scale = torch.ones(1, dtype=dtypes.fp32)
+
+    key_cache = (
+        key.view(blocks, 1, block_size, head_dim // 16, 16)
+        .permute(0, 1, 3, 2, 4)
+        .contiguous()
+    )
+    value_cache = value.permute(0, 1, 3, 2).contiguous()
+    block_tables = torch.arange(blocks, dtype=dtypes.i32).reshape(1, blocks)
+    context_lengths = torch.full((1,), context_length, dtype=dtypes.i32)
+
+    keys = key.float().reshape(tokens, head_dim)
+    values = value.float().reshape(tokens, head_dim)
+    if per_token:
+        keys = keys * key_scale.float().reshape(tokens, 1)
+        values = values * value_scale.float().reshape(tokens, 1)
+    reference = torch.empty(
+        query_length, query_group_size, head_dim, dtype=dtypes.fp32, device="cuda"
+    )
+    for position in range(query_length):
+        # MTP position `p` sees context_length - (query_length - 1) + p tokens.
+        visible = context_length - (query_length - 1) + position
+        scores = query[position].float() @ keys[:visible].T * head_dim**-0.5
+        reference[position] = torch.softmax(scores, dim=-1) @ values[:visible]
+
+    output = torch.empty_like(query)
+    torch.ops.aiter.pa_decode_flydsl(
+        output,
+        query,
+        key_cache,
+        value_cache,
+        context_lengths,
+        block_tables,
+        head_dim**-0.5,
+        query_length,
+        1,
+        256,
+        quant_dtype,
+        None,
+        key_scale,
+        value_scale,
+    )
+    return output.float(), reference
+
+
+def _assert_matches(output, reference, tolerance=0.06):
+    assert torch.isfinite(output).all(), (
+        f"{int((~torch.isfinite(output)).sum())} of {output.numel()} outputs "
+        "are NaN or inf"
+    )
+    scale = float(reference.abs().max()) or 1.0
+    error = float((output - reference).abs().max()) / scale
+    assert error < tolerance, f"relative error {error:.3%} exceeds {tolerance:.1%}"
+
+
+@pytest.mark.parametrize("query_length", [1, 4])
+@pytest.mark.parametrize("per_token", [False, True])
+def test_zero_query_stays_finite(query_length, per_token):
+    """An all-zero query row quantises to scale 0; -inf * 0 must not reach exp2."""
+    _require_gpu()
+    output, reference = _adversarial_case(
+        query_length=query_length, per_token=per_token, zero_query=True
+    )
+    _assert_matches(output, reference)
+
+
+@pytest.mark.parametrize("block_size", [16, 64])
+@pytest.mark.parametrize("context_length", [1, 257, 1027])
+def test_block_table_padding_is_not_dereferenced(block_size, context_length):
+    """Entries past the sequence's extent must resolve to block 0.
+
+    A 256-token tile always walks 256/block_size pages, so it reads block-table
+    entries the sequence does not own. Those hold whatever the caller left --
+    often a stale id pointing at another sequence's live page. The tokens behind
+    them get a zero probability, but the PV matmul still multiplies their V
+    bytes (``0 * NaN == NaN``), so the page index itself has to be pinned.
+
+    Not covered here, by design: the unwritten tail of the last page the
+    sequence does own. Those slots are inside a real block and the caller is
+    expected to leave them finite.
+    """
+    _require_gpu()
+    output, reference = _adversarial_case(
+        context_length=context_length,
+        block_size=block_size,
+        poison_padding_blocks=True,
+    )
+    _assert_matches(output, reference)
+
+
+@pytest.mark.parametrize("query_length", [1, 4])
+@pytest.mark.parametrize("context_length", [1, 257])
+def test_extreme_tail_value_scale_is_ignored(context_length, query_length):
+    """A huge scale on an unwritten slot must not underflow valid probabilities.
+
+    Only finite tails are covered: scale tensors are allocated zeroed, so a NaN
+    scale past ``context_len`` is not a case the kernel has to survive.
+    """
+    _require_gpu()
+    if context_length < query_length:
+        pytest.skip("MTP position 0 would see a non-positive causal bound")
+    output, reference = _adversarial_case(
+        context_length=context_length,
+        query_length=query_length,
+        per_token=True,
+        tail_value_scale=1e9,
+    )
+    _assert_matches(output, reference)
+
+
+@pytest.mark.parametrize("head_dim", [64, 128, 256])
+def test_supported_head_dims_are_accurate(head_dim):
+    _require_gpu()
+    output, reference = _adversarial_case(head_dim=head_dim, context_length=1027)
+    _assert_matches(output, reference)
+
+
+@pytest.mark.parametrize("head_dim", [192, 320])
+def test_unsupported_head_dim_is_rejected(head_dim):
+    """head_dim//16 above 8 and not a multiple of 8 leaves the Q tail unloaded."""
+    _require_gpu()
+    with pytest.raises(NotImplementedError, match="head_dim"):
+        _adversarial_case(head_dim=head_dim, context_length=64)
+
+
 def main():
+    torch.set_default_device("cuda")
     if not torch.cuda.is_available():
         aiter.logger.warning("ROCm is not available; skipping pa_decode")
         return
