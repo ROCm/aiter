@@ -8,6 +8,7 @@
         "num_warps": 4,
         "waves_per_eu": 1,
         "num_stages": 3,
+        "matrix_instr_nonkdim": 16,
         "cache_modifier": null
     }
 }
