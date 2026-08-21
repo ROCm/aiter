@@ -81,32 +81,6 @@ _MOE_A8W4_BYPASS_QUANT = os.environ.get("AITER_MOE_A8W4_BYPASS_QUANT", "0") == "
 # so there is no overhead.
 kernel_bench_callable = None
 
-# CK 2-stage kernel-instance names embed the activation token (see
-# gemm_moe_ck2stages_common.ACT_OP_NAME). Used to detect when the act-disabled
-# tuned-config fallback tier handed us another activation's CK kernel name.
-_CK2STAGES_ACT_TOKENS = {
-    int(_member): _token
-    for _name, _token in (
-        ("Silu", "silu"),
-        ("Gelu", "gelu"),
-        ("Swiglu", "swiglu"),
-        ("GeluTanh", "gelutanh"),
-    )
-    if (_member := getattr(ActivationType, _name, None)) is not None
-}
-
-
-def _ck2stages_kname_act_token(kname: str) -> str | None:
-    """Return the activation token embedded in a CK 2-stage kernel name, if any.
-
-    Order matters: check ``gelutanh`` before ``gelu`` so the shorter token does
-    not shadow the longer one.
-    """
-    for tok in ("gelutanh", "swiglu", "silu", "gelu"):
-        if f"_{tok}_" in kname:
-            return tok
-    return None
-
 
 # FLAT 1stage asm kernels (manifest flat=1) ingest raw topk_ids /
 # topk_weights through the sorted_* kernarg slots and accumulate via
@@ -1457,8 +1431,10 @@ def _flydsl_stage1_wrapper(
         act = "swiglu"
     elif activation == ActivationType.Situv2:
         act = "situv2"
-    else:
+    elif activation == ActivationType.Silu:
         act = "silu"
+    else:
+        raise ValueError(f"Unsupported activation for FlyDSL MoE stage1: {activation}")
     _a_scale_one = parsed.get("a_scale_one", False)
     return aiter.ops.flydsl.flydsl_moe_stage1(
         a=hidden_states,
@@ -2208,6 +2184,14 @@ def get_2stage_cfgs(
 
         # Fallback dict: disable act_type so any activation can match.
         df_fallback = df.copy()
+        if "kernelName1" in df_fallback.columns:
+            is_ck2stages = (
+                df_fallback["kernelName1"]
+                .fillna("")
+                .astype(str)
+                .str.contains("moe_ck2stages")
+            )
+            df_fallback = df_fallback.loc[~is_ck2stages]
         if "act_type" in df_fallback.columns:
             df_fallback["act_type"] = _ACT_TYPE_DISABLED_KEY
         dup_mask = df_fallback.duplicated(subset=_INDEX_COLS, keep="first")
@@ -2361,23 +2345,6 @@ def get_2stage_cfgs(
                     f"[fused_moe] Opus stage2 config unsupported ({opus_reason}); "
                     "using default heuristics"
                 )
-
-    # The tuned-config lookup disables act_type for its fallback tier, so a request
-    # for one activation can match another activation's row. Drop such cross-activation
-    # CK configs so the correct routing / heuristic dispatch is used instead.
-    if cfg is not None:
-        kn1 = str(cfg.get("kernelName1", "") or "").strip()
-        if "moe_ck2stages" in kn1:
-            want_act = _CK2STAGES_ACT_TOKENS.get(int(activation))
-            have_act = _ck2stages_kname_act_token(kn1)
-            if want_act is not None and have_act is not None and have_act != want_act:
-                cfg = None
-                logger.warning(
-                    f"[fused_moe] discarding cross-activation CK tuned config "
-                    f"(kernelName1 activation '{have_act}' != requested "
-                    f"'{want_act}') for {keys}; using default routing/heuristics"
-                )
-
     use_non_temporal_load = False
     if cfg is None or int(os.environ.get("AITER_BYPASS_TUNE_CONFIG", "0")):
         ksplit = 0
@@ -3440,8 +3407,12 @@ def asm_stage1(
             aiter.silu_and_mul(out, tmp_out.view(dtypes.fp32))
         elif activation == ActivationType.Swiglu:
             aiter.swiglu_and_mul(out, tmp_out.view(dtypes.fp32))
-        else:
+        elif activation == ActivationType.Gelu:
             aiter.gelu_and_mul(out, tmp_out.view(dtypes.fp32))
+        else:
+            raise ValueError(
+                f"Unsupported activation for split-k post-activation: {activation}"
+            )
     return out
 
 
@@ -3868,8 +3839,12 @@ def ck_moe_stage1(
         valid_out = tmp_out[: token_num * topk, :]
         if activation == ActivationType.Silu:
             aiter.silu_and_mul(out, valid_out.view(dtypes.fp32))
-        else:
+        elif activation == ActivationType.Gelu:
             aiter.gelu_and_mul(out, valid_out.view(dtypes.fp32))
+        else:
+            raise ValueError(
+                f"Unsupported activation for split-k post-activation: {activation}"
+            )
     return out
 
 
@@ -3987,13 +3962,18 @@ def cktile_moe_stage1(
                     token_num,
                     topk,
                 )
-            else:
+            elif activation == ActivationType.Gelu:
                 NLane = 16
                 N0 = inter_dim // NLane
                 flat = valid_out.view(-1, N0, 2, NLane)
                 gate = flat[:, :, 0, :].reshape(-1, inter_dim)
                 up = flat[:, :, 1, :].reshape(-1, inter_dim)
                 out.view(-1, inter_dim).copy_(torch.nn.functional.gelu(gate) * up)
+            else:
+                raise ValueError(
+                    f"Unsupported activation for interleaved split-k "
+                    f"post-activation: {activation}"
+                )
         else:
             if bias1 is not None and topk_ids is None:
                 raise ValueError(
@@ -4004,14 +3984,23 @@ def cktile_moe_stage1(
                 aiter.silu_and_mul_bias(out, valid_out, expert_ids, bias1)
             elif bias1 is not None and activation == ActivationType.Swiglu:
                 aiter.swiglu_and_mul_bias(out, valid_out, expert_ids, bias1)
-            elif bias1 is not None:
+            elif bias1 is not None and activation == ActivationType.Gelu:
                 aiter.gelu_and_mul_bias(out, valid_out, expert_ids, bias1)
+            elif bias1 is not None:
+                raise ValueError(
+                    f"Unsupported activation for split-k post-activation "
+                    f"with bias: {activation}"
+                )
             elif activation == ActivationType.Silu:
                 aiter.silu_and_mul(out, valid_out)
             elif activation == ActivationType.Swiglu:
                 aiter.swiglu_and_mul(out, valid_out)
-            else:
+            elif activation == ActivationType.Gelu:
                 aiter.gelu_and_mul(out, valid_out)
+            else:
+                raise ValueError(
+                    f"Unsupported activation for split-k post-activation: {activation}"
+                )
     return out
 
 
