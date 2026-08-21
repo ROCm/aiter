@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 from dataclasses import replace
 from pathlib import Path
@@ -99,6 +100,30 @@ def make_inputs(tokens, rank, world, model_dim, experts, topk, route, hot_bias, 
     )
 
 
+def load_route_artifact(path: str, rank: int, device: torch.device):
+    artifact_dir = Path(path)
+    matches = sorted(artifact_dir.glob(f"*rank{rank}.pt"))
+    if len(matches) != 1:
+        raise ValueError(
+            f"expected one rank{rank} route artifact in {artifact_dir}, got {matches}"
+        )
+    payload = torch.load(matches[0], map_location="cpu", weights_only=False)
+    ids = payload["expert_ids"].to(device=device, dtype=torch.int32).contiguous()
+    weights = (
+        payload["route_weights"].to(device=device, dtype=torch.float32).contiguous()
+    )
+    if ids.ndim != 2 or weights.shape != ids.shape:
+        raise ValueError(
+            f"invalid route artifact shapes ids={tuple(ids.shape)} weights={tuple(weights.shape)}"
+        )
+    return weights, ids, payload.get("metadata", {})
+
+
+def tensor_hash(tensor: torch.Tensor) -> str:
+    raw = tensor.detach().contiguous().view(torch.int16).cpu().numpy().tobytes()
+    return hashlib.sha256(raw).hexdigest()
+
+
 def make_weights(local_experts, model_dim, inter_dim, rank, device):
     generator = torch.Generator(device=device).manual_seed(9000 + rank)
     quantize = aiter.get_torch_quant(aiter.QuantType.per_1x32)
@@ -159,7 +184,11 @@ def time_graph(graph, iters, device):
     maximum = mean.clone()
     dist.all_reduce(mean, op=dist.ReduceOp.SUM)
     dist.all_reduce(maximum, op=dist.ReduceOp.MAX)
-    return float(mean.item() / dist.get_world_size()), float(maximum.item())
+    return (
+        float(mean.item() / dist.get_world_size()),
+        float(maximum.item()),
+        float(local_ms),
+    )
 
 
 def profile_graph(graph, name, rank, out_dir, replays=3):
@@ -178,6 +207,7 @@ def profile_graph(graph, name, rank, out_dir, replays=3):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--tokens", type=int, default=8192)
+    parser.add_argument("--print-rank-times", action="store_true")
     parser.add_argument("--rank-tokens", default="")
     parser.add_argument("--config-tokens", type=int, default=0)
     parser.add_argument("--mtpr", type=int, default=8192)
@@ -201,20 +231,34 @@ def main():
     parser.add_argument("--stage2-strided", action="store_true")
     parser.add_argument("--stage2-persist-cu", type=int, default=0)
     parser.add_argument("--stage2-skew-cu", type=int, default=0)
+    parser.add_argument("--stage2-block-m", type=int, default=0)
+    parser.add_argument("--stage2-block-n", type=int, default=0)
+    parser.add_argument("--stage2-block-k", type=int, default=0)
     parser.add_argument("--disable-stage2-skew", action="store_true")
     parser.add_argument("--stage1-payload-chunk-rows", type=int, default=0)
-    parser.add_argument("--stage1-tile-ready", action="store_true")
-    parser.add_argument("--disable-stage1-tile-ready", action="store_true")
-    parser.add_argument("--stage1-internal-grouping", action="store_true")
     parser.add_argument("--stage1-work-shards", type=int, default=0)
+    parser.add_argument("--stage1-prepare-cu", type=int, default=0)
+    parser.add_argument("--stage1-prepare-quant-cu", type=int, default=0)
     parser.add_argument("--stage1-dispatch-cu", type=int, default=0)
     parser.add_argument("--stage1-grid-mult", type=int, default=0)
     parser.add_argument("--stage1-b-nt", type=int, default=-1)
     parser.add_argument("--stage1-tile-resource", action="store_true")
+    parser.add_argument(
+        "--stage1-fanout-masks",
+        default="",
+        help="comma-separated local-expert masks, one per destination",
+    )
+    parser.add_argument("--route-artifacts", default="")
+    parser.add_argument("--output-hash", action="store_true")
     parser.add_argument("--check-variant", action="store_true")
     parser.add_argument("--profile-dir", default="")
     parser.add_argument("--mega-only", action="store_true")
     parser.add_argument("--perf-guard", action="store_true")
+    parser.add_argument(
+        "--separate-quant-prepare",
+        action="store_true",
+        help="bench-only A/B: launch the stock quant kernel before compact prepare",
+    )
     args = parser.parse_args()
 
     rank, world, device = setup_dist()
@@ -238,6 +282,28 @@ def main():
         args.hot_bias,
         device,
     )
+    artifact_metadata = None
+    if args.route_artifacts:
+        route_weights, ids, artifact_metadata = load_route_artifact(
+            args.route_artifacts, rank, device
+        )
+        tokens = int(ids.shape[0])
+        if ids.shape[1] != args.topk:
+            raise ValueError(
+                f"artifact topk={ids.shape[1]} does not match --topk={args.topk}"
+            )
+        if x.shape[0] != tokens:
+            x, _, _ = make_inputs(
+                tokens,
+                rank,
+                world,
+                args.model_dim,
+                args.experts,
+                args.topk,
+                args.route,
+                args.hot_bias,
+                device,
+            )
     route_counts = torch.zeros(world, dtype=torch.int64, device=device)
     route_counts.scatter_add_(
         0,
@@ -253,6 +319,9 @@ def main():
         local_experts, args.model_dim, args.inter_dim, rank, device
     )
 
+    fanout_masks = tuple(
+        int(item, 0) for item in args.stage1_fanout_masks.split(",") if item
+    )
     mega = MegaMoEV2(
         rank=rank,
         world_size=world,
@@ -267,6 +336,7 @@ def main():
         w2_scale=w2_scale,
         max_tok_per_rank=args.mtpr,
         swiglu_limit=SWIGLU_LIMIT,
+        fanout_masks=fanout_masks,
     )
     default_select_config = mega._select_config
     variant_select_config = None
@@ -274,12 +344,14 @@ def main():
         args.stage2_strided
         or args.stage2_persist_cu
         or args.stage2_skew_cu
+        or args.stage2_block_m
+        or args.stage2_block_n
+        or args.stage2_block_k
         or args.disable_stage2_skew
         or args.stage1_payload_chunk_rows
-        or args.stage1_tile_ready
-        or args.disable_stage1_tile_ready
-        or args.stage1_internal_grouping
         or args.stage1_work_shards
+        or args.stage1_prepare_cu
+        or args.stage1_prepare_quant_cu
         or args.stage1_dispatch_cu
         or args.stage1_grid_mult
         or args.stage1_b_nt >= 0
@@ -295,16 +367,12 @@ def main():
                 stage1 = replace(
                     stage1, payload_chunk_rows=args.stage1_payload_chunk_rows
                 )
-            if args.stage1_tile_ready:
-                stage1 = replace(stage1, payload_tile_ready=True)
-            if args.disable_stage1_tile_ready:
-                stage1 = replace(stage1, payload_tile_ready=False)
-            if args.stage1_internal_grouping:
-                stage1 = replace(
-                    stage1, external_grouping=False, external_counting=False
-                )
             if args.stage1_work_shards:
                 stage1 = replace(stage1, work_shards=args.stage1_work_shards)
+            if args.stage1_prepare_cu:
+                stage1 = replace(stage1, prepare_cu=args.stage1_prepare_cu)
+            if args.stage1_prepare_quant_cu:
+                stage1 = replace(stage1, prepare_quant_cu=args.stage1_prepare_quant_cu)
             if args.stage1_dispatch_cu:
                 stage1 = replace(stage1, num_dispatch_cu=args.stage1_dispatch_cu)
             if args.stage1_grid_mult:
@@ -317,10 +385,16 @@ def main():
                 args.stage2_strided
                 or args.stage2_persist_cu
                 or args.stage2_skew_cu
+                or args.stage2_block_m
+                or args.stage2_block_n
+                or args.stage2_block_k
                 or args.disable_stage2_skew
             ):
                 stage2 = replace(
                     stage2,
+                    block_m=args.stage2_block_m or stage2.block_m,
+                    block_n=args.stage2_block_n or stage2.block_n,
+                    block_k=args.stage2_block_k or stage2.block_k,
                     persist_strided=args.stage2_strided,
                     persist_cu=args.stage2_persist_cu or stage2.persist_cu,
                     skew_cu=(
@@ -383,14 +457,26 @@ def main():
         holders["mori"] = mori_op.combine(local_out, None, ids)[0]
 
     def mega_body():
-        holders["mega"] = mega(x, route_weights, ids)
+        if args.separate_quant_prepare:
+            x_q_e2e, x_scale_e2e = mega.quantize(x)
+            holders["mega"] = mega._run_joint(
+                x_q_e2e,
+                x_scale_e2e,
+                route_weights,
+                ids,
+                tokens,
+                None,
+                True,
+            )
+        else:
+            holders["mega"] = mega(x, route_weights, ids)
 
     mori_graph = None if args.mega_only else capture(mori_body)
     print(f"[STEP] rank={rank} mori-capture-done", flush=True)
     mega_graph = capture(mega_body)
     print(f"[STEP] rank={rank} mega-capture-done", flush=True)
     mori_ms = (
-        (float("nan"), float("nan"))
+        (float("nan"), float("nan"), float("nan"))
         if mori_graph is None
         else time_graph(mori_graph, args.iters, device)
     )
@@ -415,6 +501,24 @@ def main():
     mega_stage1()
     barrier()
     stage2_ms = time_graph(stage2_graph, args.iters, device)
+
+    rank_times = None
+    if args.print_rank_times:
+        rank_times = [None] * world
+        dist.all_gather_object(
+            rank_times,
+            {
+                "mega": mega_ms[2],
+                "stage1": stage1_ms[2],
+                "stage2": stage2_ms[2],
+            },
+        )
+
+    output_digests = None
+    if args.output_hash:
+        local_digest = tensor_hash(holders["mega"])
+        output_digests = [None] * world
+        dist.all_gather_object(output_digests, local_digest)
 
     rel_l2 = None
     if args.check_variant:
@@ -462,6 +566,16 @@ def main():
             f"mean_routes={expert_counts.float().mean().item():.1f}",
             flush=True,
         )
+        if artifact_metadata is not None:
+            print(
+                f"[ARTIFACT] call={artifact_metadata.get('call_index')} "
+                f"layer={artifact_metadata.get('layer_id')}",
+                flush=True,
+            )
+        if output_digests is not None:
+            print(f"[OUTPUT-HASH] per-rank={output_digests}", flush=True)
+        if rank_times is not None:
+            print(f"[RANK-TIMES] {rank_times}", flush=True)
         if rel_l2 is not None:
             print(
                 f"[ACCURACY] variant_vs_default_rel_l2={rel_l2.item():.6e}", flush=True

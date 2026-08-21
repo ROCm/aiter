@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-import mori.ir.flydsl as mori_shmem
 import torch
 from flydsl.expr import T, const_expr, range_constexpr
 from flydsl.expr.rocdl import (
@@ -36,6 +35,9 @@ from .communication_ops_utils import (
     load_i64_global,
     store_i32_system,
     store_i64_global_system,
+    wait_i32_until_equals,
+    wait_i32_until_greater_than,
+    wait_i64_until_equals,
 )
 
 # Bump when generated kernel shape changes.
@@ -284,7 +286,7 @@ def make_dispatch_kernel(
         recv_num_local_byte_off = fx.Int64(rank) * 4
         for dest_pe in range(lane, npes, 64):
             if global_warp_id == 0:
-                mori_shmem.int32_wait_until_equals(addr_disp_bar, block_num)
+                wait_i32_until_equals(addr_disp_bar, fx.Int32(block_num))
                 # Acquire fence pairs with the per-block release atomic_add
                 # on ``addr_disp_bar``; makes Phase-1 P2P writes visible.
                 fence_system_acquire()
@@ -297,15 +299,15 @@ def make_dispatch_kernel(
                     buffer_load(_r_p2p_recv_num, dest_pe, vec_width=1, dtype=T.i64)
                     + recv_num_local_byte_off
                 )
-                mori_shmem.int32_wait_until_equals(recv_num_remote_addr, 0)
+                wait_i32_until_equals(recv_num_remote_addr, fx.Int32(0))
                 store_i32_system(recv_num_remote_addr, 0, signal_value)
 
         # Phase 3: wait each peer's count signal, accumulate total_recv.
         for src_pe in range(lane, npes, 64):
             if global_warp_id == 0:
                 recv_num_src_addr = addr_shmem_recv_num + fx.Int64(src_pe) * 4
-                signal_value = mori_shmem.int32_wait_until_greater_than(
-                    recv_num_src_addr, 0
+                signal_value = wait_i32_until_greater_than(
+                    recv_num_src_addr, fx.Int32(0)
                 )
                 peer_recv_count = signal_value - 1  # undo +1 sentinel offset
                 store_i32_system(recv_num_src_addr, 0, 0)
@@ -326,7 +328,7 @@ def make_dispatch_kernel(
                 _target = (
                     _ticket // _bn_i64 + _one_i64
                 ) * _bn_i64  # (epoch+1)*block_num
-                mori_shmem.int64_wait_until_equals(addr_disp_grid_bar, _target)
+                wait_i64_until_equals(addr_disp_grid_bar, fx.Int64(_target))
                 # Acquire fence pairs with the release atomic_add tickets; makes
                 # total_recv / shmem_tok_id_to_src / shmem_idx visible.
                 fence_system_acquire()
@@ -900,7 +902,7 @@ def make_combine_kernel(
             atomic_add_global_at(addr_comb_bar, 1)
 
         if grid_thread_id < npes:
-            mori_shmem.int32_wait_until_equals(addr_comb_bar, block_num)
+            wait_i32_until_equals(addr_comb_bar, fx.Int32(block_num))
             # Acquire fence pairs with the per-block release atomic_add on
             # ``addr_comb_bar``; makes Stage 1 P2P writes visible.
             fence_system_acquire()
@@ -916,7 +918,7 @@ def make_combine_kernel(
 
         if tid < npes:
             xdb_peer_slot = addr_shmem_xdb_mem + fx.Int64(tid) * 8
-            mori_shmem.uint64_wait_until_equals(xdb_peer_slot, xdb_cur_flag)
+            wait_i64_until_equals(xdb_peer_slot, fx.Int64(xdb_cur_flag))
             # wait_until_equals' relaxed-system load does not invalidate L2, so a
             # paired acquire fence is required before Stage 3 reads peer shmem_comb_inp.
             fence_system_acquire()

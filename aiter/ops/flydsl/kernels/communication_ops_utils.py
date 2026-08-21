@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 
+import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as _llvm_d
@@ -26,22 +27,68 @@ __all__ = [
     "atomic_add_agent",
     "atomic_add_global_at",
     "atomic_add_system",
+    "atomic_add_workgroup",
     "fence_acquire",
     "fence_agent_acquire",
     "fence_agent_release",
     "fence_release",
     "fence_system_acquire",
     "fence_system_release",
+    "load_i32_system",
     "load_i64_global",
     "store_i32_system",
     "store_i64_global_system",
+    "wait_i32_until_equals",
+    "wait_i32_until_greater_than",
+    "wait_i64_until_equals",
 ]
+
+
+def _global_ptr(addr, elem_ty):
+    ptr_ty = fx.PointerType.get(
+        elem_ty.ir_type, fx.AddressSpace.Global, alignment=elem_ty.width // 8
+    )
+    return fx.inttoptr(ptr_ty, fx.Int64(addr))
+
+
+@flyc.jit
+def load_i32_system(addr: fx.Int64, index: fx.Int32):
+    """System-scope relaxed i32 load at ``addr + index * 4``."""
+    item_addr = addr + fx.Int64(index) * fx.Int64(4)
+    return fx.rocdl.atomic_load_relaxed_system(_global_ptr(item_addr, fx.Int32))
+
+
+@flyc.jit
+def wait_i32_until_equals(addr: fx.Int64, expected: fx.Int32):
+    while fx.rocdl.atomic_load_relaxed_system(_global_ptr(addr, fx.Int32)) != expected:
+        pass
+
+
+@flyc.jit
+def wait_i32_until_greater_than(addr: fx.Int64, expected: fx.Int32):
+    observed = fx.rocdl.atomic_load_relaxed_system(_global_ptr(addr, fx.Int32))
+    while observed <= expected:
+        observed = fx.rocdl.atomic_load_relaxed_system(_global_ptr(addr, fx.Int32))
+    return observed
+
+
+@flyc.jit
+def wait_i64_until_equals(addr: fx.Int64, expected: fx.Int64):
+    while fx.rocdl.atomic_load_relaxed_system(_global_ptr(addr, fx.Int64)) != expected:
+        pass
 
 
 def _to_ptr_global(v):
     """Cast an i64 address to ``!llvm.ptr<1>`` (global address space)."""
     return _llvm_d.IntToPtrOp(
         _llvm_d.PointerType.get(address_space=1), arith.unwrap(v)
+    ).result
+
+
+def _to_ptr_shared(v):
+    """Cast an i64 address to ``!llvm.ptr<3>`` (shared address space)."""
+    return _llvm_d.IntToPtrOp(
+        _llvm_d.PointerType.get(address_space=3), arith.unwrap(v)
     ).result
 
 
@@ -138,6 +185,17 @@ def atomic_add_agent(addr_i64, val):
 def atomic_add_system(addr_i64, val):
     """System-scope monotonic global fetch-and-add."""
     return atomic_add_global_at(addr_i64, val)
+
+
+def atomic_add_workgroup(addr_i64, val):
+    """Workgroup-scope monotonic shared-memory fetch-and-add."""
+    return _llvm_d.AtomicRMWOp(
+        _llvm_d.AtomicBinOp.add,
+        _to_ptr_shared(addr_i64),
+        arith.unwrap(val),
+        _llvm_d.AtomicOrdering.monotonic,
+        syncscope="workgroup",
+    ).res
 
 
 @dataclass
