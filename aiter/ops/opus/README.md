@@ -86,13 +86,13 @@ pairs are discarded together before the caller continues to its normal skinny
 or PyTorch fallback. Legacy gfx942 requested-to-actual resolution also happens
 in the caller, so only the final integer id reaches `opus_gemm` or `opus_bmm`.
 
-The high-level BF16 BMM caller follows the same boundary in
-`aiter/ops/batched_gemm_op_bf16.py`. `batched_gemm_bf16_OPUS` resolves a tuned
-OPUS row or the A16 heuristic before calling exact-kid `opus_bmm`.
-`batched_gemm_bf16_tuned` reads the mixed BF16 BMM CSV and dispatches the
-measured `libtype=ck|opus` winner; legacy rows without `libtype` remain CK.
-The corresponding tuner uses `--libtype ck`, `opus`, or `all` and stores the
-batch dimension in the tuned key.
+There is currently no high-level A16W16 BF16 BMM wrapper. In particular,
+`aiter/ops/batched_gemm_op_bf16.py` contains the existing CK entry points but
+does not define `batched_gemm_bf16_OPUS` or a tuned CK/OPUS dispatcher. A16W16
+BMM therefore starts at exact-kid `opus_bmm`: its caller owns `Y`, resolves the
+final `kid`/`split_k`, and may provide a Torch workspace. The public router
+calls `_launch_a16w16_bmm`, which preserves the batch dimension and forwards
+to the same `_execute_a16w16` planner/executor used by A16W16 GEMM.
 
 ## Current families
 
@@ -131,7 +131,8 @@ opus_bmm(XQ_b, WQ_b, Y_b, kid=200, split_k=2)
 `opus_gemm` requires 2D tensors; `opus_bmm` requires batch-first 3D tensors.
 Inputs are K-contiguous and `Y` is N-contiguous. Current gfx1250 kernels still
 require BMM batch one. Exact instances can impose additional tile, output
-dtype, bias, or K-loop constraints.
+dtype, bias, or K-loop constraints. The BMM example is a direct exact-API call;
+there is no current `batched_gemm_bf16_OPUS` high-level wrapper.
 
 ### gfx950 A8W8 without scales
 
@@ -174,7 +175,9 @@ Y = aiter.gemm_a8w8_blockscale(
 
 The group contract is 1x128x128. GEMM scales are contiguous FP32
 `[M,K/128]` and `[N/128,K/128]` tensors. This family does not accept
-`opus_bmm`.
+`opus_bmm`. The high-level OPUS branch is strictly plain-W plus
+`dtype=torch.float32`. BF16 and FP16 calls retain the existing
+CK/CKTile/ASM/Triton dispatch and are not gfx950 OPUS validation cases.
 
 ### gfx950 MXFP8 BMM
 
@@ -223,7 +226,12 @@ opus_gemm(
 
 `layout="bpreshuffle"` is a declaration of WQ content, not something Tensor
 shape or strides can prove. Kid 11000 requires batch one, exact 128-wide N/K
-tiles, BF16 output, and its registered scale storage contracts.
+tiles, BF16 output, and its registered scale storage contracts. The high-level
+`gemm_a8w8_blockscale_bpreshuffle` dispatcher enters this OPUS route only when
+the tuned row has `libtype=opus`; CK, CKTile, ASM and Triton rows remain on
+their respective backends. gfx950 currently registers zero OPUS kids for this
+family, so a gfx950 OPUS validation must report it unavailable rather than run
+a non-OPUS fallback as coverage.
 
 ## A16 Torch workspace
 
@@ -235,13 +243,21 @@ validate exact kid and split_k
   -> reuse caller workspace or torch.empty for this call
   -> _launch_a16w16_backend
        -> first call: existing pybind wrapper owns normal lazy JIT build
-       -> later calls: reuse that module's C ABI on the live stream
+       -> eager / manual graph capture: call the cached C ABI directly
+       -> torch.compile / Meta / FakeTensor: registered torch.ops boundary
+            -> the same cached C ABI on the live stream
 ```
 
 There is no process-global Tensor, pointer registry, HIP allocator, or prewarm
 API. The bounded public-contract and A16 launch-plan caches store only registry
 metadata, integers, dtypes, option-presence flags and shapes; they never retain
 Tensor objects, data pointers, devices, streams or workspaces.
+
+The registered operator remains the Dynamo/FakeTensor boundary, but ordinary
+eager execution does not pay its dispatcher cost. The eager path refreshes
+thread-local descriptors, reads the raw current stream and invokes the same C
+ABI body directly. This changes host dispatch only; kernel selection, launch
+arguments, C++ validation and Torch workspace ownership are identical.
 
 Let `padded_M=ceil_div(M,B_M)*B_M` and
 `padded_N=ceil_div(N,B_N)*B_N`:
@@ -368,6 +384,6 @@ skip on another architecture is not a pass for that target.
 | `gemm_op_a16w16.py` | A16 GEMM/BMM adapters, one executor with call-scoped Torch workspace materialization, and the unified `_launch_a16w16_backend` entry over pybind priming/C ABI |
 | `gemm_op_a8w8.py` | three non-MX A8 GEMM adapters, MXFP8 BMM workspace materialization, and the unified `_launch_a8w8_backend` over four pybind raw bindings |
 | `../gemm_op_a8w8.py` | high-level no-scale/plain-blockscale OPUS entry points plus the existing CK/CKTile/ASM/Triton A8 dispatchers |
-| `../batched_gemm_op_bf16.py` | high-level explicit OPUS A16W16 BMM and tuned CK/OPUS BF16 BMM dispatch |
+| `../batched_gemm_op_bf16.py` | existing high-level CK BF16 BMM path; it is not an OPUS A16W16 BMM wrapper |
 | `../batched_gemm_op_a8w8.py` | MXFP8 high-level caller, scalar launch cache, output allocation and split-one/workspace execution choice |
 | `../../../csrc/opus_gemm/` | canonical registry, C++ family launchers, codegen, traits and pipelines |
