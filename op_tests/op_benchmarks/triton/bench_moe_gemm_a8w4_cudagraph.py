@@ -44,13 +44,13 @@ Everything except the GEMMs -- gating, routing, and the activation quantization
 that feeds each layer -- is built once outside the timed region, so the numbers
 cover the two projections and nothing else.
 
-Unlike moe_gemm_a4w4 there is no backend switch: moe_gemm_a8w4 runs the gluon
-kernels on gfx1250 and the triton kernel everywhere else. On gfx1250 the
-variant follows routing's block_m *and* the projection's K -- persistent decode
-for block_m == 16 with K <= 768, plain decode for the rest of block_m == 16,
-prefill otherwise -- so the two projections can land on different kernels and
-the `kernel` column is per layer. --preshuffle enables the gluon-only gfx1250
-WMMA weight preshuffle.
+moe_gemm_a8w4 defaults to the gluon kernels on gfx1250 and the triton kernel
+everywhere else; --backend pins one instead (gluon needs gfx1250). Under gluon
+the variant follows routing's block_m *and* the projection's K -- persistent
+decode for block_m == 16 with K <= 768, plain decode for the rest of
+block_m == 16, prefill otherwise -- so the two projections can land on different
+kernels and the `kernel` column is per layer. --preshuffle enables the
+gluon-only gfx1250 WMMA weight preshuffle.
 """
 
 import argparse
@@ -254,14 +254,20 @@ def pin_routed_experts(logits, n_routed, n_expts_act):
     return masked, n_pinned
 
 
-def kernel_variant(block_m, K):
+def backend_name(backend=None):
+    """Backend moe_gemm_a8w4 runs, resolving None the way the op does."""
+    if backend is not None:
+        return backend
+    return "gluon" if get_arch() == "gfx1250" else "triton"
+
+
+def kernel_variant(block_m, K, backend=None):
     """Compiled kernel moe_gemm_a8w4 dispatches to for a K-deep projection.
 
-    There is no backend argument: the op takes the gluon path iff the arch is
-    gfx1250. Within gluon, get_kernel_config_gluon() turns on the persistent
-    decode variant for shallow K, so moe1 and moe2 can differ.
+    Within gluon, get_kernel_config_gluon() turns on the persistent decode
+    variant for shallow K, so moe1 and moe2 can differ.
     """
-    if get_arch() != "gfx1250":
+    if backend_name(backend) != "gluon":
         return "_moe_gemm_a8w4"
     if block_m != 16:
         return "_moe_gemm_a8w4_prefill"
@@ -278,6 +284,7 @@ def bench_mlp_single_weight_init(
     w_dtype,
     TP,
     preshuffle,
+    backend,
     routed_experts,
     rep,
     layers=LAYERS,
@@ -292,6 +299,9 @@ def bench_mlp_single_weight_init(
         assert (
             get_arch() == "gfx1250"
         ), f"--preshuffle needs the gfx1250 gluon kernel, got {get_arch()}"
+        assert (
+            backend_name(backend) == "gluon"
+        ), "--preshuffle needs the gluon kernel, which --backend triton excludes"
     if routed_experts is not None:
         # every token needs n_expts_act distinct experts, so the pool can't be smaller
         assert n_expts_act <= routed_experts <= n_expts_tot, (
@@ -361,6 +371,7 @@ def bench_mlp_single_weight_init(
             out_dtype=out_dtype,
             apply_swiglu=True,
             preshuffled=preshuffle,
+            backend=backend,
         )
 
     if static_fp8:
@@ -404,6 +415,7 @@ def bench_mlp_single_weight_init(
             scatter_indx=scatter_indx,
             swizzle_mx_scale=swizzle_mx_scale2,
             preshuffled=preshuffle,
+            backend=backend,
         )
 
     y2 = layer2()
@@ -442,8 +454,8 @@ def bench_mlp_single_weight_init(
 
     # the two projections have the same block_m but different K, so they can
     # land on different gluon variants
-    kernel1 = kernel_variant(rdata.block_m, dim1)
-    kernel2 = kernel_variant(rdata.block_m, dim2 // TP // 2)
+    kernel1 = kernel_variant(rdata.block_m, dim1, backend)
+    kernel2 = kernel_variant(rdata.block_m, dim2 // TP // 2, backend)
     kernels = {
         "moe1": kernel1,
         "moe2": kernel2,
@@ -487,6 +499,7 @@ def bench_mlp(
     w_dtype,
     TP,
     preshuffle,
+    backend,
     routed_experts,
     rep,
     layers=LAYERS,
@@ -504,6 +517,7 @@ def bench_mlp(
             w_dtype,
             TP,
             preshuffle,
+            backend,
             routed_experts,
             rep,
             layers,
@@ -542,6 +556,7 @@ def roofline_mlp(
     w_dtype,
     TP,
     preshuffle,
+    backend,
     routed_experts,
     rep,
     layers=LAYERS,
@@ -560,6 +575,7 @@ def roofline_mlp(
     )
     if routed_experts is not None:
         stem += f"-routed={routed_experts}"
+    stem += f"-{backend_name(backend)}"
     if preshuffle:
         stem += "-preshuffled"
     if tuple(layers) != LAYERS:
@@ -576,6 +592,7 @@ def roofline_mlp(
         w_dtype,
         TP,
         preshuffle,
+        backend,
         routed_experts,
         rep,  # fixed args
         layers,
@@ -630,6 +647,13 @@ def parse_args(args: list[str] | None = None):
         "layer 1 emitting layer 2's input directly) or mx8 (mxfp8, one ue8m0 "
         "scale per 32 values along K). Weights are mxfp4 either way. "
         "Default: fp8.",
+    )
+    parser.add_argument(
+        "--backend",
+        choices=["triton", "gluon"],
+        default=None,
+        help="Kernel backend for moe_gemm_a8w4. Default: unset, i.e. the arch "
+        "default (gluon on gfx1250, triton elsewhere). gluon requires gfx1250.",
     )
     parser.add_argument(
         "--preshuffle",
@@ -705,6 +729,7 @@ def main(args: list[str] | None = None) -> None:
         quantized_dtypes[1],
         TP=1,
         preshuffle=parsed_args.preshuffle,
+        backend=parsed_args.backend,
         routed_experts=parsed_args.routed_experts,
         rep=parsed_args.rep,
         # dedupe, keeping the canonical report order rather than argv order

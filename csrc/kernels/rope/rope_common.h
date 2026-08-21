@@ -13,7 +13,7 @@
 #include <type_traits>
 
 #ifdef __HIP_DEVICE_COMPILE__
-#include "opus/opus.hpp"
+#include "aiter_opus_plus.h"
 #endif
 
 // =====================================================================================================================
@@ -7325,6 +7325,9 @@ __inline__ __device__ T warp_shfl_sync(T val, int src_id)
 
 } // namespace block_utils
 
+struct fp8e4m3fn;
+struct fp8e4m3fnuz;
+
 template <typename T, int vec_size>
 struct alignas(sizeof(T) * vec_size) vec_t
 {
@@ -7392,17 +7395,39 @@ struct alignas(sizeof(T) * vec_size) vec_t
     template <typename IT>
     __device__ __forceinline__ void from_(const vec_t<IT, vec_size>& src, float scale)
     {
-#pragma unroll
-        for(int i = 0; i < vec_size; ++i)
+        if constexpr(std::is_same_v<T, IT>)
         {
-            if constexpr(std::is_same_v<T, IT>)
-            {
+#pragma unroll
+            for(int i = 0; i < vec_size; ++i)
                 data[i] = src[i];
-            }
-            else
+        }
+#if defined(__HIP_DEVICE_COMPILE__) && (defined(__gfx942__) || defined(__gfx950__))
+        else if constexpr((std::is_same_v<T, fp8e4m3fnuz> || std::is_same_v<T, fp8e4m3fn>) &&
+                          (vec_size % 2 == 0))
+        {
+            const float inverted_scale = 1.0f / scale;
+#pragma unroll
+            for(int i = 0; i < vec_size; i += 2)
             {
-                data[i] = static_cast<T>(static_cast<float>(src[i]) / scale);
+                const opus::fp32x2_t values{static_cast<float>(src[i]),
+                                            static_cast<float>(src[i + 1])};
+                const auto converted =
+                    aiter::scaled_cast<opus::fp8_t>(values, inverted_scale);
+                const uint16_t packed = __builtin_bit_cast(uint16_t, converted);
+                data[i] = T(static_cast<uint8_t>(packed), T::from_bits());
+                data[i + 1] =
+                    T(static_cast<uint8_t>(packed >> 8), T::from_bits());
             }
+        }
+#endif
+        else
+        {
+            // Reciprocal once rather than a divide per element: scale is uniform
+            // across the vector, and v_rcp_f32 + multiply beats N full divides.
+            const float rcp_scale = 1.0f / scale;
+#pragma unroll
+            for(int i = 0; i < vec_size; ++i)
+                data[i] = static_cast<T>(static_cast<float>(src[i]) * rcp_scale);
         }
     }
 };
@@ -7709,6 +7734,20 @@ struct alignas(1) fp8e4m3fnuz
     }
 };
 
+// Power-of-2 integer division/modulo via shift/mask. block_size and x are kernel
+// parameters, hence warp-uniform, so __builtin_ctz lowers to a single s_ff1_i32_b32
+// and the per-lane operation becomes a shift instead of the ~30-cycle integer
+// division emulation. The power-of-2 precondition is enforced host-side in
+// fused_mrope_rms_set_kv / fused_mrope_rms_set_kv_pts.
+__device__ __forceinline__ int po2_div(int64_t val, int po2)
+{
+    return static_cast<int>(val >> __builtin_ctz(po2));
+}
+__device__ __forceinline__ int po2_mod(int64_t val, int po2)
+{
+    return static_cast<int>(val & (po2 - 1));
+}
+
 template <int HEAD_SIZE>
 __device__ __forceinline__ int64_t get_shuffle_layout_k_base(const int64_t slot_id,
                                                              const int block_size,
@@ -7719,18 +7758,18 @@ __device__ __forceinline__ int64_t get_shuffle_layout_k_base(const int64_t slot_
                                                              const int64_t k_block_stride)
 {
     // Shuffle layout: [num_blocks, num_kv_heads, head_size // x, block_size, x]
-    const int block_id      = static_cast<int>(slot_id / block_size);
-    const int block_offset  = static_cast<int>(slot_id % block_size);
+    const int block_id      = po2_div(slot_id, block_size);
+    const int block_offset  = po2_mod(slot_id, block_size);
     const int k_head_stride = HEAD_SIZE * block_size;
     const int64_t k_per_block =
         (k_block_stride != 0) ? k_block_stride : static_cast<int64_t>(num_heads_k) * k_head_stride;
     const int64_t dst_base = static_cast<int64_t>(block_id) * k_per_block + head_id_k * k_head_stride;
     // Pre-compute K base offset: since VEC_SIZE <= x, all elements are in the same
     // chunk
-    const int chunk_id     = access_id_in_head / x;
+    const int chunk_id     = po2_div(access_id_in_head, x);
     const int block_size_x = block_size * x;
     const int64_t k_base =
-        dst_base + chunk_id * block_size_x + block_offset * x + (access_id_in_head % x);
+        dst_base + chunk_id * block_size_x + block_offset * x + po2_mod(access_id_in_head, x);
     return k_base;
 }
 
@@ -7744,15 +7783,15 @@ __device__ __forceinline__ int64_t get_shuffle_layout_v_base(const int64_t slot_
                                                              const int64_t v_block_stride)
 {
     // Shuffle layout: [num_blocks, num_kv_heads, block_size // x, head_size, x]
-    const int block_id      = static_cast<int>(slot_id / block_size);
-    const int block_offset  = static_cast<int>(slot_id % block_size);
-    const int v_head_stride = (block_size / x) * HEAD_SIZE * x;
+    const int block_id      = po2_div(slot_id, block_size);
+    const int block_offset  = po2_mod(slot_id, block_size);
+    const int v_head_stride = po2_div(block_size, x) * HEAD_SIZE * x;
     const int64_t v_per_block =
         (v_block_stride != 0) ? v_block_stride : static_cast<int64_t>(num_heads_v) * v_head_stride;
     const int64_t dst_base = static_cast<int64_t>(block_id) * v_per_block + head_id_v * v_head_stride;
     // Pre-compute V base offset (fixed for this token)
-    const int v_slot_chunk    = block_offset / x;
-    const int v_slot_in_chunk = block_offset % x;
+    const int v_slot_chunk    = po2_div(block_offset, x);
+    const int v_slot_in_chunk = po2_mod(block_offset, x);
     const int64_t v_base      = dst_base + v_slot_chunk * HEAD_SIZE * x + v_slot_in_chunk;
     return v_base;
 }
@@ -8029,8 +8068,8 @@ __global__ void fused_mrope_rms_kv_kernel(const T* qkv,
                 }
                 else
                 {
-                    const int block_id         = static_cast<int>(slot_id / block_size);
-                    const int block_offset     = static_cast<int>(slot_id % block_size);
+                    const int block_id         = po2_div(slot_id, block_size);
+                    const int block_offset     = po2_mod(slot_id, block_size);
                     const int64_t block_stride = (k_block_stride != 0)
                                                      ? k_block_stride
                                                      : static_cast<int64_t>(block_size) * slot_size;
@@ -8084,8 +8123,8 @@ __global__ void fused_mrope_rms_kv_kernel(const T* qkv,
             }
             else
             {
-                const int block_id         = static_cast<int>(slot_id / block_size);
-                const int block_offset     = static_cast<int>(slot_id % block_size);
+                const int block_id         = po2_div(slot_id, block_size);
+                const int block_offset     = po2_mod(slot_id, block_size);
                 const int64_t block_stride = (v_block_stride != 0)
                                                  ? v_block_stride
                                                  : static_cast<int64_t>(block_size) * slot_size;
@@ -8136,9 +8175,22 @@ void fused_mrope_rms_set_kv(const T* qkv,
                             int64_t block_size       = 0,
                             int64_t x                = 0,
                             int64_t rotary_dim       = 0,
-                            bool gemma_norm          = false)
+                            int64_t k_block_stride   = 0,
+                            int64_t v_block_stride   = 0,
+                            bool gemma_norm          = false,
+                            int64_t k_token_stride   = 0,
+                            int64_t k_head_stride    = 0,
+                            int64_t v_token_stride   = 0,
+                            int64_t v_head_stride    = 0)
 {
     AITER_CHECK(head_size == 64 || head_size == 128 || head_size == 256);
+    // po2_div/po2_mod in the paged and shuffle-layout address math assume these are
+    // powers of two. Every vLLM block_size and every x = 16 / sizeof(elem) satisfies
+    // it, but check rather than corrupt the cache silently if that ever changes.
+    AITER_CHECK(block_size == 0 || (block_size & (block_size - 1)) == 0,
+                "block_size must be a power of 2, got ", block_size);
+    AITER_CHECK(!use_shuffle_layout || (x > 0 && (x & (x - 1)) == 0),
+                "x must be a power of 2 when use_shuffle_layout is set, got ", x);
     auto dim           = std::accumulate(mrope_section.begin(), mrope_section.end(), 0);
     auto expected_half = rotary_dim > 0 ? rotary_dim / 2 : head_size / 2;
     AITER_CHECK(dim == expected_half,
@@ -8183,9 +8235,13 @@ void fused_mrope_rms_set_kv(const T* qkv,
                                                         block_size,                  \
                                                         x,                           \
                                                         (int)rotary_dim,             \
-                                                        (int64_t)0,                  \
-                                                        (int64_t)0,                  \
-                                                        gemma_norm);                 \
+                                                        k_block_stride,              \
+                                                        v_block_stride,              \
+                                                        gemma_norm,                  \
+                                                        k_token_stride,              \
+                                                        k_head_stride,               \
+                                                        v_token_stride,              \
+                                                        v_head_stride);              \
     }                                                                                \
     else                                                                             \
     {                                                                                \
@@ -8216,9 +8272,13 @@ void fused_mrope_rms_set_kv(const T* qkv,
                                                         block_size,                  \
                                                         x,                           \
                                                         (int)rotary_dim,             \
-                                                        (int64_t)0,                  \
-                                                        (int64_t)0,                  \
-                                                        gemma_norm);                 \
+                                                        k_block_stride,              \
+                                                        v_block_stride,              \
+                                                        gemma_norm,                  \
+                                                        k_token_stride,              \
+                                                        k_head_stride,               \
+                                                        v_token_stride,              \
+                                                        v_head_stride);              \
     }
 
     if(is_interleaved)
@@ -8279,6 +8339,13 @@ void fused_rope_rms_set_kv(const T* qkv,
                            int64_t v_head_stride    = 0)
 {
     AITER_CHECK(head_size == 64 || head_size == 128 || head_size == 256);
+    // po2_div/po2_mod in the paged and shuffle-layout address math assume these are
+    // powers of two. Every vLLM block_size and every x = 16 / sizeof(elem) satisfies
+    // it, but check rather than corrupt the cache silently if that ever changes.
+    AITER_CHECK(block_size == 0 || (block_size & (block_size - 1)) == 0,
+                "block_size must be a power of 2, got ", block_size);
+    AITER_CHECK(!use_shuffle_layout || (x > 0 && (x & (x - 1)) == 0),
+                "x must be a power of 2 when use_shuffle_layout is set, got ", x);
     constexpr int THREAD_BLOCK_SIZE = 256;
     auto total_warps                = num_tokens * (num_heads_q + num_heads_k + num_heads_v);
     auto num_warps_per_block        = THREAD_BLOCK_SIZE / WARP_SIZE;
