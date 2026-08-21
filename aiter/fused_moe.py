@@ -2109,6 +2109,10 @@ def get_2stage_cfgs(
         "use_g1u1",
         "doweight_stage1",
     ]
+    if config_file is not None:
+        _INDEX_COLS.extend(
+            ["shared_expert_id", "hidden_pad", "intermediate_pad", "gate_mode"]
+        )
 
     def _ensure_gfx_column(df):
         """Guarantee a usable `gfx` column, migrating legacy cu_num-only CSVs."""
@@ -2136,12 +2140,17 @@ def get_2stage_cfgs(
         df_primary = df.copy()
         dup_mask = df_primary.duplicated(subset=_INDEX_COLS, keep="first")
         if dup_mask.any():
+            if config_file is not None:
+                raise ValueError(f"Duplicate dedicated FHMoE rows in {tune_file}")
             logger.warning(
                 f"[fused_moe] duplicate tuned rows (primary) in {tune_file}; "
                 f"keeping first match for {int(dup_mask.sum())} rows"
             )
             df_primary = df_primary.loc[~dup_mask]
         primary = df_primary.set_index(_INDEX_COLS).to_dict("index")
+
+        if config_file is not None:
+            return primary, {}
 
         # Fallback dict: disable act_type so any activation can match.
         df_fallback = df.copy()
@@ -2210,6 +2219,10 @@ def get_2stage_cfgs(
         use_g1u1,
         doweight_stage1,
     )
+    if config_file is not None:
+        fhmoe_keys = (expert - 1, hidden_pad, intermediate_pad, str(gate_mode))
+        keys += fhmoe_keys
+        keys_disabled += fhmoe_keys
 
     def MainFunc():
         with open(untune_file, "a") as f:
@@ -2236,11 +2249,14 @@ def get_2stage_cfgs(
         if not c2s:
             return None
         primary, fallback = c2s
-        result = primary.get(keys, None)
-        if result is None:
+        lookup_keys = keys
+        if config_file is not None:
+            lookup_keys = keys[:7] + (str(activation),) + keys[8:]
+        result = primary.get(lookup_keys, None)
+        if result is None and config_file is None:
             result = fallback.get(keys_disabled, None)
         # Tier fallback: if current tier not found, try smaller tiers in descending order
-        if result is None and token > _PADDED_M_TIERS[0]:
+        if result is None and config_file is None and token > _PADDED_M_TIERS[0]:
             tier_idx = _PADDED_M_TIERS.index(token) if token in _PADDED_M_TIERS else -1
             for fallback_tier in reversed(_PADDED_M_TIERS[:tier_idx]):
                 # keys layout: (gfx, cu_num, token, ...); replace token (idx 2).
@@ -2309,8 +2325,15 @@ def get_2stage_cfgs(
                     f"[fused_moe] Opus stage2 config unsupported ({opus_reason}); "
                     "using default heuristics"
                 )
+    bypass_tuned_config = int(os.environ.get("AITER_BYPASS_TUNE_CONFIG", "0"))
+    if config_file is not None and (cfg is None or bypass_tuned_config):
+        raise NotImplementedError(
+            "The dedicated FHMoE path requires an exact tuned config row for "
+            f"{keys} in {tune_file}"
+        )
+
     use_non_temporal_load = False
-    if cfg is None or int(os.environ.get("AITER_BYPASS_TUNE_CONFIG", "0")):
+    if cfg is None or bypass_tuned_config:
         ksplit = 0
         kernelName1 = ""
         kernelName2 = ""
