@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -433,7 +435,7 @@ def test_triton_unified_attn_3d(
         LDS_limit = 327680 if IS_DEVICE_ARCH_GFX12 else 262144
         if kv_cache_shared_mem_size > LDS_limit:
             pytest.skip(
-                f"Skipping test for KV cache LDS required memory = {kv_cache_shared_mem_size/1024} kB > 320 kB"
+                f"Skipping test for KV cache LDS required memory = {kv_cache_shared_mem_size / 1024} kB > 320 kB"
             )
 
     # TODO: Uncomment after pytorch adds support for manual_seed
@@ -597,7 +599,15 @@ def test_triton_unified_attn(
     use_out_scale: bool,
     shuffled_kv_cache: bool,
 ) -> None:
-    use_gluon_2d = is_2d_gluon_available(q_dtype, kv_dtype, soft_cap, False, False)
+    use_gluon_2d = is_2d_gluon_available(
+        SimpleNamespace(
+            q_dtype=q_dtype,
+            kv_cache_dtype=kv_dtype,
+            softcap=soft_cap,
+            use_qq_bias=False,
+            use_alibi_slopes=False,
+        )
+    )
     torch.manual_seed(0)
     # shuffling only supported for gfx1250 gluon kernels
     if shuffled_kv_cache and not use_gluon_2d:
@@ -699,6 +709,7 @@ def test_triton_unified_attn(
             f"(max abs diff {torch.max(torch.abs(output - ref_output))})"
         )
     else:
-        torch.testing.assert_close(
-            output, ref_output, atol=atol, rtol=rtol
-        ), f"{torch.max(torch.abs(output - ref_output))}"
+        (
+            torch.testing.assert_close(output, ref_output, atol=atol, rtol=rtol),
+            f"{torch.max(torch.abs(output - ref_output))}",
+        )
