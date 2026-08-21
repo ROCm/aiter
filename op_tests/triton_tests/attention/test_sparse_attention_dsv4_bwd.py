@@ -143,6 +143,17 @@ def test_sparse_mla_bwd_dsv4_rejects_bad_chunk():
         )
 
 
+def test_sparse_mla_bwd_dsv4_rejects_short_topk():
+    """topk_indices must have one row per query token.
+
+    The dQ grid is sized from `q`, so a shorter index tensor is read past its end rather than
+    producing a shape error anywhere downstream.
+    """
+    t = _dummy_inputs(T=64, topk=64)
+    with pytest.raises(AssertionError, match="topk_indices must be"):
+        sparse_mla_bwd_dsv4(t["q"], t["kv"], t["do"], t["o"], t["lse"], t["idx"][:32])
+
+
 def test_sparse_mla_bwd_dsv4_rejects_indivisible_chunk():
     """A chunk width that is a valid tile multiple but does not divide TOPK is still rejected.
 

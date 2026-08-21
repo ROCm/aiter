@@ -103,6 +103,10 @@ def sparse_mla_bwd_dsv4(
             raise RuntimeError(f"{name} dtype mismatch: {name}={t.dtype}, q={q.dtype}")
 
     T, H, D = q.shape
+    assert topk_indices.ndim == 2 and topk_indices.shape[0] == T, (
+        f"topk_indices must be [T, TOPK] with T={T}, got {tuple(topk_indices.shape)} -- the dQ "
+        "grid is sized from q, so a shorter index tensor is read past its end"
+    )
     TOPK = topk_indices.shape[1]
     num_kv = kv.shape[0]
     assert D == 512, f"DSv4 sparse-MLA backward is fixed to head_dim 512, got {D}"
