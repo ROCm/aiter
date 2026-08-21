@@ -67,7 +67,10 @@ _SUPPORTED_DTYPES = (torch.bfloat16, torch.float16)
 _VLLM_WIDTHS = range(2, 7)
 _SGLANG_WIDTHS = range(2, 5)
 
-_SUPPORTED_ARCH_PREFIX = "gfx9"
+#: Targets the kernels are built for and the test suite runs on. An exact list
+#: rather than a ``gfx9`` prefix: the older gfx9 parts are never exercised, so
+#: admitting them would dispatch where nothing has been validated.
+_SUPPORTED_ARCHS = ("gfx942", "gfx950")
 
 #: Narrowest channel tile: below one wavefront a workgroup wastes lanes.
 _WAVEFRONT = 64
@@ -203,7 +206,7 @@ def _is_supported_arch(device: torch.device) -> bool:
         arch = str(torch.cuda.get_device_properties(device).gcnArchName)
     except Exception:  # noqa: BLE001 - no live device, meta/CPU tensor
         return False
-    return arch.split(":")[0].startswith(_SUPPORTED_ARCH_PREFIX)
+    return arch.split(":")[0] in _SUPPORTED_ARCHS
 
 
 def _shapes_supported(

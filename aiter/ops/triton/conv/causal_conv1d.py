@@ -36,6 +36,18 @@ def _flydsl_conv1d_update_enabled() -> bool:
     )
 
 
+def _assert_implemented_width(width: int, fn: str) -> None:
+    """Refuse the widths neither kernel in this file implements.
+
+    Both tap loops branch on 2/3/4 only and preload at most four weight columns,
+    so a wider weight matches no branch and the convolution silently degenerates
+    to the first tap repeated ``width`` times. The HIP entry point rejects it
+    (``csrc/kernels/causal_conv1d_update.cu``); do the same here rather than
+    return a wrong answer.
+    """
+    assert 2 <= width <= 4, f"{fn}: width must be 2, 3 or 4, got {width}"
+
+
 def causal_conv1d_fn(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -102,6 +114,7 @@ def causal_conv1d_fn(
     is_channel_last = (x.stride(0) == 1) & (x.stride(1) > 1)
     dim, cu_seqlen = x.shape
     _, width = weight.shape
+    _assert_implemented_width(width, "causal_conv1d_fn")
     state_len = width - 1
     np2_statelen = triton.next_power_of_2(state_len)
 
@@ -260,13 +273,8 @@ def causal_conv1d_update(
     elif activation is not None:
         assert activation in ["silu", "swish"]
 
-    # Refuse the widths the kernel does not implement, the way the HIP entry point
-    # does. Its tap loop only branches on 2/3/4, so a wider weight used to return
-    # a silently wrong result rather than fail.
     _, width = weight.shape
-    assert (
-        2 <= width <= 4
-    ), f"causal_conv1d_update: width must be 2, 3 or 4, got {width}"
+    _assert_implemented_width(width, "causal_conv1d_update")
 
     # FlyDSL port (opt-in). This signature is SGLang's, so it maps onto the
     # SGLang-shaped wrapper and not the vLLM-shaped one, whose sentinel is a valid

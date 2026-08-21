@@ -76,10 +76,11 @@ see the block above ``_alloc_x`` for each layout. Both upstreams assert
 ``x.stride(1) == 1``, so the channel axis is always contiguous and only the token
 stride varies.
 
-The kernels are wider than what is covered here. These have no caller and are
-deliberately left out, so a regression in one would land silently: Automatic
-Prefix Caching (2D ``conv_state_indices`` with separate read and write blocks),
-fp16, widths other than 4, ``cache_seqlens`` and the ``out=`` parameter.
+The kernels are wider than what is covered here. Automatic Prefix Caching (2D
+``conv_state_indices`` with separate read and write blocks) has no caller yet and
+is deliberately left out, so a regression in it would land silently.
+``cache_seqlens`` is refused rather than implemented, on both the port and its
+upstreams.
 
 Vendored from vLLM ``63a9a5010`` and SGLang ``18107e38d2``. Bumping either means
 re-extracting the copy, not editing it, so that an answer changing shows up as a
@@ -135,12 +136,18 @@ elif not is_flydsl_available():
 else:
     try:
         from aiter.ops.flydsl.causal_conv1d_update_kernels import (
+            _SGLANG_WIDTHS,
+            _SUPPORTED_DTYPES,
+            _VLLM_WIDTHS,
             NULL_BLOCK_ID,
             _causal_conv1d_update_flydsl_supported,
             _causal_conv1d_update_sglang_flydsl_supported,
             _is_dedup_conv_window,
             causal_conv1d_update_flydsl,
             causal_conv1d_update_sglang_flydsl,
+        )
+        from aiter.ops.triton.conv.causal_conv1d import (
+            causal_conv1d_fn as causal_conv1d_fn_triton,
         )
         from aiter.ops.triton.conv.causal_conv1d import (
             causal_conv1d_update as causal_conv1d_update_triton,
@@ -164,10 +171,9 @@ DTYPE = torch.bfloat16
 #: Targets the kernels are built for; anything else skips.
 SUPPORTED_GFX = ("gfx942", "gfx950")
 
-#: One mantissa step of the storage dtype. Only bf16 is exercised; fp16 would
-#: need its own tighter step and its own cases.
-_DTYPE_EPS = {torch.bfloat16: 2.0**-8}
-_DTYPE_NAME = {torch.bfloat16: "bf16"}
+#: One mantissa step of the storage dtype: 2**-(mantissa bits + 1).
+_DTYPE_EPS = {torch.bfloat16: 2.0**-8, torch.float16: 2.0**-11}
+_DTYPE_NAME = {torch.bfloat16: "bf16", torch.float16: "fp16"}
 
 #: How many of those steps a result may accumulate, scaled per element by the
 #: conditioning (see the module docstring). Covers the taps, the bias, the silu
@@ -441,18 +447,11 @@ _VLLM_CASES = [
 ]
 
 
-@pytest.mark.parametrize("batch,dim,width,seqlen,spec", _VLLM_CASES)
-def test_vllm_matches_upstream_vllm(batch, dim, width, seqlen, spec):
-    """Drop-in for vLLM's own causal_conv1d_update, and at least as accurate.
-
-    Three things at once: the output stays inside its error budget, it is no
-    further from the spec than vLLM's kernel is, and the ``conv_state`` roll-back
-    matches vLLM's bit-exactly. The baseline is upstream rather than aiter's
-    Triton fork because it is vLLM's contract this entry point implements.
-    """
-    t = _make_inputs(batch, dim, width, seqlen, spec=spec, seed=batch * 100 + seqlen)
+def _check_vllm_case(batch, dim, width, seqlen, spec, *, seed, dtype=DTYPE):
+    """One vLLM-interface problem, checked all three ways against upstream."""
+    t = _make_inputs(batch, dim, width, seqlen, spec=spec, seed=seed, dtype=dtype)
     indices = torch.arange(1, batch + 1, dtype=torch.int32, device=DEVICE)
-    label = f"vllm b{batch} d{dim} w{width} s{seqlen} spec={spec}"
+    label = f"vllm b{batch} d{dim} w{width} {_DTYPE_NAME[dtype]} s{seqlen} spec={spec}"
 
     state_fly = t["conv_state"].clone()
     out_fly = causal_conv1d_update_flydsl(
@@ -479,6 +478,126 @@ def test_vllm_matches_upstream_vllm(batch, dim, width, seqlen, spec):
         label, out_fly, ref.out, ref.spec, ref.scale, "vLLM's own kernel"
     )
     _assert_bit_exact(label, "conv_state roll-back", state_fly, ref.state)
+
+
+@pytest.mark.parametrize("batch,dim,width,seqlen,spec", _VLLM_CASES)
+def test_vllm_matches_upstream_vllm(batch, dim, width, seqlen, spec):
+    """Drop-in for vLLM's own causal_conv1d_update, and at least as accurate.
+
+    Three things at once: the output stays inside its error budget, it is no
+    further from the spec than vLLM's kernel is, and the ``conv_state`` roll-back
+    matches vLLM's bit-exactly. The baseline is upstream rather than aiter's
+    Triton fork because it is vLLM's contract this entry point implements.
+    """
+    _check_vllm_case(batch, dim, width, seqlen, spec, seed=batch * 100 + seqlen)
+
+
+#: (width, dtype, seqlen, spec) outside the list above, which is width 4 / bf16
+#: throughout. Each is its own build rather than a variation on one: the tap loop
+#: is unrolled per width, the vectorized weight fetch exists only at W in (2, 4),
+#: and the element type selects the storage path. Decode and verify alternate so
+#: both the plain slide and the rollback appear across the sweep without
+#: squaring it.
+_VLLM_WIDTH_DTYPE_CASES = [
+    (2, torch.bfloat16, 1, False),
+    (2, torch.float16, 4, True),
+    (3, torch.bfloat16, 4, True),
+    (3, torch.float16, 1, False),
+    (4, torch.float16, 1, False),
+    (4, torch.float16, 4, True),
+    (5, torch.bfloat16, 1, False),
+    (5, torch.float16, 4, True),
+    (6, torch.bfloat16, 4, True),
+    (6, torch.float16, 1, False),
+]
+
+
+@pytest.mark.parametrize("width,dtype,seqlen,spec", _VLLM_WIDTH_DTYPE_CASES)
+def test_vllm_matches_upstream_across_widths_and_dtypes(width, dtype, seqlen, spec):
+    """The whole accepted width and dtype range, not just what call sites send.
+
+    ``_VLLM_WIDTHS`` reaches 6 because vLLM's own kernel does, and
+    ``_SUPPORTED_DTYPES`` admits fp16, so the predicate hands all of this to the
+    port. Anything it accepts is measured against upstream here; a width or dtype
+    that cannot hold up belongs outside the predicate, not inside it untested.
+    """
+    assert width in _VLLM_WIDTHS and dtype in _SUPPORTED_DTYPES
+    _check_vllm_case(4, 256, width, seqlen, spec, seed=width * 17 + seqlen, dtype=dtype)
+
+
+def test_vllm_addresses_a_conv_state_line_past_4gib():
+    """A cache line beyond the 32-bit byte offset must still read its own history.
+
+    The MUBUF offset operand is 32 bits wide, so a ``conv_state`` past 2**31 bf16
+    elements only addresses correctly because the cache-line term is folded into
+    the buffer descriptor's 64-bit base. Fold it back into the offset and the
+    access wraps to a different line, silently, which is what this pins: the live
+    lines sit above the wrap point here, and the same problem on a small buffer
+    says what they should produce.
+
+    Production cache sizes reach this; the suite's other cases are far too small
+    to, so without this one the addressing could be narrowed back with every test
+    still green.
+    """
+    dim, width, seqlen, batch = 128, 4, 1, 2
+    state_len = width - 1
+    line_bytes = dim * state_len * torch.finfo(DTYPE).bits // 8
+    # Enough lines that the last ones are addressed past the 32-bit wrap, plus a
+    # margin so it is the line itself and not a rounding of the boundary.
+    num_cache_lines = (1 << 32) // line_bytes + 4096
+    need = num_cache_lines * line_bytes
+
+    free, _ = torch.cuda.mem_get_info(DEVICE)
+    if free < need * 3 // 2:
+        pytest.skip(
+            f"needs ~{need / 2**30:.1f} GiB free to place a cache line past 4 GiB, "
+            f"{free / 2**30:.1f} GiB available"
+        )
+
+    gen = torch.Generator(device=DEVICE).manual_seed(4096)
+    x = torch.randn((batch, dim, seqlen), generator=gen, device=DEVICE, dtype=DTYPE)
+    weight = torch.randn((dim, width), generator=gen, device=DEVICE, dtype=DTYPE)
+    bias = torch.randn((dim,), generator=gen, device=DEVICE, dtype=DTYPE)
+    live = torch.randn(
+        (batch, dim, state_len), generator=gen, device=DEVICE, dtype=DTYPE
+    )
+
+    big = torch.zeros((num_cache_lines, dim, state_len), device=DEVICE, dtype=DTYPE)
+    indices = torch.arange(
+        num_cache_lines - batch, num_cache_lines, dtype=torch.int32, device=DEVICE
+    )
+    assert int(indices[0]) * line_bytes > (1 << 32), "the live lines are below the wrap"
+    big[indices[0] :] = live
+
+    out_fly = causal_conv1d_update_flydsl(
+        x.clone(),
+        big,
+        weight,
+        bias=bias,
+        activation="silu",
+        conv_state_indices=indices,
+    )
+    state_fly = big[indices[0] :].clone()
+    del big
+
+    # The same problem, addressed well inside 32 bits. The leading spare line
+    # keeps the indices off ``null_block_id``, which is 0 on this interface.
+    small = torch.cat([torch.zeros_like(live[:1]), live])
+    ref = _oracle_vllm(
+        x,
+        small,
+        weight,
+        bias,
+        torch.arange(1, batch + 1, dtype=torch.int32, device=DEVICE),
+        None,
+    )
+
+    label = f"vllm >4GiB line {int(indices[0])}"
+    _assert_tracks_spec(label, out_fly, ref.spec, ref.scale)
+    _assert_no_worse_than(
+        label, out_fly, ref.out, ref.spec, ref.scale, "vLLM's own kernel"
+    )
+    _assert_bit_exact(label, "conv_state roll-back", state_fly, ref.state[1:])
 
 
 @pytest.mark.parametrize("channels_per_thread", [1, 2])
@@ -579,8 +698,10 @@ _SGLANG_CASES = [
 ]
 
 
-def _sglang_problem(batch, dim, width, seqlen, spec, save_inter, tree):
-    t = _make_inputs(batch, dim, width, seqlen, spec=spec, seed=batch * 31 + seqlen)
+def _sglang_problem(batch, dim, width, seqlen, spec, save_inter, tree, dtype=DTYPE):
+    t = _make_inputs(
+        batch, dim, width, seqlen, spec=spec, seed=batch * 31 + seqlen, dtype=dtype
+    )
     t["indices"] = torch.arange(batch, dtype=torch.int32, device=DEVICE)
     t["window"] = None
     if save_inter:
@@ -589,7 +710,7 @@ def _sglang_problem(batch, dim, width, seqlen, spec, save_inter, tree):
             (t["conv_state"].shape[0], seqlen, dim, width - 1),
             generator=gen,
             device=DEVICE,
-            dtype=DTYPE,
+            dtype=dtype,
         )
     t["next_token"], t["next_sibling"] = (
         _eagle_tree_links(batch, seqlen) if tree else (None, None)
@@ -620,20 +741,12 @@ def _run_sglang(fn, t, batch, seqlen, tree, save_inter):
     return out, state, window, parents
 
 
-@pytest.mark.parametrize("batch,dim,width,seqlen,spec,save_inter,tree", _SGLANG_CASES)
-def test_sglang_matches_upstream_sglang(
-    batch, dim, width, seqlen, spec, save_inter, tree
-):
-    """Covers SGLang's decode, chain-verify, SAVE_INTERMEDIATE and tree paths.
-
-    The tree cases are the ones where aiter's Triton could never have served as
-    the baseline: it is a fork of this kernel with the EAGLE path stripped out, so
-    only upstream itself can say what the parent-chain convolution should return.
-    """
-    t = _sglang_problem(batch, dim, width, seqlen, spec, save_inter, tree)
+def _check_sglang_case(batch, dim, width, seqlen, spec, save_inter, tree, dtype=DTYPE):
+    """One SGLang-interface problem, checked against upstream on every output."""
+    t = _sglang_problem(batch, dim, width, seqlen, spec, save_inter, tree, dtype)
     label = (
-        f"sglang b{batch} d{dim} w{width} s{seqlen} spec={spec} "
-        f"inter={save_inter} tree={tree}"
+        f"sglang b{batch} d{dim} w{width} {_DTYPE_NAME[dtype]} s{seqlen} "
+        f"spec={spec} inter={save_inter} tree={tree}"
     )
 
     out, state, window, parents = _run_sglang(
@@ -661,6 +774,43 @@ def test_sglang_matches_upstream_sglang(
         _assert_bit_exact(label, "intermediate_conv_window", window, ref.window)
     if tree:
         _assert_bit_exact(label, "retrieve_parent_token map", parents, ref.parents)
+
+
+@pytest.mark.parametrize("batch,dim,width,seqlen,spec,save_inter,tree", _SGLANG_CASES)
+def test_sglang_matches_upstream_sglang(
+    batch, dim, width, seqlen, spec, save_inter, tree
+):
+    """Covers SGLang's decode, chain-verify, SAVE_INTERMEDIATE and tree paths.
+
+    The tree cases are the ones where aiter's Triton could never have served as
+    the baseline: it is a fork of this kernel with the EAGLE path stripped out, so
+    only upstream itself can say what the parent-chain convolution should return.
+    """
+    _check_sglang_case(batch, dim, width, seqlen, spec, save_inter, tree)
+
+
+#: (width, dtype, seqlen, spec) outside the list above, which is width 4 / bf16
+#: throughout; see ``_VLLM_WIDTH_DTYPE_CASES`` for why each is its own build.
+#: SGLang stops at width 4, so only the narrower widths are new here. The
+#: snapshot rides along because its slot count is ``width - 1``, which is the
+#: part of the layout the width actually moves.
+_SGLANG_WIDTH_DTYPE_CASES = [
+    (2, torch.bfloat16, 1, False),
+    (2, torch.float16, 4, True),
+    (3, torch.bfloat16, 4, True),
+    (3, torch.float16, 1, False),
+    (4, torch.float16, 1, False),
+    (4, torch.float16, 4, True),
+]
+
+
+@pytest.mark.parametrize("width,dtype,seqlen,spec", _SGLANG_WIDTH_DTYPE_CASES)
+def test_sglang_matches_upstream_across_widths_and_dtypes(width, dtype, seqlen, spec):
+    """Every width and dtype ``_causal_conv1d_update_sglang_flydsl`` accepts."""
+    assert width in _SGLANG_WIDTHS and dtype in _SUPPORTED_DTYPES
+    _check_sglang_case(
+        4, 256, width, seqlen, spec, save_inter=spec, tree=False, dtype=dtype
+    )
 
 
 #: SGLang only enables its deduplicated snapshot layout for linear draft chains
@@ -841,13 +991,15 @@ def test_dispatch_seam_falls_through_when_out_of_scope():
     _assert_bit_exact("seam fp32", "conv_state (fell through)", state_on, state_off)
 
 
-def test_triton_update_refuses_unimplemented_width():
-    """Widths past 4 must fail loudly on the Triton path, as they do on HIP.
+def test_triton_refuses_unimplemented_width():
+    """Widths past 4 must fail loudly on both Triton entry points, as on HIP.
 
-    That kernel loads a 4th history column at width 5 but never loads a 5th weight
-    column, and its tap loop only branches on 2/3/4, so before this guard it
-    returned a silently wrong result. The FlyDSL vLLM-interface kernel does
-    implement widths up to 6, which is why only the Triton side is refused here.
+    Neither kernel in that file loads a 5th weight column and both tap loops
+    branch on 2/3/4 only, so before the guard a wider weight returned a silently
+    wrong result. Both entry points are checked because they share the flaw: the
+    update path is what this port replaces, but ``causal_conv1d_fn`` reaches the
+    same dead end from the prefill side. The FlyDSL vLLM-interface kernel does
+    implement widths up to 6, which is why only the Triton side is refused.
     """
     t = _make_inputs(4, 256, 4, 1, spec=False, seed=31)
     wide = torch.randn((256, 5), device=DEVICE, dtype=DTYPE)
@@ -858,6 +1010,17 @@ def test_triton_update_refuses_unimplemented_width():
         causal_conv1d_update_triton(
             t["x"].clone(), state, wide, activation="silu", conv_state_indices=indices
         )
+
+    with pytest.raises(AssertionError, match="width must be 2, 3 or 4"):
+        causal_conv1d_fn_triton(
+            torch.randn((256, 8), device=DEVICE, dtype=DTYPE),
+            wide,
+            None,
+            state,
+            torch.tensor([0, 4, 8], dtype=torch.int32, device=DEVICE),
+            [4, 4],
+        )
+
     # The FlyDSL kernel covers this width, so it must not have been made to refuse.
     assert _causal_conv1d_update_flydsl_supported(t["x"], state, wide)
 
@@ -1596,7 +1759,15 @@ def _parse_args():
         only by the other three modes.""",
     )
     parser.add_argument(
-        "-d", "--dtype", type=str, nargs="*", default=["bf16"], choices=["bf16"]
+        "-d",
+        "--dtype",
+        type=str,
+        nargs="*",
+        default=["bf16"],
+        choices=sorted(_DTYPE_BY_NAME),
+        help="""Storage dtype. Both are specialized and both are checked for
+        correctness; the sweep defaults to bf16 because that is what the call
+        sites run.""",
     )
     parser.add_argument(
         "--mode", type=str, nargs="*", default=list(BENCH_MODES), choices=BENCH_MODES
@@ -1694,14 +1865,23 @@ def _run_correctness():
     torch.manual_seed(0)
     cases = [
         (test_vllm_matches_upstream_vllm, _VLLM_CASES),
+        (
+            test_vllm_matches_upstream_across_widths_and_dtypes,
+            _VLLM_WIDTH_DTYPE_CASES,
+        ),
+        (test_vllm_addresses_a_conv_state_line_past_4gib, [()]),
         (test_vllm_channels_per_thread_agree, [(1,), (2,)]),
         (test_cpt_policy_backs_off_for_long_speculative_windows, [()]),
         (test_vllm_skips_the_null_block, [()]),
         (test_sglang_matches_upstream_sglang, _SGLANG_CASES),
+        (
+            test_sglang_matches_upstream_across_widths_and_dtypes,
+            _SGLANG_WIDTH_DTYPE_CASES,
+        ),
         (test_sglang_dedup_conv_window_matches_dense, _DEDUP_CASES),
         (test_dispatch_seam_routes_to_flydsl, _SEAM_CASES),
         (test_dispatch_seam_falls_through_when_out_of_scope, [()]),
-        (test_triton_update_refuses_unimplemented_width, [()]),
+        (test_triton_refuses_unimplemented_width, [()]),
         (test_dispatch_seam_preserves_2d_decode_shape, [()]),
         (test_dispatch_seam_is_off_by_default, [()]),
         (test_vllm_varlen_matches_the_dense_path, _VARLEN_DENSE_EQUIVALENT),
@@ -1731,15 +1911,26 @@ def _run_correctness():
     # the whole report lands in one place rather than interleaved with the
     # cases still running behind it.
     cases_run = 0
+    skipped = 0
     failures = []
     for fn, arg_sets in cases:
         for args in arg_sets:
             name = f"{fn.__name__}{args if args else ''}"
-            cases_run += 1
             try:
                 fn(*args)
+            except pytest.skip.Exception as exc:
+                # Skipped derives from BaseException, so it would sail past the
+                # collector below and abort the shard. A case that skips itself
+                # (too little free HBM for the >4GiB line) neither ran nor failed.
+                aiter.logger.info("causal_conv1d_update: skipped %s -- %s", name, exc)
+                skipped += 1
             except Exception as exc:  # noqa: BLE001 - collect and keep going
                 failures.append((name, exc, traceback.format_exc()))
+                cases_run += 1
+            else:
+                cases_run += 1
+    if skipped:
+        aiter.logger.info("causal_conv1d_update: %d case(s) skipped", skipped)
     return cases_run, failures
 
 
