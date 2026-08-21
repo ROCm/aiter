@@ -12,6 +12,7 @@ import torch.nn.functional as F
 import aiter
 from aiter import dtypes, hipb_create_extension, hipb_mm
 from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
+from aiter.ops.gemm_op_a16w16 import get_semaphore_workspace
 from aiter.ops.shuffle import shuffle_weight
 from aiter.test_common import benchmark, checkAllclose, perftest
 from aiter.tuned_gemm import tgemm, triton_gemm
@@ -428,6 +429,77 @@ def test_skinny_gemm():
     return df
 
 
+def check_graph(dtype, m, n, k, otype):
+    """Capture the asm split-K GEMM in a HIP graph, replay it, compare against eager.
+
+    Not part of the perf table: this is a pass/fail check that the split-K
+    semaphore survives capture/replay. The kernel needs its counter to be zero
+    when a launch starts; a graph records launches, not the memset that zeroed
+    the counter, so a replay can start dirty and the kernel spins forever.
+    """
+    if dtype != dtypes.bf16 or otype not in (dtypes.bf16, dtypes.fp32):
+        return  # the asm a16w16 path only takes bf16 in, bf16/fp32 out
+    if k % 64 or n % 64:
+        return
+
+    x = torch.randn(m, k, dtype=dtype, device="cuda")
+    weight = torch.randn(n, k, dtype=dtype, device="cuda")
+    wshuffle = shuffle_weight(weight, layout=(16, 16))
+    out = torch.empty(m, n, dtype=otype, device="cuda")
+
+    # Warm up outside capture: the first call loads the module and allocates the
+    # semaphore workspace, neither of which may happen inside a capture region.
+    aiter.gemm_a16w16_asm(x, wshuffle, out, bpreshuffle=wshuffle.is_shuffled)
+    torch.cuda.synchronize()
+    eager = out.clone()
+
+    # Leave the counter dirty on the stream the graph captures on -- the state
+    # production reaches, and the one an unfixed build cannot recover from.
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        get_semaphore_workspace(x.device).fill_(2)
+    stream.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        aiter.gemm_a16w16_asm(x, wshuffle, out, bpreshuffle=wshuffle.is_shuffled)
+    torch.cuda.current_stream().wait_stream(stream)
+
+    out.zero_()
+    graph.replay()
+    torch.cuda.synchronize()
+
+    # splitK reduces in whatever order the blocks finish, so the same inputs are
+    # not bit-identical run to run; compare with the file's usual tolerance.
+    err = checkAllclose(
+        eager,
+        out,
+        msg=f"graph dim: {(m, n, k)!s:<20} dtype: {dtype} otype: {otype}, replay vs eager: ",
+        catastrophic_check=True,
+    )
+    assert err == 0, f"graph replay diverged from eager at {(m, n, k)} {dtype} {otype}"
+
+    # The workspace a capture hands out must have its zero-fill recorded as a
+    # graph node, or replay N starts from whatever replay N-1 left. Checked on
+    # its own graph, with no kernel, so a regression asserts here in
+    # milliseconds instead of spinning in the GEMM above.
+    sink = torch.zeros(1, device=x.device)
+    probe = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(probe, stream=stream):
+        sema = get_semaphore_workspace(x.device)
+        sink.add_(1)  # a graph needs at least one node
+    torch.cuda.current_stream().wait_stream(stream)
+    torch.cuda.synchronize()
+    sema.view(torch.int32).fill_(2)
+    torch.cuda.synchronize()
+    probe.replay()
+    torch.cuda.synchronize()
+    assert (
+        int(sema.view(torch.int32).max().item()) == 0
+    ), f"capture recorded no zero-fill for the splitK counter at {(m, n, k)}"
+
+
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description="config input of a16w16_gemm_test",
@@ -495,6 +567,13 @@ parser.add_argument(
     help="""Scale B.
     e.g.: -sb 0.5""",
 )
+parser.add_argument(
+    "--graph",
+    action="store_true",
+    help="""Also run the HIP-graph capture/replay check for the asm splitK path
+    over the same sweep. Use shapes that select splitK (small m, large k).
+    e.g.: --graph -mnk 64,256,5120 32,512,8192 -d bf16 -o fp32""",
+)
 args = parser.parse_args()
 
 df = []
@@ -503,6 +582,8 @@ for test in args.test:
         for dtype in args.dtype:
             for otype in args.otype:
                 for m, n, k in args.mnk:
+                    if args.graph:
+                        check_graph(dtype, m, n, k, otype)
                     ret = test_gemm(
                         dtype,
                         m,
@@ -521,3 +602,5 @@ for test in args.test:
 df = pd.DataFrame(df)
 df_md = df.to_markdown(index=False)
 aiter.logger.info("gemm_a16w16 summary (markdown):\n%s", df_md)
+if args.graph:
+    aiter.logger.info("all graph capture/replay checks passed")
