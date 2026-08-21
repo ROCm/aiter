@@ -904,17 +904,23 @@ def _build_kernel_w32(
                 return fx.memref_load_vec(r)
 
         else:
+            half_lay = fx.make_layout(VEC // 2, 1)
+            half_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), 16)
 
             def _load_weight_tensor(weight_tensor, tid_val):
-                """Load VEC bf16 from a 1D weight fx.Tensor via raw buffer_load.
-                Splits into dwordx4 chunks for VEC=16."""
-                wrsrc = buffer_ops.create_buffer_resource(weight_tensor, max_size=True)
-                tid_x_vec = tid_val * VEC
-                off_dw = tid_x_vec >> 1
-                f32_list = _load_bf16_raw(wrsrc, off_dw)
-                f32_vec = fx.Vector.from_elements(f32_list, dtype=fx.Float32)
+                wbuf = fx.rocdl.make_buffer_tensor(weight_tensor)
+                wdiv = fx.logical_divide(wbuf, half_lay)
+                r0 = fx.make_rmem_tensor(half_lay, elem_dtype)
+                r1 = fx.make_rmem_tensor(half_lay, elem_dtype)
+                fx.copy_atom_call(half_atom, fx.slice(wdiv, (None, tid_val * 2)), r0)
+                fx.copy_atom_call(
+                    half_atom, fx.slice(wdiv, (None, tid_val * 2 + 1)), r1
+                )
+                v0 = fx.memref_load_vec(r0).to(fx.Float32)
+                v1 = fx.memref_load_vec(r1).to(fx.Float32)
+                combined = v0.shuffle(v1, list(range(VEC)))
                 rmem = fx.make_rmem_tensor(full_lay, fx.Float32)
-                fx.memref_store_vec(f32_vec, rmem)
+                fx.memref_store_vec(combined, rmem)
                 return fx.memref_load_vec(rmem)
 
         def _load_bf16_raw(rsrc, off_dw):
@@ -1611,7 +1617,7 @@ def flydsl_qk_norm_rope_quant(
             per_wg = ROWS_PER_TILE * tiles_per_wg
             args = (
                 _cached_from_dlpack(q_2d),
-                _t_ptr(kv_c),
+                _cached_from_dlpack(kv_c),
                 _cached_from_dlpack(cos_2d),
                 _cached_from_dlpack(sin_2d),
                 _t_ptr(positions),
@@ -1770,7 +1776,7 @@ def _build_kernel_w32_tdm(
     @flyc.kernel(name=name, known_block_size=[BLOCK_THREADS, RT, 1])
     def kernel(
         q_in: fx.Tensor,  # [T*H, D] bf16
-        kv_in: fx.Pointer,  # [T, D] bf16 (contiguous)
+        kv_in: fx.Tensor,  # [T, D] bf16 (contiguous)
         cos_cache: fx.Tensor,
         sin_cache: fx.Tensor,
         positions: fx.Pointer,  # [T] i64
@@ -1798,10 +1804,15 @@ def _build_kernel_w32_tdm(
             alignment=16,
         )
 
-        cos_rsrc = buffer_ops.create_buffer_resource(cos_cache, max_size=True)
-        sin_rsrc = buffer_ops.create_buffer_resource(sin_cache, max_size=True)
+        elem_dtype = fx.BFloat16
+        cos_buf = fx.rocdl.make_buffer_tensor(cos_cache)
+        sin_buf = fx.rocdl.make_buffer_tensor(sin_cache)
         is_rope = tid >= ROPE_LO
         rope_rel = _imax(tid - ROPE_LO, fx.Int32(0))
+        cs_lay = fx.make_layout(PAIRS, 1)
+        cs_atom = fx.make_copy_atom(fx.rocdl.BufferCopy(PAIRS * 16), 16)
+        half_lay = fx.make_layout(VEC // 2, 1)
+        half_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), 16)
 
         def _ptr_res(ptr):
             return buffer_ops.create_buffer_resource_from_addr(
@@ -1811,30 +1822,22 @@ def _build_kernel_w32_tdm(
         pos_rsrc = _ptr_res(positions)
 
         def _concat(chunks):
-            """Fold 8-lane chunks into one VEC-lane vector. range_constexpr, not
-            range: a bare `for` over range() in a kernel body becomes a runtime
-            scf.for, which cannot index the compile-time `chunks` list."""
             v = chunks[0]
             for c in range_constexpr(len(chunks) - 1):
                 v = v.shuffle(chunks[c + 1], list(range(8 * (c + 2))))
             return v.to(fx.Float32)
 
-        def load_vec_global(rsrc, base_elem):
-            """`VEC` bf16 from a buffer resource -> Vector[VEC] f32. A 256-bit
-            (v16bf16) load isn't selectable, so read 128-bit (8-lane) chunks."""
-            return _concat(
-                [
-                    fx.Vector(
-                        buffer_ops.buffer_load(
-                            rsrc,
-                            base_elem + (c * 8),
-                            vec_width=8,
-                            dtype=T.bf16,
-                        )
-                    )
-                    for c in range(VEC // 8)
-                ]
-            )
+        def _load_tensor_vec(tensor, tid_val):
+            """Load VEC bf16 from a 1D fx.Tensor via two 128b copy atoms."""
+            buf = fx.rocdl.make_buffer_tensor(tensor)
+            div = fx.logical_divide(buf, half_lay)
+            r0 = fx.make_rmem_tensor(half_lay, elem_dtype)
+            r1 = fx.make_rmem_tensor(half_lay, elem_dtype)
+            fx.copy_atom_call(half_atom, fx.slice(div, (None, tid_val * 2)), r0)
+            fx.copy_atom_call(half_atom, fx.slice(div, (None, tid_val * 2 + 1)), r1)
+            v0 = fx.memref_load_vec(r0).to(fx.Float32)
+            v1 = fx.memref_load_vec(r1).to(fx.Float32)
+            return v0.shuffle(v1, list(range(VEC)))
 
         def load_cs(tok):
             """cos/sin for this token, as PAIRS-wide f32 vectors."""
@@ -1843,20 +1846,16 @@ def _build_kernel_w32_tdm(
                     i32
                 )
             )
-            cs = pos_i32 * (RD // 2) + rope_rel * PAIRS
-            if const_expr(PAIRS == 1):
-                return tuple(
-                    fx.Vector.from_elements(
-                        [buffer_ops.buffer_load(r, cs, vec_width=1, dtype=T.bf16)],
-                        fx.BFloat16,
-                    ).to(fx.Float32)
-                    for r in (cos_rsrc, sin_rsrc)
-                )
-            return tuple(
-                fx.Vector(
-                    buffer_ops.buffer_load(r, cs, vec_width=PAIRS, dtype=T.bf16)
-                ).to(fx.Float32)
-                for r in (cos_rsrc, sin_rsrc)
+            cos_row = fx.slice(cos_buf, (pos_i32, None))
+            sin_row = fx.slice(sin_buf, (pos_i32, None))
+            cos_div = fx.logical_divide(cos_row, cs_lay)
+            sin_div = fx.logical_divide(sin_row, cs_lay)
+            cr = fx.make_rmem_tensor(cs_lay, elem_dtype)
+            sr = fx.make_rmem_tensor(cs_lay, elem_dtype)
+            fx.copy_atom_call(cs_atom, fx.slice(cos_div, (None, rope_rel)), cr)
+            fx.copy_atom_call(cs_atom, fx.slice(sin_div, (None, rope_rel)), sr)
+            return fx.memref_load_vec(cr).to(fx.Float32), fx.memref_load_vec(sr).to(
+                fx.Float32
             )
 
         def norm_rope_store(xv, wv, cosv, sinv, out_rsrc, row_base_bytes):
@@ -1882,14 +1881,7 @@ def _build_kernel_w32_tdm(
             wave_lds_off = wave * (D * eb)  # this wave's slot in a tile buffer
             row_elem = tid * VEC  # LDS read pos within that slot
 
-            qw = (
-                load_vec_global(
-                    buffer_ops.create_buffer_resource(q_weight, max_size=True),
-                    tid * VEC,
-                )
-                if const_expr(q_weighted)
-                else None
-            )
+            qw = _load_tensor_vec(q_weight, tid) if const_expr(q_weighted) else None
 
             q_row0 = fx.Tensor(
                 fx.make_view(fx.get_iter(q_in), fx.make_layout((1, D), (D, 1)))
@@ -1967,10 +1959,19 @@ def _build_kernel_w32_tdm(
         def emit_kv():
             gk = g - gx_q
             tok = _imin(gk * RT + wave, num_tokens - 1)
-            xv = load_vec_global(_ptr_res(kv_in), tok * D + tid * VEC)
-            wv = load_vec_global(
-                buffer_ops.create_buffer_resource(kv_weight, max_size=True), tid * VEC
+            kv_buf = fx.rocdl.make_buffer_tensor(kv_in)
+            kv_row = fx.slice(kv_buf, (tok, None))
+            kv_div = fx.logical_divide(kv_row, half_lay)
+            kr0 = fx.make_rmem_tensor(half_lay, elem_dtype)
+            kr1 = fx.make_rmem_tensor(half_lay, elem_dtype)
+            fx.copy_atom_call(half_atom, fx.slice(kv_div, (None, tid * 2)), kr0)
+            fx.copy_atom_call(half_atom, fx.slice(kv_div, (None, tid * 2 + 1)), kr1)
+            xv = (
+                fx.memref_load_vec(kr0)
+                .to(fx.Float32)
+                .shuffle(fx.memref_load_vec(kr1).to(fx.Float32), list(range(VEC)))
             )
+            wv = _load_tensor_vec(kv_weight, tid)
             cosv, sinv = load_cs(tok)
             norm_rope_store(xv, wv, cosv, sinv, _ptr_res(kv_out), tok * (D * 2))
 
@@ -1982,7 +1983,7 @@ def _build_kernel_w32_tdm(
     @flyc.jit
     def launch(
         q_in: fx.Tensor,
-        kv_in: fx.Pointer,
+        kv_in: fx.Tensor,
         cos_cache: fx.Tensor,
         sin_cache: fx.Tensor,
         positions: fx.Pointer,
