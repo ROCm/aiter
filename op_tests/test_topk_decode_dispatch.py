@@ -77,20 +77,50 @@ def make_inputs(rows: int, width: int, seq_len: int, k: int, seed: int = 0):
     return logits, seq_lens, indices
 
 
+ROUTING_CASES = [
+    (1, 32768, 32768, 512),
+    (1, 32767, 32767, 512),  # one short of the gate -> HIP
+    (16, 65536, 65536, 512),
+    (17, 65536, 65536, 512),  # one over the row cap -> HIP
+    (1, 65536, 65536, 2048),
+    (1, 65536, 65536, 1024),  # outside every arch's window -> HIP
+    (4, 131072, 70000, 512),  # padded buffer, poisoned tail
+    (1, 8192, 8192, 512),
+    # gfx950 admits only k=2048 at width >= 131072, so every case above lands on
+    # HIP there and the FlyDSL branch of the arch this PR targets would go
+    # untested. These three sit inside both shipped windows.
+    (1, 131072, 131072, 2048),  # -> FlyDSL on gfx950 and gfx942
+    (1, 131072, 70000, 2048),  # same, with the poisoned tail
+    (2, 131072, 131072, 2048),  # gfx950 carves out rows==2 -> HIP; gfx942 FlyDSL
+]
+
+
+@gate_is_overridden
+@pytest.mark.parametrize("arch", sorted(topk_mod._FLYDSL_TOPK_DECODE_GATES))
+def test_routing_cases_reach_flydsl_on_every_shipped_arch(arch):
+    """Every arch with a gate needs at least one case above that the gate admits.
+
+    Nothing else notices when it stops being true: the cases below all return the
+    right indices from HIP, so an arch whose window drifts away from the matrix
+    keeps a green suite while never running the FlyDSL kernel at all. gfx950 was
+    in exactly that state -- its window is k==2048 above width 131072, and no case
+    held both at once. This runs on the gate tuple alone, so it fails on the arch
+    it describes rather than only on hardware that happens to be present.
+    """
+    gate = topk_mod._FLYDSL_TOPK_DECODE_GATES[arch]
+    admitted = [
+        (rows, width, seq_len, k)
+        for rows, width, seq_len, k in ROUTING_CASES
+        if rows <= gate.max_rows
+        and rows not in gate.excluded_rows
+        and k in gate.ks
+        and width >= gate.min_width
+    ]
+    assert admitted, f"no routing case lands inside the {arch} window: {gate}"
+
+
 @pytestmark_gpu
-@pytest.mark.parametrize(
-    "rows, width, seq_len, k",
-    [
-        (1, 32768, 32768, 512),
-        (1, 32767, 32767, 512),  # one short of the gate -> HIP
-        (16, 65536, 65536, 512),
-        (17, 65536, 65536, 512),  # one over the row cap -> HIP
-        (1, 65536, 65536, 2048),
-        (1, 65536, 65536, 1024),  # outside every arch's window -> HIP
-        (4, 131072, 70000, 512),  # padded buffer, poisoned tail
-        (1, 8192, 8192, 512),
-    ],
-)
+@pytest.mark.parametrize("rows, width, seq_len, k", ROUTING_CASES)
 def test_both_branches_match_torch_topk(rows, width, seq_len, k):
     logits, seq_lens, indices = make_inputs(rows, width, seq_len, k)
     indices.fill_(-1)
@@ -111,10 +141,14 @@ def test_column_strided_input_falls_back_instead_of_raising(claimed_stride1):
     screen is the only thing keeping it away from FlyDSL, which raises on it. HIP
     ignores stride1, so the call has to simply come back either way -- including
     when the caller claims 1, which HIP accepts and the gate must not take at its
-    word."""
+    word.
+
+    k has to be 2048: it is the only value inside every shipped window, and under
+    any other one gfx950 rejects on k before the stride checks are ever reached,
+    which would leave the screen this test is about unexercised there."""
     if get_gfx_runtime() not in topk_mod._FLYDSL_TOPK_DECODE_GATES:
         pytest.skip("no FlyDSL gates for this arch")
-    rows, width, k = 1, 131072, 512
+    rows, width, k = 1, 131072, 2048
     wide = torch.randn((rows, width * 2), dtype=torch.float32, device="cuda")
     logits = wide[:, ::2]
     assert logits.stride(1) == 2 and logits.shape[1] == width
