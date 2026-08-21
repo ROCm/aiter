@@ -191,7 +191,7 @@ __global__ void inverse_rope_group_quant_kernel(
     // Sorting a wave's groups also moves the addresses it touches, and that is
     // where most of the win turns out to be: with the rotation ablated from both
     // sides the sort is still worth 11% at s=16384, against 7.9% for deleting
-    // the rotation outright (md 18.3). Skipping rope accounts for under 2 of the
+    // the rotation outright (md 21.9). Skipping rope accounts for under 2 of the
     // 13, which is why the run length matters far more than the tier ratio does.
     //
     // A run has to stay a multiple of four either way, because the n32k4 scale
@@ -285,7 +285,7 @@ __global__ void inverse_rope_group_quant_kernel(
     // offsets small at any S and bounds each block to its own row. It is not
     // free -- the descriptor then depends on a scalar address chain per block
     // instead of arriving in the kernel arguments, worth ~2% at S = 16384 -- so
-    // the host only asks for it once a buffer no longer fits.
+    // the host only asks for it once a buffer no longer fits (md 21.11).
     //
     // G * D is the row length H * HEAD_DIM, so the (s, g) slice starts at
     // row * D and the input and output share the one 64-bit multiply.
@@ -314,7 +314,7 @@ __global__ void inverse_rope_group_quant_kernel(
         // divide. Resolved into a separate array first, because computing them
         // inline let the scheduler put the second pass's address math between
         // the two halves of the payload clause and push those loads ~40
-        // instructions back.
+        // instructions back, worth -7.3% (md 21.7).
         int64_t offs[K_PER_THREAD];
 #pragma unroll
         for(int k = 0; k < K_PER_THREAD; ++k)
@@ -507,8 +507,9 @@ __global__ void inverse_rope_group_quant_kernel(
         // every store in the group then waits on -- which is what the
         // s_delay_alu padding around it in the disassembly pays for. Removing
         // the reduction outright is worth 6.9% at s=512 and 4.0% at s=16384, so
-        // the depth is worth the THREAD_DATA_SIZE/2 live values it costs. fabs
-        // is a source modifier, so the first level folds in free.
+        // the depth is worth the THREAD_DATA_SIZE/2 live values it costs
+        // (md 21.3). fabs is a source modifier, so the first level folds in
+        // free.
         float amax;
         if constexpr(THREAD_DATA_SIZE == 1)
         {
@@ -945,7 +946,7 @@ void inverse_rope_group_quant(
         // in md 17.4 and 17.10, and the three values are not interchangeable
         // (forcing GS=32 to the wider tier cost 31%, md 17.3).
         // GS=32 moved from 24 to 48 when the tier sort came in: the tier the
-        // wide slice admits (one pass per hi, md 18.2) is the stronger of the
+        // wide slice admits (one pass per hi, md 21.8) is the stronger of the
         // two at small s, so the width is worth holding one step longer.
         // Measured on (128,16) n32k4: at 32 waves/SIMD the wide slice wins 2.2%
         // and at 64 the narrow one wins 19.8%, so the crossover sits between.
