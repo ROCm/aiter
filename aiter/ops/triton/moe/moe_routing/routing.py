@@ -501,6 +501,34 @@ def routing_from_hash(
 # --------------------------
 
 
+@dataclass(frozen=True)
+class EpScatterGeometry:
+    """What the sort needs to also emit the EP combine-scatter destination map.
+
+    ``src_token_map[recv_slot] = origin_pe * max_tokens_per_rank + origin_lid``
+    is the dispatch's reverse map; ``peer_rows`` is the stride, in staging-slot
+    rows, between one peer's slot region and the next in the symmetric window.
+    Pass this to ``ep_sort_routing`` and it returns ``dst_row`` alongside the
+    usual five, at no extra launch -- the scatter kernel already holds every
+    input the map needs.
+    """
+
+    src_token_map: torch.Tensor
+    max_tokens_per_rank: int
+    peer_rows: int
+
+    def __post_init__(self):
+        if (
+            self.src_token_map.dtype != torch.int32
+            or not self.src_token_map.is_contiguous()
+        ):
+            raise ValueError("src_token_map must be contiguous int32")
+        if self.max_tokens_per_rank <= 0:
+            raise ValueError("max_tokens_per_rank must be positive")
+        if self.peer_rows <= 0:
+            raise ValueError("peer_rows must be positive")
+
+
 # Persistent per-(device, n_bins) scratch for the EP sort's histogram and join
 # counter. Both are left zeroed by _ep_gate_prep_scan_kernel, so the torch.zeros
 # below is paid once per process rather than once per layer per step.
@@ -529,6 +557,7 @@ def ep_sort_routing(
     topk,
     n_gates,
     expt_data_bufs,
+    ep_scatter_geometry=None,
 ):
     """Expert-sort rows that an expert-parallel all-to-all has already dispatched.
 
@@ -545,7 +574,8 @@ def ep_sort_routing(
 
     ``expt_data_bufs`` is what ``_compute_expt_data_internal`` returns; the caller
     allocates it so kernel A can fill it in the same launch as the histogram
-    scan. Returns ``(hist, topk_indx, gate_indx, gate_scal, gate_valid)`` with
+    scan. Returns ``(hist, topk_indx, gate_indx, gate_scal, gate_valid,
+    dst_row)`` with
     the ExptData buffers filled in place. ``hist`` has ``next_pow2(E + 1)``
     entries -- the caller wants ``hist[:num_local_experts]``, since the tail
     holds the sentinel (non-local) count.
@@ -553,6 +583,10 @@ def ep_sort_routing(
     ``gate_valid`` is the piece ``routing()`` has no need for: it marks which
     gate slots this rank actually owns, in flat gate order (``row * topk +
     slot``), so a grouped reduce can skip the slots no GEMM here ever wrote.
+
+    With ``ep_scatter_geometry`` (an ``EpScatterGeometry``) the returned tuple
+    gains a sixth entry, ``dst_row``: where each sorted row must be delivered for
+    a scatter-fused combine. It is None otherwise.
 
     SINGLE STREAM ONLY. The histogram and join counter are process-persistent and
     re-armed by the kernel that drains them, so two concurrent calls sharing a
@@ -579,6 +613,14 @@ def ep_sort_routing(
     expt_indx = torch.empty(n_gates, dtype=torch.int32, device=device)
     hist = torch.empty(n_bins, dtype=torch.int32, device=device)
     cursor = torch.empty(n_bins, dtype=torch.int32, device=device)
+    # Not zero_()/full_(): kernel A pre-fills it with the "skip" sentinel over the
+    # grid it is already running, so this stays a bare allocation.
+    if ep_scatter_geometry is None:
+        dst_row = None
+        src_token_map = None
+    else:
+        dst_row = torch.empty(n_gates, dtype=torch.int32, device=device)
+        src_token_map = ep_scatter_geometry.src_token_map
     _ep_gate_prep_scan_kernel[(n_ctas,)](
         dispatch_ids,
         expert_map,
@@ -592,6 +634,7 @@ def ep_sort_routing(
         token_offs_raw,
         token_offs_pad,
         block_pid_map,
+        dst_row,
         block_pid_map.shape[0],
         n_gates,
         expert_map.numel(),
@@ -604,6 +647,7 @@ def ep_sort_routing(
         BLOCK_A=BLOCK_A,
         EQUAL_A=(num_local_experts == BLOCK_A),
         N_CTAS=n_ctas,
+        HAS_DST_ROW=dst_row is not None,
     )
 
     topk_indx = torch.empty(n_gates, dtype=torch.int32, device=device)
@@ -619,13 +663,25 @@ def ep_sort_routing(
         hist,
         token_offs_pad,
         block_pid_map,
+        dst_row,
+        src_token_map,
         n_gates,
         N_EXPTS=num_local_experts,
         SENTINEL=sentinel,
         tile_dim_log2=block_m_log2,
         GATE_BLOCK=GATE_BLOCK,
+        HAS_DST_ROW=dst_row is not None,
+        TOPK=topk,
+        MAX_TOK=(
+            0
+            if ep_scatter_geometry is None
+            else ep_scatter_geometry.max_tokens_per_rank
+        ),
+        PEER_ROWS=(
+            0 if ep_scatter_geometry is None else ep_scatter_geometry.peer_rows
+        ),
     )
-    return hist, topk_indx, gate_indx, gate_scal, gate_valid
+    return hist, topk_indx, gate_indx, gate_scal, gate_valid, dst_row
 
 
 # --------------------------

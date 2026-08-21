@@ -22,7 +22,12 @@ from aiter.ops.triton._triton_kernels.moe.moe_op_gemm_a8w4 import (
     _moe_gemm_a8w4 as _moe_gemm_a8w4_triton,
 )
 from aiter.ops.triton.moe.moe_routing.routing import RoutingData
-from aiter.ops.triton.moe.reduce import reduce_grouped, validate_reduce_out
+from aiter.ops.triton.moe.reduce import (
+    EpCombineScatter,
+    reduce_grouped,
+    scatter_grouped,
+    validate_reduce_out,
+)
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH, load_config_json
 from aiter.ops.triton.utils.device_info import get_num_sms
@@ -64,6 +69,7 @@ def allocate_output(
     split_k,
     device,
     y_out=None,
+    skip_final=False,
 ):
     # if the activations are gathered, then M is number of gather indices
     if gather_indx is not None:
@@ -78,7 +84,13 @@ def allocate_output(
     matmul_shape = (split_k, M, N // reduction_n_matmul)
     final_shape = (y_rows, N // reduction_n_matmul // reduction_n_reduction)
     matmul_output = torch.empty(matmul_shape, device=device, dtype=out_dtype)
-    if scatter_indx is not None or split_k > 1:
+    if skip_final:
+        # The rows are delivered elsewhere (expert-parallel scatter), so a
+        # reduced output would only be allocated to be thrown away -- and at
+        # (tokens x hidden) bf16 that is tens of MB per layer.
+        assert y_out is None, "y_out names a reduced output; skip_final has none"
+        final_output = None
+    elif scatter_indx is not None or split_k > 1:
         final_output = validate_reduce_out(y_out, final_shape, out_dtype, device)
     else:
         # No reduction runs: reduce_grouped early-returns the matmul buffer
@@ -373,6 +385,12 @@ def moe_gemm_a8w4(
     # rows than this GEMM produces skip a full-width copy. Requires a grouped
     # reduction to actually run, i.e. scatter_indx is not None or split_k > 1.
     y_out=None,
+    # Expert-parallel combine: deliver the un-reduced rows to a combine staging
+    # window instead of reducing them here (see EpCombineScatter). The peers'
+    # rows for a token are missing at this point, so there is nothing to reduce;
+    # whoever owns the staging window sums them once every rank has delivered.
+    # Mutually exclusive with y_out, which names a reduced output.
+    ep_scatter: EpCombineScatter | None = None,
 ):
     """
     Y[:, :] = 0.
@@ -465,6 +483,25 @@ def moe_gemm_a8w4(
         out_dtype = torch.float8_e4m3fn
     else:
         out_dtype = out_dtype  # noqa: PLW0127
+    if ep_scatter is not None:
+        assert scatter_indx is not None, (
+            "ep_scatter needs the scatter indices' row order: dst_row is indexed "
+            "by sorted row, which only exists once the gates are sorted"
+        )
+        assert not out_mx_quant, "ep_scatter delivers bf16 rows, not MXFP8"
+        assert not apply_swiglu, (
+            "ep_scatter is a GEMM2-side delivery; the activation belongs to GEMM1"
+        )
+        # `residual` is folded in by reduce_grouped, which does not run here --
+        # so accepting both would drop the residual silently. It cannot simply
+        # move into the scatter either: the residual is per TOKEN, and the rows
+        # leaving here are per (token, expert), so adding it to each would count
+        # it once per expert. It belongs after the combine.
+        assert residual is None, (
+            "ep_scatter cannot apply `residual`: it is per-token, but this path "
+            "emits per-(token, expert) rows and never reduces them. Fold the "
+            "residual into the combine's output instead."
+        )
     y, y_final = allocate_output(
         M,
         padded_N,
@@ -478,6 +515,7 @@ def moe_gemm_a8w4(
         config["split_k"],
         x.device,
         y_out=y_out,
+        skip_final=ep_scatter is not None,
     )
     # Companion ue8m0 scale buffer for the MXFP8 emit path.
     if out_mx_quant:
@@ -763,6 +801,11 @@ def moe_gemm_a8w4(
     # reduce_grouped and return (fp8 values, ue8m0 scales) directly.
     if out_mx_quant:
         return y.squeeze(0), y_scale
+    # Expert-parallel combine: hand the rows to the staging window instead of
+    # reducing them. Returns the window view, which is not a per-token output --
+    # the caller's combine produces that once every rank has delivered.
+    if ep_scatter is not None:
+        return scatter_grouped(y, ep_scatter.dst_row, ep_scatter.out)
     # Build grouped reduction inputs in a uniform way
     group_indx = (
         None

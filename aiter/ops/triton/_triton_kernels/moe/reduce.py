@@ -5,6 +5,69 @@ from aiter.ops.triton._triton_kernels.moe.activations import _swiglu
 
 
 @triton.jit
+def _scatter_grouped(
+    X,
+    stride_xb: tl.uint64,
+    stride_xm: tl.uint64,
+    stride_xn,
+    Out,
+    stride_om: tl.uint64,
+    stride_on,
+    # (M,) int32: destination row of Out for sorted row m, negative to skip.
+    DstRow,
+    B,
+    M,
+    N,
+    num_blocks,
+    BLOCK_N: tl.constexpr,
+    EVEN_N: tl.constexpr,
+):
+    """Route each matmul row to an arbitrary row of `Out` instead of reducing.
+
+    The mirror image of ``_reduce_grouped``: that one gathers a token's K sorted
+    rows and sums them locally, this one leaves the sum to somebody else and just
+    places each row where that somebody expects it. It exists for expert-parallel
+    combine, where the K rows of a token live on K different ranks, so the sum
+    cannot happen until every rank has delivered its row -- and once delivery is
+    a row-granular scatter, the local reduce has nothing left to do.
+
+    Rows are written verbatim: the matmul epilogue already applied the route
+    weight (``Gammas``, indexed by the same sorted row), so the consumer's sum is
+    unweighted.
+
+    `Out` is addressed purely through ``stride_om``, so it may be a strided view
+    over a peer-mapped symmetric window whose row pitch exceeds N -- which is the
+    point, since a combine staging slot is typically padded to a power of two.
+    ``DstRow`` is indexed by sorted row and pre-filled negative, so dead rows
+    (expert-parallel gates this rank does not own, or slots past the received
+    count) skip the load entirely rather than scattering garbage.
+    """
+    pid = tl.program_id(0)
+    pid_m = pid // num_blocks
+    pid_n = pid % num_blocks
+
+    # Scalar load -> CTA-uniform branch: a skipped row costs no row traffic.
+    dst = tl.load(DstRow + pid_m)
+    if dst >= 0:
+        offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        x_ptr = X + pid_m * stride_xm + offs_n * stride_xn
+        acc = tl.zeros([BLOCK_N], dtype=tl.float32)
+        for b in tl.range(0, B):
+            if EVEN_N:
+                vals = tl.load(x_ptr + b * stride_xb)
+            else:
+                vals = tl.load(x_ptr + b * stride_xb, mask=offs_n < N, other=0.0)
+            acc += vals.to(tl.float32)
+        # int64: dst * stride_om spans the whole symmetric window (every peer's
+        # slot region), which overflows int32 at realistic hidden sizes.
+        out_ptr = Out + dst.to(tl.int64) * stride_om + offs_n * stride_on
+        if EVEN_N:
+            tl.store(out_ptr, acc)
+        else:
+            tl.store(out_ptr, acc, mask=offs_n < N)
+
+
+@triton.jit
 def _reduce_grouped(
     X,
     stride_xb: tl.uint64,

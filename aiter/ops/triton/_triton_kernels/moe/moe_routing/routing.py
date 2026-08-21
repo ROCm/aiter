@@ -356,6 +356,7 @@ def _ep_gate_prep_scan_kernel(
     TokenStart,  # (N_EXPTS+1,) int32 out == token_offs_raw
     TileStart,  # (N_EXPTS+1,) int32 out == token_offs_pad
     MDTileInfo,  # (max_num_tiles,) int32 out == block_pid_map
+    DstRow,  # (G,) int32 out, EP scatter destinations; pre-filled here
     max_num_tiles,
     n_gates,
     e_map_numel,
@@ -368,6 +369,7 @@ def _ep_gate_prep_scan_kernel(
     BLOCK_A: tl.constexpr,
     EQUAL_A: tl.constexpr,
     N_CTAS: tl.constexpr,
+    HAS_DST_ROW: tl.constexpr,
 ):
     """EP sort kernel A: gating + histogram + (in the last CTA) the scan and
     ExptData stage1 -- all in one launch.
@@ -414,6 +416,16 @@ def _ep_gate_prep_scan_kernel(
     tl.store(GateValid + offs, valid.to(tl.int32), mask=mask)
     expt = tl.where(valid, local, SENTINEL).to(tl.int32)
     tl.store(ExptIndx + offs, expt, mask=mask)
+
+    if HAS_DST_ROW:
+        # Pre-fill the EP scatter map to "do not deliver". Kernel B overwrites
+        # only the sorted positions that a live gate lands on, and the positions
+        # it never touches -- the sentinel tail -- must stay negative or the
+        # scatter would ship a garbage row. Done here rather than in a memset
+        # because this grid already spans exactly [0, n_gates): the *set* of
+        # indices covered is the whole map, even though this kernel's axis is the
+        # gate index and the map's is the sorted position.
+        tl.store(DstRow + offs, -1, mask=mask)
 
     # `release`: these must be visible to whichever CTA later draws the last
     # ticket. Dead gates are skipped entirely -- the sentinel bin is never
@@ -468,11 +480,18 @@ def _ep_scatter_atomic_expt_data_kernel(
     Hist,  # (N_BINS,) int32 in -- stage2 half only
     TileStart,  # (N_EXPTS+1,) int32 in -- stage2 half only
     MDTileInfo,  # (max_num_tiles,) int32 out -- stage2 half only
+    # --- EP scatter map, scatter half only (see ep_sort_routing) ---
+    DstRow,  # (G,) int32 out, indexed by sorted position
+    SrcTokenMap,  # (max_recv,) int32 in, recv slot -> origin_pe*MAX_TOK + lid
     n_gates,
     N_EXPTS: tl.constexpr,
     SENTINEL: tl.constexpr,
     tile_dim_log2: tl.constexpr,
     GATE_BLOCK: tl.constexpr,
+    HAS_DST_ROW: tl.constexpr,
+    TOPK: tl.constexpr,
+    MAX_TOK: tl.constexpr,
+    PEER_ROWS: tl.constexpr,
 ):
     """EP sort kernel B: atomic-cursor scatter | ExptData stage2, split by CTA
     index.
@@ -512,6 +531,22 @@ def _ep_scatter_atomic_expt_data_kernel(
         tl.store(ScatterIndx + idx, tl.where(live, pos, 0).to(tl.int32), mask=mask)
         w = tl.load(DispatchWeights + idx, mask=live, other=0.0)
         tl.store(GateScal + pos, w.to(tl.float32), mask=live)
+        if HAS_DST_ROW:
+            # Where GEMM2's row for this gate has to land in the combine staging
+            # window: the origin rank's slot for (its token, k). `pos` is the row
+            # the GEMM will produce, so the map is keyed by it and the scatter
+            # needs no second indirection.
+            #
+            # One row index selects both peer and slot, because every peer's slot
+            # region sits at the same stride in the symmetric window. Free here:
+            # `pos`, `idx` and `live` are already in registers.
+            recv_slot = idx // TOPK
+            k = idx - recv_slot * TOPK
+            enc = tl.load(SrcTokenMap + recv_slot, mask=live, other=0)
+            origin_pe = enc // MAX_TOK
+            origin_lid = enc - origin_pe * MAX_TOK
+            dst = origin_pe * PEER_ROWS + origin_lid * TOPK + k
+            tl.store(DstRow + pos, dst.to(tl.int32), mask=live)
     else:
         # Last statement in the branch on purpose: stage2 early-returns for empty
         # experts, so nothing may follow it.
