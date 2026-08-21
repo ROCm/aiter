@@ -61,14 +61,53 @@ def _env_int(name: str, default: int | None = None) -> int | None:
         raise ValueError(f"{name} must be an integer, got {value!r}") from exc
 
 
-@functools.cache
+_FALLBACK_MIN_CU = {"gfx942": 228, "gfx950": 256}
+
+
+def _arch_floor(arch: str | None) -> int:
+    """Smallest CU count the arch is known to ship with.
+
+    Used when no device can answer for the arch being asked about. Guessing low is
+    the safe direction: the count sizes a co-residency guard, and an over-count is
+    the one that lets a grid through that cannot be co-resident.
+    """
+    return _FALLBACK_MIN_CU.get((arch or get_rocm_arch()).lower(), 64)
+
+
 def _multi_processor_count(arch: str | None = None) -> int:
+    """CU count of the device that will run the kernel, or the arch floor.
+
+    Cached per (device, arch) rather than per arch: the count sizes the
+    co-residency guard in _deadlock_safe_config, so a value cached under the arch
+    name alone describes the wrong device in two cases. A process that touches
+    several devices reuses whichever was queried first, and gfx942 spans SKUs from
+    80 to 304 CU under that one name; an AOT build for another arch takes the build
+    host's count, which on a 304-CU host is 76 over the gfx942 floor. Both loosen
+    the guard when the first device is the larger one, which is what deadlocks, so
+    device properties are believed only when the live device is the arch asked for.
+    """
     try:
-        props = torch.cuda.get_device_properties(torch.cuda.current_device())
-        return int(props.multi_processor_count)
+        device = torch.cuda.current_device()
     except Exception:  # noqa: BLE001 - no device visible during AOT; use the floor
-        fallback_min_cu = {"gfx942": 228, "gfx950": 256}
-        return fallback_min_cu.get(arch or get_rocm_arch(), 64)
+        device = None
+    return _cu_count_for(device, arch)
+
+
+@functools.cache
+def _cu_count_for(device: int | None, arch: str | None) -> int:
+    if device is None:
+        return _arch_floor(arch)
+    try:
+        props = torch.cuda.get_device_properties(device)
+    except Exception:  # noqa: BLE001 - properties unreadable; use the floor
+        return _arch_floor(arch)
+    if arch is None:
+        return int(props.multi_processor_count)
+    # gcnArchName carries feature suffixes: "gfx942:sramecc+:xnack-".
+    live_arch = getattr(props, "gcnArchName", "").split(":")[0].lower()
+    if live_arch != arch.lower():
+        return _arch_floor(arch)
+    return int(props.multi_processor_count)
 
 
 @functools.cache
