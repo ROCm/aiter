@@ -25,7 +25,7 @@ from flydsl.expr.arith import FastMathFlags
 from flydsl.expr.rocdl import tdm_ops
 from flydsl.expr.typing import Int32, ReductionOp, Stream, T
 
-from aiter.ops.flydsl.kernels import buffer_ops, vector
+from aiter.ops.flydsl.kernels import buffer_ops
 from aiter.ops.flydsl.kernels.gemm_common_gfx1250 import make_lds_copy_ops
 
 # JIT-free MX-format int mirrors (keep module import JIT-free; aiter.utility
@@ -184,27 +184,29 @@ def _store_bf16_tiled(vals_list, p_dst, copy, vec):
 
 def _store_bf16_vec(vals, out_rsrc, row_base_bytes, idx, vec):
     """Convert VEC fp32 → bf16 dwords and raw buffer_store (split for VEC>8)."""
-    i32 = T.i32
     if isinstance(vals, (list, tuple)):
-        raw = [v.ir_value() if hasattr(v, "ir_value") else v for v in vals]
-        vals = fx.Vector(vector.from_elements(T.vec(vec, T.f32), raw))
+        vals = fx.Vector.from_elements(vals, dtype=fx.Float32)
     bf16v = vals.to(fx.BFloat16)
 
     dwords = vec // 2
-    bf16_as_i32 = vector.bitcast(T.vec(dwords, i32), bf16v)
+    bf16_as_i32 = bf16v.bitcast(fx.Int32)
     off_bytes = row_base_bytes + idx * (vec * 2)
 
     if const_expr(dwords <= 4):
-        buffer_ops.buffer_store(bf16_as_i32, out_rsrc, off_bytes, offset_is_bytes=True)
+        buffer_ops.buffer_store(
+            bf16_as_i32.ir_value(), out_rsrc, off_bytes, offset_is_bytes=True
+        )
     else:
-        lo = vector.extract_strided_slice(
-            T.vec(4, i32), bf16_as_i32, offsets=[0], sizes=[4], strides=[1]
+        lo = fx.Vector.from_elements([bf16_as_i32[i] for i in range(4)], dtype=fx.Int32)
+        hi = fx.Vector.from_elements(
+            [bf16_as_i32[i] for i in range(4, dwords)], dtype=fx.Int32
         )
-        hi = vector.extract_strided_slice(
-            T.vec(4, i32), bf16_as_i32, offsets=[4], sizes=[4], strides=[1]
+        buffer_ops.buffer_store(
+            lo.ir_value(), out_rsrc, off_bytes, offset_is_bytes=True
         )
-        buffer_ops.buffer_store(lo, out_rsrc, off_bytes, offset_is_bytes=True)
-        buffer_ops.buffer_store(hi, out_rsrc, off_bytes + 16, offset_is_bytes=True)
+        buffer_ops.buffer_store(
+            hi.ir_value(), out_rsrc, off_bytes + 16, offset_is_bytes=True
+        )
 
 
 def _store_fp8_packed_w64(
@@ -265,9 +267,10 @@ def _store_fp8_packed_w32(
         dword_list.append(pk)
 
     off_bytes = row_base_bytes + idx * vec
-    store_vec_ty = T.vec(n_dwords, i32)
-    store_vec = vector.from_elements(store_vec_ty, dword_list)
-    buffer_ops.buffer_store(store_vec, out_rsrc, off_bytes, offset_is_bytes=True)
+    store_vec = fx.Vector.from_elements(dword_list, dtype=fx.Int32)
+    buffer_ops.buffer_store(
+        store_vec.ir_value(), out_rsrc, off_bytes, offset_is_bytes=True
+    )
 
 
 @lru_cache(maxsize=32)
@@ -909,7 +912,7 @@ def _build_kernel_w32(
                 tid_x_vec = tid_val * VEC
                 off_dw = tid_x_vec >> 1
                 f32_list = _load_bf16_raw(wrsrc, off_dw)
-                f32_vec = vector.from_elements(T.vec(VEC, f32), f32_list)
+                f32_vec = fx.Vector.from_elements(f32_list, dtype=fx.Float32)
                 rmem = fx.make_rmem_tensor(full_lay, fx.Float32)
                 fx.memref_store_vec(f32_vec, rmem)
                 return fx.memref_load_vec(rmem)
@@ -922,7 +925,7 @@ def _build_kernel_w32(
             out = []
             if const_expr(dwords <= 4):
                 raw = buffer_ops.buffer_load(rsrc, off_dw, vec_width=dwords, dtype=i32)
-                vec_bf16 = fx.Vector(vector.bitcast(T.vec(VEC, T.bf16), raw))
+                vec_bf16 = fx.Vector(raw).bitcast(fx.BFloat16)
                 for i in range_constexpr(VEC):
                     out.append(vec_bf16[i].to(fx.Float32))
             else:
@@ -935,7 +938,7 @@ def _build_kernel_w32(
                         vec_width=half_dw,
                         dtype=i32,
                     )
-                    vbf16 = fx.Vector(vector.bitcast(T.vec(half_bf16, T.bf16), r))
+                    vbf16 = fx.Vector(r).bitcast(fx.BFloat16)
                     for i in range_constexpr(half_bf16):
                         out.append(vbf16[i].to(fx.Float32))
             return out
@@ -1124,7 +1127,7 @@ def _build_kernel_w32(
             q_row_off_elems = bid_t * (H * D) + head_idx * D + tid * VEC
             q_off_dw = q_row_off_elems >> 1
             q_f32_list = _load_bf16_raw(q_in_rsrc, q_off_dw)
-            q_f32_fly_vec = vector.from_elements(T.vec(VEC, f32), q_f32_list)
+            q_f32_fly_vec = fx.Vector.from_elements(q_f32_list, dtype=fx.Float32)
             q_rmem = fx.make_rmem_tensor(full_lay, fx.Float32)
             fx.memref_store_vec(q_f32_fly_vec, q_rmem)
             x_f32 = fx.memref_load_vec(q_rmem)
@@ -1182,7 +1185,7 @@ def _build_kernel_w32(
             kv_off_dw = kv_off_elems >> 1
 
             kv_f32_list = _load_bf16_raw(kv_rsrc, kv_off_dw)
-            kv_f32_fly_vec = vector.from_elements(T.vec(VEC, f32), kv_f32_list)
+            kv_f32_fly_vec = fx.Vector.from_elements(kv_f32_list, dtype=fx.Float32)
             kv_rmem = fx.make_rmem_tensor(full_lay, fx.Float32)
             fx.memref_store_vec(kv_f32_fly_vec, kv_rmem)
             x_vec_f32 = fx.memref_load_vec(kv_rmem)
