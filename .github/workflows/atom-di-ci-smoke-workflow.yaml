@@ -26,9 +26,9 @@ on:
         type: string
         default: "/data/models2/GLM-5.2-FP8"
       run_glm_5_2_fp8:
-        description: "Run GLM-5.2-FP8 1P1D TP-only case (needs an image with the aiter MLA-metadata JIT op; crashes otherwise)"
+        description: "Run GLM-5.2-FP8 1P1D TP-only case"
         required: false
-        default: false
+        default: true
         type: boolean
       log_root:
         description: "Root directory for ATOMesh logs"
@@ -117,13 +117,9 @@ jobs:
                   return raw
               return str(raw).lower() == "true"
 
-          # GLM-5.2-FP8 disabled by default: the aiter build baked into
-          # rocm/atom-dev:latest crashes at init with
-          # "NameError: name 'module_mla_metadata' is not defined"
-          # (aiter/jit/core.py check_args, MLA-metadata JIT op) on the
-          # glm_moe_dsa MLA path -- independent of ATOM_REF (main crashes too).
-          # Re-enable once the image ships an aiter with that JIT op registered.
-          run_glm = bool_input("run_glm_5_2_fp8", False)
+          # Include GLM in scheduled runs; workflow_dispatch can disable it for
+          # targeted DeepSeek-only debugging.
+          run_glm = bool_input("run_glm_5_2_fp8", True)
 
           print(f"ATOM_REF={value('atom_ref', 'ATOM_REF_DEFAULT')}")
           print(f"ATOMESH_IMAGE={value('atomesh_image', 'ATOMESH_IMAGE_DEFAULT')}")
