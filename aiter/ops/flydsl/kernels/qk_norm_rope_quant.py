@@ -965,10 +965,14 @@ def _build_kernel_w32(
         pos_val_i64 = buffer_ops.buffer_load(pos_rsrc, bid_t, vec_width=1, dtype=T.i64)
         pos_i32 = fx.Int32(pos_val_i64.trunci(i32))
 
-        cos_rsrc = buffer_ops.create_buffer_resource(cos_cache, max_size=True)
-        sin_rsrc = buffer_ops.create_buffer_resource(sin_cache, max_size=True)
-        c_half_rd = fx.Int32(RD // 2)
-        cos_sin_row_base = pos_i32 * c_half_rd
+        rope_lay = fx.make_layout(PAIRS_PER_THREAD, 1)
+        rope_atom = fx.make_copy_atom(fx.rocdl.BufferCopy(PAIRS_PER_THREAD * 16), 16)
+        cos_buf = fx.rocdl.make_buffer_tensor(cos_cache)
+        sin_buf = fx.rocdl.make_buffer_tensor(sin_cache)
+        cos_row = fx.slice(cos_buf, (pos_i32, None))
+        sin_row = fx.slice(sin_buf, (pos_i32, None))
+        cos_div = fx.logical_divide(cos_row, rope_lay)
+        sin_div = fx.logical_divide(sin_row, rope_lay)
 
         def wave_reduce_add(x):
             w = fx.Float32(x)
@@ -996,21 +1000,12 @@ def _build_kernel_w32(
             VEC-wide fp32 vectors already loaded by the caller."""
             is_rope_t = tid >= fx.Int32(ROPE_THREAD_LO)
             rope_rel = _imax(tid - fx.Int32(ROPE_THREAD_LO), fx.Int32(0))
-            cs_off = cos_sin_row_base + rope_rel * fx.Int32(PAIRS_PER_THREAD)
-            if const_expr(PAIRS_PER_THREAD == 1):
-                cos_raw = buffer_ops.buffer_load(
-                    cos_rsrc, cs_off, vec_width=1, dtype=T.bf16
-                )
-                sin_raw = buffer_ops.buffer_load(
-                    sin_rsrc, cs_off, vec_width=1, dtype=T.bf16
-                )
-            else:
-                cos_raw = buffer_ops.buffer_load(
-                    cos_rsrc, cs_off, vec_width=PAIRS_PER_THREAD, dtype=T.bf16
-                )
-                sin_raw = buffer_ops.buffer_load(
-                    sin_rsrc, cs_off, vec_width=PAIRS_PER_THREAD, dtype=T.bf16
-                )
+            cos_rmem = fx.make_rmem_tensor(rope_lay, elem_dtype)
+            sin_rmem = fx.make_rmem_tensor(rope_lay, elem_dtype)
+            fx.copy_atom_call(rope_atom, fx.slice(cos_div, (None, rope_rel)), cos_rmem)
+            fx.copy_atom_call(rope_atom, fx.slice(sin_div, (None, rope_rel)), sin_rmem)
+            cos_raw = fx.memref_load_vec(cos_rmem)
+            sin_raw = fx.memref_load_vec(sin_rmem)
 
             x2 = x_f32_vec * x_f32_vec
             sq_local = x2.reduce(ReductionOp.ADD)
@@ -1080,13 +1075,14 @@ def _build_kernel_w32(
                 else:
                     scaled.append(xi * rstd)
 
+            cos_f32 = cos_raw.to(fx.Float32)
+            sin_f32 = sin_raw.to(fx.Float32)
             if const_expr(PAIRS_PER_THREAD == 1):
-                cos_vals = [cos_raw.extf(f32)]
-                sin_vals = [sin_raw.extf(f32)]
+                cos_vals = [cos_f32]
+                sin_vals = [sin_f32]
             else:
-                cos_v, sin_v = fx.Vector(cos_raw), fx.Vector(sin_raw)
-                cos_vals = [cos_v[i].to(fx.Float32) for i in range(PAIRS_PER_THREAD)]
-                sin_vals = [sin_v[i].to(fx.Float32) for i in range(PAIRS_PER_THREAD)]
+                cos_vals = [cos_f32[i] for i in range(PAIRS_PER_THREAD)]
+                sin_vals = [sin_f32[i] for i in range(PAIRS_PER_THREAD)]
 
             rotated = list(scaled)
             for k in range_constexpr(PAIRS_PER_THREAD):
