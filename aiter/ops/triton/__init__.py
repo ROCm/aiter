@@ -72,6 +72,7 @@ _BACKWARD_COMPAT_MAP = {
     "gemm_a8w8_per_token_scale": "gemm.basic.gemm_a8w8_per_token_scale",
     "gemm_a8w8": "gemm.basic.gemm_a8w8",
     "gluon.gemm_a8w8": "gemm.basic.gemm_a8w8",
+    "gluon.gemm_a8w8_blockscale": "gemm.basic.gemm_a8w8_blockscale",
     "gemm_a8wfp4": "gemm.basic.gemm_a8wfp4",
     "gemm_afp4wfp4_pre_quant_atomic": "gemm.basic.gemm_afp4wfp4_pre_quant_atomic",
     "gemm_afp4wfp4": "gemm.basic.gemm_afp4wfp4",

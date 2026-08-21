@@ -7,17 +7,19 @@ import torch.nn.functional as F
 
 from aiter.ops.shuffle import shuffle_weight
 from aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale import (
-    gemm_a8w8_blockscale,
     gemm_a8w8_blockscale_preshuffle,
-)
-from aiter.ops.triton.gluon.gemm_a8w8_blockscale import (
-    gemm_a8w8_blockscale as gluon_gfx950_gemm_a8w8_blockscale,
 )
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.types import get_fp8_dtypes, str_to_torch_dtype
+from op_tests.triton_tests.utils.gluon_paths import gluon_import_path
 
 block_shape = (128, 128)
 DEVICE_ARCH = arch_info.get_arch()
+
+
+# Gluon kernels were moved. This tests that the old import path and the new one
+# both are working.
+import_path = gluon_import_path("aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale")
 
 
 def run_torch(x, weight, x_scale, w_scale, dtype=torch.bfloat16):
@@ -185,20 +187,16 @@ def test_gemm(dtype, M, N, K, layout, output, backend, shuffle):
 
     a = run_torch(x, weight, x_scale, w_scale, dtype)
 
-    if not shuffle and backend == "gluon" and DEVICE_ARCH == "gfx950":
-        impl = gluon_gfx950_gemm_a8w8_blockscale
+    if shuffle:
+
+        def impl(x, w, xs, ws, dt, y):
+            return gemm_a8w8_blockscale_preshuffle(x, w, xs, ws, dt, y, backend=backend)
+
     else:
-        if shuffle:
+        mod = import_path(dtype, M, N, K, layout, output, backend)
 
-            def impl(x, w, xs, ws, dt, y):
-                return gemm_a8w8_blockscale_preshuffle(
-                    x, w, xs, ws, dt, y, backend=backend
-                )
-
-        else:
-
-            def impl(x, w, xs, ws, dt, y):
-                return gemm_a8w8_blockscale(x, w, xs, ws, dt, y, backend=backend)
+        def impl(x, w, xs, ws, dt, y):
+            return mod.gemm_a8w8_blockscale(x, w, xs, ws, dt, y, backend=backend)
 
     b = run_triton(x, weight_triton, x_scale_shuffled, w_scale, dtype, y, impl)
 
