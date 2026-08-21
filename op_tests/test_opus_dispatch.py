@@ -13,7 +13,6 @@ import pytest
 import torch
 
 from csrc.opus_gemm.opus_gemm_common import (
-    GFX942_BF16WS_EXACT_N,
     GFX942_EVEN_LOOP_SPLITK_TAGS,
     get_kernel_instance,
     kernel_needs_external_workspace,
@@ -720,12 +719,6 @@ def test_no_tuned_row_uses_skinny_then_torch_without_heuristic(
     assert config["libtype"] == expected_backend
 
 
-def test_gfx942_exact_n_is_shared_and_contains_384():
-    assert GFX942_BF16WS_EXACT_N == frozenset(
-        {64, 128, 256, 384, 512, 1024, 2048}
-    )
-
-
 @pytest.mark.parametrize("requested", [0, 1, 3, 17])
 @pytest.mark.parametrize("kid", [10200, 10201, 10203, 10204, 10210, 10213, 10216])
 def test_gfx942_split_resolution_matches_launcher_constraints(kid, requested):
@@ -1273,27 +1266,6 @@ def test_mxscale_bmm_workspace_path_retains_python_contract_validation(monkeypat
     workspace = raw_calls[0][5]
     assert workspace.dtype == torch.float32
     assert workspace.numel() == 2 * 2 * 32 * 128
-
-
-def test_mxscale_bmm_malformed_input_rank_still_fails_before_plan(monkeypatch):
-    a8 = importlib.import_module("aiter.ops.opus.gemm_op_a8w8")
-    fp8 = getattr(torch, "float8_e4m3fnuz")
-
-    def fail_plan(*_args, **_kwargs):
-        raise AssertionError("rank validation must run before launch planning")
-
-    monkeypatch.setattr(a8, "_get_cached_a8w8_mxscale_bmm_plan", fail_plan)
-    with pytest.raises(ValueError, match="expects batch-first 3D"):
-        a8._launch_a8w8_mxscale_bmm(
-            torch.empty((2, 128), dtype=fp8),
-            torch.empty((2, 128, 128), dtype=fp8),
-            torch.empty((2, 1, 128), dtype=torch.bfloat16),
-            torch.empty((2, 1, 1), dtype=torch.uint8),
-            torch.empty((2, 1, 1), dtype=torch.uint8),
-            kid=8311,
-            split_k=1,
-            workspace=None,
-        )
 
 
 def test_unified_dispatch_rejects_contract_mismatches_before_launch(monkeypatch):

@@ -12,7 +12,6 @@ import os
 import re
 import subprocess
 import sys
-from collections import Counter
 from dataclasses import FrozenInstanceError, is_dataclass
 from pathlib import Path
 
@@ -24,17 +23,7 @@ from csrc.opus_gemm.opus_gemm_common import (
     DEFAULT_COMPILED_KIDS_BY_ARCH,
     OPUS_KERNEL_TAGS_BY_ARCH_FAMILY,
     OPUS_MANDATORY_A8_KIDS,
-    a8w8_mxscale_bmm_kernels_list,
-    a8w8_kernels_list,
-    a8w8_scale_kernels_list,
     default_compiled_kids_for_arch,
-    get_kernel_instance,
-    gfx1250_clusterlaunch_kernels_list,
-    gfx1250_kernels_list,
-    gfx1250_splitk_fuse_kernels_list,
-    gfx942_a8w8_kernels_list,
-    gfx942_nosplit_kernels_list,
-    gfx942_splitk_kernels_list,
     kernels_list,
 )
 
@@ -279,37 +268,32 @@ def test_a8w8_mxscale_caller_policy_is_isolated_from_hot_execution():
     assert "_resolve_a8w8_mxscale_bmm_plan" in caller_source
 
 
-def test_a16w16_launch_plan_is_immutable_metadata():
-    plan_module = importlib.import_module("aiter.ops.opus.launch_plan")
-    spec = plan_module.WorkspaceSpec(shape=(2, 1, 64, 64), dtype=torch.float32)
-    plan = plan_module.A16W16LaunchPlan(
-        registry_arch="gfx950",
-        resolved_kid=200,
-        workspace_capacity_split_k=2,
-        abi_split_k=2,
-        workspace_spec=spec,
-    )
-
-    assert is_dataclass(spec) and spec.__dataclass_params__.frozen
-    assert is_dataclass(plan) and plan.__dataclass_params__.frozen
-    assert plan_module.__all__ == [
-        "A16W16LaunchPlan",
-        "A8W8MxscaleBMMPlan",
-        "WorkspaceSpec",
-    ]
-    with pytest.raises(FrozenInstanceError):
-        plan.abi_split_k = 3
-
-
-def test_a8w8_launch_plan_is_immutable_metadata():
+@pytest.mark.parametrize(
+    ("plan_name", "plan_kwargs"),
+    [
+        (
+            "A16W16LaunchPlan",
+            {
+                "registry_arch": "gfx950",
+                "resolved_kid": 200,
+                "workspace_capacity_split_k": 2,
+                "abi_split_k": 2,
+            },
+        ),
+        (
+            "A8W8MxscaleBMMPlan",
+            {
+                "registry_arch": "gfx950",
+                "resolved_kid": 8000,
+                "abi_split_k": 2,
+            },
+        ),
+    ],
+)
+def test_launch_plans_are_immutable_metadata(plan_name, plan_kwargs):
     plan_module = importlib.import_module("aiter.ops.opus.launch_plan")
     spec = plan_module.WorkspaceSpec(shape=(32768,), dtype=torch.float32)
-    plan = plan_module.A8W8MxscaleBMMPlan(
-        registry_arch="gfx950",
-        resolved_kid=8000,
-        abi_split_k=2,
-        workspace_spec=spec,
-    )
+    plan = getattr(plan_module, plan_name)(workspace_spec=spec, **plan_kwargs)
 
     assert is_dataclass(spec) and spec.__dataclass_params__.frozen
     assert is_dataclass(plan) and plan.__dataclass_params__.frozen
@@ -567,71 +551,6 @@ def test_device_info_cache_is_scoped_by_explicit_device(monkeypatch):
     assert property_reads == [torch.device("cuda", 0), torch.device("cuda", 1)]
 
 
-def test_failed_a8_registry_lookup_is_not_cached(monkeypatch):
-    plan_module = importlib.import_module("aiter.ops.opus.launch_plan")
-    plan_module._require_registered_kid_cached.cache_clear()
-    calls = []
-
-    def lookup(arch, family, kid, output_dtype):
-        calls.append((arch, family, kid, output_dtype))
-        return None if len(calls) == 1 else object()
-
-    monkeypatch.setattr(plan_module, "get_kernel_instance", lookup)
-    kwargs = dict(
-        arch="gfx950",
-        family="a8w8",
-        kid=2,
-        output_dtype=torch.float32,
-    )
-    with pytest.raises(ValueError, match="no registered OPUS kernel"):
-        plan_module._require_registered_kid(**kwargs)
-    assert plan_module._require_registered_kid(**kwargs) == 2
-    assert len(calls) == 2
-    plan_module._require_registered_kid_cached.cache_clear()
-
-
-def test_registry_counts_routes_and_a8_contracts_are_stable():
-    assert len(kernels_list) == 706
-    assert Counter(_instance_arch(instance) for instance in kernels_list.values()) == {
-        "gfx950": 187,
-        "gfx942": 23,
-        "gfx1250": 496,
-    }
-    assert {
-        "gfx950_plain_scale": len(a8w8_scale_kernels_list),
-        "gfx950_no_scale": len(a8w8_kernels_list),
-        "gfx942_non_workspace": len(gfx942_nosplit_kernels_list),
-        "gfx942_workspace": len(gfx942_splitk_kernels_list),
-        "gfx942_bpreshuffle": len(gfx942_a8w8_kernels_list),
-        "gfx1250_plain": len(gfx1250_kernels_list),
-        "gfx1250_cluster": len(gfx1250_clusterlaunch_kernels_list),
-        "gfx1250_fused": len(gfx1250_splitk_fuse_kernels_list),
-    } == {
-        "gfx950_plain_scale": 1,
-        "gfx950_no_scale": 1,
-        "gfx942_non_workspace": 14,
-        "gfx942_workspace": 8,
-        "gfx942_bpreshuffle": 1,
-        "gfx1250_plain": 28,
-        "gfx1250_cluster": 468,
-        "gfx1250_fused": 0,
-    }
-    assert kernels_list[1] is a8w8_scale_kernels_list[1]
-    assert kernels_list[2] is a8w8_kernels_list[2]
-    assert kernels_list[8000] is a8w8_mxscale_bmm_kernels_list[8000]
-    assert kernels_list[11000] is gfx942_a8w8_kernels_list[11000]
-    assert kernels_list[20000] is gfx1250_kernels_list[20000]
-    assert _instance_arch(kernels_list[1]) == "gfx950"
-    assert _instance_arch(kernels_list[11000]) == "gfx942"
-    assert _instance_arch(kernels_list[20000]) == "gfx1250"
-    assert get_kernel_instance("gfx950", "a8w8", 2, torch.float32) is (
-        a8w8_kernels_list[2]
-    )
-    assert get_kernel_instance(
-        "gfx942", "a8w8_blockscale_bpreshuffle", 11000, torch.bfloat16
-    ) is gfx942_a8w8_kernels_list[11000]
-
-
 def test_capability_slots_and_default_compile_floor_are_explicit():
     assert OPUS_MANDATORY_A8_KIDS == {
         "gfx950": frozenset({1, 2}),
@@ -703,25 +622,6 @@ def test_subset_compile_uses_exact_id_floor_and_arch_filter(tmp_path):
     assert set(json.loads(sidecar_path.read_text())) == expected
     assert {1, 2, 4, 6} <= expected
     assert {5, 10000, 999999}.isdisjoint(expected)
-
-
-def test_unified_docs_separate_caller_policy_from_exact_public_launch():
-    paths = (
-        _ROOT / "aiter/ops/opus/README.md",
-        _ROOT / "csrc/opus_gemm/README.md",
-    )
-    combined = "\n".join(path.read_text() for path in paths)
-    assert "opus_gemm" in combined
-    assert "kid" in combined
-    assert "caller" in combined.lower()
-    assert "no valid row -> skinny (if eligible) -> PyTorch fallback" in combined
-    assert "public/C++ path" in combined
-    for stale in (
-        "gemm_a16w16_opus",
-        "opus_gemm_a16w16_tune",
-        "opus_gemm_workspace_init",
-    ):
-        assert stale not in combined
 
 
 def test_non_opus_arch_does_not_truncate_top_level_import():

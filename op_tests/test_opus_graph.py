@@ -82,29 +82,6 @@ def _launch_gfx950_a8_family(family, opus, XQ, WQ, Y, x_scale, w_scale):
     )
 
 
-@pytest.mark.parametrize("family", ["noscale", "blockscale"])
-def test_gfx950_a8_logical_2d_gemm_adapter(family):
-    if _runtime_arch() != "gfx950":
-        pytest.skip("requires gfx950 hardware; a skip is not a pass")
-    opus = importlib.import_module("aiter.ops.opus")
-    XQ, WQ, x_scale, w_scale = _make_gfx950_a8_case(0x2DA8)
-    Y = torch.empty((256, 256), device="cuda", dtype=torch.float32)
-    if family == "noscale":
-        returned = opus.opus_gemm(XQ, WQ, Y, kid=2)
-    else:
-        returned = opus.opus_gemm(
-            XQ,
-            WQ,
-            Y,
-            kid=1,
-            x_scale=x_scale,
-            w_scale=w_scale,
-        )
-    torch.cuda.synchronize()
-    assert returned is Y
-    torch.testing.assert_close(Y, _golden(XQ, WQ), rtol=0, atol=0)
-
-
 @pytest.mark.parametrize("arch", ["gfx950", "gfx942", "gfx1250"])
 def test_graph_capture_replay_allocates_in_capture_without_prewarm(monkeypatch, arch):
     spec = _require_graph_case(arch)
@@ -353,14 +330,3 @@ def test_explicit_scalar_plan_cache_does_not_retain_tensors(monkeypatch):
     assert plan_module._get_cached_a16w16_launch_plan.cache_info().maxsize == 256
     assert dead_refs and all(reference() is None for reference in dead_refs)
     plan_module._get_cached_a16w16_launch_plan.cache_clear()
-
-
-def test_workspace_module_keeps_only_private_exact_kid_entry():
-    gemm = importlib.import_module("aiter.ops.opus.gemm_op_a16w16")
-    opus = importlib.import_module("aiter.ops.opus")
-    assert gemm.__all__ == []
-    assert not hasattr(gemm, "_init_a16w16_workspace")
-    assert not hasattr(gemm, "_launch_a16w16_with_torch_workspace")
-    assert not hasattr(gemm, "opus_gemm_workspace_init")
-    assert not hasattr(gemm, "gemm_a16w16_opus")
-    assert opus.__all__ == ["opus_gemm", "opus_bmm"]

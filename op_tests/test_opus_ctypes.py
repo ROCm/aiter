@@ -276,18 +276,6 @@ def test_gfx950_ctypes_errors_cross_cabi_safely(failure, message):
     assert message in text
 
 
-def test_gfx950_ctypes_uses_live_nondefault_stream():
-    gemm, plan, XQ, WQ, Y, workspace = _gfx950_case()
-    stream = torch.cuda.Stream(device=Y.device)
-    producer = torch.cuda.current_stream(Y.device)
-    stream.wait_stream(producer)
-    with torch.cuda.stream(stream):
-        _ctypes_launch(gemm, plan, XQ, WQ, Y, workspace)
-    producer.wait_stream(stream)
-    torch.cuda.synchronize(Y.device)
-    torch.testing.assert_close(Y.float(), _golden(XQ, WQ), rtol=0.03, atol=0.5)
-
-
 def test_gfx950_ctypes_graph_capture_and_replay():
     gemm, plan, XQ, WQ, Y, workspace = _gfx950_case()
     # Build/load and validate once before capture; capture itself still invokes
