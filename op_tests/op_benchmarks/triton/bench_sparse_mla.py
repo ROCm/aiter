@@ -3,14 +3,6 @@
 
 """Benchmark for sparse_mla_fwd (gfx950 gluon, separated-rope MLA).
 
-Both dot precisions are timed side by side, since the fp8 matrix-core path is
-the interesting one and only differs by a flag.
-
-A shape is num_seqs sequences of num_tokens query tokens each. Prefill and decode
-are the same operator here, one program per query token over that token's own
-gathered KV, so there is no phase to pick: num_tokens=1 is a decode step and
-anything above that is prefill.
-
 The cache is flushed between iterations by default, which matters: a decode shape
 runs up to twice as fast when the loop is allowed to re-read its KV out of cache.
 
@@ -47,12 +39,6 @@ _flush_buf = None
 
 
 def flush_l2():
-    """Push a buffer bigger than the last-level cache through it.
-
-    A benchmark loop re-reads the same KV every iteration, so without this the
-    gather is served from cache and the numbers describe the cache rather than
-    the gather. Any reuse inside a single launch is real and survives this.
-    """
     global _flush_buf
     if _flush_buf is None:
         _flush_buf = torch.empty(FLUSH_BYTES, dtype=torch.uint8, device="cuda")
@@ -60,13 +46,6 @@ def flush_l2():
 
 
 def device_time_ms(func, warmup=25, rep=100, flush=True):
-    """Mean GPU time per call, counting only this op's kernels.
-
-    do_bench would measure wall time instead, and a decode launch is small
-    enough that the wrapper's own python cost exceeds it, which is enough to make
-    the faster kernel look like the slower one. Filtering by kernel name also
-    keeps the cache flush out of the total.
-    """
     for _ in range(warmup):
         if flush:
             flush_l2()
@@ -92,11 +71,6 @@ def device_time_ms(func, warmup=25, rep=100, flush=True):
 
 def bytes_moved(num_tokens, num_heads, nnz, kv_elem_bytes, num_splits):
     """Bytes the launch actually moves, counting rows as gathered.
-
-    nnz is the summed per-token top-k length, so a row shared by several query
-    tokens counts once per token that reads it. That is what the kernel loads,
-    not the unique footprint. Split-K partials get written and read back by the
-    combine, so they count twice.
     """
     kv = nnz * D_QK * kv_elem_bytes           # the gather, and the bulk of it
     idx = nnz * 4                             # int32 index stream, read once
@@ -165,9 +139,6 @@ def run_benchmark(args):
     else:
         ylabel = "GB/s"
 
-    # "phase" is a label, not a knob: it is num_tokens read out loud. It also
-    # keeps the row from being all-numeric, which is what makes perf_report print
-    # the shape columns as ints instead of floats.
     x_vals_list = [
         ["decode" if tokens == 1 else "prefill", seqs, tokens, args.num_heads,
          args.context, args.topk]
@@ -200,9 +171,7 @@ def run_benchmark(args):
             device=q.device,
         )
         if dots == "fp8":
-            # Hand q over already quantized, the way production does. Letting
-            # the wrapper do it would put an amax and a cast inside the timed
-            # region, which is more than a decode launch costs.
+            # Hand q over already quantized, the way production does.
             cache, scale = kv_fp8, kv_scale
             q_scale = (q.float().abs().amax() / E4M3_MAX).clamp_min(1e-30).reshape(1)
             q = (
@@ -267,9 +236,7 @@ def main():
         type=str,
         choices=["time", "throughput", "bandwidth"],
         default="time",
-        help="metric to plot. bandwidth is the interesting one for a "
-        "gather-bound kernel, but an fp8 cache moves half the bytes of a bf16 "
-        "one, so only time compares the two precisions directly",
+        help="metric to plot",
     )
     args = parser.parse_args()
     over = [t for t in args.num_tokens if t > args.context]

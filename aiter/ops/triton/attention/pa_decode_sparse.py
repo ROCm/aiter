@@ -442,49 +442,6 @@ def _as_int32_contiguous_1d(x: torch.Tensor) -> torch.Tensor:
     return x.to(torch.int32).contiguous()
 
 
-def _decode_num_splits(
-    num_queries, heads_blocks, avg_main=0.0, avg_extra=0.0, block_k=64
-):
-    """Pick the split-K count by minimizing a cost model of the decode work:
-
-        cost(s) = waves(s) * iters(s)  +  GAMMA * s  +  DELTA * fill(s)
-        s = # splits
-    Tuned on gfx950 for DSv4 decode (H=16, D=512, BLOCK_K=64); split count is
-    capped at 16.
-    """
-    cu = max(1, get_num_sms())
-    base = max(1, num_queries * heads_blocks)
-    GAMMA, DELTA, FILL_CU = 0.32, 2.0, 0.75
-    thr = FILL_CU * cu
-    best_splits, best_cost = 1, None
-    for splits in range(1, 17):
-        m_it = math.ceil(math.ceil(avg_main / splits) / block_k) if avg_main > 0 else 0
-        e_it = (
-            math.ceil(math.ceil(avg_extra / splits) / block_k) if avg_extra > 0 else 0
-        )
-        waves = (base * splits + cu - 1) // cu
-        fill = max(0.0, 1.0 - base * splits / thr) / splits
-        cost = waves * (m_it + e_it) + GAMMA * splits + DELTA * fill
-        if best_cost is None or cost < best_cost - 1e-9:
-            best_splits, best_cost = splits, cost
-
-    # Collapse to the FEWEST splits that keeps both the wave count and the
-    # per-split BLOCK_K iteration count.
-    def _iters(s):
-        m = math.ceil(math.ceil(avg_main / s) / block_k) if avg_main > 0 else 0
-        e = math.ceil(math.ceil(avg_extra / s) / block_k) if avg_extra > 0 else 0
-        return m + e
-
-    def _waves(s):
-        return (base * s + cu - 1) // cu
-
-    if best_splits > 1:
-        target_waves, target_iters = _waves(best_splits), _iters(best_splits)
-        for splits in range(1, best_splits):
-            if _waves(splits) == target_waves and _iters(splits) == target_iters:
-                return splits
-    return best_splits
-
 
 def _decode_num_splits_occ(num_queries, heads_blocks, avg_main, avg_extra, block_k):
     """Split-K count for the gfx950 gluon kernel: fill the machine, but never
@@ -662,9 +619,7 @@ def _pa_decode_sparse_gfx950_gluon(
         )
         part_l = torch.empty_like(part_m)
         # bf16 partials halve both the split-K HBM traffic (~31% of the kernel's
-        # bytes) and the store count, and the mantissa bits that costs are well
-        # inside the error the fp8 KV format already carries. skip_reduce hands the
-        # partials back to the caller, so it keeps their dtype.
+        # bytes)
         part_acc = torch.empty(
             (num_queries, num_splits, num_heads, head_dim),
             dtype=torch.float32 if skip_reduce else torch.bfloat16,
@@ -700,10 +655,7 @@ def _pa_decode_sparse_gfx950_gluon(
     # than one split to give back.
     adaptive_splits = num_splits > 1
 
-    # Fuse the fp8 x E8M0 dequant into v_cvt_scalef32_pk_bf16_fp8 via inline asm:
-    # packed OCP fp8 only (uniform scales are f32, fnuz is a different encoding),
-    # bit-identical there because the scale is a power of two. It trades a shorter
-    # dependent chain for a wider live range
+    # Fuse the fp8 x E8M0 dequant into v_cvt_scalef32_pk_bf16_fp8 via inline asm
     asm_deq = one_wg_per_cu and not UNIFORM and not fp8_fnuz and main_is_fp8
 
     # Grid dim 0 varies fastest and XCD assignment is round-robin over the linear

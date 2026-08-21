@@ -7,17 +7,6 @@ decoupled rope, token-granular top-k gather.
 Prefill and decode are the same MQA operator on this path, one program per query
 token over that token's own gathered KV, so this serves both phases; the launcher
 picks the tile from what the grid supplies.
-
-Separated-rope sibling of ``pa_decode_sparse`` — both drive the same gluon
-kernel, but the calling structures differ enough to warrant separate APIs:
-DSv4 (rope inside the row, K == V, optional SWA + top-k two-loop, attention
-sink) stays on ``pa_decode_sparse``; MLA-lineage models (single top-k segment,
-no sink, QK over ``kv_lora_rank + qk_rope_head_dim``, V = the latent) use this.
-
-Follows the ``aiter.mla.mla_decode_fwd`` calling convention as vLLM's
-``ROCMAiterMLASparseImpl`` uses it, with two deviations: no head padding
-(H < 16 runs natively at BLOCK_M = next_pow2(H)) and q stays bf16 (no q-quant
-kernel; <1% accuracy effect).
 """
 
 import math
@@ -41,7 +30,7 @@ from aiter.ops.triton.utils.logger import AiterTritonLogger
 _LOGGER = AiterTritonLogger()
 
 # buffer_load carries a signed 32-bit offset; caches past this span gather
-# through 64-bit addresses (a production MLA pool crosses it at ~3.7M tokens).
+# through 64-bit addresses
 MAX_BYTES = 2**31 - 1
 
 # Tuned launch config (gfx950 / MI355). num_warps = BLOCK_K // 16 (warps tile
@@ -151,17 +140,9 @@ def _async_launch_config(
     workgroups to fill four waves/SIMD (prefill) the small tile takes that
     occupancy; otherwise (decode, where split-K caps the grid near two
     workgroups/CU) the large tile wins instead, by halving the cross-warp softmax
-    exchange rate per token. Keying on tokens-per-program misclassifies
-    high-concurrency decode, where the split policy backs off to a couple of splits.
-
-    Async is weakest at exactly one workgroup per CU, having then neither a second
-    workgroup to hide the copy nor the register path's in-wave prefetch; it stays on
-    because the surrounding shapes are parity.
+    exchange rate per token.
     """
     enabled = _ASYNC_LDS_DEFAULT
-    # The kernel static_asserts these; fall back rather than fail to trace. fp8 dots
-    # because the DMA can only deliver the cache's own code points; the rest because
-    # the async body has no masked variant and no per-tile validity vector.
     enabled = enabled and fp8_dots and uni_tile and not has_invalid and not has_extra
     workgroups = num_queries * heads_blocks * max(1, num_splits)
     num_sms = get_num_sms()
@@ -177,13 +158,6 @@ _E4M3_MAX = 448.0
 
 
 def _resolve_dot_precision(dot_precision: str, fmt: str, fp8_fnuz: bool) -> bool:
-    """True for the fp8 matrix-core path.
-
-    Every rejection below is the same constraint: the fp8 path needs the cache
-    scale to be one positive scalar, because that is what folds outside the tile
-    loop (K-side into qk_scale, V-side onto the accumulator). A scale that varies
-    along a dot's contraction axis cannot be folded out at all.
-    """
     if dot_precision not in ("bf16", "fp8"):
         raise ValueError(
             f"dot_precision must be 'bf16' or 'fp8', got {dot_precision!r}"
@@ -368,14 +342,10 @@ def sparse_mla_fwd(
         part_m = part_l = part_acc = out  # unused placeholders (never dereferenced)
         pm_stride0 = pm_stride_s = pa_stride0 = pa_stride_s = pa_stride_h = 0
 
-    # Dequant chunking: split the axis that keeps per-lane register repeats
-    # (rows at GATHER_TW1=32); waves_per_eu=2 caps the allocator at 256 VGPRs
-    # for the second occupancy slot, except when the launch cannot fill it.
+    # Dequant chunking
     col_reps = kv_lora_rank // (_GATHER_TW1 * 16)
     chunk_axis = 1 if col_reps >= 4 else 0
     nope_chunk = max(1, _BLOCK_K // 4) if chunk_axis == 0 else min(128, kv_lora_rank)
-    # UNI_TILE / HAS_EXTRA are literals at the launch below; passed so the policy
-    # owns every condition the kernel asserts on.
     async_lds_on, block_k, waves_per_eu = _async_launch_config(
         fp8_dots, has_invalid, num_queries, heads_blocks, num_splits, avg_topk,
         use_buffer_load, uni_tile=True, has_extra=False,
@@ -465,8 +435,7 @@ def sparse_mla_fwd(
     if skip_reduce:
         return part_acc, part_m, part_l
 
-    # One head per reduce workgroup: the combine is pure bandwidth, so size the
-    # grid for coverage, not for the attention kernel's tile.
+    # One head per reduce workgroup
     rgrid = (num_queries, num_heads)
     _pa_decode_sparse_reduce_gfx950[rgrid](
         part_m,
