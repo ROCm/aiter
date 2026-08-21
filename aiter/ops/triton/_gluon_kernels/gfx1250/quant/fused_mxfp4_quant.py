@@ -460,8 +460,8 @@ def _gluon_fused_dynamic_mxfp4_quant_moe_sort_kernel(
 
     # layout descriptor for quantize stage
     gLayout2d: gl.constexpr = gl.BlockedLayout(
-        [BLOCK_SIZE_Mx // 8, 2],
-        [2, 16],
+        [BLOCK_SIZE_Mx // 32, 8],
+        [8, 4],
         [4, 1],
         [1, 0],
     )
@@ -595,7 +595,6 @@ def _gluon_fused_dynamic_mxfp4_quant_moe_sort_kernel(
             [pid_m * BLOCK_SIZE_Mx, pid_n * MXFP4_QUANT_BLOCK_SIZE // 2],
             smem_x_fp4,
         )
-        gl.amd.gfx1250.tdm.async_wait(0)
 
         return
 
