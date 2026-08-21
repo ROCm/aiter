@@ -273,11 +273,23 @@ __device__ inline auto make_layout_kv_indices(int warp_id, int lane_id)
     constexpr int threads_d = T::smem_d_per_wave_kv / T::VEC_KV; // lanes covering one chunk
     constexpr int blk_grp   = T::smem_n_rpt_kv / 2;              // blocks sharing a token run
 
+    // Above PAGE_SIZE 1 this layout addresses a block table, so its offset must be the
+    // token's page (token / PAGE_SIZE) rather than the token. The deal makes that a matter
+    // of shrinking one extent: the token index comes out
+    //   tok = 64 * (warp_id / blk_grp) + 32 * (row % 2) + 4 * (row / 2) + warp_id % blk_grp
+    // (strides derived from the shape below; verified against the built layout), and only
+    // the last term is finer than blk_grp = 4. Dividing that extent and its coordinate by
+    // PAGE_SIZE halves every derived stride with it, which is exactly tok / PAGE_SIZE --
+    // exact because the other three strides are all multiples of 4. The leftover
+    // tok % PAGE_SIZE is warp_id % PAGE_SIZE, wave-uniform, and the caller folds it into
+    // the page offset. PAGE_SIZE > 4 would make that residue per-lane; hence the cap.
+    static_assert(blk_grp % T::PAGE_SIZE == 0, "the token deal must split on PAGE_SIZE");
+
     constexpr auto kv_indices_shape =
         opus::make_tuple(opus::number<T::smem_n_rpt_kv / blk_grp>{},              // block group
                          opus::number<T::smem_n_per_wave_kv / T::SWZ_TOK_BIT>{},  // row % 2
                          opus::number<T::SWZ_TOK_BIT>{},                          // row / 2
-                         opus::number<blk_grp>{},                                 // block in group
+                         opus::number<blk_grp / T::PAGE_SIZE>{},                  // block in group
                          1_I);
 
     constexpr auto kv_indices_dim = opus::make_tuple(opus::make_tuple(
@@ -291,7 +303,7 @@ __device__ inline auto make_layout_kv_indices(int warp_id, int lane_id)
                                                   opus::tuple{warp_id / blk_grp,
                                                               row % 2,
                                                               row / 2,
-                                                              warp_id % blk_grp}));
+                                                              (warp_id % blk_grp) / T::PAGE_SIZE}));
 }
 
 // KV global source, d in [0, D_HEAD_SIZE) of the combined buffer. The token dimension is
@@ -840,7 +852,7 @@ attn_mask_kv_tile(V& v_s, int last_valid_kv_pos, int kv_base_pos, opus::u32_t ne
 // Q, the O accumulator and the online-softmax state (m_row / l_row) are owned by the
 // caller and passed by reference, so a split-KV request can run several tile ranges into
 // the same accumulator.
-template <class Traits, bool STAGGER, class VO>
+template <class Traits, bool STAGGER_DEL, class VO>
 __device__ __attribute__((always_inline)) void
 mla_decode_fwd_pipelined(mla_kargs kargs,
                          int kv_ind_ptr_s,
@@ -866,6 +878,7 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
     int lane_id = thread_id_x() % T::WARP_SIZE;
     asm volatile("" : "+v"(lane_id));
     const int warp_id = __builtin_amdgcn_readfirstlane(thread_id_x() / T::WARP_SIZE);
+    const int STAGGER = warp_id / 4;
     int diag_kv_bound = 0;
     if constexpr(T::CAUSAL)
     {
@@ -883,8 +896,11 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
                   q_len * kargs.stride_q_b * sizeof(D_Q));
 
     const D_K* kv_base = reinterpret_cast<const D_K*>(kargs.kv_buffer_ptr);
-    // kv_indices always stays on a descriptor -- it is int-indexed and never large.
-    auto g_kv_indices = make_gmem(kargs.kv_indices + kv_ind_ptr_s, valid_kv_len * sizeof(int));
+    // kv_indices always stays on a descriptor -- it is int-indexed and never large. It holds
+    // one entry per page, and valid_kv_len is in tokens, so the bound is the page count; the
+    // last page may be partial, hence ceil.
+    auto g_kv_indices = make_gmem(kargs.kv_indices + kv_ind_ptr_s,
+                                  ceil_div(valid_kv_len, T::PAGE_SIZE) * sizeof(int));
 
     // Q sits in front of the KV ring and outside the slot rotation: it is written once per
     // work item and read by every wave for the whole tile range. smem_q_bytes is a multiple
@@ -967,16 +983,32 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
     D_ACC row_max;
     bool below_thresh, all_below;
 
+    // u_kv_indices offsets in pages, so the tile stride has to be in pages too. Exact:
+    // KV_TILE_SIZE * NUM_WARPS is 128 and PAGE_SIZE divides 4.
+    static_assert((T::KV_TILE_SIZE * T::NUM_WARPS) % T::PAGE_SIZE == 0,
+                  "a KV tile must hold a whole number of pages");
+    constexpr int kv_tile_pages = T::KV_TILE_SIZE * T::NUM_WARPS / T::PAGE_SIZE;
+
     auto load_kv_page = [&](int tile_idx) {
-        return load(g_kv_indices, u_kv_indices, tile_idx * T::KV_TILE_SIZE * T::NUM_WARPS)[0];
+        return load(g_kv_indices, u_kv_indices, tile_idx * kv_tile_pages)[0];
     };
 
-    auto kv_page_offset = [&](int token_idx) {
+    // Which token of its page this wave is fetching. Wave-uniform by construction of the
+    // token deal (see make_layout_kv_indices), so it stays in an SGPR; folds to a constant
+    // 0 at PAGE_SIZE 1, which is what keeps that path byte-identical to before paging.
+    const int tok_in_page = warp_id % T::PAGE_SIZE;
+
+    // A page is PAGE_SIZE contiguous token rows, so the physical row of the token this
+    // lane wants is page_idx * PAGE_SIZE + tok_in_page. stride_kv_page is the per-token
+    // row stride, deliberately not the paged tensor's dim-0 stride.
+    auto kv_page_offset = [&](int page_idx) {
         if constexpr(T::LARGE_KV)
-            return static_cast<int64_t>(token_idx) * kargs.stride_kv_page;
+            return (static_cast<int64_t>(page_idx) * T::PAGE_SIZE + tok_in_page) *
+                   kargs.stride_kv_page;
         else
-            return static_cast<int>(static_cast<unsigned>(token_idx) *
-                                    static_cast<unsigned>(kargs.stride_kv_page));
+            return static_cast<int>(
+                (static_cast<unsigned>(page_idx) * T::PAGE_SIZE + tok_in_page) *
+                static_cast<unsigned>(kargs.stride_kv_page));
     };
 
     auto async_load_kv = [&](auto* s_kv_ptr, int kv_page) {
@@ -1079,7 +1111,7 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
     s_waitcnt_vmcnt(number<T::kv_buffer_load_insts>{});
     stage_end_barrier();
 
-    if constexpr(STAGGER)
+    if (STAGGER)
     {
         stage_end();
     }
@@ -1121,25 +1153,25 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
         // worth filling. m_row already covers tile t-1: its head ran in the last stage3.
         __builtin_amdgcn_s_setprio(1);
         vs_cur = mma0(v_q, v_k, 0, 0);
-        if constexpr(!STAGGER)
+        if (!STAGGER)
         {
             stage_end();
         }
         softmax_tile(vs_prev);
         auto p_prev = cast<D_K>(vs_prev);
         store<T::VEC_WRITE_P>(s_p, p_prev, u_sp);
+        async_load_kv(s_kv[cur_slot].ptr, nxt_page);
         s_waitcnt_lgkmcnt(0_I);
+        s_waitcnt_vmcnt(number<T::kv_buffer_load_insts>{});
         stage_end_barrier();
 
         // stage2 [mem]: V(t-1); mask S(t) before stage4's softmax head folds it in.
-        if constexpr(STAGGER)
+        if (STAGGER)
         {
             stage_end();
         }
         load_p(v_p);
-        async_load_kv(s_kv[cur_slot].ptr, nxt_page);
         s_waitcnt_lgkmcnt(0_I);
-        s_waitcnt_vmcnt(number<T::kv_buffer_load_insts>{});
         stage_end_barrier();
 
         // stage3 [compute]: gemm1 PV(t-1) [4 MFMA] || softmax-head(t) -- the row max of the
@@ -1191,7 +1223,7 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
     // Only this part is under the parity branch; keeping the V read and the PV outside it
     // is what keeps v_o off scratch.
     auto epilogue_tail = [&](auto& vs_last, int last_slot) {
-        if constexpr(!STAGGER)
+        if (!STAGGER)
         {
             stage_end();
         }
@@ -1215,12 +1247,6 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
     else
         epilogue_tail(v_s[0], 0);
 
-
-    // Stagger: the group that skipped the prologue barrier does its extra one here.
-    // if constexpr(!STAGGER)
-    // {
-    //     __builtin_amdgcn_s_barrier();
-    // }
 }
 
 // --- One work item: load Q, run the tile range, normalize and store O (+ LSE) ---
@@ -1249,20 +1275,49 @@ mla_decode_fwd_one_req(mla_kargs kargs, int w, char* smem_buffer, float temperat
     const int kv_ind_ptr_e               = work_item[5];
     [[maybe_unused]] const int kv_offset = work_item[6];
 
-    const int q_len        = q_len_ptr_e - q_len_ptr_s;
-    const int valid_kv_len = kv_ind_ptr_e - kv_ind_ptr_s;
+    const int q_len = q_len_ptr_e - q_len_ptr_s;
+
+    // work_info's kv_start / kv_end are PAGE indices (the metadata emits them that way for
+    // every page size), while everything downstream -- tiling, masking, the causal diagonal
+    // -- counts tokens. At PAGE_SIZE 1 the two coincide and this all folds away. Above it,
+    // the batch's last page is partial, and kv_offset == 0 is the metadata's marker for
+    // "this item ends at the batch tail", i.e. the only case where that page is in range.
+    // One scalar load, not one per use: both the token count and the causal diagonal convert
+    // a page count to tokens the same way, and loading it twice cost 2 spilled SGPRs.
+    int last_page_len = T::PAGE_SIZE;
+    if constexpr(T::PAGE_SIZE > 1)
+    {
+        last_page_len = __builtin_amdgcn_readfirstlane(kargs.kv_last_page_lens[batch_idx]);
+    }
+    // pages -> tokens for a run that ends at the batch tail, where the last page is partial.
+    auto pages_to_tokens = [&](int pages) {
+        if constexpr(T::PAGE_SIZE == 1)
+            return pages;
+        else
+            return (pages - 1) * T::PAGE_SIZE + last_page_len;
+    };
+
+    const int kv_pages = kv_ind_ptr_e - kv_ind_ptr_s;
+    // kv_offset != 0 means the metadata handed this item an interior run, so every one of
+    // its pages is full; only the tail item can see the partial one.
+    const int valid_kv_len = (T::PAGE_SIZE == 1 || kv_offset != 0)
+                                 ? kv_pages * T::PAGE_SIZE
+                                 : pages_to_tokens(kv_pages);
     const int num_kv_tiles = ceil_div(valid_kv_len, T::KV_TILE_SIZE * T::NUM_WARPS);
     if(num_kv_tiles == 0)
         return;
 
     // Only the causal specialization needs the diagonal, so the two indptr scalar loads it
-    // costs disappear entirely from the decode-only build.
+    // costs disappear entirely from the decode-only build. kv_indptr is in pages like
+    // kv_ind_ptr_s, and the run it measures always ends at the batch tail.
     int causal_diagonal = 0;
     if constexpr(T::CAUSAL)
     {
-        causal_diagonal = q_len_ptr_s - kv_ind_ptr_s +
-                          __builtin_amdgcn_readfirstlane(kargs.kv_indptr[batch_idx + 1]) -
-                          __builtin_amdgcn_readfirstlane(kargs.q_indptr[batch_idx + 1]);
+        causal_diagonal =
+            q_len_ptr_s +
+            pages_to_tokens(__builtin_amdgcn_readfirstlane(kargs.kv_indptr[batch_idx + 1]) -
+                            kv_ind_ptr_s) -
+            __builtin_amdgcn_readfirstlane(kargs.q_indptr[batch_idx + 1]);
     }
 
     // Per-tensor descale folded into the two places it can be a single scalar multiply:
@@ -1380,17 +1435,14 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE,
         // __builtin_amdgcn_sched_barrier(0);
         // __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
-        // No STAGGER here, and it is not a tuning choice: the softmax reductions are
-        // cross-wave (attn_row_max / attn_row_sum swap through s_m / s_l), so all NUM_WARPS
-        // waves have to sit on the same tile. Skewing two wave groups by a stage would pair
-        // their barriers across different tiles and merge unrelated rows.
-        // mla_decode_fwd_one_req<Traits, false>(kargs, w, smem_buffer, temperature_scale);
 
-        if(warp_id / 4)
-            mla_decode_fwd_one_req<Traits, true>(kargs, w, smem_buffer, temperature_scale);
-        __builtin_amdgcn_sched_barrier(0);
-        if(!(warp_id / 4))
-            mla_decode_fwd_one_req<Traits, false>(kargs, w, smem_buffer, temperature_scale);
+        mla_decode_fwd_one_req<Traits, false>(kargs, w, smem_buffer, temperature_scale);
+
+        // if(warp_id / 4)
+        //     mla_decode_fwd_one_req<Traits, true>(kargs, w, smem_buffer, temperature_scale);
+        // __builtin_amdgcn_sched_barrier(0);
+        // if(!(warp_id / 4))
+        //     mla_decode_fwd_one_req<Traits, false>(kargs, w, smem_buffer, temperature_scale);
     }
 }
 

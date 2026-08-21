@@ -880,7 +880,9 @@ def mla_decode_fwd(
             and get_gfx() == "gfx950"
             and q.dtype == dtypes.fp8
             and kv_buffer.dtype == dtypes.fp8
-            and page_size == 1
+            # 16mx1 (nhead 16, one query token) addresses a real block table; every other
+            # opus shape routes to 16mx8, which has not been ported past one token per page.
+            and (page_size in (1, 2, 4) if max_seqlen_q == 1 else page_size == 1)
             and q_scale is not None
             and kv_scale is not None
         )

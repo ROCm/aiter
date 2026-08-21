@@ -43,9 +43,9 @@ AITER_CTYPES_ERROR_DEF
 // single query token needs no diagonal either way -- it then sits at the end of
 // the KV run and masks nothing -- so max_seqlen_q == 1 keeps the build that only
 // masks out-of-bounds columns even when causal is asked for.
-template <bool CAUSAL, bool LARGE_KV = false>
+template <bool CAUSAL, bool LARGE_KV = false, int PAGE_SIZE = 1>
 using OpusTraits16mx1C =
-    mla_16mx1_16nx8_fp8fp8_ps_traits<16, 16, 8, fp8_t, fp8_t, bf16_t, CAUSAL, LARGE_KV>;
+    mla_16mx1_16nx8_fp8fp8_ps_traits<16, 16, 8, fp8_t, fp8_t, bf16_t, CAUSAL, LARGE_KV, PAGE_SIZE>;
 template <bool CAUSAL, bool LARGE_KV = false>
 using OpusTraits16mx8C =
     mla_16mx8_32nx1_fp8fp8_ps_traits<16, 32, 8, fp8_t, fp8_t, bf16_t, CAUSAL, LARGE_KV>;
@@ -105,6 +105,32 @@ void launch_opus_mla_decode(bool causal,
         launch(TraitsC<false, false>{});
 }
 
+// Same causal x large_kv fan-out as above, with PAGE_SIZE pinned by the caller. Spelled out
+// rather than routed through launch_opus_mla_decode because that takes a two-parameter
+// template template argument and 16mx8 still wants exactly that shape.
+template <int PAGE_SIZE>
+void launch_16mx1_paged(bool causal,
+                        int max_seqlen_q,
+                        bool large_kv,
+                        int num_workers,
+                        hipStream_t stream,
+                        const mla_kargs& kargs)
+{
+    const bool use_causal = causal && max_seqlen_q > 1;
+    auto launch           = [&](auto traits) {
+        using Traits = decltype(traits);
+        OpusLaunch16mx1::template launch<Traits>(num_workers, stream, kargs);
+    };
+    if(use_causal && large_kv)
+        launch(OpusTraits16mx1C<true, true, PAGE_SIZE>{});
+    else if(use_causal)
+        launch(OpusTraits16mx1C<true, false, PAGE_SIZE>{});
+    else if(large_kv)
+        launch(OpusTraits16mx1C<false, true, PAGE_SIZE>{});
+    else
+        launch(OpusTraits16mx1C<false, false, PAGE_SIZE>{});
+}
+
 AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     mla_decode_fwd_opus_stage1,
     (aiter_tensor_t * q,                // [num_seqs, H, 576]    fp8 (merged nope+rope)
@@ -151,10 +177,17 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     const std::string gfx = get_gpu_arch();
     AITER_CHECK(
         gfx == "gfx950", __func__, ": unsupported GPU arch '", gfx, "' (supported: gfx950).");
-    AITER_CHECK(page_size == 1, __func__, ": only page_size==1 supported, got ", page_size);
+    // 16mx1 addresses a real block table; 16mx8 has not been ported, so it still needs 1.
+    // 4 is allowed but buys ~0.5% over 2 -- see the PAGE_SIZE note in the traits.
+    AITER_CHECK(page_size == 1 || page_size == 2 || page_size == 4,
+                __func__,
+                ": page_size must be 1, 2 or 4, got ",
+                page_size);
 
-    const int H            = q->size(1);
-    const int total_tokens = kv->size(0);
+    const int H = q->size(1);
+    // kv is [total_tokens, D] at page_size 1 and [num_page, page_size, 1, D] above it, so
+    // dim 0 counts pages either way and the token count is that times the page size.
+    const int total_tokens = static_cast<int>(kv->size(0)) * page_size;
     const int num_workers  = work_indptr->size(0) - 1;
     const bool use_16mx1   = opus_use_16mx1_kernel(H, max_seqlen_q);
     const bool use_16mx8   = opus_use_16mx8_kernel(H, max_seqlen_q);
@@ -206,7 +239,24 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     const int stride_q_h     = static_cast<int>(q->stride(1));
     const int stride_o_b     = static_cast<int>(out->stride(0));
     const int stride_o_h     = static_cast<int>(out->stride(1));
-    const int stride_kv_page = static_cast<int>(kv->stride(0));
+    // kargs.stride_kv_page is the per-TOKEN row stride, not the paged tensor's dim-0 stride:
+    // the kernel steps whole pages by scaling it by PAGE_SIZE. Deriving it by division keeps
+    // one expression correct for both the 2-D and the 4-D layout, and the exactness check is
+    // what catches a non-contiguous page.
+    AITER_CHECK(kv->stride(0) % page_size == 0,
+                __func__,
+                ": kv dim-0 stride ",
+                kv->stride(0),
+                " must be a multiple of page_size ",
+                page_size,
+                " (pages must be contiguous in tokens)");
+    const int stride_kv_page = static_cast<int>(kv->stride(0)) / page_size;
+    AITER_CHECK(stride_kv_page == D_HEAD_SIZE,
+                __func__,
+                ": kv token stride must be ",
+                D_HEAD_SIZE,
+                ", got ",
+                stride_kv_page);
     AITER_CHECK(stride_q_h == D_HEAD_SIZE,
                 __func__,
                 ": q head stride must be ",
@@ -241,6 +291,12 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     kargs.q_indptr      = static_cast<const int*>(qo_indptr->data_ptr());
     kargs.kv_indptr     = static_cast<const int*>(kv_indptr->data_ptr());
     kargs.kv_indices    = static_cast<const int*>(kv_indices->data_ptr());
+    // Only the paged builds read it, and only for the work item at a batch tail; left null
+    // at page_size 1 so nothing can quietly start depending on it there.
+    kargs.kv_last_page_lens =
+        (page_size > 1 && kv_last_page_lens && kv_last_page_lens->numel() > 0)
+            ? static_cast<const int*>(kv_last_page_lens->data_ptr())
+            : nullptr;
     kargs.work_indptr   = static_cast<const int*>(work_indptr->data_ptr());
     kargs.work_info_set = static_cast<const int*>(work_info_set->data_ptr());
     kargs.H             = H;
@@ -267,9 +323,23 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     const bool large_kv = kv_bytes >= (int64_t{1} << 32);
 
     if(use_16mx1)
-        launch_opus_mla_decode<OpusTraits16mx1C, OpusLaunch16mx1>(
-            causal, max_seqlen_q, large_kv, num_workers, stream, kargs);
+    {
+        // PAGE_SIZE is a fourth specialization axis on top of causal x large_kv, so each
+        // value costs a whole extra kernel in the binary. Only the sizes that pay are here.
+        if(page_size == 1)
+            launch_16mx1_paged<1>(causal, max_seqlen_q, large_kv, num_workers, stream, kargs);
+        else if(page_size == 2)
+            launch_16mx1_paged<2>(causal, max_seqlen_q, large_kv, num_workers, stream, kargs);
+        else
+            launch_16mx1_paged<4>(causal, max_seqlen_q, large_kv, num_workers, stream, kargs);
+    }
     else
+    {
+        AITER_CHECK(page_size == 1,
+                    __func__,
+                    ": the 16mx8 kernel only supports page_size==1, got ",
+                    page_size);
         launch_opus_mla_decode<OpusTraits16mx8C, OpusLaunch16mx8>(
             causal, max_seqlen_q, large_kv, num_workers, stream, kargs);
+    }
 }

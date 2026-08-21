@@ -23,6 +23,12 @@ struct mla_kargs
     const int* __restrict__ kv_indptr;
     const int* __restrict__ kv_indices;
 
+    // Per-batch length of the last KV page, in tokens (1..page_size). Read only when
+    // PAGE_SIZE > 1 and the work item covers the batch tail (kv_offset == 0), where that
+    // page is partial and the page range in work_info would overstate the token count.
+    // May be null when PAGE_SIZE == 1.
+    const int* __restrict__ kv_last_page_lens;
+
     const int* __restrict__ work_indptr;
     const int* __restrict__ work_info_set;
 
@@ -32,6 +38,10 @@ struct mla_kargs
     int stride_q_h;
     int stride_o_b;
     int stride_o_h;
+    // Elements between consecutive token rows of the KV cache. Deliberately NOT the dim-0
+    // stride once the cache is paged: a [num_page, page_size, 1, D] tensor strides
+    // page_size * D on dim 0, and the kernel steps whole pages by scaling this by
+    // PAGE_SIZE itself.
     int stride_kv_page;
     float softmax_scale;
 };
@@ -187,13 +197,30 @@ template <int Q_TILE_SIZE_  = 16,
           typename D_K_     = fp8_t,
           typename D_OUT_   = bf16_t,
           bool CAUSAL_      = false,
-          bool LARGE_KV_    = false>
+          bool LARGE_KV_    = false,
+          int PAGE_SIZE_    = 1>
 struct mla_16mx1_16nx8_fp8fp8_ps_traits
 {
     static constexpr int Q_TILE_SIZE  = Q_TILE_SIZE_;
     static constexpr int KV_TILE_SIZE = KV_TILE_SIZE_;
     static constexpr int NUM_WARPS    = NUM_WARPS_;
     static constexpr bool CAUSAL      = CAUSAL_;
+    // Tokens per KV page. At 1, kv_indices is a per-token table; above that it is a block
+    // table indexed by token / PAGE_SIZE and a page is PAGE_SIZE contiguous token rows.
+    //
+    // Worth having only because a 576-byte token row is 4.5 cache lines, so a row fetched
+    // in isolation drags in 640 bytes -- measured 1.113x more DRAM traffic than the kernel
+    // consumes. Two adjacent rows come to exactly 9 lines, which recovers it: a read-only
+    // bandwidth probe on gfx950 measures 5.44 TB/s for scattered 576-byte rows against
+    // 6.04 TB/s for 1152-byte pairs, out of a 6.29 TB/s coalesced ceiling. PAGE_SIZE 4
+    // adds ~0.5% over 2, which is where this stops paying.
+    //
+    // Capped at 4 because the within-page token offset has to stay wave-uniform: the DMA
+    // deals token (warp_id % 4) + 4k to warp_id, so token % PAGE_SIZE is a function of
+    // warp_id alone up to 4 and becomes per-lane at 8.
+    static constexpr int PAGE_SIZE = PAGE_SIZE_;
+    static_assert(PAGE_SIZE == 1 || PAGE_SIZE == 2 || PAGE_SIZE == 4,
+                  "PAGE_SIZE must be 1, 2 or 4");
     // KV cache past the 4 GiB a buffer descriptor can address; see the KV load in
     // mla_decode_fwd_16mx1_16nx8_fp8fp8_ps_opus.hpp. Costs ~1-2% and 3 spilled VGPR, so
     // the host only turns it on for the caches that need it.
