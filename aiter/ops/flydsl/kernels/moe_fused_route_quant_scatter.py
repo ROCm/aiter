@@ -44,10 +44,10 @@ position ``slot`` in expert ``e`` and MX block ``mx_block`` (with
     scale_tile  = slot // (wmma_rep*16)
     wmma_row    = (slot % (wmma_rep*16)) // 16
     row_lane16  = slot % 16
-    out_row     = scale_tile*16 + row_lane16
     dst_dword   = e*(max_m*scale_dwords_per_row)
-                  + out_row*(scale_dwords_per_row*wmma_rep)
-                  + scale_dword*wmma_rep + wmma_row
+                  + scale_tile*(scale_dwords_per_row*wmma_rep*16)
+                  + scale_dword*wmma_rep*16
+                  + wmma_row*16 + row_lane16
     dst_byte    = dst_dword*4 + byte_in_dword
 
 Each warp writes only its own (valid) row; padding rows are never touched, which
@@ -441,7 +441,9 @@ def _emit_quant_block_loop(c: SimpleNamespace) -> None:
             # one e8m0 byte per block, written by the block's lead lane.
             _if_lead = scf.IfOp(_raw(c.is_block_lead))
             with ir.InsertionPoint(_if_lead.then_block):
-                dst_scale_dword = dst.scale_row_dword_base + scale_dword * c.c_wmma_rep
+                dst_scale_dword = (
+                    dst.scale_row_dword_base + scale_dword * c.c_wmma_rep * 16
+                )
                 dst_scale_byte = dst_scale_dword * c.c4_i32 + byte_in_dword
                 buffer_ops.buffer_store(e8m0_byte, c.scale_rsrc, dst_scale_byte)
                 scf.YieldOp([])
