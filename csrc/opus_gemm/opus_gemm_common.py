@@ -64,7 +64,15 @@ class OpusGemmInstance:
     # Optional generated name tag override for same-pipeline variants.
     name_tag: str = ""
     # SplitK workspace storage dtype; splitK launchers still use fp32 tune dispatch.
-    splitk_workspace_dtype: str = "fp32_t"
+    # Split-K partial type. bf16 halves what the reduce reads back and what the
+    # sweep allocates, and it clears the gate the tuner actually applies: at
+    # rtol=atol=5e-2, which is what a bf16 output gets, err_ratio measures
+    # 0.004-0.012 against a 0.05 line, flat from split_k=1 to 16 and flat across
+    # shapes. It is genuinely the coarser choice -- against a 1e-2 tolerance the
+    # same partials fail from split_k=2 on -- so a consumer needing more than the
+    # output dtype's own precision wants fp32 here instead, at twice the
+    # workspace and twice the reduce's read traffic.
+    splitk_workspace_dtype: str = "bf16_t"
 
     # gfx1250 cluster/TDM split-K consumer tiling: "tileN" (split N) or
     # "tileM" (split M). Only consumed by the a16w16_cluster_tdm_splitk_ws tag.

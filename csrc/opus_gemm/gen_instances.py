@@ -154,8 +154,7 @@ def _splitk_reduce_baseline_instantiations(
     reduce_kernel, ws_ptr_type, has_oob, vec=16, block=64, split_ks=(None,), d_ws=None
 ):
     # gfx1250 tunes the reduce to VEC=8/BLOCK=128 (coalesced dwordx4 bf16 store,
-    # no cross-lane shuffle), a bf16 workspace (d_ws="__bf16", half the reduce read
-    # traffic), and a COMPILE-TIME split_k (SPLIT_K_ template) dispatched per
+    # no cross-lane shuffle), a per-kid partial type (d_ws), and a COMPILE-TIME split_k (SPLIT_K_ template) dispatched per
     # value -> split_ks lists every value the launch helper switches on (0 = the
     # runtime-`split_k` fallback, 1..16 = fully-unrolled). gfx950/gfx942 keep the
     # legacy 6-param VEC=16/BLOCK=64 fp32-workspace form (split_ks=(None,)).
@@ -226,6 +225,11 @@ NOSCALE_TAGS = A16W16_TUNE_TAGS | {"a8w8"}
 
 # SplitK tags live in the <fp32_t> dispatch slot; each instance's traits pick
 # the actual workspace dtype and the reduce launcher writes the requested Y.
+# For the two _ws families that slot is NOT the output dtype at all -- it is
+# the split-K PARTIAL type (traits D_C), which the main kernel stores and the
+# reduce reads, so it must be instantiated from the kid's own
+# splitk_workspace_dtype. Getting this wrong is a page fault, not a wrong
+# number: the host sizes the buffer from the same field.
 SPLITK_TAGS = {
     "a16w16_flatmm_splitk",
     "a16w16_cluster_tdm_splitk_ws",
@@ -236,6 +240,19 @@ SPLITK_TAGS = {
     "a16w16_clusterlaunch_tdm_splitk_fuse",
     *_SPLITK,
 }
+
+_WS_PARTIAL_TAGS = {
+    "a16w16_cluster_tdm_splitk_ws",
+    "a16w16_clusterlaunch_tdm_splitk_ws",
+}
+
+
+def _ws_partial_ctype(k):
+    """The kid's split-K partial ctype, or None if its slot is a real dtype."""
+    if k.kernel_tag not in _WS_PARTIAL_TAGS:
+        return None
+    return getattr(k, "splitk_workspace_dtype", "fp32_t")
+
 
 TRAITS_NAME_MAP = {
     **get_arch_map("gfx950", "traits_name"),
@@ -369,8 +386,16 @@ def _make_device_decl(
 def _record_one_instantiation(
     self_obj, k, kernel_func, kargs_name, host_extra, kargs_explicit_param=""
 ):
-    """Record (host_decl, device_decl) for every (kid, dtype) in k.output_dtypes."""
-    for CDtype in k.output_dtypes:
+    """Record (host_decl, device_decl) for every dtype the kid is referenced with.
+
+    For the _ws split-K families the template slot is the partial type rather
+    than the output dtype, so instantiate the kid's splitk_workspace_dtype --
+    output_dtypes would give the wrong one and the dispatch table's reference
+    would not link.
+    """
+    ws_ctype = _ws_partial_ctype(k)
+    dtypes = (ws_ctype,) if ws_ctype is not None else tuple(k.output_dtypes)
+    for CDtype in dtypes:
         self_obj._host_instantiations.append(
             {
                 "kid_name": k.name,
@@ -611,6 +636,10 @@ class opus_gemm_codegen:
         ENTRY_FORCE_FP32 = """\
     {{ {{{M}, {N}, {K}}}, &{kernel_name}<fp32_t> }}, \\
 """
+        # _ws families: the template slot is the split-K partial type, per-kid.
+        ENTRY_WS_PARTIAL = """\
+    {{ {{{M}, {N}, {K}}}, &{kernel_name}<{ctype}> }}, \\
+"""
 
         # Map ctype short name -> CSV outdtype string emitted by the
         # tuner's result_to_df.
@@ -649,13 +678,19 @@ class opus_gemm_codegen:
                     continue
                 if _kid_arch_common(k) != arch:
                     continue
-                rows.append((int(mnk[0]), int(mnk[1]), int(mnk[2]), k.name, is_splitk))
+                rows.append((int(mnk[0]), int(mnk[1]), int(mnk[2]), k.name,
+                             is_splitk, _ws_partial_ctype(k)))
 
             rows.sort(key=lambda r: (r[0], r[1], r[2]))
             n = len(rows)
-            for i, (M, N, K, name, is_splitk) in enumerate(rows):
-                entry = ENTRY_FORCE_FP32 if is_splitk else ENTRY_MATCH_CTYPE
-                line = entry.format(M=M, N=N, K=K, kernel_name=name)
+            for i, (M, N, K, name, is_splitk, ws_ctype) in enumerate(rows):
+                if ws_ctype is not None:
+                    line = ENTRY_WS_PARTIAL.format(
+                        M=M, N=N, K=K, kernel_name=name, ctype=ws_ctype
+                    )
+                else:
+                    entry = ENTRY_FORCE_FP32 if is_splitk else ENTRY_MATCH_CTYPE
+                    line = entry.format(M=M, N=N, K=K, kernel_name=name)
                 if i == n - 1:
                     # Last entry: drop the trailing `\` so the macro
                     # ends cleanly. Strip the line's continuation.
@@ -772,11 +807,15 @@ class opus_gemm_codegen:
                     continue
                 if _kid_arch_common(k) != arch:
                     continue
-                rows.append((kid, k.name))
+                rows.append((kid, k.name, _ws_partial_ctype(k)))
             rows.sort(key=lambda r: r[0])
             n = len(rows)
-            for i, (kid, name) in enumerate(rows):
-                line = ENTRY.format(kid=kid, kernel_name=name)
+            for i, (kid, name, ws_ctype) in enumerate(rows):
+                line = (
+                    CO_ENTRY.format(kid=kid, kernel_name=name, ctype=ws_ctype)
+                    if ws_ctype is not None
+                    else ENTRY.format(kid=kid, kernel_name=name)
+                )
                 if i == n - 1:
                     line = line.rstrip().rstrip("\\").rstrip() + "\n"
                 f.write(line)
@@ -1172,17 +1211,20 @@ void
             reduce_abi = SPLITK_REDUCE_ABI_MAP[reduce_arch]
             ws_ptr_type = reduce_abi["ws_type"]
             reduce_kernel = reduce_abi["kernel"]
-            # gfx1250 reduce: VEC=8/BLOCK=128 + bf16 workspace + compile-time split_k
-            # (SPLIT_K_ = 0..16, matching the launch-helper switch). Other arches keep
-            # the legacy VEC=16/BLOCK=64 fp32-workspace 6-param instantiations.
+            # gfx1250 reduce: VEC=8/BLOCK=128 + both partial types (the kid picks,
+            # so both must exist) + compile-time split_k (SPLIT_K_ = 0..16, matching
+            # the launch-helper switch). Other arches keep the legacy
+            # VEC=16/BLOCK=64 fp32-workspace 6-param instantiations.
             if reduce_arch == "gfx1250":
                 reduce_vec, reduce_block = 8, 128
                 reduce_split_ks = tuple(range(17))  # 0 (runtime) + 1..16 (unrolled)
-                reduce_d_ws = "__bf16"
+                # Both partial types: which one a kid uses is per-instance
+                # (splitk_workspace_dtype), so both instantiations must exist.
+                reduce_d_ws = ("__bf16", "float")
             else:
                 reduce_vec, reduce_block = 16, 64
                 reduce_split_ks = (None,)
-                reduce_d_ws = None
+                reduce_d_ws = (None,)
             guard_open, guard_close = _own_arch_device_pass_guard(reduce_arch)
             contents = (
                 "// SPDX-License-Identifier: MIT\n"
@@ -1202,8 +1244,9 @@ void
                         reduce_vec,
                         reduce_block,
                         reduce_split_ks,
-                        reduce_d_ws,
+                        d_ws,
                     )
+                    for d_ws in reduce_d_ws
                     for has_oob in reduce_abi["baseline_has_oob"]
                 )
             )

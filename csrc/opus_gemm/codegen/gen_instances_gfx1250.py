@@ -95,21 +95,23 @@ _FUSE_WS_CTYPE = {"bf16_t": ("__bf16", 2), "fp32_t": ("float", 4)}
 
 def splitk_reduce_extra_device_instantiations():
     # gfx1250 only: fp32 bias with a bf16 output (D_OUT=__bf16, D_BIAS=float).
-    # The main kernel writes a bf16 workspace, so an fp32 bias folds in fp32 in
+    # The main kernel writes the partial workspace, so an fp32 bias folds in fp32 in
     # the reduce before the cast to bf16. The baseline instantiations cover the
     # matched-dtype cases; this adds the bf16-out + fp32-bias mix. Emitted for
     # every compile-time split_k (0=runtime fallback, 1..16=unrolled) and
-    # HAS_OOB, with the bf16 workspace dtype (D_WS=__bf16). Same kernel NAME/ABI.
+    # HAS_OOB, and for BOTH partial types -- which one a kid uses is its
+    # splitk_workspace_dtype, so both have to exist. Same kernel NAME/ABI.
     out = (
-        "// fp32-bias + bf16-out (gfx1250 f32 bias support), per split_k + D_WS=bf16\n"
+        "// fp32-bias + bf16-out (gfx1250 f32 bias support), per split_k + D_WS\n"
     )
-    for has_oob in ("true", "false"):
-        for sk in range(17):
-            out += (
-                f"template __global__ void splitk_reduce_kernel_gfx1250<8, 128, __bf16, true,  float,  {has_oob}, {sk}, __bf16>(\n"
-                "    const void*, __bf16*, int, int, int, int, int, int,\n"
-                "    const float*,  int);\n"
-            )
+    for d_ws in ("__bf16", "float"):
+        for has_oob in ("true", "false"):
+            for sk in range(17):
+                out += (
+                    f"template __global__ void splitk_reduce_kernel_gfx1250<8, 128, __bf16, true,  float,  {has_oob}, {sk}, {d_ws}>(\n"
+                    "    const void*, __bf16*, int, int, int, int, int, int,\n"
+                    "    const float*,  int);\n"
+                )
     return out
 
 
@@ -292,9 +294,21 @@ void
     std::optional<aiter_tensor_t> bias,
     int splitK)
 {{{{
-    static_assert(std::is_same<D_C, fp32_t>::value,
-        "cluster_tdm_splitk_ws main kernel writes an fp32 workspace; D_C must "
-        "be fp32_t (Y can be bf16 or fp32; the reduce kernel handles the cast)");
+    // D_C is the split-K PARTIAL type (this kernel stores it, the reduce below
+    // reads it and casts to Y), picked per kid by splitk_workspace_dtype. Y is
+    // independent and may be bf16 or fp32 either way.
+    static_assert(std::is_same<D_C, fp32_t>::value || std::is_same<D_C, bf16_t>::value,
+        "cluster_tdm_splitk_ws split-K partial must be fp32_t or bf16_t");
+
+    // The host sizes this buffer from the kid table's splitk_workspace_dtype
+    // while D_C was baked in at build time, so a .so that is stale with respect
+    // to the table makes the two disagree. Catch it here: unchecked, a narrower
+    // buffer than D_C is a GPU page fault with no hint of where it came from.
+    AITER_CHECK(workspace.element_size() == sizeof(D_C),
+        "split-K workspace is ", workspace.element_size(),
+        "-byte but this kernel stores ", sizeof(D_C),
+        "-byte partials -- rebuild module_deepgemm_opus after changing "
+        "splitk_workspace_dtype");
 
     int batch = XQ.size(0);
     int M = XQ.size(1);
@@ -372,7 +386,9 @@ void
 
     {kernel_func}<Traits><<<grid_main, block_main, 0, stream>>>(kargs);
 
-    // Reduce reads the bf16 split-K workspace the main kernel wrote (D_WS=__bf16),
+    // Reduce reads the split-K workspace the main kernel wrote. D_C is that
+    // partial type for BOTH ends -- the main kernel stores Traits::DataC and
+    // this reads the same D_C -- so a per-kid choice cannot desynchronise them,
     // re-accumulates in fp32, folds bias, casts to Y dtype. split_k is dispatched
     // to a compile-time (unrolled) reduce instance by the launch helper.
     if (Y.dtype() == AITER_DTYPE_bf16) {{{{
@@ -380,29 +396,29 @@ void
         if (ptr_bias_ && bias_is_fp32_) {{{{
             // fp32 bias + bf16 output: fold the exact fp32 bias in the
             // reduce (D_BIAS=float), then cast the fp32 sum to bf16.
-            opus_splitk_reduce_launch_gfx1250<REDUCE_VEC, REDUCE_BS, __bf16, true, float, {has_oob_str}, __bf16>(
+            opus_splitk_reduce_launch_gfx1250<REDUCE_VEC, REDUCE_BS, __bf16, true, float, {has_oob_str}, D_C>(
                 grid_reduce, block_reduce, stream,
                 ws_ptr_, y_ptr, split_k, M, N, 1, padded_M, padded_N,
                 reinterpret_cast<const float*>(ptr_bias_), stride_bias_batch_);
         }}}} else if (ptr_bias_) {{{{
-            opus_splitk_reduce_launch_gfx1250<REDUCE_VEC, REDUCE_BS, __bf16, true, __bf16, {has_oob_str}, __bf16>(
+            opus_splitk_reduce_launch_gfx1250<REDUCE_VEC, REDUCE_BS, __bf16, true, __bf16, {has_oob_str}, D_C>(
                 grid_reduce, block_reduce, stream,
                 ws_ptr_, y_ptr, split_k, M, N, 1, padded_M, padded_N,
                 reinterpret_cast<const __bf16*>(ptr_bias_), stride_bias_batch_);
         }}}} else {{{{
-            opus_splitk_reduce_launch_gfx1250<REDUCE_VEC, REDUCE_BS, __bf16, false, __bf16, {has_oob_str}, __bf16>(
+            opus_splitk_reduce_launch_gfx1250<REDUCE_VEC, REDUCE_BS, __bf16, false, __bf16, {has_oob_str}, D_C>(
                 grid_reduce, block_reduce, stream,
                 ws_ptr_, y_ptr, split_k, M, N, 1, padded_M, padded_N, nullptr, 0);
         }}}}
     }}}} else {{{{
         float* y_ptr = reinterpret_cast<float*>(Y.data_ptr());
         if (ptr_bias_) {{{{
-            opus_splitk_reduce_launch_gfx1250<REDUCE_VEC, REDUCE_BS, float, true, float, {has_oob_str}, __bf16>(
+            opus_splitk_reduce_launch_gfx1250<REDUCE_VEC, REDUCE_BS, float, true, float, {has_oob_str}, D_C>(
                 grid_reduce, block_reduce, stream,
                 ws_ptr_, y_ptr, split_k, M, N, 1, padded_M, padded_N,
                 reinterpret_cast<const float*>(ptr_bias_), stride_bias_batch_);
         }}}} else {{{{
-            opus_splitk_reduce_launch_gfx1250<REDUCE_VEC, REDUCE_BS, float, false, float, {has_oob_str}, __bf16>(
+            opus_splitk_reduce_launch_gfx1250<REDUCE_VEC, REDUCE_BS, float, false, float, {has_oob_str}, D_C>(
                 grid_reduce, block_reduce, stream,
                 ws_ptr_, y_ptr, split_k, M, N, 1, padded_M, padded_N, nullptr, 0);
         }}}}
@@ -412,8 +428,20 @@ void
 """
     Path(os.path.join(cg.impl_path, f"{k.name}.cuh")).write_text(INSTANCE_IMPL)
 
-    # Main kernel: only <fp32_t> is instantiated (writes the fp32 workspace).
-    for CDtype in k.output_dtypes:
+    # The kid's template slot is the split-K PARTIAL type (traits D_C), not its
+    # output dtype -- the reduce decides the output. Instantiate the partial type
+    # the kid declares, since the dispatch table now references it by that type
+    # and the host sizes the workspace from the same field. The fuse family keeps
+    # output_dtypes: it reduces in-kernel and never lands a partial for us.
+    _ws_partial_tags = (
+        "a16w16_cluster_tdm_splitk_ws",
+        "a16w16_clusterlaunch_tdm_splitk_ws",
+    )
+    if k.kernel_tag in _ws_partial_tags:
+        inst_dtypes = (getattr(k, "splitk_workspace_dtype", "fp32_t"),)
+    else:
+        inst_dtypes = tuple(k.output_dtypes)
+    for CDtype in inst_dtypes:
         host_decl = (
             f"template void\n"
             f"{k.name}<{CDtype}>(\n"

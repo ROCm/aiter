@@ -491,7 +491,9 @@ def candidate_splitK(M: int, N: int, K: int, batch: int, cu_num: int, k_inst):
     # Workspace 4 GiB cap.
     padded_M = _ceil_div(M, k_inst.B_M) * k_inst.B_M
     padded_N = _ceil_div(N, k_inst.B_N) * k_inst.B_N
-    per_slice_bytes = batch * padded_M * padded_N * 4
+    per_slice_bytes = (
+        batch * padded_M * padded_N * (2 if _kid_uses_bf16_workspace(k_inst) else 4)
+    )
     UINT32_MAX_BYTES = (1 << 32) - 1
     if per_slice_bytes > 0:
         ws_cap = UINT32_MAX_BYTES // per_slice_bytes
@@ -604,7 +606,16 @@ def kid_rejects_shape(k_inst, M, N, K):
     B_K = k_inst.B_K
     loops = _ceil_div(K, B_K)
 
-    if _kid_uses_bf16_workspace(k_inst):
+    # BF16WS_EXACT_REDUCE_SHAPES is a gfx942 artifact: that family's bf16-workspace
+    # reduce was only ever validated on the handful of N in the table, so anything
+    # else is refused. It keyed on "uses a bf16 workspace" alone, which was
+    # equivalent to "is a gfx942 bf16-ws kid" only while every gfx1250 _ws kid
+    # declared an fp32 partial. Once those switched to bf16 the rule started
+    # rejecting them too, and since the table is all powers of two it wiped out
+    # the whole _ws family at N=384 / 32320 / 129280. The gfx1250 _ws reduce
+    # handles a ragged N through its tail path, so scope the rule to the family
+    # it was written for.
+    if _kid_uses_bf16_workspace(k_inst) and k_inst.kernel_tag not in _WS_SPLITK_TAGS:
         padded_N = _ceil_div(N, k_inst.B_N) * k_inst.B_N
         if loops < 2 or K % B_K != 0 or padded_N != N:
             return True
@@ -862,7 +873,7 @@ def candidate_kids_for_shape(M, N, K, bias, cu_num):
         from aiter.jit.utils.chip_info import get_gfx_runtime
 
         if get_gfx_runtime().lower() == "gfx1250":
-            return _gfx1250_select_candidates(M, N, K, cu_num)
+            return _drop_fp32_ws_kids(_gfx1250_select_candidates(M, N, K, cu_num))
     except Exception:  # noqa: BLE001,S110
         pass
 
@@ -903,11 +914,46 @@ def candidate_kids_for_shape(M, N, K, bias, cu_num):
 
     # Step 6: drop known-bad kids permanently.
     cands = cands - _OPUS_PERMA_BAD_KIDS
-    return cands
+    return _drop_fp32_ws_kids(cands)
 
 
 # Kids we never want tuner to probe.
 _OPUS_PERMA_BAD_KIDS = frozenset()
+
+
+def _drop_fp32_ws_kids(cands):
+    """Drop split-K kids that stage fp32 partials, unless opted back in.
+
+    An fp32 partial doubles both the workspace and the reduce's read traffic
+    for an accuracy the tuner's gate does not ask for: at rtol=atol=5e-2, which
+    is what _default_tol gives a bf16 output, bf16 partials score err_ratio
+    0.004-0.012 against a 0.05 line, flat across shapes. It also multiplies what
+    the sweep allocates -- every (tile padding x split_k) pair is a distinct
+    buffer -- which is what put a full 84-shape sweep at 450 GiB on a 432 GiB
+    part. Set OPUS_TUNE_FP32_WS=1 to sweep them anyway, e.g. when checking how
+    much accuracy the bf16 partial actually costs a given shape.
+    """
+    if os.environ.get("OPUS_TUNE_FP32_WS", "0") != "0":
+        return cands
+    try:
+        from opus_gemm_common import kernels_list as _klist
+    except Exception:  # noqa: BLE001
+        return cands
+    return frozenset(
+        kid
+        for kid in cands
+        if not (
+            getattr(_klist.get(kid), "kernel_tag", "") in _WS_SPLITK_TAGS
+            and getattr(_klist.get(kid), "splitk_workspace_dtype", "fp32_t") == "fp32_t"
+        )
+    )
+
+
+# The two families that stage a split-K partial the reduce then reads. The fuse
+# family reduces in-kernel, so its workspace dtype is its own business.
+_WS_SPLITK_TAGS = frozenset(
+    {"a16w16_cluster_tdm_splitk_ws", "a16w16_clusterlaunch_tdm_splitk_ws"}
+)
 
 
 def _ensure_kids_compiled(candidate_kids):

@@ -33,6 +33,7 @@ constexpr int kCtdmLayoutTileN = 0;
 constexpr int kCtdmLayoutTileM = 1;
 }  // namespace opus_gfx1250
 
+
 #ifndef OPUS_GEMM_SPLITK_WS_HANDLE_DEFINED
 #define OPUS_GEMM_SPLITK_WS_HANDLE_DEFINED
 // Indirection slot for the split-K fp32 workspace pointer. Captured HIP
@@ -225,11 +226,23 @@ struct opus_a16w16_4wave_compute_traits_gfx1250 {
     // That occupancy is the variable (rather than tile size or register
     // pressure) is pinned down by a control group: 71 variants whose registers
     // would admit two waves per SIMD but whose LDS does not are all correct,
-    // while the 61 where both admit two are all wrong. WHY 2 WG/CU breaks it is
-    // not established -- see gen_co/KNOWN_ISSUES.md before assuming a cause.
+    // while the 61 where both admit two are all wrong. WHY 2 WG/CU broke it:
+    // two independent races -- a write-after-read on the ring, and a trailing
+    // "zero-extent" transfer that actually zero-fills the slot C is staged in --
+    // both since fixed in the pipelines. The pad stays on top because dropping
+    // it is a per-shape performance trade, not because anything is unexplained.
+    // See gen_co/KNOWN_ISSUES.md issue 1.
+    //
+    // -DOPUS_CO_NO_1WG_PAD removes the pad, which puts the affected variants
+    // back at 2 WG/CU and reproduces the corruption. It exists so the failure
+    // can be re-measured against a hypothesis; nothing ships with it.
     static constexpr int kHalfLds     = 160 * 1024;
+#ifdef OPUS_CO_NO_1WG_PAD
+    static constexpr int LDS_BYTES    = SEG_BYTES_AB;
+#else
     static constexpr int LDS_BYTES    =
         (SEG_BYTES_AB <= kHalfLds) ? (kHalfLds + 1024) : SEG_BYTES_AB;
+#endif
     static_assert(LDS_BYTES <= 320 * 1024, "LDS exceeds the 320KB/CU budget");
 
     // aiter-convention aliases for the host launcher (which never sees the
@@ -290,8 +303,16 @@ struct opus_cluster_tdm_splitk_ws_traits_gfx1250 {
     using D_C   = D_C_;                                // workspace dtype
     using D_ACC = D_ACC_;
     static_assert(std::is_same<D_A, D_B>::value, "A/B dtype must match");
-    static_assert(std::is_same<D_C, float>::value,
-                  "cluster_tdm_splitk_ws main kernel writes an fp32 workspace; D_C must be float");
+    // D_C is the SPLIT-K PARTIAL type, not the GEMM's output type -- the output
+    // dtype is a runtime choice the reduce makes. Either width is legal and the
+    // kid table picks per instance (OpusGemmInstance.splitk_workspace_dtype):
+    // fp32 partials cost twice the reduce read traffic, bf16 partials cost
+    // accuracy at split_k >= 2 (about sqrt(K) * 2^-8 of ABSOLUTE error into the
+    // sum, which swamps the near-zero outputs). It used to be pinned to float
+    // here and then overridden by a build-wide macro in the pipeline, so the
+    // declared type and the stored type disagreed.
+    static_assert(std::is_same<D_C, float>::value || std::is_same<D_C, __bf16>::value,
+                  "cluster_tdm_splitk_ws partial workspace must be float or __bf16");
 
     // Aliases used by the pipeline / layout helpers.
     using DataA   = D_A;
