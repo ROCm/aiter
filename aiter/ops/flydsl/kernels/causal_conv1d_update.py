@@ -157,16 +157,16 @@ def build_causal_conv1d_update_module(
 
     @flyc.kernel
     def update_kernel(
-        x_ptr: fx.Tensor,
-        w_ptr: fx.Tensor,
-        bias_ptr: fx.Tensor,
-        cs_ptr: fx.Tensor,
-        csi_ptr: fx.Tensor,
-        nacc_ptr: fx.Tensor,
-        qsl_ptr: fx.Tensor,
-        blst_ptr: fx.Tensor,
-        isi_ptr: fx.Tensor,
-        o_ptr: fx.Tensor,
+        x_ptr: fx.Int64,
+        w_ptr: fx.Int64,
+        bias_ptr: fx.Int64,
+        cs_ptr: fx.Int64,
+        csi_ptr: fx.Int64,
+        nacc_ptr: fx.Int64,
+        qsl_ptr: fx.Int64,
+        blst_ptr: fx.Int64,
+        isi_ptr: fx.Int64,
+        o_ptr: fx.Int64,
         dim: fx.Int32,
         num_cache_lines: fx.Int32,
         null_block_id: fx.Int32,
@@ -186,7 +186,7 @@ def build_causal_conv1d_update_module(
         elem_dtype = fx.BFloat16 if dtype_str == "bf16" else fx.Float16
 
         def _rsrc(ptr):
-            return buffer_ops.create_buffer_resource(ptr, max_size=True)
+            return buffer_ops.create_buffer_resource_from_addr(ptr)
 
         def _rsrc_at(ptr, index, stride):
             """Descriptor whose base already includes ``index * stride`` elements.
@@ -201,9 +201,7 @@ def build_causal_conv1d_update_module(
             byte_offset = (
                 index.to(fx.Int64) * stride.to(fx.Int64) * fx.Int64(ELEM_BYTES)
             )
-            return buffer_ops.create_buffer_resource(
-                ptr, max_size=True, base_byte_offset=byte_offset.ir_value()
-            )
+            return buffer_ops.create_buffer_resource_from_addr(ptr + byte_offset)
 
         # Only the descriptors actually used: the rest are dummy (x) pointers, and
         # skipping them keeps their kernargs out of the prologue.
@@ -511,16 +509,16 @@ def build_causal_conv1d_update_module(
 
     @flyc.jit
     def launch(
-        x_ptr: fx.Tensor,
-        w_ptr: fx.Tensor,
-        bias_ptr: fx.Tensor,
-        cs_ptr: fx.Tensor,
-        csi_ptr: fx.Tensor,
-        nacc_ptr: fx.Tensor,
-        qsl_ptr: fx.Tensor,
-        blst_ptr: fx.Tensor,
-        isi_ptr: fx.Tensor,
-        o_ptr: fx.Tensor,
+        x_ptr: fx.Int64,
+        w_ptr: fx.Int64,
+        bias_ptr: fx.Int64,
+        cs_ptr: fx.Int64,
+        csi_ptr: fx.Int64,
+        nacc_ptr: fx.Int64,
+        qsl_ptr: fx.Int64,
+        blst_ptr: fx.Int64,
+        isi_ptr: fx.Int64,
+        o_ptr: fx.Int64,
         dim: fx.Int32,
         num_cache_lines: fx.Int32,
         null_block_id: fx.Int32,
@@ -691,18 +689,18 @@ def build_causal_conv1d_update_sglang_module(
 
     @flyc.kernel
     def update_kernel(
-        x_ptr: fx.Tensor,
-        w_ptr: fx.Tensor,
-        bias_ptr: fx.Tensor,
-        cs_ptr: fx.Tensor,
-        csi_ptr: fx.Tensor,
-        nacc_ptr: fx.Tensor,
-        o_ptr: fx.Tensor,
-        inter_ptr: fx.Tensor,
-        isi_ptr: fx.Tensor,
-        rnt_ptr: fx.Tensor,
-        rns_ptr: fx.Tensor,
-        rpt_ptr: fx.Tensor,
+        x_ptr: fx.Int64,
+        w_ptr: fx.Int64,
+        bias_ptr: fx.Int64,
+        cs_ptr: fx.Int64,
+        csi_ptr: fx.Int64,
+        nacc_ptr: fx.Int64,
+        o_ptr: fx.Int64,
+        inter_ptr: fx.Int64,
+        isi_ptr: fx.Int64,
+        rnt_ptr: fx.Int64,
+        rns_ptr: fx.Int64,
+        rpt_ptr: fx.Int64,
         dim: fx.Int32,
         num_cache_lines: fx.Int32,
         null_block_id: fx.Int32,
@@ -733,7 +731,7 @@ def build_causal_conv1d_update_sglang_module(
         elem_dtype = fx.BFloat16 if dtype_str == "bf16" else fx.Float16
 
         def _rsrc(ptr):
-            return buffer_ops.create_buffer_resource(ptr, max_size=True)
+            return buffer_ops.create_buffer_resource_from_addr(ptr)
 
         def _load_i32(rsrc, off, is_scalar=False):
             return fx.Int32(
@@ -1053,18 +1051,18 @@ def build_causal_conv1d_update_sglang_module(
 
     @flyc.jit
     def launch(
-        x_ptr: fx.Tensor,
-        w_ptr: fx.Tensor,
-        bias_ptr: fx.Tensor,
-        cs_ptr: fx.Tensor,
-        csi_ptr: fx.Tensor,
-        nacc_ptr: fx.Tensor,
-        o_ptr: fx.Tensor,
-        inter_ptr: fx.Tensor,
-        isi_ptr: fx.Tensor,
-        rnt_ptr: fx.Tensor,
-        rns_ptr: fx.Tensor,
-        rpt_ptr: fx.Tensor,
+        x_ptr: fx.Int64,
+        w_ptr: fx.Int64,
+        bias_ptr: fx.Int64,
+        cs_ptr: fx.Int64,
+        csi_ptr: fx.Int64,
+        nacc_ptr: fx.Int64,
+        o_ptr: fx.Int64,
+        inter_ptr: fx.Int64,
+        isi_ptr: fx.Int64,
+        rnt_ptr: fx.Int64,
+        rns_ptr: fx.Int64,
+        rpt_ptr: fx.Int64,
         dim: fx.Int32,
         num_cache_lines: fx.Int32,
         null_block_id: fx.Int32,

@@ -36,6 +36,24 @@ from .kernels.causal_conv1d_update import (
 )
 from .kernels.tensor_shim import _run_compiled
 
+#: Private, and absent from torch builds without a CUDA/ROCm backend, so the
+#: public spelling stays as the fallback -- same idiom as aiter/jit/core.py.
+_RAW_STREAM = getattr(torch._C, "_cuda_getCurrentRawStream", None)
+
+
+def _raw_stream(device: torch.device) -> int:
+    """Current stream handle, without building a ``torch.cuda.Stream`` per launch.
+
+    Keyed off the tensors' own device rather than the ambient one, so a caller
+    that never entered a ``torch.cuda.device`` context still enqueues where its
+    pointers live.
+    """
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    if _RAW_STREAM is None:
+        return torch.cuda.current_stream(index).cuda_stream
+    return _RAW_STREAM(index)
+
+
 #: SGLang's padded-slot sentinel (also aiter's Triton conv1d convention).
 PAD_SLOT_ID = -1
 
@@ -451,16 +469,16 @@ def causal_conv1d_update_flydsl(
 
     _run_compiled(
         launcher,
-        x,
-        weight,
-        bias_arg,
-        conv_state,
-        conv_state_indices,
-        nacc_arg,
-        qsl_arg,
-        blst_arg,
-        isi_arg,
-        out,
+        x.data_ptr(),
+        weight.data_ptr(),
+        bias_arg.data_ptr(),
+        conv_state.data_ptr(),
+        conv_state_indices.data_ptr(),
+        nacc_arg.data_ptr(),
+        qsl_arg.data_ptr(),
+        blst_arg.data_ptr(),
+        isi_arg.data_ptr(),
+        out.data_ptr(),
         int(dim),
         int(num_cache_lines),
         int(null_block_arg),
@@ -478,7 +496,7 @@ def causal_conv1d_update_flydsl(
         int(stride_o_tok),
         int(batch),
         int(grid_y_dim),
-        torch.cuda.current_stream(),
+        _raw_stream(x.device),
     )
 
     if unsqueeze:
@@ -697,18 +715,18 @@ def causal_conv1d_update_sglang_flydsl(
 
     _run_compiled(
         launcher,
-        x,
-        weight,
-        bias_arg,
-        conv_state,
-        conv_state_indices,
-        nacc_arg,
-        out,
-        inter_arg,
-        isi_arg,
-        rnt_arg,
-        rns_arg,
-        rpt_arg,
+        x.data_ptr(),
+        weight.data_ptr(),
+        bias_arg.data_ptr(),
+        conv_state.data_ptr(),
+        conv_state_indices.data_ptr(),
+        nacc_arg.data_ptr(),
+        out.data_ptr(),
+        inter_arg.data_ptr(),
+        isi_arg.data_ptr(),
+        rnt_arg.data_ptr(),
+        rns_arg.data_ptr(),
+        rpt_arg.data_ptr(),
         int(dim),
         int(num_cache_lines),
         int(null_block_arg),
@@ -737,7 +755,7 @@ def causal_conv1d_update_sglang_flydsl(
         int(srpt_tok),
         int(batch),
         int(grid_y_dim),
-        torch.cuda.current_stream(),
+        _raw_stream(x.device),
     )
 
     if unsqueeze:
