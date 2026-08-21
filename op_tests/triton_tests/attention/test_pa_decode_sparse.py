@@ -7,7 +7,10 @@ import pytest
 import torch
 import triton
 
-from aiter.ops.triton.attention.pa_decode_sparse import pa_decode_sparse
+from aiter.ops.triton.attention.pa_decode_sparse import (
+    pa_decode_sparse,
+    pa_decode_sparse_shuffled,
+)
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.test_common import checkAllclose
 
@@ -568,3 +571,256 @@ def test_pa_decode_sparse_two_loop(T, H, D, main_len, extra_len, dtype, strided_
 
     tol = 1e-2 if dtype == "fp8" else 5e-3
     torch.testing.assert_close(out, ref, atol=tol, rtol=tol)
+
+
+# ---------------------------------------------------------------------------
+# pa_decode_sparse_shuffled: block-sparse paged decode over a SHUFFLE K/V pair.
+#
+# Layout under test (AMD asm layout, kv-head collapsed into the page id):
+#   K [P, 1, D//X, PAGE, X]  with K[page, pos, d] at [page, 0, d//X, pos, d%X]
+#   V [P, 1, PAGE//X, D, X]  with V[page, pos, d] at [page, 0, pos//X, d, pos%X]
+# X is the packing factor, 16 // itemsize (8 for bf16, 16 for fp8).
+# ---------------------------------------------------------------------------
+
+_SHUF_PAGE = 16
+_SHUF_FP8_DTYPE = torch.float8_e4m3fn
+
+
+def _to_shuffle(k_plain, v_plain, x):
+    """[P, PAGE, D] pair -> the SHUFFLE 5-D K/V views the kernel consumes."""
+    P, page, D = k_plain.shape
+    k = k_plain.view(P, page, D // x, x).permute(0, 2, 1, 3).contiguous()
+    v = v_plain.view(P, page // x, x, D).permute(0, 1, 3, 2).contiguous()
+    return k.view(P, 1, D // x, page, x), v.view(P, 1, page // x, D, x)
+
+
+def _make_shuffled_inputs(
+    N,
+    H,
+    D,
+    max_pages,
+    ctx_tokens,
+    dtype=torch.bfloat16,
+    seed=0,
+    variable_len=False,
+    quantize=False,
+):
+    """Build q + a SHUFFLE K/V cache + a dense page table with exact ctx lens.
+
+    Returns the kernel inputs plus ``k_plain``/``v_plain``, the *dequantised*
+    per-token K/V the kernel is expected to reproduce.
+    """
+    used = triton.cdiv(ctx_tokens, _SHUF_PAGE)
+    assert max_pages >= used, (
+        f"max_pages={max_pages} cannot hold ctx_tokens={ctx_tokens} "
+        f"({used} pages of {_SHUF_PAGE})"
+    )
+    torch.manual_seed(seed)
+    device = torch.device("cuda")
+    x = 16 // (1 if quantize else dtype.itemsize)
+    total_pages = max(1, N * triton.cdiv(ctx_tokens, _SHUF_PAGE)) + 4
+
+    kf = torch.randn(total_pages, _SHUF_PAGE, D, device=device) * 0.5
+    vf = torch.randn(total_pages, _SHUF_PAGE, D, device=device) * 0.5
+    if quantize:
+        # Per-token dynamic quant: one fp32 scale per cached token, which is
+        # what MiniMax-M3's fused KV writer produces.
+        fp8_max = torch.finfo(_SHUF_FP8_DTYPE).max
+        k_scale = (kf.abs().amax(-1) / fp8_max).clamp(min=1e-12)
+        v_scale = (vf.abs().amax(-1) / fp8_max).clamp(min=1e-12)
+        k_q = (kf / k_scale[..., None]).to(_SHUF_FP8_DTYPE)
+        v_q = (vf / v_scale[..., None]).to(_SHUF_FP8_DTYPE)
+        k_plain = k_q.float() * k_scale[..., None]
+        v_plain = v_q.float() * v_scale[..., None]
+        k_cache, v_cache = _to_shuffle(k_q, v_q, x)
+        k_scale = k_scale.view(total_pages, 1, _SHUF_PAGE).contiguous()
+        v_scale = v_scale.view(total_pages, 1, _SHUF_PAGE).contiguous()
+    else:
+        k_plain, v_plain = kf.to(dtype), vf.to(dtype)
+        k_cache, v_cache = _to_shuffle(k_plain, v_plain, x)
+        k_plain, v_plain = k_plain.float(), v_plain.float()
+        k_scale = v_scale = None
+
+    q = (torch.randn(N, H, D, dtype=dtype, device=device) * 0.5).contiguous()
+
+    if variable_len:
+        ctx = torch.randint(1, ctx_tokens + 1, (N,), device=device, dtype=torch.int32)
+    else:
+        ctx = torch.full((N,), ctx_tokens, device=device, dtype=torch.int32)
+    # Padding slots hold page 0, matching the real block-table builders.
+    block_table = torch.zeros(N, max_pages, dtype=torch.int32, device=device)
+    block_table[:, :used] = torch.randint(
+        0, total_pages, (N, used), dtype=torch.int32, device=device
+    )
+    return {
+        "q": q,
+        "k_cache": k_cache,
+        "v_cache": v_cache,
+        "k_scale": k_scale,
+        "v_scale": v_scale,
+        "block_table": block_table,
+        "ctx": ctx,
+        "k_plain": k_plain,
+        "v_plain": v_plain,
+    }
+
+
+def _shuffled_reference(inp, softmax_scale, attn_sink=None):
+    """Dense torch reference: gather the listed pages, mask past ``ctx``."""
+    q = inp["q"].float()
+    N, H, D = q.shape
+    bt = inp["block_table"].long()
+    k = inp["k_plain"][bt].reshape(N, -1, D)  # [N, max_pages*PAGE, D]
+    v = inp["v_plain"][bt].reshape(N, -1, D)
+    pos = torch.arange(k.shape[1], device=q.device)
+    valid = pos[None, :] < inp["ctx"].long()[:, None]
+
+    scores = torch.einsum("nhd,nkd->nhk", q, k) * softmax_scale
+    scores = scores.masked_fill(~valid[:, None, :], float("-inf"))
+    if attn_sink is not None:
+        scores = torch.cat(
+            [scores, attn_sink.float().view(1, H, 1).expand(N, H, 1)], dim=-1
+        )
+    weights = scores.softmax(dim=-1)[..., : k.shape[1]]
+    return torch.einsum("nhk,nkd->nhd", weights, v).to(inp["q"].dtype)
+
+
+@pytest.mark.parametrize("N", [1, 17, 256])
+@pytest.mark.parametrize("H", [8, 16])
+@pytest.mark.parametrize("D", [128])
+@pytest.mark.parametrize("ctx_tokens", [16, 300, 2048])
+@pytest.mark.parametrize("variable_len", [True, False])
+@pytest.mark.parametrize("quantize", [True, False])
+def test_pa_decode_sparse_shuffled(N, H, D, ctx_tokens, variable_len, quantize):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+
+    # 34 is deliberately not a multiple of the kernel's 8-page KV tile, so the
+    # trailing tile reaches past the block-table row.
+    max_pages = max(34, triton.cdiv(ctx_tokens, _SHUF_PAGE))
+    inp = _make_shuffled_inputs(
+        N, H, D, max_pages, ctx_tokens, variable_len=variable_len, quantize=quantize
+    )
+    scale = float(D) ** -0.5
+
+    ref = _shuffled_reference(inp, scale)
+    out = pa_decode_sparse_shuffled(
+        inp["q"],
+        inp["k_cache"],
+        inp["v_cache"],
+        inp["block_table"],
+        inp["ctx"],
+        scale,
+        k_scale=inp["k_scale"],
+        v_scale=inp["v_scale"],
+    )
+
+    tol_err_ratio = 0.01
+    assert (
+        checkAllclose(
+            out.to(torch.float32),
+            ref.to(torch.float32),
+            atol=1e-2,
+            rtol=1e-2,
+            tol_err_ratio=tol_err_ratio,
+            msg="pa_decode_sparse_shuffled output",
+        )
+        <= tol_err_ratio
+    )
+
+
+@pytest.mark.parametrize("N", [4, 64])
+@pytest.mark.parametrize("kv_splits", [1, 2, 8])
+def test_pa_decode_sparse_shuffled_splits_and_sink(N, kv_splits):
+    """Every split count must agree, with the sink folded in by the reduce."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+
+    H, D, ctx = 16, 128, 512
+    inp = _make_shuffled_inputs(N, H, D, 34, ctx, variable_len=True, seed=3)
+    sink = (torch.randn(H, dtype=torch.float32, device="cuda") * 0.1).contiguous()
+    scale = float(D) ** -0.5
+
+    ref = _shuffled_reference(inp, scale, attn_sink=sink)
+    out = pa_decode_sparse_shuffled(
+        inp["q"],
+        inp["k_cache"],
+        inp["v_cache"],
+        inp["block_table"],
+        inp["ctx"],
+        scale,
+        attn_sink=sink,
+        kv_splits=kv_splits,
+    )
+    tol_err_ratio = 0.01
+    assert (
+        checkAllclose(
+            out.to(torch.float32),
+            ref.to(torch.float32),
+            atol=1e-2,
+            rtol=1e-2,
+            tol_err_ratio=tol_err_ratio,
+            msg=f"pa_decode_sparse_shuffled kv_splits={kv_splits}",
+        )
+        <= tol_err_ratio
+    )
+
+
+@pytest.mark.parametrize("kv_splits", [1, 4])
+def test_pa_decode_sparse_shuffled_empty_context(kv_splits):
+    """A token with zero selected keys must produce zeros, not stale memory."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+
+    N, H, D = 8, 16, 128
+    inp = _make_shuffled_inputs(N, H, D, 34, 256, seed=5)
+    inp["ctx"][::2] = 0
+    out = torch.full_like(inp["q"], float("nan"))
+    pa_decode_sparse_shuffled(
+        inp["q"],
+        inp["k_cache"],
+        inp["v_cache"],
+        inp["block_table"],
+        inp["ctx"],
+        float(D) ** -0.5,
+        out=out,
+        kv_splits=kv_splits,
+    )
+    assert torch.all(out[::2] == 0), "empty-context rows must be zeroed"
+    assert torch.isfinite(out[1::2]).all()
+
+
+@pytest.mark.parametrize("N", [4, 256])
+@pytest.mark.parametrize("ctx_tokens", [1024, 4096])
+@pytest.mark.parametrize("quantize", [True, False])
+def test_pa_decode_sparse_shuffled_deterministic(N, ctx_tokens, quantize):
+    """Repeated launches must agree bit for bit.
+
+    The launch config is not free here: some (num_warps, waves_per_eu) pairs let
+    the fp8 path's LDS staging race, and the damage looks like a plausible
+    ~15-ULP accuracy loss rather than garbage, so an allclose check against a
+    reference will not reliably catch it. Bitwise repeatability will.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+
+    # 34 pages is deliberately not a multiple of the kernel's 8-page KV tile, so
+    # the trailing tile reaches past the block-table row; widen it when the
+    # context needs more than that.
+    max_pages = max(34, triton.cdiv(ctx_tokens, _SHUF_PAGE))
+    inp = _make_shuffled_inputs(
+        N, 16, 128, max_pages, ctx_tokens, seed=7, quantize=quantize
+    )
+    args = (
+        inp["q"],
+        inp["k_cache"],
+        inp["v_cache"],
+        inp["block_table"],
+        inp["ctx"],
+        128.0**-0.5,
+    )
+    kwargs = {"k_scale": inp["k_scale"], "v_scale": inp["v_scale"]}
+    first = pa_decode_sparse_shuffled(*args, **kwargs).clone()
+    for i in range(3):
+        again = pa_decode_sparse_shuffled(*args, **kwargs)
+        assert torch.equal(first, again), f"launch {i + 1} differs from the first"

@@ -16,6 +16,11 @@ gathered subset of a unified KV pool:
                                  ``attn_sink`` as a virtual K, writes the
                                  final output.
 
+A second front-end kernel, ``_pa_decode_sparse_shuffled``, keeps that split-K
+skeleton but reads a *paged* SHUFFLE K/V cache pair addressed by a per-token
+block table instead of a page_size=1 unified pool (MiniMax-M3 block-sparse
+decode). It shares ``_pa_decode_sparse_reduce`` via ``USE_CTX_LENS``.
+
 Both kernels follow the ``tiles_per_segment`` pattern from aiter's
 ``kernel_unified_attention_3d``: the split-axis grid dim ``KV_SPLITS`` is
 constexpr; ``tiles_per_segment`` is computed at runtime per token; trailing
@@ -138,8 +143,11 @@ def _pa_decode_sparse(
 
     # aiter unified_attention 3d pattern: fixed grid axis (KV_SPLITS), runtime
     # tiles_per_segment, early-return for trailing segments past the end.
-    tiles_per_segment = tl.cdiv(kv_len, KV_SPLITS * BLOCK_K)
-    if pid_k * tiles_per_segment * BLOCK_K >= kv_len:
+    tiles_per_segment = tl.maximum(tl.cdiv(kv_len, KV_SPLITS * BLOCK_K), 1)
+    # tl.maximum(kv_len, 1): with kv_len == 0 the plain ``>= kv_len`` test is
+    # true even for pid_k 0, so every segment would bail and leave ``out`` at
+    # its torch.empty contents. Letting segment 0 through emits the zeros.
+    if pid_k * tiles_per_segment * BLOCK_K >= tl.maximum(kv_len, 1):
         return
 
     num_tiles = tl.cdiv(kv_len, BLOCK_K)
@@ -284,8 +292,8 @@ def _pa_decode_sparse_reduce(
     m_partial_ptr,  # [N, KV_SPLITS, H_padded] fp32
     l_partial_ptr,  # [N, KV_SPLITS, H_padded] fp32
     acc_partial_ptr,  # [N, KV_SPLITS, H_padded, D] fp32
-    attn_sink_ptr,  # [H]
-    kv_indptr_ptr,  # [N+1] int32 — used to derive per-token kv_len
+    attn_sink_ptr,  # [H] (unused when HAS_SINK is False)
+    kv_indptr_ptr,  # [N+1] int32 prefix sum, or [N] ctx lens when USE_CTX_LENS
     out_ptr,  # [N, H, D]
     mp_stride_t: tl.constexpr,
     mp_stride_k: tl.constexpr,
@@ -307,6 +315,8 @@ def _pa_decode_sparse_reduce(
     BLOCK_D: tl.constexpr,
     BLOCK_K: tl.constexpr,
     USE_EXP2: tl.constexpr,
+    USE_CTX_LENS: tl.constexpr = False,
+    HAS_SINK: tl.constexpr = True,
 ):
     """Combine KV_SPLITS partials, fold in attn_sink, write final output.
 
@@ -324,10 +334,20 @@ def _pa_decode_sparse_reduce(
     h_mask = h_offs < H
     d_mask = d_offs < D
 
-    kv_start = tl.load(kv_indptr_ptr + t)
-    kv_end = tl.load(kv_indptr_ptr + t + 1)
-    kv_len = kv_end - kv_start
-    tiles_per_segment = tl.cdiv(kv_len, KV_SPLITS * BLOCK_K)
+    # The split kernel derives its per-token K range either from a prefix-sum
+    # indptr (unified pool) or from a context length (paged block table); mirror
+    # whichever the caller used so ``act_num_segments`` below matches exactly.
+    if USE_CTX_LENS:
+        kv_len = tl.load(kv_indptr_ptr + t)
+    else:
+        kv_start = tl.load(kv_indptr_ptr + t)
+        kv_end = tl.load(kv_indptr_ptr + t + 1)
+        kv_len = kv_end - kv_start
+    # The clamp mirrors the split kernels: kv_len == 0 leaves cdiv at 0, which
+    # would divide by zero deriving act_num_segments below. With it an empty
+    # token falls through to act_num_segments == 0 -> every slot masked -> the
+    # zero output the split kernel also produces.
+    tiles_per_segment = tl.maximum(tl.cdiv(kv_len, KV_SPLITS * BLOCK_K), 1)
     # Only the first ``act_num_segments`` slots of the partial buffer were
     # actually written by the split kernel; the rest are stale.
     act_num_segments = tl.cdiv(kv_len, tiles_per_segment * BLOCK_K)
@@ -389,20 +409,27 @@ def _pa_decode_sparse_reduce(
     )  # [BLOCK_H, BLOCK_D]
 
     # Fold attn_sink as a virtual K of weight 1 (lifted into the main kernel's
-    # domain: base-2 for triton, natural for gluon).
-    sink = (
-        tl.load(attn_sink_ptr + h_offs, mask=h_mask, other=float("-inf")).to(tl.float32)
-        * sink_scale
-    )
-    m_final = tl.maximum(m_max, sink)
-    if USE_EXP2:
-        alpha_kv = tl.exp2(m_max - m_final)
-        alpha_sink = tl.exp2(sink - m_final)
+    # domain: base-2 for triton, natural for gluon). Without a sink the combine
+    # already sits in the m_max domain, so there is nothing to rescale.
+    if HAS_SINK:
+        sink = (
+            tl.load(attn_sink_ptr + h_offs, mask=h_mask, other=float("-inf")).to(
+                tl.float32
+            )
+            * sink_scale
+        )
+        m_final = tl.maximum(m_max, sink)
+        if USE_EXP2:
+            alpha_kv = tl.exp2(m_max - m_final)
+            alpha_sink = tl.exp2(sink - m_final)
+        else:
+            alpha_kv = tl.exp(m_max - m_final)
+            alpha_sink = tl.exp(sink - m_final)
+        l_final = l_combined * alpha_kv + alpha_sink
+        acc_final = acc_combined * alpha_kv[:, None]
     else:
-        alpha_kv = tl.exp(m_max - m_final)
-        alpha_sink = tl.exp(sink - m_final)
-    l_final = l_combined * alpha_kv + alpha_sink
-    acc_final = acc_combined * alpha_kv[:, None]
+        l_final = l_combined
+        acc_final = acc_combined
 
     denom = tl.maximum(l_final, 1.0e-30)
     out = tl.where(l_final[:, None] > 0.0, acc_final / denom[:, None], 0.0)
@@ -414,3 +441,276 @@ def _pa_decode_sparse_reduce(
         out.to(out_ptr.dtype.element_ty),
         mask=h_mask[:, None] & d_mask[None, :],
     )
+
+
+_pa_decode_sparse_shuffled_repr = make_kernel_repr(
+    "_pa_decode_sparse_shuffled",
+    [
+        "BLOCK_H",
+        "BLOCK_D",
+        "PAGE_SIZE",
+        "PAGES_PER_TILE",
+        "H",
+        "D",
+        "KV_SPLITS",
+    ],
+)
+
+
+@triton.jit(repr=_pa_decode_sparse_shuffled_repr)
+def _pa_decode_sparse_shuffled(
+    q_ptr,  # [N, H, D]
+    k_ptr,  # SHUFFLE K [P, 1, D//X, PAGE_SIZE, X]
+    v_ptr,  # SHUFFLE V [P, 1, PAGE_SIZE//X, D, X]
+    k_scales_ptr,  # [P, 1, PAGE_SIZE] fp32 when QUANT_KV (dummy otherwise)
+    v_scales_ptr,  # [P, 1, PAGE_SIZE] fp32 when QUANT_KV (dummy otherwise)
+    block_table_ptr,  # [N, MAX_PAGES] int32 — per-token page list
+    ctx_lens_ptr,  # [N] int32 — per-token valid key count
+    m_partial_ptr,  # [N, KV_SPLITS, H_padded] fp32 (unused when KV_SPLITS==1)
+    l_partial_ptr,  # [N, KV_SPLITS, H_padded] fp32 (unused when KV_SPLITS==1)
+    acc_partial_ptr,  # [N, KV_SPLITS, H_padded, D] fp32 (unused when KV_SPLITS==1)
+    attn_sink_ptr,  # [H] (only read when KV_SPLITS==1 and HAS_SINK)
+    out_ptr,  # [N, H, D] (only written when KV_SPLITS==1)
+    max_pages,
+    q_stride_t: tl.constexpr,
+    q_stride_h: tl.constexpr,
+    q_stride_d: tl.constexpr,
+    k_stride_p: tl.constexpr,
+    k_stride_dg: tl.constexpr,
+    k_stride_pos: tl.constexpr,
+    v_stride_p: tl.constexpr,
+    v_stride_pg: tl.constexpr,
+    v_stride_d: tl.constexpr,
+    s_stride_p: tl.constexpr,
+    bt_stride_n: tl.constexpr,
+    mp_stride_t: tl.constexpr,
+    mp_stride_k: tl.constexpr,
+    mp_stride_h: tl.constexpr,
+    lp_stride_t: tl.constexpr,
+    lp_stride_k: tl.constexpr,
+    lp_stride_h: tl.constexpr,
+    ap_stride_t: tl.constexpr,
+    ap_stride_k: tl.constexpr,
+    ap_stride_h: tl.constexpr,
+    ap_stride_d: tl.constexpr,
+    out_stride_t: tl.constexpr,
+    out_stride_h: tl.constexpr,
+    out_stride_d: tl.constexpr,
+    H: tl.constexpr,
+    D: tl.constexpr,
+    KV_SPLITS: tl.constexpr,
+    softmax_scale: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    PAGES_PER_TILE: tl.constexpr,
+    X: tl.constexpr,
+    HAS_SINK: tl.constexpr,
+    QUANT_KV: tl.constexpr,
+    USE_EXP2: tl.constexpr,
+    num_warps: tl.constexpr,
+):
+    """3D split-K sparse paged-decode over a SHUFFLE K/V cache pair.
+
+    Same skeleton as ``_pa_decode_sparse`` -- grid (N, ceil(H/BLOCK_H),
+    KV_SPLITS), widened BLOCK_H so one CTA owns all of a token's heads, split-K
+    over the third axis -- but the keys come from a *paged* cache addressed by a
+    per-token block table (``block_table``/``ctx_lens``, the compacted top-k
+    selection) rather than a page_size=1 unified pool, and K and V live in
+    separate tensors in AMD's SHUFFLE (asm) layout:
+
+        K[page, pos, d] at  page*k_stride_p + (d//X)*k_stride_dg
+                            + pos*k_stride_pos + (d%X)
+        V[page, pos, d] at  page*v_stride_p + (pos//X)*v_stride_pg
+                            + d*v_stride_d + (pos%X)
+
+    That interleaving is what makes the tiles 3-D here. Addressing K as a plain
+    [BLOCK_K, D] tile makes the offset non-affine in ``d`` (it steps by 1 inside
+    an X-group and by k_stride_dg between groups), so Triton cannot prove
+    contiguity and falls back to per-element loads -- ~5x slower end to end.
+    Loading [BLOCK_K, D//X, X] instead keeps ``X`` as its own affine axis with
+    unit stride, which vectorises to 16-byte ``buffer_load_b128``; the trailing
+    ``tl.reshape`` back to [BLOCK_K, D] is a pure re-index of the same registers
+    (d == (d//X)*X + d%X). V is loaded pre-transposed, [D, BLOCK_K//X, X] ->
+    [D, BLOCK_K], for the same reason.
+
+    ``QUANT_KV`` carries MiniMax-M3's *per-token* fp8 descale (one fp32 per
+    cached token, not per D-group): K's folds onto the score columns and V's
+    onto the softmax probabilities, both exact because the factor is constant
+    along D.
+    """
+    BLOCK_K: tl.constexpr = PAGE_SIZE * PAGES_PER_TILE
+    DG: tl.constexpr = D // X  # d-groups per head-dim row
+    VG: tl.constexpr = BLOCK_K // X  # pos-groups per KV tile
+    PPG: tl.constexpr = PAGE_SIZE // X  # pos-groups per page
+    LOG2E = 1.4426950408889634
+
+    t = tl.program_id(0)
+    pid_h = tl.program_id(1)
+    pid_k = tl.program_id(2)
+
+    h_offs = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
+    d_offs = tl.arange(0, BLOCK_D)
+    h_mask = h_offs < H
+    d_mask = d_offs < D
+
+    q = tl.load(
+        q_ptr
+        + t * q_stride_t
+        + h_offs[:, None] * q_stride_h
+        + d_offs[None, :] * q_stride_d,
+        mask=h_mask[:, None] & d_mask[None, :],
+        other=0.0,
+    )
+    # When USE_EXP2, fold log2(e) into q so QK scores land in the base-2 domain
+    # and per-element softmax uses the bare exp2 HW instruction.
+    qk_scale = softmax_scale * LOG2E if USE_EXP2 else softmax_scale
+    q = (q.to(tl.float32) * qk_scale).to(q_ptr.dtype.element_ty)
+
+    kv_len = tl.load(ctx_lens_ptr + t)
+
+    # aiter unified_attention 3d pattern: fixed grid axis (KV_SPLITS), runtime
+    # tiles_per_segment, early-return for trailing segments past the end.
+    tiles_per_segment = tl.maximum(tl.cdiv(kv_len, KV_SPLITS * BLOCK_K), 1)
+    # tl.maximum(kv_len, 1): with kv_len == 0 the plain ``>= kv_len`` test is
+    # true even for pid_k 0, so every segment would bail and leave ``out`` at
+    # its torch.empty contents. Letting segment 0 through emits the zeros.
+    if pid_k * tiles_per_segment * BLOCK_K >= tl.maximum(kv_len, 1):
+        return
+
+    num_tiles = tl.cdiv(kv_len, BLOCK_K)
+    tile_start = pid_k * tiles_per_segment
+    tile_end = tl.minimum((pid_k + 1) * tiles_per_segment, num_tiles)
+
+    if KV_SPLITS == 1 and HAS_SINK:
+        sink_scale = LOG2E if USE_EXP2 else 1.0
+        sink = (
+            tl.load(attn_sink_ptr + h_offs, mask=h_mask, other=float("-inf")).to(
+                tl.float32
+            )
+            * sink_scale
+        )
+        m_i = sink
+        if USE_EXP2:
+            l_i = tl.exp2(sink - m_i)
+        else:
+            l_i = tl.full((BLOCK_H,), 1.0, dtype=tl.float32)
+    else:
+        m_i = tl.full((BLOCK_H,), float("-inf"), dtype=tl.float32)
+        l_i = tl.zeros((BLOCK_H,), dtype=tl.float32)
+    acc = tl.zeros((BLOCK_H, BLOCK_D), dtype=tl.float32)
+
+    # Per-tile K offsets, tile shape [BLOCK_K, DG, X] -> reshape [BLOCK_K, D].
+    k_off = (
+        (tl.arange(0, BLOCK_K)[:, None, None] % PAGE_SIZE) * k_stride_pos
+        + tl.arange(0, DG)[None, :, None] * k_stride_dg
+        + tl.arange(0, X)[None, None, :]
+    )
+    k_page_slot = (tl.arange(0, BLOCK_K) // PAGE_SIZE)[:, None, None]
+    # Per-tile V offsets, tile shape [D, VG, X] -> reshape [D, BLOCK_K] (V^T).
+    v_off = (
+        d_offs[:, None, None] * v_stride_d
+        + (tl.arange(0, VG)[None, :, None] % PPG) * v_stride_pg
+        + tl.arange(0, X)[None, None, :]
+    )
+    v_page_slot = (tl.arange(0, VG) // PPG)[None, :, None]
+
+    k_pos = tl.arange(0, BLOCK_K)
+    bt_row = block_table_ptr + t * bt_stride_n
+
+    for j in tl.range(tile_start, tile_end, num_stages=2):
+        page_base = j * PAGES_PER_TILE
+        valid = (j * BLOCK_K + k_pos) < kv_len
+        # A trailing partial tile can reach past the block table row (max_pages
+        # need not divide by PAGES_PER_TILE), so the page-id gathers are masked
+        # and fall back to page 0 -- an in-bounds page whose keys ``valid`` drops
+        # anyway. That keeps the far larger K/V gathers mask-free.
+        k_slot = page_base + k_page_slot
+        k_pages = tl.load(bt_row + k_slot, mask=k_slot < max_pages, other=0).to(
+            tl.int64
+        )
+        k_raw = tl.load(k_ptr + k_pages * k_stride_p + k_off)
+
+        v_slot = page_base + v_page_slot
+        v_pages = tl.load(bt_row + v_slot, mask=v_slot < max_pages, other=0).to(
+            tl.int64
+        )
+        v_raw = tl.load(v_ptr + v_pages * v_stride_p + v_off)
+
+        if QUANT_KV:
+            k_raw = k_raw.to(q_ptr.dtype.element_ty)
+            v_raw = v_raw.to(q_ptr.dtype.element_ty)
+        k_tile = tl.reshape(k_raw, (BLOCK_K, D))
+        v_tile = tl.reshape(v_raw, (D, BLOCK_K))
+
+        scores = tl.dot(q, tl.trans(k_tile))
+        if QUANT_KV:
+            # ``k_pages`` already carries one page id per token of the tile.
+            s_pages = tl.reshape(k_pages, (BLOCK_K,))
+            s_pos = k_pos % PAGE_SIZE
+            k_dq = tl.load(k_scales_ptr + s_pages * s_stride_p + s_pos)
+            scores = scores * k_dq[None, :]
+        scores = tl.where(h_mask[:, None] & valid[None, :], scores, float("-inf"))
+
+        m_block = tl.max(scores, axis=1)
+        m_new = tl.maximum(m_i, m_block)
+        # A tile with no valid key leaves m_new == -inf, so exp(m_i - m_new)
+        # = exp(-inf + inf) = NaN; with l_i/acc still 0 that NaN survives as
+        # 0*NaN and poisons the split. Treat such a tile as a no-op.
+        if USE_EXP2:
+            alpha = tl.where(m_new == float("-inf"), 1.0, tl.exp2(m_i - m_new))
+            p = tl.exp2(scores - m_new[:, None])
+        else:
+            alpha = tl.where(m_new == float("-inf"), 1.0, tl.exp(m_i - m_new))
+            p = tl.exp(scores - m_new[:, None])
+        p = tl.where(h_mask[:, None] & valid[None, :], p, 0.0)
+        l_new = l_i * alpha + tl.sum(p, axis=1)
+
+        if QUANT_KV:
+            v_dq = tl.load(v_scales_ptr + s_pages * s_stride_p + s_pos)
+            p = p * v_dq[None, :]
+
+        acc = acc * alpha[:, None]
+        acc = tl.dot(p.to(k_tile.dtype), tl.trans(v_tile), acc)
+        m_i = m_new
+        l_i = l_new
+
+    if KV_SPLITS == 1:
+        denom = tl.maximum(l_i, 1.0e-30)
+        out = tl.where(l_i[:, None] > 0.0, acc / denom[:, None], 0.0)
+        tl.store(
+            out_ptr
+            + t * out_stride_t
+            + h_offs[:, None] * out_stride_h
+            + d_offs[None, :] * out_stride_d,
+            out.to(out_ptr.dtype.element_ty),
+            mask=h_mask[:, None] & d_mask[None, :],
+        )
+    else:
+        # Emit partials. The reduce reads (m, l, acc) per split and folds in the
+        # sink there, so we do *not* touch attn_sink here.
+        tl.store(
+            m_partial_ptr
+            + t * mp_stride_t
+            + pid_k * mp_stride_k
+            + h_offs * mp_stride_h,
+            m_i,
+            mask=h_mask,
+        )
+        tl.store(
+            l_partial_ptr
+            + t * lp_stride_t
+            + pid_k * lp_stride_k
+            + h_offs * lp_stride_h,
+            l_i,
+            mask=h_mask,
+        )
+        tl.store(
+            acc_partial_ptr
+            + t * ap_stride_t
+            + pid_k * ap_stride_k
+            + h_offs[:, None] * ap_stride_h
+            + d_offs[None, :] * ap_stride_d,
+            acc,
+            mask=h_mask[:, None] & d_mask[None, :],
+        )
