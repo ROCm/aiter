@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2025 FlyDSL Project Contributors
-# Modifications Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
+# Modifications Copyright (C) 2026 Advanced Micro Devices, Inc.
 
 """Uncached HIP IPC helpers for the FlyDSL INT4 QuickReduce inbox."""
 
