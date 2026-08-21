@@ -7,8 +7,6 @@ from typing import Any
 import torch
 from torch import Generator, Tensor
 
-from csrc.cpp_itfs.torch_utils import direct_register_custom_op
-
 from ..jit.core import AITER_META_DIR, CK_DIR, ENABLE_CK, compile_ops
 from ..jit.utils.chip_info import get_cu_num, get_gfx
 from ..jit.utils.mha_recipes import (
@@ -286,6 +284,11 @@ def _mha_fwd_native_splitkv(
 ) -> None: ...
 
 
+@torch_compile_guard(
+    mutates_args=["out"],
+    device="cuda",
+    gen_fake=gen_mha_fwd_native_splitkv_fake_tensors,
+)
 def mha_fwd_native_splitkv(
     q: Tensor,
     k: Tensor,
@@ -296,9 +299,11 @@ def mha_fwd_native_splitkv(
     return_lse: bool,
     num_splits: int,
 ) -> tuple[Tensor, Tensor]:
-    # Registered as torch.ops.aiter.mha_fwd_native_splitkv (opaque under
-    # torch.compile via the fake below); this eager impl allocates every buffer
-    # (the de-torched kernel can no longer allocate) and calls the void kernel.
+    # @torch_compile_guard registers this as torch.ops.aiter.mha_fwd_native_splitkv
+    # (opaque under torch.compile via the gen_fake above) *and* rebinds this module
+    # name to the op dispatcher, so callers keep writing the plain Python name.
+    # This eager impl allocates every buffer (the de-torched kernel can no longer
+    # allocate) and calls the void kernel.
     batch_size, seqlen_q, nhead_q, hdim = q.shape
     G = int(num_splits)
     o = (
@@ -336,14 +341,6 @@ def mha_fwd_native_splitkv(
         num_splits,
     )
     return o, lse
-
-
-direct_register_custom_op(
-    "mha_fwd_native_splitkv",
-    mha_fwd_native_splitkv,
-    ["out"],
-    fake_impl=gen_mha_fwd_native_splitkv_fake_tensors,
-)
 
 
 def gen_fmha_v3_fwd_fake_tensors(
@@ -2077,7 +2074,7 @@ def _flash_attn_forward(
             ), (  # ceil(seqlen_k/64); don't silently clamp
                 f"num_splits={ns} too large for seqlen_k={seqlen_k}"
             )
-            out_, softmax_lse = torch.ops.aiter.mha_fwd_native_splitkv(
+            out_, softmax_lse = mha_fwd_native_splitkv(
                 q, k, v, out, softmax_scale, causal, return_lse, ns
             )
             S_dmask = None
