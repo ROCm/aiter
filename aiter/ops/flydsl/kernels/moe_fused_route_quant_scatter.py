@@ -452,7 +452,7 @@ def _emit_quant_block_loop(c: SimpleNamespace) -> None:
                 _if_lead = scf.IfOp(_raw(c.is_block_lead))
                 with ir.InsertionPoint(_if_lead.then_block):
                     dst_scale_dword = (
-                        dst.scale_row_dword_base + scale_dword * c.c_wmma_rep
+                        dst.scale_row_dword_base + scale_dword * c.c_wmma_rep * 16
                     )
                     dst_scale_byte = dst_scale_dword * c.c4_i32 + byte_in_dword
                     buffer_ops.buffer_store(e8m0_byte, c.scale_rsrc, dst_scale_byte)
@@ -573,6 +573,7 @@ def build_moe_fused_route_quant_scatter_module(
         gather_w: fx.Pointer,  # (numel,) weight_dtype out; kept->cast, drops->0
         n_buckets: Int32,  # sentinel value (== dropped) / local expert count
     ):
+        """Write masked or contiguous ``(Mtile, K//128, wmma_rep, 16, 4)`` scales."""
         i32 = T.i32
         f32 = T.f32
         wdt = {"bf16": T.bf16, "f16": T.f16}[weight_dtype]
@@ -709,9 +710,11 @@ def build_moe_fused_route_quant_scatter_module(
                 row_in_tile = grouped_row - scale_tile * c_rows_per_tile
                 wmma_row = fx.Uint32(row_in_tile) // fx.Uint32(c16_i32)
                 row_lane16 = row_in_tile - wmma_row * c16_i32
-                out_row = scale_tile * c16_i32 + row_lane16
-                # dst dword base for out_row; scale_dword*wmma_rep added per block.
-                scale_row_dword_base = out_row * c_dst_scale_dwords_per_row + wmma_row
+                scale_row_dword_base = (
+                    scale_tile * c_dst_scale_dwords_per_row * c16_i32
+                    + wmma_row * c16_i32
+                    + row_lane16
+                )
 
                 payload_base = fx.Int64(ptrtoint(grouped_payload))
                 hidden_base = fx.Int64(ptrtoint(hidden))
@@ -894,6 +897,7 @@ def build_moe_fused_route_quant_scatter_st_ksplit_module(
         expert_row_base: fx.Pointer,  # (E,) int32
         numel: Int32,  # == topk for this specialization
     ):
+        """Write masked or contiguous ``(Mtile, K//128, wmma_rep, 16, 4)`` scales."""
         i32 = T.i32
         f32 = T.f32
 
@@ -961,8 +965,11 @@ def build_moe_fused_route_quant_scatter_st_ksplit_module(
             row_in_tile = grouped_row - scale_tile * c_rows_per_tile
             wmma_row = fx.Uint32(row_in_tile) // fx.Uint32(c16_i32)
             row_lane16 = row_in_tile - wmma_row * c16_i32
-            out_row = scale_tile * c16_i32 + row_lane16
-            scale_row_dword_base = out_row * c_dst_scale_dwords_per_row + wmma_row
+            scale_row_dword_base = (
+                scale_tile * c_dst_scale_dwords_per_row * c16_i32
+                + wmma_row * c16_i32
+                + row_lane16
+            )
 
             payload_base = fx.Int64(ptrtoint(grouped_payload))
             hidden_base = fx.Int64(ptrtoint(hidden))
@@ -1137,6 +1144,7 @@ def build_moe_fused_quant_preshuffle_module(
         n_rows: Int32,
         max_m: Int32,
     ):
+        """Write scales as ``(E, M//(wmma_rep*16), K//128, wmma_rep, 16, 4)``."""
         i32 = T.i32
         f32 = T.f32
 
@@ -1180,11 +1188,11 @@ def build_moe_fused_quant_preshuffle_module(
                 row_in_tile = slot - scale_tile * c_rows_per_tile
                 wmma_row = fx.Uint32(row_in_tile) // fx.Uint32(c16_i32)
                 row_lane16 = row_in_tile - wmma_row * c16_i32
-                out_row = scale_tile * c16_i32 + row_lane16
                 scale_row_dword_base = (
                     expert * (m * c_scale_dwords_per_row)
-                    + out_row * c_dst_scale_dwords_per_row
-                    + wmma_row
+                    + scale_tile * c_dst_scale_dwords_per_row * c16_i32
+                    + wmma_row * c16_i32
+                    + row_lane16
                 )
 
                 payload_base = fx.Int64(ptrtoint(grouped_payload))
@@ -1348,6 +1356,7 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
         numel: Int32,
         num_valid_routes: fx.Pointer,  # (1,) int32: routes >= this are dead-tail padding (EP dynamic token count); skip
     ):
+        """Write masked or contiguous ``(Mtile, K//128, wmma_rep, 16, 4)`` scales."""
         i32 = T.i32
         f32 = T.f32
 
@@ -1433,8 +1442,11 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
             row_in_tile = row - scale_tile * c_rows_per_tile
             wmma_row = fx.Uint32(row_in_tile) // fx.Uint32(c16_i32)
             row_lane16 = row_in_tile - wmma_row * c16_i32
-            out_row = scale_tile * c16_i32 + row_lane16
-            scale_row_dword_base = out_row * c_dst_scale_dwords_per_row + wmma_row
+            scale_row_dword_base = (
+                scale_tile * c_dst_scale_dwords_per_row * c16_i32
+                + wmma_row * c16_i32
+                + row_lane16
+            )
 
             if const_expr(source_topk > 0):
                 if const_expr(source_topk_is_pow2):
@@ -1652,6 +1664,7 @@ def build_moe_fused_route_psum_quant_scatter_module(
         tile_m: Int32,
         num_workers: Int32,
     ):
+        """Write ``(contiguous_m//(wmma_rep*16), K//128, wmma_rep, 16, 4)`` scales."""
         i32 = T.i32
         f32 = T.f32
 
@@ -1837,8 +1850,11 @@ def build_moe_fused_route_psum_quant_scatter_module(
             row_in_tile = grouped_row - scale_tile * c_rows_per_tile
             wmma_row = fx.Uint32(row_in_tile) // fx.Uint32(c16_i32)
             row_lane16 = row_in_tile - wmma_row * c16_i32
-            out_row = scale_tile * c16_i32 + row_lane16
-            scale_row_dword_base = out_row * c_dst_scale_dwords_per_row + wmma_row
+            scale_row_dword_base = (
+                scale_tile * c_dst_scale_dwords_per_row * c16_i32
+                + wmma_row * c16_i32
+                + row_lane16
+            )
 
             block_in_wave = fx.Uint32(lane) // fx.Uint32(c_lanes_per_block)
             lane_in_block = lane - block_in_wave * c_lanes_per_block
