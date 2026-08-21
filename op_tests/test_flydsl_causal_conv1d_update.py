@@ -266,12 +266,15 @@ def _oracle_vllm(
     null_block_id=NULL_BLOCK_ID,
     query_start_loc=None,
     max_query_len=-1,
+    block_idx_last_scheduled_token=None,
+    initial_state_idx=None,
 ):
     """vLLM's own ``causal_conv1d_update`` (rev ``63a9a5010``), run as the oracle.
 
-    Takes the packed arguments too: upstream handles the packed layout itself, so
-    unlike a dense reference this needs no separate story for it. Note the
-    wrapper defaults ``out`` to ``x`` and writes in place, hence the copies.
+    Takes the packed and prefix-caching arguments too: upstream handles both
+    layouts itself, so unlike a dense reference this needs no separate story for
+    them. Note the wrapper defaults ``out`` to ``x`` and writes in place, hence
+    the copies.
     """
     kw = {
         "conv_state_indices": conv_state_indices,
@@ -279,6 +282,8 @@ def _oracle_vllm(
         "null_block_id": null_block_id,
         "query_start_loc": query_start_loc,
         "max_query_len": max_query_len,
+        "block_idx_last_scheduled_token": block_idx_last_scheduled_token,
+        "initial_state_idx": initial_state_idx,
     }
     state = conv_state.clone()
     out = causal_conv1d_update_vllm_upstream(
@@ -684,6 +689,105 @@ def test_vllm_skips_the_null_block():
     assert not torch.equal(
         state[1], t["conv_state"][1]
     ), "a live sequence was skipped as well, so nothing was actually tested"
+
+
+#: (batch, dim, width, seqlen, spec) for prefix caching. Both decode and verify,
+#: since the mode is orthogonal to the rolled window but shares the coords with
+#: it.
+_APC_CASES = [
+    (4, 256, 4, 1, False),
+    (4, 256, 4, 4, True),
+    (8, 512, 2, 1, False),
+    (2, 128, 3, 4, True),
+]
+
+
+@pytest.mark.parametrize("batch,dim,width,seqlen,spec", _APC_CASES)
+def test_vllm_prefix_caching_writes_back_to_the_scheduled_block(
+    batch, dim, width, seqlen, spec
+):
+    """With APC on, the history and the write-back come from different blocks.
+
+    The predicate accepts ``block_idx_last_scheduled_token``, so a caller can
+    reach the kernel's IS_APC path: ``conv_state_indices`` is 2D, the history is
+    read from the block the state was last computed into and the rolled window
+    goes to the block scheduled for this step, which is vLLM's copy-on-write for
+    a prefix-cached block. Nothing else in the suite passes those arguments, so
+    the second coord could be wrong -- or equal to the first -- with every other
+    test still green, and what that corrupts is the block some later sequence
+    reads.
+    """
+    num_blocks = 3
+    state_len = (width - 1 + (seqlen - 1)) if spec else (width - 1)
+    gen = torch.Generator(device=DEVICE).manual_seed(batch * 7 + width)
+    x = torch.randn((batch, dim, seqlen), generator=gen, device=DEVICE, dtype=DTYPE)
+    weight = torch.randn((dim, width), generator=gen, device=DEVICE, dtype=DTYPE)
+    bias = torch.randn((dim,), generator=gen, device=DEVICE, dtype=DTYPE)
+    num_accepted = (
+        torch.randint(
+            1, seqlen + 1, (batch,), dtype=torch.int32, device=DEVICE, generator=gen
+        )
+        if spec
+        else None
+    )
+
+    # Line 0 is ``null_block_id`` on this interface, so the blocks start at 1.
+    # Every sequence gets its own, which is what lets a write to the wrong line
+    # show up as a difference rather than being overwritten by its owner.
+    lines = batch * num_blocks + 1
+    conv_state = torch.randn(
+        (lines, dim, state_len), generator=gen, device=DEVICE, dtype=DTYPE
+    )
+    indices = torch.arange(1, lines, dtype=torch.int32, device=DEVICE).reshape(
+        batch, num_blocks
+    )
+
+    # Read and write blocks differ for most sequences and coincide for every
+    # third, so the case the mode exists for and the in-place one it still has to
+    # handle are both covered.
+    init_idx = torch.tensor(
+        [i % num_blocks for i in range(batch)], dtype=torch.int32, device=DEVICE
+    )
+    last_idx = torch.tensor(
+        [
+            (i % num_blocks) if i % 3 == 0 else (i % num_blocks + 1) % num_blocks
+            for i in range(batch)
+        ],
+        dtype=torch.int32,
+        device=DEVICE,
+    )
+    assert (init_idx != last_idx).any(), "no sequence actually copies on write"
+
+    state_fly = conv_state.clone()
+    out_fly = causal_conv1d_update_flydsl(
+        x.clone(),
+        state_fly,
+        weight,
+        bias=bias,
+        activation="silu",
+        conv_state_indices=indices,
+        num_accepted_tokens=num_accepted,
+        block_idx_last_scheduled_token=last_idx,
+        initial_state_idx=init_idx,
+    )
+    ref = _oracle_vllm(
+        x,
+        conv_state,
+        weight,
+        bias,
+        indices,
+        num_accepted,
+        block_idx_last_scheduled_token=last_idx,
+        initial_state_idx=init_idx,
+    )
+
+    label = f"vllm apc b{batch} d{dim} w{width} s{seqlen} spec={spec}"
+    _assert_tracks_spec(label, out_fly, ref.spec, ref.scale)
+    _assert_no_worse_than(
+        label, out_fly, ref.out, ref.spec, ref.scale, "vLLM's own kernel"
+    )
+    # The whole buffer, so a roll written to the wrong block is caught too.
+    _assert_bit_exact(label, "conv_state write-back", state_fly, ref.state)
 
 
 # -- SGLang interface -----------------------------------------------------
@@ -2039,6 +2143,7 @@ def _run_correctness():
         (test_vllm_channels_per_thread_agree, [(1,), (2,)]),
         (test_cpt_policy_backs_off_for_long_speculative_windows, [()]),
         (test_vllm_skips_the_null_block, [()]),
+        (test_vllm_prefix_caching_writes_back_to_the_scheduled_block, _APC_CASES),
         (test_sglang_matches_upstream_sglang, _SGLANG_CASES),
         (
             test_sglang_matches_upstream_across_widths_and_dtypes,
