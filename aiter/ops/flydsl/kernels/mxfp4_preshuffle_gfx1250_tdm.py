@@ -1002,9 +1002,7 @@ def launch_gemm_a8w4_tdm(
             # suffices: peer multicast loads are pairwise matched with ours.
             pipeline_fence(outstanding=0)
             is_fp4_quant = bool(stage1_quant_out and a_is_fp4)
-            STORE_N = (
-                tile_n // (4 if is_fp4_quant else 2) if stage1_act else tile_n
-            )
+            STORE_N = tile_n // (4 if is_fp4_quant else 2) if stage1_act else tile_n
             # Unpadded, a row is STORE_N/2 dwords (a multiple of 32), so the 16
             # rows one b128 writes all hit one bank -- 16-way. +16 cols spreads
             # them to 4-way, the b128 floor. Pad cols never reach global.
@@ -1096,9 +1094,7 @@ def launch_gemm_a8w4_tdm(
                             if const_expr(is_fp4_quant):
                                 for sub_wn in range_constexpr(WN_PER_MX_BLOCK):
                                     wn = mx_blk * WN_PER_MX_BLOCK + sub_wn
-                                    local_vals = all_vals[
-                                        sub_wn * 4 : sub_wn * 4 + 4
-                                    ]
+                                    local_vals = all_vals[sub_wn * 4 : sub_wn * 4 + 4]
                                     peer_vals = [
                                         fx.Float32(value).shuffle_xor(16, WAVE)
                                         for value in local_vals
@@ -1116,14 +1112,10 @@ def launch_gemm_a8w4_tdm(
                                         lds_store_b32(
                                             stC_idx,
                                             row_rel * STORE_N + col_fp4,
-                                            Vec.from_elements(
-                                                [packed_i32], fx.Int32
-                                            ),
+                                            Vec.from_elements([packed_i32], fx.Int32),
                                         )
                             else:
-                                for half in range_constexpr(
-                                    WN_PER_MX_BLOCK // 2
-                                ):
+                                for half in range_constexpr(WN_PER_MX_BLOCK // 2):
                                     src = Vec.from_elements(
                                         all_vals[half * 8 : half * 8 + 8],
                                         fx.Float32,
