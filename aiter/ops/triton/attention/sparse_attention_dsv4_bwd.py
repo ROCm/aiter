@@ -191,7 +191,10 @@ def sparse_mla_bwd_dsv4(
         inv_ptr, inv_data = build_inverted_topk(
             topk_indices[:, r : r + R_CHUNK], num_kv
         )
-        dkv_gather_acc(interm, inv_ptr, inv_data, dkv_acc)
+        # dkv_acc was just zeroed, so the first chunk can write instead of read-modify-write.
+        # Unchunked -- the default -- that is the only chunk, and it saves reading back the
+        # whole [num_kv, 512] fp32 accumulator.
+        dkv_gather_acc(interm, inv_ptr, inv_data, dkv_acc, accumulate=(r > 0))
 
     dkv = dkv_acc.to(kv.dtype)
 

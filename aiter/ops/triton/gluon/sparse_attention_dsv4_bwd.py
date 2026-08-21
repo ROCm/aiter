@@ -427,7 +427,6 @@ _dkv_interm_v4_kernel_repr = make_kernel_repr(
         "D",
         "MFMA_K",
         "DUAL_STAGE",
-        "PREFETCH",
     ],
 )
 
@@ -455,7 +454,6 @@ def _dkv_interm_v4_kernel(
     D: gl.constexpr,
     MFMA_K: gl.constexpr,
     DUAL_STAGE: gl.constexpr,
-    PREFETCH: gl.constexpr,
 ):
     """Grid (T, D//BD). NH is the padded head count and the mfma contraction dim."""
     # instr_shape[2]=32: on gfx950 v_mfma_f32_16x16x32_bf16 does 2x the FLOPs of the 16-deep
@@ -568,65 +566,19 @@ def _dkv_interm_v4_kernel(
     offs_d_st = d_off + gl.arange(0, BD, layout=gl.SliceLayout(1, mfma))
     offs_col_st = gl.arange(0, TILE_K, layout=gl.SliceLayout(0, mfma))
 
-    # dS/P prefetch one rank tile ahead: without it the HBM load latency is fully exposed every
-    # iteration, which is what caps the restructured kernel once it stops being BW-bound. The
-    # last iteration re-loads tile NUM_TILES-1 rather than branching -- one redundant 8 KB load
-    # in NUM_TILES, cheaper than peeling the loop.
-    offs0 = (
-        ds_base
-        + offs_h_ds[:, None].to(tl.int64) * stride_ds_h
-        + offs_k_ds[None, :].to(tl.int64)
-    )
-    dS_nxt = gl.amd.cdna4.buffer_load(
-        ptr=dS_ptr, offsets=offs0.to(tl.int32), mask=mask_h_ds[:, None], other=0.0
-    )
-    P_nxt = gl.amd.cdna4.buffer_load(
-        ptr=P_ptr, offsets=offs0.to(tl.int32), mask=mask_h_ds[:, None], other=0.0
-    )
-
     for t in range(NUM_TILES):
-        if PREFETCH:
-            dS_blk = dS_nxt
-            P_blk = P_nxt
-            # re-load the last tile rather than branch: one redundant 8 KB load in NUM_TILES
-            t_nxt = min(t + 1, NUM_TILES - 1)
-            col_n = t_nxt * TILE_K + offs_k_ds
-            offs_n = (
-                ds_base
-                + offs_h_ds[:, None].to(tl.int64) * stride_ds_h
-                + col_n[None, :].to(tl.int64)
-            )
-            dS_nxt = gl.amd.cdna4.buffer_load(
-                ptr=dS_ptr,
-                offsets=offs_n.to(tl.int32),
-                mask=mask_h_ds[:, None],
-                other=0.0,
-            )
-            P_nxt = gl.amd.cdna4.buffer_load(
-                ptr=P_ptr,
-                offsets=offs_n.to(tl.int32),
-                mask=mask_h_ds[:, None],
-                other=0.0,
-            )
-        else:
-            col_c = t * TILE_K + offs_k_ds
-            offs_c = (
-                ds_base
-                + offs_h_ds[:, None].to(tl.int64) * stride_ds_h
-                + col_c[None, :].to(tl.int64)
-            )
-            dS_blk = gl.amd.cdna4.buffer_load(
-                ptr=dS_ptr,
-                offsets=offs_c.to(tl.int32),
-                mask=mask_h_ds[:, None],
-                other=0.0,
-            )
-            P_blk = gl.amd.cdna4.buffer_load(
-                ptr=P_ptr,
-                offsets=offs_c.to(tl.int32),
-                mask=mask_h_ds[:, None],
-                other=0.0,
-            )
+        col_c = t * TILE_K + offs_k_ds
+        offs_c = (
+            ds_base
+            + offs_h_ds[:, None].to(tl.int64) * stride_ds_h
+            + col_c[None, :].to(tl.int64)
+        )
+        dS_blk = gl.amd.cdna4.buffer_load(
+            ptr=dS_ptr, offsets=offs_c.to(tl.int32), mask=mask_h_ds[:, None], other=0.0
+        )
+        P_blk = gl.amd.cdna4.buffer_load(
+            ptr=P_ptr, offsets=offs_c.to(tl.int32), mask=mask_h_ds[:, None], other=0.0
+        )
 
         dS_dot = gl.convert_layout(dS_blk, dot_b)
         P_dot = gl.convert_layout(P_blk, dot_b)
@@ -658,20 +610,14 @@ def sparse_mla_bwd_dkv_interm_v4(
     TILE_K=128,
     MFMA_K=32,
     DUAL_STAGE=1,
-    PREFETCH=0,
     H_POW2=None,
     num_warps=4,
     interm=None,
 ):
     """V4 dKV-interm, Q/dO read once. Returns interm [T, R_CHUNK, D] bf16.
 
-    Defaults measured at T=4096 H=128 topk=512 on gfx950 (MI355X): 1.170 ms. Sweep notes:
-      * BD=256 beats 128 (traffic: dS/P costs D/BD x).
-      * MFMA_K=32 is worth ~14% at the best config. It only pays once the kernel is off the
-        bandwidth ceiling, which is what splitting D across grid.y buys.
-      * PREFETCH=0: prefetching dS/P helps at BD=128 but is consistently WORSE at BD=256
-        (1.181 -> 1.306), where the extra live registers cost occupancy.
-      * DUAL_STAGE=1 (both prologue copies behind one drain) is a small consistent win.
+    ``BD`` splits D across ``grid.y``; dS/P are re-read once per D block, so a larger BD moves
+    less of them. ``MFMA_K=32`` is the CDNA4 16x16x32 depth.
     """
     T, H, D = q.shape
     assert R_CHUNK % TILE_K == 0
@@ -701,7 +647,6 @@ def sparse_mla_bwd_dkv_interm_v4(
         D=D,
         MFMA_K=MFMA_K,
         DUAL_STAGE=DUAL_STAGE,
-        PREFETCH=PREFETCH,
         num_warps=num_warps,
     )
     return interm
@@ -736,9 +681,8 @@ def _delta_v4_kernel(
 
 
 def delta_v4(o, do, out=None, BLOCK_R=8, num_warps=8):
-    # BLOCK_R=8 / num_warps=8 measured best (0.173 ms, 6.21 TB/s = 78% peak at T4096 H128);
-    # the whole sweep plateaus at 0.173-0.187 once a lane loads >= 8 bf16, i.e. once the load
-    # is a dwordx4. Below that (BLOCK_R=2 nw=8, 2 bf16/lane) it falls off a cliff to 3.12 TB/s.
+    # BLOCK_R=8 keeps each lane loading >= 8 bf16, i.e. a dwordx4; narrower blocks drop to a
+    # dword and the kernel loses most of its bandwidth.
     """o[T,H,D] bf16, do[T,H,D] bf16 -> delta[T,H] fp32 = sum_d o*do.
 
     ``do`` must already be the D-wide (lora) slice, contiguous — same contract as the dQ kernel.
@@ -784,18 +728,16 @@ def _bwd_dkv_gather_acc_v4(
 ):
     """Grid (num_kv,) — one CTA per KV token, BLOCK_E CSR entries in flight.
 
-    Carrying ``BLOCK_E`` entries per iteration rather than walking the run one entry at a time
-    buys two separate things, and this gather needs both:
+    ``BLOCK_E`` entries are carried per iteration, which the gather needs for two reasons:
 
       * **load width.** A bare ``tl.arange(0, D)`` block over 256 threads is 2 bf16 = 4 B per
-        lane -- a dword. The [BLOCK_E, D] block gives ``BLOCK_E*D/threads`` elements per lane
-        instead, so the loads become dwordx4. The gather is issue-bound, so this dominates.
-      * **loop trip count.** The run is consumed BLOCK_E entries at a time and ``tl.sum`` over
-        the entry axis folds them. A realistic top-k gives run lengths up to ~3000 (pool rows),
-        so the serial walk was the other half of the problem.
+        lane -- a dword. The [BLOCK_E, D] block gives ``BLOCK_E*D/threads`` elements per lane,
+        so the loads become dwordx4. The gather is issue-bound, so this dominates.
+      * **trip count.** ``tl.sum`` folds the entry axis, so the run is consumed BLOCK_E at a
+        time. A realistic top-k gives run lengths up to ~3000 on the pool rows.
 
-    ``ACCUMULATE=False`` skips the read-modify-write of the destination, valid when the caller
-    does not chunk (each KV row is then written by exactly one CTA).
+    ``ACCUMULATE=False`` writes the destination instead of reading it back first. The caller
+    uses it for the first chunk, where the accumulator is still zero.
     """
     k = tl.program_id(0)
     offs_d = tl.arange(0, D)
@@ -827,15 +769,12 @@ def build_inverted_topk(topk_indices_slice, num_kv):
     """CSR inverted index over ``num_kv`` KV rows.
 
     One stable sort yields both the permutation (``inv_data``) and the sorted keys;
-    ``inv_ptr[k] = searchsorted(sorted, k, 'left')`` = the number of entries with value < k,
-    which is exactly what ``cumsum(bincount(flat+1))`` computes. Invalid (-1) entries sort to
-    the front, so ``inv_ptr[0]`` starts past them and they are never visited.
+    ``inv_ptr[k] = searchsorted(sorted, k, 'left')`` = the number of entries with value < k.
+    Invalid (-1) entries sort to the front, so ``inv_ptr[0]`` starts past them and they are
+    never visited.
 
-    Two details carry most of the cost, and the obvious formulation gets both wrong -- writing
-    this as ``bincount`` + ``cumsum`` over int64 keys measured 3x slower for the same output:
-      * the sort key is narrowed to int16 when ``num_kv`` fits, so the radix sort makes 2
-        byte-passes instead of 8;
-      * ``searchsorted`` does the job of the separate ``bincount`` + ``cumsum`` passes.
+    The sort key is narrowed to int16 when ``num_kv`` fits, which is what keeps the radix sort
+    to two byte-passes.
 
     Returns ``inv_ptr[num_kv+1]`` int32, ``inv_data[T*R]`` int32.
     """
@@ -857,11 +796,6 @@ def build_inverted_topk(topk_indices_slice, num_kv):
 def dkv_gather_acc(
     interm, inv_ptr, inv_data, dkv_acc, BLOCK_E=64, num_warps=8, accumulate=True
 ):
-    # BLOCK_E=64 / num_warps=8 measured best (0.345 ms, 6.29 TB/s = 79% peak at T4096 H128
-    # topk512 SWA+pool). Time falls monotonically with BLOCK_E across the whole sweep
-    # (4->64: 1.021, 0.715, 0.505, 0.407, 0.345), i.e. both the load width AND the trip count
-    # on the ~3000-entry pool runs were binding. The one-entry-at-a-time walk this replaced
-    # was 1.491 ms at 1.45 TB/s.
     """interm[T,R,D] bf16 -> dkv_acc[num_kv,D] fp32 via the entry-blocked CSR gather.
 
     Grid is ``num_kv`` (from ``dkv_acc``), not ``T``, so a compressed-pool KV works.
