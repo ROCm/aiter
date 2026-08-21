@@ -11,9 +11,7 @@ where each token's K range is an unordered subset of a unified KV pool.
 
 On gfx950 (CDNA4) DeepSeek-V4 sparse-MLA decode has a dedicated gluon
 implementation (bottom of this module): ``pa_decode_sparse`` routes all formats
-to the merged ``_pa_decode_sparse_gfx950_gluon`` driver -- packed fp8_ds_mla /
-bf16 block cache (3D; optional SWA+top-k two-loop via ``extra_*``) and the
-uniform fp8 / bf16 pool (2D).
+to the merged ``_pa_decode_sparse_gfx950_gluon`` driver.
 """
 
 import math
