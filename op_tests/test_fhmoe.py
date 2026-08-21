@@ -919,9 +919,10 @@ def test_fhmoe_runtime_compile_bridge_forwards_xcd(monkeypatch: pytest.MonkeyPat
     ),
 )
 def test_dsv4_i384_fhmoe_fallback_scope(overrides, expected):
-    from aiter.fhmoe import (
+    from aiter.fhmoe import _supports_dsv4_i384_fallback
+    from aiter.fhmoe_config import (
         DSV4_I384_FHMOE_MAX_TOKENS,
-        _supports_dsv4_i384_fallback,
+        DSV4_I384_FHMOE_METADATA_SOURCE_INTER_DIM,
     )
 
     args = {
@@ -938,6 +939,7 @@ def test_dsv4_i384_fhmoe_fallback_scope(overrides, expected):
     args.update(overrides)
 
     assert DSV4_I384_FHMOE_MAX_TOKENS == 2048
+    assert DSV4_I384_FHMOE_METADATA_SOURCE_INTER_DIM == 512
     assert _supports_dsv4_i384_fallback(**args) is expected
 
 

@@ -9,7 +9,10 @@ from dataclasses import replace
 import torch
 
 from aiter import ActivationType, QuantType, dtypes
-from aiter.fhmoe_config import DSV4_I384_FHMOE_MAX_TOKENS
+from aiter.fhmoe_config import (
+    DSV4_I384_FHMOE_MAX_TOKENS,
+    DSV4_I384_FHMOE_METADATA_SOURCE_INTER_DIM,
+)
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.flydsl.moe_common import GateMode
@@ -346,7 +349,7 @@ def _supports_dsv4_i384_fallback(
     gate_mode: GateMode,
     doweight_stage1: bool,
 ) -> bool:
-    """Return whether I512 metadata may select kernels for physical I384."""
+    """Return whether physical I384 may reuse I512 kernel metadata."""
     return (
         1 <= token_num <= DSV4_I384_FHMOE_MAX_TOKENS
         and (model_dim, inter_dim, experts, topk) == (7168, 384, 385, 7)
@@ -496,7 +499,7 @@ def fhmoe_(
             get_2stage_cfgs,
             get_padded_M(hidden_states.shape[0]),
             model_dim,
-            512,
+            DSV4_I384_FHMOE_METADATA_SOURCE_INTER_DIM,
             experts,
             topk,
             hidden_states.dtype if dtype is None else dtype,

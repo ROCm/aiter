@@ -12,11 +12,13 @@ from dataclasses import dataclass
 from typing import Any
 
 from aiter.aot.flydsl.common import cu_num_to_arch, job_identity
-from aiter.fhmoe_config import DSV4_I384_FHMOE_MAX_TOKENS
+from aiter.fhmoe_config import (
+    DSV4_I384_FHMOE_MAX_TOKENS,
+    DSV4_I384_FHMOE_METADATA_SOURCE_INTER_DIM,
+)
 
 _DSV4_MODEL_DIM = 7168
 _DSV4_NATIVE_INTER_DIM = 384
-_DSV4_TUNED_INTER_DIM = 512
 _DSV4_EXPERTS = 385
 _DSV4_TOPK = 7
 _DSV4_SHARED_EXPERT_ID = 384
@@ -51,7 +53,11 @@ def _is_dsv4_fhmoe_row(row: dict[str, str]) -> bool:
     """Return whether a tuned row can supply DSV4 FHMoE kernels."""
     return (
         _is_dsv4_profile_row(row)
-        and int(row["inter_dim"]) in (_DSV4_NATIVE_INTER_DIM, _DSV4_TUNED_INTER_DIM)
+        and int(row["inter_dim"])
+        in (
+            _DSV4_NATIVE_INTER_DIM,
+            DSV4_I384_FHMOE_METADATA_SOURCE_INTER_DIM,
+        )
         and "_gui" in row.get("kernelName1", "")
     )
 
@@ -62,10 +68,13 @@ def _target_inter_dims(row: dict[str, str]) -> tuple[int, ...]:
         return ()
     inter_dim = int(row["inter_dim"])
     token_num = int(row["token"])
-    if inter_dim == _DSV4_TUNED_INTER_DIM:
+    if inter_dim == DSV4_I384_FHMOE_METADATA_SOURCE_INTER_DIM:
         if 1 <= token_num <= DSV4_I384_FHMOE_MAX_TOKENS:
-            return (_DSV4_TUNED_INTER_DIM, _DSV4_NATIVE_INTER_DIM)
-        return (_DSV4_TUNED_INTER_DIM,)
+            return (
+                DSV4_I384_FHMOE_METADATA_SOURCE_INTER_DIM,
+                _DSV4_NATIVE_INTER_DIM,
+            )
+        return (DSV4_I384_FHMOE_METADATA_SOURCE_INTER_DIM,)
     if 1 <= token_num <= DSV4_I384_FHMOE_MAX_TOKENS:
         return (_DSV4_NATIVE_INTER_DIM,)
     return ()
