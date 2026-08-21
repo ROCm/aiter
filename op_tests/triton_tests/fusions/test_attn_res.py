@@ -468,8 +468,10 @@ def test_attn_res_gate_out_quant(B, with_add, close_block):
     assert (err <= ref.abs() * 2**-3 + y_scale.float()).all()
     # The scale is the row amax, which pins the convention (not just closeness).
     torch.testing.assert_close(
-        y_scale, ref.abs().amax(-1, keepdim=True) / torch.finfo(fp8_dtype).max,
-        atol=0.0, rtol=2e-2,
+        y_scale,
+        ref.abs().amax(-1, keepdim=True) / torch.finfo(fp8_dtype).max,
+        atol=0.0,
+        rtol=2e-2,
     )
     torch.testing.assert_close(
         prefix_quant.float(), prefix_bf16.float(), atol=0, rtol=0
