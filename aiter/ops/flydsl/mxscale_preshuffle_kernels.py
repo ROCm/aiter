@@ -1,0 +1,398 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+
+"""Host dispatcher for the FlyDSL MXFP4/MXFP6/MXFP8 preshuffle GEMM (gfx950 MFMA).
+
+Operand convention (matches the kernel's host preshuffle):
+    A       : [M, K]   row-major, NOT preshuffled  (fp8/fp6 = 1 byte/code, fp4 = 2 codes/byte)
+    B       : preshuffled via aiter.ops.shuffle.shuffle_weight(., (16, 16))  (fp4 or fp8 weight)
+    a_scale : blockscale -> aiter.ops.shuffle.shuffle_scale_blockscale_a(a_1x128, K)
+              MX         -> per-1x32 E8M0, shuffle_scale_a16w4'd
+    b_scale : blockscale -> aiter.ops.shuffle.shuffle_scale_blockscale_b(b_128x128, N, K)
+              MX         -> per-1x32 E8M0, shuffle_scale_a16w4'd
+    Out     : [M, N]   bf16 / fp16
+"""
+
+from __future__ import annotations
+
+import functools
+
+import torch
+
+from aiter.ops.flydsl.utils import is_flydsl_available
+
+_OUT_DTYPE_STR = {torch.bfloat16: "bf16", torch.float16: "fp16"}
+
+
+@functools.cache
+def _gemm_exe(_cfg):
+    import flydsl.compiler as flyc
+
+    from .kernels.mxscale_preshuffle import launch_gemm
+
+    return flyc.jit(launch_gemm.func)
+
+
+@functools.cache
+def _reduce_exe(_cfg):
+    import flydsl.compiler as flyc
+
+    from .kernels.mxscale_preshuffle import launch_splitk_reduce
+
+    return flyc.jit(launch_splitk_reduce.func)
+
+
+def flydsl_mxscale_preshuffle_gemm(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    a_scale: torch.Tensor,
+    b_scale: torch.Tensor,
+    Out: torch.Tensor,
+    *,
+    a_dtype: str,
+    b_dtype: str = "fp4",
+    tile_m: int,
+    tile_n: int,
+    tile_k: int,
+    waves_per_eu: int = 0,
+    xcd_swizzle: int = 0,
+    split_k: int = 1,
+    blockscale: bool = True,
+    stream=None,
+) -> torch.Tensor:
+    """Run the gfx950 MXFP4/6/8 preshuffle GEMM. a8w8 = a_dtype="fp8", b_dtype="fp8".
+
+    A is [M, K]; N is taken from Out ([M, N]); K from A. Returns Out.
+
+    split_k>1 splits the K reduction across grid.z: each split writes an fp32
+    partial slab to a scratch tmp[split_k, M, N], then a reduce kernel sums the
+    slabs into Out (bf16/fp16). Helps small-M / large-K (low-occupancy) shapes.
+
+    blockscale selects the scale format and **defaults to True** -- the coarse
+    blockscale path is the one this op is tuned for. It is a8w8-only and needs
+    N%128==0; fp4/fp6 operands (a4w4 / a6w4) must pass blockscale=False.
+
+    * blockscale=True: a_scale/b_scale are the *compact-shuffled* blockscale buffers
+      the caller built via aiter.ops.shuffle.shuffle_scale_blockscale_a/_b from the
+      coarse E8M0 (A 1x128 [rows, K//128], B 128x128 [N//128, K//128]).
+    * blockscale=False: a_scale/b_scale are per-1x32 E8M0 run through
+      `shuffle_scale_a16w4`.
+
+    Either way the op does NOT repack -- the caller pre-shuffles. For blockscale the
+    kernel broadcasts to the 1x32 scaled-MFMA via the scale load address. Prepare the
+    static B-scale at weight-prep time to keep it off the per-call path; the per-token
+    A-scale is a plain reshape+permute, so build it on device (a host round-trip
+    costs more than this GEMM).
+    """
+    if not is_flydsl_available():
+        raise RuntimeError(
+            "flydsl is not available; cannot run mxscale_preshuffle GEMM"
+        )
+
+    from .kernels.tensor_shim import _run_compiled, ptr_arg
+
+    # Logical K: fp4 A packs 2 codes/byte (A last dim = K//2); fp6/fp8 A = 1 byte/code.
+    if a_dtype not in ("fp4", "fp6", "fp8"):
+        raise ValueError(
+            f"unsupported a_dtype {a_dtype!r}; expected 'fp4', 'fp6', or 'fp8'"
+        )
+    if b_dtype not in ("fp4", "fp8"):
+        raise ValueError(f"unsupported b_dtype {b_dtype!r}; expected 'fp4' or 'fp8'")
+
+    M = int(A.shape[0])
+    K = int(A.shape[-1]) * (2 if a_dtype == "fp4" else 1)
+    N = int(Out.shape[-1])
+    if N % int(tile_n) != 0:
+        raise ValueError(f"N ({N}) is not a multiple of tile_n ({tile_n})")
+    if K % int(tile_k) != 0:
+        raise ValueError(f"K ({K}) is not a multiple of tile_k ({tile_k})")
+    if K % 128 != 0:
+        raise ValueError(
+            f"K ({K}) must be a multiple of 128 for MXFP microscale; got {K}"
+        )
+    out_dtype = _OUT_DTYPE_STR.get(Out.dtype)
+    if out_dtype is None:
+        raise ValueError(
+            f"unsupported Out dtype {Out.dtype}; expected bfloat16 or float16"
+        )
+
+    # blockscale is the default path; an unsupported shape is an error rather than
+    # a silent downgrade, so a4w4/a6w4 callers have to opt out explicitly.
+    if blockscale:
+        if a_dtype != "fp8" or b_dtype != "fp8":
+            raise ValueError(
+                f"blockscale is a8w8-only; got a_dtype={a_dtype!r} b_dtype={b_dtype!r}"
+            )
+        if N % 128 != 0:
+            raise ValueError(f"blockscale requires N ({N}) to be a multiple of 128")
+    # a_scale/b_scale are already compact-shuffled by the caller
+    # (shuffle_scale_blockscale_a/_b). No per-call repack here.
+    bs_mode = "ab" if blockscale else "none"
+
+    st = stream if stream is not None else torch.cuda.current_stream()
+
+    split_k = int(split_k)
+    if split_k > 1:
+        # split-K legality (same constraints the tuner enforces in fits_shape):
+        # per-split K must be a whole number of tile_k tiles AND 256-K scale chunks.
+        k_per_split = K // split_k
+        if K % split_k != 0 or k_per_split % int(tile_k) != 0 or k_per_split % 256 != 0:
+            raise ValueError(
+                f"illegal split_k={split_k} for K={K}, tile_k={tile_k}: "
+                f"K/split_k ({k_per_split}) must be a multiple of tile_k and 256"
+            )
+
+    # Constexpr tail of launch_gemm -- the same for the direct and the split-K launch
+    # apart from k_batch, and it doubles as the per-config compiled-kernel cache key.
+    cfg = (
+        N,
+        K,
+        int(tile_m),
+        int(tile_n),
+        int(tile_k),
+        a_dtype,
+        out_dtype,
+        b_dtype,
+        1,  # batch
+        -1,  # a_row_stride     ) each <0 keeps the contiguous
+        -1,  # a_batch_stride   ) [B,M,*] default; this op never
+        -1,  # sca_row_stride   ) overrides them, the batched
+        -1,  # sca_batch_stride ) callers do
+        -1,  # c_row_stride
+        -1,  # c_batch_stride
+        int(waves_per_eu),
+        int(xcd_swizzle),
+        split_k,  # k_batch
+        bs_mode,  # blockscale
+    )
+    gemm_exe = _gemm_exe(cfg)
+
+    if split_k == 1:
+        _run_compiled(
+            gemm_exe,
+            ptr_arg(Out),
+            ptr_arg(A),
+            ptr_arg(B),
+            ptr_arg(a_scale),
+            ptr_arg(b_scale),
+            M,
+            N,
+            st,
+            *cfg,
+        )
+        return Out
+
+    # split-K: GEMM -> fp32 partial slabs tmp[split_k, M, N] -> fused fp32 reduce -> Out.
+    tmp = torch.empty((split_k, M, N), dtype=torch.float32, device=A.device)
+    _run_compiled(
+        gemm_exe,
+        ptr_arg(tmp),
+        ptr_arg(A),
+        ptr_arg(B),
+        ptr_arg(a_scale),
+        ptr_arg(b_scale),
+        M,
+        N,
+        st,
+        *cfg,
+    )
+    _run_compiled(
+        _reduce_exe((split_k, out_dtype)),
+        ptr_arg(tmp),
+        ptr_arg(Out),
+        (M * N) // 2,  # n_out_dw (2 out elems per dword)
+        M * N,  # slab_stride_dw (fp32: 1 dword/elem)
+        st,
+        split_k,
+        out_dtype,
+    )
+    return Out
+
+
+# ── Tuned dispatch: explicit tile args > tuned CSV > heuristic default ─────────
+
+_TUNED_CACHE = {}
+
+
+def _padded_m(M: int, gl: int) -> int:
+    """The M bucket the tuner sweeps at, for granularity level ``gl``.
+    gl=0 is the fine-grained bucket; gl=1 rounds to the next power of two.
+    """
+    if gl == 0:
+        if M <= 256:
+            return (M + 15) // 16 * 16
+        if M <= 1024:
+            return (M + 31) // 32 * 32
+        if M <= 4096:
+            return (M + 63) // 64 * 64
+        return (M + 127) // 128 * 128
+    return 1 << (M - 1).bit_length() if M > 1 else 1
+
+
+def _lookup_tuned(M, N, K, a_dtype, b_dtype, tuned_file=None):
+    """Look up a tuned row keyed by (gfx, cu_num, M, N, K, a_dtype, b_dtype)."""
+    import pandas as pd
+
+    from aiter.jit.core import AITER_CONFIGS
+    from aiter.jit.utils.chip_info import get_cu_num
+    from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
+
+    tf = tuned_file or AITER_CONFIGS.AITER_CONFIG_GEMM_MXSCALE_BPRESHUFFLE_FILE
+    if tf not in _TUNED_CACHE:
+        try:
+            df = pd.read_csv(tf).drop_duplicates()
+            _TUNED_CACHE[tf] = df.set_index(
+                ["gfx", "cu_num", "M", "N", "K", "a_dtype", "b_dtype"]
+            ).to_dict("index")
+        except Exception:  # noqa: BLE001
+            # missing / empty / malformed / missing-column CSV -> no tuned config
+            _TUNED_CACHE[tf] = None
+    tbl = _TUNED_CACHE[tf]
+    if not tbl:
+        return None
+    gfx, cu_num = get_gfx(), get_cu_num()
+    for gl in (None, 0, 1):
+        m = M if gl is None else _padded_m(M, gl)
+        cfg = tbl.get((gfx, cu_num, m, N, K, a_dtype, b_dtype))
+        if cfg is not None:
+            return cfg
+    return None
+
+
+_HEURISTIC_MIN_TILE_N = 32
+
+
+@functools.lru_cache(maxsize=1024)
+def _warn_untuned(M, N, K, a_dtype, b_dtype, kernel_name):
+    from aiter import logger
+
+    logger.warning(
+        f"[flydsl mxpsh] no tuned row for M={M} N={N} K={K} {a_dtype}/{b_dtype}; "
+        f"falling back to the heuristic tile '{kernel_name}'. It picks a grid that "
+        f"fills the CUs, but nothing about this shape was measured -- tune it with "
+        f"aiter/ops/flydsl/gemm_tune/tune_mxscale_preshuffle.py."
+    )
+
+
+@functools.lru_cache(maxsize=1024)
+def _heuristic_tile(a_dtype, b_dtype, M, N, K):
+    from aiter.jit.utils.chip_info import get_cu_num
+
+    from .gemm_tune.flydsl_gemm_mxscale_preshuffle_common import candidates_for
+
+    cands = [ki for _, ki in candidates_for(a_dtype, b_dtype, M, N, K, "gfx950")]
+    if not cands:
+        return None
+
+    def _wg(ki):
+        return -(-M // ki.tile_m) * (N // ki.tile_n) * ki.split_k
+
+    pool = [ki for ki in cands if ki.tile_n >= _HEURISTIC_MIN_TILE_N] or cands
+    filled = [ki for ki in pool if _wg(ki) >= get_cu_num()]
+    if filled:
+        pool = filled
+    else:  # N too narrow, or split-K legality leaves nothing that fills the CUs
+        best_wg = max(_wg(ki) for ki in pool)
+        pool = [ki for ki in pool if _wg(ki) == best_wg]
+
+    target_m = min(max((M + 31) // 32 * 32, 32), 128)
+    return max(
+        pool,
+        key=lambda ki: (
+            -ki.split_k,
+            ki.tile_k,
+            ki.tile_n,
+            -abs(ki.tile_m - target_m),
+            -ki.waves_per_eu,
+        ),
+    )
+
+
+def gemm_mxscale_preshuffle(
+    A,
+    B,
+    a_scale,
+    b_scale,
+    Out,
+    *,
+    a_dtype,
+    b_dtype,
+    tile_m=None,
+    tile_n=None,
+    tile_k=None,
+    waves_per_eu=None,
+    xcd_swizzle=None,
+    split_k=None,
+    blockscale=True,
+    config=None,
+    stream=None,
+):
+    """Auto-dispatched MXFP4/MXFP8 preshuffle GEMM.
+
+    Tile selection precedence: explicit tile_m/n/k args > tuned CSV
+    (config or lookup by (gfx,cu_num,M,N,K,a_dtype,b_dtype)) > heuristic default.
+
+    blockscale defaults to True, matching how the tuned CSV is tuned; a4w4 / a6w4
+    callers must pass blockscale=False.
+    """
+    from aiter.jit.utils.chip_info import get_gfx_runtime
+
+    if get_gfx_runtime() != "gfx950":
+        raise RuntimeError(
+            f"gemm_mxscale_preshuffle is the gfx950 MFMA path, got "
+            f"{get_gfx_runtime()}; call aiter.gemm_a8w8_mxscale_preshuffle_flydsl, "
+            f"which dispatches per arch"
+        )
+
+    M = int(A.shape[0])
+    N = int(Out.shape[-1])
+    K = int(A.shape[-1]) * (2 if a_dtype == "fp4" else 1)
+
+    if tile_m is None or tile_n is None or tile_k is None:
+        cfg = config if config is not None else _lookup_tuned(M, N, K, a_dtype, b_dtype)
+        if cfg is not None and cfg.get("kernelName"):
+            from .gemm_tune.flydsl_gemm_mxscale_preshuffle_common import (
+                parse_kernel_name,
+            )
+
+            p = parse_kernel_name(cfg["kernelName"])
+            if p is not None:
+                tile_m, tile_n, tile_k = p["tile_m"], p["tile_n"], p["tile_k"]
+                if waves_per_eu is None:
+                    waves_per_eu = p["waves_per_eu"]
+                if xcd_swizzle is None:
+                    xcd_swizzle = p["xcd_swizzle"]
+                if split_k is None:
+                    split_k = p["split_k"]
+        if tile_m is None:  # still unresolved -> heuristic
+            ki = _heuristic_tile(a_dtype, b_dtype, M, N, K)
+            if ki is None:
+                raise ValueError(
+                    f"no legal tile for M={M} N={N} K={K} {a_dtype}/{b_dtype}; pass tile_m/n/k explicitly"
+                )
+            _warn_untuned(M, N, K, a_dtype, b_dtype, ki.name)
+            tile_m, tile_n, tile_k = ki.tile_m, ki.tile_n, ki.tile_k
+            if waves_per_eu is None:
+                waves_per_eu = ki.waves_per_eu
+            if xcd_swizzle is None:
+                xcd_swizzle = ki.xcd_swizzle
+            if split_k is None:
+                split_k = ki.split_k
+
+    return flydsl_mxscale_preshuffle_gemm(
+        A,
+        B,
+        a_scale,
+        b_scale,
+        Out,
+        a_dtype=a_dtype,
+        b_dtype=b_dtype,
+        tile_m=tile_m,
+        tile_n=tile_n,
+        tile_k=tile_k,
+        waves_per_eu=(0 if waves_per_eu is None else waves_per_eu),
+        xcd_swizzle=(0 if xcd_swizzle is None else xcd_swizzle),
+        split_k=(1 if split_k is None else split_k),
+        blockscale=blockscale,
+        stream=stream,
+    )
