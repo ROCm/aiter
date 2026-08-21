@@ -131,7 +131,6 @@ _BACKWARD_COMPAT_MAP = {
     "logger": "utils.logger",
     "mha_kernel_utils": "utils.mha_kernel_utils",
     "moe_common": "utils.moe_common",
-    "moe_config_utils": "utils.moe_config_utils",
     "types": "utils.types",
     # Quant modules (quant/)
     "fused_fp8_quant": "quant.fused_fp8_quant",
