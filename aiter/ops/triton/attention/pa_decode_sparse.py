@@ -469,15 +469,7 @@ def _decode_num_splits(
             best_splits, best_cost = splits, cost
 
     # Collapse to the FEWEST splits that keeps both the wave count and the
-    # per-split BLOCK_K iteration count. The cost model above treats extra
-    # splits as nearly free while ``waves`` stays 1 (GAMMA is small and it has no
-    # reduce term), so at small per-query work it over-splits: at C=64/H=16 with
-    # main=128, extra=8 it picked 3, where 2 does the same 2 iterations in the
-    # same single wave but launches 1/3 fewer CTAs and reduces over 2 partials
-    # instead of 3 (measured 16.2 -> 14.4 us on gfx950/MI355X).
-    #
-    # Ported from vLLM's _decode_gfx950_num_splits (PR #52212), which fixed the
-    # same over-splitting in the in-tree triton decode.
+    # per-split BLOCK_K iteration count.
     def _iters(s):
         m = math.ceil(math.ceil(avg_main / s) / block_k) if avg_main > 0 else 0
         e = math.ceil(math.ceil(avg_extra / s) / block_k) if avg_extra > 0 else 0
@@ -497,25 +489,6 @@ def _decode_num_splits(
 def _decode_num_splits_occ(num_queries, heads_blocks, avg_main, avg_extra, block_k):
     """Split-K count for the gfx950 gluon kernel: fill the machine, but never
     split a segment finer than one BLOCK_K tile.
-
-    Two facts set this. (a) The kernel is 256 unified VGPRs and 68,608 B of LDS,
-    so a CU holds two workgroups -- the launch wants ~2*CU programs before extra
-    splits stop paying. (b) Splitting a segment past its tile count does not divide
-    the work, it *multiplies* it: every split then owns a partial tile, and a
-    partial tile costs a full masked gather for a fraction of the tokens. So the
-    split count is capped by the larger segment's tile count, and the main segment
-    separately stops at its own (see MAIN_SPLITS in the kernel).
-
-    Measured at C=64 H=16 BLOCK_K=64 (attn = kernel + reduce, us), this rule picks
-    the sweep optimum at extra in {8, 64, 272, 512, 1024, 2048} and lands within
-    1.4% at extra=128:
-
-        extra      8    64   128   272   512  1024  2048
-        picked S   2     2     2     5     8     8     8
-        best S     2     2     4     5     8     8     8
-        old model  2     2     2     3     4     4     4
-        old  us  14.0  14.6  17.9  21.3  22.0  29.8  45.6
-        new  us  14.0  14.4  17.4  19.5  20.9  26.9  38.1
     """
     num_sms = get_num_sms()
     base_wg = max(1, num_queries * heads_blocks)
@@ -524,17 +497,8 @@ def _decode_num_splits_occ(num_queries, heads_blocks, avg_main, avg_extra, block
     extra_tiles = max(1, math.ceil(avg_extra / block_k)) if avg_extra > 0 else 0
     tiles = max(1, main_tiles, extra_tiles)
     if base_wg >= num_sms:
-        # Already at least one workgroup per CU without splitting, so a split buys
-        # only the second occupancy slot -- worth an extra round trip of the
-        # [queries, heads, D] f32 partials plus a reduce launch only when each
-        # split still owns a real run of tiles. At C=256 extra=8 (2 tiles) forcing
-        # a split costs 31%; at extra=2048 (32 tiles) it saves 19%.
+        # Already at least one workgroup per CU without splitting
         return max(1, min(cta_cap, tiles // 4))
-    # Deliberately NOT refined toward split counts that divide `tiles` evenly.
-    # Minimizing the executed tile count S*ceil(tiles/S) is only right for a
-    # uniform batch -- it is worth ~5% on the 1-loop seq=1152 shape -- but `tiles`
-    # here is a batch AVERAGE, and wall clock is set by the longest query. On a
-    # 16x-ragged batch that refinement picks 5 splits where 8 is 22% faster.
     return max(1, min(cta_cap, tiles))
 
 
@@ -675,14 +639,6 @@ def _pa_decode_sparse_gfx950_gluon(
 
     num_splits = _pick_splits(heads_blocks)
 
-    # Short top-k is latency- and coverage-bound rather than throughput-bound: at
-    # <= 2 KV tiles per query the whole launch is a few dozen workgroups, so what
-    # helps is more programs, not fatter ones. Halving BLOCK_M doubles heads_blocks,
-    # which is real parallelism, unlike a finer split-K that hands every split a
-    # partial tile. It costs MFMA M, though, and doubling heads_blocks can push the
-    # launch past one workgroup per CU, which makes the split policy answer with
-    # fewer splits: take the halving only when it costs neither a split nor the
-    # one-workgroup-per-CU property.
     tiles = max(
         math.ceil(avg_main / BLOCK_K) if avg_main > 0 else 1,
         math.ceil(avg_extra / BLOCK_K) if avg_extra > 0 else 1,
@@ -724,19 +680,11 @@ def _pa_decode_sparse_gfx950_gluon(
         part_m = part_l = part_acc = out  # unused placeholders (never dereferenced)
         pm_stride0 = pm_stride_s = pa_stride0 = pa_stride_s = pa_stride_h = 0
 
-    # Dequant chunking: split the axis that still has per-lane register repeats,
-    # rows at gather_tw1=32 and 128-wide column pieces otherwise (128 is the
-    # narrowest free split -- below that a piece falls inside a thread's 16-byte
-    # run). Either way a quarter of the tile's f32 expansion is live at a time.
+    # Dequant chunking
     col_reps = head_dim // (gather_tw1 * 16)
     chunk_axis = 1 if col_reps >= 4 else 0
     nope_chunk = max(1, BLOCK_K // 4) if chunk_axis == 0 else min(128, head_dim)
 
-    # waves_per_eu=2 caps the allocator at 256 unified VGPRs, the 2 waves/SIMD
-    # threshold on gfx950's 512-VGPR file, so a CU can hold a second workgroup.
-    # num_warps is 4, one wave per SIMD, so that second slot only exists if the
-    # launch has more than one workgroup per CU; below that the cap buys no overlap
-    # and only spills.
     waves_per_eu = 2
     one_wg_per_cu = (
         use_buffer_load and num_queries * heads_blocks * num_splits <= get_num_sms()
@@ -744,9 +692,6 @@ def _pa_decode_sparse_gfx950_gluon(
     if one_wg_per_cu:
         waves_per_eu = 1
 
-    # Cap the main segment's split count at whole BLOCK_K tiles: past that every
-    # split's main range is a partial tile, which costs a full masked gather for
-    # half the tokens. extra keeps all num_splits programs.
     main_splits = num_splits
     if has_extra and avg_main > 0:
         main_splits = max(1, min(num_splits, math.ceil(avg_main / BLOCK_K)))
@@ -758,8 +703,7 @@ def _pa_decode_sparse_gfx950_gluon(
     # Fuse the fp8 x E8M0 dequant into v_cvt_scalef32_pk_bf16_fp8 via inline asm:
     # packed OCP fp8 only (uniform scales are f32, fnuz is a different encoding),
     # bit-identical there because the scale is a power of two. It trades a shorter
-    # dependent chain for a wider live range, so it pays only where the extra
-    # registers are free -- the same condition that lifts the occupancy cap.
+    # dependent chain for a wider live range
     asm_deq = one_wg_per_cu and not UNIFORM and not fp8_fnuz and main_is_fp8
 
     # Grid dim 0 varies fastest and XCD assignment is round-robin over the linear
@@ -842,9 +786,7 @@ def _pa_decode_sparse_gfx950_gluon(
     if skip_reduce:
         return part_acc, part_m, part_l
 
-    # One head per reduce workgroup: the combine is pure bandwidth, so size the grid
-    # for coverage rather than for the attention kernel's tile. num_queries*num_heads
-    # workgroups give enough concurrent waves to hide the partial loads.
+    # One head per reduce workgroup
     rgrid = (num_queries, num_heads)
     _pa_decode_sparse_reduce_gfx950[rgrid](
         part_m,
