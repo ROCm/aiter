@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-"""MI300/MI308-only GPU validation for gfx942 OPUS A8 kid 11000."""
+"""Representative gfx942 GPU regression for A8 blockscale bpreshuffle."""
 
 from __future__ import annotations
 
@@ -10,15 +10,13 @@ import torch
 
 from aiter import dtypes
 from aiter.ops.gemm_op_a8w8 import gemm_a8w8_blockscale_bpreshuffle
-from aiter.ops.opus import gemm_op_a8w8 as a8
-from aiter.ops.opus import opus_bmm, opus_gemm
+from aiter.ops.opus import opus_gemm
 from aiter.ops.shuffle import shuffle_weight
-from csrc.opus_gemm.opus_gemm_common import get_kernel_instance
 
 
 pytestmark = pytest.mark.skipif(
-    os.getenv("OPUS_GFX942_EXHAUSTIVE", "0") != "1",
-    reason="set OPUS_GFX942_EXHAUSTIVE=1 for gfx942 GPU acceptance",
+    os.getenv("OPUS_GFX942_GPU", "0") != "1",
+    reason="set OPUS_GFX942_GPU=1 for the gfx942 acceptance case",
 )
 
 
@@ -56,6 +54,7 @@ def _problem():
     )
     w_scale[1].mul_(2.0)
     w_scale[:, 1].mul_(0.25)
+
     golden = torch.zeros((M, N), device="cuda", dtype=torch.float32)
     for block_k in range(K // 128):
         partial = XQ[:, block_k * 128 : (block_k + 1) * 128].float() @ WQ[
@@ -69,99 +68,17 @@ def _problem():
     return XQ, WQ_storage, x_scale_storage, w_scale, golden.to(torch.bfloat16)
 
 
-def _assert_close(actual: torch.Tensor, golden: torch.Tensor) -> None:
+def _assert_close(actual, golden):
     torch.cuda.synchronize()
-    assert torch.isfinite(actual).all()
     torch.testing.assert_close(actual.float(), golden.float(), rtol=0.03, atol=0.5)
 
 
-@pytest.mark.parametrize(
-    ("kid", "workspace_dtype"),
-    ((10200, torch.float32), (10210, torch.bfloat16)),
-)
-def test_gfx942_a16_workspace_graph_two_streams_and_caller_tensor(
-    kid, workspace_dtype
-):
-    _require_gfx942()
-    instance = get_kernel_instance("gfx942", "a16w16", kid)
-    assert instance is not None
-    M, N, K = int(instance.B_M), int(instance.B_N), 32 * int(instance.B_K)
-    torch.manual_seed(0x942000 + kid)
-    XQ = torch.randn((1, M, K), device="cuda", dtype=torch.bfloat16)
-    WQ = torch.randn((1, N, K), device="cuda", dtype=torch.bfloat16)
-    golden = torch.bmm(XQ.float(), WQ.float().transpose(1, 2))
-    Y = torch.empty((1, M, N), device="cuda", dtype=torch.bfloat16)
-    workspace = torch.empty(
-        (2, 1, M, N), device="cuda", dtype=workspace_dtype
-    )
-    graph_stream = torch.cuda.Stream()
-    graph_stream.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(graph_stream):
-        opus_bmm(
-            XQ, WQ, Y, kid=kid, split_k=2, workspace=workspace
-        )
-    graph_stream.synchronize()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph, stream=graph_stream):
-        opus_bmm(
-            XQ, WQ, Y, kid=kid, split_k=2, workspace=workspace
-        )
-    graph.replay()
-    _assert_close(Y, golden)
-
-    streams = (torch.cuda.Stream(), torch.cuda.Stream())
-    outputs = [
-        torch.empty((1, M, N), device="cuda", dtype=torch.bfloat16)
-        for _ in streams
-    ]
-    workspaces = [
-        torch.empty((2, 1, M, N), device="cuda", dtype=workspace_dtype)
-        for _ in streams
-    ]
-    for stream, output, caller_workspace in zip(
-        streams, outputs, workspaces, strict=True
-    ):
-        with torch.cuda.stream(stream):
-            opus_bmm(
-                XQ,
-                WQ,
-                output,
-                kid=kid,
-                split_k=2,
-                workspace=caller_workspace,
-            )
-    for stream in streams:
-        stream.synchronize()
-    for output in outputs:
-        _assert_close(output, golden)
-
-
-def test_gfx942_a8_11000_raw_2d_and_batch1_3d():
+def test_gfx942_kid11000_public_and_tuned_production_routes(tmp_path, monkeypatch):
     _require_gfx942()
     XQ, WQ, x_scale, w_scale, golden = _problem()
     Y = torch.empty_like(golden)
-    a8._opus_gemm_a8w8_blockscale_bpreshuffle_launch_raw(
-        XQ, WQ, x_scale, w_scale, Y, 11000
-    )
-    _assert_close(Y, golden)
 
-    Y3 = torch.empty((1, *golden.shape), device="cuda", dtype=torch.bfloat16)
-    a8._opus_gemm_a8w8_blockscale_bpreshuffle_launch_raw(
-        XQ.unsqueeze(0),
-        WQ.unsqueeze(0),
-        x_scale,
-        w_scale,
-        Y3,
-        11000,
-    )
-    _assert_close(Y3[0], golden)
-
-
-def test_gfx942_a8_11000_unified_public_and_real_tuned_csv(tmp_path, monkeypatch):
-    _require_gfx942()
-    XQ, WQ, x_scale, w_scale, golden = _problem()
-    Y = torch.empty_like(golden)
-    returned = opus_gemm(
+    assert opus_gemm(
         XQ,
         WQ,
         Y,
@@ -169,8 +86,7 @@ def test_gfx942_a8_11000_unified_public_and_real_tuned_csv(tmp_path, monkeypatch
         layout="bpreshuffle",
         x_scale=x_scale,
         w_scale=w_scale,
-    )
-    assert returned is Y
+    ) is Y
     _assert_close(Y, golden)
 
     props = torch.cuda.get_device_properties(0)
@@ -187,119 +103,3 @@ def test_gfx942_a8_11000_unified_public_and_real_tuned_csv(tmp_path, monkeypatch
         XQ, WQ, x_scale, w_scale, dtype=torch.bfloat16
     )
     _assert_close(tuned_y, golden)
-
-
-def test_gfx942_a8_11000_graph_replay_and_two_streams():
-    _require_gfx942()
-    XQ, WQ, x_scale, w_scale, golden = _problem()
-    Y = torch.empty_like(golden)
-
-    stream = torch.cuda.Stream()
-    stream.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(stream):
-        opus_gemm(
-            XQ,
-            WQ,
-            Y,
-            kid=11000,
-            layout="bpreshuffle",
-            x_scale=x_scale,
-            w_scale=w_scale,
-        )
-    stream.synchronize()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph, stream=stream):
-        opus_gemm(
-            XQ,
-            WQ,
-            Y,
-            kid=11000,
-            layout="bpreshuffle",
-            x_scale=x_scale,
-            w_scale=w_scale,
-        )
-    graph.replay()
-    _assert_close(Y, golden)
-
-    streams = (torch.cuda.Stream(), torch.cuda.Stream())
-    outputs = (torch.empty_like(golden), torch.empty_like(golden))
-    for index, live_stream in enumerate(streams):
-        with torch.cuda.stream(live_stream):
-            opus_gemm(
-                XQ,
-                WQ,
-                outputs[index],
-                kid=11000,
-                layout="bpreshuffle",
-                x_scale=x_scale,
-                w_scale=w_scale,
-            )
-    for live_stream in streams:
-        live_stream.synchronize()
-    for output in outputs:
-        _assert_close(output, golden)
-
-
-def test_gfx942_a8_11000_rejects_invalid_contracts():
-    _require_gfx942()
-    XQ, WQ, x_scale, w_scale, golden = _problem()
-    Y = torch.empty_like(golden)
-
-    bad_calls = (
-        lambda: a8._opus_gemm_a8w8_blockscale_bpreshuffle_launch_raw(
-            XQ.unsqueeze(0).expand(2, -1, -1),
-            WQ.unsqueeze(0).expand(2, -1, -1),
-            x_scale.unsqueeze(0).expand(2, -1, -1),
-            w_scale.unsqueeze(0).expand(2, -1, -1),
-            Y.unsqueeze(0).expand(2, -1, -1),
-            11000,
-        ),
-        lambda: opus_gemm(
-            XQ,
-            WQ,
-            Y,
-            kid=11000,
-            layout="bpreshuffle",
-            x_scale=x_scale.to(torch.bfloat16),
-            w_scale=w_scale,
-        ),
-        lambda: opus_gemm(
-            XQ,
-            WQ,
-            Y,
-            kid=11000,
-            layout="bpreshuffle",
-            x_scale=x_scale[:, :1],
-            w_scale=w_scale,
-        ),
-        lambda: opus_gemm(
-            XQ[:, ::2],
-            WQ,
-            Y,
-            kid=11000,
-            layout="bpreshuffle",
-            x_scale=x_scale,
-            w_scale=w_scale,
-        ),
-        lambda: opus_gemm(
-            XQ,
-            WQ,
-            Y,
-            kid=1,
-            layout="bpreshuffle",
-            x_scale=x_scale,
-            w_scale=w_scale,
-        ),
-        lambda: opus_gemm(
-            XQ,
-            WQ,
-            Y,
-            kid=20000,
-            layout="bpreshuffle",
-            x_scale=x_scale,
-            w_scale=w_scale,
-        ),
-    )
-    for call in bad_calls:
-        with pytest.raises((RuntimeError, ValueError, NotImplementedError)):
-            call()

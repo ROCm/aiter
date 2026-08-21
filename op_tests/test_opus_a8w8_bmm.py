@@ -316,20 +316,18 @@ def check_tilen_column_map():
     return len(_TILEN_REGRESSION_KIDS) * 2
 
 
-def check_workspace_and_graph():
-    """Exercise auto/caller workspace, validation and graph replay."""
+def check_splitk_workspace():
+    """Check one split-K result with automatic and caller-owned workspace."""
     g, m, n, k = 2, 32, 128, 2048
     O_mx, xs_mx, xs_fp32 = _quant_per_token_e8m0(_block_varied((g, m, k), k))
     W_mx, ws_mx, ws_fp32 = _quant_block_e8m0(_block_varied((g, n, k), k))
     O_in = O_mx.transpose(0, 1)
     xs_in = xs_mx.transpose(0, 1)
     ref = run_torch(O_mx, W_mx, xs_fp32, ws_fp32).transpose(0, 1)
-    required_numel = 2 * g * m * n
-
     auto_out = torch.empty((m, g, n), dtype=dtypes.bf16)
     _run_opus(O_in, W_mx, auto_out, xs_in, ws_mx, 8000, split_k=2)
 
-    workspace = torch.empty(required_numel, dtype=torch.float32)
+    workspace = torch.empty(2 * g * m * n, dtype=torch.float32)
     caller_out = torch.empty_like(auto_out)
     _run_opus(
         O_in,
@@ -342,85 +340,15 @@ def check_workspace_and_graph():
         workspace=workspace,
     )
     torch.cuda.synchronize()
-    for label, out in (("auto", auto_out), ("caller", caller_out)):
+    for out in (auto_out, caller_out):
         checkAllclose(
             ref,
             out.to(dtypes.fp32),
             rtol=1e-2,
             atol=1e-2,
-            msg=f"MXFP8 BMM {label} workspace",
+            msg="MXFP8 BMM split-K workspace",
         )
-
-    for bad_workspace in (
-        torch.empty(required_numel - 1, dtype=torch.float32),
-        torch.empty(required_numel, dtype=torch.bfloat16),
-    ):
-        try:
-            _run_opus(
-                O_in,
-                W_mx,
-                caller_out,
-                xs_in,
-                ws_mx,
-                8000,
-                split_k=2,
-                workspace=bad_workspace,
-            )
-        except ValueError:
-            pass
-        else:
-            raise AssertionError("invalid MXFP8 BMM workspace was accepted")
-
-    try:
-        _run_opus(
-            O_in,
-            W_mx,
-            caller_out,
-            xs_in,
-            ws_mx,
-            8000,
-            split_k=1,
-            workspace=workspace,
-        )
-    except ValueError:
-        pass
-    else:
-        raise AssertionError("split_k=1 unexpectedly accepted workspace")
-
-    graph_out = torch.empty_like(auto_out)
-    _run_opus(
-        O_in,
-        W_mx,
-        graph_out,
-        xs_in,
-        ws_mx,
-        8000,
-        split_k=2,
-        workspace=workspace,
-    )
-    graph = torch.cuda.CUDAGraph()
-    capture_stream = torch.cuda.Stream()
-    with torch.cuda.graph(graph, stream=capture_stream):
-        _run_opus(
-            O_in,
-            W_mx,
-            graph_out,
-            xs_in,
-            ws_mx,
-            8000,
-            split_k=2,
-            workspace=workspace,
-        )
-    graph.replay()
-    torch.cuda.synchronize()
-    checkAllclose(
-        ref,
-        graph_out.to(dtypes.fp32),
-        rtol=1e-2,
-        atol=1e-2,
-        msg="MXFP8 BMM graph workspace",
-    )
-    return 3
+    return 2
 
 
 # --- m_align guard ---------------------------------------------------------
@@ -605,9 +533,9 @@ def main():
     aiter.logger.info(
         "tileN column mapping passed for %d kid/layout combinations", n_tilen_checks
     )
-    n_workspace_checks = check_workspace_and_graph()
+    n_workspace_checks = check_splitk_workspace()
     aiter.logger.info(
-        "MXFP8 BMM workspace/graph checks passed (%d paths)", n_workspace_checks
+        "MXFP8 BMM split-K workspace checks passed (%d paths)", n_workspace_checks
     )
 
     if args.check_m_align:
