@@ -345,19 +345,13 @@ intentionally export an empty `__all__`.
 
 ## Validation
 
-Run the focused OPUS suite on each target GPU rather than treating
-architecture skips as coverage:
+Run the retained OPUS numerical tests on matching target GPUs rather than
+treating architecture skips as coverage:
 
 ```bash
-pytest -q \
-  op_tests/test_opus_interfaces.py \
-  op_tests/test_opus_dispatch.py \
-  op_tests/test_opus_ctypes.py \
-  op_tests/test_opus_graph.py \
-  op_tests/test_opus_workspace.py \
-  op_tests/test_opus_gfx950_exhaustive.py \
-  op_tests/test_opus_a8w8_bmm.py \
-  op_tests/test_gemm_a8w8_opus_highlevel.py
+pytest -q op_tests/test_opus_a16w16_gemm.py
+PYTHONPATH=. python3 op_tests/test_opus_a8w8_bmm.py \
+  -g 2 -s 16,1024,4096 -d bf16
 ```
 
 In particular, gfx942 and gfx1250 validation must run on matching hardware; a
