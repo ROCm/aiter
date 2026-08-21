@@ -24,19 +24,13 @@ import argparse
 import torch
 import triton
 
-from aiter.ops.triton._gluon_kernels.gfx950.attention.sparse_attention_dsv4_bwd import (
-    build_inverted_topk,
-    delta_v4,
-    dkv_gather_acc,
+from aiter.ops.triton.attention.sparse_attention_dsv4_bwd import (
+    bwd_phases,
+    plan_bwd,
+    sparse_mla_bwd_dsv4,
 )
-from aiter.ops.triton._gluon_kernels.gfx950.attention.sparse_attention_dsv4_bwd import (
-    sparse_mla_bwd_dkv_interm_v4 as _dkv_interm_gluon,
-)
-from aiter.ops.triton._gluon_kernels.gfx950.attention.sparse_attention_dsv4_bwd import (
-    sparse_mla_bwd_dq as _dq_gluon,
-)
-from aiter.ops.triton.attention.sparse_attention_dsv4_bwd import sparse_mla_bwd_dsv4
 from aiter.ops.triton.utils._triton import arch_info
+from aiter.test_mha_common import sparse_mla_dsv4_ref
 
 D = 512
 SWA = 128  # sliding-window width
@@ -108,21 +102,6 @@ def _build_case(T, H, topk, device, num_pool=1024, seed=0):
 # ---------------------------------------------------------------------------
 # Timing
 # ---------------------------------------------------------------------------
-def _bench(fn, *, warmup=5, reps=20):
-    for _ in range(warmup):
-        fn()
-    torch.cuda.synchronize()
-
-    ev0 = torch.cuda.Event(enable_timing=True)
-    ev1 = torch.cuda.Event(enable_timing=True)
-    ev0.record()
-    for _ in range(reps):
-        fn()
-    ev1.record()
-    torch.cuda.synchronize()
-    return ev0.elapsed_time(ev1) / reps
-
-
 def _flops(T, H, topk):
     # dQ contributes S, dP and dS@kv; dKV-interm contributes dS*Q and P*dO. Five 2*D-flop
     # products per (token, head, top-k slot).
@@ -130,100 +109,29 @@ def _flops(T, H, topk):
 
 
 def _time_phases(case, scale):
-    """Per-phase timings, in the order the public entry runs them."""
-    q, kv, do, o = case["q"], case["kv"], case["do"], case["o"]
-    lse, sink, indices = case["lse"], case["sink"], case["indices"]
-    T, H, _ = q.shape
-    topk = indices.shape[1]
-    num_kv = case["num_kv"]
+    """Time each phase of the real pipeline.
 
-    delta = delta_v4(o, do)
-    dq = torch.empty_like(q)
-    dkv_acc = torch.zeros(num_kv, D, dtype=torch.float32, device=q.device)
-    chunk_dS = torch.empty(T, H, topk, dtype=torch.bfloat16, device=q.device)
-    chunk_P = torch.empty(T, H, topk, dtype=torch.bfloat16, device=q.device)
-    interm = torch.empty(T, topk, D, dtype=torch.bfloat16, device=q.device)
-    inv_ptr, inv_data = build_inverted_topk(indices, num_kv)
-
-    phases = [
-        ("delta", lambda: delta_v4(o, do)),
-        (
-            "dq",
-            lambda: _dq_gluon(
-                q,
-                kv,
-                do,
-                indices,
-                lse,
-                delta,
-                dq,
-                chunk_dS,
-                chunk_P,
-                scale,
-                0,
-                topk,
-                BLOCK_H=64,
-                TILE_K=32,
-                is_first_chunk=True,
-            ),
-        ),
-        (
-            "interm",
-            lambda: _dkv_interm_gluon(
-                q, do, chunk_dS, chunk_P, topk, BD=256, TILE_K=128, interm=interm
-            ),
-        ),
-        ("csr_build", lambda: build_inverted_topk(indices, num_kv)),
-        ("gather", lambda: dkv_gather_acc(interm, inv_ptr, inv_data, dkv_acc)),
-        (
-            "d_sink",
-            lambda: -(torch.exp(sink[None, :].float() - lse) * delta).sum(dim=0),
-        ),
-    ]
-    return [(name, _bench(fn)) for name, fn in phases]
+    `plan_bwd` and `bwd_phases` are the same helpers `sparse_mla_bwd_dsv4` runs, so this cannot
+    drift from the op: the tile widths, the workspace and the phase order all come from the
+    wrapper rather than being restated here. Timing a phase repeatedly re-runs its side effects,
+    which is harmless -- only the duration is read.
+    """
+    plan = plan_bwd(
+        case["q"],
+        case["kv"],
+        case["do"],
+        case["o"],
+        case["lse"],
+        case["indices"],
+        case["sink"],
+        scale,
+    )
+    return [(name, triton.testing.do_bench(run)) for name, run in bwd_phases(plan)]
 
 
 # ---------------------------------------------------------------------------
 # Correctness gate
 # ---------------------------------------------------------------------------
-def _ref_scores(q_t, kv_f, idx, scale):
-    """Masked fp32 scores for one token: [H, topk], invalid slots -inf. Also returns the rows."""
-    valid = idx != -1
-    k = kv_f[idx.clamp(min=0)]
-    k = torch.where(valid[:, None], k, torch.zeros_like(k))
-    s = (q_t @ k.t()) * scale
-    return torch.where(valid[None, :], s, torch.full_like(s, float("-inf"))), k, valid
-
-
-def _ref_forward(q, kv, sink, topk, scale):
-    """fp32 reference forward. Per-token python loop, so small shapes only.
-
-    Returns `o` and the leaf tensors, so the caller can drive autograd through it.
-    """
-    qg = q.float().clone().requires_grad_(True)
-    kvg = kv.float().clone().requires_grad_(True)
-    sg = sink.clone().requires_grad_(True)
-    outs = []
-    for t in range(q.shape[0]):
-        s, k, valid = _ref_scores(qg[t], kvg, topk[t].long(), scale)
-        m = torch.maximum(s.max(dim=1).values, sg)
-        p = torch.where(valid[None, :], torch.exp(s - m[:, None]), torch.zeros_like(s))
-        denom = p.sum(dim=1) + torch.exp(sg - m)
-        outs.append((p @ k) / denom[:, None])
-    return torch.stack(outs, dim=0), (qg, kvg, sg)
-
-
-def _ref_lse(q, kv, sink, topk, scale):
-    """Sink-inclusive log-sum-exp matching the forward's convention."""
-    with torch.no_grad():
-        kv_f = kv.float()
-        rows = []
-        for t in range(q.shape[0]):
-            s, _, _ = _ref_scores(q[t].float(), kv_f, topk[t].long(), scale)
-            rows.append(torch.logsumexp(torch.cat([s, sink[:, None]], dim=1), dim=1))
-        return torch.stack(rows)
-
-
 def check_correctness(device):
     """Small-shape gate against autograd, so a broken kernel fails before it is timed."""
     print("\n========== CORRECTNESS ==========")
@@ -238,9 +146,11 @@ def check_correctness(device):
         case["indices"],
     )
 
-    ref_o, (qg, kvg, sg) = _ref_forward(q, kv, sink, indices, scale)
+    qg = q.float().clone().requires_grad_(True)
+    kvg = kv.float().clone().requires_grad_(True)
+    sg = sink.clone().requires_grad_(True)
+    ref_o, lse = sparse_mla_dsv4_ref(qg, kvg, indices, sg, scale)
     o = ref_o.detach().to(torch.bfloat16).contiguous()
-    lse = _ref_lse(q, kv, sink, indices, scale)
 
     dq, dkv, d_sink = sparse_mla_bwd_dsv4(
         q, kv, do, o, lse, indices, attn_sink=sink, scale=scale
@@ -287,7 +197,7 @@ def run_bwd_bench(args, device):
         scale = 1.0 / (D**0.5)
         tflops = _flops(T, H, topk) / 1e12
 
-        ms = _bench(
+        ms = triton.testing.do_bench(
             lambda c=case, s=scale: sparse_mla_bwd_dsv4(
                 c["q"],
                 c["kv"],
@@ -325,13 +235,19 @@ def _parse_args():
             "4096,128,1024",
             "8192,128,512",
         ],
+        help="one or more shapes as T,H,topk (e.g. 4096,128,512). topk must be >= the sliding "
+        "window (128); the remainder is drawn from the compressed pool.",
     )
     p.add_argument(
         "--breakdown",
         action="store_true",
         help="also time each phase separately (the per-kernel table in the PR description)",
     )
-    p.add_argument("--skip-correctness", action="store_true")
+    p.add_argument(
+        "--skip-correctness",
+        action="store_true",
+        help="skip the small-shape autograd check that otherwise runs before any timing.",
+    )
     args = p.parse_args()
     args.cfgs = [tuple(int(x) for x in s.split(",")) for s in args.cfgs]
     return args
