@@ -139,18 +139,23 @@ def compile_mega_moe_stage1(
     if debug_role_mode not in (0, 1, 2, 3, 4, 5, 6):
         raise ValueError("debug_role_mode must be in [0, 6]")
     planner_blocks = 0 if preplanned_compact else 1
-    consumer_ticket_base = dispatch_blocks + planner_blocks
+    # Compact launches exactly one CTA per CU.  Low block IDs perform finite
+    # payload work and then join the common GEMM work queue; the remaining
+    # CTAs may wait for tile readiness without preventing any producer from
+    # becoming resident.  Fixed-slot retains arrival tickets until its owner
+    # epoch protocol is converted to the same bounded-grid scheme.
+    consumer_ticket_base = 0 if preplanned_compact else dispatch_blocks + planner_blocks
     # Compact external-counting overwrites every source-owned histogram row
     # and publishes COUNT_DONE with the invocation generation.  That exchange
     # already provides the cross-rank release/acquire edge, so a separate
     # launch-ready round trip is redundant.  Fixed-slot and locally-counted
     # paths retain the entry handshake because they do not have that edge.
     cross_rank_entry_handshake = fixed_slot_dispatch
-    # Planner and producer CTAs retire permanently. A full consumer cohort is
-    # queued behind them and dynamically backfills released CUs.
+    # Compact uses a bounded all-resident cohort.  Fixed-slot still queues a
+    # full consumer cohort behind its arrival-ticket owner/producers.
     grid_x = 1 if debug_role_mode == 5 else num_cu * grid_mult
     assert grid_x > 0, "consumer grid must remain positive"
-    launch_grid_x = consumer_ticket_base + grid_x
+    launch_grid_x = grid_x if preplanned_compact else consumer_ticket_base + grid_x
     assert launch_grid_x <= num_cu * 33 + 1
     M_REPEAT = sort_block_m // 16
     NUM_ACC_N = n_per_wave // 16
@@ -278,19 +283,23 @@ def compile_mega_moe_stage1(
         if const_expr(ready_tile_queue):
             a_max_expert_tiles = _disp_ptr(DispatchSlot.MAX_EXPERT_TILES)
 
-        ticket_scratch = fx.recast_iter(fx.Int64, a_buf.ptr)
-        ticket_view = fx.make_view(ticket_scratch, fx.make_layout(1, 1))
-        if tid == fx.Int32(0):
-            ticket64 = fx.Int64(
-                comm_ops.atomic_add_agent(
-                    a_entry_count + fx.Int64(grid_epoch_slot * 8), fx.Int64(1)
+        if const_expr(preplanned_compact):
+            ticket = fx.block_idx.x
+            generation = fx.Int64(0)
+        else:
+            ticket_scratch = fx.recast_iter(fx.Int64, a_buf.ptr)
+            ticket_view = fx.make_view(ticket_scratch, fx.make_layout(1, 1))
+            if tid == fx.Int32(0):
+                ticket64 = fx.Int64(
+                    comm_ops.atomic_add_agent(
+                        a_entry_count + fx.Int64(grid_epoch_slot * 8), fx.Int64(1)
+                    )
                 )
-            )
-            fx.ptr_store(Vec.from_elements([ticket64], fx.Int64), ticket_scratch)
-        fx.barrier()
-        ticket64 = Vec(ticket_view.load())[0]
-        generation = ticket64 // fx.Int64(launch_grid_x)
-        ticket = fx.Int32(ticket64 - generation * fx.Int64(launch_grid_x))
+                fx.ptr_store(Vec.from_elements([ticket64], fx.Int64), ticket_scratch)
+            fx.barrier()
+            ticket64 = Vec(ticket_view.load())[0]
+            generation = ticket64 // fx.Int64(launch_grid_x)
+            ticket = fx.Int32(ticket64 - generation * fx.Int64(launch_grid_x))
         gate_addr = a_epoch_gate + fx.Int64(grid_epoch_slot * 4)
         gate_epoch = fx.Int32(generation + fx.Int64(1))
         if const_expr(preplanned_compact):
@@ -601,8 +610,10 @@ def compile_mega_moe_stage1(
                     addr_payload_ready + fx.Int64(pe_index) * fx.Int64(4), payload_expected
                 )
 
-        # Retired planner/producer CTAs never enter GEMM.  Queued consumers
-        # backfill released CUs and claim completion-order work dynamically.
+        # Compact producers join the work queue after their finite payload
+        # copy.  Its grid is capped at one CTA per CU, so waiting consumers
+        # cannot starve an unscheduled producer.  Fixed-slot producers retain
+        # the queued-consumer behavior until its owner epoch is converted.
         consumer_id = ticket - fx.Int32(consumer_ticket_base)
         consumer_base = fx.Int32(consumer_ticket_base)
         consumer_active = (ticket >= consumer_base) & (
