@@ -947,12 +947,13 @@ def flydsl_hgemm(
 # ---------------------------------------------------------------------------
 
 _flydsl_compile_fn = None
+_flydsl_splitk_reduce_fn = None
 _flydsl_import_done = False
 
 
 def _get_compile_fn():
     """Lazy-import compile_preshuffle_gemm so the module loads even without FlyDSL."""
-    global _flydsl_compile_fn, _flydsl_import_done
+    global _flydsl_compile_fn, _flydsl_splitk_reduce_fn, _flydsl_import_done
     if _flydsl_import_done:
         return _flydsl_compile_fn
     _flydsl_import_done = True
@@ -960,9 +961,13 @@ def _get_compile_fn():
         logger.info("[FlyDSL] not available, will fall back to CK/CKTile")
         return None
     try:
-        from .kernels.preshuffle_gemm import compile_preshuffle_gemm
+        from .kernels.preshuffle_gemm import (
+            compile_preshuffle_gemm,
+            compile_splitk_reduce,
+        )
 
         _flydsl_compile_fn = compile_preshuffle_gemm
+        _flydsl_splitk_reduce_fn = compile_splitk_reduce
         logger.info("[FlyDSL] loaded preshuffle GEMM compiler")
     except Exception as e:  # noqa: BLE001
         logger.info(
@@ -985,8 +990,14 @@ def flydsl_preshuffle_gemm_a8(
     xcd_swizzle: int = 0,
     lds_stage: int = 2,
     enable_scheduler: bool = True,
+    k_split: int = 1,
 ) -> Tensor:
-    """Compile (cached via lru_cache) and run a FlyDSL preshuffle GEMM kernel."""
+    """Compile (cached via lru_cache) and run a FlyDSL preshuffle GEMM kernel.
+
+    ``k_split`` > 1 splits the K loop across gridDim.z. Slices write fp32
+    partials into a ``[M, k_split, N]`` workspace allocated here; a second kernel
+    sums them and rounds once into ``Out``.
+    """
     compile_fn = _get_compile_fn()
     if compile_fn is None:
         raise RuntimeError("[FlyDSL] compile function not available")
@@ -1003,6 +1014,12 @@ def flydsl_preshuffle_gemm_a8(
     if k % tile_k != 0:
         raise RuntimeError(
             f"[FlyDSL] K ({k}) is not a multiple of tile_k ({tile_k}). "
+            f"Arguments not supported! Skipping gemm!"
+        )
+    if int(k_split) > 1 and (k // tile_k) % int(k_split) != 0:
+        raise RuntimeError(
+            f"[FlyDSL] k_split ({k_split}) does not divide the K-tile count "
+            f"({k // tile_k} = K {k} / tile_k {tile_k}). "
             f"Arguments not supported! Skipping gemm!"
         )
 
@@ -1037,10 +1054,27 @@ def flydsl_preshuffle_gemm_a8(
         enable_scheduler=bool(enable_scheduler),
         xcd_swizzle=int(xcd_swizzle),
         lds_stage=int(lds_stage),
+        k_split=int(k_split),
     )
 
     def _as_i8(t):
         return t.view(torch.int8) if "float8" in str(t.dtype) else t
+
+    # Each slice owns a disjoint band, so the workspace needs no pre-clear.
+    if int(k_split) > 1:
+        if _flydsl_splitk_reduce_fn is None:
+            raise RuntimeError("[FlyDSL] split-K reduce kernel not available")
+        reduce_exe = _flydsl_splitk_reduce_fn(
+            N=n,
+            k_split=int(k_split),
+            out_dtype=out_dtype,
+        )
+        gemm_dst = torch.empty(
+            (m, int(k_split), n), dtype=torch.float32, device=Out.device
+        )
+    else:
+        reduce_exe = None
+        gemm_dst = None
 
     out_contig = Out.contiguous()
     # FlyDSL's preshuffle kernel requires an arg_bias slot (used only when
@@ -1050,9 +1084,10 @@ def flydsl_preshuffle_gemm_a8(
     # The layout-API launcher (PR #754) takes fx.Tensor args (it builds views via
     # fx.get_iter/make_view), so pass flat torch tensors directly rather than raw
     # pointers.
+    stream = fx.Stream(torch.cuda.current_stream())
     _run_compiled(
         exe,
-        out_contig.view(-1),
+        (gemm_dst if gemm_dst is not None else out_contig).view(-1),
         _as_i8(XQ.contiguous()).view(-1),
         _as_i8(WQ.contiguous()).view(-1),
         x_scale.contiguous().view(-1),
@@ -1060,8 +1095,16 @@ def flydsl_preshuffle_gemm_a8(
         _dummy_bias,
         m,
         n,
-        fx.Stream(torch.cuda.current_stream()),
+        stream,
     )
+    if reduce_exe is not None:
+        _run_compiled(
+            reduce_exe,
+            out_contig.view(-1),
+            gemm_dst.view(-1),
+            m,
+            stream,
+        )
     if out_contig is not Out:
         Out.copy_(out_contig)
 
