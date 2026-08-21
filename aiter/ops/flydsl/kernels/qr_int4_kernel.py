@@ -15,7 +15,7 @@ from typing import ClassVar
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
-from flydsl._mlir.dialects import llvm, rocdl, scf
+from flydsl._mlir.dialects import llvm, scf
 from flydsl.compiler.ast_rewriter import ASTRewriter
 from flydsl.expr import gpu, range_constexpr
 from flydsl.expr import rocdl as fly_rocdl
@@ -56,10 +56,7 @@ LDS_BYTES = ATOMS * RANK_TILE_BYTES
 _CM_SC1 = 2
 _CM_NT = 4
 
-# INT4 nibble range [-8,+7] as packed fp16; bias +8 as i16x2.
-_K_RANGE_MIN = 0xC800C800  # -8
-_K_RANGE_MAX = 0x47004700  # +7
-_K_RANGE_BIAS = 0x00080008  # +8 as i16x2
+# Dequant bit-trick: nibble | 0x6400 then + (-1032.0) as f16x2 reconstructs (q-8).
 _K_MASK_000F = 0x000F000F
 _K_HALF2_1024 = 0x64006400
 _K_HALF2_1032 = 0xE408E408  # -1032.0 fp16x2
@@ -69,152 +66,53 @@ def _raw(v):
     return v.ir_value() if hasattr(v, "ir_value") else v
 
 
-def _pk2(op, a, b):
-    return fx.Int32(
-        llvm.inline_asm(
-            ir.IntegerType.get_signless(32),
-            [_raw(a), _raw(b)],
-            f"{op} $0, $1, $2",
-            "=v,v,v",
-            has_side_effects=False,
-        )
-    )
+def _f16x2(packed):
+    return fx.Vector.from_elements([packed], fx.Int32).bitcast(fx.Float16)
 
 
-def _pk_max(a, b):
-    return _pk2("v_pk_max_f16", a, b)
+def _i32(vec):
+    return vec.bitcast(fx.Int32)[0]
 
 
-def _pk_min(a, b):
-    return _pk2("v_pk_min_f16", a, b)
+def _minnumf(a, b):
+    return fx.Vector(fx.arith.minnumf(a, b), a.shape, a.dtype)
 
 
-def _pk_mul(a, b):
-    return _pk2("v_pk_mul_f16", a, b)
-
-
-def _pk_add_f16(a, b):
-    return _pk2("v_pk_add_f16", a, b)
-
-
-def _pk_fma_f16(a, b, c):
-    """``v_pk_fma_f16``: LLVM cannot contract the ``_pk_mul`` / ``_pk_add_f16``
-    inline asm. gfx942 has no packed bf16 FMA.
-    """
-    return fx.Int32(
-        llvm.inline_asm(
-            ir.IntegerType.get_signless(32),
-            [_raw(a), _raw(b), _raw(c)],
-            "v_pk_fma_f16 $0, $1, $2, $3",
-            "=v,v,v,v",
-            has_side_effects=False,
-        )
-    )
-
-
-def _pk_add_i16(a, b):
-    return _pk2("v_pk_add_i16", a, b)
-
-
-def _cvt_f16_f32(f):
-    return fx.Int32(
-        llvm.inline_asm(
-            ir.IntegerType.get_signless(32),
-            [_raw(f)],
-            "v_cvt_f16_f32 $0, $1",
-            "=v,v",
-            has_side_effects=False,
-        )
-    )
-
-
-def _cvt_pk_f16_f32(a, b):
-    lo = _cvt_f16_f32(a)
-    hi = _cvt_f16_f32(b)
-    return (lo & fx.Int32(0xFFFF)) | (hi << fx.Int32(16))
-
-
-def _cvt_f32_f16(bits):
-    return fx.Float32(
-        llvm.inline_asm(
-            ir.F32Type.get(),
-            [_raw(bits)],
-            "v_cvt_f32_f16 $0, $1",
-            "=v,v",
-            has_side_effects=False,
-        )
-    )
+def _splat_f16x2(x):
+    return fx.Vector.filled(2, x, fx.Float16)
 
 
 def _enable_fp16_ovfl():
     llvm.InlineAsmOp(None, [], "s_setreg_imm32_b32 0xdc1, 1", "", has_side_effects=True)
 
 
-def _wait_vmem():
-    rocdl.s_waitcnt(0)
-
-
-def _wait_lds():
-    """lgkmcnt(0) only so the next sub-tile may reuse ATOMS*1152 B LDS while NT stores fly."""
-    fly_rocdl.s_waitcnt(lgkmcnt=0)
-
-
-def _fabs(x):
-    zero = fx.Float32(0.0)
-    return (x < zero).select(-x, x)
-
-
-def _unpack_f16x2(packed):
-    return _cvt_f32_f16(packed), _cvt_f32_f16(packed.shrui(fx.Int32(16)))
-
-
-def _packed_abs_max(wmax, wmin):
-    a0, a1 = _unpack_f16x2(wmax)
-    b0, b1 = _unpack_f16x2(wmin)
-    r0 = (_fabs(a0) > _fabs(b0)).select(a0, b0)
-    r1 = (_fabs(a1) > _fabs(b1)).select(a1, b1)
-    return _cvt_pk_f16_f32(r0, r1)
+def _shuffle_f16x2(vec, xor_off):
+    return _f16x2(fx.Int32(gpu.shuffle_xor(_i32(vec), xor_off, WAVE)))
 
 
 def _pair_signed_ext_f16(atom):
     """Signed extremum of 16 fp16 (this thread's 8 + xor-1 neighbor)."""
-    wmax = _pk_max(_pk_max(atom[0], atom[1]), _pk_max(atom[2], atom[3]))
-    wmin = _pk_min(_pk_min(atom[0], atom[1]), _pk_min(atom[2], atom[3]))
-    wmax = _pk_max(wmax, gpu.shuffle_xor(wmax, 1, WAVE))
-    wmin = _pk_min(wmin, gpu.shuffle_xor(wmin, 1, WAVE))
-    pk = _packed_abs_max(wmax, wmin)
-    a0, a1 = _unpack_f16x2(pk)
-    return (_fabs(a0) > _fabs(a1)).select(a0, a1)
+    p0, p1, p2, p3 = (
+        _f16x2(atom[0]),
+        _f16x2(atom[1]),
+        _f16x2(atom[2]),
+        _f16x2(atom[3]),
+    )
+    wmax = fx.maxnumf(fx.maxnumf(p0, p1), fx.maxnumf(p2, p3))
+    wmin = _minnumf(_minnumf(p0, p1), _minnumf(p2, p3))
+    wmax = fx.maxnumf(wmax, _shuffle_f16x2(wmax, 1))
+    wmin = _minnumf(wmin, _shuffle_f16x2(wmin, 1))
+    pk = (abs(wmax) > abs(wmin)).select(wmax, wmin)
+    lo, hi = pk[0], pk[1]
+    return fx.Float32((abs(lo) > abs(hi)).select(lo, hi))
 
 
 def _atom_bf16_to_f16(atom):
-    out = []
-    for i in range_constexpr(4):
-        pair = atom[i]
-        lo = (pair & fx.Int32(0xFFFF)) << fx.Int32(16)
-        hi = pair.shrui(fx.Int32(16)) << fx.Int32(16)
-        out.append(_cvt_pk_f16_f32(lo.bitcast(fx.Float32), hi.bitcast(fx.Float32)))
-    return fx.Vector.from_elements(out, fx.Int32)
-
-
-def _f32_to_bf16_bits(f):
-    u = f.bitcast(fx.Int32)
-    u = u + fx.Int32(0x7FFF) + (u.shrui(fx.Int32(16)) & fx.Int32(1))
-    return u.shrui(fx.Int32(16)) & fx.Int32(0xFFFF)
+    return fx.Vector(atom).bitcast(fx.BFloat16).to(fx.Float16).bitcast(fx.Int32)
 
 
 def _atom_f16_to_bf16(atom):
-    out = []
-    for i in range_constexpr(4):
-        f0, f1 = _unpack_f16x2(atom[i])
-        lo = _f32_to_bf16_bits(f0)
-        hi = _f32_to_bf16_bits(f1)
-        out.append(lo | (hi << fx.Int32(16)))
-    return fx.Vector.from_elements(out, fx.Int32)
-
-
-def _clamp_i32(x, lo, hi):
-    return (x < lo).select(lo, (x > hi).select(hi, x))
+    return fx.Vector(atom).bitcast(fx.Float16).to(fx.BFloat16).bitcast(fx.Int32)
 
 
 def _f32_to_e4m3(x):
@@ -227,14 +125,17 @@ def _f32_to_e4m3(x):
     zero = fx.Float32(0.0)
     is_z = x == zero
     sign = (x < zero).select(fx.Int32(0x80), fx.Int32(0))
-    bits = _fabs(x).bitcast(fx.Int32)
+    bits = abs(x).bitcast(fx.Int32)
     e = (bits.shrui(fx.Int32(23)) & fx.Int32(255)) - fx.Int32(127)
     mant = bits & fx.Int32(0x7FFFFF)
     m3 = (mant + fx.Int32(1 << 19)).shrui(fx.Int32(20))
     carry = m3 == fx.Int32(8)
     e = e + carry.select(fx.Int32(1), fx.Int32(0))
     m3 = carry.select(fx.Int32(0), m3)
-    e4 = _clamp_i32(e + fx.Int32(7), fx.Int32(0), fx.Int32(15))
+    e4 = e + fx.Int32(7)
+    e4 = (e4 < fx.Int32(0)).select(
+        fx.Int32(0), (e4 > fx.Int32(15)).select(fx.Int32(15), e4)
+    )
     byte = sign | (e4 << fx.Int32(3)) | (m3 & fx.Int32(7))
     return is_z.select(fx.Int32(0), byte)
 
@@ -267,24 +168,17 @@ def _pack_e4m3_word(e, lane):
 
 
 def _e4m3_decoding_scale(e):
-    d = _e4m3_to_f32(e) * fx.Float32(-0.125)
-    return _cvt_pk_f16_f32(d, d)
-
-
-def _rint_i16_pair(packed_f16):
-    f0, f1 = _unpack_f16x2(packed_f16)
-    i0 = fx.Int32(fx.roundeven(f0))
-    i1 = fx.Int32(fx.roundeven(f1))
-    return (i0 & fx.Int32(0xFFFF)) | (i1 << fx.Int32(16))
+    return _splat_f16x2(_e4m3_to_f32(e) * fx.Float32(-0.125))
 
 
 def _quant_atom_fp16(atom, enc_pk):
     q = []
+    lo = _splat_f16x2(fx.Float16(-8.0))
+    hi = _splat_f16x2(fx.Float16(7.0))
+    bias = fx.Vector.filled(2, fx.Int16(8), fx.Int16)
     for i in range_constexpr(4):
-        w = _pk_mul(atom[i], enc_pk)
-        w = _pk_max(w, fx.Int32(_K_RANGE_MIN))
-        w = _pk_min(w, fx.Int32(_K_RANGE_MAX))
-        q.append(_pk_add_i16(_rint_i16_pair(w), fx.Int32(_K_RANGE_BIAS)))
+        w = _minnumf(fx.maxnumf(_f16x2(atom[i]) * enc_pk, lo), hi)
+        q.append(_i32(fx.roundeven(w).to(fx.Int16) + bias))
     return q[0] | (q[1] << fx.Int32(4)) | (q[2] << fx.Int32(8)) | (q[3] << fx.Int32(12))
 
 
@@ -292,11 +186,9 @@ def _codec_quant(atom, lane, tid):
     ext = _pair_signed_ext_f16(atom)
     e = _f32_to_e4m3(ext)
     d = _e4m3_to_f32(e) * fx.Float32(-0.125)
-    enc = _cvt_pk_f16_f32(
-        fx.Float32(1.0) / (d + fx.Float32(1e-7)),
-        fx.Float32(1.0) / (d + fx.Float32(1e-7)),
+    packed = _quant_atom_fp16(
+        atom, _splat_f16x2(fx.Float32(1.0) / (d + fx.Float32(1e-7)))
     )
-    packed = _quant_atom_fp16(atom, enc)
     is_leader = (tid % GROUP) == 0
     return packed, _pack_e4m3_word(e, lane), is_leader
 
@@ -305,28 +197,26 @@ def _codec_dequant(packed, scale):
     out = []
     mask = fx.Int32(_K_MASK_000F)
     bias_hi = fx.Int32(_K_HALF2_1024)
-    bias_lo = fx.Int32(_K_HALF2_1032)
+    bias_lo = _f16x2(fx.Int32(_K_HALF2_1032))
     for i in range_constexpr(4):
         q4 = (packed.shrui(fx.Int32(i * 4)) & mask) | bias_hi
-        w = _pk_add_f16(q4, bias_lo)
-        out.append(_pk_mul(w, scale))
+        out.append(_i32((_f16x2(q4) + bias_lo) * scale))
     return fx.Vector.from_elements(out, fx.Int32)
 
 
 def _codec_dequant_acc(packed, scale, acc):
-    """Nibble reconstruct ``(q-8)``, then ``v_pk_fma_f16`` into *acc*.
+    """Nibble reconstruct ``(q-8)``, then packed f16 FMA into *acc*.
 
-    ``v_dot2_f32_f16`` is not used: the two fp16 lanes are independent
-    channels (lo/hi of each packed pair), not two products into one f32.
+    ``a * b + c`` does not contract to ``v_pk_fma_f16``; ``fx.fma`` does.
+    Two fp16 lanes are independent channels, not a dot into f32.
     """
     out = []
     mask = fx.Int32(_K_MASK_000F)
     bias_hi = fx.Int32(_K_HALF2_1024)
-    bias_lo = fx.Int32(_K_HALF2_1032)
+    bias_lo = _f16x2(fx.Int32(_K_HALF2_1032))
     for i in range_constexpr(4):
         q4 = (packed.shrui(fx.Int32(i * 4)) & mask) | bias_hi
-        w = _pk_add_f16(q4, bias_lo)
-        out.append(_pk_fma_f16(w, scale, acc[i]))
+        out.append(_i32(fx.fma(_f16x2(q4) + bias_lo, scale, _f16x2(acc[i]))))
     return fx.Vector.from_elements(out, fx.Int32)
 
 
@@ -338,7 +228,9 @@ def _uniform_i64(addr):
     uses that rsrc (``v_readfirstlane`` + exec mask per load). One
     ``readfirstlane`` here moves the descriptor to SGPRs for the whole kernel.
     """
-    return fx.Int64(rocdl.readfirstlane(ir.IntegerType.get_signless(64), _raw(addr)))
+    return fx.Int64(
+        fly_rocdl.readfirstlane(ir.IntegerType.get_signless(64), _raw(addr))
+    )
 
 
 def _store_v4i32_nt_global(addr_i64, data):
@@ -368,7 +260,7 @@ def _load_i32_uncached(rsrc):
     val = buffer_ops.buffer_load(
         rsrc, 0, vec_width=1, dtype=T.i32, cache_modifier=_CM_SC1
     )
-    rocdl.s_waitcnt(0)
+    fly_rocdl.s_waitcnt(vmcnt=0)
     return val
 
 
@@ -542,7 +434,7 @@ def make_qr_int4_kernel(*, world_size: int = WORLD, super_tile: int = 1):
         def _store_color(color):
             off = fx.get_scalar(fx.crd2idx((bid,), color_layout))
             buffer_ops.buffer_store(color, color_rsrc, off)
-            _wait_vmem()
+            fly_rocdl.s_waitcnt(vmcnt=0)
 
         def _load_tile_atoms(tile):
             atoms = []
@@ -641,7 +533,7 @@ def make_qr_int4_kernel(*, world_size: int = WORLD, super_tile: int = 1):
                 _store_v4i32_nt_global(dest + byte_off, v4)
 
         def _publish(phase, inbox_src, color):
-            _wait_vmem()
+            fly_rocdl.s_waitcnt(vmcnt=0)
             gpu.barrier()
             _fanout_release(phase, inbox_src, color)
 
@@ -727,7 +619,8 @@ def make_qr_int4_kernel(*, world_size: int = WORLD, super_tile: int = 1):
                     gpu.barrier()
                     _fanout_nt(PHASE_RS, rank, s)
                     if (s + one) < n_this:
-                        _wait_lds()
+                        # lgkmcnt(0) only: reuse ATOMS*1152 B LDS while NT stores fly.
+                        fly_rocdl.s_waitcnt(lgkmcnt=0)
 
                 _publish(PHASE_RS, rank, color)
                 _wait_release(PHASE_RS, color)
@@ -738,7 +631,8 @@ def make_qr_int4_kernel(*, world_size: int = WORLD, super_tile: int = 1):
                     gpu.barrier()
                     _fanout_nt(PHASE_AG, rank, s)
                     if (s + one) < n_this:
-                        _wait_lds()
+                        # lgkmcnt(0) only: reuse ATOMS*1152 B LDS while NT stores fly.
+                        fly_rocdl.s_waitcnt(lgkmcnt=0)
 
                 _publish(PHASE_AG, rank, color)
                 _wait_release(PHASE_AG, color)
