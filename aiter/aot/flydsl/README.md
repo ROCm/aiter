@@ -70,9 +70,9 @@ python -m aiter.aot.flydsl.chunk_gdn_h --target-arch gfx942
 | `AITER_AOT_IMPORT` | Set to `1` so `import aiter` only loads the lightweight JIT core and skips the full top-level op namespace — faster and avoids heavy import side effects during AOT compilation (this is what `setup.py` sets while pre-compiling). | `0` |
 | `FLYDSL_RUNTIME_CACHE_DIR` | Cache directory | `~/.flydsl/cache` |
 | `FLYDSL_AOT_WORKERS` | Max concurrent worker processes. A positive value is honored verbatim and bypasses the memory cap below; unset, empty, zero, or negative selects the automatic CPU/memory limit. Each worker uses ~1.5–2.5 GB RSS. | `min(affinity-aware CPUs, 64)`, then capped by available memory |
-| `FLYDSL_AOT_MEM_PER_WORKER_GB` | Assumed GiB/worker for the **auto memory cap** that keeps the OOM-killer from firing. Applies whenever `FLYDSL_AOT_WORKERS` is not a positive explicit limit; non-positive disables the cap. Automatic detection uses `psutil` (declared by aiter); if unavailable, FlyDSL warns and continues with the CPU-based limit. | `2.0` |
+| `FLYDSL_AOT_MEM_PER_WORKER_GB` | Assumed GiB/worker for the **auto memory cap** that keeps the OOM-killer from firing. Applies whenever `FLYDSL_AOT_WORKERS` is not a positive explicit limit; non-positive disables the cap. Automatic detection uses `psutil` (declared by aiter); if unavailable, FlyDSL emits a warning and falls back to at most four workers. | `2.0` |
 | `FLYDSL_AOT_TIMEOUT` | Per-kernel wall-clock cap (seconds). A worker stuck *alive* past this is killed (and retried); non-positive disables. | `1200` |
-| `FLYDSL_AOT_MAX_RETRIES` | Retries for an infrastructure failure. Retries wait behind jobs that have not started. An OOM kill halves the worker limit at most once per launch wave; every subsequent healthy completion helps restore it additively. Timeouts do not change global concurrency. Clean compile errors and structured Python exceptions are never retried; negative values clamp to `0`. | `2` |
+| `FLYDSL_AOT_MAX_RETRIES` | Retries for an infrastructure failure. OOM-like kills and timeouts are classified separately but neither changes global concurrency. Retries wait behind jobs that have not started. Clean compile errors and structured Python exceptions are never retried; negative values clamp to `0`. | `2` |
 | `FLYDSL_DEBUG_LOG_TO_CONSOLE` | Emit FlyDSL scheduler messages to stderr. | `0` |
 | `FLYDSL_DEBUG_LOG_LEVEL` | Scheduler log verbosity; use `INFO` for progress and final summaries. | `WARNING` |
 | `AITER_CONFIGS` | Resolves the default CSV lookup path (same as the runtime JIT) | repo built-in |
@@ -145,9 +145,9 @@ python op_tests/test_moe_2stage.py
   your local FlyDSL checkout (`scripts/build.sh`, after `pip install
   nanobind==2.12.0` if CMake reports it missing) so the on-`PYTHONPATH` build dir
   is refreshed to the right version.
-- **Worker OOM / killed (exitcode -9)**: FlyDSL halves the worker limit once for
-  the affected launch wave before retrying, then restores it additively after
-  healthy completions. The initial default is memory-capped via `psutil` and
+- **Worker OOM / killed (exitcode -9)**: FlyDSL reports it as `possible_oom` and
+  applies the configured FIFO retry policy without changing global concurrency.
+  The initial default is memory-capped via `psutil` and
   `FLYDSL_AOT_MEM_PER_WORKER_GB`. If OOM persists, set a lower
   `FLYDSL_AOT_WORKERS` value or raise the assumed GiB/worker.
 - **A kernel hangs / never finishes**: it is killed once it exceeds
