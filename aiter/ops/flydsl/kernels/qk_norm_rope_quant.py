@@ -48,7 +48,7 @@ import torch
 from flydsl._mlir.dialects import llvm, rocdl
 from flydsl.expr import arith, const_expr, ptrtoint, range_constexpr
 from flydsl.expr import math as fmath
-from flydsl.expr.arith import ArithValue, FastMathFlags
+from flydsl.expr.arith import FastMathFlags
 from flydsl.expr.rocdl import tdm_ops
 from flydsl.expr.typing import Int32, ReductionOp, Stream, T
 
@@ -65,7 +65,25 @@ from aiter.utility.mx_types import (
     MxDtypeInt as _D,
 )
 
-from .tensor_shim import GTensor, _run_compiled, _to_raw
+from .tensor_shim import GTensor, _run_compiled
+
+
+def _imin(a, b):
+    """Signed integer min. fx's numeric layer has no int min/max."""
+    return fx.Int32(arith.minsi(a.ir_value(), b.ir_value()))
+
+
+def _imax(a, b):
+    """Signed integer max. fx's numeric layer has no int min/max."""
+    return fx.Int32(arith.maxsi(a.ir_value(), b.ir_value()))
+
+
+def _idiv(a, b):
+    """Truncating signed integer divide. ``//`` maps to arith.floordivsi, a
+    longer expansion; every dividend here is already clamped non-negative, so
+    the truncating op is both correct and cheaper."""
+    return fx.Int32(arith.divsi(a.ir_value(), b.ir_value()))
+
 
 _STATIC_ADAPTOR_CACHE = {}
 _STATIC_ADAPTOR_CACHE_MAX = 64
@@ -301,7 +319,7 @@ def _store_bf16_vec(vals, out_rsrc, row_base_bytes, idx, vec):
 
     dwords = vec // 2
     bf16_as_i32 = vector.bitcast(T.vec(dwords, i32), bf16v)
-    off_bytes = row_base_bytes + ArithValue(idx) * (vec * 2)
+    off_bytes = row_base_bytes + idx * (vec * 2)
 
     if const_expr(dwords <= 4):
         buffer_ops.buffer_store(bf16_as_i32, out_rsrc, off_bytes, offset_is_bytes=True)
@@ -314,9 +332,7 @@ def _store_bf16_vec(vals, out_rsrc, row_base_bytes, idx, vec):
             T.vec(4, i32), bf16_as_i32, offsets=[4], sizes=[4], strides=[1]
         )
         buffer_ops.buffer_store(lo, out_rsrc, off_bytes, offset_is_bytes=True)
-        buffer_ops.buffer_store(
-            hi, out_rsrc, ArithValue(off_bytes) + 16, offset_is_bytes=True
-        )
+        buffer_ops.buffer_store(hi, out_rsrc, off_bytes + 16, offset_is_bytes=True)
 
 
 def _store_fp8_packed_w32(
@@ -344,9 +360,9 @@ def _store_fp8_packed_w32(
         c_neg_uf = fx.Float32(-(2.0**-8))
         safe = []
         for v in vals_list:
-            vv = v.ir_value() if hasattr(v, "ir_value") else v
+            vv = v if hasattr(v, "ir_value") else fx.Float32(v)
             is_tn = (vv < c0) & (vv > c_neg_uf)
-            safe.append(is_tn.select(c0, vv))
+            safe.append(is_tn.select(c0, vv).ir_value())
 
     n_dwords = vec // 4
     assert n_dwords in (2, 4), f"VEC={vec} -> n_dwords={n_dwords} unsupported"
@@ -358,7 +374,7 @@ def _store_fp8_packed_w32(
         pk = rocdl.cvt_pk_fp8_f32(i32, safe[base + 2], safe[base + 3], pk, 1)
         dword_list.append(pk)
 
-    off_bytes = row_base_bytes + ArithValue(idx) * vec
+    off_bytes = row_base_bytes + idx * vec
     store_vec_ty = T.vec(n_dwords, i32)
     store_vec = vector.from_elements(store_vec_ty, dword_list)
     buffer_ops.buffer_store(store_vec, out_rsrc, off_bytes, offset_is_bytes=True)
@@ -1115,7 +1131,7 @@ def _build_kernel_w32(
                 """Load VEC bf16 from a 1D weight fx.Tensor via raw buffer_load.
                 Splits into dwordx4 chunks for VEC=16."""
                 wrsrc = buffer_ops.create_buffer_resource(weight_tensor, max_size=True)
-                tid_x_vec = ArithValue(tid_val) * VEC
+                tid_x_vec = tid_val * VEC
                 off_dw = tid_x_vec >> 1
                 f32_list = _load_bf16_raw(wrsrc, off_dw)
                 f32_vec = vector.from_elements(T.vec(VEC, f32), f32_list)
@@ -1140,7 +1156,7 @@ def _build_kernel_w32(
                 for chunk in range_constexpr(dwords // half_dw):
                     r = buffer_ops.buffer_load(
                         rsrc,
-                        ArithValue(off_dw) + (chunk * half_dw),
+                        off_dw + (chunk * half_dw),
                         vec_width=half_dw,
                         dtype=i32,
                     )
@@ -1159,11 +1175,9 @@ def _build_kernel_w32(
         # valid token instead of branching: they recompute an already-valid row
         # and write byte-identical results (idempotent), so there is no OOB
         # access and no divergent bounds check on the hot path.
-        tok = ArithValue(bid_t) * ROWS_PER_WG + ArithValue(tid_y)
-        _nt_m1 = _to_raw(num_tokens - 1)
-        tok = arith.minsi(_to_raw(tok), _nt_m1)
+        tok = _imin(bid_t * ROWS_PER_WG + tid_y, num_tokens - 1)
         bid_t = tok  # all downstream token offsets use the clamped token
-        bid_t_idx = fx.Index(_to_raw(tok))
+        bid_t_idx = fx.Index(tok)
 
         def _ptr_buffer_resource(ptr, num_records_bytes=None):
             addr = fx.ptrtoint(ptr)
@@ -1176,17 +1190,17 @@ def _build_kernel_w32(
 
         pos_rsrc = _ptr_buffer_resource(positions)
         pos_val_i64 = buffer_ops.buffer_load(pos_rsrc, bid_t, vec_width=1, dtype=T.i64)
-        pos_i32 = pos_val_i64.trunci(i32)
+        pos_i32 = fx.Int32(pos_val_i64.trunci(i32))
 
         # --- shared: cos/sin buffer resources (all threads load, NOPE
         # threads clamp index to 0 so the load is in-bounds/harmless) ---
         cos_rsrc = buffer_ops.create_buffer_resource(cos_cache, max_size=True)
         sin_rsrc = buffer_ops.create_buffer_resource(sin_cache, max_size=True)
         c_half_rd = fx.Int32(RD // 2)
-        cos_sin_row_base = ArithValue(pos_i32) * c_half_rd
+        cos_sin_row_base = pos_i32 * c_half_rd
 
         def wave_reduce_add(x):
-            w = fx.Float32(_to_raw(x))
+            w = fx.Float32(x)
             for sh_exp in range_constexpr(log2_block):
                 off = BLOCK_THREADS // (2 << sh_exp)
                 w = w + w.shuffle_xor(off, BLOCK_THREADS)
@@ -1211,12 +1225,9 @@ def _build_kernel_w32(
             VEC-wide fp32 vectors already loaded by the caller."""
             # ---- Issue cos/sin loads EARLY so they overlap with the
             # sumsq reduction ALU below (latency hiding). ----
-            is_rope_t = _to_raw(tid) >= fx.Int32(ROPE_THREAD_LO)
-            rope_rel_raw = ArithValue(tid) - fx.Int32(ROPE_THREAD_LO)
-            rope_rel = arith.maxsi(_to_raw(rope_rel_raw), _to_raw(fx.Int32(0)))
-            cs_off = cos_sin_row_base + ArithValue(rope_rel) * fx.Int32(
-                PAIRS_PER_THREAD
-            )
+            is_rope_t = tid >= fx.Int32(ROPE_THREAD_LO)
+            rope_rel = _imax(tid - fx.Int32(ROPE_THREAD_LO), fx.Int32(0))
+            cs_off = cos_sin_row_base + rope_rel * fx.Int32(PAIRS_PER_THREAD)
             if const_expr(PAIRS_PER_THREAD == 1):
                 cos_raw = buffer_ops.buffer_load(
                     cos_rsrc, cs_off, vec_width=1, dtype=T.bf16
@@ -1243,8 +1254,8 @@ def _build_kernel_w32(
                 else:
                     am_local = fmath.absf(x_f32_vec).reduce(ReductionOp.MAX)
 
-                w_sq = fx.Float32(_to_raw(sq_local))
-                w_am = fx.Float32(_to_raw(am_local))
+                w_sq = fx.Float32(sq_local)
+                w_am = fx.Float32(am_local)
                 for sh_exp in range_constexpr(log2_block):
                     off = BLOCK_THREADS // (2 << sh_exp)
                     w_sq = w_sq + w_sq.shuffle_xor(off, BLOCK_THREADS)
@@ -1266,18 +1277,20 @@ def _build_kernel_w32(
                 # and a const_expr-only branch leaves it undefined on the other
                 # path, which the AST rewriter rejects.
                 if const_expr(is_e8m0):
-                    # emit_mx_e8m0_scale is shared with the compress-attn kernels
-                    # and still takes the raw/ArithValue contract (it calls
-                    # .bitcast(T.i32) internally), so hand it a raw value.
-                    amax_post = ArithValue(_to_raw(am_safe * rstd * fx.Float32(_SQRT2)))
-                    e8m0_biased = emit_mx_e8m0_scale(
-                        amax_post, mode=_DEFAULT_MODE, dtype=_fp8_mx_dtype
+                    # emit_mx_e8m0_scale is shared with the compress-attn
+                    # kernels and calls .bitcast(T.i32) internally, so it wants a
+                    # raw value rather than a Numeric.
+                    amax_post = (am_safe * rstd * _SQRT2).ir_value()
+                    e8m0_biased = fx.Int32(
+                        emit_mx_e8m0_scale(
+                            amax_post, mode=_DEFAULT_MODE, dtype=_fp8_mx_dtype
+                        )
                     )
                     quant_scale = ((fx.Int32(254) - e8m0_biased) << 23).bitcast(
                         fx.Float32
                     )
                     factor = rstd * quant_scale
-                    scale_store = e8m0_biased.trunci(T.i8)
+                    scale_store = e8m0_biased.to(fx.Int8)
                 else:
                     rcp_am = llvm.call_intrinsic(
                         f32, "llvm.amdgcn.rcp.f32", [am_safe.ir_value()], [], []
@@ -1311,23 +1324,17 @@ def _build_kernel_w32(
                 cos_vals = [cos_v[i].to(fx.Float32) for i in range(PAIRS_PER_THREAD)]
                 sin_vals = [sin_v[i].to(fx.Float32) for i in range(PAIRS_PER_THREAD)]
 
-            scaled_raw = [_to_raw(s) for s in scaled]
-            rotated = list(scaled_raw)
+            rotated = list(scaled)
             for k in range_constexpr(PAIRS_PER_THREAD):
-                e = scaled_raw[2 * k]
-                o = scaled_raw[2 * k + 1]
+                e = scaled[2 * k]
+                o = scaled[2 * k + 1]
                 c = cos_vals[k]
                 s = sin_vals[k]
-                rotated[2 * k] = _to_raw(
-                    ArithValue(e) * ArithValue(c) - ArithValue(o) * ArithValue(s)
-                )
-                rotated[2 * k + 1] = _to_raw(
-                    ArithValue(e) * ArithValue(s) + ArithValue(o) * ArithValue(c)
-                )
+                rotated[2 * k] = e * c - o * s
+                rotated[2 * k + 1] = e * s + o * c
 
             final_list = [
-                is_rope_t.select(rotated[i], scaled_raw[i])
-                for i in range_constexpr(VEC)
+                is_rope_t.select(rotated[i], scaled[i]) for i in range_constexpr(VEC)
             ]
 
             if const_expr(quant):
@@ -1466,8 +1473,8 @@ def _build_kernel_w32(
                 do_swa = None
                 if const_expr(kv_write):
                     bid_rsrc = _ptr_buffer_resource(batch_id_per_token)
-                    bid_i32 = buffer_ops.buffer_load(
-                        bid_rsrc, bid_t, vec_width=1, dtype=i32
+                    bid_i32 = fx.Int32(
+                        buffer_ops.buffer_load(bid_rsrc, bid_t, vec_width=1, dtype=i32)
                     )
                     # A stale token carries a negative position. `divsi`/`remsi`
                     # truncate toward zero, so pos=-300 with block_size=128 gives
@@ -1476,13 +1483,11 @@ def _build_kernel_w32(
                     # the write 44 rows before that block. The C++ sibling's first
                     # gate is `bid < 0 || pos < 0`; match it, in both modes.
                     pos_ok = pos_i32 >= 0
-                    do_swa = arith.andi(_to_raw(bid_i32 >= 0), _to_raw(pos_ok))
-                    bid_safe = arith.maxsi(bid_i32, _to_raw(fx.Int32(0)))
-                    pos_safe = arith.select(
-                        _to_raw(pos_ok), pos_i32, _to_raw(fx.Int32(0))
-                    )
+                    do_swa = (bid_i32 >= 0) & pos_ok
+                    bid_safe = _imax(bid_i32, fx.Int32(0))
+                    pos_safe = pos_ok.select(pos_i32, fx.Int32(0))
                     if const_expr(paged):
-                        blk = arith.divsi(pos_safe, _to_raw(swa_cache_size))
+                        blk = _idiv(pos_safe, swa_cache_size)
                         # The other two gates the C++ sibling applies (see
                         # `swa_row_for_token`): a position past the table's last
                         # block would read the NEXT request's entry, and `-1`
@@ -1491,48 +1496,40 @@ def _build_kernel_w32(
                         # stride(0) == max_blocks, so the row stride is both the
                         # table width and the distance between two requests' rows.
                         blk_ok = blk < swa_slot_stride
-                        blk_safe = arith.select(
-                            _to_raw(blk_ok), _to_raw(blk), _to_raw(fx.Int32(0))
-                        )
+                        blk_safe = blk_ok.select(blk, fx.Int32(0))
                         bt_off = bid_safe * swa_slot_stride + blk_safe
                         bt_rsrc = _ptr_buffer_resource(swa_index)
-                        phys = buffer_ops.buffer_load(
-                            bt_rsrc, _to_raw(bt_off), vec_width=1, dtype=i32
+                        phys = fx.Int32(
+                            buffer_ops.buffer_load(
+                                bt_rsrc, bt_off, vec_width=1, dtype=i32
+                            )
                         )
-                        in_blk = arith.remsi(pos_safe, _to_raw(swa_cache_size))
+                        in_blk = pos_safe % swa_cache_size
                         row = phys * swa_cache_size + in_blk
                         # Bound the final row against the pool, as the C++ does:
                         # a phys id left over from a larger pool would otherwise
                         # write past the end of swa_kv.
-                        row_ok = arith.andi(
-                            arith.andi(_to_raw(blk_ok), _to_raw(phys >= 0)),
-                            _to_raw(row < swa_num_rows),
-                        )
-                        do_swa = arith.andi(do_swa, row_ok)
+                        row_ok = blk_ok & (phys >= 0) & (row < swa_num_rows)
+                        do_swa = do_swa & row_ok
                         # Clamp too: a negative row would move the descriptor
                         # base backwards, out of this tensor entirely.
-                        row_safe = arith.select(
-                            row_ok, _to_raw(row), _to_raw(fx.Int32(0))
-                        )
+                        row_safe = row_ok.select(row, fx.Int32(0))
                     else:
                         # Direct: the caller already resolved this token's row.
                         # A `-1` row means "skip", same as a `-1` batch id --
                         # a caller whose window is not expressible here needs a
                         # way to say so per token, not just per request.
                         row_rsrc = _ptr_buffer_resource(swa_index)
-                        row = buffer_ops.buffer_load(
-                            row_rsrc, bid_t, vec_width=1, dtype=i32
+                        row = fx.Int32(
+                            buffer_ops.buffer_load(
+                                row_rsrc, bid_t, vec_width=1, dtype=i32
+                            )
                         )
                         # Bounded against the pool as well: the caller owns the
                         # row, but a stale entry must not write past swa_kv.
-                        dest_ok = arith.andi(
-                            _to_raw(row >= 0),
-                            _to_raw(row < swa_num_rows),
-                        )
-                        do_swa = arith.andi(do_swa, dest_ok)
-                        row_safe = arith.select(
-                            dest_ok, _to_raw(row), _to_raw(fx.Int32(0))
-                        )
+                        dest_ok = (row >= 0) & (row < swa_num_rows)
+                        do_swa = do_swa & dest_ok
+                        row_safe = dest_ok.select(row, fx.Int32(0))
                     # The row index fits 32 bits; `row * D * 2` does not. A
                     # unified V4 pool runs to ~150M rows, so a 32-bit byte
                     # offset wraps 3% of the way in, and the sliding windows
@@ -1590,12 +1587,7 @@ def _build_kernel_w32(
         num_tokens: fx.Int32,
         stream: fx.Stream,
     ):
-        grid_y = fx.Index(
-            arith.divsi(
-                _to_raw(num_tokens + ROWS_PER_WG - 1),
-                _to_raw(fx.Int32(ROWS_PER_WG)),
-            )
-        )
+        grid_y = fx.Index(_idiv(num_tokens + ROWS_PER_WG - 1, fx.Int32(ROWS_PER_WG)))
         k = kernel(
             q_in,
             kv_in,
@@ -2430,8 +2422,8 @@ def _build_tdm_fused(
 
         cos_rsrc = buffer_ops.create_buffer_resource(cos_cache, max_size=True)
         sin_rsrc = buffer_ops.create_buffer_resource(sin_cache, max_size=True)
-        is_rope = _to_raw(tid >= ROPE_LO)
-        rope_rel = arith.maxsi(_to_raw(tid - ROPE_LO), _to_raw(fx.Int32(0)))
+        is_rope = tid >= ROPE_LO
+        rope_rel = _imax(tid - ROPE_LO, fx.Int32(0))
 
         def _ptr_res(ptr):
             return buffer_ops.create_buffer_resource_from_addr(
@@ -2459,7 +2451,7 @@ def _build_tdm_fused(
                     fx.Vector(
                         buffer_ops.buffer_load(
                             rsrc,
-                            _to_raw(base_elem + (c * 8)),
+                            base_elem + (c * 8),
                             vec_width=8,
                             dtype=T.bf16,
                         )
@@ -2470,9 +2462,11 @@ def _build_tdm_fused(
 
         def load_cs(tok):
             """cos/sin for this token, as PAIRS-wide f32 vectors."""
-            pos_i32 = buffer_ops.buffer_load(
-                pos_rsrc, _to_raw(tok), vec_width=1, dtype=T.i64
-            ).trunci(i32)
+            pos_i32 = fx.Int32(
+                buffer_ops.buffer_load(pos_rsrc, tok, vec_width=1, dtype=T.i64).trunci(
+                    i32
+                )
+            )
             cs = pos_i32 * (RD // 2) + rope_rel * PAIRS
             if const_expr(PAIRS == 1):
                 return tuple(
@@ -2502,14 +2496,14 @@ def _build_tdm_fused(
             ev = scaled.shuffle(scaled, EVEN)
             od = scaled.shuffle(scaled, ODD)
             rot = (ev * cosv - od * sinv).shuffle(ev * sinv + od * cosv, ILV)
-            final = fx.Boolean(is_rope).select(rot, scaled)
+            final = is_rope.select(rot, scaled)
             _store_bf16_vec(final, out_rsrc, row_base_bytes, tid, VEC)
 
         # ---- Q path ----
 
         def emit_q():
             q_out_rsrc = _ptr_res(q_out)
-            _nr_m1 = _to_raw(num_rows - 1)
+            nr_m1 = num_rows - 1
             tile_base = g * CT  # first tile index this WG owns
             wave_lds_off = wave * (D * eb)  # this wave's slot in a tile buffer
             row_elem = tid * VEC  # LDS read pos within that slot
@@ -2536,7 +2530,7 @@ def _build_tdm_fused(
             )
 
             def row_of(tile_idx):
-                return arith.minsi(_to_raw(tile_idx * RT + wave), _nr_m1)
+                return _imin(tile_idx * RT + wave, nr_m1)
 
             def issue(buf, tile_idx):
                 # this wave's row of tile_idx -> buf slot wave*D (clamped)
@@ -2572,7 +2566,7 @@ def _build_tdm_fused(
                     cosv,
                     sinv,
                     q_out_rsrc,
-                    ArithValue(row_of(tile_idx)) * (D * 2),
+                    row_of(tile_idx) * (D * 2),
                 )
 
             def fence():
@@ -2586,7 +2580,7 @@ def _build_tdm_fused(
                 my_row = row_of(tile_idx)
                 if const_expr(log2H is not None):
                     return load_cs(my_row >> log2H)
-                return load_cs(arith.divsi(_to_raw(my_row), _to_raw(fx.Int32(H))))
+                return load_cs(_idiv(my_row, fx.Int32(H)))
 
             # GROUP consecutive tiles are the same token (H/RT heads split
             # RT-per-tile) -> load pos/cos/sin once per token when tile_base is
@@ -2614,15 +2608,13 @@ def _build_tdm_fused(
 
         def emit_kv():
             gk = g - gx_q
-            tok = arith.minsi(_to_raw(gk * RT + wave), _to_raw(num_tokens - 1))
+            tok = _imin(gk * RT + wave, num_tokens - 1)
             xv = load_vec_global(_ptr_res(kv_in), tok * D + tid * VEC)
             wv = load_vec_global(
                 buffer_ops.create_buffer_resource(kv_weight, max_size=True), tid * VEC
             )
             cosv, sinv = load_cs(tok)
-            norm_rope_store(
-                xv, wv, cosv, sinv, _ptr_res(kv_out), ArithValue(tok) * (D * 2)
-            )
+            norm_rope_store(xv, wv, cosv, sinv, _ptr_res(kv_out), tok * (D * 2))
 
         if g < gx_q:
             emit_q()
@@ -2645,8 +2637,8 @@ def _build_tdm_fused(
         gx_q: fx.Int32,
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
-        gx_kv = arith.divsi(_to_raw(num_tokens + (RT - 1)), _to_raw(fx.Int32(RT)))
-        gx = ArithValue(gx_q) + gx_kv
+        gx_kv = _idiv(num_tokens + (RT - 1), fx.Int32(RT))
+        gx = gx_q + gx_kv
         k = kernel(
             q_in,
             kv_in,
@@ -2662,7 +2654,7 @@ def _build_tdm_fused(
             gx_q,
         )
         k.launch(
-            grid=(gx.index_cast(T.index), 1, 1),
+            grid=(fx.Index(gx), 1, 1),
             block=(BLOCK_THREADS, RT, 1),
             stream=stream,
         )
