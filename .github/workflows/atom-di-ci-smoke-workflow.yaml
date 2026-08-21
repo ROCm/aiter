@@ -41,7 +41,7 @@ on:
         type: string
         default: "/data/xinhuang/atomesh-ci"
       spur_nodelist:
-        description: "Optional comma-separated Spur nodes; empty lets Spur allocate"
+        description: "Comma-separated Spur node pool; Slurm chooses the required nodes"
         required: false
         type: string
         default: ""
@@ -70,7 +70,7 @@ env:
   ATOMESH_MODEL_PATH_GLM_5_2_FP8_DEFAULT: /data/models2/GLM-5.2-FP8
   ATOMESH_LOG_ROOT_DEFAULT: /data/xinhuang/spur_dsv4_logs
   ATOMESH_SHARED_WORKSPACE_ROOT_DEFAULT: /data/xinhuang/atomesh-ci
-  ATOMESH_2P1D_NODES_DEFAULT: ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-14,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-16
+  ATOMESH_NODE_POOL_DEFAULT: ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-5,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-6,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-7,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-8,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-13,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-14,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-15,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-16
   ISL_LIST_DEFAULT: "1024"
   OSL_DEFAULT: "1024"
   CONC_LIST_DEFAULT: "16"
@@ -90,6 +90,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       cell_id: ${{ steps.cell.outputs.cell_id }}
+      node_pool: ${{ steps.cell.outputs.node_pool }}
     steps:
       - name: Apply ATOM DI smoke inputs
         run: |
@@ -137,9 +138,10 @@ jobs:
               "ATOMESH_SHARED_WORKSPACE_ROOT="
               + value("shared_workspace_root", "ATOMESH_SHARED_WORKSPACE_ROOT_DEFAULT")
           )
-          node_list = value("spur_nodelist", "ATOMESH_2P1D_NODES_DEFAULT")
-          nodes = [node.strip() for node in node_list.split(",") if node.strip()]
-          print(f"ATOMESH_2P1D_NODES={node_list}")
+          node_pool = value("spur_nodelist", "ATOMESH_NODE_POOL_DEFAULT")
+          nodes = [node.strip() for node in node_pool.split(",") if node.strip()]
+          print(f"SPUR_NODE_POOL={node_pool}")
+          print(f"ATOMESH_2P1D_NODES={node_pool}")
           print(f"ATOMESH_1P1D_NODES={','.join(nodes[:2])}")
           print("ISL_LIST=" + os.environ["ISL_LIST_DEFAULT"])
           print("OSL=" + os.environ["OSL_DEFAULT"])
@@ -210,8 +212,59 @@ jobs:
               if nodes_line not in text:
                   raise SystemExit("Failed to find Spur submit SBATCH nodes directive")
               text = text.replace(nodes_line, nodes_line + ntasks_line, 1)
-              submit_path.write_text(text, encoding="utf-8")
+
+          special_nodelist_block = "\n".join(
+              [
+                  r'  if [[ -n "${NODE_LIST}" ]]; then',
+                  r"    printf '#SBATCH --nodelist=%s\n' \"${NODE_LIST}\" >> \"${SUBMIT_SCRIPT}\"",
+                  r"  fi",
+                  "",
+              ]
+          )
+          special_pool_block = "\n".join(
+              [
+                  r'  if [[ -n "${NODE_LIST}" ]]; then',
+                  r"    printf '#SBATCH --nodelist=%s\n' \"${NODE_LIST}\" >> \"${SUBMIT_SCRIPT}\"",
+                  r'  elif [[ -n "${SPUR_NODE_EXCLUDE:-}" ]]; then',
+                  r"    printf '#SBATCH --exclude=%s\n' \"${SPUR_NODE_EXCLUDE}\" >> \"${SUBMIT_SCRIPT}\"",
+                  r"  fi",
+                  "",
+              ]
+          )
+          standard_nodelist_block = "\n".join(
+              [
+                  r'  if [[ -n "${NODE_LIST}" ]]; then',
+                  r'    SBATCH_CMD+=(--nodelist "${NODE_LIST}")',
+                  r"  fi",
+                  "",
+              ]
+          )
+          standard_pool_block = "\n".join(
+              [
+                  r'  if [[ -n "${NODE_LIST}" ]]; then',
+                  r'    SBATCH_CMD+=(--nodelist "${NODE_LIST}")',
+                  r'  elif [[ -n "${SPUR_NODE_EXCLUDE:-}" ]]; then',
+                  r'    SBATCH_CMD+=(--exclude "${SPUR_NODE_EXCLUDE}")',
+                  r"  fi",
+                  "",
+              ]
+          )
+          patched_pool = False
+          for old_block, new_block in (
+              (special_nodelist_block, special_pool_block),
+              (standard_nodelist_block, standard_pool_block),
+          ):
+              if new_block in text:
+                  patched_pool = True
+              elif old_block in text:
+                  text = text.replace(old_block, new_block, 1)
+                  patched_pool = True
+          if not patched_pool:
+              raise SystemExit("Failed to find any Slurm nodelist submit block")
+
+          submit_path.write_text(text, encoding="utf-8")
           print(f"{submit_path}: patched explicit Spur Slurm task count")
+          print(f"{submit_path}: patched dynamic Spur node-pool exclusion")
           models_path = Path(".github/benchmark/models_atomesh.yaml")
           text = models_path.read_text(encoding="utf-8")
           if "  GLM-5.2-FP8:" not in text:
@@ -337,9 +390,9 @@ jobs:
                   }
               )
 
-          node_list = [
+          node_pool = [
               node.strip()
-              for node in os.environ.get("ATOMESH_2P1D_NODES", "").split(",")
+              for node in os.environ.get("SPUR_NODE_POOL", "").split(",")
               if node.strip()
           ]
           isl = parse_int_list(os.environ["ISL_LIST"])
@@ -382,12 +435,14 @@ jobs:
                       )
 
               required_nodes = int(cell["num_nodes"])
-              if node_list:
-                  if len(node_list) < required_nodes:
-                      raise SystemExit(
-                          f"Need {required_nodes} nodes, got {len(node_list)}: {node_list}"
-                      )
-                  cell["nodes"] = node_list[:required_nodes]
+              if len(node_pool) < required_nodes:
+                  raise SystemExit(
+                      f"Need {required_nodes} pool nodes, got "
+                      f"{len(node_pool)}: {node_pool}"
+                  )
+              # Leave NODE_LIST empty so Slurm can choose any currently
+              # available nodes from the allowed pool.
+              cell["nodes"] = []
 
               cell_env = cell.setdefault("env", {})
               for scope in ("common", "prefill", "decode"):
@@ -423,6 +478,7 @@ jobs:
 
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
               out.write("cell_id=" + ",".join(cell["id"] for cell in all_cells) + "\n")
+              out.write("node_pool=" + ",".join(node_pool) + "\n")
           PY
       - name: Package patched ATOM source
         run: tar -C ATOM -czf atom-source.tar.gz .
@@ -444,6 +500,7 @@ jobs:
     timeout-minutes: 420
     env:
       ATOMESH_SHARED_WORKSPACE_ROOT: /data/xinhuang/atomesh-ci
+      SPUR_NODE_POOL: ${{ needs.load-config.outputs.node_pool }}
     steps:
       - name: Show runner and Spur-compatible Slurm state
         run: |
@@ -457,6 +514,44 @@ jobs:
           squeue --help | head -80 || true
           command -v scancel
           command -v spur && spur --help | head -120 || true
+
+      - name: Restrict Slurm scheduling to Spur node pool
+        run: |
+          set -euo pipefail
+          IFS=',' read -r -a raw_pool_nodes <<< "${SPUR_NODE_POOL}"
+          declare -A allowed=()
+          pool_nodes=()
+          for raw_node in "${raw_pool_nodes[@]}"; do
+            node="${raw_node//[[:space:]]/}"
+            if [[ -n "${node}" ]]; then
+              allowed["${node}"]=1
+              pool_nodes+=("${node}")
+            fi
+          done
+          if (( ${#pool_nodes[@]} == 0 )); then
+            echo "Spur node pool is empty" >&2
+            exit 1
+          fi
+
+          mapfile -t cluster_nodes < <(sinfo -N -h -o '%N' | sort -Vu)
+          declare -A present=()
+          excluded_nodes=()
+          for node in "${cluster_nodes[@]}"; do
+            present["${node}"]=1
+            if [[ -z "${allowed[${node}]+x}" ]]; then
+              excluded_nodes+=("${node}")
+            fi
+          done
+          for node in "${pool_nodes[@]}"; do
+            if [[ -z "${present[${node}]+x}" ]]; then
+              echo "Configured Spur node is not present in sinfo: ${node}" >&2
+              exit 1
+            fi
+          done
+
+          exclude="$(IFS=,; echo "${excluded_nodes[*]}")"
+          echo "SPUR_NODE_EXCLUDE=${exclude}" >> "${GITHUB_ENV}"
+          echo "Slurm will choose from SPUR_NODE_POOL=${SPUR_NODE_POOL}"
 
       - name: Clean stale ATOMesh config from prior runs
         run: |
