@@ -58,11 +58,19 @@ _WAVE_REDUCE_MODE = "auto"
 _LOG2E = math.log2(math.e)
 _DPP_QUAD_XOR1 = 0xB1
 _DPP_QUAD_XOR2 = 0x4E
+_DPP_ROW_SHR1 = 0x111
+_DPP_ROW_SHR2 = 0x112
 _DPP_ROW_SHL4 = 0x104
 _DPP_ROW_SHR4 = 0x114
 _DPP_ROW_SHL8 = 0x108
 _DPP_ROW_SHR8 = 0x118
+_DPP_ROW_BCAST15 = 0x142
+_DPP_ROW_BCAST31 = 0x143
 _DPP_ROW_MASK = 0xF
+# row_bcast:15 moves row 0 -> 1 and row 2 -> 3.
+_DPP_ROW_BCAST15_MASK = 0xA
+# row_bcast:31 moves the row-0/1 total into rows 2 and 3.
+_DPP_ROW_BCAST31_MASK = 0xC
 # Banks 0+2 read n+4; banks 1+3 read n-4.
 _DPP_BANK_XOR4_SHL = 0x5
 _DPP_BANK_XOR4_SHR = 0xA
@@ -101,6 +109,50 @@ def _dpp_xor_f32(value, offset: int):
             "DPP XOR is row-local; offset must be 1, 2, 4, or 8, " f"got {offset}"
         )
     return fx.Int32(peer).bitcast(fx.Float32)
+
+
+def _dpp_row_f32(
+    value,
+    dpp_ctrl: int,
+    row_mask: int = _DPP_ROW_MASK,
+    bank_mask: int = _DPP_ROW_MASK,
+):
+    """Return the DPP row value, with zero for masked or out-of-bounds lanes."""
+    bits = value.bitcast(fx.Int32)
+    peer = dpp_utils.update_dpp_i32(
+        fx.Int32(0), bits, dpp_ctrl, row_mask, bank_mask, True
+    )
+    return fx.Int32(peer).bitcast(fx.Float32)
+
+
+def _wave_reduce_to_one_lane_f32(value, fastmath):
+    """Wave64 sum for consumers where a single lane reads the total.
+
+    Callers that only store from one lane do not need the broadcast,
+    so this walks a ``row_shr`` cascade into ``row_bcast`` and reads
+    lane 63 into an SGPR, which every lane can then use.
+    """
+    reduced = value
+    for dpp_ctrl in (
+        _DPP_ROW_SHR1,
+        _DPP_ROW_SHR2,
+        _DPP_ROW_SHR4,
+        _DPP_ROW_SHR8,
+    ):
+        reduced = reduced.addf(
+            _dpp_row_f32(reduced, dpp_ctrl),
+            fastmath=fastmath,
+        )
+    reduced = reduced.addf(
+        _dpp_row_f32(reduced, _DPP_ROW_BCAST15, _DPP_ROW_BCAST15_MASK),
+        fastmath=fastmath,
+    )
+    reduced = reduced.addf(
+        _dpp_row_f32(reduced, _DPP_ROW_BCAST31, _DPP_ROW_BCAST31_MASK),
+        fastmath=fastmath,
+    )
+    bits = reduced.bitcast(fx.Int32)
+    return fx.Int32(fx.rocdl.readlane(T.i32, bits, 63)).bitcast(fx.Float32)
 
 
 def _wave_reduce_add_f32(value, mode: str, fastmath):
@@ -270,6 +322,9 @@ def _build_attn_res(
         def wave_reduce_add(value):
             return _wave_reduce_add_f32(value, wave_reduce_mode, fm_fast)
 
+        def store_reduce_add(value):
+            return _wave_reduce_to_one_lane_f32(value, fm_fast)
+
         def finish_reduce(value):
             if const_expr(use_dpp_finish):
                 return _narrow_dpp_reduce_add_f32(value, red_slots, fm_fast)
@@ -281,8 +336,8 @@ def _build_attn_res(
             s_dot = fx.slice(s_dot_all, (buf, slot, None))
             lane = local_tid % _WARP_SIZE
             wave = local_tid // _WARP_SIZE
-            sumsq_wave = wave_reduce_add(sumsq_local)
-            dot_wave = wave_reduce_add(dot_local)
+            sumsq_wave = store_reduce_add(sumsq_local)
+            dot_wave = store_reduce_add(dot_local)
             if lane == 0:
                 fx.memref_store(sumsq_wave, s_sumsq, wave)
                 fx.memref_store(dot_wave, s_dot, wave)
@@ -317,7 +372,7 @@ def _build_attn_res(
             s_sumsq = fx.slice(s_sumsq_all, (buf, slot, None))
             lane = local_tid % _WARP_SIZE
             wave = local_tid // _WARP_SIZE
-            wave_total = wave_reduce_add(value)
+            wave_total = store_reduce_add(value)
 
             if lane == 0:
                 fx.memref_store(wave_total, s_sumsq, wave)
