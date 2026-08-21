@@ -7,8 +7,8 @@
 
 Dense BF16-output MHA v4 is implemented and validated on gfx950. Sorted block-sparse dispatch
 (mask/LUT APIs, `mode=1` manifest rows, 752-byte kernarg) is wired on the same family; sparse
-`.co` files are deployed next to the dense objects. Gfx942 native FP8/FP8 and signed
-INT8/FP8 rows are also available under v4.
+`.co` files are deployed next to the dense objects. Gfx942 native FP8/FP8 and signed INT8/FP8
+dense rows are also available under v4.
 
 The public raw and packed APIs support eight dense combinations:
 
@@ -23,10 +23,11 @@ The public raw and packed APIs support eight dense combinations:
 | MXFP6 E2M3 | MXFP4 E2M1 | BF16 |
 | MXFP4 E2M1 | MXFP4 E2M1 | BF16 |
 
-Current scope is batched, non-causal MHA with supported grouped-query head ratios, BF16 raw inputs,
-head dimension 128, and BF16 output. Dense and sorted block-sparse execution are both
-supported on gfx950. It is inference-only: no backward, dropout, RNG state, LSE, GQA, or
-varlen. Unsupported requests fail explicitly and never fall back to `aiter.ops.mha`.
+Current scope is batched, non-causal MHA with BF16 raw inputs, head dimension 128, and BF16
+output. Dense and sorted block-sparse execution both support grouped-query head ratios; sparse
+LUT rows are one per query head. Sparse is gfx950-only. It is inference-only: no backward,
+dropout, RNG state, LSE, or varlen. Unsupported requests fail explicitly and never fall back
+to `aiter.ops.mha`.
 
 ## Stable Decisions And Ownership
 
@@ -143,6 +144,11 @@ must be divisible by `kv_heads`, and the ratio `query_heads / kv_heads` must be 
 `1, 2, 4, 8, 16`. Ratio 1 is ordinary multi-head attention. The kernel maps each contiguous group
 of query heads to one K/V head; callers must not expand K or V to `query_heads`. Output retains Q's
 batch, sequence, and head dimensions.
+
+Sorted-sparse launch uses the same GQA ratio. The LUT and work table are indexed by query
+head; the kernel maps `kv_head = query_head >> log2(gqa)`. A 3-D mask broadcasts across
+query heads. A 4-D mask may give grouped query heads different KV-tile lists even though
+they share K/V storage.
 
 For example, Q with 32 heads and K/V with 8 heads selects GQA ratio 4. Q and K still use the same
 number format and canonical quantization recipe; "Q/K formats must match" refers to their encoding,
@@ -335,7 +341,7 @@ inference from extra pointers or a silent redirect from a dense request. Dense
 
 Raw API: optional boolean `block_mask` at query-tile 256 × KV-tile 128. Convert with
 `block_attn_mask_to_ragged_lut(..., num_heads=q.shape[2], return_none_if_dense=False)`.
-An all-True mask still takes the sparse row.
+An all-True mask still takes the sparse row. GQA is allowed; LUT rows remain one per query head.
 
 Packed API: optional int32 LUT triple. `lut_start` / `lut_count` have one entry per
 `(batch, query_head, query_block)`. `kv_block_indices` is 1-D and may be over-allocated to

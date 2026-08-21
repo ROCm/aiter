@@ -1009,24 +1009,78 @@ def test_mha_v4_sparse_schema_mutates_only_out():
     not _mha_v4_sparse_co_available(),
     reason="sorted-sparse MHA v4 code object is not deployed",
 )
-def test_mha_v4_sparse_fp8_all_true_mask_matches_dense():
+@pytest.mark.parametrize(
+    ("q_format", "v_format"),
+    [
+        (AttentionFormat.FP8, AttentionFormat.FP8),
+        (AttentionFormat.FP8, AttentionFormat.MXFP6),
+        (AttentionFormat.INT8, AttentionFormat.FP8),
+    ],
+)
+def test_mha_v4_sparse_all_true_mask_matches_dense(q_format, v_format):
     torch.manual_seed(41)
     q = torch.randn((1, 256, 2, 128), device="cuda", dtype=torch.bfloat16)
     k = torch.randn((1, 256, 2, 128), device="cuda", dtype=torch.bfloat16)
     v = torch.randn_like(k)
     mask = torch.ones((1, 2, 1, 2), device="cuda", dtype=torch.bool)
-    dense = mha_v4(
-        q, k, v, AttentionFormat.FP8, AttentionFormat.FP8, AttentionFormat.FP8
-    )
+    dense = mha_v4(q, k, v, q_format, q_format, v_format)
     sparse = mha_v4(
         q,
         k,
         v,
-        AttentionFormat.FP8,
-        AttentionFormat.FP8,
-        AttentionFormat.FP8,
+        q_format,
+        q_format,
+        v_format,
         block_mask=mask,
     )
     torch.cuda.synchronize()
     assert torch.equal(dense, sparse)
     assert torch.isfinite(sparse).all()
+
+
+@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 sparse GQA validation")
+@pytest.mark.skipif(
+    not _mha_v4_sparse_co_available(),
+    reason="sorted-sparse MHA v4 code object is not deployed",
+)
+@pytest.mark.parametrize(
+    ("q_format", "v_format"),
+    [
+        (AttentionFormat.FP8, AttentionFormat.FP8),
+        (AttentionFormat.MXFP4, AttentionFormat.FP8),
+    ],
+)
+def test_mha_v4_sparse_gqa_all_true_mask_matches_repeated_kv(q_format, v_format):
+    torch.manual_seed(41)
+    query_heads = 8
+    kv_heads = 2
+    gqa_ratio = query_heads // kv_heads
+    q = torch.randn((1, 256, query_heads, 128), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((1, 256, kv_heads, 128), device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    mask = torch.ones((1, query_heads, 1, 2), device="cuda", dtype=torch.bool)
+    k_repeated = k.repeat_interleave(gqa_ratio, dim=2)
+    v_repeated = v.repeat_interleave(gqa_ratio, dim=2)
+
+    gqa_dense = mha_v4(q, k, v, q_format, q_format, v_format)
+    gqa_sparse = mha_v4(
+        q, k, v, q_format, q_format, v_format, block_mask=mask
+    )
+    mha_dense = mha_v4(
+        q, k_repeated, v_repeated, q_format, q_format, v_format
+    )
+    mha_sparse = mha_v4(
+        q,
+        k_repeated,
+        v_repeated,
+        q_format,
+        q_format,
+        v_format,
+        block_mask=mask,
+    )
+    torch.cuda.synchronize()
+
+    assert torch.equal(gqa_dense, mha_dense)
+    assert torch.equal(gqa_sparse, gqa_dense)
+    assert torch.equal(gqa_sparse, mha_sparse)
+    assert torch.isfinite(gqa_sparse).all()

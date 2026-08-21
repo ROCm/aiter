@@ -1154,17 +1154,26 @@ def mha_v4_mxfp8(
     softmax_scale: Optional[float] = None,  # noqa: UP045
     out: Optional[Tensor] = None,  # noqa: UP045
     return_lse: bool = False,
+    block_mask: Optional[Tensor] = None,  # noqa: UP045
 ) -> Tensor:
     """Quantize BF16 BSHD Q/K to MXFP8 and V to per-tensor FP8.
 
     K and V may have fewer heads than Q for GQA. The Q-to-KV head ratio must
     be a power of two no greater than 16; output retains Q's head count.
+    Optional ``block_mask`` selects the sorted-sparse row; LUT rows are one per
+    query head, and K/V addressing uses the GQA ratio.
     """
     if return_lse:
         raise NotImplementedError("MHA v4 kernels do not produce LSE yet")
     out = _validate_mha_v4_raw_inputs(q, k, v, out, "mha_v4_mxfp8")
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** -0.5
+
+    lut_indices: Optional[Tensor] = None  # noqa: UP045
+    lut_start: Optional[Tensor] = None  # noqa: UP045
+    lut_count: Optional[Tensor] = None  # noqa: UP045
+    if block_mask is not None:
+        lut_indices, lut_start, lut_count = _block_mask_to_lut(block_mask, q, k)
 
     fp8_format = native_fp8_format()
     q_quantized, q_descale = quantize_mxfp8_q(q, mha_v4_q_multiplier(softmax_scale))
@@ -1185,6 +1194,9 @@ def mha_v4_mxfp8(
         AttentionScaleMode.F32_PER_TENSOR,
         softmax_scale=softmax_scale,
         out=out,
+        kv_block_indices=lut_indices,
+        lut_start=lut_start,
+        lut_count=lut_count,
     )
 
 
@@ -1208,6 +1220,7 @@ def mha_v4(
     be a power of two no greater than 16; output retains Q's head count.
     ``block_mask`` is optional boolean tile metadata at 256x128 geometry:
     ``[B, H, Qtiles, KVtiles]`` or ``[B, Qtiles, KVtiles]`` (broadcast heads).
+    Sparse LUT rows are one per query head; K/V addressing uses the GQA ratio.
     """
     if return_lse:
         raise NotImplementedError("MHA v4 kernels do not produce LSE yet")

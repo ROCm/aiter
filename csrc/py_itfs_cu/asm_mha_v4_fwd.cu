@@ -287,6 +287,7 @@ void populate_dense_kernarg(FmhaV4Kernarg& args,
                             int64_t seqlen_q,
                             int64_t seqlen_k,
                             int64_t nhead_q,
+                            int64_t gqa_ratio,
                             double softmax_scale)
 {
     args.ptr_o.value         = out.data_ptr();
@@ -304,7 +305,7 @@ void populate_dense_kernarg(FmhaV4Kernarg& args,
     args.s_Ts.value          = cfg.ts_qo * q.stride(1);
     args.s_Hs.value          = q.stride(2);
     args.s_Bs.value          = q.stride(0);
-    args.s_gqa.value         = 1;
+    args.s_gqa.value         = gqa_ratio;
     args.s_k_Seqs.value      = k.stride(1);
     args.s_k_Hs.value        = k.stride(2);
     args.s_k_Bs.value        = k.stride(0);
@@ -338,6 +339,7 @@ struct PackedMhaV4Shapes
     int64_t nhead_q;
     int64_t seqlen_k;
     int64_t nhead_k;
+    int64_t gqa_ratio;
 };
 
 PackedMhaV4Shapes validate_packed_mha_v4(const at::Tensor& q,
@@ -390,8 +392,8 @@ PackedMhaV4Shapes validate_packed_mha_v4(const at::Tensor& q,
                 "MHA v4 requires matching non-empty K and V head dimensions");
     TORCH_CHECK(shapes.nhead_q % shapes.nhead_k == 0,
                 "MHA v4 requires query heads to be divisible by KV heads");
-    const int64_t gqa_ratio = shapes.nhead_q / shapes.nhead_k;
-    TORCH_CHECK(gqa_ratio <= 16 && (gqa_ratio & (gqa_ratio - 1)) == 0,
+    shapes.gqa_ratio = shapes.nhead_q / shapes.nhead_k;
+    TORCH_CHECK(shapes.gqa_ratio <= 16 && (shapes.gqa_ratio & (shapes.gqa_ratio - 1)) == 0,
                 "MHA v4 supports power-of-two GQA ratios up to 16");
     TORCH_CHECK(k.size(1) == v.size(1), "K and V sequence lengths must match");
     TORCH_CHECK(q.size(3) == packed_width && k.size(3) == packed_width,
@@ -512,56 +514,20 @@ void fmha_v4_fwd(const at::Tensor& q,
         arch, q_format, k_format, v_format, q_scale_mode, k_scale_mode, v_scale_mode, /*mode=*/0);
 
     FmhaV4Kernarg args{};
-    args.ptr_o.value         = out.data_ptr();
-    args.ptr_q.value         = q.data_ptr();
-    args.ptr_k.value         = k.data_ptr();
-    args.ptr_v.value         = v.data_ptr();
-    args.ptr_q_descale.value = q_descale.data_ptr();
-    args.ptr_k_descale.value = k_descale.data_ptr();
-    args.ptr_v_descale.value = v_descale.data_ptr();
-    static_assert(sizeof(float) == sizeof(uint32_t));
-    const float scale = static_cast<float>(softmax_scale);
-    std::memcpy(&args.scalar.value, &scale, sizeof(scale));
-    args.s_seq_len.value     = seqlen_q;
-    args.s_Seqs.value        = q.stride(1) * q.element_size();
-    args.s_Ts.value          = cfg.ts_qo * q.stride(1) * q.element_size();
-    args.s_Hs.value          = q.stride(2) * q.element_size();
-    args.s_Bs.value          = q.stride(0) * q.element_size();
-    args.s_gqa.value         = gqa_ratio;
-    args.s_k_Seqs.value      = k.stride(1) * k.element_size();
-    args.s_k_Hs.value        = k.stride(2) * k.element_size();
-    args.s_k_Bs.value        = k.stride(0) * k.element_size();
-    args.s_opt.value         = 5; // Dense, non-causal v1 tuning mode inherited by these binaries.
-    args.s_lse.value         = 0;
-    args.s_kv_seq_len.value  = seqlen_k;
-    args.s_qk_head_dim.value = kHeadDim;
-    args.s_v_head_dim.value  = kHeadDim;
-    args.s_q_head_num.value  = nhead_q;
-    args.s_v_Seqs.value      = v.stride(1) * v.element_size();
-    args.s_v_Hs.value        = v.stride(2) * v.element_size();
-    args.s_v_Bs.value        = v.stride(0) * v.element_size();
-    args.s_o_Seqs.value      = out.stride(1) * out.element_size();
-    args.s_o_Hs.value        = out.stride(2) * out.element_size();
-    args.s_o_Bs.value        = out.stride(0) * out.element_size();
-
-    if(!bf16_format)
-    {
-        set_descale_strides(
-            q_descale,
-            q_descale.dim() >= 3 ? 2 : 1,
-            args.s_descale_q_Bs.value,
-            args.s_descale_q_Hs.value);
-        set_descale_strides(
-            k_descale,
-            k_descale.dim() >= 3 ? 2 : 1,
-            args.s_descale_k_Bs.value,
-            args.s_descale_k_Hs.value);
-        // Production V descales are [batch, head, channel], so the head dimension is 1.
-        set_descale_strides(v_descale,
-                            1,
-                            args.s_descale_v_Bs.value,
-                            args.s_descale_v_Hs.value);
-    }
+    populate_dense_kernarg(args,
+                           q,
+                           k,
+                           v,
+                           q_descale,
+                           k_descale,
+                           v_descale,
+                           out,
+                           cfg,
+                           shapes.seqlen_q,
+                           shapes.seqlen_k,
+                           shapes.nhead_q,
+                           shapes.gqa_ratio,
+                           softmax_scale);
 
     static SynchronizedCache<std::string, AiterAsmKernel> kernels;
     const std::string cache_key = arch + "|" + cfg.knl_name + "|" + cfg.co_name;
@@ -662,6 +628,7 @@ void fmha_v4_fwd_sparse(const at::Tensor& q,
                            shapes.seqlen_q,
                            shapes.seqlen_k,
                            shapes.nhead_q,
+                           shapes.gqa_ratio,
                            softmax_scale);
     args.ptr_kv_block_indices.value = kv_idx.data_ptr();
     args.ptr_lut_start.value        = start.data_ptr();
