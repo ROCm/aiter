@@ -1099,7 +1099,12 @@ def atomic_bf16_epilog(
                                 )
                             else:
                                 w = rocdl.cvt_scalef32_pk_fp8_f32(
-                                    pk_ty, w, _raw(vals[e]), _raw(vals[e + 1]), bs_raw, h
+                                    pk_ty,
+                                    w,
+                                    _raw(vals[e]),
+                                    _raw(vals[e + 1]),
+                                    bs_raw,
+                                    h,
                                 )
                         words.append(w)
                     emit_stores(col_g0, words, e8m0)
