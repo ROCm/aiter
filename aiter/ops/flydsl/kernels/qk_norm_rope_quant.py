@@ -3,34 +3,7 @@
 
 """Fused per-token RMSNorm + GPT-J RoPE + optional FP8 quant (FlyDSL).
 
-Q + KV in one launch (grid Y = num_tokens, grid X = num_q_heads + 1: bid_x in
-[0, H) handle Q heads, bid_x == H handles KV). One wave per block, so reductions
-are wave-local (shuffle_xor, no LDS/barrier). FP8 fast-path uses the
-rstd-cancellation algebra (matches the Triton kernel in
-``atom/model_ops/v4_kernels/qk_norm_rope_maybe_quant.py``):
-
-    scale  = abs_max(x_norm) * SQRT2 / FP8_MAX     (sqrt(2) upper bound on rope mag)
-    factor = FP8_MAX / (abs_max(x_in) * SQRT2)     (rstd cancels algebraically)
-
-(The weighted KV path carries the per-channel weight into amax and factor.)
-
-Two wave widths live here, picked by ``get_gfx()`` inside the public entry point:
-
-wave64 (gfx942 / gfx950) -- ``BLOCK_THREADS_W64 = 64``, hard-wired D=512, VEC=8.
-
-wave32 (gfx1250 / RDNA4) -- ``BLOCK_THREADS_W32 = 32``, VEC = D/32 (=16 for
-D=512), so thread t owns elements [t*VEC, t*VEC+VEC); a rope thread's slice is
-``PAIRS_PER_THREAD = VEC/2`` GPT-J pairs (2k, 2k+1). Differences vs wave64: all
-load/store paths generalized for VEC>8; shuffle_xor width 32 and log2(32)=5
-butterfly passes (was 6); FP8 packing emits VEC/4 dwords as dwordx4; BF16
-load/store split VEC=16 into 2x dwordx4 via extract_strided_slice; rope CopyAtom
-is BufferCopy128b; no preshuffle (gfx1250 uses the linear FP8 layout). It also
-packs ``ROWS_PER_WG`` independent waves per workgroup and has a TDM
-deep-prefetch prefill path.
-
-Public API ``flydsl_qk_norm_rope_quant`` dispatches on arch;
-``compile_flydsl_qk_norm_rope_quant`` / ``..._gfx1250`` return the cached
-launcher for pre-allocated callers.
+wave64 (gfx942/gfx950) and wave32 (gfx1250) in one file, dispatched by get_gfx().
 """
 
 # do NOT add `from __future__ import annotations`: PEP 563 stringifies
@@ -108,62 +81,21 @@ def _cached_from_dlpack(t: torch.Tensor):
     return adaptor
 
 
-# --- shape constants --------------------------------------------------------
 BLOCK_THREADS_W64 = 64  # 1 wave64 (gfx942 / gfx950)
-BLOCK_THREADS_W32 = 32  # 1 wave32 (RDNA4 / gfx1250)
-
-
-# Waves (rows/tokens) per workgroup. gfx1250 caps resident workgroups per CU
-# below the 64-waves/CU ceiling, so a 1-wave workgroup leaves occupancy on the
-# table even at VGPR=32. Packing ROWS_PER_WG independent waves into one
-# workgroup lets a handful of workgroups reach full occupancy and, crucially,
-# overlaps one row's load->reduce->store latency with another row's memory ops
-# (the kernel is latency-bound on that chain, not bandwidth- or ALU-bound).
-# Each wave (thread_idx.y) still processes exactly one (head, token) row.
-#
-# Adaptive by token count (chosen per launch in the public API):
-#   - Large T (prefill): ROWS_PER_WG (=32, full 1024-thread workgroup) maximises
-#     waves/workgroup so few workgroups saturate 64 waves/CU.
-#   - Small T (decode, T <= SMALL_T_THRESHOLD): a smaller R yields MORE
-#     workgroups (grid = (H+1) * ceil(T/R)), spreading across more CUs when the
-#     total row count is too small to fill the machine at R=32.
+BLOCK_THREADS_W32 = 32  # 1 wave32 (CDNA5 / gfx1250)
 ROWS_PER_WG = 32
 ROWS_PER_WG_SMALL = 4
-# At/below this token count, R=32 launches < ~256 workgroups (65*ceil(T/32)),
-# leaving CUs idle; the small-R variant fills more of them. R=4 (128 threads
-# per WG) yields many small workgroups that spread across CUs and reduce
-# memory contention under arg-rotation / changing data_ptr scenarios.
 SMALL_T_THRESHOLD = 96
-
-# BF16 prefill fast path: route large plain-BF16 launches to the TDM
-# deep-prefetch kernel (per-wave s_wait_dscnt fence + K=6 deep prefetch +
-# cos/sin hoist). Requires D % 256 == 0 and power-of-two H (all known MLA
-# models satisfy this). When the constraints aren't met, falls back to the
-# stock kernel.
 USE_TDM_PREFILL = True
-# Both kernels parallelise over rows = T*H, so the switch is on the row count,
-# not the token count. Measured crossover (bench-tdm-vs-stock.py, D=512): TDM
-# first wins at 32768 rows for every H tried -- H=128 T=256, H=64 T=512,
-# H=16 T=2048 -- and loses by 1.4-2.3x below it.
 TDM_MIN_ROWS = 32768
 
 
-# SQRT2 has no aiter dependency, so it stays at module level.
 _SQRT2 = math.sqrt(2.0)
 
 
 @lru_cache(maxsize=1)
 def _fp8_const():
-    """Lazy-resolve fp8 algebra coefficients (per-GFX native fp8).
-
-    ``aiter.utility.dtypes.fp8`` selects e4m3fnuz on gfx942 MI300 and
-    e4m3fn on gfx950 MI355 / gfx1250. ``cvt_pk_fp8_f32`` emits bytes in
-    the per-gfx native format, so FP8_MAX must track that -- hardcoding
-    e4m3fnuz's 240 on gfx950 would (a) clip outputs to a stricter range
-    than needed and (b) leave the stored dequant scale inconsistent with
-    downstream consumers reading the tensor as ``aiter.dtypes.fp8``.
-    Cached on first call (kernel build / launcher call), not at import.
-    """
+    """Lazy-resolve per-GFX fp8 coefficients. Cached; not resolved at import."""
     from aiter.utility import dtypes as aiter_dtypes
 
     fp8_dtype = aiter_dtypes.fp8
@@ -176,7 +108,6 @@ def _fp8_const():
     }
 
 
-# --- scale-dtype constants --------------------------------------------------
 SCALE_DTYPE_FP32 = "fp32"
 SCALE_DTYPE_E8M0 = "e8m0"
 SCALE_DTYPE_OPTIONS = (SCALE_DTYPE_FP32, SCALE_DTYPE_E8M0)
@@ -196,16 +127,8 @@ _DEFAULT_COMPILE_HINTS = {
 }
 
 
-# ============================================================================
-# Store helpers (module-level so they're easy to reuse / unit-test)
-# ============================================================================
-
-
 def _bf16_row_view(base_i64, num_elems, nbytes):
-    """Build a ``(1, num_elems)`` bf16 buffer-tensor view at a folded base ptr.
-
-    ``base_i64`` already includes the per-token / per-head byte shift;
-    num_records bounds the OOB clamp (base + off with an i32 voffset)."""
+    """Build a (1, num_elems) bf16 buffer-tensor view at a folded base ptr."""
     pt = fx.PointerType.get(
         fx.BFloat16.ir_type, address_space=fx.AddressSpace.Global, alignment=2
     )
@@ -215,8 +138,6 @@ def _bf16_row_view(base_i64, num_elems, nbytes):
     return fx.rocdl.make_buffer_tensor(view, num_records_bytes=fx.Int64(nbytes))
 
 
-# 1-element copy atoms sized per scalar dtype; the OOB-checked buffer tensor
-# clamps a stray voffset, so a max-size resource over a wide 1-D span is safe.
 _SCALAR_MAX_RECORDS = 1 << 24
 
 
@@ -252,10 +173,7 @@ def _scalar_store(base_i64, idx, val, fx_dt, copy_bits):
 
 
 def _store_bf16_tiled(vals_list, p_dst, copy, vec):
-    """Convert VEC fp32 values to a bf16 fragment and tiled-copy to ``p_dst``.
-
-    ``p_dst`` is this thread's D-partition of a ``(1, D)`` bf16 row view; the
-    partition already places lane ``tid`` at element ``tid*VEC``."""
+    """Convert VEC fp32 → bf16 and tiled-copy to ``p_dst``."""
     raw = [v.ir_value() if hasattr(v, "ir_value") else v for v in vals_list]
     f32v = fx.Vector.from_elements(raw, dtype=fx.Float32)
     bf16v = f32v.truncf(T.vec(vec, T.bf16))
@@ -267,14 +185,7 @@ def _store_bf16_tiled(vals_list, p_dst, copy, vec):
 def _store_fp8_packed_w64(
     vals_list, out_base_i64, row_base_bytes, idx, vec, *, skip_fnuz_clamp=False
 ):
-    """Pack VEC fp32 -> VEC fp8 via cvt_pk_fp8_f32 and store 8 bytes per thread
-    (2 packed dwords = one i64) at ``out_base + row_base_bytes + idx*8``.
-
-    fnuz clamp rationale: on e4m3fnuz, cvt_pk_fp8_f32 returns 0x80 (NaN) for
-    inputs rounding to -0, which propagates as NaN through attention -- so clamp
-    v in (-2^-8, 0) to +0. On gfx950+ (OCP e4m3fn) 0x80 is -0, not NaN, so
-    ``skip_fnuz_clamp=True`` elides the clamp (~4 ALU ops/elem).
-    """
+    """Pack VEC fp32 → fp8 and buffer-store 8 bytes (2 packed dwords) per thread."""
     i32 = T.i32
 
     if skip_fnuz_clamp:
@@ -296,21 +207,13 @@ def _store_fp8_packed_w64(
     p1 = fx.rocdl.cvt_pk_fp8_f32(i32, safe[4], safe[5], p1, 0)
     p1 = fx.rocdl.cvt_pk_fp8_f32(i32, safe[6], safe[7], p1, 1)
 
-    # Fold row_base_bytes into the base ptr; store one i64 (= 2 packed dwords)
-    # at i64-element index idx (idx*8 bytes) via the OOB-checked buffer tensor.
     base = out_base_i64 + fx.Int64(row_base_bytes)
     packed_i64 = fx.Vector.from_elements([p0, p1], dtype=fx.Int32).bitcast(fx.Int64)[0]
     _scalar_store(base, idx, fx.Int64(packed_i64), fx.Int64, 64)
 
 
 def _store_bf16_vec(vals, out_rsrc, row_base_bytes, idx, vec):
-    """Convert `vec` fp32 lanes to bf16, reinterpret as i32 dwords, and store
-    via raw buffer_store. Handles vec>8 by splitting into dwordx4 chunks.
-
-    ``vals`` is an fx.Vector of `vec` f32 lanes (a list of scalars is also
-    accepted). ``row_base_bytes`` is the byte offset to the start of this head's
-    row within the token (already token-shifted). ``idx`` is the lane id (tid).
-    """
+    """Convert VEC fp32 → bf16 dwords and raw buffer_store (split for VEC>8)."""
     i32 = T.i32
     if isinstance(vals, (list, tuple)):
         raw = [v.ir_value() if hasattr(v, "ir_value") else v for v in vals]
@@ -324,7 +227,6 @@ def _store_bf16_vec(vals, out_rsrc, row_base_bytes, idx, vec):
     if const_expr(dwords <= 4):
         buffer_ops.buffer_store(bf16_as_i32, out_rsrc, off_bytes, offset_is_bytes=True)
     else:
-        # dwords > 4 (VEC=16 → dwords=8): split into 2× dwordx4
         lo = vector.extract_strided_slice(
             T.vec(4, i32), bf16_as_i32, offsets=[0], sizes=[4], strides=[1]
         )
@@ -338,19 +240,7 @@ def _store_bf16_vec(vals, out_rsrc, row_base_bytes, idx, vec):
 def _store_fp8_packed_w32(
     vals_list, out_rsrc, row_base_bytes, idx, vec, *, skip_fnuz_clamp=False
 ):
-    """Pack VEC fp32 -> VEC fp8 via cvt_pk_fp8_f32 and store.
-
-    Generalized for VEC in {8, 16}: packs into VEC//4 dwords, stores as a
-    single vector (dwordx2 for VEC=8, dwordx4 for VEC=16).
-
-    Workaround for the e4m3fnuz NaN encoding 0x80: cvt_pk_fp8_f32 returns
-    0x80 (NaN) for inputs that round to negative zero, which propagates
-    through downstream attention as NaN. Clamp v in (-2^-8, 0) to +0 first.
-
-    On gfx950+ (OCP e4m3fn), 0x80 encodes -0 (not NaN), so the clamp is
-    unnecessary.  Pass ``skip_fnuz_clamp=True`` to elide it and save ~4
-    ALU ops per element.
-    """
+    """Pack VEC fp32 → fp8 and raw buffer_store (VEC in {8, 16})."""
     i32 = T.i32
 
     if skip_fnuz_clamp:
@@ -380,11 +270,6 @@ def _store_fp8_packed_w32(
     buffer_ops.buffer_store(store_vec, out_rsrc, off_bytes, offset_is_bytes=True)
 
 
-# ============================================================================
-# Kernel builders
-# ============================================================================
-
-
 def _build_kernel_w64(
     *,
     num_q_heads: int,
@@ -397,13 +282,7 @@ def _build_kernel_w64(
     kv_write: bool = False,
     paged: bool = False,
 ):
-    """Build the @flyc.kernel + @flyc.jit launcher for a given config.
-
-    Shape constants are captured via closure (not module globals) so launchers
-    for different configs coexist. quant=True writes fp8 with one scale per
-    ``group_size``-wide block (per-row when group_size == head_dim); scale_dtype
-    picks the stored encoding. q_weighted applies a per-channel Q weight.
-    """
+    """Build the wave64 @flyc.kernel + @flyc.jit launcher for a given config."""
     BLOCK_THREADS = BLOCK_THREADS_W64  # 1 wave64
     H = num_q_heads
     D = head_dim
@@ -419,15 +298,12 @@ def _build_kernel_w64(
     assert NOPE % VEC == 0, f"NOPE={NOPE} must be divisible by VEC={VEC}"
     assert RD % 2 == 0, "rope_head_dim must be even (GPT-J pair layout)"
     assert RD % VEC == 0, f"RD={RD} must be divisible by VEC={VEC}"
-    # Hard-wired VEC=8 (D=512): atom widths and _store_fp8_packed assume it.
     assert VEC == 8, (
         f"VEC={VEC} unsupported (D={D}); only D=512 / VEC=8 is implemented. "
         "Atom widths and fp8 packing assume VEC=8 -- generalising requires "
         "a wider refactor."
     )
 
-    # group_size must divide D and be a multiple of VEC (so a thread's VEC-wide
-    # slice never crosses a group boundary).
     assert (
         group_size > 0 and D % group_size == 0
     ), f"group_size {group_size} must divide head_dim {D}"
@@ -445,20 +321,14 @@ def _build_kernel_w64(
 
     log2_block = int(math.log2(BLOCK_THREADS))
     log2_tpg = int(math.log2(TPG))
-    # In the butterfly loop, sumsq shuffles at offsets [BLOCK/2, ..., 1].
-    # amax must NOT cross groups -> only shuffles at offsets < TPG -> only at
-    # the last log2(TPG) loop iterations (sh_exp >= amax_start_step).
     amax_start_step = log2_block - log2_tpg
 
     elem_dtype = fx.BFloat16
     is_e8m0 = scale_dtype == SCALE_DTYPE_E8M0
 
-    # FP8 element dtype follows the arch (matches _fp8_const); emit_mx_e8m0_scale
-    # uses it to pick the right max_pos reciprocal.
     _is_fnuz = _fp8_const()["dtype"] == torch.float8_e4m3fnuz
     _fp8_mx_dtype = _D.FP8_E4M3_FNUZ if _is_fnuz else _D.FP8_E4M3
 
-    # Kernel name: only flags that affect the compiled binary.
     _name_parts = ["qk_norm_rope", f"H{H}", f"D{D}", f"RD{RD}"]
     if q_weighted:
         _name_parts.append("qw")
@@ -513,9 +383,6 @@ def _build_kernel_w64(
         bid_t = fx.block_idx.y  # token id (chunked at MAX_GRID_Y per launch)
         tid = fx.thread_idx.x
 
-        # TV-tiled copy over one (1, D) bf16 row: thread t owns VEC contiguous
-        # head elems [t*VEC, (t+1)*VEC) -- the SAME thread->element map the
-        # shuffle_xor reductions assume.
         row_copy = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.BFloat16)
         row_tile_mn, row_tv = fx.make_layout_tv(
             fx.make_layout((1, BLOCK_THREADS), (BLOCK_THREADS, 1)),
@@ -536,7 +403,6 @@ def _build_kernel_w64(
         pos_val_i64 = _scalar_load(fx.Int64(ptrtoint(positions)), bid_t, fx.Int64, 64)
         pos_i32 = fx.Int64(pos_val_i64).to(fx.Int32)
 
-        # cos/sin buffer tensors (rope-threads only)
         cos_buf = fx.rocdl.make_buffer_tensor(cos_cache)
         sin_buf = fx.rocdl.make_buffer_tensor(sin_cache)
         cos_row = fx.slice(cos_buf, (pos_i32, None))
@@ -577,10 +443,6 @@ def _build_kernel_w64(
                 else:
                     am_local = fmath.absf(x_f32_vec).reduce(ReductionOp.MAX)
 
-                # Fused wave reduce: interleave sumsq-ADD (full row, RMSNorm
-                # scope=D) and amax-MAX (one quant group, TPG threads) shuffles
-                # so the scheduler overlaps both chains. amax only in tail steps
-                # where shuffle offset < TPG; earlier steps would cross groups.
                 w_sq = fx.Float32(sq_local)
                 w_am = fx.Float32(am_local)
                 for sh_exp in range_constexpr(log2_block):
@@ -601,10 +463,6 @@ def _build_kernel_w64(
                 am_safe = fx.Float32(am_group).maximumf(fx.Float32(1e-12))
 
                 if const_expr(is_e8m0):
-                    # MX E8M0 RoundUp scale (NV ROUND_UP / torchao RCEIL, as in
-                    # silu_and_mul_fq / mixed_moe_gemm_2stage). amax_post folds
-                    # rstd (per-row) and SQRT2 (post-RoPE bound) so the forward
-                    # factor bounds x_norm by the target fp8 max_pos.
                     amax_post = (am_safe * rstd * _SQRT2).ir_value()
 
                     e8m0_biased = fx.Int32(
@@ -612,29 +470,18 @@ def _build_kernel_w64(
                             amax_post, mode=_DEFAULT_MODE, dtype=_fp8_mx_dtype
                         )
                     )
-                    # quant_scale = 2^(127 - e8m0_biased) for x_norm; applied to
-                    # x_in directly, so absorb rstd: factor = rstd * quant_scale.
                     quant_exp = fx.Int32(254) - e8m0_biased
                     quant_scale = (quant_exp << fx.Int32(23)).bitcast(fx.Float32)
                     factor = rstd * quant_scale
                     scale_to_store = e8m0_biased.to(fx.Int8)
                     scale_store_dt, scale_store_bits = fx.Int8, 8
                 else:
-                    # FP32 scale with the rstd-cancellation trick.
-                    # scale_val = amax * rstd * SQRT2 / FP8_MAX  (stored)
-                    # factor   = FP8_MAX / (amax * SQRT2)        (applied to x_in)
-                    # The rstd factor cancels algebraically: store(out) =
-                    # x_in * factor -> dequant: x_norm = scale * out = x_in * rstd.
                     rcp_am = fx.Float32(fx.rocdl.rcp(f32, am_safe))
                     _fc = _fp8_const()
                     factor = rcp_am * _fc["max_over_sqrt2"]
                     scale_to_store = am_safe * rstd * _fc["inv_max_sqrt2"]
                     scale_store_dt, scale_store_bits = fx.Float32, 32
 
-                # Group-leader lanes (tid & (TPG-1) == 0) write the scale at
-                # scale_base_off + tid/TPG. NOTE: a masked store sets offset
-                # 0x7FFFFFFF on masked-off lanes -> OOB fault on gfx950; use the
-                # predicated lane-leader branch instead.
                 group_idx = tid >> fx.Int32(log2_tpg)
                 lane_in_group = tid & fx.Int32(TPG - 1)
                 if lane_in_group == 0:
@@ -647,7 +494,6 @@ def _build_kernel_w64(
                         scale_store_bits,
                     )
 
-            # Scale-multiply for ALL threads (hoisted out of rope/nope split).
             scaled = []
             for vi in range_constexpr(VEC):
                 xi = x_f32_vec[vi]
@@ -658,13 +504,11 @@ def _build_kernel_w64(
                 else:
                     scaled.append(xi * rstd)
 
-            # Round-trip scaled values through rmem so both branches share them.
             out_rmem = fx.make_rmem_tensor(full_lay, fx.Float32)
             scaled_raw = [s.ir_value() for s in scaled]
             scaled_vec = fx.Vector.from_elements(scaled_raw, dtype=fx.Float32)
             fx.memref_store_vec(scaled_vec, out_rmem)
 
-            # ROPE branch: load from rmem, rotate the GPT-J pairs, store back.
             is_rope = tid >= fx.Int32(ROPE_THREAD_LO)
             if is_rope:
                 rope_rel = tid - fx.Int32(ROPE_THREAD_LO)
@@ -685,7 +529,6 @@ def _build_kernel_w64(
                 rotated_vec = fx.Vector.from_elements(rope_elems, dtype=fx.Float32)
                 fx.memref_store_vec(rotated_vec, out_rmem)
 
-            # Unified store: all threads read the final row from rmem and write.
             final = fx.memref_load_vec(out_rmem)
             final_list = [final[i] for i in range(VEC)]
 
@@ -704,12 +547,7 @@ def _build_kernel_w64(
                 if const_expr(kv_write) and do_swa:
                     _store_bf16_tiled(final_list, swa_out_part, row_copy, VEC)
 
-        # Runtime dispatch bid_x < H (Q heads) vs == H (KV). Each in/out base
-        # folds bid_t (and the runtime kv row stride) into the descriptor base
-        # ptr in i64, so the in-thread voffset stays small (bounded by D) and
-        # large H*D configs never overflow i32 (>4GiB spans).
         if bid_x < fx.Int32(H):
-            # ---------- Q path ----------
             head_idx = bid_x
             q_in_base = (
                 fx.Int64(ptrtoint(q_in))
@@ -720,9 +558,6 @@ def _build_kernel_w64(
             q_in_part = _row_part_S(q_in_row)
             q_frag = fx.make_fragment_like(q_in_part)
             fx.copy(row_copy, q_in_part, q_frag)
-            # Round-trip through full_lay rmem so downstream sees the same vector
-            # type as the buffer_load path; otherwise the tiled-copy fragment's
-            # memref canonicalizes to ub.poison, which ROCm LLVM cannot lower.
             q_rmem = fx.make_rmem_tensor(full_lay, elem_dtype)
             fx.memref_store_vec(fx.memref_load_vec(q_frag), q_rmem)
             x_vec = fx.memref_load_vec(q_rmem)
@@ -737,12 +572,9 @@ def _build_kernel_w64(
                 qw_f32 = None
 
             if const_expr(quant):
-                # fp8 store: fold only the per-token base into the i64 base;
-                # row_base_bytes = head_idx*D added per-lane at store.
                 qo_base = fx.Int64(ptrtoint(q_out)) + fx.Int64(bid_t) * fx.Int64(H * D)
                 row_base_bytes = head_idx * D
                 qs_base = fx.Int64(ptrtoint(q_scale))
-                # q_scale (T, H, NG) flat; per-lane adds group_idx in emit_body.
                 scale_base_off_q = bid_t * (H * NG) + head_idx * NG
                 emit_body(
                     weighted=q_weighted,
@@ -754,7 +586,6 @@ def _build_kernel_w64(
                     scale_base_off=scale_base_off_q,
                 )
             else:
-                # bf16 q_out: per-token + per-head base -> (1,D) tiled-copy store.
                 qo_base = (
                     fx.Int64(ptrtoint(q_out))
                     + fx.Int64(bid_t) * fx.Int64(H * D * 2)
@@ -771,10 +602,6 @@ def _build_kernel_w64(
                     scale_base_off=None,
                 )
         else:
-            # ---------- KV path ----------
-            # KV is often a strided slice (V4: split of qkv_a). The runtime row
-            # stride (bf16 elems) is folded into the base ptr as bytes, then the
-            # token row is a plain contiguous (1, D) tiled-copy like Q.
             kv_in_base = fx.Int64(ptrtoint(kv_in)) + fx.Int64(bid_t) * (
                 fx.Int64(kv_in_row_stride) * fx.Int64(2)
             )
@@ -782,7 +609,6 @@ def _build_kernel_w64(
             kv_in_part = _row_part_S(kv_in_row)
             kv_frag = fx.make_fragment_like(kv_in_part)
             fx.copy(row_copy, kv_in_part, kv_frag)
-            # Round-trip through full_lay rmem (see Q path note re: ub.poison).
             kv_rmem = fx.make_rmem_tensor(full_lay, elem_dtype)
             fx.memref_store_vec(fx.memref_load_vec(kv_frag), kv_rmem)
             x_vec = fx.memref_load_vec(kv_rmem)
@@ -794,12 +620,9 @@ def _build_kernel_w64(
             w_f32 = w_vec.to(fx.Float32)
 
             if const_expr(quant):
-                # fp8 kv_out: fold per-token base into the i64 base (already at
-                # token base -> row_base_bytes = 0).
                 kvo_base = fx.Int64(ptrtoint(kv_out)) + fx.Int64(bid_t) * fx.Int64(D)
                 row_base_bytes = 0
                 kvs_base = fx.Int64(ptrtoint(kv_scale))
-                # kv_scale (T, NG) flat; per-lane adds group_idx in emit_body.
                 scale_base_off_kv = bid_t * NG
                 emit_body(
                     weighted=True,
@@ -811,17 +634,11 @@ def _build_kernel_w64(
                     scale_base_off=scale_base_off_kv,
                 )
             else:
-                # bf16 kv_out: per-token (1,D) row view + tiled-copy store.
                 kvo_base = fx.Int64(ptrtoint(kv_out)) + fx.Int64(bid_t) * fx.Int64(
                     D * 2
                 )
                 kvo_part = _row_part_D(_bf16_row_view(kvo_base, D, D * 2))
 
-                # ---- Fused SWA scatter setup (kv_write only) ----
-                # Target row comes from `swa_index`, whose meaning `paged`
-                # selects: a block table to walk, or this token's row outright.
-                # batch_id has a -1 sentinel on CG-pad tokens; clamp to 0 to keep
-                # the load in-bounds and gate the store on do_swa.
                 swa_out_part = None
                 do_swa = None
                 if const_expr(kv_write):
@@ -844,11 +661,6 @@ def _build_kernel_w64(
                     bid_safe = (bid_i32 >= fx.Int32(0)).select(bid_i32, fx.Int32(0))
                     pos_safe = pos_ok.select(pos_i32, fx.Int32(0))
                     if const_expr(paged):
-                        # paged / content-addressed SWA (DeepSeek-V4 #1417):
-                        # swa_kv is the FLAT [num_pages, D] pool; `swa_index` is
-                        # block_tables[bs, max_blocks], swa_slot_stride=max_blocks,
-                        # swa_cache_size=block_size, swa_pos_stride=D. Physical row
-                        # = block_tables[bid, pos//bs]*bs + pos%bs.
                         blk = pos_safe // swa_cache_size
                         # The other two gates the C++ sibling applies (see
                         # `swa_row_for_token`): a position past the table's last
@@ -883,10 +695,6 @@ def _build_kernel_w64(
                         # base backwards, out of this tensor entirely.
                         row = row_ok.select(row_raw, fx.Int32(0))
                     else:
-                        # Direct: the caller already resolved this token's row.
-                        # A -1 row means "skip", same as a -1 batch id -- a caller
-                        # whose window this kernel cannot express needs a way to
-                        # say so per token, not just per request.
                         dest = fx.Int32(
                             _scalar_load(
                                 fx.Int64(ptrtoint(swa_index)),
@@ -895,8 +703,6 @@ def _build_kernel_w64(
                                 32,
                             )
                         )
-                        # Bounded against the pool as well: the caller owns the
-                        # row, but a stale entry must not write past swa_kv.
                         dest_ok = (dest >= fx.Int32(0)) & (dest < swa_num_rows)
                         do_swa = do_swa & dest_ok
                         row = dest_ok.select(dest, fx.Int32(0))
@@ -924,8 +730,6 @@ def _build_kernel_w64(
                     do_swa=do_swa,
                 )
 
-    # Named launcher so the flydsl disk cache dir is
-    # launch_qk_norm_rope_quant_<hash>/ instead of the generic launcher_<hash>/.
     @flyc.jit
     def launch_qk_norm_rope_quant(
         q_in: fx.Pointer,
@@ -994,19 +798,7 @@ def _build_kernel_w32(
     paged: bool = False,
     rows_per_wg: int = ROWS_PER_WG,
 ):
-    """Build the @flyc.kernel + @flyc.jit launcher for a given config.
-
-    All shape constants are captured via closure (NOT module globals), so two
-    launchers with different (H, D, RD, group_size, scale_dtype, q_weighted)
-    coexist safely. Returns the launcher.
-
-    quant=True writes fp8 with one scale per ``group_size``-wide block of D.
-    When ``group_size == head_dim`` the scale degenerates to per-row (NG=1).
-    scale_dtype controls the stored scale encoding (``"fp32"`` or ``"e8m0"``).
-
-    q_weighted=True applies a per-channel weight to Q after RMSNorm (same
-    pattern as KV). Default False keeps Q weightless (V4-Pro convention).
-    """
+    """Build the wave32 @flyc.kernel + @flyc.jit launcher for a given config."""
     BLOCK_THREADS = BLOCK_THREADS_W32  # 1 wave32
     H = num_q_heads
     D = head_dim
@@ -1015,8 +807,6 @@ def _build_kernel_w32(
     VEC = D // BLOCK_THREADS
     ROPE_THREAD_LO = NOPE // VEC
     PAIRS_PER_THREAD = VEC // 2
-    # Local rebind so every ROWS_PER_WG reference below picks up the per-build
-    # value (adaptive: R=32 for prefill, R=16 for small-T decode).
     ROWS_PER_WG = rows_per_wg
 
     assert (
@@ -1025,15 +815,11 @@ def _build_kernel_w32(
     assert NOPE % VEC == 0, f"NOPE={NOPE} must be divisible by VEC={VEC}"
     assert RD % 2 == 0, "rope_head_dim must be even (GPT-J pair layout)"
     assert RD % VEC == 0, f"RD={RD} must be divisible by VEC={VEC}"
-    # gfx1250 wave32: VEC = D/32. D=512 → VEC=16, D=128 → VEC=4.
     assert VEC in (2, 4, 8, 16), (
         f"VEC={VEC} unsupported (D={D}, BLOCK_THREADS={BLOCK_THREADS}); "
         "supported set: {2, 4, 8, 16}."
     )
 
-    # --- quant-group layout ------------------------------------------------
-    # group_size must divide D evenly AND be a multiple of VEC (so a single
-    # thread's VEC-wide slice never crosses a group boundary).
     assert (
         group_size > 0 and D % group_size == 0
     ), f"group_size {group_size} must divide head_dim {D}"
@@ -1051,18 +837,13 @@ def _build_kernel_w32(
 
     log2_block = int(math.log2(BLOCK_THREADS))
     log2_tpg = int(math.log2(TPG))
-    # In the butterfly loop, sumsq shuffles at offsets [BLOCK/2, ..., 1].
-    # amax must NOT cross groups -> only shuffles at offsets < TPG -> only at
-    # the last log2(TPG) loop iterations (sh_exp >= amax_start_step).
     amax_start_step = log2_block - log2_tpg
 
     elem_dtype = fx.BFloat16
     is_e8m0 = scale_dtype == SCALE_DTYPE_E8M0
 
-    # gfx1250 ships OCP e4m3fn (max_pos=448).
     _fp8_mx_dtype = _D.FP8_E4M3
 
-    # Kernel name: include w32 suffix to avoid JIT cache collision with wave64.
     _name_parts = ["qk_norm_rope", f"H{H}", f"D{D}", f"RD{RD}"]
     if q_weighted:
         _name_parts.append("qw")
@@ -1105,14 +886,6 @@ def _build_kernel_w32(
         f32 = T.f32
         i32 = T.i32
 
-        # --- vector load helpers (generalized for VEC ∈ {2..16}) ---
-        # CopyAtom-based loads work for VEC ≤ 8 (BufferCopy128b = 16 bytes
-        # = 8 bf16). For VEC=16 (32 bytes/thread), we use raw buffer_load
-        # split into dwordx4 chunks, matching the compress_attn gfx1250 pattern.
-
-        # Full-row loads via CopyAtom (for weight tensors).
-        # VEC ≤ 8 → BufferCopy128b (16 bytes) is sufficient.
-        # VEC = 16 → need 32 bytes; use raw buffer_load split instead.
         full_lay = fx.make_layout(VEC, 1)
         if const_expr(VEC <= 8):
             full_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), 16)
@@ -1170,11 +943,6 @@ def _build_kernel_w32(
         tid = fx.thread_idx.x
         tid_y = fx.thread_idx.y  # wave within workgroup -> token selector
 
-        # Each workgroup owns ROWS_PER_WG consecutive waves; wave tid_y handles
-        # token (bid_t*ROWS_PER_WG + tid_y). Clamp OOB tail waves to the last
-        # valid token instead of branching: they recompute an already-valid row
-        # and write byte-identical results (idempotent), so there is no OOB
-        # access and no divergent bounds check on the hot path.
         tok = _imin(bid_t * ROWS_PER_WG + tid_y, num_tokens - 1)
         bid_t = tok  # all downstream token offsets use the clamped token
         bid_t_idx = fx.Index(tok)
@@ -1192,8 +960,6 @@ def _build_kernel_w32(
         pos_val_i64 = buffer_ops.buffer_load(pos_rsrc, bid_t, vec_width=1, dtype=T.i64)
         pos_i32 = fx.Int32(pos_val_i64.trunci(i32))
 
-        # --- shared: cos/sin buffer resources (all threads load, NOPE
-        # threads clamp index to 0 so the load is in-bounds/harmless) ---
         cos_rsrc = buffer_ops.create_buffer_resource(cos_cache, max_size=True)
         sin_rsrc = buffer_ops.create_buffer_resource(sin_cache, max_size=True)
         c_half_rd = fx.Int32(RD // 2)
@@ -1223,8 +989,6 @@ def _build_kernel_w32(
             """Apply RMSNorm + GPT-J RoPE (+ optional FP8 quant) for the row
             held by this block. ``x_f32_vec`` and (optional) ``w_f32_vec`` are
             VEC-wide fp32 vectors already loaded by the caller."""
-            # ---- Issue cos/sin loads EARLY so they overlap with the
-            # sumsq reduction ALU below (latency hiding). ----
             is_rope_t = tid >= fx.Int32(ROPE_THREAD_LO)
             rope_rel = _imax(tid - fx.Int32(ROPE_THREAD_LO), fx.Int32(0))
             cs_off = cos_sin_row_base + rope_rel * fx.Int32(PAIRS_PER_THREAD)
@@ -1243,7 +1007,6 @@ def _build_kernel_w32(
                     sin_rsrc, cs_off, vec_width=PAIRS_PER_THREAD, dtype=T.bf16
                 )
 
-            # ---- RMSNorm: sumsq reduction (overlaps with cos/sin loads) ----
             x2 = x_f32_vec * x_f32_vec
             sq_local = x2.reduce(ReductionOp.ADD)
 
@@ -1277,9 +1040,6 @@ def _build_kernel_w32(
                 # and a const_expr-only branch leaves it undefined on the other
                 # path, which the AST rewriter rejects.
                 if const_expr(is_e8m0):
-                    # emit_mx_e8m0_scale is shared with the compress-attn
-                    # kernels and calls .bitcast(T.i32) internally, so it wants a
-                    # raw value rather than a Numeric.
                     amax_post = (am_safe * rstd * _SQRT2).ir_value()
                     e8m0_biased = fx.Int32(
                         emit_mx_e8m0_scale(
@@ -1315,7 +1075,6 @@ def _build_kernel_w32(
                 else:
                     scaled.append(xi * rstd)
 
-            # ---- Extract cos/sin values (loads issued early, now consumed) ----
             if const_expr(PAIRS_PER_THREAD == 1):
                 cos_vals = [cos_raw.extf(f32)]
                 sin_vals = [sin_raw.extf(f32)]
@@ -1355,13 +1114,10 @@ def _build_kernel_w32(
                         VEC,
                     )
 
-        # ============ runtime dispatch on bid_x < H ============
         q_tok_off_bytes = bid_t_idx * fx.Index(H * D * 2)
 
         if bid_x < H:
-            # ---------- Q path ----------
             head_idx = bid_x
-            # Q load: use raw buffer_load to handle VEC=16 correctly.
             q_in_rsrc = _ptr_buffer_resource(q_in)
             q_row_off_elems = bid_t * (H * D) + head_idx * D + tid * VEC
             q_off_dw = q_row_off_elems >> 1
@@ -1400,7 +1156,6 @@ def _build_kernel_w32(
                     scale_base_off=scale_base_off_q,
                 )
             else:
-                # BF16 store via raw buffer_store (handles VEC=16).
                 qo_g_tmp = GTensor(
                     q_out,
                     dtype=T.bf16,
@@ -1420,7 +1175,6 @@ def _build_kernel_w32(
                     scale_base_off=None,
                 )
         else:
-            # ---------- KV path ----------
             kv_rsrc = _ptr_buffer_resource(kv_in)
             kv_off_elems = bid_t * kv_in_row_stride + tid * VEC
             kv_off_dw = kv_off_elems >> 1
@@ -1467,7 +1221,6 @@ def _build_kernel_w32(
                 kvo_rsrc = kvo_g_tmp.rsrc
                 row_base_bytes_kv = fx.Int32(0)
 
-                # ---- Fused SWA scatter setup (kv_write only) ----
                 swa_rsrc = None
                 swa_row_base = None
                 do_swa = None
@@ -1515,18 +1268,12 @@ def _build_kernel_w32(
                         # base backwards, out of this tensor entirely.
                         row_safe = row_ok.select(row, fx.Int32(0))
                     else:
-                        # Direct: the caller already resolved this token's row.
-                        # A `-1` row means "skip", same as a `-1` batch id --
-                        # a caller whose window is not expressible here needs a
-                        # way to say so per token, not just per request.
                         row_rsrc = _ptr_buffer_resource(swa_index)
                         row = fx.Int32(
                             buffer_ops.buffer_load(
                                 row_rsrc, bid_t, vec_width=1, dtype=i32
                             )
                         )
-                        # Bounded against the pool as well: the caller owns the
-                        # row, but a stale entry must not write past swa_kv.
                         dest_ok = (row >= 0) & (row < swa_num_rows)
                         do_swa = do_swa & dest_ok
                         row_safe = dest_ok.select(row, fx.Int32(0))
@@ -1617,11 +1364,6 @@ def _build_kernel_w32(
         )
 
     return launch_qk_norm_rope_quant
-
-
-# ============================================================================
-# Cached compile + public API
-# ============================================================================
 
 
 @lru_cache(maxsize=32)
@@ -1717,50 +1459,7 @@ def flydsl_qk_norm_rope_quant(
     torch.Tensor | None,
     torch.Tensor | None,
 ]:
-    """Fused RMSNorm + GPT-J RoPE + optional FP8 quant for Q and KV in one launch.
-
-    Args:
-        q: Q activations, bf16, ``[T, H*D]`` (``.view``-reshaped) or ``[T, H, D]``;
-            must be contig in the (H, D) inner dims.
-        kv: KV pre-RoPE/norm, ``[T, D]`` bf16. May be a strided view (the row
-            stride from ``kv.stride(0)`` is passed through).
-        kv_weight: per-channel KV RMSNorm weight, ``[D]`` bf16.
-        cos_cache, sin_cache: RoPE cos/sin, last dim RD/2, any leading shape that
-            ``view``-reshapes to ``[max_pos, RD/2]`` (bf16).
-        positions: per-token RoPE indices, ``[T]`` int64.
-        num_q_heads / head_dim / rope_head_dim: H / D / RD (RD-tail is rotated,
-            first D-RD elements pass through as NOPE).
-        q_weight: optional per-channel Q RMSNorm weight ``[D]`` bf16; None ->
-            weightless Q (V4-Pro default).
-        quant: if True write fp8 in the per-GFX native encoding from
-            ``aiter.dtypes.fp8`` (e4m3fnuz gfx942 / e4m3fn gfx950); else bf16.
-        quant_group_size: 1xG scale block width; default head_dim (per-row).
-            Kernel needs G a multiple of head_dim//BLOCK_THREADS_W64 (8), so
-            typical sub-row choices are {32, 64, 128}.
-        scale_dtype: ``"fp32"`` (default) or ``"e8m0"`` (MX uint8).
-        q_out, kv_out, q_scale, kv_scale: output buffers (allocated if None);
-            q_out [T,H,D], kv_out [T,D], q_scale [T,H,NG], kv_scale [T,NG] with
-            NG = head_dim // quant_group_size; fp32 or uint8 (e8m0) scales.
-        stream: launch stream (default current). Do NOT leave at
-            ``fx.Stream(None)`` under CUDA-graph capture (NULL stream -> empty
-            captured graph).
-        swa_kv: optional flat bf16 SWA pool (bf16 only, incompatible with quant);
-            the post-norm/rope KV row is also scattered into it in the same
-            launch, fusing the standalone swa_write. ``[num_rows, D]`` with
-            ``swa_dest_rows``, ``[num_pages, D]`` with ``swa_block_tables``.
-        swa_dest_rows: ``[T]`` int32 -- the row THIS TOKEN's KV goes to, one entry
-            per token (not per request: under speculation one request writes
-            several positions in a launch and they do not share a row). ``-1``
-            skips the token, letting a caller whose window layout this kernel
-            cannot express resolve the row itself. Required w/ swa_kv unless
-            ``swa_block_tables`` is given.
-        batch_id_per_token: ``[T]`` int32, -1 on CG-pad tokens (store gated off);
-            required w/ swa_kv.
-
-    Returns:
-        (q_out, kv_out, q_scale_or_None, kv_scale_or_None); scales None when
-        ``quant=False``.
-    """
+    """Fused RMSNorm + GPT-J RoPE + optional FP8 quant for Q and KV in one launch."""
     D, RD = head_dim, rope_head_dim
     G = quant_group_size if quant_group_size is not None else D
     kv_write = swa_kv is not None
@@ -1840,7 +1539,6 @@ def flydsl_qk_norm_rope_quant(
     # DCEs the load but the param binding still needs a valid tensor).
     q_weight_arg = q_weight if q_weighted else kv_weight
 
-    # Normalize Q to [T, H, D] (the kernel expects 3D).
     if q.dim() == 2:
         if q.shape[1] != H * D:
             raise ValueError(f"q shape {tuple(q.shape)} != [T, H*D={H * D}]")
@@ -1887,14 +1585,6 @@ def flydsl_qk_norm_rope_quant(
         q_scale_arg = q.new_empty(1, dtype=scale_torch_dtype)
         kv_scale_arg = q.new_empty(1, dtype=scale_torch_dtype)
 
-    # ---- Fused SWA cache-write (BF16 only) ----
-    # Two modes, both writing the post-norm/rope KV row in the same launch
-    # (no separate swa_write launch, no kv HBM round-trip; bf16 only):
-    #   direct (swa_dest_rows): flat pool swa_kv[swa_dest_rows[t], :]
-    #   paged  (swa_block_tables): flat pool swa_kv[bt[bid, pos//bs]*bs + pos%bs]
-    #                              (DeepSeek-V4 #1417; repurposes the ring
-    #                              scalars: swa_slot_stride=max_blocks,
-    #                              swa_cache_size=block_size, swa_pos_stride=D).
     paged = swa_block_tables is not None
     if kv_write:
         if batch_id_per_token is None:
@@ -1963,7 +1653,6 @@ def flydsl_qk_norm_rope_quant(
         ssm_arg = swa_dest_rows
         bid_arg = batch_id_per_token
     else:
-        # 1-elem dummies so the kernel param binding has valid pointers.
         swa_slot_stride = 0
         swa_pos_stride = 0
         swa_num_rows = 0
@@ -2062,15 +1751,7 @@ def flydsl_qk_norm_rope_quant_gfx1250(
     torch.Tensor | None,
     torch.Tensor | None,
 ]:
-    """Fused RMSNorm + GPT-J RoPE + optional FP8 quant (gfx1250 wave32).
-
-    Same API as ``flydsl_qk_norm_rope_quant`` — see that docstring for full
-    parameter descriptions. This variant compiles with BLOCK_THREADS_W32 for
-    RDNA4/gfx1250 wave32 hardware.
-
-    Inputs are validated by ``flydsl_qk_norm_rope_quant``, the only caller;
-    this entry point assumes they are already well-formed.
-    """
+    """gfx1250 wave32 entry point; called by flydsl_qk_norm_rope_quant only."""
 
     H, D, RD = num_q_heads, head_dim, rope_head_dim
     T_tok = q.shape[0]
@@ -2121,7 +1802,6 @@ def flydsl_qk_norm_rope_quant_gfx1250(
         q_scale_arg = q.new_empty(1, dtype=scale_torch_dtype)
         kv_scale_arg = q.new_empty(1, dtype=scale_torch_dtype)
 
-    # ---- Fused SWA cache-write (BF16 only) ----
     paged = swa_block_tables is not None
     kv_write = swa_kv is not None
     if kv_write:
@@ -2199,7 +1879,6 @@ def flydsl_qk_norm_rope_quant_gfx1250(
         ssm_arg = q.new_empty(1, dtype=torch.int32)
         bid_arg = q.new_empty(1, dtype=torch.int32)
 
-    # ---- BF16 prefill fast path (TDM deep-prefetch) ----
     if (
         USE_TDM_PREFILL
         and not quant
@@ -2226,10 +1905,6 @@ def flydsl_qk_norm_rope_quant_gfx1250(
         )
         return q_out, kv_out, None, None
 
-    # Adaptive workgroup packing: small-T (decode) launches too few workgroups
-    # at R=32 to fill all CUs, so use the small-R variant there; large-T
-    # (prefill) keeps R=32 for max waves/workgroup. Selected once per launch by
-    # total token count (chunking below stays within one regime for real cases).
     rows_per_wg = ROWS_PER_WG_SMALL if T_tok <= SMALL_T_THRESHOLD else ROWS_PER_WG
 
     launcher = compile_flydsl_qk_norm_rope_quant_gfx1250(
@@ -2301,53 +1976,18 @@ def flydsl_qk_norm_rope_quant_gfx1250(
     return q_out, kv_out, (q_scale if quant else None), (kv_scale if quant else None)
 
 
-# ===========================================================================
-# TDM deep-prefetch BF16 prefill.
-# Dispatched above behind USE_TDM_PREFILL. Q via per-wave s_wait_dscnt fence +
-# K=6 deep prefetch + cos/sin hoist; KV via a direct-load row-per-wave kernel.
-# See ../temp-doc/aiter/qk_norm_rope_tdm_handoff.md for the full derivation.
-# ===========================================================================
-
 ROWS_PER_TILE = 32  # = waves per WG (1024-thread WG)
 NUM_BUFFERS = 6  # K: rotating LDS buffers (1 WG at K=6: 6*32KB=192KB LDS)
 TILES_PER_WG = 40  # CT: tiles streamed per WG (unrolled; CT % (H/RT) == 0)
 
 
 def _tdm_tiles_per_wg(num_rows):
-    """Pick CT (tiles per workgroup) for a row count.
-
-    CT sets how many RT-row tiles one workgroup drains, i.e. it trades deep
-    prefetch (large CT, few workgroups) against occupancy (small CT, many
-    workgroups). grid = ceil(num_rows / (RT*CT)), so the default CT=40 leaves
-    most of the 256 CUs idle just above the dispatch threshold: at 32768 rows
-    it launches 26 workgroups and runs 2.9x slower than CT=8.
-
-    The steps below are where CT=8/16 beat CT=40 by 1.9-2.9x, reproduced at
-    H=16/64/128 (bench-tdm-vs-stock.py). Past 131072 rows the spread across
-    CT collapses to <15% and stops being monotonic -- CT=40 is not optimal
-    everywhere up there (28 is ~10% better at 524288 rows), but the ordering
-    flips between shapes, so leave the default rather than fit the noise.
-    """
+    """Pick CT (tiles per workgroup) for a row count — trades prefetch depth vs occupancy."""
     if num_rows <= 65536:
         return 8
     if num_rows <= 131072:
         return 16
     return TILES_PER_WG
-
-
-# ---------------------------------------------------------------------------
-# Fused Q + KV kernel: Q via TDM deep-prefetch, KV via direct load
-# ---------------------------------------------------------------------------
-# One launch covers both. Workgroups with block_idx.x < gx_q run the Q path
-# (RT rows per tile, K rotating LDS buffers, deep prefetch); the rest run the
-# KV path (one wave per token, straight from global, no LDS/fence). The branch
-# is workgroup-uniform, so the Q path's tensor_wait/s_wait_dscnt stay correct.
-#
-# The LDS arena is a static per-kernel allocation, so the KV workgroups reserve
-# it without using it. Measured cost of that reservation on the KV path alone:
-# ~11% (6.00us -> 6.66us at T=16384), and KV is ~2.3% of the launch, i.e.
-# ~0.25% end to end -- worth it for one launch and one copy of the
-# norm/RoPE/store math.
 
 
 def _build_tdm_fused(
@@ -2372,8 +2012,6 @@ def _build_tdm_fused(
     eb = 2
     log2b = int(math.log2(BLOCK_THREADS))
     log2H = int(math.log2(H)) if (H & (H - 1)) == 0 else None
-    # GPT-J RoPE lane shuffles: split the VEC lanes into even/odd halves, rotate
-    # them as PAIRS-wide vectors, then interleave back ([e0,o0,e1,o1,...]).
     EVEN = list(range(0, VEC, 2))
     ODD = list(range(1, VEC, 2))
     ILV = [(i // 2) if i % 2 == 0 else (PAIRS + i // 2) for i in range(VEC)]
@@ -2407,8 +2045,6 @@ def _build_tdm_fused(
         wave = fx.thread_idx.y
         g = fx.block_idx.x
 
-        # Static per-kernel LDS: only the Q path reads it, but the allocation is
-        # kernel-wide (see the header note on the KV occupancy cost).
         lds_ptr = fx.SharedAllocator(static=False).allocate(ARENA)._ptr
         lds_idx = fx.index_cast(T.index, fx.ptrtoint(lds_ptr))
         lds_i32 = fx.index_cast(T.i32, lds_idx)  # i32 form for pointer math
@@ -2431,8 +2067,6 @@ def _build_tdm_fused(
             )
 
         pos_rsrc = _ptr_res(positions)
-
-        # ---- helpers shared by both paths ----
 
         def _concat(chunks):
             """Fold 8-lane chunks into one VEC-lane vector. range_constexpr, not
@@ -2499,8 +2133,6 @@ def _build_tdm_fused(
             final = is_rope.select(rot, scaled)
             _store_bf16_vec(final, out_rsrc, row_base_bytes, tid, VEC)
 
-        # ---- Q path ----
-
         def emit_q():
             q_out_rsrc = _ptr_res(q_out)
             nr_m1 = num_rows - 1
@@ -2508,8 +2140,6 @@ def _build_tdm_fused(
             wave_lds_off = wave * (D * eb)  # this wave's slot in a tile buffer
             row_elem = tid * VEC  # LDS read pos within that slot
 
-            # q_weight [D] is per-channel and constant across all rows/tokens ->
-            # load this wave's VEC channels once, reuse for every tile.
             qw = (
                 load_vec_global(
                     buffer_ops.create_buffer_resource(q_weight, max_size=True),
@@ -2519,9 +2149,6 @@ def _build_tdm_fused(
                 else None
             )
 
-            # One (1, D) row tile per wave. The atom carries the row extent so
-            # the hardware zero-fills OOB rows; the row is picked per issue by
-            # advancing the global operand.
             q_row0 = fx.Tensor(
                 fx.make_view(fx.get_iter(q_in), fx.make_layout((1, D), (D, 1)))
             )
@@ -2533,7 +2160,6 @@ def _build_tdm_fused(
                 return _imin(tile_idx * RT + wave, nr_m1)
 
             def issue(buf, tile_idx):
-                # this wave's row of tile_idx -> buf slot wave*D (clamped)
                 dst = fx.Tensor(
                     fx.make_view(
                         fx.inttoptr(lds_bf16_ptr_ty, lds_i32 + (wave_lds_off + buf)),
@@ -2548,7 +2174,6 @@ def _build_tdm_fused(
                 )
 
             def compute_store(buf, tile_idx, cosv, sinv):
-                # 128-bit LDS reads: 4 i32 lanes == 8 bf16.
                 xv = _concat(
                     [
                         fx.Vector(
@@ -2570,9 +2195,6 @@ def _build_tdm_fused(
                 )
 
             def fence():
-                # Keep K-1 TDM loads in flight (tensorcnt), then wait the DS
-                # counter for this wave's oldest LDS write -> per-wave, no
-                # barrier.
                 tdm_ops.tensor_wait(K - 1)
                 rocdl.s_wait_dscnt(0)
 
@@ -2582,15 +2204,11 @@ def _build_tdm_fused(
                     return load_cs(my_row >> log2H)
                 return load_cs(_idiv(my_row, fx.Int32(H)))
 
-            # GROUP consecutive tiles are the same token (H/RT heads split
-            # RT-per-tile) -> load pos/cos/sin once per token when tile_base is
-            # GROUP-aligned.
             GROUP = (H // RT) if (log2H is not None and H % RT == 0) else 1
             do_hoist = hoist_cs and GROUP > 1 and (CT % GROUP == 0)
 
             for k in range_constexpr(K):
                 issue(bufs[k], tile_base + k)
-            # --- stream: keep K-1 loads in flight; overlap load with compute ---
             cs_cache = [None, None]
             for i in range_constexpr(CT):
                 fence()
@@ -2603,8 +2221,6 @@ def _build_tdm_fused(
                 compute_store(bufs[i % K], tile_base + i, cosv, sinv)
                 if const_expr(i + K < CT):
                     issue(bufs[i % K], tile_base + i + K)  # reuse after read
-
-        # ---- KV path: one wave per token, straight from global ----
 
         def emit_kv():
             gk = g - gx_q
