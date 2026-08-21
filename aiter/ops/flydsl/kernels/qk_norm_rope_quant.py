@@ -1769,6 +1769,47 @@ def flydsl_qk_norm_rope_quant(
         (q_out, kv_out, q_scale_or_None, kv_scale_or_None); scales None when
         ``quant=False``.
     """
+    D, RD = head_dim, rope_head_dim
+    G = quant_group_size if quant_group_size is not None else D
+    kv_write = swa_kv is not None
+    # Validated ahead of the wave32 dispatch below so both wave widths share
+    # this one copy. User-facing inputs use raise (not stripped under python
+    # -O); internal codegen invariants in _build_kernel stay as asserts.
+    if q.dtype != torch.bfloat16:
+        raise TypeError(f"q must be bf16, got {q.dtype}")
+    if kv.dtype != torch.bfloat16:
+        raise TypeError(f"kv must be bf16, got {kv.dtype}")
+    if kv_weight.dtype != torch.bfloat16:
+        raise TypeError(f"kv_weight must be bf16, got {kv_weight.dtype}")
+    if kv.stride(-1) != 1:
+        raise ValueError(f"kv must be dense in the last dim, stride={kv.stride()}")
+    # KV loads cast bf16->dword; the >>1 in the offset is only correct when the
+    # per-row byte offset is dword-aligned, i.e. the bf16 row stride is even.
+    if kv.stride(0) % 2 != 0:
+        raise ValueError(
+            "kv row stride (in bf16 elements) must be even for dword-cast "
+            f"buffer loads, got kv.stride(0)={kv.stride(0)}"
+        )
+    if positions.dtype != torch.int64:
+        raise TypeError(f"positions must be int64, got {positions.dtype}")
+    if scale_dtype not in SCALE_DTYPE_OPTIONS:
+        raise ValueError(f"scale_dtype {scale_dtype!r} not in {SCALE_DTYPE_OPTIONS}")
+    if q_weight is not None and q_weight.dtype != torch.bfloat16:
+        raise TypeError(f"q_weight must be bf16, got {q_weight.dtype}")
+    if D % G != 0:
+        raise ValueError(f"head_dim {D} must be divisible by quant_group_size {G}")
+    # cos/sin are view-reshaped to 2D [max_pos, RD/2] further down; accept any
+    # leading shape whose last dim is RD/2 (DeepSeek-V4 stores [max_pos,1,1,RD/2]).
+    if cos_cache.shape[-1] != RD // 2:
+        raise ValueError(
+            f"cos_cache last dim {cos_cache.shape[-1]} != RD/2 ({RD // 2})"
+        )
+    if sin_cache.shape != cos_cache.shape:
+        raise ValueError("cos/sin shape mismatch")
+    if not (cos_cache.is_contiguous() and sin_cache.is_contiguous()):
+        raise ValueError("cos/sin must be contiguous")
+    if kv_write and quant:
+        raise ValueError("kv_write (swa_kv) is BF16 only; not supported with quant")
     # ---- gfx1250 dispatch (wave32) ----
     from aiter.jit.utils.chip_info import get_gfx as _get_gfx
 
@@ -1799,36 +1840,9 @@ def flydsl_qk_norm_rope_quant(
             stream=stream,
         )
 
-    # User-facing inputs use raise (not stripped under python -O); internal
-    # codegen invariants in _build_kernel stay as asserts.
-    if q.dtype != torch.bfloat16:
-        raise TypeError(f"q must be bf16, got {q.dtype}")
-    if kv.dtype != torch.bfloat16:
-        raise TypeError(f"kv must be bf16, got {kv.dtype}")
-    if kv_weight.dtype != torch.bfloat16:
-        raise TypeError(f"kv_weight must be bf16, got {kv_weight.dtype}")
-    if kv.stride(-1) != 1:
-        raise ValueError(f"kv must be dense in the last dim, stride={kv.stride()}")
-    # KV loads cast bf16->dword; the >>1 in the offset is only correct when the
-    # per-row byte offset is dword-aligned, i.e. the bf16 row stride is even.
-    if kv.stride(0) % 2 != 0:
-        raise ValueError(
-            "kv row stride (in bf16 elements) must be even for dword-cast "
-            f"buffer loads, got kv.stride(0)={kv.stride(0)}"
-        )
-    if positions.dtype != torch.int64:
-        raise TypeError(f"positions must be int64, got {positions.dtype}")
-    if scale_dtype not in SCALE_DTYPE_OPTIONS:
-        raise ValueError(f"scale_dtype {scale_dtype!r} not in {SCALE_DTYPE_OPTIONS}")
-    if q_weight is not None and q_weight.dtype != torch.bfloat16:
-        raise TypeError(f"q_weight must be bf16, got {q_weight.dtype}")
-
-    H, D, RD = num_q_heads, head_dim, rope_head_dim
+    H = num_q_heads
     T_tok = q.shape[0]
-    G = quant_group_size if quant_group_size is not None else D
     NG = D // G
-    if D % G != 0:
-        raise ValueError(f"head_dim {D} must be divisible by quant_group_size {G}")
     q_weighted = q_weight is not None
     # Kernel always binds q_weight; pass a dummy when unused (const_expr gate
     # DCEs the load but the param binding still needs a valid tensor).
@@ -1855,16 +1869,6 @@ def flydsl_qk_norm_rope_quant(
                 f"(stride(-1)==1 and stride(-2)==D={D}), got stride={q_view.stride()}"
             )
 
-    # Normalize cos/sin to 2D [max_pos, RD/2]. Accept any shape whose last
-    # dim is RD/2 (DeepSeek-V4 stores [max_pos, 1, 1, RD/2]).
-    if cos_cache.shape[-1] != RD // 2:
-        raise ValueError(
-            f"cos_cache last dim {cos_cache.shape[-1]} != RD/2 ({RD // 2})"
-        )
-    if sin_cache.shape != cos_cache.shape:
-        raise ValueError("cos/sin shape mismatch")
-    if not (cos_cache.is_contiguous() and sin_cache.is_contiguous()):
-        raise ValueError("cos/sin must be contiguous")
     cos_2d = cos_cache.view(cos_cache.shape[0], RD // 2)
     sin_2d = sin_cache.view(sin_cache.shape[0], RD // 2)
 
@@ -1900,9 +1904,6 @@ def flydsl_qk_norm_rope_quant(
     #                              scalars: swa_slot_stride=max_blocks,
     #                              swa_cache_size=block_size, swa_pos_stride=D).
     paged = swa_block_tables is not None
-    kv_write = swa_kv is not None
-    if kv_write and quant:
-        raise ValueError("kv_write (swa_kv) is BF16 only; not supported with quant")
     if kv_write:
         if batch_id_per_token is None:
             raise ValueError("kv_write requires batch_id_per_token")
@@ -2074,33 +2075,15 @@ def flydsl_qk_norm_rope_quant_gfx1250(
     Same API as ``flydsl_qk_norm_rope_quant`` — see that docstring for full
     parameter descriptions. This variant compiles with BLOCK_THREADS_W32 for
     RDNA4/gfx1250 wave32 hardware.
+
+    Inputs are validated by ``flydsl_qk_norm_rope_quant``, the only caller;
+    this entry point assumes they are already well-formed.
     """
-    if q.dtype != torch.bfloat16:
-        raise TypeError(f"q must be bf16, got {q.dtype}")
-    if kv.dtype != torch.bfloat16:
-        raise TypeError(f"kv must be bf16, got {kv.dtype}")
-    if kv_weight.dtype != torch.bfloat16:
-        raise TypeError(f"kv_weight must be bf16, got {kv_weight.dtype}")
-    if kv.stride(-1) != 1:
-        raise ValueError(f"kv must be dense in the last dim, stride={kv.stride()}")
-    if kv.stride(0) % 2 != 0:
-        raise ValueError(
-            "kv row stride (in bf16 elements) must be even for dword-cast "
-            f"buffer loads, got kv.stride(0)={kv.stride(0)}"
-        )
-    if positions.dtype != torch.int64:
-        raise TypeError(f"positions must be int64, got {positions.dtype}")
-    if scale_dtype not in SCALE_DTYPE_OPTIONS:
-        raise ValueError(f"scale_dtype {scale_dtype!r} not in {SCALE_DTYPE_OPTIONS}")
-    if q_weight is not None and q_weight.dtype != torch.bfloat16:
-        raise TypeError(f"q_weight must be bf16, got {q_weight.dtype}")
 
     H, D, RD = num_q_heads, head_dim, rope_head_dim
     T_tok = q.shape[0]
     G = quant_group_size if quant_group_size is not None else D
     NG = D // G
-    if D % G != 0:
-        raise ValueError(f"head_dim {D} must be divisible by quant_group_size {G}")
     q_weighted = q_weight is not None
     q_weight_arg = q_weight if q_weighted else kv_weight
 
@@ -2122,14 +2105,6 @@ def flydsl_qk_norm_rope_quant_gfx1250(
                 f"(stride(-1)==1 and stride(-2)==D={D}), got stride={q_view.stride()}"
             )
 
-    if cos_cache.shape[-1] != RD // 2:
-        raise ValueError(
-            f"cos_cache last dim {cos_cache.shape[-1]} != RD/2 ({RD // 2})"
-        )
-    if sin_cache.shape != cos_cache.shape:
-        raise ValueError("cos/sin shape mismatch")
-    if not (cos_cache.is_contiguous() and sin_cache.is_contiguous()):
-        raise ValueError("cos/sin must be contiguous")
     cos_2d = cos_cache.view(cos_cache.shape[0], RD // 2)
     sin_2d = sin_cache.view(sin_cache.shape[0], RD // 2)
 
@@ -2157,8 +2132,6 @@ def flydsl_qk_norm_rope_quant_gfx1250(
     # ---- Fused SWA cache-write (BF16 only) ----
     paged = swa_block_tables is not None
     kv_write = swa_kv is not None
-    if kv_write and quant:
-        raise ValueError("kv_write (swa_kv) is BF16 only; not supported with quant")
     if kv_write:
         if batch_id_per_token is None:
             raise ValueError("kv_write requires batch_id_per_token")
