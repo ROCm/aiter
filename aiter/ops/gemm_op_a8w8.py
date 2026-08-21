@@ -148,7 +148,7 @@ def _parse_flydsl_kernel_name(kernel_name: str):
 
     m = re.match(
         r"flydsl_bpreshuflle_(\d+)x(\d+)x(\d+)_\w+_\w+_\w+_(\d+)x(\d+)(?:x(\d+))?(?:x(\d+))?"
-        r"(?:_([A-Za-z][A-Za-z0-9]*))?(?:_ks(\d+))?$",
+        r"(?:_(?!ks\d+$)([A-Za-z][A-Za-z0-9]*))?(?:_ks(\d+))?$",
         kernel_name,
     )
     if m is None:

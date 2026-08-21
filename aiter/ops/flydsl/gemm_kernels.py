@@ -1084,7 +1084,9 @@ def flydsl_preshuffle_gemm_a8(
     # The layout-API launcher (PR #754) takes fx.Tensor args (it builds views via
     # fx.get_iter/make_view), so pass flat torch tensors directly rather than raw
     # pointers.
-    stream = fx.Stream(torch.cuda.current_stream())
+    # Bind the stream to the tensors' device: the process-global current
+    # device may differ, and this stream drives both launches below.
+    stream = fx.Stream(torch.cuda.current_stream(device=Out.device))
     _run_compiled(
         exe,
         (gemm_dst if gemm_dst is not None else out_contig).view(-1),

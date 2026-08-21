@@ -84,7 +84,7 @@ _PRESHUFFLE_RE = re.compile(
     r"(?P<tile_m>\d+)x(?P<tile_n>\d+)x(?P<tile_k>\d+)_"
     r"(?P<qa>[A-Z0-9]+)_(?P<qw>[A-Z0-9]+)_(?P<out>[A-Z0-9]+)_"
     r"(?P<async_copy>\d+)x(?P<waves_per_eu>\d+)(?:x(?P<xcd_swizzle>\d+))?(?:x(?P<lds_stage>\d+))?_"
-    r"(?P<scheduler>[A-Za-z][A-Za-z0-9]*)"
+    r"(?!ks\d+$)(?P<scheduler>[A-Za-z][A-Za-z0-9]*)"
     # Trailing _ksN, emitted only for k_split > 1, so pre-split-K names still
     # match. Without it they fail fullmatch and drop out of the AOT build.
     r"(?:_ks(?P<k_split>\d+))?$"
