@@ -67,6 +67,23 @@ class TDMGatherDescriptor:
     dgroup3: object  # vector<4xi32> MLIR Value — row indices [4..7] or [8..15]
 
 
+def _byte_offset_to_i64(offset):
+    """Widen a caller byte offset to i64.
+
+    Accepts a python int, an ``index`` value, or any narrower integer value, so
+    kernel bodies can pass a plain expression instead of wrapping it in an
+    ``index_cast`` just to satisfy this boundary.
+    """
+    if isinstance(offset, int):
+        return arith.constant(offset, type=T.i64)
+    raw = _raw(offset)
+    if isinstance(raw.type, ir.IndexType):
+        return arith.index_cast(T.i64, raw)
+    if raw.type == T.i64:
+        return _ArithValue(raw)
+    return _ArithValue(std_arith.ExtUIOp(T.i64, raw).result)
+
+
 def _zero_dgroup_v8i32():
     z = as_ir_value(arith.constant(0, type=T.i32))
     return vector.from_elements(T.vec(8, T.i32), [z, z, z, z, z, z, z, z])
@@ -274,8 +291,7 @@ def make_tensor_gather_dgroup0(
     glb_ptr = _fly_d.extract_aligned_pointer_as_index(glb_ptr_type, a_raw)
     glb_base_i64 = _ArithValue(llvm_dialect.ptrtoint(i64, glb_ptr))
     if global_byte_offset is not None:
-        glb_byte_off_i64 = arith.index_cast(T.i64, global_byte_offset)
-        glb_base_i64 = glb_base_i64 + glb_byte_off_i64
+        glb_base_i64 = glb_base_i64 + _byte_offset_to_i64(global_byte_offset)
 
     # lds_memref accepts, in priority order:
     #   * an already-resolved LDS base index (e.g. from a pointer-based

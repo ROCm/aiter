@@ -45,10 +45,10 @@ from .config import (
     _WAVE_SIZE as WAVE,
 )
 
-# The cross-device xdb barrier is inlined per kernel rather than shared with
-# dispatch: FlyDSL only AST-rewrites dynamic `if` in the @flyc.kernel body, not in
-# called helpers, so a helper's `if <lane predicate>:` would raise "cannot evaluate
-# dynamic Boolean" at trace time.
+# The cross-device xdb barrier is combine's own, not shared with dispatch's: it
+# waits on monotonic per-rank phase slots, while dispatch gates on a grid-wide
+# disp_bar count and then hands each peer its recv_num. Different state, so nothing
+# to factor out.
 
 
 def _V2BF16():

@@ -301,7 +301,7 @@ def build_moe_topids_to_rows_g2l_module(weight_dtype="bf16"):
                 alignment=4,
             ).result
             row = fx.Uint32(slot) + eff_e * fx.Uint32(max_m)
-            row_out = arith.select(_raw(is_drop), dropped_row, _raw(row))
+            row_out = is_drop.select(dropped_row, row)
             buffer_ops.buffer_store(row_out, out_rsrc, route)
 
     @flyc.jit
@@ -494,7 +494,7 @@ def build_moe_route_g2l_lds_module(weight_dtype="bf16"):
         if in_range:
             base = fx.Uint32(_lds_load(lds_cnt, eff_e))
             row = base + my_rank + eff_e * fx.Uint32(max_m)
-            row_out = arith.select(_raw(is_drop), dropped_row, _raw(row))
+            row_out = is_drop.select(dropped_row, row)
             buffer_ops.buffer_store(row_out, out_rsrc, route)
 
     @flyc.jit
@@ -685,7 +685,7 @@ def build_moe_route_g2l_fused_module(weight_dtype="bf16"):
                 alignment=4,
             ).result
             row = fx.Uint32(slot) + eff_e * fx.Uint32(max_m)
-            row_out = arith.select(_raw(is_drop), dropped_row, _raw(row))
+            row_out = is_drop.select(dropped_row, row)
             buffer_ops.buffer_store(row_out, out_rsrc, route)
 
     @flyc.jit

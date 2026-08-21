@@ -20,7 +20,7 @@ import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as _llvm_d
 from flydsl._mlir.dialects import rocdl as _rocdl_d
-from flydsl._mlir.dialects import scf
+from flydsl.compiler.ast_rewriter import ASTRewriter
 from flydsl.expr import arith
 from flydsl.expr.typing import T
 
@@ -45,6 +45,7 @@ __all__ = [
     "spin_until_gt_i32",
     "store_i32_system",
     "store_i64_global_system",
+    "traced",
     "waitcnt_all",
 ]
 
@@ -64,8 +65,15 @@ def _ptr_plus(base_i64, offset, elem_bytes):
     return _to_ptr_global(addr)
 
 
-def _unwrap(v):
-    return v.ir_value() if hasattr(v, "ir_value") else v
+def traced(fn):
+    """Run FlyDSL's AST rewriting over a helper that kernel bodies call.
+
+    ``@flyc.kernel`` and ``@flyc.jit`` apply this same transform to their own
+    source but do not recurse into callees, so a helper that wants ``if`` /
+    ``while`` over traced values (rather than a host-side truthiness test) has
+    to opt in.
+    """
+    return ASTRewriter.transform(fn)
 
 
 def waitcnt_all():
@@ -112,37 +120,31 @@ def load_v4i32_nt(base_i64, offset):
     ).res
 
 
-def _spin(addr_i64, keep_waiting, *, width=32):
-    """Spin on a volatile load until ``keep_waiting`` becomes false."""
-    if width == 64:
-        ty, load, wrap = T.i64, load_i64_acquire, fx.Int64
-    else:
-        ty, load, wrap = T.i32, load_i32_acquire, fx.Int32
-    loop = scf.WhileOp([ty], [_unwrap(load(addr_i64))])
-    cond = ir.Block.create_at_start(loop.before, [ty])
-    body = ir.Block.create_at_start(loop.after, [ty])
-    with ir.InsertionPoint(cond):
-        scf.ConditionOp(
-            _unwrap(keep_waiting(wrap(cond.arguments[0]))), [cond.arguments[0]]
-        )
-    with ir.InsertionPoint(body):
-        scf.YieldOp([_unwrap(load(addr_i64))])
-    return wrap(loop.results[0])
-
-
+@traced
 def spin_until_ge_i64(addr_i64, val):
     """Spin until a monotonic cross-device i64 flag is at least ``val``."""
-    return _spin(addr_i64, lambda cur: cur < fx.Int64(val), width=64)
+    cur = fx.Int64(load_i64_acquire(addr_i64))
+    while cur < fx.Int64(val):
+        cur = fx.Int64(load_i64_acquire(addr_i64))
+    return cur
 
 
+@traced
 def spin_until_eq_i32(addr_i64, val):
     """Spin until an i32 flag equals ``val``."""
-    return _spin(addr_i64, lambda cur: cur != fx.Int32(val))
+    cur = fx.Int32(load_i32_acquire(addr_i64))
+    while cur != fx.Int32(val):
+        cur = fx.Int32(load_i32_acquire(addr_i64))
+    return cur
 
 
+@traced
 def spin_until_gt_i32(addr_i64, val):
     """Spin until an i32 flag exceeds ``val`` and return the observed value."""
-    return _spin(addr_i64, lambda cur: cur <= fx.Int32(val))
+    cur = fx.Int32(load_i32_acquire(addr_i64))
+    while cur <= fx.Int32(val):
+        cur = fx.Int32(load_i32_acquire(addr_i64))
+    return cur
 
 
 def store_i32_system(addr_i64, offset, val):

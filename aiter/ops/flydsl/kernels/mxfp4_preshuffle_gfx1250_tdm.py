@@ -1331,7 +1331,7 @@ def launch_gemm_a8w4_tdm(
                     (tile_m, STORE_PITCH),
                     (STORE_PITCH, 1),
                 )
-                _gboff = arith.index_cast(T.index, blk_n * elem_bytes)
+                _gboff = blk_n * elem_bytes
                 for g in range_constexpr(_ngrp):
                     base_row = g * _GRP
                     if wave == g % num_waves:
@@ -1391,6 +1391,8 @@ def launch_gemm_a8w4_tdm(
                         (STORE_N, 1),
                     )
                 else:
+                    # The LDS tile is (tile_m, STORE_PITCH) dense; the per-dim OOB
+                    # extent clamps the inner axis to STORE_N so the pad never lands.
                     gtC = global_view(
                         c_iter, c_off_rt, (tile_m, STORE_PITCH), (out_stride, 1)
                     )

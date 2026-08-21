@@ -58,10 +58,10 @@ _DISP_NSTREAMS = 4
 _MAIN_STRIDE_I32 = _DISP_NSTREAMS * _LANE_STRIDE_I32
 _BUTTERFLY_OFFSETS = tuple(WAVE >> i for i in range(1, LOG2_WAVE + 1))
 
-# The cross-device barrier is inlined per kernel rather than shared with combine:
-# FlyDSL only AST-rewrites dynamic `if` in the @flyc.kernel body, not in called
-# helpers, so a helper's `if <lane predicate>:` would raise "cannot evaluate
-# dynamic Boolean" at trace time.
+# Dispatch's cross-device barrier is not shared with combine's: this one gates on
+# a grid-wide disp_bar count and then hands each peer its recv_num, while combine
+# waits on monotonic per-rank phase slots. Different state, so nothing to factor
+# out.
 
 
 def _make_dispatch(
