@@ -56,7 +56,7 @@ def mxfp4_moe_sort(
     m_indices: Tensor,
     bf16_zero_out: Tensor,
     bf16_zero_workspace: Tensor,
-    sort3s_workspace: Tensor,
+    sort3stage_ws: Tensor,
     M_logical: int,
     NE: int,
     TOPK: int,

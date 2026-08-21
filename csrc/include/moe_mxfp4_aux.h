@@ -36,7 +36,7 @@ void mxfp4_moe_sort_kernel(
     aiter_tensor_t& m_indices,
     aiter_tensor_t& bf16_zero_out,
     aiter_tensor_t& bf16_zero_workspace,
-    aiter_tensor_t& sort3s_workspace,
+    aiter_tensor_t& sort3stage_ws,
     int64_t M_logical,
     int64_t NE,
     int64_t TOPK,

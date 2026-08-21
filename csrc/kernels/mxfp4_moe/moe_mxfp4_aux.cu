@@ -128,7 +128,7 @@ void mxfp4_moe_sort_kernel(
     aiter_tensor_t& m_indices,
     aiter_tensor_t& bf16_zero_out,
     aiter_tensor_t& bf16_zero_workspace,
-    aiter_tensor_t& sort3s_workspace,
+    aiter_tensor_t& sort3stage_ws,
     int64_t M_logical,
     int64_t NE,
     int64_t TOPK,
@@ -154,9 +154,9 @@ void mxfp4_moe_sort_kernel(
     if (prologue == 1 /* threestage */) {
         // Caller-provided int32 scratch (was torch::empty here before de-torch):
         // block_offsets[NE*kSplitSortCtas] followed by real_counts[NE].
-        AITER_CHECK(sort3s_workspace.numel() >= (size_t)(NE * kSplitSortCtas + NE),
-                    "mxfp4_moe_sort (threestage): sort3s_workspace too small");
-        int32_t* block_offsets = static_cast<int32_t*>(sort3s_workspace.data_ptr());
+        AITER_CHECK(sort3stage_ws.numel() >= (size_t)(NE * kSplitSortCtas + NE),
+                    "mxfp4_moe_sort (threestage): sort3stage_ws too small");
+        int32_t* block_offsets = static_cast<int32_t*>(sort3stage_ws.data_ptr());
         int32_t* real_counts   = block_offsets + NE * kSplitSortCtas;
 
         const std::string key = "aux_sort3s_NE" + std::to_string(NE)
