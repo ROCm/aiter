@@ -1,49 +1,182 @@
-# Known correctness issues in the pre-compiled (`.co`) a16w16 families
+# Pre-compiled (`.co`) a16w16 families: constraints and resolved defects
 
-Two fixed, two open and guarded. The two open ones cannot ship: a
-`static_assert` refuses the configuration. The fixed ones both produced **wrong
-results, not faults**, so only a numeric check saw them — recorded so the next
-session starts from the reproducers rather than the symptom.
+Two constraints are open, two defects were found and fixed. Neither open
+constraint can ship a wrong answer — a `static_assert` refuses the
+configuration — and both have been priced and declined rather than merely left
+undone; the verdicts and their numbers are below. The resolved sections stay
+because what they cost to find is in the reproducers and the dead ends, not in
+the fix.
 
 Applies to `a16w16_4wave_co` (reference, `..._4wave_compute_...cuh`) and
-`a16w16_4wave_wl_co` (`..._4wave_wl_...cuh`) unless noted.
+`a16w16_4wave_wl_co` (`..._4wave_wl_...cuh`) unless noted. Numbering is stable;
+commits and `README.md` refer to these by number.
 
 | | what | status |
 |---|---|---|
 | 1 | ring-buffer WAR + zero-extent TDM zero-fill | fixed, shipped in the tracked `.co` |
-| 2 | `B_K > 128` with more than one msb group | open, `static_assert` |
-| 3 | `kExpM == 1` leaves no room for the handshake | open, `static_assert` |
+| 2 | `B_K > 128` with more than one msb group | open, `static_assert`; **declined**, blocks nothing that wins |
+| 3 | `kExpM == 1` leaves no room for the handshake | open, `static_assert`; **declined**, measured below the budget floor |
 | 4 | tuner silently never nominated the `wl` family | fixed |
+
+One decision is still genuinely open: whether the 1-WG/CU LDS pad should go.
 
 ---
 
-## 1. Narrow `B_N` raced at large shapes — CAUSED BY TWO BUGS, BOTH FOUND
+## Open constraints
 
-**Status:** fixed. Two independent bugs, both found and both fixed in the
-pipelines (see "The two bugs"), and the tracked `.co` are built from those
-pipelines. With the pad off and the fixes in, all 204 variants are clean at
-2–3 WG/CU over 400 repeats.
+### 2. `B_K > 128` together with more than one msb group
 
-The 1-WG/CU pad is still applied on top. It is no longer load-bearing for
-correctness — it is belt-and-braces over a race that is understood and closed —
-but dropping it is a separate performance question, and the answer is per kid
-rather than per shape (see "Should the pad go?"), so it stays until the table
-carries both variants and tuning can choose.
+**Status:** open, **guarded** by a `static_assert` in
+`opus_gemm_pipeline_a16w16_4wave_wl_gfx1250.cuh`, so it cannot silently ship.
+Only the `wl` family can express it.
 
-Non-deterministic wrong results: same seed, same data, the wrong-element count
-changed every run, including runs that came out clean.
+```
+kHalvesPerSlot > 2  &&  kNumNSub > 1   ->  ~2/3 of output elements wrong
+```
+
+Deterministic; reproduces on 10/10 sampled configurations from a clean build.
+Either factor alone is fine: `128x64x256` (kHalves 4, kNumNSub 1) and
+`96x96x128` (kHalves 2, kNumNSub 3) both verify.
+
+Ruled out:
+
+* **not a ds-count race** — forcing `s_wait_dscnt(0)` at every tile top gives
+  bit-identical wrong output;
+* **not the main K loop** — reproduces with `k_steps == 1`, i.e. prologue plus
+  the peeled step only;
+* **not non-determinism** — 20 repeats give the same bad count.
+
+**Reproducer:** `96x96x256`, `wave_layout 2x2`, `P=3`, `cluster 4x4`, at `512^3`
+(~68% of elements wrong). Builds in ~3 s.
+
+---
+
+
+### 3. `kExpM == 1` — no room for the barrier handshake
+
+**Status:** guarded by `static_assert`, not a silent failure.
+
+`B_M / (16 * TileM) == 1` leaves the prefetch window occupying the whole tile,
+so there is nowhere ahead of it for the handshake. Fixing it means moving the
+handshake into the previous tile — a restructure, not a constant. This is what
+keeps `B_M = 16` out of reach even under the `1x4` layout (`B_M >= 32`).
+
+
+### Why neither is worth fixing
+
+Measured before spending a restructure on it. Take the 38 shapes of the 84-shape
+DSV4 sweep whose winner was a JIT `_ws` kid, and ask of each winning tile whether
+the `.co` pipeline could express it:
+
+| | shapes | |
+|---|--:|---|
+| legal today, simply had no entry | 25 | mostly `B_K = 256`, which the family had none of |
+| blocked by issue 3 (`kExpM == 1`) | 10 | `32x32x*` needs `w2x2`; `16x64x256` needs `TileM=1` |
+| blocked by issue 2 | **0** | every winning `B_K=256` tile has `kNSub == 1` already |
+| geometrically impossible | 3 | `B_N = 32` has no legal layout |
+
+So **issue 2 blocks nothing that won anything** — it is missing expressiveness,
+not a missing win. And most of what issue 3 blocks is a duplicate: the same tile
+under a different `wave_layout` is legal (`64x64x128 w4x1` is refused, `w1x4` and
+`w2x2` are not). What only issue 3 can unlock is `B_M = 16`, which needs
+`TileM = 1` and therefore `kExpM = 1`.
+
+The first row is the one that paid. Adding 15 entries — `64x64x256` in two
+layouts, `32x64x256` in one, five clusters each, no code change — and re-tuning
+those 12 shapes moved 8 of them to `wl_co`, 1.156x geomean and up to 1.331x, and
+took the group from 7/12 to 12/12 against triton.
+
+The four it did **not** take are the useful part of that result: all four run at
+`splitK` 2–5, and no `.co` family supports split-K. The eight it took are at
+`splitK` 0 or 1. A `.co` entry can only win a shape that does not want split-K.
+
+A second pass found 10 more shapes that could also reach the new tiles but had
+not been re-tuned — adding candidates does nothing for a shape nobody re-tunes.
+All 10 improved, 8/10 to 10/10 against triton.
+
+
+### The probe that settled issue 3
+
+The occupancy case for `B_M = 16` is real. Eight of the 84 shapes cannot be
+filled by any legal `.co` tile without split-K, and `B_M = 16` would fill them;
+they sit at `splitK` 3–5 for exactly that reason, so the family's usual
+split-K handicap would not apply to them.
+
+What kills it is the scheduling budget. This pipeline hides its ds_reads, its
+handshake and its TDM issue in the gaps between WMMAs, and a K step only has
+`(B_K/64) * kNumNSub * kExpM * kExpNPerSub * kExpKHalf` of them. Every `.co`
+kernel that wins a shape today has **at least 16**:
+
+| tile | WMMA / K step | shapes won |
+|---|--:|--:|
+| `128x256x128` | 128 | 26 |
+| `64x64x256`, `64x128x128`, `128x64x128` | 32 | 17 |
+| `32x64x256`, `64x64x128` | 16 | 7 |
+| `32x64x128` | 8 | **0** |
+
+That last row is measured, not extrapolated. `32x64x128 w1x4` is legal today, has
+the same grid as `32x64x256` and therefore the same occupancy, and differs from
+it only in K depth and budget — a controlled comparison of the budget alone.
+Added as a probe and tuned head-to-head on the five shapes `32x64x256` owns, it
+won **none**: 0.975–1.017x, i.e. noise. The probe entries were then removed.
+
+`B_M = 16` reaches 8 with `B_K = 256` and 4 with `B_K = 128`, at or below the
+level that just failed. Widening `B_N` to buy budget halves the grid and hands
+the occupancy back, so there is no way out of the trade. Those eight shapes
+belong to the `_ws` families, which are built for small tiles and can split K.
+
+---
+
+
+### Still open: should the 1-WG/CU pad go?
+
+Separate question, and the answer is per kid rather than per shape. No pad +
+fixes against the shipped padded build, same interleaved method:
+
+| shape | mean | per-kid p10 / median / p90 |
+|---|---|---|
+| `2048x2048x7168` | +9.2% | -11.5% / +9.5% / +39.6% |
+| `4096x4096x2048` | +5.8% | -15.3% / +4.3% / +40.9% |
+| `4096x4096x1024` | **-15.6%** | -26.4% / -12.9% / +1.2% |
+
+A spread from -26% to +41% within one shape is exactly what the kid table plus
+the tuner exist for: add the 61 entries a second time carrying
+`-DOPUS_CO_NO_1WG_PAD` and a `variant` suffix, and let tuning pick. Not done.
+
+`build_co.py` now appends `--device-flag` to every entry's own flags and
+`_expected_lds` takes the resulting `no_pad`, so a whole-family no-pad rebuild
+passes the LDS check instead of failing it. That is the command-line path only —
+per-entry no-pad variants would need `_expected_lds` to read the flag off the
+entry as well.
+
+The contrast that pins it: waiting one short of what the slot needs
+(`s_wait_tensorcnt(kSlots - 1)`), so the step genuinely reads a fill still in
+flight, produces ~3.2 M wrong elements across 1020 of 1024 tiles, whole tiles,
+both operands, every run — nothing like the failure being diagnosed. So it was
+never the counted `s_wait_tensorcnt` failing to cover its slot.
+
+
+---
+
+## Resolved
+
+### 1. Narrow `B_N` raced at large shapes — two bugs, both fixed
+
+**Status:** fixed, and the tracked `.co` are built from the fixed pipelines.
+With the pad off and the fixes in, all 204 variants were clean at 2–3 WG/CU over
+400 repeats.
+
+The symptom was non-deterministic wrong results — same seed, same data, a
+different wrong-element count every run, including runs that came out clean:
 
 ```
 kid 21182  64x64x128 w1x4 c4x1  @ 2048x2048x7168   (before the fix)
   rep0 nbad=25416   rep1 nbad=24602   rep2 nbad=33105
 ```
 
-**What is established.** This pipeline is only correct at one workgroup per CU.
-Any tile whose A/B LDS segments fit twice in the 320 KB budget (<= 160 KB) let a
-second workgroup co-reside, and every such variant raced.
-
-VGPR and LDS both scale with the tile, so the raw correlation cannot separate
-them — but the population contains the control group that does:
+**The control group that localised it.** VGPR and LDS both scale with the tile,
+so the raw correlation cannot separate them, but the population splits three
+ways:
 
 | group | n | LDS admits 2 WG | VGPR admits 2 WG | occupancy | result |
 |---|--:|---|---|---|---|
@@ -52,42 +185,18 @@ them — but the population contains the control group that does:
 | C | 72 | no | no (2xVGPR > 1024) | 1 WG/CU | all correct |
 
 A and B differ **only** in the LDS-driven occupancy — both would allow two waves
-per SIMD on registers alone. A is entirely wrong and B entirely correct, so the
-variable is workgroups-per-CU, not tile size or register pressure.
+per SIMD on registers alone — so the variable is workgroups-per-CU, not tile size
+or register pressure.
 
-**It IS a synchronization bug, and the damage geometry says which edge.** An
-earlier reading in this file said it was not, on the strength of a "maximal
-sync" experiment recorded as not helping. Re-run against the current tree,
-maximal sync (`s_wait_tensorcnt(0)` + `s_wait_dscnt(0)` + a full barrier at
-every tile) gives 0/61 on both shapes.
+**The damage geometry named the edge.** At `2048x2048x7168`, across four variants
+and twelve failing runs, every failure touched exactly one tile, spanned all of
+its M rows, sat in a short prefix of wave 3's half of B — the last region read in
+a K step, never wave 2's half and never A — and carried roughly an eighth of one
+K step's contribution. A standalone probe that samples LDS mid-transfer shows the
+engine filling rows in **ascending** order, so a reader that is early misses a
+region's tail while a writer that is early clobbers its head. The damage was at
+the head of the last-read region: a write-after-read.
 
-What the wrong elements look like is what localises it. With the pad off, at
-`2048x2048x7168`, `tol = 4` against a noise floor of 1.0, across four variants
-and twelve failing runs, every single one:
-
-* touches exactly **one tile**, i.e. one workgroup;
-* spans **all** of that tile's M rows;
-* is confined in N to `[B_N/2, B_N/2 + a few)` — a short **prefix of wave 3's
-  half of B**, never wave 2's half, never A;
-* carries an error of ~7.6 against a `|ref|` of ~54 at those positions, where
-  one whole K step contributes ~60 — so roughly an eighth of one step, about 16
-  of the 128 K elements in a row.
-
-Read that back into the pipeline. Wave 2 and wave 3 load the two halves of B's
-`B_N` rows; the tile walk takes the N sub-groups in order, so wave 3's half is
-the **last** region read in a K step.
-
-Fill order decides what that means, and it is measured, not assumed: a
-standalone probe that samples LDS mid-transfer (`s_sleep` instead of
-`s_wait_tensorcnt`, sweeping the delay) shows the engine filling **rows in
-ascending order** — at one delay step, rows 0..21 of a 32-row tile had landed
-and 22..31 had not. So a reader that is too early misses the **tail** of a
-region, while a writer that is too early clobbers its **head**.
-
-The damage is at the head, sub-row, in the last-read region. That is a
-write-after-read: the step refills the very slot it is reading (slot g%P is
-consumed by step g and reloaded at its end for step g+P), and the refill lands
-while a `ds_read` of that slot is still in flight.
 
 ### The two bugs
 
@@ -144,6 +253,7 @@ x 200 repeats at `4096x4096x1024` and `4096x4096x2048`. Without a co-resident
 workgroup the trailing transfer lands long before the staging, and the ring's
 refill lands long after the reads.
 
+
 ### What the fixes cost
 
 Measure this box's A/B by **interleaving** the two builds and taking a median
@@ -167,34 +277,40 @@ the 61 variants:
 
 So about 2%, uniformly, for two real races.
 
-### Should the pad go?
 
-Separate question, and the answer is per kid rather than per shape. No pad +
-fixes against the shipped padded build, same interleaved method:
+### 4. The tuner silently never nominated the `wl` family
 
-| shape | mean | per-kid p10 / median / p90 |
-|---|---|---|
-| `2048x2048x7168` | +9.2% | -11.5% / +9.5% / +39.6% |
-| `4096x4096x2048` | +5.8% | -15.3% / +4.3% / +40.9% |
-| `4096x4096x1024` | **-15.6%** | -26.4% / -12.9% / +1.2% |
+**Status:** fixed in `opus_gemm_tune.py`. Not a kernel bug, but it belongs here
+because it failed the same way the others do: quietly, and only a measurement
+saw it.
 
-A spread from -26% to +41% within one shape is exactly what the kid table plus
-the tuner exist for: add the 61 entries a second time carrying
-`-DOPUS_CO_NO_1WG_PAD` and a `variant` suffix, and let tuning pick. Not done.
+`kid_rejects_shape` answered `a16w16_4wave_co` early — no buffer resource, every
+tail clamped by the D#, so no M/N/K alignment applies — and named only that tag.
+`a16w16_4wave_wl_co` fell through to the rules below it, where a gfx942
+whitelist, `BF16WS_EXACT_REDUCE_SHAPES`, refuses any `N` outside
+`{64,128,256,512,1024,2048}` for a kid that "uses a bf16 workspace". The wl kids
+have no workspace at all; they matched because `splitk_workspace_dtype` is a
+field on every instance and its default had become `bf16_t`.
 
-`build_co.py` now appends `--device-flag` to every entry's own flags and
-`_expected_lds` takes the resulting `no_pad`, so a whole-family no-pad rebuild
-passes the LDS check instead of failing it. That is the command-line path only —
-per-entry no-pad variants would need `_expected_lds` to read the flag off the
-entry as well.
+All 140 wl kids were therefore rejected at `N = 384 / 32320 / 129280`, and the
+same rule took the `_ws` split-K families with them. At `256x384x7168` that left
+**6 of 106 candidates, all one tile, none with split-K**, which the tuner then
+reported as a flat ~25 us floor that did not scale with M — indistinguishable
+from a slow kernel. With the family restored the same shape tunes to 7.0 us, and
+across the 21 affected shapes opus gains 1.29x geomean, up to 3.65x.
 
-The contrast that pins it: waiting one short of what the slot needs
-(`s_wait_tensorcnt(kSlots - 1)`), so the step genuinely reads a fill still in
-flight, produces ~3.2 M wrong elements across 1020 of 1024 tiles, whole tiles,
-both operands, every run — nothing like the failure being diagnosed. So it was
-never the counted `s_wait_tensorcnt` failing to cover its slot.
+The trap worth remembering: **a candidate that was never nominated reads exactly
+like a candidate that lost.** Nothing in the tuner's output distinguishes them.
+When a shape looks structurally slow, count the candidates before profiling the
+winner — `candidate_kids_for_shape` minus `kid_rejects_shape` should not be
+throwing away most of the set.
 
-### Dead ends, so they are not walked twice
+---
+
+
+---
+
+## Dead ends, so they are not walked twice
 
 * **The TDM descriptor's LDS base.** `make_tdm` is handed
   `reinterpret_cast<uintptr_t>(smem_a)`, a *workgroup-relative* offset, so if the
@@ -245,134 +361,6 @@ nothing about a race, and should have pointed at non-determinism sooner.
 
 ---
 
-## 2. `B_K > 128` together with more than one msb group
-
-**Status:** open, **guarded** by a `static_assert` in
-`opus_gemm_pipeline_a16w16_4wave_wl_gfx1250.cuh`, so it cannot silently ship.
-Only the `wl` family can express it.
-
-```
-kHalvesPerSlot > 2  &&  kNumNSub > 1   ->  ~2/3 of output elements wrong
-```
-
-Deterministic; reproduces on 10/10 sampled configurations from a clean build.
-Either factor alone is fine: `128x64x256` (kHalves 4, kNumNSub 1) and
-`96x96x128` (kHalves 2, kNumNSub 3) both verify.
-
-Ruled out:
-
-* **not a ds-count race** — forcing `s_wait_dscnt(0)` at every tile top gives
-  bit-identical wrong output;
-* **not the main K loop** — reproduces with `k_steps == 1`, i.e. prologue plus
-  the peeled step only;
-* **not non-determinism** — 20 repeats give the same bad count.
-
-**Reproducer:** `96x96x256`, `wave_layout 2x2`, `P=3`, `cluster 4x4`, at `512^3`
-(~68% of elements wrong). Builds in ~3 s.
-
----
-
-## 3. `kExpM == 1` — no room for the barrier handshake
-
-**Status:** guarded by `static_assert`, not a silent failure.
-
-`B_M / (16 * TileM) == 1` leaves the prefetch window occupying the whole tile,
-so there is nowhere ahead of it for the handshake. Fixing it means moving the
-handshake into the previous tile — a restructure, not a constant. This is what
-keeps `B_M = 16` out of reach even under the `1x4` layout (`B_M >= 32`).
-
-### What 2 and 3 are actually worth
-
-Measured before spending a restructure on it. Take the 38 shapes of the 84-shape
-DSV4 sweep whose winner was a JIT `_ws` kid, and ask of each winning tile whether
-the `.co` pipeline could express it:
-
-| | shapes | |
-|---|--:|---|
-| legal today, simply had no entry | 25 | mostly `B_K = 256`, which the family had none of |
-| blocked by issue 3 (`kExpM == 1`) | 10 | `32x32x*` needs `w2x2`; `16x64x256` needs `TileM=1` |
-| blocked by issue 2 | **0** | every winning `B_K=256` tile has `kNSub == 1` already |
-| geometrically impossible | 3 | `B_N = 32` has no legal layout |
-
-So **issue 2 blocks nothing that won anything** — it is missing expressiveness,
-not a missing win. And most of what issue 3 blocks is a duplicate: the same tile
-under a different `wave_layout` is legal (`64x64x128 w4x1` is refused, `w1x4` and
-`w2x2` are not). What only issue 3 can unlock is `B_M = 16`, which needs
-`TileM = 1` and therefore `kExpM = 1`.
-
-The first row is the one that paid. Adding 15 entries — `64x64x256` in two
-layouts, `32x64x256` in one, five clusters each, no code change — and re-tuning
-those 12 shapes moved 8 of them to `wl_co`, 1.156x geomean and up to 1.331x, and
-took the group from 7/12 to 12/12 against triton.
-
-The four it did **not** take are the useful part of that result: all four run at
-`splitK` 2–5, and no `.co` family supports split-K. The eight it took are at
-`splitK` 0 or 1. A `.co` entry can only win a shape that does not want split-K.
-
-A second pass found 10 more shapes that could also reach the new tiles but had
-not been re-tuned — adding candidates does nothing for a shape nobody re-tunes.
-All 10 improved, 8/10 to 10/10 against triton.
-
-### Issue 3 is not worth fixing, and there is a probe that says so
-
-The occupancy case for `B_M = 16` is real. Eight of the 84 shapes cannot be
-filled by any legal `.co` tile without split-K, and `B_M = 16` would fill them;
-they sit at `splitK` 3–5 for exactly that reason, so the family's usual
-split-K handicap would not apply to them.
-
-What kills it is the scheduling budget. This pipeline hides its ds_reads, its
-handshake and its TDM issue in the gaps between WMMAs, and a K step only has
-`(B_K/64) * kNumNSub * kExpM * kExpNPerSub * kExpKHalf` of them. Every `.co`
-kernel that wins a shape today has **at least 16**:
-
-| tile | WMMA / K step | shapes won |
-|---|--:|--:|
-| `128x256x128` | 128 | 26 |
-| `64x64x256`, `64x128x128`, `128x64x128` | 32 | 17 |
-| `32x64x256`, `64x64x128` | 16 | 7 |
-| `32x64x128` | 8 | **0** |
-
-That last row is measured, not extrapolated. `32x64x128 w1x4` is legal today, has
-the same grid as `32x64x256` and therefore the same occupancy, and differs from
-it only in K depth and budget — a controlled comparison of the budget alone.
-Added as a probe and tuned head-to-head on the five shapes `32x64x256` owns, it
-won **none**: 0.975–1.017x, i.e. noise. The probe entries were then removed.
-
-`B_M = 16` reaches 8 with `B_K = 256` and 4 with `B_K = 128`, at or below the
-level that just failed. Widening `B_N` to buy budget halves the grid and hands
-the occupancy back, so there is no way out of the trade. Those eight shapes
-belong to the `_ws` families, which are built for small tiles and can split K.
-
----
-
-## 4. The tuner silently never nominated the `wl` family — FIXED
-
-**Status:** fixed in `opus_gemm_tune.py`. Not a kernel bug, but it belongs here
-because it failed the same way the others do: quietly, and only a measurement
-saw it.
-
-`kid_rejects_shape` answered `a16w16_4wave_co` early — no buffer resource, every
-tail clamped by the D#, so no M/N/K alignment applies — and named only that tag.
-`a16w16_4wave_wl_co` fell through to the rules below it, where a gfx942
-whitelist, `BF16WS_EXACT_REDUCE_SHAPES`, refuses any `N` outside
-`{64,128,256,512,1024,2048}` for a kid that "uses a bf16 workspace". The wl kids
-have no workspace at all; they matched because `splitk_workspace_dtype` is a
-field on every instance and its default had become `bf16_t`.
-
-All 140 wl kids were therefore rejected at `N = 384 / 32320 / 129280`, and the
-same rule took the `_ws` split-K families with them. At `256x384x7168` that left
-**6 of 106 candidates, all one tile, none with split-K**, which the tuner then
-reported as a flat ~25 us floor that did not scale with M — indistinguishable
-from a slow kernel. With the family restored the same shape tunes to 7.0 us, and
-across the 21 affected shapes opus gains 1.29x geomean, up to 3.65x.
-
-The trap worth remembering: **a candidate that was never nominated reads exactly
-like a candidate that lost.** Nothing in the tuner's output distinguishes them.
-When a shape looks structurally slow, count the candidates before profiling the
-winner — `candidate_kids_for_shape` minus `kid_rejects_shape` should not be
-throwing away most of the set.
-
----
 
 ## How to test for these
 

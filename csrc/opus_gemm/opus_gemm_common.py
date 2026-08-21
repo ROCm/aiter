@@ -274,8 +274,14 @@ class OpusGemmInstance:
             # launch_bounds waves-per-EU. Two JSON entries differing in any one
             # of them are two distinct symbols and two distinct .co files; if
             # they differ ONLY in device_flags, co_variant separates them.
-            parts.insert(tag_at, "4wave_wl_co"
-                         if self.kernel_tag == "a16w16_4wave_wl_co" else "4wave_co")
+            parts.insert(
+                tag_at,
+                (
+                    "4wave_wl_co"
+                    if self.kernel_tag == "a16w16_4wave_wl_co"
+                    else "4wave_co"
+                ),
+            )
             # Wave layout only shows up for the family that can vary it, so the
             # 4wave_co names already on disk are untouched.
             if self.kernel_tag == "a16w16_4wave_wl_co":
@@ -1917,23 +1923,26 @@ HEURISTIC_DEFAULT_KIDS_GFX942 = frozenset(
 # must be force-compiled as the always-available (M,N,K) fallback. Every other
 # plain kid and ALL clusterlaunch kids are compiled on demand by the tuner
 # (candidate selection + sidecar expansion), so default builds stay small.
-HEURISTIC_DEFAULT_KIDS_GFX1250 = frozenset(
-    GFX1250_PLAIN_KID_OF[_t]
-    for _t in (
-        (16, 32, 128),
-        (16, 64, 128),
-        (16, 128, 128),
-        (32, 32, 128),
-        (32, 64, 128),
-        (32, 128, 128),
+HEURISTIC_DEFAULT_KIDS_GFX1250 = (
+    frozenset(
+        GFX1250_PLAIN_KID_OF[_t]
+        for _t in (
+            (16, 32, 128),
+            (16, 64, 128),
+            (16, 128, 128),
+            (32, 32, 128),
+            (32, 64, 128),
+            (32, 128, 128),
+        )
+        # The 4wave_co kids are NOT reachable from the C++ shape heuristic; they are
+        # here only for this set's other job -- membership in the subset-compile set
+        # S (gen_instances.py), so the explicit-kernelId path can always reach them.
+        # Their device side is a pre-built .co, so "compiling" one is just the host
+        # launcher: no per-kid device TU is emitted (see the co emit branch in
+        # codegen/gen_instances_gfx1250.py).
     )
-    # The 4wave_co kids are NOT reachable from the C++ shape heuristic; they are
-    # here only for this set's other job -- membership in the subset-compile set
-    # S (gen_instances.py), so the explicit-kernelId path can always reach them.
-    # Their device side is a pre-built .co, so "compiling" one is just the host
-    # launcher: no per-kid device TU is emitted (see the co emit branch in
-    # codegen/gen_instances_gfx1250.py).
-) | GFX1250_4WAVE_CO_KIDS
+    | GFX1250_4WAVE_CO_KIDS
+)
 
 HEURISTIC_DEFAULT_KIDS = (
     HEURISTIC_DEFAULT_KIDS_GFX950

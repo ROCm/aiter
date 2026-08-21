@@ -678,8 +678,16 @@ class opus_gemm_codegen:
                     continue
                 if _kid_arch_common(k) != arch:
                     continue
-                rows.append((int(mnk[0]), int(mnk[1]), int(mnk[2]), k.name,
-                             is_splitk, _ws_partial_ctype(k)))
+                rows.append(
+                    (
+                        int(mnk[0]),
+                        int(mnk[1]),
+                        int(mnk[2]),
+                        k.name,
+                        is_splitk,
+                        _ws_partial_ctype(k),
+                    )
+                )
 
             rows.sort(key=lambda r: (r[0], r[1], r[2]))
             n = len(rows)

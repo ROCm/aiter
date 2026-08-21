@@ -90,9 +90,31 @@ name as `_w{m}x{n}`. |
 | `device_flags` | extra device-pass flags for this entry — there is no global default |
 | `variant` | optional name suffix, for two entries differing ONLY in `device_flags` |
 
-`wave_layout`, `num_vgpr`, `launch_bounds[1]` and `cluster` all land in the symbol
+`wave_layout`, `wave_layout`, `num_vgpr`, `launch_bounds[1]` and `cluster` all land in the symbol
 name (`...[_w{m}x{n}]_c{m}x{n}_p{slots}_v{vgpr}w{waves}[_{variant}]`), so no two
-entries can collide on one `.co`. The loader asserts that, and asserts each `kid` is in band.
+entries can collide on one `.co`.
+
+### Which tiles are worth adding
+
+Two numbers decide it, and both are arithmetic on the entry — no build required.
+
+**Grid.** With no split-K to widen it, `⌈M/B_M⌉ * ⌈N/B_N⌉` is all the parallelism
+a shape gets, and it has to reach the CU count. A tile that leaves the machine
+half idle loses to a `_ws` kid that splits K instead, however good its inner loop
+is.
+
+**WMMA budget.** A K step has
+`(B_K/64) * kNumNSub * kExpM * kExpNPerSub * kExpKHalf` WMMAs, and this pipeline
+hides its ds_reads, its barrier handshake and its TDM issue in the gaps between
+them. Measured over the 84-shape DSV4 sweep, every entry that wins a shape has at
+least **16**; a tile with 8 was added as a probe and won none of the five shapes
+it was aimed at. Below 16, expect nothing.
+
+The two pull against each other — shrinking `B_M`/`B_N` to raise the grid lowers
+the budget — which is why the useful additions are the ones that raise `B_K`
+instead: `B_K = 256` doubles the budget at no cost to the grid. That is what the
+`64x64x256` and `32x64x256` entries are, and they took 8 shapes off the `_ws`
+families when they were added. The loader asserts that, and asserts each `kid` is in band.
 
 A **missing** `co_kernels.json` leaves the family empty rather than breaking the
 build — a data file that failed to ship should cost the co kids, not all of opus.

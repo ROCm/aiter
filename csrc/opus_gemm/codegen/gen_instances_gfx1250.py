@@ -84,8 +84,11 @@ def co_traits_args(k):
         f"{d_a}, {d_b}, {d_c}, {d_acc}, "
         f"{k.cluster_wg_m}, {k.cluster_wg_n}"
         # The wave-layout family takes two more: how the 4 waves tile the block.
-        + (f", {k.co_wave_layout[0]}, {k.co_wave_layout[1]}"
-           if k.kernel_tag == "a16w16_4wave_wl_co" else "")
+        + (
+            f", {k.co_wave_layout[0]}, {k.co_wave_layout[1]}"
+            if k.kernel_tag == "a16w16_4wave_wl_co"
+            else ""
+        )
     )
 
 
@@ -101,9 +104,7 @@ def splitk_reduce_extra_device_instantiations():
     # every compile-time split_k (0=runtime fallback, 1..16=unrolled) and
     # HAS_OOB, and for BOTH partial types -- which one a kid uses is its
     # splitk_workspace_dtype, so both have to exist. Same kernel NAME/ABI.
-    out = (
-        "// fp32-bias + bf16-out (gfx1250 f32 bias support), per split_k + D_WS\n"
-    )
+    out = "// fp32-bias + bf16-out (gfx1250 f32 bias support), per split_k + D_WS\n"
     for d_ws in ("__bf16", "float"):
         for has_oob in ("true", "false"):
             for sk in range(17):

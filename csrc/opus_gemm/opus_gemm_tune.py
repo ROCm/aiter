@@ -86,7 +86,6 @@ _patch_flaky_hip_device_count()
 # opus_gemm_common is a sibling file in csrc/opus_gemm/.
 from opus_gemm_common import (
     BIAS_AWARE_KIDS,
-    GFX1250_4WAVE_CO_KIDS,
     GFX1250_CLUSTERLAUNCH_KID_OF,
     GFX1250_PLAIN_KID_OF,
     GFX1250_SPLITK_FUSE_ENABLED,
@@ -374,6 +373,7 @@ def _gfx1250_cluster_dims_for_grid(gx, gy, avail, top_clusters, cu_num=0):
     11.2 us against 13.3 us for 4x2, and 1x4 (11.4 us) beats both 2x2 (13.9 us)
     and 4x1 (20.1 us).
     """
+
     def _free(cwm, cwn):
         return cu_num > 0 and _round_up(gx, cwm) * _round_up(gy, cwn) <= cu_num
 
@@ -411,9 +411,14 @@ for _kid, _k in gfx1250_4wave_co_kernels_list.items():
     ).append(_kid)
 
 
-def _gfx1250_co_candidates(M, N, K, cu_num,
-                           top_tiles=GFX1250_CO_TOP_TILES,
-                           top_clusters=GFX1250_CO_TOP_CLUSTERS):
+def _gfx1250_co_candidates(
+    M,
+    N,
+    K,
+    cu_num,
+    top_tiles=GFX1250_CO_TOP_TILES,
+    top_clusters=GFX1250_CO_TOP_CLUSTERS,
+):
     """Pre-compiled (.co) kids worth benchmarking for this shape.
 
     Same shape as the plain/clusterlaunch selection -- top-N tiles by
@@ -424,6 +429,7 @@ def _gfx1250_co_candidates(M, N, K, cu_num,
     Every tile carries a c1x1 entry and c1x1 is feasible for any non-empty grid,
     so a selected tile always contributes at least one kid.
     """
+
     def _tile_score(t):
         bm, bn, _bk = t
         return _gfx1250_occ_cost(_ceil_div(M, bm) * _ceil_div(N, bn), cu_num)
@@ -434,8 +440,9 @@ def _gfx1250_co_candidates(M, N, K, cu_num,
         bm, bn, _bk = t
         gx, gy = _ceil_div(M, bm), _ceil_div(N, bn)
         avail = _GFX1250_CO_BY_TILE[t]
-        for dims in _gfx1250_cluster_dims_for_grid(gx, gy, avail, top_clusters,
-                                                   cu_num=cu_num):
+        for dims in _gfx1250_cluster_dims_for_grid(
+            gx, gy, avail, top_clusters, cu_num=cu_num
+        ):
             out.update(avail[dims])
     return out
 

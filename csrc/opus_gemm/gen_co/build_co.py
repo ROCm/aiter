@@ -62,22 +62,23 @@ import sys
 import tempfile
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-_OPUS_GEMM_DIR = os.path.dirname(_HERE)          # csrc/opus_gemm
-_CSRC_DIR = os.path.dirname(_OPUS_GEMM_DIR)      # csrc
+_OPUS_GEMM_DIR = os.path.dirname(_HERE)  # csrc/opus_gemm
+_CSRC_DIR = os.path.dirname(_OPUS_GEMM_DIR)  # csrc
 
 # opus_gemm_common / codegen.* are imported the same way gen_instances.py does.
 sys.path.insert(0, _OPUS_GEMM_DIR)
 
-from codegen.gen_instances_gfx1250 import (  # noqa: E402
+from codegen.gen_instances_gfx1250 import (
     KARGS_NAME_MAP,
     KERNEL_FUNC_MAP,
     TRAITS_NAME_MAP,
     co_traits_args,
 )
+
 # The _declared_ table, not the filtered one: opus_gemm_common drops entries
 # whose .co is not on disk (so nothing downstream can register an unlaunchable
 # kid), and this script exists to create exactly those files.
-from opus_gemm_common import gfx1250_4wave_co_kernels_declared  # noqa: E402
+from opus_gemm_common import gfx1250_4wave_co_kernels_declared
 
 # Every pre-compiled family and the pipeline header each one's device body
 # lives in. The rest of the stub (traits/kargs/body names) comes from the
@@ -167,14 +168,16 @@ def _unbundle_if_needed(path, llvm_bin, arch):
         return False
     bundler = _tool(llvm_bin, "clang-offload-bundler")
     tmp = path + ".unbundled"
-    _run([
-        bundler,
-        "--unbundle",
-        "--type=o",
-        f"--targets=hipv4-amdgcn-amd-amdhsa--{arch}",
-        f"--input={path}",
-        f"--output={tmp}",
-    ])
+    _run(
+        [
+            bundler,
+            "--unbundle",
+            "--type=o",
+            f"--targets=hipv4-amdgcn-amd-amdhsa--{arch}",
+            f"--input={path}",
+            f"--output={tmp}",
+        ]
+    )
     os.replace(tmp, path)
     return True
 
@@ -185,7 +188,7 @@ def _kernel_metadata(readelf, path, symbol):
     out = _run([readelf, "--notes", path]).stdout
     # One kernel per .co, so a flat scan is enough -- but assert that, because
     # a second kernel would make the numbers ambiguous.
-    names = re.findall(r"^\s*\.name:\s*(\S+)\s*$", out, re.M)
+    names = re.findall(r"^\s*\.name:\s*(\S+)\s*$", out, re.MULTILINE)
     if names != [symbol]:
         raise SystemExit(
             f"build_co: {os.path.basename(path)} should contain exactly one "
@@ -200,7 +203,7 @@ def _kernel_metadata(readelf, path, symbol):
         "group_segment_fixed_size",
         "kernarg_segment_size",
     ):
-        m = re.search(rf"^\s*\.{key}:\s*(\d+)\s*$", out, re.M)
+        m = re.search(rf"^\s*\.{key}:\s*(\d+)\s*$", out, re.MULTILINE)
         if m is None:
             raise SystemExit(f"build_co: .{key} missing from {path} metadata")
         fields[key] = int(m.group(1))
@@ -218,7 +221,7 @@ def _expected_lds(k, no_pad=False):
     ``no_pad`` mirrors -DOPUS_CO_NO_1WG_PAD, the debug switch that puts the
     padded variants back at 2 WG/CU.
     """
-    pitch = k.B_K + 16 // 2          # + PAD_ELEMS for bf16
+    pitch = k.B_K + 16 // 2  # + PAD_ELEMS for bf16
     seg = k.num_slots * (k.B_M + k.B_N) * pitch * 2
     half = 160 * 1024
     if no_pad:
@@ -290,7 +293,8 @@ def build_one(k, args, llvm_bin, workdir):
     # byte-for-byte the same compilation.
     common = [
         *args.hipcc.split(),
-        "-x", "hip",
+        "-x",
+        "hip",
         f"--offload-arch={args.arch}",
         "-std=c++20",
         "-O3",
@@ -310,7 +314,12 @@ def build_one(k, args, llvm_bin, workdir):
     def run_compile(extra, out, what):
         proc = subprocess.run(
             [*common, *extra, "-o", out, stub_path],
-            capture_output=True, text=True, env=env,
+            capture_output=True,
+            text=True,
+            env=env,
+            # The failure path prints hipcc's own diagnostics before exiting;
+            # CalledProcessError would hide them behind a traceback.
+            check=False,
         )
         if proc.returncode != 0:
             sys.stderr.write(proc.stdout)
@@ -339,8 +348,10 @@ def build_one(k, args, llvm_bin, workdir):
             f"{md['group_segment_fixed_size']}, traits say {want_lds}"
         )
     if md["vgpr_spill_count"] or md["sgpr_spill_count"]:
-        msg = (f"{symbol} spills (vgpr={md['vgpr_spill_count']}, "
-               f"sgpr={md['sgpr_spill_count']})")
+        msg = (
+            f"{symbol} spills (vgpr={md['vgpr_spill_count']}, "
+            f"sgpr={md['sgpr_spill_count']})"
+        )
         if args.fail_on_spill:
             raise SystemExit(f"build_co: {msg} and --fail-on-spill is set")
         # Expected at the tighter VGPR budgets, so a warning: the counts are in
@@ -406,14 +417,14 @@ def main():
     )
     p.add_argument(
         "--llvm-bin",
-        "--pin-llvm-bin",   # old spelling, kept working
+        "--pin-llvm-bin",  # old spelling, kept working
         dest="llvm_bin",
         default=os.environ.get("OPUS_CO_LLVM_BIN", os.environ.get("PIN", "")),
         help="bin/ of the LLVM build to compile with; exported as "
-             "HIP_CLANG_PATH and used for llvm-readelf / llvm-objdump / "
-             "clang-offload-bundler. No version is assumed or checked -- what "
-             "was used is recorded in build_info.json. "
-             "Defaults to $OPUS_CO_LLVM_BIN, then $PIN.",
+        "HIP_CLANG_PATH and used for llvm-readelf / llvm-objdump / "
+        "clang-offload-bundler. No version is assumed or checked -- what "
+        "was used is recorded in build_info.json. "
+        "Defaults to $OPUS_CO_LLVM_BIN, then $PIN.",
     )
     p.add_argument("--arch", default="gfx1250")
     p.add_argument(
@@ -422,10 +433,10 @@ def main():
         default=[],
         metavar="FLAG",
         help="extra device-pass flag appended to EVERY entry, repeatable. For "
-             "investigations that need the whole family rebuilt one way, e.g. "
-             "--device-flag=-DOPUS_CO_NO_1WG_PAD to drop the 1-WG/CU pad and "
-             "put the affected variants back at 2 WG/CU. Recorded per entry in "
-             "build_info.json, so an artifact never hides which one built it.",
+        "investigations that need the whole family rebuilt one way, e.g. "
+        "--device-flag=-DOPUS_CO_NO_1WG_PAD to drop the 1-WG/CU pad and "
+        "put the affected variants back at 2 WG/CU. Recorded per entry in "
+        "build_info.json, so an artifact never hides which one built it.",
     )
     p.add_argument(
         "--out-dir",
@@ -441,16 +452,17 @@ def main():
         "--fail-on-spill",
         action="store_true",
         help="treat any VGPR/SGPR spill as an error. Off by default: at the "
-             "tighter VGPR budgets spilling is the expected outcome, not a "
-             "malfunction. The counts always land in build_info.json.",
+        "tighter VGPR budgets spilling is the expected outcome, not a "
+        "malfunction. The counts always land in build_info.json.",
     )
     p.add_argument(
-        "--jobs", "-j",
+        "--jobs",
+        "-j",
         type=int,
         default=max(1, (os.cpu_count() or 2) // 8),
         help="parallel hipcc invocations. Each takes ~1 core for ~3 s, so the "
-             "default is deliberately well under nproc; a full sweep is thousands "
-             "of entries and serial is hours.",
+        "default is deliberately well under nproc; a full sweep is thousands "
+        "of entries and serial is hours.",
     )
     p.add_argument("--keep-temps", action="store_true")
     args = p.parse_args()
@@ -463,7 +475,8 @@ def main():
     print(f"[build_co] clang from: {llvm_bin or '(PATH / hipcc default)'}")
 
     instances = [
-        k for k in gfx1250_4wave_co_kernels_declared.values()
+        k
+        for k in gfx1250_4wave_co_kernels_declared.values()
         if k.kernel_tag in _PIPELINE_HEADERS
     ]
     if not instances:
@@ -481,10 +494,12 @@ def main():
             # entries; serially that is hours, and the box has hundreds of cores.
             # Threads, not processes: every worker spends its life in subprocess.
             from concurrent.futures import ThreadPoolExecutor
+
             print(f"[build_co] {len(instances)} entries on {args.jobs} jobs")
             with ThreadPoolExecutor(max_workers=args.jobs) as pool:
-                built = list(pool.map(
-                    lambda k: build_one(k, args, llvm_bin, workdir), instances))
+                built = list(
+                    pool.map(lambda k: build_one(k, args, llvm_bin, workdir), instances)
+                )
             built.sort(key=lambda b: b["kid"])
     finally:
         if args.keep_temps:
