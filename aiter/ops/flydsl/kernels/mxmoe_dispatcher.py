@@ -95,14 +95,6 @@ def _spart_output_tile_index(block_1d_id, M0, N0, group_num, m01, nmajor=False):
 
 
 def _pick_epi_lanes(BM, BN, route_out_fp8, g2_scale_blk, nthreads=256):
-    """Lanes per output row in the fp8 route-out epilogue (None -> kernel default).
-
-    Fewer lanes -> more columns per lane (ROUTE_VEC = BN/lanes) -> wider fp8
-    stores and fewer amax reduction steps, but fewer rows in flight
-    (EPI_ROWS = nthreads/lanes must divide BM). The e8m0 block scale must also
-    cover a whole number of lane-groups, and the store loop packs 4 fp8/dword.
-    BN=256/BM=32/scale_blk=32: 16 lanes -> ROUTE_VEC 16, EPI_ROWS 16.
-    """
     if not route_out_fp8:
         return None
     order = (32, 16, 8) if BN >= 512 else (16, 8, 32)
@@ -204,8 +196,6 @@ def compile_gemm2_a4w4_port(
     aStages = 3 if (not g2_bf16_lds or 3 * slot_bytes <= c_lds_bytes) else 2
     a_slot_alias = aStages <= kStages
     lds_bytes = max(c_lds_bytes, aStages * slot_bytes)
-    # If every K-tile of A fits in the aStages LDS slots, preload them all before
-    # the K loop: no in-loop prefetch and no per-tile barrier (see a_all_resident).
     K_TILES_RT_MAX = INTER_MAX // BK
     g2_apre = g2_kstatic and aStages >= K_TILES_RT_MAX
     a_preload = min(aStages, K_TILES_RT_MAX) if g2_apre else kStages

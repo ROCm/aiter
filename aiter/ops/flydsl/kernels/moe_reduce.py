@@ -195,9 +195,6 @@ def moe_reduction_kernel(
 
 
 def _pick_reduce_block(model_dim: int, V: int) -> int:
-    """Threads per block, grown from BLOCK so one row fits in as few grid.y
-    tiles as possible (each extra tile re-reads topk_ids/weights and re-runs the
-    mask). model_dim 3584 / V=8 -> 448 needed -> 512 threads, grid.y 2 -> 1."""
     need = -(-model_dim // V)
     block = BLOCK
     while block < need and block < 1024:
