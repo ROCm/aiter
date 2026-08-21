@@ -520,33 +520,57 @@ class KManager16b:
 
     # ------------------------------------------------------------------
     def ds_load_ptrs(self, *, ptr_lds, lane_idx):
-        """LDS (address-space 3) pointers for EVERY ``ds_load_b128`` read of one K
-        block, ready to hand to ``llvm_dialect.load`` with no further address math, in
-        the exact ``_qk_gemm`` consume order ``[(kv, dt, half) ...]``: ``NKV =
-        n_block//_WMMA_M`` kv-tiles x ``NDT = qk_hdim//_WMMA_K`` d-tiles x 2 halves
-        (length ``NKV*NDT*2``).
+        """The **2** per-lane LDS (address-space 3) base pointers that ``load_k_to_reg``
+        needs to reach EVERY ``ds_load_b128`` of one K block by a compile-time immediate.
 
-        Entry ``(kv, dt, half)`` is the 16x16 tile at ``row = kv*16``,
-        ``col = dt*32 + half*16`` read as a natural WMMA B fragment (lane -> row_in_tile
-        = lane%16, col_half = lane//16); a ``(half=0, half=1)`` pair shuffles into a
-        16x32 fragment. Pure index math (no memory op)."""
+        The K swizzle within a 16x32 WMMA tile depends only on ``half`` (which 8-hdim
+        half) plus the lane; every other tile ``(kv, dt)`` in the block sits at the SAME
+        in-tile position shifted by the lane-independent tile stride ``(kv*hd_units +
+        dt)*1024`` bytes. So the whole block's ds_load addresses collapse to just 2 base
+        pointers — the ``(kv=0, dt=0)`` tile for ``half=0`` and ``half=1`` — and 16
+        compile-time immediates applied in ``load_k_to_reg``. Returns
+        ``[base_half0, base_half1]``. This replaces the former 32-pointer list, saving
+        ~15 address VGPRs/lane and the per-pointer swizzle VALU. Pure index math."""
         row_in_tile = lane_idx % _WMMA_M
         col_half = lane_idx // _WMMA_M  # 0 or 1: which 8-hdim half of the 16 cols
+        bases = []
+        for half in fx.range_constexpr(2):  # rep tile (kv=0, dt=0), both halves
+            col_idx = half * _WMMA_M
+            chunk_base = (col_idx % _WMMA_K) // _CHUNK_ELEMS  # 0 or 2
+            chunk = fx.Int32(chunk_base) + col_half
+            off = ptr_lds + self._lds_byte(0, 0, row_in_tile, chunk)
+            bases.append(buffer_ops.create_llvm_ptr(off, address_space=3))
+        return bases
+
+    def load_k_to_reg(self, *, base_ptrs, lds_imm_offset=0):
+        """Issue EVERY K ``ds_load_b128`` for one resident KV block as a single
+        back-to-back burst from the 2 base pointers of ``ds_load_ptrs``, returning the
+        raw v8-bf16 results in the exact ``_qk_gemm`` consume order
+        ``[(kv, dt, half) ...]`` (``NKV = n_block//_WMMA_M`` kv-tiles x ``NDT =
+        qk_hdim//_WMMA_K`` d-tiles x 2 halves, length ``NKV*NDT*2``).
+
+        Each ``(kv, dt, half)`` tile is ``base_ptrs[half]`` shifted by the compile-time
+        byte immediate ``(kv*hd_units + dt)*1024 + lds_imm_offset`` via a static-offset
+        GEP, which the AMDGPU backend folds into the ds_read ``offset:`` field (no
+        per-tile address VALU). ``lds_imm_offset`` (compile-time) selects the ping-pong
+        buffer: 0 for buffer 0, ``slot_bytes`` for buffer 1 (interleaved
+        ``[K.pp0|V.pp0][K.pp1|V.pp1]`` layout). Keeping the LDS reads out of the WMMA
+        stream avoids the ~24-cyc wmma->ds_load bubble (see [[gfx1250-wmma-dsload-bubble]]);
+        no ``s_wait_dscnt`` here — ``_qk_gemm`` drains the burst before its first WMMA."""
+        v8_ty = fx.Vector.make_type(8, fx.BFloat16)
+        tile_stride = _WMMA_M * _WMMA_K * _BF16_BYTES  # 1024: lane-independent tile step
         NKV = self.n_block // _WMMA_M
         NDT = self.qk_hdim // _WMMA_K
-        ptrs = []
-        for kv in fx.range_constexpr(NKV):
-            for dt in fx.range_constexpr(NDT):
-                for half in fx.range_constexpr(2):
-                    row_idx = kv * _WMMA_M
-                    col_idx = dt * _WMMA_K + half * _WMMA_M
-                    tile_row = row_idx // _WMMA_M
-                    tile_col = col_idx // _WMMA_K
-                    chunk_base = (col_idx % _WMMA_K) // _CHUNK_ELEMS  # 0 or 2
-                    chunk = fx.Int32(chunk_base) + col_half
-                    off = ptr_lds + self._lds_byte(tile_row, tile_col, row_in_tile, chunk)
-                    ptrs.append(buffer_ops.create_llvm_ptr(off, address_space=3))
-        return ptrs
+        out = []
+        for kv in range(NKV):
+            for dt in range(NDT):
+                imm = (kv * self.hd_units + dt) * tile_stride + lds_imm_offset
+                for half in range(2):
+                    p = base_ptrs[half]
+                    if imm:
+                        p = buffer_ops.get_element_ptr(p, static_byte_offset=imm)
+                    out.append(fx.Vector(llvm_dialect.load(v8_ty, p)))
+        return out
 
 
 # ============================================================================
@@ -613,44 +637,7 @@ class VManager16b:
             + (rloc * _V_SUB_HD + cloc) * _BF16_BYTES
         )
 
-    def async_load_vram_to_lds_wr_tile(
-        self,
-        *,
-        ptr_lds,
-        v_base_i64,  # fx.Int64: ptrtoint(get_iter(ptr_V))
-        stride_v_seq,
-        stride_v_head,
-        kv_head,
-        kv_row0,  # fx.Int32: global token of this block's kv-row 0
-        kv_valid,  # fx.Int32: valid kv rows in this block (only read if check_oob)
-        row_idx,  # kv offset within block, mult of 8, < n_block
-        col_idx,  # d offset, mult of 32, < v_hdim
-        lane_idx,
-        check_oob=True,  # compile-time: clamp rows >= kv_valid in-bounds
-    ):
-        """One warp streams an 8(kv) x 32(d) tile into ``ptr_lds`` (new V swizzle) —
-        one b128 (8 bf16) per lane: lane -> (wr_row = lane//4, chunk = lane%4). The
-        global read is coalesced (d contiguous); the LDS write is swizzled. When
-        ``check_oob`` is False the caller guarantees the block is in-bounds."""
-        _assert_multiple("row_idx", row_idx, _V_WR_TILE_KV)
-        _assert_multiple("col_idx", col_idx, _V_WR_TILE_HD)
-        wr_row = lane_idx // 4  # kv row within the 8-row write tile [0,8)
-        chunk = lane_idx % 4  # which 8-d b128 [0,4) -> spans the 32-wide tile
-        kv_row = fx.Int32(row_idx) + wr_row
-        d_col = fx.Int32(col_idx) + chunk * _CHUNK_ELEMS
-
-        safe_kv = kv_row
-        if check_oob:
-            safe_kv = (kv_row < kv_valid).select(kv_row, fx.Int32(0))  # clamp OOB
-        token = kv_row0 + safe_kv
-        g_off = token * stride_v_seq + kv_head * stride_v_head + d_col * _BF16_BYTES
-        # LDS position uses the UNCLAMPED kv_row (global read uses clamped safe_kv).
-        lds_off = ptr_lds + self._lds_byte(kv_row, d_col)
-        gptr = buffer_ops.create_llvm_ptr(v_base_i64 + fx.Int64(g_off), address_space=1)
-        lds_ptr = buffer_ops.create_llvm_ptr(lds_off, address_space=3)
-        _async_load_to_lds(gptr, lds_ptr, cluster=True)
-
-    def async_load_vram_to_lds(
+    def global_load_ptrs(
         self,
         *,
         ptr_lds,
@@ -658,16 +645,26 @@ class VManager16b:
         stride_v_seq,
         stride_v_head,
         kv_head,
-        kv_row0,
-        kv_valid,
+        kv_row0,  # fx.Int32: global token of this block's kv-row 0
+        kv_valid,  # fx.Int32: valid kv rows in this block (only read if check_oob)
         warp_idx,
         lane_idx,
-        check_oob=True,
+        check_oob=True,  # compile-time: clamp rows >= kv_valid in-bounds
     ):
-        """Load the whole ``n_block`` x ``v_hdim`` V block into ``ptr_lds``.
+        """Src+dst pointers for EVERY ``cluster_load_async_to_lds_b128`` of this warp's
+        share of the ``n_block x v_hdim`` V block, ready to hand to ``_async_load_to_lds``
+        with no further address math. Pure index arithmetic (no memory op) so the caller
+        can hoist all address VALU ahead of the load burst.
 
-        The 8x32 write-tile grid is spread round-robin across the waves (warp ``w``
-        streams tiles ``w, w+num_waves, ...``); ``check_oob`` forwards to each tile."""
+        Returns ``(gptrs, lds_ptrs)`` — equal-length pointer lists, one 8(kv)x32(d)
+        b128 per entry (length = ``n_wr_tile_rows*n_wr_tile_cols // num_waves``);
+        ``gptrs`` global (address-space 1) sources, ``lds_ptrs`` LDS (address-space 3)
+        destinations (new V swizzle). The 8x32 write-tile grid is spread round-robin
+        across the waves (warp ``w`` streams tiles ``w, w+num_waves, ...``); per tile
+        lane -> (wr_row = lane//4, chunk = lane%4). The global read is coalesced (d
+        contiguous); the LDS write is swizzled. Rows >= ``kv_valid`` are clamped
+        in-bounds on the GLOBAL side when ``check_oob`` (masked later in softmax); the
+        LDS position uses the UNCLAMPED kv_row."""
         n_tiles = self.n_wr_tile_rows * self.n_wr_tile_cols
         if n_tiles % self.num_waves != 0:
             raise NotImplementedError(
@@ -675,42 +672,85 @@ class VManager16b:
                 f"got n_block={self.n_block}, v_hdim={self.v_hdim}"
             )
         v_base_i64 = fx.Int64(fx.ptrtoint(fx.get_iter(ptr_V)))
+        wr_row = lane_idx // 4  # kv row within the 8-row write tile [0,8)
+        chunk = lane_idx % 4  # which 8-d b128 [0,4) -> spans the 32-wide tile
+        gptrs, lds_ptrs = [], []
         for i in fx.range_constexpr(n_tiles // self.num_waves):
             tile_id = warp_idx + fx.Int32(i * self.num_waves)
             row_idx = (tile_id // self.n_wr_tile_cols) * _V_WR_TILE_KV
             col_idx = (tile_id % self.n_wr_tile_cols) * _V_WR_TILE_HD
-            self.async_load_vram_to_lds_wr_tile(
-                ptr_lds=ptr_lds,
-                v_base_i64=v_base_i64,
-                stride_v_seq=stride_v_seq,
-                stride_v_head=stride_v_head,
-                kv_head=kv_head,
-                kv_row0=kv_row0,
-                kv_valid=kv_valid,
-                row_idx=row_idx,
-                col_idx=col_idx,
-                lane_idx=lane_idx,
-                check_oob=check_oob,
+            kv_row = fx.Int32(row_idx) + wr_row
+            d_col = fx.Int32(col_idx) + chunk * _CHUNK_ELEMS
+            safe_kv = kv_row
+            if check_oob:
+                safe_kv = (kv_row < kv_valid).select(kv_row, fx.Int32(0))  # clamp OOB
+            token = kv_row0 + safe_kv
+            g_off = token * stride_v_seq + kv_head * stride_v_head + d_col * _BF16_BYTES
+            gptrs.append(
+                buffer_ops.create_llvm_ptr(v_base_i64 + fx.Int64(g_off), address_space=1)
             )
+            # LDS position uses the UNCLAMPED kv_row (global read uses clamped safe_kv).
+            lds_off = ptr_lds + self._lds_byte(kv_row, d_col)
+            lds_ptrs.append(buffer_ops.create_llvm_ptr(lds_off, address_space=3))
+        return gptrs, lds_ptrs
 
     # ------------------------------------------------------------------
-    def load_lds_to_vgpr_tile_as_v(self, *, ptr_lds, kv_idx, d_idx, lane_idx):
-        """Transpose-load one 16(kv) x 16(d) tile as a PV A-fragment via
-        ``ds_load_tr16_b128`` (kv_idx, d_idx both mult of 16) -> v8 bf16 per lane.
+    def ds_load_ptrs(self, *, ptr_lds, lane_idx):
+        """The **2** per-lane LDS (address-space 3) transpose-load base pointers that
+        ``load_v_to_reg`` needs to reach EVERY ``ds_load_tr16_b128`` of one V block by a
+        compile-time immediate.
 
-        Each lane feeds one b128 fetch; the fixed 8x8 crossbar then yields:
-        lane l holds ``V[kv_idx + (l//16)*8 + e, d_idx + l%16]`` for e in 0..7 (v8[e]),
-        i.e. 8 consecutive kv values at a fixed d = d_idx + l%16 -> the transposed
-        ``V^T`` fragment. Fetch address per lane:
-        ``V[kv_idx + (l//16)*8 + l%8, d_idx + ((l//8)%2)*8]`` (see class docstring)."""
-        _assert_multiple("kv_idx", kv_idx, _WMMA_M)
-        _assert_multiple("d_idx", d_idx, _WMMA_M)
-        fetch_kv = fx.Int32(kv_idx) + (lane_idx // 16) * 8 + lane_idx % 8
-        fetch_d = fx.Int32(d_idx) + ((lane_idx // 8) % 2) * 8
-        v8_ty = fx.Vector.make_type(_CHUNK_ELEMS, fx.BFloat16)
-        addr = ptr_lds + self._lds_byte(fetch_kv, fetch_d)
-        lds_ptr = buffer_ops.create_llvm_ptr(addr, address_space=3)
-        return fx.Vector(rocdl.ds_load_tr16_b128(v8_ty, lds_ptr))
+        Unlike K (2 bases split by ``half``), the V transpose swizzle
+        (``cidx ^ (ridx&1)``) makes the in-tile position depend on the output d-tile's
+        PARITY: keys with even ``dt`` share one lane-relative position and odd ``dt``
+        another, while ``kt``, ``half`` and even/odd-``dt`` steps are all lane-independent
+        byte shifts (verified exact for all 32 lanes x all keys). So the block's transpose
+        addresses collapse to 2 base pointers — the ``(kt=0, half=0)`` tile for ``dt=0``
+        (even) and ``dt=1`` (odd) — plus 16 compile-time immediates applied in
+        ``load_v_to_reg``. Returns ``[base_dt_even, base_dt_odd]``. This replaces the
+        former 32-pointer list, saving ~15 address VGPRs/lane. Per-lane b128 fetch
+        (fixed 8x8 crossbar): ``V[kv_idx + (l//16)*8 + l%8, d_idx + ((l//8)%2)*8]``."""
+        bases = []
+        for dp in fx.range_constexpr(2):  # rep tile (dt=dp, kt=0, half=0): dt parity
+            d_idx = dp * _WMMA_M
+            fetch_kv = (lane_idx // 16) * 8 + lane_idx % 8  # kv_idx == 0 (kt=0, half=0)
+            fetch_d = fx.Int32(d_idx) + ((lane_idx // 8) % 2) * 8
+            addr = ptr_lds + self._lds_byte(fetch_kv, fetch_d)
+            bases.append(buffer_ops.create_llvm_ptr(addr, address_space=3))
+        return bases
+
+    def load_v_to_reg(self, *, base_ptrs, lds_imm_offset=0):
+        """Burst EVERY V ``ds_load_tr16_b128`` (transpose load) for one resident KV block
+        from the 2 base pointers of ``ds_load_ptrs``, returning the raw v8-bf16 results in
+        the exact ``_pv_gemm`` consume order ``[(dt, kt, half) ...]`` (``d_tiles =
+        v_hdim//_WMMA_M`` output d-tiles x ``nkt = n_block//_WMMA_K`` kv tiles x 2 halves,
+        length ``d_tiles*nkt*2``).
+
+        Each ``(dt, kt, half)`` tile is ``base_ptrs[dt & 1]`` shifted by a compile-time
+        byte immediate via a static-offset GEP (folded into the ds_read ``offset:``
+        field). The immediate is derived by reusing ``_lds_byte`` at lane 0 — since the
+        key-minus-rep byte delta is lane-independent, the lane-0 scalar delta IS the
+        universal immediate — plus ``lds_imm_offset`` (0 for ping-pong buffer 0,
+        ``slot_bytes`` for buffer 1). Kept OUT of the WMMA stream (avoids the
+        wmma->ds_load bubble, see [[gfx1250-wmma-dsload-bubble]]); no ``s_wait_dscnt``
+        here — ``_pv_gemm`` drains the burst before its first WMMA."""
+        v8_ty = fx.Vector.make_type(8, fx.BFloat16)
+        d_tiles = self.v_hdim // _WMMA_M
+        nkt = self.n_block // _WMMA_K
+        out = []
+        for dt in range(d_tiles):
+            # rep for this key's class is (dt=dt&1, kt=0, half=0): lane-0 fetch (0, (dt&1)*16)
+            rep_off = self._lds_byte(0, (dt % 2) * _WMMA_M)
+            for kt in range(nkt):
+                for half in range(2):
+                    # lane-0 fetch for this key: kv_idx = kt*32 + half*16, d_idx = dt*16
+                    key_off = self._lds_byte(kt * _WMMA_K + half * _WMMA_M, dt * _WMMA_M)
+                    imm = (key_off - rep_off) + lds_imm_offset
+                    p = base_ptrs[dt % 2]
+                    if imm:
+                        p = buffer_ops.get_element_ptr(p, static_byte_offset=imm)
+                    out.append(fx.Vector(rocdl.ds_load_tr16_b128(v8_ty, p)))
+        return out
 
 
 # ============================================================================
