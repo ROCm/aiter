@@ -287,6 +287,22 @@ jobs:
               text = text.replace(old_sacct, new_sacct, 1)
           helper_path.write_text(text, encoding="utf-8")
           print(f"{helper_path}: patched Spur sacct exit-code query")
+
+          # ATOM streams every rank's container and role logs to stderr while
+          # also uploading the same files as artifacts. A single cell can exceed
+          # the GitHub Actions per-job log limit and block the runner's final
+          # Slurm status handling. Keep the lightweight Slurm monitor output;
+          # the complete server logs remain available in the result artifact.
+          text = submit_path.read_text(encoding="utf-8")
+          old_streamer = "  SLURM_EXTRA_LOG_STREAMER=stream_spur_shared_logs_once"
+          new_streamer = "  unset SLURM_EXTRA_LOG_STREAMER"
+          if new_streamer not in text:
+              if text.count(old_streamer) != 1:
+                  raise SystemExit("Failed to find unique Spur shared-log streamer")
+              text = text.replace(old_streamer, new_streamer, 1)
+          submit_path.write_text(text, encoding="utf-8")
+          print(f"{submit_path}: disabled duplicate full-rank live-log streaming")
+
           models_path = Path(".github/benchmark/models_atomesh.yaml")
           text = models_path.read_text(encoding="utf-8")
           if "  GLM-5.2-FP8:" not in text:
