@@ -245,7 +245,14 @@ def torch_mla_extend(
 @pytest.mark.parametrize("batch_size", [1, 4, 8, 32])
 @pytest.mark.parametrize("decode_qlen", [1, 3])
 @pytest.mark.parametrize("ctx_lens", [1328, 4371])
-@pytest.mark.parametrize("num_heads", [(16, 1), (128, 1)])
+@pytest.mark.parametrize(
+    "num_heads",
+    [
+        pytest.param((16, 1), id="gqa16"),
+        pytest.param((64, 1), id="gqa64"),
+        pytest.param((128, 1), id="gqa128"),
+    ],
+)
 @pytest.mark.parametrize("kv_lora_rank, qk_rope_head_dim", [(512, 64)])
 @pytest.mark.parametrize("num_blocks", [32768])
 @pytest.mark.parametrize("varlen", [True, False])
@@ -428,6 +435,177 @@ def test_mla_decode_fwd(
             msg="mla_decode_fwd output",
         )
         <= tol_err_ratio
+    )
+
+
+@torch.inference_mode()
+def test_mla_decode_fwd_fp8_gqa64_page_size_1():
+    """Cover the per-token KV layout used by sparse MLA decode."""
+    test_mla_decode_fwd(
+        batch_size=1,
+        decode_qlen=1,
+        ctx_lens=1328,
+        num_heads=(64, 1),
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        block_size=1,
+        num_blocks=4096,
+        varlen=False,
+        q_dtype=e4m3_dtype,
+        kv_dtype=e4m3_dtype,
+        out_dtype=torch.bfloat16,
+        use_out_scale=False,
+        shuffled_kv_cache=False,
+    )
+
+
+@torch.inference_mode()
+def test_mla_decode_fwd_fp8_gqa64_csr_lse_dcp_merge():
+    """Validate native sparse gather, natural-log LSE, and empty DCP shards."""
+    if DEVICE_ARCH != "gfx950":
+        pytest.skip("native CSR MLA decode is currently gfx950-only")
+
+    torch.manual_seed(7)
+    batch_size = 2
+    num_query_heads, num_kv_heads = 64, 1
+    kv_lora_rank, qk_rope_head_dim = 512, 64
+    qk_head_dim = kv_lora_rank + qk_rope_head_dim
+    num_slots = 1024
+    row_lengths = [257, 2]
+    sm_scale = 1.0 / (qk_head_dim**0.5)
+    q_descale = torch.tensor([0.75], dtype=torch.float32, device="cuda")
+    kv_descale = torch.tensor([0.5], dtype=torch.float32, device="cuda")
+
+    query = (
+        torch.randn(
+            batch_size,
+            num_query_heads,
+            qk_head_dim,
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        / 4
+    ).to(e4m3_dtype)
+    kv_buffer = (
+        torch.randn(
+            num_slots,
+            1,
+            num_kv_heads,
+            qk_head_dim,
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        / 4
+    ).to(e4m3_dtype)
+    rows = [
+        torch.randperm(num_slots, device="cuda", dtype=torch.int64)[:length]
+        .to(torch.int32)
+        .tolist()
+        for length in row_lengths
+    ]
+    cu_seqlens_q = torch.arange(
+        batch_size + 1, dtype=torch.int32, device="cuda"
+    )
+
+    def run_csr(csr_rows):
+        counts = torch.tensor(
+            [len(row) for row in csr_rows], dtype=torch.int32, device="cuda"
+        )
+        indptr = torch.zeros(batch_size + 1, dtype=torch.int32, device="cuda")
+        indptr[1:] = counts.cumsum(0)
+        indices = torch.tensor(
+            [slot for row in csr_rows for slot in row],
+            dtype=torch.int32,
+            device="cuda",
+        )
+        output = torch.empty(
+            batch_size,
+            num_query_heads,
+            kv_lora_rank,
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        output, lse = mla_decode_fwd(
+            q=query,
+            kv_buffer=kv_buffer,
+            out=output,
+            cu_seqlens_q=cu_seqlens_q,
+            seqused_k=counts,
+            max_seqlen_kv=max(row_lengths),
+            block_tables=indices,
+            softmax_scale=sm_scale,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            causal=True,
+            q_descale=q_descale,
+            kv_descale=kv_descale,
+            kv_indptr=indptr,
+            return_lse=True,
+        )
+        return output, lse
+
+    output, lse = run_csr(rows)
+
+    ref_outputs = []
+    ref_lses = []
+    for seq_idx, row in enumerate(rows):
+        k = kv_buffer[row, 0].to(torch.bfloat16)
+        k = torch.repeat_interleave(k, num_query_heads, dim=1)
+        q = query[seq_idx : seq_idx + 1].to(torch.bfloat16)
+        logits = torch.einsum("qhd,khd->hqk", q, k).float()
+        logits *= sm_scale * q_descale * kv_descale
+        ref_lses.append(torch.logsumexp(logits, dim=-1).squeeze(-1))
+        probs = torch.softmax(logits, dim=-1).to(torch.bfloat16)
+        values = k[..., :kv_lora_rank]
+        ref_output = torch.einsum("hqk,khd->qhd", probs, values)
+        ref_outputs.append(
+            (ref_output * kv_descale).to(torch.bfloat16).squeeze(0)
+        )
+    ref_output = torch.stack(ref_outputs)
+    ref_lse = torch.stack(ref_lses)
+
+    assert (
+        checkAllclose(
+            output,
+            ref_output,
+            atol=1.5e-1,
+            rtol=1.5e-1,
+            tol_err_ratio=0.01,
+            msg="native CSR MLA output",
+        )
+        <= 0.01
+    )
+    torch.testing.assert_close(lse, ref_lse, atol=8e-2, rtol=2e-2)
+
+    rank_outputs = []
+    rank_lses = []
+    for rank in range(4):
+        rank_rows = [row[rank::4] for row in rows]
+        rank_output, rank_lse = run_csr(rank_rows)
+        rank_outputs.append(rank_output.float())
+        rank_lses.append(rank_lse)
+        if rank >= 2:
+            assert torch.count_nonzero(rank_output[1]) == 0
+            assert torch.isneginf(rank_lse[1]).all()
+
+    rank_lses = torch.stack(rank_lses)
+    global_lse = torch.logsumexp(rank_lses, dim=0)
+    rank_weights = torch.exp(rank_lses - global_lse)
+    merged_output = torch.sum(
+        torch.stack(rank_outputs) * rank_weights[..., None], dim=0
+    )
+
+    torch.testing.assert_close(global_lse, lse, atol=8e-2, rtol=2e-2)
+    assert (
+        checkAllclose(
+            merged_output.to(torch.bfloat16),
+            output,
+            atol=1.5e-1,
+            rtol=1.5e-1,
+            tol_err_ratio=0.01,
+            msg="DCP-merged CSR MLA output",
+        )
+        <= 0.01
     )
 
 

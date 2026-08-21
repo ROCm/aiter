@@ -279,11 +279,17 @@ def mla_decode_fwd(
     out_scale=None,
     shuffled_kv_cache: bool = False,
     skip_reduce: bool = False,
+    kv_indptr=None,
+    return_lse: bool = False,
 ):
     assert causal, "Only causal attention is supported"
+    assert not (
+        skip_reduce and return_lse
+    ), "return_lse requires the final segment reduction"
     q_dtype = q.dtype
     kv_buffer_dtype = kv_buffer.dtype
     total_num_tokens, num_query_heads, qk_head_dim = q.shape
+    use_kv_indices = kv_indptr is not None
 
     BLOCK_SCALES_SIZE = 16
     if q_dtype == torch.uint8:
@@ -332,7 +338,15 @@ def mla_decode_fwd(
         num_blocks, block_size, num_kv_heads, _ = kv_buffer.shape
         K_WIDTH = 16 if kv_buffer_dtype == e4m3_dtype else 8
 
-    num_seqs = len(seqused_k)
+    if use_kv_indices:
+        assert not IS_DEVICE_ARCH_GFX12, "CSR MLA decode is currently gfx950-only"
+        assert not shuffled_kv_cache, "CSR MLA decode requires the normal KV layout"
+        assert block_size == 1, "CSR MLA decode requires a page_size=1 KV view"
+        assert block_tables.ndim == 1, "CSR MLA expects flat physical slot indices"
+        assert kv_indptr.ndim == 1
+        num_seqs = len(kv_indptr) - 1
+    else:
+        num_seqs = len(seqused_k)
     num_tokens_per_seq = total_num_tokens // num_seqs
     num_queries_per_kv = num_query_heads // num_kv_heads
 
@@ -352,6 +366,8 @@ def mla_decode_fwd(
     cu_count = get_num_sms()
     target_num_prgms = cu_count * 4
     ALL_DECODE = num_tokens_per_seq == 1
+    if use_kv_indices:
+        assert ALL_DECODE, "CSR MLA currently supports single-token decode only"
     if ALL_DECODE:
         total_num_q_blocks = num_seqs * NUM_HEAD_BLOCKS
     else:
@@ -361,8 +377,12 @@ def mla_decode_fwd(
     num_2d_prgms = total_num_q_blocks * num_kv_heads
     # if batch contains a prefill
 
+    # Sparse CSR stores one arbitrary physical slot per entry, but using the
+    # physical page size (1) as the dot N tile is prohibitively slow. Gather a
+    # full MFMA-friendly tile of indirect slots instead.
+    tile_size = 64 if use_kv_indices else block_size
     attn_config, reduce_config = select_3d_config(
-        block_size,
+        tile_size,
         max_seqlen_kv,
         target_num_prgms,
         num_2d_prgms,
@@ -373,7 +393,11 @@ def mla_decode_fwd(
     )
 
     NUM_SEGMENTS = attn_config["NUM_SEGMENTS_PER_SEQ"]
-    if NUM_SEGMENTS > 1:
+    # The gfx950 Triton stage-1 stores unnormalized partials. Always use the
+    # reduction, even for one segment; this also avoids aliasing M/L onto `out`.
+    force_triton_reduce = not IS_DEVICE_ARCH_GFX12
+    needs_reduce = NUM_SEGMENTS > 1 or force_triton_reduce
+    if needs_reduce:
         segm_output = torch.empty(
             total_num_tokens,
             num_query_heads,
@@ -400,6 +424,16 @@ def mla_decode_fwd(
         segm_output = out
         segm_max = out  # dummy ptr
         segm_expsum = out  # dummy ptr
+    final_lse = (
+        torch.empty(
+            total_num_tokens,
+            num_query_heads,
+            dtype=torch.float32,
+            device=q.device,
+        )
+        if return_lse
+        else None
+    )
 
     if IS_DEVICE_ARCH_GFX12:
         if shuffled_kv_cache:
@@ -461,6 +495,7 @@ def mla_decode_fwd(
             query_scales_ptr=q_scales,
             kv_buffer_ptr=kv_buffer,
             block_tables_ptr=block_tables,
+            kv_indptr_ptr=kv_indptr,
             seq_lens_ptr=seqused_k,
             scale=softmax_scale,
             q_scale_ptr=q_descale,
@@ -487,10 +522,15 @@ def mla_decode_fwd(
             SHUFFLED_KV_CACHE=shuffled_kv_cache,
             IS_Q_FP8=(q_dtype == e4m3_dtype),
             IS_KV_FP8=(kv_buffer_dtype == e4m3_dtype),
+            USE_KV_INDICES=use_kv_indices,
             **attn_config,
         )
 
-    if NUM_SEGMENTS == 1:
+    if not needs_reduce:
+        if return_lse:
+            raise NotImplementedError(
+                "return_lse for single-segment gfx1250 MLA is not implemented"
+            )
         return segm_output
     elif skip_reduce:
         return segm_output, segm_max, segm_expsum
@@ -508,6 +548,8 @@ def mla_decode_fwd(
         segm_output_ptr=segm_output,
         segm_max_ptr=segm_max,
         segm_expsum_ptr=segm_expsum,
+        final_lse_ptr=final_lse if final_lse is not None else out,
+        kv_indptr_ptr=kv_indptr,
         seq_lens_ptr=seqused_k,
         out_scale_ptr=out_scale,
         num_seqs=num_seqs,
@@ -521,6 +563,8 @@ def mla_decode_fwd(
         query_start_len_ptr=cu_seqlens_q,
         BLOCK_Q=BLOCK_Q,
         ALL_DECODE=ALL_DECODE,
+        USE_KV_INDICES=use_kv_indices,
+        HAS_FINAL_LSE=return_lse,
         **reduce_config,
     )
-    return out
+    return (out, final_lse) if return_lse else out

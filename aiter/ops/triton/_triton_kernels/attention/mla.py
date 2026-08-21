@@ -328,6 +328,7 @@ _mla_decode_fwd_kernel_repr = make_kernel_repr(
         "SHUFFLED_KV_CACHE",
         "IS_Q_FP8",
         "IS_KV_FP8",
+        "USE_KV_INDICES",
     ],
 )
 
@@ -341,6 +342,7 @@ def _mla_decode_fwd_kernel(
     query_scales_ptr,  # nvfp4 query scales (unused for non-shuffled bf16/fp8)
     kv_buffer_ptr,  # [num_blks, blk_size, num_kv_heads, head_size]
     block_tables_ptr,  # [num_seqs, max_num_blocks_per_seq]
+    kv_indptr_ptr,  # optional CSR row offsets; block_tables_ptr is flat slot ids
     seq_lens_ptr,  # [num_seqs]
     scale,  # float32
     q_scale_ptr,  # float32
@@ -372,6 +374,7 @@ def _mla_decode_fwd_kernel(
     SHUFFLED_KV_CACHE: tl.constexpr = False,  # bool
     IS_Q_FP8: tl.constexpr = False,  # bool
     IS_KV_FP8: tl.constexpr = False,  # bool
+    USE_KV_INDICES: tl.constexpr = False,  # bool
 ):
     q_block_global_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
@@ -395,8 +398,16 @@ def _mla_decode_fwd_kernel(
     head_block_idx = q_block_local_idx % NUM_HEAD_BLOCKS
     head_offset = head_block_idx * BLOCK_M
 
-    # sequence len for this particular sequence
-    seq_len = tl.load(seq_lens_ptr + seq_idx)
+    # sequence len for this particular sequence. Sparse MLA supplies a compact
+    # CSR of arbitrary physical token slots, while dense MLA supplies a paged
+    # block table plus an explicit sequence length.
+    if USE_KV_INDICES:
+        kv_start = tl.load(kv_indptr_ptr + seq_idx)
+        kv_end = tl.load(kv_indptr_ptr + seq_idx + 1)
+        seq_len = kv_end - kv_start
+    else:
+        kv_start = 0
+        seq_len = tl.load(seq_lens_ptr + seq_idx)
 
     # number of segments for this particular sequence
     num_segments = NUM_SEGMENTS_PER_SEQ
@@ -464,7 +475,10 @@ def _mla_decode_fwd_kernel(
         other=0.0,
     )
 
-    block_tables_ptr_shifted = block_tables_ptr + seq_idx * block_tables_stride
+    if USE_KV_INDICES:
+        block_tables_ptr_shifted = block_tables_ptr + kv_start
+    else:
+        block_tables_ptr_shifted = block_tables_ptr + seq_idx * block_tables_stride
 
     M = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
     L = tl.full([BLOCK_M], 1.0, dtype=tl.float32)
@@ -500,9 +514,30 @@ def _mla_decode_fwd_kernel(
         min((segm_idx + 1) * tiles_per_segment, num_tiles),
         num_stages=1,
     ):
-        physical_block_idx = tl.load(block_tables_ptr_shifted + j).to(tl.int64)
-
-        if SHUFFLED_KV_CACHE:
+        if USE_KV_INDICES:
+            # One CSR entry is one physical token slot. TILE_SIZE is deliberately
+            # independent of the physical page size (which is 1) so the FP8 dot
+            # still operates on a useful N tile instead of degenerating to N=1.
+            physical_slot_idx = tl.load(
+                block_tables_ptr_shifted + seq_offset,
+                mask=seq_offset < seq_len,
+                other=0,
+            ).to(tl.int64)
+            kv_offset = (
+                physical_slot_idx * stride_kv_buffer_0
+                + kv_head_idx * stride_kv_buffer_2
+            )
+            kv_lora_offset = (
+                kv_offset[:, None]
+                + offs_lora_rank[None, :] * stride_kv_buffer_3
+            )
+            k_rope_offset = (
+                kv_offset[None, :]
+                + (KV_LORA_RANK + offs_rope_head_dim)[:, None]
+                * stride_kv_buffer_3
+            )
+        elif SHUFFLED_KV_CACHE:
+            physical_block_idx = tl.load(block_tables_ptr_shifted + j).to(tl.int64)
             kv_offset = (
                 physical_block_idx * stride_kv_buffer_0
                 + kv_head_idx * stride_kv_buffer_1
@@ -520,6 +555,7 @@ def _mla_decode_fwd_kernel(
                 + offs_rope_head_dim_shfl[None, :] * stride_kv_buffer_3
             )
         else:
+            physical_block_idx = tl.load(block_tables_ptr_shifted + j).to(tl.int64)
             kv_offset = (
                 physical_block_idx * stride_kv_buffer_0
                 + kv_head_idx * stride_kv_buffer_2
@@ -656,6 +692,8 @@ _mla_decode_fwd_reduce_kernel_repr = make_kernel_repr(
         "KV_LORA_RANK",
         "NUM_SEGMENTS_PER_SEQ",
         "ALL_DECODE",
+        "USE_KV_INDICES",
+        "HAS_FINAL_LSE",
     ],
 )
 
@@ -667,6 +705,8 @@ def _mla_decode_fwd_reduce_kernel(
     # [num_tokens, num_query_heads, max_num_segments, head_size]
     segm_max_ptr,  # [num_tokens, num_query_heads, max_num_segments]
     segm_expsum_ptr,  # [num_tokens, num_query_heads, max_num_segments]
+    final_lse_ptr,  # [num_tokens, num_query_heads], natural log
+    kv_indptr_ptr,  # optional CSR row offsets
     seq_lens_ptr,  # [num_seqs]
     out_scale_ptr,  # float32
     num_seqs,  # int
@@ -682,6 +722,8 @@ def _mla_decode_fwd_reduce_kernel(
     BLOCK_Q: tl.constexpr,  # int
     NUM_SEGMENTS_PER_SEQ: tl.constexpr,  # int
     ALL_DECODE: tl.constexpr = False,  # int
+    USE_KV_INDICES: tl.constexpr = False,  # bool
+    HAS_FINAL_LSE: tl.constexpr = False,  # bool
     FP8_MIN: tl.constexpr = float8_info.min,
     FP8_MAX: tl.constexpr = float8_info.max,
 ):
@@ -694,7 +736,32 @@ def _mla_decode_fwd_reduce_kernel(
         seq_idx = query_token_idx // num_tokens_per_seq
 
     # sequence len for this particular sequence
-    seq_len = tl.load(seq_lens_ptr + seq_idx)
+    if USE_KV_INDICES:
+        seq_len = (
+            tl.load(kv_indptr_ptr + seq_idx + 1)
+            - tl.load(kv_indptr_ptr + seq_idx)
+        )
+    else:
+        seq_len = tl.load(seq_lens_ptr + seq_idx)
+
+    output_offset = (
+        query_token_idx * output_stride_0
+        + query_head_idx * output_stride_1
+        + tl.arange(0, KV_LORA_RANK)
+    )
+    if seq_len <= 0:
+        tl.store(
+            output_ptr + output_offset,
+            tl.zeros((KV_LORA_RANK,), dtype=tl.float32).to(
+                output_ptr.type.element_ty
+            ),
+        )
+        if HAS_FINAL_LSE:
+            tl.store(
+                final_lse_ptr + query_token_idx * num_query_heads + query_head_idx,
+                float("-inf"),
+            )
+        return
 
     out_scale = None
     if out_scale_ptr is not None:
@@ -723,6 +790,19 @@ def _mla_decode_fwd_reduce_kernel(
     segm_expsum = tl.load(segm_expsum_ptr + segm_offset, mask=segm_mask, other=0.0)
     segm_expsum = segm_expsum * tl.math.exp2(segm_max - overall_max)
     overall_expsum = tl.sum(segm_expsum)
+    if HAS_FINAL_LSE:
+        # Stage 1 scales logits by log2(e) and accumulates with exp2. Convert the
+        # resulting log2-domain maximum back to the natural-log contract used by
+        # AITER's ASM MLA and ATOM's DCP merge.
+        final_lse = tl.where(
+            overall_expsum > 0.0,
+            overall_max * 0.6931471805599453 + tl.log(overall_expsum),
+            float("-inf"),
+        )
+        tl.store(
+            final_lse_ptr + query_token_idx * num_query_heads + query_head_idx,
+            final_lse,
+        )
 
     # load, rescale, and add segment attention outputs
     segm_output_offset = (
@@ -749,9 +829,4 @@ def _mla_decode_fwd_reduce_kernel(
         acc = tl.clamp(acc, FP8_MIN, FP8_MAX)
 
     # write result
-    output_offset = (
-        query_token_idx * output_stride_0
-        + query_head_idx * output_stride_1
-        + tl.arange(0, KV_LORA_RANK)
-    )
     tl.store(output_ptr + output_offset, acc.to(output_ptr.type.element_ty))
