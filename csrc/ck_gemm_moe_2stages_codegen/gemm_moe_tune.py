@@ -36,6 +36,7 @@ from aiter.fused_moe import (
     torch_moe_stage1,
     torch_moe_stage2,
 )
+from aiter.fused_moe_registry import make_fused_moe_impl_kernel_name
 from aiter.int4_utils import (
     convert_int8_to_uint32_int4,
     rearrange_4bit_elements,
@@ -5831,15 +5832,31 @@ class FmoeTuner(TunerCommon):
         """
         from functools import partial
 
-        from aiter.fused_moe_gfx942 import fused_moe_gfx942, get_tune_space
+        from aiter.ops.flydsl.fused_moe_gfx942 import (
+            get_tune_space,
+            run_flydsl_moe_gfx942,
+        )
 
-        results_base = self.run_config(args)
+        results_base = self._run_config_for_shapes(
+            args,
+            self.untunedf,
+            config_file=self.get_out_file(args.tune_file),
+        )
         better_kernels = {}
+        # --all removes the target rows from self.tunedf during preprocessing.
+        # Re-read the output file so exact baselines remain distinguishable from
+        # activation fallbacks returned by the runtime config lookup.
+        existing_tunedf = self.get_tuned_gemm_list(args.tune_file)
+        if (
+            "gfx" in self.keys
+            and "gfx" not in existing_tunedf.columns
+            and "cu_num" in existing_tunedf.columns
+        ):
+            existing_tunedf["gfx"] = existing_tunedf["cu_num"].map(gfx_from_cu_num)
         tuned_keys = (
-            set(self.tunedf[self.keys].apply(tuple, axis=1))
-            if self.tunedf is not None
-            and not self.tunedf.empty
-            and all(col in self.tunedf.columns for col in self.keys)
+            set(existing_tunedf[self.keys].apply(tuple, axis=1))
+            if not existing_tunedf.empty
+            and all(col in existing_tunedf.columns for col in self.keys)
             else set()
         )
 
@@ -5886,7 +5903,7 @@ class FmoeTuner(TunerCommon):
             config_string="",
             swiglu_limit=None,
         ):
-            return fused_moe_gfx942(
+            return run_flydsl_moe_gfx942(
                 hidden_states,
                 w1,
                 w2,
@@ -5921,10 +5938,12 @@ class FmoeTuner(TunerCommon):
                 continue
             block_m = 16
             ksplit = 0
-            run_1stage = 1
+            run_1stage = 0
             err1 = "0%"
             err2 = "0%"
-            kernelName1 = "fused_moe_gfx942__" + config_string
+            kernelName1 = make_fused_moe_impl_kernel_name(
+                "flydsl_gfx942", config_string
+            )
             kernelName2 = ""
             xbf16 = 0
             for i in range(len(self.untunedf)):

@@ -10,6 +10,8 @@ whether the optional dependency exists before relying on FlyDSL kernels.
 
 from packaging.version import Version
 
+from aiter.fused_moe_registry import register_fused_moe_impl
+
 from .moe_common import GateMode
 from .utils import is_flydsl_available
 
@@ -59,6 +61,11 @@ if is_flydsl_available():
     from .kernels.qk_norm_rope_quant import flydsl_qk_norm_rope_quant
     from .mla_reduce_kernels import flydsl_mla_reduce_v1
     from .moe_kernels import flydsl_moe_stage1, flydsl_moe_stage2
+
+    register_fused_moe_impl(
+        "flydsl_gfx942",
+        "aiter.ops.flydsl.fused_moe_gfx942:run_flydsl_moe_gfx942_impl",
+    )
 
     # from .linear_attention_kernels import flydsl_gdr_decode
 
