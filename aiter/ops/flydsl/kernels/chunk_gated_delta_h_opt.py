@@ -7,8 +7,9 @@ Gated Delta Net K5 hidden-state recurrence kernel (@flyc.kernel API).
 HIP-aligned fork: same ``mfma_f32_16x16x16bf16_1k`` instruction and warp
 partition (BT split-M, K split across waves, V not split) as the hand-tuned
 HIP/C++ K5 kernel; writes the public [..., V, K] layout through a [V][K]
-transpose buffer + b128 store. Serially over the NT chunks: store the h
-snapshot for K6, v_new = u - w @ h, then
+transpose buffer + b128 store (fp32 snapshots use two half-BV LDS rounds).
+Serially over the NT chunks: store the h snapshot for K6,
+v_new = u - w @ h, then
 h = h * exp(g_last) + k^T @ (v_new * exp(g_last - g_cumsum)).
 """
 
@@ -72,7 +73,7 @@ def _make_bf16_converter(trunc: bool):
     return lambda v: v.to(fx.BFloat16)
 
 
-def compile_chunk_gated_delta_h_mfma16_hip(
+def compile_chunk_gated_delta_h_opt(
     *,
     K: int,
     V: int,
@@ -88,6 +89,7 @@ def compile_chunk_gated_delta_h_mfma16_hip(
     IS_VARLEN: bool = True,
     WU_CONTIGUOUS: bool = True,
     STATE_DTYPE_BF16: bool = False,
+    SNAPSHOT_DTYPE_BF16: bool = True,
     G_IS_LOG2_SCALED: bool = False,
     USE_STATE_INDICES: bool = False,
     SCHED_GFX942: bool = False,
@@ -98,11 +100,13 @@ def compile_chunk_gated_delta_h_mfma16_hip(
 
     ``STATE_DTYPE_BF16`` puts ``h0`` / ``ht`` in bf16 (promote on load, demote
     on store); the f32 accumulator and the LDS layouts are unchanged.
+
+    ``SNAPSHOT_DTYPE_BF16=False`` writes fp32 snapshots in two half-BV LDS rounds.
     """
     # BT=64 is baked into the wave mapping / load batching / BT_STEPS, gated_v
     # alias-reuses h_state panel 1, and the LDS layout is validated at K=V=128.
-    assert BT == 64, f"chunk_gated_delta_h_mfma16_hip only supports BT=64, got BT={BT}"
-    assert K == 128, f"chunk_gated_delta_h_mfma16_hip only supports K=128, got K={K}"
+    assert BT == 64, f"chunk_gated_delta_h_opt only supports BT=64, got BT={BT}"
+    assert K == 128, f"chunk_gated_delta_h_opt only supports K=128, got K={K}"
     assert BV % 16 == 0, f"BV must be a multiple of the MFMA N of 16, got BV={BV}"
     NUM_K_BLOCKS = K // 64
 
@@ -146,7 +150,16 @@ def compile_chunk_gated_delta_h_mfma16_hip(
     # [V][K] transpose buffer for the h snapshot store: V-major with K innermost
     # so 8 adjacent K are one ds_read_b128 + one 16 B-aligned buffer_store.
     LDS_HT_STRIDE = K
-    LDS_HT_ELEMS = BV * LDS_HT_STRIDE
+    if SNAPSHOT_DTYPE_BF16:
+        HT_NUM = fx.BFloat16
+        SNAP_ROUNDS = 1
+    else:
+        HT_NUM = fx.Float32
+        SNAP_ROUNDS = 2 if N_REPEAT >= 2 else 1
+    assert SNAP_ROUNDS <= 2, "the chunk loop hand-places round 1, so 2 is the max"
+    SNAP_ROUND_SLOTS = N_REPEAT // SNAP_ROUNDS
+    SNAP_ROUND_ROWS = SNAP_ROUND_SLOTS * MFMA_N
+    LDS_HT_ELEMS = SNAP_ROUND_ROWS * LDS_HT_STRIDE
 
     # ``wp`` / ``hp`` must each stay one Array: their views span both 64-K
     # panels with a panel stride, so the panels have to be contiguous.
@@ -155,7 +168,7 @@ def compile_chunk_gated_delta_h_mfma16_hip(
         wp: fx.Array[fx.BFloat16, LDS_WP_ELEMS, 16]
         kp: fx.Array[fx.BFloat16, LDS_KP_ELEMS, 16]
         hp: fx.Array[fx.BFloat16, LDS_HP_ELEMS, 16]
-        ht: fx.Array[fx.BFloat16, LDS_HT_ELEMS, 16]
+        ht: fx.Array[HT_NUM, LDS_HT_ELEMS, 16]
 
     LOAD_VEC_WIDTH = 8  # 8 bf16 = 16 bytes = buffer_load_dwordx4
     THREADS_PER_ROW_64 = 64 // LOAD_VEC_WIDTH  # 8
@@ -164,7 +177,7 @@ def compile_chunk_gated_delta_h_mfma16_hip(
 
     K_STEPS_PER_BLOCK = 64 // K_STEP
 
-    @flyc.kernel(name="chunk_gdn_fwd_h_flydsl_mfma16_hip")
+    @flyc.kernel(name="chunk_gdn_fwd_h_flydsl_opt")
     def gdn_h_kernel(
         k_tensor: fx.Tensor,
         v_tensor: fx.Tensor,
@@ -214,6 +227,7 @@ def compile_chunk_gated_delta_h_mfma16_hip(
             fx.rocdl.BufferCopy64b() if STATE_DTYPE_BF16 else fx.rocdl.BufferCopy128b(),
             state_num,
         )
+        cp_snapshot_x4 = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Float32)
 
         if const_expr(IS_VARLEN):
             cu_view = _gview(cu_seqlens_tensor, None, (N_val + 1, 1), (1, 1))
@@ -276,17 +290,18 @@ def compile_chunk_gated_delta_h_mfma16_hip(
 
         sK = [_k_panel_view(kb, 4) for kb in range(NUM_K_BLOCKS)]
         sKw = [_k_panel_view(kb, 2) for kb in range(NUM_K_BLOCKS)]
-        # [V][K] transpose buffer: [BV][K] row-major + S<4,2,5>, the layout form
-        # of the hand-written ``k_group ^ (v & 0xF)`` scatter.
+        # [V][K] transpose buffer: [rows][K] row-major + S<4,2,5>, the layout
+        # form of the hand-written ``k_group ^ (v & 0xF)`` scatter.
         sHT = lds.ht.view(
             fx.make_composed_layout(
                 fx.static(fx.SwizzleType.get(4, 2, 5)),
-                fx.make_layout((BV, K // 4, 4), (K, 4, 1)),
+                fx.make_layout((SNAP_ROUND_ROWS, K // 4, 4), (K, 4, 1)),
             )
         )
 
         # Every LDS <-> register move here is one k_group (4 bf16 = one b64).
         cp_lds_x4 = fx.make_copy_atom(fx.UniversalCopy64b(), fx.BFloat16)
+        cp_lds_f32x4 = fx.make_copy_atom(fx.UniversalCopy128b(), fx.Float32)
 
         def _lds_read_x4(tile):
             return _load_vec(cp_lds_x4, tile, 4, fx.BFloat16)
@@ -380,11 +395,12 @@ def compile_chunk_gated_delta_h_mfma16_hip(
         VEC = LOAD_VEC_WIDTH
 
         # h: [B, NT, H, V, K] (VK) -- base = (boh*H + i_h) * V * K
+        SNAP_VEC = VEC if SNAPSHOT_DTYPE_BF16 else 4
         h_view = _gview(
             h_tensor,
             (boh64 * H + i_h64) * (V * K),
-            (NT, V, K // VEC, VEC),
-            (H * V * K, K, VEC, 1),
+            (NT, V, K // SNAP_VEC, SNAP_VEC),
+            (H * V * K, K, SNAP_VEC, 1),
         )
 
         # k: [B, T, Hg, K] -- base = (bos*Hg + i_h//(H//Hg)) * K
@@ -583,23 +599,60 @@ def compile_chunk_gated_delta_h_mfma16_hip(
             def _bt_abs_row(elem_i, i_t_i32=i_t_i32):
                 return i_t_i32 * BT + wid * 16 + lane_m_base * 4 + elem_i
 
+            def _snap_stage_round(rnd):
+                for kb in range_constexpr(NUM_K_BLOCKS):
+                    for slot in range_constexpr(SNAP_ROUND_SLOTS):
+                        acc_j = rnd * SNAP_ROUND_SLOTS + slot
+                        acc_val = fx.Vector(frag_h_accs[kb][None, None, acc_j].load())
+                        _store_vec(
+                            cp_lds_f32x4,
+                            fx.slice(
+                                sHT, (slot * 16 + lane_n, kb * 16 + row_block, None)
+                            ),
+                            acc_val,
+                            4,
+                            fx.Float32,
+                        )
+
+            def _snap_flush_round(rnd, i_t_i32=i_t_i32):
+                K_VECS4 = K // 4
+                NUM_VECS = SNAP_ROUND_ROWS * K_VECS4
+                for vbase in range_constexpr(0, NUM_VECS, BLOCK_THREADS):
+                    vec_idx = vbase + tid
+                    kv = vec_idx % K_VECS4
+                    v_loc = vec_idx // K_VECS4
+                    val = _load_vec(
+                        cp_lds_f32x4, fx.slice(sHT, (v_loc, kv, None)), 4, fx.Float32
+                    )
+                    v_global = i_v * BV + rnd * SNAP_ROUND_ROWS + v_loc
+                    _store_vec(
+                        cp_snapshot_x4,
+                        fx.slice(h_view, (i_t_i32, v_global, kv, None)),
+                        val,
+                        4,
+                        fx.Float32,
+                    )
+
             # Stage h_accs into the h_state panels (GEMM1 B operand) and the
             # [V][K] transpose buffer (b128 HBM store).
             for kb in range_constexpr(NUM_K_BLOCKS):
                 for acc_j in range_constexpr(N_REPEAT):
-                    acc_bf16 = _f32x4_to_bf16x4(
-                        fx.Vector(frag_h_accs[kb][None, None, acc_j].load())
-                    )
+                    acc_val = fx.Vector(frag_h_accs[kb][None, None, acc_j].load())
+                    acc_bf16 = _f32x4_to_bf16x4(acc_val)
                     hp_col = acc_j * 16 + lane_n
                     _lds_write_x4(
                         fx.slice(sH, (hp_col, (None, row_block, kb))), acc_bf16
                     )
 
-                    # The sHT swizzle breaks bank conflicts on this scatter
-                    # write while keeping a k_group contiguous -> one b64.
-                    _lds_write_x4(
-                        fx.slice(sHT, (hp_col, kb * 16 + row_block, None)), acc_bf16
-                    )
+                    if const_expr(SNAPSHOT_DTYPE_BF16):
+                        # The sHT swizzle breaks bank conflicts on this scatter
+                        # write while keeping a k_group contiguous -> one b64.
+                        _lds_write_x4(
+                            fx.slice(sHT, (hp_col, kb * 16 + row_block, None)), acc_bf16
+                        )
+
+            if const_expr(not SNAPSHOT_DTYPE_BF16):
+                _snap_stage_round(0)
 
             # w/k for this chunk already in LDS (prologue or prev GEMM2 end).
             gpu.barrier()
@@ -687,9 +740,15 @@ def compile_chunk_gated_delta_h_mfma16_hip(
             for kb in range_constexpr(GEMM1_PF_SPLIT, NUM_K_BLOCKS):
                 _gemm1_kblock(kb)
 
+            if const_expr(not SNAPSHOT_DTYPE_BF16):
+                _snap_flush_round(0)
+
             # WAR barrier: GEMM1 is done reading the h_state panels, so gated_v
             # may now overwrite panel 1.
             gpu.barrier()
+
+            if const_expr(SNAP_ROUNDS > 1):
+                _snap_stage_round(1)
 
             if const_expr(USE_G):
                 exp_g_last = _fast_exp(g_last)
@@ -770,24 +829,28 @@ def compile_chunk_gated_delta_h_mfma16_hip(
 
             # h snapshot store: the transpose buffer is read-only from here and
             # gated_v is in a different LDS region, so the two do not conflict.
-            K_VECS = K // LOAD_VEC_WIDTH
-            NUM_HT_VECS = BV * K_VECS
-            for vbase in range_constexpr(0, NUM_HT_VECS, BLOCK_THREADS):
-                vec_idx = vbase + tid
-                kv = vec_idx % K_VECS
-                v_loc = vec_idx // K_VECS
-                kg_lo = kv * 2
-                val_lo = _lds_read_x4(fx.slice(sHT, (v_loc, kg_lo, None)))
-                val_hi = _lds_read_x4(fx.slice(sHT, (v_loc, kg_lo + 1, None)))
-                vec8 = val_lo.shuffle(val_hi, [0, 1, 2, 3, 4, 5, 6, 7])
-                v_global = i_v * BV + v_loc
-                _store_vec(
-                    cp_bf16x8,
-                    fx.slice(h_view, (i_t_i32, v_global, kv, None)),
-                    vec8,
-                    LOAD_VEC_WIDTH,
-                    fx.BFloat16,
-                )
+            if const_expr(SNAP_ROUNDS > 1):
+                _snap_flush_round(1)
+
+            if const_expr(SNAPSHOT_DTYPE_BF16):
+                K_VECS = K // LOAD_VEC_WIDTH
+                NUM_HT_VECS = BV * K_VECS
+                for vbase in range_constexpr(0, NUM_HT_VECS, BLOCK_THREADS):
+                    vec_idx = vbase + tid
+                    kv = vec_idx % K_VECS
+                    v_loc = vec_idx // K_VECS
+                    kg_lo = kv * 2
+                    val_lo = _lds_read_x4(fx.slice(sHT, (v_loc, kg_lo, None)))
+                    val_hi = _lds_read_x4(fx.slice(sHT, (v_loc, kg_lo + 1, None)))
+                    vec8 = val_lo.shuffle(val_hi, [0, 1, 2, 3, 4, 5, 6, 7])
+                    v_global = i_v * BV + v_loc
+                    _store_vec(
+                        cp_bf16x8,
+                        fx.slice(h_view, (i_t_i32, v_global, kv, None)),
+                        vec8,
+                        LOAD_VEC_WIDTH,
+                        fx.BFloat16,
+                    )
 
             # -- GEMM2: h += k^T @ v_new_gated, each 64-K block its own M tile,
             # k panel view and accumulator. A takes an fx.slice per k-tile.
@@ -904,5 +967,5 @@ def compile_chunk_gated_delta_h_mfma16_hip(
 
 
 __all__ = [
-    "compile_chunk_gated_delta_h_mfma16_hip",
+    "compile_chunk_gated_delta_h_opt",
 ]
