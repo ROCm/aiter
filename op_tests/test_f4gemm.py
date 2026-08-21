@@ -30,7 +30,14 @@ import torch
 import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
-from aiter.ops.gemm_op_a4w4 import MXFP8_OUT_SCALE_BLOCK, unpack_mxfp8_out_scale
+from aiter.ops.asm.f4gemm import (
+    MXFP8_OUT_SCALE_BLOCK,
+    _gemm_a4w4o4_asm,
+    _gemm_a4w4o8_asm,
+    _gemm_mxfp4_asm,
+    _gemm_nvfp4_asm,
+    unpack_mxfp8_out_scale,
+)
 from aiter.ops.shuffle import shuffle_scale_f4, shuffle_weight_f4
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 from aiter.utility import fp4_utils
@@ -367,7 +374,7 @@ def test_gemm(
     if intype == "nvfp4":
 
         def run_asm(A, B, sA, sB, gA, gB):
-            return aiter.gemm_nvfp4_asm(
+            return _gemm_nvfp4_asm(
                 A,
                 B,
                 sA,
@@ -383,7 +390,7 @@ def test_gemm(
     else:
 
         def run_asm(A, B, sA, sB):
-            return aiter.gemm_mxfp4_asm(
+            return _gemm_mxfp4_asm(
                 A,
                 B,
                 sA,
@@ -453,9 +460,9 @@ def test_gemm(
             ret[f"{name} err"] = float("nan")
             ret[f"{name} result"] = "not support"
             continue
-        # Func-mode only: check the high-level op contracts by outtype -- bf16 ->
-        # gemm_a4w4 (single tensor), fp4 -> gemm_a4w4o4 (single tensor [.,N//2]),
-        # fp8 -> gemm_a4w4o8 ((data, scale) tuple). Not timed/tabled.
+        # Func-mode only: check the low-precision op contracts by outtype -- fp4 ->
+        # _gemm_a4w4o4_asm (single tensor [.,N//2]), fp8 -> _gemm_a4w4o8_asm
+        # ((data, scale) tuple). bf16 output is covered by run_asm. Not timed/tabled.
         if mode == "func":
             a4_kwargs = {"apreshuffle": bool(apre)}
             if intype == "nvfp4":
@@ -467,23 +474,17 @@ def test_gemm(
                 )
             args = (inp["A"], inp["B"], inp["sA"], inp["sB"])
             if out_fp8:
-                o, s = aiter.gemm_a4w4o8(*args, **a4_kwargs)
+                o, s = _gemm_a4w4o8_asm(*args, **a4_kwargs)
                 assert o.shape == out[0].shape and s.shape == out[1].shape, (
                     f"gemm_a4w4o8 shape mismatch: {tuple(o.shape)}/{tuple(s.shape)} "
                     f"vs {tuple(out[0].shape)}/{tuple(out[1].shape)}"
                 )
             elif out_fp4:
-                res = aiter.gemm_a4w4o4(*args, **a4_kwargs)
+                res = _gemm_a4w4o4_asm(*args, **a4_kwargs)
                 assert not isinstance(res, tuple), "gemm_a4w4o4 must return a tensor"
                 assert (
                     res.shape == out.shape
                 ), f"gemm_a4w4o4 shape mismatch: {tuple(res.shape)} vs {tuple(out.shape)}"
-            else:  # bf16
-                res = aiter.gemm_a4w4(*args, dtype=out_dtype, **a4_kwargs)
-                assert not isinstance(res, tuple), "gemm_a4w4 must return a tensor"
-                assert (
-                    res.shape == out.shape
-                ), f"gemm_a4w4 shape mismatch: {tuple(res.shape)} vs {tuple(out.shape)}"
         if out_fp4:
             # e2m1 is deterministic: compare dequantized values with zero
             # tolerance (exact fp4-code match). Borderline RNE ties may differ.

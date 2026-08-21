@@ -27,6 +27,7 @@ import torch
 
 import aiter
 from aiter import dtypes
+from aiter.ops.asm.mxfp8fp4gemm import _gemm_a8w4_asm, _gemm_a8w8_asm
 from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
 from aiter.ops.shuffle import (
     shuffle_mxfp8fp4_a,
@@ -246,7 +247,7 @@ def test_gemm(
     # Single ASM kernel under test, dispatched by intype. Inputs passed as ARGS so
     # run_perftest can rotate them (defeats the L2 hot-cache). Dispatch is
     # heuristic by default (kernelName=""); an explicit --knl-name forces that .co.
-    kern = aiter.gemm_a8w4_mxfp8 if intype == "a8w4" else aiter.gemm_a8w8_mxfp8
+    kern = _gemm_a8w4_asm if intype == "a8w4" else _gemm_a8w8_asm
     knl = knl_name or ""
 
     def run_asm(A, B, sA, sB):
