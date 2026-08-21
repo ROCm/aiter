@@ -197,7 +197,7 @@ def _wmma_bf16(a, b, c):
     ).result
 
 
-def _qk_gemm(*, k_mgr, k_lds, q_frags, n_block, lane_idx):
+def _qk_gemm(*, k_values, q_frags, n_block):
     """GEMM1: S^T = K @ Q^T for one resident KV tile (this wave's 16 Q rows).
 
     WMMA convention (gfx1250): S^T[kv,q] = K @ Q^T with **K = A-operand** (src_a)
@@ -207,48 +207,30 @@ def _qk_gemm(*, k_mgr, k_lds, q_frags, n_block, lane_idx):
     element ``si`` holds S^T[kv = kv_tile*WMMA_N + (l//16)*8 + si, q = l%16]
     (kv on the C-row / M axis, q on the C-col / N axis; kv is the 8-strided one).
 
-    All K LDS->VGPR reads are issued as **one ds_load_b128 burst up front** (no
-    interleave with the WMMA stream -> no wmma->ds_load issue bubble), drained by a
-    single ``s_wait_dscnt(0)`` before any WMMA. Each K WMMA fragment is two
-    ds_load_b128 (the two 16-col halves of a d-tile) shuffled into a v16 fragment
-    matching the Q frag layout.
+    ``k_values`` is the already-burst-loaded flat ``(kv, dt, half)`` list of
+    v8-bf16 ds_load results (from ``k_mgr.load_k_to_reg``, kept OUT of the WMMA stream so
+    there is no wmma->ds_load issue bubble). A single ``s_wait_dscnt(0)`` drains
+    that burst here before any WMMA; each K fragment is the two 16-col halves of a
+    d-tile shuffled into a v16 fragment matching the Q frag layout.
     """
     NKV = n_block // WMMA_N          # output kv tiles (WMMA_N kv rows each)
     NDT = len(q_frags)               # contraction d-tiles (== qk_hdim // WMMA_K)
 
-    # Flat schedule of ds_load_b128: (kv, dt, half). kv outer / dt / half inner so
-    # a kv-tile's dt accumulations stay contiguous. Two halves shuffle to a v16 frag.
-    plan = [(kv, dt, half) for kv in range(NKV) for dt in range(NDT) for half in range(2)]
-    n_loads = len(plan)
+    # Drain the whole ds_load burst once; every k_values entry is now resident.
+    rocdl.s_wait_dscnt(0)
 
-    # All ds_load LDS source pointers for this K tile, in the SAME (kv, dt, half)
-    # order as `plan` -> k_ptrs[j] is plan[j]'s pointer. Pure index math (no memory op);
-    # the loads below issue from these precomputed pointers.
-    k_ptrs = k_mgr.ds_load_ptrs(ptr_lds=k_lds, lane_idx=lane_idx)
-    v8_ty = fx.Vector.make_type(8, fx.BFloat16)
-
-    # HEAD-style software pipeline: keep n_inflight ds_loads in flight, interleaving
-    # each fragment's WMMA with the next load's issue.
-    n_inflight = 3
-    inflight = []
-    for issued in range(min(n_inflight, n_loads)):
-        inflight.append(fx.Vector(llvm_dialect.load(v8_ty, k_ptrs[issued])))
-    issued = len(inflight)
+    # Consume in (kv, dt, half) order: a (half=0, half=1) pair shuffles into a v16
+    # K fragment; NDT d-tiles accumulate into one kv-tile's s_acc.
     s_acc = [None] * NKV
-    lo_hold = None
-    for j in range(n_loads):
-        rocdl.s_wait_dscnt(min(n_inflight - 1, n_loads - j - 1))
-        val = inflight.pop(0)
-        if issued < n_loads:
-            inflight.append(fx.Vector(llvm_dialect.load(v8_ty, k_ptrs[issued])))
-            issued += 1
-        if j % 2 == 0:
-            lo_hold = val
-            continue
-        kv, dt, _ = plan[j]
-        k_frag = lo_hold.shuffle(val, list(range(16)))
-        acc = s_acc[kv] if dt > 0 else fx.Vector.filled(8, 0.0, fx.Float32)
-        s_acc[kv] = _wmma_bf16(k_frag, q_frags[dt], acc)
+    j = 0
+    for kv in range(NKV):
+        for dt in range(NDT):
+            lo = k_values[j]
+            hi = k_values[j + 1]
+            j += 2
+            k_frag = lo.shuffle(hi, list(range(16)))
+            acc = s_acc[kv] if dt > 0 else fx.Vector.filled(8, 0.0, fx.Float32)
+            s_acc[kv] = _wmma_bf16(k_frag, q_frags[dt], acc)
     return s_acc
 
 
@@ -371,7 +353,7 @@ def _softmax(*, s, m_prev, d_prev, lane_idx, n_block,
     return p, m_new, d_new, corr
 
 
-def _pv_gemm(*, v_mgr, v_lds, p, v_hdim, n_block, lane_idx, o_acc=None):
+def _pv_gemm(*, v_values, p, v_hdim, n_block, o_acc=None):
     """GEMM2: O^T = V^T @ P^T for one resident KV tile — the second WMMA.
 
     WMMA convention (gfx1250): D[M=d, N=q] with **A = V^T** (src_a, transpose-loaded
@@ -381,37 +363,33 @@ def _pv_gemm(*, v_mgr, v_lds, p, v_hdim, n_block, lane_idx, o_acc=None):
     accumulators; lane ``l`` element ``si`` of tile ``dt`` holds
     O[q = l%16, d = dt*WMMA_M + (l//16)*8 + si] — the OManager16b frag layout.
 
-    Online accumulation: pass the running ``o_acc`` (already rescaled by ``corr``);
-    each tile's PV adds onto it. ``o_acc=None`` starts from zero (single tile / first
-    tile). Each WMMA operand is a v16 bf16 fragment = two 16-wide halves shuffled:
+    ``v_values`` is the already-burst-loaded flat ``(dt, kt, half)`` list of v8-bf16
+    transpose-load results (from ``v_mgr.load_v_to_reg``, kept OUT of the WMMA stream so there is
+    no wmma->ds_load issue bubble); a single ``s_wait_dscnt(0)`` drains that burst
+    here before any WMMA. Online accumulation: pass the running ``o_acc`` (already
+    rescaled by ``corr``); each tile's PV adds onto it. ``o_acc=None`` starts from
+    zero. Each WMMA operand is a v16 bf16 fragment = two 16-wide halves shuffled:
     A from V-tiles (kv, kv+16), B from softmax tiles (p[2kt], p[2kt+1]).
     """
     d_tiles = v_hdim // WMMA_M       # output d-tiles (M axis, WMMA_M d rows each)
     nkt = n_block // WMMA_K          # kv contraction tiles (K=32 kv each)
 
+    # Drain the whole V transpose burst once; every v_values entry is now resident.
+    rocdl.s_wait_dscnt(0)
+
     out = []
+    j = 0
     for dt in range(d_tiles):
         acc = o_acc[dt] if o_acc is not None else fx.Vector.filled(8, 0.0, fx.Float32)
         for kt in range(nkt):
             # A-operand: V^T frag = two 16-kv transpose-load tiles -> v16 bf16.
-            v_lo = v_mgr.load_lds_to_vgpr_tile_as_v(
-                ptr_lds=v_lds, kv_idx=kt * WMMA_K, d_idx=dt * WMMA_M, lane_idx=lane_idx,
-            )
-            v_hi = v_mgr.load_lds_to_vgpr_tile_as_v(
-                ptr_lds=v_lds, kv_idx=kt * WMMA_K + WMMA_N, d_idx=dt * WMMA_M,
-                lane_idx=lane_idx,
-            )
-            rocdl.s_wait_dscnt(0)
+            v_lo = v_values[j]
+            v_hi = v_values[j + 1]
+            j += 2
             v_frag = v_lo.shuffle(v_hi, list(range(16)))
             # B-operand: P^T frag = two consecutive softmax kv-tiles -> v16 bf16.
             p_frag = p[2 * kt].shuffle(p[2 * kt + 1], list(range(16)))
             acc = _wmma_bf16(v_frag, p_frag, acc)
-            # NOTE (mode-2): a rocdl.sched_barrier(0) here (to stop the compiler
-            # software-pipelining the NEXT ds_load_tr16 above this wmma -> a V-frag WAR
-            # that corrupts a full 16x16 fragment) was tried. It roughly halves the
-            # catastrophic-garbage class at 8192nc but provides NO help at scale
-            # (16384c stays ~55% defective) while serializing PV loads (perf cost).
-            # Removed per the "minimize covers" directive -- see mode-2 memory note.
         out.append(acc)
     return out
 
@@ -570,13 +548,31 @@ def _core_attention(
 
     # (2) KMgr param calc — pure address arithmetic (no memory op), hoisted into the
     # Q global-load shadow.
-    start_pp = start_tile % fx.Int32(N_KV_PP)
+    #
+    # Ping-pong parity is LOCAL to this WG's tile stream: the prologue always loads the
+    # first tile (start_tile) into buffer 0, and the main loop selects buffers by the
+    # 0-based LOCAL iteration index (not the absolute tile index), so start_tile parity
+    # is irrelevant. This lets the 2x-unrolled loop pick buffers at COMPILE time (even
+    # local iter -> buffer 0, odd -> buffer 1) and reach buffer 1 from buffer-0 ds_load
+    # pointers via a constant immediate offset.
+    start_pp = 0
     start_row0 = start_tile * fx.Int32(n_block)
     k_gptrs, k_lds_ptrs = k_mgr.global_load_ptrs(
         ptr_lds=_k_lds_buf(start_pp),
         ptr_K=ptr_K,
         stride_k_seq=stride_k_seq,
         stride_k_head=stride_k_head,
+        kv_head=kv_head,
+        kv_row0=kv_start + start_row0,
+        kv_valid=_kv_valid(start_row0),
+        warp_idx=warp_idx,
+        lane_idx=lane_idx,
+    )
+    v_gptrs, v_lds_ptrs = v_mgr.global_load_ptrs(
+        ptr_lds=_v_lds_buf(start_pp),
+        ptr_V=ptr_V,
+        stride_v_seq=stride_v_seq,
+        stride_v_head=stride_v_head,
         kv_head=kv_head,
         kv_row0=kv_start + start_row0,
         kv_valid=_kv_valid(start_row0),
@@ -595,17 +591,7 @@ def _core_attention(
     # loaders; later tiles prefetch inside the loop). Nothing runs between these loads
     # and the prologue barrier.
     _async_load_to_lds(k_gptrs, k_lds_ptrs, cluster=True)
-    v_mgr.async_load_vram_to_lds(
-        ptr_lds=_v_lds_buf(start_pp),
-        ptr_V=ptr_V,
-        stride_v_seq=stride_v_seq,
-        stride_v_head=stride_v_head,
-        kv_head=kv_head,
-        kv_row0=kv_start + start_row0,
-        kv_valid=_kv_valid(start_row0),
-        warp_idx=warp_idx,
-        lane_idx=lane_idx,
-    )
+    _async_load_to_lds(v_gptrs, v_lds_ptrs, cluster=True)
     # mode-2 async-source-WAR fix (ISA-proven): the prologue cluster_loads (K + V) must
     # issue as ONE packed burst before the compiler reuses their source address VGPRs
     # (part2's Q-scaling clobbers exactly those regs). Lighter fences here (s_wait_asynccnt
@@ -646,51 +632,128 @@ def _core_attention(
         _raw(d_init),
     ] + [_raw(fx.Vector.filled(8, 0.0, fx.Float32)) for _ in range(d_tiles)]
 
-    _lo = arith.index_cast(T.index, arith.unwrap(start_tile))
-    _hi = arith.index_cast(T.index, n_tiles)
-    _step = arith.index(1)
+    # ---- Hoisted ds_load LDS base pointers: compute the 2 per-lane LDS->VGPR base
+    # pointers for BOTH K and V exactly ONCE here, for ping-pong buffer 0. Each block's
+    # full set of ds_load addresses collapses to just 2 bases (K: split by half; V: by
+    # d-tile parity) + compile-time immediates applied inside load_k_to_reg/load_v_to_reg
+    # -- saving ~15 address VGPRs/lane each vs the former 32-pointer lists. The
+    # 2x-unrolled body reaches buffer 1 by adding the compile-time LDS_SIZE_K_V immediate
+    # (buffer 1 is slot_bytes past buffer 0 for both K and V in the interleaved
+    # [K.pp0|V.pp0][K.pp1|V.pp1] layout), folded together with the per-tile immediate into
+    # the ds_read offset: field -- so per-tile ds address VALU is eliminated. ----
+    LDS_SIZE_K_V = slot_bytes  # k_blk_bytes + v_blk_bytes; buffer-1 stride for K and V
+    k_lds_ld_ptrs = k_mgr.ds_load_ptrs(ptr_lds=_k_lds_buf(0), lane_idx=lane_idx)
+    v_lds_ld_ptrs = v_mgr.ds_load_ptrs(ptr_lds=_v_lds_buf(0), lane_idx=lane_idx)
 
     # ========================================================================
-    # Main KV loop — stream tiles [start_tile, n_tiles) through the N_KV_PP ping-pong
-    # ring. v1 shape (raw scf.for_, per [[fdsl-ast-rewriter-scope]]): a single UNIFORM
-    # loop, no first/last peel. Each iter opens by draining outstanding async and
-    # barriering, after which the current tile's KV is GUARANTEED resident in LDS
-    # (start_tile from the prologue; every later tile from THIS loop's end-of-body bulk
-    # prefetch into the other ping-pong buffer). The body computes on buffer
-    # t % N_KV_PP, then prefetches tile t+1 into (t+1) % N_KV_PP.
+    # Main KV loop -- stream tiles [start_tile, n_tiles) through the N_KV_PP ping-pong
+    # ring, MANUALLY UNROLLED BY 2. Buffer selection is by 0-based LOCAL iteration
+    # parity made COMPILE-TIME by the unroll: even local iter -> buffer 0, odd ->
+    # buffer 1. Because the buffer is compile-time, the ds_load LDS source pointers are
+    # computed once (above, for buffer 0) and buffer 1 is reached by a folded immediate.
     #
-    # TODO(perf): replace the end-of-body bulk async_load with per-write-tile
-    # async_load_vram_to_lds_wr_tile interleaved between QK/softmax/PV (order tuned by
-    # thread trace) so the tile t+1 fetch overlaps tile t's compute.
+    # Each `main_loop` call is one tile: it drains outstanding async + barriers (its KV
+    # is then GUARANTEED resident -- start_tile from the prologue, every later tile from
+    # the previous call's top-of-body bulk prefetch into the OTHER buffer), issues the
+    # tile t+1 prefetch UP FRONT into the other buffer, then computes QK->softmax->PV on
+    # its own buffer while that async copy runs, drained at the next call's top.
+    #
+    # The step-2 scf.for covers the even-count prefix [start_tile, even_hi_tile); a
+    # runtime scf.if handles the final tile when the local tile count is odd (a naive
+    # step-2 loop would run one tile past n_tiles).
+    #
+    # TODO(perf): go finer still -- per-write-tile async_load interleaved between the
+    # QK/softmax/PV ops (order tuned by thread trace) rather than one bulk burst.
     # ========================================================================
-    for _tile_iv, _iargs, _loop_res in scf.for_(_lo, _hi, _step, iter_args=_init):
-        t = fx.Int32(arith.index_cast(T.i32, _tile_iv))
-
-        # Current tile's KV is already in LDS. Drain the async that filled it, then
-        # barrier so no wave still reads the buffer a later prefetch will overwrite.
-        rocdl.s_wait_asynccnt(0)
-        gpu.barrier()
-
-        # Current tile lives in ping-pong buffer t % N_KV_PP.
-        cur_pp = t % fx.Int32(N_KV_PP)
-        k_cur = _k_lds_buf(cur_pp)
-        v_cur = _v_lds_buf(cur_pp)
+    def main_loop(t, is_odd, state):
+        # Compile-time ping-pong: even local iter -> buffer 0, odd -> buffer 1. This
+        # tile reads its own buffer (buffer-0 pointers + this immediate); the tile t+1
+        # prefetch writes the OTHER buffer.
+        lds_imm_offset = LDS_SIZE_K_V if is_odd else 0
+        nxt_pp_const = 0 if is_odd else 1
 
         kv_tile_start = t * fx.Int32(n_block)  # this tile's first (batch-relative) kv row
 
         # Unpack loop-carried state.
-        m_prev = fx.Float32(_iargs[0])
-        d_prev = fx.Float32(_iargs[1])
-        o_acc = [fx.Vector(_iargs[2 + dt]) for dt in range(d_tiles)]
+        m_prev = fx.Float32(state[0])
+        d_prev = fx.Float32(state[1])
+        o_acc = [fx.Vector(state[2 + dt]) for dt in range(d_tiles)]
 
-        # ---- GEMM1: S^T = K @ Q^T for this KV tile (== P^T pre-softmax). ----
-        s = _qk_gemm(
-            k_mgr=k_mgr,
-            k_lds=k_cur,
-            q_frags=q_frags,
-            n_block=n_block,
+        # ---- Address phase: compute ALL K + V pointers as pure VALU up front, BEFORE
+        # the async drain so this address VALU overlaps the outstanding copy -- the
+        # tile t+1 global->LDS prefetch sources/dests for BOTH K and V, AND this
+        # tile's K + V ds_load LDS sources. Computing the next-tile global pointers
+        # unconditionally is safe: pure arithmetic (create_llvm_ptr, no access); only
+        # the async ISSUE below is guarded by `nxt < n_tiles`. ----
+        nxt = t + fx.Int32(1)
+        nxt_row0 = nxt * fx.Int32(n_block)
+        nxt_valid = _kv_valid(nxt_row0)
+        k_next_gptrs, k_next_lds_ptrs = k_mgr.global_load_ptrs(
+            ptr_lds=_k_lds_buf(nxt_pp_const),
+            ptr_K=ptr_K,
+            stride_k_seq=stride_k_seq,
+            stride_k_head=stride_k_head,
+            kv_head=kv_head,
+            kv_row0=kv_start + nxt_row0,
+            kv_valid=nxt_valid,
+            warp_idx=warp_idx,
             lane_idx=lane_idx,
         )
+        v_next_gptrs, v_next_lds_ptrs = v_mgr.global_load_ptrs(
+            ptr_lds=_v_lds_buf(nxt_pp_const),
+            ptr_V=ptr_V,
+            stride_v_seq=stride_v_seq,
+            stride_v_head=stride_v_head,
+            kv_head=kv_head,
+            kv_row0=kv_start + nxt_row0,
+            kv_valid=nxt_valid,
+            warp_idx=warp_idx,
+            lane_idx=lane_idx,
+        )
+        # Current tile's KV is already resident in its buffer (prefetched during the
+        # previous tile's compute). Drain that async, then cross-wave barrier so no
+        # wave still reads the OTHER buffer that this tile's t+1 prefetch is about to
+        # overwrite. `sched_barrier(0)` then pins all the address VALU above so the K/V
+        # memory ops below issue back-to-back (no address VALU interleaved into the
+        # load burst).
+        rocdl.s_wait_asynccnt(0)
+        gpu.barrier()
+        rocdl.sched_barrier(0)
+
+        # ---- Load phase: burst ALL this-tile K ds_loads (out of the WMMA stream),
+        # THEN issue the tile t+1 async prefetch (K + V) so its issue shadows the
+        # ds_load latency. The prefetch targets the OTHER ping-pong buffer, so it
+        # never races this tile's reads of buffer t % N_KV_PP; the barrier above
+        # already retired tile t-1's reads of that other buffer before this overwrite.
+        # Prefetch ONLY when tile t+1 exists: the last iteration (t == n_tiles-1) has
+        # no next tile; issuing its would-be prefetch drops a dead async load into
+        # slot n_tiles%N_KV_PP -- exactly the slot the O epilogue reuses -- which races
+        # the epilogue's O write across waves. Skipping it leaves that slot idle so the
+        # epilogue needs no barrier. nxt_valid still clamps the mask_right tail. ----
+        k_values = k_mgr.load_k_to_reg(base_ptrs=k_lds_ld_ptrs, lds_imm_offset=lds_imm_offset)
+
+        def _prefetch_next_kv():
+            _async_load_to_lds(k_next_gptrs, k_next_lds_ptrs, cluster=True)
+            _async_load_to_lds(v_next_gptrs, v_next_lds_ptrs, cluster=True)
+
+        scf_if_dispatch(nxt < fx.Int32(n_tiles), _prefetch_next_kv)
+
+        # ---- GEMM1: S^T = K @ Q^T for this KV tile (== P^T pre-softmax). WMMA
+        # consumes the pre-loaded k_values; one s_wait_dscnt(0) inside drains the
+        # burst before the first WMMA. ----
+        s = _qk_gemm(
+            k_values=k_values,
+            q_frags=q_frags,
+            n_block=n_block,
+        )
+
+        # ---- Burst ALL this-tile V transpose ds_loads (out of the WMMA stream), now
+        # that QK has consumed the K burst. Issued BEFORE softmax so the ds_load
+        # latency hides under softmax's VALU; the values are consumed by _pv_gemm
+        # after the rescale. ----
+        rocdl.sched_barrier(0)
+        v_values = v_mgr.load_v_to_reg(base_ptrs=v_lds_ld_ptrs, lds_imm_offset=lds_imm_offset)
+        rocdl.sched_barrier(0)
 
         # ---- Softmax: online update over this KV tile's kv axis. ----
         # This lane's query attends the band [q_min, q_max] (batch-relative kv), where
@@ -722,54 +785,45 @@ def _core_attention(
         corr_vec = fx.Vector.from_elements([corr], fx.Float32).broadcast_to(8)
         o_resc = [fx.Vector(_ir(o_acc[dt])) * corr_vec for dt in range(d_tiles)]
         o_new = _pv_gemm(
-            v_mgr=v_mgr,
-            v_lds=v_cur,
+            v_values=v_values,
             p=p,
             v_hdim=v_hdim,
             n_block=n_block,
-            lane_idx=lane_idx,
             o_acc=o_resc,
         )
 
-        # ---- Prefetch tile t+1 into (t+1) % N_KV_PP, but ONLY when it exists.
-        # The last iteration (t == n_tiles-1) has no next tile; issuing its
-        # would-be prefetch drops a dead async load into slot n_tiles%N_KV_PP --
-        # exactly the slot the O epilogue reuses -- which races the epilogue's O
-        # write across waves. Skipping it leaves that slot idle so the epilogue
-        # needs no barrier. nxt_valid still clamps the mask_right partial tail. ----
-        nxt = t + fx.Int32(1)
-        nxt_pp = nxt % fx.Int32(N_KV_PP)
-        nxt_row0 = nxt * fx.Int32(n_block)
-        nxt_valid = _kv_valid(nxt_row0)
+        return [_raw(m_new), _raw(d_new)] + [_raw(o) for o in o_new]
 
-        def _prefetch_next_kv():
-            k_gptrs, k_lds_ptrs = k_mgr.global_load_ptrs(
-                ptr_lds=_k_lds_buf(nxt_pp),
-                ptr_K=ptr_K,
-                stride_k_seq=stride_k_seq,
-                stride_k_head=stride_k_head,
-                kv_head=kv_head,
-                kv_row0=kv_start + nxt_row0,
-                kv_valid=nxt_valid,
-                warp_idx=warp_idx,
-                lane_idx=lane_idx,
-            )
-            _async_load_to_lds(k_gptrs, k_lds_ptrs, cluster=True)
-            v_mgr.async_load_vram_to_lds(
-                ptr_lds=_v_lds_buf(nxt_pp),
-                ptr_V=ptr_V,
-                stride_v_seq=stride_v_seq,
-                stride_v_head=stride_v_head,
-                kv_head=kv_head,
-                kv_row0=kv_start + nxt_row0,
-                kv_valid=nxt_valid,
-                warp_idx=warp_idx,
-                lane_idx=lane_idx,
-            )
+    # ---- Even-count prefix: [start_tile, even_hi_tile) stepped by 2; each scf iteration
+    # runs a (buffer 0, buffer 1) pair. n_iter / even_hi_tile are runtime (start_tile and
+    # n_tiles depend on the compiled masks + kv_len). ----
+    n_iter = fx.Int32(n_tiles) - start_tile
+    even_hi_tile = start_tile + (n_iter // fx.Int32(2)) * fx.Int32(2)
 
-        scf_if_dispatch(nxt < fx.Int32(n_tiles), _prefetch_next_kv)
+    _lo = arith.index_cast(T.index, arith.unwrap(start_tile))
+    _hi = arith.index_cast(T.index, arith.unwrap(even_hi_tile))
+    _step = arith.index(2)
 
-        scf.yield_([_raw(m_new), _raw(d_new)] + [_raw(o) for o in o_new])
+    for _tile_iv, _iargs, _loop_res in scf.for_(_lo, _hi, _step, iter_args=_init):
+        t0 = fx.Int32(arith.index_cast(T.i32, _tile_iv))
+        _st = main_loop(t0, False, list(_iargs))
+        _st = main_loop(t0 + fx.Int32(1), True, _st)
+        scf.yield_(_st)
+
+    # ---- Runtime remainder: one trailing tile in buffer 0 when the local tile count is
+    # odd (even_hi_tile < n_tiles iff n_iter is odd). Value-returning scf.if threads the
+    # same loop-carried state; the else branch passes it through unchanged. ----
+    _res_types = [r.type for r in _loop_res]
+    _rem_if = scf.IfOp(
+        arith.unwrap(even_hi_tile < fx.Int32(n_tiles)),
+        _res_types,
+        has_else=True,
+    )
+    with ir.InsertionPoint(_rem_if.then_block):
+        scf.yield_(main_loop(even_hi_tile, False, list(_loop_res)))
+    with ir.InsertionPoint(_rem_if.else_block):
+        scf.yield_(list(_loop_res))
+    final = _rem_if.results
 
     # ========================================================================
     # Epilogue: normalize O by the running denom d, then reshape+store to VRAM.
@@ -777,8 +831,8 @@ def _core_attention(
     # (unnormalized); divide by the per-query denom d (peer-consistent across the
     # lane pair) to finish softmax. OManager16b masks rows with seq >= q_len.
     # ========================================================================
-    d_final = fx.Float32(_loop_res[1])
-    o_final = [fx.Vector(_loop_res[2 + dt]) for dt in range(d_tiles)]
+    d_final = fx.Float32(final[1])
+    o_final = [fx.Vector(final[2 + dt]) for dt in range(d_tiles)]
 
     inv_vec = (
         fx.Vector.from_elements([fx.Float32(1.0) / d_final], fx.Float32)
@@ -790,18 +844,20 @@ def _core_attention(
     # writeback or the added drain reshuffles RA into a new race. Left uncovered.
     o_norm = [o_final[dt] * inv_vec for dt in range(d_tiles)]
 
-    # O staging reuses the NON-CURRENT K|V slot n_tiles%N_KV_PP. With the last
-    # iteration's dead prefetch now skipped, no wave ever writes that slot near
-    # the end: the last load into it was tile n_tiles-2 (issued at t=n_tiles-3,
-    # consumed at t=n_tiles-2), and the top-of-loop barrier at t=n_tiles-1 already
-    # synchronized every wave past that read. So the slot is idle here -- no
-    # cross-wave barrier needed. Keep s_wait_asynccnt(0) as a per-wave WAR guard:
-    # it retires any still-inflight async load into this slot before O's LDS write.
+    # O staging reuses the NON-CURRENT K|V slot. Local-parity ring: n_iter tiles occupy
+    # local indices 0..n_iter-1, so the LAST tile lives in buffer (n_iter-1)%N_KV_PP and
+    # the free (non-current) slot is n_iter%N_KV_PP. With the last iteration's dead
+    # prefetch skipped, no wave ever writes that slot near the end: the last load into it
+    # was local tile n_iter-2 (issued during local tile n_iter-3, consumed at n_iter-2),
+    # and the top-of-body barrier at local tile n_iter-1 already synchronized every wave
+    # past that read. So the slot is idle here -- no cross-wave barrier needed. Keep
+    # s_wait_asynccnt(0) as a per-wave WAR guard: it retires any still-inflight async
+    # load into this slot before O's LDS write.
     o_mgr = OManager16b(v_hdim=v_hdim, gqa_ratio=gqa_ratio, num_waves=NUM_WAVES)
     assert o_mgr.get_lds_size_in_byte() <= slot_bytes, (
         f"O ring budget {o_mgr.get_lds_size_in_byte()}B exceeds K|V slot {slot_bytes}B"
     )
-    non_cur_pp = fx.Int32(n_tiles) % fx.Int32(N_KV_PP)
+    non_cur_pp = n_iter % fx.Int32(N_KV_PP)
     rocdl.s_wait_asynccnt(0)  # per-wave WAR: retire inflight async loads before slot reuse
     # O strides are in ELEMENTS (OManager multiplies by _BF16_BYTES itself), unlike the
     # BYTE strides the K/V load path uses -- pass stride_o_* straight through. OManager
@@ -834,7 +890,7 @@ def _core_attention(
     # lanes (0-15 per warp = the BLOCK_M packed rows), masked by seq < q_len.
     # buffer_store redirects mask-drops to byte 0x7FFFFFFF, so lse_rsrc is bounded.
     if return_lse:
-        m_final = fx.Float32(_loop_res[0])
+        m_final = fx.Float32(final[0])
         # fx.log2 lowers to the HW v_log_f32 (base-2), so scale by ln2 (= 1/LOG2E)
         # to get the natural log for LSE = m + ln(d).
         ln_d = fx.log2(d_final) * fx.Float32(1.0 / LOG2E)
