@@ -6,8 +6,8 @@
 All operate on the official V4 form (``K == V == kv``, one dense 512-wide tensor, RoPE already
 applied in place caller-side, scale ``1/sqrt(512)``, ``attn_sink`` in the softmax denominator
 only, ``topk == -1`` masked). The two MFMA phases are Gluon; the two memory-bound phases are
-plain Triton and live here rather than under ``_triton_kernels/`` because there is no Triton
-implementation of this backward to fall back to -- they are parts of this kernel, not an
+plain Triton and live alongside them rather than under ``_triton_kernels/`` because there is no
+Triton implementation of this backward to fall back to -- they are parts of this kernel, not an
 alternative to it.
 
 ``_dq_v4_kernel``
