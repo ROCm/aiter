@@ -5,20 +5,18 @@ import functools
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir.dialects import llvm
 from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
 from aiter.ops.flydsl.kernels import buffer_ops
 from aiter.ops.flydsl.kernels.act import gate_up_act, situ_params
+from aiter.ops.flydsl.kernels.mxfp4_gemm_common import lds_typed_ptr, lds_vec_load
 from aiter.ops.flydsl.kernels.tensor_shim import _to_raw as _raw
 
 from .utils import (
     _BCol,
-    _gep,
     _global_i32_at,
-    _lds_ptr3,
     _mma_bf16,
     _udiv,
     _umod,
@@ -309,7 +307,7 @@ def _gemm1_body_a16w4(
         nm = num_acc_n * m_repeat
         grp_stride = 64 * nm * 4  # f32 elems per wave (vec4 per lane per acc-slot)
         lds_scr_i32 = fx.Int32(fx.ptrtoint(lds_raw_ptr))
-        scr_base = _lds_ptr3(lds_scr_i32, fx.Int32(0))
+        lds_scr = lds_typed_ptr(lds_scr_i32, T.f32)
 
         def _reduce_round(accs):
             gpu.barrier()  # A-LDS region no longer needed; reuse it as scratch
@@ -318,10 +316,7 @@ def _gemm1_body_a16w4(
                 v = Vec(fx.memref_load_vec(accs[ai // num_acc_n][ai % num_acc_n]))
                 sidx = my_base + fx.Int32(ai * 64 * 4)
                 for vv in range_constexpr(4):
-                    llvm.StoreOp(
-                        _raw(v[vv]),
-                        _gep(scr_base, (sidx + fx.Int32(vv)) * fx.Int32(4)),
-                    )
+                    lds_scr[sidx + fx.Int32(vv)] = fx.Float32(v[vv])
             gpu.barrier()
             for ai in range_constexpr(nm):
                 ai_off = fx.Int32(ai * 64 * 4) + lane * fx.Int32(4)
@@ -331,7 +326,13 @@ def _gemm1_body_a16w4(
                     peer = fx.Int32(g * num_n_waves) + wave_n_id
                     pidx = peer * fx.Int32(grp_stride) + ai_off
                     pv = Vec(
-                        llvm.load(T.vec(4, T.f32), _gep(scr_base, pidx * fx.Int32(4)))
+                        lds_vec_load(
+                            lds_scr_i32,
+                            pidx * fx.Int32(4),
+                            Vec.make_type(4, fx.Float32),
+                            fx.Float32,
+                            align=8,
+                        )
                     )
                     s = Vec.from_elements(
                         [s[vv] + pv[vv] for vv in range_constexpr(4)], fx.Float32
