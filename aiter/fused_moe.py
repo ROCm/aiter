@@ -31,6 +31,7 @@ from aiter.jit.utils.chip_info import (
     gfx_from_cu_num,
 )
 from aiter.jit.utils.torch_guard import torch_compile_guard
+from aiter.ops.flydsl.kernels.mega_moe_gfx1250.types import Stage2ScatterContext
 
 try:
     from aiter.ops.flydsl.moe_common import GateMode
@@ -489,6 +490,7 @@ def fused_moe(
     shared_w1_scale: torch.Tensor | None = None,
     shared_w2_scale: torch.Tensor | None = None,
     shared_expert_id: int = -1,
+    stage2_scatter: Stage2ScatterContext | None = None,
 ):
     if (
         any(
@@ -531,6 +533,8 @@ def fused_moe(
         )
     if not block_size_M:
         block_size_M = -1
+    enable_ep_scatter = stage2_scatter is not None
+    scatter_source_map = stage2_scatter.source_token_map if enable_ep_scatter else None
     return fused_moe_(
         hidden_states=hidden_states,
         w1=w1,
@@ -557,6 +561,18 @@ def fused_moe(
         beta=beta,
         linear_beta=linear_beta,
         gate_mode=gate_mode,
+        ep_arena_handle=stage2_scatter.arena_handle if enable_ep_scatter else 0,
+        ep_combine_input_offset=(
+            stage2_scatter.combine_input_offset if enable_ep_scatter else 0
+        ),
+        ep_slot_stride_bytes=(
+            stage2_scatter.slot_stride_bytes if enable_ep_scatter else 0
+        ),
+        ep_max_tokens_per_rank=(
+            stage2_scatter.max_tokens_per_rank if enable_ep_scatter else 0
+        ),
+        ep_world_size=stage2_scatter.world_size if enable_ep_scatter else 0,
+        ep_source_token_map=scatter_source_map,
     )
 
 
@@ -588,6 +604,12 @@ def fused_moe_fake(
     beta: float | None = None,
     linear_beta: float | None = None,
     gate_mode: str = GateMode.SEPARATED.value,
+    ep_arena_handle: int = 0,
+    ep_combine_input_offset: int = 0,
+    ep_slot_stride_bytes: int = 0,
+    ep_max_tokens_per_rank: int = 0,
+    ep_world_size: int = 0,
+    ep_source_token_map: torch.Tensor | None = None,
 ) -> torch.Tensor:
     device = topk_ids.device
     M, _topk = topk_ids.shape
@@ -626,7 +648,23 @@ def fused_moe_(
     beta: float | None = None,
     linear_beta: float | None = None,
     gate_mode: str = GateMode.SEPARATED.value,
+    ep_arena_handle: int = 0,
+    ep_combine_input_offset: int = 0,
+    ep_slot_stride_bytes: int = 0,
+    ep_max_tokens_per_rank: int = 0,
+    ep_world_size: int = 0,
+    ep_source_token_map: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    stage2_scatter = None
+    if ep_source_token_map is not None:
+        stage2_scatter = Stage2ScatterContext(
+            arena_handle=ep_arena_handle,
+            combine_input_offset=ep_combine_input_offset,
+            slot_stride_bytes=ep_slot_stride_bytes,
+            max_tokens_per_rank=ep_max_tokens_per_rank,
+            world_size=ep_world_size,
+            source_token_map=ep_source_token_map,
+        )
     return _fused_moe_impl(
         hidden_states=hidden_states,
         w1=w1,
@@ -653,6 +691,7 @@ def fused_moe_(
         beta=beta,
         linear_beta=linear_beta,
         gate_mode=gate_mode,
+        stage2_scatter=stage2_scatter,
     )
 
 
@@ -682,6 +721,7 @@ def _fused_moe_impl(
     beta: float | None = None,
     linear_beta: float | None = None,
     gate_mode: str = GateMode.SEPARATED.value,
+    stage2_scatter: Stage2ScatterContext | None = None,
     *,
     _q_dtype_a: torch.dtype | None = None,
     _metadata_transform: Callable | None = None,
@@ -805,6 +845,7 @@ def _fused_moe_impl(
                 num_local_tokens=num_local_tokens,
                 situ_beta=1.0 if beta is None else float(beta),
                 situ_linear_beta=1.0 if linear_beta is None else float(linear_beta),
+                stage2_scatter=stage2_scatter,
             )
 
     if grouped_a8w4_out is not None:

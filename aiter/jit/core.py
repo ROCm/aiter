@@ -155,6 +155,16 @@ AITER_CONFIG_GEMM_BF16 = os.getenv(
     f"{AITER_ROOT_DIR}/aiter/configs/bf16_tuned_gemm.csv",
 )
 
+# K5 opt BV tuned config. Per-model tuned rows live under model_configs/
+# (qwen3_5_*_chunk_gdn_h_opt_tuned.csv) and get merged into this canonical file by
+# get_config_file. It ships header-only: with no per-model table present
+# get_config_file returns this path as-is, and the opt AOT reads it, so it has to
+# be a readable csv rather than a missing path.
+AITER_CONFIG_GDN_K5_OPT = os.getenv(
+    "AITER_CONFIG_GDN_K5_OPT",
+    f"{AITER_ROOT_DIR}/aiter/configs/chunk_gdn_h_opt_tuned.csv",
+)
+
 
 class AITER_CONFIG:
     @property
@@ -235,6 +245,14 @@ class AITER_CONFIG:
     def AITER_CONFIG_GEMM_BF16_FILE(self):
         return self.get_config_file(
             "AITER_CONFIG_GEMM_BF16", AITER_CONFIG_GEMM_BF16, "bf16_tuned_gemm"
+        )
+
+    @property
+    def AITER_CONFIG_GDN_K5_OPT_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_GDN_K5_OPT",
+            AITER_CONFIG_GDN_K5_OPT,
+            "chunk_gdn_h_opt_tuned",
         )
 
     @property
@@ -365,6 +383,7 @@ class AITER_CONFIG:
             logger.warning(
                 f"Untuned config file not found: {untuned_path}. Using all columns for deduplication."
             )
+
         from pathlib import Path
 
         config_path = Path("/tmp/aiter_configs/")
