@@ -46,7 +46,7 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
 from flydsl._mlir.dialects import llvm, rocdl
-from flydsl.expr import arith, const_expr, ptrtoint, range_constexpr
+from flydsl.expr import const_expr, ptrtoint, range_constexpr
 from flydsl.expr import math as fmath
 from flydsl.expr.arith import FastMathFlags
 from flydsl.expr.rocdl import tdm_ops
@@ -69,19 +69,19 @@ from .tensor_shim import GTensor, _run_compiled
 
 
 def _imin(a, b):
-    """Signed integer min. fx's numeric layer has no int min/max."""
-    return fx.Int32(arith.minsi(a.ir_value(), b.ir_value()))
+    return (a < b).select(a, b)
 
 
 def _imax(a, b):
-    """Signed integer max. fx's numeric layer has no int min/max."""
-    return fx.Int32(arith.maxsi(a.ir_value(), b.ir_value()))
+    return (a > b).select(a, b)
 
 
 def _idiv(a, b):
     """Truncating signed integer divide. ``//`` maps to arith.floordivsi, a
     longer expansion; every dividend here is already clamped non-negative, so
     the truncating op is both correct and cheaper."""
+    from flydsl.expr import arith
+
     return fx.Int32(arith.divsi(a.ir_value(), b.ir_value()))
 
 
