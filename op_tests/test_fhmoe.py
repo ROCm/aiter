@@ -12,7 +12,6 @@ bound the default atomic path's run-to-run variation.
 
 from __future__ import annotations
 
-import functools
 import inspect
 import os
 from dataclasses import dataclass
@@ -918,12 +917,9 @@ def test_fhmoe_runtime_compile_bridge_forwards_xcd(monkeypatch: pytest.MonkeyPat
         ({"doweight_stage1": True}, False),
     ),
 )
-def test_dsv4_i384_fhmoe_fallback_scope(overrides, expected):
-    from aiter.fhmoe import _supports_dsv4_i384_fallback
-    from aiter.fhmoe_config import (
-        DSV4_I384_FHMOE_MAX_TOKENS,
-        DSV4_I384_FHMOE_METADATA_SOURCE_INTER_DIM,
-    )
+def test_dsv4_i384_fhmoe_config_scope(overrides, expected):
+    from aiter.fhmoe import _uses_dsv4_fhmoe_config
+    from aiter.fhmoe_config import DSV4_I384_FHMOE_MAX_TOKENS
 
     args = {
         "token_num": 1,
@@ -939,99 +935,180 @@ def test_dsv4_i384_fhmoe_fallback_scope(overrides, expected):
     args.update(overrides)
 
     assert DSV4_I384_FHMOE_MAX_TOKENS == 2048
-    assert DSV4_I384_FHMOE_METADATA_SOURCE_INTER_DIM == 512
-    assert _supports_dsv4_i384_fallback(**args) is expected
+    assert _uses_dsv4_fhmoe_config(**args) is expected
 
 
-def test_fhmoe_retries_dsv4_metadata_with_flydsl():
-    from aiter import fhmoe
-    from aiter.fused_moe import (
-        MOEMetadata,
-        _flydsl_stage1_wrapper,
-        _flydsl_stage2_wrapper,
+@pytest.mark.parametrize(
+    ("num_tokens", "expected_stage1", "expected_stage2"),
+    (
+        (
+            1,
+            "flydsl_moe1_afp8_wfp4_bf16_t32x64x256_w4_gui_kw4_fp8",
+            "flydsl_moe2_afp8_wfp4_bf16_t32x256x128_atomic",
+        ),
+        (
+            16,
+            "flydsl_moe1_afp8_wfp4_bf16_t32x128x256_w2_gui_fp8",
+            "flydsl_moe2_afp8_wfp4_bf16_t32x128x128_atomic_bnt2",
+        ),
+        (
+            1536,
+            "flydsl_moe1_afp8_wfp4_bf16_t64x128x256_w3_bnt0_gui",
+            "flydsl_moe2_afp8_wfp4_bf16_t64x128x128_atomic",
+        ),
+        (
+            2048,
+            "flydsl_moe1_afp8_wfp4_bf16_t64x128x256_w3_bnt0_gui",
+            "flydsl_moe2_afp8_wfp4_bf16_t64x128x128_atomic",
+        ),
+    ),
+)
+def test_dsv4_i384_fhmoe_uses_dedicated_config(
+    monkeypatch: pytest.MonkeyPatch,
+    num_tokens: int,
+    expected_stage1: str,
+    expected_stage2: str,
+):
+    import importlib
+
+    fused_moe_module = importlib.import_module("aiter.fused_moe")
+
+    config_path = (
+        Path(__file__).resolve().parents[1]
+        / "aiter/configs/model_configs/dsv4_fp8fp4_tuned_fhmoe.csv"
     )
+    monkeypatch.setattr(fused_moe_module, "get_cu_num", lambda: 256)
+    monkeypatch.setattr(fused_moe_module, "get_gfx_runtime", lambda: "gfx950")
+    monkeypatch.setattr(fused_moe_module, "is_flydsl_available", lambda: True)
+    fused_moe_module.get_2stage_cfgs.cache_clear()
+    fused_moe_module.cfg_2stages_by_file.clear()
 
-    invalid = MOEMetadata(lambda: None, lambda: None, 32, 0)
-    fallback = MOEMetadata(
-        functools.partial(_flydsl_stage1_wrapper, kernelName="stage1"),
-        functools.partial(_flydsl_stage2_wrapper, kernelName="stage2"),
-        32,
+    metadata = fused_moe_module.get_2stage_cfgs(
+        fused_moe_module.get_padded_M(num_tokens),
+        7168,
+        384,
+        385,
+        7,
+        torch.bfloat16,
+        dtypes.fp8,
+        dtypes.fp4x2,
+        aiter.QuantType.per_1x32,
+        True,
+        aiter.ActivationType.Silu,
+        False,
         0,
-    )
-    calls = 0
-
-    def fallback_metadata():
-        nonlocal calls
-        calls += 1
-        return fallback
-
-    result = fhmoe._use_fhmoe_wrappers(invalid, fallback_metadata)
-
-    assert calls == 1
-    assert result.stage1.func is fhmoe._flydsl_fhmoe_stage1_wrapper
-    assert result.stage1.keywords["kernelName"] == "stage1"
-    assert result.stage2.func is fhmoe._flydsl_fhmoe_stage2_wrapper
-    assert result.stage2.keywords["kernelName"] == "stage2"
-
-
-def test_fhmoe_aot_manifest_covers_native_i384():
-    from aiter.aot.flydsl.common import job_identity
-    from aiter.aot.flydsl.moe import parse_csv
-    from aiter.ops.flydsl.moe_kernels import (
-        get_flydsl_kernel_params,
-        resolve_flydsl_stage1_tile_n,
-        resolve_flydsl_stage2_tile_k,
+        0,
+        True,
+        GateMode.INTERLEAVE,
+        config_file=str(config_path),
     )
 
-    csv_path = (
+    assert metadata.stage1.keywords["kernelName"] == expected_stage1
+    assert metadata.stage2.keywords["kernelName"] == expected_stage2
+
+
+def test_dsv4_i384_fhmoe_config_has_true_shapes():
+    import csv
+
+    config_path = (
+        Path(__file__).resolve().parents[1]
+        / "aiter/configs/model_configs/dsv4_fp8fp4_tuned_fhmoe.csv"
+    )
+    ordinary_path = (
         Path(__file__).resolve().parents[1]
         / "aiter/configs/model_configs/dsv4_fp8fp4_tuned_fmoe.csv"
     )
-    jobs = parse_csv(str(csv_path))
-    fhmoe_jobs = [job for job in jobs if job.get("shared_expert_id", -1) >= 0]
-    i512_jobs = [job for job in fhmoe_jobs if job["inter_dim"] == 512]
-    i384_jobs = [job for job in fhmoe_jobs if job["inter_dim"] == 384]
+    with config_path.open(newline="") as f:
+        rows = list(csv.DictReader(f))
+    with ordinary_path.open(newline="") as f:
+        ordinary_rows = list(csv.DictReader(f))
 
-    assert len(i512_jobs) == 32
-    assert any(job.get("xcd_swizzle", 0) > 0 for job in fhmoe_jobs)
-    for job in fhmoe_jobs:
+    assert {int(row["token"]) for row in rows} == {
+        1,
+        2,
+        4,
+        8,
+        16,
+        32,
+        64,
+        128,
+        256,
+        512,
+        1024,
+        2048,
+    }
+    assert all(int(row["inter_dim"]) == 384 for row in rows)
+    assert all(int(row["shared_expert_id"]) == 384 for row in rows)
+    assert all(int(row["hidden_pad"]) == 0 for row in rows)
+    assert all(int(row["intermediate_pad"]) == 0 for row in rows)
+    assert all(row["gate_mode"] == "GateMode.INTERLEAVE" for row in rows)
+    assert all(row["kernelName1"].startswith("flydsl_") for row in rows)
+    assert all(row["kernelName2"].startswith("flydsl_") for row in rows)
+
+    ordinary_m16 = next(
+        row
+        for row in ordinary_rows
+        if int(row["token"]) == 16
+        and int(row["inter_dim"]) == 384
+        and int(row["expert"]) == 385
+        and int(row["topk"]) == 7
+    )
+    assert ordinary_m16["kernelName2"].startswith("opus_")
+
+
+def test_fhmoe_aot_manifest_covers_native_i384():
+    from aiter.aot.flydsl.moe import parse_csv
+    from aiter.ops.flydsl.moe_kernels import get_flydsl_kernel_params
+
+    ordinary_path = (
+        Path(__file__).resolve().parents[1]
+        / "aiter/configs/model_configs/dsv4_fp8fp4_tuned_fmoe.csv"
+    )
+    config_path = (
+        Path(__file__).resolve().parents[1]
+        / "aiter/configs/model_configs/dsv4_fp8fp4_tuned_fhmoe.csv"
+    )
+    ordinary_jobs = parse_csv(str(ordinary_path))
+    dedicated_jobs = parse_csv(str(config_path))
+    ordinary_fhmoe_jobs = [
+        job for job in ordinary_jobs if job.get("shared_expert_id", -1) >= 0
+    ]
+
+    assert not ordinary_fhmoe_jobs
+    assert len(dedicated_jobs) == 24
+    assert all(job["inter_dim"] == 384 for job in dedicated_jobs)
+    assert all(job["shared_expert_id"] == 384 for job in dedicated_jobs)
+    assert all(not job.get("enable_bias", False) for job in dedicated_jobs)
+    assert {job["token_num"] for job in dedicated_jobs} == {
+        1,
+        2,
+        4,
+        8,
+        16,
+        32,
+        64,
+        128,
+        256,
+        512,
+        1024,
+        2048,
+    }
+    for job in dedicated_jobs:
         params = get_flydsl_kernel_params(job["kernel_name"])
         assert params is not None
         assert job.get("xcd_swizzle", 0) == params.get("xcd_swizzle", 0)
-    assert i384_jobs
-    assert all(job["shared_expert_id"] == 384 for job in i384_jobs)
-    assert all(1 <= job["token_num"] <= 2048 for job in i384_jobs)
-    for job in i384_jobs:
         if job["stage"] == 1:
-            tile = resolve_flydsl_stage1_tile_n(384, job["tile_n"])
+            assert 384 % job["tile_n"] == 0
         else:
-            tile = resolve_flydsl_stage2_tile_k(384, job["tile_k"])
-        assert 384 % tile == 0
+            assert 384 % job["tile_k"] == 0
 
-    i384_identities = {job_identity(job) for job in i384_jobs}
-    for i512_job in i512_jobs:
-        if i512_job["token_num"] <= 2048:
-            assert job_identity({**i512_job, "inter_dim": 384}) in i384_identities
-
-    selected_native_manifest = {
-        (2, "flydsl_moe1_afp8_wfp4_bf16_t32x64x256_bnt0_gui_kw4"),
-        (2, "flydsl_moe2_afp8_wfp4_bf16_t32x128x256_atomic"),
-        (4, "flydsl_moe1_afp8_wfp4_bf16_t32x64x256_w4_gui_kw2"),
-        (4, "flydsl_moe2_afp8_wfp4_bf16_t32x128x256_reduce_persist"),
-        (8, "flydsl_moe1_afp8_wfp4_bf16_t32x64x256_w3_gui"),
-        (
-            8,
-            "flydsl_moe2_afp8_wfp4_bf16_t32x256x128_reduce_bnt2_persist",
-        ),
-        (2048, "flydsl_moe1_afp8_wfp4_bf16_t64x128x256_w3_bnt0_gui"),
-        (2048, "flydsl_moe2_afp8_wfp4_bf16_t64x128x128_atomic"),
+    m2048_names = {
+        job["kernel_name"] for job in dedicated_jobs if job["token_num"] == 2048
     }
-    manifest = {
-        (job["token_num"], job["kernel_name"])
-        for job in i384_jobs
-        if not job.get("enable_bias", False)
+    assert m2048_names == {
+        "flydsl_moe1_afp8_wfp4_bf16_t64x128x256_w3_bnt0_gui",
+        "flydsl_moe2_afp8_wfp4_bf16_t64x128x128_atomic",
     }
-    assert selected_native_manifest <= manifest
 
 
 def test_fhmoe_aot_precompile_keeps_native_i384(monkeypatch: pytest.MonkeyPatch):

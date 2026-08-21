@@ -30,6 +30,7 @@ Run:
     python3 -m unittest op_tests.tuning_tests.test_config_shape_collision -v
 """
 
+import csv
 import os
 import shutil
 import sys
@@ -68,6 +69,7 @@ FAMILIES = [
     ),
     ("AITER_CONFIG_GEMM_BF16", "bf16_tuned_gemm"),
     ("AITER_CONFIG_FMOE", "tuned_fmoe"),
+    ("AITER_CONFIG_FHMOE", "tuned_fhmoe"),
     ("AITER_CONFIG_GROUPED_FMOE", "tuned_grouped_fmoe"),
 ]
 
@@ -217,6 +219,19 @@ class TestConfigShapeCollision(unittest.TestCase):
 
     def test_fmoe(self):
         self._check_family("AITER_CONFIG_FMOE", "tuned_fmoe")
+
+    def test_fhmoe(self):
+        merged = self._resolve(
+            self._tmp,
+            "AITER_CONFIG_FHMOE",
+            "tuned_fhmoe",
+        )
+        with open(merged, newline="") as f:
+            rows = list(csv.DictReader(f))
+        self.assertEqual(
+            {int(row["token"]) for row in rows},
+            {1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048},
+        )
 
     def test_grouped_fmoe(self):
         self._check_family("AITER_CONFIG_GROUPED_FMOE", "tuned_grouped_fmoe")
