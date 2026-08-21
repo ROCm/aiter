@@ -936,12 +936,12 @@ def gemm_a8w8_blockscale_bpreshuffle(
     else:
         Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
 
-    use_gfx1250_flydsl_or_triton_mxfp8_128  = (
+    use_gfx1250_flydsl_or_triton_mxfp8_128 = (
         get_gfx() == "gfx1250"
         and x_scale.dtype == dtypes.fp8_e8m0
         and w_scale.dtype == dtypes.fp8_e8m0
     )
-    if use_gfx1250_flydsl_or_triton_mxfp8_128 :
+    if use_gfx1250_flydsl_or_triton_mxfp8_128:
         config = get_CKGEMM_config(
             m,
             n,
