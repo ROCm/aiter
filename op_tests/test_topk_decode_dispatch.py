@@ -48,12 +48,12 @@ def test_shipped_gfx950_gate():
 
 @gate_is_overridden
 def test_shipped_gfx942_gate():
-    """Same pin for gfx942, set from the MI300X sweep. Narrower in rows than gfx950
-    because that arch runs the frozen kernel config, wider in k because all four
-    AOT-precompiled values measured alike."""
+    """Same pin for gfx942, set from the 928-cell MI300X sweep. Matches gfx950 in
+    rows and is wider in k, because all four AOT-precompiled values measured within
+    0.6us of each other there and no single row misbehaves enough to carve out."""
     gate = topk_mod._FLYDSL_TOPK_DECODE_GATES["gfx942"]
     assert gate.min_width == 131072
-    assert gate.max_rows == 8
+    assert gate.max_rows == 16
     assert gate.ks == frozenset({256, 512, 1024, 2048})
     assert gate.excluded_rows == frozenset()
 
@@ -92,6 +92,11 @@ ROUTING_CASES = [
     (1, 131072, 131072, 2048),  # -> FlyDSL on gfx950 and gfx942
     (1, 131072, 70000, 2048),  # same, with the poisoned tail
     (2, 131072, 131072, 2048),  # gfx950 carves out rows==2 -> HIP; gfx942 FlyDSL
+    # Both archs now cap rows at 16, so straddle it at a width and k that clear
+    # every other screen -- otherwise the pair below would be rejected on width or
+    # k and would say nothing about the row cap.
+    (16, 131072, 131072, 2048),  # top of the row window -> FlyDSL on both
+    (17, 131072, 131072, 2048),  # one over -> HIP on both
 ]
 
 

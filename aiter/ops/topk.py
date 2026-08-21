@@ -474,14 +474,30 @@ _TRUTHY_ENV = ("1", "true", "True", "yes", "YES")
 # cost differs several-fold, so each window is chosen to pay off across that whole
 # range rather than at one length.
 #
+# Width earns its place as that stand-in because a request cannot be longer than
+# the buffer holding it: at width 32768 nothing reaches the lengths where this
+# kernel pulls ahead, while a 163840-wide buffer at least can. Wide buffers are not
+# themselves faster -- holding the real length fixed and sweeping width moves the
+# margin by under 2.2us on gfx942 -- so min_width is a bet that a long-context
+# deployment actually serves long requests, and it loses on the short ones.
+#
 # gfx950 takes the widest window that loses no cell in the eager width-sweep, the
 # regime vLLM pays when a decode batch overflows its graph-capture limit; captured
 # cells only do better. Below 131072 the ~19us host submit sinks short-context
 # cells, k=512 still loses at full width, and rows==2 stays behind while rows 1 and
-# 4-16 pull ahead -- hence the carve-outs. gfx942 is narrower in rows and wider in
-# k, from a 1248-cell MI300X sweep where short-context cells lose up to 3x because
-# HIP one-block is cheaper there. See the SILOTIGER-699 gate investigation for the
-# per-cell numbers behind both.
+# 4-16 pull ahead -- hence the carve-outs.
+#
+# gfx942 comes from a 928-cell MI300X sweep that timed both kernels through this
+# same entry point, and its thresholds are read off graph replay alone. Eager there
+# is the more generous regime rather than the stricter one, so it cannot set the
+# boundary: HIP pays 11.7us of host work per call against FlyDSL's 2.6us, most of
+# it an un-memoized workspace-size query, which credits this kernel for an overhead
+# a fix upstream would erase. Under replay rows decay monotonically (+5.8us/cell at
+# rows 1, +1.0 at 16, -7.0 at 24) and the four AOT-precompiled k values land within
+# 0.6us of each other, hence wide in k and capped at 16 rows. That sweep samples
+# rows at 1-2-4-8-12-16-24-32, so a follow-up probe pinned the sign change between
+# rows 17 and 20; 16 is the conservative edge of it and 17 buys nothing. See the
+# SILOTIGER-699 gate investigation for the per-cell numbers behind both archs.
 class _DecodeGate(NamedTuple):
     min_width: int
     max_rows: int
@@ -491,7 +507,7 @@ class _DecodeGate(NamedTuple):
 
 _FLYDSL_TOPK_DECODE_GATES = {
     "gfx950": _DecodeGate(131072, 16, frozenset({2048}), frozenset({2})),
-    "gfx942": _DecodeGate(131072, 8, frozenset({256, 512, 1024, 2048})),
+    "gfx942": _DecodeGate(131072, 16, frozenset({256, 512, 1024, 2048})),
 }
 
 # Narrows the table above, e.g. AITER_FLYDSL_TOPK_ARCHS=gfx950 leaves gfx942 on
