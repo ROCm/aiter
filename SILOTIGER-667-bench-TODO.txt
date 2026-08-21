@@ -1,7 +1,8 @@
 NOTE: the per-stage FlyDSL-vs-CK G9 benchmark TODOs that used to live here have been
 folded into the styled plan SILOTIGER-667-plan-bench.md (Groups A-D + coverage matrix).
 This file now tracks the deferred, out-of-G9 tracks below: (1) Full-MoE / AITER-default,
-(2) CK FP4 gate_up fast path (surfaced by the D7 numerical cross-check).
+(2) CK FP4 gate_up fast path (surfaced by the D7 numerical cross-check),
+(3) FlyDSL FP8-down block2d scaled-convert fold (recover the block2d-vs-pertensor gap).
 
 === Full-MoE / AITER track (complementary to the per-stage FlyDSL-vs-CK G9 plan) ===
 This track answers "how does FlyDSL compare vs whatever AITER dispatches by default",
@@ -87,3 +88,37 @@ projects/composablekernel/include/ck_tile/ops/warp_decode/kernel/warp_decode_dow
 - REVISIT: once the fast path lands, the ticket's line-99 "refreshed head-to-head with
     down_fp4_h2 AND FP4 gate_up once built" measurement becomes possible -- re-run the G9
     compare so the gate_up|fp4 cells reflect the fast path, not the slow scalar one.
+
+=== FlyDSL FP8-down block2d scaled-convert fold track (aiter kernel work; surfaced by the g9 caveat) ===
+This track attacks the FP8-down block2d(128,128) cost that the g9_compare.md header flags as a
+CK-favored lower bound ("block2d(128,128) costs FlyDSL ~10-38% vs pertensor (B1)"). The cost is
+NOT weight-byte traffic (FP8-down fly_%peak is still ~66-74%); it is LATENCY: in the block2d branch
+of build_down_reduce_fp8 (aiter/ops/flydsl/kernels/warp_decode_moe.py, the `if const_expr(block2d)`
+path) the dot2 chain is drained PER 128-wide K-block so the per-block f32 scale can be folded after
+the dot (`acc[h] += dot_i * (rw * ds_i)`), plus an extra scale buffer_load + address compute per
+block -- vs the pertensor path which loads one broadcast scale and drains the whole K-range ONCE.
+Fragmenting the dot2 ILP + the per-block drains is what hurts, worst at B=1 (the 38% end); it washes
+out by B=32 (bandwidth-bound, FP8-down ratios already ~0.95-1.00). This is an implementation artifact,
+not intrinsic to block scaling, so it is recoverable WITHOUT dropping to coarser pertensor scales
+(which would be a model-accuracy decision, not a kernel win). Est ~1-1.5 days for the fold; +0.5-1 d
+if the independent-partials variant is also needed. Anchor = the identity-scale convert today:
+`fp8x2_to_bf16x2(dw[h][w_word], one_f32, hi=w_hi)` feeds a post-dot multiply by ds_i.
+    Sub-steps:
+    - Fold the per-block exponent into the scaled FP8->BF16 convert instead of the post-dot
+      multiply: pass the block scale into v_cvt_scalef32_pk_bf16_fp8 (currently run with one_f32)
+      so no separate per-block multiply is needed and the dot chain need not break to fold it.
+      block scale is exponent-only, so this is a cheap swap of the convert's scale operand keyed on
+      col_blk = k_base // scale_bk. Est ~1 d.
+    - If the convert-fold alone does not restore ILP, keep independent per-K-block f32 partials in
+      flight (extend the G7 dot2_acc idea ACROSS block boundaries) and fold each block's scale at the
+      very end, rather than draining inside each block. Est ~0.5-1 d.
+    - Correctness gate: reuse the existing block2d unit tests (h*_block2d / down_*_block2d cases in
+      op_tests/flydsl_tests/test_flydsl_warp_decode_moe.py) at cos>=0.999; block2d output must be
+      bit-comparable to the current fold (exponent-only scale is associative-safe here).
+    - Perf-confirm at B=1/2 (the latency regime where the 10-38% lives) that FP8-down closes toward
+      the pertensor number while keeping block2d(128,128); B>=8 is expected near-neutral (already at
+      the memory wall). Re-run the G9 compare so the FP8-down cells reflect the recovered path.
+    Cross-refs: g9_compare.md config-policy header ("FP8-down ratio is a CK-favored lower bound:
+    block2d(128,128) costs FlyDSL ~10-38% vs pertensor (B1)"); SILOTIGER-667.md line 154 (K3 report:
+    push dequant into the packed scaled-convert -- "the difference between a regression and a win");
+    B1 scale note in SILOTIGER-667-plan-bench.md.
