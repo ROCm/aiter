@@ -491,7 +491,7 @@ def _shuf_kblock_pairs(s: torch.Tensor, K: int) -> tuple[torch.Tensor, int]:
     return s, K1
 
 
-def shuffle_scale_a(a_scale: torch.Tensor, K: int, sub: int = 32) -> torch.Tensor:
+def shuffle_scale_a(a_scale: torch.Tensor, K: int, sub: int) -> torch.Tensor:
     """A-side e8m0 scales in the reference (FlyDSL) blockscale layout.
 
     One dword holds four scales -- two M subtiles ``sub`` rows apart crossed with
@@ -506,11 +506,27 @@ def shuffle_scale_a(a_scale: torch.Tensor, K: int, sub: int = 32) -> torch.Tenso
     ``sub`` is the row distance between the two M subtiles sharing a dword. It is
     a property of *the layout*, not of any one kernel's wave grid: the model holds
     one scale slab, so every consumer reads the same ``sub``. Consumers pair their
-    rows two-for-one while T_M*W_M <= sub and stop above it, which is why 32 is
-    the shipped value -- it is native for both the T_M=2 and T_M=1 grids, where 16
-    doubles the A-scale dwords for every T_M=2 tile and equals it nowhere. The
-    kernel-side constant is OPUS_SF_SHUF_SUB; take it from a kid's
-    needs_shuffle_scale rather than from T_M*W_M.
+    rows two-for-one while T_M*W_M <= sub and stop above it.
+
+    **The shipped value is 16, and ``sub`` is deliberately not defaulted.** It
+    used to default to 32, which was the Pareto-better number in isolation --
+    native for both the T_M=2 and T_M=1 grids, where 16 doubles the A-scale
+    dwords for every T_M=2 tile -- and that is why it was chosen first. It lost
+    to a constraint outside this file:
+    ``inverse_rope_group_quant`` emits ``shuffle_scale_blockscale_a``, which is
+    sub=16, and a second shuffle rule in the quantiser was rejected on
+    maintenance grounds. The GEMM side absorbed it instead (a wave-uniform
+    ``np = wave_id_m`` fold, plus a wave-M=32 remap that recovers the whole
+    doubling), so the T_M=2 penalty this paragraph warns about is no longer
+    paid.
+
+    Do not read the shipped value off this signature. ``OPUS_SF_SHUF_SUB`` in
+    opus_gemm_traits_a8w8_scale_gfx950.cuh is the single source of truth; on the
+    host take it from a kid's ``needs_shuffle_scale``, or from
+    ``opus_gemm_common._opus_sf_shuf_sub()``, never from T_M*W_M and never from
+    a literal at the call site. ``test_inverse_rope_group_quant.py --opus-tree``
+    round-trips the producer's buffer against this function at whatever sub the
+    header currently says, which is what keeps the two trees from drifting.
 
         row = n1*(2*sub) + np*sub + nl,  kblock = k1*2 + kp
         byte index = (((n1*K1 + k1)*sub + nl)*2 + kp)*2 + np

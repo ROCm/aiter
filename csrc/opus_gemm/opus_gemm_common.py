@@ -1523,7 +1523,7 @@ _BMM_MXSCALE_BPRESHUFFLE_BDIRECT_ISOLATE = {
     (336, 337): (64,  32,  128, 2),   # B_K  256->128: COM_REP_K 2->1
     (338, 339): (128, 32,  128, 2),   # B_M   64->128: COM_REP_M 2->4, vs (336,337)
     (342, 343): (64,  32,  256, 1),   # WG_PER_CU 2->1: occupancy only, geometry fixed
-    (344, 345): (64,  128, 256, 1),   # B_N   32->128: COM_REP_N 2->8, vs (342,343)
+    # (344, 345): (64, 128, 256, 1) -- B_N 32->128, vs (342,343). Unwired, see below.
 }
 # B_N has no row because it cannot be stepped alone, which took three attempts to
 # establish. 64x128x256 passes the traits at both occupancies -- LDS is fine, since
@@ -1542,8 +1542,29 @@ _BMM_MXSCALE_BPRESHUFFLE_BDIRECT_ISOLATE = {
 # build; it does NOT catch the spill, a register allocator outcome rather than a
 # static_assert, so a new geometry wants a timing smoke check too. And a 300,000us kid
 # inside a sweep is indistinguishable from a hang -- that is what it was first taken for.
-# So kid340/341 are not wired at all. 344/345 are, and only as the recorded evidence
-# that wg1 does not rescue B_N=128; nothing should sweep or ship them.
+# So kid340/341 are not wired at all, and kid344/345 are no longer wired either. They
+# had been kept as the recorded evidence that wg1 does not rescue B_N=128, but the
+# evidence is this comment, not the instantiation: they are in no pool and no tuned CSV,
+# so nothing ever built on them. What they did cost is the module's whole wall-clock
+# tail. Their six TUs (two kids x three C dtypes) compiled in ~21 min *each* -- the same
+# spill that makes them 105,000us at runtime makes the register allocator crawl -- so
+# they alone set the floor on a full rebuild, which was 36 min at ~2.5 h of CPU.
+# Measured after removing them: 524 edges, 18.3 min of CPU, 25.3 s wall, slowest single
+# edge 8.0 s and *nothing* above 10 s. On 256 cores the old wall was essentially one
+# 21-minute serial tail; the other ~520 objects were never the cost.
+#
+# Two things to carry forward. A geometry kept "for the record" is free only if the
+# record is prose: an instantiation is not a record, it is a build cost, and here it was
+# most of the module's. And when pricing a parallel build, read the per-edge
+# distribution (ninja's .ninja_log), not the wall clock -- the wall hid a 500x outlier
+# behind a 2.1 s median.
+#
+# One caveat on the "nothing references them" check, because it nearly misled me:
+# absence from compiled_kids_opus.json is NOT evidence. That sidecar lists 93 kids while
+# the shipped tuned CSV dispatches 26 kids of which 22 are absent from it -- it tracks
+# --tune builds, not what is linked. The checks that do hold are the pool/CSV grep and
+# the link itself: after removal the .so loses exactly 35 symbols, all of this tile,
+# gains none, and every other family's symbol count is unchanged.
 for (_plain_kid, _shuf_kid), (_bm, _bn, _bk, _wg) in (
     _BMM_MXSCALE_BPRESHUFFLE_BDIRECT_ISOLATE.items()
 ):
