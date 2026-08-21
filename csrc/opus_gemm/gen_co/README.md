@@ -1,13 +1,28 @@
 # Pre-compiled gfx1250 kernels (`.co`)
 
-Device code for the `a16w16_4wave_co` kid family, built ahead of time instead of
-by the aiter JIT.
+Device code for the two 4-wave kid families, built ahead of time instead of by
+the aiter JIT:
+
+| family | pipeline | entries | tiles |
+|---|---|--:|---|
+| `a16w16_4wave_co` | [`..._4wave_compute_...cuh`](../include/gfx1250/opus_gemm_pipeline_a16w16_4wave_compute_gfx1250.cuh) | 64 | `B_M = 128`, `B_K = 128` only, `B_N` 64/128/192/256 |
+| `a16w16_4wave_wl_co` | [`..._4wave_wl_...cuh`](../include/gfx1250/opus_gemm_pipeline_a16w16_4wave_wl_gfx1250.cuh) | 155 | `B_M` 32/64/96/128 x the same `B_N`, via `wave_layout`; `B_K` 128 and 256 |
+
+They differ in one thing: the `wl` pipeline takes the wave layout
+(`TileM x TileN`, product 4) as a parameter, so it reaches `B_M` below 128 —
+`B_M = kExpM * 16 * TileM`. The compute family is fixed-layout, which makes its
+tile set a strict subset of the `wl` one. That matters when a shape cannot fill
+the machine: at `M = 512, N = 2048` a `128x64` tile yields 128 workgroups on
+256 CUs while a `64x64` tile yields 256.
+
+Neither family supports split-K, which is what bounds where they win: a shape
+whose tuned winner wants `splitK >= 2` goes to the JIT `_ws` families instead,
+and adding a `.co` entry for its tile will not take it back.
 
 ## Why
 
-The symmetric 4-wave compute pipeline
-([`opus_gemm_pipeline_a16w16_4wave_compute_gfx1250.cuh`](../include/gfx1250/opus_gemm_pipeline_a16w16_4wave_compute_gfx1250.cuh))
-needs three things a release ROCm toolchain does not have:
+The symmetric 4-wave compute pipeline needs three things a release ROCm
+toolchain does not have:
 
 | Requirement | Stock ROCm |
 |---|---|
@@ -60,11 +75,14 @@ an edit to this file and nothing else.
 
 | field | notes |
 |---|---|
-| `kid` | explicit, not positional; reordering the list must not renumber. gfx1250 `a16w16_4wave_co` owns `[21000, 23000)` |
-| `tag` | `kernel_tag`; picks the codegen emit branch and the traits/kargs names |
+| `kid` | explicit, not positional; reordering the list must not renumber. Both gfx1250 co families share the band `[21000, 23000)` |
+| `tag` | `kernel_tag`, `a16w16_4wave_co` or `a16w16_4wave_wl_co`; picks the codegen emit branch and the traits/kargs names |
 | `block_size` | threads per workgroup; **must** equal `launch_bounds[0]` (asserted) |
 | `tile` | `[B_M, B_N, B_K]` |
 | `num_slots` | LDS prefetch ring depth P (the 4wave pipeline hardcodes 3) |
+| `wave_layout` | `[TileM, TileN]`, product 4. **`wl` entries only** — it is what lets that
+family express `B_M` other than 128, since `B_M = kExpM * 16 * TileM`. Lands in the symbol
+name as `_w{m}x{n}`. |
 | `cluster` | `[m, n]` → `__cluster_dims__(m, n, 1)` |
 | `launch_bounds` | `[maxThreadsPerBlock, minWavesPerEU]` |
 | `num_vgpr` | `amdgpu_num_vgpr(N)`; `0` omits the attribute |
@@ -72,9 +90,9 @@ an edit to this file and nothing else.
 | `device_flags` | extra device-pass flags for this entry — there is no global default |
 | `variant` | optional name suffix, for two entries differing ONLY in `device_flags` |
 
-`num_vgpr`, `launch_bounds[1]` and `cluster` all land in the symbol name
-(`..._c{m}x{n}_p{slots}_v{vgpr}w{waves}[_{variant}]`), so no two entries can
-collide on one `.co`. The loader asserts that, and asserts each `kid` is in band.
+`wave_layout`, `num_vgpr`, `launch_bounds[1]` and `cluster` all land in the symbol
+name (`...[_w{m}x{n}]_c{m}x{n}_p{slots}_v{vgpr}w{waves}[_{variant}]`), so no two
+entries can collide on one `.co`. The loader asserts that, and asserts each `kid` is in band.
 
 A **missing** `co_kernels.json` leaves the family empty rather than breaking the
 build — a data file that failed to ship should cost the co kids, not all of opus.
@@ -94,6 +112,14 @@ is that you can swap toolchains freely:
 python3 csrc/opus_gemm/gen_co/build_co.py --llvm-bin /path/to/llvm/build/bin
 # or: OPUS_CO_LLVM_BIN=... python3 csrc/opus_gemm/gen_co/build_co.py
 ```
+
+`--device-flag` appends a flag to **every** entry, on top of that entry's own
+`device_flags`, for investigations that need the whole family built one way.
+`-DOPUS_CO_NO_1WG_PAD` is the one that exists today: it drops the LDS pad that
+holds the affected variants at 1 WG/CU. `_expected_lds` follows the flag, so the
+`group_segment_fixed_size` check still passes rather than failing the build.
+Whatever was used is recorded per entry in `build_info.json`, so an artifact
+never hides which flags produced it.
 
 `HIP_CLANG_PATH` is how hipcc is pointed at another clang, so the driver flags
 stay identical whichever toolchain is selected. `llvm-readelf` and
@@ -153,7 +179,7 @@ compiles against.
 
 ## Dispatch
 
-These kids get **their own pair of tables** in
+Both tags share this path. These kids get **their own pair of tables** in
 [`opus_gemm_arch_gfx1250.cuh`](../include/gfx1250/opus_gemm_arch_gfx1250.cuh) —
 `opus_a16w16_co_tune_dispatch_gfx1250(kid)` for the explicit-`kernelId` / tuner
 path and `opus_a16w16_co_dispatch_gfx1250(M, N, K)` for tuned-CSV production —
@@ -164,4 +190,8 @@ kid needs. Bias and non-bf16 `Y` fall through to split-K, since this pipeline ha
 neither an epilogue nor a reduce kernel to serve them.
 
 The shape heuristic never returns a `.co` kid; reaching one always means a tuned
-CSV row or an explicit `kernelId`.
+CSV row or an explicit `kernelId`. On the tuning side both tags are answered
+early by `kid_rejects_shape` — no buffer resource, every tail clamped by the D#,
+so no M/N/K alignment applies. Naming only one of them there once cost the `wl`
+family every shape whose `N` fell outside an unrelated gfx942 whitelist; see
+issue 4 in [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md).

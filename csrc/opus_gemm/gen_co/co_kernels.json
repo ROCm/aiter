@@ -7315,6 +7315,561 @@
         1,
         4
       ]
+    },
+    {
+      "kid": 21301,
+      "tag": "a16w16_4wave_wl_co",
+      "block_size": 128,
+      "tile": [
+        64,
+        64,
+        256
+      ],
+      "num_slots": 3,
+      "cluster": [
+        1,
+        1
+      ],
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_vgpr": 1024,
+      "dtypes": {
+        "a": "bf16_t",
+        "b": "bf16_t",
+        "c": "bf16_t",
+        "acc": "fp32_t"
+      },
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "variant": "",
+      "wave_layout": [
+        1,
+        4
+      ]
+    },
+    {
+      "kid": 21302,
+      "tag": "a16w16_4wave_wl_co",
+      "block_size": 128,
+      "tile": [
+        64,
+        64,
+        256
+      ],
+      "num_slots": 3,
+      "cluster": [
+        1,
+        4
+      ],
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_vgpr": 1024,
+      "dtypes": {
+        "a": "bf16_t",
+        "b": "bf16_t",
+        "c": "bf16_t",
+        "acc": "fp32_t"
+      },
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "variant": "",
+      "wave_layout": [
+        1,
+        4
+      ]
+    },
+    {
+      "kid": 21303,
+      "tag": "a16w16_4wave_wl_co",
+      "block_size": 128,
+      "tile": [
+        64,
+        64,
+        256
+      ],
+      "num_slots": 3,
+      "cluster": [
+        4,
+        1
+      ],
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_vgpr": 1024,
+      "dtypes": {
+        "a": "bf16_t",
+        "b": "bf16_t",
+        "c": "bf16_t",
+        "acc": "fp32_t"
+      },
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "variant": "",
+      "wave_layout": [
+        1,
+        4
+      ]
+    },
+    {
+      "kid": 21304,
+      "tag": "a16w16_4wave_wl_co",
+      "block_size": 128,
+      "tile": [
+        64,
+        64,
+        256
+      ],
+      "num_slots": 3,
+      "cluster": [
+        2,
+        2
+      ],
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_vgpr": 1024,
+      "dtypes": {
+        "a": "bf16_t",
+        "b": "bf16_t",
+        "c": "bf16_t",
+        "acc": "fp32_t"
+      },
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "variant": "",
+      "wave_layout": [
+        1,
+        4
+      ]
+    },
+    {
+      "kid": 21305,
+      "tag": "a16w16_4wave_wl_co",
+      "block_size": 128,
+      "tile": [
+        64,
+        64,
+        256
+      ],
+      "num_slots": 3,
+      "cluster": [
+        4,
+        4
+      ],
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_vgpr": 1024,
+      "dtypes": {
+        "a": "bf16_t",
+        "b": "bf16_t",
+        "c": "bf16_t",
+        "acc": "fp32_t"
+      },
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "variant": "",
+      "wave_layout": [
+        1,
+        4
+      ]
+    },
+    {
+      "kid": 21306,
+      "tag": "a16w16_4wave_wl_co",
+      "block_size": 128,
+      "tile": [
+        64,
+        64,
+        256
+      ],
+      "num_slots": 3,
+      "cluster": [
+        1,
+        1
+      ],
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_vgpr": 1024,
+      "dtypes": {
+        "a": "bf16_t",
+        "b": "bf16_t",
+        "c": "bf16_t",
+        "acc": "fp32_t"
+      },
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "variant": "",
+      "wave_layout": [
+        2,
+        2
+      ]
+    },
+    {
+      "kid": 21307,
+      "tag": "a16w16_4wave_wl_co",
+      "block_size": 128,
+      "tile": [
+        64,
+        64,
+        256
+      ],
+      "num_slots": 3,
+      "cluster": [
+        1,
+        4
+      ],
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_vgpr": 1024,
+      "dtypes": {
+        "a": "bf16_t",
+        "b": "bf16_t",
+        "c": "bf16_t",
+        "acc": "fp32_t"
+      },
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "variant": "",
+      "wave_layout": [
+        2,
+        2
+      ]
+    },
+    {
+      "kid": 21308,
+      "tag": "a16w16_4wave_wl_co",
+      "block_size": 128,
+      "tile": [
+        64,
+        64,
+        256
+      ],
+      "num_slots": 3,
+      "cluster": [
+        4,
+        1
+      ],
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_vgpr": 1024,
+      "dtypes": {
+        "a": "bf16_t",
+        "b": "bf16_t",
+        "c": "bf16_t",
+        "acc": "fp32_t"
+      },
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "variant": "",
+      "wave_layout": [
+        2,
+        2
+      ]
+    },
+    {
+      "kid": 21309,
+      "tag": "a16w16_4wave_wl_co",
+      "block_size": 128,
+      "tile": [
+        64,
+        64,
+        256
+      ],
+      "num_slots": 3,
+      "cluster": [
+        2,
+        2
+      ],
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_vgpr": 1024,
+      "dtypes": {
+        "a": "bf16_t",
+        "b": "bf16_t",
+        "c": "bf16_t",
+        "acc": "fp32_t"
+      },
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "variant": "",
+      "wave_layout": [
+        2,
+        2
+      ]
+    },
+    {
+      "kid": 21310,
+      "tag": "a16w16_4wave_wl_co",
+      "block_size": 128,
+      "tile": [
+        64,
+        64,
+        256
+      ],
+      "num_slots": 3,
+      "cluster": [
+        4,
+        4
+      ],
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_vgpr": 1024,
+      "dtypes": {
+        "a": "bf16_t",
+        "b": "bf16_t",
+        "c": "bf16_t",
+        "acc": "fp32_t"
+      },
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "variant": "",
+      "wave_layout": [
+        2,
+        2
+      ]
+    },
+    {
+      "kid": 21311,
+      "tag": "a16w16_4wave_wl_co",
+      "block_size": 128,
+      "tile": [
+        32,
+        64,
+        256
+      ],
+      "num_slots": 3,
+      "cluster": [
+        1,
+        1
+      ],
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_vgpr": 1024,
+      "dtypes": {
+        "a": "bf16_t",
+        "b": "bf16_t",
+        "c": "bf16_t",
+        "acc": "fp32_t"
+      },
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "variant": "",
+      "wave_layout": [
+        1,
+        4
+      ]
+    },
+    {
+      "kid": 21312,
+      "tag": "a16w16_4wave_wl_co",
+      "block_size": 128,
+      "tile": [
+        32,
+        64,
+        256
+      ],
+      "num_slots": 3,
+      "cluster": [
+        1,
+        4
+      ],
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_vgpr": 1024,
+      "dtypes": {
+        "a": "bf16_t",
+        "b": "bf16_t",
+        "c": "bf16_t",
+        "acc": "fp32_t"
+      },
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "variant": "",
+      "wave_layout": [
+        1,
+        4
+      ]
+    },
+    {
+      "kid": 21313,
+      "tag": "a16w16_4wave_wl_co",
+      "block_size": 128,
+      "tile": [
+        32,
+        64,
+        256
+      ],
+      "num_slots": 3,
+      "cluster": [
+        4,
+        1
+      ],
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_vgpr": 1024,
+      "dtypes": {
+        "a": "bf16_t",
+        "b": "bf16_t",
+        "c": "bf16_t",
+        "acc": "fp32_t"
+      },
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "variant": "",
+      "wave_layout": [
+        1,
+        4
+      ]
+    },
+    {
+      "kid": 21314,
+      "tag": "a16w16_4wave_wl_co",
+      "block_size": 128,
+      "tile": [
+        32,
+        64,
+        256
+      ],
+      "num_slots": 3,
+      "cluster": [
+        2,
+        2
+      ],
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_vgpr": 1024,
+      "dtypes": {
+        "a": "bf16_t",
+        "b": "bf16_t",
+        "c": "bf16_t",
+        "acc": "fp32_t"
+      },
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "variant": "",
+      "wave_layout": [
+        1,
+        4
+      ]
+    },
+    {
+      "kid": 21315,
+      "tag": "a16w16_4wave_wl_co",
+      "block_size": 128,
+      "tile": [
+        32,
+        64,
+        256
+      ],
+      "num_slots": 3,
+      "cluster": [
+        4,
+        4
+      ],
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_vgpr": 1024,
+      "dtypes": {
+        "a": "bf16_t",
+        "b": "bf16_t",
+        "c": "bf16_t",
+        "acc": "fp32_t"
+      },
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "variant": "",
+      "wave_layout": [
+        1,
+        4
+      ]
     }
   ]
 }
