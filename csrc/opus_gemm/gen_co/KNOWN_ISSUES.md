@@ -307,11 +307,41 @@ took the group from 7/12 to 12/12 against triton.
 
 The four it did **not** take are the useful part of that result: all four run at
 `splitK` 2–5, and no `.co` family supports split-K. The eight it took are at
-`splitK` 0 or 1. That is the boundary — a `.co` entry can only win a shape that
-does not want split-K — and it is also how to price issue 3 before doing the
-work: its 10 shapes are `32x32x*` and `16x*`, the smallest tiles in the set,
-which is exactly the population that leans hardest on split-K. Count how many of
-them tuned to `splitK >= 2` before treating 10 as the upside.
+`splitK` 0 or 1. A `.co` entry can only win a shape that does not want split-K.
+
+A second pass found 10 more shapes that could also reach the new tiles but had
+not been re-tuned — adding candidates does nothing for a shape nobody re-tunes.
+All 10 improved, 8/10 to 10/10 against triton.
+
+### Issue 3 is not worth fixing, and there is a probe that says so
+
+The occupancy case for `B_M = 16` is real. Eight of the 84 shapes cannot be
+filled by any legal `.co` tile without split-K, and `B_M = 16` would fill them;
+they sit at `splitK` 3–5 for exactly that reason, so the family's usual
+split-K handicap would not apply to them.
+
+What kills it is the scheduling budget. This pipeline hides its ds_reads, its
+handshake and its TDM issue in the gaps between WMMAs, and a K step only has
+`(B_K/64) * kNumNSub * kExpM * kExpNPerSub * kExpKHalf` of them. Every `.co`
+kernel that wins a shape today has **at least 16**:
+
+| tile | WMMA / K step | shapes won |
+|---|--:|--:|
+| `128x256x128` | 128 | 26 |
+| `64x64x256`, `64x128x128`, `128x64x128` | 32 | 17 |
+| `32x64x256`, `64x64x128` | 16 | 7 |
+| `32x64x128` | 8 | **0** |
+
+That last row is measured, not extrapolated. `32x64x128 w1x4` is legal today, has
+the same grid as `32x64x256` and therefore the same occupancy, and differs from
+it only in K depth and budget — a controlled comparison of the budget alone.
+Added as a probe and tuned head-to-head on the five shapes `32x64x256` owns, it
+won **none**: 0.975–1.017x, i.e. noise. The probe entries were then removed.
+
+`B_M = 16` reaches 8 with `B_K = 256` and 4 with `B_K = 128`, at or below the
+level that just failed. Widening `B_N` to buy budget halves the grid and hands
+the occupancy back, so there is no way out of the trade. Those eight shapes
+belong to the `_ws` families, which are built for small tiles and can split K.
 
 ---
 
