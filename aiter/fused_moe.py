@@ -31,6 +31,7 @@ from aiter.jit.utils.chip_info import (
     gfx_from_cu_num,
 )
 from aiter.jit.utils.torch_guard import torch_compile_guard
+from aiter.ops.flydsl.kernels.mega_moe_gfx1250.types import Stage2ScatterContext
 
 try:
     from aiter.ops.flydsl.moe_common import GateMode
@@ -489,6 +490,7 @@ def fused_moe(
     shared_w1_scale: torch.Tensor | None = None,
     shared_w2_scale: torch.Tensor | None = None,
     shared_expert_id: int = -1,
+    stage2_scatter: Stage2ScatterContext | None = None,
 ):
     if (
         any(
@@ -531,6 +533,8 @@ def fused_moe(
         )
     if not block_size_M:
         block_size_M = -1
+    enable_ep_scatter = stage2_scatter is not None
+    scatter_source_map = stage2_scatter.source_token_map if enable_ep_scatter else None
     return fused_moe_(
         hidden_states=hidden_states,
         w1=w1,
@@ -557,6 +561,18 @@ def fused_moe(
         beta=beta,
         linear_beta=linear_beta,
         gate_mode=gate_mode,
+        ep_arena_handle=stage2_scatter.arena_handle if enable_ep_scatter else 0,
+        ep_combine_input_offset=(
+            stage2_scatter.combine_input_offset if enable_ep_scatter else 0
+        ),
+        ep_slot_stride_bytes=(
+            stage2_scatter.slot_stride_bytes if enable_ep_scatter else 0
+        ),
+        ep_max_tokens_per_rank=(
+            stage2_scatter.max_tokens_per_rank if enable_ep_scatter else 0
+        ),
+        ep_world_size=stage2_scatter.world_size if enable_ep_scatter else 0,
+        ep_source_token_map=scatter_source_map,
     )
 
 
@@ -588,6 +604,12 @@ def fused_moe_fake(
     beta: float | None = None,
     linear_beta: float | None = None,
     gate_mode: str = GateMode.SEPARATED.value,
+    ep_arena_handle: int = 0,
+    ep_combine_input_offset: int = 0,
+    ep_slot_stride_bytes: int = 0,
+    ep_max_tokens_per_rank: int = 0,
+    ep_world_size: int = 0,
+    ep_source_token_map: torch.Tensor | None = None,
 ) -> torch.Tensor:
     device = topk_ids.device
     M, _topk = topk_ids.shape
@@ -626,7 +648,23 @@ def fused_moe_(
     beta: float | None = None,
     linear_beta: float | None = None,
     gate_mode: str = GateMode.SEPARATED.value,
+    ep_arena_handle: int = 0,
+    ep_combine_input_offset: int = 0,
+    ep_slot_stride_bytes: int = 0,
+    ep_max_tokens_per_rank: int = 0,
+    ep_world_size: int = 0,
+    ep_source_token_map: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    stage2_scatter = None
+    if ep_source_token_map is not None:
+        stage2_scatter = Stage2ScatterContext(
+            arena_handle=ep_arena_handle,
+            combine_input_offset=ep_combine_input_offset,
+            slot_stride_bytes=ep_slot_stride_bytes,
+            max_tokens_per_rank=ep_max_tokens_per_rank,
+            world_size=ep_world_size,
+            source_token_map=ep_source_token_map,
+        )
     return _fused_moe_impl(
         hidden_states=hidden_states,
         w1=w1,
@@ -653,6 +691,7 @@ def fused_moe_(
         beta=beta,
         linear_beta=linear_beta,
         gate_mode=gate_mode,
+        stage2_scatter=stage2_scatter,
     )
 
 
@@ -682,6 +721,7 @@ def _fused_moe_impl(
     beta: float | None = None,
     linear_beta: float | None = None,
     gate_mode: str = GateMode.SEPARATED.value,
+    stage2_scatter: Stage2ScatterContext | None = None,
     *,
     _q_dtype_a: torch.dtype | None = None,
     _metadata_transform: Callable | None = None,
@@ -804,6 +844,7 @@ def _fused_moe_impl(
                 num_local_tokens=num_local_tokens,
                 situ_beta=1.0 if beta is None else float(beta),
                 situ_linear_beta=1.0 if linear_beta is None else float(linear_beta),
+                stage2_scatter=stage2_scatter,
             )
 
     if grouped_a8w4_out is not None:
@@ -1263,6 +1304,24 @@ fused_moe_1stage_dict = {
 # fmt: on
 
 quant_remap = {QuantType.per_128x128: QuantType.per_1x128}
+
+
+def _mxfp4_per_1x32_weight_expert_to_f32(weight, scale, expert_id, rows, cols):
+    from aiter.utility import fp4_utils
+
+    weight_e = fp4_utils.mxfp4_to_f32(weight[expert_id])
+    scale_e = scale.reshape(weight.shape[0], rows, cols // 32)[expert_id]
+    return (
+        weight_e.view(rows, cols // 32, 32) * scale_e.view(rows, cols // 32, 1)
+    ).view(rows, cols)
+
+
+def _int4_per_1x32_weight_expert_to_f32(weight, scale, expert_id, rows, cols):
+    scale_e = scale.reshape(weight.shape[0], cols // 32, rows)[expert_id]
+    return (
+        weight[expert_id].to(dtypes.fp32).reshape(rows, cols // 32, 32)
+        * scale_e.permute(1, 0).unsqueeze(-1)
+    ).reshape(rows, cols)
 
 
 def nextPow2(n):
@@ -3453,17 +3512,20 @@ def torch_moe_stage1(
     topk = topk_weight.shape[1]
     N = w1.shape[1]
     E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
+    lazy_w1_int4_dequant = False
+    lazy_w1_mxfp4_dequant = False
     if quant_type == QuantType.per_1x32 and w1.dtype == dtypes.i4x2:
         # a16wi4: int4 weights viewed as int8 for compute
         hidden_states = hidden_states.to(ctype)
-        w1 = w1.view(dtypes.i8).to(ctype)
+        w1 = w1.view(dtypes.i8)
+        lazy_w1_int4_dequant = True
     elif quant_type == QuantType.per_1x32:
         from aiter.utility import fp4_utils
 
         if w1.dtype == dtypes.fp8:  # mxfp8 weight
             w1 = w1.to(ctype)
         else:
-            w1 = fp4_utils.mxfp4_to_f32(w1)
+            lazy_w1_mxfp4_dequant = True
         w1_scale = fp4_utils.e8m0_to_f32(w1_scale)
         if a1_scale is not None:  # skip a16w4 / mxfp8-bf16-activation ref
             if hidden_states.dtype == dtypes.fp8:  # a8w4 mxfp8 activation
@@ -3505,18 +3567,20 @@ def torch_moe_stage1(
         # a16wi4: groupwise dequant int4 weights with scale [E, K//32, N]
         group_size = 32
         num_groups = model_dim // group_size
-        w1_shape = w1.shape
-        # w1: [E, N, K] -> apply scale per group of K
-        w1 = w1.reshape(E, N, num_groups, group_size)
-        w1.mul_(w1_scale.reshape(E, num_groups, N).permute(0, 2, 1).unsqueeze(-1))
-        w1 = w1.reshape(w1_shape)
+        if not lazy_w1_int4_dequant:
+            w1_shape = w1.shape
+            # w1: [E, N, K] -> apply scale per group of K
+            w1 = w1.reshape(E, N, num_groups, group_size)
+            w1.mul_(w1_scale.reshape(E, num_groups, N).permute(0, 2, 1).unsqueeze(-1))
+            w1 = w1.reshape(w1_shape)
         # activations are bf16, no scaling needed
     elif quant_type == QuantType.per_1x32:
-        w1_shape = w1.shape
-        w1 = w1.view(E, N, model_dim // 32, 32) * w1_scale.view(
-            E, N, model_dim // 32, 1
-        )
-        w1 = w1.view(w1_shape)
+        if not lazy_w1_mxfp4_dequant:
+            w1_shape = w1.shape
+            w1 = w1.view(E, N, model_dim // 32, 32) * w1_scale.view(
+                E, N, model_dim // 32, 1
+            )
+            w1 = w1.view(w1_shape)
 
         a1_shape = hidden_states.shape
         hidden_states = hidden_states.view(a1_shape[0], a1_shape[1] // 32, 32)
@@ -3540,7 +3604,17 @@ def torch_moe_stage1(
         mask = topk_ids == E_id
         if mask.sum():
             sub_tokens = hidden_states[mask]
-            act_input = sub_tokens @ (w1[E_id].transpose(0, 1))
+            if lazy_w1_int4_dequant:
+                w1_e = _int4_per_1x32_weight_expert_to_f32(
+                    w1, w1_scale, E_id, N, model_dim
+                )
+            elif lazy_w1_mxfp4_dequant:
+                w1_e = _mxfp4_per_1x32_weight_expert_to_f32(
+                    w1, w1_scale, E_id, N, model_dim
+                )
+            else:
+                w1_e = w1[E_id]
+            act_input = sub_tokens @ (w1_e.transpose(0, 1))
             if doweight:
                 act_input = act_input * topk_weight[mask].view(-1, 1)
             out[mask] = act_input
@@ -3581,17 +3655,20 @@ def torch_moe_stage2(
 ):
     ctype = dtypes.fp32  # compute type
     E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
+    lazy_w2_int4_dequant = False
+    lazy_w2_mxfp4_dequant = False
     if quant_type == QuantType.per_1x32 and w2.dtype == dtypes.i4x2:
         # a16wi4: int4 weights viewed as int8 for compute
         hidden_states = hidden_states.to(ctype)
-        w2 = w2.view(dtypes.i8).to(ctype)
+        w2 = w2.view(dtypes.i8)
+        lazy_w2_int4_dequant = True
     elif quant_type == QuantType.per_1x32:
         from aiter.utility import fp4_utils
 
         if w2.dtype == dtypes.fp8:  # mxfp8 weight
             w2 = w2.to(ctype)
         else:
-            w2 = fp4_utils.mxfp4_to_f32(w2)
+            lazy_w2_mxfp4_dequant = True
         w2_scale = fp4_utils.e8m0_to_f32(w2_scale)
         if a2_scale is not None:
             if hidden_states.dtype == dtypes.fp8:  # a8w4 mxfp8 activation
@@ -3632,13 +3709,16 @@ def torch_moe_stage2(
         # w2: [E, model_dim, inter_dim], w2_scale is [E, inter_dim//32, model_dim]
         group_size = 32
         num_groups = inter_dim // group_size
-        w2_shape = w2.shape
-        # w2: [E, model_dim, inter_dim] -> apply scale per group of inter_dim
-        w2 = w2.reshape(E, model_dim, num_groups, group_size)
-        w2.mul_(
-            w2_scale.reshape(E, num_groups, model_dim).permute(0, 2, 1).unsqueeze(-1)
-        )
-        w2 = w2.reshape(w2_shape)
+        if not lazy_w2_int4_dequant:
+            w2_shape = w2.shape
+            # w2: [E, model_dim, inter_dim] -> apply scale per group of inter_dim
+            w2 = w2.reshape(E, model_dim, num_groups, group_size)
+            w2.mul_(
+                w2_scale.reshape(E, num_groups, model_dim)
+                .permute(0, 2, 1)
+                .unsqueeze(-1)
+            )
+            w2 = w2.reshape(w2_shape)
         # activations are bf16, no scaling
     elif quant_type == QuantType.per_1x32:
         a2_shape = hidden_states.shape
@@ -3650,11 +3730,12 @@ def torch_moe_stage2(
             )
         hidden_states = hidden_states.view(a2_shape)
 
-        w2_shape = w2.shape
-        w2 = w2.view(E, model_dim, inter_dim // 32, 32) * w2_scale.view(
-            E, model_dim, inter_dim // 32, 1
-        )
-        w2 = w2.view(w2_shape)
+        if not lazy_w2_mxfp4_dequant:
+            w2_shape = w2.shape
+            w2 = w2.view(E, model_dim, inter_dim // 32, 32) * w2_scale.view(
+                E, model_dim, inter_dim // 32, 1
+            )
+            w2 = w2.view(w2_shape)
 
     out = torch.zeros(
         (token_num, topk, model_dim),
@@ -3665,7 +3746,17 @@ def torch_moe_stage2(
         mask = topk_ids == E_id
         if mask.sum():
             sub_tokens = hidden_states[mask]
-            act_input = sub_tokens @ (w2[E_id].transpose(0, 1))
+            if lazy_w2_int4_dequant:
+                w2_e = _int4_per_1x32_weight_expert_to_f32(
+                    w2, w2_scale, E_id, model_dim, inter_dim
+                )
+            elif lazy_w2_mxfp4_dequant:
+                w2_e = _mxfp4_per_1x32_weight_expert_to_f32(
+                    w2, w2_scale, E_id, model_dim, inter_dim
+                )
+            else:
+                w2_e = w2[E_id]
+            act_input = sub_tokens @ (w2_e.transpose(0, 1))
             out[mask] = act_input
             if w2_bias is not None:
                 out[mask] = out[mask] + w2_bias[E_id].view(1, -1)
