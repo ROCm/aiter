@@ -5,9 +5,7 @@
 #include "asm_fmoe_configs.hpp"
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
-#include <map>
 #include <memory>
-#include <mutex>
 #include <tuple>
 
 struct __attribute__((packed)) KernelArgs
@@ -68,35 +66,6 @@ struct __attribute__((packed)) KernelArgs
     p3 _p26;
     unsigned int ps_deno;
     p3 _p27;
-};
-
-// ---------------------- MXFP4 activation pre-pass ----------------
-// FLAT MXFP4 GEMM kernels that take pre-quantized X are fed by this pass: one wave per 256
-// dims of one token writes the packed fp4 row and the e8m0 block scales in the tile layout
-// the GEMM addresses, and zeroes the same slice of the output. That zeroing is not an
-// extra: FLAT rows arrive uninitialised (moe_buf is a plain torch.empty) and the GEMM
-// accumulates into them with atomics, so such a kernel is built without the in-kernel
-// zeroing protocol and relies on this pass instead.
-#define XQUANT_KNL_NAME "_ZN5aiter22fmoe_mxfp4_xquant_flatE"
-#define XQUANT_CO_NAME "fmoe/fmoe_mxfp4_xquant_flat.co"
-// One wave covers 256 dims; the MX block is 32 elements and a scale tile is 32 rows deep.
-static constexpr int XQUANT_DIM_PER_TG = 256;
-static constexpr int XQUANT_TG_THREADS = 64;
-static constexpr int MX_BLOCK_K        = 32;
-static constexpr int MX_SCALE_TILE_M   = 32;
-
-// Compact 48-byte block: small enough that the CP preloads it into user SGPRs, so unlike
-// the GEMM's KernelArgs it carries no inter-field padding.
-struct __attribute__((packed)) XQuantKernelArgs
-{
-    void* ptr_X;  // bf16 activations in
-    void* ptr_XQ; // packed fp4 out
-    void* ptr_XS; // e8m0 block scales out
-    void* ptr_O;  // output rows to zero
-    unsigned int dim;
-    unsigned int Xbs; // bf16 row stride, bytes
-    unsigned int Xs;  // fp4 row stride, bytes
-    unsigned int Os;  // output row stride, bytes
 };
 
 class FMoeKernel
@@ -553,64 +522,6 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
                                   fc2_scale,
                                   fc2_smooth_scale,
                                   stream);
-}
-
-AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
-    fmoe_mxfp4_xquant_prepass,
-    (
-    aiter_tensor_t* out,   // [token_cnt, dim] GEMM output, zeroed here
-    aiter_tensor_t* xq,    // [token_cnt, dim/2] packed fp4 X
-    aiter_tensor_t* xs,    // [token_cnt * 32, dim/32] e8m0 scale tiles
-    aiter_tensor_t* input, // [token_cnt, dim] bf16/fp16 X
-    hipStream_t stream),
-    (out, xq, xs, input, stream))
-{
-    const HipDeviceGuard device_guard(input->device_id);
-    const int token_cnt = input->size(0);
-    const int dim       = input->size(1);
-
-    AITER_CHECK(input->dtype() == AITER_DTYPE_bf16 || input->dtype() == AITER_DTYPE_fp16,
-                __func__,
-                ": X must be bf16/fp16, got ",
-                AiterDtype_to_str(input->dtype()));
-    AITER_CHECK((dim % XQUANT_DIM_PER_TG) == 0,
-                __func__,
-                ": dim must be divisible by ",
-                XQUANT_DIM_PER_TG,
-                ", got ",
-                dim);
-    AITER_CHECK(xq->size(0) == token_cnt && xq->size(1) == dim / 2,
-                __func__,
-                ": xq must be [token_cnt, dim/2]");
-    // A scale tile is MX_SCALE_TILE_M rows of dim/MX_BLOCK_K bytes and token x owns tile x.
-    // Only row 0 of each tile is written and read; the rest is the pitch the GEMM's
-    // addressing assumes, so it still has to be backed by memory.
-    AITER_CHECK(xs->size(0) == token_cnt * MX_SCALE_TILE_M && xs->size(1) == dim / MX_BLOCK_K,
-                __func__,
-                ": xs must be [token_cnt * 32, dim/32]");
-
-    static AiterAsmKernel xquant_kernel(XQUANT_KNL_NAME, XQUANT_CO_NAME);
-
-    XQuantKernelArgs args;
-    size_t arg_size = sizeof(args);
-    args.ptr_X      = input->ptr;
-    args.ptr_XQ     = xq->ptr;
-    args.ptr_XS     = xs->ptr;
-    args.ptr_O      = out->ptr;
-    args.dim        = dim;
-    args.Xbs        = input->stride(0) * input->element_size();
-    args.Xs         = xq->stride(0) * xq->element_size();
-    args.Os         = out->stride(0) * out->element_size();
-
-    xquant_kernel.launch_kernel({&args,
-                                 &arg_size,
-                                 dim / XQUANT_DIM_PER_TG, // gdx
-                                 1,                       // gdy
-                                 token_cnt,               // gdz
-                                 XQUANT_TG_THREADS,       // bdx
-                                 1,                       // bdy
-                                 1,                       // bdz
-                                 stream});
 }
 
 AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(

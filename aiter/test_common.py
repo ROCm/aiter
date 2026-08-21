@@ -339,11 +339,6 @@ def get_trace_perf(prof, num_iters):
     for el in prof.events():
         df.append([getattr(el, x, None) for x in cols])
     df = pd.DataFrame(df, columns=cols)
-    if int(os.environ.get("AITER_DUMP_INSTANCES", "0")):
-        for _n, _d in df.groupby("name", sort=False):
-            if str(_d["device_type"].iat[0]).split(".")[-1] == "CUDA":
-                _v = [round(x, 2) for x in _d["self_device_time_total"].tolist()]
-                logger.info(f"[instances] {_n[:44]:44s} {_v}")
     ###remove abnormal data
     dropped_num = warm_iter
     dropped_indexs, dropped_num = post_process_data(

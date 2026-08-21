@@ -1091,13 +1091,6 @@ def fused_moe_1stage(
             a1 = hidden_states
             a1_scale = torch.empty(0, device="cuda")
         else:
-            # The FLAT MXFP4 kernels all quantize X in-kernel (bf16=1) now, so the standalone
-            # activation pre-pass that used to serve a bf16=0 FLAT entry is gone. Such an entry
-            # must not fall through to the generic quantizer: it produces neither the scale-tile
-            # layout those kernels address nor the zeroed moe_buf their atomics require.
-            assert not (
-                bool(flat) and quant_type == QuantType.per_1x32
-            ), "FLAT MXFP4 entry published bf16=0, but the activation pre-pass was removed"
             quant_func = get_quant(quant_type)
             if hidden_states.dtype != q_dtype_a:
                 if quant_type == QuantType.per_1x128:
@@ -1123,10 +1116,11 @@ def fused_moe_1stage(
         token_num = hidden_states.shape[0]
         E, model_dim, _inter_dim = get_inter_dim(w1.shape, w2.shape)
         if quant_type == QuantType.per_1x32:
-            # An xbf16 kernel quantizes X itself, and the FLAT pre-pass already emits
-            # the scale in the tile layout its GEMM addresses; neither has a host scale
-            # to sort. Only the non-flat pre-quantized fp4 path does.
-            if not xbf16 and not flat_mxfp4_prequant:
+            # FLAT per_1x32 kernels are always xbf16: X stays bf16 and is
+            # dynamic-quantized to MXFP4 inside the kernel, so there is no host
+            # activation e8m0 scale to pack. Only the (not-yet-enabled) non-flat
+            # pre-quantized fp4 path carries a host scale that needs sorting.
+            if not xbf16:
                 a1_scale = mxfp4_moe_sort_fwd(
                     a1_scale,
                     sorted_ids=sorted_ids,

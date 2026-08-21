@@ -144,15 +144,6 @@ def fmoe_int8_g1u0(
 
 
 @compile_ops("module_moe_fmoe_asm", ffi_type="ctypes")
-def fmoe_mxfp4_xquant_prepass(
-    out: Tensor,  # [token_cnt, dim] GEMM output, zeroed by this pass
-    xq: Tensor,  # [token_cnt, dim // 2] packed fp4 X
-    xs: Tensor,  # [token_cnt * 32, dim // 32] e8m0 scale tiles
-    input: Tensor,  # [token_cnt, dim] bf16/fp16 X
-) -> None: ...
-
-
-@compile_ops("module_moe_fmoe_asm", ffi_type="ctypes")
 def fmoe_g1u1(
     out: Tensor,
     input: Tensor,
