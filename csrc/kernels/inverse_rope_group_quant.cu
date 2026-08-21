@@ -501,17 +501,30 @@ __global__ void inverse_rope_group_quant_kernel(
         }
 
         // --- Group amax reduction ---
-        // Pairwise rather than an accumulator chain. Both forms issue the same
-        // count of v_max3, but folding into one accumulator is a chain as deep
-        // as THREAD_DATA_SIZE, and it sits between the loads and the scale that
-        // every store in the group then waits on -- which is what the
-        // s_delay_alu padding around it in the disassembly pays for. Removing
-        // the reduction outright is worth 6.9% at s=512 and 4.0% at s=16384, so
-        // the depth is worth the THREAD_DATA_SIZE/2 live values it costs
-        // (md 21.3). fabs is a source modifier, so the first level folds in
-        // free.
+        // Pairwise rather than an accumulator chain, because folding into one
+        // accumulator is a chain as deep as THREAD_DATA_SIZE and it sits between
+        // the loads and the scale that every store in the group then waits on --
+        // which is what the s_delay_alu padding around it in the disassembly
+        // pays for. Removing the reduction outright is worth 6.9% at s=512 and
+        // 4.0% at s=16384, so the depth is worth the THREAD_DATA_SIZE/2 live
+        // values it costs (md 21.3). fabs is a source modifier, so the first
+        // level folds in free.
+        //
+        // wave32 only. The two forms issue the same count of v_max3 there, but
+        // not on gfx950: the chain fuses into v_max3_f32 (32 of them at GS=128,
+        // TDS=32) where the tree leaves two-way maxes (22 v_max3 and 68 v_max),
+        // and the extra VALU outweighs the shorter chain by 2.4% at s >= 2048.
         float amax;
-        if constexpr(THREAD_DATA_SIZE == 1)
+        if constexpr(WARP_SIZE == 64)
+        {
+            amax = kAbsmaxFloor;
+#pragma unroll
+            for(int i = 0; i < THREAD_DATA_SIZE; ++i)
+            {
+                amax = fmaxf(amax, fabsf(vals[i]));
+            }
+        }
+        else if constexpr(THREAD_DATA_SIZE == 1)
         {
             amax = fmaxf(fabsf(vals[0]), kAbsmaxFloor);
         }
