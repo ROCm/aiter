@@ -126,8 +126,6 @@ of 3 runs per cell:
     ./fwd.exe -prec=bf16 -iperm=0 -operm=0 -mode=0 -v=0 -lse=1 -fwd_v3=1        -b=$b -h=$hq -h_k=$hkv -s=$s -d=128 -mask=$causal
     ./bwd.exe -prec=bf16 -iperm=0 -operm=0 -mode=0 -v=0 -bwd_v3=1 -v3_bf16_cvt=1 -v3_atomic_fp32=0|1 -b=$b -h=$hq -h_k=$hkv -s=$s -d=128 -mask=$causal
 ```
-A masked run only computes about half the tiles, so both hosts halve their FLOP
-count for `mask != 0`; the `causal=1` rows are on that same convention.
 
 ![causal-fwd-perf picture](images/causal-fwd-perf.png)
 ![non-causal-fwd-perf picture](images/non-causal-fwd-perf.png)
