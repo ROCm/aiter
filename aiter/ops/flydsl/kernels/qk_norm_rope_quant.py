@@ -1580,7 +1580,7 @@ def flydsl_qk_norm_rope_quant(
         bid_arg = q.new_empty(1, dtype=torch.int32)
 
     if is_gfx1250:
-        if (
+        use_tdm = (
             USE_TDM_PREFILL
             and not quant
             and not kv_write
@@ -1588,22 +1588,47 @@ def flydsl_qk_norm_rope_quant(
             and T_tok * H >= TDM_MIN_ROWS
             and (D % 256 == 0)
             and (H & (H - 1) == 0)
-        ):
-            q_out, kv_out = flydsl_qk_norm_rope_tdm_prefill(
-                q,
-                kv,
-                kv_weight,
-                cos_cache,
-                sin_cache,
-                positions,
+        )
+        if use_tdm:
+            num_rows = T_tok * H
+            tiles_per_wg = _tdm_tiles_per_wg(num_rows)
+            launcher = _build_kernel_w32_tdm(
                 num_q_heads=H,
                 head_dim=D,
                 rope_head_dim=RD,
-                q_weight=q_weight if q_weighted else None,
-                q_out=q_out,
-                kv_out=kv_out,
-                stream=stream,
+                tiles_per_wg=tiles_per_wg,
+                q_weighted=q_weighted,
             )
+            if stream is None:
+                stream = torch.cuda.current_stream()
+            has_direct = getattr(launcher, "_direct_call_state", None) is not None
+
+            def _t_ptr(t):
+                return (
+                    int(t.data_ptr())
+                    if has_direct
+                    else flyc.from_c_void_p(fx.Uint8, t.data_ptr())
+                )
+
+            q_2d = q_view.reshape(num_rows, D)
+            kv_c = kv if kv.is_contiguous() else kv.contiguous()
+            per_wg = ROWS_PER_TILE * tiles_per_wg
+            args = (
+                _cached_from_dlpack(q_2d),
+                _t_ptr(kv_c),
+                _cached_from_dlpack(cos_2d),
+                _cached_from_dlpack(sin_2d),
+                _t_ptr(positions),
+                _t_ptr(q_out.view(num_rows, D)),
+                _t_ptr(kv_out),
+                _cached_from_dlpack(q_weight_arg.reshape(-1)),
+                _cached_from_dlpack(kv_weight.reshape(-1)),
+                num_rows,
+                T_tok,
+                (num_rows + per_wg - 1) // per_wg,
+                stream if has_direct else Stream(stream),
+            )
+            _run_compiled(launcher, *args)
             return q_out, kv_out, None, None
 
         rows_per_wg = ROWS_PER_WG_SMALL if T_tok <= SMALL_T_THRESHOLD else ROWS_PER_WG
@@ -1711,7 +1736,7 @@ def _tdm_tiles_per_wg(num_rows):
 
 
 @lru_cache(maxsize=16)
-def _build_tdm_fused(
+def _build_kernel_w32_tdm(
     *,
     num_q_heads,
     head_dim,
@@ -1998,79 +2023,3 @@ def _build_tdm_fused(
 
     launch.compile_hints = dict(_DEFAULT_COMPILE_HINTS)
     return launch
-
-
-def flydsl_qk_norm_rope_tdm_prefill(
-    q,
-    kv,
-    kv_weight,
-    cos_cache,
-    sin_cache,
-    positions,
-    *,
-    num_q_heads,
-    head_dim,
-    rope_head_dim,
-    q_weight=None,
-    q_out=None,
-    kv_out=None,
-    num_buffers=NUM_BUFFERS,
-    tiles_per_wg=None,
-    stream=None,
-):
-    """Fused RMSNorm + GPT-J RoPE prefill (BF16, gfx1250), one launch. Q rows
-    go through the TDM deep-prefetch path, KV tokens through the direct-load
-    path. Returns (q_out, kv_out)."""
-    H, D, RD = num_q_heads, head_dim, rope_head_dim
-    T_tok = q.shape[0]
-    q_view = q.view(T_tok, H, D) if q.dim() == 2 else q
-    q_2d = q_view.reshape(T_tok * H, D)
-    kv_c = kv if kv.is_contiguous() else kv.contiguous()
-    cos_2d = cos_cache.reshape(-1, RD // 2)
-    sin_2d = sin_cache.reshape(-1, RD // 2)
-    if q_out is None:
-        q_out = torch.empty((T_tok, H, D), dtype=torch.bfloat16, device=q.device)
-    if kv_out is None:
-        kv_out = torch.empty((T_tok, D), dtype=torch.bfloat16, device=kv.device)
-
-    q_weighted = q_weight is not None
-    if tiles_per_wg is None:
-        tiles_per_wg = _tdm_tiles_per_wg(T_tok * H)
-    launcher = _build_tdm_fused(
-        num_q_heads=H,
-        head_dim=D,
-        rope_head_dim=RD,
-        num_buffers=num_buffers,
-        tiles_per_wg=tiles_per_wg,
-        q_weighted=q_weighted,
-    )
-    if stream is None:
-        stream = torch.cuda.current_stream()
-
-    def _ds():
-        return getattr(launcher, "_direct_call_state", None) is not None
-
-    def _ptr(t):
-        return (
-            int(t.data_ptr()) if _ds() else flyc.from_c_void_p(fx.Uint8, t.data_ptr())
-        )
-
-    num_rows = T_tok * H
-    per_wg = ROWS_PER_TILE * tiles_per_wg
-    args = (
-        _cached_from_dlpack(q_2d),
-        _ptr(kv_c),
-        _cached_from_dlpack(cos_2d),
-        _cached_from_dlpack(sin_2d),
-        _ptr(positions),
-        _ptr(q_out.view(T_tok * H, D)),
-        _ptr(kv_out),
-        _cached_from_dlpack((q_weight if q_weighted else kv_weight).reshape(-1)),
-        _cached_from_dlpack(kv_weight.reshape(-1)),
-        num_rows,
-        T_tok,
-        (num_rows + per_wg - 1) // per_wg,
-        stream if _ds() else Stream(stream),
-    )
-    _run_compiled(launcher, *args)
-    return q_out, kv_out
