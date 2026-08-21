@@ -1367,21 +1367,18 @@ def _build_kernel_w32(
 
 
 @lru_cache(maxsize=32)
-def compile_flydsl_qk_norm_rope_quant(
+def _compile_w64(
     *,
-    num_q_heads: int,
-    head_dim: int,
-    rope_head_dim: int,
-    quant: bool,
-    group_size: int,
-    scale_dtype: str,
-    q_weighted: bool,
-    kv_write: bool = False,
-    paged: bool = False,
+    num_q_heads,
+    head_dim,
+    rope_head_dim,
+    quant,
+    group_size,
+    scale_dtype,
+    q_weighted,
+    kv_write=False,
+    paged=False,
 ):
-    """Compile (and cache) the launcher for a given config. Returns the
-    @flyc.jit launcher; call it directly to skip the per-call torch overhead in
-    ``flydsl_qk_norm_rope_quant`` (bounded lru; sibling ops do the same)."""
     launcher = _build_kernel_w64(
         num_q_heads=num_q_heads,
         head_dim=head_dim,
@@ -1398,20 +1395,19 @@ def compile_flydsl_qk_norm_rope_quant(
 
 
 @lru_cache(maxsize=32)
-def compile_flydsl_qk_norm_rope_quant_gfx1250(
+def _compile_gfx1250(
     *,
-    num_q_heads: int,
-    head_dim: int,
-    rope_head_dim: int,
-    quant: bool,
-    group_size: int,
-    scale_dtype: str,
-    q_weighted: bool,
-    kv_write: bool = False,
-    paged: bool = False,
-    rows_per_wg: int = ROWS_PER_WG,
+    num_q_heads,
+    head_dim,
+    rope_head_dim,
+    quant,
+    group_size,
+    scale_dtype,
+    q_weighted,
+    kv_write=False,
+    paged=False,
+    rows_per_wg=ROWS_PER_WG,
 ):
-    """Compile (and cache) the gfx1250 wave32 launcher for a given config."""
     launcher = _build_kernel_w32(
         num_q_heads=num_q_heads,
         head_dim=head_dim,
@@ -1501,35 +1497,9 @@ def flydsl_qk_norm_rope_quant(
         raise ValueError("cos/sin must be contiguous")
     if kv_write and quant:
         raise ValueError("kv_write (swa_kv) is BF16 only; not supported with quant")
-    # ---- gfx1250 dispatch (wave32) ----
     from aiter.jit.utils.chip_info import get_gfx as _get_gfx
 
-    if _get_gfx() == "gfx1250":
-        return flydsl_qk_norm_rope_quant_gfx1250(
-            q=q,
-            kv=kv,
-            kv_weight=kv_weight,
-            cos_cache=cos_cache,
-            sin_cache=sin_cache,
-            positions=positions,
-            num_q_heads=num_q_heads,
-            head_dim=head_dim,
-            rope_head_dim=rope_head_dim,
-            q_weight=q_weight,
-            quant=quant,
-            quant_group_size=quant_group_size,
-            scale_dtype=scale_dtype,
-            q_out=q_out,
-            kv_out=kv_out,
-            q_scale=q_scale,
-            kv_scale=kv_scale,
-            swa_kv=swa_kv,
-            swa_dest_rows=swa_dest_rows,
-            batch_id_per_token=batch_id_per_token,
-            swa_block_tables=swa_block_tables,
-            swa_block_size=swa_block_size,
-            stream=stream,
-        )
+    is_gfx1250 = _get_gfx() == "gfx1250"
 
     H = num_q_heads
     T_tok = q.shape[0]
@@ -1661,24 +1631,89 @@ def flydsl_qk_norm_rope_quant(
         ssm_arg = q.new_empty(1, dtype=torch.int32)
         bid_arg = q.new_empty(1, dtype=torch.int32)
 
-    launcher = compile_flydsl_qk_norm_rope_quant(
-        num_q_heads=H,
-        head_dim=D,
-        rope_head_dim=RD,
-        quant=quant,
-        group_size=G,
-        scale_dtype=scale_dtype,
-        q_weighted=q_weighted,
-        kv_write=kv_write,
-        paged=paged,
-    )
+    if is_gfx1250:
+        if (
+            USE_TDM_PREFILL
+            and not quant
+            and not kv_write
+            and not paged
+            and T_tok * H >= TDM_MIN_ROWS
+            and (D % 256 == 0)
+            and (H & (H - 1) == 0)
+        ):
+            q_out, kv_out = flydsl_qk_norm_rope_tdm_prefill(
+                q,
+                kv,
+                kv_weight,
+                cos_cache,
+                sin_cache,
+                positions,
+                num_q_heads=H,
+                head_dim=D,
+                rope_head_dim=RD,
+                q_weight=q_weight if q_weighted else None,
+                q_out=q_out,
+                kv_out=kv_out,
+                stream=stream,
+            )
+            return q_out, kv_out, None, None
+
+        rows_per_wg = ROWS_PER_WG_SMALL if T_tok <= SMALL_T_THRESHOLD else ROWS_PER_WG
+        launcher = _compile_gfx1250(
+            num_q_heads=H,
+            head_dim=D,
+            rope_head_dim=RD,
+            quant=quant,
+            group_size=G,
+            scale_dtype=scale_dtype,
+            q_weighted=q_weighted,
+            kv_write=kv_write,
+            paged=paged,
+            rows_per_wg=rows_per_wg,
+        )
+    else:
+        launcher = _compile_w64(
+            num_q_heads=H,
+            head_dim=D,
+            rope_head_dim=RD,
+            quant=quant,
+            group_size=G,
+            scale_dtype=scale_dtype,
+            q_weighted=q_weighted,
+            kv_write=kv_write,
+            paged=paged,
+        )
 
     if stream is None:
         stream = torch.cuda.current_stream()
-    fx_stream = Stream(stream)
 
-    def _ptr_arg(t):
-        return flyc.from_c_void_p(fx.Uint8, t.data_ptr())
+    if is_gfx1250:
+        q_weight_static = _cached_from_dlpack(q_weight_arg)
+        kv_weight_static = _cached_from_dlpack(kv_weight)
+        cos_static = _cached_from_dlpack(cos_2d)
+        sin_static = _cached_from_dlpack(sin_2d)
+        has_direct = getattr(launcher, "_direct_call_state", None) is not None
+
+        def _ptr_arg(t):
+            return (
+                int(t.data_ptr())
+                if has_direct
+                else flyc.from_c_void_p(fx.Uint8, t.data_ptr())
+            )
+
+        def _stream_arg():
+            return stream if has_direct else Stream(stream)
+
+        wt_args = (q_weight_static, kv_weight_static, cos_static, sin_static)
+    else:
+
+        def _ptr_arg(t):
+            return flyc.from_c_void_p(fx.Uint8, t.data_ptr())
+
+        def _stream_arg():
+            return Stream(stream)
+
+        wt_args = (q_weight_arg, kv_weight, cos_2d, sin_2d)
 
     # HW grid Y is a 16-bit field on AMD HIP -> cap 65535 blocks/launch and
     # chunk tokens in Python. (flydsl's ``if cond: return`` does NOT early-exit
@@ -1691,276 +1726,13 @@ def flydsl_qk_norm_rope_quant(
         args = (
             _ptr_arg(q_view[start:end]),
             _ptr_arg(kv[start:end]),
-            q_weight_arg,
-            kv_weight,
-            cos_2d,
-            sin_2d,
+            *wt_args,
             _ptr_arg(positions[start:end]),
             _ptr_arg(q_out[start:end]),
             _ptr_arg(kv_out[start:end]),
             _ptr_arg(q_scale_arg[start:end] if quant else q_scale_arg),
             _ptr_arg(kv_scale_arg[start:end] if quant else kv_scale_arg),
             kv.stride(0),
-            # swa_kv is global (absolute rows), so unsliced. `swa_index` is
-            # sliced iff it is indexed by token: block tables are per request
-            # and stay whole, destination rows are per token and must follow
-            # the chunk exactly as positions and batch_id_per_token do.
-            _ptr_arg(swa_kv_arg),
-            _ptr_arg(ssm_arg[start:end] if (kv_write and not paged) else ssm_arg),
-            _ptr_arg(bid_arg[start:end] if kv_write else bid_arg),
-            swa_slot_stride,
-            swa_pos_stride,
-            swa_num_rows,
-            swa_cache_size,
-            n,
-            fx_stream,
-        )
-        _run_compiled(launcher, *args)
-
-    return q_out, kv_out, (q_scale if quant else None), (kv_scale if quant else None)
-
-
-def flydsl_qk_norm_rope_quant_gfx1250(
-    q: torch.Tensor,
-    kv: torch.Tensor,
-    kv_weight: torch.Tensor,
-    cos_cache: torch.Tensor,
-    sin_cache: torch.Tensor,
-    positions: torch.Tensor,
-    *,
-    num_q_heads: int,
-    head_dim: int,
-    rope_head_dim: int,
-    q_weight: torch.Tensor | None = None,
-    quant: bool = False,
-    quant_group_size: int | None = None,
-    scale_dtype: str = SCALE_DTYPE_FP32,
-    q_out: torch.Tensor | None = None,
-    kv_out: torch.Tensor | None = None,
-    q_scale: torch.Tensor | None = None,
-    kv_scale: torch.Tensor | None = None,
-    swa_kv: torch.Tensor | None = None,
-    swa_dest_rows: torch.Tensor | None = None,
-    batch_id_per_token: torch.Tensor | None = None,
-    swa_block_tables: torch.Tensor | None = None,
-    swa_block_size: int | None = None,
-    stream: torch.cuda.Stream | None = None,
-) -> tuple[
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor | None,
-    torch.Tensor | None,
-]:
-    """gfx1250 wave32 entry point; called by flydsl_qk_norm_rope_quant only."""
-
-    H, D, RD = num_q_heads, head_dim, rope_head_dim
-    T_tok = q.shape[0]
-    G = quant_group_size if quant_group_size is not None else D
-    NG = D // G
-    q_weighted = q_weight is not None
-    q_weight_arg = q_weight if q_weighted else kv_weight
-
-    if q.dim() == 2:
-        if q.shape[1] != H * D:
-            raise ValueError(f"q shape {tuple(q.shape)} != [T, H*D={H * D}]")
-        if not q.is_contiguous():
-            raise ValueError("2D q must be contiguous to .view as [T,H,D]")
-        q_view = q.view(T_tok, H, D)
-    else:
-        if q.dim() != 3 or q.shape != (T_tok, H, D):
-            raise ValueError(
-                f"q shape {tuple(q.shape)} != (T, H, D)=({T_tok}, {H}, {D})"
-            )
-        q_view = q
-        if q_view.stride(-1) != 1 or q_view.stride(-2) != D:
-            raise ValueError(
-                "3D q must be contiguous in the (H, D) inner block "
-                f"(stride(-1)==1 and stride(-2)==D={D}), got stride={q_view.stride()}"
-            )
-
-    cos_2d = cos_cache.view(cos_cache.shape[0], RD // 2)
-    sin_2d = sin_cache.view(sin_cache.shape[0], RD // 2)
-
-    out_dtype = _fp8_const()["dtype"] if quant else torch.bfloat16
-    if q_out is None:
-        q_out = torch.empty((T_tok, H, D), dtype=out_dtype, device=q.device)
-    if kv_out is None:
-        kv_out = torch.empty((T_tok, D), dtype=out_dtype, device=kv.device)
-
-    scale_torch_dtype = _TORCH_DTYPE_FOR_SCALE[scale_dtype]
-    if quant:
-        if q_scale is None:
-            q_scale = torch.empty(
-                (T_tok, H, NG), dtype=scale_torch_dtype, device=q.device
-            )
-        if kv_scale is None:
-            kv_scale = torch.empty(
-                (T_tok, NG), dtype=scale_torch_dtype, device=kv.device
-            )
-        q_scale_arg, kv_scale_arg = q_scale, kv_scale
-    else:
-        q_scale_arg = q.new_empty(1, dtype=scale_torch_dtype)
-        kv_scale_arg = q.new_empty(1, dtype=scale_torch_dtype)
-
-    paged = swa_block_tables is not None
-    kv_write = swa_kv is not None
-    if kv_write:
-        if batch_id_per_token is None:
-            raise ValueError("kv_write requires batch_id_per_token")
-        if swa_kv.dtype != torch.bfloat16:
-            raise TypeError(f"swa_kv must be bf16, got {swa_kv.dtype}")
-        if not swa_kv.is_contiguous():
-            raise ValueError("swa_kv must be contiguous")
-        if batch_id_per_token.dim() != 1 or batch_id_per_token.dtype != torch.int32:
-            raise TypeError("batch_id_per_token must be 1-D int32")
-        if batch_id_per_token.shape[0] < T_tok:
-            raise ValueError(
-                f"batch_id_per_token len {batch_id_per_token.shape[0]} < T={T_tok}"
-            )
-    if kv_write and paged:
-        if swa_block_size is None:
-            raise ValueError("paged SWA write requires swa_block_size")
-        if swa_kv.dim() != 2 or swa_kv.shape[1] != D:
-            raise ValueError(
-                f"paged swa_kv must be flat [num_pages, D={D}], got {tuple(swa_kv.shape)}"
-            )
-        if swa_block_tables.dim() != 2 or swa_block_tables.dtype != torch.int32:
-            raise TypeError("swa_block_tables must be 2-D [bs, max_blocks] int32")
-        # The kernel indexes the table as `bid * stride(0) + blk` and bounds
-        # `blk` against stride(0). For that bound to be the table WIDTH (what
-        # the C++ sibling checks, via size(1)) and not merely the distance
-        # between rows, the table must be dense: a `full[:, :n]` view would
-        # leave stride(0) > n, letting a far-future position read a stale
-        # padding column instead of being skipped.
-        if swa_block_tables.stride(1) != 1:
-            raise ValueError("swa_block_tables must be contiguous in the last dim")
-        if swa_block_tables.stride(0) != swa_block_tables.shape[1]:
-            raise ValueError(
-                "swa_block_tables must be densely packed "
-                f"(stride(0)={swa_block_tables.stride(0)} != "
-                f"max_blocks={swa_block_tables.shape[1]}); a padded view would "
-                "widen the in-kernel block-index bound past the real table"
-            )
-        swa_slot_stride = swa_block_tables.stride(0)
-        swa_num_rows = swa_kv.shape[0]
-        swa_pos_stride = swa_kv.stride(0)
-        swa_cache_size = swa_block_size
-        swa_kv_arg = swa_kv
-        ssm_arg = swa_block_tables
-        bid_arg = batch_id_per_token
-    elif kv_write:
-        if swa_dest_rows is None:
-            raise ValueError("direct kv_write requires swa_dest_rows")
-        if swa_kv.dim() != 2 or swa_kv.shape[1] != D:
-            raise ValueError(
-                f"direct swa_kv must be flat [num_rows, D={D}], "
-                f"got {tuple(swa_kv.shape)}"
-            )
-        if swa_dest_rows.dim() != 1 or swa_dest_rows.dtype != torch.int32:
-            raise TypeError("swa_dest_rows must be 1-D int32")
-        if swa_dest_rows.shape[0] < T_tok:
-            raise ValueError(
-                f"swa_dest_rows len {swa_dest_rows.shape[0]} < T={T_tok}; it is "
-                "indexed by token, not by request"
-            )
-        swa_slot_stride = 0
-        swa_pos_stride = swa_kv.stride(0)
-        swa_num_rows = swa_kv.shape[0]
-        swa_cache_size = 1
-        swa_kv_arg = swa_kv
-        ssm_arg = swa_dest_rows
-        bid_arg = batch_id_per_token
-    else:
-        swa_slot_stride = 0
-        swa_pos_stride = 0
-        swa_num_rows = 0
-        swa_cache_size = 1
-        swa_kv_arg = kv_out  # bf16 dummy
-        ssm_arg = q.new_empty(1, dtype=torch.int32)
-        bid_arg = q.new_empty(1, dtype=torch.int32)
-
-    if (
-        USE_TDM_PREFILL
-        and not quant
-        and not kv_write
-        and not paged
-        and T_tok * H >= TDM_MIN_ROWS
-        and (D % 256 == 0)
-        and (H & (H - 1) == 0)
-    ):
-        q_out, kv_out = flydsl_qk_norm_rope_tdm_prefill(
-            q,
-            kv,
-            kv_weight,
-            cos_cache,
-            sin_cache,
-            positions,
-            num_q_heads=H,
-            head_dim=D,
-            rope_head_dim=RD,
-            q_weight=q_weight if q_weighted else None,
-            q_out=q_out,
-            kv_out=kv_out,
-            stream=stream,
-        )
-        return q_out, kv_out, None, None
-
-    rows_per_wg = ROWS_PER_WG_SMALL if T_tok <= SMALL_T_THRESHOLD else ROWS_PER_WG
-
-    launcher = compile_flydsl_qk_norm_rope_quant_gfx1250(
-        num_q_heads=H,
-        head_dim=D,
-        rope_head_dim=RD,
-        quant=quant,
-        group_size=G,
-        scale_dtype=scale_dtype,
-        q_weighted=q_weighted,
-        kv_write=kv_write,
-        paged=paged,
-        rows_per_wg=rows_per_wg,
-    )
-
-    if stream is None:
-        stream = torch.cuda.current_stream()
-
-    def _has_direct_state():
-        return getattr(launcher, "_direct_call_state", None) is not None
-
-    def _ptr_arg(t):
-        if _has_direct_state():
-            return int(t.data_ptr())
-        return flyc.from_c_void_p(fx.Uint8, t.data_ptr())
-
-    def _stream_arg():
-        if _has_direct_state():
-            return stream
-        return Stream(stream)
-
-    q_weight_static = _cached_from_dlpack(q_weight_arg)
-    kv_weight_static = _cached_from_dlpack(kv_weight)
-    cos_static = _cached_from_dlpack(cos_2d)
-    sin_static = _cached_from_dlpack(sin_2d)
-
-    MAX_GRID_Y = 65535
-    for start in range(0, T_tok, MAX_GRID_Y):
-        n = min(MAX_GRID_Y, T_tok - start)
-        end = start + n
-        args = (
-            _ptr_arg(q_view[start:end]),
-            _ptr_arg(kv[start:end]),
-            q_weight_static,
-            kv_weight_static,
-            cos_static,
-            sin_static,
-            _ptr_arg(positions[start:end]),
-            _ptr_arg(q_out[start:end]),
-            _ptr_arg(kv_out[start:end]),
-            _ptr_arg(q_scale_arg[start:end] if quant else q_scale_arg),
-            _ptr_arg(kv_scale_arg[start:end] if quant else kv_scale_arg),
-            kv.stride(0),
-            # `swa_index` is sliced iff it is indexed by token: block tables
-            # are per request and stay whole, destination rows are per token
-            # and must follow the chunk exactly as positions do.
             _ptr_arg(swa_kv_arg),
             _ptr_arg(ssm_arg[start:end] if (kv_write and not paged) else ssm_arg),
             _ptr_arg(bid_arg[start:end] if kv_write else bid_arg),
