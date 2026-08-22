@@ -14,7 +14,10 @@ import torch
 
 from aiter import ActivationType, QuantType, dtypes, logger
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.flydsl.kernels.mega_moe_gfx1250.types import Stage2ScatterContext
+from aiter.ops.flydsl.kernels.mega_moe_gfx1250.types import (
+    Stage1PrequantContext,
+    Stage2ScatterContext,
+)
 from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
 
 # Opt-in switch for the gfx1250 FlyDSL grouped-GEMM path.
@@ -28,6 +31,18 @@ _GROUPED_WEIGHT_CACHE = {}
 # Opt-in kernel-bench hook: a caller sets a list here to collect
 # (name, callable) per-kernel launches; None in production.
 kernel_bench_callable = None
+
+
+@functools.lru_cache(maxsize=1)
+def _stage1_producer_blocks() -> int:
+    """Workgroups gemm1 spends gathering its own A rows (0 = separate pass).
+
+    A tunable, not a derived quantity: the gather is bandwidth-bound and the
+    tiles it displaces are compute-bound, so the best split depends on the
+    shape. Too few and consumers stall on the spin-wait; too many and the GEMM
+    loses more compute than the gather was worth.
+    """
+    return max(0, int(os.environ.get("AITER_FLYDSL_STAGE1_PRODUCER_BLOCKS", "0")))
 
 
 def _grouped_weight_uint8(w: torch.Tensor) -> torch.Tensor:
@@ -391,8 +406,7 @@ def get_wmma_m_rep(
     m_warp, n_warp = int(m_warp), int(n_warp)
     if m_warp < 1 or n_warp < 1:
         raise ValueError(
-            f"[grouped-moe {label}] m_warp/n_warp must be >= 1, got "
-            f"{m_warp}x{n_warp}"
+            f"[grouped-moe {label}] m_warp/n_warp must be >= 1, got {m_warp}x{n_warp}"
         )
     if tile_m % (m_warp * wmma_m) or tile_n % (n_warp * wmma_n):
         raise ValueError(
@@ -444,6 +458,7 @@ def _grouped_a8w4_tdm_moe(
     expert_mask=None,
     num_local_tokens=None,
     stage2_scatter: Stage2ScatterContext | None = None,
+    stage1_prequant: Stage1PrequantContext | None = None,
     situ_beta=1.0,
     situ_linear_beta=1.0,
 ):
@@ -603,17 +618,62 @@ def _grouped_a8w4_tdm_moe(
     _quant_mode = "fp4" if _is_fp4 else "fp8"
     _a_is_fp4 = 1 if _is_fp4 else 0
 
-    a1_payload, a1_scale = flydsl_moe_fused_quant_preshuffle(
-        hidden_states.reshape(1, token_num, model_dim),
-        1,
-        contiguous_m,
-        wmma_rep=wmma_rep,
-        quant_mode=_quant_mode,
-        masked_m=None,
-        topids_to_rows=topids_to_rows,
-        source_topk=topk,
-        num_valid_routes=_ep_nvr,
-    )
+    # Prequantized: the rows arrived over the EP wire already MX-quantized, so
+    # this pass only routes them and preshuffles the scales.
+    _wire_stride = 0 if stage1_prequant is None else int(stage1_prequant.stride_bytes)
+    _a_rows = hidden_states.reshape(1, token_num, -1)
+    # Fold that gather into gemm1 instead of running it as its own pass: the
+    # first _producer_blocks workgroups of gemm1 route the rows while the rest
+    # compute, and each tile waits only on its own rows. Bandwidth-bound work
+    # under a compute-bound kernel, so what it costs is the tiles it displaces,
+    # which measures well under its own standalone time. Prequantized only --
+    # with quant still in the pass there would be ALU to displace too.
+    _producer_blocks = _stage1_producer_blocks() if _wire_stride else 0
+    _producer_kw = {}
+    if _producer_blocks:
+        if _ep_nvr is None:
+            raise ValueError("stage1 producer needs the EP valid-route count")
+        _pb = model_dim // 2 if _is_fp4 else model_dim
+        a1_payload = torch.empty(
+            (1, contiguous_m, _pb), dtype=torch.uint8, device=device
+        )
+        a1_scale = torch.empty(
+            (1, contiguous_m // wmma_rep, (model_dim // 32) * wmma_rep),
+            dtype=torch.uint8,
+            device=device,
+        )
+        # One counter per M-tile, incremented per row landed. Zeroed here rather
+        # than reused: a stale count from the previous layer would let a
+        # consumer read rows that have not arrived yet.
+        _tile_rows_done = torch.zeros(
+            ((contiguous_m + tile_m - 1) // tile_m,), dtype=torch.int32, device=device
+        )
+        _producer_kw = {
+            "producer_blocks": _producer_blocks,
+            "producer_numel": int(topids_to_rows.numel()),
+            "producer_topk": int(topk),
+            "producer_wire_stride": _wire_stride,
+            "producer_feat_dim": model_dim,
+            "producer_wire": _a_rows,
+            "producer_scale": a1_scale,
+            "producer_rows": topids_to_rows,
+            "producer_num_valid_routes": _ep_nvr,
+            "producer_tile_rows_done": _tile_rows_done,
+        }
+    else:
+        a1_payload, a1_scale = flydsl_moe_fused_quant_preshuffle(
+            _a_rows,
+            1,
+            contiguous_m,
+            wmma_rep=wmma_rep,
+            quant_mode=_quant_mode,
+            masked_m=None,
+            topids_to_rows=topids_to_rows,
+            source_topk=topk,
+            num_valid_routes=_ep_nvr,
+            prequant_wire_stride=_wire_stride,
+            feat_dim=model_dim if _wire_stride else None,
+        )
 
     # Fuse gemm1 activation + MX quantization + scale preshuffle into the
     # kernel epilogue, eliminating the standalone
@@ -666,6 +726,7 @@ def _grouped_a8w4_tdm_moe(
             cluster_n=cluster_n,
             waves_per_tensor_tdm=waves_per_tensor_tdm,
             next_stage_prefetch=next_stage_prefetch,
+            **_producer_kw,
             **_situ_kw,
         )
     else:
@@ -696,6 +757,7 @@ def _grouped_a8w4_tdm_moe(
             cluster_n=cluster_n,
             waves_per_tensor_tdm=waves_per_tensor_tdm,
             next_stage_prefetch=next_stage_prefetch,
+            **_producer_kw,
             **_situ_kw,
         )
         a2_payload, a2_scale = flydsl_moe_fused_quant_preshuffle(
@@ -900,6 +962,7 @@ def grouped_gemm_gfx1250_a8w4(
     situ_beta: float = 1.0,
     situ_linear_beta: float = 1.0,
     stage2_scatter: Stage2ScatterContext | None = None,
+    stage1_prequant: Stage1PrequantContext | None = None,
 ):
     """Grouped a8w4/a4w4 MoE on the TDM batched GEMM (gfx1250).
 
@@ -1167,6 +1230,7 @@ def grouped_gemm_gfx1250_a8w4(
             expert_mask=expert_mask,
             num_local_tokens=num_local_tokens,
             stage2_scatter=stage2_scatter,
+            stage1_prequant=stage1_prequant,
             situ_beta=situ_beta,
             situ_linear_beta=situ_linear_beta,
             **_tdm_kw,
@@ -1602,9 +1666,9 @@ def flydsl_moe_scatter_preshuffle_scale(
     device = a1_scale_token_u8.device
     scale_w = a1_scale_token_u8.shape[1]
     rows_per_tile = wmma_rep * 16
-    assert (
-        max_m % rows_per_tile == 0
-    ), f"max_m ({max_m}) must be a multiple of wmma_rep*16 ({rows_per_tile})"
+    assert max_m % rows_per_tile == 0, (
+        f"max_m ({max_m}) must be a multiple of wmma_rep*16 ({rows_per_tile})"
+    )
     tiles_per_expert = max_m // rows_per_tile
 
     if grouped_a1_scale is None:
@@ -1640,9 +1704,9 @@ def flydsl_moe_preshuffle_scale(
     device = scale_grouped_u8.device
     scale_w = scale_grouped_u8.shape[-1]
     rows_per_tile = wmma_rep * 16
-    assert (
-        max_m % rows_per_tile == 0
-    ), f"max_m ({max_m}) must be a multiple of wmma_rep*16 ({rows_per_tile})"
+    assert max_m % rows_per_tile == 0, (
+        f"max_m ({max_m}) must be a multiple of wmma_rep*16 ({rows_per_tile})"
+    )
     tiles_per_expert = max_m // rows_per_tile
 
     if out is None:

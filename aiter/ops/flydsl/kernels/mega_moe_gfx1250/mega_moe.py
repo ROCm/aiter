@@ -12,13 +12,17 @@ import torch
 from aiter import ActivationType, QuantType, dtypes
 from aiter.fused_moe import fused_moe
 from aiter.jit.utils.chip_info import get_gfx
+from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
+    build_moe_quant_wire_module,
+)
+from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
 from aiter.ops.flydsl.moe_common import GateMode
 
 from .combine import _make_combine_fused_reduce, _make_combine_fused_sync
 from .config import _WAVE_SIZE, _select_dispatch_config
 from .dispatch import _make_dispatch
 from .dispatch_tdm import _make_dispatch_tdm, tdm_max_warps, tdm_stage_capacity
-from .types import Stage2ScatterContext, _from_gpu_ptr
+from .types import Stage1PrequantContext, Stage2ScatterContext, _from_gpu_ptr
 
 __all__ = ["MegaMoEGfx1250"]
 
@@ -123,6 +127,10 @@ class MegaMoEStage2Config:
     dispatch_warp_num_per_block: int | None = None
     schedule: tuple | None = None
     dispatch_backend: str = "flydsl"
+    # Quantize on the sending rank and ship gemm1's A operand, instead of
+    # shipping bf16 activations for every receiver to quantize again. Halves the
+    # wire row; TDM-only, so the other backends keep a byte-identical arena.
+    prequant: bool = False
 
     def __post_init__(self):
         if self.dispatch_backend not in _DISPATCH_BACKENDS:
@@ -130,6 +138,22 @@ class MegaMoEStage2Config:
                 f"dispatch_backend must be one of {_DISPATCH_BACKENDS}, "
                 f"got {self.dispatch_backend!r}"
             )
+        if self.prequant and self.dispatch_backend != "tdm":
+            raise ValueError(
+                "prequant dispatch is only wired for dispatch_backend='tdm', "
+                f"got {self.dispatch_backend!r}"
+            )
+        if self.prequant:
+            if self.hidden_dim % 32:
+                raise ValueError(
+                    f"one e8m0 scale covers 32 elements, so prequant needs "
+                    f"hidden_dim to be a multiple of 32, got {self.hidden_dim}"
+                )
+            if (self.hidden_dim + self.hidden_dim // 32) % 4:
+                raise ValueError(
+                    f"the prequant wire row must be a whole number of dwords, "
+                    f"got {self.hidden_dim + self.hidden_dim // 32}B"
+                )
         if not 0 <= self.rank < self.world_size:
             raise ValueError(f"rank={self.rank} must be in [0, {self.world_size})")
         if self.world_size > _MAX_WORLD_SIZE:
@@ -171,6 +195,28 @@ class MegaMoEStage2Config:
     @property
     def token_nbytes(self) -> int:
         return self.hidden_dim * 2
+
+    @property
+    def wire_scale_nbytes(self) -> int:
+        """e8m0 bytes per token, one per 32-element MX block. 0 on the bf16 wire."""
+        return self.hidden_dim // 32 if self.prequant else 0
+
+    @property
+    def wire_nbytes(self) -> int:
+        """Bytes dispatch moves per token.
+
+        Under ``prequant`` a row is the MX payload (one byte per element) plus
+        its row-major e8m0 scales (one byte per 32), so roughly half a bf16 row.
+        The scales ride in the same row to keep one TDM descriptor per token;
+        the receiver splits them apart when it gathers. Combine is unaffected
+        and stays on ``token_nbytes`` -- it ships bf16 expert output.
+
+        The dispatch itself stays byte-agnostic: only the descriptor width and
+        the recv row stride change.
+        """
+        if not self.prequant:
+            return self.token_nbytes
+        return self.hidden_dim + self.wire_scale_nbytes
 
     @property
     def combine_slot_stride_bytes(self) -> int:
@@ -216,6 +262,7 @@ class MegaMoEGfx1250:
         situ_beta: torch.Tensor | None = None,
         situ_linear_beta: torch.Tensor | None = None,
         dispatch_backend: str | None = None,
+        prequant: bool | None = None,
     ):
         """Everything here is fixed for the whole model; forward() takes the rest.
 
@@ -318,6 +365,11 @@ class MegaMoEGfx1250:
                     dispatch_backend
                     if dispatch_backend is not None
                     else os.environ.get("MEGA_DISPATCH", "flydsl")
+                ),
+                prequant=(
+                    bool(prequant)
+                    if prequant is not None
+                    else os.environ.get("MEGA_PREQUANT") == "1"
                 ),
             ),
             communicator,
@@ -449,6 +501,7 @@ class MegaMoEGfx1250:
             num_local_tokens=total_recv,
             swiglu_limit=self.swiglu_limit,
             stage2_scatter=self._scatter_context(routing),
+            stage1_prequant=self._prequant_context(),
             **extra,
         )
         return self._combine(routing)
@@ -475,7 +528,7 @@ class MegaMoEGfx1250:
                 ("recv_to_src_token", max_recv * 4),
                 ("out_idx", max_recv * config.topk * 4),
                 ("out_wts", max_recv * config.topk * 4),
-                ("disp_out", max_recv * config.token_nbytes),
+                ("disp_out", max_recv * config.wire_nbytes),
                 ("cross_device_barrier", config.world_size * 8),
                 (
                     "comb_inp",
@@ -504,6 +557,20 @@ class MegaMoEGfx1250:
             dtype=torch.int16,
             device=device,
         )
+        # Send-side staging for the pre-quantized wire. Dispatch reads whole
+        # rows straight out of it, so it is sized for this rank's own tokens
+        # rather than max_recv.
+        self._wire = None
+        self._wire_quant = None
+        if config.prequant:
+            self._wire = torch.empty(
+                config.max_tokens_per_rank * config.wire_nbytes,
+                dtype=torch.uint8,
+                device=device,
+            )
+            self._wire_quant = build_moe_quant_wire_module(
+                config.hidden_dim, config.wire_nbytes, "fp8"
+            )
 
         if config.dispatch_backend == "mori":
             # mori's geometry is a compile-time Cfg field, so it brings its own
@@ -584,7 +651,10 @@ class MegaMoEGfx1250:
         peer-major destTokId SoA there so META can ship each block's reserved run
         as a couple of contiguous TDM copies.
         """
-        elem_size = config.token_nbytes // config.hidden_dim
+        # A prequantized wire row is not a whole number of bf16 elements, so the
+        # descriptor drops to byte elements. The transport never interprets the
+        # bytes either way.
+        elem_size = 1 if config.prequant else config.token_nbytes // config.hidden_dim
         stg_cap, slots = tdm_stage_capacity(
             npes=config.world_size, max_recv=config.max_recv
         )
@@ -598,7 +668,7 @@ class MegaMoEGfx1250:
         # the grid barrier, and keep the caller's spec as the variant key so the
         # runtime pick still resolves.
         max_warps = tdm_max_warps(
-            hidden_dim=config.hidden_dim,
+            hidden_dim=config.wire_nbytes // elem_size,
             hidden_elem_size=elem_size,
             npes=config.world_size,
         )
@@ -647,7 +717,10 @@ class MegaMoEGfx1250:
                     npes=config.world_size,
                     experts_per_rank=config.experts_per_rank,
                     experts_per_token=config.topk,
-                    hidden_dim=config.hidden_dim,
+                    # Wire rows are opaque bytes to dispatch; under prequant a
+                    # 1-byte element type makes the descriptor cover the payload
+                    # and the appended scales in one run.
+                    hidden_dim=config.wire_nbytes // elem_size,
                     hidden_elem_size=elem_size,
                     max_tok_per_rank=config.max_tokens_per_rank,
                     max_recv=config.max_recv,
@@ -759,9 +832,24 @@ class MegaMoEGfx1250:
         return self._dispatch_specs[-1]
 
     def _recv_tokens(self) -> torch.Tensor:
+        """bf16 activations, or packed [fp8 payload | e8m0 scales] rows.
+
+        The prequant wire has no meaningful element type -- the payload and the
+        scales share a row -- so it comes back as raw bytes. uint8 is what marks
+        it as pre-quantized downstream: the grouped GEMM keys off the dtype to
+        gather the rows instead of quantizing them, and the bf16 wire is never
+        uint8.
+        """
+        config = self._config
+        if config.prequant:
+            return _from_gpu_ptr(
+                self._arena.local_ptr("disp_out"),
+                (config.max_recv, config.wire_nbytes),
+                torch.uint8,
+            )
         return _from_gpu_ptr(
             self._arena.local_ptr("disp_out"),
-            (self._config.max_recv, self._config.hidden_dim),
+            (config.max_recv, config.hidden_dim),
             torch.bfloat16,
         )
 
@@ -788,9 +876,22 @@ class MegaMoEGfx1250:
         token_count = hidden_states.shape[0]
         spec = self._select_dispatch(token_count)
         stream = fx.Stream(torch.cuda.current_stream())
+        # Under prequant the rank quantizes its own tokens into wire rows first,
+        # and dispatch ships those instead of the bf16 activations.
+        send_ptr = hidden_states.data_ptr()
+        if self._wire_quant is not None:
+            warps = self._wire_quant.warps_per_block
+            self._wire_quant(
+                ptr_arg(hidden_states),
+                ptr_arg(self._wire),
+                token_count,
+                (token_count + warps - 1) // warps,
+                stream=stream,
+            )
+            send_ptr = self._wire.data_ptr()
         self._dispatch_variants[spec](
             self._arena.handle,
-            hidden_states.data_ptr(),
+            send_ptr,
             topk_ids.data_ptr(),
             topk_weights.data_ptr(),
             self._token_destination_map.data_ptr(),
@@ -816,6 +917,15 @@ class MegaMoEGfx1250:
             self._recv_indices(),
             self._total_recv,
             routing,
+        )
+
+    def _prequant_context(self) -> Stage1PrequantContext | None:
+        """Tells stage1 that its A operand is wire rows, and how they are laid out."""
+        if not self._config.prequant:
+            return None
+        return Stage1PrequantContext(
+            stride_bytes=self._config.wire_nbytes,
+            payload_bytes=self._config.hidden_dim,
         )
 
     def _scatter_context(self, routing: Routing) -> Stage2ScatterContext:

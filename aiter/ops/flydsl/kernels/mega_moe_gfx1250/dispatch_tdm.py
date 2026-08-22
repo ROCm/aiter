@@ -145,6 +145,7 @@ def _make_dispatch_tdm(
     hidden_elem_size=2,
     enable_signal=True,
     meta_tdm=True,
+    enable_payload=True,
 ):
     """Build the TDM dispatch kernel. Returns a ``@flyc.jit`` launcher.
 
@@ -153,6 +154,14 @@ def _make_dispatch_tdm(
     between ``addr_total_recv`` and ``my_lsa_rank``. ``meta_tdm=False`` routes
     the metadata through per-lane stores instead of the TDM engine -- same
     result, and the A/B that says whether the bulk path is worth its LDS.
+
+    ``enable_payload=False`` ships the metadata only and leaves ``tok_map``
+    behind for someone else to move the rows with. That someone is the fused
+    stage1: a token's destination *row* is not known until every peer's routes
+    have been counted and sorted by expert, which is downstream of this kernel,
+    so a dispatch that also moved the payload would have to move it to a recv
+    slot and have it copied again. Splitting the two lets the row move once,
+    straight into the layout the GEMM reads, and overlap with the GEMM.
     """
     if WAVE != 32:
         raise ValueError(
@@ -623,46 +632,54 @@ def _make_dispatch_tdm(
         # `sub` is a runtime loop and not `range_constexpr` on purpose: the route
         # loop below already unrolls `topk` descriptor sites, and unrolling this
         # one too would multiply them by `tpi`.
-        g_payload = TDM.tdm_group1(hidden_dim, 1, hidden_elem_size)
-        probe_off = arith.select(lane < topk, lane, 0)
-        for tok_base in range(global_warp_id * etpi, inp_cur_tok, warps_total * etpi):
-            for sub in range(etpi):
-                tok = tok_base + sub
-                if tok < inp_cur_tok:
-                    flat = buffer_load(
-                        rsrc_tok_map, tok * topk + probe_off, vec_width=1, dtype=T.i32
-                    )
-                    # `flat >= 0` rejects the host's -1 fill as well as the
-                    # sentinel, so a slot FINALIZE never published can never name
-                    # a route.
-                    live = (lane < topk) & (flat >= 0) & (flat < sentinel_val)
-                    if ballot(T.i32, live) != 0:
-                        TDM.tdm_load(
-                            TDM.tdm_group0(
-                                my_tile,
-                                fx.Int64(addr_inp_tok)
-                                + fx.Int64(tok) * fx.Int64(nbytes),
-                            ),
-                            g_payload,
+        if const_expr(enable_payload):
+            g_payload = TDM.tdm_group1(hidden_dim, 1, hidden_elem_size)
+            probe_off = arith.select(lane < topk, lane, 0)
+            for tok_base in range(
+                global_warp_id * etpi, inp_cur_tok, warps_total * etpi
+            ):
+                for sub in range(etpi):
+                    tok = tok_base + sub
+                    if tok < inp_cur_tok:
+                        flat = buffer_load(
+                            rsrc_tok_map,
+                            tok * topk + probe_off,
+                            vec_width=1,
+                            dtype=T.i32,
                         )
-                        TDM.tdm_wait(0)
-                        live_i = arith.select(live, fx.Int32(1), fx.Int32(0))
-                        for l in range_constexpr(topk):
-                            live_l = readlane(T.i32, live_i, l)
-                            flat_l = readlane(T.i32, flat, l)
-                            if live_l != 0:
-                                dest_pe = flat_l // max_recv
-                                dest_tok = flat_l - dest_pe * max_recv
-                                TDM.tdm_store(
-                                    TDM.tdm_group0(
-                                        my_tile,
-                                        fx.Int64(window.lsa_ptr(dest_pe, off_out_tok))
-                                        + fx.Int64(dest_tok) * fx.Int64(nbytes),
-                                    ),
-                                    g_payload,
-                                )
-                        # The next token reloads into this same tile.
-                        TDM.tdm_wait(0)
+                        # `flat >= 0` rejects the host's -1 fill as well as the
+                        # sentinel, so a slot FINALIZE never published can never
+                        # name a route.
+                        live = (lane < topk) & (flat >= 0) & (flat < sentinel_val)
+                        if ballot(T.i32, live) != 0:
+                            TDM.tdm_load(
+                                TDM.tdm_group0(
+                                    my_tile,
+                                    fx.Int64(addr_inp_tok)
+                                    + fx.Int64(tok) * fx.Int64(nbytes),
+                                ),
+                                g_payload,
+                            )
+                            TDM.tdm_wait(0)
+                            live_i = arith.select(live, fx.Int32(1), fx.Int32(0))
+                            for l in range_constexpr(topk):
+                                live_l = readlane(T.i32, live_i, l)
+                                flat_l = readlane(T.i32, flat, l)
+                                if live_l != 0:
+                                    dest_pe = flat_l // max_recv
+                                    dest_tok = flat_l - dest_pe * max_recv
+                                    TDM.tdm_store(
+                                        TDM.tdm_group0(
+                                            my_tile,
+                                            fx.Int64(
+                                                window.lsa_ptr(dest_pe, off_out_tok)
+                                            )
+                                            + fx.Int64(dest_tok) * fx.Int64(nbytes),
+                                        ),
+                                        g_payload,
+                                    )
+                            # The next token reloads into this same tile.
+                            TDM.tdm_wait(0)
 
         if const_expr(enable_signal):
             # Identical to _make_dispatch's completion, so the two kernels are

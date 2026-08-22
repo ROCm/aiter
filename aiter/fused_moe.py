@@ -31,7 +31,10 @@ from aiter.jit.utils.chip_info import (
     gfx_from_cu_num,
 )
 from aiter.jit.utils.torch_guard import torch_compile_guard
-from aiter.ops.flydsl.kernels.mega_moe_gfx1250.types import Stage2ScatterContext
+from aiter.ops.flydsl.kernels.mega_moe_gfx1250.types import (
+    Stage1PrequantContext,
+    Stage2ScatterContext,
+)
 
 try:
     from aiter.ops.flydsl.moe_common import GateMode
@@ -491,6 +494,7 @@ def fused_moe(
     shared_w2_scale: torch.Tensor | None = None,
     shared_expert_id: int = -1,
     stage2_scatter: Stage2ScatterContext | None = None,
+    stage1_prequant: Stage1PrequantContext | None = None,
 ):
     if (
         any(
@@ -573,6 +577,12 @@ def fused_moe(
         ),
         ep_world_size=stage2_scatter.world_size if enable_ep_scatter else 0,
         ep_source_token_map=scatter_source_map,
+        ep_wire_stride_bytes=(
+            stage1_prequant.stride_bytes if stage1_prequant is not None else 0
+        ),
+        ep_wire_payload_bytes=(
+            stage1_prequant.payload_bytes if stage1_prequant is not None else 0
+        ),
     )
 
 
@@ -654,6 +664,8 @@ def fused_moe_(
     ep_max_tokens_per_rank: int = 0,
     ep_world_size: int = 0,
     ep_source_token_map: torch.Tensor | None = None,
+    ep_wire_stride_bytes: int = 0,
+    ep_wire_payload_bytes: int = 0,
 ) -> torch.Tensor:
     stage2_scatter = None
     if ep_source_token_map is not None:
@@ -664,6 +676,12 @@ def fused_moe_(
             max_tokens_per_rank=ep_max_tokens_per_rank,
             world_size=ep_world_size,
             source_token_map=ep_source_token_map,
+        )
+    stage1_prequant = None
+    if ep_wire_stride_bytes:
+        stage1_prequant = Stage1PrequantContext(
+            stride_bytes=ep_wire_stride_bytes,
+            payload_bytes=ep_wire_payload_bytes,
         )
     return _fused_moe_impl(
         hidden_states=hidden_states,
@@ -692,6 +710,7 @@ def fused_moe_(
         linear_beta=linear_beta,
         gate_mode=gate_mode,
         stage2_scatter=stage2_scatter,
+        stage1_prequant=stage1_prequant,
     )
 
 
@@ -722,6 +741,7 @@ def _fused_moe_impl(
     linear_beta: float | None = None,
     gate_mode: str = GateMode.SEPARATED.value,
     stage2_scatter: Stage2ScatterContext | None = None,
+    stage1_prequant: Stage1PrequantContext | None = None,
     *,
     _q_dtype_a: torch.dtype | None = None,
     _metadata_transform: Callable | None = None,
@@ -846,6 +866,7 @@ def _fused_moe_impl(
                 situ_beta=1.0 if beta is None else float(beta),
                 situ_linear_beta=1.0 if linear_beta is None else float(linear_beta),
                 stage2_scatter=stage2_scatter,
+                stage1_prequant=stage1_prequant,
             )
 
     if grouped_a8w4_out is not None:
@@ -923,7 +944,9 @@ def _fused_moe_impl(
     assert not metadata.flat or get_gfx() in (
         "gfx942",
         "gfx950",
-    ), f"FLAT fmoe asm kernels are gfx942/gfx950-only; refusing to launch on {get_gfx()}. "
+    ), (
+        f"FLAT fmoe asm kernels are gfx942/gfx950-only; refusing to launch on {get_gfx()}. "
+    )
 
     sort_m_indices = None
     sort_reverse_sorted = None
@@ -1146,9 +1169,9 @@ def fused_moe_1stage(
                     num_rows=num_local_tokens,
                 )
             else:
-                assert (
-                    a1_scale is not None or quant_type == QuantType.No
-                ), "a1_scale must be provided for quantized input for fused_moe"
+                assert a1_scale is not None or quant_type == QuantType.No, (
+                    "a1_scale must be provided for quantized input for fused_moe"
+                )
                 a1 = hidden_states
                 if quant_type == QuantType.per_1x128:
                     scale_t = torch.empty_like(a1_scale)
@@ -3135,9 +3158,9 @@ def fused_moe_2stages(
             num_rows=num_local_tokens,
         )
     else:
-        assert (
-            a1_scale is not None or quant_type == QuantType.No
-        ), "a1_scale must be provided for quantized input for fused_moe"
+        assert a1_scale is not None or quant_type == QuantType.No, (
+            "a1_scale must be provided for quantized input for fused_moe"
+        )
         a1 = hidden_states
     # a16w4 (bf16 A x mxfp4 W) SiTUv2: stage1 allocates its own sorted
     # [sorted_size, inter_dim] bf16 intermediate and ignores this `out` buffer, so
