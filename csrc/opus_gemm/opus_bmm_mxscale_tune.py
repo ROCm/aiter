@@ -434,37 +434,19 @@ assert len(set(_CANDIDATE_KIDS)) == len(_CANDIDATE_KIDS), (
 def _shuf_arm(inst):
     """ "reg" or "lds" -- which form of the shuffled scale read this kid is.
 
-    This is a real per-kid axis only as of sf_shuf_in_lds. Before it, every
-    shuffled kid was named `_sfshuf` and optCompilerConfig.json compiled all of
-    them with -DOPUS_SFSHUF_LDS=1, so the panel was a file-scope macro decided
-    once for the whole family -- and it only *requested* the panel, since
-    SF_SHUF_FITS silently degraded it back to registers wherever the panel did
-    not fit, which was everywhere except kid215. Both published verdicts on this
-    layout are therefore single-arm: the 2025 "buys nothing" sweep was reg with
-    no panel anywhere, and the later "-0.32%" sweep was reg wearing an lds name.
+    A real per-kid axis only as of sf_shuf_in_lds; before it the panel was a
+    file-scope macro that SF_SHUF_FITS could silently degrade back to registers,
+    so every published verdict on this layout predating the flag measured `reg`
+    whatever it was named.
 
-    MEASURED, once the axis existed -- 133 shipped rows, four pools back to back,
-    --mp 8 --shape_grouped, judged on the >= 22 us band (58 shapes, 93.7% of the
-    time, null 0.988/1.000/1.014):
+    Measured with the axis in place, the LDS panel is the whole effect and `reg`
+    is a wash against plain scales -- which reproduces those old verdicts rather
+    than contradicting them. The mechanism is K amortisation: the panel fill is
+    paid once and read from LDS, so it deepens with K, while the reg arm's cost
+    is per K tile and flat.
 
-        preb      10920.3 us      --              --
-        shuf_reg  10925.2 us      med 0.999       20/58 wins
-        shuf_lds  10698.7 us      med 0.976       45/58 wins
-
-    So the panel is the whole effect and reg is a wash -- which is not a
-    contradiction of the two old verdicts but a reproduction of them, since both
-    measured reg. Given both arms the tuner takes lds on 53 of 58 big shapes.
-    Full table: shuf 11534.3 vs preb 11651.6 = -1.01%, with p95 0.999 against a
-    null p95 of 1.014, i.e. no large shape regresses.
-
-    The mechanism is the K amortisation the 2025 note already named: lds goes
-    0.978 -> 0.974 median from K=1024 to K=4096 while reg is flat at 0.991 ->
-    1.000. The fixed panel fill is paid once and read from LDS; the reg arm's
-    cost is per K tile.
-
-    What the totals still under-count is coverage, not layout: 42 small shapes
-    whose plain winner is kid179/243/226/173/236 have no shuffled twin at all
-    (blocked by 2a-ii's B_M <= 32 and 2b's B_K = 512) and cost +77.9 us.
+    Keep both arms in the pool: `shuf` lets the tuner pick, which is the number
+    that decides shipping, and the split says which mechanism earned it.
     """
     return "lds" if inst.sf_shuf_in_lds else "reg"
 

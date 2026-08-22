@@ -665,7 +665,8 @@ void gemm_a8w8_mxscale_bpreshuffle_wave8_kernel(opus_gemm_scale_splitk_kargs_gfx
     // only in which M *byte* they read, so it leaves the address and reappears as
     // sf_wave_shift; under the remap it owns whole 2*SF_SUB row blocks and so
     // multiplies the block pitch instead. Spelled as whole expressions rather than
-    // one with a substituted term -- the expression-tree trap, md ?9.
+    // one arm with a substituted sub-term: substituting re-associates the address
+    // and changes instruction selection, so an edit meant to be inert is not.
     const int shuf_a_word0 =
         SF_WPAIR ? (row / (2 * SF_SUB) + wave_id_m) * shuf_k1 * SF_SUB
                        + lane_id % T::W_M

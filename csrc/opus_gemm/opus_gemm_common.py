@@ -427,34 +427,21 @@ class OpusGemmInstance:
     def needs_shuffle_scale(self) -> int | None:
         """shuffle_scale_a's ``sub``, or None for a plain A scale.
 
-        The value is READ FROM THE HEADER (``_opus_sf_shuf_sub()``) rather than
-        written here, because it used to be duplicated in three places -- this
-        return, ``OPUS_SF_SHUF_SUB_VALUE`` in the traits, and ``SHUF_SUB`` in
-        opus_bmm_mxscale_tune.py. A disagreement between them is *silent*: the
-        host feeds one layout, the kernel reads another, and the kid returns
-        plausible wrong numbers rather than failing. The comments on each copy
-        said "must agree with", which is a request, not a mechanism.
+        sub is the row distance between the two M subtiles a dword pairs. It is a
+        property of the *layout*, not of this kid's wave grid: the quantize kernel
+        emits the A scale once per launch, so a deployment holds exactly one sub
+        and every kid must read that one. The value is READ FROM THE HEADER
+        (``_opus_sf_shuf_sub()``) rather than restated here -- if the host's sub
+        and the kernel's disagree the kid does not fail, it returns plausible
+        wrong numbers.
 
-        Same silent-wrong-answer hazard as needs_mpacked_sfa: shuffle_scale_a
-        and shuffle_scale_b permute the same bytes, so a kid handed the plain
-        panels runs and returns wrong numbers. The A panel goes in with stride(1)
-        as the per-batch slab and stride(0) zeroed -- the kernel derives every
-        other term, including the K block pair count, from the problem shape.
+        Same silent-wrong-answer hazard as needs_mpacked_sfa: a kid handed the
+        plain panels runs and returns wrong numbers. The A panel goes in with
+        stride(1) as the per-batch slab and stride(0) zeroed; the kernel derives
+        every other term, including the K block pair count, from the problem shape.
 
-        sub is the row distance between the two M subtiles a dword pairs, and it
-        is a property of the *layout*, not of this kid's wave grid: the quantize
-        kernel emits the A scale once per launch, so a deployment holds exactly
-        one sub and every kid must read that one.
-
-        It used to return T_M*W_M, which was the same number only because every
-        kid carrying the flag had T_M=2. That conflation is what kept T_M=1 tiles
-        off the shuffled path -- they could only mean sub=16, a second layout --
-        and it is what SF_SUB in the traits decouples. 32 is forced rather than
-        chosen: it matches the native pairing of every shipped tile at both T_M,
-        while sub=16 doubles the A-scale dwords of the whole T_M=2 pool.
-
-        The two pipelines assert their own tile against it, so a kid whose grid
-        cannot read this sub fails to compile rather than returning wrong numbers.
+        The two pipelines assert their own tile against this sub, so a kid whose
+        grid cannot read it fails to compile.
         """
         if not self.shuffle_scale:
             return None
@@ -1172,29 +1159,23 @@ def _a8w8_mxscale_bmm_bpreshuffle_blds(bm, bn, bk, wg_per_cu, prefetch_scale=Fal
     return inst
 
 
-# One twin per plain flatmm tile, keyed plain kid -> twin kid.
+# One preshuffled-B twin per plain flatmm tile, keyed plain kid -> twin kid.
 #
-# Only the ids are written down here; the geometry and both flag axes are read off
-# the plain kid below, so a pair cannot drift into differing by anything but B's
-# layout. Ids have to be explicit rather than derived from position because a tuned
-# CSV row names a kid, and a twin whose number moved when someone inserted a plain
-# tile would silently point a shipped table at a different kernel.
+# Only the ids are written here; geometry and both flag axes are read off the plain
+# kid, so a pair cannot differ by anything but B's layout. Ids are explicit rather
+# than positional because tuned CSV rows name kids: a twin whose number shifted when
+# a plain tile was inserted would silently repoint a shipped table.
 #
-# The set is complete over the family by assertion, not by judgement. The first cut
-# held only the five tiles that beat the preshuffled families on the dsv4 envelope,
-# which left the same gap one shape-set change away from reopening: a plain tile
-# with no twin means a preshuffled deployment has nothing to answer that cell with,
-# and nothing would have flagged it.
+# The map must stay complete over the family -- see the assertion below.
 _BMM_MXSCALE_BPRESHUFFLE_BLDS_TWIN_OF = {
-    # the five measured against their plain twin first (see the note below)
     321: 226,
     653: 227,
     324: 228,
     325: 229,
     326: 230,
-    # the rest of the family, so the pool is closed. 224 and 225 are skipped: they
-    # named the two withdrawn bdirect experiments below, and an id that has meant
-    # two different kernels makes any table row carrying it ambiguous.
+    # 224 and 225 are skipped: they named two withdrawn bdirect experiments, and an
+    # id that has meant two different kernels makes any table row carrying it
+    # ambiguous.
     32: 251,
     64: 252,
     128: 231,
@@ -1233,13 +1214,6 @@ a8w8_mxscale_bmm_bpreshuffle_blds_kernels_list = {
 # kid646 is the DIRECT_ONLY persistent schedule, which carries its own B staging
 # and rejects the flags this family sets. kid0 is the heuristic default and an
 # alias of kid32's geometry, so kid224 already covers its tile.
-#
-# A shuffle_scale flatmm kid would be exempt for a third reason: it wants a host-side
-# scale relayout, so it is not dispatchable under the layout the tables ship and cannot
-# win a shipped cell either way. None exist right now (the kid328-333 block above is
-# retired), but restoring that dict means adding its ids here too, since promoting one
-# into a table would need a preshuffled-B twin, i.e. a blds kid carrying shuffle_scale,
-# which does not exist.
 _BLDS_NO_TWIN = {0, 646}
 _blds_untwinned = sorted(
     kid
@@ -1255,27 +1229,22 @@ assert not _blds_untwinned, (
 
 # --- the small-tile shuffled twins ------------------------------------------
 #
-# B_M < 2*SUB is SUBTILE_TILE: the tile sits at one of a subtile pair's two
-# halves and which one is runtime, so it pays a wave-uniform `>> 8*mp` fold on
-# each scale word. These four tiles were the whole of that
-# coverage hole -- 42 small shapes, +77.9 us.
+# B_M < 2*SUB is SUBTILE_TILE: the tile sits at one of a subtile pair's two halves
+# and which one is runtime, so it pays a wave-uniform `>> 8*mp` fold on each scale
+# word. These tiles are what makes the shuffled pool cover the small shapes.
 #
 # Flags track the plain twin exactly rather than being re-picked: a pair that
 # differs in more than the layout under test attributes nothing.
-#
-# kid387 did not pay: 0 of 133 shapes, and its plain twin kid238 now wins 0 rows
-# of preb either. Kept only so kid238's tile stays expressible under the
-# wholesale switch; retire it with kid238.
 _BMM_MXSCALE_BPRESHUFFLE_BLDS_SHUFFLE_SCALE_TILES = {
     #   (B_M, B_N, B_K, WG_PER_CU, prefetch_scale)   plain winner it answers
-    385: (16, 32, 256, 4, False),   # kid243; wins 2 shapes
-    386: (32, 32, 256, 2, True),    # kid226; wins 6 shapes
-    387: (16, 64, 256, 2, False),   # kid238; wins 0 -- see above
-    # kid392 is the blds half of the B_K=512 pair -- see kid391. It answers
-    # kid236, which wins 7 of the 15 shapes in that hole. kid239 is the same tile
-    # without prefetch and deliberately gets *no* twin: it wins 0 of the 133 rows
-    # in preb, so a twin for it would be measuring a kid the tuner never picks.
-    392: (16, 32, 512, 2, True),    # kid236's twin -- 2b
+    385: (16, 32, 256, 4, False),   # kid243
+    386: (32, 32, 256, 2, True),    # kid226
+    # kid387 wins nothing, and neither does its plain twin kid238. Kept only so
+    # kid238's tile stays expressible under the wholesale switch; retire together.
+    387: (16, 64, 256, 2, False),   # kid238
+    # kid239 is the same tile without prefetch and deliberately gets no twin: it
+    # wins nothing, so a twin would measure a kid the tuner never picks.
+    392: (16, 32, 512, 2, True),    # kid236
 }
 a8w8_mxscale_bmm_bpreshuffle_blds_kernels_list.update({
     kid: _a8w8_mxscale_bmm_bpreshuffle_blds(bm, bn, bk, wg, prefetch_scale=pf,
@@ -1284,22 +1253,12 @@ a8w8_mxscale_bmm_bpreshuffle_blds_kernels_list.update({
     in _BMM_MXSCALE_BPRESHUFFLE_BLDS_SHUFFLE_SCALE_TILES.items()
 })
 
-# The blds half of the shuffled LDS scale panel -- see the bdirect block above.
-#
-# kid397 covers B_M=32, which was built as the discriminator: it has the panel
-# without SUBTILE_TILE's runtime fold, and it is the one member that gains.
-#
-# kid394 (16x32x512, kid236's tile) and kid396 (16x32x256 wg4) were built here
-# and are retired: over 3 preb + 3 shuf passes they won 0 shapes, and decode
-# leave-one-out was exactly 1.0000 in every pass -- the pool dispatched to them
-# nowhere. Retired rather than left as candidates because they cannot become
-# useful: at B_M=16 the fill stages 2x what the tile reads, and while K=8192
-# does take kid396 past its own reg sibling (1.006 -> 0.977), it is still
-# 10-40% behind the pool winner there, since at that K the right tile is
-# B_K=512. To bring them back, restore the entries here -- the panel path
-# itself stays exercised by kid393/kid397.
+# The blds half of the shuffled LDS scale panel -- see the bdirect block below.
+# kid397 is the only B_M>=32 panel kid, i.e. the only one whose fill is fully
+# utilised, and the only one that gains. The B_M=16 panel kids that used to sit
+# here won nothing and were removed.
 _BMM_MXSCALE_BPRESHUFFLE_BLDS_SHUFFLE_PANEL_TILES = {
-    397: (32, 32, 256, 2, True),    # kid386 + panel; the B_M>=32 geometry test
+    397: (32, 32, 256, 2, True),    # kid386 + panel
 }
 a8w8_mxscale_bmm_bpreshuffle_blds_kernels_list.update({
     kid: _a8w8_mxscale_bmm_bpreshuffle_blds(bm, bn, bk, wg, prefetch_scale=pf,
@@ -1308,148 +1267,26 @@ a8w8_mxscale_bmm_bpreshuffle_blds_kernels_list.update({
     in _BMM_MXSCALE_BPRESHUFFLE_BLDS_SHUFFLE_PANEL_TILES.items()
 })
 
-# kid216: the 64x32x256 tile again with both scale panels in the shuffle_scale layout, i.e.
-# one twin standing against both kid171 (no panel) and kid172 (panel), since the
-# layout replaces the panel rather than filling it.
+# The shuffled-scale bdirect twins. A shuffled kid reads its A scale as packed
+# dwords instead of per-subtile bytes, so it replaces the plain LDS scale panel
+# rather than filling it -- one twin therefore answers both the panelled and the
+# un-panelled member of a plain pair (kid216 stands against kid171 and kid172).
 #
-# This is the tile where the layout should cost nothing to adopt, and it is the
-# reason to try this family at all. B_K=256 means COM_REP_K=2, so the dword's two
-# 128-blocks of K land in the same K tile and op_sel's high bit is just the K
-# repeat -- no unrolled loop parity, unlike the B_K=128 wave8 kids. COM_REP_M=2
-# on top of that makes one dword the tile's entire A scale: the plain path issues
-# COM_REP_M=2 buffer_load_b32, one per M subtile, whose 16 lanes sit on 16
-# different 64B lines at stride_sfa apart; the shuffle_scale path issues one, coalesced.
-# Half the loads and a sixteenth of the lines, for identical bytes.
-#
-# The B_M=16 tiles (kid179/kid173) cannot take the layout at all: a dword pairs
-# two M subtiles and those tiles are one subtile tall, so there is no pair to
-# make. If the producer ever emits the shuffle_scale layout globally, they need a different
-# answer -- either a 32-row tile or a scalar unpack.
-#
-# What it does is collapse the kid171/kid172 K split into one kid. Those two are
-# the same tile with and without the panels, and they divide the K axis because
-# the panels earn their setup back at K=4096 and lose it at K=1024. kid216 is at
-# the better of the pair in every cell of the band, because it gets the panel's
-# access shape without the panel's setup (us, medians of four runs, each the min
-# of both kid orders; every run agreed on the sign):
-#
-#     shape             | kid171  kid172  kid216 | vs best of the two
-#     g8  m256   k4096  |   29.8    27.2    26.9 |  -1.1%
-#     g8  m512   k4096  |   53.8    48.7    49.0 |  +0.6%
-#     g8  m512   k1024  |   21.1    23.0    21.1 |   0.0%
-#     g8  m1024  k4096  |  101.9    82.1    87.8 |  +6.9%
-#
-# At m<=256 with K=4096 and everything at g2, all three sit on the ~18.2-18.7us
-# fixed-cost floor and the differences there are not readable.
-#
-# The two ends of that table are the whole mechanism. Against kid171 -- the
-# sibling with no panel, whose scale reads are the uncoalesced ones -- shuffle_scale is
-# 8.5-14% ahead at K=4096, which is the coalescing alone and the same effect the
-# kid208/kid210 pair measured. Against kid172 it is level until m1024, where the
-# panel pulls 7% back: by then there is enough M x K to amortise a one-shot
-# cooperative fill, and a fill amortised over that much work beats re-reading the
-# words per K tile however well those reads coalesce. That is the same crossover
-# the wave8 twins show, just reached from the other side.
-#
-# That m1024 cell is not one to read as a loss, though, because neither kid in
-# the pair belongs there: a 64-row tile needs 16 rounds at m1024 and both run
-# about 2x off the best kid. Whom the cell actually goes to, and what the whole
-# envelope does across the band above kid172's, at g8/n1024/k4096 (us, min of
-# both kid orders):
-#
-#     kid                      | m512   m1024  m2048
-#     172  bdirect 64x32x256   |  49.2   82.3  151.8
-#     216  shuffle_scale     64x32x256   |  49.5   88.8  166.6
-#     184  bdirect 128x128x128 |  30.7   57.8  107.7
-#     175 / 215  128x64x256    |  32.5 / 35.0   60.7 / 66.6   111.3 / 113.3
-#     205 / 210  128x256x128   |  39.1 / 38.5   41.4 / 40.9    59.2 / 59.2
-#     194        256x256x128   |  53.4   55.5   58.2
-#
-#     best plain               |  30.7   41.4   58.2
-#     best shuffle_scale                 |  35.0   40.9   59.2
-#                              | +14.0%  -1.2%  +1.7%
-#
-# So the m1024 cell is fine -- it goes to kid210, which is itself a shuffle_scale kid and
-# takes it by a hair -- and what the band leaves open is m512, which kid184 owns.
-# kid217 is that twin and does not close it; see its entry for why, and why the
-# answer there is a shuffle_scale-fed panel fill rather than another twin. The gap is also
-# narrower than one cell of one shape suggests: at m512/K4096 it is g8 only
-# (30.7 kid184 against 34.9 kid215, +13.7%), because g2 goes to kid172 and g16 to
-# kid205, and both of those have twins that match them.
-#
-# The kid is kept on the same terms as kid213/214/215: measurement, not a tuner
-# candidate, until a producer emits the layout.
+# Flags track the plain twin; the per-kid comment names it.
 _BMM_MXSCALE_BPRESHUFFLE_BDIRECT_SHUFFLE_SCALE_TILES = {
     #   (B_M, B_N, B_K, WG_PER_CU, prefetch_scale)     twin of
     216: (64, 32, 256, 2, False),    # kid171 / kid172
-    # kid217: kid184's tile, built to close the one cell where the shuffle_scale envelope
-    # gave anything up -- g8/m512/K4096, which kid184 owns -- and it does not
-    # close it. COM_REP_K=1 here, so a tile owns one of the dword's two K blocks
-    # and the read takes the u16 half whose block it is (see the pipeline note);
-    # the twin is a fair one and still loses (us, min of both kid orders):
-    #
-    #     shape             | kid184  kid217
-    #     g8  m512   k4096  |   30.7    35.2   +14.7%
-    #     g8  m1024  k4096  |   58.1    65.7   +13.1%
-    #     g8  m2048  k4096  |  109.0   121.9   +11.8%
-    #     g2  m512   k4096  |   28.9    32.2   +11.4%
-    #     g16 m512   k4096  |   58.1    65.8   +13.3%
-    #     g8  m512   k1024  |   19.1    18.8    -1.6%
-    #
-    # The K axis is the whole story and it is the kid171/kid172 curve again. At
-    # B_K=128 and K=4096 a tile is one of 32, so kid184's panel is filled once and
-    # read from LDS 32 times; kid217 issues 32 rounds of global reads instead, and
-    # coalescing them does not make up for giving the panel away. At K=1024 there
-    # are 8 tiles, the fill no longer amortises, and the twin edges ahead.
-    #
-    # So this cell is not a missing-twin problem: the shuffle_scale layout's gain is
-    # removing the panel, and on this tile the panel is worth paying for. The way
-    # to make the layout free here is not another twin but a panel fill that reads
-    # the shuffle_scale bytes -- which would decouple what the producer emits from whether a
-    # kid stages its scales, and is what to build if the producer switch is real.
     217: (128, 128, 128, 1, False),  # kid184
-    # kid216/217 with the scale load hoisted ahead of the LDS wait. Both entries
-    # above were measured with PREFETCH_SCALE off, which is not the fair setting for
-    # this layout: the shuffled read is a per-K-tile global load sitting in the
-    # critical path, where the panel it replaces is a ds_read already hoisted, and on
-    # the flatmm family turning it on was worth 1.139x to the layout. It is only
-    # testable here -- the wave8n4/wavetm1 pipeline static_asserts !PREFETCH_SCALE,
-    # so kid210/213/214/215 cannot have it -- and bdirect + shuffle_scale + prefetch
-    # is the one combination of the three that had never been instantiated.
-    #
-    # It is not what was wrong here. The axis alone is worth 1-2% on both tiles
-    # (kid334/kid216 1.008x/1.012x/1.018x and kid335/kid217 1.017x/1.016x/1.012x at
-    # K=1024/4096/8192, 6 shapes), nowhere near flatmm's 1.139x. What the pair does
-    # show, once the layout is measured at its best, is that the verdict is per tile
-    # rather than global -- against the LDS panel each replaces:
-    #
-    #     K=            1024    4096    8192
-    #     kid334/kid172  1.108x  1.041x  1.038x   64x32x256,  wg2, cRepM=2, cRepK=2
-    #     kid335/kid184  0.984x  0.805x  0.793x   128x128x128, wg1, cRepM=4, cRepK=1
-    #
-    # so the layout beats the panel outright on one tile and loses a fifth on the other.
-    # Those two kids differ in four terms at once (B_M, B_N, B_K, WG_PER_CU), so the pair
-    # attributes nothing on its own; kids 336-345 below walk the path one term at a time
-    # and find B_K carrying the largest attributable share (0.907x at K=8192), B_M little
-    # (0.979x), WG_PER_CU exactly nothing (1.000x), and a 0.86x residual that B_N cannot
-    # be separated from. kid215 is not the counterexample it looks like: 128x64x256 in
-    # another family differs in B_M, B_N, family and the prefetch it cannot have, so it
-    # was never a B_K-only comparison.
+    # ... and the same two tiles with the scale load hoisted ahead of the LDS wait.
+    # PREFETCH_SCALE is only testable here: the wave8n4/wavetm1 pipeline
+    # static_asserts !PREFETCH_SCALE.
     334: (64, 32, 256, 2, True),     # kid216 + prefetch
     335: (128, 128, 128, 1, True),   # kid217 + prefetch
-    # kid384 is kid173's 16-row tile -- see the small-tile note below for why
-    # B_M < 64 was previously unreachable. It wins 35 of the 133 rows (280.0 us),
-    # far more than the 6 it was scoped for: at these sizes the 16x32x256 bdirect
-    # tile is the small-shape workhorse and the layout was the only thing keeping
-    # it out of the shuf pool. Flags track kid173 (no prefetch, no panel).
-    384: (16, 32, 256, 2, False),    # kid173's twin
-    # kid391 is the B_K=512 tile, i.e. COM_REP_K=4, which spends two A-scale
-    # dwords along K (SF_GEOM::KD). It and kid392 were the
-    # whole of the residual coverage hole: 15 shapes the shuf pool lost to preb,
-    # every one of them won in preb by kid179 or kid236. Flags track kid179;
-    # prefetch_scale is off because kid179 does not have it and SF_PREFETCH is
-    # gated on COM_REP_K==1 in any case, so it would be inert.
-    391: (16, 32, 512, 2, False),    # kid179's twin -- 2b
+    384: (16, 32, 256, 2, False),    # kid173
+    # B_K=512, i.e. COM_REP_K=4, which spends two A-scale dwords along K
+    # (SF_GEOM::KD). prefetch_scale is off because kid179 does not have it and
+    # SF_PREFETCH is gated on COM_REP_K==1 anyway, so it would be inert.
+    391: (16, 32, 512, 2, False),    # kid179
 }
 a8w8_mxscale_bmm_bpreshuffle_bdirect_kernels_list.update({
     kid: _a8w8_mxscale_bmm_bpreshuffle_bdirect(bm, bn, bk, wg, prefetch_scale=pf,
@@ -1460,25 +1297,18 @@ a8w8_mxscale_bmm_bpreshuffle_bdirect_kernels_list.update({
 
 # --- the shuffled LDS scale panel on the small tiles -------------------------
 #
-# Every kid above reads its scales per K tile from global; the panel lived only
-# in the wave8 header, which hosts no decode tile. The panel takes *every* scale
-# global load out of the K loop on all five tiles below (24 -> 0 at B_K=512,
-# 12 -> 0 at B_K=256), leaves MFMA untouched, and still shrinks the loop body by
-# 22-66 instructions. It costs +2176 B of LDS, no spills, and every kid holds its
-# requested WG/CU.
+# Every kid above reads its scales per K tile from global. The panel stages them
+# once instead, taking every scale global load out of the K loop for +2176 B of
+# LDS, no spills, and no change to MFMA or to the requested WG/CU.
 #
-# It is still not a decode fix: at B_M=16 the tile names 2 of every dword's 4
-# bytes, so the fill stages twice what the tile reads and the B_M=16 members run
-# ~1.5% *behind* their own reg siblings. Only kid397 (B_M=32, 100% utilisation)
-# is a clear win, -11% at K >= 4096.
-#
-# kid393 stays because it does win: 4 shapes in all 3 shuf passes, all K=4096,
-# ~0.3% of decode. It is also the only B_M=16 kid left with the panel, so it is
-# what keeps SF_SHUF_IN_LDS x SUBTILE_TILE compiled and covered by the twin
-# bit-exactness gate. kid395 (16x32x256) is retired alongside kid394/396 -- see
-# the blds panel block for the measurement.
+# It is not a decode fix. At B_M=16 the tile names 2 of every dword's 4 bytes, so
+# the fill stages twice what the tile reads -- structural at SF_SUB=16 -- and those
+# members run behind their own reg siblings. kid393 is kept because it still wins a
+# few K=4096 shapes, and because it is the only B_M=16 panel kid left, so it is what
+# keeps SF_SHUF_IN_LDS x SUBTILE_TILE compiled and inside the twin bit-exactness
+# gate.
 _BMM_MXSCALE_BPRESHUFFLE_BDIRECT_SHUFFLE_PANEL_TILES = {
-    393: (16, 32, 512, 2, False),    # kid391 + panel; kid179's tile
+    393: (16, 32, 512, 2, False),    # kid391 + panel
 }
 a8w8_mxscale_bmm_bpreshuffle_bdirect_kernels_list.update({
     kid: _a8w8_mxscale_bmm_bpreshuffle_bdirect(bm, bn, bk, wg, prefetch_scale=pf,
@@ -1487,46 +1317,22 @@ a8w8_mxscale_bmm_bpreshuffle_bdirect_kernels_list.update({
     in _BMM_MXSCALE_BPRESHUFFLE_BDIRECT_SHUFFLE_PANEL_TILES.items()
 })
 
-# --- what the 25% spread between kid334/kid172 and kid335/kid184 is caused by -------
+# --- attributing the spread between the kid334/kid172 and kid335/kid184 pairs -------
 #
-# Those are the only two geometries this family has a shuffle_scale/panel pair at, and
-# they differ in four terms at once: B_M 64->128, B_N 32->128, B_K 256->128 and
-# WG_PER_CU 2->1. The instruction-count reading blamed B_K, and kid215 refutes it by
-# being B_K=256 with COM_REP_K=2 and losing anyway. So walk the path one term at a time,
-# holding the family fixed: each row below is kid334's geometry with exactly one term
-# moved toward kid335's, and each needs BOTH sides of the pair -- plain + preload_sf for
-# the panel, shuffle_scale + prefetch_scale for the layout at its best -- because a ratio
-# is only readable against a twin that moved the same term.
-#
-# Measured (shuf/plain per pair, then each term against its own reference, K=1024/4096/8192):
-#
-#     baseline  334/172   64x32x256  wg2   1.105x 1.045x 1.037x
-#     B_K->128  337/336   64x32x128  wg2   1.035x 0.982x 0.941x   term: 0.937 0.940 0.907
-#     B_M->128  339/338  128x32x128  wg2   1.051x 0.936x 0.921x   term: 1.016 0.953 0.979
-#     wg->1     343/342   64x32x256  wg1   1.102x 1.049x 1.037x   term: 0.997 1.005 1.000
-#     endpoint  335/184  128x128x128 wg1   0.997x 0.807x 0.792x
-#
-#     product of the three   0.949 0.900 0.888
-#     endpoint / baseline    0.902 0.773 0.763
-#     residual (B_N + int.)  0.951 0.859 0.860
-#
-# So B_K carries the largest attributable term and the instruction-count reading holds
-# for it: COM_REP_K=1 takes a u16 half of a dword per K tile while tiles are twice as
-# dense, 4 loads per 256 of K against 1 for the same bytes, worth 6-9%. WG_PER_CU is
-# exactly neutral, which is worth keeping as a negative. The residual is the largest
-# piece at K>=4096 and stays unattributed because B_N cannot be stepped alone.
-#     kid334/kid172   64x32x256  wg2   COM_REP (M,N,K) = (2,2,2), 8 MFMA
-#     kid335/kid184  128x128x128 wg1   COM_REP (M,N,K) = (4,8,1), 32 MFMA
-#
-# so the path between them is exactly four steps, one per row here.
+# Those are the only two geometries this family has a shuffled/panel pair at, and they
+# differ in four terms at once: B_M 64->128, B_N 32->128, B_K 256->128, WG_PER_CU 2->1.
+# Each entry below is kid334's geometry with exactly one term moved toward kid335's,
+# built as BOTH sides of the pair -- plain + preload_sf for the panel, shuffled +
+# prefetch_scale for the layout at its best -- because a ratio is only readable against
+# a twin that moved the same term. B_K carries the largest attributable share,
+# WG_PER_CU is exactly neutral; the residual belongs to B_N, which cannot be stepped
+# alone (see below).
 #
 # 128x32x256 at WG_PER_CU=2 would have been the cleaner B_M step and is not legal:
 # prefetch_k_iter divides the per-WG LDS budget by the A staging, which scales with B_M
-# (B contributes nothing under B_DIRECT_REG, so B_N is free -- 64x128x256 has the same
-# per-iteration LDS as 64x32x256), and 128 rows at B_K=256 halves the budget below the
-# `prefetch_k_iter >= 3` floor. So B_M is stepped at B_K=128 instead, against the B_K
-# row rather than against the baseline. Instantiating the traits alone against a
-# candidate geometry checks it in a second, worth doing before a 21-minute build.
+# (B contributes nothing under B_DIRECT_REG, so B_N is free), and 128 rows at B_K=256
+# falls below the `prefetch_k_iter >= 3` floor. So B_M is stepped at B_K=128 instead,
+# against the B_K row rather than the baseline.
 _BMM_MXSCALE_BPRESHUFFLE_BDIRECT_ISOLATE = {
     #    (B_M, B_N, B_K, WG_PER_CU)   term moved, and what it moves
     (336, 337): (64,  32,  128, 2),   # B_K  256->128: COM_REP_K 2->1
@@ -1534,46 +1340,20 @@ _BMM_MXSCALE_BPRESHUFFLE_BDIRECT_ISOLATE = {
     (342, 343): (64,  32,  256, 1),   # WG_PER_CU 2->1: occupancy only, geometry fixed
     # (344, 345): (64, 128, 256, 1) -- B_N 32->128, vs (342,343). Unwired, see below.
 }
-# B_N has no row because it cannot be stepped alone, which took three attempts to
-# establish. 64x128x256 passes the traits at both occupancies -- LDS is fine, since
-# B_DIRECT_REG keeps B out of it and 64x128x256 has the same per-iteration LDS as
-# 64x32x256 -- and runs at 332,000us at wg2 (kid340/341) and 105,000-133,000us at wg1
-# (kid344/345), against 19us for the baseline geometry, both sides of each pair alike.
-# That is the VGPR spill the family's own notes predict ("occupancy here is VGPR-bound at
-# 2 waves/SIMD, not LDS-bound"): COM_REP_N=8 with COM_REP_K=2 is 32 MFMA and 16 B
-# fragments per tile. B_N=128 is only viable at B_K=128, which is what every B_N=128 kid
-# in this family is. So B_N cannot move without B_K moving, and the two measured corners
-# differ in four terms because the geometry space forbids the orthogonal walk -- not
-# because the pair was picked carelessly.
+# B_N has no row because it cannot be stepped alone. 64x128x256 passes the traits at
+# both occupancies -- LDS is fine, since B_DIRECT_REG keeps B out of it -- but spills
+# and runs 5000x slow: COM_REP_N=8 with COM_REP_K=2 is 32 MFMA and 16 B fragments per
+# tile, and occupancy here is VGPR-bound rather than LDS-bound. B_N=128 is only viable
+# at B_K=128, so B_N cannot move without B_K moving.
 #
-# Two traps worth keeping. Instantiating the traits alone against a candidate geometry
-# takes a second and catches the compile-time gate, worth doing before a 21-minute
-# build; it does NOT catch the spill, a register allocator outcome rather than a
-# static_assert, so a new geometry wants a timing smoke check too. And a 300,000us kid
-# inside a sweep is indistinguishable from a hang -- that is what it was first taken for.
-# So kid340/341 are not wired at all, and kid344/345 are no longer wired either. They
-# had been kept as the recorded evidence that wg1 does not rescue B_N=128, but the
-# evidence is this comment, not the instantiation: they are in no pool and no tuned CSV,
-# so nothing ever built on them. What they did cost is the module's whole wall-clock
-# tail. Their six TUs (two kids x three C dtypes) compiled in ~21 min *each* -- the same
-# spill that makes them 105,000us at runtime makes the register allocator crawl -- so
-# they alone set the floor on a full rebuild, which was 36 min at ~2.5 h of CPU.
-# Measured after removing them: 524 edges, 18.3 min of CPU, 25.3 s wall, slowest single
-# edge 8.0 s and *nothing* above 10 s. On 256 cores the old wall was essentially one
-# 21-minute serial tail; the other ~520 objects were never the cost.
+# Those kids (340/341, 344/345) are therefore not instantiated at all. The same spill
+# makes the register allocator crawl -- ~21 min per TU, six TUs -- and they alone set
+# the floor on a full module rebuild. A geometry kept "for the record" is free only if
+# the record is prose; an instantiation is a build cost.
 #
-# Two things to carry forward. A geometry kept "for the record" is free only if the
-# record is prose: an instantiation is not a record, it is a build cost, and here it was
-# most of the module's. And when pricing a parallel build, read the per-edge
-# distribution (ninja's .ninja_log), not the wall clock -- the wall hid a 500x outlier
-# behind a 2.1 s median.
-#
-# One caveat on the "nothing references them" check, because it nearly misled me:
-# absence from compiled_kids_opus.json is NOT evidence. That sidecar lists 93 kids while
-# the shipped tuned CSV dispatches 26 kids of which 22 are absent from it -- it tracks
-# --tune builds, not what is linked. The checks that do hold are the pool/CSV grep and
-# the link itself: after removal the .so loses exactly 35 symbols, all of this tile,
-# gains none, and every other family's symbol count is unchanged.
+# Note that a traits-only instantiation checks a candidate geometry's compile-time
+# gates in a second, but does NOT catch a spill: that is a register allocator outcome,
+# so a new geometry wants a timing smoke check too.
 for (_plain_kid, _shuf_kid), (_bm, _bn, _bk, _wg) in (
     _BMM_MXSCALE_BPRESHUFFLE_BDIRECT_ISOLATE.items()
 ):
@@ -1588,33 +1368,22 @@ for (_plain_kid, _shuf_kid), (_bm, _bn, _bk, _wg) in (
 
 # --- tileN at B_M > 16: does the T_M=1 consumer grid cost anything on a narrow tile? ---
 #
-# The A-scale shuffle layout the model will actually emit is sub=16
-# (shuffle_scale_blockscale_a, which is what inverse_rope_group_quant already
-# writes and what FlyDSL consumes). A dword in that layout pairs rows 16 apart,
-# so a lane's M subtiles pair two-for-one only on the T_M=1 grid -- a T_M=2 tile
-# has its subtiles 32 rows apart and reads two dwords where one would do. opus
-# has T_M=1 at B_M=16 and, via wavetm1, at 128x256; every narrow tile in between
-# is T_M=2 only. That gap, not the layout, is the whole of the +3.04% that a
-# sub=16 restriction of the tuner pool costs against the plain pool.
+# The A-scale shuffle layout the model emits is sub=16, whose dword pairs rows 16
+# apart, so a lane's M subtiles pair two-for-one only on the T_M=1 grid; a T_M=2
+# tile reads two dwords where one would do. opus has T_M=1 at B_M=16 and, via
+# wavetm1, at 128x256 -- every narrow tile in between is T_M=2 only.
 #
-# So the question is whether a T_M=1 sibling of a narrow tile is as fast as the
-# T_M=2 original, and it has to be answered before building any of them. Two
-# things are already known and neither settles it: at 128x256x128, the one tile
-# where opus has both grids, they are a dead heat (median 0.955 over 133 shapes,
-# 0.9993 on the >=22us rows), and FlyDSL ships BM 32..128 x BN 16..256 entirely
-# on T_M=1. Neither touches a 64x32 tile, where the fragment accounting moves the
-# wrong way: T_M=2 issues 2 A + 2 B fragments for its 4 MFMAs, T_M=1 issues
-# 4 A + 1 B for the same 4.
-#
-# These are PLAIN-scale kids on purpose. Putting the shuffled layout on them at
-# the same time would charge the grid for whatever the layout does, and the
-# layout half is already settled (kid173/kid210 read it; FlyDSL ships it). What
-# is unknown is the grid alone, so that is what these move -- each is its listed
-# twin with T_M/T_N swapped and nothing else.
+# These kids answer whether a T_M=1 sibling of a narrow tile is as fast as the
+# T_M=2 original. They are PLAIN-scale on purpose: putting the shuffled layout on
+# them at the same time would charge the grid for whatever the layout does. Each
+# is its listed twin with T_M/T_N swapped and nothing else.
 #
 # Three points rather than one because the grid changes LOAD_GROUP_M, which
-# prefetch_k_iter and the LDS budget are derived from, so a wg1-only reading
-# could be an occupancy artifact rather than a grid one.
+# prefetch_k_iter and the LDS budget derive from, so a wg1-only reading could be
+# an occupancy artifact rather than a grid one.
+#
+# Answer: it is not. They lose 7-29% and win nothing, so they are retired from
+# _TUNE_POLICY and kept only to hold the TILE_N_ code path compiled.
 _BMM_MXSCALE_BPRESHUFFLE_BDIRECT_TILEN_TILES = {
     #    (B_M, B_N, B_K, WG_PER_CU, preload_sf)   twin it is measured against
     388: (64, 32, 256, 1, True),    # kid342 (wg1 + panels)
@@ -2017,49 +1786,21 @@ a8w8_mxscale_bmm_bpreshuffle_wave8n4_kernels_list.update({
 # (kid653, 19.89) at a cell the plain kid used to own. Numerics are unchanged:
 # errRatio 0.00001 across the four tiles x five shapes, and the table gate passes.
 #
-# The A-scale relayout on top is a wash wherever the shuffle_scale set has a tile of the
-# right size -- within +-2% over the whole large-M end, which is the twin-by-twin
-# result restated -- and a rout wherever it does not, up to 46% at g2/m1. All of
-# that loss is a missing tile rather than the layout: the smallest shuffle_scale kid is
-# kid216's 64x32 and the band below m256 belongs to kid311's 16x32x512 and
-# kid313, neither of which has a twin. So a model-wide switch would mean porting
-# the flatmm family as well, and the rows where a twin already exists say what
-# that would buy, which is nothing. That is the answer to whether every kid needs
-# filling in: under a per-model layout it would have to be, which is exactly why
-# the switch is not worth making.
+# The first three shuffled twins of this family, and the reason the layout is worth
+# carrying at all: the LDS scale panel they drop is filled from A's scale only, and
+# only A's scale is read per lane -- one dword from each of 16 rows stride_sfa apart.
+# Coalescing that is what the layout is for. Relayouting SFB would buy nothing: its
+# address carries no lane term, so a K tile's B scales are already one broadcast
+# dword per N group.
 #
-# The reason it comes out a wash where it is measurable at all is structural. shuffle_scale's
-# gain is dropping the LDS scale panel, and a cell only goes to a tile whose ratio
-# of MFMA to scale bytes already made that panel cheap, so the layout arrives
-# where it has least to win. kid217 is the cleanest instance: a fair twin for the
-# tile that owns m512, and it still loses 12-15% at K=4096.
-#
-# The LDS panel these twins drop is filled from A's scale only, so the panel's
-# other tenant (SFB) is unaffected either way. Nor would relayouting SFB help:
-# its address carries no lane term, so a K tile's B scales are one broadcast dword
-# per N group however they are stored, already a single line per issue. Only A's
-# scale is read per lane, one dword from each of 16 rows a stride_sfa apart, and
-# coalescing that is what shuffle_scale is for.
-#
-# One methodology note, because it invalidates part of what is written above and
-# in the kid210/216/217 entries. Calling this op from python costs ~11us of host
-# time, and a timing loop of plain calls is launch-bound below about 19us: it
-# floors there and stays flat from m=1 to m=256 while the shipped table records
-# 7.8 to 14.5 over that range. Every number at or under ~19us in the older tables
-# in this file is that floor rather than a kernel, and the small-M rows of those
-# tables say nothing. The table above is timed under a captured graph, where the
-# replay is one launch for the whole loop, and its m=1 numbers move with M as
-# they should. The large-M rows elsewhere are unaffected and reproduce the shipped
-# table within a few percent.
-#
-# The kids are kept as the measurement, not as tuner candidates: nothing should
-# route to them until a producer emits the layout, and until then their entries
-# are what says what that switch would cost.
+# Note that on any tile whose MFMA-to-scale-byte ratio already made the panel cheap,
+# the layout arrives where it has least to win; see the twin matrix below, which is
+# what separates the two mechanisms.
 _BMM_MXSCALE_BPRESHUFFLE_WAVE8N4_SHUFFLE_SCALE_TILES = {
     #   (B_M, B_N, B_K, WG_PER_CU)     twin of
     213: (256, 256, 128, 1),         # kid194
     214: (128, 256, 128, 1),         # kid168
-    215: (128, 64,  256, 1),         # kid175 -- also the only COM_REP_K=2 shuffle_scale kid
+    215: (128, 64,  256, 1),         # kid175 -- also the only COM_REP_K=2 shuffled kid
 }
 a8w8_mxscale_bmm_bpreshuffle_wave8n4_kernels_list.update({
     kid: _a8w8_mxscale_bmm_bpreshuffle_wave8n4(bm, bn, bk, wg, shuffle_scale=True)
@@ -2473,29 +2214,16 @@ a8w8_mxscale_bmm_bpreshuffle_wavetm1_kernels_list.update({
 # doubles both fragments, so the register file decides the rest of the tile.
 # T_M=1 must drop B_N to 64 (A alone is 128 registers; B_N=128 lands exactly on
 # the 224 limit with nothing left for addressing), and T_M=2 halves COM_REP_M
-# instead and fits 128x256x256 at 64+64+64. At g16/m32768/k4096, against kid205's
-# 1945 us: T_M=1/B_N=64 runs 4746 and T_M=2/B_N=256 runs 3065. Their own controls
-# run 4741 and 3126, so the tile is all of it.
+# instead and fits 128x256x256. Measured against kid205, both forms are 1.6-2.4x
+# slower and each one's own no-shuffle control is within 1-2% of it, so the tile
+# is all of it.
 #
-# The equal-tile pairs are still the cleanest read on the layout itself, since the
-# control isolates it (us, two runs, repeatable to 0.1%):
-#
-#                        T_M=1, B_N=64    T_M=2, B_N=256
-#     g   m      K     |  shuffle_scale   control |  shuffle_scale   control
-#      2   8192  1024  | 58.7     63.0  | 41.2     41.7
-#      8   8192  1024  |  227      239  |  154      152
-#     16   8192  1024  |  432      460  |  330      329
-#      2   8192  4096  |  162      160  | 96.7     92.6
-#      4  16384  4096  |  618      610  |  362      349
-#     16  32768  4096  | 4746     4741  | 3065     3126
-#
-# Which locates what the layout is worth, and it is not op_sel or access shape:
-# it is the LDS scale panel's fixed cost, and only on a tile bad enough to keep
-# re-paying it. The 5-7% at K=1024 is the B_N=64 column, where a 64-wide tile
-# quadruples the workgroups and every one of them fills the panel again; on the
-# B_N=256 tile the same comparison is a wash (+2.0% to -4.4%). kid208 got its
-# 5.8% at K=1024 from the same place, and kid205 amortises the fill well enough
-# that removing it is worth nothing at a competitive tile.
+# Those controls also locate what the layout is worth, and it is not op_sel or
+# access shape: it is the LDS scale panel's fixed cost, and only on a tile bad
+# enough to keep re-paying it. The gain shows on the narrow B_N=64 form, where a
+# 64-wide tile quadruples the workgroups and every one refills the panel; on the
+# B_N=256 tile the same comparison is a wash. kid205 amortises the fill well
+# enough that removing it is worth nothing at a competitive tile.
 #
 # Reaching either needed the est_acc_vgpr fix in the traits (it multiplied the
 # accumulator by COM_REP_K, which is reduced, not accumulated over); every kid
