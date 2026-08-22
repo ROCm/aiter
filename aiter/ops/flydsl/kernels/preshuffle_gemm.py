@@ -118,6 +118,104 @@ def _get_preload(tile_m, tile_n, tile_k):
     )
 
 
+_M_MAX = 65536
+
+# Elements per thread in the split-K reduce. 4 is the width where both sides sit
+# in one atom: 4 f32 in = 16B (BufferCopy128b), 4 bf16 out = 8B (BufferCopy64b).
+# Going wider would push the f32 load past 16B and split it across two atoms.
+_REDUCE_VEC = 4
+
+
+@functools.lru_cache(maxsize=1024)
+def compile_splitk_reduce(
+    *,
+    N: int,
+    k_split: int,
+    out_dtype: str = "bf16",
+    block: int = 256,
+):
+    """Reduce the fp32 ``[M, k_split, N]`` workspace into ``[M, N]``.
+
+    Sums in fp32 and rounds once on store. One thread owns ``_REDUCE_VEC``
+    contiguous N elements; work items past M are dropped by the output buffer
+    descriptor.
+    """
+    if k_split < 2:
+        raise ValueError(f"compile_splitk_reduce needs k_split >= 2, got {k_split}")
+    if N % _REDUCE_VEC != 0:
+        raise ValueError(f"N ({N}) must be a multiple of {_REDUCE_VEC}")
+    out_elem_cls = BFloat16 if out_dtype == "bf16" else Float16
+    n_vecs = N // _REDUCE_VEC
+
+    @flyc.kernel(known_block_size=[block, 1, 1])
+    def kernel_reduce(
+        arg_out: fx.Tensor,
+        arg_ws: fx.Tensor,
+        i32_m: fx.Int32,
+    ):
+        # Atoms/layouts build MLIR, so they need the kernel body's context.
+        load_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), Float32)
+        store_atom = fx.make_copy_atom(fx.rocdl.BufferCopy64b(), out_elem_cls)
+        reg_layout = fx.make_layout(_REDUCE_VEC, 1)
+
+        gid = Int32(gpu.block_id("x")) * Int32(block) + Int32(gpu.thread_id("x"))
+        m = gid // Int32(n_vecs)
+        nv = gid % Int32(n_vecs)
+
+        gWS = fx.rocdl.make_buffer_tensor(
+            arg_ws,
+            max_size=False,
+            num_records_bytes=fx.Int64(i32_m) * fx.Int64(k_split * N) * fx.Int64(4),
+        )
+        gOut = fx.rocdl.make_buffer_tensor(
+            arg_out,
+            max_size=False,
+            num_records_bytes=fx.Int64(i32_m) * fx.Int64(N) * fx.Int64(2),
+        )
+
+        # Sum this thread's run across slices, in fp32.
+        acc = Vec.filled(_REDUCE_VEC, 0.0, Float32)
+        for z in range_constexpr(k_split):
+            row = fx.logical_divide(fx.slice(gWS, (m, z, None)), reg_layout)
+            frag = fx.make_rmem_tensor(reg_layout, Float32)
+            fx.copy_atom_call(load_atom, fx.slice(row, (None, nv)), frag)
+            acc = acc + Vec(frag.load())
+
+        out_row = fx.logical_divide(fx.slice(gOut, (m, None)), reg_layout)
+        out_frag = fx.make_rmem_tensor(reg_layout, out_elem_cls)
+        out_frag.store(acc.to(out_elem_cls))
+        fx.copy_atom_call(store_atom, out_frag, fx.slice(out_row, (None, nv)))
+
+    @flyc.jit
+    def launch_reduce(
+        arg_out: fx.Tensor,
+        arg_ws: fx.Tensor,
+        i32_m: fx.Int32,
+        stream: fx.Stream,
+    ):
+        CompilationContext.get_current()
+        ws_3d = fx.Tensor(
+            fx.make_view(
+                fx.get_iter(arg_ws),
+                fx.make_layout((_M_MAX, k_split, N), (k_split * N, N, 1)),
+            )
+        )
+        out_2d = fx.Tensor(
+            fx.make_view(
+                fx.get_iter(arg_out),
+                fx.make_layout((_M_MAX, N), (N, 1)),
+            )
+        )
+        gx = (i32_m * Int32(n_vecs) + Int32(block - 1)) // Int32(block)
+        kernel_reduce(out_2d, ws_3d, i32_m).launch(
+            grid=(gx, 1, 1),
+            block=(block, 1, 1),
+            stream=stream,
+        )
+
+    return launch_reduce
+
+
 @functools.lru_cache(maxsize=1024)
 def compile_preshuffle_gemm(
     *,
@@ -134,10 +232,24 @@ def compile_preshuffle_gemm(
     use_async_copy: bool = False,
     xcd_swizzle: int = 0,
     lds_stage: int = 2,
+    k_split: int = 1,
 ):
     """Compile preshuffle GEMM (fp8/int8/fp16/bf16).
     Signature: fn(C, A, B, scale_a, scale_b, bias, M, N, stream). bias is the fused
     epilogue bias (per-N, out_dtype); unused when epilogue == "none".
+
+    ``k_split`` > 1 splits the K loop across gridDim.z to give small-M shapes
+    more CTAs. Each slice stores its fp32 partial into a ``[M, k_split, N]``
+    workspace -- ``arg_c`` is that workspace and must be fp32 -- for
+    ``compile_splitk_reduce`` to combine. Every element is written exactly once,
+    so no pre-clear is needed and the result is rounded once, unlike a bf16
+    atomic accumulate which rounds per slice.
+
+    scale_a/scale_b still apply per slice (they factor out of the K sum); a
+    fused bias would not, so it stays rejected for k_split > 1.
+
+    k_split == 1 is the default and compiles to exactly the code this kernel
+    emitted before split-K existed.
     """
     if in_dtype not in ("fp8", "int8", "fp16", "bf16"):
         raise ValueError(f"in_dtype must be fp8/int8/fp16/bf16, got {in_dtype!r}")
@@ -151,6 +263,18 @@ def compile_preshuffle_gemm(
         )
     if lds_stage not in (1, 2):
         raise ValueError(f"lds_stage must be 1 or 2, got {lds_stage}")
+    if k_split < 1:
+        raise ValueError(f"k_split must be >= 1, got {k_split}")
+    if (K // tile_k) % k_split != 0:
+        raise ValueError(
+            f"k_split must divide the K-tile count evenly; got k_split={k_split}, "
+            f"K//tile_k={K // tile_k} (K={K}, tile_k={tile_k})"
+        )
+    if k_split > 1 and epilogue != "none":
+        raise ValueError(
+            f"k_split > 1 runs the epilogue once per z-slice, so a fused bias "
+            f"would be added k_split times; got epilogue={epilogue!r}"
+        )
     _has_epilogue = epilogue != "none"
     _has_bias = epilogue in ("bias", "bias_relu", "bias_silu", "bias_gelu")
     _has_relu = epilogue == "bias_relu"
@@ -186,9 +310,13 @@ def compile_preshuffle_gemm(
     # Tile geometry (tile_K_perm = K-elements grouped per MMA k-step)
     tile_K_perm = 128 if use_mfma_scale_128 else (64 if is_8bit else 32)
     k_iters = tile_k // tile_K_perm
-    num_tiles = K // tile_k
+    # K-tiles each CTA walks. With k_split > 1 the K loop is cut k_split ways
+    # along gridDim.z; every loop bound below is per-slice, and the slice's
+    # first K-tile is k_off (see the kernel body).
+    num_tiles = (K // tile_k) // k_split
     m_repeat = tile_m // 16
     num_waves = 4
+    warp_grid, warp_grid_stride = (1, num_waves, 1), (0, 1, 0)
     n_per_wave = tile_n // num_waves
     num_acc_n = n_per_wave // 16
     acc_size = m_repeat * num_acc_n * 4
@@ -206,6 +334,13 @@ def compile_preshuffle_gemm(
         dsrd_preload, dvmem_preload = (0, 0)
 
     a_lds_elems = tile_m * tile_k
+
+    # Each z-slice owns a disjoint band, so the store stays an ordinary
+    # buffer_store -- only the element type and column offset change.
+    store_elem_cls = Float32 if k_split > 1 else out_elem_cls
+    store_elem_bytes = 4 if k_split > 1 else 2
+    # Workspace column count: slice z occupies columns [z*N, (z+1)*N).
+    c_cols = N * k_split
 
     @fx.struct
     class SharedStorage:
@@ -228,7 +363,18 @@ def compile_preshuffle_gemm(
         tiled_copy_g2s: fx.TiledCopy,
     ):
         tid = fx.thread_idx.x
-        bid_x, bid_y, _ = fx.block_idx
+        bid_x, bid_y, bid_z = fx.block_idx
+
+        # First K-tile this z-slice owns. Guarded so k_split == 1 keeps emitting
+        # the original (offset-free) index expressions.
+        if const_expr(k_split > 1):
+            k_off = Int32(bid_z) * Int32(num_tiles)
+
+        def _k(kt):
+            """K-tile index `kt` of this slice, in whole-K coordinates."""
+            if const_expr(k_split == 1):
+                return kt
+            return k_off + kt
 
         if const_expr(xcd_swizzle > 0):
             _bx, _by = xcd_remap_bx_by(
@@ -248,7 +394,7 @@ def compile_preshuffle_gemm(
             )
             tiled_mma = fx.make_tiled_mma(
                 _scale_atom,
-                fx.make_layout((1, 4, 1), (0, 1, 0)),
+                fx.make_layout(warp_grid, warp_grid_stride),
                 fx.make_tile(None, None, fx.make_layout((32, 4), (1, 32))),
             )
         else:
@@ -268,12 +414,22 @@ def compile_preshuffle_gemm(
         gC = fx.rocdl.make_buffer_tensor(
             arg_c,
             max_size=False,
-            num_records_bytes=fx.Int64(i32_m) * fx.Int64(N) * fx.Int64(2),
+            num_records_bytes=fx.Int64(i32_m)
+            * fx.Int64(c_cols)
+            * fx.Int64(store_elem_bytes),
         )
 
         tA = fx.flat_divide(gA, fx.make_tile(tile_m, tile_k))[None, None, bid_x, None]
         tB = fx.flat_divide(gB, fx.make_tile(tile_n, tile_k))[None, None, bid_y, None]
-        tC = fx.flat_divide(gC, fx.make_tile(tile_m, tile_n))[None, None, bid_x, bid_y]
+        # C is the (M, k_split*N) workspace; this slice writes the band at z.
+        # N % tile_n == 0, so the band starts on a tile boundary.
+        if const_expr(k_split == 1):
+            c_tile_y = bid_y
+        else:
+            c_tile_y = Int32(bid_z) * Int32(N // tile_n) + bid_y
+        tC = fx.flat_divide(gC, fx.make_tile(tile_m, tile_n))[
+            None, None, bid_x, c_tile_y
+        ]
 
         buf_copy = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), layout_elem)
         uni_copy = fx.make_copy_atom(fx.UniversalCopy128b(), layout_elem)
@@ -328,10 +484,13 @@ def compile_preshuffle_gemm(
         frag_C = thr_mma.make_fragment_C(tC)
         frag_A_retile = thr_s2r.retile(frag_A)
         frag_B_retile_stages = [thr_g2r_B.retile(b) for b in frag_B_stages]
-        buf_copy_out = fx.make_copy_atom(fx.rocdl.BufferCopy16b(), out_elem_cls)
+        buf_copy_out = fx.make_copy_atom(
+            fx.rocdl.BufferCopy32b() if k_split > 1 else fx.rocdl.BufferCopy16b(),
+            store_elem_cls,
+        )
         thr_r2g_C = fx.make_tiled_copy_C(buf_copy_out, tiled_mma).get_slice(tid)
         pC_g = thr_r2g_C.partition_S(tC)
-        frag_C_out = fx.make_fragment_like(frag_C, out_elem_cls.ir_type)
+        frag_C_out = fx.make_fragment_like(frag_C, store_elem_cls.ir_type)
         frag_C_retile = thr_r2g_C.retile(frag_C_out)
 
         # ── Async gmem->LDS DMA (buffer_load_lds) for the A tile ──
@@ -362,7 +521,7 @@ def compile_preshuffle_gemm(
                     fx.Int32.ir_type, wave_id * wave_stride_bytes
                 )
                 lds_ptr = fx.add_offset(sA_i8_ptr[stage], wave_off)
-                base_k = k_tile_val * tile_k
+                base_k = _k(k_tile_val) * tile_k
                 for i in range_constexpr(num_a_loads):
                     if const_expr(i > 0):
                         lds_ptr = fx.add_offset(lds_ptr, step_bytes)
@@ -521,7 +680,7 @@ def compile_preshuffle_gemm(
                     dma_a_to_lds(next_k_val, a_write)
                     fx.copy(
                         buf_copy,
-                        pB_g[None, None, None, next_k_val],
+                        pB_g[None, None, None, _k(next_k_val)],
                         frag_B_retile_stages[write_stage],
                     )
                 mma_kloop(a_read, cur_frag_B)
@@ -532,10 +691,10 @@ def compile_preshuffle_gemm(
                 gpu.barrier()
                 return
             if const_expr(do_next):
-                fx.copy(buf_copy, pA_g[None, None, None, next_k_val], frag_copy_A)
+                fx.copy(buf_copy, pA_g[None, None, None, _k(next_k_val)], frag_copy_A)
                 fx.copy(
                     buf_copy,
-                    pB_g[None, None, None, next_k_val],
+                    pB_g[None, None, None, _k(next_k_val)],
                     frag_B_retile_stages[write_stage],
                 )
             mma_kloop(a_read, cur_frag_B)
@@ -554,13 +713,13 @@ def compile_preshuffle_gemm(
         )
         if const_expr(use_async_copy):
             dma_a_to_lds(fx.Int32(0), 0)
-            fx.copy(buf_copy, pB_g[None, None, None, 0], frag_B_retile_stages[0])
+            fx.copy(buf_copy, pB_g[None, None, None, _k(0)], frag_B_retile_stages[0])
             frag_C.store(acc_zero)
             rocdl.s_waitcnt(num_b_loads)
             gpu.barrier()
         else:
-            fx.copy(buf_copy, pA_g[None, None, None, 0], frag_copy_A)
-            fx.copy(buf_copy, pB_g[None, None, None, 0], frag_B_retile_stages[0])
+            fx.copy(buf_copy, pA_g[None, None, None, _k(0)], frag_copy_A)
+            fx.copy(buf_copy, pB_g[None, None, None, _k(0)], frag_B_retile_stages[0])
             frag_C.store(acc_zero)
             fx.copy(uni_copy, frag_copy_A, pA_s_stages[0][None, None, None])
             gpu.barrier()
@@ -575,8 +734,8 @@ def compile_preshuffle_gemm(
                 k_next = fx.Int32(iv + 1)
                 mma_kloop(0, frag_Bc)
                 if const_expr(not use_async_copy):
-                    fx.copy(buf_copy, pA_g[None, None, None, k_next], frag_copy_A)
-                fx.copy(buf_copy, pB_g[None, None, None, k_next], frag_Bc_retile)
+                    fx.copy(buf_copy, pA_g[None, None, None, _k(k_next)], frag_copy_A)
+                fx.copy(buf_copy, pB_g[None, None, None, _k(k_next)], frag_Bc_retile)
                 gpu.barrier()  # single buffer: all reads done before overwrite
                 if const_expr(use_async_copy):
                     dma_a_to_lds(k_next, 0)
@@ -687,8 +846,10 @@ def compile_preshuffle_gemm(
             pipeline_2stage(read_stage=(num_tiles - 1) % 2, read_next=False)
 
         # ── Epilogue ─────────────────────────────────────────────
+        # k_split > 1 stores the fp32 accumulator; rounding happens in the
+        # reduce kernel.
         if const_expr(not is_8bit and not _has_epilogue):
-            frag_C_out.store(Vec(frag_C.load()).to(out_elem_cls))
+            frag_C_out.store(Vec(frag_C.load()).to(store_elem_cls))
             fx.copy(buf_copy_out, frag_C_retile, pC_g)
         else:
             if const_expr(not overlap_epi_load):
@@ -732,10 +893,10 @@ def compile_preshuffle_gemm(
                 if const_expr(_has_bias):
                     val_s = val_s + bias_vals[ni]
                 val_s = apply_activation(val_s)
-                out_elems.append(val_s.to(out_elem_cls))
+                out_elems.append(val_s.to(store_elem_cls))
 
             out_vec = vector.from_elements(
-                T.vec(acc_size, out_elem_cls.ir_type), out_elems
+                T.vec(acc_size, store_elem_cls.ir_type), out_elems
             )
             frag_C_out.store(out_vec)
             fx.copy(buf_copy_out, frag_C_retile, pC_g)
@@ -772,7 +933,7 @@ def compile_preshuffle_gemm(
 
         tiled_mma = fx.make_tiled_mma(
             mma_atom,
-            fx.make_layout((1, 4, 1), (0, 1, 0)),
+            fx.make_layout(warp_grid, warp_grid_stride),
             fx.make_tile(None, None, k_perm),
         )
 
@@ -809,12 +970,15 @@ def compile_preshuffle_gemm(
         )
 
         # Reshape A and C to 2D
-        M_max = 65536
+        M_max = _M_MAX
         arg_a_2d = fx.Tensor(
             fx.make_view(fx.get_iter(arg_a), fx.make_layout((M_max, K), (K, 1)))
         )
+        # k_split > 1: arg_c is the workspace, viewed as (M, k_split*N).
         arg_c_2d = fx.Tensor(
-            fx.make_view(fx.get_iter(arg_c), fx.make_layout((M_max, N), (N, 1)))
+            fx.make_view(
+                fx.get_iter(arg_c), fx.make_layout((M_max, c_cols), (c_cols, 1))
+            )
         )
 
         gx = (i32_m + (tile_m - 1)) // tile_m
@@ -833,7 +997,7 @@ def compile_preshuffle_gemm(
             tiled_copy_g2s,
             value_attrs={"rocdl.waves_per_eu": waves_per_eu},
         ).launch(
-            grid=(gx, gy, 1),
+            grid=(gx, gy, k_split),
             block=(256, 1, 1),
             stream=stream,
         )

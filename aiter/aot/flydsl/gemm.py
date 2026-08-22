@@ -97,7 +97,10 @@ _PRESHUFFLE_RE = re.compile(
     r"(?P<tile_m>\d+)x(?P<tile_n>\d+)x(?P<tile_k>\d+)_"
     r"(?P<qa>[A-Z0-9]+)_(?P<qw>[A-Z0-9]+)_(?P<out>[A-Z0-9]+)_"
     r"(?P<async_copy>\d+)x(?P<waves_per_eu>\d+)(?:x(?P<xcd_swizzle>\d+))?(?:x(?P<lds_stage>\d+))?_"
-    r"(?P<scheduler>[A-Za-z][A-Za-z0-9]*)$"
+    r"(?!ks\d+$)(?P<scheduler>[A-Za-z][A-Za-z0-9]*)"
+    # Trailing _ksN, emitted only for k_split > 1, so pre-split-K names still
+    # match. Without it they fail fullmatch and drop out of the AOT build.
+    r"(?:_ks(?P<k_split>\d+))?$"
 )
 _SHORT_DTYPE = {
     "F8": "fp8",
@@ -147,6 +150,7 @@ def _parse_preshuffle_kernel_name(name: str) -> dict | None:
         "xcd_swizzle": int(m.group("xcd_swizzle")) if m.group("xcd_swizzle") else 0,
         "lds_stage": int(m.group("lds_stage")) if m.group("lds_stage") else 2,
         "scheduler": m.group("scheduler"),
+        "k_split": int(m.group("k_split")) if m.group("k_split") else 1,
     }
 
 
@@ -354,10 +358,12 @@ def _compile_preshuffle_to_cache(
     xcd_swizzle: int = 0,
     lds_stage: int = 2,
     scheduler: str = "Default",
+    k_split: int = 1,
     **kwargs,
 ):
     del kwargs
     enable_scheduler = str(scheduler).lower() != "off"
+    k_split = int(k_split)
 
     import torch
 
@@ -367,7 +373,13 @@ def _compile_preshuffle_to_cache(
     # FlyDSL preshuffle kernels consume raw quantized bytes for fp8/int8 paths.
     a = torch.empty((m * k,), device=dev, dtype=torch.int8)
     b = torch.empty((n * k,), device=dev, dtype=torch.int8)
-    out = torch.empty((m * n,), device=dev, dtype=out_torch_dtype)
+    # k_split > 1 writes fp32 partials to a [M, k_split, N] workspace; both it
+    # and the reduce kernel must be in the AOT cache.
+    out = torch.empty(
+        (m * n * k_split,) if k_split > 1 else (m * n,),
+        device=dev,
+        dtype=torch.float32 if k_split > 1 else out_torch_dtype,
+    )
     scale_a = torch.empty((max(m, 1),), device=dev, dtype=torch.float32)
     scale_b = torch.empty((max(n, 1),), device=dev, dtype=torch.float32)
     bias = torch.empty(0, device=dev, dtype=out_torch_dtype)
@@ -386,6 +398,7 @@ def _compile_preshuffle_to_cache(
         enable_scheduler=enable_scheduler,
         xcd_swizzle=xcd_swizzle,
         lds_stage=lds_stage,
+        k_split=k_split,
     )
     # The layout-API launcher uses fx.Tensor args (it builds views via
     # fx.get_iter/make_view), so pass flat torch tensors directly rather
@@ -402,6 +415,17 @@ def _compile_preshuffle_to_cache(
         n,
         stream,
     )
+
+    if k_split > 1:
+        from aiter.ops.flydsl.kernels.preshuffle_gemm import compile_splitk_reduce
+
+        reduce_out = torch.empty((m * n,), device=dev, dtype=out_torch_dtype)
+        reduce_exe = compile_splitk_reduce(
+            N=n,
+            k_split=k_split,
+            out_dtype="bf16" if out_torch_dtype == torch.bfloat16 else "fp16",
+        )
+        _compile_executable_to_cache(reduce_exe, reduce_out, out, m, stream)
 
 
 def _compile_8wave_to_cache(

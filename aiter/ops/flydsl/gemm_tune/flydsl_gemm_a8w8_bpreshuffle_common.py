@@ -67,6 +67,7 @@ class kernelInstance:
     xcd_swizzle: int  # 0=off, >0=group size for XCD remap
     lds_stage: int = 2  # 2=double-buffer ping-pong, 1=single A-LDS buffer (half LDS)
     sScheduler: str = "Default"  # scheduler hints on; "Off" = compiler default
+    k_split: int = 1  # >1 splits the K loop over gridDim.z (fp32 workspace + reduce)
 
     @property
     def enable_scheduler(self) -> bool:
@@ -99,6 +100,9 @@ class kernelInstance:
                 ),
                 self.sScheduler.lower(),
             ]
+            # Only split-K candidates carry the suffix, so names already in the
+            # tuned CSVs keep parsing (and comparing) exactly as before.
+            + ([f"ks{self.k_split}"] if self.k_split > 1 else [])
         )
 
 
@@ -114,6 +118,7 @@ def _ki(
     q_dtype_w="fp8",
     dtype="bf16",
     scheduler="Default",
+    k_split=1,
 ):
     return kernelInstance(
         tile_m,
@@ -127,6 +132,7 @@ def _ki(
         xcd_swizzle,
         lds_stage,
         scheduler,
+        k_split,
     )
 
 
@@ -226,6 +232,10 @@ def kernel_fits_shape(ki: kernelInstance, M: int, N: int, K: int) -> bool:
     if kernel_instance_estimated_lds_bytes(ki) > max_lds_bytes_for_tune():
         return False
     if N % ki.tile_n != 0 or K % ki.tile_k != 0:
+        return False
+    # Split-K slices the K-tile count evenly; the kernel rejects anything else.
+    # Only reachable for k_split > 1, so k_split == 1 candidates are unaffected.
+    if ki.k_split > 1 and (K // ki.tile_k) % ki.k_split != 0:
         return False
     if _padded_m(M) % ki.tile_m != 0:
         return False
@@ -327,6 +337,33 @@ def _estimate_max_wpe(tile_m: int, tile_n: int, total_vgpr: int = 512) -> int:
     c_per_thread = padded_m * padded_n // _THREADS_PER_TG
     est_per_wave = c_per_thread * 1.5
     return int(total_vgpr / max(est_per_wave, 1))
+
+
+# A slice must own a whole number of K-tiles, so the legal values are the
+# divisors of K//tile_k -- shape-dependent (K=7168 gives {2,7} at tile_k=512 and
+# {2,4,7,14} at tile_k=256), hence enumerated rather than hardcoded.
+K_SPLIT_MIN_TILES_PER_SLICE = 2  # keep the ping-pong loop fed
+K_SPLIT_MAX_CTA_OVERSUBSCRIBE = 4  # no point going far past one CU each
+
+
+def k_split_candidates(ki, M: int, N: int, K: int, cu_num: int = 256) -> list[int]:
+    """Split-K values worth benchmarking; 1 is excluded, the caller has it.
+
+    Empty once the tile grid already fills the GPU -- splitting would only add
+    the reduce pass. That bound also caps the fp32 workspace, since for a given
+    tile grid it caps M.
+    """
+    if ki.k_split != 1 or K % ki.tile_k:
+        return []
+    base_ctas = ((M + ki.tile_m - 1) // ki.tile_m) * (N // ki.tile_n)
+    if base_ctas >= cu_num:
+        return []
+    n_tiles = K // ki.tile_k
+    max_split = min(
+        n_tiles // K_SPLIT_MIN_TILES_PER_SLICE,
+        max(2, cu_num * K_SPLIT_MAX_CTA_OVERSUBSCRIBE // base_ctas),
+    )
+    return [d for d in range(2, max_split + 1) if n_tiles % d == 0]
 
 
 def _build_kernels_list(tiles, total_vgpr=512):
