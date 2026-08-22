@@ -142,6 +142,26 @@ def should_skip_rocm72_issue(causal, logits_soft_cap):
     return bool((major, minor) == (7, 2) and gpu_arch == "gfx950")
 
 
+def should_skip_ck_batch_prefill_paged_kv_fault(
+    dtype, head_dim, page_size, kvcache_layout, is_input_fp8
+):
+    """Skip the shape cell that intermittently GPU-faults in the CK paged-KV kernel.
+
+    FmhaBatchPrefillWithPagedKVCacheKernel has an out-of-bounds KV read in the
+    vectorized paged-KV load path for head_dim=128 + page_size=16 (fp16 and bf16).
+    The fault is intermittent (it depends on the KV buffer's runtime address) and
+    present in the current composable_kernel. Scoped to the non-fp8 path; fp8 uses a
+    different tile geometry and has not been observed faulting. Remove once fixed.
+    """
+    return bool(
+        not is_input_fp8
+        and dtype in (torch.float16, torch.bfloat16)
+        and head_dim == 128
+        and page_size == 16
+        and kvcache_layout == "vectorized"
+    )
+
+
 def check_common_skip_conditions(
     is_input_fp8: bool,
     return_lse: bool = False,
@@ -939,6 +959,14 @@ def test_batch_prefill(
     if skip_test_if(
         should_skip_rocm72_issue(causal, logits_soft_cap),
         "ROCm 7.2 + gfx950 compiler issue with causal=True + logits_soft_cap=0.0",
+    ):
+        return {"status": "skipped"}
+
+    if skip_test_if(
+        should_skip_ck_batch_prefill_paged_kv_fault(
+            dtype, head_dim, page_size, kvcache_layout, is_input_fp8
+        ),
+        "CK paged-KV OOB fault for fp16/bf16 + head_dim=128 + page_size=16 vectorized",
     ):
         return {"status": "skipped"}
 
