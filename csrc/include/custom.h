@@ -25,4 +25,11 @@ void wvSplitKQ(aiter_tensor_t& in_a,
                aiter_tensor_t& scale_a,
                aiter_tensor_t& scale_b,
                const int64_t CuCount);
+
+void wvSplitKQ_pertoken(aiter_tensor_t& in_a,
+                        aiter_tensor_t& in_b,
+                        aiter_tensor_t& out_c,
+                        aiter_tensor_t& scale_a,
+                        aiter_tensor_t& scale_b,
+                        const int64_t CuCount);
 } // namespace aiter
