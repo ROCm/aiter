@@ -1,12 +1,22 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import argparse
 import sys
 
 import torch
 import triton
 
-from aiter.ops.triton.attention.lean_atten import _persistent_lean_attention
+from aiter.ops.triton._triton_kernels.attention.lean_atten import _get_config
+from aiter.ops.triton.attention.lean_atten import (
+    _persistent_lean_attention,
+    persistent_lean_attention,
+)
+from aiter.ops.triton.utils.device_info import get_num_sms
+
+# Take the launch params from the arch config and call the public entry point, so we
+# measure what ships instead of a swept point. Needs a config for the current GPU.
+USE_CONFIG = False
 
 configs = []
 configs.append(
@@ -315,6 +325,16 @@ def bench_lean_attention(
     provider,
     device="cuda",
 ):
+    if USE_CONFIG:
+        # Before BLOCK_N builds batch_num_block_n and total_programs sizes the
+        # buffers, which the public entry point then validates against.
+        cfg = _get_config(causal=causal, n_ctx_q=n_ctx_q)
+        BLOCK_M = cfg["BLOCK_SIZE_M"]
+        BLOCK_N = cfg["BLOCK_SIZE_N"]
+        num_warps = cfg["num_warps"]
+        waves_per_eu = cfg["waves_per_eu"]
+        total_programs = get_num_sms() * cfg["SM_CNT_FACTOR"]
+
     n_ctx = n_ctx_k * batch
     assert batch == len(n_ctx)
 
@@ -358,25 +378,41 @@ def bench_lean_attention(
     XCD_REMAP = True
 
     # Triton LeanAttention output
-    fn = lambda: _persistent_lean_attention(
-        q,
-        k,
-        v,
-        Mp,
-        Lp,
-        Op,
-        locks,
-        batch_num_block_n,
-        total_programs,
-        BLOCK_M,
-        BLOCK_N,
-        XCD_REMAP,
-        causal,
-        batch,
-        RAGGED_BATCH,
-        num_warps,
-        waves_per_eu,
-    )
+    if USE_CONFIG:
+        fn = lambda: persistent_lean_attention(
+            q,
+            k,
+            v,
+            Mp,
+            Lp,
+            Op,
+            locks,
+            batch_num_block_n,
+            batch,
+            sm_scale=d**-0.5,
+            causal=causal,
+            RAGGED_BATCH=RAGGED_BATCH,
+        )
+    else:
+        fn = lambda: _persistent_lean_attention(
+            q,
+            k,
+            v,
+            Mp,
+            Lp,
+            Op,
+            locks,
+            batch_num_block_n,
+            total_programs,
+            BLOCK_M,
+            BLOCK_N,
+            XCD_REMAP,
+            causal,
+            batch,
+            RAGGED_BATCH,
+            num_warps,
+            waves_per_eu,
+        )
 
     warmup = 1
     rep = 1
@@ -387,6 +423,18 @@ def bench_lean_attention(
 
 
 def main():
+    global USE_CONFIG
+    parser = argparse.ArgumentParser(
+        prog="Benchmark Lean Attention", allow_abbrev=False
+    )
+    parser.add_argument(
+        "--use-config",
+        action="store_true",
+        help="Take launch parameters from the arch's tuned config and call the "
+        "public persistent_lean_attention(), instead of sweeping the tuning "
+        "columns of x_vals. Requires a <arch>-LEANATTN-DEFAULT.json.",
+    )
+    USE_CONFIG = parser.parse_args().use_config
     bench_lean_attention.run(save_path=".", print_data=True)
 
 

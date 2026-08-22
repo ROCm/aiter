@@ -27,11 +27,24 @@ from aiter.ops.triton._triton_kernels.attention.lean_atten import (
     _get_config,
     la_persistent,
 )
-from aiter.ops.triton.utils._triton import arch_info
-from aiter.ops.triton.utils.device_info import get_num_xcds
+from aiter.ops.triton.utils.device_info import get_num_sms, get_num_xcds
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
+
+# Config keys the wrapper already consumes or passes to the launch by name, so they
+# must not be splatted a second time.
+explicit_config_keys_handler = frozenset(
+    {
+        "BLOCK_SIZE_M",
+        "BLOCK_SIZE_N",
+        "SM_CNT_FACTOR",
+        "XCD_REMAP",
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+    }
+)
 
 # Support tensor in [B, Seqlen, H, d] format. Taking tensors in [B*Seqlen, H, d] as inputs
 
@@ -83,8 +96,9 @@ def persistent_lean_attention(
         f"LEAN_ATTEN: q={tuple(q.shape)}  k={tuple(k.shape)}  v={tuple(v.shape)} Mp={tuple(Mp.shape)} Lp={tuple(Lp.shape)}  Op={tuple(Op.shape)}"
     )
     if config is None:
-        config = _get_config()
-    sm_count = arch_info.get_num_sms()
+        # n_ctx_q distinguishes decode from prefill
+        config = _get_config(causal=causal, n_ctx_q=q.shape[0] // batch_size)
+    sm_count = get_num_sms()
     total_programs = (
         program_count
         if program_count is not None
@@ -163,6 +177,11 @@ def _persistent_lean_attention(
     """
     if config is None:
         config = {}
+    # Forward only the keys not already passed explicitly below; splatting the whole
+    # config collides ("got multiple values for keyword argument 'XCD_REMAP'").
+    launch_options = {
+        k: v for k, v in config.items() if k not in explicit_config_keys_handler
+    }
     DEBUG = False
 
     NUM_XCDS = get_num_xcds()
@@ -375,7 +394,7 @@ def _persistent_lean_attention(
             or (q.stride(0) * N_CTX_Q) >= (1 << 31)
         ),
         RAGGED_BATCH=RAGGED_BATCH,
-        **config,
+        **launch_options,
     )
 
     """
