@@ -411,7 +411,15 @@ __global__ void inverse_rope_group_quant_kernel(
         }
         else if constexpr(TIERED)
         {
-            const int slot = k_span_base + k * k_slots;
+            // Off the wave's first slot rather than the block's, so a block
+            // wider than one wave still holds a uniform bit per wave.
+            // readfirstlane both picks that slot and tells the compiler the
+            // answer is scalar, which is what keeps this branch off the exec
+            // mask; every lane is live here, the only earlier exit being
+            // block-invariant. At one wave per block it reads zero and this is
+            // the plain pass base.
+            const int slot = k_span_base + k * k_slots +
+                             __builtin_amdgcn_readfirstlane(k_slot);
             return slot >= rope_segment_slot0 ? kRopeSegment : 0;
         }
         else
@@ -1016,6 +1024,11 @@ void inverse_rope_group_quant(
     const int S_pad = mfma_tile ? static_cast<int>(x_scale.size(1)) : S;
     const int wave_size = static_cast<int>(get_warp_size_func());
     const int rows = S * G;
+    // The template instantiates one shape of head. Out here because the block
+    // width below has to ask the same question about tier orders that the
+    // launch does.
+    constexpr int HEAD_DIM_T = 512;
+    constexpr int RD_T = 64;
 
     // k_slots (groups a block covers per pass) is a runtime launch choice: it
     // only sizes the block, so it costs no extra kernel instantiations.
@@ -1024,8 +1037,6 @@ void inverse_rope_group_quant(
     {
         constexpr ScaleLayout LAYOUT = decltype(layout_tag)::value;
         constexpr int GS = decltype(group_tag)::value;
-        constexpr int HEAD_DIM_T = 512;
-        constexpr int RD_T = 64;
         constexpr int TDS = decltype(tds_tag)::value;
         constexpr int THREADS_PER_GROUP = GS / TDS;
         constexpr int KPT = decltype(kpt_tag)::value;
@@ -1092,25 +1103,27 @@ void inverse_rope_group_quant(
             constexpr int kRopeFirstG = (HEAD_DIM_T - RD_T) / GS;
             constexpr int kNopePerHd  = kGph / 2;
             const int heads_k = (scale_n % kGph == 0) ? scale_n / kGph : 0;
-            // A pass covers k_slots consecutive slots and the tier is read off
-            // its base, so the block has to be a single wave -- otherwise one
-            // pass holds both tiers and the bit stops being uniform.
+            // The kernel reads the tier off the wave's first slot, so what must
+            // not straddle a tier boundary is a wave's slots, not a block's.
             //
             // wave32 only, which is a caution rather than a constraint: wave64
             // deals its slots out contiguously instead of interleaved, so the
             // sort lands on a different set of addresses there and none of the
             // measurements behind it were taken on that placement.
+            const int slots_per_wave = std::max(wave_size / THREADS_PER_GROUP, 1);
             const bool tier_base_ok = LAYOUT == kScaleN32K4 && heads_k > 0 &&
-                                      block_size == wave_size && k_slots > 0 &&
-                                      wave_size != 64;
+                                      k_slots > 0 && wave_size != 64;
             // Run 8 cuts the head in two and needs the nope side to be a whole
-            // number of passes. Run 4 instead makes a pass one hi value, so it
-            // needs the row's heads to supply exactly one pass of 4-group runs.
+            // number of waves' slots. Run 4 instead makes a pass one hi value,
+            // so it needs the row's heads to supply exactly one pass of 4-group
+            // runs -- a pass, not a wave, which is why it is the one order that
+            // still wants the block to be a single wave.
             const bool ok8 = tier_base_ok && kNopePerHd >= 4 &&
                              kNopePerHd % 4 == 0 && kNopePerHd <= kRopeFirstG &&
-                             (heads_k * kNopePerHd) % k_slots == 0;
-            const bool ok4 = tier_base_ok && kGph % 4 == 0 &&
-                             kRopeFirstG >= kGph - 4 && heads_k * 4 == k_slots;
+                             (heads_k * kNopePerHd) % slots_per_wave == 0;
+            const bool ok4 = tier_base_ok && block_size == wave_size &&
+                             kGph % 4 == 0 && kRopeFirstG >= kGph - 4 &&
+                             heads_k * 4 == k_slots;
             // Take the finer run where it fits. The two slice widths the
             // narrow_slice heuristic picks admit different orders, and at both
             // ends the admissible one is also the faster one, so this needs no
@@ -1308,14 +1321,33 @@ void inverse_rope_group_quant(
                     "THREAD_DATA_SIZE must divide the quant group size");
 
         const int threads_per_group = GS / tds;
-        // Row and n32k4 layouts: wave32 (gfx1250) was tuned to 1 wave/block --
-        // their scale writes are already coalesced so the narrowest block
-        // spreads best there. wave64 (gfx950) regresses badly with 1-wave
-        // blocks (S*G tiny blocks -> poor occupancy/latency hiding, measured
-        // +10..26% on the row tier), so keep it as wide as the MFMA tile path.
-        const int waves_per_block = (kMfmaTile || wave64) ? 4 : 1;
         const int k_slots_min =
             std::min(std::max(wave_size / threads_per_group, 1), scale_n);
+        // Row layout on wave32 (gfx1250) was tuned to 1 wave/block -- its scale
+        // writes are already coalesced so the narrowest block spreads best.
+        // wave64 (gfx950) regresses badly with 1-wave blocks (S*G tiny blocks
+        // -> poor occupancy/latency hiding, measured +10..26% on the row tier),
+        // so keep it as wide as the MFMA tile path.
+        //
+        // n32k4 is the exception, and the axis is which tier order the launch
+        // will land on rather than its size. Two waves buy 1.4-4.1% wherever
+        // run 8 is the order (h,g=128,16: +2.0% at s=768 rising to +3.6% at
+        // 32768, worst point flat at 4096). Where run 4 fits it does not: run 4
+        // needs a pass to be one hi value, so a wider block gives it up, and
+        // run 4 at one wave beats run 8 at two by 4% at s<=512 -- the sort is
+        // worth more there than the block width is. So ask run 4's question
+        // here, on the geometry one wave would have, and widen only when the
+        // answer is no.
+        constexpr int kGphD        = HEAD_DIM_T / GS;
+        constexpr int kRopeFirstGD = (HEAD_DIM_T - RD_T) / GS;
+        const int heads_k_d = (scale_n % kGphD == 0) ? scale_n / kGphD : 0;
+        const bool run4_fits = LAYOUT == kScaleN32K4 && !wave64 &&
+                               heads_k_d > 0 && kGphD % 4 == 0 &&
+                               kRopeFirstGD >= kGphD - 4 &&
+                               heads_k_d * 4 == k_slots_min;
+        const int waves_per_block =
+            (kMfmaTile || wave64) ? 4
+                                  : ((LAYOUT == kScaleN32K4 && !run4_fits) ? 2 : 1);
         int k_slots = std::min(
             std::max(waves_per_block * wave_size / threads_per_group, 1), scale_n);
         const int64_t target_blocks = static_cast<int64_t>(get_num_cu_func()) * 4;
