@@ -59,18 +59,17 @@ void paged_attention_ragged(std::optional<std::string> folder,
 
     if(not_built(folder.value()))
     {
-        args.push_back(func_name);
-        execute_cmd(R"(python3 -m csrc.cpp_itfs.pa.pa_ragged \
-                                    --gqa_ratio={} \
-                                    --head_size={} \
-                                    --npar_loops={} \
-                                    --dtype={} \
-                                    --kv_dtype={} \
-                                    --fp8_kv_dtype={} \
-                                    --out_dtype={} \
-                                    --block_size={} \
-                                    --alibi_enabled={} \
-                                    --func_name={})", args);
+        run_codegen("csrc.cpp_itfs.pa.pa_ragged",
+                    {{"gqa_ratio", std::to_string(gqa_ratio)},
+                     {"head_size", std::to_string(head_size)},
+                     {"npar_loops", std::to_string(npar_loops)},
+                     {"dtype", dtype},
+                     {"kv_dtype", kv_dtype},
+                     {"fp8_kv_dtype", kv_cache_dtype},
+                     {"out_dtype", out_dtype},
+                     {"block_size", std::to_string(block_size)},
+                     {"alibi_enabled", alibi_enabled},
+                     {"func_name", func_name}});
     }
     run_lib(func_name,
             folder.value(),
