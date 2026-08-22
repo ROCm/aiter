@@ -1,7 +1,7 @@
 ---
 name: review-pr
-description: AI code review for aiter PRs. Catches perf regressions, silent correctness bugs, dispatch gate holes, and AI-generated code patterns. Invoke with a PR number; works through fetch → semantic understanding → rule checklist → verdict. Add new rules here as patterns emerge from real reviews.
-argument-hint: <PR number>
+description: AI code review for aiter and FlyDSL PRs. Catches perf regressions, silent correctness bugs, dispatch gate holes, and AI-generated code patterns. Invoke with a PR number (optionally owner/repo#N); works through fetch → semantic understanding → rule checklist → verdict. For kernel PRs it consumes validate-kernel-pr's validation_report.json as evidence. Add new rules here as patterns emerge from real reviews.
+argument-hint: <PR number> [owner/repo]
 ---
 
 # aiter PR Review
@@ -11,26 +11,34 @@ argument-hint: <PR number>
 ## Step 1 — Fetch
 
 ```bash
+# Per-invocation scratch dir. Fixed /tmp paths collide: two reviews running at once
+# overwrite each other's pr.diff between the write and the read, and the second review
+# silently analyses the first one's diff under its own PR number. Observed.
+WORK=$(mktemp -d /tmp/review-pr-XXXXXX)
+
 PR=$1  # PR number from skill argument
-REPO="ROCm/aiter"
+# Second argument, or a PR given as owner/repo#N, selects the repository. FlyDSL kernels
+# are reviewed from their own repo, so this must not be hard-coded to aiter.
+REPO="${2:-ROCm/aiter}"
+case "$1" in */*#*) REPO="${1%#*}"; PR="${1##*#}";; esac
 
 # Full metadata
-gh pr view $PR --repo $REPO --json title,body,number,labels,files,author,reviews,comments > /tmp/pr_meta.json
+gh pr view $PR --repo $REPO --json title,body,number,labels,files,author,reviews,comments > "$WORK/pr_meta.json"
 
 # Diff
-gh pr diff $PR --repo $REPO > /tmp/pr.diff
+gh pr diff $PR --repo $REPO > "$WORK/pr.diff"
 
 # Linked issue (extract from body "fix: #NNN" or "close #NNN")
-ISSUE=$(cat /tmp/pr_meta.json | python3 -c "
+ISSUE=$(cat "$WORK/pr_meta.json" | python3 -c "
 import json,re,sys
 body = json.load(sys.stdin).get('body','') or ''
 m = re.search(r'(?:fix|close|resolve)[s]?[: ]*#(\d+)', body, re.I)
 print(m.group(1) if m else '')
 ")
-[ -n "$ISSUE" ] && gh issue view $ISSUE --repo $REPO --json title,body > /tmp/pr_issue.json
+[ -n "$ISSUE" ] && gh issue view $ISSUE --repo $REPO --json title,body > "$WORK/pr_issue.json"
 
 # Prior reviewer comments (top-level)
-cat /tmp/pr_meta.json | python3 -c "
+cat "$WORK/pr_meta.json" | python3 -c "
 import json,sys
 d = json.load(sys.stdin)
 for r in d.get('reviews',[]):
@@ -40,6 +48,26 @@ for c in d.get('comments',[]):
     b = (c.get('body','') or '').strip()
     if b: print(f'[COMMENT {c[\"author\"][\"login\"]}] {b[:200]}')
 "
+
+# Mechanical pre-filter for rule D9 (index x stride with no 64-bit widening).
+# It runs HERE, inside the fetch step, and not where D9 is described in Step 5. A scan that
+# Step 5 asks for mid-checklist does not happen: in a 14-PR controlled run the revised D9 text
+# caught 0 of 3 known overflow defects and no run invoked the scanner at all. Put the candidate
+# list in context before the rule pass instead of relying on the reviewer to remember it.
+SCAN=.claude/skills/validate-kernel-pr/scan_index_width.py
+[ -x "$SCAN" ] && "$SCAN" --diff "$WORK/pr.diff"
+# The candidates above cannot be judged without deployment scale, and the scale facts are
+# useless 400 lines away from them -- print both together.
+cat .claude/skills/validate-kernel-pr/production_scale.md 2>/dev/null
+# FlyDSL repos only: legacy spellings, and tests this PR adds that `python3 <file>` never runs.
+S3=.claude/skills/downstream-impact-check/scan_downstream_consumers.py
+[ -x "$S3" ] && "$S3" --diff "$WORK/pr.diff" --aiter . 2>/dev/null
+
+for S2 in .claude/skills/review-flydsl-kernel/scan_legacy_spelling.py \
+          .claude/skills/review-flydsl-kernel/scan_unreachable_tests.py; do
+  [ -x "$S2" ] || continue
+  case "$S2" in *unreachable*) "$S2" --diff "$WORK/pr.diff" . ;; *) "$S2" --diff "$WORK/pr.diff" ;; esac
+done
 
 # Inline review comments (line-level code comments — often more specific than top-level)
 gh api "repos/$REPO/pulls/$PR/comments" | python3 -c "
@@ -112,7 +140,7 @@ Check which type(s) apply; these determine which Step 5 categories are mandatory
 - [ ] **Perf / benchmark PR** → P1 (numbers with units), P5 (setup cost excluded?), P2 (production shapes), P3 (reproducible)
 - [ ] **Test / benchmark only** → P2 (production shapes), HK6 (aiter-op-test format)
 - [ ] **Async / multi-stream** → G1 (stream sync missing), G1b (blocking queue.get without timeout in serving code)
-- [ ] **FlyDSL kernel** → D10 (compile result called?), D10b (arith.unwrap() before arith.bitcast?)
+- [ ] **FlyDSL kernel** → D10 (compile result called?), D10b (arith.unwrap() before arith.bitcast?), and **require a `validation_report.json`** — load `validate-kernel-pr` and treat its stages as the evidence base. A FlyDSL/Triton kernel PR reviewed without one is `[static-only review]` (see Step 8); its own green test suite is not evidence, because a suite whose non-aligned shapes are commented out passes on an out-of-bounds tail store.
 - [ ] **New if/elif dispatch with variable assignment** → D1b (UnboundLocalError on uninitialized path)
 - [ ] **Change to behavior/dispatch of a downstream-consumed op** (mla / fused_moe / attention / mha / quant / gemm_op_a8w8 / moe_op / jit-core) → E4 (is downstream CI triggered or skipped?), E5 (stable-API owner sign-off)
 - [ ] **New `@compile_ops` / `torch.library.custom_op`, or change to an op's return dtype/arity** → D7 (fake/abstract impl exists?), D6 (fake dtype/shape matches real op?)
@@ -379,9 +407,13 @@ Trigger: new Python wrapper that calls a `@compile_ops` or C-extension kernel; c
 **D9 — INT32 overflow in GPU pointer arithmetic** 🔴
 C++ kernel launcher or Python wrapper computes a buffer offset, record count, or index in `int32` (or Python `torch.int32`) when the product of dimensions can exceed 2^31 (~2 billion) at production scale.
 Common patterns: `token_id * (num_heads * head_dim)` overflows at token_id > 16M with H=32, D=128; `seq_start * K` overflows for long-context at seq_start > 256K with K=8192; gfx1250 TDM block descriptor count fields computed as Python int default to int64 — a missing `.to(torch.int32)` cast silently produces wrong offsets.
-Trigger: any arithmetic involving `token_id`, `seq_start`, `batch_offset`, or `total_tokens` that produces a buffer address or array index without an explicit widening to int64 before the multiply; or a TDM descriptor field that feeds into block offset computation without an explicit int32 cast.
+Trigger (structural, NOT a name list): any **index-shaped value multiplied by a stride-shaped value** that produces a buffer address, record count, or array index, on a line carrying no explicit 64-bit widening (`tl.int64` / `gl.int64` annotation, `.to(tl.int64)`, `Int64(...)`, `int64_t`, `static_cast<int64_t>`). Index-shaped covers anything ending in `_id`/`_idx`/`pid`, or naming a block, row, token, slot, page, or sequence position; stride-shaped covers `stride_*`, `*_pitch`, and per-element/per-row extents. Also fires on a TDM descriptor field feeding block offset computation without an explicit int32 cast.
+**Why the trigger is structural:** an earlier version of this rule listed the names `token_id`, `seq_start`, `batch_offset`, `total_tokens`. Three real defects used none of them — `stride_out_batch`, `block_id`, `physical_block`, `context_kv_idx` — and the rule stayed silent on all three (aiter#1674 ×2, aiter#3541). Do not narrow it back to a name list.
+**Production scale.** Step 1 printed `validate-kernel-pr/production_scale.md` directly beneath the candidate list: pool sizes, batch limits and stride semantics that the diff does not contain. Use those numbers to name the triggering case the 🔴 gate requires; if none of them puts the product past 2^31, clear the candidate and say so.
+
+**The candidate list is already in context.** Step 1 ran `scan_index_width.py` over the diff and printed every index×stride site with no 64-bit widening, plus every stride-like kernel param with no width annotation. Work that list: clear each candidate, and fire D9 only where you can name the production scale at which the product exceeds 2^31. If the list is empty, say so rather than skipping the category silently.
 Real examples: `out_base = token_id * num_heads * head_dim` in int32 overflows at scale (PR#3844); forward kernel uses `Int32(seq_start) * Int32(K)` while the backward kernel correctly uses int64 (PR#4113).
-→ `🔴 D9: [expr] in int32 — widen [token_id / seq_start / total_tokens] to int64 before multiplying by [stride]`
+→ `🔴 D9: [index expr] in int32 — widen [index operand] to int64 before multiplying by [stride], overflows at [concrete production scale]`
 
 **D10 — FlyDSL compile result stored but never called** 🔴
 `flyc.compile(exe, *args)` on a cache-miss path compiles and stores the `CompiledFunction` object (`exe._cf = cf`) but does NOT call it — `cf(*args)` is absent. Every first-invocation of a new (shape, arch, dtype) combination silently no-ops the entire kernel launch and returns the uninitialized `torch.empty` output to the caller with no error.
@@ -584,13 +616,18 @@ If the answer is yes, add it to the findings. If the answer is no, proceed.
 - Output ONLY the card below. Nothing before it, nothing after it.
 - If there are no findings, the findings section is omitted entirely.
 - "What it does" must be one sentence, written for a reviewer who hasn't read the diff.
+- **At most 5 findings, ordered most-severe first.** Rank by (severity, then blast radius), keep the top 5, and drop the rest — do not append them as a tail. A maintainer reads a 5-item card; a 12-item card is skimmed, and the 🔴 at position 9 is the one that gets missed. Measured: this skill averaged 7.1 findings per PR over a 14-PR backtest, and removing everything judged noise still left 5.4.
+- **State the validation evidence** on the line under the verdict:
+  - with a report: `Validation: <verdict> — <arch> runtime, <arch> compile-only` plus the stages that failed.
+  - without one: `Validation: [static-only review] — no validation_report.json`. Then no finding may assert runtime behaviour (perf, accuracy, launch failure) as fact; such findings are `[inferred]` and phrased as questions.
 
 ```
-## aiter PR #NNN — [title]
+## [repo] PR #NNN — [title]
 
 **[One sentence: what this PR does, in plain terms.]**
 
 [✅ LGTM | ⚠️ NEEDS WORK | 🔴 BLOCK]
+Validation: [PASS/NEEDS WORK/BLOCK — gfx950 runtime, gfx942 compile-only | [static-only review] — no validation_report.json]
 
 🔴 [specific finding — what, where, why it matters]
 ⚠️ [specific finding]
