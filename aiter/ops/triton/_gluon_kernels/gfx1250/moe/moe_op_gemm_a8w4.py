@@ -1003,7 +1003,7 @@ def _moe_gemm_a8w4_decode(
     # pid_n = pid_n.to(index_type)
 
     # A pointers
-    off_x_m = BLOCK_M * block_id
+    off_x_m = (BLOCK_M * block_id).to(gl.int32)  # gfx1250 TDM block offsets must be 32-bit
     if GatherIndx is None:
         X += start_m.to(index_type) * stride_x_m
     else:
@@ -1053,8 +1053,8 @@ def _moe_gemm_a8w4_decode(
         SCALE_BLOCK_N: gl.constexpr = BLOCK_N
 
     # B pointers
-    off_w_n_scale = pid_n * SCALE_BLOCK_N
-    off_w_n = pid_n * PACKED_BLOCK_N_W
+    off_w_n_scale = (pid_n * SCALE_BLOCK_N).to(gl.int32)  # gfx1250 TDM block offsets must be 32-bit
+    off_w_n = (pid_n * PACKED_BLOCK_N_W).to(gl.int32)  # gfx1250 TDM block offsets must be 32-bit
     W += expt_id.to(index_type) * stride_w_e
 
     SHARED_LAYOUT_X: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
@@ -1532,7 +1532,7 @@ def _moe_gemm_a8w4_decode(
         )
         gl.amd.gfx1250.tdm.async_load(
             bias_desc,
-            [0, pid_n * BLOCK_N],
+            [0, (pid_n * BLOCK_N).to(gl.int32)],
             bias_buffer,
         )
         TDM_BIAS_WAIT: gl.constexpr = 1
@@ -1664,7 +1664,7 @@ def _moe_gemm_a8w4_decode(
     )
     y_buffer.store(out)
     gl.amd.gfx1250.tdm.async_store(
-        y_desc, [block_id * BLOCK_M, pid_n * OUT_BLOCK_N], y_buffer
+        y_desc, [(block_id * BLOCK_M).to(gl.int32), (pid_n * OUT_BLOCK_N).to(gl.int32)], y_buffer
     )
     gl.amd.gfx1250.tdm.async_wait(0)
 
@@ -1980,7 +1980,7 @@ def _moe_gemm_a8w4_prefill(
     # pid_n = pid_n.to(index_type)
 
     # A pointers
-    off_x_m = BLOCK_M * block_id
+    off_x_m = (BLOCK_M * block_id).to(gl.int32)  # gfx1250 TDM block offsets must be 32-bit
     if GatherIndx is None:
         X += start_m.to(index_type) * stride_x_m
     else:
@@ -2026,8 +2026,8 @@ def _moe_gemm_a8w4_prefill(
         SCALE_BLOCK_N: gl.constexpr = BLOCK_N
 
     # B pointers
-    off_w_n_scale = pid_n * SCALE_BLOCK_N
-    off_w_n = pid_n * PACKED_BLOCK_N_W
+    off_w_n_scale = (pid_n * SCALE_BLOCK_N).to(gl.int32)  # gfx1250 TDM block offsets must be 32-bit
+    off_w_n = (pid_n * PACKED_BLOCK_N_W).to(gl.int32)  # gfx1250 TDM block offsets must be 32-bit
     W += expt_id.to(index_type) * stride_w_e
 
     if GatherIndx is None:
@@ -2353,7 +2353,7 @@ def _moe_gemm_a8w4_prefill(
         )
         gl.amd.gfx1250.tdm.async_load(
             bias_desc,
-            [0, pid_n * BLOCK_N],
+            [0, (pid_n * BLOCK_N).to(gl.int32)],
             bias_buffer,
         )
         TDM_BIAS_WAIT: gl.constexpr = 1
@@ -2497,6 +2497,6 @@ def _moe_gemm_a8w4_prefill(
     )
     y_buffer.store(out)
     gl.amd.gfx1250.tdm.async_store(
-        y_desc, [block_id * BLOCK_M, pid_n * OUT_BLOCK_N], y_buffer
+        y_desc, [(block_id * BLOCK_M).to(gl.int32), (pid_n * OUT_BLOCK_N).to(gl.int32)], y_buffer
     )
     gl.amd.gfx1250.tdm.async_wait(0)
