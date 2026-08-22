@@ -64,15 +64,17 @@ class OpusGemmInstance:
     # Optional generated name tag override for same-pipeline variants.
     name_tag: str = ""
     # SplitK workspace storage dtype; splitK launchers still use fp32 tune dispatch.
-    # Split-K partial type. bf16 halves what the reduce reads back and what the
-    # sweep allocates, and it clears the gate the tuner actually applies: at
-    # rtol=atol=5e-2, which is what a bf16 output gets, err_ratio measures
-    # 0.004-0.012 against a 0.05 line, flat from split_k=1 to 16 and flat across
-    # shapes. It is genuinely the coarser choice -- against a 1e-2 tolerance the
-    # same partials fail from split_k=2 on -- so a consumer needing more than the
-    # output dtype's own precision wants fp32 here instead, at twice the
-    # workspace and twice the reduce's read traffic.
-    splitk_workspace_dtype: str = "bf16_t"
+    # Split-K partial type, per kid. Keep the DEFAULT at fp32: several pipelines
+    # static_assert on it -- gfx942's em3en4_lds1_pgr2_sk among them -- so a
+    # bf16 default silently retargets every split-K family on every arch and
+    # only shows up as a compile error on the arches you did not build.
+    # The gfx1250 _ws families opt in to bf16 (see _gfx1250_ws_bf16_partial):
+    # it halves what the reduce reads back and what a sweep allocates, and it
+    # clears the gate the tuner applies -- at rtol=atol=5e-2, which is what a
+    # bf16 output gets, err_ratio measures 0.004-0.012 against a 0.05 line, flat
+    # from split_k=1 to 16. It is the coarser choice: against a 1e-2 tolerance
+    # the same partials fail from split_k=2 on.
+    splitk_workspace_dtype: str = "fp32_t"
 
     # gfx1250 cluster/TDM split-K consumer tiling: "tileN" (split N) or
     # "tileM" (split M). Only consumed by the a16w16_cluster_tdm_splitk_ws tag.
@@ -1817,6 +1819,21 @@ default_kernels_dict = {
     (-3): _a16w16(512, 256, 256, 64, 4, 16, 16, 32),  # same as a16w16 #9
 }
 # fmt: on
+
+
+# The gfx1250 _ws families are the ones that opt in to a bf16 split-K partial;
+# see splitk_workspace_dtype for what that buys and costs. Applied here rather
+# than in each constructor so the set is one list, and scoped by tag so it
+# cannot reach the gfx942/gfx950 split-K pipelines, several of which
+# static_assert an fp32 workspace.
+_GFX1250_WS_BF16_PARTIAL_TAGS = (
+    "a16w16_cluster_tdm_splitk_ws",
+    "a16w16_clusterlaunch_tdm_splitk_ws",
+)
+for _inst in kernels_list.values():
+    if _inst.kernel_tag in _GFX1250_WS_BF16_PARTIAL_TAGS:
+        _inst.splitk_workspace_dtype = "bf16_t"
+del _inst
 
 
 # Subset-compile kid taxonomy (consumed by gen_instances.py for the `HEURISTIC_DEFAULT_KIDS ?
