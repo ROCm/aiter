@@ -213,6 +213,28 @@ def biased_grouped_topk(
         )
 
 
+def biased_grouped_topk_mixed_dtype(
+    gating_output: torch.Tensor,
+    correction_bias: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    num_expert_group: int,
+    topk_group: int,
+    need_renorm: bool,
+    routed_scaling_factor: float = 1.0,
+) -> None:
+    return biased_grouped_topk(
+        gating_output,
+        correction_bias,
+        topk_weights,
+        topk_ids,
+        num_expert_group,
+        topk_group,
+        need_renorm,
+        routed_scaling_factor,
+    )
+
+
 # this one copied from sglang
 def biased_grouped_topk_torch(
     gating_output: torch.Tensor,
