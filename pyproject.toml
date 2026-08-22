@@ -65,11 +65,22 @@ exclude = [
 
 # Vendored submodules and generated/runtime output are not ours to lint. CI
 # checks out without submodules so it never saw 3rdparty/, but local runs do.
+# The two kda_* files are vendored verbatim from FlyDSL (their source of truth,
+# where they are linted/formatted); keep them byte-identical here rather than
+# reformat a copy, so exclude them like other vendored code.
 extend-exclude = [
     "3rdparty",
     "aiter/jit/build",
     "aiter_logs",
+    "aiter/ops/flydsl/kernels/kda_kernel.py",
+    "aiter/ops/flydsl/kernels/kda_split.py",
 ]
+
+[tool.black]
+# Match ruff: the vendored FlyDSL KDA kernels are formatted upstream, so keep
+# them byte-identical here instead of reformatting a copy. force-exclude applies
+# even when the paths are passed explicitly (as the psf/black CI action does).
+force-exclude = 'aiter/ops/flydsl/kernels/(kda_kernel|kda_split)\.py'
 
 [tool.setuptools_scm]
 write_to = "aiter/_version.py"
