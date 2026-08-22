@@ -304,16 +304,17 @@ def shuffle_scale_f4(
     """
     tile_major = 8 if intype == 8 else 4
     tile_minor = 32
-    M, N = src.shape
-
-    tiles_m = M // tile_minor
-    tiles_n = N // tile_major
-
-    # src[tileM*minor + m, tileN*major + k] -> [tileM, m, tileN, k]
-    out = src.view(tiles_m, tile_minor, tiles_n, tile_major)
-    # -> [tileM, tileN, m, k] (m outer, k inner) per moe_shuffle_one
-    out = out.permute(0, 2, 1, 3).contiguous()
-    return out.view(M, N)
+    x_type = src.dtype
+    s = src.view(torch.uint8)
+    # Shader loads scales in 32-row super-rows and 128-K super-columns, so pad
+    # rows up to 32 and cols (K/block) up to tile_major (=128/block) with 0,
+    # matching the POC host ScaleA row/stride padding. No-op when aligned.
+    row_pad = (-s.shape[0]) % tile_minor
+    col_pad = (-s.shape[1]) % tile_major
+    if row_pad or col_pad:
+        s = F.pad(s, (0, col_pad, 0, row_pad), value=0)
+    out = _moe_tile_shuffle(s, tile_minor=tile_minor, tile_major=tile_major)
+    return out.view(x_type)
 
 
 def shuffle_weight_f4(src: torch.Tensor) -> torch.Tensor:
