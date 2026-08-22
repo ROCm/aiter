@@ -2632,15 +2632,15 @@ def flydsl_moe_fused_route_quant_scatter(
     numel = token_num * topk
     model_dim = hidden_states.shape[-1]
     rows_per_tile = wmma_rep * 16
-    assert (
-        max_m % rows_per_tile == 0
-    ), f"max_m ({max_m}) must be a multiple of wmma_rep*16 ({rows_per_tile})"
+    assert max_m % rows_per_tile == 0, (
+        f"max_m ({max_m}) must be a multiple of wmma_rep*16 ({rows_per_tile})"
+    )
 
     out_E = E if out_E is None else int(out_E)
     out_max_m = max_m if out_max_m is None else int(out_max_m)
-    assert (
-        out_max_m % rows_per_tile == 0
-    ), f"out_max_m ({out_max_m}) must be a multiple of wmma_rep*16 ({rows_per_tile})"
+    assert out_max_m % rows_per_tile == 0, (
+        f"out_max_m ({out_max_m}) must be a multiple of wmma_rep*16 ({rows_per_tile})"
+    )
 
     payload_bytes_per_row = model_dim if quant_mode == "fp8" else model_dim // 2
     scale_bytes_per_row = model_dim // 32
@@ -2693,9 +2693,9 @@ def flydsl_moe_fused_route_quant_scatter(
     )
 
     if use_routeks_stage1:
-        assert (
-            not use_g2l
-        ), "EP g2l fusion is not implemented on the routeks stage1 path"
+        assert not use_g2l, (
+            "EP g2l fusion is not implemented on the routeks stage1 path"
+        )
         topids_to_rows_kernel = _get_compiled_topids_to_rows()
         topids_to_rows_kernel(
             ptr_arg(topk_ids_i32),
@@ -2958,6 +2958,8 @@ def _get_compiled_fused_quant_preshuffle_route_ksplit(
     source_topk: int = 0,
     remap_rows: bool = False,
     ksplit: bool = True,
+    prequantized: bool = False,
+    wire_stride: int = 0,
 ):
     from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
         build_moe_fused_quant_preshuffle_route_ksplit_module,
@@ -2970,6 +2972,8 @@ def _get_compiled_fused_quant_preshuffle_route_ksplit(
         source_topk=source_topk,
         remap_rows=remap_rows,
         ksplit=ksplit,
+        prequantized=prequantized,
+        wire_stride=wire_stride,
     )
 
 
@@ -2990,25 +2994,45 @@ def flydsl_moe_fused_quant_preshuffle(
     num_valid_routes: (
         torch.Tensor | None
     ) = None,  # (1,) int32; route-branch only: skip routes >= this (EP dead-tail)
+    prequant_wire_stride: int = 0,  # >0: grouped_in is uint8 wire rows this wide
+    feat_dim: int | None = None,  # required when prequantized
 ):
     """Fused grouped quant + e8m0 scale-preshuffle in one kernel pass.
 
     Returns (payload, scale_preshuffle). Pass masked_m to skip padding rows.
+
+    ``prequant_wire_stride`` says the rows arrive already quantized -- uint8 wire
+    rows of MX payload followed by row-major e8m0 scales, which is what an EP
+    dispatch that quantized on the sender delivers. The pass then only routes and
+    preshuffles; the quant math is skipped. Route branch only, and ``feat_dim``
+    has to be given since the row width is the wire stride, not the feature dim.
     """
     if quant_mode not in ("fp4", "fp8"):
         raise NotImplementedError(
             f"flydsl_moe_fused_quant_preshuffle: quant_mode={quant_mode!r} "
             "unsupported (expected 'fp4' or 'fp8')."
         )
-    assert (
-        grouped_in.dtype == torch.bfloat16
-    ), f"fused grouped quant+preshuffle requires bf16 input (got {grouped_in.dtype})"
+    if prequant_wire_stride:
+        if topids_to_rows is None:
+            raise NotImplementedError(
+                "prequantized input is only wired for the route branch"
+            )
+        assert grouped_in.dtype == torch.uint8, (
+            "prequantized quant+preshuffle requires a uint8 wire buffer "
+            f"(got {grouped_in.dtype})"
+        )
+        if feat_dim is None:
+            raise ValueError("feat_dim is required when prequant_wire_stride is set")
+    else:
+        assert grouped_in.dtype == torch.bfloat16, (
+            f"fused grouped quant+preshuffle requires bf16 input (got {grouped_in.dtype})"
+        )
+        feat_dim = grouped_in.shape[-1]
     device = grouped_in.device
-    feat_dim = grouped_in.shape[-1]
     rows_per_tile = wmma_rep * 16
-    assert (
-        max_m % rows_per_tile == 0
-    ), f"max_m ({max_m}) must be a multiple of wmma_rep*16 ({rows_per_tile})"
+    assert max_m % rows_per_tile == 0, (
+        f"max_m ({max_m}) must be a multiple of wmma_rep*16 ({rows_per_tile})"
+    )
 
     n_rows = E * max_m
     Pb = feat_dim if quant_mode == "fp8" else feat_dim // 2
@@ -3057,6 +3081,8 @@ def flydsl_moe_fused_quant_preshuffle(
             source_topk=source_topk,
             remap_rows=remap_rows,
             ksplit=use_ksplit,
+            prequantized=bool(prequant_wire_stride),
+            wire_stride=int(prequant_wire_stride),
         )
         # Dead-tail skip (EP dynamic token count): routes >= num_valid_routes are
         # padding rows of the dispatch buffer and are not gathered/quantized. When

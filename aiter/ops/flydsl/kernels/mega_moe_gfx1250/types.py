@@ -10,6 +10,7 @@ import torch
 
 _DTYPE_INFO = {
     torch.int8: ("|i1", 1, None),
+    torch.uint8: ("|u1", 1, None),
     torch.int16: ("<i2", 2, None),
     torch.int32: ("<i4", 4, None),
     torch.float32: ("<f4", 4, None),
@@ -41,6 +42,44 @@ def _from_gpu_ptr(pointer: int, shape, dtype: torch.dtype) -> torch.Tensor:
         return raw.view(reinterpret_dtype).reshape(shape)
     view = GpuPointerView(pointer, shape, typestr)
     return torch.as_tensor(view, device=f"cuda:{device}")
+
+
+@dataclass(frozen=True, slots=True)
+class Stage1PrequantContext:
+    """Says that ``hidden_states`` is a dispatch wire buffer, not bf16 rows.
+
+    Quantizing before dispatch instead of after it roughly halves what crosses
+    the fabric, and costs nothing in accuracy: a token is quantized once either
+    way, on the same values. What it does cost is the layout. The MX scales that
+    gemm1 wants are interleaved across ``wmma_rep*16`` consecutive destination
+    rows, and a sender cannot know a token's destination row -- the receiver
+    assigns it only after sorting every peer's routes by expert. So the wire
+    carries plain row-major scales appended to each payload row, and the
+    receiver's gather applies the preshuffle on the way into the GEMM layout.
+
+    ``stride_bytes`` is the whole wire row; the payload occupies the first
+    ``payload_bytes`` and the e8m0 scales the rest.
+    """
+
+    stride_bytes: int
+    payload_bytes: int
+
+    def __post_init__(self):
+        if self.payload_bytes <= 0:
+            raise ValueError("payload_bytes must be positive")
+        scale_bytes = self.stride_bytes - self.payload_bytes
+        if scale_bytes <= 0:
+            raise ValueError(
+                f"wire row of {self.stride_bytes}B leaves no room for the scales "
+                f"of a {self.payload_bytes}B payload"
+            )
+        if self.payload_bytes % 32:
+            raise ValueError("an MX payload row must be a whole number of blocks")
+        if scale_bytes < self.payload_bytes // 32:
+            raise ValueError(
+                f"{scale_bytes}B of scales is short of the "
+                f"{self.payload_bytes // 32} e8m0 bytes the payload needs"
+            )
 
 
 @dataclass(frozen=True, slots=True)
