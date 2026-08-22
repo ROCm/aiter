@@ -94,6 +94,7 @@ def context_attention_fwd(
     assert Lq == Lk and Lk == Lv
     # round up Lk to a power of 2 - this is required for Triton block size
     Lk_padded = triton.next_power_of_2(Lk)
+    num_warps = 2 if Lk_padded <= 64 else NUM_WARPS
 
     if sm_scale is None:
         sm_scale = 1.0 / (Lq**0.5)
@@ -154,7 +155,7 @@ def context_attention_fwd(
             BLOCK_DMODEL_PADDED=Lk_padded,
             BLOCK_N=BLOCK,
             SKIP_DECODE=skip_decode,
-            num_warps=NUM_WARPS,
+            num_warps=num_warps,
             waves_per_eu=2,
             num_stages=1,
         )
@@ -206,7 +207,7 @@ def context_attention_fwd(
         BLOCK_N=BLOCK,
         SLIDING_WINDOW=sliding_window,
         SKIP_DECODE=skip_decode,
-        num_warps=NUM_WARPS,
+        num_warps=num_warps,
         waves_per_eu=2,
         num_stages=1,
     )
