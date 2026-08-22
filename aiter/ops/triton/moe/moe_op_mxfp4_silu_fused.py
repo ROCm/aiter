@@ -36,6 +36,11 @@ def fused_moe_mxfp4_silu(
     swizzle_mx_b: bool,
     config: dict[str, Any],
     compute_type: tl.dtype,
+    *,
+    input_row_divisor: int | None = None,
+    num_valid_routes: int | None = None,
+    quantize_a_to_mxfp4: bool = False,
+    swiglu_limit: float | None = None,
 ) -> None:
     """
     Fused MoE computation with MXFP4 quantization and SiLU activation.
@@ -60,6 +65,14 @@ def fused_moe_mxfp4_silu(
         config (Dict[str, Any]): Kernel tuning parameters (BLOCK_SIZE_M, BLOCK_SIZE_N,
             BLOCK_SIZE_K, GROUP_SIZE_M).
         compute_type (tl.dtype): Computation dtype for accumulation.
+        input_row_divisor (Optional[int]): Maps a route ID to an A row with
+            ``route_id // input_row_divisor``. Defaults to ``top_k``.
+        num_valid_routes (Optional[int]): Exclusive upper bound for valid route IDs.
+            Defaults to ``topk_ids.numel()``.
+        quantize_a_to_mxfp4 (bool): Quantize BF16/FP16 A tiles to MXFP4 in the
+            kernel before the scaled dot product.
+        swiglu_limit (Optional[float]): If positive, clamp gate to ``limit`` and
+            up to ``[-limit, limit]`` before applying SwiGLU.
 
     Returns:
         None. Results written in-place to C with SiLU activation applied.
@@ -74,6 +87,12 @@ def fused_moe_mxfp4_silu(
     )
     assert topk_weights.stride(1) == 1
     assert sorted_token_ids.stride(0) == 1
+    if input_row_divisor is None:
+        input_row_divisor = top_k
+    assert input_row_divisor > 0
+    if num_valid_routes is None:
+        num_valid_routes = topk_ids.numel()
+    assert num_valid_routes >= 0
 
     assert A_scale is not None
     assert B_scale is not None
@@ -92,7 +111,10 @@ def fused_moe_mxfp4_silu(
         # We assume that top_ids of each token is unique, so
         # so num_valid_experts <= batch_size <= BLOCK_SIZE_M,
         # and we can skip some invalid blocks.
-        EM = min(sorted_token_ids.shape[0], A.shape[0] * top_k * config["BLOCK_SIZE_M"])
+        EM = min(
+            sorted_token_ids.shape[0],
+            A.shape[0] * input_row_divisor * config["BLOCK_SIZE_M"],
+        )
 
     A_tl_dtype = torch_to_triton_dtype[A.dtype]
     A_DTYPE_FORMAT = get_scaled_dot_format_string(A_tl_dtype)
@@ -117,7 +139,7 @@ def fused_moe_mxfp4_silu(
         num_tokens_post_padded,
         B.shape[1],
         A.shape[1],
-        topk_ids.numel(),
+        num_valid_routes,
         A.stride(0),
         A.stride(1),
         B.stride(0),
@@ -134,6 +156,9 @@ def fused_moe_mxfp4_silu(
         B_DTYPE_FORMAT=B_DTYPE_FORMAT,
         MUL_ROUTED_WEIGHT=mul_routed_weight,
         top_k=top_k,
+        A_ROW_DIVISOR=input_row_divisor,
+        QUANTIZE_A_TO_MXFP4=quantize_a_to_mxfp4,
+        SWIGLU_LIMIT=0.0 if swiglu_limit is None else float(swiglu_limit),
         compute_type=compute_type,
         SWIZZLE_MX_A=swizzle_mx_a,  # TODO add swizzle support
         SWIZZLE_MX_B=swizzle_mx_b,  # TODO add swizzle support
