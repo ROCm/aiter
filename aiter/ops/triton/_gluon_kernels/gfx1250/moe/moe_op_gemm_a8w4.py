@@ -20,6 +20,7 @@ _MOE_GEMM_A8W4_REPR_KEYS = [
     "num_warps",
     "NUM_BUFFERS",
     "HAS_MX_OUT",
+    "EP_SCATTER",
 ]
 
 _moe_gemm_a8w4_prefill_repr = make_kernel_repr(
@@ -30,8 +31,12 @@ _moe_gemm_a8w4_decode_repr = make_kernel_repr(
     "_moe_gemm_a8w4_decode", _MOE_GEMM_A8W4_REPR_KEYS
 )
 
+# The persistent decode kernel has no EP_SCATTER epilogue (its writeback sits
+# inside the N-tile loop on a rolling descriptor), so it must not advertise the
+# flag in its name -- the wrapper routes ep_scatter away from it.
 _moe_gemm_a8w4_decode_persistent_repr = make_kernel_repr(
-    "_moe_gemm_a8w4_decode_persistent", _MOE_GEMM_A8W4_REPR_KEYS
+    "_moe_gemm_a8w4_decode_persistent",
+    [k for k in _MOE_GEMM_A8W4_REPR_KEYS if k != "EP_SCATTER"],
 )
 
 
@@ -949,6 +954,10 @@ def _moe_gemm_a8w4_decode(
     stride_y_mx_m=0,
     stride_y_mx_n=0,
     HAS_MX_OUT: gl.constexpr = False,
+    # Expert-parallel combine: (M,) int32 destination row in `Y` for each sorted
+    # row, negative where the row must not be delivered. See EP_SCATTER.
+    DstRow=None,
+    EP_SCATTER: gl.constexpr = False,
 ):
 
     is_x_microscaled: gl.constexpr = XMxScale is not None
@@ -1648,25 +1657,54 @@ def _moe_gemm_a8w4_decode(
     else:
         out = out.to(tl.bfloat16)
 
-    # TDM Store: accumulator → shared memory → global memory
-    Y += start_m.to(index_type) * stride_y_m
-    y_buffer = gl.allocate_shared_memory(
-        Y.type.element_ty,
-        shape=[BLOCK_M, OUT_BLOCK_N],
-        layout=SHARED_LAYOUT_Y,
-    )
-    y_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-        base=Y,
-        shape=(M, yN),
-        strides=(stride_y_m, stride_y_n),
-        block_shape=(BLOCK_M, OUT_BLOCK_N),
-        layout=SHARED_LAYOUT_Y,
-    )
-    y_buffer.store(out)
-    gl.amd.gfx1250.tdm.async_store(
-        y_desc, [block_id * BLOCK_M, pid_n * OUT_BLOCK_N], y_buffer
-    )
-    gl.amd.gfx1250.tdm.async_wait(0)
+    if EP_SCATTER:
+        # Expert-parallel combine: this tile's rows leave for arbitrary rows of a
+        # peer combine-staging window rather than for their slot in a contiguous Y
+        # tile, so there is no block move left to hand TDM -- address each row
+        # from its own destination. That is the whole point of the flag: the rows
+        # are already in registers here, so the separate `_scatter_grouped` pass
+        # over (M x hidden) disappears.
+        #
+        # Gammas was applied above, exactly as on the reduce path, so rows land
+        # already route-weighted and the peer's combine sum stays unweighted.
+        offs_m_d = BLOCK_M * block_id + gl.arange(0, BLOCK_M)
+        dst = gl.amd.gfx1250.buffer_load(
+            DstRow + start_m, offs_m_d, mask=offs_m_d < M, other=-1
+        )
+        offs_n_d = pid_n * OUT_BLOCK_N + gl.arange(0, OUT_BLOCK_N)
+        # int64 on the row term only: dst * stride_y_m spans every peer's slot
+        # region of the symmetric window, which overflows int32 at realistic
+        # hidden sizes -- the same reason _scatter_grouped upcasts. The column
+        # term is bounded by yN and stays 32-bit.
+        gl.store(
+            Y
+            + dst[:, None].to(gl.int64) * stride_y_m
+            + offs_n_d[None, :] * stride_y_n,
+            out,
+            # dst < 0 covers both the tile's padding rows (offs_m_d >= M, loaded
+            # as -1 above) and the rows this rank must not deliver.
+            mask=(dst[:, None] >= 0) & (offs_n_d[None, :] < yN),
+        )
+    else:
+        # TDM Store: accumulator → shared memory → global memory
+        Y += start_m.to(index_type) * stride_y_m
+        y_buffer = gl.allocate_shared_memory(
+            Y.type.element_ty,
+            shape=[BLOCK_M, OUT_BLOCK_N],
+            layout=SHARED_LAYOUT_Y,
+        )
+        y_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+            base=Y,
+            shape=(M, yN),
+            strides=(stride_y_m, stride_y_n),
+            block_shape=(BLOCK_M, OUT_BLOCK_N),
+            layout=SHARED_LAYOUT_Y,
+        )
+        y_buffer.store(out)
+        gl.amd.gfx1250.tdm.async_store(
+            y_desc, [block_id * BLOCK_M, pid_n * OUT_BLOCK_N], y_buffer
+        )
+        gl.amd.gfx1250.tdm.async_wait(0)
 
 
 def get_moe_a8w4_layouts(
@@ -1924,6 +1962,10 @@ def _moe_gemm_a8w4_prefill(
     DOT_LAYOUT_X_SCALES: gl.constexpr = None,
     SHARED_LAYOUT_X_SCALES: gl.constexpr = None,
     X_SCALES_LOAD_LAYOUT: gl.constexpr = None,
+    # Expert-parallel combine: (M,) int32 destination row in `Y` for each sorted
+    # row, negative where the row must not be delivered. See EP_SCATTER.
+    DstRow=None,
+    EP_SCATTER: gl.constexpr = False,
 ):
 
     is_x_microscaled: gl.constexpr = XMxScale is not None
@@ -2481,22 +2523,51 @@ def _moe_gemm_a8w4_prefill(
     else:
         out = out.to(tl.bfloat16)
 
-    # TDM Store: accumulator → shared memory → global memory
-    Y += start_m.to(index_type) * stride_y_m
-    y_buffer = gl.allocate_shared_memory(
-        Y.type.element_ty,
-        shape=[BLOCK_M, OUT_BLOCK_N],
-        layout=SHARED_LAYOUT_Y,
-    )
-    y_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-        base=Y,
-        shape=(M, yN),
-        strides=(stride_y_m, stride_y_n),
-        block_shape=(BLOCK_M, OUT_BLOCK_N),
-        layout=SHARED_LAYOUT_Y,
-    )
-    y_buffer.store(out)
-    gl.amd.gfx1250.tdm.async_store(
-        y_desc, [block_id * BLOCK_M, pid_n * OUT_BLOCK_N], y_buffer
-    )
-    gl.amd.gfx1250.tdm.async_wait(0)
+    if EP_SCATTER:
+        # Expert-parallel combine: this tile's rows leave for arbitrary rows of a
+        # peer combine-staging window rather than for their slot in a contiguous Y
+        # tile, so there is no block move left to hand TDM -- address each row
+        # from its own destination. That is the whole point of the flag: the rows
+        # are already in registers here, so the separate `_scatter_grouped` pass
+        # over (M x hidden) disappears.
+        #
+        # Gammas was applied above, exactly as on the reduce path, so rows land
+        # already route-weighted and the peer's combine sum stays unweighted.
+        offs_m_d = BLOCK_M * block_id + gl.arange(0, BLOCK_M)
+        dst = gl.amd.gfx1250.buffer_load(
+            DstRow + start_m, offs_m_d, mask=offs_m_d < M, other=-1
+        )
+        offs_n_d = pid_n * OUT_BLOCK_N + gl.arange(0, OUT_BLOCK_N)
+        # int64 on the row term only: dst * stride_y_m spans every peer's slot
+        # region of the symmetric window, which overflows int32 at realistic
+        # hidden sizes -- the same reason _scatter_grouped upcasts. The column
+        # term is bounded by yN and stays 32-bit.
+        gl.store(
+            Y
+            + dst[:, None].to(gl.int64) * stride_y_m
+            + offs_n_d[None, :] * stride_y_n,
+            out,
+            # dst < 0 covers both the tile's padding rows (offs_m_d >= M, loaded
+            # as -1 above) and the rows this rank must not deliver.
+            mask=(dst[:, None] >= 0) & (offs_n_d[None, :] < yN),
+        )
+    else:
+        # TDM Store: accumulator → shared memory → global memory
+        Y += start_m.to(index_type) * stride_y_m
+        y_buffer = gl.allocate_shared_memory(
+            Y.type.element_ty,
+            shape=[BLOCK_M, OUT_BLOCK_N],
+            layout=SHARED_LAYOUT_Y,
+        )
+        y_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+            base=Y,
+            shape=(M, yN),
+            strides=(stride_y_m, stride_y_n),
+            block_shape=(BLOCK_M, OUT_BLOCK_N),
+            layout=SHARED_LAYOUT_Y,
+        )
+        y_buffer.store(out)
+        gl.amd.gfx1250.tdm.async_store(
+            y_desc, [block_id * BLOCK_M, pid_n * OUT_BLOCK_N], y_buffer
+        )
+        gl.amd.gfx1250.tdm.async_wait(0)

@@ -34,10 +34,17 @@ class EpCombineScatter:
     Handing both to the GEMM (rather than reducing and letting the caller scatter)
     is what removes a full pass over the output: the rows are already in registers
     when their destination is known.
+
+    ``fused`` asks the GEMM epilogue to place the rows itself, so no
+    ``_scatter_grouped`` launch happens at all. It needs a kernel with the
+    EP_SCATTER epilogue (currently the gfx1250 gluon a8w4 prefill/decode
+    kernels); every other path ignores it and runs the standalone scatter, which
+    produces the same bytes either way. Set it False to A/B the two.
     """
 
     out: torch.Tensor
     dst_row: torch.Tensor
+    fused: bool = True
 
     def __post_init__(self):
         if self.out.ndim != 2:
