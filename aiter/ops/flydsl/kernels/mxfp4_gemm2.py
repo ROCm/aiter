@@ -365,6 +365,9 @@ def _gemm2_body(
     _asc_chunk_div = 16 if const_expr(BM == 16) else 32
     _asc_per_mb = (BM // _asc_chunk_div) * _kAS_per_chunk_dw * 4
     _bq_bytes = bq_bytes_for(NE, N_OUT, _K)
+    # Raw-pointer B loads once B outgrows a buffer resource. No name tag needed: this is
+    # a function of NE/N_OUT/K, all three of which the kernel name already carries.
+    _use_bqptr64 = _bq_bytes >= (1 << 31)
     _bscale_bytes = bscale_bytes_for(NE, N_OUT, _K)
     _kbs_per_expert_dw = kbs_per_expert_dw_for(N_OUT, _K)
     _num_n_blocks = num_n_blocks_for(N_OUT, BN)
@@ -379,7 +382,24 @@ def _gemm2_body(
 
     _asc_num = arith.index_cast(T.index, _raw(i32_max_m_blocks)) * fx.Index(_asc_per_mb)
     ascale_rsrc = _buffer_rsrc(arg_ascale, _asc_num)
-    bq_rsrc = _buffer_rsrc(arg_bq, fx.Index(_bq_bytes))
+    # The soffset below used to carry `e * N_OUT * _K_HALF`, which overflows i32 at a
+    # large expert count (4.9e9 at NE=896, N_OUT=3584, _K_HALF=1536). Fold the expert
+    # into the descriptor's 64-bit base and keep the soffset expert-relative.
+    _bq_per_expert = _bq_bytes // NE
+    assert _bq_per_expert == N_OUT * _K_HALF, (
+        f"mxfp4 gemm2 per-expert B bytes {_bq_per_expert} != N_OUT*K_HALF "
+        f"({N_OUT * _K_HALF}); the expert-relative soffset below assumes they match"
+    )
+    # Stay on buffer_load while B fits, for its hardware bounds check; 2 GB rather than
+    # 4 because the signed index math breaks first. Either way the expert base is added
+    # in 64-bit, which is what removes the wrap.
+    _bq_expert_base = arg_bq + fx.Int64(e) * fx.Int64(_bq_per_expert)
+    if const_expr(_use_bqptr64):
+        bq_rsrc = None
+        bq_base_ptr = buffer_ops.create_llvm_ptr(_bq_expert_base, address_space=1)
+    else:
+        bq_rsrc = _buffer_rsrc(_bq_expert_base, fx.Index(_bq_per_expert))
+        bq_base_ptr = None
     bscale_rsrc = _buffer_rsrc(arg_bscale, fx.Index(_bscale_bytes))
 
     # Sequential LDS layout: saq bytes at offset 0, f32 accumulator after them.
@@ -391,11 +411,9 @@ def _gemm2_body(
 
     b_load_s_base = []
     for j in range_constexpr(4):
+        # expert-relative: bq_rsrc is already re-based to this expert
         v = (
-            e * fx.Int32(N_OUT)
-            + n_block_idx * fx.Int32(BN)
-            + wave * fx.Int32(BN // 4)
-            + fx.Int32(j * 16)
+            n_block_idx * fx.Int32(BN) + wave * fx.Int32(BN // 4) + fx.Int32(j * 16)
         ) * fx.Int32(_K_HALF)
         b_load_s_base.append(rocdl.readfirstlane(T.i32, v))
 
@@ -455,14 +473,25 @@ def _gemm2_body(
             for half in range_constexpr(2):
                 if const_expr(kt * 2 + half >= _n_real_half):
                     continue
-                frag = buffer_ops.buffer_load(
-                    bq_rsrc,
-                    (v_voff_b + fx.Int32(half * 1024)) // fx.Int32(4),
-                    vec_width=4,
-                    dtype=T.i32,
-                    cache_modifier=b_aux,
-                    soffset_bytes=b_load_s_base[j],
-                )
+                if const_expr(_use_bqptr64):
+                    frag = buffer_ops.global_load_dwords(
+                        bq_base_ptr,
+                        arith.index_cast(
+                            T.index,
+                            v_voff_b + fx.Int32(half * 1024) + b_load_s_base[j],
+                        ),
+                        vec_width=4,
+                        cache_modifier=b_aux,
+                    )
+                else:
+                    frag = buffer_ops.buffer_load(
+                        bq_rsrc,
+                        (v_voff_b + fx.Int32(half * 1024)) // fx.Int32(4),
+                        vec_width=4,
+                        dtype=T.i32,
+                        cache_modifier=b_aux,
+                        soffset_bytes=b_load_s_base[j],
+                    )
                 out[j][half] = Vec(frag)
         return out
 

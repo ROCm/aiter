@@ -266,6 +266,53 @@ def get_element_ptr(
     ).result
 
 
+@dsl_loc_tracing
+def global_load_dwords(
+    base_ptr,
+    byte_offset,
+    *,
+    vec_width: int,
+    cache_modifier: int = 0,
+    address_space: int = 1,
+):
+    """Load ``vec_width`` i32 dwords from a global pointer via GEP + ``llvm.load``.
+
+    Counterpart to :func:`buffer_load` for offsets past 4 GB: the GEP forms the
+    address in full 64-bit, where a buffer resource's voffset is 32-bit. Lowers to
+    ``global_load_dwordxN``. There is **no hardware bounds check** -- a buffer
+    clamps to ``num_records``, a raw pointer does not -- so the caller owns keeping
+    ``byte_offset`` inside the allocation.
+
+    Args:
+        base_ptr: Allocation base; an ``!llvm.ptr``, or an address converted to one
+            in ``address_space``.
+        byte_offset: Byte offset from ``base_ptr``. Pass as index/i64 so it is not
+            truncated before reaching the GEP.
+        vec_width: Number of i32 dwords (1, 2 or 4).
+        cache_modifier: As :func:`buffer_load`. Bit 1 (value 2) is the non-temporal
+            hint; other bits have no ``llvm.load`` equivalent and are ignored.
+
+    Requires ``base_ptr + byte_offset`` aligned to ``vec_width * 4``, which the
+    emitted ``alignment`` asserts. Understating alignment to LLVM is undefined
+    behaviour, so this is a precondition rather than a hint.
+    """
+    if vec_width not in (1, 2, 4):
+        raise ValueError(f"vec_width must be 1, 2 or 4, got {vec_width}")
+
+    base_ptr = _unwrap_value(base_ptr)
+    if not str(base_ptr.type).startswith("!llvm.ptr"):
+        base_ptr = create_llvm_ptr(base_ptr, address_space=address_space)
+
+    ptr = get_element_ptr(base_ptr, byte_offset, elem_type=T.i8())
+    load_bytes = int(vec_width) * 4
+    return llvm.LoadOp(
+        ir.VectorType.get([int(vec_width)], ir.IntegerType.get_signless(32)),
+        ptr,
+        alignment=load_bytes,
+        nontemporal=bool(int(cache_modifier) & 2),
+    ).result
+
+
 class BufferResourceDescriptor:
     """AMD Buffer Resource Descriptor
 
