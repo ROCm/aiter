@@ -42,6 +42,13 @@ _GLUON_REDUCE_MAX_SEGMENTS = 8
 
 DEVICE_ARCH = arch_info.get_arch()
 IS_DEVICE_ARCH_GFX12 = DEVICE_ARCH in ("gfx1250",)
+
+# gfx950 has a FlyDSL fp8 paged backend for this op; see
+# aiter/ops/flydsl/unified_attention_kernels.py. Reuses DEVICE_ARCH, already
+# resolved above, rather than running a second detector at import time. The
+# adapter import stays inside the dispatch branch, so a non-gfx950 host never
+# touches flydsl at all. Patch this to False to A/B against Triton.
+_FLYDSL_UNIFIED_ATTN_ARCH = DEVICE_ARCH == "gfx950"
 WARP_SIZE = 32 if IS_DEVICE_ARCH_GFX12 else 64
 WAPR_SIZE_LOG2 = int(math.log2(WARP_SIZE))
 
@@ -330,8 +337,6 @@ def unified_attention(
     shuffled_kv_cache: bool = False,
     skip_reduce: bool = False,
 ):
-    assert causal, "Only causal attention is supported"
-
     use_alibi_slopes = alibi_slopes is not None
     use_qq_bias = qq_bias is not None
     SLIDING_WINDOW = 1 + window_size[0]
@@ -383,6 +388,59 @@ def unified_attention(
     num_seqs = len(seqused_k)
     num_queries_per_kv = num_query_heads // num_kv_heads
 
+    # FlyDSL fp8 paged backend (gfx950). Placed here because the layout unpack
+    # above has resolved everything it needs and nothing has launched yet. It
+    # returns None for any configuration it cannot serve, so unsupported shapes
+    # fall through to Triton below with no behaviour change.
+    if _FLYDSL_UNIFIED_ATTN_ARCH:
+        # FlyDSL is an optional dependency (imports flydsl transitively). If it
+        # isn't installed, fall through to Triton rather than raising on the
+        # import -- the adapter's own is_flydsl_available() gate can only run
+        # once the module is imported, so the import itself must be guarded.
+        try:
+            from aiter.ops.flydsl.unified_attention_kernels import (
+                flydsl_unified_attention,
+            )
+        except ImportError:
+            flydsl_unified_attention = None
+
+        if flydsl_unified_attention is not None:
+            _flydsl_out = flydsl_unified_attention(
+                q,
+                k,
+                v,
+                out,
+                cu_seqlens_q,
+                max_seqlen_q,
+                seqused_k,
+                max_seqlen_k,
+                softmax_scale,
+                causal,
+                window_size,
+                block_table,
+                softcap,
+                q_descale,
+                k_descale,
+                v_descale,
+                num_kv_heads=num_kv_heads,
+                block_size=block_size,
+                num_queries_per_kv=num_queries_per_kv,
+                num_seqs=num_seqs,
+                q_scales=q_scales,
+                alibi_slopes=alibi_slopes,
+                output_scale=output_scale,
+                qq_bias=qq_bias,
+                sinks=sinks,
+                shuffled_kv_cache=shuffled_kv_cache,
+                skip_reduce=skip_reduce,
+            )
+            if _flydsl_out is not None:
+                return _flydsl_out
+
+    # FlyDSL declined (or this isn't gfx950); the Triton fallback below only
+    # implements the causal mask.
+    assert causal, "Only causal attention is supported"
+
     BLOCK_M = (
         16 if num_queries_per_kv <= 16 else triton.next_power_of_2(num_queries_per_kv)
     )
@@ -406,6 +464,7 @@ def unified_attention(
         total_num_q_blocks = num_tokens // BLOCK_Q + num_seqs
     num_2d_prgms = total_num_q_blocks * num_kv_heads
     ALL_DECODE = int(max_seqlen_q) == 1
+
     # if batch contains a prefill
     if use_2d_kernel(
         head_size,

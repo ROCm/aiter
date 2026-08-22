@@ -145,3 +145,11 @@ pip install -r requirements-triton-comms.txt
 ```
 
 For more details, see [docs/triton_comms.md](docs/triton_comms.md).
+
+## Environment variables
+
+Runtime tuning knobs (build-time variables are noted under [Installation](#installation)):
+
+| Variable | Default | Description |
+|---|---|---|
+| `AITER_UNIFIED_ATTN_MAX_KV_SPLITS` | `16` | Caps the auto-dispatched split-K count for the FlyDSL fp8 `unified_attention` decode path. Raise (e.g. `32`) for long-context, small-batch decode: the split heuristic keys on machine fill, not KV depth, so very long contexts benefit from a higher cap. |

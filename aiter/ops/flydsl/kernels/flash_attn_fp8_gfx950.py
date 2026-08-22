@@ -1,0 +1,945 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2025 FlyDSL Project Contributors
+# Modifications Copyright (C) 2026 Advanced Micro Devices, Inc.
+
+"""gfx950 DUALWAVE_SWP FP8 flash attention, adapted and extended from FlyDSL.
+
+Helpers live in ``flash_attn_dualwave_common.py``.
+
+Upstream: FlyDSL ``kernels/attention/flash_attn_fp8_gfx950.py`` at tag v0.3.0
+(5675194f). ``flydsl.kernels`` is not shipped in the wheel (``kernels/`` sits
+outside ``python/``, which is what ``find_packages`` scans), so aiter vendors
+these sources rather than importing them.
+
+Upstream's fp8 path is dense-only and refuses paged, varlen, and split-K; the
+paged/varlen/split-K/sinks machinery here is aiter-owned and not upstream-
+tracked, so re-vendoring a new pin re-extracts only the dense base.
+"""
+
+import flydsl.compiler as flyc
+import flydsl.expr as fx
+from flydsl.compiler.kernel_function import CompilationContext
+from flydsl.expr import const_expr, range_constexpr, rocdl
+from flydsl.expr.typing import T
+from flydsl.expr.utils.arith import _to_raw as _raw
+from flydsl.runtime.device import get_rocm_arch as get_hip_arch
+
+from aiter.ops.flydsl.kernels.flash_attn_dualwave_common import (
+    DualwaveFp8GemmHelper,
+    DualwaveFp8KernelContext,
+    DualwaveFp8KvGmemToLdsLoader,
+    DualwaveFp8KvLdsToVgprLoader,
+    DualwaveFp8PageIdLoader,
+    DualwaveFp8QLoader,
+    DualwaveFp8SoftmaxHelper,
+    DualwaveFp8StoreHelper,
+    DualwaveSplitKCombineContext,
+    DualwaveSplitKCombineHelper,
+    _make_dualwave_swp_fp8_traits,
+    _sched_barrier_pairs,
+    dtype_to_elem_type,
+    stagger_extra_barrier_if_one,
+    stagger_extra_barrier_if_zero,
+    waitcnt_vm_n,
+)
+from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
+
+
+def build_flash_attn_dualwave_swp_fp8_module(
+    num_heads,
+    head_dim,
+    causal=True,
+    dtype_str="fp8",
+    out_dtype_str="bf16",
+    num_kv_heads=None,
+    waves_per_eu=2,
+    daz=True,
+    dualwave_swp_lazy_rescale=True,
+    dualwave_swp_setprio=True,
+    dualwave_swp_enable_stagger=True,
+    num_kv_splits=1,
+    varlen=False,
+    use_sinks=False,
+    paged=False,
+    pv_spread=False,
+    gqa_pack_m=None,
+    kv_cache_layout="linear",
+):
+    """Build the gfx950 D=128 dual-wave flash-attention launcher.
+
+    This builder is fp8-only QKV (``dtype_str`` must be ``"fp8"``; see the
+    check below). ``varlen`` builds the packed variant: Q/O are
+    ``[total_q, H, D]``, K/V are ``[total_kv, H_kv, D]``, and per-batch ranges
+    come from int32 ``cu_seqlens_q`` / ``cu_seqlens_kv``. ``paged`` addresses
+    KV through a block table instead of contiguously, with page size fixed at
+    BLOCK_N=64. fp8 supports all three of varlen, paged and split-K, including
+    in combination.
+
+    ``kv_cache_layout`` selects between the linear 4D KV cache (``"linear"``)
+    and the shuffled 5D vectorized one (``"vectorized"``). ``"vectorized"``
+    covers both K and V: the K loader reads the 5D shuffled layout
+    (address-only, see ``load_k``'s ``KV_VECTORIZED`` branch), and the fp8 V
+    staging path reads the 5D shuffled layout via the coalesced
+    token-contiguous store (see ``_stage_v_fp8_coalesced``), both
+    correctness-validated bit-identical against the linear path. A caller
+    building with ``kv_cache_layout="vectorized"`` must pass 5D-shuffled K AND
+    V at runtime."""
+    gpu_arch = get_hip_arch()
+
+    if not gpu_arch.startswith("gfx950"):
+        raise RuntimeError(
+            f"flash_attn_dualwave_swp requires gfx950+ (uses ds_read_tr16_b64), got {gpu_arch}"
+        )
+    if head_dim != 128:
+        raise ValueError(
+            f"flash_attn_dualwave_swp is D=128 only, got head_dim={head_dim}"
+        )
+    # dtype_str is the INPUT/COMPUTE (QKV) dtype. This builder is genuinely
+    # fp8-only: the traits factory hardcodes DTYPE_STR="fp8", so a non-fp8 value
+    # here would silently build an fp8 kernel. Reject it rather than mislead.
+    if dtype_str != "fp8":
+        raise ValueError(
+            f"flash_attn_dualwave_swp_fp8 builds fp8 QKV only, got dtype={dtype_str}"
+        )
+    # out_dtype_str is the OUTPUT store dtype, independent of the fp8 QKV compute.
+    # Both are 2-byte, so every address, num_records bound and store packet is
+    # unchanged; only the f32->out conversion at the store sites differs.
+    if out_dtype_str not in ("bf16", "f16"):
+        raise ValueError(
+            f"flash_attn_dualwave_swp_fp8 output supports bf16/f16 only, got out_dtype={out_dtype_str}"
+        )
+    # fp8 always builds the BN128 deep-pipeline path: the shallow path's PV
+    # dispatch expects an unpacked P pair the body never produces. Split-K and
+    # varlen are both supported -- split-K needs the combine pass to pack output
+    # at the kernel's fixed 2-byte width (see pack_output), varlen needs the
+    # active guard (see compute_active_guard), both in the common module.
+
+    if num_kv_heads is None:
+        num_kv_heads = num_heads
+    assert num_heads % num_kv_heads == 0
+    NUM_KV_SPLITS = int(num_kv_splits)
+    assert NUM_KV_SPLITS >= 1
+    # varlen + split-K: each sequence has its OWN kv length, so the per-segment
+    # KV range must come from that sequence's length rather than a batch-wide
+    # scalar. init_tile_bounds already derives the segment [split_t0, split_t_end)
+    # from self.seqlen_kv_v, which is per-sequence under VARLEN (init_sequence_
+    # lengths reads cu_seqlens_kv[b+1]-cu_seqlens_kv[b]); the paged block-table
+    # stage and store_empty_split likewise key on the per-sequence max_num_tiles,
+    # so empty/partial segments past a short sequence contribute nothing to the
+    # combine. compute_active_guard ANDs the split-nonempty and per-sequence
+    # q-range predicates under VARLEN+SPLITK. So the combination is now built.
+    # Sinks seed m_row per split, so under split-K exp(sink) would be counted
+    # once per split in the combine denominator (the combine kernel has no sink
+    # input to correct it). Refuse the combination rather than compute wrong
+    # output; the single-split path is fully supported. The adapter's dispatch
+    # gate mirrors this: it never selects split-K when sinks is not None.
+    if use_sinks and int(num_kv_splits) > 1:
+        raise ValueError(
+            "attention sinks are not supported together with num_kv_splits > 1"
+        )
+
+    # kv_cache_layout: "linear" (current 4D cache) or "vectorized" (shuffled
+    # 5D cache). KV_VEC_SIZE=16 fp8 elements is the only width the layout
+    # defines (one dwordx4).
+    if kv_cache_layout not in ("linear", "vectorized"):
+        raise ValueError(
+            f"kv_cache_layout must be 'linear' or 'vectorized', got {kv_cache_layout!r}"
+        )
+    kv_vectorized = kv_cache_layout == "vectorized"
+    KV_VEC_SIZE = 16
+    if kv_vectorized:
+        if not paged:
+            # load_k's KV_VECTORIZED branch computes a region base from
+            # kv_head_idx (the paged per-page-per-head layout); the dense
+            # path has no such region and was never given vectorized
+            # addressing.
+            raise ValueError("kv_cache_layout='vectorized' requires paged=True")
+        if head_dim % KV_VEC_SIZE != 0:
+            raise ValueError(
+                f"vectorized KV cache requires head_dim % {KV_VEC_SIZE} == 0, "
+                f"got head_dim={head_dim}"
+            )
+        # page_size is structurally BLOCK_N=64 for this builder (see the
+        # `paged` note above) -- not a caller-facing parameter.
+        _PAGED_PAGE_SIZE = 64
+        if _PAGED_PAGE_SIZE % KV_VEC_SIZE != 0:
+            raise ValueError(
+                f"vectorized KV cache requires page_size % {KV_VEC_SIZE} == 0, "
+                f"got page_size={_PAGED_PAGE_SIZE}"
+            )
+
+    # All compile-time tile/layout constants live in the fp8 traits object.
+    traits = _make_dualwave_swp_fp8_traits(
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        causal=causal,
+        waves_per_eu=waves_per_eu,
+        daz=daz,
+        dualwave_swp_lazy_rescale=dualwave_swp_lazy_rescale,
+        dualwave_swp_setprio=dualwave_swp_setprio,
+        dualwave_swp_enable_stagger=dualwave_swp_enable_stagger,
+        num_kv_splits=num_kv_splits,
+        varlen=varlen,
+        out_dtype_str=out_dtype_str,
+        use_sinks=use_sinks,
+        paged=paged,
+        pv_spread=pv_spread,
+        gqa_pack_m=gqa_pack_m,
+        kv_vectorized=kv_vectorized,
+        kv_vec_size=KV_VEC_SIZE,
+    )
+    # kv_vectorized builds K AND V: load_k's KV_VECTORIZED branch reads the 5D
+    # shuffled K layout (address-only, no LDS/MFMA change; see
+    # DualwaveFp8KvGmemToLdsLoader.load_k), and the fp8 V staging path reads
+    # the 5D shuffled V layout via _stage_v_fp8_coalesced. A kv_vectorized=True
+    # module expects 5D-shuffled K AND V at runtime (see this function's
+    # docstring).
+    # Builder-level aliases used by SharedStorage and the launch/compile wrappers.
+    SPLITK = traits.SPLITK
+    BLOCK_M = traits.BLOCK_M
+    BLOCK_SIZE = traits.BLOCK_SIZE
+    HEAD_DIM = traits.HEAD_DIM
+    NUM_HEADS_Q = traits.NUM_HEADS_Q
+    BLOCK_Q = traits.BLOCK_Q
+    GQA_PACK_M = traits.GQA_PACK_M
+    # Under GQA packing the whole group rides in M, so one workgroup serves a
+    # kv-head rather than a q-head: grid.x drops from 64 to 4 at GQA 16:1.
+    GRID_X = traits.NUM_HEADS_KV if GQA_PACK_M else traits.NUM_HEADS_Q
+    DEFAULT_STRIDE_Q_N = traits.DEFAULT_STRIDE_Q_N
+    DEFAULT_STRIDE_KV_N = traits.DEFAULT_STRIDE_KV_N
+    _dualwave_swp_fp8_cache_tag = traits.cache_tag
+    _lds_elem_dtype = dtype_to_elem_type(traits.DTYPE_STR)
+
+    if const_expr(traits.PAGED):
+
+        @fx.struct
+        class SharedStorage:
+            kv: fx.Array[_lds_elem_dtype, traits.LDS_KV_TOTAL_SIZE, 16]
+            vt: fx.Array[fx.BFloat16, traits.VT_BF16_TOTAL, 16]
+            q: fx.Array[_lds_elem_dtype, BLOCK_M * HEAD_DIM, 16]
+            bt: fx.Array[fx.Int32, traits.PAGED_BT_LDS_SIZE, 16]
+
+    else:
+
+        @fx.struct
+        class SharedStorage:
+            kv: fx.Array[_lds_elem_dtype, traits.LDS_KV_TOTAL_SIZE, 16]
+            vt: fx.Array[fx.BFloat16, traits.VT_BF16_TOTAL, 16]
+            q: fx.Array[_lds_elem_dtype, BLOCK_M * HEAD_DIM, 16]
+
+    # BN128: two BLOCK_N=64 KV tiles per iteration, one merged softmax correction.
+    @flyc.kernel(known_block_size=[BLOCK_SIZE, 1, 1])
+    def flash_attn_dualwave_swp_fp8_bn128_kernel(
+        Q: fx.Tensor,
+        K: fx.Tensor,
+        V: fx.Tensor,
+        O: fx.Tensor,
+        DebugCounts: fx.Tensor,
+        CuSeqQ: fx.Tensor,
+        CuSeqKv: fx.Tensor,
+        QDescale: fx.Tensor,
+        KDescale: fx.Tensor,
+        VDescale: fx.Tensor,
+        BlockTable: fx.Tensor,
+        Sink: fx.Tensor,
+        seq_len: fx.Int32,
+        seq_len_kv: fx.Int32,
+        stride_q_n: fx.Int32,
+        stride_kv_n: fx.Int32,
+        head_dim_runtime: fx.Int32,
+        block_table_stride: fx.Int32,
+    ):
+        ctx = DualwaveFp8KernelContext(
+            traits,
+            Q,
+            K,
+            V,
+            O,
+            DebugCounts,
+            CuSeqQ,
+            CuSeqKv,
+            QDescale,
+            KDescale,
+            VDescale,
+            seq_len,
+            seq_len_kv,
+            stride_q_n,
+            stride_kv_n,
+            head_dim_runtime,
+            BlockTable=BlockTable,
+            block_table_stride=block_table_stride,
+            Sink=Sink,
+        )
+        ctx.init_types_and_constants()
+        ctx.init_runtime_indices()
+        ctx.init_lds(SharedStorage)
+        ctx.init_thread_mapping()
+        if const_expr(traits.CAUSAL):
+            ctx.init_causal_lpt_order()
+        ctx.init_sequence_lengths()
+        ctx.init_descriptors()
+        ctx.init_atoms_and_lds_ptrs()
+        ctx.init_dma_thread_offsets()
+        ctx.init_descale()
+        ctx.init_tile_bounds()
+        ctx.init_workspace_io()
+        # After init_tile_bounds: the split-K guard reads split_nonempty.
+        ctx.init_active_guard()
+
+        q_loader = DualwaveFp8QLoader(ctx)
+        gemm_helper = DualwaveFp8GemmHelper(ctx)
+        softmax_helper = DualwaveFp8SoftmaxHelper(ctx)
+        kv_gmem_to_lds = DualwaveFp8KvGmemToLdsLoader(ctx)
+        kv_lds_to_regs = DualwaveFp8KvLdsToVgprLoader(ctx)
+        output_store = DualwaveFp8StoreHelper(ctx)
+        page_ids = DualwaveFp8PageIdLoader(ctx)
+
+        # Stage the block table into LDS before any page id is read. Outside the
+        # active guard below: it's a whole-CTA op, unlike the per-tile KV loads.
+        if const_expr(traits.PAGED):
+            page_ids.load_block_table_to_lds()
+            rocdl.s_waitcnt(0)
+            rocdl.s_barrier()
+
+        BN = traits.BLOCK_N
+        D_CHUNKS = traits.D_CHUNKS
+        NPF = const_expr(traits.NUM_PREFETCH_K)
+        t0 = ctx.split_t0
+        t_end = ctx.split_t_end
+
+        def _cluster_boundary(drain=False):
+            """Close a cluster: retire its LDS reads, then sync the whole CTA.
+
+            The sched_barrier(0) on both sides is what scopes a cluster as a
+            scheduling region -- IGroupLP cannot move an instruction across a
+            mask-0 fence, which is why per-cluster sched_group_barrier group ids
+            can repeat every iteration without colliding.
+
+            Intermediate boundaries wait on lgkmcnt only: the ds_reads feeding
+            this cluster's MFMAs must land, but the prefetch DMAs are for tiles
+            two iterations out and are deliberately left in flight. Only the
+            back edge drains, because that is the boundary that publishes them.
+            """
+            if const_expr(drain):
+                rocdl.s_waitcnt(0)
+            else:
+                rocdl.s_waitcnt(traits.LGKMCNT_0_ONLY)
+            rocdl.sched_barrier(0)
+            rocdl.s_barrier()
+            rocdl.sched_barrier(0)
+
+        def _subtile_tail(v_s, v_v, v_o, l_row, m_new):
+            # Raise issue priority for the whole softmax+PV region. This is the
+            # body of compute clusters C5 and C7, and under the stagger the
+            # other wave group is in a memory cluster whenever we are here --
+            # so the address VALU it issues is exactly what this outbids.
+            # Inert without the stagger: all 8 waves would run in lockstep with
+            # no competitor, which is why it is step 3 and not step 1.
+            if const_expr(traits.DUALWAVE_SWP_SETPRIO):
+                rocdl.s_setprio(1)
+            v_s = softmax_helper.sub_m(v_s, m_new)
+            v_p = softmax_helper.exp2(v_s, 0, 16)
+            v_p = softmax_helper.exp2(v_p, 16, 16)
+            for _ in range_constexpr(2):
+                rocdl.sched_group_barrier(traits.SCHED_VALU_MASK, 8, 13)
+                rocdl.sched_group_barrier(traits.SCHED_EXP_MASK, 16, 13)
+            l_row = softmax_helper.reduce_sum(l_row, v_p)
+            v_p = gemm_helper.cast_p_fp8_direct(v_p)
+            v_o = gemm_helper.pv(v_p, v_v, v_o)
+            v_o = softmax_helper.anchor_v_o(v_o)
+            # Drop priority before the cluster boundary, after anchor_v_o has
+            # pinned the accumulators, so the release cannot migrate into the
+            # PV block it is meant to follow.
+            if const_expr(traits.DUALWAVE_SWP_SETPRIO):
+                rocdl.s_setprio(0)
+            return v_o, l_row
+
+        def _mask_sub(v_s, tile_idx):
+            if const_expr(traits.CAUSAL):
+                return v_s
+            return softmax_helper.seq_pad_mask_if_needed(v_s, tile_idx)
+
+        def _mask_pair(v_s_a, v_s_b, j):
+            if const_expr(traits.CAUSAL):
+                return softmax_helper.causal_mask_pair_if_needed(v_s_a, v_s_b, j)
+            return v_s_a, v_s_b
+
+        def _merge_tile_max(v_s_a, v_s_b):
+            m_tile = softmax_helper.max2(
+                softmax_helper.reduce_max(v_s_a), softmax_helper.reduce_max(v_s_b)
+            )
+            if const_expr(traits.CAUSAL):
+                m_tile = softmax_helper.floor_masked_max(m_tile)
+            return m_tile
+
+        def _main_body():
+            kv_gmem_to_lds.load_k(t0 * BN, fx.Int32(t0) % fx.Int32(NPF))
+            q_loader.stage_q_to_lds()
+            rocdl.s_waitcnt(0)
+            rocdl.sched_barrier(0)
+            rocdl.s_barrier()
+
+            ctx.init_q_row()
+            q_row = ctx.q_row
+
+            q_wide = gemm_helper.load_q_wide() if const_expr(traits.QREG) else None
+
+            kv_gmem_to_lds.load_k((t0 + 1) * BN, fx.Int32(t0 + 1) % fx.Int32(NPF))
+            kv_gmem_to_lds.load_v(t0 * BN, fx.Int32(t0) % fx.Int32(NPF))
+            kv_gmem_to_lds.load_v((t0 + 1) * BN, fx.Int32(t0 + 1) % fx.Int32(NPF))
+            kv_gmem_to_lds.load_k((t0 + 2) * BN, fx.Int32(t0 + 2) % fx.Int32(NPF))
+            kv_gmem_to_lds.load_k((t0 + 3) * BN, fx.Int32(t0 + 3) % fx.Int32(NPF))
+            kv_gmem_to_lds.load_v((t0 + 2) * BN, fx.Int32(t0 + 2) % fx.Int32(NPF))
+            kv_gmem_to_lds.load_v((t0 + 3) * BN, fx.Int32(t0 + 3) % fx.Int32(NPF))
+            # The first loop iteration reads only K1, V0, V1 -- the first three
+            # of the seven staged above, and vmcnt retires in issue order, so
+            # vmcnt(4) covers exactly them. K2/K3/V2/V3 stay in flight; they are
+            # not read until later iterations, each preceded by the full drain
+            # at the end of the loop body. SMEM_D_RPT is 1 for fp8 d=128, so
+            # every load_k/load_v above is exactly one DMA.
+            #
+            # The lgkm wait is separate and not optional: with VDMA off, V is
+            # staged global->VGPR->LDS and only lgkmcnt covers that LDS store,
+            # which the barrier below must see. Same pairing as the upstream
+            # bf16 kernel (FlyDSL kernels/attention/flash_attn_gfx950.py).
+            rocdl.s_waitcnt(traits.LGKMCNT_0_ONLY)
+            waitcnt_vm_n(4 * ctx.NUM_DMA_K)
+            rocdl.sched_barrier(0)
+            rocdl.s_barrier()
+            rocdl.sched_barrier(0)
+
+            # Open the wave-group phase shift. Waves 4-7 take one extra barrier
+            # that waves 0-3 skip, so from here every rendezvous pairs group B
+            # at cluster N+1 against group A at cluster N. s_barrier is an
+            # arrival count, not a program point, which is what makes that
+            # legal. The result is that one group is always inside a compute
+            # cluster while the other is in a memory cluster.
+            #
+            # Only sound with the 8-cluster decomposition above: at one barrier
+            # per iteration this same offset is a FULL-iteration skew and every
+            # LDS producer/consumer handoff desynchronises. The complementary
+            # barrier for group A is in the epilogue, keeping arrival counts
+            # equal over the kernel's lifetime.
+            if const_expr(traits.DUALWAVE_SWP_ENABLE_STAGGER):
+                stagger_extra_barrier_if_one(ctx.stagger_i32)
+
+            # Attention sinks seed the running max with the per-head sink logit
+            # (raw units) so it participates in the max from the first tile; its
+            # denominator contribution is added once in the epilogue. Off the
+            # main-loop critical path -- init only.
+            if const_expr(traits.USE_SINKS):
+                m_row = fx.Float32(softmax_helper.load_sink_logit())
+            else:
+                m_row = ctx.c_neg_inf
+            l_row = ctx.c_zero_f
+            v_o = [ctx.c_zero_v16f32 for _ in range_constexpr(D_CHUNKS)]
+
+            NPF_I = const_expr(fx.Int32(NPF))
+
+            def _ring_wrap(x):
+                return (x >= NPF_I).select(x - NPF_I, x)
+
+            init_args = [m_row, l_row] + v_o + [fx.Int32(t0) % fx.Int32(NPF)]
+            loop_results = init_args
+            for j, loop_args in range(t0, t_end, fx.Int64(2), init=init_args):
+                # range lowers to scf.for, whose induction var is index-typed; the
+                # tile counter is a bounded Int32 (widened where it feeds addressing).
+                j = fx.Int32(j)
+                m_row = loop_args[0]
+                l_row = loop_args[1]
+                v_o = [loop_args[2 + i] for i in range_constexpr(D_CHUNKS)]
+
+                a_buf = loop_args[2 + D_CHUNKS]
+                b_buf = _ring_wrap(a_buf + fx.Int32(1))
+                nn_a_buf = _ring_wrap(a_buf + fx.Int32(2))
+                f_a_buf = _ring_wrap(a_buf + fx.Int32(4))
+                f_b_buf = _ring_wrap(a_buf + fx.Int32(5))
+
+                # Eight clusters, memory and compute strictly alternating, one
+                # barrier each. Mirrors the upstream bf16 kernel's decomposition, which
+                # the wave stagger needs: a one-barrier loop makes the stagger a
+                # full-iteration skew, and every LDS handoff desynchronises.
+                #
+                # Two of bf16's mechanisms are deliberately NOT ported, because
+                # fp8 cannot represent them. It carries a half-computed P across
+                # the back edge and rescales an already-cast P between PV steps;
+                # both need a P that survives an ext/scale/trunc round trip.
+                # e4m3 has 3 mantissa bits and does not. So the merged max stays
+                # (both score sets live at C3, which is what BN128 buys) and
+                # _subtile_tail stays barrier-free: sub_m -> exp2 -> exp2 ->
+                # reduce_sum -> cast -> pv has to be one straight-line region
+                # because cvt_pk_fp8_f32 is lossy and one-way.
+
+                # C0 (mem): K for subtile a.
+                v_k_a = kv_lds_to_regs.load_k(a_buf)
+                _cluster_boundary()
+
+                # C1 (cmp): QK for subtile a. Doing it here frees v_k_a before
+                # v_k_b loads, so only one K subtile is live at peak -- 32 fewer
+                # VGPRs than keeping both.
+                v_s_a = gemm_helper.qk(v_k_a, q_wide)
+                v_s_a = _mask_sub(v_s_a, j)
+                _sched_barrier_pairs(traits, 4, 6, 14)
+                _cluster_boundary()
+
+                # C2 (mem): K for subtile b.
+                v_k_b = kv_lds_to_regs.load_k(b_buf)
+                _cluster_boundary()
+
+                # C3 (cmp): QK for subtile b, then the pair-wide softmax
+                # correction. The merged max and lazy_correct_o must both see
+                # both score sets, so this is the earliest point either can run.
+                # The boundary goes after lazy_correct_o returns, never inside
+                # it: its scf.if is gated on a per-wave ballot, so waves can
+                # diverge there and a barrier would deadlock.
+                v_s_b = gemm_helper.qk(v_k_b, q_wide)
+                v_s_b = _mask_sub(v_s_b, j + fx.Int32(1))
+                v_s_a, v_s_b = _mask_pair(v_s_a, v_s_b, j)
+                m_tile = _merge_tile_max(v_s_a, v_s_b)
+                v_o, m_new, l_row = softmax_helper.lazy_correct_o(
+                    v_o, m_row, l_row, m_tile
+                )
+                v_o = softmax_helper.anchor_v_o(v_o)
+                _sched_barrier_pairs(traits, 4, 6, 15)
+                _cluster_boundary()
+
+                # C4 (mem): V for subtile a, plus the K half of the prefetch.
+                # The prefetch writes slots a+4/a+5, which are a-2/a-1 mod NPF
+                # -- the slots the PREVIOUS iteration read. The end-of-iteration
+                # barrier is what separates them; issuing later in the body than
+                # before only widens that margin.
+                v_v_a = kv_lds_to_regs.load_v(a_buf)
+                # The ring prefetches two iterations ahead unconditionally, so
+                # the last iterations fetch tiles past t_end -- a fixed 4-tile
+                # overshoot, left unclamped: the kernel is latency-bound, so the
+                # overshoot is absorbed by ring slack.
+                pf_a = fx.Int64(j) + fx.Int64(4)
+                pf_b = fx.Int64(j) + fx.Int64(5)
+                # Resolve both prefetch page ids under ONE lgkmcnt(0) drain, and
+                # reuse them for the V half at C6. K and V for a given tile
+                # resolve the SAME page id, so batching the lookups avoids
+                # redundant drains.
+                pf_pages = (
+                    kv_gmem_to_lds.end_page_ids(
+                        kv_gmem_to_lds.begin_page_ids([pf_a, pf_b])
+                    )
+                    if const_expr(traits.PAGED)
+                    else [None, None]
+                )
+                kv_gmem_to_lds.load_k(pf_a * BN, f_a_buf, pf_pages[0])
+                kv_gmem_to_lds.load_k(pf_b * BN, f_b_buf, pf_pages[1])
+                _cluster_boundary()
+
+                # C5 (cmp): softmax and PV for subtile a. Carries its own
+                # group-13 hints from _subtile_tail.
+                v_o, l_row = _subtile_tail(v_s_a, v_v_a, v_o, l_row, m_new)
+                _cluster_boundary()
+
+                # C6 (mem): V for subtile b, plus the V half of the prefetch.
+                v_v_b = kv_lds_to_regs.load_v(b_buf)
+                # Same two page ids as the K half at C4 -- already in SGPRs, so
+                # this cluster issues no LDS read and no drain at all.
+                kv_gmem_to_lds.load_v(pf_a * BN, f_a_buf, pf_pages[0])
+                kv_gmem_to_lds.load_v(pf_b * BN, f_b_buf, pf_pages[1])
+                _cluster_boundary()
+
+                # C7 (cmp): softmax and PV for subtile b, then the loop back
+                # edge. This boundary keeps the full drain: it is the one that
+                # publishes this iteration's prefetch DMAs and releases the
+                # slots the next iteration overwrites.
+                v_o, l_row = _subtile_tail(v_s_b, v_v_b, v_o, l_row, m_new)
+                m_row = m_new
+                _cluster_boundary(drain=True)
+
+                loop_results = yield [m_row, l_row] + v_o + [nn_a_buf]
+            m_row = loop_results[0]
+            l_row = loop_results[1]
+            v_o = [loop_results[2 + i] for i in range_constexpr(D_CHUNKS)]
+
+            # Sinks: add exp(sink) to the denominator (epilogue only). The sink
+            # has no value vector, so it contributes to l_row but not v_o.
+            if const_expr(traits.USE_SINKS):
+                l_row = fx.Float32(softmax_helper.add_sink_denom(l_row, m_row))
+            inv_l_rcp = rocdl.rcp(T.f32, _raw(l_row))
+            inv_l = (fx.Float32(l_row) > ctx.c_zero_f).select(inv_l_rcp, ctx.c_zero_f)
+            if const_expr(traits.FP8_PV):
+                inv_l = fx.Float32(inv_l) * ctx.vd_fp8
+            softmax_helper.scale_o(v_o, inv_l)
+            # Close the phase shift: group A takes the barrier group B took in
+            # the prologue, so both groups have executed the same number over
+            # the kernel's lifetime and neither is left waiting at a rendezvous
+            # no one else reaches. Placed after the last compute and before the
+            # store, the final point where the two groups still need to agree.
+            if const_expr(traits.DUALWAVE_SWP_ENABLE_STAGGER):
+                stagger_extra_barrier_if_zero(ctx.stagger_i32)
+            rocdl.s_barrier()
+            if const_expr(not SPLITK):
+                output_store.store_final_o(v_o, q_row)
+            else:
+                # Under split-K this workgroup owns one KV range, so it writes a
+                # partial plus its (m, l) for the combine pass instead of the
+                # final output. The fp8 body previously called store_final_o
+                # unconditionally, leaving the workspace all zeros -- the
+                # partial-store helpers existed but nothing called them.
+                output_store.store_splitk_partial_o(v_o, m_row, l_row, q_row)
+
+        # Under varlen the grid is sized for the longest sequence, so a shorter
+        # sequence's surplus Q blocks would write into the next packed sequence's
+        # rows. Guarding the body with `active` skips them. On the dense path
+        # `active` is None, so the body runs directly and emits no guard. Mirrors
+        # the upstream bf16 kernel.
+        if ctx.active is None:
+            _main_body()
+        else:
+
+            @flyc.jit
+            def _run_body_if_active():
+                if ctx.active:
+                    _main_body()
+
+            _run_body_if_active()
+
+        # Outside the active guard on purpose: a split whose KV range is empty
+        # skips the body entirely but still has to mark its (m, l) slots, or the
+        # combine pass reads stale workspace for that split.
+        if const_expr(SPLITK):
+            output_store.store_empty_split()
+
+    # Combine kernel: out = sum_s w_s * O_s / sum_s w_s * l_s, w_s = exp2(m_s - m_max).
+    # One wave row of 32 lanes covers a (b, h, s) row, 4 contiguous cols/lane.
+    COMBINE_BLOCK = 256
+    COMBINE_LANES_PER_ROW = traits.HEAD_DIM // 4
+    COMBINE_ROWS_PER_BLOCK = COMBINE_BLOCK // COMBINE_LANES_PER_ROW
+
+    @flyc.kernel(known_block_size=[COMBINE_BLOCK, 1, 1])
+    def flash_attn_splitk_combine_kernel(
+        O: fx.Tensor,
+        WS: fx.Tensor,
+        CuSeqQ: fx.Tensor,
+        batch_size: fx.Int32,
+        seq_len: fx.Int32,
+        stride_q_n: fx.Int32,
+        combine_rows: fx.Int32,
+    ):
+        ctx = DualwaveSplitKCombineContext(
+            traits, O, WS, batch_size, seq_len, stride_q_n, CuSeqQ=CuSeqQ
+        )
+        ctx.init_types_and_constants()
+        ctx.init_runtime_indices()
+        ctx.init_thread_mapping(COMBINE_ROWS_PER_BLOCK, COMBINE_LANES_PER_ROW)
+        ctx.init_workspace()
+        ctx.init_descriptors()
+
+        # The grid is rounded up to a whole number of COMBINE_ROWS_PER_BLOCK
+        # blocks, so the last block can carry rows past combine_rows (when
+        # combine_rows isn't a multiple of 8) -- guard those into a no-op
+        # rather than reading/writing past the workspace/O bounds.
+        row_active = ctx.row < combine_rows
+
+        @flyc.jit
+        def _run_combine_if_active():
+            if row_active:
+                combine = DualwaveSplitKCombineHelper(ctx)
+                m_s, l_s = combine.load_ml_rows()
+                m_max = combine.reduce_m_max(m_s)
+                acc, den = combine.accumulate_splits(m_s, l_s, m_max)
+                o_pack = combine.pack_output(acc, den)
+                combine.store_output(o_pack)
+
+        _run_combine_if_active()
+
+    @flyc.jit
+    def launch_flash_attn_dualwave_swp(
+        Q: fx.Tensor,
+        K: fx.Tensor,
+        V: fx.Tensor,
+        O: fx.Tensor,
+        DebugCounts: fx.Tensor,
+        CuSeqQ: fx.Tensor,
+        CuSeqKv: fx.Tensor,
+        QDescale: fx.Tensor,
+        KDescale: fx.Tensor,
+        VDescale: fx.Tensor,
+        BlockTable: fx.Tensor,
+        Sink: fx.Tensor,
+        batch_size: fx.Int32,
+        seq_len: fx.Int32,
+        seq_len_kv: fx.Int32,
+        stride_q_n: fx.Int32,
+        stride_kv_n: fx.Int32,
+        head_dim_runtime: fx.Int32,
+        block_table_stride: fx.Int32,
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
+    ):
+        # Make shape/mode traits visible to the JIT cache key.
+        _ = _dualwave_swp_fp8_cache_tag
+        bs_idx = fx.Int64(batch_size)
+        sl_idx = fx.Int64(seq_len)
+        # Blocks span BLOCK_Q query POSITIONS (== BLOCK_M when not packing).
+        num_q_blocks = (sl_idx + BLOCK_Q - 1) // BLOCK_Q
+        if const_expr(SPLITK):
+            grid_z = bs_idx * NUM_KV_SPLITS
+        else:
+            grid_z = bs_idx
+
+        passthrough_entries = (
+            [
+                ["denormal-fp-math-f32", "preserve-sign,preserve-sign"],
+                ["no-nans-fp-math", "true"],
+                ["unsafe-fp-math", "true"],
+            ]
+            if const_expr(daz)
+            else None
+        )
+        flash_attn_dualwave_swp_fp8_bn128_kernel(
+            Q,
+            K,
+            V,
+            O,
+            DebugCounts,
+            CuSeqQ,
+            CuSeqKv,
+            QDescale,
+            KDescale,
+            VDescale,
+            BlockTable,
+            Sink,
+            seq_len,
+            seq_len_kv,
+            stride_q_n,
+            stride_kv_n,
+            head_dim_runtime,
+            block_table_stride,
+            value_attrs={
+                "rocdl.waves_per_eu": waves_per_eu,
+                "rocdl.flat_work_group_size": f"{BLOCK_SIZE},{BLOCK_SIZE}",
+                "passthrough": passthrough_entries,
+            },
+        ).launch(
+            grid=(GRID_X, num_q_blocks, grid_z),
+            block=(BLOCK_SIZE, 1, 1),
+            stream=stream,
+        )
+        if const_expr(SPLITK):
+            combine_rows = bs_idx * NUM_HEADS_Q * sl_idx
+            # Round the grid up rather than floor-dividing: combine_rows is not
+            # always a multiple of COMBINE_ROWS_PER_BLOCK (8) outside the
+            # production NUM_HEADS_Q=64 configuration. The combine kernel body
+            # guards row < combine_rows, so the extra rows in the rounded-up
+            # last block are a no-op rather than an OOB write, and a
+            # combine_rows < 8 launch still gets one active block instead of a
+            # zero-size grid.
+            combine_grid_x = (
+                combine_rows + fx.Int32(COMBINE_ROWS_PER_BLOCK) - fx.Int32(1)
+            ) // fx.Int32(COMBINE_ROWS_PER_BLOCK)
+            flash_attn_splitk_combine_kernel(
+                O,
+                DebugCounts,
+                CuSeqQ,
+                batch_size,
+                seq_len,
+                stride_q_n,
+                fx.Int32(combine_rows),
+            ).launch(
+                grid=(combine_grid_x, 1, 1),
+                block=(COMBINE_BLOCK, 1, 1),
+                stream=stream,
+            )
+
+    _dualwave_swp_compile_hints = {
+        "fast_fp_math": True,
+        "unsafe_fp_math": True,
+        "llvm_options": {
+            "enable-post-misched": False,
+            "lsr-drop-solution": True,
+        },
+    }
+
+    def _normalize_launch_args(
+        Q,
+        K,
+        V,
+        O,
+        batch_size,
+        seq_len,
+        stride_kv_n,
+        stride_q_n,
+        head_dim_runtime,
+        debug_counts,
+        seq_len_kv,
+        workspace,
+        cu_seqlens_q,
+        cu_seqlens_kv,
+        q_descale,
+        k_descale,
+        v_descale,
+        block_table,
+        block_table_stride,
+        sink,
+        stream,
+    ):
+        """Fill the None defaults shared by _launch and _compile and return the
+        positional argument tuple for launch_flash_attn_dualwave_swp.
+
+        Unused tensor slots (cu_seqlens, descales, block_table, sink) pass O as a
+        placeholder; the kernel only reads each under its const_expr gate."""
+        if stride_kv_n is None:
+            stride_kv_n = DEFAULT_STRIDE_KV_N
+        if stride_q_n is None:
+            stride_q_n = DEFAULT_STRIDE_Q_N
+        if head_dim_runtime is None:
+            head_dim_runtime = HEAD_DIM
+        # seq_len_kv defaults to seq_len (self-attention / equal Q,KV lengths).
+        if seq_len_kv is None:
+            seq_len_kv = seq_len
+        if SPLITK:
+            if workspace is None:
+                raise ValueError(
+                    "num_kv_splits > 1 requires a fp32 workspace (see dualwave_splitk_workspace_elems)"
+                )
+            debug_counts = workspace
+        if debug_counts is None:
+            debug_counts = O
+        if cu_seqlens_q is None:
+            cu_seqlens_q = O
+        if cu_seqlens_kv is None:
+            cu_seqlens_kv = O
+        if q_descale is None:
+            q_descale = O
+        if k_descale is None:
+            k_descale = O
+        if v_descale is None:
+            v_descale = O
+        if block_table is None:
+            block_table = O
+        if block_table_stride is None:
+            block_table_stride = 0
+        if sink is None:
+            sink = O
+        return (
+            Q,
+            K,
+            V,
+            O,
+            debug_counts,
+            cu_seqlens_q,
+            cu_seqlens_kv,
+            q_descale,
+            k_descale,
+            v_descale,
+            block_table,
+            sink,
+            batch_size,
+            seq_len,
+            seq_len_kv,
+            stride_q_n,
+            stride_kv_n,
+            head_dim_runtime,
+            block_table_stride,
+            fx.Stream(stream),
+        )
+
+    def _launch(
+        Q,
+        K,
+        V,
+        O,
+        batch_size,
+        seq_len,
+        stride_kv_n=None,
+        stride_q_n=None,
+        head_dim_runtime=None,
+        debug_counts=None,
+        *,
+        seq_len_kv=None,
+        workspace=None,
+        cu_seqlens_q=None,
+        cu_seqlens_kv=None,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+        block_table=None,
+        block_table_stride=None,
+        sink=None,
+        stream=None,
+    ):
+        args = _normalize_launch_args(
+            Q,
+            K,
+            V,
+            O,
+            batch_size,
+            seq_len,
+            stride_kv_n,
+            stride_q_n,
+            head_dim_runtime,
+            debug_counts,
+            seq_len_kv,
+            workspace,
+            cu_seqlens_q,
+            cu_seqlens_kv,
+            q_descale,
+            k_descale,
+            v_descale,
+            block_table,
+            block_table_stride,
+            sink,
+            stream,
+        )
+        with CompilationContext.compile_hints(_dualwave_swp_compile_hints):
+            return _run_compiled(launch_flash_attn_dualwave_swp, *args)
+
+    def _compile(
+        Q,
+        K,
+        V,
+        O,
+        batch_size,
+        seq_len,
+        stride_kv_n=None,
+        stride_q_n=None,
+        head_dim_runtime=None,
+        debug_counts=None,
+        *,
+        seq_len_kv=None,
+        workspace=None,
+        cu_seqlens_q=None,
+        cu_seqlens_kv=None,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+        block_table=None,
+        block_table_stride=None,
+        sink=None,
+        stream=None,
+    ):
+        args = _normalize_launch_args(
+            Q,
+            K,
+            V,
+            O,
+            batch_size,
+            seq_len,
+            stride_kv_n,
+            stride_q_n,
+            head_dim_runtime,
+            debug_counts,
+            seq_len_kv,
+            workspace,
+            cu_seqlens_q,
+            cu_seqlens_kv,
+            q_descale,
+            k_descale,
+            v_descale,
+            block_table,
+            block_table_stride,
+            sink,
+            stream,
+        )
+        with CompilationContext.compile_hints(_dualwave_swp_compile_hints):
+            return flyc.compile(launch_flash_attn_dualwave_swp, *args)
+
+    _launch.compile = _compile
+
+    return _launch
