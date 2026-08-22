@@ -332,10 +332,13 @@ def make_routings(n_layers, ct, E, topk, dev, seed):
 
 
 def _rmsnorm(x, eps=1e-6):
-    """RMSNorm (no learnable gain) on the last dim. Applied to each layer's MoE
-    input so activations stay unit-scale across the 61-layer residual chain --
-    without it the a8w4 fp8 activation quant (max ~448) overflows to NaN after a
-    few layers. Both device and reference use the SAME normalization."""
+    """RMSNorm (no learnable gain) on the last dim, in plain torch.
+
+    Applied to each layer's MoE input so activations stay unit-scale across the
+    61-layer residual chain -- without it the a8w4 fp8 activation quant (max
+    ~448) overflows to NaN after a few layers. This is the reference-side and
+    definitional version; the measured device path runs ``aiter.rms_norm``,
+    which is bit-identical to it (see ``_MegaPipeline._norm``)."""
     xf = x.float()
     n = xf * torch.rsqrt(xf.pow(2).mean(dim=-1, keepdim=True) + eps)
     return n.to(x.dtype)
@@ -495,6 +498,7 @@ class DeviceMoEPipeline:
         self.graph = None
         self.x0_static = None
         self.out_static = None
+        self.rms_gain = None
 
     # ---- initialization (grouped together) ---- #
     def setup(self, x0):
@@ -511,6 +515,7 @@ class DeviceMoEPipeline:
         self.w1_a, self.w2_a, self.w1_s, self.w2_s = shuffle_group(
             q1, gs1, q2, gs2, self.spec, self.EPR
         )
+        self.rms_gain = torch.ones(self.hdim, dtype=dtypes.bf16, device=dev)
         self.expert_mask = torch.zeros((self.E,), dtype=dtypes.i32, device=dev)
         self.expert_mask[self.EPR * r : self.EPR * (r + 1)] = 1
 
@@ -559,9 +564,25 @@ class DeviceMoEPipeline:
         self.comm.barrier()
 
     # ---- one graph-capturable layer + full chain (calls grouped together) ---- #
+    def _norm(self, x):
+        """`_rmsnorm` as one fused kernel, for the path that gets measured.
+
+        Bit-identical to `_rmsnorm` at unit gain, and 1.7us against that
+        function's 44us: the eager float()/pow/mean/rsqrt/mul/cast chain is six
+        kernels whose reduction runs one block per token, so 128 blocks crawl
+        through 7168 elements each. Left eager it is a tenth of the per-layer
+        budget spent on scaffolding that moves with nothing under test, and it
+        buries differences in the MoE itself -- the stage1 producer is worth
+        6us/layer here, which the eager norm's own run-to-run spread hides.
+
+        `torch.nn.functional.rms_norm` also works and is also bit-identical,
+        at 6.2us.
+        """
+        return aiter.rms_norm(x, self.rms_gain, 1e-6)
+
     def _layer_step(self, x, layer_idx):
         ids, wts = self.routings[layer_idx]
-        xn = _rmsnorm(x)  # keep a8w4 fp8 activations in range across 61 layers
+        xn = self._norm(x)  # keep a8w4 fp8 activations in range across 61 layers
         if self.mega is not None:
             y = self.mega(
                 xn,
@@ -627,9 +648,9 @@ class DeviceMoEPipeline:
 
     # ---- perf: torch.profiler breakdown + graph-replay wall-clock ---- #
     _N_WARMUP = 5
-    _N_PROF_REPLAYS = 3  # graph replays captured by torch.profiler in bench()
+    _N_PROF_REPLAYS = int(os.environ.get("MEGA_PROF_REPLAYS", "3"))
 
-    def bench(self):
+    def bench(self, profile=False):
         """Time the ONE-graph N-layer dispatch->gemm->combine chain. The graph
         already contains all N layers, so a single replay IS the per-chain
         measurement -- no separate replay-count knob. 5 warmup replays first.
@@ -637,12 +658,15 @@ class DeviceMoEPipeline:
 
         - total_us = host wall-clock of one graph replay (one sync after; not
           cuda.Event). For a GPU-bound MoE chain this ~= GPU time.
-        - torch.profiler over one EAGER pipeline pass for the per-op breakdown.
+        - prof_us / the per-kernel table come from torch.profiler over
+          `_N_PROF_REPLAYS` further replays, and only when `profile` is set.
 
-        NOTE: this ROCm torch build reports self_device_time_total == 0 for every
-        event (verified even for a plain matmul), so torch.profiler cannot give a
-        device-time number here; it is kept for the per-op (CPU-side) breakdown.
-        If a future build populates device time, prof_us below becomes > 0."""
+        Profiling is opt-in because torch.profiler segfaults in `stop_trace` on
+        most runs of this graph on this ROCm build -- 4/4 at three replays, and
+        it survived at two. It is a profiler fault, not a pipeline one: the
+        stack is entirely inside torch, and the same graph replays indefinitely
+        unprofiled. `MEGA_PROF_REPLAYS` trades capture length for the odds of
+        getting through one."""
         import time
 
         for _ in range(self._N_WARMUP):
@@ -661,6 +685,9 @@ class DeviceMoEPipeline:
         # surface the per-kernel timeline inside the graph on this build, so we
         # profile the actual graph (matches the measured per-layer wall) instead of
         # a separate eager pass.
+        if not profile:
+            self._prof = None
+            return total_us, total_us / self.n_layers, 0.0
         with tprof.profile(
             activities=[tprof.ProfilerActivity.CPU, tprof.ProfilerActivity.CUDA]
         ) as prof:
@@ -705,10 +732,18 @@ def _aggregate_prof_table(prof, dist_ctx, per_layer_denom=1.0, row_limit=200):
 
     Rows are ordered by total self device time (mean over ranks), so the kernels
     that dominate the budget come first regardless of their per-call cost. Also
-    prints the TOTAL over ALL kernels and the implied device time per layer
-    (total / per_layer_denom, where per_layer_denom = replays * n_layers) so it
-    can be compared against the measured per_layer wall -- if they match, the GPU
-    has no idle bubble. Non-zero ranks return None."""
+    prints the TOTAL over ALL kernels and the implied device time per layer, to
+    be compared against the measured per_layer wall -- if they match, the GPU has
+    no idle bubble. Non-zero ranks return None.
+
+    The per-layer figure is built from the per-call times and a calls-per-layer
+    count read off the profile itself, NOT from `per_layer_denom`. The profiler
+    drops whole cycles when its buffer wraps, uniformly across kernels, so a
+    total divided by the expected `replays * n_layers` understates the device
+    time by however much was dropped -- which looks exactly like idle GPU. The
+    modal observed count is the once-per-layer rate whatever the capture kept,
+    so dividing by that is self-correcting; `per_layer_denom` is only used to
+    report the capture fraction."""
     local = {}
     for e in prof.key_averages():
         local[e.key] = (_event_device_us(e), int(e.count))
@@ -731,7 +766,15 @@ def _aggregate_prof_table(prof, dist_ctx, per_layer_denom=1.0, row_limit=200):
         pc_avg = sum(seen) / len(seen) if seen else 0.0
         rows.append((avg_self, name, per_call, pc_avg, avg_count))
     rows.sort(key=lambda r: (-r[0], r[1]))
-    dev_per_layer = total_self / per_layer_denom if per_layer_denom else 0.0
+    # Calls one layer makes of a kernel, relative to the kernels that run once.
+    # Median over the device kernels: most of the pipeline is once per layer, so
+    # the median lands on that rate and a kernel launched twice scores 2.
+    kernel_counts = sorted(c for self_us, _, _, _, c in rows if self_us > 0)
+    base = kernel_counts[len(kernel_counts) // 2] if kernel_counts else 0.0
+    dev_per_layer = (
+        sum(pc * (c / base) for _, _, _, pc, c in rows if pc > 0) if base else 0.0
+    )
+    kept = base / per_layer_denom if per_layer_denom else 0.0
     lines = [
         (
             f"# per-call self device time (us) by rank, {world} ranks "
@@ -749,6 +792,7 @@ def _aggregate_prof_table(prof, dist_ctx, per_layer_denom=1.0, row_limit=200):
     lines.append(
         f"# TOTAL self device time over ALL {len(rows)} kernels = {total_self:.1f} us "
         f"-> {dev_per_layer:.1f} us/layer (device-busy; compare to per_layer wall)"
+        + (f"  [profiler kept {kept * 100:.0f}% of the calls]" if kept < 0.99 else "")
     )
     return "\n".join(lines)
 
@@ -839,13 +883,15 @@ def main():
     )
     pipe.setup(x0)
     pipe.capture(x0)
-    total_us, per_layer_us, prof_us = pipe.bench()
+    total_us, per_layer_us, prof_us = pipe.bench(
+        profile=bool(args.profile_table or args.save_trace)
+    )
     # Aggregate perf across ranks (collective calls -> run on every rank).
     total_us = dist_ctx.allreduce_avg_float(total_us)
     per_layer_us = dist_ctx.allreduce_avg_float(per_layer_us)
     prof_us = dist_ctx.allreduce_avg_float(prof_us)
     tbl = None
-    if args.profile_table:
+    if args.profile_table and pipe._prof is not None:
         tbl = _aggregate_prof_table(
             pipe._prof,
             dist_ctx,
@@ -870,7 +916,7 @@ def main():
         prof_note = (
             f"prof_device={prof_us:.1f}us"
             if prof_us > 0
-            else "prof_device=n/a (this ROCm torch.profiler emits no device time)"
+            else "prof_device=off (pass --profile_table to profile)"
         )
         print(
             f"# MEGA-MOE layers={n_layers} tokens/rank={ct}: "
