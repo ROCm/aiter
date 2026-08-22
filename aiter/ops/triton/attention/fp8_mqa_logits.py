@@ -210,6 +210,7 @@ def fp8_mqa_logits(
                 "BLOCK_M": block_m,
                 "MFMA_NONK_DIM": mfma_nonk_dim,
             }
+            grid = ((seq_len + block_m - 1) // block_m,)
         else:
             loop_variant = 1
             waves_per_eu = 1
@@ -219,13 +220,14 @@ def fp8_mqa_logits(
             # This kernel has no BLOCK_M: it walks one query row per program.
             block_m = 1
             other = {"LOOP_VARIANT": loop_variant}
+            grid = (seq_len,)
 
         # Buffer ops use a 32-bit byte offset (2 GiB resource descriptor cap).
         # Fall back to plain global load/store when a tensor exceeds that.
         BUFFER_LIMIT_BYTES = 2 * 1024 * 1024 * 1024
         use_buffer_load = KV.numel() * KV.element_size() < BUFFER_LIMIT_BYTES
         use_buffer_store = logits.numel() * logits.element_size() < BUFFER_LIMIT_BYTES
-        _gluon_fp8_mqa_logits_kernel[((seq_len + block_m - 1) // block_m,)](
+        _gluon_fp8_mqa_logits_kernel[grid](
             Q_ptr=Q,
             KV_ptr=KV,
             kv_scales_ptr=kv_scales,
