@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import argparse
+import contextlib
 import itertools
 
 import pandas as pd
@@ -22,13 +23,67 @@ from op_tests.triton_tests.attention.test_fp8_mqa_logits import (
 
 torch.set_default_device("cuda")
 
-SUPPORTED_GFX = ["gfx942"]
+SUPPORTED_GFX = ["gfx942", "gfx950"]
+# `e4m3_type` is arch-dependent (get_fp8_dtypes): FNUZ on gfx942, FN on gfx950.
+# So on gfx950 both keys resolve to float8_e4m3fn and the two cases coincide --
+# only gfx942 has a genuine FN/FNUZ split.
 DTYPE_MAP = {"fnuz": e4m3_type, "fn": torch.float8_e4m3fn}
+
+# Default operand-dtype sweep, per arch.
+#
+# gfx942's native MFMA operand format is FNUZ, so the kernel takes FN operands
+# by patching them (see `convert_q_fn`/`convert_kv_fn`). Both fnuz/fnuz and the
+# live DeepSeek-V4 indexer combo fn/fnuz are therefore real, distinct paths.
+#
+# gfx950's native format is FN and its CDNA4 scaled atoms reject FNUZ outright,
+# so the kernel never converts there and fn/fn is the only combination that can
+# occur.
+_DEFAULT_Q_DTYPES = ["fn"] if get_gfx() == "gfx950" else ["fnuz", "fn"]
+_DEFAULT_KV_DTYPES = ["fn"] if get_gfx() == "gfx950" else ["fnuz"]
 
 try:
     from aiter.ops.flydsl import flydsl_fp8_mqa_logits
 except ImportError:
     flydsl_fp8_mqa_logits = None
+
+
+@contextlib.contextmanager
+def _fill_output_with_nan(s_q, s_k):
+    """NaN-fill the output buffer a launcher allocates inside this block.
+
+    Why this is needed: `clean_logits=True` is satisfied by the kernel
+    itself writing -inf to the out-of-window positions -- so the `-inf` mask
+    assert below is the only thing checking the fill.
+    On its own that assert is vacuous: the launcher
+    allocates with `torch.empty`, and PyTorch's caching allocator hands the same
+    block back on every iteration, still holding the previous iteration's
+    correct -inf. An under-fill (a missed grid.y chunk, an off-by-one at a range
+    boundary) would pass every time.
+
+    Nan-initialization turns every position the kernel fails to write into a NaN, which
+    fails the mask assert directly. It also hardens `clean_logits=False` by
+    proving the epilogue writes every in-window position.
+    """
+    real_empty = torch.empty
+    nan_filled = []
+
+    def _empty(*args, **kwargs):
+        t = real_empty(*args, **kwargs)
+        if (
+            t.dtype == torch.float32
+            and t.dim() == 2
+            and t.shape[0] >= s_q
+            and t.shape[1] >= s_k
+        ):
+            t.fill_(float("nan"))
+            nan_filled.append(tuple(t.shape))
+        return t
+
+    torch.empty = _empty
+    try:
+        yield nan_filled
+    finally:
+        torch.empty = real_empty
 
 
 def _make_windows(s_q, s_k, mode):
@@ -45,6 +100,40 @@ def _make_windows(s_q, s_k, mode):
             torch.int32
         )
         return ks, ke
+    if mode == "empty":
+        # Rows with no window at all, interleaved with normal ones so a single
+        # block's union window mixes the two. Both spellings of "empty" appear:
+        #
+        #   r%3==0  cu_ends < 0        -- what a causal mask yields whenever
+        #                                 s_kv < s_q, so this is ordinary input,
+        #                                 not a synthetic edge case
+        #   r%3==1  cu_ends <= cu_starts
+        #   r%3==2  an ordinary non-empty window
+        #
+        # Both leave the union tile_end below tile_start, which the kernel must
+        # collapse to zero width before the (unsigned) grid.y split arithmetic.
+        rows = torch.arange(s_q, device="cuda")
+        ks = torch.where(rows % 3 == 1, min(100, s_k), 0)
+        ke = torch.where(
+            rows % 3 == 0,
+            -1 - (rows % 7),
+            torch.where(rows % 3 == 1, 0, torch.minimum(rows + 1, ks + s_k)),
+        )
+        return ks.to(torch.int32), ke.to(torch.int32)
+    if mode == "past_end":
+        # cu_starts beyond seq_len_kv, interleaved with ordinary rows. A window
+        # that starts past the end of KV is legal input and simply empty, but it
+        # is the one case where the kernel's -inf fill must clamp cu_starts:
+        # the fill's first range is [0, cu_starts), the per-row output view is a
+        # buffer descriptor covering 4 GiB from the row base (no hardware OOB
+        # net), and seq_len_kv is often the row stride exactly.
+        # An unclamped fill would run straight into the next row's live columns.
+        # The reference masks with an unclamped `col >= cu_starts`, so it agrees:
+        # these rows are entirely -inf.
+        rows = torch.arange(s_q, device="cuda")
+        ks = torch.where(rows % 2 == 0, s_k + 17, 0)
+        ke = torch.where(rows % 2 == 0, s_k + 64, torch.minimum(rows + 1, ks + s_k))
+        return ks.to(torch.int32), ke.to(torch.int32)
     raise ValueError(f"unknown window mode: {mode}")
 
 
@@ -52,8 +141,16 @@ def _rehydrate(out, ks, ke, s_q, s_k, clean_logits):
     if clean_logits:
         return out
     full = torch.full((s_q, s_k), float("-inf"), device="cuda")
+    # Clamp into [0, s_k] before slicing: cu_ends is allowed to be negative or
+    # to sit below cu_starts (both mean "this row has no window"), and a raw
+    # negative bound would wrap into a from-the-end slice and copy most of the
+    # row instead of none of it.
+    lo = ks.clamp(0, s_k)
+    hi = ke.clamp(0, s_k)
     for i in range(s_q):
-        full[i, ks[i] : ke[i]] = out[i, ks[i] : ke[i]]
+        a, b = int(lo[i]), int(hi[i])
+        if a < b:
+            full[i, a:b] = out[i, a:b]
     return full
 
 
@@ -77,9 +174,14 @@ def test_fp8_mqa_logits(
     ks, ke = _make_windows(s_q, s_k, window)
 
     q_fp8 = q.to(DTYPE_MAP[q_dtype])
+    # Grade against what the kernels actually consume: kv is already fake-
+    # quantized above, so round-trip q through fp8 too. Otherwise q's
+    # quantization error is charged to the kernel, which dominates the measured
+    # diff and says nothing about kernel correctness.
+    q = q_fp8.to(torch.float32).to(torch.bfloat16)
     kv_fp8, scales = per_custom_dims_cast_to_fp8(kv, (0,), False)
-    if kv_dtype != "fnuz":
-        kv_fp8 = _kv_in_dtype(kv_fp8, DTYPE_MAP[kv_dtype])
+    # A no-op when the request is already the arch-native format.
+    kv_fp8 = _kv_in_dtype(kv_fp8, DTYPE_MAP[kv_dtype])
 
     with torch.inference_mode():
         ref, cost = ref_fp8_mqa_logits(
@@ -101,7 +203,7 @@ def test_fp8_mqa_logits(
             q_fp8, kv_fp8, scales, weights, ks, ke, clean_logits
         ),
     }
-    if kv_dtype == "fnuz":
+    if DTYPE_MAP[kv_dtype] == e4m3_type:
         candidates["triton"] = lambda: triton_logits(
             q_fp8, kv_fp8, scales, weights, ks, ke, clean_logits
         )
@@ -109,7 +211,23 @@ def test_fp8_mqa_logits(
     ret = {"gfx": get_gfx()}
     for name, fn in candidates.items():
         with torch.inference_mode():
-            out, us = run_perftest(fn)
+            _, us = run_perftest(fn)
+            # Correctness is graded on a separate, NaN-initialized call -- not on
+            # run_perftest's result.
+            #
+            # This construction intercepts the regular torch.empty call the launcher
+            # makes to allocate the output buffer, and fills it with NaN.
+            # The kernel then writes into that buffer, and any unwritten positions remain NaN.
+            # The correctness check below asserts that the -inf mask matches the reference,
+            # so any unwritten positions (which should be -inf) will fail the assert if they are still NaN.
+            #
+            # Applied to triton too where it essentially does nothing since its launcher still
+            # pre-fills with torch.full when clean_logits=True.
+            with _fill_output_with_nan(s_q, s_k) as nan_filled:
+                out = fn()
+        if name == "flydsl":
+            # Ensure that then the logits buffer was NaN filled, i.e., sanity check for the FlyDSL kernel test.
+            assert nan_filled, "flydsl: the output buffer was not intercepted."
         out = _rehydrate(out, ks, ke, s_q, s_k, clean_logits)
 
         out_mask = out == float("-inf")
@@ -118,7 +236,16 @@ def test_fp8_mqa_logits(
         err = 0.0
         if not ref_mask.all():
             diff = calc_diff(out.masked_fill(out_mask, 0), ref.masked_fill(ref_mask, 0))
-            assert diff < 1e-3, f"{name} calc_diff={diff}"
+            # calc_diff is 1 - 2xy/(x^2+y^2), an aggregate similarity. Over a
+            # single finite element it degenerates to (a-b)^2/(a^2+b^2), where
+            # one borderline ReLU term (a dot product near zero flipping sign
+            # between fp32 accumulation orders) moves it by percent. Both the
+            # FlyDSL and Triton kernels land on the same value there and differ
+            # from the fp32 reference identically, so assert the aggregate only
+            # where it is meaningful; checkAllclose below still bounds the
+            # magnitude in every case.
+            if int((~ref_mask).sum()) > 1:
+                assert diff < 1e-3, f"{name} calc_diff={diff}"
             err = diff.item()
             checkAllclose(
                 ref.masked_fill(ref_mask, 0).to(dtypes.fp32),
@@ -168,7 +295,17 @@ def main():
             (128, 1024),
             (1024, 1024),
             (1024, 1560),
+            # Small-M / long-KV. The row grid alone is far too small to fill the
+            # device here (64 rows is a 16-block grid on the gfx950 default
+            # variant), so the launcher splits each row's KV window hard across
+            # grid.y -- these are the only shapes reaching a split count high
+            # enough that most blocks end up owning an empty column range.
+            (64, 2048),
             (64, 8192),
+            # s_kv < s_q. A causal mask then puts cu_ends below zero on the
+            # leading rows, so these cover the negative-window path end to end.
+            (128, 64),
+            (1024, 1000),
         ],
     )
     parser.add_argument("--num-heads", type=int, nargs="*", default=[64, 128])
@@ -177,14 +314,14 @@ def main():
         "--q-dtype",
         type=str,
         nargs="*",
-        default=["fnuz", "fn"],
+        default=_DEFAULT_Q_DTYPES,
         choices=["fnuz", "fn"],
     )
     parser.add_argument(
         "--kv-dtype",
         type=str,
         nargs="*",
-        default=["fnuz"],
+        default=_DEFAULT_KV_DTYPES,
         choices=["fnuz", "fn"],
     )
     parser.add_argument(
@@ -199,8 +336,8 @@ def main():
         "--window",
         type=str,
         nargs="*",
-        default=["causal", "cp", "misaligned"],
-        choices=["causal", "cp", "misaligned"],
+        default=["causal", "cp", "misaligned", "empty", "past_end"],
+        choices=["causal", "cp", "misaligned", "empty", "past_end"],
     )
     args = parser.parse_args()
 
