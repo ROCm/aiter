@@ -22,11 +22,13 @@ from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
 from .kernels.hgemm_dispatch import compile_flydsl_hgemm_kernel
 
 # from .kernels.small_m_hgemm import iter_small_m_registry_configs
+from .kernels.splitk_reduce import compile_splitk_reduce_kernel
 from .kernels.tensor_shim import _run_compiled
 from .utils import get_shared_memory_per_block, is_flydsl_available
 
 __all__ = [
     "flydsl_hgemm",
+    "flydsl_splitk_prewarm_capture_workspace",
 ]
 
 
@@ -36,7 +38,13 @@ def _get_dtypes():
     return dtypes
 
 
-SPLIT_K_SEMAPHORE_MAX_LEN = 256
+# Global accesses in these kernels go through an AMD buffer descriptor, so the
+# workspace is bounded by that descriptor rather than by any pointer arithmetic:
+# `num_records` is a 32-bit BYTE count (clamped to 0xFFFFFFFF in
+# `buffer_ops.create_buffer_resource*`) and the per-lane voffset is a 32-bit
+# element offset scaled to bytes. Addressing therefore wraps at 4GiB; cap the
+# workspace at half of that so the largest slot offset keeps a 2x margin.
+SPLIT_K_WORKSPACE_MAX_BYTES = 1 << 31
 FIXED_STAGE = 2
 FIXED_C_TO_LDS = False
 KERNEL_ASYNC_COPY = get_rocm_arch() != "gfx942"
@@ -63,11 +71,6 @@ _HGEMM_KERNEL_RE = re.compile(
     r")?"
     r"_(?P<target_gfx>gfx[0-9a-z]+)$"
 )
-
-SplitKStreamKey = tuple[int, int]
-SPLIT_K_GLOBAL_SEMAPHORE: dict[SplitKStreamKey, torch.Tensor] = {}
-SPLIT_K_GLOBAL_SIGNAL: dict[SplitKStreamKey, torch.Tensor] = {}
-
 
 # Keep the generic auto-generated catalog aligned with the upstream FlyDSL
 # reference tuning space. The wider local one-off search space introduced
@@ -173,13 +176,6 @@ def flydsl_kernel_name(
         )
     name += f"_{get_gfx()}"
     return name
-
-
-def _stream_cache_key(stream: torch.cuda.Stream) -> SplitKStreamKey:
-    device_index = stream.device.index
-    if device_index is None:
-        raise ValueError(f"Unable to determine device index for stream {stream!r}")
-    return (device_index, int(stream.cuda_stream))
 
 
 def _normalize_launch_stream(
@@ -697,31 +693,157 @@ def _register_all_configs():
 _register_all_configs()
 
 
-@functools.lru_cache(maxsize=128)
-def _get_split_k_tensors(
+# ---------------------------------------------------------------------------
+# Split-K fp32 workspace (workspace + reduce combine)
+# ---------------------------------------------------------------------------
+#
+# One growable fp32 buffer per device. Growth is monotonic and superseded
+# buffers are RETAINED: unlike opus (which dereferences a device-resident
+# `ws_handle->ptr` and therefore survives a post-capture grow), FlyDSL bakes the
+# raw pointer into the launch args at capture time, so an already-captured graph
+# must keep the exact buffer it captured. Keeping the old allocation alive makes
+# that pointer valid forever; growth is at least 2x, so the retained total is
+# bounded by roughly 2x the live size.
+_SPLIT_K_WS: dict[int, torch.Tensor] = {}
+_SPLIT_K_WS_RETIRED: list[torch.Tensor] = []
+
+
+def _split_k_workspace_elems(m: int, n: int, slots: int) -> int:
+    """Element count of the unpadded `[slots, m, n]` fp32 workspace."""
+    return slots * m * n
+
+
+def _split_k_workspace_slots(
+    split_k: int, block_k_warps: int, kernel_family: str
+) -> int:
+    """Slot count of the `[slots, m, n]` workspace for one kernel config.
+
+    Each slice-K warp group gets its own slot, so its partial is reduced in fp32
+    by the reduce kernel instead of through a bf16 LDS combine; small_m has no
+    slice-K. This is part of the layout contract between the main kernel, the
+    reduce kernel and the AOT precompiler, so all three read it from here rather
+    than restating the arithmetic.
+    """
+    slice_k_slots = block_k_warps if kernel_family == KERNEL_FAMILY_HGEMM else 1
+    return split_k * slice_k_slots
+
+
+def _get_split_k_workspace(
     device: torch.device,
-    stream: torch.cuda.Stream,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    semaphore = torch.zeros(
-        (SPLIT_K_SEMAPHORE_MAX_LEN,), dtype=torch.int32, device=device
-    )
-    signal = torch.zeros((SPLIT_K_SEMAPHORE_MAX_LEN,), dtype=torch.int32, device=device)
-    return semaphore, signal
+    elems: int,
+    stream: torch.cuda.Stream | None = None,
+) -> torch.Tensor:
+    """Return an fp32 workspace of at least `elems` elements on `device`.
+
+    Never grows during CUDA-graph capture: allocating inside capture would put
+    the buffer in the graph's private pool and is exactly the class of
+    capture-time state the redesign removes. Callers that capture should size
+    the workspace first (see `flydsl_splitk_prewarm_capture_workspace`).
+    """
+    if device.type != "cuda":
+        raise ValueError(f"split-K workspace requires a CUDA device, got {device}")
+    device_index = device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+        device = torch.device("cuda", device_index)
+
+    nbytes = elems * 4
+    if nbytes > SPLIT_K_WORKSPACE_MAX_BYTES:
+        raise ValueError(
+            f"FlyDSL split-K workspace would need {nbytes} bytes, above the "
+            f"{SPLIT_K_WORKSPACE_MAX_BYTES}-byte limit imposed by 32-bit buffer "
+            "descriptor addressing; use a smaller split_k for this shape"
+        )
+
+    ws = _SPLIT_K_WS.get(device_index)
+    if ws is not None and ws.numel() >= elems:
+        return ws
+
+    # Only the grow path below reaches here, so the context managers are off the
+    # hot path. Both the capture check and the allocation run under them: capture
+    # state is per (device, current stream), so checking the *current* stream
+    # while allocating on an explicitly passed `stream` can disagree -- it would
+    # miss a capturing launch stream and allocate into the graph's private pool,
+    # which is precisely what this guard exists to prevent. `torch.cuda.stream`
+    # accepts None as a no-op.
+    with torch.cuda.device(device), torch.cuda.stream(stream):
+        if torch.cuda.is_current_stream_capturing():
+            have = 0 if ws is None else ws.numel()
+            raise RuntimeError(
+                "FlyDSL split-K workspace must be sized before CUDA graph capture "
+                f"(need {elems} fp32 elements, have {have}). Run this shape eagerly "
+                "once, or call "
+                "aiter.ops.flydsl.gemm_kernels.flydsl_splitk_prewarm_capture_workspace(...) "
+                "on the capture stream, before capturing."
+            )
+
+        grow_to = max(elems, 0 if ws is None else 2 * ws.numel())
+        if grow_to * 4 > SPLIT_K_WORKSPACE_MAX_BYTES:
+            grow_to = elems
+        new_ws = torch.empty(grow_to, dtype=torch.float32, device=device)
+    if ws is not None:
+        # Retained, not freed: a captured graph may still hold this pointer.
+        _SPLIT_K_WS_RETIRED.append(ws)
+    _SPLIT_K_WS[device_index] = new_ws
+    return new_ws
 
 
-def _check_split_k_semaphore_capacity(
-    m: int, n: int, tile_m: int, tile_n: int, split_k: int
+def _graph_capture_stream() -> torch.cuda.Stream:
+    """The stream `torch.cuda.graph` captures on when called without `stream=`.
+
+    Mirrors torch's own lazy init (and `aiter/tuned_gemm.py::
+    _opus_graph_capture_stream`) so the workspace is registered on the exact
+    stream a later `with torch.cuda.graph(g):` will use.
+    """
+    g = torch.cuda.graphs.graph
+    if getattr(g, "default_capture_stream", None) is None:
+        g.default_capture_stream = torch.cuda.Stream()
+    return g.default_capture_stream
+
+
+def flydsl_splitk_prewarm_capture_workspace(
+    m: int,
+    n: int,
+    *,
+    split_k: int,
+    block_k_warps: int = 1,
+    device: torch.device | None = None,
+    stream: torch.cuda.Stream | None = None,
 ) -> None:
+    """Size the split-K fp32 workspace on the graph capture stream, before capture.
+
+    No-op when already capturing (too late to allocate), for `split_k <= 1`
+    (that path never touches the workspace), or when the buffer is already big
+    enough -- the steady state, so this is cheap to call per GEMM from dispatch.
+    Follows the opus precedent in
+    `aiter/tuned_gemm.py::_opus_prewarm_capture_workspace`.
+    """
     if split_k <= 1:
         return
-    bm = (m + tile_m - 1) // tile_m
-    bn = n // tile_n
-    required = bm * bn
-    if required > SPLIT_K_SEMAPHORE_MAX_LEN:
-        raise ValueError(
-            "Split-K semaphore capacity exceeded: "
-            f"requires {required} counters, max supported is {SPLIT_K_SEMAPHORE_MAX_LEN}"
-        )
+    # Resolve the index too: an index-less `cuda` device misses the cache lookup
+    # below and would sync on every call.
+    if device is None or device.index is None:
+        device = torch.device("cuda", torch.cuda.current_device())
+    # Capture state is per device and `torch.cuda.Stream()` binds to whichever
+    # device is current, so resolve both under `device`: prewarming for a
+    # non-current device would otherwise test, and register the workspace on,
+    # some other device's stream.
+    with torch.cuda.device(device):
+        if torch.cuda.is_current_stream_capturing():
+            return
+        capture_stream = _graph_capture_stream() if stream is None else stream
+        # Deliberately an upper bound rather than `_split_k_workspace_slots`:
+        # a prewarm that guesses the family wrong must over-allocate, never
+        # under-allocate, since under-allocating resurfaces as a hard error at
+        # capture time. small_m simply leaves the extra slots unused.
+        elems = _split_k_workspace_elems(m, n, split_k * block_k_warps)
+        before = _SPLIT_K_WS.get(device.index)
+        ws = _get_split_k_workspace(device, elems, capture_stream)
+        # Sync only when this call actually allocated: on the warm path there is
+        # nothing outstanding, and a host-side sync per GEMM would make this
+        # unusable from dispatch.
+        if ws is not before:
+            capture_stream.synchronize()
 
 
 @functools.lru_cache(maxsize=16384)
@@ -820,6 +942,26 @@ def _compile_flydsl_hgemm(
         has_bias=has_bias,
     )
 
+    # Split-K combine: the main kernel writes fp32 partials into
+    # `[slots, m, n]` and a second launch reduces them into C. The stream
+    # supplies the ordering (a dependency edge between two nodes inside a
+    # captured graph); nothing is shared between blocks.
+    is_split_k = split_k > 1
+    ws_slots = _split_k_workspace_slots(split_k, block_k_warps, kernel_family)
+    # `_split_k_workspace_elems` is `slots * m * n`; only `m` varies per call, so
+    # precompute the constant factor and keep the launcher to one multiply.
+    ws_slots_n = ws_slots * n
+    reduce_kernel = (
+        compile_splitk_reduce_kernel(
+            dtype,
+            n,
+            ws_slots,
+            HAS_BIAS=has_bias,
+        )
+        if is_split_k
+        else None
+    )
+
     def launcher(
         out: torch.Tensor,
         a: torch.Tensor,
@@ -839,18 +981,48 @@ def _compile_flydsl_hgemm(
         launch_bias = b if bias is None else bias
         runtime_m = int(a.shape[0])
         launch_stream = _normalize_launch_stream(a.device, stream)
-        _check_split_k_semaphore_capacity(runtime_m, n, tile_m, tile_n, split_k)
-        semaphore, signal = _get_split_k_tensors(a.device, launch_stream)
-        return _run_compiled(
+        if not is_split_k:
+            # The workspace slot is never dereferenced without split-K; the
+            # kernel ABI just needs a valid pointer there.
+            return _run_compiled(
+                kernel,
+                ptr_arg(out),
+                ptr_arg(a),
+                ptr_arg(b),
+                ptr_arg(launch_bias),
+                runtime_m,
+                ptr_arg(out),
+                fx.Stream(launch_stream),
+            )
+        workspace = _get_split_k_workspace(
+            a.device,
+            runtime_m * ws_slots_n,
+            launch_stream,
+        )
+        # The split-K path issues two launches, so build the argument wrappers
+        # that both share exactly once. `ptr_arg` and `fx.Stream` each allocate
+        # a python object per call, and this launcher is on the eager hot path.
+        out_ptr = ptr_arg(out)
+        ws_ptr = ptr_arg(workspace)
+        bias_ptr = ptr_arg(launch_bias)
+        fx_stream = fx.Stream(launch_stream)
+        _run_compiled(
             kernel,
-            ptr_arg(out),
+            out_ptr,
             ptr_arg(a),
             ptr_arg(b),
-            ptr_arg(launch_bias),
+            bias_ptr,
             runtime_m,
-            ptr_arg(semaphore),
-            ptr_arg(signal),
-            fx.Stream(launch_stream),
+            ws_ptr,
+            fx_stream,
+        )
+        return _run_compiled(
+            reduce_kernel,
+            out_ptr,
+            ws_ptr,
+            bias_ptr,
+            runtime_m,
+            fx_stream,
         )
 
     return launcher
