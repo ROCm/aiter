@@ -74,12 +74,15 @@ __global__ void rmsnorm_quant_opus(
 {
 }
 #else
-// fp32 -> quant element. int8: round-to-nearest; fp8: hardware e4m3 cvt.
+// fp32 -> quant element. int8: round-to-nearest-even with symmetric saturation;
+// fp8: hardware e4m3 cvt.
 template <typename out_t>
 __device__ inline out_t quant_cast(float v)
 {
     if constexpr(std::is_same_v<out_t, signed char>)
-        return static_cast<signed char>(__builtin_rintf(v));
+    {
+        return static_cast<signed char>(fminf(fmaxf(__builtin_rintf(v), -127.0f), 127.0f));
+    }
     else
         return opus::fp32_to_fp8(v);
 }
