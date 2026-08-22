@@ -4,8 +4,7 @@ import sys
 import torch
 import triton
 
-from aiter.ops.triton.quant import dynamic_mxfp4_quant as triton_dynamic_mxfp4_quant
-from aiter.utility.fp4_utils import dynamic_mxfp4_quant as fp4_utils_dynamic_mxfp4_quant
+from aiter.ops.triton.quant import dynamic_mxfp8_quant as triton_dynamic_mxfp8_quant
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_available_models,
     get_caller_name_no_ext,
@@ -14,8 +13,8 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
 
 
 def get_default_shapes() -> list[list[int]]:
-    M = [8, 32, 256, 8192, 16384]
-    N = [3072, 7168]
+    M = [8, 32, 256, 2048, 8192, 16384]
+    N = [1024, 3072, 7168]
     return [[m, n] for m in M for n in N]
 
 
@@ -42,9 +41,7 @@ def get_dtype(dtype_str: str) -> torch.dtype:
 
 def get_provider(provider: str):
     if provider == "triton":
-        return triton_dynamic_mxfp4_quant
-    if provider == "fp4_utils":
-        return fp4_utils_dynamic_mxfp4_quant
+        return triton_dynamic_mxfp8_quant
     raise ValueError(f"Unknown provider: {provider}")
 
 
@@ -86,7 +83,7 @@ def run_benchmark(args):
     )
 
     @triton.testing.perf_report([benchmark])
-    def bench_quant_mxfp4(M, N, metric, provider, dtype, model_name=None, **kwargs):
+    def bench_quant_mxfp8(M, N, metric, provider, dtype, model_name=None, **kwargs):
         dtype = get_dtype(dtype)
         x = torch.randn((M, N), dtype=dtype, device="cuda")
         quant_fn = get_provider(provider)
@@ -98,9 +95,9 @@ def run_benchmark(args):
 
         # Read x and write quantized output + block scales.
         x_bytes = x.numel() * x.element_size()
-        x_fp4_bytes = M * (N // 2)
+        x_fp8_bytes = M * N
         x_scale_bytes = M * ((N + 31) // 32)
-        total_bytes = x_bytes + x_fp4_bytes + x_scale_bytes
+        total_bytes = x_bytes + x_fp8_bytes + x_scale_bytes
 
         if metric == "time":
             return ms
@@ -108,12 +105,12 @@ def run_benchmark(args):
             return total_bytes / (ms * 1e-3) * 1e-9
         raise ValueError("Unknown metric: " + metric)
 
-    bench_quant_mxfp4.run(save_path="." if args.o else None, print_data=True)
+    bench_quant_mxfp8.run(save_path="." if args.o else None, print_data=True)
 
 
 def parse_args(args: list[str] | None = None):
     parser = argparse.ArgumentParser(
-        prog="Benchmark MXFP4 Quant",
+        prog="Benchmark MXFP8 Quant",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
@@ -146,7 +143,7 @@ def parse_args(args: list[str] | None = None):
         "--provider",
         type=str,
         default="triton",
-        help="Provider(s) to benchmark. Comma-separated values from: triton,fp4_utils.",
+        help="Provider(s) to benchmark. Comma-separated values from: triton.",
     )
     parser.add_argument(
         "--dtype",
