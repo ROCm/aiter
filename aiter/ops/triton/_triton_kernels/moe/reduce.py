@@ -43,7 +43,9 @@ def _reduce_grouped(
     start = pid_t * K
     # load indices into a tuple
     if InIndx is None:
-        indxs = (pid_t,)
+        indxs = ()
+        for i in tl.static_range(0, K):
+            indxs = indxs + (pid_t * K + i,)
     else:
         indxs = ()
         for i in tl.static_range(0, K):
