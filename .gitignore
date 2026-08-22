@@ -77,6 +77,12 @@ debug_log.txt
 OUT_FOLDER/
 *.att
 
+# hipify output, written next to the checked-in csrc headers by a local build.
+# Nothing under this pattern is tracked, so an untracked one is always generated.
+csrc/**/*_hip.h
+csrc/**/*_hip.cuh
+csrc/**/*_hip.hpp
+
 # Large benchmark results - archive to Wiki or external storage
 op_tests/moe_benchmarking_profiling/results/*.csv
 scripts/results/*.csv
