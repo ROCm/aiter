@@ -243,6 +243,12 @@ struct mha_fwd_args
 
     ck_tile::index_t block_scale_size_q;
     ck_tile::index_t block_scale_size_kv;
+
+    // Native split-K workspace fields.
+    // Minimum byte size:
+    //   num_splits * batch * nhead_q * seqlen_q * (kHeadDim + 1) * sizeof(float)
+    int   num_splits            = 0;       // number of KV-axis splits (from mha_fwd_calculate_num_splits)
+    void* splitkv_workspace_ptr = nullptr; // caller-owned device scratch buffer (see above)
 };
 
 #if ENABLE_CK
@@ -359,6 +365,19 @@ struct __attribute__((packed)) fmha_fwd_v3_args
 
 __attribute__((visibility("default"))) float mha_fwd(mha_fwd_args args,
                                                      const ck_tile::stream_config& s);
+
+#if FAV_NATIVE_ON
+// Returns the optimal number of KV-axis splits for the native split-K kernel.
+//
+//   -1  : native split-K is not feasible for this config
+//          (wrong arch, dtype, head-dim, mask type, varlen, etc.)
+//    0  : feasible but the heuristic judges split-K not beneficial
+//          (single-pass batch kernel is preferable for this problem shape)
+//   >0  : heuristic returns his many splits;
+__attribute__((visibility("default"))) int mha_fwd_calculate_num_splits(const mha_fwd_args& a);
+
+__attribute__((visibility("default"))) size_t mha_fwd_workspace_size(const mha_fwd_args& a);
+#endif
 
 float fmha_fwd_v3(mha_fwd_args a, const ck_tile::stream_config& s);
 } // namespace aiter
