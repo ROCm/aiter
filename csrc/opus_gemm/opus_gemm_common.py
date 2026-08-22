@@ -1286,14 +1286,19 @@ a8w8_mxscale_bmm_bpreshuffle_blds_kernels_list.update({
 
 # The blds half of the shuffled LDS scale panel -- see the bdirect block above.
 #
-# kid394 answers kid236, the single largest twin in the decode table (15.5% of
-# decode time). kid397 covers B_M=32, which was built as the discriminator: it
-# has the panel without SUBTILE_TILE's runtime fold, and it is the one member
-# that gains. kid396 is the tightest kid in the set, landing at exactly 4 WG/CU
-# with the panel in (40196 B against 40960).
+# kid397 covers B_M=32, which was built as the discriminator: it has the panel
+# without SUBTILE_TILE's runtime fold, and it is the one member that gains.
+#
+# kid394 (16x32x512, kid236's tile) and kid396 (16x32x256 wg4) were built here
+# and are retired: over 3 preb + 3 shuf passes they won 0 shapes, and decode
+# leave-one-out was exactly 1.0000 in every pass -- the pool dispatched to them
+# nowhere. Retired rather than left as candidates because they cannot become
+# useful: at B_M=16 the fill stages 2x what the tile reads, and while K=8192
+# does take kid396 past its own reg sibling (1.006 -> 0.977), it is still
+# 10-40% behind the pool winner there, since at that K the right tile is
+# B_K=512. To bring them back, restore the entries here -- the panel path
+# itself stays exercised by kid393/kid397.
 _BMM_MXSCALE_BPRESHUFFLE_BLDS_SHUFFLE_PANEL_TILES = {
-    394: (16, 32, 512, 2, True),    # kid392 + panel; kid236's tile -- the prize
-    396: (16, 32, 256, 4, False),   # kid385 + panel; kid243's tile
     397: (32, 32, 256, 2, True),    # kid386 + panel; the B_M>=32 geometry test
 }
 a8w8_mxscale_bmm_bpreshuffle_blds_kernels_list.update({
@@ -1463,13 +1468,17 @@ a8w8_mxscale_bmm_bpreshuffle_bdirect_kernels_list.update({
 # requested WG/CU.
 #
 # It is still not a decode fix: at B_M=16 the tile names 2 of every dword's 4
-# bytes, so the fill stages twice what the tile reads and these four run
-# 1.7% *behind* their own reg siblings. Only kid397 (B_M=32, 100% utilisation)
-# is a win, -11% at K >= 4096. They are bit-exact and cost no occupancy, so they
-# stay as candidates.
+# bytes, so the fill stages twice what the tile reads and the B_M=16 members run
+# ~1.5% *behind* their own reg siblings. Only kid397 (B_M=32, 100% utilisation)
+# is a clear win, -11% at K >= 4096.
+#
+# kid393 stays because it does win: 4 shapes in all 3 shuf passes, all K=4096,
+# ~0.3% of decode. It is also the only B_M=16 kid left with the panel, so it is
+# what keeps SF_SHUF_IN_LDS x SUBTILE_TILE compiled and covered by the twin
+# bit-exactness gate. kid395 (16x32x256) is retired alongside kid394/396 -- see
+# the blds panel block for the measurement.
 _BMM_MXSCALE_BPRESHUFFLE_BDIRECT_SHUFFLE_PANEL_TILES = {
     393: (16, 32, 512, 2, False),    # kid391 + panel; kid179's tile
-    395: (16, 32, 256, 2, False),    # kid384 + panel; kid173's tile
 }
 a8w8_mxscale_bmm_bpreshuffle_bdirect_kernels_list.update({
     kid: _a8w8_mxscale_bmm_bpreshuffle_bdirect(bm, bn, bk, wg, prefetch_scale=pf,
