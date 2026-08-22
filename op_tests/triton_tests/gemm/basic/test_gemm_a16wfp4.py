@@ -2,6 +2,9 @@ import pytest
 import torch
 
 from aiter.ops.shuffle import shuffle_weight
+from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a16wfp4 import (
+    _get_config,
+)
 from aiter.ops.triton.gemm.basic.gemm_a16wfp4 import (
     gemm_a16wfp4,
     gemm_a16wfp4_preshuffle,
@@ -211,3 +214,67 @@ def test_gemm_a16wfp4(
     torch_out = run_torch(x, w, w_scales, dtype).to(dtype)
 
     torch.testing.assert_close(torch_out, y)
+
+
+@pytest.mark.parametrize(
+    "M, N, K, BLOCK_SIZE_K", [(7, 512, 192, 128), (128, 128, 192, 128)]
+)
+def test_gemm_a16wfp4_odd_k_scale_mask(M: int, N: int, K: int, BLOCK_SIZE_K: int):
+    """Regression: the b_scales load must be masked when EVEN_K is false, or
+    the tail block reads past the scale tensor, where 0xFF is e8m0 NaN and
+    0 * NaN poisons the dot. The a/b loads here were already masked."""
+    if not (arch_info.is_fp4_avail()):
+        pytest.skip("MXFP4 not supported on this architecture")
+
+    config, _ = _get_config(M, N, K // 2)
+    config = dict(config)
+    config["BLOCK_SIZE_K"] = BLOCK_SIZE_K
+    assert config["NUM_KSPLIT"] == 1, f"expected NUM_KSPLIT == 1, got {config}"
+    assert BLOCK_SIZE_K < K, "wrapper would clamp BLOCK_SIZE_K to next_pow2(K)"
+    assert K % BLOCK_SIZE_K != 0, "EVEN_K would be true; nothing to pin"
+
+    dtype = torch.bfloat16
+    x, w, w_triton, _, w_scales, _, _ = generate_gemm_a16wfp4_inputs(
+        M, N, K, output=False, atomic_add=False, dtype=dtype, layout="TN"
+    )
+
+    n_groups = K // SCALE_GROUP_SIZE
+    numel = n_groups * N
+    poisoned = torch.full((2 * numel + 2 * N,), 0xFF, dtype=torch.uint8, device="cuda")
+    w_scales_oob = poisoned[:numel].view(n_groups, N).T
+    assert w_scales_oob.shape == w_scales.shape
+    assert w_scales_oob.stride() == w_scales.stride()
+    w_scales_oob.copy_(w_scales)
+
+    y = gemm_a16wfp4(
+        x, w_triton, w_scales_oob, atomic_add=False, dtype=dtype, config=config
+    )
+
+    torch_out = run_torch(x, w, w_scales, dtype).to(dtype)
+    torch.testing.assert_close(torch_out, y)
+
+
+@pytest.mark.parametrize("M, N, K, BLOCK_SIZE_K", [(128, 512, 768, 512)])
+def test_gemm_a16wfp4_preshuffle_rejects_odd_k(M, N, K, BLOCK_SIZE_K):
+    """The preshuffle kernel is EVEN_K-only: its `if EVEN_K` has no `else`, so
+    a_bf16/b are undefined and tracing died on `NameError: b is not defined`.
+    A static_assert now names the constraint."""
+    if not (arch_info.is_fp4_avail()):
+        pytest.skip("MXFP4 not supported on this architecture")
+
+    config, _ = _get_config(M, N, K // 2, True)
+    config = dict(config)
+    config["BLOCK_SIZE_K"] = BLOCK_SIZE_K
+    assert config["NUM_KSPLIT"] == 1, f"expected NUM_KSPLIT == 1, got {config}"
+    assert BLOCK_SIZE_K < K, "wrapper would clamp BLOCK_SIZE_K to next_pow2(K)"
+    assert K % BLOCK_SIZE_K != 0, "EVEN_K would be true; nothing to pin"
+
+    dtype = torch.bfloat16
+    x, _, w_triton, _, _, w_scales_triton, _ = generate_gemm_a16wfp4_inputs(
+        M, N, K, output=False, atomic_add=False, dtype=dtype, layout="TN", shuffle=True
+    )
+
+    with pytest.raises(Exception, match="requires EVEN_K"):
+        gemm_a16wfp4_preshuffle(
+            x, w_triton, w_scales_triton, prequant=True, dtype=dtype, config=config
+        )
