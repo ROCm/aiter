@@ -350,13 +350,14 @@ def shuffle_scale(
 
     if not is_guinterleave:
         m, n = src.shape
-        scale_padded = torch.empty(
-            (m + 255) // 256 * 256,
-            (n + 7) // 8 * 8,
-            dtype=src.dtype,
-            device=src.device,
+        # Zero-pad (not torch.empty) so the alignment padding is deterministic:
+        # uninitialized padding leaked into the shuffled e8m0 scale and corrupted
+        # results for shapes that pad here (Gemma 4 MXFP4). See gemma4 fp4 fix.
+        sm = (m + 255) // 256 * 256
+        sn = (n + 7) // 8 * 8
+        scale_padded = torch.zeros(
+            sm, sn, dtype=src.dtype, device=src.device,
         )
-
         scale_padded[:m, :n] = src
         scale = scale_padded
         sm, sn = scale.shape
