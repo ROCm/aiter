@@ -771,6 +771,18 @@ __global__ void inverse_rope_group_quant_kernel(
             vals[i] = static_cast<float>(in_vec[k][i]);
         }
 
+        // First level of the amax tree, folded into the rotation: a pair is
+        // reduced the moment it is produced. max is associative, so pairing
+        // (2i, 2i+1) here rather than (i, i+kHalf) below leaves amax bit-identical.
+        //
+        // Narrow slice only. At TDS=32, holding red[] live across the rotation
+        // costs 16 floats and an occupancy step, measured +9% on the small
+        // shapes against 1.4-2.2% at s >= 8192 (md 18.18).
+        constexpr int kRed      = THREAD_DATA_SIZE > 1 ? THREAD_DATA_SIZE / 2 : 1;
+        constexpr bool kFuseRed = THREAD_DATA_SIZE <= 16;
+        float red[kRed];
+        bool red_ready = false;
+
         auto rope_whole_slice = [&]()
         {
 #pragma unroll
@@ -782,7 +794,10 @@ __global__ void inverse_rope_group_quant_kernel(
                 const float odd = vals[2 * i + 1];
                 vals[2 * i] = even * c + odd * sn;
                 vals[2 * i + 1] = odd * c - even * sn;
+                if constexpr(kFuseRed)
+                    red[i] = fmaxf(fabsf(vals[2 * i]), fabsf(vals[2 * i + 1]));
             }
+            red_ready = kFuseRed;
         };
 
         if constexpr(kSliceAlignedToRope)
@@ -815,7 +830,10 @@ __global__ void inverse_rope_group_quant_kernel(
                         vals[2 * i] = even * c + odd * sn;
                         vals[2 * i + 1] = odd * c - even * sn;
                     }
+                    if constexpr(kFuseRed)
+                        red[i] = fmaxf(fabsf(vals[2 * i]), fabsf(vals[2 * i + 1]));
                 }
+                red_ready = kFuseRed;
             }
         }
 
@@ -850,11 +868,14 @@ __global__ void inverse_rope_group_quant_kernel(
         else
         {
             constexpr int kHalf = THREAD_DATA_SIZE / 2;
-            float red[kHalf];
-#pragma unroll
-            for(int i = 0; i < kHalf; ++i)
+            static_assert(kHalf == kRed);
+            if(!red_ready)
             {
-                red[i] = fmaxf(fabsf(vals[i]), fabsf(vals[i + kHalf]));
+#pragma unroll
+                for(int i = 0; i < kHalf; ++i)
+                {
+                    red[i] = fmaxf(fabsf(vals[i]), fabsf(vals[i + kHalf]));
+                }
             }
 #pragma unroll
             for(int w = kHalf >> 1; w >= 1; w >>= 1)
