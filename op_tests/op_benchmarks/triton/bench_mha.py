@@ -919,11 +919,7 @@ def parse_args(args: list[str] | None = None) -> BenchRun:
         help="Enable persistent kernels. Use '-persistent dynamic' for dynamic scheduling of the tiles.",
     )
     parser.add_argument(
-        "-o",
-        type=str,
-        default=None,
-        metavar="DIR",
-        help="Write performance results to CSV in DIR",
+        "-o", action="store_true", help="Write performance results to CSV file"
     )
     parser.add_argument(
         "--profile",
@@ -1052,7 +1048,7 @@ def parse_args(args: list[str] | None = None) -> BenchRun:
         plot_name=get_caller_name_no_ext(),
         sink=parsed.sink,
         equal_seqlens=parsed.equal_seqlens,
-        save_path=parsed.o,
+        save_path="." if parsed.o else None,
         profile_dir=parsed.profile,
         print_vgpr=parsed.print_vgpr,
         bench_torch=parsed.bench_torch,
