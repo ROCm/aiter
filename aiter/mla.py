@@ -349,6 +349,9 @@ def get_meta_param(
         32: 128,
         48: 64,
         64: 64,
+        80: 64,
+        96: 64,
+        112: 64,
         128: 32,
         256: 32,
         384: 32,
@@ -356,7 +359,7 @@ def get_meta_param(
     }
 
     if dtype == dtypes.fp8 and not ignore_total_kv:
-        min_block_n = get_block_n_fp8[int(nhead * max_seqlen_q)]
+        min_block_n = get_block_n_fp8.get(int(nhead * max_seqlen_q), 64)
         # ceil(avg_kv / min_block_n) computed in pure integers (avg_kv = total_kv/bs).
         num_kv_splits = min(
             num_kv_splits,
