@@ -127,7 +127,10 @@ def run_torch_gemm_afp8wfp8(
 # (x_scale_group_size, transpose_x_scale). 128/True is what ATOM's per_1x128
 # quant emits; 32/False is MX activations.
 # SCALE_MODES = [(128, False), (128, True), (32, False), (32, True)]
-SCALE_MODES = [(128, True),]
+SCALE_MODES = [
+    (128, True),
+]
+
 
 def get_shapes():
     # (M, N, K), with N % 128 == 0 and K % 128 == 0 to fit the 128x128 W-scale layout.

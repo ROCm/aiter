@@ -137,6 +137,7 @@ def cga_flat(cga):
 def make_wmma_layout(warp_bases, cga):
     return gl.amd.AMDWMMALayout(3, True, warp_bases, [], [16, 16, 128], cga_layout=cga)
 
+
 _gemm_mxfp8_preshuffle_bandwidth_bound_repr = make_kernel_repr(
     "_gemm_mxfp8_preshuffle_gfx1250_bandwidth_bound_kernel",
     _PRESHUFFLE_GLUON_REPR_KEYS,
@@ -800,7 +801,10 @@ def _gemm_mxfp8_preshuffle_bandwidth_bound_kernel(
     # Flat view for the 1-D gathers. reinterpret rather than reshape: reshape
     # derives its own layout and asserts in LLVM on this allocation.
     bs_flat_shared: gl.constexpr = gl.SwizzledSharedLayout(
-        vec=1, per_phase=1, max_phase=1, order=[0],
+        vec=1,
+        per_phase=1,
+        max_phase=1,
+        order=[0],
         cga_layout=cga_flat(cga_bcast(cga_c)),
     )
     bs_flat = bs_slab.reinterpret(
