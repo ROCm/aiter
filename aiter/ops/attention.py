@@ -169,6 +169,9 @@ def _should_use_asm_kernel(
     kv_cache_tensor_dtype: torch.dtype,
     high_precision: int,
 ) -> bool:
+    if get_gfx() not in ("gfx942", "gfx950"):
+        return False
+
     # ASM kernel only supports head_size == 128; all other head sizes use HIP.
     if head_size != 128:
         return False
