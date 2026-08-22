@@ -1,18 +1,111 @@
 import argparse
+import os
 import random
+import resource
+import subprocess
+import sys
 
 import numpy as np
 import torch
 
 from aiter.ops.groupnorm import GroupNorm
+from aiter.test_common import checkAllclose, perftest
 
 random.seed(0)
 torch.manual_seed(0)
 np.random.seed(0)
 
 
-class GroupNormTimer:
+@perftest(num_iters=25, num_warmup=5, num_rotate_args=1, use_cuda_event=True)
+def run_torch_autocast(norm, x):
+    with torch.inference_mode(), torch.amp.autocast("cuda", dtype=torch.float16):
+        return norm(x, use_torch=True)
 
+
+@perftest(num_iters=25, num_warmup=5, num_rotate_args=1, use_cuda_event=True)
+def run_aiter_autocast(norm, x):
+    with torch.inference_mode(), torch.amp.autocast("cuda", dtype=torch.float16):
+        return norm(x)
+
+
+def test_autocast_matches_torch(spatial_size=64):
+    device = torch.device("cuda")
+    num_groups = 32
+    num_channels = 128
+    norm = GroupNorm(
+        num_groups,
+        num_channels,
+        eps=1e-6,
+        affine=True,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    norm.weight = torch.nn.Parameter(
+        torch.randn(num_channels, dtype=torch.bfloat16, device=device)
+    )
+    norm.bias = torch.nn.Parameter(
+        torch.randn(num_channels, dtype=torch.bfloat16, device=device)
+    )
+    x = torch.randn(
+        (1, num_channels, 4, spatial_size, spatial_size),
+        dtype=torch.float16,
+        device=device,
+    )
+
+    expected, torch_us = run_torch_autocast(norm, x)
+    actual, aiter_us = run_aiter_autocast(norm, x)
+
+    assert expected.dtype == torch.float32
+    assert actual.dtype == expected.dtype
+    message = (
+        f"[perf] shape: {tuple(x.shape)}, torch: {torch_us:.2f} us, "
+        f"aiter: {aiter_us:.2f} us, speedup: {torch_us / aiter_us:.2f}x "
+    )
+    mismatch_ratio = checkAllclose(
+        actual,
+        expected,
+        rtol=1e-3,
+        atol=1e-2,
+        tol_err_ratio=0,
+        msg=message,
+    )
+    assert mismatch_ratio == 0
+
+
+def test_mixed_dtype_without_autocast_is_rejected():
+    code = """
+import torch
+from aiter.ops.groupnorm import groupnorm_run
+
+x = torch.randn((1, 8, 4, 4), dtype=torch.float16, device="cuda")
+weight = torch.randn(8, dtype=torch.bfloat16, device="cuda")
+bias = torch.randn(8, dtype=torch.bfloat16, device="cuda")
+groupnorm_run(x, 4, weight, bias, 1e-6)
+"""
+    env = os.environ.copy()
+    env.pop("AITER_REBUILD", None)
+
+    def disable_core_dump():
+        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+
+    process = subprocess.run(
+        [sys.executable, "-c", code],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        preexec_fn=disable_core_dump,
+        check=False,
+    )
+    output = process.stdout + process.stderr
+    assert process.returncode != 0
+    assert (
+        "groupnorm requires input, output, weight, and bias to have the same dtype"
+        in output
+    )
+
+
+class GroupNormTimer:
     def __init__(self, num_groups, num_channels, device, dtype):
         self.norm = GroupNorm(
             num_groups, num_channels, eps=1e-6, affine=True, device=device, dtype=dtype
@@ -70,7 +163,8 @@ class GroupNormTimer:
             print("z :")
             print(z)
 
-        is_equal = torch.allclose(y, z, rtol=1e-3, atol=1e-2)
+        rtol = 1e-2 if self.dtype == torch.bfloat16 else 1e-3
+        is_equal = torch.allclose(y, z, rtol=rtol, atol=1e-2)
         return (time_elapsed_torch, time_elapsed_opt, is_equal)
 
 
@@ -197,7 +291,17 @@ if __name__ == "__main__":
         help="Number of measurement iterations (default: 25)",
     )
 
+    parser.add_argument(
+        "--autocast-spatial-size",
+        type=int,
+        default=64,
+        help="Spatial size for the Hunyuan autocast regression (default: 64)",
+    )
+
     args = parser.parse_args()
+
+    test_autocast_matches_torch(args.autocast_spatial_size)
+    test_mixed_dtype_without_autocast_is_rejected()
 
     print("=== GroupNorm Performance Benchmark ===", flush=True)
     print(f"Device: {args.device}", flush=True)
