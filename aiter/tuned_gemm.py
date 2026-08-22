@@ -471,6 +471,63 @@ def asm_gemm(
     return gemm_a16w16_asm(inp, weights, out_asm, bias, splitK, kernelName, bpreshuffle)
 
 
+_FLY1250_NAME_RE = None
+
+
+def _parse_flydsl_gfx1250_kname(name: str) -> dict:
+    """Parse flydsl_a16w16_gfx1250_t{tm}x{tn}x{tk}_mw{mw}_nw{nw}_nb{nb}_sk{sk}_unroll{0|1}."""
+    global _FLY1250_NAME_RE
+    if _FLY1250_NAME_RE is None:
+        import re
+
+        _FLY1250_NAME_RE = re.compile(
+            r"flydsl_a16w16_gfx1250_t(\d+)x(\d+)x(\d+)_mw(\d+)_nw(\d+)"
+            r"_nb(\d+)_sk(\d+)_unroll([01])"
+        )
+    m = _FLY1250_NAME_RE.match(name)
+    assert m is not None, f"unrecognized flydsl_gfx1250 kernel name: {name!r}"
+    tm, tn, tk, mw, nw, nb, sk, un = (int(g) for g in m.groups())
+    return {
+        "tile_m": tm,
+        "tile_n": tn,
+        "tile_k": tk,
+        "m_warp": mw,
+        "n_warp": nw,
+        "num_buffers": nb,
+        "split_k": sk,
+        "main_loop_unroll": bool(un),
+    }
+
+
+def flydsl_gfx1250_gemm(
+    inp: Tensor,
+    weights: Tensor,
+    solidx: int,
+    bias: Tensor | None = None,
+    otype: torch.dtype | None = None,
+    scale_a: Tensor | None = None,
+    scale_b: Tensor | None = None,
+    scale_c: Tensor | None = None,
+    bpreshuffle=False,
+    config: dict | None = None,
+):
+    assert (
+        scale_a is None and scale_b is None and scale_c is None
+    ), "flydsl_gfx1250 a16w16 does not support scaling."
+    assert not bpreshuffle, "flydsl_gfx1250 a16w16 expects unshuffled weights."
+    from aiter.ops.flydsl.gemm_a16w16_gfx1250 import gemm_a16w16 as _fly1250
+
+    cfg = _parse_flydsl_gfx1250_kname(config["kernelName"])
+    return _fly1250(
+        inp,
+        weights,
+        bias=bias,
+        dtype=otype if otype is not None else inp.dtype,
+        waves_per_eu=None,
+        **cfg,
+    )
+
+
 def flydsl_gemm(
     inp: Tensor,
     weights: Tensor,
@@ -609,6 +666,7 @@ solMap = {
     "asm": asm_gemm,
     "triton": triton_gemm,
     "flydsl": flydsl_gemm,
+    "flydsl_gfx1250": flydsl_gfx1250_gemm,
     "opus": opus_gemm,
 }
 
