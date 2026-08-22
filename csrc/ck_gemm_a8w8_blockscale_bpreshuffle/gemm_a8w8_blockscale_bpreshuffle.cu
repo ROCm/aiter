@@ -12,7 +12,7 @@
 #include "gemm_a8w8_blockscale_bpreshuffle_manifest.h"
 
 using BlockwiseKernel = torch::Tensor (*)(
-    torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&);
+    torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, int);
 
 // Name-keyed dispatch table; see gemm_a8w8_blockscale.cu for the rationale
 // behind std::string_view keys + raw fn-ptr values (constant-init into
@@ -67,18 +67,22 @@ torch::Tensor gemm_a8w8_blockscale_bpreshuffle(torch::Tensor& XQ,
                                                torch::Tensor& x_scale,
                                                torch::Tensor& w_scale,
                                                torch::Tensor& Y,
+                                               int splitK,
                                                std::string kernelName)
 {
     TORCH_CHECK(XQ.dtype() == WQ.dtype(), "Weights and activations should have the same dtype!");
     TORCH_CHECK(x_scale.dtype() == w_scale.dtype(), "Scales should have the same dtype!");
+    TORCH_CHECK(splitK >= 0 && splitK <= 30, "splitK must be in the range [0, 30], got ", splitK);
+
+    int KBatch = 1 << splitK;
 
     if(x_scale.dtype() == at::ScalarType::Float && Y.dtype() == at::ScalarType::Half)
     {
-        blockscale_bpreshuffle_dispatch<F32, F16>(kernelName)(XQ, WQ, x_scale, w_scale, Y);
+        blockscale_bpreshuffle_dispatch<F32, F16>(kernelName)(XQ, WQ, x_scale, w_scale, Y, KBatch);
     }
     else if(x_scale.dtype() == at::ScalarType::Float && Y.dtype() == at::ScalarType::BFloat16)
     {
-        blockscale_bpreshuffle_dispatch<F32, B16>(kernelName)(XQ, WQ, x_scale, w_scale, Y);
+        blockscale_bpreshuffle_dispatch<F32, B16>(kernelName)(XQ, WQ, x_scale, w_scale, Y, KBatch);
     }
     else
     {
