@@ -1391,7 +1391,17 @@ void inverse_rope_group_quant(
 
     auto dispatch_group_size = [&](auto layout_tag)
     {
-        if(quant_group_size == 32)
+        constexpr ScaleLayout LAYOUT = decltype(layout_tag)::value;
+        // n32k4 pins the quant group to 32: a lane's WMMA scaleB operand is the
+        // four e8m0 of one K=128 step, so four groups have to cover 128
+        // elements (md 15.10). The host check rejects the other two before we
+        // get here, so dispatching them only emits kernels nothing can reach --
+        // 288 of them, a third of the module.
+        if constexpr(LAYOUT == kScaleN32K4)
+        {
+            dispatch(layout_tag, ic<32>{});
+        }
+        else if(quant_group_size == 32)
         {
             dispatch(layout_tag, ic<32>{});
         }
