@@ -38,6 +38,11 @@ if is_flydsl_available():
         )
 
     from .fmha_kernels import flydsl_flash_attn_func
+    from .gemm_a4w4 import (
+        PreshuffledA4W4Weight,
+        flydsl_gemm_a4w4,
+        prepare_gemm_a4w4_weight,
+    )
     from .gemm_kernels import flydsl_hgemm, flydsl_preshuffle_gemm_a8
     from .kernels.mqa_logits.fp8_mqa_logits import (
         DEFAULT_VARIANT as FP8_MQA_LOGITS_DEFAULT_VARIANT,
@@ -65,9 +70,11 @@ if is_flydsl_available():
     __all__ += [
         "FP8_MQA_LOGITS_DEFAULT_VARIANT",
         "FP8_MQA_LOGITS_VARIANTS",
+        "PreshuffledA4W4Weight",
         "compute_varqlen_windows",
         "flydsl_flash_attn_func",
         "flydsl_fp8_mqa_logits",
+        "flydsl_gemm_a4w4",
         "flydsl_hgemm",
         "flydsl_mla_reduce_v1",
         "flydsl_moe_stage1",
@@ -77,5 +84,6 @@ if is_flydsl_available():
         "flydsl_pa_mqa_logits_fp4_varqlen",
         "flydsl_preshuffle_gemm_a8",
         "flydsl_qk_norm_rope_quant",
+        "prepare_gemm_a4w4_weight",
         # "flydsl_gdr_decode",
     ]
