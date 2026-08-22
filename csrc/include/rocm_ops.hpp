@@ -2539,7 +2539,10 @@ namespace py = pybind11;
           py::arg("q"),                                                     \
           py::arg("k"),                                                     \
           py::arg("v"),                                                     \
-          py::arg("out"),                                                   \
+          py::arg("o"),                                                     \
+          py::arg("lse"),                                                   \
+          py::arg("scratch_o"),                                            \
+          py::arg("scratch_lse"),                                          \
           py::arg("softmax_scale"),                                         \
           py::arg("causal"),                                                \
           py::arg("return_lse"),                                            \
@@ -2636,6 +2639,7 @@ namespace py = pybind11;
           py::arg("m_indices"),               \
           py::arg("bf16_zero_out"),           \
           py::arg("bf16_zero_workspace"),     \
+          py::arg("sort3stage_ws"),           \
           py::arg("M_logical"),               \
           py::arg("NE"),                      \
           py::arg("TOPK"),                    \

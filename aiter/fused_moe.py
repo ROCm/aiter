@@ -147,6 +147,16 @@ def _adaptive_moe_sort(
     empty_bf16 = _empty_bf16(device)
     bf16_zero = moe_buf if (atomic and BM == 16) else empty_bf16
 
+    # threestage-sort scratch (prologue==1, i.e. BM != 16). Previously allocated
+    # via torch::empty inside the kernel; now passed in so the C++ TU is torch-free.
+    # Size = NE*kSplitSortCtas + NE int32; kSplitSortCtas=16 mirrors
+    # csrc/kernels/mxfp4_moe/moe_aux/codegen/mxfp4_moe_aux_dispatch.h.
+    sort3stage_ws = (
+        torch.empty(0, dtype=dtypes.i32, device=device)
+        if BM == 16
+        else torch.empty(num_experts * 17, dtype=dtypes.i32, device=device)
+    )
+
     aiter.mxfp4_moe_sort(
         topk_ids=topk_ids,
         topk_weight=topk_weights,
@@ -158,6 +168,7 @@ def _adaptive_moe_sort(
         m_indices=m_indices,
         bf16_zero_out=bf16_zero,
         bf16_zero_workspace=empty_bf16,
+        sort3stage_ws=sort3stage_ws,
         M_logical=M,
         NE=num_experts,
         TOPK=topk,
