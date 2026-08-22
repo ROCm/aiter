@@ -282,6 +282,33 @@ def gemm_afp8wfp8_preshuffle(
     if config is None:
         config, _ = _get_config(M, N, K, shuffle=True, backend=backend)
 
+    # CTA-cluster (CGA) multicast, gluon only. CTAS_M x CTAS_N CTAs form one
+    # cluster, and each operand fetch is multicast to every CTA in the cluster
+    # that wants it.
+    #
+    # NOTE the convention flip that happens right here, because the two sides
+    # disagree on what BLOCK_SIZE_M / BLOCK_SIZE_N mean:
+    #
+    #   in the JSON   -> the PER-CTA tile. A tuned config keeps its meaning when
+    #                    CTAS changes, and the LDS/register budget stays
+    #                    readable straight off the file.
+    #   in the kernel -> the CLUSTER tile. gl.arange over BLOCK_SIZE_N then
+    #                    shards across the cluster on its own, and the grid
+    #                    lambda below counts clusters rather than CTAs (triton
+    #                    multiplies the grid by num_ctas at launch).
+    #
+    # So `"BLOCK_SIZE_N": 256, "CTAS_N": 2` is 256 columns per CTA and a
+    # 512-column cluster tile -- per-CTA LDS is unchanged from 1x1, which is the
+    # whole point. Verified: LDS/CTA is 311536 B at 1x1 and 311792 B at both 1x2
+    # and 2x2, rather than halving or quartering.
+    if backend == "gluon":
+        ctas_m, ctas_n = config["CTAS_M"], config["CTAS_N"]
+        num_ctas = ctas_m * ctas_n
+        config["BLOCK_SIZE_M"] *= ctas_m
+        config["BLOCK_SIZE_N"] *= ctas_n
+    else:
+        ctas_m, ctas_n, num_ctas = 1, 1, 1
+
     if y is None and (config["NUM_KSPLIT"] == 1 or not skip_reduce):
         y = torch.empty((M, N), dtype=dtype, device=x.device)
 
@@ -314,6 +341,9 @@ def gemm_afp8wfp8_preshuffle(
             f"Unknown kernel_type '{kernel_type}', must be one of "
             f"{list(_PRESHUFFLE_KERNEL_MAP.keys())}"
         )
+        assert (
+            num_ctas == 1 or kernel_type == "bandwidth_bound"
+        ), f"CGA multicast is only wired into bandwidth_bound, got '{kernel_type}'"
         _LOGGER.info(
             f"GEMM_AFP8WFP8 PRESHUFFLE [gluon/gfx1250]: x={tuple(x.shape)} "
             f"w={tuple(w_view.shape)} kernel={kernel_type}"
@@ -379,6 +409,11 @@ def gemm_afp8wfp8_preshuffle(
             # Not read by the kernel: triton forwards it to the AMD backend as
             # the amdgpu-waves-per-eu occupancy hint. 0 emits no attribute.
             waves_per_eu=config["waves_per_eu"],
+            CTAS_M=ctas_m,
+            CTAS_N=ctas_n,
+            # Reserved launch option (sets the cluster dim) that the kernel also
+            # declares, so it is bound both ways -- like waves_per_eu above.
+            num_ctas=num_ctas,
         )
     else:
         _gemm_afp8wfp8_preshuffle_kernel[grid](

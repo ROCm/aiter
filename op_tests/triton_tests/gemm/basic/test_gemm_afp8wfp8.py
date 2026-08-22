@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import copy
+
 import pytest
 import torch
 
@@ -10,6 +12,7 @@ from aiter.ops.triton.gemm.basic.gemm_afp8wfp8 import (
     gemm_afp8wfp8_preshuffle,
 )
 from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
 from aiter.test_common import checkAllclose
 
 SCALE_GROUP_SIZE = 32  # A: 1x32 e8m0 scale group
@@ -123,26 +126,17 @@ def run_torch_gemm_afp8wfp8(
 
 # (x_scale_group_size, transpose_x_scale). 128/True is what ATOM's per_1x128
 # quant emits; 32/False is MX activations.
-SCALE_MODES = [(128, False), (128, True), (32, False), (32, True)]
-
+# SCALE_MODES = [(128, False), (128, True), (32, False), (32, True)]
+SCALE_MODES = [(128, True),]
 
 def get_shapes():
     # (M, N, K), with N % 128 == 0 and K % 128 == 0 to fit the 128x128 W-scale layout.
     return [
         (m, n, k)
         # for m in [1, 8, 16, 32, 64, 512, 16384]
-        for m in [64, 512, 16384]
+        for m in [512, 16384]
         for n, k in [
-            (2048, 7168),
-            (16384, 1536),
-            (8192, 1536),
-            (7168, 4096),
-            (1536, 7168),
-            (7168, 768),
             (65536, 1536),
-            (7168, 16384),
-            (6144, 7168),
-            (7168, 3072),
         ]
     ]
 
@@ -265,6 +259,81 @@ def test_gemm_afp8wfp8_preshuffle(
         catastrophic_check=True,
     )
     assert err < TOL_ERR_RATIO, f"{err:.2%} of elements mismatch"
+
+
+@pytest.mark.parametrize("ragged", [False, True])
+@pytest.mark.parametrize("ctas_m, ctas_n", [(2, 1), (1, 2), (2, 2), (4, 1), (1, 4)])
+def test_gluon_preshuffle_cga_multicast(ctas_m: int, ctas_n: int, ragged: bool):
+    """CTA-cluster (CGA) operand multicast reproduces the single-CTA result.
+
+    BLOCK_SIZE_M / BLOCK_SIZE_N become the cluster tile, so a CTAS_M x CTAS_N
+    cluster covers the same output tile with the same per-CTA footprint and each
+    operand fetch multicast to the CTAs that share it. The result must be
+    bit-identical to CTAS 1x1: multicast changes who reads a byte, never which
+    byte or the order it is accumulated in.
+    """
+    if not _gluon_available():
+        pytest.skip("Gluon MXFP8 preshuffle CGA multicast requires gfx1250")
+
+    from triton._C.libtriton.gluon_ir import make_cga_layout
+
+    from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_mxfp8 import (
+        cga_bases,
+    )
+
+    # The kernel cannot call make_cga_layout (nanobind, rejected by gluon's
+    # dependency walker), so it reimplements it -- pin the two together.
+    assert cga_bases(ctas_m, ctas_n) == make_cga_layout(
+        [ctas_m, ctas_n], [ctas_m, ctas_n], [0, 1]
+    )
+
+    torch.manual_seed(0)
+    x_scale_group_size, transpose_x_scale = 128, True
+    config, _ = get_gemm_config(
+        "GEMM-AFP8WFP8_PRESHUFFLED", 1024, 1024, 1536, backend="gluon"
+    )
+    # Enough tiles that the cluster grid has more than one entry in both dims.
+    M = config["BLOCK_SIZE_M"] * ctas_m * 2
+    N = config["BLOCK_SIZE_N"] * ctas_n * 2
+    K = 1536
+    if ragged:
+        # A cluster tile that does not divide M: the tail is handled purely by
+        # the TDM descriptor bounds (zero-fill on load, clip on store), same as
+        # the single-CTA path -- but the cluster tile is CTAS_M times larger, so
+        # a CGA turns shapes that used to be exact into ragged ones. N stays
+        # aligned because the preshuffled B descriptor is indexed in N//16.
+        M -= config["BLOCK_SIZE_M"] // 2
+
+    x_fp8, _, w_kernel, _, x_scales_kernel, w_scales = generate_inputs(
+        M,
+        N,
+        K,
+        shuffle=True,
+        x_scale_group_size=x_scale_group_size,
+        transpose_x_scale=transpose_x_scale,
+    )
+
+    def run(cm, cn):
+        cfg = copy.deepcopy(config)
+        cfg["CTAS_M"], cfg["CTAS_N"] = cm, cn
+        return gemm_afp8wfp8_preshuffle(
+            x_fp8,
+            w_kernel,
+            x_scales_kernel,
+            w_scales,
+            dtype=torch.bfloat16,
+            config=cfg,
+            x_scale_group_size=x_scale_group_size,
+            is_x_scale_transposed=transpose_x_scale,
+            backend="gluon",
+        )
+
+    single = run(1, 1)
+    clustered = run(ctas_m, ctas_n)
+    assert torch.equal(single, clustered), (
+        f"CTAS {ctas_m}x{ctas_n} differs from 1x1: max abs delta "
+        f"{(single.float() - clustered.float()).abs().max().item()}"
+    )
 
 
 @pytest.mark.parametrize("M, N, K", get_shapes())

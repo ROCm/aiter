@@ -32,7 +32,110 @@ _PRESHUFFLE_GLUON_REPR_KEYS = [
     "NUM_BUFFERS",
     "LOOP_UNROLL_FACTOR",
     "B_SCALE_TDM",
+    "CTAS_M",
+    "CTAS_N",
 ]
+
+
+# --------------------------------------------------------------------------- #
+# CTA-cluster (CGA) layouts -- operand multicast
+# --------------------------------------------------------------------------- #
+# gfx1250 can launch a workgroup cluster of CTAS_M x CTAS_N CTAs and fan a single
+# TDM fetch out to every CTA in it. Which CTAs share a fetch is decided entirely
+# by layout: a cga_layout is a list of bases, one per CTA-id bit, where basis[d]
+# is that bit's stride along dim d in units of the PER-CTA shape. A basis entry
+# of 0 replicates the dimension across that bit -- and that replication is the
+# multicast.
+#
+# BLOCK_SIZE_M / BLOCK_SIZE_N are the CLUSTER tile, so the per-CTA tile (and
+# hence LDS and register pressure) is BLOCK_SIZE_M // CTAS_M by
+# BLOCK_SIZE_N // CTAS_N. Nothing in the index arithmetic changes: gl.arange
+# over a logical block shape hands each CTA its own shard, and TDM applies the
+# per-CTA offset from the destination's CGA layout. gl.program_id(0) is the
+# CLUSTER id -- every CTA of a cluster sees the same value -- so the grid counts
+# clusters and triton scales it by num_ctas at launch.
+#
+#   CTAS_M x CTAS_N = 2 x 2  ->  cga_c = [[1, 0], [0, 1]]  (bit0 -> M, bit1 -> N)
+#     A is (M, K), K never split  ->  [[1, 0], [0, 0]]  broadcast over the N bit
+#     B is (K, N), K never split  ->  [[0, 0], [0, 1]]  broadcast over the M bit
+#
+# so at 2x2 each operand tile is fetched once per cluster and multicast to the
+# two CTAs that want it -- half the operand request traffic of four independent
+# CTAs, at unchanged per-CTA LDS.
+
+
+@gluon.constexpr_function
+def cga_bases(ctas_m, ctas_n):
+    """Pure-python ``make_cga_layout([m, n], [m, n], [0, 1])``.
+
+    Deliberately not a call into libtriton's ``make_cga_layout``: gluon's
+    dependency walker inspects the globals of every function a kernel body
+    references and rejects nanobind builtins outright ("Unsupported function
+    referenced"), so even a constexpr_function wrapper around it cannot be used
+    from inside a kernel. Equivalence is asserted in the op test.
+    """
+    bases = []
+    for dim, ctas in ((0, ctas_m), (1, ctas_n)):
+        bit = 1
+        while bit < ctas:
+            basis = [0, 0]
+            basis[dim] = bit
+            bases.append(basis)
+            bit *= 2
+    return bases
+
+
+@gluon.constexpr_function
+def cga_drop_k(cga, operand_index):
+    """Zero the K dim of a rank-2 CGA, mirroring ``DotOperandLayout.cga_layout``.
+
+    Zeroing is what turns the other CTA axis into a broadcast: the M-major
+    operand stops depending on the N-CTA bit, and vice versa.
+    """
+    if not cga:
+        return []
+    k_dim = 1 if operand_index == 0 else 0
+    return [[0 if d == k_dim else b[d] for d in range(2)] for b in cga]
+
+
+@gluon.constexpr_function
+def cga_swap(cga):
+    """Transpose a rank-2 CGA, for a tensor whose storage swaps the two dims."""
+    return [[b[1], b[0]] for b in cga]
+
+
+@gluon.constexpr_function
+def cga_bcast(cga):
+    """All-broadcast CGA with the same CTA-bit count: every CTA holds everything.
+
+    For a buffer small enough that replication is free this beats sharding: the
+    fill is still one multicast fetch, and the reader's index arithmetic stays
+    cluster-relative. A *sharded* memdesc read with a replicated index is
+    rejected outright -- "AMDGPU does not support cross-CTA shared memory
+    transfers" -- which is exactly what a flat gather over a sharded slab is.
+    """
+    return [[0 for _ in b] for b in cga]
+
+
+@gluon.constexpr_function
+def cga_flat(cga):
+    """Project a rank-2 dim0-major CGA onto its flattened rank-1 view.
+
+    Basis strides are in units of the per-CTA block, and flattening a
+    (rows, cols) tensor whose cols are never split just renames the row block as
+    the flat block, so the dim0 stride carries over verbatim. Collapsing it to 1
+    would make two CTA bits share a stride, which the compiler rejects with
+    "after removing broadcast bases the CGA encoding must be a permutation
+    matrix".
+    """
+    if not cga:
+        return []
+    return [[b[0]] for b in cga]
+
+
+@gluon.constexpr_function
+def make_wmma_layout(warp_bases, cga):
+    return gl.amd.AMDWMMALayout(3, True, warp_bases, [], [16, 16, 128], cga_layout=cga)
 
 _gemm_mxfp8_preshuffle_bandwidth_bound_repr = make_kernel_repr(
     "_gemm_mxfp8_preshuffle_gfx1250_bandwidth_bound_kernel",
@@ -336,6 +439,14 @@ def _gemm_mxfp8_preshuffle_bandwidth_bound_kernel(
     LOOP_UNROLL_FACTOR: gl.constexpr = 1,
     B_SCALE_TDM: gl.constexpr = True,
     waves_per_eu: gl.constexpr = 0,
+    # CTA-cluster shape. BLOCK_SIZE_M / BLOCK_SIZE_N are the CLUSTER tile, so
+    # the per-CTA tile is BLOCK_SIZE_M // CTAS_M by BLOCK_SIZE_N // CTAS_N and
+    # operand fetches are multicast across the cluster. 1 x 1 is the
+    # single-CTA path and compiles to exactly what it did before.
+    CTAS_M: gl.constexpr = 1,
+    CTAS_N: gl.constexpr = 1,
+    # Reserved launch option; also declared so the body can branch on it.
+    num_ctas: gl.constexpr = 1,
 ):
     """
     Gluon gfx1250 kernel for FP8 x FP8 GEMM with preshuffled weights.
@@ -392,8 +503,12 @@ def _gemm_mxfp8_preshuffle_bandwidth_bound_kernel(
     # free in occupancy terms. A K span that would overflow it (BLOCK_SIZE_M 256
     # past K 16384) keeps the in-loop global path.
     A_SCALE_SLAB_BYTES: gl.constexpr = 32768
+    # Per-CTA rows, not cluster rows: LDS is a per-CTA resource, and under a CGA
+    # the slab is sharded along M so a CTA only stores BLOCK_SIZE_M // CTAS_M of
+    # them. Scaling BLOCK_SIZE_M by CTAS_M therefore leaves the budget unchanged.
     A_SCALE_CHUNK_K: gl.constexpr = (
-        (A_SCALE_SLAB_BYTES * A_SCALE_K_GROUP // BLOCK_SIZE_M) // BLOCK_SIZE_K
+        (A_SCALE_SLAB_BYTES * A_SCALE_K_GROUP // (BLOCK_SIZE_M // CTAS_M))
+        // BLOCK_SIZE_K
     ) * BLOCK_SIZE_K
     NUM_SCALE_CHUNKS: gl.constexpr = (
         SPLITK_BLOCK_SIZE + A_SCALE_CHUNK_K - 1
@@ -513,30 +628,56 @@ def _gemm_mxfp8_preshuffle_bandwidth_bound_kernel(
 
     NUM_K_ITER = gl.cdiv(K_local, BLOCK_SIZE_K)
 
+    # ---- CGA (CTA-cluster) layouts ----
+    # See the module header. Every one of these is [] at CTAS_M == CTAS_N == 1,
+    # so the single-CTA path gets exactly the layout set it had before.
+    cga_c: gl.constexpr = cga_bases(CTAS_M, CTAS_N)
+    CGA_A: gl.constexpr = cga_drop_k(cga_c, 0)  # A is (M, K)
+    CGA_B: gl.constexpr = cga_drop_k(cga_c, 1)  # B is (K, N)
+    CGA_A_T: gl.constexpr = cga_swap(CGA_A)  # A-scale slab is stored (K, M)
+    CGA_B_NM: gl.constexpr = cga_swap(CGA_B)  # preshuffled B is stored N-major
+
     # ---- layouts ----
     # fp8 operands: 1 byte each, so both sides use the k=128 wmma instruction
     # shape with k_width=16 (matching the fp8 side of the a8w4 MoE kernel).
-    wmma_layout: gl.constexpr = gl.amd.AMDWMMALayout(
-        3, True, warp_bases, [], [16, 16, 128]
-    )
+    wmma_layout: gl.constexpr = make_wmma_layout(warp_bases, cga_c)
     dot_a_layout: gl.constexpr = gl.DotOperandLayout(
         operand_index=0, parent=wmma_layout, k_width=16
     )
     dot_b_layout: gl.constexpr = gl.DotOperandLayout(
         operand_index=1, parent=wmma_layout, k_width=16
     )
+    # get_wmma_scale_layout reads its argument's PARENT cga_layout, not the one
+    # DotOperandLayout derives, so passing dot_a_layout / dot_b_layout would give
+    # the scale tiles the accumulator's CGA -- which splits a scale tile along K
+    # instead of broadcasting it, and silently feeds wmma_scaled the wrong bytes.
+    # Each scale operand therefore gets its own parent already carrying the CGA
+    # of the tensor it indexes: CGA_A for the (M, K_GROUPS) A-scale tile,
+    # CGA_B_NM for the (N, K_GROUPS) B-scale tile.
     a_scale_layout: gl.constexpr = gl.amd.gfx1250.get_wmma_scale_layout(
-        dot_a_layout, [BLOCK_SIZE_M, K_GROUPS], scale_factor=SCALE_GROUP_SIZE
+        gl.DotOperandLayout(
+            operand_index=0,
+            parent=make_wmma_layout(warp_bases, CGA_A),
+            k_width=16,
+        ),
+        [BLOCK_SIZE_M, K_GROUPS],
+        scale_factor=SCALE_GROUP_SIZE,
     )
     b_scale_layout: gl.constexpr = gl.amd.gfx1250.get_wmma_scale_layout(
-        dot_b_layout, [BLOCK_SIZE_N, K_GROUPS], scale_factor=SCALE_GROUP_SIZE
+        gl.DotOperandLayout(
+            operand_index=1,
+            parent=make_wmma_layout(warp_bases, CGA_B_NM),
+            k_width=16,
+        ),
+        [BLOCK_SIZE_N, K_GROUPS],
+        scale_factor=SCALE_GROUP_SIZE,
     )
 
     tdm_shared_a: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
-        [[BLOCK_SIZE_K, 16]], [BLOCK_SIZE_M, BLOCK_SIZE_K], [1, 0]
+        [[BLOCK_SIZE_K, 16]], [BLOCK_SIZE_M, BLOCK_SIZE_K], [1, 0], CGA_A
     )
     tdm_shared_b: gl.constexpr = gl.SwizzledSharedLayout(
-        vec=1, per_phase=1, max_phase=1, order=[1, 0]
+        vec=1, per_phase=1, max_phase=1, order=[1, 0], cga_layout=CGA_B_NM
     )
 
     # ---- scale addressing (see _load_scale_tile) ----
@@ -616,7 +757,7 @@ def _gemm_mxfp8_preshuffle_bandwidth_bound_kernel(
     # Lane n reads slab[kg, n] -> consecutive bytes across lanes, so an unpadded
     # swizzled layout is already bank-conflict free.
     as_shared: gl.constexpr = gl.SwizzledSharedLayout(
-        vec=1, per_phase=1, max_phase=1, order=[1, 0]
+        vec=1, per_phase=1, max_phase=1, order=[1, 0], cga_layout=CGA_A_T
     )
     if A_SCALE_IN_LDS:
         as_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
@@ -634,15 +775,33 @@ def _gemm_mxfp8_preshuffle_bandwidth_bound_kernel(
     # 128x row replication wmma_scaled wants happens in registers at gather time
     # (see _gather_scale_vec), which is what lets this be 128 B instead of 16 KiB
     # and lifts the BLOCK_SIZE_N == 128 restriction the old TDM fill had.
+    #
+    # Under a CGA this slab is REPLICATED across the cluster rather than sharded
+    # along N like the B operand it belongs to. Two reasons, both hard:
+    #  - it is BS_N_GROUPS x B_SCALE_COLS bytes (128 B at BLOCK_SIZE_N 128 /
+    #    K 16384, 512 B at the widest tuned config), so replication is free, and
+    #    the fill is still a single multicast fetch either way;
+    #  - the reader is a FLAT gather whose index tensor is replicated across the
+    #    cluster (the K-group axis is never split). Reading a sharded memdesc
+    #    with a replicated index is rejected outright -- "AMDGPU does not
+    #    support cross-CTA shared memory transfers" -- and making the index
+    #    CTA-relative instead would mean deriving the CTA's own N shard, which
+    #    gluon exposes no intrinsic for.
+    # Replicating keeps bs_grp_n cluster-relative, so the gather code below is
+    # byte-identical to the single-CTA path.
+    bs_shared: gl.constexpr = gl.SwizzledSharedLayout(
+        vec=1, per_phase=1, max_phase=1, order=[1, 0], cga_layout=cga_bcast(cga_c)
+    )
     bs_slab = gl.allocate_shared_memory(
         b_scale_ptr.dtype.element_ty,
         shape=[BS_N_GROUPS, B_SCALE_COLS],
-        layout=as_shared,
+        layout=bs_shared,
     )
     # Flat view for the 1-D gathers. reinterpret rather than reshape: reshape
     # derives its own layout and asserts in LLVM on this allocation.
     bs_flat_shared: gl.constexpr = gl.SwizzledSharedLayout(
-        vec=1, per_phase=1, max_phase=1, order=[0]
+        vec=1, per_phase=1, max_phase=1, order=[0],
+        cga_layout=cga_flat(cga_bcast(cga_c)),
     )
     bs_flat = bs_slab.reinterpret(
         dtype=b_scale_ptr.dtype.element_ty,
@@ -655,7 +814,11 @@ def _gemm_mxfp8_preshuffle_bandwidth_bound_kernel(
     # of the loop. It is a BS_N_GROUPS-row load now, not BLOCK_SIZE_N.
     if not USE_B_SCALE_TDM:
         bs_fill_layout: gl.constexpr = gl.BlockedLayout(
-            [1, B_SCALE_COLS], [32, 1], [num_warps, 1], [1, 0]
+            [1, B_SCALE_COLS],
+            [32, 1],
+            [num_warps, 1],
+            [1, 0],
+            cga_layout=cga_bcast(cga_c),
         )
         # Clamped, not masked, exactly as _load_scale_tile does: a column past
         # the real K span is only ever gathered for a K tile the loop does not
@@ -703,7 +866,7 @@ def _gemm_mxfp8_preshuffle_bandwidth_bound_kernel(
             shape=(gl.cdiv(N, B_SCALE_N_GROUP), gl.cdiv(K_local, B_SCALE_K_GROUP)),
             strides=(stride_bsn, stride_bsk),
             block_shape=(BS_N_GROUPS, B_SCALE_COLS),
-            layout=as_shared,
+            layout=bs_shared,
         )
         gl.amd.gfx1250.tdm.async_load(
             bs_desc, [(pid_n * BLOCK_SIZE_N) // B_SCALE_N_GROUP, 0], bs_slab
@@ -719,7 +882,14 @@ def _gemm_mxfp8_preshuffle_bandwidth_bound_kernel(
         )
         num_loads += 1
 
+    # cluster.arrive/wait bracket the TDM wait so every CTA of a cluster stays
+    # within one iteration of the others -- the hardware only coalesces the
+    # fetches into one multicast when they are issued together.
+    if num_ctas > 1:
+        gl.amd.gfx1250.cluster.arrive()
     gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2) * 2)
+    if num_ctas > 1:
+        gl.amd.gfx1250.cluster.wait()
 
     # Only the register-staged path needs this: the fill layout spreads rows
     # across waves while the gather reads them in the wmma scale layout, so a
@@ -790,7 +960,11 @@ def _gemm_mxfp8_preshuffle_bandwidth_bound_kernel(
             pred=1,
         )
 
+        if num_ctas > 1:
+            gl.amd.gfx1250.cluster.arrive()
         gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2) * 2)
+        if num_ctas > 1:
+            gl.amd.gfx1250.cluster.wait()
         num_loads += 1
         num_computes += 1
 
@@ -841,7 +1015,11 @@ def _gemm_mxfp8_preshuffle_bandwidth_bound_kernel(
             cur_a, cur_as, "e4m3", cur_b, cur_bs, "e4m3", acc
         )
 
+        if num_ctas > 1:
+            gl.amd.gfx1250.cluster.arrive()
         gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 3 - i) * 2)
+        if num_ctas > 1:
+            gl.amd.gfx1250.cluster.wait()
 
         num_computes += 1
 
@@ -892,8 +1070,12 @@ def _gemm_mxfp8_preshuffle_bandwidth_bound_kernel(
     # ---------------- Store ----------------
     # c_ptr is the (M, N) output for NUM_KSPLIT == 1, or the fp32 partial slab
     # c_ptr + pid_k * stride_ck otherwise (a downstream reduce sums the slabs).
+    # The padding interval is the PER-CTA innermost block dim: a TDM store
+    # rejects a padInterval that is not equal to the innermost dimension of the
+    # block it actually moves, and under a CGA that block is
+    # BLOCK_SIZE_N // CTAS_N wide.
     tdm_shared_c: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
-        [[BLOCK_SIZE_N, 8]], [BLOCK_SIZE_M, BLOCK_SIZE_N], [1, 0]
+        [[BLOCK_SIZE_N // CTAS_N, 8]], [BLOCK_SIZE_M, BLOCK_SIZE_N], [1, 0], cga_c
     )
     tdm_smem_c = gl.allocate_shared_memory(
         c_ptr.type.element_ty,
