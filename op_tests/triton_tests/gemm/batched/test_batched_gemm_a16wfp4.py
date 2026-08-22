@@ -1,6 +1,9 @@
 import pytest
 import torch
 
+from aiter.ops.triton._triton_kernels.gemm.batched.batched_gemm_a16wfp4 import (
+    _get_config,
+)
 from aiter.ops.triton.gemm.batched.batched_gemm_a16wfp4 import (
     batched_gemm_a16wfp4,
 )
@@ -188,6 +191,50 @@ def test_batched_gemm_a16wfp4(B: int, M: int, N: int, K: int, layout, dtype):
     torch_out = run_torch(x, w, w_scales, dtype).to(dtype)
 
     batched_gemm_a16wfp4(x, w, w_scales, dtype, out, transpose_bm=False, prequant=True)
+
+    torch.testing.assert_close(torch_out, out)
+
+
+@pytest.mark.parametrize(
+    "B, M, N, K, BLOCK_SIZE_K",
+    [(2, 7, 512, 192, 128), (3, 16, 128, 192, 128), (2, 7, 512, 1152, 256)],
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_batched_gemm_a16wfp4_odd_k_tail_masks(
+    B: int, M: int, N: int, K: int, BLOCK_SIZE_K: int, dtype
+):
+    """Regression: the two OOB reads on the EVEN_K == False path. A's
+    bound must be 2*K (K is packed, A is bf16), and the b_scales load must
+    be masked or it reads past the scale tensor, where 0xFF is e8m0 NaN."""
+    if not (arch_info.is_fp4_avail()):
+        pytest.skip("MXFP4 not supported on this architecture")
+
+    config, _ = _get_config(M, N, K // 2)
+    config = dict(config)
+    config["BLOCK_SIZE_K"] = BLOCK_SIZE_K
+    assert config["NUM_KSPLIT"] == 1, f"expected NUM_KSPLIT == 1, got {config}"
+    assert BLOCK_SIZE_K < K, "wrapper would clamp BLOCK_SIZE_K to next_pow2(K)"
+    assert K % BLOCK_SIZE_K != 0, "EVEN_K would be true; nothing to pin"
+
+    x, w, _x_scales, w_scales, out = generate_batched_gemm_a16wfp4_inputs(
+        B, M, N, K, dtype, layout="TN", output=True
+    )
+
+    num_groups = K // SCALE_GROUP_SIZE
+    numel = B * num_groups * N
+    poisoned = torch.full(
+        (2 * numel + 2 * N,), 0xFF, dtype=torch.uint8, device=w_scales.device
+    )
+    w_scales_oob = poisoned[:numel].view(B, num_groups, N).transpose(1, 2)
+    w_scales_oob.copy_(w_scales)
+    assert w_scales_oob.shape == w_scales.shape
+    assert w_scales_oob.stride() == w_scales.stride()
+
+    torch_out = run_torch(x, w, w_scales_oob, dtype).to(dtype)
+
+    batched_gemm_a16wfp4(
+        x, w, w_scales_oob, dtype, out, config=config, transpose_bm=False, prequant=True
+    )
 
     torch.testing.assert_close(torch_out, out)
 
