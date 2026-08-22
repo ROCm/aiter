@@ -1030,6 +1030,11 @@ void inverse_rope_group_quant(
     constexpr int HEAD_DIM_T = 512;
     constexpr int RD_T = 64;
 
+    // Decided below, next to the slice width it overrides, and read by the tier
+    // gate inside the launch: where a block covers the whole row there is no
+    // tier left to sort. md 18.14.
+    bool whole_row_block = false;
+
     // k_slots (groups a block covers per pass) is a runtime launch choice: it
     // only sizes the block, so it costs no extra kernel instantiations.
     auto launch = [&](auto layout_tag, auto group_tag, auto tds_tag, auto kpt_tag,
@@ -1111,7 +1116,8 @@ void inverse_rope_group_quant(
             // sort lands on a different set of addresses there and none of the
             // measurements behind it were taken on that placement.
             const int slots_per_wave = std::max(wave_size / THREADS_PER_GROUP, 1);
-            const bool tier_base_ok = LAYOUT == kScaleN32K4 && heads_k > 0 &&
+            const bool tier_base_ok = !whole_row_block &&
+                                      LAYOUT == kScaleN32K4 && heads_k > 0 &&
                                       k_slots > 0 && wave_size != 64;
             // Run 8 cuts the head in two and needs the nope side to be a whole
             // number of waves' slots. Run 4 instead makes a pass one hi value,
@@ -1266,7 +1272,27 @@ void inverse_rope_group_quant(
         const int64_t simds = static_cast<int64_t>(get_num_cu_func()) * 4;
         const int64_t wide_waves =
             static_cast<int64_t>(rows) * D / (wave_size * 32);
+
+        // Decided before the slice width because it overrides it: the whole-row
+        // block wants the wide slice, and the band does not end at the narrow
+        // crossover but one step later -- holding the ceiling at 64 is worth
+        // 10-13% at 48 waves/SIMD and 7-12% at 56, on all three of G=16/4/2
+        // with no interval overlap (md 18.16.6).
+        //
+        // Both edges are fitted to this card. waves/SIMD and the working set
+        // are collinear across every shape knob here, so no sweep can say which
+        // one they track, and masking CUs rules out real concurrency but not
+        // the host config (md 18.16.3, 18.16.4). Past 64 the runtime goes
+        // bimodal over a ~3% spread in a config that does not change there, so
+        // there is nothing to fit anyway.
+        constexpr int kWholeRowFloorWavesPerSimd = 32;
+        constexpr int kWholeRowCeilWavesPerSimd  = 64;
+        whole_row_block = !wave64 && LAYOUT == kScaleN32K4 && GS == 32 &&
+                          wide_waves >= simds * kWholeRowFloorWavesPerSimd &&
+                          wide_waves < simds * kWholeRowCeilWavesPerSimd;
+
         const bool narrow_slice =
+            !whole_row_block &&
             wide_waves >= simds * kNarrowCrossoverWavesPerSimd;
 
         // Bytes per thread at bf16/fp16: 16B on wave64, else 32B or 64B.
@@ -1345,9 +1371,13 @@ void inverse_rope_group_quant(
                                heads_k_d > 0 && kGphD % 4 == 0 &&
                                kRopeFirstGD >= kGphD - 4 &&
                                heads_k_d * 4 == k_slots_min;
+        // In the whole-row band the launch is already large enough that the
+        // one-wave block run 4 needs is the wrong trade: giving up the tier and
+        // handing a block the whole row is worth 14-21% there (md 18.14).
         const int waves_per_block =
-            (kMfmaTile || wave64) ? 4
-                                  : ((LAYOUT == kScaleN32K4 && !run4_fits) ? 2 : 1);
+            (kMfmaTile || wave64 || whole_row_block)
+                ? 4
+                : ((LAYOUT == kScaleN32K4 && !run4_fits) ? 2 : 1);
         int k_slots = std::min(
             std::max(waves_per_block * wave_size / threads_per_group, 1), scale_n);
         const int64_t target_blocks = static_cast<int64_t>(get_num_cu_func()) * 4;
