@@ -1,4 +1,18 @@
+import pytest
 import torch
+
+from aiter.ops.triton.attention.mha import gluon_forward_unsupported_reason
+
+
+def skip_if_gluon_unsupported(backend: str, **feature_flags):
+    """
+    Skip forward tests the Gluon backend can't run.
+    """
+    if backend != "gluon":
+        return
+    reason = gluon_forward_unsupported_reason(**feature_flags)
+    if reason:
+        pytest.skip(reason)
 
 
 def pad_rearrange_dropout_mask(
