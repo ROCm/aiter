@@ -59,6 +59,10 @@ if is_flydsl_available():
     from .kernels.qk_norm_rope_quant import flydsl_qk_norm_rope_quant
     from .mla_reduce_kernels import flydsl_mla_reduce_v1
     from .moe_kernels import flydsl_moe_stage1, flydsl_moe_stage2
+    from .mla_kernels import (
+        flydsl_mla_pagesize1_fp8_fp8,
+        flydsl_mla_pagesize64_fp8_fp8,
+    )
 
     # from .linear_attention_kernels import flydsl_gdr_decode
 
@@ -69,6 +73,8 @@ if is_flydsl_available():
         "flydsl_flash_attn_func",
         "flydsl_fp8_mqa_logits",
         "flydsl_hgemm",
+        "flydsl_mla_pagesize1_fp8_fp8",
+        "flydsl_mla_pagesize64_fp8_fp8",
         "flydsl_mla_reduce_v1",
         "flydsl_moe_stage1",
         "flydsl_moe_stage2",
