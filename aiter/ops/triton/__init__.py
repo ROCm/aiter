@@ -112,16 +112,8 @@ _BACKWARD_COMPAT_MAP = {
     "fused_mul_add": "fusions.fused_mul_add",
     "fused_qk_concat": "fusions.fused_qk_concat",
     # MOE modules (moe/)
-    "moe_align_block_size": "moe.moe_align_block_size",
-    "moe_op_e2e": "moe.moe_op_e2e",
-    "moe_op_gelu": "moe.moe_op_gelu",
     "moe_op_gemm_a8w4": "moe.moe_op_gemm_a8w4",
     "moe_op_gemm_a8w8": "moe.moe_op_gemm_a8w8",
-    "moe_op_mxfp4_silu_fused": "moe.moe_op_mxfp4_silu_fused",
-    "moe_op_mxfp4": "moe.moe_op_mxfp4",
-    "moe_op_silu_fused": "moe.moe_op_silu_fused",
-    "moe_op": "moe.moe_op",
-    "moe_routing_sigmoid_top1_fused": "moe.moe_routing_sigmoid_top1_fused",
     "moe_routing": "moe.moe_routing",
     "quant_moe": "moe.quant_moe",
     # Normalization modules (normalization/)
@@ -139,7 +131,6 @@ _BACKWARD_COMPAT_MAP = {
     "logger": "utils.logger",
     "mha_kernel_utils": "utils.mha_kernel_utils",
     "moe_common": "utils.moe_common",
-    "moe_config_utils": "utils.moe_config_utils",
     "types": "utils.types",
     # Quant modules (quant/)
     "fused_fp8_quant": "quant.fused_fp8_quant",
