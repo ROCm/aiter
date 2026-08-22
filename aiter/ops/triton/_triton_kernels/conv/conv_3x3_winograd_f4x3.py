@@ -8,24 +8,17 @@ from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils.conv_config_utils import get_conv_config
 
 from ..activation import _gelu_tanh, _relu, _relu6
-from .helpers import CONV_AUTOTUNE_ENABLED
 
 
 def _get_config_input(shape_key=None, M=None):
-    if CONV_AUTOTUNE_ENABLED:
-        return {}
     return get_conv_config("CONV-WINO-F4X3-INPUT", shape_key=shape_key, M=M)
 
 
 def _get_config_gemm(shape_key=None, M=None):
-    if CONV_AUTOTUNE_ENABLED:
-        return {}
     return get_conv_config("CONV-WINO-F4X3-GEMM", shape_key=shape_key, M=M)
 
 
 def _get_config_output(shape_key=None, M=None):
-    if CONV_AUTOTUNE_ENABLED:
-        return {}
     return get_conv_config("CONV-WINO-F4X3-OUTPUT", shape_key=shape_key, M=M)
 
 
@@ -957,7 +950,7 @@ def _winograd_f4x3_output_transform_kernel(
 
     # Bias
     if HAS_BIAS:
-        bias = tl.load(BIAS + offs_k, mask=k_mask, other=0.0)
+        bias = tl.load(BIAS + offs_k, mask=k_mask, other=0.0).to(tl.float32)
         y00 += bias
         y01 += bias
         y02 += bias
@@ -1078,84 +1071,3 @@ def _winograd_f4x3_output_transform_kernel(
                         tl.store(
                             y_base + p * stride_y_p + q * stride_y_q, val, mask=k_mask
                         )
-
-
-# Autotune search spaces (used when AITER_TRITON_CONV_AUTOTUNE=1).
-AUTOTUNE_WINO_GEMM_CONFIGS = [
-    triton.Config(
-        {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_SIZE_M": 8},
-        num_warps=8,
-        num_stages=1,
-    ),
-    triton.Config(
-        {"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 64, "GROUP_SIZE_M": 8},
-        num_warps=4,
-        num_stages=1,
-    ),
-    triton.Config(
-        {"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_SIZE_M": 8},
-        num_warps=4,
-        num_stages=1,
-    ),
-    triton.Config(
-        {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 64, "GROUP_SIZE_M": 4},
-        num_warps=4,
-        num_stages=1,
-    ),
-    # gfx1100 (RDNA3): smaller tiles / fewer warps for small-T buckets.
-    triton.Config(
-        {"BLOCK_M": 32, "BLOCK_N": 64, "BLOCK_K": 64, "GROUP_SIZE_M": 4},
-        num_warps=4,
-        num_stages=1,
-    ),
-    triton.Config(
-        {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 64, "GROUP_SIZE_M": 4},
-        num_warps=2,
-        num_stages=1,
-    ),
-]
-
-AUTOTUNE_WINO4_INPUT_CONFIGS = [
-    triton.Config({"BLOCK_C": 64}, num_warps=4, num_stages=1),
-    triton.Config({"BLOCK_C": 32}, num_warps=4, num_stages=1),
-    # gfx1100 (RDNA3): wider channel tile + a warp-8 option.
-    triton.Config({"BLOCK_C": 128}, num_warps=4, num_stages=1),
-    triton.Config({"BLOCK_C": 64}, num_warps=8, num_stages=1),
-    triton.Config({"BLOCK_C": 16}, num_warps=4, num_stages=1),
-]
-
-AUTOTUNE_WINO4_OUTPUT_CONFIGS = [
-    triton.Config({"BLOCK_K": 64}, num_warps=4, num_stages=1),
-    triton.Config({"BLOCK_K": 128}, num_warps=4, num_stages=1),
-    # gfx1100 (RDNA3): BLOCK_K=128 pegged the old ceiling on 17/19 shapes —
-    # probe larger, plus warp-8 options.
-    triton.Config({"BLOCK_K": 256}, num_warps=4, num_stages=1),
-    triton.Config({"BLOCK_K": 128}, num_warps=8, num_stages=1),
-    triton.Config({"BLOCK_K": 256}, num_warps=8, num_stages=1),
-]
-
-
-if CONV_AUTOTUNE_ENABLED:
-    _winograd_f4x3_input_transform_kernel = triton.autotune(
-        configs=AUTOTUNE_WINO4_INPUT_CONFIGS,
-        key=["T", "C_pad"],
-        cache_results=True,
-    )(_winograd_f4x3_input_transform_kernel)
-
-    _winograd_f4x3_cblocked_input_transform_kernel = triton.autotune(
-        configs=AUTOTUNE_WINO4_INPUT_CONFIGS,
-        key=["T", "C_pad"],
-        cache_results=True,
-    )(_winograd_f4x3_cblocked_input_transform_kernel)
-
-    _winograd_f4x3_batched_gemm_kernel = triton.autotune(
-        configs=AUTOTUNE_WINO_GEMM_CONFIGS,
-        key=["T", "K_out", "C_pad"],
-        cache_results=True,
-    )(_winograd_f4x3_batched_gemm_kernel)
-
-    _winograd_f4x3_output_transform_kernel = triton.autotune(
-        configs=AUTOTUNE_WINO4_OUTPUT_CONFIGS,
-        key=["T", "K_out"],
-        cache_results=True,
-    )(_winograd_f4x3_output_transform_kernel)
