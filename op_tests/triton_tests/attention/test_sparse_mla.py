@@ -137,8 +137,9 @@ def test_sparse_mla(fmt, dots, tol, H, C, topk, ragged, pool):
     dots get a looser tolerance because q and p both round-trip through e4m3.
     """
     _skip_unless_gfx950()
-    _run_and_check(fmt, C=C, H=H, topk=topk, ragged=ragged, pool=pool, tol=tol,
-                   dot_precision=dots)
+    _run_and_check(
+        fmt, C=C, H=H, topk=topk, ragged=ragged, pool=pool, tol=tol, dot_precision=dots
+    )
 
 
 def test_ds_mla_format():
@@ -150,9 +151,17 @@ def test_ds_mla_format():
 @pytest.mark.parametrize("dots", ["bf16", "fp8"])
 def test_split_k(kv_splits, dots):
     _skip_unless_gfx950()
-    _run_and_check("tensor", C=4, H=16, topk=2048, ragged=False, pool=1 << 15,
-                   tol=7e-2 if dots == "fp8" else 2e-2,
-                   kv_splits=kv_splits, dot_precision=dots)
+    _run_and_check(
+        "tensor",
+        C=4,
+        H=16,
+        topk=2048,
+        ragged=False,
+        pool=1 << 15,
+        tol=7e-2 if dots == "fp8" else 2e-2,
+        kv_splits=kv_splits,
+        dot_precision=dots,
+    )
 
 
 def test_per_tensor_scale_folding_bitwise():
@@ -162,8 +171,11 @@ def test_per_tensor_scale_folding_bitwise():
     torch.manual_seed(3)
     C, H, topk, pool = 4, 16, 512, 1 << 15
     sm = D_QK**-0.5
-    exact = (torch.randn(pool, D_QK, dtype=torch.bfloat16, device="cuda") * 0.25
-             ).float().to(torch.float8_e4m3fn)
+    exact = (
+        (torch.randn(pool, D_QK, dtype=torch.bfloat16, device="cuda") * 0.25)
+        .float()
+        .to(torch.float8_e4m3fn)
+    )
     ks = torch.ones(1, dtype=torch.float32, device="cuda")
     q = torch.randn(C, H, D_QK, dtype=torch.bfloat16, device="cuda") * 0.125
     idx, ptr = make_indices(C, pool, topk, "cuda", 11, ragged=True)
@@ -180,9 +192,7 @@ def test_vllm_cache_shapes():
     sm = D_QK**-0.5
     q, cache, ks, idx, ptr, _ = _build("tensor", C, 16, topk, pool, ragged=False)
     o_flat = sparse_mla_fwd(q, cache, ptr, idx, sm, kv_scale=ks)
-    o_4d = sparse_mla_fwd(
-        q, cache.view(pool, 1, 1, D_QK), ptr, idx, sm, kv_scale=ks
-    )
+    o_4d = sparse_mla_fwd(q, cache.view(pool, 1, 1, D_QK), ptr, idx, sm, kv_scale=ks)
     o_paged = sparse_mla_fwd(
         q, cache.view(pool // 64, 64, D_QK), ptr, idx, sm, kv_scale=ks
     )

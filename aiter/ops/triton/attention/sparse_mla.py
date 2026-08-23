@@ -47,12 +47,10 @@ def _check_out(out, q, kv_lora_rank):
     kv_lora_rank is accepted and written in its leading columns."""
     C, H = q.shape[0], q.shape[1]
     if out is None:
-        return torch.empty(
-            (C, H, kv_lora_rank), dtype=torch.bfloat16, device=q.device
-        )
-    assert out.shape[0] == C and out.shape[1] == H, (
-        f"out shape {tuple(out.shape)} != [{C}, {H}, >= {kv_lora_rank}]"
-    )
+        return torch.empty((C, H, kv_lora_rank), dtype=torch.bfloat16, device=q.device)
+    assert (
+        out.shape[0] == C and out.shape[1] == H
+    ), f"out shape {tuple(out.shape)} != [{C}, {H}, >= {kv_lora_rank}]"
     assert out.shape[2] >= kv_lora_rank and out.stride(2) == 1
     assert out.dtype == torch.bfloat16 and out.device == q.device
     return out
@@ -75,9 +73,9 @@ def _infer_cache_format(kv, d_qk, kv_lora_rank, qk_rope_head_dim, kv_scale):
         if kv.dtype == torch.bfloat16:
             return "bf16", kv, kv, None, 1, False
         assert kv.dtype in fp8_dtypes, f"unsupported flat cache dtype {kv.dtype}"
-        assert kv_scale is not None, (
-            "flat fp8 cache needs the per-tensor kv_scale (layer._k_scale)"
-        )
+        assert (
+            kv_scale is not None
+        ), "flat fp8 cache needs the per-tensor kv_scale (layer._k_scale)"
         assert kv_scale.dtype == torch.float32
         u8 = kv.view(torch.uint8)
         fnuz = kv.dtype == torch.float8_e4m3fnuz
@@ -85,13 +83,14 @@ def _infer_cache_format(kv, d_qk, kv_lora_rank, qk_rope_head_dim, kv_scale):
     if (
         kv.ndim == 3
         and kv.element_size() == 1
-        and kv.shape[2] == kv_lora_rank + 4 * (kv_lora_rank // 128) + 2 * qk_rope_head_dim
+        and kv.shape[2]
+        == kv_lora_rank + 4 * (kv_lora_rank // 128) + 2 * qk_rope_head_dim
     ):
         # vLLM fp8_ds_mla: 512 fp8 | 4 f32 per-128 scales | 64 bf16 rope = 656 B
         u8 = kv if kv.dtype == torch.uint8 else kv.view(torch.uint8)
-        assert u8.stride(2) == 1 and u8.stride(1) == u8.shape[2], (
-            "fp8_ds_mla rows must be contiguous 656-byte records"
-        )
+        assert (
+            u8.stride(2) == 1 and u8.stride(1) == u8.shape[2]
+        ), "fp8_ds_mla rows must be contiguous 656-byte records"
         return (
             "dsmla",
             u8,
@@ -120,7 +119,7 @@ def _mla_num_splits(num_queries: int, heads_blocks: int, avg_topk: float) -> int
 # Direct-to-LDS tile pipeline; wins wherever the launch gives a CU more than one
 # workgroup to hide the copy behind.
 _ASYNC_LDS_DEFAULT = True
-_ASYNC_ROPE_VEC = 16    # bytes/lane in the rope copy
+_ASYNC_ROPE_VEC = 16  # bytes/lane in the rope copy
 
 
 def _async_launch_config(
@@ -170,13 +169,9 @@ def _resolve_dot_precision(dot_precision: str, fmt: str, fp8_fnuz: bool) -> bool
             "Use dot_precision='bf16'."
         )
     if fmt == "bf16":
-        raise ValueError(
-            "dot_precision='fp8' needs an fp8 cache."
-        )
+        raise ValueError("dot_precision='fp8' needs an fp8 cache.")
     if fp8_fnuz:
-        raise ValueError(
-            "dot_precision='fp8' is OCP e4m3 only."
-        )
+        raise ValueError("dot_precision='fp8' is OCP e4m3 only.")
     return True
 
 
@@ -241,8 +236,11 @@ def sparse_mla_fwd(
     if q.dtype not in (torch.bfloat16, torch.float8_e4m3fn):
         raise ValueError(
             f"q must be bf16 or float8_e4m3fn, got {q.dtype}"
-            + (" (fnuz is a different encoding from what the matrix core reads)"
-               if "fnuz" in str(q.dtype) else "")
+            + (
+                " (fnuz is a different encoding from what the matrix core reads)"
+                if "fnuz" in str(q.dtype)
+                else ""
+            )
         )
     if q_is_fp8:
         # Caller-quantized q, the asm calling convention: one scaled_fp8_quant
@@ -254,9 +252,9 @@ def sparse_mla_fwd(
             raise ValueError(f"q_scale must be a scalar, got {tuple(q_scale.shape)}")
         q_scale = q_scale.reshape(1).to(torch.float32).contiguous()
     num_queries, num_heads, d_qk = q.shape
-    assert d_qk == kv_lora_rank + qk_rope_head_dim, (
-        f"q last dim {d_qk} != {kv_lora_rank} + {qk_rope_head_dim}"
-    )
+    assert (
+        d_qk == kv_lora_rank + qk_rope_head_dim
+    ), f"q last dim {d_qk} != {kv_lora_rank} + {qk_rope_head_dim}"
     _LOGGER.info(
         f"SPARSE_MLA C={num_queries} H={num_heads} d_qk={d_qk} "
         f"nnz={kv_indices.shape[0]}"
@@ -277,7 +275,8 @@ def sparse_mla_fwd(
                 .reshape(1)
             )
         q = (
-            (q.float() / q_scale).clamp(-_E4M3_MAX, _E4M3_MAX)
+            (q.float() / q_scale)
+            .clamp(-_E4M3_MAX, _E4M3_MAX)
             .to(torch.float8_e4m3fn)
             .contiguous()
         )
@@ -347,8 +346,15 @@ def sparse_mla_fwd(
     chunk_axis = 1 if col_reps >= 4 else 0
     nope_chunk = max(1, _BLOCK_K // 4) if chunk_axis == 0 else min(128, kv_lora_rank)
     async_lds_on, block_k, waves_per_eu = _async_launch_config(
-        fp8_dots, has_invalid, num_queries, heads_blocks, num_splits, avg_topk,
-        use_buffer_load, uni_tile=True, has_extra=False,
+        fp8_dots,
+        has_invalid,
+        num_queries,
+        heads_blocks,
+        num_splits,
+        avg_topk,
+        use_buffer_load,
+        uni_tile=True,
+        has_extra=False,
     )
     # num_warps stays 4: warps tile the dot's N (MFMA N=16), so a larger BLOCK_K just
     # gives each warp two N tiles.
@@ -360,7 +366,7 @@ def sparse_mla_fwd(
         alt,
         kv_indices,
         kv_indptr,
-        cache,       # extra_* segment: unread placeholders (HAS_EXTRA=False)
+        cache,  # extra_* segment: unread placeholders (HAS_EXTRA=False)
         alt,
         kv_indices,
         kv_indptr,
@@ -369,7 +375,7 @@ def sparse_mla_fwd(
         part_m,
         part_l,
         part_acc,
-        scl,         # f32 side-channel: k_scale ("tensor") / f32 view ("dsmla")
+        scl,  # f32 side-channel: k_scale ("tensor") / f32 view ("dsmla")
         scl,
         float(softmax_scale),
         q.stride(0),

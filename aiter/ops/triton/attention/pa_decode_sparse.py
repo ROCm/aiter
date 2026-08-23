@@ -440,7 +440,6 @@ def _as_int32_contiguous_1d(x: torch.Tensor) -> torch.Tensor:
     return x.to(torch.int32).contiguous()
 
 
-
 def _decode_num_splits_occ(num_queries, heads_blocks, avg_main, avg_extra, block_k):
     """Split-K count for the gfx950 gluon kernel: fill the machine, but never
     split a segment finer than one BLOCK_K tile.

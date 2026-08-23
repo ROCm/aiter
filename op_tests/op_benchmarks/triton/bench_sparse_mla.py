@@ -70,10 +70,9 @@ def device_time_ms(func, warmup=25, rep=100, flush=True):
 
 
 def bytes_moved(num_tokens, num_heads, nnz, kv_elem_bytes, num_splits):
-    """Bytes the launch actually moves, counting rows as gathered.
-    """
-    kv = nnz * D_QK * kv_elem_bytes           # the gather, and the bulk of it
-    idx = nnz * 4                             # int32 index stream, read once
+    """Bytes the launch actually moves, counting rows as gathered."""
+    kv = nnz * D_QK * kv_elem_bytes  # the gather, and the bulk of it
+    idx = nnz * 4  # int32 index stream, read once
     q = num_tokens * num_heads * D_QK * kv_elem_bytes
     out = num_tokens * num_heads * KV_LORA_RANK * 2
     partials = 0
@@ -100,7 +99,10 @@ def build_case(num_seqs, num_tokens, num_heads, context, topk, device="cuda"):
     kv = torch.randn(pool, D_QK, dtype=torch.bfloat16, device=device) * 0.125
     q = (
         torch.randn(
-            num_seqs * num_tokens, num_heads, D_QK, dtype=torch.bfloat16,
+            num_seqs * num_tokens,
+            num_heads,
+            D_QK,
+            dtype=torch.bfloat16,
             device=device,
         )
         * 0.125
@@ -140,15 +142,20 @@ def run_benchmark(args):
         ylabel = "GB/s"
 
     x_vals_list = [
-        ["decode" if tokens == 1 else "prefill", seqs, tokens, args.num_heads,
-         args.context, args.topk]
+        [
+            "decode" if tokens == 1 else "prefill",
+            seqs,
+            tokens,
+            args.num_heads,
+            args.context,
+            args.topk,
+        ]
         for seqs in args.num_seqs
         for tokens in args.num_tokens
     ]
 
     benchmark = triton.testing.Benchmark(
-        x_names=["phase", "num_seqs", "num_tokens", "num_heads", "context",
-                 "topk"],
+        x_names=["phase", "num_seqs", "num_tokens", "num_heads", "context", "topk"],
         x_vals=x_vals_list,
         line_arg="dots",
         line_vals=["bf16", "fp8"],
@@ -160,31 +167,39 @@ def run_benchmark(args):
     )
 
     @triton.testing.perf_report([benchmark])
-    def bench_sparse_mla(phase, num_seqs, num_tokens, num_heads, context, topk,
-                         dots, metric, **kwargs):
+    def bench_sparse_mla(
+        phase, num_seqs, num_tokens, num_heads, context, topk, dots, metric, **kwargs
+    ):
         q, kv, kv_fp8, kv_scale, indices, indptr = build_case(
             num_seqs, num_tokens, num_heads, context, topk
         )
         sm_scale = D_QK**-0.5
         out = torch.empty(
-            q.shape[0], num_heads, KV_LORA_RANK, dtype=torch.bfloat16,
+            q.shape[0],
+            num_heads,
+            KV_LORA_RANK,
+            dtype=torch.bfloat16,
             device=q.device,
         )
         if dots == "fp8":
             # Hand q over already quantized, the way production does.
             cache, scale = kv_fp8, kv_scale
             q_scale = (q.float().abs().amax() / E4M3_MAX).clamp_min(1e-30).reshape(1)
-            q = (
-                (q.float() / q_scale).clamp(-E4M3_MAX, E4M3_MAX)
-                .to(torch.float8_e4m3fn)
-            )
+            q = (q.float() / q_scale).clamp(-E4M3_MAX, E4M3_MAX).to(torch.float8_e4m3fn)
         else:
             cache, scale, q_scale = kv, None, None
 
         def func():
             return sparse_mla_fwd(
-                q, cache, indptr, indices, sm_scale, kv_scale=scale,
-                q_scale=q_scale, dot_precision=dots, out=out,
+                q,
+                cache,
+                indptr,
+                indices,
+                sm_scale,
+                kv_scale=scale,
+                q_scale=q_scale,
+                dot_precision=dots,
+                out=out,
             )
 
         time_ms = device_time_ms(func, flush=not args.no_flush_l2)
@@ -194,7 +209,10 @@ def run_benchmark(args):
         # QK reads the whole row, PV only the latent half
         flops = 2.0 * num_heads * nnz * (D_QK + KV_LORA_RANK)
         moved = bytes_moved(
-            num_tokens, num_heads, nnz, 1 if dots == "fp8" else 2,
+            num_tokens,
+            num_heads,
+            nnz,
+            1 if dots == "fp8" else 2,
             _mla_num_splits(num_tokens, 1, nnz / num_tokens),
         )
 
@@ -213,11 +231,17 @@ def main():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
-        "--num_seqs", type=int, nargs="+", default=[1, 8, 64, 256],
+        "--num_seqs",
+        type=int,
+        nargs="+",
+        default=[1, 8, 64, 256],
         help="sequences in the launch; every value is benchmarked",
     )
     parser.add_argument(
-        "--num_tokens", type=int, nargs="+", default=[1],
+        "--num_tokens",
+        type=int,
+        nargs="+",
+        default=[1],
         help="query tokens per sequence. 1 is a decode step, more is prefill; "
         "every value is benchmarked against every --num_seqs",
     )
@@ -225,7 +249,8 @@ def main():
     parser.add_argument("--context", type=int, default=8192, help="context length")
     parser.add_argument("--topk", type=int, default=2048, help="indexer top-k")
     parser.add_argument(
-        "--no_flush_l2", action="store_true",
+        "--no_flush_l2",
+        action="store_true",
         help="skip the cache flush between iterations, so the gather runs warm",
     )
     parser.add_argument(
