@@ -1,95 +1,96 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import hashlib
 import math
-import os
 
-from jinja2 import Template
+from aiter.jit.core import compile_ops
 
-from csrc.cpp_itfs.utils import (
-    AITER_CORE_DIR,
-    compile_template_op,
-    get_default_func_name,
+
+@compile_ops(
+    "module_sparse_attn", fc_name="pa_sparse_block_score_decode", ffi_type="ctypes"
 )
-
-MD_NAME_SCORE_DECODE = "pa_sparse_block_score_decode"
-MD_NAME_SCORE_PREFILL = "pa_sparse_block_score_prefill"
-MD_NAME_TOPK = "pa_sparse_block_topk"
-
-_THIS_DIR = f"{AITER_CORE_DIR}/csrc/cpp_itfs/sparse_attn"
-
-
-def _read(path: str) -> str:
-    with open(path, "r") as f:
-        return f.read()
-
-
-# All three kernels come from one header. Scoring is two of them, one per shape:
-# they share the fragment layout and the MFMA and disagree only on what the waves
-# of a workgroup divide -- prefill splits the query axis and stages the page
-# through LDS so one read serves every wave, decode has a single query token and
-# splits the block axis instead, which leaves no page to share and no LDS to
-# share it through. Top-k is the third.
-_KERNELS_SRC = _read(f"{_THIS_DIR}/pa_sparse_block_select_kernels.cuh")
-_SCORE_DECODE_SRC = _read(f"{_THIS_DIR}/pa_sparse_block_score_decode.cpp.jinja")
-_SCORE_PREFILL_SRC = _read(f"{_THIS_DIR}/pa_sparse_block_score_prefill.cpp.jinja")
-_TOPK_SRC = _read(f"{_THIS_DIR}/pa_sparse_block_topk.cpp.jinja")
-
-score_decode_template = Template(_SCORE_DECODE_SRC)
-score_prefill_template = Template(_SCORE_PREFILL_SRC)
-topk_template = Template(_TOPK_SRC)
-
-# The scoring kernels keep their MFMA accumulators in VGPRs rather than AGPRs.
-# Left to itself the compiler picks AGPRs and then copies every result back with
-# v_accvgpr_read_b32, which on this kernel is 128 VALU instructions per page and
-# the single largest item in its VALU mix. Forcing the accumulators where the
-# reduction already reads them removes those copies outright, and it costs one
-# AGPR and no VGPRs, so the occupancy is unchanged.
-#
-# The top-k pass is untouched: it has no MFMA to place.
-_SCORE_CXXFLAGS = ["-mllvm -amdgpu-mfma-vgpr-form=1"]
-
-# Build dirs are keyed by a digest of the sources and the flags they are built
-# with, so editing a kernel or a flag lands in a new dir instead of silently
-# reusing an object built from the old text.
-_SRC_TAG = hashlib.md5(
-    "".join(
-        [
-            _KERNELS_SRC,
-            _SCORE_DECODE_SRC,
-            _SCORE_PREFILL_SRC,
-            _TOPK_SRC,
-        ]
-        + _SCORE_CXXFLAGS
-    ).encode("utf-8")
-).hexdigest()[:8]
+def _score_decode_raw(
+    q_idx: int,
+    key_cache_idx: int,
+    score: int,
+    block_table: int,
+    seq_lens: int,
+    num_reqs: int,
+    num_q_tiles: int,
+    block_table_stride: int,
+    score_head_stride: int,
+    score_num_stride: int,
+    num_chunks: int,
+    init_blocks: int,
+    local_blocks: int,
+    query_len: int,
+    block_size: int,
+    head_dim: int,
+    num_idx_heads: int,
+    num_waves: int,
+) -> None: ...
 
 
-def _folder(md_name: str, folder: str | None, *args) -> str:
-    """Build dir for one instantiation, distinct per source revision.
+@compile_ops(
+    "module_sparse_attn", fc_name="pa_sparse_block_score_prefill", ffi_type="ctypes"
+)
+def _score_prefill_raw(
+    q_idx: int,
+    key_cache_idx: int,
+    score: int,
+    block_table: int,
+    cu_seqlens_q: int,
+    seq_lens: int,
+    num_reqs: int,
+    num_q_groups: int,
+    block_table_stride: int,
+    score_head_stride: int,
+    score_num_stride: int,
+    num_chunks: int,
+    chunk_blocks: int,
+    init_blocks: int,
+    local_blocks: int,
+    block_size: int,
+    head_dim: int,
+    num_idx_heads: int,
+    num_waves: int,
+    q_tiles: int,
+) -> None: ...
 
-    An explicit folder is left alone: the AOT sweep names its own dirs and
-    rebuilds them from the sources it ships with.
-    """
-    return (
-        folder
-        if folder is not None
-        else f"{get_default_func_name(md_name, args)}_{_SRC_TAG}"
-    )
+
+@compile_ops("module_sparse_attn", fc_name="pa_sparse_block_topk", ffi_type="ctypes")
+def _topk_raw(
+    score: int,
+    topk_idx: int,
+    seq_lens: int,
+    num_valid_pages: int,
+    block_table: int,
+    row_req_id: int,
+    kv_lens: int,
+    sparse_bt: int,
+    sparse_ctx: int,
+    num_idx_heads: int,
+    total_q: int,
+    score_head_stride: int,
+    score_num_stride: int,
+    topk_head_stride: int,
+    topk_num_stride: int,
+    block_table_stride: int,
+    sparse_bt_stride: int,
+    num_kv_heads: int,
+    query_len: int,
+    block_size: int,
+    topk: int,
+    slots: int,
+    num_waves: int,
+    pages_per_block: int,
+) -> None: ...
 
 
-_INCLUDES = [
-    f"{_THIS_DIR}/pa_sparse_block_select_kernels.cuh",
-    f"{AITER_CORE_DIR}/csrc/include",
-    f"{AITER_CORE_DIR}/csrc/include/ck_tile/",
-]
+def _ptr(t) -> int:
+    """Device address of a tensor; 0 is the null the kernels test for."""
+    return 0 if t is None else t.data_ptr()
 
-# Page tiles the decode kernel keeps in flight, and whether it marks the pages
-# non-temporal. Both are compile-time, so they are here rather than on the call,
-# and both defaults are measured -- see scoring_decode_cfg for what they cost.
-SCORE_DECODE_PREFETCH = int(os.environ.get("AITER_SPARSE_DECODE_PREFETCH", "8"))
-SCORE_DECODE_NONTEMPORAL = os.environ.get("AITER_SPARSE_DECODE_NT", "0") == "1"
 
 WAVE_SIZE = 64
 
@@ -173,13 +174,11 @@ def _tokens_per_tile(num_idx_heads: int) -> int:
 def _resolve_q_tiles_prefill(num_tiles: int, num_reqs: int, q_waves: int) -> int:
     """Query tiles per *wave* for the ragged pass's own kernel.
 
-    Unlike ``_resolve_q_tiles`` this takes the cap whenever the tiles are there to
-    fill it. On the shared kernel a folded tile buys its read reduction back with
-    the narrower grid it leaves; here the page is staged once for the whole
-    workgroup, so folding costs registers and nothing else, and the block-axis
-    split puts the parallelism back. What it will not do is fold past the tiles
-    that exist, since a wave handed none exits and takes its share of the
-    workgroup's span with it.
+    Takes the cap whenever the tiles are there to fill it: the page is staged
+    once for the whole workgroup, so folding costs registers and nothing else,
+    and the block-axis split puts the parallelism back. What it will not do is
+    fold past the tiles that exist, since a wave handed none exits and takes its
+    share of the workgroup's span with it.
     """
     return _pow2_floor(min(SCORE_PREFILL_MAX_Q_TILES, max(1, num_tiles // q_waves)))
 
@@ -205,113 +204,6 @@ def _score_split_prefill(max_blk: int, num_groups: int) -> tuple[int, int]:
     blocks = _pow2_floor(max(1, num_groups // SCORE_PREFILL_GROUPS_PER_BLOCK))
     blocks = min(blocks, SCORE_PREFILL_MAX_CHUNK_BLOCKS, max(1, max_blk))
     return max(1, math.ceil(max_blk / blocks)), blocks
-
-
-def compile_score_decode(
-    block_size: int,
-    head_dim: int,
-    num_idx_heads: int,
-    num_waves: int = SCORE_WAVES,
-    q_tiles: int = 1,
-    prefetch: int = SCORE_DECODE_PREFETCH,
-    non_temporal: bool = SCORE_DECODE_NONTEMPORAL,
-    folder: str = None,
-):
-    """The uniform-row kernel: every wave on the block axis.
-
-    prefetch and non_temporal are compile-time, so a build is keyed by them and
-    a sweep over either lands in its own dir rather than reusing the last one.
-    """
-    return compile_template_op(
-        score_decode_template,
-        MD_NAME_SCORE_DECODE,
-        _INCLUDES,
-        cxxflags=list(_SCORE_CXXFLAGS),
-        block_size=block_size,
-        head_dim=head_dim,
-        num_idx_heads=num_idx_heads,
-        num_waves=num_waves,
-        q_tiles=q_tiles,
-        prefetch=prefetch,
-        non_temporal="true" if non_temporal else "false",
-        folder=_folder(
-            MD_NAME_SCORE_DECODE,
-            folder,
-            block_size,
-            head_dim,
-            num_idx_heads,
-            num_waves,
-            q_tiles,
-            prefetch,
-            int(non_temporal),
-        ),
-    )
-
-
-def compile_score_prefill(
-    block_size: int,
-    head_dim: int,
-    num_idx_heads: int,
-    num_waves: int = SCORE_WAVES,
-    q_tiles: int = 1,
-    folder: str = None,
-):
-    """The ragged-row kernel: every wave on the query axis.
-
-    No q_waves. The workgroup stages one page for all of its waves, which only
-    works if they are all on the query axis at the same time, so q_waves is a
-    property of the mapping rather than a choice and the caller's group size is
-    q_tiles * num_waves.
-    """
-    return compile_template_op(
-        score_prefill_template,
-        MD_NAME_SCORE_PREFILL,
-        _INCLUDES,
-        cxxflags=list(_SCORE_CXXFLAGS),
-        block_size=block_size,
-        head_dim=head_dim,
-        num_idx_heads=num_idx_heads,
-        num_waves=num_waves,
-        q_tiles=q_tiles,
-        folder=_folder(
-            MD_NAME_SCORE_PREFILL,
-            folder,
-            block_size,
-            head_dim,
-            num_idx_heads,
-            num_waves,
-            q_tiles,
-        ),
-    )
-
-
-def compile_topk(
-    block_size: int,
-    topk: int,
-    slots: int,
-    num_waves: int = 1,
-    pages_per_block: int = 8,
-    folder: str = None,
-):
-    return compile_template_op(
-        topk_template,
-        MD_NAME_TOPK,
-        _INCLUDES,
-        block_size=block_size,
-        topk=topk,
-        slots=slots,
-        num_waves=num_waves,
-        pages_per_block=pages_per_block,
-        folder=_folder(
-            MD_NAME_TOPK,
-            folder,
-            block_size,
-            topk,
-            slots,
-            num_waves,
-            pages_per_block,
-        ),
-    )
 
 
 def _check_score_tensors(q_idx, key_cache_idx, score):
@@ -387,41 +279,35 @@ def _launch_score_decode(
     num_idx_heads: int,
     head_dim: int,
     block_size: int,
-    q_tiles: int = 1,
 ):
-    """Compile and launch the uniform-row score kernel.
+    """Launch the uniform-row score kernel.
 
     Rows are laid out from ``query_len`` alone, so there is no ``cu_seqlens_q``
-    to pass; the null below only fills the slot the C boundary still has for it.
+    to pass.
 
-    ``num_q_tiles`` counts groups of ``q_tiles`` tiles, so the two have to come
-    from the same resolution: a build compiled for one and launched with a grid
-    sized for another would leave the tail of the query axis unscored.
+    ``num_q_tiles`` counts the tiles the grid covers; the kernel folds one tile
+    per wave, so a grid sized for a different count would leave the tail of the
+    query axis unscored.
     """
-    import torch
-
-    from csrc.cpp_itfs.torch_utils import torch_to_c_types
-
-    func = compile_score_decode(block_size, head_dim, num_idx_heads, num_waves, q_tiles)
-    func(
-        *torch_to_c_types(
-            q_idx,
-            key_cache_idx,
-            score,
-            block_table,
-            None,
-            seq_lens,
-            num_reqs,
-            num_q_tiles,
-            block_table.stride(0),
-            score.stride(0),
-            score.stride(1),
-            num_chunks,
-            init_blocks,
-            local_blocks,
-            query_len,
-            torch.cuda.current_stream(),
-        )
+    _score_decode_raw(
+        _ptr(q_idx),
+        _ptr(key_cache_idx),
+        _ptr(score),
+        _ptr(block_table),
+        _ptr(seq_lens),
+        num_reqs,
+        num_q_tiles,
+        block_table.stride(0),
+        score.stride(0),
+        score.stride(1),
+        num_chunks,
+        init_blocks,
+        local_blocks,
+        query_len,
+        block_size,
+        head_dim,
+        num_idx_heads,
+        num_waves,
     )
     return score
 
@@ -445,42 +331,38 @@ def _launch_score_prefill(
     block_size: int,
     q_tiles: int,
 ):
-    """Compile and launch the ragged-row score kernel.
+    """Launch the ragged-row score kernel.
 
     ``num_q_groups`` counts groups of ``q_tiles * num_waves`` tiles, so all three
-    have to come from the same resolution: a build compiled for one and launched
-    with a grid sized for another would leave the tail of the query axis unscored.
+    have to come from the same resolution: a variant built for one and launched
+    with a grid sized for another would leave the tail of the query axis
+    unscored.
 
     ``chunk_blocks`` is the pages one chunk covers and ``num_chunks`` is how many
     of them the longest reach needs, so the two multiply out to that reach rather
     than dividing it.
     """
-    import torch
-
-    from csrc.cpp_itfs.torch_utils import torch_to_c_types
-
-    func = compile_score_prefill(
-        block_size, head_dim, num_idx_heads, num_waves, q_tiles
-    )
-    func(
-        *torch_to_c_types(
-            q_idx,
-            key_cache_idx,
-            score,
-            block_table,
-            cu_seqlens_q,
-            seq_lens,
-            num_reqs,
-            num_q_groups,
-            block_table.stride(0),
-            score.stride(0),
-            score.stride(1),
-            num_chunks,
-            chunk_blocks,
-            init_blocks,
-            local_blocks,
-            torch.cuda.current_stream(),
-        )
+    _score_prefill_raw(
+        _ptr(q_idx),
+        _ptr(key_cache_idx),
+        _ptr(score),
+        _ptr(block_table),
+        _ptr(cu_seqlens_q),
+        _ptr(seq_lens),
+        num_reqs,
+        num_q_groups,
+        block_table.stride(0),
+        score.stride(0),
+        score.stride(1),
+        num_chunks,
+        chunk_blocks,
+        init_blocks,
+        local_blocks,
+        block_size,
+        head_dim,
+        num_idx_heads,
+        num_waves,
+        q_tiles,
     )
     return score
 
@@ -622,7 +504,7 @@ def pa_sparse_block_score_prefill(
             range, trading registers for block loads not repeated. 0 derives it
             from the tile and request counts, which is what a caller should want;
             it is settable so a test can reach the folded path on a shape too
-            small to pick it, and to sweep it.
+            small to pick it.
     """
     total_q, num_idx_heads, head_dim, block_size = _check_score_tensors(
         q_idx, key_cache_idx, score
@@ -661,6 +543,13 @@ def pa_sparse_block_score_prefill(
     # while they still carry their share of the page.
     if q_tiles < 1:
         q_tiles = _resolve_q_tiles_prefill(num_tiles, num_reqs, num_waves)
+    elif q_tiles > SCORE_PREFILL_MAX_Q_TILES or q_tiles & (q_tiles - 1):
+        # The derived path only ever produces a power of two within the cap, so
+        # this catches an explicit q_tiles that no variant was built for.
+        raise ValueError(
+            f"q_tiles {q_tiles} must be a power of two no larger than "
+            f"{SCORE_PREFILL_MAX_Q_TILES}"
+        )
     num_q_groups = math.ceil(num_tiles / (q_tiles * num_waves))
 
     max_blk = math.ceil(max_seq_len / block_size)
@@ -740,7 +629,7 @@ def pa_sparse_block_topk(
             ``query_len``, so the prefill pass passes the counts directly. Must
             agree with the scoring pass's causal masking block for block.
         block_table: ``[num_reqs, max_blocks]`` int32, logical block to logical
-            page, which is what the emitted table is resolved through.
+            page, which is wvs hat the emitted table is resolved through.
         sparse_bt: ``[total_q * num_kv_heads, TopK * pages_per_block]`` int32,
             written in place: the selected blocks' pages packed towards slot 0
             with the partial tail block last, zeros after. Physical page ids
@@ -765,8 +654,6 @@ def pa_sparse_block_topk(
         in wherever they were passed in.
     """
     import torch
-
-    from csrc.cpp_itfs.torch_utils import torch_to_c_types
 
     if score.dtype != torch.float32:
         raise ValueError(f"score must be fp32, got {score.dtype}")
@@ -859,63 +746,36 @@ def pa_sparse_block_topk(
         num_waves = _topk_waves(slots, num_idx_heads * total_q)
     elif slots % num_waves:
         raise ValueError(f"num_waves {num_waves} must divide slots {slots}")
-
-    func = compile_topk(block_size, topk, slots, num_waves, pages_per_block)
-
-    func(
-        *torch_to_c_types(
-            score,
-            topk_idx,
-            seq_lens,
-            num_valid_pages,
-            block_table,
-            row_req_id,
-            kv_lens,
-            sparse_bt,
-            sparse_ctx,
-            num_idx_heads,
-            total_q,
-            score.stride(0),
-            score.stride(1),
-            topk_idx.stride(0),
-            topk_idx.stride(1),
-            block_table.stride(0),
-            sparse_bt.stride(0),
-            num_kv_heads,
-            query_len,
-            torch.cuda.current_stream(),
+    elif num_waves > TOPK_MAX_WAVES:
+        raise ValueError(
+            f"num_waves {num_waves} exceeds the {TOPK_MAX_WAVES} a workgroup is "
+            f"built to split a row across"
         )
+
+    _topk_raw(
+        _ptr(score),
+        _ptr(topk_idx),
+        _ptr(seq_lens),
+        _ptr(num_valid_pages),
+        _ptr(block_table),
+        _ptr(row_req_id),
+        _ptr(kv_lens),
+        _ptr(sparse_bt),
+        _ptr(sparse_ctx),
+        num_idx_heads,
+        total_q,
+        score.stride(0),
+        score.stride(1),
+        topk_idx.stride(0),
+        topk_idx.stride(1),
+        block_table.stride(0),
+        sparse_bt.stride(0),
+        num_kv_heads,
+        query_len,
+        block_size,
+        topk,
+        slots,
+        num_waves,
+        pages_per_block,
     )
     return topk_idx, sparse_bt, sparse_ctx
-
-
-if __name__ == "__main__":
-    import argparse
-
-    parser = argparse.ArgumentParser()
-    sub = parser.add_subparsers(dest="pass_name", required=True)
-
-    for name in ("decode", "prefill"):
-        p = sub.add_parser(name)
-        p.add_argument("--block_size", type=int, required=True)
-        p.add_argument("--head_dim", type=int, required=True)
-        p.add_argument("--num_idx_heads", type=int, required=True)
-        p.add_argument("--num_waves", type=int, default=SCORE_WAVES)
-        p.add_argument("--q_tiles", type=int, default=1)
-        p.add_argument("--folder", type=str, default=None)
-
-    p = sub.add_parser("topk")
-    p.add_argument("--block_size", type=int, required=True)
-    p.add_argument("--topk", type=int, required=True)
-    p.add_argument("--slots", type=int, required=True)
-    p.add_argument("--num_waves", type=int, default=1)
-    p.add_argument("--folder", type=str, default=None)
-
-    args = vars(parser.parse_args())
-    which = args.pop("pass_name")
-    if which == "decode":
-        compile_score_decode(**args)
-    elif which == "prefill":
-        compile_score_prefill(**args)
-    else:
-        compile_topk(**args)

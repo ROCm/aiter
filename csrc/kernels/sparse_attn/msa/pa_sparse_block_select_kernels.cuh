@@ -85,9 +85,9 @@ template <int BlockSize_,
           int HeadDim_,
           int H_,
           int WAVES_,
-          int QTiles_   = 1,
-          int Prefetch_ = 8,
-          bool NonTemp_ = false>
+          int QTiles_,
+          int Prefetch_,
+          bool NonTemp_>
 struct scoring_decode_cfg
 {
     static constexpr int kBlockSize = BlockSize_;
@@ -427,7 +427,7 @@ __device__ __forceinline__ void prefill_main_loop(const uint8_t* __restrict__ q_
 }
 
 // prefill scoring kernel
-template <int BlockSize, int HeadDim, int H, int WAVES, int QTiles = 1>
+template <int BlockSize, int HeadDim, int H, int WAVES, int QTiles>
 __global__ __launch_bounds__(WAVES* kWave) void pa_sparse_block_score_prefill(
     const uint8_t* __restrict__ q_idx,         // [total_q, H, HeadDim] e4m3
     const uint8_t* __restrict__ key_cache_idx, // [num_pages, BlockSize, HeadDim] e4m3
@@ -657,13 +657,7 @@ __device__ __forceinline__ void decode_main_loop(const uint8_t* __restrict__ q_i
 }
 
 // decode scoring kernel
-template <int BlockSize,
-          int HeadDim,
-          int H,
-          int WAVES,
-          int QTiles   = 1,
-          int Prefetch = 4,
-          bool NonTemp = true>
+template <int BlockSize, int HeadDim, int H, int WAVES, int QTiles, int Prefetch, bool NonTemp>
 __global__ __launch_bounds__(WAVES* kWave) void pa_sparse_block_score_decode(
     const uint8_t* __restrict__ q_idx,         // [total_q, H, HeadDim] e4m3
     const uint8_t* __restrict__ key_cache_idx, // [num_pages, BlockSize, HeadDim] e4m3

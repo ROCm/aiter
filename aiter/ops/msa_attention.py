@@ -1,32 +1,21 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Sparse block selection for index-head attention, as torch custom ops.
-
-The passes themselves live in ``csrc/cpp_itfs/sparse_attn``; this is the layer
-that puts them on the ``aiter`` namespace and behind the dispatcher, so a caller
-under torch.compile or a cudagraph sees an opaque op with declared mutations
-rather than a python function that allocates and launches.
-
-That is also why the top-k op takes ``sparse_bt`` and ``sparse_ctx`` where the
-underlying call would allocate them: a custom op may not return its own inputs,
-and a caller that is capturing wants the addresses to be its own anyway.
-"""
+"""Sparse block selection for index-head attention."""
 
 from typing import Optional
 
 import torch
 
-from csrc.cpp_itfs.sparse_attn.pa_sparse_block_select import (
+from csrc.cpp_itfs.torch_utils import direct_register_custom_op
+
+from .msa_block_select import (
     pa_sparse_block_score_decode as pa_sparse_block_score_decode_core,
 )
-from csrc.cpp_itfs.sparse_attn.pa_sparse_block_select import (
+from .msa_block_select import (
     pa_sparse_block_score_prefill as pa_sparse_block_score_prefill_core,
 )
-from csrc.cpp_itfs.sparse_attn.pa_sparse_block_select import (
-    pa_sparse_block_topk as pa_sparse_block_topk_core,
-)
-from csrc.cpp_itfs.torch_utils import direct_register_custom_op
+from .msa_block_select import pa_sparse_block_topk as pa_sparse_block_topk_core
 
 
 def pa_sparse_block_score_decode(
