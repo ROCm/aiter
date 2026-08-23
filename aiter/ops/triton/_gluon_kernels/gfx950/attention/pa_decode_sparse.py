@@ -1005,9 +1005,8 @@ def _stage(cfg, seg, x_u8, sc, k_rope, kv_smem, rope_smem):
             kv_smem.slice(fmt.NOPE_DIM, cfg.ROPE_DIM, dim=1).store(k_rope)
         elif fmt.KIND == "dsmla":
             rope_smem.store(k_rope)
-        elif fmt.KIND == "tensor":
-            if cfg.ROPE_SEPARATE:
-                rope_smem.store(_fp8_to_bf16(k_rope, fmt.FP8_FNUZ))
+        elif fmt.KIND == "tensor" and cfg.ROPE_SEPARATE:
+            rope_smem.store(_fp8_to_bf16(k_rope, fmt.FP8_FNUZ))
         # "uniform": the whole head is one fp8 tile; nothing else to store.
 
 
@@ -1464,8 +1463,7 @@ def _process_segment(
                 False,
             )
 
-    if (not cfg.UNI_TILE) or (not seg.fmt.IS_FP8):
-      if hi_full < hi:
+    if ((not cfg.UNI_TILE) or (not seg.fmt.IS_FP8)) and hi_full < hi:
         m_i, l_i, acc = _decode_tile(
             cfg,
             seg,
@@ -2041,7 +2039,7 @@ def _pa_decode_sparse_reduce(
     pid_h = gl.program_id(1)
 
     # Lay the 64 lanes out so a small BLOCK_M spends them on the head dim.
-    TPW0: gl.constexpr = BLOCK_M if BLOCK_M < 8 else 8
+    TPW0: gl.constexpr = min(8, BLOCK_M)
     TPW1: gl.constexpr = 64 // TPW0
     BLK: gl.constexpr = gl.BlockedLayout(
         size_per_thread=[1, 8],
