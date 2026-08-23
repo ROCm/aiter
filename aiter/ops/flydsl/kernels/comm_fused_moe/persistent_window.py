@@ -259,8 +259,10 @@ def _compose_persistent_producer(config: Config, phase: int):
     def compose(*, module_name, emit_gemm2, allocator):
         @flyc.kernel(
             name=(
-                f"{module_name}_comm_persistent_m{config.m}"
-                f"_w{config.window}_sg{config.service_grid}_p{phase}"
+                f"flydsl_fused_moe_pwin_prod_p{phase}_sr{config.shard_rows}"
+                f"_t{config.tile_m}x{config.tile_n}x{config.tile_k}"
+                f"_sbm{config.sort_block_m}_w{config.window}"
+                f"_lw{config.local_workers}_sg{config.service_grid}"
             ),
             known_block_size=[BLOCK, 1, 1],
         )
@@ -385,8 +387,9 @@ def compile_persistent_cycle(config: Config, phase: int):
 def compile_persistent_drain(config: Config):
     @flyc.kernel(
         name=(
-            f"comm_fused_moe_persistent_m{config.m}_w{config.window}"
-            f"_lw{config.local_workers}_sg{config.service_grid}_drain"
+            f"flydsl_fused_moe_pwin_drain_sr{config.shard_rows}"
+            f"_w{config.window}"
+            f"_lw{config.local_workers}_sg{config.service_grid}"
         ),
         known_block_size=[BLOCK, 1, 1],
     )
@@ -414,8 +417,8 @@ def compile_persistent_drain(config: Config):
 def compile_persistent_final_publish(config: Config):
     @flyc.kernel(
         name=(
-            f"comm_fused_moe_persistent_m{config.m}_w{config.window}"
-            f"_sg{config.service_grid}_final_publish"
+            f"flydsl_fused_moe_pwin_publish_w{config.window}"
+            f"_sg{config.service_grid}"
         ),
         known_block_size=[64, 1, 1],
     )
@@ -501,7 +504,10 @@ def compile_stage2_service(config: Config):
         epoch: fx.Array[fx.Int64, 1, 16]
 
     @flyc.kernel(
-        name=f"comm_fused_moe_persistent_m{m}_w{window}_sg{service_grid}_service",
+        name=(
+            f"flydsl_fused_moe_pwin_service_sr{shard_rows}_w{window}"
+            f"_sg{service_grid}"
+        ),
         known_block_size=[BLOCK, 1, 1],
     )
     def kernel(

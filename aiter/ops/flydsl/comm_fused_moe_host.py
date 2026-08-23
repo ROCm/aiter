@@ -12,6 +12,7 @@ import torch.distributed._symmetric_memory as symm_mem
 from mori.cco import Communicator
 
 from aiter.jit.utils.chip_info import get_gfx_runtime
+from aiter.ops.flydsl.kernels.comm_fused_moe import atomic_compressed
 from aiter.ops.flydsl.kernels.comm_fused_moe import full_width
 from aiter.ops.flydsl.kernels.comm_fused_moe import persistent_window
 from aiter.ops.flydsl.kernels.comm_fused_moe import windowed
@@ -36,8 +37,14 @@ class ShapeKey:
     tp: int
 
 
-PipelineConfig = full_width.Config | windowed.Config | persistent_window.Config
+PipelineConfig = (
+    atomic_compressed.Config
+    | full_width.Config
+    | windowed.Config
+    | persistent_window.Config
+)
 _CONFIG_TYPES = {
+    "atomic": atomic_compressed.Config,
     "full": full_width.Config,
     "window": windowed.Config,
     "persistent": persistent_window.Config,
@@ -127,6 +134,90 @@ def _stage2_args(args, kwargs, kernels, config):
     )
 
 
+class _AtomicCompressedRunner:
+    def __init__(self, tp_group, config: atomic_compressed.Config) -> None:
+        k = atomic_compressed
+        self.config = config
+        self.rank = int(tp_group.rank_in_group)
+        self.device = torch.device(tp_group.device)
+        self.partial_ready = config.m * (k.H + k.H // 32)
+        self.partial = _workspace(self.device, self.partial_ready)
+        self.reduced_ready = config.shard_rows * k.H
+        self.reduced_payload = _workspace(self.device, self.reduced_ready)
+        self.reduced_scale = _symmetric(
+            self.device, (config.shard_rows, k.H // 32)
+        )
+        self.output = torch.empty(
+            (config.m, k.H), dtype=torch.bfloat16, device=self.device
+        )
+        self.comm, self.windows, bases = _register(
+            tp_group,
+            self.rank,
+            k.TP,
+            (self.partial, self.reduced_payload, self.reduced_scale),
+        )
+        (
+            self.partial_flat_base,
+            self.reduced_payload_base,
+            self.reduced_scale_base,
+        ) = bases
+        shard_begin = self.rank * config.shard_rows
+        self.reduced_shard = self.output[
+            shard_begin : shard_begin + config.shard_rows
+        ]
+
+    def __call__(
+        self,
+        *,
+        stage2_args: tuple,
+        stage2_kwargs: dict,
+        shared_partial,
+        ordinary_stage2,
+    ):
+        k = atomic_compressed
+        config = self.config
+        ordinary_stage2(
+            *stage2_args[:6],
+            shared_partial,
+            *stage2_args[7:],
+            **stage2_kwargs,
+        )
+        stream = torch.cuda.current_stream(self.device)
+        _run_compiled(
+            k.compile_stage2_quantize(config),
+            (ptr_arg(shared_partial), ptr_arg(self.partial), stream),
+        )
+        _barrier(self.partial, self.partial_flat_base, self.partial_ready, stream)
+        _run_compiled(
+            k.compile_stage2_tp_reduce_scatter(config),
+            (
+                fx.Int64(self.partial_flat_base),
+                ptr_arg(self.reduced_shard),
+                ptr_arg(self.reduced_payload),
+                ptr_arg(self.reduced_scale),
+                self.rank,
+                stream,
+            ),
+        )
+        _barrier(
+            self.reduced_payload,
+            self.reduced_payload_base,
+            self.reduced_ready,
+            stream,
+        )
+        _run_compiled(
+            k.compile_stage2_tp_all_gather(config),
+            (
+                fx.Int64(self.reduced_payload_base),
+                fx.Int64(self.reduced_scale_base),
+                ptr_arg(self.output),
+                self.rank,
+                stream,
+            ),
+        )
+        return self.output
+
+
 class _FullWidthRunner:
     def __init__(self, tp_group, config: full_width.Config) -> None:
         k = full_width
@@ -164,7 +255,14 @@ class _FullWidthRunner:
             shard_begin : shard_begin + config.shard_rows
         ]
 
-    def __call__(self, *, stage2_args: tuple, stage2_kwargs: dict, shared_partial):
+    def __call__(
+        self,
+        *,
+        stage2_args: tuple,
+        stage2_kwargs: dict,
+        shared_partial,
+        ordinary_stage2,
+    ):
         k = full_width
         config = self.config
         stream = torch.cuda.current_stream(self.device)
@@ -305,7 +403,14 @@ class _WindowedRunner:
             ),
         )
 
-    def __call__(self, *, stage2_args: tuple, stage2_kwargs: dict, shared_partial):
+    def __call__(
+        self,
+        *,
+        stage2_args: tuple,
+        stage2_kwargs: dict,
+        shared_partial,
+        ordinary_stage2,
+    ):
         k = windowed
         config = self.config
         stream = torch.cuda.current_stream(self.device)
@@ -449,7 +554,14 @@ class _PersistentWindowRunner:
             ),
         )
 
-    def __call__(self, *, stage2_args: tuple, stage2_kwargs: dict, shared_partial):
+    def __call__(
+        self,
+        *,
+        stage2_args: tuple,
+        stage2_kwargs: dict,
+        shared_partial,
+        ordinary_stage2,
+    ):
         k = persistent_window
         config = self.config
         producer = torch.cuda.current_stream(self.device)
@@ -489,6 +601,7 @@ class _PersistentWindowRunner:
 
 
 _RUNNER_TYPES = {
+    atomic_compressed.Config: _AtomicCompressedRunner,
     full_width.Config: _FullWidthRunner,
     windowed.Config: _WindowedRunner,
     persistent_window.Config: _PersistentWindowRunner,

@@ -209,7 +209,10 @@ def compile_stage2_local_reduce(config: Config):
     local_workers = config.local_workers
 
     @flyc.kernel(
-        name=f"comm_fused_moe_m{m}_local",
+        name=(
+            f"flydsl_fused_moe_full_lr_sr{config.shard_rows}"
+            f"_lw{local_workers}"
+        ),
         known_block_size=[BLOCK, 1, 1],
     )
     def kernel(
@@ -239,7 +242,10 @@ def compile_stage2_tp_reduce_scatter(config: Config):
     shard_rows = config.shard_rows
 
     @flyc.kernel(
-        name=f"comm_fused_moe_m{m}_rs{config.reduce_scatter_grid}",
+        name=(
+            f"flydsl_fused_moe_full_rs_sr{shard_rows}"
+            f"_g{config.reduce_scatter_grid}"
+        ),
         known_block_size=[BLOCK, 1, 1],
     )
     def kernel(
@@ -283,7 +289,10 @@ def compile_stage2_tp_all_gather(config: Config):
     shard_rows = config.shard_rows
 
     @flyc.kernel(
-        name=f"comm_fused_moe_m{m}_ag{config.all_gather_grid}",
+        name=(
+            f"flydsl_fused_moe_full_ag_sr{shard_rows}"
+            f"_g{config.all_gather_grid}"
+        ),
         known_block_size=[BLOCK, 1, 1],
     )
     def kernel(

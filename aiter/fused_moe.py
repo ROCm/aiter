@@ -3443,6 +3443,7 @@ def fused_moe_2stages(
     else:
         _stage2_call = functools.partial(
             _stage2_override,
+            ordinary_stage2=metadata.stage2,
             stage2_args=stage2_args,
             stage2_kwargs=stage2_kwargs,
         )
