@@ -86,14 +86,15 @@ def launch_gemm_a8w4_tdm(
     f32_situ_beta: fx.Float32 = 1.0,
     f32_situ_linear_beta: fx.Float32 = 1.0,
     producer_blocks: Constexpr[int] = 0,
-    producer_numel: Constexpr[int] = 0,
+    producer_rejoin: Constexpr[int] = 1,
+    producer_chunk_rows: Constexpr[int] = 0,
+    producer_total_rows: Constexpr[int] = 0,
     producer_topk: Constexpr[int] = 0,
     producer_wire_stride: Constexpr[int] = 0,
     producer_feat_dim: Constexpr[int] = 0,
     arg_prod_wire: fx.Pointer = None,
     arg_prod_scale: fx.Pointer = None,
-    arg_prod_rows: fx.Pointer = None,
-    arg_prod_nvr: fx.Pointer = None,
+    arg_prod_row_src: fx.Pointer = None,
     arg_prod_done: fx.Pointer = None,
 ):
     """Launch the grouped contiguous-M a8w4 MoE GEMM for gfx1250.
@@ -124,14 +125,17 @@ def launch_gemm_a8w4_tdm(
        check -- so the callers that choose cluster_n enforce it
        (batched_gemm_mxfp4._pick_cluster_n and its assert).
 
-    ``producer_blocks`` > 0 splits the grid by role: that many workgroups are
-    prepended to the tile grid and gather this GEMM's own A rows out of an EP
-    dispatch wire buffer (pre-quantized rows followed by row-major scales) into
-    contiguous-M payload and preshuffled scales, while the tile workgroups run
-    behind them and each waits only on its own M-tile. That folds a
-    memory-bound pass into a compute-bound kernel instead of serializing the
-    two. The wait is one-way and intra-device, and the producers hold the low
-    block ids, which the hardware dispatches first, so it cannot deadlock.
+    ``producer_blocks`` > 0 splits the grid by role: that many workgroups first
+    gather this GEMM's own A rows out of an EP dispatch wire buffer
+    (pre-quantized rows followed by row-major scales) into contiguous-M payload
+    and preshuffled scales, while the tile workgroups run behind them and each
+    waits only on its own M-tile. That folds a memory-bound pass into a
+    compute-bound kernel instead of serializing the two. The wait is one-way and
+    intra-device, and the producers hold the low block ids, which the hardware
+    dispatches first, so it cannot deadlock. Under ``producer_rejoin`` (the
+    default) the producers then compute a tile like everyone else and the grid
+    stays the plain tile grid; otherwise they are extra workgroups prepended to
+    it and retire after the gather.
     """
     WMMA_M = 16
     WMMA_N = 32 if a_is_fp4 else 16
@@ -168,7 +172,9 @@ def launch_gemm_a8w4_tdm(
         ep_destination_stride,
         ep_world_size,
         producer_blocks,
-        producer_numel,
+        producer_rejoin,
+        producer_chunk_rows,
+        producer_total_rows,
         producer_topk,
         producer_wire_stride,
         producer_feat_dim,
@@ -178,8 +184,12 @@ def launch_gemm_a8w4_tdm(
     if producer_on:
         if cluster_n > 1:
             raise ValueError("producer blocks and cluster launch are exclusive")
-        if producer_numel <= 0 or producer_topk <= 0 or producer_feat_dim <= 0:
-            raise ValueError("producer blocks need numel, topk and feat_dim")
+        if producer_topk <= 0 or producer_feat_dim <= 0:
+            raise ValueError("producer blocks need topk and feat_dim")
+        if producer_total_rows <= 0 or producer_chunk_rows <= 0:
+            raise ValueError("producer blocks need total_rows and chunk_rows")
+        if n_experts <= 0:
+            raise ValueError("producer blocks need the grouped expert count")
     if enable_ep_scatter:
         if stage1_act != 0:
             raise ValueError("enable_ep_scatter is gemm2-only (stage1_act must be 0)")
@@ -258,7 +268,8 @@ def launch_gemm_a8w4_tdm(
     )
     _ep = "_epscatter" if enable_ep_scatter else ""
     _prod = (
-        f"_prod{producer_blocks}x{producer_numel}"
+        f"_prod{producer_blocks}x{producer_total_rows}c{producer_chunk_rows}"
+        f"{'r' if producer_rejoin else ''}"
         f"_tk{producer_topk}_ws{producer_wire_stride}_fd{producer_feat_dim}"
         if producer_on
         else ""
@@ -284,8 +295,7 @@ def launch_gemm_a8w4_tdm(
         arg_ep_row_map: fx.Tensor,
         arg_prod_wire: fx.Pointer,
         arg_prod_scale: fx.Pointer,
-        arg_prod_rows: fx.Pointer,
-        arg_prod_nvr: fx.Pointer,
+        arg_prod_row_src: fx.Pointer,
         arg_prod_done: fx.Pointer,
         i32_m: fx.Int32,
         i32_n: fx.Int32,
@@ -309,26 +319,36 @@ def launch_gemm_a8w4_tdm(
         wave_n = wave % n_warp
 
         # Role split. The first ``producer_blocks`` workgroups gather this
-        # GEMM's A rows instead of computing tiles; the rest shift down by that
-        # many ids and are the ordinary GEMM. Producers must be the *low* ids:
-        # consumers spin on them, and the hardware dispatches workgroups in
+        # GEMM's A rows before doing anything else. Producers must be the *low*
+        # ids: consumers spin on them, and the hardware dispatches workgroups in
         # increasing id order, so low ids are guaranteed resident.
+        #
+        # With ``producer_rejoin`` they then fall through into the ordinary tile
+        # path and compute their own tile -- the grid is the plain tile grid and
+        # the gather is work those workgroups do on the way in. Without it the
+        # producers are extra workgroups prepended to the tile grid and retire
+        # once the gather is done.
         if const_expr(producer_on):
             bid_raw = fx.block_idx.x
             is_producer = bid_raw < producer_blocks
-            is_consumer = bid_raw >= producer_blocks
-            # Clamped so a producer's (unused) tile decode cannot divide by a
-            # non-positive group_tiles; its results are masked off below.
-            bid_x = is_consumer.select(bid_raw - producer_blocks, 0)
+            if const_expr(producer_rejoin):
+                bid_x = bid_raw
+            else:
+                is_consumer = bid_raw >= producer_blocks
+                # Clamped so a producer's (unused) tile decode cannot divide by
+                # a non-positive group_tiles; its results are masked off below.
+                bid_x = is_consumer.select(bid_raw - producer_blocks, 0)
             if is_producer:
                 emit_prequant_gather_producer(
                     wire_in=arg_prod_wire,
                     grouped_payload=arg_a,
                     grouped_scale=arg_prod_scale,
-                    topids_to_rows=arg_prod_rows,
-                    num_valid_routes=arg_prod_nvr,
+                    row_src_route=arg_prod_row_src,
+                    m_tile_map=arg_m_tile_map,
                     tile_rows_done=arg_prod_done,
-                    numel=producer_numel,
+                    n_experts=n_experts,
+                    total_rows=producer_total_rows,
+                    chunk_rows=producer_chunk_rows,
                     feat_dim=producer_feat_dim,
                     wmma_rep=wmma_m_rep,
                     quant_mode="fp4" if a_is_fp4 else "fp8",
@@ -954,9 +974,9 @@ def launch_gemm_a8w4_tdm(
                 rocdl.sched_barrier(0)
 
         # Skip padding tiles (expert id == n_experts); uniform across workgroup.
-        # With producers in the grid the same guard also retires them.
+        # Producers that do not rejoin own no tile and retire on the same guard.
         live_tile = expert < n_experts
-        if const_expr(producer_on):
+        if const_expr(producer_on and not producer_rejoin):
             live_tile = live_tile & is_consumer
         if live_tile:
             if const_expr(producer_on):
@@ -1528,8 +1548,7 @@ def launch_gemm_a8w4_tdm(
         arg_ep_row_map,
         arg_prod_wire,
         arg_prod_scale,
-        arg_prod_rows,
-        arg_prod_nvr,
+        arg_prod_row_src,
         arg_prod_done,
         i32_m,
         N,
@@ -1537,7 +1556,8 @@ def launch_gemm_a8w4_tdm(
         f32_situ_beta,
         f32_situ_linear_beta,
     )
-    grid = (producer_blocks + m_tiles * n_tiles, 1, 1)
+    extra_blocks = producer_blocks if (producer_blocks and not producer_rejoin) else 0
+    grid = (extra_blocks + m_tiles * n_tiles, 1, 1)
     if cluster_n > 1:
         # Geometry must reach BOTH the definition and the launch site, or the
         # cluster never forms and the TDM loads silently fall back to per-load.

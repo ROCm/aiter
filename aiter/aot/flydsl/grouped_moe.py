@@ -265,6 +265,9 @@ def _compile_grouped_moe_aux_kernels(job, *, dtype, quant_mode, wmma_rep, contig
             max_m,
             tile_m,
             ptr_arg(torch.empty(0, dtype=i32, device=dev)),
+            ptr_arg(torch.empty(0, dtype=i32, device=dev)),
+            0,
+            ptr_arg(torch.empty(0, dtype=i32, device=dev)),
             stream=0,
         )
 

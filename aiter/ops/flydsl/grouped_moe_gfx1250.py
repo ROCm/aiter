@@ -45,6 +45,30 @@ def _stage1_producer_blocks() -> int:
     return max(0, int(os.environ.get("AITER_FLYDSL_STAGE1_PRODUCER_BLOCKS", "0")))
 
 
+@functools.lru_cache(maxsize=1)
+def _stage1_producer_rejoin() -> bool:
+    """Whether producer workgroups compute a tile once their gather is done.
+
+    On by default: the gather is a detour those workgroups take on the way into
+    the ordinary tile grid, not a set of extra workgroups that retire. Off puts
+    the producers back in front of the grid as dedicated workgroups, which
+    keeps the tiles they would own off the critical path at the cost of the
+    workgroups themselves.
+    """
+    return _as_bool(os.environ.get("AITER_FLYDSL_STAGE1_PRODUCER_REJOIN"), True)
+
+
+@functools.lru_cache(maxsize=1)
+def _stage1_producer_chunk_rows() -> int:
+    """Consecutive destination rows one producer warp gathers per chunk.
+
+    Chunks may not straddle an M-tile (one atomic publishes one tile's rows),
+    so this has to divide tile_m. Smaller spreads the rows more evenly over the
+    producer warps; larger amortises the tile bisect and the publish.
+    """
+    return max(1, int(os.environ.get("AITER_FLYDSL_STAGE1_PRODUCER_CHUNK_ROWS", "8")))
+
+
 def _grouped_weight_uint8(w: torch.Tensor) -> torch.Tensor:
     """Contiguous uint8 view of a static MoE weight, cached by data_ptr."""
     key = (w.data_ptr(), tuple(w.shape), tuple(w.stride()), str(w.dtype))
@@ -563,6 +587,34 @@ def _grouped_a8w4_tdm_moe(
             "max_tok": int(stage2_scatter.max_tokens_per_rank),
             "slot_stride": int(stage2_scatter.max_tokens_per_rank) * int(topk),
         }
+    # Prequantized: the rows arrived over the EP wire already MX-quantized, so
+    # gemm1's A pass only routes them and preshuffles the scales.
+    _wire_stride = 0 if stage1_prequant is None else int(stage1_prequant.stride_bytes)
+    # Fold that gather into gemm1 instead of running it as its own pass: the
+    # first _producer_blocks workgroups of gemm1 route the rows while the rest
+    # compute, and each tile waits only on its own rows. Bandwidth-bound work
+    # under a compute-bound kernel, so what it costs is the tiles it displaces,
+    # which measures well under its own standalone time. Prequantized only --
+    # with quant still in the pass there would be ALU to displace too.
+    _producer_blocks = _stage1_producer_blocks() if _wire_stride else 0
+    # One counter per M-tile, incremented per chunk of rows landed, zeroed by
+    # the remap pass below: a stale count from the previous layer would let a
+    # consumer read rows that have not arrived yet. ``_row_src`` is that pass's
+    # inverse map (grouped row -> route), which is what lets the producer
+    # gather in destination order; it is fully written for every row a route
+    # claimed and the producer never reads past that bound.
+    _tile_rows_done = (
+        torch.empty(
+            ((contiguous_m + tile_m - 1) // tile_m,), dtype=torch.int32, device=device
+        )
+        if _producer_blocks
+        else None
+    )
+    _row_src = (
+        torch.empty((contiguous_m,), dtype=torch.int32, device=device)
+        if _producer_blocks
+        else None
+    )
     _starts, psum, _ = contiguous_psum_remap(
         _masked_m,
         topids_to_rows,
@@ -571,6 +623,8 @@ def _grouped_a8w4_tdm_moe(
         tile_m,
         num_valid_routes=_ep_nvr,
         ep_scatter_params=ep_scatter_params,
+        zero_tile_rows_done=_tile_rows_done,
+        row_src_route=_row_src,
     )
     psum = psum.to(torch.int32).contiguous()
     # Turns the TDM GEMM2 epilogue into the fused P2P scatter-combine.
@@ -618,21 +672,9 @@ def _grouped_a8w4_tdm_moe(
     _quant_mode = "fp4" if _is_fp4 else "fp8"
     _a_is_fp4 = 1 if _is_fp4 else 0
 
-    # Prequantized: the rows arrived over the EP wire already MX-quantized, so
-    # this pass only routes them and preshuffles the scales.
-    _wire_stride = 0 if stage1_prequant is None else int(stage1_prequant.stride_bytes)
     _a_rows = hidden_states.reshape(1, token_num, -1)
-    # Fold that gather into gemm1 instead of running it as its own pass: the
-    # first _producer_blocks workgroups of gemm1 route the rows while the rest
-    # compute, and each tile waits only on its own rows. Bandwidth-bound work
-    # under a compute-bound kernel, so what it costs is the tiles it displaces,
-    # which measures well under its own standalone time. Prequantized only --
-    # with quant still in the pass there would be ALU to displace too.
-    _producer_blocks = _stage1_producer_blocks() if _wire_stride else 0
     _producer_kw = {}
     if _producer_blocks:
-        if _ep_nvr is None:
-            raise ValueError("stage1 producer needs the EP valid-route count")
         _pb = model_dim // 2 if _is_fp4 else model_dim
         a1_payload = torch.empty(
             (1, contiguous_m, _pb), dtype=torch.uint8, device=device
@@ -642,22 +684,32 @@ def _grouped_a8w4_tdm_moe(
             dtype=torch.uint8,
             device=device,
         )
-        # One counter per M-tile, incremented per row landed. Zeroed here rather
-        # than reused: a stale count from the previous layer would let a
-        # consumer read rows that have not arrived yet.
-        _tile_rows_done = torch.zeros(
-            ((contiguous_m + tile_m - 1) // tile_m,), dtype=torch.int32, device=device
+        _chunk_rows = _stage1_producer_chunk_rows()
+        if tile_m % _chunk_rows:
+            raise ValueError(
+                f"stage1 producer chunk_rows={_chunk_rows} must divide tile_m={tile_m}"
+            )
+        _rejoin = _stage1_producer_rejoin()
+        # Rejoining producers own a tile, so there has to be one for each.
+        _gemm1_tiles = ((contiguous_m + tile_m - 1) // tile_m) * (
+            (two_inter + tile_n - 1) // tile_n
         )
+        if _rejoin and _producer_blocks > _gemm1_tiles:
+            raise ValueError(
+                f"stage1 producer_blocks={_producer_blocks} exceeds the gemm1 tile "
+                f"grid; lower it or set AITER_FLYDSL_STAGE1_PRODUCER_REJOIN=0"
+            )
         _producer_kw = {
             "producer_blocks": _producer_blocks,
-            "producer_numel": int(topids_to_rows.numel()),
+            "producer_rejoin": int(_rejoin),
+            "producer_chunk_rows": _chunk_rows,
+            "producer_total_rows": int(contiguous_m),
             "producer_topk": int(topk),
             "producer_wire_stride": _wire_stride,
             "producer_feat_dim": model_dim,
             "producer_wire": _a_rows,
             "producer_scale": a1_scale,
-            "producer_rows": topids_to_rows,
-            "producer_num_valid_routes": _ep_nvr,
+            "producer_row_src": _row_src,
             "producer_tile_rows_done": _tile_rows_done,
         }
     else:
@@ -1404,12 +1456,18 @@ def contiguous_psum_remap(
     tile_m: int,
     num_valid_routes: torch.Tensor | None = None,
     ep_scatter_params: dict | None = None,
+    zero_tile_rows_done: torch.Tensor | None = None,
+    row_src_route: torch.Tensor | None = None,
 ):
     """Tile-aligned psum and in-place masked-row -> contiguous-row remap.
 
     With ``ep_scatter_params`` (gather_w/tis/ep_rowmap/topk/max_tok/slot_stride)
     the same pass also scatters the gemm2-fused EP row map, reusing the final row
-    it just computed.
+    it just computed. ``zero_tile_rows_done``, when given, is zeroed by the same
+    pass -- the stage1 producer's counters, which would otherwise cost a fill
+    launch of their own -- and ``row_src_route`` receives the inverse of the
+    remap (grouped row -> route), which the producer walks to gather in
+    destination order.
     """
     device = masked_m.device
     experts = int(experts)
@@ -1430,6 +1488,16 @@ def contiguous_psum_remap(
             .to(device=device, dtype=torch.int32)
             .contiguous()
         )
+    # Same null-pointer convention as num_valid_routes above.
+    if zero_tile_rows_done is None:
+        done_i32 = torch.empty(0, dtype=torch.int32, device=device)
+    else:
+        done_i32 = zero_tile_rows_done.reshape(-1)
+    done_len = int(done_i32.numel())
+    if row_src_route is None:
+        src_i32 = torch.empty(0, dtype=torch.int32, device=device)
+    else:
+        src_i32 = row_src_route.reshape(-1)
     if ep_scatter_params is not None:
         launch = _get_compiled_contiguous_psum_remap_ep()
         # Init ep_rowmap to (-1, 0) with one int64 fill (low i32 = -1, high = 0);
@@ -1451,6 +1519,9 @@ def contiguous_psum_remap(
             int(ep_scatter_params["topk"]),
             int(ep_scatter_params["max_tok"]),
             int(ep_scatter_params["slot_stride"]),
+            ptr_arg(done_i32),
+            done_len,
+            ptr_arg(src_i32),
             stream=torch.cuda.current_stream(),
         )
         return starts, psum, contiguous_m_t
@@ -1466,6 +1537,9 @@ def contiguous_psum_remap(
         int(route_max_m),
         int(tile_m),
         ptr_arg(num_valid_routes_i32),
+        ptr_arg(done_i32),
+        done_len,
+        ptr_arg(src_i32),
         stream=torch.cuda.current_stream(),
     )
     return starts, psum, contiguous_m_t

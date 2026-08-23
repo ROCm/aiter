@@ -97,14 +97,15 @@ def flydsl_grouped_gemm_a8w4_masked(
     situ_beta=1.0,
     situ_linear_beta=1.0,
     producer_blocks=0,
-    producer_numel=0,
+    producer_rejoin=1,
+    producer_chunk_rows=0,
+    producer_total_rows=0,
     producer_topk=0,
     producer_wire_stride=0,
     producer_feat_dim=0,
     producer_wire=None,
     producer_scale=None,
-    producer_rows=None,
-    producer_num_valid_routes=None,
+    producer_row_src=None,
     producer_tile_rows_done=None,
 ):
     """Launches a contiguous-M grouped a8w4 GEMM on the TDM kernel."""
@@ -175,7 +176,9 @@ def flydsl_grouped_gemm_a8w4_masked(
         f32_situ_beta=float(situ_beta),
         f32_situ_linear_beta=float(situ_linear_beta),
         producer_blocks=int(producer_blocks),
-        producer_numel=int(producer_numel),
+        producer_rejoin=int(producer_rejoin),
+        producer_chunk_rows=int(producer_chunk_rows),
+        producer_total_rows=int(producer_total_rows),
         producer_topk=int(producer_topk),
         producer_wire_stride=int(producer_wire_stride),
         producer_feat_dim=int(producer_feat_dim),
@@ -184,8 +187,7 @@ def flydsl_grouped_gemm_a8w4_masked(
         # it. `a` stands in as a harmless well-formed pointer.
         arg_prod_wire=ptr_arg(producer_wire if producer_blocks else a),
         arg_prod_scale=ptr_arg(producer_scale if producer_blocks else a),
-        arg_prod_rows=ptr_arg(producer_rows if producer_blocks else a),
-        arg_prod_nvr=ptr_arg(producer_num_valid_routes if producer_blocks else a),
+        arg_prod_row_src=ptr_arg(producer_row_src if producer_blocks else a),
         arg_prod_done=ptr_arg(producer_tile_rows_done if producer_blocks else a),
     )
     return out

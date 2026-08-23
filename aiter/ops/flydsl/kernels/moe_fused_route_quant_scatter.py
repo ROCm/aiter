@@ -58,6 +58,7 @@ Grid  : (ceil(numel / warps_per_block), 1, 1)   numel = token_num*topk
 Block : (BLOCK_THREADS, 1, 1)
 """
 
+import math
 from types import SimpleNamespace
 
 import flydsl.compiler as flyc
@@ -578,51 +579,102 @@ def _scale_row_dword_base(row, *, c_rows_per_tile, c_dst_scale_dwords_per_row, c
     )
 
 
-@traced
-def _emit_producer_route_loop(c: SimpleNamespace) -> None:
-    """Rolled grid-stride loop over routes; one warp per route, one copy each.
+def _emit_expert_of_row(c: SimpleNamespace, blk_m):
+    """Bisect ``m_tile_map`` for the expert owning the tile starting at ``blk_m``.
 
-    Rolled rather than unrolled: a producer warp walks hundreds of routes and
-    each route's copy is already a long unrolled MX-block chain.
+    The consumer runs this same search on the same input, so producer and
+    consumer agree on how many rows a tile holds without a second buffer for
+    the per-tile expected count. ``blk_m * 0`` seeds the bounds as traced
+    values (a Python int would fold the whole search away).
+    """
+    lo, hi = blk_m * 0, blk_m * 0 + c.c_n_experts
+    for _ in range_constexpr(c.bisect_steps):
+        mid = (lo + hi) >> 1
+        mid_clamped = (mid < c.c_n_experts - 1).select(mid, c.c_n_experts - 1)
+        end = fx.Int32(
+            buffer_ops.buffer_load(c.map_rsrc, mid_clamped, vec_width=1, is_scalar=True)
+        )
+        go_right = end <= blk_m
+        lo = go_right.select(mid + 1, lo)
+        hi = go_right.select(hi, mid)
+    return lo
+
+
+@traced
+def _emit_producer_chunk_loop(c: SimpleNamespace) -> None:
+    """Rolled grid-stride loop over row chunks; one warp per chunk.
+
+    The walk is over *destination* rows, not routes: a chunk is a run of
+    consecutive contiguous-M rows that never straddles an M-tile, so the whole
+    chunk lands in one tile and one atomic publishes it. That is what makes the
+    counter move tile by tile -- a consumer's tile completes as soon as the
+    chunks covering it are done, where a route-ordered walk scatters every
+    tile's rows across the whole gather and completes them all at the end.
+    Chunks are handed out in row order too, so the tiles the consumers reach
+    first are also the ones filled first.
+
+    Rolled rather than unrolled: a warp walks several chunks and each row's
+    copy is already a long unrolled MX-block chain.
     """
     it = fx.Int32(0)
     while it < fx.Int32(c.iters):
-        route = fx.Uint32(c.warp_id) + fx.Uint32(it) * fx.Uint32(c.num_warps)
+        chunk = fx.Uint32(c.warp_id) + fx.Uint32(it) * fx.Uint32(c.num_warps)
         it = it + fx.Int32(1)
-        if route < fx.Uint32(c.valid_cnt):
-            # Scalar load: `route` is wave-uniform, so the row (and the whole
-            # destination descriptor built from it) stays in SGPRs.
-            row_raw = fx.Int32(
-                buffer_ops.buffer_load(
-                    c.rows_rsrc, route, vec_width=1, is_scalar=True
+        row0 = fx.Int32(chunk * fx.Uint32(c.c_chunk_rows))
+        if row0 < fx.Int32(c.c_total_rows):
+            m_tile = fx.Uint32(row0) >> c.c_tile_m_shift
+            blk_m = fx.Int32(m_tile << fx.Uint32(c.c_tile_m_shift))
+            expert = _emit_expert_of_row(c, blk_m)
+            # Tiles past the last expert hold no rows at all; their consumer
+            # retires on the same bound and never waits on them.
+            if expert < fx.Int32(c.c_n_experts):
+                # Rows [blk_m, valid_end) are exactly the rows some route
+                # claimed, so every row this loop touches has a source. The
+                # padding above valid_end is never produced and never read.
+                valid_end = fx.Int32(
+                    buffer_ops.buffer_load(
+                        c.map_rsrc, expert, vec_width=1, is_scalar=True
+                    )
                 )
-            )
-            if row_raw >= fx.Int32(0):
-                row = fx.Uint32(row_raw)
-                qc = SimpleNamespace(**vars(c.copy_args))
-                qc.feat_row_i32 = fx.Uint32(route) // fx.Uint32(c.c_topk)
-                qc.dests = [
-                    SimpleNamespace(
-                        payload_row_i32=row,
-                        scale_row_dword_base=_scale_row_dword_base(
-                            row,
-                            c_rows_per_tile=c.c_rows_per_tile,
-                            c_dst_scale_dwords_per_row=c.c_dst_scale_dwords_per_row,
-                            c16_i32=c.c16_i32,
-                        ),
+                chunk_end = row0 + fx.Int32(c.c_chunk_rows)
+                row_end = (chunk_end < valid_end).select(chunk_end, valid_end)
+                row_end = (row_end > row0).select(row_end, row0)
+                row = row0
+                while row < row_end:
+                    # Scalar loads: the chunk (hence the row and the whole
+                    # destination descriptor built from it) is wave-uniform, so
+                    # it all stays in SGPRs.
+                    route = fx.Int32(
+                        buffer_ops.buffer_load(
+                            c.src_rsrc, row, vec_width=1, is_scalar=True
+                        )
                     )
-                ]
-                _emit_copy_block_loop(qc)
-                # Release: the row must be in L2 before the counter that lets a
-                # consumer workgroup TDM-read it moves.
-                comm_ops.waitcnt_stores()
-                if c.is_lane0:
-                    m_tile = fx.Uint32(row) >> c.c_tile_m_shift
-                    # System scope to match the consumer's spin load; the
-                    # cross-rank producer will need it anyway.
-                    comm_ops.atomic_add_system(
-                        c.done_base + fx.Int64(m_tile) * 4, c.c1_i32
-                    )
+                    qc = SimpleNamespace(**vars(c.copy_args))
+                    qc.feat_row_i32 = fx.Uint32(route) // fx.Uint32(c.c_topk)
+                    qc.dests = [
+                        SimpleNamespace(
+                            payload_row_i32=fx.Uint32(row),
+                            scale_row_dword_base=_scale_row_dword_base(
+                                fx.Uint32(row),
+                                c_rows_per_tile=c.c_rows_per_tile,
+                                c_dst_scale_dwords_per_row=c.c_dst_scale_dwords_per_row,
+                                c16_i32=c.c16_i32,
+                            ),
+                        )
+                    ]
+                    _emit_copy_block_loop(qc)
+                    row = row + fx.Int32(1)
+                rows_done = row_end - row0
+                if rows_done > fx.Int32(0):
+                    # Release: the rows must be in L2 before the counter that
+                    # lets a consumer workgroup TDM-read them moves.
+                    comm_ops.waitcnt_stores()
+                    if c.is_lane0:
+                        # System scope to match the consumer's spin load; the
+                        # cross-rank producer will need it anyway.
+                        comm_ops.atomic_add_system(
+                            c.done_base + fx.Int64(m_tile) * 4, rows_done
+                        )
 
 
 def emit_prequant_gather_producer(
@@ -630,10 +682,12 @@ def emit_prequant_gather_producer(
     wire_in,
     grouped_payload,
     grouped_scale,
-    topids_to_rows,
-    num_valid_routes,
+    row_src_route,
+    m_tile_map,
     tile_rows_done,
-    numel: int,
+    n_experts: int,
+    total_rows: int,
+    chunk_rows: int,
     feat_dim: int,
     wmma_rep: int,
     quant_mode: str,
@@ -653,9 +707,14 @@ def emit_prequant_gather_producer(
     it. ``tile_rows_done[m_tile]`` counts rows landed per M-tile; a consumer
     workgroup spins on it until its own tile is complete.
 
+    Production is destination-ordered: ``row_src_route[row]`` gives the route
+    (hence the wire row) that claimed each contiguous-M row, and the warps walk
+    ``chunk_rows``-row chunks of the destination buffer. ``m_tile_map`` bounds
+    each tile's real rows, so no row without a source is ever touched.
+
     Only ``num_warps`` warps (spread over the producer workgroups) share the
-    ``numel`` routes, so the caller must place those workgroups at the low block
-    ids: consumers block on them, and the hardware dispatches in id order.
+    chunks, so the caller must place those workgroups at the low block ids:
+    consumers block on them, and the hardware dispatches in id order.
     """
     L = _quant_layout(feat_dim, quant_mode, wmma_rep)
     if not L.use_pk8:
@@ -664,6 +723,13 @@ def emit_prequant_gather_producer(
         raise ValueError(f"source_topk must be positive, got {source_topk}")
     if tile_m & (tile_m - 1):
         raise ValueError(f"tile_m must be a power of two, got {tile_m}")
+    if chunk_rows <= 0 or tile_m % chunk_rows:
+        raise ValueError(
+            f"chunk_rows {chunk_rows} must divide tile_m {tile_m} (chunks may not "
+            "straddle an M-tile: one atomic publishes one tile's rows)"
+        )
+    if n_experts <= 0 or total_rows <= 0:
+        raise ValueError("producer gather needs n_experts and total_rows")
     if wire_stride < L.payload_bytes_per_row + L.scale_bytes_per_row:
         raise ValueError(
             f"wire_stride {wire_stride} too small for {quant_mode} rows of {feat_dim}"
@@ -702,19 +768,22 @@ def emit_prequant_gather_producer(
         scale_rsrc=ptr_rsrc(grouped_scale),
     )
 
-    _emit_producer_route_loop(
+    total_chunks = (total_rows + chunk_rows - 1) // chunk_rows
+    _emit_producer_chunk_loop(
         SimpleNamespace(
-            iters=(numel + num_warps - 1) // num_warps,
+            iters=(total_chunks + num_warps - 1) // num_warps,
             num_warps=arith.constant(num_warps, type=i32),
             warp_id=warp_id,
-            valid_cnt=buffer_ops.buffer_load(
-                ptr_rsrc(num_valid_routes), c0_i32, vec_width=1, dtype=i32
-            ),
-            rows_rsrc=ptr_rsrc(topids_to_rows),
+            src_rsrc=ptr_rsrc(row_src_route),
+            map_rsrc=ptr_rsrc(m_tile_map),
             done_base=fx.Int64(ptrtoint(tile_rows_done)),
             copy_args=copy_args,
             c_topk=arith.constant(source_topk, type=i32),
             c_tile_m_shift=arith.constant(tile_m.bit_length() - 1, type=i32),
+            c_chunk_rows=arith.constant(chunk_rows, type=i32),
+            c_total_rows=arith.constant(total_rows, type=i32),
+            c_n_experts=n_experts,
+            bisect_steps=max(1, math.ceil(math.log2(max(2, n_experts))) + 1),
             c_rows_per_tile=arith.constant(L.rows_per_tile, type=i32),
             c_dst_scale_dwords_per_row=arith.constant(
                 L.dst_scale_dwords_per_row, type=i32

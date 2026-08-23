@@ -23,6 +23,7 @@ from aiter.ops.flydsl.kernels.tensor_shim import (
     AITER_FLYDSL_KERNARG_PRELOAD,
     AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
     ptr_buf_tensor,
+    ptr_rsrc,
 )
 
 MAX_EXPERTS_PER_BLOCK = 512
@@ -219,6 +220,9 @@ def build_moe_contiguous_psum_remap_module():
         route_max_m: Int32,
         tile_m: Int32,
         num_valid_routes: fx.Pointer,  # (1,) int32: only remap routes < this (EP dead-tail skip)
+        tile_rows_done: fx.Pointer,  # (m_tiles,) int32 out, zeroed; null when unused
+        tile_rows_done_len: Int32,
+        row_src_route: fx.Pointer,  # (contiguous_m,) int32 out: row -> route; null when unused
     ):
         # Uint32: every value here is a non-negative count/index, so `<`, `>=`
         # and `//` lower to ult/uge/divui rather than their signed forms.
@@ -241,6 +245,20 @@ def build_moe_contiguous_psum_remap_module():
         if is_lane0:
             carry[0] = fx.Int32(0)
         gpu.barrier()
+
+        # The stage1 producer's per-M-tile row counters have to start at 0 every
+        # layer -- a stale count would let a consumer tile read rows that have
+        # not landed. This pass already runs ahead of gemm1 and has idle lanes,
+        # so it does the zeroing instead of a separate fill launch. The pointer
+        # is null (0-element tensor) whenever no producer runs, which leaves the
+        # loop with zero trips.
+        done_len = fx.Uint32(0)
+        done_is_set = fx.Int64(ptrtoint(tile_rows_done)) != 0
+        if done_is_set:
+            done_len = fx.Uint32(tile_rows_done_len)
+        done_rsrc = ptr_rsrc(tile_rows_done)
+        for done_i32 in range(tid, done_len, MAX_EXPERTS_PER_BLOCK):
+            buffer_ops.buffer_store(fx.Int32(0), done_rsrc, done_i32)
 
         # Chunked scan; see psum_kernel for why E is swept in block-sized chunks.
         for base in range(0, experts, MAX_EXPERTS_PER_BLOCK):
@@ -301,6 +319,11 @@ def build_moe_contiguous_psum_remap_module():
             valid_route_count = fx.Uint32(
                 ptr_buf_tensor(num_valid_routes)[fx.Uint32(0)]
             )
+        # The inverse map the stage1 producer walks: it gathers in destination
+        # order, so it needs the route that claimed each contiguous-M row. Null
+        # pointer (0-element tensor) when no producer runs.
+        src_is_set = fx.Int64(ptrtoint(row_src_route)) != 0
+        src_rsrc = ptr_rsrc(row_src_route)
         for route_i32 in range(tid, valid_route_count, MAX_EXPERTS_PER_BLOCK):
             row_raw = rows_p[route_i32]
             # An EP route with no grouped row carries the negative
@@ -314,7 +337,10 @@ def build_moe_contiguous_psum_remap_module():
                 expert = row // m
                 slot = row - expert * m
                 start = fx.Uint32(s_p[expert])
-                rows_p[route_i32] = start + slot
+                final_row = start + slot
+                rows_p[route_i32] = final_row
+                if src_is_set:
+                    buffer_ops.buffer_store(fx.Uint32(route_i32), src_rsrc, final_row)
 
     @flyc.jit
     def launch_psum_remap(
@@ -328,6 +354,9 @@ def build_moe_contiguous_psum_remap_module():
         route_max_m: fx.Int32,
         tile_m: fx.Int32,
         num_valid_routes: fx.Pointer,
+        tile_rows_done: fx.Pointer,
+        tile_rows_done_len: fx.Int32,
+        row_src_route: fx.Pointer,
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         psum_remap_kernel(
@@ -341,6 +370,9 @@ def build_moe_contiguous_psum_remap_module():
             route_max_m,
             tile_m,
             num_valid_routes,
+            tile_rows_done,
+            tile_rows_done_len,
+            row_src_route,
         ).launch(
             grid=(1, 1, 1),
             block=(MAX_EXPERTS_PER_BLOCK, 1, 1),
@@ -388,6 +420,9 @@ def build_moe_contiguous_psum_remap_ep_module():
         topk: Int32,
         max_tok: Int32,
         slot_stride: Int32,
+        tile_rows_done: fx.Pointer,  # (m_tiles,) int32 out, zeroed; null when unused
+        tile_rows_done_len: Int32,
+        row_src_route: fx.Pointer,  # (contiguous_m,) int32 out: row -> route; null when unused
     ):
         # Uint32 for the same reason as psum_remap_kernel: all counts/indices.
         tid = fx.Uint32(fx.thread_idx.x)
@@ -435,6 +470,19 @@ def build_moe_contiguous_psum_remap_ep_module():
         bid = fx.Uint32(fx.block_idx.x)
         gtid = bid * MAX_EXPERTS_PER_BLOCK + tid
         is_blk0 = bid == fx.Uint32(0)
+
+        # Zero the stage1 producer's per-M-tile row counters here (see the
+        # non-EP remap kernel): this pass runs ahead of gemm1 with lanes to
+        # spare, so the counters cost no launch of their own. Null pointer when
+        # no producer runs, which leaves the loop with zero trips.
+        done_len = fx.Uint32(0)
+        done_is_set = fx.Int64(ptrtoint(tile_rows_done)) != 0
+        if done_is_set:
+            done_len = fx.Uint32(tile_rows_done_len)
+        done_rsrc = ptr_rsrc(tile_rows_done)
+        for done_i32 in range(gtid, done_len, EP_REMAP_NBLK * MAX_EXPERTS_PER_BLOCK):
+            buffer_ops.buffer_store(fx.Int32(0), done_rsrc, done_i32)
+
         # Multi-block: every block keeps its exclusive per-expert starts in LDS so the
         # grid-strided scatter reads starts from LDS (never global -> no cross-block
         # barrier). Only block 0 writes the global starts/psum/contiguous_m outputs.
@@ -462,6 +510,11 @@ def build_moe_contiguous_psum_remap_ep_module():
         nvr = fx.Uint32(ptr_buf_tensor(num_valid_routes)[fx.Uint32(0)])
         topk_v = fx.Uint32(topk)
         max_tok_v = fx.Uint32(max_tok)
+        # The inverse map the stage1 producer walks: it gathers in destination
+        # order, so it needs the route that claimed each contiguous-M row. Null
+        # pointer (0-element tensor) when no producer runs.
+        src_is_set = fx.Int64(ptrtoint(row_src_route)) != 0
+        src_rsrc = ptr_rsrc(row_src_route)
         # Fused remap + ep_rowmap scatter over valid routes ([0, nvr)).
         for route in range(gtid, nvr, EP_REMAP_NBLK * MAX_EXPERTS_PER_BLOCK):
             row_raw = rows_p[route]
@@ -477,6 +530,8 @@ def build_moe_contiguous_psum_remap_ep_module():
                 slot = row - expert * m
                 final_row = fx.Uint32(starts_lds[expert]) + slot
                 rows_p[route] = final_row
+                if src_is_set:
+                    buffer_ops.buffer_store(fx.Uint32(route), src_rsrc, final_row)
                 # ep_rowmap scatter for this row: packed dest + f32 weight bits.
                 w_f32 = w_p[route].to(fx.Float32)
                 t = fx.Uint32(route) // topk_v
@@ -506,6 +561,9 @@ def build_moe_contiguous_psum_remap_ep_module():
         topk: fx.Int32,
         max_tok: fx.Int32,
         slot_stride: fx.Int32,
+        tile_rows_done: fx.Pointer,
+        tile_rows_done_len: fx.Int32,
+        row_src_route: fx.Pointer,
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         psum_remap_ep_kernel(
@@ -524,6 +582,9 @@ def build_moe_contiguous_psum_remap_ep_module():
             topk,
             max_tok,
             slot_stride,
+            tile_rows_done,
+            tile_rows_done_len,
+            row_src_route,
         ).launch(
             grid=(EP_REMAP_NBLK, 1, 1),
             block=(MAX_EXPERTS_PER_BLOCK, 1, 1),
