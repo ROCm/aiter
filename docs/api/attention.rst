@@ -129,7 +129,7 @@ AITER attention kernels are optimized for:
 
 * **AMD Instinct MI300X** (gfx942) - Best performance
 * **AMD Instinct MI250X** (gfx90a) - Fully supported
-* **AMD Instinct MI300A** (gfx942) - Experimental
+* **AMD Instinct MI355X** (gfx950) - Experimental
 
 Performance Characteristics
 ----------------------------
