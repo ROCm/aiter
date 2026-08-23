@@ -8,10 +8,11 @@
 Dense BF16-output MHA v4 is implemented and validated on gfx950. Gfx942 native FP8/FP8 and signed
 INT8/FP8 rows are also available under v4.
 
-The public raw and packed APIs support seven dense combinations:
+The public raw and packed APIs support eight dense combinations:
 
 | Q/K | V | Output |
 |---|---|---|
+| BF16 | BF16 | BF16 |
 | INT8 | FP8 | BF16 |
 | FP8 | FP8 | BF16 |
 | MXFP8 | FP8 | BF16 |
@@ -68,7 +69,7 @@ migration, and distributed integration are complete. Callers can delegate quanti
 scaling, scale recipes, and packed views to MHA v4 while retaining separate Q/K/V custom ops for
 communication overlap.
 
-Validation includes eager accuracy for all six combinations, fullgraph eager/compiled parity,
+Validation includes eager accuracy for all eight combinations, fullgraph eager/compiled parity,
 finite outputs, allocator churn with downstream consumers, explicit code-object dispatch,
 unaligned and unequal sequence lengths, retained model captures, and balanced multi-GPU target-shape
 benchmarks. Focused coverage lives in `op_tests/test_mha_v4.py`.
@@ -77,7 +78,7 @@ Still deferred:
 
 - sparse ragged-LUT execution, VSA/Sparge compatibility, and ring/LSE support;
 - low-precision output with an explicit data/scale ABI;
-- approximate BF16 input under a distinct identity from v3 BF16;
+- additional BF16 kernel variants with distinct manifest identities;
 - causal, varlen, other head dimensions, and more Q/K/V/O combinations;
 - broader gfx942, CDNA5, and RDNA manifest/code-object coverage.
 
@@ -306,8 +307,9 @@ code_object
 
 Kernel cache identity is `(kernel_symbol, code_object)`, never the symbol alone.
 
-The approximate BF16 kernel uses a distinct symbol, code-object slot, and manifest row, for example
-`fwd_hd128_bf16_approx.co`. It must not overwrite or reuse generic `fwd_hd128_bf16.co` dispatch.
+BF16 dispatch uses the same explicit format and scale-mode key as other rows. Each architecture
+owns its manifest row and code object under `hsa/<arch>/fmha_v4_fwd/`; adding gfx942 BF16 support
+does not require a Python-side architecture branch.
 
 ## Sparse Contract
 
@@ -379,7 +381,7 @@ Fix offsets with the first implementing kernel; existing v1 binaries retain thei
 1. Add sparse manifest rows, ragged-LUT validation, and exact 256x128/128x128 execution paths.
 2. Add VSA/Sparge adapters over the shared sparse descriptor and packed executor.
 3. Add LSE under a stable output schema for ring attention.
-4. Add approximate BF16 under a distinct symbol and code object from generic v3 BF16.
+4. Add further BF16 variants only under distinct manifest identities.
 5. Add a versioned low-precision-output ABI once data/scale ownership is concrete.
 6. Expand architectures, head dimensions, sequence modes, and format combinations only through
     explicit manifest rows.

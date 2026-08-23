@@ -138,6 +138,7 @@ class AttentionScaleMode(IntEnum):
 _FP8_FORMATS = (AttentionFormat.FP8_E4M3, AttentionFormat.FP8_E4M3_FNUZ)
 _MX_FORMATS = (AttentionFormat.FP6_E2M3, AttentionFormat.FP4_E2M1)
 _PACKED_QK_WIDTH = {
+    AttentionFormat.BF16: 128,
     AttentionFormat.INT8: 128,
     AttentionFormat.FP8_E4M3: 128,
     AttentionFormat.FP8_E4M3_FNUZ: 128,
@@ -176,6 +177,10 @@ def _validate_format_contract(
         )
     if q_format != k_format:
         raise ValueError("MHA v4 currently requires matching Q and K formats")
+    if q_format == AttentionFormat.BF16:
+        if v_format != AttentionFormat.BF16:
+            raise ValueError("BF16 Q/K currently requires BF16 V")
+        return
     if q_format not in _PACKED_QK_WIDTH:
         raise ValueError(f"unsupported Q/K format: {q_format!r}")
     if v_format not in (
@@ -200,6 +205,12 @@ def scale_modes_for_formats(
 ) -> tuple[AttentionScaleMode, AttentionScaleMode, AttentionScaleMode]:
     """Return the canonical Q, K, and V scale modes for a format recipe."""
     _validate_format_contract(q_format, k_format, v_format)
+    if q_format == AttentionFormat.BF16:
+        return (
+            AttentionScaleMode.NONE,
+            AttentionScaleMode.NONE,
+            AttentionScaleMode.NONE,
+        )
     if q_format == AttentionFormat.INT8 or q_format in _FP8_FORMATS:
         v_scale_mode = (
             AttentionScaleMode.F32_PER_TENSOR
@@ -1002,6 +1013,23 @@ def mha_v4(
         q_format, k_format, v_format
     )
 
+    if q_format == AttentionFormat.BF16:
+        return mha_v4_packed(
+            q,
+            k,
+            v,
+            q,
+            k,
+            v,
+            q_format,
+            k_format,
+            v_format,
+            q_scale_mode,
+            k_scale_mode,
+            v_scale_mode,
+            softmax_scale=softmax_scale,
+            out=out,
+        )
     if q_format == AttentionFormat.INT8 and _is_fp8_format(v_format):
         q_quantized, q_descale = quantize_int8(q)
         k_quantized, k_descale = quantize_int8(k)

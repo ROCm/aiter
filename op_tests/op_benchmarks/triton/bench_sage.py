@@ -126,41 +126,43 @@ KernelName = Literal[
     "sage_fp8",
     "sage_mxfp4",
     "fav3_fp8",
-    "aiter_i8fp8",
-    "aiter_mxfp8",
-    "aiter_fp8",
-    "aiter_f8f6",
-    "aiter_mxfp6",
-    "aiter_f6f4",
-    "aiter_mxfp4",
-    "aiter_f4f4",
     "aiter_bf16",
+    "mha4_bf16",
+    "mha4_i8fp8",
+    "mha4_mxfp8",
+    "mha4_fp8",
+    "mha4_f8f6",
+    "mha4_mxfp6",
+    "mha4_f6f4",
+    "mha4_mxfp4",
+    "mha4_f4f4",
 ]
 
 ALL_KERNELS: list[str] = [
-    "aiter_i8fp8",
-    "aiter_mxfp8",
-    "aiter_fp8",
-    "aiter_f8f6",
-    "aiter_mxfp6",
-    "aiter_f6f4",
-    "aiter_mxfp4",
-    "aiter_f4f4",
     "aiter_bf16",
+    "mha4_bf16",
+    "mha4_i8fp8",
+    "mha4_mxfp8",
+    "mha4_fp8",
+    "mha4_f8f6",
+    "mha4_mxfp6",
+    "mha4_f6f4",
+    "mha4_mxfp4",
+    "mha4_f4f4",
 ]
 
 QUANT_KERNELS = {
     "sage_fp8",
     "sage_mxfp4",
     "fav3_fp8",
-    "aiter_i8fp8",
-    "aiter_mxfp8",
-    "aiter_fp8",
-    "aiter_f8f6",
-    "aiter_mxfp6",
-    "aiter_f6f4",
-    "aiter_mxfp4",
-    "aiter_f4f4",
+    "mha4_i8fp8",
+    "mha4_mxfp8",
+    "mha4_fp8",
+    "mha4_f8f6",
+    "mha4_mxfp6",
+    "mha4_f6f4",
+    "mha4_mxfp4",
+    "mha4_f4f4",
 }
 
 
@@ -1065,7 +1067,18 @@ def make_kernel_runner(
             return_attn_probs=False,
         )
 
-    if args.kernel == "aiter_fp8":
+    if args.kernel == "mha4_bf16":
+        return lambda: mha_v4(
+            q_bshd,
+            k_bshd,
+            v_bshd,
+            AttentionFormat.BF16,
+            AttentionFormat.BF16,
+            AttentionFormat.BF16,
+            softmax_scale=softmax_scale,
+        )
+
+    if args.kernel == "mha4_fp8":
         if args.e2e and args.hadamard_rotate:
             return lambda: mha_v4(
                 q_bshd,
@@ -1102,9 +1115,9 @@ def make_kernel_runner(
             softmax_scale=softmax_scale,
         )
 
-    if args.kernel == "aiter_mxfp8":
+    if args.kernel == "mha4_mxfp8":
         if not args.hadamard_rotate or args.block_r != 128 or args.qsmooth:
-            raise ValueError("aiter_mxfp8 requires block_r=128 Hadamard rotation")
+            raise ValueError("mha4_mxfp8 requires block_r=128 Hadamard rotation")
         mxfp8_scale_modes = (
             AttentionScaleMode.E8M0_PER_1X32,
             AttentionScaleMode.E8M0_PER_1X32,
@@ -1133,10 +1146,10 @@ def make_kernel_runner(
             softmax_scale=softmax_scale,
         )
 
-    if args.kernel == "aiter_f8f6":
+    if args.kernel == "mha4_f8f6":
         if args.qsmooth or (args.hadamard_rotate and args.block_r != 128):
             raise ValueError(
-                "aiter_f8f6 Hadamard preprocessing requires block_r=128 "
+                "mha4_f8f6 Hadamard preprocessing requires block_r=128 "
                 "and does not support --qsmooth"
             )
         if args.e2e and args.hadamard_rotate and args.f8f6_v_scale == "block":
@@ -1182,7 +1195,7 @@ def make_kernel_runner(
             softmax_scale=softmax_scale,
         )
 
-    if args.kernel == "aiter_i8fp8":
+    if args.kernel == "mha4_i8fp8":
         q_clip = args.q_clip if args.q_clip is not None else args.qk_clip
         k_clip = args.k_clip if args.k_clip is not None else args.qk_clip
 
@@ -1218,14 +1231,14 @@ def make_kernel_runner(
             softmax_scale=softmax_scale,
         )
 
-    if args.kernel in ("aiter_mxfp4", "aiter_f4f4"):
+    if args.kernel in ("mha4_mxfp4", "mha4_f4f4"):
         block_r = args.block_r
         if block_r != 128:
             raise ValueError(f"{args.kernel} requires block_r=128, got {block_r}")
         if args.qsmooth:
             raise ValueError(f"{args.kernel} does not support --qsmooth")
 
-        is_f4f4 = args.kernel == "aiter_f4f4"
+        is_f4f4 = args.kernel == "mha4_f4f4"
         v_format = AttentionFormat.MXFP4 if is_f4f4 else fp8_format
         scale_modes = scale_modes_for_formats(
             AttentionFormat.MXFP4, AttentionFormat.MXFP4, v_format
@@ -1271,8 +1284,8 @@ def make_kernel_runner(
         packed = _quantize_mxfp4()
         return lambda: _kernel_mxfp4(*packed)
 
-    if args.kernel in ("aiter_mxfp6", "aiter_f6f4"):
-        is_f6f4 = args.kernel == "aiter_f6f4"
+    if args.kernel in ("mha4_mxfp6", "mha4_f6f4"):
+        is_f6f4 = args.kernel == "mha4_f6f4"
         block_r = args.block_r
         if args.qsmooth or (args.hadamard_rotate and block_r != 128):
             raise ValueError(
@@ -1564,14 +1577,14 @@ def benchmark_single_case(
         if args.kernel
         in (
             "fav3_fp8",
-            "aiter_mxfp8",
-            "aiter_fp8",
-            "aiter_f8f6",
-            "aiter_i8fp8",
-            "aiter_mxfp4",
-            "aiter_mxfp6",
-            "aiter_f6f4",
-            "aiter_f4f4",
+            "mha4_mxfp8",
+            "mha4_fp8",
+            "mha4_f8f6",
+            "mha4_i8fp8",
+            "mha4_mxfp4",
+            "mha4_mxfp6",
+            "mha4_f6f4",
+            "mha4_f4f4",
         )
         else v.element_size()
     )
@@ -1773,13 +1786,13 @@ def validate_args(args: argparse.Namespace) -> None:
         "sage_fp8",
         "sage_mxfp4",
         "fav3_fp8",
-        "aiter_mxfp8",
-        "aiter_fp8",
-        "aiter_f8f6",
-        "aiter_mxfp6",
-        "aiter_f6f4",
-        "aiter_mxfp4",
-        "aiter_f4f4",
+        "mha4_mxfp8",
+        "mha4_fp8",
+        "mha4_f8f6",
+        "mha4_mxfp6",
+        "mha4_f6f4",
+        "mha4_mxfp4",
+        "mha4_f4f4",
         "all",
     )
 
@@ -2105,15 +2118,16 @@ def parse_args() -> argparse.Namespace:
             "sage_fp8",
             "sage_mxfp4",
             "fav3_fp8",
-            "aiter_i8fp8",
-            "aiter_mxfp8",
-            "aiter_fp8",
-            "aiter_f8f6",
-            "aiter_mxfp6",
-            "aiter_f6f4",
-            "aiter_mxfp4",
-            "aiter_f4f4",
             "aiter_bf16",
+            "mha4_bf16",
+            "mha4_i8fp8",
+            "mha4_mxfp8",
+            "mha4_fp8",
+            "mha4_f8f6",
+            "mha4_mxfp6",
+            "mha4_f6f4",
+            "mha4_mxfp4",
+            "mha4_f4f4",
             "all",
         ],
         help="Kernel implementation to benchmark. Use 'all' to compare all backends.",
@@ -2158,7 +2172,7 @@ def parse_args() -> argparse.Namespace:
         "--qk-clip",
         type=float,
         default=1.0,
-        help="Clip factor applied to Q and K absmax before int8 quantization for aiter_i8fp8",
+        help="Clip factor applied to Q and K absmax before int8 quantization for mha4_i8fp8",
     )
     parser.add_argument(
         "--f8f6-v-scale",
@@ -2170,13 +2184,13 @@ def parse_args() -> argparse.Namespace:
         "--q-clip",
         type=float,
         default=None,
-        help="Optional Q-only absmax clip factor for aiter_i8fp8; overrides --qk-clip for Q",
+        help="Optional Q-only absmax clip factor for mha4_i8fp8; overrides --qk-clip for Q",
     )
     parser.add_argument(
         "--k-clip",
         type=float,
         default=None,
-        help="Optional K-only absmax clip factor for aiter_i8fp8; overrides --qk-clip for K",
+        help="Optional K-only absmax clip factor for mha4_i8fp8; overrides --qk-clip for K",
     )
     parser.add_argument(
         "--metric",

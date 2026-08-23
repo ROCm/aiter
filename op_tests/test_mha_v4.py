@@ -152,6 +152,16 @@ def test_mha_v4_f8f6_scale_recipe():
     )
 
 
+def test_mha_v4_bf16_scale_recipe():
+    assert scale_modes_for_formats(
+        AttentionFormat.BF16, AttentionFormat.BF16, AttentionFormat.BF16
+    ) == (
+        AttentionScaleMode.NONE,
+        AttentionScaleMode.NONE,
+        AttentionScaleMode.NONE,
+    )
+
+
 def test_mha_v4_rejects_f8f4_format_pair():
     with pytest.raises(ValueError, match="matching FP8 or MXFP6 V"):
         scale_modes_for_formats(
@@ -557,7 +567,7 @@ def test_mha_v4_rejects_reserved_raw_formats(q_format):
         )
 
 
-@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 six-format validation")
+@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MHA v4 validation")
 def test_mha_v4_packed_rejects_wrong_scale_recipe():
     q = torch.zeros((1, 128, 2, 128), device="cuda", dtype=torch.int8)
     v = torch.zeros((1, 128, 2, 128), device="cuda", dtype=torch.float8_e4m3fn)
@@ -600,7 +610,7 @@ def test_mha_v4_packed_accepts_mxfp8_scale_recipe():
     )
 
 
-@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 six-format validation")
+@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MHA v4 validation")
 def test_mha_v4_packed_rejects_wrong_fp8_encoding():
     q = torch.zeros((1, 128, 2, 128), device="cuda", dtype=torch.float8_e4m3fn)
     scale = torch.ones(1, device="cuda", dtype=torch.float32)
@@ -660,11 +670,18 @@ def test_mha_v4_packed_rejects_wrong_mxfp4_k_layout():
     assert coalesced_k.stride() == (16384, 64, 8192, 1)
 
 
-@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 six-format validation")
-@pytest.mark.parametrize("q_format", [AttentionFormat.INT8, AttentionFormat.FP8])
-def test_mha_v4_zero_inputs_are_finite(q_format):
+@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MHA v4 validation")
+@pytest.mark.parametrize(
+    ("q_format", "v_format"),
+    [
+        (AttentionFormat.BF16, AttentionFormat.BF16),
+        (AttentionFormat.INT8, AttentionFormat.FP8),
+        (AttentionFormat.FP8, AttentionFormat.FP8),
+    ],
+)
+def test_mha_v4_zero_inputs_are_finite(q_format, v_format):
     q = torch.zeros((1, 128, 2, 128), device="cuda", dtype=torch.bfloat16)
-    out = mha_v4(q, q, q, q_format, q_format, AttentionFormat.FP8)
+    out = mha_v4(q, q, q, q_format, q_format, v_format)
     torch.cuda.synchronize()
     assert torch.count_nonzero(out) == 0
     assert torch.isfinite(out).all()
@@ -791,7 +808,7 @@ def test_mha_v4_packed_fp8_compile_parity():
     assert torch.equal(eager, compiled)
 
 
-@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 six-format validation")
+@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MHA v4 validation")
 def test_mha_v4_native_schema_mutates_only_out():
     q = torch.zeros((1, 128, 2, 128), device="cuda", dtype=torch.float8_e4m3fn)
     scale = torch.ones(1, device="cuda", dtype=torch.float32)
@@ -818,10 +835,11 @@ def test_mha_v4_native_schema_mutates_only_out():
     assert schema.endswith("-> ()")
 
 
-@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 six-format validation")
+@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MHA v4 validation")
 @pytest.mark.parametrize(
     ("q_format", "v_format"),
     [
+        (AttentionFormat.BF16, AttentionFormat.BF16),
         (AttentionFormat.INT8, AttentionFormat.FP8),
         (AttentionFormat.FP8, AttentionFormat.FP8),
         (AttentionFormat.FP8, AttentionFormat.MXFP6),
