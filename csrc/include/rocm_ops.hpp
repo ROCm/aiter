@@ -1410,8 +1410,8 @@ namespace py = pybind11;
     m.def("moe_sum", &aiter::moe_sum, "moe_sum(Tensor! input, Tensor output) -> ()");
 
 #define MOE_TOPK_PYBIND                                      \
-    m.def("topk_softplus",                                   \
-          &aiter::topk_softplus,                             \
+    m.def("topk_gating",                                     \
+          &aiter::topk_gating,                               \
           py::arg("topk_weights"),                           \
           py::arg("topk_indices"),                           \
           py::arg("gating_output"),                          \
@@ -2124,7 +2124,7 @@ namespace py = pybind11;
           py::arg("sin_cache"),                        \
           py::arg("num_groups"),                       \
           py::arg("quant_group_size") = 128,           \
-          py::arg("scale_shuffle")    = false);
+          py::arg("scale_layout")     = 0);
 
 #define SMOOTHQUANT_PYBIND                      \
     m.def("smoothquant_fwd", &smoothquant_fwd); \
