@@ -260,12 +260,16 @@ __global__ void pack_work_table_kernel(int32_t* __restrict__ table,
     table[slot] = pack_work_table_entry(static_cast<int32_t>(order[slot]), q_tiles, nhead);
 }
 
-// Largest table one workgroup will order in LDS, at 8 bytes per entry. Past roughly this size the
-// quadratic rank count loses to ATen's sort, which is nearly flat in comparison because it spreads
-// over the whole device. Whole-table build time measured on gfx950, fused against ATen: 512 entries
-// 9us against 23us, 1024 entries 21us against 23us, 2048 entries 80us against 24us.
-constexpr int32_t kWorkTableFusedMax    = 1024;
+// Largest table the fused path will order. Keys stage in LDS at 8 bytes each, so this is exactly
+// the 64KB a workgroup gets and there is no room for a second shared array. Build time measured on
+// gfx950 is flat near 5us from 512 entries through 2048, 7us at 4096 and 15us at 8192, against
+// 33-45us once the sort goes to ATen. Measure with a warm module: folding a JIT build into the same
+// process inflates the first readings roughly threefold.
+constexpr int32_t kWorkTableFusedMax    = 8192;
 constexpr int32_t kWorkTableSortThreads = 1024;
+// Host-side wave width, only used to size the grid. Device code reads warpSize directly, and the
+// grid-stride loop stays correct if the two disagree.
+constexpr int32_t kWorkTableWave = 64;
 
 // Order and pack in a single launch, by counting each entry's rank rather than moving entries past
 // each other. The key carries the whole ordering: the count is complemented into the high half so
@@ -273,10 +277,13 @@ constexpr int32_t kWorkTableSortThreads = 1024;
 // order and so makes uniform counts come out as the identity permutation.
 //
 // Because the slot index makes every key distinct, an entry's rank is exactly the number of keys
-// below it, which is a permutation with no tie-breaking pass and is stable by definition. Counting
-// ranks costs O(n^2) compares against a sorting network's O(n log^2 n), but it needs one barrier
-// instead of one per pass, and every lane in a wave reads the same key each step, so the inner loop
-// is an LDS broadcast. At these table sizes that trade is heavily in its favour.
+// below it. That is a permutation with no tie-breaking pass, and it is stable by definition.
+//
+// One wave ranks one entry, each lane counting a strided slice of the keys and the wave reducing
+// the partial counts. Total compares are O(n^2), but the work per lane is only n/64 and the only
+// barrier is the one after staging, so latency stays near the launch floor over the whole supported
+// range. Spreading each entry's count across a wave is what keeps this ahead of ATen's sort here;
+// giving one thread a whole entry costs O(n) per thread and loses above about 1024 entries.
 //
 // A counting sort over the LUT length would be O(n + bins), but positions within a bin would be
 // handed out by atomics in arbitrary order. That loses stability, and with it the identity
@@ -296,13 +303,21 @@ __global__ void rank_and_pack_work_table_kernel(int32_t* __restrict__ table,
     }
     __syncthreads();
 
-    for(int32_t slot = threadIdx.x; slot < total; slot += blockDim.x)
+    const int32_t lane            = threadIdx.x % warpSize;
+    const int32_t waves_per_block = blockDim.x / warpSize;
+    const int32_t first_wave      = blockIdx.x * waves_per_block + threadIdx.x / warpSize;
+
+    // Wave-uniform bounds, so every lane stays active through the reduction below.
+    for(int32_t slot = first_wave; slot < total; slot += gridDim.x * waves_per_block)
     {
         const uint64_t mine = keys[slot];
         int32_t rank        = 0;
-        for(int32_t other = 0; other < total; ++other)
+        for(int32_t other = lane; other < total; other += warpSize)
             rank += keys[other] < mine ? 1 : 0;
-        table[rank] = pack_work_table_entry(slot, q_tiles, nhead);
+        for(int32_t offset = warpSize >> 1; offset > 0; offset >>= 1)
+            rank += __shfl_xor(rank, offset);
+        if(lane == 0)
+            table[rank] = pack_work_table_entry(slot, q_tiles, nhead);
     }
 }
 
@@ -333,7 +348,12 @@ at::Tensor build_sorted_work_table(const at::Tensor& lut_count,
 
     if(total <= kWorkTableFusedMax)
     {
-        rank_and_pack_work_table_kernel<<<1, dim3(kWorkTableSortThreads), 0, stream>>>(
+        // One wave per entry, so the grid follows the table rather than the machine. Every block
+        // stages the whole key array, which is why the launch stays one dimension.
+        const int32_t waves_per_block = kWorkTableSortThreads / kWorkTableWave;
+        const dim3 grid(
+            static_cast<uint32_t>((total + waves_per_block - 1) / waves_per_block));
+        rank_and_pack_work_table_kernel<<<grid, dim3(kWorkTableSortThreads), 0, stream>>>(
             table.data_ptr<int32_t>(),
             flat.data_ptr<int32_t>(),
             static_cast<int32_t>(total),
@@ -342,7 +362,7 @@ at::Tensor build_sorted_work_table(const at::Tensor& lut_count,
         return table;
     }
 
-    // Beyond one workgroup's LDS, defer the sort to ATen and pack separately. A stable sort keeps
+    // Past the LDS staging limit, defer the sort to ATen and pack separately. A stable sort keeps
     // the tie behaviour identical to the fused path.
     const auto order = at::argsort(flat, /*stable=*/true, /*dim=*/0, /*descending=*/true);
     constexpr int32_t block_size = 256;

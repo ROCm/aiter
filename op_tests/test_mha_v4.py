@@ -1079,12 +1079,22 @@ def _unpack_work_table(table, nhead, q_tiles):
     return (b_idx * nhead + h_idx) * q_tiles + q_idx
 
 
-# The table has one entry per (batch, head, query tile). 1024 is the point where the builder hands
-# the sort to ATen, so straddle it, and include sizes that are not multiples of the workgroup.
+# The table has one entry per (batch, head, query tile). 8192 is the point where the builder hands
+# the sort to ATen, so straddle it, and include sizes that are not multiples of a wave or workgroup.
 @pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 sparse validation")
 @pytest.mark.parametrize(
     ("batch", "nhead", "q_tiles"),
-    [(1, 1, 1), (1, 8, 3), (2, 5, 7), (1, 16, 32), (1, 32, 32), (4, 16, 64)],
+    [
+        (1, 1, 1),
+        (1, 8, 3),
+        (2, 5, 7),
+        (1, 16, 32),
+        (1, 32, 32),
+        (1, 5, 296),
+        (4, 16, 64),
+        (8, 16, 64),
+        (8, 32, 64),
+    ],
 )
 @pytest.mark.parametrize(
     "pattern",
@@ -1120,7 +1130,9 @@ def test_mha_v4_sparse_work_table_is_longest_lut_first(batch, nhead, q_tiles, pa
 
 
 @pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 sparse validation")
-@pytest.mark.parametrize("batch,nhead,q_tiles", [(1, 16, 32), (4, 16, 64)])
+@pytest.mark.parametrize(
+    "batch,nhead,q_tiles", [(1, 16, 32), (1, 5, 296), (8, 16, 64), (8, 32, 64)]
+)
 def test_mha_v4_sparse_work_table_leaves_uniform_counts_in_raster_order(
     batch, nhead, q_tiles
 ):
