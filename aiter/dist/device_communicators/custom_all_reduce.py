@@ -1059,7 +1059,15 @@ class CustomAllreduce:
         # PyTorch caching allocator (its memory accounting is what downstream
         # consumers profile against). Gated on the same condition as the
         # capture copy-in path above; _init_ipc only runs for non-VMM.
-        raw_cached = _expandable_segments_enabled()
+        # AITER_CUSTOM_AR_RAW_INPUT_POOL forces the raw pool without
+        # expandable segments. Its use case is co-resident engines on one node
+        # (#4921): a second engine's torch.empty input pool can fail
+        # hipIpcGetMemHandle outright, and the raw pool sidesteps that while
+        # everything else (meta pool, capture-time outputs) stays exportable
+        # under the default allocator.
+        raw_cached = _expandable_segments_enabled() or _env_flag(
+            "AITER_CUSTOM_AR_RAW_INPUT_POOL"
+        )
         self._pool.create("input", max_size, raw_cached=raw_cached)
 
         handles, offsets = self._pool.get_ipc_meta("meta")

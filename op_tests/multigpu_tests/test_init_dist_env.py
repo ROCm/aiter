@@ -32,11 +32,13 @@ logger = logging.getLogger("aiter")
 set_start_method("spawn", force=True)
 
 
-def _worker(tp_size, rankID, expandable_segments, shape):
+def _worker(tp_size, rankID, mode, shape):
     # Must precede CUDA init in this process: the allocator reads the setting
     # once, when the context comes up.
-    if expandable_segments:
+    if mode == "expandable":
         os.environ["PYTORCH_HIP_ALLOC_CONF"] = "expandable_segments:True"
+    elif mode == "raw_override":
+        os.environ["AITER_CUSTOM_AR_RAW_INPUT_POOL"] = "1"
 
     from aiter.dist.communication_op import tensor_model_parallel_all_reduce
     from aiter.dist.parallel_state import get_tp_group
@@ -66,12 +68,12 @@ def _worker(tp_size, rankID, expandable_segments, shape):
     return pool_mode, out
 
 
-def test_init_dist_env(tp_size, shape, expandable_segments):
+def test_init_dist_env(tp_size, shape, run_mode):
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = "49374"
     pool = Pool(processes=tp_size)
     rets = [
-        pool.apply_async(_worker, args=(tp_size, i, expandable_segments, shape))
+        pool.apply_async(_worker, args=(tp_size, i, run_mode, shape))
         for i in range(tp_size)
     ]
     pool.close()
@@ -85,9 +87,13 @@ def test_init_dist_env(tp_size, shape, expandable_segments):
         checkAllclose(
             ref,
             out,
-            msg=f"init_dist_env allreduce: {tp_size=} {expandable_segments=} pool={mode}",
+            msg=f"init_dist_env allreduce: {tp_size=} mode={run_mode} pool={mode}",
         )
-    if expandable_segments and modes == {"torch"}:
+    if run_mode == "raw_override":
+        assert modes == {
+            "raw_cached"
+        }, f"AITER_CUSTOM_AR_RAW_INPUT_POOL did not select the raw pool: {modes}"
+    if run_mode == "expandable" and modes == {"torch"}:
         # The allocator snapshot is authoritative; a platform that does not
         # honor expandable segments falls back to the torch pool, and this run
         # then did not exercise the raw_cached path.
@@ -104,6 +110,6 @@ if __name__ == "__main__":
     parser.add_argument("-t", "--tp_size", type=int, default=2)
     args = parser.parse_args()
 
-    for expandable in (False, True):
-        ret = test_init_dist_env(args.tp_size, (128, 8192), expandable)
-        print(f"expandable_segments={expandable}: {ret}")
+    for run_mode in ("default", "expandable", "raw_override"):
+        ret = test_init_dist_env(args.tp_size, (128, 8192), run_mode)
+        print(f"mode={run_mode}: {ret}")
