@@ -35,7 +35,6 @@ else
 fi
 
 skip_tests=(
-    "op_tests/test_moe_2stage.py"
     "op_tests/multigpu_tests/test_dispatch_combine.py"
     "op_tests/multigpu_tests/test_communication.py"
     "op_tests/multigpu_tests/test_mori_all2all.py"
@@ -103,6 +102,28 @@ for file in "${sharded_files[@]}"; do
                             --tokens "$tokens" --mtpr 8192 --route "$route" \
                             --hot-bias "$bias" --iters 20 --perf-guard
                     done
+                '
+                _ "$file"
+            )
+            ;;
+        op_tests/multigpu_tests/test_mega_moe_gfx1250.py)
+            {
+                echo "Running gfx1250 MegaMoE fused-scatter accuracy on 8 GPUs when supported"
+            } | tee -a latest_test.log
+            test_cmd=(
+                timeout 60m
+                bash -c '
+                    set -euo pipefail
+                    test_file=$1
+                    arch=$(python3 -c \
+                        "from aiter.jit.utils.chip_info import get_gfx; print(get_gfx())")
+                    if [[ "$arch" != "gfx1250" ]]; then
+                        echo "Skipping $test_file: requires gfx1250, got $arch"
+                        exit 0
+                    fi
+                    exec env MORI_SHMEM_HEAP_SIZE=40G \
+                        torchrun --standalone --nproc_per_node=8 "$test_file" \
+                        --combine scatter_fused --layers 2 --acc_verify 1
                 '
                 _ "$file"
             )
