@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 
 #include "aiter_hip_common.h"
 #include "asm_fmha_v4_fwd_configs.hpp"
@@ -239,6 +240,22 @@ void set_descale_strides(const at::Tensor& tensor,
     }
 }
 
+__global__ void pack_work_table_kernel(int32_t* __restrict__ table,
+                                       const int64_t* __restrict__ order,
+                                       const int32_t total,
+                                       const int32_t q_tiles,
+                                       const int32_t nhead)
+{
+    const int32_t slot = blockIdx.x * blockDim.x + threadIdx.x;
+    if(slot >= total)
+        return;
+    const int64_t linear = order[slot];
+    const int32_t q_idx  = static_cast<int32_t>(linear % q_tiles);
+    const int32_t h_idx  = static_cast<int32_t>((linear / q_tiles) % nhead);
+    const int32_t b_idx  = static_cast<int32_t>(linear / (static_cast<int64_t>(q_tiles) * nhead));
+    table[slot] = (q_idx & 0xFFFF) | ((h_idx & 0xFF) << 16) | ((b_idx & 0xFF) << 24);
+}
+
 at::Tensor build_sorted_work_table(const at::Tensor& lut_count,
                                    int64_t batch,
                                    int64_t nhead,
@@ -250,29 +267,31 @@ at::Tensor build_sorted_work_table(const at::Tensor& lut_count,
                 "lut_count.numel() must equal batch * heads * query_tiles");
     TORCH_CHECK(batch < 256 && nhead < 256 && q_tiles < 65536,
                 "sorted work table packing requires batch<256, heads<256, query_tiles<65536");
+    TORCH_CHECK(total <= std::numeric_limits<int32_t>::max(),
+                "work table slot index is int32; batch * heads * query_tiles must fit");
     TORCH_CHECK(flat.scalar_type() == at::ScalarType::Int, "lut_count must be int32");
 
-    // Policy B: identity raster when every tile has the same LUT length (top-k / uniform
-    // sparsity) so we preserve spatial locality. Otherwise LPT-sort by lut_count descending.
-    const auto mn = flat.min();
-    const auto mx = flat.max();
-    at::Tensor order;
-    if(mn.item<int32_t>() == mx.item<int32_t>())
-    {
-        order = at::arange(total, flat.options().dtype(at::kLong));
-    }
-    else
-    {
-        order = at::argsort(flat, /*dim=*/0, /*descending=*/true);
-    }
-    const auto q_idx = at::remainder(order, q_tiles);
-    const auto h_idx = at::remainder(at::div(order, q_tiles, "trunc"), nhead);
-    const auto b_idx = at::div(order, q_tiles * nhead, "trunc");
-    auto packed      = at::bitwise_or(
-        at::bitwise_or(at::bitwise_and(q_idx, static_cast<int64_t>(0xFFFF)),
-                       at::bitwise_left_shift(at::bitwise_and(h_idx, static_cast<int64_t>(0xFF)), 16)),
-        at::bitwise_left_shift(at::bitwise_and(b_idx, static_cast<int64_t>(0xFF)), 24));
-    return packed.to(at::kInt).contiguous();
+    // LPT order, longest LUT first, so a heavy tile cannot straggle behind the others. The sort is
+    // stable on purpose: equal counts then keep their raster order, which makes the uniform case
+    // (top-k sparsity) come out as the identity permutation and keep its spatial locality without
+    // a readback to detect it. Ties inside any single count group keep that locality too, which the
+    // previous whole-tensor min == max test could not.
+    const auto order = at::argsort(flat, /*stable=*/true, /*dim=*/0, /*descending=*/true);
+
+    // One launch for the packing. It is a few hundred elements, so an ATen expression here costs
+    // launch overhead an order of magnitude above the arithmetic, and this table is rebuilt on
+    // every call while its cost stays flat as sparsity rises.
+    auto table = at::empty({total}, flat.options().dtype(at::kInt));
+    constexpr int32_t block_size = 256;
+    const dim3 grid(static_cast<uint32_t>((total + block_size - 1) / block_size));
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
+    pack_work_table_kernel<<<grid, dim3(block_size), 0, stream>>>(
+        table.data_ptr<int32_t>(),
+        order.data_ptr<int64_t>(),
+        static_cast<int32_t>(total),
+        static_cast<int32_t>(q_tiles),
+        static_cast<int32_t>(nhead));
+    return table;
 }
 
 void populate_dense_kernarg(FmhaV4Kernarg& args,
