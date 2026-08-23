@@ -42,9 +42,9 @@ from aiter.ops.mha_v4 import (
     quantize_v_fp8,
     quantize_v_mxfp4,
     quantize_v_mxfp6,
+    rotate_activation_hd128,
     scale_modes_for_formats,
 )
-from aiter.ops.quant import rotate_activation
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_3
 from aiter.ops.triton.attention.fav3_sage import (
     fav3_sage_func,
@@ -742,8 +742,8 @@ def cancel_internal_qk_rotation(
     """Pre-rotate Q/K so a fused production Hadamard quantizer emits raw-domain Q/K."""
     q_rotated = torch.empty_like(q)
     k_rotated = torch.empty_like(k)
-    rotate_activation(q_rotated, q)
-    rotate_activation(k_rotated, k)
+    rotate_activation_hd128(q_rotated, q)
+    rotate_activation_hd128(k_rotated, k)
     return q_rotated, k_rotated
 
 

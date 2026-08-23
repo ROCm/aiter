@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import math
 import os
 
 import pytest
 import torch
+import torch._dynamo
 
 from aiter import dtypes
 from aiter.jit.core import AITER_ROOT_DIR
@@ -130,6 +132,19 @@ def _reference_mxfp4_v(value):
                         scale[:, :, offset] = encoded[:, :, 2 * pair]
                         scale[:, :, offset + 4] = encoded[:, :, 2 * pair + 1]
     return raw, scale
+
+
+@pytest.fixture(autouse=True)
+def isolate_dynamo_cache():
+    """Keep each test's ``torch.compile`` behaviour independent of the tests that ran before it.
+
+    Dynamo caches compiled entries per code object, and this file compiles ``mha_v4`` under many
+    format combinations. Sharing that cache across tests means the suite drifts toward the recompile
+    limit and whichever test compiles last fails under ``fullgraph=True`` -- a failure that reports
+    against a kernel while actually depending on how many earlier tests got far enough to compile.
+    """
+    torch._dynamo.reset()
+    yield
 
 
 def test_attention_format_ids_are_stable():
@@ -280,6 +295,42 @@ def test_mha_v4_fp8_quantization_matches_torch():
 
 @pytest.mark.skipif(
     get_gfx() not in ("gfx942", "gfx950"),
+    reason="gfx942/gfx950 hd128 rotation",
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("sequence,heads", [(1, 1), (129, 5), (2048, 1)])
+def test_mha_v4_rotation_matches_an_explicit_hadamard_matrix(dtype, sequence, heads):
+    """The rotation is the orthonormal hd128 Walsh-Hadamard transform, not merely self-consistent.
+
+    Checked against a Sylvester matrix applied as an fp32 matmul, which shares no code with the
+    kernel's butterfly. That pins the transform and its 1/sqrt(128) normalization, where comparing
+    against another kernel would only pin the two against each other -- and the recipe test below
+    cannot help, because it evaluates the same rotation on both sides.
+
+    The comparison is exact rather than toleranced: 128 values of one 16-bit dtype summed in fp32
+    lose nothing, so the only rounding is the final cast back to that dtype.
+    """
+    torch.manual_seed(31)
+    value = torch.randn((1, sequence, heads, 128), device="cuda", dtype=dtype)
+    rotated = torch.empty_like(value)
+    rotate_activation_hd128(rotated, value)
+
+    index = torch.arange(128, device=value.device)
+    overlap = index.view(-1, 1) & index.view(1, -1)
+    parity = torch.zeros_like(overlap)
+    for bit in range(7):
+        parity ^= (overlap >> bit) & 1
+    hadamard = torch.where(parity.bool(), -1.0, 1.0)
+    assert torch.equal(
+        hadamard @ hadamard.T / 128, torch.eye(128, device=value.device)
+    ), "the reference matrix is not an orthonormal Hadamard matrix"
+
+    expected = (value.float().reshape(-1, 128) @ hadamard) / math.sqrt(128)
+    assert torch.equal(rotated, expected.to(dtype).reshape(value.shape))
+
+
+@pytest.mark.skipif(
+    get_gfx() not in ("gfx942", "gfx950"),
     reason="gfx942/gfx950 rotated FP8 quantization",
 )
 @pytest.mark.parametrize("sequence,heads", [(257, 3), (512, 1), (2048, 1)])
@@ -362,7 +413,6 @@ def test_mha_v4_fp8_raw_recipe_matches_rotated_packed():
 @pytest.mark.parametrize("case", ["random", "zero", "powers", "extreme"])
 def test_mha_v4_mxfp8_q_matches_unfused_pipeline(case):
     from aiter import dtypes
-    from aiter.ops.quant import rotate_activation
 
     if case == "random":
         torch.manual_seed(29)
@@ -387,7 +437,7 @@ def test_mha_v4_mxfp8_q_matches_unfused_pipeline(case):
 
     multiplier = mha_v4_q_multiplier(128**-0.5)
     rotated = torch.empty_like(value)
-    rotate_activation(rotated, value)
+    rotate_activation_hd128(rotated, value)
     expected, expected_scale = dynamic_mxfp8_quant(
         rotated * multiplier, quant_dtype=dtypes.fp8
     )
@@ -402,7 +452,6 @@ def test_mha_v4_mxfp8_q_matches_unfused_pipeline(case):
 @pytest.mark.parametrize("case", ["random", "zero", "extreme"])
 def test_mha_v4_mxfp8_k_matches_unfused_pipeline(case):
     from aiter import dtypes
-    from aiter.ops.quant import rotate_activation
 
     if case == "random":
         torch.manual_seed(41)
@@ -418,7 +467,7 @@ def test_mha_v4_mxfp8_k_matches_unfused_pipeline(case):
         )
 
     rotated = torch.empty_like(value)
-    rotate_activation(rotated, value)
+    rotate_activation_hd128(rotated, value)
     expected, expected_scale = dynamic_mxfp8_quant(rotated, quant_dtype=dtypes.fp8)
 
     actual, scale = quantize_mxfp8_k(value)
