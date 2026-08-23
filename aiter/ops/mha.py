@@ -261,8 +261,32 @@ def gen_mha_fwd_native_splitkv_fake_tensors(
     return o, lse
 
 
+# torch-free kernel entry: the C++ TU takes aiter_tensor_t views and writes into
+# caller-allocated buffers, so all outputs/scratch are allocated Python-side (see
+# mha_fwd_native_splitkv below) and passed in.
 @compile_ops(
     "module_mha_fwd_native_splitkv",
+    fc_name="mha_fwd_native_splitkv",
+    develop=True,
+)
+def _mha_fwd_native_splitkv(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    o: Tensor,
+    lse: Tensor,
+    scratch_o: Tensor,
+    scratch_lse: Tensor,
+    softmax_scale: float,
+    causal: bool,
+    return_lse: bool,
+    num_splits: int,
+) -> None: ...
+
+
+@torch_compile_guard(
+    mutates_args=["out"],
+    device="cuda",
     gen_fake=gen_mha_fwd_native_splitkv_fake_tensors,
 )
 def mha_fwd_native_splitkv(
@@ -274,7 +298,49 @@ def mha_fwd_native_splitkv(
     causal: bool,
     return_lse: bool,
     num_splits: int,
-) -> tuple[Tensor, Tensor]: ...
+) -> tuple[Tensor, Tensor]:
+    # @torch_compile_guard registers this as torch.ops.aiter.mha_fwd_native_splitkv
+    # (opaque under torch.compile via the gen_fake above) *and* rebinds this module
+    # name to the op dispatcher, so callers keep writing the plain Python name.
+    # This eager impl allocates every buffer (the de-torched kernel can no longer
+    # allocate) and calls the void kernel.
+    batch_size, seqlen_q, nhead_q, hdim = q.shape
+    G = int(num_splits)
+    o = (
+        out
+        if out is not None
+        else torch.empty(
+            (batch_size, seqlen_q, nhead_q, hdim), dtype=q.dtype, device=q.device
+        )
+    )
+    lse = (
+        torch.empty(
+            (batch_size, nhead_q, seqlen_q), dtype=torch.float32, device=q.device
+        )
+        if return_lse
+        else torch.empty((0,), dtype=torch.float32, device=q.device)
+    )
+    # split-major fp32 scratch: [G,B,Hq,Sq,D] partial-O + [G,B,Hq,Sq] partial-LSE.
+    scratch_o = torch.empty(
+        (G, batch_size, nhead_q, seqlen_q, hdim), dtype=torch.float32, device=q.device
+    )
+    scratch_lse = torch.empty(
+        (G, batch_size, nhead_q, seqlen_q), dtype=torch.float32, device=q.device
+    )
+    _mha_fwd_native_splitkv(
+        q,
+        k,
+        v,
+        o,
+        lse,
+        scratch_o,
+        scratch_lse,
+        softmax_scale,
+        causal,
+        return_lse,
+        num_splits,
+    )
+    return o, lse
 
 
 def gen_fmha_v3_fwd_fake_tensors(
