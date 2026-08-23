@@ -639,6 +639,35 @@ def _emit_producer_chunk_loop(c: SimpleNamespace) -> None:
                 chunk_end = row0 + fx.Int32(c.c_chunk_rows)
                 row_end = (chunk_end < valid_end).select(chunk_end, valid_end)
                 row_end = (row_end > row0).select(row_end, row0)
+                payload_ready_base = getattr(c, "payload_ready_base", None)
+                if payload_ready_base is not None:
+                    # Resolve the whole producer chunk before copying it. The
+                    # old row loop issued a system acquire fence per slot;
+                    # readiness loads remain per source slot, but one acquire
+                    # now covers all rows copied by this warp.
+                    ready_row = row0
+                    while ready_row < row_end:
+                        ready_route = fx.Int32(
+                            buffer_ops.buffer_load(
+                                c.src_rsrc,
+                                ready_row,
+                                vec_width=1,
+                                is_scalar=True,
+                            )
+                        )
+                        ready_token = fx.Uint32(ready_route) // fx.Uint32(c.c_topk)
+                        ready_index = (
+                            fx.Int32(c.payload_parity)
+                            * fx.Int32(c.payload_max_recv)
+                            + fx.Int32(ready_token)
+                        )
+                        comm_ops.spin_until_eq_i32(
+                            fx.Int64(payload_ready_base)
+                            + fx.Int64(ready_index) * fx.Int64(4),
+                            fx.Int32(c.payload_expected),
+                        )
+                        ready_row = ready_row + fx.Int32(1)
+                    comm_ops.fence_system_acquire()
                 row = row0
                 while row < row_end:
                     # Scalar loads: the chunk (hence the row and the whole
@@ -698,6 +727,11 @@ def emit_prequant_gather_producer(
     num_warps: int,
     lane,
     runtime_total_rows=None,
+    payload_ready_base=None,
+    payload_expected=None,
+    payload_parity=None,
+    payload_max_recv=0,
+    wire_is_address=False,
 ) -> None:
     """In-kernel form of the pre-quantized receiver gather.
 
@@ -753,7 +787,11 @@ def emit_prequant_gather_producer(
         block_iters=L.block_iters,
         payload_base=fx.Int64(ptrtoint(grouped_payload)),
         payload_bytes_per_row=L.payload_bytes_per_row,
-        hidden_base=fx.Int64(ptrtoint(wire_in)),
+        hidden_base=(
+            fx.Int64(wire_in)
+            if wire_is_address
+            else fx.Int64(ptrtoint(wire_in))
+        ),
         feat_bytes_per_row=wire_stride,
         src_scale_row_off=L.payload_bytes_per_row,
         payload_bytes_per_lane=L.payload_bytes_per_lane,
@@ -797,6 +835,10 @@ def emit_prequant_gather_producer(
             c16_i32=c16_i32,
             c1_i32=c1_i32,
             is_lane0=lane_u == fx.Uint32(c0_i32),
+            payload_ready_base=payload_ready_base,
+            payload_expected=payload_expected,
+            payload_parity=payload_parity,
+            payload_max_recv=payload_max_recv,
         )
     )
 

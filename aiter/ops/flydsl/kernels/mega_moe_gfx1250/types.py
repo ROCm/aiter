@@ -63,6 +63,22 @@ class Stage1PrequantContext:
 
     stride_bytes: int
     payload_bytes: int
+    fused_dispatch: bool = False
+    overlap_dispatch: bool = False
+    dispatch_descriptor: torch.Tensor | None = None
+    arena_handle: int = 0
+    rank: int = 0
+    world_size: int = 0
+    experts_per_rank: int = 0
+    max_tokens_per_rank: int = 0
+    max_recv: int = 0
+    off_tok_off: int = 0
+    off_recv_num: int = 0
+    off_tis: int = 0
+    off_out_idx: int = 0
+    off_out_wts: int = 0
+    off_out_tok: int = 0
+    off_payload_ready: int = 0
 
     def __post_init__(self):
         if self.payload_bytes <= 0:
@@ -80,6 +96,21 @@ class Stage1PrequantContext:
                 f"{scale_bytes}B of scales is short of the "
                 f"{self.payload_bytes // 32} e8m0 bytes the payload needs"
             )
+        if self.fused_dispatch and self.overlap_dispatch:
+            raise ValueError("dispatch cannot be both inline-fused and stream-overlapped")
+        if self.fused_dispatch or self.overlap_dispatch:
+            if (
+                self.dispatch_descriptor is None
+                or self.dispatch_descriptor.dtype != torch.int64
+                or not self.dispatch_descriptor.is_contiguous()
+            ):
+                raise ValueError("fused dispatch needs a contiguous int64 descriptor")
+            if self.world_size != 2:
+                raise NotImplementedError(
+                    f"fused gfx1250 Stage1 currently supports world_size=2, got {self.world_size}"
+                )
+            if self.max_recv != self.world_size * self.max_tokens_per_rank:
+                raise ValueError("fused dispatch max_recv must equal world_size*max_tokens")
 
 
 @dataclass(frozen=True, slots=True)

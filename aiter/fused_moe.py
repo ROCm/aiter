@@ -595,6 +595,44 @@ def fused_moe(
         ep_wire_payload_bytes=(
             stage1_prequant.payload_bytes if stage1_prequant is not None else 0
         ),
+        ep_fused_stage1_dispatch=(
+            bool(stage1_prequant.fused_dispatch)
+            if stage1_prequant is not None
+            else False
+        ),
+        ep_stage1_dispatch_descriptor=(
+            stage1_prequant.dispatch_descriptor
+            if stage1_prequant is not None and stage1_prequant.fused_dispatch
+            else None
+        ),
+        ep_stage1_rank=(stage1_prequant.rank if stage1_prequant is not None else 0),
+        ep_stage1_off_tok_off=(
+            stage1_prequant.off_tok_off if stage1_prequant is not None else 0
+        ),
+        ep_stage1_off_recv_num=(
+            stage1_prequant.off_recv_num if stage1_prequant is not None else 0
+        ),
+        ep_stage1_off_tis=(
+            stage1_prequant.off_tis if stage1_prequant is not None else 0
+        ),
+        ep_stage1_off_out_idx=(
+            stage1_prequant.off_out_idx if stage1_prequant is not None else 0
+        ),
+        ep_stage1_off_out_wts=(
+            stage1_prequant.off_out_wts if stage1_prequant is not None else 0
+        ),
+        ep_stage1_off_out_tok=(
+            stage1_prequant.off_out_tok if stage1_prequant is not None else 0
+        ),
+        ep_stage1_off_payload_ready=(
+            stage1_prequant.off_payload_ready if stage1_prequant is not None else 0
+        ),
+        ep_stage1_max_recv=(
+            stage1_prequant.max_recv if stage1_prequant is not None else 0
+        ),
+        ep_stage1_max_tokens=(
+            stage1_prequant.max_tokens_per_rank if stage1_prequant is not None else 0
+        ),
     )
 
 
@@ -632,6 +670,20 @@ def fused_moe_fake(
     ep_max_tokens_per_rank: int = 0,
     ep_world_size: int = 0,
     ep_source_token_map: torch.Tensor | None = None,
+    ep_wire_stride_bytes: int = 0,
+    ep_wire_payload_bytes: int = 0,
+    ep_fused_stage1_dispatch: bool = False,
+    ep_stage1_dispatch_descriptor: torch.Tensor | None = None,
+    ep_stage1_rank: int = 0,
+    ep_stage1_off_tok_off: int = 0,
+    ep_stage1_off_recv_num: int = 0,
+    ep_stage1_off_tis: int = 0,
+    ep_stage1_off_out_idx: int = 0,
+    ep_stage1_off_out_wts: int = 0,
+    ep_stage1_off_out_tok: int = 0,
+    ep_stage1_off_payload_ready: int = 0,
+    ep_stage1_max_recv: int = 0,
+    ep_stage1_max_tokens: int = 0,
 ) -> torch.Tensor:
     device = topk_ids.device
     M, _topk = topk_ids.shape
@@ -678,6 +730,18 @@ def fused_moe_(
     ep_source_token_map: torch.Tensor | None = None,
     ep_wire_stride_bytes: int = 0,
     ep_wire_payload_bytes: int = 0,
+    ep_fused_stage1_dispatch: bool = False,
+    ep_stage1_dispatch_descriptor: torch.Tensor | None = None,
+    ep_stage1_rank: int = 0,
+    ep_stage1_off_tok_off: int = 0,
+    ep_stage1_off_recv_num: int = 0,
+    ep_stage1_off_tis: int = 0,
+    ep_stage1_off_out_idx: int = 0,
+    ep_stage1_off_out_wts: int = 0,
+    ep_stage1_off_out_tok: int = 0,
+    ep_stage1_off_payload_ready: int = 0,
+    ep_stage1_max_recv: int = 0,
+    ep_stage1_max_tokens: int = 0,
 ) -> torch.Tensor:
     stage2_scatter = None
     if ep_source_token_map is not None:
@@ -694,6 +758,25 @@ def fused_moe_(
         stage1_prequant = Stage1PrequantContext(
             stride_bytes=ep_wire_stride_bytes,
             payload_bytes=ep_wire_payload_bytes,
+            fused_dispatch=ep_fused_stage1_dispatch,
+            dispatch_descriptor=ep_stage1_dispatch_descriptor,
+            world_size=2 if ep_fused_stage1_dispatch else 0,
+            max_tokens_per_rank=(
+                int(ep_stage1_max_tokens)
+                if ep_fused_stage1_dispatch
+                else 0
+            ),
+            max_recv=(
+                int(ep_stage1_max_recv) if ep_fused_stage1_dispatch else 0
+            ),
+            rank=ep_stage1_rank,
+            off_tok_off=ep_stage1_off_tok_off,
+            off_recv_num=ep_stage1_off_recv_num,
+            off_tis=ep_stage1_off_tis,
+            off_out_idx=ep_stage1_off_out_idx,
+            off_out_wts=ep_stage1_off_out_wts,
+            off_out_tok=ep_stage1_off_out_tok,
+            off_payload_ready=ep_stage1_off_payload_ready,
         )
     return _fused_moe_impl(
         hidden_states=hidden_states,

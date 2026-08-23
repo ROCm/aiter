@@ -22,6 +22,22 @@ from .combine import _make_combine_fused_reduce, _make_combine_fused_sync
 from .config import _WAVE_SIZE, _select_dispatch_config
 from .dispatch import _make_dispatch
 from .dispatch_tdm import _make_dispatch_tdm, tdm_max_warps, tdm_stage_capacity
+from .stage1_dispatch_tdm import (
+    ARENA_HANDLE,
+    DEST_CTR,
+    DISPATCH_STATE,
+    DISP_BARRIER,
+    OFF_OUT_IDX,
+    OFF_OUT_TOK,
+    OFF_OUT_WTS,
+    OFF_PAYLOAD_READY,
+    OFF_RECV_NUM,
+    OFF_TIS,
+    OFF_TOK_OFF,
+    RANK,
+    TOK_MAP,
+    TOTAL_RECV,
+)
 from .types import Stage1PrequantContext, Stage2ScatterContext, _from_gpu_ptr
 
 __all__ = ["MegaMoEGfx1250"]
@@ -519,6 +535,22 @@ class MegaMoEGfx1250:
         self._closed = False
         device = torch.device("cuda", torch.cuda.current_device())
         max_recv = config.max_recv
+        # Keep the fused path opt-in until its gfx1250 multi-GPU validation is
+        # clean; MEGA_FUSED_STAGE1=0 (and the default) is the safe A/B fallback.
+        requested_fused_stage1 = os.environ.get("MEGA_FUSED_STAGE1", "0") == "1"
+        self._fused_stage1 = requested_fused_stage1 and (
+            config.dispatch_backend == "tdm"
+            and config.prequant
+            and config.world_size == 2
+            and self.experts == 384
+            and config.topk == 6
+            and config.hidden_dim == 7168
+            and self.inter_dim == 3072
+        )
+        if requested_fused_stage1 and not self._fused_stage1:
+            # Explicit fallback: all other shapes keep the proven two-launch
+            # dispatch + GEMM path instead of entering a partially supported kernel.
+            self._fused_stage1 = False
 
         self._arena = SymmetricArena(
             communicator,
@@ -529,6 +561,7 @@ class MegaMoEGfx1250:
                 ("out_idx", max_recv * config.topk * 4),
                 ("out_wts", max_recv * config.topk * 4),
                 ("disp_out", max_recv * config.wire_nbytes),
+                ("payload_ready", 2 * max_recv * 4),
                 ("cross_device_barrier", config.world_size * 8),
                 (
                     "comb_inp",
@@ -551,6 +584,7 @@ class MegaMoEGfx1250:
         )
         self._dispatch_barrier = torch.zeros(1, dtype=torch.int32, device=device)
         self._total_recv = torch.zeros(1, dtype=torch.int32, device=device)
+        self._fused_dispatch_state = torch.zeros(4, dtype=torch.int64, device=device)
         self._cross_device_flag = torch.ones(1, dtype=torch.int64, device=device)
         self._combine_output = torch.zeros(
             config.max_tokens_per_rank * config.hidden_dim,
@@ -570,6 +604,28 @@ class MegaMoEGfx1250:
             )
             self._wire_quant = build_moe_quant_wire_module(
                 config.hidden_dim, config.wire_nbytes, "fp8"
+            )
+
+        self._fused_dispatch_descriptor = None
+        self._fused_this_call = False
+        if self._fused_stage1:
+            descriptor = [0] * 14
+            descriptor[TOK_MAP] = self._token_destination_map.data_ptr()
+            descriptor[DEST_CTR] = self._destination_peer_counter.data_ptr()
+            descriptor[DISP_BARRIER] = self._dispatch_barrier.data_ptr()
+            descriptor[TOTAL_RECV] = self._total_recv.data_ptr()
+            descriptor[DISPATCH_STATE] = self._fused_dispatch_state.data_ptr()
+            descriptor[ARENA_HANDLE] = self._arena.handle
+            descriptor[RANK] = config.rank
+            descriptor[OFF_TOK_OFF] = self._arena.offset("tok_off")
+            descriptor[OFF_RECV_NUM] = self._arena.offset("recv_num")
+            descriptor[OFF_TIS] = self._arena.offset("recv_to_src_token")
+            descriptor[OFF_OUT_IDX] = self._arena.offset("out_idx")
+            descriptor[OFF_OUT_WTS] = self._arena.offset("out_wts")
+            descriptor[OFF_OUT_TOK] = self._arena.offset("disp_out")
+            descriptor[OFF_PAYLOAD_READY] = self._arena.offset("payload_ready")
+            self._fused_dispatch_descriptor = torch.tensor(
+                descriptor, dtype=torch.int64, device=device
             )
 
         if config.dispatch_backend == "mori":
@@ -889,6 +945,27 @@ class MegaMoEGfx1250:
                 stream=stream,
             )
             send_ptr = self._wire.data_ptr()
+        self._fused_this_call = bool(self._fused_stage1)
+        if self._fused_this_call:
+            send_wire = self._wire.view(
+                self._config.max_tokens_per_rank, self._config.wire_nbytes
+            )[:token_count]
+            reverse_source_view = _from_gpu_ptr(
+                self._arena.local_ptr("recv_to_src_token"),
+                (self._config.max_recv,),
+                torch.int32,
+            )
+            routing = Routing(
+                token_count=token_count,
+                reverse_source_view=reverse_source_view,
+            )
+            return (
+                send_wire,
+                topk_weights,
+                topk_ids,
+                self._total_recv,
+                routing,
+            )
         self._dispatch_variants[spec](
             self._arena.handle,
             send_ptr,
@@ -926,6 +1003,23 @@ class MegaMoEGfx1250:
         return Stage1PrequantContext(
             stride_bytes=self._config.wire_nbytes,
             payload_bytes=self._config.hidden_dim,
+            fused_dispatch=self._fused_this_call,
+            dispatch_descriptor=(
+                self._fused_dispatch_descriptor if self._fused_this_call else None
+            ),
+            arena_handle=self._arena.handle,
+            rank=self._config.rank,
+            world_size=self._config.world_size,
+            experts_per_rank=self._config.experts_per_rank,
+            max_tokens_per_rank=self._config.max_tokens_per_rank,
+            max_recv=self._config.max_recv,
+            off_tok_off=self._arena.offset("tok_off"),
+            off_recv_num=self._arena.offset("recv_num"),
+            off_tis=self._arena.offset("recv_to_src_token"),
+            off_out_idx=self._arena.offset("out_idx"),
+            off_out_wts=self._arena.offset("out_wts"),
+            off_out_tok=self._arena.offset("disp_out"),
+            off_payload_ready=self._arena.offset("payload_ready"),
         )
 
     def _scatter_context(self, routing: Routing) -> Stage2ScatterContext:
