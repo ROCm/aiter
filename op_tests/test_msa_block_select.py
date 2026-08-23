@@ -201,9 +201,7 @@ def test_topk(num_idx_heads: int, batch: int, ctx: int, query_len: int):
         q, k, score, bt, seq, query_len=query_len, max_seq_len=max(seq_lens)
     )
     total_q = score.size(1)
-    topk_idx = torch.empty(
-        num_idx_heads, total_q, TOPK, dtype=torch.int32, device=DEV
-    )
+    topk_idx = torch.empty(num_idx_heads, total_q, TOPK, dtype=torch.int32, device=DEV)
 
     _, avg_us = run_topk(
         score, topk_idx, bt, seq, max(seq_lens), query_len, num_idx_heads
