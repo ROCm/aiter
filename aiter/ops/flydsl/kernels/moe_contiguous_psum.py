@@ -98,9 +98,10 @@ def emit_tile_psum_plan(c: SimpleNamespace) -> None:
     continuous prefix sum; lanes past ``n_experts`` feed 0 in and write nothing.
 
     ``starts`` is the tile-aligned exclusive sum, ``psum`` the inclusive end of
-    each expert's real rows -- the map the tile decode bisects. Unlike the
-    standalone kernel this writes no ``contiguous_m``: every caller of the
-    fused form already knows it as a host-side static bound.
+    each expert's real rows -- the map the tile decode bisects. ``total_addr``
+    receives the runtime tile-aligned row count. The GEMM still allocates from
+    its host-side static ``contiguous_m`` bound, but its work queue can stop at
+    this live tail instead of issuing every dead tile in that bound.
 
     Its LDS comes in as raw byte addresses (``2 * nthreads + 1`` i32 slots),
     because the caller is a GEMM whose scratch is one big arena rather than a
@@ -159,6 +160,13 @@ def emit_tile_psum_plan(c: SimpleNamespace) -> None:
         if is_lane0:
             comm_ops.store_i32_lds(c.carry, base_off + chunk_total)
         gpu.barrier()
+
+    if is_lane0:
+        comm_ops.store_i32_system(
+            c.total_addr,
+            fx.Int32(0),
+            fx.Int32(comm_ops.load_i32_lds(c.carry)),
+        )
 
 
 @traced

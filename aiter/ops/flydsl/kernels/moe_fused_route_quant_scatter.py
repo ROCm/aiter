@@ -697,6 +697,7 @@ def emit_prequant_gather_producer(
     warp_id,
     num_warps: int,
     lane,
+    runtime_total_rows=None,
 ) -> None:
     """In-kernel form of the pre-quantized receiver gather.
 
@@ -768,10 +769,15 @@ def emit_prequant_gather_producer(
         scale_rsrc=ptr_rsrc(grouped_scale),
     )
 
-    total_chunks = (total_rows + chunk_rows - 1) // chunk_rows
+    total_rows_v = (
+        fx.Int32(total_rows)
+        if runtime_total_rows is None
+        else fx.Int32(runtime_total_rows)
+    )
+    total_chunks = (total_rows_v + fx.Int32(chunk_rows - 1)) // fx.Int32(chunk_rows)
     _emit_producer_chunk_loop(
         SimpleNamespace(
-            iters=(total_chunks + num_warps - 1) // num_warps,
+            iters=(total_chunks + fx.Int32(num_warps - 1)) // fx.Int32(num_warps),
             num_warps=arith.constant(num_warps, type=i32),
             warp_id=warp_id,
             src_rsrc=ptr_rsrc(row_src_route),
@@ -781,7 +787,7 @@ def emit_prequant_gather_producer(
             c_topk=arith.constant(source_topk, type=i32),
             c_tile_m_shift=arith.constant(tile_m.bit_length() - 1, type=i32),
             c_chunk_rows=arith.constant(chunk_rows, type=i32),
-            c_total_rows=arith.constant(total_rows, type=i32),
+            c_total_rows=total_rows_v,
             c_n_experts=n_experts,
             bisect_steps=max(1, math.ceil(math.log2(max(2, n_experts))) + 1),
             c_rows_per_tile=arith.constant(L.rows_per_tile, type=i32),

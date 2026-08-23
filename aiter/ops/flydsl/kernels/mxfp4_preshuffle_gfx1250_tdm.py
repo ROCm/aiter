@@ -61,13 +61,15 @@ ENTRY_TICKET_DWORDS = 16
 # whole grid, the other is a hot atomic.
 PLAN_GATE_DWORDS = 16
 REMAP_DONE_DWORDS = 16
+LIVE_ROWS_DWORDS = 16
 # Dword offsets of each counter past the per-M-tile ones, in the same buffer.
 WORK_HEAD_OFF = 0
 ENTRY_TICKET_OFF = WORK_QUEUE_SHARDS * WORK_QUEUE_SHARD_DWORDS
 PLAN_GATE_OFF = ENTRY_TICKET_OFF + ENTRY_TICKET_DWORDS
 REMAP_DONE_OFF = PLAN_GATE_OFF + PLAN_GATE_DWORDS
+LIVE_ROWS_OFF = REMAP_DONE_OFF + REMAP_DONE_DWORDS
 # i32 slots the tickets need after the per-M-tile counters in the same buffer.
-TICKET_SLOTS = REMAP_DONE_OFF + REMAP_DONE_DWORDS
+TICKET_SLOTS = LIVE_ROWS_OFF + LIVE_ROWS_DWORDS
 
 
 @flyc.jit
@@ -476,6 +478,14 @@ def launch_gemm_a8w4_tdm(
         wave_m = wave // n_warp
         wave_n = wave % n_warp
 
+        # One SharedAllocator for the whole kernel (FlyDSL allows only one).
+        # static=False when tickets, the GEMM arena, or the EP rowmap all need
+        # disjoint slices of the same dyn-shared blob. Producers + EP scatter
+        # (mega-moe fused stage1) hit that; a lone GEMM arena stays static.
+        _smem = fx.SharedAllocator(
+            static=not bool(enable_ep_scatter or ticket_on)
+        )
+
         # Tickets. The role split and the work queue both want one number per
         # workgroup that every wave in it agrees on, so they share one atomic
         # broadcast: lane 0 does the fetch-add and LDS carries it to the rest.
@@ -484,13 +494,8 @@ def launch_gemm_a8w4_tdm(
         # per-tile ones, so a replay starts from zero; with it there is no pass
         # left in front to do that, and the epoch below takes over instead.
         if const_expr(ticket_on):
-            # Static allocator: each allocate() is its own LDS symbol, so these
-            # are disjoint from the GEMM arena below without sharing an
-            # allocator with it. Only reachable with producers on, which never
-            # coincides with ep_scatter's single dyn-shared base.
-            _tk_smem = fx.SharedAllocator()
-            _entry_lds = fx.index_cast(T.index, fx.ptrtoint(_tk_smem.allocate(8)._ptr))
-            _wq_lds = fx.index_cast(T.index, fx.ptrtoint(_tk_smem.allocate(4)._ptr))
+            _entry_lds = fx.index_cast(T.index, fx.ptrtoint(_smem.allocate(8)._ptr))
+            _wq_lds = fx.index_cast(T.index, fx.ptrtoint(_smem.allocate(4)._ptr))
             _tk_load, _tk_store = make_lds_copy_ops(32)
             _tk_base = fx.Int64(ptrtoint(arg_prod_done)) + fx.Int64(
                 producer_tile_count * 4
@@ -498,6 +503,7 @@ def launch_gemm_a8w4_tdm(
             _entry_addr = _tk_base + fx.Int64(ENTRY_TICKET_OFF * 4)
             _gate_addr = _tk_base + fx.Int64(PLAN_GATE_OFF * 4)
             _remap_addr = _tk_base + fx.Int64(REMAP_DONE_OFF * 4)
+            _live_rows_addr = _tk_base + fx.Int64(LIVE_ROWS_OFF * 4)
 
             def take_ticket(addr, lds_idx):
                 """One fetch-add at ``addr``, broadcast to the workgroup."""
@@ -515,13 +521,6 @@ def launch_gemm_a8w4_tdm(
         # allocated once, before the tile body, and reused across tiles. It is
         # also what the planner scans in -- allocated ahead of the role split
         # for that, since at that point no tile is staged in it yet.
-        # static=False (one dyn-shared base) only where a second region is
-        # needed, so the non-scatter path keeps its per-leaf static allocation.
-        _smem = (
-            fx.SharedAllocator(static=False)
-            if const_expr(enable_ep_scatter)
-            else fx.SharedAllocator()
-        )
         base_ptr = _smem.allocate(ARENA_B)._ptr
 
         def ptr_to_idx(p):
@@ -631,6 +630,7 @@ def launch_gemm_a8w4_tdm(
                             lds0=_scan,
                             lds1=_scan + fx.Int64(block * 4),
                             carry=_scan + fx.Int64(block * 8),
+                            total_addr=_live_rows_addr,
                         )
                     )
                     # Release: the tile map and the reset counters must be in
@@ -645,6 +645,12 @@ def launch_gemm_a8w4_tdm(
                     if tid == 0:
                         comm_ops.spin_until_gt_i32(_gate_addr, entry_gen)
                     workgroup_barrier()
+
+            live_rows = fx.Int32(producer_total_rows)
+            if const_expr(plan_on):
+                # Published by the planner before its gate. Besides bounding
+                # consumer work, this shortens each producer's chunk loop.
+                live_rows = fx.Int32(comm_ops.load_i32_acquire(_live_rows_addr))
 
             if is_producer:
                 if const_expr(plan_on):
@@ -707,6 +713,7 @@ def launch_gemm_a8w4_tdm(
                     warp_id=(entry_id - plan_blocks) * num_waves + wave,
                     num_warps=producer_blocks * num_waves,
                     lane=lane,
+                    runtime_total_rows=live_rows,
                 )
         else:
             bid_x = fx.block_idx.x
@@ -1933,6 +1940,13 @@ def launch_gemm_a8w4_tdm(
             wq_total = ((i32_m + (tile_m - 1)) // tile_m) * (
                 (i32_n + (tile_n - 1)) // tile_n
             )
+            if const_expr(plan_on):
+                # The planner publishes the tile-aligned live row tail before
+                # raising its epoch gate. Keep the static i32_m for allocations
+                # and graph capture, but never hand dead-tail tiles to the queue.
+                wq_total = (live_rows // fx.Int32(tile_m)) * (
+                    (i32_n + (tile_n - 1)) // tile_n
+                )
             wq_work = take_work()
             wq_more = wq_work < wq_total
             if const_expr(persist_on):
@@ -1994,12 +2008,16 @@ def launch_gemm_a8w4_tdm(
         f32_situ_linear_beta,
     )
     extra_blocks = producer_blocks if (producer_blocks and not producer_rejoin) else 0
-    if persist_on:
-        # Persistent: the grid is sized to the machine, not to the problem, and
-        # the queue hands each workgroup as many tiles as it can get through.
-        grid = (producer_persist_blocks, 1, 1)
-    else:
-        grid = (extra_blocks + m_tiles * n_tiles, 1, 1)
+    # Arithmetic, not `if persist_on`: this launcher is a FlyDSL JIT function,
+    # so an `if` becomes an SCF region and `grid` would not be visible at the
+    # cluster launch below (NameError on the untaken-looking else). persist_on
+    # is 0/1. Persistent: grid is the machine width; otherwise one wg per tile.
+    tile_grid_x = extra_blocks + m_tiles * n_tiles
+    grid = (
+        persist_on * producer_persist_blocks + (1 - persist_on) * tile_grid_x,
+        1,
+        1,
+    )
     if cluster_n > 1:
         # Geometry must reach BOTH the definition and the launch site, or the
         # cluster never forms and the TDM loads silently fall back to per-load.

@@ -37,16 +37,25 @@ _GROUPED_WEIGHT_CACHE = {}
 kernel_bench_callable = None
 
 
-@functools.lru_cache(maxsize=1)
-def _stage1_producer_blocks() -> int:
-    """Workgroups gemm1 spends gathering its own A rows (0 = separate pass).
+def _stage1_producer_blocks(
+    device: torch.device, contiguous_m: int, gemm1_tiles: int
+) -> int:
+    """Workgroups gemm1 spends gathering its own A rows.
 
     A tunable, not a derived quantity: the gather is bandwidth-bound and the
     tiles it displaces are compute-bound, so the best split depends on the
     shape. Too few and consumers stall on the spin-wait; too many and the GEMM
-    loses more compute than the gather was worth.
+    loses more compute than the gather was worth. ``auto`` (the prequant-path
+    default) assigns one producer per 384 static rows, clamped to [CU/8, CU/4].
+    Explicit ``0`` keeps the standalone gather baseline.
     """
-    return max(0, int(os.environ.get("AITER_FLYDSL_STAGE1_PRODUCER_BLOCKS", "0")))
+    raw = os.environ.get("AITER_FLYDSL_STAGE1_PRODUCER_BLOCKS", "auto").strip().lower()
+    if raw != "auto":
+        return max(0, int(raw))
+    cu = _device_cu_count(device)
+    producer = (int(contiguous_m) + 383) // 384
+    producer = max(max(1, cu // 8), min(producer, max(1, cu // 4)))
+    return min(producer, max(1, int(gemm1_tiles)))
 
 
 @functools.lru_cache(maxsize=1)
@@ -124,9 +133,16 @@ def _stage1_fuse_plan() -> bool:
 
 
 @functools.lru_cache(maxsize=1)
-def _stage1_plan_grid_mult() -> int:
-    """Workgroups per CU for the persistent grid the fused plan needs."""
-    return max(1, int(os.environ.get("AITER_FLYDSL_STAGE1_PLAN_GRID_MULT", "2")))
+def _stage1_plan_grid_mult() -> float:
+    """Workgroups per CU for the persistent grid the fused plan needs.
+
+    1.5x CU (384 on gfx1250) beat both 1x and 2x in the 2-GPU DSV4-Pro sweep:
+    enough consumers to drain the live queue without crowding out 48 producer
+    workgroups. Override with AITER_FLYDSL_STAGE1_PERSIST_BLOCKS.
+    """
+    return max(
+        0.25, float(os.environ.get("AITER_FLYDSL_STAGE1_PLAN_GRID_MULT", "1.5"))
+    )
 
 
 @functools.lru_cache(maxsize=8)
@@ -163,7 +179,7 @@ def _stage1_grid_plan(
         )
     fuse_plan = _stage1_fuse_plan()
     if not persist and fuse_plan:
-        persist = _device_cu_count(device) * _stage1_plan_grid_mult()
+        persist = round(_device_cu_count(device) * _stage1_plan_grid_mult())
     # A persistent grid wider than the tile grid is the tile grid plus idle
     # workgroups, so cap it there -- and drop it entirely once the cap leaves
     # too few workgroups to cover every queue shard.
@@ -730,7 +746,15 @@ def _grouped_a8w4_tdm_moe(
     # under a compute-bound kernel, so what it costs is the tiles it displaces,
     # which measures well under its own standalone time. Prequantized only --
     # with quant still in the pass there would be ALU to displace too.
-    _producer_blocks = _stage1_producer_blocks() if _wire_stride else 0
+    two_inter = 2 * inter_dim
+    _gemm1_tiles = ((contiguous_m + tile_m - 1) // tile_m) * (
+        (two_inter + tile_n - 1) // tile_n
+    )
+    _producer_blocks = (
+        _stage1_producer_blocks(device, contiguous_m, _gemm1_tiles)
+        if _wire_stride
+        else 0
+    )
     _work_queue = bool(_producer_blocks) and _stage1_producer_work_queue()
     # Both tickets need the producers to rejoin: the queue because a workgroup
     # that claims a tile has to compute it, the role ticket because otherwise
@@ -738,16 +762,20 @@ def _grouped_a8w4_tdm_moe(
     # only decodes if producers are the low ids.
     _role_ticket = bool(_producer_blocks) and _stage1_producer_role_ticket()
     _rejoin = True if (_work_queue or _role_ticket) else _stage1_producer_rejoin()
-    two_inter = 2 * inter_dim
-    _gemm1_tiles = ((contiguous_m + tile_m - 1) // tile_m) * (
-        (two_inter + tile_n - 1) // tile_n
-    )
     _persist, _fuse_plan = _stage1_grid_plan(
         device=device,
         producer_blocks=_producer_blocks,
         work_queue=_work_queue,
         gemm1_tiles=_gemm1_tiles,
     )
+    if os.environ.get("AITER_FLYDSL_STAGE1_DEBUG", "0") == "1":
+        print(
+            f"# stage1 producer={_producer_blocks} persist={_persist} "
+            f"fuse_plan={int(_fuse_plan)} gemm1_tiles={_gemm1_tiles} "
+            f"contig_m={contiguous_m} tile_m={tile_m} tile_n={tile_n} "
+            f"work_queue={int(_work_queue)} rejoin={int(_rejoin)}",
+            flush=True,
+        )
     # One counter per M-tile, incremented per chunk of rows landed: a stale
     # count from the previous layer would let a consumer read rows that have
     # not arrived yet. The ticket counters ride at the end of the same buffer,
