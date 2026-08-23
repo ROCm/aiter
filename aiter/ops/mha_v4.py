@@ -102,6 +102,33 @@ def rotate_activation_mxfp4_quant_k(
     """Apply hd128 Walsh-Hadamard rotation and pack K in the MXFP4 ASM tile order."""
 
 
+def _mha_v4_sparse_work_table_fake(
+    lut_count: Tensor,
+    batch: int,
+    nhead: int,
+    q_tiles: int,
+) -> Tensor:
+    del lut_count
+    return torch.empty(batch * nhead * q_tiles, dtype=torch.int32, device="cuda")
+
+
+@compile_ops("module_fmha_v4_fwd", gen_fake=_mha_v4_sparse_work_table_fake)
+def mha_v4_sparse_work_table(
+    lut_count: Tensor,
+    batch: int,
+    nhead: int,
+    q_tiles: int,
+) -> Tensor:
+    """Return the tile visit order the sparse kernel would use for these LUT lengths.
+
+    Exposed for testing. The sparse launcher builds this itself, and a wrong order only unbalances
+    the waves rather than changing the result, so no test of the attention output can see it.
+
+    Each entry packs one tile as ``q_tile | head << 16 | batch << 24``, ordered by LUT length
+    descending with ties left in raster order.
+    """
+
+
 class AttentionFormat(IntEnum):
     """Stable operand-encoding IDs used by the Python/C++ dispatch ABI.
 

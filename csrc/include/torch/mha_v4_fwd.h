@@ -43,5 +43,12 @@ void fmha_v4_fwd_sparse(const at::Tensor& q,
                         const at::Tensor& lut_start,
                         const at::Tensor& lut_count);
 
+// The work table fmha_v4_fwd_sparse builds internally, exposed so its ordering can be tested. A
+// wrong order costs only load balance, never a wrong result, so nothing else observes it.
+at::Tensor mha_v4_sparse_work_table(const at::Tensor& lut_count,
+                                    int64_t batch,
+                                    int64_t nhead,
+                                    int64_t q_tiles);
+
 } // namespace torch_itfs
 } // namespace aiter

@@ -240,6 +240,14 @@ void set_descale_strides(const at::Tensor& tensor,
     }
 }
 
+__device__ inline int32_t pack_work_table_entry(int32_t linear, int32_t q_tiles, int32_t nhead)
+{
+    const int32_t q_idx = linear % q_tiles;
+    const int32_t h_idx = (linear / q_tiles) % nhead;
+    const int32_t b_idx = linear / (q_tiles * nhead);
+    return (q_idx & 0xFFFF) | ((h_idx & 0xFF) << 16) | ((b_idx & 0xFF) << 24);
+}
+
 __global__ void pack_work_table_kernel(int32_t* __restrict__ table,
                                        const int64_t* __restrict__ order,
                                        const int32_t total,
@@ -249,11 +257,53 @@ __global__ void pack_work_table_kernel(int32_t* __restrict__ table,
     const int32_t slot = blockIdx.x * blockDim.x + threadIdx.x;
     if(slot >= total)
         return;
-    const int64_t linear = order[slot];
-    const int32_t q_idx  = static_cast<int32_t>(linear % q_tiles);
-    const int32_t h_idx  = static_cast<int32_t>((linear / q_tiles) % nhead);
-    const int32_t b_idx  = static_cast<int32_t>(linear / (static_cast<int64_t>(q_tiles) * nhead));
-    table[slot] = (q_idx & 0xFFFF) | ((h_idx & 0xFF) << 16) | ((b_idx & 0xFF) << 24);
+    table[slot] = pack_work_table_entry(static_cast<int32_t>(order[slot]), q_tiles, nhead);
+}
+
+// Largest table one workgroup will order in LDS, at 8 bytes per entry. Past roughly this size the
+// quadratic rank count loses to ATen's sort, which is nearly flat in comparison because it spreads
+// over the whole device. Whole-table build time measured on gfx950, fused against ATen: 512 entries
+// 9us against 23us, 1024 entries 21us against 23us, 2048 entries 80us against 24us.
+constexpr int32_t kWorkTableFusedMax    = 1024;
+constexpr int32_t kWorkTableSortThreads = 1024;
+
+// Order and pack in a single launch, by counting each entry's rank rather than moving entries past
+// each other. The key carries the whole ordering: the count is complemented into the high half so
+// longer LUTs come first, and the slot index sits in the low half, which breaks ties toward raster
+// order and so makes uniform counts come out as the identity permutation.
+//
+// Because the slot index makes every key distinct, an entry's rank is exactly the number of keys
+// below it, which is a permutation with no tie-breaking pass and is stable by definition. Counting
+// ranks costs O(n^2) compares against a sorting network's O(n log^2 n), but it needs one barrier
+// instead of one per pass, and every lane in a wave reads the same key each step, so the inner loop
+// is an LDS broadcast. At these table sizes that trade is heavily in its favour.
+//
+// A counting sort over the LUT length would be O(n + bins), but positions within a bin would be
+// handed out by atomics in arbitrary order. That loses stability, and with it the identity
+// permutation for uniform counts, which is the case worth protecting most.
+__global__ void rank_and_pack_work_table_kernel(int32_t* __restrict__ table,
+                                                const int32_t* __restrict__ lut_count,
+                                                const int32_t total,
+                                                const int32_t q_tiles,
+                                                const int32_t nhead)
+{
+    __shared__ uint64_t keys[kWorkTableFusedMax];
+
+    for(int32_t slot = threadIdx.x; slot < total; slot += blockDim.x)
+    {
+        keys[slot] = (static_cast<uint64_t>(~static_cast<uint32_t>(lut_count[slot])) << 32) |
+                     static_cast<uint32_t>(slot);
+    }
+    __syncthreads();
+
+    for(int32_t slot = threadIdx.x; slot < total; slot += blockDim.x)
+    {
+        const uint64_t mine = keys[slot];
+        int32_t rank        = 0;
+        for(int32_t other = 0; other < total; ++other)
+            rank += keys[other] < mine ? 1 : 0;
+        table[rank] = pack_work_table_entry(slot, q_tiles, nhead);
+    }
 }
 
 at::Tensor build_sorted_work_table(const at::Tensor& lut_count,
@@ -271,20 +321,32 @@ at::Tensor build_sorted_work_table(const at::Tensor& lut_count,
                 "work table slot index is int32; batch * heads * query_tiles must fit");
     TORCH_CHECK(flat.scalar_type() == at::ScalarType::Int, "lut_count must be int32");
 
-    // LPT order, longest LUT first, so a heavy tile cannot straggle behind the others. The sort is
-    // stable on purpose: equal counts then keep their raster order, which makes the uniform case
-    // (top-k sparsity) come out as the identity permutation and keep its spatial locality without
-    // a readback to detect it. Ties inside any single count group keep that locality too, which the
-    // previous whole-tensor min == max test could not.
-    const auto order = at::argsort(flat, /*stable=*/true, /*dim=*/0, /*descending=*/true);
+    // LPT order, longest LUT first, so a heavy tile cannot straggle behind the others. Ties resolve
+    // toward raster order, which makes the uniform case (top-k sparsity) come out as the identity
+    // permutation and keep its spatial locality, with no readback needed to recognise it.
+    //
+    // This table is rebuilt on every call and its cost does not fall with sparsity, so it otherwise
+    // grows to dominate the launch as density drops. Both paths below therefore avoid per-element
+    // ATen ops, whose launch overhead on a few hundred entries dwarfs the arithmetic.
+    auto table               = at::empty({total}, flat.options().dtype(at::kInt));
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
 
-    // One launch for the packing. It is a few hundred elements, so an ATen expression here costs
-    // launch overhead an order of magnitude above the arithmetic, and this table is rebuilt on
-    // every call while its cost stays flat as sparsity rises.
-    auto table = at::empty({total}, flat.options().dtype(at::kInt));
+    if(total <= kWorkTableFusedMax)
+    {
+        rank_and_pack_work_table_kernel<<<1, dim3(kWorkTableSortThreads), 0, stream>>>(
+            table.data_ptr<int32_t>(),
+            flat.data_ptr<int32_t>(),
+            static_cast<int32_t>(total),
+            static_cast<int32_t>(q_tiles),
+            static_cast<int32_t>(nhead));
+        return table;
+    }
+
+    // Beyond one workgroup's LDS, defer the sort to ATen and pack separately. A stable sort keeps
+    // the tie behaviour identical to the fused path.
+    const auto order = at::argsort(flat, /*stable=*/true, /*dim=*/0, /*descending=*/true);
     constexpr int32_t block_size = 256;
     const dim3 grid(static_cast<uint32_t>((total + block_size - 1) / block_size));
-    const hipStream_t stream = at::hip::getCurrentHIPStream();
     pack_work_table_kernel<<<grid, dim3(block_size), 0, stream>>>(
         table.data_ptr<int32_t>(),
         order.data_ptr<int64_t>(),
@@ -498,6 +560,14 @@ PackedMhaV4Shapes validate_packed_mha_v4(const at::Tensor& q,
 }
 
 } // namespace
+
+at::Tensor mha_v4_sparse_work_table(const at::Tensor& lut_count,
+                                    int64_t batch,
+                                    int64_t nhead,
+                                    int64_t q_tiles)
+{
+    return build_sorted_work_table(lut_count, batch, nhead, q_tiles);
+}
 
 void fmha_v4_fwd(const at::Tensor& q,
                  const at::Tensor& k,

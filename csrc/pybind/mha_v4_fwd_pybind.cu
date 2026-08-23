@@ -73,4 +73,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("out"),
           py::arg("scale"),
           py::arg("input"));
+    m.def("mha_v4_sparse_work_table",
+          &aiter::torch_itfs::mha_v4_sparse_work_table,
+          py::arg("lut_count"),
+          py::arg("batch"),
+          py::arg("nhead"),
+          py::arg("q_tiles"));
 }

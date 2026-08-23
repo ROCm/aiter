@@ -19,6 +19,7 @@ from aiter.ops.mha_v4 import (
     mha_v4_mxfp8,
     mha_v4_packed,
     mha_v4_q_multiplier,
+    mha_v4_sparse_work_table,
     mxfp4_k_view,
     mxfp4_v_view,
     mxfp6_k_view,
@@ -1051,6 +1052,86 @@ def test_mha_v4_sparse_schema_mutates_only_out():
     assert "Tensor lut_count" in sparse
     assert "Tensor(a6!) out" in sparse
     assert sparse.endswith("-> ()")
+
+
+def _work_table_counts(total, pattern):
+    """LUT lengths covering the tie structures the ordering has to get right."""
+    if pattern == "uniform":
+        return torch.full((total,), 7, device="cuda", dtype=torch.int32)
+    if pattern == "zeros":
+        return torch.zeros((total,), device="cuda", dtype=torch.int32)
+    if pattern == "random":
+        return torch.randint(0, 64, (total,), device="cuda", dtype=torch.int32)
+    if pattern == "wide_random":
+        return torch.randint(0, 8192, (total,), device="cuda", dtype=torch.int32)
+    if pattern == "two_values":
+        alternating = torch.arange(total, device="cuda") % 3 == 0
+        return torch.where(alternating, 9, 4).to(torch.int32)
+    if pattern == "descending":
+        return torch.arange(total, 0, -1, device="cuda", dtype=torch.int32)
+    return torch.arange(1, total + 1, device="cuda", dtype=torch.int32)
+
+
+def _unpack_work_table(table, nhead, q_tiles):
+    q_idx = (table & 0xFFFF).long()
+    h_idx = ((table >> 16) & 0xFF).long()
+    b_idx = ((table >> 24) & 0xFF).long()
+    return (b_idx * nhead + h_idx) * q_tiles + q_idx
+
+
+# The table has one entry per (batch, head, query tile). 1024 is the point where the builder hands
+# the sort to ATen, so straddle it, and include sizes that are not multiples of the workgroup.
+@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 sparse validation")
+@pytest.mark.parametrize(
+    ("batch", "nhead", "q_tiles"),
+    [(1, 1, 1), (1, 8, 3), (2, 5, 7), (1, 16, 32), (1, 32, 32), (4, 16, 64)],
+)
+@pytest.mark.parametrize(
+    "pattern",
+    [
+        "uniform",
+        "zeros",
+        "random",
+        "wide_random",
+        "two_values",
+        "descending",
+        "ascending",
+    ],
+)
+def test_mha_v4_sparse_work_table_is_longest_lut_first(batch, nhead, q_tiles, pattern):
+    torch.manual_seed(7)
+    total = batch * nhead * q_tiles
+    counts = _work_table_counts(total, pattern)
+
+    table = mha_v4_sparse_work_table(counts, batch, nhead, q_tiles)
+    visited = _unpack_work_table(table, nhead, q_tiles)
+
+    # Every tile exactly once. This is the part a wrong table would turn into a wrong result.
+    assert torch.equal(visited.sort().values, torch.arange(total, device="cuda"))
+
+    # Longest LUT first, so no heavy tile straggles behind the rest.
+    ordered = counts[visited]
+    assert bool((ordered[:-1] >= ordered[1:]).all())
+
+    # Ties keep raster order, which is what leaves uniform counts spatially coherent. A stable
+    # reference sort pins the whole permutation, not just the two properties above.
+    expected = torch.argsort(counts, descending=True, stable=True)
+    assert torch.equal(visited, expected)
+
+
+@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 sparse validation")
+@pytest.mark.parametrize("batch,nhead,q_tiles", [(1, 16, 32), (4, 16, 64)])
+def test_mha_v4_sparse_work_table_leaves_uniform_counts_in_raster_order(
+    batch, nhead, q_tiles
+):
+    """Top-k sparsity gives every tile the same LUT length, and that case must not be shuffled."""
+    total = batch * nhead * q_tiles
+    counts = torch.full((total,), 5, device="cuda", dtype=torch.int32)
+
+    table = mha_v4_sparse_work_table(counts, batch, nhead, q_tiles)
+
+    visited = _unpack_work_table(table, nhead, q_tiles)
+    assert torch.equal(visited, torch.arange(total, device="cuda"))
 
 
 @pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 sparse validation")
