@@ -19,35 +19,36 @@ Stage2 GEMM + shared partial + TP communication
 
 ```text
 ATOM
-  初始化时选择普通 FusedMoE 或 CommFusedMoe
+  standard backend 下按模型契约自动选择 CommFusedMoe 容器
+  每次 forward 按 exact M winner 选择融合路径，否则走普通 MoE
         ↓
 AITer 公共层
   复用普通 MoE 到 Stage1，通过 _stage2_override 接管 Stage2
         ↓
 后端 runner
-  FlyDSL full-width / windowed / persistent-window
+  FlyDSL atomic-compressed / full-width / windowed / persistent-window
   以后可以增加 Opus / ASM
 ```
 
-普通模型没有传 `_stage2_override`，执行路径不变。选择 `comm_fused` 后缺少 exact
-shape 或 M winner 直接报错，不在融合路径里静默回退普通 Stage2。
-
-本轮只重构 AITer FlyDSL backend，不修改 ATOM 接口和模型适配。
+ATOM 只在 `moe_backend=standard`、非 online quant、FP4 权重且 exact 模型 shape
+受支持时创建 `CommFusedMoe`，不需要额外启动参数。已有 exact M winner 时传
+`_stage2_override`；没有 winner 时在模型层继续走普通 Stage2 + AllReduce，不进入
+融合 runtime。M=1 decode 同时保留普通 MoE 的 shared/routed dual-stream。
 
 ## 3. 当前文件职责
 
 | 文件 | 唯一职责 |
 | --- | --- |
-| `aiter/ops/flydsl/comm_fused_moe_host.py` | CSV exact lookup、通信资源、三种真实 pipeline 和 lazy runner cache |
+| `aiter/ops/flydsl/comm_fused_moe_host.py` | CSV exact lookup、通信资源、四种真实 pipeline 和 lazy runner cache |
 | `op_tests/multigpu_tests/tune_comm_fused_moe.py` | 离线候选、完整 pipeline 测量、精度 gate 和 CSV 输出 |
 | `aiter/configs/comm_fused_moe.csv` | 所有 production winner |
-| `aiter/ops/flydsl/kernels/comm_fused_moe/*.py` | 三种 GPU 算法，不保存 production bucket 表 |
+| `aiter/ops/flydsl/kernels/comm_fused_moe/*.py` | 四种 GPU 算法，不保存 production bucket 表 |
 
 生产包只保留 host、winner CSV 和 kernel。离线 tuner 位于 `op_tests`，不会被生产路径导入。
 没有独立 runners package，也不再为 spec、factory、common 和每个 runner 建文件。GPU 算法
-仍按 full/window/persistent 分成三个 kernel 文件。
+仍按 atomic/full/window/persistent 分成四个 kernel 文件。
 
-这里没有为了压低 `host.py` 行数把代码搬到别处。buffer 注册、launch 顺序、barrier 和三种
+这里没有为了压低 `host.py` 行数把代码搬到别处。buffer 注册、launch 顺序、barrier 和四种
 pipeline 都是真实 host runtime，因此保留在一个文件中；新增 shape/M 不会继续增加这些代码。
 
 ## 4. Production winner 数据
@@ -62,17 +63,19 @@ ShapeKey
   experts
   topk
   TP
-  activation dtype
-  weight dtype
        ↓
 padded M → winner row → kernel Config
 ```
+
+量化契约不重复写入 CSV：ATOM 在初始化时已限定非 online quant 的 FP4 权重，
+runner/kernel 内部则是固定的 MXFP8 通信协议。未来如果同一 shape 需要支持多种量化
+契约，再把 dtype/quant 加入 key，第一版不预留无用列。
 
 winner 直接保存在一个 CSV 中，每行对应一个 exact ShapeKey/M：
 
 ```csv
 gfx,...,m,kid,family,tile_m,tile_n,tile_k,sort_block_m,window,...
-gfx950,...,256,full_tm32_...,full,32,256,128,32,,...
+gfx950,...,256,atomic_...,atomic,,,,,,...
 gfx950,...,8192,window_tm64_...,window,64,256,128,64,1024,...
 gfx950,...,32768,persistent_tm64_...,persistent,64,256,128,64,1024,...
 ```
@@ -121,12 +124,13 @@ winner。
 
 ## 6. 轻量离线 tuner
 
-`op_tests/multigpu_tests/tune_comm_fused_moe.py` 提供四类能力：
+`op_tests/multigpu_tests/tune_comm_fused_moe.py` 提供五类能力：
 
-1. `full_width_candidates(...)`
-2. `windowed_candidates(...)`
-3. `persistent_window_candidates(...)`
-4. `benchmark(...) / select_winner(...) / winner_row(...) / write_winner(...)`
+1. `atomic_compressed_candidates(...)`
+2. `full_width_candidates(...)`
+3. `windowed_candidates(...)`
+4. `persistent_window_candidates(...)`
+5. `benchmark(...) / select_winner(...) / winner_row(...) / write_winner(...)`
 
 候选生成器只做独立参数的笛卡尔积，不把派生 layout 值暴露给调参脚本。tuner 和生产端
 直接复用 `full_width.Config`、`windowed.Config`、`persistent_window.Config`，不存在重复的
@@ -166,7 +170,7 @@ AITer 内再建设一套多进程 tuner framework。
 
 1. 定义 exact `ShapeKey`。
 2. 列出需要覆盖的 padded M。
-3. 为每个 M 生成 full/window/persistent 候选。
+3. 为每个 M 生成 atomic/full/window/persistent 候选。
 4. 使用相同输入建立普通路径 reference。
 5. 每个 candidate 跑完整 pipeline 精度和 Graph rank-max。
 6. 选择无精度问题的最快结果。
@@ -174,8 +178,9 @@ AITer 内再建设一套多进程 tuner framework。
 8. 初始化时 exact lookup 该 ShapeKey/M。
 9. 跑全 bucket、uniform/skew、eager/Graph 和整网验证。
 
-没有 winner 的 shape 继续在模型配置层选择普通 MoE。融合 backend 内不做最近邻、向上
-取 bucket、自动 family 切换或普通路径 fallback。
+没有 winner 的 shape 在初始化时保持普通 MoE；没有 winner 的 M 在模型 forward 处
+走普通 Stage2 + AllReduce。融合 backend 内不做最近邻、向上取 bucket、自动 family
+切换或内部 fallback。
 
 ## 8. 当前验证结果
 
@@ -200,6 +205,43 @@ uniform M=8192/32768 另用 7 轮、每轮 50 次 Graph replay 复测，分别�
 
 MORI SDMA、CU push 等实验未超过当前 compressed direct-pull 完整 pipeline，因此不进入
 production。MORI 只在初始化时注册 external window，热路径没有 MORI host 调用。
+
+### 最终模型接入验证
+
+- ATOM 已在 `moe_backend=standard` 下自动选择，不再需要
+  `--moe-backend comm_fused`。
+- M=256/512/1024 走 atomic-compressed，M=2048/4096 走 full-width，
+  M=8192/16384 走 windowed，M=32768 走 persistent-window。
+- CUDA Graph capture smoke 已通过；kernel trace 已确认 full/window/persistent 使用
+  `flydsl_fused_moe_full_*`、`flydsl_fused_moe_win_*`、`flydsl_fused_moe_pwin_*`
+  的逻辑名称，不再把某个 M 写入 kernel name。
+- 不支持的 M（包括 M=1 decode）保持普通 Stage2 + AllReduce；M=1 的
+  shared/routed dual-stream 也已恢复。targeted A/B 中 M=1 TPOT 仅波动 `+0.200%`。
+- 全 bucket 整网验证覆盖 M=256～32768：融合支路 TTFT 在 M=512～32768
+  改善 `0.55%～12.58%`，M=256 的 `-1.81%` 在 2% 测量波动内；各 bucket
+  TPOT 变化在约 `-0.54%～+1.12%` 内。
+- 最终 InferenceX-style 同场 A/B（ISL=8192、OSL=1024、concurrency=64、
+  640 requests）两侧均 640/640 成功，无 traceback、memory fault、HTTP 5xx 或 hang。
+
+| 整网指标 | baseline | candidate | candidate 变化 |
+| --- | ---: | ---: | ---: |
+| benchmark duration | 1245.61 s | 1227.73 s | -1.44% |
+| total token throughput | 4279.42 tok/s | 4341.72 tok/s | +1.46% |
+| median TTFT | 442.57 ms | 407.68 ms | -7.88% |
+| P90 / P99 TTFT | 1248.81 / 14095.80 ms | 1081.11 / 13277.86 ms | -13.43% / -5.80% |
+| median TPOT | 127.10 ms | 126.06 ms | -0.82% |
+| P90 / P99 TPOT | 131.41 / 139.32 ms | 129.77 / 137.61 ms | -1.25% / -1.23% |
+| median E2EL | 118530.98 ms | 117585.57 ms | -0.80% |
+| P99 E2EL | 144853.61 ms | 142822.52 ms | -1.40% |
+
+median ITL 有 `+0.99%` 的单项波动，P90 基本持平（`+0.12%`），P99 改善
+`4.25%`；结合 TPOT、E2EL 和总吞吐的同向改善，该变化归为调度测量波动。
+
+完整结果保存在仓外：
+
+```text
+/home/yifehuan/data/comm_fused_moe_final_inferencex_ab_20260823
+```
 
 ## 9. 扩展 Opus / ASM
 
@@ -231,10 +273,10 @@ registry。
 
 ## 11. 下一步
 
-1. review 当前未提交结构 diff，不 amend。
-2. 用 tuner 跑一组小范围已知参数 sweep，验证 winner 选择和输出格式。
-3. 将仓外历史 sweep driver 改为直接构造 kernel Config，不再 monkey-patch kernel 全局常量。
-4. AITer review 通过后，再做 ATOM 整网验证；本轮不改 ATOM。
-5. 后续按独立计划继续优化 persistent-window 的跨 phase RS/AG overlap。
+1. 用 tuner 跑一组小范围已知参数 sweep，持续校验 winner 选择和输出格式。
+2. 将仓外历史 sweep driver 改为直接构造 kernel Config，不再 monkey-patch kernel 全局常量。
+3. 优先尝试 persistent-window 的 RS/AG 跨 phase overlap，但只 promotion 全 M 和
+   整网都通过门禁的 winner。
+4. 需要新模型或新 shape 时，按第 7 节流程新增 CSV winner，不扩张 host 热路径。
 
 Persistent 的结构性优化记录见 `docs/comm_fused_moe_persistent_kernel_plan.md`。
