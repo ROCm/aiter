@@ -191,7 +191,11 @@ def _emit_local(config: Config, route, partial, shared, worker):
 
 
 def _compose_cycle(
-    config: Config, *, has_reduce_scatter: bool, has_all_gather: bool
+    config: Config,
+    window_index: int,
+    *,
+    has_reduce_scatter: bool,
+    has_all_gather: bool,
 ):
     m = config.m
     shard_rows = config.shard_rows
@@ -209,9 +213,11 @@ def _compose_cycle(
     ):
         @flyc.kernel(
             name=(
-                f"{module_name}_comm_m{m}_w{window}_lw{local_workers}"
-                f"_rs{reduce_scatter_grid}_ag{all_gather_grid}"
-                f"_cycle_rs{int(has_reduce_scatter)}ag{int(has_all_gather)}"
+                f"flydsl_fused_moe_win_cycle_p{window_index}_sr{shard_rows}"
+                f"_t{config.tile_m}x{config.tile_n}x{config.tile_k}"
+                f"_sbm{config.sort_block_m}_w{window}_lw{local_workers}"
+                f"_rsg{reduce_scatter_grid}_agg{all_gather_grid}"
+                f"_rs{int(has_reduce_scatter)}ag{int(has_all_gather)}"
             ),
             known_block_size=[BLOCK, 1, 1],
         )
@@ -449,6 +455,7 @@ def compile_stage2_cycle(
         window,
         _compose_cycle(
             config,
+            window,
             has_reduce_scatter=has_reduce_scatter,
             has_all_gather=has_all_gather,
         ),
@@ -472,9 +479,10 @@ def compile_stage2_drain(
 
     @flyc.kernel(
         name=(
-            f"comm_fused_moe_m{m}_w{window}_lw{local_workers}"
-            f"_rs{reduce_scatter_grid}_ag{all_gather_grid}"
-            f"_drain_l{int(has_local)}"
+            f"flydsl_fused_moe_win_drain_sr{shard_rows}"
+            f"_w{window}_lw{local_workers}"
+            f"_rsg{reduce_scatter_grid}_agg{all_gather_grid}"
+            f"_l{int(has_local)}"
             f"rs{int(has_reduce_scatter)}ag{int(has_all_gather)}"
         ),
         known_block_size=[BLOCK, 1, 1],

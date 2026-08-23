@@ -15,6 +15,7 @@ from aiter.ops.flydsl.comm_fused_moe_host import (
     ShapeKey,
     create_runner,
 )
+from aiter.ops.flydsl.kernels.comm_fused_moe import atomic_compressed
 from aiter.ops.flydsl.kernels.comm_fused_moe import full_width
 from aiter.ops.flydsl.kernels.comm_fused_moe import persistent_window
 from aiter.ops.flydsl.kernels.comm_fused_moe import windowed
@@ -35,6 +36,7 @@ _WINNER_KEY_FIELDS = (
     "m",
 )
 _CONFIG_FAMILIES = {
+    atomic_compressed.Config: "atomic",
     full_width.Config: "full",
     windowed.Config: "window",
     persistent_window.Config: "persistent",
@@ -59,6 +61,10 @@ def full_width_candidates(*, m, **axes):
     return _candidates(full_width.Config, m, axes)
 
 
+def atomic_compressed_candidates(*, m, **axes):
+    return _candidates(atomic_compressed.Config, m, axes)
+
+
 def windowed_candidates(*, m, **axes):
     return _candidates(windowed.Config, m, axes)
 
@@ -74,6 +80,7 @@ def benchmark(
     config: PipelineConfig,
     stage2_args: tuple,
     stage2_kwargs: dict,
+    ordinary_stage2=None,
     shared_partial: torch.Tensor,
     reference: torch.Tensor,
     rounds: int = 3,
@@ -88,6 +95,7 @@ def benchmark(
             stage2_args=stage2_args,
             stage2_kwargs=stage2_kwargs,
             shared_partial=shared_partial,
+            ordinary_stage2=ordinary_stage2,
         )
 
     reference_f32 = reference.float()
