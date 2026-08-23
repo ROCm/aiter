@@ -3,8 +3,6 @@
 
 """Sparse block selection for index-head attention."""
 
-from typing import Optional
-
 import torch
 
 from csrc.cpp_itfs.torch_utils import direct_register_custom_op
@@ -27,8 +25,6 @@ def pa_sparse_block_score_decode(
     init_blocks: int = 0,
     local_blocks: int = 0,
     query_len: int = 1,
-    num_chunks: int = 0,
-    num_waves: int = 0,
     max_seq_len: int = 0,
 ) -> None:
     pa_sparse_block_score_decode_core(
@@ -40,8 +36,6 @@ def pa_sparse_block_score_decode(
         init_blocks,
         local_blocks,
         query_len,
-        num_chunks,
-        num_waves,
         max_seq_len,
     )
 
@@ -63,10 +57,7 @@ def pa_sparse_block_score_prefill(
     init_blocks: int = 0,
     local_blocks: int = 0,
     max_query_len: int = 0,
-    num_chunks: int = 0,
-    num_waves: int = 0,
     max_seq_len: int = 0,
-    q_tiles: int = 0,
 ) -> None:
     pa_sparse_block_score_prefill_core(
         q_idx,
@@ -78,10 +69,7 @@ def pa_sparse_block_score_prefill(
         init_blocks,
         local_blocks,
         max_query_len,
-        num_chunks,
-        num_waves,
         max_seq_len,
-        q_tiles,
     )
 
 
@@ -103,9 +91,9 @@ def pa_sparse_block_topk(
     block_size: int = 0,
     query_len: int = 1,
     num_waves: int = 0,
-    num_valid_pages: Optional[torch.Tensor] = None,
-    row_req_id: Optional[torch.Tensor] = None,
-    kv_lens: Optional[torch.Tensor] = None,
+    num_valid_pages: torch.Tensor | None = None,
+    row_req_id: torch.Tensor | None = None,
+    kv_lens: torch.Tensor | None = None,
     num_kv_heads: int = 1,
     pages_per_block: int = 8,
 ) -> None:

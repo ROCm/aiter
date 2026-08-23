@@ -54,7 +54,12 @@ def _setup(seq_lens, qlens, num_idx_heads):
 
     torch.manual_seed(0)
     q = (torch.randn(total_q, num_idx_heads, HEAD_DIM, device=DEV) / 4).to(FP8)
-    k = (torch.randn(num_pages, BLOCK_SIZE, HEAD_DIM, device=DEV) / 4).to(FP8)
+    # Filled a slice at a time: drawing the whole cache in fp32 first needs four
+    # times the cache itself, which is what runs out at the top of the sweep.
+    k = torch.empty(num_pages, BLOCK_SIZE, HEAD_DIM, device=DEV, dtype=FP8)
+    for i in range(0, num_pages, 4096):
+        n = min(4096, num_pages - i)
+        k[i : i + n] = (torch.randn(n, BLOCK_SIZE, HEAD_DIM, device=DEV) / 4).to(FP8)
     block_table = torch.arange(num_reqs * max_blk, device=DEV, dtype=torch.int32).view(
         num_reqs, max_blk
     )
@@ -71,14 +76,16 @@ def ref_block_scores(q, k, block_table, seq_lens, qlens, num_slots):
     """score[h, n, b] = max over the causal tokens of block b of q[n,h,:] . k[b,t,:]."""
     total_q, heads, _ = q.shape
     ref = torch.full((heads, total_q, num_slots), -float("inf"), device=DEV)
-    qf, kf = q.float(), k.float()
+    qf = q.float()
     row = 0
     for r, qlen in enumerate(qlens):
         seq_len = int(seq_lens[r])
         nblk = (seq_len + BLOCK_SIZE - 1) // BLOCK_SIZE
         pages = block_table[r, :nblk].long()
+        # Gathered before the upcast: one request's pages are a slice of the
+        # cache, and promoting the whole cache to fp32 is what will not fit.
         # [nblk, BLOCK, D] x [qlen, H, D] -> [nblk, qlen, H, BLOCK]
-        prod = torch.einsum("btd,qhd->bqht", kf[pages], qf[row : row + qlen])
+        prod = torch.einsum("btd,qhd->bqht", k[pages].float(), qf[row : row + qlen])
 
         # Token t of block b is visible to query token j only while it precedes
         # that row's causal length; everything past it must not enter the max.

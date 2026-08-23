@@ -107,6 +107,8 @@ TOPK_WAVE_BUDGET = 2048
 
 SCORE_WAVES = 4
 
+SCORE_MAX_WORKGROUPS = 16384
+
 # Columns of the MFMA, each holding one (token, head) pair.
 SCORE_MFMA_COLS = 16
 
@@ -150,7 +152,7 @@ def _topk_waves(slots: int, rows: int) -> int:
     )
 
 
-def _score_split(max_blk: int) -> tuple[int, int]:
+def _score_split(max_blk: int, num_reqs: int) -> tuple[int, int]:
     """Chunks along the block axis and waves per workgroup for the score pass.
 
     The pass is a pure stream of the index key cache, so what it wants is one
@@ -160,9 +162,16 @@ def _score_split(max_blk: int) -> tuple[int, int]:
     not depend on the batch -- rows contribute parallelism of their own, but
     starving the block axis to compensate only lengthens each wave's serial run.
     Both are launch dimensions, so both are fixed at capture.
+
+    The batch does come back in at the ceiling. ``max_blk`` follows the caller's
+    upper bound on the context rather than the one being served, so on a batch
+    whose rows sit far below that bound the split runs past every block there is
+    and the surplus workgroups only read a length and exit. Since the grid is
+    num_reqs x num_chunks, the ceiling belongs on the product.
     """
     waves = min(SCORE_WAVES, _pow2_floor(max(1, max_blk)))
-    return max(1, max_blk // waves), waves
+    chunks = max(1, max_blk // waves)
+    return max(1, min(chunks, SCORE_MAX_WORKGROUPS // max(1, num_reqs))), waves
 
 
 def _tokens_per_tile(num_idx_heads: int) -> int:
@@ -203,6 +212,13 @@ def _score_split_prefill(max_blk: int, num_groups: int) -> tuple[int, int]:
     """
     blocks = _pow2_floor(max(1, num_groups // SCORE_PREFILL_GROUPS_PER_BLOCK))
     blocks = min(blocks, SCORE_PREFILL_MAX_CHUNK_BLOCKS, max(1, max_blk))
+
+    # The same grid ceiling the uniform pass keeps, reached from the other side:
+    # the size is the knob here, so widen it until num_groups x num_chunks fits.
+    # Widening rather than dropping chunks is what holds the size the same for
+    # every group, which is the alignment the paragraph above rests on.
+    cap = max(1, SCORE_MAX_WORKGROUPS // max(1, num_groups))
+    blocks = max(blocks, _pow2_ceil(math.ceil(max_blk / cap)))
     return max(1, math.ceil(max_blk / blocks)), blocks
 
 
@@ -233,34 +249,6 @@ def _check_score_tensors(q_idx, key_cache_idx, score):
     if score.size(0) != num_idx_heads or score.size(1) != total_q:
         raise ValueError("score must be [num_idx_heads, total_q, S]")
     return total_q, num_idx_heads, head_dim, block_size
-
-
-def _resolve_score_split(
-    num_chunks: int,
-    num_waves: int,
-    max_seq_len: int,
-    block_size: int,
-    split,
-) -> tuple[int, int]:
-    """Fill in whichever of num_chunks / num_waves the caller left at 0.
-
-    Both are launch dimensions, which is why they come from ``max_seq_len`` and
-    never from ``seq_lens``: reading the live lengths would move the grid between
-    steps and break cudagraph capture. ``split`` is the pass's own heuristic.
-    """
-    if num_chunks >= 1 and num_waves >= 1:
-        return num_chunks, num_waves
-    if max_seq_len < 1:
-        raise ValueError(
-            "pass max_seq_len when leaving num_chunks or num_waves to be derived, "
-            "so the launch dimensions are fixed at capture"
-        )
-
-    auto_chunks, auto_waves = split(math.ceil(max_seq_len / block_size))
-    return (
-        auto_chunks if num_chunks < 1 else num_chunks,
-        auto_waves if num_waves < 1 else num_waves,
-    )
 
 
 def _launch_score_decode(
@@ -376,8 +364,6 @@ def pa_sparse_block_score_decode(
     init_blocks: int = 0,
     local_blocks: int = 0,
     query_len: int = 1,
-    num_chunks: int = 0,
-    num_waves: int = 0,
     max_seq_len: int = 0,
 ):
     """Score every block of the index key cache against the query.
@@ -401,13 +387,12 @@ def pa_sparse_block_score_decode(
             selection via sentinel scores.
         query_len: query tokens per request; ``num_idx_heads * query_len`` must
             fit the MFMA's 16 columns.
-        num_chunks: splits the block range across the grid's z axis. Fixed at
-            capture time, so the launch stays cudagraph-safe. 0 derives it from
-            ``max_seq_len``.
-        num_waves: waves per workgroup; 0 derives it alongside ``num_chunks``.
-        max_seq_len: launch-time upper bound used to pick ``num_chunks``. Only
-            read when a count is being derived, and never from ``seq_lens``, so
-            the launch dimensions stay fixed at capture.
+        max_seq_len: upper bound on the context, required. The chunk and wave
+            counts the grid is built from come from this and never from
+            ``seq_lens``: reading the live lengths would move the grid between
+            steps and break cudagraph capture. A bound well above the context
+            actually served is safe and costs only what the grid ceiling in
+            ``_score_split`` does not already trim.
     """
     total_q, num_idx_heads, head_dim, block_size = _check_score_tensors(
         q_idx, key_cache_idx, score
@@ -427,9 +412,11 @@ def pa_sparse_block_score_decode(
     if num_reqs == 0:
         return score
 
-    num_chunks, num_waves = _resolve_score_split(
-        num_chunks, num_waves, max_seq_len, block_size, _score_split
-    )
+    if max_seq_len < 1:
+        raise ValueError(
+            "pass max_seq_len so the launch dimensions are fixed at capture"
+        )
+    num_chunks, num_waves = _score_split(math.ceil(max_seq_len / block_size), num_reqs)
 
     return _launch_score_decode(
         q_idx,
@@ -460,10 +447,7 @@ def pa_sparse_block_score_prefill(
     init_blocks: int = 0,
     local_blocks: int = 0,
     max_query_len: int = 0,
-    num_chunks: int = 0,
-    num_waves: int = 0,
     max_seq_len: int = 0,
-    q_tiles: int = 0,
 ):
     """Score every block of the index key cache against ragged query rows.
 
@@ -496,15 +480,11 @@ def pa_sparse_block_score_prefill(
             fixes the query-tile count and, with the request count, how many tiles
             a workgroup folds into one pass over the block range. Never read from
             ``cu_seqlens_q``, so the launch dimensions stay fixed at capture.
-        num_chunks: splits the block range across the grid's z axis. 0 derives it
-            from ``max_seq_len`` and the tile count.
-        num_waves: waves per workgroup; 0 derives it alongside ``num_chunks``.
-        max_seq_len: launch-time upper bound used to pick ``num_chunks``.
-        q_tiles: query tiles a *wave* folds into a single pass over the block
-            range, trading registers for block loads not repeated. 0 derives it
-            from the tile and request counts, which is what a caller should want;
-            it is settable so a test can reach the folded path on a shape too
-            small to pick it.
+        max_seq_len: upper bound on the context, required. The block-axis split
+            comes from this and never from ``seq_lens``, so the launch dimensions
+            stay fixed at capture. A bound well above the context actually served
+            is safe and costs only what the grid ceiling in
+            ``_score_split_prefill`` does not already trim.
     """
     total_q, num_idx_heads, head_dim, block_size = _check_score_tensors(
         q_idx, key_cache_idx, score
@@ -533,7 +513,7 @@ def pa_sparse_block_score_prefill(
         )
 
     num_tiles = math.ceil(max_query_len / _tokens_per_tile(num_idx_heads))
-    num_waves = num_waves if num_waves >= 1 else SCORE_WAVES
+    num_waves = SCORE_WAVES
 
     # Tiles per wave, and the waves are every wave of the workgroup: the page is
     # staged once for all of them, so folding costs registers and nothing else
@@ -541,26 +521,11 @@ def pa_sparse_block_score_prefill(
     # the tiles there are is not a problem -- the waves past the end come out
     # with no live tiles, which masks their loads, their MFMAs and their stores
     # while they still carry their share of the page.
-    if q_tiles < 1:
-        q_tiles = _resolve_q_tiles_prefill(num_tiles, num_reqs, num_waves)
-    elif q_tiles > SCORE_PREFILL_MAX_Q_TILES or q_tiles & (q_tiles - 1):
-        # The derived path only ever produces a power of two within the cap, so
-        # this catches an explicit q_tiles that no variant was built for.
-        raise ValueError(
-            f"q_tiles {q_tiles} must be a power of two no larger than "
-            f"{SCORE_PREFILL_MAX_Q_TILES}"
-        )
+    q_tiles = _resolve_q_tiles_prefill(num_tiles, num_reqs, num_waves)
     num_q_groups = math.ceil(num_tiles / (q_tiles * num_waves))
 
     max_blk = math.ceil(max_seq_len / block_size)
-    if num_chunks >= 1:
-        # An explicit count still has to name a chunk size, since the kernel
-        # takes the size and not the count.
-        chunk_blocks = max(1, math.ceil(max_blk / num_chunks))
-    else:
-        num_chunks, chunk_blocks = _score_split_prefill(
-            max_blk, num_q_groups * num_reqs
-        )
+    num_chunks, chunk_blocks = _score_split_prefill(max_blk, num_q_groups * num_reqs)
 
     return _launch_score_prefill(
         q_idx,
