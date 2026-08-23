@@ -12,7 +12,8 @@ from triton.runtime.jit import constexpr_function
 
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
-from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH, load_config_json
+from aiter.ops.triton.utils.core import load_config_json
+from aiter.ops.triton.utils.gemm_config_utils import resolve_config_dir
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
@@ -990,18 +991,19 @@ def _get_config_cached(
             "Gluon implementation is not supported on this device (requires CDNA4)."
         )
 
-    dev = arch_info.get_arch()
+    cfg_dir, prefix = resolve_config_dir(
+        "gemm", "GEMM-A8W8_BLOCKSCALE", backend="gluon", legacy_dir="gemm"
+    )
 
     # Try specialized config first.
     config_dict = load_config_json(
-        f"{AITER_TRITON_CONFIGS_PATH}/gemm/gluon/{dev}-GEMM-A8W8_BLOCKSCALE-N={N}-K={K}.json",
+        f"{cfg_dir}/{prefix}GEMM-A8W8_BLOCKSCALE-N={N}-K={K}.json",
         required=False,
     )
     # Fall back to the general config (must exist).
     if config_dict is None:
-        config_dict = load_config_json(
-            f"{AITER_TRITON_CONFIGS_PATH}/gemm/gluon/{dev}-GEMM-A8W8_BLOCKSCALE.json"
-        )
+        default_stem = "DEFAULT" if prefix == "" else f"{prefix}GEMM-A8W8_BLOCKSCALE"
+        config_dict = load_config_json(f"{cfg_dir}/{default_stem}.json")
 
     # Config keys should be named M_LEQ_<bound> or "any"
     bounds = []
