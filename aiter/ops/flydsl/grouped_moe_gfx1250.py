@@ -18,6 +18,10 @@ from aiter.ops.flydsl.kernels.mega_moe_gfx1250.types import (
     Stage1PrequantContext,
     Stage2ScatterContext,
 )
+from aiter.ops.flydsl.kernels.mxfp4_preshuffle_gfx1250_tdm import (
+    TICKET_SLOTS,
+    WORK_QUEUE_SHARDS,
+)
 from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
 
 # Opt-in switch for the gfx1250 FlyDSL grouped-GEMM path.
@@ -67,6 +71,136 @@ def _stage1_producer_chunk_rows() -> int:
     producer warps; larger amortises the tile bisect and the publish.
     """
     return max(1, int(os.environ.get("AITER_FLYDSL_STAGE1_PRODUCER_CHUNK_ROWS", "8")))
+
+
+@functools.lru_cache(maxsize=1)
+def _stage1_producer_work_queue() -> bool:
+    """Whether gemm1's tiles are claimed from an atomic queue, not by block id.
+
+    On by default once there are producers: a rejoining producer that still
+    owned the tile its block id names would hold that tile behind its whole
+    gather, while the workgroups that finished early idled. With the queue a
+    tile goes to whoever is free, and the producers take what is left.
+    """
+    return _as_bool(os.environ.get("AITER_FLYDSL_STAGE1_WORK_QUEUE"), True)
+
+
+@functools.lru_cache(maxsize=1)
+def _stage1_producer_role_ticket() -> bool:
+    """Whether gemm1 picks its producers by arrival order instead of block id.
+
+    On by default: the consumers spin on the producers, so the producers have
+    to be workgroups that are already resident. An entry ticket makes that
+    true by construction -- whoever runs first gathers -- where block ids only
+    make it true as long as the hardware dispatches them in order.
+    """
+    return _as_bool(os.environ.get("AITER_FLYDSL_STAGE1_ROLE_TICKET"), True)
+
+
+@functools.lru_cache(maxsize=1)
+def _stage1_producer_persist_blocks() -> int:
+    """Workgroups gemm1 launches when the queue runs a persistent grid (0 = off).
+
+    Off by default: with one workgroup per tile the hardware distributor is
+    already the scheduler, and persistence only starts paying when the tile
+    count is far above what the machine holds at once -- at which point this
+    is the grid to size to the machine (a small multiple of the CU count).
+    """
+    return max(0, int(os.environ.get("AITER_FLYDSL_STAGE1_PERSIST_BLOCKS", "0")))
+
+
+@functools.lru_cache(maxsize=1)
+def _stage1_fuse_plan() -> bool:
+    """Whether gemm1 runs the plan itself instead of a pass in front of it.
+
+    On by default once there are producers. The plan -- the per-expert
+    tile-aligned prefix sum and the masked -> contiguous row remap -- is tiny
+    and mostly serial, so as a launch of its own it is almost pure latency
+    between the route kernel and gemm1's first tile. Inside gemm1 the planner
+    workgroup runs it while the rest of the grid is still being dispatched, and
+    the producers absorb the remap on their way to the gather.
+    """
+    return _as_bool(os.environ.get("AITER_FLYDSL_STAGE1_FUSE_PLAN"), True)
+
+
+@functools.lru_cache(maxsize=1)
+def _stage1_plan_grid_mult() -> int:
+    """Workgroups per CU for the persistent grid the fused plan needs."""
+    return max(1, int(os.environ.get("AITER_FLYDSL_STAGE1_PLAN_GRID_MULT", "2")))
+
+
+@functools.lru_cache(maxsize=8)
+def _device_cu_count(device: torch.device) -> int:
+    try:
+        return int(torch.cuda.get_device_properties(device).multi_processor_count)
+    except Exception:  # noqa: BLE001
+        return 256
+
+
+def _stage1_grid_plan(
+    *, device: torch.device, producer_blocks: int, work_queue: bool, gemm1_tiles: int
+) -> tuple[int, bool]:
+    """Persistent grid width for gemm1 and whether the plan can be fused in.
+
+    The fused plan needs a grid whose width is known here, because the epoch
+    its gate compares against is the never-reset entry ticket divided by that
+    width -- which the one-workgroup-per-tile grid is not, its M comes from a
+    traced value. So it comes with the persistent grid, sized to the machine
+    when the tuning knob does not name a width.
+    """
+    if not (producer_blocks and work_queue):
+        return 0, False
+    persist = _stage1_producer_persist_blocks()
+    if persist and persist < producer_blocks:
+        raise ValueError(
+            f"stage1 persist blocks={persist} is below "
+            f"producer_blocks={producer_blocks}"
+        )
+    if persist and persist < WORK_QUEUE_SHARDS:
+        raise ValueError(
+            f"stage1 persist blocks={persist} is below the "
+            f"{WORK_QUEUE_SHARDS} work-queue shards"
+        )
+    fuse_plan = _stage1_fuse_plan()
+    if not persist and fuse_plan:
+        persist = _device_cu_count(device) * _stage1_plan_grid_mult()
+    # A persistent grid wider than the tile grid is the tile grid plus idle
+    # workgroups, so cap it there -- and drop it entirely once the cap leaves
+    # too few workgroups to cover every queue shard.
+    persist = min(persist, gemm1_tiles)
+    if persist < WORK_QUEUE_SHARDS:
+        persist = 0
+    # Ticket 0 plans and the next producer_blocks tickets gather, so a grid
+    # that cannot seat all of them would leave the rendezvous waiting on a
+    # producer that never runs.
+    fuse_plan = fuse_plan and persist >= producer_blocks + 1
+    return persist, fuse_plan
+
+
+# Keyed by (device, slots, persistent grid width): the fused plan's counters
+# have to survive between launches, see _stage1_plan_workspace.
+_PLAN_WORKSPACE: dict[tuple, torch.Tensor] = {}
+
+
+def _stage1_plan_workspace(
+    device: torch.device, slots: int, persist: int
+) -> torch.Tensor:
+    """gemm1's counter buffer for the fused plan: allocated and zeroed once.
+
+    With the plan inside gemm1 there is no pass in front of it to reset these
+    counters, and the planner cannot reset the entry ticket it was itself
+    assigned by. So the ticket is never reset: it counts across launches, and
+    the launch a workgroup belongs to is its ticket divided by the grid. That
+    holds only while the buffer survives between launches and the grid it is
+    divided by stays the same, which is what this is keyed on. Everything else
+    in the buffer is reset per launch by the planner, behind its gate.
+    """
+    key = (device, int(slots), int(persist))
+    buf = _PLAN_WORKSPACE.get(key)
+    if buf is None:
+        buf = torch.zeros(int(slots), dtype=torch.int32, device=device)
+        _PLAN_WORKSPACE[key] = buf
+    return buf
 
 
 def _grouped_weight_uint8(w: torch.Tensor) -> torch.Tensor:
@@ -597,36 +731,90 @@ def _grouped_a8w4_tdm_moe(
     # which measures well under its own standalone time. Prequantized only --
     # with quant still in the pass there would be ALU to displace too.
     _producer_blocks = _stage1_producer_blocks() if _wire_stride else 0
-    # One counter per M-tile, incremented per chunk of rows landed, zeroed by
-    # the remap pass below: a stale count from the previous layer would let a
-    # consumer read rows that have not arrived yet. ``_row_src`` is that pass's
-    # inverse map (grouped row -> route), which is what lets the producer
-    # gather in destination order; it is fully written for every row a route
-    # claimed and the producer never reads past that bound.
-    _tile_rows_done = (
-        torch.empty(
-            ((contiguous_m + tile_m - 1) // tile_m,), dtype=torch.int32, device=device
-        )
-        if _producer_blocks
-        else None
+    _work_queue = bool(_producer_blocks) and _stage1_producer_work_queue()
+    # Both tickets need the producers to rejoin: the queue because a workgroup
+    # that claims a tile has to compute it, the role ticket because otherwise
+    # the tile a workgroup owns is its block id minus the producer count, which
+    # only decodes if producers are the low ids.
+    _role_ticket = bool(_producer_blocks) and _stage1_producer_role_ticket()
+    _rejoin = True if (_work_queue or _role_ticket) else _stage1_producer_rejoin()
+    two_inter = 2 * inter_dim
+    _gemm1_tiles = ((contiguous_m + tile_m - 1) // tile_m) * (
+        (two_inter + tile_n - 1) // tile_n
     )
+    _persist, _fuse_plan = _stage1_grid_plan(
+        device=device,
+        producer_blocks=_producer_blocks,
+        work_queue=_work_queue,
+        gemm1_tiles=_gemm1_tiles,
+    )
+    # One counter per M-tile, incremented per chunk of rows landed: a stale
+    # count from the previous layer would let a consumer read rows that have
+    # not arrived yet. The ticket counters ride at the end of the same buffer,
+    # and who zeroes all of it depends on where the plan runs -- the remap pass
+    # below when it is a pass, the planner workgroup behind its epoch gate when
+    # it is fused into gemm1, which is also why that buffer has to survive
+    # between launches. ``_row_src`` is the plan's inverse map (grouped row ->
+    # route), which is what lets the producer gather in destination order; it
+    # is fully written for every row a route claimed and the producer never
+    # reads past that bound.
+    _tile_rows_done = None
+    if _producer_blocks:
+        _counter_slots = (contiguous_m + tile_m - 1) // tile_m + TICKET_SLOTS
+        _tile_rows_done = (
+            _stage1_plan_workspace(device, _counter_slots, _persist)
+            if _fuse_plan
+            else torch.empty((_counter_slots,), dtype=torch.int32, device=device)
+        )
     _row_src = (
         torch.empty((contiguous_m,), dtype=torch.int32, device=device)
         if _producer_blocks
         else None
     )
-    _starts, psum, _ = contiguous_psum_remap(
-        _masked_m,
-        topids_to_rows,
-        E,
-        max_m,
-        tile_m,
-        num_valid_routes=_ep_nvr,
-        ep_scatter_params=ep_scatter_params,
-        zero_tile_rows_done=_tile_rows_done,
-        row_src_route=_row_src,
-    )
-    psum = psum.to(torch.int32).contiguous()
+    _plan_kw = {}
+    if _fuse_plan:
+        # gemm1 runs the plan itself: allocate what the pass used to return and
+        # hand the kernel its inputs. Same (-1, 0) ep_rowmap sentinel fill as
+        # the pass did, stream-ordered ahead of the launch that overwrites the
+        # kept rows.
+        _starts = torch.empty((E,), dtype=torch.int32, device=device)
+        psum = torch.empty((E,), dtype=torch.int32, device=device)
+        if enable_ep_scatter:
+            ep_rowmap.view(torch.int64).fill_(0xFFFFFFFF)
+        _plan_kw = {
+            "plan_in_kernel": 1,
+            "plan_route_max_m": int(max_m),
+            "plan_numel": int(token_num) * int(topk),
+            "plan_ep_scatter": int(enable_ep_scatter),
+            "plan_max_tok": (
+                int(ep_scatter_params["max_tok"]) if enable_ep_scatter else 0
+            ),
+            "plan_slot_stride": (
+                int(ep_scatter_params["slot_stride"]) if enable_ep_scatter else 0
+            ),
+            "plan_masked_m": _masked_m,
+            "plan_rows": topids_to_rows.reshape(-1),
+            "plan_starts": _starts,
+            "plan_num_valid_routes": _ep_nvr,
+            "plan_gather_w": _gather_w_buf.reshape(-1) if enable_ep_scatter else None,
+            "plan_tis": (
+                ep_scatter_params["tis"].reshape(-1) if enable_ep_scatter else None
+            ),
+            "plan_rowmap": ep_rowmap.reshape(-1) if enable_ep_scatter else None,
+        }
+    else:
+        _starts, psum, _ = contiguous_psum_remap(
+            _masked_m,
+            topids_to_rows,
+            E,
+            max_m,
+            tile_m,
+            num_valid_routes=_ep_nvr,
+            ep_scatter_params=ep_scatter_params,
+            zero_tile_rows_done=_tile_rows_done,
+            row_src_route=_row_src,
+        )
+        psum = psum.to(torch.int32).contiguous()
     # Turns the TDM GEMM2 epilogue into the fused P2P scatter-combine.
     _ep_gemm2_kwargs = (
         {
@@ -641,7 +829,6 @@ def _grouped_a8w4_tdm_moe(
     )
 
     out_is_f16 = 1 if (dtype == torch.float16 or dtype == dtypes.fp16) else 0
-    two_inter = 2 * inter_dim
     # Stage1 epilogue code: 1 silu, 2 swiglu, 3 SiTUv2. The caller has already
     # rejected anything else.
     if activation == ActivationType.Swiglu:
@@ -689,11 +876,6 @@ def _grouped_a8w4_tdm_moe(
             raise ValueError(
                 f"stage1 producer chunk_rows={_chunk_rows} must divide tile_m={tile_m}"
             )
-        _rejoin = _stage1_producer_rejoin()
-        # Rejoining producers own a tile, so there has to be one for each.
-        _gemm1_tiles = ((contiguous_m + tile_m - 1) // tile_m) * (
-            (two_inter + tile_n - 1) // tile_n
-        )
         if _rejoin and _producer_blocks > _gemm1_tiles:
             raise ValueError(
                 f"stage1 producer_blocks={_producer_blocks} exceeds the gemm1 tile "
@@ -702,6 +884,9 @@ def _grouped_a8w4_tdm_moe(
         _producer_kw = {
             "producer_blocks": _producer_blocks,
             "producer_rejoin": int(_rejoin),
+            "producer_work_queue": int(_work_queue),
+            "producer_role_ticket": int(_role_ticket),
+            "producer_persist_blocks": int(_persist),
             "producer_chunk_rows": _chunk_rows,
             "producer_total_rows": int(contiguous_m),
             "producer_topk": int(topk),
@@ -711,6 +896,7 @@ def _grouped_a8w4_tdm_moe(
             "producer_scale": a1_scale,
             "producer_row_src": _row_src,
             "producer_tile_rows_done": _tile_rows_done,
+            **_plan_kw,
         }
     else:
         a1_payload, a1_scale = flydsl_moe_fused_quant_preshuffle(
@@ -1740,9 +1926,9 @@ def flydsl_moe_scatter_preshuffle_scale(
     device = a1_scale_token_u8.device
     scale_w = a1_scale_token_u8.shape[1]
     rows_per_tile = wmma_rep * 16
-    assert max_m % rows_per_tile == 0, (
-        f"max_m ({max_m}) must be a multiple of wmma_rep*16 ({rows_per_tile})"
-    )
+    assert (
+        max_m % rows_per_tile == 0
+    ), f"max_m ({max_m}) must be a multiple of wmma_rep*16 ({rows_per_tile})"
     tiles_per_expert = max_m // rows_per_tile
 
     if grouped_a1_scale is None:
@@ -1778,9 +1964,9 @@ def flydsl_moe_preshuffle_scale(
     device = scale_grouped_u8.device
     scale_w = scale_grouped_u8.shape[-1]
     rows_per_tile = wmma_rep * 16
-    assert max_m % rows_per_tile == 0, (
-        f"max_m ({max_m}) must be a multiple of wmma_rep*16 ({rows_per_tile})"
-    )
+    assert (
+        max_m % rows_per_tile == 0
+    ), f"max_m ({max_m}) must be a multiple of wmma_rep*16 ({rows_per_tile})"
     tiles_per_expert = max_m // rows_per_tile
 
     if out is None:

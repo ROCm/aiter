@@ -12,6 +12,8 @@ the scan sweeps the experts in block-sized chunks and carries the running offset
 between chunks in LDS. Kimi-K3 (E=896) is the first model to exceed one chunk.
 """
 
+from types import SimpleNamespace
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm
@@ -19,6 +21,8 @@ from flydsl.expr import arith, const_expr, gpu, ptrtoint, range_constexpr
 from flydsl.expr.typing import Int32, T
 
 from aiter.ops.flydsl.kernels import buffer_ops
+from aiter.ops.flydsl.kernels import communication_ops_utils as comm_ops
+from aiter.ops.flydsl.kernels.communication_ops_utils import traced
 from aiter.ops.flydsl.kernels.tensor_shim import (
     AITER_FLYDSL_KERNARG_PRELOAD,
     AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
@@ -78,7 +82,136 @@ class _PsumRemapEpStorage:
 
 # The chunked scan below is written out in both kernels rather than shared:
 # @flyc.kernel AST-transforms only the decorated body, so a dynamic `for`/`if`
-# does not survive being factored into a plain helper.
+# does not survive being factored into a plain helper. The two emitters at the
+# end of this file are the exception: @traced puts the transform back, which is
+# what lets the grouped GEMM run this pass in-kernel.
+
+
+@traced
+def emit_tile_psum_plan(c: SimpleNamespace) -> None:
+    """Tile-aligned exclusive prefix sum over per-expert counts, in one CTA.
+
+    The scan of ``psum_remap_kernel``, emitted where a caller wants it: the
+    grouped GEMM's planner workgroup runs it in-kernel so the plan stops being
+    a launch of its own. Chunked Hillis-Steele over LDS with a carry between
+    chunks, so an expert count wider than the workgroup still comes out as one
+    continuous prefix sum; lanes past ``n_experts`` feed 0 in and write nothing.
+
+    ``starts`` is the tile-aligned exclusive sum, ``psum`` the inclusive end of
+    each expert's real rows -- the map the tile decode bisects. Unlike the
+    standalone kernel this writes no ``contiguous_m``: every caller of the
+    fused form already knows it as a host-side static bound.
+
+    Its LDS comes in as raw byte addresses (``2 * nthreads + 1`` i32 slots),
+    because the caller is a GEMM whose scratch is one big arena rather than a
+    typed struct -- and the arena is free at this point, the plan runs before
+    the first tile is staged.
+    """
+    tid = c.tid
+    tile_v = fx.Uint32(c.c_tile_m)
+    tile_minus_1 = tile_v - 1
+    is_lane0 = tid == fx.Uint32(0)
+    if is_lane0:
+        comm_ops.store_i32_lds(c.carry, fx.Int32(0))
+    gpu.barrier()
+
+    for base in range_constexpr(0, c.n_experts, c.nthreads):
+        e = fx.Uint32(base) + tid
+        in_expert = e < fx.Uint32(c.n_experts)
+        m_e = fx.Uint32(0)
+        if in_expert:
+            m_e = fx.Uint32(
+                buffer_ops.buffer_load(c.m_rsrc, e, vec_width=1, dtype=T.i32)
+            )
+        _slot = fx.Int64(tid) * 4
+        comm_ops.store_i32_lds(
+            c.lds0 + _slot, fx.Int32((m_e + tile_minus_1) // tile_v * tile_v)
+        )
+        gpu.barrier()
+
+        src = c.lds0
+        dst = c.lds1
+        for offset in range_constexpr(1, c.nthreads):
+            if const_expr((offset & (offset - 1)) != 0):
+                continue
+            val = fx.Int32(comm_ops.load_i32_lds(src + _slot))
+            has_prev = tid >= offset
+            prev = fx.Int32(0)
+            if has_prev:
+                prev = fx.Int32(comm_ops.load_i32_lds(src + _slot - offset * 4))
+            comm_ops.store_i32_lds(dst + _slot, val + prev)
+            gpu.barrier()
+            src, dst = dst, src
+
+        base_off = fx.Int32(comm_ops.load_i32_lds(c.carry))
+        if in_expert:
+            is_not_first = tid != 0
+            excl = fx.Int32(0)
+            if is_not_first:
+                excl = fx.Int32(comm_ops.load_i32_lds(src + _slot - 4))
+            start = excl + base_off
+            buffer_ops.buffer_store(start, c.s_rsrc, e)
+            buffer_ops.buffer_store(start + fx.Int32(m_e), c.p_rsrc, e)
+
+        # Fold this chunk's total in before the next one overwrites lds0.
+        chunk_total = fx.Int32(comm_ops.load_i32_lds(src + (c.nthreads - 1) * 4))
+        gpu.barrier()
+        if is_lane0:
+            comm_ops.store_i32_lds(c.carry, base_off + chunk_total)
+        gpu.barrier()
+
+
+@traced
+def emit_route_remap_share(c: SimpleNamespace) -> None:
+    """One workgroup's share of the masked -> contiguous row remap.
+
+    The route loop of ``psum_remap_kernel``, split across the grouped GEMM's
+    producer workgroups rather than run as a pass of its own: each walks a
+    grid-strided slice of the routes, rewrites ``topids_to_rows`` in place and
+    records the inverse map (row -> route) the gather walks. Under ``ep_on`` it
+    also scatters gemm2's row map -- packed destination plus route weight -- for
+    the row it just resolved, reusing that row instead of recomputing it.
+
+    The caller owns the two fences this needs: ``starts`` must be visible before
+    the first trip, and every producer's slice must be done before any of them
+    reads the inverse map.
+    """
+    for route in range(c.gtid, c.nvr, c.stride):
+        row_raw = buffer_ops.buffer_load(c.rows_rsrc, route, vec_width=1, dtype=T.i32)
+        # A route with no grouped row carries the negative DROPPED_ROUTE_ROW
+        # sentinel: the row math would turn it into a wild expert index (an OOB
+        # starts[] read) and there is nothing to scatter, so leave it alone.
+        row_is_mapped = fx.Int32(row_raw) >= fx.Int32(0)
+        if row_is_mapped:
+            row = fx.Uint32(row_raw)
+            m = fx.Uint32(c.c_route_max_m)
+            expert = row // m
+            slot = row - expert * m
+            start = fx.Uint32(
+                buffer_ops.buffer_load(c.s_rsrc, expert, vec_width=1, dtype=T.i32)
+            )
+            final_row = start + slot
+            buffer_ops.buffer_store(final_row, c.rows_rsrc, route)
+            buffer_ops.buffer_store(fx.Uint32(route), c.src_rsrc, final_row)
+            if const_expr(c.ep_on):
+                w_f32 = fx.BFloat16(
+                    buffer_ops.buffer_load(c.w_rsrc, route, vec_width=1, dtype=T.bf16)
+                ).to(fx.Float32)
+                topk_v = fx.Uint32(c.c_topk)
+                t = fx.Uint32(route) // topk_v
+                k = fx.Uint32(route) - t * topk_v
+                enc = fx.Uint32(
+                    buffer_ops.buffer_load(c.tis_rsrc, t, vec_width=1, dtype=T.i32)
+                )
+                max_tok_v = fx.Uint32(c.c_max_tok)
+                origin_pe = enc // max_tok_v
+                origin_lid = enc - origin_pe * max_tok_v
+                packed = (
+                    origin_pe * fx.Uint32(c.c_slot_stride) + origin_lid * topk_v + k
+                )
+                ep_base = final_row * 2
+                buffer_ops.buffer_store(packed, c.ep_rsrc, ep_base)
+                buffer_ops.buffer_store(w_f32.bitcast(fx.Int32), c.ep_rsrc, ep_base + 1)
 
 
 def build_moe_contiguous_psum_module():

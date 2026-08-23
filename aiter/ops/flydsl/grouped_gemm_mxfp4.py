@@ -13,6 +13,19 @@ from .kernels.mega_moe_gfx1250.types import Stage2ScatterContext
 from .kernels.tensor_shim import ptr_arg
 
 _SUPPORTED_CLUSTER_N = (4, 3, 2)
+# One per device: torch hands out a null data_ptr for a 0-element tensor, which
+# is how an optional pointer argument says "absent" to the kernel. Cached so
+# saying so does not allocate on every launch.
+_NULL_ARG: dict[torch.device, torch.Tensor] = {}
+
+
+def _null_ptr_arg(like: torch.Tensor) -> torch.Tensor:
+    """A 0-element tensor on ``like``'s device: the null pointer argument."""
+    cached = _NULL_ARG.get(like.device)
+    if cached is None:
+        cached = torch.empty(0, dtype=torch.int32, device=like.device)
+        _NULL_ARG[like.device] = cached
+    return cached
 
 
 def _select_next_stage_prefetch(csv_next_stage_prefetch: int) -> int:
@@ -98,6 +111,9 @@ def flydsl_grouped_gemm_a8w4_masked(
     situ_linear_beta=1.0,
     producer_blocks=0,
     producer_rejoin=1,
+    producer_work_queue=0,
+    producer_role_ticket=0,
+    producer_persist_blocks=0,
     producer_chunk_rows=0,
     producer_total_rows=0,
     producer_topk=0,
@@ -107,6 +123,19 @@ def flydsl_grouped_gemm_a8w4_masked(
     producer_scale=None,
     producer_row_src=None,
     producer_tile_rows_done=None,
+    plan_in_kernel=0,
+    plan_route_max_m=0,
+    plan_numel=0,
+    plan_ep_scatter=0,
+    plan_max_tok=0,
+    plan_slot_stride=0,
+    plan_masked_m=None,
+    plan_rows=None,
+    plan_starts=None,
+    plan_num_valid_routes=None,
+    plan_gather_w=None,
+    plan_tis=None,
+    plan_rowmap=None,
 ):
     """Launches a contiguous-M grouped a8w4 GEMM on the TDM kernel."""
     from .kernels.mxfp4_preshuffle_gfx1250_tdm import launch_gemm_a8w4_tdm
@@ -177,6 +206,9 @@ def flydsl_grouped_gemm_a8w4_masked(
         f32_situ_linear_beta=float(situ_linear_beta),
         producer_blocks=int(producer_blocks),
         producer_rejoin=int(producer_rejoin),
+        producer_work_queue=int(producer_work_queue),
+        producer_role_ticket=int(producer_role_ticket),
+        producer_persist_blocks=int(producer_persist_blocks),
         producer_chunk_rows=int(producer_chunk_rows),
         producer_total_rows=int(producer_total_rows),
         producer_topk=int(producer_topk),
@@ -189,5 +221,24 @@ def flydsl_grouped_gemm_a8w4_masked(
         arg_prod_scale=ptr_arg(producer_scale if producer_blocks else a),
         arg_prod_row_src=ptr_arg(producer_row_src if producer_blocks else a),
         arg_prod_done=ptr_arg(producer_tile_rows_done if producer_blocks else a),
+        plan_in_kernel=int(plan_in_kernel),
+        plan_route_max_m=int(plan_route_max_m),
+        plan_numel=int(plan_numel),
+        plan_ep_scatter=int(plan_ep_scatter),
+        plan_max_tok=int(plan_max_tok),
+        plan_slot_stride=int(plan_slot_stride),
+        arg_plan_masked_m=ptr_arg(plan_masked_m if plan_in_kernel else a),
+        arg_plan_rows=ptr_arg(plan_rows if plan_in_kernel else a),
+        arg_plan_starts=ptr_arg(plan_starts if plan_in_kernel else a),
+        # Truncation is optional even with the plan fused in, so this one keeps
+        # the null-pointer convention: an empty tensor means "all routes".
+        arg_plan_nvr=ptr_arg(
+            plan_num_valid_routes
+            if plan_num_valid_routes is not None
+            else _null_ptr_arg(a)
+        ),
+        arg_plan_gather_w=ptr_arg(plan_gather_w if plan_ep_scatter else a),
+        arg_plan_tis=ptr_arg(plan_tis if plan_ep_scatter else a),
+        arg_plan_rowmap=ptr_arg(plan_rowmap if plan_ep_scatter else a),
     )
     return out
