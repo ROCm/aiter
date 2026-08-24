@@ -34,6 +34,7 @@ from .fused_solve_tril_recompute import fused_solve_tril_recompute_w_u
 
 _SUPPORTED_GFX12_ARCHS = frozenset({"gfx1200", "gfx1201"})
 
+
 def _get_arch_name(device: torch.device) -> str | None:
     try:
         props = torch.cuda.get_device_properties(device)
@@ -41,6 +42,7 @@ def _get_arch_name(device: torch.device) -> str | None:
         return arch.split(":")[0] if arch else None
     except Exception:  # noqa: BLE001
         return None
+
 
 def _is_unsupported_gfx12_runtime(device: torch.device) -> bool:
     try:
@@ -527,7 +529,8 @@ def chunk_gated_delta_rule_fwd_opt_vk(
         # pool, non-default snapshot dtype).
         # TODO: Benchmark gfx950 to see what kernel is best.
         _use_vk = (
-            _device_cu_count() >= 304 and _get_arch_name(q.device) == "gfx942"
+            _device_cu_count() >= 304
+            and _get_arch_name(q.device) == "gfx942"
             and initial_state_indices is None
             and inplace_final_state is not True
             and (snapshot_dtype is None or snapshot_dtype == k.dtype)

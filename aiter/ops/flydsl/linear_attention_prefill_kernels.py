@@ -39,7 +39,6 @@ from ..triton._triton_kernels.gated_delta_rule.utils import (
     prepare_rebased_cu_seqlens,
 )
 from .kernels.chunk_gated_delta_h import compile_chunk_gated_delta_h
-from .kernels.gdn_prepare import compile_gdn_prepare
 from .kernels.chunk_gated_delta_h_gfx942 import (
     compile_chunk_gated_delta_h_gfx942,
 )
@@ -49,6 +48,7 @@ from .kernels.chunk_gated_delta_h_gfx942 import (
 from .kernels.chunk_gated_delta_h_gfx942 import (
     select_variant as _gfx942_select_variant,
 )
+from .kernels.gdn_prepare import compile_gdn_prepare
 
 # Arch-agnostic K5 variant tag grammar + legality (shared with the gfx942 kernel
 # module -- kept in its own module to avoid an import cycle). Re-exported here so
@@ -77,10 +77,10 @@ __all__ = [
     "K5K6Fusion",
     "chunk_gated_delta_rule_fwd_h_flydsl",
     "chunk_gated_delta_rule_fwd_h_flydsl_opt",
-    "gdn_prepare_flydsl_supported",
-    "gdn_prepare_fwd_flydsl",
     "chunk_gated_delta_rule_fwd_h_o_auto",
     "chunk_gated_delta_rule_fwd_h_o_flydsl",
+    "gdn_prepare_flydsl_supported",
+    "gdn_prepare_fwd_flydsl",
     "should_use_fused_gfx942",
 ]
 

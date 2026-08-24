@@ -501,8 +501,20 @@ _CI_PREFILL_GROUPS = [
 _FULL_PREFILL_GROUPS = [
     *_k5_dense_groups("Qwen3.5-35B", 32, prompt_lens=_DENSE_PROMPT_LENS, tps=_K5_TPS),
     *_k5_dense_groups("Qwen3.5-397B", 64, prompt_lens=_DENSE_PROMPT_LENS, tps=_K5_TPS),
-    *_k5_varlen_groups("Qwen3.5-35B", 32, seqlens=_VARLEN_SEQLENS, mnbt_values=_VARLEN_TOTAL_T, tps=_K5_TPS),
-    *_k5_varlen_groups("Qwen3.5-397B", 64, seqlens=_VARLEN_SEQLENS, mnbt_values=_VARLEN_TOTAL_T, tps=_K5_TPS),
+    *_k5_varlen_groups(
+        "Qwen3.5-35B",
+        32,
+        seqlens=_VARLEN_SEQLENS,
+        mnbt_values=_VARLEN_TOTAL_T,
+        tps=_K5_TPS,
+    ),
+    *_k5_varlen_groups(
+        "Qwen3.5-397B",
+        64,
+        seqlens=_VARLEN_SEQLENS,
+        mnbt_values=_VARLEN_TOTAL_T,
+        tps=_K5_TPS,
+    ),
 ]
 
 _PREFILL_GROUPS = _FULL_PREFILL_GROUPS
@@ -2372,7 +2384,9 @@ class TestVariantSelection:
 class TestPerformance:
     def test_perf_comparison(self, args: PrefillArgs):
         if "TestPerformance" not in _current_cli_opts_raw():
-            pytest.skip("perf benchmark — run explicitly: python op_tests/test_flydsl_linear_attention_prefill.py TestPerformance")
+            pytest.skip(
+                "perf benchmark — run explicitly: python op_tests/test_flydsl_linear_attention_prefill.py TestPerformance"
+            )
         _run_perf_comparison(args)
 
 

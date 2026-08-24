@@ -27,11 +27,10 @@ Run as a script for the perf sweep (not collected by pytest):
 from __future__ import annotations
 
 import argparse
+import sys
 
 import pandas as pd
 import pytest
-import sys
-
 import torch
 
 import aiter
@@ -1022,7 +1021,7 @@ def bench_k5(model_tag, H, Hg, T_flat, N, gate, variants=None):
         + n_chunks * H * V * K  # h snapshots (one per chunk, not per sequence)
     ) * 2  # bf16
 
-    # Record what the "flydsl" (auto) candidate will actually run. 
+    # Record what the "flydsl" (auto) candidate will actually run.
     # _resolve_variant is the same chain the launcher uses.
     from aiter.ops.flydsl.linear_attention_prefill_kernels import _resolve_variant
 
@@ -1134,9 +1133,7 @@ def main():
             if kernel == "fused":
                 rows.append(bench_fused_k5k6(model_tag, H, Hg, T_flat, N, gate))
             else:
-                row = bench_k5(
-                    model_tag, H, Hg, T_flat, N, gate, variants=k5_variants
-                )
+                row = bench_k5(model_tag, H, Hg, T_flat, N, gate, variants=k5_variants)
                 # ``variants`` is a callarg so @benchmark puts it in the row;
                 # it is already encoded in the flydsl_vk:<tag> column names.
                 row.pop("variants", None)
@@ -1148,7 +1145,7 @@ def main():
             pd.DataFrame(rows).to_markdown(index=False),
         )
 
-    # Correctness gate: only flydsl_vk kernels can fail the run. 
+    # Correctness gate: only flydsl_vk kernels can fail the run.
     # Upstream hip / flydsl_opt mismatches are reported as warnings and
     # do not affect the exit status.
     if _STRICT_FAILURES:
@@ -1158,7 +1155,7 @@ def main():
             "\n  ".join(_STRICT_FAILURES),
         )
         return 1
- 
+
     return 0
 
 
