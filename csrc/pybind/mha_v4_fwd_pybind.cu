@@ -1,11 +1,20 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
+// fmha_v4_fwd is still torch (at::Tensor); the rotate_activation_* quant ops are
+// torch-free (aiter_tensor_t). rocm_ops.hpp supplies pybind11 + `namespace py` +
+// the module_aiter_core-registered aiter_tensor_t type used by the develop=True
+// marshalling; it coexists with <torch/extension.h> (see moe_topk_ck_pybind.cu).
+#include "rocm_ops.hpp"
+#include "aiter_stream.h"
 #include "torch/mha_v4_fwd.h"
-#include "torch/mha_v4_quant.h"
+#include "mha_v4_quant.h"
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
+    // Required by the develop=True rotate_activation_* ops: lets the Python
+    // marshalling push the current HIP stream into the torch-free TU.
+    AITER_SET_STREAM_PYBIND
     m.def("fmha_v4_fwd",
           &aiter::torch_itfs::fmha_v4_fwd,
           py::arg("q"),

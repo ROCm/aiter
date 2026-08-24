@@ -45,12 +45,12 @@ def mha_v4_q_multiplier(softmax_scale: float) -> float:
     return softmax_scale * MHA_V4_LOG2E
 
 
-@compile_ops("module_fmha_v4_fwd")
+@compile_ops("module_fmha_v4_fwd", develop=True)
 def rotate_activation_hd128(out: Tensor, input: Tensor) -> None:
     """Apply normalized Walsh-Hadamard rotation to contiguous hd128 rows."""
 
 
-@compile_ops("module_fmha_v4_fwd")
+@compile_ops("module_fmha_v4_fwd", develop=True)
 def rotate_activation_mxfp8_quant(
     out: Tensor,
     scale: Tensor,
@@ -60,7 +60,7 @@ def rotate_activation_mxfp8_quant(
     """Apply hd128 Walsh-Hadamard rotation and quantize directly to MXFP8."""
 
 
-@compile_ops("module_fmha_v4_fwd")
+@compile_ops("module_fmha_v4_fwd", develop=True)
 def rotate_activation_mxfp6_quant(
     out: Tensor,
     scale: Tensor,
@@ -70,7 +70,7 @@ def rotate_activation_mxfp6_quant(
     """Apply hd128 Walsh-Hadamard rotation and pack directly to MXFP6 E2M3."""
 
 
-@compile_ops("module_fmha_v4_fwd")
+@compile_ops("module_fmha_v4_fwd", develop=True)
 def rotate_activation_mxfp6_quant_k(
     out: Tensor,
     scale: Tensor,
@@ -79,7 +79,7 @@ def rotate_activation_mxfp6_quant_k(
     """Rotate and pack hd128 K directly into the MXFP6 LDS-order buffers."""
 
 
-@compile_ops("module_fmha_v4_fwd")
+@compile_ops("module_fmha_v4_fwd", develop=True)
 def rotate_activation_mxfp4_quant(
     out: Tensor,
     scale: Tensor,
@@ -89,7 +89,7 @@ def rotate_activation_mxfp4_quant(
     """Apply hd128 Walsh-Hadamard rotation and pack directly to MXFP4 E2M1."""
 
 
-@compile_ops("module_fmha_v4_fwd")
+@compile_ops("module_fmha_v4_fwd", develop=True)
 def rotate_activation_mxfp4_quant_k(
     out: Tensor,
     scale: Tensor,
