@@ -50,6 +50,7 @@ The existing experimental branch `dev/tp_fuse_gemm1_v0` is not an implementation
 7. Support CUDA Graph capture without device-to-host scalar reads or host synchronization.
 8. Keep the existing `MegaMoEV2` public API, resource ownership, and execution path unchanged.
 9. Reuse existing quantization, compact dispatch, GEMM1, SwiGLU, and output-quantization building blocks wherever their semantics match.
+10. Preserve all existing public API implementations and all existing kernel behavior. Purely additive classes, methods, helpers, and exports are allowed when they improve reuse, but existing callable bodies, signatures, defaults, layouts, and behavior remain unchanged.
 
 ## 3. Non-goals
 
@@ -61,6 +62,7 @@ The existing experimental branch `dev/tp_fuse_gemm1_v0` is not an implementation
 - No performance target, tuning work, or performance-regression gate.
 - No integration into the high-level FMoE dispatcher.
 - No conversion of the existing `MegaMoEV2` implementation to use the new class.
+- No behavioral edits to existing public APIs or existing MegaMoE/FMoE kernels.
 
 ## 4. Selected Architecture
 
@@ -76,7 +78,7 @@ Files:
   - Dedicated compile/run entry for the compact EP Stage1 kernel.
   - Ticket/epoch scheduling glue and direct FMoE metadata publication.
 - `aiter/ops/flydsl/kernels/mega_moe/__init__.py`
-  - Lazy exports for the new public types.
+  - Additive lazy exports for the new public types; existing entries and import logic remain byte-for-byte unchanged.
 - `op_tests/multigpu_tests/test_mega_moe_stage1.py`
   - Multi-rank correctness, ABI, lifetime, and CUDA Graph coverage.
 
@@ -113,6 +115,25 @@ The new path implements:
 The existing `MegaMoEV2` continues to call its existing Stage1 kernel. It is not
 changed to compose or delegate to `MegaMoEStage1`; the new kernel imports the
 shared lower-level helpers listed above directly.
+
+The following existing implementation areas are compatibility-frozen in this phase:
+
+- `aiter/ops/flydsl/kernels/mega_moe/mega_moe_v2.py`
+- `aiter/ops/flydsl/kernels/mega_moe/mega_moe_stage1.py`
+- `aiter/ops/flydsl/kernels/mega_moe/dispatch.py`
+- `aiter/ops/flydsl/kernels/mega_moe/gemm1.py`
+- `aiter/ops/flydsl/kernels/mega_moe/gemm_util.py`
+- `aiter/ops/flydsl/kernels/flydsl_dispatch_combine_intranode_op.py`
+- `aiter/fused_moe.py`
+- `aiter/ops/flydsl/kernels/mxmoe_dispatcher.py`
+
+Existing classes and functions may be imported and called. New definitions may
+also be appended to these modules or classes when that is the cleanest way to
+share behavior. However, no pre-existing callable body, signature, default,
+branch, data layout, synchronization rule, or runtime behavior may change. The
+compact top-level scheduler, which cannot be reused through an additive API, is
+implemented independently in the new kernel file. The lazy export table may gain
+the two new names without changing existing entries or import behavior.
 
 ## 5. Public API
 
@@ -504,3 +525,4 @@ The first phase is accepted when:
 7. CUDA Graph capture/replay passes without host synchronization or device scalar reads.
 8. Existing MegaMoEV2 correctness tests remain passing.
 9. No performance threshold is imposed in this phase.
+10. Diffs to pre-existing files are additive only: no pre-existing function or method implementation, signature, default, control flow, layout, or behavior is deleted or rewritten.

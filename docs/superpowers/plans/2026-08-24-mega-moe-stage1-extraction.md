@@ -17,6 +17,24 @@
 - Read and follow `AGENTS.md` plus the repository-required skills before implementation. In particular, use `karpathy-guidelines`, `superpowers:test-driven-development`, `aiter-op-test`, and `flydsl-kernel-authoring` when their trigger conditions apply.
 - Do not cherry-pick, copy, or use implementation code from `dev/tp_fuse_gemm1_v0`.
 - Do not change `MegaMoEV2` to call the new operator.
+- Treat existing public implementations and kernel behavior as compatibility-frozen:
+  - `aiter/ops/flydsl/kernels/mega_moe/mega_moe_v2.py`
+  - `aiter/ops/flydsl/kernels/mega_moe/mega_moe_stage1.py`
+  - `aiter/ops/flydsl/kernels/mega_moe/dispatch.py`
+  - `aiter/ops/flydsl/kernels/mega_moe/gemm1.py`
+  - `aiter/ops/flydsl/kernels/mega_moe/gemm_util.py`
+  - `aiter/ops/flydsl/kernels/flydsl_dispatch_combine_intranode_op.py`
+  - `aiter/fused_moe.py`
+  - `aiter/ops/flydsl/kernels/mxmoe_dispatcher.py`
+- Reuse existing callable building blocks by importing and calling them. Purely
+  additive definitions are allowed in existing modules or classes when needed:
+  new methods, new helper functions, new classes, and new export entries.
+- Do not edit any pre-existing callable body, signature, default, branch, data
+  layout, synchronization rule, or runtime behavior.
+- Reimplement the compact top-level scheduler in the new kernel file because
+  sharing it would require rewriting the existing kernel implementation.
+- In `mega_moe/__init__.py`, add the two new lazy-export mappings without
+  changing any existing mapping or the `__getattr__`/`__dir__` implementation.
 - Do not add fixed-slot support.
 - Do not add a post-Stage1 metadata conversion kernel.
 - The prequantized entry must launch exactly one fused Stage1 kernel after its inputs are available.
@@ -30,7 +48,7 @@
 - Create `aiter/ops/flydsl/kernels/mega_moe/mega_moe_fmoe_stage1.py`
   - Dedicated compact EP Stage1 compiler and launcher.
 - Modify `aiter/ops/flydsl/kernels/mega_moe/__init__.py`
-  - Lazy exports for `MegaMoEStage1` and `MegaMoEStage1Output`.
+  - Add only lazy exports for `MegaMoEStage1` and `MegaMoEStage1Output`.
 - Create `op_tests/flydsl_tests/test_mega_moe_stage1_contracts.py`
   - CPU/import-level contract and capacity tests.
 - Create `op_tests/multigpu_tests/test_mega_moe_stage1.py`
@@ -487,10 +505,11 @@ Expected: FAIL because the dedicated launcher is not implemented.
 
 - [ ] **Step 3: Create the dedicated compile/run entry**
 
-Copy `compile_mega_moe_stage1` and `run_mega_moe_stage1` from
-`mega_moe_stage1.py:71-502` into `mega_moe_fmoe_stage1.py`, rename them to
-`compile_mega_moe_fmoe_stage1` and `run_mega_moe_fmoe_stage1`, and replace the
-runtime signature with the following exact argument order:
+Use `compile_mega_moe_stage1` and `run_mega_moe_stage1` from
+`mega_moe_stage1.py:71-502` as the behavioral reference. Implement the compact
+subset independently in `mega_moe_fmoe_stage1.py` under the names
+`compile_mega_moe_fmoe_stage1` and `run_mega_moe_fmoe_stage1`, with the following
+exact runtime argument order:
 
 ```python
 def run_mega_moe_fmoe_stage1(
@@ -1413,6 +1432,25 @@ git diff --name-only $(git merge-base HEAD origin/main)..HEAD
 
 Confirm that no TP AllGather, TP all-reduce, fixed-slot support, performance gate, high-level dispatcher integration, or unrelated cleanup was introduced.
 
+Inspect additive changes to pre-existing files against the design-only baseline:
+
+```bash
+git diff --unified=0 b84c97b73 -- \
+  aiter/ops/flydsl/kernels/mega_moe/mega_moe_v2.py \
+  aiter/ops/flydsl/kernels/mega_moe/mega_moe_stage1.py \
+  aiter/ops/flydsl/kernels/mega_moe/dispatch.py \
+  aiter/ops/flydsl/kernels/mega_moe/gemm1.py \
+  aiter/ops/flydsl/kernels/mega_moe/gemm_util.py \
+  aiter/ops/flydsl/kernels/flydsl_dispatch_combine_intranode_op.py \
+  aiter/fused_moe.py \
+  aiter/ops/flydsl/kernels/mxmoe_dispatcher.py
+```
+
+Expected: either no output, or additive hunks containing only new definitions or
+new export entries. There must be no removed line (`-`, excluding the diff
+header) from a pre-existing callable. If an existing callable would need an edit,
+move the new behavior into a new helper/class/kernel instead.
+
 - [ ] **Step 6: Commit verification corrections only when files changed**
 
 If verification required a code or test correction, commit only those directly related files:
@@ -1441,4 +1479,5 @@ If no files changed, do not create an empty commit.
 - [ ] CUDA Graph capture/replay passes.
 - [ ] The target v2 GEMM2 API accepts the returned output.
 - [ ] Existing MegaMoEV2 fixed and compact correctness regressions pass.
+- [ ] Existing public API implementations have no removed or rewritten lines from commit `b84c97b73`; any existing-file changes are purely additive.
 - [ ] No performance requirement is added.
