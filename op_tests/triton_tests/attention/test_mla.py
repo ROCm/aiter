@@ -685,8 +685,8 @@ if _GLUON_AVAILABLE and DEVICE_ARCH == "gfx942":
             end = int(case.kv_indptr[batch_idx + 1].item())
             token_indices = case.kv_indices[start:end].long()
             kv = case.kv_buffer.index_select(0, token_indices)
-            k_nope = kv[:, : _GFX942_GRAPH_HEAD_DIM_CKV].float()
-            k_pe = kv[:, _GFX942_GRAPH_HEAD_DIM_CKV :].float()
+            k_nope = kv[:, :_GFX942_GRAPH_HEAD_DIM_CKV].float()
+            k_pe = kv[:, _GFX942_GRAPH_HEAD_DIM_CKV:].float()
             value = k_nope
 
             for q_pos in range(qlen):
@@ -702,9 +702,7 @@ if _GLUON_AVAILABLE and DEVICE_ARCH == "gfx942":
                     k_pe[:causal_end],
                 )
                 probs = torch.softmax(scores * _GFX942_GRAPH_SM_SCALE, dim=-1)
-                output[batch_idx, q_pos] = (probs @ value[:causal_end]).to(
-                    output.dtype
-                )
+                output[batch_idx, q_pos] = (probs @ value[:causal_end]).to(output.dtype)
 
         return output.squeeze(1) if case.q_nope.dim() == 3 else output
 
@@ -802,8 +800,8 @@ if _GLUON_AVAILABLE and DEVICE_ARCH == "gfx942":
         _mla_gluon_gfx942(
             case.q_nope,
             case.q_pe,
-            case.kv_buffer[:, : _GFX942_GRAPH_HEAD_DIM_CKV],
-            case.kv_buffer[:, _GFX942_GRAPH_HEAD_DIM_CKV :],
+            case.kv_buffer[:, :_GFX942_GRAPH_HEAD_DIM_CKV],
+            case.kv_buffer[:, _GFX942_GRAPH_HEAD_DIM_CKV:],
             case.kv_indices,
             case.kv_indptr,
             case.output,
@@ -836,8 +834,8 @@ if _GLUON_AVAILABLE and DEVICE_ARCH == "gfx942":
             _mla_gluon_gfx942(
                 case.q_nope,
                 q_pe,
-                case.kv_buffer[:, : _GFX942_GRAPH_HEAD_DIM_CKV],
-                case.kv_buffer[:, _GFX942_GRAPH_HEAD_DIM_CKV :],
+                case.kv_buffer[:, :_GFX942_GRAPH_HEAD_DIM_CKV],
+                case.kv_buffer[:, _GFX942_GRAPH_HEAD_DIM_CKV:],
                 case.kv_indices,
                 case.kv_indptr,
                 case.output,
