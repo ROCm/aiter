@@ -15,6 +15,7 @@ class UncachedIpcHeap:
     _HIP_IPC_HANDLE_BYTES = 64
     _HIP_IPC_MEM_LAZY_ENABLE_PEER_ACCESS = 0x1
     _HIP_DEVICE_MALLOC_UNCACHED = 0x3
+    _HIP_MEMCPY_HOST_TO_DEVICE = 1
     _hip = None
     _hipIpcMemHandle_t = None
 
@@ -64,6 +65,13 @@ class UncachedIpcHeap:
             ctypes.c_void_p,
             ctypes.c_int,
             ctypes.c_size_t,
+        ]
+        cls._hip.hipMemcpy.restype = ctypes.c_int
+        cls._hip.hipMemcpy.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.c_int,
         ]
         return cls._hip
 
@@ -124,6 +132,17 @@ class UncachedIpcHeap:
         return int(buf.value)
 
     @classmethod
+    def copy_host_to_device(cls, dst_ptr: int, src, nbytes: int) -> None:
+        hip = cls._load_hip()
+        err = hip.hipMemcpy(
+            ctypes.c_void_p(int(dst_ptr)),
+            src,
+            ctypes.c_size_t(nbytes),
+            ctypes.c_int(cls._HIP_MEMCPY_HOST_TO_DEVICE),
+        )
+        cls._hip_check(err, what="hipMemcpy")
+
+    @classmethod
     def free_device_mem(cls, ptr: int) -> None:
         hip = cls._load_hip()
         err = hip.hipFree(ctypes.c_void_p(ptr))
@@ -131,6 +150,11 @@ class UncachedIpcHeap:
 
     @staticmethod
     def gather_object_list_via_broadcast(group, shard_data):
+        """All-gather Python objects over ``group``.
+
+        Only torch.distributed surface. Swap this helper if another runtime
+        (e.g. JAX) needs to ship HIP IPC handles.
+        """
         import torch.distributed as dist
 
         world_size = dist.get_world_size(group=group)

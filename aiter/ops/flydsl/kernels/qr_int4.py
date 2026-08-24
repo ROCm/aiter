@@ -9,9 +9,10 @@ INT4 nibble + group-16 E4M3. Payload HBM is bf16.
 
 from __future__ import annotations
 
+import ctypes
+
 import flydsl.compiler as flyc
-import torch
-from flydsl.expr.typing import Int32, Int64
+from flydsl.expr.typing import Int32, Int64, Stream
 
 from .qr_int4_ipc import UncachedIpcHeap
 from .qr_int4_kernel import (
@@ -24,10 +25,14 @@ from .qr_int4_kernel import (
 )
 
 
+def _is_bf16(t) -> bool:
+    return str(getattr(t, "dtype", "")).endswith("bfloat16")
+
+
 class _StEngine:
     """One compile-time SUPER inbox + launch."""
 
-    def __init__(self, *, spec, group, device, rank: int, world_size: int):
+    def __init__(self, *, spec, group, rank: int, world_size: int):
         self.spec = spec
         self.launch = spec["launch"]
         self.compiled = None
@@ -40,6 +45,7 @@ class _StEngine:
         self.wire_tile_bytes = spec["wire_tile_bytes"]
         self._peer_bases = [None] * world_size
         self._buf_ptr = UncachedIpcHeap.alloc_uncached(self.buf_bytes)
+        self._meta_ptr = None
         my_handle = UncachedIpcHeap.get_mem_handle_bytes(self._buf_ptr)
         all_meta = UncachedIpcHeap.gather_object_list_via_broadcast(
             group, (my_handle, 0)
@@ -55,8 +61,21 @@ class _StEngine:
                 self._peer_bases[r] = base
                 peer_ptrs[r] = base + off
 
-        self._gpu_peer_ptrs = torch.tensor(peer_ptrs, dtype=torch.int64, device=device)
-        self._colors = torch.ones(GRID, dtype=torch.int32, device=device)
+        peer_bytes = world_size * 8
+        color_bytes = GRID * 4
+        self._meta_ptr = UncachedIpcHeap.alloc_uncached(peer_bytes + color_bytes)
+        self._gpu_peer_ptrs = self._meta_ptr
+        self._colors = self._meta_ptr + peer_bytes
+        UncachedIpcHeap.copy_host_to_device(
+            self._gpu_peer_ptrs,
+            (ctypes.c_int64 * world_size)(*peer_ptrs),
+            peer_bytes,
+        )
+        UncachedIpcHeap.copy_host_to_device(
+            self._colors,
+            (ctypes.c_int32 * GRID)(*([1] * GRID)),
+            color_bytes,
+        )
 
     def close(self):
         for b in self._peer_bases:
@@ -66,6 +85,12 @@ class _StEngine:
                 except RuntimeError:  # noqa: S110
                     pass
         self._peer_bases = []
+        if self._meta_ptr:
+            try:
+                UncachedIpcHeap.free_device_mem(self._meta_ptr)
+            except RuntimeError:  # noqa: S110
+                pass
+            self._meta_ptr = None
         if self._buf_ptr:
             try:
                 UncachedIpcHeap.free_device_mem(self._buf_ptr)
@@ -112,7 +137,6 @@ class QRInt4:
             self._by_st[st] = _StEngine(
                 spec=spec,
                 group=self.group,
-                device=self.device,
                 rank=self.rank,
                 world_size=self.world_size,
             )
@@ -130,22 +154,20 @@ class QRInt4:
             return self.super_tile
         return 1
 
-    def _launch_eng(
-        self, eng: _StEngine, inp: torch.Tensor, out: torch.Tensor, stream
-    ) -> None:
+    def _launch_eng(self, eng: _StEngine, inp, out, stream) -> None:
         live_bytes = int(inp.numel()) * int(inp.element_size())
         num_tiles = max(1, (live_bytes + TILE_BYTES - 1) // TILE_BYTES)
         grid_x = min(num_tiles, GRID)
         if stream is None:
-            stream = torch.cuda.current_stream()
+            stream = Stream(None)
         args = (
             Int32(self.rank),
             Int64(live_bytes),
             Int32(num_tiles),
             Int64(int(inp.data_ptr())),
             Int64(int(out.data_ptr())),
-            Int64(int(eng._gpu_peer_ptrs.data_ptr())),
-            Int64(int(eng._colors.data_ptr())),
+            Int64(int(eng._gpu_peer_ptrs)),
+            Int64(int(eng._colors)),
             Int32(grid_x),
             stream,
         )
@@ -154,7 +176,7 @@ class QRInt4:
         else:
             eng.compiled(*args)
 
-    def compile(self, inp: torch.Tensor, out: torch.Tensor, stream=None) -> None:
+    def compile(self, inp, out, stream=None) -> None:
         """Eager-JIT every ST binary. Optional: first ``allreduce`` JIT-compiles the picked ST.
 
         Default ST=8 also builds an ST=1 engine for ``num_tiles ≤ GRID``.
@@ -176,8 +198,8 @@ class QRInt4:
             eng.close()
         self._by_st = {}
 
-    def allreduce(self, inp: torch.Tensor, out: torch.Tensor, stream=None):
-        if inp.dtype != torch.bfloat16 or out.dtype != torch.bfloat16:
+    def allreduce(self, inp, out, stream=None):
+        if not _is_bf16(inp) or not _is_bf16(out):
             raise ValueError("QRInt4 supports bf16 input/output")
         live_bytes = int(inp.numel()) * int(inp.element_size())
         if live_bytes % 16 != 0:
