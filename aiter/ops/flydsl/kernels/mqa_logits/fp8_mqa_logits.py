@@ -387,12 +387,33 @@ KERNEL_VARIANTS = tuple(_VARIANT_BUILDERS.keys())
 DEFAULT_VARIANT = "mfma_r2_w4"
 
 
+# Smallest seq_len at which RPB=4 pays off. Below it the host padding to a
+# multiple of RPB dominates: at seq_len=1 an RPB=4 kernel computes 4 rows to
+# obtain 1. Measured crossover on gfx942 at seq_len_kv=131072 (us, best variant
+# vs the RPB=2 pick this replaces):
+#   seq_len    1 -> r2 25.2 wins, r4 79.1   (3.1x worse)
+#   seq_len    4 -> r2 24.3 wins, r4 31.5   (1.3x worse)
+#   seq_len    8 -> r4 32.9 wins by 1.03x
+#   seq_len   16 -> r4 47.5 wins by 1.19x
+#   seq_len 1024 -> r4 1520.3 wins by 1.69x
+_RPB4_MIN_SEQ_LEN = 8
+
+
 def _auto_variant(seq_len, seq_len_kv):
-    """Pick (RPB, WPB) from the problem shape: RPB=2 always; WPB=2 packs more
-    column tiles per wave when M and N are both large, else WPB=4 for more
-    wavefronts on small-M / short-window shapes."""
+    """Pick (RPB, WPB) from the problem shape.
+
+    RPB=4 amortizes each KV tile load over twice as many query rows as RPB=2 and
+    wins from ``_RPB4_MIN_SEQ_LEN`` upward, by 1.65x at the long-context prefill
+    shapes vLLM issues (seq_len 1024, seq_len_kv 131072). Below that threshold
+    the padding of seq_len up to a multiple of RPB costs more than the extra
+    reuse buys, so RPB=2 stays.
+
+    WPB=2 packs more column tiles per wave when M and N are both large, else
+    WPB=4 for more wavefronts on small-M / short-window shapes.
+    """
+    rpb = 4 if seq_len >= _RPB4_MIN_SEQ_LEN else 2
     wpb = 2 if (seq_len >= 2048 and seq_len_kv >= 8192) else 4
-    return f"mfma_r2_w{wpb}"
+    return f"mfma_r{rpb}_w{wpb}"
 
 
 def _resolve_variant(variant, seq_len, seq_len_kv):
