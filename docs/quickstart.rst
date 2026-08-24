@@ -185,6 +185,6 @@ Common Issues
 Get Help
 --------
 
-* **Documentation**: https://doc.aiter.amd.com
+* **Documentation**: https://rocm.github.io/aiter/
 * **GitHub Issues**: https://github.com/ROCm/aiter/issues
 * **ROCm Community**: https://github.com/ROCm/ROCm/discussions

@@ -1,7 +1,7 @@
 self-hosted-runner:
   labels:
-    - aiter-1gpu-runner
-    - aiter-8gpu-runner
+    - linux-aiter-oci-mi300x-1
+    - linux-aiter-oci-mi300x-8
     - aiter-di-ci-spur-login
     - aiter-di-ci-spur-login-vllm
     - aiter-gfx1100

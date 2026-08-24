@@ -7,23 +7,22 @@
 
 # Python standard library
 import functools
-import json
-import os.path
 
 # Triton
 import triton
 import triton.language as tl
 
-# AITER
-from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
+
+# AITER
+from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH, load_config_json
 
 # Kernel config.
 # ------------------------------------------------------------------------------
 
 
-@functools.lru_cache()
+@functools.lru_cache
 def get_config(
     gmm_type: str, M: int, K: int, N: int, G: int, accumulate: bool = False
 ) -> dict[str, int]:
@@ -32,25 +31,16 @@ def get_config(
         "ptgmm",
         "nptgmm",
     }, f"'{gmm_type}' is an invalid GMM variant."
-    if not hasattr(get_config, "_config_dict"):
-        dev = arch_info.get_arch()
-        config_filename = f"{AITER_TRITON_CONFIGS_PATH}/{dev}-GMM.json"
-        assert os.path.exists(config_filename) and os.path.isfile(
-            config_filename
-        ), f"'{config_filename}' isn't an existent file."
-        with open(config_filename, "r") as config_file:
-            get_config._config_dict = json.load(config_file)
-            assert all(
-                gmm_type in get_config._config_dict
-                for gmm_type in {"gmm", "ptgmm", "nptgmm"}
-            ), "Not all GMM variants are present in the configuration file."
+    dev = arch_info.get_arch()
+    config_dict = load_config_json(f"{AITER_TRITON_CONFIGS_PATH}/{dev}-GMM.json")
+    assert all(
+        variant in config_dict for variant in ("gmm", "ptgmm", "nptgmm")
+    ), "Not all GMM variants are present in the configuration file."
     # TODO: Fine tune GMM kernels and use (M, K, N, G) shape to query the best
     #       config in the dictionary.
-    assert (
-        "default" in get_config._config_dict[gmm_type]
-    ), "Default configuration is absent."
+    assert "default" in config_dict[gmm_type], "Default configuration is absent."
     key = "accumulate" if accumulate else "default"
-    return get_config._config_dict[gmm_type][key]
+    return config_dict[gmm_type][key]
 
 
 # Common code shared by GMM and TGMM kernels.
@@ -175,7 +165,7 @@ def _process_gmm_tile(
 
     acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 
-    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+    for k in range(tl.cdiv(K, BLOCK_SIZE_K)):
         if K_DIVISIBLE_BY_BLOCK_SIZE_K:
             lhs = tl.load(lhs_ptrs)
             rhs = tl.load(rhs_ptrs)
@@ -593,7 +583,7 @@ def tgmm_persistent_kernel(
             # Initialize bias accumulator
             bias_acc = tl.zeros((BLOCK_SIZE_K,), dtype=tl.float32)
 
-            for _ in range(0, loop_m):
+            for _ in range(loop_m):
                 lhs = tl.load(lhs_ptrs)
                 rhs = tl.load(rhs_ptrs)
 
@@ -764,7 +754,7 @@ def tgmm_non_persistent_kernel(
     # Initialize bias accumulator
     bias_acc = tl.zeros((BLOCK_SIZE_K,), dtype=tl.float32)
 
-    for _ in range(0, loop_m):
+    for _ in range(loop_m):
         lhs = tl.load(lhs_ptrs)
         rhs = tl.load(rhs_ptrs)
 

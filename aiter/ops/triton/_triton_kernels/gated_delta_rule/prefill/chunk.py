@@ -9,8 +9,19 @@ This module implements the chunk-based parallel computation for the gated delta 
 Note: Only forward pass is implemented. Backward pass is not supported in aiter.
 """
 
+import warnings
+from collections.abc import Sequence
+
 import torch
 
+from ..utils import (
+    GatedDeltaRulePrefillMetadata,
+    build_gated_delta_rule_prefill_metadata,
+    chunk_local_cumsum,
+    chunk_scaled_dot_kkt_fwd,
+    recompute_w_u_fwd,
+    solve_tril,
+)
 from .chunk_delta_h import (
     chunk_gated_delta_rule_fwd_h,
     chunk_gated_delta_rule_fwd_h_opt,
@@ -19,20 +30,26 @@ from .chunk_delta_h import (
 from .chunk_o import chunk_fwd_o, chunk_fwd_o_opt, chunk_fwd_o_opt_vk
 from .fused_cumsum_kkt import fused_chunk_local_cumsum_scaled_dot_kkt_fwd
 from .fused_solve_tril_recompute import fused_solve_tril_recompute_w_u
-from ..utils import (
-    chunk_local_cumsum,
-    chunk_scaled_dot_kkt_fwd,
-    recompute_w_u_fwd,
-    solve_tril,
-)
+
+_SUPPORTED_GFX12_ARCHS = frozenset({"gfx1200", "gfx1201"})
 
 
-def _is_gfx12_runtime() -> bool:
+def _is_unsupported_gfx12_runtime(device: torch.device) -> bool:
     try:
-        props = torch.cuda.get_device_properties(torch.cuda.current_device())
+        props = torch.cuda.get_device_properties(device)
+        arch = getattr(props, "gcnArchName", "")
+        arch = arch.split(":")[0] if arch else ""
+        return arch.startswith("gfx12") and arch not in _SUPPORTED_GFX12_ARCHS
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _is_gfx12_runtime(device: torch.device) -> bool:
+    try:
+        props = torch.cuda.get_device_properties(device)
         arch = getattr(props, "gcnArchName", "")
         return arch.split(":")[0].startswith("gfx12") if arch else False
-    except Exception:
+    except Exception:  # noqa: BLE001
         return False
 
 
@@ -222,11 +239,17 @@ def chunk_gated_delta_rule_fwd_opt_vk(
     cu_seqlens: torch.LongTensor | None = None,
     use_chunk_hip: bool = False,
     use_chunk_flydsl: bool = False,
+    use_prepare_flydsl: bool = False,
     state_dtype: torch.dtype | None = None,
     use_exp2: bool = True,
     o: torch.Tensor | None = None,
     num_decodes: int = 0,
     num_decode_tokens: int = 0,
+    seq_lens_cpu: Sequence[int] | None = None,
+    prefill_metadata: GatedDeltaRulePrefillMetadata | None = None,
+    initial_state_indices: torch.Tensor | None = None,
+    inplace_final_state: bool | None = None,
+    snapshot_dtype: torch.dtype | None = None,
 ):
     """
     Optimized chunk gated delta rule forward with h layout [V, K].
@@ -238,6 +261,10 @@ def chunk_gated_delta_rule_fwd_opt_vk(
     instead of Triton. When use_chunk_flydsl=True, hidden state computation
     uses the FlyDSL kernel. The two flags are mutually exclusive.
 
+    When use_prepare_flydsl=True, one FlyDSL kernel replaces the Triton prepare
+    pair without materializing `A_raw`. It preserves the pair's output contract
+    and is independent of the hidden-state choice.
+
     Args:
         q: [B, T, Hg, K]
         k: [B, T, Hg, K]
@@ -248,20 +275,28 @@ def chunk_gated_delta_rule_fwd_opt_vk(
         initial_state: optional [N, H, V, K] — note transposed h layout
         output_final_state: bool
         cu_seqlens: [N+1] optional
-        use_chunk_hip: bool — use HIP kernel for hidden state (K5)
-        use_chunk_flydsl: bool — use FlyDSL kernel for hidden state (K5)
+        use_chunk_hip: bool — use HIP kernel for hidden state
+        use_chunk_flydsl: bool — use FlyDSL kernel for hidden state
+        use_prepare_flydsl: bool — use the fused prepare kernel when supported.
+            Variable-length input also requires a prefill schedule; otherwise
+            the function warns and falls back to Triton.
         state_dtype: optional initial/final state dtype (`fp32` or `bf16`),
             supported by both the HIP and Triton hidden-state paths
         use_exp2: bool — use exp2 instead of exp for gate computation
         o: optional pre-allocated [B, T, H, V] output buffer (written in
-            place by K6). If None, a fresh buffer is allocated.
+            place by the output stage). If None, a fresh buffer is allocated.
         num_decodes / num_decode_tokens: skip a leading decode-only prefix in
-            the ORIGINAL cu_seqlens (data tensors are expected pre-sliced).
-            Threaded into every stage; the cached prologue helpers
-            (prepare_chunk_indices / prepare_chunk_offsets /
-            prepare_rebased_cu_seqlens) key on the original cu_seqlens identity,
-            so chunk-index / offset builds stay cache-warm across forwards
-            (no per-forward .tolist() D2H).
+            the original cu_seqlens; data tensors contain only prefill tokens.
+        seq_lens_cpu: Host-resident sequence lengths used to build a schedule.
+        prefill_metadata: Prebuilt reusable host/device schedule. This is the
+            preferred path when multiple layers process the same batch.
+        initial_state_indices: Optional ``[N]`` state-pool slot indices. When
+            provided, K5 gathers from and writes back to ``initial_state`` in
+            place. Supported by the HIP and Triton VK K5 paths only.
+        inplace_final_state: Controls in-place K5 state-pool write-back. It
+            defaults to ``True`` when ``initial_state_indices`` is provided.
+        snapshot_dtype: optional temporary chunk snapshot dtype (`fp32` or
+            `bf16`). Defaults to `k.dtype` and is independent of state_dtype.
 
     Returns:
         tuple: (g_cumsum, o, final_state) where:
@@ -274,30 +309,99 @@ def chunk_gated_delta_rule_fwd_opt_vk(
             "use_chunk_hip and use_chunk_flydsl are mutually exclusive; "
             "set at most one."
         )
-    if use_chunk_hip and (_is_gfx12_runtime() or num_decodes > 0):
+    if use_chunk_flydsl and (
+        initial_state_indices is not None or inplace_final_state is True
+    ):
+        raise ValueError(
+            "Indexed state pools and in-place final-state write-back are not "
+            "supported by the FlyDSL K5 path."
+        )
+    if cu_seqlens is None:
+        if seq_lens_cpu is not None or prefill_metadata is not None:
+            raise ValueError(
+                "`seq_lens_cpu` and `prefill_metadata` require `cu_seqlens`."
+            )
+    elif prefill_metadata is None and seq_lens_cpu is not None:
+        prefill_metadata = build_gated_delta_rule_prefill_metadata(
+            seq_lens_cpu,
+            cu_seqlens=cu_seqlens,
+            chunk_size=64,
+            num_decodes=num_decodes,
+            num_decode_tokens=num_decode_tokens,
+        )
+
+    if use_chunk_hip and (
+        _is_unsupported_gfx12_runtime(q.device)
+        or (num_decodes > 0 and prefill_metadata is None)
+    ):
         use_chunk_hip = False
+    if use_chunk_flydsl:
+        if _is_unsupported_gfx12_runtime(q.device):
+            use_chunk_flydsl = False
+        elif k.dtype != torch.bfloat16 or k.shape[-1] != 128 or v.shape[-1] != 128:
+            raise ValueError(
+                "use_chunk_flydsl requires bfloat16 inputs with K=128 and V=128; "
+                f"got dtype={k.dtype}, K={k.shape[-1]}, V={v.shape[-1]}."
+            )
 
-    g_cumsum, A_raw = fused_chunk_local_cumsum_scaled_dot_kkt_fwd(
-        k=k,
-        beta=beta,
-        g=g,
-        cu_seqlens=cu_seqlens,
-        use_exp2=use_exp2,
-        num_decodes=num_decodes,
-        num_decode_tokens=num_decode_tokens,
-    )
+    if use_prepare_flydsl:
+        from aiter.ops.flydsl.linear_attention_prefill_kernels import (
+            gdn_prepare_flydsl_supported,
+        )
 
-    w, u = fused_solve_tril_recompute_w_u(
-        A_raw=A_raw,
-        k=k,
-        v=v,
-        beta=beta,
-        g_cumsum=g_cumsum,
-        cu_seqlens=cu_seqlens,
-        use_exp2=use_exp2,
-        num_decodes=num_decodes,
-        num_decode_tokens=num_decode_tokens,
-    )
+        # Unsupported configurations keep the Triton prepare path.
+        use_prepare_flydsl = gdn_prepare_flydsl_supported(k, v)
+
+    # Warn only when the prefill schedule is the missing requirement.
+    if use_prepare_flydsl and cu_seqlens is not None and prefill_metadata is None:
+        warnings.warn(
+            "use_prepare_flydsl needs a prefill schedule for a varlen batch; "
+            "pass seq_lens_cpu or prefill_metadata to enable the fused prepare "
+            "kernel. Falling back to the Triton prepare pair.",
+            stacklevel=2,
+        )
+        use_prepare_flydsl = False
+
+    if use_prepare_flydsl:
+        from aiter.ops.flydsl.linear_attention_prefill_kernels import (
+            gdn_prepare_fwd_flydsl,
+        )
+
+        w, u, g_cumsum = gdn_prepare_fwd_flydsl(
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            cu_seqlens=cu_seqlens,
+            use_exp2=use_exp2,
+            num_decodes=num_decodes,
+            num_decode_tokens=num_decode_tokens,
+            prefill_metadata=prefill_metadata,
+        )
+    else:
+        g_cumsum, A_raw = fused_chunk_local_cumsum_scaled_dot_kkt_fwd(
+            k=k,
+            beta=beta,
+            g=g,
+            cu_seqlens=cu_seqlens,
+            use_exp2=use_exp2,
+            num_decodes=num_decodes,
+            num_decode_tokens=num_decode_tokens,
+            prefill_metadata=prefill_metadata,
+        )
+
+        w, u = fused_solve_tril_recompute_w_u(
+            A_raw=A_raw,
+            k=k,
+            v=v,
+            beta=beta,
+            g_cumsum=g_cumsum,
+            cu_seqlens=cu_seqlens,
+            use_exp2=use_exp2,
+            num_decodes=num_decodes,
+            num_decode_tokens=num_decode_tokens,
+            prefill_metadata=prefill_metadata,
+        )
 
     if use_chunk_hip:
         from aiter.ops.chunk_gated_delta_rule_fwd_h import (
@@ -313,19 +417,27 @@ def chunk_gated_delta_rule_fwd_opt_vk(
             output_final_state=output_final_state,
             cu_seqlens=cu_seqlens,
             state_dtype=state_dtype,
+            snapshot_dtype=snapshot_dtype,
             use_exp2=use_exp2,
             g_head_major=True,
+            prefill_metadata=prefill_metadata,
+            num_decodes=num_decodes,
+            num_decode_tokens=num_decode_tokens,
+            initial_state_indices=initial_state_indices,
+            inplace_final_state=inplace_final_state,
         )
     elif use_chunk_flydsl:
-        # FlyDSL K5 wrapper expects ``g`` in head-major [B, H, T] layout
-        # (matches Triton VK / HIP). ``g_cumsum`` from K1+K2 is already
-        # head-major, so pass it through directly. The wrapper accepts
-        # ``use_exp2`` as a kwarg and pre-scales ``gk`` internally.
+        if snapshot_dtype is not None and snapshot_dtype != k.dtype:
+            raise ValueError(
+                "FlyDSL K5 does not support overriding `snapshot_dtype`; "
+                "omit it or pass `k.dtype`."
+            )
+        # Prepare emits head-major ``g_cumsum``.
         from aiter.ops.flydsl.linear_attention_prefill_kernels import (
-            chunk_gated_delta_rule_fwd_h_flydsl,
+            chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip,
         )
 
-        h, v_new, final_state = chunk_gated_delta_rule_fwd_h_flydsl(
+        h, v_new, final_state = chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(
             k=k,
             w=w,
             u=u,
@@ -337,6 +449,8 @@ def chunk_gated_delta_rule_fwd_opt_vk(
             use_exp2=use_exp2,
             num_decodes=num_decodes,
             num_decode_tokens=num_decode_tokens,
+            g_head_major=True,
+            prefill_metadata=prefill_metadata,
         )
     else:
         h, v_new, final_state = chunk_gated_delta_rule_fwd_h_opt_vk(
@@ -349,8 +463,12 @@ def chunk_gated_delta_rule_fwd_opt_vk(
             cu_seqlens=cu_seqlens,
             use_exp2=use_exp2,
             state_dtype=state_dtype,
+            snapshot_dtype=snapshot_dtype,
             num_decodes=num_decodes,
             num_decode_tokens=num_decode_tokens,
+            initial_state_indices=initial_state_indices,
+            inplace_final_state=inplace_final_state,
+            prefill_metadata=prefill_metadata,
         )
 
     if o is None:
@@ -369,6 +487,7 @@ def chunk_gated_delta_rule_fwd_opt_vk(
         use_exp2=use_exp2,
         num_decodes=num_decodes,
         num_decode_tokens=num_decode_tokens,
+        prefill_metadata=prefill_metadata,
     )
 
     return g_cumsum, o, final_state

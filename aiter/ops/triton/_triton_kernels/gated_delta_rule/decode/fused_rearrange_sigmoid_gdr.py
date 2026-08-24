@@ -116,7 +116,7 @@ def fused_rearrange_sigmoid_gated_delta_rule_update_kernel(
         p_h0 = p_h0 + i_hv * V * K + o_v[:, None] * K + o_k[None, :]
         b_h += tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
 
-    for i_t in range(0, T):
+    for i_t in range(T):
         b_q = tl.load(p_q, mask=mask_k, other=0).to(tl.float32)
         b_k = tl.load(p_k, mask=mask_k, other=0).to(tl.float32)
         b_v = tl.load(p_v, mask=mask_v, other=0).to(tl.float32)

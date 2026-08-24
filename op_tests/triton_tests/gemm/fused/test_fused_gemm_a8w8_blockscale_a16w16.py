@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import torch
-import triton
 import pytest
+import torch
+import torch.nn.functional as F
+import triton
+
 from aiter.ops.triton.gemm.fused.fused_gemm_a8w8_blockscale_a16w16 import (
     fused_gemm_a8w8_blockscale_a16w16,
 )
@@ -16,7 +18,6 @@ from op_tests.triton_tests.gemm.basic.test_gemm_a8w8_blockscale import (
 from op_tests.triton_tests.gemm.basic.test_gemm_a16w16 import (
     generate_gemm_a16w16_inputs,
 )
-import torch.nn.functional as F
 
 block_shape = (128, 128)
 

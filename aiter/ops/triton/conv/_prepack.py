@@ -15,6 +15,7 @@ weight is a cache hit, making the steady-state repack cost negligible.
 
 import os
 from collections import OrderedDict
+
 import torch
 
 from aiter.ops.triton.conv._utils import BLOCK_K, _storage_ptr
@@ -44,7 +45,7 @@ class _LRUPackCache:
     cannot be reused by a different tensor while this entry lives."""
 
     def __init__(self, maxsize: int = _PACK_CACHE_MAXSIZE):
-        self._d: "OrderedDict[tuple, tuple]" = OrderedDict()
+        self._d: OrderedDict[tuple, tuple] = OrderedDict()
         self._max = max(1, maxsize)
 
     def get(self, key):

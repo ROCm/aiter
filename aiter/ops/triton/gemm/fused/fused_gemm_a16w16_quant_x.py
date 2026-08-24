@@ -1,17 +1,17 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-from typing import Optional, Tuple
 import torch
 import triton
+
+from aiter.ops.triton._triton_kernels.activation import _get_activation_from_str
+from aiter.ops.triton._triton_kernels.common.splitk_reduce import (
+    _gemm_splitk_reduce_kernel,
+)
 from aiter.ops.triton._triton_kernels.gemm.fused.fused_gemm_a16w16_quant_x import (
     _fused_gemm_a16w16_quant_x_kernel,
     _get_config,
 )
-from aiter.ops.triton._triton_kernels.common.splitk_reduce import (
-    _gemm_splitk_reduce_kernel,
-)
-from aiter.ops.triton._triton_kernels.activation import _get_activation_from_str
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
@@ -22,16 +22,16 @@ _QUANT_BLOCK_SIZE = 32
 def fused_gemm_a16w16_quant_x(
     x,
     w,
-    bias: Optional[torch.Tensor] = None,
-    dtype: Optional[torch.dtype] = torch.bfloat16,
-    quant_dtype: Optional[torch.dtype] = None,
-    y: Optional[torch.Tensor] = None,
-    x_quant: Optional[torch.Tensor] = None,
-    x_scales: Optional[torch.Tensor] = None,
-    config: Optional[dict] = None,
-    activation: Optional[str] = None,
-    skip_reduce: Optional[bool] = False,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    bias: torch.Tensor | None = None,
+    dtype: torch.dtype | None = torch.bfloat16,
+    quant_dtype: torch.dtype | None = None,
+    y: torch.Tensor | None = None,
+    x_quant: torch.Tensor | None = None,
+    x_scales: torch.Tensor | None = None,
+    config: dict | None = None,
+    activation: str | None = None,
+    skip_reduce: bool | None = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Computes 16-bit matmul Y = X @ W^T and also emits an MXFP8-quantized X.
 
@@ -108,7 +108,7 @@ def fused_gemm_a16w16_quant_x(
     else:
         y_pp = None
 
-    grid = lambda META: (  # noqa: E731
+    grid = lambda META: (
         META["NUM_KSPLIT"]
         * triton.cdiv(M, META["BLOCK_SIZE_M"])
         * triton.cdiv(N, META["BLOCK_SIZE_N"])

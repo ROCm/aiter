@@ -110,7 +110,7 @@ __global__ void splitk_reduce_kernel(
     const int b = bm_id / M;
     const int m = bm_id - b * M;
 
-    // ── Bias prefetch (per-N vector load) ──────────────────────────────────
+    // -- Bias prefetch (per-N vector load) ----------------------------------
     // Bias is per-output-feature [N] (F.linear convention). Each thread
     // loads VEC bias values at its own n_base. Fired before the split-K
     // accumulation so the vmem loads overlap.
@@ -200,7 +200,7 @@ __global__ void splitk_reduce_kernel(
                     c_idx + g * STEP);
             });
         } else if (n_base < N) {
-            // Tail path: decompose valid ∈ [1, VEC-1] into descending
+            // Tail path: decompose valid ? [1, VEC-1] into descending
             // power-of-2 chunks so we emit dwordx4/dwordx2/dword/short
             // instead of VEC scalar stores.
             // Ref: demon_gcn/opus_gemm/mxfp8_e8m0/gemm_mxfp_a8w8_1d1d.hpp
@@ -256,4 +256,72 @@ __global__ void splitk_reduce_kernel(
     // Non-gfx950 device pass: empty stub. See gfx950 branch above.
 #endif  // __gfx950__
 #endif  // __HIP_DEVICE_COMPILE__
+}
+
+// -- opus_bmm_splitk_reduce_kernel ------------------------------------------
+// mmajor batched-matmul split-K reduce. Sums the fp32 split-K workspace along
+// the split axis and casts to D_OUT, writing an mmajor C tensor whose row
+// (M) and batch strides are passed explicitly (stride_c / stride_c_batch).
+// Distinct from splitk_reduce_kernel above (no bias fold, mmajor C strides,
+// VEC/BLOCK defaults tuned for the BMM launcher's 8x128 grid). Lives here so
+// the codegen'd a8w8_mxscale BMM launcher (.device.cu / fused host TU) can
+// reference it; the explicit instantiations are emitted alongside the baseline
+// reduce into splitk_reduce_gfx950.device.cu (gen_instances_gfx950.py's
+// splitk_reduce_extra hook).
+template <typename D_OUT, int VEC = 16, int BLOCK = 64>
+__global__ void opus_bmm_splitk_reduce_kernel(
+    const opus_splitk_ws_handle* __restrict__ ws_handle,
+    D_OUT* __restrict__ out,
+    int split_k, int M, int N, int batch,
+    int padded_M, int padded_N,
+    int stride_c, int stride_c_batch)
+{
+#ifdef __HIP_DEVICE_COMPILE__
+#if defined(__gfx950__)
+  using namespace opus;
+  constexpr int STEP = 16 / sizeof(D_OUT);
+  static_assert(VEC % STEP == 0);
+
+  const int bm_id = int(block_id_y());
+  const int n_base = (int(block_id_x()) * BLOCK + int(thread_id_x())) * VEC;
+  if (bm_id >= batch * M || n_base >= N) return;
+  const int b = bm_id / M;
+  const int m = bm_id - b * M;
+
+  const float* __restrict__ workspace =
+      reinterpret_cast<const float*>(ws_handle->ptr);
+  const long split_stride = (long)batch * padded_M * padded_N;
+  const int base = b * padded_M * padded_N + m * padded_N + n_base;
+  auto g_ws = make_gmem(workspace, (unsigned int)(split_stride * split_k * sizeof(float)));
+  vector_t<float, VEC> acc;
+  static_for<VEC>([&](auto i) { acc[i.value] = 0.0f; });
+  for (int s = 0; s < split_k; ++s) {
+    #pragma unroll
+    for (int g = 0; g < VEC / 4; ++g) {
+      auto v = g_ws.template load<4>((long)s * split_stride + base + g * 4);
+      static_for<4>([&](auto j) { acc[g * 4 + j.value] += v[j.value]; });
+    }
+  }
+
+  vector_t<D_OUT, VEC> out_v;
+  static_for<VEC>([&](auto i) { out_v[i.value] = static_cast<D_OUT>(acc[i.value]); });
+  const int c_idx = b * stride_c_batch + m * stride_c + n_base;
+  const size_t c_records =
+      (size_t)(M - 1) * (size_t)stride_c
+    + (size_t)(batch - 1) * (size_t)stride_c_batch
+    + (size_t)N;
+  auto g_c = make_gmem(out, (unsigned int)(c_records * sizeof(D_OUT)));
+  if (n_base + VEC <= N) {
+    static_for<VEC / STEP>([&](auto group) {
+      constexpr int off = group.value * STEP;
+      g_c.template store<STEP>(slice(out_v, number<off>{}, number<off + STEP>{}), c_idx + off);
+    });
+  } else {
+    #pragma unroll
+    for (int i = 0; i < VEC; ++i) {
+      if (n_base + i < N) g_c.template store<1>(out_v[i], c_idx + i);
+    }
+  }
+#endif
+#endif
 }

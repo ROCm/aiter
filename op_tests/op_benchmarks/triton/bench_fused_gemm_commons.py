@@ -2,9 +2,9 @@ import torch
 import triton
 
 from op_tests.op_benchmarks.triton.utils.argparse import (
-    get_parser,
     add_argparse_ff,
     get_ff_args,
+    get_parser,
 )
 from op_tests.triton_tests.fusions.test_fused_mul_add import (
     generate_fused_mul_add_inputs,
@@ -120,7 +120,7 @@ def run_fused_benchmark(
         )
     for arg in unsupported_args:
         if getattr(args, arg, None) != getattr(defaults, arg, None):
-            raise Exception(f"Argument '{arg}' is not supported for {kernel_label}.")
+            raise RuntimeError(f"Argument '{arg}' is not supported for {kernel_label}.")
     run_fused_shape_benchmark(args, x_names, bench_fn, get_x_vals, plot_name)
 
 

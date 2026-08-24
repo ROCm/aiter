@@ -9,15 +9,12 @@ This module provides an alternative using the HIP VMM API
 which exports a POSIX fd that can be passed across processes via Unix sockets.
 """
 
+import array
 import ctypes
 import os
 import socket
 import struct
-import array
 import threading
-from typing import List
-
-from aiter import logger
 
 
 def load_hip_runtime() -> ctypes.CDLL:
@@ -155,7 +152,7 @@ class VMMBuffer:
 
         self._set_access([device_id])
 
-    def _set_access(self, device_ids: List[int]):
+    def _set_access(self, device_ids: list[int]):
         for dev in device_ids:
             desc = _hipMemAccessDesc(_DEVICE, dev, _READ_WRITE)
             _check(
@@ -187,7 +184,7 @@ class VMMBuffer:
         fd: int,
         alloc_size: int,
         local_device_id: int,
-        access_device_ids: List[int],
+        access_device_ids: list[int],
     ) -> "VMMBuffer":
         obj = object.__new__(cls)
         obj._device_id = local_device_id
@@ -271,7 +268,7 @@ def _recv_fd(sock_path: str, timeout: float = 120.0) -> int:
         server.settimeout(timeout)
         conn, _ = server.accept()
         with conn:
-            msg, ancdata, _, _ = conn.recvmsg(
+            _msg, ancdata, _, _ = conn.recvmsg(
                 1, socket.CMSG_LEN(ctypes.sizeof(ctypes.c_int))
             )
             for cmsg_level, cmsg_type, cmsg_data in ancdata:
@@ -289,8 +286,8 @@ def vmm_exchange(
     local_buf: VMMBuffer,
     store,
     ranks_tag: str,
-    all_device_ids: List[int],
-) -> List[int]:
+    all_device_ids: list[int],
+) -> list[int]:
     """Exchange a VMMBuffer across all ranks and return device pointers.
 
     Each rank exports its buffer as an fd, sends it to every other rank via
@@ -323,7 +320,7 @@ def vmm_exchange(
     def _do_recv(src_rank, path):
         try:
             received_fds[src_rank] = _recv_fd(path)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             recv_errors[src_rank] = e
 
     threads = []

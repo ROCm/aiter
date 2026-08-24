@@ -14,20 +14,20 @@ Usage:
   python op_tests/op_benchmarks/triton/bench_sparse_attention_dsv4.py --shapes prefill
 """
 
-from aiter.ops.triton._triton_kernels.attention.sparse_attention_dsv4 import (
-    _sparse_attn_prefill_kernel as csa_prefill_tl,
-)
-
 import argparse
 
 import torch
 import triton
 
+from aiter.ops.triton._triton_kernels.attention.sparse_attention_dsv4 import (
+    _sparse_attn_prefill_kernel as csa_prefill_tl,
+)
+
 # The Gluon prefill kernel is opt-in (gfx950 + Triton >= 3.6). Probe it once at
 # import time; the benchmark falls back to Triton-only when unavailable.
 try:
-    from aiter.ops.triton.gluon.mla_gluon import mla_gluon
     from aiter.jit.utils.chip_info import get_gfx
+    from aiter.ops.triton.gluon.mla_gluon import mla_gluon
 
     HAS_GLUON = get_gfx() == "gfx950"
 except ImportError:
@@ -222,7 +222,7 @@ def run_prefill_bench(args, device: str):
             + num_queries * num_heads * HEAD_DIM * 2
         )
 
-        def _perf(ms):
+        def _perf(ms, bytes_moved=bytes_moved, flops=flops):
             return flops / (ms * 1e-3) / 1e12, bytes_moved / (ms * 1e-3) / 1e9
 
         tri_ms = _time_backend(
@@ -234,7 +234,7 @@ def run_prefill_bench(args, device: str):
             glu_ms = _time_backend(
                 "gluon", q, kv, indices, indptr, num_queries, num_heads, scale
             )
-            glu_tflops, glu_gbps = _perf(glu_ms)
+            glu_tflops, _glu_gbps = _perf(glu_ms)
             speedup = tri_ms / glu_ms if glu_ms > 0 else float("nan")
             rows.append(
                 (
@@ -334,7 +334,7 @@ def check_correctness(device: str):
             max_diff = (out.float() - ref.float()).abs().max().item()
             torch.testing.assert_close(out.float(), ref.float(), atol=1e-2, rtol=1e-2)
             print(
-                f"  {backend:6s} sink={str(has_sink):5s}: OK (max|delta|={max_diff:.4f})"
+                f"  {backend:6s} sink={has_sink!s:5s}: OK (max|delta|={max_diff:.4f})"
             )
 
 

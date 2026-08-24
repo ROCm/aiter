@@ -3,16 +3,17 @@
 
 import pytest
 import torch
+
 import aiter
-from aiter.ops.triton.utils.types import str_to_torch_dtype
 from aiter.ops.triton.normalization.rmsnorm import (
     rms_norm,
     rmsnorm2d_fwd_with_add,
-    rmsnorm2d_fwd_with_smoothquant,
-    rmsnorm2d_fwd_with_dynamicquant,
-    rmsnorm2d_fwd_with_add_smoothquant,
     rmsnorm2d_fwd_with_add_dynamicquant,
+    rmsnorm2d_fwd_with_add_smoothquant,
+    rmsnorm2d_fwd_with_dynamicquant,
+    rmsnorm2d_fwd_with_smoothquant,
 )
+from aiter.ops.triton.utils.types import str_to_torch_dtype
 
 
 def generate_rmsnorm_inputs(M, N, dtype):
@@ -23,7 +24,7 @@ def generate_rmsnorm_inputs(M, N, dtype):
 
 
 def torch_rmsnorm(x, g, out_dtype=torch.float16, epsilon=1e-6):
-    M, N = x.shape
+    _M, N = x.shape
     # cast to float32 as the triton kernel
     x_f32 = x.float()
     g_f32 = g.float()

@@ -20,6 +20,14 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
+  ci_config:
+    if: >-
+      github.event_name != 'pull_request' ||
+      (github.event.pull_request.draft == false &&
+      (contains(github.event.pull_request.labels.*.name, 'ci:sglang') ||
+      contains(github.event.pull_request.labels.*.name, 'ci:all')))
+    uses: ./.github/workflows/ci-config.yaml
+
   check-signal:
     if: >-
       github.event_name != 'pull_request' ||
@@ -61,7 +69,7 @@ jobs:
   sglang:
     if: needs.select-sglang-tests.outputs.has_tests == 'true'
     name: Sglang ${{ matrix.model }} ${{ matrix.test_type }} (8 GPU)
-    needs: [check-signal, select-sglang-tests]
+    needs: [check-signal, select-sglang-tests, ci_config]
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -86,17 +94,18 @@ jobs:
           SGLANG_WORKSPACE="${RUNNER_TEMP}/sglang-downstream"
           rm -rf "${SGLANG_WORKSPACE}"
           git clone --depth 1 -b ${SGL_BRANCH} https://github.com/sgl-project/sglang.git "${SGLANG_WORKSPACE}"
-          test -d "${SGLANG_WORKSPACE}/sgl-kernel"
+          test -d "${SGLANG_WORKSPACE}/python/sglang/kernels/aot"
           test -d "${SGLANG_WORKSPACE}/python"
           echo "SGLANG_WORKSPACE=${SGLANG_WORKSPACE}" >> "${GITHUB_ENV}"
 
       - name: Docker login
         if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork }}
         env:
-          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+          DOCKER_USERNAME: ${{ secrets[needs.ci_config.outputs.docker_username_secret] }}
+          DOCKER_PASSWORD: ${{ secrets[needs.ci_config.outputs.docker_password_secret] }}
         run: |
           for attempt in 1 2 3; do
-            if echo "$DOCKER_PASSWORD" | docker login -u rocmshared --password-stdin; then
+            if echo "$DOCKER_PASSWORD" | docker login -u "$DOCKER_USERNAME" --password-stdin; then
               echo "Docker login succeeded on attempt ${attempt}"
               exit 0
             fi
@@ -116,8 +125,8 @@ jobs:
           set -ex
           docker rm -f ci_sglang || true
           cd "${SGLANG_WORKSPACE}"
-          GITHUB_WORKSPACE="${SGLANG_WORKSPACE}" HF_TOKEN="${{ secrets.HF_TOKEN_TEST }}" bash scripts/ci/amd/amd_ci_start_container.sh
-          docker exec ci_sglang bash -lc 'pwd; ls -la /sglang-checkout; test -d /sglang-checkout/sgl-kernel; test -d /sglang-checkout/python; test -d /models'
+          GITHUB_WORKSPACE="${SGLANG_WORKSPACE}" HF_TOKEN="${{ secrets.HF_TOKEN_TEST }}" bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+          docker exec ci_sglang bash -lc 'pwd; ls -la /sglang-checkout; test -d /sglang-checkout/python/sglang/kernels/aot; test -d /sglang-checkout/python; test -d /models'
 
       - name: Setup pip config
         run: |

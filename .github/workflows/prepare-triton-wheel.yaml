@@ -5,14 +5,12 @@ on:
     inputs:
       docker-image:
         description: Docker image used to resolve and download the matching Triton wheel.
-        required: false
+        required: true
         type: string
-        default: rocm/pytorch:latest
       artifact-name:
         description: Name of the Triton wheel artifact uploaded for the caller workflow run.
-        required: false
+        required: true
         type: string
-        default: triton_wheelhouse
       retention-days:
         description: Number of days to keep the Triton wheel artifact.
         required: false

@@ -1,20 +1,21 @@
 import torch
 import triton
+
 from aiter.ops.triton.gemm.fused.fused_gemm_afp4wfp4_mul_add import (
     fused_gemm_afp4wfp4_mul_add,
 )
-from op_tests.triton_tests.gemm.basic.test_gemm_afp4wfp4 import (
-    generate_gemm_afp4wfp4_inputs,
-)
-from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
-    print_vgpr,
-    get_caller_name_no_ext,
-)
 from op_tests.op_benchmarks.triton.bench_fused_gemm_commons import (
+    make_mul_add_ab,
     metric_to_scalar,
     parse_fused_args,
     run_fused_benchmark,
-    make_mul_add_ab,
+)
+from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    get_caller_name_no_ext,
+    print_vgpr,
+)
+from op_tests.triton_tests.gemm.basic.test_gemm_afp4wfp4 import (
+    generate_gemm_afp4wfp4_inputs,
 )
 
 dimension = ["M", "N", "K"]
@@ -86,7 +87,7 @@ def bench_fn(M: int, N: int, K: int, metric: str, **kwargs):
     )
 
     ms = triton.testing.do_bench(
-        lambda: fused_gemm_afp4wfp4_mul_add(  # noqa: E731
+        lambda: fused_gemm_afp4wfp4_mul_add(
             x_fp4,
             w_fp4_triton,
             x_fp4_scale_triton,
@@ -126,7 +127,7 @@ def get_x_vals(args=None):
 def main(args: list[str] | None = None) -> None:
     parsed_args, defaults = parse_fused_args(kernel_name, args=args)
     plot_name = get_caller_name_no_ext()
-    run = lambda: run_fused_benchmark(  # noqa: E731
+    run = lambda: run_fused_benchmark(
         parsed_args,
         defaults,
         kernel_label,

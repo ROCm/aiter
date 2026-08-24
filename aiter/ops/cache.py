@@ -3,7 +3,7 @@
 
 import torch
 from torch import Tensor
-from typing import Optional
+
 from ..jit.core import compile_ops
 
 MD_NAME = "module_cache"
@@ -27,8 +27,8 @@ def reshape_and_cache(
     value_cache: torch.Tensor,
     slot_mapping: torch.Tensor,
     kv_cache_dtype: str,
-    k_scale: Optional[torch.Tensor] = None,
-    v_scale: Optional[torch.Tensor] = None,
+    k_scale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
     asm_layout: bool = False,
 ) -> None: ...
 
@@ -169,6 +169,9 @@ def fused_qk_rope_concat_and_cache_mla(
     sin_cache: Tensor,  # [max_position, rot_dim//2]
     is_neox: bool,
     is_nope_first: bool,
+    # False (default, non-DCP): slot<0 tokens early-return (skip Q RoPE + q_out).
+    # True (DCP): compute Q RoPE for every token (needed after head all-gather).
+    compute_all_q_rope: bool = False,
 ) -> None: ...
 
 

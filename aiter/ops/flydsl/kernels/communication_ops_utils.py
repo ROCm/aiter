@@ -15,19 +15,26 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from typing import Dict, Tuple
 
+import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as _llvm_d
 from flydsl.expr import arith
 
 __all__ = [
+    "GeometryTuningTable",
+    "atomic_add_agent",
+    "atomic_add_global_at",
+    "atomic_add_system",
+    "fence_acquire",
+    "fence_agent_acquire",
+    "fence_agent_release",
+    "fence_release",
+    "fence_system_acquire",
+    "fence_system_release",
+    "load_i64_global",
     "store_i32_system",
     "store_i64_global_system",
-    "fence_system_acquire",
-    "load_i64_global",
-    "atomic_add_global_at",
-    "GeometryTuningTable",
 ]
 
 
@@ -73,9 +80,34 @@ def store_i64_global_system(addr_i64, val):
     )
 
 
+def fence_acquire(syncscope):
+    """Emit an acquire fence for the selected AMDGPU memory scope."""
+    _llvm_d.FenceOp(_llvm_d.AtomicOrdering.acquire, syncscope=syncscope)
+
+
+def fence_release(syncscope):
+    """Emit a release fence for the selected AMDGPU memory scope."""
+    _llvm_d.FenceOp(_llvm_d.AtomicOrdering.release, syncscope=syncscope)
+
+
 def fence_system_acquire():
     """System-scope acquire fence."""
-    _llvm_d.FenceOp(_llvm_d.AtomicOrdering.acquire, syncscope="one-as")
+    fence_acquire(fx.rocdl.SyncScope.OneAs)
+
+
+def fence_system_release():
+    """System-scope release fence."""
+    fence_release(fx.rocdl.SyncScope.OneAs)
+
+
+def fence_agent_acquire():
+    """Agent-scope acquire fence."""
+    fence_acquire(fx.rocdl.SyncScope.AgentOneAs)
+
+
+def fence_agent_release():
+    """Agent-scope release fence."""
+    fence_release(fx.rocdl.SyncScope.AgentOneAs)
 
 
 def load_i64_global(addr_i64):
@@ -85,15 +117,27 @@ def load_i64_global(addr_i64):
     return _llvm_d.LoadOp(_i64, ptr, alignment=8).result
 
 
-def atomic_add_global_at(addr_i64, val):
-    """Monotonic global ``atomic fetch-and-add``; returns the old value."""
+def atomic_add_global_at(addr_i64, val, syncscope="one-as"):
+    """Monotonic global fetch-add with configurable agent/system visibility."""
     ptr = _to_ptr_global(addr_i64)
+    kwargs = {} if syncscope is None else {"syncscope": syncscope}
     return _llvm_d.AtomicRMWOp(
         _llvm_d.AtomicBinOp.add,
         ptr,
         arith.unwrap(val),
         _llvm_d.AtomicOrdering.monotonic,
+        **kwargs,
     ).res
+
+
+def atomic_add_agent(addr_i64, val):
+    """Agent-scope monotonic global fetch-and-add."""
+    return atomic_add_global_at(addr_i64, val, syncscope=fx.rocdl.SyncScope.Agent)
+
+
+def atomic_add_system(addr_i64, val):
+    """System-scope monotonic global fetch-and-add."""
+    return atomic_add_global_at(addr_i64, val)
 
 
 @dataclass
@@ -101,8 +145,8 @@ class GeometryTuningTable:
     """Per-shape token-count -> (block_num, warp_num_per_block) lookup; rounds up
     to the smallest bucket >= count (largest on overflow, mori parity)."""
 
-    dispatch: Dict[int, Tuple[int, int]] = field(default_factory=dict)
-    combine: Dict[int, Tuple[int, int]] = field(default_factory=dict)
+    dispatch: dict[int, tuple[int, int]] = field(default_factory=dict)
+    combine: dict[int, tuple[int, int]] = field(default_factory=dict)
 
     def __post_init__(self):
         for phase, tbl in (("dispatch", self.dispatch), ("combine", self.combine)):
@@ -144,9 +188,7 @@ class GeometryTuningTable:
                 and int(r["local_expert_num"]) != local_expert_num
             ):
                 return False
-            if need_zc and bool(r.get("zero_copy", False)) != bool(zero_copy):
-                return False
-            return True
+            return not (need_zc and bool(r.get("zero_copy", False)) != bool(zero_copy))
 
         def _build(rules, want_dtype, need_zc):
             return {

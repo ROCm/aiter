@@ -2,18 +2,20 @@
 # original code https://github.com/triton-lang/triton/blob/main/python/triton_kernels/triton_kernels/matmul_ogs.py
 
 import itertools
+
 import torch
 import triton
-from aiter.ops.triton.moe.moe_routing.routing import RoutingData
-from aiter.ops.triton.utils.device_info import get_num_sms
-from aiter.ops.triton._triton_kernels.moe.moe_op_gemm_int8_smoothquant import (
-    _moe_gemm_int8_smoothquant,
-)
+
 from aiter.ops.triton._gluon_kernels.gfx942.moe.moe_op_gemm_int8_smoothquant import (
     _gluon_moe_gemm_int8_smoothquant,
 )
+from aiter.ops.triton._triton_kernels.moe.moe_op_gemm_int8_smoothquant import (
+    _moe_gemm_int8_smoothquant,
+)
+from aiter.ops.triton.moe.moe_routing.routing import RoutingData
 from aiter.ops.triton.moe.reduce import reduce_grouped
 from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.device_info import get_num_sms
 from aiter.ops.triton.utils.shuffle import shuffle_weight
 
 # -----------------------------------------------------------------------------
@@ -477,7 +479,7 @@ def fused_moe_int8_smoothquant(
     from aiter.ops.triton.moe.moe_routing.routing import routing
     from aiter.ops.triton.moe.quant_moe import smoothquant_quantize
 
-    M, H = hidden_states.shape
+    _M, H = hidden_states.shape
     routing_data, gather_idx, scatter_idx = routing(
         gating_output, topk, sm_first=not renormalize
     )

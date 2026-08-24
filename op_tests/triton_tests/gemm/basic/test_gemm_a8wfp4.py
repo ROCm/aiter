@@ -1,13 +1,14 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import torch
-import pytest
 from enum import Enum
+
+import pytest
+import torch
+
 from aiter.ops.triton.gemm.basic.gemm_a8wfp4 import gemm_a8wfp4
-import aiter.ops.triton.utils._triton.arch_info as arch_info
 from aiter.ops.triton.utils import types
-from typing import Union
+from aiter.ops.triton.utils._triton import arch_info
 
 # Debug
 DEBUG = False
@@ -50,8 +51,8 @@ def generate_gemm_a8wfp4_inputs(
     M: int,
     N: int,
     K: int,
-    a_dtype: Union[torch.dtype, str],
-    out_dtype: Union[torch.dtype, str],
+    a_dtype: torch.dtype | str,
+    out_dtype: torch.dtype | str,
     output: bool = False,
     layout: str = "TN",
 ):
@@ -163,7 +164,7 @@ def quantize_to_fp4(w_fp32):
         w_packed: packed fp4 tensor [N, K//2]
         w_scales: e8m0 scale factors [N, K//SCALE_GROUP_SIZE]
     """
-    N, K = w_fp32.shape
+    _N, K = w_fp32.shape
 
     # scale to fit in fp4 range
     max_w = w_fp32.abs().float().amax(dim=1, keepdim=True)  # [N, 1]
@@ -240,7 +241,7 @@ def mxfp4_to_f32(x):
 
 
 def e8m0_to_f32(x):
-    x_f32 = 2 ** ((x.to(torch.float32) - 127))
+    x_f32 = 2 ** (x.to(torch.float32) - 127)
     x_f32[x == 128] = float("nan")
     return x_f32
 

@@ -3,10 +3,11 @@
 
 import triton
 import triton.language as tl
+
 from aiter.ops.triton._triton_kernels.activation import _silu_exp2
-from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
-from aiter.ops.triton.utils._triton.moe_common import _write_zeros_to_output
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+from aiter.ops.triton.utils._triton.moe_common import _write_zeros_to_output
+from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
 
 
 def get_scaled_dot_format_string(dtype: tl.dtype):
@@ -307,7 +308,7 @@ def _fused_moe_kernel_mxfp4_silu(
     # of fp32 values for higher accuracy.
     # `accumulator` will be converted back to fp16 after the loop.
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-    for k in range(0, tl.cdiv(K, PACKED_BLOCK_K_A)):
+    for k in range(tl.cdiv(K, PACKED_BLOCK_K_A)):
         # Load the next block of A and B, generate a mask by checking the
         # K dimension.
         if EVEN_K:

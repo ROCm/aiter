@@ -22,16 +22,18 @@ Packed token ID format: (topk_position << 24) | token_id
 
 import functools
 
-import torch
-
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import buffer_ops, gpu, range_constexpr
+import torch
+from flydsl.expr import gpu, range_constexpr
 from flydsl.expr import rocdl as fly_rocdl
 from flydsl.expr.arith import ArithValue
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
+
+from aiter.ops.flydsl.kernels import buffer_ops
+
 from .kernels_common import get_warp_size
 from .tensor_shim import _run_compiled
 
@@ -325,7 +327,7 @@ def _compile_moe_sorting_oneshot(
         c_unit = fx.Int32(unit_size)
         c_sub_tokens = fx.Int32(sub_tokens)
         c_smem_cols = fx.Int32(smem_cols)
-        c_sentinel = fx.Int32((topk << 24))
+        c_sentinel = fx.Int32(topk << 24)
 
         # =================== MOE_BUF ZEROING (blocks > 0 only) ===============
         if bid != c_zero_i32:

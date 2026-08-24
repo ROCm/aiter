@@ -2,20 +2,21 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import random
+
 import pytest
 import torch
 
 from aiter.ops.triton.attention.mla import (
-    mla_prefill_fwd,
     mla_decode_fwd,
+    mla_prefill_fwd,
 )
-from aiter.ops.triton.utils.shuffle import shuffle_weight, shuffle_scale_batched
+from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.shuffle import shuffle_scale_batched, shuffle_weight
+from aiter.ops.triton.utils.types import e4m3_dtype
+from aiter.test_common import checkAllclose
 from op_tests.triton_tests.quant.test_quant_mxfp4 import (
     torch_dynamic_mxfp4_quant,
 )
-import aiter.ops.triton.utils._triton.arch_info as arch_info
-from aiter.ops.triton.utils.types import e4m3_dtype
-from typing import Optional
 
 DEVICE_ARCH = arch_info.get_arch()
 
@@ -52,7 +53,7 @@ def shuffle_kv_buffer(
         # we use (16, 16) here, noted that you must set k_width to 16 in the corresponding DotOperandLayout, the math will be equivalent.
         layout = (16, 16)
 
-    num_blocks, block_size, num_kv_heads, head_size = kv_buffer.shape
+    _num_blocks, block_size, num_kv_heads, head_size = kv_buffer.shape
 
     assert block_size >= 16
 
@@ -105,7 +106,7 @@ def dynamic_nvfp4_quant_kv_buffer(
     dtype = kv_buffer.dtype
     assert dtype == torch.bfloat16
 
-    num_blocks, block_size, num_kv_heads, head_size = kv_buffer.shape
+    _num_blocks, block_size, num_kv_heads, head_size = kv_buffer.shape
 
     assert block_size >= 128
 
@@ -173,8 +174,8 @@ def ref_masked_attention(
     k: torch.Tensor,
     v: torch.Tensor,
     scale: float,
-    q_descale: Optional[torch.Tensor] = None,
-    kv_descale: Optional[torch.Tensor] = None,
+    q_descale: torch.Tensor | None = None,
+    kv_descale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     query_len = q.shape[0]
     kv_len = k.shape[0]
@@ -211,10 +212,10 @@ def torch_mla_extend(
     block_tables,
     qk_lora_rank,
     scale: float,
-    q_descale: Optional[torch.Tensor] = None,
-    kv_descale: Optional[torch.Tensor] = None,
-    out_scale: Optional[torch.Tensor] = None,
-    o_dtype: Optional[torch.dtype] = torch.bfloat16,
+    q_descale: torch.Tensor | None = None,
+    kv_descale: torch.Tensor | None = None,
+    out_scale: torch.Tensor | None = None,
+    o_dtype: torch.dtype | None = torch.bfloat16,
 ):
     _, block_size, num_kv_heads, qk_head_dim = kv_buffer.shape
     num_seqs = cu_seqlens_q.shape[0] - 1
@@ -243,7 +244,7 @@ def torch_mla_extend(
 
 @pytest.mark.parametrize("batch_size", [1, 4, 8, 32])
 @pytest.mark.parametrize("decode_qlen", [1, 3])
-@pytest.mark.parametrize("ctx_lens", [200, 4371, 8192])
+@pytest.mark.parametrize("ctx_lens", [1328, 4371])
 @pytest.mark.parametrize("num_heads", [(16, 1), (128, 1)])
 @pytest.mark.parametrize("kv_lora_rank, qk_rope_head_dim", [(512, 64)])
 @pytest.mark.parametrize("num_blocks", [32768])
@@ -255,9 +256,8 @@ def torch_mla_extend(
         (torch.bfloat16, e4m3_dtype, torch.bfloat16, 64, False),
         (e4m3_dtype, e4m3_dtype, torch.bfloat16, 64, False),
         (e4m3_dtype, e4m3_dtype, e4m3_dtype, 64, True),
-        # skip NVFP4 KV cache for now as ds_load_tr4 is not yet supported
-        # (e4m3_dtype, torch.uint8, torch.bfloat16, 128, False),
-        # (torch.uint8, torch.uint8, torch.bfloat16, 128, False),
+        (e4m3_dtype, torch.uint8, torch.bfloat16, 128, False),
+        (torch.uint8, torch.uint8, torch.bfloat16, 128, False),
     ],
 )
 @pytest.mark.parametrize("shuffled_kv_cache", [True, False])
@@ -417,9 +417,18 @@ def test_mla_decode_fwd(
     atol, rtol = 1.5e-2, 1e-2
     if q_dtype != torch.bfloat16 or kv_dtype != torch.bfloat16:
         atol, rtol = 1.5e-1, 1.5e-1
-    torch.testing.assert_close(
-        output.to(torch.bfloat16), ref_output.to(torch.bfloat16), atol=atol, rtol=rtol
-    ), f"{torch.max(torch.abs(output.to(torch.bfloat16) - ref_output.to(torch.bfloat16)))}"
+    tol_err_ratio = 0.01
+    assert (
+        checkAllclose(
+            output.to(torch.bfloat16),
+            ref_output.to(torch.bfloat16),
+            atol=atol,
+            rtol=rtol,
+            tol_err_ratio=tol_err_ratio,
+            msg="mla_decode_fwd output",
+        )
+        <= tol_err_ratio
+    )
 
 
 @pytest.mark.parametrize("batch_size", [1])

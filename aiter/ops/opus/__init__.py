@@ -37,10 +37,13 @@ def _make_unsupported_arch_stub(name: str):
 
 
 if _arch_ok:
-    from .gemm_op_a16w16 import (  # noqa: E402
-        opus_gemm_a16w16_tune,
+    from .bmm_op import bmm_a8w8_mxscale_opus
+    from .gemm_op_a16w16 import (
         gemm_a16w16_opus,
+        opus_gemm_a16w16_tune,
         opus_gemm_workspace_init,
+        opus_gemm_workspace_release,
+        opus_gemm_workspace_release_all,
     )
 
     def opus_gemm_a8w8_blockscale_bpreshuffle_tune(*args, **kwargs):
@@ -55,15 +58,25 @@ else:
     # it and silently disable the 30+ subsequent op imports.
     gemm_a16w16_opus = _make_unsupported_arch_stub("gemm_a16w16_opus")
     opus_gemm_a16w16_tune = _make_unsupported_arch_stub("opus_gemm_a16w16_tune")
+    bmm_a8w8_mxscale_opus = _make_unsupported_arch_stub("bmm_a8w8_mxscale_opus")
     opus_gemm_a8w8_blockscale_bpreshuffle_tune = _make_unsupported_arch_stub(
         "opus_gemm_a8w8_blockscale_bpreshuffle_tune"
     )
     opus_gemm_workspace_init = _make_unsupported_arch_stub("opus_gemm_workspace_init")
+    opus_gemm_workspace_release = _make_unsupported_arch_stub(
+        "opus_gemm_workspace_release"
+    )
+    opus_gemm_workspace_release_all = _make_unsupported_arch_stub(
+        "opus_gemm_workspace_release_all"
+    )
 
 
 __all__ = [
-    "opus_gemm_a16w16_tune",
-    "opus_gemm_a8w8_blockscale_bpreshuffle_tune",
+    "bmm_a8w8_mxscale_opus",
     "gemm_a16w16_opus",
+    "opus_gemm_a8w8_blockscale_bpreshuffle_tune",
+    "opus_gemm_a16w16_tune",
     "opus_gemm_workspace_init",
+    "opus_gemm_workspace_release",
+    "opus_gemm_workspace_release_all",
 ]

@@ -120,7 +120,6 @@ def test_gemm_a8w8_bpreshuffle_uses_cktile_for_untuned_padded_k(monkeypatch):
 
     def fake_config(m, n, k, q_dtype_w, tuned_file):
         seen["config_shapes"].append((m, n, k))
-        return None
 
     def fake_cktile(XQ, WQ, x_scale, w_scale, Y, splitK):
         seen["x_shape"] = tuple(XQ.shape)

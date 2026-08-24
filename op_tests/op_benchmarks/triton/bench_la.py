@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import sys
+
 import torch
 import triton
 
@@ -357,7 +358,7 @@ def bench_lean_attention(
     XCD_REMAP = True
 
     # Triton LeanAttention output
-    fn = lambda: _persistent_lean_attention(  # noqa: E731
+    fn = lambda: _persistent_lean_attention(
         q,
         k,
         v,

@@ -20,14 +20,15 @@ import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import scf
 from flydsl.compiler.kernel_function import CompilationContext
-from flydsl.expr import arith, buffer_ops
+from flydsl.expr import arith
 from flydsl.expr.arith import ArithValue, CmpIPredicate
-from flydsl.expr.typing import T, Int32
+from flydsl.expr.typing import Int32, T
 
+from aiter.ops.flydsl.kernels import buffer_ops
 from aiter.ops.flydsl.kernels.tensor_shim import (
-    ptr_rsrc,
     AITER_FLYDSL_KERNARG_PRELOAD,
     AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
+    ptr_rsrc,
 )
 
 BLOCK_THREADS = 256
@@ -163,7 +164,7 @@ def build_moe_m_tile_map_module():
         m_tile_map: fx.Pointer,
         experts: fx.Int32,
         max_m_tiles: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream,
     ):
         ctx = CompilationContext.get_current()
         with ir.InsertionPoint(ctx.gpu_module_body):

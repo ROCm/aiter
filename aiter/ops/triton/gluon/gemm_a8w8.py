@@ -1,18 +1,13 @@
-from typing import Optional
-import functools
-import json
-
 import torch
-
 import triton
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
-import aiter.ops.triton.utils._triton.arch_info as arch_info
-from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
-from aiter.ops.triton.utils.logger import AiterTritonLogger
+from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
 from aiter.ops.triton.utils.device_info import get_num_xcds
-from aiter.ops.triton.utils._triton.pid_preprocessing import remap_xcd, pid_grid
+from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
+from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
 
@@ -195,7 +190,7 @@ def _gemm_a8w8_kernel(
     acc = gl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype, layout=mfma_layout)
 
     # num_stages:2
-    for k in range(0, gl.cdiv(K, BLOCK_SIZE_K) - 1):
+    for k in range(gl.cdiv(K, BLOCK_SIZE_K) - 1):
 
         # advance pointers for block A and B
         a_ptr += BLOCK_SIZE_K * stride_ak
@@ -463,7 +458,7 @@ def _gemm_a8w8_preshuffled_kernel(
 
     cur_b = b
     # num_stages:2
-    for k in range(0, gl.cdiv(K, BLOCK_SIZE_K) - 1):
+    for k in range(gl.cdiv(K, BLOCK_SIZE_K) - 1):
 
         # advance pointers for block A and B
         a_ptr += BLOCK_SIZE_K * stride_ak
@@ -555,25 +550,18 @@ def _gemm_a8w8_preshuffled_kernel(
     gl.amd.cdna4.buffer_store(stored_value=c, ptr=c_ptr, offsets=c_offs, mask=c_mask)
 
 
-@functools.lru_cache(maxsize=1024)
 def _get_config(
     M: int,
     N: int,
     K: int,
 ):
-
-    if not hasattr(_get_config, "_config_dict"):
-        dev = arch_info.get_arch()
-        if dev != "gfx950":
-            raise ValueError(
-                "Gluon implementation is not supported on this device (requires CDNA4)."
-            )
-        fpath = f"{AITER_TRITON_CONFIGS_PATH}/gemm/gluon/{dev}-GEMM-A8W8.json"
-        with open(fpath, "r") as file:
-            config = json.load(file)
-        _get_config._config_dict = config
-
-    return _get_config._config_dict["any"]
+    if arch_info.get_arch() != "gfx950":
+        raise ValueError(
+            "Gluon implementation is not supported on this device (requires CDNA4)."
+        )
+    # get_gemm_config caches internally and returns a fresh deep copy.
+    config, _ = get_gemm_config("GEMM-A8W8", M, N, K, backend="gluon")
+    return config
 
 
 def gemm_a8w8(
@@ -581,10 +569,10 @@ def gemm_a8w8(
     w: torch.Tensor,
     x_scale: torch.Tensor,
     w_scale: torch.Tensor,
-    bias: Optional[torch.Tensor] = None,
-    dtype: Optional[float] = torch.bfloat16,
-    y: Optional[torch.Tensor] = None,
-    config: Optional[dict] = None,
+    bias: torch.Tensor | None = None,
+    dtype: float | None = torch.bfloat16,
+    y: torch.Tensor | None = None,
+    config: dict | None = None,
 ):
     """
     Computes 8 bit matrix multiplication Y = (X @ W^T) * (x_scale * w_scale) with optional bias.
@@ -666,10 +654,10 @@ def gemm_a8w8_preshuffle(
     w: torch.Tensor,
     x_scale: torch.Tensor,
     w_scale: torch.Tensor,
-    bias: Optional[torch.Tensor] = None,
-    dtype: Optional[float] = torch.bfloat16,
-    y: Optional[torch.Tensor] = None,
-    config: Optional[dict] = None,
+    bias: torch.Tensor | None = None,
+    dtype: float | None = torch.bfloat16,
+    y: torch.Tensor | None = None,
+    config: dict | None = None,
 ):
     """
     Computes 8 bit matrix multiplication Y = (X @ W^T) * (x_scale * w_scale) with optional bias.

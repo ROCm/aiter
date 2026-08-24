@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import triton.language as tl
-import torch
-import pytest
 import random
-from aiter.ops.triton.attention.pa_decode import paged_attention_decode
+
+import pytest
+import torch
+import triton.language as tl
+
 from aiter import pertoken_quant
+from aiter.ops.triton.attention.pa_decode import paged_attention_decode
 
 DEBUG_MODE = False
 

@@ -40,7 +40,6 @@ def la_persistent_paged(
     Op,
     Out,
     kv_block_tables,
-    kv_shape,
     batch_num_block_n,
     locks,
     stride_qh,
@@ -118,7 +117,9 @@ def la_persistent_paged(
             finishing_block = False
 
         KV_block_tables_ptr = kv_block_tables + iter
-        kv_offset = tile_head_idx * stride_kh
+        # 64-bit: this reaches H * CTX * HEAD_DIM, which overflows int32 past 2**31
+        # elements (e.g. H=96, CTX=524288, HEAD_DIM=64). Scalar, so no VGPR cost.
+        kv_offset = tile_head_idx.to(tl.int64) * stride_kh.to(tl.int64)
 
         K_base = K + kv_offset
         V_base = V + kv_offset
@@ -136,7 +137,6 @@ def la_persistent_paged(
             Q_base,
             stride_qm,
             stride_qk,
-            kv_shape,
             K_base,
             V_base,
             KV_block_tables_ptr,
@@ -259,7 +259,6 @@ def _attn_lean_tile(
     Q_base,
     stride_qm,
     stride_qk,
-    kv_shape,
     K_base,
     V_base,
     KV_block_tables_ptr,
@@ -267,50 +266,33 @@ def _attn_lean_tile(
     stride_kk,
     stride_vn,
     stride_vk,
-    qk_scale: tl.constexpr,  #
+    qk_scale: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     tile_idx,
     local_iter,
     local_iter_end,
-):  #
-    Q_block_ptr = tl.make_block_ptr(
-        base=Q_base,
-        shape=(BLOCK_M, HEAD_DIM),
-        strides=(stride_qm, stride_qk),
-        offsets=(0, 0),
-        block_shape=(BLOCK_M, HEAD_DIM),
-        order=(1, 0),
-    )
+):
+    offs_m = tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, HEAD_DIM)
 
-    q = tl.load(Q_block_ptr)
+    q = tl.load(Q_base + offs_m[:, None] * stride_qm + offs_k[None, :] * stride_qk)
 
-    K_block_ptr = tl.make_block_ptr(
-        base=K_base,
-        shape=(HEAD_DIM, kv_shape),
-        strides=(stride_kk, stride_kn),
-        offsets=(0, 0),
-        block_shape=(HEAD_DIM, BLOCK_N),
-        order=(0, 1),  # K parent tensor shape [Z, H, CTX, HEAD_DIM]
-    )
-    V_block_ptr = tl.make_block_ptr(
-        base=V_base,
-        shape=(kv_shape, HEAD_DIM),
-        strides=(stride_vn, stride_vk),
-        offsets=(0, 0),
-        block_shape=(BLOCK_N, HEAD_DIM),
-        order=(1, 0),
-    )
+    # Offsets of a K/V tile relative to the start of the KV page holding it.
+    # K is loaded transposed as [HEAD_DIM, BLOCK_N].
+    k_offs = offs_k[:, None] * stride_kk + offs_n[None, :] * stride_kn
+    v_offs = offs_n[:, None] * stride_vn + offs_k[None, :] * stride_vk
 
     for iter in range(local_iter, local_iter_end):
-        # update k/v pointer
+        # The block table maps this lean tile onto a physical KV page.
         kv_block_id = tl.load(KV_block_tables_ptr, cache_modifier=".cg")
-        V_bptr = tl.advance(V_block_ptr, (kv_block_id * BLOCK_N, 0))
-        K_bptr = tl.advance(K_block_ptr, (0, kv_block_id * BLOCK_N))
+        k_ptrs = K_base + kv_block_id * BLOCK_N * stride_kn + k_offs
+        v_ptrs = V_base + kv_block_id * BLOCK_N * stride_vn + v_offs
 
         # -- compute qk ----
-        k = tl.load(K_bptr, cache_modifier=".cg")
+        k = tl.load(k_ptrs, cache_modifier=".cg")
         qk = tl.dot(q, k)
         qk = qk * qk_scale
 
@@ -322,7 +304,7 @@ def _attn_lean_tile(
         acc = (
             acc * alpha[:, None]
         )  # Scale each row of acc by the corresponding elements in alpha
-        v = tl.load(V_bptr, cache_modifier=".cg")  # v.shape = [BLOCK_N, HEAD_DIM]
+        v = tl.load(v_ptrs, cache_modifier=".cg")  # v.shape = [BLOCK_N, HEAD_DIM]
         acc = tl.dot(p.to(v.dtype), v, acc=acc)  # acc.shape = [BLOCK_M, HEAD_DIM]
         # -- update l_i
         l_ij = tl.sum(p, 1)  # rowsum(p)

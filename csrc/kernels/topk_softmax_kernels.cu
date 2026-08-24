@@ -27,8 +27,6 @@
 
 #include <algorithm>
 #include <cfloat>
-#include <hipcub/hipcub.hpp>
-#include <hipcub/util_type.hpp>
 
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
@@ -60,17 +58,21 @@ class alignas(Alignment) AlignedArray
 // in the softmax kernel when we extend this module to support expert-choice routing.
 template <typename DTYPE, int TPB>
 __launch_bounds__(TPB) __global__
-    void moeSoftmax(const DTYPE* input, const bool* finished, float* output, const int num_cols)
+    void moeSoftmax(const DTYPE* input,
+                    const bool* finished,
+                    float* output,
+                    const int num_cols,
+                    const int input_row_stride)
 {
-    using BlockReduce = hipcub::BlockReduce<float, TPB>;
-    __shared__ typename BlockReduce::TempStorage tmpStorage;
-
     __shared__ float normalizing_factor;
     __shared__ float float_max;
 
-    const int thread_row_offset = blockIdx.x * num_cols;
+    // `input` is the caller's gating tensor, whose rows may be strided; `output` is the
+    // compact fp32 workspace, so the two need separate row offsets.
+    const int thread_row_offset = blockIdx.x * input_row_stride;
+    const int output_row_offset = blockIdx.x * num_cols;
 
-    hipcub::Sum sum;
+    aiter::Sum sum;
     float threadData(-FLT_MAX);
 
     // Don't touch finished rows.
@@ -85,7 +87,7 @@ __launch_bounds__(TPB) __global__
         threadData    = max(static_cast<float>(input[idx]), threadData);
     }
 
-    const float maxElem = BlockReduce(tmpStorage).Reduce(threadData, hipcub::Max());
+    const float maxElem = block_reduce<float, aiter::Max, TPB, true>(threadData, aiter::Max());
     if(threadIdx.x == 0)
     {
         float_max = maxElem;
@@ -100,7 +102,7 @@ __launch_bounds__(TPB) __global__
         threadData += exp((static_cast<float>(input[idx]) - float_max));
     }
 
-    const auto Z = BlockReduce(tmpStorage).Reduce(threadData, sum);
+    const auto Z = block_reduce<float, aiter::Sum, TPB, true>(threadData, sum);
 
     if(threadIdx.x == 0)
     {
@@ -110,9 +112,10 @@ __launch_bounds__(TPB) __global__
 
     for(int ii = threadIdx.x; ii < num_cols; ii += TPB)
     {
-        const int idx   = thread_row_offset + ii;
-        const float val = exp((static_cast<float>(input[idx]) - float_max)) * normalizing_factor;
-        output[idx]     = val;
+        const float val =
+            exp((static_cast<float>(input[thread_row_offset + ii]) - float_max)) *
+            normalizing_factor;
+        output[output_row_offset + ii] = val;
     }
 }
 
@@ -126,15 +129,15 @@ __launch_bounds__(TPB) __global__ void moeTopK(const float* inputs_after_softmax
                                                const int k,
                                                const int start_expert,
                                                const int end_expert,
+                                               const int output_row_stride,
+                                               const int index_row_stride,
                                                const bool need_renorm)
 {
 
-    using cub_kvp     = hipcub::KeyValuePair<int, float>;
-    using BlockReduce = hipcub::BlockReduce<cub_kvp, TPB>;
-    __shared__ typename BlockReduce::TempStorage tmpStorage;
+    using cub_kvp = aiter::KeyValuePair<int, float>;
 
     cub_kvp thread_kvp;
-    hipcub::ArgMax arg_max;
+    aiter::ArgMax arg_max;
 
     const int num_rows  = gridDim.x;
     const int block_row = blockIdx.x;
@@ -156,7 +159,7 @@ __launch_bounds__(TPB) __global__ void moeTopK(const float* inputs_after_softmax
 
             for(int prior_k = 0; prior_k < k_idx; ++prior_k)
             {
-                const int prior_winning_expert = indices[k * block_row + prior_k];
+                const int prior_winning_expert = indices[index_row_stride * block_row + prior_k];
 
                 if(prior_winning_expert == expert)
                 {
@@ -167,7 +170,9 @@ __launch_bounds__(TPB) __global__ void moeTopK(const float* inputs_after_softmax
             thread_kvp = arg_max(inp_kvp, thread_kvp);
         }
 
-        const cub_kvp result_kvp = BlockReduce(tmpStorage).Reduce(thread_kvp, arg_max);
+        // The __syncthreads() at the end of this loop body also separates
+        // consecutive block_reduce rounds, which share one smem staging buffer.
+        const cub_kvp result_kvp = block_reduce<cub_kvp, aiter::ArgMax, TPB, true>(thread_kvp, arg_max);
         if(threadIdx.x == 0)
         {
             // Ignore experts the node isn't responsible for with expert parallelism
@@ -175,11 +180,13 @@ __launch_bounds__(TPB) __global__ void moeTopK(const float* inputs_after_softmax
             const bool node_uses_expert   = expert >= start_expert && expert < end_expert;
             const bool should_process_row = row_is_active && node_uses_expert;
 
-            const int idx = k * block_row + k_idx;
-            output[idx]   = result_kvp.value;
-            indices[idx]  = should_process_row ? (expert - start_expert) : num_experts;
-            assert(indices[idx] >= 0);
-            source_rows[idx] = k_idx * num_rows + block_row;
+            // source_rows stays compactly packed, matching the fast path.
+            const int output_idx  = output_row_stride * block_row + k_idx;
+            const int indices_idx = index_row_stride * block_row + k_idx;
+            output[output_idx]    = result_kvp.value;
+            indices[indices_idx]  = should_process_row ? (expert - start_expert) : num_experts;
+            assert(indices[indices_idx] >= 0);
+            source_rows[k * block_row + k_idx] = k_idx * num_rows + block_row;
 
             if(need_renorm)
             {
@@ -194,7 +201,7 @@ __launch_bounds__(TPB) __global__ void moeTopK(const float* inputs_after_softmax
         renorm_value = 1 / renorm_value;
         for(int k_idx = 0; k_idx < k; k_idx++)
         {
-            int64_t const idx = k * block_row + k_idx;
+            int64_t const idx = output_row_stride * block_row + k_idx;
             output[idx] *= renorm_value;
         }
     }
@@ -306,9 +313,7 @@ __launch_bounds__(WARPS_PER_CTA * opus::get_warp_size()) __global__
     // here to avoid the dependency on CUTLASS.
     using AccessType = opus::vector_t<DTYPE, ELTS_PER_LDG>;
     using ChunkType  = opus::vector_t<float, ELTS_PER_LDG>;
-    using kvp        = hipcub::KeyValuePair<int, float>;
-    // hipcub::ArgMax arg_max;
-    // hipcub::ArgMin arg_min;
+    using kvp        = aiter::KeyValuePair<int, float>;
 
     // Finally, we pull in the data from global mem
     float row_chunk[VPT];
@@ -703,7 +708,7 @@ void topkGatingSoftmaxKernelLauncher(const DTYPE* gating_output,
             "softmax_workspace must be provided for num_experts that are not a power of 2.");
         static constexpr int TPB = 256;
         moeSoftmax<DTYPE, TPB><<<num_tokens, TPB, 0, stream>>>(
-            gating_output, nullptr, softmax_workspace, num_experts);
+            gating_output, nullptr, softmax_workspace, num_experts, gating_token_stride);
         moeTopK<TPB><<<num_tokens, TPB, 0, stream>>>(softmax_workspace,
                                                      nullptr,
                                                      topk_weights,
@@ -713,6 +718,8 @@ void topkGatingSoftmaxKernelLauncher(const DTYPE* gating_output,
                                                      topk,
                                                      0,
                                                      num_experts,
+                                                     topk_weights_stride,
+                                                     topk_id_stride,
                                                      need_renorm);
 
         // Handle shared experts for non-power-of-2 case

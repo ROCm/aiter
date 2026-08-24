@@ -19,7 +19,7 @@ from aiter.ops.triton._triton_kernels.gated_delta_rule.decode.causal_conv1d_upda
     gluon_causal_conv1d_update_split_qkv_kernel_notuple,
 )
 
-__all__ = ["causal_conv1d_update_split_qkv", "PAD_SLOT_ID"]
+__all__ = ["PAD_SLOT_ID", "causal_conv1d_update_split_qkv"]
 
 
 def causal_conv1d_update_split_qkv(

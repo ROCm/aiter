@@ -1,21 +1,22 @@
 from functools import cache
-from typing import Optional
+
 import torch
 import triton
+
 import aiter
-from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
-from aiter.ops.triton._triton_kernels.quant.fused_fp8_quant import (
-    _fused_rms_fp8_per_tensor_static_quant_kernel,
-    _fused_rms_fp8_group_quant_kernel,
-    _fused_flatten_fp8_group_quant_kernel,
-    _fused_reduce_act_mul_fp8_group_quant,
-    _fused_reduce_rms_fp8_group_quant_kernel,
-    _fused_silu_mul_fp8_per_tensor_static_quant_kernel,
-)
 from aiter.ops.triton._triton_kernels.activation import (
     _get_activation_from_str,
 )
+from aiter.ops.triton._triton_kernels.quant.fused_fp8_quant import (
+    _fused_flatten_fp8_group_quant_kernel,
+    _fused_reduce_act_mul_fp8_group_quant,
+    _fused_reduce_rms_fp8_group_quant_kernel,
+    _fused_rms_fp8_group_quant_kernel,
+    _fused_rms_fp8_per_tensor_static_quant_kernel,
+    _fused_silu_mul_fp8_per_tensor_static_quant_kernel,
+)
 from aiter.ops.triton.utils.logger import AiterTritonLogger
+from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
 
 _LOGGER = AiterTritonLogger()
 
@@ -172,6 +173,7 @@ def fused_rms_fp8_group_quant(
     res1=None,
     output_unquantized_inp1=False,
     transpose_scale=False,
+    is_x_scale_strided: bool = False,
 ):
     """
     This op contains several steps:
@@ -182,9 +184,16 @@ def fused_rms_fp8_group_quant(
 
     Key parameters:
     - x: Matrix X with shape (M, N1, N2).
-    - transpose_scale: If True, return scale with shape (M, cdiv(N1, group_size)) but stored in
-                      column-major (transposed) memory layout. Equivalent to:
-                      scale.transpose(0, 1).contiguous().view(*scale.shape)
+    - transpose_scale: If True, return scale with shape (M, cdiv(N1, group_size)) stored in
+                      column-major (transposed) memory. The scale buffer bytes are the same
+                      either way; is_x_scale_strided selects how those bytes are presented.
+    - is_x_scale_strided: Only used when transpose_scale=True. Selects the presentation of the
+                      column-major scale buffer for the CK bpreshuffle GEMM (see PR #4406, which
+                      detects the layout via is_x_scale_tranposed = x_scale.stride(0) != 1):
+                        False (default): contiguous view, shape (M, num_bs_cols), strides
+                          (num_bs_cols, 1). Equivalent to scale.transpose(0,1).contiguous().view(*scale.shape).
+                        True: strided column-major view, shape (M, num_bs_cols), strides (1, M).
+                          Equivalent to scale.transpose(0,1).contiguous().transpose(0,1).
 
     Returns:
     - out1_fp8: The output matrix with shape (M, N1).
@@ -340,10 +349,17 @@ def fused_rms_fp8_group_quant(
         ACTIVATION="silu",
         num_warps=num_warps,
     )
-    # When transpose_scale=True, view the transposed buffer back to original shape
-    # This keeps shape (M, num_bs_cols) but with column-major memory layout
+    # When transpose_scale=True, re-present the [num_bs_cols, M] column-major
+    # buffer the kernel wrote as (M, num_bs_cols). Both branches return the same
+    # bytes; they differ only in stride(0), which is how the CK bpreshuffle GEMM
+    # detects the layout (PR #4406: is_x_scale_tranposed = x_scale.stride(0) != 1).
     if transpose_scale:
-        out1_bs = out1_bs.view(M, num_bs_cols)
+        if is_x_scale_strided:
+            # Strided column-major view: strides (1, M), stride(0) == 1.
+            out1_bs = out1_bs.transpose(0, 1)
+        else:
+            # Default: contiguous view, strides (num_bs_cols, 1), stride(0) != 1.
+            out1_bs = out1_bs.view(M, num_bs_cols)
 
     return (out1_fp8, out1_bs), out1, out2, out_res1
 
@@ -590,10 +606,10 @@ def fused_flatten_fp8_group_quant(
 def fused_reduce_act_mul_fp8_group_quant(
     x: torch.Tensor,
     activation: str = "silu",
-    x2: Optional[torch.Tensor] = None,
+    x2: torch.Tensor | None = None,
     group_size=128,
     dtype_quant=fp8_dtype,
-    dtype: Optional[float] = torch.bfloat16,
+    dtype: float | None = torch.bfloat16,
 ):
     """
     Apply reduction along the first dimension and apply the activation function + per-token group quantization.
@@ -728,6 +744,7 @@ def fused_reduce_rms_fp8_group_quant(
     output_unquantized_inp1=False,
     out3=None,
     transpose_scale=False,
+    is_x_scale_strided: bool = False,
 ):
     """
     This op contains several steps:
@@ -739,6 +756,16 @@ def fused_reduce_rms_fp8_group_quant(
 
     Key parameters:
     - x: Matrix X with shape (M, N1, N2).
+    - transpose_scale: If True, return scale with shape (M, cdiv(N1, group_size)) stored in
+                      column-major (transposed) memory. is_x_scale_strided selects how those
+                      bytes are presented.
+    - is_x_scale_strided: Only used when transpose_scale=True. Selects the presentation of the
+                      column-major scale buffer for the CK bpreshuffle GEMM (see PR #4406, which
+                      detects the layout via is_x_scale_tranposed = x_scale.stride(0) != 1):
+                        False (default): contiguous view, shape (M, num_bs_cols), strides
+                          (num_bs_cols, 1). Equivalent to scale.transpose(0,1).contiguous().view(*scale.shape).
+                        True: strided column-major view, shape (M, num_bs_cols), strides (1, M).
+                          Equivalent to scale.transpose(0,1).contiguous().transpose(0,1).
 
     Returns:
     - out1_fp8: The output matrix with shape (M, N1).
@@ -945,10 +972,17 @@ def fused_reduce_rms_fp8_group_quant(
         NUM_SPLITK_POW2=triton.next_power_of_2(SPK),
         num_warps=num_warps,
     )
-    # When transpose_scale=True, view the transposed buffer back to original shape
-    # This keeps shape (M, num_bs_cols) but with column-major memory layout
+    # When transpose_scale=True, re-present the [num_bs_cols, M] column-major
+    # buffer the kernel wrote as (M, num_bs_cols). Both branches return the same
+    # bytes; they differ only in stride(0), which is how the CK bpreshuffle GEMM
+    # detects the layout (PR #4406: is_x_scale_tranposed = x_scale.stride(0) != 1).
     if transpose_scale:
-        out1_bs = out1_bs.view(M, num_bs_cols)
+        if is_x_scale_strided:
+            # Strided column-major view: strides (1, M), stride(0) == 1.
+            out1_bs = out1_bs.transpose(0, 1)
+        else:
+            # Default: contiguous view, strides (num_bs_cols, 1), stride(0) != 1.
+            out1_bs = out1_bs.view(M, num_bs_cols)
 
     return (out1_fp8, out1_bs), out1, out2, out_res1, out3
 

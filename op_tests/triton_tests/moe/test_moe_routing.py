@@ -1,16 +1,17 @@
 import pytest
 import torch
-import triton
 import torch.nn.functional as F
+import triton
+
+from aiter.ops.topk import biased_grouped_topk_torch, grouped_topk_torch
 from aiter.ops.triton.moe.moe_routing.routing import (
+    compute_expt_data_torch,
     routing,
     routing_from_hash,
     routing_torch,
-    compute_expt_data_torch,
 )
+from aiter.ops.triton.moe.moe_routing.topk import grouped_topk, topk
 from aiter.ops.triton.utils._triton.arch_info import get_arch
-from aiter.ops.topk import biased_grouped_topk_torch, grouped_topk_torch
-from aiter.ops.triton.moe.moe_routing.topk import grouped_topk
 
 
 def _routing_block_m(n_tokens, n_expts_act, n_expts_tot):
@@ -78,21 +79,17 @@ def assert_close(ref, tri, maxtol=None, rmstol=None, description="--", verbose=T
 
     if verbose:
         print(
-            "%s maximum relative error = %s (threshold = %s)"
-            % (description, max_err, maxtol)
+            f"{description} maximum relative error = {max_err} (threshold = {maxtol})"
         )
-        print(
-            "%s RMS relative error = %s (threshold = %s)"
-            % (description, rms_err, rmstol)
-        )
+        print(f"{description} RMS relative error = {rms_err} (threshold = {rmstol})")
 
     if max_err > maxtol:
         bad_idxs = torch.nonzero(rel_err > maxtol)
         num_nonzero = bad_idxs.size(0)
         bad_idxs = bad_idxs[:1000]
         print(
-            "%d / %d mismatched elements (shape = %s) at coords %s"
-            % (num_nonzero, rel_err.numel(), tuple(rel_err.shape), bad_idxs.tolist())
+            f"{num_nonzero} / {rel_err.numel()} mismatched elements "
+            f"(shape = {tuple(rel_err.shape)}) at coords {bad_idxs.tolist()}"
         )
 
         bad_idxs = bad_idxs.unbind(-1)
@@ -109,6 +106,49 @@ def init_data(n_tokens, n_expts_tot, dtype=torch.float16, device="cuda"):
 
 
 n_tokens = [4, 7, 8, 64, 255, 256, 371, 911, 1023, 1024, 4096, 8192]
+
+
+@pytest.mark.parametrize("n_tokens", [8, 16, 24, 32])
+@pytest.mark.parametrize("n_expts_tot", [32, 64, 128])
+def test_topk_in_range(n_tokens: int, n_expts_tot: int):
+    if get_arch() not in ["gfx950", "gfx1250"]:
+        pytest.skip("MOE stack not fully implemented on non-CDNA4 arch yet.")
+
+    n_expts_act = 4
+    hist_block_m = 32
+    sm_first = False
+
+    # A CUDA graph replay pads the batch to the captured size, so rows
+    # [n_tokens_unpadded, n_tokens) hold whatever the router produced for
+    # uninitialised hidden states.
+    n_tokens_unpadded = n_tokens - 1
+    torch.manual_seed(0)
+    logits = torch.randn(
+        (n_tokens, n_expts_tot), dtype=torch.bfloat16, device="cuda"
+    ).detach()
+
+    # streaming_topk masks columns [n_expts_tot, N_EXPTS_PAD) with -inf, which
+    # is not strictly below every real logit: a real -inf ties with it and a
+    # negative NaN sorts under it, and ties break towards the larger column
+    # index. Once fewer than n_expts_act real columns outrank the placeholder,
+    # top-k elects padded columns and returns expert ids >= n_expts_tot.
+    logits[n_tokens_unpadded:, :] = -float("inf")
+    logits[n_tokens_unpadded:, 0] = float("inf")
+    logits[n_tokens_unpadded:, 1] = float("nan")
+    logits[n_tokens_unpadded:, 2] = -float("nan")
+
+    expt_scal, expt_indx, bitmatrix = topk(
+        logits,
+        n_expts_act,
+        apply_softmax=not sm_first,
+        HIST_BLOCK_M=hist_block_m,
+    )
+    assert expt_scal.shape == (n_tokens, n_expts_act)
+    assert expt_indx.shape == (n_tokens, n_expts_act)
+    assert bitmatrix.shape[0] == n_tokens
+
+    assert torch.all(expt_indx >= 0)
+    assert torch.all(expt_indx < n_expts_tot)
 
 
 @pytest.mark.parametrize("n_tokens", n_tokens)
@@ -169,6 +209,9 @@ def test_routing(n_tokens, n_expts_tot, n_expts_act, sm_first):
 def _score_transform_torch(logits, score_mode):
     if score_mode == "sqrtsoftplus":
         return torch.sqrt(F.softplus(logits.to(torch.float32))).to(logits.dtype)
+    if score_mode == "sigmoid":
+        # kept in fp32: the kernel selects in fp32 for this mode
+        return torch.sigmoid(logits.to(torch.float32))
     # "softmax" mode in the kernel means "no pre-transform" (identity)
     return logits
 
@@ -206,7 +249,7 @@ def routing_score_mode_torch(
     renorm=True,
     routed_scaling_factor=1.0,
 ):
-    n_tokens, n_expts_tot = logits.shape
+    _n_tokens, n_expts_tot = logits.shape
 
     # 1. Score transform; bias added only for selection.
     transformed_f32 = _score_transform_torch(logits, score_mode).to(torch.float32)
@@ -246,7 +289,7 @@ def routing_from_hash_torch(
     renorm=True,
     routed_scaling_factor=1.0,
 ):
-    n_tokens, n_expts_tot = router_logits.shape
+    _n_tokens, n_expts_tot = router_logits.shape
     iid = input_ids.to(torch.int64)
     # Expert ids come straight from the table — no per-row sort.
     expt_indx = tid2eid[iid, :n_expts_act].to(torch.int32)
@@ -333,8 +376,8 @@ def _check_routing_data_bucket(
     for i, e in enumerate(flat_ids):
         token = i // n_expts_act
         ground[e].append((token, flat_w[i]))
-    for e in ground:
-        ground[e].sort()
+    for v in ground.values():
+        v.sort()
 
     got = {e: [] for e in range(n_expts_tot)}
     e = 0
@@ -349,8 +392,8 @@ def _check_routing_data_bucket(
             f"has expert {flat_ids[src[j]]}, expected {e}"
         )
         got[e].append((token, scal[j]))
-    for e in got:
-        got[e].sort()
+    for v in got.values():
+        v.sort()
 
     for e in range(n_expts_tot):
         rb, tb = ground[e], got[e]
@@ -378,12 +421,16 @@ def _check_routing_data_bucket(
     ],
 )
 @pytest.mark.parametrize(
-    "score_mode, has_bias, renorm, routed_scaling_factor",
+    "score_mode, has_bias, renorm, routed_scaling_factor, dtype",
     [
-        ("sqrtsoftplus", True, True, 2.5),  # full V4 noaux_tc path
-        ("sqrtsoftplus", True, False, 1.0),  # bias, no renorm
-        ("sqrtsoftplus", False, True, 1.0),  # no bias
-        ("softmax", False, False, 1.0),  # identity transform, no renorm
+        ("sqrtsoftplus", True, True, 2.5, torch.float32),  # full V4 noaux_tc path
+        ("sqrtsoftplus", True, False, 1.0, torch.float32),  # bias, no renorm
+        ("sqrtsoftplus", False, True, 1.0, torch.float32),  # no bias
+        ("sigmoid", True, True, 2.5, torch.float32),  # full GLM-5.2 / DSv3 path
+        ("sigmoid", True, False, 1.0, torch.float32),  # bias, no renorm
+        ("sigmoid", False, True, 1.0, torch.float32),  # no bias
+        ("sigmoid", True, True, 2.5, torch.bfloat16),  # selection must stay fp32
+        ("softmax", False, False, 1.0, torch.float32),  # identity, no renorm
     ],
 )
 def test_routing_score_mode(
@@ -394,13 +441,14 @@ def test_routing_score_mode(
     has_bias,
     renorm,
     routed_scaling_factor,
+    dtype,
 ):
     if get_arch() not in ["gfx950", "gfx1250"]:
         pytest.skip("MOE stack not fully implemented on non-CDNA4 arch yet.")
 
     device = "cuda"
     torch.manual_seed(2)
-    logits = init_data(n_tokens, n_expts_tot, device=device, dtype=torch.float32)
+    logits = init_data(n_tokens, n_expts_tot, device=device, dtype=dtype)
     bias = (
         torch.randn(n_expts_tot, dtype=torch.float32, device=device) * 0.05
         if has_bias
@@ -603,7 +651,7 @@ def _ref_arbitrary_grouped(
     """General reference honoring an arbitrary expert->group table (equal-size
     groups). Used for the non-contiguous mapping case where the aiter refs
     (which assume contiguous .view groups) don't apply."""
-    nt, ne = logits.shape
+    nt, _ne = logits.shape
     f32 = logits.float()
     if score_mode == "softmax":
         scores = torch.softmax(f32, dim=-1)
@@ -906,13 +954,13 @@ def bench_routing():
     proton.start("routing")
     proton.activate()
     for i in range(100):
-        tri_routing_data, tri_gather, tri_scatter = routing(tri_logits, n_expts_act)
+        _tri_routing_data, _tri_gather, _tri_scatter = routing(tri_logits, n_expts_act)
     proton.finalize()
     try:
         import os
 
         os.system("proton-viewer -m time/ms routing.hatchet")
-    except Exception:
+    except Exception:  # noqa: BLE001,S110
         pass
 
 

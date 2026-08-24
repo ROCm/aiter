@@ -1,20 +1,19 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-from typing import Optional
 import functools
-import json
-import os
+
 import torch
 import triton
-from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
-import aiter.ops.triton.utils._triton.arch_info as arch_info
-from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
-from aiter.ops.triton.utils.logger import AiterTritonLogger
 from triton import language as tl
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 from triton.runtime.jit import constexpr_function
+
+from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
+from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH, load_config_json
+from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
 
@@ -981,39 +980,32 @@ def _gemm_a8w8_blockscale_reduce_kernel(
 
 
 @functools.lru_cache(maxsize=1024)
-def _get_config(
+def _get_config_cached(
     M: int,
     N: int,
     K: int,
 ):
-    if not hasattr(_get_config, "_config_dict"):
-        dev = arch_info.get_arch()
-        if int(dev.split("gfx")[1]) < 950:
-            raise ValueError(
-                "Gluon implementation is not supported on this device (requires CDNA4)."
-            )
-        _get_config._config_dict = {}
-        fpath = (
+    if not arch_info.is_gluon_avail():
+        raise ValueError(
+            "Gluon implementation is not supported on this device (requires CDNA4)."
+        )
+
+    dev = arch_info.get_arch()
+
+    # Try specialized config first.
+    config_dict = load_config_json(
+        f"{AITER_TRITON_CONFIGS_PATH}/gemm/gluon/{dev}-GEMM-A8W8_BLOCKSCALE-N={N}-K={K}.json",
+        required=False,
+    )
+    # Fall back to the general config (must exist).
+    if config_dict is None:
+        config_dict = load_config_json(
             f"{AITER_TRITON_CONFIGS_PATH}/gemm/gluon/{dev}-GEMM-A8W8_BLOCKSCALE.json"
         )
-        with open(fpath, "r") as file:
-            config = json.load(file)
-        _get_config._config_dict["default"] = config
-
-    key = f"{N}_{K}"
-    if key not in _get_config._config_dict.keys():
-        dev = arch_info.get_arch()
-        fpath = f"{AITER_TRITON_CONFIGS_PATH}/gemm/gluon/{dev}-GEMM-A8W8_BLOCKSCALE-N={N}-K={K}.json"
-        if os.path.exists(fpath):
-            with open(fpath, "r") as file:
-                config = json.load(file)
-                _get_config._config_dict[key] = config
-        else:
-            key = "default"  # fall back to default config
 
     # Config keys should be named M_LEQ_<bound> or "any"
     bounds = []
-    for setting in _get_config._config_dict[key].keys():
+    for setting in config_dict:
         potential_block_m = setting.replace("M_LEQ_", "")
         if potential_block_m.isnumeric():
             bounds.append(int(potential_block_m))
@@ -1022,18 +1014,27 @@ def _get_config(
     # the kernel currently supports. Unsupported buckets are skipped (those
     # configs become live again once the kernel grows the corresponding
     # padded-LDS layouts), so we may fall through to "any".
-    config = _get_config._config_dict[key]["any"]
+    config = config_dict["any"]
     for bound in sorted(bounds):
-        if M > bound or f"M_LEQ_{bound}" not in _get_config._config_dict[key]:
+        if M > bound or f"M_LEQ_{bound}" not in config_dict:
             continue
-        candidate = _get_config._config_dict[key][f"M_LEQ_{bound}"]
+        candidate = config_dict[f"M_LEQ_{bound}"]
         if (candidate["BLOCK_SIZE_M"], candidate["BLOCK_SIZE_N"]) in _SUPPORTED_TILES:
             config = candidate
             break
 
-    config = (
-        config.copy()
-    )  # avoid later inplace modification from interacting with cached config
+    return config
+
+
+def _get_config(
+    M: int,
+    N: int,
+    K: int,
+):
+    # Fresh copy per call, outside the lru boundary — the caller writes
+    # derived fields (SPLITK_BLOCK_SIZE here, GROUP_K/GROUP_N at the call
+    # site) into the returned dict.
+    config = _get_config_cached(M, N, K).copy()
 
     block_size_k = config["BLOCK_SIZE_K"]
     num_k_blocks = triton.cdiv(K, block_size_k)
@@ -1048,9 +1049,9 @@ def gemm_a8w8_blockscale(
     w: torch.Tensor,
     x_scale: torch.Tensor,
     w_scale: torch.Tensor,
-    dtype: Optional[float] = torch.bfloat16,
-    y: Optional[torch.Tensor] = None,
-    config: Optional[dict] = None,
+    dtype: float | None = torch.bfloat16,
+    y: torch.Tensor | None = None,
+    config: dict | None = None,
 ):
     """
     Computes the 8 bit matmul Y = X x WT using the block-scale quantization approach.
@@ -1108,7 +1109,7 @@ def gemm_a8w8_blockscale(
     num_stages = max(num_stages, 2)
 
     # grid = (config["NUM_KSPLIT"], triton.cdiv(M, config["BLOCK_SIZE_M"]) * triton.cdiv(N, config["BLOCK_SIZE_N"]),)
-    grid = lambda META: (  # noqa: E731
+    grid = lambda META: (
         (
             META["NUM_KSPLIT"]
             * triton.cdiv(M, META["BLOCK_SIZE_M"])

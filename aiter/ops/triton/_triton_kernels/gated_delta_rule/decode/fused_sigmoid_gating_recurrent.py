@@ -1,5 +1,3 @@
-from typing import Optional
-
 import torch
 import triton
 import triton.language as tl
@@ -122,7 +120,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
             )
             b_h += tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
 
-    for _ in range(0, T):
+    for _ in range(T):
         # Load inputs
         b_q = tl.load(p_q, mask=mask_k, other=0).to(tl.float32)
         b_k = tl.load(p_k, mask=mask_k, other=0).to(tl.float32)
@@ -207,9 +205,9 @@ def fused_sigmoid_gating_delta_rule_update(
     b: torch.Tensor,
     initial_state_source: torch.Tensor,
     initial_state_indices: torch.Tensor,
-    scale: Optional[float] = None,
+    scale: float | None = None,
     use_qk_l2norm_in_kernel: bool = False,
-    cu_seqlens: Optional[torch.Tensor] = None,
+    cu_seqlens: torch.Tensor | None = None,
 ):
     """
     Fused triton implementation of sigmoid gating delta rule update.

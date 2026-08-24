@@ -5,11 +5,10 @@ import argparse
 import logging
 import os
 from multiprocessing import Pool, freeze_support, set_start_method
-from typing_extensions import Optional
 
+import pandas as pd
 import torch
 import torch.distributed as dist
-import pandas as pd
 
 from aiter import dtypes
 from aiter.dist.communication_op import tensor_model_parallel_all_reduce
@@ -36,7 +35,7 @@ def allreduce_custom(
     rankID,
     x,
     withGraph=False,
-    distributed_init_method: Optional[str] = None,
+    distributed_init_method: str | None = None,
 ):
     device = torch.device(f"cuda:{rankID}")
     torch.cuda.set_device(device)
@@ -59,9 +58,8 @@ def allreduce_custom(
 
     if withGraph:
         graph = torch.cuda.CUDAGraph()
-        with graph_capture() as gc:
-            with torch.cuda.graph(graph, stream=gc.stream):
-                out = tensor_model_parallel_all_reduce(x)
+        with graph_capture() as gc, torch.cuda.graph(graph, stream=gc.stream):
+            out = tensor_model_parallel_all_reduce(x)
         out.fill_(0)
 
         @perftest()
@@ -93,7 +91,7 @@ def test_allreduce_custom(
     shape,
     dtype,
     withGraph=False,
-    distributed_init_method: Optional[str] = None,
+    distributed_init_method: str | None = None,
 ):
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = "49373"

@@ -15,19 +15,18 @@ import torch
 from flydsl.runtime.device import get_rocm_arch
 
 from aiter import logger
-from aiter.ops.flydsl.kernels.hstu_attention_bwd import (
-    NUM_GRID_GROUPS,
-    build_hstu_attention_bwd_dvdk,
-)
-from aiter.ops.flydsl.kernels.hstu_attention_bwd_dq import (
-    build_hstu_attention_bwd_dq,
-)
 from aiter.ops.flydsl.kernels.hstu_attention_fwd import (
     build_hstu_attention_fwd,
     validate_hstu_attention_fwd,
 )
+from aiter.ops.flydsl.kernels.hstu_attention_bwd import (
+    build_hstu_attention_bwd_dvdk,
+    NUM_GRID_GROUPS,
+)
+from aiter.ops.flydsl.kernels.hstu_attention_bwd_dq import (
+    build_hstu_attention_bwd_dq,
+)
 from aiter.ops.triton.utils.common_utils import prev_power_of_2
-from aiter.utility.dtypes import str2bool
 
 from .kernels.tensor_shim import _run_compiled, get_dtype_str
 
@@ -40,6 +39,19 @@ __all__ = [
 
 
 _GPU_ARCH = get_rocm_arch()
+
+
+def _str2bool(v: bool | str) -> bool:
+    # Local copy to avoid importing aiter.utility.dtypes at module load: that
+    # pulls in aiter.ops.enum, which triggers a JIT get_module() during the AOT
+    # build (setup.py run_aot) before the module exists -> import-time failure.
+    if isinstance(v, bool):
+        return v
+    if v.lower() in ("yes", "true", "t", "y", "1"):
+        return True
+    if v.lower() in ("no", "false", "f", "n", "0"):
+        return False
+    raise ValueError(f"Boolean value expected, got {v!r}.")
 
 
 # Tuned kernel configs
@@ -83,9 +95,9 @@ def _problem_key(
         int(hidden_dim),
         prev_power_of_2(int(batch)),
         prev_power_of_2(int(max_seq_len)),
-        str2bool(has_window),
-        str2bool(has_contextual),
-        str2bool(has_targets),
+        _str2bool(has_window),
+        _str2bool(has_contextual),
+        _str2bool(has_targets),
     )
 
 
@@ -184,20 +196,12 @@ def _get_tuned_config(
 
 def _get_default_config(
     *,
-    batch: int,
     head_dim: int,
     hidden_dim: int,
-    num_heads: int,
-    max_seq_len: int,
-    max_attn_len: int,
 ) -> dict:
     """
     Heuristic config for when tuning is unavailable.
-
     Derived from a device sweep over shapes on MI300X.
-    - block_m by occupancy
-    - block_n by head/hidden dim (bounded by the LDS K+V tile)
-    - waves_per_eu lifts residency only for tiny-dim tiles that benefit.
     """
 
     def as_dict(
@@ -214,36 +218,29 @@ def _get_default_config(
             "waves_per_eu": waves_per_eu,
         }
 
-    # hidden_dims 96/160/224 don't divide the K/V DMA pass with num_waves=4
-    # This map is so the kernel still runs for these values.
+    # hidden_dims 96/160/192 don't divide the K/V DMA pass with num_waves=4
+    # This map is required so the kernel still runs for these values.
     non_64_divisible_map = {
         96: (96, 48, 3, 0),
         160: (160, 80, 5, 0),
         192: (96, 48, 3, 0),
-        224: (112, 112, 7, 0),
     }
     if hidden_dim in non_64_divisible_map:
         return as_dict(*non_64_divisible_map[hidden_dim])
 
-    grid = batch * num_heads * ((max_seq_len + 127) // 128)
-    dim = max(head_dim, hidden_dim)
-
-    if dim <= 64:
-        if max_attn_len:
-            return as_dict(128, 32, 4, 0)
-
-        if grid >= 6144:
-            return as_dict(256, 32, 4, 0)
-        if grid >= 768:
-            return as_dict(128, 32, 4, 2)
-        return as_dict(64, 32, 4, 2)
-
-    # dim > 64
-    if grid >= 2560 or max_seq_len >= 16384:
-        return as_dict(192, 48, 4, 0)
-    if grid >= 768:
+    # Key on the K stride the kernel actually processes: head_dim is rounded up to a
+    # multiple of 64 (HEAD_DIM_K) for the swizzled K LDS tile. Using the unrounded
+    # head_dim here picks too-large a block_n for non-64-aligned dims in the 128-192
+    # (and 192-256) band, which measured ~34% slower on gfx942 (144/176 head dims).
+    head_dim_k = ((head_dim + 63) // 64) * 64
+    dim = max(hidden_dim, head_dim_k)
+    if dim >= 256:
+        return as_dict(128, 16, 4, 0)
+    if dim >= 192:
+        return as_dict(128, 32, 4, 2)
+    if dim >= 128:
         return as_dict(128, 64, 4, 2)
-    return as_dict(64, 64, 4, 2)
+    return as_dict(128, 32, 4, 2)
 
 
 @functools.lru_cache(maxsize=16384)
@@ -264,7 +261,7 @@ def _compile_launcher(
     block_n: int | None,
     num_waves: int | None,
     waves_per_eu: int | None,
-) -> tuple[str, Callable]:
+) -> Callable:
     #  Config overrides (if provided)
     custom_config: dict = {
         "block_m": block_m,
@@ -289,12 +286,8 @@ def _compile_launcher(
 
     # Default hueristic config
     default_config = _get_default_config(
-        batch=batch,
-        head_dim=head_dim,
         hidden_dim=hidden_dim,
-        num_heads=num_heads,
-        max_seq_len=max_seq_len,
-        max_attn_len=max_attn_len,
+        head_dim=head_dim,
     )
 
     kernel_config = {
@@ -307,13 +300,11 @@ def _compile_launcher(
         num_heads=num_heads,
         head_dim=head_dim,
         hidden_dim=hidden_dim,
-        batch=batch,
         causal=causal,
         max_attn_len=max_attn_len,
         has_targets=has_targets,
         alpha=alpha,
         dtype_str=dtype_str,
-        max_seq_len=max_seq_len,
         contextual_seq_len=contextual_seq_len,
         **kernel_config,
     )
@@ -328,6 +319,7 @@ def _validate_inputs(
     v: torch.Tensor,
     seq_offsets: torch.Tensor,
     num_targets: torch.Tensor | None,
+    max_seq_len: int,
 ) -> tuple[int, int, int, int, str]:
     tensors: dict[str, torch.Tensor] = {
         "q": q,
@@ -368,6 +360,12 @@ def _validate_inputs(
     hidden_dim = v.shape[2]
     batch = seq_offsets.numel() - 1
 
+    if batch <= 0:
+        raise ValueError(
+            f"batch (seq_offsets.numel() - 1) must be positive, got {batch}"
+        )
+    if max_seq_len <= 0:
+        raise ValueError(f"max_seq_len (N) must be positive, got {max_seq_len}")
     if dtype_str is None:
         raise ValueError(f"Unsupported dtype: get_dtype_str({q.dtype}) is None")
     if num_targets is not None:
@@ -413,6 +411,7 @@ def flydsl_hstu_attention_fwd(
         v=v,
         seq_offsets=seq_offsets,
         num_targets=num_targets,
+        max_seq_len=N,
     )
 
     launcher = _compile_launcher(
@@ -441,6 +440,8 @@ def flydsl_hstu_attention_fwd(
     with torch.cuda.device(q.device.index):
         _run_compiled(
             launcher,
+            N,
+            batch,
             q.contiguous(),
             k.contiguous(),
             v.contiguous(),
@@ -459,6 +460,7 @@ def _validate_bwd_inputs(
     dout: torch.Tensor,
     seq_offsets: torch.Tensor,
     num_targets: torch.Tensor | None,
+    max_seq_len: int,
 ) -> tuple[int, int, int, int, str]:
     """Validate backward inputs, reusing the forward's q/k/v checks.
 
@@ -471,6 +473,7 @@ def _validate_bwd_inputs(
         v=v,
         seq_offsets=seq_offsets,
         num_targets=num_targets,
+        max_seq_len=max_seq_len,
     )
 
     if not dout.is_cuda:
@@ -781,6 +784,7 @@ def flydsl_hstu_attention_bwd(
         dout=dout,
         seq_offsets=seq_offsets,
         num_targets=num_targets,
+        max_seq_len=N,
     )
 
     # Two single-writer kernels (no atomics): the fused dV+dK kernel reduces over
@@ -893,6 +897,7 @@ def _make_bwd_kernel_runners(
         dout=dout,
         seq_offsets=seq_offsets,
         num_targets=num_targets,
+        max_seq_len=N,
     )
     dvdk_launcher, dq_launcher = _compile_bwd_launcher(
         batch=batch,

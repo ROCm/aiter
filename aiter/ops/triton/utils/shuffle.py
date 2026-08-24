@@ -179,19 +179,25 @@ def shuffle_scale_moe(
     label ("GFX1250_SCALE" for gfx1250, "CDNA4_SCALE" for gfx950) as
     ``(scale, label)``, so callers stay arch-agnostic; otherwise returns just
     the shuffled scale tensor.
+
+    On archs with no native preshuffled MX scale layout (i.e. not gfx950 /
+    gfx1250, e.g. gfx942), this is a no-op: returns ``data`` unchanged and
+    ``layout=None``, so callers can invoke this unconditionally without an
+    arch check of their own.
     """
     arch = arch or get_arch()
-    layout = None
     if arch == "gfx1250":
         tiled = _shuffle_scale_tile_gfx1250(
             data.transpose(-1, -2), preshuffle_factor, scale_kwidth
         )
         layout = "GFX1250_SCALE"
-    elif (arch or get_arch()) == "gfx950":
+    elif arch == "gfx950":
         tiled = _shuffle_scale_tile_gfx950(
             data.transpose(-1, -2), preshuffle_factor, scale_kwidth
         )
         layout = "CDNA4_SCALE"
+    else:
+        return (data, None) if return_layout else data
     scale = tiled.transpose(-1, -2)
     return (scale, layout) if return_layout else scale
 

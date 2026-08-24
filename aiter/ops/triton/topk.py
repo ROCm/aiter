@@ -6,12 +6,12 @@
 
 #  Top-K on GPU:  1-stage (tiny rows) + 2-stage (large rows) Triton kernels,
 from __future__ import annotations
-from typing import Tuple
+
 import math
+
 import torch
 import triton
 import triton.language as tl
-
 
 from aiter.ops.triton._triton_kernels.topk import (
     _topk_kernel,
@@ -34,7 +34,7 @@ def _pick_block(m: int, k: int) -> int:
 def one_stage_topk(
     x: torch.Tensor,
     k: int,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     B, M = x.shape
     BLOCK = _pick_block(M, k)
     if M > BLOCK or BLOCK > 1024:

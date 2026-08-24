@@ -18,10 +18,16 @@
 //
 // Output is UNCHANGED from the plain-grid ws variant: each (split,m,n) cell is
 // written by exactly one WG -> plain fp32 store into ws[split_k, padded_M, padded_N];
-// the reduce kernel folds bias + casts. OOB tiles (grid rounded up to a multiple of
-// the cluster dims) are guarded: their TDM row-extent clamps to 0 and the ws store
-// is skipped.  Producer/consumer sync is the SAME per-producer FREE-barrier scheme
-// as the plain variant (see below).
+// the reduce kernel folds bias + casts.  Producer/consumer sync is the SAME
+// per-producer FREE-barrier scheme as the plain variant (see below).
+//
+// The host rounds the tile grid UP to a whole number of clusters (the runtime
+// rejects a grid that is not a multiple of the cluster dims), so an edge cluster
+// carries workgroups with no tile at all. Those leave at `tile_oob` below, right
+// after paying their one cluster-barrier arrival and before any TDM is issued --
+// they never enter the ring, so the multicast group never sees a request whose
+// extents disagree with its peers'. That is what makes ANY (CWGM, CWGN) legal for
+// ANY (M, N) here: no exact-fill requirement, no divisibility assert at launch.
 //
 // Producer/consumer sync = a PER-SLOT pair of NAMED barriers (ported from the
 // 4-wave atomic cluster pipeline's data/compute run-ahead), kNumSlots-deep:
@@ -64,10 +70,19 @@ __host__ __device__ constexpr inline int opus_ctdmcl_max_i(int a, int b) {
 // Cluster geometry comes from the traits (T::kClusterWgM x T::kClusterWgN x 1);
 // default (4,4,1). The __cluster_dims__ attribute reads it off the traits directly
 // (it precedes the body where `T` is aliased), resolved at instantiation.
+//
+// Guarded like the body below, and for the same reason: SPG clusters exist only
+// on gfx1250, so a mixed-arch build's gfx950/gfx942 device pass rejects the
+// attribute outright ("'cluster_dims' is not supported for this GPU
+// architecture") even though it compiles the body away to an empty stub. The
+// host pass keeps the attribute -- that is where the launch reads the cluster
+// geometry from.
 template <typename UserTraits>
 __global__ __launch_bounds__(128, 1)
+#if defined(__gfx1250__) || !defined(__HIP_DEVICE_COMPILE__)
 __cluster_dims__(opus::remove_cvref_t<UserTraits>::kClusterWgM,
                  opus::remove_cvref_t<UserTraits>::kClusterWgN, 1)
+#endif
 void gemm_a16w16_clusterlaunch_tdm_splitk_ws_kernel_gfx1250(opus_gemm_cluster_tdm_ws_kargs_gfx1250 kargs) {
 #ifdef __HIP_DEVICE_COMPILE__
 #if defined(__gfx1250__)
@@ -144,19 +159,27 @@ void gemm_a16w16_clusterlaunch_tdm_splitk_ws_kernel_gfx1250(opus_gemm_cluster_td
     const int tile_row  = (cluster_x * T::kClusterWgM + local_x) * T::kBlockM;
     const int tile_col  = (cluster_y * T::kClusterWgN + local_y) * T::kBlockN;
 
+    // Whether this workgroup has a tile at all. `tile_row >= m` is exactly
+    // `tile_index >= ceil_div(m, B_M)` because tile_row is that index times B_M, so
+    // the test costs neither of the two runtime divisions the tile counts would, and
+    // it is workgroup-uniform. It is acted on in the prologue rather than here: a
+    // workgroup without a tile still owes the cluster barrier its one arrival.
+    const bool tile_oob = tile_row >= kargs.m || tile_col >= kargs.n;
+
     // Multicast workgroup_mask over the 16 cluster WGs (flat id = local_y*CWGM +
     // local_x, x fastest). A is shared by the CWGN peers that fix M (same local_x,
-    // vary local_y); B by the CWGM peers that fix N (same local_y, vary local_x).
-    // Writing this mask into the TDM window's workgroup_mask selects CLUSTER_LOAD_
-    // ASYNC so one load fans out to the whole group (MI400 SPG §4.10.3 / Tbl 80).
-    // NOTE: the mask names EVERY WG of the cluster, so the host launcher MUST
-    // guarantee the grid fills the cluster exactly (no OOB tail WG) -- enforced by
-    // a strict assert at launch in main.cc.
-    u16_t mask_a = 0u, mask_b = 0u;
-    #pragma unroll
-    for (int yy = 0; yy < T::kClusterWgN; ++yy) mask_a |= (u16_t)(1u << (yy * T::kClusterWgM + local_x));
-    #pragma unroll
-    for (int xx = 0; xx < T::kClusterWgM; ++xx) mask_b |= (u16_t)(1u << (local_y * T::kClusterWgM + xx));
+    // vary local_y); B by the CWGM peers that fix N (same local_y, vary local_x) --
+    // which is exactly what peers_along_y/peers_along_x name. Writing the mask into
+    // the TDM window selects CLUSTER_LOAD_ASYNC so one load fans out to the whole
+    // group (MI400 SPG §4.10.3 / Tbl 80); a degenerate cluster dim folds to mask 0
+    // (multicast off) inside the helper rather than here.
+    // The mask names every WG of the group including any that left at `tile_oob`,
+    // which neither hangs nor writes into their dead LDS: GL1 returns only to the
+    // waves that made a request. Such a request merges with fewer peers than the
+    // mask claims and so waits out its timeout, which is why an edge cluster gains
+    // less than the K loop its dead peers skipped would suggest.
+    const auto mask_a = opus::tdm_traits::peers_along_y<T::kClusterWgM, T::kClusterWgN>();
+    const auto mask_b = opus::tdm_traits::peers_along_x<T::kClusterWgM, T::kClusterWgN>();
 
     const int stride_a = kargs.stride_a;
     const int stride_b = kargs.stride_b;
@@ -226,36 +249,42 @@ void gemm_a16w16_clusterlaunch_tdm_splitk_ws_kernel_gfx1250(opus_gemm_cluster_td
         __builtin_amdgcn_s_barrier_wait(-3);
     }
 
+    // Workgroups the cluster round-up added leave here, having paid for nothing but
+    // the barrier above. Everything before this point is workgroup-scope state
+    // (named-barrier init, the -1 publish) or the cluster arrival, and the first TDM
+    // is below, so the exit costs the cluster no work it has to undo.
+    //
+    // This is the earliest point they may go, not the latest they can be caught: -3
+    // counts one arrival PER WORKGROUP, so skipping the barrier above would hang
+    // every peer of the cluster forever. Past it no peer ever waits on a departed
+    // workgroup -- every later barrier is either workgroup-scope (the DATA/FREE named
+    // barriers and the epilogue rendezvous, all four waves of a WG taking this
+    // workgroup-uniform branch together) or a multicast request that merges with
+    // whoever is present. Letting them run instead is not merely wasteful: a tile-less
+    // WG used to issue the entire K stream as ZERO-EXTENT multicast loads, so every
+    // request it made into the group disagreed with its peers' on all of its extents
+    // while still naming them in the mask.
+    if (tile_oob) return;
+
     // ---- Producers: w0 fills A slots, w1 fills B slots (kNumSlots ring). ----
     if (is_producer) {
         const int gk0 = k_step_beg * T::kBlockK;
-        const u32_t k_extent = (u32_t)(kargs.k - gk0);
-        constexpr int slot_a_b = T::kSlotBytesA;
-        constexpr int slot_b_b = T::kSlotBytesB;
+        constexpr int slot_a_e = T::kSlotElemsA;
+        constexpr int slot_b_e = T::kSlotElemsB;
         constexpr auto KStep = opus::number<T::kBlockK>{};
 
-        // TDM row extent = remaining valid rows (clamps OOB global reads on the
-        // last M/N tile). Clamp to >= 0 so a fully-OOB tile (grid rounded up to a
-        // cluster multiple, tile_row >= M) loads 0 rows / zero-fills instead of
-        // reading far OOB via a negative-cast-to-uint32 extent.
-        const int row_extent_a = opus_ctdmcl_max_i(0, kargs.m - tile_row);
-        const int row_extent_b = opus_ctdmcl_max_i(0, kargs.n - tile_col);
-
         // Producer (per wave, A on w0 / B on w1). Steps stream into a kNumSlots
-        // ring (slot = step % kNumSlots; LDS delta +slot_bytes, wrap on slot 0).
+        // ring; the window walks the global side only (move(KStep) along K) and
+        // the ring slot rides in as the per-issue LDS write offset, in elements.
         // FreeBaseN selects this producer's own FREE barrier set: FREE_A (1+P) for
         // w0, FREE_B (1+2P) for w1. Each producer only ever waits on its own set.
-        auto produce = [&](auto& w, int slot_bytes, auto FreeBaseN) __attribute__((always_inline)) {
+        auto produce = [&](auto& w, int slot_elems, auto FreeBaseN) __attribute__((always_inline)) {
             constexpr int kFreeBase = FreeBaseN.value;
-            int loaded = 0;
-            auto load_next = [&]() __attribute__((always_inline)) {
-                if (loaded > 0) {
-                    const int delta = (loaded % T::kNumSlots == 0)
-                        ? -(T::kNumSlots - 1) * slot_bytes : slot_bytes;
-                    w.move(KStep, 0_I, 0_I, 0_I, 0_I, delta);
-                }
-                w.load_to_lds();
-                ++loaded;
+            // One K step into ring slot S. Advance is off only for the very first
+            // issue, which loads the window where make_tdm() left it.
+            auto load_slot = [&](auto SlotN, auto AdvanceN) __attribute__((always_inline)) {
+                if constexpr (AdvanceN.value) w.move(KStep);
+                w.async_load((u32_t)(decltype(SlotN)::value * slot_elems));
             };
             // Steady-state slot step (compile-time slot & barrier ids; runtime K).
             // RUN-AHEAD with a 2-deep TDM overlap + LAGGED DATA signal: issue this
@@ -272,8 +301,8 @@ void gemm_a16w16_clusterlaunch_tdm_splitk_ws_kernel_gfx1250(opus_gemm_cluster_td
                 constexpr int s = decltype(sN)::value;
                 constexpr int prev2 = (s - 2 + T::kNumSlots) % T::kNumSlots;
                 bjsw(opus::number<kFreeBase + s>{});              // FREE_{A,B}[s] (wait)
-                load_next();                                      // issue load for slot s
-                __builtin_amdgcn_s_wait_tensorcnt(2);             // leave 2 in flight; prev2 landed
+                load_slot(sN, opus::number<1>{});                 // issue load for slot s
+                opus::s_wait_tensorcnt<2>();                      // leave 2 in flight; prev2 landed
                 bjs(opus::number<1 + prev2>{});                   // DATA[prev2] (signal, landed)
             };
             // Prologue: issue nload = min(kNumSlots, k_steps) TDMs, drain them, then
@@ -290,12 +319,12 @@ void gemm_a16w16_clusterlaunch_tdm_splitk_ws_kernel_gfx1250(opus_gemm_cluster_td
                 // leaving the LAST TWO prologue loads (slots P-2, P-1) in flight ->
                 // their DATA is pending (signalled lagged by the first steady steps).
                 // This starts the producer P slots ahead with 2 TDMs already overlapping.
-                opus::static_for<T::kNumSlots>([&](auto) __attribute__((always_inline)) {
-                    load_next();
+                opus::static_for<T::kNumSlots>([&](auto sN) __attribute__((always_inline)) {
+                    load_slot(sN, opus::number<(decltype(sN)::value > 0) ? 1 : 0>{});
                 });
                 opus::static_for<T::kNumSlots - 2>([&](auto jN) __attribute__((always_inline)) {
                     constexpr int j = decltype(jN)::value;
-                    __builtin_amdgcn_s_wait_tensorcnt(T::kNumSlots - 1 - j); // load j landed
+                    opus::s_wait_tensorcnt<T::kNumSlots - 1 - j>();          // load j landed
                     bjs(opus::number<1 + j>{});                              // DATA[j] (signal)
                 });
                 // Steady state: full-group main loop + once-run tail. step_slot signals
@@ -312,7 +341,7 @@ void gemm_a16w16_clusterlaunch_tdm_splitk_ws_kernel_gfx1250(opus_gemm_cluster_td
                 // but step_slot only signalled up to 2 steps back. Drain to 0 (both
                 // landed), then signal them in consume order. Runtime-select the
                 // compile-time barrier ids.
-                __builtin_amdgcn_s_wait_tensorcnt(0);
+                opus::s_wait_tensorcnt<0>();
                 const int last2_slot = (k_steps - 2) % T::kNumSlots;
                 const int last_slot  = (k_steps - 1) % T::kNumSlots;
                 opus::static_for<T::kNumSlots>([&](auto sN) __attribute__((always_inline)) {
@@ -326,8 +355,11 @@ void gemm_a16w16_clusterlaunch_tdm_splitk_ws_kernel_gfx1250(opus_gemm_cluster_td
             } else {
                 // Rare: k_steps in [1, kNumSlots-1] -> prologue only (no steady loop).
                 const int nload = k_steps;
-                for (int p = 0; p < nload; ++p) load_next();
-                __builtin_amdgcn_s_wait_tensorcnt(0);
+                opus::static_for<T::kNumSlots>([&](auto sN) __attribute__((always_inline)) {
+                    if ((int)decltype(sN)::value < nload)
+                        load_slot(sN, opus::number<(decltype(sN)::value > 0) ? 1 : 0>{});
+                });
+                opus::s_wait_tensorcnt<0>();
                 opus::static_for<T::kNumSlots>([&](auto sN) __attribute__((always_inline)) {
                     if ((int)decltype(sN)::value < nload)
                         bjs(opus::number<1 + decltype(sN)::value>{});   // DATA[s] (signal)
@@ -335,20 +367,24 @@ void gemm_a16w16_clusterlaunch_tdm_splitk_ws_kernel_gfx1250(opus_gemm_cluster_td
             }
         };  // produce
 
+        // The window takes the WHOLE tensor's extents plus this tile's origin and
+        // clamps per issue, which is what gives free OOB handling: the ragged last
+        // M/N tile needs no guard, and a K step past the end saturates the descriptor
+        // extent to 0 -- a zero-extent DMA that touches no memory but still bumps
+        // tensorcnt. Tiles that are OOB in their ENTIRETY are gone by now (tile_oob),
+        // so no zero-extent request ever enters a multicast group here.
         if (wave_id == 0) {
-            WindowA w;
-            w.make((u32_t)reinterpret_cast<u64_t>(smem_a), kargs.ptr_a, 0,
-                   k_extent, (u32_t)row_extent_a, (u64_t)stride_a,
-                   (u32_t)gk0, (u32_t)tile_row);
-            w.desc.set_workgroup_mask(mask_a);   // <=1-WG mask -> 0 -> multicast off; multi-WG mask kept for fan-out
-            produce(w, slot_a_b, opus::number<1 + T::kNumSlots>{});       // FREE_A
+            auto w = opus::make_tdm<WindowA>((u32_t)reinterpret_cast<u64_t>(smem_a), kargs.ptr_a,
+                                             (u32_t)kargs.k, (u32_t)kargs.m, (u64_t)stride_a,
+                                             (u32_t)gk0, (u32_t)tile_row);
+            w.set_workgroup_mask(mask_a);
+            produce(w, slot_a_e, opus::number<1 + T::kNumSlots>{});       // FREE_A
         } else {  // wave_id == 1 -> B
-            WindowB w;
-            w.make((u32_t)reinterpret_cast<u64_t>(smem_b), kargs.ptr_b, 0,
-                   k_extent, (u32_t)row_extent_b, (u64_t)stride_b,
-                   (u32_t)gk0, (u32_t)tile_col);
-            w.desc.set_workgroup_mask(mask_b);   // <=1-WG mask -> 0 -> multicast off; multi-WG mask kept for fan-out
-            produce(w, slot_b_b, opus::number<1 + 2 * T::kNumSlots>{});   // FREE_B
+            auto w = opus::make_tdm<WindowB>((u32_t)reinterpret_cast<u64_t>(smem_b), kargs.ptr_b,
+                                             (u32_t)kargs.k, (u32_t)kargs.n, (u64_t)stride_b,
+                                             (u32_t)gk0, (u32_t)tile_col);
+            w.set_workgroup_mask(mask_b);
+            produce(w, slot_b_e, opus::number<1 + 2 * T::kNumSlots>{});   // FREE_B
         }
         // Producer epilogue: rendezvous with the consumers at a workgroup barrier
         // before exiting, so no wave leaves while the per-slot named-barrier
@@ -448,30 +484,33 @@ void gemm_a16w16_clusterlaunch_tdm_splitk_ws_kernel_gfx1250(opus_gemm_cluster_td
     if (wave_split == 0) run(opus::true_type{});
     else                 run(opus::false_type{});
 
-    // ---- Plain store the fp32 partial into ws[split_idx][padded_m][padded_n]. ----
+    // ---- Store the partial into ws[split_idx][padded_m][padded_n]. ----
     // bias is folded once by the reduce kernel (not here).
-    constexpr int kCVec = T::kCVec;   // 4 (fp32 dwordx4)
-    DataAcc* ws_ptr = reinterpret_cast<DataAcc*>(kargs.ws_handle->ptr);
+    // OPUS_WS_BF16 (default 1): downcast the fp32 accumulator to bf16 (DataA) so
+    // the split-K-dominated reduce READ moves half the bytes (reduce re-accumulates
+    // in fp32). The reduce kernel is instantiated with the matching D_WS.
+#ifndef OPUS_WS_BF16
+#define OPUS_WS_BF16 1
+#endif
+    using DataWs          = typename std::conditional<(OPUS_WS_BF16 != 0), DataA, DataAcc>::type;
+    constexpr int kCVec   = T::kCVec; // 4 (fp32 dwordx4 / bf16 dwordx2)
+    DataWs* ws_ptr        = reinterpret_cast<DataWs*>(kargs.ptr_ws);
     const size_t ws_split = (size_t)split_idx * (size_t)kargs.stride_ws_batch;
     const size_t ws_base  = ws_split + (size_t)tile_row * (size_t)kargs.stride_ws + (size_t)tile_col;
-    const unsigned int ws_bytes =
-        (unsigned int)(((size_t)kargs.stride_ws_batch
-                        - ((size_t)tile_row * kargs.stride_ws + tile_col)) * sizeof(DataAcc));
-    auto g_ws = make_gmem<DataAcc>(ws_ptr + ws_base, ws_bytes);
+    const unsigned int ws_bytes = (unsigned int)(((size_t)kargs.stride_ws_batch -
+                                                  ((size_t)tile_row * kargs.stride_ws + tile_col)) *
+                                                 sizeof(DataWs));
+    auto g_ws                   = make_gmem<DataWs>(ws_ptr + ws_base, ws_bytes);
     auto u_gc = partition_layout_c<kCVec>(mma, opus::make_tuple((int)kargs.stride_ws, 1_I),
                     opus::make_tuple(wave_m, lane_id % mma.grpn_c, wave_n, lane_id / mma.grpn_c));
     // Consumer epilogue: rendezvous with the producers (all 4 waves) BEFORE the
-    // store -- this barrier must run for EVERY WG (incl. cluster-round-up OOB ones)
-    // or the producers (waiting at their epilogue barrier) would hang.
+    // store, or the producers (waiting at their epilogue barrier) would hang.
     __builtin_amdgcn_s_barrier();
-    // Skip the store for tiles the cluster round-up pushed past the padded workspace
-    // (padded_N = stride_ws, padded_M = stride_ws_batch / stride_ws). These OOB tiles
-    // still ran the full barrier handshake above; they just have nothing to write.
-    const int padded_n = kargs.stride_ws;
-    const int padded_m = (kargs.stride_ws != 0) ? (int)(kargs.stride_ws_batch / kargs.stride_ws) : 0;
-    if (tile_row < padded_m && tile_col < padded_n) {
-        store<kCVec>(g_ws, reg_c, u_gc, 0);
-    }
+    // Unguarded: the tiles the cluster round-up pushed past the padded workspace
+    // (padded_M = ceil(M/B_M)*B_M, and tile_row >= padded_M is the same test as
+    // tile_row >= M) left at tile_oob, so every WG still here owns a real tile.
+    auto reg_c_ws = opus::cast<DataWs>(reg_c);
+    store<kCVec>(g_ws, reg_c_ws, u_gc, 0);
 
     // Consumer epilogue: rendezvous with the producers (matches the producer's
     // workgroup barrier above) so all 4 waves of the WG exit together.

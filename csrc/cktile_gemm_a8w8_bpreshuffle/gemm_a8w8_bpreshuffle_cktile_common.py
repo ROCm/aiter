@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
-from copy import copy
-from dataclasses import dataclass
 import os
 import sys
+from copy import copy
+from dataclasses import dataclass
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
 AITER_CORE_DIR = os.path.abspath(f"{this_dir}/../../../")
@@ -15,7 +15,7 @@ else:
     )  # develop mode
 sys.path.insert(0, AITER_CORE_DIR)
 
-from chip_info import get_gfx  # noqa: E402
+from chip_info import get_gfx
 
 
 @dataclass
@@ -47,27 +47,23 @@ class kernelInstance:
             [
                 "a8w8_bpreshuffle_cktile",
                 ("x").join(
-                    map(
-                        lambda x: str(x),
-                        [
-                            self.sTransposeC,
-                            self.sUseStructuredSparsity,
-                            self.sTileParitionerGroupNum,
-                            self.sTileParitionerM01,
-                            self.sNumWaveGroups,
-                            self.sDoubleSmemBuffer,
-                            self.PadM,
-                            self.PadN,
-                            self.PadK,
-                            self.BlockPerCu,
-                        ],
-                    )
+                    str(x)
+                    for x in [
+                        self.sTransposeC,
+                        self.sUseStructuredSparsity,
+                        self.sTileParitionerGroupNum,
+                        self.sTileParitionerM01,
+                        self.sNumWaveGroups,
+                        self.sDoubleSmemBuffer,
+                        self.PadM,
+                        self.PadN,
+                        self.PadK,
+                        self.BlockPerCu,
+                    ]
                 ),
-                ("x").join(map(lambda x: str(x), [self.MTile, self.NTile, self.KTile])),
-                ("x").join(map(lambda x: str(x), [self.MWarp, self.NWarp, self.KWarp])),
-                ("x").join(
-                    map(lambda x: str(x), [self.MWTile, self.NWTile, self.KWTile])
-                ),
+                ("x").join(str(x) for x in [self.MTile, self.NTile, self.KTile]),
+                ("x").join(str(x) for x in [self.MWarp, self.NWarp, self.KWarp]),
+                ("x").join(str(x) for x in [self.MWTile, self.NWTile, self.KWTile]),
                 self.sScheduler.lower(),
             ]
         )

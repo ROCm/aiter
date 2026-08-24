@@ -417,18 +417,15 @@ def _fused_fp4_bmm_rope_cat_and_cache_mla_kernel(
                 decode_q_pe_out_ptrs, q_pe.to(decode_q_pe_out_ptr.dtype.element_ty)
             )
 
-        if OUTPUT_Q_NOPE_ZEROS:
-            if pid_adjusted < num_decode_toks_for_zeros * QH:
-                z = tl.zeros(
-                    (BLOCK_DK_nope,), dtype=q_nope_zeros_out_ptr.dtype.element_ty
-                )
-                tl.store(
-                    q_nope_zeros_out_ptr
-                    + pid_b * q_nope_zeros_out_stride_b
-                    + pid_hq * q_nope_zeros_out_stride_h
-                    + dk_nope_offs * q_nope_zeros_out_stride_d,
-                    z,
-                )
+        if OUTPUT_Q_NOPE_ZEROS and pid_adjusted < num_decode_toks_for_zeros * QH:
+            z = tl.zeros((BLOCK_DK_nope,), dtype=q_nope_zeros_out_ptr.dtype.element_ty)
+            tl.store(
+                q_nope_zeros_out_ptr
+                + pid_b * q_nope_zeros_out_stride_b
+                + pid_hq * q_nope_zeros_out_stride_h
+                + dk_nope_offs * q_nope_zeros_out_stride_d,
+                z,
+            )
 
         if pid_hq % QH_PER_KH == 0:
             pid_slot = tl.load(slot_mapping_ptr + pid_b).to(tl.int64)
@@ -798,7 +795,7 @@ def _fused_fp8_bmm_rope_cat_and_cache_mla_kernel(
 
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 
-        for k_idx in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+        for k_idx in range(tl.cdiv(K, BLOCK_SIZE_K)):
             if EVEN_K:
                 a = tl.load(a_ptrs)
                 b = tl.load(b_ptrs, cache_modifier=cache_modifier)
@@ -902,18 +899,15 @@ def _fused_fp8_bmm_rope_cat_and_cache_mla_kernel(
                 decode_q_pe_out_ptrs, q_pe.to(decode_q_pe_out_ptr.dtype.element_ty)
             )
 
-        if OUTPUT_Q_NOPE_ZEROS:
-            if pid_adjusted < num_decode_toks_for_zeros * QH:
-                z = tl.zeros(
-                    (BLOCK_DK_nope,), dtype=q_nope_zeros_out_ptr.dtype.element_ty
-                )
-                tl.store(
-                    q_nope_zeros_out_ptr
-                    + pid_b * q_nope_zeros_out_stride_b
-                    + pid_hq * q_nope_zeros_out_stride_h
-                    + dk_nope_offs * q_nope_zeros_out_stride_d,
-                    z,
-                )
+        if OUTPUT_Q_NOPE_ZEROS and pid_adjusted < num_decode_toks_for_zeros * QH:
+            z = tl.zeros((BLOCK_DK_nope,), dtype=q_nope_zeros_out_ptr.dtype.element_ty)
+            tl.store(
+                q_nope_zeros_out_ptr
+                + pid_b * q_nope_zeros_out_stride_b
+                + pid_hq * q_nope_zeros_out_stride_h
+                + dk_nope_offs * q_nope_zeros_out_stride_d,
+                z,
+            )
 
         if pid_hq % QH_PER_KH == 0:
             pid_slot = tl.load(slot_mapping_ptr + pid_b).to(tl.int64)

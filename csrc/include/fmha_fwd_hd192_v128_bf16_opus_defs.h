@@ -70,11 +70,20 @@ static constexpr int HEADTAIL_MIN_WG = 512;
 
 // Configuration traits for the D_QK=192 / D_V=128 GQA kernel.
 // Fixed MFMA 32x32x16 bf16 (same wave tile as the symmetric D=128 kernel).
+// LARGE_K_ / LARGE_V_ select how the kernel reaches a K resp. V tile. false keeps one
+// descriptor per (b, h_kv) and puts the tile offset in soffset, which needs that buffer's
+// per-head extent to fit the 32-bit num_records; true rebases the descriptor on every tile,
+// which lifts the limit but costs the rebuild per tile. They are separate because K's row
+// span is 1.5x V's at (D_QK, D_V) = (192, 128), so K crosses 4GiB at two thirds the seqlen
+// V does and there is a band where only K needs rebasing. The host picks both from the
+// actual extents, so shapes under 4GiB do not pay for the large-KV support.
 template<int Q_TILE_SIZE_ = 32,
          int KV_TILE_SIZE_ = 64,
          int NUM_WARPS_ = 8,
          bool CAUSAL_ = false,
-         bool GROUP_MODE_ = false>
+         bool GROUP_MODE_ = false,
+         bool LARGE_K_ = true,
+         bool LARGE_V_ = true>
 struct opus_gqa_d192_traits {
     static constexpr int Q_TILE_SIZE  = Q_TILE_SIZE_;
     static constexpr int KV_TILE_SIZE = KV_TILE_SIZE_;
@@ -83,6 +92,8 @@ struct opus_gqa_d192_traits {
     static constexpr int NUM_WARPS    = NUM_WARPS_;
     static constexpr bool CAUSAL      = CAUSAL_;
     static constexpr bool GROUP_MODE  = GROUP_MODE_;
+    static constexpr bool LARGE_K     = LARGE_K_;
+    static constexpr bool LARGE_V     = LARGE_V_;
     static constexpr int Q_TOTAL_TILE_SIZE  = Q_TILE_SIZE * NUM_WARPS; // 256
 
     static constexpr int WARP_SIZE  = 64; // AMD wavefront size

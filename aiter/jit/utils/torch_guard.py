@@ -1,9 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
+import importlib
+import types
+from collections.abc import Callable
+from typing import Any, Union, get_args, get_origin
+
 from packaging import version
 from packaging.version import Version
-import importlib
-from typing import Any, Callable, Optional, Union, List, get_args, get_origin
 
 aiter_lib = None
 
@@ -21,7 +24,7 @@ def is_torch_equal_or_newer(target: str) -> bool:
 
     try:
         return _is_torch_equal_or_newer(str(torch.__version__), target)
-    except Exception:
+    except Exception:  # noqa: BLE001
         # Fallback to PKG-INFO to load the package info, needed by the doc gen.
         return Version(importlib.metadata.version("torch")) >= Version(target)
 
@@ -89,7 +92,7 @@ NONE_WRAPPED_OP = [
 ]
 
 
-def generate_schema(func, mutates_args: Union[list[str], str] = "unknown") -> str:
+def generate_schema(func, mutates_args: list[str] | str = "unknown") -> str:
     import inspect
 
     import torch
@@ -108,12 +111,13 @@ def generate_schema(func, mutates_args: Union[list[str], str] = "unknown") -> st
                 type_str = f"Tensor(a{idx}!)"
             else:
                 type_str = "Tensor"
-        elif param_type == Optional[torch.Tensor]:
-            if is_mutates:
-                type_str = f"Tensor(a{idx}!)?"
-            else:
-                type_str = "Tensor?"
-        elif get_origin(param_type) is Union and torch.Tensor in get_args(param_type):
+        # Runtime comparison values, not annotations. Both spellings compare
+        # equal (Optional[T] == T | None), so either side may be written either way.
+        elif (
+            param_type == (torch.Tensor | None)
+            or get_origin(param_type) in (Union, types.UnionType)
+            and (torch.Tensor in get_args(param_type))
+        ):
             if is_mutates:
                 type_str = f"Tensor(a{idx}!)?"
             else:
@@ -122,19 +126,19 @@ def generate_schema(func, mutates_args: Union[list[str], str] = "unknown") -> st
             type_str = "SymInt"
         elif param_type in (float, bool, str):
             type_str = param_type.__name__
-        elif param_type == Optional[torch.Generator]:
+        elif param_type == (torch.Generator | None):
             type_str = "Generator?"
         elif (
-            get_origin(param_type) in (list, List)
+            get_origin(param_type) in (list, list)
             and get_args(param_type)[0] is torch.Tensor
         ):
             if is_mutates:
                 type_str = f"Tensor(a{idx}!)[]"
             else:
                 type_str = "Tensor[]"
-        elif get_origin(param_type) in (list, List) and get_args(param_type)[0] is int:
+        elif get_origin(param_type) in (list, list) and get_args(param_type)[0] is int:
             type_str = "int[]"
-        elif param_type == Optional[torch.dtype]:
+        elif param_type == (torch.dtype | None):
             type_str = "ScalarType?"
         else:
             type_str = "*"
@@ -194,10 +198,10 @@ def generate_schema(func, mutates_args: Union[list[str], str] = "unknown") -> st
 
 
 def torch_compile_guard(
-    mutates_args: Union[list[str], str] = "unknown",
+    mutates_args: list[str] | str = "unknown",
     device: str = "cpu",
-    calling_func_: Optional[Callable[..., Any]] = None,
-    gen_fake: Optional[Callable[..., Any]] = None,
+    calling_func_: Callable[..., Any] | None = None,
+    gen_fake: Callable[..., Any] | None = None,
 ):
     def decorator(func):
         # In core.py, we calling wrapper, but actually we need use aiter.op func
@@ -207,9 +211,10 @@ def torch_compile_guard(
             return func(*args, **kwargs)
 
         try:
-            import torch
-            from torch.library import Library
             import inspect
+
+            import torch
+            from torch.library import Library  # noqa: F401  availability probe
         except ImportError:
             return wrapper
 
@@ -342,10 +347,11 @@ def torch_compile_guard(
                 tags = ()
             else:
                 tags = (torch.Tag.needs_fixed_stride_order,)
-            op_schema = f"aiter::{loadName}" + schema
+            # no ns prefix: aiter_lib adds it (torch>=2.13 won't strip dup)
+            op_schema = f"{loadName}" + schema
             aiter_lib.define(op_schema, tags=tags)
-            aiter_lib.impl(f"aiter::{loadName}", custom_func, dispatch_key="CUDA")
-            aiter_lib.impl(f"aiter::{loadName}", custom_func, dispatch_key="CPU")
+            aiter_lib.impl(f"{loadName}", custom_func, dispatch_key="CUDA")
+            aiter_lib.impl(f"{loadName}", custom_func, dispatch_key="CPU")
             aiter_lib._register_fake(f"{loadName}", fake_func)
 
         return wrapper_custom

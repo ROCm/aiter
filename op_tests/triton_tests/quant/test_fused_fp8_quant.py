@@ -1,21 +1,20 @@
-import torch
 import pytest
+import torch
+import torch.nn.functional as F
+
+import aiter
+import aiter as rocm_aiter
 from aiter.ops.triton.quant.fused_fp8_quant import (
-    fused_rms_fp8_per_tensor_static_quant,
-    fused_rms_fp8_group_quant,
     fused_flatten_fp8_group_quant,
     fused_reduce_act_mul_fp8_group_quant,
     fused_reduce_rms_fp8_group_quant,
+    fused_rms_fp8_group_quant,
+    fused_rms_fp8_per_tensor_static_quant,
     fused_silu_mul_fp8_per_tensor_static_quant,
 )
-
 from aiter.test_common import (
     checkAllclose,
 )
-import aiter
-import torch.nn.functional as F
-
-import aiter as rocm_aiter
 
 rocm_aiter_fp8_dtype = rocm_aiter.dtypes.fp8
 
@@ -253,11 +252,62 @@ def test_rmsnorm_quant_fuse(m, n):
     checkAllclose(fp8_x.to(torch.float32), fp8_x_ref.to(torch.float32))
 
 
+def _assert_transpose_scale_layout(
+    y1_s_transposed, y1_s_orig, M, num_bs_cols, is_x_scale_strided
+):
+    """Shared layout checks for transpose_scale=True under both presentations.
+
+    Both is_x_scale_strided modes return the SAME column-major scale bytes; they
+    differ only in stride(0), which is how the CK bpreshuffle GEMM detects the
+    layout (PR #4406: is_x_scale_tranposed = x_scale.stride(0) != 1). In either
+    mode, reading the storage column-major (strides (1, M)) recovers the
+    row-major reference scale -- i.e. no scale value is ever scrambled.
+    """
+    assert y1_s_transposed.shape == (M, num_bs_cols)
+
+    if is_x_scale_strided:
+        # Strided column-major view: logical values match the reference directly;
+        # strides (1, M) and the transpose is contiguous.
+        torch.testing.assert_close(y1_s_transposed, y1_s_orig, atol=0, rtol=0)
+        if num_bs_cols > 1 and M > 1:
+            assert y1_s_transposed.stride() == (1, M)
+            assert y1_s_transposed.T.is_contiguous()
+            torch.testing.assert_close(
+                y1_s_transposed, y1_s_orig.t().contiguous().t(), atol=0, rtol=0
+            )
+    else:
+        # Default contiguous view: strides (num_bs_cols, 1); bit-exact with the
+        # trans->contig->view form of the reference scale.
+        assert y1_s_transposed.is_contiguous()
+        assert y1_s_transposed.stride() == (num_bs_cols, 1)
+        torch.testing.assert_close(
+            y1_s_transposed,
+            y1_s_orig.t().contiguous().view(M, num_bs_cols),
+            atol=0,
+            rtol=0,
+        )
+
+    # Shared invariant: reading the storage column-major recovers the reference,
+    # regardless of how the flag presents it (this is what #4406 does for the GEMM).
+    if num_bs_cols > 1 and M > 1:
+        recovered = torch.as_strided(y1_s_transposed, (M, num_bs_cols), (1, M))
+        torch.testing.assert_close(recovered, y1_s_orig, atol=0, rtol=0)
+
+
 @pytest.mark.parametrize("M", [1, 32, 256])
 @pytest.mark.parametrize("N1, N2", [(128, 128), (128, 7168), (7168, 7168)])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_fused_rms_fp8_group_quant_transpose_scale(M: int, N1: int, N2: int, dtype):
-    """Test that transpose_scale parameter returns scale with transposed memory layout."""
+@pytest.mark.parametrize("is_x_scale_strided", [False, True])
+def test_fused_rms_fp8_group_quant_transpose_scale(
+    M: int, N1: int, N2: int, dtype, is_x_scale_strided: bool
+):
+    """transpose_scale=True returns the (M, num_bs_cols) scale in column-major
+    storage. is_x_scale_strided selects the presentation of the same bytes:
+      False (default): contiguous view, strides (num_bs_cols, 1)  -> trans->contig->view
+      True:            strided view,   strides (1, M)             -> trans->contig->trans
+    Both are consumed by the CK bpreshuffle GEMM (PR #4406) via
+    is_x_scale_tranposed = x_scale.stride(0) != 1.
+    """
     torch.manual_seed(0)
     group_size = 128
     dtype_quant = aiter.dtypes.fp8
@@ -296,33 +346,23 @@ def test_fused_rms_fp8_group_quant_transpose_scale(M: int, N1: int, N2: int, dty
         res1=res1,
         output_unquantized_inp1=True,
         transpose_scale=True,
+        is_x_scale_strided=is_x_scale_strided,
     )
 
     num_bs_cols = (N1 + group_size - 1) // group_size
 
-    # Verify that both outputs have the same shape
+    # Default path is row-major contiguous.
     assert y1_s_orig.shape == (
         M,
         num_bs_cols,
     ), f"Expected shape (M, num_bs_cols), got {y1_s_orig.shape}"
-    assert y1_s_transposed.shape == (
-        M,
-        num_bs_cols,
-    ), f"Expected shape (M, num_bs_cols), got {y1_s_transposed.shape}"
+    assert y1_s_orig.stride() == (num_bs_cols, 1)
+    assert y1_s_orig.is_contiguous()
 
-    # Verify that transpose_scale=True version is equivalent to .transpose().contiguous().view()
-    y1_s_expected = y1_s_orig.transpose(0, 1).contiguous().view(*y1_s_orig.shape)
-
-    # Verify that both have the same shape and strides (row-major)
-    assert (
-        y1_s_orig.stride() == y1_s_transposed.stride()
-    ), "Both should have row-major strides"
-    assert (
-        y1_s_orig.is_contiguous() and y1_s_transposed.is_contiguous()
-    ), "Both should be contiguous"
-
-    # Verify numerical correctness - values should match the transpose().contiguous().view() pattern
-    torch.testing.assert_close(y1_s_transposed, y1_s_expected, atol=1e-6, rtol=1e-6)
+    # transpose_scale=True layout checks (both is_x_scale_strided modes).
+    _assert_transpose_scale_layout(
+        y1_s_transposed, y1_s_orig, M, num_bs_cols, is_x_scale_strided
+    )
 
     # Verify that other outputs are identical
     # For fp8 tensors, use exact bitwise comparison
@@ -609,10 +649,13 @@ def test_fused_reduce_rms_fp8_group_quant(
 )
 @pytest.mark.parametrize("SPK", [1, 4, 14])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("is_x_scale_strided", [False, True])
 def test_fused_reduce_rms_fp8_group_quant_transpose_scale(
-    M: int, N1: int, N2: int, N3: int, SPK: int, dtype
+    M: int, N1: int, N2: int, N3: int, SPK: int, dtype, is_x_scale_strided: bool
 ):
-    """Test that transpose_scale parameter returns scale with transposed memory layout."""
+    """transpose_scale=True returns the (M, num_bs_cols) scale in column-major
+    storage; is_x_scale_strided selects the presentation (contiguous view by
+    default, strided view when True). See _assert_transpose_scale_layout."""
     torch.manual_seed(0)
     group_size = 128
     dtype_quant = aiter.dtypes.fp8
@@ -664,33 +707,23 @@ def test_fused_reduce_rms_fp8_group_quant_transpose_scale(
         res1=res1,
         output_unquantized_inp1=True,
         transpose_scale=True,
+        is_x_scale_strided=is_x_scale_strided,
     )
 
     num_bs_cols = (N1 + group_size - 1) // group_size
 
-    # Verify that both outputs have the same shape
+    # Default path is row-major contiguous.
     assert y1_s_orig.shape == (
         M,
         num_bs_cols,
     ), f"Expected shape (M, num_bs_cols), got {y1_s_orig.shape}"
-    assert y1_s_transposed.shape == (
-        M,
-        num_bs_cols,
-    ), f"Expected shape (M, num_bs_cols), got {y1_s_transposed.shape}"
+    assert y1_s_orig.stride() == (num_bs_cols, 1)
+    assert y1_s_orig.is_contiguous()
 
-    # Verify that transpose_scale=True version is equivalent to .transpose().contiguous().view()
-    y1_s_expected = y1_s_orig.transpose(0, 1).contiguous().view(*y1_s_orig.shape)
-
-    # Verify that both have the same shape and strides (row-major)
-    assert (
-        y1_s_orig.stride() == y1_s_transposed.stride()
-    ), "Both should have row-major strides"
-    assert (
-        y1_s_orig.is_contiguous() and y1_s_transposed.is_contiguous()
-    ), "Both should be contiguous"
-
-    # Verify numerical correctness - values should match the transpose().contiguous().view() pattern
-    torch.testing.assert_close(y1_s_transposed, y1_s_expected, atol=1e-6, rtol=1e-6)
+    # transpose_scale=True layout checks (both is_x_scale_strided modes).
+    _assert_transpose_scale_layout(
+        y1_s_transposed, y1_s_orig, M, num_bs_cols, is_x_scale_strided
+    )
 
     # Verify that other outputs are identical
     # For fp8 tensors, use exact bitwise comparison
@@ -702,7 +735,7 @@ def test_fused_reduce_rms_fp8_group_quant_transpose_scale(
 
 
 def silu_mul_fp8_quantization_ref(x, x_scale, rocm_fp8_dtype):
-    m, n2 = x.shape
+    _m, n2 = x.shape
     assert n2 % 2 == 0
     n = n2 // 2
     x1, x2 = x.split([n, n], dim=-1)

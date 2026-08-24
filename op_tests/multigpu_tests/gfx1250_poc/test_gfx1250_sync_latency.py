@@ -142,7 +142,7 @@ if __name__ == "__main__":
             init_method = get_distributed_init_method(get_ip(), get_open_port())
             try:
                 latency_us = run_one(tp_size, grid, kernel, init_method)
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 import traceback
 
                 traceback.print_exc()

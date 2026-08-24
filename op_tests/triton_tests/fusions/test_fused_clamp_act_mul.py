@@ -1,17 +1,17 @@
+import pytest
 import torch
 import torch.nn.functional as F
-import pytest
 
 import aiter
 from aiter.ops.triton.fusions.fused_clamp_act_mul import (
     fused_clamp_act_mul,
 )
+from aiter.ops.triton.utils.shuffle import unshuffle_scale_gemm
 from aiter.utility import fp4_utils
 from op_tests.triton_tests.quant.test_fused_fp8_quant import (
     per_token_fp8_group_quant,
     upcast,
 )
-from aiter.ops.triton.utils.shuffle import unshuffle_scale_gemm
 
 
 def _torch_reference(inp, swiglu_limit, weights, dtype_quant):

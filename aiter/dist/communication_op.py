@@ -15,7 +15,7 @@
 * limitations under the License.
 """
 
-from typing import Any, Dict, Optional, Union
+from typing import Any
 
 import torch
 import torch.distributed
@@ -23,11 +23,11 @@ import torch.distributed
 from aiter.ops.enum import QuantType
 
 from .parallel_state import (
-    get_tp_group,
-    get_pp_group,
+    get_custom_group,
     get_dp_group,
     get_ep_group,
-    get_custom_group,
+    get_pp_group,
+    get_tp_group,
     has_custom_group,
 )
 
@@ -66,7 +66,7 @@ def _normalize_fused_ar_rms_quant_type(quant_type):
             return "mxfp4"
         try:
             return _normalize_fused_ar_rms_quant_type(QuantType(quant_type))
-        except Exception:
+        except Exception:  # noqa: BLE001,S110
             pass
     raise ValueError(
         "unsupported fused AR+RMSNorm quant_type="
@@ -81,7 +81,10 @@ _PER_GROUP_QUANT_ALIASES = frozenset(
 )
 _PER_GROUP_QUANT_VALUES = frozenset(
     q.value
-    for q in (getattr(QuantType, "per_1x128", None), getattr(QuantType, "per_128x128", None))
+    for q in (
+        getattr(QuantType, "per_1x128", None),
+        getattr(QuantType, "per_128x128", None),
+    )
     if q is not None
 )
 _PER_TOKEN_QUANT_VALUES = frozenset(
@@ -310,14 +313,14 @@ def tensor_model_parallel_all_gather(
 
 def tensor_model_parallel_gather(
     input_: torch.Tensor, dst: int = 0, dim: int = -1
-) -> Optional[torch.Tensor]:
+) -> torch.Tensor | None:
     """Gather the input tensor across model parallel group."""
     _assert_no_custom_group("tensor_model_parallel_gather")
     return get_tp_group().gather(input_, dst, dim)
 
 
 def broadcast_tensor_dict(
-    tensor_dict: Optional[Dict[Any, Union[torch.Tensor, Any]]] = None, src: int = 0
+    tensor_dict: dict[Any, torch.Tensor | Any] | None = None, src: int = 0
 ):
     _assert_no_custom_group("broadcast_tensor_dict")
     if not torch.distributed.is_initialized():
@@ -356,7 +359,7 @@ def expert_parallel_reduce_scatter(
 
 def expert_parallel_gather(
     input_: torch.Tensor, dst: int = 0, dim: int = -1
-) -> Optional[torch.Tensor]:
+) -> torch.Tensor | None:
     """Gather the input tensor across expert parallel group."""
     _assert_no_custom_group("expert_parallel_gather")
     return get_ep_group().gather(input_, dst, dim)
@@ -369,7 +372,7 @@ def expert_parallel_broadcast(input_: torch.Tensor, src: int = 0) -> torch.Tenso
 
 
 def expert_parallel_broadcast_tensor_dict(
-    tensor_dict: Optional[Dict[Any, Union[torch.Tensor, Any]]] = None, src: int = 0
+    tensor_dict: dict[Any, torch.Tensor | Any] | None = None, src: int = 0
 ):
     """Broadcast a tensor dict across expert parallel group."""
     _assert_no_custom_group("expert_parallel_broadcast_tensor_dict")
@@ -409,7 +412,7 @@ def data_parallel_reduce_scatter(
 
 def data_parallel_gather(
     input_: torch.Tensor, dst: int = 0, dim: int = -1
-) -> Optional[torch.Tensor]:
+) -> torch.Tensor | None:
     """Gather the input tensor across data parallel group."""
     _assert_no_custom_group("data_parallel_gather")
     return get_dp_group().gather(input_, dst, dim)
@@ -422,7 +425,7 @@ def data_parallel_broadcast(input_: torch.Tensor, src: int = 0) -> torch.Tensor:
 
 
 def data_parallel_broadcast_tensor_dict(
-    tensor_dict: Optional[Dict[Any, Union[torch.Tensor, Any]]] = None, src: int = 0
+    tensor_dict: dict[Any, torch.Tensor | Any] | None = None, src: int = 0
 ):
     """Broadcast a tensor dict across data parallel group."""
     _assert_no_custom_group("data_parallel_broadcast_tensor_dict")
@@ -460,16 +463,14 @@ def pipeline_model_parallel_broadcast(
     return get_pp_group().broadcast(input_, src)
 
 
-def pipeline_model_parallel_send(
-    input_: torch.Tensor, dst: Optional[int] = None
-) -> None:
+def pipeline_model_parallel_send(input_: torch.Tensor, dst: int | None = None) -> None:
     """Send a tensor to the next stage in the pipeline."""
     _assert_no_custom_group("pipeline_model_parallel_send")
     get_pp_group().send(input_, dst)
 
 
 def pipeline_model_parallel_recv(
-    size: torch.Size, dtype: torch.dtype, src: Optional[int] = None
+    size: torch.Size, dtype: torch.dtype, src: int | None = None
 ) -> torch.Tensor:
     """Receive a tensor from the previous stage in the pipeline."""
     _assert_no_custom_group("pipeline_model_parallel_recv")
@@ -477,7 +478,7 @@ def pipeline_model_parallel_recv(
 
 
 def pipeline_model_parallel_broadcast_tensor_dict(
-    tensor_dict: Optional[Dict[Any, Union[torch.Tensor, Any]]] = None, src: int = 0
+    tensor_dict: dict[Any, torch.Tensor | Any] | None = None, src: int = 0
 ):
     """Broadcast a tensor dict across pipeline parallel group."""
     _assert_no_custom_group("pipeline_model_parallel_broadcast_tensor_dict")
@@ -495,7 +496,7 @@ def custom_all_reduce(
     input_: torch.Tensor,
     use_new: bool = True,
     open_fp8_quant: bool = False,
-    group: Optional[str] = None,
+    group: str | None = None,
 ) -> torch.Tensor:
     """All-reduce the input tensor across the user-specified custom group.
 
@@ -512,7 +513,7 @@ def custom_all_gather(
     input_: torch.Tensor,
     use_custom: bool = True,
     dim: int = 0,
-    group: Optional[str] = None,
+    group: str | None = None,
 ) -> torch.Tensor:
     """All-gather the input tensor across the user-specified custom group.
 
@@ -529,7 +530,7 @@ def custom_reduce_scatter(
     input_: torch.Tensor,
     use_custom: bool = True,
     dim: int = 0,
-    group: Optional[str] = None,
+    group: str | None = None,
 ) -> torch.Tensor:
     """Reduce-scatter the input tensor across the user-specified custom group.
 

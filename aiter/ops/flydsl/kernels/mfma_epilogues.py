@@ -33,11 +33,11 @@ modules (`arith`, `vector`, `gpu`) and the `range_constexpr` iterator.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from contextlib import contextmanager
-from typing import Callable
 
-from flydsl._mlir import ir
 import flydsl.expr as fx
+from flydsl._mlir import ir
 from flydsl._mlir.dialects.arith import CmpIPredicate
 from flydsl.expr.typing import T
 
@@ -264,7 +264,7 @@ def c_shuffle_epilog(
         for mr in range_constexpr(m_reps_s):
             row_local, row, row_ctx, row_pred = _precomputed_rows_s[mr]
 
-            def _do_store_row_split():
+            def _do_store_row_split(row=row, row_ctx=row_ctx, row_local=row_local):
                 row_base_lds = row_local * _half_n_idx
                 for nr in range_constexpr(n_reps_s):
                     col_base_nr = arith.constant(
@@ -395,7 +395,7 @@ def c_shuffle_epilog(
     for mr in range_constexpr(m_reps_shuffle):
         row_local, row, row_ctx, row_pred = _precomputed_rows[mr]
 
-        def _do_store_row():
+        def _do_store_row(row=row, row_ctx=row_ctx, row_local=row_local):
             row_base_lds = row_local * tile_n_idx
             if _lds_row_base_offset is not None:
                 row_base_lds = row_base_lds + _lds_row_base_offset

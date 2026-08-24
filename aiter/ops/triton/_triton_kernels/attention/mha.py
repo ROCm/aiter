@@ -2,16 +2,19 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import functools
-import json
+
 import torch
 import triton
 import triton.language as tl
 
 from aiter.ops.triton.utils._triton import arch_info
-from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
-from aiter.ops.triton.utils._triton.pid_preprocessing import remap_xcd
-from aiter.ops.triton.utils._triton.mha_kernel_utils import _compute_fp8_scaling_factors
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+from aiter.ops.triton.utils._triton.mha_kernel_utils import _compute_fp8_scaling_factors
+from aiter.ops.triton.utils._triton.pid_preprocessing import (
+    remap_workgroup_spatial,
+    remap_xcd,
+)
+from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH, load_config_json
 
 
 @triton.jit
@@ -359,6 +362,7 @@ def _attn_fwd(
     VARLEN: tl.constexpr,
     BATCH,
     NUM_XCD: tl.constexpr,
+    SWIZZLE: tl.constexpr,
     USE_INT64_STRIDES: tl.constexpr,
     ENABLE_SINK: tl.constexpr,
     SLIDING_WINDOW: tl.constexpr,
@@ -371,10 +375,22 @@ def _attn_fwd(
     )  # workgroup id ranging: 0,1,2,...., (BATCH * NUM_Q_HEADS * NUM_BLOCKS - 1)
     # num blocks along seqlen
 
-    off_q_head = wid % NUM_Q_HEADS
-    off_q_head = remap_xcd(off_q_head, NUM_Q_HEADS, NUM_XCD)
-    start_m = (wid // NUM_Q_HEADS) % NUM_BLOCKS
-    off_z = (wid // (NUM_BLOCKS * NUM_Q_HEADS)) % BATCH
+    tl.static_assert(
+        SWIZZLE == "default" or SWIZZLE == "spatial",
+        "SWIZZLE must be 'default' or 'spatial'; set via AITER_TRITON_MHA_SWIZZLE or mha_set_swizzle()",
+    )
+    if SWIZZLE == "default":
+        # Default: head-first round-robin with XCD-aware head remapping.
+        off_q_head = wid % NUM_Q_HEADS
+        off_q_head = remap_xcd(off_q_head, NUM_Q_HEADS, NUM_XCD)
+        start_m = (wid // NUM_Q_HEADS) % NUM_BLOCKS
+        off_z = (wid // (NUM_BLOCKS * NUM_Q_HEADS)) % BATCH
+    else:
+        # Spatial: XCD-aware KV-head mapping for MHA and GQA.
+        NUM_QUERIES_PER_KV: tl.constexpr = NUM_Q_HEADS // NUM_K_HEADS
+        off_q_head, start_m, off_z = remap_workgroup_spatial(
+            wid, NUM_Q_HEADS, NUM_BLOCKS, BATCH, NUM_QUERIES_PER_KV, NUM_XCD
+        )
 
     # offsets
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -870,15 +886,14 @@ def _attn_fwd(
     end_m_idx = (start_m + 1) * BLOCK_M
     start_m_idx = start_m * BLOCK_M
     causal_start_idx = seqlen_q - seqlen_k
-    if IS_CAUSAL:
-        if causal_start_idx > start_m_idx and causal_start_idx < end_m_idx:
-            out_mask_boundary = tl.full(
-                (BLOCK_DMODEL_POW2,), causal_start_idx, dtype=tl.int32
-            )
-            mask_m_offsets = start_m_idx + tl.arange(0, BLOCK_M)
-            out_ptrs_mask = mask_m_offsets[:, None] >= out_mask_boundary[None, :]
-            z = 0.0
-            acc = tl.where(out_ptrs_mask, acc, z.to(acc.type.element_ty))
+    if IS_CAUSAL and causal_start_idx > start_m_idx and causal_start_idx < end_m_idx:
+        out_mask_boundary = tl.full(
+            (BLOCK_DMODEL_POW2,), causal_start_idx, dtype=tl.int32
+        )
+        mask_m_offsets = start_m_idx + tl.arange(0, BLOCK_M)
+        out_ptrs_mask = mask_m_offsets[:, None] >= out_mask_boundary[None, :]
+        z = 0.0
+        acc = tl.where(out_ptrs_mask, acc, z.to(acc.type.element_ty))
 
     # write back LSE(Log Sum Exponents), the log of the normalization constant
     overflow_size = end_m_idx - seqlen_q
@@ -935,15 +950,11 @@ def _get_config(
     enable_dropout: bool,
     dtype: torch.dtype,
     has_pe: bool = False,
+    head_dim_v: int | None = None,
 ):
-    if not hasattr(_get_config, "_config_dict"):
-        dev = arch_info.get_arch()
-        _get_config._config_dict = {}
-        fpath = f"{AITER_TRITON_CONFIGS_PATH}/{dev}-MHA-DEFAULT.json"
-        with open(fpath, "r") as file:
-            config = json.load(file)
-        _get_config._config_dict["default"] = config
-    fwd_cfg = _get_config._config_dict["default"]["fwd"]
+    dev = arch_info.get_arch()
+    config = load_config_json(f"{AITER_TRITON_CONFIGS_PATH}/{dev}-MHA-DEFAULT.json")
+    fwd_cfg = config["fwd"]
     has_dropout_or_fp32 = enable_dropout or dtype == torch.float32
     # TODO: pe + dropout is not tuned
     if has_pe and has_dropout_or_fp32 and "pe_dropout_or_fp32" in fwd_cfg:
@@ -952,5 +963,11 @@ def _get_config(
         return fwd_cfg["pe"]
     elif enable_dropout or dtype == torch.float32:
         return fwd_cfg["dropout_or_fp32"]
+    elif head_dim_v is not None and 16 < head_dim_v <= 64 and "small_head" in fwd_cfg:
+        # Mid-small V head dims (16 < d <= 64) hit a num_stages=1 software-pipelining
+        # pathology on this backend (e.g. ~3x slower at d64). Using num_stages=3
+        # recovers performance and is numerically verified for these dims, but
+        # regresses d128 and miscompiles d<=16, so only 16 < d <= 64 uses this path.
+        return fwd_cfg["small_head"]
     else:
         return fwd_cfg["default"]

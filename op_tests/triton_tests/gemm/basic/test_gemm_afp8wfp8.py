@@ -4,12 +4,12 @@
 import pytest
 import torch
 
+from aiter.ops.shuffle import shuffle_weight
 from aiter.ops.triton.gemm.basic.gemm_afp8wfp8 import (
     gemm_afp8wfp8,
     gemm_afp8wfp8_preshuffle,
 )
-from aiter.ops.shuffle import shuffle_weight
-import aiter.ops.triton.utils._triton.arch_info as arch_info
+from aiter.ops.triton.utils._triton import arch_info
 
 SCALE_GROUP_SIZE = 32  # A: 1x32 e8m0 scale group
 W_SCALE_K_GROUP = 128  # B: 128 in K direction

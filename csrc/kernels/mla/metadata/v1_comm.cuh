@@ -4,13 +4,13 @@
 #pragma once
 
 #include "aiter_hip_common.h"
+#include "aiter_stream.h"
+#include "aiter_tensor.h"
 #include "custom_all_reduce.cuh"
 #include "mla.h"
 #include "opus/opus.hpp"
 #include "pa.h"
-#include <ATen/hip/HIPContext.h>
-#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
-#include <torch/python.h>
+#include <hip/hip_runtime.h>
 
 // Integer utility helpers (replacing ck_tile equivalents)
 template <typename T>

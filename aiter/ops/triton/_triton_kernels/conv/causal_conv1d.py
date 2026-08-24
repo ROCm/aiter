@@ -416,7 +416,6 @@ def _causal_conv1d_update_kernel(
     BLOCK_N: tl.constexpr,
     SAVE_INTERMEDIATE: tl.constexpr,
 ):
-    # ruff: noqa: E501
     idx_seq = tl.program_id(0)
     if idx_seq >= batch:
         return

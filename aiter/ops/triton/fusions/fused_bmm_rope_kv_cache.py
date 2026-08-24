@@ -1,30 +1,28 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-from typing import Optional, Tuple
 
 import torch
 import triton
 
-from aiter.ops.triton.utils._triton import arch_info
-from aiter.ops.triton.utils.logger import AiterTritonLogger
-from aiter.ops.triton.utils.common_utils import deserialize_str
-from aiter.ops.triton.gemm.basic.gemm_a16wfp4 import get_splitk
-from aiter.ops.triton._triton_kernels.gemm.batched.batched_gemm_a16wfp4 import (
-    _get_config as _get_fp4_config,
+from aiter.ops.triton._triton_kernels.fusions.fused_bmm_rope_kv_cache import (
+    _fused_fp4_bmm_reduce_kernel,
+    _fused_fp4_bmm_rope_cat_and_cache_mla_kernel,
+    _fused_fp8_bmm_rope_cat_and_cache_mla_kernel,
 )
 from aiter.ops.triton._triton_kernels.gemm.batched.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (
     _get_config as _get_fp8_config,
 )
-from aiter.ops.triton._triton_kernels.fusions.fused_bmm_rope_kv_cache import (
-    _fused_fp4_bmm_rope_cat_and_cache_mla_kernel,
-    _fused_fp4_bmm_reduce_kernel,
-    _fused_fp8_bmm_rope_cat_and_cache_mla_kernel,
+from aiter.ops.triton._triton_kernels.gemm.batched.batched_gemm_a16wfp4 import (
+    _get_config as _get_fp4_config,
 )
+from aiter.ops.triton.gemm.basic.gemm_a16wfp4 import get_splitk
+from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.common_utils import deserialize_str
+from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
 
-global _USE_GEMM_SPLITK_BF16
 _USE_GEMM_SPLITK_BF16 = False
 
 
@@ -45,16 +43,16 @@ def fused_fp4_bmm_rope_cat_and_cache_mla(
     positions: torch.Tensor,
     cos: torch.Tensor,
     sin: torch.Tensor,
-    y: Optional[torch.Tensor] = None,
+    y: torch.Tensor | None = None,
     transpose_bm: bool = True,
     prequant: bool = True,
-    y_scale: Optional[torch.Tensor] = None,
-    config: Optional[str] = None,
-    k_scale: Optional[torch.Tensor] = None,
+    y_scale: torch.Tensor | None = None,
+    config: str | None = None,
+    k_scale: torch.Tensor | None = None,
     is_neox: bool = False,
     q_out_dtype=None,
     num_decode_toks_for_zeros: int = 0,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Fused FP4 BMM + RoPE + concat + KV-cache write for MLA.
 
@@ -127,7 +125,7 @@ def fused_fp4_bmm_rope_cat_and_cache_mla(
     bk, kh, kv_lora_rank = k_nope.shape
     bk2, kh2, qk_rope_head_dim = k_rope.shape
 
-    b_cache, h_cache, d_cache = kv_cache.shape
+    _b_cache, h_cache, d_cache = kv_cache.shape
     (b_slot,) = slot_mapping.shape
 
     assert (
@@ -392,12 +390,12 @@ def fused_fp8_bmm_rope_cat_and_cache_mla(
     sin: torch.Tensor,
     group_size: int = 128,
     transpose_bm: bool = True,
-    config: Optional[dict] = None,
-    k_scale: Optional[torch.Tensor] = None,
+    config: dict | None = None,
+    k_scale: torch.Tensor | None = None,
     is_neox: bool = False,
-    q_out_dtype: Optional[torch.dtype] = torch.bfloat16,
+    q_out_dtype: torch.dtype | None = torch.bfloat16,
     num_decode_toks_for_zeros: int = 0,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Fused FP8 BMM + RoPE + concat + KV-cache write for MLA.
 
@@ -466,7 +464,7 @@ def fused_fp8_bmm_rope_cat_and_cache_mla(
     bk, kh, kv_lora_rank = k_nope.shape
     bk2, kh2, qk_rope_head_dim = k_rope.shape
 
-    b_cache, h_cache, d_cache = kv_cache.shape
+    _b_cache, h_cache, d_cache = kv_cache.shape
     (b_slot,) = slot_mapping.shape
 
     assert (

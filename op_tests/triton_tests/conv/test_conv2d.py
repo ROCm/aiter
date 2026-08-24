@@ -37,13 +37,13 @@ from aiter.ops.triton.utils._triton.arch_info import get_arch
 
 from ._helpers import (
     ALL_SUPPORTED_ARCHS,
-    TestSuite,
     ORDERED_METHODS,
-    run_edge_cases,
+    TestSuite,
     run_activations,
+    run_cross_method,
+    run_edge_cases,
     run_no_bias,
     run_random_fuzzing,
-    run_cross_method,
 )
 
 # Module-level arch gate. Skip the whole test module on unsupported archs

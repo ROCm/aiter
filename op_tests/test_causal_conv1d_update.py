@@ -34,7 +34,7 @@ def causal_conv1d_update(
     pad_slot_id=-1,
 ):
     """Wrapper for aiter.causal_conv1d_update."""
-    batch, dim, seqlen = x.shape
+    _batch, _dim, _seqlen = x.shape
     out = torch.zeros_like(x)
     weight_tensor = weight.to(dtype=x.dtype) if weight.dtype != x.dtype else weight
     if bias is None:

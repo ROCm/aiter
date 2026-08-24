@@ -24,7 +24,6 @@ See ``aiter/csrc/include/pa_sparse_prefill_opus.h`` for the C++ API.
 """
 
 import torch
-from typing import Optional
 
 from ..jit.core import compile_ops
 from ..jit.utils.chip_info import get_gfx_runtime
@@ -58,7 +57,7 @@ def _pa_sparse_prefill_opus_fake(
     kv_indptr_extend: torch.Tensor,
     attn_sink: torch.Tensor,
     softmax_scale: float,
-    out: Optional[torch.Tensor] = None,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return out if out is not None else torch.empty_like(q)
 
@@ -74,7 +73,7 @@ def pa_sparse_prefill_opus(
     kv_indptr_extend: torch.Tensor,
     attn_sink: torch.Tensor,
     softmax_scale: float,
-    out: Optional[torch.Tensor] = None,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Sparse prefill attention over two KV sources (paged ``unified_kv`` +
     flat per-fwd ``kv``), backed by the OPUS gfx950 HIP kernel.
@@ -173,7 +172,7 @@ def _pa_sparse_prefill_fp8_opus_fake(
     kv_indptr_extend: torch.Tensor,
     attn_sink: torch.Tensor,
     softmax_scale: float,
-    out: Optional[torch.Tensor] = None,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if out is not None:
         return out
@@ -195,7 +194,7 @@ def pa_sparse_prefill_fp8_opus(
     kv_indptr_extend: torch.Tensor,
     attn_sink: torch.Tensor,
     softmax_scale: float,
-    out: Optional[torch.Tensor] = None,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Sparse prefill attention with split fp8 NoPE and bf16 RoPE inputs.
 
@@ -264,8 +263,8 @@ def pa_sparse_prefill_fp8_opus(
 
 
 __all__ = [
-    "pa_sparse_prefill_opus_fwd",
-    "pa_sparse_prefill_opus",
-    "pa_sparse_prefill_fp8_opus_fwd",
     "pa_sparse_prefill_fp8_opus",
+    "pa_sparse_prefill_fp8_opus_fwd",
+    "pa_sparse_prefill_opus",
+    "pa_sparse_prefill_opus_fwd",
 ]

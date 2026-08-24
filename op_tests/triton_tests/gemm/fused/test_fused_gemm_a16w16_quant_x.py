@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import pytest
 import torch
 import torch.nn.functional as F
-import pytest
 
 from aiter.ops.triton.gemm.fused.fused_gemm_a16w16_quant_x import (
     fused_gemm_a16w16_quant_x,

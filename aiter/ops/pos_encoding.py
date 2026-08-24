@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 from torch import Tensor
+
 from ..jit.core import compile_ops
 
 MD_NAME = "module_pos_encoding"

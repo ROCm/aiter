@@ -10,10 +10,11 @@
 import argparse
 import itertools
 
-import aiter
 import numpy as np
 import pandas as pd
 import torch
+
+import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.test_common import benchmark, checkAllclose, run_perftest

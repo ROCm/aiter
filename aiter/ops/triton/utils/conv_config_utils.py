@@ -3,16 +3,15 @@
 
 import copy
 import functools
-import json
-import os
-from typing import Optional, Tuple
 
 from aiter.ops.triton.utils._triton import arch_info
-from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
+from aiter.ops.triton.utils.core import (
+    AITER_TRITON_CONFIGS_PATH,
+    USE_LRU_CACHE,
+    load_config_json,
+)
 
-USE_LRU_CACHE = True
-
-STANDARD_M_BOUNDS: Tuple[int, ...] = (
+STANDARD_M_BOUNDS: tuple[int, ...] = (
     4,
     8,
     16,
@@ -57,44 +56,17 @@ def format_shape_key(
     )
 
 
-def _load_config_file(
-    cache_dict: dict,
-    cache_key: str,
-    fpath: str,
-    fpath_should_exist: bool = True,
-) -> bool:
-    if os.path.exists(fpath):
-        with open(fpath, "r") as file:
-            cache_dict[cache_key] = json.load(file)
-        return True
-    elif fpath_should_exist:
-        raise AssertionError(f"Required config file doesn't exist: {fpath}")
-    return False
-
-
 @functools.lru_cache(maxsize=512 if USE_LRU_CACHE else 0)
 def _get_conv_config_cached(
     config_name: str,
-    shape_key: Optional[str],
-    M: Optional[int],
+    shape_key: str | None,
+    M: int | None,
 ) -> dict:
     """Three-tier walk: literal shape entry -> M_LEQ bucket -> 'any'."""
-    if not hasattr(_get_conv_config_cached, "_file_cache"):
-        _get_conv_config_cached._file_cache = {}
-
     dev = arch_info.get_arch()
-    file_cache_key = f"{dev}_{config_name}"
-
-    if file_cache_key not in _get_conv_config_cached._file_cache:
-        fpath = f"{AITER_TRITON_CONFIGS_PATH}/conv/{dev}-{config_name}.json"
-        _load_config_file(
-            _get_conv_config_cached._file_cache,
-            file_cache_key,
-            fpath,
-            fpath_should_exist=True,
-        )
-
-    config_dict = _get_conv_config_cached._file_cache[file_cache_key]
+    config_dict = load_config_json(
+        f"{AITER_TRITON_CONFIGS_PATH}/conv/{dev}-{config_name}.json"
+    )
 
     # Tier 1: literal shape key.
     shapes = config_dict.get("shapes", {})
@@ -120,8 +92,8 @@ def _get_conv_config_cached(
 
 def get_conv_config(
     config_name: str,
-    shape_key: Optional[str] = None,
-    M: Optional[int] = None,
+    shape_key: str | None = None,
+    M: int | None = None,
 ) -> dict:
     """Load a conv kernel config for the running GPU arch.
 

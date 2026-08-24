@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import argparse
+
 import torch
 import torch.nn.functional as F
+
 import aiter
-from aiter.test_common import checkAllclose, perftest
 from aiter import dtypes
-import argparse
+from aiter.test_common import checkAllclose, perftest
 
 
 @perftest()
@@ -69,7 +71,7 @@ def test_rmsnorm2d(dtype, m, n):
     (a, *_), avg_a = run_torch(input, weight, 1e-5)
     (b, *_), avg_b = run_ck(input, weight, 1e-5)
     (c, *_), avg_c = run_cu(input, weight, 1e-5)
-    msg = f"[perf] dim: {str(dim):<20}, dtype: {dtype}, torch avg: {avg_a:<8.2f} us, ck avg: {avg_b:<8.2f} us, cu avg: {avg_c:<8.2f} us, uplift: {avg_a/avg_b-1:<5.1%}"
+    msg = f"[perf] dim: {dim!s:<20}, dtype: {dtype}, torch avg: {avg_a:<8.2f} us, ck avg: {avg_b:<8.2f} us, cu avg: {avg_c:<8.2f} us, uplift: {avg_a/avg_b-1:<5.1%}"
     checkAllclose(a, b, msg=msg)
     checkAllclose(a, c, msg="cu")
 
@@ -86,9 +88,9 @@ def test_rmsnorm2d_fuseAdd(dtype, m, n):
     (c, res_c, *_), avg_c = run_ck(
         input, weight, 1e-5, residual=res, use_model_sensitive_rmsnorm=1
     )
-    (d, res_d, *_), avg_d = run_cu(input, weight, 1e-5, residual=res)
+    (_d, _res_d, *_), _avg_d = run_cu(input, weight, 1e-5, residual=res)
 
-    msg = f"[perf] dim: {str(dim):<20}, dtype: {dtype}, torch avg: {avg_a:<8.2f} us, ck avg: {avg_b:<8.2f} us, cu avg: {avg_c:<8.2f} us,uplift: {avg_a/avg_b-1:<5.1%}"
+    msg = f"[perf] dim: {dim!s:<20}, dtype: {dtype}, torch avg: {avg_a:<8.2f} us, ck avg: {avg_b:<8.2f} us, cu avg: {avg_c:<8.2f} us,uplift: {avg_a/avg_b-1:<5.1%}"
     checkAllclose(a, b, atol=0.03, msg=msg)
     checkAllclose(res_a, res_b, msg="ck res check (NO_SPECIFIC_MODEL)")
 

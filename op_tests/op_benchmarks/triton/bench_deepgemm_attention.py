@@ -1,22 +1,21 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import random
 import argparse
+import os
+import random
 
 import torch
-import os
-
 import triton
 
-from aiter.test_common import run_perftest
+from aiter.ops.shuffle import shuffle_weight
 from aiter.ops.triton.attention.pa_mqa_logits import (
     deepgemm_fp8_paged_mqa_logits,
     deepgemm_fp8_paged_mqa_logits_schedule,
 )
-from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
 from aiter.ops.triton.utils._triton import arch_info
-from aiter.ops.shuffle import shuffle_weight
+from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
+from aiter.test_common import run_perftest
 
 
 def cdiv(x: int, y: int) -> int:
@@ -57,8 +56,8 @@ def ref_fp8_paged_mqa_logits(
     block_tables: torch.Tensor,
     max_model_len: int,
 ):
-    batch_size, next_n, heads, dim = q.size()
-    num_block, block_size, _, dim = kv_cache.size()
+    batch_size, next_n, _heads, _dim = q.size()
+    _num_block, block_size, _, _dim = kv_cache.size()
     logits = torch.full(
         [batch_size * next_n, max_model_len],
         float("-inf"),
@@ -107,8 +106,8 @@ def ref_fp8_paged_mqa_logits_ragged(
     kv_indices: torch.Tensor,
     max_model_len: int,
 ):
-    batch_size, next_n, heads, dim = q.size()
-    seq_kv, block_size, dim = kv_cache.size()  # 3d
+    batch_size, next_n, _heads, _dim = q.size()
+    _seq_kv, _block_size, _dim = kv_cache.size()  # 3d
     logits = torch.full(
         [batch_size * next_n, max_model_len],
         float("-inf"),
@@ -398,7 +397,9 @@ def run_benchmark(args: argparse.Namespace):
 
             padded_str = "T" if args.padding else "F"
             os.makedirs(aot_kernel_dir, exist_ok=True)
-            aot_name = f"paged_mqa_logits{"_preshuffle" if args.kv_preshuffle else ""}{"_varctx" if EnableVarCtxOpt else ""}_{heads}x{ChunkK}x{index_dim}_B{blocksize}P{padded_str}W{WavePerEU}"
+            # Inner quotes must differ from the outer ones: reusing them is PEP 701
+            # (Python 3.12+) and leaves this module unparseable on 3.10/3.11.
+            aot_name = f"paged_mqa_logits{'_preshuffle' if args.kv_preshuffle else ''}{'_varctx' if EnableVarCtxOpt else ''}_{heads}x{ChunkK}x{index_dim}_B{blocksize}P{padded_str}W{WavePerEU}"
 
             src = os.path.join(triton_cache_dir, cache_key)
             dst = os.path.join(aot_kernel_dir, aot_name)

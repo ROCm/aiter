@@ -1,15 +1,17 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+from typing import Any
+
 import torch
 import triton
 import triton.language as tl
-from typing import Any, Dict
-from aiter.ops.triton.utils.logger import AiterTritonLogger
+
 from aiter.ops.triton._triton_kernels.moe.moe_op_mxfp4_silu_fused import (
     _fused_moe_kernel_mxfp4_silu,
     get_scaled_dot_format_string,
 )
+from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.types import torch_to_triton_dtype
 
 _LOGGER = AiterTritonLogger()
@@ -32,7 +34,7 @@ def fused_moe_mxfp4_silu(
     top_k: int,
     swizzle_mx_a: bool,
     swizzle_mx_b: bool,
-    config: Dict[str, Any],
+    config: dict[str, Any],
     compute_type: tl.dtype,
 ) -> None:
     """
@@ -97,7 +99,7 @@ def fused_moe_mxfp4_silu(
     B_tl_dtype = torch_to_triton_dtype[B.dtype]
     B_DTYPE_FORMAT = get_scaled_dot_format_string(B_tl_dtype)
 
-    grid = lambda META: (  # noqa: E731
+    grid = lambda META: (
         triton.cdiv(EM, META["BLOCK_SIZE_M"])
         * triton.cdiv(B.shape[1], META["BLOCK_SIZE_N"]),
     )

@@ -9,7 +9,6 @@ import argparse
 import logging
 import os
 from multiprocessing import Pool, freeze_support, set_start_method
-from typing import Optional
 
 import pandas as pd
 import torch
@@ -28,8 +27,8 @@ from aiter.dist.parallel_state import (
 )
 from aiter.dist.utils import get_distributed_init_method, get_ip, get_open_port
 from aiter.ops.custom_all_reduce import (
-    fused_allreduce_mhc_post_only,
     fused_allreduce_mhc_post_one_stage,
+    fused_allreduce_mhc_post_only,
     fused_allreduce_mhc_post_split,
 )
 from aiter.test_common import benchmark, checkAllclose
@@ -236,22 +235,20 @@ def _profile_worker(
 
     if with_graph:
         graph_split = torch.cuda.CUDAGraph()
-        with graph_capture() as gc:
-            with torch.cuda.graph(graph_split, stream=gc.stream):
-                reduced = tensor_model_parallel_all_reduce(tensors["layer_input"])
-                aiter.mhc_post(
-                    next_residual_split,
-                    reduced,
-                    tensors["residual_in"],
-                    post_mix,
-                    tensors["comb_res_mix"],
-                )
+        with graph_capture() as gc, torch.cuda.graph(graph_split, stream=gc.stream):
+            reduced = tensor_model_parallel_all_reduce(tensors["layer_input"])
+            aiter.mhc_post(
+                next_residual_split,
+                reduced,
+                tensors["residual_in"],
+                post_mix,
+                tensors["comb_res_mix"],
+            )
         next_residual_split.zero_()
 
         graph_fused = torch.cuda.CUDAGraph()
-        with graph_capture() as gc:
-            with torch.cuda.graph(graph_fused, stream=gc.stream):
-                fused_ar_post(registered=True)
+        with graph_capture() as gc, torch.cuda.graph(graph_fused, stream=gc.stream):
+            fused_ar_post(registered=True)
         next_residual_fused.zero_()
 
         split_us = _event_mean_us(
@@ -262,9 +259,10 @@ def _profile_worker(
         )
         if breakdown:
             graph_fused_split = torch.cuda.CUDAGraph()
-            with graph_capture() as gc:
-                with torch.cuda.graph(graph_fused_split, stream=gc.stream):
-                    fused_ar_post_split(registered=True)
+            with graph_capture() as gc, torch.cuda.graph(
+                graph_fused_split, stream=gc.stream
+            ):
+                fused_ar_post_split(registered=True)
             next_residual_split_fused.zero_()
             fused_split_us = _event_mean_us(
                 graph_fused_split.replay, warmup=BENCH_WARMUP, iters=BENCH_ITERS
@@ -324,7 +322,7 @@ def _run_profile(
     m: int,
     hidden_size: int,
     with_graph: bool,
-    init_method: Optional[str] = None,
+    init_method: str | None = None,
     *,
     run_correctness: bool = False,
     breakdown: bool = False,
@@ -390,7 +388,7 @@ def test_ar_mhc_post_only_profile(
     m: int,
     hidden_size: int,
     with_graph: bool = False,
-    distributed_init_method: Optional[str] = None,
+    distributed_init_method: str | None = None,
     run_correctness: bool = False,
     breakdown: bool = False,
     compare_stages: bool = False,

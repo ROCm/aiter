@@ -1,5 +1,6 @@
-import torch
 import pytest
+import torch
+
 from aiter.ops.triton.gemm.feed_forward.ff_a16w16_fused_gated import (
     ff_a16w16_fused_gated,
 )
