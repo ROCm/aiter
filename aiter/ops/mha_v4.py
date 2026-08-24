@@ -921,7 +921,7 @@ def _validate_mha_v4_raw_inputs(
     q: Tensor,
     k: Tensor,
     v: Tensor,
-    out: Optional[Tensor],
+    out: Optional[Tensor],  # noqa: UP045
     operation: str,
 ) -> Tensor:
     if q.dim() != 4 or k.dim() != 4 or v.dim() != 4:

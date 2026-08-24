@@ -17,6 +17,7 @@ from aiter.ops.mha_v4 import (
     mxfp4_k_view,
     mxfp4_v_view,
     mxfp6_k_view,
+    native_fp8_format,
     quantize_fp8,
     quantize_fp8_rotated,
     quantize_int8,
@@ -29,7 +30,6 @@ from aiter.ops.mha_v4 import (
     quantize_v_mxfp6,
     rotate_activation_mxfp6_quant,
     scale_modes_for_formats,
-    native_fp8_format,
 )
 from aiter.ops.triton.quant.mxfp6_fmha_pack import (
     _v_direct_kvtab,
