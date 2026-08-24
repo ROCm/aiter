@@ -675,6 +675,10 @@ def mha_v4_packed(
     if lut is None:
         _mha_v4_fwd_launch(*launch_args)
     else:
+        if q_format == AttentionFormat.BF16:
+            raise NotImplementedError(
+                "sorted-sparse MHA v4 does not have a BF16 manifest row yet"
+            )
         if k.shape[1] % _MHA_V4_KV_TILE != 0:
             raise ValueError(
                 "sorted-sparse MHA v4 requires key length padded to a "
@@ -1266,6 +1270,25 @@ def mha_v4(
         lut_start=lut_start,
         lut_count=lut_count,
     )
+    if q_format == AttentionFormat.BF16:
+        return mha_v4_packed(
+            q,
+            k,
+            v,
+            q,
+            k,
+            v,
+            q_format,
+            k_format,
+            v_format,
+            q_scale_mode,
+            k_scale_mode,
+            v_scale_mode,
+            softmax_scale=softmax_scale,
+            out=out,
+            return_lse=return_lse,
+            **packed_lut,
+        )
     if q_format == AttentionFormat.INT8 and _is_fp8_format(v_format):
         q_quantized, q_descale = quantize_int8(q)
         k_quantized, k_descale = quantize_int8(k)

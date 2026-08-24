@@ -385,12 +385,15 @@ void populate_dense_kernarg(FmhaV4Kernarg& args,
                             const at::Tensor& v_descale,
                             const at::Tensor& out,
                             const fmha_v4_fwdConfig& cfg,
+                            int64_t q_format,
                             int64_t seqlen_q,
                             int64_t seqlen_k,
                             int64_t nhead_q,
                             int64_t gqa_ratio,
                             double softmax_scale)
 {
+    const bool bf16_format = q_format == format_id(AttentionFormat::Bf16);
+
     args.ptr_o.value         = out.data_ptr();
     args.ptr_q.value         = q.data_ptr();
     args.ptr_k.value         = k.data_ptr();
@@ -402,35 +405,39 @@ void populate_dense_kernarg(FmhaV4Kernarg& args,
     const float scale = static_cast<float>(softmax_scale);
     std::memcpy(&args.scalar.value, &scale, sizeof(scale));
     args.s_seq_len.value     = seqlen_q;
-    args.s_Seqs.value        = q.stride(1);
-    args.s_Ts.value          = cfg.ts_qo * q.stride(1);
-    args.s_Hs.value          = q.stride(2);
-    args.s_Bs.value          = q.stride(0);
+    args.s_Seqs.value        = q.stride(1) * q.element_size();
+    args.s_Ts.value          = cfg.ts_qo * q.stride(1) * q.element_size();
+    args.s_Hs.value          = q.stride(2) * q.element_size();
+    args.s_Bs.value          = q.stride(0) * q.element_size();
     args.s_gqa.value         = gqa_ratio;
-    args.s_k_Seqs.value      = k.stride(1);
-    args.s_k_Hs.value        = k.stride(2);
-    args.s_k_Bs.value        = k.stride(0);
+    args.s_k_Seqs.value      = k.stride(1) * k.element_size();
+    args.s_k_Hs.value        = k.stride(2) * k.element_size();
+    args.s_k_Bs.value        = k.stride(0) * k.element_size();
     args.s_opt.value         = 5;
     args.s_lse.value         = 0;
     args.s_kv_seq_len.value  = seqlen_k;
     args.s_qk_head_dim.value = kHeadDim;
     args.s_v_head_dim.value  = kHeadDim;
     args.s_q_head_num.value  = nhead_q;
-    args.s_v_Seqs.value      = v.stride(1);
-    args.s_v_Hs.value        = v.stride(2);
-    args.s_v_Bs.value        = v.stride(0);
-    args.s_o_Seqs.value      = out.stride(1) * 2;
-    args.s_o_Hs.value        = out.stride(2) * 2;
-    args.s_o_Bs.value        = out.stride(0) * 2;
-    set_descale_strides(q_descale,
-                        q_descale.dim() >= 3 ? 2 : 1,
-                        args.s_descale_q_Bs.value,
-                        args.s_descale_q_Hs.value);
-    set_descale_strides(k_descale,
-                        k_descale.dim() >= 3 ? 2 : 1,
-                        args.s_descale_k_Bs.value,
-                        args.s_descale_k_Hs.value);
-    set_descale_strides(v_descale, 1, args.s_descale_v_Bs.value, args.s_descale_v_Hs.value);
+    args.s_v_Seqs.value      = v.stride(1) * v.element_size();
+    args.s_v_Hs.value        = v.stride(2) * v.element_size();
+    args.s_v_Bs.value        = v.stride(0) * v.element_size();
+    args.s_o_Seqs.value      = out.stride(1) * out.element_size();
+    args.s_o_Hs.value        = out.stride(2) * out.element_size();
+    args.s_o_Bs.value        = out.stride(0) * out.element_size();
+
+    if(!bf16_format)
+    {
+        set_descale_strides(q_descale,
+                            q_descale.dim() >= 3 ? 2 : 1,
+                            args.s_descale_q_Bs.value,
+                            args.s_descale_q_Hs.value);
+        set_descale_strides(k_descale,
+                            k_descale.dim() >= 3 ? 2 : 1,
+                            args.s_descale_k_Bs.value,
+                            args.s_descale_k_Hs.value);
+        set_descale_strides(v_descale, 1, args.s_descale_v_Bs.value, args.s_descale_v_Hs.value);
+    }
 }
 
 struct PackedMhaV4Shapes
@@ -632,6 +639,7 @@ void fmha_v4_fwd(const at::Tensor& q,
                            v_descale,
                            out,
                            cfg,
+                           q_format,
                            shapes.seqlen_q,
                            shapes.seqlen_k,
                            shapes.nhead_q,
@@ -734,6 +742,7 @@ void fmha_v4_fwd_sparse(const at::Tensor& q,
                            v_descale,
                            out,
                            cfg,
+                           q_format,
                            shapes.seqlen_q,
                            shapes.seqlen_k,
                            shapes.nhead_q,
