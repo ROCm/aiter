@@ -158,10 +158,11 @@ jobs:
       - name: Docker login
         if: ${{ matrix.build_enabled && (!github.event.pull_request || !github.event.pull_request.head.repo.fork) }}
         env:
-          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+          DOCKER_USERNAME: ${{ secrets[needs.ci_config.outputs.docker_username_secret] }}
+          DOCKER_PASSWORD: ${{ secrets[needs.ci_config.outputs.docker_password_secret] }}
         run: |
           for attempt in 1 2 3; do
-            if echo "$DOCKER_PASSWORD" | docker login -u rocmshared --password-stdin; then
+            if echo "$DOCKER_PASSWORD" | docker login -u "$DOCKER_USERNAME" --password-stdin; then
               echo "Docker login succeeded on attempt ${attempt}"
               exit 0
             fi
@@ -337,7 +338,8 @@ jobs:
           for WHL in all-wheels/amd_aiter*.whl; do
             WHL_NAME=$(basename "${WHL}")
             echo "Uploading ${WHL_NAME}..."
-            aws s3 cp "${WHL}" "${S3_STAGING}/${WHL_NAME}"
+            aws s3 cp "${WHL}" "${S3_STAGING}/${WHL_NAME}" \
+              --cache-control "public, max-age=31536000, immutable"
           done
 
           echo "=== Generating versioned manifest ==="
@@ -345,6 +347,7 @@ jobs:
 
           python3 - <<'PY'
           import json, glob, os, re, sys
+          from urllib.parse import quote
 
           s3_public = os.environ["S3_PUBLIC"]
           timestamp = os.environ["MANIFEST_TIMESTAMP"]
@@ -362,7 +365,7 @@ jobs:
 
           for whl_path in wheels:
               whl_name = os.path.basename(whl_path)
-              whl_url = f"{s3_public}/{whl_name}"
+              whl_url = f"{s3_public}/{quote(whl_name, safe='')}"
               match = re.search(r"-(cp3\d+)-", whl_name)
               if match:
                   tag = match.group(1)
@@ -387,12 +390,27 @@ jobs:
           PY
 
           aws s3 cp latest-main-wheel.json \
+            "${S3_STAGING}/commits/${GITHUB_SHA}/latest.json" \
+            --content-type application/json \
+            --cache-control "public, max-age=31536000, immutable"
+
+          aws s3 cp latest-main-wheel.json \
             "${S3_STAGING}/main/latest.json" \
-            --content-type application/json
+            --content-type application/json \
+            --cache-control "no-store, max-age=0, must-revalidate"
+
+          if [ -n "${CLOUDFRONT_DISTRIBUTION_ID:-}" ]; then
+            aws cloudfront create-invalidation \
+              --distribution-id "${CLOUDFRONT_DISTRIBUTION_ID}" \
+              --paths "/whl-staging/gfx942-gfx950/main/latest.json"
+          else
+            echo "::warning::CLOUDFRONT_DISTRIBUTION_ID is not set; skipping latest.json invalidation"
+          fi
 
           echo "Uploaded versioned manifest"
         env:
           S3_PUBLIC: "https://rocm.frameworks-nightlies.amd.com/whl-staging/gfx942-gfx950"
+          CLOUDFRONT_DISTRIBUTION_ID: ${{ vars.AITER_WHEEL_CLOUDFRONT_DISTRIBUTION_ID }}
 
   split_aiter_tests:
     if: ${{ needs.detect_aiter_test_scope.outputs.run_tests == 'true' }}
@@ -510,7 +528,41 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
+      - name: Network preflight before Aiter test artifact downloads
+        if: ${{ startsWith(runner.name, 'linux-aiter-mi35x-1-') }}
+        continue-on-error: true
+        timeout-minutes: 5
+        run: |
+          set +e
+
+          echo "=== Runner info ==="
+          echo "RUNNER_NAME=${RUNNER_NAME}"
+          echo "RUNNER_OS=${RUNNER_OS}"
+          echo "hostname=$(hostname -f 2>/dev/null || hostname)"
+          date -u
+
+          echo "=== DNS check ==="
+          getent hosts github.com || true
+          getent hosts api.github.com || true
+          getent hosts productionresultssa4.blob.core.windows.net || true
+          getent hosts productionresultssa8.blob.core.windows.net || true
+
+          echo "=== GitHub and Azure Blob connectivity check ==="
+          for url in \
+            https://api.github.com/rate_limit \
+            https://github.com/ROCm/aiter \
+            https://productionresultssa4.blob.core.windows.net/ \
+            https://productionresultssa8.blob.core.windows.net/
+          do
+            curl -L -o /dev/null -sS \
+              --connect-timeout 10 \
+              --max-time 30 \
+              -w "url=${url} code=%{http_code} dns=%{time_namelookup}s connect=%{time_connect}s tls=%{time_appconnect}s ttfb=%{time_starttransfer}s total=%{time_total}s speed=%{speed_download}B/s\n" \
+              "$url" || true
+          done
+
       - name: Download test shard lists
+        id: download_aiter_shards
         uses: actions/download-artifact@v4
         timeout-minutes: 15
         with:
@@ -548,6 +600,7 @@ jobs:
 
       - name: Retry Download Aiter wheel artifact
         if: steps.restore_aiter_wheel.outputs.cache-hit != 'true' && steps.download_aiter_wheel.outcome == 'failure'
+        id: retry_aiter_wheel
         uses: actions/download-artifact@v4
         timeout-minutes: 30
         with:
@@ -555,6 +608,7 @@ jobs:
           path: aiter_wheels
 
       - name: Download Triton wheel artifact
+        id: download_triton_wheel
         uses: actions/download-artifact@v4
         timeout-minutes: 30
         continue-on-error: true
@@ -562,13 +616,32 @@ jobs:
           name: ${{ env.TRITON_WHEEL_ARTIFACT_NAME }}
           path: triton_wheels
 
+      - name: Speedtest after Aiter test artifact download failure
+        if: ${{ always() && startsWith(runner.name, 'linux-aiter-mi35x-1-') && (steps.download_aiter_shards.outcome == 'failure' || steps.restore_aiter_wheel.outcome == 'failure' || steps.retry_aiter_wheel.outcome == 'failure' || steps.download_triton_wheel.outcome == 'failure') }}
+        continue-on-error: true
+        timeout-minutes: 5
+        run: |
+          set +e
+
+          echo "=== Runner info ==="
+          echo "RUNNER_NAME=${RUNNER_NAME}"
+          echo "RUNNER_OS=${RUNNER_OS}"
+          echo "hostname=$(hostname -f 2>/dev/null || hostname)"
+          date -u
+
+          echo "=== speedtest-cli ==="
+          python3 -m pip install --user --disable-pip-version-check speedtest-cli || true
+          speedtest_bin="$(python3 -m site --user-base)/bin/speedtest-cli"
+          timeout 120 "$speedtest_bin" --simple --secure || true
+
       - name: Docker login
         if: ${{ !github.event.pull_request || !github.event.pull_request.head.repo.fork }}
         env:
-          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+          DOCKER_USERNAME: ${{ secrets[needs.ci_config.outputs.docker_username_secret] }}
+          DOCKER_PASSWORD: ${{ secrets[needs.ci_config.outputs.docker_password_secret] }}
         run: |
           for attempt in 1 2 3; do
-            if echo "$DOCKER_PASSWORD" | docker login -u rocmshared --password-stdin; then
+            if echo "$DOCKER_PASSWORD" | docker login -u "$DOCKER_USERNAME" --password-stdin; then
               echo "Docker login succeeded on attempt ${attempt}"
               exit 0
             fi
@@ -845,10 +918,11 @@ jobs:
       - name: Docker login
         if: ${{ !github.event.pull_request || !github.event.pull_request.head.repo.fork }}
         env:
-          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+          DOCKER_USERNAME: ${{ secrets[needs.ci_config.outputs.docker_username_secret] }}
+          DOCKER_PASSWORD: ${{ secrets[needs.ci_config.outputs.docker_password_secret] }}
         run: |
           for attempt in 1 2 3; do
-            if echo "$DOCKER_PASSWORD" | docker login -u rocmshared --password-stdin; then
+            if echo "$DOCKER_PASSWORD" | docker login -u "$DOCKER_USERNAME" --password-stdin; then
               echo "Docker login succeeded on attempt ${attempt}"
               exit 0
             fi
@@ -934,6 +1008,8 @@ jobs:
             pip install --upgrade 'pybind11>=3.0.1'
             pip install --upgrade 'ninja>=1.11.1'
             pip install tabulate
+            pip install 'amd-mori==1.2.2'
+            python3 -c 'import mori, mori.shmem'
             pip install '${AITER_WHEEL_PATH}'
             pip show amd-aiter
           "
