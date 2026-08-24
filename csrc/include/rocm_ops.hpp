@@ -1509,6 +1509,7 @@ namespace py = pybind11;
           py::arg("out"),                           \
           py::arg("causal"),                        \
           py::arg("softmax_scale"),                 \
+          py::arg("lse")            = std::nullopt, \
           py::arg("seqstart_q")     = std::nullopt, \
           py::arg("seqstart_k")     = std::nullopt, \
           py::arg("seqstart_q_pad") = std::nullopt, \

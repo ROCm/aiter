@@ -1009,7 +1009,7 @@ jobs:
             pip install --upgrade 'ninja>=1.11.1'
             pip install tabulate
             pip install 'amd-mori==1.2.2'
-            python3 -c 'import mori, mori.shmem; print("mori import ok")'
+            python3 -c 'import mori, mori.shmem'
             pip install '${AITER_WHEEL_PATH}'
             pip show amd-aiter
           "

@@ -9,6 +9,7 @@ from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import (
 )
 from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import (
     gemm_afp4wfp4_preshuffle,
+    use_gluon_preshuffle,
 )
 from aiter.ops.triton.gluon.gemm_afp4wfp4 import (
     gemm_afp4wfp4 as gluon_gemm_afp4wfp4_CDNA4,
@@ -79,7 +80,10 @@ def generate_gemm_afp4wfp4_inputs(
     x_scales = x_scales.T
     w_scales = w_scales.T
     if shuffle_scales_fg:
-        if DEVICE_ARCH == "gfx1250":
+        # The scale layout is dictated by the kernel the wrapper dispatches to,
+        # not by the arch: gfx1250 also runs the triton kernel while the gluon
+        # preshuffle path is disabled.
+        if use_gluon_preshuffle():
             if M >= 32:
                 x_scales_shuffled = shuffle_scale_gemm(
                     x_scales, arch="gfx1250", preshuffle_factor=16, scale_kwidth=4
