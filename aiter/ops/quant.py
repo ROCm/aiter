@@ -1265,6 +1265,17 @@ def rotate_activation(
       + e8m0 ``scale`` (``scale`` required; ``group_size`` defaults to 32).
       ``shuffle_scale`` selects the dsv4 preshuffled scale layout.
     """
+    if not input.is_contiguous() or not out.is_contiguous():
+        raise ValueError("input and out must be contiguous")
+    expected_shape = (*input.shape[:-1], input.shape[-1] // 2)
+    if out.dtype == dtypes.fp4x2:
+        if out.shape != expected_shape:
+            raise ValueError(
+                "FP4 out shape must match input with a packed last dimension"
+            )
+    elif out.shape != input.shape:
+        raise ValueError("input and out shapes must match")
+
     if out.dtype == dtypes.fp4x2:
         assert scale is not None, "fp4 rotate_activation requires `scale`"
         _rotate_activation_fp4quant(
@@ -1355,6 +1366,17 @@ def rope_rotate_activation(
     When ``do_rotate_act`` is False, the Hadamard rotate is skipped and only
     RoPE (plus any quantization) is applied.
     """
+    if not input.is_contiguous() or not out.is_contiguous():
+        raise ValueError("input and out must be contiguous")
+    expected_shape = (*input.shape[:-1], input.shape[-1] // 2)
+    if out.dtype == dtypes.fp4x2:
+        if out.shape != expected_shape:
+            raise ValueError(
+                "FP4 out shape must match input with a packed last dimension"
+            )
+    elif out.shape != input.shape:
+        raise ValueError("input and out shapes must match")
+
     if out.dtype == dtypes.fp4x2:
         assert out_scale is not None, "fp4 rope_rotate_activation requires `out_scale`"
         _rope_rotate_activation_fp4quant(

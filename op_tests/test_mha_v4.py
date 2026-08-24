@@ -285,6 +285,51 @@ def test_mha_v4_rotated_fp8_quantization_matches_native_rotation(sequence, heads
 
 @pytest.mark.skipif(
     get_gfx() not in ("gfx942", "gfx950"),
+    reason="gfx942/gfx950 activation rotation",
+)
+def test_rotate_activation_rejects_noncontiguous_input():
+    from aiter.ops.quant import rotate_activation
+
+    value = torch.randn((1, 1, 128, 2), device="cuda", dtype=torch.bfloat16)
+    value = value.transpose(-1, -2)
+    rotated = torch.empty(value.shape, device="cuda", dtype=value.dtype)
+
+    with pytest.raises(ValueError, match="input and out must be contiguous"):
+        rotate_activation(rotated, value)
+
+
+@pytest.mark.skipif(
+    get_gfx() not in ("gfx942", "gfx950"),
+    reason="gfx942/gfx950 activation rotation",
+)
+def test_rotate_activation_rejects_same_numel_output_reshape():
+    from aiter.ops.quant import rotate_activation
+
+    value = torch.randn((1, 2, 128), device="cuda", dtype=torch.bfloat16)
+    rotated = torch.empty((2, 1, 128), device="cuda", dtype=value.dtype)
+
+    with pytest.raises(ValueError, match="input and out shapes must match"):
+        rotate_activation(rotated, value)
+
+
+@pytest.mark.skipif(
+    get_gfx() not in ("gfx942", "gfx950"),
+    reason="gfx942/gfx950 activation rotation",
+)
+def test_rotate_activation_accepts_empty_input():
+    from aiter.ops.quant import rotate_activation
+
+    value = torch.empty((1, 0, 1, 128), device="cuda", dtype=torch.bfloat16)
+    rotated = torch.empty_like(value)
+
+    rotate_activation(rotated, value)
+
+    assert rotated.shape == value.shape
+    assert rotated.numel() == 0
+
+
+@pytest.mark.skipif(
+    get_gfx() not in ("gfx942", "gfx950"),
     reason="gfx942/gfx950 FP8 recipe validation",
 )
 def test_mha_v4_fp8_raw_recipe_matches_rotated_packed():
