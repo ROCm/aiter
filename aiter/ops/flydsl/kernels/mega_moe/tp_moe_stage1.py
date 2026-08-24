@@ -124,3 +124,27 @@ class TPMoEStage1:
     def max_sorted_for(self, m_local: int) -> int:
         """Mirror of moe_sorting's max_num_tokens_padded."""
         return self.m_logical_for(m_local) * self.topk + self.experts * self.sort_block_m - self.topk
+
+    def _all_gather_one(self, t):
+        t = t.contiguous()
+        if self.tp_size == 1:
+            return t
+        out = torch.empty(
+            (t.shape[0] * self.tp_size,) + tuple(t.shape[1:]),
+            dtype=t.dtype,
+            device=t.device,
+        )
+        dist.all_gather_into_tensor(out, t, group=self.group)
+        return out
+
+    def _all_gather_inputs(self, x, route_weights, topk_ids):
+        """Gather the three per-rank inputs in rank-major order.
+
+        Returns (x_g, weights_g, ids_g) laid out so that
+        ``global_token = src_rank * m_local + local_token``.
+        """
+        return (
+            self._all_gather_one(x),
+            self._all_gather_one(route_weights),
+            self._all_gather_one(topk_ids),
+        )
