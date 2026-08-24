@@ -55,13 +55,13 @@ def mha_set_impl(impl: Literal["default", "dao_ai"]):
     _MHA_IMPL = impl
 
 
-def _use_gluon_fwd(q, k, v, enable_dropout, IS_FP8, config) -> bool:
+def _use_gluon_fwd(q, k, v, IS_FP8, config) -> bool:
     """Whether the gfx1250 gluon forward can serve this call.
 
-    The kernel implements causal / varlen / GQA / sliding window / sink / LSE /
-    alibi / padded head / PE head dim / return_scores, in bf16 and fp8. Dropout
-    is the one forward feature it does not implement (gluon has no philox), and
-    that stays on Triton.
+    The kernel implements every forward feature of `_attn_fwd`: causal / varlen
+    / GQA / sliding window / sink / LSE / alibi / padded head / PE head dim /
+    return_scores / dropout, in bf16 and fp8. What is left below are the
+    kernel's structural preconditions, not feature gaps.
     """
     if _gluon_attn_fwd is None or _MHA_GLUON_ENV == "0":
         return False
@@ -72,8 +72,6 @@ def _use_gluon_fwd(q, k, v, enable_dropout, IS_FP8, config) -> bool:
         all(t.dtype is torch.bfloat16 for t in (q, k, v))
         or (IS_FP8 and q.dtype is k.dtype is v.dtype)
     ):
-        return False
-    if enable_dropout:
         return False
     # The K/V TDM descriptors hardcode a unit innermost stride
     # (`strides=[stride_kn, 1]`). Q and O are indexed with explicit strides, so
@@ -328,7 +326,7 @@ def _flash_attn_forward(
 
         fwd_impl = (
             _gluon_attn_fwd
-            if _use_gluon_fwd(q, k, v, enable_dropout, IS_FP8, config)
+            if _use_gluon_fwd(q, k, v, IS_FP8, config)
             else _gluon_attn_fwd
         )
 
