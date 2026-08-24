@@ -687,7 +687,9 @@ def quant_mxfp6_gemm_out(
 ) -> tuple[Tensor, Tensor]:
     """Quantize + pack into caller-provided output buffers."""
     if w.ndim != 2:
-        raise ValueError(f"quant_mxfp6_gemm_out expects a 2D [rows, K] tensor, got {w.ndim}D")
+        raise ValueError(
+            f"quant_mxfp6_gemm_out expects a 2D [rows, K] tensor, got {w.ndim}D"
+        )
     rows, K = w.shape
     padK = _ceil(K, _K_TILE)
     expected_packed, expected_scale = mxfp6_gemm_pack_size(rows, K)
@@ -767,6 +769,10 @@ def quant_mxfp6_gemm(w: Tensor) -> tuple[Tensor, Tensor]:
     Returns (packed uint8, packed_scale uint8) torch tensors on w.device.
     Works identically for both A and B operands. Runs entirely on the GPU.
     """
+    if w.ndim != 2:
+        raise ValueError(
+            f"quant_mxfp6_gemm expects a 2D [rows, K] tensor, got {w.ndim}D"
+        )
     rows, K = w.shape
     padR, padK = _ceil(rows, _TILE), _ceil(K, _K_TILE)
     w = w.detach()

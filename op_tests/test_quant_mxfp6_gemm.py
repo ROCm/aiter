@@ -21,6 +21,18 @@ def _pack_out(x: torch.Tensor, backend: str) -> tuple[torch.Tensor, torch.Tensor
     return mxfp6.quant_mxfp6_gemm_out(x, packed, packed_scale)
 
 
+@pytest.mark.parametrize("shape", [(4,), (2, 3, 4)])
+def test_quant_mxfp6_gemm_rejects_non_matrix(shape: tuple[int, ...]):
+    x = torch.empty(shape, dtype=torch.bfloat16, device="cuda")
+    packed = torch.empty(1, dtype=torch.uint8, device=x.device)
+    packed_scale = torch.empty(1, dtype=torch.uint8, device=x.device)
+
+    with pytest.raises(ValueError, match=r"expects a 2D \[rows, K\] tensor"):
+        mxfp6.quant_mxfp6_gemm(x)
+    with pytest.raises(ValueError, match=r"expects a 2D \[rows, K\] tensor"):
+        mxfp6.quant_mxfp6_gemm_out(x, packed, packed_scale)
+
+
 def _unpack_first_block(packed: torch.Tensor) -> torch.Tensor:
     block = torch.cat((packed[:16], packed[16384:16392])).to(torch.int32)
     triplets = block.reshape(8, 3)
