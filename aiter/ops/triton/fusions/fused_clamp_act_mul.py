@@ -24,7 +24,7 @@ _LOGGER = AiterTritonLogger()
 def _get_config(M: int, N: int, block_size_n: int, backend: str) -> dict:
     """Tuned config for ``(M, N)`` on ``backend``, or the untuned default.
 
-    Both backends read ``configs/{arch}/{backend}/fused_clamp_act_mul/``.
+    Both backends read ``configs/{arch}/{backend}/fusions/fused_clamp_act_mul/``.
 
     gluon takes the N-specialized ``FUSED_CLAMP_ACT_MUL-N={N}.json`` and falls
     back to ``DEFAULT.json``; within the specialized file the largest
@@ -32,7 +32,8 @@ def _get_config(M: int, N: int, block_size_n: int, backend: str) -> dict:
     through to the default. A null ``BLOCK_SIZE_N`` means "keep the caller's
     width" (the whole row unless overridden).
 
-    triton takes ``DEFAULT.json`` for the running arch and picks the smallest
+    triton takes ``DEFAULT.json`` for the running arch, falling back to the
+    gfx950 copy where that arch has none, and picks the smallest
     ``N_LEQ_<x> >= block_size_n``, else ``any``. M and N are unused there --
     the triton kernel only tunes on the row width.
 
@@ -40,10 +41,16 @@ def _get_config(M: int, N: int, block_size_n: int, backend: str) -> dict:
         The config dict for this shape.
     """
     arch = get_arch()
-    base = f"{AITER_TRITON_CONFIGS_PATH}/{arch}/{backend}/fused_clamp_act_mul"
+    base = f"{AITER_TRITON_CONFIGS_PATH}/{arch}/{backend}/fusions/fused_clamp_act_mul"
 
     if backend == "triton":
-        raw = load_config_json(f"{base}/DEFAULT.json", required=True)
+        raw = load_config_json(f"{base}/DEFAULT.json", required=False)
+        if raw is None:
+            raw = load_config_json(
+                f"{AITER_TRITON_CONFIGS_PATH}/gfx950/{backend}/fusions/"
+                f"fused_clamp_act_mul/DEFAULT.json",
+                required=True,
+            )
         for bound in sorted(
             int(k[len("N_LEQ_") :]) for k in raw if k.startswith("N_LEQ_")
         ):
