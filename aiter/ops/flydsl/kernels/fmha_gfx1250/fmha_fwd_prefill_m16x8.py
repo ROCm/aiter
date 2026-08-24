@@ -247,11 +247,11 @@ def _softmax(*, s, m_prev, d_prev, lane_idx, n_block,
 
     Masking (per element, sequence-relative kv position ``kv_pos = kv_pos_base +
     (l//16)*8 + kvt*16 + i``; all bounds are fx.Int32):
-      q_max (band upper edge): when set, mask ``kv_pos > min(q_max, kv_len-1)``
+      q_max (band upper edge): when set, mask ``kv_pos > q_max``
         (``q_max = q_seq + (kv_len-q_len) + window_right``; causal has window_right=0).
-        Clamping to ``kv_len-1`` folds in the last-tile tail mask (rows past kv_len
-        that the clamped OOB load left holding duplicate data), so kv_len need not be
-        masked separately here.
+        When kv_len is also passed (last tile), q_max is clamped to ``kv_len-1`` to
+        fold in the tail mask (rows past kv_len that the clamped OOB load left holding
+        duplicate data); interior tiles pass kv_len=None (no tail, no clamp needed).
       q_min (band lower edge): when set, mask ``kv_pos < q_min``
         (``q_min = q_seq + (kv_len-q_len) - window_left``).
       kv_len (only when q_max is None): mask ``kv_pos >= kv_len`` (the standalone tail
@@ -307,7 +307,8 @@ def _softmax(*, s, m_prev, d_prev, lane_idx, n_block,
             if q_max is not None or q_min is not None or kv_len is not None:
                 kv_pos = kv_pos_base + khalf * fx.Int32(8) + fx.Int32(kvt * WMMA_N + i)
                 if q_max is not None:
-                    sval = (kv_pos > _min_i32(q_max, kv_len - fx.Int32(1))).select(neg_inf, sval)
+                    ubound = q_max if kv_len is None else _min_i32(q_max, kv_len - fx.Int32(1))
+                    sval = (kv_pos > ubound).select(neg_inf, sval)
                 if q_min is not None:
                     sval = (kv_pos < q_min).select(neg_inf, sval)
                 if kv_len is not None and q_max is None:
@@ -661,7 +662,11 @@ def _core_attention(
     # TODO(perf): go finer still -- per-write-tile async_load interleaved between the
     # QK/softmax/PV ops (order tuned by thread trace) rather than one bulk burst.
     # ========================================================================
-    def main_loop(t, state):
+    def main_loop(t, state, *, mask_left, mask_right, kv_len):
+        # mask_left/mask_right/kv_len shadow the closure flags: the caller splits the
+        # tile stream into a mask-free clean region + boundary loops and passes None for
+        # any edge this sub-loop provably doesn't cross (compile-time gate).
+        #
         # Runtime ping-pong: this tile reads its curr buffer (carried curr pointers); the
         # tile t+1 prefetch writes the next buffer, and curr<->next are swapped in the yield.
         nxt_pp = (t - start_tile + fx.Int32(1)) % fx.Int32(2)
@@ -753,18 +758,12 @@ def _core_attention(
         v_values = v_mgr.load_v_to_reg(v_curr)
         rocdl.sched_barrier(0)
 
-        # ---- Softmax: online update over this KV tile's kv axis. ----
-        # This lane's query attends the band [q_min, q_max] (batch-relative kv), where
-        # q_max = seq_idx+causal_off+window_right, q_min = seq_idx+causal_off-window_left
-        # (causal_off = kv_len - q_len; seq_idx is the GQA-aware query seq). Pass only
-        # the bounds the compiled variant masks: q_max when mask_right, q_min when
-        # mask_left. kv_len is always passed — _softmax clamps q_max to kv_len-1 (folds
-        # the tail mask) when mask_right, else uses it as the standalone tail mask.
-        #
-        # TODO(perf): the per-element `.select` lowers to one v_cmp + v_cndmask_b32
-        # per masked score (64 pairs for n_block=128). Split the KV loop into a
-        # fully-in-band prefix (no mask) + boundary tiles so the mask select is gone
-        # from the loop's steady state.
+        # ---- Softmax: online update over this KV tile's kv axis. This lane's query
+        # attends [q_min, q_max] (batch-relative kv): q_max = seq+causal_off+window_right,
+        # q_min = seq+causal_off-window_left (causal_off = kv_len-q_len). None bounds are
+        # skipped -> a clean-region tile passes all-None and does zero per-element masking.
+        # kv_len is passed only on the last tile (folds the OOB tail into the q_max clamp
+        # / standalone tail mask). ----
         q_max = seq_idx + causal_off + window_right if mask_right else None
         q_min = seq_idx + causal_off - window_left if mask_left else None
         p, m_new, d_new, corr = _softmax(
@@ -798,19 +797,63 @@ def _core_attention(
             + [v_next[0], v_next[1], v_curr[0], v_curr[1]]
         )
 
-    # ---- Stream tiles [start_tile, n_tiles) one per iteration; ping-pong buffer selected
-    # by the carried curr ds pointers, swapped each iteration. ----
+    # ---- Stream tiles [start_tile, n_tiles) through 3 sub-loops split by the attention
+    # band so interior tiles fully inside the band skip masking. clean_lo/clean_hi are
+    # runtime split points, but the mask on/off per sub-loop is COMPILE-TIME (each loop
+    # traces main_loop once with fixed None-ness). Ping-pong swap state threads
+    # continuously through all three; buffer parity is by LOCAL iteration index, so the
+    # split leaves it intact.
+    #   [start_tile, clean_lo) left boundary   (emitted only when mask_left)
+    #   [clean_lo,   clean_hi) clean, no mask
+    #   [clean_hi,   n_tiles)  right boundary + kv_len tail (last tile)
     n_iter = fx.Int32(n_tiles) - start_tile
+    n_last = fx.Int32(n_tiles) - fx.Int32(1)  # last tile always carries the kv_len tail
 
-    _lo = arith.index_cast(T.index, arith.unwrap(start_tile))
-    _hi = arith.index_cast(T.index, arith.unwrap(fx.Int32(n_tiles)))
-    _step = arith.index(1)
+    # clean_hi = first tile that could need RIGHT masking = the WG's earliest query's
+    # diagonal tile ((min q_max + 1)//n_block). Kept <= n_last so the tail tile stays in
+    # the right loop, and >= start_tile for a valid partition.
+    if mask_right:
+        wg_min_seq = (block_x * fx.Int32(BLOCK_M)) // fx.Int32(gqa_ratio)
+        qmax_min = _max_i32(wg_min_seq + causal_off + window_right, fx.Int32(0))
+        clean_hi = (qmax_min + fx.Int32(1)) // fx.Int32(n_block)
+    else:
+        clean_hi = fx.Int32(n_tiles)
+    clean_hi = _max_i32(_min_i32(clean_hi, n_last), start_tile)
 
-    for _tile_iv, _iargs, _loop_res in scf.for_(_lo, _hi, _step, iter_args=_init):
-        t0 = fx.Int32(arith.index_cast(T.i32, _tile_iv))
-        scf.yield_(main_loop(t0, list(_iargs)))
+    # clean_lo = first tile fully at/above the WG's latest query's window start
+    # (ceildiv(max q_min, n_block)); clamped into [start_tile, clean_hi].
+    if mask_left:
+        wg_max_seq = _min_i32(
+            (block_x * fx.Int32(BLOCK_M) + fx.Int32(BLOCK_M - 1)) // fx.Int32(gqa_ratio),
+            q_len - fx.Int32(1),
+        )
+        qmin_max = _max_i32(wg_max_seq + causal_off - window_left, fx.Int32(0))
+        clean_lo = (qmin_max + fx.Int32(n_block - 1)) // fx.Int32(n_block)
+    else:
+        clean_lo = start_tile
+    clean_lo = _min_i32(_max_i32(clean_lo, start_tile), clean_hi)
 
-    final = _loop_res
+    def _run_tiles(state, lo_i32, hi_i32, *, mask_left, mask_right, kv_len):
+        _lo = arith.index_cast(T.index, arith.unwrap(lo_i32))
+        _hi = arith.index_cast(T.index, arith.unwrap(hi_i32))
+        _step = arith.index(1)
+        for _iv, _iargs, _res in scf.for_(_lo, _hi, _step, iter_args=state):
+            t0 = fx.Int32(arith.index_cast(T.i32, _iv))
+            scf.yield_(main_loop(
+                t0, list(_iargs),
+                mask_left=mask_left, mask_right=mask_right, kv_len=kv_len,
+            ))
+        return _res
+
+    state = _init
+    if mask_left:
+        state = _run_tiles(state, start_tile, clean_lo,
+                           mask_left=mask_left, mask_right=mask_right, kv_len=None)
+    state = _run_tiles(state, clean_lo, clean_hi,
+                       mask_left=None, mask_right=None, kv_len=None)
+    state = _run_tiles(state, clean_hi, fx.Int32(n_tiles),
+                       mask_left=mask_left, mask_right=mask_right, kv_len=kv_len)
+    final = state
 
     # ========================================================================
     # Epilogue: normalize O by the running denom d, then reshape+store to VRAM.
