@@ -17,6 +17,19 @@ from ..jit.utils.torch_guard import torch_compile_guard
 from ..utility import dtypes
 
 
+def _fmha_kv_byte_extent_ge_u32(
+    max_seqlen_k: int, k: torch.Tensor, v: torch.Tensor
+) -> bool:
+    """True when per-head KV row byte extent reaches the 32-bit buffer-offset limit.
+
+    dim -3 is the token axis in both layouts this is called with: dense BSHD
+    [B, S, H, D] and packed varlen THD [total, H, D].
+    """
+    k_bytes = int(max_seqlen_k) * int(k.stride(-3)) * k.element_size()
+    v_bytes = int(max_seqlen_k) * int(v.stride(-3)) * v.element_size()
+    return k_bytes >= (1 << 32) or v_bytes >= (1 << 32)
+
+
 def cmdGenFunc_mha_fwd(
     q: Tensor,
     k: Tensor,
@@ -248,8 +261,32 @@ def gen_mha_fwd_native_splitkv_fake_tensors(
     return o, lse
 
 
+# torch-free kernel entry: the C++ TU takes aiter_tensor_t views and writes into
+# caller-allocated buffers, so all outputs/scratch are allocated Python-side (see
+# mha_fwd_native_splitkv below) and passed in.
 @compile_ops(
     "module_mha_fwd_native_splitkv",
+    fc_name="mha_fwd_native_splitkv",
+    develop=True,
+)
+def _mha_fwd_native_splitkv(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    o: Tensor,
+    lse: Tensor,
+    scratch_o: Tensor,
+    scratch_lse: Tensor,
+    softmax_scale: float,
+    causal: bool,
+    return_lse: bool,
+    num_splits: int,
+) -> None: ...
+
+
+@torch_compile_guard(
+    mutates_args=["out"],
+    device="cuda",
     gen_fake=gen_mha_fwd_native_splitkv_fake_tensors,
 )
 def mha_fwd_native_splitkv(
@@ -261,7 +298,49 @@ def mha_fwd_native_splitkv(
     causal: bool,
     return_lse: bool,
     num_splits: int,
-) -> tuple[Tensor, Tensor]: ...
+) -> tuple[Tensor, Tensor]:
+    # @torch_compile_guard registers this as torch.ops.aiter.mha_fwd_native_splitkv
+    # (opaque under torch.compile via the gen_fake above) *and* rebinds this module
+    # name to the op dispatcher, so callers keep writing the plain Python name.
+    # This eager impl allocates every buffer (the de-torched kernel can no longer
+    # allocate) and calls the void kernel.
+    batch_size, seqlen_q, nhead_q, hdim = q.shape
+    G = int(num_splits)
+    o = (
+        out
+        if out is not None
+        else torch.empty(
+            (batch_size, seqlen_q, nhead_q, hdim), dtype=q.dtype, device=q.device
+        )
+    )
+    lse = (
+        torch.empty(
+            (batch_size, nhead_q, seqlen_q), dtype=torch.float32, device=q.device
+        )
+        if return_lse
+        else torch.empty((0,), dtype=torch.float32, device=q.device)
+    )
+    # split-major fp32 scratch: [G,B,Hq,Sq,D] partial-O + [G,B,Hq,Sq] partial-LSE.
+    scratch_o = torch.empty(
+        (G, batch_size, nhead_q, seqlen_q, hdim), dtype=torch.float32, device=q.device
+    )
+    scratch_lse = torch.empty(
+        (G, batch_size, nhead_q, seqlen_q), dtype=torch.float32, device=q.device
+    )
+    _mha_fwd_native_splitkv(
+        q,
+        k,
+        v,
+        o,
+        lse,
+        scratch_o,
+        scratch_lse,
+        softmax_scale,
+        causal,
+        return_lse,
+        num_splits,
+    )
+    return o, lse
 
 
 def gen_fmha_v3_fwd_fake_tensors(
@@ -339,7 +418,6 @@ def gen_fmha_fwd_bf16_opus_fwd_fake(
     "module_fmha_fwd_bf16_opus",
     fc_name="fmha_fwd_bf16_opus_fwd",
     gen_fake=gen_fmha_fwd_bf16_opus_fwd_fake,
-    develop=True,
 )
 def _fmha_fwd_bf16_opus_fwd(
     q: Tensor,
@@ -1821,6 +1899,8 @@ def _flash_attn_forward(
         if is_fmha_v3_fp8():
             gqa_ratio = nhead_q // nhead_k
             ret = ret and ((gqa_ratio & (gqa_ratio - 1)) == 0)
+        if hdim_q == 192 and hdim_v == 128:
+            ret = ret and not _fmha_kv_byte_extent_ge_u32(seqlen_k, k, v)
         return ret
 
     def can_impl_fmha_fwd_with_sink_asm():
@@ -1939,12 +2019,9 @@ def _flash_attn_forward(
         # OPUS gfx950 dense D_QK=192 / D_V=128 bf16 forward. Enabled by DEFAULT (no env)
         if int(os.environ.get("AITER_DISABLE_FMHA_OPUS", "0")) != 0:
             return False
-        if not (hdim_q == 192 and hdim_v == 128):
-            return False
-        # KV byte extent >= 2^32 wraps the kernel's 32-bit async-load soffset (same as D=128).
-        if seqlen_k * k.stride(1) * k.element_size() >= (1 << 32):
-            return False
-        return not seqlen_k * v.stride(1) * v.element_size() >= 1 << 32
+        # Any KV extent: the kernel rebases the buffer descriptor per KV tile, so the
+        # 32-bit buffer-offset limit no longer bounds the per-head KV row.
+        return hdim_q == 192 and hdim_v == 128
 
     def can_impl_fmha_fwd_bf16_opus():
         # Shared eligibility for the OPUS gfx950 bf16 forward kernels (inference-only:
@@ -2843,6 +2920,8 @@ def _flash_attn_varlen_forward(
         if is_fmha_v3_fp8():
             gqa_ratio = nhead_q // nhead_k
             ret = ret and ((gqa_ratio & (gqa_ratio - 1)) == 0)
+        if hdim_q == 192 and hdim_v == 128 and block_table is None:
+            ret = ret and not _fmha_kv_byte_extent_ge_u32(max_seqlen_k, k, v)
         return ret
 
     def can_impl_fmha_fwd_with_sink_varlen_asm():

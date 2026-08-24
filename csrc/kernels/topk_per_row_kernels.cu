@@ -1,17 +1,16 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-#include <ATen/hip/HIPContext.h>
-#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
-#include <torch/all.h>
-
 #include "aiter_hip_common.h"
-#include "dispatch_utils.h"
+#include "aiter_tensor.h"
+#include "aiter_stream.h"
+#include "hip_reduce.h"
 #include <hipcub/hipcub.hpp>
 #include <hipcub/util_type.hpp>
 
 #include <algorithm>
 #include <limits>
+#include <optional>
 #include <type_traits>
 #include <vector>
 
@@ -105,36 +104,16 @@ __device__ constexpr unsigned calc_mask(int pass)
  * whose sign bit is 1 but compares equal to +0.0f under IEEE 754.
  */
 template <typename T>
-__device__ typename hipcub::Traits<T>::UnsignedBits twiddle_in(T key, bool select_min)
+__device__ typename aiter::radix_traits<T>::UnsignedBits twiddle_in(T key, bool select_min)
 {
-    auto bits = reinterpret_cast<typename hipcub::Traits<T>::UnsignedBits&>(key);
-    if constexpr(std::is_same_v<T, float>)
-    {
-        uint32_t mask = (bits >> 31) ? 0 : 0x7fffffff;
-        return bits ^ mask;
-    }
-    else
-    {
-        bits = hipcub::Traits<T>::TwiddleIn(bits);
-        if(!select_min)
-        {
-            bits = ~bits;
-        }
-        return bits;
-    }
+    static_assert(std::is_same_v<T, float>, "radix top-k only supports fp32");
+    // select_min never mattered for float: the mask below is symmetric, so the
+    // ordering flip is handled by the comparison direction at the call sites.
+    (void)select_min;
+    auto bits     = reinterpret_cast<typename aiter::radix_traits<T>::UnsignedBits&>(key);
+    uint32_t mask = (bits >> 31) ? 0 : 0x7fffffff;
+    return bits ^ mask;
 }
-
-// // twiddle_out: convert sorted bits back to the original value type.
-// template <typename T>
-// __device__ T twiddle_out(typename hipcub::Traits<T>::UnsignedBits bits, bool select_min)
-// {
-//     if(!select_min)
-//     {
-//         bits = ~bits;
-//     }
-//     bits = hipcub::Traits<T>::TwiddleOut(bits);
-//     return reinterpret_cast<T&>(bits);
-// }
 
 // Compute bucket index using v_bfe_u32 (single-instruction bit field extract).
 // `mask` is unused: __builtin_amdgcn_ubfe extracts a fixed BitsPerPass-wide
@@ -279,7 +258,7 @@ struct alignas(128) Counter
     IdxT k;
     IdxT len;
     IdxT previous_len;
-    typename hipcub::Traits<T>::UnsignedBits kth_value_bits;
+    typename aiter::radix_traits<T>::UnsignedBits kth_value_bits;
     alignas(128) IdxT filter_cnt;
     alignas(128) unsigned int finished_block_cnt;
     alignas(128) IdxT out_cnt;
@@ -404,7 +383,7 @@ __global__ void radix_kernel_persistent(T const* in,
     const size_t total_threads = static_cast<size_t>(blockDim.x) * gridDim.x;
 
     __shared__ IdxT histogram_smem[num_buckets];
-    __shared__ typename hipcub::Traits<T>::UnsignedBits local_kth_value_bits;
+    __shared__ typename aiter::radix_traits<T>::UnsignedBits local_kth_value_bits;
     __shared__ IdxT local_k;
     __shared__ IdxT local_len;
 
@@ -560,7 +539,7 @@ __global__ void radix_kernel_persistent(T const* in,
                 {
                     local_k = current_k - prev;
                     local_len = cur - prev;
-                    typename hipcub::Traits<T>::UnsignedBits bucket = i;
+                    typename aiter::radix_traits<T>::UnsignedBits bucket = i;
                     local_kth_value_bits |= bucket << start_bit;
                 }
             }
@@ -971,23 +950,15 @@ __device__ constexpr unsigned calc_mask(int pass)
 
 // Map value to order-preserving unsigned bits; uses (bits >> 31) for correct -0.0f handling.
 template <typename T>
-__device__ typename hipcub::Traits<T>::UnsignedBits twiddle_in(T key, bool select_min)
+__device__ typename aiter::radix_traits<T>::UnsignedBits twiddle_in(T key, bool select_min)
 {
-    auto bits = reinterpret_cast<typename hipcub::Traits<T>::UnsignedBits&>(key);
-    if constexpr(std::is_same_v<T, float>)
-    {
-        uint32_t mask = (bits >> 31) ? 0 : 0x7fffffff;
-        return bits ^ mask;
-    }
-    else
-    {
-        bits = hipcub::Traits<T>::TwiddleIn(bits);
-        if(!select_min)
-        {
-            bits = ~bits;
-        }
-        return bits;
-    }
+    static_assert(std::is_same_v<T, float>, "radix top-k only supports fp32");
+    // select_min never mattered for float: the mask below is symmetric, so the
+    // ordering flip is handled by the comparison direction at the call sites.
+    (void)select_min;
+    auto bits     = reinterpret_cast<typename aiter::radix_traits<T>::UnsignedBits&>(key);
+    uint32_t mask = (bits >> 31) ? 0 : 0x7fffffff;
+    return bits ^ mask;
 }
 
 // Compute bucket index using v_bfe_u32.
@@ -1133,7 +1104,7 @@ struct alignas(128) Counter
     IdxT k;
     IdxT len;
     IdxT previous_len;
-    typename hipcub::Traits<T>::UnsignedBits kth_value_bits;
+    typename aiter::radix_traits<T>::UnsignedBits kth_value_bits;
     alignas(128) IdxT filter_cnt;
     alignas(128) unsigned int finished_block_cnt;
     alignas(128) IdxT out_cnt;
@@ -1322,8 +1293,8 @@ choose_bucket(Counter<T, IdxT>* counter, IdxT const* histogram, const IdxT k, in
         {
             counter->k   = k - prev;
             counter->len = cur - prev;
-            typename hipcub::Traits<T>::UnsignedBits bucket = i;
-            int start_bit                                   = calc_start_bit<T, BitsPerPass>(pass);
+            typename aiter::radix_traits<T>::UnsignedBits bucket = i;
+            int start_bit = calc_start_bit<T, BitsPerPass>(pass);
             counter->kth_value_bits |= bucket << start_bit;
         }
     }
@@ -2757,6 +2728,19 @@ int64_t topk_mb_workspace_size(int64_t numRows, int64_t stride0, int64_t k, bool
     return static_cast<int64_t>(sz);
 }
 
+// Same as topk_mb_workspace_size but for the one-block (ob) path, which Python
+// uses to size the cached scratch buffer it passes into the ob dispatch.
+int64_t topk_ob_workspace_size(int64_t numRows, int64_t stride0, int64_t k, bool is_decode)
+{
+    const int32_t batch  = static_cast<int>(numRows);
+    const int32_t stride = static_cast<int>(stride0);
+    const int kTopK      = static_cast<int>(k);
+    const size_t sz      = is_decode
+                               ? query_ob_workspace<aiter::Phase::Decode>(batch, stride, kTopK)
+                               : query_ob_workspace<aiter::Phase::Prefill>(batch, stride, kTopK);
+    return static_cast<int64_t>(sz);
+}
+
 bool topk_use_mulblocks(int64_t numRows, int64_t stride0)
 {
     return aiter::should_use_mulblocks(static_cast<int>(numRows), stride0);
@@ -2826,20 +2810,22 @@ void radix_topk_dispatch(void* buf,
 }
 
 // Prefill entry: dispatches to mb or ob based on batch size and seq_len.
-// `workspace` (optional): a caller-provided, zero-initialized persistent buffer
-// for the mb path (see get_topk_mb_workspace in topk.py). When given, the host
-// memset is skipped and the kernel self_resets it; when absent, the mb path
-// falls back to a fresh per-call buffer + memset (back-compat).
-void top_k_per_row_prefill(const torch::Tensor& logits,
-                           const torch::Tensor& rowStarts,
-                           const torch::Tensor& rowEnds,
-                           torch::Tensor& indices,
-                           std::optional<torch::Tensor> values,
+// `workspace` is a caller-provided persistent buffer, allocated + cached on the
+// Python side (get_topk_mb_workspace / get_topk_scratch_workspace in topk.py)
+// and passed in so this host code never allocates device scratch itself (torch's
+// caching allocator manages the buffer). The mb path expects a zero-initialized
+// buffer (the host memset is skipped and the kernel self_resets it); the ob path
+// uses it as plain scratch (the kernel does its own internal memset).
+void top_k_per_row_prefill(const aiter_tensor_t& logits,
+                           const aiter_tensor_t& rowStarts,
+                           const aiter_tensor_t& rowEnds,
+                           aiter_tensor_t& indices,
+                           std::optional<aiter_tensor_t> values,
                            int64_t numRows,
                            int64_t stride0,
                            int64_t /*stride1*/,
                            int64_t k = 2048,
-                           std::optional<torch::Tensor> workspace = std::nullopt,
+                           std::optional<aiter_tensor_t> workspace = std::nullopt,
                            bool stable = false)
 {
     if (numRows <= 0) return;
@@ -2848,27 +2834,30 @@ void top_k_per_row_prefill(const torch::Tensor& logits,
     static constexpr bool is_largest = true;
     size_t buf_size                  = 0;
 
-    const hipStream_t stream = at::hip::getCurrentHIPStream();
+    HipDeviceGuard device_guard(logits.device_id);
+    const hipStream_t stream = aiter::getCurrentHIPStream();
     const int batch          = static_cast<int>(numRows);
-    auto options             = torch::TensorOptions().dtype(torch::kUInt8).device(logits.device());
 
-    float* logits_ptr      = logits.data_ptr<float>();
-    int* indices_ptr       = indices.data_ptr<int>();
-    int* row_starts_ptr    = rowStarts.data_ptr<int>();
-    int* row_ends_ptr      = rowEnds.data_ptr<int>();
-    float* values_ptr      = values.has_value() ? values->data_ptr<float>() : nullptr;
+    float* logits_ptr      = static_cast<float*>(logits.data_ptr());
+    int* indices_ptr       = static_cast<int*>(indices.data_ptr());
+    int* row_starts_ptr    = static_cast<int*>(rowStarts.data_ptr());
+    int* row_ends_ptr      = static_cast<int*>(rowEnds.data_ptr());
+    float* values_ptr      = values.has_value() ? static_cast<float*>(values.value().data_ptr()) : nullptr;
     const bool write_vals  = values.has_value();
+
+    AITER_CHECK(workspace.has_value(),
+                "top_k_per_row_prefill requires a caller-provided workspace "
+                "(see top_k_per_row_prefill in topk.py)");
+    void* ws_ptr = workspace.value().data_ptr();
 
     // stable=true: force the one-block path with the deterministic, ascending-
     // ordered, smallest-index tie-break emit (STABLE=true). This guarantees a
     // scheduling-independent top-k so every tensor-parallel rank selects and
     // orders an identical KV set. The multi-block persistent path is bypassed
-    // (its cross-block atomic emit is inherently order-dependent).
+    // (its cross-block atomic emit is inherently order-dependent). The caller
+    // sizes `workspace` for the ob path in this case (see topk.py).
     if (stable) {
         constexpr bool select_min = !is_largest;
-        const size_t ob_ws      = query_ob_workspace<aiter::Phase::Prefill>(batch, stride0, kTopK);
-        torch::Tensor ws        = torch::empty({static_cast<int64_t>(ob_ws)}, options);
-        void* ws_ptr            = static_cast<void*>(ws.data_ptr<uint8_t>());
         if (write_vals) {
             aiter::ob::dispatch_topk_oneblock<float, int, 1024, true, aiter::ob::Phase::Prefill, /*STABLE=*/true>(
                 ws_ptr, buf_size, logits_ptr, static_cast<int*>(nullptr),
@@ -2884,18 +2873,9 @@ void top_k_per_row_prefill(const torch::Tensor& logits,
     }
 
     if (aiter::should_use_mulblocks(batch, stride0)) {
-        // Prefer the caller's persistent zeroed buffer (memset-free + self_reset);
-        // otherwise fall back to a fresh per-call buffer + the internal memset.
-        const bool prezeroed = workspace.has_value();
-        torch::Tensor fallback;
-        void* ws_ptr;
-        if (prezeroed) {
-            ws_ptr = workspace->data_ptr();
-        } else {
-            const size_t mb_ws = query_mb_workspace<aiter::Phase::Prefill>(batch, stride0, kTopK);
-            fallback = torch::empty({static_cast<int64_t>(mb_ws)}, options);
-            ws_ptr   = static_cast<void*>(fallback.data_ptr<uint8_t>());
-        }
+        // mb path: the caller-provided buffer is zero-initialized and the kernel
+        // self_resets it, so the host memset is skipped (prezeroed=true).
+        constexpr bool prezeroed = true;
         if (write_vals) {
             aiter::mb::standalone_stable_radix_topk<float, int, true, true, aiter::mb::Phase::Prefill>(
                 ws_ptr, buf_size, logits_ptr, batch, stride0,
@@ -2911,10 +2891,7 @@ void top_k_per_row_prefill(const torch::Tensor& logits,
         }
     } else {
         constexpr bool select_min = !is_largest;
-        // ob path keeps a fresh per-call buffer + its own internal memset.
-        const size_t ob_ws      = query_ob_workspace<aiter::Phase::Prefill>(batch, stride0, kTopK);
-        torch::Tensor workspace = torch::empty({static_cast<int64_t>(ob_ws)}, options);
-        void* ws_ptr            = static_cast<void*>(workspace.data_ptr<uint8_t>());
+        // ob path: caller-provided scratch; the kernel does its own internal memset.
         if (write_vals) {
             aiter::ob::dispatch_topk_oneblock<float, int, 1024, true, aiter::ob::Phase::Prefill>(
                 ws_ptr, buf_size, logits_ptr, static_cast<int*>(nullptr),
@@ -2945,17 +2922,18 @@ void top_k_per_row_prefill(const torch::Tensor& logits,
 // The original mb/ob dispatch logic is preserved below (commented out) for
 // reference in case multi-block decode is revisited in the future.
 //
-// `workspace` parameter is kept in the signature for API compatibility but
-// is unused on the ob-only path.
-void top_k_per_row_decode(const torch::Tensor& logits,
+// `workspace` is a caller-provided scratch buffer, allocated + cached on the
+// Python side (see top_k_per_row_decode in topk.py); the ob path uses it
+// directly so this host code never allocates device scratch itself.
+void top_k_per_row_decode(const aiter_tensor_t& logits,
                           int64_t next_n,
-                          const torch::Tensor& seqLens,
-                          torch::Tensor& indices,
+                          const aiter_tensor_t& seqLens,
+                          aiter_tensor_t& indices,
                           int64_t numRows,
                           int64_t stride0,
                           int64_t /*stride1*/,
                           int64_t k = 2048,
-                          std::optional<torch::Tensor> workspace = std::nullopt,
+                          std::optional<aiter_tensor_t> workspace = std::nullopt,
                           bool stable = false)
 {
     if (numRows <= 0) return;
@@ -2965,18 +2943,20 @@ void top_k_per_row_decode(const torch::Tensor& logits,
     constexpr bool select_min        = !is_largest;
     size_t buf_size                  = 0;
 
-    const hipStream_t stream = at::hip::getCurrentHIPStream();
+    HipDeviceGuard device_guard(logits.device_id);
+    const hipStream_t stream = aiter::getCurrentHIPStream();
     const int batch          = static_cast<int>(numRows);
-    auto options             = torch::TensorOptions().dtype(torch::kUInt8).device(logits.device());
 
-    float* logits_ptr = logits.data_ptr<float>();
-    int* indices_ptr  = indices.data_ptr<int>();
-    int* seq_lens_ptr = seqLens.data_ptr<int>();
+    float* logits_ptr = static_cast<float*>(logits.data_ptr());
+    int* indices_ptr  = static_cast<int*>(indices.data_ptr());
+    int* seq_lens_ptr = static_cast<int*>(seqLens.data_ptr());
+
+    AITER_CHECK(workspace.has_value(),
+                "top_k_per_row_decode requires a caller-provided workspace "
+                "(see top_k_per_row_decode in topk.py)");
+    void* ws_ptr = workspace.value().data_ptr();
 
     // Always use one-block path for decode.
-    const size_t ob_ws         = query_ob_workspace<aiter::Phase::Decode>(batch, stride0, kTopK);
-    torch::Tensor ob_workspace = torch::empty({static_cast<int64_t>(ob_ws)}, options);
-    void* ws_ptr               = static_cast<void*>(ob_workspace.data_ptr<uint8_t>());
     // stable=true: deterministic ascending-ordered, smallest-index tie-break
     // emit so every TP rank selects and orders an identical KV set.
     if (stable) {
@@ -2996,27 +2976,15 @@ void top_k_per_row_decode(const torch::Tensor& logits,
         select_min, stream, /*sorted=*/true, static_cast<int>(next_n));
 
     // --- Original mb/ob dispatch (commented out for reference) ---
+    // Both branches take the caller-provided `workspace` (no device allocation
+    // here); the mb buffer is zeroed + self_reset by the kernel (prezeroed=true).
     // if (aiter::should_use_mulblocks(batch, stride0)) {
-    //     const bool prezeroed = workspace.has_value();
-    //     torch::Tensor fallback;
-    //     void* ws_ptr;
-    //     if (prezeroed) {
-    //         ws_ptr = workspace->data_ptr();
-    //     } else {
-    //         const size_t mb_ws = query_mb_workspace<aiter::Phase::Decode>(batch, stride0, kTopK);
-    //         fallback = torch::empty({static_cast<int64_t>(mb_ws)}, options);
-    //         ws_ptr   = static_cast<void*>(fallback.data_ptr<uint8_t>());
-    //     }
     //     aiter::mb::standalone_stable_radix_topk<float, int, false, true, aiter::mb::Phase::Decode>(
     //         ws_ptr, buf_size, logits_ptr, batch, stride0,
     //         /*rowStarts=*/nullptr, /*rowEnds=*/seq_lens_ptr,
     //         kTopK, /*out=*/nullptr, indices_ptr,
-    //         is_largest, stream, static_cast<int>(next_n), prezeroed);
+    //         is_largest, stream, static_cast<int>(next_n), /*prezeroed=*/true);
     // } else {
-    //     constexpr bool select_min = !is_largest;
-    //     const size_t ob_ws         = query_ob_workspace<aiter::Phase::Decode>(batch, stride0, kTopK);
-    //     torch::Tensor ob_workspace = torch::empty({static_cast<int64_t>(ob_ws)}, options);
-    //     void* ws_ptr               = static_cast<void*>(ob_workspace.data_ptr<uint8_t>());
     //     aiter::ob::dispatch_topk_oneblock<float, int, 1024, false, aiter::ob::Phase::Decode>(
     //         ws_ptr, buf_size, logits_ptr, static_cast<int*>(nullptr),
     //         batch, stride0,

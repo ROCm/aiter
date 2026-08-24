@@ -39,6 +39,15 @@ def _active_m_blocks_upper_bound(M_logical, topk, NE, BM, SBM):
     return sort_blocks * (SBM // BM)
 
 
+def _validate_v2_gemm2_dtypes(a_dtype: str, b_dtype: str) -> None:
+    if (a_dtype, b_dtype) not in {
+        ("fp4", "fp4"),
+        ("fp8", "fp4"),
+        ("fp8", "fp8"),
+    }:
+        raise AssertionError(f"unsupported v2 GEMM2 dtype pair {(a_dtype, b_dtype)!r}")
+
+
 # ---- gemm2 (down-proj) compile ----
 def _spart_output_tile_index(block_1d_id, M0, N0, group_num, m01, nmajor=False):
     """ck_tile GemmSpatiallyLocalTilePartitioner::GetOutputTileIndex: 1D block id -> spatially-local (m_block_idx, n_block_idx). block_1d_id/M0 runtime; N0/group_num/m01 compile-time."""
@@ -85,6 +94,20 @@ def _spart_output_tile_index(block_1d_id, M0, N0, group_num, m01, nmajor=False):
     return m_block_idx, n_block_idx
 
 
+def _pick_epi_lanes(BM, BN, route_out_fp8, g2_scale_blk, nthreads=256):
+    if not route_out_fp8:
+        return None
+    order = (32, 16, 8) if BN >= 512 else (16, 8, 32)
+    for lanes in order:
+        epi_rows = nthreads // lanes
+        route_vec = BN // lanes
+        if BM % epi_rows or BN % lanes or route_vec % 4:
+            continue
+        if g2_scale_blk in (route_vec, 2 * route_vec, 4 * route_vec):
+            return lanes
+    return None
+
+
 def compile_gemm2_a4w4_port(
     BM=32,
     BN=256,
@@ -94,6 +117,7 @@ def compile_gemm2_a4w4_port(
     epilog="atomic",
     INTER_MAX=8192,
     a_dtype="fp4",
+    b_dtype="fp4",
     topk=1,
     SBM=None,
     persist=False,
@@ -113,10 +137,10 @@ def compile_gemm2_a4w4_port(
             f"mxfp4_moe_gemm2 supports only (BM in {{16,32,64,128}}, epilog in {{'atomic','reduce'}}); "
             f"got (BM={BM}, epilog={epilog})"
         )
-    if BN not in (64, 128, 256, 512) or BK not in (128, 256):
+    if BN not in (128, 256, 512) or BK not in (128, 256):
         raise AssertionError(
             "mxfp4_moe_gemm2 supports only "
-            f"(BN in {{64,128,256,512}}, BK in {{128,256}}); got (BN={BN}, BK={BK})"
+            f"(BN in {{128,256,512}}, BK in {{128,256}}); got (BN={BN}, BK={BK})"
         )
     if SBM % BM != 0:
         raise AssertionError(f"SBM ({SBM}) must be a multiple of BM ({BM})")
@@ -153,8 +177,7 @@ def compile_gemm2_a4w4_port(
         raise AssertionError(
             f"g2_spart={g2_spart} must encode GroupNum>=1,M01>=1 as GroupNum*100+M01 (e.g. 402)"
         )
-    if a_dtype not in ("fp4", "fp8"):
-        raise AssertionError(f"a_dtype must be 'fp4' or 'fp8', got {a_dtype!r}")
+    _validate_v2_gemm2_dtypes(a_dtype, b_dtype)
     assert INTER_MAX % BK == 0, f"INTER_MAX must be a multiple of {BK}, got {INTER_MAX}"
     is_f8 = a_dtype == "fp8"
     if g2_bf16_lds is None:
@@ -173,6 +196,9 @@ def compile_gemm2_a4w4_port(
     aStages = 3 if (not g2_bf16_lds or 3 * slot_bytes <= c_lds_bytes) else 2
     a_slot_alias = aStages <= kStages
     lds_bytes = max(c_lds_bytes, aStages * slot_bytes)
+    K_TILES_RT_MAX = INTER_MAX // BK
+    g2_apre = g2_kstatic and aStages >= K_TILES_RT_MAX
+    a_preload = min(aStages, K_TILES_RT_MAX) if g2_apre else kStages
     # N_OUT = model_dim/hidden is runtime; HIDDEN_MAX is a compile/cache bucket
     # so different runtime hidden sizes can reuse one compiled launcher.
     assert (
@@ -181,6 +207,7 @@ def compile_gemm2_a4w4_port(
 
     # Kernel-name tags empty on the default so its name/IR stays byte-identical (each variant distinct).
     atag = "_a8" if is_f8 else ""
+    btag = "_w8" if b_dtype == "fp8" else ""
     etag = "atomic" if not use_reduce else f"reduce_tk{topk}"
     sbm_tag = "" if SBM == BM else f"_sbm{SBM}"
     if persist and cu_num <= 0:
@@ -207,7 +234,8 @@ def compile_gemm2_a4w4_port(
     sblk_tag = f"_sblk{g2_scale_blk}" if (route_out_fp8 and g2_scale_blk != 8) else ""
     out_tag = "_fp8out" if route_out_fp8 else ""
     tile_tag = "" if (BN, BK) == (256, 256) else f"_bn{BN}_bk{BK}"
-    tag = f"hmax{HIDDEN_MAX}_imax{INTER_MAX}_bm{BM}{tile_tag}{'_nt' if use_nt else ''}_{etag}{atag}{sbm_tag}{persist_tag}{pad_tag}{bh_tag}{apf_tag}{spart_tag}{bf16lds_tag}{dw_tag}{kst_tag}{pitch_tag}{sblk_tag}{out_tag}_v2"
+    g2_epi_lanes = _pick_epi_lanes(BM, BN, route_out_fp8, g2_scale_blk)
+    tag = f"hmax{HIDDEN_MAX}_imax{INTER_MAX}_bm{BM}{tile_tag}{'_nt' if use_nt else ''}_{etag}{atag}{btag}{sbm_tag}{persist_tag}{pad_tag}{bh_tag}{apf_tag}{spart_tag}{bf16lds_tag}{dw_tag}{kst_tag}{pitch_tag}{sblk_tag}{out_tag}_v2"
     name = f"gemm2_a4w4_port_{tag}"
 
     @fx.struct
@@ -244,7 +272,7 @@ def compile_gemm2_a4w4_port(
         lds_base_i32 = fx.Int32(fx.ptrtoint(lds.buf.ptr))
 
         def issue_all_a_loads(m_row0):
-            for slot in range_constexpr(kStages):
+            for slot in range_constexpr(a_preload):
                 issue_a_load_lds_dt(
                     arg_aq,
                     aq_num,
@@ -290,6 +318,7 @@ def compile_gemm2_a4w4_port(
                 aStages=aStages,
                 a_slot_alias=a_slot_alias,
                 a_dtype=a_dtype,
+                b_dtype=b_dtype,
                 use_reduce=use_reduce,
                 topk=topk,
                 has_pad=has_pad,
@@ -301,6 +330,8 @@ def compile_gemm2_a4w4_port(
                 g2_out_pitch_align=g2_out_pitch_align,
                 g2_scale_blk=g2_scale_blk,
                 route_out_fp8=route_out_fp8,
+                g2_epi_lanes=g2_epi_lanes,
+                g2_apre=g2_apre,
                 mn_idx=mn_idx,
             )
 
@@ -466,6 +497,7 @@ def get_g2(
     epilog,
     INTER_MAX,
     a_dtype,
+    b_dtype="fp4",
     topk=1,
     SBM=None,
     persist=False,
@@ -502,6 +534,7 @@ def get_g2(
         epilog,
         INTER_MAX,
         a_dtype,
+        b_dtype,
         topk_key,
         SBM,
         persist,
@@ -525,6 +558,7 @@ def get_g2(
             epilog=epilog,
             INTER_MAX=INTER_MAX,
             a_dtype=a_dtype,
+            b_dtype=b_dtype,
             topk=topk_key,
             SBM=SBM,
             persist=persist,
@@ -563,6 +597,7 @@ def mxfp4_moe_gemm2(
     BK=256,
     use_nt=False,
     a_dtype="fp4",
+    b_dtype="fp4",
     epilog="atomic",
     SBM=None,
     persist=False,
@@ -580,12 +615,13 @@ def mxfp4_moe_gemm2(
     """Stage-2 down-proj gemm; epilog 'atomic' (weighted atomic.fadd) or 'reduce' (store into out[token_id*topk+slot]). inter_dim_pad/model_dim_pad>0 enable has_pad pad-skip (both 0 -> byte-identical); persist = fixed cu_num m-slot grid (default OFF)."""
     import torch
 
+    _validate_v2_gemm2_dtypes(a_dtype, b_dtype)
     if persist and cu_num <= 0:
         cu_num = get_cu_num()
     SBM = _norm_sbm(SBM, BM)
     has_pad = inter_dim_pad > 0 or model_dim_pad > 0
-    if BN <= 0 or BN % 128 != 0:
-        raise AssertionError(f"BN must be a positive multiple of 128, got {BN}")
+    if BN not in (128, 256, 512):
+        raise AssertionError(f"BN must be one of (128, 256, 512), got {BN}")
     if BK not in (128, 256):
         raise AssertionError(f"BK must be one of (128, 256), got {BK}")
     # model_dim/hidden (gemm2 N-output) is a runtime arg; validate host-side (not compile-time).
@@ -605,6 +641,19 @@ def mxfp4_moe_gemm2(
         raise AssertionError(
             f"D_INTER ({D_INTER}) exceeds compile cap INTER_MAX ({INTER_MAX})"
         )
+    if (
+        str(out_dtype).strip().lower() == "bf16"
+        and getattr(out, "dtype", None) != torch.bfloat16
+    ):
+        raise TypeError(
+            "FlyDSL v2 GEMM2 supports only torch.bfloat16 output, "
+            f"got {getattr(out, 'dtype', None)}"
+        )
+    if sorted_weights is None:
+        raise NotImplementedError(
+            "FlyDSL v2 GEMM2 requires sorted_weights; "
+            "doweight_stage1=True is not supported"
+        )
     _kstatic = os.environ.get("MXFP4_G2_KSTATIC", "1") == "1"
     if _kstatic:
         INTER_MAX = D_INTER
@@ -618,6 +667,7 @@ def mxfp4_moe_gemm2(
         INTER_MAX,
         a_dtype,
         g2_kstatic=_kstatic,
+        b_dtype=b_dtype,
         topk=topk,
         SBM=SBM,
         persist=persist,
