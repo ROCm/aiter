@@ -30,6 +30,8 @@ import argparse
 
 import pandas as pd
 import pytest
+import sys
+
 import torch
 
 import aiter
@@ -509,6 +511,9 @@ class _CaptureSafeMeta:
 
 _NUM_WARMUP = 2
 _NUM_ITERS = 101
+# ``checkAllclose`` returns the RATIO of elements outside (rtol, atol), so 0 is
+# clean. Matches its own ``tol_err_ratio`` default.
+_ERR_RATIO_TOL = 0.05
 
 
 def _graph_time_us(fn) -> float:
@@ -537,37 +542,106 @@ def _graph_time_us(fn) -> float:
     return start.elapsed_time(end) * 1e3 / _NUM_ITERS  # ms -> us, per iter
 
 
+# Set by _bench_candidates whenever a kernel we own disagrees with the Triton
+# baseline; main() turns it into a nonzero exit status.
+_STRICT_FAILURES = []
+
+
 def _bench_candidates(
-    candidates, *, flops, nbytes, label, out_of=lambda o: o, extra=None
+    candidates,
+    *,
+    flops,
+    nbytes,
+    label,
+    baseline,
+    strict,
+    out_of=lambda o: o,
+    extra=None,
 ):
-    """Time each candidate, check it against the first (baseline), collect a row.
+    """Time each candidate against ``baseline``, collect one row.
+
+    ``baseline`` names the reference candidate explicitly (it must be a key of
+    ``candidates``) rather than relying on dict order -- every correctness and
+    speedup number in the row is relative to it, so it should not be implicit.
+    It is run first regardless of where it sits in ``candidates``.
+
+    ``strict`` is the set of candidate names we own. Only those gate the run:
+
+      * ``strict`` candidate outside tolerance -> **FAIL** (logged at error
+        level, recorded in ``_STRICT_FAILURES``, nonzero exit from ``main``).
+      * any other candidate outside tolerance -> **warn** only. ``hip`` and
+        ``flydsl_opt`` are upstream implementations.
 
     ``out_of`` maps a candidate's return value to the tensor to compare; K5
     returns ``(h, v_new, final_state)`` while the fused path returns ``o``.
     ``extra`` is merged into the row first (e.g. the resolved variant tag).
+
+    Column scheme: two columns per candidate -- ``us`` and ``vs <baseline>``.
+    TFLOPS / TB/s are deliberately NOT per-candidate: ``flops`` and ``nbytes``
+    are constant for the row (both reported once), so those are pure functions
+    of ``us`` and would double the width for no information. Correctness
+    collapses to a single ``check`` column; ``checkAllclose`` already logs the
+    per-candidate detail, and its return value is the RATIO of elements outside
+    tolerance (0 == clean), not an error magnitude.
     """
-    ret = {"gfx": get_gfx(), **(extra or {})}
+    if baseline not in candidates:
+        raise KeyError(f"baseline {baseline!r} is not one of {list(candidates)}")
+    unknown = set(strict) - set(candidates)
+    if unknown:
+        raise KeyError(f"strict names not in candidates: {sorted(unknown)}")
+
+    ret = {"gfx": get_gfx(), "baseline": baseline, **(extra or {})}
     ref_out = None
-    for name, fn in candidates.items():
+    base_us = None
+    errs = {}
+    # Baseline first, whatever the dict order -- it defines ref_out and base_us.
+    for name in [baseline] + [n for n in candidates if n != baseline]:
+        fn = candidates[name]
         # Correctness: minimal eager run just to get the output tensor.
         out, _ = run_perftest(fn, num_iters=2, num_warmup=_NUM_WARMUP)
         out = out_of(out)
         if ref_out is None:
-            ref_out = out  # the first candidate is the baseline
-        err = checkAllclose(
+            ref_out = out
+        errs[name] = checkAllclose(
             ref_out.to(dtypes.fp32),
             out.to(dtypes.fp32),
             rtol=1e-2,
             atol=1e-2,
-            msg=f"{name}: {label}",
+            msg=f"{name} vs {baseline}: {label}",
         )
 
         us = _graph_time_us(fn)
         aiter.logger.info(f"avg: {us:.3f} us/iter with hipgraph")
+        if base_us is None:
+            base_us = us
         ret[f"{name} us"] = us
-        ret[f"{name} TFLOPS"] = flops / us / 1e6
-        ret[f"{name} TB/s"] = nbytes / us / 1e6
-        ret[f"{name} err"] = err
+        ret[f"{name} vs {baseline}"] = (
+            f"{(base_us / us):.2f}x" if us > 0 else float("nan")
+        )
+
+    # flops/bytes once per row, so any candidate's TFLOPS/TB-s is one division.
+    ret["flops"] = flops
+    ret["bytes"] = nbytes
+
+    over = {n: e for n, e in errs.items() if e > _ERR_RATIO_TOL}
+    failed = {n: e for n, e in over.items() if n in strict}
+    warned = {n: e for n, e in over.items() if n not in strict}
+    parts = []
+    if failed:
+        msg = ", ".join(f"{n}={e:.2g}" for n, e in failed.items())
+        aiter.logger.error("FAIL vs %s: %s (%s)", baseline, msg, label)
+        _STRICT_FAILURES.append(f"{label}: {msg}")
+        parts.append("FAIL (tolerance exceeded): " + msg)
+    if warned:
+        msg = ", ".join(f"{n}={e:.2g}" for n, e in warned.items())
+        aiter.logger.warning(
+            "known upstream mismatch vs %s: %s (%s)", baseline, msg, label
+        )
+        parts.append("warn (tolerance exceeded): " + msg)
+    if not parts:
+        worst = max(errs.values(), default=0.0)
+        parts.append("ok" if worst == 0 else f"ok(max {worst:.1g})")
+    ret[f"check (vs {baseline})"] = " | ".join(parts)
     return ret
 
 
@@ -605,10 +679,12 @@ def bench_fused_k5k6(model_tag, H, Hg, T_flat, N, gate):
     seq_lens = [T_flat // N] * (N - 1) + [T_flat - (T_flat // N) * (N - 1)]
     inp = _make_inputs(H, Hg, K, V, T_flat, seq_lens, gate)
     q = torch.randn(1, T_flat, Hg, K, dtype=torch.bfloat16, device="cuda") * 0.1
-    # HIP K5 expects g as [B, H, T] head-major.
-    g_hip = inp["g"].unsqueeze(0) if inp["g"] is not None else None
+    # The HIP K5 and the FlyDSL "opt" port both want g as 3-D [B, H, T]
+    # head-major; ``inp["g"]`` is the 2-D [H, T_flat] form the vk kernel takes.
+    g_hm3 = inp["g"].unsqueeze(0) if inp["g"] is not None else None
     o_triton = inp["u_tm"].new_empty(1, T_flat, H, V)
     o_hip = inp["u_tm"].new_empty(1, T_flat, H, V)
+    o_opt = inp["u_tm"].new_empty(1, T_flat, H, V)
     o_always = inp["u_tm"].new_empty(1, T_flat, H, V)
     o_auto = inp["u_tm"].new_empty(1, T_flat, H, V)
 
@@ -690,6 +766,43 @@ def bench_fused_k5k6(model_tag, H, Hg, T_flat, N, gate):
         )
         return o_hip
 
+    def _run_flydsl_opt():
+        # Kernel (1) K5 + Triton K6 -- the SEPARATE path that production runs
+        # today, i.e. the number the fused candidates actually have to beat.
+        # (1) has no fused build, so it can only appear here as a two-kernel
+        # pipeline.
+        from aiter.ops.flydsl.linear_attention_prefill_kernels import (
+            chunk_gated_delta_rule_fwd_h_flydsl_opt,
+        )
+
+        h, v_new, _ = chunk_gated_delta_rule_fwd_h_flydsl_opt(
+            k=inp["k"],
+            w=inp["w_hm"],
+            u=inp["u_hm"],
+            g=g_hm3,
+            gk=inp["gk"],
+            initial_state=inp["h0"],
+            output_final_state=True,
+            save_new_value=True,
+            cu_seqlens=inp["cu"],
+            use_exp2=_USE_EXP2,
+            g_head_major=True,
+            prefill_metadata=safe_meta,
+        )
+        k6_triton(
+            q=q,
+            k=inp["k"],
+            v=v_new,
+            o=o_opt,
+            h=h,
+            g=inp["g"],
+            scale=scale,
+            cu_seqlens=inp["cu"],
+            use_exp2=_USE_EXP2,
+            prefill_metadata=safe_meta,
+        )
+        return o_opt
+
     def _run_fused_always():
         chunk_gated_delta_rule_fwd_h_o_flydsl(
             q=q,
@@ -743,6 +856,7 @@ def bench_fused_k5k6(model_tag, H, Hg, T_flat, N, gate):
     candidates = {
         "triton+triton": _run_triton,  # baseline
         "hip+triton": _run_hip,
+        "flydsl_opt+triton": _run_flydsl_opt,
         "fused_always": _run_fused_always,
         "fused_auto": _run_fused_auto,
     }
@@ -761,6 +875,10 @@ def bench_fused_k5k6(model_tag, H, Hg, T_flat, N, gate):
         flops=flops,
         nbytes=nbytes,
         label=f"fused_k5k6 H={H} N={N} T={T_flat}",
+        baseline="triton+triton",
+        # Ours: the fused K5+K6 kernel. hip+triton / flydsl_opt+triton are
+        # upstream and only warn (see _bench_candidates).
+        strict=("fused_always", "fused_auto"),
         extra={
             "HxN": H * N,
             "fused variant": fused_tag,
@@ -773,7 +891,15 @@ def bench_fused_k5k6(model_tag, H, Hg, T_flat, N, gate):
 
 @benchmark()
 def bench_k5(model_tag, H, Hg, T_flat, N, gate, variants=None):
-    """Triton K5 baseline vs HIP K5 and FlyDSL K5 -- the state scan in isolation.
+    """Triton K5 baseline vs HIP K5 and both FlyDSL K5 kernels -- the state
+    scan in isolation.
+
+    Candidates: ``triton`` (baseline), ``hip`` (hand-written HIP/C++),
+    ``flydsl_opt`` (kernel 1, the HIP-aligned FlyDSL port) and ``flydsl_vk``
+    (kernel 2, the gfx942-tuned build reached through
+    ``chunk_gated_delta_rule_fwd_h_flydsl``). ``flydsl_opt`` vs ``flydsl_vk``
+    is the comparison that decides whether kernel (2) should be routed into
+    production.
 
     The K5-only counterpart of ``bench_fused_k5k6``, mirroring the ``k5``
     subcommand of ``op_tests/op_benchmarks/flydsl/bench_chunk_gdn_fwd.py``: no K6
@@ -782,15 +908,18 @@ def bench_k5(model_tag, H, Hg, T_flat, N, gate, variants=None):
     these numbers are the baseline the fused path is trying to beat -- they are
     NOT comparable to the fused rows (different work, different byte counts).
 
-    ``variants`` adds explicit FlyDSL variant tags (e.g. ``["bv16", "bv64w8"]``)
-    as extra candidates alongside the auto-selected one; useful for re-checking
-    the H*N selection rule. Default: auto only.
+    ``variants`` adds explicit kernel-(2) tile tags (e.g. ``["bv16",
+    "bv64w8"]``) as extra ``flydsl_vk:<tag>`` candidates alongside the
+    auto-selected one; useful for re-checking the H*N selection rule. Kernel
+    (1) takes no tile argument -- it resolves BV internally -- so it always
+    appears exactly once. Default: auto only.
     """
     from aiter.ops.chunk_gated_delta_rule_fwd_h import (
         chunk_gated_delta_rule_fwd_h_hip_fn,
     )
     from aiter.ops.flydsl.linear_attention_prefill_kernels import (
         chunk_gated_delta_rule_fwd_h_flydsl,
+        chunk_gated_delta_rule_fwd_h_flydsl_opt,
     )
     from aiter.ops.triton._triton_kernels.gated_delta_rule.prefill.chunk_delta_h import (
         chunk_gated_delta_rule_fwd_h_opt_vk as k5_triton,
@@ -801,8 +930,9 @@ def bench_k5(model_tag, H, Hg, T_flat, N, gate, variants=None):
 
     seq_lens = [T_flat // N] * (N - 1) + [T_flat - (T_flat // N) * (N - 1)]
     inp = _make_inputs(H, Hg, K, V, T_flat, seq_lens, gate)
-    # HIP K5 expects g as [B, H, T] head-major.
-    g_hip = inp["g"].unsqueeze(0) if inp["g"] is not None else None
+    # The HIP K5 and the FlyDSL "opt" port both want g as 3-D [B, H, T]
+    # head-major; ``inp["g"]`` is the 2-D [H, T_flat] form the vk kernel takes.
+    g_hm3 = inp["g"].unsqueeze(0) if inp["g"] is not None else None
 
     safe_meta = None
     if inp["cu"] is not None:
@@ -840,9 +970,16 @@ def bench_k5(model_tag, H, Hg, T_flat, N, gate, variants=None):
         return k5_triton(g=inp["g"], **common)
 
     def _run_hip():
-        return chunk_gated_delta_rule_fwd_h_hip_fn(g=g_hip, g_head_major=True, **common)
+        return chunk_gated_delta_rule_fwd_h_hip_fn(g=g_hm3, g_head_major=True, **common)
 
-    def _make_flydsl(tag):
+    def _run_flydsl_opt():
+        # Kernel (1): the HIP-aligned FlyDSL port. No ``variant=`` -- it picks
+        # BV internally (tuned CSV -> _hipeq_select_bv).
+        return chunk_gated_delta_rule_fwd_h_flydsl_opt(
+            g=g_hm3, g_head_major=True, **common
+        )
+
+    def _make_flydsl_vk(tag):
         def _run():
             return chunk_gated_delta_rule_fwd_h_flydsl(
                 g=inp["g"], variant=tag, **common
@@ -853,10 +990,11 @@ def bench_k5(model_tag, H, Hg, T_flat, N, gate, variants=None):
     candidates = {
         "triton": _run_triton,  # baseline
         "hip": _run_hip,
-        "flydsl": _make_flydsl(None),  # None -> the auto (H*N rule) selection
+        "flydsl_opt": _run_flydsl_opt,
+        "flydsl_vk": _make_flydsl_vk(None),  # None -> the auto (H*N rule) pick
     }
     for tag in variants or ():
-        candidates[f"flydsl:{tag}"] = _make_flydsl(tag)
+        candidates[f"flydsl_vk:{tag}"] = _make_flydsl_vk(tag)
 
     # FLOPs: K5 only = GEMM1 (w@h^T) + GEMM2 (k^T@v_new) = 4*BT*K*V per chunk/head.
     n_chunks = sum(-(-s // BT) for s in seq_lens)
@@ -870,10 +1008,8 @@ def bench_k5(model_tag, H, Hg, T_flat, N, gate, variants=None):
         + n_chunks * H * V * K  # h snapshots (one per chunk, not per sequence)
     ) * 2  # bf16
 
-    # Record what the "flydsl" (auto) candidate will ACTUALLY run. _resolve_variant
-    # is the same chain the launcher uses, so this also exposes an
-    # FLYDSL_GDN_K5_VARIANT env override -- which silently outranks the H*N rule
-    # and would otherwise make a pinned tile look like the heuristic's pick.
+    # Record what the "flydsl" (auto) candidate will actually run. 
+    # _resolve_variant is the same chain the launcher uses.
     from aiter.ops.flydsl.linear_attention_prefill_kernels import _resolve_variant
 
     auto_tag = _resolve_variant(
@@ -885,8 +1021,12 @@ def bench_k5(model_tag, H, Hg, T_flat, N, gate, variants=None):
         flops=flops,
         nbytes=nbytes,
         label=f"k5 H={H} N={N} T={T_flat}",
+        baseline="triton",
+        # Ours: the vk kernel and any explicitly pinned vk tile. hip and
+        # flydsl_opt are upstream and only warn (see _bench_candidates).
+        strict=tuple(n for n in candidates if n.startswith("flydsl_vk")),
         out_of=lambda ret: ret[0],  # (h, v_new, final_state) -> compare h
-        extra={"HxN": H * N, "flydsl variant": auto_tag},
+        extra={"HxN": H * N, "flydsl_vk variant": auto_tag},
     )
 
 
@@ -960,9 +1100,13 @@ def main():
             if kernel == "fused":
                 rows.append(bench_fused_k5k6(model_tag, H, Hg, T_flat, N, gate))
             else:
-                rows.append(
-                    bench_k5(model_tag, H, Hg, T_flat, N, gate, variants=k5_variants)
+                row = bench_k5(
+                    model_tag, H, Hg, T_flat, N, gate, variants=k5_variants
                 )
+                # ``variants`` is a callarg so @benchmark puts it in the row;
+                # it is already encoded in the flydsl_vk:<tag> column names.
+                row.pop("variants", None)
+                rows.append(row)
         title = "fused GDN K5+K6" if kernel == "fused" else "GDN K5 (state scan)"
         aiter.logger.info(
             "%s summary (markdown):\n%s",
@@ -970,6 +1114,19 @@ def main():
             pd.DataFrame(rows).to_markdown(index=False),
         )
 
+    # Correctness gate: only flydsl_vk kernels can fail the run. 
+    # Upstream hip / flydsl_opt mismatches are reported as warnings and
+    # do not affect the exit status.
+    if _STRICT_FAILURES:
+        aiter.logger.error(
+            "%d shape(s) where our kernel disagreed with the Triton baseline:\n  %s",
+            len(_STRICT_FAILURES),
+            "\n  ".join(_STRICT_FAILURES),
+        )
+        return 1
+ 
+    return 0
+
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
