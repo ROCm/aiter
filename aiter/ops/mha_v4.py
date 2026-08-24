@@ -736,14 +736,23 @@ def _quantize_v_fp8_fake(input: Tensor) -> tuple[Tensor, Tensor]:
 
 
 @torch.library.custom_op("aiter::mha_v4_quantize_v_mxfp4_raw_v2", mutates_args=())
-def quantize_v_mxfp4(input: Tensor) -> tuple[Tensor, Tensor]:
-    """Pack hd128 BSHD V into raw column-major MXFP4 data and scale buffers."""
+def quantize_v_mxfp4(input: Tensor, direct_p: bool = False) -> tuple[Tensor, Tensor]:
+    """Pack hd128 BSHD V into raw column-major MXFP4 data and scale buffers.
+
+    direct_p selects the kv-column order wanted by the f4f4f6 kernel variant that keeps P in its
+    natural QK element order instead of re-seating it every tile; see
+    aiter.ops.triton.quant.sage_attention_quant_wrappers._f4f4_v_p_fp6_token_perm. Default
+    False is the layout f4f4, f6f4 and mxfp4 all expect.
+    """
     _validate_bshd_hd128(input, "MXFP4 V quantization")
-    return pack_v_mxfp4_colmajor_raw(input)
+    return pack_v_mxfp4_colmajor_raw(input, direct_p)
 
 
 @quantize_v_mxfp4.register_fake
-def _quantize_v_mxfp4_raw_fake(input: Tensor) -> tuple[Tensor, Tensor]:
+def _quantize_v_mxfp4_raw_fake(
+    input: Tensor, direct_p: bool = False
+) -> tuple[Tensor, Tensor]:
+    del direct_p  # layout-only: shapes and dtypes are identical either way
     batch, sequence, heads, _ = input.shape
     tiles = fp4_v_padded_sequence(sequence) // 128
     return input.new_empty(

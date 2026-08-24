@@ -207,23 +207,46 @@ def _apply_int8_q_smoothing(q, k, BLKQ, layout, sm_scale):
     return q_out, delta_s
 
 
-_F4F4_V_KPERM_CACHE = {}
+_V_KPERM_CACHE = {}
 
 
-def _f4f4_v_kperm(device):
-    """Cached int32 [64] 'meas' kv-column permutation for the f4f4 col-major V pack
-    (col c holds kv-token kperm[c]). Built once per device so it is not recreated per
-    call (and stays out of any CUDA-graph capture region)."""
-    kp = _F4F4_V_KPERM_CACHE.get(device)
+def _f4f4_v_base_kperm(device):
+    """'meas' kv-column order for the f4f4 col-major V pack: col c holds kv-token kperm[c]."""
+    s = torch.arange(64, device=device)
+    j = s % 32
+    pi = 4 * (j // 8) + 16 * ((j // 4) % 2) + (j % 4)
+    tau64 = 32 * (s // 32) + pi
+    kperm = torch.empty(64, dtype=torch.long, device=device)
+    kperm[tau64] = s  # kperm[col] = tau64^{-1}(col)
+    return kperm
+
+
+def _f4f4_v_p_fp8_token_perm(device):
+    """kv-column permutation for an FP8 P operand: the order f4f4, f6f4 and mxfp4 all expect."""
+    return _f4f4_v_base_kperm(device).to(torch.int32).contiguous()
+
+
+def _f4f4_v_p_fp6_token_perm(device):
+    """kv-column permutation for an FP6 P operand, which lets it skip its cross-lane re-seat.
+
+    Composes sigma -- swap bits 2 and 5 of the 6-bit token index -- onto the FP8 order, so column
+    c holds sigma(kperm[c]). The physical column set per MX block is unchanged, so the block
+    scales still cover 32 tokens each, just a different 32."""
+    token = torch.arange(64, device=device)
+    sigma = (token & ~0x24) | ((token & 0x04) << 3) | ((token & 0x20) >> 3)
+    return sigma[_f4f4_v_base_kperm(device)].to(torch.int32).contiguous()
+
+
+def _f4f4_v_kperm(device, direct_p: bool = False):
+    """Cached int32 [64] kv-column permutation, selected by the kernel's P format.
+
+    Built once per (device, format) so it is not recreated per call, and so the allocation stays
+    out of any CUDA-graph capture region."""
+    key = (device, direct_p)
+    kp = _V_KPERM_CACHE.get(key)
     if kp is None:
-        s = torch.arange(64, device=device)
-        j = s % 32
-        pi = 4 * (j // 8) + 16 * ((j // 4) % 2) + (j % 4)
-        tau64 = 32 * (s // 32) + pi
-        kperm = torch.empty(64, dtype=torch.long, device=device)
-        kperm[tau64] = s  # kperm[col] = tau64^{-1}(col)
-        kp = kperm.to(torch.int32).contiguous()
-        _F4F4_V_KPERM_CACHE[device] = kp
+        kp = (_f4f4_v_p_fp6_token_perm if direct_p else _f4f4_v_p_fp8_token_perm)(device)
+        _V_KPERM_CACHE[key] = kp
     return kp
 
 
@@ -245,70 +268,19 @@ def fp4_v_raw_buffer_size(batch, sequence, heads):
     )
 
 
-def sage_quant_v_f4f4(v, layout="bshd"):
-    """Pack per-channel FP4 V into a padded, slack-backed col-major LDS layout."""
-    if layout == "bshd":
-        b, kv_len, h_kv, head_dim = v.shape
-        v_tok = v.permute(0, 2, 1, 3)
-    elif layout == "bhsd":
-        b, h_kv, kv_len, head_dim = v.shape
-        v_tok = v
-    else:
-        raise ValueError(f"Unknown tensor layout: {layout}")
-
-    tile = FP4_V_TILE_TOKENS
-    assert head_dim == 128, f"f4f4 requires head_dim=128, got {head_dim}"
-    padded_kv_len = fp4_v_padded_sequence(kv_len)
-    nT = padded_kv_len // tile
-    amax = v_tok.abs().amax(dim=-2).to(torch.float32)
-    v_descale = torch.where(amax > 0, amax / 6.0, torch.ones_like(amax)).contiguous()
-    kperm = _f4f4_v_kperm(v.device)
-    buf = torch.empty(
-        fp4_v_raw_buffer_size(b, kv_len, h_kv),
-        dtype=torch.uint8,
-        device=v.device,
-    )
-    packed = buf[: b * h_kv * padded_kv_len * FP4_V_PACKED_BYTES_PER_TOKEN].view(
-        b, h_kv, nT * tile * FP4_V_PACKED_BYTES_PER_TOKEN
-    )
-    sage_quant_v_fp4_colmajor_kernel[(b * h_kv * nT * 8,)](
-        v_tok,
-        packed,
-        v_descale,
-        kperm,
-        v_tok.stride(0),
-        v_tok.stride(1),
-        v_tok.stride(2),
-        v_tok.stride(3),
-        packed.stride(0),
-        packed.stride(1),
-        v_descale.stride(0),
-        v_descale.stride(1),
-        h_kv,
-        nT,
-        kv_len,
-    )
-    v_fp4_view = torch.as_strided(
-        buf,
-        (b, kv_len, h_kv, 128),
-        (
-            h_kv * padded_kv_len * FP4_V_PACKED_BYTES_PER_TOKEN,
-            FP4_V_PACKED_BYTES_PER_TOKEN,
-            padded_kv_len * FP4_V_PACKED_BYTES_PER_TOKEN,
-            1,
-        ),
-    )
-    return v_fp4_view, v_descale
-
-
 @torch.library.custom_op("aiter::pack_v_mxfp4_colmajor_raw", mutates_args=())
 def pack_v_mxfp4_colmajor_raw(
     value: torch.Tensor,
+    direct_p: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Pack V into contiguous payload and ASM-order E8M0 scale buffers.
 
     Each 128-token tile contributes 512 scale bytes: four 32-token blocks times
     128 channels, arranged in the gather order consumed by the F4F4/F6F4 kernels.
+
+    direct_p selects the alternate kv-column order wanted by the f4f4f6 kernel built with
+    P_DIRECT_KMAP=True; see _f4f4_v_p_fp6_token_perm. Default False keeps the layout every
+    existing consumer expects.
     """
     batch, sequence, heads, head_dim = value.shape
     if head_dim != 128 or not value.is_contiguous():
@@ -325,7 +297,7 @@ def pack_v_mxfp4_colmajor_raw(
     )
     value_bhsd = value.permute(0, 2, 1, 3)
     payload = raw[: batch * heads * tiles * 8192].view(batch, heads, tiles * 8192)
-    kperm = _f4f4_v_kperm(value.device)
+    kperm = _f4f4_v_kperm(value.device, direct_p)
     sage_quant_v_mxfp4_colmajor_kernel[(batch * heads * tiles * 16,)](
         value_bhsd,
         payload,
@@ -349,7 +321,8 @@ def pack_v_mxfp4_colmajor_raw(
 
 
 @pack_v_mxfp4_colmajor_raw.register_fake
-def _pack_v_mxfp4_colmajor_raw_fake(value):
+def _pack_v_mxfp4_colmajor_raw_fake(value, direct_p=False):
+    del direct_p  # layout-only: shapes and dtypes are identical either way
     batch, sequence, heads, _ = value.shape
     tiles = fp4_v_padded_sequence(sequence) // FP4_V_TILE_TOKENS
     return (
@@ -360,11 +333,11 @@ def _pack_v_mxfp4_colmajor_raw_fake(value):
     )
 
 
-def sage_quant_v_mxfp4(value):
+def sage_quant_v_mxfp4(value, direct_p: bool = False):
     """Return true-MXFP4 V data view and kernel-ready E8M0 block-scale image."""
     batch, sequence, heads, _ = value.shape
     padded_sequence = fp4_v_padded_sequence(sequence)
-    raw, scale = pack_v_mxfp4_colmajor_raw(value)
+    raw, scale = pack_v_mxfp4_colmajor_raw(value, direct_p)
     view = torch.as_strided(
         raw,
         (batch, sequence, heads, 128),

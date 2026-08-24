@@ -102,7 +102,10 @@ def _production_quantize_f4f4(query, key, value, softmax_scale):
     q_fp4, q_scale = quantize_mxfp4_q(query, mha_v4_q_multiplier(softmax_scale))
     k_raw, k_scale = quantize_mxfp4_k(key)
     k_fp4 = mxfp4_k_view(k_raw, k_scale)
-    v_raw, v_scale = quantize_v_mxfp4(value)
+    # direct_p: f4f4f6 keeps P in its natural QK element order and expects V's kv columns
+    # permuted to match, which is free here and saves a cross-lane re-seat every tile. This is the
+    # f4f4 path only -- f6f4 and mxfp4 below still want the standard order.
+    v_raw, v_scale = quantize_v_mxfp4(value, True)
     v_fp4 = mxfp4_v_view(v_raw, v_scale, value.shape[1])
     return q_fp4, q_scale, k_fp4, k_scale, v_fp4, v_scale
 

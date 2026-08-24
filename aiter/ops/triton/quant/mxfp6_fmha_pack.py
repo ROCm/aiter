@@ -168,6 +168,7 @@ def quantize_fp6_v_clean_triton(
         FIXED_E8M0=fixed_e8m0,
         SEPARATE_OUTPUT=False,
         BLOCK_N=BLOCK_N,
+        num_warps=2,   # same gather/store profile as the separate-output launch above
     )
     return out.view(b, h_kv, nT * 12800)
 
@@ -203,6 +204,13 @@ def quantize_fp6_v_data_scale_triton(
         FIXED_E8M0=fixed_e8m0,
         SEPARATE_OUTPUT=True,
         BLOCK_N=BLOCK_N,
+        # 2 warps, not Triton's default 4. The kernel gathers (for a fixed d_row it reads 32 kv
+        # positions, and V is [b, sk, h, d], so lanes are stride_vs*2 = 1280 B apart) and stores
+        # 24 bytes per row as separate byte stores. Both are latency-bound rather than
+        # occupancy-bound, and 4 warps thrash more than they hide: swept on gfx950 at
+        # b1 s65536 h5 d128 this is 97.3 -> 68.3 us (1.20 -> 1.71 TB/s effective), output
+        # bit-identical.
+        num_warps=2,
     )
     return data, scale
 
