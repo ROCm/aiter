@@ -433,11 +433,17 @@ def gemm_afp4wfp4_preshuffle(
 
     Args:
         x (torch.Tensor): FP4 E2M1 input matrix with shape (M, K//2).
-        w (torch.Tensor): FP4 E2M1 weight matrix with shape (N//16, K*16), internally transposed.
-        x_scales (torch.Tensor): E8M0 per-group scale for x with shape (M//32, K) if M >= 32 otherwise (M, K//32).
-            One scale per 32 elements in K dimension.
-        w_scales (torch.Tensor): E8M0 per-group scale for w with shape (M//32, K).
-            One scale per 32 elements in K dimension.
+        w (torch.Tensor): FP4 E2M1 weight matrix with shape (N//16, K*16),
+            preshuffled via aiter.ops.shuffle.shuffle_weight_gfx1250 (or
+            equivalently shuffle_weight(layout=(16, 16)) reshaped to
+            (N//16, K*16) — both produce the same bytes). Internally transposed.
+        x_scales (torch.Tensor): E8M0 per-group scale for x, one scale per 32
+            elements in K. For M >= 32: flat (M_pad, K//32) preshuffled via
+            aiter.ops.shuffle.shuffle_scale (M_pad = M rounded up to a
+            multiple of 256; identical layout on gfx950 and gfx1250).
+            For M < 32: un-shuffled (M, K//32) row-major.
+        w_scales (torch.Tensor): E8M0 per-group scale for w, one scale per 32
+            elements in K: flat (N_pad, K//32) via aiter.ops.shuffle.shuffle_scale.
         dtype (Optional[torch.dtype]): Output datatype (BF16 or FP16).
         y (Optional[torch.Tensor]): Pre-allocated output tensor with shape (M, N).
         config (Optional[dict]): Kernel tuning parameters (BLOCK_SIZE_M, BLOCK_SIZE_N,
@@ -471,6 +477,13 @@ def gemm_afp4wfp4_preshuffle(
             config["BLOCK_SIZE_M"] >= 32
         ), "for M >= 32, BLOCK_SIZE_M must be 32 or more as x_scale are assumed to be preshuffled"
 
+    # aiter.ops.shuffle.shuffle_scale returns flat (rows_pad, K // 32) scales;
+    # view one row per 32-row stripe so the kernels' stride math steps over
+    # whole stripes. For M < 32, x_scales stay un-shuffled (M, K // 32).
+    if M >= 32:
+        x_scales = x_scales.view(-1, x_scales.shape[-1] * 32)
+    w_scales = w_scales.view(-1, w_scales.shape[-1] * 32)
+
     if use_gluon:
         from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_mxfp4 import (
             gemm_mxfp4_preshuffle_gfx1250 as _gluon_gemm_mxfp4_preshuffle_gfx1250,
@@ -501,13 +514,6 @@ def gemm_afp4wfp4_preshuffle(
             config["BLOCK_SIZE_K"],
         )
 
-        # Kernel consumes preshuffled scales directly for M >= 32 (address math
-        # inverts the shuffle in registers) and un-shuffled (M, K // 32) scales for M < 32
-        if M < 32:
-            assert x_scales.shape[-1] == K_elems // 32 and x_scales.stride(-1) == 1, (
-                "x_scales must be un-shuffled (M, K // 32) K-contiguous for "
-                f"M < 32, got shape {tuple(x_scales.shape)}"
-            )
         _gluon_gemm_mxfp4_preshuffle_gfx1250[grid](
             x_fp4,
             w_preshuf,
