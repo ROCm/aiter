@@ -74,6 +74,7 @@ static std::tuple<std::string, int> get_heuristic_kernel(int M,
                                                          int K,
                                                          std::string arch_id,
                                                          const std::string& b_intype,
+                                                         const std::string& outtype,
                                                          int a_preshuffle,
                                                          CFG* cfgs)
 {
@@ -93,6 +94,9 @@ static std::tuple<std::string, int> get_heuristic_kernel(int M,
             continue;
         const auto& cfg = el.second;
         if(cfg.b_intype != b_intype || cfg.a_preshuffle != a_preshuffle)
+            continue;
+
+        if(cfg.outtype != outtype)
             continue;
 
         const int m_align = a_preshuffle ? F8GEMM_M_ALIGN_APRE : 1;
@@ -150,6 +154,7 @@ static void mxfp8fp4_launch(aiter_tensor_t* A,
                             hipStream_t stream)
 {
     AITER_CHECK(out->dtype() == AITER_DTYPE_bf16, __func__, " only supports BFloat16 output");
+    const char* out_type = "bf16";
     AITER_CHECK(
         b_intype == "mxfp8" || b_intype == "mxfp4", __func__, " unsupported b_intype ", b_intype);
     AITER_CHECK(a_preshuffle == 0 || a_preshuffle == 1, __func__, " a_preshuffle must be 0 or 1");
@@ -201,14 +206,17 @@ static void mxfp8fp4_launch(aiter_tensor_t* A,
     std::string arch_id      = get_gpu_arch();
     std::string selectedName = (kernelName && kernelName[0] != '\0') ? (arch_id + kernelName) : "";
 
-    using DictKey = std::tuple<int, int, int, std::string, int>; // M,N,K,b_intype,apre
+    const int intype_id = (b_intype == "mxfp4") ? 1 : 0; // else mxfp8
+    using DictKey       = std::tuple<int, int, int, int, int>; // M,N,K,intype_id,apre
     struct DictHash
     {
         size_t operator()(const DictKey& k) const
         {
             const auto& [m, n, kk, it, ap] = k;
-            return std::hash<int>()(m) ^ std::hash<int>()(n) ^ std::hash<int>()(kk) ^
-                   std::hash<std::string>()(it) ^ std::hash<int>()(ap);
+            size_t h                       = 1469598103934665603ull;
+            for(int v : {m, n, kk, it, ap})
+                h = (h ^ static_cast<size_t>(static_cast<unsigned>(v))) * 1099511628211ull;
+            return h;
         }
     };
     static SynchronizedCache<DictKey, std::string, DictHash> heuristic_kernel_dict;
@@ -216,9 +224,9 @@ static void mxfp8fp4_launch(aiter_tensor_t* A,
     if(selectedName.empty())
     {
         selectedName = heuristic_kernel_dict.get_or_create(
-            DictKey(Mdim, Ndim, Kdim, b_intype, a_preshuffle), [&]() {
+            DictKey(Mdim, Ndim, Kdim, intype_id, a_preshuffle), [&]() {
                 auto [name, _] = get_heuristic_kernel(
-                    Mdim, Ndim, Kdim, arch_id, b_intype, a_preshuffle, config_map);
+                    Mdim, Ndim, Kdim, arch_id, b_intype, out_type, a_preshuffle, config_map);
                 return name;
             });
     }
@@ -228,11 +236,19 @@ static void mxfp8fp4_launch(aiter_tensor_t* A,
         it != config_map->end(), __func__, " kernel not in cfg_mxfp8fp4gemm: ", selectedName);
 
     const auto& cfg = it->second;
-    AITER_CHECK(cfg.b_intype == b_intype && cfg.a_preshuffle == a_preshuffle,
+    // Guard the explicit-kernelName path. outtype MUST match: a mismatched .co
+    // keeps the same kernarg size (HIP won't catch it) but sizes stride_d / the
+    // output buffer for a different element width -> device-side OOB write.
+    AITER_CHECK(cfg.b_intype == b_intype && cfg.a_preshuffle == a_preshuffle &&
+                    cfg.outtype == out_type,
                 __func__,
                 " selected kernel ",
                 selectedName,
-                " mismatches requested b_intype/a_preshuffle");
+                " mismatches requested b_intype/a_preshuffle/outtype (got outtype=",
+                cfg.outtype,
+                ", requested ",
+                out_type,
+                ")");
 
     static SynchronizedCache<std::string_view, AiterAsmKernel> impl_ptr_map;
     AiterAsmKernel* impl_ptr = &impl_ptr_map.get_or_create(

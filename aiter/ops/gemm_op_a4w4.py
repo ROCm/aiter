@@ -88,9 +88,6 @@ def gemm_a4w4_fake(
     alpha: float | None = 1.0,
     beta: float | None = 0.0,
     bpreshuffle: bool | None = True,
-    apreshuffle: bool | None = False,
-    global_A_scale: Tensor | None = None,  # NVFP4 per-tensor
-    global_B_scale: Tensor | None = None,  # NVFP4 per-tensor
 ) -> torch.Tensor:
     if dtype in (dtypes.fp4x2, dtypes.fp8):
         raise NotImplementedError(
@@ -112,9 +109,6 @@ def gemm_a4w4(
     alpha: float | None = 1.0,
     beta: float | None = 0.0,
     bpreshuffle: bool | None = True,
-    apreshuffle: bool | None = False,
-    global_A_scale: Tensor | None = None,  # NVFP4 per-tensor
-    global_B_scale: Tensor | None = None,  # NVFP4 per-tensor
 ) -> torch.Tensor:
     """A4W4 GEMM (4-bit quantized matmul) returning one plain-dtype tensor."""
     # Low-precision output has a different return arity/shape (fp4 is [M,N//2],

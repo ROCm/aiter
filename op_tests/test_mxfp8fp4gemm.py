@@ -248,7 +248,19 @@ def test_gemm(
     # run_perftest can rotate them (defeats the L2 hot-cache). Dispatch is
     # heuristic by default (kernelName=""); an explicit --knl-name forces that .co.
     kern = _gemm_a8w4_asm if intype == "a8w4" else _gemm_a8w8_asm
-    knl = knl_name or ""
+    # Dispatch mode. Default (knl_name=None) is heuristic: knl="" lets the op pick
+    # the .co by (b_intype, a_preshuffle). Explicit is opt-in via --knl-name:
+    # "auto" derives this config's mangled name from the CSV convention (see
+    # hsa/gfx1250/mxfp8fp4gemm/mxfp8fp4gemm.csv); any other value is used verbatim.
+    if not knl_name:
+        knl = ""
+    elif knl_name == "auto":
+        middle = "mxfp8fp8" if intype == "a8w8" else "mxfp8fp4"
+        pre = "ABpreShuffle" if apre else "BpreShuffle"
+        base = f"f8gemm_{outtype}_{middle}_{pre}_256x256_4x4_ps"
+        knl = f"_ZN5aiter{len(base)}{base}E"
+    else:
+        knl = knl_name
 
     def run_asm(A, B, sA, sB):
         return kern(
@@ -259,15 +271,21 @@ def test_gemm(
     candidates = {"asm": (run_asm, asm_args)}
 
     flops = 2 * M * N * K
-    in_bytes = inp["A"].nbytes + inp["B"].nbytes + inp["sA"].nbytes + inp["sB"].nbytes
+    # Scale bytes use the LOGICAL (unpadded) size: shuffle_mxfp8fp4_scale pads rows
+    # to a multiple of 32, but the shader clamps its scale dim and never reads the
+    # padding, so the padded buffer's .nbytes would inflate the reported bandwidth.
+    # (A/B shuffles are pure reshapes -- no padding -- so their .nbytes is exact.)
+    scale_bytes = (M + N) * (K // MX_SCALE_BLOCK)  # e8m0: 1 byte per 32-K block
+    in_bytes = inp["A"].nbytes + inp["B"].nbytes + scale_bytes
 
     ret = {"gfx": get_gfx(), "knl_name": knl_name or "(heuristic)"}
     # Only a missing .co is reported as "not support"; any other failure (OOM,
     # memory fault, shape assert, ...) must propagate, not show as a green cell.
-    _NOT_SUPPORTED_MARKERS = (
-        "cannot get heuristic kernel",
-        "kernel not in cfg_mxfp8fp4gemm",
-    )
+    # An explicit --knl-name that isn't in the cfg is a real error (typo / missing
+    # build), so "kernel not in cfg" is benign ONLY on the heuristic path (knl == "").
+    _NOT_SUPPORTED_MARKERS = ("cannot get heuristic kernel",)
+    if not knl:
+        _NOT_SUPPORTED_MARKERS += ("kernel not in cfg_mxfp8fp4gemm",)
     for name, (cand, cand_args) in candidates.items():
         try:
             out, us = run_perftest(
