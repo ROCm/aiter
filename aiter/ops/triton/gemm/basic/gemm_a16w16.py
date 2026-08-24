@@ -135,11 +135,8 @@ def gemm_a16w16_(
             arch = get_arch()
             _stem = f"{arch}-GEMM-A16W16-PERSISTENT-N={N}-K={K}.json"
             _base = f"{AITER_TRITON_CONFIGS_PATH}/{arch}/{backend}/gemm"
-            raw = None
-            for fpath in (f"{_base}/gemm_a16w16/{_stem}", f"{_base}/{_stem}"):
-                raw = load_config_json(fpath, required=False)
-                if raw is not None:
-                    break
+            _persistent_dir = f"{_base}/gemm_a16w16_persistent"
+            raw = load_config_json(f"{_persistent_dir}/{_stem}", required=False)
             config = None
             if raw is not None:
                 for bound in STANDARD_M_BOUNDS:
