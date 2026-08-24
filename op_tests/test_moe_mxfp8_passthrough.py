@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+
 """Numerical test for the MXFP8 activation passthrough in fused_moe.
 
 The passthrough lets a caller hand over activations that are already fp8 with
@@ -9,18 +12,15 @@ This mirrors the SGLang MoRI a8w4 call pattern: PER_1X32 MXFP4 weights,
 GateMode.INTERLEAVE, and fp8 activations even at decode batch sizes (the
 production path sets AITER_BF16_FP8_MOE_BOUND=0). Without those knobs a
 standalone harness routes fp8 inputs into the mxfp4 quant branch and aborts
-inside the HIP launcher — that is a test-setup failure, not evidence that the
+inside the HIP launcher -- that is a test-setup failure, not evidence that the
 passthrough is broken in serving.
 """
-
-from __future__ import annotations
 
 import os
 
 import pytest
 import torch
 
-import aiter
 from aiter import ActivationType, QuantType, dtypes
 from aiter.fused_moe import fused_moe
 from aiter.jit.utils.chip_info import get_gfx
@@ -81,16 +81,16 @@ def _build(tokens, device, dtype=dtypes.bf16):
 
 
 def _fused_moe_kwargs(topk_weight, topk_ids, w1_scale, w2_scale):
-    return dict(
-        topk_weight=topk_weight,
-        topk_ids=topk_ids,
-        quant_type=QuantType.per_1x32,
-        activation=ActivationType.Swiglu,
-        gate_mode=GateMode.INTERLEAVE.value,
-        w1_scale=w1_scale,
-        w2_scale=w2_scale,
-        dtype=dtypes.bf16,
-    )
+    return {
+        "topk_weight": topk_weight,
+        "topk_ids": topk_ids,
+        "quant_type": QuantType.per_1x32,
+        "activation": ActivationType.Swiglu,
+        "gate_mode": GateMode.INTERLEAVE.value,
+        "w1_scale": w1_scale,
+        "w2_scale": w2_scale,
+        "dtype": dtypes.bf16,
+    }
 
 
 @pytest.mark.parametrize("tokens", TOKENS)
