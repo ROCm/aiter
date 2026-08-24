@@ -10,6 +10,7 @@ def make_bounded_buffer_tensor(tensor, num_records_bytes):
     """Like fx.rocdl.make_buffer_tensor but with a runtime byte bound, so the
     hardware OOB-drops stores past num_records_bytes."""
     from flydsl._mlir.dialects.fly_rocdl import TargetAddressSpace
+
     from aiter.ops.flydsl.kernels.buffer_ops import _get_buffer_flags
 
     elem_ty = tensor.element_type
