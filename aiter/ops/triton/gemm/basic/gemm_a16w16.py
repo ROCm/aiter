@@ -131,6 +131,12 @@ def gemm_a16w16_(
         M, K = x.shape
         N, _ = w.shape
 
+        # WGs hard set to 256 for gfx1250, otherwise arch-dependent
+        if get_arch() in ("gfx1250",):
+            NUM_WGS = 256
+        else:
+            NUM_WGS = torch.cuda.get_device_properties(x.device).multi_processor_count
+
         if config is None:
             arch = get_arch()
             _stem = f"{arch}-GEMM-A16W16-PERSISTENT-N={N}-K={K}.json"
@@ -223,7 +229,6 @@ def gemm_a16w16_(
             _LOGGER.info(
                 f"GEMM_A16W16 [gluon, persistent]: x={tuple(x.shape)} w={tuple(w.shape)}"
             )
-            NUM_WGS = torch.cuda.get_device_properties(x.device).multi_processor_count
             num_tiles = triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N)
 
             _gluon_persistent_kernel[(min(NUM_WGS, num_tiles),)](
@@ -267,7 +272,6 @@ def gemm_a16w16_(
             y = torch.empty((M, N), dtype=dtype, device=x.device)
 
         # Persistent, one WG per CU
-        NUM_WGS = torch.cuda.get_device_properties(x.device).multi_processor_count
         num_tiles = triton.cdiv(M, config["BLOCK_SIZE_M"]) * triton.cdiv(
             N, config["BLOCK_SIZE_N"]
         )
