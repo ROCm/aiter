@@ -3524,6 +3524,9 @@ class CustomAllreduce
             HIP_CALL(hipStreamIsCapturing(stream, &status));
             if(status == hipStreamCaptureStatusActive)
             {
+                // Inputs grow up and outputs grow down; guard so they cannot alias.
+                check_rank_data_capacity(graph_unreg_input_buffers_.size() +
+                                         graph_unreg_output_buffers_.size() + 1);
                 ptrs = d_rank_data_base_ + graph_unreg_input_buffers_.size();
                 graph_unreg_input_buffers_.push_back(input);
             }
@@ -3552,9 +3555,10 @@ class CustomAllreduce
             HIP_CALL(hipStreamIsCapturing(stream, &status));
             if(status == hipStreamCaptureStatusActive)
             {
-                // For graph mode, collect output addresses
-                ptrs = d_rank_data_base_ + graph_unreg_input_buffers_.size() +
-                       graph_unreg_output_buffers_.size();
+                // Reserve top-down: the input count still grows during capture.
+                check_rank_data_capacity(graph_unreg_input_buffers_.size() +
+                                         graph_unreg_output_buffers_.size() + 1);
+                ptrs = d_rank_data_end_ - 1 - graph_unreg_output_buffers_.size();
                 graph_unreg_output_buffers_.push_back(output);
             }
             else
@@ -3609,7 +3613,7 @@ class CustomAllreduce
         for(int i = 0; i < num_output_buffers; i++)
         {
             auto self_ptr = graph_unreg_output_buffers_[i];
-            auto& rd      = rank_data[num_input_buffers + i];
+            auto& rd      = rank_data[num_input_buffers + i];  // staging only
             for(int j = 0; j < world_size_; j++)
             {
                 if(j != rank_)
@@ -3625,14 +3629,25 @@ class CustomAllreduce
                     rd.ptrs[j] = self_ptr;
                 }
             }
-            output_buffers_[self_ptr] = d_rank_data_base_ + num_input_buffers + i;
+            output_buffers_[self_ptr] = d_rank_data_end_ - 1 - i;
         }
 
-        HIP_CALL(hipMemcpy(d_rank_data_base_,
-                           rank_data.data(),
-                           sizeof(RankData) * total_buffers,
-                           hipMemcpyHostToDevice));
-        d_rank_data_base_ += total_buffers;
+        if(num_input_buffers > 0)
+        {
+            HIP_CALL(hipMemcpy(d_rank_data_base_,
+                               rank_data.data(),
+                               sizeof(RankData) * num_input_buffers,
+                               hipMemcpyHostToDevice));
+        }
+        for(int i = 0; i < num_output_buffers; i++)
+        {
+            HIP_CALL(hipMemcpy(d_rank_data_end_ - 1 - i,
+                               &rank_data[num_input_buffers + i],
+                               sizeof(RankData),
+                               hipMemcpyHostToDevice));
+        }
+        d_rank_data_base_ += num_input_buffers;
+        d_rank_data_end_ -= num_output_buffers;
         graph_unreg_input_buffers_.clear();
         graph_unreg_output_buffers_.clear();
     }
