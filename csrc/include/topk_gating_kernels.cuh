@@ -1300,7 +1300,13 @@ void topk_gating_launch(const topk_gating_params& p)
         else            { LAUNCH_TOPK_KERNEL_OPT_N(NE, false, SF, TPW) }        \
         return;                                                                   \
     }
-            if(topk <= 8 && row_cap >= 8 && num_experts == 64 && num_tokens >= 4096)
+            // The breakevens above are EPT = NE / (WARP_SIZE / TPW) = 8 on a
+            // 64-lane wave.  On wave32 the same TPW halves THREADS_PER_ROW, so
+            // EPT doubles to 16 and the unrolled sort spills (2096B scratch,
+            // occupancy 8): measured ~250us vs ~5us for the TPW=1 reg kernel on
+            // gfx1250.  Same reason E=384 reg is wave64-only further down.
+            if(topk <= 8 && row_cap >= 8 && num_experts == 64 && num_tokens >= 4096 &&
+               get_warp_size_func() != 32)
             {
                 _DISPATCH_OPT_N_KERNEL(64, 8)
             }
