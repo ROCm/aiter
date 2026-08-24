@@ -113,6 +113,11 @@ AITER_CONFIG_FMOE = os.getenv(
     f"{AITER_ROOT_DIR}/aiter/configs/tuned_fmoe.csv",
 )
 
+AITER_CONFIG_FHMOE = os.getenv(
+    "AITER_CONFIG_FHMOE",
+    f"{AITER_ROOT_DIR}/aiter/configs/tuned_fhmoe.csv",
+)
+
 AITER_CONFIG_GROUPED_FMOE = os.getenv(
     "AITER_CONFIG_GROUPED_FMOE",
     f"{AITER_ROOT_DIR}/aiter/configs/tuned_grouped_fmoe.csv",
@@ -196,6 +201,12 @@ class AITER_CONFIG:
     def AITER_CONFIG_FMOE_FILE(self):
         return self.get_config_file(
             "AITER_CONFIG_FMOE", AITER_CONFIG_FMOE, "tuned_fmoe"
+        )
+
+    @property
+    def AITER_CONFIG_FHMOE_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_FHMOE", AITER_CONFIG_FHMOE, "tuned_fhmoe"
         )
 
     @property
@@ -1258,6 +1269,7 @@ def get_args_of_build(ops_name: str, exclude=None):
                         "srcs": single_ops["srcs"],
                         "flags_extra_cc": single_ops["flags_extra_cc"],
                         "flags_extra_hip": single_ops["flags_extra_hip"],
+                        "extra_ldflags": single_ops["extra_ldflags"],
                         "extra_include": single_ops["extra_include"],
                         "blob_gen_cmd": single_ops["blob_gen_cmd"],
                         "third_party": single_ops["third_party"],

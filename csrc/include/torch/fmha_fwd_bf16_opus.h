@@ -25,6 +25,12 @@
 // `causal` selects the causal mask (bottom-right aligned when seqlen_q != seqlen_kv).
 // `softmax_scale` is applied to Q·K^T internally (pass <= 0 for the default 1/sqrt(D_QK)).
 //
+// `lse` (optional) receives the log-sum-exp of the scaled scores in natural log,
+// float32, contiguous along the query dim:
+//   batch mode: [B, H, N]        group mode: [H, total_q]
+// Rows that see no keys (causal with seqlen_q > seqlen_kv) get -inf, matching
+// torch.logsumexp. Pass std::nullopt to skip it (the kernel then stores nothing).
+//
 // Group / varlen (all four seqstart tensors are int32, length num_groups+1; pass
 // std::nullopt for batch mode):
 //   seqstart_q / seqstart_k          : cumulative REAL sequence lengths (mask / tile count)
@@ -37,6 +43,7 @@ void fmha_fwd_bf16_opus_fwd(at::Tensor& q,
                             at::Tensor& out,
                             bool causal,
                             float softmax_scale,
+                            std::optional<at::Tensor> lse            = std::nullopt,
                             std::optional<at::Tensor> seqstart_q     = std::nullopt,
                             std::optional<at::Tensor> seqstart_k     = std::nullopt,
                             std::optional<at::Tensor> seqstart_q_pad = std::nullopt,

@@ -5,9 +5,9 @@ from collections import namedtuple
 import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as llvm_dialect
-from flydsl.expr import arith, gpu, rocdl, tdm_ops
+from flydsl.expr import arith, gpu, rocdl
 from flydsl.expr.arith import _to_raw as _raw
-from flydsl.expr.rocdl import cluster
+from flydsl.expr.rocdl import cluster, tdm_ops
 from flydsl.expr.typing import T
 
 
@@ -24,8 +24,7 @@ def make_lds_copy_ops(bits):
     )
 
     def _view(lds_base_idx, byte_offset):
-        byte_offset = fx.index_cast(T.index, byte_offset)
-        addr_i32 = fx.index_cast(T.i32, lds_base_idx + byte_offset)
+        addr_i32 = fx.Int32(lds_base_idx) + fx.Int32(byte_offset)
         ptr = fx.inttoptr(ptr_ty, addr_i32)
         return fx.Tensor(fx.make_view(ptr, layout))
 
@@ -118,6 +117,24 @@ def pipeline_fence(outstanding=0, use_cluster=False):
     """
     tdm_ops.tensor_wait(outstanding)
     workgroup_barrier(use_cluster=use_cluster)
+
+
+WGP_BARRIER_ID = -1
+
+
+def pipeline_fence_signal(outstanding=0, use_cluster=False):
+    """Signal the first half of a split pipeline fence."""
+    tdm_ops.tensor_wait(outstanding)
+    rocdl.s_barrier_signal(WGP_BARRIER_ID)
+    if use_cluster:
+        cluster.cluster_signal_once_per_wg()
+
+
+def pipeline_fence_wait(use_cluster=False):
+    """Wait for the second half of a split pipeline fence."""
+    rocdl.s_barrier_wait(WGP_BARRIER_ID)
+    if use_cluster:
+        cluster.cluster_wait()
 
 
 import math as _math
@@ -340,6 +357,8 @@ __all__ = [
     "make_lds_copy_ops",
     "make_sgpr_opaque",
     "pipeline_fence",
+    "pipeline_fence_signal",
+    "pipeline_fence_wait",
     "situv2_consts",
     "workgroup_barrier",
 ]
