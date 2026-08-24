@@ -289,7 +289,35 @@ def mla_decode_fwd(
     out_scale=None,
     shuffled_kv_cache: bool = False,
     skip_reduce: bool = False,
+    *,
+    q_nope=None,
+    q_pe=None,
+    page_table=None,
+    seq_info=None,
+    within_2gb_override=None,
 ):
+    if (
+        DEVICE_ARCH == "gfx942"
+        and q_nope is not None
+        and q_pe is not None
+        and page_table is not None
+        and seq_info is not None
+    ):
+        assert (
+            _mla_gluon_gfx942_impl is not None
+        ), f"gfx942 graph MLA requires gfx942, got {DEVICE_ARCH}"
+        return _mla_gluon_gfx942_impl(
+            q_nope,
+            q_pe,
+            kv_buffer,
+            out,
+            page_table,
+            seq_info,
+            softmax_scale,
+            within_2gb_override=within_2gb_override,
+        )
+
+    assert q is not None, "q is required for the standard MLA decode path"
     assert causal, "Only causal attention is supported"
     q_dtype = q.dtype
     kv_buffer_dtype = kv_buffer.dtype
@@ -534,29 +562,3 @@ def mla_decode_fwd(
         **reduce_config,
     )
     return out
-
-
-def mla_gluon_gfx942(
-    q_nope,
-    q_pe,
-    kv_buffer,
-    o,
-    page_table,
-    seq_info,
-    sm_scale,
-    within_2gb_override=None,
-):
-    """Run the graph-capturable gfx942 Gluon MLA adapter."""
-    assert (
-        _mla_gluon_gfx942_impl is not None
-    ), f"mla_gluon_gfx942 requires gfx942, got {DEVICE_ARCH}"
-    return _mla_gluon_gfx942_impl(
-        q_nope,
-        q_pe,
-        kv_buffer,
-        o,
-        page_table,
-        seq_info,
-        sm_scale,
-        within_2gb_override=within_2gb_override,
-    )

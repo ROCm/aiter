@@ -54,7 +54,7 @@ Some features (e.g., scheduling hints like `sched_barrier`) require the [AMD Glu
 <tr>
   <td><code>mla_gluon_gfx942</code></td><td>MLA</td><td>CDNA3</td>
   <td nowrap>Q/KV/Out: bf16<br>QLEN in {1, 4}<br>nhead = 12<br>latent dim = 512<br>RoPE dim = 64<br>PAGE_SIZE=1</td>
-  <td><code>python -m pytest -q op_tests/triton_tests/test_mla_gluon_gfx942.py</code></td>
+  <td><code>python -m pytest -q op_tests/triton_tests/attention/test_mla.py -k gfx942_graph</code></td>
   <td>—</td><td>—</td><td>—</td>
 </tr>
 <tr>
@@ -255,12 +255,12 @@ python op_tests/test_mla.py -c 10000 100000 -b 1 3 4 -n 16,1 -d bf16 -kvd bf16 -
 
 ### `aiter/ops/triton/_gluon_kernels/gfx942/attention/mla.py` — CDNA3 MLA Decode
 
-**Public API:** `aiter.ops.triton.attention.mla.mla_gluon_gfx942(...)`
+**Public API:** `aiter.ops.triton.attention.mla.mla_decode_fwd(..., q_nope=..., q_pe=..., page_table=..., seq_info=...)`
 
 **Test:**
 
 ```
-python -m pytest -q op_tests/triton_tests/test_mla_gluon_gfx942.py
+python -m pytest -q op_tests/triton_tests/attention/test_mla.py -k gfx942_graph
 ```
 
 **Description:** Synchronous-LDS bf16 MLA decode for gfx942 with 12 query
