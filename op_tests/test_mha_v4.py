@@ -850,6 +850,7 @@ def test_mha_v4_native_schema_mutates_only_out():
     ],
 )
 def test_mha_v4_raw_compile_parity(q_format, v_format):
+    torch._dynamo.reset()
     torch.manual_seed(31)
     q = torch.randn((1, 512, 5, 128), device="cuda", dtype=torch.bfloat16)
     k = torch.randn_like(q)
