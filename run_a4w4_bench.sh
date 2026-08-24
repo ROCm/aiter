@@ -7,6 +7,7 @@ readonly TEST_SCRIPT="${SCRIPT_DIR}/op_tests/test_flydsl_grouped_gemm_gfx1250.py
 
 # Add test cases as: "model_dim inter_dim experts tokens".
 readonly TEST_CASES=(
+  "16384 3072 96 128"
   "7168 3072 96 128"
   # "16384 3072 96 512"
   # "32768 3072 96 512"
@@ -14,10 +15,7 @@ readonly TEST_CASES=(
 
 # An empty value runs the baseline without AITER_TDM_TILE_M.
 # readonly TILE_M_VALUES=("32" "64")
-readonly TILE_M_VALUES=("16" "")
-
-# "random" omits --const-init; numeric values are passed to --const-init.
-readonly INIT_MODES=("random" "0")
+readonly TILE_M_VALUES=("16")
 
 run_test() {
   local model_dim="$1"
@@ -25,30 +23,24 @@ run_test() {
   local experts="$3"
   local tokens="$4"
   local tile_m="$5"
-  local init_mode="$6"
   local tile_label="${tile_m:-unset}"
 
   printf \
-    '\nRunning model_dim=%s inter_dim=%s experts=%s tokens=%s tile_m=%s init=%s\n' \
+    '\nRunning model_dim=%s inter_dim=%s experts=%s tokens=%s tile_m=%s\n' \
     "${model_dim}" "${inter_dim}" "${experts}" "${tokens}" \
-    "${tile_label}" "${init_mode}"
+    "${tile_label}"
 
   local -a test_env=(
     "AITER_USE_GROUPED_GEMM=1"
     "AITER_GROUPED_DEBUG=0"
     "ENABLE_CK=0"
-    "FLYDSL_DUMP_IR=0"
+    "FLYDSL_DUMP_IR=1"
     "AITER_LOG_MORE=1"
     "AITER_MOE_EXPERT_BALANCE=true"
     "AITER_FLYDSL_MOE_EXPERT_SCHEDULING_MODE=1"
   )
   if [[ -n "${tile_m}" ]]; then
     test_env+=("AITER_TDM_TILE_M=${tile_m}")
-  fi
-
-  local -a init_args=()
-  if [[ "${init_mode}" != "random" ]]; then
-    init_args=(--const-init "${init_mode}")
   fi
 
   env "${test_env[@]}" python3 -u "${TEST_SCRIPT}" \
@@ -61,21 +53,18 @@ run_test() {
     --inter-dim "${inter_dim}" \
     --act silu \
     --no-bias \
-    --no-check-aot-cache \
-    "${init_args[@]}"
+    --no-check-aot-cache
 }
 
 main() {
-  local test_case model_dim inter_dim experts tokens tile_m init_mode
+  local test_case model_dim inter_dim experts tokens tile_m
 
   for test_case in "${TEST_CASES[@]}"; do
     read -r model_dim inter_dim experts tokens <<<"${test_case}"
     for tile_m in "${TILE_M_VALUES[@]}"; do
-      for init_mode in "${INIT_MODES[@]}"; do
-        run_test \
-          "${model_dim}" "${inter_dim}" "${experts}" "${tokens}" \
-          "${tile_m}" "${init_mode}"
-      done
+      run_test \
+        "${model_dim}" "${inter_dim}" "${experts}" "${tokens}" \
+        "${tile_m}"
     done
   done
 }
