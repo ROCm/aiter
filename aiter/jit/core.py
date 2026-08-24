@@ -113,6 +113,11 @@ AITER_CONFIG_FMOE = os.getenv(
     f"{AITER_ROOT_DIR}/aiter/configs/tuned_fmoe.csv",
 )
 
+AITER_CONFIG_FHMOE = os.getenv(
+    "AITER_CONFIG_FHMOE",
+    f"{AITER_ROOT_DIR}/aiter/configs/tuned_fhmoe.csv",
+)
+
 AITER_CONFIG_GROUPED_FMOE = os.getenv(
     "AITER_CONFIG_GROUPED_FMOE",
     f"{AITER_ROOT_DIR}/aiter/configs/tuned_grouped_fmoe.csv",
@@ -148,6 +153,16 @@ AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE = os.getenv(
 AITER_CONFIG_GEMM_BF16 = os.getenv(
     "AITER_CONFIG_GEMM_BF16",
     f"{AITER_ROOT_DIR}/aiter/configs/bf16_tuned_gemm.csv",
+)
+
+# K5 opt BV tuned config. Per-model tuned rows live under model_configs/
+# (qwen3_5_*_chunk_gdn_h_opt_tuned.csv) and get merged into this canonical file by
+# get_config_file. It ships header-only: with no per-model table present
+# get_config_file returns this path as-is, and the opt AOT reads it, so it has to
+# be a readable csv rather than a missing path.
+AITER_CONFIG_GDN_K5_OPT = os.getenv(
+    "AITER_CONFIG_GDN_K5_OPT",
+    f"{AITER_ROOT_DIR}/aiter/configs/chunk_gdn_h_opt_tuned.csv",
 )
 
 
@@ -189,6 +204,12 @@ class AITER_CONFIG:
         )
 
     @property
+    def AITER_CONFIG_FHMOE_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_FHMOE", AITER_CONFIG_FHMOE, "tuned_fhmoe"
+        )
+
+    @property
     def AITER_CONFIG_GROUPED_FMOE_FILE(self):
         return self.get_config_file(
             "AITER_CONFIG_GROUPED_FMOE",
@@ -224,6 +245,14 @@ class AITER_CONFIG:
     def AITER_CONFIG_GEMM_BF16_FILE(self):
         return self.get_config_file(
             "AITER_CONFIG_GEMM_BF16", AITER_CONFIG_GEMM_BF16, "bf16_tuned_gemm"
+        )
+
+    @property
+    def AITER_CONFIG_GDN_K5_OPT_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_GDN_K5_OPT",
+            AITER_CONFIG_GDN_K5_OPT,
+            "chunk_gdn_h_opt_tuned",
         )
 
     @property
@@ -354,6 +383,7 @@ class AITER_CONFIG:
             logger.warning(
                 f"Untuned config file not found: {untuned_path}. Using all columns for deduplication."
             )
+
         from pathlib import Path
 
         config_path = Path("/tmp/aiter_configs/")
@@ -1221,6 +1251,7 @@ def get_args_of_build(ops_name: str, exclude=None):
                         "srcs": single_ops["srcs"],
                         "flags_extra_cc": single_ops["flags_extra_cc"],
                         "flags_extra_hip": single_ops["flags_extra_hip"],
+                        "extra_ldflags": single_ops["extra_ldflags"],
                         "extra_include": single_ops["extra_include"],
                         "blob_gen_cmd": single_ops["blob_gen_cmd"],
                         "third_party": single_ops["third_party"],
