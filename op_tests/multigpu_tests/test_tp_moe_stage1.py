@@ -18,6 +18,18 @@ from aiter.ops.flydsl.kernels.mega_moe.tp_moe_stage1 import (
     TPMoEStage1Output,
 )
 
+# torchrun rewrites sys.path[0] to the launcher's dir, so make the
+# same-directory reference module importable by name.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from tp_moe_stage1_ref import (  # noqa: E402
+    build_mxfp4_w1,
+    dequant_w1_expert,
+    per_1x32_fp8_quant_dequant,
+    read_shuffled_scale,
+    reference_inter_row,
+)
+
 NETWORK = dict(
     model_dim=7168,
     experts=384,
@@ -308,11 +320,109 @@ def case_forward_contract():
     dist.destroy_process_group()
 
 
+def case_numerics():
+    rank, world, device = _setup_dist()
+    inter_dim = 384
+    model_dim = NETWORK["model_dim"]
+    experts, topk = NETWORK["experts"], NETWORK["topk"]
+    limit = NETWORK["swiglu_limit"]
+
+    w1_ref, w1_scale_ref, w1_shuf, w1_scale_shuf = build_mxfp4_w1(
+        experts, inter_dim, model_dim, device, seed=2026
+    )
+    op = TPMoEStage1(
+        model_dim=model_dim,
+        inter_dim=inter_dim,
+        experts=experts,
+        topk=topk,
+        w1=w1_shuf,
+        w1_scale=w1_scale_shuf,
+        device=device,
+        swiglu_limit=limit,
+        stage1_kernel_name=STAGE1_KERNEL,
+    )
+
+    worst = 0.0
+    for m_local in (1, 4, 16, 64, 128):
+        x = torch.randn((m_local, model_dim), dtype=torch.bfloat16, device=device) * (
+            model_dim**-0.25
+        )
+        ids, wts = _random_routes(m_local, experts, topk, device, seed=31 + rank)
+        out = op.forward(x, wts, ids)
+        torch.cuda.synchronize()
+
+        # Rebuild the gathered inputs on the host side for the reference.
+        x_g, wts_g, ids_g = op._all_gather_inputs(x, wts, ids)
+        x_g_f32 = x_g.float()
+        x_deq = per_1x32_fp8_quant_dequant(x_g_f32)
+
+        nvalid = int(out.num_valid_ids[0].item())
+        packed = out.sorted_token_ids[:nvalid]
+        tok = (packed & 0x00FFFFFF).long()
+        slot = ((packed >> 24) & 0xFF).long()
+        valid = (tok < out.m_logical).nonzero(as_tuple=True)[0]
+
+        scale_cols = inter_dim // 32
+        got_scale = read_shuffled_scale(
+            out.inter_sorted_shuffled_scale, nvalid, scale_cols
+        )
+        got = out.inter_sorted_quant[:nvalid].float() * got_scale.repeat_interleave(
+            32, dim=-1
+        )
+
+        num, den = 0.0, 0.0
+        # Rows are Expert-grouped, so a single-entry cache turns O(rows) weight
+        # dequantizations into O(active experts). Without it this loop re-expands a
+        # [2*inter, model_dim] tensor once per row and takes minutes.
+        cur_e, cur_w1_deq = -1, None
+        for r in valid.tolist():
+            e = int(out.sorted_expert_ids[r // out.sort_block_m].item())
+            t = int(tok[r].item())
+            assert int(ids_g[t, int(slot[r].item())].item()) == e, (
+                f"row {r}: sorted_expert_ids says {e} but topk_ids says "
+                f"{int(ids_g[t, int(slot[r].item())].item())}"
+            )
+            assert (
+                abs(
+                    float(out.sorted_weights[r].item())
+                    - float(wts_g[t, int(slot[r].item())].item())
+                )
+                < 1e-6
+            ), f"row {r}: route weight mismatch"
+
+            if e != cur_e:
+                cur_e, cur_w1_deq = e, dequant_w1_expert(
+                    w1_ref, w1_scale_ref, e, inter_dim
+                )
+            ref = reference_inter_row(x_deq[t], cur_w1_deq, limit)
+            ref_q = per_1x32_fp8_quant_dequant(ref.unsqueeze(0)).squeeze(0)
+            num += float(((got[r] - ref_q) ** 2).sum())
+            den += float((ref_q**2).sum())
+
+        rel_l2 = (num / max(den, 1e-30)) ** 0.5
+        worst = max(worst, rel_l2)
+        if rank == 0:
+            print(f"m_local={m_local:4d} rows={len(valid):6d} rel_l2={rel_l2:.5f}")
+
+    t = torch.tensor([worst], device=device)
+    dist.all_reduce(t, op=dist.ReduceOp.MAX)
+    worst = float(t.item())
+    if rank == 0:
+        print(f"case_numerics worst rel_l2={worst:.5f}")
+    if worst >= 0.05:
+        raise AssertionError(f"rel_l2={worst:.5f} exceeds 0.05")
+    if rank == 0:
+        print("case_numerics OK")
+    dist.barrier()
+    dist.destroy_process_group()
+
+
 CASES = {
     "construct": case_construct_validates,
     "capacity": case_capacity,
     "all_gather": case_all_gather,
     "forward_contract": case_forward_contract,
+    "numerics": case_numerics,
 }
 
 
