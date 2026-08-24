@@ -388,7 +388,6 @@ def sparse_mla_fwd(
         part_m,
         part_l,
         part_acc,
-        lse,
         scl,  # f32 side-channel: k_scale ("tensor") / f32 view ("dsmla")
         scl,
         float(softmax_scale),
@@ -408,7 +407,6 @@ def sparse_mla_fwd(
         num_heads,
         HAS_EXTRA=False,
         HAS_SINK=False,
-        HAS_LSE=return_lse,
         MAIN_FMT=fmt,
         EXTRA_FMT=fmt,
         MAIN_BLOCK_SIZE=block_size,
@@ -447,6 +445,8 @@ def sparse_mla_fwd(
         GATHER_CACHE="",
         q_scl_ptr=q_scale,
         Q_FP8=q_is_fp8,
+        lse_ptr=lse,
+        HAS_LSE=return_lse,
         num_warps=num_warps,
         waves_per_eu=waves_per_eu,
     )
@@ -464,7 +464,6 @@ def sparse_mla_fwd(
         part_acc,
         attn_sink,
         out,
-        lse,
         out.stride(0),
         out.stride(1),
         pm_stride0,
@@ -474,12 +473,13 @@ def sparse_mla_fwd(
         pa_stride_h,
         num_heads,
         HAS_SINK=False,
-        HAS_LSE=return_lse,
         HEAD_SIZE=kv_lora_rank,
         BLOCK_M=1,
         NUM_SPLITS=num_splits,
         HEAD_ALIGNED=True,
         ADAPTIVE_SPLITS=num_splits > 1,
+        lse_ptr=lse,
+        HAS_LSE=return_lse,
         num_warps=1,
     )
     return out, (lse if return_lse else None)

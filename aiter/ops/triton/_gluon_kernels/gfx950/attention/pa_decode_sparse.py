@@ -1614,7 +1614,6 @@ def _pa_decode_sparse(
     part_m_ptr,  # [C, NUM_SPLITS, H] f32 row max, base-2 domain
     part_l_ptr,  # [C, NUM_SPLITS, H] f32 row sum
     part_acc_ptr,  # [C, NUM_SPLITS, H, S] bf16 or f32, un-normalized
-    lse_ptr,  # [C, H] f32 natural-log LSE, HAS_LSE only
     # f32 side-channel per segment: scalar k_scale ("tensor") or f32 cache view
     # ("dsmla"). None elides the argument, keeping other formats' kernarg
     # layouts unchanged.
@@ -1637,7 +1636,6 @@ def _pa_decode_sparse(
     num_heads: gl.constexpr,
     HAS_EXTRA: gl.constexpr,
     HAS_SINK: gl.constexpr,
-    HAS_LSE: gl.constexpr,
     MAIN_FMT: gl.constexpr,
     EXTRA_FMT: gl.constexpr,
     MAIN_BLOCK_SIZE: gl.constexpr,
@@ -1681,6 +1679,9 @@ def _pa_decode_sparse(
     # mla_decode_fwd uses, where vLLM passes layer._q_scale.
     q_scl_ptr=None,
     Q_FP8: gl.constexpr = False,
+    # [C, H] f32 natural-log LSE, written only when HAS_LSE.
+    lse_ptr=None,
+    HAS_LSE: gl.constexpr = False,
     # Defaults keep every existing launch byte-identical; the MLA launcher opts in.
     GATHER_CACHE: gl.constexpr = _CG,
     IDX_CACHE: gl.constexpr = _NO_CACHE,
@@ -2130,7 +2131,6 @@ def _pa_decode_sparse_reduce(
     part_acc_ptr,
     attn_sink_ptr,
     out_ptr,
-    lse_ptr,
     out_stride0: gl.constexpr,
     out_stride1: gl.constexpr,
     pm_stride0: gl.constexpr,
@@ -2140,12 +2140,13 @@ def _pa_decode_sparse_reduce(
     pa_stride_h: gl.constexpr,
     num_heads: gl.constexpr,
     HAS_SINK: gl.constexpr,
-    HAS_LSE: gl.constexpr,
     HEAD_SIZE: gl.constexpr,
     BLOCK_M: gl.constexpr,
     NUM_SPLITS: gl.constexpr,
     HEAD_ALIGNED: gl.constexpr,
     ADAPTIVE_SPLITS: gl.constexpr,
+    lse_ptr=None,
+    HAS_LSE: gl.constexpr = False,
 ):
     """Split-KV combine: merge per-split partials, fold the sink, write the
     output. Identical for both geometries (partials are HEAD_SIZE = V wide).
