@@ -495,9 +495,13 @@ _TRUTHY_ENV = ("1", "true", "True", "yes", "YES")
 # a fix upstream would erase. Under replay rows decay monotonically (+5.8us/cell at
 # rows 1, +1.0 at 16, -7.0 at 24) and the four AOT-precompiled k values land within
 # 0.6us of each other, hence wide in k and capped at 16 rows. That sweep samples
-# rows at 1-2-4-8-12-16-24-32, so a follow-up probe pinned the sign change between
-# rows 17 and 20; 16 is the conservative edge of it and 17 buys nothing. See the
-# SILOTIGER-699 gate investigation for the per-cell numbers behind both archs.
+# rows at 1-2-4-8-12-16-24-32, so a 420-cell follow-up probe walked 13-15 and 17-20
+# twice: replay crosses zero at rows 18 (+0.08us/cell) and turns a real loss at 19
+# (-0.53), so the threshold is 18 rather than the 20 the coarse grid suggested.
+# Rows 17 is genuinely positive (+33.9us, and no k slice of it goes negative), but
+# it buys 2.5% of the window's +1371us while moving the worst cell from -11.7us to
+# -14.6us, so 16 stays the conservative edge. See the SILOTIGER-699 gate
+# investigation for the per-cell numbers behind both archs.
 class _DecodeGate(NamedTuple):
     min_width: int
     max_rows: int
