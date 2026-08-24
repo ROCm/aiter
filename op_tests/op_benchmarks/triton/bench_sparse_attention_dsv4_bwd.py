@@ -175,7 +175,7 @@ def check_correctness(device):
 # ---------------------------------------------------------------------------
 # Reporting
 # ---------------------------------------------------------------------------
-def _print_table(title, headers, rows):
+def _print_table(headers, rows):
     def _fmt(x):
         if isinstance(x, float):
             return f"{x:.3f}" if x >= 1 or x == 0 else f"{x:.4f}"
@@ -221,7 +221,7 @@ def run_bwd_bench(args, device):
                 f"    {'SUM':10s} {total:7.3f} ms  -> {tflops / (total * 1e-3):.0f} TFLOPS"
             )
 
-    _print_table("BACKWARD", ["T", "H", "Kv", "topk", "ms", "TFLOPS"], rows)
+    _print_table(["T", "H", "Kv", "topk", "ms", "TFLOPS"], rows)
 
 
 def _parse_args():

@@ -204,7 +204,9 @@ def build_inverted_topk(topk_indices_slice, num_kv):
     # Its dtype must match `keys` -- searchsorted is built per branch for that reason, not by
     # accident.
     flat_kv = topk_indices_slice.reshape(-1)  # [T*R] int32; -1 = invalid
-    if num_kv < 32767:  # int16 range, -1 included
+    # row_ids reaches num_kv, so int16 holds it as long as num_kv is within the type;
+    # the -1 sentinel is fine either way.
+    if num_kv <= torch.iinfo(torch.int16).max:
         keys = flat_kv.to(torch.int16)
         row_ids = torch.arange(num_kv + 1, device=flat_kv.device, dtype=torch.int16)
     else:
