@@ -1020,19 +1020,19 @@ def grouped_gemm_gfx1250_a8w4(
     ):
         _grouped_dbg("unsupported activation")
         return None
-    is_grouped_a4w4 = q_dtype_a == dtypes.fp4x2 and q_dtype_w == dtypes.fp4x2
-    is_grouped_a8w4 = q_dtype_a == dtypes.fp8 and (
-        q_dtype_w == dtypes.fp4x2 or w1.dtype == torch.uint8
-    )
+    # mxfp4 weights reach here either as fp4x2 or as the uint8 VIEW of the same
+    # bytes -- ATOM's loader keeps them uint8, and MegaMoE accepts both. Both
+    # arms have to say so: requiring the packed dtype on the a4w4 arm alone sent
+    # a4w4-with-uint8-weights to the 2-stage fallback instead, which is a silent
+    # detour to a different kernel family, not an error. The very next statement
+    # already normalizes the two spellings for the CSV key.
+    w_is_mxfp4 = q_dtype_w == dtypes.fp4x2 or w1.dtype == torch.uint8
+    is_grouped_a4w4 = q_dtype_a == dtypes.fp4x2 and w_is_mxfp4
+    is_grouped_a8w4 = q_dtype_a == dtypes.fp8 and w_is_mxfp4
     if not (is_grouped_a4w4 or is_grouped_a8w4):
         return None
     data_format = "fp4" if is_grouped_a4w4 else "a8w4"
-    # Normalize uint8-viewed fp4 weights back to fp4x2 for CSV key matching.
-    q_dtype_w_key = (
-        dtypes.fp4x2
-        if (q_dtype_w == dtypes.fp4x2 or w1.dtype == torch.uint8)
-        else q_dtype_w
-    )
+    q_dtype_w_key = dtypes.fp4x2 if w_is_mxfp4 else q_dtype_w
     _grouped_dbg(f"eligible data_format={data_format}")
     if w1_scale is None or w2_scale is None:
         return None

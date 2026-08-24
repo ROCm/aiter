@@ -95,7 +95,7 @@ def _import_mori_v2():
 
 
 # Config / quant-path spec
-def resolve_spec(quant_key, transport):
+def resolve_spec(quant_key, transport, combine_mode="gather"):
     """How to prepare weights / quantize activations / call fused_moe for a quant
     key, plus the dispatch transport dtype. transport: auto|bf16|fp8."""
     is_mxfp4 = quant_key in _MXFP4_KEYS
@@ -116,11 +116,26 @@ def resolve_spec(quant_key, transport):
         aiter_qtype = QuantType.per_1x32
 
     gate_mode = GateMode.INTERLEAVE if quant_key == "a8w4_mxfp4" else GateMode.SEPARATED
+    if is_mxfp4 and combine_mode == "scatter_fused":
+        # MegaMoE rejects anything but g1u1 interleave outright (its gemm2-fused
+        # scatter is built on that layout), so the a4w4 key has to follow a8w4
+        # here rather than keep the SEPARATED default it uses elsewhere. Weight
+        # prep and the fp32 reference both read gate_mode off this spec, so
+        # overriding it in one place keeps all three consistent.
+        gate_mode = GateMode.INTERLEAVE
 
     return {
         "key": quant_key,
         "aiter_qtype": aiter_qtype,
         "gate_mode": gate_mode,
+        # Which family of expert kernels the weights are laid out for. The MX
+        # keys differ only in the ACTIVATION dtype -- the weights are the same
+        # mxfp4 either way -- but a4w4 has historically meant "the 2-stage mxfp4
+        # kernels" here (e8m0_shuffle, is_shuffled) while a8w4 meant "the grouped
+        # n32k4 ones". MegaMoE is grouped-only, so under it both keys take the
+        # grouped prep; getting this wrong is silent, and costs a full run to
+        # find (the output is uncorrelated, not merely imprecise).
+        "grouped_weights": is_mxfp4 and combine_mode == "scatter_fused",
         "activation": ActivationType.Silu,
         "is_mxfp4": is_mxfp4,
         "is_fp8": is_fp8,
@@ -224,7 +239,7 @@ def shuffle_group(w1_qt, w1_s, w2_qt, w2_s, spec, n_experts):
     key = spec["key"]
     if key in ("No", "per_Token", "per_128x128"):
         return shuffle_weight(w1_qt), shuffle_weight(w2_qt), w1_s, w2_s
-    if key == "a8w4_mxfp4":
+    if key == "a8w4_mxfp4" or spec.get("grouped_weights"):
         if spec["gate_mode"] == GateMode.INTERLEAVE:
             w1_phys = _gguu_to_gugu_rows(w1_qt.view(torch.uint8))
             w1_a = shuffle_weight(w1_phys, layout=(16, 16))
@@ -240,7 +255,8 @@ def shuffle_group(w1_qt, w1_s, w2_qt, w2_s, spec, n_experts):
         w2_a = shuffle_weight(w2_qt.view(torch.uint8), layout=(16, 16))
         w2_ss = moe_shuffle_scale(w2_s.contiguous(), experts_cnt=n_experts)
         return w1_a, w2_a, w1_ss, w2_ss
-    # a4w4_mxfp4
+    # a4w4_mxfp4 on the 2-stage kernels (a different B layout from the grouped
+    # branch above -- e8m0_shuffle, not the n32k4 fold).
     w1_a = shuffle_weight(w1_qt, layout=(16, 16))
     w2_a = shuffle_weight(w2_qt, layout=(16, 16))
     w1_ss = fp4_utils.e8m0_shuffle(w1_s)
@@ -810,7 +826,7 @@ def main():
     os.environ["AITER_FORCE_A8W4"] = "0" if args.quant_type == "a4w4_mxfp4" else "1"
     dist_ctx = Dist()
     dev = torch.device("cuda", dist_ctx.local_rank)
-    spec = resolve_spec(args.quant_type, args.dispatch_commu_dtype)
+    spec = resolve_spec(args.quant_type, args.dispatch_commu_dtype, args.combine)
     spec["mega_wire"] = resolve_mega_wire(args.mega_wire, args.quant_type)
 
     if spec["is_mxfp4"] and get_gfx() not in ("gfx950", "gfx1250"):
