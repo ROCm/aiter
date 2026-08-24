@@ -283,17 +283,17 @@ def _pipeline_inputs(H, Hg, seq_lens, device="cuda"):
     g = torch.randn(1, T_flat, H, dtype=torch.float32, device=device) * -0.5
     beta = torch.randn(1, T_flat, H, dtype=torch.float32, device=device).sigmoid()
     h0 = torch.randn(N, H, V, K, dtype=torch.float32, device=device) * 0.01
-    return dict(
-        q=q,
-        k=k,
-        v=v,
-        g=g,
-        beta=beta,
-        scale=K**-0.5,
-        initial_state=h0,
-        output_final_state=True,
-        cu_seqlens=cu,
-    )
+    return {
+        "q": q,
+        "k": k,
+        "v": v,
+        "g": g,
+        "beta": beta,
+        "scale": K**-0.5,
+        "initial_state": h0,
+        "output_final_state": True,
+        "cu_seqlens": cu,
+    }
 
 
 @pytest.mark.parametrize("H,Hg", [(4, 2), (8, 4)])

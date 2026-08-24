@@ -110,7 +110,7 @@ def _device_cu_count() -> int:
                     torch.cuda.current_device()
                 ).multi_processor_count
             )
-        except Exception:
+        except RuntimeError:
             _cu_count_cache = 304
     return _cu_count_cache
 
@@ -458,23 +458,23 @@ def _get_or_compile(
         num_waves,
     )
     if cache_key not in _compiled_kernels:
-        _compile_kwargs = dict(
-            K=K,
-            V=V,
-            BT=BT,
-            BV=BV,
-            H=H,
-            Hg=Hg,
-            USE_G=use_g,
-            USE_GK=use_gk,
-            USE_INITIAL_STATE=use_h0,
-            STORE_FINAL_STATE=store_fs,
-            SAVE_NEW_VALUE=save_vn,
-            IS_VARLEN=is_varlen,
-            WU_CONTIGUOUS=wu_contig,
-            STATE_DTYPE_BF16=state_bf16,
-            G_IS_LOG2_SCALED=g_log2_scaled,
-        )
+        _compile_kwargs = {
+            "K": K,
+            "V": V,
+            "BT": BT,
+            "BV": BV,
+            "H": H,
+            "Hg": Hg,
+            "USE_G": use_g,
+            "USE_GK": use_gk,
+            "USE_INITIAL_STATE": use_h0,
+            "STORE_FINAL_STATE": store_fs,
+            "SAVE_NEW_VALUE": save_vn,
+            "IS_VARLEN": is_varlen,
+            "WU_CONTIGUOUS": wu_contig,
+            "STATE_DTYPE_BF16": state_bf16,
+            "G_IS_LOG2_SCALED": g_log2_scaled,
+        }
         if _ARCH == "gfx950":
             if num_waves != 4:
                 raise ValueError(
@@ -1912,7 +1912,7 @@ def _run_fused_gfx942(
     T_flat = w.shape[2]
 
     if cu_seqlens is None:
-        N, NT, chunk_offsets = B, triton.cdiv(T, BT), None
+        N, chunk_offsets = B, None
         kernel_cu_seqlens = None
     elif prefill_metadata is not None:
         prefill_metadata.validate(
@@ -1929,14 +1929,12 @@ def _run_fused_gfx942(
             num_decode_tokens=num_decode_tokens,
         )
         chunk_offsets = schedule.chunk_offsets
-        NT = schedule.total_chunks
         kernel_cu_seqlens = schedule.kernel_cu_seqlens
         N = schedule.n_prefill
     else:
         chunk_offsets = prepare_chunk_offsets(
             cu_seqlens, BT, num_decodes, num_decode_tokens
         )
-        NT = prepare_num_chunks(cu_seqlens, BT, num_decodes, num_decode_tokens)
         kernel_cu_seqlens = prepare_rebased_cu_seqlens(
             cu_seqlens, num_decodes, num_decode_tokens
         )
@@ -2129,7 +2127,7 @@ def chunk_gated_delta_rule_fwd_h_o_flydsl(
             "provided."
         )
 
-    B, T, Hg, K = q.shape
+    B, T, _Hg, K = q.shape
     V = u.shape[-1]
     if scale is None:
         scale = K**-0.5

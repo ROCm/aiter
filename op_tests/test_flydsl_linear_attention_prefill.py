@@ -1898,7 +1898,7 @@ class TestCorrectness:
         when the sequence length is not a multiple of the chunk size.
         Uses the KDA (gk) path.
         """
-        H, Hg, K, V, BT = 12, 12, 128, 128, 64
+        H, Hg, K, V, _BT = 12, 12, 128, 128, 64
         seq_len = 8192 + 37  # not a multiple of 64
         cu_seqlens = torch.tensor([0, seq_len], dtype=torch.int32, device="cuda")
         k = torch.randn(1, seq_len, Hg, K, dtype=torch.bfloat16, device="cuda") * 0.1
