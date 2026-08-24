@@ -7,8 +7,8 @@ Pytest collects validity cases only (no timing). ``python3`` this file
 runs an aiter-op-test ``@benchmark`` / markdown sweep. Each rank times
 ``fly.allreduce`` with default ``run_perftest`` after ``compile()``. The
 oracle is an untimed fp32 NCCL all-reduce of the same per-rank inputs.
-INT4 is lossy, so the gate is SQNR vs that oracle, not bit-identity or
-tight ``checkAllclose``.
+INT4 is lossy, so the gate is SQNR vs that oracle on **every** rank, not
+bit-identity or tight ``checkAllclose``.
 
 5120 is a measured calibration width, not an ABI requirement. The kernel
 is gfx942 TP∈{2,4,8}; other archs skip. Pytest skips a world size when
@@ -183,7 +183,7 @@ def _run_rank(args) -> None:
         torch.cuda.empty_cache()
 
     gathered = [None] * args.tp
-    dist.all_gather_object(gathered, rows, group=group)
+    dist.all_gather_object(gathered, rows, group=gloo)
     if rank == 0 and args.out:
         with open(args.out, "w") as fh:
             json.dump({"ranks": gathered}, fh)
@@ -198,7 +198,7 @@ def _spawn(
     *,
     time_it: bool,
     super_tile: int = SUPER_TILE,
-) -> list[dict]:
+) -> list[list[dict]]:
     # HIP QR/fused-AR use multiprocessing.Pool from ``python3`` __main__.
     # This file is also collected by pytest, and FlyDSL JIT needs a fresh
     # interpreter per rank, so ranks are Popen of this file with --rank
@@ -271,36 +271,75 @@ def _spawn(
         raise RuntimeError("QRInt4 ranks failed\n" + "\n".join(tails))
     with open(out_path) as fh:
         payload = json.load(fh)
-    return payload["ranks"][0]
+    ranks = payload["ranks"]
+    if len(ranks) != world_size:
+        raise RuntimeError(
+            f"QRInt4 gathered {len(ranks)} ranks, expected {world_size}"
+        )
+    return ranks
+
+
+def _assert_sqnr(
+    ranks: list[list[dict]],
+    *,
+    tokens: int,
+    hidden: int,
+    world_size: int,
+    label: str,
+) -> dict:
+    expected_st = _pick_st(tokens, hidden)
+    if len(ranks) != world_size:
+        raise AssertionError(
+            f"{label}: gathered {len(ranks)} ranks, expected {world_size}"
+        )
+    fails = []
+    for rank, rows in enumerate(ranks):
+        if not rows:
+            fails.append(f"rank {rank}: no rows")
+            continue
+        row = rows[0]
+        if row["st_used"] != expected_st:
+            fails.append(
+                f"rank {rank}: ST={row['st_used']}, expected {expected_st}"
+            )
+        if row["sqnr_db"] < SQNR_MIN_DB:
+            fails.append(
+                f"rank {rank}: SQNR {row['sqnr_db']:.2f} dB < {SQNR_MIN_DB} "
+                f"(rel MAE {row['rel_mae']:.3e})"
+            )
+    if fails:
+        raise AssertionError(
+            f"{label} tp={world_size} tokens={tokens} hidden={hidden}: "
+            + "; ".join(fails)
+        )
+    return ranks[0][0]
 
 
 @pytest.mark.parametrize("world_size,tokens,hidden,label", _PYTEST_CASES)
 def test_qr_int4_sqnr_vs_fp32_allreduce(world_size, tokens, hidden, label):
-    rows = _spawn(world_size, [(tokens, hidden)], time_it=False)
-    row = rows[0]
-    expected_st = _pick_st(tokens, hidden)
-    assert (
-        row["st_used"] == expected_st
-    ), f"{label}: host picked ST={row['st_used']}, expected {expected_st}"
-    assert row["sqnr_db"] >= SQNR_MIN_DB, (
-        f"{label} tp={world_size} tokens={tokens} hidden={hidden} "
-        f"ST={row['st_used']}: SQNR {row['sqnr_db']:.2f} dB < {SQNR_MIN_DB} "
-        f"(rel MAE {row['rel_mae']:.3e})"
+    ranks = _spawn(world_size, [(tokens, hidden)], time_it=False)
+    _assert_sqnr(
+        ranks,
+        tokens=tokens,
+        hidden=hidden,
+        world_size=world_size,
+        label=label,
     )
 
 
 @benchmark()
 def test_qr_int4(tokens, hidden, dtype, tp):
-    rows = _spawn(tp, [(tokens, hidden)], time_it=True)
-    row = rows[0]
+    ranks = _spawn(tp, [(tokens, hidden)], time_it=True)
+    row = _assert_sqnr(
+        ranks,
+        tokens=tokens,
+        hidden=hidden,
+        world_size=tp,
+        label="bench",
+    )
     nbytes = tokens * hidden * 2
     # Reduce of tp ranks: (world-1) adds per element, plus INT4 codec ALU.
     flops = tokens * hidden * (tp - 1)
-    if row["sqnr_db"] < SQNR_MIN_DB:
-        raise AssertionError(
-            f"SQNR {row['sqnr_db']:.2f} dB < {SQNR_MIN_DB} "
-            f"for tp={tp} {tokens}x{hidden} ST={row['st_used']}"
-        )
     us = row["us"] or 0.0
     return {
         "gfx": ARCH,
@@ -309,8 +348,8 @@ def test_qr_int4(tokens, hidden, dtype, tp):
         "flydsl us": us,
         "flydsl TFLOPS": (flops / us / 1e6) if us else 0.0,
         "flydsl TB/s": (nbytes / us / 1e6) if us else 0.0,
-        "flydsl err": row["rel_mae"],
-        "flydsl sqnr_db": row["sqnr_db"],
+        "flydsl err": max(r[0]["rel_mae"] for r in ranks),
+        "flydsl sqnr_db": min(r[0]["sqnr_db"] for r in ranks),
     }
 
 
