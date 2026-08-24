@@ -138,7 +138,12 @@ class TPMoEStage1:
         self.stage1_kernel_name = stage1_kernel_name
         self.stage1_params = params
         self.transport = transport
-        self.device = device or torch.device("cuda", torch.cuda.current_device())
+        dev = device or torch.device("cuda", torch.cuda.current_device())
+        if dev.type == "cuda" and dev.index is None:
+            # Normalise "cuda" -> "cuda:N"; _validate_call compares devices by
+            # equality and torch.device("cuda") != torch.device("cuda", 0).
+            dev = torch.device("cuda", torch.cuda.current_device())
+        self.device = dev
         # flydsl_moe_stage1 derives E and inter_dim from w1 itself and ignores the
         # constructor values, so a mis-sized shard (e.g. a TP4 slice handed to a
         # TP8-configured op) would silently produce wrong numbers.
