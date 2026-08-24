@@ -13,12 +13,11 @@ launcher.
 
 from __future__ import annotations
 
-from functools import lru_cache
+from functools import cache, lru_cache
 
 import pandas as pd
 
 from aiter import logger
-
 from csrc.opus_gemm.opus_gemm_common import (
     DEFAULT_COMPILED_KIDS_BY_ARCH,
     GFX942_BF16WS_EXACT_N,
@@ -30,12 +29,10 @@ from csrc.opus_gemm.opus_gemm_common import (
 from ...jit.core import AITER_CONFIGS, AITER_LOG_TUNED_CONFIG
 from ...jit.utils.chip_info import get_gfx_runtime as get_gfx
 from ..gemm_op_common import get_padded_m
-
 from .launch_plan import (
     A16W16LaunchPlan,
     _get_cached_a16w16_launch_plan,
 )
-
 
 # ---- A16W16 tuned-candidate and heuristic policy -------------------------
 
@@ -106,9 +103,7 @@ def _gfx942_heuristic_symbol_to_kid() -> dict[str, int]:
     for kid in DEFAULT_COMPILED_KIDS_BY_ARCH["gfx942"]:
         instance = get_kernel_instance("gfx942", "a16w16", kid)
         if instance is None:
-            raise RuntimeError(
-                f"gfx942 heuristic kid {kid} has no a16w16 instance"
-            )
+            raise RuntimeError(f"gfx942 heuristic kid {kid} has no a16w16 instance")
         previous = result.setdefault(instance.name, int(kid))
         if previous != kid:
             raise RuntimeError(
@@ -134,10 +129,7 @@ def _gfx942_heuristic_split_barrier_ok(N: int, K: int) -> bool:
 
 def _gfx942_heuristic_bf16ws_band(M: int, N: int, K: int) -> bool:
     return (
-        K >= 4096
-        and K % 64 == 0
-        and 104 <= M <= 608
-        and (N == 256 or 512 <= N <= 2048)
+        K >= 4096 and K % 64 == 0 and 104 <= M <= 608 and (N == 256 or 512 <= N <= 2048)
     )
 
 
@@ -178,8 +170,10 @@ def _gfx942_heuristic_bf16_symbol(M: int, N: int, K: int) -> str:
             return "opus_gemm_gfx942_wkc_512x16x32x64_1x1_16x16x16_0x0x0"
         return "opus_gemm_gfx942_wkc_256x32x32x64_1x1_16x16x16_0x0x0"
 
-    if K >= 512 and k64_ok and (
-        N <= 64 or (M <= 128 and N <= 1024) or (M <= 8 and N <= 1536)
+    if (
+        K >= 512
+        and k64_ok
+        and (N <= 64 or (M <= 128 and N <= 1024) or (M <= 8 and N <= 1536))
     ):
         if N <= 64 and M > 128:
             return "opus_gemm_gfx942_wkc_512x32x16x64_1x1_16x16x16_0x0x0"
@@ -274,17 +268,13 @@ def _gfx950_heuristic_shape_compatible(kid: int, M: int, N: int, K: int) -> bool
         if loops < a16w16_flatmm_prefetch_k_iter(instance):
             return False
         return instance.has_oob or (
-            M % instance.B_M == 0
-            and N % instance.B_N == 0
-            and K % instance.B_K == 0
+            M % instance.B_M == 0 and N % instance.B_N == 0 and K % instance.B_K == 0
         )
     if instance.kernel_tag in ("a16w16", "a16w16_persistent"):
         if loops < 2 or loops % 2 != 0 or N % 16 != 0:
             return False
         return instance.has_oob or (
-            M % instance.B_M == 0
-            and N % instance.B_N == 0
-            and K % instance.B_K == 0
+            M % instance.B_M == 0 and N % instance.B_N == 0 and K % instance.B_K == 0
         )
     return True
 
@@ -419,9 +409,7 @@ def resolve_a16w16_heuristic_candidate(
     except (TypeError, ValueError):
         return None
     for kid in _a16w16_heuristic_candidates(arch, preferred):
-        if arch == "gfx950" and not _gfx950_heuristic_shape_compatible(
-            kid, M, N, K
-        ):
+        if arch == "gfx950" and not _gfx950_heuristic_shape_compatible(kid, M, N, K):
             continue
         plan = _resolve_a16w16_candidate(
             arch=arch,
@@ -492,7 +480,7 @@ _MXSCALE_BMM_GLOBAL_KID_MAX = _MXSCALE_BMM_KID_OFFSET + _MXSCALE_BMM_LOCAL_KID_M
 _TUNED_PERF_COLUMNS = ("us", "tflops", "bw", "errRatio")
 
 
-@lru_cache(maxsize=None)
+@cache
 def _load_mxscale_bmm_tuned(libtype: str | None = None) -> dict:
     path = AITER_CONFIGS.AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE_FILE
     try:
@@ -504,9 +492,7 @@ def _load_mxscale_bmm_tuned(libtype: str | None = None) -> dict:
     required = {"gfx", "b", "m", "n", "k", "kernelId", "splitK"}
     missing = required.difference(df.columns)
     if missing:
-        raise ValueError(
-            f"MXFP8 BMM tuned CSV is missing columns {sorted(missing)}"
-        )
+        raise ValueError(f"MXFP8 BMM tuned CSV is missing columns {sorted(missing)}")
 
     # The checked-in tuned data uses the original local OPUS ids (0..653),
     # while the unified public dispatcher owns the 8000 band. Keep the source
@@ -516,9 +502,7 @@ def _load_mxscale_bmm_tuned(libtype: str | None = None) -> dict:
         if "libtype" in df.columns
         else pd.Series(True, index=df.index, dtype=bool)
     )
-    legacy_opus_rows = opus_rows & df["kernelId"].between(
-        0, _MXSCALE_BMM_LOCAL_KID_MAX
-    )
+    legacy_opus_rows = opus_rows & df["kernelId"].between(0, _MXSCALE_BMM_LOCAL_KID_MAX)
     df.loc[legacy_opus_rows, "kernelId"] += _MXSCALE_BMM_KID_OFFSET
 
     if libtype is not None and "libtype" in df.columns:
@@ -543,14 +527,8 @@ def _load_mxscale_bmm_tuned(libtype: str | None = None) -> dict:
     shape_keys = ["gfx", "b", "m", "n", "k"]
     duplicate_shapes = df.duplicated(subset=shape_keys, keep=False)
     if duplicate_shapes.any():
-        rows = (
-            df.loc[duplicate_shapes, shape_keys]
-            .drop_duplicates()
-            .to_dict("records")
-        )
-        raise RuntimeError(
-            f"duplicate shapes across MXFP8 BMM tuned CSV files: {rows}"
-        )
+        rows = df.loc[duplicate_shapes, shape_keys].drop_duplicates().to_dict("records")
+        raise RuntimeError(f"duplicate shapes across MXFP8 BMM tuned CSV files: {rows}")
     return df.set_index(shape_keys).to_dict("index")
 
 
@@ -584,9 +562,7 @@ def lookup_mxscale_bmm_config(
         return None
     if AITER_LOG_TUNED_CONFIG:
         cfg = {
-            key: value
-            for key, value in row.items()
-            if key not in _TUNED_PERF_COLUMNS
+            key: value for key, value in row.items() if key not in _TUNED_PERF_COLUMNS
         }
         logger.info(
             "shape B:%s M:%s N:%s K:%s uses padded_M:%s MXFP8 config %s",
@@ -600,7 +576,7 @@ def lookup_mxscale_bmm_config(
     return row
 
 
-@lru_cache(maxsize=None)
+@cache
 def _mxscale_bmm_kid_m_align() -> dict[int, int]:
     from csrc.opus_gemm.opus_gemm_common import a8w8_mxscale_bmm_kernel_lists
 
@@ -622,8 +598,10 @@ def _heuristic_mxscale_bmm_kid(g: int, m: int, n: int, k: int) -> int:
     def divisible(value: int, divisor: int) -> bool:
         return value % divisor == 0
 
-    if divisible(n, 256) and divisible(k, 128) and (
-        m >= 2048 or (m >= 1024 and g >= 8)
+    if (
+        divisible(n, 256)
+        and divisible(k, 128)
+        and (m >= 2048 or (m >= 1024 and g >= 8))
     ):
         return 8158 if 4096 <= k <= 8192 else 8150
     if m < 64:
@@ -659,9 +637,9 @@ def resolve_a8w8_mxscale_bmm_plan(
 
 __all__ = [
     "lookup_mxscale_bmm_config",
+    "resolve_a8w8_mxscale_bmm_plan",
     "resolve_a16w16_caller_candidate",
     "resolve_a16w16_heuristic_candidate",
     "resolve_a16w16_tuned_candidate",
-    "resolve_a8w8_mxscale_bmm_plan",
     "select_a16w16_heuristic_kid",
 ]

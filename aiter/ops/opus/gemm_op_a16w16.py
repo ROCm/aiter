@@ -8,14 +8,13 @@ from threading import local
 
 import torch
 
+from csrc.opus_gemm.opus_gemm_common import OpusGemmInstance
+
 from ...jit.core import compile_ops, get_module
 from ...jit.utils.torch_guard import torch_compile_guard
 from ...utility.dtypes import _aiter_dtype_id, aiter_tensor_t
-from csrc.opus_gemm.opus_gemm_common import OpusGemmInstance
-
 from ._arch import _device_arch_and_cu
 from .launch_plan import _get_cached_a16w16_launch_plan
-
 
 # ---- Low-level A16W16 backend --------------------------------------------
 
@@ -163,9 +162,7 @@ def _invoke_opus_a16w16_cabi(
         else _fill_aiter_tensor_descriptor(workspace, pool.workspace)
     )
     bias_arg = (
-        _NULL_AITER_TENSOR
-        if bias_descriptor is None
-        else ctypes.byref(bias_descriptor)
+        _NULL_AITER_TENSOR if bias_descriptor is None else ctypes.byref(bias_descriptor)
     )
     workspace_arg = (
         _NULL_AITER_TENSOR
@@ -291,9 +288,9 @@ def _launch_a16w16_backend(
             )
             _load_opus_a16w16_cabi()
         _opus_a16w16_cabi_primed = True
-        return None
+        return
     _invoke_opus_a16w16_cabi(XQ, WQ, Y, bias, workspace, kid, split_k)
-    return None
+    return
 
 
 def _check_a16w16_launch_layout(

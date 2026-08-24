@@ -163,7 +163,7 @@ def _read_device_arch_and_cu(device: torch.device) -> tuple[str, int]:
             from ...jit.utils.chip_info import get_gfx_runtime
 
             arch = get_gfx_runtime().lower()
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             raise RuntimeError(
                 f"cannot determine the AMD gfx architecture for device {device}"
             ) from exc

@@ -35,13 +35,13 @@ from opus_gemm_common import (
     a16w16_flatmm_splitk_kernels_list,
     a16w16_kernels_list,
     a16w16_mono_tile_kernels_list,
+    default_compiled_kids_for_arch,
     gfx942_a8w8_kernels_list,
     gfx942_nosplit_kernels_list,
     gfx942_splitk_kernels_list,
     gfx1250_clusterlaunch_kernels_list,
     gfx1250_kernels_list,
     gfx1250_splitk_fuse_kernels_list,
-    default_compiled_kids_for_arch,
     kernels_list,
 )
 
@@ -139,11 +139,7 @@ def _splitk_reduce_baseline_instantiations(
     out = f"// HAS_OOB={has_oob_str} variants\n"
     for split_k in split_ks:
         for workspace_type in workspace_types:
-            tail = (
-                ""
-                if split_k is None
-                else f", {split_k}, {workspace_type}"
-            )
+            tail = "" if split_k is None else f", {split_k}, {workspace_type}"
             for out_type, has_bias, bias_type in configs:
                 out += (
                     f"template __global__ void {reduce_kernel}<"
@@ -348,8 +344,7 @@ A16W16_WORKSPACE_LAUNCH_HOST_EXTRA = (
     "\n    int"
 )
 A8W8_BLOCKSCALE_HOST_EXTRA = (
-    ",\n    aiter_tensor_t &x_scale,"
-    "\n    aiter_tensor_t &w_scale"
+    ",\n    aiter_tensor_t &x_scale," "\n    aiter_tensor_t &w_scale"
 )
 
 
@@ -539,13 +534,9 @@ class opus_gemm_codegen:
             "make_host_decl": _make_host_decl,
             "make_device_decl": _make_device_decl,
             "A16W16_LAUNCH_HOST_EXTRA": A16W16_LAUNCH_HOST_EXTRA,
-            "A16W16_WORKSPACE_LAUNCH_HOST_EXTRA": (
-                A16W16_WORKSPACE_LAUNCH_HOST_EXTRA
-            ),
+            "A16W16_WORKSPACE_LAUNCH_HOST_EXTRA": (A16W16_WORKSPACE_LAUNCH_HOST_EXTRA),
             "A8W8_BLOCKSCALE_HOST_EXTRA": A8W8_BLOCKSCALE_HOST_EXTRA,
-            "make_a8w8_bpreshuffle_host_decl": (
-                _make_a8w8_bpreshuffle_host_decl
-            ),
+            "make_a8w8_bpreshuffle_host_decl": (_make_a8w8_bpreshuffle_host_decl),
             "A16W16_KID_DISPATCH_TAGS": A16W16_KID_DISPATCH_TAGS,
             "BIAS_HOST_VALIDATE": self.BIAS_HOST_VALIDATE,
         }
@@ -601,6 +592,7 @@ class opus_gemm_codegen:
         WORKSPACE_ENTRY = """\
     {{ {kid}, &{kernel_name}<fp32_t> }},  \\
 """
+
         def _write_rows(f, macro_name, rows, entry, function_like=False):
             f.write(f"#define {macro_name}_SIZE {len(rows)}\n")
             macro_suffix = "(CTYPE)" if function_like else ""
@@ -619,8 +611,7 @@ class opus_gemm_codegen:
             rows = []
             for kid, k in kernels_dict.items():
                 if not (
-                    isinstance(kid, int)
-                    and k.kernel_tag in A16W16_KID_DISPATCH_TAGS
+                    isinstance(kid, int) and k.kernel_tag in A16W16_KID_DISPATCH_TAGS
                 ):
                     continue
                 if _kid_arch_common(k) != arch or k.kernel_tag in SPLITK_TAGS:
@@ -636,16 +627,13 @@ class opus_gemm_codegen:
                 "GENERATE_A16W16_NONWORKSPACE_KID_DISPATCH_"
                 f"{arch.upper()}_{dtype_suffix}"
             )
-            _write_rows(
-                f, macro_name, rows, NON_WORKSPACE_ENTRY, function_like=True
-            )
+            _write_rows(f, macro_name, rows, NON_WORKSPACE_ENTRY, function_like=True)
 
         def _emit_workspace_map(f, arch):
             rows = []
             for kid, k in kernels_dict.items():
                 if not (
-                    isinstance(kid, int)
-                    and k.kernel_tag in A16W16_KID_DISPATCH_TAGS
+                    isinstance(kid, int) and k.kernel_tag in A16W16_KID_DISPATCH_TAGS
                 ):
                     continue
                 if _kid_arch_common(k) != arch or k.kernel_tag not in SPLITK_TAGS:
@@ -657,9 +645,7 @@ class opus_gemm_codegen:
                     )
                 rows.append((kid, k.name))
             rows.sort(key=lambda r: r[0])
-            macro_name = (
-                f"GENERATE_A16W16_WORKSPACE_KID_DISPATCH_{arch.upper()}"
-            )
+            macro_name = f"GENERATE_A16W16_WORKSPACE_KID_DISPATCH_{arch.upper()}"
             _write_rows(f, macro_name, rows, WORKSPACE_ENTRY)
 
         with open(
@@ -848,20 +834,13 @@ void
     std::optional<aiter_tensor_t> workspace,
     int splitK);
 """
-        GFX1250_SPLITK_TAGS = {
-            "a16w16_cluster_tdm_splitk_ws",
-            "a16w16_clusterlaunch_tdm_splitk_ws",
-            "a16w16_clusterlaunch_tdm_splitk_fuse",
-        }
         with open(os.path.join(self.working_path, "opus_gemm_manifest.h"), "w") as f:
             f.write(MANIFEST_HEAD)
             for k in kernels_dict.values():
                 if k.kernel_tag.startswith("a8w8_mxscale_bmm_"):
                     f.write(MANIFEST_BMM_MXSCALE.format(kernel_name=k.name))
                 elif k.kernel_tag in SPLITK_TAGS:
-                    f.write(
-                        MANIFEST_A16W16_WORKSPACE.format(kernel_name=k.name)
-                    )
+                    f.write(MANIFEST_A16W16_WORKSPACE.format(kernel_name=k.name))
                 elif k.kernel_tag in A16W16_KID_DISPATCH_TAGS:
                     f.write(MANIFEST_A16W16.format(kernel_name=k.name))
                 elif k.kernel_tag == "a8w8":
@@ -869,15 +848,9 @@ void
                 elif k.kernel_tag == "a8w8_scale":
                     f.write(MANIFEST_BLOCKSCALE.format(kernel_name=k.name))
                 elif k.kernel_tag in A8W8_BPRESHUFFLE_TAGS:
-                    f.write(
-                        MANIFEST_BLOCKSCALE_BPRESHUFFLE.format(
-                            kernel_name=k.name
-                        )
-                    )
+                    f.write(MANIFEST_BLOCKSCALE_BPRESHUFFLE.format(kernel_name=k.name))
                 else:
-                    raise ValueError(
-                        f"no manifest ABI for kernel tag {k.kernel_tag!r}"
-                    )
+                    raise ValueError(f"no manifest ABI for kernel tag {k.kernel_tag!r}")
 
     # -- Per-pass TU emission -- Replaces the old "one .cpp per (kid, dtype)" scheme.
 
@@ -967,9 +940,7 @@ void
         for row in self._device_instantiations:
             name = row["kid_name"]
             dtype = row["dtype"]
-            guard_open, guard_close = _own_arch_device_pass_guard(
-                _kid_name_arch(name)
-            )
+            guard_open, guard_close = _own_arch_device_pass_guard(_kid_name_arch(name))
             # Include the kid's .cuh -- it transitively pulls in the full pipeline header (because
             # OPUS_FUSED_HOST_TU is NOT defined here) an...
             contents = (
@@ -1338,15 +1309,10 @@ if __name__ == "__main__":
     # mentions them.  This set is arch-scoped so single-arch builds never pull
     # another architecture's launcher symbol into their host TU.
     mandatory_arches = (
-        set(OPUS_MANDATORY_A8_KIDS)
-        if target_arches is None
-        else set(target_arches)
+        set(OPUS_MANDATORY_A8_KIDS) if target_arches is None else set(target_arches)
     )
     mandatory_a8_kids = set().union(
-        *(
-            OPUS_MANDATORY_A8_KIDS.get(arch, frozenset())
-            for arch in mandatory_arches
-        )
+        *(OPUS_MANDATORY_A8_KIDS.get(arch, frozenset()) for arch in mandatory_arches)
     )
     S |= mandatory_a8_kids & valid_kids
 

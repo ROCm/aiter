@@ -127,9 +127,10 @@ EXACT_N_ROWBLOCK_REDUCE_CONFIGS = (
     (8, 256, 1),  # N=2048, 1 row/wg
 )
 
-assert frozenset(
-    vec * nvec for vec, nvec, _ in EXACT_N_ROWBLOCK_REDUCE_CONFIGS
-) == GFX942_BF16WS_EXACT_N
+assert (
+    frozenset(vec * nvec for vec, nvec, _ in EXACT_N_ROWBLOCK_REDUCE_CONFIGS)
+    == GFX942_BF16WS_EXACT_N
+)
 
 
 def splitk_reduce_extra_forward_decls():
@@ -213,8 +214,8 @@ def gen_splitk_gfx942_instance(
         kargs_explicit_param = f", {k.GROUP_M}, opus_gemm_splitk_kargs"
         fwd_decl_kargs_tpl = ", int COL_MAJOR_GROUP_M, typename Kargs"
         fwd_decl_kargs_fnarg = "Kargs"
-    workspace_dtype, workspace_ptr_type, workspace_aiter_dtype = (
-        splitk_workspace_type(k)
+    workspace_dtype, workspace_ptr_type, workspace_aiter_dtype = splitk_workspace_type(
+        k
     )
     bf16ws = workspace_dtype == "bf16_t"
     # gfx942 a16w16_traits: 7 params <BLOCK_SIZE, BLOCK, DTYPE, VEC, TILE, WAVE, LDS_DEPTH=2>.
@@ -562,7 +563,7 @@ def _emit_a16w16_nosplit_launcher(
     device_decl_for_dtype,
 ):
     extra_param = (
-            ",\n    std::optional<aiter_tensor_t> bias," "\n    int /*split_k*/"
+        ",\n    std::optional<aiter_tensor_t> bias," "\n    int /*split_k*/"
         if k.kernel_tag in A16W16_KID_DISPATCH_TAGS
         else ""
     )

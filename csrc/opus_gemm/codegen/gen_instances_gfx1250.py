@@ -100,8 +100,8 @@ def gen_cluster_tdm_splitk_ws_instance(
     **_unused,
 ):
     """Emit a checked gfx1250 two-stage split-K launcher."""
-    workspace_dtype, workspace_ptr_type, workspace_aiter_dtype = (
-        splitk_workspace_type(k)
+    workspace_dtype, workspace_ptr_type, workspace_aiter_dtype = splitk_workspace_type(
+        k
     )
     # The final #4246 reducer uses the same coalesced VEC=8/BLOCK=128 geometry
     # for either physical workspace type.
@@ -412,8 +412,8 @@ def gen_splitk_fuse_instance(
 ):
     """Emit the fused gfx1250 split-K launcher and workspace checks."""
     del BIAS_HOST_VALIDATE
-    workspace_dtype, workspace_ptr_type, workspace_aiter_dtype = (
-        splitk_workspace_type(k)
+    workspace_dtype, workspace_ptr_type, workspace_aiter_dtype = splitk_workspace_type(
+        k
     )
     layout_int = _LAYOUT_INT[getattr(k, "ctdm_layout", "tileN")]
     enable_bias_str = "true" if getattr(k, "enable_bias", False) else "false"

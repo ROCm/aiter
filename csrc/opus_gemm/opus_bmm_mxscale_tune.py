@@ -180,12 +180,9 @@ _TUNE_POLICY = {
 for _kid, _sks in _TUNE_POLICY.items():
     if any(s > 1 for s in _sks):
         _tag = _CODEGEN_BMM[_kid].kernel_tag
-        assert (
-            _tag == "a8w8_mxscale_bmm_flatmm_splitk"
-            and not getattr(_CODEGEN_BMM[_kid], "direct_only", False)
-        ), (
-            f"kid {_kid} ({_tag}) is not split-K capable but sweeps {_sks}"
-        )
+        assert _tag == "a8w8_mxscale_bmm_flatmm_splitk" and not getattr(
+            _CODEGEN_BMM[_kid], "direct_only", False
+        ), f"kid {_kid} ({_tag}) is not split-K capable but sweeps {_sks}"
 
 
 def _applicable(kid, g, m, n, k):
@@ -278,14 +275,7 @@ def _workspace_numel(kernel_id, split_k, batch, m, n):
         return 0
     tiles_m = (m + instance.B_M - 1) // instance.B_M
     tiles_n = (n + instance.B_N - 1) // instance.B_N
-    partial_numel = (
-        split_k
-        * batch
-        * tiles_m
-        * instance.B_M
-        * tiles_n
-        * instance.B_N
-    )
+    partial_numel = split_k * batch * tiles_m * instance.B_M * tiles_n * instance.B_N
     if instance.kernel_tag != "a8w8_mxscale_bmm_fused":
         return partial_numel
     counter_offset = (partial_numel * 4 + 255) & ~255
@@ -323,9 +313,7 @@ def gen_bmm_mxscale_data(
     return (O_mx, W_mx, Y, xs_mx, ws_mx, workspace, ref)
 
 
-def run_bmm_mxscale_bench(
-    O_mx, W_mx, Y, xs_mx, ws_mx, workspace, kernelId, splitK
-):
+def run_bmm_mxscale_bench(O_mx, W_mx, Y, xs_mx, ws_mx, workspace, kernelId, splitK):
     """Tuner bench func: run the kid in-place, return Y for checkAllclose."""
     # Production owns contiguous token-major Y. Expose its batch-first view to
     # the public API; the adapter transposes it back before the raw launch.
@@ -503,9 +491,7 @@ class OpusBmmMxscaleTuner(GemmCommonTuner):
 
         gfx = self.get_gfx()
         if gfx != "gfx950":
-            raise RuntimeError(
-                f"MXFP8 BMM tuning is gfx950-only; detected {gfx!r}"
-            )
+            raise RuntimeError(f"MXFP8 BMM tuning is gfx950-only; detected {gfx!r}")
 
         manual_g = args.batch_g is not None
         manual_m = args.M is not None

@@ -58,17 +58,18 @@ _patch_flaky_hip_device_count()
 # opus_gemm_common is a sibling file in csrc/opus_gemm/.
 from opus_gemm_common import (
     BIAS_AWARE_KIDS,
+    DEFAULT_COMPILED_KIDS,
+    GFX942_BF16WS_EXACT_N,
     GFX1250_CLUSTERLAUNCH_KID_OF,
     GFX1250_PLAIN_KID_OF,
     GFX1250_SPLITK_FUSE_ENABLED,
     GFX1250_SPLITK_FUSE_KID_OF,
-    GFX942_BF16WS_EXACT_N,
-    DEFAULT_COMPILED_KIDS,
+    GFX1250_SPLITK_FUSE_KIDS,
     NON_SPLITK_KIDS,
     SPLITK_KIDS,
     _opus_sidecar_path,
-    a16w16_flatmm_prefetch_k_iter,
     a16w16_flatmm_kernels_list,
+    a16w16_flatmm_prefetch_k_iter,
     a16w16_flatmm_splitk_kernels_list,
     a16w16_flatmm_splitk_kernels_list_nooob,
     a16w16_kernels_list,
@@ -197,9 +198,7 @@ def gfx1250_splitK_window(M, N, K, cu_num, k_inst, base_candidates):
 
 
 GFX1250_FUSE_TOP_SPLITK = 3
-GFX1250_FUSE_MAX_SPLITK = max(
-    (key[4] for key in GFX1250_SPLITK_FUSE_KID_OF), default=0
-)
+GFX1250_FUSE_MAX_SPLITK = max((key[4] for key in GFX1250_SPLITK_FUSE_KID_OF), default=0)
 
 
 def _gfx1250_fuse_kids_for_tile(M, N, K, cu_num, bm, bn, bk):
@@ -215,12 +214,8 @@ def _gfx1250_fuse_kids_for_tile(M, N, K, cu_num, bm, bn, bk):
     num_tiles_m = _ceil_div(M, bm)
     base_wg = num_tiles_n * num_tiles_m
     k_steps = _ceil_div(K, bk)
-    valid_n_cluster = [
-        nc for nc in range(1, 6) if num_tiles_n % nc == 0
-    ]
-    selected_n_cluster = (
-        sorted({1, max(valid_n_cluster)}) if valid_n_cluster else [1]
-    )
+    valid_n_cluster = [nc for nc in range(1, 6) if num_tiles_n % nc == 0]
+    selected_n_cluster = sorted({1, max(valid_n_cluster)}) if valid_n_cluster else [1]
 
     out = []
     for n_cluster in selected_n_cluster:
@@ -233,9 +228,7 @@ def _gfx1250_fuse_kids_for_tile(M, N, K, cu_num, bm, bn, bk):
             # family's registry range.
             valid_split_k = [
                 split_k
-                for split_k in range(
-                    2, min(k_steps, GFX1250_FUSE_MAX_SPLITK) + 1
-                )
+                for split_k in range(2, min(k_steps, GFX1250_FUSE_MAX_SPLITK) + 1)
                 if (
                     bm,
                     bn,
@@ -250,9 +243,7 @@ def _gfx1250_fuse_kids_for_tile(M, N, K, cu_num, bm, bn, bk):
             valid_split_k.sort(
                 key=lambda sk: (_gfx1250_occ_cost(base_wg * sk, cu_num), sk)
             )
-            for split_k in sorted(
-                valid_split_k[:GFX1250_FUSE_TOP_SPLITK]
-            ):
+            for split_k in sorted(valid_split_k[:GFX1250_FUSE_TOP_SPLITK]):
                 kid = GFX1250_SPLITK_FUSE_KID_OF.get(
                     (
                         bm,
@@ -283,9 +274,7 @@ def _gfx1250_fuse_candidates(M, N, K, cu_num, top_tiles=GFX1250_TOP_TILES):
         return min(
             (
                 _gfx1250_occ_cost(base * split_k, cu_num)
-                for split_k in range(
-                    2, min(GFX1250_FUSE_MAX_SPLITK, k_steps) + 1
-                )
+                for split_k in range(2, min(GFX1250_FUSE_MAX_SPLITK, k_steps) + 1)
             ),
             default=float("inf"),
         )
@@ -525,9 +514,8 @@ def kid_rejects_shape(k_inst, M, N, K):
 
     # The exact-N bf16-workspace restriction belongs only to the gfx942
     # reducer. gfx1250 #4246 has a different bf16 reducer and accepts padded N.
-    if (
-        getattr(k_inst, "arch_prefix", "") == "gfx942"
-        and _kid_uses_bf16_workspace(k_inst)
+    if getattr(k_inst, "arch_prefix", "") == "gfx942" and _kid_uses_bf16_workspace(
+        k_inst
     ):
         padded_N = _ceil_div(N, k_inst.B_N) * k_inst.B_N
         if loops < 2 or K % B_K != 0 or padded_N != N:
@@ -800,9 +788,7 @@ def candidate_kids_for_shape(M, N, K, bias, cu_num):
         from aiter.jit.utils.chip_info import get_gfx_runtime
 
         if get_gfx_runtime().lower() == "gfx1250":
-            return _gfx1250_select_candidates(
-                M, N, K, cu_num, include_fused=not bias
-            )
+            return _gfx1250_select_candidates(M, N, K, cu_num, include_fused=not bias)
     except Exception:  # noqa: BLE001,S110
         pass
 

@@ -30,13 +30,10 @@ def _validate_a16w16_public_contract(
     """Validate A16W16-only options shared by both public routers."""
     if input_dtype != weight_dtype:
         raise ValueError(
-            f"OPUS requires matching XQ/WQ dtypes; got "
-            f"{input_dtype}/{weight_dtype}"
+            f"OPUS requires matching XQ/WQ dtypes; got " f"{input_dtype}/{weight_dtype}"
         )
     if input_dtype != torch.bfloat16:
-        raise ValueError(
-            f"OPUS kid {kid} requires bf16 XQ/WQ; got {input_dtype}"
-        )
+        raise ValueError(f"OPUS kid {kid} requires bf16 XQ/WQ; got {input_dtype}")
     if layout != "plain":
         raise ValueError(
             f"OPUS kid {kid} belongs to family a16w16 and requires "
@@ -46,9 +43,7 @@ def _validate_a16w16_public_contract(
         raise ValueError("OPUS a16w16 does not accept x_scale/w_scale")
     arch = (instance.arch_prefix or "gfx950").lower()
     if get_kernel_instance(arch, "a16w16", kid, output_dtype) is None:
-        raise ValueError(
-            f"OPUS kid {kid} does not support Y.dtype={output_dtype}"
-        )
+        raise ValueError(f"OPUS kid {kid} does not support Y.dtype={output_dtype}")
 
 
 @lru_cache(maxsize=4096)
@@ -325,4 +320,4 @@ def opus_bmm(
     )
 
 
-__all__ = ["opus_gemm", "opus_bmm"]
+__all__ = ["opus_bmm", "opus_gemm"]

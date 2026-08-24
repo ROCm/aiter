@@ -912,9 +912,8 @@ void
 #endif // launcher only on regular host pass
 """
     Path(os.path.join(cg.impl_path, f"{k.name}.cuh")).write_text(INSTANCE_IMPL)
-    record_one_instantiation(
-        cg, k, kernel_func, kargs_name, A8W8_BLOCKSCALE_HOST_EXTRA
-    )
+    record_one_instantiation(cg, k, kernel_func, kargs_name, A8W8_BLOCKSCALE_HOST_EXTRA)
+
 
 def gen_noscale_instance_gfx950(
     cg,
@@ -1396,8 +1395,8 @@ def gen_flatmm_splitk_instance(
     **_unused,
 ):
     """Emit a gfx950 split-K launcher using a caller-owned typed workspace."""
-    workspace_dtype, _workspace_ptr_type, workspace_aiter_dtype = (
-        splitk_workspace_type(k)
+    workspace_dtype, _workspace_ptr_type, workspace_aiter_dtype = splitk_workspace_type(
+        k
     )
     if workspace_dtype != "fp32_t":
         raise ValueError(
@@ -2397,7 +2396,7 @@ _BMM_MOUTER_TAIL = r"""  kargs.split_k = m_per_wg;
 
 _BMM_MOUTER_LAUNCHER_BODY = (
     _BMM_SPEC_SIG.replace("@@SPLITK_ARG@@", "splitK")
-    + "  AITER_CHECK(splitK == 1, \"@@NAME@@ requires splitK == 1\");\n"
+    + '  AITER_CHECK(splitK == 1, "@@NAME@@ requires splitK == 1");\n'
     + _BMM_MOUTER_CHECKS
     + _BMM_MOUTER_KARGS
     + "  const int m_per_wg = (num_tiles_m >= 16) ? 2 : 1;\n"
@@ -2408,7 +2407,7 @@ _BMM_MOUTER_LAUNCHER_BODY = (
 # num_tiles_m]); reuses the same mouter kernel.
 _BMM_MOUTER_TUNABLE_LAUNCHER_BODY = (
     _BMM_SPEC_SIG.replace("@@SPLITK_ARG@@", "splitK")
-    + "  AITER_CHECK(splitK >= 1, \"@@NAME@@ requires splitK >= 1\");\n"
+    + '  AITER_CHECK(splitK >= 1, "@@NAME@@ requires splitK >= 1");\n'
     + _BMM_MOUTER_CHECKS
     + _BMM_MOUTER_KARGS
     + "  int m_per_wg = splitK;\n"

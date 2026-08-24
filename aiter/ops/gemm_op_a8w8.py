@@ -597,17 +597,13 @@ def gemm_a8w8(
         if bias is not None:
             raise ValueError("OPUS no-scale gemm_a8w8 does not support bias")
         if dtype != dtypes.fp32:
-            raise ValueError(
-                "OPUS no-scale gemm_a8w8 requires dtype=torch.float32"
-            )
+            raise ValueError("OPUS no-scale gemm_a8w8 requires dtype=torch.float32")
         if splitK not in (None, 0):
             raise ValueError("OPUS no-scale gemm_a8w8 does not support splitK")
 
         from aiter.ops.opus import opus_gemm
 
-        Y = torch.empty(
-            XQ.shape[0], WQ.shape[0], dtype=dtypes.fp32, device=XQ.device
-        )
+        Y = torch.empty(XQ.shape[0], WQ.shape[0], dtype=dtypes.fp32, device=XQ.device)
         return opus_gemm(
             XQ,
             WQ,
@@ -980,11 +976,7 @@ def _filter_blockscale_bpreshuffle_config_for_dtype(config, dtype):
     """Drop a shape-only tuned row when its backend cannot write this dtype."""
     # The tuned CSV has no output-dtype key.  OPUS bpreshuffle currently writes
     # BF16 only, so its BF16 winner must not capture an FP16 production call.
-    if (
-        config is not None
-        and config["libtype"] == "opus"
-        and dtype != dtypes.bf16
-    ):
+    if config is not None and config["libtype"] == "opus" and dtype != dtypes.bf16:
         return None
     return config
 

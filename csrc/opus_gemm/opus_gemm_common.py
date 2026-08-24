@@ -204,9 +204,7 @@ class OpusGemmInstance:
             parts.insert(tag_at, "skfuse")
             parts.append(f"n{self.fuse_m_cluster}s{self.fuse_split_k}")
             parts.append(
-                "wsf32"
-                if self.splitk_workspace_dtype == "fp32_t"
-                else "wsbf16"
+                "wsf32" if self.splitk_workspace_dtype == "fp32_t" else "wsbf16"
             )
             parts.append(f"p{self.num_slots}w{self.wg_per_cu}")
         elif self.name_tag:
@@ -225,6 +223,7 @@ class OpusGemmInstance:
         ):
             parts.append(f"cA{self.cachectl_a}cB{self.cachectl_b}")
         return "_".join(parts)
+
     @property
     def m_align(self) -> int:
         """M multiple enforced by the generated launcher (1 means tail-safe)."""
@@ -1787,8 +1786,7 @@ def get_kernel_instance(
             # BF16 only.  Other A16 workspace reducers support BF16/FP32 Y.
             allowed = (
                 {"bf16_t"}
-                if arch == "gfx942"
-                and instance.splitk_workspace_dtype == "bf16_t"
+                if arch == "gfx942" and instance.splitk_workspace_dtype == "bf16_t"
                 else {"bf16_t", "fp32_t"}
             )
             output_compatible = dtype in allowed

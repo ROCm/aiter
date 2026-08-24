@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from functools import lru_cache
+from functools import cache, lru_cache
 
 import torch
 
@@ -104,9 +104,7 @@ def _plan_gfx942_split_k(
         tiles_mn = max(1, tiles_mn)
         target_wg = (2 * cu_num) if instance.kernel_tag.endswith("_p1") else cu_num
         workspace_capacity = (target_wg + tiles_mn - 1) // tiles_mn
-        workspace_capacity = min(
-            GFX942_MAX_AUTO_SPLIT_K, max(1, workspace_capacity)
-        )
+        workspace_capacity = min(GFX942_MAX_AUTO_SPLIT_K, max(1, workspace_capacity))
 
     total_iters = (K + instance.B_K - 1) // instance.B_K
     if total_iters < GFX942_MIN_ITERS_PER_SPLIT:
@@ -120,9 +118,7 @@ def _plan_gfx942_split_k(
     while abi_split_k > 1:
         iters_full = (total_iters + abi_split_k - 1) // abi_split_k
         last_loops = total_iters - (abi_split_k - 1) * iters_full
-        parity_ok = not require_even or (
-            iters_full % 2 == 0 and last_loops % 2 == 0
-        )
+        parity_ok = not require_even or (iters_full % 2 == 0 and last_loops % 2 == 0)
         if (
             iters_full >= GFX942_MIN_ITERS_PER_SPLIT
             and last_loops >= GFX942_MIN_ITERS_PER_SPLIT
@@ -167,9 +163,7 @@ def _build_a16w16_workspace_spec(
 
     is_fused = instance.kernel_tag == _GFX1250_FUSED_SPLITK_TAG
     split_k = (
-        int(instance.fuse_split_k)
-        if is_fused
-        else int(workspace_capacity_split_k)
+        int(instance.fuse_split_k) if is_fused else int(workspace_capacity_split_k)
     )
     if split_k <= 0:
         raise ValueError(
@@ -271,17 +265,14 @@ def _build_a16w16_launch_plan(
         ) from exc
     if requested_split_k < 0:
         raise ValueError(
-            "OPUS a16w16 split_k must be non-negative, "
-            f"got {requested_split_k}"
+            "OPUS a16w16 split_k must be non-negative, " f"got {requested_split_k}"
         )
     if input_dtype != torch.bfloat16:
         raise ValueError(
             f"OPUS a16w16 requires bf16 XQ/WQ, got input dtype {input_dtype}"
         )
 
-    instance = get_kernel_instance(
-        registry_arch, "a16w16", resolved_kid, output_dtype
-    )
+    instance = get_kernel_instance(registry_arch, "a16w16", resolved_kid, output_dtype)
     if instance is None:
         if get_kernel_instance(registry_arch, "a16w16", resolved_kid) is None:
             raise ValueError(
@@ -289,8 +280,7 @@ def _build_a16w16_launch_plan(
                 f"runtime arch {registry_arch}"
             )
         raise ValueError(
-            f"OPUS kid {resolved_kid} does not support output dtype "
-            f"{output_dtype}"
+            f"OPUS kid {resolved_kid} does not support output dtype " f"{output_dtype}"
         )
 
     needs_workspace = resolved_kid in SPLITK_KIDS
@@ -445,6 +435,8 @@ _FP8_DTYPES = frozenset(
     )
     if dtype is not None
 )
+
+
 @dataclass(frozen=True)
 class A8W8MxscaleBMMPlan:
     """One resolved MXFP8 BMM launch and its optional workspace."""
@@ -479,13 +471,10 @@ def _validate_a8w8_public_contract(
 
     if input_dtype != weight_dtype:
         raise ValueError(
-            f"OPUS requires matching XQ/WQ dtypes; got "
-            f"{input_dtype}/{weight_dtype}"
+            f"OPUS requires matching XQ/WQ dtypes; got " f"{input_dtype}/{weight_dtype}"
         )
     if input_dtype not in _FP8_DTYPES:
-        raise ValueError(
-            f"OPUS kid {kid} requires FP8 XQ/WQ; got {input_dtype}"
-        )
+        raise ValueError(f"OPUS kid {kid} requires FP8 XQ/WQ; got {input_dtype}")
 
     if family == _A8W8_MXSCALE_BMM_FAMILY:
         if output_dtype not in (torch.bfloat16, torch.float32):
@@ -494,9 +483,7 @@ def _validate_a8w8_public_contract(
             )
     else:
         expected_output_dtype = (
-            torch.bfloat16
-            if family == _A8W8_BPRESHUFFLE_FAMILY
-            else torch.float32
+            torch.bfloat16 if family == _A8W8_BPRESHUFFLE_FAMILY else torch.float32
         )
         if output_dtype != expected_output_dtype:
             raise ValueError(
@@ -519,9 +506,7 @@ def _validate_a8w8_public_contract(
         if not has_x_scale:
             raise ValueError("OPUS a8w8_mxscale_bmm requires x_scale and w_scale")
         if split_k == 0 and has_workspace:
-            raise ValueError(
-                "OPUS a8w8_mxscale_bmm split_k=0 does not use workspace"
-            )
+            raise ValueError("OPUS a8w8_mxscale_bmm split_k=0 does not use workspace")
         return family
 
     if has_workspace:
@@ -536,7 +521,7 @@ def _validate_a8w8_public_contract(
     return family
 
 
-@lru_cache(maxsize=None)
+@cache
 def _require_registered_kid_cached(
     arch: str,
     family: str,
@@ -565,9 +550,7 @@ def _require_registered_kid(
         resolved_kid = int(kid)
     except (TypeError, ValueError) as exc:
         raise ValueError(f"OPUS {family} kid must be an integer, got {kid!r}") from exc
-    return _require_registered_kid_cached(
-        arch, family, resolved_kid, output_dtype
-    )
+    return _require_registered_kid_cached(arch, family, resolved_kid, output_dtype)
 
 
 def _build_a8w8_mxscale_bmm_plan(
@@ -609,8 +592,7 @@ def _build_a8w8_mxscale_bmm_plan(
     m_align = max(1, int(instance.m_align))
     if M % m_align:
         raise ValueError(
-            f"OPUS BMM kid {resolved_kid} requires M % {m_align} == 0; "
-            f"got M={M}"
+            f"OPUS BMM kid {resolved_kid} requires M % {m_align} == 0; " f"got M={M}"
         )
     if instance.direct_only and abi_split_k != 1:
         raise ValueError(f"OPUS BMM kid {resolved_kid} requires split_k <= 1")
@@ -672,7 +654,7 @@ def _get_cached_a8w8_mxscale_bmm_plan(
 
 
 __all__ = [
-    "A16W16LaunchPlan",
     "A8W8MxscaleBMMPlan",
+    "A16W16LaunchPlan",
     "WorkspaceSpec",
 ]

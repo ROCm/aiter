@@ -19,7 +19,6 @@ from ..jit.utils.chip_info import get_gfx_runtime as get_gfx
 from ..jit.utils.torch_guard import torch_compile_guard
 from ..utility import dtypes
 from .opus.policy import (
-    lookup_mxscale_bmm_config,
     resolve_a8w8_mxscale_bmm_plan as _resolve_a8w8_mxscale_bmm_plan,
 )
 
@@ -166,7 +165,10 @@ def _get_mxscale_bmm_launchers():
 
     return _opus_gemm_a8w8_mxscale_bmm_launch_raw, opus_bmm
 
-_MXSCALE_BMM_LAUNCH_PLANS: dict[tuple[int, int, int, int], tuple[object, object, int, int]] = {}
+
+_MXSCALE_BMM_LAUNCH_PLANS: dict[
+    tuple[int, int, int, int], tuple[object, object, int, int]
+] = {}
 
 
 def _batched_gemm_a8w8_mxscale_impl(
@@ -248,9 +250,7 @@ def batched_gemm_a8w8_mxscale(
     dtype: torch.dtype = dtypes.bf16,
 ) -> Tensor:
     """Run gfx950 E8M0 MXFP8 BMM and return token-major ``[M,G,N]``."""
-    return _batched_gemm_a8w8_mxscale_impl(
-        x, wo_a, x_scale, w_scale, dtype=dtype
-    )
+    return _batched_gemm_a8w8_mxscale_impl(x, wo_a, x_scale, w_scale, dtype=dtype)
 
 
 def gen_batched_gemm_a8w8_tune_fake_tensors(

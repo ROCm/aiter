@@ -168,7 +168,7 @@ def _launch_a8w8_backend(
         if workspace is not None or split_k != 0:
             raise RuntimeError("A8W8 no-scale backend received split-K state")
         _opus_gemm_a8w8_launch_raw(XQ, WQ, Y, kid)
-        return None
+        return
 
     if x_scale is None or w_scale is None:
         raise RuntimeError(f"A8W8 backend family {family!r} requires both scales")
@@ -184,7 +184,7 @@ def _launch_a8w8_backend(
             w_scale,
             kid,
         )
-        return None
+        return
 
     if family == _A8W8_BPRESHUFFLE_FAMILY:
         if workspace is not None or split_k != 0:
@@ -199,7 +199,7 @@ def _launch_a8w8_backend(
             Y,
             kid,
         )
-        return None
+        return
 
     if family == _A8W8_MXSCALE_BMM_FAMILY:
         _opus_gemm_a8w8_mxscale_bmm_launch_raw(
@@ -212,7 +212,7 @@ def _launch_a8w8_backend(
             kid,
             split_k,
         )
-        return None
+        return
 
     raise RuntimeError(f"unsupported A8W8 backend family {family!r}")
 
@@ -234,8 +234,7 @@ def _launch_a8w8_gemm(
     if instance is None:
         if XQ.dim() != 2 or WQ.dim() != 2 or Y.dim() != 2:
             raise ValueError(
-                "opus_gemm A8W8 expects logical 2D XQ/WQ/Y; "
-                "this family is GEMM-only"
+                "opus_gemm A8W8 expects logical 2D XQ/WQ/Y; " "this family is GEMM-only"
             )
         arch = route_arch or _device_arch(XQ.device)
         resolved_kid = _require_registered_kid(
@@ -272,9 +271,7 @@ def _launch_a8w8_blockscale_gemm(
     """Launch logical 2D blockscale A8W8 GEMM with 2D scales."""
     resolved_kid = kid
     if instance is None:
-        if any(
-            tensor.dim() != 2 for tensor in (XQ, WQ, Y, x_scale, w_scale)
-        ):
+        if any(tensor.dim() != 2 for tensor in (XQ, WQ, Y, x_scale, w_scale)):
             raise ValueError(
                 "opus_gemm A8W8 blockscale expects logical 2D "
                 "XQ/WQ/Y/x_scale/w_scale; this family is GEMM-only"
@@ -320,9 +317,7 @@ def _launch_a8w8_blockscale_bpreshuffle_gemm(
     """
     resolved_kid = kid
     if instance is None:
-        if any(
-            tensor.dim() != 2 for tensor in (XQ, WQ, Y, x_scale, w_scale)
-        ):
+        if any(tensor.dim() != 2 for tensor in (XQ, WQ, Y, x_scale, w_scale)):
             raise ValueError(
                 "opus_gemm A8W8 blockscale bpreshuffle expects logical 2D "
                 "XQ/WQ/Y/x_scale/w_scale; this family is GEMM-only"
@@ -382,9 +377,7 @@ def _validate_a8w8_mxscale_bmm_tensors(
     if min(M, batch, N, K) <= 0:
         raise ValueError(f"{entry}: M, batch, N and K must be positive")
     if N % 128 or K % 128:
-        raise ValueError(
-            f"{entry}: N and K must be multiples of 128; got N={N}, K={K}"
-        )
+        raise ValueError(f"{entry}: N and K must be multiples of 128; got N={N}, K={K}")
     if (w_batch, w_K) != (batch, K):
         raise ValueError(
             f"{entry}: WQ must have shape [{batch},N,{K}], got {tuple(WQ.shape)}"
@@ -428,14 +421,12 @@ def _launch_a8w8_mxscale_bmm(
     kernels retain their established M-major ``[M,B,*]`` activation/output
     ABI; transpose views bridge the two contracts without copying storage.
     """
-    if instance is None:
-        if any(
-            tensor.dim() != 3 for tensor in (XQ, WQ, Y, x_scale, w_scale)
-        ):
-            raise ValueError(
-                "opus_bmm A8W8 mxscale expects batch-first 3D "
-                "XQ/WQ/Y/x_scale/w_scale"
-            )
+    if instance is None and any(
+        tensor.dim() != 3 for tensor in (XQ, WQ, Y, x_scale, w_scale)
+    ):
+        raise ValueError(
+            "opus_bmm A8W8 mxscale expects batch-first 3D " "XQ/WQ/Y/x_scale/w_scale"
+        )
     launch_x = XQ.transpose(0, 1)
     launch_y = Y.transpose(0, 1)
     launch_x_scale = x_scale.transpose(0, 1)

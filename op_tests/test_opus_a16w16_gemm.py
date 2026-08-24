@@ -11,7 +11,6 @@ Usage:
 """
 
 import argparse
-import os
 import sys
 
 import pytest
@@ -24,47 +23,6 @@ _arch_ok, _detected_gfx = _detect_arch({"gfx950", "gfx942", "gfx1250"})
 
 from aiter.ops.opus import opus_bmm, opus_gemm
 from aiter.test_common import checkAllclose, run_perftest
-
-try:
-    from aiter.ops.opus import opus_gemm_workspace_init
-except Exception:  # noqa: BLE001
-    opus_gemm_workspace_init = None
-
-
-def _graph_capture_stream():
-    """The stream torch.cuda.graph captures on when no `stream=` is passed.
-
-    torch lazily creates a single process-global `default_capture_stream`; we
-    mirror that here so the opus split-K workspace is registered/grown on the
-    exact stream a later `with torch.cuda.graph(g):` (as used by run_perftest's
-    graph mode) will capture on.
-    """
-    g = torch.cuda.graphs.graph
-    if getattr(g, "default_capture_stream", None) is None:
-        g.default_capture_stream = torch.cuda.Stream()
-    return g.default_capture_stream
-
-
-def _prewarm_opus_graph_workspace(A, B, out_dtype):
-    """Eagerly register + size the opus split-K workspace on the capture stream.
-
-    opus split-K kernels keep a per-stream fp32 workspace backed by raw
-    hipMalloc; growing it is stream-capture-illegal, so it must be registered
-    and grown to the shape's size *eagerly* before HIP graph capture. Without
-    this, capturing an opus split-K shape aborts with "splitk workspace not
-    initialized for the current CUDA stream". No-op on archs without the
-    registry (opus_gemm_workspace_init unavailable) or while already capturing.
-    """
-    if opus_gemm_workspace_init is None:
-        return
-    if torch.cuda.is_current_stream_capturing():
-        return
-    s = _graph_capture_stream()
-    with torch.cuda.stream(s):
-        opus_gemm_workspace_init()
-        # Warm the exact shape so the workspace buffer reaches its final size.
-        _ = gemm_a16w16_opus(A, B, None, out_dtype)
-    s.synchronize()
 
 
 def _torch_ref(A: torch.Tensor, B: torch.Tensor, out_dtype):
@@ -126,7 +84,9 @@ def load_shapes_from_csv(csv_path, *, default_kid=None, default_split_k=0):
     import pandas as pd
 
     df = pd.read_csv(csv_path)
-    kid_column = next((name for name in ("kernelId", "solidx", "kid") if name in df), None)
+    kid_column = next(
+        (name for name in ("kernelId", "solidx", "kid") if name in df), None
+    )
     split_column = next((name for name in ("splitK", "split_k") if name in df), None)
     if kid_column is None and default_kid is None:
         raise ValueError(
@@ -140,7 +100,11 @@ def load_shapes_from_csv(csv_path, *, default_kid=None, default_split_k=0):
                 int(row["N"]),
                 int(row["K"]),
                 int(default_kid if default_kid is not None else row[kid_column]),
-                int(row[split_column]) if split_column is not None else int(default_split_k),
+                (
+                    int(row[split_column])
+                    if split_column is not None
+                    else int(default_split_k)
+                ),
             )
         )
     return list(dict.fromkeys(rows))
@@ -153,9 +117,7 @@ def run_a16w16_csv_sweep(
     kid: int | None = None,
     split_k: int = 0,
 ):
-    shapes = load_shapes_from_csv(
-        csv_path, default_kid=kid, default_split_k=split_k
-    )
+    shapes = load_shapes_from_csv(csv_path, default_kid=kid, default_split_k=split_k)
     print(f"\n{'=' * 80}")
     print(f"a16w16 sweep from {csv_path}: {len(shapes)} unique shapes, batch={batch}")
     print("=" * 80)
@@ -168,9 +130,7 @@ def run_a16w16_csv_sweep(
         try:
             A = torch.randn(batch, M, K, device="cuda", dtype=torch.bfloat16)
             B = _make_b(batch, N, K)
-            Y = torch.empty(
-                (batch, M, N), device="cuda", dtype=torch.bfloat16
-            )
+            Y = torch.empty((batch, M, N), device="cuda", dtype=torch.bfloat16)
             ref = _torch_ref(A, B, torch.bfloat16)
             Y, us = run_perftest(
                 opus_bmm,
@@ -278,9 +238,7 @@ def test_gfx950_mono_fp32_overwrites_poisoned_output(kid):
     torch.manual_seed(0x950000 + kid)
     A = torch.randn((1, 192, 128), device="cuda", dtype=torch.bfloat16)
     B = torch.randn((1, 256, 128), device="cuda", dtype=torch.bfloat16)
-    out = torch.full(
-        (1, 192, 256), 12345.0, device="cuda", dtype=torch.float32
-    )
+    out = torch.full((1, 192, 256), 12345.0, device="cuda", dtype=torch.float32)
 
     actual = opus_bmm(
         A,
