@@ -636,7 +636,8 @@
     "module_moe_topk": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/moe_topk_pybind.cu'",
-            "f'{AITER_CSRC_DIR}/kernels/topk_gating_kernels.cu'"
+            "f'{AITER_CSRC_DIR}/kernels/topk_gating_kernels.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/topk_gating'"
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [],
@@ -1312,6 +1313,21 @@
             "f'{AITER_META_DIR}/hsa/codegen.py -m fmha_v3_fwd --output_dir {{}}'"
         ]
     },
+    "module_fmha_v4_fwd": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_mha_v4_fwd.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/mha_v4_quant.cu'",
+            "f'{AITER_CSRC_DIR}/pybind/mha_v4_fwd_pybind.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": [
+            "f'{AITER_META_DIR}/hsa/codegen.py -m fmha_v4_fwd --output_dir {{}}'"
+        ]
+    },
     "module_vsa_sparse_attention": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/py_itfs_ck/vsa_sparse_attention_kernels.cu'",
@@ -1573,7 +1589,7 @@
             "'-U__CUDA_NO_HALF_CONVERSIONS__'",
             "'-ftemplate-depth=1024'"
         ],
-        "extra_ldflags": "None",
+        "extra_ldflags": "['-lrocblas']",
         "extra_include": [
             "f'{AITER_GRADLIB_DIR}/include/'"
         ],
@@ -1591,7 +1607,7 @@
             "'-ftemplate-depth=1024'",
             "'-DENABLE_TORCH_FP8' if hasattr(torch, 'float8_e4m3fnuz') else '' "
         ],
-        "extra_ldflags": "None",
+        "extra_ldflags": "['-lhipblaslt', '-lhipblas']",
         "extra_include": [
             "f'{AITER_GRADLIB_DIR}/include/'"
         ],
@@ -1684,8 +1700,24 @@
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/mla_ds32_pybind.cu'",
             "f'{AITER_CSRC_DIR}/kernels/mla/ds32_decode_fwd.cu'",
-            "f'{AITER_CSRC_DIR}/kernels/mla/ds32/dsa_v32_splitkv.hpp'",
-            "f'{AITER_CSRC_DIR}/kernels/mla/ds32/defs.h'"
+            "f'{AITER_CSRC_DIR}/kernels/mla/opus/dsa_v32_splitkv.hpp'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/opus/defs.h'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [
+            "'-ffast-math'"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    },
+    "module_opus_mla": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/kernels/mla/mla_decode_fwd_opus.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/opus/mla_decode_fwd_16mx8_32nx1_fp8fp8_ps_opus.hpp'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/opus/mla_global_load.hpp'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/opus/mla_fp8fp8_def.h'"
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [

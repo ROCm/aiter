@@ -1410,8 +1410,8 @@ namespace py = pybind11;
     m.def("moe_sum", &aiter::moe_sum, "moe_sum(Tensor! input, Tensor output) -> ()");
 
 #define MOE_TOPK_PYBIND                                      \
-    m.def("topk_softplus",                                   \
-          &aiter::topk_softplus,                             \
+    m.def("topk_gating",                                     \
+          &aiter::topk_gating,                               \
           py::arg("topk_weights"),                           \
           py::arg("topk_indices"),                           \
           py::arg("gating_output"),                          \
@@ -1509,6 +1509,7 @@ namespace py = pybind11;
           py::arg("out"),                           \
           py::arg("causal"),                        \
           py::arg("softmax_scale"),                 \
+          py::arg("lse")            = std::nullopt, \
           py::arg("seqstart_q")     = std::nullopt, \
           py::arg("seqstart_k")     = std::nullopt, \
           py::arg("seqstart_q_pad") = std::nullopt, \
@@ -2124,7 +2125,7 @@ namespace py = pybind11;
           py::arg("sin_cache"),                        \
           py::arg("num_groups"),                       \
           py::arg("quant_group_size") = 128,           \
-          py::arg("scale_shuffle")    = false);
+          py::arg("scale_layout")     = 0);
 
 #define SMOOTHQUANT_PYBIND                      \
     m.def("smoothquant_fwd", &smoothquant_fwd); \
@@ -2404,17 +2405,17 @@ namespace py = pybind11;
           py::arg("epsilon"),                \
           py::arg("gemma_norm") = false);    \
 
-#define GATED_RMSNORM_QUANT_PYBIND                   \
-    m.def("gated_rmsnorm_fp8_group_quant",           \
-          &aiter::gated_rmsnorm_fp8_group_quant,     \
-          py::arg("out"),                            \
-          py::arg("scale"),                          \
-          py::arg("x"),                              \
-          py::arg("z"),                              \
-          py::arg("weight"),                         \
-          py::arg("epsilon"),                        \
-          py::arg("group_size"),                     \
-          py::arg("transpose_scale") = false,        \
+#define GATED_RMSNORM_QUANT_PYBIND                         \
+    m.def("gated_rmsnorm_fp8_group_quant",                 \
+          &aiter::gated_rmsnorm_fp8_group_quant,           \
+          py::arg("out"),                                  \
+          py::arg("scale"),                                \
+          py::arg("x"),                                    \
+          py::arg("z"),                                    \
+          py::arg("weight"),                               \
+          py::arg("epsilon"),                              \
+          py::arg("group_size"),                           \
+          py::arg("transpose_scale") = false,              \
           "Fused Gated RMSNorm + FP8 Group Quantization"); \
     m.def("gated_rmsnorm_fp8_per_token_quant",             \
           &aiter::gated_rmsnorm_fp8_per_token_quant,       \
@@ -2539,7 +2540,10 @@ namespace py = pybind11;
           py::arg("q"),                                                     \
           py::arg("k"),                                                     \
           py::arg("v"),                                                     \
-          py::arg("out"),                                                   \
+          py::arg("o"),                                                     \
+          py::arg("lse"),                                                   \
+          py::arg("scratch_o"),                                            \
+          py::arg("scratch_lse"),                                          \
           py::arg("softmax_scale"),                                         \
           py::arg("causal"),                                                \
           py::arg("return_lse"),                                            \
@@ -2636,6 +2640,7 @@ namespace py = pybind11;
           py::arg("m_indices"),               \
           py::arg("bf16_zero_out"),           \
           py::arg("bf16_zero_workspace"),     \
+          py::arg("sort3stage_ws"),           \
           py::arg("M_logical"),               \
           py::arg("NE"),                      \
           py::arg("TOPK"),                    \

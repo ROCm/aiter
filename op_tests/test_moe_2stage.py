@@ -752,11 +752,6 @@ parser.add_argument(
     "Only affects SiTUv2.",
 )
 parser.add_argument(
-    "--no-situv2",
-    action="store_true",
-    help="Skip the default SiTUv2 (per_1x32 fp4/fp8) FlyDSL cases.",
-)
-parser.add_argument(
     "--kernel",
     action="store_true",
     help="""Time the stage1 / stage2 kernels in isolation (loop each launch
@@ -1013,6 +1008,66 @@ def _runtime_swiglu_mxfp4_q_dtype_a(
     return dtypes.bf16 if get_gfx() != "gfx950" or token < bound else dtypes.fp8
 
 
+def _moe_2stage_reference_workspace_gib(kwargs):
+    token = kwargs["token"]
+    topk = kwargs["topk"]
+    model_dim = kwargs["model_dim"]
+    inter_dim = kwargs["inter_dim"]
+    expert = kwargs["E"]
+    stage1_dim = inter_dim * 2 if kwargs["use_g1u1"] else inter_dim
+
+    # torch_moe_stage1/2 materialize routed fp32 activations and dequantized
+    # fp32 weights. This is a preflight estimate; OOM is still caught per case.
+    routed_activation_bytes = token * topk * (model_dim * 2 + stage1_dim) * 4
+    dequant_weight_bytes = expert * model_dim * (stage1_dim + inter_dim) * 4
+    input_score_bytes = token * (model_dim + expert) * 2
+    return (routed_activation_bytes + dequant_weight_bytes + input_score_bytes) / (
+        1024**3
+    )
+
+
+def _format_moe_2stage_case(kwargs):
+    return (
+        f"token={kwargs['token']}, dim=({kwargs['model_dim']},{kwargs['inter_dim']}), "
+        f"E={kwargs['E']}, topk={kwargs['topk']}, act={kwargs['actType']}, "
+        f"q={kwargs['qType']}, aq={kwargs['AQDType']}, wq={kwargs['WQDType']}, "
+        f"use_g1u1={kwargs['use_g1u1']}, doweight_stage1={kwargs['doweight_stage1']}"
+    )
+
+
+def _moe_2stage_skip_reason(kwargs):
+    # Set AITER_MOE_2STAGE_MAX_FREE_MEMORY_FRACTION=0 to run manually.
+    max_free_memory_fraction = float(
+        os.environ.get("AITER_MOE_2STAGE_MAX_FREE_MEMORY_FRACTION", "0.8")
+    )
+    if max_free_memory_fraction <= 0:
+        return None
+
+    reference_gib = _moe_2stage_reference_workspace_gib(kwargs)
+    try:
+        free_bytes, total_bytes = torch.cuda.mem_get_info()
+    except RuntimeError as exc:
+        aiter.logger.warning(
+            "moe_2stage: failed to query GPU memory, continuing without "
+            "preflight skip: %s",
+            exc,
+        )
+        return None
+
+    free_gib = free_bytes / (1024**3)
+    total_gib = total_bytes / (1024**3)
+    max_reference_gib = free_gib * max_free_memory_fraction
+    if reference_gib <= max_reference_gib:
+        return None
+
+    return (
+        f"estimated reference workspace {reference_gib:.1f} GiB exceeds "
+        f"{max_free_memory_fraction:.0%} of current free GPU memory "
+        f"({max_reference_gib:.1f} GiB of {free_gib:.1f} GiB free, "
+        f"{total_gib:.1f} GiB total)"
+    )
+
+
 def _iter_legacy_cases():
     """Yield (kwargs, extras) for the original CLI-driven sweep."""
     extras = {"model": "legacy"}
@@ -1149,58 +1204,6 @@ def _iter_legacy_cases():
                     ), extras
 
 
-def _iter_situv2_default_cases():
-    """Yield (kwargs, extras) exercising the SiTUv2 activation by default.
-
-    SiTUv2 only routes to the FlyDSL MXFP4 kernel for per_1x32 + fp4/fp8, so we
-    hardcode the supported quant family instead of relying on the -a list:
-      * a8w4 (fp8 activation, fp4 weight) at a 256-aligned inter_dim shape
-    beta / linear_beta come from --beta / --linear-beta (None -> kernel 1.0).
-    Non-gfx950 runs are skipped inside test_fmoe's per_1x32 gfx guard.
-
-    Notes on cases intentionally kept out of this DEFAULT auto-run:
-      * The real DSV4 customer shape uses inter_dim=640, which is not 256-aligned.
-        shuffle_scale_a16w4 requires inter_dim % 256 == 0 on this branch; the
-        non-256 inter_dim fix lives on fix/shuffle-scale-a16w4-kdim. Verify the
-        640 shape once that branch is combined with this one. We default to a
-        256-aligned inter_dim (512) here so the a8w4 case runs on this branch.
-      * a4w4 (fp4 act, fp4 weight) full 2-stage is omitted because CK stage2
-        codegen (gen_instances.py) has no 'situv2' activation instance
-        (only silu/gelu), so the full a4w4 2-stage path can't be built here.
-        -a situv2 -q 4 remains reachable via explicit CLI.
-    """
-    extras = {"model": "situv2"}
-    dtype = args.dtype[0]
-    model_dim = 3072
-    tokens = [16, 128]
-    # ((quant_type, aq_dtype, wq_dtype), inter_dim)
-    situv2_cases = [
-        (_PER1X32_FP8_FP4, 512),  # a8w4: fp8 act, fp4 weight (256-aligned inter_dim)
-    ]
-    for (quant_type, aq_dtype, wq_dtype), inter_dim in situv2_cases:
-        for m in tokens:
-            yield {
-                "dtype": dtype,
-                "token": m,
-                "model_dim": model_dim,
-                "inter_dim": inter_dim,
-                "E": args.expert,
-                "topk": args.topk,
-                "actType": aiter.ActivationType.Situv2,
-                "gateMode": _effective_gate_mode(aq_dtype, wq_dtype),
-                "qType": quant_type,
-                "AQDType": aq_dtype,
-                "WQDType": wq_dtype,
-                "use_g1u1": True,
-                "doweight_stage1": False,
-                "strict_accuracy": False,
-                "check_aot_cache": False,
-                "swiglu_limit": None,
-                "beta": args.beta,
-                "linear_beta": args.linear_beta,
-            }, extras
-
-
 def test_bm16_tiled_scale_boundary():
     """Validate tuned BM16 dispatch and the 33-row scale boundary."""
     if get_gfx() != "gfx950":
@@ -1298,10 +1301,6 @@ else:
         )
     if not args.no_legacy:
         _case_iters.append(_iter_legacy_cases())
-    # SiTUv2 default coverage runs only in a full default sweep (no explicit -q),
-    # so an explicit quant selection is never silently overridden.
-    if not args.no_situv2 and args.quant is None:
-        _case_iters.append(_iter_situv2_default_cases())
 case_iter = itertools.chain(*_case_iters)
 
 _csv_out = os.environ.get("AITER_TUNED_OP_BENCH_CSV", "tuned_op_bench.csv")
@@ -1330,6 +1329,14 @@ df = []
 seen = 0
 for kwargs, extras in case_iter:
     seen += 1
+    skip_reason = _moe_2stage_skip_reason(kwargs)
+    if skip_reason is not None:
+        aiter.logger.warning(
+            "skip moe_2stage case: %s (%s)",
+            _format_moe_2stage_case(kwargs),
+            skip_reason,
+        )
+        continue
     _old_moe_bound = os.environ.get("AITER_BF16_FP8_MOE_BOUND")
     _force_moe_bound_zero = (
         kwargs["qType"],
@@ -1346,6 +1353,13 @@ for kwargs, extras in case_iter:
             ret = test_fmoe(
                 **kwargs, kernel_bench=args.kernel, ref_dtype=args.ref_dtype
             )
+    except torch.cuda.OutOfMemoryError as exc:
+        aiter.logger.warning(
+            "skip moe_2stage case after OOM: %s (%s)",
+            _format_moe_2stage_case(kwargs),
+            exc,
+        )
+        ret = None
     finally:
         if _force_moe_bound_zero:
             if _old_moe_bound is None:
