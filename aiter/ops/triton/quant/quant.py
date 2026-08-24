@@ -9,6 +9,7 @@ from aiter.ops.triton._gluon_kernels.gfx950.quant.quant import (
 )
 from aiter.ops.triton._gluon_kernels.gfx1250.quant.quant import (
     gluon_dynamic_mxfp4_quant_kernel_gfx1250,
+    gluon_dynamic_mxfp8_quant_kernel_gfx1250,
 )
 from aiter.ops.triton._triton_kernels.quant.quant import (
     _dynamic_mxfp4_quant_kernel,
@@ -322,27 +323,92 @@ def dynamic_mxfp8_quant(
         assert scale.shape == (M, Ns), f"scale shape {scale.shape} != ({M},{Ns})"
         assert scale.dtype == torch.uint8
 
-    BLOCK_SIZE_N = triton.next_power_of_2(K)
-    # Bound launch overhead on large token-head batches; the kernel loops rows by stride.
-    NUM_PRGMS = min(M, 32768)
-    grid = (NUM_PRGMS,)
+    # The gluon scaled_downcast_fp8 hw instruction only emits OCP e4m3fn
+    # (gl.float8e4nv), not the AMD e4m3fnuz variant -- fall back to the plain
+    # Triton kernel for any other arch/quant_dtype combination. gfx950 doesn't
+    # need a gluon mxfp8 path, so this is gfx1250-only. fp32 input is excluded:
+    # the TDM shared-memory descriptor's padding interval (in dwords) overflows
+    # for wide BLOCK_SIZE_N tiles at 4 bytes/element.
+    arch = arch_info.get_arch()
+    if (
+        arch == "gfx1250"
+        and x2d.dtype in (torch.bfloat16, torch.float16)
+        and quant_dtype == torch.float8_e4m3fn
+    ):
+        if M <= 32:
+            NUM_ITER = 1
+            BLOCK_SIZE_M = triton.next_power_of_2(M)
+            BLOCK_SIZE_N = 4096 // BLOCK_SIZE_M
+            NUM_WARPS = 4
+            NUM_STAGES = 1
+        else:
+            NUM_ITER = 2
+            BLOCK_SIZE_M = 64
+            BLOCK_SIZE_N = 64
+            NUM_WARPS = 4
+            NUM_STAGES = 2
 
-    _dynamic_mxfp8_quant_kernel[grid](
-        x2d,
-        y,
-        scale,
-        M,
-        K,
-        x2d.stride(0),
-        x2d.stride(1),
-        y.stride(0),
-        y.stride(1),
-        scale.stride(0),
-        scale.stride(1),
-        BLOCK_SIZE_N=BLOCK_SIZE_N,
-        QUANT_BLOCK_SIZE=_MXFP8_QUANT_BLOCK_SIZE,
-        NUM_PRGMS=NUM_PRGMS,
-    )
+            if K <= 16384:
+                BLOCK_SIZE_M = 32
+                BLOCK_SIZE_N = 256
+
+        if K <= 1024:
+            NUM_ITER = 1
+            NUM_STAGES = 1
+            NUM_WARPS = 4
+            BLOCK_SIZE_N = min(128, triton.next_power_of_2(K))
+            BLOCK_SIZE_N = max(32, BLOCK_SIZE_N)
+            BLOCK_SIZE_M = min(32, triton.next_power_of_2(M))
+
+        grid = (
+            triton.cdiv(M, BLOCK_SIZE_M),
+            triton.cdiv(K, BLOCK_SIZE_N * NUM_ITER),
+        )
+        even_m_n = (M % BLOCK_SIZE_M == 0) and (K % (BLOCK_SIZE_N * NUM_ITER) == 0)
+
+        kernel_args = dict(
+            BLOCK_SIZE_M=BLOCK_SIZE_M,
+            BLOCK_SIZE_N=BLOCK_SIZE_N,
+            NUM_ITER=NUM_ITER,
+            num_warps=NUM_WARPS,
+            MXFP8_QUANT_BLOCK_SIZE=_MXFP8_QUANT_BLOCK_SIZE,
+            EVEN_M_N=even_m_n,
+            waves_per_eu=0,
+        )
+        gluon_dynamic_mxfp8_quant_kernel_gfx1250[grid](
+            x2d,
+            y,
+            scale,
+            *x2d.stride(),
+            *y.stride(),
+            *scale.stride(),
+            M=M,
+            N=K,
+            NUM_STAGES=NUM_STAGES,
+            **kernel_args,
+        )
+    else:
+        BLOCK_SIZE_N = triton.next_power_of_2(K)
+        # Bound launch overhead on large token-head batches; the kernel loops rows by stride.
+        NUM_PRGMS = min(M, 32768)
+        grid = (NUM_PRGMS,)
+
+        _dynamic_mxfp8_quant_kernel[grid](
+            x2d,
+            y,
+            scale,
+            M,
+            K,
+            x2d.stride(0),
+            x2d.stride(1),
+            y.stride(0),
+            y.stride(1),
+            scale.stride(0),
+            scale.stride(1),
+            BLOCK_SIZE_N=BLOCK_SIZE_N,
+            QUANT_BLOCK_SIZE=_MXFP8_QUANT_BLOCK_SIZE,
+            NUM_PRGMS=NUM_PRGMS,
+        )
 
     y = y.view(*orig_shape[:-1], K)
     s = scale.view(*orig_shape[:-1], Ns)
