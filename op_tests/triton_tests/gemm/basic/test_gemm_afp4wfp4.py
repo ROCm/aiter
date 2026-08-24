@@ -80,13 +80,18 @@ def generate_gemm_afp4wfp4_inputs(
     w_scales = w_scales.T
     if shuffle_scales_fg:
         # Arch-independent aiter.ops.shuffle.shuffle_scale layout (shared with
-        # the CK/asm GEMMs): flat (rows_pad, K//32), 32-row stripes of 8
-        # k-groups, rows padded to a multiple of 256. M < 32 stays un-shuffled.
+        # the CK/asm GEMMs): 32-row stripes of 8 k-groups, returned flat as
+        # (pad256(rows), pad8(K//32)). The kernels index one row per 32-row
+        # stripe, so view it as (pad256(rows)//32, pad8(K//32)*32) -- taken off
+        # the shuffled tensor's own shape, which is padded on both dims.
+        # M < 32 stays un-shuffled (M, K//32) row-major.
         if M >= 32:
-            x_scales_shuffled = shuffle_scale(x_scales[:M])
+            xs = shuffle_scale(x_scales[:M])
+            x_scales_shuffled = xs.view(-1, xs.shape[1] * 32)
         else:
             x_scales_shuffled = x_scales[:M].contiguous()
-        w_scales_shuffled = shuffle_scale(w_scales)
+        ws = shuffle_scale(w_scales)
+        w_scales_shuffled = ws.view(-1, ws.shape[1] * 32)
     else:
         x_scales_shuffled = x_scales[:M]
         w_scales_shuffled = w_scales

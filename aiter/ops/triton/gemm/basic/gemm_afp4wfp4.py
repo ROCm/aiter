@@ -438,12 +438,18 @@ def gemm_afp4wfp4_preshuffle(
             equivalently shuffle_weight(layout=(16, 16)) reshaped to
             (N//16, K*16) — both produce the same bytes). Internally transposed.
         x_scales (torch.Tensor): E8M0 per-group scale for x, one scale per 32
-            elements in K. For M >= 32: flat (M_pad, K//32) preshuffled via
-            aiter.ops.shuffle.shuffle_scale (M_pad = M rounded up to a
-            multiple of 256; identical layout on gfx950 and gfx1250).
-            For M < 32: un-shuffled (M, K//32) row-major.
+            elements in K. For M >= 32: preshuffled via
+            aiter.ops.shuffle.shuffle_scale (identical layout on gfx950 and
+            gfx1250), then viewed as one row per 32-row stripe, i.e.
+            (M_pad//32, (K//32)*32) where M_pad = M rounded up to a multiple
+            of 256. shuffle_scale returns the buffer flat as
+            (M_pad, K//32), so the caller owns the reshape:
+            ``s = shuffle_scale(x_scales); s.view(-1, s.shape[-1] * 32)``
+            (take the shape off the shuffled tensor -- shuffle_scale pads both
+            dims). For M < 32: un-shuffled (M, K//32) row-major.
         w_scales (torch.Tensor): E8M0 per-group scale for w, one scale per 32
-            elements in K: flat (N_pad, K//32) via aiter.ops.shuffle.shuffle_scale.
+            elements in K: same shuffle_scale + stripe view as x_scales,
+            i.e. (N_pad//32, (K//32)*32). Always shuffled, including M < 32.
         dtype (Optional[torch.dtype]): Output datatype (BF16 or FP16).
         y (Optional[torch.Tensor]): Pre-allocated output tensor with shape (M, N).
         config (Optional[dict]): Kernel tuning parameters (BLOCK_SIZE_M, BLOCK_SIZE_N,
@@ -477,12 +483,18 @@ def gemm_afp4wfp4_preshuffle(
             config["BLOCK_SIZE_M"] >= 32
         ), "for M >= 32, BLOCK_SIZE_M must be 32 or more as x_scale are assumed to be preshuffled"
 
-    # aiter.ops.shuffle.shuffle_scale returns flat (rows_pad, K // 32) scales;
-    # view one row per 32-row stripe so the kernels' stride math steps over
-    # whole stripes. For M < 32, x_scales stay un-shuffled (M, K // 32).
-    if M >= 32:
-        x_scales = x_scales.view(-1, x_scales.shape[-1] * 32)
-    w_scales = w_scales.view(-1, w_scales.shape[-1] * 32)
+    # shuffle_scale pads K//32 up to a multiple of 8 (its k-chunk), but the
+    # kernels bound the scale reads at (K//32)*32 columns per stripe row. A
+    # k-chunk interleaves its 8 k-groups across all 256 of its bytes, so a
+    # bound that lands mid-chunk silently masks *real* k-groups to zero rather
+    # than only the padding -- e.g. K=896 loses k-groups 26 and 27. Require
+    # whole k-chunks. w_scales are always preshuffled, so this holds for M < 32
+    # too, where x_scales themselves are un-shuffled.
+    assert K_elems % 256 == 0, (
+        f"preshuffled scales require K % 256 == 0 (K//32 a multiple of 8), got K={K_elems}. "
+        "shuffle_scale pads K//32 to a multiple of 8 and the kernels cannot mask a "
+        "partial k-chunk"
+    )
 
     if use_gluon:
         from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_mxfp4 import (
