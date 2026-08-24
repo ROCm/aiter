@@ -16,6 +16,7 @@ Supported kernel families:
   - ``flydsl_bpreshuffle_8w_*``               gfx950 8-wave a8w8 ptpc GEMM kernels
   - ``flydsl_bpreshuffle_wmma_*``             gfx1250 a8w8 ptpc GEMM kernels
   - ``flydsl_mxfp8_128_bpreshuffle_wmma_*``   gfx1250 mxfp8_128 GEMM kernels
+  - ``flydsl_mxpsh_*``                        gfx950 MX-microscale preshuffle GEMM
 
 Usage:
     # Compile all unique FlyDSL GEMM kernels from default CSVs
@@ -59,6 +60,9 @@ from aiter.ops.flydsl.gemm_a8w8_bpreshuffle_8wave import (
 from aiter.ops.flydsl.gemm_kernels import (
     SPLIT_K_SEMAPHORE_MAX_LEN,
     get_flydsl_splitk_hgemm_kernel_params,
+)
+from aiter.ops.flydsl.gemm_tune.flydsl_gemm_mxscale_preshuffle_common import (
+    parse_kernel_name as parse_mxscale_preshuffle_kernel_name,
 )
 from aiter.ops.flydsl.kernels.hgemm_dispatch import compile_flydsl_hgemm_kernel
 from aiter.ops.flydsl.kernels.preshuffle_gemm import compile_preshuffle_gemm
@@ -158,6 +162,12 @@ def parse_csv(csv_path: str):
 
             if kernel_name.startswith("flydsl_bpreshuflle_"):
                 params = _parse_preshuffle_kernel_name(kernel_name)
+            elif kernel_name.startswith("flydsl_mxpsh_"):
+                params = parse_mxscale_preshuffle_kernel_name(kernel_name)
+                if params is not None:
+                    params = dict(params)
+                    params["kind"] = "mxscale_preshuffle"
+                    params["blockscale"] = True
             elif kernel_name.startswith("flydsl_bpreshuffle_8w_"):
                 params = parse_8wave_kernel_name(kernel_name)
                 if params is not None:
@@ -386,6 +396,77 @@ def _compile_preshuffle_to_cache(
     )
 
 
+def _compile_mxscale_preshuffle_to_cache(
+    *,
+    m: int,
+    n: int,
+    k: int,
+    tile_m: int,
+    tile_n: int,
+    tile_k: int,
+    a_dtype: str,
+    b_dtype: str,
+    out_dtype: str,
+    waves_per_eu: int,
+    xcd_swizzle: int = 0,
+    split_k: int = 1,
+    blockscale: bool = True,
+    **kwargs,
+):
+    """gfx950 MX-microscale preshuffle GEMM (``flydsl_mxpsh_*``).
+
+    ``blockscale`` selects the scale format; the two modes are distinct
+    Constexprs and therefore distinct binaries, so each is its own job.
+    """
+    del kwargs
+
+    import torch
+
+    from aiter.ops.flydsl.mxscale_preshuffle_kernels import (
+        flydsl_mxscale_preshuffle_gemm,
+    )
+
+    dev = torch.device("cpu")
+    m = int(tile_m)
+    # fp4 packs 2 codes/byte; fp6/fp8 are 1 byte/code.
+    a_bytes = k // 2 if a_dtype == "fp4" else k
+    b_bytes = k // 2 if b_dtype == "fp4" else k
+    out_torch_dtype = _torch_dtype_for_kernel(out_dtype)
+
+    a = torch.empty((m, a_bytes), device=dev, dtype=torch.uint8)
+    b = torch.empty((n, b_bytes), device=dev, dtype=torch.uint8)
+    out = torch.empty((m, n), device=dev, dtype=out_torch_dtype)
+    if not blockscale:
+        raise NotImplementedError(
+            "mxscale preshuffle AOT covers the a8w8 blockscale mode only. "
+            "Enabling the per-1x32 MX scale layout needs matching tuner and "
+            "runner support (a4w4 / a6w4), not just dummy operands here."
+        )
+    rows = (m + 31) // 32 * 32
+    K1 = (k + 255) // 256
+    a_scale = torch.empty(rows * 2 * K1, device=dev, dtype=torch.uint8)
+    b_scale = torch.empty((n // 128) * 4 * K1, device=dev, dtype=torch.uint8)
+
+    with compile_only_env():
+        flydsl_mxscale_preshuffle_gemm(
+            a,
+            b,
+            a_scale,
+            b_scale,
+            out,
+            a_dtype=a_dtype,
+            b_dtype=b_dtype,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            waves_per_eu=waves_per_eu,
+            xcd_swizzle=xcd_swizzle,
+            split_k=split_k,
+            blockscale=blockscale,
+            stream=fx.Stream(0),
+        )
+
+
 def _compile_8wave_to_cache(
     *,
     m: int,
@@ -575,6 +656,8 @@ def compile_one_config(
                 _compile_hgemm_to_cache(m=m, n=n, k=k, **hgemm_kwargs)
             elif kind == "preshuffle":
                 _compile_preshuffle_to_cache(m=m, n=n, k=k, **kwargs)
+            elif kind == "mxscale_preshuffle":
+                _compile_mxscale_preshuffle_to_cache(m=m, n=n, k=k, **kwargs)
             elif kind == "8wave":
                 _compile_8wave_to_cache(m=m, n=n, k=k, **kwargs)
             elif kind == "mxfp8_128_wmma":
@@ -632,6 +715,7 @@ def main():
     eightwave_jobs = [j for j in all_jobs if j["kind"] == "8wave"]
     mxfp8_128_wmma_jobs = [j for j in all_jobs if j["kind"] == "mxfp8_128_wmma"]
     ptpc_wmma_jobs = [j for j in all_jobs if j["kind"] == "ptpc_wmma"]
+    mxscale_jobs = [j for j in all_jobs if j["kind"] == "mxscale_preshuffle"]
 
     print("=" * 72)
     print("FlyDSL GEMM AOT Pre-compilation")
@@ -643,6 +727,7 @@ def main():
     print(f"  8wave jobs:       {len(eightwave_jobs)}")
     print(f"  MXFP8_128 wmma jobs: {len(mxfp8_128_wmma_jobs)}")
     print(f"  PTPC wmma jobs:   {len(ptpc_wmma_jobs)}")
+    print(f"  MXscale preshuffle jobs: {len(mxscale_jobs)}")
     print(f"  Total jobs:       {len(all_jobs)}")
     print(f"  Cache dir:        {cache_dir}")
     print(f"  Target arch:      {arch or '(all archs found in CSVs)'}")
@@ -659,7 +744,8 @@ def main():
         + preshuffle_jobs
         + eightwave_jobs
         + mxfp8_128_wmma_jobs
-        + ptpc_wmma_jobs,
+        + ptpc_wmma_jobs
+        + mxscale_jobs,
     )
 
     total_elapsed = time.time() - total_t0

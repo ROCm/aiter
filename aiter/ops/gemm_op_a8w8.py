@@ -207,6 +207,35 @@ def gemm_a8w8_bpreshuffle_flydsl(
     return Out
 
 
+SCALE_TYPE_FP32 = "fp32"
+SCALE_TYPE_E8M0 = "e8m0"
+
+BLOCKSCALE_BPRESHUFFLE_BACKENDS = {
+    SCALE_TYPE_FP32: ("ck", "cktile", "asm", "opus", "triton"),
+    SCALE_TYPE_E8M0: ("flydsl",),
+}
+
+
+@functools.cache
+def _warn_unknown_scaletype(scaletype: str) -> None:
+    logger.warning(
+        f"a8w8 blockscale-bpreshuffle: unknown scaletype {scaletype!r}; no backend "
+        f"can serve it. Known groups: {sorted(BLOCKSCALE_BPRESHUFFLE_BACKENDS)}."
+    )
+
+
+def blockscale_bpreshuffle_backends(scaletype) -> tuple:
+    """Backends able to serve the given scale format."""
+    key = "" if scaletype is None else str(scaletype)
+    if not key or key == "nan":
+        key = SCALE_TYPE_FP32
+    backends = BLOCKSCALE_BPRESHUFFLE_BACKENDS.get(key)
+    if backends is None:
+        _warn_unknown_scaletype(key)
+        return ()
+    return backends
+
+
 def gemm_a8w8_mxfp8_128_bpreshuffle_flydsl(
     XQ: Tensor,
     WQ: Tensor,
@@ -225,6 +254,29 @@ def gemm_a8w8_mxfp8_128_bpreshuffle_flydsl(
     )
 
     return run_gemm_a8w8_mxfp8_128_bpreshuffle_gfx1250(
+        XQ, WQ, x_scale, w_scale, Out, kernel_name
+    )
+
+
+def gemm_a8w8_mxscale_preshuffle_flydsl(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    Out: Tensor,
+    config: dict,
+) -> Tensor:
+    """gfx950 FlyDSL MX-microscale preshuffle GEMM (CDNA4 scaled-MFMA)."""
+    kernel_name = str(config.get("kernelName", ""))
+    if get_gfx() != "gfx950":
+        raise RuntimeError(
+            "gemm_a8w8_mxscale_preshuffle_flydsl is only supported on gfx950"
+        )
+    from .flydsl.mxscale_preshuffle_kernels import (
+        run_gemm_a8w8_mxscale_preshuffle_gfx950,
+    )
+
+    return run_gemm_a8w8_mxscale_preshuffle_gfx950(
         XQ, WQ, x_scale, w_scale, Out, kernel_name
     )
 
@@ -446,37 +498,56 @@ _CKGEMM_HAS_GFX: dict = {}
 
 
 @functools.lru_cache(maxsize=1024)
-def get_CKGEMM_config(M: int, N: int, K: int, tuned_file=None):
+def get_CKGEMM_config(M: int, N: int, K: int, tuned_file=None, scaletype=None):
     if tuned_file is None:
         tuned_file = AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_FILE
-    if tuned_file not in _CKGEMM_CONFIG_CACHE:
+    cache_key = (tuned_file, scaletype)
+    if cache_key not in _CKGEMM_CONFIG_CACHE:
         ckgemm_dict = pd.read_csv(f"{tuned_file}").drop_duplicates()
+        if scaletype is not None:
+            if "scaletype" in ckgemm_dict.columns:
+                ckgemm_dict = ckgemm_dict[
+                    ckgemm_dict["scaletype"].fillna(SCALE_TYPE_FP32) == scaletype
+                ]
+            elif scaletype != SCALE_TYPE_FP32:
+                # No column at all -> every row is a legacy fp32 row.
+                ckgemm_dict = ckgemm_dict.iloc[0:0]
         # Use (gfx, cu_num, M, N, K) key when the CSV has a gfx column (new schema).
         # Fall back to (cu_num, M, N, K) for old CSVs that pre-date the gfx column.
+        index_cols = (
+            ["gfx", "cu_num", "M", "N", "K"]
+            if "gfx" in ckgemm_dict.columns
+            else ["cu_num", "M", "N", "K"]
+        )
+        if ckgemm_dict.duplicated(subset=index_cols).any():
+            sort_col = "us" if "us" in ckgemm_dict.columns else None
+            if sort_col:
+                ckgemm_dict = ckgemm_dict.sort_values(sort_col, kind="stable")
+            ckgemm_dict = ckgemm_dict.drop_duplicates(subset=index_cols, keep="first")
         if "gfx" in ckgemm_dict.columns:
-            _CKGEMM_CONFIG_CACHE[tuned_file] = ckgemm_dict.set_index(
+            _CKGEMM_CONFIG_CACHE[cache_key] = ckgemm_dict.set_index(
                 ["gfx", "cu_num", "M", "N", "K"]
             ).to_dict("index")
-            _CKGEMM_HAS_GFX[tuned_file] = True
+            _CKGEMM_HAS_GFX[cache_key] = True
         else:
             logger.warning(
                 f"{tuned_file} has no 'gfx' column -- falling back to cu_num-only key. "
                 "Re-run the tuner or migrate the CSV to add a gfx column."
             )
-            _CKGEMM_CONFIG_CACHE[tuned_file] = ckgemm_dict.set_index(
+            _CKGEMM_CONFIG_CACHE[cache_key] = ckgemm_dict.set_index(
                 ["cu_num", "M", "N", "K"]
             ).to_dict("index")
-            _CKGEMM_HAS_GFX[tuned_file] = False
+            _CKGEMM_HAS_GFX[cache_key] = False
 
     gfx = get_gfx()
     cu_num = get_cu_num()
-    has_gfx = _CKGEMM_HAS_GFX[tuned_file]
+    has_gfx = _CKGEMM_HAS_GFX[cache_key]
     padded_M = M
     config = None
     for gl in [None, 0, 1]:
         padded_M = M if gl is None else get_padded_m(M, N, K, gl)
         key = (gfx, cu_num, padded_M, N, K) if has_gfx else (cu_num, padded_M, N, K)
-        config = _CKGEMM_CONFIG_CACHE[tuned_file].get(key, None)
+        config = _CKGEMM_CONFIG_CACHE[cache_key].get(key, None)
         if config is not None:
             if AITER_LOG_TUNED_CONFIG:
                 logger.info(
@@ -976,6 +1047,46 @@ def gemm_a8w8_blockscale_bpreshuffle(
                 XQ, WQ, x_scale, w_scale, Y, {"kernelName": ki.name}
             )
 
+    use_gfx950_flydsl_mxscale = (
+        get_gfx() == "gfx950"
+        and x_scale.dtype == dtypes.fp8_e8m0
+        and w_scale.dtype == dtypes.fp8_e8m0
+    )
+    if use_gfx950_flydsl_mxscale:
+        if not is_flydsl_available():
+            raise RuntimeError(
+                "gfx950 MX bpreshuffle (fp8_e8m0 scales) requires FlyDSL"
+            )
+        config = get_CKGEMM_config(
+            m,
+            n,
+            k,
+            AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE,
+            scaletype=SCALE_TYPE_E8M0,
+        )
+        if config is not None and config["libtype"] == "flydsl":
+            return gemm_a8w8_mxscale_preshuffle_flydsl(
+                XQ, WQ, x_scale, w_scale, Y, config
+            )
+
+        from ..ops.flydsl.mxscale_preshuffle_kernels import _heuristic_tile
+
+        ki = _heuristic_tile("fp8", "fp8", m, n, k)
+        if ki is None:
+            # Cannot fall through: the scales are the MX kernel's shuffled flat
+            # buffers, which the fp32 backends below would read as garbage.
+            raise RuntimeError(
+                f"gemm_a8w8_blockscale_bpreshuffle: no legal gfx950 MX tile for "
+                f"M={m}, N={n}, K={k} (needs N%128==0 and K%128==0)"
+            )
+        logger.warning(
+            f"[gfx950] gemm_a8w8_blockscale_bpreshuffle untuned "
+            f"M={m}, N={n}, K={k}; falling back to flydsl kernel '{ki.name}'."
+        )
+        return gemm_a8w8_mxscale_preshuffle_flydsl(
+            XQ, WQ, x_scale, w_scale, Y, {"kernelName": ki.name}
+        )
+
     # temporarily guard scale that are not fp32.
     if x_scale.dtype == dtypes.fp8_e8m0:
         x_scale = x_scale.to(dtypes.fp32)
@@ -1018,8 +1129,14 @@ def gemm_a8w8_blockscale_bpreshuffle(
             config=_fallback_cfg,
             is_x_scale_tranposed=x_scale.stride(0) != 1,
         )
+    # fp32 scales -> the fp32 group only; an e8m0 row names a kernel that cannot
+    # read these operands.
     config = get_CKGEMM_config(
-        m, n, k, AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE
+        m,
+        n,
+        k,
+        AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE,
+        scaletype=SCALE_TYPE_FP32,
     )
     # Triton path first: it allocates its own output, so skip the Y buffer the
     # ck/asm paths below need.
@@ -1074,7 +1191,7 @@ def gemm_a8w8_blockscale_bpreshuffle(
             return opus_gemm_a8w8_blockscale_bpreshuffle_tune(
                 XQ, WQ, x_scale, w_scale, Y, kernelId=kernelId
             )
-        elif libtype == "flydsl" and is_flydsl_available():
+        elif libtype == "flydsl" and is_flydsl_available() and get_gfx() == "gfx1250":
             return gemm_a8w8_mxfp8_128_bpreshuffle_flydsl(
                 XQ, WQ, x_scale, w_scale, Y, config
             )
