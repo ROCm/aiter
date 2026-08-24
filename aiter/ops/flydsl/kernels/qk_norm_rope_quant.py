@@ -63,6 +63,17 @@ _STATIC_ADAPTOR_CACHE_MAX = 64
 
 
 def _cached_from_dlpack(t: torch.Tensor):
+    """Adaptor cache for STATIC tensors only (weights, cos/sin).
+
+    The cached adaptor holds a DLPack reference to ``t``, so a cached entry
+    keeps that tensor's allocation alive until the entry is evicted. That is
+    free for model-lifetime tensors, whose ``data_ptr`` is stable so the cache
+    actually hits -- but it is pure loss for a per-call activation: the pointer
+    differs every call (0% hit rate) while up to ``_STATIC_ADAPTOR_CACHE_MAX``
+    of them stay pinned, which under serving is tens of GiB of allocator blocks
+    the rest of the model can no longer reuse. Activations must therefore build
+    their adaptor uncached, via ``flyc.from_dlpack`` directly.
+    """
     key = (
         int(t.data_ptr()),
         str(t.device),
@@ -1616,7 +1627,9 @@ def flydsl_qk_norm_rope_quant(
             kv_c = kv if kv.is_contiguous() else kv.contiguous()
             per_wg = ROWS_PER_TILE * tiles_per_wg
             args = (
-                _cached_from_dlpack(q_2d),
+                # q is a per-call activation: uncached, else the adaptor cache
+                # pins its allocation (see _cached_from_dlpack).
+                flyc.from_dlpack(q_2d),
                 _t_ptr(kv_c),
                 _cached_from_dlpack(cos_2d),
                 _cached_from_dlpack(sin_2d),
