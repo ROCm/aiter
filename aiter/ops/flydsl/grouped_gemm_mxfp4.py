@@ -96,6 +96,7 @@ def flydsl_grouped_gemm_a8w4_masked(
     ep_row_map=None,
     situ_beta=1.0,
     situ_linear_beta=1.0,
+    persistent_mode=0,
 ):
     """Launches a contiguous-M grouped a8w4 GEMM on the TDM kernel."""
     from .kernels.mxfp4_preshuffle_gfx1250_tdm import launch_gemm_a8w4_tdm
@@ -108,6 +109,10 @@ def flydsl_grouped_gemm_a8w4_masked(
         if float(situ_linear_beta) <= 0.0:
             raise ValueError(f"situ_linear_beta must be > 0, got {situ_linear_beta!r}")
     num_buffers = min(num_buffers, max(1, K // tile_k))
+    if persistent_mode and (stage1_quant_out or (stage2_scatter is not None)):
+        persistent_mode = 0
+    if persistent_mode and num_buffers >= 3:
+        next_stage_prefetch = 1
     has_bias = 1 if bias is not None else 0
     bias_ptr = ptr_arg(bias) if bias is not None else ptr_arg(a)
     quant_scale_tensor = out if quant_scale is None else quant_scale.view(torch.uint8)
@@ -164,5 +169,6 @@ def flydsl_grouped_gemm_a8w4_masked(
         arg_ep_row_map=ep_row_map_tensor,
         f32_situ_beta=float(situ_beta),
         f32_situ_linear_beta=float(situ_linear_beta),
+        persistent_mode=int(persistent_mode),
     )
     return out

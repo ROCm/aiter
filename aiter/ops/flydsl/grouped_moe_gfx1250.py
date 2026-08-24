@@ -446,6 +446,7 @@ def _grouped_a8w4_tdm_moe(
     stage2_scatter: Stage2ScatterContext | None = None,
     situ_beta=1.0,
     situ_linear_beta=1.0,
+    persistent_mode=0,
 ):
     import functools
 
@@ -666,6 +667,7 @@ def _grouped_a8w4_tdm_moe(
             cluster_n=cluster_n,
             waves_per_tensor_tdm=waves_per_tensor_tdm,
             next_stage_prefetch=next_stage_prefetch,
+            persistent_mode=persistent_mode,
             **_situ_kw,
         )
     else:
@@ -696,6 +698,7 @@ def _grouped_a8w4_tdm_moe(
             cluster_n=cluster_n,
             waves_per_tensor_tdm=waves_per_tensor_tdm,
             next_stage_prefetch=next_stage_prefetch,
+            persistent_mode=persistent_mode,
             **_situ_kw,
         )
         a2_payload, a2_scale = flydsl_moe_fused_quant_preshuffle(
@@ -735,6 +738,7 @@ def _grouped_a8w4_tdm_moe(
         cluster_n=cluster_n,
         waves_per_tensor_tdm=waves_per_tensor_tdm,
         next_stage_prefetch=next_stage_prefetch,
+        persistent_mode=persistent_mode,
         **_ep_gemm2_kwargs,
     )
 
@@ -772,6 +776,7 @@ def _grouped_a8w4_tdm_moe(
                         cluster_n=cluster_n,
                         waves_per_tensor_tdm=waves_per_tensor_tdm,
                         next_stage_prefetch=next_stage_prefetch,
+                        persistent_mode=persistent_mode,
                         **_situ_kw,
                     ),
                 )
@@ -806,6 +811,7 @@ def _grouped_a8w4_tdm_moe(
                         cluster_n=cluster_n,
                         waves_per_tensor_tdm=waves_per_tensor_tdm,
                         next_stage_prefetch=next_stage_prefetch,
+                        persistent_mode=persistent_mode,
                         **_situ_kw,
                     ),
                 )
@@ -838,6 +844,7 @@ def _grouped_a8w4_tdm_moe(
                     cluster_n=cluster_n,
                     waves_per_tensor_tdm=waves_per_tensor_tdm,
                     next_stage_prefetch=next_stage_prefetch,
+                    persistent_mode=persistent_mode,
                 ),
             )
         )
@@ -1146,6 +1153,8 @@ def grouped_gemm_gfx1250_a8w4(
             _tdm_kw["n_warp"] = _base_nw
             _tdm_kw["m_warp2"] = _ov_mw2 if _ov_mw2 is not None else _base_mw
             _tdm_kw["n_warp2"] = _ov_nw2 if _ov_nw2 is not None else _base_nw
+        _ov_persist = _tdm_env("AITER_TDM_PERSISTENT")
+        _persist = _ov_persist if _ov_persist is not None else 0
         return _grouped_a8w4_tdm_moe(
             hidden_states,
             w1,
@@ -1169,6 +1178,7 @@ def grouped_gemm_gfx1250_a8w4(
             stage2_scatter=stage2_scatter,
             situ_beta=situ_beta,
             situ_linear_beta=situ_linear_beta,
+            persistent_mode=_persist,
             **_tdm_kw,
         )
 
