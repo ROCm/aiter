@@ -33,7 +33,11 @@ def _attn_fwd_inner(
     stride_sd_n,
     seqlen_k,
     seqlen_q,
+    dropout_p,
     sd_ptr,
+    dm_ptr,
+    philox_seed,
+    philox_base,
     block_min,
     block_max,
     alibi_slope,
@@ -49,6 +53,8 @@ def _attn_fwd_inner(
     sm_scale,
     IS_CAUSAL: gl.constexpr,
     MASK_STEPS: gl.constexpr,
+    ENABLE_DROPOUT: gl.constexpr,
+    RETURN_SCORES: gl.constexpr,
     IS_FP8: gl.constexpr,
     FP8_MAX: gl.constexpr,
     SLIDING_WINDOW: gl.constexpr,
@@ -156,21 +162,42 @@ def _attn_fwd_inner(
             # exp2(-inf - -inf) = NaN. Zero those elements.
             p = gl.where(mask, p, 0.0)
 
+        # CAVEAT: l_ij must be summed before dropout is applied -- the LSE is
+        # the pre-dropout normalizer.
         l_ij = gl.sum(p, axis=1)
 
-        if sd_ptr is not None:
-            # NOTE: as in the Triton kernel, the score written here is not the
-            # final softmax numerator -- it is normalized against the running
-            # max at this block, which later blocks may raise. Kept identical
-            # so the two kernels produce the same tensor.
-            gl.store(
-                sd_ptr
-                + offs_m[:, None] * stride_sd_m
-                + (start_n + offs_n)[None, :] * stride_sd_n,
-                p,
-                mask=(offs_m < seqlen_q)[:, None]
-                & ((start_n + offs_n) < seqlen_k)[None, :],
+        if ENABLE_DROPOUT or RETURN_SCORES:
+            # Element (m, n) of the score matrix for this (batch, q head).
+            sd_offs = (
+                offs_m[:, None] * stride_sd_m
+                + (start_n + offs_n)[None, :] * stride_sd_n
             )
+            p_mask = (offs_m < seqlen_q)[:, None] & (
+                (start_n + offs_n) < seqlen_k
+            )[None, :]
+
+        if ENABLE_DROPOUT:
+            # Philox is counter-based: the draw for element (m, n) depends only
+            # on the seed and that element's offset, so the mask is
+            # reproducible without storing it. `tl.rand` is a @triton.jit
+            # device helper -- it inlines into gluon and needs no gl.* port.
+            #
+            # NOTE: this diverges from the Triton kernel. Triton advances its
+            # philox pointer for the skipped blocks but not across the
+            # full/masked phase boundary, so its RNG stream repeats over the
+            # trailing blocks. Deriving the offset from `start_n` avoids that,
+            # at the cost of the two kernels drawing different masks.
+            keep = (
+                tl.rand(philox_seed, philox_base + sd_offs) > dropout_p
+            ) # TODO: use tl.randint for better performance
+            gl.store(dm_ptr + sd_offs, keep.to(gl.float32), mask=p_mask)
+            # Dropped scores are returned negated so the caller can recover the
+            # mask from the sign.
+            gl.store(sd_ptr + sd_offs, gl.where(keep, p, -p), mask=p_mask)
+            p = gl.where(keep, p, 0.0)
+        elif RETURN_SCORES:
+            # NOTE: the returned score is not the same as the reference because we need to adjust as we find new maxes per block. We are not doing that
+            gl.store(sd_ptr + sd_offs, p, mask=p_mask)
 
         alpha = gl.exp2(m_i - m_ij)
         if SLIDING_WINDOW > 0:
@@ -309,7 +336,6 @@ def _attn_fwd(
     HEAD_STRIDE_ALIGNED_8: gl.constexpr = False,
 ):
     # ---- unsupported-feature gates ----
-    gl.static_assert(not ENABLE_DROPOUT, "gluon MHA: dropout not supported")
     gl.static_assert(SWIZZLE == "default", "gluon MHA: only the default swizzle")
 
     NUM_BLOCKS = (SEQLEN_Q + BLOCK_M - 1) // BLOCK_M
@@ -374,6 +400,8 @@ def _attn_fwd(
         stride_lse_z = gl.cast(stride_lse_z_in, gl.int64)
         stride_lse_h = gl.cast(stride_lse_h_in, gl.int64)
         stride_lse_m = gl.cast(stride_lse_m_in, gl.int64)
+        # NOTE: philox offset is needed in dropout pointer calculations
+        philox_offset_base = gl.cast(philox_offset_base_in, gl.int64)
     else:
         stride_qz = stride_qz_in
         stride_qm = stride_qm_in
@@ -401,6 +429,7 @@ def _attn_fwd(
         stride_descale_q_z = stride_descale_q_z_in
         stride_descale_k_z = stride_descale_k_z_in
         stride_descale_v_z = stride_descale_v_z_in
+        philox_offset_base = philox_offset_base_in
 
     # ---- layouts: ONE mma layout, M-split, shared by QK and PV ----
     if NUM_WARPS == 1:
@@ -661,11 +690,21 @@ def _attn_fwd(
         descale_k = 1.0
         descale_v = 1.0
 
-    # ---- s_dmask (return_scores): base pointer for this (batch, q head) ----
-    if RETURN_SCORES:
-        sd_ptr = s_dmask_ptr + off_z * stride_sd_z + off_q_head * stride_sd_h
+    # ---- s_dmask / dropout: base offset for this (batch, q head) ----
+    # s_dmask is allocated whenever scores are returned *or* dropout is on, so
+    # the gate is the pointer itself rather than RETURN_SCORES (mirrors the
+    # Triton kernel).
+    sd_base = off_z * stride_sd_z + off_q_head * stride_sd_h
+    if s_dmask_ptr is not None:
+        sd_ptr = s_dmask_ptr + sd_base
     else:
         sd_ptr = None
+    if ENABLE_DROPOUT:
+        dm_ptr = dropout_mask_ptr + sd_base
+        philox_base = philox_offset_base + sd_base
+    else:
+        dm_ptr = None
+        philox_base = 0
 
     # ---- alibi: one scalar slope per (batch, q head) ----
     if alibi_slopes_ptr is not None:
@@ -735,7 +774,11 @@ def _attn_fwd(
                 stride_sd_n,
                 seqlen_k,
                 seqlen_q,
+                dropout_p,
                 sd_ptr,
+                dm_ptr,
+                philox_seed,
+                philox_base,
                 block_min,
                 block_full_end,
                 alibi_slope,
@@ -751,6 +794,8 @@ def _attn_fwd(
                 sm_scale,
                 IS_CAUSAL=False,
                 MASK_STEPS=False,
+                ENABLE_DROPOUT=ENABLE_DROPOUT,
+                RETURN_SCORES=RETURN_SCORES,
                 IS_FP8=IS_FP8,
                 FP8_MAX=FP8_MAX,
                 SLIDING_WINDOW=SLIDING_WINDOW,
@@ -781,7 +826,11 @@ def _attn_fwd(
                 stride_sd_n,
                 seqlen_k,
                 seqlen_q,
+                dropout_p,
                 sd_ptr,
+                dm_ptr,
+                philox_seed,
+                philox_base,
                 block_full_end,
                 block_last,
                 alibi_slope,
@@ -797,6 +846,8 @@ def _attn_fwd(
                 sm_scale,
                 IS_CAUSAL=IS_CAUSAL,
                 MASK_STEPS=True,
+                ENABLE_DROPOUT=ENABLE_DROPOUT,
+                RETURN_SCORES=RETURN_SCORES,
                 IS_FP8=IS_FP8,
                 FP8_MAX=FP8_MAX,
                 SLIDING_WINDOW=SLIDING_WINDOW,
@@ -826,7 +877,11 @@ def _attn_fwd(
             stride_sd_n,
             seqlen_k,
             seqlen_q,
+            dropout_p,
             sd_ptr,
+            dm_ptr,
+            philox_seed,
+            philox_base,
             block_last,
             block_max,
             alibi_slope,
@@ -842,6 +897,8 @@ def _attn_fwd(
             sm_scale,
             IS_CAUSAL=IS_CAUSAL,
             MASK_STEPS=True,
+            ENABLE_DROPOUT=ENABLE_DROPOUT,
+            RETURN_SCORES=RETURN_SCORES,
             IS_FP8=IS_FP8,
             FP8_MAX=FP8_MAX,
             SLIDING_WINDOW=SLIDING_WINDOW,
@@ -864,6 +921,10 @@ def _attn_fwd(
     # Reciprocal on l_i (BLOCK_M) rather than acc (BLOCK_M x D) so the compiler's
     # Newton-Raphson runs on the small tensor.
     acc = acc * (1.0 / l_i[:, None])
+    if ENABLE_DROPOUT:
+        # The surviving scores carry the full row mass, so scale back up. LSE is
+        # deliberately left alone -- it is the pre-dropout normalizer.
+        acc = acc * (1.0 / (1.0 - dropout_p))
 
     start_m_idx = start_m * BLOCK_M
     end_m_idx = (start_m + 1) * BLOCK_M
