@@ -61,7 +61,7 @@ def case_construct_validates():
     else:
         raise AssertionError("tp_size=2 must be rejected")
 
-    # sort_block_m must divide the stage1 tile_m
+    # sort_block_m must equal the stage1 tile_m
     try:
         TPMoEStage1(
             model_dim=NETWORK["model_dim"],
@@ -79,6 +79,24 @@ def case_construct_validates():
         assert "sort_block_m" in str(exc), exc
     else:
         raise AssertionError("sort_block_m=48 must be rejected")
+
+    # supplying only one of tp_size / tp_rank must be rejected with "together"
+    try:
+        TPMoEStage1(
+            model_dim=NETWORK["model_dim"],
+            inter_dim=inter_dim,
+            experts=NETWORK["experts"],
+            topk=NETWORK["topk"],
+            w1=w1,
+            w1_scale=w1_scale,
+            tp_size=8,
+            tp_rank=None,
+            device=device,
+        )
+    except ValueError as exc:
+        assert "together" in str(exc), exc
+    else:
+        raise AssertionError("tp_size=8, tp_rank=None must be rejected")
 
     op = TPMoEStage1(
         model_dim=NETWORK["model_dim"],
@@ -119,12 +137,12 @@ def case_capacity():
         stage1_kernel_name=STAGE1_KERNEL,
     )
     # M_global = tp_size * m_local; max_sorted matches moe_sorting's own formula.
-    assert op.m_logical(1) == 8
-    assert op.m_logical(128) == 1024
+    assert op.m_logical_for(1) == 8
+    assert op.m_logical_for(128) == 1024
     # 8*6 + 384*32 - 6
-    assert op.max_sorted(1) == 8 * 6 + 384 * 32 - 6
+    assert op.max_sorted_for(1) == 8 * 6 + 384 * 32 - 6
     # 1024*6 + 384*32 - 6
-    assert op.max_sorted(128) == 1024 * 6 + 384 * 32 - 6
+    assert op.max_sorted_for(128) == 1024 * 6 + 384 * 32 - 6
     print("case_capacity OK")
 
 

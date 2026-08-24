@@ -12,6 +12,7 @@ six tensors the ordinary FlyDSL v2 FMoE GEMM2 consumes.
 from dataclasses import dataclass
 
 import torch
+import torch.distributed as dist
 
 from aiter.ops.flydsl.moe_kernels import get_flydsl_kernel_params
 
@@ -68,13 +69,12 @@ class TPMoEStage1:
         transport: str = "allgather_bf16",
     ):
         self.group = group
+        if (tp_size is None) != (tp_rank is None):
+            raise ValueError("tp_size and tp_rank must be supplied together, or both omitted")
         if tp_size is None or tp_rank is None:
-            import torch.distributed as dist
-
             if not dist.is_initialized():
                 raise ValueError(
-                    "TPMoEStage1 needs an initialized process group, or explicit "
-                    "tp_size/tp_rank"
+                    "TPMoEStage1 needs an initialized process group, or both tp_size and tp_rank"
                 )
             tp_size = dist.get_world_size(group)
             tp_rank = dist.get_rank(group)
@@ -103,6 +103,8 @@ class TPMoEStage1:
 
         self.tp_size = int(tp_size)
         self.tp_rank = int(tp_rank)
+        if not (0 <= self.tp_rank < self.tp_size):
+            raise ValueError(f"tp_rank={self.tp_rank} out of range for tp_size={self.tp_size}")
         self.model_dim = int(model_dim)
         self.inter_dim = int(inter_dim)
         self.experts = int(experts)
@@ -116,9 +118,9 @@ class TPMoEStage1:
         self.w1 = w1
         self.w1_scale = w1_scale
 
-    def m_logical(self, m_local: int) -> int:
+    def m_logical_for(self, m_local: int) -> int:
         return self.tp_size * int(m_local)
 
-    def max_sorted(self, m_local: int) -> int:
+    def max_sorted_for(self, m_local: int) -> int:
         """Mirror of moe_sorting's max_num_tokens_padded."""
-        return self.m_logical(m_local) * self.topk + self.experts * self.sort_block_m - self.topk
+        return self.m_logical_for(m_local) * self.topk + self.experts * self.sort_block_m - self.topk
