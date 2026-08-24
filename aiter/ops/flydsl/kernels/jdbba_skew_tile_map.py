@@ -13,10 +13,9 @@ Pattern mirrors ``aiter/ops/flydsl/kernels/moe_m_tile_map.py``:
 
 from __future__ import annotations
 
-import torch
-
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+import torch
 from flydsl.expr import buffer_ops
 from flydsl.expr.typing import T
 

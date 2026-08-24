@@ -18,6 +18,7 @@ from collections import OrderedDict
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+from flydsl._mlir import ir
 from flydsl.compiler.kernel_function import CompilationContext
 
 from ._buffer_utils import make_bounded_buffer_tensor
@@ -467,13 +468,8 @@ def _build_launcher(
 
 
 def _drop_leaked_ir_contexts() -> None:
-    try:
-        from flydsl._mlir import ir
-
-        while ir.Context.current is not None:
-            ir.Context.current.__exit__(None, None, None)
-    except Exception:
-        pass
+    while ir.Context.current is not None:
+        ir.Context.current.__exit__(None, None, None)
 
 
 def _cache_get(key):
