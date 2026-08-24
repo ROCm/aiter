@@ -93,6 +93,18 @@ def _multi_processor_count(arch: str | None = None) -> int:
     return _cu_count_for(device, arch)
 
 
+def decode_cu_count(device: torch.device | int | None, arch: str | None = None) -> int:
+    """CU count of `device`, which is not always the current device.
+
+    Pass None for the current-device behaviour, which is what AOT needs.
+    """
+    if isinstance(device, torch.device):
+        device = device.index
+    if device is None:
+        return _multi_processor_count(arch)
+    return _cu_count_for(device, arch or get_rocm_arch())
+
+
 @functools.cache
 def _cu_count_for(device: int | None, arch: str | None) -> int:
     if device is None:
@@ -133,6 +145,7 @@ def _resolved_kernel_config(
     max_model_len: int,
     arch: str | None = None,
     overrides: dict | None = None,
+    cu_count: int | None = None,
 ) -> dict:
     """Derive the tiered config, folding each override in at the point the field is
     defined rather than over the finished dict. Several fields (blocks_per_row above
@@ -154,7 +167,8 @@ def _resolved_kernel_config(
 
     # bits_per_pass: 11 (2048-bin LDS histogram) whenever the arch can afford it;
     # the short tier requires 11. gfx942/gfx950 both qualify (CU count >= 128).
-    cu_count = _multi_processor_count(arch)
+    if cu_count is None:
+        cu_count = _multi_processor_count(arch)
     bits_per_pass = (
         11 if cu_count >= 128 or SMEM_CAPACITY_MAP.get(arch, 0) >= 128 * 1024 else 10
     )
@@ -323,9 +337,14 @@ def _resolved_kernel_config(
     }
 
 
-def _kernel_config(num_rows: int, max_model_len: int, arch: str | None = None) -> dict:
+def _kernel_config(
+    num_rows: int,
+    max_model_len: int,
+    arch: str | None = None,
+    cu_count: int | None = None,
+) -> dict:
     kernel_config = _resolved_kernel_config(
-        num_rows, max_model_len, arch, _environ_kernel_config()
+        num_rows, max_model_len, arch, _environ_kernel_config(), cu_count
     )
 
     bits_per_pass = kernel_config["bits_per_pass"]
@@ -339,7 +358,9 @@ def _kernel_config(num_rows: int, max_model_len: int, arch: str | None = None) -
             f"got {tier_mode!r}"
         )
 
-    kernel_config = _apply_deadlock_guard(kernel_config, num_rows, max_model_len, arch)
+    kernel_config = _apply_deadlock_guard(
+        kernel_config, num_rows, max_model_len, arch, cu_count
+    )
     return kernel_config
 
 
@@ -348,6 +369,7 @@ def _apply_deadlock_guard(
     num_rows: int,
     max_model_len: int,
     arch: str | None = None,
+    cu_count: int | None = None,
 ) -> dict:
     """Clamp the tiered config so the mid/long-tier inter-workgroup barrier cannot
     deadlock. Reaching that state takes both a wide batch (num_rows > ~80-90) and
@@ -397,7 +419,9 @@ def _apply_deadlock_guard(
     # the 1024-thread block is wave-limited (32 waves/CU / 16), with VGPR/LDS
     # headroom (measured gfx942: VGPR=40, LDS=8.7KB). Re-check if scan_stages or
     # the histogram grows enough to push VGPR>64 / LDS>32KB (would drop occ to 1).
-    max_coresident_workgroups = _multi_processor_count(arch or get_rocm_arch()) * 2
+    if cu_count is None:
+        cu_count = _multi_processor_count(arch or get_rocm_arch())
+    max_coresident_workgroups = cu_count * 2
     is_deadlock_free = (
         num_rows * (max_active_workgroups_per_row - 1) < max_coresident_workgroups
     )
@@ -410,23 +434,30 @@ def _apply_deadlock_guard(
         kernel_config["tiered_mid_cap"] = min(mid_cap, max_safe_active_workgroups)
         kernel_config["tiered_long_cap"] = min(long_cap, max_safe_active_workgroups)
     else:
-        # max_safe_active_workgroups < 2 -> force short tier
+        # max_safe_active_workgroups < 2 -> force short tier, which the kernel
+        # compiles only with the 2048-bin histogram. The sizing helpers read
+        # bits_per_pass back out of this dict, so raising it here keeps them level.
         kernel_config["tier_mode"] = "short"
+        kernel_config["bits_per_pass"] = 11
     return kernel_config
 
 
 def flydsl_top_k_per_row_decode_workspace_size(
     num_rows: int,
     max_model_len: int,
+    cu_count: int | None = None,
 ) -> int:
     """
     Number of int32 elements the decode TopK workspace needs for this shape.
     max_model_len = int(logits.shape[1])
+
+    cu_count must match the device the kernel will run on, or the buffer is
+    sized for the wrong bits_per_pass.
     """
     if num_rows <= 0:
         return 0
 
-    kernel_config = _kernel_config(num_rows, max_model_len)
+    kernel_config = _kernel_config(num_rows, max_model_len, None, cu_count)
     workspace_slots = topk_workspace_slots(
         num_rows,
         kernel_config["bits_per_pass"],
@@ -451,19 +482,22 @@ def _build_launcher(
     num_rows: int,
     max_model_len: int,
     arch: str,
+    cu_count: int | None = None,
 ):
     """Build (and lru-cache) the launcher + workspace metadata for this shape.
 
     Returns the flyc.jit launcher object, does not compile. The first
     _run_compiled() call triggers flyc.compile.
 
-    Cached per unique (top_k, num_rows, max_model_len, arch). The arch belongs in
-    the key: it decides several config fields (short_max, and the gfx950-only
-    row_proportional_parts / early_stop), and the JitFunction freezes its compile
-    target on first use. Without it, an AOT process compiling several archs hands
-    the first arch's launcher to the rest and their kernels never reach the cache.
+    Cached per unique (top_k, num_rows, max_model_len, arch, cu_count). The arch
+    belongs in the key: it decides several config fields (short_max, and the
+    gfx950-only row_proportional_parts / early_stop), and the JitFunction freezes
+    its compile target on first use. Without it, an AOT process compiling several
+    archs hands the first arch's launcher to the rest and their kernels never
+    reach the cache. cu_count keys the same way one step finer, because one arch
+    spans SKUs whose bits_per_pass differs.
     """
-    kernel_config = _kernel_config(num_rows, max_model_len, arch)
+    kernel_config = _kernel_config(num_rows, max_model_len, arch, cu_count)
 
     workspace_slots = topk_workspace_slots(
         num_rows,
@@ -614,11 +648,13 @@ def flydsl_top_k_per_row_decode(
         workspace,
     )
 
+    arch = _current_arch()
     launcher, workspace_slots, workspace_zero = _build_launcher(
         k,
         numRows,
         logits.shape[1],
-        _current_arch(),
+        arch,
+        decode_cu_count(logits.device, arch),
     )
 
     if workspace is None:

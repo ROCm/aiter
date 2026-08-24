@@ -643,8 +643,18 @@ def _stream_key(device: torch.device) -> int:
     return torch.cuda.current_stream(device).cuda_stream
 
 
-@functools.lru_cache(maxsize=64)
-def _flydsl_topk_workspace_alloc(numRows: int, max_model_len: int) -> int:
+@functools.lru_cache(maxsize=16)
+def _flydsl_decode_cu_count(device: torch.device) -> int:
+    """CU count of `device`, cached because it sits on the per-call decode path."""
+    from .flydsl.topk_per_row_decode import decode_cu_count
+
+    return decode_cu_count(device)
+
+
+@functools.lru_cache(maxsize=256)
+def _flydsl_topk_workspace_alloc(
+    numRows: int, max_model_len: int, cu_count: int | None = None
+) -> int:
     """Workspace element count for this shape, rounded up to a power of two.
 
     Memoized because the FlyDSL sizing helper rebuilds the whole kernel config on
@@ -654,7 +664,7 @@ def _flydsl_topk_workspace_alloc(numRows: int, max_model_len: int) -> int:
         flydsl_top_k_per_row_decode_workspace_size,
     )
 
-    size = flydsl_top_k_per_row_decode_workspace_size(numRows, max_model_len)
+    size = flydsl_top_k_per_row_decode_workspace_size(numRows, max_model_len, cu_count)
     if size <= 0:
         return 0
     return 1 if size <= 1 else 1 << (int(size) - 1).bit_length()
@@ -690,7 +700,9 @@ def _get_flydsl_topk_workspace(
     if _is_stream_capturing():
         return None
 
-    alloc = _flydsl_topk_workspace_alloc(numRows, max_model_len)
+    alloc = _flydsl_topk_workspace_alloc(
+        numRows, max_model_len, _flydsl_decode_cu_count(device)
+    )
     if alloc <= 0:
         return None
     return _get_flydsl_topk_workspace_keyed(device, _stream_key(device), alloc)
