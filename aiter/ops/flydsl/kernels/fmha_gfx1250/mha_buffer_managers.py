@@ -145,7 +145,7 @@ def _ir(x):
     return x.ir_value() if hasattr(x, "ir_value") else x
 
 
-def _async_load_to_lds(gptrs, lds_ptrs, *, cluster):
+def _async_load_to_lds(gptrs, lds_ptrs, *, cluster, imm_offs=None):
     """Issue a BATCH of async 16B (b128) global->LDS loads. Pure issue, no address
     math: the managers' ``global_load_ptrs`` already built the pointers.
 
@@ -154,6 +154,12 @@ def _async_load_to_lds(gptrs, lds_ptrs, *, cluster):
       lds_ptrs[i] LDS (address-space 3) destination pointer
     A scalar (non-list) pointer is accepted and treated as a 1-load batch.
     ``cluster`` selects the MCAST form (K/V) vs plain global (Q).
+
+    ``imm_offs`` (optional) is a list of per-load COMPILE-TIME byte immediates (default
+    all 0). The async immediate hits BOTH the global source AND the LDS dest by the same
+    byte amount in lockstep (GPU-verified), so a caller that wants it as a global-only
+    stride must pre-subtract it from ``lds_ptrs`` (see ``global_load_ptrs``); here it is
+    passed straight to the op's ``offset`` attribute. Must be b128 (16B) aligned.
 
     Each load is the plain rocdl intrinsic — under mode 2 the LLVM expert-scheduling
     hint inserts the RAW/WAR covers itself; under mode 0 the HW issue interlocks do."""
@@ -164,16 +170,20 @@ def _async_load_to_lds(gptrs, lds_ptrs, *, cluster):
     n = len(gptrs)
     if len(lds_ptrs) != n:
         raise ValueError(f"gptrs/lds_ptrs length mismatch: {n} vs {len(lds_ptrs)}")
+    if imm_offs is None:
+        imm_offs = [0] * n
+    elif len(imm_offs) != n:
+        raise ValueError(f"gptrs/imm_offs length mismatch: {n} vs {len(imm_offs)}")
 
-    for gptr, lds_ptr in zip(gptrs, lds_ptrs):
+    for gptr, lds_ptr, imm in zip(gptrs, lds_ptrs, imm_offs):
         if cluster:
             # FlyDSL 0.3.x b128 op takes (gptr, lds_ptr, offset, mask); its
             # expr.rocdl.cluster_load_async_to_lds wrapper still passes the old
             # positional order, so call the dialect op directly with a 0 mask.
             mask0 = _ir(fx.Int32(0))
-            rocdl_dialect.cluster_load_async_to_lds_b128(gptr, lds_ptr, 0, mask0)
+            rocdl_dialect.cluster_load_async_to_lds_b128(gptr, lds_ptr, imm, mask0)
         else:
-            rocdl_dialect.global_load_async_to_lds_b128(gptr, lds_ptr, 0)
+            rocdl_dialect.global_load_async_to_lds_b128(gptr, lds_ptr, imm)
 
 
 # ============================================================================
@@ -478,13 +488,27 @@ class KManager16b:
         ``_async_load_to_lds`` with no further address math. Pure index arithmetic (no
         memory op) so the caller can hoist all address VALU ahead of the load burst.
 
-        Returns ``(gptrs, lds_ptrs)`` — equal-length pointer lists, one 8(kv)x32(hdim)
+        Returns ``(gptrs, lds_ptrs, imm_offs)`` — equal-length lists, one 8(kv)x32(hdim)
         b128 per entry (length = ``n_wr_tile_rows*n_wr_tile_cols // num_waves``);
         ``gptrs`` global (address-space 1) sources, ``lds_ptrs`` LDS (address-space 3)
-        destinations. The 8x32 write-tile grid is spread round-robin across the waves
-        (warp ``w`` streams tiles ``w, w+num_waves, ...``); per tile lane -> (wr_row =
-        lane//4, chunk = lane%4). Rows >= ``kv_valid`` are clamped in-bounds when
-        ``check_oob`` (masked later in softmax)."""
+        destinations, ``imm_offs`` per-load COMPILE-TIME byte immediates for the async
+        op. Rows >= ``kv_valid`` are clamped in-bounds when ``check_oob`` (masked later
+        in softmax).
+
+        **Immediate column-stride (HK trick, when num_waves == n_wr_tile_rows):** each
+        warp owns exactly one 8-kv row-block and streams all ``n_wr_tile_cols`` hdim
+        columns of it. Every column shares the SAME VRAM row (token) and differs only in
+        the hdim column -- a compile-time byte stride -- so the row's global base is
+        computed ONCE (one pointer, one row-multiply, reused across the columns) and the
+        async immediate carries the column stride. The immediate hits src+dst in lockstep
+        (GPU-verified), so it is pre-SUBTRACTED from the swizzled LDS dest to cancel there
+        and act as a global-only stride. Collapses N global pointers -> 1. Other configs
+        (a warp spanning multiple kv rows -> runtime row stride, not immediate-able) fall
+        back to the per-tile round-robin path with imm=0.
+
+        Round-robin fallback: the 8x32 write-tile grid is spread across the waves (warp
+        ``w`` streams tiles ``w, w+num_waves, ...``); per tile lane -> (wr_row = lane//4,
+        chunk = lane%4)."""
         n_tiles = self.n_wr_tile_rows * self.n_wr_tile_cols
         if n_tiles % self.num_waves != 0:
             raise NotImplementedError(
@@ -494,7 +518,36 @@ class KManager16b:
         base_i64 = fx.Int64(fx.ptrtoint(fx.get_iter(ptr_K)))
         wr_row = lane_idx // 4  # kv row within the 8-row write tile [0,8)
         chunk = lane_idx % 4  # which 8-hdim b128 [0,4) -> spans the 32-wide tile
-        gptrs, lds_ptrs = [], []
+        gptrs, lds_ptrs, imm_offs = [], [], []
+
+        if self.num_waves == self.n_wr_tile_rows:
+            # One 8-kv row-block per warp; stride the hdim columns by immediate.
+            row_idx = warp_idx * fx.Int32(_K_WR_TILE_KV)
+            tile_row = row_idx // _WMMA_M  # which 16-kv LDS tile (runtime; once/warp)
+            row_in_tile = (row_idx % _WMMA_M) + wr_row  # row within that tile [0,16)
+            kv_row = row_idx + wr_row
+            if check_oob:
+                kv_row = (kv_row < kv_valid).select(kv_row, fx.Int32(0))  # clamp OOB
+            token = kv_row0 + kv_row
+            # Row base at hdim column 0 (col term lives in the immediate); computed once.
+            g_base = token * stride_k_seq + kv_head * stride_k_head + (
+                chunk * _CHUNK_ELEMS
+            ) * _BF16_BYTES
+            gptr = buffer_ops.create_llvm_ptr(base_i64 + fx.Int64(g_base), address_space=1)
+            for i in fx.range_constexpr(self.n_wr_tile_cols):
+                col_idx = i * _K_WR_TILE_HD  # compile-time
+                tile_col = col_idx // _WMMA_K  # == i
+                imm = col_idx * _BF16_BYTES  # compile-time byte immediate (16B aligned)
+                lds_off = (
+                    ptr_lds
+                    + self._lds_byte(tile_row, tile_col, row_in_tile, chunk)
+                    - fx.Int32(imm)  # pre-cancel the immediate on the LDS side
+                )
+                gptrs.append(gptr)  # same source reused across the columns
+                lds_ptrs.append(buffer_ops.create_llvm_ptr(lds_off, address_space=3))
+                imm_offs.append(imm)
+            return gptrs, lds_ptrs, imm_offs
+
         for i in fx.range_constexpr(n_tiles // self.num_waves):
             tile_id = warp_idx + fx.Int32(i * self.num_waves)
             row_idx = (tile_id // self.n_wr_tile_cols) * _K_WR_TILE_KV
@@ -516,7 +569,8 @@ class KManager16b:
             )
             lds_off = ptr_lds + self._lds_byte(tile_row, tile_col, row_in_tile, chunk)
             lds_ptrs.append(buffer_ops.create_llvm_ptr(lds_off, address_space=3))
-        return gptrs, lds_ptrs
+            imm_offs.append(0)
+        return gptrs, lds_ptrs, imm_offs
 
     # ------------------------------------------------------------------
     def ds_load_ptrs(self, *, ptr_lds, lane_idx):
@@ -645,15 +699,19 @@ class VManager16b:
         with no further address math. Pure index arithmetic (no memory op) so the caller
         can hoist all address VALU ahead of the load burst.
 
-        Returns ``(gptrs, lds_ptrs)`` — equal-length pointer lists, one 8(kv)x32(d)
+        Returns ``(gptrs, lds_ptrs, imm_offs)`` — equal-length lists, one 8(kv)x32(d)
         b128 per entry (length = ``n_wr_tile_rows*n_wr_tile_cols // num_waves``);
         ``gptrs`` global (address-space 1) sources, ``lds_ptrs`` LDS (address-space 3)
-        destinations (new V swizzle). The 8x32 write-tile grid is spread round-robin
-        across the waves (warp ``w`` streams tiles ``w, w+num_waves, ...``); per tile
-        lane -> (wr_row = lane//4, chunk = lane%4). The global read is coalesced (d
-        contiguous); the LDS write is swizzled. Rows >= ``kv_valid`` are clamped
-        in-bounds on the GLOBAL side when ``check_oob`` (masked later in softmax); the
-        LDS position uses the UNCLAMPED kv_row."""
+        destinations (new V swizzle), ``imm_offs`` per-load compile-time byte immediates.
+        The global read is coalesced (d contiguous); the LDS write is swizzled. Rows >=
+        ``kv_valid`` are clamped in-bounds on the GLOBAL side when ``check_oob`` (masked
+        later in softmax); the LDS position uses the UNCLAMPED kv_row.
+
+        **Immediate column-stride (HK trick, when num_waves == n_wr_tile_rows):** as in
+        ``KManager16b.global_load_ptrs`` -- one 8-kv row-block per warp, the d columns
+        share a VRAM row so the row base is computed once and the async immediate carries
+        the d stride (pre-subtracted from the swizzled LDS dest, which it also shifts).
+        Other configs fall back to the per-tile round-robin path with imm=0."""
         n_tiles = self.n_wr_tile_rows * self.n_wr_tile_cols
         if n_tiles % self.num_waves != 0:
             raise NotImplementedError(
@@ -663,7 +721,35 @@ class VManager16b:
         v_base_i64 = fx.Int64(fx.ptrtoint(fx.get_iter(ptr_V)))
         wr_row = lane_idx // 4  # kv row within the 8-row write tile [0,8)
         chunk = lane_idx % 4  # which 8-d b128 [0,4) -> spans the 32-wide tile
-        gptrs, lds_ptrs = [], []
+        gptrs, lds_ptrs, imm_offs = [], [], []
+
+        if self.num_waves == self.n_wr_tile_rows:
+            # One 8-kv row-block per warp; stride the d columns by immediate.
+            row_idx = warp_idx * fx.Int32(_V_WR_TILE_KV)
+            kv_row = row_idx + wr_row  # UNCLAMPED (LDS position); once/warp
+            safe_kv = kv_row
+            if check_oob:
+                safe_kv = (kv_row < kv_valid).select(kv_row, fx.Int32(0))  # clamp OOB
+            token = kv_row0 + safe_kv
+            # Row base at d column 0 (col term lives in the immediate); computed once.
+            g_base = token * stride_v_seq + kv_head * stride_v_head + (
+                chunk * _CHUNK_ELEMS
+            ) * _BF16_BYTES
+            gptr = buffer_ops.create_llvm_ptr(v_base_i64 + fx.Int64(g_base), address_space=1)
+            for i in fx.range_constexpr(self.n_wr_tile_cols):
+                col_idx = i * _V_WR_TILE_HD  # compile-time
+                imm = col_idx * _BF16_BYTES  # compile-time byte immediate (16B aligned)
+                d_col = fx.Int32(col_idx) + chunk * _CHUNK_ELEMS  # UNCLAMPED for LDS
+                lds_off = (
+                    ptr_lds
+                    + self._lds_byte(kv_row, d_col)
+                    - fx.Int32(imm)  # pre-cancel the immediate on the LDS side
+                )
+                gptrs.append(gptr)  # same source reused across the d columns
+                lds_ptrs.append(buffer_ops.create_llvm_ptr(lds_off, address_space=3))
+                imm_offs.append(imm)
+            return gptrs, lds_ptrs, imm_offs
+
         for i in fx.range_constexpr(n_tiles // self.num_waves):
             tile_id = warp_idx + fx.Int32(i * self.num_waves)
             row_idx = (tile_id // self.n_wr_tile_cols) * _V_WR_TILE_KV
@@ -681,7 +767,8 @@ class VManager16b:
             # LDS position uses the UNCLAMPED kv_row (global read uses clamped safe_kv).
             lds_off = ptr_lds + self._lds_byte(kv_row, d_col)
             lds_ptrs.append(buffer_ops.create_llvm_ptr(lds_off, address_space=3))
-        return gptrs, lds_ptrs
+            imm_offs.append(0)
+        return gptrs, lds_ptrs, imm_offs
 
     # ------------------------------------------------------------------
     def ds_load_ptrs(self, *, ptr_lds, lane_idx):

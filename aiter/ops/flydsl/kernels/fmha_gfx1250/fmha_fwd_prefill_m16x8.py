@@ -595,7 +595,7 @@ def _core_attention(
     # pointers via a constant immediate offset.
     start_pp = 0
     start_row0 = start_tile * fx.Int32(n_block)
-    k_gptrs, k_lds_ptrs = k_mgr.global_load_ptrs(
+    k_gptrs, k_lds_ptrs, k_imm_offs = k_mgr.global_load_ptrs(
         ptr_lds=_k_lds_buf(start_pp),
         ptr_K=ptr_K,
         stride_k_seq=stride_k_seq,
@@ -606,7 +606,7 @@ def _core_attention(
         warp_idx=warp_idx,
         lane_idx=lane_idx,
     )
-    v_gptrs, v_lds_ptrs = v_mgr.global_load_ptrs(
+    v_gptrs, v_lds_ptrs, v_imm_offs = v_mgr.global_load_ptrs(
         ptr_lds=_v_lds_buf(start_pp),
         ptr_V=ptr_V,
         stride_v_seq=stride_v_seq,
@@ -628,8 +628,8 @@ def _core_attention(
     # (start_tile)'s K and V into its ping-pong buffer (the ONLY use of the full-block
     # loaders; later tiles prefetch inside the loop). Nothing runs between these loads
     # and the prologue barrier.
-    _async_load_to_lds(k_gptrs, k_lds_ptrs, cluster=True)
-    _async_load_to_lds(v_gptrs, v_lds_ptrs, cluster=True)
+    _async_load_to_lds(k_gptrs, k_lds_ptrs, cluster=True, imm_offs=k_imm_offs)
+    _async_load_to_lds(v_gptrs, v_lds_ptrs, cluster=True, imm_offs=v_imm_offs)
     # mode-2 async-source-WAR fix (ISA-proven): the prologue cluster_loads (K + V) must
     # issue as ONE packed burst before the compiler reuses their source address VGPRs
     # (part2's Q-scaling clobbers exactly those regs). Lighter fences here (s_wait_asynccnt
@@ -728,7 +728,7 @@ def _core_attention(
         nxt = t + fx.Int32(1)
         nxt_row0 = nxt * fx.Int32(n_block)
         nxt_valid = _kv_valid(nxt_row0)
-        k_next_gptrs, k_next_lds_ptrs = k_mgr.global_load_ptrs(
+        k_next_gptrs, k_next_lds_ptrs, k_next_imm = k_mgr.global_load_ptrs(
             ptr_lds=_k_lds_buf(nxt_pp),
             ptr_K=ptr_K,
             stride_k_seq=stride_k_seq,
@@ -739,7 +739,7 @@ def _core_attention(
             warp_idx=warp_idx,
             lane_idx=lane_idx,
         )
-        v_next_gptrs, v_next_lds_ptrs = v_mgr.global_load_ptrs(
+        v_next_gptrs, v_next_lds_ptrs, v_next_imm = v_mgr.global_load_ptrs(
             ptr_lds=_v_lds_buf(nxt_pp),
             ptr_V=ptr_V,
             stride_v_seq=stride_v_seq,
@@ -773,8 +773,8 @@ def _core_attention(
         k_values = k_mgr.load_k_to_reg(k_curr)
 
         def _prefetch_next_kv():
-            _async_load_to_lds(k_next_gptrs, k_next_lds_ptrs, cluster=True)
-            _async_load_to_lds(v_next_gptrs, v_next_lds_ptrs, cluster=True)
+            _async_load_to_lds(k_next_gptrs, k_next_lds_ptrs, cluster=True, imm_offs=k_next_imm)
+            _async_load_to_lds(v_next_gptrs, v_next_lds_ptrs, cluster=True, imm_offs=v_next_imm)
 
         scf_if_dispatch(nxt < fx.Int32(n_tiles), _prefetch_next_kv)
 
