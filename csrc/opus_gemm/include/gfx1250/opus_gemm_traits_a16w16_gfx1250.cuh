@@ -226,16 +226,11 @@ struct opus_a16w16_4wave_compute_traits_gfx1250 {
     // That occupancy is the variable (rather than tile size or register
     // pressure) is pinned down by a control group: 71 variants whose registers
     // would admit two waves per SIMD but whose LDS does not are all correct,
-    // while the 61 where both admit two are all wrong. WHY 2 WG/CU broke it:
-    // two independent races -- a write-after-read on the ring, and a trailing
-    // "zero-extent" transfer that actually zero-fills the slot C is staged in --
-    // both since fixed in the pipelines. The pad stays on top because dropping
-    // it is a per-shape performance trade, not because anything is unexplained.
-    // See gen_co/KNOWN_ISSUES.md issue 1.
-    //
-    // -DOPUS_CO_NO_1WG_PAD removes the pad, which puts the affected variants
-    // back at 2 WG/CU and reproduces the corruption. It exists so the failure
-    // can be re-measured against a hypothesis; nothing ships with it.
+    // while the 61 where both admit two are all wrong. Both races behind it -- a
+    // write-after-read on the ring and a trailing "zero-extent" transfer that
+    // zero-fills the slot C stages in -- are fixed; the pad stays only because
+    // dropping it is a per-shape performance trade. See KNOWN_ISSUES.md issue 1.
+    // -DOPUS_CO_NO_1WG_PAD drops it, back to 2 WG/CU, for re-measuring.
     static constexpr int kHalfLds     = 160 * 1024;
 #ifdef OPUS_CO_NO_1WG_PAD
     static constexpr int LDS_BYTES    = SEG_BYTES_AB;
@@ -303,14 +298,8 @@ struct opus_cluster_tdm_splitk_ws_traits_gfx1250 {
     using D_C   = D_C_;                                // workspace dtype
     using D_ACC = D_ACC_;
     static_assert(std::is_same<D_A, D_B>::value, "A/B dtype must match");
-    // D_C is the SPLIT-K PARTIAL type, not the GEMM's output type -- the output
-    // dtype is a runtime choice the reduce makes. Either width is legal and the
-    // kid table picks per instance (OpusGemmInstance.splitk_workspace_dtype):
-    // fp32 partials cost twice the reduce read traffic, bf16 partials cost
-    // accuracy at split_k >= 2 (about sqrt(K) * 2^-8 of ABSOLUTE error into the
-    // sum, which swamps the near-zero outputs). It used to be pinned to float
-    // here and then overridden by a build-wide macro in the pipeline, so the
-    // declared type and the stored type disagreed.
+    // D_C is the split-K PARTIAL type, not the output dtype -- the reduce picks the
+    // output. Either width is legal; the kid table chooses (splitk_workspace_dtype).
     static_assert(std::is_same<D_C, float>::value || std::is_same<D_C, __bf16>::value,
                   "cluster_tdm_splitk_ws partial workspace must be float or __bf16");
 

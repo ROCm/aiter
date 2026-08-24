@@ -486,10 +486,8 @@ void gemm_a16w16_clusterlaunch_tdm_splitk_ws_kernel_gfx1250(opus_gemm_cluster_td
 
     // ---- Store the partial into ws[split_idx][padded_m][padded_n]. ----
     // bias is folded once by the reduce kernel (not here).
-    // The partial type is the traits' D_C, so it is a per-kid choice
-    // (OpusGemmInstance.splitk_workspace_dtype) rather than a build-wide one:
-    // bf16 halves the reduce's read traffic, fp32 keeps split_k >= 2 accurate.
-    // The reduce is instantiated with this same type -- they must not diverge.
+    // The partial type is the traits' D_C -- per kid (splitk_workspace_dtype), and
+    // the reduce is instantiated with the same D_C so the two cannot diverge.
     using DataWs          = typename T::DataC;
     constexpr int kCVec   = T::kCVec; // 4 (fp32 dwordx4 / bf16 dwordx2)
     DataWs* ws_ptr        = reinterpret_cast<DataWs*>(kargs.ptr_ws);

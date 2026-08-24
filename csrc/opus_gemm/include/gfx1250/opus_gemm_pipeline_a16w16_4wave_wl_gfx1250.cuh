@@ -688,12 +688,8 @@ __device__ void gemm_a16w16_4wave_wl_body_gfx1250(
                 // only at P == 3 -- at P == 2 a literal 1 lets the loop read a slot
                 // whose DMA has not landed, which is silent garbage, not a fault.
                 __builtin_amdgcn_s_wait_tensorcnt(PT::kSlots - 2);
-                // The step refills the slot it is reading -- slot g%P is consumed
-                // by step g and reloaded at its end for step g+P -- so this
-                // handshake carries a write-after-read as well as the fill it was
-                // written for, and that needs the reads RETIRED rather than
-                // merely issued: a barrier orders waves, not their in-flight LDS
-                // traffic. Same distinction the epilogue's ds_writes call out.
+                // WAR: this step refills the slot it reads, and a barrier orders
+                // waves, not in-flight LDS traffic -- so retire the reads first.
                 opus::s_wait_dscnt(opus::number<0>{});
             }
             opus::static_for<PT::kWmmaPerTile>([&](auto wmmaN) __attribute__((always_inline)) {
@@ -724,9 +720,8 @@ __device__ void gemm_a16w16_4wave_wl_body_gfx1250(
                 constexpr bool do_hs   = is_last && wmma == PT::kBarrierAhead - 1;
 
                 if constexpr (do_hs) {
-                    // Arrive and wait together. Split, the kBarrierAhead WMMAs
-                    // between the two let a wave that is ahead signal for the
-                    // NEXT step into this step's count.
+                    // Arrive and wait as one: split, a wave that is ahead signals the
+                    // next step into this step's count.
                     __builtin_amdgcn_s_barrier();
                     load_A(next, 0, 0);
                 }
@@ -793,11 +788,8 @@ __device__ void gemm_a16w16_4wave_wl_body_gfx1250(
             peel_slot = cur + 1;
         }
     });
-    // A step past the last is NOT a no-op transfer: measured on gfx1250, one
-    // whose origin is at or past either extent zero-fills its whole tile in LDS.
-    // C stages in the slot one of those is aimed at, so they have to be retired
-    // BEFORE the staging -- which the peeled step below already begins whenever
-    // it fuses any msb (kFusedMsb > 0).
+    // A step past the last is not a no-op: measured on gfx1250 it zero-fills its
+    // whole LDS tile, and C stages in one such slot -- so drain before staging.
     __builtin_amdgcn_s_wait_tensorcnt(0);
     smem_c = reinterpret_cast<DataC*>(
         smem_b + (size_t)((peel_slot + 1 == PT::kSlots) ? 0 : (peel_slot + 1)) * T::kSlotElemsB);
