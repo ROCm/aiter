@@ -93,19 +93,19 @@ class _StEngine:
             if b is not None:
                 try:
                     UncachedIpcHeap.close_mem_handle(int(b))
-                except RuntimeError:  # noqa: S110
+                except RuntimeError:
                     pass
         self._peer_bases = []
         if self._meta_ptr:
             try:
                 UncachedIpcHeap.free_device_mem(self._meta_ptr)
-            except RuntimeError:  # noqa: S110
+            except RuntimeError:
                 pass
             self._meta_ptr = None
         if self._buf_ptr:
             try:
                 UncachedIpcHeap.free_device_mem(self._buf_ptr)
-            except RuntimeError:  # noqa: S110
+            except RuntimeError:
                 pass
             self._buf_ptr = None
 
