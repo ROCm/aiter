@@ -172,7 +172,18 @@ def _adaptive_moe_sort(
     return std
 
 
-def _validate_output_buffer(output, shape, dtype, device, hidden_states=None):
+# `output`: caller-provided [M, model_dim] destination.
+#
+#     path                                      in-place?  why?
+#     opus / ck / flydsl sort + accumulate      yes        sort kernel zeroes what it is handed
+#     ... + reduce mode (non-EP)                yes        buffer is born in fused_moe_2stages
+#     FLAT 1stage (tuned flat=1/2)              no         kernel needs 8 spare bytes past the rows
+#     adaptive-aux sort (a4w4, atomic)          no         parameter not threaded yet
+#     grouped a4w4/a8w4 (gfx1250)               no         callee has no out param
+#
+# Not in-place => _return_output copies, so the contract holds either way;
+# only the saving is lost.
+def _validate_output_buffer_metadata(output, shape, dtype, device):
     if output is None:
         return
     # The buffer has to stand in for the tensor fused_moe would have allocated.
@@ -187,8 +198,13 @@ def _validate_output_buffer(output, shape, dtype, device, hidden_states=None):
             f"device={output.device} contiguous={output.is_contiguous()}, expected a "
             f"contiguous {tuple(shape)} {dtype} tensor on {device}"
         )
+
+
+def _validate_output_buffer_no_overlap(output, hidden_states):
+    if output is None:
+        return
     # Accumulate mode zeroes the output rows before stage1 reads hidden_states.
-    if hidden_states is not None and (
+    if (
         output.data_ptr() < hidden_states.data_ptr() + hidden_states.nbytes
         and hidden_states.data_ptr() < output.data_ptr() + output.nbytes
     ):
@@ -199,9 +215,7 @@ def _validate_output_buffer(output, shape, dtype, device, hidden_states=None):
 
 
 def _return_output(ret, output):
-    # `output` is always what fused_moe returns, so the paths that could not write
-    # it in place (FLAT, adaptive-aux, grouped a8w4, fhmoe) get copied here. They
-    # share return points with paths that did, hence the `is` test.
+    # Paths that already wrote output return it directly; others copy here.
     if output is None or ret is output:
         return ret
     return output.copy_(ret)
@@ -426,6 +440,7 @@ def moe_sorting(
     # FLAT kernel: in-kernel routing (manifest flat=1); pass through unsorted topk.
     # `output` cannot be written in place: FLAT needs extra bytes appended to moe_buf.
     if flat:
+        assert output is None, "FLAT over-allocates moe_buf; the caller copies"
         return _moe_prepare_unsorted_input(
             topk_ids, topk_weights, model_dim, moebuf_dtype
         )
@@ -618,7 +633,6 @@ def fused_moe(
         beta=beta,
         linear_beta=linear_beta,
         gate_mode=gate_mode,
-        output=output,
         ep_arena_handle=stage2_scatter.arena_handle if enable_ep_scatter else 0,
         ep_combine_input_offset=(
             stage2_scatter.combine_input_offset if enable_ep_scatter else 0
@@ -631,6 +645,7 @@ def fused_moe(
         ),
         ep_world_size=stage2_scatter.world_size if enable_ep_scatter else 0,
         ep_source_token_map=scatter_source_map,
+        output=output,
     )
 
 
@@ -674,10 +689,18 @@ def fused_moe_fake(
     M, _topk = topk_ids.shape
     dtype = hidden_states.dtype if dtype is None else dtype
     model_dim = w2.shape[1]
+    if ep_source_token_map is not None and output is not None:
+        raise RuntimeError(
+            "output= is incompatible with stage2_scatter: GEMM2 P2P-writes the "
+            "route-weighted results into the peers' combine buffers and returns an "
+            "uninitialized placeholder"
+        )
     # Unconditional: the runtime returns `output` on every path, and which kernel
     # writes it depends on env vars and tuned metadata the fake cannot see.
     if output is not None:
-        _validate_output_buffer(output, (M, model_dim), dtype, hidden_states.device)
+        _validate_output_buffer_metadata(
+            output, (M, model_dim), dtype, hidden_states.device
+        )
         return output
     return torch.empty((M, model_dim), dtype=dtype, device=device)
 
@@ -755,8 +778,8 @@ def fused_moe_(
         beta=beta,
         linear_beta=linear_beta,
         gate_mode=gate_mode,
-        output=output,
         stage2_scatter=stage2_scatter,
+        output=output,
     )
 
 
@@ -819,9 +842,16 @@ def _fused_moe_impl(
         dtypes.fp16,
         dtypes.bf16,
     ], f"Fused_moe unsupported out dtype: {dtype}"
-    _validate_output_buffer(
-        output, (M, model_dim), dtype, hidden_states.device, hidden_states
+    if stage2_scatter is not None and output is not None:
+        raise RuntimeError(
+            "output= is incompatible with stage2_scatter: GEMM2 P2P-writes the "
+            "route-weighted results into the peers' combine buffers and returns an "
+            "uninitialized placeholder"
+        )
+    _validate_output_buffer_metadata(
+        output, (M, model_dim), dtype, hidden_states.device
     )
+    _validate_output_buffer_no_overlap(output, hidden_states)
     quant_type = quant_remap.get(quant_type, quant_type)
     q_dtype_w = w1.dtype
     q_dtype_a = w1.dtype if w1.dtype != torch.uint32 else dtypes.fp8
@@ -1040,7 +1070,7 @@ def _fused_moe_impl(
             return_local_topk_ids=need_local_topk_ids,
             accumulate=not stage2_uses_route_reduce(metadata.stage2),
             flat=metadata.flat,
-            output=output,
+            output=None if metadata.flat else output,
         )
         if need_local_topk_ids:
             (
