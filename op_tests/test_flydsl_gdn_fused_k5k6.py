@@ -742,7 +742,7 @@ def bench_fused_k5k6(model_tag, H, Hg, T_flat, N, gate):
             k=inp["k"],
             w=inp["w_hm"],
             u=inp["u_hm"],
-            g=g_hip,
+            g=g_hm3,
             gk=inp["gk"],
             initial_state=inp["h0"],
             output_final_state=True,
