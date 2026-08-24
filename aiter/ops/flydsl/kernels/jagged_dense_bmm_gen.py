@@ -18,10 +18,12 @@ from collections import OrderedDict
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+from flydsl._mlir import ir
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr.typing import T
 
 from aiter.ops.flydsl.kernels import buffer_ops
+
 from ._buffer_utils import make_bounded_buffer_tensor
 
 BLOCK_M = 128
@@ -31,6 +33,8 @@ STAGES_A = 2
 THREADS = 256
 LDS_BYTES = 65536
 K_TILE_GRAN = 32  # MFMA K-tile loop uses BLOCK_K // 32 stages
+
+_DEFAULT_STREAM = fx.Stream(None)
 
 NXCD = 8
 XCD_W = 8
@@ -131,9 +135,7 @@ def _build_launcher(
                 tile_row = fx.Int32(pid_mn)
                 block_n_idx = fx.Int32(raw_b)
             base = tile_row * fx.Int32(2)
-            off_b = buffer_ops.buffer_load(
-                tile_rsrc, base, vec_width=1, dtype=T.i32
-            )
+            off_b = buffer_ops.buffer_load(tile_rsrc, base, vec_width=1, dtype=T.i32)
             block_m_idx = buffer_ops.buffer_load(
                 tile_rsrc, base + fx.Int32(1), vec_width=1, dtype=T.i32
             )
@@ -387,7 +389,7 @@ def _build_launcher(
         total_occ_tiles: int,
         n_groups: int,
         max_seq_len: int,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream = _DEFAULT_STREAM,
     ):
         if fx.const_expr(USE_MFMA_K32):
             tiled_mma = fx.make_tiled_mma(
@@ -469,13 +471,8 @@ def _build_launcher(
 
 
 def _drop_leaked_ir_contexts() -> None:
-    try:
-        from flydsl._mlir import ir
-
-        while ir.Context.current is not None:
-            ir.Context.current.__exit__(None, None, None)
-    except Exception:
-        pass
+    while ir.Context.current is not None:
+        ir.Context.current.__exit__(None, None, None)
 
 
 def _cache_get(key):
@@ -500,7 +497,7 @@ def jagged_dense_bmm(
     SEQ_OFFSETS,
     n_groups: int,
     max_seq_len: int,
-    stream: fx.Stream = fx.Stream(None),
+    stream: fx.Stream = _DEFAULT_STREAM,
     xcd_c: int | None = None,
     xcd_w: int | None = None,
     use_mfma_k32: bool | None = None,
