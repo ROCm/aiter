@@ -945,29 +945,19 @@ def _gemm1_body(
     if const_expr(k_wave == 1):
         run_k_slice(0)
     elif const_expr(k_wave == 2):
-
-        @flyc.jit
-        def dispatch_k_slice_2():
-            if wave_k == fx.Int32(0):
-                run_k_slice(0)
-            else:
-                run_k_slice(K_TILES_PER_WAVE)
-
-        dispatch_k_slice_2()
+        if wave_k == fx.Int32(0):
+            run_k_slice(0)
+        else:
+            run_k_slice(K_TILES_PER_WAVE)
     else:
-
-        @flyc.jit
-        def dispatch_k_slice_4():
-            if wave_k == fx.Int32(0):
-                run_k_slice(0)
-            elif wave_k == fx.Int32(1):
-                run_k_slice(K_TILES_PER_WAVE)
-            elif wave_k == fx.Int32(2):
-                run_k_slice(2 * K_TILES_PER_WAVE)
-            else:
-                run_k_slice(3 * K_TILES_PER_WAVE)
-
-        dispatch_k_slice_4()
+        if wave_k == fx.Int32(0):
+            run_k_slice(0)
+        elif wave_k == fx.Int32(1):
+            run_k_slice(K_TILES_PER_WAVE)
+        elif wave_k == fx.Int32(2):
+            run_k_slice(2 * K_TILES_PER_WAVE)
+        else:
+            run_k_slice(3 * K_TILES_PER_WAVE)
 
     gpu.barrier()
 

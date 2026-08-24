@@ -1872,7 +1872,12 @@ def _mxfp4_a4w4_stage1_fw(
         kernelName1=kernelName1,
         device=device,
         use_nt=p1["use_nt"],
-        interleave=p1["interleave"] or interleave,
+        # interleave is the gate/up layout of the w1 tensor we were handed, so it
+        # can only come from the caller. It must never be ORed with the "_il"/"_sep"
+        # tag in kernelName1: that tag records which layout the tuner benchmarked,
+        # and a tuned row naming "_il" applied to a SEPARATED w1 makes the kernel
+        # read gate columns as up (silent garbage, cosine ~0 -- see the caller).
+        interleave=interleave,
         num_waves=p1.get("num_waves", 4),
         native_scale_layout=native_scale_layout,
         k_wave=p1.get("k_wave", 1),
@@ -2526,11 +2531,27 @@ def get_2stage_cfgs(
         needs_reverse_sorted = (
             is_native_gemm2 and not parse_g2_kname_any(kernelName2)["atomic"]
         )
+        runtime_interleave = gate_mode == GateMode.INTERLEAVE
+        if _p1["interleave"] != runtime_interleave:
+            # The row was tuned against the other gate/up layout, so its recorded
+            # us1 does not describe this run. Honour the layout we actually hold --
+            # forcing the kernel to the tuned tag instead silently mixes gate and
+            # up columns and the MoE output degenerates to noise.
+            logger.warning(
+                "[fused_moe] tuned GEMM1 %r was tuned for gate_mode=%s but this "
+                "call passes gate_mode=%s; running the %s variant instead. "
+                "Re-tune this shape under %s for a valid perf config.",
+                kernelName1,
+                "interleave" if _p1["interleave"] else "separated",
+                gate_mode.value,
+                "interleave" if runtime_interleave else "separated",
+                gate_mode.value,
+            )
         return MOEMetadata(
             stage1=functools.partial(
                 _mxfp4_a4w4_stage1_fw,
                 kernelName1=kernelName1,
-                interleave=_p1["interleave"] or (gate_mode == GateMode.INTERLEAVE),
+                interleave=runtime_interleave,
                 native_scale_layout=_bm == 16
                 and isinstance(kernelName2, str)
                 and kernelName2.startswith("flydsl_mxmoe_g2_"),
