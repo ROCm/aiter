@@ -33,8 +33,8 @@
     },
     "M_LEQ_256": {
         "BLOCK_M": 128,
-        "BLOCK_N": 256,
-        "BLOCK_K": 256,
+        "BLOCK_N": 128,
+        "BLOCK_K": 128,
         "GROUP_SIZE_M": 2,
         "NUM_BUFFERS": 2,
         "num_warps": 2
