@@ -542,21 +542,10 @@ class KManager16b:
             bases.append(buffer_ops.create_llvm_ptr(off, address_space=3))
         return bases
 
-    def load_k_to_reg(self, *, base_ptrs, lds_imm_offset=0):
-        """Issue EVERY K ``ds_load_b128`` for one resident KV block as a single
-        back-to-back burst from the 2 base pointers of ``ds_load_ptrs``, returning the
-        raw v8-bf16 results in the exact ``_qk_gemm`` consume order
-        ``[(kv, dt, half) ...]`` (``NKV = n_block//_WMMA_M`` kv-tiles x ``NDT =
-        qk_hdim//_WMMA_K`` d-tiles x 2 halves, length ``NKV*NDT*2``).
-
-        Each ``(kv, dt, half)`` tile is ``base_ptrs[half]`` shifted by the compile-time
-        byte immediate ``(kv*hd_units + dt)*1024 + lds_imm_offset`` via a static-offset
-        GEP, which the AMDGPU backend folds into the ds_read ``offset:`` field (no
-        per-tile address VALU). ``lds_imm_offset`` (compile-time) selects the ping-pong
-        buffer: 0 for buffer 0, ``slot_bytes`` for buffer 1 (interleaved
-        ``[K.pp0|V.pp0][K.pp1|V.pp1]`` layout). Keeping the LDS reads out of the WMMA
-        stream avoids the ~24-cyc wmma->ds_load bubble (see [[gfx1250-wmma-dsload-bubble]]);
-        no ``s_wait_dscnt`` here — ``_qk_gemm`` drains the burst before its first WMMA."""
+    def load_k_to_reg(self, base_ptrs, lds_imm_offset=0):
+        """Burst all K ``ds_load_b128`` for the resident block from the 2 bases of
+        ``ds_load_ptrs`` (buffer selected by ``base_ptrs``), in ``_qk_gemm`` order
+        ``[(kv, dt, half) ...]``."""
         v8_ty = fx.Vector.make_type(8, fx.BFloat16)
         tile_stride = _WMMA_M * _WMMA_K * _BF16_BYTES  # 1024: lane-independent tile step
         NKV = self.n_block // _WMMA_M
@@ -719,31 +708,18 @@ class VManager16b:
             bases.append(buffer_ops.create_llvm_ptr(addr, address_space=3))
         return bases
 
-    def load_v_to_reg(self, *, base_ptrs, lds_imm_offset=0):
-        """Burst EVERY V ``ds_load_tr16_b128`` (transpose load) for one resident KV block
-        from the 2 base pointers of ``ds_load_ptrs``, returning the raw v8-bf16 results in
-        the exact ``_pv_gemm`` consume order ``[(dt, kt, half) ...]`` (``d_tiles =
-        v_hdim//_WMMA_M`` output d-tiles x ``nkt = n_block//_WMMA_K`` kv tiles x 2 halves,
-        length ``d_tiles*nkt*2``).
-
-        Each ``(dt, kt, half)`` tile is ``base_ptrs[dt & 1]`` shifted by a compile-time
-        byte immediate via a static-offset GEP (folded into the ds_read ``offset:``
-        field). The immediate is derived by reusing ``_lds_byte`` at lane 0 — since the
-        key-minus-rep byte delta is lane-independent, the lane-0 scalar delta IS the
-        universal immediate — plus ``lds_imm_offset`` (0 for ping-pong buffer 0,
-        ``slot_bytes`` for buffer 1). Kept OUT of the WMMA stream (avoids the
-        wmma->ds_load bubble, see [[gfx1250-wmma-dsload-bubble]]); no ``s_wait_dscnt``
-        here — ``_pv_gemm`` drains the burst before its first WMMA."""
+    def load_v_to_reg(self, base_ptrs, lds_imm_offset=0):
+        """Burst all V ``ds_load_tr16_b128`` for the resident block from the 2 bases of
+        ``ds_load_ptrs`` (buffer selected by ``base_ptrs``), in ``_pv_gemm`` order
+        ``[(dt, kt, half) ...]``."""
         v8_ty = fx.Vector.make_type(8, fx.BFloat16)
         d_tiles = self.v_hdim // _WMMA_M
         nkt = self.n_block // _WMMA_K
         out = []
         for dt in range(d_tiles):
-            # rep for this key's class is (dt=dt&1, kt=0, half=0): lane-0 fetch (0, (dt&1)*16)
             rep_off = self._lds_byte(0, (dt % 2) * _WMMA_M)
             for kt in range(nkt):
                 for half in range(2):
-                    # lane-0 fetch for this key: kv_idx = kt*32 + half*16, d_idx = dt*16
                     key_off = self._lds_byte(kt * _WMMA_K + half * _WMMA_M, dt * _WMMA_M)
                     imm = (key_off - rep_off) + lds_imm_offset
                     p = base_ptrs[dt % 2]

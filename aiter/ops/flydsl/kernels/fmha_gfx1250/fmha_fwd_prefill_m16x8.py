@@ -632,25 +632,25 @@ def _core_attention(
         _raw(d_init),
     ] + [_raw(fx.Vector.filled(8, 0.0, fx.Float32)) for _ in range(d_tiles)]
 
-    # ---- Hoisted ds_load LDS base pointers: compute the 2 per-lane LDS->VGPR base
-    # pointers for BOTH K and V exactly ONCE here, for ping-pong buffer 0. Each block's
-    # full set of ds_load addresses collapses to just 2 bases (K: split by half; V: by
-    # d-tile parity) + compile-time immediates applied inside load_k_to_reg/load_v_to_reg
-    # -- saving ~15 address VGPRs/lane each vs the former 32-pointer lists. The
-    # 2x-unrolled body reaches buffer 1 by adding the compile-time LDS_SIZE_K_V immediate
-    # (buffer 1 is slot_bytes past buffer 0 for both K and V in the interleaved
-    # [K.pp0|V.pp0][K.pp1|V.pp1] layout), folded together with the per-tile immediate into
-    # the ds_read offset: field -- so per-tile ds address VALU is eliminated. ----
-    LDS_SIZE_K_V = slot_bytes  # k_blk_bytes + v_blk_bytes; buffer-1 stride for K and V
-    k_lds_ld_ptrs = k_mgr.ds_load_ptrs(ptr_lds=_k_lds_buf(0), lane_idx=lane_idx)
-    v_lds_ld_ptrs = v_mgr.ds_load_ptrs(ptr_lds=_v_lds_buf(0), lane_idx=lane_idx)
+    # ---- ds_load LDS base pointers (2 per mgr) for both ping-pong buffers, carried as
+    # iter_args and swapped curr<->next each iteration (buffer selected by pointer, not
+    # immediate -> scales past n_block=64). Swap lowers to 4 s_swap_b32. ----
+    k_lds_ld_curr_ptrs = k_mgr.ds_load_ptrs(ptr_lds=_k_lds_buf(0), lane_idx=lane_idx)
+    v_lds_ld_curr_ptrs = v_mgr.ds_load_ptrs(ptr_lds=_v_lds_buf(0), lane_idx=lane_idx)
+    k_lds_ld_next_ptrs = k_mgr.ds_load_ptrs(ptr_lds=_k_lds_buf(1), lane_idx=lane_idx)
+    v_lds_ld_next_ptrs = v_mgr.ds_load_ptrs(ptr_lds=_v_lds_buf(1), lane_idx=lane_idx)
+    _PTR_BASE = len(_init)  # index of the first ds pointer within loop-carried state
+    _init = _init + [
+        k_lds_ld_curr_ptrs[0], k_lds_ld_curr_ptrs[1],
+        k_lds_ld_next_ptrs[0], k_lds_ld_next_ptrs[1],
+        v_lds_ld_curr_ptrs[0], v_lds_ld_curr_ptrs[1],
+        v_lds_ld_next_ptrs[0], v_lds_ld_next_ptrs[1],
+    ]
 
     # ========================================================================
     # Main KV loop -- stream tiles [start_tile, n_tiles) through the N_KV_PP ping-pong
-    # ring, MANUALLY UNROLLED BY 2. Buffer selection is by 0-based LOCAL iteration
-    # parity made COMPILE-TIME by the unroll: even local iter -> buffer 0, odd ->
-    # buffer 1. Because the buffer is compile-time, the ds_load LDS source pointers are
-    # computed once (above, for buffer 0) and buffer 1 is reached by a folded immediate.
+    # ring, one tile per iteration. The buffer is selected by the carried curr ds
+    # pointers, swapped curr<->next at the end of each `main_loop`.
     #
     # Each `main_loop` call is one tile: it drains outstanding async + barriers (its KV
     # is then GUARANTEED resident -- start_tile from the prologue, every later tile from
@@ -658,19 +658,13 @@ def _core_attention(
     # tile t+1 prefetch UP FRONT into the other buffer, then computes QK->softmax->PV on
     # its own buffer while that async copy runs, drained at the next call's top.
     #
-    # The step-2 scf.for covers the even-count prefix [start_tile, even_hi_tile); a
-    # runtime scf.if handles the final tile when the local tile count is odd (a naive
-    # step-2 loop would run one tile past n_tiles).
-    #
     # TODO(perf): go finer still -- per-write-tile async_load interleaved between the
     # QK/softmax/PV ops (order tuned by thread trace) rather than one bulk burst.
     # ========================================================================
-    def main_loop(t, is_odd, state):
-        # Compile-time ping-pong: even local iter -> buffer 0, odd -> buffer 1. This
-        # tile reads its own buffer (buffer-0 pointers + this immediate); the tile t+1
-        # prefetch writes the OTHER buffer.
-        lds_imm_offset = LDS_SIZE_K_V if is_odd else 0
-        nxt_pp_const = 0 if is_odd else 1
+    def main_loop(t, state):
+        # Runtime ping-pong: this tile reads its curr buffer (carried curr pointers); the
+        # tile t+1 prefetch writes the next buffer, and curr<->next are swapped in the yield.
+        nxt_pp = (t - start_tile + fx.Int32(1)) % fx.Int32(2)
 
         kv_tile_start = t * fx.Int32(n_block)  # this tile's first (batch-relative) kv row
 
@@ -678,6 +672,10 @@ def _core_attention(
         m_prev = fx.Float32(state[0])
         d_prev = fx.Float32(state[1])
         o_acc = [fx.Vector(state[2 + dt]) for dt in range(d_tiles)]
+        k_curr = [state[_PTR_BASE + 0], state[_PTR_BASE + 1]]
+        k_next = [state[_PTR_BASE + 2], state[_PTR_BASE + 3]]
+        v_curr = [state[_PTR_BASE + 4], state[_PTR_BASE + 5]]
+        v_next = [state[_PTR_BASE + 6], state[_PTR_BASE + 7]]
 
         # ---- Address phase: compute ALL K + V pointers as pure VALU up front, BEFORE
         # the async drain so this address VALU overlaps the outstanding copy -- the
@@ -689,7 +687,7 @@ def _core_attention(
         nxt_row0 = nxt * fx.Int32(n_block)
         nxt_valid = _kv_valid(nxt_row0)
         k_next_gptrs, k_next_lds_ptrs = k_mgr.global_load_ptrs(
-            ptr_lds=_k_lds_buf(nxt_pp_const),
+            ptr_lds=_k_lds_buf(nxt_pp),
             ptr_K=ptr_K,
             stride_k_seq=stride_k_seq,
             stride_k_head=stride_k_head,
@@ -700,7 +698,7 @@ def _core_attention(
             lane_idx=lane_idx,
         )
         v_next_gptrs, v_next_lds_ptrs = v_mgr.global_load_ptrs(
-            ptr_lds=_v_lds_buf(nxt_pp_const),
+            ptr_lds=_v_lds_buf(nxt_pp),
             ptr_V=ptr_V,
             stride_v_seq=stride_v_seq,
             stride_v_head=stride_v_head,
@@ -730,7 +728,7 @@ def _core_attention(
         # slot n_tiles%N_KV_PP -- exactly the slot the O epilogue reuses -- which races
         # the epilogue's O write across waves. Skipping it leaves that slot idle so the
         # epilogue needs no barrier. nxt_valid still clamps the mask_right tail. ----
-        k_values = k_mgr.load_k_to_reg(base_ptrs=k_lds_ld_ptrs, lds_imm_offset=lds_imm_offset)
+        k_values = k_mgr.load_k_to_reg(k_curr)
 
         def _prefetch_next_kv():
             _async_load_to_lds(k_next_gptrs, k_next_lds_ptrs, cluster=True)
@@ -752,7 +750,7 @@ def _core_attention(
         # latency hides under softmax's VALU; the values are consumed by _pv_gemm
         # after the rescale. ----
         rocdl.sched_barrier(0)
-        v_values = v_mgr.load_v_to_reg(base_ptrs=v_lds_ld_ptrs, lds_imm_offset=lds_imm_offset)
+        v_values = v_mgr.load_v_to_reg(v_curr)
         rocdl.sched_barrier(0)
 
         # ---- Softmax: online update over this KV tile's kv axis. ----
@@ -792,38 +790,27 @@ def _core_attention(
             o_acc=o_resc,
         )
 
-        return [_raw(m_new), _raw(d_new)] + [_raw(o) for o in o_new]
+        # Yield state with K/V ds pointers swapped curr<->next (4 s_swap_b32).
+        return (
+            [_raw(m_new), _raw(d_new)]
+            + [_raw(o) for o in o_new]
+            + [k_next[0], k_next[1], k_curr[0], k_curr[1]]
+            + [v_next[0], v_next[1], v_curr[0], v_curr[1]]
+        )
 
-    # ---- Even-count prefix: [start_tile, even_hi_tile) stepped by 2; each scf iteration
-    # runs a (buffer 0, buffer 1) pair. n_iter / even_hi_tile are runtime (start_tile and
-    # n_tiles depend on the compiled masks + kv_len). ----
+    # ---- Stream tiles [start_tile, n_tiles) one per iteration; ping-pong buffer selected
+    # by the carried curr ds pointers, swapped each iteration. ----
     n_iter = fx.Int32(n_tiles) - start_tile
-    even_hi_tile = start_tile + (n_iter // fx.Int32(2)) * fx.Int32(2)
 
     _lo = arith.index_cast(T.index, arith.unwrap(start_tile))
-    _hi = arith.index_cast(T.index, arith.unwrap(even_hi_tile))
-    _step = arith.index(2)
+    _hi = arith.index_cast(T.index, arith.unwrap(fx.Int32(n_tiles)))
+    _step = arith.index(1)
 
     for _tile_iv, _iargs, _loop_res in scf.for_(_lo, _hi, _step, iter_args=_init):
         t0 = fx.Int32(arith.index_cast(T.i32, _tile_iv))
-        _st = main_loop(t0, False, list(_iargs))
-        _st = main_loop(t0 + fx.Int32(1), True, _st)
-        scf.yield_(_st)
+        scf.yield_(main_loop(t0, list(_iargs)))
 
-    # ---- Runtime remainder: one trailing tile in buffer 0 when the local tile count is
-    # odd (even_hi_tile < n_tiles iff n_iter is odd). Value-returning scf.if threads the
-    # same loop-carried state; the else branch passes it through unchanged. ----
-    _res_types = [r.type for r in _loop_res]
-    _rem_if = scf.IfOp(
-        arith.unwrap(even_hi_tile < fx.Int32(n_tiles)),
-        _res_types,
-        has_else=True,
-    )
-    with ir.InsertionPoint(_rem_if.then_block):
-        scf.yield_(main_loop(even_hi_tile, False, list(_loop_res)))
-    with ir.InsertionPoint(_rem_if.else_block):
-        scf.yield_(list(_loop_res))
-    final = _rem_if.results
+    final = _loop_res
 
     # ========================================================================
     # Epilogue: normalize O by the running denom d, then reshape+store to VRAM.
