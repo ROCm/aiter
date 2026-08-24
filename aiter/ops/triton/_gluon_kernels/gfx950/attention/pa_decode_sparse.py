@@ -41,6 +41,9 @@ from aiter.ops.triton.utils.common_utils import strip_annotate
 # row is guarded), so propagate instead.
 _MAX_PROP_NAN: gl.constexpr = gl.constexpr(PropagateNan.ALL)
 
+_CG: gl.constexpr = gl.constexpr(".cg")
+_NO_CACHE: gl.constexpr = gl.constexpr("")
+
 
 @gluon.jit
 def _max2(a, b):
@@ -60,7 +63,7 @@ def _cache_load(
     USE_BUFFER_LOAD: gl.constexpr,
     mask=None,
     other=None,
-    CACHE: gl.constexpr = gl.constexpr(".cg"),
+    CACHE: gl.constexpr = _CG,
 ):
     """Gather rows[i] + col[j]. row is the per-token offset in ptr's element
     units; col a small compile-time arange. Keeping them apart resolves one
@@ -1679,8 +1682,8 @@ def _pa_decode_sparse(
     q_scl_ptr=None,
     Q_FP8: gl.constexpr = False,
     # Defaults keep every existing launch byte-identical; the MLA launcher opts in.
-    GATHER_CACHE: gl.constexpr = gl.constexpr(".cg"),
-    IDX_CACHE: gl.constexpr = gl.constexpr(""),
+    GATHER_CACHE: gl.constexpr = _CG,
+    IDX_CACHE: gl.constexpr = _NO_CACHE,
     ASYNC_LDS: gl.constexpr = False,
     RELAXED_LOAD: gl.constexpr = True,
     ROPE_VEC: gl.constexpr = 16,
