@@ -14,6 +14,7 @@ Usage:
 
 import argparse
 import itertools
+import math
 import os
 import sys
 
@@ -51,6 +52,17 @@ torch.set_default_device("cuda")
 _TIE_TOL = 1e-4
 
 _WEIGHT_TOL = 1e-4
+
+
+def _renorm_err(topk_weights):
+    """Max |sum(weights) - 1| per row, with non-finite mapped to a failing value.
+
+    A NaN weight makes the raw error NaN, and `NaN > _WEIGHT_TOL` is false, so
+    reporting it unmapped would let invalid weights pass as success.
+    """
+    err = float((topk_weights.sum(-1) - 1.0).abs().max())
+    return err if math.isfinite(err) else float("inf")
+
 
 # EP world size assumed by the eplb section; experts are sharded contiguously,
 # so rank r owns [r * num_experts / _EPLB_EP_SIZE, (r + 1) * ...).
@@ -624,7 +636,7 @@ def bench_topk_gating_ties(num_experts, num_tokens, topk, score_func, dtype):
     ret["fused TB/s"] = nbytes / us / 1e6
     ret["fused err"] = dropped / num_tokens
     ret["dup ids"] = dup
-    ret["renorm err"] = float((topk_weights.sum(-1) - 1.0).abs().max())
+    ret["renorm err"] = _renorm_err(topk_weights)
     return ret
 
 
@@ -708,7 +720,7 @@ def bench_topk_gating_eplb(
     ret["dup ids"] = dup
     ret["ep max share"] = max_rank_share(topk_ids)
     ret["ref ep max share"] = max_rank_share(i_ref)
-    ret["renorm err"] = float((topk_weights.sum(-1) - 1.0).abs().max())
+    ret["renorm err"] = _renorm_err(topk_weights)
     return ret
 
 
@@ -911,22 +923,32 @@ def main():
             )
             if cfg[0] % _EPLB_EP_SIZE == 0
         ]
-        df = [bench_topk_gating_eplb(*cfg) for cfg in eplb_configs]
-        df = pd.DataFrame(df)
-        aiter.logger.info(
-            "topk_gating fake-eplb EP balance summary (markdown):\n%s",
-            df.to_markdown(index=False),
-        )
-        errors = df[
-            (df["fused err"] > 0)
-            | (df["dup ids"] > 0)
-            | (df["ep max share"] > df["ref ep max share"] + 0.05)
-            | (df["renorm err"] > _WEIGHT_TOL)
-        ]
-        if len(errors) > 0:
-            print(f"\nERROR: {len(errors)} eplb config(s) failed!")
-            print(errors.to_string(index=False))
-            failed_sections.append("eplb")
+        # Experts are sharded across ranks, so only counts divisible by the EP
+        # size can run. If the caller picked none that qualify (e.g. --section
+        # eplb --num-experts 2) there is nothing to measure, and an empty frame
+        # has none of the columns the checks below index.
+        if not eplb_configs:
+            print(
+                f"SKIP: eplb needs num_experts divisible by {_EPLB_EP_SIZE}, "
+                f"none of {num_experts_list} qualify"
+            )
+        else:
+            df = [bench_topk_gating_eplb(*cfg) for cfg in eplb_configs]
+            df = pd.DataFrame(df)
+            aiter.logger.info(
+                "topk_gating fake-eplb EP balance summary (markdown):\n%s",
+                df.to_markdown(index=False),
+            )
+            errors = df[
+                (df["fused err"] > 0)
+                | (df["dup ids"] > 0)
+                | (df["ep max share"] > df["ref ep max share"] + 0.05)
+                | (df["renorm err"] > _WEIGHT_TOL)
+            ]
+            if len(errors) > 0:
+                print(f"\nERROR: {len(errors)} eplb config(s) failed!")
+                print(errors.to_string(index=False))
+                failed_sections.append("eplb")
 
     if failed_sections:
         print(
