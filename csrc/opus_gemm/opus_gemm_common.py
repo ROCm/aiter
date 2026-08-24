@@ -94,6 +94,11 @@ class OpusGemmInstance:
     prefetch_scale: bool = False
     fused_reduce: bool = False
     preload_sf: bool = False
+    # Optional override for the D_OUT=void split-K specialization.  None keeps
+    # the direct-output specialization's preload_sf setting; False lets an
+    # exact kid retain its tuned splitK=1 preload while using the equivalent
+    # lower-register-pressure path for FP32 workspace partials.
+    workspace_preload_sf: bool | None = None
     skip_scale_wait: bool = False
     pack_scale_on_demand: bool = False
     k1024_only: bool = False
@@ -437,6 +442,14 @@ _bmm_flatmm_local.update({
     kid: _a8w8_mxscale_bmm_flatmm_splitk(bm, bn, bk, wg, preload_sf=True)
     for kid, (bm, bn, bk, wg) in _BMM_MXSCALE_SPLITK_PRELOAD_TILES.items()
 })
+
+# ROCm 7.2.4 clang-22 assigns an illegal register class while compiling this
+# exact high-pressure PRELOAD_SF_LDS + D_OUT=void specialization after the
+# workspace kargs moved to a direct pointer.  Its splitK=1 BF16/FP32 kernels
+# keep PRELOAD_SF_LDS; only the split-K workspace specialization uses the
+# semantically equivalent non-preload implementation (the same geometry as
+# local kid 139).
+_bmm_flatmm_local[326].workspace_preload_sf = False
 
 
 def _a8w8_mxscale_bmm_minterleave(bm, bn, bk, wg_per_cu, skip_scale_wait=False):

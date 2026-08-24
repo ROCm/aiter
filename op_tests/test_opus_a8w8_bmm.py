@@ -317,38 +317,52 @@ def check_tilen_column_map():
 
 
 def check_splitk_workspace():
-    """Check one split-K result with automatic and caller-owned workspace."""
-    g, m, n, k = 2, 32, 128, 2048
-    O_mx, xs_mx, xs_fp32 = _quant_per_token_e8m0(_block_varied((g, m, k), k))
-    W_mx, ws_mx, ws_fp32 = _quant_block_e8m0(_block_varied((g, n, k), k))
-    O_in = O_mx.transpose(0, 1)
-    xs_in = xs_mx.transpose(0, 1)
-    ref = run_torch(O_mx, W_mx, xs_fp32, ws_fp32).transpose(0, 1)
-    auto_out = torch.empty((m, g, n), dtype=dtypes.bf16)
-    _run_opus(O_in, W_mx, auto_out, xs_in, ws_mx, 8000, split_k=2)
-
-    workspace = torch.empty(2 * g * m * n, dtype=torch.float32)
-    caller_out = torch.empty_like(auto_out)
-    _run_opus(
-        O_in,
-        W_mx,
-        caller_out,
-        xs_in,
-        ws_mx,
-        8000,
-        split_k=2,
-        workspace=workspace,
-    )
-    torch.cuda.synchronize()
-    for out in (auto_out, caller_out):
-        checkAllclose(
-            ref,
-            out.to(dtypes.fp32),
-            rtol=1e-2,
-            atol=1e-2,
-            msg="MXFP8 BMM split-K workspace",
+    """Check baseline and sfpreload-fallback split-K workspace paths."""
+    g, n, k = 2, 128, 2048
+    checks = 0
+    # kid8326 is the ROCm 7.2.4 regression: its splitK=1 path keeps scale
+    # preload, while D_OUT=void deliberately uses the same non-preload device
+    # specialization as kid8139.  M=128 makes both workspaces tightly sized.
+    for kid, m in ((8000, 32), (8326, 128)):
+        O_mx, xs_mx, xs_fp32 = _quant_per_token_e8m0(
+            _block_varied((g, m, k), k)
         )
-    return 2
+        W_mx, ws_mx, ws_fp32 = _quant_block_e8m0(_block_varied((g, n, k), k))
+        O_in = O_mx.transpose(0, 1)
+        xs_in = xs_mx.transpose(0, 1)
+        ref = run_torch(O_mx, W_mx, xs_fp32, ws_fp32).transpose(0, 1)
+
+        auto_out = torch.empty((m, g, n), dtype=dtypes.bf16)
+        _run_opus(O_in, W_mx, auto_out, xs_in, ws_mx, kid, split_k=2)
+
+        workspace = torch.empty(2 * g * m * n, dtype=torch.float32)
+        caller_out = torch.empty_like(auto_out)
+        _run_opus(
+            O_in,
+            W_mx,
+            caller_out,
+            xs_in,
+            ws_mx,
+            kid,
+            split_k=2,
+            workspace=workspace,
+        )
+        torch.cuda.synchronize()
+        for mode, out in (("automatic", auto_out), ("caller-owned", caller_out)):
+            err = checkAllclose(
+                ref,
+                out.to(dtypes.fp32),
+                rtol=1e-2,
+                atol=1e-2,
+                msg=f"MXFP8 BMM kid{kid} split-K {mode} workspace",
+            )
+            assert err <= _TILEN_REGRESSION_ERR_TOL, (
+                f"kid{kid} split-K {mode} workspace mismatch ratio {err:.4%} "
+                f"> {_TILEN_REGRESSION_ERR_TOL:.4%}"
+            )
+            checks += 1
+        torch.testing.assert_close(auto_out, caller_out, rtol=0, atol=0)
+    return checks
 
 
 # --- m_align guard ---------------------------------------------------------

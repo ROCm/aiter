@@ -1625,6 +1625,7 @@ void
   constexpr bool DIRECT_ONLY = @@DIRECT@@;
   constexpr bool PREFETCH_SCALE = @@PREFETCH@@;
   constexpr bool PRELOAD_SF_LDS = @@PRELOAD@@;
+  constexpr bool SPLITK_PRELOAD_SF_LDS = @@SPLITK_PRELOAD@@;
 
   AITER_CHECK(splitK >= 1, "splitK must be >= 1");
   if constexpr (DIRECT_ONLY) {
@@ -1712,7 +1713,9 @@ void
     // kernel casts to the runtime Y dtype). The fused host TU only sees a
     // no-default forward decl of @@KERNEL@@, so relying on the template's
     // default args here would fail overload resolution ("no matching function").
-    @@KERNEL@@<Traits, void, DIRECT_ONLY, PREFETCH_SCALE, PRELOAD_SF_LDS>
+    // The workspace specialization may use a lower-register-pressure scale
+    // path than this kid's tuned splitK=1 direct-output specialization.
+    @@KERNEL@@<Traits, void, DIRECT_ONLY, PREFETCH_SCALE, SPLITK_PRELOAD_SF_LDS>
         <<<grid_main, block_main, 0, stream>>>(kargs);
 
     constexpr int REDUCE_VEC = 8;
@@ -1811,12 +1814,16 @@ __global__ void opus_bmm_splitk_reduce_kernel(
     int stride_c, int stride_c_batch);
 """
 
+    workspace_preload_sf = (
+        k.preload_sf if k.workspace_preload_sf is None else k.workspace_preload_sf
+    )
     launcher = (
         _BMM_MXSCALE_SPLITK_LAUNCHER_BODY.replace("@@NAME@@", k.name)
         .replace("@@KERNEL@@", kernel_func)
         .replace("@@DIRECT@@", "true" if k.direct_only else "false")
         .replace("@@PREFETCH@@", "true" if k.prefetch_scale else "false")
         .replace("@@PRELOAD@@", "true" if k.preload_sf else "false")
+        .replace("@@SPLITK_PRELOAD@@", "true" if workspace_preload_sf else "false")
     )
 
     INSTANCE_IMPL = (
@@ -1850,25 +1857,27 @@ __global__ void opus_bmm_splitk_reduce_kernel(
     direct = "true" if k.direct_only else "false"
     prefetch = "true" if k.prefetch_scale else "false"
     preload = "true" if k.preload_sf else "false"
+    splitk_preload = "true" if workspace_preload_sf else "false"
 
-    def _dev(dtype_tag, d_out, dir_flag, pfk_flag):
+    def _dev(dtype_tag, d_out, dir_flag, pfk_flag, preload_flag):
         decl = (
             f"template __global__ void {kernel_func}<\n"
-            f"    {k.name}_Traits, {d_out}, {dir_flag}, {pfk_flag}, {preload}>({kargs_name});\n"
+            f"    {k.name}_Traits, {d_out}, {dir_flag}, {pfk_flag}, "
+            f"{preload_flag}>({kargs_name});\n"
         )
         cg._device_instantiations.append(
             {"kid_name": k.name, "dtype": dtype_tag, "device_decl": decl}
         )
 
-    _dev("bf16", "__bf16", direct, prefetch)
-    _dev("fp32", "float", direct, prefetch)
+    _dev("bf16", "__bf16", direct, prefetch, preload)
+    _dev("fp32", "float", direct, prefetch, preload)
     if not k.direct_only:
         # Split-K > 1 workspace path: host launches <Traits, void, DIRECT_ONLY,
-        # PREFETCH_SCALE, PRELOAD_SF_LDS>. DIRECT_ONLY is false here (direct kids
-        # never take the workspace path), but PREFETCH_SCALE / PRELOAD_SF_LDS must
-        # match the kid, else the <void, false, ...> instantiation is missing for
-        # prefetch/preload kids -> undefined symbol at load.
-        _dev("void", "void", "false", prefetch)
+        # PREFETCH_SCALE, SPLITK_PRELOAD_SF_LDS>. DIRECT_ONLY is false here
+        # (direct kids never take the workspace path).  The split-K preload flag
+        # normally inherits the kid, with a per-instance compiler workaround
+        # permitted by workspace_preload_sf.
+        _dev("void", "void", "false", prefetch, splitk_preload)
 
 
 _BMM_MXSCALE_MINTERLEAVE_LAUNCHER_BODY = r"""
