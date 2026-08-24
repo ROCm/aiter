@@ -13,14 +13,16 @@ Pattern mirrors ``aiter/ops/flydsl/kernels/moe_m_tile_map.py``:
 
 from __future__ import annotations
 
-import torch
-
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from aiter.ops.flydsl.kernels import buffer_ops
+import torch
 from flydsl.expr.typing import T
 
+from aiter.ops.flydsl.kernels import buffer_ops
+
 BLOCK_THREADS = 256
+
+_DEFAULT_STREAM = fx.Stream(None)
 
 
 @flyc.jit
@@ -81,7 +83,7 @@ def _launch_fused(
     TILE_MAP: fx.Tensor,
     n_groups: fx.Int32,
     block_m: fx.Int32,
-    stream: fx.Stream = fx.Stream(None),
+    stream: fx.Stream = _DEFAULT_STREAM,
 ):
     _fused_kernel(SEQ_OFFSETS, TILE_MAP, n_groups, block_m).launch(
         grid=(n_groups, 1, 1), block=(BLOCK_THREADS, 1, 1), stream=stream
