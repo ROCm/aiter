@@ -840,11 +840,15 @@ def gemm_a6w6_asm(
     B_scale: Tensor,
     out: Tensor,
     K: int,
-    kernelName: str = _KERNEL_NAME,
+    kernelName: str | None = None,
     alpha: float = 1.0,
 ) -> Tensor:
     if float(alpha) != 1.0:
         raise ValueError("gemm_a6w6 currently supports only alpha=1.0.")
+    if not kernelName:
+        if out.ndim != 2:
+            raise ValueError("gemm_a6w6_asm expects a 2D [M, N] output tensor.")
+        kernelName = _default_gemm_a6w6_kernel(*out.shape, K)
     _gemm_a6w6_asm(
         A,
         B,
@@ -852,7 +856,7 @@ def gemm_a6w6_asm(
         B_scale,
         out,
         int(K),
-        kernelName if kernelName else None,
+        kernelName,
         float(alpha),
     )
     return out

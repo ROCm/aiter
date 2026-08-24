@@ -167,6 +167,20 @@ class TestA6W6TuningLookup(unittest.TestCase):
 
 
 class TestA6W6ApiValidation(unittest.TestCase):
+    def test_asm_wrapper_selects_safe_default_kernel(self):
+        packed = torch.empty(0, dtype=torch.uint8, device="meta")
+        out = torch.empty((512, 55296), dtype=torch.bfloat16, device="meta")
+
+        with mock.patch.object(gemm_op_a6w6, "_gemm_a6w6_asm") as launch:
+            result = gemm_op_a6w6.gemm_a6w6_asm(
+                packed, packed, packed, packed, out, 6144
+            )
+
+        self.assertIs(result, out)
+        self.assertEqual(
+            launch.call_args.args[6], gemm_op_a6w6._SAFE_FALLBACK_KERNEL_NAME
+        )
+
     def test_torch_quantizer_rejects_non_matrix_input(self):
         with self.assertRaisesRegex(ValueError, r"2D \[R, K\] tensor"):
             gemm_op_a6w6.quant_mxfp6_torch(torch.empty((1, 1, 32)))
