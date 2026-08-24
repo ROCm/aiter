@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import os
+
 import torch
 import triton
 
@@ -28,8 +30,10 @@ _LOGGER = AiterTritonLogger()
 
 _USE_GEMM_SPLITK_BF16 = False
 
-# gfx1250 runs the triton preshuffle kernel; flip this to hand it back to gluon.
-_USE_GLUON_PRESHUFFLE = False
+# gfx1250 runs the triton preshuffle kernel by default; set
+# AITER_FORCE_GFX1250_GLUON_FP4=1 to force the gluon path back on. This is a
+# workaround switch kept for validation until the Triton-side fix lands.
+_USE_GLUON_PRESHUFFLE = os.environ.get("AITER_FORCE_GFX1250_GLUON_FP4", "0") == "1"
 
 
 def set_use_gemm_splitk_bf16(value: bool):
@@ -39,6 +43,9 @@ def set_use_gemm_splitk_bf16(value: bool):
 
 def use_gluon_preshuffle() -> bool:
     """Whether gemm_afp4wfp4_preshuffle dispatches to the gluon kernel.
+
+    Defaults to the triton kernel on gfx1250; set AITER_FORCE_GFX1250_GLUON_FP4=1
+    to force gluon. The env var is a no-op on every other arch.
 
     The two kernels consume different scale layouts (gluon: preshuffle_factor
     16 / scale_kwidth 4, triton: 32 / 8), so callers that shuffle scales
