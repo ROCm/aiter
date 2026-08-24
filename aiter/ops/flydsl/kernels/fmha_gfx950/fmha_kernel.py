@@ -7,7 +7,7 @@ CDNA wave64. Host Q/K/V stay width 72; LDS/PV tiles still pad D to 96
 because mfma 32x32x16 cannot use a 72-wide K/N. QK only runs ceil(72/16)=5
 K-steps (the last pad-16 is skipped). O stores mask D>=72.
 
-GEMM1/GEMM2 use mfma 32x32x16 bf16 with CK TransposeC: QK is mfma(K, Q)
+GEMM1/GEMM2 use mfma 32x32x16 bf16: QK is mfma(K, Q)
 and PV is mfma(V, P). K rows are bit-swizzled (swap bits 2 and 3 of
 lane%32) so QK C[0:8]/C[8:16] is already the 32x32 B fragment and P
 needs no shuffle_xor pack. Softmax still reduces the partner half-wave
@@ -187,7 +187,7 @@ def build_fmha_fwd_d72_module(
         f"{KERNEL_NAME}_bm{BLOCK_M}_bn{BLOCK_N}_pad{HEAD_DIM_PAD}"
         f"_m32_swk_tr_kb{NUM_K_BUFS}_vb{NUM_V_BUFS}_wpe{int(waves_per_eu)}_pm{int(post_misched)}"
         f"_hd{int(bool(dma_hd_only))}_nk{int(NEXT_K_AFTER_QK)}"
-        f"_vk{int(VWAIT_KEEP_K)}_sp{int(lds_stride_pad)}_xor{int(K_XOR)}_v39"
+        f"_vk{int(VWAIT_KEEP_K)}_sp{int(lds_stride_pad)}_xor{int(K_XOR)}_v43"
     )
 
     @flyc.kernel(known_block_size=[BLOCK_SIZE, 1, 1], name=kernel_sym)
@@ -299,9 +299,9 @@ def build_fmha_fwd_d72_module(
             )
         )
 
-        batch_idx = fx.Index(gpu.block_idx.x)
+        head_idx = fx.Index(gpu.block_idx.x)
         q_tile_idx = fx.Index(gpu.block_idx.y)
-        head_idx = fx.Index(gpu.block_idx.z)
+        batch_idx = fx.Index(gpu.block_idx.z)
 
         def _load_i32(ptr, idx):
             gep = buffer_ops.get_element_ptr(ptr, fx.Int64(idx), elem_type=i32_type)
@@ -387,24 +387,30 @@ def build_fmha_fwd_d72_module(
                 has_side_effects=True,
             )
 
-        def coop_dma_kv_iter(rsrc, lds_base, tile_start, it, elem_fn, stride):
+        def coop_dma_kv_iter(
+            rsrc, lds_base, tile_start, it, elem_fn, stride, skip_tok=False
+        ):
             linear = tid + fx.Index(it * BLOCK_SIZE)
             row = linear // VECS_PER_ROW_V
             col = (linear % VECS_PER_ROW_V) * VEC
             kv_row = tile_start + row
-            tok_valid = arith.cmpi(
-                arith.CmpIPredicate.ult, _raw(kv_row), _raw(actual_kv_len)
-            )
             col_valid = arith.cmpi(
                 arith.CmpIPredicate.ult, _raw(col), _raw(fx.Index(HEAD_DIM))
             )
-            do_load = arith.andi(tok_valid, col_valid)
+            do_load = col_valid
+            if const_expr(not skip_tok):
+                tok_valid = arith.cmpi(
+                    arith.CmpIPredicate.ult, _raw(kv_row), _raw(actual_kv_len)
+                )
+                do_load = arith.andi(tok_valid, col_valid)
+                safe_row = ArithValue(tok_valid).select(kv_row, fx.Index(0))
+            else:
+                safe_row = kv_row
             if const_expr(NUM_V_VECS % BLOCK_SIZE != 0):
                 in_range = arith.cmpi(
                     arith.CmpIPredicate.ult, _raw(linear), _raw(fx.Index(NUM_V_VECS))
                 )
                 do_load = arith.andi(do_load, in_range)
-            safe_row = ArithValue(tok_valid).select(kv_row, fx.Index(0))
             byte_off = fx.Int32(elem_fn(safe_row, col)) * fx.Int32(2)
             voff = ArithValue(do_load).select(byte_off, fx.Int32(0x7FFFFFFF))
             lds_col = fx.Int32(col)
@@ -412,20 +418,24 @@ def build_fmha_fwd_d72_module(
             lds_ptr = _lds_to_llvm_ptr_as3(lds_base + lds_idx)
             rocdl.buffer_load_to_lds(rsrc, lds_ptr, voff, size_bytes=16)
 
-        def coop_dma_k_iter(lds_base, tile_start, it):
+        def coop_dma_k_iter(lds_base, tile_start, it, skip_tok=False):
             linear = tid + fx.Index(it * BLOCK_SIZE)
             row = linear // VECS_PER_ROW_K
             col = (linear % VECS_PER_ROW_K) * VEC
             kv_row = tile_start + row
-            tok_valid = arith.cmpi(
-                arith.CmpIPredicate.ult, _raw(kv_row), _raw(actual_kv_len)
+            last_partial = const_expr(
+                NUM_K_VECS % BLOCK_SIZE != 0 and it == NUM_KV_ITERS - 1
             )
-            in_range = arith.cmpi(
-                arith.CmpIPredicate.ult, _raw(linear), _raw(fx.Index(NUM_K_VECS))
-            )
-            safe_row = ArithValue(tok_valid).select(kv_row, fx.Index(0))
-            byte_off = fx.Int32(k_elem(safe_row, col)) * fx.Int32(2)
-            voff = ArithValue(tok_valid).select(byte_off, fx.Int32(0x7FFFFFFF))
+            if const_expr(skip_tok):
+                byte_off = fx.Int32(k_elem(kv_row, col)) * fx.Int32(2)
+                voff = byte_off
+            else:
+                tok_valid = arith.cmpi(
+                    arith.CmpIPredicate.ult, _raw(kv_row), _raw(actual_kv_len)
+                )
+                safe_row = ArithValue(tok_valid).select(kv_row, fx.Index(0))
+                byte_off = fx.Int32(k_elem(safe_row, col)) * fx.Int32(2)
+                voff = ArithValue(tok_valid).select(byte_off, fx.Int32(0x7FFFFFFF))
             lds_col = fx.Int32(col)
             if K_XOR:
                 lds_col = fx.Int32(
@@ -439,24 +449,30 @@ def build_fmha_fwd_d72_module(
                 )
             lds_idx = fx.Int32(row) * fx.Int32(K_STRIDE) + lds_col
             lds_ptr = _lds_to_llvm_ptr_as3(lds_base + lds_idx)
-            if in_range:
+            if const_expr(last_partial):
+                in_range = arith.cmpi(
+                    arith.CmpIPredicate.ult, _raw(linear), _raw(fx.Index(NUM_K_VECS))
+                )
+                if in_range:
+                    rocdl.buffer_load_to_lds(k_rsrc, lds_ptr, voff, size_bytes=16)
+            else:
                 rocdl.buffer_load_to_lds(k_rsrc, lds_ptr, voff, size_bytes=16)
 
-        def coop_dma_k(tile_start, buf):
+        def coop_dma_k(tile_start, buf, skip_tok=False):
             base = lds_k
             if const_expr(NUM_K_BUFS == 2):
                 base = lds_k + fx.Int32(buf) * fx.Int32(LDS_K_TILE)
             for it in range_constexpr(NUM_KV_ITERS):
-                coop_dma_k_iter(base, tile_start, it)
+                coop_dma_k_iter(base, tile_start, it, skip_tok)
 
-        def coop_dma_v_iter(tile_start, it, v_lds):
+        def coop_dma_v_iter(tile_start, it, v_lds, skip_tok=False):
             coop_dma_kv_iter(
-                v_rsrc, v_lds, tile_start, it, v_elem, V_STRIDE
+                v_rsrc, v_lds, tile_start, it, v_elem, V_STRIDE, skip_tok
             )
 
-        def coop_dma_v(tile_start, v_lds):
+        def coop_dma_v(tile_start, v_lds, skip_tok=False):
             for it in range_constexpr(NUM_V_ITERS):
-                coop_dma_v_iter(tile_start, it, v_lds)
+                coop_dma_v_iter(tile_start, it, v_lds, skip_tok)
 
         def load_q_frag(ks, q_row, q_valid):
             d_col = fx.Index(ks * MFMA_K) + kgrp * fx.Index(8)
@@ -576,8 +592,14 @@ def build_fmha_fwd_d72_module(
         q_valid = arith.cmpi(
             arith.CmpIPredicate.ult, _raw(q_row), _raw(actual_q_len)
         )
+        first_full = arith.cmpi(
+            arith.CmpIPredicate.uge, _raw(actual_kv_len), _raw(fx.Index(BLOCK_N))
+        )
         # Issue first K DMA before Q HBM loads so they overlap.
-        coop_dma_k(fx.Index(0), fx.Int32(0))
+        if first_full:
+            coop_dma_k(fx.Index(0), fx.Int32(0), skip_tok=True)
+        else:
+            coop_dma_k(fx.Index(0), fx.Int32(0), skip_tok=False)
         q_frags = []
         for ks in range_constexpr(K_STEPS_QK_COMPUTE):
             q_frags.append(load_q_frag(ks, q_row, q_valid))
@@ -616,7 +638,14 @@ def build_fmha_fwd_d72_module(
             for ks in range_constexpr(K_STEPS_QK_COMPUTE):
                 if const_expr(ks < NUM_V_ITERS):
                     if is_first:
-                        coop_dma_v_iter(kv_block_start, ks, v_lds)
+                        if first_full:
+                            coop_dma_v_iter(
+                                kv_block_start, ks, v_lds, skip_tok=True
+                            )
+                        else:
+                            coop_dma_v_iter(
+                                kv_block_start, ks, v_lds, skip_tok=False
+                            )
                         rocdl.sched_vmem(1)
                 q_pack = q_frags[ks]
                 k_pack = load_k_frag(0, ks, k_lds)
@@ -636,13 +665,29 @@ def build_fmha_fwd_d72_module(
             if const_expr(NUM_V_ITERS > K_STEPS_QK_COMPUTE):
                 if is_first:
                     for it in range_constexpr(NUM_V_ITERS - K_STEPS_QK_COMPUTE):
-                        coop_dma_v_iter(
-                            kv_block_start, K_STEPS_QK_COMPUTE + it, v_lds
-                        )
+                        if first_full:
+                            coop_dma_v_iter(
+                                kv_block_start,
+                                K_STEPS_QK_COMPUTE + it,
+                                v_lds,
+                                skip_tok=True,
+                            )
+                        else:
+                            coop_dma_v_iter(
+                                kv_block_start,
+                                K_STEPS_QK_COMPUTE + it,
+                                v_lds,
+                                skip_tok=False,
+                            )
 
             next_start = kv_block_start + fx.Index(BLOCK_N)
             more_k = arith.cmpi(
                 arith.CmpIPredicate.ult, _raw(next_start), _raw(actual_kv_len)
+            )
+            next_full = arith.cmpi(
+                arith.CmpIPredicate.ule,
+                _raw(next_start + fx.Index(BLOCK_N)),
+                _raw(actual_kv_len),
             )
             nxt_buf = fx.Int32(0)
             if const_expr(NUM_K_BUFS == 2):
@@ -650,7 +695,10 @@ def build_fmha_fwd_d72_module(
                 nxt_buf = fx.Int32(1) - (kv_i % fx.Int32(2))
             if const_expr(NEXT_K_AFTER_QK):
                 if more_k:
-                    coop_dma_k(next_start, nxt_buf)
+                    if next_full:
+                        coop_dma_k(next_start, nxt_buf, skip_tok=True)
+                    else:
+                        coop_dma_k(next_start, nxt_buf, skip_tok=False)
 
             kv_start_i32 = fx.Int32(kv_block_start)
             kv_len_i32 = fx.Int32(actual_kv_len)
@@ -768,7 +816,10 @@ def build_fmha_fwd_d72_module(
             l_new = _fadd(_fmul(corr, l_running), reduce_sum(tile_sum))
             if more_k:
                 _wait_lgkm_barrier()
-                coop_dma_v(next_start, v_lds)
+                if next_full:
+                    coop_dma_v(next_start, v_lds, skip_tok=True)
+                else:
+                    coop_dma_v(next_start, v_lds, skip_tok=False)
             loop_results = yield [m_new, l_new] + list(o_accs)
 
         o_finals = [loop_results[2 + i] for i in range_constexpr(NUM_O_ACCS)]
@@ -826,9 +877,9 @@ def build_fmha_fwd_d72_module(
         num_q_tiles = (fx.Index(max_seqlen_q) + fx.Index(BLOCK_M - 1)) // fx.Index(
             BLOCK_M
         )
-        grid_x = arith.index_cast(T.index, batch_size)
+        grid_x = arith.index_cast(T.index, num_heads)
         grid_y = arith.index_cast(T.index, num_q_tiles)
-        grid_z = arith.index_cast(T.index, num_heads)
+        grid_z = arith.index_cast(T.index, batch_size)
         launcher = fmha_fwd_d72_kernel(
             Q,
             K,

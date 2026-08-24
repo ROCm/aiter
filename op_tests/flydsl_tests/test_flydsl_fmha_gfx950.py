@@ -101,6 +101,17 @@ def test_flydsl_fmha_gfx950_packed_remainders():
     _assert_close(out, ref)
 
 
+def test_flydsl_fmha_gfx950_trailing_empty_slot():
+    seqlens = [128, 80, 0]
+    q, k, v, cu, max_s = _pack_varlen(seqlens, num_heads=16, head_dim=HEAD_DIM, dtype=torch.bfloat16)
+    out = flydsl_flash_attn_varlen_func(
+        q, k, v, cu, cu, max_s, max_s, softmax_scale=SOFTMAX_SCALE, causal=False
+    )
+    assert out is not None
+    ref = _ref_varlen(q, k, v, cu, SOFTMAX_SCALE)
+    _assert_close(out, ref)
+
+
 def test_flydsl_fmha_gfx950_skips_causal():
     q, k, v, cu, max_s = _pack_varlen([128], num_heads=4, head_dim=HEAD_DIM, dtype=torch.bfloat16)
     got = flydsl_flash_attn_varlen_func(
