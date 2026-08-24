@@ -743,6 +743,20 @@ def quantize_v_mxfp4(input: Tensor, direct_p: bool = False) -> tuple[Tensor, Ten
     natural QK element order instead of re-seating it every tile; see
     aiter.ops.triton.quant.sage_attention_quant_wrappers._f4f4_v_p_fp6_token_perm. Default
     False is the layout f4f4, f6f4 and mxfp4 all expect.
+    
+    TODO(v-layout coupling): direct_p is a property of the .co DEPLOYED IN THE SLOT, not of this
+    call, and nothing checks that the two agree. A mismatch is SILENT -- it does not fault, it just
+    returns wrong numbers (cosine ~0.55 instead of ~0.996), so it reads as an accuracy regression
+    rather than a wiring bug. This packer is shared by kernels with different P formats, so the
+    default cannot simply be flipped:
+      fp6 P (direct_p=True)  : f8f6f6 (mxfp6 V), f4f4f6 (mxfp4 V)
+      fp8 P (direct_p=False) : stock f8f6 (mxfp6 V), f6f4 (mxfp4 V)
+    quantize_v_mxfp6 has exactly one caller (the f8f6 branch) and quantize_v_mxfp4 has two (f4f4
+    and f6f4); the mxfp4 kernel takes fp8 V through quantize_v_fp8 and is unaffected either way.
+    Once every low-precision-V kernel packs P as fp6, direct_p becomes the only layout and this
+    parameter should be deleted rather than re-defaulted. Until then, either give the kernel and
+    the packer a shared format tag that can be asserted at launch, or flip a kernel's production
+    entry in the same change that deploys its .co.
     """
     _validate_bshd_hd128(input, "MXFP4 V quantization")
     return pack_v_mxfp4_colmajor_raw(input, direct_p)
@@ -761,14 +775,37 @@ def _quantize_v_mxfp4_raw_fake(
 
 
 @torch.library.custom_op("aiter::mha_v4_quantize_v_mxfp6", mutates_args=())
-def quantize_v_mxfp6(input: Tensor) -> tuple[Tensor, Tensor]:
-    """Pack hd128 BSHD V into MXFP6 data and E8M0 scale views."""
+def quantize_v_mxfp6(input: Tensor, direct_p: bool = False) -> tuple[Tensor, Tensor]:
+    """Pack hd128 BSHD V into MXFP6 data and E8M0 scale views.
+
+    direct_p selects the kv-column order wanted by the f8f6f6 kernel variant that keeps P in its
+    natural QK element order instead of re-seating it every tile; see
+    aiter.ops.triton.quant.mxfp6_fmha_pack._v_p_fp6_kvtab. Default False is the layout the stock
+    f8f6 kernel expects.
+    
+    TODO(v-layout coupling): direct_p is a property of the .co DEPLOYED IN THE SLOT, not of this
+    call, and nothing checks that the two agree. A mismatch is SILENT -- it does not fault, it just
+    returns wrong numbers (cosine ~0.55 instead of ~0.996), so it reads as an accuracy regression
+    rather than a wiring bug. This packer is shared by kernels with different P formats, so the
+    default cannot simply be flipped:
+      fp6 P (direct_p=True)  : f8f6f6 (mxfp6 V), f4f4f6 (mxfp4 V)
+      fp8 P (direct_p=False) : stock f8f6 (mxfp6 V), f6f4 (mxfp4 V)
+    quantize_v_mxfp6 has exactly one caller (the f8f6 branch) and quantize_v_mxfp4 has two (f4f4
+    and f6f4); the mxfp4 kernel takes fp8 V through quantize_v_fp8 and is unaffected either way.
+    Once every low-precision-V kernel packs P as fp6, direct_p becomes the only layout and this
+    parameter should be deleted rather than re-defaulted. Until then, either give the kernel and
+    the packer a shared format tag that can be asserted at launch, or flip a kernel's production
+    entry in the same change that deploys its .co.
+    """
     _validate_bshd_hd128(input, "MXFP6 V quantization")
-    return pack_fp6_v_data_scale_views(input)
+    return pack_fp6_v_data_scale_views(input, direct_p=direct_p)
 
 
 @quantize_v_mxfp6.register_fake
-def _quantize_v_mxfp6_fake(input: Tensor) -> tuple[Tensor, Tensor]:
+def _quantize_v_mxfp6_fake(
+    input: Tensor, direct_p: bool = False
+) -> tuple[Tensor, Tensor]:
+    del direct_p  # layout-only: shapes and dtypes are identical either way
     batch, sequence, heads, head_dim = input.shape
     tiles = (sequence + 127) // 128
     head_stride = tiles * 12288
@@ -963,7 +1000,10 @@ def mha_v4(
         if _is_fp8_format(v_format):
             v_quantized, v_descale = quantize_fp8(v)
         else:
-            v_quantized, v_descale = quantize_v_mxfp6(v)
+            # direct_p=True: the f8f6 slot runs f8f6f6, which packs P as fp6 and keeps it in its
+            # natural QK element order, so V's kv columns carry the matching permutation. This is
+            # the only production caller of this packer, so the f8f6 V path is unambiguous.
+            v_quantized, v_descale = quantize_v_mxfp6(v, direct_p=True)
     elif q_format == AttentionFormat.MXFP4 and v_format in (
         *_FP8_FORMATS,
         AttentionFormat.MXFP4,
@@ -975,7 +1015,10 @@ def mha_v4(
         if _is_fp8_format(v_format):
             v_quantized, v_descale = quantize_v_fp8(v)
         else:
-            v_quantized, v_descale = quantize_v_mxfp4(v)
+            # direct_p=True: the f4f4 slot runs f4f4f6, which packs P as fp6 and keeps it in its
+            # natural QK element order, so V's kv columns carry the matching permutation. f6f4
+            # below shares this packer but still packs P as fp8, hence the default there.
+            v_quantized, v_descale = quantize_v_mxfp4(v, direct_p=True)
         _launch_mxfp4_coalesced(
             q_quantized,
             q_descale,

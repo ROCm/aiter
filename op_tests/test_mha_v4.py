@@ -29,7 +29,8 @@ from aiter.ops.mha_v4 import (
     scale_modes_for_formats,
 )
 from aiter.ops.triton.quant.mxfp6_fmha_pack import (
-    _v_direct_kvtab,
+    _v_p_fp6_kvtab,
+    _v_p_fp8_kvtab,
     fp6_k_raw_buffer_sizes,
     quantize_fp6_v_clean_triton,
     quantize_fp6_v_data_scale_triton,
@@ -171,7 +172,21 @@ def test_mha_v4_f8f6_v_kv_table_matches_live_p_pack():
             )
         expected.append(row)
 
-    assert _v_direct_kvtab().tolist() == expected
+    assert _v_p_fp8_kvtab().tolist() == expected
+
+
+def test_mha_v4_f8f6_direct_p_v_kv_table_is_the_fp8_one_relabelled():
+    # The FP6-P kernel keeps P in QK's element order, which relabels every kv column by
+    # sigma = swap bits 2 and 5 of the token index. Nothing else moves: each lane still holds one
+    # 32-token MX block, so the E8M0 granularity is unchanged.
+    base = _v_p_fp8_kvtab()
+    direct = _v_p_fp6_kvtab()
+    for lane in range(64):
+        for field in range(32):
+            token = int(base[lane][field])
+            sigma = (token & ~0x24) | ((token & 0x04) << 3) | ((token & 0x20) >> 3)
+            assert int(direct[lane][field]) == sigma
+        assert len({int(token) for token in direct[lane]}) == 32
 
 
 @pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MXFP6 V packing")
@@ -188,8 +203,9 @@ def test_mha_v4_mxfp6_v_layout_contract():
 
 
 @pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MXFP6 V packing")
+@pytest.mark.parametrize("direct_p", [False, True])
 @pytest.mark.parametrize("sequence", [256, 257])
-def test_mha_v4_mxfp6_v_direct_buffers_match_combined_reference(sequence):
+def test_mha_v4_mxfp6_v_direct_buffers_match_combined_reference(sequence, direct_p):
     torch.manual_seed(sequence)
     value = torch.randn((1, sequence, 2, 128), device="cuda", dtype=torch.bfloat16)
     tiles = (sequence + 127) // 128
@@ -199,10 +215,10 @@ def test_mha_v4_mxfp6_v_direct_buffers_match_combined_reference(sequence):
             dim=1,
         )
 
-    combined = quantize_fp6_v_clean_triton(value, direct_p=True).view(
+    combined = quantize_fp6_v_clean_triton(value, direct_p=direct_p).view(
         1, 2, tiles, 12800
     )
-    data, scale = quantize_fp6_v_data_scale_triton(value)
+    data, scale = quantize_fp6_v_data_scale_triton(value, direct_p=direct_p)
     expected_data = combined[..., :12288].contiguous().view(-1)
 
     scale_tail = combined[..., 12288:].view(1, 2, tiles, 128, 4)

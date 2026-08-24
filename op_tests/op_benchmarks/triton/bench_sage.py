@@ -726,13 +726,16 @@ def f8f6_quantize(
     q_quant, q_descale = quantize_qk(q)
     k_quant, k_descale = quantize_qk(k)
     if v_scale_mode == "block":
-        v_quant, v_descale = quantize_v_mxfp6(v)
+        # direct_p: f8f6f6 keeps P in its natural QK element order and expects V's kv columns
+        # permuted to match, which is free here and saves a cross-lane re-seat every tile. This is
+        # the f8f6 path only -- mxfp6 and f6f4 take V through other packers.
+        v_quant, v_descale = quantize_v_mxfp6(v, True)
     else:
         reduce_dims = (0, 1, 2, 3) if v_scale_mode == "tensor" else (1, 3)
         amax = v.abs().to(torch.float32).amax(dim=reduce_dims, keepdim=True)
         scale = torch.clamp(amax / 7.5, min=torch.finfo(torch.float32).tiny)
         v_quant, v_descale = pack_fp6_v_data_scale_views(
-            v.to(torch.float32) / scale, fixed_e8m0=True
+            v.to(torch.float32) / scale, direct_p=True, fixed_e8m0=True
         )
         batch, _, heads, _ = v.shape
         scale_by_head = scale.expand(batch, 1, heads, 1)[:, 0, :, 0].contiguous()

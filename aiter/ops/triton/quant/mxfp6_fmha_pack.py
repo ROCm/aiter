@@ -71,67 +71,21 @@ def _k_lds_order_gather_index():
     return (v_k_base + c_i + byte).astype(np.int64)
 
 
-_TR8_SIGMA32 = np.array(
-    [
-        0,
-        1,
-        2,
-        3,
-        16,
-        17,
-        18,
-        19,
-        4,
-        5,
-        6,
-        7,
-        20,
-        21,
-        22,
-        23,
-        8,
-        9,
-        10,
-        11,
-        24,
-        25,
-        26,
-        27,
-        12,
-        13,
-        14,
-        15,
-        28,
-        29,
-        30,
-        31,
-    ],
-    dtype=np.int64,
-)
-
-
-def _v_field_perm() -> np.ndarray:
-    """Per-output-field source index into a 32-kv MX block.
-
-    Combines (a) the cvt field interleave field[2i]=blk[i], field[2i+1]=blk[16+i]
-    and (b) the tr8 within-block kv scramble, so loading the 32 values in this
-    order yields the fp6 fields already in their final packed positions (groups of
-    4 contiguous fields = 3 contiguous bytes, no further permutation)."""
-    inv32 = np.empty(32, dtype=np.int64)
-    inv32[_TR8_SIGMA32] = np.arange(32)
-    c = np.where(np.arange(32) % 2 == 0, np.arange(32) // 2, 16 + np.arange(32) // 2)
-    return inv32[c].astype(np.int32)  # fieldperm[f] = inv32[c(f)]
-
-
 _V_KVTAB_CACHE: dict = {}
 
 
 def _v_kvtab_dev(device, direct_p: bool):
-    """Return the cached per-device field-to-KV permutation for V packing."""
+    """Return the cached per-device field-to-KV permutation for V packing.
+
+    direct_p selects the order wanted by a kernel that leaves P in the element order QK produced
+    it in (f8f6f6); False is the order an FP8-layout P operand needs, which is what every other
+    consumer of this packer expects. Cached per (device, direct_p) so the table is not rebuilt per
+    call and the allocation stays out of any CUDA-graph capture region.
+    """
     key = (device, direct_p)
     kvtab = _V_KVTAB_CACHE.get(key)
     if kvtab is None:
-        table = _v_direct_kvtab() if direct_p else _v_noswap_kvtab()
+        table = _v_p_fp6_kvtab() if direct_p else _v_p_fp8_kvtab()
         kvtab = torch.from_numpy(table.reshape(-1)).to(device)
         _V_KVTAB_CACHE[key] = kvtab
     return kvtab
@@ -143,7 +97,10 @@ def quantize_fp6_v_clean_triton(
     direct_p: bool = False,
     fixed_e8m0: bool = False,
 ):
-    """Pack FP8 V into combined FP6 data and E8M0 scale tiles."""
+    """Pack FP8 V into combined FP6 data and E8M0 scale tiles.
+
+    direct_p picks the kv-column order; see _v_kvtab_dev.
+    """
     assert _HAVE_TRITON, "triton/torch unavailable"
     b, sk, h_kv, d = v_fp8.shape
     assert d == 128 and tile == 128 and sk % tile == 0, (d, sk, tile)
@@ -174,7 +131,10 @@ def quantize_fp6_v_clean_triton(
 
 
 def quantize_fp6_v_data_scale_triton(
-    v_fp8: "torch.Tensor", tile: int = 128, fixed_e8m0: bool = False
+    v_fp8: "torch.Tensor",
+    tile: int = 128,
+    direct_p: bool = False,
+    fixed_e8m0: bool = False,
 ):
     """Pack F8F6 V directly into its separate data and scale ABI buffers."""
     assert _HAVE_TRITON, "triton/torch unavailable"
@@ -186,7 +146,7 @@ def quantize_fp6_v_data_scale_triton(
         b * h_kv * nT * 12288 + 256, dtype=torch.uint8, device=v_fp8.device
     )
     scale = torch.empty(b * h_kv * nT * 512, dtype=torch.uint8, device=v_fp8.device)
-    kvtab = _v_kvtab_dev(v_fp8.device, True)
+    kvtab = _v_kvtab_dev(v_fp8.device, direct_p)
     BLOCK_N = 128
     grid = (triton.cdiv(n_blocks, BLOCK_N),)
     _pack_v_fp6_kernel[grid](
@@ -215,33 +175,8 @@ def quantize_fp6_v_data_scale_triton(
     return data, scale
 
 
-_NOSWAP_KVTAB_CACHE = None
-
-
-def _v_noswap_kvtab() -> np.ndarray:
-    """Return the field-to-KV map for the pre-swap P operand layout."""
-    global _NOSWAP_KVTAB_CACHE
-    if _NOSWAP_KVTAB_CACHE is not None:
-        return _NOSWAP_KVTAB_CACHE
-    fperm = _v_field_perm()
-    srcL = np.zeros((64, 32), np.int64)
-    srcF = np.zeros((64, 32), np.int64)
-    for L in range(64):
-        hi = L >= 32
-        base = L - 32 if hi else L
-        for f in range(32):
-            even = (f % 2) == 0
-            if not hi:
-                srcL[L, f], srcF[L, f] = (L, f) if even else (L + 32, f - 1)
-            else:
-                srcL[L, f], srcF[L, f] = (base, f + 1) if even else (L, f)
-    kvtab = 32 * (srcL // 32) + fperm[srcF]
-    _NOSWAP_KVTAB_CACHE = kvtab.astype(np.int32)
-    return _NOSWAP_KVTAB_CACHE
-
-
-def _v_direct_kvtab() -> np.ndarray:
-    """Scaled FP6-src0 field to logical KV for the direct FP8 P operand.
+def _v_p_fp8_kvtab() -> np.ndarray:
+    """Scaled FP6-src0 field to logical KV for an FP8-layout P operand.
 
     A gfx950 one-hot probe shows FP6 physical contraction index ``a`` pairs with
     FP8 index ``swap_bits_4_5(a)`` for all 64 indices. The live P pack maps its
@@ -257,6 +192,24 @@ def _v_direct_kvtab() -> np.ndarray:
     return (32 * (byte // 16) + 8 * ((byte % 16) // 4) + byte % 4 + 4 * group).astype(
         np.int32
     )
+
+
+def _v_p_fp6_kvtab() -> np.ndarray:
+    """Field-to-KV map for an FP6 P operand left in its natural QK element order.
+
+    An FP6 B operand's K map is contiguous-32 per lane group while an FP8 B operand's is the
+    16/16 split, so a kernel that packs P as FP6 must either re-seat P across the lane pair every
+    tile or have V's kv columns relabelled to match. Relabelling is free here, so this table
+    composes sigma -- swap bits 2 and 5 of the 6-bit token index within a 64-token PV block --
+    onto the FP8 order. sigma is measured, not assumed:
+    asm/fmha_sage_fwd/tools/probes/fp6_pack_element_kmap_probe.py in the kernel repo.
+
+    Each lane's 32 fields still form one MX block, so the E8M0 granularity is unchanged at 32
+    tokens per scale -- a different 32.
+    """
+    token = np.arange(64)
+    sigma = (token & ~0x24) | ((token & 0x04) << 3) | ((token & 0x20) >> 3)
+    return sigma[_v_p_fp8_kvtab()].astype(np.int32)
 
 
 if _HAVE_TRITON:
@@ -869,7 +822,10 @@ def quantize_fp6_k_lds_order_torch(
 
 
 def pack_fp6_v_data_scale_views(
-    v: "torch.Tensor", tile: int = 128, fixed_e8m0: bool = False
+    v: "torch.Tensor",
+    tile: int = 128,
+    direct_p: bool = False,
+    fixed_e8m0: bool = False,
 ):
     """Pack V into separate F8F6 data and E8M0 scale images."""
     assert _HAVE_TRITON, "triton/torch unavailable"
@@ -881,7 +837,7 @@ def pack_fp6_v_data_scale_views(
         v = torch.cat([v, tail], dim=1)
 
     data_flat, scale_flat = quantize_fp6_v_data_scale_triton(
-        v, tile=tile, fixed_e8m0=fixed_e8m0
+        v, tile=tile, direct_p=direct_p, fixed_e8m0=fixed_e8m0
     )
     v_hs = n_tiles * 12288
     v_bs = h_kv * v_hs
