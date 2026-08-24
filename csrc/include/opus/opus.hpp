@@ -3194,18 +3194,18 @@ using mfma_scale_f32_16x16x128_fp4_fp4  = mfma_f32_16x16x128_fp4_fp4;
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 // wmma (RDNA4 / wave32) -- gfx1250 uses wmma-256b builtins (16x16x{4,32,64,128}); gfx1200/gfx1201 (Navi 44/48) use wmma-128b _w32_gfx12 builtins (16x16x16). Dispatch macros for the two arg-list shapes differ -- gfx12 set is DISPATCH_WMMA_GFX12_*.
 #if defined(__gfx1250__) || defined(__gfx1201__) || defined(__gfx1200__) || !defined(__HIP_DEVICE_COMPILE__)
-// f16/bf16/f32 builtins: (neg_a, A, neg_b, B, matrix_fmts, C, clamp, neg_c)
+// f16/bf16/f32 builtins: (a_neg, A, b_neg, B, c_mod, C, matrix_a_reuse, matrix_b_reuse)
 #define DISPATCH_WMMA_(ta_, tb_, tc_, wm_, wn_, wk_, inst_) \
  (std::is_same_v<dtype_a, ta_> && std::is_same_v<dtype_b, tb_> && std::is_same_v<dtype_c, tc_> && \
   wave_m == wm_ && wave_n == wn_ && wave_k == wk_) { \
-    return inst_(false, a, false, b, static_cast<short>(0), c, false, false); }
-// bf16f32 special: accumulator is f32 but output is bf16 => (neg_a, A, neg_b, B, fmts, C_f32, clamp, neg_c)
+    return inst_(false, a, false, b, static_cast<short>(0), c, reuse_a, reuse_b); }
+// bf16f32 special: accumulator is f32 but output is bf16 => (a_neg, A, b_neg, B, c_mod, C_f32, matrix_a_reuse, matrix_b_reuse)
 // The builtin takes f32 accumulator and returns bf16 output; we store the f32 accum but return bf16.
 #define DISPATCH_WMMA_BF16F32_(ta_, tb_, tc_, wm_, wn_, wk_, inst_) \
  (std::is_same_v<dtype_a, ta_> && std::is_same_v<dtype_b, tb_> && std::is_same_v<dtype_c, tc_> && \
   wave_m == wm_ && wave_n == wn_ && wave_k == wk_) { \
-    return inst_(false, a, false, b, static_cast<short>(0), c, false, false); }
-// fp8/bf8 builtins: (A, B, matrix_fmts, C, clamp, neg_c)  -- no neg_a/neg_b
+    return inst_(false, a, false, b, static_cast<short>(0), c, reuse_a, reuse_b); }
+// fp8/bf8 builtins: (A, B, c_mod, C, matrix_a_reuse, matrix_b_reuse)  -- no a_neg/b_neg
 // A/B are packed as _ExtVector<N, int>; bitcast from the fp8/bf8 vector
 #define DISPATCH_WMMA_8BIT_(ta_, tb_, tc_, wm_, wn_, wk_, inst_) \
  (std::is_same_v<dtype_a, ta_> && std::is_same_v<dtype_b, tb_> && std::is_same_v<dtype_c, tc_> && \
@@ -3214,7 +3214,7 @@ using mfma_scale_f32_16x16x128_fp4_fp4  = mfma_f32_16x16x128_fp4_fp4;
     constexpr index_t i32_b = elem_b * static_cast<index_t>(sizeof(dtype_b)) / static_cast<index_t>(sizeof(i32_t)); \
     return inst_(__builtin_bit_cast(vector_t<i32_t, i32_a>, a), \
                  __builtin_bit_cast(vector_t<i32_t, i32_b>, b), \
-                 static_cast<short>(0), c, false, false); }
+                 static_cast<short>(0), c, reuse_a, reuse_b); }
 
 // gfx12 builtins: 3-arg (A, B, C) -- no matrix_fmts/neg_c. ws_ selects _w32/_w64 (same {wm,wn,wk} triple).
 #define DISPATCH_WMMA_GFX12_MATCH_(ta_, tb_, tc_, wm_, wn_, wk_, ws_) \
@@ -3262,8 +3262,8 @@ struct wmma {
     static constexpr int fmt_a = std::is_same_v<dtype_a, fp8_t> ? 0 : std::is_same_v<dtype_a, bf8_t> ? 1 : std::is_same_v<dtype_a, fp4_t> ? 4 : -1;
     static constexpr int fmt_b = std::is_same_v<dtype_b, fp8_t> ? 0 : std::is_same_v<dtype_b, bf8_t> ? 1 : std::is_same_v<dtype_b, fp4_t> ? 4 : -1;
 
-    // Regular (non-scaled) dispatch
-    template<typename VA, typename VB, typename VC>
+    // Regular (non-scaled) dispatch. reuse_a/reuse_b are the gfx1250 matrix_{a,b}_reuse hints: assert the operand repeats the previous WMMA's. Undefined if it does not; matrix_a_reuse is a no-op on MI450.
+    template<bool reuse_a = false, bool reuse_b = false, typename VA, typename VB, typename VC>
     OPUS_D constexpr auto operator()(const VA& a, const VB& b, const VC& c) -> vtype_c {
         (void)a; (void)b; (void)c;
         if      constexpr (false) {}
@@ -3733,9 +3733,10 @@ struct wmma_adaptor_swap_ab : wmma_adaptor<WMMA> {
     // Only generate _c layout methods (shape_c/dim_c changed)
     OPUS_ADAPTOR_LAYOUT_API_DEFINE_FOR(c)
 
-    template<typename VA, typename VB, typename VC>
+    // reuse_a/reuse_b name THIS call's operands, so they swap too: under swap_ab `a` lands in SRC1, making reuse_a the one that reaches the working bit.
+    template<bool reuse_a = false, bool reuse_b = false, typename VA, typename VB, typename VC>
     OPUS_D constexpr auto operator()(const VA& a, const VB& b, const VC& c) {
-        return base::operator()(b, a, c);
+        return base::template operator()<reuse_b, reuse_a>(b, a, c);
     }
 
     template<typename VA, typename VB>
