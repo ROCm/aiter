@@ -108,3 +108,93 @@ def read_shuffled_scale(scale_tensor, n_rows: int, n_kgroups: int) -> torch.Tens
         + (xs % 32) // 16
     ).to(flat.device)
     return e8m0_to_f32(flat[idx.reshape(-1)]).view(n_rows, n_kgroups)
+
+
+def build_global_weights(experts, inter_global, model_dim, device, seed):
+    """Build UNSHARDED bf16 W1/W2 and quantize to MXFP4.
+
+    Scale shapes are 2D (get_torch_quant flattens the leading dims):
+        w1_s: (experts * 2*inter_global, model_dim // 32)
+        w2_s: (experts * model_dim,      inter_global // 32)
+    """
+    import aiter
+
+    g = torch.Generator(device="cpu").manual_seed(seed)
+    w1 = torch.randn((experts, 2 * inter_global, model_dim), generator=g).to(
+        device=device, dtype=dtypes.bf16
+    ) * (model_dim**-0.25)
+    w2 = torch.randn((experts, model_dim, inter_global), generator=g).to(
+        device=device, dtype=dtypes.bf16
+    ) * (inter_global**-0.25)
+    quant = aiter.get_torch_quant(aiter.QuantType.per_1x32)
+    w1_q, w1_s = quant(w1, quant_dtype=dtypes.fp4x2)
+    w2_q, w2_s = quant(w2, quant_dtype=dtypes.fp4x2)
+    return w1_q, w1_s, w2_q, w2_s
+
+
+def shard_w1(w1_q, w1_s, tp_rank, tp_size, inter_global):
+    """W1 is column-parallel: TP shards the N axis (2*inter_global).
+
+    Take this rank's [start, start+I_rank) window out of BOTH halves.
+    """
+    experts = w1_q.shape[0]
+    i_rank = inter_global // tp_size
+    lo = tp_rank * i_rank
+
+    def _sl(t):
+        # torch.cat has no CUDA kernel for float8_e8m0fnu (and fp4x2 is exotic
+        # too), so concatenate through a uint8 view -- both are 1-byte dtypes,
+        # so the view is a pure reinterpret that preserves the shape.
+        u = t.view(torch.uint8)
+        return (
+            torch.cat(
+                (
+                    u[:, lo : lo + i_rank],
+                    u[:, inter_global + lo : inter_global + lo + i_rank],
+                ),
+                dim=1,
+            )
+            .contiguous()
+            .view(t.dtype)
+        )
+
+    q = _sl(w1_q)
+    s = _sl(w1_s.reshape(experts, 2 * inter_global, -1))
+    return q, s.reshape(experts * 2 * i_rank, -1).contiguous()
+
+
+def shard_w2(w2_q, w2_s, tp_rank, tp_size, inter_global, model_dim):
+    """W2 is row-parallel: TP shards the contraction axis (inter_global).
+
+    The fp4x2 payload packs two values per byte so its last dim is halved;
+    the scale's last dim is inter/32.
+    """
+    experts = w2_q.shape[0]
+    i_rank = inter_global // tp_size
+    lo = tp_rank * i_rank
+    q = w2_q[:, :, lo // 2 : (lo + i_rank) // 2].contiguous()
+    s = w2_s.reshape(experts, model_dim, -1)[:, :, lo // 32 : (lo + i_rank) // 32]
+    return q, s.reshape(experts * model_dim, -1).contiguous()
+
+
+def reference_full_moe(x_g_bf16, ids_g, wts_g, w1_q, w1_s, w2_q, w2_s, swiglu_limit):
+    """Full unsharded MoE in fp32, modelling both activation quantizations."""
+    m, model_dim = x_g_bf16.shape
+    inter_global = w1_q.shape[1] // 2
+    x_deq = per_1x32_fp8_quant_dequant(x_g_bf16.float())
+    # w2_s is 2D (E * model_dim, inter_global//32); restore the expert axis once.
+    w2_s3 = w2_s.reshape(w2_q.shape[0], model_dim, -1)
+    out = torch.zeros((m, model_dim), dtype=torch.float32, device=x_deq.device)
+    for e in torch.unique(ids_g).tolist():
+        rows, slots = (ids_g == e).nonzero(as_tuple=True)
+        if rows.numel() == 0:
+            continue
+        w1_deq = dequant_w1_expert(w1_q, w1_s, e, inter_global)
+        w2_deq = (
+            mxfp4_to_f32(w2_q[e]) * e8m0_to_f32(w2_s3[e]).repeat_interleave(32, dim=-1)
+        ).float()
+        for r, s in zip(rows.tolist(), slots.tolist()):
+            inter = reference_inter_row(x_deq[r], w1_deq, swiglu_limit)
+            inter = per_1x32_fp8_quant_dequant(inter.unsqueeze(0)).squeeze(0)
+            out[r] += (w2_deq @ inter) * float(wts_g[r, s].item())
+    return out

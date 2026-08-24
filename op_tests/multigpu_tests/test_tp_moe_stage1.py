@@ -17,17 +17,23 @@ from aiter.ops.flydsl.kernels.mega_moe.tp_moe_stage1 import (
     TPMoEStage1,
     TPMoEStage1Output,
 )
+from aiter.ops.flydsl.kernels.mxmoe_dispatcher import mxfp4_moe_gemm2
+from aiter.ops.shuffle import shuffle_scale_a16w4, shuffle_weight_a16w4
 
 # torchrun rewrites sys.path[0] to the launcher's dir, so make the
 # same-directory reference module importable by name.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from tp_moe_stage1_ref import (  # noqa: E402
+    build_global_weights,
     build_mxfp4_w1,
     dequant_w1_expert,
     per_1x32_fp8_quant_dequant,
     read_shuffled_scale,
+    reference_full_moe,
     reference_inter_row,
+    shard_w1,
+    shard_w2,
 )
 
 NETWORK = dict(
@@ -536,6 +542,110 @@ def case_prequant_equivalence():
     dist.destroy_process_group()
 
 
+GEMM2_BM, GEMM2_BN, GEMM2_BK = 32, 128, 128
+
+
+def case_end_to_end():
+    rank, world, device = _setup_dist()
+    model_dim = NETWORK["model_dim"]
+    experts, topk = NETWORK["experts"], NETWORK["topk"]
+    limit = NETWORK["swiglu_limit"]
+    inter_global = 384 * world  # TP8 -> 3072, TP4 -> 1536
+    inter_dim = inter_global // world  # this rank's shard == 384
+
+    w1_q, w1_s, w2_q, w2_s = build_global_weights(
+        experts, inter_global, model_dim, device, seed=4096
+    )
+    w1_loc, w1_s_loc = shard_w1(w1_q, w1_s, rank, world, inter_global)
+    w2_loc, w2_s_loc = shard_w2(w2_q, w2_s, rank, world, inter_global, model_dim)
+
+    op = TPMoEStage1(
+        model_dim=model_dim,
+        inter_dim=inter_dim,
+        experts=experts,
+        topk=topk,
+        w1=shuffle_weight_a16w4(w1_loc, 16, True),
+        w1_scale=shuffle_scale_a16w4(w1_s_loc, experts, True),
+        device=device,
+        swiglu_limit=limit,
+        stage1_kernel_name=STAGE1_KERNEL,
+    )
+    w2_u8 = shuffle_weight_a16w4(w2_loc, 16, False).view(torch.uint8)
+    w2_scale_u8 = shuffle_scale_a16w4(w2_s_loc, experts, False).view(torch.uint8)
+
+    for m_local in (1, 8, 64, 128):
+        gx = torch.Generator(device="cpu").manual_seed(5000 + rank * 11 + m_local)
+        x = torch.randn((m_local, model_dim), generator=gx).to(
+            device=device, dtype=torch.bfloat16
+        ) * (model_dim**-0.25)
+        ids, wts = _random_routes(m_local, experts, topk, device, seed=555 + rank)
+        s1 = op.forward(x, wts, ids)
+
+        # epilog="atomic" accumulates, so the buffer must start at zero.
+        partial = torch.zeros(
+            (s1.m_logical, model_dim), dtype=torch.bfloat16, device=device
+        )
+        mxfp4_moe_gemm2(
+            inter_sorted_quant=s1.inter_sorted_quant,
+            inter_sorted_shuffled_scale=s1.inter_sorted_shuffled_scale,
+            w2_u8=w2_u8,
+            w2_scale_u8=w2_scale_u8,
+            sorted_expert_ids=s1.sorted_expert_ids,
+            cumsum_tensor=s1.num_valid_ids,
+            sorted_token_ids=s1.sorted_token_ids,
+            sorted_weights=s1.sorted_weights,
+            out=partial,
+            M_logical=s1.m_logical,
+            max_sorted=s1.max_sorted,
+            NE=experts,
+            D_HIDDEN=model_dim,
+            D_INTER=inter_dim,
+            topk=topk,
+            BM=GEMM2_BM,
+            BN=GEMM2_BN,
+            BK=GEMM2_BK,
+            a_dtype="fp8",
+            b_dtype="fp4",
+            epilog="atomic",
+            SBM=s1.sort_block_m,
+            out_dtype="bf16",
+        )
+        torch.cuda.synchronize()
+
+        # Stage1 leaves the output scale of padding rows uninitialized (measured in
+        # Task 5). GEMM2 gates the store on `token_id < i32_M`
+        # (mxmoe_gemm_v2.py:1006-1008) so that garbage must never reach `out` -- but
+        # a NaN leaking through the shared CShuffle LDS would be silent, so check.
+        assert torch.isfinite(partial).all(), "GEMM2 output contains non-finite values"
+
+        # TP partials -> sum across ranks, keep only this rank's DP shard.
+        got = torch.empty((m_local, model_dim), dtype=torch.float32, device=device)
+        dist.reduce_scatter_tensor(got, partial.float().contiguous(), group=op.group)
+
+        x_g, wts_g, ids_g = op._all_gather_inputs(x, wts, ids)
+        ref_full = reference_full_moe(x_g, ids_g, wts_g, w1_q, w1_s, w2_q, w2_s, limit)
+        ref = ref_full[rank * m_local : (rank + 1) * m_local]
+        assert torch.isfinite(ref).all(), "reference produced non-finite values"
+        rel = float(
+            ((got - ref) ** 2).sum() ** 0.5 / max(float((ref**2).sum() ** 0.5), 1e-30)
+        )
+        assert rel == rel, "rel_l2 is NaN"
+        t = torch.tensor([rel], device=device)
+        dist.all_reduce(t, op=dist.ReduceOp.MAX)
+        rel = float(t.item())
+        if rank == 0:
+            print(f"m_local={m_local:4d} end-to-end rel_l2={rel:.5f}")
+        if rel >= 0.05:
+            raise AssertionError(
+                f"m_local={m_local} end-to-end rel_l2={rel:.5f} >= 0.05"
+            )
+
+    if rank == 0:
+        print("case_end_to_end OK")
+    dist.barrier()
+    dist.destroy_process_group()
+
+
 CASES = {
     "construct": case_construct_validates,
     "capacity": case_capacity,
@@ -543,6 +653,7 @@ CASES = {
     "forward_contract": case_forward_contract,
     "numerics": case_numerics,
     "prequant": case_prequant_equivalence,
+    "e2e": case_end_to_end,
 }
 
 
