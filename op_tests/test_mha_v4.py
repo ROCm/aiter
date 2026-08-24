@@ -882,9 +882,7 @@ def test_mha_v4_mxfp8_raw_compile_parity():
     compiled_out = torch.empty_like(q)
 
     eager = mha_v4_mxfp8(q, k, v, out=eager_out)
-    compiled = torch.compile(mha_v4_mxfp8, fullgraph=True)(
-        q, k, v, out=compiled_out
-    )
+    compiled = torch.compile(mha_v4_mxfp8, fullgraph=True)(q, k, v, out=compiled_out)
     torch.cuda.synchronize()
 
     assert eager.data_ptr() == eager_out.data_ptr()

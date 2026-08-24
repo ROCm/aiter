@@ -395,9 +395,7 @@ def mha_v4_packed(
     if kv_heads == 0:
         raise ValueError("MHA v4 requires non-empty KV heads")
     if query_heads % kv_heads != 0:
-        raise ValueError(
-            "MHA v4 requires query heads to be divisible by KV heads"
-        )
+        raise ValueError("MHA v4 requires query heads to be divisible by KV heads")
     gqa_ratio = query_heads // kv_heads
     if gqa_ratio > 16 or gqa_ratio & (gqa_ratio - 1):
         raise ValueError("MHA v4 supports power-of-two GQA ratios up to 16")
@@ -965,9 +963,7 @@ def mha_v4_mxfp8(
         softmax_scale = q.shape[-1] ** -0.5
 
     fp8_format = native_fp8_format()
-    q_quantized, q_descale = quantize_mxfp8_q(
-        q, mha_v4_q_multiplier(softmax_scale)
-    )
+    q_quantized, q_descale = quantize_mxfp8_q(q, mha_v4_q_multiplier(softmax_scale))
     k_quantized, k_descale = quantize_mxfp8_k(k)
     v_quantized, v_descale = quantize_fp8(v)
     return mha_v4_packed(

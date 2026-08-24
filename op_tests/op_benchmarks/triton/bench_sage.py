@@ -1126,9 +1126,7 @@ def make_kernel_runner(
 
         if args.e2e:
             return lambda: mha_v4_packed(
-                *_production_quantize_mxfp8(
-                    q_bshd, k_bshd, v_bshd, softmax_scale
-                ),
+                *_production_quantize_mxfp8(q_bshd, k_bshd, v_bshd, softmax_scale),
                 fp8_format,
                 fp8_format,
                 fp8_format,
@@ -1251,9 +1249,7 @@ def make_kernel_runner(
                 quant_q, quant_k = cancel_internal_qk_rotation(quant_q, quant_k)
             return quantize(quant_q, quant_k, v_bshd, softmax_scale)
 
-        def _kernel_mxfp4(
-            q_fp4, q_descale, k_fp4, k_descale, v_quantized, v_descale
-        ):
+        def _kernel_mxfp4(q_fp4, q_descale, k_fp4, k_descale, v_quantized, v_descale):
             return mha_v4_packed(
                 q_fp4,
                 k_fp4,
@@ -1310,9 +1306,7 @@ def make_kernel_runner(
             AttentionFormat.MXFP6, AttentionFormat.MXFP6, v_format
         )
 
-        def _kernel_mxfp6(
-            q_fp6, q_descale, k_fp6, k_descale, v_quantized, v_descale
-        ):
+        def _kernel_mxfp6(q_fp6, q_descale, k_fp6, k_descale, v_quantized, v_descale):
             return mha_v4_packed(
                 q_fp6,
                 k_fp6,
