@@ -446,6 +446,7 @@ def _grouped_a8w4_tdm_moe(
     stage2_scatter: Stage2ScatterContext | None = None,
     situ_beta=1.0,
     situ_linear_beta=1.0,
+    a1_scale=None,
 ):
     import functools
 
@@ -603,8 +604,37 @@ def _grouped_a8w4_tdm_moe(
     _quant_mode = "fp4" if _is_fp4 else "fp8"
     _a_is_fp4 = 1 if _is_fp4 else 0
 
+    # Pre-quantized activation: an MX payload plus its e8m0 row is what a
+    # quantizing EP dispatch delivers, and it is also aiter's standing meaning
+    # for this pair. The fused pass then keeps its route gather and its scale
+    # preshuffle and drops only the quant -- the preshuffle cannot move to the
+    # sender anyway, because its destination is a function of the grouped row
+    # THIS rank assigns.
+    _prequantized = a1_scale is not None and hidden_states.dtype in (
+        dtypes.fp8,
+        torch.uint8,
+        dtypes.fp4x2,
+    )
+    if a1_scale is not None and not _prequantized:
+        # Loud rather than silently re-quantizing something already quantized.
+        assert hidden_states.dtype == dtype, (
+            f"a1_scale given with hidden_states dtype {hidden_states.dtype}: "
+            "expected packed MX bytes (pre-quantized) or the model dtype (ignored)"
+        )
+    # A payload row is model_dim bytes on an fp8 wire and model_dim//2 on an fp4
+    # one. Checked rather than inferred: a wire that disagrees with the GEMM's
+    # data_format would otherwise read into the next token's bytes and produce
+    # plausible garbage.
+    _src_width = hidden_states.shape[-1]
+    if _prequantized:
+        _want_width = model_dim // 2 if _is_fp4 else model_dim
+        assert _src_width == _want_width, (
+            f"prequantized {_quant_mode} payload should be {_want_width} B per "
+            f"row at model_dim {model_dim}, got {_src_width}"
+        )
+
     a1_payload, a1_scale = flydsl_moe_fused_quant_preshuffle(
-        hidden_states.reshape(1, token_num, model_dim),
+        hidden_states.reshape(1, token_num, _src_width),
         1,
         contiguous_m,
         wmma_rep=wmma_rep,
@@ -613,6 +643,7 @@ def _grouped_a8w4_tdm_moe(
         topids_to_rows=topids_to_rows,
         source_topk=topk,
         num_valid_routes=_ep_nvr,
+        prequantized_scale=a1_scale if _prequantized else None,
     )
 
     # Fuse gemm1 activation + MX quantization + scale preshuffle into the
@@ -900,6 +931,7 @@ def grouped_gemm_gfx1250_a8w4(
     situ_beta: float = 1.0,
     situ_linear_beta: float = 1.0,
     stage2_scatter: Stage2ScatterContext | None = None,
+    a1_scale: torch.Tensor | None = None,
 ):
     """Grouped a8w4/a4w4 MoE on the TDM batched GEMM (gfx1250).
 
@@ -1169,6 +1201,7 @@ def grouped_gemm_gfx1250_a8w4(
             stage2_scatter=stage2_scatter,
             situ_beta=situ_beta,
             situ_linear_beta=situ_linear_beta,
+            a1_scale=a1_scale,
             **_tdm_kw,
         )
 

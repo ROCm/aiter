@@ -130,6 +130,38 @@ def resolve_spec(quant_key, transport):
     }
 
 
+# The MegaMoE (scatter_fused) wire. Unrelated to `transport` above, which belongs
+# to the mori-v1 dispatch the other combine modes use.
+_MEGA_WIRE_FOR_QUANT = {"a8w4_mxfp4": "fp8", "a4w4_mxfp4": "fp4"}
+
+
+def resolve_mega_wire(mega_wire, quant_key):
+    """What MegaMoE's dispatch puts on the wire: bf16 | fp8 | fp4.
+
+    A quantizing wire is not a free choice -- the receiver hands the payload to
+    the grouped GEMM as its A operand, so it has to be the format that GEMM wants
+    (a8w4 -> fp8, a4w4 -> fp4), which is what ``auto`` resolves to. Picking the
+    other one is a width error, not a slow path, so it is rejected here rather
+    than deep inside the gather.
+    """
+    if mega_wire == "auto":
+        return _MEGA_WIRE_FOR_QUANT.get(quant_key, "bf16")
+    if mega_wire == "bf16":
+        return "bf16"
+    want = _MEGA_WIRE_FOR_QUANT.get(quant_key)
+    if want is None:
+        raise ValueError(
+            f"--mega_wire={mega_wire} needs an MX quant key "
+            f"({'/'.join(_MEGA_WIRE_FOR_QUANT)}), got -q {quant_key}"
+        )
+    if mega_wire != want:
+        raise ValueError(
+            f"-q {quant_key} wants a {want} A operand, so --mega_wire={mega_wire} "
+            "would hand the GEMM the wrong payload width"
+        )
+    return mega_wire
+
+
 # Weight quantization + shuffle (device path) / dequant (reference)
 def weight_per_128x128_quant(weight, quant_dtype):
     E, dim1, dim2 = weight.shape
@@ -522,9 +554,9 @@ class DeviceMoEPipeline:
         uid = self.dist_ctx.bcast_uid(uid)
         self.comm = Communicator.init(self.dist_ctx.world, r, uid)
         if self.combine_mode == "scatter_fused":
-            if self.spec["key"] != "a8w4_mxfp4":
+            if self.spec["key"] not in _MXFP4_KEYS:
                 raise NotImplementedError(
-                    "scatter_fused is available only for a8w4_mxfp4"
+                    f"scatter_fused is available only for {'/'.join(_MXFP4_KEYS)}"
                 )
             from aiter.ops.flydsl.kernels.mega_moe_gfx1250 import MegaMoEGfx1250
 
@@ -542,6 +574,9 @@ class DeviceMoEPipeline:
                 activation=self.spec["activation"],
                 gate_mode=self.spec["gate_mode"].value,
                 quant_type=self.spec["aiter_qtype"],
+                # Explicit, not left to $MEGA_WIRE: the harness owns this now, and
+                # a stale env would otherwise silently change what is measured.
+                dispatch_wire=self.spec.get("mega_wire", "bf16"),
             )
         else:
             EpDispatchCombineConfig, EpDispatchCombineOp = _import_mori_v2()
@@ -768,9 +803,15 @@ def _device_shared_ffn(tokens, sw1, sw2):
 # Driver
 def main():
     args = _parse_args()
+    # The import-time setdefault above pins a8w4; a4w4 is the other half of the
+    # same switch (aiter/fused_moe.py reads it per call on gfx1250, defaulting to
+    # fp4x2 unless this is 1), so the quant key has to drive it or -q a4w4_mxfp4
+    # silently measures a8w4.
+    os.environ["AITER_FORCE_A8W4"] = "0" if args.quant_type == "a4w4_mxfp4" else "1"
     dist_ctx = Dist()
     dev = torch.device("cuda", dist_ctx.local_rank)
     spec = resolve_spec(args.quant_type, args.dispatch_commu_dtype)
+    spec["mega_wire"] = resolve_mega_wire(args.mega_wire, args.quant_type)
 
     if spec["is_mxfp4"] and get_gfx() not in ("gfx950", "gfx1250"):
         if dist_ctx.rank == 0:
@@ -790,7 +831,8 @@ def main():
         print(
             f"[cfg] world={dist_ctx.world} layers={n_layers} tokens/rank={ct} hidden={hdim} "
             f"inter={idim} E={E} topk={topk} EPR={E // dist_ctx.world} quant={args.quant_type} "
-            f"combine={args.combine} "
+            f"combine={args.combine} mega_wire={spec['mega_wire']} "
+            f"force_a8w4={os.environ['AITER_FORCE_A8W4']} "
             f"gate={spec['gate_mode'].name} shared_E={args.shared_experts} gfx={get_gfx()}",
             flush=True,
         )
@@ -959,6 +1001,16 @@ def _parse_args():
         choices=["auto", "bf16", "fp8"],
         default="auto",
         help="dispatch transport (communication) dtype",
+    )
+    p.add_argument(
+        "--mega_wire",
+        type=str,
+        choices=["auto", "bf16", "fp8", "fp4"],
+        default=os.environ.get("MEGA_WIRE", "bf16"),
+        help="MegaMoE (scatter_fused) dispatch wire: bf16 sends activations and "
+        "the receiver quantizes each copy; fp8/fp4 quantize once on the sender "
+        "and forward the e8m0 row. 'auto' picks what the quant key's GEMM wants. "
+        "Needs dispatch_backend=mori (MEGA_DISPATCH=mori).",
     )
     p.add_argument(
         "--combine",
