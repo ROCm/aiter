@@ -646,6 +646,49 @@ def case_end_to_end():
     dist.destroy_process_group()
 
 
+def case_exports():
+    import aiter.ops.flydsl.kernels.mega_moe as mm
+
+    assert "TPMoEStage1" in mm.__all__
+    assert "TPMoEStage1Output" in mm.__all__
+    assert mm.TPMoEStage1 is TPMoEStage1
+    assert mm.TPMoEStage1Output is TPMoEStage1Output
+    # existing exports must survive untouched
+    for name in (
+        "MegaMoEConfig",
+        "MegaMoEV2",
+        "Stage1Config",
+        "Stage2Config",
+        "compile_gemm1",
+        "gemm1_kernel",
+        "select_mega_moe_config",
+    ):
+        assert name in mm.__all__, f"existing export {name} disappeared"
+        assert getattr(mm, name) is not None
+
+    # phase-2 seam: the knob exists and rejects unimplemented transports clearly
+    device = torch.device("cuda", 0)
+    w1, w1_scale = _fake_w1(NETWORK["experts"], 384, NETWORK["model_dim"], device)
+    try:
+        TPMoEStage1(
+            model_dim=NETWORK["model_dim"],
+            inter_dim=384,
+            experts=NETWORK["experts"],
+            topk=NETWORK["topk"],
+            w1=w1,
+            w1_scale=w1_scale,
+            tp_size=8,
+            tp_rank=0,
+            device=device,
+            transport="fused_allgather",
+        )
+    except NotImplementedError as exc:
+        assert "fused_allgather" in str(exc), exc
+    else:
+        raise AssertionError("unimplemented transport must raise NotImplementedError")
+    print("case_exports OK")
+
+
 CASES = {
     "construct": case_construct_validates,
     "capacity": case_capacity,
@@ -654,6 +697,7 @@ CASES = {
     "numerics": case_numerics,
     "prequant": case_prequant_equivalence,
     "e2e": case_end_to_end,
+    "exports": case_exports,
 }
 
 
