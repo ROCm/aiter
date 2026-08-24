@@ -246,9 +246,8 @@ void quant_mxfp6_gemm_hip(const aiter_tensor_t& input,
                 __func__,
                 " expected all tensors on the same GPU");
     HipDeviceGuard device_guard(input.device_id);
-    static const bool is_gfx950 = get_gpu_arch() == "gfx950";
+    const bool is_gfx950 = get_gpu_arch() == "gfx950";
     AITER_CHECK(is_gfx950, __func__, " requires gfx950 hardware FP6 conversion");
-    AITER_CHECK(input.dim() == 2, __func__, " expected a 2D [rows, K] input");
     AITER_CHECK(input.is_contiguous(), __func__, " expected contiguous input");
     AITER_CHECK(packed.is_contiguous(), __func__, " expected contiguous packed output");
     AITER_CHECK(packed_scale.is_contiguous(), __func__, " expected contiguous packed-scale output");

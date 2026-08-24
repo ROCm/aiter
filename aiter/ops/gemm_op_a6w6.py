@@ -686,6 +686,8 @@ def quant_mxfp6_gemm_out(
     w: Tensor, packed: Tensor, packed_scale: Tensor
 ) -> tuple[Tensor, Tensor]:
     """Quantize + pack into caller-provided output buffers."""
+    if w.ndim != 2:
+        raise ValueError(f"quant_mxfp6_gemm_out expects a 2D [rows, K] tensor, got {w.ndim}D")
     rows, K = w.shape
     padK = _ceil(K, _K_TILE)
     expected_packed, expected_scale = mxfp6_gemm_pack_size(rows, K)
