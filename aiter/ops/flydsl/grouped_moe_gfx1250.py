@@ -39,21 +39,41 @@ kernel_bench_callable = None
 
 
 def _stage1_producer_blocks(
-    device: torch.device, contiguous_m: int, gemm1_tiles: int
+    device: torch.device,
+    contiguous_m: int,
+    gemm1_tiles: int,
+    compact: bool = False,
 ) -> int:
     """Workgroups gemm1 spends gathering its own A rows.
 
     A tunable, not a derived quantity: the gather is bandwidth-bound and the
     tiles it displaces are compute-bound, so the best split depends on the
     shape. Too few and consumers stall on the spin-wait; too many and the GEMM
-    loses more compute than the gather was worth. ``auto`` (the prequant-path
-    default) assigns one producer per 384 static rows, clamped to [CU/8, CU/4].
-    Explicit ``0`` keeps the standalone gather baseline.
+    loses more compute than the gather was worth. Explicit ``0`` keeps the
+    standalone gather baseline; an explicit count overrides everything.
+
+    ``auto`` splits by path:
+
+    * Recv-slot producers (``compact=False``): one producer per 384 static
+      rows, clamped to [CU/8, CU/4].
+
+    * Compact-dispatch producers (``compact=True``): the cross-fabric copy is
+      the fused-stage1 bottleneck and every producer rejoins as a consumer once
+      its gather drains (``rejoin=1``), so oversubscribing the gather is nearly
+      free -- the count that actually matters is how many workgroups stay
+      resident, which scales with the machine, not the capacity-padded row
+      count (that padding pins the old ``contig_m/384`` estimate near CU/4 for
+      every shape). Targeting ~CU producers was 300-800us/layer faster than the
+      old clamp across a tpr={64,128,256,512} sweep on gfx1250, and landed
+      within ~85us/layer of each shape's individually swept optimum (which
+      drifts over [CU*0.75, CU*1.25] with tile occupancy and dispatch load).
     """
     raw = os.environ.get("AITER_FLYDSL_STAGE1_PRODUCER_BLOCKS", "auto").strip().lower()
     if raw != "auto":
         return max(0, int(raw))
     cu = _device_cu_count(device)
+    if compact:
+        return min(cu, max(1, int(gemm1_tiles)))
     producer = (int(contiguous_m) + 383) // 384
     producer = max(max(1, cu // 8), min(producer, max(1, cu // 4)))
     return min(producer, max(1, int(gemm1_tiles)))
@@ -782,7 +802,10 @@ def _grouped_a8w4_tdm_moe(
         _tdm_align_up(
             max(
                 int(stage1_dispatch.world_size),
-                _stage1_producer_blocks(device, contiguous_m, _gemm1_tiles) or 128,
+                _stage1_producer_blocks(
+                    device, contiguous_m, _gemm1_tiles, compact=True
+                )
+                or 128,
             ),
             int(stage1_dispatch.world_size),
         )

@@ -4,6 +4,7 @@
 """Grouped contiguous-M A8W4 preshuffle MoE GEMM for gfx1250 (TDM pipeline)."""
 
 import math
+import os
 from collections import namedtuple
 from types import SimpleNamespace
 
@@ -305,6 +306,21 @@ def launch_gemm_a8w4_tdm(
     _ = cache_tag
     producer_on = producer_blocks > 0
     dispatch_on = dispatch_blocks > 0
+    # Row-major coalesced scale transport (change(a)), the fused-path default:
+    # the producer writes each grouped row's e8m0 scales contiguously (one
+    # coalesced remote burst per row) instead of scattering them into the
+    # WMMA-interleaved layout byte-by-byte, and the GEMM strided-reads that
+    # row-major buffer straight into the identical per-k-tile LDS slot -- so no
+    # on-chip transpose and no extra persistent LDS, ~18% faster end-to-end than
+    # the scatter.  Only the flat SA layout (AS_SUPERS==m_warp==1,
+    # AS_KSTEPS==tile_k//128==1) is wired; any other tile silently keeps the
+    # interleaved scatter.  Set AITER_STAGE1_ROWMAJOR_SCALE=0 to force it off.
+    _stage1_rowmajor_scale = (
+        dispatch_on
+        and m_warp == 1
+        and tile_k == 128
+        and os.environ.get("AITER_STAGE1_ROWMAJOR_SCALE", "1") == "1"
+    )
     role_on = producer_on or dispatch_on
     work_queue_on = 1 if (dispatch_on or (producer_on and producer_work_queue)) else 0
     plan_on = 1 if (producer_on and plan_in_kernel) else 0
@@ -473,12 +489,13 @@ def launch_gemm_a8w4_tdm(
     # otherwise fall back to the single-tile drain-every-row path.
     _dispatch_pipe_depth = 1
     if dispatch_on:
-        if (
+        _fits_depth2 = (
             compact_payload_lds_bytes(
                 wire_stride=dispatch_wire_stride, num_waves=num_waves, pipe_depth=2
             )
             <= ARENA_B
-        ):
+        )
+        if _fits_depth2:
             _dispatch_pipe_depth = 2
         elif (
             compact_payload_lds_bytes(
@@ -487,14 +504,19 @@ def launch_gemm_a8w4_tdm(
             > ARENA_B
         ):
             raise ValueError("compact dispatch wire tiles exceed the GEMM LDS arena")
-        import sys as _sys
-
-        print(
-            f"[DIAG] dispatch_pipe_depth={_dispatch_pipe_depth} ARENA_B={ARENA_B} "
-            f"need2={compact_payload_lds_bytes(wire_stride=dispatch_wire_stride, num_waves=num_waves, pipe_depth=2)} "
-            f"wire_stride={dispatch_wire_stride} num_waves={num_waves}",
-            file=_sys.stderr,
-        )
+        # AITER_DISPATCH_PIPE_DEPTH pins the producer's wire double-buffering for
+        # A/B tuning; depth 2 needs two wire tiles per wave to fit the arena.
+        _pd_env = os.environ.get("AITER_DISPATCH_PIPE_DEPTH")
+        if _pd_env is not None:
+            _req = int(_pd_env)
+            if _req not in (1, 2):
+                raise ValueError("AITER_DISPATCH_PIPE_DEPTH must be 1 or 2")
+            if _req == 2 and not _fits_depth2:
+                raise ValueError(
+                    "AITER_DISPATCH_PIPE_DEPTH=2 requested but two wire tiles do "
+                    "not fit the GEMM LDS arena"
+                )
+            _dispatch_pipe_depth = _req
     # The planner scans in the arena rather than in LDS of its own: the plan
     # runs before the first tile is staged, so the space is free, and taking a
     # second region would cost every workgroup occupancy for one workgroup's
@@ -543,12 +565,13 @@ def launch_gemm_a8w4_tdm(
         if dispatch_on
         else ""
     )
+    _rms = "_rms" if _stage1_rowmajor_scale else ""
     _kname = (
         f"a8w4_tdm_{_afp}"
         f"_t{tile_m}x{tile_n}x{tile_k}_w{m_warp}x{n_warp}"
         f"_b{num_buffers}_K{K}"
         f"{_grouped}{_act}{_bias}{_qout}{_cl}{_next_stage}{_waves_per_tensor}{_ep}"
-        f"{_prod}{_disp}"
+        f"{_prod}{_disp}{_rms}"
     )
 
     @flyc.kernel(name=_kname, known_block_size=[block, 1, 1])
@@ -803,6 +826,7 @@ def launch_gemm_a8w4_tdm(
                         scale_bytes=dispatch_scale_bytes,
                         tile_m=tile_m,
                         wmma_rep=wmma_m_rep,
+                        scale_rowmajor=_stage1_rowmajor_scale,
                         parity=entry_gen & fx.Int32(1),
                         expected=entry_gen + fx.Int32(1),
                         pipe_depth=_dispatch_pipe_depth,
@@ -1204,20 +1228,47 @@ def launch_gemm_a8w4_tdm(
                 k_adv=PACK_TK * 16,
                 wv=waves[1],
             )
-            add_tdm_loads(
-                gSA_base,
-                (blk_m64 // (wmma_m_rep * 16)) * AS_ROW,
-                AS_ROW,
-                None,
-                AS_INNER,
-                AS_SUPERS,
-                on_i32=True,
-                lds_off=SA_OFF // 4,
-                lds_row=AS_INNER,
-                k_adv=AS_INNER * 4,
-                wv=waves[2],
-                split_inner=AS_SUPERS < len(waves[2]),
-            )
+            if const_expr(_stage1_rowmajor_scale):
+                # Row-major scale: the producer stored gSA as [grouped_row][k128]
+                # so element (blk_m64//R)*AS_ROW + row_in_tile*SA_DPR + kt equals
+                # destination_row*SA_DPR + kt.  Strided-read one dword per row per
+                # k-tile (outer=rows, inner=1, row stride SA_DPR dwords, k step 1
+                # dword) so the LDS lands byte-identical to the interleaved load
+                # and load_sa is unchanged.  Only the flat m_warp==1/tile_k==128
+                # (AS_SUPERS==1, AS_KSTEPS==1) layout is wired.
+                assert (
+                    AS_SUPERS == 1 and AS_KSTEPS == 1
+                ), "row-major scale needs AS_SUPERS==1 and AS_KSTEPS==1"
+                SA_DPR = K // 128
+                add_tdm_loads(
+                    gSA_base,
+                    (blk_m64 // (wmma_m_rep * 16)) * AS_ROW,
+                    SA_DPR,
+                    None,
+                    1,
+                    wmma_m_rep * 16,
+                    on_i32=True,
+                    lds_off=SA_OFF // 4,
+                    lds_row=1,
+                    k_adv=4,
+                    wv=waves[2],
+                    split_inner=False,
+                )
+            else:
+                add_tdm_loads(
+                    gSA_base,
+                    (blk_m64 // (wmma_m_rep * 16)) * AS_ROW,
+                    AS_ROW,
+                    None,
+                    AS_INNER,
+                    AS_SUPERS,
+                    on_i32=True,
+                    lds_off=SA_OFF // 4,
+                    lds_row=AS_INNER,
+                    k_adv=AS_INNER * 4,
+                    wv=waves[2],
+                    split_inner=AS_SUPERS < len(waves[2]),
+                )
             add_tdm_loads(
                 gSB_base,
                 sb_off0,

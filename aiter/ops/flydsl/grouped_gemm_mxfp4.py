@@ -130,7 +130,6 @@ def flydsl_grouped_gemm_a8w4_masked(
     dispatch_weights=None,
     dispatch_cur_tokens=0,
     plan_in_kernel=0,
-    plan_nvr_is_tokens=0,
     plan_route_max_m=0,
     plan_numel=0,
     plan_ep_scatter=0,
@@ -143,18 +142,6 @@ def flydsl_grouped_gemm_a8w4_masked(
     plan_gather_w=None,
     plan_tis=None,
     plan_rowmap=None,
-    fused_dispatch=0,
-    fused_dispatch_overlap=0,
-    overlap_dispatch=0,
-    dispatch_descriptor=None,
-    dispatch_input_idx=None,
-    dispatch_input_wts=None,
-    dispatch_cur_tokens=0,
-    dispatch_blocks=0,
-    dispatch_rank=0,
-    dispatch_offsets=(0, 0, 0, 0, 0, 0, 0),
-    dispatch_max_recv=0,
-    dispatch_max_tokens=0,
 ):
     """Launches a contiguous-M grouped a8w4 GEMM on the TDM kernel."""
     from .kernels.mxfp4_preshuffle_gfx1250_tdm import launch_gemm_a8w4_tdm
@@ -329,7 +316,6 @@ def flydsl_grouped_gemm_a8w4_masked(
             dispatch_context.num_valid if dispatch_context is not None else a
         ),
         plan_in_kernel=int(plan_in_kernel),
-        plan_nvr_is_tokens=int(plan_nvr_is_tokens),
         plan_route_max_m=int(plan_route_max_m),
         plan_numel=int(plan_numel),
         plan_ep_scatter=int(plan_ep_scatter),
@@ -348,25 +334,5 @@ def flydsl_grouped_gemm_a8w4_masked(
         arg_plan_gather_w=ptr_arg(plan_gather_w if plan_ep_scatter else a),
         arg_plan_tis=ptr_arg(plan_tis if plan_ep_scatter else a),
         arg_plan_rowmap=ptr_arg(plan_rowmap if plan_ep_scatter else a),
-        fused_dispatch=int(fused_dispatch),
-        fused_dispatch_overlap=int(fused_dispatch_overlap),
-        overlap_dispatch=int(overlap_dispatch),
-        arg_dispatch_descriptor=ptr_arg(
-            dispatch_descriptor if (fused_dispatch or overlap_dispatch) else a
-        ),
-        arg_dispatch_idx=ptr_arg(dispatch_input_idx if fused_dispatch else a),
-        arg_dispatch_wts=ptr_arg(dispatch_input_wts if fused_dispatch else a),
-        dispatch_cur_tokens=int(dispatch_cur_tokens),
-        dispatch_blocks=int(dispatch_blocks),
-        dispatch_rank=int(dispatch_rank),
-        dispatch_off_tok_off=int(dispatch_offsets[0]),
-        dispatch_off_recv_num=int(dispatch_offsets[1]),
-        dispatch_off_tis=int(dispatch_offsets[2]),
-        dispatch_off_out_idx=int(dispatch_offsets[3]),
-        dispatch_off_out_wts=int(dispatch_offsets[4]),
-        dispatch_off_out_tok=int(dispatch_offsets[5]),
-        dispatch_off_payload_ready=int(dispatch_offsets[6]),
-        dispatch_max_recv=int(dispatch_max_recv),
-        dispatch_max_tokens=int(dispatch_max_tokens),
     )
     return out

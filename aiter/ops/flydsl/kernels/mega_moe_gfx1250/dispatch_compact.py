@@ -521,6 +521,7 @@ def emit_compact_payload(
     parity,
     expected,
     pipe_depth: int = 1,
+    scale_rowmajor: bool = False,
 ) -> None:
     """Emit one compact payload-producer workgroup.
 
@@ -661,20 +662,34 @@ def emit_compact_payload(
                     vec_width=1,
                     dtype=T.i8,
                 )
-                scale_dword = fx.Uint32(mx_block) // fx.Uint32(4)
-                byte_in_dword = mx_block - fx.Int32(scale_dword) * fx.Int32(4)
-                row_base = _scale_row_dword_base(
-                    fx.Uint32(destination_row),
-                    c_rows_per_tile=fx.Int32(rows_per_tile),
-                    c_dst_scale_dwords_per_row=fx.Int32(dst_scale_dwords_per_row),
-                    c16_i32=fx.Int32(16),
-                )
-                dst_dword = row_base + scale_dword * fx.Uint32(rows_per_tile)
-                buffer_ops.buffer_store(
-                    value,
-                    _rsrc(dst_scale),
-                    fx.Int32(dst_dword) * fx.Int32(4) + byte_in_dword,
-                )
+                if const_expr(scale_rowmajor):
+                    # Row-major coalesced: grouped row r's e8m0 scales are a
+                    # contiguous ``scale_bytes`` run at ``r*scale_bytes``.
+                    # Consecutive lanes write consecutive bytes, so each wave step
+                    # is one coalesced remote burst instead of ``scale_bytes``
+                    # scattered single-byte peer stores.  The GEMM strided-reads
+                    # element ``r*(scale_bytes//4)+k128`` back, so this lands
+                    # byte-for-byte where the WMMA-interleaved LDS load expects it.
+                    buffer_ops.buffer_store(
+                        value,
+                        _rsrc(dst_scale),
+                        destination_row * fx.Int32(scale_bytes) + mx_block,
+                    )
+                else:
+                    scale_dword = fx.Uint32(mx_block) // fx.Uint32(4)
+                    byte_in_dword = mx_block - fx.Int32(scale_dword) * fx.Int32(4)
+                    row_base = _scale_row_dword_base(
+                        fx.Uint32(destination_row),
+                        c_rows_per_tile=fx.Int32(rows_per_tile),
+                        c_dst_scale_dwords_per_row=fx.Int32(dst_scale_dwords_per_row),
+                        c16_i32=fx.Int32(16),
+                    )
+                    dst_dword = row_base + scale_dword * fx.Uint32(rows_per_tile)
+                    buffer_ops.buffer_store(
+                        value,
+                        _rsrc(dst_scale),
+                        fx.Int32(dst_dword) * fx.Int32(4) + byte_in_dword,
+                    )
         if lane == fx.Int32(0):
             weight = buffer_ops.buffer_load(
                 _rsrc(addr_in_weights), route, vec_width=1, dtype=T.f32
