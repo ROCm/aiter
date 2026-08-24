@@ -7,6 +7,7 @@ import triton.language as tl
 
 from aiter.ops.triton._triton_kernels.moe.activations import _swiglu
 from aiter.ops.triton._triton_kernels.quant.quant import _mxfp4_quant_op
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid
 
 
@@ -103,6 +104,30 @@ def unswizzle_mx_scale_cdna4(
 
 
 @triton.jit
+def unswizzle_mx_scale_gfx1250(
+    scale_buffer_slice,
+    BLOCK_N: tl.constexpr,
+    MX_SCALE_BLOCK_K: tl.constexpr,
+    PRESHUFFLE_FACTOR: tl.constexpr,
+    SCALE_KWIDTH: tl.constexpr,
+):
+    scale_buffer_slice = (
+        scale_buffer_slice.reshape(
+            (
+                BLOCK_N // PRESHUFFLE_FACTOR,
+                MX_SCALE_BLOCK_K // SCALE_KWIDTH,
+                PRESHUFFLE_FACTOR,
+                SCALE_KWIDTH,
+            )
+        )
+        .permute((0, 2, 1, 3))
+        .reshape((BLOCK_N, MX_SCALE_BLOCK_K))
+    )
+
+    return scale_buffer_slice
+
+
+@triton.jit
 def _mxfp4_quant_kernel(
     x_ptr,
     x_fp4_ptr,
@@ -164,7 +189,22 @@ def _mxfp4_quant_kernel(
         )
 
 
-@triton.jit(launch_metadata=matmul_launch_metadata)
+_moe_gemm_a4w4_repr = make_kernel_repr(
+    "_moe_gemm_a4w4",
+    [
+        "BLOCK_M",
+        "BLOCK_N",
+        "BLOCK_K",
+        "GROUP_M",
+        "SPLIT_K",
+        "EVEN_K",
+        "SWIZZLE_MX_SCALE",
+        "APPLY_SWIGLU",
+    ],
+)
+
+
+@triton.jit(launch_metadata=matmul_launch_metadata, repr=_moe_gemm_a4w4_repr)
 def _moe_gemm_a4w4(
     Y,
     stride_y_k,
@@ -333,10 +373,17 @@ def _moe_gemm_a4w4(
     )
 
     WMxScale += expt_id * stride_w_mx_e
-    if SWIZZLE_MX_SCALE == "CDNA4_SCALE":
+    tl.static_assert(
+        SWIZZLE_MX_SCALE is None
+        or SWIZZLE_MX_SCALE == "CDNA4_SCALE"
+        or SWIZZLE_MX_SCALE == "GFX1250_SCALE",
+        "SWIZZLE_MX_SCALE must be None, 'CDNA4_SCALE' or 'GFX1250_SCALE'",
+    )
+    if SWIZZLE_MX_SCALE is not None:
         tl.static_assert(stride_w_mx_k is not None)
         tl.static_assert(stride_w_mx_n is not None)
         NON_K_PRESHUFFLE_BLOCK_SIZE: tl.constexpr = 32
+        GFX1250_SCALE_KWIDTH: tl.constexpr = 4
         PACKED_MX_BLOCK: tl.constexpr = MX_SCALE_BLOCK_K * NON_K_PRESHUFFLE_BLOCK_SIZE
         SCALE_BLOCK_N: tl.constexpr = BLOCK_N // NON_K_PRESHUFFLE_BLOCK_SIZE
     else:
@@ -397,6 +444,14 @@ def _moe_gemm_a4w4(
                 BLOCK_N,
                 MX_SCALE_BLOCK_K,
             )
+        elif SWIZZLE_MX_SCALE == "GFX1250_SCALE":
+            w_scales = unswizzle_mx_scale_gfx1250(
+                tl.load(WMxScalePtrs, cache_modifier=W_CACHE_MODIFIER),
+                BLOCK_N,
+                MX_SCALE_BLOCK_K,
+                NON_K_PRESHUFFLE_BLOCK_SIZE,
+                GFX1250_SCALE_KWIDTH,
+            )
         else:
             w_scales = tl.load(WMxScalePtrs)
 
@@ -433,6 +488,14 @@ def _moe_gemm_a4w4(
                 tl.load(WMxScalePtrs, cache_modifier=W_CACHE_MODIFIER),
                 BLOCK_N,
                 MX_SCALE_BLOCK_K,
+            )
+        elif SWIZZLE_MX_SCALE == "GFX1250_SCALE":
+            w_scales = unswizzle_mx_scale_gfx1250(
+                tl.load(WMxScalePtrs, cache_modifier=W_CACHE_MODIFIER),
+                BLOCK_N,
+                MX_SCALE_BLOCK_K,
+                NON_K_PRESHUFFLE_BLOCK_SIZE,
+                GFX1250_SCALE_KWIDTH,
             )
         else:
             w_scales = tl.load(WMxScalePtrs, mask=mask_w_k_scale[None, :])

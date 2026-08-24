@@ -139,6 +139,25 @@ struct ArgMin
     }
 };
 
+// The unsigned type a radix pass reinterprets T as, i.e. what
+// hipcub::Traits<T>::UnsignedBits used to give us. ROCm 10 hipcub (CCCL 3.0)
+// dropped the public Traits<> class, so carry the one mapping the radix top-k
+// paths actually need. hipcub resolved float through
+// NumericTraits<float> -> BaseTraits<FLOATING_POINT, ..., unsigned int, float>,
+// so UnsignedBits was uint32_t; this is that type, not an approximation of it.
+//
+// Left undefined for every other T on purpose: the radix paths are fp32-only,
+// and a missing specialization should fail to compile rather than silently
+// pick a width. Add one here if a caller ever needs another dtype.
+template <typename T>
+struct radix_traits;
+
+template <>
+struct radix_traits<float>
+{
+    using UnsignedBits = uint32_t;
+};
+
 } // namespace aiter
 
 template <typename T, typename F>
