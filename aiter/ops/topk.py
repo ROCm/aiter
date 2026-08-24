@@ -460,57 +460,31 @@ def _top_k_per_row_decode(
 _TRUTHY_ENV = ("1", "true", "True", "yes", "YES")
 
 
-# Per-arch admission windows: min padded width, max rows, the k set that wins, and
-# any row carved out by hand. A window does not transfer between archs, since the
-# grid-trim, batch-cap, row-proportional and early-stop tuning is gfx950-only and
-# gfx942 runs a frozen configuration measured separately.
+# Per-arch admission windows: min padded width, max rows, and the k set that wins.
+# A window does not transfer between archs -- the grid-trim, batch-cap and
+# early-stop tuning is gfx950-only, gfx942 runs a frozen configuration, and the
+# row cap tracks CU count (12 on 256 CU against 16 on 304 CU).
 #
-# The width gate asks "is this a long-context model", not "is this a long request",
+# min_width asks "is this a long-context model", not "is this a long request",
 # and it has to: callers size the score buffer to the model's max context (vLLM's
-# sparse indexer builds logits as (batch * next_n, max_model_len)), the real per-row
-# lengths live in seqLens on the device where reading them would cost a sync, and
-# under CUDA-graph capture the request length does not exist yet -- one graph per
-# batch size, replayed at every length. One width therefore covers requests whose
-# cost differs several-fold, so each window is chosen to pay off across that whole
-# range rather than at one length.
+# sparse indexer builds logits as (batch * next_n, max_model_len)), the real
+# per-row lengths live in seqLens on the device where reading them would cost a
+# sync, and under CUDA-graph capture the request length does not exist yet. Width
+# only bounds the request, so this kernel wins across the long half of what one
+# width covers and loses on the short half; the window is a bet that a
+# long-context deployment actually serves long requests.
 #
-# Width earns its place as that stand-in because a request cannot be longer than
-# the buffer holding it: at width 32768 nothing reaches the lengths where this
-# kernel pulls ahead, while a 163840-wide buffer at least can. Wide buffers are not
-# themselves faster -- holding the real length fixed and sweeping width moves the
-# margin by under 2.2us on gfx942 -- so min_width is a bet that a long-context
-# deployment actually serves long requests, and it loses on the short ones.
-#
-# gfx950 takes the widest window that loses no cell in the eager width-sweep, the
-# regime vLLM pays when a decode batch overflows its graph-capture limit; captured
-# cells only do better. Below 131072 the ~19us host submit sinks short-context
-# cells, k=512 still loses at full width, and rows==2 stays behind while rows 1 and
-# 4-16 pull ahead -- hence the carve-outs.
-#
-# gfx942 comes from a 928-cell MI300X sweep that timed both kernels through this
-# same entry point, and its thresholds are read off graph replay alone. Eager there
-# is the more generous regime rather than the stricter one, so it cannot set the
-# boundary: HIP pays 11.7us of host work per call against FlyDSL's 2.6us, most of
-# it an un-memoized workspace-size query, which credits this kernel for an overhead
-# a fix upstream would erase. Under replay rows decay monotonically (+5.8us/cell at
-# rows 1, +1.0 at 16, -7.0 at 24) and the four AOT-precompiled k values land within
-# 0.6us of each other, hence wide in k and capped at 16 rows. That sweep samples
-# rows at 1-2-4-8-12-16-24-32, so a 420-cell follow-up probe walked 13-15 and 17-20
-# twice: replay crosses zero at rows 18 (+0.08us/cell) and turns a real loss at 19
-# (-0.53), so the threshold is 18 rather than the 20 the coarse grid suggested.
-# Rows 17 is genuinely positive (+33.9us, and no k slice of it goes negative), but
-# it buys 2.5% of the window's +1371us while moving the worst cell from -11.7us to
-# -14.6us, so 16 stays the conservative edge. See the SILOTIGER-699 gate
-# investigation for the per-cell numbers behind both archs.
+# Both windows are read off graph replay rather than eager, and each threshold
+# sits below the measured sign change rather than on it. The SILOTIGER-699 gate
+# investigation holds the per-cell numbers and the reasoning behind every one.
 class _DecodeGate(NamedTuple):
     min_width: int
     max_rows: int
     ks: frozenset
-    excluded_rows: frozenset = frozenset()
 
 
 _FLYDSL_TOPK_DECODE_GATES = {
-    "gfx950": _DecodeGate(131072, 16, frozenset({2048}), frozenset({2})),
+    "gfx950": _DecodeGate(131072, 12, frozenset({256, 512, 1024, 2048})),
     "gfx942": _DecodeGate(131072, 16, frozenset({256, 512, 1024, 2048})),
 }
 
@@ -603,19 +577,18 @@ def _should_use_flydsl_decode(
     if gate is None:
         return False
 
-    if numRows > gate.max_rows or numRows in gate.excluded_rows:
+    if numRows > gate.max_rows:
         return False
     if k not in gate.ks:
         return False
     if logits.ndim != 2 or logits.shape[1] < gate.min_width:
         return False
 
-    # HIP drops stride1 entirely and never validates next_n, so a call that works
-    # there today can violate FlyDSL's contract, which raises rather than falling
-    # back. Screen those here so the fallback stays a routing decision. Both
-    # strides are checked against the tensor as well as against the contract,
-    # since a caller that claims stride1 == 1 for a column-strided buffer is one
-    # HIP accepts and FlyDSL rejects.
+    # HIP drops stride1 and never validates next_n, so a call that works there can
+    # violate FlyDSL's contract, which raises rather than falling back. Screen those
+    # here to keep the fallback a routing decision. Strides are checked against the
+    # tensor, not the declared value: a caller claiming stride1 == 1 for a strided
+    # buffer is exactly the case HIP accepts and misreads.
     if (
         stride1 != 1
         or next_n < 1
@@ -764,13 +737,10 @@ def top_k_per_row_decode(
     request -- on the HIP path, which ignores ``workspace`` entirely, with nothing
     to raise on.
     """
-    # Neither kernel reads a column stride. FlyDSL raises on one; HIP ignores the
-    # argument and walks the dense buffer the view sits in, so a strided caller
-    # gets the Top-K of its neighbours' elements back with nothing raised. Densify
-    # up front so the gate below routes on shape alone and both kernels see the
-    # elements the caller asked about. The tensor decides, not the declared
-    # stride: a caller claiming 1 for a strided buffer is the case HIP accepts and
-    # silently misreads.
+    # Neither kernel reads a column stride: FlyDSL raises on one, HIP ignores it and
+    # walks the dense buffer the view sits in, returning the Top-K of the neighbouring
+    # elements with nothing raised. Densify up front so the gate routes on shape alone
+    # and both kernels see what the caller asked about.
     if stride1 != 1 or logits.stride(1) != 1:
         logits = logits.contiguous()
         stride0, stride1 = logits.stride()

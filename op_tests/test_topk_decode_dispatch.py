@@ -38,24 +38,24 @@ gate_is_overridden = pytest.mark.skipif(
 @gate_is_overridden
 def test_shipped_gfx950_gate():
     """Pin the real gfx950 window to the SILOTIGER-699 conclusion so a silent edit
-    to the table trips here."""
+    to the table trips here. Set from the 1276-cell MI355X sweep: rows cross zero
+    at 14 so 12 is the conservative edge, and all four AOT k values pass."""
     gate = topk_mod._FLYDSL_TOPK_DECODE_GATES["gfx950"]
     assert gate.min_width == 131072
-    assert gate.max_rows == 16
-    assert gate.ks == frozenset({2048})
-    assert gate.excluded_rows == frozenset({2})
+    assert gate.max_rows == 12
+    assert gate.ks == frozenset({256, 512, 1024, 2048})
 
 
 @gate_is_overridden
 def test_shipped_gfx942_gate():
-    """Same pin for gfx942, set from the 928-cell MI300X sweep. Matches gfx950 in
-    rows and is wider in k, because all four AOT-precompiled values measured within
-    0.6us of each other there and no single row misbehaves enough to carve out."""
+    """Same pin for gfx942, set from the 928-cell MI300X sweep. Wider in rows than
+    gfx950 because the row threshold tracks CU count (304 against 256), and equally
+    wide in k, because all four AOT-precompiled values measured within 0.6us of
+    each other there."""
     gate = topk_mod._FLYDSL_TOPK_DECODE_GATES["gfx942"]
     assert gate.min_width == 131072
     assert gate.max_rows == 16
     assert gate.ks == frozenset({256, 512, 1024, 2048})
-    assert gate.excluded_rows == frozenset()
 
 
 # --- GPU ---------------------------------------------------------------------
@@ -86,17 +86,24 @@ ROUTING_CASES = [
     (1, 65536, 65536, 1024),  # outside every arch's window -> HIP
     (4, 131072, 70000, 512),  # padded buffer, poisoned tail
     (1, 8192, 8192, 512),
-    # gfx950 admits only k=2048 at width >= 131072, so every case above lands on
-    # HIP there and the FlyDSL branch of the arch this PR targets would go
-    # untested. These three sit inside both shipped windows.
+    # Everything above is rejected on width, so without these the FlyDSL branch
+    # would go untested on both archs.
     (1, 131072, 131072, 2048),  # -> FlyDSL on gfx950 and gfx942
     (1, 131072, 70000, 2048),  # same, with the poisoned tail
-    (2, 131072, 131072, 2048),  # gfx950 carves out rows==2 -> HIP; gfx942 FlyDSL
-    # Both archs now cap rows at 16, so straddle it at a width and k that clear
-    # every other screen -- otherwise the pair below would be rejected on width or
-    # k and would say nothing about the row cap.
-    (16, 131072, 131072, 2048),  # top of the row window -> FlyDSL on both
+    (2, 131072, 131072, 2048),  # rows==2 is ordinary on both -> FlyDSL
+    # The two archs cap rows apart (gfx950 12, gfx942 16) because the threshold
+    # tracks CU count, so straddle both edges at a width and k that clear every
+    # other screen -- otherwise these would be rejected on width or k and would say
+    # nothing about the row cap.
+    (12, 131072, 131072, 2048),  # top of the gfx950 window -> FlyDSL on both
+    (13, 131072, 131072, 2048),  # over gfx950, inside gfx942
+    (16, 131072, 131072, 2048),  # top of the gfx942 window
     (17, 131072, 131072, 2048),  # one over -> HIP on both
+    # Both archs now admit all four AOT k values, so cover the three that used to
+    # be gfx950-only rejections.
+    (1, 131072, 131072, 256),
+    (1, 131072, 131072, 512),
+    (1, 131072, 131072, 1024),
 ]
 
 
@@ -116,10 +123,7 @@ def test_routing_cases_reach_flydsl_on_every_shipped_arch(arch):
     admitted = [
         (rows, width, seq_len, k)
         for rows, width, seq_len, k in ROUTING_CASES
-        if rows <= gate.max_rows
-        and rows not in gate.excluded_rows
-        and k in gate.ks
-        and width >= gate.min_width
+        if rows <= gate.max_rows and k in gate.ks and width >= gate.min_width
     ]
     assert admitted, f"no routing case lands inside the {arch} window: {gate}"
 
