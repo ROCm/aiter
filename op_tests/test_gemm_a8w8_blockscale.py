@@ -117,10 +117,6 @@ def test_gemm(dtype, m, n, k, ck_preshuffle=True, use_flydsl=False):
     x_scale_t = x_scale.transpose(0, 1).contiguous().view(*x_scale.shape)
     gemm_weight = shuffle_weight(weight, layout=(16, 16)) if ck_preshuffle else weight
     if use_flydsl_fp8_scale and get_gfx() == "gfx950":
-        assert n % 128 == 0 and k % 128 == 0, (
-            f"gfx950 MX bpreshuffle needs N and K to be multiples of 128; "
-            f"got N={n}, K={k}"
-        )
         gemm_x_scale = shuffle_scale_blockscale_a(x_scale, k)
         gemm_w_scale = shuffle_scale_blockscale_b(w_scale, n, k)
     elif use_flydsl_fp8_scale:

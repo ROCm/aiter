@@ -26,7 +26,7 @@ _TILE_K_OPTS = (128, 256, 512, 1024)
 _NUM_BUFFERS_OPTS = (2, 3, 4)
 _WARP_OPTS = ((1, 4), (2, 2), (4, 1))
 _CLUSTER_OPTS = ((1, 1),)
-_SPLIT_K = (1,)
+_SPLIT_K = (1, 2, 4, 8)
 
 _CLUSTER_MIN_DIM = 8192
 _CLUSTER_MIN_TILES = 32
@@ -90,13 +90,11 @@ def kernel_instance_estimated_lds_bytes(ki: WmmaKernelInstance) -> int:
     stage_pitch = _align_up(stage_bytes, 1024)
     arena_bytes = stage_pitch * ki.num_buffers
 
-    if ki.split_k == 1:  # split_k>1 uses the buffer/atomic store, no LDS D buffer
-        warp_tile_m = ki.tile_m // ki.m_warp
-        warp_tile_n = ki.tile_n // ki.n_warp
-        d_row_stride = warp_tile_n * _ELEM_BYTES_D + _LDS_PAD_D_BYTES
-        total_d_bytes = (ki.m_warp * ki.n_warp) * warp_tile_m * d_row_stride
-        return max(arena_bytes, total_d_bytes)
-    return arena_bytes
+    warp_tile_m = ki.tile_m // ki.m_warp
+    warp_tile_n = ki.tile_n // ki.n_warp
+    d_row_stride = warp_tile_n * _ELEM_BYTES_D + _LDS_PAD_D_BYTES
+    total_d_bytes = (ki.m_warp * ki.n_warp) * warp_tile_m * d_row_stride
+    return max(arena_bytes, total_d_bytes)
 
 
 def _build_kernels_list() -> dict[int, WmmaKernelInstance]:

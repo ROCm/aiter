@@ -1007,22 +1007,59 @@ def gemm_a8w8_blockscale_bpreshuffle(
     else:
         Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
 
-    use_gfx1250_flydsl_mxfp8_128 = (
+    use_gfx1250_flydsl_or_triton_mxfp8_128 = (
         get_gfx() == "gfx1250"
         and x_scale.dtype == dtypes.fp8_e8m0
         and w_scale.dtype == dtypes.fp8_e8m0
     )
-    if use_gfx1250_flydsl_mxfp8_128:
-        if not is_flydsl_available():
-            raise RuntimeError(
-                "gfx1250 mxfp8_128 bpreshuffle (fp8_e8m0 scales) requires FlyDSL"
-            )
+    if use_gfx1250_flydsl_or_triton_mxfp8_128:
         config = get_CKGEMM_config(
             m,
             n,
             k,
             AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE,
         )
+        # A tuned triton/gluon row wins over flydsl on the SAME mxfp8_128
+        # operands: gemm_afp8wfp8_preshuffle consumes the e8m0 scales natively
+        # (wmma_scaled on gluon / dot_scaled on triton), so unlike the fp32
+        # blockscale path further down there is no scale widening, and the (N, K)
+        # shuffled weight + column-major x_scale layout is a direct fit.
+        # Deliberately checked BEFORE the FlyDSL availability gate so a
+        # triton-tuned shape does not require FlyDSL to be installed.
+        if config is not None and config["libtype"] == "triton":
+            from aiter.ops.triton.gemm.basic.gemm_afp8wfp8 import (
+                gemm_afp8wfp8_preshuffle as _gemm_afp8wfp8_preshuffle_triton,
+            )
+
+            # Same convention as the fp32 blockscale triton branch below:
+            # kernelName optionally carries the backend hint ("triton"/"gluon"),
+            # anything else -> None (auto gluon->triton detection).
+            kernelName = str(config.get("kernelName", ""))
+            backend = kernelName if kernelName in ("triton", "gluon") else None
+            return _gemm_afp8wfp8_preshuffle_triton(
+                XQ,
+                WQ,
+                # wmma_scaled/dot_scaled take uint8-typed scale operands; e8m0 is
+                # bit-identical, so a view is the whole conversion.
+                x_scale.view(torch.uint8),
+                w_scale.view(torch.uint8),
+                dtype=dtype,
+                y=Y,  # honor caller out= (zero-copy); Y = out or fresh empty
+                x_scale_group_size=128,
+                # The mxfp8_128 contract, not a guess: x_scale bytes are
+                # column-major (K // 128, M) -- what per_group_quant_hip(
+                # transpose_scale=True) emits, and what the flydsl runner
+                # hard-codes as x_scale_transposed=True. It is NOT inferable from
+                # strides here: that buffer is a contiguous (M, K // 128) tensor
+                # whose *bytes* are transposed, so the stride(0) != 1 probe the
+                # fp32 branches use would read it as row-major.
+                is_x_scale_transposed=True,
+                backend=backend,
+            )
+        if not is_flydsl_available():
+            raise RuntimeError(
+                "gfx1250 mxfp8_128 bpreshuffle (fp8_e8m0 scales) requires FlyDSL"
+            )
         if config is not None and config["libtype"] == "flydsl":
             return gemm_a8w8_mxfp8_128_bpreshuffle_flydsl(
                 XQ, WQ, x_scale, w_scale, Y, config
