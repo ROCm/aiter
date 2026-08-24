@@ -12,7 +12,10 @@ from __future__ import annotations
 import ctypes
 
 import flydsl.compiler as flyc
+import torch
 from flydsl.expr.typing import Int32, Int64, Stream
+
+from aiter.jit.utils.chip_info import get_gfx_runtime
 
 from .qr_int4_ipc import UncachedIpcHeap
 from .qr_int4_kernel import (
@@ -24,9 +27,17 @@ from .qr_int4_kernel import (
     make_qr_int4_kernel,
 )
 
+_SUPPORTED_ARCH = "gfx942"
 
-def _is_bf16(t) -> bool:
-    return str(getattr(t, "dtype", "")).endswith("bfloat16")
+
+def _cuda_index(device) -> int:
+    if isinstance(device, torch.device):
+        if device.type != "cuda":
+            raise ValueError(f"QRInt4 requires a CUDA device, got {device}")
+        if device.index is None:
+            return int(torch.cuda.current_device())
+        return int(device.index)
+    return int(device)
 
 
 class _StEngine:
@@ -119,8 +130,13 @@ class QRInt4:
             raise ValueError(
                 f"super_tile must be one of {SUPER_TILES}, got {super_tile!r}"
             )
+        arch = get_gfx_runtime()
+        if arch != _SUPPORTED_ARCH:
+            raise RuntimeError(f"QRInt4 is {_SUPPORTED_ARCH}-only, got {arch}")
+        torch.cuda.set_device(device)
         self.group = group
         self.device = device
+        self._device_index = _cuda_index(device)
         self.rank = int(rank)
         self.world_size = int(world_size)
         self.super_tile = int(super_tile)
@@ -153,6 +169,30 @@ class QRInt4:
         if self.super_tile == 1 or num_tiles > GRID:
             return self.super_tile
         return 1
+
+    def _check_payload(self, inp, out) -> int:
+        if not isinstance(inp, torch.Tensor) or not isinstance(out, torch.Tensor):
+            raise TypeError("QRInt4 requires torch.Tensor input/output")
+        if inp.dtype != torch.bfloat16 or out.dtype != torch.bfloat16:
+            raise ValueError("QRInt4 supports bf16 input/output")
+        if not inp.is_cuda or not out.is_cuda:
+            raise ValueError("QRInt4 requires CUDA tensors")
+        if (
+            inp.device.index != self._device_index
+            or out.device.index != self._device_index
+        ):
+            raise ValueError(
+                f"inp/out must be on cuda:{self._device_index}, "
+                f"got {inp.device} / {out.device}"
+            )
+        if not inp.is_contiguous() or not out.is_contiguous():
+            raise ValueError("QRInt4 requires contiguous input/output")
+        live_bytes = int(inp.numel()) * int(inp.element_size())
+        if live_bytes % 16 != 0:
+            raise ValueError("byte size must be a multiple of 16 (8 bf16)")
+        if int(out.numel()) * int(out.element_size()) != live_bytes:
+            raise ValueError("inp/out byte size mismatch")
+        return live_bytes
 
     def _launch_eng(self, eng: _StEngine, inp, out, stream) -> None:
         live_bytes = int(inp.numel()) * int(inp.element_size())
@@ -190,6 +230,7 @@ class QRInt4:
         prefill-sized ``allreduce`` does not JIT mid-collective. ``out`` is
         overwritten.
         """
+        self._check_payload(inp, out)
         for eng in self._by_st.values():
             self._launch_eng(eng, inp, out, stream)
 
@@ -199,13 +240,7 @@ class QRInt4:
         self._by_st = {}
 
     def allreduce(self, inp, out, stream=None):
-        if not _is_bf16(inp) or not _is_bf16(out):
-            raise ValueError("QRInt4 supports bf16 input/output")
-        live_bytes = int(inp.numel()) * int(inp.element_size())
-        if live_bytes % 16 != 0:
-            raise ValueError("byte size must be a multiple of 16 (8 bf16)")
-        if int(out.numel()) * int(out.element_size()) != live_bytes:
-            raise ValueError("inp/out byte size mismatch")
+        live_bytes = self._check_payload(inp, out)
         num_tiles = max(1, (live_bytes + TILE_BYTES - 1) // TILE_BYTES)
         st = self._pick_st(num_tiles)
         self._launch_eng(self._by_st[st], inp, out, stream)

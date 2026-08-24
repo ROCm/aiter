@@ -152,8 +152,8 @@ class UncachedIpcHeap:
     def gather_object_list_via_broadcast(group, shard_data):
         """All-gather Python objects over ``group``.
 
-        Only torch.distributed surface. Swap this helper if another runtime
-        (e.g. JAX) needs to ship HIP IPC handles.
+        Only torch.distributed surface. Index by group-local rank; ``src`` is
+        the matching entry in unsorted ``get_process_group_ranks``.
         """
         import torch.distributed as dist
 
@@ -161,7 +161,7 @@ class UncachedIpcHeap:
         rank = dist.get_rank(group=group)
         all_data = [[None] for _ in range(world_size)]
         all_data[rank][0] = shard_data
-        ranks = sorted(dist.get_process_group_ranks(group=group))
+        ranks = dist.get_process_group_ranks(group=group)
         for i, r in enumerate(ranks):
             dist.broadcast_object_list(all_data[i], src=r, group=group, device="cpu")
         return [all_data[i][0] for i in range(world_size)]

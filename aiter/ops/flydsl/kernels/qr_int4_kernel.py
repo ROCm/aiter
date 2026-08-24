@@ -638,8 +638,13 @@ def make_qr_int4_kernel(*, world_size: int = WORLD, super_tile: int = 1):
                     gpu.barrier()
                     _fanout_nt(PHASE_REDUCE_SCATTER, rank, s)
                     if (s + fx.Int32(1)) < n_this:
-                        # lgkmcnt(0) only: reuse ATOMS*1152 B LDS while NT stores fly.
+                        # Drain this wave's LDS loads, then join the WG.
+                        # world_size<8 leaves waves idle in fanout; without the
+                        # barrier they pack the next sub-tile into LDS while
+                        # a busy wave still ptr_loads it. lgkmcnt only: NT
+                        # payload stays in flight until _publish.
                         rocdl.s_waitcnt(lgkmcnt=0)
+                        gpu.barrier()
 
                 _publish(PHASE_REDUCE_SCATTER, rank, color)
                 _wait_release(PHASE_REDUCE_SCATTER, color)
@@ -650,8 +655,8 @@ def make_qr_int4_kernel(*, world_size: int = WORLD, super_tile: int = 1):
                     gpu.barrier()
                     _fanout_nt(PHASE_ALL_GATHER, rank, s)
                     if (s + fx.Int32(1)) < n_this:
-                        # lgkmcnt(0) only: reuse ATOMS*1152 B LDS while NT stores fly.
                         rocdl.s_waitcnt(lgkmcnt=0)
+                        gpu.barrier()
 
                 _publish(PHASE_ALL_GATHER, rank, color)
                 _wait_release(PHASE_ALL_GATHER, color)

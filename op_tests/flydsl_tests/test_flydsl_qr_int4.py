@@ -64,14 +64,17 @@ pytestmark = pytest.mark.skipif(
 # Distinct correctness branches, not a tokens x hidden product.
 # hidden=5120 is calibration; 4096 proves the map is not width-locked.
 # (8, 1024) is a half-tile tail (TILE_BYTES = 32 KiB).
-# TP2/4: one calib case each; skip when fewer GPUs than TP.
+# TP2/4: ST=1 calib plus one ST=8 case (num_tiles > GRID) each.
+# Pytest skips a world size when fewer GPUs are visible than TP.
 _PYTEST_CASES = (
     (8, 8, 1024, "partial-tile"),
     (8, 512, 5120, "st1-auto-calib"),
     (8, 9216, 4096, "st8-alt-hidden"),
     (8, 32768, 5120, "st8-calib-prefill"),
     (4, 512, 5120, "tp4-st1-auto-calib"),
+    (4, 9216, 4096, "tp4-st8-alt-hidden"),
     (2, 512, 5120, "tp2-st1-auto-calib"),
+    (2, 9216, 4096, "tp2-st8-alt-hidden"),
 )
 
 
