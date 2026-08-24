@@ -14,7 +14,9 @@ from dataclasses import dataclass
 import torch
 import torch.distributed as dist
 
-from aiter.ops.flydsl.moe_kernels import get_flydsl_kernel_params
+from aiter.fused_moe import moe_sorting
+from aiter.ops.flydsl.moe_kernels import flydsl_moe_stage1, get_flydsl_kernel_params
+from aiter.ops.quant import fused_dynamic_mxfp8_quant_moe_sort
 
 _SUPPORTED_TP = (4, 8)
 _DEFAULT_STAGE1_KERNEL = "flydsl_moe1_afp8_wfp4_bf16_t32x64x256_w4_gui_xcd4_kw4_fp8"
@@ -122,7 +124,12 @@ class TPMoEStage1:
         return self.tp_size * int(m_local)
 
     def max_sorted_for(self, m_local: int) -> int:
-        """Mirror of moe_sorting's max_num_tokens_padded."""
+        """Mirror of moe_sorting's max_num_tokens_padded.
+
+        NOTE: this is NOT sort_block_m-aligned. The stage1 payload — and hence
+        ``TPMoEStage1Output.max_sorted`` — is the next multiple of sort_block_m
+        above this value.
+        """
         return self.m_logical_for(m_local) * self.topk + self.experts * self.sort_block_m - self.topk
 
     def _all_gather_one(self, t):
@@ -148,3 +155,111 @@ class TPMoEStage1:
             self._all_gather_one(route_weights),
             self._all_gather_one(topk_ids),
         )
+
+    def _validate_call(self, x, route_weights, topk_ids, x_dtype):
+        if x.dtype != x_dtype or not x.is_contiguous():
+            raise ValueError(f"x must be contiguous {x_dtype}")
+        if route_weights.dtype != torch.float32 or not route_weights.is_contiguous():
+            raise ValueError("route_weights must be contiguous float32")
+        if topk_ids.dtype != torch.int32 or not topk_ids.is_contiguous():
+            raise ValueError("topk_ids must be contiguous int32")
+        m_local = int(x.shape[0])
+        if m_local <= 0:
+            raise ValueError("m_local must be positive")
+        if route_weights.shape != (m_local, self.topk):
+            raise ValueError(
+                f"route_weights must be [{m_local}, {self.topk}], got {tuple(route_weights.shape)}"
+            )
+        if topk_ids.shape != (m_local, self.topk):
+            raise ValueError(
+                f"topk_ids must be [{m_local}, {self.topk}], got {tuple(topk_ids.shape)}"
+            )
+        return m_local
+
+    def _sort(self, topk_ids_g, weights_g):
+        sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, _ = moe_sorting(
+            topk_ids_g,
+            weights_g,
+            self.experts,
+            self.model_dim,
+            torch.bfloat16,
+            block_size=self.sort_block_m,
+        )
+        return sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids
+
+    def _run_gemm1(self, a_fp8, a_scale_sorted, sorted_ids, sorted_expert_ids, num_valid_ids):
+        p = self.stage1_params
+        payload, scale = flydsl_moe_stage1(
+            a_fp8,
+            self.w1,
+            sorted_ids,
+            sorted_expert_ids,
+            num_valid_ids,
+            out=None,
+            topk=self.topk,
+            tile_m=int(p["tile_m"]),
+            tile_n=int(p["tile_n"]),
+            tile_k=int(p["tile_k"]),
+            a_dtype=str(p["a_dtype"]),
+            b_dtype=str(p["b_dtype"]),
+            out_dtype=str(p["out_dtype"]),
+            act="silu",
+            w1_scale=self.w1_scale,
+            a1_scale=a_scale_sorted,
+            sorted_weights=None,
+            waves_per_eu=int(p.get("waves_per_eu", 3)),
+            b_nt=int(p.get("b_nt", 0)),
+            gate_mode=str(p.get("gate_mode", "separated")),
+            xcd_swizzle=int(p.get("xcd_swizzle", 0)),
+            k_wave=int(p.get("k_wave", 1)),
+            swiglu_limit=(self.swiglu_limit or None),
+            v2_output_layout=True,
+        )
+        return payload, scale
+
+    def _pack(self, payload, scale, sorted_ids, sorted_weights, sorted_expert_ids,
+              num_valid_ids, m_global):
+        return TPMoEStage1Output(
+            inter_sorted_quant=payload.view(torch.float8_e4m3fn),
+            inter_sorted_shuffled_scale=scale,
+            sorted_token_ids=sorted_ids,
+            sorted_weights=sorted_weights,
+            sorted_expert_ids=sorted_expert_ids,
+            num_valid_ids=num_valid_ids,
+            m_logical=m_global,
+            max_sorted=int(payload.shape[0]),
+            num_experts=self.experts,
+            model_dim=self.model_dim,
+            inter_dim=self.inter_dim,
+            topk=self.topk,
+            sort_block_m=self.sort_block_m,
+        )
+
+    def forward(self, x_bf16, route_weights, topk_ids) -> "TPMoEStage1Output":
+        """BF16 entry. Gathers bf16, then quantizes after sorting."""
+        m_local = self._validate_call(x_bf16, route_weights, topk_ids, torch.bfloat16)
+        m_global = self.m_logical_for(m_local)
+
+        x_g, wts_g, ids_g = self._all_gather_inputs(x_bf16, route_weights, topk_ids)
+        sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids = self._sort(
+            ids_g, wts_g
+        )
+        a_fp8, a_scale_sorted = fused_dynamic_mxfp8_quant_moe_sort(
+            x_g,
+            sorted_ids=sorted_ids,
+            num_valid_ids=num_valid_ids,
+            token_num=m_global,
+            topk=self.topk,
+            block_size=self.sort_block_m,
+            sorted_weights=None,
+        )
+        payload, scale = self._run_gemm1(
+            a_fp8, a_scale_sorted, sorted_ids, sorted_expert_ids, num_valid_ids
+        )
+        return self._pack(
+            payload, scale, sorted_ids, sorted_weights, sorted_expert_ids,
+            num_valid_ids, m_global,
+        )
+
+    __call__ = forward
+    forward_bf16 = forward
