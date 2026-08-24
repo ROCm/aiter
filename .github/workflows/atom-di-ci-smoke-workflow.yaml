@@ -290,27 +290,103 @@ jobs:
 
           # Each rank's container log already contains the server, router,
           # benchmark, and eval output because pd_server_atom.sh tees its role
-          # logs to the container stdout. Stream the container logs so failures
-          # are visible live, but do not stream the nested role logs a second
-          # time; the complete files are still uploaded in the result artifact.
+          # logs to the container stdout. Stream bounded windows plus error
+          # context from those logs so failures are visible without exceeding
+          # the GitHub Actions live-log rendering limit. Complete files are
+          # still uploaded in the result artifact.
           text = submit_path.read_text(encoding="utf-8")
-          old_log_globs = "\n".join(
-              [
-                  '    "${run_dir}"/rank-*/container*.log \\',
-                  '    "${run_dir}"/logs/*.log \\',
-                  r'    "${run_dir}"/logs/*/*.log; do',
-              ]
-          )
-          new_log_globs = r'    "${run_dir}"/rank-*/container*.log; do'
-          if new_log_globs not in text:
-              if text.count(old_log_globs) != 1:
-                  raise SystemExit("Failed to find unique Spur shared-log glob list")
-              text = text.replace(old_log_globs, new_log_globs, 1)
+          function_start = "stream_spur_shared_logs_once() {\n"
+          function_end = '\n}\n\nif [[ "${SLURM_SUBMIT_RUNNER}"'
+          if text.count(function_start) != 1 or text.count(function_end) != 1:
+              raise SystemExit("Failed to find unique Spur shared-log function")
+          start = text.index(function_start)
+          end = text.index(function_end, start)
+          old_function = text[start : end + 3]
+          new_function = r'''stream_spur_log_window() {
+            local file="$1"
+            local prefix="$2"
+            local current_line="$3"
+            local total_lines new_lines head_lines tail_lines head_end tail_start
+
+            if [[ ! -f "${file}" ]]; then
+              printf '%s\n' "${current_line}"
+              return 0
+            fi
+
+            total_lines="$(wc -l < "${file}" | tr -d ' ')"
+            if (( total_lines < current_line )); then
+              current_line=0
+            fi
+            new_lines=$((total_lines - current_line))
+            if (( new_lines <= 0 )); then
+              printf '%s\n' "${total_lines}"
+              return 0
+            fi
+
+            tail_lines="${SPUR_LIVE_LOG_TAIL_LINES:-80}"
+            head_lines=0
+            if (( current_line == 0 )); then
+              head_lines="${SPUR_LIVE_LOG_HEAD_LINES:-40}"
+            fi
+            if (( new_lines <= head_lines + tail_lines )); then
+              stream_file_lines "${file}" "${prefix}" "${current_line}"
+              return 0
+            fi
+
+            head_end=$((current_line + head_lines))
+            tail_start=$((total_lines - tail_lines + 1))
+            printf '%s\n' \
+              "${prefix}[live-log] sampling ${new_lines} new lines: head=${head_lines}, tail=${tail_lines}, plus error context" >&2
+            awk \
+              -v start="${current_line}" \
+              -v head_end="${head_end}" \
+              -v tail_start="${tail_start}" \
+              -v prefix="${prefix}" '
+                NR <= start { next }
+                NR <= head_end || NR >= tail_start {
+                  print prefix $0
+                  next
+                }
+                {
+                  lower = tolower($0)
+                  if (lower ~ /(traceback|error|exception|fatal|fail|timeout|timed out|out of memory|oom|killed|segmentation fault|assertion)/) {
+                    important = 12
+                  }
+                  if (important > 0) {
+                    print prefix "[important] " $0
+                    important--
+                  }
+                }
+              ' "${file}" >&2
+            printf '%s\n' "${total_lines}"
+          }
+
+          stream_spur_shared_logs_once() {
+            local job_id="$1"
+            local run_dir="${LOG_ROOT}/slurm_job-${job_id}"
+            local log_file rel_path current_line
+
+            [[ -d "${run_dir}" ]] || return 0
+
+            shopt -s nullglob
+            for log_file in "${run_dir}"/rank-*/container*.log; do
+              rel_path="${log_file#"${run_dir}/"}"
+              current_line="${SPUR_SHARED_LOG_LINES[${log_file}]:-0}"
+              SPUR_SHARED_LOG_LINES["${log_file}"]="$(
+                stream_spur_log_window \
+                  "${log_file}" \
+                  "[spur:${rel_path}] " \
+                  "${current_line}"
+              )"
+            done
+            shopt -u nullglob
+          }'''
+          text = text.replace(old_function, new_function + "\n", 1)
           streamer = "  SLURM_EXTRA_LOG_STREAMER=stream_spur_shared_logs_once"
           if text.count(streamer) != 1:
               raise SystemExit("Failed to find enabled Spur shared-log streamer")
           submit_path.write_text(text, encoding="utf-8")
-          print(f"{submit_path}: enabled de-duplicated per-rank live-log streaming")
+          print(f"{submit_path}: enabled bounded per-rank live-log streaming")
 
           models_path = Path(".github/benchmark/models_atomesh.yaml")
           text = models_path.read_text(encoding="utf-8")
