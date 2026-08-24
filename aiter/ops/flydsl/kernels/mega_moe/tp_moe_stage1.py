@@ -72,7 +72,9 @@ class TPMoEStage1:
     ):
         self.group = group
         if (tp_size is None) != (tp_rank is None):
-            raise ValueError("tp_size and tp_rank must be supplied together, or both omitted")
+            raise ValueError(
+                "tp_size and tp_rank must be supplied together, or both omitted"
+            )
         if tp_size is None or tp_rank is None:
             if not dist.is_initialized():
                 raise ValueError(
@@ -81,7 +83,9 @@ class TPMoEStage1:
             tp_size = dist.get_world_size(group)
             tp_rank = dist.get_rank(group)
         if int(tp_size) not in _SUPPORTED_TP:
-            raise ValueError(f"tp_size={tp_size} unsupported; expected one of {_SUPPORTED_TP}")
+            raise ValueError(
+                f"tp_size={tp_size} unsupported; expected one of {_SUPPORTED_TP}"
+            )
 
         params = get_flydsl_kernel_params(stage1_kernel_name)
         if params is None:
@@ -106,7 +110,9 @@ class TPMoEStage1:
         self.tp_size = int(tp_size)
         self.tp_rank = int(tp_rank)
         if not (0 <= self.tp_rank < self.tp_size):
-            raise ValueError(f"tp_rank={self.tp_rank} out of range for tp_size={self.tp_size}")
+            raise ValueError(
+                f"tp_rank={self.tp_rank} out of range for tp_size={self.tp_size}"
+            )
         self.model_dim = int(model_dim)
         self.inter_dim = int(inter_dim)
         self.experts = int(experts)
@@ -130,7 +136,11 @@ class TPMoEStage1:
         ``TPMoEStage1Output.max_sorted`` — is the next multiple of sort_block_m
         above this value.
         """
-        return self.m_logical_for(m_local) * self.topk + self.experts * self.sort_block_m - self.topk
+        return (
+            self.m_logical_for(m_local) * self.topk
+            + self.experts * self.sort_block_m
+            - self.topk
+        )
 
     def _all_gather_one(self, t):
         t = t.contiguous()
@@ -187,7 +197,9 @@ class TPMoEStage1:
         )
         return sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids
 
-    def _run_gemm1(self, a_fp8, a_scale_sorted, sorted_ids, sorted_expert_ids, num_valid_ids):
+    def _run_gemm1(
+        self, a_fp8, a_scale_sorted, sorted_ids, sorted_expert_ids, num_valid_ids
+    ):
         p = self.stage1_params
         payload, scale = flydsl_moe_stage1(
             a_fp8,
@@ -217,8 +229,16 @@ class TPMoEStage1:
         )
         return payload, scale
 
-    def _pack(self, payload, scale, sorted_ids, sorted_weights, sorted_expert_ids,
-              num_valid_ids, m_global):
+    def _pack(
+        self,
+        payload,
+        scale,
+        sorted_ids,
+        sorted_weights,
+        sorted_expert_ids,
+        num_valid_ids,
+        m_global,
+    ):
         return TPMoEStage1Output(
             inter_sorted_quant=payload.view(torch.float8_e4m3fn),
             inter_sorted_shuffled_scale=scale,
@@ -257,8 +277,13 @@ class TPMoEStage1:
             a_fp8, a_scale_sorted, sorted_ids, sorted_expert_ids, num_valid_ids
         )
         return self._pack(
-            payload, scale, sorted_ids, sorted_weights, sorted_expert_ids,
-            num_valid_ids, m_global,
+            payload,
+            scale,
+            sorted_ids,
+            sorted_weights,
+            sorted_expert_ids,
+            num_valid_ids,
+            m_global,
         )
 
     __call__ = forward

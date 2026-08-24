@@ -45,7 +45,10 @@ def _fake_w1(experts, inter_dim, model_dim, device):
         (experts, 2 * inter_dim, model_dim // 2), dtype=torch.uint8, device=device
     )
     w1_scale = torch.full(
-        (experts, 2 * inter_dim, model_dim // 32), 0x7F, dtype=torch.uint8, device=device
+        (experts, 2 * inter_dim, model_dim // 32),
+        0x7F,
+        dtype=torch.uint8,
+        device=device,
     )
     return w1, w1_scale
 
@@ -189,11 +192,12 @@ def case_all_gather():
 
     # Rank-identifiable payloads so we can assert the concatenation order.
     x = torch.full(
-        (m_local, NETWORK["model_dim"]), float(rank), dtype=torch.bfloat16, device=device
+        (m_local, NETWORK["model_dim"]),
+        float(rank),
+        dtype=torch.bfloat16,
+        device=device,
     )
-    ids = torch.full(
-        (m_local, NETWORK["topk"]), rank, dtype=torch.int32, device=device
-    )
+    ids = torch.full((m_local, NETWORK["topk"]), rank, dtype=torch.int32, device=device)
     wts = torch.full(
         (m_local, NETWORK["topk"]), float(rank), dtype=torch.float32, device=device
     )
@@ -265,7 +269,10 @@ def case_forward_contract():
         n = -(-sorted_len // 32) * 32
         assert out.max_sorted == n, (out.max_sorted, n)
 
-        assert out.inter_sorted_quant.shape == (n, inter_dim), out.inter_sorted_quant.shape
+        assert out.inter_sorted_quant.shape == (
+            n,
+            inter_dim,
+        ), out.inter_sorted_quant.shape
         assert out.inter_sorted_quant.dtype == torch.float8_e4m3fn
         assert out.sorted_token_ids.shape == (sorted_len,)
         assert out.sorted_token_ids.dtype == torch.int32
@@ -278,9 +285,10 @@ def case_forward_contract():
 
         pad_rows = (n + 255) // 256 * 256
         pad_cols = ((inter_dim // 32) + 7) // 8 * 8
-        assert out.inter_sorted_shuffled_scale.shape == (pad_rows, pad_cols), (
-            out.inter_sorted_shuffled_scale.shape
-        )
+        assert out.inter_sorted_shuffled_scale.shape == (
+            pad_rows,
+            pad_cols,
+        ), out.inter_sorted_shuffled_scale.shape
 
         # moe_sorting only writes rows [0, num_valid_ids[0]). The tail of the allocated
         # tensor is uninitialized torch.empty memory that no kernel reads: stage1
@@ -298,10 +306,12 @@ def case_forward_contract():
         assert torch.all(slot[valid] < topk), "valid rows must carry a real top-k slot"
         assert torch.all(tok[~valid] == m_global), "padding sentinel must be M_logical"
         assert torch.all(slot[~valid] == topk), "padding sentinel slot must be topk"
-        assert torch.all(out.sorted_weights[:nvalid][~valid] == 0.0), "padding weight must be 0"
-        assert int(valid.sum().item()) == m_global * topk, (
-            f"expected {m_global * topk} routes, found {int(valid.sum().item())}"
-        )
+        assert torch.all(
+            out.sorted_weights[:nvalid][~valid] == 0.0
+        ), "padding weight must be 0"
+        assert (
+            int(valid.sum().item()) == m_global * topk
+        ), f"expected {m_global * topk} routes, found {int(valid.sum().item())}"
 
         used = out.sorted_expert_ids[: nvalid // 32]
         assert torch.all((used >= 0) & (used < experts)), "expert ids out of range"
@@ -344,9 +354,12 @@ def case_numerics():
 
     worst = 0.0
     for m_local in (1, 4, 16, 64, 128):
-        x = torch.randn((m_local, model_dim), dtype=torch.bfloat16, device=device) * (
-            model_dim**-0.25
-        )
+        # Seed the activation too: an unseeded numerical regression test reports a
+        # different rel_l2 every run, which makes a future regression hard to bisect.
+        gx = torch.Generator(device="cpu").manual_seed(9000 + rank * 17 + m_local)
+        x = torch.randn((m_local, model_dim), generator=gx).to(
+            device=device, dtype=torch.bfloat16
+        ) * (model_dim**-0.25)
         ids, wts = _random_routes(m_local, experts, topk, device, seed=31 + rank)
         out = op.forward(x, wts, ids)
         torch.cuda.synchronize()
