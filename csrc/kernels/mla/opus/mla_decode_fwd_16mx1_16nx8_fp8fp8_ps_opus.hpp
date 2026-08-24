@@ -32,6 +32,78 @@
 // t+1 (landed) and t+2 (in flight) are all resident at once. The prologue primes slots
 // 0..2 and runs a partial phase for tile_begin; the epilogue drains the last tail + PV.
 //
+// WHERE THE TIME GOES AT THE SHAPES THIS KERNEL IS DISPATCHED FOR: not here. At
+// b=256 c=8192 page_size=1 the kernel runs at 228 us and moves 1.35 GB of DRAM read traffic
+// doing it -- 5.9 TB/s against gfx950's ~6.3 TB/s coalesced roof, i.e. ~94% of the machine.
+// The hand-written asm decode kernel (AITER_MLA_USE_OPUS=0) lands at 227.95 us on the
+// identical shape, which is the cheapest confirmation available that this is a wall and not
+// an implementation. Per phase a wave issues 9 MFMA, 288 MAI cycles, into a phase thousands
+// of cycles long: the MAI pipe is a few per cent busy, not the 69% the 16mx8 kernel sees.
+//
+// The only lever is DRAM traffic, and rocprofv3 (see memprobe.sh) says where it goes. Every
+// EA read is 64 B -- TCC_EA0_RDREQ_32B and TCC_BUBBLE are both zero -- and TCC counters come
+// back from half the instances, so double them:
+//
+//               64B sectors per 576B row      L2 hit rate      DRAM read      time
+//   page_size 1           10.08                  1.25%          1.352 GB     228.8 us
+//   page_size 2            9.05                  7.11%          1.215 GB     216.5 us
+//   minimum                9.00
+//
+// So page_size 1 fetches exactly one wasted 64 B sector per token row, and that is the whole
+// 11%. 576 is not a multiple of 128, so a row's tail shares a 128 B line with the NEXT token
+// row -- which at page_size 1 sits somewhere unrelated in the cache and is read by an
+// unrelated request at an unrelated time. The working set is 1.2 GB against a 256 MB last
+// level, and TCC_HIT/TCC_REQ = 1.25% says the sharing is never recovered. At page_size 2 the
+// two rows are one page, the same workgroup reads them together, the hit rate goes to 7.1%
+// and the extra sector disappears -- the traffic is then exactly the 9 sectors the data is.
+//
+// Nothing in the kernel can reach this: it is set by the page table the caller hands in.
+// Use page_size >= 2. It is not a micro-optimisation, it removes a structural 11%, and 4
+// adds ~0.5% over 2 because there is nothing left to recover.
+//
+// Both sides are at the memory system's knee either way. TCC_EA0_RDREQ_LEVEL / RDREQ puts
+// average EA read latency at ~1840 cycles, well above unloaded, and
+// TCC_EA0_RDREQ_DRAM_CREDIT_STALL falls 1.83x for that 11% traffic cut -- a superlinear
+// response to backing off is what saturation looks like.
+//
+// Instruction interleaving in particular was tried and does nothing; do not redo it. The
+// obvious holes are real -- stage3's four PV MFMA have an empty shadow in the steady state
+// (the mask sits behind a scalar branch only the last tile takes), and stage1's prefetch is
+// ~27 issue-bound instructions with no MFMA in reach -- but every way of filling them is a
+// regression, measured best-of-3 at b=32/128/256 and at page_size 1 and 4:
+//   * KV prefetch into stage3's PV shadow: +1.4%. Into the QK shadow above softmax: +10%.
+//     Neither is a scheduling failure. `nxt_page` is a gmem load, so consuming it forces a
+//     vmcnt(0) that also drains the PREVIOUS phase's prefetch -- issue point to drain point
+//     is what sets that prefetch's latency window, and at the end of stage1 it is a full
+//     phase. Anywhere else it is shorter, and the KV stream cannot afford it.
+//   * Reusing the phase's own barriers for the two cross-wave softmax exchanges (push the
+//     row max from stage3, pull the row sum in stage2), which removes two of the seven
+//     barriers per phase and merges stage1 into one scheduling region: 4-6% slower on every
+//     shape. A barrier here is not the cost it looks like -- the wave waiting at one has a
+//     SIMD partner that is computing -- and the exchanges are part of what keeps the two
+//     wave groups' STAGGER skew from collapsing.
+//   * sched_group_barrier hints (MFMA/EXP/VALU, the fmha hd192 sched_mfma_exp_valu recipe)
+//     on the QK and PV regions, at several MFMA/VALU budget splits: 0 to -0.4%, i.e. noise
+//     to slightly worse, with VGPR and spill unchanged. They do move instructions -- the
+//     disassembly changes -- there is just nothing to gain by moving them.
+//
+// The one thing that did help, ~0.4%, is issuing gemm0 AFTER stage1's entry barrier rather
+// than before: MFMA issued ahead of a rendezvous the wave is about to wait at buys nothing.
+//
+// STAGGER IS LIVE HERE and it is worth 1.0-1.5%, unlike in the 16mx8 kernel where the same
+// skew measured 4-6% slower. Keeping it means every cross-wave hazard costs TWO barriers,
+// not one. The two wave groups run one barrier apart -- group B takes an extra barrier in
+// the prologue and group A an extra one in each stage1, so barrier instance k pairs A's
+// k-th barrier with B's k-th while B sits one program point behind -- and a single barrier
+// between a producer and a consumer therefore leaves them in the same instance window. This
+// is not theoretical: the prologue's slot-0 prefetch had exactly one, and it silently
+// corrupted ~46% of the output for any tile range of 2 or more (see the fix site below).
+// Anything new that writes LDS one group reads must be checked by pairing the two barrier
+// sequences, not by eyeballing that "there is a barrier in between".
+//
+// The paragraph below is the 16mx8 kernel's ATT analysis, kept because the register and
+// opcode conclusions carry over; the occupancy numbers do not.
+//
 // Where the time goes (ATT, b=256 c=8192): the MAI pipe is the binding resource at ~69%
 // occupancy and its idle time is diffuse -- ~30 gaps of ~25 cycles per phase, not one
 // hole -- so there is no single big win left here. Two corollaries worth not relearning.
@@ -131,7 +203,7 @@ __device__ inline void sched_pv()
 template <class T>
 __device__ inline auto make_layout_gq_nope(int warp_id, int lane_id)
 {
-    constexpr int threads_d = T::W_K / T::VEC_Q;      // lanes covering one W_K line
+    constexpr int threads_d = T::W_K / T::VEC_Q;              // lanes covering one W_K line
     constexpr int waves_d   = T::NUM_WARPS / T::smem_n_rpt_q; // waves spanning d
 
     constexpr auto gq_shape = opus::make_tuple(opus::number<T::smem_n_per_wave_q>{},
@@ -213,11 +285,10 @@ __device__ inline auto make_layout_rq_nope(int lane_id)
     return opus::make_layout(
         rq_shape,
         opus::unfold_x_stride(
-            rq_dim,
-            rq_shape,
-            opus::tuple{opus::number<wave_block>{}, opus::number<T::W_K>{}, 1_I}),
+            rq_dim, rq_shape, opus::tuple{opus::number<wave_block>{}, opus::number<T::W_K>{}, 1_I}),
         opus::unfold_p_coord(
-            rq_dim, opus::tuple{lane_m % T::smem_n_rpt_q, lane_m / T::smem_n_rpt_q, lane_id / T::W_M}));
+            rq_dim,
+            opus::tuple{lane_m % T::smem_n_rpt_q, lane_m / T::smem_n_rpt_q, lane_id / T::W_M}));
 }
 
 // Q rope, d in [D_NOPE_SIZE, D_HEAD_SIZE); the caller offsets the gmem base by +D_NOPE_SIZE.
@@ -233,9 +304,8 @@ __device__ inline auto make_layout_rq_nope(int lane_id)
 template <class T>
 __device__ inline auto make_layout_gq_rope(int lane_id)
 {
-    constexpr auto gq_shape = opus::make_tuple(opus::number<T::W_M>{},
-                                               opus::number<T::WARP_SIZE / T::W_M>{},
-                                               opus::number<T::VEC_Q>{});
+    constexpr auto gq_shape = opus::make_tuple(
+        opus::number<T::W_M>{}, opus::number<T::WARP_SIZE / T::W_M>{}, opus::number<T::VEC_Q>{});
 
     constexpr auto gq_dim = opus::make_tuple(opus::make_tuple(opus::p_dim{}),
                                              opus::make_tuple(opus::p_dim{}, opus::y_dim{}));
@@ -295,10 +365,10 @@ __device__ inline auto make_layout_kv_indices(int warp_id, int lane_id)
     static_assert(blk_grp % T::PAGE_SIZE == 0, "the token deal must split on PAGE_SIZE");
 
     constexpr auto kv_indices_shape =
-        opus::make_tuple(opus::number<T::smem_n_rpt_kv / blk_grp>{},              // block group
-                         opus::number<T::smem_n_per_wave_kv / T::SWZ_TOK_BIT>{},  // row % 2
-                         opus::number<T::SWZ_TOK_BIT>{},                          // row / 2
-                         opus::number<blk_grp / T::PAGE_SIZE>{},                  // block in group
+        opus::make_tuple(opus::number<T::smem_n_rpt_kv / blk_grp>{},             // block group
+                         opus::number<T::smem_n_per_wave_kv / T::SWZ_TOK_BIT>{}, // row % 2
+                         opus::number<T::SWZ_TOK_BIT>{},                         // row / 2
+                         opus::number<blk_grp / T::PAGE_SIZE>{},                 // block in group
                          1_I);
 
     constexpr auto kv_indices_dim = opus::make_tuple(opus::make_tuple(
@@ -306,13 +376,12 @@ __device__ inline auto make_layout_kv_indices(int warp_id, int lane_id)
 
     const int row = lane_id / threads_d;
 
-    return opus::make_layout(kv_indices_shape,
-                             opus::unfold_x_stride(kv_indices_dim, kv_indices_shape, opus::tuple{1_I}),
-                             opus::unfold_p_coord(kv_indices_dim,
-                                                  opus::tuple{warp_id / blk_grp,
-                                                              row % 2,
-                                                              row / 2,
-                                                              (warp_id % blk_grp) / T::PAGE_SIZE}));
+    return opus::make_layout(
+        kv_indices_shape,
+        opus::unfold_x_stride(kv_indices_dim, kv_indices_shape, opus::tuple{1_I}),
+        opus::unfold_p_coord(
+            kv_indices_dim,
+            opus::tuple{warp_id / blk_grp, row % 2, row / 2, (warp_id % blk_grp) / T::PAGE_SIZE}));
 }
 
 // KV global source, d in [0, D_HEAD_SIZE) of the combined buffer. The token dimension is
@@ -329,9 +398,8 @@ __device__ inline auto make_layout_gkv(int lane_id)
 {
     constexpr int threads_d = T::smem_d_per_wave_kv / T::VEC_KV;
 
-    constexpr auto gkv_shape = opus::make_tuple(opus::number<T::smem_d_rpt_kv>{},
-                                                opus::number<threads_d>{},
-                                                opus::number<T::VEC_KV>{});
+    constexpr auto gkv_shape = opus::make_tuple(
+        opus::number<T::smem_d_rpt_kv>{}, opus::number<threads_d>{}, opus::number<T::VEC_KV>{});
 
     constexpr auto gkv_dim = opus::make_tuple(opus::make_tuple(opus::y_dim{}),
                                               opus::make_tuple(opus::p_dim{}, opus::y_dim{}));
@@ -400,11 +468,11 @@ __device__ inline auto make_layout_rk(int warp_id, int lane_id)
                          opus::number<T::WARP_SIZE / T::W_N>{},                  // lane's d-group
                          opus::number<T::VEC_KV>{});
 
-    constexpr auto rk_dim = opus::make_tuple(
-        opus::make_tuple(opus::y_dim{}),
-        opus::make_tuple(opus::p_dim{}, opus::p_dim{}),
-        opus::make_tuple(opus::p_dim{}, opus::p_dim{}, opus::p_dim{}),
-        opus::make_tuple(opus::p_dim{}, opus::y_dim{}));
+    constexpr auto rk_dim =
+        opus::make_tuple(opus::make_tuple(opus::y_dim{}),
+                         opus::make_tuple(opus::p_dim{}, opus::p_dim{}),
+                         opus::make_tuple(opus::p_dim{}, opus::p_dim{}, opus::p_dim{}),
+                         opus::make_tuple(opus::p_dim{}, opus::y_dim{}));
 
     const int lane_n = lane_id % T::W_N;
 
@@ -480,7 +548,7 @@ __device__ inline auto make_layout_sp(int warp_id, int lane_id)
                   "the C packs of one lane group must tile a block row");
     static_assert(T::W_M == 16 && T::P_SWZ_ROW_MUL % 2 == 1, "row_off must stay a permutation");
 
-    constexpr auto sp_shape = opus::make_tuple(opus::number<T::NUM_WARPS>{},           // block
+    constexpr auto sp_shape = opus::make_tuple(opus::number<T::NUM_WARPS>{},          // block
                                                opus::number<T::W_M>{},                // query row
                                                opus::number<T::WARP_SIZE / T::W_M>{}, // C pack
                                                opus::number<T::VEC_WRITE_P>{});
@@ -493,8 +561,7 @@ __device__ inline auto make_layout_sp(int warp_id, int lane_id)
     // the pack XOR is the row's half swap: 2 packs are one 8 B half
     return opus::make_layout(
         sp_shape,
-        opus::unfold_x_stride(
-            sp_dim, sp_shape, opus::tuple{opus::number<T::smem_p_pitch>{}, 1_I}),
+        opus::unfold_x_stride(sp_dim, sp_shape, opus::tuple{opus::number<T::smem_p_pitch>{}, 1_I}),
         opus::unfold_p_coord(sp_dim,
                              opus::tuple{warp_id,
                                          p_row_perm<T>(row),
@@ -514,11 +581,11 @@ __device__ inline auto make_layout_rp(int lane_id)
     static_assert(rounds * blks * T::KV_TILE_SIZE == T::W_K, "P must fill one MFMA k step");
     static_assert(2 * T::VEC_READ_P == T::KV_TILE_SIZE, "a row is two halves");
 
-    constexpr auto rp_shape = opus::make_tuple(opus::number<rounds>{},           // kk
-                                               opus::number<blks>{},             // block in round
-                                               opus::number<T::W_M>{},           // query row slot
-                                               opus::number<2>{},                // 8 B half
-                                               opus::number<T::VEC_READ_P>{});   // tokens
+    constexpr auto rp_shape = opus::make_tuple(opus::number<rounds>{},         // kk
+                                               opus::number<blks>{},           // block in round
+                                               opus::number<T::W_M>{},         // query row slot
+                                               opus::number<2>{},              // 8 B half
+                                               opus::number<T::VEC_READ_P>{}); // tokens
 
     constexpr auto rp_dim = opus::make_tuple(opus::make_tuple(opus::y_dim{}, opus::p_dim{}),
                                              opus::make_tuple(opus::p_dim{}),
@@ -537,8 +604,7 @@ __device__ inline auto make_layout_rp(int lane_id)
                          opus::number<2 * T::VEC_READ_P>{},
                          half_stride,
                          1_I),
-        opus::unfold_p_coord(rp_dim,
-                             opus::tuple{lane_id / T::W_M, p_row_perm<T>(row)}));
+        opus::unfold_p_coord(rp_dim, opus::tuple{lane_id / T::W_M, p_row_perm<T>(row)}));
     if(half_swz)
         u += T::VEC_READ_P;
     return u;
@@ -554,8 +620,7 @@ __device__ inline auto make_layout_rv(int warp_id, int lane_id)
     constexpr int blk_grp    = T::smem_n_rpt_kv / 2; // 4, blocks sharing a token run
     constexpr int wave_block = T::smem_linear_wave_kv + T::smem_padding_32B;
 
-    static_assert(T::SLICE_D == T::smem_d_per_wave_kv &&
-                      T::NUM_D_SLICES == T::SLICE_D / T::VEC_KV,
+    static_assert(T::SLICE_D == T::smem_d_per_wave_kv && T::NUM_D_SLICES == T::SLICE_D / T::VEC_KV,
                   "a wave's GEMM1 d must be one KV d chunk, one d-tile per d-group");
     static_assert(T::NUM_D_SLICES == 4, "d-tile index splits into two y-dims of 2");
     static_assert(T::W_N == T::smem_n_per_wave_kv && grp_toks == 2 * blk_grp &&
@@ -567,16 +632,16 @@ __device__ inline auto make_layout_rv(int warp_id, int lane_id)
     // before kk so tr_load fills v_v e_n-major. The DMA swizzle EN ^ (grp % 2) is folded
     // into a lane-dependent en_lo stride (+/- VEC_KV) and a +VEC_KV base on odd groups.
     constexpr auto rv_shape = opus::make_tuple(opus::number<T::smem_d_rpt_kv>{}, // d chunk
-                                               opus::number<2>{},                 // en_hi
-                                               opus::number<2>{},                 // en_lo
+                                               opus::number<2>{},                // en_hi
+                                               opus::number<2>{},                // en_lo
                                                opus::number<T::smem_n_rpt_kv / blk_grp>{}, // kk
-                                               opus::number<blk_grp>{},           // block in run
-                                               opus::number<2>{},                 // row SWZ_TOK_BIT
-                                               opus::number<2>{},                 // row j / grp_toks
-                                               opus::number<2>{},                 // row t / blk_grp
-                                               opus::number<2>{},                 // row deal rot
-                                               opus::number<halves>{},            // d-tile 8 B half
-                                               opus::number<T::VEC_TR_V>{});      // transpose read
+                                               opus::number<blk_grp>{},      // block in run
+                                               opus::number<2>{},            // row SWZ_TOK_BIT
+                                               opus::number<2>{},            // row j / grp_toks
+                                               opus::number<2>{},            // row t / blk_grp
+                                               opus::number<2>{},            // row deal rot
+                                               opus::number<halves>{},       // d-tile 8 B half
+                                               opus::number<T::VEC_TR_V>{}); // transpose read
 
     constexpr auto rv_dim = opus::make_tuple(
         opus::make_tuple(opus::p_dim{}),
@@ -606,13 +671,10 @@ __device__ inline auto make_layout_rv(int warp_id, int lane_id)
                          opus::number<T::smem_d_per_wave_kv>{},
                          opus::number<T::VEC_TR_V>{},
                          1_I),
-        opus::unfold_p_coord(rv_dim,
-                             opus::tuple{warp_id,
-                                         tok % blk_grp,
-                                         grp % 2,
-                                         tok / blk_grp,
-                                         grp / 2,
-                                         lane_id % halves}));
+        opus::unfold_p_coord(
+            rv_dim,
+            opus::tuple{
+                warp_id, tok % blk_grp, grp % 2, tok / blk_grp, grp / 2, lane_id % halves}));
     if(grp & 1)
         u += T::VEC_KV;
     return u;
@@ -634,12 +696,12 @@ __device__ inline auto make_layout_o(int warp_id, int lane_id, int stride_o_h)
                   "the waves' d slices must tile the output d exactly once");
 
     constexpr auto o_block_shape =
-        opus::make_tuple(opus::number<T::GEMM1_E_M>{},                             // e_m
-                         opus::number<T::W_M>{},                                   // query row
-                         opus::number<T::T_N>{},                                   // wave's d slice
-                         opus::number<T::GEMM1_E_N>{},                             // d-tile in it
+        opus::make_tuple(opus::number<T::GEMM1_E_M>{}, // e_m
+                         opus::number<T::W_M>{},       // query row
+                         opus::number<T::T_N>{},       // wave's d slice
+                         opus::number<T::GEMM1_E_N>{}, // d-tile in it
                          opus::number<T::W_M * T::W_N / T::WARP_SIZE / T::VEC_O>{},
-                         opus::number<T::WARP_SIZE / T::W_M>{},                    // lane's d group
+                         opus::number<T::WARP_SIZE / T::W_M>{}, // lane's d group
                          opus::number<T::VEC_O>{});
 
     constexpr auto o_block_dim = opus::make_tuple(
@@ -915,11 +977,10 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
     // work item and read by every wave for the whole tile range. smem_q_bytes is a multiple
     // of 128, so the KV blocks behind it keep the 32 B alignment make_layout_rv's swizzle
     // needs.
-    auto s_q  = make_smem(reinterpret_cast<D_Q*>(smem_buffer));
-    smem<D_K> s_kv[2] = {
-        make_smem(reinterpret_cast<D_K*>(smem_buffer) + T::smem_q_padding_bytes),
-        make_smem(reinterpret_cast<D_K*>(smem_buffer) + T::smem_q_padding_bytes + T::smem_kv_bytes)
-    };
+    auto s_q          = make_smem(reinterpret_cast<D_Q*>(smem_buffer));
+    smem<D_K> s_kv[2] = {make_smem(reinterpret_cast<D_K*>(smem_buffer) + T::smem_q_padding_bytes),
+                         make_smem(reinterpret_cast<D_K*>(smem_buffer) + T::smem_q_padding_bytes +
+                                   T::smem_kv_bytes)};
     // P costs no LDS of its own: it aliases Q, which is dead once the prologue has read it into
     // v_q, with barriers between that read and the first P write covering the cross-wave WAR.
     // No slots either -- a tile's scores are written and read back inside one phase.
@@ -927,8 +988,8 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
     // Cross-wave softmax exchange, behind P in that same dead Q region: one D_ACC per
     // (query row, wave) for the max and, right after it, one for the sum.
     auto s_m = make_smem(reinterpret_cast<D_ACC*>(smem_buffer + T::smem_ml_offset_bytes));
-    auto s_l =
-        make_smem(reinterpret_cast<D_ACC*>(smem_buffer + T::smem_ml_offset_bytes) + T::smem_ml_elems);
+    auto s_l = make_smem(reinterpret_cast<D_ACC*>(smem_buffer + T::smem_ml_offset_bytes) +
+                         T::smem_ml_elems);
 
     auto u_gq_nope = make_layout_gq_nope<T>(warp_id, lane_id);
     auto u_sq_nope = make_layout_sq_nope<T>(warp_id);
@@ -1015,21 +1076,18 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
             return (static_cast<int64_t>(page_idx) * T::PAGE_SIZE + tok_in_page) *
                    kargs.stride_kv_page;
         else
-            return static_cast<int>(
-                (static_cast<unsigned>(page_idx) * T::PAGE_SIZE + tok_in_page) *
-                static_cast<unsigned>(kargs.stride_kv_page));
+            return static_cast<int>((static_cast<unsigned>(page_idx) * T::PAGE_SIZE + tok_in_page) *
+                                    static_cast<unsigned>(kargs.stride_kv_page));
     };
 
     auto async_load_kv = [&](auto* s_kv_ptr, int kv_page) {
         if constexpr(T::LARGE_KV)
         {
-            global_load<T::VEC_KV>(
-                g_kv + kv_page_offset(kv_page), s_kv_ptr, u_gkv, u_skv);
+            global_load<T::VEC_KV>(g_kv + kv_page_offset(kv_page), s_kv_ptr, u_gkv, u_skv);
         }
         else
         {
-            async_load<T::VEC_KV>(
-                g_kv, s_kv_ptr, u_gkv + kv_page_offset(kv_page), u_skv);
+            async_load<T::VEC_KV>(g_kv, s_kv_ptr, u_gkv + kv_page_offset(kv_page), u_skv);
         }
     };
 
@@ -1107,7 +1165,8 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
 
     async_load<T::VEC_Q>(g_q_nope, s_q.ptr, u_gq_nope, u_sq_nope);
     async_load_kv(s_kv[0].ptr, load_kv_page(tile_begin));
-    s_waitcnt_vmcnt(number<T::kv_buffer_load_insts>{}); // slot 0 is read below, so drain it outright
+    s_waitcnt_vmcnt(
+        number<T::kv_buffer_load_insts>{}); // slot 0 is read below, so drain it outright
     stage_end_barrier();
 
     // load q from smem
@@ -1127,15 +1186,17 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
     // Page index the first phase prefetches (tile_begin + 2, the one after the two the
     // prologue has already staged). Indices past the end read as 0 through the kv_indices
     // descriptor and land in a slot nobody reads.
-    int cur_page      = load_kv_page(min(tile_begin + 2, tile_end - 1));
-    int nxt_page      = cur_page;
+    int cur_page = load_kv_page(min(tile_begin + 2, tile_end - 1));
+    int nxt_page = cur_page;
 
     set_slice(v_k, load<T::VEC_KV>(s_kv[0], u_rk), 0_I, number<qk_rope_end>{});
     v_v[0] = tr_load<T::VEC_TR_V>(s_kv[0], u_rv);
     s_waitcnt_lgkmcnt(0_I);
-
-    async_load_kv(s_kv[0].ptr, cur_page);
-    s_waitcnt_vmcnt(number<T::kv_buffer_load_insts>{});
+    // Land slot 1's prefetch here so the barrier below publishes it. Left implicit it would
+    // be drained by the vmcnt(0) that consuming cur_page forces -- and the WAR fix moves
+    // that use two barriers later, past the point the other wave group reads slot 1. Costs
+    // nothing where it stands: the reads above are already in flight.
+    s_waitcnt_vmcnt(0_I);
     stage_end_barrier();
 
     // Scores, mask, row max: the head of tile_begin's softmax, which no phase runs since a
@@ -1148,11 +1209,15 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
     asm volatile("" : "+v"(v_s[0])::);
     stage_end();
 
+    async_load_kv(s_kv[0].ptr, cur_page);
+    s_waitcnt_vmcnt(number<T::kv_buffer_load_insts>{});
+    stage_end_barrier();
+
     auto run_phase = [&](auto& vs_cur, auto& vs_prev, int cur_slot, int prev_slot, int t) {
         // stage0 [mem]: load k.
         set_slice(v_k, load<T::VEC_KV>(s_kv[cur_slot], u_rk), 0_I, number<qk_rope_end>{});
         v_v[cur_slot] = tr_load<T::VEC_TR_V>(s_kv[cur_slot], u_rv);
-        nxt_page = load_kv_page(t + 2);
+        nxt_page      = load_kv_page(t + 2);
         s_waitcnt_lgkmcnt(number<T::v_ds_read_insts>{});
         stage_end();
 
@@ -1175,10 +1240,10 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
         stage_end_barrier();
 
         // stage2 [mem]: V(t-1); mask S(t) before stage4's softmax head folds it in.
-        if constexpr(STAGGER)
-        {
-            stage_end();
-        }
+        // if constexpr(STAGGER)
+        // {
+        //     stage_end();
+        // }
         load_p(v_p);
         s_waitcnt_lgkmcnt(0_I);
         stage_end();
@@ -1239,7 +1304,7 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
         softmax_tile(vs_last);
         store<T::VEC_WRITE_P>(s_p, cast<D_K>(vs_last), u_sp);
         s_waitcnt_lgkmcnt(0_I);
-        stage_end();
+        stage_end_barrier();
         load_p(v_p);
         s_waitcnt_lgkmcnt(0_I);
 
@@ -1255,7 +1320,6 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
         epilogue_tail(v_s[1], 1);
     else
         epilogue_tail(v_s[0], 0);
-
 }
 
 // --- One work item: load Q, run the tile range, normalize and store O (+ LSE) ---
@@ -1309,9 +1373,8 @@ mla_decode_fwd_one_req(mla_kargs kargs, int w, char* smem_buffer, float temperat
     const int kv_pages = kv_ind_ptr_e - kv_ind_ptr_s;
     // kv_offset != 0 means the metadata handed this item an interior run, so every one of
     // its pages is full; only the tail item can see the partial one.
-    const int valid_kv_len = (T::PAGE_SIZE == 1 || kv_offset != 0)
-                                 ? kv_pages * T::PAGE_SIZE
-                                 : pages_to_tokens(kv_pages);
+    const int valid_kv_len =
+        (T::PAGE_SIZE == 1 || kv_offset != 0) ? kv_pages * T::PAGE_SIZE : pages_to_tokens(kv_pages);
     const int num_kv_tiles = ceil_div(valid_kv_len, T::KV_TILE_SIZE * T::NUM_WARPS);
     if(num_kv_tiles == 0)
         return;
@@ -1332,8 +1395,7 @@ mla_decode_fwd_one_req(mla_kargs kargs, int w, char* smem_buffer, float temperat
     // Per-tensor descale folded into the two places it can be a single scalar multiply:
     // QK's descale_q*descale_k rides the softmax temperature, and V's descale_k is applied
     // once on the finished O below (the PV MFMA itself consumes raw fp8).
-    const float descale_q =
-        readfirstlane_f32(reinterpret_cast<const float*>(kargs.q_scale_ptr)[0]);
+    const float descale_q = readfirstlane_f32(reinterpret_cast<const float*>(kargs.q_scale_ptr)[0]);
     const float descale_k =
         readfirstlane_f32(reinterpret_cast<const float*>(kargs.kv_scale_ptr)[0]);
     const float qk_scale = readfirstlane_f32(temperature_scale * descale_q * descale_k);
