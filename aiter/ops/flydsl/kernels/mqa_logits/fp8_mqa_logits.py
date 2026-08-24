@@ -387,31 +387,45 @@ KERNEL_VARIANTS = tuple(_VARIANT_BUILDERS.keys())
 DEFAULT_VARIANT = "mfma_r2_w4"
 
 
-# Smallest seq_len at which RPB=4 pays off. Below it the host padding to a
-# multiple of RPB dominates: at seq_len=1 an RPB=4 kernel computes 4 rows to
-# obtain 1. Measured crossover on gfx942 at seq_len_kv=131072 (us, best variant
-# vs the RPB=2 pick this replaces):
-#   seq_len    1 -> r2 25.2 wins, r4 79.1   (3.1x worse)
-#   seq_len    4 -> r2 24.3 wins, r4 31.5   (1.3x worse)
-#   seq_len    8 -> r4 32.9 wins by 1.03x
-#   seq_len   16 -> r4 47.5 wins by 1.19x
-#   seq_len 1024 -> r4 1520.3 wins by 1.69x
-_RPB4_MIN_SEQ_LEN = 8
+# RPB crossovers track the logits element count seq_len * seq_len_kv, not
+# seq_len alone: a larger RPB amortizes each KV tile load over more query rows,
+# and that pays off once there is enough total work. Measured on gfx942
+# (MI325X) over seq_len 1..8192 x seq_len_kv 1024..262144, the boundaries land
+# on the same element count at every context:
+#
+#   elements < 2**19   RPB=1 fastest at all 27 shapes measured
+#   elements = 2**19   RPB=2 fastest at all 6
+#   elements >= 2**21  RPB=4 fastest at all 38
+#
+# (2**20 is the transition band, split 3/3 between RPB=2 and RPB=4.)
+_RPB2_MIN_ELEMS = 2**19
+_RPB4_MIN_ELEMS = 2**21
 
 
 def _auto_variant(seq_len, seq_len_kv):
     """Pick (RPB, WPB) from the problem shape.
 
-    RPB=4 amortizes each KV tile load over twice as many query rows as RPB=2 and
-    wins from ``_RPB4_MIN_SEQ_LEN`` upward, by 1.65x at the long-context prefill
-    shapes vLLM issues (seq_len 1024, seq_len_kv 131072). Below that threshold
-    the padding of seq_len up to a multiple of RPB costs more than the extra
-    reuse buys, so RPB=2 stays.
+    RPB was previously pinned to 2, which left the whole r4 family unreachable
+    and cost 1.65x at the long-context prefill shapes vLLM issues (seq_len 1024,
+    seq_len_kv 131072, i.e. 2**27 elements).
 
-    WPB=2 packs more column tiles per wave when M and N are both large, else
-    WPB=4 for more wavefronts on small-M / short-window shapes.
+    RPB must also divide seq_len. When it does not, the launcher pads seq_len up
+    with four ``torch.cat`` calls, a flat ~44 us of host-side overhead that does
+    not scale with the work -- so it swamps small shapes and is noise on large
+    ones. Stepping down to a divisor is therefore right below
+    ``_RPB4_MIN_ELEMS`` and wrong above it: at seq_len 1025, seq_len_kv 131072,
+    RPB=1 divides but runs 3880 us against 2601 us for a padded RPB=2.
+
+    WPB is left as it was. It is worth a few percent at most here, and unlike
+    RPB its optimum moves with the head count, so it needs its own sweep.
     """
-    rpb = 4 if seq_len >= _RPB4_MIN_SEQ_LEN else 2
+    elems = seq_len * seq_len_kv
+    if elems < _RPB2_MIN_ELEMS:
+        rpb = 1
+    elif elems < _RPB4_MIN_ELEMS:
+        rpb = 2 if seq_len % 2 == 0 else 1
+    else:
+        rpb = 4
     wpb = 2 if (seq_len >= 2048 and seq_len_kv >= 8192) else 4
     return f"mfma_r{rpb}_w{wpb}"
 
