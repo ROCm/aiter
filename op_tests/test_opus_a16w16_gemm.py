@@ -327,6 +327,8 @@ if __name__ == "__main__":
             f"gfx950/gfx942/gfx1250 (detected {_detected_gfx!r})"
         )
         sys.exit(0)
+    if len(sys.argv) == 1:
+        sys.exit(pytest.main([__file__]))
     parser = argparse.ArgumentParser(
         description="End-to-end exact-kid test for aiter.ops.opus.opus_bmm"
     )
