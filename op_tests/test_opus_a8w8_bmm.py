@@ -324,9 +324,7 @@ def check_splitk_workspace():
     # preload, while D_OUT=void deliberately uses the same non-preload device
     # specialization as kid8139.  M=128 makes both workspaces tightly sized.
     for kid, m in ((8000, 32), (8326, 128)):
-        O_mx, xs_mx, xs_fp32 = _quant_per_token_e8m0(
-            _block_varied((g, m, k), k)
-        )
+        O_mx, xs_mx, xs_fp32 = _quant_per_token_e8m0(_block_varied((g, m, k), k))
         W_mx, ws_mx, ws_fp32 = _quant_block_e8m0(_block_varied((g, n, k), k))
         O_in = O_mx.transpose(0, 1)
         xs_in = xs_mx.transpose(0, 1)
