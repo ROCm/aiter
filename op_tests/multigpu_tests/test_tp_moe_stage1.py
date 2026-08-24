@@ -430,12 +430,119 @@ def case_numerics():
     dist.destroy_process_group()
 
 
+def case_prequant_equivalence():
+    rank, world, device = _setup_dist()
+    inter_dim = 384
+    model_dim = NETWORK["model_dim"]
+    experts, topk = NETWORK["experts"], NETWORK["topk"]
+    w1_ref, w1_scale_ref, w1_shuf, w1_scale_shuf = build_mxfp4_w1(
+        experts, inter_dim, model_dim, device, seed=2026
+    )
+    op = TPMoEStage1(
+        model_dim=model_dim,
+        inter_dim=inter_dim,
+        experts=experts,
+        topk=topk,
+        w1=w1_shuf,
+        w1_scale=w1_scale_shuf,
+        device=device,
+        swiglu_limit=NETWORK["swiglu_limit"],
+        stage1_kernel_name=STAGE1_KERNEL,
+    )
+
+    worst = 0.0
+    for m_local in (1, 8, 64, 128):
+        gx = torch.Generator(device="cpu").manual_seed(4000 + rank * 13 + m_local)
+        x = torch.randn((m_local, model_dim), generator=gx).to(
+            device=device, dtype=torch.bfloat16
+        ) * (model_dim**-0.25)
+        ids, wts = _random_routes(m_local, experts, topk, device, seed=77 + rank)
+
+        a = op.forward(x, wts, ids)
+        x_q, x_scale = op.quantize(x)
+        assert x_q.dtype == torch.float8_e4m3fn, x_q.dtype
+        assert x_q.shape == (m_local, model_dim), x_q.shape
+        b = op.forward_prequant(x_q, x_scale, wts, ids)
+        torch.cuda.synchronize()
+
+        # Routing metadata does not depend on quantization at all -> must match
+        # exactly. Compare only the region moe_sorting actually writes: rows
+        # [0, num_valid_ids[0]) of the id/weight vectors and the corresponding
+        # nvalid//sort_block_m expert blocks. The tail is uninitialized
+        # torch.empty memory (see case_forward_contract), so comparing the full
+        # tensors asserts on garbage -- two identical forward() calls already
+        # differ there. num_valid_ids itself is fully written, so it compares whole.
+        assert torch.equal(a.num_valid_ids, b.num_valid_ids)
+        nvalid = int(a.num_valid_ids[0].item())
+        assert torch.equal(a.sorted_token_ids[:nvalid], b.sorted_token_ids[:nvalid])
+        assert torch.equal(
+            a.sorted_expert_ids[: nvalid // a.sort_block_m],
+            b.sorted_expert_ids[: nvalid // b.sort_block_m],
+        )
+        assert torch.equal(a.sorted_weights[:nvalid], b.sorted_weights[:nvalid])
+        assert a.m_logical == b.m_logical and a.max_sorted == b.max_sorted
+
+        cols = inter_dim // 32
+        # Compare only genuinely-routed rows. Stage1 never writes the output SCALE
+        # for padding rows: poisoning the caching allocator with 0xFF makes BOTH
+        # forward and forward_prequant read back 7680/7680 non-finite padding rows
+        # and 0 non-finite valid rows, so that tail is uninitialized memory in both
+        # paths rather than a property of either. case_numerics already scopes the
+        # same way by iterating `valid` only. Padding rows carry sorted_weights == 0
+        # and are masked off downstream by the token-id sentinel.
+        tok = (a.sorted_token_ids[:nvalid] & 0x00FFFFFF).long()
+        keep = tok < a.m_logical
+        assert int(keep.sum()) == a.m_logical * topk, (
+            int(keep.sum()),
+            a.m_logical * topk,
+        )
+        va = (
+            a.inter_sorted_quant[:nvalid].float()
+            * read_shuffled_scale(
+                a.inter_sorted_shuffled_scale, nvalid, cols
+            ).repeat_interleave(32, dim=-1)
+        )[keep]
+        vb = (
+            b.inter_sorted_quant[:nvalid].float()
+            * read_shuffled_scale(
+                b.inter_sorted_shuffled_scale, nvalid, cols
+            ).repeat_interleave(32, dim=-1)
+        )[keep]
+        # A genuinely-routed row must never be inf/NaN in either path.
+        assert torch.isfinite(va).all(), "forward produced non-finite routed rows"
+        assert torch.isfinite(
+            vb
+        ).all(), "forward_prequant produced non-finite routed rows"
+        rel = float(
+            ((va - vb) ** 2).sum() ** 0.5 / max(float((va**2).sum() ** 0.5), 1e-30)
+        )
+        # max(0.0, nan) returns 0.0 in Python, so a NaN would otherwise pass silently.
+        if rel != rel or rel == float("inf"):
+            raise AssertionError(f"m_local={m_local}: non-finite rel_l2={rel}")
+        worst = max(worst, rel)
+        if rank == 0:
+            print(f"m_local={m_local:4d} forward-vs-prequant rel_l2={rel:.6f}")
+
+    t = torch.tensor([worst], device=device)
+    dist.all_reduce(t, op=dist.ReduceOp.MAX)
+    worst = float(t.item())
+    if worst >= 0.02:
+        raise AssertionError(
+            f"forward vs forward_prequant rel_l2={worst:.6f} exceeds 0.02"
+        )
+    if rank == 0:
+        print(f"case_prequant_equivalence OK (worst rel_l2={worst:.6f})")
+    dist.barrier()
+    dist.destroy_process_group()
+
+
 CASES = {
     "construct": case_construct_validates,
     "capacity": case_capacity,
     "all_gather": case_all_gather,
     "forward_contract": case_forward_contract,
     "numerics": case_numerics,
+    "prequant": case_prequant_equivalence,
 }
 
 

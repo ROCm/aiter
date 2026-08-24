@@ -15,8 +15,10 @@ import torch
 import torch.distributed as dist
 
 from aiter.fused_moe import moe_sorting
+from aiter.ops.flydsl.kernels.mega_moe.quant import per_1x32_mx_quant
 from aiter.ops.flydsl.moe_kernels import flydsl_moe_stage1, get_flydsl_kernel_params
 from aiter.ops.quant import fused_dynamic_mxfp8_quant_moe_sort
+from aiter.utility.fp4_utils import moe_mxfp4_sort
 
 _SUPPORTED_TP = (4, 8)
 _DEFAULT_STAGE1_KERNEL = "flydsl_moe1_afp8_wfp4_bf16_t32x64x256_w4_gui_xcd4_kw4_fp8"
@@ -275,6 +277,56 @@ class TPMoEStage1:
         )
         payload, scale = self._run_gemm1(
             a_fp8, a_scale_sorted, sorted_ids, sorted_expert_ids, num_valid_ids
+        )
+        return self._pack(
+            payload,
+            scale,
+            sorted_ids,
+            sorted_weights,
+            sorted_expert_ids,
+            num_valid_ids,
+            m_global,
+        )
+
+    def quantize(self, x_bf16):
+        """Local per-1x32 BF16 -> FP8 E4M3 + E8M0. Same routine MegaMoEV2 uses."""
+        return per_1x32_mx_quant(x_bf16, quant_mode="fp8")
+
+    def forward_prequant(
+        self, x_fp8, x_scale, route_weights, topk_ids
+    ) -> TPMoEStage1Output:
+        """Prequantized entry.
+
+        Gathers FP8 payload + E8M0 scale instead of BF16, i.e. quantize-then-gather.
+        Per row this moves ``model_dim + model_dim/32`` bytes instead of
+        ``model_dim * 2``.
+        """
+        m_local = self._validate_call(
+            x_fp8, route_weights, topk_ids, torch.float8_e4m3fn
+        )
+        if not x_scale.is_contiguous():
+            raise ValueError("x_scale must be contiguous")
+        if x_scale.shape != (m_local, self.model_dim // 32):
+            raise ValueError(
+                f"x_scale must be [{m_local}, {self.model_dim // 32}], "
+                f"got {tuple(x_scale.shape)}"
+            )
+        m_global = self.m_logical_for(m_local)
+
+        x_g, wts_g, ids_g = self._all_gather_inputs(x_fp8, route_weights, topk_ids)
+        scale_g = self._all_gather_one(x_scale)
+        sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids = self._sort(
+            ids_g, wts_g
+        )
+        a_scale_sorted = moe_mxfp4_sort(
+            scale_g.view(m_global, 1, -1),
+            sorted_ids,
+            num_valid_ids,
+            m_global,
+            self.sort_block_m,
+        )
+        payload, scale = self._run_gemm1(
+            x_g, a_scale_sorted, sorted_ids, sorted_expert_ids, num_valid_ids
         )
         return self._pack(
             payload,
