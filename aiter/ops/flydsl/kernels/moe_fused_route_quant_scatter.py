@@ -296,12 +296,10 @@ def _emit_quant_block_loop(c: SimpleNamespace) -> None:
     )
     feat_elem_base = arith.constant(0, type=i32)
 
-    # Pre-quantized source: the sender already produced the MX payload and its
-    # e8m0 row, so this pass loads what the quant pass would have computed. The
-    # store pass below is then shared verbatim -- which is the point. The
-    # preshuffled scale destination has already moved once (to WMMA-contiguous),
-    # and a second copy of that arithmetic would fail by writing to the wrong
-    # offset, silently, rather than as a merge conflict.
+    # Pre-quantized source: load what the quant pass would have computed, so the
+    # store pass below stays shared. That destination arithmetic has already
+    # moved once (to WMMA-contiguous); a second copy of it would fail silently,
+    # by writing to the wrong offset.
     prequantized = getattr(c, "prequantized", False)
     src_scale_rsrc = None
     if const_expr(prequantized):

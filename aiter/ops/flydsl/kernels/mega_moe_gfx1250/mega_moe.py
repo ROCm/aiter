@@ -37,28 +37,32 @@ _MORI_REGION_NAMES = {
     "dispOut": "disp_out",
     "outTok": "comb_inp",
     "xdb": "cross_device_barrier",
-    # Only laid out on a quantizing wire. plan_api binds a region the arena does
-    # not carry to offset 0, and the kernel's own `if constexpr` is what keeps a 0
-    # from being read, so the bf16 arena needs no placeholder.
+    # Only laid out on a quantizing wire; plan_api binds a missing region to 0 and
+    # the kernel's `if constexpr` keeps that 0 from being read.
     "outScales": "out_scales",
 }
 
-# What dispatch puts on the wire, and what each mode costs per token at
-# hidden 7168: bf16 14336 B, fp8 7168 + 256, fp4 3584 + 256.
-_DISPATCH_WIRES = ("bf16", "fp8", "fp4")
-# Payload bytes per feature. fp4 packs two features per byte, which is why the
-# wire's element COUNT and the model's feature count part ways below.
-_WIRE_PAYLOAD_BYTES = {"bf16": 2, "fp8": 1, "fp4": 0.5}
-# What mori's Cfg is told the payload is. fp8 and fp4 both land on its byte8
-# transport, which only copies -- fp4x2 is declared for what it is rather than
-# borrowed from fp8, so a reader of the plan sees the wire, not a stand-in.
-_MORI_WIRE_DTYPE = {
-    "bf16": torch.bfloat16,
-    "fp8": dtypes.fp8,
-    "fp4": dtypes.fp4x2,
+
+@dataclass(frozen=True)
+class _Wire:
+    """One dispatch wire. Per token at hidden 7168: bf16 14336 B, fp8 7168 + 256,
+    fp4 3584 + 256.
+    """
+
+    payload_bytes: float  # PER FEATURE; fp4 packs two features into a byte
+    mori_dtype: torch.dtype
+    quant_dtype: torch.dtype | None  # None: nothing for the sender to quantize to
+    # fp4 is viewed as raw bytes: the gather addresses a row in BYTES, and a
+    # packed dtype would make shape[-1] read as a feature count.
+    recv_dtype: torch.dtype
+
+
+_WIRES = {
+    "bf16": _Wire(2, torch.bfloat16, None, torch.bfloat16),
+    "fp8": _Wire(1, dtypes.fp8, dtypes.fp8, dtypes.fp8),
+    "fp4": _Wire(0.5, dtypes.fp4x2, dtypes.fp4x2, torch.uint8),
 }
-# What the sender quantizes to.
-_QUANT_WIRE_DTYPE = {"fp8": dtypes.fp8, "fp4": dtypes.fp4x2}
+_DISPATCH_WIRES = tuple(_WIRES)
 
 
 def _align_up(value: int, alignment: int) -> int:
@@ -168,10 +172,6 @@ class MegaMoEStage2Config:
                 "one e8m0 scale covers 32 features, so a quantizing wire needs "
                 f"hidden_dim % 32 == 0, got {self.hidden_dim}"
             )
-        if self.dispatch_wire == "fp4" and self.hidden_dim % 2:
-            raise ValueError(
-                f"fp4 packs two features per byte, got hidden_dim={self.hidden_dim}"
-            )
         if self.dispatch_backend not in _DISPATCH_BACKENDS:
             raise ValueError(
                 f"dispatch_backend must be one of {_DISPATCH_BACKENDS}, "
@@ -220,22 +220,12 @@ class MegaMoEStage2Config:
         return self.dispatch_wire in ("fp8", "fp4")
 
     @property
-    def is_fp8_wire(self) -> bool:
-        return self.dispatch_wire == "fp8"
+    def wire(self) -> "_Wire":
+        return _WIRES[self.dispatch_wire]
 
     @property
-    def is_fp4_wire(self) -> bool:
-        return self.dispatch_wire == "fp4"
-
-    @property
-    def quant_mode(self) -> str | None:
-        """aiter's name for the MX format on the wire, or None on bf16."""
-        return self.dispatch_wire if self.is_quant_wire else None
-
-    @property
-    def token_nbytes(self) -> int:
-        """Payload bytes per dispatched token -- the DISPATCH direction only."""
-        return int(self.hidden_dim * _WIRE_PAYLOAD_BYTES[self.dispatch_wire])
+    def dispatch_token_nbytes(self) -> int:
+        return int(self.hidden_dim * self.wire.payload_bytes)
 
     @property
     def wire_elem_count(self) -> int:
@@ -245,42 +235,46 @@ class MegaMoEStage2Config:
         halve the count itself -- mori sizes the token as hidden_dim * elem_size
         and would otherwise move two bytes per packed byte.
         """
-        return self.token_nbytes if self.is_quant_wire else self.hidden_dim
+        return self.dispatch_token_nbytes if self.is_quant_wire else self.hidden_dim
 
     @property
     def combine_token_nbytes(self) -> int:
-        """Combine always moves bf16 post-expert tokens, whatever the wire carried.
-
-        Kept separate from token_nbytes on purpose: deriving the combine slot
-        stride from a now-wire-dependent token size silently halves it on fp8
-        (quarters it on fp4) while the rows staged into comb_inp are still bf16.
-        """
+        """Combine moves bf16 post-expert tokens, whatever the wire carried."""
         return self.hidden_dim * 2
 
     @property
     def scale_nbytes(self) -> int:
-        """Per-token e8m0 row, padded to 128 B. Same width for fp8 and fp4.
+        """Per-token e8m0 row as WE produce it: one byte per 32 features, packed.
 
-        Dword padding is all mori's validator demands, but it is not what makes
-        the transfer fast. mori's gfx1250 dispatch batches these rows through TDM,
-        and TdmWholeOrSplit128 only yields a `body` for the part of a run that
-        starts on a 128 B boundary. At the natural 224 B stride only every 4th
-        token starts aligned, so most of the run fell out to the scalar
-        global->global fallback -- measured as dispatch 87.8us (bf16) -> 157.7us
-        (fp8) at 512 tokens/rank. At a 128 B multiple every token is aligned.
+        Handed to mori as-is. mori lays it down at its own, 128 B-aligned stride
+        (scale_dst_nbytes) because that is what keeps a TDM run's start aligned;
+        that padding is mori's business, and the quant op's output can go straight
+        onto the wire without a repack.
+        """
+        return self.hidden_dim // 32 if self.is_quant_wire else 0
 
-        The padding is a bigger share of an fp4 wire (256 B against 3584 B of
-        payload, versus 7168) -- but it buys the same alignment, and the fp4
-        payload row is 128 B-aligned for the same reason.
+    @property
+    def scale_dst_nbytes(self) -> int:
+        """The stride the rows ARRIVE at, which the receiving gather addresses by.
+
+        Asked of mori rather than recomputed: it is the transport's layout
+        decision, and a local copy of the rule would drift the first time the
+        alignment changes.
         """
         if not self.is_quant_wire:
             return 0
-        return (self.hidden_dim // 32 + 127) // 128 * 128
+        try:
+            from mori.ops.dispatch_combine_v2.hip_backend import scale_stride_bytes
+        except ImportError as e:
+            # Imported here, not at module scope: a bf16 wire needs none of this,
+            # so an older mori keeps working until someone asks for fp8/fp4.
+            raise RuntimeError(
+                f"dispatch_wire={self.dispatch_wire!r} needs a mori whose EP "
+                "dispatch carries a per-token scale row (ROCm/mori#593 or later); "
+                "the installed one has no scale_stride_bytes"
+            ) from e
 
-    @property
-    def scale_used_nbytes(self) -> int:
-        """The e8m0 bytes that carry information; the rest of the row is padding."""
-        return self.hidden_dim // 32 if self.is_quant_wire else 0
+        return scale_stride_bytes(self.scale_nbytes)
 
     @property
     def combine_slot_stride_bytes(self) -> int:
@@ -599,11 +593,13 @@ class MegaMoEGfx1250:
                 ("recv_to_src_token", max_recv * 4),
                 ("out_idx", max_recv * config.topk * 4),
                 ("out_wts", max_recv * config.topk * 4),
-                ("disp_out", max_recv * config.token_nbytes),
+                ("disp_out", max_recv * config.dispatch_token_nbytes),
                 ("cross_device_barrier", config.world_size * 8),
                 *(
-                    [("out_scales", max_recv * config.scale_nbytes)]
-                    if config.scale_nbytes
+                    # Arrival stride, not the packed row: undersizing overruns
+                    # the last slots.
+                    [("out_scales", max_recv * config.scale_dst_nbytes)]
+                    if config.scale_dst_nbytes
                     else []
                 ),
                 (
@@ -626,8 +622,8 @@ class MegaMoEGfx1250:
             config.world_size, dtype=torch.int32, device=device
         )
         self._dispatch_barrier = torch.zeros(1, dtype=torch.int32, device=device)
-        # Set per dispatch on the fp8 wire; 0 (and unread) on bf16.
-        self._sent_scales = None
+        # Points at the quant op's own scale rows, set per dispatch on a quantizing
+        # wire; 0 (and unread) on bf16.
         self._sent_scales_ptr = 0
         self._total_recv = torch.zeros(1, dtype=torch.int32, device=device)
         self._cross_device_flag = torch.ones(1, dtype=torch.int64, device=device)
@@ -729,16 +725,14 @@ class MegaMoEGfx1250:
         for spec in self._dispatch_specs:
             plan = EpDispatchPlan(
                 world_size=config.world_size,
-                # ELEMENTS at mori's element size, which is not the feature count
-                # on an fp4 wire: fp8 and fp4 both transport as byte8, so mori
-                # sizes a token as hidden_dim * 1 and fp4 has to halve the count
-                # itself (plan_api says as much: "the caller halves hiddenDim").
+                # see wire_elem_count; mori's plan_api: "the caller halves
+                # hiddenDim"
                 hidden_dim=config.wire_elem_count,
                 max_tok_per_rank=config.max_tokens_per_rank,
                 num_expert_per_rank=config.experts_per_rank,
                 num_expert_per_token=config.topk,
                 max_recv=config.max_recv,
-                dtype=_MORI_WIRE_DTYPE[config.dispatch_wire],
+                dtype=config.wire.mori_dtype,
                 use_weights=True,
                 scale_bytes=config.scale_nbytes,
                 block_num=spec[0],
@@ -805,28 +799,25 @@ class MegaMoEGfx1250:
 
     def _recv_tokens(self) -> torch.Tensor:
         config = self._config
-        if config.is_fp4_wire:
-            # uint8, not fp4x2: this is what the grouped GEMM's prequantized
-            # gather reads, and it addresses the row in BYTES. A packed dtype
-            # would make shape[-1] the feature count and hide the packing.
-            return _from_gpu_ptr(
-                self._arena.local_ptr("disp_out"),
-                (config.max_recv, config.token_nbytes),
-                torch.uint8,
-            )
+        # Width in whatever recv_dtype counts: features for bf16/fp8, bytes for
+        # fp4 -- see _Wire.recv_dtype.
+        width = config.dispatch_token_nbytes // config.wire.recv_dtype.itemsize
         return _from_gpu_ptr(
             self._arena.local_ptr("disp_out"),
-            (config.max_recv, config.hidden_dim),
-            dtypes.fp8 if config.is_fp8_wire else torch.bfloat16,
+            (config.max_recv, width),
+            config.wire.recv_dtype,
         )
 
     def _recv_scales(self) -> torch.Tensor | None:
         """The forwarded e8m0 rows, or None on the bf16 wire."""
         if not self._config.is_quant_wire:
             return None
+        # Full padded rows, not a trimmed view: this goes to the gather kernel as a
+        # base pointer plus a build-constant pitch, and that pitch is the arrival
+        # stride. The kernel reads only the meaningful bytes of each row.
         return _from_gpu_ptr(
             self._arena.local_ptr("out_scales"),
-            (self._config.max_recv, self._config.scale_nbytes),
+            (self._config.max_recv, self._config.scale_dst_nbytes),
             torch.uint8,
         )
 
@@ -863,23 +854,13 @@ class MegaMoEGfx1250:
 
             payload, scale_rows = per_1x32_mx_quant_hip(
                 hidden_states,
-                quant_dtype=_QUANT_WIRE_DTYPE[self._config.dispatch_wire],
+                quant_dtype=self._config.wire.quant_dtype,
                 scale_type=dtypes.fp8_e8m0,
                 shuffle=False,
             )
-            # Copied into a 128 B-strided buffer rather than sent as-is: see
-            # scale_nbytes. Allocated once at capacity and reused, so the copy is
-            # the only per-call cost and the pointer is stable under graph capture.
-            used = self._config.scale_used_nbytes
-            if self._sent_scales is None:
-                self._sent_scales = torch.zeros(
-                    (self._config.max_tokens_per_rank, self._config.scale_nbytes),
-                    dtype=torch.uint8,
-                    device=hidden_states.device,
-                )
-                self._sent_scales_ptr = self._sent_scales.data_ptr()
-            rows_u8 = scale_rows.view(torch.uint8).reshape(token_count, -1)
-            self._sent_scales[:token_count, :used] = rows_u8[:, :used]
+            # Straight onto the wire; mori restrides these packed rows while it
+            # stages them, so there is no repack here.
+            self._sent_scales_ptr = scale_rows.data_ptr()
         self._dispatch_variants[spec](
             self._arena.handle,
             payload.data_ptr(),

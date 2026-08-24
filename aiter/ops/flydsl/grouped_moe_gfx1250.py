@@ -606,10 +606,7 @@ def _grouped_a8w4_tdm_moe(
 
     # Pre-quantized activation: an MX payload plus its e8m0 row is what a
     # quantizing EP dispatch delivers, and it is also aiter's standing meaning
-    # for this pair. The fused pass then keeps its route gather and its scale
-    # preshuffle and drops only the quant -- the preshuffle cannot move to the
-    # sender anyway, because its destination is a function of the grouped row
-    # THIS rank assigns.
+    # for this pair.
     _prequantized = a1_scale is not None and hidden_states.dtype in (
         dtypes.fp8,
         torch.uint8,
@@ -621,10 +618,8 @@ def _grouped_a8w4_tdm_moe(
             f"a1_scale given with hidden_states dtype {hidden_states.dtype}: "
             "expected packed MX bytes (pre-quantized) or the model dtype (ignored)"
         )
-    # A payload row is model_dim bytes on an fp8 wire and model_dim//2 on an fp4
-    # one. Checked rather than inferred: a wire that disagrees with the GEMM's
-    # data_format would otherwise read into the next token's bytes and produce
-    # plausible garbage.
+    # Checked, not inferred: a wire disagreeing with the GEMM's data_format would
+    # read into the next token's bytes and produce plausible garbage.
     _src_width = hidden_states.shape[-1]
     if _prequantized:
         _want_width = model_dim // 2 if _is_fp4 else model_dim
@@ -1020,12 +1015,10 @@ def grouped_gemm_gfx1250_a8w4(
     ):
         _grouped_dbg("unsupported activation")
         return None
-    # mxfp4 weights reach here either as fp4x2 or as the uint8 VIEW of the same
-    # bytes -- ATOM's loader keeps them uint8, and MegaMoE accepts both. Both
-    # arms have to say so: requiring the packed dtype on the a4w4 arm alone sent
-    # a4w4-with-uint8-weights to the 2-stage fallback instead, which is a silent
-    # detour to a different kernel family, not an error. The very next statement
-    # already normalizes the two spellings for the CSV key.
+    # mxfp4 weights arrive as fp4x2 or as the uint8 view of the same bytes --
+    # ATOM's loader keeps them uint8, and MegaMoE accepts both. Requiring the
+    # packed dtype on the a4w4 arm alone silently routed a4w4-with-uint8-weights
+    # to the 2-stage fallback.
     w_is_mxfp4 = q_dtype_w == dtypes.fp4x2 or w1.dtype == torch.uint8
     is_grouped_a4w4 = q_dtype_a == dtypes.fp4x2 and w_is_mxfp4
     is_grouped_a8w4 = q_dtype_a == dtypes.fp8 and w_is_mxfp4

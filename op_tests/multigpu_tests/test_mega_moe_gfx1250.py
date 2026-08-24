@@ -117,11 +117,8 @@ def resolve_spec(quant_key, transport, combine_mode="gather"):
 
     gate_mode = GateMode.INTERLEAVE if quant_key == "a8w4_mxfp4" else GateMode.SEPARATED
     if is_mxfp4 and combine_mode == "scatter_fused":
-        # MegaMoE rejects anything but g1u1 interleave outright (its gemm2-fused
-        # scatter is built on that layout), so the a4w4 key has to follow a8w4
-        # here rather than keep the SEPARATED default it uses elsewhere. Weight
-        # prep and the fp32 reference both read gate_mode off this spec, so
-        # overriding it in one place keeps all three consistent.
+        # MegaMoE's gemm2-fused scatter is g1u1-interleave only, so a4w4 cannot
+        # keep the SEPARATED default it uses elsewhere.
         gate_mode = GateMode.INTERLEAVE
 
     return {
@@ -590,9 +587,8 @@ class DeviceMoEPipeline:
                 activation=self.spec["activation"],
                 gate_mode=self.spec["gate_mode"].value,
                 quant_type=self.spec["aiter_qtype"],
-                # Explicit, not left to $MEGA_WIRE: the harness owns this now, and
-                # a stale env would otherwise silently change what is measured.
-                dispatch_wire=self.spec.get("mega_wire", "bf16"),
+                # Explicit so a stale $MEGA_WIRE cannot change what is measured.
+                dispatch_wire=self.spec["mega_wire"],
             )
         else:
             EpDispatchCombineConfig, EpDispatchCombineOp = _import_mori_v2()
