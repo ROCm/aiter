@@ -760,6 +760,17 @@ def top_k_per_row_decode(
     request -- on the HIP path, which ignores ``workspace`` entirely, with nothing
     to raise on.
     """
+    # Neither kernel reads a column stride. FlyDSL raises on one; HIP ignores the
+    # argument and walks the dense buffer the view sits in, so a strided caller
+    # gets the Top-K of its neighbours' elements back with nothing raised. Densify
+    # up front so the gate below routes on shape alone and both kernels see the
+    # elements the caller asked about. The tensor decides, not the declared
+    # stride: a caller claiming 1 for a strided buffer is the case HIP accepts and
+    # silently misreads.
+    if stride1 != 1 or logits.stride(1) != 1:
+        logits = logits.contiguous()
+        stride0, stride1 = logits.stride()
+
     if not stable and _should_use_flydsl_decode(
         logits, next_n, numRows, stride0, stride1, k
     ):

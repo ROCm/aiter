@@ -141,12 +141,14 @@ def test_both_branches_match_torch_topk(rows, width, seq_len, k):
 
 @pytestmark_gpu
 @pytest.mark.parametrize("claimed_stride1", [2, 1], ids=["honest", "claims_one"])
-def test_column_strided_input_falls_back_instead_of_raising(claimed_stride1):
-    """A column-strided buffer sits inside the gate's width window, so the stride1
-    screen is the only thing keeping it away from FlyDSL, which raises on it. HIP
-    ignores stride1, so the call has to simply come back either way -- including
-    when the caller claims 1, which HIP accepts and the gate must not take at its
-    word.
+def test_column_strided_input_reads_the_view_not_the_buffer(claimed_stride1):
+    """Neither kernel reads a column stride, so the op densifies before routing.
+
+    Coming back without raising is not enough on its own: HIP ignores stride1 and
+    walks the dense buffer the view sits in, which returns the Top-K of the
+    interleaved neighbours instead. Both cases have to match torch.topk of the
+    view, including when the caller claims stride1 == 1 -- that is the one HIP
+    accepts, and the op must trust the tensor rather than the claim.
 
     k has to be 2048: it is the only value inside every shipped window, and under
     any other one gfx950 rejects on k before the stride checks are ever reached,
@@ -159,11 +161,22 @@ def test_column_strided_input_falls_back_instead_of_raising(claimed_stride1):
     assert logits.stride(1) == 2 and logits.shape[1] == width
     seq_lens = torch.full((rows,), width, dtype=torch.int32, device="cuda")
     indices = torch.empty((rows, k), dtype=torch.int32, device="cuda")
+    indices.fill_(-1)
 
     topk_mod.top_k_per_row_decode(
         logits, 1, seq_lens, indices, rows, logits.stride(0), claimed_stride1, k
     )
     torch.cuda.synchronize()
+
+    assert bool(((indices >= 0) & (indices < width)).all())
+    expected = torch.topk(logits, k, dim=1).indices
+    assert torch.equal(indices.long().sort(dim=1).values, expected.sort(dim=1).values)
+    # The dense buffer behind the view is the wrong answer this densification
+    # exists to prevent, so a run that returns it has to fail here.
+    wrong = torch.topk(wide[:, :width], k, dim=1).indices
+    assert not torch.equal(
+        indices.long().sort(dim=1).values, wrong.sort(dim=1).values
+    )
 
 
 if __name__ == "__main__":
