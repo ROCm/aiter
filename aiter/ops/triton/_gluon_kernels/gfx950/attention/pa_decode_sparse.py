@@ -60,7 +60,7 @@ def _cache_load(
     USE_BUFFER_LOAD: gl.constexpr,
     mask=None,
     other=None,
-    CACHE: gl.constexpr = ".cg",
+    CACHE: gl.constexpr = gl.constexpr(".cg"),
 ):
     """Gather rows[i] + col[j]. row is the per-token offset in ptr's element
     units; col a small compile-time arange. Keeping them apart resolves one
@@ -1611,6 +1611,7 @@ def _pa_decode_sparse(
     part_m_ptr,  # [C, NUM_SPLITS, H] f32 row max, base-2 domain
     part_l_ptr,  # [C, NUM_SPLITS, H] f32 row sum
     part_acc_ptr,  # [C, NUM_SPLITS, H, S] bf16 or f32, un-normalized
+    lse_ptr,  # [C, H] f32 natural-log LSE, HAS_LSE only
     # f32 side-channel per segment: scalar k_scale ("tensor") or f32 cache view
     # ("dsmla"). None elides the argument, keeping other formats' kernarg
     # layouts unchanged.
@@ -1633,6 +1634,7 @@ def _pa_decode_sparse(
     num_heads: gl.constexpr,
     HAS_EXTRA: gl.constexpr,
     HAS_SINK: gl.constexpr,
+    HAS_LSE: gl.constexpr,
     MAIN_FMT: gl.constexpr,
     EXTRA_FMT: gl.constexpr,
     MAIN_BLOCK_SIZE: gl.constexpr,
@@ -1677,8 +1679,8 @@ def _pa_decode_sparse(
     q_scl_ptr=None,
     Q_FP8: gl.constexpr = False,
     # Defaults keep every existing launch byte-identical; the MLA launcher opts in.
-    GATHER_CACHE: gl.constexpr = ".cg",
-    IDX_CACHE: gl.constexpr = "",
+    GATHER_CACHE: gl.constexpr = gl.constexpr(".cg"),
+    IDX_CACHE: gl.constexpr = gl.constexpr(""),
     ASYNC_LDS: gl.constexpr = False,
     RELAXED_LOAD: gl.constexpr = True,
     ROPE_VEC: gl.constexpr = 16,
@@ -1804,6 +1806,7 @@ def _pa_decode_sparse(
     # k_scale joins the per-segment fold (max/exp2 commute with a positive
     # scale) and the V-side scale hits p in the loop. Both are exact.
     RCP_LN2: gl.constexpr = 1.4426950408889634
+    LN2: gl.constexpr = 0.6931471805599453
     qk_scale = scale * RCP_LN2
     main_qk_scale = qk_scale
     main_v_scale = 1.0
@@ -2057,6 +2060,7 @@ def _pa_decode_sparse(
             l_final = l_pv * alpha + gl.exp2(sink - m_final)
             acc = acc * alpha[:, None]
         else:
+            m_final = m_pv
             l_final = l_pv
         one_over_l = 1.0 / l_final
         out = acc * one_over_l[:, None]
@@ -2070,6 +2074,15 @@ def _pa_decode_sparse(
             offsets=o_off,
             mask=head_mask_pv[:, None],
         )
+        if HAS_LSE:
+            # m is base-2, so sum_j exp(s_j) = 2^m * l and ln of it is
+            # (m + log2 l) * ln2. A fully masked row keeps -inf, not NaN.
+            gl.amd.cdna4.buffer_store(
+                (m_final + gl.log2(l_final)) * LN2,
+                ptr=lse_ptr + query_idx * num_heads,
+                offsets=h_pv.to(gl.int32),
+                mask=head_mask_pv,
+            )
     else:
         # Un-normalized partials for the reduce kernel; m stays in the base-2
         # exponent domain (the triton reduce's convention too).
@@ -2114,6 +2127,7 @@ def _pa_decode_sparse_reduce(
     part_acc_ptr,
     attn_sink_ptr,
     out_ptr,
+    lse_ptr,
     out_stride0: gl.constexpr,
     out_stride1: gl.constexpr,
     pm_stride0: gl.constexpr,
@@ -2123,6 +2137,7 @@ def _pa_decode_sparse_reduce(
     pa_stride_h: gl.constexpr,
     num_heads: gl.constexpr,
     HAS_SINK: gl.constexpr,
+    HAS_LSE: gl.constexpr,
     HEAD_SIZE: gl.constexpr,
     BLOCK_M: gl.constexpr,
     NUM_SPLITS: gl.constexpr,
@@ -2135,6 +2150,7 @@ def _pa_decode_sparse_reduce(
     BLOCK_M is sized for workgroup count, not for the attention kernel's tile."""
     NUM_WARPS: gl.constexpr = gl.num_warps()
     RCP_LN2: gl.constexpr = 1.4426950408889634
+    LN2: gl.constexpr = 0.6931471805599453
     query_idx = gl.program_id(0)
     pid_h = gl.program_id(1)
 
@@ -2221,6 +2237,15 @@ def _pa_decode_sparse_reduce(
 
     if HAS_SINK:
         l_final = l_final + gl.exp2(scaled_sink - m_final)
+
+    if HAS_LSE:
+        # Same base-2 -> natural conversion as the no-split epilogue.
+        gl.amd.cdna4.buffer_store(
+            (m_final + gl.log2(l_final)) * LN2,
+            ptr=lse_ptr + query_idx * num_heads,
+            offsets=h.to(gl.int32),
+            mask=head_mask,
+        )
 
     # One reciprocal per row instead of a per-element f32 divide.
     one_over_l = 1.0 / l_final

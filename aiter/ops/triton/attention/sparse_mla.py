@@ -190,15 +190,16 @@ def sparse_mla_fwd(
     dot_precision: str = "bf16",
     q_scale: torch.Tensor | None = None,
     out: torch.Tensor | None = None,
-) -> torch.Tensor:
+    return_lse: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Sparse (top-k gathered) MLA attention, separated-rope geometry.
 
     Args:
-        q: ``[C, H, kv_lora_rank + qk_rope_head_dim]`` queries, one row per
+        q: [C, H, kv_lora_rank + qk_rope_head_dim] queries, one row per
             query token (prefill and decode alike).
-        kv_buffer: the KV pool — ``[nb, block, R]`` / ``[slots, 1, 1, R]`` /
-            ``[slots, R]`` in bf16, the same shapes in fp8 (+ scalar
-            ``kv_scale``), or ``[nb, block, 656]`` uint8 (vLLM ``fp8_ds_mla``).
+        kv_buffer: the KV pool [nb, block, R] / [slots, 1, 1, R] /
+            [slots, R] in bf16, the same shapes in fp8 (+ scalar
+            kv_scale), or [nb, block, 656] uint8 (vLLM ``fp8_ds_mla``).
         kv_indptr: ``[C + 1]`` int32 prefix sum of per-query index counts.
         kv_indices: flat int32 GLOBAL slot ids into the pool.
         softmax_scale: the layer's softmax scale.
@@ -226,9 +227,13 @@ def sparse_mla_fwd(
             scale, matching production's scaled_fp8_quant(q, layer._q_scale);
             omitted, a per-tensor amax is taken here.
         out: optional ``[C, H, >= kv_lora_rank]`` bf16 destination.
+        return_lse: also return the natural-log log-sum-exp, [C, H] f32, for
+            merging partials across context-parallel ranks. A fully masked row
+            reports -inf.
 
     Returns:
-        ``[C, H, kv_lora_rank]`` bf16 attention output (the latent V).
+        (out, lse), following aiter.mla.mla_decode_fwd: out is
+        [C, H, kv_lora_rank] bf16 (the latent V), lse is None unless return_lse.
     """
     assert q.ndim == 3, f"expected q=[b,h,d], got {q.shape}"
     assert arch_info.get_arch() == "gfx950", "sparse_mla_fwd is gfx950-only"
@@ -313,6 +318,14 @@ def sparse_mla_fwd(
     head_aligned = num_heads % block_m == 0
     heads_blocks = (num_heads + block_m - 1) // block_m
     out = _check_out(out, q, kv_lora_rank)
+    if return_lse and skip_reduce:
+        raise ValueError("return_lse needs the combine, so skip_reduce cannot be set")
+    # A live pointer either way, like attn_sink below.
+    lse = (
+        torch.empty((num_queries, num_heads), dtype=torch.float32, device=q.device)
+        if return_lse
+        else torch.empty(1, dtype=torch.float32, device=q.device)
+    )
 
     if kv_splits is not None:
         num_splits = max(1, int(kv_splits))
@@ -375,6 +388,7 @@ def sparse_mla_fwd(
         part_m,
         part_l,
         part_acc,
+        lse,
         scl,  # f32 side-channel: k_scale ("tensor") / f32 view ("dsmla")
         scl,
         float(softmax_scale),
@@ -394,6 +408,7 @@ def sparse_mla_fwd(
         num_heads,
         HAS_EXTRA=False,
         HAS_SINK=False,
+        HAS_LSE=return_lse,
         MAIN_FMT=fmt,
         EXTRA_FMT=fmt,
         MAIN_BLOCK_SIZE=block_size,
@@ -437,7 +452,7 @@ def sparse_mla_fwd(
     )
 
     if num_splits == 1:
-        return out
+        return out, (lse if return_lse else None)
     if skip_reduce:
         return part_acc, part_m, part_l
 
@@ -449,6 +464,7 @@ def sparse_mla_fwd(
         part_acc,
         attn_sink,
         out,
+        lse,
         out.stride(0),
         out.stride(1),
         pm_stride0,
@@ -458,6 +474,7 @@ def sparse_mla_fwd(
         pa_stride_h,
         num_heads,
         HAS_SINK=False,
+        HAS_LSE=return_lse,
         HEAD_SIZE=kv_lora_rank,
         BLOCK_M=1,
         NUM_SPLITS=num_splits,
@@ -465,4 +482,4 @@ def sparse_mla_fwd(
         ADAPTIVE_SPLITS=num_splits > 1,
         num_warps=1,
     )
-    return out
+    return out, (lse if return_lse else None)

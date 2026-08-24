@@ -190,7 +190,8 @@ def run_benchmark(args):
             cache, scale, q_scale = kv, None, None
 
         def func():
-            return sparse_mla_fwd(
+            # out= is supplied, so the returned pair is not needed
+            sparse_mla_fwd(
                 q,
                 cache,
                 indptr,
