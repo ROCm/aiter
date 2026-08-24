@@ -7,8 +7,9 @@ various configurations.
 
 Usage:
   python test_moe_topk_gating.py --num-experts 64,128 --topk 2,4,8 --dtype fp16
-  python test_moe_topk_gating.py --score-func softmax --topk 8
-  python test_moe_topk_gating.py --score-func sigmoid,softmax --num-tokens 64,1024
+  python test_moe_topk_gating.py --section softmax --topk 8
+  python test_moe_topk_gating.py --section sigmoid,softmax --num-tokens 64,1024
+  python test_moe_topk_gating.py --section ties,eplb
 """
 
 import argparse
@@ -51,7 +52,11 @@ _TIE_TOL = 1e-4
 
 _WEIGHT_TOL = 1e-4
 
-SUPPORTED_GFX = ["gfx942", "gfx950"]
+# EP world size assumed by the eplb section; experts are sharded contiguously,
+# so rank r owns [r * num_experts / _EPLB_EP_SIZE, (r + 1) * ...).
+_EPLB_EP_SIZE = 4
+
+SUPPORTED_GFX = ["gfx942", "gfx950", "gfx1250"]
 
 
 def _selection_scores(
@@ -538,6 +543,144 @@ def bench_topk_gating_nan(num_experts, num_tokens, topk, score_func, dtype):
     return ret
 
 
+@benchmark()
+def bench_topk_gating_ties(num_experts, num_tokens, topk, score_func, dtype):
+    """Exact-tie benchmark. The other cases build rows of distinct values, but
+    real gating output repeats, and lanes that disagree about which of two equal
+    experts won consume two selection slots while recording one.
+
+    Scored on dropped slots rather than set equality: any expert whose score
+    equals the reference's k-th pick is a valid choice, so the failure to catch
+    is picking one strictly below it.
+    """
+    torch.random.manual_seed(0)
+    # Quantise hard so each row holds many exactly-equal values.
+    gating_output = (torch.randn(num_tokens, num_experts, device="cuda") * 2).round()
+    gating_output = gating_output.to(dtype)
+
+    topk_weights = torch.empty((num_tokens, topk), dtype=torch.float32, device="cuda")
+    topk_ids = torch.empty((num_tokens, topk), dtype=torch.int32, device="cuda")
+
+    _, us = run_perftest(
+        aiter.topk_gating,
+        topk_weights,
+        topk_ids,
+        gating_output,
+        None,
+        need_renorm=True,
+        score_func=score_func,
+    )
+
+    g = gating_output.float()
+    if score_func == "softmax":
+        sel = torch.softmax(g, dim=-1)
+    elif score_func == "sigmoid":
+        sel = torch.sigmoid(g)
+    else:
+        sel = torch.nn.functional.softplus(g).sqrt()
+
+    kth = sel.topk(topk, dim=-1).values.amin(dim=-1, keepdim=True)
+    dropped = int(((kth - sel.gather(1, topk_ids.long())) > _TIE_TOL).any(dim=1).sum())
+    ids_sorted = topk_ids.sort(dim=-1).values
+    dup = int((ids_sorted.diff(dim=-1) == 0).any(dim=1).sum())
+
+    nbytes = (
+        num_tokens * num_experts * gating_output.element_size()
+        + num_tokens * topk * (4 + 4)
+    )
+    ret = {"gfx": get_gfx()}
+    ret["fused us"] = us
+    ret["fused TB/s"] = nbytes / us / 1e6
+    ret["fused err"] = dropped / num_tokens
+    ret["dup ids"] = dup
+    ret["renorm err"] = float((topk_weights.sum(-1) - 1.0).abs().max())
+    return ret
+
+
+# ---------------------------------------------------------------------------
+# EP load balance on fake-eplb balance-router logits
+# ---------------------------------------------------------------------------
+
+
+def _eplb_gating(num_experts, num_tokens, topk, ep_size, dtype, logit=10.0):
+    """Synthetic balance-router logits, as fake-eplb substitutes them.
+
+    A flat ring walks position p = t * topk + j across EP ranks, so consecutive
+    picks step the rank by one and rank load is even over the batch. The chosen
+    experts sit at +logit and everything else at -logit, which makes the top-K
+    set unique while every pair inside it -- and every pair outside -- ties
+    exactly. That is the densest tie pattern a router can hand the kernel.
+    """
+    experts_per_rank = num_experts // ep_size
+    p = torch.arange(num_tokens, device="cuda").unsqueeze(1) * topk + torch.arange(
+        topk, device="cuda"
+    ).unsqueeze(0)
+    expert_ids = (p % ep_size) * experts_per_rank + (p // ep_size) % experts_per_rank
+    gating_output = torch.full(
+        (num_tokens, num_experts), -logit, dtype=dtype, device="cuda"
+    )
+    gating_output.scatter_(1, expert_ids, logit)
+    return gating_output, expert_ids.to(torch.int32)
+
+
+@benchmark()
+def bench_topk_gating_eplb(
+    num_experts, num_tokens, topk, score_func, dtype, ep_size=_EPLB_EP_SIZE
+):
+    """EP load-balance benchmark on tie-dense balance-router logits.
+
+    The ties section perturbs otherwise-distinct rows; here every selected
+    expert ties with every other one, which is what turns a slot drop into a
+    routing collapse: retiring several tied experts while recording one frees
+    slots that refill from the rejected pool, and those sit low in the index
+    space, so the batch piles onto the first EP rank instead of spreading.
+
+    Scored on exact set equality -- unlike the ties section, the reference set
+    here is unambiguous, since every selected expert outscores every rejected
+    one -- plus the resulting EP rank load.
+    """
+    torch.random.manual_seed(0)
+    gating_output, i_ref = _eplb_gating(num_experts, num_tokens, topk, ep_size, dtype)
+
+    topk_weights = torch.empty((num_tokens, topk), dtype=torch.float32, device="cuda")
+    topk_ids = torch.empty((num_tokens, topk), dtype=torch.int32, device="cuda")
+
+    _, us = run_perftest(
+        aiter.topk_gating,
+        topk_weights,
+        topk_ids,
+        gating_output,
+        None,
+        need_renorm=True,
+        score_func=score_func,
+    )
+
+    ids_sorted = topk_ids.sort(dim=-1).values
+    mism = int((ids_sorted != i_ref.sort(dim=-1).values).any(dim=1).sum())
+    dup = int((ids_sorted.diff(dim=-1) == 0).any(dim=1).sum())
+
+    experts_per_rank = num_experts // ep_size
+
+    def max_rank_share(ids):
+        ranks = ids.reshape(-1).long() // experts_per_rank
+        counts = torch.bincount(ranks, minlength=ep_size)
+        return float(counts.max()) / ids.numel()
+
+    nbytes = (
+        num_tokens * num_experts * gating_output.element_size()
+        + num_tokens * topk * (4 + 4)
+    )
+    ret = {"gfx": get_gfx()}
+    ret["fused us"] = us
+    ret["fused TB/s"] = nbytes / us / 1e6
+    ret["fused err"] = mism / num_tokens
+    ret["dup ids"] = dup
+    ret["ep max share"] = max_rank_share(topk_ids)
+    ret["ref ep max share"] = max_rank_share(i_ref)
+    ret["renorm err"] = float((topk_weights.sum(-1) - 1.0).abs().max())
+    return ret
+
+
 # ---------------------------------------------------------------------------
 # main() -- argparse + sweep, one table per score function
 # ---------------------------------------------------------------------------
@@ -579,10 +722,15 @@ def main():
         help="Comma-separated list of dtypes: fp16, bf16, fp32 (default: fp16,bf16,fp32)",
     )
     parser.add_argument(
+        "--section",
         "--score-func",
+        dest="section",
         type=lambda s: [x.strip() for x in s.split(",")],
-        default=["sigmoid", "softplus", "softmax", "nan"],
-        help="Comma-separated list of sections to run: sigmoid,softplus,softmax,nan (default: all)",
+        default=["sigmoid", "softplus", "softmax", "nan", "ties", "eplb"],
+        help="Comma-separated list of sections to run: "
+        "sigmoid,softplus,softmax,nan,ties,eplb (default: all). "
+        "The first three are named after a score function; nan, ties and eplb "
+        "each sweep all score functions. --score-func is a deprecated alias.",
     )
     args = parser.parse_args()
 
@@ -593,12 +741,12 @@ def main():
     num_tokens_list = to_list(args.num_tokens)
     topk_list = to_list(args.topk)
     dtype_list = to_list(args.dtype)
-    score_funcs = args.score_func
+    sections = args.section
 
     failed_sections: list[str] = []
 
     # -- topk_sigmoid --------------------------------------------------
-    if "sigmoid" in score_funcs:
+    if "sigmoid" in sections:
         sigmoid_dtypes = [d for d in dtype_list if d != torch.float32]
         sigmoid_configs = list(
             itertools.product(
@@ -617,7 +765,7 @@ def main():
             failed_sections.append("sigmoid")
 
     # -- topk_softplus ---------------------------------------------------
-    if "softplus" in score_funcs:
+    if "softplus" in sections:
         softplus_configs = list(
             itertools.product(num_experts_list, num_tokens_list, topk_list, dtype_list)
         )
@@ -635,7 +783,7 @@ def main():
             failed_sections.append("softplus")
 
     # -- topk_softmax: topk_gating (fused) vs topk_softmax (vLLM) --------
-    if "softmax" in score_funcs:
+    if "softmax" in sections:
         softmax_configs = list(
             itertools.product(
                 num_experts_list, num_tokens_list, topk_list, dtype_list, [False, True]
@@ -661,7 +809,7 @@ def main():
             failed_sections.append("softmax")
 
     # -- topk_gating NaN/Inf robustness -----------------------------------
-    if "nan" in score_funcs:
+    if "nan" in sections:
         nan_dtypes = [d for d in dtype_list if d != torch.float32]
         nan_configs = list(
             itertools.product(
@@ -685,6 +833,63 @@ def main():
             )
             print(errors.to_string(index=False))
             failed_sections.append("nan")
+
+    # -- topk_gating exact-tie handling ------------------------------------
+    if "ties" in sections:
+        tie_configs = list(
+            itertools.product(
+                num_experts_list,
+                num_tokens_list,
+                topk_list,
+                ["sqrtsoftplus", "sigmoid", "softmax"],
+                dtype_list,
+            )
+        )
+        df = [bench_topk_gating_ties(*cfg) for cfg in tie_configs]
+        df = pd.DataFrame(df)
+        aiter.logger.info(
+            "topk_gating exact-tie summary (markdown):\n%s",
+            df.to_markdown(index=False),
+        )
+        errors = df[
+            (df["fused err"] > 0)
+            | (df["dup ids"] > 0)
+            | (df["renorm err"] > _WEIGHT_TOL)
+        ]
+        if len(errors) > 0:
+            print(f"\nERROR: {len(errors)} tie config(s) failed!")
+            print(errors.to_string(index=False))
+            failed_sections.append("ties")
+
+    # -- topk_gating EP load balance (fake-eplb balance logits) -------------
+    if "eplb" in sections:
+        eplb_configs = [
+            cfg
+            for cfg in itertools.product(
+                num_experts_list,
+                num_tokens_list,
+                topk_list,
+                ["sqrtsoftplus", "sigmoid", "softmax"],
+                dtype_list,
+            )
+            if cfg[0] % _EPLB_EP_SIZE == 0
+        ]
+        df = [bench_topk_gating_eplb(*cfg) for cfg in eplb_configs]
+        df = pd.DataFrame(df)
+        aiter.logger.info(
+            "topk_gating fake-eplb EP balance summary (markdown):\n%s",
+            df.to_markdown(index=False),
+        )
+        errors = df[
+            (df["fused err"] > 0)
+            | (df["dup ids"] > 0)
+            | (df["ep max share"] > df["ref ep max share"] + 0.05)
+            | (df["renorm err"] > _WEIGHT_TOL)
+        ]
+        if len(errors) > 0:
+            print(f"\nERROR: {len(errors)} eplb config(s) failed!")
+            print(errors.to_string(index=False))
+            failed_sections.append("eplb")
 
     if failed_sections:
         print(
