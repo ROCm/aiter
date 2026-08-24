@@ -24,6 +24,8 @@
 #include <iostream>
 #include <limits>
 #include <map>
+#include <mutex>
+#include <cstdlib>
 #include <string>
 #include <type_traits>
 #include <unordered_map>
@@ -1519,6 +1521,393 @@ __global__ void __launch_bounds__(tnum, 1) local_device_load_rmsnorm(RankSignals
     }
 }
 
+
+// ============================================================================
+// Lamport (flag-free) fused all-reduce + RMSNorm -- opt-in via
+// AITER_AR_RMSNORM_LAMPORT=1.
+//
+// The default two-kernel path is:
+//
+//   reduce_scatter_cross_device_store   ... end_sync (global barrier)
+//   local_device_load_rmsnorm           ... reads the tmp buffer
+//
+// The barrier plus the kernel boundary make the two stages strictly serial:
+// on a decode step we measure sum(kernel) == union(kernel), i.e. zero overlap.
+// A separate stream does not help -- the consumer genuinely depends on the
+// producer's data, and ROCm has no equivalent of PDL to let the second kernel
+// start while the first is draining.
+//
+// Lamport removes the barrier instead of trying to hide it: the data IS the
+// flag. The tmp buffer is pre-filled with a sentinel (negative zero), the
+// producer stores real values into it, and the consumer spins per 16B pack
+// until the pack no longer reads as sentinel. Arrival of the value and
+// arrival of the "it is ready" signal are the same store, so there is no
+// flag/data ordering problem -- which is also what makes the RELAXED-end_sync
+// corruption documented on reduce_scatter_cross_device_store impossible here.
+//
+// Producer and consumer live in ONE kernel so that they overlap without a
+// second stream: every block first finishes its share of the reduce-scatter
+// (which depends on nobody) and then spins on the rows it owns. No block can
+// starve another, so the spin cannot deadlock.
+//
+// Sentinel safety: the producer canonicalises -0.0 to +0.0 before storing, so
+// a sentinel word can never be a legitimate result.
+// ============================================================================
+
+template <typename T>
+struct LamportSentinel
+{
+    // two bf16/fp16 negative zeros per 32-bit word
+    static constexpr uint32_t word = 0x80008000u;
+};
+
+template <>
+struct LamportSentinel<opus::fp32_t>
+{
+    static constexpr uint32_t word = 0x80000000u;
+};
+
+// Replace any -0.0 lane with +0.0 so that no real value aliases the sentinel.
+template <typename T, int pack_size>
+DINLINE void lamport_canonicalize(opus::vector_t<T, pack_size>& p)
+{
+    constexpr int nwords = pack_size * sizeof(T) / 4;
+    uint32_t* w          = reinterpret_cast<uint32_t*>(&p);
+#pragma unroll
+    for(int i = 0; i < nwords; ++i)
+    {
+        if constexpr(sizeof(T) == 4)
+        {
+            if(w[i] == 0x80000000u)
+                w[i] = 0u;
+        }
+        else
+        {
+            if((w[i] & 0x0000FFFFu) == 0x00008000u)
+                w[i] &= 0xFFFF0000u;
+            if((w[i] & 0xFFFF0000u) == 0x80000000u)
+                w[i] &= 0x0000FFFFu;
+        }
+    }
+}
+
+// Spin until every word of the pack has been overwritten by the producer.
+template <typename T, int pack_size>
+DINLINE opus::vector_t<T, pack_size> lamport_spin_load(const void* addr)
+{
+    constexpr int nwords          = pack_size * sizeof(T) / 4;
+    constexpr uint32_t kSentinel  = LamportSentinel<T>::word;
+    volatile const uint32_t* wsrc = reinterpret_cast<volatile const uint32_t*>(addr);
+    uint32_t v[nwords];
+    bool ready = false;
+    while(!ready)
+    {
+        ready = true;
+#pragma unroll
+        for(int i = 0; i < nwords; ++i)
+        {
+            v[i] = wsrc[i];
+            if(v[i] == kSentinel)
+                ready = false;
+        }
+        if(!ready)
+            __builtin_amdgcn_s_sleep(1);
+    }
+    opus::vector_t<T, pack_size> out;
+    uint32_t* wdst = reinterpret_cast<uint32_t*>(&out);
+#pragma unroll
+    for(int i = 0; i < nwords; ++i)
+        wdst[i] = v[i];
+    return out;
+}
+
+// Re-arm one pack for the next iteration. Each pack is consumed by exactly one
+// thread, so this needs no synchronisation.
+template <typename T, int pack_size>
+DINLINE void lamport_arm(void* addr)
+{
+    constexpr int nwords = pack_size * sizeof(T) / 4;
+    volatile uint32_t* w = reinterpret_cast<volatile uint32_t*>(addr);
+#pragma unroll
+    for(int i = 0; i < nwords; ++i)
+        w[i] = LamportSentinel<T>::word;
+}
+
+// start_sync with release/acquire ordering.
+//
+// The plain start_sync is RELAXED, which is fine when a later end_sync
+// publishes the payload. Here there is no end_sync, and the barrier has to
+// order the *previous* iteration's re-arming stores (this rank writing
+// sentinels into its own tmp buffer) before a peer's producer stores land in
+// that same buffer. A relaxed barrier would allow a stale sentinel to clobber
+// fresh data and hang the consumer.
+template <int ngpus>
+DINLINE void start_sync_acqrel(const RankSignals& sg,
+#ifndef USE_ROCM
+                               volatile
+#endif
+                               Signal* self_sg,
+                               int rank)
+{
+#ifdef USE_ROCM
+    uint32_t flag = self_sg->_flag[blockIdx.x] + 1;
+    if(threadIdx.x < ngpus)
+    {
+        __scoped_atomic_store_n(&sg.signals[threadIdx.x]->start[blockIdx.x][rank],
+                                flag,
+                                __ATOMIC_RELEASE,
+                                __MEMORY_SCOPE_SYSTEM);
+        while(__scoped_atomic_load_n(&self_sg->start[blockIdx.x][threadIdx.x],
+                                     __ATOMIC_ACQUIRE,
+                                     __MEMORY_SCOPE_DEVICE) < flag)
+            ;
+    }
+    __syncthreads();
+    if(threadIdx.x == 0)
+        self_sg->_flag[blockIdx.x] = flag;
+#else
+    __threadfence_system();
+    if(threadIdx.x < ngpus)
+    {
+        self_sg->end[blockIdx.x][threadIdx.x]            = 0;
+        sg.signals[threadIdx.x]->start[blockIdx.x][rank] = 1;
+        while(!self_sg->start[blockIdx.x][threadIdx.x])
+            ;
+    }
+    __syncthreads();
+#endif
+}
+
+// Fill this rank's tmp buffer with the sentinel. Only needed once per buffer
+// (and again if a later call needs a larger region); steady state re-arming is
+// done by the consumer.
+template <typename T>
+__global__ void lamport_prefill_sentinel(RankSignals sg, int rank, int pack_count)
+{
+    constexpr int pack_size = 16 / sizeof(T);
+    using P                 = typename opus::vector_t<T, pack_size>;
+    P* tmps                 = get_tmp_buf<P>(sg.signals[rank]);
+    for(int i = blockIdx.x * blockDim.x + threadIdx.x; i < pack_count;
+        i += gridDim.x * blockDim.x)
+    {
+        lamport_arm<T, pack_size>(&tmps[i]);
+    }
+}
+
+/*
+ * Single-kernel all-reduce + RMSNorm.
+ *
+ * Phase A (producer) is reduce_scatter_cross_device_store with the end_sync
+ * dropped and -0.0 canonicalised away.
+ * Phase B (consumer) is local_device_load_rmsnorm with a per-pack Lamport spin
+ * in place of the plain load, plus a re-arming store.
+ *
+ * tnum is fixed at 512 so phase A keeps the exact thread mapping of the
+ * original producer. out_hidden_dim >= n is supported (tail packs are zeroed),
+ * matching local_device_load_rmsnorm.
+ */
+template <typename T, int ngpus, int tnum, int n_loop, bool GEMMA_NORM = false>
+__global__ void __launch_bounds__(tnum, 1)
+    fused_allreduce_rmsnorm_lamport(RankData* _dp,
+                                    RankSignals sg,
+#ifndef USE_ROCM
+                                    volatile
+#endif
+                                    Signal* self_sg,
+                                    int rank,
+                                    T* __restrict__ residual_inp,
+                                    T* __restrict__ residual_out,
+                                    T* __restrict__ results,
+                                    T* __restrict__ weight,
+                                    float eps,
+                                    int m,
+                                    int n,
+                                    int input_hidden_dim,
+                                    int out_hidden_dim)
+{
+    constexpr int pack_size = 16 / sizeof(T);
+    constexpr int tnum_gpu  = tnum / ngpus;
+    using P                 = typename opus::vector_t<T, pack_size>;
+    using A                 = typename opus::vector_t<opus::fp32_t, pack_size>;
+
+    // Phase A needs tnum * pack_size elements of T, phase B needs tnum floats.
+    constexpr int kLdsBytes = (tnum * pack_size * sizeof(T) > tnum * sizeof(float))
+                                  ? tnum * pack_size * sizeof(T)
+                                  : tnum * sizeof(float);
+    __shared__ __align__(16) char lds_raw[kLdsBytes];
+    T* tmp_smem  = reinterpret_cast<T*>(lds_raw);
+    float* smem  = reinterpret_cast<float*>(lds_raw);
+
+    const int valid_pack_count = n / pack_size;
+    const int input_pack_count = input_hidden_dim / pack_size;
+    const int out_pack_count   = out_hidden_dim / pack_size;
+    const int tail_pack_count  = out_pack_count - valid_pack_count;
+
+    const int warp_id = threadIdx.x / tnum_gpu;
+    const int lane_id = threadIdx.x % tnum_gpu;
+    const int tid     = blockIdx.x * tnum_gpu + lane_id;
+
+    const P* ptrs[ngpus];
+    P* peer_tmps[ngpus];
+#pragma unroll
+    for(int i = 0; i < ngpus; ++i)
+    {
+        ptrs[i]      = (const P*)_dp->ptrs[i];
+        peer_tmps[i] = get_tmp_buf<P>(sg.signals[i]);
+    }
+
+    start_sync_acqrel<ngpus>(sg, self_sg, rank);
+
+    // ---------------- phase A: reduce-scatter + cross-device store ----------
+    const int part = m * valid_pack_count / ngpus;
+    for(int idx = tid; idx < part; idx += gridDim.x * tnum_gpu)
+    {
+        const int flat_idx  = rank * part + idx;
+        const int row       = flat_idx / valid_pack_count;
+        const int col       = flat_idx % valid_pack_count;
+        const int input_idx = row * input_pack_count + col;
+
+        P input_reg                                         = ptrs[warp_id][input_idx];
+        *(reinterpret_cast<P*>(&tmp_smem[0]) + threadIdx.x) = input_reg;
+        __syncthreads();
+        if(warp_id == 0)
+        {
+            A add_reg;
+#pragma unroll
+            for(int i = 0; i < pack_size; ++i)
+            {
+                add_reg[i] = upcast_s(tmp_smem[pack_size * threadIdx.x + i]);
+            }
+#pragma unroll
+            for(int i = 1; i < ngpus; ++i)
+            {
+#pragma unroll
+                for(int j = 0; j < pack_size; ++j)
+                {
+                    add_reg[j] +=
+                        upcast_s(tmp_smem[i * pack_size * tnum_gpu + pack_size * threadIdx.x + j]);
+                }
+            }
+            P add_rslt;
+#pragma unroll
+            for(int i = 0; i < pack_size; ++i)
+            {
+                add_rslt[i] = downcast_s<T>(add_reg[i]);
+            }
+            // must happen before the store: a -0.0 lane would read as "not yet
+            // arrived" on the consumer side and hang it forever.
+            lamport_canonicalize<T, pack_size>(add_rslt);
+            *(reinterpret_cast<P*>(&tmp_smem[0]) + lane_id) = add_rslt;
+        }
+        __syncthreads();
+
+        P rslt                                = *(reinterpret_cast<P*>(&tmp_smem[0]) + lane_id);
+        peer_tmps[warp_id][rank * part + idx] = rslt;
+    }
+
+    // Publish this block's stores. No barrier: peers are woken by the data
+    // itself, and the consumer below spins for whatever has not landed yet.
+    __syncthreads();
+    __threadfence_system();
+
+    // ---------------- phase B: Lamport spin + RMSNorm -----------------------
+    P* tmps = get_tmp_buf<P>(sg.signals[rank]);
+
+    for(int bid = blockIdx.x; bid < m; bid += gridDim.x)
+    {
+        float square_sum = 0.0f;
+        A rms_inp_f32[n_loop];
+        P w_arr[n_loop];
+#pragma unroll
+        for(int n_iter = 0; n_iter < n_loop; ++n_iter)
+        {
+            if(n_iter * tnum + threadIdx.x < valid_pack_count)
+            {
+                const int read_idx = bid * valid_pack_count + n_iter * tnum + threadIdx.x;
+                P reduce_out_pack  = lamport_spin_load<T, pack_size>(&tmps[read_idx]);
+                lamport_arm<T, pack_size>(&tmps[read_idx]);
+                P residual_inp_pack = *(reinterpret_cast<P*>(residual_inp) + read_idx);
+                w_arr[n_iter] = *(reinterpret_cast<P*>(weight) + n_iter * tnum + threadIdx.x);
+                A reduce_pack;
+#pragma unroll
+                for(int i = 0; i < pack_size; ++i)
+                {
+                    float ar_out           = upcast_s(reduce_out_pack[i]);
+                    float res_inp          = upcast_s(residual_inp_pack[i]);
+                    float rms_inp          = ar_out + res_inp;
+                    rms_inp_f32[n_iter][i] = rms_inp;
+                    reduce_pack[i]         = rms_inp * rms_inp;
+                }
+                square_sum += packReduce<AddFunctor, float, pack_size>(reduce_pack);
+            }
+        }
+        // smem aliases tmp_smem; phase A is finished for this block.
+        smem[threadIdx.x] = square_sum;
+        __syncthreads();
+        smemReduceSum<tnum>(&smem[0]);
+        square_sum        = smem[0];
+        const float denom = rsqrtf(square_sum / n + eps);
+#pragma unroll
+        for(int n_iter = 0; n_iter < n_loop; ++n_iter)
+        {
+            if(n_iter * tnum + threadIdx.x < valid_pack_count)
+            {
+                P rmsnorm_rslt;
+                P rmsnorm_inp;
+#pragma unroll
+                for(int i = 0; i < pack_size; ++i)
+                {
+                    float x_f32 = rms_inp_f32[n_iter][i];
+                    float w_f32 = upcast_s(w_arr[n_iter][i]);
+                    if constexpr(GEMMA_NORM)
+                        w_f32 += 1.0f;
+                    rmsnorm_inp[i]  = downcast_s<T>(x_f32);
+                    rmsnorm_rslt[i] = downcast_s<T>(x_f32 * w_f32 * denom);
+                }
+                const int read_idx = bid * valid_pack_count + n_iter * tnum + threadIdx.x;
+                const int out_idx  = bid * out_pack_count + n_iter * tnum + threadIdx.x;
+                *(reinterpret_cast<P*>(results) + out_idx)       = rmsnorm_rslt;
+                *(reinterpret_cast<P*>(residual_out) + read_idx) = rmsnorm_inp;
+            }
+        }
+        for(int tail_offset = threadIdx.x; tail_offset < tail_pack_count;
+            tail_offset += blockDim.x)
+        {
+            P zero_pack{};
+            const int tail_idx = bid * out_pack_count + valid_pack_count + tail_offset;
+            *(reinterpret_cast<P*>(results) + tail_idx) = zero_pack;
+        }
+        // next bid iteration reuses smem
+        __syncthreads();
+    }
+}
+
+inline bool ar_rmsnorm_lamport_enabled()
+{
+    static const bool enabled = []() {
+        const char* v = std::getenv("AITER_AR_RMSNORM_LAMPORT");
+        return v != nullptr && v[0] == '1';
+    }();
+    return enabled;
+}
+
+// Arm the sentinel for a tmp buffer the first time it is used, and again if a
+// later call needs a larger region than has ever been armed. Steady state costs
+// nothing: the consumer re-arms every pack it reads.
+template <typename T>
+inline void lamport_ensure_armed(hipStream_t stream, RankSignals sg, int rank, int pack_count)
+{
+    static std::mutex mu;
+    static std::unordered_map<void*, int> armed;
+    void* key = (void*)sg.signals[rank];
+    std::lock_guard<std::mutex> lk(mu);
+    auto it = armed.find(key);
+    if(it != armed.end() && it->second >= pack_count)
+        return;
+    const int blocks = std::min((pack_count + 255) / 256, 1024);
+    lamport_prefill_sentinel<T><<<blocks, 256, 0, stream>>>(sg, rank, pack_count);
+    armed[key] = pack_count;
+}
 template <typename T, int n_loop, bool GEMMA_NORM = false>
 __global__ void __launch_bounds__(256, 1)
     local_device_load_rmsnorm_512n(RankSignals sg,
@@ -4153,6 +4542,100 @@ void dispatchFusedAllReduceRMSNorm(hipStream_t stream,
                                                                         stream);           \
         }                                                                                  \
         return;                                                                            \
+    }
+
+    // ---- opt-in single-kernel Lamport path (AITER_AR_RMSNORM_LAMPORT=1) ----
+    // Replaces the reduce_scatter_cross_device_store + local_device_load_rmsnorm
+    // pair with one kernel, removing the end_sync barrier between them.
+    if(ar_rmsnorm_lamport_enabled())
+    {
+        constexpr int lam_tnum = 512;
+        const int lam_packs    = n / pack_size;
+        const int lam_n_loop   = (lam_packs + lam_tnum - 1) / lam_tnum;
+        const bool lam_ok      = (n % pack_size == 0) && (lam_packs >= 64) &&
+                            (lam_n_loop >= 1 && lam_n_loop <= 4) &&
+                            ((m * lam_packs) % world_size_ == 0) &&
+                            (world_size_ == 2 || world_size_ == 4 || world_size_ == 8);
+        if(lam_ok)
+        {
+            lamport_ensure_armed<T>(stream, sg_, rank_, m * lam_packs);
+            dim3 lam_block(lam_tnum);
+            // IMPORTANT: this kernel is *persistent-style* -- a block spins on data
+            // produced by other blocks of the same grid.  If the grid is larger than
+            // what fits resident on the device, the unscheduled producer blocks can
+            // never run and the resident consumers spin forever.  So the grid must be
+            // clamped to the co-resident block count for the exact instantiation.
+            int lam_blocks = std::max(1, std::min(m, static_cast<int>(num_cu) * 2));
+
+#define LAMPORT_LAUNCH(NGPUS, NLOOP, GEMMA)                                        \
+    do                                                                             \
+    {                                                                              \
+        auto lam_kptr = fused_allreduce_rmsnorm_lamport<T, NGPUS, lam_tnum, NLOOP, GEMMA>; \
+        int lam_occ   = 0;                                                         \
+        if(hipOccupancyMaxActiveBlocksPerMultiprocessor(                           \
+               &lam_occ, reinterpret_cast<const void*>(lam_kptr), lam_tnum, 0) !=  \
+               hipSuccess ||                                                       \
+           lam_occ < 1)                                                            \
+        {                                                                          \
+            lam_occ = 1;                                                           \
+        }                                                                          \
+        int lam_cap = static_cast<int>(num_cu) * lam_occ;                          \
+        dim3 lam_grid(std::max(1, std::min(lam_blocks, lam_cap)));                 \
+        lam_kptr                                                                   \
+        <<<lam_grid, lam_block, 0, stream>>>(ptrs,                                 \
+                                             sg_,                                  \
+                                             self_sg_,                             \
+                                             rank_,                                \
+                                             residual_inp,                         \
+                                             residual_out,                         \
+                                             output,                               \
+                                             weight,                               \
+                                             eps,                                  \
+                                             m,                                    \
+                                             n,                                    \
+                                             input_hidden_dim,                     \
+                                             out_n);                               \
+    } while(0)
+
+#define LAMPORT_DISPATCH_NLOOP(NGPUS)                                              \
+    switch(lam_n_loop)                                                             \
+    {                                                                              \
+    case 1:                                                                        \
+        if(gemma_norm)                                                             \
+            LAMPORT_LAUNCH(NGPUS, 1, true);                                        \
+        else                                                                       \
+            LAMPORT_LAUNCH(NGPUS, 1, false);                                       \
+        break;                                                                     \
+    case 2:                                                                        \
+        if(gemma_norm)                                                             \
+            LAMPORT_LAUNCH(NGPUS, 2, true);                                        \
+        else                                                                       \
+            LAMPORT_LAUNCH(NGPUS, 2, false);                                       \
+        break;                                                                     \
+    case 3:                                                                        \
+        if(gemma_norm)                                                             \
+            LAMPORT_LAUNCH(NGPUS, 3, true);                                        \
+        else                                                                       \
+            LAMPORT_LAUNCH(NGPUS, 3, false);                                       \
+        break;                                                                     \
+    default:                                                                       \
+        if(gemma_norm)                                                             \
+            LAMPORT_LAUNCH(NGPUS, 4, true);                                        \
+        else                                                                       \
+            LAMPORT_LAUNCH(NGPUS, 4, false);                                       \
+        break;                                                                     \
+    }
+
+            switch(world_size_)
+            {
+            case 8: LAMPORT_DISPATCH_NLOOP(8); break;
+            case 4: LAMPORT_DISPATCH_NLOOP(4); break;
+            default: LAMPORT_DISPATCH_NLOOP(2); break;
+            }
+#undef LAMPORT_DISPATCH_NLOOP
+#undef LAMPORT_LAUNCH
+            return;
+        }
     }
 
     // step 1, run reduce-scatter + allgather cross device save
