@@ -4,6 +4,7 @@
 import os
 from abc import ABC, abstractmethod
 from itertools import product
+from threading import RLock
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -16,6 +17,8 @@ from flydsl.expr import ptrtoint, range_constexpr
 from flydsl.expr.typing import T
 
 from aiter.ops.flydsl.kernels import buffer_ops, vector
+
+_FLYDSL_COMPILE_LOCK = RLock()
 
 # Global toggle for the amdgpu-kernarg-preload compile hint used by the flydsl
 # kernels. Enabled by default; set AITER_FLYDSL_KERNARG_PRELOAD=0 to disable it
@@ -60,17 +63,32 @@ def _run_compiled(exe, *args):
     if cf is not None:
         cf(*args)
         return
-    try:
-        cf = flyc.compile(exe, *args)
-        exe._cf = cf
-    except Exception:
-        # flyc.compile leaks ir.Context on failure; pop it so a retry takes the right path.
-        try:
-            while ir.Context.current is not None:
-                ir.Context.current.__exit__(None, None, None)
-        except Exception:  # noqa: BLE001, S110
-            pass
-        raise
+
+    # Multiple model-worker threads can reach the same JIT function before its
+    # first compile finishes. Serialize that cold path and check the cache again
+    # under the lock; otherwise every racing thread performs Python/MLIR tracing.
+    compiled_here = False
+    with _FLYDSL_COMPILE_LOCK:
+        cf = getattr(exe, "_cf", None)
+        if cf is None:
+            try:
+                cf = flyc.compile(exe, *args)
+                exe._cf = cf
+                compiled_here = True
+            except Exception:
+                # flyc.compile leaks ir.Context on failure; pop it so a retry
+                # takes the right path.
+                try:
+                    while ir.Context.current is not None:
+                        ir.Context.current.__exit__(None, None, None)
+                except Exception:  # noqa: BLE001, S110
+                    pass
+                raise
+
+    # flyc.compile already executes the first invocation. Threads that lost
+    # the race still need to dispatch their own invocation after the lock.
+    if not compiled_here:
+        cf(*args)
 
 
 def _to_raw(v):

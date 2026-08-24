@@ -8,6 +8,7 @@ from __future__ import annotations
 import functools
 import re
 from itertools import product
+from threading import RLock
 
 import flydsl.expr as fx
 import torch
@@ -93,6 +94,7 @@ KERNEL_CONFIG_VARIANTS = [
 ]
 
 _SPLITK_HGEMM_KERNELS: dict[str, dict] = {}
+_FLYDSL_HGEMM_FACTORY_LOCK = RLock()
 
 
 def _normalize_supported_kernel_metadata(
@@ -856,6 +858,14 @@ def _compile_flydsl_hgemm(
     return launcher
 
 
+def _get_flydsl_hgemm_launcher(*args, **kwargs):
+    # functools.lru_cache may execute the wrapped function more than once when
+    # identical cold misses race. Serialize factory lookup so all threads get
+    # the same JIT function object and therefore share its compiled `_cf`.
+    with _FLYDSL_HGEMM_FACTORY_LOCK:
+        return _compile_flydsl_hgemm(*args, **kwargs)
+
+
 def flydsl_hgemm(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -912,7 +922,7 @@ def flydsl_hgemm(
     resolved_kernel_family = (
         KERNEL_FAMILY_HGEMM if kernel_family is None else kernel_family
     )
-    launcher = _compile_flydsl_hgemm(
+    launcher = _get_flydsl_hgemm_launcher(
         kernel_dtype,
         m,
         n,
