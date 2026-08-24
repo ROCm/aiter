@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
 """High-level FlyDSL HSTU Attention Forward API."""
 
@@ -274,7 +274,7 @@ def _compile_launcher(
         has_targets=has_targets,
     )
 
-    # Default hueristic config
+    # Default heuristic config
     default_config = _get_default_config(
         hidden_dim=hidden_dim,
         head_dim=head_dim,

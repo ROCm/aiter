@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+
 """hstu_attention_fwd - FlyDSL kernel
 
 out_i = (1/N) * sum_j valid(i,j) * silu(alpha * q_i * k_j^T) * v_j   (N = max_seq_len)
@@ -41,13 +44,6 @@ from flydsl.utils.smem_allocator import SMEM_CAPACITY_MAP
 
 _LOG2E = host_math.log2(host_math.e)
 
-# s_waitcnt vmcnt encoding: vmcnt is split lo[3:0] @ bit 0, hi[5:4] @ bit 14; lgkmcnt(63) and
-# expcnt(7) stay maximal so only vmcnt is constrained.
-_VMCNT_LO_MASK = 0xF
-_LGKMCNT_EXPCNT_BASE = 0x3F70
-_VMCNT_HI_SHIFT = 14
-_VMCNT_HI_MASK = 0x3
-
 
 def _dtype_to_elem_type(dtype_str: str):
     if dtype_str == "f16":
@@ -76,7 +72,7 @@ def _arch_dma_params(arch: str | None = None):
 
     K columns are XOR-swizzled off LDS banks: swizzled_col = col ^ ((row & (ROWS-1)) << SHIFT).
     gfx942: 32 banks -> dword DMA -> (16, 2); gfx950: 64 banks -> dwordx4 DMA -> (8, 3).
-    Both tile a 64-element block and the mask maxes < 64, so the XOR stays in-row (K_STRIDE % 64 == 0).
+    Both tile a 64-element block and the mask maxes < 64, so the XOR stays in-row (HEAD_DIM_K % 64 == 0).
     """
     if arch is None:
         arch = get_rocm_arch()
@@ -88,11 +84,19 @@ def _arch_dma_params(arch: str | None = None):
 
 
 def _waitcnt_vm_n(n: int):
-    """s_waitcnt vmcnt(n) only (lgkmcnt=63, expcnt=7) so V reg loads stay outstanding across the K DMA."""
+    """s_waitcnt vmcnt(n) only (lgkmcnt=63, expcnt=7) so V reg loads stay outstanding across the K DMA.
+
+    vmcnt is split across the immediate: lo[3:0] @ bit 0, hi[5:4] @ bit 14. The lgkmcnt/expcnt
+    fields stay maximal (63/7) so only vmcnt is constrained.
+    """
+    VMCNT_LO_MASK = 0xF
+    LGKMCNT_EXPCNT_BASE = 0x3F70
+    VMCNT_HI_SHIFT = 14
+    VMCNT_HI_MASK = 0x3
     val = (
-        (n & _VMCNT_LO_MASK)
-        | _LGKMCNT_EXPCNT_BASE
-        | (((n >> 4) & _VMCNT_HI_MASK) << _VMCNT_HI_SHIFT)
+        (n & VMCNT_LO_MASK)
+        | LGKMCNT_EXPCNT_BASE
+        | (((n >> 4) & VMCNT_HI_MASK) << VMCNT_HI_SHIFT)
     )
     rocdl.s_waitcnt(val)
 
@@ -243,9 +247,10 @@ def build_hstu_attention_fwd(
 
     # real 16-wide contraction steps (Q side)
     K_STEPS = head_dim // MFMA_K
-    # k_swz_col has period 64, so a K_STRIDE < 64 swizzles out of row and corrupts GEMM2's A-operand.
+    # k_swz_col has period 64, so a K stride < 64 swizzles out of row and corrupts GEMM2's A-operand.
     # Round the K stride up to 64; the extra columns over-fetch (buffer bounds -> 0) against a zero Q
-    # operand and contribute nothing. head_dim % 64 == 0 leaves HEAD_DIM_K == head_dim.
+    # operand and contribute nothing. head_dim % 64 == 0 leaves HEAD_DIM_K == head_dim. HEAD_DIM_K
+    # doubles as the K LDS row pitch (64-aligned, so the XOR swizzle stays in-row).
     HEAD_DIM_K = ((head_dim + 63) // 64) * 64
     # Column over-fetch guard is only real when padded (HEAD_DIM_K > head_dim); otherwise the lane
     # column max is < head_dim, so it is compile-time true and dropped (else a live runtime select).
@@ -254,9 +259,6 @@ def build_hstu_attention_fwd(
     K_STEPS_K = HEAD_DIM_K // MFMA_K
     # GEMM2 output chunks (per-lane O accumulators)
     D_CHUNKS = hidden_dim // MFMA_M
-
-    # K LDS tile: XOR-swizzled, K_STRIDE == HEAD_DIM_K (64-aligned so the swizzle stays in-row).
-    K_STRIDE = HEAD_DIM_K
 
     # V LDS: store V transposed as [d, kv] so GEMM2's B-operand (4 consecutive kv for a d) is
     # contiguous -> one ds_read_b64 rather than 4x ds_read_u16. The +8 pads the [d, kv] row stride
@@ -304,13 +306,13 @@ def build_hstu_attention_fwd(
     NUM_BATCHES_V = max(1, BLOCK_N // ROWS_PER_BATCH_V)
     V_NEEDS_GUARD = ROWS_PER_BATCH_V > BLOCK_N
 
-    # LDS map: [K tile][V tile]. K is XOR-swizzled by column ([BLOCK_N, K_STRIDE]); V is stored
+    # LDS map: [K tile][V tile]. K is XOR-swizzled by column ([BLOCK_N, HEAD_DIM_K]); V is stored
     # transposed ([hidden_dim, V_T_STRIDE]) so GEMM2's B-operand reads 4 consecutive kv per
     # ds_read_b64. Each field is a 16B-aligned fx.Array; SharedAllocator sizes the static LDS
     # global for us (no manual _align / finalize / get_base).
     @fx.struct
     class SharedStorage:
-        k: fx.Array[elem_dtype, BLOCK_N * K_STRIDE, 16]
+        k: fx.Array[elem_dtype, BLOCK_N * HEAD_DIM_K, 16]
         v: fx.Array[elem_dtype, hidden_dim * V_T_STRIDE, 16]
 
     # ---- Device Kernel ----
@@ -397,13 +399,13 @@ def build_hstu_attention_fwd(
         # no manual row*stride+col). Column indices are computed directly in MFMA_LANE_K-group units
         # (see k_swz_grp and the read/store helpers) so the hot path never issues a runtime divide.
         # Views are taken once here in the enclosing region so they dominate both KV loops. k_smem is
-        # K[kv, d] swizzled; v_smem is V[d, kv] transposed. Both column strides (K_STRIDE, V_T_STRIDE)
+        # K[kv, d] swizzled; v_smem is V[d, kv] transposed. Both column strides (HEAD_DIM_K, V_T_STRIDE)
         # are MFMA_LANE_K-aligned, and every column index lands on a group boundary.
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
         k_smem = lds.k.view(
             fx.make_layout(
-                (BLOCK_N, K_STRIDE // MFMA_LANE_K, MFMA_LANE_K),
-                (K_STRIDE, MFMA_LANE_K, 1),
+                (BLOCK_N, HEAD_DIM_K // MFMA_LANE_K, MFMA_LANE_K),
+                (HEAD_DIM_K, MFMA_LANE_K, 1),
             )
         )
         v_smem = lds.v.view(
@@ -454,7 +456,7 @@ def build_hstu_attention_fwd(
         # exp2(x*-log2e) == e^-x, so amdgcn.exp2/rcp build sigmoid(alpha*s) without a slow exp. Fuse
         # alpha and -log2e into one scale g = s*(alpha*-log2e): it is both the exp2 arg and the outer
         # factor p = g*sigm = (-log2e)*silu(alpha*s), so the loop does 2 muls not 3. The residual
-        # -1/log2e rides the O-epilogue 1/N mul. Fast-fp comes from the launch passthrough attrs.
+        # -1/log2e rides the O-epilogue 1/N mul. Fast-fp comes from _hstu_compile_hints.
         c_alpha_neg_log2e = fx.Float32(alpha * -_LOG2E)
         c_one_f = fx.Float32(1.0)
         c_zero_f = fx.Float32(0.0)
@@ -920,11 +922,6 @@ def build_hstu_attention_fwd(
             hz_total,
             inv_n,
             value_attrs={
-                "passthrough": [
-                    ["denormal-fp-math-f32", "preserve-sign,preserve-sign"],
-                    ["no-nans-fp-math", "true"],
-                    ["unsafe-fp-math", "true"],
-                ],
                 "rocdl.waves_per_eu": WAVES_PER_EU,
                 "rocdl.flat_work_group_size": f"{BLOCK_THREADS},{BLOCK_THREADS}",
             },
