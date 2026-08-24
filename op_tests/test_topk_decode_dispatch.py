@@ -174,9 +174,7 @@ def test_column_strided_input_reads_the_view_not_the_buffer(claimed_stride1):
     # The dense buffer behind the view is the wrong answer this densification
     # exists to prevent, so a run that returns it has to fail here.
     wrong = torch.topk(wide[:, :width], k, dim=1).indices
-    assert not torch.equal(
-        indices.long().sort(dim=1).values, wrong.sort(dim=1).values
-    )
+    assert not torch.equal(indices.long().sort(dim=1).values, wrong.sort(dim=1).values)
 
 
 if __name__ == "__main__":
