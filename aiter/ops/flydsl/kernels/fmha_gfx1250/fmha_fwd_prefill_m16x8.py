@@ -96,6 +96,20 @@ N_KV_PP = 2
 # log2(e): exp(x) = exp2(x * LOG2E). Softmax uses the native ISA exp2 intrinsic.
 LOG2E = 1.4426950408889634
 
+# Deferred oaccu rescale (FAv4 innovation, hk_mla spec §9.1.1). Rescaling the
+# running O accumulator by corr = exp(m_prev - m_new) is a full-width VALU pass
+# (d_tiles*8 f32/lane) every tile, but corr == 1 when the running max doesn't
+# move. So keep m STALE while the tile's row max stays within RESCALE_THRESHOLD
+# logit units of it: P = exp2(S - m_stale) accumulates against the un-rescaled
+# oaccu/denom, staying consistent. The per-lane test is promoted to wave-uniform
+# via ballot (any lane over threshold => the whole wave rescales), so the caller
+# can gate the wide multiply with one non-divergent scf.if. Since our exp is
+# exp2((s-m)*LOG2E) = e^(s-m) (natural logits), threshold 8.0 => defer until the
+# max would move by e^8 ~ 2981x, far under the e^88 fp32 exp overflow wall.
+# Set ENABLE_DEFER_RESCALE=False (or threshold < 0) to always rescale.
+ENABLE_DEFER_RESCALE = True
+RESCALE_THRESHOLD = 8.0
+
 # NOTE: the remaining tiling constants (chunk sizes, K/V write-tile + V swizzle
 # granularity) live inside mha_buffer_managers.py — they are intrinsic to the
 # managers' LDS layouts, so the kernel no longer declares them here.
@@ -260,11 +274,16 @@ def _softmax(*, s, m_prev, d_prev, lane_idx, n_block,
     Args:
       m_prev, d_prev: running max / denom (fx.Float32, shared by the l<->l^16 pair).
 
-    Returns ``(p, m_new, d_new, corr)``:
+    Returns ``(p, m_new, d_new, corr, do_rescale)``:
       p:     list of NKV v8 **bf16** — P^T = exp(S^T - m_new) (PV B-operand).
-      m_new: updated running max (fx.Float32).
+      m_new: updated running max (fx.Float32). Kept STALE (== m_prev) when the
+             deferred-rescale ballot did not fire (FAv4, §9.1.1).
       d_new: updated running denom = corr*d_prev + rowsum(p) (fx.Float32).
-      corr:  exp(m_prev - m_new), the O-accumulator rescale factor (fx.Float32).
+      corr:  exp(m_prev - m_new), the O-accumulator rescale factor (fx.Float32);
+             == 1 on the deferred (stale) path since m_new == m_prev.
+      do_rescale: wave-uniform i1 ir.Value — True when the running max moved past
+             RESCALE_THRESHOLD so the caller must apply corr to oaccu; None when
+             deferral is compiled out (caller always rescales). See ENABLE_DEFER_RESCALE.
     """
     NKV = n_block // WMMA_N
     f32 = ir.F32Type.get()
@@ -319,7 +338,25 @@ def _softmax(*, s, m_prev, d_prev, lane_idx, n_block,
     for v in s_masked[1:]:
         local_max = fmax(local_max, v)
     row_max = fmax(local_max, peer(local_max))
-    m_new = fmax(m_prev, row_max)
+    m_full = fmax(m_prev, row_max)
+
+    # ---- Deferred oaccu rescale decision (FAv4, hk_mla spec 9.1.1). Keep m STALE while
+    # the running max barely moves: if NO lane's row_max exceeds m_prev by more than
+    # RESCALE_THRESHOLD logits, defer -> m_new = m_prev, corr = exp(0) = 1, and the caller
+    # SKIPS the wide `o_acc *= corr` multiply. Promote the per-lane test to wave-uniform
+    # via ballot so the caller's rescale branch is non-divergent. A NaN diff (a fully
+    # masked lane sees row_max = -inf, m_prev = -inf seed -> -inf - -inf = NaN) fails the
+    # ORDERED OGT -> never spuriously forces a rescale. Safe on the stale path because
+    # row_max - m_prev <= 8 there, so p = exp(S - m_prev) <= e^8 (no fp32 overflow). ----
+    if ENABLE_DEFER_RESCALE and RESCALE_THRESHOLD >= 0.0:
+        need = arith.cmpf(arith.CmpFPredicate.OGT,
+                          _raw(fsub(row_max, m_prev)), _raw(fx.Float32(RESCALE_THRESHOLD)))
+        mask = rocdl.ballot(ir.IntegerType.get_signless(32), need)
+        do_rescale = arith.cmpi(arith.CmpIPredicate.ne, mask, _raw(fx.Int32(0)))
+        m_new = fx.Float32(arith.select(do_rescale, _raw(m_full), _raw(m_prev)))
+    else:
+        do_rescale = None
+        m_new = m_full
 
     # corr = exp(m_prev - m_new); neg_m = -(m_new * log2e) for the fused p exp.
     if q_min is not None:
@@ -351,7 +388,7 @@ def _softmax(*, s, m_prev, d_prev, lane_idx, n_block,
         p.append(fx.Vector.from_elements(pe, fx.Float32).to(fx.BFloat16))
 
     d_new = fadd(fmul(corr, d_prev), fadd(local_sum, peer(local_sum)))
-    return p, m_new, d_new, corr
+    return p, m_new, d_new, corr, do_rescale
 
 
 def _pv_gemm(*, v_values, p, v_hdim, n_block, o_acc=None):
@@ -766,7 +803,7 @@ def _core_attention(
         # / standalone tail mask). ----
         q_max = seq_idx + causal_off + window_right if mask_right else None
         q_min = seq_idx + causal_off - window_left if mask_left else None
-        p, m_new, d_new, corr = _softmax(
+        p, m_new, d_new, corr, do_rescale = _softmax(
             s=s,
             m_prev=m_prev,
             d_prev=d_prev,
@@ -778,9 +815,26 @@ def _core_attention(
             kv_len=kv_len,
         )
 
-        # ---- Rescale the running O by corr, then GEMM2 accumulates this tile. ----
+        # ---- Rescale the running O by corr, then GEMM2 accumulates this tile. When
+        # deferral is active (do_rescale is a wave-uniform i1) the wide `o_acc *= corr`
+        # multiply (d_tiles*8 f32/lane) is gated behind a non-divergent scf.if that fires
+        # only when the running max actually moved; on the stale path corr == 1 so the
+        # else-branch passes o_acc through untouched. do_rescale is None -> deferral
+        # compiled out, keep the unconditional multiply. ----
         corr_vec = fx.Vector.from_elements([corr], fx.Float32).broadcast_to(8)
-        o_resc = [fx.Vector(_ir(o_acc[dt])) * corr_vec for dt in range(d_tiles)]
+        o_vecs = [fx.Vector(_ir(o_acc[dt])) for dt in range(d_tiles)]
+        if do_rescale is None:
+            o_resc = [ov * corr_vec for ov in o_vecs]
+        else:
+            # Gate the wide multiply behind a wave-uniform scf.if (via the file's
+            # scf_if_dispatch idiom): the then-branch rescales, the omitted else-branch
+            # auto-passes o_acc through unchanged. Result types are inferred from o_vecs.
+            o_resc = list(scf_if_dispatch(
+                do_rescale,
+                lambda *_: [ov * corr_vec for ov in o_vecs],
+                result_names=tuple(f"o{dt}" for dt in range(d_tiles)),
+                result_values=o_vecs,
+            ))
         o_new = _pv_gemm(
             v_values=v_values,
             p=p,
