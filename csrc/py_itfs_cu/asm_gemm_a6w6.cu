@@ -143,12 +143,12 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     const size_t expected_B = static_cast<size_t>(Ndim / kTileSize) * nk_pad * kPackedTileBytes;
     const size_t expected_scaleA = static_cast<size_t>(Mdim / kTileSize) * nk_pad * kScaleTileBytes;
     const size_t expected_scaleB = static_cast<size_t>(Ndim / kTileSize) * nk_pad * kScaleTileBytes;
-    AITER_CHECK(A->numel() >= expected_A && B->numel() >= expected_B,
+    AITER_CHECK(A->numel() == expected_A && B->numel() == expected_B,
                 __func__,
-                " packed operand buffer is smaller than the launch requires");
-    AITER_CHECK(A_scale->numel() >= expected_scaleA && B_scale->numel() >= expected_scaleB,
+                " packed operand buffer sizes must exactly match the launch dimensions");
+    AITER_CHECK(A_scale->numel() == expected_scaleA && B_scale->numel() == expected_scaleB,
                 __func__,
-                " packed scale buffer is smaller than the launch requires");
+                " packed scale buffer sizes must exactly match the launch dimensions");
 
     KernelArgs args{};
     size_t arg_size     = sizeof(args);

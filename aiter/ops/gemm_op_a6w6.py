@@ -34,7 +34,9 @@ _GROUPED_SWIZZLE_MAX_N = 64 * _TILE
 _BATCHED_PACK_MIN_ELEMENTS = 32 * 1024 * 1024
 _BATCHED_PACK_BLOCK_M = 64
 _BATCHED_PACK_K_BLOCKS = _K_TILE // _SCALE_GROUP_SIZE
-_QUANT_BACKEND = os.environ.get("AITER_MXFP6_QUANT_BACKEND", "auto").lower()
+_QUANT_BACKEND = (
+    os.environ.get("AITER_MXFP6_QUANT_BACKEND", "").strip().lower() or "auto"
+)
 if _QUANT_BACKEND not in {"auto", "hip", "triton"}:
     raise ValueError(
         "AITER_MXFP6_QUANT_BACKEND must be one of auto, hip, or triton, "
