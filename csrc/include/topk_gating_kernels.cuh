@@ -274,7 +274,12 @@ __global__ void topk_gating_kernel_opt(
     {
         int   e     = threadIdx.x + i * static_cast<int>(WARP_SIZE);
         float score = compute_score<SCORE_FUNC>(static_cast<float>(input_ptr[e]));
-        orig[i]     = score;
+        // Weight 0, not the NaN itself: an invalid expert is only ever selected
+        // when the row has fewer than topk valid ones, and its NaN would then
+        // reach the renorm sum. fmaxf() drops a NaN sum to RENORM_SUM_FLOOR,
+        // rescaling the row's *valid* weights by ~1e20; zero keeps the floor
+        // doing what it documents (all-invalid row -> all-zero weights).
+        orig[i]     = ::isnan(score) ? 0.0f : score;
         vals[i]     = score;
         idxs[i]     = e;
         if(correction_bias != nullptr)
@@ -394,7 +399,8 @@ __global__ void topk_gating_kernel_opt_multiwave(
     {
         int e = lane_id + wave_id * LANES + i * WAVES_PER_TOKEN * LANES;
         float score = compute_score<SCORE_FUNC>(static_cast<float>(input_ptr[e]));
-        orig[i]     = score;
+        // NaN weight -> 0 so it cannot poison the renorm sum; see opt kernel.
+        orig[i]     = ::isnan(score) ? 0.0f : score;
         vals[i]     = score;
         idxs[i]     = e;
         if(correction_bias != nullptr)
@@ -575,7 +581,8 @@ __global__ void topk_gating_kernel_opt_n(
     {
         int   e     = lane_in_group + i * THREADS_PER_ROW;
         float score = compute_score<SCORE_FUNC>(static_cast<float>(input_ptr[e]));
-        orig[i]     = score;
+        // NaN weight -> 0 so it cannot poison the renorm sum; see opt kernel.
+        orig[i]     = ::isnan(score) ? 0.0f : score;
         vals[i]     = score;
         idxs[i]     = e;
         if(correction_bias != nullptr)
@@ -723,6 +730,10 @@ void topk_gating_kernel_prefill(
                 // same reason; softmax does its own below.
                 // NOTE: ::isnan() is compiled away under -ffast-math; see opt kernel.
                 row_chunk[elt] = ::isnan(row_chunk[elt]) ? -INFINITY : row_chunk[elt];
+                // NaN weight -> 0 so it cannot poison the renorm sum; see opt
+                // kernel. Softmax needs no equivalent: it overwrites row_orig
+                // with normalized probabilities below.
+                row_orig[elt]  = ::isnan(score) ? 0.0f : score;
             }
         }
     }
@@ -969,6 +980,11 @@ __global__ void topk_gating_kernel(
         if(correction_bias != nullptr)
             max_val -= static_cast<float>(correction_bias[max_idx]);
         scores[max_idx] = -INFINITY;
+        // -Inf here means the row ran out of valid experts and this slot elected
+        // a sentinel (either a NaN scrubbed at load or an already-taken expert).
+        // Weight it 0 rather than -Inf; see opt kernel for why the sum matters.
+        if(!::isfinite(max_val))
+            max_val = 0.0f;
         if(static_cast<int>(threadIdx.x) == k)
         {
             topk_indice = max_idx;
@@ -1154,6 +1170,11 @@ __global__ void topk_gating_kernel_smem_n(
 
         // Clear winner -- visible to all lanes in this group (LDS coherent in wavefront)
         scores[max_idx] = -INFINITY;
+
+        // Sentinel elected because the row ran out of valid experts; see the
+        // other smem kernel.
+        if(!::isfinite(max_val))
+            max_val = 0.0f;
 
         if(lane_in_row == k)
         {

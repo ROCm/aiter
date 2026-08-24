@@ -258,6 +258,35 @@ def _ref_selection_with_nan(gating_output, bias, score_func):
     return sel.masked_fill(exclude, float("-inf"))
 
 
+def _starved_rows_finite(num_experts, num_tokens, topk, score_func, dtype):
+    """Do rows with fewer valid experts than topk still yield finite weights?
+
+    Such a row cannot fill every slot, so the kernel elects a sentinel for the
+    remainder. If that sentinel reaches the renorm sum, fmaxf() drops the sum
+    to RENORM_SUM_FLOOR and rescales the row's *valid* weights by ~1e20, so a
+    single starved row corrupts the experts it did resolve. Reuses the sweep's
+    token count to keep the same dispatch path as the measured case.
+    """
+    gating_output = _make_gating(num_experts, num_tokens, dtype)
+    gating_output[0, :] = float("nan")  # no valid expert at all
+    if num_tokens > 1:
+        gating_output[1, :] = float("nan")
+        gating_output[1, 5 % num_experts] = 1.0  # exactly one valid expert
+
+    topk_weights = torch.empty((num_tokens, topk), dtype=torch.float32, device="cuda")
+    topk_ids = torch.empty((num_tokens, topk), dtype=torch.int32, device="cuda")
+    aiter.topk_gating(
+        topk_weights,
+        topk_ids,
+        gating_output,
+        None,
+        need_renorm=score_func != "softmax",
+        routed_scaling_factor=2.5,
+        score_func=score_func,
+    )
+    return bool(topk_weights.isfinite().all().item())
+
+
 # ---------------------------------------------------------------------------
 # topk_sigmoid (Llama4 routing, via topk_gating score_func="sigmoid")
 # ---------------------------------------------------------------------------
@@ -529,6 +558,7 @@ def bench_topk_gating_nan(num_experts, num_tokens, topk, score_func, dtype):
     )
     nan_leak = bool(topk_weights.isnan().any().item())
     inf_leak = bool(topk_weights.isinf().any().item())
+    starved_ok = _starved_rows_finite(num_experts, num_tokens, topk, score_func, dtype)
 
     nbytes = (
         num_tokens * num_experts * gating_output.element_size()
@@ -540,6 +570,7 @@ def bench_topk_gating_nan(num_experts, num_tokens, topk, score_func, dtype):
     ret["fused err"] = n_mism / num_tokens
     ret["nan_leak"] = nan_leak
     ret["inf_leak"] = inf_leak
+    ret["starved ok"] = starved_ok
     return ret
 
 
@@ -826,10 +857,16 @@ def main():
             "topk_gating NaN/Inf robustness summary (markdown):\n%s",
             df.to_markdown(index=False),
         )
-        errors = df[(df["fused err"] > 0) | (df["nan_leak"]) | (df["inf_leak"])]
+        errors = df[
+            (df["fused err"] > 0)
+            | (df["nan_leak"])
+            | (df["inf_leak"])
+            | (~df["starved ok"])
+        ]
         if len(errors) > 0:
             print(
-                f"\nERROR: {len(errors)} nan config(s) failed (err>0 or nan/inf leak)!"
+                f"\nERROR: {len(errors)} nan config(s) failed "
+                f"(err>0, nan/inf leak, or non-finite weights on a starved row)!"
             )
             print(errors.to_string(index=False))
             failed_sections.append("nan")
