@@ -155,10 +155,18 @@ class QRInt4:
             eng.compiled(*args)
 
     def compile(self, inp: torch.Tensor, out: torch.Tensor, stream=None) -> None:
-        """Launch every ST engine so JIT finishes before the first wait.
+        """Eager-JIT every ST binary. Optional: first ``allreduce`` JIT-compiles the picked ST.
 
-        All ranks must participate. Compile-only / cache warming belongs in
-        developer scripts, not this host or pytest.
+        Default ST=8 also builds an ST=1 engine for ``num_tiles ≤ GRID``.
+        Skipping this method is correct for a single size class: that
+        ``allreduce`` calls ``flyc.compile`` for the chosen ST only, and a
+        later size that picks the other ST JIT-compiles then.
+
+        ``flyc.compile`` also launches, so this is a real collective: every
+        rank must call it with the same ``inp``/``out`` shape. The warmup
+        tensor may be small; we still launch every engine so a later
+        prefill-sized ``allreduce`` does not JIT mid-collective. ``out`` is
+        overwritten.
         """
         for eng in self._by_st.values():
             self._launch_eng(eng, inp, out, stream)
