@@ -37,7 +37,9 @@ aiter/ops/triton/
 ```
 
 Public wrapper modules live in the categorized folders; the kernel bodies live
-in `_triton_kernels/` (and `_gluon_kernels/`) under the same category path.
+in `_triton_kernels/` at the same relative category path, or in
+`_gluon_kernels/<arch>/` at the same relative category path when the Gluon
+implementation is architecture-specific.
 Tests mirror the same categories under `op_tests/triton_tests/<category>/`.
 Kernel bodies are internal: tests, benchmarks, and external code call the
 public wrappers only — never `_triton_kernels/` / `_gluon_kernels/` directly.
@@ -120,7 +122,8 @@ def _get_config(M: int, N: int, K: int):
 Split-K kernels also share one common second-stage reduce —
 `_gemm_splitk_reduce_kernel` (and `_batched_gemm_splitk_reduce_kernel`) in
 `_triton_kernels/common/splitk_reduce.py` — rather than carrying a per-kernel
-reduce stage. New split-K kernels import it from there.
+reduce stage, regardless of whether the first-stage kernel uses Triton or
+Gluon. New split-K kernels import it from there.
 
 ### Config JSON format
 
@@ -207,14 +210,22 @@ _gemm_a16w16_repr = make_kernel_repr(
     ["BLOCK_SIZE_M", "BLOCK_SIZE_N", "BLOCK_SIZE_K", "GROUP_SIZE_M", "NUM_KSPLIT"],
 )
 
+# Triton entry kernel
 @triton.jit(repr=_gemm_a16w16_repr)
 def _gemm_a16w16_kernel(...):
+    ...
+
+# Gluon uses the same make_kernel_repr callback:
+@gluon.jit(repr=_gemm_a16w16_repr)
+def _gemm_a16w16_gluon_kernel(...):
     ...
 ```
 
 Values are read from `specialization.constants` and sanitized (`None → NONE`,
 bools → `0/1`, strings uppercased with non-alphanumerics folded to `_`).
-**Every new kernel gets a `repr=`** with its meaningful config keys.
+**Every new launchable Triton or Gluon kernel gets a `repr=`** containing its
+meaningful compile-time/tuned config keys. JIT-decorated device helpers that
+cannot be launched independently do not require their own `repr`.
 
 ---
 
@@ -281,14 +292,17 @@ pytest op_tests/triton_tests/gemm/basic/   # one subset
 - Reuse first: check `utils/`, `_triton_kernels/common/`, and existing
   kernels before writing new helpers — don't duplicate code that already
   exists in the tree.
-- Wrapper in the right category folder; kernel body under `_triton_kernels/`
-  (or `_gluon_kernels/`) at the same path, launched only through the wrapper.
-  No new top-level flat files.
+- Wrapper in the right category folder; Triton kernel body under
+  `_triton_kernels/` or Gluon kernel body under `_gluon_kernels/<arch>/` at
+  the same category path, launched only through the wrapper. JIT-decorated
+  device helpers may remain with the entry kernel they support. No new
+  top-level flat files.
 - `_get_config()` is a thin `get_gemm_config(...)` call; split-K goes through
   `compute_splitk_params()`. No tuning values in Python.
 - Config JSON in the **nested layout** (`configs/<arch>/<backend>/<op>/<d_type>/`),
   `M_LEQ/M_GEQ/any` keys, all required params present.
-- `make_kernel_repr(...)` + `@triton.jit(repr=...)`.
+- `make_kernel_repr(...)` + `@triton.jit(repr=...)` for Triton entry kernels,
+  `@gluon.jit(repr=...)` for Gluon entry kernels.
 - Weight/scale shuffling imported from `utils/shuffle.py`.
 - Arch checks against `gfx*` identifiers.
 - Wrapper docstring.

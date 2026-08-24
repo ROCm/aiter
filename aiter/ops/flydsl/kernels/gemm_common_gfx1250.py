@@ -5,9 +5,9 @@ from collections import namedtuple
 import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as llvm_dialect
-from flydsl.expr import arith, gpu, rocdl, tdm_ops
+from flydsl.expr import arith, gpu, rocdl
 from flydsl.expr.arith import _to_raw as _raw
-from flydsl.expr.rocdl import cluster
+from flydsl.expr.rocdl import cluster, tdm_ops
 from flydsl.expr.typing import T
 
 
@@ -24,8 +24,7 @@ def make_lds_copy_ops(bits):
     )
 
     def _view(lds_base_idx, byte_offset):
-        byte_offset = fx.index_cast(T.index, byte_offset)
-        addr_i32 = fx.index_cast(T.i32, lds_base_idx + byte_offset)
+        addr_i32 = fx.Int32(lds_base_idx) + fx.Int32(byte_offset)
         ptr = fx.inttoptr(ptr_ty, addr_i32)
         return fx.Tensor(fx.make_view(ptr, layout))
 
@@ -65,6 +64,39 @@ def make_sgpr_opaque(val_i32):
     return op.res
 
 
+def _raw_lds_ptr(lds_base_idx, byte_offset):
+    """Materialize an LLVM LDS pointer from a pre-extracted byte base."""
+    from flydsl._mlir.dialects import llvm as _llvm
+    from flydsl.expr.arith import ArithValue as _AV
+
+    if not isinstance(_raw(byte_offset).type, ir.IndexType):
+        byte_offset = arith.index_cast(T.index, byte_offset)
+    lds_ptr_ty = ir.Type.parse("!llvm.ptr<3>")
+    total_byte = _AV(lds_base_idx) + byte_offset
+    addr_i32 = _raw(arith.index_cast(T.i32, total_byte))
+    return _llvm.inttoptr(lds_ptr_ty, addr_i32)
+
+
+def lds_load_b128_raw(lds_base_idx, byte_offset):
+    """Load 16 bytes from LDS using a pre-extracted base index (raw LLVM)."""
+    ptr_val = _raw_lds_ptr(lds_base_idx, byte_offset)
+    return llvm_dialect.load(
+        ir.VectorType.get([4], ir.IntegerType.get_signless(32)), ptr_val
+    )
+
+
+def lds_load_b32_raw(lds_base_idx, byte_offset):
+    """Load 4 bytes from LDS as ``i32`` using a pre-extracted base index."""
+    ptr_val = _raw_lds_ptr(lds_base_idx, byte_offset)
+    return llvm_dialect.load(ir.IntegerType.get_signless(32), ptr_val)
+
+
+def lds_store_b128_raw(lds_base_idx, byte_offset, data):
+    """Store 16 bytes to LDS using a pre-extracted base index (raw LLVM)."""
+    ptr_val = _raw_lds_ptr(lds_base_idx, byte_offset)
+    llvm_dialect.store(_raw(data), ptr_val)
+
+
 def workgroup_barrier(use_cluster=False):
     """Issue the appropriate barrier for LDS visibility.
 
@@ -85,6 +117,24 @@ def pipeline_fence(outstanding=0, use_cluster=False):
     """
     tdm_ops.tensor_wait(outstanding)
     workgroup_barrier(use_cluster=use_cluster)
+
+
+WGP_BARRIER_ID = -1
+
+
+def pipeline_fence_signal(outstanding=0, use_cluster=False):
+    """Signal the first half of a split pipeline fence."""
+    tdm_ops.tensor_wait(outstanding)
+    rocdl.s_barrier_signal(WGP_BARRIER_ID)
+    if use_cluster:
+        cluster.cluster_signal_once_per_wg()
+
+
+def pipeline_fence_wait(use_cluster=False):
+    """Wait for the second half of a split pipeline fence."""
+    rocdl.s_barrier_wait(WGP_BARRIER_ID)
+    if use_cluster:
+        cluster.cluster_wait()
 
 
 import math as _math
@@ -301,8 +351,14 @@ __all__ = [
     "fmin_f32",
     "fused_silu_swiglu_elem",
     "fused_situv2_elem",
+    "lds_load_b32_raw",
+    "lds_load_b128_raw",
+    "lds_store_b128_raw",
     "make_lds_copy_ops",
+    "make_sgpr_opaque",
     "pipeline_fence",
+    "pipeline_fence_signal",
+    "pipeline_fence_wait",
     "situv2_consts",
     "workgroup_barrier",
 ]
