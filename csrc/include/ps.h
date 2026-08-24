@@ -4,7 +4,12 @@
 #pragma once
 #define PRINT_DBG 0
 
-#include <torch/extension.h>
+#include "aiter_tensor.h"
+#include <cstdint>
+#include <optional>
+#include <ostream>
+#include <tuple>
+#include <vector>
 
 template <typename T>
 inline T pack_dword(const T low_part, const T high_part)
@@ -86,17 +91,17 @@ struct QTile
 };
 
 
-void get_ps_metadata_v1(const torch::Tensor& seqlens_qo_indptr,     // [batch size + 1]
-                        const torch::Tensor& pages_kv_indptr,       // [batch size + 1]
-                        const torch::Tensor& context_lens,          // [batch size]
+void get_ps_metadata_v1(const aiter_tensor_t& seqlens_qo_indptr,     // [batch size + 1]
+                        const aiter_tensor_t& pages_kv_indptr,       // [batch size + 1]
+                        const aiter_tensor_t& context_lens,          // [batch size]
                         const int32_t        gqa_ratio,
                         const int32_t        num_heads_k,
-                        torch::Tensor&       work_metadata_ptrs,
-                        torch::Tensor&       work_indptr,
-                        torch::Tensor&       work_info,
-                        torch::Tensor&       reduce_indptr,
-                        torch::Tensor&       reduce_final_map,
-                        torch::Tensor&       reduce_partial_map,
+                        aiter_tensor_t&       work_metadata_ptrs,
+                        aiter_tensor_t&       work_indptr,
+                        aiter_tensor_t&       work_info,
+                        aiter_tensor_t&       reduce_indptr,
+                        aiter_tensor_t&       reduce_final_map,
+                        aiter_tensor_t&       reduce_partial_map,
                         const int32_t        qhead_granularity,
                         const int32_t        qlen_granularity,
                         const int32_t        kvlen_granlarity,

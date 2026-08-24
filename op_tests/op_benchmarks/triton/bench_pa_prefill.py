@@ -1,18 +1,19 @@
-import torch
-import sys
 import math
 import random
+import sys
+
+import torch
 import triton
 
 from aiter.ops.triton.attention.pa_prefill import context_attention_fwd
 from aiter.ops.triton.utils.types import str_to_torch_dtype
+from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
-    get_model_configs,
-    get_dtype_bytes,
     get_caller_name_no_ext,
+    get_dtype_bytes,
+    get_model_configs,
     print_vgpr,
 )
-from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 from op_tests.triton_tests.attention.test_pa_prefill import seed_everything
 
 
@@ -207,8 +208,6 @@ def run_benchmark(args):
     x_vals_list = model_benchmark_configs(args)
     x_names = ["model", "BS", "HQ", "HK", "MAX_SEQ_LEN", "HEAD_DIM"]
 
-    model_name = "paged-attn-decode"
-
     line_names = ["Time_(ms)", "TFLOPS", "Bandwidth_(GB/s)"]
     line_vals = ["time", "tflops", "bandwidth"]
 
@@ -267,14 +266,14 @@ def run_benchmark(args):
             num_queries_per_kv=num_queries_per_kv,
             dtype=dtype,
             kv_cache_dtype=kv_cache_dtype,
-            device=[
+            device=next(
                 f"cuda:{i}" for i in range(1 if torch.cuda.device_count() == 1 else 2)
-            ][0],
+            ),
             use_alibi_slope=use_alibi_slope,
         )
 
         num_tokens = query.shape[0]
-        fn = lambda: context_attention_fwd(  # noqa: E731
+        fn = lambda: context_attention_fwd(
             query,
             k,
             v,
@@ -375,7 +374,7 @@ def main():
     args = parse_args()
     if args.print_vgpr:
         print("Retrieving VGPR usage for Triton kernels...")
-        fun = lambda: run_benchmark(args)  # noqa: E731
+        fun = lambda: run_benchmark(args)
         print_vgpr(fun, get_caller_name_no_ext())
         return 0
     run_benchmark(args)

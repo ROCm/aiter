@@ -5,16 +5,15 @@
 
 from __future__ import annotations
 
-
-import os
 import csv
-import torch
-
-
+import os
 from pathlib import Path
+
+import torch
 from flydsl.runtime.device import get_rocm_arch
+
 from .kernels.gdr_decode import create_vk_gdr_decode_kernel
-from .kernels.tensor_shim import get_dtype_str, _run_compiled
+from .kernels.tensor_shim import _run_compiled, get_dtype_str
 
 __all__ = [
     "flydsl_gdr_decode",
@@ -40,7 +39,6 @@ def get_default_kwargs(
     d["NUM_WARPS"] = 4
     d["WARP_THREADS_K"] = 8
     global GDR_GLOBAL_CONFIG_MAP
-    global GDR_GPU_ARCH
     if GDR_GLOBAL_CONFIG_MAP is None:
         _dict = {}
         fname = os.path.join(Path(__file__).resolve().parent, "gdr_decode_tuned.csv")
@@ -98,19 +96,45 @@ def flydsl_gdr_decode(
     use_qk_l2norm: bool,
     need_shuffle_state: bool,
     stream: torch.cuda.Stream = None,
+    read_indices: torch.Tensor | None = None,
+    write_indices: torch.Tensor | None = None,
 ):
     if stream is None:
         stream = torch.cuda.current_stream()
     device = query.device
     dtype = query.dtype
-    for input in [query, key, value, a, b, dt_bias, A_log, indices, out]:
+    read_indices = indices if read_indices is None else read_indices
+    write_indices = indices if write_indices is None else write_indices
+    for input in [
+        query,
+        key,
+        value,
+        a,
+        b,
+        dt_bias,
+        A_log,
+        read_indices,
+        write_indices,
+        out,
+    ]:
         assert input.device == device
     assert state.data_ptr() % 16 == 0
     for input in [key, value, a, b, dt_bias, out]:
         assert input.dtype == dtype
     assert state.dtype in [torch.float, torch.bfloat16]
     assert A_log.dtype in [torch.float, torch.bfloat16]
-    assert indices.dtype == torch.int32
+    assert read_indices.dtype == torch.int32
+    assert write_indices.dtype == torch.int32
+    if query.stride(-1) != 1:
+        raise ValueError(
+            "`query` must have a contiguous last dimension for vectorized loads; "
+            f"got stride {query.stride()}."
+        )
+    if key.stride(-1) != 1:
+        raise ValueError(
+            "`key` must have a contiguous last dimension for vectorized loads; "
+            f"got stride {key.stride()}."
+        )
 
     if need_shuffle_state:
         state_ = state.permute(0, 1, 3, 2).contiguous()
@@ -138,6 +162,9 @@ def flydsl_gdr_decode(
         num_v_heads,
         head_k_dim,
         head_v_dim,
+        query.stride(),
+        key.stride(),
+        value.stride(),
         state_.stride(),
         a.stride(),
         b.stride(),
@@ -147,14 +174,15 @@ def flydsl_gdr_decode(
     with torch.cuda.device(query.device.index):
         _run_compiled(
             exe,
-            query.contiguous(),
-            key.contiguous(),
-            value.contiguous(),
+            query,
+            key,
+            value,
             a,
             b,
             dt_bias.contiguous(),
             A_log.contiguous(),
-            indices.contiguous(),
+            read_indices.contiguous(),
+            write_indices.contiguous(),
             state_,
             out,
             batch_size,

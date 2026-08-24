@@ -11,6 +11,7 @@ Note: Only forward pass is implemented. Backward pass is not supported in aiter.
 
 import triton
 import triton.language as tl
+
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
 _fused_recurrent_gated_delta_rule_fwd_kernel_repr = make_kernel_repr(
@@ -141,7 +142,7 @@ def _fused_recurrent_gated_delta_rule_fwd_kernel(
         p_h0 = h0 + i_nh * K * V + o_k[:, None] * V + o_v[None, :]
         b_h += tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
 
-    for _ in range(0, T):
+    for _ in range(T):
         b_q = tl.load(p_q, mask=mask_k, other=0).to(tl.float32)
         b_k = tl.load(p_k, mask=mask_k, other=0).to(tl.float32)
         b_v = tl.load(p_v, mask=mask_v, other=0).to(tl.float32)

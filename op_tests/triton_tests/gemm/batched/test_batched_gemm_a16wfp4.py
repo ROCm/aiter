@@ -1,9 +1,10 @@
-import torch
 import pytest
+import torch
+
 from aiter.ops.triton.gemm.batched.batched_gemm_a16wfp4 import (
     batched_gemm_a16wfp4,
 )
-import aiter.ops.triton.utils._triton.arch_info as arch_info
+from aiter.ops.triton.utils._triton import arch_info
 
 # Note this is specified by the HW and cannot be changed.
 SCALE_GROUP_SIZE = 32
@@ -117,7 +118,7 @@ def get_x_vals():
     x_vals_with_batch = [
         (b, 2**m, n, k)
         for b in range(1, 17)
-        for m in range(0, 9)
+        for m in range(9)
         for (n, k) in [(512, 128), (128, 512)]
     ]
     # x_vals_with_batch = [(1, 1, 128, 512+128), ] # TODO check
@@ -180,7 +181,7 @@ def test_batched_gemm_a16wfp4(B: int, M: int, N: int, K: int, layout, dtype):
 
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
 
-    x, w, x_scales, w_scales, out = generate_batched_gemm_a16wfp4_inputs(
+    x, w, _x_scales, w_scales, out = generate_batched_gemm_a16wfp4_inputs(
         B, M, N, K, dtype, layout=layout, output=True
     )
 

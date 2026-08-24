@@ -15,8 +15,8 @@ Run:
 import csv
 import os
 import re
-import sys
 import subprocess
+import sys
 import unittest
 
 AITER_ROOT = os.path.dirname(
@@ -63,14 +63,16 @@ def _find_tuned_csvs(pattern):
 
 def _resolve_config_via_aiter(config_property):
     """Resolve config file through AITER_CONFIGS (same path as production).
-    Returns the resolved file path, or None if unavailable."""
+
+    Returns the resolved file path, or None if unavailable.
+    """
     try:
         from aiter.jit.core import AITER_CONFIGS
 
         config_file = getattr(AITER_CONFIGS, config_property, None)
         if config_file and os.path.exists(config_file):
             return config_file
-    except Exception:
+    except Exception:  # noqa: BLE001,S110
         pass
     return None
 
@@ -105,6 +107,7 @@ def _run_config(script, config_csv, timeout=600, extra_args=None):
             timeout=timeout,
             cwd=AITER_ROOT,
             env=env,
+            check=False,
         )
     except subprocess.TimeoutExpired as e:
         raise AssertionError(
@@ -165,7 +168,7 @@ def _parse_all_benchmark_results(lines):
         stripped = line.strip()
         if "| " not in stripped:
             continue
-        if stripped.startswith("Shape") or stripped.startswith("-"):
+        if stripped.startswith(("Shape", "-")):
             continue
         parts = [p.strip() for p in stripped.split("|")]
         if len(parts) < 3:
@@ -318,6 +321,13 @@ TUNER_FAMILIES = {
         "exclude_patterns": ["batched"],
         "config_property": "AITER_CONFIG_GEMM_BF16_FILE",
     },
+    "gdn_k5_opt": {
+        "script": "csrc/gdn_k5/chunk_gdn_h_opt_tune.py",
+        "csv_pattern": "chunk_gdn_h_opt_tuned",
+        "exclude_patterns": ["untuned"],
+        "timeout": 1800,
+        "config_property": "AITER_CONFIG_GDN_K5_OPT_FILE",
+    },
 }
 
 
@@ -412,6 +422,9 @@ class TestRunConfig(unittest.TestCase):
 
     def test_csrc_bf16(self):
         self._test_family("csrc_bf16")
+
+    def test_gdn_k5_opt(self):
+        self._test_family("gdn_k5_opt")
 
 
 @unittest.skipUnless(_gpu_available(), "No GPU available")

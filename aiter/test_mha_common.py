@@ -2,11 +2,14 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import math
-from .bert_padding import pad_input, unpad_input
-from einops import rearrange, repeat
+
 import torch
 import torch.nn.functional as F
+from einops import rearrange, repeat
+
 from aiter import dtypes
+
+from .bert_padding import pad_input, unpad_input
 
 
 def ck_randval_to_dropout_mask(randval, p):
@@ -125,7 +128,7 @@ def attn_bias_from_alibi_slopes(
     causal=False,
     key_leftpad=None,
 ):
-    batch, nheads = slopes.shape
+    _batch, _nheads = slopes.shape
     device = slopes.device
     slopes = rearrange(slopes, "b h -> b h 1 1")
     if causal:
@@ -194,7 +197,7 @@ def generate_qkv(
         input_layout: "BSHD", "BHSD", "SBHD"
     """
     assert not (kvpacked and qkvpacked)
-    batch_size, seqlen_q, nheads, d = q.shape
+    batch_size, seqlen_q, _nheads, d = q.shape
     _, seqlen_k, nheads_k, _ = k.shape
     _, _, _, d_v = v.shape
     assert k.shape == (batch_size, seqlen_k, nheads_k, d)
@@ -369,8 +372,15 @@ def construct_local_mask(
         if query_padding_mask is None
         else rearrange(query_padding_mask.sum(-1), "b -> b 1 1 1")
     )
-    if window_size[0] < 0:
+    if window_size[0] < 0 and window_size[1] < 0:
+        # both edges unbounded: nothing is masked out
+        return (row_idx < 0) | (col_idx < 0)
+    elif window_size[0] < 0:
+        # unbounded left, finite right
         return col_idx > row_idx + sk - sq + window_size[1]
+    elif window_size[1] < 0:
+        # unbounded right, finite left (mirror of the infinite-left branch)
+        return col_idx < row_idx + sk - sq - window_size[0]
     else:
         sk = torch.full_like(col_idx, seqlen_k) if key_padding_mask is None else sk
         return torch.logical_or(
@@ -668,3 +678,49 @@ def attention_ref_with_tol(q, k, v, do, is_fp8=False, **kwargs):
     bwd_tols = [_tol(dq, dq_pt), _tol(dk, dk_pt), _tol(dv, dv_pt)]
 
     return out, (dq, dk, dv), fwd_tol, bwd_tols
+
+
+def opus_ref_lse(q, k, causal, budget=1 << 23):
+    """fp32 logsumexp of the scaled scores, bottom-right causal, GQA-aware.
+
+    attention_ref downcasts its lse to the input dtype, too coarse to check against.
+    Chunked over query rows (`budget` score elements) to bound peak memory.
+    """
+    batch, seqlen_q, nheads, d = q.shape
+    seqlen_k, nheads_k = k.shape[1], k.shape[2]
+    group = nheads // nheads_k
+    scale = d**-0.5
+
+    k_f = k.float()
+    lse = torch.empty((batch, nheads, seqlen_q), dtype=torch.float32, device=q.device)
+    col = torch.arange(seqlen_k, device=q.device)
+    off = seqlen_k - seqlen_q
+    rows = max(1, budget // max(1, batch * nheads * seqlen_k))
+
+    for lo in range(0, seqlen_q, rows):
+        hi = min(lo + rows, seqlen_q)
+        q_c = q[:, lo:hi].float().reshape(batch, hi - lo, nheads_k, group, d)
+        scores = torch.einsum("bthgd,bshd->bhgts", q_c, k_f) * scale
+        if causal:
+            row = torch.arange(lo, hi, device=q.device)[:, None]
+            scores = scores.masked_fill(col > row + off, float("-inf"))
+        lse[:, :, lo:hi] = torch.logsumexp(scores, dim=-1).reshape(
+            batch, nheads, hi - lo
+        )
+    return lse
+
+
+def opus_check_lse(tag, lse, lse_ref):
+    """Compare fp32 LSE against opus_ref_lse.
+
+    0.01 accommodates D=128 folding softmax_scale into bf16 Q (~4e-3 off an fp32
+    post-scale reference); D=192 lands at ~1e-6.
+    """
+    assert lse.dtype == torch.float32, f"{tag}: lse dtype {lse.dtype}, expected float32"
+    assert torch.equal(
+        torch.isneginf(lse), torch.isneginf(lse_ref)
+    ), f"{tag}: -inf (fully-masked row) pattern differs from the reference"
+    finite = ~torch.isneginf(lse_ref)
+    diff = (lse[finite] - lse_ref[finite]).abs().max().item() if finite.any() else 0.0
+    print(f"[{tag}] lse max diff: {diff}")
+    assert diff <= 0.01, f"{tag}: lse diff {diff} > 0.01"

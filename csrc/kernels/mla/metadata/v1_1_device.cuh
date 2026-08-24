@@ -639,8 +639,8 @@ void dispatch_mla_metadata_v1_1_device(const MlaMetadataV1KernelParameter& param
     kn_get_mla_metadata_v1_1<Traits><<<grid, warp_size, lds_size, stream>>>(params, coefs);
 }
 
-void get_mla_metadata_v1_1_device(const torch::Tensor& seqlens_qo_indptr, // [batch size + 1]
-                                  const torch::Tensor& seqlens_kv_indptr, // [batch size + 1]
+void get_mla_metadata_v1_1_device(const aiter_tensor_t& seqlens_qo_indptr, // [batch size + 1]
+                                  const aiter_tensor_t& seqlens_kv_indptr, // [batch size + 1]
                                   const int32_t num_heads_per_head_k,
                                   const int32_t num_heads_k,
                                   const bool is_causal,
@@ -649,12 +649,12 @@ void get_mla_metadata_v1_1_device(const torch::Tensor& seqlens_qo_indptr, // [ba
                                   const int32_t max_seqlen_qo,
                                   const int32_t ori_uni_seqlen_qo,
                                   const int32_t topk,
-                                  torch::Tensor& work_metadata_ptrs,
-                                  torch::Tensor& work_info_set,
-                                  torch::Tensor& work_indptr,
-                                  torch::Tensor& reduce_indptr,
-                                  torch::Tensor& reduce_final_map,
-                                  torch::Tensor& reduce_partial_map)
+                                  aiter_tensor_t& work_metadata_ptrs,
+                                  aiter_tensor_t& work_info_set,
+                                  aiter_tensor_t& work_indptr,
+                                  aiter_tensor_t& reduce_indptr,
+                                  aiter_tensor_t& reduce_final_map,
+                                  aiter_tensor_t& reduce_partial_map)
 {
     // This default settings is for our ASM MLA decode kernel. This kernel supports num_heads=16 and
     // qo size from 1 to 4 without support to split qo for each workgroup. This means that
@@ -662,7 +662,7 @@ void get_mla_metadata_v1_1_device(const torch::Tensor& seqlens_qo_indptr, // [ba
     constexpr int32_t kPackedQoLenPerWg = 128;
     constexpr int32_t kMaxClusterSize   = 1;
 
-    const hipStream_t stream = at::hip::getCurrentHIPStream();
+    const hipStream_t stream = aiter::getCurrentHIPStream();
 
     hipDevice_t dev;
     hipDeviceProp_t dev_prop;
@@ -694,10 +694,10 @@ void get_mla_metadata_v1_1_device(const torch::Tensor& seqlens_qo_indptr, // [ba
         uni_seqlen_qo = 1;
     }
 
-    TORCH_CHECK((num_heads == 16) || (num_heads == 128),
+    AITER_CHECK((num_heads == 16) || (num_heads == 128),
                 __func__,
                 ": only supports #heads in [16, 128], or (#head, uni_seqlen_qo) = (16*N, 1) where "
-                "N is in [2, 8).")
+                "N is in [2, 8).");
 
     const int32_t warp_size = dev_prop.warpSize;
     const int32_t lds_size_in_bytes = [&]() {
@@ -733,28 +733,28 @@ void get_mla_metadata_v1_1_device(const torch::Tensor& seqlens_qo_indptr, // [ba
         return (lds_size > lds_sort_size) ? lds_size : lds_sort_size;
     }();
 
-    TORCH_CHECK(lds_size_in_bytes <= dev_prop.maxSharedMemoryPerMultiProcessor,
+    AITER_CHECK(lds_size_in_bytes <= dev_prop.maxSharedMemoryPerMultiProcessor,
                 __func__,
                 ": There is no enough LDS.");
 
-    // auto opts = seqlens_kv_indptr.options();
-    // auto work_ptrs          = torch::empty({2}, opts.dtype(torch::kUInt64));
-    // auto work_indptr        = torch::empty({num_cu + 1}, opts);
-    // auto work_info_set      = torch::empty({max_works, kSizeMlaWorkInfoInDw}, opts);
-    // auto reduce_indptr      = torch::empty({max_qo_tiles + 1}, opts);
-    // auto reduce_final_map   = torch::empty({max_qo_tiles, kSizeMlaPartialTileInfoInDw}, opts);
-    // auto reduce_partial_map = torch::empty({max_works}, opts);
+    // The output buffers below are allocated Python-side (aiter equivalents of):
+    //   work_ptrs          : [2]                                  u64
+    //   work_indptr        : [num_cu + 1]                         i32
+    //   work_info_set      : [max_works, kSizeMlaWorkInfoInDw]    i32
+    //   reduce_indptr      : [max_qo_tiles + 1]                   i32
+    //   reduce_final_map   : [max_qo_tiles, kSizeMlaPartialTileInfoInDw] i32
+    //   reduce_partial_map : [max_works]                          i32
 
     // kernel input parameters
     MlaMetadataV1KernelParameter params = {};
-    params.p_work_metadata_ptrs         = work_metadata_ptrs.data_ptr<uint64_t>();
-    params.p_work_indptr                = work_indptr.data_ptr<int32_t>();
-    params.p_work_info_set_raw          = work_info_set.data_ptr<int32_t>();
-    params.p_reduce_indptr              = reduce_indptr.data_ptr<int32_t>();
-    params.p_reduce_final_map           = reduce_final_map.data_ptr<int32_t>();
-    params.p_reduce_partial_map         = reduce_partial_map.data_ptr<int32_t>();
-    params.p_seqlens_qo_indptr          = seqlens_qo_indptr.data_ptr<int32_t>();
-    params.p_seqlens_kv_indptr          = seqlens_kv_indptr.data_ptr<int32_t>();
+    params.p_work_metadata_ptrs         = static_cast<uint64_t*>(work_metadata_ptrs.data_ptr());
+    params.p_work_indptr                = static_cast<int32_t*>(work_indptr.data_ptr());
+    params.p_work_info_set_raw          = static_cast<int32_t*>(work_info_set.data_ptr());
+    params.p_reduce_indptr              = static_cast<int32_t*>(reduce_indptr.data_ptr());
+    params.p_reduce_final_map           = static_cast<int32_t*>(reduce_final_map.data_ptr());
+    params.p_reduce_partial_map         = static_cast<int32_t*>(reduce_partial_map.data_ptr());
+    params.p_seqlens_qo_indptr          = static_cast<int32_t*>(seqlens_qo_indptr.data_ptr());
+    params.p_seqlens_kv_indptr          = static_cast<int32_t*>(seqlens_kv_indptr.data_ptr());
     params.num_batches                  = num_batches;
     params.num_heads                    = num_heads;
     params.num_cu                       = num_cu;

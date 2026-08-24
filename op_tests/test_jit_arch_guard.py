@@ -5,7 +5,7 @@
 import os
 import tempfile
 
-import aiter.jit.core as core
+from aiter.jit import core
 from aiter.jit.core import _so_offload_archs
 
 

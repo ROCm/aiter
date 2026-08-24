@@ -5,11 +5,10 @@ import argparse
 import logging
 import os
 from multiprocessing import Pool, freeze_support, set_start_method
-from typing_extensions import Optional
 
+import pandas as pd
 import torch
 import torch.distributed as dist
-import pandas as pd
 
 from aiter import dtypes
 from aiter.dist.communication_op import (
@@ -45,7 +44,7 @@ def qknorm_allreduce(
     head_dim,
     rotary_dim,
     withGraph=False,
-    distributed_init_method: Optional[str] = None,
+    distributed_init_method: str | None = None,
 ):
     device = torch.device(f"cuda:{rankID}")
     torch.cuda.set_device(device)
@@ -78,18 +77,17 @@ def qknorm_allreduce(
 
     if withGraph:
         graph = torch.cuda.CUDAGraph()
-        with graph_capture() as gc:
-            with torch.cuda.graph(graph, stream=gc.stream):
-                q_out, k_out, v_out = method(
-                    qkv_in,
-                    q_w,
-                    k_w,
-                    cos_sin_cache,
-                    position_ids,
-                    head_dim,
-                    rotary_dim,
-                    1e-6,
-                )
+        with graph_capture() as gc, torch.cuda.graph(graph, stream=gc.stream):
+            q_out, k_out, v_out = method(
+                qkv_in,
+                q_w,
+                k_w,
+                cos_sin_cache,
+                position_ids,
+                head_dim,
+                rotary_dim,
+                1e-6,
+            )
         q_out.fill_(0)
         k_out.fill_(0)
         v_out.fill_(0)
@@ -199,7 +197,7 @@ def test_qknorm_allreduce(
     rotary_dim,
     dtype,
     withGraph=False,
-    distributed_init_method: Optional[str] = None,
+    distributed_init_method: str | None = None,
 ):
     token_num = shape[0]
     hidden_dim_q = shape[1]
@@ -256,8 +254,7 @@ def test_qknorm_allreduce(
         )
 
     max_err = 0.0
-    ii = 0
-    for outs, us in rets:
+    for ii, (outs, us) in enumerate(rets):
         msg = f"test_qknorm_allreduce: {shape=} {dtype=} {withGraph=} {us:>8.2f}"
         err_q = checkAllclose(q_outs[ii], outs[0].to(q_outs[ii]), msg=msg)
         err_k = checkAllclose(k_outs[ii], outs[1].to(k_outs[ii]), msg=msg)
@@ -265,7 +262,6 @@ def test_qknorm_allreduce(
         max_err = max(max_err, err_q)
         max_err = max(max_err, err_k)
         max_err = max(max_err, err_v)
-        ii += 1
     return {
         "min_us": min(all_us),
         "max_us": max(all_us),

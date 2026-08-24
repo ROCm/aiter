@@ -1,18 +1,26 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import os
+
 import torch
 import triton
-from typing import Tuple
+
 from aiter.ops.triton._triton_kernels.fusions.fused_kv_cache import (
     _fused_qk_rope_cat_and_cache_mla_kernel as triton_fused_qk_rope_cat_and_cache_mla_kernel,
-    _fused_qk_rope_reshape_and_cache_kernel as triton_fused_qk_rope_reshape_and_cache_kernel,
+)
+from aiter.ops.triton._triton_kernels.fusions.fused_kv_cache import (
     _fused_qk_rope_cosine_cache_llama_kernel,
+)
+from aiter.ops.triton._triton_kernels.fusions.fused_kv_cache import (
+    _fused_qk_rope_reshape_and_cache_kernel as triton_fused_qk_rope_reshape_and_cache_kernel,
 )
 
 try:
     from aiter.ops.triton._gluon_kernels.gfx1250.fusions.fused_kv_cache import (
         _fused_qk_rope_cat_and_cache_mla_kernel as gluon_fused_qk_rope_cat_and_cache_mla_kernel,
+    )
+    from aiter.ops.triton._gluon_kernels.gfx1250.fusions.fused_kv_cache import (
         _fused_qk_rope_reshape_and_cache_kernel as gluon_fused_qk_rope_reshape_and_cache_kernel,
     )
 except:  # noqa: E722
@@ -20,13 +28,15 @@ except:  # noqa: E722
     gluon_fused_qk_rope_reshape_and_cache_kernel = None
 
 from aiter.jit.utils.torch_guard import torch_compile_guard
+from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.types import e4m3_dtype
-from aiter.ops.triton.utils._triton import arch_info
 
 _LOGGER = AiterTritonLogger()
 
 DEVICE_ARCH = arch_info.get_arch()
+
+_BLOCK_H_MIN_TOKENS = int(os.environ.get("AITER_FUSED_KV_CACHE_MIN_TOKENS", "128"))
 
 
 def fused_qk_rope_cat_and_cache_mla_fake_tensor(
@@ -49,7 +59,7 @@ def fused_qk_rope_cat_and_cache_mla_fake_tensor(
     q_out_dtype: torch.dtype = None,
     shuffled_kv_cache: bool = False,
     upcast_operand: bool = False,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     b, qh, d_nope = q_nope.shape
     _, _, d_pe = q_pe.shape
     bk, kh, dk_nope = k_nope.shape
@@ -108,7 +118,7 @@ def fused_qk_rope_cat_and_cache_mla(
     q_out_dtype: torch.dtype = None,
     shuffled_kv_cache: bool = False,
     upcast_operand: bool = False,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Perform RoPE on q_pe and k_pe and concat q_nope with q_pe and k_nope with k_pe along the last dimension
     the concatenated k_nope and k_pe are copied to kv_cache inplace
@@ -150,7 +160,7 @@ def fused_qk_rope_cat_and_cache_mla(
     SCALE_K_WIDTH_ROPE = 4
     if kv_cache_dtype == torch.uint8:
         assert shuffled_kv_cache, "shuffle_kv_cache must be True for FP4 KV cache"
-        b_cache, h_cache, block_size, d_cache = kv_cache.shape
+        _b_cache, h_cache, block_size, d_cache = kv_cache.shape
         SCALE_K_LORA = d_nope // 16
         SCALE_K_ROPE = d_pe // 16
         SCALE_K_WIDTH_NOPE = (
@@ -165,9 +175,9 @@ def fused_qk_rope_cat_and_cache_mla(
         )
     else:
         if shuffled_kv_cache:
-            b_cache, h_cache, block_size, d_cache = kv_cache.shape
+            _b_cache, h_cache, block_size, d_cache = kv_cache.shape
         else:
-            b_cache, h_cache, d_cache = kv_cache.shape
+            _b_cache, h_cache, d_cache = kv_cache.shape
     (b_slot,) = slot_mapping.shape
 
     # allow bk >= b to support prefill + decode mixed scenario
@@ -254,8 +264,13 @@ def fused_qk_rope_cat_and_cache_mla(
     grid = (n_pid, 1, 1)
     if DEVICE_ARCH == "gfx1250":
         _kernel = gluon_fused_qk_rope_cat_and_cache_mla_kernel
+        # The gfx1250 gluon kernel keeps an extra (unused) MAX_EMBD_POS positional
+        # arg for a uniform launch interface with the BLOCK kernel. Pass the
+        # cos/sin cache length to satisfy its signature.
+        _extra_uniform_args = (cos.shape[0],)
     else:
         _kernel = triton_fused_qk_rope_cat_and_cache_mla_kernel
+        _extra_uniform_args = ()
 
     _kernel[grid](
         q_nope,
@@ -274,6 +289,7 @@ def fused_qk_rope_cat_and_cache_mla(
         b,
         b_slot,
         num_decode_toks_for_zeros,
+        *_extra_uniform_args,
         *q_nope.stride(),
         *q_pe.stride(),
         *k_nope.stride(),
@@ -534,9 +550,20 @@ def fused_qk_rope_reshape_and_cache(
         _kernel = gluon_fused_qk_rope_reshape_and_cache_kernel
         _extra_args = {"BLOCK_T": BLOCK_T}
     else:
-        n_pid = t * qh + (t_slot - t) * kh
+        # 1 q-head per program is 2B/lane; tile heads once the grid is big enough.
+        BLOCK_H = 1
+        if t >= _BLOCK_H_MIN_TOKENS:
+            qh_per_kh = qh // kh
+            for cand in (16, 8, 4, 2):
+                if qh % cand == 0 and (cand % qh_per_kh == 0 or qh_per_kh % cand == 0):
+                    BLOCK_H = cand
+                    break
+        n_pid = t * (qh // BLOCK_H) + (t_slot - t) * kh
         _kernel = triton_fused_qk_rope_reshape_and_cache_kernel
-        _extra_args = {}
+        _extra_args = {
+            "BLOCK_H": BLOCK_H,
+            "KH_BLOCK": max(1, BLOCK_H // (qh // kh)),
+        }
     grid = (n_pid, 1, 1)
     _kernel[grid](
         q,
@@ -716,12 +743,12 @@ def fused_qk_rope_cosine_cache_llama(
         cos.stride(0),
         cos.stride(-1),
         *q_out.stride(),
-        key_cache.stride(0) if not flash_layout else key_cache.stride(0),
+        key_cache.stride(0),
         key_cache.stride(1) if not flash_layout else key_cache.stride(2),
         key_cache.stride(2) if not flash_layout else key_cache.stride(3),
         key_cache.stride(3) if not flash_layout else key_cache.stride(1),
         key_cache.stride(4) if not flash_layout else 0,
-        value_cache.stride(0) if not flash_layout else value_cache.stride(0),
+        value_cache.stride(0),
         value_cache.stride(1) if not flash_layout else value_cache.stride(2),
         value_cache.stride(2) if not flash_layout else value_cache.stride(3),
         value_cache.stride(3) if not flash_layout else value_cache.stride(1),

@@ -76,26 +76,26 @@ class FMoeKernel
     bool is_int4                = false;
     uint32_t num_persistent_tgs = 0;
     const char* name            = nullptr;
-    //Kernel is processing 1 token per TG and does not require sorting.
-    bool is_flat_dispatch = false;
+    // flat_mode: 0 = host-sorted, 1 = flat one-token-per-TG grid, 2 = emsort persistent grid
+    int flat_mode = 0;
 
     public:
     FMoeKernel(const char* name,
                const char* hsaco,
                uint32_t sub_GU             = 512,
                uint32_t num_persistent_tgs = 0,
-               bool is_flat_dispatch       = false) : kernel(name, hsaco)
+               int flat_mode               = 0) : kernel(name, hsaco)
     {
         this->sub_GU             = sub_GU;
         this->num_persistent_tgs = num_persistent_tgs;
         this->name               = name;
-        this->is_flat_dispatch   = is_flat_dispatch;
+        this->flat_mode          = flat_mode;
     };
 
     const char* get_name() const { return name; }
     int get_num_persistent_tgs() { return num_persistent_tgs; }
     int get_sub_GU() { return sub_GU; }
-    bool get_is_flat_dispatch() const { return is_flat_dispatch; }
+    int get_flat_mode() const { return flat_mode; }
     void set_4bit(bool is_4bit_) { is_int4 = is_4bit_; }
 
     template <int I_elemSize, int O_elemSize, bool switchGxy = false>
@@ -187,10 +187,9 @@ class FMoeKernel
         int gdx;
         int gdy;
         int gdz;
-        // FLAT (manifest flat): raw topk in sorted_* slots; no host moe_sort.
-        // gdx=tiles, gdy=topk, gdz=tokens; switchGxy swaps gdx/gdy at launch.
-        // One TG per (token, top-k slot); sub_X_cnt unused for grid sizing.
-        if(this->is_flat_dispatch)
+        // flat_mode==1: one-TG-per-(token,topk) grid; no host moe_sort.
+        // flat_mode==2: emsort persistent grid; no host moe_sort, same grid as ps.
+        if(this->flat_mode == 1)
         {
             bdx = 256;
             gdx = ((inter_dim + sub_GU - 1) / sub_GU);
@@ -265,7 +264,8 @@ FMoeKernel* get_heuristic_kernel(
             if(el.first.find(arch_id) != 0)
                 continue;
             const auto& cfg = el.second;
-            if(cfg.vskip == vskip && cfg.smf == smf && block_size_M == cfg.subGU_m)
+            if(cfg.vskip == vskip && cfg.smf == smf && block_size_M == cfg.subGU_m &&
+               cfg.flat == 0)
             {
                 if((inter_dim % cfg.subGU_n) == 0)
                 {
@@ -312,9 +312,8 @@ FMoeKernel* get_heuristic_kernel(
         else
             num_persistent_tgs = 0;
 
-        const bool is_flat_dispatch = (cfg.flat != 0);
         impl_ptr = &impl_ptr_map.get_or_create(name, [&]() {
-            return FMoeKernel(name, co_name, cfg.subGU_n, num_persistent_tgs, is_flat_dispatch);
+            return FMoeKernel(name, co_name, cfg.subGU_n, num_persistent_tgs, cfg.flat);
         });
     }
     else

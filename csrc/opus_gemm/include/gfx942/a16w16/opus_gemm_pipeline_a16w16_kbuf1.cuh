@@ -13,7 +13,7 @@
 
 #ifdef __HIP_DEVICE_COMPILE__
 
-#include "opus_gemm_asm_mma16x16x16.cuh"
+#include "opus_gemm_mfma16x16x16_gfx942.cuh"
 #include "opus_gemm_helpers_a16w16.cuh"
 
 #endif // __HIP_DEVICE_COMPILE__

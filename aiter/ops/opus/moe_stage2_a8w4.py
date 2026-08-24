@@ -3,36 +3,84 @@
 
 from __future__ import annotations
 
-from typing import Optional
+from dataclasses import dataclass
 
 import torch
 from torch import Tensor
 
-from ...jit.core import compile_ops
-from .moe_stage2_a8w4_meta import (
+from csrc.opus_moe.opus_moe_common import (
+    OPUS_A8W4_GFX950_DECODE_KERNEL_CONTRACT,
     OPUS_A8W4_OUT_MODE_BF16,
     OPUS_A8W4_OUT_MODE_FP8,
+    OpusA8W4Stage2Instance,
     opus_a8w4_best_atomic_kid,
     opus_a8w4_decode_kid,
-    opus_a8w4_kid_block_m,
-    opus_a8w4_kid_is_fp8,
-    opus_a8w4_kid_name,
-    opus_a8w4_kid_uses_route,
-    opus_a8w4_shape_family_for_shape,
+    opus_a8w4_effective_inter_dim,
+    opus_a8w4_scale_cols_for_effective_inter_dim,
+    opus_a8w4_stage2_instance_from_name,
+    require_opus_a8w4_stage2_instance,
 )
 
+from ...jit.core import compile_ops
+
+_DEFAULT_SORT_BLOCK_M = 32
 _OPUS_MOE_STAGE2_ROUTE_REDUCE_AUTO_BLOCK_N = -1
+
+
+@dataclass(frozen=True)
+class OpusA8W4LaunchConfig:
+    """Resolved runtime plan for one tuned Opus A8W4 Stage2 selection."""
+
+    instance: OpusA8W4Stage2Instance
+
+    @property
+    def kernel_id(self) -> int:
+        return self.instance.kid
+
+    @property
+    def sort_block_m(self) -> int:
+        return self.instance.sort_block_m
+
+    @property
+    def reduce_block_n(self) -> int | None:
+        return self.instance.reduce_block_n
+
+    @property
+    def route_out(self) -> bool:
+        return self.instance.route_out
 
 
 def _contiguous(tensor: Tensor) -> Tensor:
     return tensor if tensor.is_contiguous() else tensor.contiguous()
 
 
-def _optional_contiguous(tensor: Optional[Tensor]) -> Optional[Tensor]:
+def _optional_contiguous(tensor: Tensor | None) -> Tensor | None:
     return None if tensor is None else _contiguous(tensor)
 
 
-def _route_out_mode_from_dtype(route_out_dtype: Optional[str]) -> int:
+def _pad_scale_cols(tensor: Tensor, cols: int) -> Tensor:
+    if tensor.shape[1] >= cols:
+        return tensor
+    padded = torch.empty(
+        (*tensor.shape[:-1], cols), dtype=tensor.dtype, device=tensor.device
+    )
+    padded[..., : tensor.shape[-1]] = tensor
+    padded[..., tensor.shape[-1] :] = tensor[..., -1:]
+    return padded
+
+
+def _pad_scale_rows(tensor: Tensor, rows: int) -> Tensor:
+    if tensor.shape[0] >= rows:
+        return tensor
+    padded = torch.empty(
+        (rows, tensor.shape[1]), dtype=tensor.dtype, device=tensor.device
+    )
+    padded[: tensor.shape[0], :] = tensor
+    padded[tensor.shape[0] :, :] = tensor[-1:, :]
+    return padded
+
+
+def _route_out_mode_from_dtype(route_out_dtype: str | None) -> int:
     if route_out_dtype is None:
         return OPUS_A8W4_OUT_MODE_FP8
     route_out_dtype = str(route_out_dtype).strip().lower()
@@ -69,7 +117,7 @@ def _gen_opus_moe_stage2_a8w4_decode_fake_tensors(
     a2_scale: Tensor,
     w2_scale: Tensor,
     sorted_token_ids: Tensor,
-    sorted_weights: Optional[Tensor],
+    sorted_weights: Tensor | None,
     sorted_expert_ids: Tensor,
     num_valid_ids: Tensor,
     out: Tensor,
@@ -98,10 +146,12 @@ def _opus_moe_stage2_a8w4_decode_fwd_raw(
     a2_scale: Tensor,
     w2_scale: Tensor,
     sorted_token_ids: Tensor,
-    sorted_weights: Optional[Tensor],
+    sorted_weights: Tensor | None,
     sorted_expert_ids: Tensor,
     num_valid_ids: Tensor,
     out: Tensor,
+    token_num: int,
+    topk: int,
     block_m: int,
     kernel_id: int,
     inter_dim_pad: int,
@@ -128,30 +178,41 @@ def opus_moe_stage2_a8w4_decode_fwd(
     a2_scale: Tensor,
     w2_scale: Tensor,
     sorted_token_ids: Tensor,
-    sorted_weights: Optional[Tensor],
+    sorted_weights: Tensor | None,
     sorted_expert_ids: Tensor,
     num_valid_ids: Tensor,
     *,
     block_m: int,
     inter_dim_pad: int,
-    out: Optional[Tensor] = None,
+    out: Tensor | None = None,
     kernel_id: int = -1,
     return_per_slot: bool = False,
-    route_out_dtype: Optional[str] = None,
+    route_out_dtype: str | None = None,
+    token_num: int | None = None,
+    topk: int | None = None,
 ) -> Tensor:
-    # Output mode is encoded in the kid. Route-out kernels must be requested
-    # explicitly after they have been added to the metadata table.
-    shape_family = opus_a8w4_shape_family_for_shape(
-        model_dim=w2.shape[1],
-        inter_dim=inter_states.shape[2],
-        expert=w2.shape[0],
-        topk=inter_states.shape[1],
-    )
-    shape_family_name = None if shape_family is None else shape_family.name
-    if kernel_id == -1 and shape_family_name is None:
+    if inter_states.dim() == 3:
+        token_num = int(inter_states.shape[0])
+        topk = int(inter_states.shape[1])
+    elif inter_states.dim() == 2:
+        if token_num is None or topk is None:
+            raise ValueError(
+                "2D sorted inter_states requires explicit token_num and topk"
+            )
+        token_num = int(token_num)
+        topk = int(topk)
+    else:
         raise ValueError(
-            "unsupported Opus A8W4 shape family for auto kid selection: "
-            f"inter_states={tuple(inter_states.shape)}, w2={tuple(w2.shape)}"
+            "Opus A8W4 stage2 expects inter_states=[token, topk, inter_dim] or "
+            f"[sorted_row, inter_dim], got {tuple(inter_states.shape)}"
+        )
+    effective_inter_dim = opus_a8w4_effective_inter_dim(
+        inter_states.shape[-1], inter_dim_pad
+    )
+    if effective_inter_dim is None:
+        raise ValueError(
+            "Opus A8W4 stage2 requires 0 <= inter_dim_pad < logical inter_dim, "
+            f"got inter_states={tuple(inter_states.shape)}, inter_dim_pad={inter_dim_pad}"
         )
     if route_out_dtype is not None and not return_per_slot:
         raise ValueError("route_out_dtype requires return_per_slot=True")
@@ -159,36 +220,44 @@ def opus_moe_stage2_a8w4_decode_fwd(
         kernel_id = opus_a8w4_decode_kid(
             _route_out_mode_from_dtype(route_out_dtype),
             block_m,
-            shape_family=shape_family_name,
         )
     elif not return_per_slot and kernel_id == -1 and block_m == 32:
         kernel_id = opus_a8w4_best_atomic_kid(
-            inter_states.shape[0],
-            shape_family=shape_family_name,
+            token_num,
         )
-        block_m = opus_a8w4_kid_block_m(kernel_id)
+        block_m = require_opus_a8w4_stage2_instance(kernel_id).block_m
     route_out = bool(return_per_slot)
     route_out_fp8 = False
     if kernel_id != -1:
-        kid_route_out = opus_a8w4_kid_uses_route(kernel_id)
-        if return_per_slot and not kid_route_out:
+        instance = require_opus_a8w4_stage2_instance(kernel_id)
+        if return_per_slot and not instance.route_out:
             raise ValueError(
                 "return_per_slot=True requires a route-output Opus A8W4 stage2 "
-                f"kid, got kernel_id={kernel_id} ({opus_a8w4_kid_name(kernel_id)})"
+                f"kid, got kernel_id={kernel_id} ({instance.name})"
             )
-        route_out = kid_route_out
-        route_out_fp8 = opus_a8w4_kid_is_fp8(kernel_id)
+        route_out = instance.route_out
+        route_out_fp8 = instance.route_out_fp8
+    scale_cols = opus_a8w4_scale_cols_for_effective_inter_dim(effective_inter_dim)
+    scale_row_pack = 2 * OPUS_A8W4_GFX950_DECODE_KERNEL_CONTRACT.mfma_m
+    scale_rows = (
+        (int(sorted_token_ids.shape[0]) + scale_row_pack - 1)
+        // scale_row_pack
+        * scale_row_pack
+    )
+    a2_scale = _pad_scale_rows(a2_scale, scale_rows)
+    a2_scale = _pad_scale_cols(a2_scale, scale_cols)
+    w2_scale = _pad_scale_cols(w2_scale, scale_cols)
     md = w2.shape[1]
     if out is None:
         if route_out_fp8:
             # MXFP8 route_out: uint8 [rows, md fp8 | md/8 e8m0 scale].
-            rows = inter_states.shape[0] * inter_states.shape[1]
+            rows = token_num * topk
             out = torch.empty((rows, md + md // 8), dtype=torch.uint8, device=w2.device)
         else:
             shape = (
-                (inter_states.shape[0], inter_states.shape[1], w2.shape[1])
+                (token_num, topk, w2.shape[1])
                 if route_out
-                else (inter_states.shape[0], w2.shape[1])
+                else (token_num, w2.shape[1])
             )
             alloc = torch.empty if route_out else torch.zeros
             out = alloc(shape, dtype=torch.bfloat16, device=w2.device)
@@ -207,6 +276,8 @@ def opus_moe_stage2_a8w4_decode_fwd(
         _contiguous(sorted_expert_ids),
         _contiguous(num_valid_ids),
         kernel_out,
+        int(token_num),
+        int(topk),
         int(block_m),
         int(kernel_id),
         int(inter_dim_pad),
@@ -216,7 +287,7 @@ def opus_moe_stage2_a8w4_decode_fwd(
 
 def opus_moe_stage2_reduce_token_slot_route_output_fwd(
     route_out: Tensor,
-    out: Optional[Tensor] = None,
+    out: Tensor | None = None,
     *,
     topk: int | None = None,
     block_n: int | None = None,
@@ -308,7 +379,322 @@ def opus_moe_stage2_reduce_token_slot_route_output_fwd(
     return out
 
 
+# ---- Tuned-config adapter -------------------------------------------------
+
+
+def _value_is_empty(value) -> bool:
+    return (
+        value is None
+        or value != value  # noqa: PLR0124
+        or str(value).strip() in ("", "nan", "None")
+    )
+
+
+def _cfg_first(cfg: dict, *names: str):
+    for name in names:
+        if name in cfg and not _value_is_empty(cfg[name]):
+            return cfg[name]
+    return None
+
+
+def _cfg_int(value, default: int = 0) -> int:
+    return default if _value_is_empty(value) else int(float(value))
+
+
+def _cfg_optional_int(value) -> int | None:
+    return None if _value_is_empty(value) else int(float(value))
+
+
+def _cfg_bool(value, default: bool = False) -> bool:
+    if _value_is_empty(value):
+        return default
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in ("true", "yes", "y"):
+        return True
+    if text in ("false", "no", "n"):
+        return False
+    return bool(int(float(value)))
+
+
+def _cfg_str(value, default: str = "") -> str:
+    return default if _value_is_empty(value) else str(value).strip()
+
+
+def is_opus_a8w4_stage2_kernel(kernel_name) -> bool:
+    name = _cfg_str(kernel_name)
+    return opus_a8w4_stage2_instance_from_name(name) is not None
+
+
+def route_bucket_metadata(cfg: dict) -> dict[str, object]:
+    return {
+        "route_bucket": _cfg_str(_cfg_first(cfg, "route_bucket", "route_bucket_name")),
+        "expected_sorted_blocks": _cfg_optional_int(
+            _cfg_first(cfg, "expected_sorted_blocks", "expected_route_blocks")
+        ),
+        "min_sorted_blocks": _cfg_optional_int(
+            _cfg_first(cfg, "min_sorted_blocks", "min_route_blocks")
+        ),
+        "max_sorted_blocks": _cfg_optional_int(
+            _cfg_first(cfg, "max_sorted_blocks", "max_route_blocks")
+        ),
+    }
+
+
+def stage2_launch_config(kernel_id: int) -> OpusA8W4LaunchConfig:
+    instance = require_opus_a8w4_stage2_instance(kernel_id)
+    return OpusA8W4LaunchConfig(instance=instance)
+
+
+def parse_stage2_config(cfg: dict, block_m) -> OpusA8W4LaunchConfig:
+    """Resolve a tuned CSV row into one typed Stage2 launch plan."""
+
+    sort_block_m = _cfg_int(block_m, _DEFAULT_SORT_BLOCK_M)
+    name = _cfg_str(_cfg_first(cfg, "kernelName2", "kernel_name2", "stage2_kernel"))
+    instance = opus_a8w4_stage2_instance_from_name(name)
+    if instance is None:
+        raise ValueError(f"unknown Opus A8W4 stage2 kernelName2={name!r}")
+    launch = stage2_launch_config(instance.kid)
+    if sort_block_m != launch.sort_block_m:
+        raise ValueError(
+            f"requires sort block_m={launch.sort_block_m}, "
+            f"got tuned block_m={sort_block_m}"
+        )
+    return launch
+
+
+def cfg_is_supported(
+    kernel_name,
+    *,
+    cfg: dict,
+    gfx: str,
+    block_m,
+    is_ep: bool,
+    has_stage2_bias: bool = False,
+) -> tuple[bool, str]:
+    if not is_opus_a8w4_stage2_kernel(kernel_name):
+        return False, f"unknown Opus A8W4 stage2 kernelName2={kernel_name!r}"
+    if gfx != "gfx950":
+        return False, f"requires gfx950, got {gfx}"
+    if is_ep:
+        return False, "EP expert_mask/topk_ids are not supported"
+    if has_stage2_bias:
+        return False, "stage2 bias is not supported"
+
+    sort_block_m = _cfg_int(block_m, _DEFAULT_SORT_BLOCK_M)
+    if sort_block_m <= 0:
+        return False, f"requires positive sort block_m, got {sort_block_m}"
+    try:
+        parse_stage2_config(cfg, block_m)
+    except ValueError as exc:
+        return False, str(exc)
+    return True, ""
+
+
+def stage2_uses_route_reduce(stage2) -> bool:
+    keywords = getattr(stage2, "keywords", {})
+    launch = keywords.get("launch")
+    if isinstance(launch, OpusA8W4LaunchConfig):
+        return launch.route_out
+    return _cfg_bool(keywords.get("route_out"), False)
+
+
+def check_route_bucket_metadata(metadata, sorted_expert_ids, logger) -> None:
+    if (
+        not metadata.route_bucket
+        and metadata.expected_sorted_blocks is None
+        and metadata.min_sorted_blocks is None
+        and metadata.max_sorted_blocks is None
+    ):
+        return
+
+    actual = int(sorted_expert_ids.numel())
+    errors = []
+    if (
+        metadata.expected_sorted_blocks is not None
+        and actual != metadata.expected_sorted_blocks
+    ):
+        errors.append(f"expected sorted_blocks={metadata.expected_sorted_blocks}")
+    if metadata.min_sorted_blocks is not None and actual < metadata.min_sorted_blocks:
+        errors.append(f"min sorted_blocks={metadata.min_sorted_blocks}")
+    if metadata.max_sorted_blocks is not None and actual > metadata.max_sorted_blocks:
+        errors.append(f"max sorted_blocks={metadata.max_sorted_blocks}")
+    if not errors:
+        return
+
+    bucket = f" route_bucket={metadata.route_bucket!r}" if metadata.route_bucket else ""
+    logger.warning(
+        f"[fused_moe] tuned route bucket mismatch{bucket}: "
+        f"actual sorted_blocks={actual}; " + ", ".join(errors)
+    )
+
+
+# ---- Unified high-level Stage2 execution ----------------------------------
+
+
+def opus_moe_stage2_a8w4_fwd(
+    inter_states: Tensor,
+    w2: Tensor,
+    a2_scale: Tensor,
+    w2_scale: Tensor,
+    sorted_token_ids: Tensor,
+    sorted_weights: Tensor | None,
+    sorted_expert_ids: Tensor,
+    num_valid_ids: Tensor,
+    *,
+    launch: OpusA8W4LaunchConfig,
+    inter_dim_pad: int,
+    out: Tensor | None = None,
+    token_num: int | None = None,
+    topk: int | None = None,
+) -> Tensor:
+    """Run Stage2 and fold route-output reduction into one shared path."""
+
+    if not launch.route_out:
+        return opus_moe_stage2_a8w4_decode_fwd(
+            inter_states,
+            w2,
+            a2_scale,
+            w2_scale,
+            sorted_token_ids,
+            sorted_weights,
+            sorted_expert_ids,
+            num_valid_ids,
+            out=out,
+            block_m=launch.sort_block_m,
+            kernel_id=launch.kernel_id,
+            inter_dim_pad=inter_dim_pad,
+            token_num=token_num,
+            topk=topk,
+        )
+
+    if token_num is None:
+        if inter_states.dim() == 3:
+            token_num = int(inter_states.shape[0])
+        elif out is not None:
+            token_num = int(out.shape[0])
+        else:
+            raise ValueError("route-output Stage2 requires explicit token_num")
+    if topk is None:
+        if inter_states.dim() != 3:
+            raise ValueError("route-output Stage2 requires explicit topk")
+        topk = int(inter_states.shape[1])
+    route_output = opus_moe_stage2_a8w4_decode_fwd(
+        inter_states,
+        w2,
+        a2_scale,
+        w2_scale,
+        sorted_token_ids,
+        sorted_weights,
+        sorted_expert_ids,
+        num_valid_ids,
+        block_m=launch.sort_block_m,
+        kernel_id=launch.kernel_id,
+        inter_dim_pad=inter_dim_pad,
+        return_per_slot=True,
+        token_num=token_num,
+        topk=topk,
+    )
+    return opus_moe_stage2_reduce_token_slot_route_output_fwd(
+        route_output,
+        out=out,
+        topk=int(topk),
+        block_n=launch.reduce_block_n,
+    )
+
+
+def opus_a8w4_stage2_wrapper(
+    inter_states,
+    w1,
+    w2,
+    sorted_token_ids,
+    sorted_expert_ids,
+    num_valid_ids,
+    out,
+    topk,
+    *,
+    launch: OpusA8W4LaunchConfig,
+    kernelName="",
+    w2_scale=None,
+    a2_scale=None,
+    sorted_weights=None,
+    bias2=None,
+    inter_dim_pad: int = 0,
+    model_dim_pad: int = 0,
+    expert_mask=None,
+    topk_ids=None,
+    block_m: int = _DEFAULT_SORT_BLOCK_M,
+    **_kwargs,
+):
+    del w1, model_dim_pad, block_m, _kwargs
+    named_instance = opus_a8w4_stage2_instance_from_name(kernelName)
+    if named_instance is None:
+        raise ValueError(f"Invalid Opus A8W4 stage2 kernel name: {kernelName}")
+    if named_instance != launch.instance:
+        raise ValueError(
+            "Opus A8W4 stage2 kernel name/launch mismatch: "
+            f"kernelName={kernelName!r}, launch={launch.instance.name!r}"
+        )
+    if bias2 is not None:
+        raise ValueError("Opus A8W4 stage2 does not support bias2")
+    if expert_mask is not None or topk_ids is not None:
+        raise ValueError("Opus A8W4 stage2 does not support EP expert_mask/topk_ids")
+    if a2_scale is None or w2_scale is None:
+        raise ValueError("Opus A8W4 stage2 requires a2_scale and w2_scale")
+    if inter_states.dim() not in (2, 3):
+        raise ValueError(
+            "Opus A8W4 stage2 expects inter_states=[token, topk, inter_dim] or "
+            "[sorted_row, inter_dim], "
+            f"got {tuple(inter_states.shape)}"
+        )
+
+    contract = OPUS_A8W4_GFX950_DECODE_KERNEL_CONTRACT
+    expected_w2 = (
+        w2.shape[0],
+        w2.shape[1],
+        inter_states.shape[-1] // contract.fp4_values_per_byte,
+    )
+    if tuple(w2.shape) != expected_w2:
+        raise ValueError(
+            f"Opus A8W4 stage2 expects w2={list(expected_w2)}, got {tuple(w2.shape)}"
+        )
+    token_num = inter_states.shape[0] if inter_states.dim() == 3 else out.shape[0]
+    expected_out = (token_num, w2.shape[1])
+    if tuple(out.shape) != expected_out:
+        raise ValueError(
+            f"Opus A8W4 stage2 expects out={list(expected_out)}, "
+            f"got {tuple(out.shape)}"
+        )
+
+    return opus_moe_stage2_a8w4_fwd(
+        inter_states,
+        w2,
+        a2_scale,
+        w2_scale,
+        sorted_token_ids,
+        sorted_weights,
+        sorted_expert_ids,
+        num_valid_ids,
+        launch=launch,
+        inter_dim_pad=int(inter_dim_pad),
+        out=out,
+        token_num=int(token_num),
+        topk=int(topk),
+    )
+
+
 __all__ = [
+    "OpusA8W4LaunchConfig",
+    "cfg_is_supported",
+    "check_route_bucket_metadata",
+    "is_opus_a8w4_stage2_kernel",
+    "opus_a8w4_stage2_wrapper",
     "opus_moe_stage2_a8w4_decode_fwd",
+    "opus_moe_stage2_a8w4_fwd",
     "opus_moe_stage2_reduce_token_slot_route_output_fwd",
+    "parse_stage2_config",
+    "route_bucket_metadata",
+    "stage2_launch_config",
+    "stage2_uses_route_reduce",
 ]

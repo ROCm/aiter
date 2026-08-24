@@ -1,12 +1,8 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+#include "rocm_ops.hpp"
 #include "aiter_stream.h"
 #include "custom_all_reduce_gfx1250.h"
-#include <pybind11/pybind11.h>
-#include <pybind11/stl.h>
-#include <torch/extension.h>
-
-namespace py = pybind11;
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
@@ -16,6 +12,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("init_custom_ar", &aiter::init_custom_ar,
           py::arg("meta_ptr"), py::arg("rank_data_ptr"), py::arg("rank_data_sz"),
           py::arg("all_meta_ptrs"), py::arg("rank"),
+          py::arg("fully_connected"));
+    m.def("init_custom_ar_ipc", &aiter::init_custom_ar_ipc,
+          py::arg("meta_ptr"), py::arg("rank_data_ptr"), py::arg("rank_data_sz"),
+          py::arg("ipc_handle_ptrs"), py::arg("offsets"), py::arg("rank"),
           py::arg("fully_connected"));
     m.def("all_reduce", &aiter::all_reduce,
           py::arg("_fa"), py::arg("inp"), py::arg("out"),
@@ -39,6 +39,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("_fa"), py::arg("self_ptr"), py::arg("all_ptrs"));
     m.def("register_output_buffer", &aiter::register_output_buffer,
           py::arg("_fa"), py::arg("self_ptr"), py::arg("all_ptrs"));
+    m.def("register_input_buffer_ipc", &aiter::register_input_buffer_ipc,
+          py::arg("_fa"), py::arg("self_ptr"), py::arg("ipc_handle_ptrs"),
+          py::arg("offsets"));
+    m.def("register_output_buffer_ipc", &aiter::register_output_buffer_ipc,
+          py::arg("_fa"), py::arg("self_ptr"), py::arg("ipc_handle_ptrs"),
+          py::arg("offsets"));
     m.def("get_graph_buffer_count", &aiter::get_graph_buffer_count, py::arg("_fa"));
     m.def("get_graph_buffer_ptrs", &aiter::get_graph_buffer_ptrs,
           py::arg("_fa"), py::arg("ptrs_out"));
