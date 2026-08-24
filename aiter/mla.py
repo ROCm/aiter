@@ -837,6 +837,27 @@ def mla_decode_fwd(
                 o_orig = o
 
             o = o.view(total_s, nhead, -1)
+
+            qo_indptr = torch.arange(
+                0,
+                (bs * fold_factor + 1) * max_seqlen_q,
+                max_seqlen_q,
+                dtype=qo_indptr.dtype,
+                device=device,
+            )
+            if g_kv_indptr is not None:
+
+                g_len = (g_kv_indptr[1:] - g_kv_indptr[:-1]).repeat_interleave(
+                    fold_factor
+                )
+                folded_g_kv_indptr = torch.zeros(
+                    bs * fold_factor + 1, dtype=g_kv_indptr.dtype, device=device
+                )
+                folded_g_kv_indptr[1:] = torch.cumsum(g_len, 0).to(g_kv_indptr.dtype)
+                g_kv_indptr = folded_g_kv_indptr
+                kv_indptr = torch.cat(
+                    [kv_indptr[:-1].repeat_interleave(fold_factor), kv_indptr[-1:]]
+                )
             io_transformed = True
         else:
             assert False, f"{nhead=} and {max_seqlen_q=} not supported"
