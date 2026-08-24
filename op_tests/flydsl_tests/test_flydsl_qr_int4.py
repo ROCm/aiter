@@ -93,7 +93,11 @@ def _pick_st(tokens: int, hidden: int, requested: int = SUPER_TILE) -> int:
 def _sqnr_db(got: torch.Tensor, reference: torch.Tensor) -> float:
     mse = float(((got - reference) ** 2).mean().item())
     ref_pow = float((reference * reference).mean().item())
-    if mse <= 0.0 or ref_pow <= 0.0:
+    if not math.isfinite(mse) or not math.isfinite(ref_pow):
+        return float("-inf")
+    if ref_pow <= 0.0:
+        return float("inf") if mse <= 0.0 else float("-inf")
+    if mse <= 0.0:
         return float("inf")
     return 10.0 * math.log10(ref_pow / mse)
 
@@ -118,10 +122,7 @@ def _run_rank(args) -> None:
         world_size=args.tp,
         rank=rank,
     )
-    try:
-        gloo = dist.new_group(backend="gloo")
-    except Exception:  # noqa: BLE001
-        gloo = dist.group.WORLD
+    gloo = dist.new_group(backend="gloo")
     group = dist.group.WORLD
 
     fly = QRInt4(
@@ -273,9 +274,7 @@ def _spawn(
         payload = json.load(fh)
     ranks = payload["ranks"]
     if len(ranks) != world_size:
-        raise RuntimeError(
-            f"QRInt4 gathered {len(ranks)} ranks, expected {world_size}"
-        )
+        raise RuntimeError(f"QRInt4 gathered {len(ranks)} ranks, expected {world_size}")
     return ranks
 
 
@@ -299,9 +298,7 @@ def _assert_sqnr(
             continue
         row = rows[0]
         if row["st_used"] != expected_st:
-            fails.append(
-                f"rank {rank}: ST={row['st_used']}, expected {expected_st}"
-            )
+            fails.append(f"rank {rank}: ST={row['st_used']}, expected {expected_st}")
         if row["sqnr_db"] < SQNR_MIN_DB:
             fails.append(
                 f"rank {rank}: SQNR {row['sqnr_db']:.2f} dB < {SQNR_MIN_DB} "

@@ -13,6 +13,7 @@ import ctypes
 
 import flydsl.compiler as flyc
 import torch
+import torch.distributed as dist
 from flydsl.expr.typing import Int32, Int64, Stream
 
 from aiter.jit.utils.chip_info import get_gfx_runtime
@@ -130,6 +131,14 @@ class QRInt4:
             raise ValueError(
                 f"super_tile must be one of {SUPER_TILES}, got {super_tile!r}"
             )
+        group_world = dist.get_world_size(group=group)
+        group_rank = dist.get_rank(group=group)
+        if group_world != int(world_size):
+            raise ValueError(
+                f"world_size={world_size} does not match group size {group_world}"
+            )
+        if group_rank != int(rank):
+            raise ValueError(f"rank={rank} does not match group rank {group_rank}")
         arch = get_gfx_runtime()
         if arch != _SUPPORTED_ARCH:
             raise RuntimeError(f"QRInt4 is {_SUPPORTED_ARCH}-only, got {arch}")
