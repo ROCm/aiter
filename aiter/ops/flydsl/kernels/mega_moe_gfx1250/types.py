@@ -114,6 +114,83 @@ class Stage1PrequantContext:
 
 
 @dataclass(frozen=True, slots=True)
+class Stage1DispatchContext:
+    """Resources for the gfx950-style dispatch fused into gfx1250 GEMM1.
+
+    The sender-side wire remains row-major ``[fp8 payload | e8m0 scales]``.
+    Dispatch producers use the destination-owned compact plan to write each
+    route directly into the receiver's final contiguous-M payload/scale/rowmap
+    slots. GEMM1 therefore consumes ``payload`` directly; it does not gather
+    from recv slots.
+
+    Arena offsets name the same regions on every rank. ``workspace`` and all
+    output tensors are local views of those regions, passed explicitly so the
+    custom-op boundary records the buffers the fused kernel mutates.
+    """
+
+    arena_handle: int
+    workspace_offset: int
+    payload_offset: int
+    row_scale_offset: int
+    scale_offset: int
+    rowmap_offset: int
+    m_tile_map_offset: int
+    num_valid_offset: int
+    rank: int
+    world_size: int
+    experts_per_rank: int
+    max_tokens_per_rank: int
+    max_rows: int
+    wire_stride_bytes: int
+    payload_bytes: int
+    wire: torch.Tensor
+    workspace: torch.Tensor
+    payload: torch.Tensor
+    scale: torch.Tensor
+    rowmap: torch.Tensor
+    num_valid: torch.Tensor
+    m_tile_map: torch.Tensor
+
+    def __post_init__(self):
+        if self.arena_handle < 0:
+            raise ValueError("arena_handle must be non-negative")
+        if min(
+            self.workspace_offset,
+            self.payload_offset,
+            self.row_scale_offset,
+            self.scale_offset,
+            self.rowmap_offset,
+            self.m_tile_map_offset,
+            self.num_valid_offset,
+        ) < 0:
+            raise ValueError("stage1 dispatch arena offsets must be non-negative")
+        if not 0 <= self.rank < self.world_size:
+            raise ValueError("stage1 dispatch rank must be in [0, world_size)")
+        if min(
+            self.world_size,
+            self.experts_per_rank,
+            self.max_tokens_per_rank,
+            self.max_rows,
+            self.wire_stride_bytes,
+            self.payload_bytes,
+        ) <= 0:
+            raise ValueError("stage1 dispatch dimensions must be positive")
+        if self.wire_stride_bytes <= self.payload_bytes:
+            raise ValueError("stage1 dispatch wire must append row-major scales")
+        for name, tensor, dtype in (
+            ("wire", self.wire, torch.uint8),
+            ("workspace", self.workspace, torch.uint8),
+            ("payload", self.payload, torch.uint8),
+            ("scale", self.scale, torch.uint8),
+            ("rowmap", self.rowmap, torch.int32),
+            ("num_valid", self.num_valid, torch.int32),
+            ("m_tile_map", self.m_tile_map, torch.int32),
+        ):
+            if tensor.dtype != dtype or not tensor.is_contiguous():
+                raise ValueError(f"{name} must be contiguous {dtype}")
+
+
+@dataclass(frozen=True, slots=True)
 class Stage2ScatterContext:
     """Resources used by the GEMM2 P2P scatter epilogue.
 

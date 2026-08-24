@@ -123,6 +123,12 @@ def flydsl_grouped_gemm_a8w4_masked(
     producer_scale=None,
     producer_row_src=None,
     producer_tile_rows_done=None,
+    dispatch_blocks=0,
+    dispatch_persist_blocks=0,
+    dispatch_context=None,
+    dispatch_topk_ids=None,
+    dispatch_weights=None,
+    dispatch_cur_tokens=0,
     plan_in_kernel=0,
     plan_nvr_is_tokens=0,
     plan_route_max_m=0,
@@ -234,6 +240,94 @@ def flydsl_grouped_gemm_a8w4_masked(
         arg_prod_scale=ptr_arg(producer_scale if producer_blocks else a),
         arg_prod_row_src=ptr_arg(producer_row_src if producer_blocks else a),
         arg_prod_done=ptr_arg(producer_tile_rows_done if producer_blocks else a),
+        dispatch_blocks=int(dispatch_blocks),
+        dispatch_persist_blocks=int(dispatch_persist_blocks),
+        dispatch_arena_handle=(
+            int(dispatch_context.arena_handle) if dispatch_context is not None else 0
+        ),
+        dispatch_workspace_offset=(
+            int(dispatch_context.workspace_offset)
+            if dispatch_context is not None
+            else 0
+        ),
+        dispatch_payload_offset=(
+            int(dispatch_context.payload_offset)
+            if dispatch_context is not None
+            else 0
+        ),
+        dispatch_row_scale_offset=(
+            int(dispatch_context.row_scale_offset)
+            if dispatch_context is not None
+            else 0
+        ),
+        dispatch_scale_offset=(
+            int(dispatch_context.scale_offset)
+            if dispatch_context is not None
+            else 0
+        ),
+        dispatch_rowmap_offset=(
+            int(dispatch_context.rowmap_offset)
+            if dispatch_context is not None
+            else 0
+        ),
+        dispatch_m_tile_map_offset=(
+            int(dispatch_context.m_tile_map_offset)
+            if dispatch_context is not None
+            else 0
+        ),
+        dispatch_num_valid_offset=(
+            int(dispatch_context.num_valid_offset)
+            if dispatch_context is not None
+            else 0
+        ),
+        dispatch_rank=int(dispatch_context.rank) if dispatch_context is not None else 0,
+        dispatch_world=(
+            int(dispatch_context.world_size) if dispatch_context is not None else 0
+        ),
+        dispatch_epr=(
+            int(dispatch_context.experts_per_rank)
+            if dispatch_context is not None
+            else 0
+        ),
+        dispatch_mtpr=(
+            int(dispatch_context.max_tokens_per_rank)
+            if dispatch_context is not None
+            else 0
+        ),
+        dispatch_max_rows=(
+            int(dispatch_context.max_rows) if dispatch_context is not None else 0
+        ),
+        dispatch_wire_stride=(
+            int(dispatch_context.wire_stride_bytes)
+            if dispatch_context is not None
+            else 0
+        ),
+        dispatch_payload_bytes=(
+            int(dispatch_context.payload_bytes)
+            if dispatch_context is not None
+            else 0
+        ),
+        dispatch_scale_bytes=(
+            int(dispatch_context.scale.numel() // dispatch_context.max_rows)
+            if dispatch_context is not None
+            else 0
+        ),
+        dispatch_cur_tokens=int(dispatch_cur_tokens),
+        arg_dispatch_wire=ptr_arg(
+            dispatch_context.wire if dispatch_context is not None else a
+        ),
+        arg_dispatch_ids=ptr_arg(
+            dispatch_topk_ids if dispatch_topk_ids is not None else a
+        ),
+        arg_dispatch_weights=ptr_arg(
+            dispatch_weights if dispatch_weights is not None else a
+        ),
+        arg_dispatch_workspace=ptr_arg(
+            dispatch_context.workspace if dispatch_context is not None else a
+        ),
+        arg_dispatch_num_valid=ptr_arg(
+            dispatch_context.num_valid if dispatch_context is not None else a
+        ),
         plan_in_kernel=int(plan_in_kernel),
         plan_nvr_is_tokens=int(plan_nvr_is_tokens),
         plan_route_max_m=int(plan_route_max_m),

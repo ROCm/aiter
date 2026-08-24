@@ -31,17 +31,15 @@ from .mega_moe_gfx1250.tdm_gather_shim import (
     make_tensor_gather_descriptor,
     tensor_store_gather,
 )
-from .mega_moe_gfx1250.stage1_dispatch_tdm import (
-    ARENA_HANDLE,
-    DEST_CTR,
-    DISPATCH_STATE,
-    DISP_BARRIER,
-    TOK_MAP,
-    TOTAL_RECV,
-    emit_stage1_dispatch_tdm,
-)
 from .moe_contiguous_psum import emit_route_remap_share, emit_tile_psum_plan
 from .moe_fused_route_quant_scatter import emit_prequant_gather_producer
+from .mega_moe_gfx1250.dispatch_compact import (
+    compact_payload_lds_bytes,
+    compact_workspace_layout,
+    emit_compact_payload,
+    emit_compact_planner,
+    emit_compact_wait_expert,
+)
 from .quant_utils import (
     emit_amax_e8m0_native_scale,
     emit_cvt_scalef32_pk8_fp4_bf16,
@@ -70,15 +68,13 @@ ENTRY_TICKET_DWORDS = 16
 # whole grid, the other is a hot atomic.
 PLAN_GATE_DWORDS = 16
 REMAP_DONE_DWORDS = 16
-LIVE_ROWS_DWORDS = 16
 # Dword offsets of each counter past the per-M-tile ones, in the same buffer.
 WORK_HEAD_OFF = 0
 ENTRY_TICKET_OFF = WORK_QUEUE_SHARDS * WORK_QUEUE_SHARD_DWORDS
 PLAN_GATE_OFF = ENTRY_TICKET_OFF + ENTRY_TICKET_DWORDS
 REMAP_DONE_OFF = PLAN_GATE_OFF + PLAN_GATE_DWORDS
-LIVE_ROWS_OFF = REMAP_DONE_OFF + REMAP_DONE_DWORDS
 # i32 slots the tickets need after the per-M-tile counters in the same buffer.
-TICKET_SLOTS = LIVE_ROWS_OFF + LIVE_ROWS_DWORDS
+TICKET_SLOTS = REMAP_DONE_OFF + REMAP_DONE_DWORDS
 
 
 @flyc.jit
@@ -135,8 +131,31 @@ def launch_gemm_a8w4_tdm(
     arg_prod_scale: fx.Pointer = None,
     arg_prod_row_src: fx.Pointer = None,
     arg_prod_done: fx.Pointer = None,
+    dispatch_blocks: Constexpr[int] = 0,
+    dispatch_persist_blocks: Constexpr[int] = 0,
+    dispatch_arena_handle: Constexpr[int] = 0,
+    dispatch_workspace_offset: Constexpr[int] = 0,
+    dispatch_payload_offset: Constexpr[int] = 0,
+    dispatch_row_scale_offset: Constexpr[int] = 0,
+    dispatch_scale_offset: Constexpr[int] = 0,
+    dispatch_rowmap_offset: Constexpr[int] = 0,
+    dispatch_m_tile_map_offset: Constexpr[int] = 0,
+    dispatch_num_valid_offset: Constexpr[int] = 0,
+    dispatch_rank: Constexpr[int] = 0,
+    dispatch_world: Constexpr[int] = 0,
+    dispatch_epr: Constexpr[int] = 0,
+    dispatch_mtpr: Constexpr[int] = 0,
+    dispatch_max_rows: Constexpr[int] = 0,
+    dispatch_wire_stride: Constexpr[int] = 0,
+    dispatch_payload_bytes: Constexpr[int] = 0,
+    dispatch_scale_bytes: Constexpr[int] = 0,
+    dispatch_cur_tokens: Constexpr[int] = 0,
+    arg_dispatch_wire: fx.Pointer = None,
+    arg_dispatch_ids: fx.Pointer = None,
+    arg_dispatch_weights: fx.Pointer = None,
+    arg_dispatch_workspace: fx.Pointer = None,
+    arg_dispatch_num_valid: fx.Pointer = None,
     plan_in_kernel: Constexpr[int] = 0,
-    plan_nvr_is_tokens: Constexpr[int] = 0,
     plan_route_max_m: Constexpr[int] = 0,
     plan_numel: Constexpr[int] = 0,
     plan_ep_scatter: Constexpr[int] = 0,
@@ -149,24 +168,6 @@ def launch_gemm_a8w4_tdm(
     arg_plan_gather_w: fx.Pointer = None,
     arg_plan_tis: fx.Pointer = None,
     arg_plan_rowmap: fx.Pointer = None,
-    fused_dispatch: Constexpr[int] = 0,
-    fused_dispatch_overlap: Constexpr[int] = 0,
-    overlap_dispatch: Constexpr[int] = 0,
-    arg_dispatch_descriptor: fx.Pointer = None,
-    arg_dispatch_idx: fx.Pointer = None,
-    arg_dispatch_wts: fx.Pointer = None,
-    dispatch_cur_tokens: Constexpr[int] = 0,
-    dispatch_blocks: Constexpr[int] = 0,
-    dispatch_rank: Constexpr[int] = 0,
-    dispatch_off_tok_off: Constexpr[int] = 0,
-    dispatch_off_recv_num: Constexpr[int] = 0,
-    dispatch_off_tis: Constexpr[int] = 0,
-    dispatch_off_out_idx: Constexpr[int] = 0,
-    dispatch_off_out_wts: Constexpr[int] = 0,
-    dispatch_off_out_tok: Constexpr[int] = 0,
-    dispatch_off_payload_ready: Constexpr[int] = 0,
-    dispatch_max_recv: Constexpr[int] = 0,
-    dispatch_max_tokens: Constexpr[int] = 0,
 ):
     """Launch the grouped contiguous-M a8w4 MoE GEMM for gfx1250.
 
@@ -275,35 +276,57 @@ def launch_gemm_a8w4_tdm(
         producer_topk,
         producer_wire_stride,
         producer_feat_dim,
+        dispatch_blocks,
+        dispatch_persist_blocks,
+        dispatch_arena_handle,
+        dispatch_workspace_offset,
+        dispatch_payload_offset,
+        dispatch_row_scale_offset,
+        dispatch_scale_offset,
+        dispatch_rowmap_offset,
+        dispatch_m_tile_map_offset,
+        dispatch_num_valid_offset,
+        dispatch_rank,
+        dispatch_world,
+        dispatch_epr,
+        dispatch_mtpr,
+        dispatch_max_rows,
+        dispatch_wire_stride,
+        dispatch_payload_bytes,
+        dispatch_scale_bytes,
+        dispatch_cur_tokens,
         plan_in_kernel,
-        plan_nvr_is_tokens,
         plan_route_max_m,
         plan_numel,
         plan_ep_scatter,
         plan_max_tok,
         plan_slot_stride,
-        fused_dispatch,
-        fused_dispatch_overlap,
-        overlap_dispatch,
-        dispatch_cur_tokens,
-        dispatch_blocks,
-        dispatch_max_recv,
-        dispatch_max_tokens,
     )
     _ = cache_tag
     producer_on = producer_blocks > 0
-    work_queue_on = 1 if (producer_on and producer_work_queue) else 0
+    dispatch_on = dispatch_blocks > 0
+    role_on = producer_on or dispatch_on
+    work_queue_on = 1 if (dispatch_on or (producer_on and producer_work_queue)) else 0
     plan_on = 1 if (producer_on and plan_in_kernel) else 0
-    fused_dispatch_on = 1 if (plan_on and fused_dispatch) else 0
-    overlap_dispatch_on = 1 if (plan_on and overlap_dispatch) else 0
-    dispatch_transport_on = 1 if (
-        fused_dispatch_on or overlap_dispatch_on
-    ) else 0
-    role_ticket_on = 1 if (producer_on and (producer_role_ticket or plan_on)) else 0
+    role_ticket_on = (
+        1 if (dispatch_on or (producer_on and (producer_role_ticket or plan_on))) else 0
+    )
     ticket_on = 1 if (work_queue_on or role_ticket_on) else 0
     # Ticket 0 plans; the producers are the next ``producer_blocks`` to arrive.
-    plan_blocks = 1 if plan_on else 0
-    persist_on = 1 if (work_queue_on and producer_persist_blocks > 0) else 0
+    plan_blocks = 1 if (dispatch_on or plan_on) else 0
+    persist_blocks = dispatch_persist_blocks if dispatch_on else producer_persist_blocks
+    persist_on = 1 if (work_queue_on and persist_blocks > 0) else 0
+    dispatch_layout = (
+        compact_workspace_layout(
+            npes=dispatch_world,
+            experts_per_rank=dispatch_epr,
+            max_tokens=dispatch_mtpr,
+            topk=producer_topk,
+            work_head_count=WORK_QUEUE_SHARDS,
+        )
+        if dispatch_on
+        else None
+    )
     # The queue's counters live past the per-M-tile ones in the same buffer,
     # at an offset the host has to agree on when it sizes it.
     producer_tile_count = (
@@ -318,6 +341,25 @@ def launch_gemm_a8w4_tdm(
             raise ValueError("producer blocks need total_rows and chunk_rows")
         if n_experts <= 0:
             raise ValueError("producer blocks need the grouped expert count")
+    if dispatch_on:
+        if producer_on or plan_on:
+            raise ValueError("compact dispatch replaces the recv-slot producer/plan path")
+        if cluster_n > 1:
+            raise ValueError("compact dispatch and cluster launch are exclusive")
+        if dispatch_world <= 0 or dispatch_epr != n_experts:
+            raise ValueError("compact dispatch geometry does not match grouped GEMM")
+        if dispatch_blocks < dispatch_world:
+            raise ValueError("compact dispatch needs at least one producer per rank")
+        if dispatch_blocks % dispatch_world:
+            raise ValueError("compact dispatch blocks must divide evenly across ranks")
+        if dispatch_persist_blocks < 1 + dispatch_blocks:
+            raise ValueError("persistent grid cannot resident the planner and producers")
+        if dispatch_persist_blocks < WORK_QUEUE_SHARDS:
+            raise ValueError("compact dispatch persistent grid must cover every queue shard")
+        if dispatch_wire_stride < dispatch_payload_bytes + dispatch_scale_bytes:
+            raise ValueError("compact dispatch wire must append row-major scales")
+        if dispatch_cur_tokens <= 0 or dispatch_cur_tokens > dispatch_mtpr:
+            raise ValueError("compact dispatch token count exceeds its static capacity")
     if producer_work_queue:
         # The ticket counters ride in the producer's own buffer, and a producer
         # that took a ticket has to spend it, so neither is optional.
@@ -372,35 +414,6 @@ def launch_gemm_a8w4_tdm(
             )
         if plan_ep_scatter and (plan_max_tok <= 0 or plan_slot_stride <= 0):
             raise ValueError("the fused ep_rowmap scatter needs max_tok/slot_stride")
-    if fused_dispatch:
-        if not plan_on or not producer_on or not persist_on:
-            raise ValueError("fused dispatch needs the persistent in-kernel plan")
-        if (n_experts, producer_topk, producer_feat_dim) != (192, 6, 7168):
-            raise NotImplementedError(
-                "fused Stage1 supports E_local=192, topk=6, hd=7168 only"
-            )
-        if (
-            producer_wire_stride != 7392
-            or dispatch_cur_tokens <= 0
-            or dispatch_blocks <= 0
-        ):
-            raise NotImplementedError(
-                "fused Stage1 supports MEGA_PREQUANT=1 FP8 wire rows only"
-            )
-        if dispatch_max_recv <= 0 or dispatch_max_tokens <= 0:
-            raise ValueError(
-                "fused Stage1 needs dispatch_max_recv and dispatch_max_tokens"
-            )
-        if producer_persist_blocks < dispatch_blocks + plan_blocks + producer_blocks:
-            raise ValueError(
-                "fused Stage1 persistent grid cannot concurrently seat dispatch, "
-                "planner, and producer roles"
-            )
-    if overlap_dispatch:
-        if not plan_on or not producer_on or not persist_on:
-            raise ValueError("overlap dispatch needs the persistent in-kernel plan")
-        if producer_wire_stride != 7392 or dispatch_max_recv <= 0:
-            raise ValueError("overlap dispatch needs the Stage1 FP8 wire protocol")
     if enable_ep_scatter:
         if stage1_act != 0:
             raise ValueError("enable_ep_scatter is gemm2-only (stage1_act must be 0)")
@@ -455,20 +468,33 @@ def launch_gemm_a8w4_tdm(
     store_pad = c_lds_pad_elems if enable_ep_scatter else 16
     C_STORE_B = ((tile_m * (tile_n + store_pad) * 2 + 127) // 128) * 128
     ARENA_B = max(num_buffers * PITCH, C_STORE_B)
-    # mega_moe v2: dispatch producers reuse the GEMM arena as TDM scratch
-    # instead of a second LDS region. Extra tiles would lower occupancy on
-    # every CTA, including GEMM consumers that never touch TDM.
-    _dispatch_tile_bytes = 0
-    if fused_dispatch:
-        _dispatch_tile_pitch = (producer_wire_stride + 127) // 128 * 128
-        # 128B control prefix + one TDM tile per wave, all inside the GEMM
-        # arena so fused Stage1 does not add a second LDS region.
-        _dispatch_tile_bytes = 128 + num_waves * _dispatch_tile_pitch
-        if ARENA_B < _dispatch_tile_bytes:
-            raise ValueError(
-                f"arena {ARENA_B}B is too small for dispatch control+TDM tiles "
-                f"({_dispatch_tile_bytes}B, pitch={_dispatch_tile_pitch})"
+    # Double-buffer the compact payload producer when its two wire tiles per wave
+    # fit the GEMM's LDS arena (they usually do at the large tiles fusion picks);
+    # otherwise fall back to the single-tile drain-every-row path.
+    _dispatch_pipe_depth = 1
+    if dispatch_on:
+        if (
+            compact_payload_lds_bytes(
+                wire_stride=dispatch_wire_stride, num_waves=num_waves, pipe_depth=2
             )
+            <= ARENA_B
+        ):
+            _dispatch_pipe_depth = 2
+        elif (
+            compact_payload_lds_bytes(
+                wire_stride=dispatch_wire_stride, num_waves=num_waves, pipe_depth=1
+            )
+            > ARENA_B
+        ):
+            raise ValueError("compact dispatch wire tiles exceed the GEMM LDS arena")
+        import sys as _sys
+
+        print(
+            f"[DIAG] dispatch_pipe_depth={_dispatch_pipe_depth} ARENA_B={ARENA_B} "
+            f"need2={compact_payload_lds_bytes(wire_stride=dispatch_wire_stride, num_waves=num_waves, pipe_depth=2)} "
+            f"wire_stride={dispatch_wire_stride} num_waves={num_waves}",
+            file=_sys.stderr,
+        )
     # The planner scans in the arena rather than in LDS of its own: the plan
     # runs before the first tile is staged, so the space is free, and taking a
     # second region would cost every workgroup occupancy for one workgroup's
@@ -511,15 +537,18 @@ def launch_gemm_a8w4_tdm(
         if producer_on
         else ""
     )
-    _base_kname = (
+    _disp = (
+        f"_disp{dispatch_blocks}p{dispatch_persist_blocks}"
+        f"_r{dispatch_rank}w{dispatch_world}t{dispatch_cur_tokens}"
+        if dispatch_on
+        else ""
+    )
+    _kname = (
         f"a8w4_tdm_{_afp}"
         f"_t{tile_m}x{tile_n}x{tile_k}_w{m_warp}x{n_warp}"
         f"_b{num_buffers}_K{K}"
         f"{_grouped}{_act}{_bias}{_qout}{_cl}{_next_stage}{_waves_per_tensor}{_ep}"
-        f"{_prod}"
-    )
-    _kname = (
-        f"mega_moe_stage1_{_base_kname}" if fused_dispatch_on else _base_kname
+        f"{_prod}{_disp}"
     )
 
     @flyc.kernel(name=_kname, known_block_size=[block, 1, 1])
@@ -537,6 +566,11 @@ def launch_gemm_a8w4_tdm(
         arg_prod_scale: fx.Pointer,
         arg_prod_row_src: fx.Pointer,
         arg_prod_done: fx.Pointer,
+        arg_dispatch_wire: fx.Pointer,
+        arg_dispatch_ids: fx.Pointer,
+        arg_dispatch_weights: fx.Pointer,
+        arg_dispatch_workspace: fx.Pointer,
+        arg_dispatch_num_valid: fx.Pointer,
         arg_plan_masked_m: fx.Pointer,
         arg_plan_rows: fx.Pointer,
         arg_plan_starts: fx.Pointer,
@@ -544,9 +578,6 @@ def launch_gemm_a8w4_tdm(
         arg_plan_gather_w: fx.Pointer,
         arg_plan_tis: fx.Pointer,
         arg_plan_rowmap: fx.Pointer,
-        arg_dispatch_descriptor: fx.Pointer,
-        arg_dispatch_idx: fx.Pointer,
-        arg_dispatch_wts: fx.Pointer,
         i32_m: fx.Int32,
         i32_n: fx.Int32,
         f32_swiglu_limit: fx.Float32,
@@ -568,188 +599,19 @@ def launch_gemm_a8w4_tdm(
         wave_m = wave // n_warp
         wave_n = wave % n_warp
 
-        # One SharedAllocator for the whole kernel (FlyDSL allows only one).
-        # static=False when tickets, the GEMM arena, or the EP rowmap all need
-        # disjoint slices of the same dyn-shared blob. Producers + EP scatter
-        # (mega-moe fused stage1) hit that; a lone GEMM arena stays static.
-        _smem = fx.SharedAllocator(
-            static=not bool(enable_ep_scatter or ticket_on)
-        )
-        # Tickets. The role split and the work queue both want one number per
-        # workgroup that every wave in it agrees on, so they share one atomic
-        # broadcast: lane 0 does the fetch-add and LDS carries it to the rest.
-        # The counters sit past the per-M-tile ones in the producer's buffer.
-        # Without the in-kernel plan the remap pass zeroes them along with the
-        # per-tile ones, so a replay starts from zero; with it there is no pass
-        # left in front to do that, and the epoch below takes over instead.
-        if const_expr(ticket_on):
-            _entry_lds = fx.index_cast(T.index, fx.ptrtoint(_smem.allocate(16)._ptr))
-            _wq_lds = fx.index_cast(T.index, fx.ptrtoint(_smem.allocate(4)._ptr))
-            _tk_load, _tk_store = make_lds_copy_ops(32)
-            _tk_base = fx.Int64(ptrtoint(arg_prod_done)) + fx.Int64(
-                producer_tile_count * 4
-            )
-            _entry_addr = _tk_base + fx.Int64(ENTRY_TICKET_OFF * 4)
-            _gate_addr = _tk_base + fx.Int64(PLAN_GATE_OFF * 4)
-            _remap_addr = _tk_base + fx.Int64(REMAP_DONE_OFF * 4)
-            _live_rows_addr = _tk_base + fx.Int64(LIVE_ROWS_OFF * 4)
-
-            def take_ticket(addr, lds_idx):
-                """One fetch-add at ``addr``, broadcast to the workgroup."""
-                if tid == 0:
-                    _v = comm_ops.atomic_add_agent(addr, fx.Int32(1))
-                    _tk_store(lds_idx, 0, Vec.from_elements([_v], fx.Int32))
-                # The barrier is also what makes a ticket safe to take from
-                # inside the tile loop: nobody moves on to the next tile until
-                # every wave is done with the arena holding the current one.
-                workgroup_barrier()
-                return rocdl.readfirstlane(T.i32, _tk_load(lds_idx, 0)[0])
-
         # LDS belongs to the workgroup, not to a tile: with the work queue on,
         # one workgroup runs several tiles out of this one arena, so it is
         # allocated once, before the tile body, and reused across tiles. It is
         # also what the planner scans in -- allocated ahead of the role split
         # for that, since at that point no tile is staged in it yet.
-        # Stage1 dispatch reuses the GEMM arena for one payload tile per wave.
-        # Its raw TDM GROUP0 requires the LDS byte address to retain 128B
-        # alignment even though ticket allocations precede the arena.
-        base_ptr = _smem.allocate(ARENA_B, 128)._ptr
-
-        dispatch_wire = arg_prod_wire
-        dispatch_ready_base = None
-        dispatch_expected = None
-        dispatch_parity = None
-        dispatch_idx_base = None
-        dispatch_wts_base = None
-        _dispatch_state = None
-        _dispatch_meta_gate = None
-        if const_expr(dispatch_transport_on):
-            import mori.cco.device.flydsl as cco
-
-            _dd_rsrc = ptr_rsrc(arg_dispatch_descriptor)
-
-            def _load_dispatch_pointer(slot):
-                return fx.Int64(
-                    buffer_ops.buffer_load(
-                        _dd_rsrc,
-                        fx.Int32(slot),
-                        vec_width=1,
-                        dtype=T.i64,
-                    )
-                )
-
-            _dispatch_state = _load_dispatch_pointer(DISPATCH_STATE)
-            _dispatch_arena = _load_dispatch_pointer(ARENA_HANDLE)
-            _dispatch_window = cco.Window(_dispatch_arena)
-            dispatch_wire = fx.Int64(
-                _dispatch_window.lsa_ptr(dispatch_rank, dispatch_off_out_tok)
-            )
-            dispatch_ready_base = fx.Int64(
-                _dispatch_window.lsa_ptr(dispatch_rank, dispatch_off_payload_ready)
-            )
-            dispatch_idx_base = fx.Int64(
-                _dispatch_window.lsa_ptr(dispatch_rank, dispatch_off_out_idx)
-            )
-            dispatch_wts_base = fx.Int64(
-                _dispatch_window.lsa_ptr(dispatch_rank, dispatch_off_out_wts)
-            )
-
-        if const_expr(fused_dispatch_on):
-            _dispatch_tok_map = _load_dispatch_pointer(TOK_MAP)
-            _dispatch_dest_ctr = _load_dispatch_pointer(DEST_CTR)
-            _dispatch_barrier = _load_dispatch_pointer(DISP_BARRIER)
-            _dispatch_total_recv = _load_dispatch_pointer(TOTAL_RECV)
-            if tid == 0:
-                _dt64 = fx.Int64(
-                    comm_ops.atomic_add_agent(_dispatch_state, fx.Int64(1))
-                )
-                _dgen64 = _dt64 // fx.Int64(producer_persist_blocks)
-                _tk_store(
-                    _entry_lds,
-                    8,
-                    Vec.from_elements(
-                        [
-                            fx.Int32(
-                                _dt64
-                                - _dgen64 * fx.Int64(producer_persist_blocks)
-                            )
-                        ],
-                        fx.Int32,
-                    ),
-                )
-                _tk_store(
-                    _entry_lds,
-                    12,
-                    Vec.from_elements([fx.Int32(_dgen64)], fx.Int32),
-                )
-            workgroup_barrier()
-            _dispatch_id = rocdl.readfirstlane(T.i32, _tk_load(_entry_lds, 8)[0])
-            _dispatch_gen = rocdl.readfirstlane(T.i32, _tk_load(_entry_lds, 12)[0])
-            dispatch_parity = _dispatch_gen & fx.Int32(1)
-            dispatch_expected = (_dispatch_gen // fx.Int32(2)) + fx.Int32(1)
-            if (_dispatch_id == fx.Int32(0)) & (tid == 0):
-                comm_ops.store_i32_system(
-                    _dispatch_state
-                    + fx.Int64(8)
-                    + fx.Int64(dispatch_parity) * fx.Int64(4),
-                    fx.Int32(0),
-                    fx.Int32(dispatch_expected),
-                )
-            _dispatch_meta_gate = (
-                _dispatch_state
-                + fx.Int64(24)
-                + fx.Int64(dispatch_parity) * fx.Int64(4)
-            )
-            (
-                dispatch_wire,
-                dispatch_ready_base,
-                dispatch_idx_base,
-                dispatch_wts_base,
-                _dispatch_rank,
-            ) = (
-                emit_stage1_dispatch_tdm(
-                    tok_map=_dispatch_tok_map,
-                    dest_ctr=_dispatch_dest_ctr,
-                    disp_barrier=_dispatch_barrier,
-                    total_recv=_dispatch_total_recv,
-                    arena_handle=_dispatch_arena,
-                    rank=dispatch_rank,
-                    off_tok_off=dispatch_off_tok_off,
-                    off_recv_num=dispatch_off_recv_num,
-                    off_tis=dispatch_off_tis,
-                    off_out_idx=dispatch_off_out_idx,
-                    off_out_wts=dispatch_off_out_wts,
-                    off_out_tok=dispatch_off_out_tok,
-                    off_payload_ready=dispatch_off_payload_ready,
-                    send_wire=arg_prod_wire,
-                    input_idx=arg_dispatch_idx,
-                    input_wts=arg_dispatch_wts,
-                    dispatch_id=_dispatch_id,
-                    is_dispatch=_dispatch_id < fx.Int32(dispatch_blocks),
-                    generation=_dispatch_gen,
-                    expected=dispatch_expected,
-                    parity=dispatch_parity,
-                    metadata_gate_addr=_dispatch_meta_gate,
-                    payload_lds=arith.index_cast(
-                        T.i32,
-                        fx.index_cast(T.index, fx.ptrtoint(base_ptr)),
-                    )
-                    + fx.Int32(128),
-                    control_lds=fx.Int64(fx.ptrtoint(base_ptr)),
-                    cur_tokens=dispatch_cur_tokens,
-                    dispatch_blocks=dispatch_blocks,
-                    async_payload=bool(fused_dispatch_overlap),
-                    num_waves=num_waves,
-                    topk=producer_topk,
-                    experts_per_rank=n_experts,
-                    max_tokens=dispatch_max_tokens,
-                    max_recv=dispatch_max_recv,
-                    wire_stride=producer_wire_stride,
-                )
-            )
-            # mega_moe: only the planner waits on metadata. Dispatch CTAs keep
-            # moving payload; GEMM consumers wait on the plan gate and then
-            # per-slot payload_ready.
+        # static=False (one dyn-shared base) only where a second region is
+        # needed, so the non-scatter path keeps its per-leaf static allocation.
+        _smem = (
+            fx.SharedAllocator(static=False)
+            if const_expr(enable_ep_scatter)
+            else fx.SharedAllocator()
+        )
+        base_ptr = _smem.allocate(ARENA_B)._ptr
 
         def ptr_to_idx(p):
             return fx.index_cast(T.index, fx.ptrtoint(p))
@@ -761,6 +623,47 @@ def launch_gemm_a8w4_tdm(
             # off the SAME allocator so it is disjoint from the A/B/C arena.
             _rowmap_lds_ptr = _smem.allocate(tile_m * 8)._ptr
             rowmap_lds_idx = ptr_to_idx(_rowmap_lds_ptr)
+
+        # Tickets. The role split and the work queue both want one number per
+        # workgroup that every wave in it agrees on, so they share one atomic
+        # broadcast: lane 0 does the fetch-add and LDS carries it to the rest.
+        # The counters sit past the per-M-tile ones in the producer's buffer.
+        # Without the in-kernel plan the remap pass zeroes them along with the
+        # per-tile ones, so a replay starts from zero; with it there is no pass
+        # left in front to do that, and the epoch below takes over instead.
+        #
+        # Bumped off the arena's own allocator, at the tail so the arena keeps
+        # offset 0: a kernel gets exactly one SharedAllocator, and with
+        # ep_scatter that one is the dyn-shared base.
+        if const_expr(ticket_on):
+            _entry_lds = ptr_to_idx(_smem.allocate(8)._ptr)
+            _wq_lds = ptr_to_idx(_smem.allocate(4)._ptr)
+            _tk_load, _tk_store = make_lds_copy_ops(32)
+            if const_expr(dispatch_on):
+                _tk_base = fx.Int64(ptrtoint(arg_dispatch_workspace))
+                _entry_addr = _tk_base + fx.Int64(dispatch_layout.entry_ticket)
+                _gate_addr = _tk_base + fx.Int64(dispatch_layout.epoch_gate)
+                _work_head_base = _tk_base + fx.Int64(dispatch_layout.work_heads)
+                _remap_addr = _gate_addr
+            else:
+                _tk_base = fx.Int64(ptrtoint(arg_prod_done)) + fx.Int64(
+                    producer_tile_count * 4
+                )
+                _entry_addr = _tk_base + fx.Int64(ENTRY_TICKET_OFF * 4)
+                _gate_addr = _tk_base + fx.Int64(PLAN_GATE_OFF * 4)
+                _work_head_base = _tk_base + fx.Int64(WORK_HEAD_OFF * 4)
+                _remap_addr = _tk_base + fx.Int64(REMAP_DONE_OFF * 4)
+
+            def take_ticket(addr, lds_idx):
+                """One fetch-add at ``addr``, broadcast to the workgroup."""
+                if tid == 0:
+                    _v = comm_ops.atomic_add_agent(addr, fx.Int32(1))
+                    _tk_store(lds_idx, 0, Vec.from_elements([_v], fx.Int32))
+                # The barrier is also what makes a ticket safe to take from
+                # inside the tile loop: nobody moves on to the next tile until
+                # every wave is done with the arena holding the current one.
+                workgroup_barrier()
+                return rocdl.readfirstlane(T.i32, _tk_load(lds_idx, 0)[0])
 
         # Role split. The first ``producer_blocks`` workgroups gather this
         # GEMM's A rows before doing anything else, and the consumers spin on
@@ -774,9 +677,9 @@ def launch_gemm_a8w4_tdm(
         # plain tile grid and the gather is work those workgroups do on the way
         # in. Without it they are extra workgroups prepended to the tile grid
         # and retire once the gather is done.
-        if const_expr(producer_on):
+        if const_expr(role_on):
             bid_raw = fx.block_idx.x
-            if const_expr(plan_on):
+            if const_expr(plan_on or dispatch_on):
                 # With the plan in here there is no pass in front of this
                 # kernel to reset the entry counter, so it is never reset: it
                 # counts across launches, and the launch a workgroup belongs to
@@ -787,14 +690,14 @@ def launch_gemm_a8w4_tdm(
                 # workgroup waits for is a different number every time.
                 if tid == 0:
                     _t64 = fx.Int64(comm_ops.atomic_add_agent(_entry_addr, fx.Int64(1)))
-                    _gen64 = _t64 // fx.Int64(producer_persist_blocks)
+                    _gen64 = _t64 // fx.Int64(persist_blocks)
                     _tk_store(
                         _entry_lds,
                         0,
                         Vec.from_elements(
                             [
                                 fx.Int32(
-                                    _t64 - _gen64 * fx.Int64(producer_persist_blocks)
+                                    _t64 - _gen64 * fx.Int64(persist_blocks)
                                 )
                             ],
                             fx.Int32,
@@ -806,41 +709,20 @@ def launch_gemm_a8w4_tdm(
                 workgroup_barrier()
                 entry_id = rocdl.readfirstlane(T.i32, _tk_load(_entry_lds, 0)[0])
                 entry_gen = rocdl.readfirstlane(T.i32, _tk_load(_entry_lds, 4)[0])
-                if const_expr(overlap_dispatch_on):
-                    # The standalone dispatch and this persistent grid advance
-                    # once per Stage1 call, so their generations stay in
-                    # lockstep without a host-visible epoch.
-                    dispatch_parity = entry_gen & fx.Int32(1)
-                    dispatch_expected = (entry_gen // fx.Int32(2)) + fx.Int32(1)
-                    _dispatch_meta_gate = (
-                        _dispatch_state
-                        + fx.Int64(24)
-                        + fx.Int64(dispatch_parity) * fx.Int64(4)
-                    )
             elif const_expr(role_ticket_on):
                 entry_id = take_ticket(_entry_addr, _entry_lds)
             else:
                 entry_id = bid_raw
-            role_id = entry_id
-            if const_expr(plan_on):
-                if const_expr(fused_dispatch_on and fused_dispatch_overlap):
-                    # Dispatch occupies ticket ids [0, dispatch_blocks). Rotate
-                    # those ids behind the planner/producers so the first
-                    # non-dispatch workgroup can plan as soon as metadata is
-                    # published while dispatch workgroups continue payload TDM.
-                    _rotated = _dispatch_id - fx.Int32(dispatch_blocks)
-                    role_id = arith.select(
-                        _rotated >= fx.Int32(0),
-                        _rotated,
-                        _rotated + fx.Int32(producer_persist_blocks),
-                    )
-                is_planner = role_id < plan_blocks
-                is_producer = (role_id >= plan_blocks) & (
-                    role_id < plan_blocks + producer_blocks
+            if const_expr(plan_on or dispatch_on):
+                is_planner = entry_id < plan_blocks
+                is_producer = (entry_id >= plan_blocks) & (
+                    entry_id
+                    < plan_blocks
+                    + (dispatch_blocks if dispatch_on else producer_blocks)
                 )
             else:
                 is_producer = entry_id < producer_blocks
-            if const_expr(producer_rejoin):
+            if const_expr(dispatch_on or producer_rejoin):
                 bid_x = bid_raw
             else:
                 is_consumer = entry_id >= producer_blocks
@@ -848,20 +730,96 @@ def launch_gemm_a8w4_tdm(
                 # a non-positive group_tiles; its results are masked off below.
                 bid_x = is_consumer.select(bid_raw - producer_blocks, 0)
 
-            if const_expr(plan_on):
+            if const_expr(dispatch_on):
+                if is_planner:
+                    if tid < fx.Int32(WORK_QUEUE_SHARDS):
+                        comm_ops.store_i32_system(
+                            _work_head_base, tid, fx.Int32(0)
+                        )
+                    emit_compact_planner(
+                        arena_handle=dispatch_arena_handle,
+                        arena_offset=dispatch_workspace_offset,
+                        layout=dispatch_layout,
+                        rank=dispatch_rank,
+                        npes=dispatch_world,
+                        experts_per_rank=dispatch_epr,
+                        topk=producer_topk,
+                        max_tokens=dispatch_mtpr,
+                        tile_m=tile_m,
+                        capacity_rows=dispatch_max_rows,
+                        num_waves=num_waves,
+                        addr_in_idx=fx.Int64(ptrtoint(arg_dispatch_ids)),
+                        cur_tokens=fx.Int32(dispatch_cur_tokens),
+                        m_tile_map_offset=(
+                            dispatch_m_tile_map_offset - dispatch_workspace_offset
+                        ),
+                        num_valid_offset=(
+                            dispatch_num_valid_offset - dispatch_workspace_offset
+                        ),
+                        parity=entry_gen & fx.Int32(1),
+                        expected=entry_gen + fx.Int32(1),
+                    )
+                    if tid == fx.Int32(0):
+                        comm_ops.fence_system_release()
+                        comm_ops.store_i32_system(
+                            _gate_addr, 0, entry_gen + fx.Int32(1)
+                        )
+                else:
+                    if tid == fx.Int32(0):
+                        comm_ops.spin_until_eq_i32(
+                            _gate_addr, entry_gen + fx.Int32(1)
+                        )
+                workgroup_barrier()
+                if is_producer:
+                    emit_compact_payload(
+                        arena_handle=dispatch_arena_handle,
+                        arena_offset=dispatch_workspace_offset,
+                        layout=dispatch_layout,
+                        rank=dispatch_rank,
+                        npes=dispatch_world,
+                        experts_per_rank=dispatch_epr,
+                        topk=producer_topk,
+                        max_tokens_per_rank=dispatch_mtpr,
+                        num_waves=num_waves,
+                        producer_blocks=dispatch_blocks,
+                        producer_slot=entry_id - plan_blocks,
+                        lds_base_i32=arith.index_cast(T.i32, ptr_to_idx(base_ptr)),
+                        addr_in_wire=fx.Int64(ptrtoint(arg_dispatch_wire)),
+                        addr_in_weights=fx.Int64(ptrtoint(arg_dispatch_weights)),
+                        payload_offset=(
+                            dispatch_payload_offset - dispatch_workspace_offset
+                        ),
+                        grouped_scale_offset=(
+                            dispatch_scale_offset - dispatch_workspace_offset
+                        ),
+                        rowmap_offset=(
+                            dispatch_rowmap_offset - dispatch_workspace_offset
+                        ),
+                        num_valid_offset=(
+                            dispatch_num_valid_offset - dispatch_workspace_offset
+                        ),
+                        wire_stride=dispatch_wire_stride,
+                        payload_bytes=dispatch_payload_bytes,
+                        scale_bytes=dispatch_scale_bytes,
+                        tile_m=tile_m,
+                        wmma_rep=wmma_m_rep,
+                        parity=entry_gen & fx.Int32(1),
+                        expected=entry_gen + fx.Int32(1),
+                        pipe_depth=_dispatch_pipe_depth,
+                    )
+                # Producers now scatter WMMA-interleaved scales per expert, so
+                # there is no global scale-finalize phase and no launch_ready
+                # barrier: consumers wait per-tile on payload_ready[expert]
+                # (see emit_compact_wait_expert in the work-queue tile loop) and
+                # planner/producers rejoin the queue as consumers below.
+                workgroup_barrier()
+            elif const_expr(plan_on):
                 # The plan: one workgroup, ahead of everything, while the rest
                 # of the grid is still being dispatched. It also resets what
                 # this launch needs zeroed -- the per-M-tile row counters, the
                 # queue heads and the remap rendezvous -- all of it behind the
                 # gate it raises last, so nobody can read a stale count.
                 if is_planner:
-                    if const_expr(dispatch_transport_on):
-                        if tid == 0:
-                            comm_ops.spin_until_eq_i32(
-                                _dispatch_meta_gate, fx.Int32(dispatch_expected)
-                            )
-                            comm_ops.fence_system_acquire()
-                        workgroup_barrier()
                     if const_expr(work_queue_on):
                         _head_lane = tid < WORK_QUEUE_SHARDS
                         if _head_lane:
@@ -873,65 +831,6 @@ def launch_gemm_a8w4_tdm(
                     _done_rsrc = ptr_rsrc(arg_prod_done)
                     for _z in range(tid, producer_tile_count, block):
                         buffer_ops.buffer_store(fx.Int32(0), _done_rsrc, _z)
-                    if const_expr(fused_dispatch_on):
-                        _masked_addr = fx.Int64(ptrtoint(arg_plan_masked_m))
-                        _masked_rsrc = ptr_rsrc(arg_plan_masked_m)
-                        _rows_rsrc = ptr_rsrc(arg_plan_rows)
-                        _gather_rsrc = ptr_rsrc(arg_plan_gather_w)
-                        for _e in range(tid, n_experts, block):
-                            buffer_ops.buffer_store(fx.Int32(0), _masked_rsrc, _e)
-                        workgroup_barrier()
-                        _recv_tokens = fx.Int32(
-                            buffer_ops.buffer_load(
-                                ptr_rsrc(arg_plan_nvr),
-                                fx.Uint32(0),
-                                vec_width=1,
-                                is_scalar=True,
-                            )
-                        )
-                        _recv_routes = _recv_tokens * fx.Int32(producer_topk)
-                        _recv_idx_rsrc = buffer_ops.create_buffer_resource_from_addr(
-                            dispatch_idx_base
-                        )
-                        _recv_wts_rsrc = buffer_ops.create_buffer_resource_from_addr(
-                            dispatch_wts_base
-                        )
-                        for _r in range(tid, _recv_routes, block):
-                            _ge = fx.Int32(
-                                buffer_ops.buffer_load(
-                                    _recv_idx_rsrc, _r, vec_width=1, dtype=T.i32
-                                )
-                            )
-                            _le = _ge - _dispatch_rank * fx.Int32(n_experts)
-                            _keep = (_le >= fx.Int32(0)) & (
-                                _le < fx.Int32(n_experts)
-                            )
-                            _slot = fx.Int32(0)
-                            if _keep:
-                                _slot = fx.Int32(
-                                    comm_ops.atomic_add_agent(
-                                        _masked_addr + fx.Int64(_le) * fx.Int64(4),
-                                        fx.Int32(1),
-                                    )
-                                )
-                            _row = _le * fx.Int32(plan_route_max_m) + _slot
-                            buffer_ops.buffer_store(
-                                _keep.select(_row, fx.Int32(-1)),
-                                _rows_rsrc,
-                                _r,
-                            )
-                            _wf = fx.Float32(
-                                buffer_ops.buffer_load(
-                                    _recv_wts_rsrc, _r, vec_width=1, dtype=T.f32
-                                )
-                            )
-                            buffer_ops.buffer_store(
-                                _keep.select(_wf, fx.Float32(0.0)).to(fx.BFloat16),
-                                _gather_rsrc,
-                                _r,
-                            )
-                        comm_ops.waitcnt_stores()
-                        workgroup_barrier()
                     if tid == 0:
                         comm_ops.store_i32_system(_remap_addr, 0, fx.Int32(0))
                     _scan = fx.Int64(fx.ptrtoint(base_ptr))
@@ -947,7 +846,6 @@ def launch_gemm_a8w4_tdm(
                             lds0=_scan,
                             lds1=_scan + fx.Int64(block * 4),
                             carry=_scan + fx.Int64(block * 8),
-                            total_addr=_live_rows_addr,
                         )
                     )
                     # Release: the tile map and the reset counters must be in
@@ -963,84 +861,86 @@ def launch_gemm_a8w4_tdm(
                         comm_ops.spin_until_gt_i32(_gate_addr, entry_gen)
                     workgroup_barrier()
 
-            live_rows = fx.Int32(producer_total_rows)
-            if const_expr(plan_on):
-                # Published by the planner before its gate. Besides bounding
-                # consumer work, this shortens each producer's chunk loop.
-                live_rows = fx.Int32(comm_ops.load_i32_acquire(_live_rows_addr))
-
-            if is_producer:
-                if const_expr(plan_on):
-                    # Producers split the row remap between them on the way to
-                    # the gather -- it is per-route work with no ordering to
-                    # it, and they are the workgroups that then walk its
-                    # output. Every slice has to be complete before any of them
-                    # starts gathering, though: a producer's chunk of
-                    # destination rows is filled by routes from all the slices.
-                    _nvr = fx.Int32(plan_numel)
-                    if fx.Int64(ptrtoint(arg_plan_nvr)) != 0:
-                        _nvr = fx.Int32(
-                            buffer_ops.buffer_load(
-                                ptr_rsrc(arg_plan_nvr),
-                                fx.Uint32(0),
-                                vec_width=1,
-                                is_scalar=True,
+            if const_expr(producer_on):
+                if is_producer:
+                    if const_expr(plan_on):
+                        # Producers split the row remap between them on the way
+                        # to the gather. Every slice must complete before any
+                        # producer starts gathering destination rows.
+                        _nvr = fx.Int32(plan_numel)
+                        if fx.Int64(ptrtoint(arg_plan_nvr)) != 0:
+                            _nvr = fx.Int32(
+                                buffer_ops.buffer_load(
+                                    ptr_rsrc(arg_plan_nvr),
+                                    fx.Uint32(0),
+                                    vec_width=1,
+                                    is_scalar=True,
+                                )
+                            )
+                        emit_route_remap_share(
+                            SimpleNamespace(
+                                gtid=(entry_id - plan_blocks) * block + tid,
+                                stride=producer_blocks * block,
+                                nvr=_nvr,
+                                c_route_max_m=plan_route_max_m,
+                                rows_rsrc=ptr_rsrc(arg_plan_rows),
+                                s_rsrc=ptr_rsrc(arg_plan_starts),
+                                src_rsrc=ptr_rsrc(arg_prod_row_src),
+                                ep_on=plan_ep_scatter,
+                                c_topk=producer_topk,
+                                c_max_tok=plan_max_tok,
+                                c_slot_stride=plan_slot_stride,
+                                w_rsrc=ptr_rsrc(arg_plan_gather_w),
+                                tis_rsrc=ptr_rsrc(arg_plan_tis),
+                                ep_rsrc=ptr_rsrc(arg_plan_rowmap),
                             )
                         )
-                        if const_expr(plan_nvr_is_tokens):
-                            _nvr = _nvr * fx.Int32(producer_topk)
-                    emit_route_remap_share(
-                        SimpleNamespace(
-                            gtid=(role_id - plan_blocks) * block + tid,
-                            stride=producer_blocks * block,
-                            nvr=_nvr,
-                            c_route_max_m=plan_route_max_m,
-                            rows_rsrc=ptr_rsrc(arg_plan_rows),
-                            s_rsrc=ptr_rsrc(arg_plan_starts),
-                            src_rsrc=ptr_rsrc(arg_prod_row_src),
-                            ep_on=plan_ep_scatter,
-                            c_topk=producer_topk,
-                            c_max_tok=plan_max_tok,
-                            c_slot_stride=plan_slot_stride,
-                            w_rsrc=ptr_rsrc(arg_plan_gather_w),
-                            tis_rsrc=ptr_rsrc(arg_plan_tis),
-                            ep_rsrc=ptr_rsrc(arg_plan_rowmap),
-                        )
+                        comm_ops.waitcnt_stores()
+                        workgroup_barrier()
+                        if tid == 0:
+                            comm_ops.atomic_add_system(_remap_addr, fx.Int32(1))
+                            comm_ops.spin_until_gt_i32(
+                                _remap_addr, producer_blocks - 1
+                            )
+                        workgroup_barrier()
+                    emit_prequant_gather_producer(
+                        wire_in=arg_prod_wire,
+                        grouped_payload=arg_a,
+                        grouped_scale=arg_prod_scale,
+                        row_src_route=arg_prod_row_src,
+                        m_tile_map=arg_m_tile_map,
+                        tile_rows_done=arg_prod_done,
+                        n_experts=n_experts,
+                        total_rows=producer_total_rows,
+                        chunk_rows=producer_chunk_rows,
+                        feat_dim=producer_feat_dim,
+                        wmma_rep=wmma_m_rep,
+                        quant_mode="fp4" if a_is_fp4 else "fp8",
+                        wire_stride=producer_wire_stride,
+                        source_topk=producer_topk,
+                        tile_m=tile_m,
+                        warp_id=(entry_id - plan_blocks) * num_waves + wave,
+                        num_warps=producer_blocks * num_waves,
+                        lane=lane,
                     )
-                    comm_ops.waitcnt_stores()
-                    workgroup_barrier()
-                    if tid == 0:
-                        comm_ops.atomic_add_system(_remap_addr, fx.Int32(1))
-                        comm_ops.spin_until_gt_i32(_remap_addr, producer_blocks - 1)
-                    workgroup_barrier()
-                emit_prequant_gather_producer(
-                    wire_in=dispatch_wire,
-                    grouped_payload=arg_a,
-                    grouped_scale=arg_prod_scale,
-                    row_src_route=arg_prod_row_src,
-                    m_tile_map=arg_m_tile_map,
-                    tile_rows_done=arg_prod_done,
-                    n_experts=n_experts,
-                    total_rows=producer_total_rows,
-                    chunk_rows=producer_chunk_rows,
-                    feat_dim=producer_feat_dim,
-                    wmma_rep=wmma_m_rep,
-                    quant_mode="fp4" if a_is_fp4 else "fp8",
-                    wire_stride=producer_wire_stride,
-                    source_topk=producer_topk,
-                    tile_m=tile_m,
-                    warp_id=(role_id - plan_blocks) * num_waves + wave,
-                    num_warps=producer_blocks * num_waves,
-                    lane=lane,
-                    runtime_total_rows=live_rows,
-                    payload_ready_base=dispatch_ready_base,
-                    payload_expected=dispatch_expected,
-                    payload_parity=dispatch_parity,
-                    payload_max_recv=dispatch_max_recv,
-                    wire_is_address=bool(fused_dispatch_on),
-                )
         else:
             bid_x = fx.block_idx.x
+
+        # Compact planning publishes the actual padded destination M during
+        # this same launch. Read it only after the planner gate; using the
+        # static capacity here would enqueue thousands of sentinel tiles.
+        gemm_m = (
+            fx.Int32(
+                buffer_ops.buffer_load(
+                    ptr_rsrc(arg_dispatch_num_valid),
+                    fx.Uint32(0),
+                    vec_width=1,
+                    is_scalar=True,
+                )
+            )
+            if dispatch_on
+            else i32_m
+        )
 
         if const_expr(work_queue_on):
             # Shard s serves exactly the work ids s, s+SHARDS, s+2*SHARDS, ...
@@ -1050,7 +950,11 @@ def launch_gemm_a8w4_tdm(
             # way, so each shard is drawn from by exactly as many workgroups as
             # it has ids to hand out.
             wq_shard = entry_id % WORK_QUEUE_SHARDS
-            wq_head = _tk_base + fx.Int64(wq_shard * WORK_QUEUE_SHARD_DWORDS * 4)
+            wq_head = _work_head_base + fx.Int64(
+                wq_shard
+                * (1 if dispatch_on else WORK_QUEUE_SHARD_DWORDS)
+                * 4
+            )
 
             def take_work():
                 """Claim the next tile for the whole workgroup (uniform)."""
@@ -1061,7 +965,7 @@ def launch_gemm_a8w4_tdm(
             # on one m_tile. Ternaries, not `if`: the rewriter would trace a branch.
             TILES_PER_GROUP = 16
             total_n_tiles = (i32_n + (tile_n - 1)) // tile_n
-            total_m_tiles = (i32_m + (tile_m - 1)) // tile_m
+            total_m_tiles = (gemm_m + (tile_m - 1)) // tile_m
             swz_id = bid_x // cluster_n if cluster_n > 1 else bid_x
             local_n = bid_x - swz_id * cluster_n if cluster_n > 1 else None
             n_units = total_n_tiles // cluster_n if cluster_n > 1 else total_n_tiles
@@ -1107,6 +1011,26 @@ def launch_gemm_a8w4_tdm(
                 lo = go_right.select(mid + 1, lo)
                 hi = go_right.select(hi, mid)
             expert = lo
+            if const_expr(dispatch_on):
+                # gfx950-style per-tile payload wait: block only on this tile's
+                # expert becoming GEMM-readable (all sources delivered payload +
+                # WMMA-interleaved scales), not on a global launch barrier.
+                # Padding tiles decode to ``expert == n_experts``; clamp so the
+                # workgroup-uniform wait never indexes payload_ready OOB (their
+                # results are masked by ``expert < n_experts`` downstream).
+                _wait_expert = (expert < fx.Int32(n_experts)).select(
+                    expert, fx.Int32(0)
+                )
+                emit_compact_wait_expert(
+                    arena_handle=dispatch_arena_handle,
+                    arena_offset=dispatch_workspace_offset,
+                    layout=dispatch_layout,
+                    rank=dispatch_rank,
+                    npes=dispatch_world,
+                    experts_per_rank=dispatch_epr,
+                    expert=_wait_expert,
+                    parity=entry_gen & fx.Int32(1),
+                )
             eb64 = fx.Int64(expert)
             B_BATCH_ROWS = n64 // 16
             N_SUPERS = (n64 + 31) // 32
@@ -2261,16 +2185,9 @@ def launch_gemm_a8w4_tdm(
         # it in the pool: the grid is sized to the machine and each workgroup
         # drains tiles until the queue is empty.
         if const_expr(work_queue_on):
-            wq_total = ((i32_m + (tile_m - 1)) // tile_m) * (
+            wq_total = ((gemm_m + (tile_m - 1)) // tile_m) * (
                 (i32_n + (tile_n - 1)) // tile_n
             )
-            if const_expr(plan_on):
-                # The planner publishes the tile-aligned live row tail before
-                # raising its epoch gate. Keep the static i32_m for allocations
-                # and graph capture, but never hand dead-tail tiles to the queue.
-                wq_total = (live_rows // fx.Int32(tile_m)) * (
-                    (i32_n + (tile_n - 1)) // tile_n
-                )
             wq_work = take_work()
             wq_more = wq_work < wq_total
             if const_expr(persist_on):
@@ -2318,6 +2235,11 @@ def launch_gemm_a8w4_tdm(
         arg_prod_scale,
         arg_prod_row_src,
         arg_prod_done,
+        arg_dispatch_wire,
+        arg_dispatch_ids,
+        arg_dispatch_weights,
+        arg_dispatch_workspace,
+        arg_dispatch_num_valid,
         arg_plan_masked_m,
         arg_plan_rows,
         arg_plan_starts,
@@ -2325,9 +2247,6 @@ def launch_gemm_a8w4_tdm(
         arg_plan_gather_w,
         arg_plan_tis,
         arg_plan_rowmap,
-        arg_dispatch_descriptor,
-        arg_dispatch_idx,
-        arg_dispatch_wts,
         i32_m,
         N,
         f32_swiglu_limit,
@@ -2335,15 +2254,15 @@ def launch_gemm_a8w4_tdm(
         f32_situ_linear_beta,
     )
     extra_blocks = producer_blocks if (producer_blocks and not producer_rejoin) else 0
-    # Arithmetic, not `if persist_on`: this launcher is a FlyDSL JIT function,
-    # so an `if` becomes an SCF region and `grid` would not be visible at the
-    # cluster launch below (NameError on the untaken-looking else). persist_on
-    # is 0/1. Persistent: grid is the machine width; otherwise one wg per tile.
-    tile_grid_x = extra_blocks + m_tiles * n_tiles
+    # Persistent: the grid is sized to the machine, not to the problem, and the
+    # queue hands each workgroup as many tiles as it can get through. An
+    # expression rather than an if: @flyc.jit rewrites if statements into
+    # functions and only the names it already knows as locals come back out, so
+    # a name that exists ONLY inside the branches is undefined after it.
     grid = (
-        persist_on * producer_persist_blocks + (1 - persist_on) * tile_grid_x,
-        1,
-        1,
+        (persist_blocks, 1, 1)
+        if persist_on
+        else (extra_blocks + m_tiles * n_tiles, 1, 1)
     )
     if cluster_n > 1:
         # Geometry must reach BOTH the definition and the launch site, or the

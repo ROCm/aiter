@@ -15,6 +15,7 @@ import torch
 from aiter import ActivationType, QuantType, dtypes, logger
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.kernels.mega_moe_gfx1250.types import (
+    Stage1DispatchContext,
     Stage1PrequantContext,
     Stage2ScatterContext,
 )
@@ -52,46 +53,10 @@ def _stage1_producer_blocks(
     raw = os.environ.get("AITER_FLYDSL_STAGE1_PRODUCER_BLOCKS", "auto").strip().lower()
     if raw != "auto":
         return max(0, int(raw))
-    return _stage1_auto_producer_blocks(device, contiguous_m, gemm1_tiles)
-
-
-def _stage1_auto_producer_blocks(
-    device: torch.device, contiguous_m: int, gemm1_tiles: int
-) -> int:
-    """Auto producer geometry, ignoring the standalone-gather override."""
     cu = _device_cu_count(device)
     producer = (int(contiguous_m) + 383) // 384
     producer = max(max(1, cu // 8), min(producer, max(1, cu // 4)))
     return min(producer, max(1, int(gemm1_tiles)))
-
-
-def _fused_stage1_producer_blocks(
-    device: torch.device, recv_bound: int, topk: int, gemm1_tiles: int
-) -> int:
-    """Gather workers sized from live-route capacity, not padded contiguous M."""
-    raw = os.environ.get("AITER_FLYDSL_STAGE1_PRODUCER_BLOCKS", "auto").strip().lower()
-    if raw not in ("", "auto", "0"):
-        return min(max(1, int(raw)), max(1, int(gemm1_tiles)))
-    live_routes = max(1, int(recv_bound) * int(topk))
-    producer = (live_routes + 383) // 384
-    cu = _device_cu_count(device)
-    # Keep the fused producer population off the 32-shard queue period.
-    # Exactly 32 repeatedly aliases queue shards after role rotation and was
-    # 1.4-1.6x slower than 33 on gfx1250.
-    producer_floor = max(1, cu // 8 + 1)
-    producer = max(producer_floor, min(producer, max(1, cu // 4)))
-    return min(producer, max(1, int(gemm1_tiles)))
-
-
-def _fused_stage1_dispatch_blocks(
-    device: torch.device, send_tokens: int, num_waves: int
-) -> int:
-    """TDM dispatch geometry independent of the later gather producers."""
-    raw = os.environ.get("AITER_FLYDSL_STAGE1_DISPATCH_BLOCKS", "auto").strip().lower()
-    if raw not in ("", "auto"):
-        return max(1, int(raw))
-    one_pass = (max(1, int(send_tokens)) + int(num_waves) - 1) // int(num_waves)
-    return min(one_pass, max(1, _device_cu_count(device) // 8))
 
 
 @functools.lru_cache(maxsize=1)
@@ -195,8 +160,7 @@ def _stage1_grid_plan(
     producer_blocks: int,
     work_queue: bool,
     gemm1_tiles: int,
-    force_fuse_plan: bool = False,
-    fused_dispatch: bool = False,
+    compact_dispatch: bool = False,
 ) -> tuple[int, bool]:
     """Persistent grid width for gemm1 and whether the plan can be fused in.
 
@@ -219,24 +183,14 @@ def _stage1_grid_plan(
             f"stage1 persist blocks={persist} is below the "
             f"{WORK_QUEUE_SHARDS} work-queue shards"
         )
-    fuse_plan = force_fuse_plan or _stage1_fuse_plan()
+    fuse_plan = True if compact_dispatch else _stage1_fuse_plan()
     if not persist and fuse_plan:
-        mult = _stage1_plan_grid_mult()
-        if fused_dispatch:
-            mult = max(
-                0.25,
-                float(
-                    os.environ.get(
-                        "AITER_FLYDSL_STAGE1_FUSED_GRID_MULT",
-                        "1.5",
-                    )
-                ),
-            )
-        persist = round(_device_cu_count(device) * mult)
+        persist = round(_device_cu_count(device) * _stage1_plan_grid_mult())
     # A persistent grid wider than the tile grid is the tile grid plus idle
     # workgroups, so cap it there -- and drop it entirely once the cap leaves
     # too few workgroups to cover every queue shard.
-    persist = min(persist, gemm1_tiles)
+    if not compact_dispatch:
+        persist = min(persist, gemm1_tiles)
     if persist < WORK_QUEUE_SHARDS:
         persist = 0
     # Ticket 0 plans and the next producer_blocks tickets gather, so a grid
@@ -686,6 +640,7 @@ def _grouped_a8w4_tdm_moe(
     num_local_tokens=None,
     stage2_scatter: Stage2ScatterContext | None = None,
     stage1_prequant: Stage1PrequantContext | None = None,
+    stage1_dispatch: Stage1DispatchContext | None = None,
     situ_beta=1.0,
     situ_linear_beta=1.0,
 ):
@@ -701,25 +656,15 @@ def _grouped_a8w4_tdm_moe(
 
     device = hidden_states.device
     token_num, topk = topk_ids.shape
-    _send_token_num = int(token_num)
-    _fused_dispatch = bool(
-        stage1_prequant is not None and stage1_prequant.fused_dispatch
-    )
-    if _fused_dispatch:
-        if (
-            E,
-            topk,
-            model_dim,
-            inter_dim,
-        ) != (192, 6, 7168, 3072):
-            raise NotImplementedError(
-                "fused gfx1250 Stage1 currently supports local E=192, topk=6, "
-                "hd=7168, id=3072 only"
-            )
-        if stage1_prequant.dispatch_descriptor is None:
-            raise ValueError("fused Stage1 dispatch descriptor is missing")
-        token_num = 2 * _send_token_num
     enable_ep_scatter = stage2_scatter is not None
+    dispatch_on = stage1_dispatch is not None
+    if dispatch_on:
+        if stage1_prequant is None or not enable_ep_scatter:
+            raise ValueError(
+                "the fused compact stage1 needs both prequant and stage2 scatter contexts"
+            )
+        if E != stage1_dispatch.experts_per_rank:
+            raise ValueError("stage1 dispatch experts_per_rank does not match w1")
     if tile_m2 is None:
         tile_m2 = tile_m
     if tile_n2 is None:
@@ -735,8 +680,13 @@ def _grouped_a8w4_tdm_moe(
     wmma_rep = get_wmma_m_rep(tile_m, tile_n, m_warp, n_warp, "gemm1")
     wmma_rep2 = get_wmma_m_rep(tile_m2, tile_n2, m_warp2, n_warp2, "gemm2")
     _align_m = max(tile_m, tile_m2)
-    contiguous_m = max(
-        _align_m, _tdm_align_up(token_num * topk + E * _align_m - topk, _align_m)
+    contiguous_m = (
+        int(stage1_dispatch.max_rows)
+        if dispatch_on
+        else max(
+            _align_m,
+            _tdm_align_up(token_num * topk + E * _align_m - topk, _align_m),
+        )
     )
     max_m = max(_align_m, _tdm_align_up(token_num * topk, _align_m))
 
@@ -756,16 +706,11 @@ def _grouped_a8w4_tdm_moe(
     _gather_w_buf = None
     _ep_nvr = None
     _ep_nvt = None
-    if _is_ep and _fused_dispatch:
-        if num_local_tokens is None:
-            raise ValueError("fused Stage1 dispatch needs the device total_recv tensor")
-        _ep_nvt = num_local_tokens.reshape(-1)[:1]
-        _ep_nvr = _ep_nvt
-        _gather_w_buf = torch.empty((token_num, topk), dtype=dtype, device=device)
-        _masked_m = torch.empty((E,), dtype=torch.int32, device=device)
-        topids_to_rows = torch.empty(
-            (token_num, topk), dtype=torch.int32, device=device
-        )
+    if dispatch_on:
+        _ep_nvt = stage1_dispatch.num_valid[:1]
+        _ep_nvr = None
+        _masked_m = None
+        topids_to_rows = None
     elif _is_ep:
         if num_local_tokens is not None:
             _ep_nvt = (
@@ -806,7 +751,9 @@ def _grouped_a8w4_tdm_moe(
     # can P2P each weighted row into peers' comb_inp.
     ep_scatter_params = None
     ep_rowmap = None
-    if enable_ep_scatter:
+    if dispatch_on:
+        ep_rowmap = stage1_dispatch.rowmap
+    elif enable_ep_scatter:
         ep_rowmap = torch.empty(
             (int(contiguous_m) + 1, 2), dtype=torch.int32, device=device
         )
@@ -831,47 +778,44 @@ def _grouped_a8w4_tdm_moe(
     _gemm1_tiles = ((contiguous_m + tile_m - 1) // tile_m) * (
         (two_inter + tile_n - 1) // tile_n
     )
-    _dispatch_blocks = 0
-    _producer_blocks = 0
-    if _wire_stride:
-        if _fused_dispatch:
-            _dispatch_blocks = _fused_stage1_dispatch_blocks(
-                device, _send_token_num, m_warp * n_warp
-            )
-            _producer_blocks = _fused_stage1_producer_blocks(
-                device, token_num, topk, _gemm1_tiles
-            )
-        else:
-            _producer_blocks = _stage1_producer_blocks(
-                device, contiguous_m, _gemm1_tiles
-            )
-    _work_queue = bool(_producer_blocks) and (
-        _fused_dispatch or _stage1_producer_work_queue()
+    _dispatch_blocks = (
+        _tdm_align_up(
+            max(
+                int(stage1_dispatch.world_size),
+                _stage1_producer_blocks(device, contiguous_m, _gemm1_tiles) or 128,
+            ),
+            int(stage1_dispatch.world_size),
+        )
+        if dispatch_on
+        else 0
     )
+    _producer_blocks = (
+        0
+        if dispatch_on
+        else (
+            _stage1_producer_blocks(device, contiguous_m, _gemm1_tiles)
+            if _wire_stride
+            else 0
+        )
+    )
+    _role_blocks = _dispatch_blocks or _producer_blocks
+    _work_queue = bool(_role_blocks) and _stage1_producer_work_queue()
     # Both tickets need the producers to rejoin: the queue because a workgroup
     # that claims a tile has to compute it, the role ticket because otherwise
     # the tile a workgroup owns is its block id minus the producer count, which
     # only decodes if producers are the low ids.
-    _role_ticket = bool(_producer_blocks) and _stage1_producer_role_ticket()
+    _role_ticket = bool(_role_blocks) and _stage1_producer_role_ticket()
     _rejoin = True if (_work_queue or _role_ticket) else _stage1_producer_rejoin()
     _persist, _fuse_plan = _stage1_grid_plan(
         device=device,
-        producer_blocks=_producer_blocks,
+        producer_blocks=_role_blocks,
         work_queue=_work_queue,
         gemm1_tiles=_gemm1_tiles,
-        force_fuse_plan=_fused_dispatch,
-        fused_dispatch=_fused_dispatch,
+        compact_dispatch=dispatch_on,
     )
-    if _fused_dispatch and not _fuse_plan:
+    if dispatch_on and not _fuse_plan:
         raise ValueError(
-            "fused Stage1 dispatch requires enough persistent blocks to seat "
-            "the planner and payload producers"
-        )
-    if _fused_dispatch and _persist < _dispatch_blocks + 1 + _producer_blocks:
-        raise ValueError(
-            f"fused Stage1 persist blocks={_persist} cannot concurrently seat "
-            f"{_dispatch_blocks} dispatch blocks, one planner, and "
-            f"{_producer_blocks} payload producers"
+            "compact stage1 persistent grid cannot seat planner plus dispatch producers"
         )
     if os.environ.get("AITER_FLYDSL_STAGE1_DEBUG", "0") == "1":
         print(
@@ -906,7 +850,9 @@ def _grouped_a8w4_tdm_moe(
         else None
     )
     _plan_kw = {}
-    if _fuse_plan:
+    if dispatch_on:
+        psum = stage1_dispatch.m_tile_map
+    elif _fuse_plan:
         # gemm1 runs the plan itself: allocate what the pass used to return and
         # hand the kernel its inputs. Same (-1, 0) ep_rowmap sentinel fill as
         # the pass did, stream-ordered ahead of the launch that overwrites the
@@ -919,7 +865,6 @@ def _grouped_a8w4_tdm_moe(
             "plan_in_kernel": 1,
             "plan_route_max_m": int(max_m),
             "plan_numel": int(token_num) * int(topk),
-            "plan_nvr_is_tokens": int(_fused_dispatch),
             "plan_ep_scatter": int(enable_ep_scatter),
             "plan_max_tok": (
                 int(ep_scatter_params["max_tok"]) if enable_ep_scatter else 0
@@ -994,20 +939,27 @@ def _grouped_a8w4_tdm_moe(
     _quant_mode = "fp4" if _is_fp4 else "fp8"
     _a_is_fp4 = 1 if _is_fp4 else 0
 
-    _a_rows = hidden_states.reshape(1, _send_token_num, -1)
+    _a_rows = None if dispatch_on else hidden_states.reshape(1, token_num, -1)
     _producer_kw = {}
-    if _producer_blocks:
-        # mega_moe v2 overlap: one persistent grid, low-ID CTAs dispatch,
-        # the planner waits on metadata_gate, GEMM consumers wait per-slot
-        # payload_ready, and dispatch CTAs rejoin the work queue. Not a second
-        # HIP stream -- gfx1250 TDM/VGPR pressure is worse if dispatch is
-        # compiled into a fatter GEMM kernel *and* extra LDS.
-        _overlap_env = os.environ.get("AITER_FLYDSL_STAGE1_DISPATCH_OVERLAP")
-        _dispatch_overlap = _fused_dispatch and (
-            _as_bool(_overlap_env, False)
-            if _overlap_env is not None
-            else True
+    if dispatch_on:
+        a1_payload = stage1_dispatch.payload.reshape(
+            1, contiguous_m, stage1_dispatch.payload_bytes
         )
+        a1_scale = stage1_dispatch.scale.reshape(
+            1,
+            contiguous_m // wmma_rep,
+            (model_dim // 32) * wmma_rep,
+        )
+        _producer_kw = {
+            "dispatch_blocks": _dispatch_blocks,
+            "dispatch_persist_blocks": int(_persist),
+            "dispatch_context": stage1_dispatch,
+            "dispatch_topk_ids": topk_ids,
+            "dispatch_weights": topk_weight,
+            "dispatch_cur_tokens": int(token_num),
+            "producer_topk": int(topk),
+        }
+    elif _producer_blocks:
         _pb = model_dim // 2 if _is_fp4 else model_dim
         a1_payload = torch.empty(
             (1, contiguous_m, _pb), dtype=torch.uint8, device=device
@@ -1038,42 +990,10 @@ def _grouped_a8w4_tdm_moe(
             "producer_topk": int(topk),
             "producer_wire_stride": _wire_stride,
             "producer_feat_dim": model_dim,
-            # On the fused path the kernel replaces this pointer with the
-            # descriptor's local recv-wire address after dispatch.
             "producer_wire": _a_rows,
             "producer_scale": a1_scale,
             "producer_row_src": _row_src,
             "producer_tile_rows_done": _tile_rows_done,
-            "fused_dispatch": int(_fused_dispatch),
-            "fused_dispatch_overlap": int(_dispatch_overlap),
-            "overlap_dispatch": 0,
-            "dispatch_descriptor": (
-                stage1_prequant.dispatch_descriptor if _fused_dispatch else None
-            ),
-            "dispatch_input_idx": topk_ids if _fused_dispatch else None,
-            "dispatch_input_wts": topk_weight if _fused_dispatch else None,
-            "dispatch_cur_tokens": _send_token_num if _fused_dispatch else 0,
-            "dispatch_blocks": _dispatch_blocks if _fused_dispatch else 0,
-            "dispatch_rank": stage1_prequant.rank if _fused_dispatch else 0,
-            "dispatch_max_recv": (
-                stage1_prequant.max_recv if _fused_dispatch else 0
-            ),
-            "dispatch_max_tokens": (
-                stage1_prequant.max_tokens_per_rank if _fused_dispatch else 0
-            ),
-            "dispatch_offsets": (
-                (
-                    stage1_prequant.off_tok_off,
-                    stage1_prequant.off_recv_num,
-                    stage1_prequant.off_tis,
-                    stage1_prequant.off_out_idx,
-                    stage1_prequant.off_out_wts,
-                    stage1_prequant.off_out_tok,
-                    stage1_prequant.off_payload_ready,
-                )
-                if _fused_dispatch
-                else (0,) * 7
-            ),
             **_plan_kw,
         }
     else:
@@ -1379,6 +1299,7 @@ def grouped_gemm_gfx1250_a8w4(
     situ_linear_beta: float = 1.0,
     stage2_scatter: Stage2ScatterContext | None = None,
     stage1_prequant: Stage1PrequantContext | None = None,
+    stage1_dispatch: Stage1DispatchContext | None = None,
 ):
     """Grouped a8w4/a4w4 MoE on the TDM batched GEMM (gfx1250).
 
@@ -1502,8 +1423,20 @@ def grouped_gemm_gfx1250_a8w4(
     tile_m = 64
     n_warp = 4
     num_buffers = 2
+    # When stage1 dispatch is fused into GEMM1, ``topk_ids`` are this rank's
+    # *local* tokens, but GEMM1 computes over the dispatched contiguous-M rows
+    # -- up to ``world_size * max_tokens_per_rank`` received tokens, exactly the
+    # recv-buffer row count the standalone dispatch path feeds this same lookup.
+    # Keying on the local token count instead picks a small-M tile (tile_m=16)
+    # sized for one rank, which is ~4x slower for GEMM1; use the received-token
+    # count so the fused path selects the same tile as dispatch + GEMM1 does.
+    _cfg_token_num = token_num
+    if stage1_dispatch is not None:
+        _cfg_token_num = (
+            stage1_dispatch.world_size * stage1_dispatch.max_tokens_per_rank
+        )
     cfg_row = _find_grouped_config(
-        token_num=_get_padded_m(token_num),
+        token_num=_get_padded_m(_cfg_token_num),
         model_dim=model_dim,
         inter_dim=inter_dim,
         experts=E,
@@ -1527,7 +1460,7 @@ def grouped_gemm_gfx1250_a8w4(
             "experts=%d topk=%d act=%s dtype=%s q_dtype_a=%s q_dtype_w=%s "
             "quant_type=%s); using defaults tile_m=%d n_warp=%d "
             "num_buffers=%d",
-            _get_padded_m(token_num),
+            _get_padded_m(_cfg_token_num),
             model_dim,
             inter_dim,
             E,
@@ -1647,6 +1580,7 @@ def grouped_gemm_gfx1250_a8w4(
             num_local_tokens=num_local_tokens,
             stage2_scatter=stage2_scatter,
             stage1_prequant=stage1_prequant,
+            stage1_dispatch=stage1_dispatch,
             situ_beta=situ_beta,
             situ_linear_beta=situ_linear_beta,
             **_tdm_kw,

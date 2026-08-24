@@ -32,6 +32,7 @@ from aiter.jit.utils.chip_info import (
 )
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.flydsl.kernels.mega_moe_gfx1250.types import (
+    Stage1DispatchContext,
     Stage1PrequantContext,
     Stage2ScatterContext,
 )
@@ -507,6 +508,7 @@ def fused_moe(
     shared_expert_id: int = -1,
     stage2_scatter: Stage2ScatterContext | None = None,
     stage1_prequant: Stage1PrequantContext | None = None,
+    stage1_dispatch: Stage1DispatchContext | None = None,
 ):
     if (
         any(
@@ -595,43 +597,51 @@ def fused_moe(
         ep_wire_payload_bytes=(
             stage1_prequant.payload_bytes if stage1_prequant is not None else 0
         ),
-        ep_fused_stage1_dispatch=(
-            bool(stage1_prequant.fused_dispatch)
-            if stage1_prequant is not None
-            else False
+        ep_s1_dispatch_arena=(
+            stage1_dispatch.arena_handle if stage1_dispatch is not None else 0
         ),
-        ep_stage1_dispatch_descriptor=(
-            stage1_prequant.dispatch_descriptor
-            if stage1_prequant is not None and stage1_prequant.fused_dispatch
-            else None
+        ep_s1_workspace_offset=(
+            stage1_dispatch.workspace_offset if stage1_dispatch is not None else 0
         ),
-        ep_stage1_rank=(stage1_prequant.rank if stage1_prequant is not None else 0),
-        ep_stage1_off_tok_off=(
-            stage1_prequant.off_tok_off if stage1_prequant is not None else 0
+        ep_s1_payload_offset=(
+            stage1_dispatch.payload_offset if stage1_dispatch is not None else 0
         ),
-        ep_stage1_off_recv_num=(
-            stage1_prequant.off_recv_num if stage1_prequant is not None else 0
+        ep_s1_row_scale_offset=(
+            stage1_dispatch.row_scale_offset if stage1_dispatch is not None else 0
         ),
-        ep_stage1_off_tis=(
-            stage1_prequant.off_tis if stage1_prequant is not None else 0
+        ep_s1_scale_offset=(
+            stage1_dispatch.scale_offset if stage1_dispatch is not None else 0
         ),
-        ep_stage1_off_out_idx=(
-            stage1_prequant.off_out_idx if stage1_prequant is not None else 0
+        ep_s1_rowmap_offset=(
+            stage1_dispatch.rowmap_offset if stage1_dispatch is not None else 0
         ),
-        ep_stage1_off_out_wts=(
-            stage1_prequant.off_out_wts if stage1_prequant is not None else 0
+        ep_s1_m_tile_map_offset=(
+            stage1_dispatch.m_tile_map_offset if stage1_dispatch is not None else 0
         ),
-        ep_stage1_off_out_tok=(
-            stage1_prequant.off_out_tok if stage1_prequant is not None else 0
+        ep_s1_num_valid_offset=(
+            stage1_dispatch.num_valid_offset if stage1_dispatch is not None else 0
         ),
-        ep_stage1_off_payload_ready=(
-            stage1_prequant.off_payload_ready if stage1_prequant is not None else 0
+        ep_s1_rank=stage1_dispatch.rank if stage1_dispatch is not None else 0,
+        ep_s1_world=stage1_dispatch.world_size if stage1_dispatch is not None else 0,
+        ep_s1_epr=(
+            stage1_dispatch.experts_per_rank if stage1_dispatch is not None else 0
         ),
-        ep_stage1_max_recv=(
-            stage1_prequant.max_recv if stage1_prequant is not None else 0
+        ep_s1_mtpr=(
+            stage1_dispatch.max_tokens_per_rank if stage1_dispatch is not None else 0
         ),
-        ep_stage1_max_tokens=(
-            stage1_prequant.max_tokens_per_rank if stage1_prequant is not None else 0
+        ep_s1_max_rows=stage1_dispatch.max_rows if stage1_dispatch is not None else 0,
+        ep_s1_wire=stage1_dispatch.wire if stage1_dispatch is not None else None,
+        ep_s1_workspace=(
+            stage1_dispatch.workspace if stage1_dispatch is not None else None
+        ),
+        ep_s1_payload=stage1_dispatch.payload if stage1_dispatch is not None else None,
+        ep_s1_scale=stage1_dispatch.scale if stage1_dispatch is not None else None,
+        ep_s1_rowmap=stage1_dispatch.rowmap if stage1_dispatch is not None else None,
+        ep_s1_num_valid=(
+            stage1_dispatch.num_valid if stage1_dispatch is not None else None
+        ),
+        ep_s1_m_tile_map=(
+            stage1_dispatch.m_tile_map if stage1_dispatch is not None else None
         ),
     )
 
@@ -672,18 +682,26 @@ def fused_moe_fake(
     ep_source_token_map: torch.Tensor | None = None,
     ep_wire_stride_bytes: int = 0,
     ep_wire_payload_bytes: int = 0,
-    ep_fused_stage1_dispatch: bool = False,
-    ep_stage1_dispatch_descriptor: torch.Tensor | None = None,
-    ep_stage1_rank: int = 0,
-    ep_stage1_off_tok_off: int = 0,
-    ep_stage1_off_recv_num: int = 0,
-    ep_stage1_off_tis: int = 0,
-    ep_stage1_off_out_idx: int = 0,
-    ep_stage1_off_out_wts: int = 0,
-    ep_stage1_off_out_tok: int = 0,
-    ep_stage1_off_payload_ready: int = 0,
-    ep_stage1_max_recv: int = 0,
-    ep_stage1_max_tokens: int = 0,
+    ep_s1_dispatch_arena: int = 0,
+    ep_s1_workspace_offset: int = 0,
+    ep_s1_payload_offset: int = 0,
+    ep_s1_row_scale_offset: int = 0,
+    ep_s1_scale_offset: int = 0,
+    ep_s1_rowmap_offset: int = 0,
+    ep_s1_m_tile_map_offset: int = 0,
+    ep_s1_num_valid_offset: int = 0,
+    ep_s1_rank: int = 0,
+    ep_s1_world: int = 0,
+    ep_s1_epr: int = 0,
+    ep_s1_mtpr: int = 0,
+    ep_s1_max_rows: int = 0,
+    ep_s1_wire: torch.Tensor | None = None,
+    ep_s1_workspace: torch.Tensor | None = None,
+    ep_s1_payload: torch.Tensor | None = None,
+    ep_s1_scale: torch.Tensor | None = None,
+    ep_s1_rowmap: torch.Tensor | None = None,
+    ep_s1_num_valid: torch.Tensor | None = None,
+    ep_s1_m_tile_map: torch.Tensor | None = None,
 ) -> torch.Tensor:
     device = topk_ids.device
     M, _topk = topk_ids.shape
@@ -730,18 +748,26 @@ def fused_moe_(
     ep_source_token_map: torch.Tensor | None = None,
     ep_wire_stride_bytes: int = 0,
     ep_wire_payload_bytes: int = 0,
-    ep_fused_stage1_dispatch: bool = False,
-    ep_stage1_dispatch_descriptor: torch.Tensor | None = None,
-    ep_stage1_rank: int = 0,
-    ep_stage1_off_tok_off: int = 0,
-    ep_stage1_off_recv_num: int = 0,
-    ep_stage1_off_tis: int = 0,
-    ep_stage1_off_out_idx: int = 0,
-    ep_stage1_off_out_wts: int = 0,
-    ep_stage1_off_out_tok: int = 0,
-    ep_stage1_off_payload_ready: int = 0,
-    ep_stage1_max_recv: int = 0,
-    ep_stage1_max_tokens: int = 0,
+    ep_s1_dispatch_arena: int = 0,
+    ep_s1_workspace_offset: int = 0,
+    ep_s1_payload_offset: int = 0,
+    ep_s1_row_scale_offset: int = 0,
+    ep_s1_scale_offset: int = 0,
+    ep_s1_rowmap_offset: int = 0,
+    ep_s1_m_tile_map_offset: int = 0,
+    ep_s1_num_valid_offset: int = 0,
+    ep_s1_rank: int = 0,
+    ep_s1_world: int = 0,
+    ep_s1_epr: int = 0,
+    ep_s1_mtpr: int = 0,
+    ep_s1_max_rows: int = 0,
+    ep_s1_wire: torch.Tensor | None = None,
+    ep_s1_workspace: torch.Tensor | None = None,
+    ep_s1_payload: torch.Tensor | None = None,
+    ep_s1_scale: torch.Tensor | None = None,
+    ep_s1_rowmap: torch.Tensor | None = None,
+    ep_s1_num_valid: torch.Tensor | None = None,
+    ep_s1_m_tile_map: torch.Tensor | None = None,
 ) -> torch.Tensor:
     stage2_scatter = None
     if ep_source_token_map is not None:
@@ -758,25 +784,32 @@ def fused_moe_(
         stage1_prequant = Stage1PrequantContext(
             stride_bytes=ep_wire_stride_bytes,
             payload_bytes=ep_wire_payload_bytes,
-            fused_dispatch=ep_fused_stage1_dispatch,
-            dispatch_descriptor=ep_stage1_dispatch_descriptor,
-            world_size=2 if ep_fused_stage1_dispatch else 0,
-            max_tokens_per_rank=(
-                int(ep_stage1_max_tokens)
-                if ep_fused_stage1_dispatch
-                else 0
-            ),
-            max_recv=(
-                int(ep_stage1_max_recv) if ep_fused_stage1_dispatch else 0
-            ),
-            rank=ep_stage1_rank,
-            off_tok_off=ep_stage1_off_tok_off,
-            off_recv_num=ep_stage1_off_recv_num,
-            off_tis=ep_stage1_off_tis,
-            off_out_idx=ep_stage1_off_out_idx,
-            off_out_wts=ep_stage1_off_out_wts,
-            off_out_tok=ep_stage1_off_out_tok,
-            off_payload_ready=ep_stage1_off_payload_ready,
+        )
+    stage1_dispatch = None
+    if ep_s1_wire is not None:
+        stage1_dispatch = Stage1DispatchContext(
+            arena_handle=ep_s1_dispatch_arena,
+            workspace_offset=ep_s1_workspace_offset,
+            payload_offset=ep_s1_payload_offset,
+            row_scale_offset=ep_s1_row_scale_offset,
+            scale_offset=ep_s1_scale_offset,
+            rowmap_offset=ep_s1_rowmap_offset,
+            m_tile_map_offset=ep_s1_m_tile_map_offset,
+            num_valid_offset=ep_s1_num_valid_offset,
+            rank=ep_s1_rank,
+            world_size=ep_s1_world,
+            experts_per_rank=ep_s1_epr,
+            max_tokens_per_rank=ep_s1_mtpr,
+            max_rows=ep_s1_max_rows,
+            wire_stride_bytes=ep_wire_stride_bytes,
+            payload_bytes=ep_wire_payload_bytes,
+            wire=ep_s1_wire,
+            workspace=ep_s1_workspace,
+            payload=ep_s1_payload,
+            scale=ep_s1_scale,
+            rowmap=ep_s1_rowmap,
+            num_valid=ep_s1_num_valid,
+            m_tile_map=ep_s1_m_tile_map,
         )
     return _fused_moe_impl(
         hidden_states=hidden_states,
@@ -806,6 +839,7 @@ def fused_moe_(
         gate_mode=gate_mode,
         stage2_scatter=stage2_scatter,
         stage1_prequant=stage1_prequant,
+        stage1_dispatch=stage1_dispatch,
     )
 
 
@@ -837,6 +871,7 @@ def _fused_moe_impl(
     gate_mode: str = GateMode.SEPARATED.value,
     stage2_scatter: Stage2ScatterContext | None = None,
     stage1_prequant: Stage1PrequantContext | None = None,
+    stage1_dispatch: Stage1DispatchContext | None = None,
     *,
     _q_dtype_a: torch.dtype | None = None,
     _metadata_transform: Callable | None = None,
@@ -968,6 +1003,7 @@ def _fused_moe_impl(
                 situ_linear_beta=1.0 if linear_beta is None else float(linear_beta),
                 stage2_scatter=stage2_scatter,
                 stage1_prequant=stage1_prequant,
+                stage1_dispatch=stage1_dispatch,
             )
 
     if grouped_a8w4_out is not None:
