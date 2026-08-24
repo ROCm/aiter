@@ -802,7 +802,13 @@ def mla_decode_fwd(
                 and max_seqlen_q == 2
             )
             or (
-                get_gfx() == "gfx942"
+                # [glm-dsa gqa64 fix] DISABLED: this native-support claim routes GLM-5.1
+                # gqa64 fp8 decode to mla_a8w8_qh64_qseqlen1_gqaratio64_v3_ps, which
+                # GPU-faults on gfx942. Force False so gqa64 falls through to the
+                # capture-safe persistent view-fold (nhead in range(32,128,16) below),
+                # which keeps cudagraph decode working (no in-forward allocations).
+                False
+                and get_gfx() == "gfx942"
                 and nhead == 64
                 and q.dtype == dtypes.fp8
                 and kv_buffer.dtype == dtypes.fp8
