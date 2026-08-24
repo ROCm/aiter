@@ -918,15 +918,12 @@ def atomic_bf16_epilog(
 
     stids = flat_buffer(arg_stids, T.i32, 4)
     sweights = flat_buffer(arg_sweights, T.f32, 4)
-    out_bf16 = flat_buffer(arg_out, T.bf16, 4)
+    out_bf16 = flat_buffer(arg_out, T.bf16, 4, _out_nrec)
     out_bf16_ptr = global_typed_ptr(arg_out, T.bf16, align=2)
-    out_i8 = flat_buffer(arg_out, T.i8, 4)
+    out_i8 = flat_buffer(arg_out, T.i8, 4, _out_nrec)
 
     load_i32 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), Int32)
     load_f32 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), Float32)
-    store_bf16x2 = fx.make_copy_atom(
-        fx.rocdl.BufferCopy32b(STORE_CACHE_MODIFIER), BFloat16
-    )
     atomic_bf16x2 = fx.make_copy_atom(fx.rocdl.BufferAtomicPkAdd(BFloat16), BFloat16)
     store_i32 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(STORE_CACHE_MODIFIER), Int32)
     store_i8 = fx.make_copy_atom(fx.rocdl.BufferCopy8b(STORE_CACHE_MODIFIER), Int8)
@@ -1008,8 +1005,9 @@ def atomic_bf16_epilog(
     # token_id<i32_M gates padding at runtime. At small/mid M the block-sparse sort floor is
     # ~97% padding rows (M64: 12288 pad vs 384 real); ungated, every padding row (token_id==M) issues
     # a weighted atomic-fadd into an OOB out-row -> 77x wasted atomics + L2 RMW serialization
-    # (rocprof M64: TCC_ATOMIC 7.3M->95K, 932us->107us). Always gate; reduce already gated via
-    # use_reduce. (fp4-atomic families are gated too -> strictly correct OOB-skip, kernel IR changes.)
+    # (rocprof M64: TCC_ATOMIC 7.3M->95K, 932us->107us). Reduce mode needs the
+    # same gate: its raw-pointer store is not protected by a buffer descriptor,
+    # so padding rows otherwise write beyond [M, topk, N].
 
     def store_one_mr(mr):
         row_in_block = fx.Int32(mr * EPI_ROWS) + m_lane
@@ -1179,13 +1177,9 @@ def atomic_bf16_epilog(
     for mr in range_constexpr(M_REPS):
         token_id = packed[mr] & fx.Int32(0x00FFFFFF)
 
-        if const_expr(use_reduce):
-            store_one_mr(mr)
-        else:
+        @flyc.jit
+        def store_if_valid(token_id, mr):
+            if token_id < i32_M:
+                store_one_mr(mr)
 
-            @flyc.jit
-            def store_if_valid(token_id, mr):
-                if token_id < i32_M:
-                    store_one_mr(mr)
-
-            store_if_valid(token_id, mr)
+        store_if_valid(token_id, mr)
