@@ -24,6 +24,16 @@ _TORCH_ACTIVATIONS = {
 }
 
 
+def _check_backend(backend):
+    """Run only the backend the card actually uses: gluon on gfx1250, triton
+    everywhere else, so gfx1250 skips the triton cases and vice versa."""
+    on_gfx1250 = get_arch() in ("gfx1250",)
+    if backend == "gluon" and not on_gfx1250:
+        pytest.skip("gluon backend requires gfx1250")
+    if backend == "triton" and on_gfx1250:
+        pytest.skip("gfx1250 runs the gluon backend only")
+
+
 def _torch_reference(inp, swiglu_limit, weights, dtype_quant, activation="silu"):
     gate, up = inp.chunk(2, dim=-1)
     gate = gate.float()
@@ -61,10 +71,7 @@ def test_fused_clamp_act_mul(
     backend,
 ):
 
-    if backend == "gluon" and not get_arch() in ("gfx1250",):
-        pytest.skip("gluon backend requires gfx1250")
-    if backend == "triton" and get_arch() in ("gfx1250",):
-        pytest.skip("gfx1250 runs the gluon backend only")
+    _check_backend(backend)
     torch.manual_seed(42)
     N = D // 2
     if with_weights:
@@ -141,10 +148,7 @@ def test_fused_clamp_act_mul_weights_multirow_tile(
 ):
     """Weights must be applied per row when a tile stages BLOCK_SIZE_M > 1 rows."""
 
-    if backend == "gluon" and not get_arch() in ("gfx1250",):
-        pytest.skip("gluon backend requires gfx1250")
-    if backend == "triton" and get_arch() in ("gfx1250",):
-        pytest.skip("gfx1250 runs the gluon backend only")
+    _check_backend(backend)
 
     config = _get_config(M, n_half, n_half, backend)
     block_m = config.get("BLOCK_SIZE_M", 1)
@@ -182,10 +186,7 @@ def test_fused_clamp_act_mul_broadcast_matches_expanded(M, n_half, backend):
     The two take different code paths so testing if they match, and checked with
     torch.
     """
-    if backend == "gluon" and not get_arch() in ("gfx1250",):
-        pytest.skip("gluon backend requires gfx1250")
-    if backend == "triton" and get_arch() in ("gfx1250",):
-        pytest.skip("gfx1250 runs the gluon backend only")
+    _check_backend(backend)
 
     torch.manual_seed(3)
     inp = torch.randn(M, 2 * n_half, device="cuda", dtype=torch.bfloat16)
@@ -219,10 +220,7 @@ def test_fused_clamp_act_mul_full_weights_vary_along_n(M, n_half, backend):
     A kernel that collapsed [M, N] weights to one value per row would still
     pass a broadcast-only test, so every column has a distinct factor.
     """
-    if backend == "gluon" and not get_arch() in ("gfx1250",):
-        pytest.skip("gluon backend requires gfx1250")
-    if backend == "triton" and get_arch() in ("gfx1250",):
-        pytest.skip("gfx1250 runs the gluon backend only")
+    _check_backend(backend)
 
     torch.manual_seed(4)
     inp = torch.randn(M, 2 * n_half, device="cuda", dtype=torch.bfloat16)
@@ -249,10 +247,7 @@ def test_fused_clamp_act_mul_weights_with_quant(M, n_half, weight_broadcast, bac
     the path the multi-row tuned configs are actually used on.
     """
 
-    if backend == "gluon" and not get_arch() in ("gfx1250",):
-        pytest.skip("gluon backend requires gfx1250")
-    if backend == "triton" and get_arch() in ("gfx1250",):
-        pytest.skip("gfx1250 runs the gluon backend only")
+    _check_backend(backend)
 
     torch.manual_seed(6)
     inp = torch.randn(M, 2 * n_half, device="cuda", dtype=torch.bfloat16)
@@ -328,10 +323,7 @@ def test_fused_clamp_act_mul_ue8m0(
     reference; when ``shuffle_scale`` is set the kernel must lay the scales out
     exactly like ``fp4_utils.e8m0_shuffle`` applied to the unshuffled scales."""
 
-    if backend == "gluon" and not get_arch() in ("gfx1250",):
-        pytest.skip("gluon backend requires gfx1250")
-    if backend == "triton" and get_arch() in ("gfx1250",):
-        pytest.skip("gfx1250 runs the gluon backend only")
+    _check_backend(backend)
     torch.manual_seed(42)
     N = D // 2
     quant_block_size = 32
@@ -387,10 +379,7 @@ def test_fused_clamp_act_mul_ue8m0(
 @pytest.mark.parametrize("backend", ["triton", "gluon"])
 def test_fused_clamp_act_mul_activations(M, D, activation, dtype_quant, backend):
     """Every activation path must match the torch reference."""
-    if backend == "gluon" and get_arch() not in ("gfx1250",):
-        pytest.skip("gluon backend requires gfx1250")
-    if backend == "triton" and get_arch() in ("gfx1250",):
-        pytest.skip("gfx1250 runs the gluon backend only")
+    _check_backend(backend)
 
     torch.manual_seed(42)
     inp = torch.randn(M, D, device="cuda", dtype=torch.bfloat16)
@@ -437,10 +426,7 @@ def test_fused_clamp_act_mul_activations(M, D, activation, dtype_quant, backend)
 @pytest.mark.parametrize("backend", ["triton", "gluon"])
 def test_fused_clamp_act_mul_large_n_configs(M, n_half, dtype_quant, backend):
     """Exercise tuned configs at N=4096 and N=8192 with ROWS_PER_PROG > 1."""
-    if backend == "gluon" and get_arch() not in ("gfx1250",):
-        pytest.skip("gluon backend requires gfx1250")
-    if backend == "triton" and get_arch() in ("gfx1250",):
-        pytest.skip("gfx1250 runs the gluon backend only")
+    _check_backend(backend)
 
     torch.manual_seed(7)
     inp = torch.randn(M, 2 * n_half, device="cuda", dtype=torch.bfloat16)
@@ -521,10 +507,7 @@ def test_fused_clamp_act_mul_backend_auto(M, D, dtype_quant):
 @pytest.mark.parametrize("backend", ["triton", "gluon"])
 def test_fused_clamp_act_mul_odd_m_tail(M, n_half, dtype_quant, backend):
     """Partial last tile: M not divisible by BLOCK_SIZE_M * ROWS_PER_PROG."""
-    if backend == "gluon" and get_arch() not in ("gfx1250",):
-        pytest.skip("gluon backend requires gfx1250")
-    if backend == "triton" and get_arch() in ("gfx1250",):
-        pytest.skip("gfx1250 runs the gluon backend only")
+    _check_backend(backend)
 
     torch.manual_seed(99)
     inp = torch.randn(M, 2 * n_half, device="cuda", dtype=torch.bfloat16)
@@ -562,10 +545,7 @@ def test_fused_clamp_act_mul_odd_m_tail(M, n_half, dtype_quant, backend):
 @pytest.mark.parametrize("backend", ["triton", "gluon"])
 def test_fused_clamp_act_mul_float16_input(M, D, dtype_quant, backend):
     """float16 inputs must work identically to bfloat16."""
-    if backend == "gluon" and get_arch() not in ("gfx1250",):
-        pytest.skip("gluon backend requires gfx1250")
-    if backend == "triton" and get_arch() in ("gfx1250",):
-        pytest.skip("gfx1250 runs the gluon backend only")
+    _check_backend(backend)
 
     torch.manual_seed(42)
     inp = torch.randn(M, D, device="cuda", dtype=torch.float16)
