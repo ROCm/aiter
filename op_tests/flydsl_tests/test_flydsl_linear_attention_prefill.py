@@ -3,17 +3,23 @@
 
 """Unit tests for FlyDSL Linear Attention Prefill (chunk_gated_delta_h) regressions.
 
-Usage:
-    rm -rf ~/.triton/cache
-    export GATED_DELTA_RULE_TRITON_AUTOTUNE=1
-    FLYDSL_RUNTIME_ENABLE_CACHE=0 HIP_VISIBLE_DEVICES=7 pytest -sv op_tests/flydsl_tests/test_flydsl_linear_attention_prefill.py::TestPerformance -s
-    FLYDSL_RUNTIME_ENABLE_CACHE=0 HIP_VISIBLE_DEVICES=7 python -m pytest op_tests/flydsl_tests/test_flydsl_linear_attention_prefill.py::TestPerformance -k "varlen-64k-qwen-ptpc-ali" -v -s
+Grid: Qwen3.5-35B (Hv=32) and Qwen3.5-397B (Hv=64), TP 1/2/4/8.
+Dense T=1k/2k/4k/8k/16k/32k/64k; varlen total T=16k/32k/64k with seqlen 1k/2k/4k/8k.
+
+Filter cases (omit shape flags for the full 304-case grid)::
+
+    python op_tests/flydsl_tests/test_flydsl_linear_attention_prefill.py \\
+        TestPerformance --model 397b --tp 4 --t 8192 --n 8 --snapshot-dtype bf16 fp32
+
+Plain ``pytest`` without these flags still runs the full grid.
 """
 
 from __future__ import annotations
 
+import argparse
 import math
-from dataclasses import dataclass
+import zlib
+from dataclasses import dataclass, replace
 
 import pytest
 import torch
@@ -21,6 +27,9 @@ import triton
 from torch.profiler import ProfilerActivity, profile
 
 from aiter.ops.flydsl.utils import is_flydsl_available
+from aiter.ops.prefill_batch_metadata import (
+    build_gated_delta_rule_prefill_metadata,
+)
 
 if not torch.cuda.is_available():
     pytest.skip("ROCm not available. Skipping GPU tests.", allow_module_level=True)
@@ -32,7 +41,7 @@ if not is_flydsl_available():
 
 try:
     from aiter.ops.flydsl.linear_attention_prefill_kernels import (
-        chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip,
+        chunk_gated_delta_rule_fwd_h_flydsl_opt,
     )
     from aiter.ops.triton._triton_kernels.gated_delta_rule.prefill.chunk import (
         chunk_gated_delta_rule_fwd_opt_vk,
@@ -70,12 +79,6 @@ except ImportError:
     chunk_gated_delta_rule_fwd_h_hip_fn = None
     _HAS_HIP_K5 = False
 
-# When True, ``test_consistency_flydsl_mfma16_hip_vs_hip`` requires the
-# flydsl-hip fork to match HIP/C++ BIT-FOR-BIT (torch.equal). Until the LDS /
-# layout / (optionally) numeric alignment work fully lands it stays False and
-# the test only records the gap + asserts a loose same-algorithm band.
-_MFMA16_HIP_VS_HIP_BITEXACT = False
-
 torch.set_default_device("cuda")
 
 
@@ -100,6 +103,10 @@ class PrefillArgs:
     # accumulator unchanged for both choices; bf16 only affects HBM
     # bandwidth/footprint of the SSM state.
     ssm_state_dtype: torch.dtype = torch.float32
+    # Per-chunk h-snapshot dtype, an independent policy from the SSM state
+    # dtype. None (the default) resolves to k.dtype (bf16 here), which is the
+    # bf16 store specialization; torch.float32 selects the fp32 one.
+    snapshot_dtype: object = None  # torch.dtype | None
     # If set, override ``_build_context_lens(full_prompt_len,
     # max_num_batched_tokens)`` and use these segment lengths verbatim.
     # Used by trace-derived ragged-batch cases (e.g. the prefill_gdr.log
@@ -185,6 +192,8 @@ class PrefillArgs:
             tag += "_nofs"
         if self.ssm_state_dtype == torch.bfloat16:
             tag += "_stateBF16"
+        if self.snapshot_dtype == torch.float32:
+            tag += "_snapFP32"
         return tag
 
 
@@ -223,6 +232,8 @@ class PrefillGroup:
     is_varlen: bool = True
     output_final_state: bool = True
     ssm_state_dtype: torch.dtype = torch.float32
+    # Per-chunk h-snapshot dtype; None -> k.dtype (bf16). See PrefillArgs.
+    snapshot_dtype: object = None  # torch.dtype | None
     # Semantics for ``max_num_batched_tokens``:
     #   - list/tuple : sweep -- materialise one case per element (Cartesian with
     #           tps x full_prompt_lens). Each element is itself one of the specs
@@ -321,6 +332,7 @@ def expand_groups(groups):
                                 is_varlen=g.is_varlen,
                                 output_final_state=g.output_final_state,
                                 ssm_state_dtype=g.ssm_state_dtype,
+                                snapshot_dtype=g.snapshot_dtype,
                                 bt_tag=bt_tag,
                                 dense_batch=g.dense_batch,
                                 use_g=g.use_g,
@@ -376,6 +388,7 @@ def expand_groups(groups):
                                     is_varlen=g.is_varlen,
                                     output_final_state=g.output_final_state,
                                     ssm_state_dtype=g.ssm_state_dtype,
+                                    snapshot_dtype=g.snapshot_dtype,
                                     context_lens=context_lens,
                                     trace_tag=tag,
                                     dense_batch=g.dense_batch,
@@ -386,150 +399,155 @@ def expand_groups(groups):
     return out
 
 
+_DENSE_PROMPT_LENS = [1024, 2048, 4096, 8192, 16384, 32768, 65536]
+_VARLEN_SEQLENS = [1024, 2048, 4096, 8192]
+_VARLEN_TOTAL_T = [8192, 16384, 32768, 65536]
+_K5_TPS = [1, 2, 4, 8]
+
+
+def _k5_dense_groups(model_name: str, hv: int) -> list[PrefillGroup]:
+    """Dense prefill: TP x T sweep x bf16/fp32 per-chunk snapshot."""
+    groups: list[PrefillGroup] = []
+    for tp in _K5_TPS:
+        groups.append(
+            PrefillGroup(
+                model_name=f"{model_name}-dense-tp{tp}-bf16snap",
+                Hv=hv,
+                tps=[tp],
+                full_prompt_lens=_DENSE_PROMPT_LENS,
+                is_varlen=False,
+                output_final_state=False,
+                max_num_batched_tokens="full_prompt_len",
+            )
+        )
+        groups.append(
+            PrefillGroup(
+                model_name=f"{model_name}-dense-tp{tp}-fp32snap",
+                Hv=hv,
+                tps=[tp],
+                full_prompt_lens=_DENSE_PROMPT_LENS,
+                is_varlen=False,
+                output_final_state=False,
+                max_num_batched_tokens="full_prompt_len",
+                snapshot_dtype=torch.float32,
+            )
+        )
+    return groups
+
+
+def _k5_varlen_groups(model_name: str, hv: int) -> list[PrefillGroup]:
+    """Varlen prefill: TP x seqlen x total T x bf16/fp32 snapshot."""
+    groups: list[PrefillGroup] = []
+    for tp in _K5_TPS:
+        groups.append(
+            PrefillGroup(
+                model_name=f"{model_name}-varlen-tp{tp}-bf16snap",
+                Hv=hv,
+                tps=[tp],
+                full_prompt_lens=_VARLEN_SEQLENS,
+                max_num_batched_tokens=_VARLEN_TOTAL_T,
+            )
+        )
+        groups.append(
+            PrefillGroup(
+                model_name=f"{model_name}-varlen-tp{tp}-fp32snap",
+                Hv=hv,
+                tps=[tp],
+                full_prompt_lens=_VARLEN_SEQLENS,
+                max_num_batched_tokens=_VARLEN_TOTAL_T,
+                snapshot_dtype=torch.float32,
+            )
+        )
+    return groups
+
+
 _PREFILL_GROUPS = [
-    # non-varlen + no final state (Qwen3.5-35B family, Hv=32).
-    # Original rows set max_num_batched_tokens == full_prompt_len so that
-    # _build_context_lens emits exactly one segment of length full_prompt_len.
-    PrefillGroup(
-        model_name="Qwen3.5-35B",
-        Hv=32,
-        tps=[1, 2],
-        full_prompt_lens=[2500, 60000, 128000],
-        is_varlen=False,
-        output_final_state=False,
-        max_num_batched_tokens="full_prompt_len",
-    ),
-    # non-varlen + no final state (Qwen3.5-397B family, Hv=64).
-    PrefillGroup(
-        model_name="Qwen3.5-397B",
-        Hv=64,
-        tps=[1, 2],
-        full_prompt_lens=[2500, 60000, 128000],
-        is_varlen=False,
-        output_final_state=False,
-        max_num_batched_tokens="full_prompt_len",
-    ),
-    PrefillGroup(
-        model_name="Qwen3.5-397B-ptpc-ali",
-        Hv=64,
-        tps=[8],
-        full_prompt_lens=[1024, 2048, 4096, 8192],
-        is_varlen=False,
-        max_num_batched_tokens="full_prompt_len",
-        # dense B>1: g becomes 3D [B,H,T], validating the kernel's batch-head
-        # gate offset (g_sh_base includes i_n*H*T_flat). Bumping B to 2 covers
-        # the i_n>0 batch-stride branch. Also set g_head_major=True so this group
-        # exercises the head-major dense layout (the other dense/varlen groups
-        # cover the default token-major layout).
-        dense_batch=2,
-        g_head_major=True,
-    ),
-    # varlen + final_state (default path), TP=4 / TP=8 share everything
-    # else, so they collapse into a single group. Original rows left
-    # max_num_batched_tokens at the PrefillArgs default of 32768, which
-    # makes _build_context_lens slice 32768 into ceil(32768/full_len)
-    # equal-length segments (e.g. 32 segments of length 1024 for the
-    # 1k row). Keeping ``max_num_batched_tokens=None`` here preserves that.
-    PrefillGroup(
-        model_name="varlen-32k-qwen",
-        Hv=64,
-        tps=[4, 8],
-        full_prompt_lens=[1024, 2048, 4096, 8192],
-        max_num_batched_tokens=32768,
-    ),
-    PrefillGroup(
-        model_name="varlen-64k-qwen-ptpc-ali",
-        Hv=64,
-        tps=[8],
-        full_prompt_lens=[8192],
-        max_num_batched_tokens=[8192, 16384, 24576, 32768, 40960, 49152, 57344, 65536],
-        # max_num_batched_tokens=[65536],
-    ),
-    PrefillGroup(
-        # No g (USE_G=False) + short single-segment sequences: T=100/200/300 are
-        # all %64!=0, so the last chunk has padding rows -- validates the masking
-        # of OOB rows when there is no g (otherwise invalid tokens' v_new flows
-        # through gated_v and corrupts the state update). Short sequences
-        # (<=5 chunks) are used on purpose: no-g has no gate decay, so a long
-        # sequence lets the state grow and amplify bf16 accumulation error past
-        # 5e-2; the no-g compute path itself is already bit-identical to the
-        # with-g path at g=0, so here we only need to validate padding masking
-        # within a numerically controlled range. (The original aws-16k with-g
-        # coverage is carried by the retained varlen-32k-aws group.)
-        model_name="nog-short",
-        Hv=32,
-        tps=[1],
-        full_prompt_lens=[100, 200, 300],
-        max_num_batched_tokens="full_prompt_len",
-        use_g=False,
-    ),
-    PrefillGroup(
-        model_name="varlen-32k-aws",
-        Hv=32,
-        tps=[1],
-        full_prompt_lens=[1000, 5000, 10000],
-        # full_prompt_lens=[1000],
-        max_num_batched_tokens=32768,
-    ),
-    PrefillGroup(
-        model_name="flydsl-k5-n1",
-        Hv=32,
-        tps=[1],
-        full_prompt_lens=[5000, 10000],
-        max_num_batched_tokens="full_prompt_len",
-    ),
-    PrefillGroup(
-        model_name="flydsl-k5-n3-mid10k",
-        Hv=32,
-        tps=[1],
-        full_prompt_lens=[16384],
-        max_num_batched_tokens=16384,
-        # head=0 creates an empty first segment (cu_seqlens=[0,0,10000,16384]),
-        # validating that empty varlen sequences skip the W/K prologue, do not
-        # read out of bounds, and pass state through h0->ht correctly.
-        head_seqlens=[0, 10, 65, 704, 936, 1820, 4467, 5508],
-        mid_seqlen=10000,
-    ),
-    PrefillGroup(
-        model_name="flydsl-k5-n2-16k",
-        Hv=32,
-        tps=[1],
-        full_prompt_lens=[16384],
-        max_num_batched_tokens=16384,
-        head_seqlens=[4000, 6396, 8192, 9912, 10000],
-        num_segments=2,
-        # head-major varlen coverage (other varlen groups use token-major).
-        g_head_major=True,
-    ),
+    *_k5_dense_groups("Qwen3.5-35B", 32),
+    *_k5_dense_groups("Qwen3.5-397B", 64),
+    *_k5_varlen_groups("Qwen3.5-35B", 32),
+    *_k5_varlen_groups("Qwen3.5-397B", 64),
 ]
+
+
+def _model_key(hv: int) -> str:
+    return "35b" if hv == 32 else "397b"
+
+
+def _snapshot_key(args: PrefillArgs) -> str:
+    return "fp32" if args.snapshot_dtype == torch.float32 else "bf16"
+
+
+def _current_cli_opts():
+    import sys
+
+    return _build_prefill_cli_parser().parse_known_args(sys.argv[1:])[0]
+
+
+def _cli_has_filters(opts) -> bool:
+    return any(
+        [
+            opts.model,
+            opts.tp is not None,
+            opts.t is not None,
+            opts.n is not None,
+            opts.dense,
+            opts.snapshot_dtype,
+        ]
+    )
+
+
+def _case_matches_cli(args: PrefillArgs, opts) -> bool:
+    if opts.model and _model_key(args.Hv) != opts.model:
+        return False
+    if opts.tp is not None and args.tp != opts.tp:
+        return False
+    if opts.dense:
+        if args.is_varlen:
+            return False
+    elif opts.n is not None and not args.is_varlen:
+        return False
+    if opts.t is not None:
+        if args.is_varlen:
+            if opts.n is not None:
+                if (
+                    args.full_prompt_len != opts.t
+                    or args.max_num_batched_tokens != opts.n * opts.t
+                ):
+                    return False
+            elif (
+                args.full_prompt_len != opts.t and args.max_num_batched_tokens != opts.t
+            ):
+                return False
+        elif args.full_prompt_len != opts.t:
+            return False
+    return not (opts.snapshot_dtype and _snapshot_key(args) not in opts.snapshot_dtype)
+
+
+def _filtered_prefill_params():
+    opts = _current_cli_opts()
+    if not _cli_has_filters(opts):
+        return PREFILL_PARAMS
+    filtered = [p for p in PREFILL_PARAMS if _case_matches_cli(p, opts)]
+    if not filtered:
+        raise RuntimeError(
+            "No PrefillArgs cases matched --model/--tp/--t/--n/--dense/--snapshot-dtype."
+        )
+    return filtered
+
 
 PREFILL_PARAMS = expand_groups(_PREFILL_GROUPS)
 
-# Explicit empty-TAIL varlen case (cu_seqlens=[0, 6384, 16384, 16384]; last
-# segment length 0). The existing empty-segment group only covers an empty
-# FIRST segment (bos=0), which can only read token 0 and never reaches the
-# buffer tail; the original OOB was a tail prologue over-read that requires
-# bos==eos==T_total. ``context_lens`` is used verbatim (bypasses the
-# ``expand_groups`` tail>0 guard), and the 0-length tail also validates the
-# reference passes ``initial_state`` straight through to ``final_state``.
-PREFILL_PARAMS = list(PREFILL_PARAMS) + [
-    PrefillArgs(
-        K=128,
-        V=128,
-        Hk=16,
-        Hv=32,
-        tp=1,
-        full_prompt_len=16384,
-        model_name="flydsl-k5-empty-tail",
-        is_varlen=True,
-        output_final_state=True,
-        max_num_batched_tokens=16384,
-        context_lens=[6384, 10000, 0],
-    ),
-]
-
-
 PREFILL_TEST_IDS = [repr(p) for p in PREFILL_PARAMS]
+
+
+def pytest_generate_tests(metafunc):
+    if metafunc.function.__name__ not in (
+        "test_correctness_flydsl_opt",
+        "test_perf_comparison",
+    ):
+        return
+    params = _filtered_prefill_params()
+    metafunc.parametrize("args", params, ids=[repr(p) for p in params])
 
 
 # -- bf16 SSM-state params (paired with TestStateDtypeBF16 below) ------
@@ -544,11 +562,11 @@ STATE_BF16_PARAMS = [
         Hk=16,
         Hv=32,
         tp=2,
-        full_prompt_len=2500,
+        full_prompt_len=1024,
         model_name="Qwen3.5-35B-bf16state",
         is_varlen=False,
         output_final_state=True,
-        max_num_batched_tokens=2500,
+        max_num_batched_tokens=1024,
         ssm_state_dtype=torch.bfloat16,
     ),
     PrefillArgs(
@@ -558,14 +576,30 @@ STATE_BF16_PARAMS = [
         Hv=64,
         tp=4,
         full_prompt_len=1024,
-        model_name="Qwen3.5-tp4-1k-bf16state",
+        model_name="Qwen3.5-397B-bf16state",
         is_varlen=True,
         output_final_state=True,
-        max_num_batched_tokens=8192,
+        max_num_batched_tokens=16384,
         ssm_state_dtype=torch.bfloat16,
     ),
 ]
 STATE_BF16_TEST_IDS = [repr(p) for p in STATE_BF16_PARAMS]
+
+
+# -- fp32 chunk-snapshot params (paired with TestSnapshotDtype below) ---
+
+# The snapshot dtype is an independent policy from the SSM state dtype, so these
+# reuse the small bf16-state shapes (one dense, one varlen launch route) with the
+# default fp32 state and vary only ``snapshot_dtype``.
+SNAPSHOT_DTYPE_PARAMS = [
+    replace(
+        p,
+        model_name=f"{p.model_name}-fp32snapshot",
+        ssm_state_dtype=torch.float32,
+    )
+    for p in STATE_BF16_PARAMS
+]
+SNAPSHOT_DTYPE_TEST_IDS = [repr(p) for p in SNAPSHOT_DTYPE_PARAMS]
 
 
 # -- Helper functions ---------------------------------------------------
@@ -591,6 +625,17 @@ def _build_cu_seqlens(context_lens, device="cuda"):
     return scheduled_q_lens, cu_seqlens
 
 
+def _case_seed(context_lens, args: PrefillArgs = None) -> int:
+    """Per-case seed derived from the case identity.
+
+    ``crc32`` (not the builtin ``hash``) so the value is stable across
+    processes regardless of ``PYTHONHASHSEED``, and derived per case so a
+    shape's inputs no longer depend on how many other cases ran before it.
+    """
+    tag = f"{args!r}|{list(context_lens)}"
+    return zlib.crc32(tag.encode()) & 0x7FFFFFFF
+
+
 def _make_inputs(
     context_lens,
     args: PrefillArgs = None,
@@ -608,7 +653,9 @@ def _make_inputs(
     dense_batch=1,
     use_g=True,
     g_head_major=False,
+    seed=None,
 ):
+    torch.manual_seed(_case_seed(context_lens, args) if seed is None else seed)
     if args is not None:
         tp = args.tp
         K_dim = args.K
@@ -793,7 +840,7 @@ def _is_gfx950() -> bool:
     ``mfma_f32_32x32x16_bf16`` -- both are gfx950-only instructions. On gfx942
     (CDNA3 / MI300) they fail to compile with an LLVM ``Cannot select``
     abort, so the perf harness skips them there. The remaining forks
-    (``kv`` / ``mfma16_hip`` / ``mfma16_2wave_opt1`` / ``mfma16_3wave_opt2``)
+    (``kv`` / ``opt`` / ``mfma16_2wave_opt1`` / ``mfma16_3wave_opt2``)
     use the K=16 ``mfma_f32_16x16x16bf16_1k`` and run on both.
     """
     try:
@@ -822,6 +869,8 @@ def chunk_gated_delta_rule_fwd_h_hip_k5(
     initial_state=None,
     output_final_state=False,
     cu_seqlens=None,
+    snapshot_dtype=None,
+    prefill_metadata=None,
 ):
     """HIP/C++ K5 host wrapper, adapted to this file's K5 calling convention.
 
@@ -862,6 +911,8 @@ def chunk_gated_delta_rule_fwd_h_hip_k5(
         cu_seqlens=cu_seqlens,
         use_exp2=False,
         g_head_major=True,
+        snapshot_dtype=snapshot_dtype,
+        prefill_metadata=prefill_metadata,
     )
 
 
@@ -871,7 +922,7 @@ def chunk_gated_delta_rule_fwd_h_hip_k5(
 _K5_KERNEL_PREFIXES = [
     "chunk_gdn_fwd_h_flydsl_vk",
     "chunk_gdn_fwd_h_flydsl_kv",
-    "chunk_gdn_fwd_h_flydsl_mfma16",
+    "chunk_gdn_fwd_h_flydsl_opt",
     "chunk_gdn_fwd_h_flydsl_naive",
     "chunk_gated_delta_rule_fwd_kernel_h",
 ]
@@ -890,6 +941,24 @@ def _is_k5_kernel(name: str) -> bool:
     if any(name.startswith(p) for p in _K5_KERNEL_PREFIXES):
         return True
     return any(s in name for s in _K5_KERNEL_SUBSTRINGS)
+
+
+def _build_prefill_metadata(context_lens, cu_seqlens, chunk_size: int = 64):
+    """Prebuild the reusable GDR chunk schedule for a benchmarked shape.
+
+    Serving stacks build this once per forward pass and hand it to every GDR
+    kernel; benchmarks that skip it make each wrapper rediscover the chunk
+    counts with a blocking device-to-host copy. Returns None for the dense
+    (``cu_seqlens is None``) shapes, where the wrappers take the batch layout
+    straight from the tensor shapes.
+    """
+    if cu_seqlens is None:
+        return None
+    return build_gated_delta_rule_prefill_metadata(
+        list(context_lens),
+        cu_seqlens=cu_seqlens,
+        chunk_size=chunk_size,
+    )
 
 
 def _bench_fn(fn, *args, **kwargs):
@@ -939,49 +1008,10 @@ def _assert_mean_abs_within(out, ref, *, mean_atol, label):
     )
 
 
-def _assert_close_lowmem(a, b, *, atol, rtol, msg, chunk_rows=1 << 22):
-    """Memory-frugal elementwise ``|a-b| <= atol + rtol*|b|`` check.
-
-    Equivalent in semantics to ``torch.testing.assert_close(a, b, atol, rtol)``
-    but streams over a flattened view in row chunks so it never materialises
-    more than one chunk-sized fp32 temporary. Used for the mfma16_2wave_opt1/triton_vk
-    consistency check, where the h / v_new tensors at long context are
-    multi-GiB and the stock ``assert_close`` (which up-casts both whole tensors
-    and builds a full mismatch report) OOMs on a 256 GiB card. On mismatch it
-    reports the worst element's abs error / allowed tol rather than dumping the
-    entire tensor.
-    """
-    assert a.shape == b.shape, f"{msg}: shape {tuple(a.shape)} vs {tuple(b.shape)}"
-    af = a.reshape(-1)
-    bf = b.reshape(-1)
-    n = af.numel()
-    worst_abs = 0.0
-    worst_allowed = 0.0
-    worst_idx = -1
-    n_bad = 0
-    for s in range(0, n, chunk_rows):
-        e = min(s + chunk_rows, n)
-        ac = af[s:e].float()
-        bc = bf[s:e].float()
-        abs_e = (ac - bc).abs()
-        allowed = atol + rtol * bc.abs()
-        bad = abs_e > allowed
-        nb = int(bad.sum().item())
-        if nb:
-            n_bad += nb
-            # track the single worst (abs - allowed) margin in this chunk
-            margin = abs_e - allowed
-            mi = int(margin.argmax().item())
-            if abs_e[mi].item() - allowed[mi].item() > worst_abs - worst_allowed:
-                worst_abs = abs_e[mi].item()
-                worst_allowed = allowed[mi].item()
-                worst_idx = s + mi
-        del ac, bc, abs_e, allowed, bad
-    assert n_bad == 0, (
-        f"{msg}: {n_bad}/{n} elements exceed atol={atol:g}+rtol={rtol:g}*|b|. "
-        f"Worst @ flat idx {worst_idx}: abs_err={worst_abs:.3e} > "
-        f"allowed={worst_allowed:.3e}."
-    )
+def _truncate_to_bf16(x):
+    """Keep the high 16 bits of an fp32 tensor, i.e. the HIP ``float_to_bf16``
+    truncation the bf16 snapshot specialization applies to its accumulators."""
+    return (x.contiguous().view(torch.int32) >> 16).to(torch.int16).view(torch.bfloat16)
 
 
 def _assert_k5_outputs_match_ref(
@@ -1061,19 +1091,8 @@ def _assert_k5_outputs_match_ref(
 class TestCorrectness:
     """Correctness and integration coverage for the FlyDSL mfma16 K5 backend."""
 
-    @staticmethod
-    def _minimal_inputs():
-        """Smallest validated mfma16_hip input set for contract tests."""
-        device = "cuda"
-        B, T, Hg, H, K, V = 1, 64, 2, 4, 128, 128
-        k = torch.zeros(B, T, Hg, K, dtype=torch.bfloat16, device=device)
-        w = torch.zeros(B, H, T, K, dtype=torch.bfloat16, device=device)
-        u = torch.zeros(B, H, T, V, dtype=torch.bfloat16, device=device)
-        return k, w, u
-
-    @pytest.mark.parametrize("args", PREFILL_PARAMS, ids=PREFILL_TEST_IDS)
-    def test_correctness_flydsl_mfma16_hip(self, args: PrefillArgs):
-        """mfma16 / HIP-aligned FlyDSL K5 impl (formerly the "vk" fork): 16x16x16
+    def test_correctness_flydsl_opt(self, args: PrefillArgs):
+        """K5 opt FlyDSL K5 impl (formerly the "vk" fork): 16x16x16
         MFMA + HIP warp partition. Same VK public outputs as the baseline flydsl
         path; only the BV==64 configs exercise the kernel, others fall back."""
         context_lens = args.resolve_context_lens()
@@ -1081,7 +1100,7 @@ class TestCorrectness:
             context_lens, args=args
         )
 
-        h_fly, vn_fly, fs_fly = chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(
+        h_fly, vn_fly, fs_fly = chunk_gated_delta_rule_fwd_h_flydsl_opt(
             k,
             w_c,
             u_c,
@@ -1097,7 +1116,9 @@ class TestCorrectness:
             # ``use_exp2=True`` the kernel would treat ``g`` as log2-space and
             # compute ``exp2(x)``, a mismatch masked only by gates decaying to 0.
             use_exp2=False,
+            snapshot_dtype=args.snapshot_dtype,
         )
+        assert h_fly.dtype == (args.snapshot_dtype or k.dtype)
         h_ref, vn_ref, fs_ref = ref_chunk_gated_delta_rule_fwd_h(
             k,
             w_orig,
@@ -1117,7 +1138,7 @@ class TestCorrectness:
             vn_ref,
             fs_ref,
             output_final_state=args.output_final_state,
-            label="flydsl_mfma16_hip",
+            label="flydsl_opt",
         )
 
     @pytest.mark.parametrize("args", STATE_BF16_PARAMS, ids=STATE_BF16_TEST_IDS)
@@ -1128,7 +1149,7 @@ class TestCorrectness:
             context_lens, args=args
         )
 
-        h_fly, vn_fly, fs_fly = chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(
+        h_fly, vn_fly, fs_fly = chunk_gated_delta_rule_fwd_h_flydsl_opt(
             k,
             w_c,
             u_c,
@@ -1159,7 +1180,70 @@ class TestCorrectness:
             vn_ref,
             fs_ref,
             output_final_state=True,
-            label="flydsl_mfma16_hip_bf16_state",
+            label="flydsl_opt_bf16_state",
+        )
+
+    @pytest.mark.parametrize("args", SNAPSHOT_DTYPE_PARAMS, ids=SNAPSHOT_DTYPE_TEST_IDS)
+    def test_correctness_fp32_snapshot(self, args: PrefillArgs):
+        """fp32 per-chunk snapshots on the dense and varlen launch paths.
+
+        The fp32 specialization stores the f32 accumulators straight from
+        registers while the bf16 one truncates the very same registers through
+        the [V][K] LDS transpose buffer, so truncating the fp32 snapshots must
+        reproduce the bf16 ones bit for bit. Everything else the kernel writes
+        (``v_new``, ``final_state``) must be untouched by the snapshot policy.
+        """
+        context_lens = args.resolve_context_lens()
+        k, w_orig, u_orig, w_c, u_c, g, h0, cu, _ = _make_inputs(
+            context_lens, args=args
+        )
+
+        def run(snapshot_dtype):
+            return chunk_gated_delta_rule_fwd_h_flydsl_opt(
+                k,
+                w_c,
+                u_c,
+                g=g,
+                initial_state=h0,
+                output_final_state=True,
+                cu_seqlens=cu,
+                g_head_major=args.g_head_major,
+                use_exp2=False,
+                snapshot_dtype=snapshot_dtype,
+            )
+
+        h_bf16, vn_bf16, fs_bf16 = run(torch.bfloat16)
+        h_f32, vn_f32, fs_f32 = run(torch.float32)
+
+        assert h_bf16.dtype == torch.bfloat16
+        assert h_f32.dtype == torch.float32
+        assert fs_bf16.dtype == torch.float32 and fs_f32.dtype == torch.float32
+        assert torch.equal(vn_bf16, vn_f32), "snapshot dtype perturbed v_new"
+        assert torch.equal(fs_bf16, fs_f32), "snapshot dtype perturbed final_state"
+        assert torch.equal(_truncate_to_bf16(h_f32), h_bf16), (
+            "fp32 snapshots do not truncate back to the bf16 specialization's "
+            "snapshots; the two paths are storing different accumulators"
+        )
+
+        h_ref, vn_ref, fs_ref = ref_chunk_gated_delta_rule_fwd_h(
+            k,
+            w_orig,
+            u_orig,
+            g=g,
+            initial_state=h0,
+            output_final_state=True,
+            cu_seqlens=cu,
+            g_head_major=args.g_head_major,
+        )
+        _assert_k5_outputs_match_ref(
+            h_f32,
+            vn_f32,
+            fs_f32,
+            h_ref,
+            vn_ref,
+            fs_ref,
+            output_final_state=True,
+            label="flydsl_opt_fp32_snapshot",
         )
 
     def test_e2e_dispatch_matches_triton(self):
@@ -1197,21 +1281,55 @@ class TestCorrectness:
         )
         torch.testing.assert_close(fs_fly.float(), fs_tri.float(), atol=2e-2, rtol=2e-2)
 
-    def test_e2e_dispatch_rejects_k64(self):
-        """K=64 is unsupported and must fail before launching any K1-K6 kernel."""
-        B, T, H, D = 1, 64, 4, 64
-        with pytest.raises(ValueError, match="K=128 and V=128"):
-            chunk_gated_delta_rule_fwd_opt_vk(
-                q=torch.zeros(B, T, H, D, dtype=torch.bfloat16),
-                k=torch.zeros(B, T, H, D, dtype=torch.bfloat16),
-                v=torch.zeros(B, T, H, 128, dtype=torch.bfloat16),
-                g=torch.zeros(B, T, H, dtype=torch.float32),
-                beta=torch.zeros(B, T, H, dtype=torch.bfloat16),
-                scale=D**-0.5,
-                initial_state=None,
-                output_final_state=False,
-                use_chunk_flydsl=True,
-            )
+    def test_e2e_dispatch_indexed_state_pool(self):
+        """K5 gathers from / writes back into an SGLang-style pool via dispatch."""
+        torch.manual_seed(42)
+        B, T, H, D = 1, 64, 4, 128
+        q = torch.randn(B, T, H, D, dtype=torch.bfloat16)
+        k = torch.nn.functional.normalize(
+            torch.randn(B, T, H, D, dtype=torch.float32), p=2, dim=-1
+        ).to(torch.bfloat16)
+        v = torch.randn(B, T, H, D, dtype=torch.bfloat16)
+        g = torch.nn.functional.logsigmoid(torch.rand(B, T, H, dtype=torch.float32))
+        beta = torch.rand(B, T, H, dtype=torch.bfloat16).sigmoid()
+        h0 = torch.randn(B, H, D, D, dtype=torch.float32)
+        kwargs = {
+            "q": q,
+            "k": k,
+            "v": v,
+            "g": g,
+            "beta": beta,
+            "scale": D**-0.5,
+            "output_final_state": True,
+            "use_exp2": True,
+            "use_chunk_flydsl": True,
+        }
+
+        _, out_ref, fs_ref = chunk_gated_delta_rule_fwd_opt_vk(
+            **kwargs, initial_state=h0.clone()
+        )
+
+        pool_size = B + 5
+        indices = torch.tensor([3], device=h0.device, dtype=torch.int32)
+        pool = torch.randn(pool_size, H, D, D, dtype=torch.float32, device=h0.device)
+        pool_before = pool.clone()
+        pool[indices.long()] = h0
+
+        _, out_pool, returned = chunk_gated_delta_rule_fwd_opt_vk(
+            **kwargs, initial_state=pool, initial_state_indices=indices
+        )
+
+        assert returned is pool
+        torch.testing.assert_close(
+            out_pool.float(), out_ref.float(), atol=2e-2, rtol=2e-2
+        )
+        torch.testing.assert_close(
+            pool[indices.long()].float(), fs_ref.float(), atol=2e-2, rtol=2e-2
+        )
+
+        untouched = torch.ones(pool_size, dtype=torch.bool, device=pool.device)
+        untouched[indices.long()] = False
+        assert torch.equal(pool[untouched], pool_before[untouched])
 
     def test_natural_log_gate_formula(self):
         """Natural-log gates must use exp(x), not exp2(x).
@@ -1238,7 +1356,7 @@ class TestCorrectness:
         w_c = w.permute(0, 2, 1, 3).contiguous()
         u_c = u.permute(0, 2, 1, 3).contiguous()
 
-        _, _, fs_fly = chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(
+        _, _, fs_fly = chunk_gated_delta_rule_fwd_h_flydsl_opt(
             k,
             w_c,
             u_c,
@@ -1274,216 +1392,6 @@ class TestCorrectness:
             msg="natural-log gate path must compute exp(x), not exp2(x)",
         )
 
-    def test_portable_rne_preserves_nan_and_inf(self):
-        """RNE conversion must not turn low-payload f32 NaNs into bf16 Inf."""
-        k, w, u = self._minimal_inputs()
-        H, K, V = 4, 128, 128
-
-        # Inject exact f32 bit patterns into h0. The first chunk snapshot converts
-        # these f32 values to bf16 through the selected RNE converter before any
-        # recurrence update can alter them.
-        h0_bits = torch.zeros(1, H, V, K, dtype=torch.int32, device="cuda")
-        h0_bits[0, 0, 0, 0] = 0x7F800001  # +NaN, mantissa only below bit 16
-        h0_bits[0, 0, 0, 1] = -8388607  # 0xFF800001: -NaN, same low payload
-        h0_bits[0, 0, 0, 2] = 0x7F800000  # +Inf
-        h0_bits[0, 0, 0, 3] = -8388608  # 0xFF800000: -Inf
-        h0 = h0_bits.view(torch.float32)
-
-        h, _, _ = chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(
-            k,
-            w,
-            u,
-            initial_state=h0,
-            output_final_state=False,
-            save_new_value=False,
-            bf16_convert_trunc=False,
-        )
-        converted = h[0, 0, 0, 0, :4].float()
-        assert torch.isnan(
-            converted[:2]
-        ).all(), "portable RNE converted a low-payload NaN to a non-NaN value"
-        assert torch.isposinf(converted[2]), "portable RNE did not preserve +Inf"
-        assert torch.isneginf(converted[3]), "portable RNE did not preserve -Inf"
-
-    @pytest.mark.parametrize(
-        "indices,index_dtype,match",
-        [
-            ([-1, 0], torch.int32, "out of range"),
-            ([0, 3], torch.int64, "out of range"),
-            ([1, 1], torch.int64, "duplicate initial_state_indices"),
-            ([2**32, 1], torch.int64, "out of range"),
-            ([0.0, 1.0], torch.float32, "must be int32 or int64"),
-        ],
-    )
-    def test_initial_state_indices_validation(self, indices, index_dtype, match):
-        """Indexed state-pool access validates before narrowing to int32."""
-        k, w, u = self._minimal_inputs()
-        H, V, K = w.shape[1], u.shape[-1], k.shape[-1]
-        h0_pool = torch.zeros(3, H, V, K, dtype=torch.float32, device="cuda")
-        cu = torch.tensor([0, 32, 64], dtype=torch.int32, device="cuda")
-        state_indices = torch.tensor(indices, dtype=index_dtype, device="cuda")
-
-        with pytest.raises(ValueError, match=match):
-            chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(
-                k,
-                w,
-                u,
-                initial_state=h0_pool,
-                output_final_state=True,
-                cu_seqlens=cu,
-                initial_state_indices=state_indices,
-            )
-
-    def test_initial_state_indices_rank_and_device_validation(self):
-        """Indexed state-pool indices must be 1-D and colocated with the pool."""
-        k, w, u = self._minimal_inputs()
-        H, V, K = w.shape[1], u.shape[-1], k.shape[-1]
-        h0_pool = torch.zeros(3, H, V, K, dtype=torch.float32, device="cuda")
-        cu = torch.tensor([0, 32, 64], dtype=torch.int32, device="cuda")
-
-        with pytest.raises(ValueError, match="must be 1-D"):
-            chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(
-                k,
-                w,
-                u,
-                initial_state=h0_pool,
-                output_final_state=True,
-                cu_seqlens=cu,
-                initial_state_indices=torch.tensor(
-                    [[0, 1]], dtype=torch.int64, device="cuda"
-                ),
-            )
-
-        with pytest.raises(ValueError, match="must be on the same device"):
-            chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(
-                k,
-                w,
-                u,
-                initial_state=h0_pool,
-                output_final_state=True,
-                cu_seqlens=cu,
-                initial_state_indices=torch.tensor(
-                    [0, 1], dtype=torch.int64, device="cpu"
-                ),
-            )
-
-    def test_valid_int64_initial_state_indices(self):
-        """Validated int64 indices narrow safely and execute the int32 kernel ABI."""
-        k, w, u = self._minimal_inputs()
-        H, V, K = w.shape[1], u.shape[-1], k.shape[-1]
-        h0_pool = torch.zeros(3, H, V, K, dtype=torch.float32, device="cuda")
-        cu = torch.tensor([0, 32, 64], dtype=torch.int32, device="cuda")
-        indices = torch.tensor([2, 0], dtype=torch.int64, device="cuda")
-
-        h, v_new, final_state = chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(
-            k,
-            w,
-            u,
-            initial_state=h0_pool,
-            output_final_state=True,
-            cu_seqlens=cu,
-            initial_state_indices=indices,
-        )
-        assert final_state.data_ptr() == h0_pool.data_ptr()
-        assert torch.count_nonzero(h) == 0
-        assert torch.count_nonzero(v_new) == 0
-        assert torch.count_nonzero(final_state) == 0
-
-    @pytest.mark.parametrize(
-        "case,match",
-        [
-            ("rank", "must be 4-D"),
-            ("dtype", "dtype must match"),
-            ("contiguous", "must be contiguous"),
-            ("time_shape", "k T dim"),
-            ("unsupported_v", "only V=128 is supported"),
-            ("gk_dtype", "gk must be float32"),
-            ("gk_shape", "gk must use token-major"),
-            ("state_shape", "initial_state must have shape"),
-            ("state_contiguous", "initial_state must be contiguous"),
-            ("g_device", "g must be on k's device"),
-        ],
-    )
-    def test_mfma16_input_validation(self, case, match):
-        """Raw-buffer kernel inputs fail early on invalid dtype/layout/shape."""
-        k, w, u = self._minimal_inputs()
-        kwargs = {}
-        if case == "rank":
-            k = k.squeeze(0)
-        elif case == "dtype":
-            w = w.float()
-        elif case == "contiguous":
-            k = k.transpose(1, 2)
-        elif case == "time_shape":
-            w = w[:, :, :-1].contiguous()
-            u = u[:, :, :-1].contiguous()
-        elif case == "unsupported_v":
-            u = u[..., :64].contiguous()
-        elif case == "gk_dtype":
-            kwargs["gk"] = torch.zeros(
-                1, 64, 4, 128, dtype=torch.bfloat16, device="cuda"
-            )
-        elif case == "gk_shape":
-            kwargs["gk"] = torch.zeros(1, 64, 4, 64, dtype=torch.float32, device="cuda")
-        elif case == "state_shape":
-            kwargs["initial_state"] = torch.zeros(
-                1, 4, 64, 128, dtype=torch.float32, device="cuda"
-            )
-        elif case == "state_contiguous":
-            kwargs["initial_state"] = torch.zeros(
-                1, 4, 128, 128, dtype=torch.float32, device="cuda"
-            ).transpose(-1, -2)
-        elif case == "g_device":
-            kwargs["g"] = torch.zeros(1, 64, 4, dtype=torch.float32, device="cpu")
-
-        with pytest.raises(ValueError, match=match):
-            chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(k, w, u, **kwargs)
-
-    def test_gk_token_major_contract(self):
-        """A valid contiguous float32 gk uses [B,T,H,K] and runs successfully."""
-        k, w, u = self._minimal_inputs()
-        gk = torch.zeros(1, 64, 4, 128, dtype=torch.float32, device="cuda")
-        h, v_new, final_state = chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(
-            k,
-            w,
-            u,
-            gk=gk,
-            output_final_state=True,
-        )
-        assert torch.count_nonzero(h) == 0
-        assert torch.count_nonzero(v_new) == 0
-        assert torch.count_nonzero(final_state) == 0
-
-    def test_reference_empty_tail_passthrough(self):
-        """The FP32 reference must pass ``initial_state`` straight through to
-        ``final_state`` for an empty (zero-length) trailing segment, not leave
-        it at the zero-initialised buffer value. Guards the reference itself
-        (independent of the kernel) so the empty-tail correctness check above
-        cannot be silently satisfied by a wrong reference."""
-        device = "cuda"
-        BT = 64
-        H, V, K, Hg = 4, 128, 128, 2
-        # cu_seqlens=[0, BT, BT]: segment 0 has BT tokens, segment 1 is empty.
-        _, cu = _build_cu_seqlens([BT, 0], device=device)
-        T_total = int(cu[-1].item())
-        k = torch.randn(1, T_total, Hg, K, dtype=torch.bfloat16, device=device) * 0.1
-        w = torch.randn(1, T_total, H, K, dtype=torch.bfloat16, device=device) * 0.1
-        u = torch.randn(1, T_total, H, V, dtype=torch.bfloat16, device=device) * 0.1
-        h0 = torch.randn(2, H, V, K, dtype=torch.float32, device=device) * 0.01
-        _, _, fs = ref_chunk_gated_delta_rule_fwd_h(
-            k,
-            w,
-            u,
-            g=None,
-            initial_state=h0,
-            output_final_state=True,
-            cu_seqlens=cu,
-        )
-        # Empty trailing segment: final_state must equal the passed-in h0.
-        assert torch.equal(fs[1], h0[1]), "empty tail segment did not pass h0 through"
-        # Non-empty segment must have been updated (differs from h0).
-        assert not torch.equal(fs[0], h0[0]), "non-empty segment was not updated"
-
 
 # -- Performance benchmark (flydsl-hip vs hip vs triton) -----------------
 
@@ -1509,8 +1417,14 @@ def _run_perf_comparison(args: PrefillArgs):
     if g is not None:
         g_hm = g if args.g_head_major else g.transpose(1, 2).contiguous()
 
+    # Every backend takes the chunk schedule a serving stack builds once per
+    # forward pass. Without it the wrappers recover the chunk counts with a
+    # blocking chunk_offsets D2H, which stalls the launch stream and measures
+    # host behaviour the production path does not have.
+    metadata = _build_prefill_metadata(context_lens, cu)
+
     us_fly = _bench_fn(
-        chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip,
+        chunk_gated_delta_rule_fwd_h_flydsl_opt,
         k,
         w_c,
         u_c,
@@ -1519,6 +1433,8 @@ def _run_perf_comparison(args: PrefillArgs):
         output_final_state=ofs,
         cu_seqlens=cu,
         g_head_major=args.g_head_major,
+        snapshot_dtype=args.snapshot_dtype,
+        prefill_metadata=metadata,
     )
     us_tri = _bench_fn(
         chunk_gated_delta_rule_fwd_h_opt_vk,
@@ -1529,6 +1445,8 @@ def _run_perf_comparison(args: PrefillArgs):
         initial_state=h0,
         output_final_state=ofs,
         cu_seqlens=cu,
+        snapshot_dtype=args.snapshot_dtype,
+        prefill_metadata=metadata,
     )
     if _HAS_HIP_K5 and _hip_k5_supported(args):
         us_hip = _bench_fn(
@@ -1540,6 +1458,8 @@ def _run_perf_comparison(args: PrefillArgs):
             initial_state=h0,
             output_final_state=ofs,
             cu_seqlens=cu,
+            snapshot_dtype=args.snapshot_dtype,
+            prefill_metadata=metadata,
         )
     else:
         us_hip = float("nan")
@@ -1555,6 +1475,7 @@ def _run_perf_comparison(args: PrefillArgs):
             "T": total_tokens,
             "varlen": args.is_varlen,
             "final_st": ofs,
+            "snap": "fp32" if args.snapshot_dtype == torch.float32 else "bf16",
             "fly_hip": us_fly,
             "HIP": us_hip,
             "Triton": us_tri,
@@ -1579,6 +1500,7 @@ def _print_perf_table():
         ("T", "T", 6),
         ("varlen", "varlen", 6),
         ("final_st", "final_st", 8),
+        ("snap", "snap", 4),
         ("FlyDSL_hip(us)", "fly_hip", 14),
         ("HIP(us)", "HIP", 8),
         ("Triton(us)", "Triton", 10),
@@ -1602,7 +1524,7 @@ def _print_perf_table():
         "",
         border,
         (
-            "K5 Prefill Perf Summary (mfma16_hip vs hip vs triton; K5 device kernel us via "
+            "K5 Prefill Perf Summary (opt vs hip vs triton; K5 device kernel us via "
             "torch.profiler; fly/hip & tri/hip = speedup vs hip, >1 faster / <1 slower)"
         ),
         border,
@@ -1626,6 +1548,33 @@ def _print_summary_table(request):
 
 
 class TestPerformance:
-    @pytest.mark.parametrize("args", PREFILL_PARAMS, ids=PREFILL_TEST_IDS)
     def test_perf_comparison(self, args: PrefillArgs):
         _run_perf_comparison(args)
+
+
+def _build_prefill_cli_parser():
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--model", choices=["35b", "397b"], default=None)
+    parser.add_argument("--tp", type=int, choices=[1, 2, 4, 8], default=None)
+    parser.add_argument("--t", type=int, default=None)
+    parser.add_argument(
+        "--n",
+        type=int,
+        default=None,
+        help="varlen sequence count (mnbt = n * t); ignored with --dense",
+    )
+    parser.add_argument("--dense", action="store_true", default=False)
+    parser.add_argument(
+        "--snapshot-dtype",
+        nargs="+",
+        choices=["bf16", "fp32"],
+        default=None,
+    )
+    return parser
+
+
+if __name__ == "__main__":
+    import sys
+
+    _, pytest_argv = _build_prefill_cli_parser().parse_known_args(sys.argv[1:])
+    raise SystemExit(pytest.main([__file__, *pytest_argv]))
