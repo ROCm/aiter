@@ -472,7 +472,21 @@ _SWEEP_SHAPES: list[tuple] = [
     # GDN Qwen3.5-MoE TP1 (H=32, Hg=8, g)
     ("gdn_q35_tp1", 32, 8, 32768, 1, "g"),
     ("gdn_q35_tp1", 32, 8, 32768, 8, "g"),
+    # -- Shapes benchmarked in PR #4732 (the flydsl_opt / mfma16_hip fork) ----
+    # "varlen-qwen-ali-tp1" (TP1, H=32, Hg=16)
+    ("gdn_qwen_tp1", 32, 16, 8192, 1, "g"),
+    ("gdn_qwen_tp1", 32, 16, 16384, 2, "g"),
+    ("gdn_qwen_tp1", 32, 16, 32768, 4, "g"),
+    ("gdn_qwen_tp1", 32, 16, 65536, 8, "g"),
+    # "varlen-qwen3.5-397b-ptpc-ali" (TP8, H=8, Hg=2)
+    ("gdn_q35_397b_tp8", 8, 2, 8192, 1, "g"),
+    ("gdn_q35_397b_tp8", 8, 2, 16384, 2, "g"),
+    ("gdn_q35_397b_tp8", 8, 2, 32768, 4, "g"),
+    ("gdn_q35_397b_tp8", 8, 2, 65536, 8, "g"),
 ]
+
+# Every T_flat present above; --T accepts any of these (or "all").
+_SWEEP_T_VALUES = sorted({s[3] for s in _SWEEP_SHAPES})
 
 SUPPORTED_GFX = ["gfx942"]
 
@@ -1049,10 +1063,13 @@ def main():
     )
     parser.add_argument(
         "--T",
-        type=int,
+        type=str,
         nargs="*",
-        default=[8192, 32768],
-        help="T_flat values to include.",
+        default="all",
+        help=(
+            f"T_flat values to include, or 'all'. Available: {_SWEEP_T_VALUES}.\n"
+            f"Default: all."
+        ),
     )
     parser.add_argument(
         "--kernel",
@@ -1081,7 +1098,19 @@ def main():
     args = parser.parse_args()
 
     gate_set = set(args.gate)
-    t_set = set(args.T)
+    if args.T == "all":
+        t_set = set(_SWEEP_T_VALUES)
+    else:
+        try:
+            t_set = {int(t) for t in args.T}
+        except ValueError:
+            parser.error(f"--T takes integers or 'all'; got {args.T}")
+        unknown = t_set - set(_SWEEP_T_VALUES)
+        if unknown:
+            parser.error(
+                f"no shapes with T_flat in {sorted(unknown)}; "
+                f"available: {_SWEEP_T_VALUES}"
+            )
 
     k5_variants = args.k5_variants
     if k5_variants == ["all"]:
@@ -1093,6 +1122,11 @@ def main():
             )
 
     shapes = [s for s in _SWEEP_SHAPES if s[5] in gate_set and s[3] in t_set]
+    if not shapes:
+        parser.error(
+            f"no shapes match --gate {sorted(gate_set)} --T {sorted(t_set)}; "
+            "the sweep would be empty"
+        )
 
     for kernel in args.kernel:
         rows = []
