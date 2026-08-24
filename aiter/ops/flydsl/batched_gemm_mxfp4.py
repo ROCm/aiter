@@ -175,6 +175,7 @@ def flydsl_grouped_gemm_a8w4_masked(
     force_persistent=False,
     situ_beta=1.0,
     situ_linear_beta=1.0,
+    fused_tdm_inputs=0,
 ):
     """Contiguous-M grouped a8w4 GEMM on the batched TDM kernel.
 
@@ -220,6 +221,11 @@ def flydsl_grouped_gemm_a8w4_masked(
     else:
         quant_scale_tensor = quant_scale.view(torch.uint8)
     enable_ep_scatter = stage2_scatter is not None
+    if fused_tdm_inputs and (N % tile_n or K % tile_k):
+        raise ValueError(
+            f"fused TDM inputs require exact tiles, got N={N}, tile_n={tile_n}, "
+            f"K={K}, tile_k={tile_k}"
+        )
     ep_row_map_tensor = ep_row_map if ep_row_map is not None else out
     n_tiles = (N + tile_n - 1) // tile_n
     cluster_n = _select_cluster_n(n_tiles, cluster_n)
@@ -283,6 +289,7 @@ def flydsl_grouped_gemm_a8w4_masked(
         f32_situ_linear_beta=float(situ_linear_beta),
         grouped_persistent_m=grouped_persistent_m,
         persistent_workers=persistent_workers,
+        fused_tdm_inputs=int(fused_tdm_inputs),
     )
     return out
 

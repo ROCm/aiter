@@ -148,6 +148,7 @@ def launch_gemm_a8w4_tdm(
     f32_situ_linear_beta: fx.Float32 = 1.0,
     grouped_persistent_m: Constexpr[int] = 0,
     persistent_workers: Constexpr[int] = 0,
+    fused_tdm_inputs: Constexpr[int] = 0,
 ):
     """Launch the grouped contiguous-M a8w4 MoE GEMM for gfx1250.
 
@@ -227,6 +228,7 @@ def launch_gemm_a8w4_tdm(
         ep_slot_stride_bytes,
         ep_destination_stride,
         ep_world_size,
+        fused_tdm_inputs,
     )
     _ = cache_tag
     if enable_ep_scatter:
@@ -271,8 +273,13 @@ def launch_gemm_a8w4_tdm(
     AS_SUPERS = tile_m // wmma_m_rep
     STAGE_SA = ((AS_SUPERS * AS_INNER * 4 + 15) // 16) * 16
     STAGE_SB = ((SB_SUPERS * SC_INNER * 4 + 15) // 16) * 16
-    SA_OFF = STAGE_A + STAGE_B
-    SB_OFF = STAGE_A + STAGE_B + STAGE_SA
+    B_OFF = STAGE_A + STAGE_SA if fused_tdm_inputs else STAGE_A
+    SA_OFF = STAGE_A if fused_tdm_inputs else STAGE_A + STAGE_B
+    SB_OFF = (
+        B_OFF + STAGE_B
+        if fused_tdm_inputs
+        else STAGE_A + STAGE_B + STAGE_SA
+    )
     # 512-align so per-buffer ptr offset preserves LDS alignment for TDM/ds_b128
     PITCH = ((STAGE_A + STAGE_B + STAGE_SA + STAGE_SB + 511) // 512) * 512
 
@@ -333,12 +340,13 @@ def launch_gemm_a8w4_tdm(
         f"_wpt{num_waves_per_tensor_tdm}" if num_waves_per_tensor_tdm != 2 else ""
     )
     _ep = "_epscatter" if enable_ep_scatter else ""
+    _fused_inputs = "_fusedabscale" if fused_tdm_inputs else ""
     _kname = (
         f"a8w4_tdm_{_afp}"
         f"_t{tile_m}x{tile_n}x{tile_k}_w{m_warp}x{n_warp}"
         f"_b{num_buffers}_K{K}"
         f"{_grouped}{_act}{_bias}{_qout}{_cl}{_next_stage}"
-        f"{_waves_per_tensor}{_persistent}{_ep}"
+        f"{_waves_per_tensor}{_persistent}{_ep}{_fused_inputs}"
     )
 
     @flyc.kernel(name=_kname, known_block_size=[block, 1, 1])
@@ -535,7 +543,11 @@ def launch_gemm_a8w4_tdm(
         ) % num_waves == 0, "A/B/SA/SB ownership must cover every workgroup wave"
         # TDMs one wave issues per k-tile: its share of the four A/B/SA/SB jobs.
         # Both the tensorcnt arithmetic and the WMMA interleave count in these.
-        TDM_PER = 4 * num_waves_per_tensor_tdm // num_waves
+        TDM_PER = (
+            1
+            if fused_tdm_inputs
+            else 4 * num_waves_per_tensor_tdm // num_waves
+        )
         shared = fx.AddressSpace.Shared
         p8_shared = fx.PointerType.get(
             elem_ty=fx.Int8.ir_type, address_space=shared, alignment=16
@@ -652,64 +664,108 @@ def launch_gemm_a8w4_tdm(
             b_off0 = b_outer_row * Kp16
             sb_batch_off = eb64 * (N_SUPERS * K4)
             sb_off0 = (coords.blk_n64 // 32) * SB_OUTER_STRIDE + sb_batch_off
-            add_tdm_loads(
-                jobs,
-                gA_base,
-                a_off0,
-                A_KROW,
-                coords.mn_oob,
-                A_ROW_B,
-                tile_m,
-                on_i32=False,
-                lds_off=0,
-                lds_row=A_LDS_ROW,
-                k_adv=A_ROW_B,
-                wv=waves[0],
-                pad=(A_ROW_B, LDS_PAD_A),
-                wg_mask=a_mcast_mask,
-            )
-            add_tdm_loads(
-                jobs,
-                gB_base,
-                b_off0,
-                Kp16,
-                None,
-                PACK_TK * 16,
-                tile_n // 16,
-                on_i32=False,
-                lds_off=STAGE_A,
-                lds_row=B_LDS_ROW,
-                k_adv=PACK_TK * 16,
-                wv=waves[1],
-            )
-            add_tdm_loads(
-                jobs,
-                gSA_base,
-                (coords.blk_m64 // wmma_m_rep) * AS_ROW,
-                AS_ROW,
-                None,
-                AS_INNER,
-                AS_SUPERS,
-                on_i32=True,
-                lds_off=SA_OFF // 4,
-                lds_row=AS_INNER,
-                k_adv=AS_INNER * 4,
-                wv=waves[2],
-            )
-            add_tdm_loads(
-                jobs,
-                gSB_base,
-                sb_off0,
-                SB_OUTER_STRIDE,
-                None,
-                SC_INNER,
-                SB_SUPERS,
-                on_i32=True,
-                lds_off=SB_OFF // 4,
-                lds_row=SC_INNER,
-                k_adv=SC_INNER * 4,
-                wv=waves[3],
-            )
+            if const_expr(fused_tdm_inputs):
+                fused_a_bytes = STAGE_A + STAGE_SA
+                fused_b_bytes = STAGE_B + STAGE_SB
+                fused_m_tile = coords.blk_m // tile_m
+                fused_a_off = (
+                    fx.Int64(fused_m_tile * K_TILES) * fx.Int64(fused_a_bytes)
+                )
+                fused_n_tiles = i32_n // tile_n
+                fused_b_record = (
+                    coords.expert * fused_n_tiles + coords.blk_n // tile_n
+                )
+                fused_b_off = (
+                    fx.Int64(fused_b_record * K_TILES) * fx.Int64(fused_b_bytes)
+                )
+                add_tdm_loads(
+                    jobs,
+                    gA_base,
+                    fused_a_off,
+                    fused_a_bytes,
+                    None,
+                    fused_a_bytes,
+                    1,
+                    on_i32=False,
+                    lds_off=0,
+                    lds_row=fused_a_bytes,
+                    k_adv=fused_a_bytes,
+                    wv=(0,),
+                    wg_mask=a_mcast_mask,
+                )
+                add_tdm_loads(
+                    jobs,
+                    gB_base,
+                    fused_b_off,
+                    fused_b_bytes,
+                    None,
+                    fused_b_bytes,
+                    1,
+                    on_i32=False,
+                    lds_off=B_OFF,
+                    lds_row=fused_b_bytes,
+                    k_adv=fused_b_bytes,
+                    wv=(1,),
+                )
+            else:
+                add_tdm_loads(
+                    jobs,
+                    gA_base,
+                    a_off0,
+                    A_KROW,
+                    coords.mn_oob,
+                    A_ROW_B,
+                    tile_m,
+                    on_i32=False,
+                    lds_off=0,
+                    lds_row=A_LDS_ROW,
+                    k_adv=A_ROW_B,
+                    wv=waves[0],
+                    pad=(A_ROW_B, LDS_PAD_A),
+                    wg_mask=a_mcast_mask,
+                )
+                add_tdm_loads(
+                    jobs,
+                    gB_base,
+                    b_off0,
+                    Kp16,
+                    None,
+                    PACK_TK * 16,
+                    tile_n // 16,
+                    on_i32=False,
+                    lds_off=STAGE_A,
+                    lds_row=B_LDS_ROW,
+                    k_adv=PACK_TK * 16,
+                    wv=waves[1],
+                )
+                add_tdm_loads(
+                    jobs,
+                    gSA_base,
+                    (coords.blk_m64 // wmma_m_rep) * AS_ROW,
+                    AS_ROW,
+                    None,
+                    AS_INNER,
+                    AS_SUPERS,
+                    on_i32=True,
+                    lds_off=SA_OFF // 4,
+                    lds_row=AS_INNER,
+                    k_adv=AS_INNER * 4,
+                    wv=waves[2],
+                )
+                add_tdm_loads(
+                    jobs,
+                    gSB_base,
+                    sb_off0,
+                    SB_OUTER_STRIDE,
+                    None,
+                    SC_INNER,
+                    SB_SUPERS,
+                    on_i32=True,
+                    lds_off=SB_OFF // 4,
+                    lds_row=SC_INNER,
+                    k_adv=SC_INNER * 4,
+                    wv=waves[3],
+                )
             return TileState(coords, jobs)
 
         def owns(wv):
@@ -738,7 +794,11 @@ def launch_gemm_a8w4_tdm(
             else:
                 # Wave ids are runtime, so one stream serves every wave and one
                 # test per owner list is the floor.
-                job_waves = sorted({j.waves for j in jobs})
+                job_waves = (
+                    [(i,) for i in range(num_waves)]
+                    if fused_tdm_inputs
+                    else sorted({j.waves for j in jobs})
+                )
                 for g in range_constexpr(len(job_waves)):
                     if owns(job_waves[g]):
                         for j in jobs:
@@ -747,7 +807,11 @@ def launch_gemm_a8w4_tdm(
 
         def dispatch_wave_job(jobs, fn):
             """Run ``fn`` with the current wave's jobs."""
-            job_waves = sorted({j.waves for j in jobs})
+            job_waves = (
+                [(i,) for i in range(num_waves)]
+                if fused_tdm_inputs
+                else sorted({j.waves for j in jobs})
+            )
             for g in range_constexpr(len(job_waves)):
                 if owns(job_waves[g]):
                     fn([j for j in jobs if j.waves == job_waves[g]])
@@ -801,7 +865,7 @@ def launch_gemm_a8w4_tdm(
             # can pin, and a compile-time part that folds into ds_load's offset:.
             lds_a_lane_off = (wmb + lane16) * A_LDS_ROW + kgrp * 16
             lds_b_lane_off = (
-                STAGE_A + (wnb // 16) * B_LDS_ROW + kgrp * 256 + lane16 * 16
+                B_OFF + (wnb // 16) * B_LDS_ROW + kgrp * 256 + lane16 * 16
             )
             assert wmma_m_rep == 1 or wmma_m_rep % 2 == 0
             sa_kgrp = 0 if wmma_m_rep == 1 else kgrp

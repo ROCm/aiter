@@ -27,6 +27,7 @@ _WARNED_NAIVE_EPILOGUE = False
 # Cache the contiguous uint8 view of static MoE weights so a non-contiguous
 # weight is materialized at most once (not re-copied on every fused_moe call).
 _GROUPED_WEIGHT_CACHE = {}
+_FUSED_TDM_WEIGHT_CACHE = {}
 
 # Opt-in kernel-bench hook: a caller sets a list here to collect
 # (name, callable) per-kernel launches; None in production.
@@ -43,6 +44,110 @@ def _grouped_weight_uint8(w: torch.Tensor) -> torch.Tensor:
     if len(_GROUPED_WEIGHT_CACHE) > 64:
         _GROUPED_WEIGHT_CACHE.clear()
     _GROUPED_WEIGHT_CACHE[key] = out
+    return out
+
+
+def _pack_fused_tdm_a(
+    payload: torch.Tensor,
+    scale: torch.Tensor,
+    *,
+    rows: int,
+    k_dim: int,
+    tile_m: int,
+    tile_k: int,
+    a_is_fp4: bool,
+) -> torch.Tensor:
+    """Pack target-branch A/scale layout into persistent TDM tile records."""
+    if rows % tile_m or k_dim % tile_k or tile_k % 128:
+        raise ValueError(
+            f"invalid fused A layout rows={rows}, K={k_dim}, "
+            f"tile_m={tile_m}, tile_k={tile_k}"
+        )
+    wmma_rep = tile_m // 16
+    m_tiles, k_tiles = rows // tile_m, k_dim // tile_k
+    payload_k = k_dim // 2 if a_is_fp4 else k_dim
+    payload_tile_k = tile_k // 2 if a_is_fp4 else tile_k
+    payload_tiles = (
+        payload.view(torch.uint8)
+        .reshape(rows, payload_k)
+        .reshape(m_tiles, tile_m, k_tiles, payload_tile_k)
+        .permute(0, 2, 1, 3)
+        .contiguous()
+    )
+    payload_pad = torch.zeros(
+        (m_tiles, k_tiles, tile_m, 16),
+        dtype=torch.uint8,
+        device=payload.device,
+    )
+    payload_tiles = torch.cat((payload_tiles, payload_pad), dim=-1).flatten(2)
+
+    as_inner = (tile_k // 128) * wmma_rep
+    scale_tiles = (
+        scale.reshape(-1)
+        .view(torch.int32)
+        .reshape(rows // wmma_rep, k_tiles, as_inner)
+        .reshape(m_tiles, tile_m // wmma_rep, k_tiles, as_inner)
+        .permute(0, 2, 1, 3)
+        .contiguous()
+        .view(torch.uint8)
+        .flatten(2)
+    )
+    return torch.cat((payload_tiles, scale_tiles), dim=-1).reshape(-1).contiguous()
+
+
+def _pack_fused_tdm_b(
+    payload: torch.Tensor,
+    scale: torch.Tensor,
+    *,
+    experts: int,
+    n_dim: int,
+    k_dim: int,
+    tile_n: int,
+    tile_k: int,
+) -> torch.Tensor:
+    """Pack each B K-tile as ``[preshuffled payload | n32k4 scale]``."""
+    if n_dim % tile_n or k_dim % tile_k or tile_n % 32 or tile_k % 128:
+        raise ValueError(
+            f"invalid fused B layout N={n_dim}, K={k_dim}, "
+            f"tile_n={tile_n}, tile_k={tile_k}"
+        )
+    key = (
+        payload.data_ptr(),
+        scale.data_ptr(),
+        experts,
+        n_dim,
+        k_dim,
+        tile_n,
+        tile_k,
+    )
+    cached = _FUSED_TDM_WEIGHT_CACHE.get(key)
+    if cached is not None:
+        return cached
+    n_tiles, k_tiles = n_dim // tile_n, k_dim // tile_k
+    pack_tk = tile_k // 2
+    payload_tiles = (
+        payload.view(torch.uint8)
+        .reshape(experts, n_dim // 16, k_tiles, pack_tk * 16)
+        .reshape(experts, n_tiles, tile_n // 16, k_tiles, pack_tk * 16)
+        .permute(0, 1, 3, 2, 4)
+        .contiguous()
+        .flatten(3)
+    )
+    sc_inner = tile_k // 4
+    scale_tiles = (
+        scale.reshape(-1)
+        .view(torch.int32)
+        .reshape(experts, n_dim // 32, k_tiles, sc_inner)
+        .reshape(experts, n_tiles, tile_n // 32, k_tiles, sc_inner)
+        .permute(0, 1, 3, 2, 4)
+        .contiguous()
+        .view(torch.uint8)
+        .flatten(3)
+    )
+    out = torch.cat((payload_tiles, scale_tiles), dim=-1).reshape(-1).contiguous()
+    if len(_FUSED_TDM_WEIGHT_CACHE) > 32:
+        _FUSED_TDM_WEIGHT_CACHE.clear()
+    _FUSED_TDM_WEIGHT_CACHE[key] = out
     return out
 
 
@@ -404,6 +509,7 @@ def _grouped_a8w4_tdm_moe(
     next_stage_prefetch=0,
     grouped_persistent_m=False,
     persistent_workers=None,
+    fused_tdm_inputs=0,
     data_format="a8w4",
     expert_mask=None,
     num_local_tokens=None,
@@ -567,6 +673,7 @@ def _grouped_a8w4_tdm_moe(
         "next_stage_prefetch": next_stage_prefetch,
         "grouped_persistent_m": grouped_persistent_m,
         "persistent_workers": persistent_workers,
+        "fused_tdm_inputs": int(bool(fused_tdm_inputs)),
     }
     _gemm2_kw = dict(_ep_gemm2_kwargs)
     _gemm2_kw.update(_persistent_kw)
@@ -593,6 +700,7 @@ def _grouped_a8w4_tdm_moe(
     _is_fp4 = data_format == "fp4"
     _quant_mode = "fp4" if _is_fp4 else "fp8"
     _a_is_fp4 = 1 if _is_fp4 else 0
+    _fused_tdm_inputs = bool(fused_tdm_inputs)
 
     a1_payload, a1_scale = flydsl_moe_fused_quant_preshuffle(
         hidden_states.reshape(1, token_num, model_dim),
@@ -605,6 +713,19 @@ def _grouped_a8w4_tdm_moe(
         source_topk=topk,
         num_valid_routes=_ep_nvr,
     )
+    a1_gemm = (
+        _pack_fused_tdm_a(
+            a1_payload,
+            a1_scale,
+            rows=contiguous_m,
+            k_dim=model_dim,
+            tile_m=tile_m,
+            tile_k=tile_k,
+            a_is_fp4=_is_fp4,
+        )
+        if _fused_tdm_inputs
+        else a1_payload
+    )
 
     # Fuse gemm1 silu/swiglu + fp8 quantization + scale preshuffle into the
     # kernel epilogue (a8w4 only), eliminating the standalone
@@ -612,6 +733,19 @@ def _grouped_a8w4_tdm_moe(
     _fuse_quant = (not _is_fp4) and (_b1 is None)
     w1_u8 = _grouped_weight_uint8(w1)
     w1s_i32 = w1_scale.reshape(-1).view(torch.int32)
+    w1_gemm = (
+        _pack_fused_tdm_b(
+            w1_u8,
+            w1_scale,
+            experts=E,
+            n_dim=two_inter,
+            k_dim=model_dim,
+            tile_n=tile_n,
+            tile_k=tile_k,
+        )
+        if _fused_tdm_inputs
+        else w1_u8
+    )
 
     if _fuse_quant:
         # Pre-allocate fp8 payload + preshuffled e8m0 scale for gemm1 output.
@@ -631,8 +765,8 @@ def _grouped_a8w4_tdm_moe(
         # quant_scale / arg_quant_scale).
         flydsl_grouped_gemm_a8w4_masked(
             a2_payload.view(torch.uint8),
-            a1_payload,
-            w1_u8,
+            a1_gemm,
+            w1_gemm,
             a1_scale,
             w1s_i32,
             psum,
@@ -660,8 +794,8 @@ def _grouped_a8w4_tdm_moe(
         y = torch.empty((1, contiguous_m, inter_dim), dtype=dtype, device=device)
         flydsl_grouped_gemm_a8w4_masked(
             y,
-            a1_payload,
-            w1_u8,
+            a1_gemm,
+            w1_gemm,
             a1_scale,
             w1s_i32,
             psum,
@@ -694,10 +828,36 @@ def _grouped_a8w4_tdm_moe(
     grouped_out = torch.empty((1, contiguous_m, model_dim), dtype=dtype, device=device)
     w2_u8 = _grouped_weight_uint8(w2)
     w2s_i32 = w2_scale.reshape(-1).view(torch.int32)
+    a2_gemm = (
+        _pack_fused_tdm_a(
+            a2_payload,
+            a2_scale,
+            rows=contiguous_m,
+            k_dim=inter_dim,
+            tile_m=tile_m2,
+            tile_k=tile_k2,
+            a_is_fp4=_is_fp4,
+        )
+        if _fused_tdm_inputs
+        else a2_payload
+    )
+    w2_gemm = (
+        _pack_fused_tdm_b(
+            w2_u8,
+            w2_scale,
+            experts=E,
+            n_dim=model_dim,
+            k_dim=inter_dim,
+            tile_n=tile_n2,
+            tile_k=tile_k2,
+        )
+        if _fused_tdm_inputs
+        else w2_u8
+    )
     flydsl_grouped_gemm_a8w4_masked(
         grouped_out,
-        a2_payload,
-        w2_u8,
+        a2_gemm,
+        w2_gemm,
         a2_scale,
         w2s_i32,
         psum,
@@ -724,8 +884,8 @@ def _grouped_a8w4_tdm_moe(
                     functools.partial(
                         flydsl_grouped_gemm_a8w4_masked,
                         a2_payload.view(torch.uint8),
-                        a1_payload,
-                        w1_u8,
+                        a1_gemm,
+                        w1_gemm,
                         a1_scale,
                         w1s_i32,
                         psum,
@@ -757,8 +917,8 @@ def _grouped_a8w4_tdm_moe(
                     functools.partial(
                         flydsl_grouped_gemm_a8w4_masked,
                         y,
-                        a1_payload,
-                        w1_u8,
+                        a1_gemm,
+                        w1_gemm,
                         a1_scale,
                         w1s_i32,
                         psum,
@@ -786,8 +946,8 @@ def _grouped_a8w4_tdm_moe(
                 functools.partial(
                     flydsl_grouped_gemm_a8w4_masked,
                     grouped_out,
-                    a2_payload,
-                    w2_u8,
+                    a2_gemm,
+                    w2_gemm,
                     a2_scale,
                     w2s_i32,
                     psum,
@@ -1100,6 +1260,9 @@ def grouped_gemm_gfx1250_a8w4(
             _tdm_kw["tile_n2"] = _ov_n2 if _ov_n2 is not None else _base_n
             _tdm_kw["tile_k2"] = _ov_k2 if _ov_k2 is not None else _base_k
             _tdm_kw["num_buffers2"] = _ov_nb2 if _ov_nb2 is not None else _base_nb
+        _ov_fused_inputs = _tdm_env("AITER_TDM_FUSED_INPUTS")
+        if _ov_fused_inputs is not None:
+            _tdm_kw["fused_tdm_inputs"] = _ov_fused_inputs
         return _grouped_a8w4_tdm_moe(
             hidden_states,
             w1,
