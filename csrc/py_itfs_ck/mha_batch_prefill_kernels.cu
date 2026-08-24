@@ -813,6 +813,18 @@ mha_batch_prefill(at::Tensor& q,       // [total_q, hq, d]
                 ck_tile::BlockAttentionKVCacheLookupTableEnum::VLLM_BLOCK_TABLE_2D;
         }
 
+        // seqlen_k is i32[batch]. SGLang 1D tables have last-page lengths only:
+        // kv_len = (pages - 1) * page_size + last_page_len.
+        at::Tensor seqlen_k_derived;
+        if(args.seqlen_k_ptr == nullptr && kv_last_page_lens_.has_value())
+        {
+            auto pages = kv_indptr.slice(/*dim=*/0, 1, batch_size + 1) -
+                         kv_indptr.slice(/*dim=*/0, 0, batch_size);
+            seqlen_k_derived =
+                ((pages - 1) * page_block_size + kv_last_page_lens_.value()).to(at::kInt);
+            args.seqlen_k_ptr = seqlen_k_derived.data_ptr();
+        }
+
         float t = aiter::mha_batch_prefill(args,
                                            stream_config,
                                            dtype_str,
