@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+
 import torch
 import triton
 
@@ -470,8 +471,12 @@ def gemm_afp4wfp4_preshuffle(
 
     if config is None:
         # _get_config doubles K itself (logical K = 2 * K_bytes) — pass bytes,
-        # matching the non-preshuffled path.
-        config, _ = _get_config(M, N, K_bytes, True)
+        # matching the non-preshuffled path. The two backends take disjoint
+        # params (gluon: NUM_BUFFERS, triton: NUM_KSPLIT/GROUP_SIZE_M/...), so
+        # the config must come from the dir of the backend we actually launch.
+        config, _ = _get_config(
+            M, N, K_bytes, True, backend="gluon" if use_gluon else "triton"
+        )
 
     config["BLOCK_SIZE_N"] = max(config["BLOCK_SIZE_N"], 32)
     if M < 32:
