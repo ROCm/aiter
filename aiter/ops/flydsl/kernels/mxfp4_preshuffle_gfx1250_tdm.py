@@ -21,7 +21,6 @@ from .gemm_common_gfx1250 import (
     fused_silu_swiglu_elem,
     fused_situv2_elem,
     make_lds_copy_ops,
-    make_sgpr_opaque,
     pipeline_fence,
     situv2_consts,
     workgroup_barrier,
@@ -32,6 +31,7 @@ from .mega_moe_gfx1250.tdm_gather_shim import (
 )
 from .quant_utils import (
     emit_amax_e8m0_native_scale,
+    emit_cvt_scalef32_pk8_fp4_bf16,
     emit_cvt_scalef32_pk8_fp8_f32,
 )
 from .tensor_shim import (
@@ -340,31 +340,6 @@ def launch_gemm_a8w4_tdm(
 
         def buf_ptr(s):
             return base_ptr + s * PITCH
-
-        def buf_ptr_opaque(s):
-            """``buf_ptr(s)`` as an index the backend cannot constant-fold.
-
-            In the constexpr-unrolled drain tail ``s`` is a literal and
-            ``base_ptr`` is LDS offset 0, so the stage base is a constant and the
-            backend re-associates ``(base + lane) + off`` into ``(base + off) +
-            lane``: one v_add and one depctr wait per ds_load instead of one
-            shared base register plus 16-bit ``offset:`` immediates. Hiding the
-            base restores the shape the rolled loop gets for free -- 63 address
-            registers down to 12, matching the main loop's 8.
-
-            Only ever apply this to the *carry target*. Making the buffer a tile
-            computes from opaque returns wrong results (logits_diff 0.039 against
-            0.001 with random activations); the cause is not understood, and
-            neither a matching "=s,0" constraint nor a real s_mov_b32 body
-            changes it. Note --const-init 0 hides this: zero activations make a
-            wrong LDS address read zeros, so it must be checked on random data.
-            """
-            return fx.index_cast(
-                T.index,
-                fx.Int32(
-                    make_sgpr_opaque(fx.index_cast(T.i32, ptr_to_idx(buf_ptr(s))))
-                ),
-            )
 
         def global_view(base, off, shape, stride):
             return fx.Tensor(fx.make_view(base + off, fx.make_layout(shape, stride)))
@@ -1043,10 +1018,8 @@ def launch_gemm_a8w4_tdm(
                         # rowmap inside a carry's tensor_wait window, so the wait
                         # would block on it instead of overlapping it.
                         fx.copy(_rm_atom, _rm_gt, _rm_dst)
-                    # Carry target only -- see buf_ptr_opaque; ``buf`` itself
-                    # must stay foldable or the tile reads wrong LDS.
                     next_stage_buf = (
-                        buf_ptr_opaque((kt + 1) % num_buffers)
+                        ptr_to_idx(buf_ptr((kt + 1) % num_buffers))
                         if const_expr(has_next)
                         else None
                     )
@@ -1077,7 +1050,8 @@ def launch_gemm_a8w4_tdm(
             # The epilogue restages C in this arena. Draining our own tensorcnt
             # suffices: peer multicast loads are pairwise matched with ours.
             pipeline_fence(outstanding=0)
-            STORE_N = (tile_n // 2) if stage1_act else tile_n
+            is_fp4_quant = bool(stage1_quant_out and a_is_fp4)
+            STORE_N = tile_n // (4 if is_fp4_quant else 2) if stage1_act else tile_n
             # Unpadded, a row is STORE_N/2 dwords (a multiple of 32), so the 16
             # rows one b128 writes all hit one bank -- 16-way. +16 cols spreads
             # them to 4-way, the b128 floor. Pad cols never reach global.
@@ -1109,7 +1083,7 @@ def launch_gemm_a8w4_tdm(
 
             # -- Activate + stage to LDS --
             if const_expr(stage1_quant_out and stage1_act):
-                # Fused silu/swiglu -> fp8 quant; payload to LDS, scale to global.
+                # Fused activation + MX quant; payload to LDS, scale to global.
                 i32_ptr_g = fx.PointerType.get(
                     elem_ty=fx.Int8.ir_type,
                     address_space=fx.AddressSpace.Global,
@@ -1165,35 +1139,68 @@ def launch_gemm_a8w4_tdm(
                                 )
 
                             scale_f32, e8m0_byte = emit_amax_e8m0_native_scale(
-                                all_vals, wave_size=WAVE, dtype=MxDtype.FP8_E4M3
+                                all_vals,
+                                wave_size=WAVE,
+                                dtype=(
+                                    MxDtype.FP4_E2M1
+                                    if is_fp4_quant
+                                    else MxDtype.FP8_E4M3
+                                ),
                             )
                             mx_col = blk_n + wnb + mx_blk * WN_PER_MX_BLOCK * 16
                             mx_blk_i = fx.Int32(mx_col) >> 6
                             e8m0_bytes.append(e8m0_byte)
                             mx_blk_is.append(mx_blk_i)
 
-                            for half in range_constexpr(WN_PER_MX_BLOCK // 2):
-                                src_f32 = Vec.from_elements(
-                                    all_vals[half * 8 : half * 8 + 8],
-                                    fx.Float32,
-                                ).ir_value()
-                                packed_v2i32 = emit_cvt_scalef32_pk8_fp8_f32(
-                                    src_f32, scale_f32, v2i32_ty=v2i32_ty, rocdl=rocdl
-                                )
-                                for sub in range_constexpr(2):
-                                    sub_wn = half * 2 + sub
+                            if const_expr(is_fp4_quant):
+                                for sub_wn in range_constexpr(WN_PER_MX_BLOCK):
                                     wn = mx_blk * WN_PER_MX_BLOCK + sub_wn
-                                    packed_i32 = vector.extract(
-                                        packed_v2i32,
-                                        static_position=[sub],
-                                        dynamic_position=[],
+                                    local_vals = all_vals[sub_wn * 4 : sub_wn * 4 + 4]
+                                    peer_vals = [
+                                        fx.Float32(value).shuffle_xor(16, WAVE)
+                                        for value in local_vals
+                                    ]
+                                    src = Vec.from_elements(
+                                        local_vals + peer_vals, fx.Float32
                                     )
-                                    col_fp8 = (wnb + wn * 16 + kgrp * 8) // 2
-                                    lds_store_b32(
-                                        stC_idx,
-                                        row_rel * STORE_N + col_fp8,
-                                        Vec.from_elements([packed_i32], fx.Int32),
+                                    packed_i32 = emit_cvt_scalef32_pk8_fp4_bf16(
+                                        src.to(fx.BFloat16).ir_value(),
+                                        scale_f32,
+                                        i32_ty=T.i32,
                                     )
+                                    if kgrp == 0:
+                                        col_fp4 = (wnb + wn * 16) // 4
+                                        lds_store_b32(
+                                            stC_idx,
+                                            row_rel * STORE_N + col_fp4,
+                                            Vec.from_elements([packed_i32], fx.Int32),
+                                        )
+                            else:
+                                for half in range_constexpr(WN_PER_MX_BLOCK // 2):
+                                    src = Vec.from_elements(
+                                        all_vals[half * 8 : half * 8 + 8],
+                                        fx.Float32,
+                                    )
+                                    packed_v2i32 = emit_cvt_scalef32_pk8_fp8_f32(
+                                        src.ir_value(),
+                                        scale_f32,
+                                        v2i32_ty=v2i32_ty,
+                                        rocdl=rocdl,
+                                    )
+                                    for sub in range_constexpr(2):
+                                        sub_wn = half * 2 + sub
+                                        wn = mx_blk * WN_PER_MX_BLOCK + sub_wn
+                                        packed_i32 = vector.extract(
+                                            packed_v2i32,
+                                            static_position=[sub],
+                                            dynamic_position=[],
+                                        )
+                                        col_fp8 = (wnb + wn * 16 + kgrp * 8) // 2
+                                        lds_store_b32(
+                                            stC_idx,
+                                            row_rel * STORE_N + col_fp8,
+                                            Vec.from_elements([packed_i32], fx.Int32),
+                                        )
 
                         # Preshuffled e8m0 scale: one branch per wm (not per mx_blk).
                         if row_rel < mn_oob and is_kgrp0:
@@ -1370,8 +1377,9 @@ def launch_gemm_a8w4_tdm(
                 tdm_ops.tensor_wait(0)
             else:
                 if const_expr(stage1_act):
-                    out_stride = i32_n // 2
-                    out_col_off = blk_n64 // 2
+                    out_divisor = 4 if is_fp4_quant else 2
+                    out_stride = i32_n // out_divisor
+                    out_col_off = blk_n64 // out_divisor
                 else:
                     out_stride = c_stride
                     out_col_off = c_inner_off

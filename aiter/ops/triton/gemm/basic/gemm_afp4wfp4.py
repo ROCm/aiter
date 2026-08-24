@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import os
+
 import torch
 import triton
 
@@ -28,10 +30,28 @@ _LOGGER = AiterTritonLogger()
 
 _USE_GEMM_SPLITK_BF16 = False
 
+# gfx1250 runs the triton preshuffle kernel by default; set
+# AITER_FORCE_GFX1250_GLUON_FP4=1 to force the gluon path back on. This is a
+# workaround switch kept for validation until the Triton-side fix lands.
+_USE_GLUON_PRESHUFFLE = os.environ.get("AITER_FORCE_GFX1250_GLUON_FP4", "0") == "1"
+
 
 def set_use_gemm_splitk_bf16(value: bool):
     global _USE_GEMM_SPLITK_BF16
     _USE_GEMM_SPLITK_BF16 = value
+
+
+def use_gluon_preshuffle() -> bool:
+    """Whether gemm_afp4wfp4_preshuffle dispatches to the gluon kernel.
+
+    Defaults to the triton kernel on gfx1250; set AITER_FORCE_GFX1250_GLUON_FP4=1
+    to force gluon. The env var is a no-op on every other arch.
+
+    The two kernels consume different scale layouts (gluon: preshuffle_factor
+    16 / scale_kwidth 4, triton: 32 / 8), so callers that shuffle scales
+    themselves must pick the layout according to this predicate.
+    """
+    return _USE_GLUON_PRESHUFFLE and arch_info.get_arch() == "gfx1250"
 
 
 def get_splitk(K: int, BLOCK_SIZE_K: int, NUM_KSPLIT: int):
@@ -449,7 +469,7 @@ def gemm_afp4wfp4_preshuffle(
     """
 
     assert arch_info.is_fp4_avail(), "MXFP4 is not available on your device"
-    use_gluon = arch_info.get_arch() == "gfx1250"
+    use_gluon = use_gluon_preshuffle()
 
     M, K_bytes = x_fp4.shape
     n16, _ = w_preshuf.shape
@@ -458,8 +478,12 @@ def gemm_afp4wfp4_preshuffle(
 
     if config is None:
         # _get_config doubles K itself (logical K = 2 * K_bytes) — pass bytes,
-        # matching the non-preshuffled path.
-        config, _ = _get_config(M, N, K_bytes, True)
+        # matching the non-preshuffled path. The two backends take disjoint
+        # params (gluon: NUM_BUFFERS, triton: NUM_KSPLIT/GROUP_SIZE_M/...), so
+        # the config must come from the dir of the backend we actually launch.
+        config, _ = _get_config(
+            M, N, K_bytes, True, backend="gluon" if use_gluon else "triton"
+        )
 
     config["BLOCK_SIZE_N"] = max(config["BLOCK_SIZE_N"], 32)
     if M < 32:

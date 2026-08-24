@@ -147,6 +147,16 @@ def _adaptive_moe_sort(
     empty_bf16 = _empty_bf16(device)
     bf16_zero = moe_buf if (atomic and BM == 16) else empty_bf16
 
+    # threestage-sort scratch (prologue==1, i.e. BM != 16). Previously allocated
+    # via torch::empty inside the kernel; now passed in so the C++ TU is torch-free.
+    # Size = NE*kSplitSortCtas + NE int32; kSplitSortCtas=16 mirrors
+    # csrc/kernels/mxfp4_moe/moe_aux/codegen/mxfp4_moe_aux_dispatch.h.
+    sort3stage_ws = (
+        torch.empty(0, dtype=dtypes.i32, device=device)
+        if BM == 16
+        else torch.empty(num_experts * 17, dtype=dtypes.i32, device=device)
+    )
+
     aiter.mxfp4_moe_sort(
         topk_ids=topk_ids,
         topk_weight=topk_weights,
@@ -158,6 +168,7 @@ def _adaptive_moe_sort(
         m_indices=m_indices,
         bf16_zero_out=bf16_zero,
         bf16_zero_workspace=empty_bf16,
+        sort3stage_ws=sort3stage_ws,
         M_logical=M,
         NE=num_experts,
         TOPK=topk,
@@ -725,6 +736,7 @@ def _fused_moe_impl(
     *,
     _q_dtype_a: torch.dtype | None = None,
     _metadata_transform: Callable | None = None,
+    _metadata_config_file: str | None = None,
     _stage1_extra_args: dict | None = None,
     _stage2_extra_args: dict | None = None,
 ) -> torch.Tensor:
@@ -899,6 +911,7 @@ def _fused_moe_impl(
         has_stage2_bias=bias2 is not None,
         opus_weights_shuffled=getattr(w1, "is_shuffled", False)
         and getattr(w2, "is_shuffled", False),
+        config_file=_metadata_config_file,
     )
 
     if _metadata_transform is not None:
@@ -1054,6 +1067,7 @@ def _fused_moe_impl(
             m_indices=sort_m_indices,
             reverse_sorted=sort_reverse_sorted,
             _metadata_transform=_metadata_transform,
+            _metadata_config_file=_metadata_config_file,
             _stage1_extra_args=_stage1_extra_args,
             _stage2_extra_args=_stage2_extra_args,
         )
@@ -1273,6 +1287,7 @@ def get_ksplit(token, topk, expert, inter_dim, model_dim):
 
 
 cfg_2stages = None
+cfg_2stages_by_file = {}
 # fmt: off
 fused_moe_1stage_dict = {
     "gfx942":
@@ -2123,6 +2138,7 @@ def get_2stage_cfgs(
     is_ep=False,
     has_stage2_bias=False,
     opus_weights_shuffled=None,
+    config_file=None,
 ):
     gate_mode = GateMode(gate_mode)
     # Configs are keyed on (gfx, cu_num, ...) so archs that share a cu_num
@@ -2145,6 +2161,10 @@ def get_2stage_cfgs(
         "use_g1u1",
         "doweight_stage1",
     ]
+    if config_file is not None:
+        _INDEX_COLS.extend(
+            ["shared_expert_id", "hidden_pad", "intermediate_pad", "gate_mode"]
+        )
 
     def _ensure_gfx_column(df):
         """Guarantee a usable `gfx` column, migrating legacy cu_num-only CSVs."""
@@ -2172,12 +2192,17 @@ def get_2stage_cfgs(
         df_primary = df.copy()
         dup_mask = df_primary.duplicated(subset=_INDEX_COLS, keep="first")
         if dup_mask.any():
+            if config_file is not None:
+                raise ValueError(f"Duplicate dedicated FHMoE rows in {tune_file}")
             logger.warning(
                 f"[fused_moe] duplicate tuned rows (primary) in {tune_file}; "
                 f"keeping first match for {int(dup_mask.sum())} rows"
             )
             df_primary = df_primary.loc[~dup_mask]
         primary = df_primary.set_index(_INDEX_COLS).to_dict("index")
+
+        if config_file is not None:
+            return primary, {}
 
         # Fallback dict: disable act_type so any activation can match.
         df_fallback = df.copy()
@@ -2195,12 +2220,19 @@ def get_2stage_cfgs(
         return primary, fallback
 
     global cfg_2stages
-    config_path = os.path.dirname(AITER_CONFIGS.AITER_CONFIG_FMOE_FILE)
-    tune_file = AITER_CONFIGS.AITER_CONFIG_FMOE_FILE
+    tune_file = config_file or AITER_CONFIGS.AITER_CONFIG_FMOE_FILE
+    config_path = os.path.dirname(tune_file)
     untune_file = os.path.join(config_path, "untuned_fmoe.csv")
     profile_file = os.path.join(config_path, "profile_fmoe.csv")
-    if cfg_2stages is None:
-        cfg_2stages = get_cfg_2stages(tune_file)
+    if config_file is None:
+        if cfg_2stages is None:
+            cfg_2stages = get_cfg_2stages(tune_file)
+        active_cfg_2stages = cfg_2stages
+    else:
+        active_cfg_2stages = cfg_2stages_by_file.get(tune_file)
+        if active_cfg_2stages is None:
+            active_cfg_2stages = get_cfg_2stages(tune_file)
+            cfg_2stages_by_file[tune_file] = active_cfg_2stages
     cu_num = get_cu_num()
     gfx = get_gfx_runtime()
     # EP convention: callers append one always-masked fake-expert slot to
@@ -2239,6 +2271,10 @@ def get_2stage_cfgs(
         use_g1u1,
         doweight_stage1,
     )
+    if config_file is not None:
+        fhmoe_keys = (expert - 1, hidden_pad, intermediate_pad, str(gate_mode))
+        keys += fhmoe_keys
+        keys_disabled += fhmoe_keys
 
     def MainFunc():
         with open(untune_file, "a") as f:
@@ -2265,11 +2301,14 @@ def get_2stage_cfgs(
         if not c2s:
             return None
         primary, fallback = c2s
-        result = primary.get(keys, None)
-        if result is None:
+        lookup_keys = keys
+        if config_file is not None:
+            lookup_keys = keys[:7] + (str(activation),) + keys[8:]
+        result = primary.get(lookup_keys, None)
+        if result is None and config_file is None:
             result = fallback.get(keys_disabled, None)
         # Tier fallback: if current tier not found, try smaller tiers in descending order
-        if result is None and token > _PADDED_M_TIERS[0]:
+        if result is None and config_file is None and token > _PADDED_M_TIERS[0]:
             tier_idx = _PADDED_M_TIERS.index(token) if token in _PADDED_M_TIERS else -1
             for fallback_tier in reversed(_PADDED_M_TIERS[:tier_idx]):
                 # keys layout: (gfx, cu_num, token, ...); replace token (idx 2).
@@ -2284,8 +2323,12 @@ def get_2stage_cfgs(
                     break
         return result
 
-    cfg = _lookup_cfg(cfg_2stages)
-    if cfg is None and os.environ.get("AITER_ONLINE_TUNE", "0") == "1":
+    cfg = _lookup_cfg(active_cfg_2stages)
+    if (
+        cfg is None
+        and config_file is None
+        and os.environ.get("AITER_ONLINE_TUNE", "0") == "1"
+    ):
         lock_name = re.sub(r"[^\w.\-]", "_", str(keys))
         lock_path = os.path.join(bd_dir, f"lock_fmoe_tune_{lock_name}")
         mp_lock(lock_path, MainFunc=MainFunc, FinalFunc=FinalFunc)
@@ -2334,8 +2377,15 @@ def get_2stage_cfgs(
                     f"[fused_moe] Opus stage2 config unsupported ({opus_reason}); "
                     "using default heuristics"
                 )
+    bypass_tuned_config = int(os.environ.get("AITER_BYPASS_TUNE_CONFIG", "0"))
+    if config_file is not None and (cfg is None or bypass_tuned_config):
+        raise NotImplementedError(
+            "The dedicated FHMoE path requires an exact tuned config row for "
+            f"{keys} in {tune_file}"
+        )
+
     use_non_temporal_load = False
-    if cfg is None or int(os.environ.get("AITER_BYPASS_TUNE_CONFIG", "0")):
+    if cfg is None or bypass_tuned_config:
         ksplit = 0
         kernelName1 = ""
         kernelName2 = ""
@@ -2975,6 +3025,7 @@ def fused_moe_2stages(
     m_indices=None,
     reverse_sorted=None,
     _metadata_transform: Callable | None = None,
+    _metadata_config_file: str | None = None,
     _stage1_extra_args: dict | None = None,
     _stage2_extra_args: dict | None = None,
 ):
@@ -3009,6 +3060,7 @@ def fused_moe_2stages(
         has_stage2_bias=bias2 is not None,
         opus_weights_shuffled=getattr(w1, "is_shuffled", False)
         and getattr(w2, "is_shuffled", False),
+        config_file=_metadata_config_file,
     )
     if _metadata_transform is not None:
         metadata = _metadata_transform(metadata)
