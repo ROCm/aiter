@@ -23,14 +23,18 @@ The layout is: public wrapper modules in category folders
 (`gemm/{basic,batched,feed_forward,fused}/`, `attention/`, `moe/`,
 `normalization/`, `quant/`, `rope/`, `fusions/`, `comms/`, `conv/`,
 `gated_delta_net/`, `kimi_delta_attn/`, `gluon/`), kernel bodies under
-`_triton_kernels/` (or `_gluon_kernels/`) at the same relative path, shared
-machinery in `utils/`, tuned JSON in `configs/`. Flag:
+`_triton_kernels/` at the same relative category path, or under
+`_gluon_kernels/<arch>/` at the same relative category path when the Gluon
+implementation is architecture-specific. Shared machinery lives in `utils/`
+and tuned JSON in `configs/`. Flag:
 
 - New modules added flat at the top of `aiter/ops/triton/` — every new
   wrapper goes in the correct category folder.
-- New `@triton.jit` kernel bodies defined inside wrapper modules — the body
-  belongs under `_triton_kernels/` (Gluon: `_gluon_kernels/`) mirroring the
-  wrapper's category path.
+- New launchable `@triton.jit` or `@gluon.jit` kernel bodies defined inside
+  public wrapper modules — Triton bodies belong under `_triton_kernels/` and
+  Gluon bodies under `_gluon_kernels/<arch>/`, mirroring the wrapper's
+  category path. JIT-decorated device helpers that are called only from
+  another kernel may remain with the entry kernel they support.
 - Generic helpers (config loading, shuffling, arch detection, logging)
   re-implemented inside a kernel file instead of imported from `utils/`.
 - New code importing via the legacy flat paths
@@ -94,14 +98,17 @@ Flag, inside GEMM-family config JSON:
 
 ## Python-side config hygiene
 
-Tuning values live in JSON, never in Python. Flag:
+These rules apply equally to Triton and Gluon wrappers and kernels. Tuning
+values for either backend live in JSON, never in Python. Flag:
 
 - Hardcoded tuning values in `.py` files: `config.setdefault(...)` blocks,
   inline dict literals with `BLOCK_SIZE_*`/`num_warps`/`waves_per_eu` keys,
   arch-conditional tuning constants, or hardcoded fallback configs. The fix is
   always in the JSON file, not the Python.
-- A `_get_config()` that does anything beyond calling `get_gemm_config(...)`
-  (plus `compute_splitk_params()` for split-K kernels):
+- A new or modified Triton or Gluon GEMM `_get_config()` that does anything
+  beyond calling `get_gemm_config(...)` with the appropriate backend selection
+  (plus `compute_splitk_params()` for split-K kernels), and that does not
+  preserve the standardized `(config, is_tuned)` result:
 
   ```python
   # Correct — thin wrapper
@@ -111,10 +118,11 @@ Tuning values live in JSON, never in Python. Flag:
 
 - A `_get_config()` that swallows the `is_tuned` flag: the standardized
   signature returns `(config, is_tuned)` straight from `get_gemm_config()`,
-  so flag `_get_config()` implementations that return a bare config dict.
-  Call sites may legitimately ignore the flag (`config, _ = _get_config(...)`
-  is fine) — it exists so callers and tuning tooling can detect a shape
-  resolving to the untuned default and log or re-tune.
+  so flag new or modified `_get_config()` implementations that return a bare
+  config dict. Call sites may legitimately ignore the flag
+  (`config, _ = _get_config(...)` is fine) — it exists so callers and tuning
+  tooling can detect a shape resolving to the untuned default and log or
+  re-tune.
 - Raw config-file reads — `json.load(open(...))` or function-attribute caches
   like `_get_config._config_dict` — instead of
   `aiter.ops.triton.utils.core.load_config_json` (which caches per path,
@@ -146,14 +154,29 @@ All weight/scale pre-shuffle helpers are unified in
 
 ## Kernel conventions
 
-- Every new `@triton.jit` kernel must set a config-aware repr:
-  `@triton.jit(repr=make_kernel_repr("_kernel_name", [<config keys>]))` from
-  `aiter.ops.triton.utils._triton.kernel_repr`. Flag new kernels without it —
-  trace names must embed the tuned config.
-- Split-K GEMM kernels must use the shared second-stage reduce —
+- Every new launchable Triton or Gluon kernel must set a config-aware `repr`
+  using `make_kernel_repr` from `aiter.ops.triton.utils._triton.kernel_repr`:
+
+  ```python
+  _kernel_repr = make_kernel_repr(
+      "_kernel_name",
+      ["BLOCK_SIZE_M", "BLOCK_SIZE_N", "num_warps"],
+  )
+
+  @triton.jit(repr=_kernel_repr)  # Triton entry kernel
+  # or
+  @gluon.jit(repr=_kernel_repr)   # Gluon entry kernel
+  ```
+
+  Flag every new launchable `@triton.jit` or `@gluon.jit` kernel without
+  `repr=`. Include all meaningful compile-time/tuned config keys so trace
+  names identify the specialization. JIT-decorated device helpers that cannot
+  be launched independently do not require their own `repr`.
+- Split-K GEMM implementations must use the shared second-stage reduce,
+  regardless of whether the first-stage kernel uses Triton or Gluon —
   `_gemm_splitk_reduce_kernel` / `_batched_gemm_splitk_reduce_kernel` from
   `aiter/ops/triton/_triton_kernels/common/splitk_reduce.py`. Flag any new
-  per-kernel reduce kernel that duplicates it.
+  Triton or Gluon per-operation reduce kernel that duplicates it.
 - Triton and Gluon kernel bodies are internal: they must be launched only
   from their public wrapper under `aiter/ops/triton/`. Flag any direct
   import or launch of a kernel from `_triton_kernels/` or `_gluon_kernels/`
@@ -177,7 +200,7 @@ All weight/scale pre-shuffle helpers are unified in
 
 ## Tests and benchmarks
 
-- Every new kernel must ship a unit test under
+- Every new Triton or Gluon kernel must ship a unit test under
   `op_tests/triton_tests/<category>/`, mirroring the kernel's category (a new
   `gemm/basic/` kernel gets `op_tests/triton_tests/gemm/basic/test_<op>.py`).
   Flag PRs that add a kernel wrapper without adding or extending a matching

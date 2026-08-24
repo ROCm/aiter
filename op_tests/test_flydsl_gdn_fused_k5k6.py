@@ -118,6 +118,13 @@ def _make_inputs(H, Hg, K, V, T_flat, seq_lens, gate, *, device="cuda"):
 
     h0 = torch.randn(N, H, V, K, dtype=torch.float32, device=device) * 0.01
 
+    # ``g`` is built 2-D head-major [H, T_flat] -- B is folded away (B == 1
+    # here, and varlen flattens the batch regardless). The kernel accepts that:
+    # it only checks ``g.shape[-2:] == (H, T_flat)``. The pure-PyTorch
+    # reference, however, indexes ``g[b_idx, i_h]`` and needs the explicit batch
+    # dim, so expose a 3-D view for it rather than reshaping at each call site.
+    g_ref = g.unsqueeze(0) if g is not None else None
+
     return {
         "q": q,
         "k": k,
@@ -126,6 +133,7 @@ def _make_inputs(H, Hg, K, V, T_flat, seq_lens, gate, *, device="cuda"):
         "w_hm": w_hm,
         "u_hm": u_hm,
         "g": g,
+        "g_ref": g_ref,
         "gk": gk,
         "h0": h0,
         "cu": cu,
@@ -149,11 +157,12 @@ def _reference_o(inp, *, scale, use_exp2):
         k=inp["k"],
         w=inp["w_tm"],
         u=inp["u_tm"],
-        g=inp["g"],
+        g=inp["g_ref"],
         gk=inp["gk"],
         initial_state=inp["h0"],
         output_final_state=False,
         cu_seqlens=inp["cu"],
+        g_head_major=True,
     )
     # token-major [B, T, H, V] -> head-major [B, H, T, V]
     v_hm = v_new_ref.permute(0, 2, 1, 3).contiguous().to(inp["u_tm"].dtype)
@@ -233,11 +242,12 @@ def test_fused_final_state():
         k=inp["k"],
         w=inp["w_tm"],
         u=inp["u_tm"],
-        g=inp["g"],
+        g=inp["g_ref"],
         gk=inp["gk"],
         initial_state=inp["h0"],
         output_final_state=True,
         cu_seqlens=inp["cu"],
+        g_head_major=True,
     )[0::2]
 
     _, fs_fused = chunk_gated_delta_rule_fwd_h_o_flydsl(
