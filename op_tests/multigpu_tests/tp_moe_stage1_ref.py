@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 """Torch fp32 reference for TPMoEStage1.
 
 Models BOTH the per-1x32 FP8 activation quantization and the MXFP4 weights,

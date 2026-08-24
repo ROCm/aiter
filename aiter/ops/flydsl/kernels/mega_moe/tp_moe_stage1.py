@@ -15,10 +15,11 @@ import torch
 import torch.distributed as dist
 
 from aiter.fused_moe import moe_sorting
-from aiter.ops.flydsl.kernels.mega_moe.quant import per_1x32_mx_quant
 from aiter.ops.flydsl.moe_kernels import flydsl_moe_stage1, get_flydsl_kernel_params
 from aiter.ops.quant import fused_dynamic_mxfp8_quant_moe_sort
 from aiter.utility.fp4_utils import moe_mxfp4_sort
+
+from .quant import per_1x32_mx_quant
 
 _SUPPORTED_TP = (4, 8)
 _DEFAULT_STAGE1_KERNEL = "flydsl_moe1_afp8_wfp4_bf16_t32x64x256_w4_gui_xcd4_kw4_fp8"
@@ -101,6 +102,19 @@ class TPMoEStage1:
             raise ValueError(
                 f"inter_dim={inter_dim} must be divisible by tile_n={params['tile_n']}"
             )
+        # A *_fp4 stage1 kernel passes both checks above but returns an fp4x2
+        # payload of shape [rows, inter_dim//2]; _pack's view(float8_e4m3fn) then
+        # reports an inter_dim twice the real row width and GEMM2 over-reads.
+        if str(params.get("out_dtype")) != "fp8":
+            raise ValueError(
+                f"{stage1_kernel_name} emits out_dtype={params.get('out_dtype')!r}; "
+                "TPMoEStage1 requires an fp8 stage1 kernel (the v2 GEMM2 A operand)"
+            )
+        if (str(params.get("a_dtype")), str(params.get("b_dtype"))) != ("fp8", "fp4"):
+            raise ValueError(
+                f"{stage1_kernel_name} is not an afp8/wfp4 stage1 kernel: "
+                f"a_dtype={params.get('a_dtype')!r} b_dtype={params.get('b_dtype')!r}"
+            )
         if float(swiglu_limit) < 0:
             raise ValueError("swiglu_limit must be non-negative")
         if transport != "allgather_bf16":
@@ -125,6 +139,25 @@ class TPMoEStage1:
         self.stage1_params = params
         self.transport = transport
         self.device = device or torch.device("cuda", torch.cuda.current_device())
+        # flydsl_moe_stage1 derives E and inter_dim from w1 itself and ignores the
+        # constructor values, so a mis-sized shard (e.g. a TP4 slice handed to a
+        # TP8-configured op) would silently produce wrong numbers.
+        expected_w1 = (self.experts, 2 * self.inter_dim, self.model_dim // 2)
+        if tuple(w1.shape) != expected_w1:
+            raise ValueError(
+                f"w1 must be a preshuffled MXFP4 shard of shape {expected_w1} "
+                f"(shuffle_weight_a16w4 preserves shape), got {tuple(w1.shape)}"
+            )
+        # shuffle_scale_a16w4 reshapes the scale, so only its element count is
+        # a stable invariant.
+        expected_scale_numel = (
+            self.experts * 2 * self.inter_dim * (self.model_dim // 32)
+        )
+        if w1_scale.numel() != expected_scale_numel:
+            raise ValueError(
+                f"w1_scale must have {expected_scale_numel} elements, "
+                f"got {w1_scale.numel()}"
+            )
         self.w1 = w1
         self.w1_scale = w1_scale
 
@@ -175,9 +208,20 @@ class TPMoEStage1:
             raise ValueError("route_weights must be contiguous float32")
         if topk_ids.dtype != torch.int32 or not topk_ids.is_contiguous():
             raise ValueError("topk_ids must be contiguous int32")
+        for name, t in (
+            ("x", x),
+            ("route_weights", route_weights),
+            ("topk_ids", topk_ids),
+        ):
+            if t.device != self.device:
+                raise ValueError(f"{name} is on {t.device}, expected {self.device}")
         m_local = int(x.shape[0])
         if m_local <= 0:
             raise ValueError("m_local must be positive")
+        if x.shape[1] != self.model_dim:
+            raise ValueError(
+                f"x must be [{m_local}, {self.model_dim}], got {tuple(x.shape)}"
+            )
         if route_weights.shape != (m_local, self.topk):
             raise ValueError(
                 f"route_weights must be [{m_local}, {self.topk}], got {tuple(route_weights.shape)}"
@@ -196,6 +240,11 @@ class TPMoEStage1:
             self.model_dim,
             torch.bfloat16,
             block_size=self.sort_block_m,
+            # accumulate=False -> moe_buf comes back as a (0,0) placeholder and the
+            # sorting kernel skips its zero pass (aiter/fused_moe.py:326-334). We
+            # discard moe_buf, so paying for a [M_global, model_dim] memset every
+            # call would be pure waste.
+            accumulate=False,
         )
         return sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids
 
@@ -306,6 +355,15 @@ class TPMoEStage1:
         )
         if not x_scale.is_contiguous():
             raise ValueError("x_scale must be contiguous")
+        if x_scale.device != self.device:
+            raise ValueError(f"x_scale is on {x_scale.device}, expected {self.device}")
+        # moe_mxfp4_sort does a bare .view(torch.uint8); anything wider than one
+        # byte would be silently reinterpreted instead of converted.
+        if x_scale.dtype not in (torch.uint8, torch.float8_e8m0fnu):
+            raise ValueError(
+                f"x_scale must be uint8 or float8_e8m0fnu E8M0 scales, "
+                f"got {x_scale.dtype}"
+            )
         if x_scale.shape != (m_local, self.model_dim // 32):
             raise ValueError(
                 f"x_scale must be [{m_local}, {self.model_dim // 32}], "

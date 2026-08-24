@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 """TPMoEStage1 correctness tests. Run with:
 
     torchrun --standalone --nproc_per_node=8 \
@@ -272,7 +274,8 @@ def case_forward_contract():
         # out.max_sorted is the payload row count, matching what the production path
         # feeds GEMM2 (`max_sorted = inter_states.shape[0]`, aiter/fused_moe.py:2018).
         sorted_len = op.max_sorted_for(m_local)
-        n = -(-sorted_len // 32) * 32
+        sbm = out.sort_block_m
+        n = -(-sorted_len // sbm) * sbm
         assert out.max_sorted == n, (out.max_sorted, n)
 
         assert out.inter_sorted_quant.shape == (
@@ -284,7 +287,7 @@ def case_forward_contract():
         assert out.sorted_token_ids.dtype == torch.int32
         assert out.sorted_weights.shape == (sorted_len,)
         assert out.sorted_weights.dtype == torch.float32
-        assert out.sorted_expert_ids.shape == (n // 32,), out.sorted_expert_ids.shape
+        assert out.sorted_expert_ids.shape == (n // sbm,), out.sorted_expert_ids.shape
         assert out.num_valid_ids.shape == (2,)
         assert out.num_valid_ids.dtype == torch.int32
         assert out.num_valid_ids.device.type == "cuda"
@@ -302,7 +305,7 @@ def case_forward_contract():
         # content check to [:nvalid] — asserting over the full tensor reads garbage.
         nvalid = int(out.num_valid_ids[0].item())
         assert 0 < nvalid <= sorted_len, (nvalid, sorted_len)
-        assert nvalid % 32 == 0, nvalid
+        assert nvalid % sbm == 0, nvalid
 
         # token-id encoding: low 24 bits index the gathered batch, high 8 bits the slot
         packed = out.sorted_token_ids[:nvalid]
@@ -319,7 +322,7 @@ def case_forward_contract():
             int(valid.sum().item()) == m_global * topk
         ), f"expected {m_global * topk} routes, found {int(valid.sum().item())}"
 
-        used = out.sorted_expert_ids[: nvalid // 32]
+        used = out.sorted_expert_ids[: nvalid // sbm]
         assert torch.all((used >= 0) & (used < experts)), "expert ids out of range"
 
     # per-call allocation: two calls must not alias
@@ -388,6 +391,12 @@ def case_numerics():
         got = out.inter_sorted_quant[:nvalid].float() * got_scale.repeat_interleave(
             32, dim=-1
         )
+        # An all-NaN kernel output would otherwise slip through: max(0.0, nan)
+        # returns 0.0 and nan >= threshold is False, so the aggregate check below
+        # cannot see it. Fail here, where the message still names the row shape.
+        assert torch.isfinite(
+            got[valid]
+        ).all(), f"m_local={m_local}: stage1 produced non-finite values in routed rows"
 
         num, den = 0.0, 0.0
         # Rows are Expert-grouped, so a single-entry cache turns O(rows) weight
@@ -419,6 +428,8 @@ def case_numerics():
             den += float((ref_q**2).sum())
 
         rel_l2 = (num / max(den, 1e-30)) ** 0.5
+        if rel_l2 != rel_l2 or rel_l2 == float("inf"):
+            raise AssertionError(f"m_local={m_local}: non-finite rel_l2={rel_l2}")
         worst = max(worst, rel_l2)
         if rank == 0:
             print(f"m_local={m_local:4d} rows={len(valid):6d} rel_l2={rel_l2:.5f}")
@@ -428,8 +439,11 @@ def case_numerics():
     worst = float(t.item())
     if rank == 0:
         print(f"case_numerics worst rel_l2={worst:.5f}")
-    if worst >= 0.05:
-        raise AssertionError(f"rel_l2={worst:.5f} exceeds 0.05")
+    # measured 0.00050 on 8x gfx950, 2026-08-24; 10x headroom. A looser bound is
+    # not free: with 384 experts one wholly wrong expert only moves the aggregate
+    # to ~sqrt(1/384) = 0.051, i.e. right on the old 0.05 line.
+    if worst >= 0.005:
+        raise AssertionError(f"rel_l2={worst:.5f} exceeds 0.005")
     if rank == 0:
         print("case_numerics OK")
     dist.barrier()
@@ -441,7 +455,7 @@ def case_prequant_equivalence():
     inter_dim = 384
     model_dim = NETWORK["model_dim"]
     experts, topk = NETWORK["experts"], NETWORK["topk"]
-    w1_ref, w1_scale_ref, w1_shuf, w1_scale_shuf = build_mxfp4_w1(
+    _, _, w1_shuf, w1_scale_shuf = build_mxfp4_w1(
         experts, inter_dim, model_dim, device, seed=2026
     )
     op = TPMoEStage1(
@@ -532,9 +546,11 @@ def case_prequant_equivalence():
     t = torch.tensor([worst], device=device)
     dist.all_reduce(t, op=dist.ReduceOp.MAX)
     worst = float(t.item())
-    if worst >= 0.02:
+    # measured exactly 0.000000 on 8x gfx950, 2026-08-24: both paths feed the
+    # same kernel the same bytes, so any nonzero drift is a real divergence.
+    if worst >= 1e-3:
         raise AssertionError(
-            f"forward vs forward_prequant rel_l2={worst:.6f} exceeds 0.02"
+            f"forward vs forward_prequant rel_l2={worst:.6f} exceeds 1e-3"
         )
     if rank == 0:
         print(f"case_prequant_equivalence OK (worst rel_l2={worst:.6f})")
@@ -616,7 +632,12 @@ def case_end_to_end():
         # Task 5). GEMM2 gates the store on `token_id < i32_M`
         # (mxmoe_gemm_v2.py:1006-1008) so that garbage must never reach `out` -- but
         # a NaN leaking through the shared CShuffle LDS would be silent, so check.
-        assert torch.isfinite(partial).all(), "GEMM2 output contains non-finite values"
+        #
+        # All three health predicates below are rank-local. Raising on one directly
+        # would abort a single rank *before* a collective and leave the others
+        # blocked in it until torchrun SIGTERMs them, hiding the real failure. Carry
+        # them through the same all_reduce as rel_l2 so every rank raises together.
+        bad_partial = float(not bool(torch.isfinite(partial).all()))
 
         # TP partials -> sum across ranks, keep only this rank's DP shard.
         got = torch.empty((m_local, model_dim), dtype=torch.float32, device=device)
@@ -625,19 +646,34 @@ def case_end_to_end():
         x_g, wts_g, ids_g = op._all_gather_inputs(x, wts, ids)
         ref_full = reference_full_moe(x_g, ids_g, wts_g, w1_q, w1_s, w2_q, w2_s, limit)
         ref = ref_full[rank * m_local : (rank + 1) * m_local]
-        assert torch.isfinite(ref).all(), "reference produced non-finite values"
+        bad_ref = float(not bool(torch.isfinite(ref).all()))
         rel = float(
             ((got - ref) ** 2).sum() ** 0.5 / max(float((ref**2).sum() ** 0.5), 1e-30)
         )
-        assert rel == rel, "rel_l2 is NaN"
-        t = torch.tensor([rel], device=device)
+        # ReduceOp.MAX over a NaN operand is not dependable, so flag it and send 0.
+        bad_rel = float(rel != rel or rel == float("inf"))
+        t = torch.tensor(
+            [0.0 if bad_rel else rel, bad_partial, bad_ref, bad_rel], device=device
+        )
         dist.all_reduce(t, op=dist.ReduceOp.MAX)
-        rel = float(t.item())
+        rel = float(t[0].item())
+        if float(t[1].item()):
+            raise AssertionError(
+                f"m_local={m_local}: GEMM2 output contains non-finite values"
+            )
+        if float(t[2].item()):
+            raise AssertionError(
+                f"m_local={m_local}: reference produced non-finite values"
+            )
+        if float(t[3].item()):
+            raise AssertionError(f"m_local={m_local}: end-to-end rel_l2 is non-finite")
         if rank == 0:
             print(f"m_local={m_local:4d} end-to-end rel_l2={rel:.5f}")
-        if rel >= 0.05:
+        # measured 0.0037-0.0040 on 8x gfx950, 2026-08-24, over a documented
+        # ~0.0031 bf16 atomic-epilog floor; 0.01 leaves ~2.5x headroom.
+        if rel >= 0.01:
             raise AssertionError(
-                f"m_local={m_local} end-to-end rel_l2={rel:.5f} >= 0.05"
+                f"m_local={m_local} end-to-end rel_l2={rel:.5f} >= 0.01"
             )
 
     if rank == 0:
