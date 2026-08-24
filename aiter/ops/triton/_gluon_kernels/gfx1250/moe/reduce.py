@@ -32,13 +32,9 @@ def reduce_grouped_gluon(
     HAS_EXT_RESIDUAL: gl.constexpr,
 ):
     group = gl.program_id(0)
-    gl.static_assert(NPAD >= 32, "NPAD must be >= 32")
-    gl.static_assert(
-        NPAD % (NUM_WARPS * 32) == 0, "NPAD must be a multiple of NUM_WARPS*32"
-    )
 
     # Load a power-of-2 column tile NPAD>=N (TDM block dims must be pow2) while the descriptor shape stays at true N, so TDM zero-pads cols [N:NPAD) (masked off on store).
-    SIZE_N: gl.constexpr = NPAD // (NUM_WARPS * 32)
+    SIZE_N: gl.constexpr = max(1, NPAD // (NUM_WARPS * 32))
     BLKN: gl.constexpr = gl.BlockedLayout([1, SIZE_N], [1, 32], [1, NUM_WARPS], [1, 0])
     SH: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, order=[1, 0])
 

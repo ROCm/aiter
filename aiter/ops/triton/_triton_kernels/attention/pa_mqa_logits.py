@@ -367,9 +367,11 @@ def _deepgemm_fp8_paged_mqa_logits(
     stride_q_next_n,
     stride_q_heads,
     KV_buffer,
-    stride_k_seq,
+    stride_k_block,
+    stride_k_token,
     scale_buffer,
-    stride_scale_seq,
+    stride_scale_block,
+    stride_scale_token,
     context_len_ptr,
     kv_indices,
     weights,
@@ -381,6 +383,7 @@ def _deepgemm_fp8_paged_mqa_logits(
     ChunkQ: tl.constexpr,
     ChunkK: tl.constexpr,
     HiddenDim: tl.constexpr,
+    KVBlockSize: tl.constexpr,
     SplitKV: tl.constexpr = 1,
 ):
     pid = tl.program_id(0)
@@ -417,21 +420,31 @@ def _deepgemm_fp8_paged_mqa_logits(
     for context_idx in range(
         split_context_start, split_context_start + split_context_length, ChunkK
     ):
-        mask_kv = context_idx + tl.arange(0, ChunkK) < context_length
-        context_kv_idx = tl.load(
-            kv_indices + pid_batch * max_blk_len + context_idx + tl.arange(0, ChunkK),
+        logical_kv_idx = context_idx + tl.arange(0, ChunkK)
+        logical_block_idx = logical_kv_idx // KVBlockSize
+        mask_kv = (logical_kv_idx < context_length) & (logical_block_idx < max_blk_len)
+        physical_block_idx = tl.load(
+            kv_indices + pid_batch * max_blk_len + logical_block_idx,
             mask=mask_kv,
             other=0,
         )
+        block_offset = logical_kv_idx % KVBlockSize
 
         k = tl.load(
             KV_buffer
-            + context_kv_idx[:, None] * stride_k_seq
+            + physical_block_idx[:, None] * stride_k_block
+            + block_offset[:, None] * stride_k_token
             + tl.arange(0, HiddenDim)[None, :],
             mask=mask_kv[:, None],
             other=0.0,
         )
-        k_scale_f = tl.load(scale_buffer + context_kv_idx[:, None] * stride_scale_seq)
+        k_scale_f = tl.load(
+            scale_buffer
+            + physical_block_idx[:, None] * stride_scale_block
+            + block_offset[:, None] * stride_scale_token,
+            mask=mask_kv[:, None],
+            other=0.0,
+        )
 
         o = tl.dot(q, k.T)
         o = o * k_scale_f.T

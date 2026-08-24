@@ -36,8 +36,6 @@ def build_silu_and_mul_fq_module(
     gui_layout: bool = False,
     act: str = "silu",
     enable_bias: bool = False,
-    situ_beta: float = 1.0,
-    situ_linear_beta: float = 1.0,
 ):
     """Return a JIT launcher for fused gate activation + optional quant + scale sort.
 
@@ -99,6 +97,10 @@ def build_silu_and_mul_fq_module(
         topk_ids: fx.Pointer,
         bias: fx.Pointer,
         token_num: Int32,
+        situ_beta_f: fx.Float32,
+        situ_beta_rcp_f: fx.Float32,
+        situ_linear_beta_f: fx.Float32,
+        situ_linear_beta_rcp_f: fx.Float32,
         swiglu_limit_f: fx.Float32,
     ):
         bid = fx.block_idx.x
@@ -321,20 +323,13 @@ def build_silu_and_mul_fq_module(
                         two = fx.Float32(2.0)
                         return two * _sigmoid_s(two * x) - c1_f32
 
-                    # SiTUv2 scale params are compile-time constants (like the main
-                    # gemm1 kernel's situ_beta/situ_linear_beta model).
-                    _sv2_beta_f32 = fx.Float32(float(situ_beta))
-                    _sv2_beta_rcp = fx.Float32(1.0 / float(situ_beta))
-                    _sv2_linbeta_f32 = fx.Float32(float(situ_linear_beta))
-                    _sv2_linbeta_rcp = fx.Float32(1.0 / float(situ_linear_beta))
-
                     def _situv2_elem(
                         g,
                         u,
-                        _sv2_beta_f32=_sv2_beta_f32,
-                        _sv2_beta_rcp=_sv2_beta_rcp,
-                        _sv2_linbeta_f32=_sv2_linbeta_f32,
-                        _sv2_linbeta_rcp=_sv2_linbeta_rcp,
+                        _sv2_beta_f32=situ_beta_f,
+                        _sv2_beta_rcp=situ_beta_rcp_f,
+                        _sv2_linbeta_f32=situ_linear_beta_f,
+                        _sv2_linbeta_rcp=situ_linear_beta_rcp_f,
                     ):
                         # beta*tanh(g/beta)*sigmoid(g) * linear_beta*tanh(u/linear_beta)
                         situ_g = (
@@ -553,6 +548,10 @@ def build_silu_and_mul_fq_module(
         bias: fx.Pointer,
         token_num: fx.Int32,
         num_sorted_rows: fx.Int32,
+        situ_beta_f: fx.Float32,
+        situ_beta_rcp_f: fx.Float32,
+        situ_linear_beta_f: fx.Float32,
+        situ_linear_beta_rcp_f: fx.Float32,
         swiglu_limit_f: fx.Float32,
         stream: fx.Stream,
     ):
@@ -570,6 +569,10 @@ def build_silu_and_mul_fq_module(
             topk_ids,
             bias,
             token_num,
+            situ_beta_f,
+            situ_beta_rcp_f,
+            situ_linear_beta_f,
+            situ_linear_beta_rcp_f,
             swiglu_limit_f,
         )
         launcher.launch(
