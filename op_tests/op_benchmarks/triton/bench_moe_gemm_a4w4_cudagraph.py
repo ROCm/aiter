@@ -31,10 +31,11 @@ that feeds each layer -- is built once outside the timed region, mirroring the
 build()/fn() split in mi450-scripts/run_moe_a4w4.py so the numbers are
 comparable to that runner (which benches one projection per invocation).
 
-On gfx1250 `moe_gemm_a4w4` defaults to the gluon backend, which dispatches to
-_moe_gemm_a4w4_decode when routing picks block_m == 16 and to
-_moe_gemm_a4w4_prefill otherwise. --backend pins the backend, and --preshuffle
-enables the gluon-only gfx1250 WMMA weight preshuffle.
+`moe_gemm_a4w4` defaults to the gluon kernels on gfx1250 --
+_moe_gemm_a4w4_decode when routing picks block_m == 16 and _moe_gemm_a4w4_prefill
+otherwise -- and the triton kernel elsewhere. --backend pins one instead (gluon
+needs gfx1250). --preshuffle enables the gluon-only gfx1250 WMMA weight
+preshuffle.
 """
 
 import argparse
@@ -46,17 +47,16 @@ from pathlib import Path
 import torch
 import triton
 
-from aiter.ops.shuffle import shuffle_weight_gfx1250
+from aiter.ops.shuffle import moe_shuffle_scale, moe_shuffle_weight
 from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16
 from aiter.ops.triton.moe.moe_op_gemm_a4w4 import (
-    is_gluon_supported,
     moe_gemm_a4w4,
     mxfp4_quant,
 )
 from aiter.ops.triton.moe.moe_routing.routing import _USE_HERD, routing
 from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
 from aiter.ops.triton.utils._triton.arch_info import get_arch
-from aiter.ops.triton.utils.shuffle import shuffle_scale_moe
+from aiter.ops.triton.utils.shuffle import moe_weight_decode_view, shuffle_scale_moe
 
 # measurable layers, in report order; see the module docstring
 LAYERS = ("moe1", "moe2", "total")
@@ -147,29 +147,40 @@ def compute_roofline(
                 )
 
 
+def preshuffle_moe_wscale(s):
+    """``(E, K//32, N)`` B-scale -> gfx1250 n32k4 layout, same orientation back.
+
+    ``moe_shuffle_scale`` is the n32k4 tile (preshuffle 32, scale kwidth 4) and
+    takes the ``(E, N, K//32)`` orientation, so transpose in and back out. Must
+    stay in step with ``SCALE_KWIDTH`` in the gfx1250 gluon kernels.
+    """
+    return moe_shuffle_scale(s.transpose(-1, -2)).transpose(-1, -2)
+
+
 def check_and_shuffle_scales(scale, N, K):
     if get_arch() == "gfx950" and N % 32 == 0 and K % (32 * 8) == 0:
         scale = shuffle_scale_moe(
             scale, arch="gfx950", preshuffle_factor=32, scale_kwidth=8
         )
         return scale, "CDNA4_SCALE"
-    elif get_arch() == "gfx1250" and N % 32 == 0 and K % (32 * 8) == 0:
-        scale = shuffle_scale_moe(
-            scale, arch="gfx1250", preshuffle_factor=32, scale_kwidth=8
-        )
+    elif get_arch() == "gfx1250" and N % 32 == 0 and K % (32 * 4) == 0:
+        # n32k4 layout (scale kwidth 4), so K//32 only needs to divide by 4.
+        scale = preshuffle_moe_wscale(scale)
         return scale, "GFX1250_SCALE"
     else:
         return scale, None
 
 
-def preshuffle_weight(w):
+def preshuffle_moe_weight(w):
     """gfx1250 WMMA weight preshuffle.
 
     `w` is the mxfp4 weight [E, K // 2, N]; the result is the TDM view
-    [E, (K // 2) * 16, N // 16] the gluon kernel reads with PRESHUFFLED=True.
-    shuffle_weight_gfx1250() asserts K // 2 % 32 and N % 16.
+    [E, (K // 2) * 16, N // 16] the gluon kernel reads with PRESHUFFLE_WEIGHTS=True.
+    ``moe_shuffle_weight`` takes the ``(E, N, K // 2)`` orientation and asserts
+    K // 2 % 32 and N % 16; ``moe_weight_decode_view`` then reinterprets the
+    result (zero-copy) as the flattened view the kernel loads.
     """
-    return shuffle_weight_gfx1250(w)
+    return moe_weight_decode_view(moe_shuffle_weight(w.transpose(-1, -2)))
 
 
 def quantize(x, dtype):
@@ -231,17 +242,17 @@ def pin_routed_experts(logits, n_routed, n_expts_act):
     return masked, n_pinned
 
 
-def resolve_backend(backend):
-    """`None` lets moe_gemm_a4w4 pick per arch; resolve it the way it does."""
-    if backend is None:
-        return "gluon" if is_gluon_supported() else "triton"
-    return backend
+def backend_name(backend=None):
+    """Backend moe_gemm_a4w4 runs, resolving None the way the op does."""
+    if backend is not None:
+        return backend
+    return "gluon" if get_arch() == "gfx1250" else "triton"
 
 
-def kernel_variant(block_m, backend):
+def kernel_variant(block_m, backend=None):
     """Compiled kernel moe_gemm_a4w4 dispatches to -- same rule as
     run_moe_a4w4.py's `name` subcommand."""
-    if resolve_backend(backend) != "gluon":
+    if backend_name(backend) != "gluon":
         return "_moe_gemm_a4w4"
     return "_moe_gemm_a4w4_decode" if block_m == 16 else "_moe_gemm_a4w4_prefill"
 
@@ -255,8 +266,8 @@ def bench_mlp_single_weight_init(
     x_dtype,
     w_dtype,
     TP,
-    backend,
     preshuffle,
+    backend,
     routed_experts,
     rep,
     layers=LAYERS,
@@ -305,8 +316,8 @@ def bench_mlp_single_weight_init(
         w2_scale, dim1, dim2 // TP // 2
     )
     if preshuffle:
-        w1 = preshuffle_weight(w1)
-        w2 = preshuffle_weight(w2)
+        w1 = preshuffle_moe_weight(w1)
+        w2 = preshuffle_moe_weight(w2)
 
     # -- routing + layer-1 activations: built once, outside the timed region --
     x = torch.randn((batch, dim1), dtype=torch.bfloat16, device=dev)
@@ -422,8 +433,8 @@ def bench_mlp(
     x_dtype,
     w_dtype,
     TP,
-    backend,
     preshuffle,
+    backend,
     routed_experts,
     rep,
     layers=LAYERS,
@@ -440,8 +451,8 @@ def bench_mlp(
             x_dtype,
             w_dtype,
             TP,
-            backend,
             preshuffle,
+            backend,
             routed_experts,
             rep,
             layers,
@@ -475,8 +486,8 @@ def roofline_mlp(
     x_dtype,
     w_dtype,
     TP,
-    backend,
     preshuffle,
+    backend,
     routed_experts,
     rep,
     layers=LAYERS,
@@ -495,7 +506,7 @@ def roofline_mlp(
     )
     if routed_experts is not None:
         stem += f"-routed={routed_experts}"
-    stem += f"-{resolve_backend(backend)}"
+    stem += f"-{backend_name(backend)}"
     if preshuffle:
         stem += "-preshuffled"
     if tuple(layers) != LAYERS:
@@ -511,8 +522,8 @@ def roofline_mlp(
         x_dtype,
         w_dtype,
         TP,
-        backend,
         preshuffle,
+        backend,
         routed_experts,
         rep,  # fixed args
         layers,
@@ -561,9 +572,10 @@ def parse_args(args: list[str] | None = None):
     )
     parser.add_argument(
         "--backend",
-        choices=["auto", "triton", "gluon"],
-        default="auto",
-        help="moe_gemm_a4w4 backend (default: auto, which is gluon on gfx1250).",
+        choices=["triton", "gluon"],
+        default=None,
+        help="Kernel backend for moe_gemm_a4w4. Default: unset, i.e. the arch "
+        "default (gluon on gfx1250, triton elsewhere). gluon requires gfx1250.",
     )
     parser.add_argument(
         "--preshuffle",
@@ -638,8 +650,8 @@ def main(args: list[str] | None = None) -> None:
         quantized_dtypes[0],
         quantized_dtypes[1],
         TP=1,
-        backend=None if parsed_args.backend == "auto" else parsed_args.backend,
         preshuffle=parsed_args.preshuffle,
+        backend=parsed_args.backend,
         routed_experts=parsed_args.routed_experts,
         rep=parsed_args.rep,
         # dedupe, keeping the canonical report order rather than argv order
