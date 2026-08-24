@@ -77,14 +77,11 @@ def _arch_floor(arch: str | None) -> int:
 def _multi_processor_count(arch: str | None = None) -> int:
     """CU count of the device that will run the kernel, or the arch floor.
 
-    Cached per (device, arch) rather than per arch: the count sizes the
-    co-residency guard in _deadlock_safe_config, so a value cached under the arch
-    name alone describes the wrong device in two cases. A process that touches
-    several devices reuses whichever was queried first, and gfx942 spans SKUs from
-    80 to 304 CU under that one name; an AOT build for another arch takes the build
-    host's count, which on a 304-CU host is 76 over the gfx942 floor. Both loosen
-    the guard when the first device is the larger one, which is what deadlocks, so
-    device properties are believed only when the live device is the arch asked for.
+    Cached per (device, arch), not per arch: the count sizes the co-residency guard
+    in _deadlock_safe_config, and one gfx942 name spans 80 to 304 CU. Caching under
+    the arch alone would let a multi-device process, or an AOT build on a large host,
+    reuse an over-count -- which loosens the guard and is what deadlocks. Device
+    properties are believed only when the live device is the arch asked for.
     """
     try:
         device = torch.cuda.current_device()
@@ -213,22 +210,16 @@ def _resolved_kernel_config(
     # (kernel validation requires it when force_single_wg lifts short_max to L).
     tiered_mid_max = overrides.get("tiered_mid_max", _TIERED_MID_MAX)
 
-    # Dead-block trim (gfx950 only). The launch grid is (blocks_per_row, num_rows) but
-    # the real workers per row = min(blocks_per_row, tier_cap); the excess workgroups
-    # return immediately yet still occupy co-resident slots ("dead" blocks). Trimming
-    # blocks_per_row down to that cap leaves active_parts (a min) unchanged, so results
-    # are identical and only wasted scheduling is cut. Applied only when the full padded
-    # grid (32*num_rows) already fits one co-resident wave (cu_count*occ, occ=2 ->
-    # num_rows <= 16); beyond that the extra blocks help hide latency, so those are left
-    # to the batch co-resident cap. blocks_per_row stays >= 2 here (the bpr==1 grid=1
-    # fold requires the kernel's single-workgroup launch path). Env
-    # FLYDSL_TOPK_TIERED_TRIM (0/1) overrides; gfx942 is untouched (default 0).
+    # Dead-block trim (gfx950 only; FLYDSL_TOPK_TIERED_TRIM, gfx942 default 0). A grid
+    # wider than the row's tier_cap only adds workgroups that return immediately while
+    # holding co-resident slots. Trimming to that cap is a min on active_parts, so
+    # results are identical. Skipped once the padded grid outgrows one co-resident wave,
+    # where the extra blocks hide latency instead.
     trim_on = _env_int("FLYDSL_TOPK_TIERED_TRIM", 1 if arch == "gfx950" else 0)
     if trim_on:
         if max_model_len <= tiered_short_max and single_wg_ok:
-            # All rows short-tier (active_parts=1): every block but one is dead and the
-            # barrier-free single-wg tier has nothing for the extras to hide latency for
-            # -> collapse to grid=1 (HIP one-block shape). Needs the kernel bpr==1 path.
+            # Every row short-tier: all but one block is dead and the barrier-free tier
+            # has nothing to hide. Collapse to grid=1 via the kernel's bpr==1 path.
             blocks_per_row = 1
         elif (
             max_model_len > tiered_short_max
@@ -240,18 +231,16 @@ def _resolved_kernel_config(
                 max_active_parts = max(tiered_mid_cap_default, tiered_long_cap_default)
             blocks_per_row = max(2, min(blocks_per_row, max_active_parts))
 
-    # Batch co-resident grid-width cap (gfx950 only). Keep blocks_per_row*num_rows within
-    # one co-resident wave (envelope = CU*occ) so the persistent barrier does not serialize
-    # rows into sequential waves. Env FLYDSL_TOPK_TIERED_BATCH_CAP (0/1) overrides; gfx942
-    # frozen (default 0).
+    # Batch co-resident grid-width cap (gfx950 only; FLYDSL_TOPK_TIERED_BATCH_CAP,
+    # gfx942 default 0). Keeps blocks_per_row*num_rows inside one co-resident wave
+    # (CU*occ) so the persistent barrier does not serialize rows into separate waves.
     force_single_wg = False
     batch_cap_on = _env_int(
         "FLYDSL_TOPK_TIERED_BATCH_CAP", 1 if arch == "gfx950" else 0
     )
     if batch_cap_on and num_rows > 1:
-        # occ=2 co-resides for modest grids, but beyond _COCAP_OCC2_MAX_ROWS the envelope
-        # spills into a 2nd wave, so occ=1 (one true wave) is faster. Env
-        # FLYDSL_TOPK_TIERED_OCC forces occ.
+        # occ=2 co-resides for modest grids; past _COCAP_OCC2_MAX_ROWS the envelope
+        # spills into a second wave, so occ=1 is faster. FLYDSL_TOPK_TIERED_OCC forces.
         occ = _env_int("FLYDSL_TOPK_TIERED_OCC")
         if not occ:
             occ = _CDNA_OCCUPANCY if num_rows <= _COCAP_OCC2_MAX_ROWS else 1
@@ -260,31 +249,24 @@ def _resolved_kernel_config(
         if budget >= 2:
             blocks_per_row = min(blocks_per_row, budget)
         elif single_wg_ok:
-            # budget<2: even a width-2 grid can't fit the batch in one wave. The padded
-            # grid would launch (blocks_per_row-1)*num_rows dead blocks that occupy
-            # co-resident slots and serialize the real workers -> catastrophic latency.
-            # Collapse to grid=(1, num_rows): every row runs the barrier-free single-wg
-            # short tier (HIP one-block shape). Needs the kernel bpr==1 path.
+            # Even a width-2 grid cannot fit the batch in one wave, and the padded grid
+            # would launch dead blocks that hold slots and serialize the real workers.
+            # Collapse to grid=(1, num_rows), every row barrier-free (kernel bpr==1).
             blocks_per_row = 1
             force_single_wg = True
 
     if force_single_wg:
-        # grid=(1, num_rows): active_parts=1 for every row regardless of length. Make the
-        # all-short intent explicit so needs_workspace_zero() stays False and the deadlock
-        # guard early-outs; also skips the mid-batch cap below (tiered_short_max >= L). The
-        # kernel requires mid_max >= short_max, so raise both together.
+        # active_parts=1 everywhere now. Say so explicitly so needs_workspace_zero()
+        # stays False and the mid-batch cap below is skipped. The kernel requires
+        # mid_max >= short_max, so both move together.
         tiered_short_max = max(tiered_short_max, max_model_len)
         tiered_mid_max = max(tiered_mid_max, tiered_short_max)
 
-    # Mid-batch coordination cap (gfx950 only). Once the batch alone fills the device
-    # (num_rows > 16), the co-resident budget over-provisions blocks_per_row; the measured
-    # cooperation optimum in the multi-block regime is well below it. Cap blocks_per_row by
-    # a small L-keyed step. Only reduces blocks_per_row (a min), so results stay valid.
-    # The first rule (rows>63, L<=65536 -> cap=1) folds a wide short-mid batch onto the
-    # kernel's single-workgroup launch path (enabled by the Phase B bpr=1 support); it is
-    # NOT paired with force_single_wg (short_max stays < L), so the row runs the mid tier
-    # with a single cooperating block -- barrier-free, matching HIP's one-block shape.
-    # Env FLYDSL_TOPK_TIERED_MIDBATCH_CAP overrides the matched cap (0 off).
+    # Mid-batch coordination cap (gfx950 only; FLYDSL_TOPK_TIERED_MIDBATCH_CAP). Once
+    # the batch alone fills the device the co-resident budget over-provisions
+    # blocks_per_row, so cap it by a small L-keyed step. Only a min, so results stay
+    # valid. The rows>63 rule reaches cap=1 without force_single_wg -- short_max stays
+    # below L, so the row runs the mid tier with one cooperating block, barrier-free.
     if arch == "gfx950" and max_model_len > tiered_short_max:
         mb_cap = None
         for mb_min_rows, mb_L_max, mb_cap_val in (
@@ -304,24 +286,19 @@ def _resolved_kernel_config(
         if mb_cap:
             blocks_per_row = max(1 if single_wg_ok else 2, min(blocks_per_row, mb_cap))
 
-    # Row-proportional parts (gfx950 only). The launch grid width is sized for the
-    # padded buffer, so short rows over-provision cooperating workgroups; the kernel
-    # caps participating parts by each row's actual coverage need (a min, so results
-    # are unchanged). Env FLYDSL_TOPK_TIERED_RPP (0/1) overrides; gfx942 frozen (0).
+    # Row-proportional parts (gfx950 only; FLYDSL_TOPK_TIERED_RPP, gfx942 default 0).
+    # The kernel caps participating parts by each row's own coverage need -- a min, so
+    # results are unchanged.
     rpp_on = _env_int("FLYDSL_TOPK_TIERED_RPP", 1 if arch == "gfx950" else 0)
 
-    # Early-stop (gfx950 only). Skips the final radix pass when the boundary bucket
-    # is taken whole; only enabled for the single-row (num_rows <= 1) decode case,
-    # where the merged histogram / row_barrier are cheapest and the win is cleanest.
-    # Env FLYDSL_TOPK_TIERED_ES (0/1) overrides; gfx942 frozen (0).
+    # Early-stop (gfx950 only; FLYDSL_TOPK_TIERED_ES, gfx942 default 0). Skips the last
+    # radix pass when the boundary bucket is taken whole. Single-row only.
     es_on = _env_int("FLYDSL_TOPK_TIERED_ES", 1 if arch == "gfx950" else 0)
 
-    # mask_non_finite off: the HIP kernel a gated call can fall back to ranks
-    # +inf/NaN by their raw twiddled bits, which puts them at the top, and so does
-    # torch.topk. Masking them to -inf here would make the answer depend on which
-    # kernel the gate picked for that batch. It would also bury an upstream
-    # numerical failure rather than surface it. Env
-    # FLYDSL_TOPK_TIERED_MASK_NONFINITE=1 restores the masking.
+    # mask_non_finite stays off (FLYDSL_TOPK_TIERED_MASK_NONFINITE=1 restores it): HIP
+    # and torch.topk both rank +inf/NaN by raw twiddled bits, putting them at the top.
+    # Masking to -inf here would make the answer depend on which kernel the gate picked,
+    # and would bury an upstream numerical failure instead of surfacing it.
     return {
         "blocks_per_row": blocks_per_row,
         "bits_per_pass": bits_per_pass,
@@ -372,19 +349,14 @@ def _apply_deadlock_guard(
     cu_count: int | None = None,
 ) -> dict:
     """Clamp the tiered config so the mid/long-tier inter-workgroup barrier cannot
-    deadlock. Reaching that state takes both a wide batch (num_rows > ~80-90) and
-    long rows (L > ~16-40K).
+    deadlock.
 
     The barrier spins over a non-cooperative launch, so a row's participating
-    workgroups are not guaranteed to be resident together, and one that arrives
-    early holds its slot until the rest of its row shows up. Once the workgroups
-    blocked that way outnumber the co-resident capacity nothing can drain, so the
-    guard caps the active workgroups per row or forces the barrier-free short tier.
-
-    On MI300X with 8 cooperating workgroups per row: 304 CUs x occupancy 2 = 608
-    slots, and a row blocks only 8 - 1 of them because the last arriver never
-    waits, so the guard engages at 87 rows (87 x 7 = 609 > 608) once max_model_len
-    passes 32768.
+    workgroups are not guaranteed to be resident together, and one that arrives early
+    holds its slot until the rest of its row shows up. Once the workgroups blocked
+    that way outnumber the co-resident capacity nothing can drain, so the guard caps
+    active workgroups per row or forces the barrier-free short tier. Reaching that
+    state needs both a wide batch and long rows.
     """
     if num_rows <= 0:
         return kernel_config

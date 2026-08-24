@@ -285,14 +285,11 @@ def create_topk_per_row_decode_tiered_kernel(
         s_scan = lds.s_scan.view(fx.make_layout(red_slots * 2, 1))
         s_meta = lds.s_meta.view(fx.make_layout(8, 1))
 
-        # Bound this descriptor to the real allocation instead of 4 GiB. The vec4
-        # tail loads a whole group even when the row has 1-3 elements left, and the
-        # lanes are predicated only after the load, so the last row of an unpadded
-        # buffer fetches an address past the tensor. max_size switches off the
-        # hardware range check that would otherwise return zero for it; the true
-        # size restores it, and the tail mask discards that zero exactly as it
-        # discarded the garbage before. num_rows is the grid's y extent -- see the
-        # launcher.
+        # Bound this descriptor to the real allocation instead of 4 GiB. The vec4 tail
+        # loads a whole group even when 1-3 elements remain and predicates the lanes
+        # only afterwards, so the last row of an unpadded buffer fetches past the
+        # tensor. The true size restores the hardware range check, which returns zero
+        # for those lanes, and the tail mask discards it as before.
         logits_bytes = fx.Int64(gpu.grid_dim.y) * fx.Int64(stride0) * fx.Int64(4)
         logits_rsrc = buffer_ops.create_buffer_resource(
             logits, max_size=False, num_records_bytes=logits_bytes
@@ -328,13 +325,11 @@ def create_topk_per_row_decode_tiered_kernel(
         mid_parts = (c_parts < c_mid_cap).select(c_parts, c_mid_cap)
         long_parts = (c_parts < c_long_cap).select(c_parts, c_long_cap)
         if const_expr(row_proportional_parts):
-            # gfx950: the launch grid (c_parts) is sized for the padded buffer width,
-            # so a short row would otherwise spin up far more cooperating workgroups
-            # than it needs -- each extra part only adds cross-CU barrier/merge latency
-            # (the mid/long floor). Cap participating workgroups by the row's actual
-            # coverage need: one part per items_per_block (LOAD_VEC*BLOCK_THREADS)
-            # elements, floored at 2 so the persistent tier still has >1 workgroup.
-            # Fewer parts is always correct (the scan stride covers all vec-blocks).
+            # gfx950: the grid is sized for the padded width, so a short row would spin
+            # up more cooperating workgroups than it needs, each adding barrier/merge
+            # latency. Cap parts by the row's coverage need (one per items_per_block),
+            # floored at 2. Fewer parts is always correct -- the scan stride still
+            # covers every vec-block.
             items_per_block = LOAD_VEC * block_threads
             cover_shift = (items_per_block).bit_length() - 1
             row_cover = (row_len + fx.Int32(items_per_block - 1)).shrui(
@@ -828,17 +823,12 @@ def create_topk_per_row_decode_tiered_kernel(
             return next_k, next_len, next_bits
 
         def one_workgroup_short_tier():
-            # Faithful copy of the standalone one-workgroup unordered radix-select.
-            # Runs entirely within a single workgroup (part 0):
-            # LDS-only histograms, a hierarchical block scan to locate each
-            # radix threshold, and a direct LDS-counter atomic-append write.
-            # Unlike the persistent multi-block path, this short tier uses the
-            # standalone ascending ordered key and total-k threshold convention.
-            # Three order-preserving passes peel 11/11/10 bits of that key, so
-            # it requires a 2048-bin histogram
-            # (``num_buckets == 2048``, i.e. bits_per_pass == 11). It reuses the
-            # persistent kernel's existing LDS (``s_hist`` 2048 ints,
-            # ``s_scan`` 32 ints, ``s_meta`` 8 ints) with no extra shared memory.
+            # Faithful copy of the standalone one-workgroup unordered radix-select,
+            # running entirely in part 0: LDS-only histograms, a hierarchical block
+            # scan, and an atomic-append write. Unlike the multi-block path it uses the
+            # standalone ascending key and total-k threshold convention, and its three
+            # 11/11/10-bit passes require a 2048-bin histogram (bits_per_pass == 11).
+            # Reuses the persistent kernel's LDS with no extra shared memory.
             c_shift = fx.Int32(32 - 11)
             c_mid_shift = fx.Int32(10)
             c_bin_mask = fx.Int32((1 << 11) - 1)
@@ -1107,12 +1097,11 @@ def create_topk_per_row_decode_tiered_kernel(
             local_len = row_len
             kth_bits = c_zero
             if early_stop:
-                # HIP-mb-style early termination: run every pass but the last (none of
-                # these write), then skip the final radix pass when the boundary bucket
+                # Early termination: skip the final radix pass when the boundary bucket
                 # is taken whole (remaining_len == remaining_k) and write those elements
-                # directly. `early` is computed from the globally merged histogram, so it
-                # is identical across every block of the row -> the last pass's row_barrier
-                # is entered (or skipped) by all blocks together, no deadlock.
+                # directly. `early` comes from the globally merged histogram, so it is
+                # identical across the row's blocks -- they enter or skip the last
+                # row_barrier together, which is what keeps this deadlock-free.
                 for pass_id in range_constexpr(num_passes - 1):
                     local_k, local_len, kth_bits = scan_pass(
                         pass_id, local_k, kth_bits, pass_id + 1
