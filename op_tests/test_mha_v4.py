@@ -197,6 +197,16 @@ def test_mha_v4_bf16_scale_recipe():
     )
 
 
+def test_mha_v4_bf16fp8_scale_recipe():
+    assert scale_modes_for_formats(
+        AttentionFormat.BF16, AttentionFormat.BF16, AttentionFormat.FP8
+    ) == (
+        AttentionScaleMode.NONE,
+        AttentionScaleMode.NONE,
+        AttentionScaleMode.F32_PER_TENSOR,
+    )
+
+
 def test_mha_v4_rejects_f8f4_format_pair():
     with pytest.raises(ValueError, match="matching FP8 or MXFP6 V"):
         scale_modes_for_formats(
@@ -766,6 +776,7 @@ def test_mha_v4_packed_rejects_wrong_mxfp4_k_layout():
     ("q_format", "v_format"),
     [
         (AttentionFormat.BF16, AttentionFormat.BF16),
+        (AttentionFormat.BF16, AttentionFormat.FP8),
         (AttentionFormat.INT8, AttentionFormat.FP8),
         (AttentionFormat.FP8, AttentionFormat.FP8),
     ],
@@ -776,6 +787,40 @@ def test_mha_v4_zero_inputs_are_finite(q_format, v_format):
     torch.cuda.synchronize()
     assert torch.count_nonzero(out) == 0
     assert torch.isfinite(out).all()
+
+
+@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 BF16-FP8 validation")
+@pytest.mark.parametrize(("sequence_q", "sequence_k"), [(129, 257), (257, 193)])
+def test_mha_v4_bf16fp8_matches_dequantized_reference(sequence_q, sequence_k):
+    torch.manual_seed(sequence_q + sequence_k)
+    q = torch.randn((1, sequence_q, 5, 128), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((1, sequence_k, 5, 128), device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+
+    v_quantized, v_descale = quantize_fp8(v)
+    v_dequantized = v_quantized.float() * v_descale
+    scores = torch.matmul(
+        q.transpose(1, 2).float(), k.transpose(1, 2).float().transpose(-1, -2)
+    ) * (128**-0.5)
+    reference = torch.matmul(
+        torch.softmax(scores, dim=-1), v_dequantized.transpose(1, 2)
+    ).transpose(1, 2)
+
+    actual = mha_v4(
+        q,
+        k,
+        v,
+        AttentionFormat.BF16,
+        AttentionFormat.BF16,
+        AttentionFormat.FP8,
+    )
+    torch.cuda.synchronize()
+
+    cosine = torch.nn.functional.cosine_similarity(
+        actual.float().flatten(), reference.flatten(), dim=0
+    )
+    assert torch.isfinite(actual).all()
+    assert cosine > 0.998
 
 
 @pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 GQA validation")
@@ -931,6 +976,7 @@ def test_mha_v4_native_schema_mutates_only_out():
     ("q_format", "v_format"),
     [
         (AttentionFormat.BF16, AttentionFormat.BF16),
+        (AttentionFormat.BF16, AttentionFormat.FP8),
         (AttentionFormat.INT8, AttentionFormat.FP8),
         (AttentionFormat.FP8, AttentionFormat.FP8),
         (AttentionFormat.FP8, AttentionFormat.MXFP6),
@@ -959,7 +1005,10 @@ def test_mha_v4_raw_compile_parity(q_format, v_format):
 
     assert eager.data_ptr() == eager_out.data_ptr()
     assert compiled.data_ptr() == compiled_out.data_ptr()
-    assert torch.equal(eager, compiled)
+    if q_format == AttentionFormat.BF16 and v_format == AttentionFormat.FP8:
+        torch.testing.assert_close(eager, compiled, atol=0.02, rtol=0.02)
+    else:
+        assert torch.equal(eager, compiled)
     assert torch.isfinite(consumed).all()
     assert churn.numel() == 16 * 1024 * 1024
 

@@ -129,6 +129,7 @@ KernelName = Literal[
     "fav3_fp8",
     "aiter_bf16",
     "mha4_bf16",
+    "mha4_bf16fp8",
     "mha4_i8fp8",
     "mha4_mxfp8",
     "mha4_fp8",
@@ -142,6 +143,7 @@ KernelName = Literal[
 ALL_KERNELS: list[str] = [
     "aiter_bf16",
     "mha4_bf16",
+    "mha4_bf16fp8",
     "mha4_i8fp8",
     "mha4_mxfp8",
     "mha4_fp8",
@@ -164,6 +166,7 @@ QUANT_KERNELS = {
     "mha4_f6f4",
     "mha4_mxfp4",
     "mha4_f4f4",
+    "mha4_bf16fp8",
 }
 
 
@@ -1106,6 +1109,36 @@ def make_kernel_runner(
             AttentionFormat.BF16,
             AttentionFormat.BF16,
             AttentionFormat.BF16,
+            softmax_scale=softmax_scale,
+        )
+
+    if args.kernel == "mha4_bf16fp8":
+        if args.e2e:
+            return lambda: mha_v4(
+                q_bshd,
+                k_bshd,
+                v_bshd,
+                AttentionFormat.BF16,
+                AttentionFormat.BF16,
+                fp8_format,
+                softmax_scale=softmax_scale,
+            )
+
+        v_quantized, v_descale = quantize_fp8(v_bshd)
+        bf16fp8_scale_modes = scale_modes_for_formats(
+            AttentionFormat.BF16, AttentionFormat.BF16, fp8_format
+        )
+        return lambda: mha_v4_packed(
+            q_bshd,
+            k_bshd,
+            v_quantized,
+            q_bshd,
+            k_bshd,
+            v_descale,
+            AttentionFormat.BF16,
+            AttentionFormat.BF16,
+            fp8_format,
+            *bf16fp8_scale_modes,
             softmax_scale=softmax_scale,
         )
 
@@ -2149,6 +2182,7 @@ def parse_args() -> argparse.Namespace:
             "fav3_fp8",
             "aiter_bf16",
             "mha4_bf16",
+            "mha4_bf16fp8",
             "mha4_i8fp8",
             "mha4_mxfp8",
             "mha4_fp8",

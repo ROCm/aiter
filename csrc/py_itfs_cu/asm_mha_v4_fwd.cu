@@ -466,13 +466,15 @@ void populate_dense_kernarg(FmhaV4Kernarg& args,
                             const at::Tensor& out,
                             const fmha_v4_fwdConfig& cfg,
                             int64_t q_format,
+                            int64_t v_format,
                             int64_t seqlen_q,
                             int64_t seqlen_k,
                             int64_t nhead_q,
                             int64_t gqa_ratio,
                             double softmax_scale)
 {
-    const bool bf16_format = q_format == format_id(AttentionFormat::Bf16);
+    const bool bf16_qk = q_format == format_id(AttentionFormat::Bf16);
+    const bool bf16_v  = v_format == format_id(AttentionFormat::Bf16);
 
     args.ptr_o.value         = out.data_ptr();
     args.ptr_q.value         = q.data_ptr();
@@ -506,7 +508,7 @@ void populate_dense_kernarg(FmhaV4Kernarg& args,
     args.s_o_Hs.value        = out.stride(2) * out.element_size();
     args.s_o_Bs.value        = out.stride(0) * out.element_size();
 
-    if(!bf16_format)
+    if(!bf16_qk)
     {
         set_descale_strides(q_descale,
                             q_descale.dim() >= 3 ? 2 : 1,
@@ -516,6 +518,9 @@ void populate_dense_kernarg(FmhaV4Kernarg& args,
                             k_descale.dim() >= 3 ? 2 : 1,
                             args.s_descale_k_Bs.value,
                             args.s_descale_k_Hs.value);
+    }
+    if(!bf16_v)
+    {
         set_descale_strides(v_descale, 1, args.s_descale_v_Bs.value, args.s_descale_v_Hs.value);
     }
 }
@@ -604,15 +609,19 @@ PackedMhaV4Shapes validate_packed_mha_v4(const at::Tensor& q,
 
     const bool mx_qk_format = q_format == format_id(AttentionFormat::Fp6E2M3) ||
                               q_format == format_id(AttentionFormat::Fp4E2M1);
-    const bool bf16_format    = q_format == format_id(AttentionFormat::Bf16);
+    const bool bf16_qk        = q_format == format_id(AttentionFormat::Bf16);
+    const bool bf16_v         = v_format == format_id(AttentionFormat::Bf16);
     const bool e8m0_qk_scales = q_scale_mode == scale_mode_id(AttentionScaleMode::E8M0Per1x32) &&
                                 k_scale_mode == scale_mode_id(AttentionScaleMode::E8M0Per1x32);
-    if(bf16_format)
+    if(bf16_qk)
     {
         TORCH_CHECK(q_scale_mode == scale_mode_id(AttentionScaleMode::None) &&
-                        k_scale_mode == scale_mode_id(AttentionScaleMode::None) &&
-                        v_scale_mode == scale_mode_id(AttentionScaleMode::None),
-                    "BF16 Q/K/V must use NONE scale modes");
+                        k_scale_mode == scale_mode_id(AttentionScaleMode::None),
+                    "BF16 Q/K must use NONE scale modes");
+        TORCH_CHECK((bf16_v && v_scale_mode == scale_mode_id(AttentionScaleMode::None)) ||
+                        (!bf16_v &&
+                         v_scale_mode == scale_mode_id(AttentionScaleMode::F32PerTensor)),
+                    "BF16 Q/K requires NONE scale mode for BF16 V or F32_PER_TENSOR for FP8 V");
     }
     else if(e8m0_qk_scales)
     {
@@ -636,9 +645,14 @@ PackedMhaV4Shapes validate_packed_mha_v4(const at::Tensor& q,
     }
     const bool mx_v = v_format == format_id(AttentionFormat::Fp6E2M3) ||
                       v_format == format_id(AttentionFormat::Fp4E2M1);
-    if(bf16_format)
+    if(bf16_qk && bf16_v)
     {
         // Raw BF16 operands do not use descale tensors.
+    }
+    else if(bf16_qk)
+    {
+        TORCH_CHECK(v_descale.scalar_type() == at::ScalarType::Float && v_descale.numel() == 1,
+                    "BF16/FP8 V descale must be a scalar float32 tensor");
     }
     else if(mx_v)
     {
@@ -724,6 +738,7 @@ void fmha_v4_fwd(const at::Tensor& q,
                            out,
                            cfg,
                            q_format,
+                           v_format,
                            shapes.seqlen_q,
                            shapes.seqlen_k,
                            shapes.nhead_q,
@@ -842,6 +857,7 @@ void fmha_v4_fwd_sparse(const at::Tensor& q,
                            out,
                            cfg,
                            q_format,
+                           v_format,
                            shapes.seqlen_q,
                            shapes.seqlen_k,
                            shapes.nhead_q,

@@ -265,8 +265,8 @@ def _validate_format_contract(
     if q_format != k_format:
         raise ValueError("MHA v4 currently requires matching Q and K formats")
     if q_format == AttentionFormat.BF16:
-        if v_format != AttentionFormat.BF16:
-            raise ValueError("BF16 Q/K currently requires BF16 V")
+        if v_format != AttentionFormat.BF16 and not _is_fp8_format(v_format):
+            raise ValueError("BF16 Q/K currently requires BF16 or FP8 V")
         return
     if q_format not in _PACKED_QK_WIDTH:
         raise ValueError(f"unsupported Q/K format: {q_format!r}")
@@ -296,7 +296,11 @@ def scale_modes_for_formats(
         return (
             AttentionScaleMode.NONE,
             AttentionScaleMode.NONE,
-            AttentionScaleMode.NONE,
+            (
+                AttentionScaleMode.NONE
+                if v_format == AttentionFormat.BF16
+                else AttentionScaleMode.F32_PER_TENSOR
+            ),
         )
     if q_format == AttentionFormat.INT8 or q_format in _FP8_FORMATS:
         v_scale_mode = (
@@ -1332,7 +1336,7 @@ def mha_v4(
         "lut_start": lut_start,
         "lut_count": lut_count,
     }
-    if q_format == AttentionFormat.BF16:
+    if q_format == AttentionFormat.BF16 and v_format == AttentionFormat.BF16:
         return mha_v4_packed(
             q,
             k,
@@ -1350,6 +1354,24 @@ def mha_v4(
             out=out,
             return_lse=return_lse,
             **packed_lut,
+        )
+    if q_format == AttentionFormat.BF16 and _is_fp8_format(v_format):
+        v_quantized, v_descale = quantize_fp8(v)
+        return mha_v4_packed(
+            q,
+            k,
+            v_quantized,
+            q,
+            k,
+            v_descale,
+            q_format,
+            k_format,
+            v_format,
+            q_scale_mode,
+            k_scale_mode,
+            v_scale_mode,
+            softmax_scale=softmax_scale,
+            out=out,
         )
     if q_format == AttentionFormat.INT8 and _is_fp8_format(v_format):
         q_quantized, q_descale = quantize_int8(q)
