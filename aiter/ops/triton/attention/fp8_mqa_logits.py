@@ -216,6 +216,8 @@ def fp8_mqa_logits(
             num_chains = 8 if USE_FOLDED_REDUCTION else 0
             num_warps = 4
             block_kv = 128
+            # This kernel has no BLOCK_M: it walks one query row per program.
+            block_m = 1
             other = {"LOOP_VARIANT": loop_variant}
 
         # Buffer ops use a 32-bit byte offset (2 GiB resource descriptor cap).
