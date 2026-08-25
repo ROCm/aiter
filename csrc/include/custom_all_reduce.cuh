@@ -52,6 +52,29 @@ struct Signal
     alignas(128) uint32_t _flag[kMaxBlocks]; // incremental flags for each rank
 };
 
+// Scratch reserved for the Lamport fused AR+RMSNorm path, carved out of the meta
+// buffer immediately after Signal and ahead of the general tmp region.
+//
+// It cannot share the general tmp region. Lamport encodes arrival in the data
+// itself, so the buffer has to hold sentinels at the start of every call, and
+// the only thing that restores them is the Lamport consumer re-arming each pack
+// it reads. Any other kernel that stages through the tmp region -- the 2-stage
+// all-reduce, reduce-scatter, allgather -- overwrites those sentinels with real
+// data, and lamport_ensure_armed will not re-arm because it tracks a high-water
+// mark and believes the buffer is still primed. The next Lamport call then sees
+// non-sentinel words, treats stale data as arrived, and returns the previous
+// iteration's values. It does not hang; it is silently wrong.
+//
+// Re-arming defensively is not an option under CUDA graphs: the pollution comes
+// from replaying a graph captured at a different shape, and the re-arm cannot be
+// recorded into the Lamport graph (it would clobber producer stores the peers
+// have already landed). A private region is the only fix that holds across
+// replays.
+//
+// Sized for m * n * sizeof(T): 32 MiB covers m=2048 at n=7168 bf16. Shapes past
+// it fall back to the two-kernel path via the lam_ok check.
+constexpr size_t kLamportScratchBytes = 32ull * 1024 * 1024;
+
 #ifdef USE_ROCM
 struct __align__(16) RankData
 {
@@ -311,7 +334,21 @@ DINLINE P* get_tmp_buf(Signal* sg)
 DINLINE P* get_tmp_buf(volatile Signal* sg)
 {
 #endif
-    return (P*)(((Signal*)sg) + 1);
+    // Skips the Lamport scratch; see kLamportScratchBytes.
+    return (P*)(reinterpret_cast<char*>((Signal*)sg + 1) + kLamportScratchBytes);
+}
+
+// Lamport's private staging region: the kLamportScratchBytes immediately after
+// Signal, which no other kernel touches.
+template <typename P>
+#ifdef USE_ROCM
+DINLINE P* get_lamport_buf(Signal* sg)
+{
+#else
+DINLINE P* get_lamport_buf(volatile Signal* sg)
+{
+#endif
+    return (P*)((Signal*)sg + 1);
 }
 
 template <typename T, int ngpus, bool is_broadcast_reg_outptr = false>
@@ -1723,7 +1760,7 @@ __global__ void lamport_prefill_sentinel(RankSignals sg, int rank, int pack_coun
 {
     constexpr int pack_size = 16 / sizeof(T);
     using P                 = typename opus::vector_t<T, pack_size>;
-    P* tmps                 = get_tmp_buf<P>(sg.signals[rank]);
+    P* tmps                 = get_lamport_buf<P>(sg.signals[rank]);
     for(int i = blockIdx.x * blockDim.x + threadIdx.x; i < pack_count;
         i += gridDim.x * blockDim.x)
     {
@@ -1790,7 +1827,7 @@ __global__ void __launch_bounds__(tnum, 1)
     for(int i = 0; i < ngpus; ++i)
     {
         ptrs[i]      = (const P*)_dp->ptrs[i];
-        peer_tmps[i] = get_tmp_buf<P>(sg.signals[i]);
+        peer_tmps[i] = get_lamport_buf<P>(sg.signals[i]);
     }
 
     start_sync_acqrel<ngpus>(sg, self_sg, rank);
@@ -1871,7 +1908,7 @@ __global__ void __launch_bounds__(tnum, 1)
     __syncthreads();
 
     // ---------------- phase B: Lamport spin + RMSNorm -----------------------
-    P* tmps = get_tmp_buf<P>(sg.signals[rank]);
+    P* tmps = get_lamport_buf<P>(sg.signals[rank]);
 
     for(int bid = blockIdx.x; bid < m; bid += gridDim.x)
     {
@@ -3879,7 +3916,8 @@ class CustomAllreduce
     template <typename T>
     T* local_tmp_reduced_ptr() const
     {
-        return reinterpret_cast<T*>(self_sg_ + 1);
+        return reinterpret_cast<T*>(reinterpret_cast<char*>(self_sg_ + 1) +
+                                    kLamportScratchBytes);
     }
 
     /**
@@ -4706,6 +4744,7 @@ void dispatchFusedAllReduceRMSNorm(hipStream_t stream,
         // same whoever calls in.
         const size_t lam_bytes = static_cast<size_t>(m) * n * sizeof(T);
         const bool lam_ok      = (lam_bytes >= ar_rmsnorm_lamport_min_bytes()) &&
+                            (lam_bytes <= kLamportScratchBytes) &&
                             (n % pack_size == 0) && (lam_packs >= 64) &&
                             (lam_n_loop >= 1 && lam_n_loop <= 4) &&
                             ((m * lam_packs) % world_size_ == 0) &&
