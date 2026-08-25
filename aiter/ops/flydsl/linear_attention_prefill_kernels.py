@@ -502,6 +502,14 @@ def _get_or_compile(
     return _compiled_kernels[cache_key]
 
 
+def _build_declares_qo() -> bool:
+    """Whether the K5 build ``_get_or_compile`` selects declares ``q``/``o``.
+
+    Only the shared gfx942 builder does. The gfx950 builder has no such parameters.
+    """
+    return _ARCH == "gfx942"
+
+
 def _launch_kernel(
     launch_fn,
     BV,
@@ -527,6 +535,7 @@ def _launch_kernel(
 ):
     grid_v = triton.cdiv(V, BV)
     grid_nh = N * H
+    qo_args = (q_arg, o_arg) if _build_declares_qo() else ()
     _run_compiled(
         launch_fn,
         k,
@@ -540,8 +549,7 @@ def _launch_kernel(
         ht_arg,
         cu_arg,
         co_arg,
-        q_arg,
-        o_arg,
+        *qo_args,
         T,
         T_flat,
         N,
