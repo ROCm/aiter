@@ -24,6 +24,19 @@ __device__ __forceinline__ i32x8 join_frag(const i32x4& lo, const i32x4& hi)
     return __builtin_shufflevector(lo, hi, 0, 1, 2, 3, 4, 5, 6, 7);
 }
 
+__device__ __forceinline__ f32x4 mfma_scale(i32x8 a, i32x8 b, f32x4 acc)
+{
+#if defined(__gfx950__)
+    return __builtin_amdgcn_mfma_scale_f32_16x16x128_f8f6f4(a, b, acc, 0, 0, 0, 0, 0, 0);
+#else
+    (void)a;
+    (void)b;
+    (void)acc;
+    __builtin_trap();
+    return f32x4{0.f, 0.f, 0.f, 0.f};
+#endif
+}
+
 // ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
@@ -382,8 +395,7 @@ __device__ __forceinline__ void prefill_main_loop(const uint8_t* __restrict__ q_
                     break;
 
                 f32x4 acc = {0.f, 0.f, 0.f, 0.f};
-                acc       = __builtin_amdgcn_mfma_scale_f32_16x16x128_f8f6f4(
-                    join_frag(a[0], a[1]), join_frag(qb[qt][0], qb[qt][1]), acc, 0, 0, 0, 0, 0, 0);
+                acc       = mfma_scale(join_frag(a[0], a[1]), join_frag(qb[qt][0], qb[qt][1]), acc);
 
                 if(!masked)
                 {
@@ -622,8 +634,7 @@ __device__ __forceinline__ void decode_main_loop(const uint8_t* __restrict__ q_i
                     break;
 
                 f32x4 acc = {0.f, 0.f, 0.f, 0.f};
-                acc       = __builtin_amdgcn_mfma_scale_f32_16x16x128_f8f6f4(
-                    kfrag, join_frag(qb[qt][0], qb[qt][1]), acc, 0, 0, 0, 0, 0, 0);
+                acc       = mfma_scale(kfrag, join_frag(qb[qt][0], qb[qt][1]), acc);
 
                 if(!masked)
                 {

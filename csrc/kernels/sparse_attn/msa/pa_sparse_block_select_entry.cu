@@ -25,6 +25,18 @@ AITER_CTYPES_ERROR_DEF
                 " is not built; this build carries block_size ",                    \
                 SPARSE_BLOCK_SIZE)
 
+inline bool sparse_arch_supported()
+{
+    static const bool v = (get_gpu_arch() == "gfx950");
+    return v;
+}
+
+#define SPARSE_CHECK_ARCH(pass)                         \
+    AITER_CHECK(sparse_arch_supported(),                \
+                pass ": requires gfx950 architecture; " \
+                     "the running device is ",          \
+                get_gpu_arch())
+
 #define SPARSE_DECODE_DISPATCH(H, W)                                          \
     if(num_idx_heads == (H) && num_waves == (W))                              \
     {                                                                         \
@@ -72,6 +84,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(pa_sparse_block_score_decode,
                                      num_waves,
                                      stream))
 {
+    SPARSE_CHECK_ARCH("pa_sparse_block_score_decode");
     SPARSE_CHECK_SHAPE("pa_sparse_block_score_decode");
 
     const auto* q_idx         = reinterpret_cast<const uint8_t*>(q_idx_ptr);
@@ -140,6 +153,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(pa_sparse_block_score_prefill,
                                      q_tiles,
                                      stream))
 {
+    SPARSE_CHECK_ARCH("pa_sparse_block_score_prefill");
     SPARSE_CHECK_SHAPE("pa_sparse_block_score_prefill");
     // The workgroup stages one page for all of its waves, so the wave count is
     // part of that mapping and not a variant axis.
