@@ -1905,7 +1905,41 @@ inline void lamport_ensure_armed(hipStream_t stream, RankSignals sg, int rank, i
     if(it != armed.end() && it->second >= pack_count)
         return;
     const int blocks = std::min((pack_count + 255) / 256, 1024);
-    lamport_prefill_sentinel<T><<<blocks, 256, 0, stream>>>(sg, rank, pack_count);
+
+    // Arming must happen once, not once per graph replay. Recording the prefill
+    // into a graph re-arms the whole buffer on every replay, which overwrites
+    // producer stores the peers have already landed and leaves the consumers
+    // spinning forever (reproduced at TP=4 / n=7168 / m=1: 3/3 hangs with the
+    // prefill captured, 3/3 clean when it is armed before capture).
+    //
+    // So when the target stream is capturing, run the prefill for real on a
+    // private non-capturing stream and keep it out of the graph. Steady state
+    // stays armed because phase B re-arms every pack it consumes. No explicit
+    // sync here: synchronising is illegal under global capture mode, and the
+    // capture is always followed by a device sync before the first replay.
+    hipStreamCaptureStatus capture_status = hipStreamCaptureStatusNone;
+    if(hipStreamIsCapturing(stream, &capture_status) != hipSuccess)
+        capture_status = hipStreamCaptureStatusNone;
+
+    hipStream_t arm_stream = stream;
+    if(capture_status != hipStreamCaptureStatusNone)
+    {
+        static std::unordered_map<int, hipStream_t> arm_streams;
+        int dev = 0;
+        if(hipGetDevice(&dev) != hipSuccess)
+            dev = 0;
+        auto sit = arm_streams.find(dev);
+        if(sit == arm_streams.end())
+        {
+            hipStream_t s = nullptr;
+            if(hipStreamCreateWithFlags(&s, hipStreamNonBlocking) == hipSuccess)
+                sit = arm_streams.emplace(dev, s).first;
+        }
+        if(sit != arm_streams.end())
+            arm_stream = sit->second;
+    }
+
+    lamport_prefill_sentinel<T><<<blocks, 256, 0, arm_stream>>>(sg, rank, pack_count);
     armed[key] = pack_count;
 }
 template <typename T, int n_loop, bool GEMMA_NORM = false>
@@ -4565,7 +4599,13 @@ void dispatchFusedAllReduceRMSNorm(hipStream_t stream,
             // what fits resident on the device, the unscheduled producer blocks can
             // never run and the resident consumers spin forever.  So the grid must be
             // clamped to the co-resident block count for the exact instantiation.
-            int lam_blocks = std::max(1, std::min(m, static_cast<int>(num_cu) * 2));
+            //
+            // kMaxBlocks is the harder limit of the two: start_sync_acqrel indexes
+            // Signal::start/end/_flag by blockIdx.x and those arrays are sized
+            // [kMaxBlocks], so a larger grid corrupts the signal region and the
+            // barrier never completes.  Both phases are grid-stride loops, so a
+            // smaller grid only costs throughput.
+            int lam_blocks = std::max(1, std::min(m, kMaxBlocks));
 
 #define LAMPORT_LAUNCH(NGPUS, NLOOP, GEMMA)                                        \
     do                                                                             \
