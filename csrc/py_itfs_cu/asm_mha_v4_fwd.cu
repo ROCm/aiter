@@ -683,12 +683,12 @@ void fmha_v4_fwd_sparse(const at::Tensor& q,
                                                q_scale_mode,
                                                k_scale_mode,
                                                v_scale_mode);
-    TORCH_CHECK(shapes.seqlen_k % 128 == 0,
-                "sorted-sparse MHA v4 requires key length padded to a multiple of 128");
-
-    const auto arch = get_gpu_arch();
-    const auto& cfg = find_config(
+    const auto arch   = get_gpu_arch();
+    const auto& cfg   = find_config(
         arch, q_format, k_format, v_format, q_scale_mode, k_scale_mode, v_scale_mode, /*mode=*/1);
+    TORCH_CHECK(shapes.seqlen_k % cfg.ts_kv == 0,
+                "sorted-sparse MHA v4 requires key length padded to a multiple of ",
+                cfg.ts_kv);
 
     const int64_t q_tiles  = (shapes.seqlen_q + cfg.ts_qo - 1) / cfg.ts_qo;
     const int64_t kv_tiles = (shapes.seqlen_k + cfg.ts_kv - 1) / cfg.ts_kv;

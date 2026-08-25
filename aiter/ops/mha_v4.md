@@ -7,8 +7,8 @@
 
 Dense BF16-output MHA v4 is implemented and validated on gfx950. Sorted block-sparse dispatch
 (mask/LUT APIs, `mode=1` manifest rows) is wired on the same family; sparse `.co` files are
-deployed next to the dense objects. Gfx942 native FP8/FP8 and signed INT8/FP8 dense rows are
-also available under v4.
+deployed next to the dense objects. Gfx942 native FP8/FP8 and signed INT8/FP8 have both dense
+and sorted-sparse rows under v4 (256×64 tiles).
 
 The public raw and packed APIs support eight dense combinations:
 
@@ -25,7 +25,8 @@ The public raw and packed APIs support eight dense combinations:
 
 Current scope is batched, non-causal MHA with BF16 raw inputs, head dimension 128, and BF16
 output. Dense and sorted block-sparse execution both support grouped-query head ratios; sparse
-LUT rows are one per query head. Sparse is gfx950-only. It is inference-only: no backward,
+LUT rows are one per query head. Sparse ships on gfx950 (all eight packed recipes, 256×128)
+and gfx942 (native FP8/FP8 and INT8/FP8, 256×64). It is inference-only: no backward,
 dropout, RNG state, LSE, or varlen. Unsupported requests fail explicitly and never fall back
 to `aiter.ops.mha`.
 
@@ -53,7 +54,8 @@ The current implementation is intentionally one module, `aiter/ops/mha_v4.py`; a
 subpackage split is not part of the design. It exports:
 
 - `mha_v4`, `mha_v4_mxfp8`, and `mha_v4_packed`;
-- `AttentionFormat`, `AttentionScaleMode`, `native_fp8_format`, and `scale_modes_for_formats`;
+- `AttentionFormat`, `AttentionScaleMode`, `native_fp8_format`, `mha_v4_kv_tile`, and
+  `scale_modes_for_formats`;
 - canonical per-tensor, MX Q/K, and V quantizers;
 - `mxfp4_k_view`, `mxfp6_k_view`, and `mxfp4_v_view` for raw-buffer reconstruction;
 - `mha_v4_q_multiplier` for the MX Q scaling recipe.
@@ -83,7 +85,7 @@ Still deferred:
 - low-precision output with an explicit data/scale ABI;
 - additional BF16 kernel variants with distinct manifest identities;
 - causal, varlen, other head dimensions, and more Q/K/V/O combinations;
-- broader gfx942, CDNA5, and RDNA manifest/code-object coverage.
+- remaining gfx942 recipes (MX, BF16 sparse), plus CDNA5 and RDNA coverage.
 
 ## Current Dense Performance
 
@@ -131,9 +133,10 @@ Output is BF16, and a supplied `out` must match Q's shape/device. Q, K, and V pr
 separate custom ops so distributed schedulers can overlap each with its input communication.
 The canonical FP8 Q/K recipe applies normalized hd128 Walsh-Hadamard rotation before per-tensor
 quantization on both gfx942 and gfx950; V uses unrotated per-tensor FP8 quantization.
-Optional `block_mask` is a boolean tile mask at 256×128 geometry: `[B, H, Qtiles, KVtiles]` or
-`[B, Qtiles, KVtiles]` (broadcast across heads). It is converted internally to a ragged LUT; the
-host work table is not a Python argument.
+Optional `block_mask` is a boolean tile mask at the architecture's sparse geometry (256×128 on
+gfx950, 256×64 on gfx942): `[B, H, Qtiles, KVtiles]` or `[B, Qtiles, KVtiles]` (broadcast across
+heads). Use `mha_v4_kv_tile()` for the KV dimension. It is converted internally to a ragged LUT;
+the host work table is not a Python argument.
 
 #### Grouped-Query Attention
 
@@ -326,13 +329,15 @@ does not require a Python-side architecture branch.
 
 ## Sparse Contract
 
-Sorted block-sparse execution is implemented for gfx950 hd128 rows.
+Sorted block-sparse execution is implemented for gfx950 hd128 rows (256×128) and for gfx942
+native FP8/FP8 plus INT8/FP8 (256×64). Other gfx942 recipes stay dense-only.
 
 Selection is an explicit manifest dimension (`mode=0` dense, `mode=1` sorted-sparse), not
 inferred from pointers or redirected from a dense request. Dense and sparse use separate
 launchers so the dense kernarg layout stays frozen.
 
-Raw API: optional boolean `block_mask` at query-tile 256 × KV-tile 128. Convert with
+Raw API: optional boolean `block_mask` at query-tile 256 × `mha_v4_kv_tile()` (128 on gfx950,
+64 on gfx942). Convert with
 `block_attn_mask_to_ragged_lut(..., num_heads=q.shape[2], return_none_if_dense=False)`.
 An all-True mask still takes the sparse row. GQA uses the same ratio as dense; LUT and work-table
 rows are one per query head. A 3-D mask broadcasts across query heads; a 4-D mask may give grouped
@@ -340,14 +345,15 @@ query heads different KV-tile lists.
 
 Packed API: optional int32 LUT triple. `lut_start` / `lut_count` have one entry per
 `(batch, query_head, query_block)`. `kv_block_indices` is 1-D and may be over-allocated to
-`B*H*Qtiles*KVtiles` to avoid data-dependent allocations. Key length must be a multiple of 128.
+`B*H*Qtiles*KVtiles` to avoid data-dependent allocations. Key length must be a multiple of the
+architecture KV tile (128 on gfx950, 64 on gfx942).
 
 The host builds a work table inside the sparse custom op. If every `lut_count` is equal
 (uniform / top-k sparsity), visit order stays raster; otherwise rows are ordered
 longest-LUT-first (LPT). Empty LUT rows still launch as no-ops.
 
-Sparse code objects live next to dense ones under `hsa/gfx950/fmha_v4_fwd/` (for example
-`fwd_hd128_fp8_sparse.co`).
+Sparse code objects live next to dense ones: `hsa/gfx950/fmha_v4_fwd/` (for example
+`fwd_hd128_fp8_sparse.co`) and `hsa/gfx942/fmha_v4_fwd/MI300/` for the two gfx942 recipes.
 
 Do not add optional LUT arguments to the dense MXFP4/MXFP6 launch custom ops; sparse MX goes
 through `mha_v4_packed` after reconstructing views.

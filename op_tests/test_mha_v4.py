@@ -16,6 +16,7 @@ from aiter.ops.mha_v4 import (
     AttentionFormat,
     AttentionScaleMode,
     mha_v4,
+    mha_v4_kv_tile,
     mha_v4_mxfp8,
     mha_v4_packed,
     mha_v4_q_multiplier,
@@ -999,10 +1000,20 @@ def test_mha_v4_raw_mxfp4_v_supports_unaligned_sequence(q_format):
 
 
 def _mha_v4_sparse_co_available() -> bool:
+    gfx = get_gfx()
     asm_dir = os.environ.get("AITER_ASM_DIR", os.path.join(AITER_ROOT_DIR, "hsa"))
+    if gfx == "gfx942":
+        return os.path.isfile(
+            os.path.join(
+                asm_dir, "gfx942", "fmha_v4_fwd", "MI300", "fwd_hd128_fp8_sparse.co"
+            )
+        )
     return os.path.isfile(
         os.path.join(asm_dir, "gfx950", "fmha_v4_fwd", "fwd_hd128_fp8_sparse.co")
     )
+
+
+_MHA_V4_SPARSE_ARCH = get_gfx() in ("gfx942", "gfx950")
 
 
 def test_mha_v4_packed_rejects_partial_lut():
@@ -1040,7 +1051,7 @@ def test_mha_v4_rejects_wrong_block_mask_shape():
         )
 
 
-@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 six-format validation")
+@pytest.mark.skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 sparse schema")
 def test_mha_v4_sparse_schema_mutates_only_out():
     dense = str(torch.ops.aiter.mha_v4_fwd_launch.default._schema)
     assert "Tensor kv_block_indices" not in dense
@@ -1081,7 +1092,7 @@ def _unpack_work_table(table, nhead, q_tiles):
 
 # The table has one entry per (batch, head, query tile). 8192 is the point where the builder hands
 # the sort to ATen, so straddle it, and include sizes that are not multiples of a wave or workgroup.
-@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 sparse validation")
+@pytest.mark.skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 sparse validation")
 @pytest.mark.parametrize(
     ("batch", "nhead", "q_tiles"),
     [
@@ -1129,7 +1140,7 @@ def test_mha_v4_sparse_work_table_is_longest_lut_first(batch, nhead, q_tiles, pa
     assert torch.equal(visited, expected)
 
 
-@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 sparse validation")
+@pytest.mark.skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 sparse validation")
 @pytest.mark.parametrize(
     "batch,nhead,q_tiles", [(1, 16, 32), (1, 5, 296), (8, 16, 64), (8, 32, 64)]
 )
@@ -1146,7 +1157,7 @@ def test_mha_v4_sparse_work_table_leaves_uniform_counts_in_raster_order(
     assert torch.equal(visited, torch.arange(total, device="cuda"))
 
 
-@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 sparse validation")
+@pytest.mark.skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 sparse validation")
 @pytest.mark.skipif(
     not _mha_v4_sparse_co_available(),
     reason="sorted-sparse MHA v4 code object is not deployed",
@@ -1154,9 +1165,24 @@ def test_mha_v4_sparse_work_table_leaves_uniform_counts_in_raster_order(
 @pytest.mark.parametrize(
     ("q_format", "v_format"),
     [
-        (AttentionFormat.FP8, AttentionFormat.FP8),
-        (AttentionFormat.FP8, AttentionFormat.MXFP6),
-        (AttentionFormat.INT8, AttentionFormat.FP8),
+        pytest.param(
+            native_fp8_format(),
+            native_fp8_format(),
+            id="fp8",
+        ),
+        pytest.param(
+            AttentionFormat.FP8,
+            AttentionFormat.MXFP6,
+            marks=pytest.mark.skipif(
+                get_gfx() != "gfx950", reason="gfx950 MXFP6 sparse"
+            ),
+            id="f8f6",
+        ),
+        pytest.param(
+            AttentionFormat.INT8,
+            native_fp8_format(),
+            id="i8fp8",
+        ),
     ],
 )
 def test_mha_v4_sparse_all_true_mask_matches_dense(q_format, v_format):
@@ -1164,7 +1190,8 @@ def test_mha_v4_sparse_all_true_mask_matches_dense(q_format, v_format):
     q = torch.randn((1, 256, 2, 128), device="cuda", dtype=torch.bfloat16)
     k = torch.randn((1, 256, 2, 128), device="cuda", dtype=torch.bfloat16)
     v = torch.randn_like(k)
-    mask = torch.ones((1, 2, 1, 2), device="cuda", dtype=torch.bool)
+    kv_tiles = 256 // mha_v4_kv_tile()
+    mask = torch.ones((1, 2, 1, kv_tiles), device="cuda", dtype=torch.bool)
     dense = mha_v4(q, k, v, q_format, q_format, v_format)
     sparse = mha_v4(
         q,
@@ -1180,7 +1207,7 @@ def test_mha_v4_sparse_all_true_mask_matches_dense(q_format, v_format):
     assert torch.isfinite(sparse).all()
 
 
-@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 sparse GQA validation")
+@pytest.mark.skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 sparse validation")
 @pytest.mark.skipif(
     not _mha_v4_sparse_co_available(),
     reason="sorted-sparse MHA v4 code object is not deployed",
@@ -1188,8 +1215,19 @@ def test_mha_v4_sparse_all_true_mask_matches_dense(q_format, v_format):
 @pytest.mark.parametrize(
     ("q_format", "v_format"),
     [
-        (AttentionFormat.FP8, AttentionFormat.FP8),
-        (AttentionFormat.MXFP4, AttentionFormat.FP8),
+        pytest.param(
+            native_fp8_format(),
+            native_fp8_format(),
+            id="fp8",
+        ),
+        pytest.param(
+            AttentionFormat.MXFP4,
+            native_fp8_format(),
+            marks=pytest.mark.skipif(
+                get_gfx() != "gfx950", reason="gfx950 MXFP4 sparse"
+            ),
+            id="mxfp4",
+        ),
     ],
 )
 def test_mha_v4_sparse_gqa_all_true_mask_matches_repeated_kv(q_format, v_format):
@@ -1200,7 +1238,8 @@ def test_mha_v4_sparse_gqa_all_true_mask_matches_repeated_kv(q_format, v_format)
     q = torch.randn((1, 256, query_heads, 128), device="cuda", dtype=torch.bfloat16)
     k = torch.randn((1, 256, kv_heads, 128), device="cuda", dtype=torch.bfloat16)
     v = torch.randn_like(k)
-    mask = torch.ones((1, query_heads, 1, 2), device="cuda", dtype=torch.bool)
+    kv_tiles = 256 // mha_v4_kv_tile()
+    mask = torch.ones((1, query_heads, 1, kv_tiles), device="cuda", dtype=torch.bool)
     k_repeated = k.repeat_interleave(gqa_ratio, dim=2)
     v_repeated = v.repeat_interleave(gqa_ratio, dim=2)
 

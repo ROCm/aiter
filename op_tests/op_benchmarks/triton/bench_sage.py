@@ -24,6 +24,7 @@ from aiter.ops.mha_v4 import (
     AttentionFormat,
     AttentionScaleMode,
     mha_v4,
+    mha_v4_kv_tile,
     mha_v4_packed,
     mha_v4_q_multiplier,
     mxfp4_k_view,
@@ -595,8 +596,10 @@ def load_block_mask_from_json(
 
 
 def kernel_block_sizes(kernel: KernelName) -> tuple[int, int]:
-    if kernel.startswith("aiter_") and kernel != "aiter_bf16":
-        return 256, 128
+    # MHA v4's sparse tile is set by its manifest row, not by the Triton configs
+    # below: 256x128 on gfx950 but 256x64 on gfx942.
+    if kernel.startswith("mha4_"):
+        return 256, mha_v4_kv_tile()
     if kernel == "sage_mxfp4":
         cfg = get_sage_fwd_configs_mxfp4()
     else:

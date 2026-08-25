@@ -181,9 +181,10 @@ _PACKED_QK_WIDTH = {
     AttentionFormat.FP4_E2M1: 64,
 }
 
-# gfx950 sorted-sparse ASM tiles. Manifest rows currently share this geometry.
+# Sorted-sparse ASM tiles. gfx950 rows are 256x128; gfx942 FP8/I8FP8 rows are 256x64.
 _MHA_V4_Q_TILE = 256
-_MHA_V4_KV_TILE = 128
+_MHA_V4_KV_TILE_GFX950 = 128
+_MHA_V4_KV_TILE_GFX942 = 64
 
 
 def native_fp8_format() -> AttentionFormat:
@@ -193,6 +194,11 @@ def native_fp8_format() -> AttentionFormat:
         if get_gfx() == "gfx942"
         else AttentionFormat.FP8_E4M3
     )
+
+
+def mha_v4_kv_tile() -> int:
+    """Return the KV tile of sorted-sparse MHA v4 rows on the active GPU."""
+    return _MHA_V4_KV_TILE_GFX942 if get_gfx() == "gfx942" else _MHA_V4_KV_TILE_GFX950
 
 
 def _is_fp8_format(format: AttentionFormat) -> bool:
@@ -302,13 +308,14 @@ def _block_mask_to_lut(
     batch, query_length, query_heads, _ = query.shape
     key_length = key.shape[1]
     q_tiles = (query_length + _MHA_V4_Q_TILE - 1) // _MHA_V4_Q_TILE
-    kv_tiles = (key_length + _MHA_V4_KV_TILE - 1) // _MHA_V4_KV_TILE
+    kv_tile = mha_v4_kv_tile()
+    kv_tiles = (key_length + kv_tile - 1) // kv_tile
     if block_mask.dim() == 4:
         expected = (batch, query_heads, q_tiles, kv_tiles)
         if tuple(block_mask.shape) != expected:
             raise ValueError(
                 "block_mask must have shape [batch, heads, "
-                f"ceil(Sq/{_MHA_V4_Q_TILE}), ceil(Sk/{_MHA_V4_KV_TILE})]; "
+                f"ceil(Sq/{_MHA_V4_Q_TILE}), ceil(Sk/{kv_tile})]; "
                 f"got {tuple(block_mask.shape)}, expected {expected}"
             )
     elif block_mask.dim() == 3:
@@ -316,7 +323,7 @@ def _block_mask_to_lut(
         if tuple(block_mask.shape) != expected:
             raise ValueError(
                 "block_mask must have shape [batch, "
-                f"ceil(Sq/{_MHA_V4_Q_TILE}), ceil(Sk/{_MHA_V4_KV_TILE})] "
+                f"ceil(Sq/{_MHA_V4_Q_TILE}), ceil(Sk/{kv_tile})] "
                 f"or the 4-D per-head form; got {tuple(block_mask.shape)}, "
                 f"expected {expected}"
             )
@@ -679,10 +686,11 @@ def mha_v4_packed(
             raise NotImplementedError(
                 "sorted-sparse MHA v4 does not have a BF16 manifest row yet"
             )
-        if k.shape[1] % _MHA_V4_KV_TILE != 0:
+        kv_tile = mha_v4_kv_tile()
+        if k.shape[1] % kv_tile != 0:
             raise ValueError(
                 "sorted-sparse MHA v4 requires key length padded to a "
-                f"multiple of {_MHA_V4_KV_TILE}"
+                f"multiple of {kv_tile}"
             )
         _mha_v4_fwd_sparse_launch(*launch_args, *lut)
     return out
@@ -1191,8 +1199,8 @@ def mha_v4_mxfp8(
 
     K and V may have fewer heads than Q for GQA. The Q-to-KV head ratio must
     be a power of two no greater than 16; output retains Q's head count.
-    Optional ``block_mask`` selects the sorted-sparse row; LUT rows are one per
-    query head, and K/V addressing uses the GQA ratio.
+    Optional ``block_mask`` selects the sorted-sparse row (gfx950 MXFP8 only);
+    LUT rows are one per query head, and K/V addressing uses the GQA ratio.
     """
     if return_lse:
         raise NotImplementedError("MHA v4 kernels do not produce LSE yet")
@@ -1249,9 +1257,10 @@ def mha_v4(
     quantizers, scale modes, and the packed ASM row; output is BF16 BSHD.
     K and V may have fewer heads than Q for GQA. The Q-to-KV head ratio must
     be a power of two no greater than 16; output retains Q's head count.
-    ``block_mask`` is optional boolean tile metadata at 256x128 geometry:
-    ``[B, H, Qtiles, KVtiles]`` or ``[B, Qtiles, KVtiles]`` (broadcast heads).
-    Sparse LUT rows are one per query head; K/V addressing uses the GQA ratio.
+    ``block_mask`` is optional boolean tile metadata: ``[B, H, Qtiles, KVtiles]``
+    or ``[B, Qtiles, KVtiles]`` (broadcast heads). Geometry is 256x128 on gfx950
+    and 256x64 on gfx942. Sparse LUT rows are one per query head; K/V addressing
+    uses the GQA ratio.
     """
     if return_lse:
         raise NotImplementedError("MHA v4 kernels do not produce LSE yet")
