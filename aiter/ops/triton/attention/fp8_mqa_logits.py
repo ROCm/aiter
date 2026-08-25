@@ -194,6 +194,12 @@ def fp8_mqa_logits(
             matrix_instr_nonkdim=matrix_instr_nonkdim,
         )
     else:
+        # Buffer ops use a 32-bit byte offset (2 GiB resource descriptor cap).
+        # Fall back to plain global load/store when a tensor exceeds that.
+        BUFFER_LIMIT_BYTES = 2 * 1024 * 1024 * 1024
+        use_buffer_load = KV.numel() * KV.element_size() < BUFFER_LIMIT_BYTES
+        use_buffer_store = logits.numel() * logits.element_size() < BUFFER_LIMIT_BYTES
+
         num_buffers = 2
         USE_FOLDED_REDUCTION = FOLDED_REDUCTED_SUPPORT and num_heads > 16
         if arch == "gfx950":
@@ -203,7 +209,12 @@ def fp8_mqa_logits(
             num_chains = 4 if USE_FOLDED_REDUCTION else 0
             num_warps = 2 if num_heads <= 32 else 1
             block_kv = 64 if num_heads <= 32 else 32
-            block_m = 2 if (num_heads <= 32 and seq_len > 4096) else 1
+            # BLOCK_M=2 with the non-buffer store path aborts the AMDGCN backend
+            # at JIT time (Sequence.h:275 "Begin must be less or equal to End").
+            # Only reachable once logits pass 2 GiB, i.e. context past ~32K.
+            block_m = (
+                2 if (num_heads <= 32 and seq_len > 4096 and use_buffer_store) else 1
+            )
             mfma_nonk_dim = 32 if (head_size <= 64 or num_heads == 32) else 16
             other = {
                 "USE_PADDED_SHARED_LAYOUT": ASYNC_COPY_SUPPORTS_DISTRIBUTED,
@@ -220,11 +231,6 @@ def fp8_mqa_logits(
             block_m = 1
             other = {"LOOP_VARIANT": loop_variant}
 
-        # Buffer ops use a 32-bit byte offset (2 GiB resource descriptor cap).
-        # Fall back to plain global load/store when a tensor exceeds that.
-        BUFFER_LIMIT_BYTES = 2 * 1024 * 1024 * 1024
-        use_buffer_load = KV.numel() * KV.element_size() < BUFFER_LIMIT_BYTES
-        use_buffer_store = logits.numel() * logits.element_size() < BUFFER_LIMIT_BYTES
         _gluon_fp8_mqa_logits_kernel[((seq_len + block_m - 1) // block_m,)](
             Q_ptr=Q,
             KV_ptr=KV,

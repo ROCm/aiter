@@ -149,3 +149,47 @@ def test_fp8_mqa_logits(
     if ref_neginf_mask.all():
         return  # nothing left to compare
     assert diff < 1e-3, f"{diff=}"
+
+
+# Both shapes land on exactly 2 GiB of logits, which is where the gfx950 kernel
+# pairs BLOCK_M=2 with a non-buffer store and used to abort the AMDGCN backend at
+# JIT time. Nothing above reaches it: every shape there is <= 1024 queries or far
+# under 2 GiB.
+@pytest.mark.parametrize("s_q, s_k", [(8192, 65536), (16384, 32768)])
+@torch.inference_mode()
+def test_fp8_mqa_logits_long_context(s_q: int, s_k: int) -> None:
+    num_heads, head_dim = 32, 128
+    logits_bytes = s_q * s_k * 4
+    if torch.cuda.mem_get_info()[0] < logits_bytes + 2 * 1024**3:
+        pytest.skip(f"needs ~{(logits_bytes + 2 * 1024**3) / 1024**3:.0f} GiB free")
+
+    torch.manual_seed(0)
+    q = torch.randn(s_q, num_heads, head_dim, device="cuda", dtype=torch.bfloat16)
+    kv = torch.randn(s_k, head_dim, device="cuda", dtype=torch.bfloat16)
+    kv_fp8, scales = per_custom_dims_cast_to_fp8(kv, (0,), False)
+    kv = (kv_fp8.to(torch.float32) * scales.reshape(-1, 1)).to(torch.bfloat16)
+    weights = torch.randn(s_q, num_heads, device="cuda", dtype=torch.float32)
+    # Every row attends to all of kv, so clean_logits=False leaves nothing
+    # undefined and the whole output is comparable.
+    ks = torch.zeros(s_q, dtype=torch.int, device="cuda")
+    ke = torch.full((s_q,), s_k, dtype=torch.int, device="cuda")
+
+    q_fp8 = q.to(e4m3_type)
+    kv_fp8, scales = per_custom_dims_cast_to_fp8(kv, (0,), False)
+
+    logits = fp8_mqa_logits(q_fp8, kv_fp8, scales, weights, ks, ke, clean_logits=False)
+    assert logits.shape == (s_q, s_k)
+
+    # A full reference needs num_heads x s_q x s_k floats, so compare row windows
+    # instead. Rows are independent, and both ends cover a paired block and the
+    # trailing one.
+    for rows in (slice(0, 32), slice(s_q - 32, s_q)):
+        ref_logits, _ = ref_fp8_mqa_logits(
+            q=q[rows],
+            kv=kv,
+            weights=weights[rows],
+            cu_seqlen_ks=ks[rows],
+            cu_seqlen_ke=ke[rows],
+        )
+        diff = calc_diff(logits[rows], ref_logits)
+        assert diff < 1e-3, f"{s_q=} {s_k=} {rows=} {diff=}"
