@@ -87,13 +87,7 @@ def build_flash_attn_fp8_module(
     V_DBLOCK_STRIDE = BLOCK_N * V_KV_STRIDE + PAD_V
 
     NUM_BUF_K = 2
-    # V stays 3-deep. The asm gets away with 2 (kLdsSizeV2) because its loop
-    # is cut QK -> softmax -> PV, so the PV consumes the very tile the QK tail
-    # just prefetched and only two V tiles are live per iteration. This loop is
-    # cut PV -> QK -> softmax, so tile i-1 (PV), tile i (QK prefetch) and tile
-    # i+1 (DMA) are all live at once. Dropping to 2 needs the loop re-cut, not
-    # just a smaller buffer -- see the note in do_qk about the tail barrier.
-    NUM_BUF_V = 2
+    NUM_BUF_V = 3
     LDS_K_TILE = N_K_UNITS * K_UNIT_STRIDE
     LDS_V_TILE = N_DBLOCKS * V_DBLOCK_STRIDE
     LDS_K_SIZE = NUM_BUF_K * LDS_K_TILE
@@ -541,8 +535,6 @@ def build_flash_attn_fp8_module(
             return fx.buffer_ops.create_llvm_ptr(fx.Int64(byte_off), address_space=3)
 
         def read_v_pack(v_off, dt, ks):
-            if const_expr(v_off is None):
-                return _load_v_unit_global(dt, ks)
             base = _v_base_ptr(v_off)
             reads = []
             for kc in range_constexpr(4):
@@ -651,7 +643,7 @@ def build_flash_attn_fp8_module(
                 if const_expr(u + PREFETCH_DEPTH < PV_UNITS):
                     un = u + PREFETCH_DEPTH
                     vw[un % 4] = read_v_pack(
-                        v_off, u // PV_K_STEPS, u % PV_K_STEPS
+                        v_off, un // PV_K_STEPS, un % PV_K_STEPS
                     )
                 else:
                     ki = u - (PV_UNITS - PREFETCH_DEPTH)
@@ -701,26 +693,6 @@ def build_flash_attn_fp8_module(
             raw = ArithValue(k_in_b).select(raw, zero_qpack.ir_value())
             return Vec(raw).bitcast(fx.Int32)
 
-        def _load_v_unit_global(dt, ks, kv_start=0):
-            if const_expr(isinstance(kv_start, int)):
-                kv_start = fx.Index(kv_start)
-            d_col = fx.Index(dt * MFMA_N) + lo
-            kv_base = kv_start + fx.Index(ks * MFMA_K) + hi * fx.Index(4)
-            v_bytes = []
-            for j in range_constexpr(A_FP8_PER_LANE):
-                kv_row = kv_base + fx.Index((j // 4) * 8 + (j % 4))
-                v_in_b = kv_row < seq_len_v
-                kv_safe = fx.Index(ArithValue(v_in_b).select(kv_row, fx.Index(0)))
-                gep = fx.buffer_ops.get_element_ptr(
-                    v_ptr,
-                    fx.Int64(global_idx(kv_safe, d_col)),
-                    elem_type=i8_type,
-                )
-                v_bytes.append(
-                    ArithValue(v_in_b).select(_pointer_load(i8_type, gep), fx.Int8(0))
-                )
-            return Vec.from_elements(v_bytes, i8_dtype).bitcast(fx.Int32)
-
         def do_qk(k_buf_off, preloaded_kw, v_off, seed=None, dma=None):
             kw = [None] * 4
             vw_prime = [None] * PREFETCH_DEPTH
@@ -745,7 +717,7 @@ def build_flash_attn_fp8_module(
                     )
                 else:
                     vi = u - (QK_UNITS - PREFETCH_DEPTH)
-                    vw_prime[vi] = read_v_pack(v_off, u // PV_K_STEPS, u % PV_K_STEPS)
+                    vw_prime[vi] = read_v_pack(v_off, vi // PV_K_STEPS, vi % PV_K_STEPS)
                 _sched_barrier()
             # Every ds_read of this phase has now been issued, so the DMA can
             # no longer force a vmcnt drain in front of one.
@@ -1049,7 +1021,8 @@ def build_flash_attn_fp8_module(
         if is_g0:
             dma_k(fx.Index(0), fx.Index(0))
         else:
-            dma_v(fx.Index(0), fx.Index(MFMA_N))
+            dma_v(fx.Index(0), fx.Index(0))
+            dma_v(fx.Index(1), fx.Index(BLOCK_N))
 
         _wait_vmcnt()
         _wait_lgkmcnt()
@@ -1066,9 +1039,9 @@ def build_flash_attn_fp8_module(
         if is_g0:
 
             def g0_iter0():
-                k_buf_off = fx.Index(LDS_K_OFF)
+                k_buf_off = _k_slot(0)
 
-                v_buff_off = None
+                v_buff_off = _v_slot(0)
 
                 ## LDS k offs
                 l_koffs = get_lds_koffs(_k_slot(1))
@@ -1095,6 +1068,7 @@ def build_flash_attn_fp8_module(
                     *(bc_new if const_expr(USE_BIAS_FOLD) else ()),
                     _v_slot(0),
                     _v_slot(1),
+                    _v_slot(2),
                     _k_slot(1),
                     _k_slot(0),
                     *g_koffs,
@@ -1107,8 +1081,8 @@ def build_flash_attn_fp8_module(
                 ]
                 rest = carry[10 + N_BIAS_CHUNKS :]
                 v_buff_off_e = rest[0]
-                k_buf_off_e = rest[2]
-                vwp = rest[4 + DMA_PASSES :]
+                k_buf_off_e = rest[3]
+                vwp = rest[5 + DMA_PASSES :]
                 # After the final yield the carries describe the iteration that
                 # never ran, so the last tile's K buffer is the second slot.
                 o, l2, lr2, _ = apply_pv(
@@ -1142,15 +1116,15 @@ def build_flash_attn_fp8_module(
                 p_c, prowsum_c, corr_c = _g0_args[7:10]
                 bc_c = _g0_args[10 : 10 + N_BIAS_CHUNKS]
                 _rest = _g0_args[10 + N_BIAS_CHUNKS :]
-                v_buff_off, v_next_off = _rest[0:2]
-                k_buf_off, k_next_off = _rest[2:4]
-                g_koffs = _rest[4 : 4 + DMA_PASSES]
+                v_buff_off, v_next_off, v_further_off = _rest[0:3]
+                k_buf_off, k_next_off = _rest[3:5]
+                g_koffs = _rest[5 : 5 + DMA_PASSES]
                 # The DMA of this iteration lands in the buffer the *next* one
                 # reads; its voffsets were computed in the previous softmax
                 # phase, its LDS pointers are wave-uniform SALU rebuilt here.
                 l_koffs = get_lds_koffs(k_next_off)
 
-                vwp = _rest[4 + DMA_PASSES :]
+                vwp = _rest[5 + DMA_PASSES :]
                 kv_start = fx.Index(iv)
                 oA, lA, lrA, kw_prime = apply_pv(
                     [oo0, oo1, oo2, oo3],
@@ -1167,7 +1141,7 @@ def build_flash_attn_fp8_module(
                 sA, vwp_new = do_qk(
                     k_buf_off,
                     preloaded_kw=kw_prime,
-                    v_off=v_buff_off,
+                    v_off=v_next_off,
                     seed=(_bias_prefill(bc_c) if const_expr(USE_BIAS_FOLD) else None),
                     dma=(k_rsrc, l_koffs, g_koffs),
                 )
@@ -1198,6 +1172,7 @@ def build_flash_attn_fp8_module(
                         *[_raw(c) for c in (bc_new or ())],
                         # Rotate the V triple and swap the K pair.
                         _raw(v_next_off),
+                        _raw(v_further_off),
                         _raw(v_buff_off),
                         _raw(k_next_off),
                         _raw(k_buf_off),
@@ -1217,14 +1192,14 @@ def build_flash_attn_fp8_module(
         else:
 
             def g1_iter0():
-                k_buf_off = fx.Index(LDS_K_OFF)
+                k_buf_off = _k_slot(0)
 
-                v_buff_off = None
+                v_buff_off = _v_slot(0)
 
                 ## LDS v offs
-                l_voffs = get_lds_voffs(_v_slot(1))
+                l_voffs = get_lds_voffs(_v_slot(2))
                 ## HBM v offs
-                g_voffs = get_hbm_voffs(BLOCK_N + MFMA_N)
+                g_voffs = get_hbm_voffs(2 * BLOCK_N)
                 sB, vwp = do_qk(k_buf_off, preloaded_kw=kvw, v_off=v_buff_off, dma=(v_rsrc, l_voffs, g_voffs))
                 m_frozen = (
                     _rowmax(sB, m_init) if const_expr(USE_FROZEN_MAX) else m_init
@@ -1250,6 +1225,7 @@ def build_flash_attn_fp8_module(
                     # Offsets for the first loop body (i=1); see g0_iter0.
                     _v_slot(0),
                     _v_slot(1),
+                    _v_slot(2),
                     _k_slot(1),
                     _k_slot(0),
                     *vwp[:PREFETCH_DEPTH],
@@ -1259,9 +1235,9 @@ def build_flash_attn_fp8_module(
                 m_e, l_e, oe0, oe1, oe2, oe3, lr_e = carry[:7]
                 sce0, sce1, sce2, sce3 = carry[7:11]
                 rest = carry[11:]
-                v_prev_off_e = rest[0]
-                k_buf_off_e = rest[2]
-                vwp = rest[4:]
+                v_buff_off_e = rest[0]
+                k_buf_off_e = rest[3]
+                vwp = rest[5:]
                 _m_e, corrf, pf, prowsumf, _bc = do_softmax(
                     [sce0, sce1, sce2, sce3],
                     m_e,
@@ -1275,7 +1251,7 @@ def build_flash_attn_fp8_module(
                     pf,
                     prowsumf,
                     corrf,
-                    v_prev_off_e,
+                    v_buff_off_e,
                     list(vwp),
                     k_buf_off_e,
                 )
@@ -1298,9 +1274,9 @@ def build_flash_attn_fp8_module(
                 m_r, l_a, oo0, oo1, oo2, oo3, lr_a = _g1_args[:7]
                 ss0, ss1, ss2, ss3 = _g1_args[7:11]
                 _rest = _g1_args[11:]
-                v_buff_off, v_next_off = _rest[0:2]
-                k_buf_off, k_next_off = _rest[2:4]
-                vwp = _rest[4:]
+                v_buff_off, v_next_off, v_further_off = _rest[0:3]
+                k_buf_off, k_next_off = _rest[3:5]
+                vwp = _rest[5:]
                 kv_start = fx.Index(iv)
                 m_sm, corr_sm, p_sm, prowsum_sm, bc_sm = do_softmax(
                     [ss0, ss1, ss2, ss3],
@@ -1312,7 +1288,7 @@ def build_flash_attn_fp8_module(
                 # The K DMA's address math belongs to this (VALU) phase; the
                 # buffer_loads themselves are interleaved into do_qk below.
                 l_voffs = get_lds_voffs(v_buff_off)
-                g_voffs = get_hbm_voffs(kv_start + fx.Index(BLOCK_N + MFMA_N))
+                g_voffs = get_hbm_voffs(kv_start + fx.Index(2 * BLOCK_N))
 
                 oB, lB, lrB, kw_prime = apply_pv(
                     [oo0, oo1, oo2, oo3],
@@ -1329,7 +1305,7 @@ def build_flash_attn_fp8_module(
                 sB, vwp_new = do_qk(
                     k_buf_off,
                     preloaded_kw=kw_prime,
-                    v_off=v_buff_off,
+                    v_off=v_next_off,
                     seed=(_bias_prefill(bc_sm) if const_expr(USE_BIAS_FOLD) else None),
                     dma=(v_rsrc, l_voffs, g_voffs),
                 )
@@ -1349,6 +1325,7 @@ def build_flash_attn_fp8_module(
                         _raw(sB[3]),
                         # Rotate the V triple and swap the K pair.
                         _raw(v_next_off),
+                        _raw(v_further_off),
                         _raw(v_buff_off),
                         _raw(k_next_off),
                         _raw(k_buf_off),
