@@ -16,6 +16,7 @@ import torch
 import torch.distributed as dist
 from flydsl.expr.typing import Int32, Int64, Stream
 
+from aiter.dist.parallel_state import in_the_same_node_as
 from aiter.jit.utils.chip_info import get_gfx_runtime
 
 from .qr_int4_ipc import UncachedIpcHeap
@@ -39,6 +40,34 @@ def _cuda_index(device) -> int:
             return int(torch.cuda.current_device())
         return int(device.index)
     return int(device)
+
+
+def _validate_ipc_process_group(group, *, rank: int) -> None:
+    """Reject groups that cannot exchange HIP IPC handles or CPU-side metadata."""
+    backend = dist.get_backend(group)
+    if backend == dist.Backend.NCCL:
+        raise ValueError(
+            "QRInt4 refuses NCCL process groups. "
+            "IPC inbox setup uses broadcast_object_list on CPU, which NCCL "
+            "groups cannot serve; passing the TP/NCCL group fails late with "
+            "opaque collective errors. "
+            "Create a separate gloo subgroup for QRInt4 and keep NCCL for "
+            "payload all-reduce only, e.g. "
+            "ipc_group = dist.new_group(backend='gloo'); "
+            "QRInt4(group=ipc_group, ...). "
+            f"Got backend={backend!r} on group rank {rank}."
+        )
+
+    same_node = in_the_same_node_as(group, source_rank=0)
+    if not all(same_node):
+        off_node = [r for r, ok in enumerate(same_node) if not ok]
+        raise RuntimeError(
+            "QRInt4 requires every rank on the same host: HIP IPC memory "
+            "handles are not valid across nodes. "
+            f"Group ranks not co-located with rank 0: {off_node} "
+            f"(same_node={same_node}). "
+            "Do not construct QRInt4 on a multi-node process group."
+        )
 
 
 class _StEngine:
@@ -113,7 +142,12 @@ class _StEngine:
 
 
 class QRInt4:
-    """IPC inbox + flag buffer and launch wrapper for ``qr_int4``."""
+    """IPC inbox + flag buffer and launch wrapper for ``qr_int4``.
+
+    ``group`` must be a **non-NCCL** subgroup (typically ``gloo``) whose ranks
+    are all on one node. Use a separate NCCL group for ordinary tensor
+    all-reduce; QRInt4 only needs the CPU/IPC metadata path on ``group``.
+    """
 
     def __init__(
         self,
@@ -141,6 +175,7 @@ class QRInt4:
             )
         if group_rank != int(rank):
             raise ValueError(f"rank={rank} does not match group rank {group_rank}")
+        _validate_ipc_process_group(group, rank=int(rank))
         arch = get_gfx_runtime()
         if arch not in _SUPPORTED_ARCHS:
             raise RuntimeError(
