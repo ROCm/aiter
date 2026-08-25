@@ -6,9 +6,9 @@
 ## Current Status
 
 Dense BF16-output MHA v4 is implemented and validated on gfx950. Sorted block-sparse dispatch
-(mask/LUT APIs, `mode=1` manifest rows, 752-byte kernarg) is wired on the same family; sparse
-`.co` files are deployed next to the dense objects. Gfx942 native FP8/FP8 and signed INT8/FP8
-dense rows are also available under v4.
+(mask/LUT APIs, `mode=1` manifest rows) is wired on the same family; sparse `.co` files are
+deployed next to the dense objects. Gfx942 native FP8/FP8 and signed INT8/FP8 dense rows are
+also available under v4.
 
 The public raw and packed APIs support eight dense combinations:
 
@@ -145,11 +145,6 @@ must be divisible by `kv_heads`, and the ratio `query_heads / kv_heads` must be 
 of query heads to one K/V head; callers must not expand K or V to `query_heads`. Output retains Q's
 batch, sequence, and head dimensions.
 
-Sorted-sparse launch uses the same GQA ratio. The LUT and work table are indexed by query
-head; the kernel maps `kv_head = query_head >> log2(gqa)`. A 3-D mask broadcasts across
-query heads. A 4-D mask may give grouped query heads different KV-tile lists even though
-they share K/V storage.
-
 For example, Q with 32 heads and K/V with 8 heads selects GQA ratio 4. Q and K still use the same
 number format and canonical quantization recipe; "Q/K formats must match" refers to their encoding,
 not their head counts. Ratios outside the supported power-of-two set fail explicitly.
@@ -187,8 +182,7 @@ the complete recipe plus dtype, shape, and layout before launching. Call
 `scale_modes_for_formats()` for the production recipe rather than duplicating mode triples.
 The optional LUT triple (`kv_block_indices`, `lut_start`, `lut_count`) must be all set or all
 omitted; do not pass a dataclass and do not pass a mask to the packed API. Sparse launch uses
-manifest `mode=1` and a 752-byte kernarg. The work table is built inside
-`fmha_v4_fwd_sparse`.
+manifest `mode=1`; the work table is built inside the sparse custom op.
 
 MX Q/K/V producers return contiguous raw buffers where the ASM layout is not an ordinary tensor
 layout. `mxfp4_k_view`, `mxfp6_k_view`, and `mxfp4_v_view` reconstruct logical views. Raw buffers,
@@ -332,32 +326,28 @@ does not require a Python-side architecture branch.
 
 ## Sparse Contract
 
-Sorted block-sparse execution is implemented for gfx950 hd128 rows. Unsorted sparse is an
-A/B compile of the ASM generators only; deployed sparse `.co` files are sparse+sorted.
+Sorted block-sparse execution is implemented for gfx950 hd128 rows.
 
-Selection is an explicit manifest dimension (`mode=0` dense, `mode=1` sorted-sparse), never an
-inference from extra pointers or a silent redirect from a dense request. Dense
-`aiter::mha_v4_fwd_launch` stays schema-frozen; sparse uses `aiter::mha_v4_fwd_sparse_launch`.
+Selection is an explicit manifest dimension (`mode=0` dense, `mode=1` sorted-sparse), not
+inferred from pointers or redirected from a dense request. Dense and sparse use separate
+launchers so the dense kernarg layout stays frozen.
 
 Raw API: optional boolean `block_mask` at query-tile 256 × KV-tile 128. Convert with
 `block_attn_mask_to_ragged_lut(..., num_heads=q.shape[2], return_none_if_dense=False)`.
-An all-True mask still takes the sparse row. GQA is allowed; LUT rows remain one per query head.
+An all-True mask still takes the sparse row. GQA uses the same ratio as dense; LUT and work-table
+rows are one per query head. A 3-D mask broadcasts across query heads; a 4-D mask may give grouped
+query heads different KV-tile lists.
 
 Packed API: optional int32 LUT triple. `lut_start` / `lut_count` have one entry per
 `(batch, query_head, query_block)`. `kv_block_indices` is 1-D and may be over-allocated to
 `B*H*Qtiles*KVtiles` to avoid data-dependent allocations. Key length must be a multiple of 128.
 
-The host builds `ptr_work_table` at kernarg `0x2D0` inside the sparse custom op. Packing is
-`uint32 = q | (h << 16) | (b << 24)` (`q<65536`, `h<256`, `b<256`). Launch grid is
-`(total_tiles, 1, 1)`. If every `lut_count` is equal (top-k / uniform), the table is identity
-raster so spatial locality is preserved; otherwise tiles are LPT-sorted by `lut_count`
-descending. Empty LUT rows still launch; the KV loop is a no-op and O stays the zeroed
-accumulator.
+The host builds a work table inside the sparse custom op. If every `lut_count` is equal
+(uniform / top-k sparsity), visit order stays raster; otherwise rows are ordered
+longest-LUT-first (LPT). Empty LUT rows still launch as no-ops.
 
-LUT pointers remain at `0x290` / `0x2A0` / `0x2B0`. Do not dual-write the deprecated affine
-sorted-fork overlay at `0x1B0` / `0x1C0` / `0x1E0`. Sparse code objects live next to dense ones
-under `hsa/gfx950/fmha_v4_fwd/` (for example `fwd_hd128_fp8_sparse.co`) and keep the sparse
-symbol, not a `_sorted` suffix.
+Sparse code objects live next to dense ones under `hsa/gfx950/fmha_v4_fwd/` (for example
+`fwd_hd128_fp8_sparse.co`).
 
 Do not add optional LUT arguments to the dense MXFP4/MXFP6 launch custom ops; sparse MX goes
 through `mha_v4_packed` after reconstructing views.
