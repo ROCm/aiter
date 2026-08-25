@@ -387,42 +387,18 @@ KERNEL_VARIANTS = tuple(_VARIANT_BUILDERS.keys())
 DEFAULT_VARIANT = "mfma_r2_w4"
 
 
-# RPB crossovers track the logits element count seq_len * seq_len_kv, not
-# seq_len alone: a larger RPB amortizes each KV tile load over more query rows,
-# and that pays off once there is enough total work. Measured on gfx942
-# (MI325X) over seq_len 1..8192 x seq_len_kv 1024..262144, the boundaries land
-# on the same element count at every context:
-#
-#   elements < 2**19   RPB=1 fastest at all 27 shapes measured
-#   elements = 2**19   RPB=2 fastest at all 6
-#   elements >= 2**21  RPB=4 fastest at all 38
-#
-# (2**20 is the transition band, split 3/3 between RPB=2 and RPB=4.)
-_RPB2_MIN_ELEMS = 2**19
-_RPB4_MIN_ELEMS = 2**21
-
-
 def _auto_variant(seq_len, seq_len_kv):
     """Pick (RPB, WPB) from the problem shape.
 
-    RPB was previously pinned to 2, which left the whole r4 family unreachable
-    and cost 1.65x at the long-context prefill shapes vLLM issues (seq_len 1024,
-    seq_len_kv 131072, i.e. 2**27 elements).
-
-    RPB must also divide seq_len. When it does not, the launcher pads seq_len up
-    with four ``torch.cat`` calls, a flat ~44 us of host-side overhead that does
-    not scale with the work -- so it swamps small shapes and is noise on large
-    ones. Stepping down to a divisor is therefore right below
-    ``_RPB4_MIN_ELEMS`` and wrong above it: at seq_len 1025, seq_len_kv 131072,
-    RPB=1 divides but runs 3880 us against 2601 us for a padded RPB=2.
-
-    WPB is left as it was. It is worth a few percent at most here, and unlike
-    RPB its optimum moves with the head count, so it needs its own sweep.
+    RPB from ``seq_len * seq_len_kv`` thresholds; step down to a divisor of
+    ``seq_len`` when padding overhead would dominate. WPB unchanged.
     """
+    rpb2_min_elems = 2**19
+    rpb4_min_elems = 2**21
     elems = seq_len * seq_len_kv
-    if elems < _RPB2_MIN_ELEMS:
+    if elems < rpb2_min_elems:
         rpb = 1
-    elif elems < _RPB4_MIN_ELEMS:
+    elif elems < rpb4_min_elems:
         rpb = 2 if seq_len % 2 == 0 else 1
     else:
         rpb = 4
