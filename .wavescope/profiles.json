@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "profiles": [
+    {
+      "profileId": "fp8-mqa-logits-flydsl-shape1",
+      "name": "fp8_mqa_logits flydsl · shape1 (bkv64 r1 w2 lds3)",
+      "workload": "fp8_mqa_logits · bs1 sq1024 skv1024 H64 D128 · q fp8_e4m3fnuz / kv fp8_e4m3fnuz",
+      "cwd": "${workspaceFolder}",
+      "kernelRegex": "^fp8_mqa_logits_H64_D128_mfma32x32x64_bkv64_r1_w2_lds3_swizzled_flydsl$",
+      "launch": "env HIP_VISIBLE_DEVICES=7 FLYDSL_DEBUG_ENABLE_DEBUG_INFO=1 FLYDSL_RUNTIME_ENABLE_CACHE=0 python3 op_tests/op_benchmarks/triton/bench_flydsl_vs_triton_fp8_mqa_logits.py --shape 1 --verification none --warmup 0 --bench-iters 1 --graph-replay-iters 2 --replay-iters 0 --impl flydsl",
+      "rocprof": {
+        "attLibraryPath": "/home/vpietila/.local/rocprof-trace-decoder/opt/rocm/lib",
+        "targetCu": 1,
+        "bufferSize": "0x20000000",
+        "extraArgs": [
+          "--att-shader-engine-mask", "0x1",
+          "--att-simd-select", "0xF",
+          "--att-activity", "8",
+          "--att-serialize-all",
+          "--kernel-iteration-range", "[1]"
+        ]
+      }
+    }
+  ]
+}

@@ -1,0 +1,3 @@
+# Captured traces are large and machine-specific; the profile recipe is not.
+runs/
+decoder/
