@@ -30,13 +30,14 @@ import math as host_math
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir.dialects import fly, llvm
+from flydsl._mlir.dialects import llvm
 from flydsl._mlir.dialects.fly_rocdl import TargetAddressSpace as _TargetAddressSpace
-from flydsl.expr import arith, buffer_ops, const_expr, gpu, range_constexpr, rocdl
+from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Vector as Vec
 from flydsl.runtime.device import get_rocm_arch
 from flydsl.utils.smem_allocator import SMEM_CAPACITY_MAP
 
+from aiter.ops.flydsl.kernels import buffer_ops
 from aiter.ops.flydsl.kernels.hstu_attention_common import (
     decode_lane,
     grouped_loader,
@@ -84,13 +85,6 @@ def lds_cap_bytes(arch: str | None = None) -> int:
 
 
 _LOG2E = host_math.log2(host_math.e)
-
-
-def _waitcnt_vm_n(n: int):
-    """Emit `s_waitcnt vmcnt(n)` only (lgkmcnt/expcnt left unconstrained, so
-    outstanding LDS/export traffic isn't serialized).
-    """
-    llvm.InlineAsmOp(None, [], f"s_waitcnt vmcnt({n})", "", has_side_effects=True)
 
 
 def validate_hstu_attention_bwd(
@@ -306,13 +300,20 @@ def build_hstu_attention_bwd_dvdk(
     ) -> None:
         elem_type = elem_dtype.ir_type
         compute_type = fx.Float32.ir_type
-        v4f32_type = Vec.make_type(MFMA_ELEMS_PER_LANE, fx.Float32)
         c_zero_mfma_pack = Vec.filled(MFMA_LANE_K, 0.0, elem_dtype).ir_value()
 
+        # ---- MMA atom: one 16x16x16 f16/bf16 accumulate per wave ----
         _mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(MFMA_M, MFMA_M, MFMA_K, elem_dtype))
+        _mfma_a = fx.make_rmem_tensor(MFMA_LANE_K, elem_dtype)
+        _mfma_b = fx.make_rmem_tensor(MFMA_LANE_K, elem_dtype)
+        _mfma_c = fx.make_rmem_tensor(MFMA_ELEMS_PER_LANE, fx.Float32)
 
         def mfma_acc(a_pack, b_pack, c):
-            return fly.mma_atom_call_ssa([v4f32_type], _mma_atom, a_pack, b_pack, c)
+            _mfma_a.store(Vec(a_pack))
+            _mfma_b.store(Vec(b_pack))
+            _mfma_c.store(Vec(c))
+            fx.mma_atom_call(_mma_atom, _mfma_c, _mfma_a, _mfma_b, _mfma_c)
+            return _mfma_c.load().ir_value()
 
         tid = fx.Int32(gpu.thread_idx.x)
         wave_id, _lane, lane_div_16, lane_mod_16 = decode_lane(
@@ -512,7 +513,7 @@ def build_hstu_attention_bwd_dvdk(
                 def bf16_pair(lo_f32, hi_f32):
                     lo_i32 = fx.Float32(lo_f32).bitcast(fx.Int32)
                     hi_i32 = fx.Float32(hi_f32).bitcast(fx.Int32)
-                    return (hi_i32 & cmask) | lo_i32.shrui(c16)
+                    return (hi_i32 & cmask) | fx.Int32(arith.shrui(lo_i32, c16))
 
                 pairs = [bf16_pair(vals[0], vals[1]), bf16_pair(vals[2], vals[3])]
                 return Vec.from_elements(pairs, fx.Int32).bitcast(elem_dtype).ir_value()
@@ -793,7 +794,7 @@ def build_hstu_attention_bwd_dvdk(
             # DMA both Q and dO global->LDS, then one workgroup barrier publishes both.
             async_load_q(q_start)
             async_load_do_lds(q_start)
-            _waitcnt_vm_n(0)
+            rocdl.s_waitcnt(vmcnt=0)
             gpu.barrier()
             q_packs = [read_q_packs(ng) for ng in range_constexpr(Q_STREAM_SUBTILES)]
             p_packs, s_meta = compute_s_tile(q_start, q_packs)
