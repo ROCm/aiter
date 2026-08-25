@@ -17,7 +17,7 @@ import torch
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import buffer_ops
+from aiter.ops.flydsl.kernels import buffer_ops
 from flydsl.expr.typing import T
 
 BLOCK_THREADS = 256
