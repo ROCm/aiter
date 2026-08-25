@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Paged FP8 MQA logits (DeepSeek lightning indexer, decode) -- FlyDSL gfx942/gfx950.
+"""Paged FP8 MQA logits (DeepSeek lightning indexer, decode) -- FlyDSL gfx950.
 
 Compute for each decode batch element ``b`` and next-n query slot ``n`` (query
 row ``b*next_n + n``) and KV logical position ``p``::
@@ -38,8 +38,6 @@ from functools import lru_cache
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from flydsl._mlir import ir
-from flydsl._mlir.dialects import scf
 from flydsl.expr import arith, range_constexpr
 from flydsl.expr.typing import T
 
@@ -89,6 +87,18 @@ def _auto_split_kv(
 _BLOCK_KV = 128
 
 
+def _uceildiv(a, b):
+    a = fx.Int32(a)
+    b = fx.Int32(b)
+    return fx.Int32((fx.Uint32(a) + fx.Uint32(b) - 1) // fx.Uint32(b))
+
+
+def _imin(a, b):
+    a = fx.Int32(a)
+    b = fx.Int32(b)
+    return (a <= b).select(a, b)
+
+
 def _build_paged_kernel(
     *,
     num_heads: int,
@@ -97,7 +107,6 @@ def _build_paged_kernel(
     waves_per_block: int,
     kv_block_size: int = 1,
     preshuffle: bool = False,
-    scale_mul: float = 1.0,
 ):
     """Paged MQA-logits kernel with SplitKV column parallelism.
 
@@ -108,8 +117,6 @@ def _build_paged_kernel(
 
     ``preshuffle`` only changes the intra-block key-byte offset -- the
     block-table gather, scale gather, MFMA and mask are identical either way.
-    ``scale_mul`` folds the FN->FNUZ 2x compensation into the per-token scale at
-    compile time, which is exact by ReLU positive-homogeneity.
     """
     H = num_heads
     D = head_size
@@ -131,10 +138,9 @@ def _build_paged_kernel(
     K_STEPS = D // MFMA_K
     N_TILES_PER_WAVE = N_TILES // WPB
 
-    fm_fast = arith.FastMathFlags.fast
     _kname = (
         f"fp8_paged_mqa_logits_H{H}_D{D}_bkv{BKV}_kvb{KVB}_w{WPB}"
-        f"{'_ps' if preshuffle else ''}{'' if scale_mul == 1.0 else '_s2'}_flydsl"
+        f"{'_ps' if preshuffle else ''}_flydsl"
     )
 
     @flyc.kernel(name=_kname, known_block_size=[MR_BLOCK_THREADS, 1, 1])
@@ -155,8 +161,6 @@ def _build_paged_kernel(
         max_block_len: fx.Int32,  # kv_indices row width
         stride_out: fx.Int32,  # out_logits.stride(0) == max_model_len
     ):
-        scale_mul_c = arith.constant(float(scale_mul), type=T.f32)
-
         tid = fx.thread_idx.x
         bid = fx.block_idx.x
 
@@ -213,28 +217,21 @@ def _build_paged_kernel(
             for ii in range_constexpr(_DREG):
                 h_off = (ii % 4) + lane_div_N * 4 + (ii // 4) * 8
                 h_w = mi * MFMA_M + h_off
-                w_frag[mi][ii] = _to_raw(fx.Float32(w_t[out_row, h_w]))
+                w_frag[mi][ii] = fx.Float32(w_t[out_row, h_w])
 
         # ---- SplitKV: each split owns ceil(total_tiles/split_kv) contiguous
         # BKV-aligned tiles, so the slices are gap-free and disjoint and every
         # logits column has exactly one writer -- no cross-CTA reduction. A
         # split past ctx runs zero iterations. ----
-        context_chunk_num = arith.ceildivui(
-            _to_raw(context_length), _to_raw(fx.Int32(BKV))
-        )
-        split_chunk_num = arith.ceildivui(context_chunk_num, _to_raw(split_kv))
+        context_chunk_num = _uceildiv(context_length, fx.Int32(BKV))
+        split_chunk_num = _uceildiv(context_chunk_num, split_kv)
         full_end = context_chunk_num * BKV
         split_cols = split_chunk_num * BKV
         tile_lo_col = pid_split_kv * split_cols
-        tile_hi_col = arith.minsi(_to_raw(tile_lo_col + split_cols), _to_raw(full_end))
+        tile_hi_col = _imin(tile_lo_col + split_cols, full_end)
         ctx_m1 = context_length - 1
 
-        for iv in scf.for_(
-            _to_raw(fx.Index(tile_lo_col)),
-            _to_raw(fx.Index(fx.Int32(tile_hi_col))),
-            _to_raw(fx.Index(fx.Int32(BKV))),
-        ):
-            col0 = fx.Int32(arith.index_cast(T.i32, iv))
+        for col0 in range(tile_lo_col, tile_hi_col, fx.Int32(BKV)):
             wave_ni_base = wave * N_TILES_PER_WAVE
 
             # Helpers close over this chunk's SSA values; default args silence B023.
@@ -242,9 +239,7 @@ def _build_paged_kernel(
                 return _col0 + abs_ni * MFMA_N + lane_mod_N
 
             def _col_c_for(abs_ni, _ctx_m1=ctx_m1):
-                return fx.Int32(
-                    arith.minsi(_to_raw(_col_for(abs_ni)), _to_raw(_ctx_m1))
-                )
+                return _imin(_col_for(abs_ni), _ctx_m1)
 
             def _ind_off_for(abs_ni):
                 return pid_batch * max_block_len + udiv(_col_c_for(abs_ni), KVB)
@@ -256,14 +251,9 @@ def _build_paged_kernel(
                 return fx.Int32(ind_t[ind_off])
 
             def _prefetch_physical(physical_cur, ind_off_cur, ind_off_next):
-                same = _to_raw(ind_off_next) == _to_raw(ind_off_cur)
-                phys_raw = _to_raw(physical_cur)
-                if_op = scf.IfOp(same, results_=[T.i32], has_else=True)
-                with ir.InsertionPoint(if_op.then_block):
-                    scf.YieldOp([phys_raw])
-                with ir.InsertionPoint(if_op.else_block):
-                    scf.YieldOp([_to_raw(_load_physical(ind_off_next))])
-                return fx.Int32(if_op.results[0])
+                if ind_off_next == ind_off_cur:
+                    return physical_cur
+                return _load_physical(ind_off_next)
 
             def _b_col_for_tile(physical, tok_in_block, b0_carried):
                 return [
@@ -275,18 +265,21 @@ def _build_paged_kernel(
                 col = _col_for(abs_ni)
                 tok_in_block = _tok_in_block_for(abs_ni)
                 b_col = _b_col_for_tile(physical, tok_in_block, b0_carried)
-                kv_scale = _to_raw(fx.Float32(kv_scale_v[physical, tok_in_block]))
-                if scale_mul != 1.0:
-                    kv_scale = arith.MulFOp(
-                        kv_scale, scale_mul_c, fastmath=fm_fast
-                    ).result
+                kv_scale = fx.Float32(kv_scale_v[physical, tok_in_block])
                 col_sum = mfma_head_reduce(
                     a_pack, b_col, w_frag, kv_scale, m_tiles=M_TILES, k_steps=K_STEPS
                 )
-                is_writer = _to_raw((lane_div_N == 0) & (col <= q_limit))
-                with ir.InsertionPoint(scf.IfOp(is_writer).then_block):
-                    out_row_t[col] = fx.Float32(col_sum)
-                    scf.YieldOp([])
+                is_writer = (lane_div_N == 0) & (col <= q_limit)
+
+                def _do_write(_t=out_row_t, _c=col, _v=col_sum):
+                    _t[_c] = _v
+
+                @flyc.jit
+                def _guarded_write(_pred=is_writer, _w=_do_write):
+                    if _pred:
+                        _w()
+
+                _guarded_write()
 
             def _prefetch_k0(abs_ni, physical):
                 return load_pack_kv(
@@ -393,14 +386,11 @@ def compile_fp8_paged_mqa_logits(
     kv_block_size: int = 1,
     preshuffle: bool = False,
     variant: str = DEFAULT_VARIANT,
-    scale_mul: float = 1.0,
 ):
     """Return a cached, compiled FlyDSL paged launcher for the given config.
 
     ``num_heads``/``head_size``/``kv_block_size``/``preshuffle`` are compile-time
-    constants and ``variant`` is a ``paged_w<WPB>`` tag. ``scale_mul`` folds a
-    constant into the co-packed dequant scale; it carries the gfx942 FN->FNUZ
-    2x compensation.
+    constants and ``variant`` is a ``paged_w<WPB>`` tag.
     """
     launcher = _build_paged_kernel(
         num_heads=num_heads,
@@ -409,7 +399,6 @@ def compile_fp8_paged_mqa_logits(
         waves_per_block=_variant_wpb(variant),
         kv_block_size=kv_block_size,
         preshuffle=preshuffle,
-        scale_mul=scale_mul,
     )
     launcher.compile_hints = dict(DEFAULT_COMPILE_HINTS)
     return launcher
@@ -437,7 +426,7 @@ def flydsl_fp8_paged_mqa_logits(
 
     Drop-in for the Triton ``deepgemm_fp8_paged_mqa_logits`` tensor contract.
 
-    q_fp8:        [batch, next_n, heads, hidden_dim], float8 e4m3 (fn or fnuz)
+    q_fp8:        [batch, next_n, heads, hidden_dim], float8 e4m3fn (gfx950 native)
     kv_cache:     [num_blocks, KVBlockSize, 1, index_dim] uint8, co-packed per
                   block as KVBlockSize*hidden_dim fp8 K bytes then KVBlockSize
                   f32 scales; index_dim == hidden_dim + 4 (+ optional padding).
@@ -509,13 +498,10 @@ def flydsl_fp8_paged_mqa_logits(
         _fnuz,
         _fn,
     ), f"q_fp8 must be e4m3 fp8 (fnuz or fn); got {q_fp8.dtype}"
+    assert get_gfx() == "gfx950", (
+        f"flydsl_fp8_paged_mqa_logits targets gfx950 (32x32x64 MFMA); got {get_gfx()}"
+    )
 
-    # gfx942's fp8 MFMA reads operands as e4m3 FNUZ (bias 8), so an FN (OCP,
-    # bias 7) Q byte decodes to half its value there; scale_mul undoes that on
-    # the co-packed scale. NOTE: FN -0 (0x80) is FNUZ NaN and is *not* patched
-    # -- the vector<8xi32> operand has no byte-patch path. The KV cache is
-    # always arch-native fp8, so it never needs either.
-    scale_mul = 2.0 if (get_gfx() == "gfx942" and q_fp8.dtype == _fn) else 1.0
     variant = _resolve_variant(variant)
 
     launcher = compile_fp8_paged_mqa_logits(
@@ -525,7 +511,6 @@ def flydsl_fp8_paged_mqa_logits(
         kv_block_size=int(KVBlockSize),
         preshuffle=bool(Preshuffle),
         variant=variant,
-        scale_mul=scale_mul,
     )
 
     # Co-packed cache -> raw uint8 byte view [num_blocks * KVBlockSize * index_dim].

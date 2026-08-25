@@ -1,32 +1,24 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""FlyDSL building blocks for the paged FP8 MQA-logits kernel::
+"""FlyDSL building blocks for the paged FP8 MQA-logits kernel (gfx950 / CDNA4).
 
     logits[row, n] = sum_h ReLU(<Q[row, h, :], K[n, :]> * kv_scale[n]) * weights[row, h]
-
-Split out of ``fp8_paged_mqa_logits`` to keep the gather layouts, the MFMA
-head-reduce and the output view separable from the kernel body. The dense
-``fp8_mqa_logits`` carries its own copies and does not import this.
 """
-
-# No `from __future__ import annotations`: FlyDSL arg typing needs real
-# annotation objects, not PEP 563 strings.
 
 from functools import lru_cache
 
 import flydsl.expr as fx
 import torch
 from flydsl.expr import arith, range_constexpr, rocdl
-from flydsl.expr.numeric import ArithValue
 from flydsl.expr.typing import T
 
 from ..tensor_shim import GTensor, _to_raw
 
 Vec = fx.Vector
 
-# 32x32x64 scaled fp8 MFMA (CDNA4). A/B are vector<8xi32> per lane (32 fp8
-# bytes), C/D are 16 f32 D-regs. lane_div_N = lane//32, lane_mod_N = lane%32.
+# 32x32x64 scaled fp8 MFMA (gfx950 / CDNA4). A/B are vector<8xi32> per lane
+# (32 fp8 bytes), C/D are 16 f32 D-regs. lane_div_N = lane//32, lane_mod_N = lane%32.
 MFMA_M = 32
 MFMA_N = 32
 MFMA_K = 64
@@ -65,18 +57,18 @@ def umod(a, b):
 
 @lru_cache(maxsize=8)
 def device_cu_count(device_index: int) -> int:
-    """Compute-unit count for a CUDA/HIP device (cached); 304 if unavailable."""
+    """Compute-unit count for a CUDA/HIP device (cached); 256 if unavailable."""
     try:
         return torch.cuda.get_device_properties(device_index).multi_processor_count
     except Exception:  # noqa: BLE001
-        return 304
+        return 256
 
 
 def load_pack_v8i32(i32_view, byte_off_i32, lane8):
     """Load 32 fp8 bytes as the vector<8xi32> A/B operand of the 32x32x64 MFMA.
 
     Each lane holds 4 K-groups of 8 bytes at ``lane8 + kk*16``. Reads go out as
-    2-dword loads because a ``v8i8`` buffer_load fails to lower on gfx942.
+    2-dword loads because a ``v8i8`` buffer_load fails to lower.
     """
 
     def _load_i64(off):
@@ -159,34 +151,31 @@ def mfma_head_reduce(
     m_tiles,
     k_steps,
     dreg_count=16,
-    fm_fast=arith.FastMathFlags.fast,
     mfma_fn=MFMA_FN,
 ):
     """One column's logit: fp8 MFMA over heads, ReLU * weight sum, kv-scale,
-    in-wave head reduce. Returns the reduced f32 ``col_sum`` (raw ir value).
+    in-wave head reduce.
 
     ``kv_scale`` (>= 0) is applied once to the column sum rather than per head:
     ReLU is positively homogeneous, so ReLU(s*x) = s*ReLU(x) and hoisting it out
     of the head sum is exact.
     """
     res_ty = Vec.make_type(dreg_count, fx.Float32)
-    f32_0 = arith.constant(0.0, type=T.f32)
-    col_sum = _to_raw(f32_0)
+    f32_0 = fx.Float32(0.0)
+    col_sum = f32_0
     for mi in range_constexpr(m_tiles):
         acc = Vec.filled(dreg_count, 0.0, fx.Float32)
         for kk in range_constexpr(k_steps):
             acc = mfma_fn(res_ty, [a_row[mi][kk], b_col[kk], acc, 0, 0, 0])
         for ii in range_constexpr(dreg_count):
-            score = Vec(acc)[ii].ir_value()
-            relu = arith.maximumf(score, _to_raw(f32_0))
-            wsc = arith.MulFOp(relu, w_row[mi][ii], fastmath=fm_fast).result
-            col_sum = arith.AddFOp(col_sum, wsc, fastmath=fm_fast).result
-    col_sum = arith.MulFOp(col_sum, kv_scale, fastmath=fm_fast).result
+            score = fx.Float32(Vec(acc)[ii])
+            relu = score.maximumf(f32_0)
+            col_sum = col_sum + relu * w_row[mi][ii]
+    col_sum = col_sum * fx.Float32(kv_scale)
 
     # For 32x32 tile: lane_div_N = lane // 32 (0 or 1); shuffle_xor(32) sums them.
-    # For 16x16 tile: lane_div_N = lane // 16 (0..3); shuffle_xor(16) + xor(32).
     shuffles = (32,) if dreg_count == 16 else (16, 32)
     for sh in shuffles:
-        peer = _to_raw(ArithValue(col_sum).shuffle_xor(sh, 64))
-        col_sum = arith.AddFOp(col_sum, peer, fastmath=fm_fast).result
+        peer = col_sum.shuffle_xor(sh, 64)
+        col_sum = col_sum + peer
     return col_sum
