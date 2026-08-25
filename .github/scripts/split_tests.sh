@@ -224,7 +224,6 @@ elif [[ "$TEST_TYPE" == "triton" ]]; then
     FILE_TIMES[op_tests/triton_tests/moe/test_moe_gemm_int8_smoothquant.py]=58
     FILE_TIMES[op_tests/triton_tests/test_activation.py]=58
     FILE_TIMES[op_tests/triton_tests/chunk_delta_attn/test_flash_kda.py]=56
-    FILE_TIMES[op_tests/triton_tests/attention/test_la.py]=54
     FILE_TIMES[op_tests/triton_tests/gemm/fused/test_fused_gemm_afp4wfp4_split_cat.py]=48
     FILE_TIMES[op_tests/triton_tests/test_gather_kv_b_proj.py]=46
     FILE_TIMES[op_tests/triton_tests/attention/test_la_paged.py]=41

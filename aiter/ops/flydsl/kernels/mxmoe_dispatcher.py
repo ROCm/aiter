@@ -94,6 +94,20 @@ def _spart_output_tile_index(block_1d_id, M0, N0, group_num, m01, nmajor=False):
     return m_block_idx, n_block_idx
 
 
+def _pick_epi_lanes(BM, BN, route_out_fp8, g2_scale_blk, nthreads=256):
+    if not route_out_fp8:
+        return None
+    order = (32, 16, 8) if BN >= 512 else (16, 8, 32)
+    for lanes in order:
+        epi_rows = nthreads // lanes
+        route_vec = BN // lanes
+        if BM % epi_rows or BN % lanes or route_vec % 4:
+            continue
+        if g2_scale_blk in (route_vec, 2 * route_vec, 4 * route_vec):
+            return lanes
+    return None
+
+
 def compile_gemm2_a4w4_port(
     BM=32,
     BN=256,
@@ -182,6 +196,9 @@ def compile_gemm2_a4w4_port(
     aStages = 3 if (not g2_bf16_lds or 3 * slot_bytes <= c_lds_bytes) else 2
     a_slot_alias = aStages <= kStages
     lds_bytes = max(c_lds_bytes, aStages * slot_bytes)
+    K_TILES_RT_MAX = INTER_MAX // BK
+    g2_apre = g2_kstatic and aStages >= K_TILES_RT_MAX
+    a_preload = min(aStages, K_TILES_RT_MAX) if g2_apre else kStages
     # N_OUT = model_dim/hidden is runtime; HIDDEN_MAX is a compile/cache bucket
     # so different runtime hidden sizes can reuse one compiled launcher.
     assert (
@@ -217,6 +234,7 @@ def compile_gemm2_a4w4_port(
     sblk_tag = f"_sblk{g2_scale_blk}" if (route_out_fp8 and g2_scale_blk != 8) else ""
     out_tag = "_fp8out" if route_out_fp8 else ""
     tile_tag = "" if (BN, BK) == (256, 256) else f"_bn{BN}_bk{BK}"
+    g2_epi_lanes = _pick_epi_lanes(BM, BN, route_out_fp8, g2_scale_blk)
     tag = f"hmax{HIDDEN_MAX}_imax{INTER_MAX}_bm{BM}{tile_tag}{'_nt' if use_nt else ''}_{etag}{atag}{btag}{sbm_tag}{persist_tag}{pad_tag}{bh_tag}{apf_tag}{spart_tag}{bf16lds_tag}{dw_tag}{kst_tag}{pitch_tag}{sblk_tag}{out_tag}_v2"
     name = f"gemm2_a4w4_port_{tag}"
 
@@ -254,7 +272,7 @@ def compile_gemm2_a4w4_port(
         lds_base_i32 = fx.Int32(fx.ptrtoint(lds.buf.ptr))
 
         def issue_all_a_loads(m_row0):
-            for slot in range_constexpr(kStages):
+            for slot in range_constexpr(a_preload):
                 issue_a_load_lds_dt(
                     arg_aq,
                     aq_num,
@@ -312,6 +330,8 @@ def compile_gemm2_a4w4_port(
                 g2_out_pitch_align=g2_out_pitch_align,
                 g2_scale_blk=g2_scale_blk,
                 route_out_fp8=route_out_fp8,
+                g2_epi_lanes=g2_epi_lanes,
+                g2_apre=g2_apre,
                 mn_idx=mn_idx,
             )
 
