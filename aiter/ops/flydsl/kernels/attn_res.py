@@ -28,9 +28,8 @@ from functools import lru_cache
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from flydsl.expr import arith, const_expr, gpu, range_constexpr
+from flydsl.expr import arith, const_expr, range_constexpr
 from flydsl.expr import math as fmath
-from flydsl.expr.arith import CmpFPredicate
 from flydsl.expr.typing import ReductionOp, Stream, T
 
 from . import dpp_utils
@@ -359,7 +358,7 @@ def _build_attn_res(
             if const_expr(red_slots == 1):
                 return wave_reduce_add(sumsq_local), wave_reduce_add(dot_local)
             store_pair_partials(sumsq_local, dot_local, slot, buf)
-            gpu.barrier()
+            fx.gpu.barrier()
             return finish_pair_reduce(slot, buf)
 
         def block_reduce_add(value, buf, slot):
@@ -376,7 +375,7 @@ def _build_attn_res(
 
             if lane == 0:
                 fx.memref_store(wave_total, s_sumsq, wave)
-            gpu.barrier()
+            fx.gpu.barrier()
 
             in_range = lane < red_slots
             lane_safe = in_range.select(lane, 0)
@@ -389,9 +388,7 @@ def _build_attn_res(
 
         def issue_bf16_vec(divided_tensor, index):
             register = fx.make_rmem_tensor(_VEC_WIDTH, fx.BFloat16)
-            fx.copy_atom_call(
-                copy_atom, fx.slice(divided_tensor, (None, index)), register
-            )
+            fx.copy(copy_atom, fx.slice(divided_tensor, (None, index)), register)
             return register
 
         def load_bf16_vec(divided_tensor, index):
@@ -400,9 +397,7 @@ def _build_attn_res(
         def store_bf16_vec(value, divided_tensor, index):
             register = fx.make_rmem_tensor(_VEC_WIDTH, fx.BFloat16)
             fx.memref_store_vec(value, register)
-            fx.copy_atom_call(
-                copy_atom, register, fx.slice(divided_tensor, (None, index))
-            )
+            fx.copy(copy_atom, register, fx.slice(divided_tensor, (None, index)))
 
         prefix_buf = fx.rocdl.make_buffer_tensor(prefix)
         blocks_buf = fx.rocdl.make_buffer_tensor(blocks)
@@ -508,11 +503,10 @@ def _build_attn_res(
                 logit = dot * reciprocal_rms
 
                 new_max = old_max.maximumf(logit)
-                is_first_source = arith.cmpf(CmpFPredicate.OEQ, old_max, neg_inf)
                 old_scale_active = fmath.exp2(
                     (old_max - new_max) * log2e, fastmath=fm_fast
                 )
-                old_scale = arith.select(is_first_source, zero, old_scale_active)
+                old_scale = (old_max == neg_inf).select(zero, old_scale_active)
                 new_scale = fmath.exp2((logit - new_max) * log2e, fastmath=fm_fast)
                 new_denominator = old_denominator * old_scale + new_scale
 
@@ -564,7 +558,7 @@ def _build_attn_res(
                             source_local = prefix_local
                         store_source_partials(source_local, slot, buf)
                         group_local.append(source_local)
-                    gpu.barrier()
+                    fx.gpu.barrier()
                     for slot in range_constexpr(n_members):
                         sumsq, dot = finish_source_reduce(slot, buf)
                         max_logit, denominator, mixed_local = update_softmax(
