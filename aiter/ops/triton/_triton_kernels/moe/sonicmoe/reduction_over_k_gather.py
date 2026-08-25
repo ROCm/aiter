@@ -7,6 +7,11 @@ import torch
 import triton
 import triton.language as tl
 
+from aiter.ops.triton.utils.sonicmoe_config_utils import (
+    get_token_gather_config,
+    split_launch_config,
+)
+
 
 def get_powers_of_2(start: int, end: int) -> list[int]:
     output = []
@@ -53,11 +58,6 @@ def _prune_triton_autotune_config(configs, nargs, **kw):
         return pruned_configs
 
 
-@triton.autotune(
-    configs=_get_triton_autotune_configs(),
-    key=["H", "MAX_K", "w_is_None", "is_varlen_K"],
-    prune_configs_by={"early_config_prune": _prune_triton_autotune_config},
-)
 @triton.jit
 def token_gather_sum_kernel(
     x_ptr,  # (Mtotal, H)
@@ -136,6 +136,13 @@ def token_gather_sum_kernel(
         tl.store(out_ptrs, acc, mask=m_h)
 
 
+token_gather_sum_kernel_autotuned = triton.autotune(
+    configs=_get_triton_autotune_configs(),
+    key=["H", "MAX_K", "w_is_None", "is_varlen_K"],
+    prune_configs_by={"early_config_prune": _prune_triton_autotune_config},
+)(token_gather_sum_kernel)
+
+
 def token_gather_and_sum_varlen_K_triton(
     x: torch.Tensor,  # (Mtotal, H)
     w: torch.Tensor | None,  # (Mtotal,)
@@ -157,12 +164,8 @@ def token_gather_and_sum_varlen_K_triton(
     """
 
     # 1D grid over T only
-    token_gather_sum_kernel[(T,)](
-        x,
-        w,
-        M_perm,
-        M_offset,
-        out,
+    common = (x, w, M_perm, M_offset, out)
+    kwargs = dict(
         T=T,
         H=H,
         MAX_K=MAX_K,
@@ -173,3 +176,9 @@ def token_gather_and_sum_varlen_K_triton(
         w_is_None=(w is None),
         is_varlen_K=is_varlen_K,
     )
+    gather_cfg = get_token_gather_config(H)
+    if gather_cfg is not None:
+        constexprs, launch = split_launch_config(gather_cfg)
+        token_gather_sum_kernel[(T,)](*common, **kwargs, **constexprs, **launch)
+    else:
+        token_gather_sum_kernel_autotuned[(T,)](*common, **kwargs)

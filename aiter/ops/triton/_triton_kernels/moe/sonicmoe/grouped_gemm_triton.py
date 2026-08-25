@@ -2,6 +2,12 @@ import torch
 import triton
 import triton.language as tl
 
+from aiter.ops.triton.utils.sonicmoe_config_utils import (
+    get_grouped_gemm_dw_config,
+    get_grouped_gemm_fwd_config,
+    split_launch_config,
+)
+
 
 def _get_fwd_autotune_configs():
     configs = []
@@ -37,11 +43,6 @@ def _prune_fwd_configs(configs, nargs, **kw):
     return pruned if pruned else configs
 
 
-@triton.autotune(
-    configs=_get_fwd_autotune_configs(),
-    key=["N", "K", "E"],
-    prune_configs_by={"early_config_prune": _prune_fwd_configs},
-)
 @triton.jit
 def _grouped_gemm_kernel(
     A_ptr,
@@ -174,6 +175,13 @@ def _grouped_gemm_kernel(
     tl.store(c_ptrs, c, mask=c_mask)
 
 
+_grouped_gemm_kernel_autotuned = triton.autotune(
+    configs=_get_fwd_autotune_configs(),
+    key=["N", "K", "E"],
+    prune_configs_by={"early_config_prune": _prune_fwd_configs},
+)(_grouped_gemm_kernel)
+
+
 def _get_dw_autotune_configs():
     configs = []
     for BLOCK_K in [32, 64, 128]:
@@ -207,11 +215,6 @@ def _prune_dw_configs(configs, nargs, **kw):
     return pruned if pruned else configs
 
 
-@triton.autotune(
-    configs=_get_dw_autotune_configs(),
-    key=["N", "K", "E"],
-    prune_configs_by={"early_config_prune": _prune_dw_configs},
-)
 @triton.jit
 def _grouped_gemm_dw_kernel(
     A_ptr,
@@ -298,6 +301,13 @@ def _grouped_gemm_dw_kernel(
     tl.store(c_ptrs, c, mask=c_mask)
 
 
+_grouped_gemm_dw_kernel_autotuned = triton.autotune(
+    configs=_get_dw_autotune_configs(),
+    key=["N", "K", "E"],
+    prune_configs_by={"early_config_prune": _prune_dw_configs},
+)(_grouped_gemm_dw_kernel)
+
+
 def _compute_grid_fwd(cu_seqlens_cpu, N, E, BLOCK_M, BLOCK_N):
     total_blocks = 0
     for e in range(E):
@@ -335,7 +345,8 @@ def grouped_gemm(
             _compute_grid_fwd(cu_seqlens_cpu, N, E, META["BLOCK_M"], META["BLOCK_N"]),
         )
 
-    _grouped_gemm_kernel[grid](
+    fwd_cfg = get_grouped_gemm_fwd_config(N, K_dim, E)
+    common = (
         A,
         B,
         out,
@@ -352,14 +363,20 @@ def grouped_gemm(
         out.stride(1),
         bias.stride(0) if bias is not None else 0,
         bias.stride(1) if bias is not None else 0,
+    )
+    kwargs = dict(
         N=N,
         K=K_dim,
         E=E,
-        GROUP_SIZE_M=8,
         HAS_BIAS=(bias is not None),
         HAS_GATHER_IDX=(A_idx is not None),
         HAS_SCATTER_IDX=(scatter_idx is not None),
     )
+    if fwd_cfg is not None:
+        constexprs, launch = split_launch_config(fwd_cfg)
+        _grouped_gemm_kernel[grid](*common, **kwargs, **constexprs, **launch)
+    else:
+        _grouped_gemm_kernel_autotuned[grid](*common, **kwargs, GROUP_SIZE_M=8)
     return out
 
 
@@ -382,7 +399,7 @@ def _grouped_gemm_dw(
         num_n_blocks = triton.cdiv(N, META["BLOCK_N"])
         return (E * num_k_blocks * num_n_blocks,)
 
-    _grouped_gemm_dw_kernel[grid](
+    common = (
         A,
         B,
         out,
@@ -395,9 +412,17 @@ def _grouped_gemm_dw(
         out.stride(0),
         out.stride(1),
         out.stride(2),
+    )
+    kwargs = dict(
         N=N,
         K=K_dim,
         E=E,
         HAS_GATHER_IDX=(A_idx is not None),
     )
+    dw_cfg = get_grouped_gemm_dw_config(N, K_dim, E)
+    if dw_cfg is not None:
+        constexprs, launch = split_launch_config(dw_cfg)
+        _grouped_gemm_dw_kernel[grid](*common, **kwargs, **constexprs, **launch)
+    else:
+        _grouped_gemm_dw_kernel_autotuned[grid](*common, **kwargs)
     return out

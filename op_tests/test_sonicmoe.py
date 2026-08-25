@@ -269,6 +269,29 @@ def main():
         return
 
     print("=== SonicMoE Correctness Test ===")
+    from aiter.ops.triton.utils.sonicmoe_config_utils import (
+        get_grouped_gemm_dw_config,
+        get_grouped_gemm_fwd_config,
+        get_token_gather_config,
+        load_sonicmoe_configs,
+    )
+
+    sonic_cfgs = load_sonicmoe_configs()
+    if sonic_cfgs is None:
+        print("SONICMOE JSON: not found for this arch (will autotune)")
+    else:
+        large_fwd = get_grouped_gemm_fwd_config(4096, 4096, 64)
+        large_dw = get_grouped_gemm_dw_config(4096, 4096, 64)
+        large_g = get_token_gather_config(4096)
+        small_fwd = get_grouped_gemm_fwd_config(128, 128, 4)
+        assert large_fwd is not None and large_fwd["BLOCK_M"] == 128
+        assert large_fwd["BLOCK_N"] == 128 and large_fwd["BLOCK_K"] == 64
+        assert large_fwd["num_warps"] == 4
+        assert large_dw is not None and large_dw["BLOCK_K"] == 128
+        assert large_g is not None and large_g["BLOCK_H"] == 4096
+        assert small_fwd is not None and small_fwd["BLOCK_M"] == 64
+        print("SONICMOE JSON: gfx bucket selection OK")
+
     activations = [args.activation] if args.activation else list(_ACT_MAP.keys())
     all_pass = True
     for act_name in activations:
