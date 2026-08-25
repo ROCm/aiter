@@ -29,6 +29,10 @@ _LOGGER = AiterTritonLogger()
 
 _USE_GEMM_SPLITK_BF16 = False
 
+_GLUON_SUPPORTED_ARCHS = ("gfx950",)
+_GLUON_PRESHUFFLE_ARCHS = ("gfx1250",)
+_GLUON_DEFAULT_ARCHS = ("gfx1250",)
+
 
 def set_use_gemm_splitk_bf16(value: bool):
     global _USE_GEMM_SPLITK_BF16
@@ -84,6 +88,7 @@ def gemm_afp4wfp4_fake_tensor(
     y: torch.Tensor | None = None,
     config: str | None = None,
     skip_reduce: bool | None = False,
+    backend: str = "triton",
 ) -> torch.Tensor:
     M, K = x.shape
     N, _ = w.shape
@@ -120,6 +125,7 @@ def gemm_afp4wfp4_(
     y: torch.Tensor | None = None,
     config: str | None = None,
     skip_reduce: bool | None = False,
+    backend: str = "triton",
 ) -> torch.Tensor:
     """
     Computes matrix multiplication Y = X @ W^T with FP4 activations and FP4 weights.
@@ -144,7 +150,26 @@ def gemm_afp4wfp4_(
         f"GEMM_AFPWFP4: x.shape={tuple(x.shape)} w.shape={tuple(w.shape)} x_scale={tuple(x_scales.shape)} w_scale={tuple(w_scales.shape)} "
     )
 
+    assert backend in (
+        "triton",
+        "gluon",
+    ), f"Unknown backend '{backend}', must be 'triton' or 'gluon'"
+
     assert arch_info.is_fp4_avail(), "MXFP4 is not available on your device"
+
+    if backend == "gluon":
+        arch = arch_info.get_arch()
+        assert arch in _GLUON_SUPPORTED_ARCHS, (
+            f"Gluon backend requires one of {_GLUON_SUPPORTED_ARCHS}, got '{arch}'. "
+            "gfx1250 gluon MXFP4 goes through gemm_afp4wfp4_preshuffle."
+        )
+        from aiter.ops.triton._gluon_kernels.gfx950.gemm.basic.gemm_afp4wfp4 import (
+            _gemm_afp4wfp4_kernel as _gluon_gemm_afp4wfp4_gfx950_kernel,
+        )
+
+        impl = _gluon_gemm_afp4wfp4_gfx950_kernel
+    else:
+        impl = _triton_gemm_afp4wfp4_kernel
 
     M, K = x.shape
     N, K = w.shape
@@ -153,11 +178,27 @@ def gemm_afp4wfp4_(
     w = w.T
 
     if config is None:
-        config, _ = _get_config(M, N, K)
+        if backend == "gluon":
+            config, _ = _get_config(M, N, K, backend="gluon")
+        else:
+            config, _ = _get_config(M, N, K)
     else:
         config = deserialize_str(config)
 
-    if config["NUM_KSPLIT"] > 1:
+    if backend == "gluon":
+        # The gluon kernel rounds SPLITK_BLOCK_SIZE up to a BLOCK_SIZE_K
+        # multiple and leaves BLOCK_SIZE_K alone; get_splitk's shrinking is
+        # tuned for the triton kernel.
+        if config["BLOCK_SIZE_K"] >= 2 * K:
+            config["NUM_KSPLIT"] = 1
+        if config["NUM_KSPLIT"] > 1:
+            config["SPLITK_BLOCK_SIZE"] = (
+                triton.cdiv(
+                    2 * triton.cdiv(K, config["NUM_KSPLIT"]), config["BLOCK_SIZE_K"]
+                )
+                * config["BLOCK_SIZE_K"]
+            )
+    elif config["NUM_KSPLIT"] > 1:
         SPLITK_BLOCK_SIZE, BLOCK_SIZE_K, NUM_KSPLIT = get_splitk(
             K, config["BLOCK_SIZE_K"], config["NUM_KSPLIT"]
         )
@@ -166,23 +207,21 @@ def gemm_afp4wfp4_(
         config["BLOCK_SIZE_K"] = BLOCK_SIZE_K
         config["NUM_KSPLIT"] = NUM_KSPLIT
 
-    if config["BLOCK_SIZE_K"] >= 2 * K:
-        config["BLOCK_SIZE_K"] = triton.next_power_of_2(2 * K)
-        config["SPLITK_BLOCK_SIZE"] = 2 * K
-        config["NUM_KSPLIT"] = 1
-    config["BLOCK_SIZE_K"] = max(config["BLOCK_SIZE_K"], 128)
+    if backend == "triton":
+        if config["BLOCK_SIZE_K"] >= 2 * K:
+            config["BLOCK_SIZE_K"] = triton.next_power_of_2(2 * K)
+            config["SPLITK_BLOCK_SIZE"] = 2 * K
+            config["NUM_KSPLIT"] = 1
+        config["BLOCK_SIZE_K"] = max(config["BLOCK_SIZE_K"], 128)
 
     return_y_pp = config["NUM_KSPLIT"] > 1 and skip_reduce
 
     if config["NUM_KSPLIT"] > 1:
-        if _USE_GEMM_SPLITK_BF16:
-            y_pp = torch.empty(
-                (config["NUM_KSPLIT"], M, N), dtype=y.dtype, device=x.device
-            )
-        else:
-            y_pp = torch.empty(
-                (config["NUM_KSPLIT"], M, N), dtype=torch.float32, device=x.device
-            )
+        y_pp = torch.empty(
+            (config["NUM_KSPLIT"], M, N),
+            dtype=dtype if _USE_GEMM_SPLITK_BF16 else torch.float32,
+            device=x.device,
+        )
     else:
         config["SPLITK_BLOCK_SIZE"] = 2 * K
         y_pp = None
@@ -200,7 +239,7 @@ def gemm_afp4wfp4_(
         ),
     )
 
-    _triton_gemm_afp4wfp4_kernel[grid](
+    impl[grid](
         x,
         w,
         y if config["NUM_KSPLIT"] == 1 else y_pp,
@@ -270,15 +309,31 @@ def gemm_afp4wfp4(
     y: torch.Tensor | None = None,
     config: dict | None = None,
     skip_reduce: bool | None = False,
+    backend: str | None = None,
 ) -> torch.Tensor:
+    arch = arch_info.get_arch()
+    if backend is None:
+        backend = "gluon" if arch in _GLUON_DEFAULT_ARCHS else "triton"
+
+    if backend == "gluon" and arch not in _GLUON_SUPPORTED_ARCHS:
+        # This entry point takes w as (N, K//2) row-major. gfx1250's gluon MXFP4
+        # kernel takes preshuffled weights, so it cannot serve it.
+        _LOGGER.info(
+            f"GEMM_AFP4WFP4: no gluon kernel for unshuffled weights on {arch}, "
+            "using triton"
+        )
+        backend = "triton"
+
     if config is None:
-        config_hashable = None
         M, K = x.shape
         N, _ = w.shape
-        config, _ = _get_config(M, N, K)
+        if backend == "gluon":
+            config, _ = _get_config(M, N, K, backend="gluon")
+        else:
+            config, _ = _get_config(M, N, K)
     config_hashable = serialize_dict(config)
     return gemm_afp4wfp4_(
-        x, w, x_scales, w_scales, dtype, y, config_hashable, skip_reduce
+        x, w, x_scales, w_scales, dtype, y, config_hashable, skip_reduce, backend
     )
 
 
@@ -466,7 +521,7 @@ def gemm_afp4wfp4_preshuffle(
     """
 
     assert arch_info.is_fp4_avail(), "MXFP4 is not available on your device"
-    use_gluon = arch_info.get_arch() == "gfx1250"
+    use_gluon = arch_info.get_arch() in _GLUON_PRESHUFFLE_ARCHS
 
     M, K_bytes = x_fp4.shape
     n16, _ = w_preshuf.shape
