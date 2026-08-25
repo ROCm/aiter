@@ -2528,9 +2528,6 @@ def get_2stage_cfgs(
         stage2_supports_bias = isinstance(kernelName2, str) and (
             kernelName2.startswith(("flydsl_", "cktile_"))
         )
-        needs_reverse_sorted = (
-            is_native_gemm2 and not parse_g2_kname_any(kernelName2)["atomic"]
-        )
         runtime_interleave = gate_mode == GateMode.INTERLEAVE
         if _p1["interleave"] != runtime_interleave:
             # The row was tuned against the other gate/up layout, so its recorded
@@ -2560,7 +2557,15 @@ def get_2stage_cfgs(
             block_m=_bm,
             ksplit=int(ksplit),
             fuse_quant=_p1["out_dtype"],
-            output_aux=needs_reverse_sorted,
+            # output_aux does not only request the reverse map: it is also the
+            # gate that selects the fused mxfp4_moe_sort, which is what emits
+            # m_indices. Narrowing it to needs_reverse_sorted dropped the whole
+            # fused prologue for atomic-GEMM2 configs, so m_indices came back
+            # None and fused_moe fell back to generic opus sorting plus a torch
+            # `sorted_token_ids & 0xFFFFFF` and a zero-fill -- ~12 us/iter of
+            # extra GPU work at BM16. Keep main's unconditional True; the
+            # reverse-map buffer is cheap next to losing the fused sort.
+            output_aux=True,
             prequant=_p1["a_dtype"] == "fp8" and not _p1["inline_quant"],
             has_bias=enable_bias and _p1.get("enable_bias", False),
             stage2_has_bias=enable_bias and stage2_supports_bias,
