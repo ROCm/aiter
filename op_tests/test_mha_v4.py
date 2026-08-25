@@ -28,6 +28,7 @@ from aiter.ops.mha_v4 import (
     quantize_mxfp8_q,
     quantize_v_mxfp4,
     quantize_v_mxfp6,
+    rotate_activation_hd128,
     rotate_activation_mxfp6_quant,
     scale_modes_for_formats,
 )
@@ -51,6 +52,18 @@ def _e2m1_code_ties_low(value):
         magnitude > midpoint for midpoint in (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0)
     ).to(torch.uint8)
     return code | ((value < 0).to(torch.uint8) << 3)
+
+
+def _rotate_hd128_reference(value):
+    rotated = value.float()
+    group_size = 1
+    while group_size < 128:
+        pairs = rotated.reshape(*value.shape[:-1], -1, 2, group_size)
+        left = pairs[..., 0, :]
+        right = pairs[..., 1, :]
+        rotated = torch.cat((left + right, left - right), dim=-1).reshape(value.shape)
+        group_size *= 2
+    return (rotated / 128**0.5).to(value.dtype)
 
 
 def _reference_mxfp4_v(value):
@@ -267,62 +280,39 @@ def test_mha_v4_fp8_quantization_matches_torch():
     reason="gfx942/gfx950 rotated FP8 quantization",
 )
 @pytest.mark.parametrize("sequence,heads", [(257, 3), (512, 1), (2048, 1)])
-def test_mha_v4_rotated_fp8_quantization_matches_native_rotation(sequence, heads):
-    from aiter.ops.quant import rotate_activation
-
+def test_mha_v4_rotated_fp8_quantization_matches_reference(sequence, heads):
     torch.manual_seed(23)
     value = torch.randn((1, heads, sequence, 128), device="cuda", dtype=torch.bfloat16)
     value = value.permute(0, 2, 1, 3).contiguous()
+    expected_rotated = _rotate_hd128_reference(value)
     rotated = torch.empty_like(value)
-    rotate_activation(rotated, value)
-    expected, expected_scale = quantize_fp8(rotated)
+    rotate_activation_hd128(rotated, value)
+    expected, expected_scale = quantize_fp8(expected_rotated)
 
     actual, scale = quantize_fp8_rotated(value)
 
+    assert torch.equal(rotated, expected_rotated)
     assert torch.equal(actual, expected)
     assert torch.equal(scale, expected_scale)
 
 
-@pytest.mark.skipif(
-    get_gfx() not in ("gfx942", "gfx950"),
-    reason="gfx942/gfx950 activation rotation",
-)
-def test_rotate_activation_rejects_noncontiguous_input():
-    from aiter.ops.quant import rotate_activation
-
+def test_mha_v4_rotated_fp8_quantization_rejects_noncontiguous_input():
     value = torch.randn((1, 1, 128, 2), device="cuda", dtype=torch.bfloat16)
     value = value.transpose(-1, -2)
-    rotated = torch.empty(value.shape, device="cuda", dtype=value.dtype)
 
-    with pytest.raises(ValueError, match="input and out must be contiguous"):
-        rotate_activation(rotated, value)
-
-
-@pytest.mark.skipif(
-    get_gfx() not in ("gfx942", "gfx950"),
-    reason="gfx942/gfx950 activation rotation",
-)
-def test_rotate_activation_rejects_same_numel_output_reshape():
-    from aiter.ops.quant import rotate_activation
-
-    value = torch.randn((1, 2, 128), device="cuda", dtype=torch.bfloat16)
-    rotated = torch.empty((2, 1, 128), device="cuda", dtype=value.dtype)
-
-    with pytest.raises(ValueError, match="input and out shapes must match"):
-        rotate_activation(rotated, value)
+    with pytest.raises(ValueError, match="requires contiguous hd128 input"):
+        quantize_fp8_rotated(value)
 
 
 @pytest.mark.skipif(
     get_gfx() not in ("gfx942", "gfx950"),
     reason="gfx942/gfx950 activation rotation",
 )
-def test_rotate_activation_accepts_empty_input():
-    from aiter.ops.quant import rotate_activation
-
+def test_mha_v4_rotate_activation_hd128_accepts_empty_input():
     value = torch.empty((1, 0, 1, 128), device="cuda", dtype=torch.bfloat16)
     rotated = torch.empty_like(value)
 
-    rotate_activation(rotated, value)
+    rotate_activation_hd128(rotated, value)
 
     assert rotated.shape == value.shape
     assert rotated.numel() == 0

@@ -17,7 +17,6 @@ from torch import Tensor
 from aiter import dtypes
 from aiter.jit.core import compile_ops
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.quant import rotate_activation
 from aiter.ops.triton._triton_kernels.quant.sage_attention_quant import (
     mha_v4_per_tensor_amax_kernel,
     mha_v4_per_tensor_quant_kernel,
@@ -44,6 +43,11 @@ MHA_V4_PER_TENSOR_BLOCK_SIZE = 8192
 def mha_v4_q_multiplier(softmax_scale: float) -> float:
     """Return the Q multiplier expected by the MX attention quantizers."""
     return softmax_scale * MHA_V4_LOG2E
+
+
+@compile_ops("module_fmha_v4_fwd")
+def rotate_activation_hd128(out: Tensor, input: Tensor) -> None:
+    """Apply normalized Walsh-Hadamard rotation to contiguous hd128 rows."""
 
 
 @compile_ops("module_fmha_v4_fwd")
@@ -523,7 +527,7 @@ def quantize_fp8_rotated(input: Tensor) -> tuple[Tensor, Tensor]:
     if input.shape[-1] != 128 or not input.is_contiguous():
         raise ValueError("rotated FP8 quantization requires contiguous hd128 input")
     rotated = torch.empty_like(input)
-    rotate_activation(rotated, input)
+    rotate_activation_hd128(rotated, input)
     return quantize_fp8(rotated)
 
 
