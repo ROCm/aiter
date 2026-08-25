@@ -2135,15 +2135,39 @@ def chunk_gated_delta_rule_fwd_h_o_flydsl(
             "provided."
         )
 
+    # Validate dtype: the fused kernel is bf16-only.
+    for name, t in (("q", q), ("k", k), ("w", w), ("u", u)):
+        if t.dtype != torch.bfloat16:
+            raise ValueError(
+                f"chunk_gated_delta_rule_fwd_h_o_flydsl: '{name}' must be bfloat16, "
+                f"got {t.dtype}."
+            )
+
+    # Validate contiguity: the kernel assumes packed strides throughout.
+    for name, t in (("q", q), ("k", k), ("w", w), ("u", u)):
+        if not t.is_contiguous():
+            raise ValueError(
+                f"chunk_gated_delta_rule_fwd_h_o_flydsl: '{name}' must be contiguous."
+            )
+
     B, T, _Hg, K = q.shape
+    H = w.shape[1]
     V = u.shape[-1]
     if scale is None:
         scale = K**-0.5
 
     if o is None:
         # Token-major [B, T, H, V], matching the Triton K6 output layout.
-        H = w.shape[1]
         o = u.new_empty(B, T, H, V, dtype=u.dtype)
+    elif o.shape != (B, T, H, V):
+        raise ValueError(
+            f"chunk_gated_delta_rule_fwd_h_o_flydsl: pre-allocated 'o' must be "
+            f"[{B}, {T}, {H}, {V}], got {tuple(o.shape)}."
+        )
+    elif not o.is_contiguous():
+        raise ValueError(
+            "chunk_gated_delta_rule_fwd_h_o_flydsl: pre-allocated 'o' must be contiguous."
+        )
 
     # The fused kernel is gfx942-only: it is the sole implementation of this
     # entry point (there is no separate-K5/K6 fallback here -- callers that need
