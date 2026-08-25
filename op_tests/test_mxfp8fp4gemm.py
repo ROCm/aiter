@@ -21,6 +21,7 @@
 
 import argparse
 import itertools
+import sys
 
 import pandas as pd
 import torch
@@ -28,7 +29,6 @@ import torch
 import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
-from aiter.ops.asm.mxfp8fp4gemm import _gemm_a8w4_asm, _gemm_a8w8_asm
 from aiter.ops.shuffle import (
     shuffle_mxfp8fp4_a,
     shuffle_mxfp8fp4_b,
@@ -52,6 +52,42 @@ pd.set_option("display.width", 1000)
 SUPPORTED_GFX = ["gfx1250"]
 
 _OUT_DTYPE = {"bf16": dtypes.bf16}
+
+# gfx1250 F8GEMM .co is a persistent shader: it always launches PERSISTENT_TG
+# threadgroups regardless of problem size (must match the .co's WG_MAX).
+PERSISTENT_TG = 256
+
+
+def _heuristic_tile(M):
+    """Tile (tile_m, tile_n) the cpp dispatch picks for this M (mirrors
+    get_heuristic_kernel in asm_mxfp8fp4gemm.cu): M<=64 wastes most of a 256-tall
+    tile's rows, so it takes the 64x512 variant; any larger M takes 256x256."""
+    return (64, 512) if M <= 64 else (256, 256)
+
+
+def _report_active_tg(M, N, tile_m, tile_n, label):
+    """Warn when the persistent shader's TG slots aren't fully packed.
+
+    The .co always launches PERSISTENT_TG (256) threadgroups. The real work is
+    ceil(M/tile_m) * ceil(N/tile_n) tiles; when that isn't a multiple of 256 the
+    final wave leaves the leftover TG slots idle (wasted CUs) -> "poor perf".
+    (Moved here from the cpp dispatch so the report lives with the test.)
+    """
+    tg_m = (M + tile_m - 1) // tile_m
+    tg_n = (N + tile_n - 1) // tile_n
+    active_tg = tg_m * tg_n
+    wave_active = (
+        PERSISTENT_TG if active_tg % PERSISTENT_TG == 0 else active_tg % PERSISTENT_TG
+    )
+    info = (
+        f"{label}: active {wave_active}/{PERSISTENT_TG} TG "
+        f"({tg_m} M-tiles x {tg_n} N-tiles, tile_m={tile_m}, tile_n={tile_n})"
+    )
+    if active_tg % PERSISTENT_TG == 0:
+        aiter.logger.info("dispatch to %s", info)
+    else:
+        tag = "\033[31mpoor perf\033[0m" if sys.stderr.isatty() else "poor perf"
+        aiter.logger.warning("dispatch to %s - %s!", info, tag)
 
 PERF_SHAPES = {
     "a8w8": [
@@ -247,7 +283,7 @@ def test_gemm(
     # Single ASM kernel under test, dispatched by intype. Inputs passed as ARGS so
     # run_perftest can rotate them (defeats the L2 hot-cache). Dispatch is
     # heuristic by default (kernelName=""); an explicit --knl-name forces that .co.
-    kern = _gemm_a8w4_asm if intype == "a8w4" else _gemm_a8w8_asm
+    kern = aiter.gemm_a8w4_mxfp8 if intype == "a8w4" else aiter.gemm_a8w8_mxfp8
     # Dispatch mode. Default (knl_name=None) is heuristic: knl="" lets the op pick
     # the .co by (b_intype, a_preshuffle). Explicit is opt-in via --knl-name:
     # "auto" derives this config's mangled name from the CSV convention (see
@@ -279,6 +315,12 @@ def test_gemm(
     in_bytes = inp["A"].nbytes + inp["B"].nbytes + scale_bytes
 
     ret = {"gfx": get_gfx(), "knl_name": knl_name or "(heuristic)"}
+    # Report TG occupancy for the tile the cpp dispatch picks (M<=64 -> 64x512).
+    _middle = "mxfp8fp8" if intype == "a8w8" else "mxfp8fp4"
+    _pre = "ABpreShuffle" if apre else "BpreShuffle"
+    _tile_m, _tile_n = _heuristic_tile(M)
+    _label = f"f8gemm_{outtype}_{_middle}_{_pre}_{_tile_m}x{_tile_n}_4x4_ps"
+    _report_active_tg(M, N, _tile_m, _tile_n, _label)
     # Only a missing .co is reported as "not support"; any other failure (OOM,
     # memory fault, shape assert, ...) must propagate, not show as a green cell.
     # An explicit --knl-name that isn't in the cfg is a real error (typo / missing

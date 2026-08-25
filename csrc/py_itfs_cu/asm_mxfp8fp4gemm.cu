@@ -36,36 +36,9 @@
 #include "aiter_ctypes_error.h"
 #include "asm_mxfp8fp4gemm_configs.hpp"
 #include <cmath>
-#include <cstdio>
-#include <cstdlib>
 #include <cstring>
-#include <cxxabi.h>
 #include <memory>
-#include <string>
-#include <unistd.h>
 #include <hip/hip_runtime.h>
-
-// Demangle an Itanium C++ ABI symbol (the CSV knl_name) for readable logs;
-// returns the input unchanged if demangling fails.
-static std::string demangle_knl(const std::string& mangled)
-{
-    int status         = 0;
-    char* out          = abi::__cxa_demangle(mangled.c_str(), nullptr, nullptr, &status);
-    std::string result = (status == 0 && out) ? out : mangled;
-    std::free(out);
-    return result;
-}
-
-// ANSI bold-red for the "poor perf" tag, emitted only when stderr is a TTY
-// (AITER_LOG_WARNING writes to std::cerr); redirected/piped logs stay clean.
-static const char* ansi_red()
-{
-    return isatty(fileno(stderr)) ? "\033[1;31m" : "";
-}
-static const char* ansi_reset()
-{
-    return isatty(fileno(stderr)) ? "\033[0m" : "";
-}
 
 constexpr int MX_SCALE_BLOCK = 32;
 
@@ -283,26 +256,6 @@ static void mxfp8fp4_launch(aiter_tensor_t* A,
     const int cluster_y = cfg.cluster_y > 0 ? cfg.cluster_y : 1;
 
     constexpr int WG_MAX = 256; // must match the .co's WG_MAX
-
-    // Report the actual thread-groups (tiles) that carry real work. The .co is a
-    // persistent shader tuned for a full WG_MAX (256) wave: it always launches
-    // WG_MAX threadgroups regardless of problem size. When the real tile count
-    // isn't a multiple of 256, the final wave leaves the leftover threadgroup
-    // slots idle (wasted CUs), so warn.
-    const int tg_num_M  = (Mdim + cfg.tile_m - 1) / cfg.tile_m;
-    const int tg_num_N  = (Ndim + cfg.tile_n - 1) / cfg.tile_n;
-    const int active_tg   = tg_num_M * tg_num_N;
-    const int wave_active = (active_tg % WG_MAX == 0) ? WG_MAX : (active_tg % WG_MAX);
-    const std::string tg_info =
-        demangle_knl(cfg.knl_name) + ": active " + std::to_string(wave_active) + "/" +
-        std::to_string(WG_MAX) + " TG (" + std::to_string(tg_num_M) + " M-tiles x " +
-        std::to_string(tg_num_N) + " N-tiles, tile_m=" + std::to_string(cfg.tile_m) +
-        ", tile_n=" + std::to_string(cfg.tile_n) + ")";
-    if(active_tg % WG_MAX == 0)
-        AITER_LOG_INFO("dispatch to " << tg_info);
-    else
-        AITER_LOG_WARNING("dispatch to " << tg_info << " - " << ansi_red() << "poor perf"
-                                         << ansi_reset() << "!");
 
     const int cluster_size = cluster_x * cluster_y;
     AITER_CHECK((WG_MAX % cluster_size) == 0,
