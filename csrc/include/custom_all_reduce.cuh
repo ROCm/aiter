@@ -1745,7 +1745,6 @@ __global__ void __launch_bounds__(tnum, 1)
 
     const int warp_id = threadIdx.x / tnum_gpu;
     const int lane_id = threadIdx.x % tnum_gpu;
-    const int tid     = blockIdx.x * tnum_gpu + lane_id;
 
     const P* ptrs[ngpus];
     P* peer_tmps[ngpus];
@@ -1759,15 +1758,33 @@ __global__ void __launch_bounds__(tnum, 1)
     start_sync_acqrel<ngpus>(sg, self_sg, rank);
 
     // ---------------- phase A: reduce-scatter + cross-device store ----------
-    const int part = m * valid_pack_count / ngpus;
-    for(int idx = tid; idx < part; idx += gridDim.x * tnum_gpu)
-    {
-        const int flat_idx  = rank * part + idx;
-        const int row       = flat_idx / valid_pack_count;
-        const int col       = flat_idx % valid_pack_count;
-        const int input_idx = row * input_pack_count + col;
+    //
+    // The trip count comes from the block's base index, not from each thread's
+    // own idx, so every thread in the block runs the loop the same number of
+    // times. That matters because the body contains __syncthreads(): now that
+    // the grid is sized for phase A rather than for m, a per-thread `idx < part`
+    // bound would leave the tail block's waves disagreeing on how many barriers
+    // to execute. All ngpus warp groups share lane_id, so they agree on `idx`
+    // and on `active`, which is what warp 0's cross-rank reduction assumes.
+    const int part   = m * valid_pack_count / ngpus;
+    const int stride = gridDim.x * tnum_gpu;
+    const int base   = blockIdx.x * tnum_gpu;
+    const int trips  = (base < part) ? ((part - base + stride - 1) / stride) : 0;
 
-        P input_reg                                         = ptrs[warp_id][input_idx];
+    for(int t = 0; t < trips; ++t)
+    {
+        const int idx     = base + t * stride + lane_id;
+        const bool active = idx < part;
+
+        P input_reg{};
+        if(active)
+        {
+            const int flat_idx  = rank * part + idx;
+            const int row       = flat_idx / valid_pack_count;
+            const int col       = flat_idx % valid_pack_count;
+            const int input_idx = row * input_pack_count + col;
+            input_reg           = ptrs[warp_id][input_idx];
+        }
         *(reinterpret_cast<P*>(&tmp_smem[0]) + threadIdx.x) = input_reg;
         __syncthreads();
         if(warp_id == 0)
@@ -1801,8 +1818,11 @@ __global__ void __launch_bounds__(tnum, 1)
         }
         __syncthreads();
 
-        P rslt                                = *(reinterpret_cast<P*>(&tmp_smem[0]) + lane_id);
-        peer_tmps[warp_id][rank * part + idx] = rslt;
+        if(active)
+        {
+            P rslt = *(reinterpret_cast<P*>(&tmp_smem[0]) + lane_id);
+            peer_tmps[warp_id][rank * part + idx] = rslt;
+        }
     }
 
     // Publish this block's stores. No barrier: peers are woken by the data
@@ -1889,6 +1909,19 @@ inline bool ar_rmsnorm_lamport_enabled()
         return v != nullptr && v[0] == '1';
     }();
     return enabled;
+}
+
+// Tuning knob only: pin the grid instead of deriving it from m and the
+// reduce-scatter width. The two phases pull the grid in opposite directions
+// (phase A wants blocks, the cross-rank barrier gets more expensive with them),
+// so the sweet spot is shape-dependent and worth sweeping without a rebuild.
+inline int ar_rmsnorm_lamport_forced_blocks()
+{
+    static const int blocks = []() {
+        const char* v = std::getenv("AITER_AR_RMSNORM_LAMPORT_BLOCKS");
+        return v != nullptr ? std::atoi(v) : 0;
+    }();
+    return blocks;
 }
 
 // Arm the sentinel for a tmp buffer the first time it is used, and again if a
@@ -4594,18 +4627,29 @@ void dispatchFusedAllReduceRMSNorm(hipStream_t stream,
         {
             lamport_ensure_armed<T>(stream, sg_, rank_, m * lam_packs);
             dim3 lam_block(lam_tnum);
-            // IMPORTANT: this kernel is *persistent-style* -- a block spins on data
-            // produced by other blocks of the same grid.  If the grid is larger than
-            // what fits resident on the device, the unscheduled producer blocks can
-            // never run and the resident consumers spin forever.  So the grid must be
-            // clamped to the co-resident block count for the exact instantiation.
+            // The grid trades two opposing costs. Phase A wants blocks to widen the
+            // reduce-scatter, but start_sync_acqrel costs roughly 0.1us per block
+            // because every block signals every peer, so opening the grid past the
+            // crossover loses more to the barrier than phase A gains. Measured on
+            // MI355X/TP4 at n=7168 the crossover sits near kLamMaxUseful, and below
+            // it one block per token wins; kLamMinBlocks keeps a single-token decode
+            // from running the whole reduce-scatter on one CU.
             //
-            // kMaxBlocks is the harder limit of the two: start_sync_acqrel indexes
-            // Signal::start/end/_flag by blockIdx.x and those arrays are sized
-            // [kMaxBlocks], so a larger grid corrupts the signal region and the
-            // barrier never completes.  Both phases are grid-stride loops, so a
-            // smaller grid only costs throughput.
-            int lam_blocks = std::max(1, std::min(m, kMaxBlocks));
+            // kMaxBlocks is a hard bound rather than a tuning choice: start_sync_acqrel
+            // indexes Signal::start/end/_flag by blockIdx.x and those arrays are
+            // sized [kMaxBlocks], so a larger grid corrupts the signal region and the
+            // barrier never completes. It also keeps the grid below the co-resident
+            // block count, which this persistent-style kernel needs -- a block spins
+            // on data produced by other blocks of the same grid, so an unscheduled
+            // producer block would hang the resident consumers.
+            constexpr int kLamMinBlocks = 4;
+            constexpr int kLamMaxUseful = 64;
+            int lam_blocks =
+                std::min(std::max(m, kLamMinBlocks), std::min(kLamMaxUseful, kMaxBlocks));
+            if(const int forced = ar_rmsnorm_lamport_forced_blocks(); forced > 0)
+            {
+                lam_blocks = std::min(forced, kMaxBlocks);
+            }
 
 #define LAMPORT_LAUNCH(NGPUS, NLOOP, GEMMA)                                        \
     do                                                                             \
