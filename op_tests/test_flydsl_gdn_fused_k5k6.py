@@ -275,8 +275,8 @@ def test_fused_final_state():
 @pytest.mark.parametrize(
     "seq_lens",
     [
-        [613],          # dense, not a multiple of BT=64 → exercises tail masking in K6
-        [512, 613],     # varlen with a ragged tail sequence → exercises causal-column mask
+        [613],  # dense, not a multiple of BT=64 → exercises tail masking in K6
+        [512, 613],  # varlen with a ragged tail sequence → exercises causal-column mask
     ],
 )
 def test_fused_nonaligned(seq_lens):
@@ -304,9 +304,9 @@ def test_fused_nonaligned(seq_lens):
         use_exp2=use_exp2,
     )
     ratio = _rmse_ratio(o_fused, o_ref)
-    assert ratio < _RMSE_TOL, (
-        f"fused nonaligned mismatch: rmse_ratio={ratio:.3e} (seq_lens={seq_lens})"
-    )
+    assert (
+        ratio < _RMSE_TOL
+    ), f"fused nonaligned mismatch: rmse_ratio={ratio:.3e} (seq_lens={seq_lens})"
 
 
 # --------------------------------------------------------------------------- #
