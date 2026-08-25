@@ -521,6 +521,8 @@ def run_flydsl_moe_gfx942(
         raise RuntimeError("Unsupported input for the gfx942 FlyDSL MoE backend")
     if quant_type not in (QuantType.per_Token, QuantType.per_Tensor):
         raise RuntimeError(f"Unsupported quant_type: {quant_type}")
+    if w1_scale is None or w2_scale is None:
+        raise ValueError("FP8 weights require both w1_scale and w2_scale")
 
     activation_str = "swiglu" if activation == ActivationType.Swiglu else "silu"
     problem = _Problem.from_inputs(hidden_states, w1, w2, topk_ids, quant_type)

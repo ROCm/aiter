@@ -23,6 +23,12 @@ from aiter import (
     mxfp4_moe_sort_fwd,
 )
 from aiter import get_hip_quant as get_quant
+from aiter.fused_moe_registry import (
+    BoundFusedMoeImpl,
+    FusedMoeImplResolutionError,
+    FusedMoeRequest,
+    resolve_fused_moe_impl,
+)
 from aiter.jit.core import AITER_CONFIGS, AITER_CSRC_DIR, PY, bd_dir, mp_lock
 from aiter.jit.utils.chip_info import (
     get_cu_num,
@@ -32,12 +38,6 @@ from aiter.jit.utils.chip_info import (
 )
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.flydsl.kernels.mega_moe_gfx1250.types import Stage2ScatterContext
-from aiter.fused_moe_registry import (
-    BoundFusedMoeImpl,
-    FusedMoeImplResolutionError,
-    FusedMoeRequest,
-    resolve_fused_moe_impl,
-)
 
 try:
     from aiter.ops.flydsl.moe_common import GateMode
@@ -923,9 +923,7 @@ def _fused_moe_impl(
     if _metadata_transform is not None:
         metadata = _metadata_transform(metadata)
 
-    selected_block_size_m = (
-        metadata.block_m if block_size_M is None else block_size_M
-    )
+    selected_block_size_m = metadata.block_m if block_size_M is None else block_size_M
     if metadata.full_impl is not None:
         return metadata.full_impl(
             FusedMoeRequest(

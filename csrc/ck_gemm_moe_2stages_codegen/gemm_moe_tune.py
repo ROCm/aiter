@@ -138,7 +138,7 @@ COS_DIFF_THRESHOLD = 1e-1
 # it falls back to the next-best accurate kernel (CK stage1 / FlyDSL / 1-stage).
 # Scoped to the invoking tune only, so other models are unaffected.
 _TUNE_EXCLUDE_KERNEL_PATTERNS = [
-    p
+    p.strip()
     for p in os.environ.get("AITER_FMOE_TUNE_EXCLUDE_KERNELS", "").split(",")
     if p.strip()
 ]
@@ -148,6 +148,8 @@ def _is_tune_excluded_kernel(kernel_name) -> bool:
     """True if ``kernel_name`` matches any excluded-kernel pattern."""
     name = str(kernel_name or "")
     return any(pat in name for pat in _TUNE_EXCLUDE_KERNEL_PATTERNS)
+
+
 def _a16w_sorted_cos(ref, res, msg="", printLog=True):
     """compare_fn for a16w-mix stage1/stage2 in SORTED layout: ref is the sorted bf16
     reference ([max_sorted, inter], padding rows all-zero), res the kernel's sorted
@@ -4835,7 +4837,8 @@ class FmoeTuner(TunerCommon):
                         status = (
                             f"mismatch:err_ratio={err_ratio:.6g}"
                             f"(>{allowed_err_ratio_desc}),"
-                            f"logits_diff={logits_diff:.6g}(>{cos_tol})(>{diag})"
+                            f"logits_diff={logits_diff:.6g}(>{cos_tol}),"
+                            f"diagnostics={diag}"
                         )
                 results.append(
                     {
@@ -5994,9 +5997,7 @@ class FmoeTuner(TunerCommon):
         for i, k in better_kernels.items():
             if k["kernel_name"] is None:
                 continue
-            tune_results.append(
-                [*[k["row"][col] for col in self.keys], *k["results"]]
-            )
+            tune_results.append([*[k["row"][col] for col in self.keys], *k["results"]])
             print(
                 f"{k['name']} {GREEN} {float(k['e2e_us_base']):.3f}us -> {float(k['e2e_us']):.3f}us (err: {k['err_ratio_base']*100:.0f}% -> {k['err_ratio']*100:.0f}%) {END} {k['kernel_name']}"
             )

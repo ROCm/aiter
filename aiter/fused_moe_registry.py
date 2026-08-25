@@ -97,9 +97,7 @@ def resolve_fused_moe_impl(kernel_name: str) -> BoundFusedMoeImpl | None:
         )
     candidate = _IMPLEMENTATIONS.get(name)
     if candidate is None:
-        raise FusedMoeImplResolutionError(
-            f"Unknown fused MoE implementation: {name!r}"
-        )
+        raise FusedMoeImplResolutionError(f"Unknown fused MoE implementation: {name!r}")
     if callable(candidate):
         implementation = candidate
     else:
