@@ -1049,7 +1049,7 @@ def build_flash_attn_fp8_module(
         if is_g0:
             dma_k(fx.Index(0), fx.Index(0))
         else:
-            dma_v(fx.Index(0), fx.Index(MFMA_N * 2))
+            dma_v(fx.Index(0), fx.Index(MFMA_N))
 
         _wait_vmcnt()
         _wait_lgkmcnt()
@@ -1224,7 +1224,7 @@ def build_flash_attn_fp8_module(
                 ## LDS v offs
                 l_voffs = get_lds_voffs(_v_slot(1))
                 ## HBM v offs
-                g_voffs = get_hbm_voffs(BLOCK_N + 2 * MFMA_N)
+                g_voffs = get_hbm_voffs(BLOCK_N + MFMA_N)
                 sB, vwp = do_qk(k_buf_off, preloaded_kw=kvw, v_off=v_buff_off, dma=(v_rsrc, l_voffs, g_voffs))
                 m_frozen = (
                     _rowmax(sB, m_init) if const_expr(USE_FROZEN_MAX) else m_init
@@ -1312,7 +1312,7 @@ def build_flash_attn_fp8_module(
                 # The K DMA's address math belongs to this (VALU) phase; the
                 # buffer_loads themselves are interleaved into do_qk below.
                 l_voffs = get_lds_voffs(v_buff_off)
-                g_voffs = get_hbm_voffs(kv_start + fx.Index(BLOCK_N + 2 * MFMA_N))
+                g_voffs = get_hbm_voffs(kv_start + fx.Index(BLOCK_N + MFMA_N))
 
                 oB, lB, lrB, kw_prime = apply_pv(
                     [oo0, oo1, oo2, oo3],
