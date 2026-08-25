@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Compare Mori EP and MegaMoEV2 with the same v4_pro A8W4 CUDA Graph workload."""
+"""Compare Mori EP and MegaMoE with the same v4_pro CUDA Graph workload."""
 
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ from torch.profiler import ProfilerActivity, profile
 import aiter
 from aiter import dtypes
 from aiter.fused_moe import fused_moe
-from aiter.ops.flydsl.kernels.mega_moe import MegaMoEV2
+from aiter.ops.flydsl.kernels.mega_moe import MegaMoE
 from aiter.ops.flydsl.moe_common import GateMode
 from aiter.ops.shuffle import shuffle_scale_a16w4, shuffle_weight_a16w4
 
@@ -253,7 +253,7 @@ def main():
         local_experts, args.model_dim, args.inter_dim, rank, device
     )
 
-    mega = MegaMoEV2(
+    mega = MegaMoE(
         rank=rank,
         world_size=world,
         model_dim=args.model_dim,

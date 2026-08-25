@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2025 FlyDSL Project Contributors
-"""Fused stage1 with low-ID dispatch producers and oversubscribed FP8xFP4 grouped-GEMM1 consumers."""
+"""Fused Stage1 dispatch with FP8/FP4 activation and FP4-weight GEMM1."""
 
 import functools
 
@@ -25,12 +25,13 @@ from .dispatch import (
 from .gemm1 import _LdsF32View, build_fused_gemm1
 from .gemm_util import _buffer_load, _buffer_store, _make_buffer, _make_buffer_from_addr
 
-_SC0_CACHE = 1
-_BUFFER_OFFSET_ABI_BYTES = 1 << 32
-
 
 def ceildiv(a, b):
     return (a + b - 1) // b
+
+
+_SC0_CACHE = 1
+_BUFFER_OFFSET_ABI_BYTES = 1 << 32
 
 
 def _use_direct_fixed_slot(
@@ -55,15 +56,13 @@ def _validate_dispatch_capacity(
     max_rows = npes * batch_size * topk + experts_per_rank * tile_m
     if not use_tile_resource and max_rows * row_bytes >= _BUFFER_OFFSET_ABI_BYTES:
         raise ValueError(
-            "MegaMoE v2 stage1 payload exceeds the 32-bit buffer-resource ABI"
+            "MegaMoE stage1 payload exceeds the 32-bit buffer-resource ABI"
         )
     if (
         not use_tile_resource
         and max_rows * output_row_bytes >= _BUFFER_OFFSET_ABI_BYTES
     ):
-        raise ValueError(
-            "MegaMoE v2 stage1 output exceeds the 32-bit buffer-resource ABI"
-        )
+        raise ValueError("MegaMoE stage1 output exceeds the 32-bit buffer-resource ABI")
 
 
 # fmt: off
@@ -76,12 +75,13 @@ def compile_mega_moe_stage1(
     async_a_copy: bool = False, use_tile_resource: bool = True,
     waves_per_eu_hint: int = 2, num_cu: int = 256, num_dispatch_cu: int = 32, b_nt: int = -1,
     work_shards: int | None = None, external_grouping: bool | None = None,
-    external_counting: bool | None = None, payload_chunk_rows: int = 0, payload_tile_ready: bool = False,
+    external_counting: bool | None = None, a_dtype: str = "fp8", out_dtype: str = "fp8",
+    payload_chunk_rows: int = 0, payload_tile_ready: bool = False,
     swiglu_limit: float = 0.0,
 ):
     arch = str(get_rocm_arch() or "")
     if not arch.startswith("gfx95"):
-        raise RuntimeError(f"MegaMoE v2 stage1 requires CDNA4 (gfx95x), got {arch or 'unknown'}")
+        raise RuntimeError(f"MegaMoE stage1 requires CDNA4 (gfx95x), got {arch or 'unknown'}")
     NUM_WAVES = int(num_waves)
     assert NUM_WAVES > 1, "planner needs one communication wave and at least one grouping wave"
     assert 1 <= waves_per_eu_hint <= 4
@@ -108,11 +108,11 @@ def compile_mega_moe_stage1(
     M_REPEAT = sort_block_m // 16
     NUM_ACC_N = n_per_wave // 16
     assert NUM_ACC_N % 2 == 0 and M_REPEAT % 2 == 0
+    assert a_dtype in ("fp4", "fp8")
+    assert out_dtype in ("fp4", "fp8")
 
-    TILE_K_BYTES = tile_k // 2
-    assert TILE_K_BYTES % 128 == 0
-    A_K_STEP_BYTES = tile_k
-    assert A_K_STEP_BYTES == 256, "MegaMoE v2 GEMM1 requires tile_k=256"
+    assert tile_k == 256, "MegaMoE GEMM1 requires tile_k=256"
+    A_K_STEP_BYTES = tile_k // (2 if a_dtype == "fp4" else 1)
     K_ITERS = model_dim // tile_k
     TOTAL_THREADS = NUM_WAVES * 64
     WORK_SHARDS = 4 if work_shards is None and int(fuse_mtpr) >= 8192 else 8
@@ -130,9 +130,9 @@ def compile_mega_moe_stage1(
     fz_npes, fz_epr, fz_k = int(fuse_npes), int(experts_per_rank), int(fuse_topk)
     fz_cap, fz_mtpr, fz_rank = int(fuse_cap), int(fuse_mtpr), int(rank)
     if fz_npes * fz_mtpr > 1 << 24:
-        raise ValueError("MegaMoE v2 source-token encoding exceeds 24 bits")
+        raise ValueError("MegaMoE source-token encoding exceeds 24 bits")
     if fz_k > 1 << 8:
-        raise ValueError("MegaMoE v2 top-k slot encoding exceeds 8 bits")
+        raise ValueError("MegaMoE top-k slot encoding exceeds 8 bits")
     if external_grouping is None:
         external_grouping = fz_mtpr >= 2048 and fz_npes == 8 and fz_epr == 48
     if external_counting is None:
@@ -146,7 +146,10 @@ def compile_mega_moe_stage1(
     fz_total_experts = fz_npes * fz_epr
     # Small batches stream B; large batches cache it across M tiles.
     b_cache_modifier = int(b_nt) if int(b_nt) >= 0 else (3 if fz_mtpr <= 512 else 0)
-    fz_n_i32, fz_nbytes = model_dim // 4, model_dim
+    a_pack = 2 if a_dtype == "fp4" else 1
+    out_pack = 2 if out_dtype == "fp4" else 1
+    fz_nbytes = model_dim // a_pack
+    fz_n_i32 = fz_nbytes // 4
     fz_scale_bytes = int(fuse_scale_dim)
     fz_scale_n_i32 = (fz_scale_bytes + 3) // 4 if fz_scale_bytes > 0 else 0
     if direct_fixed_slot and fz_scale_n_i32 > 64:
@@ -154,7 +157,7 @@ def compile_mega_moe_stage1(
     fz_enable_scales = fz_scale_bytes > 0
     fz_safe_end_i32 = (fz_n_i32 // 512) * 512
     _validate_dispatch_capacity(
-        fz_mtpr, fz_npes, fz_epr, fz_k, fz_tile_m, fz_nbytes, inter_dim, use_tile_resource
+        fz_mtpr, fz_npes, fz_epr, fz_k, fz_tile_m, fz_nbytes, inter_dim // out_pack, use_tile_resource
     )
 
     @fx.struct
@@ -166,6 +169,7 @@ def compile_mega_moe_stage1(
     swiglu_suffix = "" if swiglu_limit <= 0 else f"_sl{str(float(swiglu_limit)).replace('.', 'p')}"
     kernel_name = (
         f"megamoe_stage1_{dispatch_path}_t{sort_block_m}x{tile_n}x{tile_k}"
+        f"_a{a_dtype}o{out_dtype}"
         f"_w{NUM_WAVES}_gm{grid_mult}"
         f"_dcu{dispatch_blocks}_pw{int(pipe_weights)}ma{int(mfma_amajor)}sw{int(swizzle_a)}"
         f"aa{int(async_a_copy)}"
@@ -375,8 +379,13 @@ def compile_mega_moe_stage1(
         if const_expr(use_tile_resource):
             out_rsrc = None
         else:
-            out_nbytes = tokens * fx.Int32(inter_dim)
-            out_rsrc = _make_buffer(out, fx.Int16, max_size=False, num_records_bytes=out_nbytes)
+            out_nbytes = tokens * fx.Int32(inter_dim // out_pack)
+            out_rsrc = _make_buffer(
+                out,
+                fx.Int8 if out_dtype == "fp4" else fx.Int16,
+                max_size=False,
+                num_records_bytes=out_nbytes,
+            )
         os_rsrc = _make_buffer(out_scale, fx.Int8, max_size=False, num_records_bytes=os_nbytes)
 
         expert_of_flat, _do_scheduled_tile = build_fused_gemm1(
@@ -391,6 +400,7 @@ def compile_mega_moe_stage1(
             n_tiles=N_TILES, expert_offset=fz_rank * fz_epr, b_cache_modifier=b_cache_modifier,
             swizzle_a=swizzle_a, pipe_weights=pipe_weights, mfma_amajor=mfma_amajor,
             async_a_copy=async_a_copy, use_tile_resource=use_tile_resource,
+            a_dtype=a_dtype, out_dtype=out_dtype,
             swiglu_limit=swiglu_limit,
         )
 
@@ -480,7 +490,8 @@ def run_mega_moe_stage1(out, x, w, scale_x, scale_w, sorted_token_ids, expert_id
     mfma_amajor=False, swizzle_a=True, async_a_copy=False, num_dispatch_cu=32,
     use_tile_resource=True, waves_per_eu_hint=2,
     b_nt=-1, work_shards=None, external_grouping=None, external_counting=None,
-    payload_chunk_rows=0, payload_tile_ready=False, swiglu_limit=0.0):
+    a_dtype="fp8", out_dtype="fp8", payload_chunk_rows=0, payload_tile_ready=False,
+    swiglu_limit=0.0):
     launch = compile_mega_moe_stage1(
         model_dim=model_dim, inter_dim=inter_dim, rank=rank, experts_per_rank=experts_per_rank,
         fuse_npes=fuse_npes, fuse_topk=fuse_topk, fuse_cap=fuse_cap, fuse_mtpr=fuse_mtpr,
@@ -490,7 +501,8 @@ def run_mega_moe_stage1(out, x, w, scale_x, scale_w, sorted_token_ids, expert_id
         async_a_copy=async_a_copy, use_tile_resource=use_tile_resource,
         waves_per_eu_hint=waves_per_eu_hint, num_cu=num_cu, num_dispatch_cu=num_dispatch_cu,
         b_nt=b_nt, work_shards=work_shards, external_grouping=external_grouping,
-        external_counting=external_counting, payload_chunk_rows=payload_chunk_rows,
+        external_counting=external_counting, a_dtype=a_dtype, out_dtype=out_dtype,
+        payload_chunk_rows=payload_chunk_rows,
         payload_tile_ready=payload_tile_ready,
         swiglu_limit=swiglu_limit,
     )
