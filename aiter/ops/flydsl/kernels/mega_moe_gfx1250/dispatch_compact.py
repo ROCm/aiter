@@ -562,6 +562,8 @@ def emit_compact_payload(
         raise ValueError("payload_bytes and scale_bytes must be positive")
     if scale_bytes % 4:
         raise ValueError("scale_bytes must be dword aligned")
+    if wire_stride % 4 or payload_bytes % 4:
+        raise ValueError("wire_stride and payload_bytes must be dword aligned")
     if wmma_rep <= 0 or tile_m % (wmma_rep * 16):
         raise ValueError("tile_m must be divisible by wmma_rep*16")
     if pipe_depth not in (1, 2):
@@ -651,44 +653,51 @@ def emit_compact_payload(
         # finalize used, so each expert is GEMM-readable as soon as its
         # ``payload_ready`` counter reaches ``npes``.
         dst_scale = _peer(window, destination, arena_offset, grouped_scale_offset)
-        for mx in range_constexpr(0, scale_bytes, WAVE):
-            mx_block = fx.Int32(mx) + lane
-            if mx_block < fx.Int32(scale_bytes):
+        # Move the e8m0 scales one dword per lane, not one byte.  The scales are
+        # dword-aligned (scale_bytes % 4 == 0) and, in the WMMA-interleaved
+        # layout, the four bytes of one source dword share a destination dword
+        # (``_scale_row_dword_base`` addresses dwords, and consecutive bytes only
+        # differ in ``byte_in_dword``), so a whole dword lands with a single
+        # store.  The wire read stays coalesced across lanes and the destination
+        # store count drops 4x -- that store count is the bulk of the fused
+        # producer's non-payload cost.
+        scale_dwords = scale_bytes // 4
+        wire_scale_dw_base = fx.Int32(source_token) * fx.Int32(wire_stride // 4) + fx.Int32(
+            payload_bytes // 4
+        )
+        for dw in range_constexpr(0, scale_dwords, WAVE):
+            dword = fx.Int32(dw) + lane
+            if dword < fx.Int32(scale_dwords):
                 value = buffer_ops.buffer_load(
                     _rsrc(fx.Int64(addr_in_wire)),
-                    fx.Int32(source_token) * fx.Int32(wire_stride)
-                    + fx.Int32(payload_bytes)
-                    + mx_block,
+                    wire_scale_dw_base + dword,
                     vec_width=1,
-                    dtype=T.i8,
+                    dtype=T.i32,
                 )
                 if const_expr(scale_rowmajor):
                     # Row-major coalesced: grouped row r's e8m0 scales are a
                     # contiguous ``scale_bytes`` run at ``r*scale_bytes``.
-                    # Consecutive lanes write consecutive bytes, so each wave step
-                    # is one coalesced remote burst instead of ``scale_bytes``
-                    # scattered single-byte peer stores.  The GEMM strided-reads
+                    # Consecutive lanes write consecutive dwords, so each wave
+                    # step is one coalesced remote burst.  The GEMM strided-reads
                     # element ``r*(scale_bytes//4)+k128`` back, so this lands
-                    # byte-for-byte where the WMMA-interleaved LDS load expects it.
+                    # where the WMMA-interleaved LDS load expects it.
                     buffer_ops.buffer_store(
                         value,
                         _rsrc(dst_scale),
-                        destination_row * fx.Int32(scale_bytes) + mx_block,
+                        destination_row * fx.Int32(scale_dwords) + dword,
                     )
                 else:
-                    scale_dword = fx.Uint32(mx_block) // fx.Uint32(4)
-                    byte_in_dword = mx_block - fx.Int32(scale_dword) * fx.Int32(4)
                     row_base = _scale_row_dword_base(
                         fx.Uint32(destination_row),
                         c_rows_per_tile=fx.Int32(rows_per_tile),
                         c_dst_scale_dwords_per_row=fx.Int32(dst_scale_dwords_per_row),
                         c16_i32=fx.Int32(16),
                     )
-                    dst_dword = row_base + scale_dword * fx.Uint32(rows_per_tile)
+                    dst_dword = row_base + fx.Uint32(dword) * fx.Uint32(rows_per_tile)
                     buffer_ops.buffer_store(
                         value,
                         _rsrc(dst_scale),
-                        fx.Int32(dst_dword) * fx.Int32(4) + byte_in_dword,
+                        fx.Int32(dst_dword),
                     )
         if lane == fx.Int32(0):
             weight = buffer_ops.buffer_load(
