@@ -1002,7 +1002,10 @@ jobs:
           -w /workspace \
           aiter_test \
           bash -lc "
+            set -euo pipefail
             pip uninstall -y amd-aiter aiter || true
+            apt-get update
+            DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends libgrpc++1.51t64
             pip install -r requirements.txt
             pip install --upgrade pandas pyzmq einops numpy==1.26.2
             pip install --upgrade 'pybind11>=3.0.1'
