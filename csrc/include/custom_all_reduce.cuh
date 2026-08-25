@@ -1981,6 +1981,21 @@ inline int ar_rmsnorm_lamport_arm_repeat()
     return n;
 }
 
+// Smallest message this path is allowed to take, in bytes of one rank's input.
+// 448 KB is where the measured crossover against the one-shot kernel sits at
+// TP=4 / n=7168 / bf16: 13.40 -> 14.63 us at 448 KB (m=32), 22.44 -> 19.47 us
+// at 896 KB (m=64).
+inline size_t ar_rmsnorm_lamport_min_bytes()
+{
+    static const size_t bytes = []() -> size_t {
+        const char* v = std::getenv("AITER_AR_RMSNORM_LAMPORT_MIN_BYTES");
+        if(v == nullptr) return static_cast<size_t>(448) * 1024;
+        const long long parsed = std::atoll(v);
+        return parsed > 0 ? static_cast<size_t>(parsed) : 0;
+    }();
+    return bytes;
+}
+
 // Arm the sentinel for a tmp buffer the first time it is used, and again if a
 // later call needs a larger region than has ever been armed. Steady state costs
 // nothing: the consumer re-arms every pack it reads.
@@ -4683,7 +4698,15 @@ void dispatchFusedAllReduceRMSNorm(hipStream_t stream,
         constexpr int lam_tnum = 512;
         const int lam_packs    = n / pack_size;
         const int lam_n_loop   = (lam_packs + lam_tnum - 1) / lam_tnum;
-        const bool lam_ok      = (n % pack_size == 0) && (lam_packs >= 64) &&
+        // Size floor, independent of the caller's use_1stage. !use_1stage alone is
+        // not enough: callers disagree on where that threshold sits (aiter's own
+        // communicator uses 128*7168*2/world_size = 448 KB at TP=4, sglang uses a
+        // flat 128 KB), and below the crossover this path loses to the one-shot
+        // kernel by up to 52%. Gate on the measured number so the behaviour is the
+        // same whoever calls in.
+        const size_t lam_bytes = static_cast<size_t>(m) * n * sizeof(T);
+        const bool lam_ok      = (lam_bytes >= ar_rmsnorm_lamport_min_bytes()) &&
+                            (n % pack_size == 0) && (lam_packs >= 64) &&
                             (lam_n_loop >= 1 && lam_n_loop <= 4) &&
                             ((m * lam_packs) % world_size_ == 0) &&
                             (world_size_ == 2 || world_size_ == 4 || world_size_ == 8);
