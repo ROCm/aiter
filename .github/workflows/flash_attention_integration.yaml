@@ -13,6 +13,7 @@ on:
       - 'setup.py'
       - 'aiter/__init__.py'
       - '.github/workflows/flash_attention_integration.yaml'
+      - '.github/workflows/ci-config.yaml'
   pull_request:
     branches: [main]
     paths:
@@ -25,6 +26,7 @@ on:
       - 'setup.py'
       - 'aiter/__init__.py'
       - '.github/workflows/flash_attention_integration.yaml'
+      - '.github/workflows/ci-config.yaml'
   workflow_dispatch:
 
 concurrency:
@@ -35,12 +37,14 @@ env:
   # Keep on upstream (Dao-AILab) main; do not re-point at a personal fork/branch.
   FA_BRANCH: main
   FA_REPOSITORY_URL: https://github.com/Dao-AILab/flash-attention.git
-  BASE_IMAGE: rocm/pytorch:latest
   AITER_SUBMODULE_PATH: third_party/aiter
   DOCKER_PULL_MAX_ATTEMPTS: "3"
   DOCKER_PULL_RETRY_DELAY_SECONDS: "10"
 
 jobs:
+  ci_config:
+    uses: ./.github/workflows/ci-config.yaml
+
   check-signal:
     runs-on: ubuntu-latest
     steps:
@@ -74,6 +78,7 @@ jobs:
               - 'setup.py'
               - 'aiter/__init__.py'
               - '.github/workflows/flash_attention_integration.yaml'
+              - '.github/workflows/ci-config.yaml'
             triton:
               - 'aiter/ops/triton/_triton_kernels/flash_attn_triton_amd/**'
               - 'aiter/ops/triton/attention/mha_v3.py'
@@ -103,8 +108,10 @@ jobs:
   flash_attention_triton:
     if: ${{ needs.prechecks.outputs.run_triton == 'true' }}
     name: Flash Attention - Triton / ${{ matrix.label }} (1 GPU)
-    needs: [check-signal, prechecks]
+    needs: [check-signal, prechecks, ci_config]
     runs-on: ${{ matrix.runner }}
+    env:
+      BASE_IMAGE: ${{ needs.ci_config.outputs.pytorch_py312_image }}
     strategy:
       fail-fast: false
       matrix:
@@ -126,10 +133,11 @@ jobs:
       - name: Docker login
         if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork }}
         env:
-          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+          DOCKER_USERNAME: ${{ secrets[needs.ci_config.outputs.docker_username_secret] }}
+          DOCKER_PASSWORD: ${{ secrets[needs.ci_config.outputs.docker_password_secret] }}
         run: |
           for attempt in 1 2 3; do
-            if echo "$DOCKER_PASSWORD" | docker login -u rocmshared --password-stdin; then
+            if echo "$DOCKER_PASSWORD" | docker login -u "$DOCKER_USERNAME" --password-stdin; then
               echo "Docker login succeeded on attempt ${attempt}"
               exit 0
             fi
@@ -457,25 +465,29 @@ jobs:
       - name: Fetch baseline from PR base.sha
         if: steps.current.outputs.found == 'true'
         continue-on-error: true
-        uses: dawidd6/action-download-artifact@v3
+        uses: dawidd6/action-download-artifact@v21
         timeout-minutes: 10
         with:
           workflow: flash_attention_integration.yaml
           commit: ${{ github.event.pull_request.base.sha }}
           name: flash-attention-triton-benchmark-MI35X
           path: /tmp/baseline_pinned/
+          # GHSA-5xr6-xhww-33m4: a fork run's artifact must never become a trusted
+          # baseline. false is v6+'s default, stated so a flip cannot undo it.
+          allow_forks: false
           if_no_artifact_found: warn
 
       - name: Fallback baseline from latest main
         if: steps.current.outputs.found == 'true'
         continue-on-error: true
-        uses: dawidd6/action-download-artifact@v3
+        uses: dawidd6/action-download-artifact@v21
         timeout-minutes: 10
         with:
           workflow: flash_attention_integration.yaml
           branch: main
           name: flash-attention-triton-benchmark-MI35X
           path: /tmp/baseline_main/
+          allow_forks: false
           if_no_artifact_found: warn
 
       - name: Compare
@@ -600,8 +612,10 @@ jobs:
     if: false  # Disabled until CK tests are ready
     # if: ${{ needs.prechecks.outputs.run_ck == 'true' }}
     name: Flash Attention - CK (1 GPU)
-    needs: [check-signal, prechecks]
+    needs: [check-signal, prechecks, ci_config]
     runs-on: linux-aiter-mi35x-1
+    env:
+      BASE_IMAGE: ${{ needs.ci_config.outputs.pytorch_py312_image }}
 
     steps:
       - name: Checkout aiter repo
@@ -613,10 +627,11 @@ jobs:
       - name: Docker login
         if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork }}
         env:
-          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+          DOCKER_USERNAME: ${{ secrets[needs.ci_config.outputs.docker_username_secret] }}
+          DOCKER_PASSWORD: ${{ secrets[needs.ci_config.outputs.docker_password_secret] }}
         run: |
           for attempt in 1 2 3; do
-            if echo "$DOCKER_PASSWORD" | docker login -u rocmshared --password-stdin; then
+            if echo "$DOCKER_PASSWORD" | docker login -u "$DOCKER_USERNAME" --password-stdin; then
               echo "Docker login succeeded on attempt ${attempt}"
               exit 0
             fi
@@ -712,4 +727,3 @@ jobs:
           docker stop fa_ck_test || true
           docker rm -f fa_ck_test || true
           docker rmi fa_ck_test:ci || true
-

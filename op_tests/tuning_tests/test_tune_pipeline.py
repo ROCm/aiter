@@ -286,6 +286,65 @@ class TestTunePipeline(unittest.TestCase):
                 "timeout": 1800,
                 "timeout_mp1": 2400,
             },
+            "gdn_k5_opt": {
+                "script": "csrc/gdn_k5/chunk_gdn_h_opt_tune.py",
+                "header": [
+                    "gfx",
+                    "dtype",
+                    "K",
+                    "V",
+                    "BT",
+                    "H",
+                    "Hg",
+                    "is_varlen",
+                    "use_h0",
+                    "store_fs",
+                ],
+                "shapes": [
+                    (
+                        "gfx942",
+                        "torch.bfloat16",
+                        128,
+                        128,
+                        64,
+                        8,
+                        2,
+                        True,
+                        True,
+                        True,
+                    ),
+                ],
+                "shapes_mp1": [
+                    (
+                        "gfx942",
+                        "torch.bfloat16",
+                        128,
+                        128,
+                        64,
+                        8,
+                        2,
+                        True,
+                        True,
+                        True,
+                    ),
+                ],
+                "keys": [
+                    "gfx",
+                    "H",
+                    "Hg",
+                    "V",
+                    "BV",
+                    "us",
+                    "total_chunks",
+                    "max_seq_chunks",
+                ],
+                "extra_args": [
+                    "--case",
+                    "Qwen3.5-397B-varlen-tp8-bf16snap.*TP8_T8192_mnbt16384",
+                ],
+                "timeout": 900,
+                "timeout_mp1": 900,
+            },
             "csrc_bf16": {
                 "script": "csrc/gemm_a16w16/gemm_a16w16_tune.py",
                 "header": [
@@ -547,6 +606,9 @@ class TestTunePipeline(unittest.TestCase):
 
     def test_gradlib_bf16_mp_default(self):
         self._run_gradlib(mp=None)
+
+    def test_gdn_k5_opt_mp1(self):
+        self._run_one("gdn_k5_opt", mp=1)
 
 
 @unittest.skipUnless(_gpu_available(), "No GPU available")

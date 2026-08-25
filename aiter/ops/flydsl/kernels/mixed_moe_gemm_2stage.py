@@ -7,22 +7,21 @@ import functools
 
 from aiter.ops.flydsl.moe_common import GateMode
 
+# a16w4 (bf16 A x mxfp4 W) SiTUv2 is now served by the ported FlyDSL kernel
+# (aiter/ops/flydsl/kernels/moe_2stage_a16wmix), built via compile_flydsl_moe_stage{1,2}
+# and launched by flydsl_a16w4_gemm{1,2} from the a16w4 branches of
+# _flydsl_moe_stage{1,2}_impl (aiter/ops/flydsl/moe_kernels.py); its old builders were
+# removed from mixed_moe_gemm_2stage_common. The a8w4/mxfp8/a4w4 builders are unchanged.
 from .mixed_moe_gemm_2stage_common import (
-    compile_a16w4_moe_gemm2,
-    compile_mixed_moe_gemm1_a16w4,
     compile_mixed_moe_gemm1_common,
-    compile_mixed_moe_gemm2_a16w4,
     compile_mixed_moe_gemm2_common,
     validate_moe_dtypes,
 )
 
 __all__ = [
     "GateMode",
-    "compile_a16w4_moe_gemm2",
     "compile_mixed_moe_gemm1",
-    "compile_mixed_moe_gemm1_a16w4",
     "compile_mixed_moe_gemm2",
-    "compile_mixed_moe_gemm2_a16w4",
     "validate_moe_dtypes",
 ]
 
@@ -42,8 +41,6 @@ def compile_mixed_moe_gemm1(
     b_dtype: str = "fp4",
     out_dtype: str = "f16",
     act: str = "silu",
-    situ_beta: float = 1.0,
-    situ_linear_beta: float = 1.0,
     use_cshuffle_epilog: bool | None = None,
     enable_bias: bool = False,
     model_dim_pad: int = 0,
@@ -73,8 +70,6 @@ def compile_mixed_moe_gemm1(
         b_dtype=b_dtype,
         out_dtype=out_dtype,
         act=act,
-        situ_beta=situ_beta,
-        situ_linear_beta=situ_linear_beta,
         use_cshuffle_epilog=use_cshuffle_epilog,
         enable_bias=enable_bias,
         model_dim_pad=model_dim_pad,
