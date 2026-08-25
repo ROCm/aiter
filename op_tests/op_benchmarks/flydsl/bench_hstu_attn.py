@@ -5,7 +5,7 @@ import torch
 import triton
 
 from aiter.ops.flydsl import flydsl_hstu_attention_fwd
-from op_tests.flydsl_tests.test_flydsl_hstu_attention import (
+from op_tests.test_flydsl_hstu_attention import (
     generate_hstu_attn_inputs,
 )
 
