@@ -142,6 +142,28 @@ import math as _math
 LOG2E = _math.log2(_math.e)
 
 
+def _exp2_f32(x):
+    """gfx1250 fast exp2; rocdl.exp2 often lowers to v_exp_f32 in the epilogue."""
+    import flydsl.expr as _fx
+
+    return _fx.Float32(
+        llvm_dialect.call_intrinsic(
+            T.f32, "llvm.amdgcn.exp2.f32", [_raw(x)], [], []
+        )
+    )
+
+
+def _rcp_f32(x):
+    """gfx1250 fast reciprocal."""
+    import flydsl.expr as _fx
+
+    return _fx.Float32(
+        llvm_dialect.call_intrinsic(
+            T.f32, "llvm.amdgcn.rcp.f32", [_raw(x)], [], []
+        )
+    )
+
+
 def fmin_f32(a, b):
     """Scalar f32 min (maps to v_min_num_f32)."""
     import flydsl.expr as _fx
@@ -165,12 +187,12 @@ def fused_silu_swiglu_elem(g, u, *, swiglu, limit_f32, neg_limit_f32):
     u = fclamp_f32(u, neg_limit_f32, limit_f32)
     if swiglu:
         nlog2e = _fx.Float32(-1.702 * LOG2E)
-        exp_val = _fx.Float32(rocdl.exp2(T.f32, _raw(g * nlog2e)))
-        sig = _fx.Float32(rocdl.rcp(T.f32, _one + exp_val))
+        exp_val = _exp2_f32(g * nlog2e)
+        sig = _rcp_f32(_one + exp_val)
         return g * sig * (u + _one)
     nlog2e = _fx.Float32(-LOG2E)
-    exp_val = _fx.Float32(rocdl.exp2(T.f32, _raw(g * nlog2e)))
-    sig = _fx.Float32(rocdl.rcp(T.f32, _one + exp_val))
+    exp_val = _exp2_f32(g * nlog2e)
+    sig = _rcp_f32(_one + exp_val)
     return g * sig * u
 
 
@@ -187,8 +209,8 @@ def _tanh_f32(x, tanh_mul):
 
     _one = _fx.Float32(1.0)
     _two = _fx.Float32(2.0)
-    exp_val = _fx.Float32(rocdl.exp2(T.f32, _raw(x * tanh_mul)))
-    rcp_val = _fx.Float32(rocdl.rcp(T.f32, _one + exp_val))
+    exp_val = _exp2_f32(x * tanh_mul)
+    rcp_val = _rcp_f32(_one + exp_val)
     return _two * rcp_val - _one
 
 
@@ -213,9 +235,9 @@ def situv2_consts(beta, linear_beta):
     neg_two_log2e = _fx.Float32(-2.0 * LOG2E)
     return SituV2Consts(
         beta=beta,
-        gate_tanh_mul=neg_two_log2e * _fx.Float32(rocdl.rcp(T.f32, _raw(beta))),
+        gate_tanh_mul=neg_two_log2e * _rcp_f32(beta),
         linear_beta=linear_beta,
-        up_tanh_mul=neg_two_log2e * _fx.Float32(rocdl.rcp(T.f32, _raw(linear_beta))),
+        up_tanh_mul=neg_two_log2e * _rcp_f32(linear_beta),
     )
 
 
@@ -231,8 +253,8 @@ def fused_situv2_elem(g, u, *, consts):
 
     _one = _fx.Float32(1.0)
     nlog2e = _fx.Float32(-LOG2E)
-    exp_val = _fx.Float32(rocdl.exp2(T.f32, _raw(g * nlog2e)))
-    sig = _fx.Float32(rocdl.rcp(T.f32, _one + exp_val))
+    exp_val = _exp2_f32(g * nlog2e)
+    sig = _rcp_f32(_one + exp_val)
     gate_act = consts.beta * _tanh_f32(g, consts.gate_tanh_mul) * sig
     up_act = consts.linear_beta * _tanh_f32(u, consts.up_tanh_mul)
     return gate_act * up_act
@@ -270,7 +292,7 @@ def batched_situv2(pairs, *, consts, range_constexpr):
     rocdl.sched_barrier(0)
     exp_vals = []
     for i in range_constexpr(3 * N):
-        exp_vals.append(_fx.Float32(rocdl.exp2(T.f32, _raw(args[i]))))
+        exp_vals.append(_exp2_f32(args[i]))
     # Stage 2a: 1 + exp
     rocdl.sched_barrier(0)
     sum_vals = []
@@ -280,7 +302,7 @@ def batched_situv2(pairs, *, consts, range_constexpr):
     rocdl.sched_barrier(0)
     rcp_vals = []
     for i in range_constexpr(3 * N):
-        rcp_vals.append(_fx.Float32(rocdl.rcp(T.f32, sum_vals[i])))
+        rcp_vals.append(_rcp_f32(sum_vals[i]))
     # Stage 3: sigmoid / tanh assembly and the final product.
     rocdl.sched_barrier(0)
     results = []
@@ -296,6 +318,11 @@ def batched_situv2(pairs, *, consts, range_constexpr):
 def batched_silu_swiglu(pairs, *, swiglu, limit_f32, neg_limit_f32, range_constexpr):
     """Batched silu/swiglu with pipelined exp2/rcp for better TRANS utilisation.
 
+    Stages clamp, all exp2 args, all exp2s, all (1+exp), all rcps, then the
+    final muls so the TRANS pipe stays busy instead of stalling on each
+    dependent pair in turn.  Uses exp2 (not exp) so sigmoid/silu maps to the
+    gfx1250 fast path.
+
     Args:
         pairs: list of (gate, up) f32 value pairs.
         swiglu: True for swiglu, False for silu.
@@ -310,35 +337,36 @@ def batched_silu_swiglu(pairs, *, swiglu, limit_f32, neg_limit_f32, range_conste
     _one = _fx.Float32(1.0)
     nlog2e = _fx.Float32((-1.702 * LOG2E) if swiglu else (-LOG2E))
     N = len(pairs)
-    # Stage 1: clamp + exp2
-    gs, us, exp_vals = [], [], []
+    # Stage 1: clamp + exp2 argument (kept separate from exp2 for sched_barriers).
+    gs, us, exp_args = [], [], []
     for i in range_constexpr(N):
         g = fmin_f32(pairs[i][0], limit_f32)
         u = fclamp_f32(pairs[i][1], neg_limit_f32, limit_f32)
         gs.append(g)
         us.append(u)
+        exp_args.append(g * nlog2e)
+    # Stage 2: all exp2, then all (1+exp), then all rcp.
     rocdl.sched_barrier(0)
+    exp_vals = []
     for i in range_constexpr(N):
-        exp_val = _fx.Float32(rocdl.exp2(T.f32, _raw(gs[i] * nlog2e)))
-        exp_vals.append(exp_val)
-    # Stage 2a: add 1+exp
+        exp_vals.append(_exp2_f32(exp_args[i]))
     rocdl.sched_barrier(0)
     sum_vals = []
     for i in range_constexpr(N):
         sum_vals.append(_one + exp_vals[i])
-    # Stage 2b: rcp
     rocdl.sched_barrier(0)
     rcp_vals = []
     for i in range_constexpr(N):
-        rcp_vals.append(_fx.Float32(rocdl.rcp(T.f32, sum_vals[i])))
-    # Stage 3: final mul
+        rcp_vals.append(_rcp_f32(sum_vals[i]))
+    # Stage 3: final mul (gate * sigmoid * up[/swiglu term]).
     rocdl.sched_barrier(0)
     results = []
     for i in range_constexpr(N):
+        sig_u = gs[i] * rcp_vals[i]
         if swiglu:
-            results.append(gs[i] * rcp_vals[i] * (us[i] + _one))
+            results.append(sig_u * (us[i] + _one))
         else:
-            results.append(gs[i] * rcp_vals[i] * us[i])
+            results.append(sig_u * us[i])
     return results
 
 

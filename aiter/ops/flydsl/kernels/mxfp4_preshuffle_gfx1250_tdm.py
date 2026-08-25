@@ -26,8 +26,6 @@ from aiter.utility.mx_types import MxDtypeInt as MxDtype
 from .gemm_common_gfx1250 import (
     batched_silu_swiglu,
     batched_situv2,
-    fused_silu_swiglu_elem,
-    fused_situv2_elem,
     make_lds_copy_ops,
     pipeline_fence,
     situv2_consts,
@@ -49,6 +47,8 @@ from .tensor_shim import (
 )
 
 TDM_DESCRIPTOR_VERSION = 1
+# Bump when codegen/scheduling changes must invalidate AOT cache.
+KERNEL_CODEGEN_REV = 5
 PREFETCH_SCOPE_CU = 0
 PREFETCH_SCOPE_SE = 8
 
@@ -164,6 +164,7 @@ def launch_gemm_a8w4_tdm(
         ep_slot_stride_bytes,
         ep_destination_stride,
         ep_world_size,
+        KERNEL_CODEGEN_REV,
     )
     _ = cache_tag
     if enable_ep_scatter:
@@ -1187,17 +1188,40 @@ def launch_gemm_a8w4_tdm(
                         ),
                     )
 
-            accs = []
             output_fragments_per_acc = WMMA_N // 16
-            for idx in range_constexpr(n_acc):
-                acc = Vec(c_frags[idx].load())
-                for fragment in range_constexpr(output_fragments_per_acc):
-                    accs.append(
-                        Vec.from_elements(
-                            [acc[fragment * 8 + i] for i in range_constexpr(8)],
-                            fx.Float32,
-                        ).ir_value()
-                    )
+            # Quant gemm1: acc_rmem for batched activation. Passthrough gemm2:
+            # flat SSA accs avoid an extra rmem store/load roundtrip.
+            if const_expr(stage1_quant_out and stage1_act):
+                acc_rmem = [
+                    [
+                        fx.make_rmem_tensor(8, fx.Float32)
+                        for wn in range_constexpr(output_n_rep)
+                    ]
+                    for wm in range_constexpr(wmma_m_rep)
+                ]
+                for wm in range_constexpr(wmma_m_rep):
+                    for wn in range_constexpr(output_n_rep):
+                        wmma_wn = wn // output_fragments_per_acc
+                        frag = wn % output_fragments_per_acc
+                        idx = wm * wmma_n_rep + wmma_wn
+                        src = Vec(c_frags[idx].load())
+                        acc_rmem[wm][wn].store(
+                            Vec.from_elements(
+                                [src[frag * 8 + i] for i in range_constexpr(8)],
+                                fx.Float32,
+                            )
+                        )
+            else:
+                accs = []
+                for idx in range_constexpr(n_acc):
+                    acc = Vec(c_frags[idx].load())
+                    for fragment in range_constexpr(output_fragments_per_acc):
+                        accs.append(
+                            Vec.from_elements(
+                                [acc[fragment * 8 + i] for i in range_constexpr(8)],
+                                fx.Float32,
+                            ).ir_value()
+                        )
             # The epilogue restages C in this arena. Draining our own tensorcnt
             # suffices: peer multicast loads are pairwise matched with ours.
             pipeline_fence(outstanding=0)
@@ -1251,6 +1275,7 @@ def launch_gemm_a8w4_tdm(
                 N_MX_BLKS = output_n_rep // WN_PER_MX_BLOCK
                 # Total activated elements per wm row = N_MX_BLKS * WN_PER_MX_BLOCK * 4
                 _N_ELEM = N_MX_BLKS * WN_PER_MX_BLOCK * 4
+                _PAIRS_PER_MX = WN_PER_MX_BLOCK * 4
                 for wm in range_constexpr(wmma_m_rep):
                     # A 16-row block entirely past this expert's valid rows has its
                     # output OOB-clamped away, so skip its work. Wave-uniform, so
@@ -1263,34 +1288,36 @@ def launch_gemm_a8w4_tdm(
                         wmma_row = row_in_tile >> 4
                         scale_lane = row_in_tile & 15
 
-                        e8m0_bytes = []
-                        mx_blk_is = []
+                        # One batched activation over all MX blocks in this wm row.
+                        pairs = []
                         for mx_blk in range_constexpr(N_MX_BLKS):
-                            # Gather (gate, up) pairs for this MX block.
-                            pairs = []
                             for sub_wn in range_constexpr(WN_PER_MX_BLOCK):
                                 wn = mx_blk * WN_PER_MX_BLOCK + sub_wn
-                                acc = Vec(accs[wm * output_n_rep + wn])
+                                acc = Vec(acc_rmem[wm][wn].load())
                                 for p in range_constexpr(4):
                                     pairs.append((acc[2 * p], acc[2 * p + 1]))
 
-                            if const_expr(is_situv2):
-                                all_vals = batched_situv2(
-                                    pairs,
-                                    consts=situ_c,
-                                    range_constexpr=range_constexpr,
-                                )
-                            else:
-                                all_vals = batched_silu_swiglu(
-                                    pairs,
-                                    swiglu=is_swiglu,
-                                    limit_f32=f32_swiglu_limit,
-                                    neg_limit_f32=neg_limit,
-                                    range_constexpr=range_constexpr,
-                                )
+                        if const_expr(is_situv2):
+                            all_vals = batched_situv2(
+                                pairs,
+                                consts=situ_c,
+                                range_constexpr=range_constexpr,
+                            )
+                        else:
+                            all_vals = batched_silu_swiglu(
+                                pairs,
+                                swiglu=is_swiglu,
+                                limit_f32=f32_swiglu_limit,
+                                neg_limit_f32=neg_limit,
+                                range_constexpr=range_constexpr,
+                            )
 
+                        for mx_blk in range_constexpr(N_MX_BLKS):
+                            blk_vals = all_vals[
+                                mx_blk * _PAIRS_PER_MX : (mx_blk + 1) * _PAIRS_PER_MX
+                            ]
                             scale_f32, e8m0_byte = emit_amax_e8m0_native_scale(
-                                all_vals,
+                                blk_vals,
                                 wave_size=WAVE,
                                 dtype=(
                                     MxDtype.FP4_E2M1
@@ -1300,13 +1327,13 @@ def launch_gemm_a8w4_tdm(
                             )
                             mx_col = blk_n + wnb + mx_blk * WN_PER_MX_BLOCK * 16
                             mx_blk_i = fx.Int32(mx_col) >> 6
-                            e8m0_bytes.append(e8m0_byte)
-                            mx_blk_is.append(mx_blk_i)
 
                             if const_expr(is_fp4_quant):
                                 for sub_wn in range_constexpr(WN_PER_MX_BLOCK):
                                     wn = mx_blk * WN_PER_MX_BLOCK + sub_wn
-                                    local_vals = all_vals[sub_wn * 4 : sub_wn * 4 + 4]
+                                    local_vals = blk_vals[
+                                        sub_wn * 4 : sub_wn * 4 + 4
+                                    ]
                                     peer_vals = [
                                         fx.Float32(value).shuffle_xor(16, WAVE)
                                         for value in local_vals
@@ -1329,7 +1356,7 @@ def launch_gemm_a8w4_tdm(
                             else:
                                 for half in range_constexpr(WN_PER_MX_BLOCK // 2):
                                     src = Vec.from_elements(
-                                        all_vals[half * 8 : half * 8 + 8],
+                                        blk_vals[half * 8 : half * 8 + 8],
                                         fx.Float32,
                                     )
                                     packed_v2i32 = emit_cvt_scalef32_pk8_fp8_f32(
@@ -1353,11 +1380,10 @@ def launch_gemm_a8w4_tdm(
                                             Vec.from_elements([packed_i32], fx.Int32),
                                         )
 
-                        # Preshuffled e8m0 scale: one branch per wm (not per mx_blk).
-                        if row_rel < mn_oob and is_kgrp0:
-                            for mx_blk in range_constexpr(N_MX_BLKS):
-                                scale_dw = mx_blk_is[mx_blk] >> 2
-                                byte_in_dw = mx_blk_is[mx_blk] & 3
+                            # Preshuffled e8m0 scale: store inline per mx_blk.
+                            if row_rel < mn_oob and is_kgrp0:
+                                scale_dw = mx_blk_i >> 2
+                                byte_in_dw = mx_blk_i & 3
                                 dst_byte = (
                                     (
                                         (scale_tile * q_dst_scale_dwpr + scale_dw)
@@ -1367,7 +1393,7 @@ def launch_gemm_a8w4_tdm(
                                     * 16
                                     + scale_lane
                                 ) * 4 + byte_in_dw
-                                fx.ptr_store(e8m0_bytes[mx_blk], scale_ptr + dst_byte)
+                                fx.ptr_store(e8m0_byte, scale_ptr + dst_byte)
             else:
                 # bf16/f16 activation (or passthrough) -> stage to LDS.
                 if const_expr(has_bias):
@@ -1378,9 +1404,6 @@ def launch_gemm_a8w4_tdm(
                     )
                     bias_map = fx.recast_iter(bias_ptr_type, arg_bias)
                 if const_expr(enable_ep_scatter):
-                    # Route weight per output row (byte 4 of the prefetched 8-byte
-                    # [dst|weight] slot), hoisted out of the wn loop -- alias
-                    # analysis would otherwise re-read it for every wn subtile.
                     _wf_rows = [
                         lds_load_b32(rowmap_lds_idx, (wmb + wm * 16 + lane16) * 8 + 4)[
                             0
@@ -1400,26 +1423,24 @@ def launch_gemm_a8w4_tdm(
                                 )
                             ).to(fx.Float32)
                         if const_expr(stage1_act):
+                            pairs = [
+                                (acc[2 * p], acc[2 * p + 1])
+                                for p in range_constexpr(4)
+                            ]
                             if const_expr(is_situv2):
-                                act_vals = [
-                                    fused_situv2_elem(
-                                        acc[2 * p],
-                                        acc[2 * p + 1],
-                                        consts=situ_c,
-                                    )
-                                    for p in range_constexpr(4)
-                                ]
+                                act_vals = batched_situv2(
+                                    pairs,
+                                    consts=situ_c,
+                                    range_constexpr=range_constexpr,
+                                )
                             else:
-                                act_vals = [
-                                    fused_silu_swiglu_elem(
-                                        acc[2 * p],
-                                        acc[2 * p + 1],
-                                        swiglu=is_swiglu,
-                                        limit_f32=f32_swiglu_limit,
-                                        neg_limit_f32=neg_limit,
-                                    )
-                                    for p in range_constexpr(4)
-                                ]
+                                act_vals = batched_silu_swiglu(
+                                    pairs,
+                                    swiglu=is_swiglu,
+                                    limit_f32=f32_swiglu_limit,
+                                    neg_limit_f32=neg_limit,
+                                    range_constexpr=range_constexpr,
+                                )
                             hv = Vec.from_elements(act_vals, fx.Float32).to(oc)
                             lds_store_b64(
                                 stC_idx,
@@ -1428,8 +1449,6 @@ def launch_gemm_a8w4_tdm(
                             )
                         else:
                             if const_expr(enable_ep_scatter):
-                                # Weight the row BEFORE truncating to bf16; the
-                                # combine kernel does an unweighted sum.
                                 _wf = _wf_rows[wm]
                                 hv = Vec.from_elements(
                                     [acc[i] * _wf for i in range_constexpr(8)],
