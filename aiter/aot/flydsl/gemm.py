@@ -16,11 +16,8 @@ Supported kernel families:
   - ``flydsl_bpreshuffle_8w_*``               gfx950 8-wave a8w8 ptpc GEMM kernels
   - ``flydsl_bpreshuffle_wmma_*``             gfx1250 a8w8 ptpc GEMM kernels
   - ``flydsl_mxfp8_128_bpreshuffle_wmma_*``   gfx1250 mxfp8_128 GEMM kernels
-<<<<<<< HEAD
   - ``flydsl_decode_*``                       exact-shape BF16 decode GEMM kernels
-=======
   - ``flydsl_mxfp8_128_bpreshuffle_compute_wmma_*`` gfx1250 compute-bound mxfp8_128 kernels
->>>>>>> main
 
 Usage:
     # Compile all unique FlyDSL GEMM kernels from default CSVs
@@ -539,21 +536,12 @@ def _compile_mxfp8_128_wmma_to_cache(
     stream = fx.Stream(0)
 
     with compile_only_env():
-<<<<<<< HEAD
-        launch_gemm_a8w8(
-            ptr_arg(out),
-            ptr_arg(xq),
-            ptr_arg(wq),
-            ptr_arg(a_scale),
-            ptr_arg(b_scale),
-=======
         launch_args = (
             _ptr_view_safe(out),
             _ptr_view_safe(xq),
             _ptr_view_safe(wq),
             _ptr_view_safe(a_scale),
             _ptr_view_safe(b_scale),
->>>>>>> main
             m,
             stream,
             n,
