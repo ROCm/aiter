@@ -1,16 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2025 FlyDSL Project Contributors
-"""GEMM1 compute shared by fused MegaMoE v2 stage1 and its standalone interface."""
+"""GEMM1 compute shared by fused MegaMoE stage1 and its standalone interface."""
 
 import functools
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-import torch
 from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr.typing import Vector as Vec
 
-from ..tensor_shim import _run_compiled, ptr_buf_tensor
+from ..tensor_shim import _run_compiled
 from .gemm_util import (
     _PACK,
     AS2RLoader,
@@ -21,6 +20,8 @@ from .gemm_util import (
     MfmaScaleGU,
     SiluQuantEpilogue,
     TileScheduler,
+    _buffer_load,
+    _make_buffer,
     wait_lds_barrier,
 )
 
@@ -34,7 +35,7 @@ class _LdsF32View:
 @flyc.jit
 def do_tile(m_tile, n_tile_base, expert, sched, a_gather, a_s2r, b_loader, b_scale, a_scale, mfma, epi, a_buf,
     a_scale_lds, a_lds_i32, K_ITERS, M_REPEAT, NUM_ACC_N, A_K_STEP_BYTES, pipe_weights,
-    mfma_amajor, async_a_copy, trb_rsrc, tib_rsrc, indirect_input):
+    mfma_amajor, async_a_copy, trb_rsrc):
 # fmt: on
     N_ACC = M_REPEAT * NUM_ACC_N
     NUM_B_SCALE = NUM_ACC_N // _PACK
@@ -44,12 +45,9 @@ def do_tile(m_tile, n_tile_base, expert, sched, a_gather, a_s2r, b_loader, b_sca
     )
     SB_STATE_END = B_STATE_END + NUM_B_SCALE
     last = fx.Int32(K_ITERS - 1)
-    tile_row_base = trb_rsrc[m_tile]
-    tile_input_base = tile_row_base
-    if const_expr(indirect_input):
-        tile_input_base = tib_rsrc[m_tile]
+    tile_row_base = _buffer_load(trb_rsrc, m_tile, fx.Int32)
     b_row = sched.gate_base_row(expert) + n_tile_base
-    a_gather.for_tile(tile_input_base)
+    a_gather.for_tile(tile_row_base)
     if const_expr(pipe_weights):
         if const_expr(async_a_copy):
             a_gather.prefetch_to_lds(
@@ -63,7 +61,7 @@ def do_tile(m_tile, n_tile_base, expert, sched, a_gather, a_s2r, b_loader, b_sca
                 a_gather.load_regs(fx.Int32(0)),
                 fx.Int32(0),
             )
-        a_scale.stage(a_scale_lds, tile_input_base)
+        a_scale.stage(a_scale_lds, tile_row_base)
         wait_lds_barrier(0 if async_a_copy else 63)
         b0 = b_loader.load_step(b_row, fx.Int32(0))
         init = [mfma.zero_value for _ in range(N_ACC)]
@@ -216,7 +214,7 @@ def do_tile(m_tile, n_tile_base, expert, sched, a_gather, a_s2r, b_loader, b_sca
                 a_gather.load_regs(fx.Int32(0)),
                 fx.Int32(0),
             )
-        a_scale.stage(a_scale_lds, tile_input_base)
+        a_scale.stage(a_scale_lds, tile_row_base)
         wait_lds_barrier(0 if async_a_copy else 63)
         init = [mfma.zero_value for _ in range(N_ACC)]
         for sp_i, state in range(0, K_ITERS, 1, init=init):
@@ -268,12 +266,11 @@ def do_tile(m_tile, n_tile_base, expert, sched, a_gather, a_s2r, b_loader, b_sca
 
 # fmt: off
 def build_fused_gemm1(*, x_tensor, w_rsrc, sw_rsrc, sx_rsrc,
-    out_rsrc, os_rsrc, trb_rsrc, tib_rsrc, expert_rsrc, out_tensor, a_buf, a_scale_lds, c_tile,
+    out_rsrc, os_rsrc, trb_rsrc, expert_rsrc, out_tensor, a_buf, a_scale_lds, c_tile,
     model_dim, inter_dim, sort_block_m, tile_n, num_waves, n_per_wave, wave_id,
     m_repeat, num_acc_n, a_k_step_bytes, total_threads, k_iters, a_lds_i32, n_tiles,
     expert_offset, b_cache_modifier, swizzle_a, pipe_weights, mfma_amajor, async_a_copy,
-    use_tile_resource, indirect_input, indexed_input=False, row_map_rsrc=None,
-    source_rows=0, swiglu_limit=0.0):
+    use_tile_resource, a_dtype="fp8", out_dtype="fp8", swiglu_limit=0.0):
     # fmt: on
     """Build the GEMM1 atoms and return its expert resolver and tile runner."""
     sched = TileScheduler(
@@ -284,13 +281,12 @@ def build_fused_gemm1(*, x_tensor, w_rsrc, sw_rsrc, sx_rsrc,
     n_wave_base = wave_id * fx.Int32(n_per_wave)
 
     # fmt: off
-    a_gather = ATileLoader(row_bytes=model_dim, sort_block_m=sort_block_m,
+    a_pack = 2 if a_dtype == "fp4" else 1
+    a_gather = ATileLoader(row_bytes=model_dim // a_pack, sort_block_m=sort_block_m,
         k_step_bytes=a_k_step_bytes, total_threads=total_threads, swizzle=swizzle_a,
-        x_tensor=x_tensor, async_copy=async_a_copy,
-        indexed_input=indexed_input, row_map_rsrc=row_map_rsrc,
-        source_rows=source_rows)
+        x_tensor=x_tensor, async_copy=async_a_copy, a_dtype=a_dtype)
     # fmt: on
-    a_s2r = AS2RLoader(k_step_bytes=a_k_step_bytes, swizzle=swizzle_a)
+    a_s2r = AS2RLoader(k_step_bytes=a_k_step_bytes, swizzle=swizzle_a, a_dtype=a_dtype)
     b_loader = BWeightLoader(
         w_rsrc=w_rsrc,
         num_acc_n=num_acc_n,
@@ -304,15 +300,13 @@ def build_fused_gemm1(*, x_tensor, w_rsrc, sw_rsrc, sx_rsrc,
         model_dim=model_dim,
         sort_block_m=sort_block_m,
         total_threads=total_threads,
-        indexed_input=indexed_input,
-        row_map_rsrc=row_map_rsrc,
     )
-    mfma = MfmaScaleGU(m_repeat=m_repeat, num_acc_n=num_acc_n)
+    mfma = MfmaScaleGU(m_repeat=m_repeat, num_acc_n=num_acc_n, a_dtype=a_dtype)
     # fmt: off
     epi = SiluQuantEpilogue(out_rsrc=out_rsrc, out_scale_rsrc=os_rsrc, sorted_rsrc=trb_rsrc, tokens=0,
         inter_dim=inter_dim, m_repeat=m_repeat, num_acc_n=num_acc_n, sort_block_m=sort_block_m, tile_n=tile_n,
         num_waves=num_waves, lds_out=c_tile, swiglu_limit=swiglu_limit, always_valid=True,
-        out_tensor=out_tensor if use_tile_resource else None)
+        out_tensor=out_tensor if use_tile_resource else None, out_dtype=out_dtype)
     # fmt: on
 
     def _decode(flat):
@@ -333,7 +327,7 @@ def build_fused_gemm1(*, x_tensor, w_rsrc, sw_rsrc, sx_rsrc,
             a_s2r, b_loader, b_scale, a_scale, mfma, epi, a_buf,
             a_scale_lds, a_lds_i32, k_iters, m_repeat, num_acc_n,
             a_k_step_bytes, pipe_weights, mfma_amajor, async_a_copy,
-            trb_rsrc, tib_rsrc, indirect_input)
+            trb_rsrc)
         # fmt: on
 
     return expert_of_flat, do_scheduled_tile
@@ -346,7 +340,7 @@ def compile_gemm1(
     tile_n: int = 256, tile_k: int = 256, num_waves: int = 4, pipe_weights: bool = True,
     mfma_amajor: bool = False, swizzle_a: bool = True, async_a_copy: bool = False,
     use_tile_resource: bool = True, waves_per_eu_hint: int = 2, b_cache_modifier: int = 0,
-    swiglu_limit: float = 0.0,
+    a_dtype: str = "fp8", out_dtype: str = "fp8", swiglu_limit: float = 0.0,
 ):
     # fmt: on
     """Compile standalone group GEMM1 from the fused Stage1 compute body."""
@@ -356,6 +350,8 @@ def compile_gemm1(
     assert tile_n % num_waves == 0
     assert (2 * inter_dim) % tile_n == 0
     assert tile_k == 256 and model_dim % tile_k == 0
+    assert a_dtype in ("fp4", "fp8")
+    assert out_dtype in ("fp4", "fp8")
 
     n_per_wave = tile_n // num_waves
     n_tiles = (2 * inter_dim) // tile_n
@@ -363,7 +359,8 @@ def compile_gemm1(
     num_acc_n = n_per_wave // 16
     assert num_acc_n % 2 == 0 and m_repeat % 2 == 0
 
-    a_k_step_bytes = tile_k
+    a_k_step_bytes = tile_k // (2 if a_dtype == "fp4" else 1)
+    out_row_bytes = inter_dim // (2 if out_dtype == "fp4" else 1)
     k_iters = model_dim // tile_k
     total_threads = num_waves * 64
     a_lds_size = sort_block_m * a_k_step_bytes
@@ -388,23 +385,25 @@ def compile_gemm1(
         a_scale_lds = lds.A_scale
         c_tile = _LdsF32View(fx.recast_iter(fx.Float32, lds.pool.ptr))
 
-        w_rsrc = ptr_buf_tensor(fx.get_iter(w), fx.Int32, unit_elems=4)
-        sx_rsrc = ptr_buf_tensor(fx.get_iter(scale_x), fx.Int32, unit_elems=4)
-        sw_rsrc = ptr_buf_tensor(fx.get_iter(scale_w), fx.Int32)
-        trb_rsrc = ptr_buf_tensor(fx.get_iter(tile_row_base), fx.Int32)
-        expert_rsrc = ptr_buf_tensor(fx.get_iter(expert_ids), fx.Int32)
+        w_rsrc = _make_buffer(w, fx.Int32, 4)
+        sx_rsrc = _make_buffer(scale_x, fx.Int32, 4)
+        sw_rsrc = _make_buffer(scale_w, fx.Int32)
+        trb_rsrc = _make_buffer(tile_row_base, fx.Int32)
+        expert_rsrc = _make_buffer(expert_ids, fx.Int32)
         if const_expr(use_tile_resource):
             out_rsrc = None
         else:
-            out_rsrc = ptr_buf_tensor(
-                fx.get_iter(out),
-                fx.Int16,
-                num_records_bytes=num_valid * fx.Int32(inter_dim),
+            out_rsrc = _make_buffer(
+                out,
+                fx.Int8 if out_dtype == "fp4" else fx.Int16,
+                max_size=False,
+                num_records_bytes=num_valid * fx.Int32(out_row_bytes),
             )
         scale_cols = (inter_dim // 32 + 7) // 8 * 8
-        os_rsrc = ptr_buf_tensor(
-            fx.get_iter(out_scale),
+        os_rsrc = _make_buffer(
+            out_scale,
             fx.Int8,
+            max_size=False,
             num_records_bytes=num_valid * fx.Int32(scale_cols) + fx.Int32(8192),
         )
         wave_id = fx.thread_idx.x // 64
@@ -412,7 +411,6 @@ def compile_gemm1(
         _, run_tile = build_fused_gemm1(
             x_tensor=x, w_rsrc=w_rsrc, sw_rsrc=sw_rsrc,
             sx_rsrc=sx_rsrc, out_rsrc=out_rsrc, os_rsrc=os_rsrc, trb_rsrc=trb_rsrc,
-            tib_rsrc=trb_rsrc,
             expert_rsrc=expert_rsrc, out_tensor=out, a_buf=a_buf,
             a_scale_lds=a_scale_lds, c_tile=c_tile, model_dim=model_dim, inter_dim=inter_dim,
             sort_block_m=sort_block_m, tile_n=tile_n, num_waves=num_waves, n_per_wave=n_per_wave,
@@ -420,7 +418,7 @@ def compile_gemm1(
             total_threads=total_threads, k_iters=k_iters, a_lds_i32=a_lds_i32, n_tiles=n_tiles,
             expert_offset=expert_offset, b_cache_modifier=b_cache_modifier, swizzle_a=swizzle_a,
             pipe_weights=pipe_weights, mfma_amajor=mfma_amajor, async_a_copy=async_a_copy,
-            use_tile_resource=use_tile_resource, indirect_input=False,
+            use_tile_resource=use_tile_resource, a_dtype=a_dtype, out_dtype=out_dtype,
             swiglu_limit=swiglu_limit,
         )
         total_work = (num_valid // fx.Int32(sort_block_m)) * fx.Int32(n_tiles)
@@ -451,10 +449,11 @@ def gemm1_kernel(
     tile_n: int = 256, tile_k: int = 256, num_waves: int = 4, grid_mult: int = 4,
     pipe_weights: bool = True, mfma_amajor: bool = False, swizzle_a: bool = True,
     async_a_copy: bool = False, use_tile_resource: bool = True, waves_per_eu_hint: int = 2,
-    num_cu: int = 256, b_cache_modifier: int = 0, swiglu_limit: float = 0.0,
+    num_cu: int = 256, b_cache_modifier: int = 0, a_dtype: str = "fp8", out_dtype: str = "fp8",
+    swiglu_limit: float = 0.0,
 ):
     # fmt: on
-    """Run standalone MegaMoEV2 group GEMM1 and return ``(out, out_scale)``."""
+    """Run standalone MegaMoE group GEMM1 and return ``(out, out_scale)``."""
     num_valid = int(num_valid)
     if num_valid < 0 or num_valid % int(sort_block_m):
         raise ValueError("num_valid must be a non-negative multiple of sort_block_m")
@@ -469,10 +468,11 @@ def gemm1_kernel(
         pipe_weights=pipe_weights, mfma_amajor=mfma_amajor, swizzle_a=swizzle_a,
         async_a_copy=async_a_copy, use_tile_resource=use_tile_resource,
         waves_per_eu_hint=waves_per_eu_hint, b_cache_modifier=b_cache_modifier,
+        a_dtype=a_dtype, out_dtype=out_dtype,
         swiglu_limit=swiglu_limit,
     )
     _run_compiled(
-        launch, out, x, w.view(torch.uint8), scale_x, scale_w.view(torch.uint8), tile_row_base, expert_ids, out_scale,
+        launch, out, x, w, scale_x, scale_w, tile_row_base, expert_ids, out_scale,
         fx.Int32(num_valid), fx.Int32(grid_x), stream,
     )
     return out, out_scale
