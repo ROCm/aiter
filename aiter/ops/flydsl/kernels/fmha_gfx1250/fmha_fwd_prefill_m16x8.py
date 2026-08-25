@@ -42,8 +42,10 @@ from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as llvm_dialect
 from flydsl._mlir.dialects import rocdl as rocdl_dialect
 from flydsl._mlir.dialects import scf
-from flydsl.expr import arith, buffer_ops, gpu, rocdl
+from flydsl.expr import arith, gpu, rocdl
 from flydsl.expr import math as fmath
+
+from aiter.ops.flydsl.kernels import buffer_ops
 from flydsl.expr.typing import T
 from flydsl.expr.utils.arith import _to_raw as _raw
 from flydsl.compiler.ast_rewriter import ReplaceIfWithDispatch

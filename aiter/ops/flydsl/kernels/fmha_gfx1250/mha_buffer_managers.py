@@ -28,7 +28,9 @@ Target: gfx1250 (MI400 / mi450), wave32, 8 waves per threadgroup (256 threads).
 import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm as llvm_dialect
 from flydsl._mlir.dialects import rocdl as rocdl_dialect
-from flydsl.expr import buffer_ops, gpu, rocdl
+from flydsl.expr import gpu, rocdl
+
+from aiter.ops.flydsl.kernels import buffer_ops
 
 # ============================================================================
 # Manager-intrinsic tiling constants (private — not the caller's config).
