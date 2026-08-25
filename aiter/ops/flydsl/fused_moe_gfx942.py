@@ -100,7 +100,7 @@ def get_tune_space():
         # decoding ignored BLOCK_N/BLOCK_K
         Config(16, 16, 16, False).to_string(),
         # Config(64, 256, 64, True).to_string(),
-        # Config(64, 256, 128, True).to_string(),
+        Config(64, 256, 128, True).to_string(),
         Config(64, 128, 256, True).to_string(),
         Config(64, 128, 128, True).to_string(),
     ]

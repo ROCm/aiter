@@ -2392,6 +2392,9 @@ def get_2stage_cfgs(
         logger.warning(f"[fused_moe] {error}; using default heuristics.")
         cfg = None
         full_impl = None
+    if is_ep and full_impl is not None:
+        cfg = None
+        full_impl = None
     if full_impl is not None:
         block_m = int(cfg.get("block_m", BLOCK_SIZE_M))
         ksplit = int(cfg.get("ksplit", 0))
