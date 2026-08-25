@@ -1621,6 +1621,43 @@ DINLINE opus::vector_t<T, pack_size> lamport_spin_load(const void* addr)
     return out;
 }
 
+// Publish one reduced pack into a peer's staging buffer.
+//
+// Deliberately unfenced. In an LL/Lamport protocol the data is its own flag, so
+// there is no separate flag store that the payload must be ordered before, and
+// word order within the pack does not matter either: the producer canonicalises
+// away the sentinel, so a consumer that sees any word still holding it simply
+// keeps spinning. The non-temporal hint keeps the pack out of the caches so it
+// reaches the peer without a writeback. Same idiom as ll_store_b128 in
+// custom_all_reduce_gfx1250.cuh and the QuickReduce send path, neither of which
+// fences either.
+//
+// The fence this replaces was expensive out of all proportion to the work: a
+// per-block __threadfence_system() serialises every CU on the same L2
+// writeback, costing ~0.09us per block. At (1, 7168) that added 7.2us going
+// from 4 to 80 blocks, on a shape where 78 of those blocks publish nothing at
+// all, and it was what made widening the grid for phase A a losing trade.
+template <typename T, int pack_size>
+DINLINE void lamport_publish(void* addr, const opus::vector_t<T, pack_size>& val, bool nt)
+{
+    constexpr int nwords = pack_size * sizeof(T) / 4;
+    uint32_t* dst        = reinterpret_cast<uint32_t*>(addr);
+    const uint32_t* src  = reinterpret_cast<const uint32_t*>(&val);
+    if(nt)
+    {
+#pragma unroll
+        for(int i = 0; i < nwords; ++i)
+            __builtin_nontemporal_store(src[i], dst + i);
+    }
+    else
+    {
+#pragma unroll
+        for(int i = 0; i < nwords; ++i)
+            dst[i] = src[i];
+    }
+    asm volatile("" ::: "memory");
+}
+
 // Re-arm one pack for the next iteration. Each pack is consumed by exactly one
 // thread, so this needs no synchronisation.
 template <typename T, int pack_size>
@@ -1821,14 +1858,16 @@ __global__ void __launch_bounds__(tnum, 1)
         if(active)
         {
             P rslt = *(reinterpret_cast<P*>(&tmp_smem[0]) + lane_id);
-            peer_tmps[warp_id][rank * part + idx] = rslt;
+            lamport_publish<T, pack_size>(
+                &peer_tmps[warp_id][rank * part + idx], rslt, warp_id != rank);
         }
     }
 
-    // Publish this block's stores. No barrier: peers are woken by the data
-    // itself, and the consumer below spins for whatever has not landed yet.
+    // No barrier and no publish fence here: peers are woken by the data itself
+    // (see lamport_publish), and the consumer below spins for whatever has not
+    // landed yet. The __syncthreads() is only to stop phase B from overwriting
+    // the LDS that phase A is still reading.
     __syncthreads();
-    __threadfence_system();
 
     // ---------------- phase B: Lamport spin + RMSNorm -----------------------
     P* tmps = get_tmp_buf<P>(sg.signals[rank]);
@@ -4627,13 +4666,12 @@ void dispatchFusedAllReduceRMSNorm(hipStream_t stream,
         {
             lamport_ensure_armed<T>(stream, sg_, rank_, m * lam_packs);
             dim3 lam_block(lam_tnum);
-            // The grid trades two opposing costs. Phase A wants blocks to widen the
-            // reduce-scatter, but start_sync_acqrel costs roughly 0.1us per block
-            // because every block signals every peer, so opening the grid past the
-            // crossover loses more to the barrier than phase A gains. Measured on
-            // MI355X/TP4 at n=7168 the crossover sits near kLamMaxUseful, and below
-            // it one block per token wins; kLamMinBlocks keeps a single-token decode
-            // from running the whole reduce-scatter on one CU.
+            // Size the grid for phase A: enough blocks to cover the reduce-scatter
+            // in one trip. Phase B grid-strides over m, so it does not constrain
+            // this. Once the publish fence went away the grid became nearly free
+            // (~0.01us per block, all of it barrier), which is what makes sizing for
+            // phase A rather than for m worthwhile; the floor keeps a small decode
+            // from serialising the reduce-scatter onto a couple of CUs.
             //
             // kMaxBlocks is a hard bound rather than a tuning choice: start_sync_acqrel
             // indexes Signal::start/end/_flag by blockIdx.x and those arrays are
@@ -4642,10 +4680,9 @@ void dispatchFusedAllReduceRMSNorm(hipStream_t stream,
             // block count, which this persistent-style kernel needs -- a block spins
             // on data produced by other blocks of the same grid, so an unscheduled
             // producer block would hang the resident consumers.
-            constexpr int kLamMinBlocks = 4;
-            constexpr int kLamMaxUseful = 64;
-            int lam_blocks =
-                std::min(std::max(m, kLamMinBlocks), std::min(kLamMaxUseful, kMaxBlocks));
+            constexpr int kLamMinBlocks = 16;
+            const int lam_prod_blocks   = (m * lam_packs + lam_tnum - 1) / lam_tnum;
+            int lam_blocks = std::min(std::max(lam_prod_blocks, kLamMinBlocks), kMaxBlocks);
             if(const int forced = ar_rmsnorm_lamport_forced_blocks(); forced > 0)
             {
                 lam_blocks = std::min(forced, kMaxBlocks);
