@@ -50,7 +50,7 @@ pd.set_option("display.width", 1000)
 
 SUPPORTED_GFX = ["gfx1250"]
 
-_OUT_DTYPE = {"bf16": dtypes.bf16, "fp8": dtypes.fp8, "fp4": dtypes.fp4x2}
+_OUT_DTYPE = {"bf16": dtypes.bf16, "fp8": dtypes.fp8}
 
 # gfx1250 F4GEMM .co is a persistent shader: it always launches PERSISTENT_TG
 # threadgroups regardless of problem size (must match the .co's WG_MAX).
@@ -80,6 +80,7 @@ def _report_active_tg(M, N, tile_m, tile_n, label):
     else:
         tag = "\033[31mpoor perf\033[0m" if sys.stderr.isatty() else "poor perf"
         aiter.logger.warning("dispatch to %s - %s!", info, tag)
+
 
 PERF_SHAPES = [(16384, 16384, 16384)]
 FUNC_SHAPES = [
@@ -201,9 +202,9 @@ def _verdict(err):
     return "warning" if err <= _TOL_ERR_RATIO else "failed"
 
 
-def _support_reason(intype, outtype, apre, M, N, K):
-    """Support matrix gate. Returns None if the (intype,outtype,apre,M,N,K) combo
-    is supported, else a short reason string (row marked "not support"). Mirrors
+def _support_reason(outtype, apre, M, N, K):
+    """Support matrix gate. Returns None if the (outtype,apre,M,N,K) combo is
+    supported, else a short reason string (row marked "not support"). Mirrors
     the dispatch heuristic in asm_f4gemm.cu so shapes are skipped before the
     shuffle/prep step rather than crashing on an assert."""
     if outtype not in _OUT_DTYPE:
@@ -216,8 +217,6 @@ def _support_reason(intype, outtype, apre, M, N, K):
         return "apre M%16"  # A 16x16 preshuffle
     if outtype == "fp8" and N % MXFP8_OUT_SCALE_BLOCK != 0:
         return "fp8 N%128"  # per-128 output-scale golden limitation
-    if outtype == "fp4" and intype != "mxfp4":
-        return "fp4 mxfp4-only"
     return None
 
 
@@ -225,35 +224,26 @@ def _e4m3_to_f32(s: torch.Tensor) -> torch.Tensor:
     return s.view(torch.float8_e4m3fn).to(torch.float32)
 
 
-def run_torch_mxfp4(xq, wq, xs, ws, noscale=False):
+def run_torch_mxfp4(xq, wq, xs, ws):
     # Reference only: fp32 math. Returns fp32; the caller casts to bf16 or
-    # quantizes to packed fp4 per outtype. Not timed, not in the table.
+    # quantizes per outtype. Not timed, not in the table.
     x_f32 = fp4_utils.mxfp4_to_f32(xq)
     w_f32 = fp4_utils.mxfp4_to_f32(wq)
-    if noscale:
-        # noscale kernel drops all per-block scale loads and uses the HW default
-        # scale (1.0), so the reference must ignore the e8m0 scales too.
-        return x_f32 @ w_f32.T
     xs = fp4_utils.e8m0_to_f32(xs).repeat_interleave(MXFP4_SCALE_BLOCK, dim=1)
     ws = fp4_utils.e8m0_to_f32(ws).repeat_interleave(MXFP4_SCALE_BLOCK, dim=1)
     return (x_f32 * xs) @ (w_f32 * ws).T
 
 
-def run_torch_nvfp4(xq, wq, xs, ws, gA, gB, noscale=False):
+def run_torch_nvfp4(xq, wq, xs, ws, gA, gB):
     # Reference only: fp32 math. Returns fp32 (see run_torch_mxfp4).
     x_f32 = fp4_utils.mxfp4_to_f32(xq)
     w_f32 = fp4_utils.mxfp4_to_f32(wq)
-    if noscale:
-        # noscale kernel drops the per-block e4m3 scales (HW default 1.0) but
-        # STILL folds the per-tensor global scales gA*gB, so the reference must
-        # match: skip the per-block scales, keep the global ones.
-        return float(gA) * float(gB) * (x_f32 @ w_f32.T)
     xs = _e4m3_to_f32(xs).repeat_interleave(NVFP4_SCALE_BLOCK, dim=1)
     ws = _e4m3_to_f32(ws).repeat_interleave(NVFP4_SCALE_BLOCK, dim=1)
     return float(gA) * float(gB) * (x_f32 * xs) @ (w_f32 * ws).T
 
 
-def _prep_mxfp4(M, N, K, apre, data_init, scale_init, gen, noscale=False):
+def _prep_mxfp4(M, N, K, apre, data_init, scale_init, gen):
     # DATA (fp4 e2m1, packed 2/byte). data & scale are sampled *independently*.
     if data_init == "constant":
         # f4gemm.cpp data_init=0: A=0x22, B=0x33 (fixed representable e2m1).
@@ -270,7 +260,7 @@ def _prep_mxfp4(M, N, K, apre, data_init, scale_init, gen, noscale=False):
     else:  # auto / pow2_binomial / random
         xs = bench_init.fill_scale_e8m0((M, K // MXFP4_SCALE_BLOCK), scale_init, gen)
         ws = bench_init.fill_scale_e8m0((N, K // MXFP4_SCALE_BLOCK), scale_init, gen)
-    ref = run_torch_mxfp4(xq, wq, xs, ws, noscale=noscale)
+    ref = run_torch_mxfp4(xq, wq, xs, ws)
     inp = {
         "A": shuffle_weight_f4(xq) if apre else xq,
         "B": shuffle_weight_f4(wq),
@@ -282,7 +272,7 @@ def _prep_mxfp4(M, N, K, apre, data_init, scale_init, gen, noscale=False):
     return inp, ref
 
 
-def _prep_nvfp4(M, N, K, apre, data_init, scale_init, gen, noscale=False):
+def _prep_nvfp4(M, N, K, apre, data_init, scale_init, gen):
     # DATA (fp4 e2m1). data & scale sampled independently (bench_init).
     if data_init == "constant":
         # f4gemm.cpp data_init=0: A=0x22, B=0x33 (fixed representable e2m1).
@@ -301,7 +291,7 @@ def _prep_nvfp4(M, N, K, apre, data_init, scale_init, gen, noscale=False):
         ws = bench_init.fill_scale_e4m3((N, K // NVFP4_SCALE_BLOCK), scale_init, gen)
     # Per-tensor global scale is NOT part of bench_init: keep neutral.
     gA = gB = 1.0
-    ref = run_torch_nvfp4(xq, wq, xs, ws, gA, gB, noscale=noscale)
+    ref = run_torch_nvfp4(xq, wq, xs, ws, gA, gB)
     inp = {
         "A": shuffle_weight_f4(xq) if apre else xq,
         "B": shuffle_weight_f4(wq),
@@ -330,10 +320,9 @@ def test_gemm(
     # Skip unsupported combos up front (before prep/shuffle) so they show as
     # "not support" rather than crashing on a shape assert.
     pre = "ABpreShuffle" if apre else "BpreShuffle"
-    reason = _support_reason(intype, outtype, apre, M, N, K)
+    reason = _support_reason(outtype, apre, M, N, K)
     if reason is not None:
-        ns = "_noscale" if outtype == "fp4" else ""
-        base = f"f4gemm_{outtype}_{intype}_{pre}_256x256_4x4_ps{ns}"
+        base = f"f4gemm_{outtype}_{intype}_{pre}_256x256_4x4_ps"
         actual_knl = knl_name if (knl_name and knl_name != "auto") else base
         aiter.logger.warning(
             "f4gemm not supported (%s): intype=%s outtype=%s apre=%s M=%s N=%s K=%s",
@@ -357,20 +346,14 @@ def test_gemm(
 
     block = MXFP4_SCALE_BLOCK if intype == "mxfp4" else NVFP4_SCALE_BLOCK
     assert K % block == 0, f"K must be a multiple of {block}"
-    # Only the packed-fp4 .co is noscale (cvt_scale=1); bf16/fp8 use scales.
-    # Scale tensors are still built (API-required) but ignored when noscale.
-    noscale = outtype == "fp4"
-    out_fp4 = outtype == "fp4"
     out_fp8 = outtype == "fp8"
     out_dtype = _OUT_DTYPE[outtype]
     gen = bench_init.make_generator(seed)  # fixed seed -> bit-identical buffers
     prep = _prep_mxfp4 if intype == "mxfp4" else _prep_nvfp4
-    inp, ref_f32 = prep(M, N, K, apre, data_init, scale_init, gen, noscale=noscale)
-    # Reference in the kernel's output form: packed e2m1 for fp4, block-scaled
-    # (fp8 e4m3 data + e8m0 scale) tuple for fp8, else bf16.
-    if out_fp4:
-        ref = fp4_utils.f32_to_mxfp4(ref_f32)
-    elif out_fp8:
+    inp, ref_f32 = prep(M, N, K, apre, data_init, scale_init, gen)
+    # Reference in the kernel's output form: block-scaled (fp8 e4m3 data + e8m0
+    # scale) tuple for fp8, else bf16.
+    if out_fp8:
         ref = _quant_mxfp8_blockN(ref_f32)  # (ref_fp8, ref_scale_e8m0)
     else:
         ref = ref_f32.to(out_dtype)
@@ -380,8 +363,7 @@ def test_gemm(
     # Kernel/.co base name for this config (used for logging, and to derive the
     # mangled knl_name when an explicit dispatch is requested). See
     # hsa/gfx1250/f4gemm/f4gemm.csv. (`pre` is set above.)
-    ns = "_noscale" if noscale else ""
-    base = f"f4gemm_{outtype}_{intype}_{pre}_256x256_4x4_ps{ns}"
+    base = f"f4gemm_{outtype}_{intype}_{pre}_256x256_4x4_ps"
 
     # Dispatch mode. Default (knl_name=None) is heuristic: kernelName="" lets the
     # aiter op pick the .co from f4gemm.csv by (intype, a_preshuffle, outtype), so
@@ -430,11 +412,8 @@ def test_gemm(
     candidates = {"asm": (run_asm, asm_args)}
 
     flops = 2 * M * N * K
-    # Output bytes: packed fp4 = M*N/2; fp8 = M*N (fp8) + M*N/128 (e8m0 scale);
-    # bf16 = M*N*itemsize.
-    if out_fp4:
-        out_bytes = (M * N) // 2
-    elif out_fp8:
+    # Output bytes: fp8 = M*N (fp8) + M*N/128 (e8m0 scale); bf16 = M*N*itemsize.
+    if out_fp8:
         out_bytes = M * N + M * (N // MXFP8_OUT_SCALE_BLOCK)
     else:
         out_bytes = M * N * out_dtype.itemsize
@@ -466,13 +445,12 @@ def test_gemm(
         except Exception as e:
             if not any(m in str(e) for m in _NOT_SUPPORTED_MARKERS):
                 raise
-            # No .co for this config (e.g. nvfp4-fp4); mark unsupported, keep going.
+            # No .co for this config; mark unsupported, keep going.
             aiter.logger.warning(
-                "f4gemm not supported: intype=%s outtype=%s noscale=%s apre=%s "
+                "f4gemm not supported: intype=%s outtype=%s apre=%s "
                 "M=%s N=%s K=%s [%s.co]: %s",
                 intype,
                 outtype,
-                noscale,
                 apre,
                 M,
                 N,
@@ -487,8 +465,8 @@ def test_gemm(
             ret[f"{name} result"] = "not support"
             continue
         # Func-mode only: check the high-level op contracts by outtype -- bf16 ->
-        # gemm_a4w4 (single tensor), fp4 -> gemm_a4w4o4 (single tensor [.,N//2]),
-        # fp8 -> gemm_a4w4o8 ((data, scale) tuple). Not timed/tabled.
+        # gemm_a4w4 (single tensor), fp8 -> gemm_a4w4o8 ((data, scale) tuple).
+        # Not timed/tabled.
         if mode == "func":
             a4_kwargs = {"apreshuffle": bool(apre)}
             if intype == "nvfp4":
@@ -505,29 +483,13 @@ def test_gemm(
                     f"gemm_a4w4o8 shape mismatch: {tuple(o.shape)}/{tuple(s.shape)} "
                     f"vs {tuple(out[0].shape)}/{tuple(out[1].shape)}"
                 )
-            elif out_fp4:
-                res = aiter.gemm_a4w4o4(*args, **a4_kwargs)
-                assert not isinstance(res, tuple), "gemm_a4w4o4 must return a tensor"
-                assert (
-                    res.shape == out.shape
-                ), f"gemm_a4w4o4 shape mismatch: {tuple(res.shape)} vs {tuple(out.shape)}"
             else:  # bf16
                 res = aiter.gemm_a4w4(*args, dtype=out_dtype, **a4_kwargs)
                 assert not isinstance(res, tuple), "gemm_a4w4 must return a tensor"
                 assert (
                     res.shape == out.shape
                 ), f"gemm_a4w4 shape mismatch: {tuple(res.shape)} vs {tuple(out.shape)}"
-        if out_fp4:
-            # e2m1 is deterministic: compare dequantized values with zero
-            # tolerance (exact fp4-code match). Borderline RNE ties may differ.
-            err = checkAllclose(
-                fp4_utils.mxfp4_to_f32(ref),
-                fp4_utils.mxfp4_to_f32(out),
-                rtol=0,
-                atol=0,
-                msg=f"{intype} {name} fp4",
-            )
-        elif out_fp8:
+        if out_fp8:
             # (fp8 data, packed e8m0). Unpack scale to row-major; e8m0 compared
             # with a +-1 step tolerance, data dequant with tolerance.
             ref_fp8, ref_scale = ref
@@ -606,7 +568,7 @@ def main():
         choices=[1, 0],
         default=None,
         help="A-preshuffle sweep list: 1 preshuffles A (M%%16), 0 sends it "
-        "row-major (M%%1). Default (unset): func/profile = [1], perf = [1, 0].",
+        "row-major (M%%1). Default (unset): perf/profile = [1], func = [1, 0].",
     )
     parser.add_argument(
         "--outtype",
@@ -615,8 +577,7 @@ def main():
         default=["bf16", "fp8"],
         help="output-format sweep list (default: bf16 fp8):\n"
         "  bf16 = bf16 [M,N]\n"
-        "  fp8  = fp8 e4m3 [M,N] + per-128 E8M0 scale (mxfp8)\n"
-        "  fp4  = packed e2m1 [M,N//2] (noscale; mxfp4 only)",
+        "  fp8  = fp8 e4m3 [M,N] + per-128 E8M0 scale (mxfp8)",
     )
     parser.add_argument(
         "--data-init",
@@ -708,8 +669,8 @@ def main():
     else:
         shapes = FUNC_SHAPES if args.mode == "func" else PERF_SHAPES
 
-    # A-preshuffle sweep. Mode-aware default when unset: func/profile exercise only
-    # the preshuffled path ([1]); perf sweeps both ([1, 0]).
+    # A-preshuffle sweep. Mode-aware default when unset: perf/profile exercise only
+    # the preshuffled path ([1]); func sweeps both ([1, 0]).
     if args.apre is not None:
         apre_list = args.apre
     elif args.mode in ("perf", "profile"):

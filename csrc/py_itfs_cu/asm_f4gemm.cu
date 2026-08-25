@@ -25,8 +25,8 @@
 // Two entrypoints:
 //   - mxfp4_gemm_asm: D = A[M,K/2] mxfp4 * B[N,K/2] mxfp4 (e8m0 scales)
 //   - nvfp4_gemm_asm: D = A[M,K/2] nvfp4 * B[N,K/2] nvfp4 (e4m3 scales + GlobalScale)
-// Output D is bf16 [M,N], packed FP4 [M,N/2] (fp4x2, cvt_scale=1), or fp8:
-// FP8 e4m3 [M,N] data + a per-128-block E8M0 scale [M,N/128] (out_scale).
+// Output D is bf16 [M,N] or fp8: FP8 e4m3 [M,N] data + a per-128-block E8M0
+// scale [M,N/128] (out_scale).
 //
 // KernelArgs uses the ROCm kernarg-preload layout (sgpr_mode==1): pointers
 // first (dw 0..9, MEM-first), then 4B-tight scalars. Bytes shipped to HW,
@@ -86,15 +86,9 @@ static std::tuple<std::string, int> get_heuristic_kernel(
     int M, int N, int K, std::string arch_id, const std::string& intype,
     const std::string& outtype, int a_preshuffle, CFG* cfgs)
 {
-    hipDevice_t dev;
-    hipDeviceProp_t dev_prop;
-    HIP_CALL(hipGetDevice(&dev));
-    HIP_CALL(hipGetDeviceProperties(&dev_prop, dev));
-    uint32_t num_cu        = dev_prop.multiProcessorCount;
-    uint32_t empty_cu      = num_cu;
-    uint32_t tg_num        = 0;
-    uint32_t round         = 0xffffffff;
-    float compute2mem_effi = 1.0f;
+    // (intype, a_preshuffle, outtype) maps to a single .co in the CSV -- the scale
+    // mode is baked into that variant -- so there is no tile/round search: pick
+    // the one variant whose alignment matches.
     std::string selectedKernelName = "";
 
     for(const auto& el : *cfgs)
@@ -104,8 +98,6 @@ static std::tuple<std::string, int> get_heuristic_kernel(
         const auto& cfg = el.second;
         if(cfg.intype != intype || cfg.a_preshuffle != a_preshuffle)
             continue;
-        // (intype, a_preshuffle, outtype) maps to a single .co in the CSV; the
-        // scale mode is baked into that variant (fp4 output is a noscale .co).
         if(cfg.outtype != outtype)
             continue;
 
@@ -113,28 +105,8 @@ static std::tuple<std::string, int> get_heuristic_kernel(
         if((M % m_align) != 0 || (N % F4GEMM_N_ALIGN) != 0 || (K % F4GEMM_K_ALIGN) != 0)
             continue;
 
-        int tg_num_M         = (M + cfg.tile_m - 1) / cfg.tile_m;  // tiles in M (gdy)
-        int tg_num_N         = (N + cfg.tile_n - 1) / cfg.tile_n;  // tiles in N (gdx)
-
-        tg_num               = tg_num_M * tg_num_N;
-        uint32_t local_round = (tg_num + num_cu - 1) / num_cu;
-
-        float local_compute2mem_effi =
-            (float)(cfg.tile_m * cfg.tile_n) / (cfg.tile_m + cfg.tile_n);
-
-        bool is_earlier_round        = (local_round < round);
-        bool is_same_round           = (local_round == round);
-        bool has_sufficient_empty_cu = (empty_cu > (local_round * num_cu - tg_num));
-        bool has_better_efficiency   = (local_compute2mem_effi > compute2mem_effi);
-
-        if(is_earlier_round ||
-           (is_same_round && (has_sufficient_empty_cu || has_better_efficiency)))
-        {
-            round              = local_round;
-            empty_cu           = local_round * num_cu - tg_num;
-            compute2mem_effi   = local_compute2mem_effi;
-            selectedKernelName = el.first;
-        }
+        selectedKernelName = el.first;
+        break;
     }
 
     AITER_CHECK(selectedKernelName != "",
@@ -169,14 +141,12 @@ static void f4gemm_launch(aiter_tensor_t* A,
                                 float           GlobalScaleB,
                                 hipStream_t     stream)
 {
-    AITER_CHECK(out->dtype() == AITER_DTYPE_bf16 || out->dtype() == AITER_DTYPE_fp4x2 ||
-                    out->dtype() == AITER_DTYPE_fp8,
+    AITER_CHECK(out->dtype() == AITER_DTYPE_bf16 || out->dtype() == AITER_DTYPE_fp8,
                 __func__,
-                " only supports BFloat16, packed FP4 (fp4x2) or FP8 (e4m3 + E8M0 scale) output");
-    const bool out_is_fp4 = (out->dtype() == AITER_DTYPE_fp4x2);
+                " only supports BFloat16 or FP8 (e4m3 + E8M0 scale) output");
     const bool out_is_fp8 = (out->dtype() == AITER_DTYPE_fp8);
-    // CSV outtype name (fp4|fp8|bf16); const char* to avoid a per-call alloc.
-    const char* out_type = out_is_fp4 ? "fp4" : (out_is_fp8 ? "fp8" : "bf16");
+    // CSV outtype name (fp8|bf16); const char* to avoid a per-call alloc.
+    const char* out_type = out_is_fp8 ? "fp8" : "bf16";
     AITER_CHECK(!out_is_fp8 || out_scale != nullptr,
                 __func__,
                 " fp8 output requires an out_scale (E8M0) tensor");
@@ -202,13 +172,11 @@ static void f4gemm_launch(aiter_tensor_t* A,
     // Strides in bytes.
     unsigned int stride_a = static_cast<unsigned int>(Kdim / 2);     // fp4 packed
     unsigned int stride_b = static_cast<unsigned int>(Kdim / 2);     // fp4 packed
-    // Output row stride in bytes: bf16 = Ndim*2; packed fp4 (e2m1, 2 vals/byte,
-    // cvt_scale=1) = Ndim/2; fp8 (fp8 e4m3, 1 byte/val) = Ndim. Output format is
-    // compile-time per .co; the host only needs the matching stride + buffer dtype.
-    unsigned int stride_d =
-        out_is_fp4 ? static_cast<unsigned int>(Ndim / 2)
-                   : (out_is_fp8 ? static_cast<unsigned int>(Ndim)
-                                 : static_cast<unsigned int>(Ndim) * 2);
+    // Output row stride in bytes: bf16 = Ndim*2; fp8 (fp8 e4m3, 1 byte/val) =
+    // Ndim. Output format is compile-time per .co; the host only needs the
+    // matching stride + buffer dtype.
+    unsigned int stride_d = out_is_fp8 ? static_cast<unsigned int>(Ndim)
+                                       : static_cast<unsigned int>(Ndim) * 2;
     // Scale row stride: the shader loads scales in 128-K super-columns, so the
     // per-row scale count is padded up to a multiple of 128/scale_block. Equals
     // Kdim/scale_block when K%128==0.
@@ -261,7 +229,7 @@ static void f4gemm_launch(aiter_tensor_t* A,
 
     // All-int cache key: the hot lookup hashes ints, not std::strings.
     const int intype_id = (intype == "nvfp4") ? 1 : 0;   // else mxfp4
-    const int out_id    = out_is_fp4 ? 2 : (out_is_fp8 ? 1 : 0);  // bf16=0
+    const int out_id    = out_is_fp8 ? 1 : 0;  // bf16=0
     using DictKey = std::tuple<int, int, int, int, int, int>; // M,N,K,intype_id,apre,out_id
     struct DictHash
     {
@@ -396,7 +364,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
      aiter_tensor_t* B,         // B:[N, K/2] fp4x2 (always preshuffled)
      aiter_tensor_t* ScaleA,    // ScaleA:[M, K/32] e8m0 (shuffled)
      aiter_tensor_t* ScaleB,    // ScaleB:[N, K/32] e8m0 (shuffled)
-     aiter_tensor_t* out,       // Out: bf16 [M,N] / fp4x2 [M,N/2] / fp8 [M,N]
+     aiter_tensor_t* out,       // Out: bf16 [M,N] / fp8 [M,N]
      aiter_tensor_t* out_scale, // fp8 only: E8M0 [M, N/128] (null otherwise)
      const char*     kernelName,
      int             a_preshuffle,
@@ -416,7 +384,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
      aiter_tensor_t* ScaleB,    // ScaleB:[N, K/32] e4m3 (shuffled)
      float           GlobalScaleA,
      float           GlobalScaleB,
-     aiter_tensor_t* out,       // Out: bf16 [M,N] / fp4x2 [M,N/2] / fp8 [M,N]
+     aiter_tensor_t* out,       // Out: bf16 [M,N] / fp8 [M,N]
      aiter_tensor_t* out_scale, // fp8 only: E8M0 [M, N/128] (null otherwise)
      const char*     kernelName,
      int             a_preshuffle,

@@ -89,6 +89,7 @@ def _report_active_tg(M, N, tile_m, tile_n, label):
         tag = "\033[31mpoor perf\033[0m" if sys.stderr.isatty() else "poor perf"
         aiter.logger.warning("dispatch to %s - %s!", info, tag)
 
+
 PERF_SHAPES = {
     "a8w8": [
         (32768, 16384, 8192),  # compute-bound
@@ -413,7 +414,7 @@ def main():
         choices=[1, 0],
         default=None,
         help="A-preshuffle sweep list: 1 preshuffles A (M%%2), 0 sends it "
-        "row-major (M%%1). Default (unset): func/profile = [1], perf = [1, 0].",
+        "row-major (M%%1). Default (unset): perf/profile = [1], func = [1, 0].",
     )
     parser.add_argument(
         "--outtype",
@@ -500,8 +501,8 @@ def main():
         )
     init_pairs = list(zip(di_list, si_list))
 
-    # A-preshuffle sweep. Mode-aware default when unset: func/profile exercise only
-    # the preshuffled path ([1]); perf sweeps both ([1, 0]).
+    # A-preshuffle sweep. Mode-aware default when unset: perf/profile exercise only
+    # the preshuffled path ([1]); func sweeps both ([1, 0]).
     if args.apre is not None:
         apre_list = args.apre
     elif args.mode in ("perf", "profile"):
