@@ -1,16 +1,25 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import csv
+"""Correctness and performance coverage for FlyDSL HSTU attention forward."""
 
+import argparse
+import csv
+import itertools
+
+import pandas as pd
 import pytest
 import torch
 
+import aiter
 import aiter.ops.flydsl.hstu_attention_kernels as hstu_kernels
+from aiter import dtypes
+from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.hstu_attention_kernels import (
     _validate_inputs,
     flydsl_hstu_attention_fwd,
 )
+from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 _DEFAULT_DEVICE = torch.device("cuda")
 
@@ -96,6 +105,140 @@ def generate_hstu_attn_inputs(
     return q.contiguous(), k.contiguous(), v.contiguous(), seq_offsets, num_targets
 
 
+# Validated on gfx942; gfx950 is permitted but unvalidated.
+HSTU_SUPPORTED_GFX = ["gfx942", "gfx950"]
+
+
+def _hstu_fwd_flops(
+    seq_offsets: torch.Tensor, heads: int, attn_dim: int, hidden_dim: int
+) -> float:
+    """Lower-triangular mask: no x2 factor on matmul FLOPs."""
+    total_flops = 0.0
+    seq_num = seq_offsets.shape[0] - 1
+    for i in range(seq_num):
+        length = int(seq_offsets[i + 1].item() - seq_offsets[i].item())
+        total_flops += length * length * (attn_dim + hidden_dim) * heads
+    return total_flops
+
+
+def _hstu_fwd_bytes(
+    seq_offsets: torch.Tensor,
+    heads: int,
+    attn_dim: int,
+    hidden_dim: int,
+    elem_size: int,
+) -> int:
+    seq_num = seq_offsets.shape[0] - 1
+    total_bytes = 0
+    for i in range(seq_num):
+        length = int(seq_offsets[i + 1].item() - seq_offsets[i].item())
+        total_bytes += length * (attn_dim + length + hidden_dim) * heads * elem_size
+    return total_bytes
+
+
+# Padded torch ref builds [B, H, N, N]; skip it above this size in perf sweeps.
+_REF_MAX_QK_BYTES = 8 * 1024**3
+
+
+def _padded_qk_bytes(batch_size, max_seq_len, num_heads, elem_size) -> int:
+    return batch_size * num_heads * max_seq_len * max_seq_len * elem_size
+
+
+@pytest.mark.skip(reason="perf sweep: run via python op_tests/test_flydsl_hstu_attention.py")
+@benchmark()
+def test_flydsl_hstu_attention_perf(
+    batch_size,
+    max_seq_len,
+    sparsity,
+    num_heads,
+    head_dim,
+    hidden_dim,
+    target_size,
+    dtype,
+    max_attn_len=0,
+    contextual_seq_len=0,
+    causal=True,
+    seed=1001,
+):
+    from op_tests.triton_tests.utils.hstu_attention_ref import torch_hstu_attention
+
+    torch.cuda.empty_cache()
+    device = torch.device("cuda")
+    alpha = 1.0 / head_dim * 10000
+
+    q, k, v, seq_offsets, num_targets = generate_hstu_attn_inputs(
+        batch_size=batch_size,
+        max_seq_len=max_seq_len,
+        sparsity=sparsity,
+        heads=num_heads,
+        attn_dim=head_dim,
+        hidden_dim=hidden_dim,
+        target_size=target_size,
+        dtype=dtype,
+        device=device,
+        seed=seed,
+    )
+
+    def flydsl_attn():
+        return flydsl_hstu_attention_fwd(
+            max_seq_len,
+            alpha,
+            q,
+            k,
+            v,
+            seq_offsets,
+            causal,
+            num_targets,
+            max_attn_len,
+            contextual_seq_len,
+        )
+
+    out, us = run_perftest(flydsl_attn)
+    qk_bytes = _padded_qk_bytes(batch_size, max_seq_len, num_heads, q.element_size())
+    if qk_bytes <= _REF_MAX_QK_BYTES:
+        out_ref = (
+            torch_hstu_attention(
+                max_seq_len,
+                alpha,
+                q,
+                k,
+                v,
+                seq_offsets,
+                causal,
+                dropout_pr=0.0,
+                training=False,
+                num_targets=num_targets,
+                max_attn_len=max_attn_len,
+                contextual_seq_len=contextual_seq_len,
+                min_full_attn_seq_len=0,
+            )
+            * max_seq_len
+        )
+        err = checkAllclose(
+            out_ref,
+            out * max_seq_len,
+            rtol=0,
+            atol=1e-3,
+            msg="flydsl_hstu_attention_fwd",
+        )
+    else:
+        # Production shapes OOM the dense padded ref; correctness is covered by
+        # the parametrized pytest cases at smaller max_seq_len.
+        err = float("nan")
+
+    flops = _hstu_fwd_flops(seq_offsets, num_heads, head_dim, hidden_dim)
+    nbytes = _hstu_fwd_bytes(
+        seq_offsets, num_heads, head_dim, hidden_dim, q.element_size()
+    )
+    return {
+        "gfx": get_gfx(),
+        "flydsl us": round(us, 3),
+        "flydsl TFLOPS": round(flops / us / 1e6, 1),
+        "flydsl TB/s": round(nbytes / us / 1e6, 3),
+        "flydsl err": err,
+    }
+
+
 @pytest.mark.parametrize(
     "batch_size,max_seq_len,sparsity,"
     "max_attn_len,contextual_seq_len,target_size,"
@@ -144,7 +287,7 @@ def test_flydsl_hstu_attention(
     dtype=torch.bfloat16,
 ):
     # The torch reference lives on the triton side; import it lazily so that
-    # merely importing this module (e.g. from the benchmark) stays triton-free.
+    # merely importing this module stays triton-free for pytest collection.
     from op_tests.triton_tests.utils.hstu_attention_ref import torch_hstu_attention
 
     torch.cuda.empty_cache()
@@ -330,3 +473,136 @@ def test_tuned_csv_best_duration_wins(tmp_path):
 
     (config,) = config_map.values()
     assert config["block_m"] == 256
+
+
+def main():
+    if get_gfx() not in HSTU_SUPPORTED_GFX:
+        aiter.logger.warning(
+            "flydsl_hstu_attention unsupported on %s; skipping", get_gfx()
+        )
+        return
+
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter,
+        description="FlyDSL HSTU attention perf sweep",
+    )
+    parser.add_argument(
+        "-d",
+        "--dtype",
+        type=dtypes.str2Dtype,
+        nargs="*",
+        default=[dtypes.bf16, dtypes.fp16],
+        help="dtype sweep (bf16, fp16)",
+    )
+    parser.add_argument(
+        "-b",
+        "--batch",
+        type=int,
+        nargs="*",
+        default=[120],
+        help="batch_size sweep",
+    )
+    parser.add_argument(
+        "--max-seq-len",
+        type=int,
+        nargs="*",
+        default=[16384],
+        help="max_seq_len sweep",
+    )
+    parser.add_argument(
+        "--sparsity",
+        type=float,
+        nargs="*",
+        default=[0.475],
+        help="sparsity sweep",
+    )
+    parser.add_argument(
+        "--num-heads",
+        type=int,
+        nargs="*",
+        default=[4],
+        help="num_heads sweep",
+    )
+    parser.add_argument(
+        "--head-dim",
+        type=int,
+        nargs="*",
+        default=[64],
+        help="head_dim (attn_dim) sweep",
+    )
+    parser.add_argument(
+        "--hidden-dim",
+        type=int,
+        nargs="*",
+        default=[0],
+        help="hidden_dim sweep (0 -> head_dim)",
+    )
+    parser.add_argument(
+        "--max-attn-len",
+        type=int,
+        nargs="*",
+        default=[0],
+        help="max_attn_len sweep",
+    )
+    parser.add_argument(
+        "--contextual-seq-len",
+        type=int,
+        nargs="*",
+        default=[0],
+        help="contextual_seq_len sweep",
+    )
+    parser.add_argument(
+        "--target-size",
+        type=int,
+        nargs="*",
+        default=[300],
+        help="target_size sweep",
+    )
+    args = parser.parse_args()
+
+    rows = []
+    for (
+        dtype,
+        batch_size,
+        max_seq_len,
+        sparsity,
+        num_heads,
+        head_dim,
+        hidden_dim,
+        max_attn_len,
+        contextual_seq_len,
+        target_size,
+    ) in itertools.product(
+        args.dtype,
+        args.batch,
+        args.max_seq_len,
+        args.sparsity,
+        args.num_heads,
+        args.head_dim,
+        args.hidden_dim,
+        args.max_attn_len,
+        args.contextual_seq_len,
+        args.target_size,
+    ):
+        rows.append(
+            test_flydsl_hstu_attention_perf(
+                batch_size,
+                max_seq_len,
+                sparsity,
+                num_heads,
+                head_dim,
+                hidden_dim or head_dim,
+                target_size,
+                dtype,
+                max_attn_len=max_attn_len,
+                contextual_seq_len=contextual_seq_len,
+            )
+        )
+    aiter.logger.info(
+        "flydsl_hstu_attention summary (markdown):\n%s",
+        pd.DataFrame(rows).to_markdown(index=False),
+    )
+
+
+if __name__ == "__main__":
+    main()
