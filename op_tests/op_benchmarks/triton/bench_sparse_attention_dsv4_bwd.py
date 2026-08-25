@@ -25,8 +25,8 @@ import torch
 import triton
 
 from aiter.ops.triton.attention.sparse_attention_dsv4_bwd import (
-    bwd_phases,
-    plan_bwd,
+    _bwd_phases,
+    _plan_bwd,
     sparse_mla_bwd_dsv4,
 )
 from aiter.ops.triton.utils._triton import arch_info
@@ -117,12 +117,12 @@ def _flops(T, H, topk):
 def _time_phases(case, scale):
     """Time each phase of the real pipeline.
 
-    `plan_bwd` and `bwd_phases` are the same helpers `sparse_mla_bwd_dsv4` runs, so this cannot
+    `_plan_bwd` and `_bwd_phases` are the same helpers `sparse_mla_bwd_dsv4` runs, so this cannot
     drift from the op: the tile widths, the workspace and the phase order all come from the
     wrapper rather than being restated here. Timing a phase repeatedly re-runs its side effects,
     which is harmless -- only the duration is read.
     """
-    plan = plan_bwd(
+    plan = _plan_bwd(
         case["q"],
         case["kv"],
         case["do"],
@@ -132,7 +132,7 @@ def _time_phases(case, scale):
         case["sink"],
         scale,
     )
-    return [(name, triton.testing.do_bench(run)) for name, run in bwd_phases(plan)]
+    return [(name, triton.testing.do_bench(run)) for name, run in _bwd_phases(plan)]
 
 
 # ---------------------------------------------------------------------------

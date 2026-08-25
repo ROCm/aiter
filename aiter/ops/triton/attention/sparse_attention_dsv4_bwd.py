@@ -245,7 +245,7 @@ class _BwdPlan:
     """Validated inputs, tile choices and workspace for one backward call.
 
     Holds the values that flow between phases (``delta``, the CSR pair, the accumulator) so
-    ``bwd_phases`` can hand out independent thunks that still compose into the real pipeline.
+    ``_bwd_phases`` can hand out independent thunks that still compose into the real pipeline.
     """
 
     q: torch.Tensor
@@ -289,11 +289,13 @@ class _BwdPlan:
         return self.dq, self.dkv_acc.to(self.kv.dtype), self.d_sink
 
 
-def plan_bwd(q, kv, do, o, lse, topk_indices, attn_sink=None, scale=None, R_CHUNK=None):
+def _plan_bwd(
+    q, kv, do, o, lse, topk_indices, attn_sink=None, scale=None, R_CHUNK=None
+):
     """Validate the inputs, pick the tile widths and allocate the workspace for one call.
 
     Split out from ``sparse_mla_bwd_dsv4`` so the op benchmark can build the same plan and then
-    time ``bwd_phases`` against it. Argument meanings are documented on the public entry.
+    time ``_bwd_phases`` against it. Argument meanings are documented on the public entry.
     """
     assert (
         arch_info.get_arch() == "gfx950"
@@ -334,6 +336,16 @@ def plan_bwd(q, kv, do, o, lse, topk_indices, attn_sink=None, scale=None, R_CHUN
     assert lse.shape == (T, H), f"lse must be [{T}, {H}], got {tuple(lse.shape)}"
     assert num_kv >= T, f"num_kv ({num_kv}) must be >= T ({T})"
     if attn_sink is not None:
+        # Optional, so it misses the device sweep above; d_sink does GPU math with it.
+        if not attn_sink.is_cuda:
+            raise RuntimeError(
+                f"sparse_mla_bwd_dsv4 requires CUDA/HIP tensors, attn_sink is on "
+                f"{attn_sink.device}"
+            )
+        if attn_sink.dtype != torch.float32:
+            raise RuntimeError(
+                f"sparse_mla_bwd_dsv4 expects fp32 attn_sink, got {attn_sink.dtype}"
+            )
         assert attn_sink.shape == (
             H,
         ), f"attn_sink must be [{H}], got {tuple(attn_sink.shape)}"
@@ -405,7 +417,7 @@ def plan_bwd(q, kv, do, o, lse, topk_indices, attn_sink=None, scale=None, R_CHUN
     )
 
 
-def bwd_phases(plan):
+def _bwd_phases(plan):
     """``(name, thunk)`` for every phase of one backward call, in execution order.
 
     ``sparse_mla_bwd_dsv4`` runs these; the op benchmark times them one at a time. Sharing the
@@ -501,8 +513,8 @@ def sparse_mla_bwd_dsv4(
     Returns:
         dq [T, H, 512] bf16, dkv [num_kv, 512] bf16, d_sink [H] fp32 (None if no ``attn_sink``)
     """
-    plan = plan_bwd(q, kv, do, o, lse, topk_indices, attn_sink, scale, R_CHUNK)
-    for _, run in bwd_phases(plan):
+    plan = _plan_bwd(q, kv, do, o, lse, topk_indices, attn_sink, scale, R_CHUNK)
+    for _, run in _bwd_phases(plan):
         run()
     return plan.result()
 
