@@ -158,10 +158,11 @@ jobs:
       - name: Docker login
         if: ${{ matrix.build_enabled && (!github.event.pull_request || !github.event.pull_request.head.repo.fork) }}
         env:
-          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+          DOCKER_USERNAME: ${{ secrets[needs.ci_config.outputs.docker_username_secret] }}
+          DOCKER_PASSWORD: ${{ secrets[needs.ci_config.outputs.docker_password_secret] }}
         run: |
           for attempt in 1 2 3; do
-            if echo "$DOCKER_PASSWORD" | docker login -u rocmshared --password-stdin; then
+            if echo "$DOCKER_PASSWORD" | docker login -u "$DOCKER_USERNAME" --password-stdin; then
               echo "Docker login succeeded on attempt ${attempt}"
               exit 0
             fi
@@ -337,7 +338,8 @@ jobs:
           for WHL in all-wheels/amd_aiter*.whl; do
             WHL_NAME=$(basename "${WHL}")
             echo "Uploading ${WHL_NAME}..."
-            aws s3 cp "${WHL}" "${S3_STAGING}/${WHL_NAME}"
+            aws s3 cp "${WHL}" "${S3_STAGING}/${WHL_NAME}" \
+              --cache-control "public, max-age=31536000, immutable"
           done
 
           echo "=== Generating versioned manifest ==="
@@ -345,6 +347,7 @@ jobs:
 
           python3 - <<'PY'
           import json, glob, os, re, sys
+          from urllib.parse import quote
 
           s3_public = os.environ["S3_PUBLIC"]
           timestamp = os.environ["MANIFEST_TIMESTAMP"]
@@ -362,7 +365,7 @@ jobs:
 
           for whl_path in wheels:
               whl_name = os.path.basename(whl_path)
-              whl_url = f"{s3_public}/{whl_name}"
+              whl_url = f"{s3_public}/{quote(whl_name, safe='')}"
               match = re.search(r"-(cp3\d+)-", whl_name)
               if match:
                   tag = match.group(1)
@@ -387,12 +390,27 @@ jobs:
           PY
 
           aws s3 cp latest-main-wheel.json \
+            "${S3_STAGING}/commits/${GITHUB_SHA}/latest.json" \
+            --content-type application/json \
+            --cache-control "public, max-age=31536000, immutable"
+
+          aws s3 cp latest-main-wheel.json \
             "${S3_STAGING}/main/latest.json" \
-            --content-type application/json
+            --content-type application/json \
+            --cache-control "no-store, max-age=0, must-revalidate"
+
+          if [ -n "${CLOUDFRONT_DISTRIBUTION_ID:-}" ]; then
+            aws cloudfront create-invalidation \
+              --distribution-id "${CLOUDFRONT_DISTRIBUTION_ID}" \
+              --paths "/whl-staging/gfx942-gfx950/main/latest.json"
+          else
+            echo "::warning::CLOUDFRONT_DISTRIBUTION_ID is not set; skipping latest.json invalidation"
+          fi
 
           echo "Uploaded versioned manifest"
         env:
           S3_PUBLIC: "https://rocm.frameworks-nightlies.amd.com/whl-staging/gfx942-gfx950"
+          CLOUDFRONT_DISTRIBUTION_ID: ${{ vars.AITER_WHEEL_CLOUDFRONT_DISTRIBUTION_ID }}
 
   split_aiter_tests:
     if: ${{ needs.detect_aiter_test_scope.outputs.run_tests == 'true' }}
@@ -619,10 +637,11 @@ jobs:
       - name: Docker login
         if: ${{ !github.event.pull_request || !github.event.pull_request.head.repo.fork }}
         env:
-          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+          DOCKER_USERNAME: ${{ secrets[needs.ci_config.outputs.docker_username_secret] }}
+          DOCKER_PASSWORD: ${{ secrets[needs.ci_config.outputs.docker_password_secret] }}
         run: |
           for attempt in 1 2 3; do
-            if echo "$DOCKER_PASSWORD" | docker login -u rocmshared --password-stdin; then
+            if echo "$DOCKER_PASSWORD" | docker login -u "$DOCKER_USERNAME" --password-stdin; then
               echo "Docker login succeeded on attempt ${attempt}"
               exit 0
             fi
@@ -899,10 +918,11 @@ jobs:
       - name: Docker login
         if: ${{ !github.event.pull_request || !github.event.pull_request.head.repo.fork }}
         env:
-          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+          DOCKER_USERNAME: ${{ secrets[needs.ci_config.outputs.docker_username_secret] }}
+          DOCKER_PASSWORD: ${{ secrets[needs.ci_config.outputs.docker_password_secret] }}
         run: |
           for attempt in 1 2 3; do
-            if echo "$DOCKER_PASSWORD" | docker login -u rocmshared --password-stdin; then
+            if echo "$DOCKER_PASSWORD" | docker login -u "$DOCKER_USERNAME" --password-stdin; then
               echo "Docker login succeeded on attempt ${attempt}"
               exit 0
             fi
@@ -982,12 +1002,17 @@ jobs:
           -w /workspace \
           aiter_test \
           bash -lc "
+            set -euo pipefail
             pip uninstall -y amd-aiter aiter || true
+            apt-get update
+            DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends libgrpc++1.51t64
             pip install -r requirements.txt
             pip install --upgrade pandas pyzmq einops numpy==1.26.2
             pip install --upgrade 'pybind11>=3.0.1'
             pip install --upgrade 'ninja>=1.11.1'
             pip install tabulate
+            pip install 'amd-mori==1.2.2'
+            python3 -c 'import mori, mori.shmem'
             pip install '${AITER_WHEEL_PATH}'
             pip show amd-aiter
           "
