@@ -114,9 +114,17 @@ def pipeline_fence(outstanding=0, use_cluster=False):
     """Fused READY+REUSE fence for gfx1250 multi-buffer pipeline.
 
     Issues ``s_wait_tensorcnt`` followed by the appropriate barrier.
+    Uses explicit s_barrier_signal/wait instead of gpu.barrier() to avoid
+    the implicit s_wait_dscnt 0 that the LLVM backend inserts before
+    gpu.barrier, which would drain carry ds_loads prematurely.
     """
     tdm_ops.tensor_wait(outstanding)
-    workgroup_barrier(use_cluster=use_cluster)
+    rocdl.s_barrier_signal(WGP_BARRIER_ID)
+    if use_cluster:
+        cluster.cluster_signal_once_per_wg()
+    rocdl.s_barrier_wait(WGP_BARRIER_ID)
+    if use_cluster:
+        cluster.cluster_wait()
 
 
 WGP_BARRIER_ID = -1

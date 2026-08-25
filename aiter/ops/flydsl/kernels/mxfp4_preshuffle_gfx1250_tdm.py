@@ -16,12 +16,15 @@ from aiter.ops.flydsl.kernels import vector
 from aiter.utility.mx_types import MxDtypeInt as MxDtype
 
 from .gemm_common_gfx1250 import (
+    WGP_BARRIER_ID,
     batched_silu_swiglu,
     batched_situv2,
     fused_silu_swiglu_elem,
     fused_situv2_elem,
     make_lds_copy_ops,
     pipeline_fence,
+    pipeline_fence_signal,
+    pipeline_fence_wait,
     situv2_consts,
     workgroup_barrier,
 )
@@ -932,8 +935,10 @@ def launch_gemm_a8w4_tdm(
                     issue(i, i, tile_deltas=td)
                 n_steady = K_TILES - num_buffers
                 if const_expr(next_stage_on):
-                    tdm_ops.tensor_wait(TDM_PER * (num_buffers - 1))
-                    workgroup_barrier()
+                    # Use split fence so the initial load_state's ds_loads
+                    # are not drained by an implicit s_wait_dscnt 0.
+                    pipeline_fence_signal(outstanding=TDM_PER * (num_buffers - 1))
+                    pipeline_fence_wait()
                     load_state(rmem_slots[0], ptr_to_idx(buf_ptr(0)), 0)
 
                 def _steady(my_jobs):
@@ -941,7 +946,10 @@ def launch_gemm_a8w4_tdm(
                         s = kt % num_buffers
                         buf = ptr_to_idx(buf_ptr(s))
                         if const_expr(not next_stage_on):
-                            pipeline_fence(outstanding=TDM_PER * (num_buffers - 1))
+                            pipeline_fence_signal(
+                                outstanding=TDM_PER * (num_buffers - 1)
+                            )
+                            pipeline_fence_wait()
                         next_stage_buf = (
                             ptr_to_idx(buf_ptr((kt + 1) % num_buffers))
                             if const_expr(next_stage_on)
@@ -958,7 +966,8 @@ def launch_gemm_a8w4_tdm(
                                 else None
                             ),
                         )
-                        workgroup_barrier()
+                        rocdl.s_barrier_signal(WGP_BARRIER_ID)
+                        rocdl.s_barrier_wait(WGP_BARRIER_ID)
                         issue(s, kt + num_buffers, my_jobs, tile_deltas=td)
 
                 dispatch_wave_job(_steady)
@@ -966,10 +975,11 @@ def launch_gemm_a8w4_tdm(
                     kt = n_steady + j_drain
                     buf = ptr_to_idx(buf_ptr(kt % num_buffers))
                     has_next = next_stage_on and j_drain + 1 < num_buffers
-                    pipeline_fence(
+                    pipeline_fence_signal(
                         outstanding=TDM_PER
                         * max(0, num_buffers - 1 - j_drain - (1 if has_next else 0))
                     )
+                    pipeline_fence_wait()
                     next_stage_buf = (
                         ptr_to_idx(buf_ptr((kt + 1) % num_buffers))
                         if const_expr(has_next)
@@ -1241,7 +1251,8 @@ def launch_gemm_a8w4_tdm(
                                     else None
                                 ),
                             )
-                            workgroup_barrier()
+                            rocdl.s_barrier_signal(WGP_BARRIER_ID)
+                            rocdl.s_barrier_wait(WGP_BARRIER_ID)
                             issue(s, kt + num_buffers, my_jobs)
 
                     dispatch_wave_job(steady_post)
