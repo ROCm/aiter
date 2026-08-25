@@ -196,6 +196,8 @@ def _reference_o(inp, *, scale, use_exp2):
 @pytest.mark.parametrize("variant", ["bv16", "bv32", "bv64", "bv64w8", None])
 def test_fused_unit(gate, H, Hg, seq_lens, variant):
     """Fused wrapper output matches pure-PyTorch K5 ref + Triton K6."""
+    if get_gfx() != "gfx942":
+        pytest.skip(f"fused K5+K6 kernel is gfx942-only; arch={get_gfx()}")
     K = V = 128
     T_flat = sum(seq_lens)
     scale = K**-0.5
@@ -229,6 +231,8 @@ def test_fused_unit(gate, H, Hg, seq_lens, variant):
 
 def test_fused_final_state():
     """output_final_state=True returns a final state matching the K5 ref."""
+    if get_gfx() != "gfx942":
+        pytest.skip(f"fused K5+K6 kernel is gfx942-only; arch={get_gfx()}")
     H = Hg = 12
     K = V = 128
     seq_lens = [512, 512]
@@ -268,6 +272,43 @@ def test_fused_final_state():
     assert ratio < _RMSE_TOL, f"final_state mismatch: rmse_ratio={ratio:.3e}"
 
 
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        [613],          # dense, not a multiple of BT=64 → exercises tail masking in K6
+        [512, 613],     # varlen with a ragged tail sequence → exercises causal-column mask
+    ],
+)
+def test_fused_nonaligned(seq_lens):
+    """Fused output matches reference when sequence length is not a multiple of BT=64."""
+    if get_gfx() != "gfx942":
+        pytest.skip(f"fused K5+K6 kernel is gfx942-only; arch={get_gfx()}")
+    H = Hg = 8
+    K = V = 128
+    T_flat = sum(seq_lens)
+    scale = K**-0.5
+    use_exp2 = False
+
+    inp = _make_inputs(H, Hg, K, V, T_flat, seq_lens, "g")
+    o_ref = _reference_o(inp, scale=scale, use_exp2=use_exp2)
+    o_fused, _ = chunk_gated_delta_rule_fwd_h_o_flydsl(
+        q=inp["q"],
+        k=inp["k"],
+        w=inp["w_hm"],
+        u=inp["u_hm"],
+        g=inp["g"],
+        scale=scale,
+        initial_state=inp["h0"],
+        output_final_state=False,
+        cu_seqlens=inp["cu"],
+        use_exp2=use_exp2,
+    )
+    ratio = _rmse_ratio(o_fused, o_ref)
+    assert ratio < _RMSE_TOL, (
+        f"fused nonaligned mismatch: rmse_ratio={ratio:.3e} (seq_lens={seq_lens})"
+    )
+
+
 # --------------------------------------------------------------------------- #
 # Pipeline tests: the K5K6Fusion API on chunk_gated_delta_rule_fwd_opt_vk.
 # --------------------------------------------------------------------------- #
@@ -300,6 +341,8 @@ def _pipeline_inputs(H, Hg, seq_lens, device="cuda"):
 @pytest.mark.parametrize("seq_lens", [[512], [512, 512]])
 def test_fused_pipeline(H, Hg, seq_lens):
     """fusion=ALWAYS (FlyDSL backend) matches the pure-Triton baseline."""
+    if get_gfx() != "gfx942":
+        pytest.skip(f"fused K5+K6 kernel is gfx942-only; arch={get_gfx()}")
     from aiter.ops.triton._triton_kernels.gated_delta_rule.prefill.chunk import (
         chunk_gated_delta_rule_fwd_opt_vk,
     )
