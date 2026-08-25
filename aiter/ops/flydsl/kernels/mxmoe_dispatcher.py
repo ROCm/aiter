@@ -133,7 +133,6 @@ def compile_gemm2_a4w4_port(
     has_npad=False,
     out_dtype="bf16",
     enable_bias=False,
-    experts=1,
 ):
     """Compile gemm2 a4w4 down-proj; epilog 'atomic' (weighted atomic-fadd) or 'reduce' (store into out[token_id*topk+slot]). inter_dim runtime; SBM None -> SBM==BM byte-identical."""
     SBM = _norm_sbm(SBM, BM)
@@ -352,7 +351,6 @@ def compile_gemm2_a4w4_port(
                 g2_epi_lanes=g2_epi_lanes,
                 g2_apre=g2_apre,
                 enable_bias=enable_bias,
-                bias_nbytes=experts * HIDDEN_MAX * 4,
                 k_valid_halves=k_valid_halves,
                 has_kpad=has_kpad,
                 has_npad=has_npad,
@@ -539,7 +537,6 @@ def get_g2(
     has_kpad=False,
     has_npad=False,
     enable_bias=False,
-    experts=1,
 ):
     # Cache key uses compile-time buckets; runtime inter_dim/model_dim share a
     # launcher while remaining within their respective caps.
@@ -583,7 +580,6 @@ def get_g2(
         has_npad,
         out_dtype,
         enable_bias,
-        experts,
     )
     launch = G2_CACHE.get(key)
     if launch is None:
@@ -612,7 +608,6 @@ def get_g2(
             has_npad=has_npad,
             out_dtype=out_dtype,
             enable_bias=enable_bias,
-            experts=experts,
         )
         G2_CACHE[key] = launch
     return launch
@@ -742,7 +737,6 @@ def mxfp4_moe_gemm2(
         has_kpad=inter_dim_pad > 0,
         has_npad=model_dim_pad > 0,
         enable_bias=bias is not None,
-        experts=NE,
     )
     max_m_blocks = (max_sorted + BM - 1) // BM
     if persist:

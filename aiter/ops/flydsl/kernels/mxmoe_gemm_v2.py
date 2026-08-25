@@ -264,7 +264,6 @@ def gemm2_body_v2(
     g2_epi_lanes=None,
     g2_apre=False,
     enable_bias=False,
-    bias_nbytes=0,
     k_valid_halves=None,
     has_kpad=False,
     has_npad=False,
@@ -663,7 +662,6 @@ def gemm2_body_v2(
             g2_scale_blk=g2_scale_blk,
             g2_epi_lanes=g2_epi_lanes,
             enable_bias=enable_bias,
-            bias_nbytes=bias_nbytes,
             **kw,
         )
 
@@ -916,7 +914,6 @@ def atomic_bf16_epilog(
     emit_thunks=None,
     lds_ready=False,
     enable_bias=False,
-    bias_nbytes=0,
 ):
     if SBM is None:
         SBM = BM
@@ -951,29 +948,16 @@ def atomic_bf16_epilog(
     col_start = n_lane * store_vec
     wave_n = BN // 4
 
-    def flat_buffer(arg, elem_ty, align, nrec=None):
+    def flat_buffer(arg, elem_ty, align):
         ptr = global_typed_ptr(arg, elem_ty, align=align)
         view = fx.Tensor(fx.make_view(ptr, fx.make_layout((1, 1), (1, 1))))
-        if nrec is not None:
-            return fx.rocdl.make_buffer_tensor(view, num_records_bytes=nrec)
         return fx.rocdl.make_buffer_tensor(view, max_size=True)
-
-    _out_nrec = None
-    if const_expr(use_reduce):
-        if const_expr(route_out_fp8):
-            _rp = N_OUT + _udiv(N_OUT, fx.Int32(g2_scale_blk))
-            if const_expr(g2_out_pitch_align > 0):
-                _al = fx.Int32(g2_out_pitch_align)
-                _rp = ((_rp + _al - fx.Int32(1)) // _al) * _al
-        else:
-            _rp = N_OUT * fx.Int32(2)
-        _out_nrec = fx.Int64(i32_M) * fx.Int64(topk) * fx.Int64(_rp)
 
     stids = flat_buffer(arg_stids, T.i32, 4)
     sweights = flat_buffer(arg_sweights, T.f32, 4)
     bias_f32 = None
     if const_expr(enable_bias):
-        bias_f32 = flat_buffer(arg_bias, T.f32, 4, nrec=bias_nbytes)
+        bias_f32 = flat_buffer(arg_bias, T.f32, 4)
     out_bf16 = flat_buffer(arg_out, T.bf16, 4)
     out_bf16_ptr = global_typed_ptr(arg_out, T.bf16, align=2)
     out_i8 = flat_buffer(arg_out, T.i8, 4)
