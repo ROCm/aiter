@@ -1142,8 +1142,16 @@ void inverse_rope_group_quant(
             // sort lands on a different set of addresses there and none of the
             // measurements behind it were taken on that placement.
             const int slots_per_wave = std::max(wave_size / THREADS_PER_GROUP, 1);
-            const bool tier_base_ok = !whole_row_block &&
-                                      LAYOUT == kScaleN32K4 && heads_k > 0 &&
+            // Row-major admits the same sort once the slice is narrow, and it is
+            // worth 13-18% there (md 23.4). Below that width the sort is not
+            // merely unhelpful but premature -- the groups a wave spans are too
+            // few to amortize it -- so it is gated rather than taken outright.
+            // TDS == 16 is that width on wave32, stated here as TDS because it
+            // is narrow_slice that picks it and narrow_slice is not yet in scope.
+            constexpr bool kTierLayoutOk =
+                LAYOUT == kScaleN32K4 || (LAYOUT == kScaleRowMajor && TDS == 16);
+            const bool tier_base_ok = !whole_row_block && kTierLayoutOk &&
+                                      heads_k > 0 &&
                                       k_slots > 0 && wave_size != 64;
             // Run 8 cuts the head in two and needs the nope side to be a whole
             // number of waves' slots. Run 4 instead makes a pass one hi value,
@@ -1216,7 +1224,7 @@ void inverse_rope_group_quant(
                     }
                 };
                 // Only instantiate the tiered kernels where they can ever run.
-                if constexpr(LAYOUT == kScaleN32K4 && kNopePerHd >= 4)
+                if constexpr(kTierLayoutOk && kNopePerHd >= 4)
                 {
                     if(tier == kTierRun4)
                     {
