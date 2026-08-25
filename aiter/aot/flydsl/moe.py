@@ -57,6 +57,7 @@ from aiter.ops.flydsl.mxfp4_kname import parse_flydsl_v2_gemm2_kernel
 # Keep the default AOT coverage aligned with runtime config resolution.
 DEFAULT_CSVS = [
     AITER_CONFIGS.AITER_CONFIG_FMOE_FILE,
+    AITER_CONFIGS.AITER_CONFIG_FHMOE_FILE,
 ]
 MOE_AOT_ARCH_DEFAULT = "gfx950"
 
@@ -68,8 +69,8 @@ def parse_csv(csv_path: str):
         kernel_name, stage, model_dim, inter_dim, experts, topk,
         doweight_stage1 (for stage1), and all params from get_flydsl_kernel_params.
 
-    Deduplicates by
-    (kernel_name, model_dim, inter_dim, experts, topk, doweight_stage1).
+    Deduplicates with ``job_identity``, including token bucket, block size, and
+    the shared-expert ID when present.
     """
     jobs = []
     seen = set()
@@ -85,6 +86,7 @@ def parse_csv(csv_path: str):
             doweight_stage1 = bool(int(row.get("doweight_stage1", "0")))
             cu_num = int(row.get("cu_num", "0"))
             block_m = int(row.get("block_m", "0") or "0")
+            shared_expert_id = int(row.get("shared_expert_id", "-1") or "-1")
             act_type = row.get("act_type", "")
             act_name = act_type.strip().split(".")[-1].lower()
             act = act_name if act_name in ("swiglu", "situv2") else "silu"
@@ -99,7 +101,11 @@ def parse_csv(csv_path: str):
                 and dtype in ("torch.bfloat16", "torch.float16")
                 and "float4_e2m1fn_x2" in q_dtype_w
             )
-            enable_bias_options = [False, True] if bias_supported else [False]
+            enable_bias_options = (
+                [False]
+                if shared_expert_id >= 0
+                else ([False, True] if bias_supported else [False])
+            )
 
             # Detect stage1's fuse_quant from kernel suffix to align stage2's
             # a2_scale shape with what runtime actually passes.
@@ -173,6 +179,8 @@ def parse_csv(csv_path: str):
                         "token_num": token,
                         "block_m": block_m,
                     }
+                    if shared_expert_id >= 0:
+                        job["shared_expert_id"] = shared_expert_id
                     # Stage2 needs to know whether stage1 fuses fp4/fp8 quant —
                     # this changes the shape of a2_scale (sorted scale buffer
                     # vs separate quant call output).
@@ -194,9 +202,7 @@ def parse_csv(csv_path: str):
 
                     jobs.append(full_job)
 
-    from aiter.aot.flydsl.fhmoe import extend_fhmoe_jobs
-
-    return extend_fhmoe_jobs(csv_path, jobs, seen)
+    return jobs
 
 
 def _precompile_to_cache(
@@ -648,6 +654,10 @@ def _precompile_to_cache(
                         _ptr_view_safe(torch.empty(0, device=dev, dtype=torch.float32)),
                         tokens,
                         sorted_token_ids.shape[0],
+                        1.0,
+                        1.0,
+                        1.0,
+                        1.0,
                         runtime_swiglu_limit(None, act),
                         0,
                     ),
@@ -955,7 +965,7 @@ def _precompile_epilogue_to_cache(act: str, inter_dim: int, topk: int):
             return
 
         exe = _get_compiled_silu_fused(
-            inter_dim, topk, quant_mode="none", gui_layout=True, act="silu"
+            inter_dim, topk, quant_mode="none", gui_layout=True, act=act
         )
         x = torch.zeros((rows, inter_dim * 2), dtype=torch.bfloat16, device=dev)
         out = torch.zeros((rows, inter_dim), dtype=torch.bfloat16, device=dev)
@@ -976,6 +986,10 @@ def _precompile_epilogue_to_cache(act: str, inter_dim: int, topk: int):
                 _ptr_view_safe(empty_f32),
                 rows,
                 sorted_token_ids.shape[0],
+                1.0,  # situ_beta
+                1.0,  # 1 / situ_beta
+                1.0,  # situ_linear_beta
+                1.0,  # 1 / situ_linear_beta
                 float("inf"),  # swiglu_limit (unused for silu)
                 0,  # stream: null/default (compile-only, kernel is never launched)
             ),

@@ -10,7 +10,7 @@ the JIT path hits the cache instead of compiling again.
 | `moe.py` | `MOE` | MoE / Mixed-MoE kernels (stage1 + stage2) |
 | `gemm.py` | `GEMM` | GEMM kernels |
 | `grouped_moe.py` | `GROUPED_MOE` | gfx1250 grouped MoE GEMM kernels |
-| `chunk_gdn_h.py` | `CHUNK_GDN_H` | chunk-gdn-h kernels |
+| `chunk_gdn_h.py` | `CHUNK_GDN_H` | chunk-gdn-h opt (K5) kernels |
 | `common.py` | — | Shared job collection, the deadlock-free fork pool, and cache-hit checking logic |
 
 ---
@@ -54,9 +54,7 @@ python -m aiter.aot.flydsl.chunk_gdn_h
 ```bash
 # Custom CSV(s) — every module supports --csv and accepts multiple paths
 python -m aiter.aot.flydsl.moe --csv /path/to/config1.csv /path/to/config2.csv
-
-# chunk_gdn_h also supports overriding the arch column for cross-compiling
-python -m aiter.aot.flydsl.chunk_gdn_h --target-arch gfx942
+python -m aiter.aot.flydsl.chunk_gdn_h --csv /path/to/tuned.csv
 ```
 
 ### Environment variables
@@ -76,9 +74,8 @@ python -m aiter.aot.flydsl.chunk_gdn_h --target-arch gfx942
 > for is derived per-job from the CSV's `cu_num` column (`cu_num_to_arch(...)`)
 > and applied internally via `FLYDSL_GPU_ARCH`. That internal var is overwritten
 > for every job, so setting `ARCH` / `GPU_ARCHS` / `FLYDSL_GPU_ARCH` in your shell
-> does **not** change what gets built. To cross-compile, use
-> `chunk_gdn_h --target-arch <arch>` (the only module that exposes an override),
-> or edit the `cu_num` column in the CSV.
+> does **not** change what gets built. To cross-compile, edit the `cu_num`
+> column in the CSV.
 
 Example:
 

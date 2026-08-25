@@ -678,3 +678,97 @@ def attention_ref_with_tol(q, k, v, do, is_fp8=False, **kwargs):
     bwd_tols = [_tol(dq, dq_pt), _tol(dk, dk_pt), _tol(dv, dv_pt)]
 
     return out, (dq, dk, dv), fwd_tol, bwd_tols
+
+
+def opus_ref_lse(q, k, causal, budget=1 << 23):
+    """fp32 logsumexp of the scaled scores, bottom-right causal, GQA-aware.
+
+    attention_ref downcasts its lse to the input dtype, too coarse to check against.
+    Chunked over query rows (`budget` score elements) to bound peak memory.
+    """
+    batch, seqlen_q, nheads, d = q.shape
+    seqlen_k, nheads_k = k.shape[1], k.shape[2]
+    group = nheads // nheads_k
+    scale = d**-0.5
+
+    k_f = k.float()
+    lse = torch.empty((batch, nheads, seqlen_q), dtype=torch.float32, device=q.device)
+    col = torch.arange(seqlen_k, device=q.device)
+    off = seqlen_k - seqlen_q
+    rows = max(1, budget // max(1, batch * nheads * seqlen_k))
+
+    for lo in range(0, seqlen_q, rows):
+        hi = min(lo + rows, seqlen_q)
+        q_c = q[:, lo:hi].float().reshape(batch, hi - lo, nheads_k, group, d)
+        scores = torch.einsum("bthgd,bshd->bhgts", q_c, k_f) * scale
+        if causal:
+            row = torch.arange(lo, hi, device=q.device)[:, None]
+            scores = scores.masked_fill(col > row + off, float("-inf"))
+        lse[:, :, lo:hi] = torch.logsumexp(scores, dim=-1).reshape(
+            batch, nheads, hi - lo
+        )
+    return lse
+
+
+def opus_check_lse(tag, lse, lse_ref):
+    """Compare fp32 LSE against opus_ref_lse.
+
+    0.01 accommodates D=128 folding softmax_scale into bf16 Q (~4e-3 off an fp32
+    post-scale reference); D=192 lands at ~1e-6.
+    """
+    assert lse.dtype == torch.float32, f"{tag}: lse dtype {lse.dtype}, expected float32"
+    assert torch.equal(
+        torch.isneginf(lse), torch.isneginf(lse_ref)
+    ), f"{tag}: -inf (fully-masked row) pattern differs from the reference"
+    finite = ~torch.isneginf(lse_ref)
+    diff = (lse[finite] - lse_ref[finite]).abs().max().item() if finite.any() else 0.0
+    print(f"[{tag}] lse max diff: {diff}")
+    assert diff <= 0.01, f"{tag}: lse diff {diff} > 0.01"
+
+
+def sparse_mla_dsv4_ref(q, kv, topk_indices, attn_sink=None, scale=None):
+    """fp32 reference forward for the DeepSeek-V4 sparse MLA attention.
+
+    The official V4 form: shared-KV GQA where ``K == V == kv`` is one dense ``head_dim``-wide
+    tensor, RoPE already applied in place caller-side, ``attn_sink`` folded into the softmax
+    denominator only, and ``topk_indices == -1`` masked out.
+
+    Differentiable in ``q`` / ``kv`` / ``attn_sink``, so a backward reference is just autograd
+    through this. It is a per-token python loop, so keep the shapes small.
+
+    Args:
+        q:            [T, H, D] float32, requires_grad for a backward reference
+        kv:           [num_kv, D] float32, ``num_kv >= T``; rows ``T..`` are the compressed pool
+        topk_indices: [T, TOPK] int, -1 marks an invalid slot
+        attn_sink:    [H] float32 or None
+        scale:        softmax scale, defaults to ``1/sqrt(D)``
+
+    Returns:
+        ``(o, lse)`` -- ``o`` [T, H, D] float32 carrying grad, and ``lse`` [T, H] float32
+        detached and sink-inclusive, which is the convention the backward kernel expects.
+        A row whose top-k is entirely -1 gets ``o = 0`` and ``lse = -inf``.
+    """
+    if scale is None:
+        scale = 1.0 / (q.shape[-1] ** 0.5)
+    outs, lses = [], []
+    for t in range(q.shape[0]):
+        idx = topk_indices[t].long()
+        valid = idx != -1
+        k = kv[idx.clamp(min=0)]
+        k = torch.where(valid[:, None], k, torch.zeros_like(k))
+        s = (q[t] @ k.t()) * scale
+        s = torch.where(valid[None, :], s, torch.full_like(s, float("-inf")))
+        row_max = s.max(dim=1).values
+        m = row_max if attn_sink is None else torch.maximum(row_max, attn_sink)
+        p = torch.where(valid[None, :], torch.exp(s - m[:, None]), torch.zeros_like(s))
+        denom = p.sum(dim=1)
+        if attn_sink is not None:
+            denom = denom + torch.exp(attn_sink - m)
+        # A row whose top-k is entirely -1 has no contributors at all, and without a sink the
+        # denominator is then 0. Define that row's output as zero rather than letting 0/0 make
+        # it NaN; the lse stays -inf, which is the honest value for an empty row.
+        outs.append(
+            (p @ k) / torch.where(denom > 0, denom, torch.ones_like(denom))[:, None]
+        )
+        lses.append((m + torch.log(denom)).detach())
+    return torch.stack(outs, dim=0), torch.stack(lses, dim=0)
