@@ -276,6 +276,28 @@ def get_gluon_a8w4_ctas_per_cga(m):
     return [1, num_ctas]
 
 
+def _untuned_config_gluon(n, k, block_m, out_mx_quant):
+    """Shape-derived (block_n, block_k, num_buffers, num_warps, persistent_iters)
+    for shapes with no tuned entry."""
+    num_warps = 4
+    if block_m == 16:
+        # The persistent decode kernel has no MXFP8 emit path (HAS_MX_OUT);
+        # route out_mx_quant to the non-persistent decode kernel.
+        if k <= 768 and not out_mx_quant:
+            return 128, 256, 2, num_warps, 3
+        if n <= 1536:
+            return 128, 512, 3, num_warps, 0
+        if n <= 3072:
+            return 128, 512, 2, num_warps, 0
+        if n <= 4096:
+            return 256, 512, 1, num_warps, 0
+        return 512, 512, 1, num_warps, 0
+    if block_m == 32:
+        block_n = 128 if n <= 1024 else 256
+        return block_n, 512, 3, num_warps, 0
+    return 256, 256, 3, num_warps, 0
+
+
 def get_kernel_config_gluon(m, n, k, routing_data, out_mx_quant=False):
     ctas_per_cga = get_gluon_a8w4_ctas_per_cga(m)
     num_ctas = ctas_per_cga[0] * ctas_per_cga[1]
@@ -287,16 +309,22 @@ def get_kernel_config_gluon(m, n, k, routing_data, out_mx_quant=False):
     bucket = m2bucket(m)
     tuned = _get_a8w4_dispatch(get_arch())
     key = f"bm{block_m}_n{n}_k{k}_{bucket}"
-    if key not in tuned:
-        key = f"bm{block_m}_any"
-    cfg = tuned[key]
-    block_n, block_k, num_buffers, num_warps, persistent_iters = (
-        cfg["block_n"],
-        cfg["block_k"],
-        cfg["num_buffers"],
-        cfg["num_warps"],
-        cfg["persistent_iters"],
-    )
+    if key in tuned:
+        cfg = tuned[key]
+        block_n, block_k, num_buffers, num_warps, persistent_iters = (
+            cfg["block_n"],
+            cfg["block_k"],
+            cfg["num_buffers"],
+            cfg["num_warps"],
+            cfg["persistent_iters"],
+        )
+    else:
+        # The generic bm*_any entries are not a safe stand-in for an untuned
+        # shape: they force BLOCK_K=256, which yields wrong results for
+        # block_m <= 32. Fall back to the shape-derived configuration instead.
+        block_n, block_k, num_buffers, num_warps, persistent_iters = (
+            _untuned_config_gluon(n, k, block_m, out_mx_quant)
+        )
 
     num_buffers = min(num_buffers, triton.cdiv(k, block_k))
     block_m *= ctas_per_cga[0]
