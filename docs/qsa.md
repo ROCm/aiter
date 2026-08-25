@@ -41,7 +41,8 @@ Paged MQA scoring auto-selects Gluon only when all of the following hold:
 
 - the device architecture is gfx950 and the Gluon kernels imported
   successfully with Triton 3.6 or newer;
-- the query is BF16 with shape `[tokens, 8, 128]`;
+- the query is BF16 with shape `[tokens, 4, 128]` (the released Qwen3.8
+  checkpoint) or `[tokens, 8, 128]` (the earlier Qwen-Air checkpoint);
 - `compress_ratio` is 4; and
 - the query, compressed K cache, and output can use signed 32-bit buffer
   offsets.
@@ -65,7 +66,7 @@ error. Large-address cases therefore remain on Triton.
 
 ## Validation and performance
 
-On gfx950, the eight QSA tests passed, including forced Triton/Gluon parity for
+On gfx950, the QSA test suite passed, including forced Triton/Gluon parity for
 page boundaries, causal masking, invalid indices, multiple request page
 tables, head dimension 128, Qwen-Air grouped-query geometry, and selection
 width 2051. The vLLM QSA integration tests passed (3 passed, 5 deselected), and
@@ -74,6 +75,8 @@ integration paths.
 
 Representative median kernel times were:
 
+- released Qwen3.8 paged MQA scorer, query shape `(32, 4, 128)` with 4096
+  columns: Triton 0.018383 ms, Gluon 0.017566 ms (4.5% lower latency, 1.047x);
 - paged MQA scorer, query shape `(32, 8, 128)` with 4096 columns: Triton
   0.0229 ms, Gluon 0.0164 ms (28% faster);
 - sparse GQA, query shape `(16, 10, 128)` with selection width 2051 and ordered

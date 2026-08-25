@@ -400,9 +400,10 @@ def test_qsa_sparse_paged_gqa_qwen_air_selection_width():
     torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
 
 
-def test_qsa_forced_gluon_mqa_matches_triton_across_pages_and_requests():
+@pytest.mark.parametrize("index_heads", (4, 8))
+def test_qsa_forced_gluon_mqa_matches_triton_across_pages_and_requests(index_heads):
     torch.manual_seed(6)
-    q = torch.randn(4, 8, 128, device="cuda", dtype=torch.bfloat16)
+    q = torch.randn(4, index_heads, 128, device="cuda", dtype=torch.bfloat16)
     cache = torch.randn(9, 4, 1, 128, device="cuda", dtype=torch.bfloat16)
     page_table = torch.tensor(
         [
@@ -438,12 +439,24 @@ def test_qsa_forced_gluon_mqa_matches_triton_across_pages_and_requests():
         compress_ratio=4,
         backend="gluon",
     )
+    auto_logits, auto_visible = qsa_paged_mqa_logits(
+        q,
+        cache,
+        page_table,
+        token_to_request,
+        query_positions,
+        context_lens,
+        compress_ratio=4,
+        backend="auto",
+    )
     expected = _mqa_reference(q, cache, page_table, token_to_request, expected_visible)
 
     torch.testing.assert_close(triton_visible, expected_visible)
     torch.testing.assert_close(gluon_visible, expected_visible)
+    torch.testing.assert_close(auto_visible, expected_visible)
     torch.testing.assert_close(triton_logits, expected, rtol=2e-3, atol=2e-3)
     torch.testing.assert_close(gluon_logits, triton_logits, rtol=2e-3, atol=2e-3)
+    torch.testing.assert_close(auto_logits, gluon_logits, rtol=2e-3, atol=2e-3)
 
 
 def test_qsa_forced_gluon_sparse_gqa_qwen_geometry_and_width():

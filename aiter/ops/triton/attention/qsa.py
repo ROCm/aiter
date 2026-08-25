@@ -24,7 +24,7 @@ from aiter.ops.triton._triton_kernels.attention.qsa_sparse_paged_gqa import (
 
 _DEFAULT_LOGITS_WORKSPACE_BYTES = 128 * 1024 * 1024
 _MAX_INT32 = (1 << 31) - 1
-_GLUON_MQA_HEADS = 8
+_GLUON_MQA_HEAD_COUNTS = (4, 8)
 _GLUON_HEAD_DIM = 128
 _GLUON_GQA_GROUP_SIZE = 5
 _GLUON_SPARSE_WIDTH = 2051
@@ -167,7 +167,7 @@ def qsa_paged_mqa_logits(
     block_n = 32
     gluon_compatible = (
         _gluon_qsa_paged_mqa_logits_kernel is not None
-        and q.shape[1] == _GLUON_MQA_HEADS
+        and q.shape[1] in _GLUON_MQA_HEAD_COUNTS
         and q.shape[2] == _GLUON_HEAD_DIM
         and compress_ratio == 4
         and _has_safe_buffer_offsets(q, compressed_k_cache, logits)
@@ -175,7 +175,7 @@ def qsa_paged_mqa_logits(
     if selected_backend == "gluon" and not gluon_compatible:
         raise RuntimeError(
             "forced Gluon QSA scoring requires gfx950, Triton >= 3.6, "
-            "BF16 [tokens, 8, 128] queries, compress_ratio=4, and "
+            "BF16 [tokens, 4 or 8, 128] queries, compress_ratio=4, and "
             "signed-32-bit buffer offsets"
         )
     use_gluon = selected_backend != "triton" and gluon_compatible
