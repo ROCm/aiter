@@ -18,6 +18,13 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+def _require_gfx950_gluon() -> None:
+    from aiter.ops.triton.utils._triton.arch_info import get_arch
+
+    if get_arch() != "gfx950":
+        pytest.skip("Gluon QSA kernels are currently supported only on gfx950")
+
+
 def _strided_int_vector(values):
     interleaved = [item for value in values for item in (value, 99)]
     return torch.tensor(interleaved, device="cuda", dtype=torch.int32)[::2]
@@ -402,6 +409,7 @@ def test_qsa_sparse_paged_gqa_qwen_air_selection_width():
 
 @pytest.mark.parametrize("index_heads", (4, 8))
 def test_qsa_forced_gluon_mqa_matches_triton_across_pages_and_requests(index_heads):
+    _require_gfx950_gluon()
     torch.manual_seed(6)
     q = torch.randn(4, index_heads, 128, device="cuda", dtype=torch.bfloat16)
     cache = torch.randn(9, 4, 1, 128, device="cuda", dtype=torch.bfloat16)
@@ -460,6 +468,7 @@ def test_qsa_forced_gluon_mqa_matches_triton_across_pages_and_requests(index_hea
 
 
 def test_qsa_forced_gluon_sparse_gqa_qwen_geometry_and_width():
+    _require_gfx950_gluon()
     torch.manual_seed(7)
     rows = 3
     page_size = 16
