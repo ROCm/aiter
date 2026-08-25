@@ -5524,6 +5524,8 @@ def pa_decode_gluon(
     assert key_cache.shape[4] == kv_elements_per_16b
 
     one_shot = max_context_partition_num <= 1
+    ps = ps or one_shot
+    uses_persistent_kernel = ps and not (sliding_window > 0 and kv_block_size == 1024)
 
     if exp_sums is None:
         exp_sums = torch.empty(
@@ -5648,7 +5650,7 @@ def pa_decode_gluon(
         raise NotImplementedError(
             "asymmetric Q/K and V head dimensions currently require one KV head"
         )
-    if asymmetric_value and not (ps or one_shot):
+    if asymmetric_value and not uses_persistent_kernel:
         raise NotImplementedError(
             "asymmetric Q/K and V head dimensions require the persistent PS kernel"
         )
@@ -5673,7 +5675,6 @@ def pa_decode_gluon(
     # ==================== ATTENTION DECODE KERNEL EXECUTION ====================
     # Determine output tensor and strides based on one_shot mode
     output_for_kernel = output_5d if one_shot else temporary_output
-    ps = ps or one_shot
     _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
         grid,
         exp_sums,
