@@ -284,9 +284,7 @@ class PackStorage:
     pack: fx.Array[fx.Int32, PACK_I32, 16]
 
 
-def make_qr_int4_kernel(
-    *, world_size: int = WORLD, super_tile: int = 1, grid: int
-):
+def make_qr_int4_kernel(*, world_size: int = WORLD, super_tile: int = 1, grid: int):
     if world_size not in SUPPORTED_WORLDS:
         raise ValueError(
             f"world_size must be one of {SUPPORTED_WORLDS}, got {world_size}"
