@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""gfx942 TP∈{2,4,8} INT4 two-shot all-reduce.
+"""gfx942/gfx950 TP∈{2,4,8} INT4 two-shot all-reduce.
 
 INT4 nibble: [-8,+7], −1/8, 4 B/thread, 1152 B rank-tile. Scale is
 group-16 signed E4M3 in the 128 B region. Super-tile ST∈{1,8}; host
@@ -26,7 +26,7 @@ ATOMS = 8
 TILE_BYTES = BLOCK * ATOMS * 16
 TILE_I32 = TILE_BYTES // 4
 TILE_FP16 = TILE_BYTES // 2
-GRID = 304 * 4
+DEFAULT_GRID_CAP = 304 * 4
 PHASES = 2
 PHASE_REDUCE_SCATTER = 0
 PHASE_ALL_GATHER = 1
@@ -284,7 +284,9 @@ class PackStorage:
     pack: fx.Array[fx.Int32, PACK_I32, 16]
 
 
-def make_qr_int4_kernel(*, world_size: int = WORLD, super_tile: int = 1):
+def make_qr_int4_kernel(
+    *, world_size: int = WORLD, super_tile: int = 1, grid: int
+):
     if world_size not in SUPPORTED_WORLDS:
         raise ValueError(
             f"world_size must be one of {SUPPORTED_WORLDS}, got {world_size}"
@@ -293,6 +295,8 @@ def make_qr_int4_kernel(*, world_size: int = WORLD, super_tile: int = 1):
         raise ValueError(f"ATOMS={ATOMS} is not divisible by world_size={world_size}")
     if super_tile not in SUPER_TILES:
         raise ValueError(f"super_tile must be one of {SUPER_TILES}, got {super_tile!r}")
+    if grid < 1:
+        raise ValueError(f"grid must be positive, got {grid}")
     # Each rank owns this many 16-byte atoms of a 32 KiB tile
     # (8 GPUs → 1, 4 → 2, 2 → 4). LDS still holds all ATOMS atoms.
     rank_atoms = ATOMS // world_size
@@ -302,7 +306,7 @@ def make_qr_int4_kernel(*, world_size: int = WORLD, super_tile: int = 1):
     wire_tile_i32 = release_i32_off + 16
     wire_tile_bytes = wire_tile_i32 * 4
 
-    flags_i32 = PHASES * GRID * world_size
+    flags_i32 = PHASES * grid * world_size
 
     @flyc.kernel(known_block_size=[BLOCK, 1, 1])
     def qr_int4(
@@ -355,11 +359,11 @@ def make_qr_int4_kernel(*, world_size: int = WORLD, super_tile: int = 1):
         # on the INT4 stripes when world_size < 8). Cover 18 as 8+8+2.
         fanout_int4_stripe = fx.make_layout((world_size, 8), (1, world_size))
         fanout_scale_stripe = fx.make_layout((world_size, 2), (1, world_size))
-        color_layout = fx.make_layout((GRID,), (1,))
+        color_layout = fx.make_layout((grid,), (1,))
         wire_slot_layout = fx.make_layout(
-            (PHASES, GRID, world_size, super_tile),
+            (PHASES, grid, world_size, super_tile),
             (
-                GRID * world_size * wire_tile_i32,
+                grid * world_size * wire_tile_i32,
                 world_size * wire_tile_i32,
                 wire_tile_i32,
                 rank_payload_i32,
@@ -599,11 +603,11 @@ def make_qr_int4_kernel(*, world_size: int = WORLD, super_tile: int = 1):
                     gathered.append(_codec_dequant(packed, scale))
             return gathered
 
-        n_block_tiles = (num_tiles - bid + fx.Int32(GRID - 1)) // fx.Int32(GRID)
+        n_block_tiles = (num_tiles - bid + fx.Int32(grid - 1)) // fx.Int32(grid)
         color = _load_color()
         if super_tile == 1:
             for i in range(fx.Int32(0), n_block_tiles, fx.Int32(1)):
-                tile = bid + i * fx.Int32(GRID)
+                tile = bid + i * fx.Int32(grid)
                 atoms = _load_tile_atoms(tile)
                 _pack_reduce_scatter(atoms)
                 gpu.barrier()
@@ -632,7 +636,7 @@ def make_qr_int4_kernel(*, world_size: int = WORLD, super_tile: int = 1):
                 n_this = (remain < st_i).select(remain, st_i)
 
                 for s in range(fx.Int32(0), n_this, fx.Int32(1)):
-                    tile = bid + (i + s) * fx.Int32(GRID)
+                    tile = bid + (i + s) * fx.Int32(grid)
                     atoms = _load_tile_atoms(tile)
                     _pack_reduce_scatter(atoms)
                     gpu.barrier()
@@ -663,7 +667,7 @@ def make_qr_int4_kernel(*, world_size: int = WORLD, super_tile: int = 1):
 
                 for s in range(fx.Int32(0), n_this, fx.Int32(1)):
                     gathered = _recv_all_gather(s)
-                    tile = bid + (i + s) * fx.Int32(GRID)
+                    tile = bid + (i + s) * fx.Int32(grid)
                     _store_tile_atoms(tile, gathered)
 
                 color = color + fx.Int32(1)
@@ -710,7 +714,7 @@ def make_qr_int4_kernel(*, world_size: int = WORLD, super_tile: int = 1):
     return {
         "launch": launch_qr_int4,
         "flags_bytes": flags_i32 * 4,
-        "data_bytes": PHASES * GRID * world_size * wire_tile_bytes,
+        "data_bytes": PHASES * grid * world_size * wire_tile_bytes,
         "lds_bytes": LDS_BYTES,
         "tile_bytes": TILE_BYTES,
         "tile_fp16": TILE_FP16,
@@ -719,6 +723,6 @@ def make_qr_int4_kernel(*, world_size: int = WORLD, super_tile: int = 1):
         "super_tile": super_tile,
         "world_size": world_size,
         "rank_atoms": rank_atoms,
-        "grid": GRID,
+        "grid": grid,
         "block": BLOCK,
     }

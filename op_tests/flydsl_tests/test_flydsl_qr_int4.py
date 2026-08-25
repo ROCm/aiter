@@ -5,14 +5,14 @@
 
 Pytest collects validity cases only (no timing). ``python3`` this file
 runs an aiter-op-test ``@benchmark`` / markdown sweep. Each rank times
-``fly.allreduce`` with default ``run_perftest`` after ``compile()``. The
-oracle is an untimed fp32 NCCL all-reduce of the same per-rank inputs.
-INT4 is lossy, so the gate is SQNR vs that oracle on **every** rank, not
+``fly.allreduce`` with ``run_perftest`` after ``compile()``. The oracle
+is an untimed fp32 NCCL all-reduce of the same per-rank inputs. INT4 is
+lossy, so the gate is SQNR vs that oracle on **every** rank, not
 bit-identity or tight ``checkAllclose``.
 
 5120 is a measured calibration width, not an ABI requirement. The kernel
-is gfx942 TP∈{2,4,8}; other archs skip. Pytest skips a world size when
-fewer GPUs are visible than TP.
+is gfx942/gfx950 TP∈{2,4,8}; other archs skip. Pytest skips a world size
+when fewer GPUs are visible than TP.
 """
 
 from __future__ import annotations
@@ -43,28 +43,28 @@ from aiter.test_common import benchmark, run_perftest
 
 pytest.importorskip("flydsl")
 
+from aiter.ops.flydsl.kernels.qr_int4 import DEFAULT_GRID_CAP
 from aiter.ops.flydsl.kernels.qr_int4_kernel import (
-    GRID,
     SUPPORTED_WORLDS,
     TILE_BYTES,
     WORLD,
 )
 
 ARCH = get_gfx_runtime()
-SUPPORTED_ARCHS = ("gfx942",)
+SUPPORTED_ARCHS = ("gfx942", "gfx950")
 SQNR_MIN_DB = 18.0
 SUPER_TILE = 8
 TP = WORLD
 
 pytestmark = pytest.mark.skipif(
     ARCH not in SUPPORTED_ARCHS,
-    reason="QRInt4 is gfx942-only",
+    reason="QRInt4 unsupported arch (need gfx942 or gfx950)",
 )
 
 # Distinct correctness branches, not a tokens x hidden product.
 # hidden=5120 is calibration; 4096 proves the map is not width-locked.
 # (8, 1024) is a half-tile tail (TILE_BYTES = 32 KiB).
-# TP2/4: ST=1 calib plus one ST=8 case (num_tiles > GRID) each.
+# TP2/4: ST=1 calib plus one ST=8 case (num_tiles > grid_cap) each.
 # Pytest skips a world size when fewer GPUs are visible than TP.
 _PYTEST_CASES = (
     (8, 8, 1024, "partial-tile"),
@@ -83,9 +83,15 @@ def _num_tiles(tokens: int, hidden: int) -> int:
     return max(1, (nbytes + TILE_BYTES - 1) // TILE_BYTES)
 
 
-def _pick_st(tokens: int, hidden: int, requested: int = SUPER_TILE) -> int:
+def _pick_st(
+    tokens: int,
+    hidden: int,
+    requested: int = SUPER_TILE,
+    *,
+    grid_cap: int = DEFAULT_GRID_CAP,
+) -> int:
     tiles = _num_tiles(tokens, hidden)
-    if requested == 1 or tiles > GRID:
+    if requested == 1 or tiles > grid_cap:
         return requested
     return 1
 
@@ -131,6 +137,7 @@ def _run_rank(args) -> None:
         rank=rank,
         world_size=args.tp,
         super_tile=args.super_tile,
+        grid_cap=args.grid_cap,
     )
     compile_tokens = min(512, max(args.tokens))
     compile_hidden = max(args.hiddens)
@@ -164,6 +171,7 @@ def _run_rank(args) -> None:
         row = {
             "tokens": tokens,
             "hidden": hidden,
+            "grid_cap": args.grid_cap,
             "st_used": fly._pick_st(tiles),
             "sqnr_db": _sqnr_db(got, ref),
             "rel_mae": _rel_mae(got, ref),
@@ -199,6 +207,7 @@ def _spawn(
     *,
     time_it: bool,
     super_tile: int = SUPER_TILE,
+    grid_cap: int = DEFAULT_GRID_CAP,
 ) -> list[list[dict]]:
     # HIP QR/fused-AR use multiprocessing.Pool from ``python3`` __main__.
     # This file is also collected by pytest, and FlyDSL JIT needs a fresh
@@ -216,7 +225,7 @@ def _spawn(
         f"{_REPO_ROOT}:{env['PYTHONPATH']}" if env.get("PYTHONPATH") else _REPO_ROOT
     )
     env["PYTHONUNBUFFERED"] = "1"
-    env.setdefault("FLYDSL_GPU_ARCH", "gfx942")
+    env.setdefault("FLYDSL_GPU_ARCH", ARCH)
     tokens = ",".join(str(t) for t, _ in pairs)
     hiddens = ",".join(str(h) for _, h in pairs)
     procs = []
@@ -237,6 +246,8 @@ def _spawn(
             hiddens,
             "--super-tile",
             str(super_tile),
+            "--grid-cap",
+            str(grid_cap),
         ]
         if time_it:
             cmd.append("--time-it")
@@ -286,7 +297,7 @@ def _assert_sqnr(
     world_size: int,
     label: str,
 ) -> dict:
-    expected_st = _pick_st(tokens, hidden)
+    expected_st = _pick_st(tokens, hidden, grid_cap=ranks[0][0]["grid_cap"])
     if len(ranks) != world_size:
         raise AssertionError(
             f"{label}: gathered {len(ranks)} ranks, expected {world_size}"
@@ -325,8 +336,8 @@ def test_qr_int4_sqnr_vs_fp32_allreduce(world_size, tokens, hidden, label):
 
 
 @benchmark()
-def test_qr_int4(tokens, hidden, dtype, tp):
-    ranks = _spawn(tp, [(tokens, hidden)], time_it=True)
+def test_qr_int4(tokens, hidden, dtype, tp, grid_cap=DEFAULT_GRID_CAP):
+    ranks = _spawn(tp, [(tokens, hidden)], time_it=True, grid_cap=grid_cap)
     row = _assert_sqnr(
         ranks,
         tokens=tokens,
@@ -341,6 +352,7 @@ def test_qr_int4(tokens, hidden, dtype, tp):
     return {
         "gfx": ARCH,
         "tp": tp,
+        "grid_cap": row["grid_cap"],
         "st_used": row["st_used"],
         "flydsl us": us,
         "flydsl TFLOPS": (flops / us / 1e6) if us else 0.0,
@@ -392,14 +404,24 @@ def main():
         type=dtypes.str2tuple,
         nargs="*",
         default=[
-            (512, 4096),
             (512, 5120),
-            (9216, 4096),
             (9216, 5120),
             (32768, 5120),
         ],
         help="(tokens, hidden) pairs. 5120 is calibration, not ABI.\n"
-        "    e.g.: -s 512,4096 9216,4096",
+        "    e.g.: -s 512,5120 9216,5120",
+    )
+    parser.add_argument(
+        "-o",
+        "--out",
+        default=None,
+        help="Optional JSON output path (rank-0 bench payload).",
+    )
+    parser.add_argument(
+        "--grid-cap",
+        type=int,
+        default=DEFAULT_GRID_CAP,
+        help="Persistent launch/inbox block cap (default 304*4=1216, matches HIP QR).",
     )
     args = parser.parse_args()
 
@@ -425,13 +447,32 @@ def main():
             if not isinstance(mnk, tuple) or len(mnk) < 2:
                 raise ValueError(f"-s expects tokens,hidden; got {mnk!r}")
             tokens, hidden = int(mnk[0]), int(mnk[1])
-            df.append(test_qr_int4(tokens, hidden, dtype, tp))
+            df.append(test_qr_int4(tokens, hidden, dtype, tp, grid_cap=args.grid_cap))
         if df:
             table = pd.DataFrame(df)
             aiter.logger.info(
                 "flydsl QR INT4 summary (markdown):\n%s",
                 table.to_markdown(index=False),
             )
+            if args.out:
+                out_dir = os.path.dirname(os.path.abspath(args.out))
+                if out_dir:
+                    os.makedirs(out_dir, exist_ok=True)
+                with open(args.out, "w") as fh:
+                    json.dump(
+                        {
+                            "meta": {
+                                "gfx": ARCH,
+                                "grid_cap": args.grid_cap,
+                                "timer": "run_perftest",
+                            },
+                            "rows": df,
+                        },
+                        fh,
+                        indent=2,
+                        default=str,
+                    )
+                aiter.logger.info("wrote %s", args.out)
 
 
 if __name__ == "__main__":
@@ -441,6 +482,7 @@ if __name__ == "__main__":
     parser.add_argument("--tokens", default="")
     parser.add_argument("--hiddens", default="")
     parser.add_argument("--super-tile", type=int, default=SUPER_TILE)
+    parser.add_argument("--grid-cap", type=int, default=DEFAULT_GRID_CAP)
     parser.add_argument("--time-it", action="store_true")
     parser.add_argument("--out", default=None)
     known, rest = parser.parse_known_args()

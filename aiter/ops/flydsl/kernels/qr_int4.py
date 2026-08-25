@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Host launch for gfx942 TP∈{2,4,8} INT4 two-shot all-reduce.
+"""Host launch for gfx942/gfx950 TP∈{2,4,8} INT4 two-shot all-reduce.
 
-Public type ``QRInt4``. Super-tile ST∈{1,8}; ST=1 when ``num_tiles ≤ GRID``.
+Public type ``QRInt4``. Super-tile ST∈{1,8}; ST=1 when ``num_tiles ≤ grid_cap``.
 INT4 nibble + group-16 E4M3. Payload HBM is bf16.
 """
 
@@ -20,7 +20,7 @@ from aiter.jit.utils.chip_info import get_gfx_runtime
 
 from .qr_int4_ipc import UncachedIpcHeap
 from .qr_int4_kernel import (
-    GRID,
+    DEFAULT_GRID_CAP,
     SUPER_TILES,
     SUPPORTED_WORLDS,
     TILE_BYTES,
@@ -28,7 +28,7 @@ from .qr_int4_kernel import (
     make_qr_int4_kernel,
 )
 
-_SUPPORTED_ARCH = "gfx942"
+_SUPPORTED_ARCHS = ("gfx942", "gfx950")
 
 
 def _cuda_index(device) -> int:
@@ -49,6 +49,7 @@ class _StEngine:
         self.launch = spec["launch"]
         self.compiled = None
         self.super_tile = spec["super_tile"]
+        self.grid = spec["grid"]
         self.buf_bytes = spec["flags_bytes"] + spec["data_bytes"]
         self.lds_bytes = spec["lds_bytes"]
         self.tile_bytes = spec["tile_bytes"]
@@ -74,7 +75,7 @@ class _StEngine:
                 peer_ptrs[r] = base + off
 
         peer_bytes = world_size * 8
-        color_bytes = GRID * 4
+        color_bytes = self.grid * 4
         self._meta_ptr = UncachedIpcHeap.alloc_uncached(peer_bytes + color_bytes)
         self._gpu_peer_ptrs = self._meta_ptr
         self._colors = self._meta_ptr + peer_bytes
@@ -85,7 +86,7 @@ class _StEngine:
         )
         UncachedIpcHeap.copy_host_to_device(
             self._colors,
-            (ctypes.c_int32 * GRID)(*([1] * GRID)),
+            (ctypes.c_int32 * self.grid)(*([1] * self.grid)),
             color_bytes,
         )
 
@@ -122,6 +123,7 @@ class QRInt4:
         rank: int,
         world_size: int = WORLD,
         super_tile: int = 8,
+        grid_cap: int | None = None,
     ):
         if world_size not in SUPPORTED_WORLDS:
             raise ValueError(
@@ -140,8 +142,13 @@ class QRInt4:
         if group_rank != int(rank):
             raise ValueError(f"rank={rank} does not match group rank {group_rank}")
         arch = get_gfx_runtime()
-        if arch != _SUPPORTED_ARCH:
-            raise RuntimeError(f"QRInt4 is {_SUPPORTED_ARCH}-only, got {arch}")
+        if arch not in _SUPPORTED_ARCHS:
+            raise RuntimeError(
+                f"QRInt4 supports {', '.join(_SUPPORTED_ARCHS)}, got {arch}"
+            )
+        cap = DEFAULT_GRID_CAP if grid_cap is None else int(grid_cap)
+        if cap < 1:
+            raise ValueError(f"grid_cap must be positive, got {cap}")
         torch.cuda.set_device(device)
         self.group = group
         self.device = device
@@ -149,6 +156,7 @@ class QRInt4:
         self.rank = int(rank)
         self.world_size = int(world_size)
         self.super_tile = int(super_tile)
+        self._grid = cap
 
         sts = [1]
         if self.super_tile != 1:
@@ -158,6 +166,7 @@ class QRInt4:
             spec = make_qr_int4_kernel(
                 world_size=self.world_size,
                 super_tile=st,
+                grid=self._grid,
             )
             self._by_st[st] = _StEngine(
                 spec=spec,
@@ -175,7 +184,7 @@ class QRInt4:
         self.wire_tile_bytes = primary.wire_tile_bytes
 
     def _pick_st(self, num_tiles: int) -> int:
-        if self.super_tile == 1 or num_tiles > GRID:
+        if self.super_tile == 1 or num_tiles > self._grid:
             return self.super_tile
         return 1
 
@@ -206,7 +215,7 @@ class QRInt4:
     def _launch_eng(self, eng: _StEngine, inp, out, stream) -> None:
         live_bytes = int(inp.numel()) * int(inp.element_size())
         num_tiles = max(1, (live_bytes + TILE_BYTES - 1) // TILE_BYTES)
-        grid_x = min(num_tiles, GRID)
+        grid_x = min(num_tiles, self._grid)
         if stream is None:
             stream = Stream(None)
         args = (
@@ -228,7 +237,7 @@ class QRInt4:
     def compile(self, inp, out, stream=None) -> None:
         """Eager-JIT every ST binary. Optional: first ``allreduce`` JIT-compiles the picked ST.
 
-        Default ST=8 also builds an ST=1 engine for ``num_tiles ≤ GRID``.
+        Default ST=8 also builds an ST=1 engine for ``num_tiles ≤ grid_cap``.
         Skipping this method is correct for a single size class: that
         ``allreduce`` calls ``flyc.compile`` for the chosen ST only, and a
         later size that picks the other ST JIT-compiles then.
