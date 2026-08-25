@@ -270,20 +270,33 @@ def _ref_selection_with_nan(gating_output, bias, score_func):
     return sel.masked_fill(exclude, float("-inf"))
 
 
-def _starved_rows_finite(num_experts, num_tokens, topk, score_func, dtype):
-    """Do rows with fewer valid experts than topk still yield finite weights?
+def _starved_rows_ok(num_experts, num_tokens, topk, score_func, dtype):
+    """Does a row with fewer valid experts than topk degrade the documented way?
 
     Such a row cannot fill every slot, so the kernel elects a sentinel for the
-    remainder. If that sentinel reaches the renorm sum, fmaxf() drops the sum
-    to RENORM_SUM_FLOOR and rescales the row's *valid* weights by ~1e20, so a
-    single starved row corrupts the experts it did resolve. Reuses the sweep's
-    token count to keep the same dispatch path as the measured case.
+    remainder, and what that sentinel is worth decides how far the damage goes.
+    Reaching the renorm sum, it drops the sum to RENORM_SUM_FLOOR and rescales
+    the row's *valid* weights by ~1e20, so one starved row corrupts the experts
+    it did resolve. Keeping a weight of its own is worse: the slot becomes a
+    real routing decision for a token that has none to make, and since every
+    sentinel elects the same expert, the id repeats across the slots.
+
+    Two poisoned rows, so both halves are checked: row 0 has no valid expert at
+    all and must come out all-zero, row 1 is short by exactly one slot and must
+    weight precisely its valid experts -- an id set, so a sentinel that either
+    takes a slot or duplicates a real one fails. Reuses the sweep's token count
+    to keep the same dispatch path as the measured case.
     """
     gating_output = _make_gating(num_experts, num_tokens, dtype)
     gating_output[0, :] = float("nan")  # no valid expert at all
-    if num_tokens > 1:
-        gating_output[1, :] = float("nan")
-        gating_output[1, 5 % num_experts] = 1.0  # exactly one valid expert
+    starved_row = 1 if (num_tokens > 1 and topk > 1) else None
+    valid_experts = []
+    if starved_row is not None:
+        # Short by one slot. Distinct logits, so no tie-break is involved.
+        valid_experts = [(5 + i) % num_experts for i in range(topk - 1)]
+        gating_output[starved_row, :] = float("nan")
+        for i, e in enumerate(valid_experts):
+            gating_output[starved_row, e] = 1.0 + 0.5 * i
 
     topk_weights = torch.empty((num_tokens, topk), dtype=torch.float32, device="cuda")
     topk_ids = torch.empty((num_tokens, topk), dtype=torch.int32, device="cuda")
@@ -296,7 +309,18 @@ def _starved_rows_finite(num_experts, num_tokens, topk, score_func, dtype):
         routed_scaling_factor=2.5,
         score_func=score_func,
     )
-    return bool(topk_weights.isfinite().all().item())
+
+    if not topk_weights.isfinite().all().item():
+        return False
+    if ((topk_ids < 0) | (topk_ids >= num_experts)).any().item():
+        return False
+    if (topk_weights[0] != 0.0).any().item():
+        return False
+    if starved_row is not None:
+        held = topk_ids[starved_row][topk_weights[starved_row] != 0.0]
+        if sorted(held.tolist()) != sorted(valid_experts):
+            return False
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -570,7 +594,7 @@ def bench_topk_gating_nan(num_experts, num_tokens, topk, score_func, dtype):
     )
     nan_leak = bool(topk_weights.isnan().any().item())
     inf_leak = bool(topk_weights.isinf().any().item())
-    starved_ok = _starved_rows_finite(num_experts, num_tokens, topk, score_func, dtype)
+    starved_ok = _starved_rows_ok(num_experts, num_tokens, topk, score_func, dtype)
 
     nbytes = (
         num_tokens * num_experts * gating_output.element_size()
@@ -878,7 +902,7 @@ def main():
         if len(errors) > 0:
             print(
                 f"\nERROR: {len(errors)} nan config(s) failed "
-                f"(err>0, nan/inf leak, or non-finite weights on a starved row)!"
+                f"(err>0, nan/inf leak, or a mis-weighted starved row)!"
             )
             print(errors.to_string(index=False))
             failed_sections.append("nan")

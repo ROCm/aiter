@@ -789,7 +789,15 @@ void topk_gating_kernel_prefill(
         for(int off = THREADS_PER_ROW >> 1; off >= 1; off >>= 1)
             local_sum += __shfl_xor(local_sum, off);
 
-        float inv_sum = __builtin_amdgcn_rcpf(fmaxf(local_sum, RENORM_SUM_FLOOR));
+        // local_max == -Inf means the row had no valid expert at all. Every diff
+        // is then -Inf - -Inf = NaN, which the +Inf case above reads as ex = 1.0,
+        // so the row would normalize to a uniform 1/E and the merge below would
+        // hand a token with nothing to route full-weight slots. Scale by 0 to get
+        // the all-zero weights the smem kernels reach by clamping their -Inf
+        // selection score, and that RENORM_SUM_FLOOR documents for this row.
+        float inv_sum = (local_max == -INFINITY)
+                            ? 0.0f
+                            : __builtin_amdgcn_rcpf(fmaxf(local_sum, RENORM_SUM_FLOOR));
 #pragma unroll
         for(int i = 0; i < VPT; i++)
         {
