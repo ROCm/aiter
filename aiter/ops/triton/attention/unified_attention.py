@@ -66,7 +66,7 @@ def is_gfx950_small_head(head_size):
     return DEVICE_ARCH == "gfx950" and head_size <= 128
 
 
-def is_2d_gluon_available(
+def is_2d_gfx1250_gluon_available(
     q_dtype, kv_cache_dtype, softcap, use_qq_bias, use_alibi_slopes
 ):
     use_gluon_2d = (
