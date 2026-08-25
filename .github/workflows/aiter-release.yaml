@@ -166,7 +166,7 @@ jobs:
       DOCKER_PASSWORD_SECRET: ${{ github.event_name == 'workflow_dispatch' && needs.ci_config.outputs.docker_password_secret || '' }}
       BUILD_REF: ${{ inputs.commit || github.event.inputs.commit || '' }}
       ARTIFACT_SUFFIX: ${{ inputs.artifact_suffix || '' }}
-      DOCKER_LOGIN: ${{ inputs.docker_login || false }}
+      DOCKER_LOGIN: ${{ github.event_name == 'workflow_dispatch' || inputs.docker_login || false }}
 
     steps:
       - name: Checkout aiter repo
