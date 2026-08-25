@@ -1265,11 +1265,11 @@ def mha_v4(
     lut_count: Optional[Tensor] = None  # noqa: UP045
     if block_mask is not None:
         lut_indices, lut_start, lut_count = _block_mask_to_lut(block_mask, q, k)
-    packed_lut = dict(
-        kv_block_indices=lut_indices,
-        lut_start=lut_start,
-        lut_count=lut_count,
-    )
+    packed_lut = {
+        "kv_block_indices": lut_indices,
+        "lut_start": lut_start,
+        "lut_count": lut_count,
+    }
     if q_format == AttentionFormat.BF16:
         return mha_v4_packed(
             q,

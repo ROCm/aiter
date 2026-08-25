@@ -1205,12 +1205,8 @@ def test_mha_v4_sparse_gqa_all_true_mask_matches_repeated_kv(q_format, v_format)
     v_repeated = v.repeat_interleave(gqa_ratio, dim=2)
 
     gqa_dense = mha_v4(q, k, v, q_format, q_format, v_format)
-    gqa_sparse = mha_v4(
-        q, k, v, q_format, q_format, v_format, block_mask=mask
-    )
-    mha_dense = mha_v4(
-        q, k_repeated, v_repeated, q_format, q_format, v_format
-    )
+    gqa_sparse = mha_v4(q, k, v, q_format, q_format, v_format, block_mask=mask)
+    mha_dense = mha_v4(q, k_repeated, v_repeated, q_format, q_format, v_format)
     mha_sparse = mha_v4(
         q,
         k_repeated,

@@ -933,9 +933,6 @@ def make_kernel_runner(
     i8fp8_scale_modes = scale_modes_for_formats(
         AttentionFormat.INT8, AttentionFormat.INT8, fp8_format
     )
-    mxfp4_scale_modes = scale_modes_for_formats(
-        AttentionFormat.MXFP4, AttentionFormat.MXFP4, fp8_format
-    )
     packed_sparse = _mha_v4_packed_sparse_kwargs(block_lut)
     raw_sparse = (
         {"block_mask": block_mask}

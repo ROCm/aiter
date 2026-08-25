@@ -42,12 +42,12 @@ constexpr int64_t format_id(AttentionFormat format) { return static_cast<int64_t
 // Scale granularity is dispatched independently from the operand encoding.
 enum class AttentionScaleMode : int64_t
 {
-    None                 = 0,
-    F32PerTensor         = 1,
-    F32PerHead           = 2,
-    F32PerToken          = 3,
-    F32PerChannel        = 4,
-    E8M0Per1x32          = 5,
+    None          = 0,
+    F32PerTensor  = 1,
+    F32PerHead    = 2,
+    F32PerToken   = 3,
+    F32PerChannel = 4,
+    E8M0Per1x32   = 5,
 };
 
 constexpr int64_t scale_mode_id(AttentionScaleMode mode) { return static_cast<int64_t>(mode); }
@@ -165,9 +165,8 @@ void check_format_tensor(const at::Tensor& tensor, int64_t format, const char* n
     }
     else if(format == format_id(AttentionFormat::Fp8E4M3))
     {
-        TORCH_CHECK(tensor.scalar_type() == at::ScalarType::Float8_e4m3fn,
-                    name,
-                    " must be FP8 E4M3 FN");
+        TORCH_CHECK(
+            tensor.scalar_type() == at::ScalarType::Float8_e4m3fn, name, " must be FP8 E4M3 FN");
     }
     else if(format == format_id(AttentionFormat::Fp8E4M3Fnuz))
     {
@@ -201,11 +200,11 @@ const fmha_v4_fwdConfig& find_config(const std::string& arch,
     {
         const auto& cfg = entry.second;
         if(cfg.arch == arch && cfg.q_format == q_format && cfg.k_format == k_format &&
-               cfg.v_format == v_format && cfg.q_scale_mode == q_scale_mode &&
-               cfg.k_scale_mode == k_scale_mode && cfg.v_scale_mode == v_scale_mode &&
-               cfg.o_format == format_id(AttentionFormat::Bf16) &&
-               cfg.o_scale_mode == scale_mode_id(AttentionScaleMode::None) &&
-           cfg.hdim_q == kHeadDim && cfg.hdim_v == kHeadDim && cfg.mask == 0 && cfg.mode == mode)
+           cfg.v_format == v_format && cfg.q_scale_mode == q_scale_mode &&
+           cfg.k_scale_mode == k_scale_mode && cfg.v_scale_mode == v_scale_mode &&
+           cfg.o_format == format_id(AttentionFormat::Bf16) &&
+           cfg.o_scale_mode == scale_mode_id(AttentionScaleMode::None) && cfg.hdim_q == kHeadDim &&
+           cfg.hdim_v == kHeadDim && cfg.mask == 0 && cfg.mode == mode)
             return cfg;
     }
     TORCH_CHECK(false,
@@ -321,15 +320,12 @@ __global__ void rank_and_pack_work_table_kernel(int32_t* __restrict__ table,
     }
 }
 
-at::Tensor build_sorted_work_table(const at::Tensor& lut_count,
-                                   int64_t batch,
-                                   int64_t nhead,
-                                   int64_t q_tiles)
+at::Tensor
+build_sorted_work_table(const at::Tensor& lut_count, int64_t batch, int64_t nhead, int64_t q_tiles)
 {
-    auto flat             = lut_count.reshape({-1}).contiguous();
-    const int64_t total   = batch * nhead * q_tiles;
-    TORCH_CHECK(flat.numel() == total,
-                "lut_count.numel() must equal batch * heads * query_tiles");
+    auto flat           = lut_count.reshape({-1}).contiguous();
+    const int64_t total = batch * nhead * q_tiles;
+    TORCH_CHECK(flat.numel() == total, "lut_count.numel() must equal batch * heads * query_tiles");
     TORCH_CHECK(batch < 256 && nhead < 256 && q_tiles < 65536,
                 "sorted work table packing requires batch<256, heads<256, query_tiles<65536");
     TORCH_CHECK(total <= std::numeric_limits<int32_t>::max(),
@@ -351,8 +347,7 @@ at::Tensor build_sorted_work_table(const at::Tensor& lut_count,
         // One wave per entry, so the grid follows the table rather than the machine. Every block
         // stages the whole key array, which is why the launch stays one dimension.
         const int32_t waves_per_block = kWorkTableSortThreads / kWorkTableWave;
-        const dim3 grid(
-            static_cast<uint32_t>((total + waves_per_block - 1) / waves_per_block));
+        const dim3 grid(static_cast<uint32_t>((total + waves_per_block - 1) / waves_per_block));
         rank_and_pack_work_table_kernel<<<grid, dim3(kWorkTableSortThreads), 0, stream>>>(
             table.data_ptr<int32_t>(),
             flat.data_ptr<int32_t>(),
@@ -367,12 +362,11 @@ at::Tensor build_sorted_work_table(const at::Tensor& lut_count,
     const auto order = at::argsort(flat, /*stable=*/true, /*dim=*/0, /*descending=*/true);
     constexpr int32_t block_size = 256;
     const dim3 grid(static_cast<uint32_t>((total + block_size - 1) / block_size));
-    pack_work_table_kernel<<<grid, dim3(block_size), 0, stream>>>(
-        table.data_ptr<int32_t>(),
-        order.data_ptr<int64_t>(),
-        static_cast<int32_t>(total),
-        static_cast<int32_t>(q_tiles),
-        static_cast<int32_t>(nhead));
+    pack_work_table_kernel<<<grid, dim3(block_size), 0, stream>>>(table.data_ptr<int32_t>(),
+                                                                  order.data_ptr<int64_t>(),
+                                                                  static_cast<int32_t>(total),
+                                                                  static_cast<int32_t>(q_tiles),
+                                                                  static_cast<int32_t>(nhead));
     return table;
 }
 
@@ -479,23 +473,24 @@ PackedMhaV4Shapes validate_packed_mha_v4(const at::Tensor& q,
     check_format_tensor(q, q_format, "Q");
     check_format_tensor(k, k_format, "K");
     check_format_tensor(v, v_format, "V");
-    TORCH_CHECK(q.stride(-1) == 1 && k.stride(-1) == 1 && v.stride(-1) == 1 &&
-                    out.stride(-1) == 1,
+    TORCH_CHECK(q.stride(-1) == 1 && k.stride(-1) == 1 && v.stride(-1) == 1 && out.stride(-1) == 1,
                 "Q, K, V, and out must have contiguous last dimensions");
 
     PackedMhaV4Shapes shapes{};
-    shapes.batch        = q.size(0);
-    shapes.seqlen_q     = q.size(1);
-    shapes.nhead_q      = q.size(2);
-    shapes.seqlen_k     = k.size(1);
-    shapes.nhead_k      = k.size(2);
-    const int64_t packed_width = q_format == format_id(AttentionFormat::Fp6E2M3) ? 96 :
-                                 q_format == format_id(AttentionFormat::Fp4E2M1) ? 64 : 128;
+    shapes.batch               = q.size(0);
+    shapes.seqlen_q            = q.size(1);
+    shapes.nhead_q             = q.size(2);
+    shapes.seqlen_k            = k.size(1);
+    shapes.nhead_k             = k.size(2);
+    const int64_t packed_width = q_format == format_id(AttentionFormat::Fp6E2M3)   ? 96
+                                 : q_format == format_id(AttentionFormat::Fp4E2M1) ? 64
+                                                                                   : 128;
 
     TORCH_CHECK(shapes.batch > 0 && shapes.seqlen_q > 0 && shapes.seqlen_k > 0 &&
                     shapes.nhead_q > 0,
                 "MHA v4 requires non-empty inputs");
-    TORCH_CHECK(k.size(0) == shapes.batch && v.size(0) == shapes.batch, "Q, K, and V batch sizes must match");
+    TORCH_CHECK(k.size(0) == shapes.batch && v.size(0) == shapes.batch,
+                "Q, K, and V batch sizes must match");
     TORCH_CHECK(shapes.nhead_k > 0 && v.size(2) == shapes.nhead_k,
                 "MHA v4 requires matching non-empty K and V head dimensions");
     TORCH_CHECK(shapes.nhead_q % shapes.nhead_k == 0,
@@ -517,16 +512,15 @@ PackedMhaV4Shapes validate_packed_mha_v4(const at::Tensor& q,
     }
     TORCH_CHECK(out.scalar_type() == at::ScalarType::BFloat16,
                 "MHA v4 currently supports BF16 output only");
-    TORCH_CHECK(out.sizes() == torch::IntArrayRef(
-                    {shapes.batch, shapes.seqlen_q, shapes.nhead_q, kHeadDim}),
+    TORCH_CHECK(out.sizes() ==
+                    torch::IntArrayRef({shapes.batch, shapes.seqlen_q, shapes.nhead_q, kHeadDim}),
                 "out must have shape [batch, query_length, query_heads, 128]");
 
     const bool mx_qk_format = q_format == format_id(AttentionFormat::Fp6E2M3) ||
                               q_format == format_id(AttentionFormat::Fp4E2M1);
-    const bool bf16_format = q_format == format_id(AttentionFormat::Bf16);
-    const bool e8m0_qk_scales =
-        q_scale_mode == scale_mode_id(AttentionScaleMode::E8M0Per1x32) &&
-        k_scale_mode == scale_mode_id(AttentionScaleMode::E8M0Per1x32);
+    const bool bf16_format    = q_format == format_id(AttentionFormat::Bf16);
+    const bool e8m0_qk_scales = q_scale_mode == scale_mode_id(AttentionScaleMode::E8M0Per1x32) &&
+                                k_scale_mode == scale_mode_id(AttentionScaleMode::E8M0Per1x32);
     if(bf16_format)
     {
         TORCH_CHECK(q_scale_mode == scale_mode_id(AttentionScaleMode::None) &&
@@ -539,11 +533,11 @@ PackedMhaV4Shapes validate_packed_mha_v4(const at::Tensor& q,
         TORCH_CHECK(q_descale.scalar_type() == at::ScalarType::Byte &&
                         k_descale.scalar_type() == at::ScalarType::Byte,
                     "MX Q/K descales must be uint8 E8M0 tensors");
-        TORCH_CHECK(q_descale.sizes() == torch::IntArrayRef(
-                        {shapes.batch, shapes.seqlen_q, shapes.nhead_q, 4}),
+        TORCH_CHECK(q_descale.sizes() ==
+                        torch::IntArrayRef({shapes.batch, shapes.seqlen_q, shapes.nhead_q, 4}),
                     "MX Q descale must have shape [batch, query_length, query_heads, 4]");
-        TORCH_CHECK(k_descale.sizes() == torch::IntArrayRef(
-                        {shapes.batch, shapes.seqlen_k, shapes.nhead_k, 4}),
+        TORCH_CHECK(k_descale.sizes() ==
+                        torch::IntArrayRef({shapes.batch, shapes.seqlen_k, shapes.nhead_k, 4}),
                     "MX K descale must have shape [batch, key_length, key_heads, 4]");
     }
     else
@@ -565,16 +559,16 @@ PackedMhaV4Shapes validate_packed_mha_v4(const at::Tensor& q,
         const int64_t tiles = (shapes.seqlen_k + 127) / 128;
         TORCH_CHECK(v_scale_mode == 5 && v_descale.scalar_type() == at::ScalarType::Byte,
                     "MX V descale must use uint8 E8M0 per-1x32 scales");
-        TORCH_CHECK(v_descale.sizes() == torch::IntArrayRef(
-                        {shapes.batch, shapes.nhead_k, tiles * 512}),
+        TORCH_CHECK(v_descale.sizes() ==
+                        torch::IntArrayRef({shapes.batch, shapes.nhead_k, tiles * 512}),
                     "MX V descale must have shape [batch, key_heads, tiles * 512]");
     }
     else if(mx_qk_format)
     {
         TORCH_CHECK(v_descale.scalar_type() == at::ScalarType::Float,
                     "MX FP8 V descale must be a float32 tensor");
-        TORCH_CHECK(v_descale.sizes() == torch::IntArrayRef(
-                        {shapes.batch, shapes.nhead_k, kHeadDim}),
+        TORCH_CHECK(v_descale.sizes() ==
+                        torch::IntArrayRef({shapes.batch, shapes.nhead_k, kHeadDim}),
                     "MX V descale must have shape [batch, key_heads, 128]");
     }
     else
@@ -588,10 +582,8 @@ PackedMhaV4Shapes validate_packed_mha_v4(const at::Tensor& q,
 
 } // namespace
 
-at::Tensor mha_v4_sparse_work_table(const at::Tensor& lut_count,
-                                    int64_t batch,
-                                    int64_t nhead,
-                                    int64_t q_tiles)
+at::Tensor
+mha_v4_sparse_work_table(const at::Tensor& lut_count, int64_t batch, int64_t nhead, int64_t q_tiles)
 {
     return build_sorted_work_table(lut_count, batch, nhead, q_tiles);
 }
@@ -648,9 +640,8 @@ void fmha_v4_fwd(const at::Tensor& q,
 
     static SynchronizedCache<std::string, AiterAsmKernel> kernels;
     const std::string cache_key = arch + "|" + cfg.knl_name + "|" + cfg.co_name;
-    auto& kernel = kernels.get_or_create(cache_key, [&]() {
-        return AiterAsmKernel(cfg.knl_name.c_str(), cfg.co_name.c_str());
-    });
+    auto& kernel                = kernels.get_or_create(
+        cache_key, [&]() { return AiterAsmKernel(cfg.knl_name.c_str(), cfg.co_name.c_str()); });
 
     size_t arg_size = sizeof(args);
     const int gdx   = (shapes.seqlen_q + cfg.ts_qo - 1) / cfg.ts_qo;
@@ -757,15 +748,13 @@ void fmha_v4_fwd_sparse(const at::Tensor& q,
 
     static SynchronizedCache<std::string, AiterAsmKernel> kernels;
     const std::string cache_key = arch + "|" + cfg.knl_name + "|" + cfg.co_name;
-    auto& kernel = kernels.get_or_create(cache_key, [&]() {
-        return AiterAsmKernel(cfg.knl_name.c_str(), cfg.co_name.c_str());
-    });
+    auto& kernel                = kernels.get_or_create(
+        cache_key, [&]() { return AiterAsmKernel(cfg.knl_name.c_str(), cfg.co_name.c_str()); });
 
-    size_t arg_size              = sizeof(args);
+    size_t arg_size = sizeof(args);
     const HipDeviceGuard device_guard{q.get_device()};
-    const hipStream_t stream     = at::hip::getCurrentHIPStream();
-    kernel.launch_kernel(
-        {&args, &arg_size, static_cast<int>(lut_rows), 1, 1, 512, 1, 1, stream});
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
+    kernel.launch_kernel({&args, &arg_size, static_cast<int>(lut_rows), 1, 1, 512, 1, 1, stream});
 }
 
 } // namespace torch_itfs
