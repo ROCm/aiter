@@ -47,14 +47,20 @@ def _build_topk_swa_pool(T, topk, num_pool, device, generator):
 
     KV row layout is ``[ per-token 0..T-1 | pool T..T+num_pool-1 ]``. Early tokens see fewer
     than `topk - SWA` pool blocks, so their trailing slots stay -1, exactly as in production.
+
+    ``topk`` must be at least the window width: the window is the floor of a V4 top-k, and a
+    narrower request has no meaning here. Returning the full window anyway would report one
+    ``topk`` in the results table while timing another.
     """
+    assert topk >= SWA, f"topk={topk} is narrower than the SWA({SWA}) window"
+
     idx = torch.arange(T, device=device)
     off = torch.arange(SWA, device=device)
     swa = idx[:, None] - (SWA - 1) + off[None, :]
     swa = torch.where(swa >= 0, swa, torch.full_like(swa, -1))
 
     n_pool = topk - SWA
-    if n_pool <= 0 or num_pool == 0:
+    if n_pool == 0 or num_pool == 0:
         return swa.to(torch.int32).contiguous()
     assert n_pool <= num_pool, f"need {n_pool} pool ranks but only {num_pool} blocks"
 
