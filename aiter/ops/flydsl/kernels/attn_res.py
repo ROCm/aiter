@@ -384,7 +384,7 @@ def _build_attn_res(
             partial = in_range.select(partial, zero)
             return finish_reduce(partial)
 
-        copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), 16)
+        copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.BFloat16)
         vector_layout = fx.make_layout(_VEC_WIDTH, 1)
 
         def issue_bf16_vec(divided_tensor, index):
