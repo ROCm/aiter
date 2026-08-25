@@ -11,6 +11,7 @@ loop over blocks is far too slow to be a useful check at these context lengths.
 
 import argparse
 import math
+import sys
 
 import pandas as pd
 import torch
@@ -266,6 +267,12 @@ parser.add_argument(
     help="Query tokens per request. num_idx_heads * query_len must not exceed 16",
 )
 args = parser.parse_args()
+
+# The scoring passes are tested only on the gfx950.
+current_gfx = aiter.get_gfx()
+if current_gfx != "gfx950":
+    print(f"Skipping test_msa_block_select.py: requires gfx950, got {current_gfx}")
+    sys.exit(0)
 
 if args.num_idx_heads is not None:
     l_num_idx_heads = args.num_idx_heads
