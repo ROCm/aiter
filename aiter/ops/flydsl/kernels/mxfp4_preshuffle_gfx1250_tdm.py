@@ -872,10 +872,10 @@ def launch_gemm_a8w4_tdm(
             ]
             slot.sb.store(Vec.from_elements(sb_v + sb_v[: SB_WIDTH - sb_pairs]))
             slot.sa.store(Vec.from_elements(sa_v + sa_v[: SA_WIDTH - sa_pairs]))
-            for wn in range_constexpr(wmma_n_rep):
-                slot.b[wn].store(load_b(buf, wn, ksl))
             for wm in range_constexpr(wmma_m_rep):
                 slot.a[wm].store(load_a(buf, wm, ksl))
+            for wn in range_constexpr(wmma_n_rep):
+                slot.b[wn].store(load_b(buf, wn, ksl))
 
         def k_step(
             cur_rmem,
@@ -943,6 +943,10 @@ def launch_gemm_a8w4_tdm(
                 )
                 if const_expr(ksl == 0):
                     rocdl.sched_dsrd(STATE_DS if not rmem_preloaded else 0)
+                # Keep at least one main group for interleaved LDS/TDM hints.
+                # Small per-wave tiles can have no more accumulators than the
+                # preferred closing group.
+                tail_mfma = min(tail_mfma, max(0, n_acc - MMA_GROUP))
                 mma_total = n_acc - tail_mfma
                 # K256 needs grouping to limit VGPR-bank switches without
                 # turning the complete A/B/scale prefetch into long LDS bursts.

@@ -621,7 +621,8 @@ def _grouped_a8w4_tdm_moe(
     # Fuse gemm1 activation + MX quantization + scale preshuffle into the
     # kernel epilogue, eliminating the standalone
     # flydsl_moe_fused_quant_preshuffle call between gemm1 and gemm2.
-    _fuse_quant = _b1 is None
+    disable_requant = _as_bool(os.environ.get("AITER_MOE_DISABLE_REQUANT"), False)
+    _fuse_quant = _b1 is None and not disable_requant
     w1_u8 = _grouped_weight_uint8(w1)
     w1s_i32 = w1_scale.reshape(-1).view(torch.int32)
 
