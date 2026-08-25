@@ -1042,7 +1042,7 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
         PRELOAD_SF_LDS ? ((SFA_ROWS + T::N_SCALE_GROUPS) * SF_SCALES_MAX) : 1;
     // 16B-aligned so the panel fill below can land ds_write_b128; a byte array is
     // only byte-aligned as far as the language is concerned.
-    alignas(16) __shared__ D_SF smem_sf[SF_LDS_ELEMS];
+    __shared__ __align__(16) D_SF smem_sf[SF_LDS_ELEMS];
 
     // SF_SHUF_IN_LDS: the shuffled scale panel. Words, not bytes -- the layout's unit
     // is the dword, and staging anything finer would have to unpack and repack it.
@@ -1055,7 +1055,7 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
     constexpr int SHUF_A_WORDS  = SF_SHUF_IN_LDS ? T::SF_N1_BLOCKS * SHUF_K1_MAX * SFG::SUB : 0;
     constexpr int SHUF_B_WORDS  = SF_SHUF_IN_LDS ? T::N_SCALE_GROUPS * SHUF_K1_MAX : 0;
     constexpr int SHUF_WORDS    = SHUF_A_WORDS + SHUF_B_WORDS;
-    alignas(16) __shared__ int smem_sf_shuf[SHUF_WORDS > 0 ? SHUF_WORDS : 1];
+    __shared__ __align__(16) int smem_sf_shuf[SHUF_WORDS > 0 ? SHUF_WORDS : 1];
 
     auto smem_a_at = [&](int slot_k, int m_block, int k_group) -> D_A* {
         return reinterpret_cast<D_A*>(smem_a

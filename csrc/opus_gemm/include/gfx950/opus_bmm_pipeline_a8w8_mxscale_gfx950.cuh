@@ -277,7 +277,7 @@ __device__ __forceinline__ void gemm_a8w8_scale_kernel_impl(opus_gemm_scale_karg
         PRELOAD_SFA_LDS ? (SFA_ROWS * SFA_K_TILES_MAX * (int)sizeof(D_SF)) : 1;
     // 16B-aligned so the panel fill below can land ds_write_b128; a bare char
     // array is only byte-aligned as far as the language is concerned.
-    alignas(16) __shared__ char smem_sfa[SFA_LDS_BYTES];
+    __shared__ __align__(16) char smem_sfa[SFA_LDS_BYTES];
     D_SF* s_sfa_ptr = reinterpret_cast<D_SF*>(smem_sfa);
     // Runtime packed K-tile count (== loops); used as the compact LDS M-row
     // stride so the read layout reuses make_layout_sfa with stride_sfa replaced.

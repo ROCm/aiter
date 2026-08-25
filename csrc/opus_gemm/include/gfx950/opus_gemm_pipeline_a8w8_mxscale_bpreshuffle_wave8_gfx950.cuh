@@ -471,7 +471,7 @@ void gemm_a8w8_mxscale_bpreshuffle_wave8_kernel(opus_gemm_scale_splitk_kargs_gfx
     constexpr bool SF_LDS_B = !SHUFFLE_SCALE;
     constexpr int SF_LDS_ELEMS =
         ((SF_LDS_A ? SFA_ROWS : 0) + (SF_LDS_B ? T::N_SCALE_GROUPS : 0)) * SF_SCALES_MAX;
-    alignas(16) __shared__ D_SF smem_sf[SF_LDS_ELEMS > 0 ? SF_LDS_ELEMS : 1];
+    __shared__ __align__(16) D_SF smem_sf[SF_LDS_ELEMS > 0 ? SF_LDS_ELEMS : 1];
 
     // Shuffled-word panel, in dwords, holding what read_scales_shuf would
     // otherwise fetch from global over the whole split:
@@ -494,7 +494,7 @@ void gemm_a8w8_mxscale_bpreshuffle_wave8_kernel(opus_gemm_scale_splitk_kargs_gfx
     constexpr int SHUF_A_WORDS = SF_SHUF_IN_LDS ? T::SF_N1_BLOCKS * SHUF_K1_MAX * SF_SUB : 0;
     constexpr int SHUF_B_WORDS = SF_SHUF_IN_LDS ? T::N_SCALE_GROUPS * SHUF_K1_MAX : 0;
     constexpr int SHUF_WORDS   = SHUF_A_WORDS + SHUF_B_WORDS;
-    alignas(16) __shared__ int smem_sf_shuf[SHUF_WORDS > 0 ? SHUF_WORDS : 1];
+    __shared__ __align__(16) int smem_sf_shuf[SHUF_WORDS > 0 ? SHUF_WORDS : 1];
 
     auto smem_a_at = [&](int slot_k, int m_block, int k_group) -> D_A* {
         return reinterpret_cast<D_A*>(smem_a
