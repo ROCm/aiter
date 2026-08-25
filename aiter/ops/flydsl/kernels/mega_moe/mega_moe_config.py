@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2025 FlyDSL Project Contributors
-"""Static MegaMoE configurations tuned for MI355X multi-GPU execution."""
+"""Static MegaMoEV2 configurations tuned for MI355X multi-GPU execution."""
 
 from bisect import bisect_left
 from dataclasses import dataclass, fields, replace
@@ -102,8 +102,10 @@ class Stage1Config:
     pipe_weights: bool = True
     swizzle_a: bool = True
     work_shards: int = WORK_SHARDS_PIPELINED
-    external_grouping: bool = False
-    external_counting: bool = False
+    # external_grouping/counting drive a CROSS-RANK dispatch handshake and MUST be rank-invariant.
+    # Leave None so the kernel derives them from mtpr; do NOT set from the per-rank token bucket.
+    external_grouping: bool | None = None
+    external_counting: bool | None = None
     payload_chunk_rows: int = 0
     payload_tile_ready: bool = False
 
@@ -259,18 +261,14 @@ _A4_BUCKET_PATCHES = {
     TokenBucket.BS4096: _patch(
         stage1={
             "num_dispatch_cu": 72,
-            "payload_chunk_rows": 0,
-            "payload_tile_ready": False,
-        },
+        },  # payload NOT set: cross-rank, rank-invariant via base mtpr
     ),
     TokenBucket.BS8192: _patch(
         stage1={
             "grid_mult": 2,
             "num_dispatch_cu": 32,
             "swizzle_a": False,
-            "payload_chunk_rows": 0,
-            "payload_tile_ready": False,
-        },
+        },  # payload NOT set: cross-rank, rank-invariant via base mtpr
     ),
 }
 
@@ -285,8 +283,7 @@ _A4_FIXED8192_SINGLE_TOKEN_PATCH = _patch(stage1={"num_dispatch_cu": 160})
 _A4_FIXED8192_TWO_TOKEN_PATCH = _patch(
     stage1={
         "num_dispatch_cu": 128,
-        "payload_chunk_rows": 0,
-        "payload_tile_ready": False,
+        # payload NOT set: cross-rank, rank-invariant via base mtpr
     }
 )
 _A4_FIXED8192_COMPACT_DISPATCH_PATCH = _patch(stage1={"num_dispatch_cu": 32})
@@ -339,13 +336,9 @@ def _a4_fixed8192_tuned_patch(bucket: int) -> ConfigPatch | None:
         return None
     dispatch_cu = _a4_fixed8192_dispatch_cu(bucket)
     assert dispatch_cu is not None
-    use_chunk_pipeline = (
-        _a4_fixed8192_estimated_hot_rows(bucket) >= A4_HOT_PAYLOAD_CHUNK_ROWS
-    )
+    # payload_chunk_rows/tile_ready NOT set: cross-rank, kept rank-invariant via base mtpr.
     stage1 = {
         "num_dispatch_cu": dispatch_cu,
-        "payload_chunk_rows": A4_HOT_PAYLOAD_CHUNK_ROWS if use_chunk_pipeline else 0,
-        "payload_tile_ready": use_chunk_pipeline,
     }
     if bucket == TokenBucket.BS256:
         stage1["tile_n"] = TILE_N_BASE
@@ -354,8 +347,7 @@ def _a4_fixed8192_tuned_patch(bucket: int) -> ConfigPatch | None:
             grid_mult=GRID_MULT_SINGLE_EPOCH,
             swizzle_a=True,
             waves_per_eu_hint=WAVES_PER_EU_DEFAULT,
-            external_grouping=False,
-            external_counting=False,
+            # external_grouping/counting NOT set: cross-rank, must stay rank-invariant.
         )
     return _patch(stage1=stage1)
 
@@ -553,23 +545,25 @@ def _select_bounded_stage1(
 
 
 _LARGE_PAYLOAD_GEOMETRY_DEFAULT = (384, True)
-_LARGE_PAYLOAD_GEOMETRY_BY_BUCKET = {
-    TokenBucket.BS2048: (0, False),
-    TokenBucket.BS16384: (1536, True),
-    TokenBucket.BS32768: (768, True),
+# Keyed by mtpr (rank-invariant capacity), NOT the per-rank token bucket. The payload
+# tile-ready handshake is cross-rank, so every rank must derive identical geometry;
+# mtpr is the same on all ranks while local token counts (and their buckets) are not.
+_LARGE_PAYLOAD_GEOMETRY_BY_MTPR = {
+    2048: (0, False),
+    16384: (1536, True),
+    32768: (768, True),
 }
 
 
-def _large_payload_geometry(bucket: int) -> tuple[int, bool]:
-    return _LARGE_PAYLOAD_GEOMETRY_BY_BUCKET.get(
-        bucket, _LARGE_PAYLOAD_GEOMETRY_DEFAULT
-    )
+def _large_payload_geometry(mtpr: int) -> tuple[int, bool]:
+    return _LARGE_PAYLOAD_GEOMETRY_BY_MTPR.get(mtpr, _LARGE_PAYLOAD_GEOMETRY_DEFAULT)
 
 
 def _select_large_stage1(
     bucket: int,
     experts_per_rank: int,
     inter_dim: int,
+    mtpr: int,
 ) -> Stage1Config:
     sort_block_m, tile_n, num_waves, mfma_amajor, async_a_copy = (
         _derive_stage1_geometry(
@@ -584,7 +578,12 @@ def _select_large_stage1(
     )
     if bucket == TokenBucket.BS2048:
         work_shards = WORK_SHARDS_PIPELINED
-    payload_chunk_rows, payload_tile_ready = _large_payload_geometry(bucket)
+    # main-style: payload_tile_ready hardcoded True for ALL large-path buckets — a rank-invariant
+    # constant that cannot deadlock. The per-bucket small-bs False optimization (PR#972) is
+    # intentionally dropped: it needs per-run_tokens judgment (per-rank) which deadlocks on rank
+    # skew. Small bs pays a tile-pipeline overhead but is safe. (external_grouping/counting below
+    # left as kernel fz_mtpr default, also rank-invariant.)
+    payload_chunk_rows, payload_tile_ready = 384, True
     return Stage1Config(
         sort_block_m=sort_block_m,
         tile_n=tile_n,
@@ -602,8 +601,7 @@ def _select_large_stage1(
             else B_NT_DISABLED
         ),
         work_shards=work_shards,
-        external_grouping=bucket == TokenBucket.BS4 or bucket >= TokenBucket.BS256,
-        external_counting=bucket >= TokenBucket.BS256,
+        # external_grouping/counting unset (None) -> kernel fz_mtpr default (rank-invariant).
         payload_chunk_rows=payload_chunk_rows,
         payload_tile_ready=payload_tile_ready,
     )
@@ -701,12 +699,14 @@ def _select_bucket_config(
     model_dim: int,
     inter_dim: int,
     p2p_quant: str,
+    mtpr: int,
 ) -> MegaMoEConfig:
     if mtpr_class == MAX_MTPR_CLASS:
         stage1 = _select_large_stage1(
             bucket,
             experts_per_rank,
             inter_dim,
+            mtpr,
         )
         stage2 = _select_large_stage2(
             bucket,
@@ -777,6 +777,10 @@ def select_mega_moe_config(
     model_dim: int = DEFAULT_MODEL_DIM,
     inter_dim: int = DEFAULT_INTER_DIM,
 ) -> MegaMoEConfig:
+    """Return base MegaMoEV2 config (no tuning patches applied).
+
+    For production use, prefer resolve_mega_moe_config() which applies tuning patches.
+    """
     bucket, mtpr_class, p2p_quant = _normalize_config_request(
         tokens,
         mtpr,
@@ -793,6 +797,7 @@ def select_mega_moe_config(
         model_dim,
         inter_dim,
         p2p_quant,
+        mtpr,
     )
 
 
@@ -955,7 +960,7 @@ def resolve_mega_moe_config(
     model_dim: int = DEFAULT_MODEL_DIM,
     inter_dim: int = DEFAULT_INTER_DIM,
 ) -> MegaMoEConfig:
-    """Resolve and cache the complete base-plus-tuning MegaMoE config."""
+    """Resolve and cache the complete base-plus-tuning MegaMoEV2 config."""
     bucket, mtpr_class, p2p_quant = _normalize_config_request(
         tokens,
         mtpr,
@@ -972,6 +977,7 @@ def resolve_mega_moe_config(
         model_dim,
         inter_dim,
         p2p_quant,
+        mtpr,
     )
     return _resolve_tuned_config(
         config,

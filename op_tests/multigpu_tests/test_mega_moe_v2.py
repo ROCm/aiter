@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Independent v4_pro MegaMoE accuracy and performance test."""
+"""Independent v4_pro MegaMoEV2 accuracy and performance test."""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ import torch.nn.functional as F
 
 import aiter
 from aiter import dtypes
-from aiter.ops.flydsl.kernels.mega_moe import MegaMoE
+from aiter.ops.flydsl.kernels.mega_moe import MegaMoEV2
 from aiter.ops.shuffle import shuffle_scale_a16w4, shuffle_weight_a16w4
 from aiter.utility import fp4_utils
 
@@ -348,7 +348,7 @@ def main():
     parser.add_argument("--forward-config-tokens", type=int)
     args = parser.parse_args()
     if args.rtol is None:
-        args.rtol = 0.28 if args.quant == "a4w4" else 0.10
+        args.rtol = 0.25 if args.quant == "a4w4" else 0.10
     batch_sizes = [int(value) for value in args.bs_list.split(",")]
     if not batch_sizes or min(batch_sizes) <= 0:
         raise ValueError("--bs-list must contain positive integers")
@@ -402,7 +402,7 @@ def main():
             max_tok_per_rank = args.max_tok_per_rank or max(
                 16, _next_power_of_two(batch_size)
             )
-            moe = MegaMoE(
+            moe = MegaMoEV2(
                 rank=rank,
                 world_size=world,
                 quant=args.quant,
