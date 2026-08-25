@@ -14,28 +14,29 @@
 #define FMHA_FWD_HD192_V128_BF16_OPUS_IMPL
 #include "fmha_fwd_hd192_v128_bf16_opus.h"
 
-#include "fmha_fwd_bf16_opus.h"
+#include "torch/fmha_fwd_bf16_opus.h"
 #include "aiter_hip_common.h"
-#include "aiter_stream.h"
-#include "aiter_tensor.h"
 
+#include <ATen/hip/HIPContext.h>
 #include <cmath>
+#include <type_traits>
 
 namespace {
 
 // ─── D_QK=128 / D_V=128 (symmetric) launch — logic unchanged from the original
 //     fmha_fwd_hd128_bf16_opus_fwd, only moved under the shared entry point. ───
-void launch_d128(aiter_tensor_t& q,
-                 aiter_tensor_t& k,
-                 aiter_tensor_t& v,
-                 aiter_tensor_t& out,
+void launch_d128(at::Tensor& q,
+                 at::Tensor& k,
+                 at::Tensor& v,
+                 at::Tensor& out,
                  bool causal,
-                 float softmax_scale)
+                 float softmax_scale,
+                 std::optional<at::Tensor>& lse)
 {
-    AITER_CHECK(q.dim() == 4, "q must be 4-D [B, N, H, D], got ndim=", q.dim());
-    AITER_CHECK(k.dim() == 4, "k must be 4-D [B, N, H_KV, D], got ndim=", k.dim());
-    AITER_CHECK(v.dim() == 4, "v must be 4-D [B, N, H_KV, D], got ndim=", v.dim());
-    AITER_CHECK(out.dim() == 4, "out must be 4-D [B, N, H, D], got ndim=", out.dim());
+    TORCH_CHECK(q.dim() == 4, "q must be 4-D [B, N, H, D], got ndim=", q.dim());
+    TORCH_CHECK(k.dim() == 4, "k must be 4-D [B, N, H_KV, D], got ndim=", k.dim());
+    TORCH_CHECK(v.dim() == 4, "v must be 4-D [B, N, H_KV, D], got ndim=", v.dim());
+    TORCH_CHECK(out.dim() == 4, "out must be 4-D [B, N, H, D], got ndim=", out.dim());
 
     const int B    = static_cast<int>(q.size(0));
     const int N    = static_cast<int>(q.size(1));      // seqlen_q
@@ -44,22 +45,23 @@ void launch_d128(aiter_tensor_t& q,
     const int H_KV = static_cast<int>(k.size(2));
     const int N_KV = static_cast<int>(k.size(1));      // seqlen_kv (cross-attn: may != N)
 
-    AITER_CHECK(D == 128, "launch_d128 only compiles D=128, got D=", D);
-    AITER_CHECK(k.size(0) == B && v.size(0) == B, "k/v batch must equal q batch B");
-    AITER_CHECK(v.size(1) == N_KV, "k/v seqlen must match (v seqlen != k seqlen)");
-    AITER_CHECK(v.size(2) == H_KV, "k/v must share H_KV");
-    AITER_CHECK(k.size(3) == D && v.size(3) == D, "k/v head dim must equal D=128");
-    AITER_CHECK(H_KV > 0 && (H % H_KV) == 0, "H must be divisible by H_KV (GQA group)");
-    AITER_CHECK(out.size(0) == B && out.size(1) == N && out.size(2) == H && out.size(3) == D,
+    TORCH_CHECK(D == 128, "launch_d128 only compiles D=128, got D=", D);
+    TORCH_CHECK(k.size(0) == B && v.size(0) == B, "k/v batch must equal q batch B");
+    TORCH_CHECK(v.size(1) == N_KV, "k/v seqlen must match (v seqlen != k seqlen)");
+    TORCH_CHECK(v.size(2) == H_KV, "k/v must share H_KV");
+    TORCH_CHECK(k.size(3) == D && v.size(3) == D, "k/v head dim must equal D=128");
+    TORCH_CHECK(H_KV > 0 && (H % H_KV) == 0, "H must be divisible by H_KV (GQA group)");
+    TORCH_CHECK(out.size(0) == B && out.size(1) == N && out.size(2) == H && out.size(3) == D,
                 "out shape must match q [B, N, H, D]");
 
-    AITER_CHECK(q.stride(3) == 1 && k.stride(3) == 1 && v.stride(3) == 1 && out.stride(3) == 1,
+    TORCH_CHECK(q.stride(3) == 1 && k.stride(3) == 1 && v.stride(3) == 1 && out.stride(3) == 1,
                 "q/k/v/out must be contiguous along the head dim D");
 
     // 32-bit KV buffer-offset guard: extent >= 2^32 wraps the async-load soffset (silent
     // wrong output), reject instead.
-    const long long kv_slice_bytes = (long long)N_KV * (long long)k.stride(1) * 2LL;  // bf16
-    AITER_CHECK(kv_slice_bytes < (1LL << 32),
+    const long long kv_slice_bytes =
+        (long long)N_KV * std::max(k.stride(1), v.stride(1)) * 2LL;  // bf16
+    TORCH_CHECK(kv_slice_bytes < (1LL << 32),
                 "OPUS D=128: KV byte extent ", kv_slice_bytes,
                 " reaches the 32-bit buffer-offset limit (2^32); reduce seqlen_kv or use another backend");
 
@@ -79,17 +81,38 @@ void launch_d128(aiter_tensor_t& q,
     kargs.stride_q_b  = static_cast<int>(q.stride(0));
     kargs.stride_q_n  = static_cast<int>(q.stride(1));
     kargs.stride_q_h  = static_cast<int>(q.stride(2));
-    kargs.stride_kv_b = static_cast<int>(k.stride(0));
-    kargs.stride_kv_n = static_cast<int>(k.stride(1));
-    kargs.stride_kv_h = static_cast<int>(k.stride(2));
+    kargs.stride_o_b  = static_cast<int>(out.stride(0));
+    kargs.stride_o_n  = static_cast<int>(out.stride(1));
+    kargs.stride_o_h  = static_cast<int>(out.stride(2));
+    kargs.stride_k_b  = static_cast<int>(k.stride(0));
+    kargs.stride_k_n  = static_cast<int>(k.stride(1));
+    kargs.stride_k_h  = static_cast<int>(k.stride(2));
+    kargs.stride_v_b  = static_cast<int>(v.stride(0));
+    kargs.stride_v_n  = static_cast<int>(v.stride(1));
+    kargs.stride_v_h  = static_cast<int>(v.stride(2));
 
     if (softmax_scale <= 0.0f) {
         softmax_scale = 1.0f / std::sqrt(static_cast<float>(D));
     }
     kargs.softmax_scale = softmax_scale;  // kernel applies scale * log2(e) to Q
 
-    HipDeviceGuard guard(q.device_id);
-    const hipStream_t stream = aiter::getCurrentHIPStream();
+    // Optional LSE (fp32, natural log; one value per (head, query row)). Left as nullptr
+    // when absent, which the kernel reads as "skip the store".
+    if (lse.has_value()) {
+        const at::Tensor& l = *lse;
+        TORCH_CHECK(l.device() == q.device(), "lse must be on the same device as q");
+        TORCH_CHECK(l.scalar_type() == at::kFloat, "lse must be float32");
+        TORCH_CHECK(l.stride(-1) == 1, "lse must be contiguous along the query dim");
+        TORCH_CHECK(l.dim() == 3 && static_cast<int>(l.size(0)) == B &&
+                        static_cast<int>(l.size(1)) == H && static_cast<int>(l.size(2)) == N,
+                    "lse must be [B, H, N]");
+        kargs.ptr_lse      = l.data_ptr();
+        kargs.stride_lse_b = static_cast<int>(l.stride(0));
+        kargs.stride_lse_h = static_cast<int>(l.stride(1));
+    }
+
+    HipDeviceGuard guard(q.device().index());
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
 
     using TraitsCausal    = opus_gqa_traits<32, 64, 128, 8, true>;
     using TraitsNonCausal = opus_gqa_traits<32, 64, 128, 8, false>;
@@ -112,16 +135,17 @@ void launch_d128(aiter_tensor_t& q,
 }
 
 // ─── D_QK=192 / D_V=128 (asymmetric) launch — batch + group (varlen). ───
-void launch_d192_v128(aiter_tensor_t& q,
-                      aiter_tensor_t& k,
-                      aiter_tensor_t& v,
-                      aiter_tensor_t& out,
+void launch_d192_v128(at::Tensor& q,
+                      at::Tensor& k,
+                      at::Tensor& v,
+                      at::Tensor& out,
                       bool causal,
                       float softmax_scale,
-                      std::optional<aiter_tensor_t>& seqstart_q,
-                      std::optional<aiter_tensor_t>& seqstart_k,
-                      std::optional<aiter_tensor_t>& seqstart_q_pad,
-                      std::optional<aiter_tensor_t>& seqstart_k_pad,
+                      std::optional<at::Tensor>& lse,
+                      std::optional<at::Tensor>& seqstart_q,
+                      std::optional<at::Tensor>& seqstart_k,
+                      std::optional<at::Tensor>& seqstart_q_pad,
+                      std::optional<at::Tensor>& seqstart_k_pad,
                       int max_seqlen_q,
                       int max_seqlen_k)
 {
@@ -146,8 +170,8 @@ void launch_d192_v128(aiter_tensor_t& q,
     // Plumbed into the kernel via kargs; the kernel folds in log2(e) for its exp2 softmax.
     kargs.softmax_scale = softmax_scale;
 
-    HipDeviceGuard guard(q.device_id);
-    const hipStream_t stream = aiter::getCurrentHIPStream();
+    HipDeviceGuard guard(q.device().index());
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
 
     int B, N, N_KV, H, H_KV;
     int num_q_blocks;   // for grid / merge decision
@@ -156,35 +180,37 @@ void launch_d192_v128(aiter_tensor_t& q,
     if (is_group) {
         // Packed / varlen: q [total_q, H, D_QK], k [total_k, H_KV, D_QK],
         // v [total_k, H_KV, D_V], out [total_q, H, D_V]. group = num sequences.
-        AITER_CHECK(q.dim() == 3 && k.dim() == 3 && v.dim() == 3 && out.dim() == 3,
+        TORCH_CHECK(q.dim() == 3 && k.dim() == 3 && v.dim() == 3 && out.dim() == 3,
                     "group mode expects packed 3-D q/k/v/out [total, H, D]");
-        AITER_CHECK(static_cast<int>(q.size(2)) == D_QK && static_cast<int>(k.size(2)) == D_QK,
+        TORCH_CHECK(static_cast<int>(q.size(2)) == D_QK && static_cast<int>(k.size(2)) == D_QK,
                     "group mode q/k head dim must be 192");
-        AITER_CHECK(static_cast<int>(v.size(2)) == D_V && static_cast<int>(out.size(2)) == D_V,
+        TORCH_CHECK(static_cast<int>(v.size(2)) == D_V && static_cast<int>(out.size(2)) == D_V,
                     "group mode v/out head dim must be 128");
-        AITER_CHECK(seqstart_q.has_value() && seqstart_k.has_value(),
+        TORCH_CHECK(seqstart_q.has_value() && seqstart_k.has_value(),
                     "group mode requires seqstart_q and seqstart_k");
         H    = static_cast<int>(q.size(1));
         H_KV = static_cast<int>(k.size(1));
-        AITER_CHECK(static_cast<int>(v.size(1)) == H_KV, "group mode k/v must share H_KV");
-        AITER_CHECK(static_cast<int>(out.size(0)) == static_cast<int>(q.size(0)) &&
+        TORCH_CHECK(static_cast<int>(v.size(1)) == H_KV, "group mode k/v must share H_KV");
+        TORCH_CHECK(static_cast<int>(out.size(0)) == static_cast<int>(q.size(0)) &&
                     static_cast<int>(out.size(1)) == H,
                     "group mode out must be [total_q, H, D_V]");
         B    = static_cast<int>(seqstart_q->numel()) - 1;   // num groups
-        AITER_CHECK(B > 0, "group mode requires seqstart_q length >= 2");
-        AITER_CHECK(max_seqlen_q > 0 && max_seqlen_k > 0,
+        TORCH_CHECK(B > 0, "group mode requires seqstart_q length >= 2");
+        TORCH_CHECK(max_seqlen_q > 0 && max_seqlen_k > 0,
                     "group mode requires max_seqlen_q / max_seqlen_k > 0");
         N    = max_seqlen_q;
         N_KV = max_seqlen_k;
 
         // Validate the cumulative-length arrays before reinterpreting their storage as
-        // int32: a wrong dtype (e.g. int64), non-contiguous layout, or wrong length would
-        // otherwise silently corrupt the per-group offsets or fault.
-        auto check_seqstart = [&](const aiter_tensor_t& s, const char* name) {
-            AITER_CHECK(s.dtype() == AITER_DTYPE_i32, name, " must be int32");
-            AITER_CHECK(s.dim() == 1, name, " must be 1-D");
-            AITER_CHECK(s.is_contiguous(), name, " must be contiguous");
-            AITER_CHECK(static_cast<int>(s.numel()) == B + 1, name, " length must be num_groups+1");
+        // int32: a wrong dtype (e.g. int64), non-contiguous layout, wrong length or a
+        // host/foreign-device buffer would otherwise silently corrupt the per-group
+        // offsets, or hand the kernel a pointer it cannot dereference.
+        auto check_seqstart = [&](const at::Tensor& s, const char* name) {
+            TORCH_CHECK(s.device() == q.device(), name, " must be on the same device as q");
+            TORCH_CHECK(s.scalar_type() == at::kInt, name, " must be int32");
+            TORCH_CHECK(s.dim() == 1, name, " must be 1-D");
+            TORCH_CHECK(s.is_contiguous(), name, " must be contiguous");
+            TORCH_CHECK(static_cast<int>(s.numel()) == B + 1, name, " length must be num_groups+1");
         };
         check_seqstart(*seqstart_q, "seqstart_q");
         check_seqstart(*seqstart_k, "seqstart_k");
@@ -208,20 +234,20 @@ void launch_d192_v128(aiter_tensor_t& q,
         num_q_blocks = ceil_div(N, Q_BLOCK);          // nqb_cap from max_seqlen_q
     } else {
         // Dense batch: q/k/v/out 4-D [B, N, H, D]. Cross-attention allowed (N != N_KV).
-        AITER_CHECK(q.dim() == 4 && k.dim() == 4 && v.dim() == 4 && out.dim() == 4,
+        TORCH_CHECK(q.dim() == 4 && k.dim() == 4 && v.dim() == 4 && out.dim() == 4,
                     "batch mode expects 4-D q/k/v/out [B, N, H, D]");
         B    = static_cast<int>(q.size(0));
         N    = static_cast<int>(q.size(1));
         H    = static_cast<int>(q.size(2));
         H_KV = static_cast<int>(k.size(2));
         N_KV = static_cast<int>(k.size(1));
-        AITER_CHECK(v.size(0) == B && v.size(1) == N_KV && v.size(2) == H_KV,
+        TORCH_CHECK(v.size(0) == B && v.size(1) == N_KV && v.size(2) == H_KV,
                     "k/v must share [B, N_KV, H_KV]");
-        AITER_CHECK(static_cast<int>(q.size(3)) == D_QK && static_cast<int>(k.size(3)) == D_QK,
+        TORCH_CHECK(static_cast<int>(q.size(3)) == D_QK && static_cast<int>(k.size(3)) == D_QK,
                     "q/k head dim must be 192");
-        AITER_CHECK(static_cast<int>(v.size(3)) == D_V && static_cast<int>(out.size(3)) == D_V,
+        TORCH_CHECK(static_cast<int>(v.size(3)) == D_V && static_cast<int>(out.size(3)) == D_V,
                     "v/out head dim must be 128");
-        AITER_CHECK(out.size(0) == B && out.size(1) == N && out.size(2) == H,
+        TORCH_CHECK(out.size(0) == B && out.size(1) == N && out.size(2) == H,
                     "out shape must match q [B, N, H, D_V]");
 
         kargs.stride_q_b = static_cast<int>(q.stride(0));   kargs.stride_q_n = static_cast<int>(q.stride(1));   kargs.stride_q_h = static_cast<int>(q.stride(2));
@@ -232,20 +258,35 @@ void launch_d192_v128(aiter_tensor_t& q,
         num_q_blocks = ceil_div(N, Q_BLOCK);
     }
 
-    AITER_CHECK(H_KV > 0 && (H % H_KV) == 0, "H must be divisible by H_KV (GQA group)");
-    AITER_CHECK(q.stride(-1) == 1 && k.stride(-1) == 1 && v.stride(-1) == 1 && out.stride(-1) == 1,
+    TORCH_CHECK(H_KV > 0 && (H % H_KV) == 0, "H must be divisible by H_KV (GQA group)");
+    TORCH_CHECK(q.stride(-1) == 1 && k.stride(-1) == 1 && v.stride(-1) == 1 && out.stride(-1) == 1,
                 "q/k/v/out must be contiguous along the head dim");
-    if (B == 0 || H == 0) return;
+    if (B == 0 || H == 0 || num_q_blocks == 0) return;
 
     kargs.B = B; kargs.N = N; kargs.N_KV = N_KV; kargs.H = H; kargs.H_KV = H_KV;
 
-    // 32-bit KV buffer-offset guard (same as D=128); N_KV bounds the per-group extent in
-    // group mode (max_seqlen_k).
-    const long long k_slice_bytes = (long long)N_KV * (long long)kargs.stride_k_n * 2LL;  // bf16
-    const long long v_slice_bytes = (long long)N_KV * (long long)kargs.stride_v_n * 2LL;
-    AITER_CHECK(k_slice_bytes < (1LL << 32) && v_slice_bytes < (1LL << 32),
-                "OPUS D_QK=192/D_V=128: K/V byte extent (k=", k_slice_bytes, " v=", v_slice_bytes,
-                ") reaches the 32-bit buffer-offset limit (2^32); reduce seqlen_kv");
+    // Optional LSE (fp32, natural log; one value per (head, query row)). Left as
+    // nullptr when absent, which the kernel reads as "skip the store".
+    if (lse.has_value()) {
+        const at::Tensor& l = *lse;
+        TORCH_CHECK(l.device() == q.device(), "lse must be on the same device as q");
+        TORCH_CHECK(l.scalar_type() == at::kFloat, "lse must be float32");
+        TORCH_CHECK(l.stride(-1) == 1, "lse must be contiguous along the query dim");
+        if (is_group) {
+            TORCH_CHECK(l.dim() == 2 && static_cast<int>(l.size(0)) == H &&
+                            l.size(1) == q.size(0),
+                        "group mode lse must be [H, total_q]");
+            kargs.stride_lse_b = 0;
+            kargs.stride_lse_h = static_cast<int>(l.stride(0));
+        } else {
+            TORCH_CHECK(l.dim() == 3 && static_cast<int>(l.size(0)) == B &&
+                            static_cast<int>(l.size(1)) == H && static_cast<int>(l.size(2)) == N,
+                        "batch mode lse must be [B, H, N]");
+            kargs.stride_lse_b = static_cast<int>(l.stride(0));
+            kargs.stride_lse_h = static_cast<int>(l.stride(1));
+        }
+        kargs.ptr_lse = l.data_ptr();
+    }
 
     // Head/tail merge (causal load balance): host is the single source of truth; the
     // kernel reads the OPT_MERGE_HEADTAIL bit and never recomputes it.
@@ -271,47 +312,72 @@ void launch_d192_v128(aiter_tensor_t& q,
         HIP_CALL_LAUNCH(hipGetLastError());
     };
 
-    if (is_group) {
-        if (causal) launch(opus_gqa_d192_traits<32, 64, 8, true,  true>{});
-        else        launch(opus_gqa_d192_traits<32, 64, 8, false, true>{});
-    } else {
-        if (causal) launch(opus_gqa_d192_traits<32, 64, 8, true,  false>{});
-        else        launch(opus_gqa_d192_traits<32, 64, 8, false, false>{});
-    }
+    // Per-tile descriptor rebasing is only needed once a buffer's per-head extent stops
+    // fitting the 32-bit num_records; under that the single-descriptor path is exact and
+    // cheaper. Decided per buffer: K's rows are 1.5x wider than V's here, so K crosses the
+    // limit first. N_KV is max_seqlen_k in group mode, so this bounds every group.
+    const long long k_slice_bytes = (long long)N_KV * (long long)kargs.stride_k_n * 2LL;  // bf16
+    const long long v_slice_bytes = (long long)N_KV * (long long)kargs.stride_v_n * 2LL;
+    const bool large_k = k_slice_bytes >= (1LL << 32);
+    const bool large_v = v_slice_bytes >= (1LL << 32);
+
+    auto launch_by_mode = [&](auto large_k_tag, auto large_v_tag) {
+        constexpr bool LK = decltype(large_k_tag)::value;
+        constexpr bool LV = decltype(large_v_tag)::value;
+        if (is_group) {
+            if (causal) launch(opus_gqa_d192_traits<32, 64, 8, true,  true,  LK, LV>{});
+            else        launch(opus_gqa_d192_traits<32, 64, 8, false, true,  LK, LV>{});
+        } else {
+            if (causal) launch(opus_gqa_d192_traits<32, 64, 8, true,  false, LK, LV>{});
+            else        launch(opus_gqa_d192_traits<32, 64, 8, false, false, LK, LV>{});
+        }
+    };
+    // (small K, large V) needs strides that invert the usual 192/128 row widths; rebasing K
+    // too is still correct there, so it folds into the all-large form rather than costing a
+    // fourth pair of instantiations.
+    if (!large_k && !large_v)     launch_by_mode(std::false_type{}, std::false_type{});
+    else if (large_k && !large_v) launch_by_mode(std::true_type{},  std::false_type{});
+    else                          launch_by_mode(std::true_type{},  std::true_type{});
 }
 
 } // namespace
 
-void fmha_fwd_bf16_opus_fwd(aiter_tensor_t& q,
-                            aiter_tensor_t& k,
-                            aiter_tensor_t& v,
-                            aiter_tensor_t& out,
+void fmha_fwd_bf16_opus_fwd(at::Tensor& q,
+                            at::Tensor& k,
+                            at::Tensor& v,
+                            at::Tensor& out,
                             bool causal,
                             float softmax_scale,
-                            std::optional<aiter_tensor_t> seqstart_q,
-                            std::optional<aiter_tensor_t> seqstart_k,
-                            std::optional<aiter_tensor_t> seqstart_q_pad,
-                            std::optional<aiter_tensor_t> seqstart_k_pad,
+                            std::optional<at::Tensor> lse,
+                            std::optional<at::Tensor> seqstart_q,
+                            std::optional<at::Tensor> seqstart_k,
+                            std::optional<at::Tensor> seqstart_q_pad,
+                            std::optional<at::Tensor> seqstart_k_pad,
                             int max_seqlen_q,
                             int max_seqlen_k)
 {
-    AITER_CHECK(q.dtype() == k.dtype() && q.dtype() == v.dtype() && q.dtype() == out.dtype(),
+    TORCH_CHECK(q.is_cuda(), "q must be a GPU tensor");
+    TORCH_CHECK(k.device() == q.device() && v.device() == q.device() &&
+                    out.device() == q.device(),
+                "q/k/v/out must be on the same device");
+    TORCH_CHECK(q.scalar_type() == k.scalar_type() && q.scalar_type() == v.scalar_type() &&
+                    q.scalar_type() == out.scalar_type(),
                 "q/k/v/out must share dtype");
-    AITER_CHECK(q.dtype() == AITER_DTYPE_bf16, "fmha_fwd_bf16_opus_fwd only supports bf16");
+    TORCH_CHECK(q.scalar_type() == at::kBFloat16, "fmha_fwd_bf16_opus_fwd only supports bf16");
 
     const int D_QK = static_cast<int>(q.size(-1));
     const int D_V  = static_cast<int>(v.size(-1));
     const bool is_group = seqstart_q.has_value() && seqstart_q->numel() > 0;
 
     if (D_QK == 128 && D_V == 128) {
-        AITER_CHECK(!is_group, "OPUS D=128 kernel supports batch mode only (no varlen)");
-        launch_d128(q, k, v, out, causal, softmax_scale);
+        TORCH_CHECK(!is_group, "OPUS D=128 kernel supports batch mode only (no varlen)");
+        launch_d128(q, k, v, out, causal, softmax_scale, lse);
     } else if (D_QK == 192 && D_V == 128) {
-        launch_d192_v128(q, k, v, out, causal, softmax_scale,
+        launch_d192_v128(q, k, v, out, causal, softmax_scale, lse,
                          seqstart_q, seqstart_k, seqstart_q_pad, seqstart_k_pad,
                          max_seqlen_q, max_seqlen_k);
     } else {
-        AITER_CHECK(false, "OPUS fwd supports (D_QK,D_V) in {(128,128),(192,128)}, got (",
+        TORCH_CHECK(false, "OPUS fwd supports (D_QK,D_V) in {(128,128),(192,128)}, got (",
                     D_QK, ",", D_V, ")");
     }
 }
