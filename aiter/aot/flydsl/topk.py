@@ -79,13 +79,15 @@ def parse_csv(csv_path: str) -> list[dict[str, Any]]:
             # blocks_per_row = min(32, max(2, ceil(L / items_per_block))); sweep every
             # distinct value up to the row's max context via a representative L.
             max_bpr = min(32, max(2, -(-mml // items_per_block)))
-            # Derive configs for the target arch so the dedup + the compile below
-            # agree, and match a runtime on that arch.
+            # Both target values come from the CSV row, never from the build host:
+            # the CU count picks bits_per_pass and the tier caps.
             with override_env("FLYDSL_GPU_ARCH", arch):
                 for bpr in range(2, max_bpr + 1):
                     rep_l = min(bpr * items_per_block, mml)
                     for num_rows in range(1, max_seqs + 1):
-                        cfg = _kernel_config(num_rows, rep_l)
+                        cfg = _kernel_config(
+                            num_rows, rep_l, arch=arch, cu_count=cu or None
+                        )
                         ident = (k, arch, tuple(sorted(cfg.items())))
                         if ident in seen:
                             continue
@@ -139,11 +141,10 @@ def compile_one_config(
             override_env("FLYDSL_GPU_ARCH", aot_arch),
             FakeTensorMode(),
         ):
-            # Pass the target arch explicitly: it is part of the launcher cache
-            # key, so jobs for different archs cannot share one launcher even
-            # though this process compiles them all back to back.
+            # Both are in the launcher cache key, and must match what parse_csv
+            # deduped on or a job's kernel_name stops describing its kernel.
             launcher, ws_slots, _ = _build_launcher(
-                k, num_rows, max_model_len, aot_arch
+                k, num_rows, max_model_len, aot_arch, cu_count=cu_num or None
             )
 
             dev = torch.device("cpu")
