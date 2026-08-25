@@ -2217,7 +2217,11 @@ def chunk_gated_delta_rule_fwd_h_o_auto(
     resolved_fusion = K5K6Fusion.coerce(fusion)
     H = w.shape[1]
     V = u.shape[-1]
-    N = (cu_seqlens.shape[0] - 1) if cu_seqlens is not None else q.shape[0]
+    N = (
+        cu_seqlens.shape[0] - 1 - num_decodes
+        if cu_seqlens is not None
+        else q.shape[0]
+    )
 
     use_fused = resolved_fusion == K5K6Fusion.ALWAYS or (
         resolved_fusion == K5K6Fusion.AUTO and should_use_fused_gfx942(H=H, N=N, V=V)
