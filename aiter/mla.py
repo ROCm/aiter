@@ -398,6 +398,20 @@ def _persistent_mla_decode_max_batch():
         return _MLA_DECODE_PERSISTENT_MAX_BATCH_DEFAULT
 
 
+def _fold_seqlen_indptr(indptr, fold_factor):
+    """Repeat each batch's seqlen ``fold_factor`` times (head-folding pseudo-batches)."""
+    lens = indptr[1:] - indptr[:-1]
+    folded_lens = lens.repeat_interleave(fold_factor)
+    out = torch.empty(
+        indptr.shape[0] + (fold_factor - 1) * (indptr.shape[0] - 1),
+        dtype=indptr.dtype,
+        device=indptr.device,
+    )
+    out[0] = 0
+    out[1:] = torch.cumsum(folded_lens, dim=0).to(indptr.dtype)
+    return out
+
+
 def _use_persistent_mla_decode(bs, nhead, max_seqlen_q, q_dtype, kv_dtype):
     """Whether to keep the persistent MLA decode kernel.
 
@@ -838,23 +852,10 @@ def mla_decode_fwd(
 
             o = o.view(total_s, nhead, -1)
 
-            qo_indptr = torch.arange(
-                0,
-                (bs * fold_factor + 1) * max_seqlen_q,
-                max_seqlen_q,
-                dtype=qo_indptr.dtype,
-                device=device,
-            )
+            qo_indptr = _fold_seqlen_indptr(qo_indptr, fold_factor)
             if g_kv_indptr is not None:
-
-                g_len = (g_kv_indptr[1:] - g_kv_indptr[:-1]).repeat_interleave(
-                    fold_factor
-                )
-                folded_g_kv_indptr = torch.zeros(
-                    bs * fold_factor + 1, dtype=g_kv_indptr.dtype, device=device
-                )
-                folded_g_kv_indptr[1:] = torch.cumsum(g_len, 0).to(g_kv_indptr.dtype)
-                g_kv_indptr = folded_g_kv_indptr
+                g_kv_indptr = _fold_seqlen_indptr(g_kv_indptr, fold_factor)
+                # Each pseudo-batch shares the original batch's local kv begin.
                 kv_indptr = torch.cat(
                     [kv_indptr[:-1].repeat_interleave(fold_factor), kv_indptr[-1:]]
                 )
