@@ -2388,11 +2388,24 @@ def get_2stage_cfgs(
                     f"[fused_moe] Opus stage2 config unsupported ({opus_reason}); "
                     "using default heuristics"
                 )
+
     bypass_tuned_config = int(os.environ.get("AITER_BYPASS_TUNE_CONFIG", "0"))
     if config_file is not None and (cfg is None or bypass_tuned_config):
         raise NotImplementedError(
             "The dedicated FHMoE path requires an exact tuned config row for "
             f"{keys} in {tune_file}"
+        )
+
+    # The asm 1-stage kernels are compiled only for Silu/Gelu
+    if (
+        cfg is not None
+        and cfg.get("run_1stage", False)
+        and activation not in (ActivationType.Silu, ActivationType.Gelu)
+    ):
+        cfg = None
+        logger.warning(
+            f"[fused_moe] discarding 1-stage tuned config for unsupported "
+            f"activation {activation}; using default heuristics"
         )
 
     use_non_temporal_load = False
