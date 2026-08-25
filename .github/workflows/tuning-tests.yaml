@@ -22,17 +22,22 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  DOCKER_IMAGE: rocm/pytorch:latest
   GPU_ARCHS: gfx950
   REPORT_DIR: tuning_test_reports
   LOG_DIR: .github/test-logs/tuning-tests
 
 jobs:
+  ci_config:
+    uses: ./.github/workflows/ci-config.yaml
+
   cpu-validation:
     if: ${{ github.event_name == 'schedule' || github.event.inputs.suite == 'all' || github.event.inputs.suite == 'level01' }}
     name: README Level 0+1
     runs-on: linux-aiter-mi35x-1
     timeout-minutes: 45
+    needs: ci_config
+    env:
+      DOCKER_IMAGE: ${{ needs.ci_config.outputs.pytorch_py312_image }}
 
     steps:
       - name: Checkout code
@@ -113,6 +118,9 @@ jobs:
     name: README Level 2 Pipeline
     runs-on: linux-aiter-mi35x-1
     timeout-minutes: 75
+    needs: ci_config
+    env:
+      DOCKER_IMAGE: ${{ needs.ci_config.outputs.pytorch_py312_image }}
 
     steps:
       - name: Checkout code
@@ -193,6 +201,9 @@ jobs:
     name: README Level 2 Run Config
     runs-on: linux-aiter-mi35x-1
     timeout-minutes: 120
+    needs: ci_config
+    env:
+      DOCKER_IMAGE: ${{ needs.ci_config.outputs.pytorch_py312_image }}
 
     steps:
       - name: Checkout code

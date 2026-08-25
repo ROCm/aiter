@@ -11,15 +11,13 @@ from pathlib import Path
 import torch
 import triton.profiler as proton
 
-from aiter.ops.shuffle import shuffle_weight_gfx1250
+from aiter.ops.shuffle import moe_shuffle_scale, moe_shuffle_weight
 from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16
-from aiter.ops.triton.moe.moe_op_gemm_a8w4 import (
-    moe_gemm_a8w4,
-)
+from aiter.ops.triton.moe.moe_op_gemm_a8w4 import moe_gemm_a8w4
 from aiter.ops.triton.moe.moe_routing.routing import _USE_HERD, routing
 from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp, downcast_to_static_fp8
 from aiter.ops.triton.utils._triton.arch_info import get_arch
-from aiter.ops.triton.utils.shuffle import shuffle_scale_moe
+from aiter.ops.triton.utils.shuffle import moe_weight_decode_view, shuffle_scale_moe
 
 
 def parse_profile(profile_path, useful_op_regex, reps):
@@ -135,16 +133,35 @@ def compute_roofline(
             )
 
 
+def preshuffle_moe_weight(w: torch.Tensor) -> torch.Tensor:
+    """``(E, K, N)`` -> the gfx1250 WMMA TDM view ``(E, K*16, N//16)``.
+
+    ``moe_shuffle_weight`` takes the ``(E, N, K)`` MoE weight orientation and
+    returns the shuffled buffer in that same shape; ``moe_weight_decode_view``
+    then reinterprets it (zero-copy) as the flattened view the kernel loads.
+    """
+    return moe_weight_decode_view(moe_shuffle_weight(w.transpose(-1, -2)))
+
+
+def preshuffle_moe_wscale(s: torch.Tensor) -> torch.Tensor:
+    """``(E, K//32, N)`` B-scale -> gfx1250 n32k4 layout, same orientation back.
+
+    ``moe_shuffle_scale`` is the n32k4 tile (preshuffle 32, scale kwidth 4) and
+    takes the ``(E, N, K//32)`` orientation, so transpose in and back out. Must
+    stay in step with ``SCALE_KWIDTH`` in the gfx1250 gluon kernels.
+    """
+    return moe_shuffle_scale(s.transpose(-1, -2)).transpose(-1, -2)
+
+
 def check_and_shuffle_scales(scale, N, K):
     if get_arch() == "gfx950" and N % 32 == 0 and K % (32 * 8) == 0:
         scale = shuffle_scale_moe(
             scale, arch="gfx950", preshuffle_factor=32, scale_kwidth=8
         )
         return scale, "CDNA4_SCALE"
-    elif get_arch() == "gfx1250" and N % 32 == 0 and K % (32 * 8) == 0:
-        scale = shuffle_scale_moe(
-            scale, arch="gfx1250", preshuffle_factor=32, scale_kwidth=8
-        )
+    elif get_arch() == "gfx1250" and N % 32 == 0 and K % (32 * 4) == 0:
+        # n32k4 layout (scale kwidth 4), so K//32 only needs to divide by 4.
+        scale = preshuffle_moe_wscale(scale)
         return scale, "GFX1250_SCALE"
     else:
         return scale, None
@@ -217,6 +234,7 @@ def bench_mlp_single_weight_init(
     op_regex,
     routed_experts=None,
     preshuffle=False,
+    backend=None,
 ):
     rank = 0
     dev = f"cuda:{rank}"
@@ -254,8 +272,8 @@ def bench_mlp_single_weight_init(
         w2_scale, dim1, dim2 // TP // 2
     )
     if preshuffle:
-        w1 = shuffle_weight_gfx1250(w1)
-        w2 = shuffle_weight_gfx1250(w2)
+        w1 = preshuffle_moe_weight(w1)
+        w2 = preshuffle_moe_weight(w2)
 
     # -- benchmark --
     x_dtype_str = x_dtype
@@ -304,6 +322,7 @@ def bench_mlp_single_weight_init(
                 out_dtype=x_dtype,
                 apply_swiglu=True,
                 preshuffled=preshuffle,
+                backend=backend,
             )
             x = moe_gemm_a8w4(
                 x,
@@ -317,6 +336,7 @@ def bench_mlp_single_weight_init(
                 scatter_indx=scatter_indx,
                 swizzle_mx_scale=swizzle_mx_scale2,
                 preshuffled=preshuffle,
+                backend=backend,
             )
         else:
             assert x_dtype_str == "mx8"
@@ -334,6 +354,7 @@ def bench_mlp_single_weight_init(
                 swizzle_mx_scale=swizzle_mx_scale1,
                 apply_swiglu=True,
                 preshuffled=preshuffle,
+                backend=backend,
             )
             x, x_scale = quantize(x, x_dtype_str)
             x = moe_gemm_a8w4(
@@ -348,6 +369,7 @@ def bench_mlp_single_weight_init(
                 scatter_indx=scatter_indx,
                 swizzle_mx_scale=swizzle_mx_scale2,
                 preshuffled=preshuffle,
+                backend=backend,
             )
     proton.finalize()
     return parse_profile(
@@ -368,6 +390,7 @@ def bench_mlp(
     routed_experts=None,
     num_weight_inits=1,
     preshuffle=False,
+    backend=None,
 ):
     all_results = []
     for _ in range(num_weight_inits):
@@ -383,6 +406,7 @@ def bench_mlp(
             op_regex,
             routed_experts=routed_experts,
             preshuffle=preshuffle,
+            backend=backend,
         )
         all_results.append(result)
 
@@ -412,6 +436,7 @@ def roofline_mlp(
     name="",
     num_weight_inits=1,
     preshuffle=False,
+    backend=None,
 ):
     # Avoid creating an empty directory named like the output CSV stem.
     out_dir = Path("logs") / name
@@ -431,6 +456,7 @@ def roofline_mlp(
         routed_experts,  # fixed args
         num_weight_inits,
         preshuffle,
+        backend,
         bench_fn=bench_mlp,  # function to benchmark
         intensity_proxy_name="batch",  # intensity proxy name
         intensity_proxy_values=batch_sizes,  # intensity proxy values to sweep
@@ -487,6 +513,13 @@ def parse_args(args: list[str] | None = None):
         "experts.",
     )
     parser.add_argument(
+        "--backend",
+        choices=["triton", "gluon"],
+        default=None,
+        help="Kernel backend for moe_gemm_a8w4. Default: unset, i.e. the arch "
+        "default (gluon on gfx1250, triton elsewhere). gluon requires gfx1250.",
+    )
+    parser.add_argument(
         "--num-weight-inits",
         type=int,
         default=1,
@@ -537,6 +570,7 @@ def main(args: list[str] | None = None) -> None:
         name="gpt-oss-x2",
         num_weight_inits=parsed_args.num_weight_inits,
         preshuffle=parsed_args.preshuffle,
+        backend=parsed_args.backend,
     )
 
 

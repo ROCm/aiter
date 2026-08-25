@@ -374,6 +374,11 @@ def get_flydsl_stage2_v2_kernels(
 ):
     """Return v2 layout GEMM2 candidates, optionally filtered for a shape."""
     kernels = {}
+    valid_pairs = {("fp4", "fp4"), ("fp8", "fp4"), ("fp8", "fp8")}
+    if (a_dtype, b_dtype) not in valid_pairs:
+        return kernels
+    if a_dtype == "fp8" and b_dtype == "fp8" and block_m == 16:
+        return kernels
     # tile_m=16 requires the native SBM16 layout: its A-scale chunks are only
     # valid when the sort block (sbm=block_m) is also 16, so re-tiling a larger
     # sort block down to 16 is excluded.
@@ -612,8 +617,6 @@ def compile_flydsl_moe_stage1(
     b_dtype: str,
     out_dtype: str,
     act: str = "silu",
-    situ_beta: float = 1.0,
-    situ_linear_beta: float = 1.0,
     persist_m: int = 1,
     use_async_copy: bool = False,
     k_batch: int = 1,
@@ -674,8 +677,6 @@ def compile_flydsl_moe_stage1(
             b_dtype=b_dtype,
             out_dtype=out_dtype,
             act=act,
-            situ_beta=situ_beta,
-            situ_linear_beta=situ_linear_beta,
             persist_m=persist_m,
             use_async_copy=use_async_copy,
             k_batch=k_batch,
@@ -828,6 +829,8 @@ def _s1_args_fp4(
     bias=None,
     stream=None,
     swiglu_limit=float("inf"),
+    situ_beta=1.0,
+    situ_linear_beta=1.0,
     pass_swiglu_limit: bool = True,
 ):
     empty_f32 = torch.empty(0, device=dev, dtype=torch.float32)
@@ -852,7 +855,16 @@ def _s1_args_fp4(
         size_expert_ids_in,
     )
     if pass_swiglu_limit:
-        return args + (float(swiglu_limit), stream)
+        beta = float(situ_beta)
+        linear_beta = float(situ_linear_beta)
+        return args + (
+            beta,
+            1.0 / beta,
+            linear_beta,
+            1.0 / linear_beta,
+            float(swiglu_limit),
+            stream,
+        )
     return args + (stream,)
 
 
@@ -1311,14 +1323,8 @@ def _get_compiled_silu_fused(
     gui_layout: bool = False,
     act: str = "silu",
     enable_bias: bool = False,
-    situ_beta: float = 1.0,
-    situ_linear_beta: float = 1.0,
 ):
-    """Compile and cache the fused gate activation + quant + scale-sort kernel.
-
-    situ_beta/situ_linear_beta are compile-time constants for the SiTUv2 split-K
-    post-activation (mirrors the main gemm1 kernel); they are part of the cache
-    key so distinct betas compile distinct modules and never alias on disk."""
+    """Compile and cache the fused gate activation + quant + scale-sort kernel."""
     from aiter.ops.flydsl.kernels.silu_and_mul_fq import build_silu_and_mul_fq_module
 
     return build_silu_and_mul_fq_module(
@@ -1328,8 +1334,6 @@ def _get_compiled_silu_fused(
         gui_layout,
         act=act,
         enable_bias=enable_bias,
-        situ_beta=situ_beta,
-        situ_linear_beta=situ_linear_beta,
     )
 
 
@@ -1403,6 +1407,10 @@ def flydsl_silu_and_mul_interleaved(
             ptr_arg(empty_f32),
             token_num,
             num_sorted_rows,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
             float("inf"),
             torch.cuda.current_stream(),
         ),
@@ -1649,6 +1657,13 @@ def _flydsl_moe_stage1_impl(
     _n_in = inter_dim * 2 if use_mx_gemm else inter_dim
     _k_in = model_dim
     _swiglu_limit_val = runtime_swiglu_limit(swiglu_limit, act)
+    _situ_beta_val = float(situ_beta)
+    _situ_linear_beta_val = float(situ_linear_beta)
+    if _situ_beta_val <= 0.0 or _situ_linear_beta_val <= 0.0:
+        raise ValueError(
+            "situ_beta/situ_linear_beta must be > 0, got "
+            f"{_situ_beta_val!r}/{_situ_linear_beta_val!r}"
+        )
 
     if use_mx_gemm:
         args = _build_mx_args(
@@ -1673,6 +1688,8 @@ def _flydsl_moe_stage1_impl(
                 else torch.empty(0, device=dev)
             ),
             swiglu_limit=_swiglu_limit_val,
+            situ_beta=_situ_beta_val,
+            situ_linear_beta=_situ_linear_beta_val,
         )
     else:
         args = _s1_args_std(
@@ -1704,8 +1721,6 @@ def _flydsl_moe_stage1_impl(
         "b_dtype": b_dtype,
         "out_dtype": _gemm_out_dtype,
         "act": act,
-        "situ_beta": situ_beta,
-        "situ_linear_beta": situ_linear_beta,
         "persist_m": _persist_m,
         "use_async_copy": use_async_copy,
         "k_batch": k_batch,
@@ -1754,8 +1769,6 @@ def _flydsl_moe_stage1_impl(
             gui_layout=True,
             act=act,
             enable_bias=use_splitk_bias,
-            situ_beta=situ_beta,
-            situ_linear_beta=situ_linear_beta,
         )
         _run_compiled(
             _silu_fused_k,
@@ -1769,6 +1782,10 @@ def _flydsl_moe_stage1_impl(
                 ptr_arg(bias_arg),
                 token_num,
                 num_sorted_rows,
+                _situ_beta_val,
+                1.0 / _situ_beta_val,
+                _situ_linear_beta_val,
+                1.0 / _situ_linear_beta_val,
                 _swiglu_limit_val,
                 torch.cuda.current_stream(),
             ),
@@ -1781,8 +1798,6 @@ def _flydsl_moe_stage1_impl(
             gui_layout=True,
             act=act,
             enable_bias=use_splitk_bias,
-            situ_beta=situ_beta,
-            situ_linear_beta=situ_linear_beta,
         )
         _run_compiled(
             _silu_fused_k,
@@ -1796,6 +1811,10 @@ def _flydsl_moe_stage1_impl(
                 ptr_arg(bias_arg),
                 token_num,
                 num_sorted_rows,
+                _situ_beta_val,
+                1.0 / _situ_beta_val,
+                _situ_linear_beta_val,
+                1.0 / _situ_linear_beta_val,
                 _swiglu_limit_val,
                 torch.cuda.current_stream(),
             ),
@@ -1806,8 +1825,6 @@ def _flydsl_moe_stage1_impl(
             topk,
             act=act,
             enable_bias=use_splitk_bias,
-            situ_beta=situ_beta,
-            situ_linear_beta=situ_linear_beta,
         )
         _run_compiled(
             _silu_fused_k,
@@ -1821,6 +1838,10 @@ def _flydsl_moe_stage1_impl(
                 ptr_arg(bias_arg),
                 token_num,
                 num_sorted_rows,
+                _situ_beta_val,
+                1.0 / _situ_beta_val,
+                _situ_linear_beta_val,
+                1.0 / _situ_linear_beta_val,
                 _swiglu_limit_val,
                 torch.cuda.current_stream(),
             ),
@@ -2446,8 +2467,12 @@ def flydsl_moe_topids_to_rows(
 
     When ``g2l_lut`` is given, ``topk_ids`` are treated as GLOBAL expert ids and
     remapped to local buckets on-device (EP fusion): ``g2l_lut[global] -> local``
-    in [0, E), or the sentinel ``E`` for dropped routes. Dropped routes fold into
-    bucket 0. The kernel casts the f32 ``weight_in`` route weights into ``gather_w``
+    in [0, E), or the sentinel ``E`` for dropped routes. Dropped routes claim no
+    slot and get ``moe_route_maps.DROPPED_ROUTE_ROW`` as their row, so the returned
+    counts (== ``masked_m``) cover only the routes whose expert is local to this
+    rank -- everything downstream (psum, contiguous row count, the grouped GEMM's
+    M) shrinks with them, and every consumer of the row map must skip the sentinel.
+    The kernel casts the f32 ``weight_in`` route weights into ``gather_w``
     (``weight_dtype``, out) in the same pass -- kept -> cast, dropped -> 0 --
     folding the host ``topk_weight.to(bf16)`` copy + dropped-weight masked_fill.
 
@@ -2586,7 +2611,9 @@ def flydsl_moe_fused_route_quant_scatter(
 
     When ``g2l_lut`` is given (EP fusion), ``topk_ids`` are GLOBAL expert ids and
     the kernel remaps them to local buckets in [0, E) on-device (sentinel ``E``
-    for dropped routes, folded into bucket 0 with their ``gather_w`` entry zeroed).
+    for dropped routes). A dropped route claims no slot, is tagged with
+    ``moe_route_maps.DROPPED_ROUTE_ROW``, has its ``gather_w`` entry zeroed and is
+    not quantized/scattered, so ``masked_m`` counts local routes only.
 
     ``counter`` is the ``(E,)`` per-expert atomic slot counter; a pre-zeroed
     buffer (from the g2l-LUT kernel) skips the host ``torch.zeros(E)`` launch.
