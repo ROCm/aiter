@@ -7,8 +7,8 @@ readonly TEST_SCRIPT="${SCRIPT_DIR}/op_tests/test_flydsl_grouped_gemm_gfx1250.py
 
 # Add test cases as: "model_dim inter_dim experts tokens".
 readonly TEST_CASES=(
-  "16384 3072 96 128"
-  "7168 3072 96 128"
+  # "16384 3072 96 128"
+  # "7168 3072 96 128"
   "7168 3072 96 512"
   # "32768 3072 96 512"
 )
@@ -28,6 +28,7 @@ run_test() {
     "AITER_GROUPED_DEBUG=0"
     "ENABLE_CK=0"
     "AITER_LOG_MORE=1"
+    "FLYDSL_DUMP_IR=1"
     "AITER_MOE_EXPERT_BALANCE=true"
     "AITER_FLYDSL_MOE_EXPERT_SCHEDULING_MODE=1"
   )
