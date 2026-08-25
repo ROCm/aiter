@@ -221,14 +221,19 @@ def compact_payload_lds_bytes(
 
     ``pipe_depth`` whole-wire-row tiles per wave.  ``pipe_depth == 1`` fully
     drains TDM every iteration, so a multi-row expert reuses the one tile.
-    ``pipe_depth == 2`` double-buffers so each row's remote payload store
-    overlaps the next row's load (the producer runs inside the register/LDS-heavy
-    GEMM at low occupancy, so this latency is otherwise fully exposed).
+    ``pipe_depth >= 2`` gives each wave that many wire tiles in separate LDS
+    banks: the producer issues ``pipe_depth`` whole-row loads back-to-back so
+    that many TDM descriptors stay in flight before any drain, then flushes the
+    chunk.  The producer runs inside the register/LDS-heavy GEMM at low
+    occupancy, so keeping the tensor engine fed this way -- rather than exposing
+    one descriptor's full fabric latency per row -- is what hides the gather.
+    These tiles reuse the GEMM's LDS arena, so a deeper pipe costs no occupancy
+    as long as it fits that arena.
     """
     if wire_stride <= 0 or num_waves <= 0:
         raise ValueError("wire_stride and num_waves must be positive")
-    if pipe_depth not in (1, 2):
-        raise ValueError("pipe_depth must be 1 or 2")
+    if pipe_depth < 1:
+        raise ValueError("pipe_depth must be >= 1")
     return _align(wire_stride, 128) * num_waves * pipe_depth
 
 
@@ -566,8 +571,8 @@ def emit_compact_payload(
         raise ValueError("wire_stride and payload_bytes must be dword aligned")
     if wmma_rep <= 0 or tile_m % (wmma_rep * 16):
         raise ValueError("tile_m must be divisible by wmma_rep*16")
-    if pipe_depth not in (1, 2):
-        raise ValueError("pipe_depth must be 1 or 2")
+    if pipe_depth < 1:
+        raise ValueError("pipe_depth must be >= 1")
     if npes * max_tokens_per_rank > 1 << 24:
         raise ValueError("source-token encoding exceeds 24 bits")
     if max_tokens_per_rank <= 0 or (
@@ -605,10 +610,11 @@ def emit_compact_payload(
     fx.barrier()
     comm_ops.fence_system_acquire()
 
-    # One complete wire row per wave.  128B alignment preserves descriptor/LDS
-    # alignment even when wire_stride itself is not a power of two.  With
-    # ``pipe_depth == 2`` each wave owns two such tiles in separate LDS banks so
-    # a row's remote payload store overlaps the next row's load.
+    # One complete wire row per wave-tile.  128B alignment preserves
+    # descriptor/LDS alignment even when wire_stride itself is not a power of
+    # two.  With ``pipe_depth >= 2`` each wave owns that many tiles in separate
+    # LDS banks so ``pipe_depth`` whole-row loads issue back-to-back and stay in
+    # flight together before the chunk is drained and flushed.
     tile_bytes = _align(wire_stride, 128)
     bank_stride = num_waves * tile_bytes
     wire_desc = TDM.tdm_group1(wire_stride, 1, 1)
@@ -735,39 +741,43 @@ def emit_compact_payload(
         )
 
         if const_expr(pipe_depth > 1):
-            # Software-pipelined: issue this row's load, then flush the row
-            # loaded last iteration so its remote store overlaps the load.  The
-            # load/store tensor counter retires in issue order, so ``tdm_wait(1)``
-            # after issuing the current load guarantees the previous row's load
-            # (and every store before it) has landed while leaving the current
-            # load in flight.
-            row = wave
-            have_prev = fx.Int32(0)
-            p_tok = fx.Int32(0)
-            p_dst = fx.Int32(0)
-            p_route = fx.Int32(0)
-            p_buf = fx.Int32(1)
-            while row < source_count:
+            # Chunked deep pipeline.  Each wave takes ``pipe_depth`` of its
+            # strided rows at a time, issues all their whole-row loads into
+            # separate LDS banks back-to-back (so up to ``pipe_depth`` TDM
+            # descriptors are in flight), drains once, then flushes the whole
+            # chunk (payload store + scale scatter + rowmap) and drains once
+            # more before reusing the banks.  This keeps the tensor engine fed
+            # at the GEMM's low producer occupancy, where the depth-1 path
+            # exposed a full load->store fabric round trip per row because only
+            # one descriptor was ever live.  Draining to zero between the load
+            # and store phase (and between chunks) needs no counter arithmetic,
+            # so the deeper pipe stays correct as ``pipe_depth`` grows.
+            base_row = wave
+            while base_row < source_count:
                 if overflow == fx.Int32(0):
-                    cur_buf = fx.Int32(1) - p_buf
-                    route = _load_i32(pair_order, source_base + row)
-                    source_token = route // fx.Int32(topk)
-                    destination_row = destination_base + row
-                    emit_load(wave_tile(cur_buf), source_token)
-                    if have_prev != fx.Int32(0):
-                        TDM.tdm_wait(1)
-                        emit_flush(wave_tile(p_buf), p_tok, p_dst, p_route)
-                    have_prev = fx.Int32(1)
-                    p_tok = source_token
-                    p_dst = destination_row
-                    p_route = route
-                    p_buf = cur_buf
-                row = row + fx.Int32(num_waves)
-            if overflow == fx.Int32(0):
-                if have_prev != fx.Int32(0):
+                    toks = []
+                    dsts = []
+                    routes = []
+                    preds = []
+                    for s in range_constexpr(pipe_depth):
+                        r = base_row + fx.Int32(s * num_waves)
+                        pred = r < source_count
+                        safe_r = pred.select(r, fx.Int32(0))
+                        route = _load_i32(pair_order, source_base + safe_r)
+                        toks.append(route // fx.Int32(topk))
+                        dsts.append(destination_base + r)
+                        routes.append(route)
+                        preds.append(pred)
+                        if pred:
+                            emit_load(wave_tile(fx.Int32(s)), toks[s])
                     TDM.tdm_wait(0)
-                    emit_flush(wave_tile(p_buf), p_tok, p_dst, p_route)
+                    for s in range_constexpr(pipe_depth):
+                        if preds[s]:
+                            emit_flush(
+                                wave_tile(fx.Int32(s)), toks[s], dsts[s], routes[s]
+                            )
                     TDM.tdm_wait(0)
+                base_row = base_row + fx.Int32(pipe_depth * num_waves)
             comm_ops.waitcnt_all()
         else:
             row = wave
