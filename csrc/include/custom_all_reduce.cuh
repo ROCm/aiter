@@ -1760,7 +1760,8 @@ __global__ void __launch_bounds__(tnum, 1)
                                     int m,
                                     int n,
                                     int input_hidden_dim,
-                                    int out_hidden_dim)
+                                    int out_hidden_dim,
+                                    int arm_repeat)
 {
     constexpr int pack_size = 16 / sizeof(T);
     constexpr int tnum_gpu  = tnum / ngpus;
@@ -1884,7 +1885,11 @@ __global__ void __launch_bounds__(tnum, 1)
             {
                 const int read_idx = bid * valid_pack_count + n_iter * tnum + threadIdx.x;
                 P reduce_out_pack  = lamport_spin_load<T, pack_size>(&tmps[read_idx]);
-                lamport_arm<T, pack_size>(&tmps[read_idx]);
+                // arm_repeat > 1 is a diagnostic: repeating an idempotent store
+                // leaves the result correct, so the extra passes measure what one
+                // re-arm pass costs without invalidating the run.
+                for(int a = 0; a < arm_repeat; ++a)
+                    lamport_arm<T, pack_size>(&tmps[read_idx]);
                 P residual_inp_pack = *(reinterpret_cast<P*>(residual_inp) + read_idx);
                 w_arr[n_iter] = *(reinterpret_cast<P*>(weight) + n_iter * tnum + threadIdx.x);
                 A reduce_pack;
@@ -1961,6 +1966,19 @@ inline int ar_rmsnorm_lamport_forced_blocks()
         return v != nullptr ? std::atoi(v) : 0;
     }();
     return blocks;
+}
+
+// Diagnostic only: run the consumer's re-arm store this many times per pack.
+// The store is idempotent, so the extra passes cost time without changing the
+// result, which is how the re-arm's share of the runtime gets measured.
+inline int ar_rmsnorm_lamport_arm_repeat()
+{
+    static const int n = []() {
+        const char* v = std::getenv("AITER_AR_RMSNORM_LAMPORT_ARM_REPEAT");
+        int parsed    = v != nullptr ? std::atoi(v) : 1;
+        return parsed >= 1 ? parsed : 1;
+    }();
+    return n;
 }
 
 // Arm the sentinel for a tmp buffer the first time it is used, and again if a
@@ -4653,7 +4671,14 @@ void dispatchFusedAllReduceRMSNorm(hipStream_t stream,
     // ---- opt-in single-kernel Lamport path (AITER_AR_RMSNORM_LAMPORT=1) ----
     // Replaces the reduce_scatter_cross_device_store + local_device_load_rmsnorm
     // pair with one kernel, removing the end_sync barrier between them.
-    if(ar_rmsnorm_lamport_enabled())
+    //
+    // Only ever displaces that pair. This is a reduce-scatter, so it is the wrong
+    // shape of algorithm for the small messages that MAYBE_DISPATCH_1S_KERNEL
+    // handles below: the one-shot kernel reads each peer's input once and never
+    // stages anything, which no amount of tuning here can match. Without the
+    // use_1stage guard, enabling this path would silently take over everything
+    // under 128 KB and lose.
+    if(!use_1stage && ar_rmsnorm_lamport_enabled())
     {
         constexpr int lam_tnum = 512;
         const int lam_packs    = n / pack_size;
@@ -4681,6 +4706,7 @@ void dispatchFusedAllReduceRMSNorm(hipStream_t stream,
             // on data produced by other blocks of the same grid, so an unscheduled
             // producer block would hang the resident consumers.
             constexpr int kLamMinBlocks = 16;
+            const int lam_arm_repeat    = ar_rmsnorm_lamport_arm_repeat();
             const int lam_prod_blocks   = (m * lam_packs + lam_tnum - 1) / lam_tnum;
             int lam_blocks = std::min(std::max(lam_prod_blocks, kLamMinBlocks), kMaxBlocks);
             if(const int forced = ar_rmsnorm_lamport_forced_blocks(); forced > 0)
@@ -4715,7 +4741,8 @@ void dispatchFusedAllReduceRMSNorm(hipStream_t stream,
                                              m,                                    \
                                              n,                                    \
                                              input_hidden_dim,                     \
-                                             out_n);                               \
+                                             out_n,                                \
+                                             lam_arm_repeat);                      \
     } while(0)
 
 #define LAMPORT_DISPATCH_NLOOP(NGPUS)                                              \
