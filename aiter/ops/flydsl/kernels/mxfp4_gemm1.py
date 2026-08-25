@@ -43,6 +43,20 @@ from .mxfp4_gemm_common import (
 ACC_LDS_PAD_DW = 4
 
 
+def scale_out_uses_atomic(BM):
+    """True when the GEMM1 A-scale epilogue accumulates into the scale buffer
+    with atomics, which obliges the launcher to zero that buffer first.
+
+    Every path now writes disjoint sub-fields of each dword -- the BM16 native
+    layout owns one of two 16-bit halves (selected by ikxdl) and the BM16
+    generic layout owns one of four bytes (selected by byte_pos) -- so a plain
+    narrow store suffices everywhere and no pre-clear is needed. Keep this the
+    single place that answers the question so the launcher cannot drift from
+    the kernel.
+    """
+    return False
+
+
 def k_g2_half_for(inter):
     return inter // 2
 
@@ -1219,21 +1233,6 @@ def _gemm1_body(
         )
         ascaleout_i8_tiles = _global_scalar_tiles(arg_ascaleout, fx.Int8, 1 << 26)
         ascaleout_i16_tiles = _global_scalar_tiles(arg_ascaleout, fx.Int16, 1 << 25)
-        ascaleout_i32_tiles = _global_scalar_tiles(arg_ascaleout, fx.Int32, 1 << 24)
-        atomic_add_atom = fx.make_copy_atom(
-            fx.UniversalAtomicAdd(fx.Int32, syncscope=fx.rocdl.SyncScope.Agent),
-            fx.Int32,
-        )
-
-        def atomic_add_scale(idx, value):
-            r = fx.make_rmem_tensor(mem_1x1, fx.Int32)
-            r.store(fx.Vector.from_elements([value], fx.Int32))
-            fx.copy_atom_call(
-                atomic_add_atom,
-                r,
-                fx.slice(ascaleout_i32_tiles, (None, idx)),
-            )
-
         if kk == fx.Int32(0):
             if const_expr(BN == 64):
                 ku = n_block_idx >> fx.Int32(3)
@@ -1262,8 +1261,14 @@ def _gemm1_body(
                     duplicated_scale = scales_per_mr[0] | (
                         scales_per_mr[0] << fx.Int32(8)
                     )
-                    packed_scale = duplicated_scale << (ikxdl * fx.Int32(16))
-                    atomic_add_scale(dword_off, packed_scale)
+                    # ikxdl selects one of the two disjoint 16-bit halves of
+                    # the dword, so a narrow store replaces the atomic merge.
+                    _scalar_store(
+                        ascaleout_i16_tiles,
+                        dword_off * fx.Int32(2) + ikxdl,
+                        duplicated_scale,
+                        fx.Int16,
+                    )
                 else:
                     # Generic v2 GEMM2 packs two BM16 blocks into one 32-row
                     # scale chunk.
@@ -1273,8 +1278,13 @@ def _gemm1_body(
                         ascaleout_layout, chunk, ku, scale_wave_grp, m_lane
                     )
                     byte_pos = ikxdl * fx.Int32(2) + row_half
-                    packed_scale = scales_per_mr[0] << (byte_pos * fx.Int32(8))
-                    atomic_add_scale(dword_off, packed_scale)
+                    # byte_pos selects one of the four disjoint bytes.
+                    _scalar_store(
+                        ascaleout_i8_tiles,
+                        dword_off * fx.Int32(4) + byte_pos,
+                        scales_per_mr[0],
+                        fx.Int8,
+                    )
             elif const_expr(num_waves == 2):
                 chunk = m_block_idx
                 row_half = m_lane >> fx.Int32(4)
