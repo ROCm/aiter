@@ -190,6 +190,49 @@ CI 有 black gate（`.github/workflows/pre-checks.yaml:28-35` 跑 `psf/black@sta
 - 要不要复用 `dispatch.py` 里的 `DispatchSlot` 和同步原语，还是另起一套。复用的话要处理决定 19 的冻结约束。
 - `FlyDSLDispatchGroupMajorOp` 要不要加 `local_only`。TP 的 all-gather 需要 peer 可见的接收 buffer，但不需要 EP 那套 srcmap/wts_em。
 
-### 建议的第一步
+### 已完成的基线测量（2026-08-25）
 
-先量 baseline 的时间分解，把 all-gather 占的比例测出来。如果 all-gather 只占 5%，那融合版的天花板就是 5%，值不值得做要先有数。这件事不需要写任何 kernel，用现成的两个入口加 CUDA event 就能测。
+用 `op_tests/multigpu_tests/bench_tp_moe_stage1.py` 在 8 卡 gfx950 上量的，中位数，跨 rank 取 max，每次迭代前有 barrier 所以读数不含 rank skew。
+
+BF16 入口的分段耗时（毫秒）：
+
+| m_local | all-gather | moe_sorting | 量化 | GEMM1 | 总计 |
+|---|---|---|---|---|---|
+| 1 | 0.0749 | 0.0540 | 0.0203 | 0.0763 | 0.2256 |
+| 8 | 0.0837 | 0.0557 | 0.0269 | 0.2372 | 0.4034 |
+| 64 | 0.1002 | 0.0446 | 0.0413 | 0.3033 | 0.4894 |
+| 128 | 0.1226 | 0.0191 | 0.0419 | 0.3530 | 0.5365 |
+
+**关键结论一：all-gather 是延迟瓶颈，不是带宽瓶颈。** 拟合出来是
+`T ≈ 20 µs + 17 µs × collective 次数 + bytes / 275 GB/s`。m_local=128 时 12.85 MB 的边际传输只花 46 µs，而三次 collective 的固定开销是 70 µs。
+
+**关键结论二：决定 18 的前提不成立。** `forward_prequant` 虽然跨卡字节减半，但它为了单独传 scale 多做一次 collective，实测每一档都比 BF16 入口慢。「先 quant 再 gather 省带宽」这个理由在当前 token 规模下不成立。
+
+**关键结论三：一次 kernel launch 约 7 µs。** 证据是解包两个小张量的耗时在 m_local 变化 128 倍时始终是 0.014 ms。
+
+### 试过但无效的两条路（不要重复）
+
+**`torch.distributed._coalescing_manager` 更慢。** m_local=128 时 0.2113 ms，比不用它的 0.1178 差了将近一倍。
+
+**把所有输入打包成一个 buffer 做单次 all-gather，净收益接近零。** 拆解数据（m_local=128，BF16）：
+
+```
+3 次独立 collective   0.1148 ms
+cat 打包              0.0107
+1 次 collective       0.0806
+解包 x                0.0159
+解包 3 个小张量        0.0141
+打包版合计            0.1051   ← 只省 10 µs，约总时间的 2%
+```
+
+省下 2 次 collective 的 34 µs，但 cat 加三次解包拷贝要花 41 µs。这一版实现过并跑通了全部数值用例，因为收益太小且 fp8 入口在小 m_local 反而变慢，已经退回。
+
+### 对阶段二立论的修正
+
+原来的立论是「重叠通信和计算，天花板 22% 到 32%」。测完之后这个说法**低估了收益，归因也不对**。
+
+融合 kernel 真正消掉的是**启动开销**，不只是把通信藏起来。它把 gather、sort、量化、GEMM1 合成一次 launch，三次 collective 的 51 µs 和中间几次 kernel launch 一起消失。m_local=128 时非 GEMM1 的部分合计 0.1836 ms，全部吸收进 GEMM1 的话总时间从 0.5365 降到 0.353，是 34%。m_local=1 时非 GEMM1 部分占四分之三，比例更高。
+
+这也解释了为什么打包和 coalescing 都无效：它们只是把开销在 collective 和 kernel launch 之间搬来搬去，总量不变。只有合成一个 kernel 才能真正消掉。
+
+打折扣的地方是融合 kernel 自身的调度开销不是免费的，MegaMoE 那套 ticket、epoch、ready flag 协议要花时间，所以 34% 是上限而不是预期值。
