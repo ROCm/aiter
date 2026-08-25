@@ -45,7 +45,9 @@ def _opus_sf_shuf_sub() -> int:
 
         with open(_SF_SHUF_SUB_HEADER) as f:
             m = re.search(
-                r"^#define\s+OPUS_SF_SHUF_SUB_VALUE\s+(\d+)\s*$", f.read(), re.M
+                r"^#define\s+OPUS_SF_SHUF_SUB_VALUE\s+(\d+)\s*$",
+                f.read(),
+                re.MULTILINE,
             )
         if not m:
             raise RuntimeError(

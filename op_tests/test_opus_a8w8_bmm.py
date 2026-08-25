@@ -684,7 +684,7 @@ def check_shuffle_scale_index():
         _shuf_walk(
             sub,
             ksc,
-            lambda g, ctx, word, byte, m, kb: (
+            lambda g, ctx, word, byte, m, kb, fired=fired: (
                 fired.append(1) if (word, byte) != _shuf_ref(m, kb, sub, k1) else None
             ),
             mutate=mut,
@@ -744,6 +744,8 @@ def check_shuffle_scale_bytes():
                     rows=rows,
                     ksc=ksc,
                     k=k,
+                    mpad=mpad,
+                    k1=k1,
                 ):
                     nonlocal checked
                     if m >= mpad or kb >= 2 * k1 or word >= words.shape[1]:
