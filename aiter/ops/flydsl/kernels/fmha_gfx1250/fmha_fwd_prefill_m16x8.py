@@ -248,6 +248,23 @@ def _qk_gemm(*, k_values, q_frags, n_block):
     return s_acc
 
 
+def _tree_reduce(vals, op3, op2):
+    """Balanced 3-way tree reduction (fast-math): critical path ~ceil(log3(N)) vs N-1
+    for a left-fold. op3 = nested op2 so the backend fuses it (v_max3_f32 for max)."""
+    cur = list(vals)
+    while len(cur) > 1:
+        nxt, i, n = [], 0, len(cur)
+        while i < n:
+            if n - i >= 3:
+                nxt.append(op3(cur[i], cur[i + 1], cur[i + 2])); i += 3
+            elif n - i == 2:
+                nxt.append(op2(cur[i], cur[i + 1])); i += 2
+            else:
+                nxt.append(cur[i]); i += 1
+        cur = nxt
+    return cur[0]
+
+
 def _softmax(*, s, m_prev, d_prev, lane_idx, n_block,
             kv_pos_base=None, q_max=None, q_min=None, kv_len=None):
     """Online-softmax update for one KV tile. ``s`` already includes softmax_scale
@@ -298,6 +315,14 @@ def _softmax(*, s, m_prev, d_prev, lane_idx, n_block,
     def fadd(a, b):
         return fx.Float32(arith.addf(_raw(a), _raw(b), fastmath=fast))
 
+    # fast-math WITHOUT reassoc: LLVM's Reassociate pass otherwise re-linearizes the
+    # sum tree back into a serial chain (max survives — Reassociate ignores maxnum).
+    _FF = arith.FastMathFlags
+    _no_reassoc = _FF.nnan | _FF.ninf | _FF.nsz | _FF.arcp | _FF.contract | _FF.afn
+
+    def fadd_t(a, b):
+        return fx.Float32(arith.addf(_raw(a), _raw(b), fastmath=_no_reassoc))
+
     def fsub(a, b):
         return fx.Float32(arith.subf(_raw(a), _raw(b), fastmath=fast))
 
@@ -334,9 +359,8 @@ def _softmax(*, s, m_prev, d_prev, lane_idx, n_block,
                     sval = (kv_pos >= kv_len).select(neg_inf, sval)
             s_masked.append(sval)
 
-    local_max = s_masked[0]
-    for v in s_masked[1:]:
-        local_max = fmax(local_max, v)
+    max3 = lambda a, b, c: fmax(fmax(a, b), c)
+    local_max = _tree_reduce(s_masked, max3, fmax)
     row_max = fmax(local_max, peer(local_max))
     m_full = fmax(m_prev, row_max)
 
@@ -373,20 +397,22 @@ def _softmax(*, s, m_prev, d_prev, lane_idx, n_block,
         corr = exp2(fmul(fsub(m_prev, m_new), log2e))
         neg_m = fsub(zero, fmul(m_new, log2e))
 
-    # ---- Pass 2: p = exp(S - m_new) (bf16, per tile) + running row sum ----
+    # ---- Pass 2: p = exp(S - m_new) (bf16, per tile) + row sum (tree-reduced) ----
     p = []
-    local_sum = zero
+    p_flat = []
     idx = 0
     for kvt in range(NKV):
         pe = []
         for i in range(8):
             # exp2(s*log2e - m_new*log2e) via one fma.
             pj = exp2(fx.Float32(fmath.fma(_raw(s_masked[idx]), _raw(log2e), _raw(neg_m))))
-            local_sum = fadd(local_sum, pj)
             pe.append(pj)
+            p_flat.append(pj)
             idx += 1
         p.append(fx.Vector.from_elements(pe, fx.Float32).to(fx.BFloat16))
 
+    add3 = lambda a, b, c: fadd_t(fadd_t(a, b), c)
+    local_sum = _tree_reduce(p_flat, add3, fadd_t)
     d_new = fadd(fmul(corr, d_prev), fadd(local_sum, peer(local_sum)))
     return p, m_new, d_new, corr, do_rescale
 
