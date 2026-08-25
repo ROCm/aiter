@@ -24,6 +24,13 @@ from .quant import per_1x32_mx_quant
 _SUPPORTED_TP = (4, 8)
 _DEFAULT_STAGE1_KERNEL = "flydsl_moe1_afp8_wfp4_bf16_t32x64x256_w4_gui_xcd4_kw4_fp8"
 
+# How the operator collects every rank's activation shard. The names describe the
+# mechanism, not the payload dtype: both entry points (bf16 ``forward`` and fp8
+# ``forward_prequant``) run over whichever transport is selected.
+_TRANSPORT_NCCL = "nccl_allgather"  # dist.all_gather_into_tensor, outside the kernel
+_TRANSPORT_FUSED = "fused_p2p"  # phase 2: in-kernel P2P over Mori SHMEM
+_TRANSPORTS = frozenset({_TRANSPORT_NCCL, _TRANSPORT_FUSED})
+
 
 @dataclass(frozen=True)
 class TPMoEStage1Output:
@@ -71,7 +78,7 @@ class TPMoEStage1:
         sort_block_m: int = 32,
         swiglu_limit: float = 0.0,
         stage1_kernel_name: str = _DEFAULT_STAGE1_KERNEL,
-        transport: str = "allgather_bf16",
+        transport: str = _TRANSPORT_NCCL,
     ):
         self.group = group
         if (tp_size is None) != (tp_rank is None):
@@ -117,10 +124,14 @@ class TPMoEStage1:
             )
         if float(swiglu_limit) < 0:
             raise ValueError("swiglu_limit must be non-negative")
-        if transport != "allgather_bf16":
+        if transport not in _TRANSPORTS:
+            raise ValueError(
+                f"unknown transport={transport!r}; expected one of {sorted(_TRANSPORTS)}"
+            )
+        if transport != _TRANSPORT_NCCL:
             raise NotImplementedError(
-                f"transport={transport!r} is not implemented yet; phase 1 only "
-                "supports 'allgather_bf16'"
+                f"transport={transport!r} is not implemented yet; only "
+                f"{_TRANSPORT_NCCL!r} is available"
             )
 
         self.tp_size = int(tp_size)

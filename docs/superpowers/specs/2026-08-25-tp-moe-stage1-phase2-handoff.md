@@ -39,7 +39,7 @@ TPMoEStage1(
     group=None, tp_size=None, tp_rank=None,
     device=None, sort_block_m=32, swiglu_limit=0.0,
     stage1_kernel_name="flydsl_moe1_afp8_wfp4_bf16_t32x64x256_w4_gui_xcd4_kw4_fp8",
-    transport="allgather_bf16",
+    transport="nccl_allgather",
 )
 .forward(x_bf16, route_weights, topk_ids) -> TPMoEStage1Output
 .forward_prequant(x_fp8, x_scale, route_weights, topk_ids) -> TPMoEStage1Output
@@ -169,13 +169,13 @@ CI 有 black gate（`.github/workflows/pre-checks.yaml:28-35` 跑 `psf/black@sta
 
 对外 API 不变。要做的是：
 
-1. 放开 `transport="fused_allgather"` 分支，现在它抛 `NotImplementedError`。
+1. 放开 `transport="fused_p2p"` 分支，现在它抛 `NotImplementedError`。
 2. 写一个新的 fused kernel，照 `mega_moe_stage1.py` 的 ticket/epoch 调度骨架，把 `dispatch.py` 的 `emit_dispatch_*` 换成 push-based all-gather，让 GEMM consumer 按 tile 等数据到位。
 3. 复用现成的 `_pack()` 产出同一个 `TPMoEStage1Output`。
 
 ### 对拍方式
 
-在同一个进程里构造两个实例，`transport` 分别是 `"allgather_bf16"` 和 `"fused_allgather"`，喂同一份输入，逐行比 `inter_sorted_quant * scale`。因为决定 11 是每次调用新分配，两份结果不会互相覆盖。
+在同一个进程里构造两个实例，`transport` 分别是 `"nccl_allgather"` 和 `"fused_p2p"`，喂同一份输入，逐行比 `inter_sorted_quant * scale`。因为决定 11 是每次调用新分配，两份结果不会互相覆盖。
 
 ### 已有的性能基线
 

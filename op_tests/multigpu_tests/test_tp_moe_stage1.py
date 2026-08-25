@@ -702,11 +702,14 @@ def case_exports():
         assert name in mm.__all__, f"existing export {name} disappeared"
         assert getattr(mm, name) is not None
 
-    # phase-2 seam: the knob exists and rejects unimplemented transports clearly
+    # The phase-2 extension point: the knob exists, a known-but-unbuilt transport
+    # raises NotImplementedError, and a typo raises ValueError instead of being
+    # silently accepted.
     device = torch.device("cuda", 0)
     w1, w1_scale = _fake_w1(NETWORK["experts"], 384, NETWORK["model_dim"], device)
-    try:
-        TPMoEStage1(
+
+    def _build(transport):
+        return TPMoEStage1(
             model_dim=NETWORK["model_dim"],
             inter_dim=384,
             experts=NETWORK["experts"],
@@ -716,12 +719,24 @@ def case_exports():
             tp_size=8,
             tp_rank=0,
             device=device,
-            transport="fused_allgather",
+            transport=transport,
         )
+
+    try:
+        _build("fused_p2p")
     except NotImplementedError as exc:
-        assert "fused_allgather" in str(exc), exc
+        assert "fused_p2p" in str(exc), exc
     else:
         raise AssertionError("unimplemented transport must raise NotImplementedError")
+
+    try:
+        _build("allgather_bf16")  # the pre-rename name is no longer valid
+    except ValueError as exc:
+        assert "unknown transport" in str(exc), exc
+    else:
+        raise AssertionError("unknown transport must raise ValueError")
+
+    assert _build("nccl_allgather").transport == "nccl_allgather"
     print("case_exports OK")
 
 
