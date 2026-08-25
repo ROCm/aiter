@@ -3,15 +3,16 @@
 
 import torch
 import triton
+
 from aiter.ops.triton._triton_kernels.quant.quant_mxfp8 import (
-    _convert_to_mxfp8_kernel,
     _convert_from_mxfp8_kernel,
+    _convert_to_mxfp8_kernel,
 )
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 __all__ = [
-    "convert_to_mxfp8",
     "convert_from_mxfp8",
+    "convert_to_mxfp8",
 ]
 
 _LOGGER = AiterTritonLogger()
@@ -58,11 +59,17 @@ def convert_to_mxfp8(
 
     grid = (triton.cdiv(M, block_m), triton.cdiv(N, block_n))
     _convert_to_mxfp8_kernel[grid](
-        x, y, s,
-        x.stride(0), x.stride(1),
-        y.stride(0), y.stride(1),
-        s.stride(0), s.stride(1),
-        0, 0,
+        x,
+        y,
+        s,
+        x.stride(0),
+        x.stride(1),
+        y.stride(0),
+        y.stride(1),
+        s.stride(0),
+        s.stride(1),
+        0,
+        0,
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         QUANT_BLOCK_SIZE=quant_block_size,
@@ -107,10 +114,15 @@ def convert_from_mxfp8(
 
     grid = (triton.cdiv(M, block_m), triton.cdiv(N, block_n))
     _convert_from_mxfp8_kernel[grid](
-        x, y, s,
-        x.stride(0), x.stride(1),
-        y.stride(0), y.stride(1),
-        s.stride(0), s.stride(1),
+        x,
+        y,
+        s,
+        x.stride(0),
+        x.stride(1),
+        y.stride(0),
+        y.stride(1),
+        s.stride(0),
+        s.stride(1),
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         QUANT_BLOCK_SIZE=quant_block_size,

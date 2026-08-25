@@ -10,15 +10,22 @@ import triton.language as tl
 
 @triton.jit
 def _indexer_fwd_kernel(
-    q_ptr, k_ptr, w_ptr, scores_ptr,
-    q_stride_s: tl.int64, q_stride_h: tl.int64,
+    q_ptr,
+    k_ptr,
+    w_ptr,
+    scores_ptr,
+    q_stride_s: tl.int64,
+    q_stride_h: tl.int64,
     k_stride_p: tl.int64,
     w_stride_s: tl.int64,
     scores_stride_s: tl.int64,
-    S: tl.int32, P: tl.int32,
-    H: tl.constexpr, HD: tl.constexpr,
+    S: tl.int32,
+    P: tl.int32,
+    H: tl.constexpr,
+    HD: tl.constexpr,
     COMPRESS_RATIO: tl.constexpr,
-    BLOCK_S: tl.constexpr, BLOCK_P: tl.constexpr,
+    BLOCK_S: tl.constexpr,
+    BLOCK_P: tl.constexpr,
 ):
     pid_s = tl.program_id(0)
     pid_p = tl.program_id(1)
@@ -34,12 +41,14 @@ def _indexer_fwd_kernel(
     for h in tl.static_range(0, H):
         q_tile = tl.load(
             q_ptr + s_offs[:, None] * q_stride_s + h * q_stride_h + hd_idx[None, :],
-            mask=s_mask[:, None], other=0.0,
+            mask=s_mask[:, None],
+            other=0.0,
         ).to(tl.float32)
 
         k_tile = tl.load(
             k_ptr + p_offs[:, None] * k_stride_p + hd_idx[None, :],
-            mask=p_mask[:, None], other=0.0,
+            mask=p_mask[:, None],
+            other=0.0,
         ).to(tl.float32)
 
         dot = tl.dot(q_tile, tl.trans(k_tile), out_dtype=tl.float32)
@@ -47,7 +56,8 @@ def _indexer_fwd_kernel(
 
         w_h = tl.load(
             w_ptr + s_offs * w_stride_s + h,
-            mask=s_mask, other=0.0,
+            mask=s_mask,
+            other=0.0,
         ).to(tl.float32)
 
         acc += dot * w_h[:, None]
@@ -64,17 +74,27 @@ def _indexer_fwd_kernel(
 
 @triton.jit
 def _indexer_bwd_dq_dw_kernel(
-    q_ptr, k_ptr, w_ptr, d_scores_ptr, dq_ptr, dw_ptr,
-    q_stride_s: tl.int64, q_stride_h: tl.int64,
+    q_ptr,
+    k_ptr,
+    w_ptr,
+    d_scores_ptr,
+    dq_ptr,
+    dw_ptr,
+    q_stride_s: tl.int64,
+    q_stride_h: tl.int64,
     k_stride_p: tl.int64,
     w_stride_s: tl.int64,
     ds_stride_s: tl.int64,
-    dq_stride_s: tl.int64, dq_stride_h: tl.int64,
+    dq_stride_s: tl.int64,
+    dq_stride_h: tl.int64,
     dw_stride_s: tl.int64,
-    S: tl.int32, P: tl.int32,
-    H: tl.constexpr, HD: tl.constexpr,
+    S: tl.int32,
+    P: tl.int32,
+    H: tl.constexpr,
+    HD: tl.constexpr,
     COMPRESS_RATIO: tl.constexpr,
-    BLOCK_S: tl.constexpr, BLOCK_P: tl.constexpr,
+    BLOCK_S: tl.constexpr,
+    BLOCK_P: tl.constexpr,
 ):
     pid_s = tl.program_id(0)
 
@@ -85,12 +105,14 @@ def _indexer_bwd_dq_dw_kernel(
     for h in tl.static_range(0, H):
         q_tile = tl.load(
             q_ptr + s_offs[:, None] * q_stride_s + h * q_stride_h + hd_idx[None, :],
-            mask=s_mask[:, None], other=0.0,
+            mask=s_mask[:, None],
+            other=0.0,
         ).to(tl.float32)
 
         w_h = tl.load(
             w_ptr + s_offs * w_stride_s + h,
-            mask=s_mask, other=0.0,
+            mask=s_mask,
+            other=0.0,
         ).to(tl.float32)
 
         acc_dq = tl.zeros((BLOCK_S, HD), dtype=tl.float32)
@@ -102,12 +124,14 @@ def _indexer_bwd_dq_dw_kernel(
 
             k_tile = tl.load(
                 k_ptr + p_offs[:, None] * k_stride_p + hd_idx[None, :],
-                mask=p_mask[:, None], other=0.0,
+                mask=p_mask[:, None],
+                other=0.0,
             ).to(tl.float32)
 
             d_scores_tile = tl.load(
                 d_scores_ptr + s_offs[:, None] * ds_stride_s + p_offs[None, :],
-                mask=s_mask[:, None] & p_mask[None, :], other=0.0,
+                mask=s_mask[:, None] & p_mask[None, :],
+                other=0.0,
             ).to(tl.float32)
 
             allowed = (p_offs[None, :] + 1) * COMPRESS_RATIO - 1 <= s_offs[:, None]
@@ -138,16 +162,24 @@ def _indexer_bwd_dq_dw_kernel(
 
 @triton.jit
 def _indexer_bwd_dk_kernel(
-    q_ptr, k_ptr, w_ptr, d_scores_ptr, dk_ptr,
-    q_stride_s: tl.int64, q_stride_h: tl.int64,
+    q_ptr,
+    k_ptr,
+    w_ptr,
+    d_scores_ptr,
+    dk_ptr,
+    q_stride_s: tl.int64,
+    q_stride_h: tl.int64,
     k_stride_p: tl.int64,
     w_stride_s: tl.int64,
     ds_stride_s: tl.int64,
     dk_stride_p: tl.int64,
-    S: tl.int32, P: tl.int32,
-    H: tl.constexpr, HD: tl.constexpr,
+    S: tl.int32,
+    P: tl.int32,
+    H: tl.constexpr,
+    HD: tl.constexpr,
     COMPRESS_RATIO: tl.constexpr,
-    BLOCK_S: tl.constexpr, BLOCK_P: tl.constexpr,
+    BLOCK_S: tl.constexpr,
+    BLOCK_P: tl.constexpr,
 ):
     pid_p = tl.program_id(0)
 
@@ -157,7 +189,8 @@ def _indexer_bwd_dk_kernel(
 
     k_tile = tl.load(
         k_ptr + p_offs[:, None] * k_stride_p + hd_idx[None, :],
-        mask=p_mask[:, None], other=0.0,
+        mask=p_mask[:, None],
+        other=0.0,
     ).to(tl.float32)
 
     acc_dk = tl.zeros((BLOCK_P, HD), dtype=tl.float32)
@@ -168,7 +201,8 @@ def _indexer_bwd_dk_kernel(
 
         d_scores_tile = tl.load(
             d_scores_ptr + s_offs[:, None] * ds_stride_s + p_offs[None, :],
-            mask=s_mask[:, None] & p_mask[None, :], other=0.0,
+            mask=s_mask[:, None] & p_mask[None, :],
+            other=0.0,
         ).to(tl.float32)
 
         allowed = (p_offs[None, :] + 1) * COMPRESS_RATIO - 1 <= s_offs[:, None]
@@ -177,12 +211,14 @@ def _indexer_bwd_dk_kernel(
         for h in tl.static_range(0, H):
             q_tile = tl.load(
                 q_ptr + s_offs[:, None] * q_stride_s + h * q_stride_h + hd_idx[None, :],
-                mask=s_mask[:, None], other=0.0,
+                mask=s_mask[:, None],
+                other=0.0,
             ).to(tl.float32)
 
             w_h = tl.load(
                 w_ptr + s_offs * w_stride_s + h,
-                mask=s_mask, other=0.0,
+                mask=s_mask,
+                other=0.0,
             ).to(tl.float32)
 
             dot = tl.dot(q_tile, tl.trans(k_tile), out_dtype=tl.float32)

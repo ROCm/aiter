@@ -289,9 +289,7 @@ def _mhc_fused_kernel(
 
     bias = tl.load(bias_ptr + rn_global, mask=rn_global < N, other=0.0).to(tl.float32)
     if ALPHAS_ARE_POINTER:
-        alpha_val = tl.load(
-            alpha_ptr + is_post_i32 + is_res_i32 * 2
-        ).to(tl.float32)
+        alpha_val = tl.load(alpha_ptr + is_post_i32 + is_res_i32 * 2).to(tl.float32)
     else:
         alpha_val = tl.where(
             is_pre_program, alpha_pre, tl.where(is_post_program, alpha_post, alpha_res)

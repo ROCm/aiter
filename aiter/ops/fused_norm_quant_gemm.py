@@ -24,10 +24,14 @@ def _get_fused_cpp():
     _fused_cpp_probed = True
     try:
         from aiter import module_fused_norm_quant_gemm
+
         _fused_cpp = module_fused_norm_quant_gemm
         _log.info("fused_norm_quant_gemm: C++ JIT module loaded")
-    except (ImportError, Exception) as e:
-        _log.debug("fused_norm_quant_gemm: C++ JIT module not available (%s), using Python fallback", e)
+    except (ImportError, OSError, RuntimeError) as e:
+        _log.debug(
+            "fused_norm_quant_gemm: C++ JIT module not available (%s), using Python fallback",
+            e,
+        )
         _fused_cpp = None
     return _fused_cpp
 
@@ -61,14 +65,23 @@ def fused_rmsnorm_quant_gemm(
     if cpp is not None:
         try:
             return cpp.fused_rmsnorm_quant_gemm(
-                input_2d, weight_fp8, norm_w, eps,
-                scale_a, scale_w, fp8_workspace, solution_index,
+                input_2d,
+                weight_fp8,
+                norm_w,
+                eps,
+                scale_a,
+                scale_w,
+                fp8_workspace,
+                solution_index,
             )
-        except Exception:
-            pass
+        except (ImportError, OSError, RuntimeError) as e:
+            _log.debug(
+                "fused_norm_quant_gemm: C++ path failed (%s), using Python fallback",
+                e,
+            )
 
-    from aiter.ops.rmsnorm_quant import rmsnorm_quant as _rmsnorm_quant
     from aiter.ops.gradlib import hipb_mm
+    from aiter.ops.rmsnorm_quant import rmsnorm_quant as _rmsnorm_quant
 
     _rmsnorm_quant(fp8_workspace, input_2d, scale_a, norm_w, eps)
 
@@ -76,5 +89,11 @@ def fused_rmsnorm_quant_gemm(
     sa = scale_a.to(torch.float32).reshape(1, 1)
     sw = scale_w.to(torch.float32).reshape(1, 1)
 
-    return hipb_mm(fp8_workspace, weight_t, solution_index,
-                   out_dtype=torch.bfloat16, scaleA=sa, scaleB=sw)
+    return hipb_mm(
+        fp8_workspace,
+        weight_t,
+        solution_index,
+        out_dtype=torch.bfloat16,
+        scaleA=sa,
+        scaleB=sw,
+    )

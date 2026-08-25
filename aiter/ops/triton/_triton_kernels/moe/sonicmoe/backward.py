@@ -1,13 +1,11 @@
-from typing import Optional
-
 import torch
 import triton
 import triton.language as tl
 
-from .enums import LIBRARY_NAME
-from .reduction_over_k_gather import token_gather_and_sum_varlen_K_triton
-from .grouped_gemm_triton import grouped_gemm
 from .activation_kernels import activation_bwd, activation_fwd
+from .enums import LIBRARY_NAME
+from .grouped_gemm_triton import grouped_gemm
+from .reduction_over_k_gather import token_gather_and_sum_varlen_K_triton
 
 
 def _get_powers_of_2(start: int, end: int) -> list[int]:
@@ -67,13 +65,19 @@ def db2_and_ds_kernel(
         tk_mask = tk_offsets < n_tokens
         tk_grouped = E_count_start + tk_offsets
 
-        token_indices = tl.load(x_gather_idx_ptr + tk_grouped, mask=tk_mask, other=0).to(tl.int64)
-        scatter_indices = tl.load(s_scatter_idx_ptr + tk_grouped, mask=tk_mask, other=0).to(tl.int64)
+        token_indices = tl.load(
+            x_gather_idx_ptr + tk_grouped, mask=tk_mask, other=0
+        ).to(tl.int64)
+        scatter_indices = tl.load(
+            s_scatter_idx_ptr + tk_grouped, mask=tk_mask, other=0
+        ).to(tl.int64)
         s = tl.load(s_ptr + scatter_indices, mask=tk_mask, other=0.0).to(tl.float32)
 
         dout_offsets = token_indices[:, None] * H + h_offsets[None, :]
         dout_mask = tk_mask[:, None] & h_mask[None, :]
-        dout = tl.load(dout_ptr + dout_offsets, mask=dout_mask, other=0.0).to(tl.float32)
+        dout = tl.load(dout_ptr + dout_offsets, mask=dout_mask, other=0.0).to(
+            tl.float32
+        )
 
         db2_acc += tl.sum(dout * s[:, None], axis=0)
 
@@ -81,14 +85,24 @@ def db2_and_ds_kernel(
 
         if Hidx == 0:
             n_offsets = tl.arange(0, BLOCK_OLD_DS_PARTIAL_N)
-            old_ds_partial_offsets = scatter_indices[:, None] * OLD_DS_PARTIAL_N + n_offsets[None, :]
-            old_ds_partial_mask = tk_mask[:, None] & (n_offsets[None, :] < OLD_DS_PARTIAL_N)
+            old_ds_partial_offsets = (
+                scatter_indices[:, None] * OLD_DS_PARTIAL_N + n_offsets[None, :]
+            )
+            old_ds_partial_mask = tk_mask[:, None] & (
+                n_offsets[None, :] < OLD_DS_PARTIAL_N
+            )
             old_ds_partial_vals = tl.load(
-                old_ds_partial_ptr + old_ds_partial_offsets, mask=old_ds_partial_mask, other=0.0
+                old_ds_partial_ptr + old_ds_partial_offsets,
+                mask=old_ds_partial_mask,
+                other=0.0,
             ).to(tl.float32)
             ds_partial += tl.sum(old_ds_partial_vals, axis=1)
 
-        tl.store(new_ds_partial_ptr + scatter_indices * NUM_H_BLOCKS + Hidx, ds_partial, mask=tk_mask)
+        tl.store(
+            new_ds_partial_ptr + scatter_indices * NUM_H_BLOCKS + Hidx,
+            ds_partial,
+            mask=tk_mask,
+        )
 
     tl.store(db2_ptr + Eidx * H + h_offsets, db2_acc, mask=h_mask)
 
@@ -98,7 +112,13 @@ def _get_autotune_configs_for_db1() -> list[triton.Config]:
     for BLOCK_TK in _get_powers_of_2(4, 128):
         for BLOCK_I in _get_powers_of_2(64, 4096):
             if 4096 <= BLOCK_I * BLOCK_TK <= 16384:
-                configs.append(triton.Config({"BLOCK_I": BLOCK_I, "BLOCK_TK": BLOCK_TK}, num_warps=8, num_stages=4))
+                configs.append(
+                    triton.Config(
+                        {"BLOCK_I": BLOCK_I, "BLOCK_TK": BLOCK_TK},
+                        num_warps=8,
+                        num_stages=4,
+                    )
+                )
     return configs
 
 
@@ -158,7 +178,10 @@ def db1_kernel(
         tl.store(db1_ptr + db1_offsets, db1_acc, mask=i_mask)
 
 
-@torch.library.custom_op(f"{LIBRARY_NAME}::_up_projection_backward_act_rocm", mutates_args={"dx_expanded", "db1"})
+@torch.library.custom_op(
+    f"{LIBRARY_NAME}::_up_projection_backward_act_rocm",
+    mutates_args={"dx_expanded", "db1"},
+)
 def _up_projection_backward_act(
     w1: torch.Tensor,
     dx_expanded: torch.Tensor,
@@ -168,7 +191,7 @@ def _up_projection_backward_act(
     is_glu_activation: bool,
     concat_layout: bool = False,
 ) -> None:
-    I_full, H, E = w1.size()
+    I_full, _H, E = w1.size()
     I = I_full // 2 if is_glu_activation else I_full
 
     grouped_gemm(
@@ -189,7 +212,10 @@ def _up_projection_backward_act(
         )
 
 
-@torch.library.custom_op(f"{LIBRARY_NAME}::_down_projection_backward_act_rocm", mutates_args={"dh", "ds", "db2", "a_prime"})
+@torch.library.custom_op(
+    f"{LIBRARY_NAME}::_down_projection_backward_act_rocm",
+    mutates_args={"dh", "ds", "db2", "a_prime"},
+)
 def _down_projection_backward_act(
     dout: torch.Tensor,
     h: torch.Tensor,
@@ -236,7 +262,9 @@ def _down_projection_backward_act(
 
     # y_recomputed = a_prime @ w2 per expert
     y_recomputed = torch.empty(TK, H, dtype=dy.dtype, device=dy.device)
-    grouped_gemm(a_prime_val, w2.permute(2, 1, 0), expert_frequency_offset, out=y_recomputed)
+    grouped_gemm(
+        a_prime_val, w2.permute(2, 1, 0), expert_frequency_offset, out=y_recomputed
+    )
     # w2 is (H, I, E), permute(2,1,0) = (E, I, H) — so A=(TK, I), B=(E, I, H) -> C=(TK, H)
 
     ds_scattered = (dout_gathered * y_recomputed).sum(dim=-1)
@@ -249,12 +277,16 @@ def _down_projection_backward_act(
     if db2 is None:
         ds[s_scatter_idx] = ds_scattered
     else:
-        old_ds_partial = torch.empty(TK, 1, device=ds_scattered.device, dtype=ds_scattered.dtype)
+        old_ds_partial = torch.empty(
+            TK, 1, device=ds_scattered.device, dtype=ds_scattered.dtype
+        )
         old_ds_partial[s_scatter_idx, 0] = ds_scattered
 
         BLOCK_H = min(triton.next_power_of_2(H), 2048)
         NUM_H_BLOCKS = triton.cdiv(H, BLOCK_H)
-        new_ds_partial = torch.empty(TK, NUM_H_BLOCKS, dtype=torch.float32, device=ds.device)
+        new_ds_partial = torch.empty(
+            TK, NUM_H_BLOCKS, dtype=torch.float32, device=ds.device
+        )
 
         db2_and_ds_kernel[(E, NUM_H_BLOCKS)](
             dout,
@@ -279,12 +311,14 @@ def _down_projection_backward_act(
             ds.copy_(new_ds_partial.sum(dim=-1, dtype=ds.dtype))
 
 
-@torch.library.custom_op(f"{LIBRARY_NAME}::_token_broadcast_backward_rocm", mutates_args={"dx_reduced"})
+@torch.library.custom_op(
+    f"{LIBRARY_NAME}::_token_broadcast_backward_rocm", mutates_args={"dx_reduced"}
+)
 def _token_broadcast_backward(
     dx_reduced: torch.Tensor,
     dx_expanded: torch.Tensor,
     s_reverse_scatter_idx: torch.Tensor,
-    num_activated_expert_per_token_offset: Optional[torch.Tensor],
+    num_activated_expert_per_token_offset: torch.Tensor | None,
     varlen_K_max: int,
     H: int,
     is_varlen_K: bool,

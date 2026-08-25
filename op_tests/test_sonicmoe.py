@@ -11,16 +11,16 @@ Usage:
 """
 
 import argparse
+
 import torch
 import torch.nn.functional as F
 from triton.testing import do_bench
 
 from aiter.ops.triton.sonicmoe import (
-    moe_TC_softmax_topk_layer,
     SonicMoEActivationType,
+    moe_TC_softmax_topk_layer,
     sonicmoe_is_glu,
 )
-
 
 _ACT_MAP = {
     "swiglu": SonicMoEActivationType.SWIGLU,
@@ -68,7 +68,7 @@ def ref_moe_topk(x, router_w, w1_orig, b1, w2_orig, b2, K, act_type):
     expert_freq = torch.zeros(E, dtype=torch.int32, device=x.device)
 
     for e in range(E):
-        mask = (topk_indices == e)
+        mask = topk_indices == e
         if not mask.any():
             continue
         token_idx, slot_idx = mask.nonzero(as_tuple=True)
@@ -106,12 +106,28 @@ def run_correctness(T, H, I, E, K, act_type, dtype):
 
     stream_id = torch.cuda.current_stream().cuda_stream
 
-    o, router_logits, expert_freq = moe_TC_softmax_topk_layer(
-        x, router_w, w1, b1, w2, b2, K, stream_id, act_type, False,
+    o, _router_logits, _expert_freq = moe_TC_softmax_topk_layer(
+        x,
+        router_w,
+        w1,
+        b1,
+        w2,
+        b2,
+        K,
+        stream_id,
+        act_type,
+        False,
     )
 
-    ref_o, ref_logits, ref_freq = ref_moe_topk(
-        x_ref, router_w, w1_orig, b1, w2_orig, b2, K, act_type,
+    ref_o, _ref_logits, _ref_freq = ref_moe_topk(
+        x_ref,
+        router_w,
+        w1_orig,
+        b1,
+        w2_orig,
+        b2,
+        K,
+        act_type,
     )
 
     def rel_err(a, b):
@@ -122,7 +138,8 @@ def run_correctness(T, H, I, E, K, act_type, dtype):
 
     dx, dw1, dw2 = torch.autograd.grad(o, [x, w1, w2], grad_outputs=dout)
     ref_dx, ref_dw1, ref_dw2 = torch.autograd.grad(
-        ref_o, [x_ref, w1_orig, w2_orig],
+        ref_o,
+        [x_ref, w1_orig, w2_orig],
         grad_outputs=dout,
     )
 
@@ -162,14 +179,32 @@ def run_benchmark(T, H, I, E, K, act_type, dtype, rep=100, trials=5):
 
     # warmup
     o, _, _ = moe_TC_softmax_topk_layer(
-        x, router_w, w1, None, w2, None, K, stream_id, act_type, False,
+        x,
+        router_w,
+        w1,
+        None,
+        w2,
+        None,
+        K,
+        stream_id,
+        act_type,
+        False,
     )
     torch.autograd.grad(o, [x, w1_orig, w2_orig], dout)
     x.grad = w1_orig.grad = w2_orig.grad = None
 
     fwd_ms = do_bench(
         lambda: moe_TC_softmax_topk_layer(
-            x, router_w, w1, None, w2, None, K, stream_id, act_type, False,
+            x,
+            router_w,
+            w1,
+            None,
+            w2,
+            None,
+            K,
+            stream_id,
+            act_type,
+            False,
         ),
         warmup=10,
         rep=rep,
@@ -179,7 +214,16 @@ def run_benchmark(T, H, I, E, K, act_type, dtype, rep=100, trials=5):
 
     def e2e_fn():
         o, _, _ = moe_TC_softmax_topk_layer(
-            x, router_w, w1, None, w2, None, K, stream_id, act_type, False,
+            x,
+            router_w,
+            w1,
+            None,
+            w2,
+            None,
+            K,
+            stream_id,
+            act_type,
+            False,
         )
         torch.autograd.grad(o, [x, w1_orig, w2_orig], dout, retain_graph=False)
         x.grad = w1_orig.grad = w2_orig.grad = None
@@ -205,11 +249,15 @@ def main():
     parser.add_argument("--I", type=int, default=64)
     parser.add_argument("--E", type=int, default=4)
     parser.add_argument("--K", type=int, default=2)
-    parser.add_argument("--activation", type=str, default=None,
-                        choices=list(_ACT_MAP.keys()))
+    parser.add_argument(
+        "--activation", type=str, default=None, choices=list(_ACT_MAP.keys())
+    )
     parser.add_argument("--dtype", type=str, default="bf16", choices=["bf16", "fp16"])
-    parser.add_argument("--benchmark", action="store_true",
-                        help="Run performance benchmark instead of correctness test")
+    parser.add_argument(
+        "--benchmark",
+        action="store_true",
+        help="Run performance benchmark instead of correctness test",
+    )
     args = parser.parse_args()
 
     torch.cuda.set_device(0)
@@ -226,7 +274,9 @@ def main():
     for act_name in activations:
         at = _ACT_MAP[act_name]
         print(f"\n{act_name}:")
-        _, _, _, _, status = run_correctness(args.T, args.H, args.I, args.E, args.K, at, torch_dtype)
+        _, _, _, _, status = run_correctness(
+            args.T, args.H, args.I, args.E, args.K, at, torch_dtype
+        )
         if status != "PASS":
             all_pass = False
 

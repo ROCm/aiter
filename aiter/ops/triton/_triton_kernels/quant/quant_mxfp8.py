@@ -20,8 +20,13 @@ def _calculate_scales(
     E8M0_EXPONENT_BIAS: tl.constexpr = 127
 
     if IS_2D_BLOCK:
-        tl.static_assert(BLOCK_M % QUANT_BLOCK_SIZE == 0, "block m must be divided by QUANT_BLOCK_SIZE")
-    tl.static_assert(BLOCK_N % QUANT_BLOCK_SIZE == 0, "block N must be divided by QUANT_BLOCK_SIZE")
+        tl.static_assert(
+            BLOCK_M % QUANT_BLOCK_SIZE == 0,
+            "block m must be divided by QUANT_BLOCK_SIZE",
+        )
+    tl.static_assert(
+        BLOCK_N % QUANT_BLOCK_SIZE == 0, "block N must be divided by QUANT_BLOCK_SIZE"
+    )
     if x.type.element_ty == tl.float32:
         hp_int_dtype = tl.int32
         hp_mbits = 23
@@ -115,7 +120,9 @@ def _pack_fp8(
     if IS_2D_BLOCK:
         scales_fp32 = (
             scales_fp32.expand_dims(axis=(1, 3))
-            .broadcast_to(SCALE_BLOCK_M, QUANT_BLOCK_SIZE, SCALE_BLOCK_N, HALF_QUANT_BLOCK_SIZE)
+            .broadcast_to(
+                SCALE_BLOCK_M, QUANT_BLOCK_SIZE, SCALE_BLOCK_N, HALF_QUANT_BLOCK_SIZE
+            )
             .reshape(BLOCK_M, HALF_BLOCK_N)
         )
     else:
@@ -145,7 +152,9 @@ def _pack_fp8(
                     pack=1,
                 )
             else:
-                x0 = (x1.to(tl.uint32, bitcast=True).to(tl.uint64) << 32) | x0.to(tl.uint32, bitcast=True)
+                x0 = (x1.to(tl.uint32, bitcast=True).to(tl.uint64) << 32) | x0.to(
+                    tl.uint32, bitcast=True
+                )
                 y = tl.inline_asm_elementwise(
                     asm="""
                     v_cvt_scalef32_sr_pk_fp8_f32 $0, $1, $2, $3 op_sel:[0,0,0,0];
@@ -158,7 +167,9 @@ def _pack_fp8(
                 )
         else:
             if not USE_SR:
-                x0 = (x1.to(tl.uint16, bitcast=True).to(tl.uint32) << 16) | x0.to(tl.uint16, bitcast=True)
+                x0 = (x1.to(tl.uint16, bitcast=True).to(tl.uint32) << 16) | x0.to(
+                    tl.uint16, bitcast=True
+                )
                 y = tl.inline_asm_elementwise(
                     asm="""
                     v_cvt_scalef32_pk_fp8_bf16 $0, $1, $2 op_sel:[0,0,0,0];
@@ -192,15 +203,15 @@ def _pack_fp8(
             y0 = (y & 0x00FF).to(tl.uint8).to(float8_dtype, bitcast=True)
             y = tl.join(y0, y1).reshape(BLOCK_M, BLOCK_N)
         y = y.to(tl.float32)
-        mask_pos = (y != y) & (x > 0)
-        mask_neg = (y != y) & (x < 0)
+        mask_pos = (y != y) & (x > 0)  # noqa: PLR0124
+        mask_neg = (y != y) & (x < 0)  # noqa: PLR0124
         y = tl.where(mask_neg, -max_pos, y)
         y = tl.where(mask_pos, max_pos, y)
         y = y.to(float8_dtype)
     else:
-        x_scaled = x / scales_fp32.expand_dims(axis=2).broadcast_to(BLOCK_M, HALF_BLOCK_N, 2).reshape(
-            BLOCK_M, BLOCK_N
-        )
+        x_scaled = x / scales_fp32.expand_dims(axis=2).broadcast_to(
+            BLOCK_M, HALF_BLOCK_N, 2
+        ).reshape(BLOCK_M, BLOCK_N)
 
         if USE_SR:
             noise = randval0.to(tl.float32) * (1.0 / 4294967296.0)
@@ -233,7 +244,9 @@ def _unpack_fp8(
     if IS_2D_BLOCK:
         scales_fp32 = (
             scales_fp32.expand_dims(axis=(1, 3))
-            .broadcast_to(SCALE_BLOCK_M, QUANT_BLOCK_SIZE, SCALE_BLOCK_N, HALF_QUANT_BLOCK_SIZE)
+            .broadcast_to(
+                SCALE_BLOCK_M, QUANT_BLOCK_SIZE, SCALE_BLOCK_N, HALF_QUANT_BLOCK_SIZE
+            )
             .reshape(BLOCK_M, HALF_BLOCK_N)
         )
     else:
@@ -245,7 +258,9 @@ def _unpack_fp8(
 
     if USE_ASM:
         tl.static_assert(x.type.element_ty == tl.float8e4nv)
-        x0 = (x1.to(tl.uint8, bitcast=True).to(tl.uint16) << 8) | x0.to(tl.uint8, bitcast=True)
+        x0 = (x1.to(tl.uint8, bitcast=True).to(tl.uint16) << 8) | x0.to(
+            tl.uint8, bitcast=True
+        )
         if output_dtype == tl.float32:
             y_packed = tl.inline_asm_elementwise(
                 asm="""
@@ -258,7 +273,11 @@ def _unpack_fp8(
                 pack=1,
             )
             y1 = (y_packed >> 32).to(tl.uint32).to(tl.float32, bitcast=True)
-            y0 = (y_packed & 0x00000000FFFFFFFF).to(tl.uint32).to(tl.float32, bitcast=True)
+            y0 = (
+                (y_packed & 0x00000000FFFFFFFF)
+                .to(tl.uint32)
+                .to(tl.float32, bitcast=True)
+            )
         else:
             y_packed = tl.inline_asm_elementwise(
                 asm="""
@@ -275,9 +294,9 @@ def _unpack_fp8(
         y = tl.join(y0, y1).reshape(BLOCK_M, BLOCK_N)
     else:
         y = x.to(output_dtype)
-        y = y * scales_fp32.expand_dims(axis=2).broadcast_to(BLOCK_M, HALF_BLOCK_N, 2).reshape(
-            BLOCK_M, BLOCK_N
-        )
+        y = y * scales_fp32.expand_dims(axis=2).broadcast_to(
+            BLOCK_M, HALF_BLOCK_N, 2
+        ).reshape(BLOCK_M, BLOCK_N)
 
     return y
 
@@ -318,7 +337,9 @@ def _convert_to_mxfp8_kernel(
     offs_x = offs_m[:, None] * stride_xm + offs_xn[None, :] * stride_xn
     offs_s = offs_sm[:, None] * stride_sm + offs_sn[None, :] * stride_sn
 
-    tl.static_assert(x_ptr.type.element_ty == tl.float32 or x_ptr.type.element_ty == tl.bfloat16)
+    tl.static_assert(
+        x_ptr.type.element_ty == tl.float32 or x_ptr.type.element_ty == tl.bfloat16
+    )
 
     float8_dtype = y_ptr.type.element_ty
     tl.static_assert(float8_dtype == tl.float8e4nv or float8_dtype == tl.float8e5)
@@ -388,8 +409,12 @@ def _convert_from_mxfp8_kernel(
     x = tl.load(x_ptr + offs_x)
     s = tl.load(s_ptr + offs_s)
 
-    tl.static_assert(y_ptr.type.element_ty == tl.float32 or y_ptr.type.element_ty == tl.bfloat16)
-    tl.static_assert(x_ptr.type.element_ty == tl.float8e4nv or x_ptr.type.element_ty == tl.float8e5)
+    tl.static_assert(
+        y_ptr.type.element_ty == tl.float32 or y_ptr.type.element_ty == tl.bfloat16
+    )
+    tl.static_assert(
+        x_ptr.type.element_ty == tl.float8e4nv or x_ptr.type.element_ty == tl.float8e5
+    )
 
     y = _unpack_fp8(
         x,

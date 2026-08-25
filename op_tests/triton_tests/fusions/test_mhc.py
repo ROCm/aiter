@@ -40,8 +40,8 @@ from op_tests.triton_tests.utils.mhc_ref import (
     is_doubly_stochastic,
     mhc_e2e_ref,
     mhc_head_dsv4_torch,
-    mhc_pre_dsv4_torch,
     mhc_post_torch,
+    mhc_pre_dsv4_torch,
     mhc_torch,
 )
 
@@ -1137,7 +1137,7 @@ def test_mhc_e2e_correctness(M, n, C, dtype):
 
 def test_mhc_dsv4_public_api_and_backward_policy():
     """The stable DSV4 wrappers are exported and name their fallback."""
-    import aiter.ops.triton.fusions as fusions
+    from aiter.ops.triton import fusions
 
     mhc_module = importlib.import_module("aiter.ops.triton.fusions.mhc")
 
@@ -1217,17 +1217,15 @@ def test_mhc_pre_dsv4_asymmetric_forward_and_recompute_gradients(dtype):
     torch.manual_seed(41)
     M, n, C = 3, 4, 2
     N = 2 * n + n * n
-    residual = torch.randn(
-        M, n, C, device="cuda", dtype=dtype, requires_grad=True
-    )
+    residual = torch.randn(M, n, C, device="cuda", dtype=dtype, requires_grad=True)
     fn = (
         torch.randn(N, n * C, device="cuda", dtype=torch.float32) * 0.03
     ).requires_grad_()
     scale = torch.randn(3, device="cuda", dtype=torch.float32, requires_grad=True)
-    base = (
-        torch.randn(N, device="cuda", dtype=torch.float32) * 0.03
-    ).requires_grad_()
-    ref_inputs = tuple(t.detach().clone().requires_grad_() for t in (residual, fn, scale, base))
+    base = (torch.randn(N, device="cuda", dtype=torch.float32) * 0.03).requires_grad_()
+    ref_inputs = tuple(
+        t.detach().clone().requires_grad_() for t in (residual, fn, scale, base)
+    )
 
     actual = mhc_pre_dsv4(residual, fn, scale, base)
     expected = mhc_pre_dsv4_torch(*ref_inputs)

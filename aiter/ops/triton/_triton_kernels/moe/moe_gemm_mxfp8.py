@@ -13,6 +13,7 @@ Grid layout:  ``(total_m_blocks * n_blocks,)``
 
 import triton
 import triton.language as tl
+
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
 _repr = make_kernel_repr(
@@ -35,15 +36,15 @@ _repr = make_kernel_repr(
 @triton.jit(repr=_repr)
 def _moe_gemm_mxfp8_kernel(
     # Data pointers
-    lhs_ptr,            # [total_tokens, K]  FP8
-    rhs_ptr,            # [E, N, K]          FP8
-    out_ptr,            # [total_tokens, N]  output dtype
-    x_scale_ptr,        # [total_tokens, K // QBS]  uint8 E8M0
-    w_scale_ptr,        # [E, N, K // QBS]          uint8 E8M0
-    bias_ptr,           # [E, N] or None
+    lhs_ptr,  # [total_tokens, K]  FP8
+    rhs_ptr,  # [E, N, K]          FP8
+    out_ptr,  # [total_tokens, N]  output dtype
+    x_scale_ptr,  # [total_tokens, K // QBS]  uint8 E8M0
+    w_scale_ptr,  # [E, N, K // QBS]          uint8 E8M0
+    bias_ptr,  # [E, N] or None
     # Block-to-expert mapping
-    block_expert_ids_ptr,    # [total_m_blocks]  int32
-    block_token_offsets_ptr, # [total_m_blocks]  int32
+    block_expert_ids_ptr,  # [total_m_blocks]  int32
+    block_token_offsets_ptr,  # [total_m_blocks]  int32
     # Dimensions
     total_M,
     N,
@@ -56,11 +57,11 @@ def _moe_gemm_mxfp8_kernel(
     stride_rhs_k,
     stride_out_m,
     stride_out_n,
-    stride_xs_m,    # x_scale row stride
-    stride_xs_k,    # x_scale col stride
-    stride_ws_e,    # w_scale expert stride
-    stride_ws_n,    # w_scale N stride
-    stride_ws_k,    # w_scale K stride
+    stride_xs_m,  # x_scale row stride
+    stride_xs_k,  # x_scale col stride
+    stride_ws_e,  # w_scale expert stride
+    stride_ws_n,  # w_scale N stride
+    stride_ws_k,  # w_scale K stride
     # Flags
     HAS_BIAS: tl.constexpr,
     # Block sizes
@@ -99,11 +100,7 @@ def _moe_gemm_mxfp8_kernel(
     n_mask = offs_n < N
 
     # lhs pointers
-    a_ptrs = (
-        lhs_ptr
-        + offs_m[:, None] * stride_lhs_m
-        + offs_k[None, :] * stride_lhs_k
-    )
+    a_ptrs = lhs_ptr + offs_m[:, None] * stride_lhs_m + offs_k[None, :] * stride_lhs_k
     # rhs[expert_id] transposed view (K, N)
     b_ptrs = (
         rhs_ptr
@@ -115,11 +112,10 @@ def _moe_gemm_mxfp8_kernel(
     # Scale pointers — advance by 1 per K-iteration since BLOCK_K == QUANT_BLOCK_SIZE
     xs_ptrs = x_scale_ptr + offs_m * stride_xs_m
     ws_ptrs = w_scale_ptr + expert_id * stride_ws_e + offs_n * stride_ws_n
-    k_scale_idx = 0
 
     accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
-    for _ in range(0, tl.cdiv(K, BLOCK_K)):
+    for k_scale_idx in range(tl.cdiv(K, BLOCK_K)):
         if EVEN_K:
             a = tl.load(a_ptrs, mask=m_mask[:, None], other=0.0)
             b = tl.load(b_ptrs, mask=n_mask[None, :], other=0.0)
@@ -151,15 +147,12 @@ def _moe_gemm_mxfp8_kernel(
         b_scale = (b_scale_e8m0.to(tl.uint32) << 23).to(tl.float32, bitcast=True)
 
         accumulator += (
-            tl.dot(a, b, input_precision="ieee")
-            * a_scale[:, None]
-            * b_scale[None, :]
+            tl.dot(a, b, input_precision="ieee") * a_scale[:, None] * b_scale[None, :]
         )
 
         a_ptrs += BLOCK_K * stride_lhs_k
         b_ptrs += BLOCK_K * stride_rhs_k
         offs_k += BLOCK_K
-        k_scale_idx += 1
 
     if HAS_BIAS:
         bias = tl.load(
@@ -170,10 +163,6 @@ def _moe_gemm_mxfp8_kernel(
         accumulator += bias[None, :]
 
     c = accumulator.to(out_ptr.type.element_ty)
-    c_ptrs = (
-        out_ptr
-        + offs_m[:, None] * stride_out_m
-        + offs_n[None, :] * stride_out_n
-    )
+    c_ptrs = out_ptr + offs_m[:, None] * stride_out_m + offs_n[None, :] * stride_out_n
     c_mask = m_mask[:, None] & n_mask[None, :]
     tl.store(c_ptrs, c, mask=c_mask)

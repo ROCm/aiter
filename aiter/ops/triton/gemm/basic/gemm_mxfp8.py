@@ -12,9 +12,9 @@ Scale conversion:  ``scale_fp32 = 2^(e8m0_val - 127)``
 Implemented as a bit-shift:  ``(e8m0.to(int32) << 23).view(float32)``
 """
 
-from typing import Optional
 
 import torch
+
 from aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale import gemm_a8w8_blockscale
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
@@ -46,8 +46,8 @@ def gemm_mxfp8(
     x_scale: torch.Tensor,
     w_scale: torch.Tensor,
     quant_block_size: int = 32,
-    dtype: Optional[torch.dtype] = torch.bfloat16,
-    y: Optional[torch.Tensor] = None,
+    dtype: torch.dtype | None = torch.bfloat16,
+    y: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """MXFP8 GEMM: Y = (X * x_scale) @ (W * w_scale)^T.
 
@@ -76,16 +76,22 @@ def gemm_mxfp8(
     M, K = x.shape
 
     expected_scale_k = K // quant_block_size
-    assert x_scale.shape == (M, expected_scale_k), (
-        f"x_scale shape {x_scale.shape} != expected ({M}, {expected_scale_k})"
-    )
-    assert w_scale.shape[1] == expected_scale_k, (
-        f"w_scale K-dim {w_scale.shape[1]} != expected {expected_scale_k}"
-    )
+    assert x_scale.shape == (
+        M,
+        expected_scale_k,
+    ), f"x_scale shape {x_scale.shape} != expected ({M}, {expected_scale_k})"
+    assert (
+        w_scale.shape[1] == expected_scale_k
+    ), f"w_scale K-dim {w_scale.shape[1]} != expected {expected_scale_k}"
 
     x_scale_fp32 = e8m0_to_fp32(x_scale)
     w_scale_fp32 = e8m0_to_fp32(w_scale)
 
     return gemm_a8w8_blockscale(
-        x, w, x_scale_fp32, w_scale_fp32, dtype=dtype, y=y,
+        x,
+        w,
+        x_scale_fp32,
+        w_scale_fp32,
+        dtype=dtype,
+        y=y,
     )

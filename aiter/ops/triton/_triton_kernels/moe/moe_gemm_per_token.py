@@ -14,6 +14,7 @@ table (``block_expert_ids``, ``block_token_offsets``).
 
 import triton
 import triton.language as tl
+
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
 _repr = make_kernel_repr(
@@ -35,15 +36,15 @@ _repr = make_kernel_repr(
 @triton.jit(repr=_repr)
 def _moe_gemm_per_token_kernel(
     # Data pointers
-    lhs_ptr,            # [total_tokens, K]  FP8
-    rhs_ptr,            # [E, N, K]          FP8
-    out_ptr,            # [total_tokens, N]  output dtype
-    x_scale_ptr,        # [total_tokens]     FP32 per-token scale
-    w_scale_ptr,        # [E]                FP32 per-expert scale
-    bias_ptr,           # [E, N] or None
+    lhs_ptr,  # [total_tokens, K]  FP8
+    rhs_ptr,  # [E, N, K]          FP8
+    out_ptr,  # [total_tokens, N]  output dtype
+    x_scale_ptr,  # [total_tokens]     FP32 per-token scale
+    w_scale_ptr,  # [E]                FP32 per-expert scale
+    bias_ptr,  # [E, N] or None
     # Block-to-expert mapping (pre-computed on host)
-    block_expert_ids_ptr,    # [total_m_blocks]  int32
-    block_token_offsets_ptr, # [total_m_blocks]  int32
+    block_expert_ids_ptr,  # [total_m_blocks]  int32
+    block_token_offsets_ptr,  # [total_m_blocks]  int32
     # Dimensions
     total_M,
     N,
@@ -88,11 +89,7 @@ def _moe_gemm_per_token_kernel(
     offs_k = tl.arange(0, BLOCK_K)
 
     # lhs[offs_m, offs_k]
-    a_ptrs = (
-        lhs_ptr
-        + offs_m[:, None] * stride_lhs_m
-        + offs_k[None, :] * stride_lhs_k
-    )
+    a_ptrs = lhs_ptr + offs_m[:, None] * stride_lhs_m + offs_k[None, :] * stride_lhs_k
     # rhs[expert_id] transposed: (K, N) view
     b_ptrs = (
         rhs_ptr
@@ -106,7 +103,7 @@ def _moe_gemm_per_token_kernel(
 
     accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
-    for _ in range(0, tl.cdiv(K, BLOCK_K)):
+    for _ in range(tl.cdiv(K, BLOCK_K)):
         if EVEN_K:
             a = tl.load(a_ptrs, mask=m_mask[:, None], other=0.0)
             b = tl.load(b_ptrs, mask=n_mask[None, :], other=0.0)
@@ -143,10 +140,6 @@ def _moe_gemm_per_token_kernel(
         accumulator += bias[None, :]
 
     c = accumulator.to(out_ptr.type.element_ty)
-    c_ptrs = (
-        out_ptr
-        + offs_m[:, None] * stride_out_m
-        + offs_n[None, :] * stride_out_n
-    )
+    c_ptrs = out_ptr + offs_m[:, None] * stride_out_m + offs_n[None, :] * stride_out_n
     c_mask = m_mask[:, None] & n_mask[None, :]
     tl.store(c_ptrs, c, mask=c_mask)

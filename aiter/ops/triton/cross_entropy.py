@@ -10,7 +10,6 @@ higher-level frameworks (e.g. Lumen, Megatron) only need a single function
 call.
 """
 
-from typing import Union
 from functools import reduce
 from operator import mul
 
@@ -19,15 +18,15 @@ import torch.distributed as dist
 import triton
 
 from aiter.ops.triton._triton_kernels.cross_entropy import (
-    online_softmax_kernel,
     cross_entropy_kernel,
     element_mul_kernel,
+    online_softmax_kernel,
 )
 
 __all__ = [
+    "cross_entropy_backward",
     "cross_entropy_forward",
     "cross_entropy_forward_chunked",
-    "cross_entropy_backward",
 ]
 
 MAX_FUSED_SIZE = 65536 // 2
@@ -39,7 +38,7 @@ def cross_entropy_forward(
     target: torch.Tensor,
     label_smoothing: float,
     reduce_loss: bool,
-    dist_group: Union[dist.ProcessGroup, None],
+    dist_group: dist.ProcessGroup | None,
     ignore_idx: int,
 ):
     """Compute vocab-parallel cross-entropy loss (forward).
@@ -73,29 +72,45 @@ def cross_entropy_forward(
     rank = 0 if dist_group is None else dist.get_rank(dist_group)
 
     online_softmax_kernel[(n_rows,)](
-        _input, _input.stride(-2),
-        target, target.stride(-1),
-        m_d_Xy, m_d_Xy.stride(-1),
-        rank, V,
-        BLOCK_SIZE=BLOCK_SIZE, num_warps=NUM_WARPS,
+        _input,
+        _input.stride(-2),
+        target,
+        target.stride(-1),
+        m_d_Xy,
+        m_d_Xy.stride(-1),
+        rank,
+        V,
+        BLOCK_SIZE=BLOCK_SIZE,
+        num_warps=NUM_WARPS,
     )
 
     world_size = 1 if dist_group is None else dist.get_world_size(dist_group)
     if world_size > 1:
-        gathered = torch.zeros(n_rows * 3 * world_size, dtype=torch.float32, device=_input.device)
+        gathered = torch.zeros(
+            n_rows * 3 * world_size, dtype=torch.float32, device=_input.device
+        )
         dist.all_gather_into_tensor(gathered, m_d_Xy, group=dist_group)
     else:
         gathered = m_d_Xy
 
     cross_entropy_kernel[(n_rows,)](
-        _input, _input.stride(-2),
-        target, target.stride(-1),
-        loss_1d, loss_1d.stride(-1),
-        gathered, gathered.stride(-1),
-        rank, world_size, ignore_idx, V, n_rows,
+        _input,
+        _input.stride(-2),
+        target,
+        target.stride(-1),
+        loss_1d,
+        loss_1d.stride(-1),
+        gathered,
+        gathered.stride(-1),
+        rank,
+        world_size,
+        ignore_idx,
+        V,
+        n_rows,
         reduce_loss=reduce_loss,
         label_smoothing=label_smoothing,
-        BLOCK_SIZE=BLOCK_SIZE, num_warps=NUM_WARPS,
+        BLOCK_SIZE=BLOCK_SIZE,
+        num_warps=NUM_WARPS,
     )
 
     loss = loss_1d.reshape(B, SQ) if not reduce_loss else (loss_1d.sum() / n_rows)
@@ -107,7 +122,7 @@ def cross_entropy_forward_chunked(
     target: torch.Tensor,
     label_smoothing: float,
     reduce_loss: bool,
-    dist_group: Union[dist.ProcessGroup, None],
+    dist_group: dist.ProcessGroup | None,
     ignore_idx: int,
     chunk_rows: int,
 ):
@@ -134,8 +149,8 @@ def cross_entropy_forward_chunked(
     n_rows = B * SQ
 
     # Flatten to 2-D views so we can slice by row without copying.
-    input_2d = _input.reshape(n_rows, V)      # view, no alloc
-    target_1d = target.reshape(n_rows)         # view, no alloc
+    input_2d = _input.reshape(n_rows, V)  # view, no alloc
+    target_1d = target.reshape(n_rows)  # view, no alloc
     loss_1d = torch.empty(n_rows, dtype=torch.float32, device=_input.device)
 
     BLOCK_SIZE = min(MAX_FUSED_SIZE, triton.next_power_of_2(V))
@@ -145,7 +160,9 @@ def cross_entropy_forward_chunked(
     # Allocate scratch buffers once at max chunk size to avoid per-chunk alloc.
     m_d_Xy = torch.empty(chunk_rows * 3, dtype=torch.float32, device=_input.device)
     gathered_buf = (
-        torch.empty(chunk_rows * 3 * world_size, dtype=torch.float32, device=_input.device)
+        torch.empty(
+            chunk_rows * 3 * world_size, dtype=torch.float32, device=_input.device
+        )
         if world_size > 1
         else None
     )
@@ -153,17 +170,22 @@ def cross_entropy_forward_chunked(
     row = 0
     while row < n_rows:
         rows_this = min(chunk_rows, n_rows - row)
-        chunk_x = input_2d[row : row + rows_this]      # view [rows_this, V]
-        chunk_y = target_1d[row : row + rows_this]     # view [rows_this]
-        chunk_loss = loss_1d[row : row + rows_this]    # view [rows_this]
+        chunk_x = input_2d[row : row + rows_this]  # view [rows_this, V]
+        chunk_y = target_1d[row : row + rows_this]  # view [rows_this]
+        chunk_loss = loss_1d[row : row + rows_this]  # view [rows_this]
         m_d_Xy_chunk = m_d_Xy[: rows_this * 3]
 
         online_softmax_kernel[(rows_this,)](
-            chunk_x, chunk_x.stride(0),
-            chunk_y, chunk_y.stride(0),
-            m_d_Xy_chunk, 1,  # stride=1: (m,d,Xy) packed per row
-            rank, V,
-            BLOCK_SIZE=BLOCK_SIZE, num_warps=NUM_WARPS,
+            chunk_x,
+            chunk_x.stride(0),
+            chunk_y,
+            chunk_y.stride(0),
+            m_d_Xy_chunk,
+            1,  # stride=1: (m,d,Xy) packed per row
+            rank,
+            V,
+            BLOCK_SIZE=BLOCK_SIZE,
+            num_warps=NUM_WARPS,
         )
 
         if world_size > 1:
@@ -173,14 +195,23 @@ def cross_entropy_forward_chunked(
             gathered = m_d_Xy_chunk
 
         cross_entropy_kernel[(rows_this,)](
-            chunk_x, chunk_x.stride(0),
-            chunk_y, chunk_y.stride(0),
-            chunk_loss, chunk_loss.stride(0),
-            gathered, 1,  # stride=1: same packed layout
-            rank, world_size, ignore_idx, V, rows_this,
+            chunk_x,
+            chunk_x.stride(0),
+            chunk_y,
+            chunk_y.stride(0),
+            chunk_loss,
+            chunk_loss.stride(0),
+            gathered,
+            1,  # stride=1: same packed layout
+            rank,
+            world_size,
+            ignore_idx,
+            V,
+            rows_this,
             reduce_loss=False,  # accumulate manually after loop
             label_smoothing=label_smoothing,
-            BLOCK_SIZE=BLOCK_SIZE, num_warps=NUM_WARPS,
+            BLOCK_SIZE=BLOCK_SIZE,
+            num_warps=NUM_WARPS,
         )
 
         row += rows_this
@@ -219,9 +250,12 @@ def cross_entropy_backward(
     n_rows = B * SQ
     BLOCK_SIZE = min(MAX_FUSED_SIZE, triton.next_power_of_2(V))
     element_mul_kernel[(n_rows,)](
-        _input, _input.stride(-2),
-        grad_output, 1 if grad_output.numel() > 1 else 0,
+        _input,
+        _input.stride(-2),
+        grad_output,
+        1 if grad_output.numel() > 1 else 0,
         V,
-        BLOCK_SIZE=BLOCK_SIZE, num_warps=NUM_WARPS,
+        BLOCK_SIZE=BLOCK_SIZE,
+        num_warps=NUM_WARPS,
     )
     return _input

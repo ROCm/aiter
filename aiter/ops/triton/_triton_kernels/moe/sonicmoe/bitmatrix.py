@@ -39,7 +39,9 @@ def _bitmatrix_metadata_compute_stage1(
         curr_sum = 0
         for start in range(0, n_tiles, BLOCK_M):
             offs = start + tl.arange(0, BLOCK_M)
-            tile_counts = tl.load(expert_partial_sum_ptr + offs, mask=offs < n_tiles, other=0)
+            tile_counts = tl.load(
+                expert_partial_sum_ptr + offs, mask=offs < n_tiles, other=0
+            )
             excl_cumsum = tl.cumsum(tile_counts, 0) - tile_counts + curr_sum
             curr_sum += tl.sum(tile_counts, 0)
             tl.store(expert_partial_sum_ptr + offs, excl_cumsum, mask=offs < n_tiles)
@@ -88,14 +90,18 @@ def _bitmatrix_metadata_compute_stage2(
     tl.static_assert(BLOCK_SIZE <= 32768)
 
     pid_m = tl.program_id(0)
-    offs_local = tl.arange(0, BLOCK_SIZE)  # position within this tile's flat [BLOCK*K_POW2] space
+    offs_local = tl.arange(
+        0, BLOCK_SIZE
+    )  # position within this tile's flat [BLOCK*K_POW2] space
     offs_global = pid_m * BLOCK_SIZE + offs_local
     mask = offs_global < T * K_POW2
 
     # Load expert id for each slot. IS_POW2_K fast path reads topk_indices as a
     # flat 1D array (no padding gaps). Non-pow2 path reads 2D with k_slot masking.
     if IS_POW2_K:
-        expert = tl.load(topk_indices_ptr + offs_global, mask=mask, other=-1).to(tl.uint32)
+        expert = tl.load(topk_indices_ptr + offs_global, mask=mask, other=-1).to(
+            tl.uint32
+        )
     else:
         token_i_local = offs_local // K_POW2
         k_slot = offs_local % K_POW2
@@ -120,12 +126,16 @@ def _bitmatrix_metadata_compute_stage2(
     # _keyed_add resets the count at each expert boundary.
     scan_input = (kv_pairs & 0xFFFF0000) | 0x00000001
     inclusive_run_lengths = tl.associative_scan(scan_input, 0, _keyed_add)
-    within_expert_rank = (inclusive_run_lengths - 1) & 0xFFFF  # exclusive = inclusive - 1
+    within_expert_rank = (
+        inclusive_run_lengths - 1
+    ) & 0xFFFF  # exclusive = inclusive - 1
 
     # Output position for this entry in the expert-sorted output array.
     # partial_sum layout after stage1: [n_tiles, E], stride (1, n_tiles).
     # So partial_sum[pid_m, expert] = partial_sum_ptr + pid_m*1 + expert*n_tiles.
-    s_reverse_scatter_idx = tl.load(partial_sum_ptr + pid_m + expert * n_tiles, mask=mask)
+    s_reverse_scatter_idx = tl.load(
+        partial_sum_ptr + pid_m + expert * n_tiles, mask=mask
+    )
     s_reverse_scatter_idx += tl.load(expert_offs_ptr + expert, mask=mask)
     s_reverse_scatter_idx += within_expert_rank
 
@@ -134,14 +144,20 @@ def _bitmatrix_metadata_compute_stage2(
         # topk_router_indices.view(-1), i.e. token * K + k_slot.
         presort_offs = kv_pairs & 0xFFFF
         entry_idx = pid_m * BLOCK_SIZE + presort_offs
-        tl.store(s_reverse_scatter_idx_ptr + entry_idx, s_reverse_scatter_idx, mask=mask)
+        tl.store(
+            s_reverse_scatter_idx_ptr + entry_idx, s_reverse_scatter_idx, mask=mask
+        )
         tl.store(s_scatter_idx_ptr + s_reverse_scatter_idx, entry_idx, mask=mask)
-        tl.store(x_gather_idx_ptr + s_reverse_scatter_idx, entry_idx // K_POW2, mask=mask)
+        tl.store(
+            x_gather_idx_ptr + s_reverse_scatter_idx, entry_idx // K_POW2, mask=mask
+        )
     else:
         # presort_offs is in K_POW2-padded space; convert to unpadded entry_idx.
         presort_offs = kv_pairs & 0xFFFF
         token_i_global_s = pid_m * TOKENS_PER_BLOCK + presort_offs // K_POW2
         entry_idx = token_i_global_s * K + presort_offs % K_POW2
-        tl.store(s_reverse_scatter_idx_ptr + entry_idx, s_reverse_scatter_idx, mask=mask)
+        tl.store(
+            s_reverse_scatter_idx_ptr + entry_idx, s_reverse_scatter_idx, mask=mask
+        )
         tl.store(s_scatter_idx_ptr + s_reverse_scatter_idx, entry_idx, mask=mask)
         tl.store(x_gather_idx_ptr + s_reverse_scatter_idx, token_i_global_s, mask=mask)

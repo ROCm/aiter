@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-from typing import Optional, Tuple
 
 import torch
 import triton
@@ -878,7 +877,7 @@ def _mhc_pre_dsv4_torch(
     sinkhorn_eps: float,
     post_multiplier: float,
     sinkhorn_iters: int,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Differentiable correctness fallback used only by DSV4 backward."""
     M, n, C = residual.shape
     x = residual.float().reshape(M, n * C)
@@ -894,9 +893,7 @@ def _mhc_pre_dsv4_torch(
     )
     logits = logits * stream_scale + base.float()
     pre = torch.sigmoid(logits[:, :n]) + pre_eps
-    post = (
-        post_multiplier * torch.sigmoid(logits[:, n : 2 * n])
-    ).unsqueeze(-1)
+    post = (post_multiplier * torch.sigmoid(logits[:, n : 2 * n])).unsqueeze(-1)
     comb = logits[:, 2 * n :].reshape(M, n, n)
     if sinkhorn_iters > 0:
         row_max = comb.amax(dim=-1, keepdim=True)
@@ -936,21 +933,29 @@ def _validate_dsv4_parameters(
     base: torch.Tensor,
     *,
     head: bool,
-) -> Tuple[int, int, int]:
+) -> tuple[int, int, int]:
     if residual.ndim != 3:
-        raise ValueError(f"residual must have shape [M,n,C], got {tuple(residual.shape)}")
+        raise ValueError(
+            f"residual must have shape [M,n,C], got {tuple(residual.shape)}"
+        )
     M, n, C = residual.shape
     rows = n if head else 2 * n + n * n
     if fn.shape != (rows, n * C):
         raise ValueError(f"fn must have shape ({rows}, {n * C}), got {tuple(fn.shape)}")
     scale_size = 1 if head else 3
     if scale.shape != (scale_size,):
-        raise ValueError(f"scale must have shape ({scale_size},), got {tuple(scale.shape)}")
+        raise ValueError(
+            f"scale must have shape ({scale_size},), got {tuple(scale.shape)}"
+        )
     if base.shape != (rows,):
         raise ValueError(f"base must have shape ({rows},), got {tuple(base.shape)}")
     if residual.dtype not in (torch.float16, torch.bfloat16):
         raise TypeError("residual must be float16 or bfloat16")
-    if fn.dtype != torch.float32 or scale.dtype != torch.float32 or base.dtype != torch.float32:
+    if (
+        fn.dtype != torch.float32
+        or scale.dtype != torch.float32
+        or base.dtype != torch.float32
+    ):
         raise TypeError("fn, scale, and base must be float32")
     if not (residual.device == fn.device == scale.device == base.device):
         raise ValueError("residual, fn, scale, and base must be on the same device")
@@ -975,8 +980,8 @@ def _mhc_pre_dsv4_forward(
     sinkhorn_eps: float,
     post_multiplier: float,
     sinkhorn_iters: int,
-    config: Optional[dict],
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    config: dict | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     M, n, C = _validate_dsv4_parameters(residual, fn, scale, base, head=False)
     x = residual.view(M, n * C)
     post, raw_comb, layer_input = mhc(
@@ -1049,7 +1054,9 @@ class _MHCPreDSV4(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_post, grad_comb, grad_layer):
         residual, fn, scale, base = ctx.saved_tensors
-        inputs = tuple(t.detach().requires_grad_(True) for t in (residual, fn, scale, base))
+        inputs = tuple(
+            t.detach().requires_grad_(True) for t in (residual, fn, scale, base)
+        )
         with torch.enable_grad():
             outputs = _mhc_pre_dsv4_torch(*inputs, *ctx.params)
         grad_outputs = tuple(
@@ -1071,8 +1078,8 @@ def mhc_pre_dsv4(
     hc_sinkhorn_eps: float = 1e-6,
     hc_post_mult_value: float = 2.0,
     sinkhorn_repeat: int = 20,
-    config: Optional[dict] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    config: dict | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Run DSV4 MHC pre-processing with a pure-Triton production forward.
 
     ``residual`` is ``[M,n,C]`` in fp16/bf16; ``fn`` is
@@ -1126,7 +1133,7 @@ def mhc_post_dsv4(
     post_mix: torch.Tensor,
     comb_mix: torch.Tensor,
     *,
-    config: Optional[dict] = None,
+    config: dict | None = None,
 ) -> torch.Tensor:
     """Apply DSV4 post mixing with Triton forward and recomputation backward.
 
@@ -1143,7 +1150,7 @@ def _mhc_head_dsv4_forward(
     base: torch.Tensor,
     eps: float,
     pre_eps: float,
-    config: Optional[dict],
+    config: dict | None,
 ) -> torch.Tensor:
     M, n, C = _validate_dsv4_parameters(residual, fn, scale, base, head=True)
     x = residual.view(M, n * C)
@@ -1205,7 +1212,7 @@ def mhc_head_dsv4(
     *,
     rms_eps: float = 1e-6,
     hc_pre_eps: float = 1e-6,
-    config: Optional[dict] = None,
+    config: dict | None = None,
 ) -> torch.Tensor:
     """Contract DSV4 residual heads using a fused pure-Triton forward.
 
@@ -1213,6 +1220,4 @@ def mhc_head_dsv4(
     ``scale`` is ``[1]`` FP32, and ``base`` is ``[n]`` FP32. Returns
     ``[M,C]`` in ``residual.dtype``. Backward uses PyTorch recomputation.
     """
-    return _MHCHeadDSV4.apply(
-        residual, fn, scale, base, rms_eps, hc_pre_eps, config
-    )
+    return _MHCHeadDSV4.apply(residual, fn, scale, base, rms_eps, hc_pre_eps, config)

@@ -40,34 +40,43 @@ else:
 philox_seed: tl.constexpr = 0x1BF52
 philox_offset: tl.constexpr = 0x1D4B42
 
-AUTOTUNE = os.environ.get("AITER_TRITON_AMD_AUTOTUNE", "0").lower() in ("1", "true", "yes")
+AUTOTUNE = os.environ.get("AITER_TRITON_AMD_AUTOTUNE", "0").lower() in (
+    "1",
+    "true",
+    "yes",
+)
 
 
 def get_shape_from_layout(
-    q, k, v, layout, cu_seqlens_q=None, cu_seqlens_k=None, max_seqlen_q=None, max_seqlen_k=None
+    q,
+    k,
+    v,
+    layout,
+    cu_seqlens_q=None,
+    cu_seqlens_k=None,
+    max_seqlen_q=None,
+    max_seqlen_k=None,
 ):
     if layout == "bhsd":
         batch_q, nheads_q, max_seqlen_q, head_size_q = q.shape
         batch_k, nheads_k, max_seqlen_k, head_size_k = k.shape
-        batch_v, nheads_v, max_seqlen_v, head_size_v = v.shape
+        _batch_v, _nheads_v, _max_seqlen_v, head_size_v = v.shape
     elif layout == "bshd":
         batch_q, max_seqlen_q, nheads_q, head_size_q = q.shape
         batch_k, max_seqlen_k, nheads_k, head_size_k = k.shape
-        batch_v, max_seqlen_v, nheads_v, head_size_v = v.shape
+        _batch_v, _max_seqlen_v, _nheads_v, head_size_v = v.shape
     elif layout == "thd":
-        batch_q, max_seqlen_q, nheads_q, head_size_q = (
+        batch_q, nheads_q, head_size_q = (
             len(cu_seqlens_q) - 1,
-            max_seqlen_q,
             q.shape[1],
             q.shape[2],
         )
-        batch_k, max_seqlen_k, nheads_k, head_size_k = (
+        batch_k, nheads_k, head_size_k = (
             len(cu_seqlens_k) - 1,
-            max_seqlen_k,
             k.shape[1],
             k.shape[2],
         )
-        batch_v, max_seqlen_v, nheads_v, head_size_v = (
+        _batch_v, _max_seqlen_v, _nheads_v, head_size_v = (
             len(cu_seqlens_k) - 1,
             max_seqlen_k,
             v.shape[1],
@@ -80,7 +89,15 @@ def get_shape_from_layout(
     assert batch_q == batch_k
     assert head_size_q == head_size_k
 
-    return batch_q, nheads_q, nheads_k, head_size_q, head_size_v, max_seqlen_q, max_seqlen_k
+    return (
+        batch_q,
+        nheads_q,
+        nheads_k,
+        head_size_q,
+        head_size_v,
+        max_seqlen_q,
+        max_seqlen_k,
+    )
 
 
 def get_strides_from_layout(q, layout):
@@ -125,7 +142,9 @@ def dropout_offsets(philox_seed, philox_offset, dropout_p, m, n, stride):
 
 @triton.jit
 def dropout_rng(philox_seed, philox_offset, dropout_p, m, n, stride):
-    rng_offsets = dropout_offsets(philox_seed, philox_offset, dropout_p, m, n, stride).to(tl.uint32)
+    rng_offsets = dropout_offsets(
+        philox_seed, philox_offset, dropout_p, m, n, stride
+    ).to(tl.uint32)
     # TODO: use tl.randint for better performance
     return tl.rand(philox_seed, rng_offsets)
 
@@ -142,7 +161,9 @@ def dropout_mask(philox_seed, philox_offset, dropout_p, m, n, stride):
 @triton.jit
 def load_fn(ptrs, offset_first, offset_second, boundary_first, boundary_second):
     if offset_first is not None and offset_second is not None:
-        mask = (offset_first[:, None] < boundary_first) & (offset_second[None, :] < boundary_second)
+        mask = (offset_first[:, None] < boundary_first) & (
+            offset_second[None, :] < boundary_second
+        )
         tensor = tl.load(ptrs, mask=mask, other=0.0)
     elif offset_first is not None:
         mask = offset_first[:, None] < boundary_first
@@ -156,7 +177,9 @@ def load_fn(ptrs, offset_first, offset_second, boundary_first, boundary_second):
 
 
 @triton.jit
-def compute_alibi_block(alibi_slope, seqlen_q, seqlen_k, offs_m, offs_n, transpose=False):
+def compute_alibi_block(
+    alibi_slope, seqlen_q, seqlen_k, offs_m, offs_n, transpose=False
+):
     # when seqlen_k and seqlen_q are different we want the diagonal to stick to the bottom right of the attention matrix
     # for casual mask we want something like this where (1 is kept and 0 is masked)
     # seqlen_q = 2 and seqlen_k = 5
@@ -261,14 +284,14 @@ def _attn_fwd_inner(
         USE_ASM: tl.constexpr = False
 
     if scales_num_block_n == 1 and scales_num_block_d_qk == 1:
-        TRANS_K_SCALE_BLK: tl.constexpr = False
+        pass
     else:
-        TRANS_K_SCALE_BLK: tl.constexpr = True
+        pass
 
     if scales_num_block_d_v == 1 and scales_num_block_n == 1:
-        TRANS_V_SCALE_BLK: tl.constexpr = False
+        pass
     else:
-        TRANS_V_SCALE_BLK: tl.constexpr = True
+        pass
 
     if use_mxfp8:
         p_scale_t = tl.cast(p_scale, tl.uint8)
@@ -302,20 +325,46 @@ def _attn_fwd_inner(
 
         if PRE_LOAD_V:
             # We can use the same offsets as k, just with dims transposed.
-            v = load_fn(v_ptrs, k_offs_n, v_offs_k, actual_seqlen_k, ACTUAL_BLOCK_DMODEL_V)
+            v = load_fn(
+                v_ptrs, k_offs_n, v_offs_k, actual_seqlen_k, ACTUAL_BLOCK_DMODEL_V
+            )
 
         # -- compute qk ----
         if use_mxfp8:
             if SCALE_NUM_PER_D_QK % 2 == 0:
-                qk = tl.dot_scaled(q, q_scale, FLOAT_DTYPE, k, blk_k_scale, FLOAT_DTYPE, out_dtype=tl.float32)
+                qk = tl.dot_scaled(
+                    q,
+                    q_scale,
+                    FLOAT_DTYPE,
+                    k,
+                    blk_k_scale,
+                    FLOAT_DTYPE,
+                    out_dtype=tl.float32,
+                )
             else:
                 q_descaled = _unpack_fp8(
-                    q, q_scale, tl.float32, BLOCK_M, BLOCK_DMODEL_QK, QUANT_BLOCK_SIZE, True, USE_ASM
+                    q,
+                    q_scale,
+                    tl.float32,
+                    BLOCK_M,
+                    BLOCK_DMODEL_QK,
+                    QUANT_BLOCK_SIZE,
+                    True,
+                    USE_ASM,
                 )
                 k_descaled = _unpack_fp8(
-                    k, blk_k_scale, tl.float32, BLOCK_DMODEL_QK, BLOCK_N, QUANT_BLOCK_SIZE, True, USE_ASM
+                    k,
+                    blk_k_scale,
+                    tl.float32,
+                    BLOCK_DMODEL_QK,
+                    BLOCK_N,
+                    QUANT_BLOCK_SIZE,
+                    True,
+                    USE_ASM,
                 )
-                qk = tl.dot(q_descaled, k_descaled, out_dtype=tl.float32, allow_tf32=False)
+                qk = tl.dot(
+                    q_descaled, k_descaled, out_dtype=tl.float32, allow_tf32=False
+                )
 
         else:
             qk = tl.dot(q, k, out_dtype=tl.float32, allow_tf32=False)
@@ -323,17 +372,11 @@ def _attn_fwd_inner(
         # We start from end of seqlen_k so only the first iteration would need
         # to be checked for padding if it is not a multiple of block_n
         # TODO: This can be optimized to only be true for the padded block.
-        if MASK_STEPS:
-            # If this is the last block / iteration, we want to
-            # mask if the sequence length is not a multiple of block size
-            # a solution is to always do BLOCK_M // BLOCK_N + 1 steps if not is_modulo_mn.
-            # last step might get wasted but that is okay. check if this masking works For
-            # that case.
-            if (start_n + BLOCK_N == block_max) and (n_extra_tokens != 0):
-                boundary_m = tl.full([BLOCK_M], actual_seqlen_k, dtype=tl.int32)
-                size_n = start_n + OFFS_N[None, :]
-                mask = size_n < boundary_m[:, None]
-                qk = tl.where(mask, qk, float("-inf"))
+        if MASK_STEPS and (start_n + BLOCK_N == block_max) and (n_extra_tokens != 0):
+            boundary_m = tl.full([BLOCK_M], actual_seqlen_k, dtype=tl.int32)
+            size_n = start_n + OFFS_N[None, :]
+            mask = size_n < boundary_m[:, None]
+            qk = tl.where(mask, qk, float("-inf"))
 
         qk_scaled = qk * SM_SCALE
 
@@ -349,7 +392,9 @@ def _attn_fwd_inner(
             qk_scaled = tl.where(causal_mask, qk_scaled, float("-inf"))
         if bias_ptrs is not None:
             bias_offs_n = start_n + tl.arange(0, BLOCK_N) if MASK_STEPS else None
-            bias = load_fn(bias_ptrs, OFFS_M, bias_offs_n, actual_seqlen_q, actual_seqlen_k)
+            bias = load_fn(
+                bias_ptrs, OFFS_M, bias_offs_n, actual_seqlen_q, actual_seqlen_k
+            )
             qk_scaled += bias
 
         if alibi_slope is not None:
@@ -357,7 +402,11 @@ def _attn_fwd_inner(
             global_m_positions = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
             global_n_positions = start_n + tl.arange(0, BLOCK_N)
             alibi_block = compute_alibi_block(
-                alibi_slope, actual_seqlen_q, actual_seqlen_k, global_m_positions, global_n_positions
+                alibi_slope,
+                actual_seqlen_q,
+                actual_seqlen_k,
+                global_m_positions,
+                global_n_positions,
             )
             qk_scaled += alibi_block
         # get max scores so far
@@ -370,7 +419,9 @@ def _attn_fwd_inner(
             scores_scaled_shifted_mask = (OFFS_M[:, None] < actual_seqlen_q) & (
                 (start_n + tl.arange(0, BLOCK_N))[None, :] < actual_seqlen_k
             )
-            tl.store(scores_scaled_shifted_ptrs, q_shifted, mask=scores_scaled_shifted_mask)
+            tl.store(
+                scores_scaled_shifted_ptrs, q_shifted, mask=scores_scaled_shifted_mask
+            )
 
         # Compute scaled QK and softmax probabilities
         if USE_EXP2:
@@ -382,8 +433,15 @@ def _attn_fwd_inner(
         l_ij = tl.sum(p, 1)
 
         if ENABLE_DROPOUT:
-            philox_offset = batch_philox_offset + start_m * BLOCK_M * actual_seqlen_k + start_n - BLOCK_N
-            keep = dropout_mask(philox_seed, philox_offset, dropout_p, BLOCK_M, BLOCK_N, actual_seqlen_k)
+            philox_offset = (
+                batch_philox_offset
+                + start_m * BLOCK_M * actual_seqlen_k
+                + start_n
+                - BLOCK_N
+            )
+            keep = dropout_mask(
+                philox_seed, philox_offset, dropout_p, BLOCK_M, BLOCK_N, actual_seqlen_k
+            )
             if RETURN_SCORES:
                 # NOTE: the returned score is not the same as the reference because we need to adjust as we find new maxes per block. We are not doing that
                 exp_score_mask = (OFFS_M[:, None] < actual_seqlen_q) & (
@@ -399,7 +457,9 @@ def _attn_fwd_inner(
             tl.store(exp_scores_ptrs, p, mask=exp_score_mask)
 
         if not PRE_LOAD_V:
-            v = load_fn(v_ptrs, k_offs_n, v_offs_k, actual_seqlen_k, ACTUAL_BLOCK_DMODEL_V)
+            v = load_fn(
+                v_ptrs, k_offs_n, v_offs_k, actual_seqlen_k, ACTUAL_BLOCK_DMODEL_V
+            )
 
         if use_mxfp8:
             if SCALE_NUM_PER_N % 2 == 0:
@@ -415,9 +475,18 @@ def _attn_fwd_inner(
 
             else:
                 v_descaled = _unpack_fp8(
-                    v, blk_v_scale, tl.float32, BLOCK_N, BLOCK_DMODEL_V, QUANT_BLOCK_SIZE, True, USE_ASM
+                    v,
+                    blk_v_scale,
+                    tl.float32,
+                    BLOCK_N,
+                    BLOCK_DMODEL_V,
+                    QUANT_BLOCK_SIZE,
+                    True,
+                    USE_ASM,
                 )
-                pv = tl.dot(p * p_scale_f, v_descaled, allow_tf32=False, out_dtype=tl.float32)
+                pv = tl.dot(
+                    p * p_scale_f, v_descaled, allow_tf32=False, out_dtype=tl.float32
+                )
 
         else:
             pv = tl.dot(p.to(v.dtype), v, allow_tf32=False, out_dtype=tl.float32)
@@ -463,7 +532,16 @@ def get_autotune_fwd_configs():
             num_stages=1,
             num_warps=4,
         ),
-    ], ["IS_CAUSAL", "dropout_p", "MAX_SEQLENS_Q", "MAX_SEQLENS_K", "VARLEN", "HQ", "HK", "use_mxfp8"]
+    ], [
+        "IS_CAUSAL",
+        "dropout_p",
+        "MAX_SEQLENS_Q",
+        "MAX_SEQLENS_K",
+        "VARLEN",
+        "HQ",
+        "HK",
+        "use_mxfp8",
+    ]
 
 
 autotune_fwd_configs, autotune_fwd_keys = get_autotune_fwd_configs()
@@ -644,7 +722,9 @@ def attn_fwd_mxfp8(
                 + stride_kdescale_h * off_h_k
                 + cu_seqlens_k_start // QUANT_BLOCK_SIZE * stride_kdescale_m
                 + scale_offs_n_b[:, None] // QUANT_BLOCK_SIZE * stride_kdescale_m
-                + scale_offs_d_qk_q[None, :] // SCALE_NUM_PER_QUANT_BLK * stride_kdescale_d
+                + scale_offs_d_qk_q[None, :]
+                // SCALE_NUM_PER_QUANT_BLK
+                * stride_kdescale_d
             )
             q_scale_offset = (
                 q_scale_ptr
@@ -653,7 +733,9 @@ def attn_fwd_mxfp8(
                 + cu_seqlens_q_start // QUANT_BLOCK_SIZE * stride_qdescale_m
                 + start_m * scales_num_block_m * stride_qdescale_m
                 + scale_offs_m_b[:, None] // QUANT_BLOCK_SIZE * stride_qdescale_m
-                + scale_offs_d_qk_q[None, :] // SCALE_NUM_PER_QUANT_BLK * stride_qdescale_d
+                + scale_offs_d_qk_q[None, :]
+                // SCALE_NUM_PER_QUANT_BLK
+                * stride_qdescale_d
             )
 
         else:
@@ -712,15 +794,24 @@ def attn_fwd_mxfp8(
         # the causal mask boundary is bottom right aligned, and ends at either
         # the top edge (seqlen_q < seqlen_k) or left edge.
         # This captures the decrease in n_blocks if we have a rectangular attn matrix
-        n_blocks_seqlen = cdiv_fn((start_m + 1) * BLOCK_M + seqlen_k - seqlen_q, BLOCK_N)
+        n_blocks_seqlen = cdiv_fn(
+            (start_m + 1) * BLOCK_M + seqlen_k - seqlen_q, BLOCK_N
+        )
         # This is what adjusts the block_max for the current WG, only
         # if IS_CAUSAL. Otherwise we want to always iterate through all n_blocks
         n_blocks = min(n_blocks, n_blocks_seqlen)
         # If we have no blocks after adjusting for seqlen deltas, this WG is part of
         # the blocks that are all 0. We exit early.
         if n_blocks <= 0:
-            o_offset = Out + off_z * stride_oz + off_h_q * stride_oh + cu_seqlens_q_start * stride_om
-            o_ptrs = o_offset + offs_m[:, None] * stride_om + offs_d_v[None, :] * stride_on
+            o_offset = (
+                Out
+                + off_z * stride_oz
+                + off_h_q * stride_oh
+                + cu_seqlens_q_start * stride_om
+            )
+            o_ptrs = (
+                o_offset + offs_m[:, None] * stride_om + offs_d_v[None, :] * stride_on
+            )
             acc = tl.zeros([BLOCK_M, BLOCK_DMODEL_V], dtype=Out.type.element_ty)
             o_ptrs_mask = offs_m[:, None] < seqlen_q
             if PADDED_HEAD_V:
@@ -729,7 +820,12 @@ def attn_fwd_mxfp8(
             tl.store(o_ptrs, acc, mask=o_ptrs_mask)
             # The tensor allocated for L is based on MAX_SEQLENS_Q as that is
             # statically known.
-            l_offset = LSE + off_z * stride_lse_z + off_h_q * stride_lse_h + cu_seqlens_q_start * stride_lse_m
+            l_offset = (
+                LSE
+                + off_z * stride_lse_z
+                + off_h_q * stride_lse_h
+                + cu_seqlens_q_start * stride_lse_m
+            )
             l_ptrs = l_offset + offs_m * stride_lse_m
 
             l = tl.full([BLOCK_M], value=0.0, dtype=tl.float32)
@@ -753,16 +849,27 @@ def attn_fwd_mxfp8(
         n_extra_tokens = seqlen_k % BLOCK_N
 
     # Compute pointers for all the tensors used in this kernel.
-    q_offset = Q + off_z * stride_qz + off_h_q * stride_qh + cu_seqlens_q_start * stride_qm
+    q_offset = (
+        Q + off_z * stride_qz + off_h_q * stride_qh + cu_seqlens_q_start * stride_qm
+    )
     q_ptrs = q_offset + offs_m[:, None] * stride_qm + offs_d_qk[None, :] * stride_qk
-    k_offset = K + off_z * stride_kz + off_h_k * stride_kh + cu_seqlens_k_start * stride_kn
+    k_offset = (
+        K + off_z * stride_kz + off_h_k * stride_kh + cu_seqlens_k_start * stride_kn
+    )
     k_ptrs = k_offset + offs_d_qk[:, None] * stride_kk + offs_n[None, :] * stride_kn
-    v_offset = V + off_z * stride_vz + off_h_k * stride_vh + cu_seqlens_k_start * stride_vk
+    v_offset = (
+        V + off_z * stride_vz + off_h_k * stride_vh + cu_seqlens_k_start * stride_vk
+    )
     v_ptrs = v_offset + offs_n[:, None] * stride_vk + offs_d_v[None, :] * stride_vn
     if USE_BIAS:
         # Note: this might get large enough to overflow on some configs
         bias_offset = off_h_q * stride_bh
-        bias_ptrs = bias + bias_offset + offs_m[:, None] * stride_bm + offs_n[None, :] * stride_bn
+        bias_ptrs = (
+            bias
+            + bias_offset
+            + offs_m[:, None] * stride_bm
+            + offs_n[None, :] * stride_bn
+        )
     else:
         bias_ptrs = None
 
@@ -773,20 +880,39 @@ def attn_fwd_mxfp8(
         alibi_slope = None
 
     if RETURN_SCORES:
-        scores_offset = scores + off_z * stride_sz + off_h_q * stride_sh + cu_seqlens_q_start * stride_sm
-        score_ptrs = scores_offset + offs_m[:, None] * stride_sm + offs_n[None, :] * stride_sn
+        scores_offset = (
+            scores
+            + off_z * stride_sz
+            + off_h_q * stride_sh
+            + cu_seqlens_q_start * stride_sm
+        )
+        score_ptrs = (
+            scores_offset + offs_m[:, None] * stride_sm + offs_n[None, :] * stride_sn
+        )
 
         scores_scaled_shifted_offset = (
-            scores_scaled_shifted + off_z * stride_sz + off_h_q * stride_sh + cu_seqlens_q_start * stride_sm
+            scores_scaled_shifted
+            + off_z * stride_sz
+            + off_h_q * stride_sh
+            + cu_seqlens_q_start * stride_sm
         )
         scores_scaled_shifted_ptrs = (
-            scores_scaled_shifted_offset + offs_m[:, None] * stride_sm + offs_n[None, :] * stride_sn
+            scores_scaled_shifted_offset
+            + offs_m[:, None] * stride_sm
+            + offs_n[None, :] * stride_sn
         )
 
         exp_scores_offset = (
-            exp_scores + off_z * stride_sz + off_h_q * stride_sh + cu_seqlens_q_start * stride_sm
+            exp_scores
+            + off_z * stride_sz
+            + off_h_q * stride_sh
+            + cu_seqlens_q_start * stride_sm
         )
-        exp_scores_ptrs = exp_scores_offset + offs_m[:, None] * stride_sm + offs_n[None, :] * stride_sn
+        exp_scores_ptrs = (
+            exp_scores_offset
+            + offs_m[:, None] * stride_sm
+            + offs_n[None, :] * stride_sn
+        )
     else:
         score_ptrs = None
         scores_scaled_shifted_ptrs = None
@@ -1002,16 +1128,20 @@ def attn_fwd_mxfp8(
     causal_start_idx = seqlen_q - seqlen_k
 
     acc = acc.to(Out.type.element_ty)
-    if IS_CAUSAL:
-        if causal_start_idx > start_m_idx and causal_start_idx < end_m_idx:
-            out_mask_boundary = tl.full((BLOCK_DMODEL_V,), causal_start_idx, dtype=tl.int32)
-            mask_m_offsets = start_m_idx + tl.arange(0, BLOCK_M)
-            out_ptrs_mask = mask_m_offsets[:, None] >= out_mask_boundary[None, :]
-            z = 0.0
-            acc = tl.where(out_ptrs_mask, acc, z.to(acc.dtype))
+    if IS_CAUSAL and causal_start_idx > start_m_idx and causal_start_idx < end_m_idx:
+        out_mask_boundary = tl.full((BLOCK_DMODEL_V,), causal_start_idx, dtype=tl.int32)
+        mask_m_offsets = start_m_idx + tl.arange(0, BLOCK_M)
+        out_ptrs_mask = mask_m_offsets[:, None] >= out_mask_boundary[None, :]
+        z = 0.0
+        acc = tl.where(out_ptrs_mask, acc, z.to(acc.dtype))
 
     # write back LSE(Log Sum Exponents), the log of the normalization constant
-    l_offset = LSE + off_z * stride_lse_z + off_h_q * stride_lse_h + cu_seqlens_q_start * stride_lse_m
+    l_offset = (
+        LSE
+        + off_z * stride_lse_z
+        + off_h_q * stride_lse_h
+        + cu_seqlens_q_start * stride_lse_m
+    )
     offs_l_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
     l_ptrs = l_offset + offs_l_m * stride_lse_m
     if USE_EXP2:
@@ -1036,12 +1166,16 @@ def attn_fwd_mxfp8(
     if overflow_size > 0:
         boundary = tl.full((BLOCK_M,), BLOCK_M - overflow_size, dtype=tl.int32)
         l_ptrs_mask = tl.arange(0, BLOCK_M) < boundary
-        tl.store(l_ptrs, softmax_lse, mask=l_ptrs_mask)  # the log of the normalization constant
+        tl.store(
+            l_ptrs, softmax_lse, mask=l_ptrs_mask
+        )  # the log of the normalization constant
     else:
         tl.store(l_ptrs, softmax_lse)  # the log of the normalization constant
 
     # write back O
-    o_offset = Out + off_z * stride_oz + off_h_q * stride_oh + cu_seqlens_q_start * stride_om
+    o_offset = (
+        Out + off_z * stride_oz + off_h_q * stride_oh + cu_seqlens_q_start * stride_om
+    )
     o_ptrs = o_offset + offs_m[:, None] * stride_om + offs_d_v[None, :] * stride_on
     o_ptrs_mask = tl.full([BLOCK_M, BLOCK_DMODEL_V], 1, dtype=tl.int1)
     if overflow_size > 0:
@@ -1151,12 +1285,19 @@ def _bwd_preprocess_use_o_mxfp8(
 
     # write-back delta
     off_d_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    delta_offset = delta_ptr + off_z * stride_deltaz + off_h * stride_deltah + q_start * stride_deltam
+    delta_offset = (
+        delta_ptr
+        + off_z * stride_deltaz
+        + off_h * stride_deltah
+        + q_start * stride_deltam
+    )
     delta_ptrs = delta_offset + off_d_m * stride_deltam
     tl.store(delta_ptrs, delta, mask=mask_m)
 
     if use_mxfp8:
-        do_scale = _calculate_scales(do, BLOCK_M, BLOCK_DMODEL_V, QUANT_BLOCK_SIZE, True, F8_BWD_DTYPE)
+        do_scale = _calculate_scales(
+            do, BLOCK_M, BLOCK_DMODEL_V, QUANT_BLOCK_SIZE, True, F8_BWD_DTYPE
+        )
 
         do_fp8 = _pack_fp8(
             do,
@@ -1172,8 +1313,12 @@ def _bwd_preprocess_use_o_mxfp8(
             F8_BWD_DTYPE,
         )
 
-        do_fp8_offset = do_fp8_ptr + off_z * stride_doz + off_h * stride_doh + q_start * stride_dom
-        do_fp8_ptrs = do_fp8_offset + off_m[:, None] * stride_dom + off_d_v[None, :] * stride_dok
+        do_fp8_offset = (
+            do_fp8_ptr + off_z * stride_doz + off_h * stride_doh + q_start * stride_dom
+        )
+        do_fp8_ptrs = (
+            do_fp8_offset + off_m[:, None] * stride_dom + off_d_v[None, :] * stride_dok
+        )
 
         tl.store(do_fp8_ptrs, do_fp8, mask=mask_o)
 
@@ -1293,7 +1438,9 @@ def _attn_bwd_dkdv(
         # can_skip_causal_block = start_m < causal_boundary
         offs_m = start_m + tl.arange(0, BLOCK_M)
         q_ptrs = q_offset + offs_m[:, None] * stride_qm + offs_d_qk[None, :] * stride_qk
-        do_ptrs = do_offset + offs_m[:, None] * stride_dom + offs_d_v[None, :] * stride_dok
+        do_ptrs = (
+            do_offset + offs_m[:, None] * stride_dom + offs_d_v[None, :] * stride_dok
+        )
 
         # Important: keep parentheses; `&` has higher precedence than comparisons in Triton.
         mask_m = (offs_m >= 0) & (offs_m < N_CTX_Q)
@@ -1328,17 +1475,39 @@ def _attn_bwd_dkdv(
         if use_mxfp8:
             if (SCALE_NUM_PER_D_QK) % 2 == 0:
                 qk = tl.dot_scaled(
-                    q, blk_q_scale_1d_ds, FLOAT_DTYPE, k, k_scale, FLOAT_DTYPE, out_dtype=tl.float32
+                    q,
+                    blk_q_scale_1d_ds,
+                    FLOAT_DTYPE,
+                    k,
+                    k_scale,
+                    FLOAT_DTYPE,
+                    out_dtype=tl.float32,
                 )
             else:
                 # can fuse with sm_scale
                 q_descaled = _unpack_fp8(
-                    q, blk_q_scale_2d, tl.float32, BLOCK_M, BLOCK_DMODEL_QK, QUANT_BLOCK_SIZE, True, USE_ASM
+                    q,
+                    blk_q_scale_2d,
+                    tl.float32,
+                    BLOCK_M,
+                    BLOCK_DMODEL_QK,
+                    QUANT_BLOCK_SIZE,
+                    True,
+                    USE_ASM,
                 )
                 k_descaled = _unpack_fp8(
-                    k, k_scale, tl.float32, BLOCK_DMODEL_QK, BLOCK_N, QUANT_BLOCK_SIZE, True, USE_ASM
+                    k,
+                    k_scale,
+                    tl.float32,
+                    BLOCK_DMODEL_QK,
+                    BLOCK_N,
+                    QUANT_BLOCK_SIZE,
+                    True,
+                    USE_ASM,
                 )
-                qk = tl.dot(q_descaled, k_descaled, out_dtype=tl.float32, allow_tf32=False)
+                qk = tl.dot(
+                    q_descaled, k_descaled, out_dtype=tl.float32, allow_tf32=False
+                )
         else:
             qk = tl.dot(q, k, out_dtype=tl.float32, allow_tf32=False)
 
@@ -1379,12 +1548,28 @@ def _attn_bwd_dkdv(
                 )
             else:
                 do_descaled = _unpack_fp8(
-                    do, blk_do_scale_2d, tl.float32, BLOCK_M, BLOCK_DMODEL_V, QUANT_BLOCK_SIZE, True, DO_USE_ASM
+                    do,
+                    blk_do_scale_2d,
+                    tl.float32,
+                    BLOCK_M,
+                    BLOCK_DMODEL_V,
+                    QUANT_BLOCK_SIZE,
+                    True,
+                    DO_USE_ASM,
                 )
                 v_descaled = _unpack_fp8(
-                    v, v_scale, tl.float32, BLOCK_DMODEL_V, BLOCK_N, QUANT_BLOCK_SIZE, True, USE_ASM
+                    v,
+                    v_scale,
+                    tl.float32,
+                    BLOCK_DMODEL_V,
+                    BLOCK_N,
+                    QUANT_BLOCK_SIZE,
+                    True,
+                    USE_ASM,
                 )
-                dp = tl.dot(do_descaled, v_descaled, allow_tf32=False, out_dtype=tl.float32)
+                dp = tl.dot(
+                    do_descaled, v_descaled, allow_tf32=False, out_dtype=tl.float32
+                )
         else:
             dp = tl.dot(do, v, out_dtype=tl.float32, allow_tf32=False)
 
@@ -1416,17 +1601,23 @@ def _attn_bwd_dkdv(
                         True,
                         DO_USE_ASM,
                     )
-                dv += tl.dot(tl.trans(p), do_descaled, out_dtype=tl.float32, allow_tf32=False)
+                dv += tl.dot(
+                    tl.trans(p), do_descaled, out_dtype=tl.float32, allow_tf32=False
+                )
 
         else:
             # compute dv
-            dv += tl.dot(tl.trans(p.to(k.dtype)), do, out_dtype=tl.float32, allow_tf32=False)
+            dv += tl.dot(
+                tl.trans(p.to(k.dtype)), do, out_dtype=tl.float32, allow_tf32=False
+            )
 
         # compute dk = dot(ds.T, q)
         if use_mxfp8:
             if (SCALE_NUM_PER_M) % 2 == 0:
                 ds_T = ds.T
-                ds_scale = _calculate_scales(ds_T, BLOCK_N, BLOCK_M, QUANT_SIZE, False, q.dtype)
+                ds_scale = _calculate_scales(
+                    ds_T, BLOCK_N, BLOCK_M, QUANT_SIZE, False, q.dtype
+                )
 
                 ds_scalsed = _pack_fp8(
                     ds_T,
@@ -1463,10 +1654,14 @@ def _attn_bwd_dkdv(
                         True,
                         USE_ASM,
                     )
-                _dk = tl.dot(tl.trans(ds), q_descaled, out_dtype=tl.float32, allow_tf32=False)
+                _dk = tl.dot(
+                    tl.trans(ds), q_descaled, out_dtype=tl.float32, allow_tf32=False
+                )
                 dk += _dk
         else:
-            _dk = tl.dot(tl.trans(ds).to(q.dtype), q, out_dtype=tl.float32, allow_tf32=False)
+            _dk = tl.dot(
+                tl.trans(ds).to(q.dtype), q, out_dtype=tl.float32, allow_tf32=False
+            )
             dk += _dk
 
         if use_mxfp8:
@@ -1753,7 +1948,9 @@ def _bwd_kernel_dkdv_mxfp8(
             k_scale_offset = (
                 k_scale_offset_base
                 + scale_offs_n_b[:, None] // QUANT_BLOCK_SIZE * stride_kdescalem
-                + scale_offs_d_qk_q[None, :] // SCALE_NUM_PER_QUANT_BLK * stride_kdescaled
+                + scale_offs_d_qk_q[None, :]
+                // SCALE_NUM_PER_QUANT_BLK
+                * stride_kdescaled
             )
         else:
             k_scale_offset = (
@@ -1766,7 +1963,9 @@ def _bwd_kernel_dkdv_mxfp8(
             v_scale_offset = (
                 v_scale_offset_base
                 + scale_offs_n_b[:, None] // QUANT_BLOCK_SIZE * stride_vdescalem
-                + scale_offs_d_v_q[None, :] // SCALE_NUM_PER_QUANT_BLK * stride_vdescaled
+                + scale_offs_d_v_q[None, :]
+                // SCALE_NUM_PER_QUANT_BLK
+                * stride_vdescaled
             )
         else:
             v_scale_offset = (
@@ -1922,7 +2121,7 @@ def _attn_bwd_dq(
     FLOAT_DTYPE: tl.constexpr,
     QUANT_SIZE: tl.constexpr,
 ):
-    idx_block_n = tl.full([1], -1, dtype=tl.int32)
+    tl.full([1], -1, dtype=tl.int32)
 
     RCP_LN2: tl.constexpr = 1.4426950408889634
     if USE_EXP2:
@@ -1952,18 +2151,18 @@ def _attn_bwd_dq(
     # scale number per N in this warp tile for mxfp
     SCALE_NUM_PER_N: tl.constexpr = scales_num_block_n * SCALE_NUM_PER_QUANT_BLK
     # scale number per N in this warp tile for mxfp
-    SCALE_NUM_PER_M: tl.constexpr = scales_num_block_m * SCALE_NUM_PER_QUANT_BLK
+    scales_num_block_m * SCALE_NUM_PER_QUANT_BLK
 
     # if block size can be divided by quant block size, the scale wont be tranposed.
     if scales_num_block_n == 1 and scales_num_block_d_v == 1:
-        TRANS_V_SCALE_BLK: tl.constexpr = False
+        pass
     else:
-        TRANS_V_SCALE_BLK: tl.constexpr = True
+        pass
 
     if scales_num_block_n == 1 and scales_num_block_d_qk == 1:
-        TRANS_K_SCALE_BLK: tl.constexpr = False
+        pass
     else:
-        TRANS_K_SCALE_BLK: tl.constexpr = True
+        pass
 
     # loop over rows
     for start_n in range(0, hi, BLOCK_N):
@@ -1995,12 +2194,31 @@ def _attn_bwd_dq(
             else:
                 blk_k_scale = tl.load(k_scale_ptr_2d_base)
                 q_descaled = _unpack_fp8(
-                    q, q_scale, tl.float32, BLOCK_M, BLOCK_DMODEL_QK, QUANT_BLOCK_SIZE, True, USE_ASM
+                    q,
+                    q_scale,
+                    tl.float32,
+                    BLOCK_M,
+                    BLOCK_DMODEL_QK,
+                    QUANT_BLOCK_SIZE,
+                    True,
+                    USE_ASM,
                 )
                 k_descaled = _unpack_fp8(
-                    k, blk_k_scale, tl.float32, BLOCK_N, BLOCK_DMODEL_QK, QUANT_BLOCK_SIZE, True, USE_ASM
+                    k,
+                    blk_k_scale,
+                    tl.float32,
+                    BLOCK_N,
+                    BLOCK_DMODEL_QK,
+                    QUANT_BLOCK_SIZE,
+                    True,
+                    USE_ASM,
                 )
-                qk = tl.dot(q_descaled, tl.trans(k_descaled), out_dtype=tl.float32, allow_tf32=False)
+                qk = tl.dot(
+                    q_descaled,
+                    tl.trans(k_descaled),
+                    out_dtype=tl.float32,
+                    allow_tf32=False,
+                )
 
         else:
             kt = tl.trans(k)
@@ -2036,12 +2254,28 @@ def _attn_bwd_dq(
                 )
             else:
                 do_descaled = _unpack_fp8(
-                    do, do_scale, tl.float32, BLOCK_M, BLOCK_DMODEL_V, QUANT_BLOCK_SIZE, True, DO_USE_ASM
+                    do,
+                    do_scale,
+                    tl.float32,
+                    BLOCK_M,
+                    BLOCK_DMODEL_V,
+                    QUANT_BLOCK_SIZE,
+                    True,
+                    DO_USE_ASM,
                 )
                 v_descaled = _unpack_fp8(
-                    v, blk_v_scale, tl.float32, BLOCK_DMODEL_V, BLOCK_N, QUANT_BLOCK_SIZE, True, USE_ASM
+                    v,
+                    blk_v_scale,
+                    tl.float32,
+                    BLOCK_DMODEL_V,
+                    BLOCK_N,
+                    QUANT_BLOCK_SIZE,
+                    True,
+                    USE_ASM,
                 )
-                dp = tl.dot(do_descaled, v_descaled, allow_tf32=False, out_dtype=tl.float32)
+                dp = tl.dot(
+                    do_descaled, v_descaled, allow_tf32=False, out_dtype=tl.float32
+                )
         else:
             dp = tl.dot(do, v, out_dtype=tl.float32, allow_tf32=False)
 
@@ -2050,7 +2284,9 @@ def _attn_bwd_dq(
         if use_mxfp8:
             if (SCALE_NUM_PER_N) % 2 == 0:
                 blk_k_scale = tl.load(k_scale_ptr_1d_ds_base_T)
-                ds_scale = _calculate_scales(ds, BLOCK_M, BLOCK_N, QUANT_SIZE, False, q.dtype)
+                ds_scale = _calculate_scales(
+                    ds, BLOCK_M, BLOCK_N, QUANT_SIZE, False, q.dtype
+                )
                 ds = _pack_fp8(
                     ds,
                     ds_scale,
@@ -2080,7 +2316,14 @@ def _attn_bwd_dq(
                 if (SCALE_NUM_PER_D_QK) % 2 == 0:
                     blk_k_scale = tl.load(k_scale_ptr_2d_base)
                     k_descaled = _unpack_fp8(
-                        k, blk_k_scale, tl.float32, BLOCK_N, BLOCK_DMODEL_QK, QUANT_BLOCK_SIZE, True, USE_ASM
+                        k,
+                        blk_k_scale,
+                        tl.float32,
+                        BLOCK_N,
+                        BLOCK_DMODEL_QK,
+                        QUANT_BLOCK_SIZE,
+                        True,
+                        USE_ASM,
                     )
 
                 _dq = tl.dot(ds, k_descaled, out_dtype=tl.float32, allow_tf32=False)
@@ -2303,7 +2546,9 @@ def _bwd_kernel_dq_mxfp8(
             v_scale_ptr_base = (
                 v_scale_ptr_offs
                 + scale_offs_n_b[:, None] // QUANT_BLOCK_SIZE * stride_vdescalem
-                + scale_offs_d_v_q[None, :] // SCALE_NUM_PER_QUANT_BLK * stride_vdescaled
+                + scale_offs_d_v_q[None, :]
+                // SCALE_NUM_PER_QUANT_BLK
+                * stride_vdescaled
             )
         else:
             v_scale_ptr_base = (
@@ -2321,7 +2566,9 @@ def _bwd_kernel_dq_mxfp8(
         causal_boundary = start_m * BLOCK_M - BLOCK_N
         # For a given Q block (start_m), keys up to (start_m+1)*BLOCK_M can contribute under causal masking.
         # Convert that limit to a K-block boundary in multiples of BLOCK_N.
-        hi = (tl.minimum(cdiv_fn((start_m + 1) * BLOCK_M, BLOCK_N), num_block_n)) * BLOCK_N
+        hi = (
+            tl.minimum(cdiv_fn((start_m + 1) * BLOCK_M, BLOCK_N), num_block_n)
+        ) * BLOCK_N
 
     else:
         causal_boundary = 0
@@ -2357,7 +2604,9 @@ def _bwd_kernel_dq_mxfp8(
             q_scale_offset = (
                 q_scale_offset_base
                 + scale_offs_m_b[:, None] // QUANT_BLOCK_SIZE * stride_qdescalem
-                + scale_offs_d_qk_q[None, :] // SCALE_NUM_PER_QUANT_BLK * stride_qdescaled
+                + scale_offs_d_qk_q[None, :]
+                // SCALE_NUM_PER_QUANT_BLK
+                * stride_qdescaled
             )
         else:
             q_scale_offset = (
@@ -2378,7 +2627,9 @@ def _bwd_kernel_dq_mxfp8(
             do_scale_offset = (
                 do_scale_offset_base
                 + scale_offs_m_b[:, None] // QUANT_BLOCK_SIZE * stride_dodescalem
-                + scale_offs_d_v_q[None, :] // SCALE_NUM_PER_QUANT_BLK * stride_dodescaled
+                + scale_offs_d_v_q[None, :]
+                // SCALE_NUM_PER_QUANT_BLK
+                * stride_dodescaled
             )
         else:
             do_scale_offset = (

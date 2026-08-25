@@ -1,6 +1,6 @@
 # op_tests/test_topk_softmax.py
-import torch
 import pytest
+import torch
 
 from aiter.ops.moe_op import topk_softmax
 
@@ -43,20 +43,20 @@ def test_topk_softmax(num_tokens, num_experts, topk, need_renorm):
     gating_output = torch.randn(num_tokens, num_experts, dtype=torch.float32)
 
     weights_ref, ids_ref = topk_softmax_ref(gating_output, topk, need_renorm)
-    topk_weights, topk_indices = _run_topk_softmax(
-        gating_output, topk, need_renorm
-    )
+    topk_weights, topk_indices = _run_topk_softmax(gating_output, topk, need_renorm)
 
     torch.testing.assert_close(topk_weights, weights_ref, atol=1e-4, rtol=1e-4)
 
     for row in range(min(num_tokens, 16)):
-        assert set(topk_indices[row].tolist()) == set(ids_ref[row].tolist()), (
-            f"Row {row}: expert sets differ"
-        )
+        assert set(topk_indices[row].tolist()) == set(
+            ids_ref[row].tolist()
+        ), f"Row {row}: expert sets differ"
 
 
 def test_topk_softmax_n_zero():
-    pytest.skip("topk_softmax ASM kernel does not support 0 tokens (invalid HIP launch)")
+    pytest.skip(
+        "topk_softmax ASM kernel does not support 0 tokens (invalid HIP launch)"
+    )
 
 
 def test_topk_softmax_bf16_input():
@@ -70,6 +70,6 @@ def test_topk_softmax_bf16_input():
 
     torch.testing.assert_close(topk_weights, weights_ref, atol=2e-3, rtol=2e-3)
     for row in range(16):
-        assert set(topk_indices[row].tolist()) == set(ids_ref[row].tolist()), (
-            f"Row {row}: expert sets differ"
-        )
+        assert set(topk_indices[row].tolist()) == set(
+            ids_ref[row].tolist()
+        ), f"Row {row}: expert sets differ"

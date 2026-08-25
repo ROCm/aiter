@@ -24,10 +24,14 @@ import triton.language as tl
 
 @triton.jit
 def online_softmax_kernel(
-    X_ptr, X_stride,
-    Y_ptr, Y_stride,
-    m_d_Xy_ptr, m_d_Xy_stride,
-    rank, n_cols,
+    X_ptr,
+    X_stride,
+    Y_ptr,
+    Y_stride,
+    m_d_Xy_ptr,
+    m_d_Xy_stride,
+    rank,
+    n_cols,
     BLOCK_SIZE: tl.constexpr,
 ):
     """Compute per-rank softmax statistics for one row.
@@ -49,16 +53,17 @@ def online_softmax_kernel(
     vocab_start = rank * n_cols
     vocab_end = (rank + 1) * n_cols
     X_y: tl.float32 = float("-inf")
-    if y >= vocab_start:
-        if y < vocab_end:
-            X_y = tl.load(X_ptr + y - vocab_start).to(tl.float32)
+    if y >= vocab_start and y < vocab_end:
+        X_y = tl.load(X_ptr + y - vocab_start).to(tl.float32)
 
     base = pid * m_d_Xy_stride * 3
     m: tl.float32 = float("-inf")
     d: tl.float32 = 0.0
     for i in range(0, n_cols, BLOCK_SIZE):
         offs = i + tl.arange(0, BLOCK_SIZE)
-        blk = tl.load(X_ptr + offs, mask=offs < n_cols, other=float("-inf")).to(tl.float32)
+        blk = tl.load(X_ptr + offs, mask=offs < n_cols, other=float("-inf")).to(
+            tl.float32
+        )
         blk_max = tl.max(blk)
         m_new = tl.maximum(m, blk_max)
         d = d * tl.exp(m - m_new) + tl.sum(tl.exp(blk - m_new))
@@ -71,11 +76,19 @@ def online_softmax_kernel(
 
 @triton.jit
 def cross_entropy_kernel(
-    X_ptr, X_stride,
-    Y_ptr, Y_stride,
-    loss_ptr, loss_stride,
-    m_d_Xy_ptr, m_d_Xy_stride,
-    rank, world_size, ignore_idx, n_cols, n_rows,
+    X_ptr,
+    X_stride,
+    Y_ptr,
+    Y_stride,
+    loss_ptr,
+    loss_stride,
+    m_d_Xy_ptr,
+    m_d_Xy_stride,
+    rank,
+    world_size,
+    ignore_idx,
+    n_cols,
+    n_rows,
     reduce_loss: tl.constexpr,
     label_smoothing: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
@@ -114,7 +127,9 @@ def cross_entropy_kernel(
         m_new = tl.load(ptr)
         d_new = tl.load(ptr + m_d_Xy_stride)
         Xy_new = tl.load(ptr + 2 * m_d_Xy_stride)
-        d = d * tl.exp(m - tl.maximum(m, m_new)) + d_new * tl.exp(m_new - tl.maximum(m, m_new))
+        d = d * tl.exp(m - tl.maximum(m, m_new)) + d_new * tl.exp(
+            m_new - tl.maximum(m, m_new)
+        )
         m = tl.maximum(m, m_new)
         ori_Xy = tl.maximum(ori_Xy, Xy_new)
 
@@ -143,22 +158,23 @@ def cross_entropy_kernel(
 
     vocab_start = rank * n_cols
     vocab_end = (rank + 1) * n_cols
-    if y >= vocab_start:
-        if y < vocab_end:
-            Xy_grad = tl.load(X_ptr + y - vocab_start)
-            if reduce_loss:
-                Xy_grad += -(1 - label_smoothing) / n_rows
-            else:
-                Xy_grad += -(1 - label_smoothing)
-            tl.store(X_ptr + y - vocab_start, Xy_grad)
+    if y >= vocab_start and y < vocab_end:
+        Xy_grad = tl.load(X_ptr + y - vocab_start)
+        if reduce_loss:
+            Xy_grad += -(1 - label_smoothing) / n_rows
+        else:
+            Xy_grad += -(1 - label_smoothing)
+        tl.store(X_ptr + y - vocab_start, Xy_grad)
 
     tl.store(loss_ptr, loss)
 
 
 @triton.jit
 def element_mul_kernel(
-    X_ptr, X_stride,
-    grad_ptr, grad_stride,
+    X_ptr,
+    X_stride,
+    grad_ptr,
+    grad_stride,
     n_cols,
     BLOCK_SIZE: tl.constexpr,
 ):

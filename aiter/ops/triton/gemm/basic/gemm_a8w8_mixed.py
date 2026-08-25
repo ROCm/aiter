@@ -6,9 +6,10 @@
 # Uses the same Triton kernel as gemm_a8w8 — tl.dot accumulates in FP32
 # regardless of input element types, so mixed E4M3/E5M2 is valid.
 
-from typing import Optional
+
 import torch
 import triton
+
 from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a8w8 import (
     _gemm_a8w8_kernel,
     _get_config,
@@ -21,10 +22,10 @@ def gemm_a8w8_mixed(
     w: torch.Tensor,
     x_scale: torch.Tensor,
     w_scale: torch.Tensor,
-    bias: Optional[torch.Tensor] = None,
-    dtype: Optional[float] = torch.bfloat16,
-    y: Optional[torch.Tensor] = None,
-    config: Optional[dict] = None,
+    bias: torch.Tensor | None = None,
+    dtype: float | None = torch.bfloat16,
+    y: torch.Tensor | None = None,
+    config: dict | None = None,
     w_transposed: bool = False,
 ):
     """Mixed-dtype FP8 GEMM: Y = (X @ W) * (x_scale * w_scale).
@@ -55,9 +56,9 @@ def gemm_a8w8_mixed(
     Returns:
         Output tensor ``(M, N)`` in ``dtype``.
     """
-    assert x.dtype.is_floating_point and w.dtype.is_floating_point, (
-        f"Expected FP8 inputs, got {x.dtype} and {w.dtype}"
-    )
+    assert (
+        x.dtype.is_floating_point and w.dtype.is_floating_point
+    ), f"Expected FP8 inputs, got {x.dtype} and {w.dtype}"
 
     M, K = x.shape
     if w_transposed:

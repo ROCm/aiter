@@ -2,11 +2,11 @@
 # Copyright (c) 2025, Wentao Guo, Mayank Mishra, Xinle Cheng, Ion Stoica, Tri Dao
 # ********************************************************************************
 
-from typing import Optional
 
 import torch
 import triton
 import triton.language as tl
+
 
 def get_powers_of_2(start: int, end: int) -> list[int]:
     output = []
@@ -24,7 +24,11 @@ def _get_triton_autotune_configs() -> list[triton.Config]:
             for num_warps in [4, 8]:
                 if BLOCK_K * BLOCK_H <= 32768:
                     configs.append(
-                        triton.Config({"BLOCK_H": BLOCK_H, "BLOCK_K": BLOCK_K}, num_warps=num_warps, num_stages=4)
+                        triton.Config(
+                            {"BLOCK_H": BLOCK_H, "BLOCK_K": BLOCK_K},
+                            num_warps=num_warps,
+                            num_stages=4,
+                        )
                     )
     return configs
 
@@ -109,7 +113,9 @@ def token_gather_sum_kernel(
             m_abs = Ms + k_idx  # [BLOCK_K]
 
             # Gather permuted indices
-            perm_idx = tl.load(M_perm_ptr + m_abs, mask=m_k, other=0).to(tl.int64)  # [BLOCK_K]
+            perm_idx = tl.load(M_perm_ptr + m_abs, mask=m_k, other=0).to(
+                tl.int64
+            )  # [BLOCK_K]
 
             # Load x values: [BLOCK_K, BLOCK_H]
             x_ptrs = x_ptr + perm_idx[:, None] * stride_xM + h_idx[None, :] * stride_xH
@@ -120,7 +126,9 @@ def token_gather_sum_kernel(
             if w_is_None:
                 acc += tl.sum(x_vals, axis=0)  # [BLOCK_H]
             else:
-                w_vals = tl.load(w_ptr + m_abs, mask=m_k, other=0.0).to(tl.float32)  # [BLOCK_K]
+                w_vals = tl.load(w_ptr + m_abs, mask=m_k, other=0.0).to(
+                    tl.float32
+                )  # [BLOCK_K]
                 acc += tl.sum(x_vals * w_vals[:, None], axis=0)  # [BLOCK_H]
 
         # Store final result for this H tile (only once!)
@@ -130,7 +138,7 @@ def token_gather_sum_kernel(
 
 def token_gather_and_sum_varlen_K_triton(
     x: torch.Tensor,  # (Mtotal, H)
-    w: Optional[torch.Tensor],  # (Mtotal,)
+    w: torch.Tensor | None,  # (Mtotal,)
     out: torch.Tensor,  # (T, H)
     M_perm: torch.Tensor,  # (Mtotal,) int32
     M_offset: torch.Tensor,  # (T+1,)   int32, variable K per token

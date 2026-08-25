@@ -10,9 +10,9 @@ from aiter.ops.triton._triton_kernels.normalization.rmsnorm import (
     _quant_rms_norm_kernel,
     _rms_norm_kernel,
     _rmsnorm_bwd_dg_reduce_triton,
+    _rmsnorm_bwd_kernel_large_m_small_n,
     _rmsnorm_bwd_triton,
     _rmsnorm_kernel_large_m_small_n,
-    _rmsnorm_bwd_kernel_large_m_small_n,
 )
 from aiter.ops.triton.utils.device_info import get_num_sms
 from aiter.ops.triton.utils.logger import AiterTritonLogger
@@ -136,7 +136,7 @@ def _rmsnorm_backward(dz, x, gamma, rsigma):
             num_warps=8,
             num_stages=2,
         )
-        grid_reduce = lambda meta: [triton.cdiv(N, meta["BLOCK_SIZE_N"])]  # noqa: E731
+        grid_reduce = lambda meta: [triton.cdiv(N, meta["BLOCK_SIZE_N"])]
         _rmsnorm_bwd_dg_reduce_triton[grid_reduce](
             dg_tmp,
             dgamma,

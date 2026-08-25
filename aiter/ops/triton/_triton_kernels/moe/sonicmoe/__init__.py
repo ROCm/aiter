@@ -1,28 +1,39 @@
 import torch
 import torch.nn.functional as F
 
-from .enums import ActivationType, is_glu
-from .routing import TC_topk_router_metadata_triton, general_routing_router_metadata_triton  # noqa: E501
-
-from .grouped_gemm_triton import grouped_gemm
-from .activation_kernels import activation_fwd, activation_bwd
-from .forward import _topk_softmax_fwd, _topk_softmax_bwd, _router_forward
+from .activation_kernels import activation_fwd
 from .backward import (
-    _up_projection_backward_act,
     _down_projection_backward_act,
     _token_broadcast_backward,
+    _up_projection_backward_act,
+)
+from .enums import ActivationType, is_glu
+from .forward import _router_forward, _topk_softmax_bwd, _topk_softmax_fwd
+from .grouped_gemm_triton import grouped_gemm
+from .routing import (
+    TC_topk_router_metadata_triton,
+    general_routing_router_metadata_triton,
 )
 
 
 class TC_Softmax_Topk_Router_Function(torch.autograd.Function):
     @staticmethod
     def forward(
-        ctx, router_logits: torch.Tensor, E: int, K: int, is_softmax_over_topk: bool, norm_topk_probs: bool
+        ctx,
+        router_logits: torch.Tensor,
+        E: int,
+        K: int,
+        is_softmax_over_topk: bool,
+        norm_topk_probs: bool,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         T = router_logits.size(0)
 
-        topk_router_score = torch.empty(T, K, dtype=torch.float32, device=router_logits.device)
-        topk_router_indices = torch.empty(T, K, dtype=torch.int32, device=router_logits.device)
+        topk_router_score = torch.empty(
+            T, K, dtype=torch.float32, device=router_logits.device
+        )
+        topk_router_indices = torch.empty(
+            T, K, dtype=torch.int32, device=router_logits.device
+        )
 
         _topk_softmax_fwd(
             router_logits,
@@ -47,7 +58,9 @@ class TC_Softmax_Topk_Router_Function(torch.autograd.Function):
         T, K = dtopk_score.size()
         E = ctx.E
         topk_router_score, topk_router_indices, router_logits = ctx.saved_tensors
-        dlogits = torch.zeros(T, ctx.E, dtype=ctx.dtype, device=topk_router_score.device)
+        dlogits = torch.zeros(
+            T, ctx.E, dtype=ctx.dtype, device=topk_router_score.device
+        )
 
         _topk_softmax_bwd(
             router_logits,
@@ -85,7 +98,7 @@ class _UpProjection(torch.autograd.Function):
         concat_layout: bool = False,
     ) -> torch.Tensor:
         T, H = x.shape
-        I_full, H_w, E = w1.shape
+        I_full, _H_w, E = w1.shape
         is_glu_activation = is_glu(activation_type)
         I = I_full // 2 if is_glu_activation else I_full
         TK = total_expert_freq
@@ -115,7 +128,9 @@ class _UpProjection(torch.autograd.Function):
         ctx.K = K
         ctx.H = H
         ctx.I = I
-        ctx.is_each_token_has_variable_activated_experts = is_each_token_has_variable_activated_experts
+        ctx.is_each_token_has_variable_activated_experts = (
+            is_each_token_has_variable_activated_experts
+        )
         ctx.is_glu_activation = is_glu_activation
         ctx.concat_layout = concat_layout and is_glu_activation
 
@@ -143,7 +158,9 @@ class _UpProjection(torch.autograd.Function):
         K = ctx.K
         H = ctx.H
         is_glu_activation = ctx.is_glu_activation
-        is_each_token_has_variable_activated_experts = ctx.is_each_token_has_variable_activated_experts
+        is_each_token_has_variable_activated_experts = (
+            ctx.is_each_token_has_variable_activated_experts
+        )
         concat_layout = ctx.concat_layout
 
         (
@@ -152,7 +169,7 @@ class _UpProjection(torch.autograd.Function):
             b1,
             expert_frequency_offset,
             x_gather_idx,
-            s_scatter_idx,
+            _s_scatter_idx,
             s_reverse_scatter_idx,
             num_activated_expert_per_token_offset,
         ) = ctx.saved_tensors
@@ -179,7 +196,11 @@ class _UpProjection(torch.autograd.Function):
         # But dw1 shape is (I_full, H, E) and permuted is (E, H, I_full)
         grouped_gemm(
             x,
-            dh.unsqueeze(0).expand(E, -1, -1).contiguous().reshape(E, TK, -1) if False else dh,
+            (
+                dh.unsqueeze(0).expand(E, -1, -1).contiguous().reshape(E, TK, -1)
+                if False
+                else dh
+            ),
             expert_frequency_offset,
             out=dw1.permute(2, 1, 0),  # (E, H, I_full) output
             A_idx=x_gather_idx,
@@ -221,7 +242,7 @@ class _DownProjection(torch.autograd.Function):
         activation_type: ActivationType,
     ) -> torch.Tensor:
         TK = a.size(0)
-        H, I, E = w2.shape
+        H, _I, E = w2.shape
 
         # Grouped GEMM: y = a @ w2 per expert
         # w2 is (H, I, E), permute to (E, I, H) for B: A=(TK, I), B=(E, I, H) -> C=(TK, H)
@@ -341,9 +362,7 @@ def moe_TC_softmax_topk_layer(
     norm_topk_probs: bool = False,
     concat_layout: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    assert ((b1 is None) and (b2 is None)) or (
-        (b1 is not None) and (b2 is not None)
-    )
+    assert ((b1 is None) and (b2 is None)) or ((b1 is not None) and (b2 is not None))
     E = router_w.size(0)
     router_logits = F.linear(x, router_w)
     topk_scores, topk_indices = TC_Softmax_Topk_Router_Function.apply(
@@ -361,7 +380,13 @@ def moe_TC_softmax_topk_layer(
     x_gather_idx = torch.empty(TK, dtype=torch.int32, device=device)
 
     TC_topk_router_metadata_triton(
-        topk_indices, E, expert_frequency, expert_frequency_offset, x_gather_idx, s_scatter_idx, s_reverse_scatter_idx
+        topk_indices,
+        E,
+        expert_frequency,
+        expert_frequency_offset,
+        x_gather_idx,
+        s_scatter_idx,
+        s_reverse_scatter_idx,
     )
 
     if type(activation_type) == str:
@@ -419,9 +444,7 @@ def moe_general_routing_inputs(
     is_inference_mode_enabled: bool = False,
     concat_layout: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    assert ((b1 is None) and (b2 is None)) or (
-        (b1 is not None) and (b2 is not None)
-    )
+    assert ((b1 is None) and (b2 is None)) or ((b1 is not None) and (b2 is not None))
 
     T = x.size(0)
     TK = router_scores.size(0)
@@ -436,7 +459,9 @@ def moe_general_routing_inputs(
     expert_frequency = torch.empty(E, dtype=torch.int32, device=device)
     expert_frequency_offset = torch.empty(E + 1, dtype=torch.int32, device=device)
     x_gather_idx = torch.empty(TK, dtype=torch.int32, device=device)
-    num_activated_expert_per_token_offset = torch.empty(T + 1, dtype=torch.int32, device=device)
+    num_activated_expert_per_token_offset = torch.empty(
+        T + 1, dtype=torch.int32, device=device
+    )
 
     general_routing_router_metadata_triton(
         token_indices,

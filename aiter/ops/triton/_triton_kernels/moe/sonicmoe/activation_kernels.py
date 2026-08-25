@@ -2,18 +2,23 @@ import torch
 import triton
 import triton.language as tl
 
-
 # ============================================================================
 # GLU-family forward kernels (SwiGLU, GEGLU, ReGLU)
 # ============================================================================
 
+
 @triton.jit
 def _glu_fwd_kernel(
-    h_ptr, a_ptr,
-    TK, I: tl.constexpr,
-    stride_h_m, stride_h_i,
-    stride_a_m, stride_a_i,
-    BLOCK_M: tl.constexpr, BLOCK_I: tl.constexpr,
+    h_ptr,
+    a_ptr,
+    TK,
+    I: tl.constexpr,
+    stride_h_m,
+    stride_h_i,
+    stride_a_m,
+    stride_a_i,
+    BLOCK_M: tl.constexpr,
+    BLOCK_I: tl.constexpr,
     CONCAT_LAYOUT: tl.constexpr,
     ACT_TYPE: tl.constexpr,
 ):
@@ -32,12 +37,18 @@ def _glu_fwd_kernel(
         up_offs = offs_i * 2 + 1
 
     gate = tl.load(
-        h_ptr + offs_m[:, None].to(tl.int64) * stride_h_m + gate_offs[None, :].to(tl.int64) * stride_h_i,
-        mask=m_mask[:, None] & i_mask[None, :], other=0.0,
+        h_ptr
+        + offs_m[:, None].to(tl.int64) * stride_h_m
+        + gate_offs[None, :].to(tl.int64) * stride_h_i,
+        mask=m_mask[:, None] & i_mask[None, :],
+        other=0.0,
     ).to(tl.float32)
     up = tl.load(
-        h_ptr + offs_m[:, None].to(tl.int64) * stride_h_m + up_offs[None, :].to(tl.int64) * stride_h_i,
-        mask=m_mask[:, None] & i_mask[None, :], other=0.0,
+        h_ptr
+        + offs_m[:, None].to(tl.int64) * stride_h_m
+        + up_offs[None, :].to(tl.int64) * stride_h_i,
+        mask=m_mask[:, None] & i_mask[None, :],
+        other=0.0,
     ).to(tl.float32)
 
     if ACT_TYPE == 0:  # swiglu
@@ -53,7 +64,9 @@ def _glu_fwd_kernel(
     out = act_gate * up
 
     tl.store(
-        a_ptr + offs_m[:, None].to(tl.int64) * stride_a_m + offs_i[None, :].to(tl.int64) * stride_a_i,
+        a_ptr
+        + offs_m[:, None].to(tl.int64) * stride_a_m
+        + offs_i[None, :].to(tl.int64) * stride_a_i,
         out.to(a_ptr.dtype.element_ty),
         mask=m_mask[:, None] & i_mask[None, :],
     )
@@ -63,14 +76,22 @@ def _glu_fwd_kernel(
 # GLU-family backward kernels
 # ============================================================================
 
+
 @triton.jit
 def _glu_bwd_kernel(
-    h_ptr, dh_ptr, da_ptr,
-    TK, I: tl.constexpr,
-    stride_h_m, stride_h_i,
-    stride_dh_m, stride_dh_i,
-    stride_da_m, stride_da_i,
-    BLOCK_M: tl.constexpr, BLOCK_I: tl.constexpr,
+    h_ptr,
+    dh_ptr,
+    da_ptr,
+    TK,
+    I: tl.constexpr,
+    stride_h_m,
+    stride_h_i,
+    stride_dh_m,
+    stride_dh_i,
+    stride_da_m,
+    stride_da_i,
+    BLOCK_M: tl.constexpr,
+    BLOCK_I: tl.constexpr,
     CONCAT_LAYOUT: tl.constexpr,
     ACT_TYPE: tl.constexpr,
 ):
@@ -89,16 +110,25 @@ def _glu_bwd_kernel(
         up_offs = offs_i * 2 + 1
 
     gate = tl.load(
-        h_ptr + offs_m[:, None].to(tl.int64) * stride_h_m + gate_offs[None, :].to(tl.int64) * stride_h_i,
-        mask=m_mask[:, None] & i_mask[None, :], other=0.0,
+        h_ptr
+        + offs_m[:, None].to(tl.int64) * stride_h_m
+        + gate_offs[None, :].to(tl.int64) * stride_h_i,
+        mask=m_mask[:, None] & i_mask[None, :],
+        other=0.0,
     ).to(tl.float32)
     up = tl.load(
-        h_ptr + offs_m[:, None].to(tl.int64) * stride_h_m + up_offs[None, :].to(tl.int64) * stride_h_i,
-        mask=m_mask[:, None] & i_mask[None, :], other=0.0,
+        h_ptr
+        + offs_m[:, None].to(tl.int64) * stride_h_m
+        + up_offs[None, :].to(tl.int64) * stride_h_i,
+        mask=m_mask[:, None] & i_mask[None, :],
+        other=0.0,
     ).to(tl.float32)
     da = tl.load(
-        da_ptr + offs_m[:, None].to(tl.int64) * stride_da_m + offs_i[None, :].to(tl.int64) * stride_da_i,
-        mask=m_mask[:, None] & i_mask[None, :], other=0.0,
+        da_ptr
+        + offs_m[:, None].to(tl.int64) * stride_da_m
+        + offs_i[None, :].to(tl.int64) * stride_da_i,
+        mask=m_mask[:, None] & i_mask[None, :],
+        other=0.0,
     ).to(tl.float32)
 
     if ACT_TYPE == 0:  # swiglu
@@ -123,12 +153,16 @@ def _glu_bwd_kernel(
         d_gate = da * up * tl.where(relu_mask, 1.0, 0.0)
 
     tl.store(
-        dh_ptr + offs_m[:, None].to(tl.int64) * stride_dh_m + gate_offs[None, :].to(tl.int64) * stride_dh_i,
+        dh_ptr
+        + offs_m[:, None].to(tl.int64) * stride_dh_m
+        + gate_offs[None, :].to(tl.int64) * stride_dh_i,
         d_gate.to(dh_ptr.dtype.element_ty),
         mask=m_mask[:, None] & i_mask[None, :],
     )
     tl.store(
-        dh_ptr + offs_m[:, None].to(tl.int64) * stride_dh_m + up_offs[None, :].to(tl.int64) * stride_dh_i,
+        dh_ptr
+        + offs_m[:, None].to(tl.int64) * stride_dh_m
+        + up_offs[None, :].to(tl.int64) * stride_dh_i,
         d_up.to(dh_ptr.dtype.element_ty),
         mask=m_mask[:, None] & i_mask[None, :],
     )
@@ -138,13 +172,19 @@ def _glu_bwd_kernel(
 # Non-GLU forward kernels (GELU, ReLU, SiLU, ReLU²)
 # ============================================================================
 
+
 @triton.jit
 def _pointwise_act_fwd_kernel(
-    h_ptr, a_ptr,
-    TK, I: tl.constexpr,
-    stride_h_m, stride_h_i,
-    stride_a_m, stride_a_i,
-    BLOCK_M: tl.constexpr, BLOCK_I: tl.constexpr,
+    h_ptr,
+    a_ptr,
+    TK,
+    I: tl.constexpr,
+    stride_h_m,
+    stride_h_i,
+    stride_a_m,
+    stride_a_i,
+    BLOCK_M: tl.constexpr,
+    BLOCK_I: tl.constexpr,
     ACT_TYPE: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
@@ -155,8 +195,11 @@ def _pointwise_act_fwd_kernel(
     i_mask = offs_i < I
 
     x = tl.load(
-        h_ptr + offs_m[:, None].to(tl.int64) * stride_h_m + offs_i[None, :].to(tl.int64) * stride_h_i,
-        mask=m_mask[:, None] & i_mask[None, :], other=0.0,
+        h_ptr
+        + offs_m[:, None].to(tl.int64) * stride_h_m
+        + offs_i[None, :].to(tl.int64) * stride_h_i,
+        mask=m_mask[:, None] & i_mask[None, :],
+        other=0.0,
     ).to(tl.float32)
 
     if ACT_TYPE == 3:  # gelu (tanh approx)
@@ -173,7 +216,9 @@ def _pointwise_act_fwd_kernel(
         out = relu_x * relu_x
 
     tl.store(
-        a_ptr + offs_m[:, None].to(tl.int64) * stride_a_m + offs_i[None, :].to(tl.int64) * stride_a_i,
+        a_ptr
+        + offs_m[:, None].to(tl.int64) * stride_a_m
+        + offs_i[None, :].to(tl.int64) * stride_a_i,
         out.to(a_ptr.dtype.element_ty),
         mask=m_mask[:, None] & i_mask[None, :],
     )
@@ -181,12 +226,19 @@ def _pointwise_act_fwd_kernel(
 
 @triton.jit
 def _pointwise_act_bwd_kernel(
-    h_ptr, dh_ptr, da_ptr,
-    TK, I: tl.constexpr,
-    stride_h_m, stride_h_i,
-    stride_dh_m, stride_dh_i,
-    stride_da_m, stride_da_i,
-    BLOCK_M: tl.constexpr, BLOCK_I: tl.constexpr,
+    h_ptr,
+    dh_ptr,
+    da_ptr,
+    TK,
+    I: tl.constexpr,
+    stride_h_m,
+    stride_h_i,
+    stride_dh_m,
+    stride_dh_i,
+    stride_da_m,
+    stride_da_i,
+    BLOCK_M: tl.constexpr,
+    BLOCK_I: tl.constexpr,
     ACT_TYPE: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
@@ -197,12 +249,18 @@ def _pointwise_act_bwd_kernel(
     i_mask = offs_i < I
 
     x = tl.load(
-        h_ptr + offs_m[:, None].to(tl.int64) * stride_h_m + offs_i[None, :].to(tl.int64) * stride_h_i,
-        mask=m_mask[:, None] & i_mask[None, :], other=0.0,
+        h_ptr
+        + offs_m[:, None].to(tl.int64) * stride_h_m
+        + offs_i[None, :].to(tl.int64) * stride_h_i,
+        mask=m_mask[:, None] & i_mask[None, :],
+        other=0.0,
     ).to(tl.float32)
     da = tl.load(
-        da_ptr + offs_m[:, None].to(tl.int64) * stride_da_m + offs_i[None, :].to(tl.int64) * stride_da_i,
-        mask=m_mask[:, None] & i_mask[None, :], other=0.0,
+        da_ptr
+        + offs_m[:, None].to(tl.int64) * stride_da_m
+        + offs_i[None, :].to(tl.int64) * stride_da_i,
+        mask=m_mask[:, None] & i_mask[None, :],
+        other=0.0,
     ).to(tl.float32)
 
     if ACT_TYPE == 3:  # gelu (tanh approx)
@@ -223,7 +281,9 @@ def _pointwise_act_bwd_kernel(
         dx = da * tl.where(relu_mask, 2.0 * x, 0.0)
 
     tl.store(
-        dh_ptr + offs_m[:, None].to(tl.int64) * stride_dh_m + offs_i[None, :].to(tl.int64) * stride_dh_i,
+        dh_ptr
+        + offs_m[:, None].to(tl.int64) * stride_dh_m
+        + offs_i[None, :].to(tl.int64) * stride_dh_i,
         dx.to(dh_ptr.dtype.element_ty),
         mask=m_mask[:, None] & i_mask[None, :],
     )
@@ -243,17 +303,25 @@ def _launch_grid(TK, I, BLOCK_M=32, BLOCK_I=None):
     return (triton.cdiv(TK, BLOCK_M), triton.cdiv(I, BLOCK_I)), BLOCK_M, BLOCK_I
 
 
-def activation_fwd(h: torch.Tensor, I: int, activation_type: str, concat_layout: bool = False) -> torch.Tensor:
+def activation_fwd(
+    h: torch.Tensor, I: int, activation_type: str, concat_layout: bool = False
+) -> torch.Tensor:
     TK = h.shape[0]
 
     if activation_type in _GLU_ACT_MAP:
         a = torch.empty(TK, I, dtype=h.dtype, device=h.device)
         grid, BLOCK_M, BLOCK_I = _launch_grid(TK, I)
         _glu_fwd_kernel[grid](
-            h, a, TK, I,
-            h.stride(0), h.stride(1),
-            a.stride(0), a.stride(1),
-            BLOCK_M=BLOCK_M, BLOCK_I=BLOCK_I,
+            h,
+            a,
+            TK,
+            I,
+            h.stride(0),
+            h.stride(1),
+            a.stride(0),
+            a.stride(1),
+            BLOCK_M=BLOCK_M,
+            BLOCK_I=BLOCK_I,
             CONCAT_LAYOUT=concat_layout,
             ACT_TYPE=_GLU_ACT_MAP[activation_type],
         )
@@ -262,10 +330,16 @@ def activation_fwd(h: torch.Tensor, I: int, activation_type: str, concat_layout:
         a = torch.empty(TK, I, dtype=h.dtype, device=h.device)
         grid, BLOCK_M, BLOCK_I = _launch_grid(TK, I)
         _pointwise_act_fwd_kernel[grid](
-            h, a, TK, I,
-            h.stride(0), h.stride(1),
-            a.stride(0), a.stride(1),
-            BLOCK_M=BLOCK_M, BLOCK_I=BLOCK_I,
+            h,
+            a,
+            TK,
+            I,
+            h.stride(0),
+            h.stride(1),
+            a.stride(0),
+            a.stride(1),
+            BLOCK_M=BLOCK_M,
+            BLOCK_I=BLOCK_I,
             ACT_TYPE=_POINTWISE_ACT_MAP[activation_type],
         )
         return a
@@ -273,18 +347,32 @@ def activation_fwd(h: torch.Tensor, I: int, activation_type: str, concat_layout:
         raise NotImplementedError(f"activation_type={activation_type}")
 
 
-def activation_bwd(h: torch.Tensor, da: torch.Tensor, I: int, activation_type: str, concat_layout: bool = False) -> torch.Tensor:
+def activation_bwd(
+    h: torch.Tensor,
+    da: torch.Tensor,
+    I: int,
+    activation_type: str,
+    concat_layout: bool = False,
+) -> torch.Tensor:
     TK = h.shape[0]
 
     if activation_type in _GLU_ACT_MAP:
         dh = torch.empty_like(h)
         grid, BLOCK_M, BLOCK_I = _launch_grid(TK, I)
         _glu_bwd_kernel[grid](
-            h, dh, da, TK, I,
-            h.stride(0), h.stride(1),
-            dh.stride(0), dh.stride(1),
-            da.stride(0), da.stride(1),
-            BLOCK_M=BLOCK_M, BLOCK_I=BLOCK_I,
+            h,
+            dh,
+            da,
+            TK,
+            I,
+            h.stride(0),
+            h.stride(1),
+            dh.stride(0),
+            dh.stride(1),
+            da.stride(0),
+            da.stride(1),
+            BLOCK_M=BLOCK_M,
+            BLOCK_I=BLOCK_I,
             CONCAT_LAYOUT=concat_layout,
             ACT_TYPE=_GLU_ACT_MAP[activation_type],
         )
@@ -293,11 +381,19 @@ def activation_bwd(h: torch.Tensor, da: torch.Tensor, I: int, activation_type: s
         dh = torch.empty_like(h)
         grid, BLOCK_M, BLOCK_I = _launch_grid(TK, I)
         _pointwise_act_bwd_kernel[grid](
-            h, dh, da, TK, I,
-            h.stride(0), h.stride(1),
-            dh.stride(0), dh.stride(1),
-            da.stride(0), da.stride(1),
-            BLOCK_M=BLOCK_M, BLOCK_I=BLOCK_I,
+            h,
+            dh,
+            da,
+            TK,
+            I,
+            h.stride(0),
+            h.stride(1),
+            dh.stride(0),
+            dh.stride(1),
+            da.stride(0),
+            da.stride(1),
+            BLOCK_M=BLOCK_M,
+            BLOCK_I=BLOCK_I,
             ACT_TYPE=_POINTWISE_ACT_MAP[activation_type],
         )
         return dh

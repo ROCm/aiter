@@ -38,8 +38,13 @@ def moe_aux_loss_fwd(
         return out
     BLOCK_N = min(triton.next_power_of_2(N), 1024)
     _moe_aux_loss_fwd_kernel[(E,)](
-        probs, tokens_per_expert, out,
-        coeff_scaled, N, E, BLOCK_N,
+        probs,
+        tokens_per_expert,
+        out,
+        coeff_scaled,
+        N,
+        E,
+        BLOCK_N,
     )
     return out
 
@@ -71,14 +76,20 @@ def moe_aux_loss_bwd(
     num_experts: int,
 ) -> torch.Tensor:
     if num_tokens == 0:
-        return torch.empty(0, num_experts, dtype=torch.float32,
-                           device=tokens_per_expert.device)
-    grad_probs = torch.empty(num_tokens, num_experts, dtype=torch.float32,
-                             device=tokens_per_expert.device)
+        return torch.empty(
+            0, num_experts, dtype=torch.float32, device=tokens_per_expert.device
+        )
+    grad_probs = torch.empty(
+        num_tokens, num_experts, dtype=torch.float32, device=tokens_per_expert.device
+    )
     scale = coeff_scaled * grad_aux_loss.item()
     BLOCK_N = min(triton.next_power_of_2(num_tokens), 1024)
     _moe_aux_loss_bwd_kernel[(num_experts,)](
-        tokens_per_expert, grad_probs,
-        scale, num_tokens, num_experts, BLOCK_N,
+        tokens_per_expert,
+        grad_probs,
+        scale,
+        num_tokens,
+        num_experts,
+        BLOCK_N,
     )
     return grad_probs

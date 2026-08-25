@@ -1,5 +1,3 @@
-from typing import Optional
-
 import torch
 import triton
 import triton.language as tl
@@ -33,7 +31,8 @@ def _router_forward(
 
 
 @torch.library.custom_op(
-    f"{LIBRARY_NAME}::_softmax_topk_fwd_rocm", mutates_args={"topk_router_score", "topk_router_indices"}
+    f"{LIBRARY_NAME}::_softmax_topk_fwd_rocm",
+    mutates_args={"topk_router_score", "topk_router_indices"},
 )
 def _topk_softmax_fwd(
     router_logits: torch.Tensor,
@@ -82,9 +81,15 @@ def _softmax_over_topk_bwd_kernel(
     k_offs = tl.arange(0, BLOCK_K)
     k_mask = k_offs < K
 
-    idx = tl.load(idx_ptr + row * stride_im + k_offs * stride_ik, mask=k_mask, other=0).to(tl.int32)
-    s_sel = tl.load(score_ptr + row * stride_sm + k_offs * stride_sn, mask=k_mask, other=0).to(tl.float32)
-    g_sel = tl.load(dscore_ptr + row * stride_gm + k_offs * stride_gk, mask=k_mask, other=0).to(tl.float32)
+    idx = tl.load(
+        idx_ptr + row * stride_im + k_offs * stride_ik, mask=k_mask, other=0
+    ).to(tl.int32)
+    s_sel = tl.load(
+        score_ptr + row * stride_sm + k_offs * stride_sn, mask=k_mask, other=0
+    ).to(tl.float32)
+    g_sel = tl.load(
+        dscore_ptr + row * stride_gm + k_offs * stride_gk, mask=k_mask, other=0
+    ).to(tl.float32)
 
     dot = tl.sum(g_sel * s_sel, axis=0)
     add_vals = s_sel * (g_sel - dot)
@@ -122,7 +127,11 @@ def _topk_over_softmax_bwd_kernel(
 
     e_offs = tl.arange(0, BLOCK_E)
     e_mask = e_offs < E
-    logits = tl.load(logits_ptr + row * stride_lm + e_offs * stride_le, mask=e_mask, other=-float("inf")).to(tl.float32)
+    logits = tl.load(
+        logits_ptr + row * stride_lm + e_offs * stride_le,
+        mask=e_mask,
+        other=-float("inf"),
+    ).to(tl.float32)
     row_max = tl.max(logits, axis=0)
     exp_vals = tl.exp(logits - row_max)
     row_sum = tl.sum(exp_vals, axis=0)
@@ -130,14 +139,22 @@ def _topk_over_softmax_bwd_kernel(
 
     k_offs = tl.arange(0, BLOCK_K)
     k_mask = k_offs < K
-    idx = tl.load(idx_ptr + row * stride_im + k_offs * stride_ik, mask=k_mask, other=0).to(tl.int32)
-    g_sel = tl.load(dscore_ptr + row * stride_sm + k_offs * stride_sn, mask=k_mask, other=0).to(tl.float32)
+    idx = tl.load(
+        idx_ptr + row * stride_im + k_offs * stride_ik, mask=k_mask, other=0
+    ).to(tl.int32)
+    g_sel = tl.load(
+        dscore_ptr + row * stride_sm + k_offs * stride_sn, mask=k_mask, other=0
+    ).to(tl.float32)
 
-    sel_logits = tl.load(logits_ptr + row * stride_lm + idx * stride_le, mask=k_mask, other=-float("inf")).to(tl.float32)
+    sel_logits = tl.load(
+        logits_ptr + row * stride_lm + idx * stride_le, mask=k_mask, other=-float("inf")
+    ).to(tl.float32)
     p_sel = tl.exp(sel_logits - row_max) / row_sum
 
     if norm_topk_probs:
-        scores = tl.load(score_ptr + row * stride_scm + k_offs * stride_scn, mask=k_mask, other=0).to(tl.float32)
+        scores = tl.load(
+            score_ptr + row * stride_scm + k_offs * stride_scn, mask=k_mask, other=0
+        ).to(tl.float32)
         dot_s = tl.sum(g_sel * scores, axis=0)
         S = tl.sum(p_sel, axis=0)
         dp_sel = (g_sel - dot_s) / S
@@ -156,11 +173,13 @@ def _topk_over_softmax_bwd_kernel(
     tl.store(dlogits_ptr + row * stride_dm + e_offs * stride_dn, dlogits, mask=e_mask)
 
 
-@torch.library.custom_op(f"{LIBRARY_NAME}::_topk_softmax_bwd_rocm", mutates_args={"dlogits_full"})
+@torch.library.custom_op(
+    f"{LIBRARY_NAME}::_topk_softmax_bwd_rocm", mutates_args={"dlogits_full"}
+)
 def _topk_softmax_bwd(
     router_logits: torch.Tensor,
     dlogits_full: torch.Tensor,
-    dlogits: Optional[torch.Tensor],
+    dlogits: torch.Tensor | None,
     dtopk_score: torch.Tensor,
     topk_router_score: torch.Tensor,
     topk_router_indices: torch.Tensor,

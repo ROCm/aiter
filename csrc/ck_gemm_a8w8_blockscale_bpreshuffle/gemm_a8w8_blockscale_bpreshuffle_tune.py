@@ -1,14 +1,16 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+from typing import ClassVar
+
 import torch
 import torch.nn.functional as F
-from aiter.jit.core import AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE
 from einops import rearrange
 from gemm_a8w8_blockscale_bpreshuffle_common import kernels_list
 
 import aiter
 from aiter import dtypes
+from aiter.jit.core import AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE
 from aiter.ops.shuffle import shuffle_weight
 from aiter.utility.base_tuner import GemmCommonTuner
 from aiter.utility.mp_tuner import mp_tuner
@@ -17,7 +19,7 @@ block_shape = (128, 128)
 
 
 class Gemma8W8BlockScaleBPreShuffleTuner(GemmCommonTuner):
-    ARG_DEFAULTS = {
+    ARG_DEFAULTS: ClassVar[dict] = {
         **GemmCommonTuner.ARG_DEFAULTS,
         "tune_file": f"{AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE}",
         "untune_file": "aiter/configs/a8w8_blockscale_bpreshuffle_untuned_gemm.csv",
@@ -144,15 +146,15 @@ class Gemma8W8BlockScaleBPreShuffleTuner(GemmCommonTuner):
         useSplitK = args.splitK
         shape_grouped = False
         mp_num = args.mp
-        cu_num = self.get_cu_num()
+        self.get_cu_num()
         task = []
         tasks_data = []
 
         seed = 0
         for i in range(len(untunedf)):
-            M = untunedf.loc[i, "M"]
-            N = untunedf.loc[i, "N"]
-            K = untunedf.loc[i, "K"]
+            untunedf.loc[i, "M"]
+            untunedf.loc[i, "N"]
+            untunedf.loc[i, "K"]
             seed = seed + 1
             total_kernel_nums = 0
 

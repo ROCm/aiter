@@ -12,6 +12,7 @@ import torch.nn.functional as F
 
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
+
 def _load_module(name, path):
     spec = importlib.util.spec_from_file_location(name, path)
     mod = importlib.util.module_from_spec(spec)
@@ -19,9 +20,18 @@ def _load_module(name, path):
     spec.loader.exec_module(mod)
     return mod
 
+
 _load_module(
     "aiter.ops.triton._triton_kernels.attention.dsv4_indexer",
-    os.path.join(_REPO, "aiter", "ops", "triton", "_triton_kernels", "attention", "dsv4_indexer.py"),
+    os.path.join(
+        _REPO,
+        "aiter",
+        "ops",
+        "triton",
+        "_triton_kernels",
+        "attention",
+        "dsv4_indexer.py",
+    ),
 )
 _wrapper = _load_module(
     "aiter.ops.triton.attention.dsv4_indexer",
@@ -37,7 +47,7 @@ torch.set_default_device("cuda")
 
 def ref_indexer_fwd(q, k, w, compress_ratio):
     """PyTorch reference: q=[S,H,Hd], k=[P,Hd], w=[S,H] → scores=[S,P]."""
-    S, H, Hd = q.shape
+    S, _H, _Hd = q.shape
     P = k.shape[0]
 
     dot = torch.einsum("shd,pd->shp", q.float(), k.float())
@@ -54,10 +64,10 @@ def ref_indexer_fwd(q, k, w, compress_ratio):
 TEST_CONFIGS = [
     # (S, H, Hd, P) — compress_ratio = S // P
     # Basic shapes
-    (64,  4,  32,  16),
-    (128, 8,  64,  32),
-    (256, 8,  128, 64),
-    (512, 8,  128, 128),
+    (64, 4, 32, 16),
+    (128, 8, 64, 32),
+    (256, 8, 128, 64),
+    (512, 8, 128, 128),
     (1024, 8, 128, 256),
     # H=16 (from Miles test suite)
     (128, 16, 128, 32),
@@ -101,7 +111,9 @@ def test_fwd():
         inf_match = (torch.isneginf(ref) == torch.isneginf(out)).all().item()
 
         status = "PASS" if cos > 0.999 and inf_match else "FAIL"
-        print(f"  S={S} H={H} Hd={Hd} P={P} cr={compress_ratio} ... cos={cos:.6f} inf_ok={inf_match} {status}")
+        print(
+            f"  S={S} H={H} Hd={Hd} P={P} cr={compress_ratio} ... cos={cos:.6f} inf_ok={inf_match} {status}"
+        )
         assert status == "PASS", f"FWD failed: cos={cos}, inf_ok={inf_match}"
 
 
@@ -128,7 +140,9 @@ def test_bwd():
         s_idx = torch.arange(S, device=q.device)[:, None]
         p_idx = torch.arange(P, device=q.device)[None, :]
         allowed = (p_idx + 1) * compress_ratio - 1 <= s_idx
-        scores_ref = torch.where(allowed, scores_ref, torch.tensor(0.0, device=q.device))
+        scores_ref = torch.where(
+            allowed, scores_ref, torch.tensor(0.0, device=q.device)
+        )
 
         (scores_ref * d_scores).sum().backward()
         ref_dq = q_f.grad
@@ -141,8 +155,12 @@ def test_bwd():
         dk_cos = F.cosine_similarity(ref_dk.reshape(1, -1), dk.reshape(1, -1)).item()
         dw_cos = F.cosine_similarity(ref_dw.reshape(1, -1), dw.reshape(1, -1)).item()
 
-        status = "PASS" if dq_cos > 0.999 and dk_cos > 0.999 and dw_cos > 0.999 else "FAIL"
-        print(f"  S={S} H={H} Hd={Hd} P={P} cr={compress_ratio} ... dq={dq_cos:.6f} dk={dk_cos:.6f} dw={dw_cos:.6f} {status}")
+        status = (
+            "PASS" if dq_cos > 0.999 and dk_cos > 0.999 and dw_cos > 0.999 else "FAIL"
+        )
+        print(
+            f"  S={S} H={H} Hd={Hd} P={P} cr={compress_ratio} ... dq={dq_cos:.6f} dk={dk_cos:.6f} dw={dw_cos:.6f} {status}"
+        )
         assert status == "PASS", f"BWD failed: dq={dq_cos}, dk={dk_cos}, dw={dw_cos}"
 
 
@@ -154,14 +172,16 @@ def test_autograd():
         k = torch.randn(P, Hd, dtype=torch.bfloat16, requires_grad=True)
         w = (torch.randn(S, H, dtype=torch.float32) * 0.1).requires_grad_(True)
 
-        scores, indices = dsv4_indexer(q, k, w, compress_ratio, topk=min(512, P))
+        scores, _indices = dsv4_indexer(q, k, w, compress_ratio, topk=min(512, P))
         valid = scores != float("-inf")
         loss = scores[valid].sum()
         loss.backward()
 
         ok = q.grad is not None and k.grad is not None and w.grad is not None
         status = "PASS" if ok else "FAIL"
-        print(f"  S={S} H={H} Hd={Hd} P={P} cr={compress_ratio} ... grads_exist={ok} {status}")
+        print(
+            f"  S={S} H={H} Hd={Hd} P={P} cr={compress_ratio} ... grads_exist={ok} {status}"
+        )
         assert status == "PASS", "AUTOGRAD failed"
 
 

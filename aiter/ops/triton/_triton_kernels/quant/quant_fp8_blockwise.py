@@ -38,7 +38,9 @@ def quant_fp8_blockwise_kernel(
     x_tile = tl.load(x_ptrs, mask=mask, other=0.0).to(tl.float32)
     x_tile_abs = tl.abs(x_tile)
 
-    x_fp8_tile, x_scales_tile = compute_scale_and_quant(x_tile, x_tile_abs, AXIS, FP8_MAX)
+    x_fp8_tile, x_scales_tile = compute_scale_and_quant(
+        x_tile, x_tile_abs, AXIS, FP8_MAX
+    )
 
     # Store
     x_fp8_ptrs = x_fp8_ptr + offs_m[:, None] * N + offs_n[None, :]
@@ -60,7 +62,9 @@ def quant_fp8_blockwise_kernel(
 
 
 @triton.jit
-def compute_m_range(pid, batch_size, seg_indptr, scales_seg_indptr_ptr, BLOCK_SIZE: tl.constexpr):
+def compute_m_range(
+    pid, batch_size, seg_indptr, scales_seg_indptr_ptr, BLOCK_SIZE: tl.constexpr
+):
     bid = 0
     for bs in range(batch_size):
         tiles = tl.load(scales_seg_indptr_ptr + bs)
@@ -92,7 +96,7 @@ def quant_fp8_blockwise_segment_m_kernel(
     if pid_m >= total_m_block:
         return
 
-    m_range_start, m_range_end, bid = compute_m_range(
+    m_range_start, m_range_end, _bid = compute_m_range(
         pid_m, batch_size, seg_indptr, scales_seg_indptr_ptr, BLOCK_SIZE
     )
     if m_range_end - m_range_start == 0:
@@ -196,16 +200,24 @@ def quant_fp8_blockwise_for_act_grad_kernel(
     x_tile_abs = tl.abs(x_tile)
 
     # Row-wise quantization
-    x_fp8_tile_row, x_scales_tile_row = compute_scale_and_quant(x_tile, x_tile_abs, 1, FP8_MAX)
+    x_fp8_tile_row, x_scales_tile_row = compute_scale_and_quant(
+        x_tile, x_tile_abs, 1, FP8_MAX
+    )
 
     # Col-wise quantization
-    x_fp8_tile_col, x_scales_tile_col = compute_scale_and_quant(x_tile, x_tile_abs, 0, FP8_MAX)
+    x_fp8_tile_col, x_scales_tile_col = compute_scale_and_quant(
+        x_tile, x_tile_abs, 0, FP8_MAX
+    )
 
     # Store
     x_fp8_row_ptrs = x_fp8_row_ptr + offs_m[:, None] * N + offs_n[None, :]
     x_fp8_col_ptrs = x_fp8_col_ptr + offs_m[:, None] * N + offs_n[None, :]
-    tl.store(x_fp8_row_ptrs, x_fp8_tile_row.to(x_fp8_row_ptr.dtype.element_ty), mask=mask)
-    tl.store(x_fp8_col_ptrs, x_fp8_tile_col.to(x_fp8_col_ptr.dtype.element_ty), mask=mask)
+    tl.store(
+        x_fp8_row_ptrs, x_fp8_tile_row.to(x_fp8_row_ptr.dtype.element_ty), mask=mask
+    )
+    tl.store(
+        x_fp8_col_ptrs, x_fp8_tile_col.to(x_fp8_col_ptr.dtype.element_ty), mask=mask
+    )
 
     # Store row-wise scales inverse: [M, N // BLOCK_SIZE]
     row_scale_offs = offs_m * tl.cdiv(N, BLOCK_SIZE) + pid_n
@@ -255,24 +267,28 @@ def requant_fp8_row_to_col_kernel(
     # Load FP8 tile and dequant to float32 using saved row scales.
     # Row scale index: each row has K//BLOCK_SIZE scales; tile (pid_m, pid_k) reads
     # one scale per row — the scale for the pid_k-th block along K.
-    x_fp8_tile = tl.load(x_fp8_ptr + offs_m[:, None] * K + offs_k[None, :],
-                         mask=mask, other=0.0)
+    x_fp8_tile = tl.load(
+        x_fp8_ptr + offs_m[:, None] * K + offs_k[None, :], mask=mask, other=0.0
+    )
     x_f32 = x_fp8_tile.to(tl.float32)
 
     row_scale_offs = offs_m * tl.cdiv(K, BLOCK_SIZE) + pid_k
     row_scales = tl.load(x_scales_ptr + row_scale_offs, mask=offs_m < M, other=1.0)
-    x_f32 = x_f32 * row_scales[:, None]   # broadcast: (BLOCK,1) * (BLOCK, BLOCK)
+    x_f32 = x_f32 * row_scales[:, None]  # broadcast: (BLOCK,1) * (BLOCK, BLOCK)
 
     # Col-wise (axis=0) requant: one scale per column in this tile.
     x_abs = tl.abs(x_f32)
-    col_amax = tl.max(x_abs, axis=0, keep_dims=True)   # (1, BLOCK)
+    col_amax = tl.max(x_abs, axis=0, keep_dims=True)  # (1, BLOCK)
     col_amax = tl.maximum(col_amax, 1e-4)
     col_scale = FP8_MAX / col_amax
     y_f32 = tl.clamp(x_f32 * col_scale, min=-FP8_MAX, max=FP8_MAX)
 
-    tl.store(y_fp8_ptr + offs_m[:, None] * K + offs_k[None, :],
-             y_f32.to(y_fp8_ptr.dtype.element_ty), mask=mask)
+    tl.store(
+        y_fp8_ptr + offs_m[:, None] * K + offs_k[None, :],
+        y_f32.to(y_fp8_ptr.dtype.element_ty),
+        mask=mask,
+    )
 
     # Col dequant scales: shape (M//BLOCK_SIZE, K), one float per column element.
-    col_scale_inv = tl.reshape(1.0 / col_scale, BLOCK_SIZE)   # (BLOCK,) dequant per col
+    col_scale_inv = tl.reshape(1.0 / col_scale, BLOCK_SIZE)  # (BLOCK,) dequant per col
     tl.store(y_scales_ptr + pid_m * K + offs_k, col_scale_inv, mask=offs_k < K)

@@ -16,10 +16,10 @@ Convention (TN layout):
     ``out[tokens_for_e] = lhs[tokens_for_e] @ rhs[e]^T * x_scale * w_scale``
 """
 
-from typing import Optional
 
 import torch
 import triton
+
 from aiter.ops.triton._triton_kernels.moe.moe_gemm_per_token import (
     _moe_gemm_per_token_kernel,
 )
@@ -60,10 +60,14 @@ def _build_block_mapping(
         )
 
     block_expert_ids = torch.tensor(
-        expert_ids_list, dtype=torch.int32, device=group_sizes.device,
+        expert_ids_list,
+        dtype=torch.int32,
+        device=group_sizes.device,
     )
     block_token_offsets = torch.tensor(
-        offsets_list, dtype=torch.int32, device=group_sizes.device,
+        offsets_list,
+        dtype=torch.int32,
+        device=group_sizes.device,
     )
     return block_expert_ids, block_token_offsets, len(expert_ids_list)
 
@@ -74,7 +78,7 @@ def moe_gemm_per_token(
     x_scale: torch.Tensor,
     w_scale: torch.Tensor,
     group_sizes: torch.Tensor,
-    bias: Optional[torch.Tensor] = None,
+    bias: torch.Tensor | None = None,
     out_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
     """Fused per-token-scaled grouped GEMM for MoE.
@@ -98,7 +102,7 @@ def moe_gemm_per_token(
     )
 
     total_tokens = lhs.shape[0]
-    E = rhs.shape[0]
+    rhs.shape[0]
     N = rhs.shape[1]
     K = rhs.shape[2]
 
@@ -113,7 +117,8 @@ def moe_gemm_per_token(
         return out
 
     block_expert_ids, block_token_offsets, total_m_blocks = _build_block_mapping(
-        group_sizes, BLOCK_M,
+        group_sizes,
+        BLOCK_M,
     )
 
     if total_m_blocks == 0:

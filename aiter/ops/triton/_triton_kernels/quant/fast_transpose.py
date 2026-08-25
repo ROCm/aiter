@@ -4,10 +4,14 @@ import triton.language as tl
 
 @triton.jit
 def _transpose_2d_kernel(
-    IN_ptr, OUT_ptr,
-    M, N,
-    stride_in_m, stride_in_n,
-    stride_out_n, stride_out_m,
+    IN_ptr,
+    OUT_ptr,
+    M,
+    N,
+    stride_in_m,
+    stride_in_n,
+    stride_out_n,
+    stride_out_m,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):

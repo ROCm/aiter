@@ -1,6 +1,6 @@
 # op_tests/test_moe_aux_loss.py
-import torch
 import pytest
+import torch
 
 torch.set_default_device("cuda")
 

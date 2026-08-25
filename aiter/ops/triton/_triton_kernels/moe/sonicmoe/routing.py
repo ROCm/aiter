@@ -7,7 +7,11 @@ import torch
 import triton
 import triton.language as tl
 
-from .bitmatrix import _bitmatrix_metadata_compute_stage1, _bitmatrix_metadata_compute_stage2, _keyed_add
+from .bitmatrix import (
+    _bitmatrix_metadata_compute_stage1,
+    _bitmatrix_metadata_compute_stage2,
+    _keyed_add,
+)
 
 
 @triton.jit
@@ -66,7 +70,7 @@ def _compute_col_partial_sum_kernel(
 
 
 @torch.library.custom_op(
-    f"triton_kernels::TC_topk_router_metadata",
+    "triton_kernels::TC_topk_router_metadata",
     mutates_args={
         "expert_frequency",
         "expert_frequency_offset",
@@ -217,7 +221,9 @@ def _general_metadata_compute_stage2(
     within_expert_rank = (inclusive_run_lengths - 1) & 0xFFFF
 
     # Output position = expert_offs[e] + partial_sum[tile, e] + within_expert_rank.
-    s_reverse_scatter_val = tl.load(partial_sum_ptr + pid_m + expert * n_tiles, mask=mask)
+    s_reverse_scatter_val = tl.load(
+        partial_sum_ptr + pid_m + expert * n_tiles, mask=mask
+    )
     s_reverse_scatter_val += tl.load(expert_offs_ptr + expert, mask=mask)
     s_reverse_scatter_val += within_expert_rank
 

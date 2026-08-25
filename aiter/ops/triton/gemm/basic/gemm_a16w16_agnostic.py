@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-from typing import Optional
+import torch
 import triton
+
+from aiter.ops.triton._triton_kernels.activation import _get_activation_from_str
 from aiter.ops.triton._triton_kernels.gemm_a16w16_agnostic import (
     _gemm_a16_w16_kernel,
     _get_config,
@@ -15,10 +17,10 @@ _LOGGER = AiterTritonLogger()
 def gemm_a16w16(
     x,
     w,
-    dtype: Optional[float] = torch.bfloat16,
-    y: Optional[torch.Tensor] = None,
-    config: Optional[dict] = None,
-    activation: Optional[str] = None,
+    dtype: float | None = torch.bfloat16,
+    y: torch.Tensor | None = None,
+    config: dict | None = None,
+    activation: str | None = None,
 ):
     """
     Computes the 16 bit matmul Y = X x W
@@ -50,7 +52,7 @@ def gemm_a16w16(
     if config is None:
         config = _get_config(M, N, K)
 
-    grid = lambda META: (  # noqa: E731
+    grid = lambda META: (
         triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
     )
     _gemm_a16_w16_kernel[grid](

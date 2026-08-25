@@ -12,10 +12,10 @@ Convention (TN layout):
 where both lhs and rhs are stored in FP8 with per-block E8M0 scales.
 """
 
-from typing import Optional
 
 import torch
 import triton
+
 from aiter.ops.triton._triton_kernels.moe.moe_gemm_mxfp8 import (
     _moe_gemm_mxfp8_kernel,
 )
@@ -51,10 +51,14 @@ def _build_block_mapping(
         )
 
     block_expert_ids = torch.tensor(
-        expert_ids_list, dtype=torch.int32, device=group_sizes.device,
+        expert_ids_list,
+        dtype=torch.int32,
+        device=group_sizes.device,
     )
     block_token_offsets = torch.tensor(
-        offsets_list, dtype=torch.int32, device=group_sizes.device,
+        offsets_list,
+        dtype=torch.int32,
+        device=group_sizes.device,
     )
     return block_expert_ids, block_token_offsets, len(expert_ids_list)
 
@@ -66,7 +70,7 @@ def moe_gemm_mxfp8(
     w_scale: torch.Tensor,
     group_sizes: torch.Tensor,
     quant_block_size: int = 32,
-    bias: Optional[torch.Tensor] = None,
+    bias: torch.Tensor | None = None,
     out_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
     """Fused MXFP8 grouped GEMM for MoE.
@@ -91,7 +95,7 @@ def moe_gemm_mxfp8(
     )
 
     total_tokens = lhs.shape[0]
-    E = rhs.shape[0]
+    rhs.shape[0]
     N = rhs.shape[1]
     K = rhs.shape[2]
 
@@ -104,7 +108,8 @@ def moe_gemm_mxfp8(
         return out
 
     block_expert_ids, block_token_offsets, total_m_blocks = _build_block_mapping(
-        group_sizes, BLOCK_M,
+        group_sizes,
+        BLOCK_M,
     )
 
     if total_m_blocks == 0:

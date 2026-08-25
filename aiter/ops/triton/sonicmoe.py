@@ -5,17 +5,19 @@
 # Ported from sonic-moe/sonicmoe/functional_rocm/.
 
 from aiter.ops.triton._triton_kernels.moe.sonicmoe import (
-    moe_TC_softmax_topk_layer,
     moe_general_routing_inputs,
+    moe_TC_softmax_topk_layer,
 )
 from aiter.ops.triton._triton_kernels.moe.sonicmoe.enums import (
     ActivationType as SonicMoEActivationType,
+)
+from aiter.ops.triton._triton_kernels.moe.sonicmoe.enums import (
     is_glu as sonicmoe_is_glu,
 )
 
 __all__ = [
+    "SonicMoEActivationType",
     "moe_TC_softmax_topk_layer",
     "moe_general_routing_inputs",
-    "SonicMoEActivationType",
     "sonicmoe_is_glu",
 ]

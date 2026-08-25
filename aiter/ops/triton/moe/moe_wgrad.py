@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+
 import torch
 import triton
 import triton.language as tl
-from typing import Optional, Dict
 
 from aiter.ops.triton.utils._triton.pid_preprocessing import remap_xcd
 from aiter.ops.triton.utils.device_info import get_num_xcds
@@ -14,27 +14,33 @@ def _get_autotune_configs():
     return [
         triton.Config(
             {"BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 64},
-            num_warps=4, num_stages=2,
+            num_warps=4,
+            num_stages=2,
         ),
         triton.Config(
             {"BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 128},
-            num_warps=4, num_stages=2,
+            num_warps=4,
+            num_stages=2,
         ),
         triton.Config(
             {"BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 64},
-            num_warps=8, num_stages=2,
+            num_warps=8,
+            num_stages=2,
         ),
         triton.Config(
             {"BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128},
-            num_warps=8, num_stages=2,
+            num_warps=8,
+            num_stages=2,
         ),
         triton.Config(
             {"BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 64},
-            num_warps=8, num_stages=2,
+            num_warps=8,
+            num_stages=2,
         ),
         triton.Config(
             {"BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128},
-            num_warps=4, num_stages=2,
+            num_warps=4,
+            num_stages=2,
         ),
     ]
 
@@ -171,7 +177,7 @@ def moe_wgrad(
     Returns:
         dW tensor with shape weight_shape.
     """
-    E, N, K = weight_shape
+    _E, N, K = weight_shape
 
     dW = torch.zeros(weight_shape, dtype=grad.dtype, device=grad.device)
 

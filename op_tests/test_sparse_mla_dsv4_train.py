@@ -13,6 +13,7 @@ import torch
 # Instead, directly import the pure-Python/Triton modules.
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
+
 def _load_module(name, path):
     spec = importlib.util.spec_from_file_location(name, path)
     mod = importlib.util.module_from_spec(spec)
@@ -20,13 +21,24 @@ def _load_module(name, path):
     spec.loader.exec_module(mod)
     return mod
 
+
 _kernel_mod = _load_module(
     "aiter.ops.triton._triton_kernels.attention.sparse_mla_dsv4_train",
-    os.path.join(_REPO, "aiter", "ops", "triton", "_triton_kernels", "attention", "sparse_mla_dsv4_train.py"),
+    os.path.join(
+        _REPO,
+        "aiter",
+        "ops",
+        "triton",
+        "_triton_kernels",
+        "attention",
+        "sparse_mla_dsv4_train.py",
+    ),
 )
 _wrapper_mod = _load_module(
     "aiter.ops.triton.attention.sparse_mla_dsv4_train",
-    os.path.join(_REPO, "aiter", "ops", "triton", "attention", "sparse_mla_dsv4_train.py"),
+    os.path.join(
+        _REPO, "aiter", "ops", "triton", "attention", "sparse_mla_dsv4_train.py"
+    ),
 )
 
 sparse_mla_fwd = _wrapper_mod.sparse_mla_fwd
@@ -41,7 +53,7 @@ torch.set_default_device("cuda")
 def ref_sparse_mla_fwd(q, kv, attn_sink, indices, scale):
     """Pure-PyTorch forward: q=[N,H,D], kv=[N_kv,D], indices=[N,topk]."""
     N, H, D = q.shape
-    topk = indices.shape[1]
+    indices.shape[1]
 
     # Gather KV: [N, topk, D]
     idx_clamped = indices.clamp(min=0).long()
@@ -65,7 +77,7 @@ def ref_sparse_mla_fwd(q, kv, attn_sink, indices, scale):
     # Softmax
     m = scores.max(dim=-1, keepdim=True).values
     exp_scores = torch.exp(scores - m)
-    l = exp_scores.sum(dim=-1, keepdim=True)  # noqa: E741
+    l = exp_scores.sum(dim=-1, keepdim=True)
     p = exp_scores / l.clamp(min=1e-30)
 
     # Output: [N, H, D]
@@ -90,13 +102,15 @@ def max_abs_err(a, b):
 
 
 def test_fwd(N, H, D, N_kv, topk, has_sink=True):
-    print(f"  FWD  N={N} H={H} D={D} N_kv={N_kv} topk={topk} sink={has_sink} ...", end=" ")
+    print(
+        f"  FWD  N={N} H={H} D={D} N_kv={N_kv} topk={topk} sink={has_sink} ...", end=" "
+    )
 
     q = torch.randn(N, H, D, dtype=torch.bfloat16)
     kv = torch.randn(N_kv, D, dtype=torch.bfloat16)
     indices = torch.randint(0, N_kv, (N, topk), dtype=torch.int32)
     attn_sink = torch.randn(H, dtype=torch.float32) * 0.1 if has_sink else None
-    scale = 1.0 / (D ** 0.5)
+    scale = 1.0 / (D**0.5)
 
     out, lse = sparse_mla_fwd(q, kv, attn_sink, indices, scale)
     ref_out, ref_lse = ref_sparse_mla_fwd(q, kv, attn_sink, indices, scale)
@@ -111,16 +125,22 @@ def test_fwd(N, H, D, N_kv, topk, has_sink=True):
 
 
 def test_bwd(N, H, D, N_kv, topk, has_sink=True):
-    print(f"  BWD  N={N} H={H} D={D} N_kv={N_kv} topk={topk} sink={has_sink} ...", end=" ")
+    print(
+        f"  BWD  N={N} H={H} D={D} N_kv={N_kv} topk={topk} sink={has_sink} ...", end=" "
+    )
 
     q = torch.randn(N, H, D, dtype=torch.bfloat16, requires_grad=True)
     kv = torch.randn(N_kv, D, dtype=torch.bfloat16, requires_grad=True)
     indices = torch.randint(0, N_kv, (N, topk), dtype=torch.int32)
-    attn_sink = (torch.randn(H, dtype=torch.float32) * 0.1).requires_grad_(True) if has_sink else None
-    scale = 1.0 / (D ** 0.5)
+    attn_sink = (
+        (torch.randn(H, dtype=torch.float32) * 0.1).requires_grad_(True)
+        if has_sink
+        else None
+    )
+    scale = 1.0 / (D**0.5)
 
     # Reference forward + backward
-    ref_out, ref_lse = ref_sparse_mla_fwd(q, kv, attn_sink, indices, scale)
+    ref_out, _ref_lse = ref_sparse_mla_fwd(q, kv, attn_sink, indices, scale)
     do = torch.randn_like(ref_out)
     ref_out.backward(do)
     ref_dq = q.grad.clone()
@@ -133,10 +153,22 @@ def test_bwd(N, H, D, N_kv, topk, has_sink=True):
         attn_sink.grad = None
 
     # Triton forward + backward
-    out, lse = sparse_mla_fwd(q.detach(), kv.detach(), attn_sink.detach() if has_sink else None, indices, scale)
+    out, lse = sparse_mla_fwd(
+        q.detach(),
+        kv.detach(),
+        attn_sink.detach() if has_sink else None,
+        indices,
+        scale,
+    )
     dq, dkv, d_sink = sparse_mla_bwd(
-        q.detach(), kv.detach(), out, do, indices, lse,
-        attn_sink.detach() if has_sink else None, scale,
+        q.detach(),
+        kv.detach(),
+        out,
+        do,
+        indices,
+        lse,
+        attn_sink.detach() if has_sink else None,
+        scale,
     )
 
     cs_dq = cos_sim(dq, ref_dq)
@@ -155,13 +187,20 @@ def test_bwd(N, H, D, N_kv, topk, has_sink=True):
 
 
 def test_autograd(N, H, D, N_kv, topk, has_sink=True):
-    print(f"  AUTOGRAD  N={N} H={H} D={D} N_kv={N_kv} topk={topk} sink={has_sink} ...", end=" ")
+    print(
+        f"  AUTOGRAD  N={N} H={H} D={D} N_kv={N_kv} topk={topk} sink={has_sink} ...",
+        end=" ",
+    )
 
     q = torch.randn(N, H, D, dtype=torch.bfloat16, requires_grad=True)
     kv = torch.randn(N_kv, D, dtype=torch.bfloat16, requires_grad=True)
     indices = torch.randint(0, N_kv, (N, topk), dtype=torch.int32)
-    attn_sink = (torch.randn(H, dtype=torch.float32) * 0.1).requires_grad_(True) if has_sink else None
-    scale = 1.0 / (D ** 0.5)
+    attn_sink = (
+        (torch.randn(H, dtype=torch.float32) * 0.1).requires_grad_(True)
+        if has_sink
+        else None
+    )
+    scale = 1.0 / (D**0.5)
 
     out = sparse_mla_dsv4_train(q, kv, attn_sink, indices, scale)
     do = torch.randn_like(out)

@@ -37,8 +37,14 @@ if quant is not None:
     __all__.append("quant")
 
 try:
-    from .cross_entropy import cross_entropy_forward, cross_entropy_backward
-    __all__.extend(["cross_entropy_forward", "cross_entropy_backward"])
+    from .cross_entropy import (
+        cross_entropy_backward as cross_entropy_backward,
+    )
+    from .cross_entropy import (
+        cross_entropy_forward as cross_entropy_forward,
+    )
+
+    __all__.extend(["cross_entropy_backward", "cross_entropy_forward"])
 except (ImportError, AttributeError):
     pass
 

@@ -26,12 +26,14 @@ def indexer_fwd(q, k, w, compress_ratio):
     Returns:
         scores: [S, P] fp32
     """
-    S, H, Hd = q.shape
+    S, _H, _Hd = q.shape
     P = k.shape[0]
     with torch.no_grad():
         dot = torch.einsum("shd,pd->shp", q.float(), k.float())
         scores = (F.relu(dot) * w.float().unsqueeze(-1)).sum(dim=1)
-        scores = torch.where(_causal_mask(S, P, compress_ratio, q.device), scores, float("-inf"))
+        scores = torch.where(
+            _causal_mask(S, P, compress_ratio, q.device), scores, float("-inf")
+        )
     return scores
 
 
@@ -50,7 +52,7 @@ def indexer_bwd(q, k, w, d_scores, compress_ratio):
         dk: [P, Hd] fp32
         dw: [S, H] fp32
     """
-    S, H, Hd = q.shape
+    S, _H, _Hd = q.shape
     P = k.shape[0]
 
     q_f = q.float().requires_grad_(True)
@@ -80,12 +82,14 @@ def dsv4_indexer(q, k, w, compress_ratio, topk):
         scores: [S, eff_topk] fp32
         indices: [S, eff_topk] int32
     """
-    S, H, Hd = q.shape
+    S, _H, _Hd = q.shape
     P = k.shape[0]
 
     dot = torch.einsum("shd,pd->shp", q.float(), k.float())
     logits = (F.relu(dot) * w.float().unsqueeze(-1)).sum(dim=1)
-    logits = torch.where(_causal_mask(S, P, compress_ratio, q.device), logits, float("-inf"))
+    logits = torch.where(
+        _causal_mask(S, P, compress_ratio, q.device), logits, float("-inf")
+    )
 
     eff_topk = min(topk, P)
     scores, indices = torch.topk(logits, eff_topk, dim=-1)

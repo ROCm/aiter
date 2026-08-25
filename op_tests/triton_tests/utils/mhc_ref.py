@@ -29,10 +29,10 @@ __all__ = [
     "generate_mhc_post_inputs",
     "get_test_shapes",
     "is_doubly_stochastic",
-    "mhc_post_torch",
-    "mhc_torch",
-    "mhc_pre_dsv4_torch",
     "mhc_head_dsv4_torch",
+    "mhc_post_torch",
+    "mhc_pre_dsv4_torch",
+    "mhc_torch",
     "sinkhorn_knopp_exp_domain_torch",
     "sinkhorn_knopp_log_domain_torch",
 ]
@@ -69,9 +69,7 @@ def mhc_pre_dsv4_torch(
     )
     logits = logits + base.float()
     pre = torch.sigmoid(logits[:, :n]) + pre_eps
-    post = (
-        post_multiplier * torch.sigmoid(logits[:, n : 2 * n])
-    ).unsqueeze(-1)
+    post = (post_multiplier * torch.sigmoid(logits[:, n : 2 * n])).unsqueeze(-1)
     comb = sinkhorn_knopp_asymmetric_exp_domain_torch(
         logits[:, 2 * n :].reshape(M, n, n),
         num_iters=sinkhorn_iters,

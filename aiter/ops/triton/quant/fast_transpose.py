@@ -22,10 +22,14 @@ def fast_transpose_2d(x: torch.Tensor) -> torch.Tensor:
     grid = (triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N),)
 
     _transpose_2d_kernel[grid](
-        x, out,
-        M, N,
-        x.stride(0), x.stride(1),
-        out.stride(0), out.stride(1),
+        x,
+        out,
+        M,
+        N,
+        x.stride(0),
+        x.stride(1),
+        out.stride(0),
+        out.stride(1),
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
     )

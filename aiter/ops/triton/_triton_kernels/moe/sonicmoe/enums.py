@@ -4,7 +4,6 @@
 
 from enum import Enum
 
-
 LIBRARY_NAME = "aiter_sonicmoe"
 TENSORMAP = "tensormap"
 
@@ -27,4 +26,8 @@ class ActivationType(Enum):
 
 
 def is_glu(activation_type: ActivationType):
-    return activation_type in [ActivationType.SWIGLU, ActivationType.REGLU, ActivationType.GEGLU]
+    return activation_type in [
+        ActivationType.SWIGLU,
+        ActivationType.REGLU,
+        ActivationType.GEGLU,
+    ]
