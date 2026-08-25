@@ -64,38 +64,21 @@ static float fmha_batch_prefill_v3(const mha_batch_prefill_args& a,
 {
     if(!use_ext_asm)
         return -1;
-    if(get_gpu_arch() != "gfx950")
+
+    if(get_gpu_arch() != "gfx950" || q_dtype_str != "fp8bf16" || a.hdim_q != 256 ||
+       a.hdim_v != 256 || a.page_block_size != 64 ||
+       a.kv_memory_layout != ck_tile::BlockAttentionKVCacheMemoryLayoutEnum::LINEAR_LAYOUT ||
+       a.kv_lookup_table != ck_tile::BlockAttentionKVCacheLookupTableEnum::SGLANG_PAGE_TABLE_1D ||
+       qscale_type != quant_scale_enum::pertensor || a.q_descale_ptr == nullptr ||
+       a.k_descale_ptr == nullptr || a.v_descale_ptr == nullptr || a.p_drop > 0.f ||
+       bias_type != bias_enum::no_bias || a.logits_soft_cap > 0.f || a.sink_size > 0 ||
+       a.sink_ptr != nullptr || a.nhead_k <= 0 || a.nhead_q % a.nhead_k != 0 ||
+       a.kv_indptr == nullptr || a.kv_page_indices == nullptr || a.seqstart_q_ptr == nullptr ||
+       a.seqlen_k_ptr == nullptr)
         return -1;
-    if(q_dtype_str != "fp8bf16")
-        return -1;
-    if(a.hdim_q != 256 || a.hdim_v != 256)
-        return -1;
-    if(a.page_block_size != 64)
-        return -1;
-    if(a.kv_memory_layout != ck_tile::BlockAttentionKVCacheMemoryLayoutEnum::LINEAR_LAYOUT)
-        return -1;
-    if(a.kv_lookup_table != ck_tile::BlockAttentionKVCacheLookupTableEnum::SGLANG_PAGE_TABLE_1D)
-        return -1;
-    if(qscale_type != quant_scale_enum::pertensor)
-        return -1;
-    if(a.q_descale_ptr == nullptr || a.k_descale_ptr == nullptr || a.v_descale_ptr == nullptr)
-        return -1;
-    if(a.p_drop > 0.f)
-        return -1;
-    if(bias_type != bias_enum::no_bias)
-        return -1;
-    if(a.logits_soft_cap > 0.f)
-        return -1;
-    if(a.sink_size > 0 || a.sink_ptr != nullptr)
-        return -1;
-    if(a.nhead_k <= 0 || a.nhead_q % a.nhead_k != 0)
-        return -1;
+
     const int gqa = a.nhead_q / a.nhead_k;
     if(!is_pow2(gqa))
-        return -1;
-    if(a.kv_indptr == nullptr || a.kv_page_indices == nullptr || a.seqstart_q_ptr == nullptr)
-        return -1;
-    if(a.seqlen_k_ptr == nullptr)
         return -1;
 
     const bool causal = mask_type == mask_enum::mask_bottom_right && a.window_size_left < 0 &&
@@ -207,8 +190,11 @@ float mha_batch_prefill(mha_batch_prefill_args args,
     if(t >= 0)
         return t;
 
-    // The generated dispatcher selects global-load kernels for KV caches whose
-    // byte offsets exceed the 32-bit SRD range.
+    // The kUseGlobalLoad decision (>2GB KV cache → use `global_load_lds_*`
+    // instead of SRD `buffer_load_*`) is made per-arm inside the auto-generated
+    // dispatcher in fmha_batch_prefill_api.cpp, where each arm knows its own
+    // compile-time bn0 and dtype element size. The wrapper just forwards args;
+    // no runtime trait field for it.
     auto traits      = get_mha_batch_prefill_traits(head_size_q,
                                                head_size_v,
                                                q_dtype_str,
