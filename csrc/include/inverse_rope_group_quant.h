@@ -46,6 +46,14 @@ enum ScaleLayout : int64_t
     //   elements. shuffle_scale_n32k4 pins both the same way (it rejects rather
     //   than pads, and its input shape is (E, N, K//32)).
     kScaleN32K4 = 2,
+    // Plain transpose [G, Ks_pad, S_pad], M contiguous. No tile swizzle and
+    // nothing to op_sel-pack: a scale spanning a whole MFMA K step is broadcast
+    // to all four 32-blocks by the consumer (opus pack_e8m0x4 = e*0x01010101),
+    // so all four bytes of a lane's dword would be equal. What the transpose
+    // buys is on the consumer's side -- its 16 M lanes read 16 adjacent bytes
+    // instead of bytes Ks apart. Both pitches come from the buffer, so a caller
+    // may over-allocate S_pad to whatever M alignment its GEMM tile wants.
+    kScaleTranspose = 3,
 };
 
 void inverse_rope_group_quant(

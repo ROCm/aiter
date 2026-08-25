@@ -141,6 +141,10 @@ def _unshuffle_scale(scale, s, g, ks, scale_layout, group_size):
         return _unshuffle_mfma_scale(scale, s, g, ks, group_size)
     if scale_layout == "n32k4":
         return _unshuffle_n32k4_scale(scale, s, g, ks)
+    if scale_layout == "transpose":
+        # [g, ks_pad, s_pad] -> [s, g, ks]; slice before permuting so an
+        # over-allocated s_pad/ks_pad is dropped rather than read.
+        return _scale_bytes(scale)[:, :ks, :s].permute(2, 0, 1).contiguous()
     return _scale_bytes(scale)
 
 
@@ -729,7 +733,8 @@ def main():
         row = [s, g, ks],
         mfma_tile = [g, s_pad, ks_pad] for gfx950 V_MFMA_SCALE,
         n32k4 = [s_pad/32, g, ks*32] for gfx1250 WMMA scaleB
-                (needs group size 32).
+                (needs group size 32),
+        transpose = [g, ks_pad, s_pad], m contiguous.
         e.g.: -l n32k4""",
     )
     parser.add_argument(
