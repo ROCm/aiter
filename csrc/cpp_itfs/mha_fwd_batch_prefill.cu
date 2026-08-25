@@ -59,8 +59,11 @@ static float fmha_batch_prefill_v3(const mha_batch_prefill_args& a,
                                    mask_enum mask_type,
                                    bias_enum bias_type,
                                    bool has_lse,
-                                   quant_scale_enum qscale_type)
+                                   quant_scale_enum qscale_type,
+                                   bool use_ext_asm)
 {
+    if(!use_ext_asm)
+        return -1;
     if(get_gpu_arch() != "gfx950")
         return -1;
     if(q_dtype_str != "fp8bf16")
@@ -188,14 +191,19 @@ float mha_batch_prefill(mha_batch_prefill_args args,
                         quant_scale_enum qscale_type,
                         bool use_ext_asm)
 {
-    (void)use_ext_asm;
     int head_size_q  = args.hdim_q;
     int head_size_v  = args.hdim_v;
     bool has_dropout = args.p_drop > 0.f;
     bool has_sink    = args.sink_size > 0 || args.sink_ptr != nullptr;
 
-    float t = fmha_batch_prefill_v3(
-        args, stream_config, q_dtype_str, mask_type, bias_type, has_lse, qscale_type);
+    float t = fmha_batch_prefill_v3(args,
+                                    stream_config,
+                                    q_dtype_str,
+                                    mask_type,
+                                    bias_type,
+                                    has_lse,
+                                    qscale_type,
+                                    use_ext_asm);
     if(t >= 0)
         return t;
 

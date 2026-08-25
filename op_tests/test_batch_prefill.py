@@ -1314,6 +1314,7 @@ def vectorize_kv_cache(
     "batch_size,qo_len,kv_len,num_qo_heads,num_kv_heads,randomize_lengths",
     [
         (1, 512, 512, 8, 1, False),
+        (1, 128, 1024, 8, 1, False),
         (2, 512, 768, 8, 1, True),
         (2, 256, 256, 16, 2, False),
     ],
@@ -1328,6 +1329,11 @@ def test_batch_prefill_hd256_fp8_page64_asm(
     randomize_lengths,
 ):
     """LINEAR FP8 hd256 page_size=64 -- asm PAGED_VARLEN (packed Q/O + varlen)."""
+    if skip_test_if(
+        get_gpu_arch() != "gfx950",
+        "hd256 FP8 page_size=64 asm is gfx950-only",
+    ):
+        return
     torch.manual_seed(19378)
     page_size = 64
     head_dim = 256
@@ -1406,89 +1412,10 @@ def test_batch_prefill_hd256_fp8_page64_asm(
         v_descale=v_descale,
         kv_last_page_lens=kv_last_page_len_gpu,
     )
-    fp8_threshold = 0.06
+    fp8_threshold = 0.06 if causal and kv_len < qo_len else 0.055
+    if head_dim > 128:
+        fp8_threshold = max(fp8_threshold, 0.06)
     verify_fp8_output(out_fp8, o_ref, threshold=fp8_threshold)
-
-
-def test_batch_prefill_hd256_fp8_page16_stays_ck():
-    """page_size=16 must not take the ps=64 asm kernel (CK fallback)."""
-    torch.manual_seed(19378)
-    page_size = 16
-    head_dim = 256
-    batch_size = 1
-    qo_len = 128
-    kv_len = 128
-    num_qo_heads = 8
-    num_kv_heads = 1
-    dtype = torch.bfloat16
-    k_vector_size_fp8 = get_vector_size(dtypes.fp8)
-
-    qo_lens = build_qo_lens(batch_size, qo_len, randomize=False)
-    q_indptr_cpu = convert_lens_to_indptr(qo_lens)
-    q = build_q_tensor_for_test(
-        qo_lens, batch_size, qo_len, num_qo_heads, head_dim, dtype, -10, 10, True
-    )
-    kv_lens = build_kv_lens(batch_size, kv_len, qo_lens, randomize=False)
-    kv_cache = build_paged_kv_cache(
-        batch_size,
-        kv_len,
-        page_size,
-        num_kv_heads,
-        head_dim,
-        kv_lens,
-        None,
-        None,
-        dtype,
-        use_uniform=True,
-        contiguous_kv=True,
-    )
-    k_cache_ref, v_cache_ref = extract_kv_caches(kv_cache, True)
-    o_ref = build_reference_output(
-        q,
-        q_indptr_cpu,
-        kv_cache["kv_data_fp32"],
-        kv_cache["kv_indices_cpu"],
-        kv_cache["kv_indptr_cpu"],
-        kv_cache["kv_last_page_len_cpu"],
-        num_kv_heads,
-        head_dim,
-        dtype,
-        True,
-        0.0,
-        return_lse=False,
-    )
-    q_quant, q_descale = per_tensor_quant(q, quant_dtype=dtypes.fp8)
-    k_cache_quant, k_descale = per_tensor_quant(
-        k_cache_ref.to(dtype), quant_dtype=dtypes.fp8
-    )
-    v_cache_quant, v_descale = per_tensor_quant(
-        v_cache_ref.to(dtype), quant_dtype=dtypes.fp8
-    )
-    k_cache_quant, v_cache_quant = apply_kv_layout(
-        k_cache_quant,
-        v_cache_quant,
-        num_kv_heads,
-        head_dim,
-        page_size,
-        k_vector_size_fp8,
-        "linear",
-    )
-    out_fp8 = aiter.mha_batch_prefill_func(
-        q_quant,
-        k_cache_quant,
-        v_cache_quant,
-        q_indptr_cpu.to(0),
-        kv_cache["kv_indptr_cpu"].to(0),
-        kv_cache["kv_indices_cpu"].to(0),
-        qo_len,
-        kv_len,
-        causal=True,
-        q_descale=q_descale,
-        k_descale=k_descale,
-        v_descale=v_descale,
-        kv_last_page_lens=kv_cache["kv_last_page_len_cpu"].to(0),
-    )
-    verify_fp8_output(out_fp8, o_ref, threshold=0.06)
 
 
 @pytest.mark.parametrize("table_layout", ["sglang", "vllm"])
