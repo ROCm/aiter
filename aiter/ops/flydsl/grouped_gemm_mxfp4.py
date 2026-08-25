@@ -71,6 +71,20 @@ def _select_tdm_b_th(csv_tdm_b_th: int) -> int:
     return th
 
 
+def _select_max_tasks_per_worker(csv_max_tasks: int) -> int:
+    """Selects the persistent-N task cap from the environment or CSV."""
+    value = os.environ.get("AITER_FLYDSL_MAX_TASKS_PER_WORKER")
+    try:
+        max_tasks = int(value) if value is not None else int(csv_max_tasks)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "AITER_FLYDSL_MAX_TASKS_PER_WORKER must be a nonnegative integer"
+        ) from exc
+    if max_tasks < 0:
+        raise ValueError("max_tasks_per_worker must be nonnegative")
+    return max_tasks
+
+
 def _select_cluster_n(n_tiles: int, csv_cluster_n: int) -> int:
     """Selects the environment override or CSV cluster degree."""
     env_cluster_n = os.environ.get("AITER_FLYDSL_MXFP4_CLUSTER_N")
@@ -139,6 +153,7 @@ def flydsl_grouped_gemm_a8w4_masked(
     tdm_as_in_prologue=0,
     b_prefetch=0,
     tdm_b_th=1,
+    max_tasks_per_worker=0,
     stage2_scatter: Stage2ScatterContext | None = None,
     ep_destination_stride=0,
     ep_row_map=None,
@@ -165,6 +180,12 @@ def flydsl_grouped_gemm_a8w4_masked(
     b_prefetch = _select_b_prefetch(b_prefetch)
     b_prefetch_scope = _select_b_prefetch_scope() if b_prefetch else 0
     tdm_b_th = _select_tdm_b_th(tdm_b_th)
+    max_tasks_per_worker = _select_max_tasks_per_worker(max_tasks_per_worker)
+    enable_ep_scatter = stage2_scatter is not None
+    if max_tasks_per_worker and cluster_n > 1:
+        raise ValueError("persistent-N requires cluster_n=1")
+    if max_tasks_per_worker and enable_ep_scatter:
+        raise ValueError("persistent-N does not yet support EP scatter")
     if b_prefetch and tile_n > N:
         raise ValueError(
             "B CU-prefetch requires tile_n <= N, got "
@@ -175,7 +196,6 @@ def flydsl_grouped_gemm_a8w4_masked(
             f"[grouped-moe tdm] cluster_n={cluster_n} needs n_tiles={n_tiles} "
             f"(N={N}, tile_n={tile_n}) to be an exact multiple"
         )
-    enable_ep_scatter = stage2_scatter is not None
     ep_row_map_tensor = ep_row_map if ep_row_map is not None else out
     launch_gemm_a8w4_tdm(
         out,
@@ -211,6 +231,7 @@ def flydsl_grouped_gemm_a8w4_masked(
         b_prefetch,
         b_prefetch_scope,
         tdm_b_th,
+        max_tasks_per_worker,
         enable_ep_scatter=int(enable_ep_scatter),
         ep_arena_handle=(int(stage2_scatter.arena_handle) if enable_ep_scatter else 0),
         ep_combine_input_offset=(

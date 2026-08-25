@@ -443,6 +443,7 @@ def _grouped_a8w4_tdm_moe(
     tdm_as_in_prologue=0,
     b_prefetch=0,
     tdm_b_th=1,
+    max_tasks_per_worker=0,
     data_format="a8w4",
     expert_mask=None,
     num_local_tokens=None,
@@ -772,6 +773,7 @@ def _grouped_a8w4_tdm_moe(
         tdm_as_in_prologue=tdm_as_in_prologue,
         b_prefetch=b_prefetch,
         tdm_b_th=tdm_b_th,
+        max_tasks_per_worker=max_tasks_per_worker,
         **_ep_gemm2_kwargs,
     )
 
@@ -812,6 +814,7 @@ def _grouped_a8w4_tdm_moe(
                         tdm_as_in_prologue=tdm_as_in_prologue,
                         b_prefetch=b_prefetch,
                         tdm_b_th=tdm_b_th,
+                        max_tasks_per_worker=max_tasks_per_worker,
                         **_situ_kw,
                     ),
                 )
@@ -849,6 +852,7 @@ def _grouped_a8w4_tdm_moe(
                         tdm_as_in_prologue=tdm_as_in_prologue,
                         b_prefetch=b_prefetch,
                         tdm_b_th=tdm_b_th,
+                        max_tasks_per_worker=max_tasks_per_worker,
                         **_situ_kw,
                     ),
                 )
@@ -884,6 +888,7 @@ def _grouped_a8w4_tdm_moe(
                     tdm_as_in_prologue=tdm_as_in_prologue,
                     b_prefetch=b_prefetch,
                     tdm_b_th=tdm_b_th,
+                    max_tasks_per_worker=max_tasks_per_worker,
                 ),
             )
         )
@@ -1140,6 +1145,9 @@ def grouped_gemm_gfx1250_a8w4(
             )
             _tdm_kw["b_prefetch"] = _as_int(cfg_row.get("b_prefetch"), 0)
             _tdm_kw["tdm_b_th"] = _as_int(cfg_row.get("tdm_b_th"), 1)
+            _tdm_kw["max_tasks_per_worker"] = _as_int(
+                cfg_row.get("max_tasks_per_worker"), 0
+            )
 
         # Env overrides for tuning (present-check so any set value wins over CSV /
         # defaults). Stage2 (*2) falls back to the stage1 value when unset. Set
