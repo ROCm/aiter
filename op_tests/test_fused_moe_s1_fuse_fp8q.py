@@ -9,22 +9,19 @@ shape without a tuned row ran a standalone quant+sort kernel that the fused
 epilogue makes unnecessary. These tests pin the fallback's choice and both
 escape hatches.
 
-The fallback is reached with a header-only config_file: pandas still sees the
-shipped schema, but no row can match, so _lookup_cfg returns None. That uses
-only the public parameter, rather than reaching into the config cache.
+The fallback is reached by emptying the tuned-config cache: get_2stage_cfgs only
+loads it when the module global is None, so a falsy-but-not-None value skips the
+load and _lookup_cfg returns None for every shape. Forcing it this way rather
+than picking a shape that happens to be untuned means the test cannot quietly
+stop exercising the fallback when someone tunes that shape.
 """
-
-import os
 
 import pytest
 import torch
 
-import aiter
 from aiter import ActivationType, QuantType, dtypes, fused_moe
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.utils import is_flydsl_available
-
-TUNED_CSV = os.path.join(os.path.dirname(aiter.__file__), "configs", "tuned_fmoe.csv")
 
 # DeepSeek-V4 shape: the fallback is what DSv4 at EP8 actually takes.
 MODEL_DIM = 7168
@@ -41,15 +38,16 @@ pytestmark = [
 
 
 @pytest.fixture
-def no_tuned_rows(tmp_path):
-    with open(TUNED_CSV) as f:
-        header = f.readline()
-    path = tmp_path / "no_tuned_rows.csv"
-    path.write_text(header)
-    return str(path)
+def no_tuned_rows(monkeypatch):
+    monkeypatch.setattr(fused_moe, "cfg_2stages", ())
+    # get_2stage_cfgs is lru_cached on its arguments, and the env knobs are not
+    # arguments. Without clearing, every test after the first gets the first
+    # test's metadata back and asserts against a stale value -- which passes for
+    # whichever expectation happened to be cached and fails for the others.
+    fused_moe.get_2stage_cfgs.cache_clear()
 
 
-def _fallback_metadata(config_file, inter_dim=INTER_DIM):
+def _fallback_metadata(inter_dim=INTER_DIM):
     return fused_moe.get_2stage_cfgs(
         TOKEN,
         MODEL_DIM,
@@ -65,27 +63,26 @@ def _fallback_metadata(config_file, inter_dim=INTER_DIM):
         False,  # doweight_stage1
         0,  # hidden_pad
         0,  # intermediate_pad
-        config_file=config_file,
     )
 
 
 def test_fallback_fuses_stage1_fp8_quant(no_tuned_rows):
     """Without a tuned row, stage 1 is still promoted to the fused fp8 variant."""
-    metadata = _fallback_metadata(no_tuned_rows)
+    metadata = _fallback_metadata()
     assert metadata.fuse_quant == "fp8"
 
 
 def test_env_disables_fusion(no_tuned_rows, monkeypatch):
     """AITER_S1_FUSE_FP8Q=0 restores the unfused bf16 stage 1."""
     monkeypatch.setenv("AITER_S1_FUSE_FP8Q", "0")
-    metadata = _fallback_metadata(no_tuned_rows)
+    metadata = _fallback_metadata()
     assert metadata.fuse_quant == ""
 
 
 def test_min_inter_dim_floor_blocks_fusion(no_tuned_rows, monkeypatch):
     """A floor above inter_dim opts the shape out."""
     monkeypatch.setattr(fused_moe, "_S1_FUSE_FP8Q_MIN_INTER_DIM", INTER_DIM + 1)
-    metadata = _fallback_metadata(no_tuned_rows)
+    metadata = _fallback_metadata()
     assert metadata.fuse_quant == ""
 
 
@@ -94,5 +91,5 @@ def test_env_forces_fusion_below_floor(no_tuned_rows, monkeypatch):
     set the default to always-fuse measured shapes below it."""
     monkeypatch.setattr(fused_moe, "_S1_FUSE_FP8Q_MIN_INTER_DIM", INTER_DIM + 1)
     monkeypatch.setenv("AITER_S1_FUSE_FP8Q", "1")
-    metadata = _fallback_metadata(no_tuned_rows)
+    metadata = _fallback_metadata()
     assert metadata.fuse_quant == "fp8"
