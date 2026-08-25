@@ -27,7 +27,6 @@ import functools
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm
-from flydsl._mlir.dialects.fly_rocdl import TargetAddressSpace as _TargetAddressSpace
 from flydsl.expr import arith, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Vector as Vec
 
@@ -278,7 +277,7 @@ def build_hstu_attention_bwd_dq(
             shifted = fx.inttoptr(base_iter.type, base_i64 + fx.Int64(byte_off))
             buf_ptr_ty = fx.PointerType.get(
                 elem_ty=elem_type,
-                address_space=_TargetAddressSpace.BufferDesc,
+                address_space=fx.rocdl.TargetAddressSpace.BufferDesc,
                 alignment=base_iter.alignment,
             )
             buf_ptr = fx.make_ptr(

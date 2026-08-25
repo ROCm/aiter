@@ -31,11 +31,9 @@ import math as host_math
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm
-from flydsl._mlir.dialects.fly_rocdl import TargetAddressSpace as _TargetAddressSpace
 from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Vector as Vec
 from flydsl.runtime.device import get_rocm_arch
-from flydsl.utils.smem_allocator import SMEM_CAPACITY_MAP
 
 from aiter.ops.flydsl.kernels import buffer_ops
 from aiter.ops.flydsl.kernels.hstu_attention_common import (
@@ -43,6 +41,7 @@ from aiter.ops.flydsl.kernels.hstu_attention_common import (
     grouped_loader,
     swz_col,
 )
+from aiter.ops.flydsl.utils import addressable_lds_bytes_for_gfx
 
 
 def _dtype_to_elem_type(dtype_str: str):
@@ -78,10 +77,9 @@ def _arch_dma_params(arch: str | None = None):
 
 @functools.lru_cache(maxsize=16384)
 def lds_cap_bytes(arch: str | None = None) -> int:
-    default_lds_cap_bytes = 65536
     if arch is None:
         arch = get_rocm_arch()
-    return SMEM_CAPACITY_MAP.get(arch, default_lds_cap_bytes)
+    return addressable_lds_bytes_for_gfx(arch)
 
 
 _LOG2E = host_math.log2(host_math.e)
@@ -410,7 +408,7 @@ def build_hstu_attention_bwd_dvdk(
             shifted = fx.inttoptr(base_iter.type, base_i64 + fx.Int64(byte_off))
             buf_ptr_ty = fx.PointerType.get(
                 elem_ty=elem_type,
-                address_space=_TargetAddressSpace.BufferDesc,
+                address_space=fx.rocdl.TargetAddressSpace.BufferDesc,
                 alignment=base_iter.alignment,
             )
             buf_ptr = fx.make_ptr(
