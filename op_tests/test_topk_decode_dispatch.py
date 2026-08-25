@@ -38,24 +38,46 @@ gate_is_overridden = pytest.mark.skipif(
 @gate_is_overridden
 def test_shipped_gfx950_gate():
     """Pin the real gfx950 window to the SILOTIGER-699 conclusion so a silent edit
-    to the table trips here. Set from the 1276-cell MI355X sweep: rows cross zero
-    at 14 so 12 is the conservative edge, and all four AOT k values pass."""
+    to the table trips here. Read off the MI355X sweep: rows cross zero at 17 when
+    the buffer is 163840 wide but already at 11 when it is 131072, so the cap is a
+    staircase rather than one number, and each step sits two rows below its own
+    crossing. All four AOT k values pass."""
     gate = topk_mod._FLYDSL_TOPK_DECODE_GATES["gfx950"]
-    assert gate.min_width == 131072
-    assert gate.max_rows == 12
+    assert gate.row_caps == ((163840, 15), (131072, 9))
     assert gate.ks == frozenset({256, 512, 1024, 2048})
 
 
 @gate_is_overridden
 def test_shipped_gfx942_gate():
-    """Same pin for gfx942, set from the 928-cell MI300X sweep. Wider in rows than
-    gfx950 because the row threshold tracks CU count (304 against 256), and equally
-    wide in k, because all four AOT-precompiled values measured within 0.6us of
-    each other there."""
+    """Same pin for gfx942, set from the MI300X sweep and the matching rows probe.
+    Crossings land later than gfx950's -- 20 rows at 163840 and 13 at 131072
+    against 17 and 11 -- so the steps are higher, but the shape is the same and
+    each sits two rows below its own crossing."""
     gate = topk_mod._FLYDSL_TOPK_DECODE_GATES["gfx942"]
-    assert gate.min_width == 131072
-    assert gate.max_rows == 16
+    assert gate.row_caps == ((163840, 18), (131072, 11))
     assert gate.ks == frozenset({256, 512, 1024, 2048})
+
+
+@gate_is_overridden
+@pytest.mark.parametrize("arch", sorted(topk_mod._FLYDSL_TOPK_DECODE_GATES))
+def test_row_caps_are_a_descending_staircase(arch):
+    """The bands are scanned widest first and the first match wins, so an entry out
+    of order would silently shadow the ones behind it. A cap must also never grow
+    as the buffer narrows: less width means less work per row, which is the
+    direction that makes multi-block cooperation stop paying sooner."""
+    caps = topk_mod._FLYDSL_TOPK_DECODE_GATES[arch].row_caps
+    assert caps, f"{arch} has no width band"
+    widths = [w for w, _ in caps]
+    rows = [r for _, r in caps]
+    assert widths == sorted(widths, reverse=True), f"{arch} bands out of order"
+    assert rows == sorted(rows, reverse=True), f"{arch} cap grows as width shrinks"
+    # Below the narrowest band nothing is admitted, whatever the row count.
+    assert (
+        topk_mod._decode_max_rows(
+            topk_mod._FLYDSL_TOPK_DECODE_GATES[arch], widths[-1] - 1
+        )
+        == 0
+    )
 
 
 # --- GPU ---------------------------------------------------------------------
@@ -91,14 +113,23 @@ ROUTING_CASES = [
     (1, 131072, 131072, 2048),  # -> FlyDSL on gfx950 and gfx942
     (1, 131072, 70000, 2048),  # same, with the poisoned tail
     (2, 131072, 131072, 2048),  # rows==2 is ordinary on both -> FlyDSL
-    # The two archs cap rows apart (gfx950 12, gfx942 16) because the threshold
-    # tracks CU count, so straddle both edges at a width and k that clear every
-    # other screen -- otherwise these would be rejected on width or k and would say
-    # nothing about the row cap.
-    (12, 131072, 131072, 2048),  # top of the gfx950 window -> FlyDSL on both
-    (13, 131072, 131072, 2048),  # over gfx950, inside gfx942
-    (16, 131072, 131072, 2048),  # top of the gfx942 window
-    (17, 131072, 131072, 2048),  # one over -> HIP on both
+    # Row-cap edges, at a width and k that clear every other screen -- otherwise
+    # these would be rejected earlier and would say nothing about the cap. Both
+    # archs are staircases (gfx950 caps at 9/15, gfx942 at 11/18), so straddle
+    # every step.
+    (9, 131072, 131072, 2048),  # top of the gfx950 narrow band -> FlyDSL on both
+    (10, 131072, 131072, 2048),  # one over gfx950, inside gfx942
+    (11, 131072, 131072, 2048),  # top of the gfx942 narrow band
+    (12, 131072, 131072, 2048),  # one over both -> HIP
+    (15, 163840, 163840, 2048),  # top of the gfx950 wide band
+    (16, 163840, 163840, 2048),  # one over gfx950, inside gfx942
+    (18, 163840, 163840, 2048),  # top of the gfx942 wide band
+    (19, 163840, 163840, 2048),  # one over both -> HIP
+    # The same row count on either side of a step: 12 rows is refused at 131072 on
+    # both archs and admitted at 163840 on both. Without a pair like this the
+    # staircase could collapse back to a single cap and every case above would
+    # still pass.
+    (12, 163840, 163840, 2048),
     # Both archs now admit all four AOT k values, so cover the three that used to
     # be gfx950-only rejections.
     (1, 131072, 131072, 256),
@@ -123,9 +154,20 @@ def test_routing_cases_reach_flydsl_on_every_shipped_arch(arch):
     admitted = [
         (rows, width, seq_len, k)
         for rows, width, seq_len, k in ROUTING_CASES
-        if rows <= gate.max_rows and k in gate.ks and width >= gate.min_width
+        if k in gate.ks and rows <= topk_mod._decode_max_rows(gate, width)
     ]
     assert admitted, f"no routing case lands inside the {arch} window: {gate}"
+
+
+@gate_is_overridden
+@pytest.mark.parametrize("arch", sorted(topk_mod._FLYDSL_TOPK_DECODE_GATES))
+def test_staircase_splits_one_row_count_across_two_widths(arch):
+    """The point of a per-width cap: 12 rows is refused on the narrow band and
+    admitted on the wide one, on both archs. A regression that flattened the table
+    back to a single number would keep every other routing test green."""
+    gate = topk_mod._FLYDSL_TOPK_DECODE_GATES[arch]
+    assert topk_mod._decode_max_rows(gate, 131072) < 12
+    assert topk_mod._decode_max_rows(gate, 163840) >= 12
 
 
 @pytestmark_gpu

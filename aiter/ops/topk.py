@@ -460,33 +460,49 @@ def _top_k_per_row_decode(
 _TRUTHY_ENV = ("1", "true", "True", "yes", "YES")
 
 
-# Per-arch admission windows: min padded width, max rows, and the k set that wins.
+# Per-arch admission windows: a row cap per width band, plus the k set that wins.
 # A window does not transfer between archs -- the grid-trim, batch-cap and
-# early-stop tuning is gfx950-only, gfx942 runs a frozen configuration, and the
-# row cap tracks CU count (12 on 256 CU against 16 on 304 CU).
+# early-stop tuning is gfx950-only and gfx942 runs a frozen configuration.
 #
-# min_width asks "is this a long-context model", not "is this a long request",
-# and it has to: callers size the score buffer to the model's max context (vLLM's
-# sparse indexer builds logits as (batch * next_n, max_model_len)), the real
-# per-row lengths live in seqLens on the device where reading them would cost a
-# sync, and under CUDA-graph capture the request length does not exist yet. Width
-# only bounds the request, so this kernel wins across the long half of what one
-# width covers and loses on the short half; the window is a bet that a
-# long-context deployment actually serves long requests.
+# Width asks "is this a long-context model", not "is this a long request", and it
+# has to: callers size the score buffer to the model's max context (vLLM's sparse
+# indexer builds logits as (batch * next_n, max_model_len)), the real per-row
+# lengths live in seqLens on the device where reading them would cost a sync, and
+# under CUDA-graph capture the request length does not exist yet. Width only
+# bounds the request, so this kernel wins across the long half of what one width
+# covers and loses on the short half; the window is a bet that a long-context
+# deployment actually serves long requests.
 #
-# Both windows are read off graph replay rather than eager, and each threshold
-# sits below the measured sign change rather than on it. The SILOTIGER-699 gate
-# investigation holds the per-cell numbers and the reasoning behind every one.
+# The row cap varies with width because the two interact: a wider buffer means
+# more work per row, so the multi-block kernel's cooperation keeps paying for more
+# concurrent rows before the batch alone fills the machine. A single cap is a
+# compromise between two different crossings and loses at both ends.
+#
+# Every threshold is read off graph replay rather than eager, and sits below the
+# measured sign change rather than on it. The SILOTIGER-699 gate investigation
+# holds the per-cell numbers and the reasoning behind every one.
 class _DecodeGate(NamedTuple):
-    min_width: int
-    max_rows: int
+    # (min padded width, max rows) bands, widest first. A call is capped by the
+    # first band whose width it reaches, and one that reaches none is refused.
+    row_caps: tuple
     ks: frozenset
 
 
+_ALL_DECODE_KS = frozenset({256, 512, 1024, 2048})
+
 _FLYDSL_TOPK_DECODE_GATES = {
-    "gfx950": _DecodeGate(131072, 12, frozenset({256, 512, 1024, 2048})),
-    "gfx942": _DecodeGate(131072, 16, frozenset({256, 512, 1024, 2048})),
+    "gfx950": _DecodeGate(((163840, 15), (131072, 9)), _ALL_DECODE_KS),
+    "gfx942": _DecodeGate(((163840, 18), (131072, 11)), _ALL_DECODE_KS),
 }
+
+
+def _decode_max_rows(gate: _DecodeGate, width: int) -> int:
+    """Rows this gate admits at `width`, or 0 when the width is below every band."""
+    for min_width, max_rows in gate.row_caps:
+        if width >= min_width:
+            return max_rows
+    return 0
+
 
 # Narrows the table above, e.g. AITER_FLYDSL_TOPK_ARCHS=gfx950 leaves gfx942 on
 # HIP. Listing an arch that has no row in the table does not enable it: adding an
@@ -527,22 +543,26 @@ if _FLYDSL_TOPK_COUNT:
 # without editing the table. Env is read once at import (as elsewhere in aiter,
 # e.g. rotary_embedding.py) because this gate runs on every decode step; tests
 # patch _FLYDSL_TOPK_DECODE_GATES directly instead of setting env late.
+#
+# MAX_ROWS replaces the cap in every band. MIN_WIDTH additionally flattens the
+# table to one band, since a sweep that moves the width is asking for a single
+# rectangular window rather than the shipped staircase.
 _FLYDSL_TOPK_MIN_WIDTH_ENV = os.environ.get("AITER_FLYDSL_TOPK_MIN_WIDTH")
 _FLYDSL_TOPK_MAX_ROWS_ENV = os.environ.get("AITER_FLYDSL_TOPK_MAX_ROWS")
 if _FLYDSL_TOPK_MIN_WIDTH_ENV or _FLYDSL_TOPK_MAX_ROWS_ENV:
-    _FLYDSL_TOPK_DECODE_GATES = {
-        _arch: _gate._replace(
-            min_width=(
-                int(_FLYDSL_TOPK_MIN_WIDTH_ENV)
-                if _FLYDSL_TOPK_MIN_WIDTH_ENV
-                else _gate.min_width
-            ),
-            max_rows=(
-                int(_FLYDSL_TOPK_MAX_ROWS_ENV)
-                if _FLYDSL_TOPK_MAX_ROWS_ENV
-                else _gate.max_rows
-            ),
+
+    def _override_row_caps(caps: tuple) -> tuple:
+        rows = (
+            int(_FLYDSL_TOPK_MAX_ROWS_ENV)
+            if _FLYDSL_TOPK_MAX_ROWS_ENV
+            else max(_rows for _, _rows in caps)
         )
+        if _FLYDSL_TOPK_MIN_WIDTH_ENV:
+            return ((int(_FLYDSL_TOPK_MIN_WIDTH_ENV), rows),)
+        return tuple((_width, rows) for _width, _ in caps)
+
+    _FLYDSL_TOPK_DECODE_GATES = {
+        _arch: _gate._replace(row_caps=_override_row_caps(_gate.row_caps))
         for _arch, _gate in _FLYDSL_TOPK_DECODE_GATES.items()
     }
 
@@ -577,11 +597,12 @@ def _should_use_flydsl_decode(
     if gate is None:
         return False
 
-    if numRows > gate.max_rows:
-        return False
     if k not in gate.ks:
         return False
-    if logits.ndim != 2 or logits.shape[1] < gate.min_width:
+    if logits.ndim != 2:
+        return False
+    # Width first: it selects which row cap applies.
+    if numRows > _decode_max_rows(gate, logits.shape[1]):
         return False
 
     # HIP drops stride1 and never validates next_n, so a call that works there can
