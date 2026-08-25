@@ -19,7 +19,9 @@ from collections import OrderedDict
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.compiler.kernel_function import CompilationContext
+from flydsl.expr.typing import T
 
+from aiter.ops.flydsl.kernels import buffer_ops
 from ._buffer_utils import make_bounded_buffer_tensor
 
 BLOCK_M = 128
@@ -118,44 +120,44 @@ def _build_launcher(
         pid_mn, _, raw_b = fx.block_idx
 
         if fx.const_expr(COMPACT):
-            tile_rsrc = fx.buffer_ops.create_buffer_resource(TILE_MAP, max_size=True)
+            tile_rsrc = buffer_ops.create_buffer_resource(TILE_MAP, max_size=True)
             if fx.const_expr(XCD_C > 1):
                 total_occ = fx.Int32(fx.grid_dim.x)
                 raw_xy = fx.Int32(raw_b) * total_occ + fx.Int32(pid_mn)
                 tile_row, n_col = _xcd_remap(raw_xy, total_occ, N_BLOCKS, XCD_C, XCD_W)
-                tile_row = fx.Int32(fx.rocdl.readfirstlane(fx.T.i32(), tile_row))
-                block_n_idx = fx.Int32(fx.rocdl.readfirstlane(fx.T.i32(), n_col))
+                tile_row = fx.Int32(fx.rocdl.readfirstlane(T.i32, tile_row))
+                block_n_idx = fx.Int32(fx.rocdl.readfirstlane(T.i32, n_col))
             else:
                 tile_row = fx.Int32(pid_mn)
                 block_n_idx = fx.Int32(raw_b)
             base = tile_row * fx.Int32(2)
-            off_b = fx.buffer_ops.buffer_load(
-                tile_rsrc, base, vec_width=1, dtype=fx.T.i32()
+            off_b = buffer_ops.buffer_load(
+                tile_rsrc, base, vec_width=1, dtype=T.i32
             )
-            block_m_idx = fx.buffer_ops.buffer_load(
-                tile_rsrc, base + fx.Int32(1), vec_width=1, dtype=fx.T.i32()
+            block_m_idx = buffer_ops.buffer_load(
+                tile_rsrc, base + fx.Int32(1), vec_width=1, dtype=T.i32
             )
-            off_b = fx.Int32(fx.rocdl.readfirstlane(fx.T.i32(), off_b))
-            block_m_idx = fx.Int32(fx.rocdl.readfirstlane(fx.T.i32(), block_m_idx))
+            off_b = fx.Int32(fx.rocdl.readfirstlane(T.i32, off_b))
+            block_m_idx = fx.Int32(fx.rocdl.readfirstlane(T.i32, block_m_idx))
         else:
             raw_xy = fx.Int32(raw_b) * fx.Int32(BM_TILES * N_BLOCKS) + fx.Int32(pid_mn)
             row, col = _xcd_remap(raw_xy, XCD_NUM_ROWS, XCD_NUM_COLS, XCD_C, XCD_W)
-            row = fx.Int32(fx.rocdl.readfirstlane(fx.T.i32(), row))
-            col = fx.Int32(fx.rocdl.readfirstlane(fx.T.i32(), col))
+            row = fx.Int32(fx.rocdl.readfirstlane(T.i32, row))
+            col = fx.Int32(fx.rocdl.readfirstlane(T.i32, col))
 
             off_b = row // fx.Int32(BM_TILES)
             block_m_idx = row % fx.Int32(BM_TILES)
             block_n_idx = col
 
-        seq_rsrc = fx.buffer_ops.create_buffer_resource(SEQ_OFFSETS, max_size=True)
-        seq_start = fx.buffer_ops.buffer_load(
-            seq_rsrc, fx.Int32(off_b), vec_width=1, dtype=fx.T.i32()
+        seq_rsrc = buffer_ops.create_buffer_resource(SEQ_OFFSETS, max_size=True)
+        seq_start = buffer_ops.buffer_load(
+            seq_rsrc, fx.Int32(off_b), vec_width=1, dtype=T.i32
         )
-        seq_end = fx.buffer_ops.buffer_load(
-            seq_rsrc, fx.Int32(off_b) + fx.Int32(1), vec_width=1, dtype=fx.T.i32()
+        seq_end = buffer_ops.buffer_load(
+            seq_rsrc, fx.Int32(off_b) + fx.Int32(1), vec_width=1, dtype=T.i32
         )
-        seq_start = fx.rocdl.readfirstlane(fx.T.i32(), seq_start)
-        seq_end = fx.rocdl.readfirstlane(fx.T.i32(), seq_end)
+        seq_start = fx.rocdl.readfirstlane(T.i32, seq_start)
+        seq_end = fx.rocdl.readfirstlane(T.i32, seq_end)
         M_b = seq_end - seq_start
         start_m = fx.Int32(block_m_idx) * fx.Int32(BLOCK_M)
 
@@ -336,11 +338,11 @@ def _build_launcher(
                 bias_frag,
             )
             bias_f32 = fx.arith.ExtFOp(
-                fx.T.VectorType.get([C_FRAG_LEN], fx.T.f32()), bias_frag.load()
+                T.vec(C_FRAG_LEN, T.f32), bias_frag.load()
             ).result
             mma_frag_C_bf16.store(
                 fx.arith.trunc_f(
-                    fx.T.VectorType.get([C_FRAG_LEN], fx.T.bf16()),
+                    T.vec(C_FRAG_LEN, T.bf16),
                     fx.arith.addf(mma_frag_C.load(), bias_f32),
                 )
             )
