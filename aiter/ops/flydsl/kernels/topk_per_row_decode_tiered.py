@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: MIT
+
 """FlyDSL decode TopK-per-row kernel (tiered persistent multi-block radix-select)
 
 Computes an unordered Top-K index set per decode row, fusing a single-workgroup and
