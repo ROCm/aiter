@@ -758,6 +758,31 @@ def top_k_per_row_decode(
     request -- on the HIP path, which ignores ``workspace`` entirely, with nothing
     to raise on.
     """
+    # The gate screens every layout contract but not these two, so without them a
+    # wrong dtype raises on a gated shape and is silently reinterpreted by HIP's
+    # hard cast on every other one. FlyDSL re-checks; HIP checks nothing.
+    if (
+        logits.dtype is not torch.float32
+        or seqLens.dtype is not torch.int32
+        or indices.dtype is not torch.int32
+    ):
+        raise TypeError(
+            "decode top-k needs float32 logits with int32 seqLens/indices, got "
+            f"{logits.dtype}, {seqLens.dtype}, {indices.dtype}"
+        )
+    # Index comparison, not torch.device: building the three wrappers costs twice
+    # what reading the indices does, and a CPU tensor answers -1.
+    device = logits.get_device()
+    if (
+        not logits.is_cuda
+        or seqLens.get_device() != device
+        or indices.get_device() != device
+    ):
+        raise ValueError(
+            "logits, seqLens, and indices must share one CUDA/ROCm device, got "
+            f"{logits.device}, {seqLens.device}, {indices.device}"
+        )
+
     # Neither kernel reads a column stride: FlyDSL raises on one, HIP ignores it and
     # walks the dense buffer the view sits in, returning the Top-K of the neighbouring
     # elements with nothing raised. Densify up front so the gate routes on shape alone

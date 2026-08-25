@@ -223,5 +223,36 @@ def test_column_strided_input_reads_the_view_not_the_buffer(claimed_stride1):
     assert not torch.equal(indices.long().sort(dim=1).values, wrong.sort(dim=1).values)
 
 
+@pytestmark_gpu
+@pytest.mark.parametrize(
+    "rows, width", [(1, 131072), (1, 8192)], ids=["gated", "ungated"]
+)
+def test_wrong_dtype_raises_on_both_branches(rows, width):
+    """The same bad buffer has to raise whichever kernel the gate picks.
+
+    FlyDSL validates dtype and HIP casts to float* without looking, so a check
+    left to the branches makes the error depend on width -- loud on one shape and
+    a wrong answer on the next one over, from one caller bug.
+    """
+    _, seq_lens, indices = make_inputs(rows, width, width, 2048)
+    logits = torch.randn((rows, width), dtype=torch.bfloat16, device="cuda")
+    with pytest.raises(TypeError, match="float32"):
+        topk_mod.top_k_per_row_decode(
+            logits, 1, seq_lens, indices, rows, logits.stride(0), 1, 2048
+        )
+
+
+@pytestmark_gpu
+def test_seqlens_on_another_device_raises():
+    """HIP hands seqLens to the kernel as an int*, so a host pointer reaches the
+    device and is read there. Nothing downstream compares the devices."""
+    rows, width, k = 1, 131072, 2048
+    logits, seq_lens, indices = make_inputs(rows, width, width, k)
+    with pytest.raises(ValueError, match="device"):
+        topk_mod.top_k_per_row_decode(
+            logits, 1, seq_lens.cpu(), indices, rows, logits.stride(0), 1, k
+        )
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
