@@ -27,6 +27,12 @@ from aiter.ops.flydsl.kernels.tensor_shim import (
 
 MAX_EXPERTS_PER_BLOCK = 512
 
+# The ep_rowmap remap+scatter is grid-strided across this many blocks. Each block
+# re-derives the tiny per-expert prefix sum in LDS (barrier-free across blocks), so
+# no cross-block sync is needed. Sized to fill the 256-CU gfx1250; the grid-stride
+# loop stays correct for any token count.
+EP_REMAP_NBLK = 256
+
 
 @fx.struct
 class _PsumStorage:
@@ -52,6 +58,19 @@ class _RoutePsumStorage:
     """
 
     cnt: fx.Array[fx.Int32, MAX_EXPERTS_PER_BLOCK, 16]
+    lds0: fx.Array[fx.Int32, MAX_EXPERTS_PER_BLOCK, 16]
+    lds1: fx.Array[fx.Int32, MAX_EXPERTS_PER_BLOCK, 16]
+
+
+@fx.struct
+class _PsumRemapEpStorage:
+    """LDS for the EP remap kernel: the scan ping-pong buffers only.
+
+    No ``carry``: EP shards the experts across ranks, so the local count always
+    fits one chunk. The buffer left free by the last scan step doubles as the
+    per-block copy of the exclusive starts the scatter reads.
+    """
+
     lds0: fx.Array[fx.Int32, MAX_EXPERTS_PER_BLOCK, 16]
     lds1: fx.Array[fx.Int32, MAX_EXPERTS_PER_BLOCK, 16]
 
@@ -316,16 +335,23 @@ def build_moe_contiguous_psum_remap_module():
                 )
             )
         for route_i32 in range(tid, valid_route_count, MAX_EXPERTS_PER_BLOCK):
-            row = fx.Uint32(
-                buffer_ops.buffer_load(rows_rsrc, route_i32, vec_width=1, dtype=i32)
+            row_raw = buffer_ops.buffer_load(
+                rows_rsrc, route_i32, vec_width=1, dtype=i32
             )
-            m = fx.Uint32(route_max_m)
-            expert = row // m
-            slot = row - expert * m
-            start = fx.Uint32(
-                buffer_ops.buffer_load(s_rsrc, expert, vec_width=1, dtype=i32)
-            )
-            buffer_ops.buffer_store(start + slot, rows_rsrc, route_i32)
+            # An EP route with no grouped row carries the negative
+            # DROPPED_ROUTE_ROW sentinel: the row math would turn it into a wild
+            # expert index (OOB starts[] read), and downstream consumers check for
+            # the sentinel, so leave the slot untouched.
+            row_is_mapped = fx.Int32(row_raw) >= fx.Int32(0)
+            if row_is_mapped:
+                row = fx.Uint32(row_raw)
+                m = fx.Uint32(route_max_m)
+                expert = row // m
+                slot = row - expert * m
+                start = fx.Uint32(
+                    buffer_ops.buffer_load(s_rsrc, expert, vec_width=1, dtype=i32)
+                )
+                buffer_ops.buffer_store(start + slot, rows_rsrc, route_i32)
 
     @flyc.jit
     def launch_psum_remap(
@@ -366,6 +392,200 @@ def build_moe_contiguous_psum_remap_module():
     }
 
     return launch_psum_remap
+
+
+def build_moe_contiguous_psum_remap_ep_module():
+    """psum + masked->contiguous remap, fused with the gemm2 EP ep_rowmap build.
+
+    Same prefix-sum and in-place row remap as
+    ``build_moe_contiguous_psum_remap_module``, but the remap pass also scatters,
+    for each kept local route, the packed dest (origin_pe*slot_stride +
+    origin_lid*topk + k) plus f32 weight bits into ep_rowmap[final_row], reusing
+    the row it just computed. ep_rowmap is a flat (cap_rows+1, 2) i32 tensor;
+    rows no kept route claims keep the -1 sentinel the host memset wrote.
+    """
+
+    @flyc.kernel(
+        name="moe_contiguous_psum_remap_ep",
+        known_block_size=[MAX_EXPERTS_PER_BLOCK, 1, 1],
+    )
+    def psum_remap_ep_kernel(
+        masked_m: fx.Pointer,
+        topids_to_rows: fx.Pointer,
+        starts: fx.Pointer,
+        psum: fx.Pointer,
+        contiguous_m: fx.Pointer,
+        experts: Int32,
+        route_max_m: Int32,
+        tile_m: Int32,
+        num_valid_routes: fx.Pointer,
+        gather_w: fx.Pointer,  # (numel,) bf16, 0 for dropped/remote
+        tis: fx.Pointer,  # (recv_cap,) i32 recv_slot -> origin enc
+        ep_rowmap: fx.Pointer,  # (cap_rows+1, 2) i32 flat out
+        topk: Int32,
+        max_tok: Int32,
+        slot_stride: Int32,
+    ):
+        i32 = T.i32
+        # Uint32 for the same reason as psum_remap_kernel: every value here is a
+        # non-negative count or index, so `<`, `>=` and `//` lower to
+        # ult/uge/divui.
+        tid = fx.Uint32(fx.thread_idx.x)
+        tile_v = fx.Uint32(tile_m)
+        tile_minus_1 = tile_v - 1
+
+        lds = fx.SharedAllocator().allocate(_PsumRemapEpStorage).peek()
+        lds0 = lds.lds0.ptr
+        lds1 = lds.lds1.ptr
+
+        m_rsrc = ptr_rsrc(masked_m)
+        rows_rsrc = ptr_rsrc(topids_to_rows)
+        s_rsrc = ptr_rsrc(starts)
+        p_rsrc = ptr_rsrc(psum)
+        c_rsrc = ptr_rsrc(contiguous_m)
+        w_rsrc = ptr_rsrc(gather_w)
+        tis_rsrc = ptr_rsrc(tis)
+        ep_rsrc = ptr_rsrc(ep_rowmap)
+
+        # Lanes past ``experts`` stay out of the scan entirely: they never write
+        # lds0, and an in-range lane only ever reads indices below its own, so
+        # it never picks up their uninitialised slots.
+        in_expert = tid < fx.Uint32(experts)
+        if in_expert:
+            m_e = fx.Uint32(buffer_ops.buffer_load(m_rsrc, tid, vec_width=1, dtype=i32))
+            _lds_store(lds0, fx.Int32((m_e + tile_minus_1) // tile_v * tile_v), tid)
+
+        gpu.barrier()
+
+        src = lds0
+        dst = lds1
+        for offset in range_constexpr(1, MAX_EXPERTS_PER_BLOCK):
+            if const_expr((offset & (offset - 1)) != 0):
+                continue
+            if in_expert:
+                val = _lds_load(src, tid)
+                has_prev = tid >= offset
+                prev = fx.Int32(0)
+                if has_prev:
+                    prev = _lds_load(src, tid - offset)
+                _lds_store(dst, val + prev, tid)
+            gpu.barrier()
+            src, dst = dst, src
+
+        bid = fx.Uint32(fx.block_idx.x)
+        gtid = bid * MAX_EXPERTS_PER_BLOCK + tid
+        is_blk0 = bid == fx.Uint32(0)
+        # Multi-block: every block keeps its exclusive per-expert starts in LDS so the
+        # grid-strided scatter reads starts from LDS (never global -> no cross-block
+        # barrier). Only block 0 writes the global starts/psum/contiguous_m outputs.
+        starts_lds = dst  # spare ping-pong buffer now holds the exclusive starts
+        if in_expert:
+            is_not_first = tid != 0
+            start = fx.Int32(0)
+            if is_not_first:
+                start = _lds_load(src, tid - 1)
+            _lds_store(starts_lds, start, tid)
+            if is_blk0:
+                m_tid = buffer_ops.buffer_load(m_rsrc, tid, vec_width=1, dtype=i32)
+                buffer_ops.buffer_store(start, s_rsrc, tid)
+                buffer_ops.buffer_store(start + fx.Int32(m_tid), p_rsrc, tid)
+                is_last = tid == fx.Uint32(experts) - 1
+                if is_last:
+                    total = _lds_load(src, tid)
+                    gt = total > fx.Int32(tile_v)
+                    buffer_ops.buffer_store(gt.select(total, tile_v), c_rsrc, 0)
+
+        gpu.barrier()
+
+        # ep_rowmap is pre-filled with the (-1, 0) sentinel by a host-side memset
+        # ordered before this launch, so the scatter below only writes kept rows.
+        nvr = fx.Uint32(
+            buffer_ops.buffer_load(
+                ptr_rsrc(num_valid_routes), fx.Uint32(0), vec_width=1, dtype=i32
+            )
+        )
+        topk_v = fx.Uint32(topk)
+        max_tok_v = fx.Uint32(max_tok)
+        # Fused remap + ep_rowmap scatter over valid routes ([0, nvr)).
+        for route in range(gtid, nvr, EP_REMAP_NBLK * MAX_EXPERTS_PER_BLOCK):
+            row_raw = buffer_ops.buffer_load(rows_rsrc, route, vec_width=1, dtype=i32)
+            # A route with no grouped row carries DROPPED_ROUTE_ROW: the
+            # masked->contiguous math would turn it into a wild expert index (OOB
+            # LDS read of starts) and there is nothing to scatter. The route
+            # kernel gives exactly the gather_w == 0 routes this sentinel.
+            row_is_mapped = fx.Int32(row_raw) >= fx.Int32(0)
+            if row_is_mapped:
+                row = fx.Uint32(row_raw)
+                m = fx.Uint32(route_max_m)
+                expert = row // m
+                slot = row - expert * m
+                final_row = fx.Uint32(_lds_load(starts_lds, expert)) + slot
+                buffer_ops.buffer_store(final_row, rows_rsrc, route)
+                # ep_rowmap scatter for this row: packed dest + f32 weight bits.
+                w_f32 = fx.BFloat16(
+                    buffer_ops.buffer_load(w_rsrc, route, vec_width=1, dtype=T.bf16)
+                ).to(fx.Float32)
+                t = fx.Uint32(route) // topk_v
+                k = fx.Uint32(route) - t * topk_v
+                enc = fx.Uint32(
+                    buffer_ops.buffer_load(tis_rsrc, t, vec_width=1, dtype=i32)
+                )
+                origin_pe = enc // max_tok_v
+                origin_lid = enc - origin_pe * max_tok_v
+                packed = origin_pe * fx.Uint32(slot_stride) + origin_lid * topk_v + k
+                ep_base = final_row * 2
+                buffer_ops.buffer_store(packed, ep_rsrc, ep_base)
+                buffer_ops.buffer_store(w_f32.bitcast(fx.Int32), ep_rsrc, ep_base + 1)
+
+    @flyc.jit
+    def launch_psum_remap_ep(
+        masked_m: fx.Pointer,
+        topids_to_rows: fx.Pointer,
+        starts: fx.Pointer,
+        psum: fx.Pointer,
+        contiguous_m: fx.Pointer,
+        experts: fx.Int32,
+        route_max_m: fx.Int32,
+        tile_m: fx.Int32,
+        num_valid_routes: fx.Pointer,
+        gather_w: fx.Pointer,
+        tis: fx.Pointer,
+        ep_rowmap: fx.Pointer,
+        topk: fx.Int32,
+        max_tok: fx.Int32,
+        slot_stride: fx.Int32,
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
+    ):
+        psum_remap_ep_kernel(
+            masked_m,
+            topids_to_rows,
+            starts,
+            psum,
+            contiguous_m,
+            experts,
+            route_max_m,
+            tile_m,
+            num_valid_routes,
+            gather_w,
+            tis,
+            ep_rowmap,
+            topk,
+            max_tok,
+            slot_stride,
+        ).launch(
+            grid=(arith.index(EP_REMAP_NBLK), 1, 1),
+            block=(MAX_EXPERTS_PER_BLOCK, 1, 1),
+            stream=stream,
+        )
+
+    launch_psum_remap_ep.compile_hints = {
+        "llvm_options": {
+            "amdgpu-kernarg-preload": AITER_FLYDSL_KERNARG_PRELOAD,
+            "amdgpu-kernarg-preload-count": AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
+        },
+    }
+
+    return launch_psum_remap_ep
 
 
 def build_moe_route_psum_fused_module():
