@@ -270,10 +270,12 @@ class MoonEPDispatchCombineIntraNodeOp:
         non-empty and dropping them loses real tokens.  The returned vector is
         therefore ``E/R + B`` long, home groups first.
 
-        Any *other* non-empty group means the planner assigned this rank work
-        for a remote expert it has no prefetch slot for; that is a shortage of
-        ``prefetch_slots``, and the experts step would fail on it further
-        downstream with no hint of the cause, so it is caught here.
+        Any *other* non-empty group is an expert the planner gave this rank work
+        for but that got no prefetch slot.  That used to be fatal -- there was no
+        way to address a remote expert's weights.  With the pool row-contiguous
+        across ranks it is merely slower: the group reads its weights in place at
+        the owner's home row over XGMI.  ``B`` is a cache size again, so the
+        overflow is reported through ``overflow_rows`` for tuning, not raised.
         """
 
         sizes = cu_seqlens - torch.cat(
@@ -283,66 +285,44 @@ class MoonEPDispatchCombineIntraNodeOp:
         lo = self.cfg.rank * self.cfg.num_experts_per_rank
         hi = lo + self.cfg.num_experts_per_rank
         mine = torch.cat([sizes[lo:hi], sizes[e:]])
-        stray = int(sizes.sum().item()) - int(mine.sum().item())
-        if stray:
-            raise RuntimeError(
-                f"rank {self.cfg.rank}: {stray} dispatched rows belong to "
-                f"remote experts with no prefetch slot (prefetch_slots="
-                f"{self._act_cfg.prefetch_slots}, experts_per_rank="
-                f"{self.cfg.num_experts_per_rank}). Raise prefetch_slots."
-            )
         return mine.to(torch.int32)
+
+    def overflow_rows(self, cu_seqlens: torch.Tensor) -> int:
+        """Rows served by a remote expert that got no prefetch slot.
+
+        Zero means ``B`` covered every borrowed expert.  Non-zero is legal and
+        correct -- those rows read the owner's weights in place -- but each one
+        is an XGMI read instead of a local one, so a persistently non-zero count
+        is the signal to raise ``prefetch_slots``.  Costs a device sync; call it
+        from tuning paths, not from the per-layer hot path.
+        """
+
+        sizes = cu_seqlens - torch.cat(
+            [cu_seqlens.new_zeros(1), cu_seqlens[:-1]]
+        )
+        return int(sizes.sum().item()) - int(
+            self.local_group_sizes(cu_seqlens).sum().item()
+        )
 
     def decode_plan_available(self) -> bool:
         return self._decode_op is not None
 
-    def needs_split(self) -> bool:
-        """Whether the experts step needs the two-call home/migration split.
+    def has_migration(self) -> bool:
+        """Whether this plan migrates experts, i.e. whether prefetch must run.
 
-        The decode plan migrates nothing, so its migration groups are always
-        empty: one call over the home experts covers every row, driven by
-        ``valid_rows()`` on device.  That is what removes the last host sync
-        from a decode step.
+        The decode plan migrates nothing, so nothing has to be pulled into the
+        prefetch tail and the whole P2P weight read drops out of the step.
+
+        This used to be called ``needs_split`` and also gated the two-call
+        experts step.  With the weights in one row-contiguous ``[E + B]`` range
+        there is only ever one call, so the two meanings have been separated --
+        migration still decides prefetch, but never the call count.
         """
 
         return not self._act_cfg.no_migration
 
-    def expert_call_split(self) -> tuple[int, int, int]:
-        """``(home_end, total_rows, num_borrowed)`` for the two experts calls.
-
-        aiter's quantised MoE gives a **zero** result when the weight tensor
-        declares experts that no row routes to -- measured: any spare slot
-        breaks it, while every expert count from 1 to 48 is exact when all of
-        them are used.  So the ``E + B`` pool cannot be handed over as one
-        tensor; the experts step is split into a home call over ``E/R``
-        experts and a migration call over exactly the ``nb`` borrowed ones.
-
-        The split is free of a search: rows are laid out in group order, so
-        home groups occupy ``[0, cu[E-1])`` and migration groups
-        ``[cu[E-1], cu[-1])``, and ``experts_to_copy`` fills its slots from 0
-        up, so the used ones are a prefix.
-
-        One device sync per MoE layer, not three: the three counts are stacked
-        and fetched together, because each separate ``.item()`` is its own
-        pipeline stall and in eager mode that is the whole cost.  Reaching zero
-        needs both calls to start at row 0 so the host never learns the split --
-        ``fused_moe`` already takes ``num_local_tokens`` as a device tensor, so
-        the home call is free; the migration call would need its rows copied
-        into their own buffer.
-        """
-
-        plan = self.live_plan()
-        cu = plan.cu_seqlens
-        e = self.cfg.num_experts
-        sel = plan.experts_to_copy[self.cfg.rank]
-        packed = torch.stack(
-            [cu[e - 1], cu[-1], (sel >= 0).sum().to(cu.dtype)]
-        )
-        home_end, total, nb = packed.tolist()
-        return int(home_end), int(total), int(nb)
-
-    def row_slot_ids(self) -> torch.Tensor:
-        """Per-row local weight-pool slot, shaped ``[NvS, 1]`` for a topk-1 MoE.
+    def row_slot_ids(self, experts_per_rank_padded: int | None = None) -> torch.Tensor:
+        """Per-row weight-pool **row**, shaped ``[NvS, 1]`` for a topk-1 MoE.
 
         MoonEP's rows are already grouped by expert, which is what a grouped
         GEMM wants -- but aiter's ``fused_moe`` reaches that layout through its
@@ -350,10 +330,16 @@ class MoonEPDispatchCombineIntraNodeOp:
         turns that pass into a no-op reordering of an already-correct order,
         and lets the whole quantised experts path stay untouched.
 
-        Ids are local to whichever experts call the row belongs to: home rows
-        index this rank's ``E/R`` experts, migration rows index the borrowed
-        ones from 0.  See ``expert_call_split`` for why the two cannot share
-        one weight tensor.
+        Ids are **global pool rows**, identical on every rank: a home group maps
+        to its expert's row ``(e // epn) * epn_padded + e % epn`` and a migration
+        group to the prefetch tail at ``R * epn_padded + slot``.  That is what
+        lets one ``fused_moe`` span the whole ``[E + B]`` range instead of one
+        call per weight slab.
+
+        ``experts_per_rank_padded`` comes from the weight pool
+        (``MoonEPWeightPool.epn_padded``); it equals ``epn`` unless the VMM
+        granularity forced the per-rank group to be padded, which it does not on
+        gfx950.  Defaulting to ``epn`` keeps callers that hold no pool working.
 
         ``searchsorted`` rather than ``repeat_interleave`` because the latter
         needs the row total on the host, and a device sync per MoE layer would
@@ -364,9 +350,13 @@ class MoonEPDispatchCombineIntraNodeOp:
         cu = plan.cu_seqlens
         e = self.cfg.num_experts
         epn = self.cfg.num_experts_per_rank
+        epp = experts_per_rank_padded or epn
+        world = e // epn
         g = cu.numel()
         gidx = torch.arange(g, device=cu.device, dtype=torch.int32)
-        slot = torch.where(gidx < e, plan.group_expert_ids % epn, gidx - e)
+        gid = plan.group_expert_ids.to(torch.int32)
+        home_row = (gid // epn) * epp + (gid % epn)
+        slot = torch.where(gidx < e, home_row, world * epp + (gidx - e))
         rows = torch.arange(
             self._act_cfg.num_dispatch_rows, device=cu.device, dtype=torch.int32
         )

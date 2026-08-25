@@ -107,22 +107,26 @@ def main() -> int:
     dist.barrier()
 
     # --- assumption 3 -------------------------------------------------
-    sizes = op.local_group_sizes(cu)  # raises on a prefetch-slot shortage
+    sizes = op.local_group_sizes(cu)
     claimed = int(sizes.sum().item())
     all_sizes = cu - torch.cat([cu.new_zeros(1), cu[:-1]])
     total = int(all_sizes.sum().item())
     lo, hi = rank * epn, (rank + 1) * epn
     migrated = int(all_sizes[E:].sum().item())
+    overflow = op.overflow_rows(cu)
     if rank == 0:
         print(
             f"[a3] rows={total} claimed={claimed} home={int(all_sizes[lo:hi].sum())} "
-            f"migrated={migrated} {'OK' if claimed == total else 'FAIL'}",
+            f"migrated={migrated} overflow={overflow}",
             flush=True,
         )
-    if claimed != total:
+    # Overflow is legal now: those rows read their expert in place at the
+    # owner's home row over XGMI instead of from a prefetch slot. It is a
+    # slowdown, not a wrong answer, so it is reported rather than raised -- the
+    # numeric bisect below is what proves it came out right.
+    if claimed + overflow != total:
         raise AssertionError(
-            f"rank{rank}: local_group_sizes accounts for {claimed} of {total} "
-            "dispatched rows; every expert_num_tokens would be wrong"
+            f"rank{rank}: {claimed} local + {overflow} overflow != {total} rows"
         )
 
     # --- run the experts step the way the ATOM hook does ----------------
@@ -198,7 +202,9 @@ def main() -> int:
     ):
         if p is None or src is None:
             continue
-        a = p.pool[:epn].reshape(-1).view(torch.uint8)
+        # p.home, not pool[:epn]: in the row-contiguous range home sits at this
+        # rank's own slot, which is row 0 only on rank 0.
+        a = p.home.reshape(-1).view(torch.uint8)
         b = src.contiguous().reshape(-1).view(torch.uint8)
         if not torch.equal(a, b):
             n_bad = int((a != b).sum().item())
@@ -209,96 +215,73 @@ def main() -> int:
     if rank == 0:
         print("[pool] all pools byte-identical to source", flush=True)
 
-    # Two calls, mirroring MoonEPPrepareAndFinalize.run_experts: aiter's MoE
-    # zeroes its output when the weight tensor declares experts no row routes
-    # to, so home and borrowed experts cannot share one tensor.
-    slot_ids = op.row_slot_ids()
+    # One call, mirroring MoonEPPrepareAndFinalize.run_experts: the pool is
+    # row-contiguous across ranks, so home experts, borrowed ones in the
+    # prefetch tail and any overflow expert read in place at its owner's row all
+    # come out of the same weight tensor. Slot ids are global pool rows.
+    slot_ids = op.row_slot_ids(pw1.epn_padded)
     out = op.get_expert_output_buffer()
-    home_end, total, nb = (
-        op.expert_call_split() if op.needs_split() else (0, 0, 0)
-    )
-    if rank == 0:
-        print(f"[split] home_end={home_end} total={total} borrowed={nb}", flush=True)
 
-    def seg(p, s0, s1):
+    def seg(p):
         if p is None:
             return None
-        t = p.pool[s0:s1]
+        t = p.pool
         return t.reshape(-1, t.shape[-1]) if t.dim() == 3 and p is not pw1 and p is not pw2 else t
 
-    def wseg(p, s0, s1):
-        t = p.pool[s0:s1]
+    def wseg(p):
+        t = p.pool
         if QUANT == "mxfp4":
+            # fused_moe reads the shuffle flag off the tensor object; a view
+            # adopted from a raw VMM pointer carries no attributes.
             t.is_shuffled = True
         return t
 
-    def experts(a, b, s0, s1, nlt=None):
+    def experts(a, b, nlt=None):
         if b <= a:
             return
         o = fused_moe(
             rows[a:b],
-            wseg(pw1, s0, s1),
-            wseg(pw2, s0, s1),
+            wseg(pw1),
+            wseg(pw2),
             torch.ones((b - a, 1), dtype=torch.float32, device=dev),
             slot_ids[a:b],
             None,
             ActivationType.Silu,
             quant_type=qt,
-            w1_scale=seg(ps1, s0, s1),
-            w2_scale=seg(ps2, s0, s1),
+            w1_scale=seg(ps1),
+            w2_scale=seg(ps2),
             num_local_tokens=nlt,
             dtype=rows.dtype,
         )
         out[a:b].copy_(o)
 
-    # Bisect: same home rows, same experts, but indexing the full E-expert
-    # tensor with global ids instead of the epn-slot pool. Any gap here is the
-    # home call itself (pool slice or slot ids); a gap only downstream points
-    # at the migration call or combine.
-    gidx = torch.arange(cu.numel(), device=dev, dtype=torch.int32)
+    total = int(cu[-1].item())
+    experts(0, out.shape[0], op.valid_rows())
+
+    # Bisect: the same rows against the full E-expert tensor indexed by global
+    # expert id. This is the whole experts step now -- one call over the pool
+    # versus one over a fully local copy -- so any gap is the pool itself
+    # (stitched rows or slot ids), and a gap only further downstream is combine.
     grp = torch.searchsorted(cu.contiguous(),
                              torch.arange(rows.shape[0], device=dev, dtype=torch.int32),
                              right=True).clamp_(max=cu.numel() - 1)
     gids = plan.group_expert_ids[grp].to(torch.int32).unsqueeze(1)
-    if home_end > 0:
-        a = fused_moe(rows[:home_end], w13, w2t,
-                      torch.ones((home_end, 1), dtype=torch.float32, device=dev),
-                      gids[:home_end], None, ActivationType.Silu,
-                      quant_type=qt, w1_scale=sc1, w2_scale=sc2, dtype=rows.dtype).float()
-        b = fused_moe(rows[:home_end], wseg(pw1, 0, epn), wseg(pw2, 0, epn),
-                      torch.ones((home_end, 1), dtype=torch.float32, device=dev),
-                      slot_ids[:home_end], None, ActivationType.Silu,
-                      quant_type=qt, w1_scale=seg(ps1, 0, epn), w2_scale=seg(ps2, 0, epn),
+    if total > 0:
+        a = fused_moe(rows[:total], w13, w2t,
+                      torch.ones((total, 1), dtype=torch.float32, device=dev),
+                      gids[:total], None, ActivationType.Silu,
+                      quant_type=qt, w1_scale=sc1, w2_scale=sc2,
                       dtype=rows.dtype).float()
-        d = (a - b).abs().max().item(); sm = a.abs().max().item()
+        b = out[:total].float()
+        d = (a - b).abs().max().item()
+        sm = a.abs().max().item()
+        rel = d / max(sm, 1e-9)
         if rank == 0:
-            print(f"[home] pool-vs-full rel={d/max(sm,1e-9):.3e} "
-                  f"{'ok' if d/max(sm,1e-9) < 5e-2 else 'HOME CALL WRONG'}", flush=True)
-        if d / max(sm, 1e-9) >= 5e-2:
-            raise AssertionError(f"rank{rank}: home call rel={d/max(sm,1e-9):.3e}")
+            print(f"[experts] pool-vs-full rel={rel:.3e} "
+                  f"{'ok' if rel < 5e-2 else 'EXPERTS CALL WRONG'}", flush=True)
+        if rel >= 5e-2:
+            raise AssertionError(f"rank{rank}: experts call rel={rel:.3e}")
 
-    if not op.needs_split():
-        experts(0, out.shape[0], 0, epn, op.valid_rows())
-        home_end = total = int(cu[-1].item())
-    else:
-        experts(0, home_end, 0, epn)
-        experts(home_end, total, epn, epn + nb)
-
-    # Same bisect for the migrated rows: reference them against the full
-    # E-expert tensor with global ids. The borrowed experts' weights exist
-    # locally in this test, so this isolates the prefetched slabs.
-    if total > home_end:
-        ra = fused_moe(rows[home_end:total], w13, w2t,
-                       torch.ones((total - home_end, 1), dtype=torch.float32, device=dev),
-                       gids[home_end:total], None, ActivationType.Silu,
-                       quant_type=qt, w1_scale=sc1, w2_scale=sc2, dtype=rows.dtype).float()
-        rb = out[home_end:total].float()
-        d = (ra - rb).abs().max().item(); sm = ra.abs().max().item()
-        if rank == 0:
-            print(f"[migr] prefetched-vs-full rel={d/max(sm,1e-9):.3e} "
-                  f"{'ok' if d/max(sm,1e-9) < 5e-2 else 'MIGRATION CALL WRONG'}", flush=True)
-        if d / max(sm, 1e-9) >= 5e-2:
-            raise AssertionError(f"rank{rank}: migration call rel={d/max(sm,1e-9):.3e}")
     got = op.combine_grouped(op.get_expert_output_buffer())[:N].float()
     torch.cuda.synchronize(dev)
     dist.barrier()

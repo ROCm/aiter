@@ -90,12 +90,25 @@ def make_moonep_weight_prefetch_fast_jit(
     block_num: int = 128,
     block_threads: int = 256,
     loads_in_flight: int = DEFAULT_LOADS_IN_FLIGHT,
+    experts_per_rank_padded: int | None = None,
 ):
-    """Build the tuned prefetch launcher (same ABI as the reference builder).
+    """Build the tuned prefetch launcher.
 
     The copy is untyped -- only ``weight_numel * elem_bytes`` matters -- so fp8
     weights and their scale blocks go through unchanged.
+
+    The source is one **row-contiguous** pool base spanning every rank's experts
+    (``moonep_vmm_pool.MoonEPVmmPool``): global expert ``e`` sits at row
+    ``(e // epn) * epn_padded + e % epn``, so a peer's weight is reached by
+    arithmetic instead of a per-owner pointer table.
+    ``experts_per_rank_padded`` defaults to ``experts_per_rank`` -- the case on
+    gfx950, where the 4 KiB VMM granularity leaves every real row aligned.
     """
+
+    if experts_per_rank_padded is None:
+        experts_per_rank_padded = experts_per_rank
+    if experts_per_rank_padded < experts_per_rank:
+        raise ValueError("padded expert count cannot be smaller than the real one")
 
     if experts_per_rank <= 0 or prefetch_slots <= 0:
         raise ValueError("expert and slot counts must be positive")
@@ -117,24 +130,26 @@ def make_moonep_weight_prefetch_fast_jit(
     passes = (weight_i32 + stride - 1) // stride
     batch = min(loads_in_flight, passes)
     span = stride * batch
+    # ``pp`` and the ``pool`` marker are part of the cache key on purpose: this
+    # builder changed ABI (peer-pointer table -> single row-contiguous base), and
+    # a stale JIT artefact under the old name would be loaded with the new
+    # argument list.
     name = (
-        f"moonep_weight_prefetch_fast_epr{experts_per_rank}_b{prefetch_slots}"
+        f"moonep_weight_prefetch_fast_pool_epr{experts_per_rank}"
+        f"pp{experts_per_rank_padded}_b{prefetch_slots}"
         f"_n{weight_numel}x{elem_bytes}_g{block_num}_t{block_threads}_f{batch}"
     )
 
     @flyc.kernel(name=name, known_block_size=[block_threads, 1, 1])
     def prefetch_kernel(
         addr_experts_to_copy: fx.Int64,  # INT32 [B], global expert ids, -1 = idle
-        addr_peer_home_weight_ptrs: fx.Int64,  # INT64 [world_size]
+        addr_pool_base: fx.Int64,  # row-contiguous [(R+1)*epn_padded] pool base
         addr_prefetched_weights: fx.Int64,  # BF16 [B, weight_numel]
     ):
         tid = fx.Int32(fx.thread_idx.x)
         gid = fx.Int32(fx.block_idx.x) * fx.Int32(block_threads) + tid
         lane_base = gid * fx.Int32(VEC_I32)
         experts_rsrc = create_buffer_resource_from_addr(addr_experts_to_copy)
-        peer_ptrs_rsrc = create_buffer_resource_from_addr(
-            addr_peer_home_weight_ptrs
-        )
 
         # Slots on the outside: an idle slot costs one wave-uniform branch for
         # the whole block instead of 1/B of every thread's iterations.
@@ -143,16 +158,17 @@ def make_moonep_weight_prefetch_fast_jit(
             # Depends only on the slot, so this is block-uniform and compiles to
             # a scalar branch -- an idle slot issues no memory traffic at all.
             if expert >= fx.Int32(0):
+                # The pool is row-contiguous across ranks, so the owner drops out
+                # of the addressing: it only picks which padded group the row
+                # falls in. No pointer-table load, no per-owner view.
                 owner = expert // fx.Int32(experts_per_rank)
                 local_expert = expert % fx.Int32(experts_per_rank)
-                owner_base = buffer_load(
-                    peer_ptrs_rsrc, owner, vec_width=1, dtype=T.i64
-                )
+                row = owner * fx.Int32(experts_per_rank_padded) + local_expert
                 # num_records bounds both sides to one weight, so the final
                 # batch's out-of-range lanes are dropped in hardware and no tail
                 # predicate is needed.
                 src_rsrc = create_buffer_resource_from_addr(
-                    owner_base + fx.Int64(local_expert) * weight_bytes,
+                    addr_pool_base + fx.Int64(row) * weight_bytes,
                     num_records_bytes=weight_bytes,
                 )
                 dst_rsrc = create_buffer_resource_from_addr(
@@ -183,13 +199,13 @@ def make_moonep_weight_prefetch_fast_jit(
     @flyc.jit
     def launch(
         addr_experts_to_copy: fx.Int64,
-        addr_peer_home_weight_ptrs: fx.Int64,
+        addr_pool_base: fx.Int64,
         addr_prefetched_weights: fx.Int64,
         stream: Stream = Stream(None),  # noqa: B008
     ):
         prefetch_kernel(
             addr_experts_to_copy,
-            addr_peer_home_weight_ptrs,
+            addr_pool_base,
             addr_prefetched_weights,
         ).launch(
             grid=(block_num, 1, 1),

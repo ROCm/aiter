@@ -1,13 +1,23 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
 
-"""Symmetric expert-weight pool for MoonEP: home and prefetch slots in one
-contiguous allocation, so a grouped GEMM can index both with one local slot id.
+"""Row-contiguous expert-weight pool for MoonEP: the whole world's experts plus
+this rank's prefetch slots in one virtual range, indexed by global row.
 
-Layout per matrix: ``(epn + B, *shape)`` in the mori symmetric heap.
-``home = view[:epn]`` (peers prefetch from here over P2P), ``prefetched =
-view[epn:]``.  ATOM's ``w1``/``w2`` are ordinary local tensors and are not
-reachable by peers, so they must be staged into ``home`` once after loading.
+Layout per matrix: ``((R + 1) * epn_padded, *shape)`` over HIP VMM
+(``aiter.ops.flydsl.moonep_vmm_pool.MoonEPVmmPool``)::
+
+    slot 0 .. R-1   rank pe's home experts   row = pe * epn_padded + k
+    slot R          this rank's B prefetch slots, past row E
+
+Only ``epn_padded + B`` rows per rank are physically resident; rows ``[0, E)``
+that belong to other ranks are *their* memory, mapped here over XGMI.  A grouped
+GEMM therefore reaches **every** expert by row index in a single call, and an
+expert that got no prefetch slot is still addressable at its home row -- so
+``B`` is a cache size, not a correctness bound.
+
+ATOM's ``w1``/``w2`` are ordinary local tensors and are not reachable by peers,
+so they must be staged into ``home`` once after loading.
 
 The pool is dtype-transparent: staging and prefetch are byte copies, so it
 holds ATOM's expert weights in whatever layout and dtype the experts kernel
@@ -21,15 +31,15 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 import mori.shmem as ms
 import torch
-from mori.shmem import mori_shmem_create_tensor, mori_shmem_free_tensor
 
 from aiter.ops.flydsl.kernels.moonep_weight_prefetch_fast import (
     make_moonep_weight_prefetch_fast_jit,
 )
+from aiter.ops.flydsl.moonep_vmm_pool import MoonEPVmmPool
 
 
 class MoonEPWeightPool:
-    """One symmetric ``(epn + B, *shape)`` pool with a prefetch launcher."""
+    """One row-contiguous ``((R+1)*epn_padded, *shape)`` pool + prefetch launcher."""
 
     def __init__(
         self,
@@ -65,30 +75,37 @@ class MoonEPWeightPool:
         self._staged = False
         self._closed = False
 
-        # Allocated as raw bytes and viewed, so the symmetric heap never has to
-        # know about fp8 or any other narrow dtype.
-        slots = experts_per_rank + prefetch_slots
-        self._raw = mori_shmem_create_tensor(
-            (slots, numel * elem_bytes), torch.uint8
+        # Allocated as raw bytes and viewed, so the pool never has to know about
+        # fp8 or any other narrow dtype.
+        self._vmm = MoonEPVmmPool(
+            row_bytes=numel * elem_bytes,
+            experts_per_rank=experts_per_rank,
+            prefetch_slots=prefetch_slots,
+            rank=rank,
+            world_size=world_size,
+            device=self.device,
         )
-        self._raw.zero_()
-        self.pool = self._raw.view(dtype).reshape(slots, *weight_shape)
+        self.epn_padded = self._vmm.epn_padded
+        self.rows = self._vmm.rows
+        self._raw = self._vmm.tensor(torch.uint8, (numel * elem_bytes,))
+        self.pool = self._vmm.tensor(dtype, tuple(weight_shape))
+
+        self._home0 = self._vmm.home_row_begin
+        self._pf0 = self.world_size * self.epn_padded
+        self.home = self.pool[self._home0 : self._home0 + experts_per_rank]
+        self.prefetched = self.pool[self._pf0 : self._pf0 + prefetch_slots]
+        # Zero only what we own -- the rest of the range is peer memory and
+        # clearing it would wipe their weights. Through the byte view, never the
+        # typed one: the narrow dtypes this pool carries (fp4x2, e8m0) have no
+        # fill_ kernel in torch and zero_() on them raises NotImplementedError.
+        self._raw[self._home0 : self._home0 + experts_per_rank].zero_()
+        self._raw[self._pf0 : self._pf0 + prefetch_slots].zero_()
         torch.cuda.synchronize(self.device)
         ms.shmem_barrier_all()
 
-        self.home = self.pool[:experts_per_rank]
-        self.prefetched = self.pool[experts_per_rank:]
-
-        self.peer_home_ptrs = torch.tensor(
-            [
-                ms.shmem_ptr_p2p(self.pool.data_ptr(), rank, p)
-                for p in range(world_size)
-            ],
-            dtype=torch.int64,
-            device=self.device,
-        )
         self._jit = make_moonep_weight_prefetch_fast_jit(
             experts_per_rank=experts_per_rank,
+            experts_per_rank_padded=self.epn_padded,
             prefetch_slots=prefetch_slots,
             weight_numel=numel,
             elem_bytes=elem_bytes,
@@ -117,7 +134,8 @@ class MoonEPWeightPool:
         # both raise on them -- so an elementwise copy_ is not something to
         # rely on, and the pool only ever needs the bytes anyway.
         src = weights.contiguous()
-        self._raw[: self.experts_per_rank].copy_(
+        lo = self._home0
+        self._raw[lo : lo + self.experts_per_rank].copy_(
             src.view(torch.uint8).reshape(self.experts_per_rank, -1)
         )
         torch.cuda.synchronize(self.device)
@@ -138,9 +156,11 @@ class MoonEPWeightPool:
             raise ValueError("experts_to_copy must be int32")
         stream = torch.cuda.current_stream(self.device)
         sel = experts_to_copy_row.contiguous()
+        # One base for the whole world now: the kernel turns a global expert id
+        # into a row itself, so there is no per-owner pointer table to pass.
         raw = (
             sel.data_ptr(),
-            self.peer_home_ptrs.data_ptr(),
+            self.pool.data_ptr(),
             self.prefetched.data_ptr(),
             stream,
         )
@@ -156,17 +176,24 @@ class MoonEPWeightPool:
         return self.prefetched
 
     def slot_of(self, group: int, num_experts: int, expert: int) -> int:
-        """Local pool slot for a plan group; grouped GEMM indexes ``pool``."""
+        """Pool **row** for a plan group; the grouped GEMM indexes ``pool``.
+
+        Home groups map to the expert's global row -- identical on every rank --
+        rather than to a rank-local slot, which is what lets one ``fused_moe``
+        call span the whole range.  Migration groups map to the prefetch tail.
+        """
         if group < num_experts:
-            return expert % self.experts_per_rank
-        return self.experts_per_rank + (group - num_experts)
+            return self._vmm.global_row(expert)
+        return self._vmm.prefetch_row(group - num_experts)
 
     def close(self) -> None:
         if self._closed:
             return
         torch.cuda.synchronize(self.device)
         ms.shmem_barrier_all()
-        mori_shmem_free_tensor(self._raw)
+        # Drop the views before the mapping they borrow from.
+        self.home = self.prefetched = self.pool = self._raw = None
+        self._vmm.close()
         self._closed = True
 
 
