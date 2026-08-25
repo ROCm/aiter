@@ -26,6 +26,51 @@ def _select_next_stage_prefetch(csv_next_stage_prefetch: int) -> int:
     return int(value)
 
 
+def _select_as_in_prologue(csv_as_in_prologue: int) -> int:
+    """Selects the environment override or the CSV setting."""
+    value = os.environ.get("AITER_GROUPED_GEMM_AS_PROLOGUE")
+    if value is None:
+        return int(bool(csv_as_in_prologue))
+    value = value.strip()
+    if value not in ("0", "1"):
+        raise ValueError("AITER_GROUPED_GEMM_AS_PROLOGUE must be 0 or 1")
+    return int(value)
+
+
+def _select_b_prefetch(csv_b_prefetch: int) -> int:
+    """Selects and validates the B page-table prefetch switch."""
+    value = os.environ.get("AITER_TDM_B_PREFETCH")
+    if value is None:
+        return int(bool(csv_b_prefetch))
+    value = value.strip()
+    if value not in ("0", "1"):
+        raise ValueError("AITER_TDM_B_PREFETCH must be 0 or 1")
+    return int(value)
+
+
+def _select_b_prefetch_scope() -> int:
+    """Selects the B page-table prefetch cache policy."""
+    scope = os.environ.get("AITER_TDM_B_PREFETCH_SCOPE", "se").strip().lower()
+    if scope not in ("cu", "se"):
+        raise ValueError("AITER_TDM_B_PREFETCH_SCOPE must be 'cu' or 'se'")
+    default_th = "0" if scope == "cu" else "1"
+    th = int(os.environ.get("AITER_TDM_B_PREFETCH_TH", default_th).strip())
+    if not 0 <= th <= 6:
+        raise ValueError("AITER_TDM_B_PREFETCH_TH must be between 0 and 6")
+    if scope == "cu" and th:
+        raise ValueError("AITER_TDM_B_PREFETCH_TH must be 0 for CU scope")
+    return (0 if scope == "cu" else 8) | th
+
+
+def _select_tdm_b_th(csv_tdm_b_th: int) -> int:
+    """Selects the B-only TDM temporal hint."""
+    value = os.environ.get("AITER_TDM_B_TH")
+    th = int(csv_tdm_b_th) if value is None else int(value.strip())
+    if not 0 <= th <= 6:
+        raise ValueError("AITER_TDM_B_TH must be between 0 and 6")
+    return th
+
+
 def _select_cluster_n(n_tiles: int, csv_cluster_n: int) -> int:
     """Selects the environment override or CSV cluster degree."""
     env_cluster_n = os.environ.get("AITER_FLYDSL_MXFP4_CLUSTER_N")
@@ -91,6 +136,9 @@ def flydsl_grouped_gemm_a8w4_masked(
     cluster_n=-1,
     waves_per_tensor_tdm=-1,
     next_stage_prefetch=0,
+    tdm_as_in_prologue=0,
+    b_prefetch=0,
+    tdm_b_th=1,
     stage2_scatter: Stage2ScatterContext | None = None,
     ep_destination_stride=0,
     ep_row_map=None,
@@ -114,6 +162,14 @@ def flydsl_grouped_gemm_a8w4_masked(
     n_tiles = (N + tile_n - 1) // tile_n
     cluster_n = _select_cluster_n(n_tiles, cluster_n)
     waves_per_tensor_tdm = _select_num_waves_per_tensor_tdm(waves_per_tensor_tdm)
+    b_prefetch = _select_b_prefetch(b_prefetch)
+    b_prefetch_scope = _select_b_prefetch_scope() if b_prefetch else 0
+    tdm_b_th = _select_tdm_b_th(tdm_b_th)
+    if b_prefetch and tile_n > N:
+        raise ValueError(
+            "B CU-prefetch requires tile_n <= N, got "
+            f"tile_n={tile_n}, N={N}"
+        )
     if cluster_n > 1 and n_tiles % cluster_n:
         raise ValueError(
             f"[grouped-moe tdm] cluster_n={cluster_n} needs n_tiles={n_tiles} "
@@ -151,6 +207,10 @@ def flydsl_grouped_gemm_a8w4_masked(
         cluster_n,
         _select_next_stage_prefetch(next_stage_prefetch),
         waves_per_tensor_tdm,
+        _select_as_in_prologue(tdm_as_in_prologue),
+        b_prefetch,
+        b_prefetch_scope,
+        tdm_b_th,
         enable_ep_scatter=int(enable_ep_scatter),
         ep_arena_handle=(int(stage2_scatter.arena_handle) if enable_ep_scatter else 0),
         ep_combine_input_offset=(
