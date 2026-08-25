@@ -271,24 +271,30 @@ def _ref_selection_with_nan(gating_output, bias, score_func):
 
 
 def _starved_rows_ok(num_experts, num_tokens, topk, score_func, dtype):
-    """Does a row with fewer valid experts than topk degrade the documented way?
+    """Does a row the kernel cannot fill degrade the documented way?
 
     Such a row cannot fill every slot, so the kernel elects a sentinel for the
     remainder, and what that sentinel is worth decides how far the damage goes.
     Reaching the renorm sum, it drops the sum to RENORM_SUM_FLOOR and rescales
     the row's *valid* weights by ~1e20, so one starved row corrupts the experts
     it did resolve. Keeping a weight of its own is worse: the slot becomes a
-    real routing decision for a token that has none to make, and since every
-    sentinel elects the same expert, the id repeats across the slots.
+    real routing decision for a token that has none to make.
 
-    Two poisoned rows, so both halves are checked: row 0 has no valid expert at
-    all and must come out all-zero, row 1 is short by exactly one slot and must
-    weight precisely its valid experts -- an id set, so a sentinel that either
-    takes a slot or duplicates a real one fails. Reuses the sweep's token count
-    to keep the same dispatch path as the measured case.
+    Three poisoned rows. Rows 0 and 2 have no valid expert at all and must come
+    out all-zero. They reach that state by different routes -- a NaN is scrubbed
+    out of the selection score, a -Inf is already the bottom of it -- and since
+    masking an expert out with -Inf is a normal thing for a caller to do, both
+    are real inputs rather than one being a theoretical variant of the other.
+    Row 1 is short by exactly one slot and must weight precisely its valid
+    experts: an id set, so a sentinel that either takes a slot or duplicates a
+    real expert fails. Only weights are checked on the dead rows, because the
+    sentinel ids there are allowed to repeat -- a zero weight makes them inert.
+    Reuses the sweep's token count to keep the same dispatch path as the
+    measured case.
     """
     gating_output = _make_gating(num_experts, num_tokens, dtype)
     gating_output[0, :] = float("nan")  # no valid expert at all
+    dead_rows = [0]
     starved_row = 1 if (num_tokens > 1 and topk > 1) else None
     valid_experts = []
     if starved_row is not None:
@@ -297,6 +303,9 @@ def _starved_rows_ok(num_experts, num_tokens, topk, score_func, dtype):
         gating_output[starved_row, :] = float("nan")
         for i, e in enumerate(valid_experts):
             gating_output[starved_row, e] = 1.0 + 0.5 * i
+    if num_tokens > 2:
+        gating_output[2, :] = float("-inf")  # masked out rather than invalid
+        dead_rows.append(2)
 
     topk_weights = torch.empty((num_tokens, topk), dtype=torch.float32, device="cuda")
     topk_ids = torch.empty((num_tokens, topk), dtype=torch.int32, device="cuda")
@@ -314,8 +323,9 @@ def _starved_rows_ok(num_experts, num_tokens, topk, score_func, dtype):
         return False
     if ((topk_ids < 0) | (topk_ids >= num_experts)).any().item():
         return False
-    if (topk_weights[0] != 0.0).any().item():
-        return False
+    for row in dead_rows:
+        if (topk_weights[row] != 0.0).any().item():
+            return False
     if starved_row is not None:
         held = topk_ids[starved_row][topk_weights[starved_row] != 0.0]
         if sorted(held.tolist()) != sorted(valid_experts):
