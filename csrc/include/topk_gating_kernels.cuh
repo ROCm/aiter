@@ -287,11 +287,10 @@ __global__ void topk_gating_kernel_opt(
         // A NaN selection score never wins the argmax and would stall this
         // lane's cursor in the k-way merge (blocking its remaining experts);
         // push NaN to the bottom so it is simply excluded.
-        // NOTE: ::isnan() is compiled away under -ffast-math (-ffinite-math-only).
-        // aiter does not use -ffast-math; if that ever changes, replace with a
-        // bit-pattern check: (bit_cast<uint32_t>(v) & 0x7F800000) == 0x7F800000
-        //                 && (bit_cast<uint32_t>(v) & 0x007FFFFF) != 0
-        vals[i] = ::isnan(vals[i]) ? -INFINITY : vals[i];
+        // fmaxf: v_max_f32 is IEEE maxNum, so it returns the non-NaN operand.
+        // NOTE: folded away under -ffast-math (-ffinite-math-only), which aiter
+        // does not use; if that changes, test the exponent/mantissa bits.
+        vals[i] = fmaxf(vals[i], -INFINITY);
     }
 
     // Step 2: sort thread-local partition descending
@@ -408,8 +407,8 @@ __global__ void topk_gating_kernel_opt_multiwave(
         // A NaN selection score never wins the argmax and would stall this
         // lane's cursor in the k-way merge (blocking its remaining experts);
         // push NaN to the bottom so it is simply excluded.
-        // NOTE: ::isnan() is compiled away under -ffast-math; see opt kernel.
-        vals[i] = ::isnan(vals[i]) ? -INFINITY : vals[i];
+        // fmaxf: IEEE maxNum returns the non-NaN operand; see opt kernel.
+        vals[i] = fmaxf(vals[i], -INFINITY);
     }
 
     sort_network_desc<EPT>(vals, orig, idxs);
@@ -590,8 +589,8 @@ __global__ void topk_gating_kernel_opt_n(
         // A NaN selection score never wins the argmax and would stall this
         // lane's cursor in the k-way merge (blocking its remaining experts);
         // push NaN to the bottom so it is simply excluded.
-        // NOTE: ::isnan() is compiled away under -ffast-math; see opt kernel.
-        vals[i] = ::isnan(vals[i]) ? -INFINITY : vals[i];
+        // fmaxf: IEEE maxNum returns the non-NaN operand; see opt kernel.
+        vals[i] = fmaxf(vals[i], -INFINITY);
     }
 
     sort_network_desc<EPT>(vals, orig, idxs);
