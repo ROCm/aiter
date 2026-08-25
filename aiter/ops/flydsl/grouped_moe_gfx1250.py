@@ -43,6 +43,7 @@ def _stage1_producer_blocks(
     contiguous_m: int,
     gemm1_tiles: int,
     compact: bool = False,
+    tile_m: int = 0,
 ) -> int:
     """Workgroups gemm1 spends gathering its own A rows.
 
@@ -63,17 +64,21 @@ def _stage1_producer_blocks(
       free -- the count that actually matters is how many workgroups stay
       resident, which scales with the machine, not the capacity-padded row
       count (that padding pins the old ``contig_m/384`` estimate near CU/4 for
-      every shape). Targeting ~CU producers was 300-800us/layer faster than the
-      old clamp across a tpr={64,128,256,512} sweep on gfx1250, and landed
-      within ~85us/layer of each shape's individually swept optimum (which
-      drifts over [CU*0.75, CU*1.25] with tile occupancy and dispatch load).
+      every shape). The knee tracks tile occupancy: small-M tiles keep many
+      workgroups resident so the gather saturates near CU*1.25 producers, while
+      large-M tiles (tile_m>=128) run at lower occupancy and oversubscribe, so
+      ~CU is the knee. On gfx1250 (CU=256) the swept optimum was ~320 for
+      tpr={64,128} (tile_m<=64) and ~256 for tpr={256,512} (tile_m=128); this
+      picks each within ~40us/layer, and any value here beats the old clamp by
+      300-800us/layer.
     """
     raw = os.environ.get("AITER_FLYDSL_STAGE1_PRODUCER_BLOCKS", "auto").strip().lower()
     if raw != "auto":
         return max(0, int(raw))
     cu = _device_cu_count(device)
     if compact:
-        return min(cu, max(1, int(gemm1_tiles)))
+        target = cu + cu // 4 if 0 < int(tile_m) <= 64 else cu
+        return min(target, max(1, int(gemm1_tiles)))
     producer = (int(contiguous_m) + 383) // 384
     producer = max(max(1, cu // 8), min(producer, max(1, cu // 4)))
     return min(producer, max(1, int(gemm1_tiles)))
@@ -803,7 +808,7 @@ def _grouped_a8w4_tdm_moe(
             max(
                 int(stage1_dispatch.world_size),
                 _stage1_producer_blocks(
-                    device, contiguous_m, _gemm1_tiles, compact=True
+                    device, contiguous_m, _gemm1_tiles, compact=True, tile_m=tile_m
                 )
                 or 128,
             ),
