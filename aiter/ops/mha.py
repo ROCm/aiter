@@ -1524,11 +1524,11 @@ def cmdGenFunc_mha_batch_prefill(
     # Per-page descale for KV_BLOCKSCALE mode (Q per-tensor, K/V per-page)
     # Mutually exclusive with k_descale/v_descale
     kv_block_descale: Tensor | None = None,  # [num_block, num_kv_head, 2]
-    sink_ptr: Tensor | None = None,
-    gen: Generator | None = None,
     kv_last_page_lens: Tensor | None = None,
     block_table: Tensor | None = None,
     seqlen_k: Tensor | None = None,
+    sink_ptr: Tensor | None = None,
+    gen: Generator | None = None,
 ):
     # causal=true is the same as causal=false in this case
     causal = is_causal
@@ -1595,7 +1595,7 @@ def cmdGenFunc_mha_batch_prefill(
         filter_fwd += "_pertensor*"
     # Sink only applies when there is a causal/window mask; full attention
     # (window_size_left==-1 and window_size_right==-1) ignores sink_size.
-    has_effective_sink = sink_size > 0 and (
+    has_effective_sink = (sink_size > 0 or sink_ptr is not None) and (
         causal or not (window_size_left == -1 and window_size_right == -1)
     )
     if has_effective_sink:
