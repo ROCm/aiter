@@ -746,6 +746,7 @@ def sparse_mla_dsv4_ref(q, kv, topk_indices, attn_sink=None, scale=None):
     Returns:
         ``(o, lse)`` -- ``o`` [T, H, D] float32 carrying grad, and ``lse`` [T, H] float32
         detached and sink-inclusive, which is the convention the backward kernel expects.
+        A row whose top-k is entirely -1 gets ``o = 0`` and ``lse = -inf``.
     """
     if scale is None:
         scale = 1.0 / (q.shape[-1] ** 0.5)
@@ -763,6 +764,11 @@ def sparse_mla_dsv4_ref(q, kv, topk_indices, attn_sink=None, scale=None):
         denom = p.sum(dim=1)
         if attn_sink is not None:
             denom = denom + torch.exp(attn_sink - m)
-        outs.append((p @ k) / denom[:, None])
+        # A row whose top-k is entirely -1 has no contributors at all, and without a sink the
+        # denominator is then 0. Define that row's output as zero rather than letting 0/0 make
+        # it NaN; the lse stays -inf, which is the honest value for an empty row.
+        outs.append(
+            (p @ k) / torch.where(denom > 0, denom, torch.ones_like(denom))[:, None]
+        )
         lses.append((m + torch.log(denom)).detach())
     return torch.stack(outs, dim=0), torch.stack(lses, dim=0)

@@ -299,6 +299,19 @@ def plan_bwd(q, kv, do, o, lse, topk_indices, attn_sink=None, scale=None, R_CHUN
         arch_info.get_arch() == "gfx950"
     ), f"sparse_mla_bwd_dsv4 requires gfx950 (CDNA4), got {arch_info.get_arch()}"
 
+    for name, t in (
+        ("q", q),
+        ("kv", kv),
+        ("do", do),
+        ("o", o),
+        ("lse", lse),
+        ("topk_indices", topk_indices),
+    ):
+        if not t.is_cuda:
+            raise RuntimeError(
+                f"sparse_mla_bwd_dsv4 requires CUDA/HIP tensors, {name} is on {t.device}"
+            )
+
     if q.dtype != torch.bfloat16:
         raise RuntimeError(f"sparse_mla_bwd_dsv4 expects bf16 q, got {q.dtype}")
     for name, t in (("kv", kv), ("do", do), ("o", o)):
