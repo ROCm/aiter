@@ -60,9 +60,18 @@ Example 3:
 
 **Verify performance**
 
-To verify that your tunned JSON config files actually is performant and can be correctly picked up by AITER, first you have to copy the generated JSON config files into `<path_to_aiter_root>/aiter/ops/triton/configs/gemm`:
+To verify that your tunned JSON config files actually is performant and can be correctly picked up by AITER, first you have to copy the generated JSON config files into the config tree. Where they go depends on whether the config family has been migrated to the nested layout yet (`<path_to_aiter_root>/aiter/ops/triton/configs/CLAUDE.md` is the authoritative rulebook):
 
-    cp *.json <path_to_aiter_root>/aiter/ops/triton/configs/gemm/
+- Migrated families (e.g. `GEMM-AFP4WFP4`, `GEMM-AFP4WFP4_PRESHUFFLED`) live in `configs/<arch>/<backend>/gemm/<d_type>/`. Files there carry **no arch prefix** and the default file is named exactly `DEFAULT.json`, so drop the arch prefix when copying:
+
+      cp GEMM-AFP4WFP4_PRESHUFFLED-N=7168-K=2048.json \
+          <path_to_aiter_root>/aiter/ops/triton/configs/gfx950/triton/gemm/gemm_afp4wfp4_preshuffled/
+
+- Families still in the legacy flat layout keep the arch prefix and go to `configs/gemm/`:
+
+      cp *.json <path_to_aiter_root>/aiter/ops/triton/configs/gemm/
+
+Two gotchas: a `<d_type>/` directory is invisible to the resolver unless it contains a `DEFAULT.json`, and config reads are cached per path (including missing files), so restart the Python process after copying for the new files to be picked up.
 
 then, you can run, for example,
 

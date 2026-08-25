@@ -18,7 +18,11 @@ from ..gated_delta_rule_utils import (
     check_shared_mem,
     gated_delta_rule_autotune_configs,
 )
-from ..utils import prepare_chunk_indices, prepare_rebased_cu_seqlens
+from ..utils import (
+    GatedDeltaRulePrefillMetadata,
+    prepare_chunk_indices,
+    prepare_rebased_cu_seqlens,
+)
 from ..utils.op import exp
 
 BKV_LIST = [64, 128] if check_shared_mem() else [32, 64]
@@ -847,7 +851,8 @@ def chunk_fwd_kernel_o_opt_vk(
     g,
     o,
     cu_seqlens,
-    chunk_indices,
+    sequence_ids,
+    chunk_ids,
     scale,
     T,
     T_flat,
@@ -860,6 +865,8 @@ def chunk_fwd_kernel_o_opt_vk(
     BV: tl.constexpr,
     USE_G: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    INDEX_STRIDE: tl.constexpr,
+    H_IS_FP32: tl.constexpr,
     USE_EXP2: tl.constexpr = False,
 ):
     i_v, i_t, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
@@ -868,8 +875,8 @@ def chunk_fwd_kernel_o_opt_vk(
     if IS_VARLEN:
         i_tg = i_t
         i_n, i_t = (
-            tl.load(chunk_indices + i_t * 2).to(tl.int32),
-            tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32),
+            tl.load(sequence_ids + i_t * INDEX_STRIDE).to(tl.int32),
+            tl.load(chunk_ids + i_t * INDEX_STRIDE).to(tl.int32),
         )
         bos, eos = (
             tl.load(cu_seqlens + i_n).to(tl.int32),
@@ -915,6 +922,10 @@ def chunk_fwd_kernel_o_opt_vk(
         b_k = tl.load(p_k, boundary_check=(0, 1))
         b_h = tl.load(p_h, boundary_check=(0, 1))
 
+        # K6 requires matching tl.dot operand dtypes. This handles every
+        # supported input/snapshot combination (FP16/BF16 input with
+        # BF16/FP32 snapshots); same-dtype casts are eliminated by Triton.
+        b_h = b_h.to(b_q.dtype)
         b_o = tl.dot(b_q, tl.trans(b_h), acc=b_o)
         b_A = tl.dot(b_q, b_k, acc=b_A)
 
@@ -956,6 +967,7 @@ def chunk_fwd_o_opt_vk(
     use_exp2: bool = True,
     num_decodes: int = 0,
     num_decode_tokens: int = 0,
+    prefill_metadata: GatedDeltaRulePrefillMetadata | None = None,
 ) -> torch.Tensor:
     """
     Optimized output forward with h layout [V, K].
@@ -983,16 +995,41 @@ def chunk_fwd_o_opt_vk(
     # (cached, no per-forward D2H); the kernel walks pre-sliced prefill data
     # via the rebased cu_seqlens.
     if cu_seqlens is not None:
-        chunk_indices = prepare_chunk_indices(
-            cu_seqlens, BT, num_decodes, num_decode_tokens
-        )
-        kernel_cu_seqlens = prepare_rebased_cu_seqlens(
-            cu_seqlens, num_decodes, num_decode_tokens
-        )
+        if prefill_metadata is not None:
+            prefill_metadata.validate(
+                cu_seqlens=cu_seqlens,
+                chunk_size=BT,
+                num_decodes=num_decodes,
+                num_decode_tokens=num_decode_tokens,
+                total_prefill_tokens=T,
+                num_sequences=len(cu_seqlens) - 1,
+            )
+            schedule = prefill_metadata.get_chunk_schedule(
+                BT,
+                num_decodes=num_decodes,
+                num_decode_tokens=num_decode_tokens,
+            )
+            sequence_ids = schedule.sequence_ids
+            chunk_ids = schedule.chunk_ids
+            kernel_cu_seqlens = schedule.kernel_cu_seqlens
+            index_stride = 1
+        else:
+            chunk_indices = prepare_chunk_indices(
+                cu_seqlens, BT, num_decodes, num_decode_tokens
+            )
+            flat_chunk_indices = chunk_indices.reshape(-1)
+            sequence_ids = flat_chunk_indices
+            chunk_ids = flat_chunk_indices[1:]
+            kernel_cu_seqlens = prepare_rebased_cu_seqlens(
+                cu_seqlens, num_decodes, num_decode_tokens
+            )
+            index_stride = 2
     else:
-        chunk_indices = None
+        sequence_ids = None
+        chunk_ids = None
         kernel_cu_seqlens = None
-    NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
+        index_stride = 1
+    NT = triton.cdiv(T, BT) if cu_seqlens is None else len(sequence_ids) // index_stride
     if scale is None:
         scale = k.shape[-1] ** -0.5
 
@@ -1009,7 +1046,8 @@ def chunk_fwd_o_opt_vk(
         g=g,
         o=o,
         cu_seqlens=kernel_cu_seqlens,
-        chunk_indices=chunk_indices,
+        sequence_ids=sequence_ids,
+        chunk_ids=chunk_ids,
         scale=scale,
         T=T,
         T_flat=T_flat,
@@ -1018,6 +1056,8 @@ def chunk_fwd_o_opt_vk(
         K=K,
         V=V,
         BT=BT,
+        INDEX_STRIDE=index_stride,
+        H_IS_FP32=h.dtype == torch.float32,
         USE_EXP2=use_exp2,
     )
     return o

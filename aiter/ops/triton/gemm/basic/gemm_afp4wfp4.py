@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import os
+
 import torch
 import triton
 
@@ -28,10 +30,28 @@ _LOGGER = AiterTritonLogger()
 
 _USE_GEMM_SPLITK_BF16 = False
 
+# gfx1250 runs the triton preshuffle kernel by default; set
+# AITER_FORCE_GFX1250_GLUON_FP4=1 to force the gluon path back on. This is a
+# workaround switch kept for validation until the Triton-side fix lands.
+_USE_GLUON_PRESHUFFLE = os.environ.get("AITER_FORCE_GFX1250_GLUON_FP4", "0") == "1"
+
 
 def set_use_gemm_splitk_bf16(value: bool):
     global _USE_GEMM_SPLITK_BF16
     _USE_GEMM_SPLITK_BF16 = value
+
+
+def use_gluon_preshuffle() -> bool:
+    """Whether gemm_afp4wfp4_preshuffle dispatches to the gluon kernel.
+
+    Defaults to the triton kernel on gfx1250; set AITER_FORCE_GFX1250_GLUON_FP4=1
+    to force gluon. The env var is a no-op on every other arch.
+
+    The two kernels consume different scale layouts (gluon: preshuffle_factor
+    16 / scale_kwidth 4, triton: 32 / 8), so callers that shuffle scales
+    themselves must pick the layout according to this predicate.
+    """
+    return _USE_GLUON_PRESHUFFLE and arch_info.get_arch() == "gfx1250"
 
 
 def get_splitk(K: int, BLOCK_SIZE_K: int, NUM_KSPLIT: int):
@@ -417,7 +437,6 @@ def gemm_afp4wfp4_preshuffled_scales(
 
 
 # TODO: Split-K support
-# TODO: gluon kernel for M < 32 without preshuffling scales for M < 32
 def gemm_afp4wfp4_preshuffle(
     x_fp4: torch.Tensor,
     w_preshuf: torch.Tensor,
@@ -450,17 +469,21 @@ def gemm_afp4wfp4_preshuffle(
     """
 
     assert arch_info.is_fp4_avail(), "MXFP4 is not available on your device"
-    use_gluon = arch_info.get_arch() == "gfx1250"
+    use_gluon = use_gluon_preshuffle()
 
     M, K_bytes = x_fp4.shape
     n16, _ = w_preshuf.shape
     N = n16 * 16
     K_elems = 2 * K_bytes
-    # _get_config doubles K for config - 2 * K_bytes == K_elems
-    K_cfg = K_elems
 
     if config is None:
-        config, _ = _get_config(M, N, K_cfg, True)
+        # _get_config doubles K itself (logical K = 2 * K_bytes) — pass bytes,
+        # matching the non-preshuffled path. The two backends take disjoint
+        # params (gluon: NUM_BUFFERS, triton: NUM_KSPLIT/GROUP_SIZE_M/...), so
+        # the config must come from the dir of the backend we actually launch.
+        config, _ = _get_config(
+            M, N, K_bytes, True, backend="gluon" if use_gluon else "triton"
+        )
 
     config["BLOCK_SIZE_N"] = max(config["BLOCK_SIZE_N"], 32)
     if M < 32:
@@ -502,8 +525,13 @@ def gemm_afp4wfp4_preshuffle(
             config["BLOCK_SIZE_K"],
         )
 
-        # Kernel consumes preshuffled scales directly (address math inverts the shuffle in registers)
-        assert M >= 32, "gluon mxfp4 preshuffle path requires M >= 32"
+        # Kernel consumes preshuffled scales directly for M >= 32 (address math
+        # inverts the shuffle in registers) and un-shuffled (M, K // 32) scales for M < 32
+        if M < 32:
+            assert x_scales.shape[-1] == K_elems // 32 and x_scales.stride(-1) == 1, (
+                "x_scales must be un-shuffled (M, K // 32) K-contiguous for "
+                f"M < 32, got shape {tuple(x_scales.shape)}"
+            )
         _gluon_gemm_mxfp4_preshuffle_gfx1250[grid](
             x_fp4,
             w_preshuf,

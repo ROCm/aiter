@@ -59,19 +59,21 @@ def solve_tril_16x16_kernel(
     A,
     Ai,
     cu_seqlens,
-    chunk_indices,
+    sequence_ids,
+    chunk_ids,
     T,
     H: tl.constexpr,
     BT: tl.constexpr,
     USE_TMA: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    INDEX_STRIDE: tl.constexpr,
     DOT_PRECISION: tl.constexpr,
 ):
     i_t, i_bh = tl.program_id(0), tl.program_id(1)
     i_b, i_h = i_bh // H, i_bh % H
     if IS_VARLEN:
-        i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(
-            chunk_indices + i_t * 2 + 1
+        i_n, i_t = tl.load(sequence_ids + i_t * INDEX_STRIDE).to(tl.int32), tl.load(
+            chunk_ids + i_t * INDEX_STRIDE
         ).to(tl.int32)
         bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(
             cu_seqlens + i_n + 1
@@ -149,19 +151,21 @@ def merge_16x16_to_32x32_inverse_kernel(
     A,
     Ai,
     cu_seqlens,
-    chunk_indices,
+    sequence_ids,
+    chunk_ids,
     T,
     H: tl.constexpr,
     BT: tl.constexpr,
     USE_TMA: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    INDEX_STRIDE: tl.constexpr,
     DOT_PRECISION: tl.constexpr,
 ):
     i_t, i_bh = tl.program_id(0), tl.program_id(1)
     i_b, i_h = i_bh // H, i_bh % H
     if IS_VARLEN:
-        i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(
-            chunk_indices + i_t * 2 + 1
+        i_n, i_t = tl.load(sequence_ids + i_t * INDEX_STRIDE).to(tl.int32), tl.load(
+            chunk_ids + i_t * INDEX_STRIDE
         ).to(tl.int32)
         bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(
             cu_seqlens + i_n + 1
@@ -300,19 +304,21 @@ def merge_16x16_to_64x64_inverse_kernel(
     A,
     Ai,
     cu_seqlens,
-    chunk_indices,
+    sequence_ids,
+    chunk_ids,
     T,
     H: tl.constexpr,
     BT: tl.constexpr,
     USE_TMA: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    INDEX_STRIDE: tl.constexpr,
     DOT_PRECISION: tl.constexpr,
 ):
     i_t, i_bh = tl.program_id(0), tl.program_id(1)
     i_b, i_h = i_bh // H, i_bh % H
     if IS_VARLEN:
-        i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(
-            chunk_indices + i_t * 2 + 1
+        i_n, i_t = tl.load(sequence_ids + i_t * INDEX_STRIDE).to(tl.int32), tl.load(
+            chunk_ids + i_t * INDEX_STRIDE
         ).to(tl.int32)
         bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(
             cu_seqlens + i_n + 1
@@ -607,8 +613,12 @@ def merge_16x16_to_64x64_inverse_kernel(
 def solve_tril(
     A: torch.Tensor,
     cu_seqlens: torch.Tensor | None = None,
-    chunk_indices: torch.LongTensor | None = None,
+    chunk_indices: torch.Tensor | None = None,
     output_dtype: torch.dtype = torch.float,
+    *,
+    sequence_ids: torch.Tensor | None = None,
+    chunk_ids: torch.Tensor | None = None,
+    index_stride: int = 1,
 ) -> torch.Tensor:
     """
     Compute the inverse of the matrix I + A where A is strictly lower triangular.
@@ -618,12 +628,25 @@ def solve_tril(
             [B, T, H, BT], where BT should only be 16, 32, or 64.
             A should be strictly lower triangular, i.e., A.triu() == 0.
         cu_seqlens (torch.Tensor):
-            The cumulative sequence lengths of the input tensor. Default: `None`.
-        chunk_indices (torch.LongTensor):
-            Pre-computed chunk indices. Default: `None`.
+            Integer cumulative sequence lengths with shape `[N+1]`. Supplying
+            it enables variable-length indexing. Default: `None`.
+        chunk_indices (torch.Tensor):
+            Integer `[num_chunks, 2]` tensor containing interleaved sequence
+            and local chunk IDs. Used only for variable-length inputs when
+            separate IDs are not supplied. Default: `None`.
         output_dtype (torch.dtype):
             The dtype of the output tensor. Default: `torch.float`.
             If `None`, the output dtype will be the same as the input dtype.
+        sequence_ids (torch.Tensor):
+            One-dimensional integer sequence IDs on the same device as `A`.
+            Must be passed together with `chunk_ids` for variable-length input.
+        chunk_ids (torch.Tensor):
+            One-dimensional integer local chunk IDs on the same device as `A`.
+            Must be passed together with `sequence_ids`.
+        index_stride (int):
+            Element stride between IDs. Use `1` for separate contiguous ID
+            tensors and `2` for flattened interleaved chunk indices.
+            Default: `1`.
 
     Returns:
         (I + A)^-1 with the same shape as A
@@ -632,9 +655,22 @@ def solve_tril(
     output_dtype = A.dtype if output_dtype is None else output_dtype
 
     B, T, H, BT = A.shape
-    if chunk_indices is None and cu_seqlens is not None:
-        chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
-    NT = len(chunk_indices) if cu_seqlens is not None else triton.cdiv(T, BT)
+    if (sequence_ids is None) != (chunk_ids is None):
+        raise ValueError("`sequence_ids` and `chunk_ids` must be provided together.")
+    if index_stride <= 0:
+        raise ValueError(f"`index_stride` must be positive, got {index_stride}.")
+    if cu_seqlens is not None and sequence_ids is None:
+        if chunk_indices is None:
+            chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
+        flat_chunk_indices = chunk_indices.reshape(-1)
+        sequence_ids = flat_chunk_indices
+        chunk_ids = flat_chunk_indices[1:]
+        index_stride = 2
+    NT = (
+        len(sequence_ids) // index_stride
+        if cu_seqlens is not None
+        else triton.cdiv(T, BT)
+    )
 
     # `empty_like` is safe because the kernels below explicitly write every
     # in-bounds element of Ai's chunked layout (strict-lower + diagonal + the
@@ -653,10 +689,12 @@ def solve_tril(
         A=A,
         Ai=Ai,
         cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
+        sequence_ids=sequence_ids,
+        chunk_ids=chunk_ids,
         T=T,
         H=H,
         BT=BT,
+        INDEX_STRIDE=index_stride,
         USE_TMA=IS_TMA_SUPPORTED,
     )
     return Ai

@@ -13,7 +13,7 @@ this_dir = os.path.dirname(os.path.abspath(__file__))
 OPT_COMPILER_CONFIG = os.path.join(this_dir, "aiter", "jit", "optCompilerConfig.json")
 PACKAGE_NAME = "amd-aiter"
 
-FLYDSL_VERSION = "flydsl==0.2.4"
+FLYDSL_VERSION = "flydsl==0.3.1"
 
 BUILD_TARGET = os.environ.get("BUILD_TARGET", "auto")
 PREBUILD_KERNELS = int(os.environ.get("PREBUILD_KERNELS", "0"))
@@ -371,7 +371,7 @@ if PREBUILD_KERNELS != 0:
                 flags_extra_hip=flags_hip,
                 blob_gen_cmd=one_opt_args["blob_gen_cmd"],
                 extra_include=one_opt_args["extra_include"],
-                extra_ldflags=None,
+                extra_ldflags=one_opt_args.get("extra_ldflags"),
                 verbose=False,
                 is_python_module=True,
                 is_standalone=False,

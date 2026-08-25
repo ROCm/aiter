@@ -16,6 +16,8 @@ Important Note:
     These implementations are optimized for inference and forward-only operations.
 """
 
+from collections.abc import Sequence
+
 import torch
 import triton
 
@@ -26,6 +28,7 @@ from aiter.ops.triton._triton_kernels.gated_delta_rule import (
     chunk_gated_delta_rule_fwd_opt_vk,
 )
 from aiter.ops.triton._triton_kernels.gated_delta_rule.utils import (
+    GatedDeltaRulePrefillMetadata,
     l2norm_fwd,
 )
 from aiter.ops.triton.utils.logger import AiterTritonLogger
@@ -454,10 +457,16 @@ def chunk_gated_delta_rule_opt_vk(
     cu_seqlens: torch.LongTensor | None = None,
     use_chunk_hip: bool = False,
     use_chunk_flydsl: bool = False,
+    use_prepare_flydsl: bool = False,
     state_dtype: torch.dtype | None = None,
     use_exp2: bool = True,
     num_decodes: int = 0,
     num_decode_tokens: int = 0,
+    seq_lens_cpu: Sequence[int] | None = None,
+    prefill_metadata: GatedDeltaRulePrefillMetadata | None = None,
+    initial_state_indices: torch.Tensor | None = None,
+    inplace_final_state: bool | None = None,
+    snapshot_dtype: torch.dtype | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     r"""
     Optimized chunk-based gated delta rule with h layout [V, K] (Forward only).
@@ -476,7 +485,8 @@ def chunk_gated_delta_rule_opt_vk(
         k (torch.Tensor): keys of shape `[B, T, H, K]`.
         v (torch.Tensor): values of shape `[B, T, H, V]`.
         o (torch.Tensor, optional): pre-allocated `[B, T, H, V]` output buffer
-            written in place by K6. If None, a fresh buffer is allocated.
+            written in place by the output stage. If None, a fresh buffer is
+            allocated.
         g (torch.Tensor): g (decays in log space) of shape `[B, T, H]`.
         beta (torch.Tensor): betas of shape `[B, T, H]`.
         scale (float, optional): Scale factor. Default: `1 / sqrt(K)`.
@@ -485,27 +495,38 @@ def chunk_gated_delta_rule_opt_vk(
         output_final_state (bool): Whether to output final state `[N, H, V, K]`.
         use_qk_l2norm_in_kernel (bool): Whether to use L2 normalization.
         cu_seqlens (torch.LongTensor, optional): Cumulative sequence lengths `[N+1]`.
-        use_chunk_hip (bool): Use HIP kernel for hidden state (K5).
-        use_chunk_flydsl (bool): Use FlyDSL kernel for hidden state (K5).
+        use_chunk_hip (bool): Use HIP kernel for hidden state.
+        use_chunk_flydsl (bool): Use FlyDSL kernel for hidden state.
             Mutually exclusive with ``use_chunk_hip``.
+        use_prepare_flydsl (bool): Use the fused FlyDSL kernel for the prepare
+            stages without materializing `A_raw`. It is independent of the
+            hidden-state flags and falls back to Triton when unsupported.
+            Variable-length input also requires a prefill schedule.
         state_dtype (torch.dtype, optional): Initial/final state dtype
             (`fp32` or `bf16`), supported by both the HIP and Triton paths.
         use_exp2 (bool): Use exp2 instead of exp for gate computation.
-        num_decodes (int): number of leading decode-only sequences to skip in
-            ``cu_seqlens``. When nonzero, the caller passes the ORIGINAL,
-            cache-stable ``cu_seqlens`` (decode prefix included) and the data
-            tensors (`q/k/v/g/beta/o`) pre-sliced to the prefill region; the
-            offsets are rebased internally by the cached prologue helpers, so
-            the chunk-index / offset builds stay cache-warm across forward
-            calls (no per-forward `.tolist()` D2H).
+        num_decodes (int): Leading decode-only sequences in the original
+            ``cu_seqlens``. Data tensors contain only prefill tokens.
         num_decode_tokens (int): number of leading decode tokens stripped from
             the data tensors; subtracted from the rebased offsets.
+        seq_lens_cpu: Original host sequence lengths used to build a schedule.
+        prefill_metadata: Reusable schedule created by
+            ``build_gated_delta_rule_prefill_metadata``. Prefer this over
+            ``seq_lens_cpu`` when several GDR layers process the same batch.
+        initial_state_indices: Optional ``[N]`` indices into a larger
+            ``initial_state`` pool. K5 reads and writes those slots in place.
+            Supported by every K5 path (HIP, FlyDSL, Triton VK).
+        inplace_final_state: Controls K5 in-place state write-back. It defaults
+            to ``True`` when ``initial_state_indices`` is provided.
+        snapshot_dtype (torch.dtype, optional): Temporary chunk snapshot dtype
+            (`fp32` or `bf16`). Defaults to `k.dtype`.
 
     Returns:
         tuple[torch.Tensor, torch.Tensor | None]:
             - o: Outputs of shape `[B, T, H, V]`.
             - final_state: `[N, H, V, K]` if `output_final_state=True` else `None`.
     """
+    n_prefill = q.shape[0]
     if cu_seqlens is not None:
         if q.shape[0] != 1:
             raise ValueError(
@@ -513,11 +534,26 @@ def chunk_gated_delta_rule_opt_vk(
             )
         # Prefill sequence count == len(cu_seqlens) - 1 - num_decodes.
         n_prefill = len(cu_seqlens) - 1 - num_decodes
-        if initial_state is not None and initial_state.shape[0] != n_prefill:
+
+    if initial_state_indices is not None:
+        if initial_state is None:
+            raise ValueError("`initial_state_indices` requires `initial_state`.")
+        if initial_state_indices.numel() != n_prefill:
             raise ValueError(
-                f"The number of initial states is expected to be equal to the number of input sequences, "
-                f"i.e., {n_prefill} rather than {initial_state.shape[0]}."
+                "The number of state indices must equal the number of "
+                f"prefill sequences, i.e. {n_prefill} rather than "
+                f"{initial_state_indices.numel()}."
             )
+        if not output_final_state:
+            raise ValueError(
+                "`initial_state_indices` requires `output_final_state=True` "
+                "(the indexed path writes the final state back into the pool)."
+            )
+    elif initial_state is not None and initial_state.shape[0] != n_prefill:
+        raise ValueError(
+            f"The number of initial states is expected to be equal to the number of input sequences, "
+            f"i.e., {n_prefill} rather than {initial_state.shape[0]}."
+        )
 
     if scale is None:
         scale = k.shape[-1] ** -0.5
@@ -544,10 +580,16 @@ def chunk_gated_delta_rule_opt_vk(
         cu_seqlens=cu_seqlens,
         use_chunk_hip=use_chunk_hip,
         use_chunk_flydsl=use_chunk_flydsl,
+        use_prepare_flydsl=use_prepare_flydsl,
         state_dtype=state_dtype,
+        snapshot_dtype=snapshot_dtype,
         use_exp2=use_exp2,
         o=o,
         num_decodes=num_decodes,
         num_decode_tokens=num_decode_tokens,
+        seq_lens_cpu=seq_lens_cpu,
+        prefill_metadata=prefill_metadata,
+        initial_state_indices=initial_state_indices,
+        inplace_final_state=inplace_final_state,
     )
     return o.to(q.dtype), final_state
