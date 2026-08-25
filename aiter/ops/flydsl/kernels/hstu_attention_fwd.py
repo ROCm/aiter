@@ -36,11 +36,11 @@ import math as host_math
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir.dialects import fly
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Vector as Vec
 from flydsl.runtime.device import get_rocm_arch
-from flydsl.utils.smem_allocator import SMEM_CAPACITY_MAP
+
+from aiter.ops.flydsl.utils import addressable_lds_bytes_for_gfx
 
 _LOG2E = host_math.log2(host_math.e)
 
@@ -81,24 +81,6 @@ def _arch_dma_params(arch: str | None = None):
     else:
         dma_bytes, k_swz_rows, k_swz_shift = 16, 8, 3
     return dma_bytes, dma_bytes // 2, k_swz_rows, k_swz_shift
-
-
-def _waitcnt_vm_n(n: int):
-    """s_waitcnt vmcnt(n) only (lgkmcnt=63, expcnt=7) so V reg loads stay outstanding across the K DMA.
-
-    vmcnt is split across the immediate: lo[3:0] @ bit 0, hi[5:4] @ bit 14. The lgkmcnt/expcnt
-    fields stay maximal (63/7) so only vmcnt is constrained.
-    """
-    VMCNT_LO_MASK = 0xF
-    LGKMCNT_EXPCNT_BASE = 0x3F70
-    VMCNT_HI_SHIFT = 14
-    VMCNT_HI_MASK = 0x3
-    val = (
-        (n & VMCNT_LO_MASK)
-        | LGKMCNT_EXPCNT_BASE
-        | (((n >> 4) & VMCNT_HI_MASK) << VMCNT_HI_SHIFT)
-    )
-    rocdl.s_waitcnt(val)
 
 
 def validate_hstu_attention_fwd(
@@ -184,7 +166,7 @@ def validate_hstu_attention_fwd(
             f"rows_per_batch_v={rows_per_batch_v} must divide block_n={block_n}, unless rows_per_batch_v > block_n"
         )
 
-    lds_cap = SMEM_CAPACITY_MAP.get(arch, 65536)
+    lds_cap = addressable_lds_bytes_for_gfx(arch)
     lds_bytes = block_n * head_dim_k * 2 + block_n * hidden_dim * 2
     if lds_bytes > lds_cap:
         raise ValueError(f"LDS tile {lds_bytes} B exceeds the {lds_cap} B budget")
@@ -330,14 +312,20 @@ def build_hstu_attention_fwd(
         inv_n: fx.Float32,
     ) -> None:
         compute_type = fx.Float32.ir_type
-        v4f32_type = Vec.make_type(MFMA_ELEMS_PER_LANE, fx.Float32)
         c_zero_mfma_pack = Vec.filled(MFMA_LANE_K, 0.0, elem_dtype).ir_value()
 
-        # ---- MMA atom (layout algebra): one 16x16x16 f16/bf16 accumulate ----
+        # ---- MMA atom: one 16x16x16 f16/bf16 accumulate per wave ----
         _mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(MFMA_M, MFMA_M, MFMA_K, elem_dtype))
+        _mfma_a = fx.make_rmem_tensor(MFMA_LANE_K, elem_dtype)
+        _mfma_b = fx.make_rmem_tensor(MFMA_LANE_K, elem_dtype)
+        _mfma_c = fx.make_rmem_tensor(MFMA_ELEMS_PER_LANE, fx.Float32)
 
         def mfma_acc(a_pack, b_pack, c):
-            return fly.mma_atom_call_ssa([v4f32_type], _mma_atom, a_pack, b_pack, c)
+            _mfma_a.store(Vec(a_pack))
+            _mfma_b.store(Vec(b_pack))
+            _mfma_c.store(Vec(c))
+            fx.mma_atom_call(_mma_atom, _mfma_c, _mfma_a, _mfma_b, _mfma_c)
+            return _mfma_c.load().ir_value()
 
         # ---- Thread / lane indices ----
         tid = fx.Int32(gpu.thread_idx.x)
@@ -790,8 +778,8 @@ def build_hstu_attention_fwd(
             """
             k_vecs = async_load_k_regs(kv_start, full_tile=full_tile)
             v_vecs = async_load_v_regs(kv_start, full_tile=full_tile)
-            # wait for K regs; V stays outstanding
-            _waitcnt_vm_n(v_reg_outstanding)
+            # wait for K regs; V stays outstanding (vmcnt only — lgkmcnt/expcnt maximal)
+            rocdl.s_waitcnt(vmcnt=v_reg_outstanding)
             store_k_regs_to_lds(k_vecs)
             # K published to LDS
             gpu.barrier()
@@ -799,7 +787,7 @@ def build_hstu_attention_fwd(
             # GEMM1 overlaps the in-flight V global load
             p_packs = compute_p_tile(kv_start, k_packs, apply_mask=apply_mask)
             # wait for V
-            _waitcnt_vm_n(0)
+            rocdl.s_waitcnt(vmcnt=0)
             store_v_regs_to_lds(v_vecs)
             # Cluster the V ds_writes before the publish barrier (codegen-only; the barrier is the fence).
             rocdl.sched_group_barrier(rocdl.mask_dswr, NUM_BATCHES_V, 0)
