@@ -24,6 +24,19 @@ from aiter.test_common import benchmark, checkAllclose, run_perftest
 _DEFAULT_DEVICE = torch.device("cuda")
 
 
+def _load_torch_hstu_reference():
+    """Import the triton-side torch reference under either import root."""
+
+    try:
+        from triton_tests.utils.hstu_attention_ref import torch_hstu_attention
+    except ModuleNotFoundError as exc:
+        if exc.name != "triton_tests":
+            raise
+        from op_tests.triton_tests.utils.hstu_attention_ref import torch_hstu_attention
+
+    return torch_hstu_attention
+
+
 def _generate_sparse_seq_len(
     size: int,
     max_seq_len: int,
@@ -162,7 +175,7 @@ def test_flydsl_hstu_attention_perf(
     causal=True,
     seed=1001,
 ):
-    from op_tests.triton_tests.utils.hstu_attention_ref import torch_hstu_attention
+    torch_hstu_attention = _load_torch_hstu_reference()
 
     torch.cuda.empty_cache()
     device = torch.device("cuda")
@@ -290,7 +303,7 @@ def test_flydsl_hstu_attention(
 ):
     # The torch reference lives on the triton side; import it lazily so that
     # merely importing this module stays triton-free for pytest collection.
-    from op_tests.triton_tests.utils.hstu_attention_ref import torch_hstu_attention
+    torch_hstu_attention = _load_torch_hstu_reference()
 
     torch.cuda.empty_cache()
 
