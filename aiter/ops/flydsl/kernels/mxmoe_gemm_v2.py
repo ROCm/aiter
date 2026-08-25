@@ -1061,9 +1061,7 @@ def atomic_bf16_epilog(
                                 bias_val = load_bias(col_g0 + q)
                                 if const_expr(not defer_w):
                                     bias_val = bias_val * weight[mr]
-                                bval = (
-                                    fx.Float32(bval) + bias_val
-                                ).to(BFloat16)
+                                bval = (fx.Float32(bval) + bias_val).to(BFloat16)
                             bvals.append(bval)
                         elif const_expr(g2_bf16_lds):
                             val = fx.Float32(lds_base_bf16[idx_q])
