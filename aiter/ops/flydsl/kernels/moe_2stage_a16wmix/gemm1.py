@@ -504,6 +504,7 @@ def compile_gemm1_a16w4_port(
         arg_out: fx.Int64,
     ):
         lds_raw_ptr = fx.SharedAllocator().allocate(SharedStorage).peek().raw.ptr
+        # gfx942 W upconvert is lshr-16 bf16 pack (utils), not scalar truncf.
         tx_i32 = fx.Int32(gpu.thread_id("x"))
         bx_i32 = fx.Int32(gpu.block_id("x"))
         lane = tx_i32 % fx.Int32(64)

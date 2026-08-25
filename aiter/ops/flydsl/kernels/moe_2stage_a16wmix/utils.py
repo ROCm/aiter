@@ -121,7 +121,8 @@ def _int4_nibble_to_bf16x8(raw_i32, scale_f32, *, use_k16=False, old_pack=False)
 
     ``raw_i32`` holds 8 signed-int4 nibbles. ``v_cvt_off_f32_i4`` reads the nibble
     unsigned, subtracts 8, and scales the mantissa by 16, so the x16 is folded into
-    eff = scale*16. ``use_k16`` (gfx942): v_cvt_pk_bf16_f32 is gfx950-only -> scalar.
+    ``eff = scale*16``. ``use_k16`` (gfx942): no ``v_cvt_pk_bf16_f32``; pack bf16
+    with the lshr-16 bit trick (old ``moe_gemm_2stage``) instead of scalar truncf.
 
     ``old_pack`` (a16wi4 consuming the OLD FlyDSL kernel's weight preshuffle,
     ``pack_int8_to_packed_int4``): byte j packs K_j (low nibble) and K_{j+4} (high
@@ -135,19 +136,25 @@ def _int4_nibble_to_bf16x8(raw_i32, scale_f32, *, use_k16=False, old_pack=False)
     raw_even = fx.Int32(raw_i32)
     raw_odd = raw_even.shrui(fx.Int32(4))
     if use_k16:
-        # gfx942 fallback: scalar f32 -> bf16 truncation (no v_cvt_pk_bf16_f32).
+        # gfx942: no v_cvt_pk_bf16_f32. High-16-bit pack, not scalar truncf.
+        # Exact for scaled int4.
         los = []
         his = []
         for j in range_constexpr(4):
             f_lo = fx.Float32(rocdl.cvt_off_f32_i4(_raw(raw_even), byte_sel=j)) * eff
             f_hi = fx.Float32(rocdl.cvt_off_f32_i4(_raw(raw_odd), byte_sel=j)) * eff
-            los.append(f_lo.to(fx.BFloat16))
-            his.append(f_hi.to(fx.BFloat16))
-        if old_pack:
-            bf16s = los + his  # K0..K3 (los), K4..K7 (his)
-        else:
-            bf16s = [x for pair in zip(los, his) for x in pair]  # K0,K1,...,K7
-        return fx.Vector.from_elements([_raw(x) for x in bf16s], fx.BFloat16)  # v8bf16
+            los.append(f_lo)
+            his.append(f_hi)
+        f32s = (los + his) if old_pack else [x for pair in zip(los, his) for x in pair]
+        c16 = fx.Int32(16)
+        hi16 = fx.Int32(0xFFFF0000)
+        i32s = []
+        for i in range_constexpr(4):
+            b0 = f32s[2 * i].bitcast(fx.Int32)
+            b1 = f32s[2 * i + 1].bitcast(fx.Int32)
+            i32s.append(b0.shrui(c16) | (b1 & hi16))
+        v4i32 = fx.Vector.from_elements([_raw(x) for x in i32s], fx.Int32)
+        return v4i32.bitcast(fx.BFloat16)  # v8bf16
     # byte_sel loads (1 shift total); side-effecting pk-convert.
     los = []
     his = []
@@ -207,17 +214,29 @@ def _mxfp4_nibble_to_bf16x8(raw_i32, scale_f32):
     Nibble *i* is bits ``[4*i : 4*i+4)``, matching gfx950 cvt sel order
     (sel 0 = byte0 = K0,K1, ...). *scale_f32* is the E8M0 block scale, still
     folded per element (same math as the previous select decode).
+
+    gfx942 has no ``v_cvt_pk_bf16_f32``; pack with lshr-16 (old
+    ``dequant_fp4_to_bf16``) rather than scalar truncf. Exact for E2M1 * E8M0.
     """
     packed = fx.Int32(raw_i32)
     even = packed & fx.Int32(0x0F0F0F0F)  # K0,K2,K4,K6
     odd = packed.shrui(fx.Int32(4)) & fx.Int32(0x0F0F0F0F)  # K1,K3,K5,K7
     fe = _fp4x4_e2m1_to_f32x4(even)
     fo = _fp4x4_e2m1_to_f32x4(odd)
-    bf16s = []
+    # zip even/odd -> K0,K1,...,K7 (gfx950 cvt sel / a16w-mix MMA order).
+    f32s = []
     for i in range_constexpr(4):
-        bf16s.append((fe[i] * scale_f32).to(fx.BFloat16))
-        bf16s.append((fo[i] * scale_f32).to(fx.BFloat16))
-    return fx.Vector.from_elements([_raw(x) for x in bf16s], fx.BFloat16)
+        f32s.append(fe[i] * scale_f32)
+        f32s.append(fo[i] * scale_f32)
+    c16 = fx.Int32(16)
+    hi16 = fx.Int32(0xFFFF0000)
+    i32s = []
+    for i in range_constexpr(4):
+        b0 = f32s[2 * i].bitcast(fx.Int32)
+        b1 = f32s[2 * i + 1].bitcast(fx.Int32)
+        i32s.append(b0.shrui(c16) | (b1 & hi16))
+    v4i32 = fx.Vector.from_elements([_raw(x) for x in i32s], fx.Int32)
+    return v4i32.bitcast(fx.BFloat16)  # v8bf16
 
 
 def _e8m0_byte_to_f32(packed_i32, byte_pos):
@@ -492,10 +511,10 @@ def make_b_loader(
     Returns a :class:`_BLoader`. The closures emit no IR until called, so building them
     here rather than inline in the kernel body does not perturb instruction order.
 
-    Cache-key note: FlyDSL hashes this factory's source (not nested ``upconvert_b``).
-    Decode edits live in ``_mxfp4_nibble_to_bf16x8`` / ``_fp4x4_e2m1_to_f32x4``; bump
-    this comment (or set FLYDSL_EXTRA_SOURCE_DIRS at this package) after those edits
-    so AOT cache cannot reuse the previous ISA. v_perm LUT decode, 2026-08-18.
+    Cache-key note: FlyDSL hashes this factory's source (not nested helpers).
+    Decode lives in ``_mxfp4_nibble_to_bf16x8`` / ``_fp4x4_e2m1_to_f32x4`` /
+    ``_int4_nibble_to_bf16x8``; bump this paragraph after those edits so AOT
+    cache cannot reuse the previous ISA. gfx942 lshr-16 bf16 pack (not truncf).
     """
     _is_int4 = w_dtype == "int4"
     _is_bf16 = w_dtype == "bf16"
@@ -793,7 +812,7 @@ def make_b_loader(
                 fx.Int32(i32_val), scale_f32, use_k16=use_k16, old_pack=True
             )
         # raw[ku//4][ku%4] i32 holds 8 fp4. gfx950: 4x v_cvt_scalef32_pk_bf16_fp4.
-        # gfx942 (use_k16): that cvt is illegal; software E2M1->bf16.
+        # gfx942 (use_k16): that cvt is illegal; software E2M1 + lshr-16 bf16 pack.
         if const_expr(use_k16):
             return _mxfp4_nibble_to_bf16x8(fx.Int32(i32_val), scale_f32)
         s_raw = _raw(scale_f32)
