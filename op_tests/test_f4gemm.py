@@ -573,9 +573,9 @@ def main():
         type=int,
         nargs="*",
         choices=[1, 0],
-        default=[1, 0],
+        default=None,
         help="A-preshuffle sweep list: 1 preshuffles A (M%%16), 0 sends it "
-        "row-major (M%%1). Default sweeps both.",
+        "row-major (M%%1). Default (unset): func/profile = [1], perf = [1, 0].",
     )
     parser.add_argument(
         "--outtype",
@@ -677,6 +677,15 @@ def main():
     else:
         shapes = FUNC_SHAPES if args.mode == "func" else PERF_SHAPES
 
+    # A-preshuffle sweep. Mode-aware default when unset: func/profile exercise only
+    # the preshuffled path ([1]); perf sweeps both ([1, 0]).
+    if args.apre is not None:
+        apre_list = args.apre
+    elif args.mode in ("perf", "profile"):
+        apre_list = [1]
+    else:
+        apre_list = [1, 0]
+
     rows = [
         test_gemm(
             intype,
@@ -692,7 +701,7 @@ def main():
             knl_name=args.knl_name,
         )
         for apre, (di, si), intype, outtype, (M, N, K) in itertools.product(
-            args.apre, init_pairs, args.intype, args.outtype, shapes
+            apre_list, init_pairs, args.intype, args.outtype, shapes
         )
     ]
     df = pd.DataFrame(rows)

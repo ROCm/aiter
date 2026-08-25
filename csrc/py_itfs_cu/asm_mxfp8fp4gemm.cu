@@ -36,9 +36,36 @@
 #include "aiter_ctypes_error.h"
 #include "asm_mxfp8fp4gemm_configs.hpp"
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <cxxabi.h>
 #include <memory>
+#include <string>
+#include <unistd.h>
 #include <hip/hip_runtime.h>
+
+// Demangle an Itanium C++ ABI symbol (the CSV knl_name) for readable logs;
+// returns the input unchanged if demangling fails.
+static std::string demangle_knl(const std::string& mangled)
+{
+    int status         = 0;
+    char* out          = abi::__cxa_demangle(mangled.c_str(), nullptr, nullptr, &status);
+    std::string result = (status == 0 && out) ? out : mangled;
+    std::free(out);
+    return result;
+}
+
+// ANSI bold-red for the "poor perf" tag, emitted only when stderr is a TTY
+// (AITER_LOG_WARNING writes to std::cerr); redirected/piped logs stay clean.
+static const char* ansi_red()
+{
+    return isatty(fileno(stderr)) ? "\033[1;31m" : "";
+}
+static const char* ansi_reset()
+{
+    return isatty(fileno(stderr)) ? "\033[0m" : "";
+}
 
 constexpr int MX_SCALE_BLOCK = 32;
 
@@ -78,15 +105,14 @@ static std::tuple<std::string, int> get_heuristic_kernel(int M,
                                                          int a_preshuffle,
                                                          CFG* cfgs)
 {
-    hipDevice_t dev;
-    hipDeviceProp_t dev_prop;
-    HIP_CALL(hipGetDevice(&dev));
-    HIP_CALL(hipGetDeviceProperties(&dev_prop, dev));
-    uint32_t num_cu                = dev_prop.multiProcessorCount;
-    uint32_t empty_cu              = num_cu;
-    uint32_t round                 = 0xffffffff;
-    float compute2mem_effi         = 1.0f;
+    // Tile choice is a plain size rule, not a round/efficiency search: a tiny M
+    // wastes most of a 256-tall tile's rows, so M<=64 takes the 64x512 variant;
+    // any larger M takes 256x256 (which also fills a full persistent 256-TG wave).
+    const int want_tile_m = (M <= 64) ? 64 : 256;
+    const int want_tile_n = (M <= 64) ? 512 : 256;
+
     std::string selectedKernelName = "";
+    std::string fallbackKernelName = ""; // any valid variant if the wanted tile is absent
 
     for(const auto& el : *cfgs)
     {
@@ -103,28 +129,20 @@ static std::tuple<std::string, int> get_heuristic_kernel(int M,
         if((M % m_align) != 0 || (N % F8GEMM_N_ALIGN) != 0 || (K % F8GEMM_K_ALIGN) != 0)
             continue;
 
-        int tg_num_M = (M + cfg.tile_m - 1) / cfg.tile_m; // tiles in M (gdy)
-        int tg_num_N = (N + cfg.tile_n - 1) / cfg.tile_n; // tiles in N (gdx)
+        // Remember the first valid variant so an odd (b_intype,outtype) combo that
+        // only ships one tile still resolves.
+        if(fallbackKernelName.empty())
+            fallbackKernelName = el.first;
 
-        uint32_t tg_num      = tg_num_M * tg_num_N;
-        uint32_t local_round = (tg_num + num_cu - 1) / num_cu;
-
-        float local_compute2mem_effi = (float)(cfg.tile_m * cfg.tile_n) / (cfg.tile_m + cfg.tile_n);
-
-        bool is_earlier_round        = (local_round < round);
-        bool is_same_round           = (local_round == round);
-        bool has_sufficient_empty_cu = (empty_cu > (local_round * num_cu - tg_num));
-        bool has_better_efficiency   = (local_compute2mem_effi > compute2mem_effi);
-
-        if(is_earlier_round ||
-           (is_same_round && (has_sufficient_empty_cu || has_better_efficiency)))
+        if(cfg.tile_m == want_tile_m && cfg.tile_n == want_tile_n)
         {
-            round              = local_round;
-            empty_cu           = local_round * num_cu - tg_num;
-            compute2mem_effi   = local_compute2mem_effi;
             selectedKernelName = el.first;
+            break;
         }
     }
+
+    if(selectedKernelName.empty())
+        selectedKernelName = fallbackKernelName;
 
     AITER_CHECK(selectedKernelName != "",
                 __func__,
@@ -265,6 +283,26 @@ static void mxfp8fp4_launch(aiter_tensor_t* A,
     const int cluster_y = cfg.cluster_y > 0 ? cfg.cluster_y : 1;
 
     constexpr int WG_MAX = 256; // must match the .co's WG_MAX
+
+    // Report the actual thread-groups (tiles) that carry real work. The .co is a
+    // persistent shader tuned for a full WG_MAX (256) wave: it always launches
+    // WG_MAX threadgroups regardless of problem size. When the real tile count
+    // isn't a multiple of 256, the final wave leaves the leftover threadgroup
+    // slots idle (wasted CUs), so warn.
+    const int tg_num_M  = (Mdim + cfg.tile_m - 1) / cfg.tile_m;
+    const int tg_num_N  = (Ndim + cfg.tile_n - 1) / cfg.tile_n;
+    const int active_tg   = tg_num_M * tg_num_N;
+    const int wave_active = (active_tg % WG_MAX == 0) ? WG_MAX : (active_tg % WG_MAX);
+    const std::string tg_info =
+        demangle_knl(cfg.knl_name) + ": active " + std::to_string(wave_active) + "/" +
+        std::to_string(WG_MAX) + " TG (" + std::to_string(tg_num_M) + " M-tiles x " +
+        std::to_string(tg_num_N) + " N-tiles, tile_m=" + std::to_string(cfg.tile_m) +
+        ", tile_n=" + std::to_string(cfg.tile_n) + ")";
+    if(active_tg % WG_MAX == 0)
+        AITER_LOG_INFO("dispatch to " << tg_info);
+    else
+        AITER_LOG_WARNING("dispatch to " << tg_info << " - " << ansi_red() << "poor perf"
+                                         << ansi_reset() << "!");
 
     const int cluster_size = cluster_x * cluster_y;
     AITER_CHECK((WG_MAX % cluster_size) == 0,

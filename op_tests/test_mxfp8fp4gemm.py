@@ -369,9 +369,9 @@ def main():
         type=int,
         nargs="*",
         choices=[1, 0],
-        default=[1, 0],
+        default=None,
         help="A-preshuffle sweep list: 1 preshuffles A (M%%2), 0 sends it "
-        "row-major (M%%1). Default sweeps both.",
+        "row-major (M%%1). Default (unset): func/profile = [1], perf = [1, 0].",
     )
     parser.add_argument(
         "--outtype",
@@ -458,6 +458,15 @@ def main():
         )
     init_pairs = list(zip(di_list, si_list))
 
+    # A-preshuffle sweep. Mode-aware default when unset: func/profile exercise only
+    # the preshuffled path ([1]); perf sweeps both ([1, 0]).
+    if args.apre is not None:
+        apre_list = args.apre
+    elif args.mode in ("perf", "profile"):
+        apre_list = [1]
+    else:
+        apre_list = [1, 0]
+
     def shapes_for(intype):
         if args.shape is not None:
             return args.shape
@@ -480,7 +489,7 @@ def main():
             knl_name=args.knl_name,
         )
         for apre, (di, si), intype, outtype in itertools.product(
-            args.apre, init_pairs, args.intype, args.outtype
+            apre_list, init_pairs, args.intype, args.outtype
         )
         for (M, N, K) in shapes_for(intype)
     ]
