@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2025 FlyDSL Project Contributors
-"""MegaMoE fused dispatch, GEMM1, GEMM2, and combine implementation."""
+"""MegaMoEV2 fused dispatch, GEMM1, GEMM2, and combine implementation."""
 
 import flydsl.expr as fx
 import mori.shmem as ms
@@ -19,10 +19,10 @@ from .mega_moe_config import (
 )
 from .quant import per_1x32_mx_quant
 
-__all__ = ["MegaMoE"]
+__all__ = ["MegaMoEV2"]
 
 
-class MegaMoE:
+class MegaMoEV2:
     """Fused dispatch, GEMM1, GEMM2, and combine with one in-flight launch.
 
     Both A8W4 and A4W4 consume INTERLEAVE gate/up W1 weight and scale buffers.
@@ -35,7 +35,7 @@ class MegaMoE:
         swiglu_limit: float = 0.0):
     # fmt: on
         if quant not in ("a4w4", "a8w4"):
-            raise ValueError("MegaMoE quant must be 'a4w4' or 'a8w4'")
+            raise ValueError("MegaMoEV2 quant must be 'a4w4' or 'a8w4'")
         if experts % world_size != 0:
             raise ValueError(f"experts={experts} must be divisible by world_size={world_size}")
         if max_tok_per_rank <= 0 or max_tok_per_rank & (max_tok_per_rank - 1):

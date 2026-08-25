@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025-2026 FlyDSL Project Contributors
-"""GEMM2 compute for fused MegaMoE stage2."""
+"""GEMM2 compute for fused MegaMoE v2 stage2."""
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -141,7 +141,7 @@ def issue_a_load_lds_dt(
     for g in range_constexpr(n_row_groups):
         lds_row = gather_base_row + g * rows_per_call
         mask = (
-            lds_swizzle_mask_f8(lds_row + a_lane_row, 256)
+            lds_swizzle_mask_f8(lds_row + a_lane_row, KH_TILE_A)
             if const_expr(is_f8)
             else lds_swizzle_mask(lds_row + a_lane_row)
         )
@@ -187,7 +187,7 @@ def gemm2_compute(
     expert_offset=0,
 ):
     """Run the GEMM2 K-loop and return accumulators for the selected epilogue."""
-    assert aStages == (4 if g2_deep_a_pipeline else 3)
+    assert aStages == (4 if g2_deep_a_pipeline else kStages + 1)
     assert not g2_deep_a_pipeline or g2_b2stage
     # SBM is the sort padding unit; BM is the compute tile and must divide SBM.
     if SBM is None:
@@ -222,7 +222,8 @@ def gemm2_compute(
     K_SCALE_CHUNKS_MAX = INTER_MAX // 256
     # Four A slots make read/write reuse distance two K tiles; one WG barrier
     # can safely retire both slots instead of fencing every iteration.
-    kFenceEvery = max(1, aStages // 2) if g2_deep_a_pipeline else 1
+    kFenceEvery = (aStages - kStages) if g2_deep_a_pipeline else 1
+    assert kFenceEvery >= 1, "deep A pipeline needs aStages > kStages"
 
     # Padded shapes mask weight tiles beyond the real K/N extents.
     N_real = None
@@ -282,7 +283,7 @@ def gemm2_compute(
                 lds_row = lane_mod_16 + i * 16
                 row_off = fx.Int32(slot * slot_bytes) + lds_row * KH_TILE_A
                 if const_expr(is_f8_a):
-                    mask = lds_swizzle_mask_f8(lane_mod_16, 256)
+                    mask = lds_swizzle_mask_f8(lane_mod_16, KH_TILE_A)
                     col0 = lane_div_16 * 16 + k * 128
                     col_lo = col0 ^ mask
                     col_hi = (col0 + 64) ^ mask

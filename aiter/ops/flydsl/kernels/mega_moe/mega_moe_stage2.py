@@ -367,7 +367,7 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
     """Compile fused GEMM2 and weighted cross-rank P2P scatter."""
     arch = str(get_rocm_arch() or "")
     if not arch.startswith("gfx95"):
-        raise RuntimeError(f"MegaMoE stage2 requires CDNA4 (gfx95x), got {arch or 'unknown'}")
+        raise RuntimeError(f"MegaMoEV2 stage2 requires CDNA4 (gfx95x), got {arch or 'unknown'}")
     assert max_tok > 0 and (max_tok & (max_tok - 1)) == 0, "max_tok must be power of two"
     assert model_dim % BN == 0 and HIDDEN_MAX % BN == 0
     assert INTER_MAX % BK == 0, f"INTER_MAX must be a multiple of {BK}"
@@ -408,7 +408,7 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
     _row_nbytes = N_OUT + N_OUT // 32 if p2p_quant_type == "fp8_blockwise_1x32" else N_OUT * 2
     _comb_inp_nbytes = max_tok * topk * _row_nbytes if comb_inp_nbytes is None else int(comb_inp_nbytes)
     if not 0 < _comb_inp_nbytes < _BUFFER_OFFSET_ABI_BYTES:
-        raise ValueError("MegaMoE stage2 P2P buffer exceeds the 32-bit buffer-resource ABI")
+        raise ValueError("MegaMoEV2 stage2 P2P buffer exceeds the 32-bit buffer-resource ABI")
     _expert_offset = rank * experts
 
     @fx.struct

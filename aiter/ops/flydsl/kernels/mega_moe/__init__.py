@@ -1,13 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2025 FlyDSL Project Contributors
 
-"""MegaMoE fused operator with lazy public imports."""
+"""MegaMoEV2 fused MoE operator with lazy public imports."""
 
 import importlib
 
 _LAZY = {
     "MegaMoEConfig": "mega_moe_config",
-    "MegaMoE": "mega_moe",
+    "MegaMoEV2": "mega_moe",
     "Stage1Config": "mega_moe_config",
     "Stage2Config": "mega_moe_config",
     "compile_gemm1": "gemm1",

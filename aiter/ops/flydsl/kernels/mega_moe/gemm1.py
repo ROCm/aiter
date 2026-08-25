@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2025 FlyDSL Project Contributors
-"""GEMM1 compute shared by fused MegaMoE stage1 and its standalone interface."""
+"""GEMM1 compute shared by fused MegaMoE v2 stage1 and its standalone interface."""
 
 import functools
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+import torch
 from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr.typing import Vector as Vec
 
@@ -453,8 +454,23 @@ def gemm1_kernel(
     swiglu_limit: float = 0.0,
 ):
     # fmt: on
-    """Run standalone MegaMoE group GEMM1 and return ``(out, out_scale)``."""
+    """Run standalone MegaMoEV2 group GEMM1 and return ``(out, out_scale)``.
+    
+    Args:
+        out: Output tensor
+        x: Input activation tensor
+        w: Weight tensor (must be torch.uint8 dtype)
+        scale_x: Input scale tensor
+        scale_w: Weight scale tensor (must be torch.uint8 dtype)
+        tile_row_base: Tile row base indices
+        expert_ids: Expert ID tensor
+        out_scale: Output scale tensor
+        num_valid: Number of valid tokens
+        stream: CUDA stream
+    """
     num_valid = int(num_valid)
+    assert w.dtype == torch.uint8, f"w must be torch.uint8, got {w.dtype}"
+    assert scale_w.dtype == torch.uint8, f"scale_w must be torch.uint8, got {scale_w.dtype}"
     if num_valid < 0 or num_valid % int(sort_block_m):
         raise ValueError("num_valid must be a non-negative multiple of sort_block_m")
     if num_valid == 0:
