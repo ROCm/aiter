@@ -15,7 +15,7 @@ from aiter.ops.chunk_gated_delta_rule_fwd_h import (
     chunk_gated_delta_rule_fwd_h_hip_fn,
 )
 from aiter.ops.flydsl.linear_attention_prefill_kernels import (
-    chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip,
+    chunk_gated_delta_rule_fwd_h_flydsl_opt,
 )
 from aiter.ops.triton._triton_kernels.gated_delta_rule.decode.fused_sigmoid_gating_recurrent import (
     fused_sigmoid_gating_delta_rule_update,
@@ -1030,7 +1030,7 @@ def test_chunk_opt_varlen_hip(
                 ),
                 pytest.mark.skipif(
                     _is_gfx12_runtime(),
-                    reason="FlyDSL mfma16_hip K5 kernel does not support gfx12!",
+                    reason="FlyDSL opt K5 kernel does not support gfx12!",
                 ),
             ],
         ),
@@ -1093,13 +1093,13 @@ def test_chunk_opt_vk_indice(
             pytest.skip(reason="HIP kernel requires D=128 and bfloat16")
         extra_kwargs = {"g_head_major": True}
     elif backend == "flydsl":
-        fwd_h = chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip
-        # FlyDSL mfma16_hip is likewise specialized for K=V=128 / bf16. It now
+        fwd_h = chunk_gated_delta_rule_fwd_h_flydsl_opt
+        # FlyDSL opt is likewise specialized for K=V=128 / bf16. It now
         # mirrors the HIP g-layout contract (default token-major), and this test
         # feeds a 3-D head-major [B, H, T] gate, so pass g_head_major=True like
         # the HIP backend above.
         if D != 128:
-            pytest.skip(reason="FlyDSL mfma16_hip kernel requires D=128 and bfloat16")
+            pytest.skip(reason="FlyDSL opt kernel requires D=128 and bfloat16")
         extra_kwargs = {"g_head_major": True}
     else:
         fwd_h = chunk_gated_delta_rule_fwd_h_opt_vk

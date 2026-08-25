@@ -1589,7 +1589,7 @@
             "'-U__CUDA_NO_HALF_CONVERSIONS__'",
             "'-ftemplate-depth=1024'"
         ],
-        "extra_ldflags": "None",
+        "extra_ldflags": "['-lrocblas']",
         "extra_include": [
             "f'{AITER_GRADLIB_DIR}/include/'"
         ],
@@ -1607,7 +1607,7 @@
             "'-ftemplate-depth=1024'",
             "'-DENABLE_TORCH_FP8' if hasattr(torch, 'float8_e4m3fnuz') else '' "
         ],
-        "extra_ldflags": "None",
+        "extra_ldflags": "['-lhipblaslt', '-lhipblas']",
         "extra_include": [
             "f'{AITER_GRADLIB_DIR}/include/'"
         ],

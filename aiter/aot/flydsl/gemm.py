@@ -16,7 +16,11 @@ Supported kernel families:
   - ``flydsl_bpreshuffle_8w_*``               gfx950 8-wave a8w8 ptpc GEMM kernels
   - ``flydsl_bpreshuffle_wmma_*``             gfx1250 a8w8 ptpc GEMM kernels
   - ``flydsl_mxfp8_128_bpreshuffle_wmma_*``   gfx1250 mxfp8_128 GEMM kernels
+<<<<<<< HEAD
   - ``flydsl_decode_*``                       exact-shape BF16 decode GEMM kernels
+=======
+  - ``flydsl_mxfp8_128_bpreshuffle_compute_wmma_*`` gfx1250 compute-bound mxfp8_128 kernels
+>>>>>>> main
 
 Usage:
     # Compile all unique FlyDSL GEMM kernels from default CSVs
@@ -66,6 +70,18 @@ from aiter.ops.flydsl.gemm_kernels import (
 from aiter.ops.flydsl.kernels.hgemm_dispatch import compile_flydsl_hgemm_kernel
 from aiter.ops.flydsl.kernels.preshuffle_gemm import compile_preshuffle_gemm
 from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg, unused_tensor_arg
+from aiter.ops.flydsl.mxfp8_128_bpreshuffle_gemm_gfx1250 import (
+    BLOCK_K as SCALE_BLOCK_SIZE,
+)
+from aiter.ops.flydsl.mxfp8_128_bpreshuffle_gemm_gfx1250 import (
+    COMPUTE_WMMA_NAME_PREFIX as MXFP8_128_COMPUTE_WMMA_PREFIX,
+)
+from aiter.ops.flydsl.mxfp8_128_bpreshuffle_gemm_gfx1250 import (
+    WMMA_NAME_PREFIX as MXFP8_128_WMMA_PREFIX,
+)
+from aiter.ops.flydsl.mxfp8_128_bpreshuffle_gemm_gfx1250 import (
+    is_compute_wmma_kernel_name,
+)
 from aiter.ops.flydsl.mxfp8_128_bpreshuffle_gemm_gfx1250 import (
     parse_wmma_kernel_name as parse_mxfp8_128_wmma_kernel_name,
 )
@@ -222,7 +238,12 @@ def parse_csv(csv_path: str):
                 if params is not None:
                     params = dict(params)
                     params["kind"] = "8wave"
-            elif kernel_name.startswith("flydsl_mxfp8_128_bpreshuffle_wmma_"):
+            elif kernel_name.startswith(
+                (
+                    f"{MXFP8_128_WMMA_PREFIX}_",
+                    f"{MXFP8_128_COMPUTE_WMMA_PREFIX}_",
+                )
+            ):
                 params = parse_mxfp8_128_wmma_kernel_name(kernel_name)
                 if params is not None:
                     params = dict(params)
@@ -481,6 +502,7 @@ def _compile_8wave_to_cache(
 
 def _compile_mxfp8_128_wmma_to_cache(
     *,
+    kernel_name: str,
     m: int,
     n: int,
     k: int,
@@ -495,11 +517,17 @@ def _compile_mxfp8_128_wmma_to_cache(
     cluster_n: int,
     **kwargs,
 ):
-    del kwargs, split_k
+    del kwargs
 
     import torch
 
+    from aiter.ops.flydsl.kernels.gemm_a8w8_256x256_gfx1250 import (
+        launch_gemm_a8w8_256x256,
+    )
     from aiter.ops.flydsl.kernels.gemm_a8w8_gfx1250 import launch_gemm_a8w8
+    from aiter.ops.flydsl.kernels.gemm_a8w8_splitk_reduce_gfx1250 import (
+        compile_gemm_a8w8_splitk_reduce,
+    )
 
     dev = torch.device("cpu")
     k_blocks = (k + 127) // 128
@@ -511,12 +539,21 @@ def _compile_mxfp8_128_wmma_to_cache(
     stream = fx.Stream(0)
 
     with compile_only_env():
+<<<<<<< HEAD
         launch_gemm_a8w8(
             ptr_arg(out),
             ptr_arg(xq),
             ptr_arg(wq),
             ptr_arg(a_scale),
             ptr_arg(b_scale),
+=======
+        launch_args = (
+            _ptr_view_safe(out),
+            _ptr_view_safe(xq),
+            _ptr_view_safe(wq),
+            _ptr_view_safe(a_scale),
+            _ptr_view_safe(b_scale),
+>>>>>>> main
             m,
             stream,
             n,
@@ -535,6 +572,22 @@ def _compile_mxfp8_128_wmma_to_cache(
             cluster_n,
             True,
         )
+        launch = (
+            launch_gemm_a8w8_256x256
+            if is_compute_wmma_kernel_name(kernel_name)
+            else launch_gemm_a8w8
+        )
+        launch(*launch_args, SCALE_BLOCK_SIZE, split_k)
+        if split_k > 1:
+            compile_gemm_a8w8_splitk_reduce(split_k=split_k, out_dtype_str="bf16")(
+                _ptr_view_safe(out),
+                _ptr_view_safe(out),
+                m * n,
+                1,
+                n,
+                m * n * 2,
+                stream,
+            )
 
 
 def _compile_ptpc_wmma_to_cache(
@@ -553,11 +606,14 @@ def _compile_ptpc_wmma_to_cache(
     cluster_n: int,
     **kwargs,
 ):
-    del kwargs, split_k
+    del kwargs
 
     import torch
 
     from aiter.ops.flydsl.kernels.gemm_a8w8_gfx1250 import launch_gemm_a8w8
+    from aiter.ops.flydsl.kernels.gemm_a8w8_splitk_reduce_gfx1250 import (
+        compile_gemm_a8w8_splitk_reduce,
+    )
 
     dev = torch.device("cpu")
     xq = torch.empty((m, k), device=dev, dtype=torch.uint8)
@@ -591,7 +647,19 @@ def _compile_ptpc_wmma_to_cache(
             cluster_m,
             cluster_n,
             False,
+            SCALE_BLOCK_SIZE,
+            split_k,
         )
+        if split_k > 1:
+            compile_gemm_a8w8_splitk_reduce(split_k=split_k, out_dtype_str="bf16")(
+                _ptr_view_safe(out),
+                _ptr_view_safe(out),
+                m * n,
+                1,
+                n,
+                m * n * 2,
+                stream,
+            )
 
 
 def job_arch(cu_num: int = 0, gfx: str = "") -> str:
@@ -674,7 +742,13 @@ def compile_one_config(
             elif kind == "8wave":
                 _compile_8wave_to_cache(m=m, n=n, k=k, **kwargs)
             elif kind == "mxfp8_128_wmma":
-                _compile_mxfp8_128_wmma_to_cache(m=m, n=n, k=k, **kwargs)
+                _compile_mxfp8_128_wmma_to_cache(
+                    kernel_name=kernel_name,
+                    m=m,
+                    n=n,
+                    k=k,
+                    **kwargs,
+                )
             elif kind == "ptpc_wmma":
                 _compile_ptpc_wmma_to_cache(m=m, n=n, k=k, **kwargs)
             elif kind == "decode":
