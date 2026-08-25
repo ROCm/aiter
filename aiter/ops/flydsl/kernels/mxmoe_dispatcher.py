@@ -129,6 +129,8 @@ def compile_gemm2_a4w4_port(
     g2_bf16_lds=None,
     g2_kstatic=False,
     out_dtype="bf16",
+    enable_bias=False,
+    experts=1,
 ):
     """Compile gemm2 a4w4 down-proj; epilog 'atomic' (weighted atomic-fadd) or 'reduce' (store into out[token_id*topk+slot]). inter_dim runtime; SBM None -> SBM==BM byte-identical."""
     SBM = _norm_sbm(SBM, BM)
@@ -234,8 +236,9 @@ def compile_gemm2_a4w4_port(
     sblk_tag = f"_sblk{g2_scale_blk}" if (route_out_fp8 and g2_scale_blk != 8) else ""
     out_tag = "_fp8out" if route_out_fp8 else ""
     tile_tag = "" if (BN, BK) == (256, 256) else f"_bn{BN}_bk{BK}"
+    bias_tag = "_bias" if enable_bias else ""
     g2_epi_lanes = _pick_epi_lanes(BM, BN, route_out_fp8, g2_scale_blk)
-    tag = f"hmax{HIDDEN_MAX}_imax{INTER_MAX}_bm{BM}{tile_tag}{'_nt' if use_nt else ''}_{etag}{atag}{btag}{sbm_tag}{persist_tag}{pad_tag}{bh_tag}{apf_tag}{spart_tag}{bf16lds_tag}{dw_tag}{kst_tag}{pitch_tag}{sblk_tag}{out_tag}_v2"
+    tag = f"hmax{HIDDEN_MAX}_imax{INTER_MAX}_bm{BM}{tile_tag}{'_nt' if use_nt else ''}_{etag}{atag}{btag}{sbm_tag}{persist_tag}{pad_tag}{bh_tag}{apf_tag}{spart_tag}{bf16lds_tag}{dw_tag}{kst_tag}{pitch_tag}{sblk_tag}{out_tag}{bias_tag}_v2_biasabi6"
     name = f"gemm2_a4w4_port_{tag}"
 
     @fx.struct
@@ -252,6 +255,7 @@ def compile_gemm2_a4w4_port(
         arg_cumsum,
         arg_stids,
         arg_sweights,
+        arg_bias,
         arg_out,
         bx_i32,
         lane,
@@ -298,6 +302,7 @@ def compile_gemm2_a4w4_port(
                 arg_eids,
                 arg_stids,
                 arg_sweights,
+                arg_bias,
                 i32_M,
                 i32_max_m_blocks,
                 arg_out,
@@ -332,6 +337,8 @@ def compile_gemm2_a4w4_port(
                 route_out_fp8=route_out_fp8,
                 g2_epi_lanes=g2_epi_lanes,
                 g2_apre=g2_apre,
+                enable_bias=enable_bias,
+                bias_nbytes=experts * HIDDEN_MAX * 4,
                 mn_idx=mn_idx,
             )
 
@@ -399,6 +406,7 @@ def compile_gemm2_a4w4_port(
         arg_cumsum: fx.Int64,
         arg_stids: fx.Int64,
         arg_sweights: fx.Int64,
+        arg_bias: fx.Int64,
         i32_M: fx.Int32,
         i32_max_m_blocks: fx.Int32,
         i32_inter: fx.Int32,
@@ -424,6 +432,7 @@ def compile_gemm2_a4w4_port(
             arg_cumsum,
             arg_stids,
             arg_sweights,
+            arg_bias,
             arg_out,
             bx_i32,
             lane,
@@ -447,6 +456,7 @@ def compile_gemm2_a4w4_port(
         arg_cumsum: fx.Int64,
         arg_stids: fx.Int64,
         arg_sweights: fx.Int64,
+        arg_bias: fx.Int64,
         i32_M: fx.Int32,
         i32_max_m_blocks: fx.Int32,
         i32_grid_blocks: fx.Int32,
@@ -470,6 +480,7 @@ def compile_gemm2_a4w4_port(
             arg_cumsum,
             arg_stids,
             arg_sweights,
+            arg_bias,
             i32_M,
             i32_max_m_blocks,
             i32_inter,
@@ -507,6 +518,8 @@ def get_g2(
     g2_bf16_lds=None,
     g2_spart=None,
     g2_kstatic=False,
+    enable_bias=False,
+    experts=1,
 ):
     # Cache key uses compile-time buckets; runtime inter_dim/model_dim share a
     # launcher while remaining within their respective caps.
@@ -546,6 +559,8 @@ def get_g2(
         g2_bf16_lds,
         g2_kstatic,
         out_dtype,
+        enable_bias,
+        experts,
     )
     launch = G2_CACHE.get(key)
     if launch is None:
@@ -570,6 +585,8 @@ def get_g2(
             g2_bf16_lds=g2_bf16_lds,
             g2_kstatic=g2_kstatic,
             out_dtype=out_dtype,
+            enable_bias=enable_bias,
+            experts=experts,
         )
         G2_CACHE[key] = launch
     return launch
@@ -611,6 +628,7 @@ def mxfp4_moe_gemm2(
     g2_bf16_lds=None,
     g2_spart=None,
     stream=None,
+    bias=None,
 ):
     """Stage-2 down-proj gemm; epilog 'atomic' (weighted atomic.fadd) or 'reduce' (store into out[token_id*topk+slot]). inter_dim_pad/model_dim_pad>0 enable has_pad pad-skip (both 0 -> byte-identical); persist = fixed cu_num m-slot grid (default OFF)."""
     import torch
@@ -657,6 +675,11 @@ def mxfp4_moe_gemm2(
     _kstatic = os.environ.get("MXFP4_G2_KSTATIC", "1") == "1"
     if _kstatic:
         INTER_MAX = D_INTER
+    if bias is not None:
+        if bias.dtype != torch.float32:
+            bias = bias.to(torch.float32)
+        if not bias.is_contiguous():
+            bias = bias.contiguous()
     launch = get_g2(
         BM,
         BN,
@@ -676,6 +699,8 @@ def mxfp4_moe_gemm2(
         out_dtype=out_dtype,
         g2_bf16_lds=g2_bf16_lds,
         g2_spart=g2_spart,
+        enable_bias=bias is not None,
+        experts=NE,
     )
     max_m_blocks = (max_sorted + BM - 1) // BM
     if persist:
@@ -701,6 +726,7 @@ def mxfp4_moe_gemm2(
         cumsum_tensor.data_ptr(),
         sorted_token_ids.data_ptr(),
         sorted_weights.data_ptr(),
+        (bias if bias is not None else out).data_ptr(),
         M_logical,
         max_m_blocks,
         grid_blocks,

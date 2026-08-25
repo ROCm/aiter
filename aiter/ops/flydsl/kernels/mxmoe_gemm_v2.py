@@ -225,6 +225,7 @@ def gemm2_body_v2(
     arg_eids,
     arg_stids,
     arg_sweights,
+    arg_bias,
     i32_M,
     i32_max_m_blocks,
     arg_out,
@@ -261,6 +262,8 @@ def gemm2_body_v2(
     g2_scale_blk=8,
     g2_epi_lanes=None,
     g2_apre=False,
+    enable_bias=False,
+    bias_nbytes=0,
 ):
     # GEMM2 double-buffers B weight and scale one tile ahead. bhoist issues that
     # prefetch above the LDS barrier; ascale_pf prefetches A-scale one tile ahead.
@@ -617,6 +620,8 @@ def gemm2_body_v2(
             arg_out,
             arg_stids,
             arg_sweights,
+            arg_bias,
+            e,
             m_row,
             n_block_idx,
             wave,
@@ -634,6 +639,8 @@ def gemm2_body_v2(
             g2_out_pitch_align=g2_out_pitch_align,
             g2_scale_blk=g2_scale_blk,
             g2_epi_lanes=g2_epi_lanes,
+            enable_bias=enable_bias,
+            bias_nbytes=bias_nbytes,
             **kw,
         )
 
@@ -844,6 +851,8 @@ def atomic_bf16_epilog(
     arg_out,
     arg_stids,
     arg_sweights,
+    arg_bias,
+    expert_id,
     m_row,
     n_block_idx,
     wave,
@@ -864,6 +873,8 @@ def atomic_bf16_epilog(
     g2_epi_lanes=None,
     emit_thunks=None,
     lds_ready=False,
+    enable_bias=False,
+    bias_nbytes=0,
 ):
     if SBM is None:
         SBM = BM
@@ -918,9 +929,12 @@ def atomic_bf16_epilog(
 
     stids = flat_buffer(arg_stids, T.i32, 4)
     sweights = flat_buffer(arg_sweights, T.f32, 4)
-    out_bf16 = flat_buffer(arg_out, T.bf16, 4, _out_nrec)
+    bias_f32 = None
+    if const_expr(enable_bias):
+        bias_f32 = flat_buffer(arg_bias, T.f32, 4, nrec=bias_nbytes)
+    out_bf16 = flat_buffer(arg_out, T.bf16, 4)
     out_bf16_ptr = global_typed_ptr(arg_out, T.bf16, align=2)
-    out_i8 = flat_buffer(arg_out, T.i8, 4, _out_nrec)
+    out_i8 = flat_buffer(arg_out, T.i8, 4)
 
     load_i32 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), Int32)
     load_f32 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), Float32)
@@ -932,6 +946,14 @@ def atomic_bf16_epilog(
         frag = fx.make_rmem_tensor(1, elem_ty)
         fx.copy(atom, src[None, index], frag)
         return Vec(frag.load())[0]
+
+    def load_bias(col):
+        return load_scalar(
+            load_f32,
+            bias_f32,
+            expert_id * N_OUT + col,
+            Float32,
+        )
 
     defer_w = bool(g2_defer_weight)
 
@@ -1001,14 +1023,6 @@ def atomic_bf16_epilog(
             return
         gpu.barrier()
 
-    # read back + weighted store (atomic: fadd out[token_id]; reduce: store out[token_id*topk+slot]);
-    # token_id<i32_M gates padding at runtime. At small/mid M the block-sparse sort floor is
-    # ~97% padding rows (M64: 12288 pad vs 384 real); ungated, every padding row (token_id==M) issues
-    # a weighted atomic-fadd into an OOB out-row -> 77x wasted atomics + L2 RMW serialization
-    # (rocprof M64: TCC_ATOMIC 7.3M->95K, 932us->107us). Reduce mode needs the
-    # same gate: its raw-pointer store is not protected by a buffer descriptor,
-    # so padding rows otherwise write beyond [M, topk, N].
-
     def store_one_mr(mr):
         row_in_block = fx.Int32(mr * EPI_ROWS) + m_lane
         token_id = packed[mr] & fx.Int32(0x00FFFFFF)
@@ -1042,13 +1056,33 @@ def atomic_bf16_epilog(
                     for q in range_constexpr(route_vec):
                         idx_q = row_in_block * BN + col_lane8 + fx.Int32(q)
                         if const_expr(bf16_src):
-                            bvals.append(lds_base_bf16[idx_q])
+                            bval = lds_base_bf16[idx_q]
+                            if const_expr(enable_bias):
+                                bias_val = load_bias(col_g0 + q)
+                                if const_expr(not defer_w):
+                                    bias_val = bias_val * weight[mr]
+                                bval = (
+                                    fx.Float32(bval) + bias_val
+                                ).to(BFloat16)
+                            bvals.append(bval)
                         elif const_expr(g2_bf16_lds):
-                            vals.append(fx.Float32(lds_base_bf16[idx_q]))
+                            val = fx.Float32(lds_base_bf16[idx_q])
+                            if const_expr(enable_bias):
+                                bias_val = load_bias(col_g0 + q)
+                                if const_expr(not defer_w):
+                                    bias_val = bias_val * weight[mr]
+                                val = val + bias_val
+                            vals.append(val)
                         elif const_expr(defer_w):
-                            vals.append(fx.Float32(lds_base_fptr[idx_q]))
+                            val = fx.Float32(lds_base_fptr[idx_q])
+                            if const_expr(enable_bias):
+                                val = val + load_bias(col_g0 + q)
+                            vals.append(val)
                         else:
-                            vals.append(fx.Float32(lds_base_fptr[idx_q]) * weight[mr])
+                            val = fx.Float32(lds_base_fptr[idx_q])
+                            if const_expr(enable_bias):
+                                val = val + load_bias(col_g0 + q)
+                            vals.append(val * weight[mr])
                     if const_expr(bf16_src):
                         msk = Vec.filled([2], 0x7FFF, Int16)
                         acc = None
@@ -1150,6 +1184,20 @@ def atomic_bf16_epilog(
                             align=4,
                         )
                     )
+                    if const_expr(enable_bias):
+                        bias_col = n_block_idx * BN + col_start + s * store_group_n
+                        bias0 = load_bias(bias_col)
+                        bias1 = load_bias(bias_col + 1)
+                        if const_expr(not defer_w):
+                            bias0 = bias0 * weight[mr]
+                            bias1 = bias1 * weight[mr]
+                        pk = Vec.from_elements(
+                            [
+                                fx.Float32(pk[0]) + bias0,
+                                fx.Float32(pk[1]) + bias1,
+                            ],
+                            Float32,
+                        ).to(BFloat16)
                 else:
                     v2 = Vec(
                         lds_vec_load(
@@ -1160,11 +1208,17 @@ def atomic_bf16_epilog(
                             align=8,
                         )
                     )
+                    v0 = fx.Float32(v2[0])
+                    v1 = fx.Float32(v2[1])
+                    if const_expr(enable_bias):
+                        bias_col = n_block_idx * BN + col_start + s * store_group_n
+                        v0 = v0 + load_bias(bias_col)
+                        v1 = v1 + load_bias(bias_col + 1)
                     if const_expr(defer_w):
-                        pk = Vec.from_elements([v2[0], v2[1]], Float32).to(BFloat16)
+                        pk = Vec.from_elements([v0, v1], Float32).to(BFloat16)
                     else:
                         pk = Vec.from_elements(
-                            [v2[0] * weight[mr], v2[1] * weight[mr]], Float32
+                            [v0 * weight[mr], v1 * weight[mr]], Float32
                         ).to(BFloat16)
                 out_frag = fx.make_rmem_tensor(store_vec, BFloat16)
                 out_frag.store(pk)

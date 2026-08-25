@@ -2106,6 +2106,7 @@ def _flydsl_v2_stage2_wrapper(
         g2_bf16_lds=cfg["bf16_lds"],
         g2_spart=cfg["spart"],
         out_dtype="fp8" if _s2_fp8_inter else "bf16",
+        bias=bias2,
     )
     if epilog == "reduce":
         from aiter.ops.flydsl.moe_kernels import _run_moe_reduction
@@ -2634,8 +2635,7 @@ def get_2stage_cfgs(
             run_1stage,
             has_bias=enable_bias and (is_opus1 or is_flydsl1),
             fuse_quant=_fuse_quant,
-            stage2_has_bias=enable_bias
-            and ((is_flydsl2 and not is_flydsl2_layout) or is_cktile2),
+            stage2_has_bias=enable_bias and (is_flydsl2 or is_cktile2),
             skip_inter_quant="_moe2_layout_" in str(kernelName2),
             **route_bucket_metadata,
         )
