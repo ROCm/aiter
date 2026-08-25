@@ -1792,7 +1792,6 @@ def test_chunk_opt_vk_k5_hip_matches_triton_tail_gfx12():
     assert_close("tail state HIP vs Triton", final_state_triton, final_state_hip, 0.005)
 
 
-
 def test_chunk_opt_vk_rejects_dense_index_count_mismatch():
     with pytest.raises(ValueError, match="state indices.*2 rather than 1"):
         chunk_gated_delta_rule_opt_vk(
