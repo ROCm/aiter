@@ -27,7 +27,7 @@ from functools import lru_cache
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
+from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
 from aiter.jit.utils.chip_info import get_gfx
@@ -36,6 +36,7 @@ from .. import buffer_ops
 from ..tensor_shim import GTensor, _run_compiled
 
 Vec = fx.Vector
+
 
 def _imax(a, b):
     return (a > b).select(a, b)
@@ -76,30 +77,43 @@ def _load_pack_i32x8(i32_view, byte_off_i32):
     return Vec(v4_lo).shuffle(v4_hi, list(range(8))).ir_value()
 
 
-def _load_row_weights(w_t, mfma, m_tiles, row, lane_div_N):
-    """``weights[row, h]`` per (mi, ii) for one query row.
+def _make_weight_copy(mma, lane):
+    """C-side tiled copy used to distribute the per-head weights.
 
-    The head an accumulator element belongs to is
-    ``mi*MFMA_M + acc_head_static_offsets[ii] + lane_div_N*acc_head_group_stride``
-    (see ``MfmaAtom``).
+    The single-tile tiled MMA exists to derive the C-fragment partitioning.
+    Sliced by ``lane``, not ``tid``: each wave owns disjoint column tiles.
     """
-    lane_head = lane_div_N * fx.Int32(mfma.acc_head_group_stride)
-    row_w = [[None] * mfma.ACC_ELEMS for _ in range_constexpr(m_tiles)]
-    for mi in range_constexpr(m_tiles):
-        for ii in range_constexpr(mfma.ACC_ELEMS):
-            h_w = (
-                fx.Int32(mi * mfma.MFMA_M + mfma.acc_head_static_offsets[ii])
-                + lane_head
-            )
-            row_w[mi][ii] = fx.Float32(w_t[row, h_w])
-    return row_w
+    tmma = fx.make_tiled_mma(mma, fx.make_layout((1, 1, 1), (0, 0, 0)))
+    cp = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Float32)
+    return cp, fx.make_tiled_copy_C(cp, tmma).get_slice(lane)
+
+
+def _load_row_weights(weights, H, cp_atom, tc_c, m_tiles, mfma_n, row):
+    """``weights[row, :]`` distributed to match this lane's accumulator elements.
+
+    The source is a broadcast along N -- a weight depends on the head (the M
+    mode) but not on the KV column -- hence the stride-0 N mode.
+    ``partition_S`` handles the degenerate mode and derives the
+    accumulator-element -> head mapping.
+    """
+    it = fx.add_offset(
+        fx.get_iter(fx.rocdl.make_buffer_tensor(weights, max_size=True)),
+        row * fx.Int32(H),
+    )
+    wv = fx.Tensor(fx.make_view(it, fx.make_layout((H, mfma_n), (1, 0))))
+    pS = tc_c.partition_S(wv)  # ((1, V), M_TILES, 1)
+    frag = fx.make_fragment_like(pS)
+    fx.copy(cp_atom, pS, frag)
+    # Vector(...) flattens the nested value mode into C-TV order, so the
+    # epilogue can keep indexing w_row[mi][ii] flat.
+    return [Vec(frag[None, mi, 0].load()) for mi in range_constexpr(m_tiles)]
 
 
 def _emit_col_sum(mfma, mma, gemm_kw, a_row, b_pack, w_row, kv_scale, f32_0):
     """One lane's logit contribution for a single (query row, n-tile) pair.
 
     ``a_row``/``w_row`` are that row's per-(mi, kk) A-fragments and per-(mi, ii)
-    weights; ``b_pack`` is the n-tile's per-kk B-fragments. 
+    weights; ``b_pack`` is the n-tile's per-kk B-fragments.
     ``kv_scale`` (>=0) is hoisted out of the head sum: ReLU is
     positive-homogeneous, so ReLU(s*x) = s*ReLU(x) and the whole column sum is
     scaled once instead of every head term -- drops M_TILES*ACC_ELEMS muls to one.
@@ -316,7 +330,7 @@ def _no_gemm_kwargs():
 
 def _identity_scale_kwargs():
     """``fx.gemm`` state for the CDNA4 scaled atoms (K=128/64).
-Next 
+
     These instructions always carry ``scale_a``/``scale_b`` UE8M0 operands as
     part of their encoding, and the atom defaults them to 0 -- which is not
     identity in UE8M0. A compile-time identity scale makes the hardware
@@ -351,8 +365,6 @@ class MfmaAtom:
         Shape tag, e.g. ``"16x16x32"``.
     MFMA_M, MFMA_N, MFMA_K : int
         Output tile is MFMA_M x MFMA_N; MFMA_K fp8 elements reduced per step.
-    ACC_ELEMS : int
-        f32 accumulator elements per lane (``vec<ACC_ELEMS x f32>``).
     make_atom : Callable
         ``() -> fx`` MMA atom. Must be called inside the ``@flyc.kernel`` body.
     make_frag : Callable
@@ -360,21 +372,6 @@ class MfmaAtom:
         ``fx.gemm`` takes. Rank-1 operands short-circuit to a single
         ``MmaAtomCall``, so the kernel's hand-computed fragment addressing is
         untouched and the atom bitcasts anything whose type does not match.
-    shuffle_offsets : tuple[int, ...]
-        ``shuffle_xor`` offsets for the in-wave head-reduce butterfly; must
-        cover every lane group so the full H-wide sum is produced.
-    acc_head_static_offsets : tuple[int, ...]
-        Compile-time head offset within one MFMA_M tile, per accumulator
-        element. Length == ACC_ELEMS. For element ``ii`` in lane group ``g``::
-
-            head_within_tile = acc_head_static_offsets[ii]
-                               + g * acc_head_group_stride
-            weight_index     = mi * MFMA_M + head_within_tile
-
-        For 16x16x32 (4 groups, ACC_ELEMS=4) the layout is sequential, so the
-        offsets are ``(0, 1, 2, 3)`` with stride 4.
-    acc_head_group_stride : int
-        Multiplier for the lane-group index (4 on gfx942/gfx950 fp8 MFMA).
     frag_bytes : int
         A/B fragment bytes owned by one lane for one K-step. 8 for the dense
         atoms (one i64 load).
@@ -391,93 +388,78 @@ class MfmaAtom:
     MFMA_M: int
     MFMA_N: int
     MFMA_K: int
-    ACC_ELEMS: int
     make_atom: Callable
     make_frag: Callable
-    shuffle_offsets: tuple
-    acc_head_static_offsets: tuple  # length == ACC_ELEMS
-    acc_head_group_stride: int
     frag_bytes: int = 8
     gemm_kwargs: Callable = _no_gemm_kwargs
     kname_tag: str | None = None
 
+    @property
+    def ACC_ELEMS(self) -> int:
+        """f32 accumulator elements per lane (``vec<ACC_ELEMS x f32>``)."""
+        return self.MFMA_M * self.MFMA_N // 64
 
-#: 16x16 output tile, K=32 fp8 elements/step. Acc: vec<4 x f32>.
-#: Fragment layout: lane l -> A[row=l%16, k=(l//16)*8 + 0..7], col=l%16.
+    @property
+    def shuffle_offsets(self) -> tuple:
+        """``shuffle_xor`` offsets for the in-wave head-reduce butterfly.
+
+        The lanes holding distinct heads for a fixed column are exactly those
+        differing in ``lane // MFMA_N``, so the butterfly is the powers of two
+        from MFMA_N up to the 64-lane wave: (16, 32) for the 16x16 atoms,
+        (32,) for 32x32.
+        """
+        return tuple(
+            self.MFMA_N << k for k in range((64 // self.MFMA_N).bit_length() - 1)
+        )
+
+
+#: gfx942/CDNA3 dense MFMA: 16x16 output tile, K=32 fp8 elements/step.
+#: A-fragment layout: lane l -> A[row=l%16, k=(l//16)*8 + 0..7], col=l%16.
 #: Writer lanes: l//16 == 0 (16 distinct output columns per tile).
-#: Acc layout: acc[ii] in lane group g -> head g*4 + ii.
 _MFMA16 = MfmaAtom(
     name="16x16x32",
     MFMA_M=16,
     MFMA_N=16,
     MFMA_K=32,
-    ACC_ELEMS=4,
     make_atom=lambda: fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 32, fx.Float8E4M3FNUZ)),
     make_frag=_frag_i64,
-    shuffle_offsets=(16, 32),
-    acc_head_static_offsets=(0, 1, 2, 3),
-    acc_head_group_stride=4,
     kname_tag="mfma",
 )
 
 #: gfx950/CDNA4 scaled MFMA: 16x16 output tile, K=128 fp8f6f4 elements/step.
-#: Acc: vec<4 x f32> -- the same layout as _MFMA16, because tv_layout_c depends
-#: only on (M, N), not on the reduction depth. Fragment: vector<8xi32>
-#: (32 bytes/lane), 4x _MFMA16's 8-byte fragment, tracking the 4x K increase.
-#: Requires native FN operands (this instruction rejects FNUZ) and, via the
-#: generic ``D % MFMA_K`` assert, head_size % 128 == 0.
+#: Same accumulator layout as _MFMA16, because tv_layout_c depends only on
+#: (M, N), not on the reduction depth. A-fragment: vector<8xi32> (32 bytes/lane),
+#: 4x _MFMA16's, tracking the 4x K increase. Requires native FN operands (this
+#: instruction rejects FNUZ) and, via the generic ``D % MFMA_K`` assert,
+#: head_size % 128 == 0.
 _MFMA16_K128 = MfmaAtom(
     name="16x16x128",
     MFMA_M=16,
     MFMA_N=16,
     MFMA_K=128,
-    ACC_ELEMS=4,
     make_atom=lambda: fx.make_mma_atom(
         fx.rocdl.cdna4.MFMA_Scale(16, 16, 128, fx.Float8E4M3FN)
     ),
     make_frag=_frag_i32x8,
-    shuffle_offsets=(16, 32),
-    acc_head_static_offsets=(0, 1, 2, 3),
-    acc_head_group_stride=4,
     frag_bytes=32,
     gemm_kwargs=_identity_scale_kwargs,
 )
 
 #: gfx950/CDNA4 scaled MFMA: 32x32 output tile, K=64 fp8f6f4 elements/step.
-#: Acc: vec<16 x f32>; the two lane groups interleave in blocks of 4, hence the
-#: static offsets below. Fragment: vector<8xi32> (32 bytes/lane). Requires
-#: native FN operands (rejects FNUZ); serves head_size 64 and 128.
+#: Accumulator is vec<16 x f32> whose two lane groups interleave in blocks of 4
+#: (heads 0..3, 8..11, 16..19, 24..27) -- non-contiguous, which is exactly why
+#: the weight distribution is left to the layout algebra rather than typed out.
+#: A-fragment: vector<8xi32> (32 bytes/lane). Requires native FN operands
+#: (rejects FNUZ); serves head_size 64 and 128.
 _MFMA32_K64 = MfmaAtom(
     name="32x32x64",
     MFMA_M=32,
     MFMA_N=32,
     MFMA_K=64,
-    ACC_ELEMS=16,
     make_atom=lambda: fx.make_mma_atom(
         fx.rocdl.cdna4.MFMA_Scale(32, 32, 64, fx.Float8E4M3FN)
     ),
     make_frag=_frag_i32x8,
-    shuffle_offsets=(32,),
-    acc_head_static_offsets=(
-        # ii=0..3 -> g*4 + 0..3, ii=4..7 -> g*4 + 8..11, etc.
-        0,
-        1,
-        2,
-        3,
-        8,
-        9,
-        10,
-        11,
-        16,
-        17,
-        18,
-        19,
-        24,
-        25,
-        26,
-        27,
-    ),
-    acc_head_group_stride=4,
     frag_bytes=32,
     gemm_kwargs=_identity_scale_kwargs,
 )
@@ -596,13 +578,13 @@ def _build_kernel_mfma_r_w(
         # Byte offset of this lane's fragment within the K-step (FRAG_BYTES per
         # lane group). 8 for the dense atoms.
         lane_frag_off = lane_div_N * fx.Int32(FRAG_BYTES)
+        cp_4xfp32, tc_c_w = _make_weight_copy(mma, lane)
 
         # fp8 operands are read 8 bytes at a time as 2 i32 dwords (v8i8
         # buffer_load fails to lower on gfx942), bitcast to i64 for the MFMA.
         q_i32 = GTensor(Q, dtype=T.i32, shape=(-1,))
         kv_i32 = GTensor(KV, dtype=T.i32, shape=(-1,))
         sc_t = GTensor(kv_scales, dtype=T.f32, shape=(-1,))
-        w_t = GTensor(weights, dtype=T.f32, shape=(-1, H))
         cs_t = GTensor(cu_starts, dtype=T.i32, shape=(-1,))
         ce_t = GTensor(cu_ends, dtype=T.i32, shape=(-1,))
         # Per-row 1-D output view: the row's i64 byte offset goes into the base
@@ -681,7 +663,9 @@ def _build_kernel_mfma_r_w(
                     )
             a_packs[j] = row_a
 
-            w_frag[j] = _load_row_weights(w_t, mfma, M_TILES, row, lane_div_N)
+            w_frag[j] = _load_row_weights(
+                weights, H, cp_4xfp32, tc_c_w, M_TILES, MFMA_N, row
+            )
 
         # ---- Union window across all RPB rows ----
         tile_start = starts[0]
@@ -988,6 +972,7 @@ def _build_kernel_mfma_lds_pipe(
         lane_div_N = lane // fx.Int32(mfma.MFMA_N)
         lane_mod_N = lane % fx.Int32(mfma.MFMA_N)
         lane_frag_off = lane_div_N * fx.Int32(mfma.frag_bytes)
+        cp_4xfp32, tc_c_w = _make_weight_copy(mma, lane)
 
         # First row owned by this wave.
         wave_row0 = block_row0 + wave * fx.Int32(RPW)
@@ -996,7 +981,6 @@ def _build_kernel_mfma_lds_pipe(
         kv_i32 = GTensor(KV, dtype=T.i32, shape=(-1,))
         kv_rsrc = kv_i32.rsrc
         sc_t = GTensor(kv_scales, dtype=T.f32, shape=(-1,))
-        w_t = GTensor(weights, dtype=T.f32, shape=(-1, H))
         cs_t = GTensor(cu_starts, dtype=T.i32, shape=(-1,))
         ce_t = GTensor(cu_ends, dtype=T.i32, shape=(-1,))
         _stride_i64 = fx.Int64(fx.Uint32(stride_logits_s))
@@ -1098,7 +1082,9 @@ def _build_kernel_mfma_lds_pipe(
                     )
             a_packs[j] = row_a_frag
 
-            w_frag[j] = _load_row_weights(w_t, mfma, M_TILES, row, lane_div_N)
+            w_frag[j] = _load_row_weights(
+                weights, H, cp_4xfp32, tc_c_w, M_TILES, mfma.MFMA_N, row
+            )
 
         # ---- Union KV window across all block rows (all waves cooperate) ----
         u_start = None
