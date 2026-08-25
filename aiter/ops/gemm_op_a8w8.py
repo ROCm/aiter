@@ -2,21 +2,22 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import functools
-from typing import Optional
 
 import pandas as pd
 import torch
 import torch.nn.functional as F
-from aiter import logger
 from torch import Tensor
 from torch.library import Library
+
+from aiter import logger
 
 from ..jit.core import (
     AITER_CONFIGS,
     AITER_LOG_TUNED_CONFIG,
     compile_ops,
 )
-from ..jit.utils.chip_info import get_cu_num, get_gfx_runtime as get_gfx
+from ..jit.utils.chip_info import get_cu_num
+from ..jit.utils.chip_info import get_gfx_runtime as get_gfx
 from ..jit.utils.torch_guard import torch_compile_guard
 from ..ops.gemm_op_common import get_padded_m
 from ..utility import dtypes
@@ -45,7 +46,7 @@ def _hip_blockscale_supported() -> bool:
     """True if the prebuilt HIP CK blockscale module covers the running arch (else triton)."""
     try:
         return get_gfx() in _BLOCKSCALE_HIP_PREBUILT_ARCHES
-    except Exception:
+    except Exception:  # noqa: BLE001
         return False
 
 
@@ -54,7 +55,7 @@ def _ck_a8w8_supported() -> bool:
     arches (e.g. RDNA gfx11/gfx12) must fall back to the Triton kernel."""
     try:
         return get_gfx().startswith("gfx9")
-    except Exception:
+    except Exception:  # noqa: BLE001
         return True
 
 
@@ -64,7 +65,7 @@ def gen_gemm_a8w8_ck_fake_tensors(
     x_scale: torch.Tensor,
     w_scale: torch.Tensor,
     Out: torch.Tensor,
-    bias: Optional[torch.Tensor] = None,
+    bias: torch.Tensor | None = None,
     splitK: int = 0,
 ) -> torch.Tensor:
     return Out
@@ -79,7 +80,7 @@ def gemm_a8w8_ck(
     x_scale: torch.Tensor,
     w_scale: torch.Tensor,
     Out: torch.Tensor,
-    bias: Optional[torch.Tensor] = None,
+    bias: torch.Tensor | None = None,
     splitK: int = 0,
 ) -> torch.Tensor: ...
 
@@ -174,6 +175,13 @@ def gemm_a8w8_bpreshuffle_flydsl(
             XQ, WQ, x_scale, w_scale, Out, kernel_name
         )
 
+    if kernel_name.startswith("flydsl_bpreshuffle_8w_"):
+        from .flydsl.gemm_a8w8_bpreshuffle_8wave import run_gemm_a8w8_bpreshuffle_8wave
+
+        return run_gemm_a8w8_bpreshuffle_8wave(
+            XQ, WQ, x_scale, w_scale, Out, kernel_name
+        )
+
     from .flydsl.gemm_kernels import flydsl_preshuffle_gemm_a8
 
     parsed = _parse_flydsl_kernel_name(kernel_name)
@@ -199,7 +207,7 @@ def gemm_a8w8_bpreshuffle_flydsl(
     return Out
 
 
-def gemm_a8w8_blockscale_bpreshuffle_flydsl(
+def gemm_a8w8_mxfp8_128_bpreshuffle_flydsl(
     XQ: Tensor,
     WQ: Tensor,
     x_scale: Tensor,
@@ -210,13 +218,13 @@ def gemm_a8w8_blockscale_bpreshuffle_flydsl(
     kernel_name = str(config.get("kernelName", ""))
     if get_gfx() != "gfx1250":
         raise RuntimeError(
-            "gemm_a8w8_blockscale_bpreshuffle_flydsl is only supported on gfx1250"
+            "gemm_a8w8_mxfp8_128_bpreshuffle_flydsl is only supported on gfx1250"
         )
-    from .flydsl.blockscale_bpreshuffle_gemm_gfx1250 import (
-        run_gemm_a8w8_blockscale_bpreshuffle_gfx1250,
+    from .flydsl.mxfp8_128_bpreshuffle_gemm_gfx1250 import (
+        run_gemm_a8w8_mxfp8_128_bpreshuffle_gfx1250,
     )
 
-    return run_gemm_a8w8_blockscale_bpreshuffle_gfx1250(
+    return run_gemm_a8w8_mxfp8_128_bpreshuffle_gfx1250(
         XQ, WQ, x_scale, w_scale, Out, kernel_name
     )
 
@@ -232,8 +240,8 @@ def _gemm_a8w8_asm(
     x_scale: Tensor,  # A_scale:[M, 1] f32
     w_scale: Tensor,  # B_scale:[1, N] f32
     Out: Tensor,  # Out:[M, N] bf16
-    kernelName: Optional[str] = None,
-    bias: Optional[Tensor] = None,  # bias:[1, N] f32
+    kernelName: str | None = None,
+    bias: Tensor | None = None,  # bias:[1, N] f32
     bpreshuffle: bool = True,
     splitK: int = -1,
 ) -> None: ...
@@ -246,9 +254,9 @@ def gemm_a8w8_asm(
     w_scale: Tensor,
     Out: Tensor,
     kernelName: str = "",
-    bias: Optional[Tensor] = None,
-    bpreshuffle: Optional[bool] = True,
-    splitK: Optional[int] = None,
+    bias: Tensor | None = None,
+    bpreshuffle: bool | None = True,
+    splitK: int | None = None,
 ) -> Tensor:
     _gemm_a8w8_asm(
         XQ,
@@ -372,11 +380,11 @@ def _gemm_a8w8_blockscale_bpreshuffle_asm(
     out: Tensor,
     A_scale: Tensor,
     B_scale: Tensor,
-    bias: Optional[Tensor] = None,
+    bias: Tensor | None = None,
     splitK: int = -1,
-    kernelName: Optional[str] = None,
+    kernelName: str | None = None,
     bpreshuffle: int = 1,
-    zero_bias_buf: Optional[Tensor] = None,
+    zero_bias_buf: Tensor | None = None,
 ) -> None: ...
 
 
@@ -399,11 +407,11 @@ def gemm_a8w8_blockscale_bpreshuffle_asm(
     out: Tensor,
     A_scale: Tensor,
     B_scale: Tensor,
-    bias: Optional[Tensor] = None,
-    splitK: Optional[int] = None,
-    kernelName: Optional[str] = None,
-    bpreshuffle: Optional[bool] = True,
-    zero_bias_buf: Optional[Tensor] = None,
+    bias: Tensor | None = None,
+    splitK: int | None = None,
+    kernelName: str | None = None,
+    bpreshuffle: bool | None = True,
+    zero_bias_buf: Tensor | None = None,
 ) -> Tensor:
     if bias is None and zero_bias_buf is None:
         zero_bias_buf = get_zero_bias_buf(B)
@@ -550,9 +558,9 @@ def gemm_a8w8_fake(
     WQ: Tensor,
     x_scale: Tensor,
     w_scale: Tensor,
-    bias: Optional[Tensor] = None,
+    bias: Tensor | None = None,
     dtype: torch.dtype = dtypes.bf16,
-    splitK: Optional[int] = None,
+    splitK: int | None = None,
 ) -> Tensor:
     return torch.empty(XQ.shape[0], WQ.shape[0], dtype=dtype, device=XQ.device)
 
@@ -563,9 +571,9 @@ def gemm_a8w8(
     WQ: Tensor,
     x_scale: Tensor,
     w_scale: Tensor,
-    bias: Optional[Tensor] = None,
+    bias: Tensor | None = None,
     dtype: torch.dtype = dtypes.bf16,
-    splitK: Optional[int] = None,
+    splitK: int | None = None,
 ) -> Tensor:
     # assert dtype in [
     #     dtypes.bf16,
@@ -640,9 +648,9 @@ def gemm_a8w8_CK(
     WQ: Tensor,
     x_scale: Tensor,
     w_scale: Tensor,
-    bias: Optional[Tensor] = None,
+    bias: Tensor | None = None,
     dtype: torch.dtype = dtypes.bf16,
-    splitK: Optional[int] = None,
+    splitK: int | None = None,
 ) -> Tensor:
     # assert dtype in [
     #     dtypes.bf16,
@@ -676,7 +684,7 @@ def gemm_a8w8_bpreshuffle_fake(
     WQ: Tensor,
     x_scale: Tensor,
     w_scale: Tensor,
-    bias: Optional[Tensor] = None,
+    bias: Tensor | None = None,
     dtype: torch.dtype = dtypes.bf16,
     check: bool = False,
 ) -> Tensor:
@@ -689,7 +697,7 @@ def gemm_a8w8_bpreshuffle(
     WQ: Tensor,
     x_scale: Tensor,
     w_scale: Tensor,
-    bias: Optional[Tensor] = None,
+    bias: Tensor | None = None,
     dtype: torch.dtype = dtypes.bf16,
     check: bool = False,
 ) -> Tensor:
@@ -887,7 +895,13 @@ def gemm_a8w8_blockscale_bpreshuffle_fake(
     x_scale: Tensor,
     w_scale: Tensor,
     dtype: torch.dtype = dtypes.bf16,
+    out: Tensor | None = None,
 ) -> Tensor:
+    # Must mirror the real signature (incl. out=): the abstract_impl forwards the
+    # out= kwarg here at trace time. When out is given the real fn returns it, so
+    # the fake returns it too (preserves tensor identity for mutation/aliasing).
+    if out is not None:
+        return out
     return torch.empty(XQ.shape[0], WQ.shape[0], dtype=dtype, device=XQ.device)
 
 
@@ -898,6 +912,7 @@ def gemm_a8w8_blockscale_bpreshuffle(
     x_scale: Tensor,
     w_scale: Tensor,
     dtype: torch.dtype = dtypes.bf16,
+    out: Tensor | None = None,
 ) -> Tensor:
     assert dtype in [
         dtypes.bf16,
@@ -906,31 +921,80 @@ def gemm_a8w8_blockscale_bpreshuffle(
     m = XQ.shape[0]
     n = WQ.shape[0]
     k = XQ.shape[1]
-    Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
+    # `out`: optional caller-owned output buffer so the result lands at a FIXED
+    # address (needed to capture this GEMM's consumer into a cudagraph without a
+    # per-step input copy). The ck/cktile/asm/opus/flydsl paths below take Y
+    # positionally and write into it, so honoring `out` there is free. The
+    # triton-fallback branches self-allocate their output and CANNOT honor `out`
+    # -> assert loud rather than silently returning a different address.
+    if out is not None:
+        assert out.shape == (m, n) and out.dtype == dtype and out.device == XQ.device, (
+            f"gemm_a8w8_blockscale_bpreshuffle: out buffer {tuple(out.shape)}/"
+            f"{out.dtype} != expected ({m},{n})/{dtype}"
+        )
+        Y = out
+    else:
+        Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
 
-    use_gfx1250_flydsl_blockscale = (
+    use_gfx1250_flydsl_or_triton_mxfp8_128 = (
         get_gfx() == "gfx1250"
         and x_scale.dtype == dtypes.fp8_e8m0
         and w_scale.dtype == dtypes.fp8_e8m0
     )
-    if use_gfx1250_flydsl_blockscale:
-        if not is_flydsl_available():
-            raise RuntimeError(
-                "gfx1250 a8w8 blockscale bpreshuffle with fp8_e8m0 scales "
-                "requires FlyDSL"
-            )
+    if use_gfx1250_flydsl_or_triton_mxfp8_128:
         config = get_CKGEMM_config(
             m,
             n,
             k,
             AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE,
         )
+        # A tuned triton/gluon row wins over flydsl on the SAME mxfp8_128
+        # operands: gemm_afp8wfp8_preshuffle consumes the e8m0 scales natively
+        # (wmma_scaled on gluon / dot_scaled on triton), so unlike the fp32
+        # blockscale path further down there is no scale widening, and the (N, K)
+        # shuffled weight + column-major x_scale layout is a direct fit.
+        # Deliberately checked BEFORE the FlyDSL availability gate so a
+        # triton-tuned shape does not require FlyDSL to be installed.
+        if config is not None and config["libtype"] == "triton":
+            from aiter.ops.triton.gemm.basic.gemm_afp8wfp8 import (
+                gemm_afp8wfp8_preshuffle as _gemm_afp8wfp8_preshuffle_triton,
+            )
+
+            # Same convention as the fp32 blockscale triton branch below:
+            # kernelName optionally carries the backend hint ("triton"/"gluon"),
+            # anything else -> None (auto gluon->triton detection).
+            kernelName = str(config.get("kernelName", ""))
+            backend = kernelName if kernelName in ("triton", "gluon") else None
+            return _gemm_afp8wfp8_preshuffle_triton(
+                XQ,
+                WQ,
+                # wmma_scaled/dot_scaled take uint8-typed scale operands; e8m0 is
+                # bit-identical, so a view is the whole conversion.
+                x_scale.view(torch.uint8),
+                w_scale.view(torch.uint8),
+                dtype=dtype,
+                y=Y,  # honor caller out= (zero-copy); Y = out or fresh empty
+                x_scale_group_size=128,
+                # The mxfp8_128 contract, not a guess: x_scale bytes are
+                # column-major (K // 128, M) -- what per_group_quant_hip(
+                # transpose_scale=True) emits, and what the flydsl runner
+                # hard-codes as x_scale_transposed=True. It is NOT inferable from
+                # strides here: that buffer is a contiguous (M, K // 128) tensor
+                # whose *bytes* are transposed, so the stride(0) != 1 probe the
+                # fp32 branches use would read it as row-major.
+                is_x_scale_transposed=True,
+                backend=backend,
+            )
+        if not is_flydsl_available():
+            raise RuntimeError(
+                "gfx1250 mxfp8_128 bpreshuffle (fp8_e8m0 scales) requires FlyDSL"
+            )
         if config is not None and config["libtype"] == "flydsl":
-            return gemm_a8w8_blockscale_bpreshuffle_flydsl(
+            return gemm_a8w8_mxfp8_128_bpreshuffle_flydsl(
                 XQ, WQ, x_scale, w_scale, Y, config
             )
 
-        from ..ops.flydsl.gemm_tune.flydsl_gemm_a8w8_blockscale_bpreshuffle_wmma_common import (
+        from ..ops.flydsl.gemm_tune.flydsl_gemm_mxfp8_128_bpreshuffle_wmma_common import (
             kernel_fits_shape,
             kernels_list,
         )
@@ -945,7 +1009,7 @@ def gemm_a8w8_blockscale_bpreshuffle(
                 f"[gfx1250] gemm_a8w8_blockscale_bpreshuffle untuned "
                 f"M={m}, N={n}, K={k}; falling back to flydsl kernel '{ki.name}'."
             )
-            return gemm_a8w8_blockscale_bpreshuffle_flydsl(
+            return gemm_a8w8_mxfp8_128_bpreshuffle_flydsl(
                 XQ, WQ, x_scale, w_scale, Y, {"kernelName": ki.name}
             )
 
@@ -980,13 +1044,16 @@ def gemm_a8w8_blockscale_bpreshuffle(
             "NUM_KSPLIT": 1,
             "kpack": 2,
         }
+        # triton impl accepts a pre-allocated `y=` -> forward `out` (zero-copy).
         return _gemm_a8w8_blockscale_preshuffle_triton(
             xq,
             wq.reshape(n // 16, k * 16),
             x_scale,
             w_scale,
             dtype=dtype,
+            y=Y,  # honor caller out= (zero-copy); Y = out or fresh empty
             config=_fallback_cfg,
+            is_x_scale_tranposed=x_scale.stride(0) != 1,
         )
     config = get_CKGEMM_config(
         m, n, k, AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE
@@ -1007,13 +1074,17 @@ def gemm_a8w8_blockscale_bpreshuffle(
         backend = kernelName if kernelName in ("triton", "gluon") else None
         xq = XQ if XQ.dtype != torch.uint8 else XQ.view(dtypes.fp8)
         wq = WQ if WQ.dtype != torch.uint8 else WQ.view(dtypes.fp8)
+        # The triton impl accepts a pre-allocated output via `y=`; forward `out`
+        # so the result lands at the caller's fixed address (zero-copy path).
         return _gemm_a8w8_blockscale_preshuffle_triton(
             xq,
             wq.reshape(n // 16, k * 16),
             x_scale,
             w_scale,
             dtype=dtype,
+            y=Y,  # honor caller out= (zero-copy); Y = out or fresh empty
             backend=backend,
+            is_x_scale_tranposed=x_scale.stride(0) != 1,
         )
     if config is not None:
         libtype = config["libtype"]
@@ -1041,7 +1112,7 @@ def gemm_a8w8_blockscale_bpreshuffle(
                 XQ, WQ, x_scale, w_scale, Y, kernelId=kernelId
             )
         elif libtype == "flydsl" and is_flydsl_available():
-            return gemm_a8w8_blockscale_bpreshuffle_flydsl(
+            return gemm_a8w8_mxfp8_128_bpreshuffle_flydsl(
                 XQ, WQ, x_scale, w_scale, Y, config
             )
     try:
@@ -1221,7 +1292,7 @@ def _mxfp8_mxfp8_gemm_asm(
     ScaleA: Tensor,  # ScaleA:[M, K/32] e8m0 (shuffled)
     ScaleB: Tensor,  # ScaleB:[N, K/32] e8m0 (shuffled)
     out: Tensor,  # Out:[M, N] bf16
-    kernelName: Optional[str] = None,
+    kernelName: str | None = None,
     a_preshuffle: int = 1,
 ) -> None: ...
 

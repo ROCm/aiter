@@ -1,19 +1,20 @@
 # adapted from triton_kernels package
 # original code https://github.com/triton-lang/triton/blob/main/python/triton_kernels/tests/test_matmul.py
 
+import os
 from dataclasses import dataclass, fields
+
 import pytest
 import torch
-
-# routing utilities
-from aiter.ops.triton.moe.moe_routing.routing import routing
 
 # matmul utilities
 from aiter.ops.triton.moe.moe_op_gemm_a16w4 import (
     moe_gemm_a16w4,
     moe_gemm_torch,
 )
-from aiter.ops.triton.utils.shuffle import shuffle_scale_moe
+
+# routing utilities
+from aiter.ops.triton.moe.moe_routing.routing import routing
 
 # numerics utilities
 from aiter.ops.triton.moe.quant_moe import (
@@ -23,7 +24,8 @@ from aiter.ops.triton.moe.quant_moe import (
 )
 
 # target-specific utilities
-import aiter.ops.triton.utils._triton.arch_info as arch_info
+from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.shuffle import shuffle_scale_moe
 from aiter.ops.triton.utils.types import str_to_torch_dtype
 
 # ---------------
@@ -129,21 +131,17 @@ def assert_close(ref, tri, maxtol=None, rmstol=None, description="--", verbose=T
 
     if verbose:
         print(
-            "%s maximum relative error = %s (threshold = %s)"
-            % (description, max_err, maxtol)
+            f"{description} maximum relative error = {max_err} (threshold = {maxtol})"
         )
-        print(
-            "%s RMS relative error = %s (threshold = %s)"
-            % (description, rms_err, rmstol)
-        )
+        print(f"{description} RMS relative error = {rms_err} (threshold = {rmstol})")
 
     if max_err > maxtol:
         bad_idxs = torch.nonzero(rel_err > maxtol)
         num_nonzero = bad_idxs.size(0)
         bad_idxs = bad_idxs[:1000]
         print(
-            "%d / %d mismatched elements (shape = %s) at coords %s"
-            % (num_nonzero, rel_err.numel(), tuple(rel_err.shape), bad_idxs.tolist())
+            f"{num_nonzero} / {rel_err.numel()} mismatched elements "
+            f"(shape = {tuple(rel_err.shape)}) at coords {bad_idxs.tolist()}"
         )
 
         bad_idxs = bad_idxs.unbind(-1)
@@ -180,6 +178,7 @@ class Case:
             Case(4, 1024, 3072, 128, 4),
             Case(32, 6144, 3072, 128, 4),
             Case(16, 1024, 1024, 128, 4),
+            Case(16, 128, 128, 2, 1),
             Case(16, 256, 256, 128, 4),
             Case(4096, 256, 256, 128, 4),
             Case(1024, 3072, 512, 128, 4),
@@ -188,6 +187,8 @@ class Case:
             Case(300, 400, 800, 8, 4),
             Case(1000, 704, 800, 8, 2),
             Case(4097, 1024, 1024, 128, 4),
+            Case(16, 32, 256, 2, 1, hbm_swizzling=True),
+            Case(16, 256, 256, 8, 4, hbm_swizzling=True),
             Case(32, 6144, 3072, 128, 4, hbm_swizzling=True),
             Case(32, 6144, 3072, 8, 4, hbm_swizzling=True),
             Case(16, 1024, 1024, 128, 4, hbm_swizzling=True),
@@ -211,6 +212,7 @@ class Case:
 )
 @pytest.mark.parametrize("has_y_gammas", [False, True])
 @pytest.mark.parametrize("apply_swiglu", [False, True])
+@pytest.mark.parametrize("backend", [None, "gluon", "triton"])
 def test_op(
     m,
     n,
@@ -222,8 +224,18 @@ def test_op(
     n_expts_tot,
     n_expts_act,
     hbm_swizzling,
+    backend,
     device="cuda",
 ):
+
+    if int(os.environ.get("AITER_IN_FFM_AM", "0")) == 1 and (
+        m > 1024
+        or n > 1024
+        or k > 1024
+        or n_expts_tot > 128
+        or (m >= 1024 or n >= 1024 or k >= 1024 and n_expts_tot >= 128)
+    ):
+        pytest.skip("Test will take too long on FFM")
 
     if not (arch_info.is_fp4_avail()):
         pytest.skip("MXFP4 not supported on this architecture")
@@ -270,10 +282,17 @@ def test_op(
     w_tri, w_scale_tri = downcast_to_mxfp(w_tri, weight_dtype, axis=1)
     w_ref = upcast_from_mxfp(w_tri, w_scale_tri, torch.bfloat16, axis=1)
     if hbm_swizzling:
-        swizzle_mx_scale = "CDNA4_SCALE"
-        w_scale_tri = shuffle_scale_moe(
-            w_scale_tri, arch="gfx950", preshuffle_factor=32, scale_kwidth=8
-        )
+        if arch_info.get_arch() == "gfx1250":
+            swizzle_mx_scale = "GFX1250_SCALE"
+            w_scale_tri = shuffle_scale_moe(
+                w_scale_tri, arch="gfx1250", preshuffle_factor=32, scale_kwidth=8
+            )
+        else:
+            assert arch_info.get_arch() == "gfx950"
+            swizzle_mx_scale = "CDNA4_SCALE"
+            w_scale_tri = shuffle_scale_moe(
+                w_scale_tri, arch="gfx950", preshuffle_factor=32, scale_kwidth=8
+            )
     else:
         swizzle_mx_scale = None
 
@@ -303,5 +322,6 @@ def test_op(
         swizzle_mx_scale,
         out_dtype,
         apply_swiglu,
+        backend=backend,
     )
     assert_close(ref_y, tri_y, maxtol=maxtol, rmstol=rmstol)

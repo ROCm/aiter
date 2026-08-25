@@ -1,17 +1,23 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+# ruff: noqa: N999  camelCase module name kept: renaming would break the test
+# selection lists and FILE_TIMES bookkeeping that reference this path.
 
+import argparse
+from functools import partial
+
+import pandas as pd
 import torch
 import torch.nn.functional as F
+
 import aiter
-import argparse
-from aiter.test_common import checkAllclose, perftest, benchmark
-from aiter import dtypes, QuantType, get_torch_quant, get_gfx
+from aiter import QuantType, dtypes, get_gfx, get_torch_quant
+from aiter.test_common import benchmark, checkAllclose, perftest
 from aiter.utility import fp4_utils
-from functools import partial
-import pandas as pd
 
 torch.set_default_device("cuda")
+
+_FP4_OUTPUT_GUARD_VALUE = 0xA5
 
 
 @perftest(num_warmup=0, num_iters=10)
@@ -138,6 +144,7 @@ def run_hip(
         group_size = 128
     else:
         raise ValueError(f"Unsupported quant type: {quant_type}")
+    output_guard = None
     if quant_type in [QuantType.per_1x32, QuantType.per_1x128]:
         group_per_row = (input.shape[1] + group_size - 1) // group_size
         if q_dtype == dtypes.fp4x2:
@@ -157,7 +164,12 @@ def run_hip(
             aiter.add_rmsnorm(output, input, residual, residual_out, weight, eps)
     else:
         if q_dtype == dtypes.fp4x2:
-            output = torch.empty((input.shape[0], input.shape[1] // 2), dtype=q_dtype)
+            output_storage = torch.empty(
+                (input.shape[0] + 1, input.shape[1] // 2), dtype=q_dtype
+            )
+            output = output_storage[:-1]
+            output_guard = output_storage[-1:].view(torch.uint8)
+            output_guard.fill_(_FP4_OUTPUT_GUARD_VALUE)
         else:
             output = torch.empty(input.shape, dtype=q_dtype)
         scale = torch.empty(scale_shape, dtype=dtypes.fp32)
@@ -169,7 +181,7 @@ def run_hip(
             aiter.add_rmsnorm_quant(
                 output, input, residual, residual_out, scale, weight, eps, group_size
             )
-    return output, residual_out, scale, None
+    return output, residual_out, scale, output_guard
 
 
 @benchmark()
@@ -246,9 +258,17 @@ def test_rmsnorm(
             (read_datasize + write_datasize) / avg_b / 1024 / 1024 / 1024 * 1e6
         )
     if not smoothquant and n <= 8192:
-        (c, res_c, yscale_c, _), avg_c = run_hip(
+        (c, res_c, yscale_c, output_guard), avg_c = run_hip(
             input, weight, 1e-5, res, q_dtype=quant_dtype, quant_type=quant_type
         )
+        if output_guard is not None:
+            changed_bytes = torch.count_nonzero(
+                output_guard != _FP4_OUTPUT_GUARD_VALUE
+            ).item()
+            assert changed_bytes == 0, (
+                f"{'add_' if add_residual else ''}rmsnorm_quant wrote "
+                f"{changed_bytes} bytes past an FP4 output row"
+            )
         if quant_dtype == dtypes.fp4x2:
             a = fp4_utils.mxfp4_to_f32(a)
             c = fp4_utils.mxfp4_to_f32(c)
@@ -313,7 +333,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "-n",
         type=int,
-        default=[1024, 2048, 4096, 8192],
+        default=[1024, 2048, 3584, 4096, 8192],
         nargs="*",
         help="""N of mnk.
     e.g.: -n 1024""",

@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-import torch
-import torch.profiler as tpf
-import os
 import copy
+import multiprocessing as mp
+import os
+
 import numpy as np
 import pandas as pd
-import multiprocessing as mp
+import torch
+import torch.profiler as tpf
+
 from aiter import logger
 
 pd.set_option("display.max_rows", 200)
@@ -75,7 +77,7 @@ def perftest(
             ] + [(args, kwargs)]
             run_iters(num_warmup, func, *args, **kwargs)
             torch.cuda.synchronize()
-            if int(os.environ.get("AITER_LOG_MORE", 0)) or use_cuda_event:
+            if int(os.environ.get("AITER_LOG_MORE", "0")) or use_cuda_event:
                 latencies = []
                 start_event = torch.cuda.Event(enable_timing=True)
                 end_event = torch.cuda.Event(enable_timing=True)
@@ -315,7 +317,7 @@ def post_process_data(df, num_iters, warm_iter=1):
     indices_to_add = [idx for sublist in index_sublists for idx in sublist]
     indices.update(indices_to_add)
     indices.update(dropped_indexs)
-    if int(os.environ.get("AITER_LOG_MORE", 0)):
+    if int(os.environ.get("AITER_LOG_MORE", "0")):
         logger.info(f"abnormal data indices: {indices}")
         for i in indices:
             logger.info(f"abnormal data: {df.iloc[i]['self_device_time_total']}")
@@ -397,7 +399,7 @@ def get_trace_perf(prof, num_iters):
             df.at[avg_name, el] = df[el].sum() / num_iters
         else:
             df.at[avg_name, el] = df[el].sum() / actual_iters
-    if int(os.environ.get("AITER_LOG_MORE", 0)):
+    if int(os.environ.get("AITER_LOG_MORE", "0")):
         pd.set_option("display.expand_frame_repr", False)
         pd.set_option("display.max_colwidth", 90)
         pd.set_option("display.float_format", "{:,.1f}".format)
@@ -562,7 +564,7 @@ def checkAllclose(
         return percent
 
 
-def tensor_dump(x: torch.tensor, name: str, dir="./"):
+def tensor_dump(x: torch.Tensor, name: str, dir="./"):
     x_cpu = x.cpu().view(torch.uint8)
     filename = f"{dir}/{name}.bin"
     x_cpu.numpy().tofile(filename)
@@ -575,5 +577,6 @@ def tensor_dump(x: torch.tensor, name: str, dir="./"):
 def tensor_load(filename: str):
     DWs = np.fromfile(filename, dtype=np.uint32)
     metafile = ".".join(filename.split(".")[:-1]) + ".meta"
-    shape, dtype = [eval(line.strip()) for line in open(metafile)]
+    with open(metafile) as fh:
+        shape, dtype = [eval(line.strip()) for line in fh]
     return torch.tensor(DWs).view(dtype).view(shape)

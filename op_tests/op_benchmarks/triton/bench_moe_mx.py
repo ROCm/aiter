@@ -1,17 +1,19 @@
 import argparse
 import sys
+
 import triton
-from aiter.ops.triton.utils.types import torch_to_triton_dtype
-import aiter.ops.triton.utils._triton.arch_info as arch_info
+
 from aiter.ops.triton.moe.moe_op_mxfp4 import fused_moe_mxfp4
 from aiter.ops.triton.moe.moe_op_mxfp4_silu_fused import fused_moe_mxfp4_silu
-from op_tests.triton_tests.moe.test_moe_mx import input_helper
+from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.types import torch_to_triton_dtype
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_available_models,
-    get_model_configs,
     get_caller_name_no_ext,
+    get_model_configs,
     print_vgpr,
 )
+from op_tests.triton_tests.moe.test_moe_mx import input_helper
 
 
 def model_benchmark_configs(args):
@@ -108,7 +110,7 @@ def run_benchmark(args):
         fused_moe = fused_moe_mxfp4_silu if silu_fused else fused_moe_mxfp4
         output_tensor = c_tri_silu if silu_fused else c_tri
 
-        fn = lambda: fused_moe(  # noqa: E731
+        fn = lambda: fused_moe(
             a_tri,
             b_tri,
             output_tensor,
@@ -192,7 +194,7 @@ def main():
     args = parse_args()
     if args.print_vgpr:
         print("Retrieving VGPR usage for Triton kernels...")
-        fun = lambda: run_benchmark(args)  # noqa: E731
+        fun = lambda: run_benchmark(args)
         print_vgpr(fun, get_caller_name_no_ext())
         return 0
     run_benchmark(args)

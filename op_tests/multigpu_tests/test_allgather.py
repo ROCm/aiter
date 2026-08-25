@@ -1,33 +1,32 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import argparse
+import logging
 import os
-from typing import Optional
+from multiprocessing import Pool, freeze_support, set_start_method
 
+import pandas as pd
 import torch
 import torch.distributed as dist
-import argparse
-import pandas as pd
-from aiter import dtypes
 
+from aiter import dtypes
+from aiter.dist.communication_op import tensor_model_parallel_all_gather
 from aiter.dist.parallel_state import (
+    destroy_distributed_environment,
+    destroy_model_parallel,
     ensure_model_parallel_initialized,
-    init_distributed_environment,
-    set_custom_all_reduce,
     get_tp_group,
     graph_capture,
-    destroy_model_parallel,
-    destroy_distributed_environment,
+    init_distributed_environment,
+    set_custom_all_reduce,
 )
-from aiter.dist.utils import get_open_port, get_distributed_init_method, get_ip
-from aiter.dist.communication_op import tensor_model_parallel_all_gather
+from aiter.dist.utils import get_distributed_init_method, get_ip, get_open_port
 from aiter.test_common import (
+    benchmark,
     checkAllclose,
     perftest,
-    benchmark,
 )
-from multiprocessing import set_start_method, Pool, freeze_support
-import logging
 
 logger = logging.getLogger("aiter")
 
@@ -42,7 +41,7 @@ def run_allgather(
     withGraph=False,
     use_custom=False,
     dim=0,
-    distributed_init_method: Optional[str] = None,
+    distributed_init_method: str | None = None,
 ):
     device = torch.device(f"cuda:{rankID}")
     torch.cuda.set_device(device)
@@ -65,11 +64,8 @@ def run_allgather(
 
     if withGraph:
         graph = torch.cuda.CUDAGraph()
-        with graph_capture() as gc:
-            with torch.cuda.graph(graph, stream=gc.stream):
-                out = tensor_model_parallel_all_gather(
-                    x, use_custom=use_custom, dim=dim
-                )
+        with graph_capture() as gc, torch.cuda.graph(graph, stream=gc.stream):
+            out = tensor_model_parallel_all_gather(x, use_custom=use_custom, dim=dim)
         out.fill_(0)
 
         @perftest()
@@ -101,7 +97,7 @@ def call_ccl_allgather_naive(
     x,
     use_custom=True,
     loop_time=1,
-    distributed_init_method: Optional[str] = None,
+    distributed_init_method: str | None = None,
 ):
     device = torch.device(f"cuda:{rankID}")
     torch.cuda.set_device(device)
@@ -116,8 +112,10 @@ def call_ccl_allgather_naive(
     ensure_model_parallel_initialized(tp_size, pp_size)
     x = x.to(device)
 
-    # warmup and align all gpu
-    group = get_tp_group().device_group
+    # warmup and align all gpu. device_group is a plain attribute assigned in
+    # GroupCoordinator.__init__, so the access itself does nothing -- the point is
+    # get_tp_group(), which raises if the TP group was never initialised.
+    _ = get_tp_group().device_group
     torch.cuda.synchronize()
 
     for i in range(loop_time):
@@ -137,7 +135,7 @@ def allgather_acctest(
     shape,
     dtype,
     use_custom=False,
-    distributed_init_method: Optional[str] = None,
+    distributed_init_method: str | None = None,
 ):
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = "49373"
@@ -186,7 +184,7 @@ def allgather_perftest(
     withGraph=False,
     use_custom=False,
     dim=0,
-    distributed_init_method: Optional[str] = None,
+    distributed_init_method: str | None = None,
 ):
     print(f"run perf test, use custom allgather {use_custom}")
     os.environ["MASTER_ADDR"] = "127.0.0.1"

@@ -38,7 +38,6 @@ import itertools
 import logging
 import os
 from multiprocessing import Pool, freeze_support, set_start_method
-from typing import Optional
 
 import torch
 import torch.distributed as dist
@@ -111,7 +110,7 @@ def _run_rank(
     eps: float,
     distributed_init_method: str,
     emit_bf16: bool,
-    stage_override: Optional[str] = None,
+    stage_override: str | None = None,
 ):
     if stage_override is not None:
         os.environ["AITER_AR_1STAGE"] = stage_override
@@ -169,7 +168,7 @@ def _expected_path(
     shape: tuple[int, int],
     tp_size: int,
     element_size: int,
-    stage_override: Optional[str],
+    stage_override: str | None,
     emit_bf16: bool,
 ) -> str:
     """Mirror CudaCommunicator.fused_allreduce_rmsnorm_mxfp4_quant gating."""
@@ -215,8 +214,8 @@ def test_fused_ar_rmsnorm_mxfp4_quant(
     shape: tuple[int, int],
     dtype: torch.dtype,
     emit_bf16: bool,
-    distributed_init_method: Optional[str] = None,
-    stage_override: Optional[str] = None,
+    distributed_init_method: str | None = None,
+    stage_override: str | None = None,
 ):
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = "49383"

@@ -1,22 +1,23 @@
 import torch
 import triton
+
 from aiter.ops.triton.gemm.fused.fused_gemm_a8w8_blockscale_a16w16 import (
     fused_gemm_a8w8_blockscale_a16w16,
+)
+from op_tests.op_benchmarks.triton.bench_fused_gemm_commons import (
+    metric_to_scalar,
+    parse_fused_args,
+    run_fused_benchmark,
+)
+from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    get_caller_name_no_ext,
+    print_vgpr,
 )
 from op_tests.triton_tests.gemm.basic.test_gemm_a8w8_blockscale import (
     generate_gemm_a8w8_blockscale_inputs,
 )
 from op_tests.triton_tests.gemm.basic.test_gemm_a16w16 import (
     generate_gemm_a16w16_inputs,
-)
-from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
-    print_vgpr,
-    get_caller_name_no_ext,
-)
-from op_tests.op_benchmarks.triton.bench_fused_gemm_commons import (
-    metric_to_scalar,
-    parse_fused_args,
-    run_fused_benchmark,
 )
 
 block_shape = (128, 128)  # matches module-level `block_shape` in similar kernels
@@ -71,7 +72,7 @@ def bench_fn(M: int, N8: int, N16: int, K: int, metric: str, **kwargs):
     )
 
     ms = triton.testing.do_bench(
-        lambda: fused_gemm_a8w8_blockscale_a16w16(  # noqa: E731
+        lambda: fused_gemm_a8w8_blockscale_a16w16(
             x_fp8,
             w_fp8,
             x_fp8_scale,
@@ -110,7 +111,7 @@ def get_x_vals(args=None):
 def main(args: list[str] | None = None) -> None:
     parsed_args, defaults = parse_fused_args(kernel_name, args=args)
     plot_name = get_caller_name_no_ext()
-    run = lambda: run_fused_benchmark(  # noqa: E731
+    run = lambda: run_fused_benchmark(
         parsed_args,
         defaults,
         kernel_label,
