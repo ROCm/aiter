@@ -124,7 +124,6 @@ jobs:
               rm -rf dist build aiter_meta ./*.egg-info &&
               pip install -r requirements.txt &&
               pip install --upgrade pandas pyzmq einops numpy==1.26.2 &&
-              pip install --upgrade "pybind11>=3.0.1" &&
               pip install --upgrade "ninja>=1.11.1" &&
               pip install --upgrade setuptools_scm &&
               pip install tabulate &&
@@ -581,7 +580,6 @@ jobs:
             pip uninstall -y amd-aiter aiter || true
             pip install -r requirements.txt
             pip install --upgrade pandas pyzmq einops numpy==1.26.2
-            pip install --upgrade 'pybind11>=3.0.1'
             pip install --upgrade 'ninja>=1.11.1'
             pip install tabulate
             pip install '${AITER_WHEEL_PATH}'
@@ -859,7 +857,6 @@ jobs:
             pip uninstall -y amd-aiter aiter || true
             pip install -r requirements.txt
             pip install --upgrade pandas pyzmq einops numpy==1.26.2
-            pip install --upgrade 'pybind11>=3.0.1'
             pip install --upgrade 'ninja>=1.11.1'
             pip install tabulate
             pip install '${AITER_WHEEL_PATH}'

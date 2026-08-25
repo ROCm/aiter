@@ -4,7 +4,6 @@
 setuptools>=45
 setuptools_scm[toml]>=6.2
 wheel
-pybind11==3.0.1
 ninja==1.11.1.4
 psutil
 packaging

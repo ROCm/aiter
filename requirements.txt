@@ -4,6 +4,5 @@ psutil
 matplotlib
 pyyaml
 einops
-pybind11>=3.0.1
 ninja
 flydsl==0.2.2
