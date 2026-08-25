@@ -1037,12 +1037,13 @@ def prepare_gluon_query_and_scale(
     Args:
         quantized_query: Quantized query tensor [batch_size * query_length, num_query_heads, head_size]
         query_scale_factors: Query scale factors [batch_size * query_length, num_query_heads, 1] or scalar
-        reference_output_quant: Reference output tensor [batch_size * query_length, num_query_heads, head_size]
+        reference_output_quant: Reference output tensor [batch_size * query_length, num_query_heads, value_head_size]
         batch_size: Batch size
         query_length: Query sequence length
         num_query_heads: Number of query heads
         num_kv_heads: Number of key-value heads
         head_size: Head dimension size
+        value_head_size: Value/output head dimension. Defaults to head_size.
 
     Returns:
         Tuple of (quantized_query_gluon, query_scale_gluon, output_gluon)
