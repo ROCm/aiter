@@ -27,37 +27,28 @@ from functools import lru_cache
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from flydsl._mlir import ir
-from flydsl._mlir.dialects import memref as memref_dialect
-from flydsl._mlir.dialects.rocdl import (
-    mfma_scale_f32_32x32x64_f8f6f4 as _ods_mfma_scale32x32x64,
-)
-from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
-from flydsl.expr.rocdl import _unwrap_mfma_operand
 from flydsl.expr.typing import T
-from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 
 from aiter.jit.utils.chip_info import get_gfx
 
 from .. import buffer_ops
-from ..tensor_shim import GTensor, STensor, _run_compiled
+from ..tensor_shim import GTensor, _run_compiled
 
 Vec = fx.Vector
 
-
-# Signed min/max and unsigned ceil-div have no fx operator form, so these thin
-# wrappers keep the call sites readable. Operands must be typed fx values.
 def _imax(a, b):
-    return fx.Int32(arith.maxsi(a.ir_value(), b.ir_value()))
+    return (a > b).select(a, b)
 
 
 def _imin(a, b):
-    return fx.Int32(arith.minsi(a.ir_value(), b.ir_value()))
+    return (a < b).select(a, b)
 
 
-def _ceildiv(a, b):
-    return fx.Int32(arith.ceildivui(a.ir_value(), b.ir_value()))
+def _uceildiv(a, b):
+    a = fx.Uint32(a)
+    b = fx.Uint32(b)
+    return fx.Int32((a + b - fx.Uint32(1)) // b)
 
 
 def _make_out_row_t(logits, stride_i64, row_i32):
@@ -67,10 +58,8 @@ def _make_out_row_t(logits, stride_i64, row_i32):
     A 2-D (row, col) view computes ``row * stride + col`` in i32 and overflows
     past 2^31 (~46k-square dense outputs), silently mis-writing.
     """
-    _ri64 = arith.extui(T.i64, row_i32.ir_value())
-    _byte = fx.Int64(_ri64) * fx.Int64(stride_i64) * fx.Int64(4)
-    _idx = arith.index_cast(T.index, _byte.ir_value())
-    return GTensor(logits, dtype=T.f32, shape=(-1,), static_bytes_offset_i64=_idx)
+    _byte = fx.Int64(fx.Uint32(row_i32)) * stride_i64 * fx.Int64(4)
+    return GTensor(logits, dtype=T.f32, shape=(-1,), static_bytes_offset_i64=_byte)
 
 
 def _load_pack_i32x8(i32_view, byte_off_i32):
@@ -85,6 +74,53 @@ def _load_pack_i32x8(i32_view, byte_off_i32):
     v4_lo = i32_view.vec_load((dword_off,), vec_size=4)
     v4_hi = i32_view.vec_load((dword_off + fx.Int32(4),), vec_size=4)
     return Vec(v4_lo).shuffle(v4_hi, list(range(8))).ir_value()
+
+
+def _load_row_weights(w_t, mfma, m_tiles, row, lane_div_N):
+    """``weights[row, h]`` per (mi, ii) for one query row.
+
+    The head an accumulator element belongs to is
+    ``mi*MFMA_M + acc_head_static_offsets[ii] + lane_div_N*acc_head_group_stride``
+    (see ``MfmaAtom``).
+    """
+    lane_head = lane_div_N * fx.Int32(mfma.acc_head_group_stride)
+    row_w = [[None] * mfma.ACC_ELEMS for _ in range_constexpr(m_tiles)]
+    for mi in range_constexpr(m_tiles):
+        for ii in range_constexpr(mfma.ACC_ELEMS):
+            h_w = (
+                fx.Int32(mi * mfma.MFMA_M + mfma.acc_head_static_offsets[ii])
+                + lane_head
+            )
+            row_w[mi][ii] = fx.Float32(w_t[row, h_w])
+    return row_w
+
+
+def _emit_col_sum(mfma, mma, gemm_kw, a_row, b_pack, w_row, kv_scale, f32_0):
+    """One lane's logit contribution for a single (query row, n-tile) pair.
+
+    ``a_row``/``w_row`` are that row's per-(mi, kk) A-fragments and per-(mi, ii)
+    weights; ``b_pack`` is the n-tile's per-kk B-fragments. 
+    ``kv_scale`` (>=0) is hoisted out of the head sum: ReLU is
+    positive-homogeneous, so ReLU(s*x) = s*ReLU(x) and the whole column sum is
+    scaled once instead of every head term -- drops M_TILES*ACC_ELEMS muls to one.
+    """
+    col_sum = f32_0
+    for mi in range_constexpr(len(a_row)):
+        c_frag = fx.make_rmem_tensor(mfma.ACC_ELEMS, fx.Float32)
+        c_frag.store(Vec.filled(mfma.ACC_ELEMS, 0.0, fx.Float32))
+        for kk in range_constexpr(len(a_row[mi])):
+            fx.gemm(mma, c_frag, a_row[mi][kk], b_pack[kk], c_frag, **gemm_kw)
+        acc = c_frag.load()
+        for ii in range_constexpr(mfma.ACC_ELEMS):
+            col_sum = col_sum + Vec(acc)[ii].maximumf(f32_0) * w_row[mi][ii]
+    col_sum = col_sum * kv_scale
+
+    # Head-reduce within the wave (width 64) via the atom's shuffle_xor
+    # butterfly (16, 32 for the 16x16 atoms); the offsets must cover every lane
+    # group so the full H-wide sum is produced.
+    for sh in mfma.shuffle_offsets:
+        col_sum = col_sum + col_sum.shuffle_xor(sh, 64)
+    return col_sum
 
 
 def _emit_row_neg_inf_fill(
@@ -145,7 +181,7 @@ def _emit_row_neg_inf_fill(
 
     def _split(lo, hi):
         """This block's chunk of ``[lo, hi)``: the ``by``-th of num_splits."""
-        chunk = _ceildiv(hi - lo, num_splits)
+        chunk = _uceildiv(hi - lo, num_splits)
         b_lo = _imin(lo + by_i32 * chunk, hi)
         return b_lo, _imin(b_lo + chunk, hi)
 
@@ -265,64 +301,44 @@ def _auto_num_splits(
     return max(1, min(math.ceil(target_blocks / grid_x), max_splits))
 
 
-# --------------------------------------------------------------------------- #
-# MfmaAtom -- bundles every MFMA-shape-derived constant plus the rocdl functor,
-# so the kernel builder carries no hardcoded tile shape. Supporting a new MFMA
-# instruction is then a new MfmaAtom instance plus a _VARIANT_BUILDERS entry.
-# --------------------------------------------------------------------------- #
+# MfmaAtom bundles every MFMA-shape-derived constant plus the atom/fragment
+# factories, so the kernel builders carry no hardcoded tile shape. Supporting a
+# new MFMA instruction is a new MfmaAtom instance plus a _VARIANT_BUILDERS entry.
 
 
-def _make_operands_dense(a, b, acc):
-    """Default ``MfmaAtom.make_operands``: the dense-MFMA 6-operand convention
-    ``[a, b, c, cbsz, abid, blgp]`` (all zero besides the fragments)."""
-    return [a, b, acc, 0, 0, 0]
+#: UE8M0 bias-127 in all four bytes -> multiplier 1.0.
+_UE8M0_IDENTITY = 0x7F7F7F7F
 
 
-def _make_operands_scaled_identity(a, b, acc):
-    """``MfmaAtom.make_operands`` for the CDNA4 scaled MFMA atoms (K=128/64).
+def _no_gemm_kwargs():
+    return {}
 
-    These instructions always carry ``scaleA``/``scaleB`` UE8M0 operands as part
-    of their encoding. Passing a compile-time identity scale (UE8M0 bias-127,
-    i.e. every byte 127 -> multiplier 1.0) makes the hardware microscale a
-    no-op; this kernel applies its own ``kv_scale`` in f32 after the MFMA
-    (scale-hoisted out of the ReLU), so no other scale is needed.
+
+def _identity_scale_kwargs():
+    """``fx.gemm`` state for the CDNA4 scaled atoms (K=128/64).
+Next 
+    These instructions always carry ``scale_a``/``scale_b`` UE8M0 operands as
+    part of their encoding, and the atom defaults them to 0 -- which is not
+    identity in UE8M0. A compile-time identity scale makes the hardware
+    microscale a no-op; this kernel applies its own ``kv_scale`` in f32 after
+    the MFMA (hoisted out of the ReLU), so no other scale is needed.
     """
-    scale = arith.constant(0x7F7F7F7F, type=T.i32)
-    return [a, b, acc, 0, 0, 0, scale, 0, scale]
+    scale = fx.Int32(_UE8M0_IDENTITY)
+    return {"scale_a": scale, "scale_b": scale}
 
 
-def _mfma32x32x64_fp8_fp8_scale_wrapper(result_type, operands, *, loc=None, ip=None):
-    """Adapt the raw ODS ``mfma_scale_f32_32x32x64_f8f6f4`` to the
-    ``(result_type, operands_list)`` convention used by ``flydsl.expr.rocdl``.
+def _frag_i64(raw):
+    """One lane's i64 A/B fragment (dense CDNA3 atoms) as a register tensor."""
+    frag = fx.make_rmem_tensor(1, fx.Int64)
+    frag.store(Vec.from_elements([fx.Int64(raw)]))
+    return frag
 
-    ``operands`` follows the 9-element scaled-MFMA convention
-    ``[a, b, c, cbsz, blgp, opselA, scaleA, opselB, scaleB]`` -- note there is
-    no ``abid``, unlike the dense atoms. FlyDSL ships a friendly wrapper for
-    the 16x16x128 scaled atom but not yet for 32x32x64.
-    """
-    a = _unwrap_mfma_operand(operands[0])
-    b = _unwrap_mfma_operand(operands[1])
-    c = _unwrap_mfma_operand(operands[2])
-    cbsz = int(operands[3]) if len(operands) > 3 else 0
-    blgp = int(operands[4]) if len(operands) > 4 else 0
-    opsel_a = int(operands[5]) if len(operands) > 5 else 0
-    scale_a = _unwrap_mfma_operand(operands[6]) if len(operands) > 6 else a
-    opsel_b = int(operands[7]) if len(operands) > 7 else 0
-    scale_b = _unwrap_mfma_operand(operands[8]) if len(operands) > 8 else b
-    return _ods_mfma_scale32x32x64(
-        result_type,
-        a,
-        b,
-        c,
-        cbsz,
-        blgp,
-        opsel_a,
-        scale_a,
-        opsel_b,
-        scale_b,
-        loc=loc,
-        ip=ip,
-    ).result
+
+def _frag_i32x8(raw):
+    """One lane's vector<8xi32> A/B fragment (CDNA4 scaled atoms)."""
+    frag = fx.make_rmem_tensor(8, fx.Int32)
+    frag.store(Vec(raw))
+    return frag
 
 
 @dataclass(frozen=True)
@@ -337,8 +353,13 @@ class MfmaAtom:
         Output tile is MFMA_M x MFMA_N; MFMA_K fp8 elements reduced per step.
     ACC_ELEMS : int
         f32 accumulator elements per lane (``vec<ACC_ELEMS x f32>``).
-    fn : Callable
-        FlyDSL ``rocdl.mfma_*`` functor taking ``(result_type, operands)``.
+    make_atom : Callable
+        ``() -> fx`` MMA atom. Must be called inside the ``@flyc.kernel`` body.
+    make_frag : Callable
+        Wraps one lane's raw A/B fragment value in the rank-1 register tensor
+        ``fx.gemm`` takes. Rank-1 operands short-circuit to a single
+        ``MmaAtomCall``, so the kernel's hand-computed fragment addressing is
+        untouched and the atom bitcasts anything whose type does not match.
     shuffle_offsets : tuple[int, ...]
         ``shuffle_xor`` offsets for the in-wave head-reduce butterfly; must
         cover every lane group so the full H-wide sum is produced.
@@ -357,8 +378,9 @@ class MfmaAtom:
     frag_bytes : int
         A/B fragment bytes owned by one lane for one K-step. 8 for the dense
         atoms (one i64 load).
-    make_operands : Callable
-        Builds the ``fn`` operand list from ``(a_frag, b_frag, acc)``.
+    gemm_kwargs : Callable
+        ``() -> dict`` of atom state passed to ``fx.gemm`` (the identity
+        scales for the scaled atoms; empty for the dense ones).
     kname_tag : str | None
         Shape tag used in the generated kernel symbol name. ``None`` means
         ``f"mfma{name}"``. ``_MFMA16`` pins the bare ``"mfma"`` it has always
@@ -370,12 +392,13 @@ class MfmaAtom:
     MFMA_N: int
     MFMA_K: int
     ACC_ELEMS: int
-    fn: Callable
+    make_atom: Callable
+    make_frag: Callable
     shuffle_offsets: tuple
     acc_head_static_offsets: tuple  # length == ACC_ELEMS
     acc_head_group_stride: int
     frag_bytes: int = 8
-    make_operands: Callable = _make_operands_dense
+    gemm_kwargs: Callable = _no_gemm_kwargs
     kname_tag: str | None = None
 
 
@@ -389,7 +412,8 @@ _MFMA16 = MfmaAtom(
     MFMA_N=16,
     MFMA_K=32,
     ACC_ELEMS=4,
-    fn=rocdl.mfma_f32_16x16x32_fp8_fp8,
+    make_atom=lambda: fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 32, fx.Float8E4M3FNUZ)),
+    make_frag=_frag_i64,
     shuffle_offsets=(16, 32),
     acc_head_static_offsets=(0, 1, 2, 3),
     acc_head_group_stride=4,
@@ -408,12 +432,15 @@ _MFMA16_K128 = MfmaAtom(
     MFMA_N=16,
     MFMA_K=128,
     ACC_ELEMS=4,
-    fn=rocdl.mfma_scale_f32_16x16x128_f8f6f4,
+    make_atom=lambda: fx.make_mma_atom(
+        fx.rocdl.cdna4.MFMA_Scale(16, 16, 128, fx.Float8E4M3FN)
+    ),
+    make_frag=_frag_i32x8,
     shuffle_offsets=(16, 32),
     acc_head_static_offsets=(0, 1, 2, 3),
     acc_head_group_stride=4,
     frag_bytes=32,
-    make_operands=_make_operands_scaled_identity,
+    gemm_kwargs=_identity_scale_kwargs,
 )
 
 #: gfx950/CDNA4 scaled MFMA: 32x32 output tile, K=64 fp8f6f4 elements/step.
@@ -426,7 +453,10 @@ _MFMA32_K64 = MfmaAtom(
     MFMA_N=32,
     MFMA_K=64,
     ACC_ELEMS=16,
-    fn=_mfma32x32x64_fp8_fp8_scale_wrapper,
+    make_atom=lambda: fx.make_mma_atom(
+        fx.rocdl.cdna4.MFMA_Scale(32, 32, 64, fx.Float8E4M3FN)
+    ),
+    make_frag=_frag_i32x8,
     shuffle_offsets=(32,),
     acc_head_static_offsets=(
         # ii=0..3 -> g*4 + 0..3, ii=4..7 -> g*4 + 8..11, etc.
@@ -449,7 +479,7 @@ _MFMA32_K64 = MfmaAtom(
     ),
     acc_head_group_stride=4,
     frag_bytes=32,
-    make_operands=_make_operands_scaled_identity,
+    gemm_kwargs=_identity_scale_kwargs,
 )
 
 
@@ -495,7 +525,6 @@ def _build_kernel_mfma_r_w(
     MFMA_M = mfma.MFMA_M
     MFMA_N = mfma.MFMA_N
     MFMA_K = mfma.MFMA_K
-    ACC_ELEMS = mfma.ACC_ELEMS
     FRAG_BYTES = mfma.frag_bytes
 
     assert H % MFMA_M == 0, f"num_heads={H} must be a multiple of MFMA_M={MFMA_M}"
@@ -518,8 +547,6 @@ def _build_kernel_mfma_r_w(
     M_TILES = H // MFMA_M  # head row-tiles
     K_STEPS = D // MFMA_K  # MFMA K-steps over the head dim
     N_TILES_PER_WAVE = N_TILES // WPB  # column-tiles per wave
-
-    mfma_fn = mfma.fn
 
     _cvt_tag = ""
     if convert_q_fn:
@@ -550,15 +577,15 @@ def _build_kernel_mfma_r_w(
         num_splits: fx.Int32,  # grid.y KV-column splits (1 == no split)
     ):
         f32_0 = fx.Float32(0.0)
-        mfma_res_ty = Vec.make_type(ACC_ELEMS, fx.Float32)
+        mma = mfma.make_atom()
+        gemm_kw = mfma.gemm_kwargs()
 
         tid = fx.thread_idx.x
         bid = fx.block_idx.x
-        # Blocks are assigned in reverse order (bid=0 → last rows, bid=n_blocks-1 → row 0)
-        # as a load-balancing heuristic: KV windows tend to be longer for later query rows,
-        # so reversing ensures the GPU scheduler picks up the heaviest work first rather than
-        # leaving it for last.
-        n_blocks = _ceildiv(seq_len, fx.Int32(RPB))
+        # Rows are handed out in reverse (bid=0 -> last rows) as a load-balancing
+        # heuristic: KV windows tend to be longer for later query rows, so this
+        # gets the heaviest work scheduled first instead of last.
+        n_blocks = _uceildiv(seq_len, fx.Int32(RPB))
         r0 = (n_blocks - bid - fx.Int32(1)) * fx.Int32(RPB)
 
         # Decompose tid into wave index and in-wave lane.
@@ -582,7 +609,7 @@ def _build_kernel_mfma_r_w(
         # pointer so the remaining column offset stays in i32. A 2-D (row, col)
         # view computes row * stride + col in i32 and overflows past 2^31
         # (~46k-square dense outputs), silently mis-writing.
-        _stride_i64 = arith.extui(T.i64, stride_logits_s.ir_value())
+        _stride_i64 = fx.Int64(fx.Uint32(stride_logits_s))
 
         def _load_pack_i64(i32_view, byte_off_i32):
             dword_off = byte_off_i32 // fx.Int32(4)
@@ -598,9 +625,9 @@ def _build_kernel_mfma_r_w(
             """
             off = base_i32 + k_byte_i32 + lane_frag_off
             if const_expr(FRAG_BYTES == 32):
-                return _load_pack_i32x8(i32_view, off)
+                return mfma.make_frag(_load_pack_i32x8(i32_view, off))
             raw = _load_pack_i64(i32_view, off)
-            return _fn_to_fnuz_i64(raw) if convert_fn else raw
+            return mfma.make_frag(_fn_to_fnuz_i64(raw) if convert_fn else raw)
 
         def _fn_to_fnuz_i64(raw_i64):
             """Map FN byte 0x80 (neg-zero) -> 0x00 in 8 packed fp8 bytes."""
@@ -620,17 +647,14 @@ def _build_kernel_mfma_r_w(
                     result = result | (cleaned << shift)
                 return result
 
-            # The widen/narrow steps stay on the unsigned raw ops: they move a
-            # bit pattern, so a sign-extending ext would corrupt the high dword.
-            hi_i64 = arith.ShRUIOp(raw_i64, arith.constant(32, type=T.i64)).result
-            lo_fix = _fix_i32(fx.Int32(arith.TruncIOp(T.i32, raw_i64).result))
-            hi_fix = _fix_i32(fx.Int32(arith.TruncIOp(T.i32, hi_i64).result))
-            lo_64 = arith.ExtUIOp(T.i64, lo_fix.ir_value()).result
-            hi_64 = arith.ShLIOp(
-                arith.ExtUIOp(T.i64, hi_fix.ir_value()).result,
-                arith.constant(32, type=T.i64),
-            ).result
-            return arith.OrIOp(lo_64, hi_64).result
+            # The widen/narrow steps stay unsigned: they move a bit pattern, so
+            # a sign-extending ext would corrupt the high dword.
+            raw = fx.Uint64(raw_i64)
+            lo_fix = _fix_i32(fx.Int32(raw))
+            hi_fix = _fix_i32(fx.Int32(raw >> 32))
+            lo_64 = fx.Int64(fx.Uint32(lo_fix))
+            hi_64 = fx.Int64(fx.Uint32(hi_fix)) << fx.Int64(32)
+            return (lo_64 | hi_64).ir_value()
 
         # ---- Preload window bounds, Q frags, and weights for all RPB rows ----
         # A-operand layout is per in-wave lane, so `lane` (not `tid`) indexes Q.
@@ -657,19 +681,7 @@ def _build_kernel_mfma_r_w(
                     )
             a_packs[j] = row_a
 
-            # weights[row, h] per (mi, ii): the head this accumulator element
-            # belongs to is mi*MFMA_M + acc_head_static_offsets[ii]
-            # + lane_div_N*acc_head_group_stride (see MfmaAtom).
-            row_w = [[None] * ACC_ELEMS for _ in range_constexpr(M_TILES)]
-            lane_head = lane_div_N * fx.Int32(mfma.acc_head_group_stride)
-            for mi in range_constexpr(M_TILES):
-                for ii in range_constexpr(ACC_ELEMS):
-                    h_w = (
-                        fx.Int32(mi * MFMA_M + mfma.acc_head_static_offsets[ii])
-                        + lane_head
-                    )
-                    row_w[mi][ii] = fx.Float32(w_t[row, h_w])
-            w_frag[j] = row_w
+            w_frag[j] = _load_row_weights(w_t, mfma, M_TILES, row, lane_div_N)
 
         # ---- Union window across all RPB rows ----
         tile_start = starts[0]
@@ -691,8 +703,8 @@ def _build_kernel_mfma_r_w(
         # exactly (disjoint, gap-free), so each column has one writer.
         # num_splits==1 collapses to the full window (by==0). ----
         by = fx.block_idx.y
-        win_tiles = _ceildiv(tile_end - tile_start, fx.Int32(BKV))
-        split_cols = _ceildiv(win_tiles, num_splits) * fx.Int32(BKV)
+        win_tiles = _uceildiv(tile_end - tile_start, fx.Int32(BKV))
+        split_cols = _uceildiv(win_tiles, num_splits) * fx.Int32(BKV)
         tile_start = tile_start + by * split_cols
         tile_end = _imin(tile_start + split_cols, tile_end)
 
@@ -723,30 +735,16 @@ def _build_kernel_mfma_r_w(
                 out_row_t = _make_out_row_t(logits, _stride_i64, row)
                 for ni in range_constexpr(N_TILES_PER_WAVE):
                     col = cols[ni]
-                    kv_scale = kv_scales_tile[ni]
-                    col_sum = f32_0
-                    for mi in range_constexpr(M_TILES):
-                        acc = Vec.filled(ACC_ELEMS, 0.0, fx.Float32)
-                        for kk in range_constexpr(K_STEPS):
-                            acc = mfma_fn(
-                                mfma_res_ty,
-                                mfma.make_operands(
-                                    a_packs[j][mi][kk], b_packs[ni][kk], acc
-                                ),
-                            )
-                        # kv_scale (>=0) is hoisted out of the head sum: ReLU is
-                        # positive-homogeneous, so ReLU(s*x)=s*ReLU(x) and the
-                        # whole column sum is scaled once (below) instead of every
-                        # head term -- drops M_TILES*4 muls to one.
-                        for ii in range_constexpr(ACC_ELEMS):
-                            relu = Vec(acc)[ii].maximumf(f32_0)
-                            col_sum = col_sum + relu * w_frag[j][mi][ii]
-                    col_sum = col_sum * kv_scale
-
-                    # Head-reduce within the wave (width=64) via the atom's
-                    # shuffle_xor butterfly (16, 32 for the 16x16 atoms).
-                    for sh in mfma.shuffle_offsets:
-                        col_sum = col_sum + col_sum.shuffle_xor(sh, 64)
+                    col_sum = _emit_col_sum(
+                        mfma,
+                        mma,
+                        gemm_kw,
+                        a_packs[j],
+                        b_packs[ni],
+                        w_frag[j],
+                        kv_scales_tile[ni],
+                        f32_0,
+                    )
 
                     # Only lane_div_N==0 lanes hold the MFMA_N distinct columns.
                     # `col >= start` is required: the tile loop is BKV-aligned
@@ -813,7 +811,7 @@ def _build_kernel_mfma_r_w(
         num_splits: fx.Int32,
         stream: fx.Stream,
     ):
-        gx = fx.Int64(_ceildiv(seq_len, fx.Int32(RPB)))
+        gx = fx.Int64(_uceildiv(seq_len, fx.Int32(RPB)))
         gy = fx.Int64(num_splits)
         kernel._func.__name__ = _kname
         kernel(
@@ -944,13 +942,13 @@ def _build_kernel_mfma_lds_pipe(
             NC >= 2
         ), f"swizzle needs D/frag_bytes>=2 (D={D}, frag_bytes={mfma.frag_bytes})"
 
-    mfma_fn = mfma.fn
-
-    # Using raw_ptr_buffer_load_lds requires the destination LDS address to be aligned to at least 128 bytes.
-    # Actually memory allocation takes place later at allocator.finalize().
-    allocator = SmemAllocator(None, arch=get_gfx())
-    lds_off = allocator._align(allocator.ptr, 128)
-    allocator.ptr = lds_off + NUM_BUFFERS * SLOT_BYTES
+    # raw_ptr_buffer_load_lds requires its destination LDS address to be at
+    # least 128-byte aligned; the third fx.Array parameter is that alignment and
+    # propagates to the emitted LDS global. It has to live on the array type --
+    # SharedAllocator.allocate(alignment=) is bookkeeping-only on the static path.
+    @fx.struct
+    class SharedStorage:
+        slots: fx.Array[fx.Int32, NUM_BUFFERS * SLOT_I32, 128]
 
     # As in the direct-load builder: only the non-default clean_logits is tagged.
     _cl_tag = "" if clean_logits else "_nocl"
@@ -975,22 +973,18 @@ def _build_kernel_mfma_lds_pipe(
         num_splits: fx.Int32,
     ):
         f32_0 = fx.Float32(0.0)
-        i32_64 = arith.constant(64, type=T.i32)
-
-        _mfma_res_ty = Vec.make_type(mfma.ACC_ELEMS, fx.Float32)
+        mma = mfma.make_atom()
+        gemm_kw = mfma.gemm_kwargs()
 
         tid = fx.thread_idx.x
         bid = fx.block_idx.x
 
-        # Blocks are assigned in reverse order (bid=0 -> last rows, bid=n_blocks-1 -> row 0)
-        # as a load-balancing heuristic: KV windows tend to be longer for later query rows,
-        # so reversing ensures the GPU scheduler picks up the heaviest work first rather than
-        # leaving it for last.
-        n_blocks = _ceildiv(seq_len, fx.Int32(ROWS_PER_BLOCK))
+        # Reverse row order -- see the direct-load builder for the rationale.
+        n_blocks = _uceildiv(seq_len, fx.Int32(ROWS_PER_BLOCK))
         block_row0 = fx.Int32((n_blocks - bid - fx.Int32(1)) * fx.Int32(ROWS_PER_BLOCK))
 
-        wave = tid // i32_64
-        lane = tid % i32_64
+        wave = tid // fx.Int32(64)
+        lane = tid % fx.Int32(64)
         lane_div_N = lane // fx.Int32(mfma.MFMA_N)
         lane_mod_N = lane % fx.Int32(mfma.MFMA_N)
         lane_frag_off = lane_div_N * fx.Int32(mfma.frag_bytes)
@@ -1005,27 +999,22 @@ def _build_kernel_mfma_lds_pipe(
         w_t = GTensor(weights, dtype=T.f32, shape=(-1, H))
         cs_t = GTensor(cu_starts, dtype=T.i32, shape=(-1,))
         ce_t = GTensor(cu_ends, dtype=T.i32, shape=(-1,))
-        _stride_i64 = arith.extui(T.i64, stride_logits_s.ir_value())
+        _stride_i64 = fx.Int64(fx.Uint32(stride_logits_s))
 
         # ---- LDS region + async-DMA base pointer ----
-        # View of the LDS region as a flat array i32 values.
-        # lds_st is for MFMA reads, lds_ptr0 is for DMA writes.
-        base_ptr = allocator.get_base()
-        region_ptr = SmemPtr(base_ptr, lds_off, T.i32, shape=(NUM_BUFFERS * SLOT_I32,))
-        lds_st = STensor(region_ptr, T.i32, shape=(NUM_BUFFERS * SLOT_I32,))
-        lds_base_idx = memref_dialect.extract_aligned_pointer_as_index(lds_st.memptr)
-        # Address space 3 is the LDS address space for raw_ptr_buffer_load_lds.
-        lds_ptr0 = buffer_ops.create_llvm_ptr(fx.Int64(lds_base_idx), address_space=3)
+        # One flat i32 array of NUM_BUFFERS slots: lds_ptr serves the MFMA reads,
+        # lds_ptr0 the DMA writes.
+        lds_ptr = fx.SharedAllocator().allocate(SharedStorage).peek().slots.ptr
+        # ptrtoint on a Shared pointer yields i32; address space 3 is LDS, which
+        # is what raw_ptr_buffer_load_lds wants.
+        lds_ptr0 = buffer_ops.create_llvm_ptr(
+            fx.Int64(fx.Uint32(fx.ptrtoint(lds_ptr))), address_space=3
+        )
+        _frag_ty = Vec.make_type(8, fx.Int32)
 
         def _lds_read_frag(dword_idx):
-            """One lane's 32-byte B-fragment out of the staged LDS tile.
-
-            A plain function, not an inline ``lds_st.vec_load(...)``: the AST
-            rewriter treats the base of any method call inside a dynamic ``for``
-            body as mutable loop state, so calling it directly would make it try
-            to thread the STensor through the loop's iter_args.
-            """
-            return lds_st.vec_load((dword_idx,), vec_size=8)
+            """One lane's 32-byte B-fragment out of the staged LDS tile."""
+            return fx.ptr_load(lds_ptr + dword_idx, result_type=_frag_ty)
 
         def _dma_kv_tile_to_lds(slot_byte_i32, col0_i32):
             """Cooperatively async-copy KV[col0:col0+BKV, :] into LDS slot.
@@ -1038,7 +1027,7 @@ def _build_kernel_mfma_lds_pipe(
             """
             wave_slot_i32 = slot_byte_i32 + wave * fx.Int32(64 * DMA_BYTES)
             wave_slot_scalar = rocdl.readfirstlane(
-                fx.Int64.ir_type, arith.extui(T.i64, wave_slot_i32.ir_value())
+                fx.Int64.ir_type, fx.Int64(fx.Uint32(wave_slot_i32)).ir_value()
             )
             lds_ptr = buffer_ops.get_element_ptr(lds_ptr0, wave_slot_scalar)
 
@@ -1101,23 +1090,15 @@ def _build_kernel_mfma_lds_pipe(
                 row_h = h_a + row * fx.Int32(H)
                 base_a = row_h * fx.Int32(D)
                 for kk in range_constexpr(K_STEPS):
-                    row_a_frag[mi][kk] = _load_pack_i32x8(
-                        q_i32,
-                        base_a + fx.Int32(kk * mfma.MFMA_K) + lane_frag_off,
+                    row_a_frag[mi][kk] = mfma.make_frag(
+                        _load_pack_i32x8(
+                            q_i32,
+                            base_a + fx.Int32(kk * mfma.MFMA_K) + lane_frag_off,
+                        )
                     )
             a_packs[j] = row_a_frag
 
-            # Load weights: weights[row, h] per (mi, ii).
-            # The head this accumulator element belongs to is
-            # mi*MFMA_M + acc_head_static_offsets[ii] + lane_div_N*acc_head_group_stride.
-            row_w = [[None] * mfma.ACC_ELEMS for _ in range_constexpr(M_TILES)]
-            h_w_static_offset = lane_div_N * fx.Int32(mfma.acc_head_group_stride)
-            for mi in range_constexpr(M_TILES):
-                for ii in range_constexpr(mfma.ACC_ELEMS):
-                    static_off = mfma.acc_head_static_offsets[ii]
-                    h_w = fx.Int32(mi * mfma.MFMA_M + static_off) + h_w_static_offset
-                    row_w[mi][ii] = fx.Float32(w_t[row, h_w])
-            w_frag[j] = row_w
+            w_frag[j] = _load_row_weights(w_t, mfma, M_TILES, row, lane_div_N)
 
         # ---- Union KV window across all block rows (all waves cooperate) ----
         u_start = None
@@ -1148,16 +1129,16 @@ def _build_kernel_mfma_lds_pipe(
         block_y = fx.block_idx.y
 
         # How many tiles of BKV columns are in the union window.
-        win_tiles = _ceildiv(tile_end - tile_start, fx.Int32(BKV))
+        win_tiles = _uceildiv(tile_end - tile_start, fx.Int32(BKV))
 
         # How many KV columns (bytes/positions, rounded up to full tiles) each grid.y split owns.
-        split_cols = _ceildiv(win_tiles, num_splits) * fx.Int32(BKV)
+        split_cols = _uceildiv(win_tiles, num_splits) * fx.Int32(BKV)
 
         # Each grid.y block (block_y) shifts its start forward by block_y * split_cols:
         tile_start = tile_start + block_y * split_cols
         tile_end = _imin(tile_start + split_cols, tile_end)
 
-        n_tiles = _ceildiv(_imax(tile_end - tile_start, fx.Int32(0)), fx.Int32(BKV))
+        n_tiles = _uceildiv(_imax(tile_end - tile_start, fx.Int32(0)), fx.Int32(BKV))
 
         # ---- Prologue: prefetch tiles 0..PREFETCH_DEPTH-1 into buffers ----
         for _p in range_constexpr(PREFETCH_DEPTH):
@@ -1214,7 +1195,9 @@ def _build_kernel_mfma_lds_pipe(
                         )
                         frag_dword = frag_byte // fx.Int32(4)
 
-                    b_packs[ni][kk] = _lds_read_frag(fx.Index(slot_dword + frag_dword))
+                    b_packs[ni][kk] = mfma.make_frag(
+                        _lds_read_frag(slot_dword + frag_dword)
+                    )
 
             # Prefetch tile i+PREFETCH_DEPTH into slot (i+PD)%NB.  When NB>PD that
             # slot != the just-read slot, so no reader-before-writer barrier is
@@ -1234,24 +1217,16 @@ def _build_kernel_mfma_lds_pipe(
                 out_row_t = _make_out_row_t(logits, _stride_i64, row)
                 for ni in range_constexpr(N_TILES):
                     col = cols[ni]
-                    kv_scale = kv_scales_tile[ni]
-                    col_sum = f32_0
-                    for mi in range_constexpr(M_TILES):
-                        acc = Vec.filled(mfma.ACC_ELEMS, 0.0, fx.Float32)
-                        for kk in range_constexpr(K_STEPS):
-                            acc = mfma_fn(
-                                _mfma_res_ty,
-                                mfma.make_operands(
-                                    a_packs[j][mi][kk], b_packs[ni][kk], acc
-                                ),
-                            )
-                        for ii in range_constexpr(mfma.ACC_ELEMS):
-                            relu = Vec(acc)[ii].maximumf(f32_0)
-                            col_sum = col_sum + relu * w_frag[j][mi][ii]
-                    col_sum = col_sum * kv_scale
-
-                    for sh in mfma.shuffle_offsets:
-                        col_sum = col_sum + col_sum.shuffle_xor(sh, 64)
+                    col_sum = _emit_col_sum(
+                        mfma,
+                        mma,
+                        gemm_kw,
+                        a_packs[j],
+                        b_packs[ni],
+                        w_frag[j],
+                        kv_scales_tile[ni],
+                        f32_0,
+                    )
 
                     in_window = (col >= starts[j]) & (col < ends[j])
                     is_writer = (lane_div_N == fx.Int32(0)) & in_window
@@ -1314,12 +1289,7 @@ def _build_kernel_mfma_lds_pipe(
         num_splits: fx.Int32,
         stream: fx.Stream,
     ):
-        allocator.finalized = False
-        ctx = CompilationContext.get_current()
-        with ir.InsertionPoint(ctx.gpu_module_body):
-            allocator.finalize()
-
-        gx = fx.Int64(_ceildiv(seq_len, fx.Int32(ROWS_PER_BLOCK)))
+        gx = fx.Int64(_uceildiv(seq_len, fx.Int32(ROWS_PER_BLOCK)))
         gy = fx.Int64(num_splits)
         kernel._func.__name__ = _kname
         kernel(
@@ -1339,7 +1309,6 @@ def _build_kernel_mfma_lds_pipe(
     return launch_fp8_mqa_logits_mfma_lds_pipe
 
 
-# --------------------------------------------------------------------------- #
 # Kernel-variant registry (arch-dependent).
 #
 # gfx942 keeps its original ``"mfma_r<RPB>_w<WPB>"`` tags unchanged: RPB query
@@ -1353,7 +1322,6 @@ def _build_kernel_mfma_lds_pipe(
 #
 # Each entry hardcodes its own block_kv, overriding whatever the caller passed
 # to ``compile_fp8_mqa_logits``.
-# --------------------------------------------------------------------------- #
 
 
 def _mk_builder(
