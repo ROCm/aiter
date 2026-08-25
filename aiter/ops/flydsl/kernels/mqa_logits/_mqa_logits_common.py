@@ -3,7 +3,7 @@
 
 """FlyDSL building blocks for the paged FP8 MQA-logits kernel (gfx950 / CDNA4).
 
-    logits[row, n] = sum_h ReLU(<Q[row, h, :], K[n, :]> * kv_scale[n]) * weights[row, h]
+logits[row, n] = sum_h ReLU(<Q[row, h, :], K[n, :]> * kv_scale[n]) * weights[row, h]
 """
 
 from functools import lru_cache

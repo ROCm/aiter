@@ -498,9 +498,9 @@ def flydsl_fp8_paged_mqa_logits(
         _fnuz,
         _fn,
     ), f"q_fp8 must be e4m3 fp8 (fnuz or fn); got {q_fp8.dtype}"
-    assert get_gfx() == "gfx950", (
-        f"flydsl_fp8_paged_mqa_logits targets gfx950 (32x32x64 MFMA); got {get_gfx()}"
-    )
+    assert (
+        get_gfx() == "gfx950"
+    ), f"flydsl_fp8_paged_mqa_logits targets gfx950 (32x32x64 MFMA); got {get_gfx()}"
 
     variant = _resolve_variant(variant)
 

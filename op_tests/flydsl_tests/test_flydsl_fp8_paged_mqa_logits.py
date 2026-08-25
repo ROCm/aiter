@@ -13,6 +13,7 @@ than separate benchmark scripts.
 
 import argparse
 import itertools
+import math
 import random
 from typing import NamedTuple
 
@@ -398,7 +399,9 @@ def test_fp8_paged_mqa_logits(
     )
 
     if block_size == 1 and not preshuffle:
-        from aiter.ops.triton.attention.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
+        from aiter.ops.triton.attention.pa_mqa_logits import (
+            deepgemm_fp8_paged_mqa_logits,
+        )
 
         out_ref = torch.full(
             (batch_size * next_n, inp.max_model_len),
@@ -604,7 +607,11 @@ def run_gluon_ab(args):
                 "B": B,
                 "nn": nn,
                 "avg_kv": kv_len,
-                "fly/ref": fly_us / ref_us if ref_us == ref_us and ref_us > 0 else float("nan"),
+                "fly/ref": (
+                    fly_us / ref_us
+                    if not math.isnan(ref_us) and ref_us > 0
+                    else float("nan")
+                ),
             }
         )
         print(
@@ -635,7 +642,9 @@ def main():
         action="store_true",
         help="run the full cartesian product instead of the curated matrix",
     )
-    parser.add_argument("--no-preshuffle", action="store_true", help="skip preshuffle cases")
+    parser.add_argument(
+        "--no-preshuffle", action="store_true", help="skip preshuffle cases"
+    )
     parser.add_argument(
         "--bench",
         action="store_true",
