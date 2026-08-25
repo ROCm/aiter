@@ -75,6 +75,11 @@ _MOE_SORT_BACKEND = os.environ.get("AITER_MOE_SORT_BACKEND", "auto").lower()
 _ACT_TYPE_DISABLED_KEY = "__ignore__"
 _SWIGLU_MXFP4_BF16_BOUND = int(os.environ.get("GPTOSS_SWIGLU_MXFP4_BF16_BOUND", "256"))
 _MOE_A8W4_BYPASS_QUANT = os.environ.get("AITER_MOE_A8W4_BYPASS_QUANT", "0") == "1"
+# Smallest inter_dim at which the heuristic fallback may fuse stage 2's mxfp8
+# quant into stage 1's epilogue. 0 means always; see get_2stage_cfgs for why.
+_S1_FUSE_FP8Q_MIN_INTER_DIM = int(
+    os.environ.get("AITER_S1_FUSE_FP8Q_MIN_INTER_DIM", "0")
+)
 
 # Opt-in kernel-bench hook: a caller sets a list here to collect (name, callable)
 # per-kernel launches in fused_moe_2stages ("stage1"/"stage2"); None in production
@@ -2781,9 +2786,50 @@ def get_2stage_cfgs(
         if get_flydsl_kernel_params(kn2) is None:
             kn2 = _base_kn2
 
+        # Fold stage 2's mxfp8 quant and scale-sort into stage 1's epilogue.
+        # out_dtype="fp8" sets both need_quant and need_sort in
+        # mixed_moe_gemm_2stage, so the e8m0 exponents are computed in the
+        # CShuffle epilogue and microscales are written straight into sorted
+        # tiled layout -- stage 1 writes one byte per element instead of two and
+        # the standalone fused_mx_quant_moe_sort kernel is not needed at all.
+        # Worth it because stage 1 is memory-bound on the expert weights, so the
+        # epilogue arithmetic is free while the halved output write is not.
+        #
+        # The tuned path already decides this per shape via the "_fp8" suffix on
+        # kernelName1 (148 of the 168 rows in dsv4_fp8fp4_tuned_fmoe.csv carry
+        # it). This heuristic path never considered it, so every shape without a
+        # tuned row paid for the separate conversion regardless of whether the
+        # fused variant existed.
+        #
+        # Fused unconditionally. The fused variant exists for every tile, so
+        # resolving the name proves nothing about whether it is faster, and the
+        # tuned rows disagree by inter_dim (at 384 all 11 rows chose unfused; at
+        # 2048 and 3072 nearly all chose fused), which suggested a floor. A
+        # direct sweep of inter_dim 384..3072 found no crossover: end-to-end
+        # fused_moe was faster fused in 14 of 16 cells (-0.4% to -4.2%) and the
+        # two exceptions (+1.0%, +0.1%) were within run-to-run spread. The tuned
+        # table's preference at 384 reflects its joint stage1+stage2 choice at
+        # its own shapes, not a standalone loss for the fused epilogue: timing
+        # stage 1 alone charges the fused arm for its epilogue while never
+        # charging the unfused arm for the quant kernel fusion deletes.
+        #
+        # AITER_S1_FUSE_FP8Q=0 disables it; AITER_S1_FUSE_FP8Q_MIN_INTER_DIM
+        # reimposes a floor, with =1 forcing fusion below that floor.
+        _fb_fuse_quant = ""
+        _fb_fp8q_env = os.environ.get("AITER_S1_FUSE_FP8Q", "")
+        _fb_fp8q_want = _fb_fp8q_env != "0" and (
+            _fb_fp8q_env == "1" or inter_dim >= _S1_FUSE_FP8Q_MIN_INTER_DIM
+        )
+        if _a_type == "fp8" and _fb_fp8q_want:
+            _kn1_fp8q = f"{kn1}_fp8"
+            if get_flydsl_kernel_params(_kn1_fp8q) is not None:
+                kn1 = _kn1_fp8q
+                _fb_fuse_quant = "fp8"
+
         logger.warning(
             f"[fused_moe] no tuned FlyDSL config for {keys}, "
-            f"using heuristic FlyDSL fallback ({kn1=}, {kn2=})"
+            f"using heuristic FlyDSL fallback ({kn1=}, {kn2=}, "
+            f"fuse_quant={_fb_fuse_quant or 'none'})"
         )
         enable_bias = _needs_swiglu_bias_support(dtype, q_type)
         return MOEMetadata(
@@ -2804,6 +2850,7 @@ def get_2stage_cfgs(
             -1,  # split_k = -1
             False,
             has_bias=enable_bias,
+            fuse_quant=_fb_fuse_quant,
             stage2_has_bias=enable_bias,
         )
     if (
