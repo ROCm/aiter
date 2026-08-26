@@ -544,6 +544,40 @@ def flydsl_dcp_topk_merge(
     )
 
 
+def flydsl_top_k_per_row_decode(
+    logits: torch.Tensor,
+    next_n: int,
+    seqLens: torch.Tensor,
+    indices: torch.Tensor,
+    numRows: int,
+    stride0: int,
+    stride1: int,
+    k: int = 2048,
+    stable: bool = False,
+) -> None:
+    """FlyDSL per-row decode TopK with the same call shape as the HIP interface.
+
+    The multi-CTA kernel specializes each ``k`` at compile time and supports
+    float32 input, int32 indices, and contiguous rows. With ``stable=True``,
+    indices are emitted in ascending order with smallest-index tie-breaking.
+    """
+    from .flydsl.topk_per_row import (
+        flydsl_top_k_per_row_decode as _flydsl_top_k_per_row_decode,
+    )
+
+    return _flydsl_top_k_per_row_decode(
+        logits,
+        next_n,
+        seqLens,
+        indices,
+        numRows,
+        stride0,
+        stride1,
+        k,
+        stable,
+    )
+
+
 @compile_ops("module_top_k_per_row", ffi_type="ctypes")
 def top_k_per_row_decode_fast(
     logits: torch.Tensor,
