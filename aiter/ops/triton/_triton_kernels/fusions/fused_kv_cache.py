@@ -307,6 +307,7 @@ def _fused_qk_rope_cat_and_cache_mla_kernel(
     OUTPUT_Q_NOPE_ZEROS_AND_Q_PE: tl.constexpr = False,
     HAVE_K_SCALE: tl.constexpr = False,
     UPCAST_OPERAND: tl.constexpr = False,
+    PAD_SLOT_ID: tl.constexpr = -1,
 ):
     pid = tl.program_id(0)
 
@@ -399,7 +400,7 @@ def _fused_qk_rope_cat_and_cache_mla_kernel(
         is_kv = pid_hk < KH
         if is_kv:
             pid_slot = tl.load(slot_mapping_ptr + pid_b).to(tl.int64)
-            if pid_slot >= 0:
+            if pid_slot >= 0 and pid_slot != PAD_SLOT_ID:
                 if BLOCK_SIZE > 1:
                     pid_t_slot = pid_slot // BLOCK_SIZE
                     pid_blk = pid_slot % BLOCK_SIZE
@@ -475,7 +476,7 @@ def _fused_qk_rope_cat_and_cache_mla_kernel(
             pid_b = pid // KH
             pid_hk = pid % KH
             pid_slot = tl.load(slot_mapping_ptr + pid_b).to(tl.int64)
-            if pid_slot >= 0:
+            if pid_slot >= 0 and pid_slot != PAD_SLOT_ID:
                 if BLOCK_SIZE > 1:
                     pid_t_slot = pid_slot // BLOCK_SIZE
                     pid_blk = pid_slot % BLOCK_SIZE

@@ -419,6 +419,7 @@ def _fused_qk_rope_cat_and_cache_mla_kernel(
     OUTPUT_Q_NOPE_ZEROS_AND_Q_PE: gl.constexpr = False,
     HAVE_K_SCALE: gl.constexpr = False,
     UPCAST_OPERAND: gl.constexpr = False,
+    PAD_SLOT_ID: gl.constexpr = -1,
 ):
     # 1-warp (wave32) blocked layouts matching the Triton-generated ttgir.
     L_NOPE: gl.constexpr = gl.BlockedLayout(
@@ -582,7 +583,7 @@ def _fused_qk_rope_cat_and_cache_mla_kernel(
             gl.amd.gfx1250.tdm.async_store(q_out_nope_desc, [0], qn_smem_out)
             gl.amd.gfx1250.tdm.async_store(q_out_pe_desc, [0], qpe_smem_out)
 
-        if is_kv and pid_slot >= 0:
+        if is_kv and pid_slot >= 0 and pid_slot != PAD_SLOT_ID:
             if BLOCK_SIZE > 1:
                 pid_t_slot = pid_slot // BLOCK_SIZE
                 pid_blk = pid_slot % BLOCK_SIZE
@@ -683,7 +684,7 @@ def _fused_qk_rope_cat_and_cache_mla_kernel(
             _issue_tdm_load_1d(k_pe_desc, 0, kpe_smem)
 
             pid_slot = gl.load(slot_mapping_ptr + pid_b).to(gl.int64)
-            if pid_slot >= 0:
+            if pid_slot >= 0 and pid_slot != PAD_SLOT_ID:
                 if BLOCK_SIZE > 1:
                     pid_t_slot = pid_slot // BLOCK_SIZE
                     pid_blk = pid_slot % BLOCK_SIZE

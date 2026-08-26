@@ -260,6 +260,82 @@ def test_fused_qk_rope_cat_and_cache_mla(
     torch.testing.assert_close(torch_k_pe_og_dtype, triton_k_pe, atol=1e-1, rtol=1e-1)
 
 
+@pytest.mark.parametrize(
+    "pad_slot_id,padded_token_index",
+    [(-1, 0), (0, 0), (0, 1)],
+    ids=["default-writes-slot-zero", "decode-branch", "prefill-branch"],
+)
+def test_fused_qk_rope_cat_and_cache_mla_pad_slot_id(
+    pad_slot_id: int, padded_token_index: int
+):
+    """A caller-selected padding slot is preserved in both KV-write branches."""
+    dtype = torch.bfloat16
+    num_q_tokens = 1
+    num_kv_tokens = 2
+    num_q_heads = 16
+    num_kv_heads = 1
+    d_nope = 512
+    d_pe = 64
+
+    q_nope = torch.zeros(
+        (num_q_tokens, num_q_heads, d_nope), dtype=dtype, device="cuda"
+    )
+    q_pe = torch.zeros(
+        (num_q_tokens, num_q_heads, d_pe), dtype=dtype, device="cuda"
+    )
+    k_nope = torch.full(
+        (num_kv_tokens, num_kv_heads, d_nope), 2, dtype=dtype, device="cuda"
+    )
+    k_pe = torch.full(
+        (num_kv_tokens, num_kv_heads, d_pe), 3, dtype=dtype, device="cuda"
+    )
+    k_nope[padded_token_index].fill_(torch.nan)
+    k_pe[padded_token_index].fill_(torch.nan)
+
+    sentinel = 17
+    kv_cache = torch.full(
+        (4, num_kv_heads, d_nope + d_pe),
+        sentinel,
+        dtype=dtype,
+        device="cuda",
+    )
+    slot_mapping = torch.tensor([0, 1], dtype=torch.int64, device="cuda")
+    if padded_token_index == 1:
+        slot_mapping = slot_mapping.flip(0)
+    positions = torch.zeros(num_q_tokens, dtype=torch.int64, device="cuda")
+    cos = torch.ones((1, d_pe), dtype=dtype, device="cuda")
+    sin = torch.zeros_like(cos)
+    k_scale = torch.ones((), dtype=torch.float32, device="cuda")
+
+    fused_qk_rope_cat_and_cache_mla(
+        q_nope,
+        q_pe,
+        k_nope,
+        k_pe,
+        kv_cache,
+        slot_mapping,
+        positions,
+        cos,
+        sin,
+        k_scale,
+        is_neox=True,
+        pad_slot_id=pad_slot_id,
+    )
+
+    if pad_slot_id == 0:
+        torch.testing.assert_close(
+            kv_cache[0], torch.full_like(kv_cache[0], sentinel)
+        )
+    else:
+        assert torch.isnan(kv_cache[0]).all()
+
+    valid_token_index = 1 - padded_token_index
+    expected_slot_one = torch.cat(
+        (k_nope[valid_token_index], k_pe[valid_token_index]), dim=-1
+    )
+    torch.testing.assert_close(kv_cache[1], expected_slot_one)
+
+
 @pytest.mark.parametrize("T", [1, 8, 2048])
 @pytest.mark.parametrize("QH_per_KH", [16])
 @pytest.mark.parametrize("KH", [8])
