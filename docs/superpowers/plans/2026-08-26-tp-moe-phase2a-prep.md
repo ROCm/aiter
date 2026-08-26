@@ -1,3 +1,22 @@
+> **⚠️ 本方案已作废（2026-08-26），只有 Task 1 执行了。**
+>
+> Task 2 到 Task 8 全部取消。原因是它们服务于「把四个 helper 从 `mega_moe_stage1.py` /
+> `dispatch.py` 抽进共享模块」这条路线，而该路线在执行 Task 3 时被否掉了：Task 3 的
+> 可复现性关卡失败，`MegaMoEV2` 在与 `main` 逐字节相同的代码上两次运行输出就不一致
+> （八个 rank 全部不一致，而编译 IR 完全一致），所以「输出逐位相同」这条守护不存在。
+> 决定改为拷贝，`MegaMoEV2` 一行不改，守护随之不再需要。
+>
+> **实际执行结果：**
+> - Task 1 完成，`TPMoEStage1NCCLRef` 与 `case_ref_fidelity` 已提交（`36806710f`、`7c020eac4`）。
+> - Task 2 完成后又删除（`2647b3223` 加 `7386405aa`），工具失去调用方且有已知缺陷。
+> - Task 3 执行到 Step 3 失败并按方案要求停止，快照脚本未提交。
+> - Task 4 到 Task 8 未执行。
+>
+> 现行设计见 `docs/superpowers/specs/2026-08-26-tp-moe-stage1-fused-p2p-design.md` 第 6 节。
+> 四个 helper 的 TP 版本改为在阶段二（下）与使用它们的 kernel 一起写。
+
+---
+
 # TPMoEStage1 阶段二（上）：准备工作 Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
