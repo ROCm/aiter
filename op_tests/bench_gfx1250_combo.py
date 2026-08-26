@@ -404,6 +404,7 @@ _NOISE = (
     "[flydsl.compile]",
     "[aiter INFO]",
     "[aiter WARNING]",
+    "import [module_",
     "In file included from",
     "torch/distributed/run.py",
     "Building extension",
@@ -429,15 +430,18 @@ def _table_row(*headers):
     """Whitespace-aligned table: the header line plus its numeric rows."""
 
     def keep(line):
+        if not _quiet(line):
+            return False
         if any(h in line for h in headers):
             return True
-        stripped = line.strip()
-        return bool(stripped) and stripped[0].isdigit()
+        # A data row starts with a bare number; "100% |####|" (pip) does not.
+        head = line.split(maxsplit=1)[0]
+        return head.strip("-").replace(",", "").replace(".", "").isdigit()
 
     return keep
 
 
-def _run_child(name, cmd, cwd, env=None, keep=_md_row, tail=30):
+def _run_child(name, cmd, cwd, env=None, keep=_md_row, timeout=None, tail=30):
     """Run a child UT with its output captured and surface only its results.
 
     Child UTs print their own progress, aiter INFO lines and (with FlyDSL) a
@@ -445,10 +449,17 @@ def _run_child(name, cmd, cwd, env=None, keep=_md_row, tail=30):
     it, echo only the rows `keep` accepts, and fall back to the tail of the
     output when the child fails or emits nothing recognisable.
     """
-    proc = subprocess.run(
-        cmd, cwd=cwd, env=env, text=True,
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-    )
+    try:
+        proc = subprocess.run(
+            cmd, cwd=cwd, env=env, text=True, timeout=timeout,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        )
+    except subprocess.TimeoutExpired as exc:
+        captured = exc.output or ""
+        print(f"\n===== {name} =====", flush=True)
+        print(f"--- timed out after {timeout}s, last {tail} lines ---")
+        print("\n".join(captured.splitlines()[-tail:]), flush=True)
+        raise
     lines = proc.stdout.splitlines()
     rows = [ln for ln in lines if keep(ln)]
     print(f"\n===== {name} =====", flush=True)
@@ -457,7 +468,7 @@ def _run_child(name, cmd, cwd, env=None, keep=_md_row, tail=30):
         print(f"--- {name}: exit={proc.returncode}, last {tail} lines ---")
         print("\n".join(lines[-tail:]), flush=True)
     if proc.returncode != 0:
-        raise subprocess.CalledProcessError(proc.returncode, cmd)
+        raise subprocess.CalledProcessError(proc.returncode, cmd, proc.stdout)
 
 
 # --- per-op runners: sweep axes silently, then print one table ---
@@ -813,6 +824,7 @@ def run_mori_ep(_args):
         cwd=mori,
         env=env,
         keep=_quiet,
+        timeout=3600,
     )
 
 
