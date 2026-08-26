@@ -1,0 +1,220 @@
+# Cluster Launch Without A Multicast
+
+## Goal
+
+Support a mode that retains the multicast scheduling/layout algorithm and the
+hardware workgroup-cluster launch, but does not broadcast A through
+`CLUSTER_LOAD_ASYNC`.
+
+For `cluster_n=4`, the four consecutive TGs must remain:
+
+```text
+TG base + 0: (m_tile, n_tile + 0)
+TG base + 1: (m_tile, n_tile + 1)
+TG base + 2: (m_tile, n_tile + 2)
+TG base + 3: (m_tile, n_tile + 3)
+```
+
+They share the same M tile, expert, and A address, but each TG independently
+loads A when multicast is disabled. Their clustered placement should still
+provide close cache reuse for the identical A accesses. B remains independent
+because each peer consumes a different N tile.
+
+## Current Behavior
+
+`cluster_n` currently controls three things together:
+
+1. TG mapping is performed at cluster granularity.
+2. The kernel launches with `cluster=(cluster_n, 1, 1)`.
+3. A receives `workgroup_mask=(1 << cluster_n) - 1`, turning its TDM operation
+   into a cluster multicast.
+
+The new mode must separate item 3 from items 1 and 2.
+
+Only the A payload is multicast in the current implementation. As, B, and Bs
+do not receive a workgroup mask and must remain unchanged.
+
+## Minimal Implementation
+
+### 1. Add an independent A-multicast option
+
+Add a compile-time `a_multicast` argument to
+`launch_gemm_a8w4_tdm()` in:
+
+```text
+aiter/ops/flydsl/kernels/mxfp4_preshuffle_gfx1250_tdm.py
+```
+
+Include it in the kernel cache tag and kernel name suffix so multicast-on and
+multicast-off binaries cannot collide in the FlyDSL cache.
+
+Recommended naming:
+
+```text
+a_multicast: Constexpr[int] = 1
+kernel suffix: _amc0 only when cluster_n > 1 and multicast is disabled
+```
+
+The default must preserve the current behavior.
+
+### 2. Decouple the A workgroup mask
+
+Keep the existing cluster-granularity mapping unchanged:
+
+```python
+swz_id = bid_x // cluster_n
+local_n = bid_x % cluster_n
+```
+
+Keep the cluster launch unchanged whenever `cluster_n > 1`:
+
+```python
+cluster=(cluster_n, 1, 1)
+```
+
+Change only the A multicast mask:
+
+```python
+a_mcast_mask = (
+    (1 << cluster_n) - 1
+    if cluster_n > 1 and a_multicast
+    else 0
+)
+```
+
+Expected behavior:
+
+| cluster_n | a_multicast | Launch | A TDM operation |
+|---:|---:|---|---|
+| 1 | 0/1 | Normal TG launch | Independent global load |
+| 4 | 1 | Cluster-4 launch | A cluster multicast |
+| 4 | 0 | Cluster-4 launch | Independent A load per TG |
+
+Do not add a cluster barrier for the no-multicast case. Each TG owns and waits
+for its own A tensor load.
+
+### 3. Thread the option through wrappers
+
+Pass `a_multicast` through:
+
+```text
+aiter/ops/flydsl/grouped_gemm_mxfp4.py
+aiter/ops/flydsl/grouped_moe_gfx1250.py
+```
+
+Add an environment override for experiments:
+
+```text
+AITER_TDM_A_MULTICAST=0|1
+```
+
+Recommended selection order:
+
+1. Explicit environment value.
+2. Optional CSV `a_multicast` column when present.
+3. Default `1`, preserving current cluster multicast behavior.
+
+Do not change `cluster_n` selection. In particular,
+`AITER_TDM_A_MULTICAST=0` must not force `cluster_n=1`.
+
+### 4. Preserve cluster validity checks
+
+Even without multicast, a cluster launch still requires a complete cluster.
+Keep the existing condition:
+
+```text
+ceil(N / tile_n) % cluster_n == 0
+```
+
+The grid size must remain:
+
+```text
+m_tiles * n_tiles
+```
+
+Do not pad with partial clusters unless a separate design explicitly handles
+the extra TGs.
+
+## Validation
+
+### Functional cases
+
+Run the same grouped-MoE case in three modes:
+
+```text
+1. cluster_n=1
+2. cluster_n=4, A multicast enabled
+3. cluster_n=4, A multicast disabled
+```
+
+All modes must pass the existing correctness gate:
+
+```text
+logits_diff < 0.01
+pass=True
+```
+
+Test at least one expert boundary and one partial final M tile to confirm that
+all four peers still resolve the same expert and use the same A OOB extent.
+
+### Mapping checks
+
+Temporarily dump or inspect the lowered mapping for one cluster and verify:
+
+```text
+bid_x % cluster_n changes only n_tile
+bid_x // cluster_n selects the shared m_tile
+expert is identical for all peers
+A base address is identical for all peers
+B base address changes with local_n
+```
+
+### ISA checks
+
+With `FLYDSL_DUMP_IR=1`, compare the generated ISA.
+
+Multicast enabled:
+
+```text
+cluster dimensions: 4,1,1
+A load: CLUSTER_LOAD_ASYNC / non-zero workgroup mask
+```
+
+Multicast disabled:
+
+```text
+cluster dimensions: 4,1,1
+A load: GLOBAL_LOAD_ASYNC / workgroup mask zero
+```
+
+B must remain a non-multicast global tensor load in both binaries.
+
+### Performance checks
+
+Use GPU-only timing:
+
+```bash
+rocprofv3 --stats --kernel-trace -f csv -o /tmp/cluster_<mode> -- <command>
+```
+
+Compare GEMM1 for:
+
+```text
+cluster1
+cluster4 + multicast
+cluster4 + no multicast
+```
+
+Also compare A traffic/cache behavior if suitable hardware counters are
+available. Cluster-4 without multicast issues four A loads, so any benefit must
+come from placement and cache reuse rather than reduced instruction/request
+count.
+
+## Acceptance Criteria
+
+1. `cluster_n=4, AITER_TDM_A_MULTICAST=0` still launches a `(4,1,1)` cluster.
+2. Four consecutive TGs share one M tile/expert and use adjacent N tiles.
+3. A uses independent global tensor loads, with no workgroup multicast mask.
+4. B, As, and Bs behavior is unchanged.
+5. Existing cluster multicast remains the default and shows no regression.
+6. All tested modes pass correctness and `git diff --check`.
