@@ -2312,9 +2312,7 @@ def get_2stage_cfgs(
         if not c2s:
             return None
         primary, fallback = c2s
-        lookup_keys = keys
-        if config_file is not None:
-            lookup_keys = keys[:7] + (str(activation),) + keys[8:]
+        lookup_keys = keys[:7] + (str(activation),) + keys[8:]
         result = primary.get(lookup_keys, None)
         if result is None and config_file is None:
             result = fallback.get(keys_disabled, None)
@@ -2323,7 +2321,7 @@ def get_2stage_cfgs(
             tier_idx = _PADDED_M_TIERS.index(token) if token in _PADDED_M_TIERS else -1
             for fallback_tier in reversed(_PADDED_M_TIERS[:tier_idx]):
                 # keys layout: (gfx, cu_num, token, ...); replace token (idx 2).
-                keys_fb = keys[:2] + (fallback_tier,) + keys[3:]
+                keys_fb = lookup_keys[:2] + (fallback_tier,) + lookup_keys[3:]
                 keys_fb_disabled = (
                     keys_disabled[:2] + (fallback_tier,) + keys_disabled[3:]
                 )
