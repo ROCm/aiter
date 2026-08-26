@@ -362,9 +362,7 @@ def _make_sparse_case(
     gen = torch.Generator(device=device)
     gen.manual_seed(seed)
     q_fp32 = torch.randn(n, h, d, device=device, generator=gen) * 0.5
-    unified_kv_fp32 = (
-        torch.randn(total_pages, d, device=device, generator=gen) * 0.5
-    )
+    unified_kv_fp32 = torch.randn(total_pages, d, device=device, generator=gen) * 0.5
     kv_fp32 = torch.randn(total_tokens, d, device=device, generator=gen) * 0.5
     attn_sink = torch.randn(h, device=device, generator=gen) * 0.25
 
@@ -414,7 +412,7 @@ def _make_split_inputs(case: dict) -> dict:
     def split_rows(rows: torch.Tensor):
         flat = rows.reshape(-1, _FP8_D_HEAD)
         nope, deq = _quantize_nope(flat[:, :_FP8_D_NOPE])
-        rope = flat[:, _FP8_D_NOPE :].to(torch.bfloat16)
+        rope = flat[:, _FP8_D_NOPE:].to(torch.bfloat16)
         return nope, rope, torch.cat([deq, rope.to(torch.float32)], dim=1)
 
     qn, qr, q_fp32 = split_rows(case["q_fp32"])
@@ -597,9 +595,7 @@ def run_sparse_prefill(
                 lambda: pa_sparse_prefill_fp8_opus(
                     **split["kernel"], softmax_scale=softmax_scale
                 ),
-                _ref_pa_sparse_prefill_fp8(
-                    **split["ref"], softmax_scale=softmax_scale
-                ),
+                _ref_pa_sparse_prefill_fp8(**split["ref"], softmax_scale=softmax_scale),
                 "fp8",
                 1,
             )
@@ -609,12 +605,8 @@ def run_sparse_prefill(
         candidates.append(
             (
                 "opus",
-                lambda: pa_sparse_prefill_opus(
-                    **single, softmax_scale=softmax_scale
-                ),
-                _ref_pa_sparse_prefill_opus(
-                    **single, softmax_scale=softmax_scale
-                ),
+                lambda: pa_sparse_prefill_opus(**single, softmax_scale=softmax_scale),
+                _ref_pa_sparse_prefill_opus(**single, softmax_scale=softmax_scale),
                 prec,
                 torch.tensor([], dtype=_PREC_TO_DTYPE[prec]).element_size(),
             )
@@ -629,9 +621,7 @@ def run_sparse_prefill(
         case["kv_indices_extend"],
         case["kv_indptr_extend"],
     )
-    triton_ref = _ref_pa_sparse_prefill_opus(
-        **bf16_inputs, softmax_scale=softmax_scale
-    )
+    triton_ref = _ref_pa_sparse_prefill_opus(**bf16_inputs, softmax_scale=softmax_scale)
     candidates.append(
         (
             "triton",
@@ -684,11 +674,7 @@ def run_sparse_prefill(
             row[f"{name} us"] = round(float(lat_us), 2)
             row[f"{name} TFLOPS"] = round(float(tflops), 2)
             row[f"{name} TB/s"] = round(
-                (
-                    n * h * d * kv_esz
-                    + total_nnz * d * kv_esz
-                    + n * h * d * 2
-                )
+                (n * h * d * kv_esz + total_nnz * d * kv_esz + n * h * d * 2)
                 / max(lat_us, 1e-12)
                 / 1e6,
                 2,
