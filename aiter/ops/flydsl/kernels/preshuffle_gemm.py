@@ -217,17 +217,9 @@ def compile_preshuffle_gemm(
         layout_elem = Int8
     else:
         layout_elem = Float8E4M3FN if is_gfx950 else Float8E4M3FNUZ
-    if out_dtype == "bf16":
-        final_out_elem_cls = BFloat16
-        final_out_elem_bytes = 2
-    elif out_dtype == "fp16":
-        final_out_elem_cls = Float16
-        final_out_elem_bytes = 2
-    elif out_dtype == "fp32":
-        final_out_elem_cls = Float32
-        final_out_elem_bytes = 4
-    else:
-        raise ValueError(f"out_dtype must be bf16/fp16/fp32, got {out_dtype!r}")
+    final_out_elem_cls = BFloat16 if out_dtype == "bf16" else Float16
+    final_out_elem_bytes = 2
+    # split_k > 1 stores fp32 partials; the last split converts them.
     out_elem_cls = Float32 if split_k > 1 else final_out_elem_cls
     out_elem_bytes = 4 if split_k > 1 else final_out_elem_bytes
 
@@ -281,6 +273,8 @@ def compile_preshuffle_gemm(
     ):
         tid = fx.thread_idx.x
         bid_x, bid_y, bid_z = fx.block_idx
+        # First K-tile this split owns; 0 when split_k == 1.
+        k_off = fx.Int32(bid_z) * num_tiles
 
         if const_expr(xcd_swizzle > 0):
             _bx, _by = xcd_remap_bx_by(
@@ -392,14 +386,8 @@ def compile_preshuffle_gemm(
         # split_k > 1 makes this the CTA-to-CTA partial path; split_k == 1 is
         # the ordinary final store and stays cached.
         out_cpol = _CPOL_COHERENT if split_k > 1 else 0
-        buf_copy_out = fx.make_copy_atom(
-            (
-                fx.rocdl.BufferCopy32b(out_cpol)
-                if out_elem_bytes == 4
-                else fx.rocdl.BufferCopy16b(out_cpol)
-            ),
-            out_elem_cls,
-        )
+        copy_op = fx.rocdl.BufferCopy32b if split_k > 1 else fx.rocdl.BufferCopy16b
+        buf_copy_out = fx.make_copy_atom(copy_op(out_cpol), out_elem_cls)
         thr_r2g_C = fx.make_tiled_copy_C(buf_copy_out, tiled_mma).get_slice(tid)
         pC_g = thr_r2g_C.partition_S(tC)
         frag_C_out = fx.make_fragment_like(frag_C, out_elem_cls.ir_type)
@@ -433,7 +421,7 @@ def compile_preshuffle_gemm(
                     fx.Int32.ir_type, wave_id * wave_stride_bytes
                 )
                 lds_ptr = fx.add_offset(sA_i8_ptr[stage], wave_off)
-                base_k = (fx.Int32(bid_z) * num_tiles + k_tile_val) * tile_k
+                base_k = (k_off + k_tile_val) * tile_k
                 for i in range_constexpr(num_a_loads):
                     if const_expr(i > 0):
                         lds_ptr = fx.add_offset(lds_ptr, step_bytes)
@@ -592,12 +580,7 @@ def compile_preshuffle_gemm(
                     dma_a_to_lds(next_k_val, a_write)
                     fx.copy(
                         buf_copy,
-                        pB_g[
-                            None,
-                            None,
-                            None,
-                            fx.Int32(bid_z) * num_tiles + next_k_val,
-                        ],
+                        pB_g[None, None, None, k_off + next_k_val],
                         frag_B_retile_stages[write_stage],
                     )
                 mma_kloop(a_read, cur_frag_B)
@@ -608,12 +591,8 @@ def compile_preshuffle_gemm(
                 gpu.barrier()
                 return
             if const_expr(do_next):
-                global_k_next = fx.Int32(bid_z) * num_tiles + next_k_val
-                fx.copy(
-                    buf_copy,
-                    pA_g[None, None, None, global_k_next],
-                    frag_copy_A,
-                )
+                global_k_next = k_off + next_k_val
+                fx.copy(buf_copy, pA_g[None, None, None, global_k_next], frag_copy_A)
                 fx.copy(
                     buf_copy,
                     pB_g[None, None, None, global_k_next],
@@ -635,26 +614,13 @@ def compile_preshuffle_gemm(
         )
         if const_expr(use_async_copy):
             dma_a_to_lds(fx.Int32(0), 0)
-            fx.copy(
-                buf_copy,
-                pB_g[None, None, None, fx.Int32(bid_z) * num_tiles],
-                frag_B_retile_stages[0],
-            )
+            fx.copy(buf_copy, pB_g[None, None, None, k_off], frag_B_retile_stages[0])
             frag_C.store(acc_zero)
             rocdl.s_waitcnt(num_b_loads)
             gpu.barrier()
         else:
-            split_tile_base = fx.Int32(bid_z) * num_tiles
-            fx.copy(
-                buf_copy,
-                pA_g[None, None, None, split_tile_base],
-                frag_copy_A,
-            )
-            fx.copy(
-                buf_copy,
-                pB_g[None, None, None, split_tile_base],
-                frag_B_retile_stages[0],
-            )
+            fx.copy(buf_copy, pA_g[None, None, None, k_off], frag_copy_A)
+            fx.copy(buf_copy, pB_g[None, None, None, k_off], frag_B_retile_stages[0])
             frag_C.store(acc_zero)
             fx.copy(uni_copy, frag_copy_A, pA_s_stages[0][None, None, None])
             gpu.barrier()
@@ -670,23 +636,11 @@ def compile_preshuffle_gemm(
                 mma_kloop(0, frag_Bc)
                 if const_expr(not use_async_copy):
                     fx.copy(
-                        buf_copy,
-                        pA_g[
-                            None,
-                            None,
-                            None,
-                            fx.Int32(bid_z) * num_tiles + k_next,
-                        ],
-                        frag_copy_A,
+                        buf_copy, pA_g[None, None, None, k_off + k_next], frag_copy_A
                     )
                 fx.copy(
                     buf_copy,
-                    pB_g[
-                        None,
-                        None,
-                        None,
-                        fx.Int32(bid_z) * num_tiles + k_next,
-                    ],
+                    pB_g[None, None, None, k_off + k_next],
                     frag_Bc_retile,
                 )
                 gpu.barrier()  # single buffer: all reads done before overwrite
@@ -769,11 +723,7 @@ def compile_preshuffle_gemm(
             if const_expr(_has_bias):
                 # Per-column bias (out_dtype), one scalar per N-block, shared across rows.
                 bias_rsrc = buffer_ops.create_buffer_resource(arg_bias, max_size=True)
-                bias_elem_ty = (
-                    T.bf16
-                    if out_dtype == "bf16"
-                    else (T.f16 if out_dtype == "fp16" else T.f32)
-                )
+                bias_elem_ty = T.bf16 if out_dtype == "bf16" else T.f16
                 bias = [
                     fx.Float32(
                         buffer_ops.buffer_load(
