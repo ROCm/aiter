@@ -959,7 +959,14 @@ OPS = {
     "mori_ep": run_mori_ep,
     "mega_moe": run_mega_moe,
 }
-PERF_OPS = ["mha", "moe", "gemm", "f8gemm", "mla_v4_decode"]
+# "gemm" and "f8gemm" are temporarily disabled on gfx1250.
+#   gemm   (f4gemm a4w4): two back-to-back cases differing only in outtype
+#          (bf16 -> fp8) abort with HSA_STATUS_ERROR_MEMORY_FAULT.
+#   f8gemm (mxfp8/fp4):   most cases report "0 us" / "inf TFLOPS" once the sweep
+#          runs back to back, so the table is silently unusable.
+# Every case passes when run in a fresh process, so this looks like state
+# leaking across cases rather than a kernel bug. Re-enable once isolated.
+PERF_OPS = ["mha", "moe", "mla_v4_decode"]
 DSV4_OPS = [
     "mega_moe",
     "mori_ep",
