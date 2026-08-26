@@ -653,7 +653,12 @@ def run_sparse_prefill(
             )
         )
 
-    row: dict = {"nnz_prefix": nnz_p, "nnz_extend": nnz_e}
+    # Report per-row nnz rather than the pool-wide total, so the column matches
+    # the --nnz-prefix/--nnz-extend the sweep was asked for instead of scaling
+    # with N. Exact for fixed/dense/empty (every row has the same count); a mean
+    # for sparse, whose rows vary. total_nnz below keeps the full count -- the
+    # FLOPs and bytes figures need the real work done, not the per-row figure.
+    row: dict = {"nnz_prefix": nnz_p // n, "nnz_extend": nnz_e // n}
     for name, invoke, ref, candidate_prec, kv_esz in candidates:
         if verify:
             rtol, atol = _get_tolerances(candidate_prec)
@@ -739,15 +744,20 @@ parser.add_argument(
     "--n_tokens",
     type=int,
     nargs="*",
-    default=[1024, 4096],
-    help="number of query tokens N (default: [1024, 4096])",
+    default=[512, 1024, 2048, 4096],
+    help="number of query tokens N (default: [512, 1024, 2048, 4096])",
 )
 parser.add_argument(
     "--h_q",
     type=int,
     nargs="*",
-    default=[16, 32, 64, 128],
-    help="number of query heads H_Q (default: [16, 32, 64, 128])",
+    default=[128],
+    help=(
+        "number of query heads H_Q (default: [128]).\n"
+        "The asm candidate only registers at H_Q=128, so the default keeps the\n"
+        "three-way opus/triton/asm comparison. Pass 16/32/64 to sweep the\n"
+        "opus-vs-triton pair at other head counts."
+    ),
 )
 parser.add_argument(
     "-d",
@@ -760,10 +770,11 @@ parser.add_argument(
     "--total_pages",
     type=int,
     nargs="*",
-    default=[4096, 16384],
+    default=[],
     help=(
-        "rows in unified_kv (default: [1024, 4096, 16384]). "
-        "Pass 0 to mirror -n for that sweep point."
+        "rows in unified_kv. Pass 0 to mirror -n for that sweep point.\n"
+        "Empty by default, which switches the mode/total_pages sweep off so a\n"
+        "bare run only does the explicit-nnz sweep; pass values to enable it."
     ),
 )
 parser.add_argument(
@@ -776,10 +787,11 @@ parser.add_argument(
     "--prec",
     type=str,
     nargs="*",
-    default=["bf16", "fp8"],
+    default=["fp8"],
     choices=list(_PRECS),
     help=(
-        "precision(s) to sweep (default: [bf16, fp8]).\n"
+        "precision(s) to sweep (default: [fp8], the only one the asm\n"
+        "candidate implements).\n"
         "  bf16/fp16: single-tensor Q/K/V/O kernel\n"
         "  fp8      : split NoPE-fp8 / RoPE-bf16 DSA kernel"
     ),
@@ -788,7 +800,7 @@ parser.add_argument(
     "--mode",
     type=str,
     nargs="*",
-    default=["sparse", "dense"],
+    default=[],
     choices=list(_MODES),
     help=(
         "CSR mode(s) to sweep for both prefix and extend.\n"
@@ -796,7 +808,7 @@ parser.add_argument(
         "          seeded at KV-tile boundaries (0, 1, T-1, T, T+1, ...)\n"
         "  dense : every token sees every page / every kv row\n"
         "  empty : all-empty CSR rows (sink-only output)\n"
-        "Default: [sparse, dense]."
+        "Empty by default (see --total_pages); this sweep needs both set."
     ),
 )
 parser.add_argument(
@@ -826,21 +838,31 @@ parser.add_argument(
     "--nnz-prefix",
     type=int,
     nargs="*",
-    default=[],
-    help="explicit per-row prefix nnz values for the shared shape sweep",
+    default=[256, 1024, 4096, 8192, 16384],
+    help=(
+        "explicit per-row prefix nnz values for the shared shape sweep\n"
+        "(default: [256, 1024, 4096, 8192, 16384])"
+    ),
 )
 parser.add_argument(
     "--nnz-extend",
     type=int,
     nargs="*",
-    default=[],
-    help="explicit per-row extend nnz values for the shared shape sweep",
+    default=[128],
+    help=(
+        "explicit per-row extend nnz values for the shared shape sweep\n"
+        "(default: [128])"
+    ),
 )
 parser.add_argument(
     "--pool",
     type=int,
     default=4096,
-    help="prefix/extend pool rows for explicit CSR sweeps",
+    help=(
+        "prefix/extend pool rows for explicit CSR sweeps. Raised to the largest\n"
+        "swept nnz when that is bigger, so the CSR never wraps and re-gathers\n"
+        "the same rows (default: 4096, i.e. 16384 for the default nnz sweep)."
+    ),
 )
 
 
