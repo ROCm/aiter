@@ -89,9 +89,9 @@ void check_csr(const aiter_tensor_t* indptr,
 {
     check_tensor(indptr, indptr_name, AITER_DTYPE_i32);
     check_tensor(indices, indices_name, AITER_DTYPE_i32, /*allow_empty=*/true);
-    AITER_CHECK(indptr->numel() == static_cast<size_t>(t + 1),
-                "mla_sparse_prefill_fp8_asm: `", indptr_name, "` must have T+1 = ", t + 1,
-                " elements, got ", indptr->numel());
+    AITER_CHECK(indptr->numel() >= static_cast<size_t>(t + 1),
+                "mla_sparse_prefill_fp8_asm: `", indptr_name, "` must have at least T+1 = ",
+                t + 1, " elements, got ", indptr->numel());
 }
 
 } // namespace
