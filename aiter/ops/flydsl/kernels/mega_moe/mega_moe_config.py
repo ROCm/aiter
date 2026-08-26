@@ -352,7 +352,7 @@ def _a4_fixed8192_tuned_patch(bucket: int) -> ConfigPatch | None:
     return _patch(stage1=stage1)
 
 
-def _a4_fixed8192_sync_patch(bucket: int, grid_mult: int) -> ConfigPatch:
+def _a4_fixed8192_sync_patch(grid_mult: int) -> ConfigPatch:
     return _patch(
         stage1={
             "sort_block_m": BLOCK_M_SMALL,
@@ -860,7 +860,7 @@ def _select_tuning_patches(
             grid_mult = (
                 2 if context.bucket == TokenBucket.BS16 else GRID_MULT_SINGLE_EPOCH
             )
-            patches.append(_a4_fixed8192_sync_patch(context.bucket, grid_mult))
+            patches.append(_a4_fixed8192_sync_patch(grid_mult))
 
         if patch := _a4_fixed8192_tuned_patch(context.bucket):
             patches.append(patch)
