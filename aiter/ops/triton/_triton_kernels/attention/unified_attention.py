@@ -125,6 +125,7 @@ def kernel_unified_attention_2d(
     FP8_MAX: tl.constexpr = float8_info.max,
     ALL_DECODE: tl.constexpr = False,  # bool
     SHUFFLED_KV_CACHE: tl.constexpr = False,  # bool
+    USE_PREFILL_FAST_PATH: tl.constexpr = False,  # bool
     K_WIDTH: tl.constexpr = 0,  # int
 ):
     kv_head_idx = tl.program_id(0)
@@ -281,96 +282,49 @@ def kernel_unified_attention_2d(
         v_descale = None
     KV_cache_modifier: tl.constexpr = ".cg" if ALL_DECODE else ""
 
-    # Smallest causal boundary among all rows in this Q-block (the row with
-    # the smallest query_pos is the most restrictive). Tiles that end at or
-    # before this boundary are causally visible in full for every row (and,
-    # by construction, also within max_seq_prefix_len), so they need none of
-    # the per-element causal/bounds masking that the general path below
-    # applies. Kept as a separate, uniform loop (rather than a branch inside
-    # one loop) so the compiler can still pipeline it -- a branchy version of
-    # this was tried and measured slower despite doing less total work.
-    #
-    # Only worthwhile when there are enough tiles per Q-block to amortize the
-    # fixed cost of a second loop -- that's true for prefill (long context
-    # spread over few, large Q-blocks) but not decode (ALL_DECODE has a
-    # single query per program, so this added a regression at short/medium
-    # context there); scoped to the prefill case only.
-    if SLIDING_WINDOW <= 0 and not ALL_DECODE:
-        full_tile_boundary = context_len + q_block_local_idx * BLOCK_Q + 1
-        fast_tile_end = tl.minimum(full_tile_boundary // TILE_SIZE, tile_end)
-        fast_tile_end = tl.maximum(fast_tile_end, tile_start)
+    # Tiles before the earliest query's causal limit need only head padding masks.
+    # A separate loop keeps their loads free of per-element bounds checks.
+    if USE_PREFILL_FAST_PATH and SLIDING_WINDOW <= 0 and not ALL_DECODE:
+        min_query_key_limit = context_len + q_block_local_idx * BLOCK_Q + 1
+        unmasked_tile_end = tl.minimum(min_query_key_limit // TILE_SIZE, tile_end)
+        unmasked_tile_end = tl.maximum(unmasked_tile_end, tile_start)
     else:
-        fast_tile_end = tile_start
+        unmasked_tile_end = tile_start
 
-    for j in range(tile_start, fast_tile_end):
+    for j in range(tile_start, unmasked_tile_end):
         seq_offset = j * TILE_SIZE + offs_t
 
-        if SHUFFLED_KV_CACHE:
-            physical_block_idx_shfl = tl.load(
-                block_tables_ptr + block_table_offset + j
-            ).to(tl.int64)
-            k_offset = (
-                physical_block_idx_shfl * stride_k_cache_0
-                + kv_head_idx * stride_k_cache_1
-                + offs_shfl
-            )
-            v_offset = (
-                physical_block_idx_shfl * stride_v_cache_0
-                + kv_head_idx * stride_v_cache_1
-                + offs_shfl
-            )
-            fast_k_mask = None
-            fast_v_mask = None
-        else:
-            physical_block_idx = tl.load(
-                block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
-            ).to(tl.int64)
-            v_offset = (
-                physical_block_idx[:, None] * stride_v_cache_0
-                + kv_head_idx * stride_v_cache_2
-                + offs_d[None, :] * stride_v_cache_3
-                + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
-            )
-            k_offset = (
-                physical_block_idx[None, :] * stride_k_cache_0
-                + kv_head_idx * stride_k_cache_2
-                + offs_d[:, None] * stride_k_cache_3
-                + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
-            )
-            # Still need the (cheap, sequence-independent) head-dim padding
-            # mask for non-power-of-2 head sizes -- just not the tile_mask
-            # factor, since this tile is already proven in-bounds.
-            fast_k_mask = dim_mask[:, None]
-            fast_v_mask = dim_mask[None, :]
+        physical_block_idx = tl.load(
+            block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
+        ).to(tl.int64)
+        v_offset = (
+            physical_block_idx[:, None] * stride_v_cache_0
+            + kv_head_idx * stride_v_cache_2
+            + offs_d[None, :] * stride_v_cache_3
+            + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
+        )
+        k_offset = (
+            physical_block_idx[None, :] * stride_k_cache_0
+            + kv_head_idx * stride_k_cache_2
+            + offs_d[:, None] * stride_k_cache_3
+            + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
+        )
 
         K_load = tl.load(
             key_cache_ptr + k_offset,
-            mask=fast_k_mask,
+            mask=dim_mask[:, None],
             other=0.0,
             cache_modifier=KV_cache_modifier,
         )
         K = K_load.to(Q.dtype)
-        if SHUFFLED_KV_CACHE:
-            K = (
-                K.reshape(HEAD_SIZE_PADDED // K_WIDTH, TILE_SIZE, K_WIDTH)
-                .permute(1, 0, 2)
-                .reshape(TILE_SIZE, HEAD_SIZE_PADDED)
-                .trans(1, 0)
-            )
 
         V_load = tl.load(
             value_cache_ptr + v_offset,
-            mask=fast_v_mask,
+            mask=dim_mask[None, :],
             other=0.0,
             cache_modifier=KV_cache_modifier,
         )
         V = V_load.to(Q.dtype)
-        if SHUFFLED_KV_CACHE:
-            V = (
-                V.reshape(TILE_SIZE // K_WIDTH, HEAD_SIZE_PADDED, K_WIDTH)
-                .permute(0, 2, 1)
-                .reshape(TILE_SIZE, HEAD_SIZE_PADDED)
-            )
 
         S = qk_scale * tl.dot(Q, K)
 
@@ -401,10 +355,7 @@ def kernel_unified_attention_2d(
         M = m_j
         acc = tl.dot(P.to(V.dtype), V, acc=acc)
 
-    # Boundary tiles: the tile(s) straddling the causal edge (or, when
-    # sliding window is active, the full range) still need the general,
-    # fully-masked path below.
-    for j in range(fast_tile_end, tile_end):
+    for j in range(unmasked_tile_end, tile_end):
         seq_offset = j * TILE_SIZE + offs_t
         # to reduce the masking effect when not needed
         if TILE_SIZE == BLOCK_SIZE:
