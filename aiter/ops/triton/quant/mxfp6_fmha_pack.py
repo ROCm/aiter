@@ -162,9 +162,11 @@ def quantize_fp6_v_clean_triton(
         v_fp8.stride(1),
         v_fp8.stride(2),
         v_fp8.stride(3),
+        sk,
         h_kv,
         nT,
         n_blocks,
+        CLAMP_TAIL=False,
         FIXED_E8M0=fixed_e8m0,
         SEPARATE_OUTPUT=False,
         BLOCK_N=BLOCK_N,
@@ -178,8 +180,8 @@ def quantize_fp6_v_data_scale_triton(
     """Pack F8F6 V directly into its separate data and scale ABI buffers."""
     assert _HAVE_TRITON, "triton/torch unavailable"
     b, sk, h_kv, d = v_fp8.shape
-    assert d == 128 and tile == 128 and sk % tile == 0, (d, sk, tile)
-    nT = sk // tile
+    assert d == 128 and tile == 128, (d, sk, tile)
+    nT = (sk + tile - 1) // tile
     n_blocks = b * h_kv * nT * 128 * 4
     data = torch.empty(
         b * h_kv * nT * 12288 + 256, dtype=torch.uint8, device=v_fp8.device
@@ -197,9 +199,11 @@ def quantize_fp6_v_data_scale_triton(
         v_fp8.stride(1),
         v_fp8.stride(2),
         v_fp8.stride(3),
+        sk,
         h_kv,
         nT,
         n_blocks,
+        CLAMP_TAIL=sk % tile != 0,
         FIXED_E8M0=fixed_e8m0,
         SEPARATE_OUTPUT=True,
         BLOCK_N=BLOCK_N,
@@ -284,9 +288,11 @@ if _HAVE_TRITON:
         stride_vs,
         stride_vh,
         stride_vd,
+        sk,
         h_kv,
         nT,
         n_blocks,  # total 32-kv MX blocks
+        CLAMP_TAIL: tl.constexpr,
         FIXED_E8M0: tl.constexpr,
         SEPARATE_OUTPUT: tl.constexpr,
         BLOCK_N: tl.constexpr,
@@ -310,6 +316,8 @@ if _HAVE_TRITON:
         f = tl.arange(0, 32)
         kt = tl.load(kvtab_ptr + L[:, None] * 32 + f[None, :])  # [BN,32]
         kv = (t * 128 + k * 64)[:, None] + kt  # [BN,32] kv-in-tile
+        if CLAMP_TAIL:
+            kv = tl.minimum(kv, sk - 1)
         voff = (
             bb[:, None] * stride_vb
             + kv * stride_vs
@@ -867,10 +875,6 @@ def pack_fp6_v_data_scale_views(
     assert _HAVE_TRITON, "triton/torch unavailable"
     b, sk, h_kv, d = v.shape
     n_tiles = (sk + tile - 1) // tile
-    sk_pad = n_tiles * tile
-    if sk_pad != sk:
-        tail = v[:, sk - 1 : sk].expand(b, sk_pad - sk, h_kv, d)
-        v = torch.cat([v, tail], dim=1)
 
     data_flat, scale_flat = quantize_fp6_v_data_scale_triton(
         v, tile=tile, fixed_e8m0=fixed_e8m0
