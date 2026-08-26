@@ -1737,7 +1737,7 @@ def flydsl_qk_norm_rope_quant(
     return q_out, kv_out, (q_scale if quant else None), (kv_scale if quant else None)
 
 
-ROWS_PER_TILE = 32  # = waves per WG (1024-thread WG)
+ROWS_PER_TILE = 8  # = waves per WG (256-thread WG)
 NUM_BUFFERS = 6  # K: rotating LDS buffers (1 WG at K=6: 6*32KB=192KB LDS)
 TILES_PER_WG = 40  # CT: tiles streamed per WG (unrolled; CT % (H/RT) == 0)
 
@@ -1745,15 +1745,19 @@ TILES_PER_WG = 40  # CT: tiles streamed per WG (unrolled; CT % (H/RT) == 0)
 def _tdm_tiles_per_wg(num_rows):
     """Pick (CT, K) for a row count — trades prefetch depth vs occupancy.
 
-    CT is bounded by keeping enough workgroups to cover the 256 CUs: at
-    num_rows=65536 (T=512, H=128) CT=8 gives gx_q=256, exactly one WG per CU,
-    so LDS is not the limiter there and K is free to pick on latency alone.
-    K=4 measures ~2.4% faster than K=5 at that point (15.31 vs 15.69 us);
-    the shallower rotation is not LDS- or occupancy-driven, so re-measure
-    rather than extrapolate this choice to other shapes.
+    CT is bounded by keeping gx_q = num_rows / (ROWS_PER_TILE * CT) at or above
+    the 256 CUs. That bound bites hardest at the low end of the TDM range: at
+    num_rows=32768 (T=256, H=128) the old ROWS_PER_TILE=32 with CT=8 gave only
+    128 workgroups, leaving half the CUs idle. RT=8 with CT=16 gives 256 there
+    and 512 at num_rows=65536.
+
+    K is then free to pick on latency alone, since LDS is not the limiter at
+    these workgroup counts. K=4 measured ~2.4% faster than K=5 at num_rows=65536
+    back when RT was 32; the shallower rotation is not LDS- or occupancy-driven,
+    so re-measure rather than extrapolate to other shapes.
     """
     if num_rows <= 65536:
-        return 8, 4
+        return 16, 4
     if num_rows <= 131072:
         return 16, NUM_BUFFERS
     return TILES_PER_WG, NUM_BUFFERS
@@ -1962,10 +1966,6 @@ def _build_kernel_w32_tdm(
                     row_of(tile_idx) * (D * 2),
                 )
 
-            def fence():
-                tdm_ops.tensor_wait(K - 1)
-                rocdl.s_wait_dscnt(0)
-
             def tok_of(tile_idx):
                 my_row = row_of(tile_idx)
                 if const_expr(log2H is not None):
@@ -1988,7 +1988,17 @@ def _build_kernel_w32_tdm(
                     fx.Int32(pending_pos[0].trunci(i32))
                 )
             for i in range_constexpr(CT):
-                fence()
+                # Tile i consumes TDM load #i (issued in tile order: K in the
+                # prologue, then one per iteration while i + K < CT). In steady
+                # state K + i are issued, so leaving K-1 outstanding retires
+                # exactly #0..#i. Once the issues stop the issued count freezes
+                # at CT and K-1 is too loose: #i is only guaranteed retired with
+                # at most CT-1-i left, reaching 0 on the last tile. Using K-1
+                # throughout lets a drain tile read an LDS buffer whose load has
+                # not landed; it stays latent only while the per-tile compute
+                # happens to outlast the load.
+                tdm_ops.tensor_wait(min(K - 1, CT - 1 - i))
+                rocdl.s_wait_dscnt(0)
                 if const_expr(do_hoist):
                     cosv, sinv = cs_cache[0], cs_cache[1]
                 else:
