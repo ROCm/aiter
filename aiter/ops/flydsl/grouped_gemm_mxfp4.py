@@ -15,6 +15,24 @@ from .kernels.tensor_shim import ptr_arg
 _SUPPORTED_CLUSTER_N = (4, 3, 2)
 
 
+def _persistent_num_buffers(k_tiles: int, requested: int) -> int:
+    """Round ``requested`` to the divisor of ``k_tiles`` nearest it.
+
+    The persistent depth-(num_buffers-1) cross-tile pipeline re-issues the next
+    tile's prologue loads into fixed ring slots during the tail; that slot
+    alignment is exact only when ``num_buffers`` divides ``k_tiles``.  Ties
+    prefer the larger divisor (a deeper pipeline).  Returns 1 for ``k_tiles``
+    below 2 so the caller can fall back off the persistent path.
+    """
+    if k_tiles < 2:
+        return 1
+    requested = max(2, min(requested, k_tiles))
+    if k_tiles % requested == 0:
+        return requested
+    divisors = [d for d in range(2, k_tiles + 1) if k_tiles % d == 0]
+    return min(divisors, key=lambda d: (abs(d - requested), -d))
+
+
 def _select_next_stage_prefetch(csv_next_stage_prefetch: int) -> int:
     """Selects the environment override or the CSV setting."""
     value = os.environ.get("AITER_TDM_NEXT_STAGE_PREFETCH")
@@ -113,6 +131,13 @@ def flydsl_grouped_gemm_a8w4_masked(
     # quant output (stage1_quant_out) now does, so it stays persistent-capable.
     if persistent_mode and (stage2_scatter is not None):
         persistent_mode = 0
+    if persistent_mode:
+        # The persistent cross-tile pipeline needs num_buffers | K_TILES for its
+        # ring-slot alignment; round to the nearest divisor (fall off the
+        # persistent path only for the degenerate K_TILES < 2).
+        num_buffers = _persistent_num_buffers(max(1, K // tile_k), num_buffers)
+        if num_buffers < 2:
+            persistent_mode = 0
     if persistent_mode and num_buffers >= 3:
         next_stage_prefetch = 1
     has_bias = 1 if bias is not None else 0

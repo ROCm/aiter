@@ -956,117 +956,128 @@ def launch_gemm_a8w4_tdm(
                 d_sb = (new_sb - orig_sb_off0) * 4
                 return [d_a, d_b, d_sa, d_sb]
 
-            # How many prologue TDMs the overlap window pre-issues for the
-            # next tile.  Capped by K_TILES so tiny-K doesn't over-issue.
-            PRE_ISSUE_COUNT = min(num_buffers - 1, K // tile_k)
+            # Pipeline depth D = num_buffers - 1 (the cross-tile scheme).
+            # One physical slot is always the "compute" slot; D loads stay in
+            # flight.  The last D iterations of a tile issue the NEXT tile's D
+            # prologue loads, overlapping them with this tile's tail WMMA so the
+            # TDM engine never idles at the tile boundary.
+            #
+            # Correctness needs K_TILES % num_buffers == 0 (the launcher rounds
+            # num_buffers to a divisor of K_TILES in persistent mode): then the
+            # tail computes slots 1..D and re-issues into slots 0..D-1 exactly
+            # one iteration after each slot is consumed.
+            D = num_buffers - 1
+            # A preissued mainloop skips this many prologue loads -- the previous
+            # tile's tail already issued all D of them.
+            PRE_ISSUE_COUNT = D
+            # The tail can only pre-issue the next tile when the epilogue C-store
+            # lives in a disjoint LDS region (else it would clobber the next
+            # tile's freshly loaded buffers).
+            _do_tail_preissue = C_PERSIST_OFF > 0
 
             def _make_mainloop_body(pre_issued):
-                """Build a mainloop with ``pre_issued`` buffers already in
-                flight from a prior overlap window.
+                """Build a depth-D mainloop.
 
-                Returns a callable ``mainloop(td)`` whose prologue skips
-                the first ``pre_issued`` TDM issues and whose initial
-                fence accounts for all ``num_buffers`` TDMs being in flight.
-                Each distinct ``pre_issued`` value (0 for the first tile,
-                PRE_ISSUE_COUNT for loop tiles) traces into its own
-                specialised code.
+                ``pre_issued`` prologue loads are assumed already in flight
+                (D for a loop tile fed by the previous tile's tail, 0 for the
+                first tile).  ``mainloop(td, next_td)`` runs this tile with
+                deltas ``td`` and, in its tail, pre-issues the next tile's
+                prologue loads with deltas ``next_td`` (masked to tile 0 when
+                there is no valid next tile).
                 """
 
-                def mainloop(td):
-                    # Issue only the buffers NOT already pre-issued.
-                    for i in range_constexpr(num_buffers):
+                def mainloop(td, next_td):
+                    # Prologue: issue the D loads not already pre-issued.
+                    for i in range_constexpr(D):
                         if const_expr(i >= pre_issued):
                             issue(i, i, tile_deltas=td)
-                    n_steady = K_TILES - num_buffers
-                    if const_expr(next_stage_on):
-                        # All num_buffers TDMs are now in flight (some
-                        # pre-issued, the rest just issued).  Fence to
-                        # let the oldest one (buffer 0) land.
-                        pipeline_fence_signal(
-                            outstanding=TDM_PER * (num_buffers - 1)
-                        )
-                        pipeline_fence_wait()
-                        load_state(rmem_slots[0], ptr_to_idx(buf_ptr(0)), 0)
+                    n_steady = K_TILES - D
 
                     def _steady(my_jobs):
                         for kt in range(n_steady):
-                            s = kt % num_buffers
-                            buf = ptr_to_idx(buf_ptr(s))
-                            if const_expr(not next_stage_on):
-                                pipeline_fence_signal(
-                                    outstanding=TDM_PER * (num_buffers - 1)
-                                )
-                                pipeline_fence_wait()
-                            next_stage_buf = (
-                                ptr_to_idx(buf_ptr((kt + 1) % num_buffers))
-                                if const_expr(next_stage_on)
-                                else None
-                            )
-                            compute_ktile(
-                                buf,
-                                None,
-                                next_stage_on,
-                                next_stage_buf,
-                                next_stage_wait=(
-                                    TDM_PER * (num_buffers - 2)
-                                    if const_expr(next_stage_on)
-                                    else None
-                                ),
-                            )
+                            buf = ptr_to_idx(buf_ptr(kt % num_buffers))
+                            # D loads in flight; drop the oldest (k-tile kt).
+                            pipeline_fence_signal(outstanding=TDM_PER * (D - 1))
+                            pipeline_fence_wait()
+                            compute_ktile(buf, None, False, None)
                             rocdl.s_barrier_signal(WGP_BARRIER_ID)
                             rocdl.s_barrier_wait(WGP_BARRIER_ID)
-                            issue(s, kt + num_buffers, my_jobs, tile_deltas=td)
+                            # Refill: issue k-tile kt+D into the freed slot.
+                            issue(
+                                (kt + D) % num_buffers,
+                                kt + D,
+                                my_jobs,
+                                tile_deltas=td,
+                            )
 
                     dispatch_wave_job(_steady)
-                    for j_drain in range_constexpr(num_buffers):
-                        kt = n_steady + j_drain
+
+                    # Tail: compute the last D k-tiles.  With tail pre-issue on,
+                    # each iteration issues one of the NEXT tile's prologue loads
+                    # into slot j, keeping D loads in flight (uniform fence).
+                    # With it off, no refill happens, so the fence target decays.
+                    for j in range_constexpr(D):
+                        kt = n_steady + j
                         buf = ptr_to_idx(buf_ptr(kt % num_buffers))
-                        has_next = next_stage_on and j_drain + 1 < num_buffers
-                        pipeline_fence_signal(
-                            outstanding=TDM_PER
-                            * max(
-                                0,
-                                num_buffers
-                                - 1
-                                - j_drain
-                                - (1 if has_next else 0),
-                            )
-                        )
+                        _tail_out = (D - 1) if _do_tail_preissue else (D - 1 - j)
+                        pipeline_fence_signal(outstanding=TDM_PER * _tail_out)
                         pipeline_fence_wait()
-                        next_stage_buf = (
-                            ptr_to_idx(buf_ptr((kt + 1) % num_buffers))
-                            if const_expr(has_next)
-                            else None
-                        )
-                        compute_ktile(buf, None, next_stage_on, next_stage_buf)
+                        compute_ktile(buf, None, False, None)
+                        if const_expr(_do_tail_preissue):
+                            rocdl.s_barrier_signal(WGP_BARRIER_ID)
+                            rocdl.s_barrier_wait(WGP_BARRIER_ID)
+                            issue(j, j, tile_deltas=next_td)
 
                 return mainloop
 
-            # Two specialisations: full prologue (first tile) and
-            # pre-issued prologue (loop tiles after overlap).
+            # Two specialisations: full prologue (first tile) and pre-issued
+            # prologue (loop tiles fed by the previous tile's tail).
             run_persist_mainloop_full = _make_mainloop_body(0)
             run_persist_mainloop_preissued = _make_mainloop_body(PRE_ISSUE_COUNT)
 
             def run_persist_tile(
                 t_blk_m, t_blk_n, t_blk_m64, t_blk_n64,
                 t_expert, t_mn_oob, td, skip_final_wait,
-                use_preissued=False,
+                use_preissued=False, t_flat=None,
             ):
                 """Mainloop + epilogue for one tile in persistent mode.
 
                 ``use_preissued``: constexpr bool.  When True, the prologue
-                skips the first PRE_ISSUE_COUNT TDMs that the overlap
-                window already issued.
+                skips the first PRE_ISSUE_COUNT TDMs the previous tile's tail
+                already issued.  ``t_flat`` is this tile's flat index, used to
+                locate the next tile whose prologue the tail pre-issues.
                 """
                 if t_expert < n_experts:
+                    # Masked deltas for the next tile the tail will pre-issue.
+                    # When the next flat index is out of range or lands on a
+                    # padding expert, the deltas are forced to zero so the
+                    # (unconditional, for static tensorcnt) TDM loads read the
+                    # first tile's base offsets -- always in bounds and later
+                    # drained without ever being consumed.
+                    if const_expr(_do_tail_preissue):
+                        _nx = t_flat + grid_nb
+                        (
+                            _nx_blk_m, _nx_blk_n, _nx_blk_m64, _nx_blk_n64,
+                            _nx_expert, _nx_eb64, _nx_mn_oob,
+                            _nx_a_off0, _nx_b_off0, _nx_sb_off0, _nx_sa_off0,
+                        ) = compute_tile_coords(_nx)
+                        _nx_ok = (_nx < total_tiles_rt) & (_nx_expert < n_experts)
+                        next_td = [
+                            _nx_ok.select(d, fx.Int64(0))
+                            for d in compute_deltas(
+                                _nx_a_off0, _nx_b_off0, _nx_sb_off0, _nx_sa_off0
+                            )
+                        ]
+                    else:
+                        next_td = zero_deltas
                     for cf in c_frags:
                         cf.store(
                             fx.constant_vector(0.0, T.vec(WMMA_VECTOR_DWORDS, T.f32))
                         )
                     if const_expr(use_preissued):
-                        run_persist_mainloop_preissued(td)
+                        run_persist_mainloop_preissued(td, next_td)
                     else:
-                        run_persist_mainloop_full(td)
+                        run_persist_mainloop_full(td, next_td)
 
                     accs = []
                     output_fragments_per_acc = WMMA_N // 16
@@ -1079,7 +1090,9 @@ def launch_gemm_a8w4_tdm(
                                     fx.Float32,
                                 ).ir_value()
                             )
-                    pipeline_fence(outstanding=0)
+                    # Keep the D next-tile prologue loads the tail issued in
+                    # flight through the epilogue (they belong to the next tile).
+                    pipeline_fence(outstanding=TDM_PER * PRE_ISSUE_COUNT)
 
                     is_fp4_quant = bool(stage1_quant_out and a_is_fp4)
                     STORE_N = (
@@ -1368,12 +1381,12 @@ def launch_gemm_a8w4_tdm(
                 run_persist_tile(
                     blk_m, blk_n, blk_m64, blk_n64,
                     expert, mn_oob, zero_deltas, True,
-                    use_preissued=False,
+                    use_preissued=False, t_flat=_bid_i32,
                 )
-            # Grid-stride loop for remaining tiles.
-            # Between tiles, overlap: issue PRE_ISSUE_COUNT prologue TDMs
-            # for the next tile while the previous epilogue store is still
-            # in flight, then fence; the next mainloop skips those buffers.
+            # Grid-stride loop for remaining tiles.  Each tile's tail already
+            # pre-issued this tile's D prologue loads (when the C-store LDS is
+            # split), overlapping them with the previous tile's tail WMMA -- so
+            # here we only re-synchronise the workgroup before the mainloop.
             for tile_flat_iv in range(bid_x + grid_nb, total_tiles_rt, grid_nb):
                 tile_flat = fx.Int32(tile_flat_iv)
                 (
@@ -1382,26 +1395,13 @@ def launch_gemm_a8w4_tdm(
                     new_a_off0, new_b_off0, new_sb_off0, new_sa_off0,
                 ) = compute_tile_coords(tile_flat)
                 td = compute_deltas(new_a_off0, new_b_off0, new_sb_off0, new_sa_off0)
-
-                if const_expr(C_PERSIST_OFF > 0):
-                    if new_expert < n_experts:
-                        for i in range_constexpr(PRE_ISSUE_COUNT):
-                            issue(i, i, tile_deltas=td)
-                        # Drain the previous epilogue store but keep
-                        # the PRE_ISSUE_COUNT pre-issued TDMs in flight.
-                        tdm_ops.tensor_wait(TDM_PER * PRE_ISSUE_COUNT)
-                    else:
-                        tdm_ops.tensor_wait(0)
-                if const_expr(not (C_PERSIST_OFF > 0)):
-                    tdm_ops.tensor_wait(0)
                 workgroup_barrier()
-
                 run_persist_tile(
                     new_blk_m, new_blk_n, new_blk_m64, new_blk_n64,
                     new_expert, new_mn_oob, td, True,
-                    use_preissued=(C_PERSIST_OFF > 0),
+                    use_preissued=(C_PERSIST_OFF > 0), t_flat=tile_flat,
                 )
-            # Final wait for last tile's store
+            # Final wait for the last tile's store and its (masked) tail loads.
             tdm_ops.tensor_wait(0)
 
         # ---- Non-persistent path (original) ----
