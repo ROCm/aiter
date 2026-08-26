@@ -18,7 +18,11 @@ Run from the aiter repo root so `op_tests/` siblings import cleanly:
     python op_tests/bench_gfx1250_combo.py            # all ops, curated defaults
     python op_tests/bench_gfx1250_combo.py --ops mha  # just one op
     python op_tests/bench_gfx1250_combo.py --ops moe  # just FlyDSL MoE
-    python op_tests/bench_gfx1250_combo.py --ops gemm  # just gemm_a4w4 (16384^3)
+    python op_tests/bench_gfx1250_combo.py --ops gemm  # just F4GEMM perf
+    python op_tests/bench_gfx1250_combo.py --ops f8gemm  # just F8GEMM perf
+    python op_tests/bench_gfx1250_combo.py --ops gemm --gemm-mode func  # F4GEMM UT
+    python op_tests/bench_gfx1250_combo.py --ops f8gemm --gemm-mode func  # F8GEMM UT
+    python op_tests/bench_gfx1250_combo.py --ops gemm f8gemm --gemm-mode func  # all GEMM UTs
     python op_tests/bench_gfx1250_combo.py --ops mla_v4  # asm vs Triton MLA v4 compare
 
 gfx1250's bundled CK does not compile, so the asm JIT modules must be built with
@@ -86,6 +90,7 @@ with _silence():
     import test_flydsl_grouped_gemm_gfx1250 as moe_mod
     import test_fmha_fwd_with_sink_asm as mha_mod  # has __main__ guard
     import test_mla_v4_kargpreld as mla_v4_kargpreld_mod
+    import test_mxfp8fp4gemm as f8gemm_mod
     import torch
     from triton_tests.attention import test_mla_v4_triton as mla_v4_triton_mod
 
@@ -234,11 +239,14 @@ _GEMM_KEEP = [
     "outtype",
     "data_init",
     "scale_init",
+    "knl_name",
     "asm us",
     "asm TFLOPS",
     "asm TB/s",
+    "asm err",
+    "asm result",
 ]
-# gemm_a4w4 throughput square only (no FUNC_SHAPES / other M,N,K sweeps).
+# gemm_a4w4 throughput square. Functional shapes come from test_f4gemm.py.
 _GEMM_A4W4_SHAPE = (16384, 16384, 16384)
 
 # Curated (gqa_ratio, batch, kv_seq_lens, num_kv_splits) grid for MLA v4 nm
@@ -390,19 +398,76 @@ def run_moe(args):
 
 
 def run_gemm(args):
-    # op_tests/test_f4gemm.py perf-mode intype/outtype/init sweep at one shape only.
-    M, N, K = _GEMM_A4W4_SHAPE
+    # Mirror test_f4gemm.py's mode-aware execution: functional mode exercises
+    # its correctness shape set and both A layouts; perf/profile keep the single
+    # throughput square and preshuffled A path.
+    is_func = args.gemm_mode == "func"
+    shapes = gemm_mod.FUNC_SHAPES if is_func else [_GEMM_A4W4_SHAPE]
+    init_pairs = (
+        [("uniform", "auto")]
+        if is_func
+        else [("constant", "constant"), ("uniform", "auto")]
+    )
+    apre_list = [1, 0] if is_func else [1]
     rows = []
-    init_pairs = [("constant", "constant"), ("uniform", "auto")]
     with _silence():
-        for (di, si), intype, apre, outtype in itertools.product(
+        for (di, si), intype, apre, outtype, (M, N, K) in itertools.product(
             init_pairs,
             ["mxfp4", "nvfp4"],
-            [1],
+            apre_list,
             ["bf16", "fp8"],
+            shapes,
         ):
-            rows.append(gemm_mod.test_gemm(intype, M, N, K, apre, outtype, di, si))
-    _print_table("gemm_a4w4", rows, keep=_GEMM_KEEP)
+            rows.append(
+                gemm_mod.test_gemm(
+                    intype,
+                    M,
+                    N,
+                    K,
+                    apre,
+                    outtype,
+                    di,
+                    si,
+                    mode=args.gemm_mode,
+                )
+            )
+    _print_table(f"gemm_a4w4 ({args.gemm_mode})", rows, keep=_GEMM_KEEP)
+
+
+def run_f8gemm(args):
+    # Mirror PR #4748's F8GEMM UT execution. Functional mode sweeps both input
+    # formats and both A layouts over the reference functional shape set.
+    is_func = args.gemm_mode == "func"
+    init_pairs = (
+        [("uniform", "auto")]
+        if is_func
+        else [("constant", "constant"), ("uniform", "auto")]
+    )
+    apre_list = [1, 0] if is_func else [1]
+    rows = []
+    with _silence():
+        for (di, si), intype, apre in itertools.product(
+            init_pairs, ["a8w8", "a8w4"], apre_list
+        ):
+            shapes = (
+                f8gemm_mod.FUNC_SHAPES
+                if is_func
+                else f8gemm_mod.PERF_SHAPES[intype]
+            )
+            for M, N, K in shapes:
+                rows.append(
+                    f8gemm_mod.test_gemm(
+                        intype,
+                        M,
+                        N,
+                        K,
+                        apre,
+                        data_init=di,
+                        scale_init=si,
+                        mode=args.gemm_mode,
+                    )
+                )
+    _print_table(f"mxfp8fp4gemm ({args.gemm_mode})", rows, keep=_GEMM_KEEP)
 
 
 def _perf_ratio(num, den):
@@ -556,6 +621,7 @@ OPS = {
     "mha": run_mha,
     "moe": run_moe,
     "gemm": run_gemm,
+    "f8gemm": run_f8gemm,
     "mla_v4": run_mla_v4,
 }
 
@@ -585,6 +651,12 @@ def main():
         nargs="*",
         default=["randn", "const0.25"],
         choices=["randn", "const0.25"],
+    )
+    p.add_argument(
+        "--gemm-mode",
+        choices=["func", "perf", "profile"],
+        default="perf",
+        help="F4/F8 GEMM execution mode: func=UT, perf=benchmark, profile=trace",
     )
     # flydsl moe — fixed kernel-bench config (see _MOE_CONFIG)
     # mla_v4 (v4 nm kernarg-preload decode) axes
