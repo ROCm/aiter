@@ -431,6 +431,7 @@ def launch_gemm_a8w4_tdm(
             inner_seg = inner // len(wv) if split_i else inner
             wave_outer_off = 0 if split_i or len(wv) == 1 else (wave - wv[0]) * seg
             wave_inner_off = (wave - wv[0]) * inner_seg if split_i else 0
+            print(split_i, wave_outer_off, wave_inner_off, seg, inner_seg, wv, outer, inner)
             gt = global_view(
                 g_base,
                 g_off + fx.Int64(wave_outer_off) * g_stride + fx.Int64(wave_inner_off),
@@ -781,10 +782,10 @@ def launch_gemm_a8w4_tdm(
             sa_v = [load_sa(buf, sm, ksl) for sm in range_constexpr(sa_pairs)]
             slot.sb.store(Vec.from_elements(sb_v + sb_v[: SB_WIDTH - sb_pairs]))
             slot.sa.store(Vec.from_elements(sa_v + sa_v[: SA_WIDTH - sa_pairs]))
-            for wn in range_constexpr(wmma_n_rep):
-                slot.b[wn].store(load_b(buf, wn, ksl))
             for wm in range_constexpr(wmma_m_rep):
                 slot.a[wm].store(load_a(buf, wm, ksl))
+            for wn in range_constexpr(wmma_n_rep):
+                slot.b[wn].store(load_b(buf, wn, ksl))
 
         def k_step(
             cur_rmem,
@@ -845,6 +846,7 @@ def launch_gemm_a8w4_tdm(
                 return counts
 
             def emit_hints(ksl, tail_mfma=0):
+                return
                 has_next = ksl + 1 < KWS or (
                     ksl + 1 == KWS and next_stage_buf is not None
                 )
