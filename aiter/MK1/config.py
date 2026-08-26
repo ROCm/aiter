@@ -13,7 +13,7 @@ from .errors import UnsupportedConfigurationError
 SUPPORTED_GPU_ARCHITECTURES = frozenset({"gfx950"})
 SUPPORTED_MODEL_FAMILY = "gpt-oss-120b"
 SUPPORTED_MODEL_REVISION = "b5c939de"
-SUPPORTED_BACKEND = "gpt_oss_gfx950_atom_v1"
+SUPPORTED_BACKEND = "gpt_oss_gfx950_v1"
 SUPPORTED_CACHE_SCALARS = frozenset({"bfloat16", "float16"})
 
 

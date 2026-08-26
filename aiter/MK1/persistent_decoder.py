@@ -22,12 +22,9 @@ from .checkpoint import (
 from .config import MK1Config, is_supported
 from .errors import BackendLaunchError, CheckpointError, PrelaunchError
 
-ATOM_PHYSICAL_PAGE_SIZE = 16
-
-
 @dataclass(frozen=True, slots=True)
-class AtomCacheBinding:
-    """Zero-copy references and geometry for ATOM's shuffled K/V planes."""
+class KVCacheBinding:
+    """Zero-copy references and geometry for separate shuffled K/V planes."""
 
     key_planes: tuple[torch.Tensor, ...]
     value_planes: tuple[torch.Tensor, ...]
@@ -60,45 +57,6 @@ class QuantumResult:
     committed_kv_length: int
     pending_token: int
     completed_epochs: int
-
-
-def write_atom_shuffled_cache(
-    key: torch.Tensor,
-    value: torch.Tensor,
-    key_cache: torch.Tensor,
-    value_cache: torch.Tensor,
-    slot_mapping: torch.Tensor,
-) -> None:
-    """Write K/V into ATOM's native 16-token SHUFFLE cache layout."""
-
-    if key_cache.element_size() != 2 or value_cache.element_size() != 2:
-        raise ValueError("ATOM SHUFFLE cache writer requires a two-byte scalar")
-    if key_cache.dtype != value_cache.dtype:
-        raise ValueError("K and V cache dtypes must match")
-    if key.ndim != 3 or value.ndim != 3:
-        raise ValueError("key and value must have [token, head, dim] shape")
-    if key.shape != value.shape:
-        raise ValueError("key and value shapes must match")
-    if slot_mapping.numel() != key.shape[0]:
-        raise ValueError("slot mapping length must match the token count")
-
-    pack = 16 // key_cache.element_size()
-    if key.shape[2] % pack:
-        raise ValueError("head dimension must be divisible by the cache pack width")
-
-    slots = slot_mapping.to(device=key.device, dtype=torch.int64)
-    blocks = torch.div(slots, ATOM_PHYSICAL_PAGE_SIZE, rounding_mode="floor")
-    tokens = torch.remainder(slots, ATOM_PHYSICAL_PAGE_SIZE)
-    key_rows = key.to(key_cache.dtype).reshape(
-        key.shape[0], key.shape[1], key.shape[2] // pack, pack
-    )
-    key_cache[blocks, :, :, tokens, :] = key_rows
-    token_groups = torch.div(tokens, pack, rounding_mode="floor")
-    token_lanes = torch.remainder(tokens, pack)
-    value_cache[blocks, :, token_groups, :, token_lanes] = value.to(value_cache.dtype)
-
-
-write_atom_fp16_cache = write_atom_shuffled_cache
 
 
 class PersistentDecoder:
@@ -187,7 +145,7 @@ class PersistentDecoder:
         if self._closed:
             raise PrelaunchError("persistent decoder is closed")
 
-    def bind_atom_cache(self, binding: AtomCacheBinding) -> None:
+    def bind_cache(self, binding: KVCacheBinding) -> None:
         self._require_open()
         lengths = {
             len(binding.key_planes),
@@ -197,7 +155,7 @@ class PersistentDecoder:
             len(binding.pools),
         }
         if len(lengths) != 1 or not binding.key_planes:
-            raise ValueError("ATOM cache binding arrays must have equal nonzero length")
+            raise ValueError("cache binding arrays must have equal nonzero length")
         for index, plane in enumerate((*binding.key_planes, *binding.value_planes)):
             if (
                 plane.dtype != torch.uint8
@@ -205,14 +163,14 @@ class PersistentDecoder:
                 or not plane.is_contiguous()
             ):
                 raise ValueError(
-                    f"ATOM cache plane {index} must be contiguous one-dimensional uint8"
+                    f"cache plane {index} must be contiguous one-dimensional uint8"
                 )
         if any(int(count) <= 0 for count in binding.block_counts):
-            raise ValueError("ATOM cache block counts must be positive")
+            raise ValueError("cache block counts must be positive")
         if any(int(stride) <= 0 for stride in binding.block_strides):
-            raise ValueError("ATOM cache block strides must be positive")
+            raise ValueError("cache block strides must be positive")
         try:
-            self.native.bind_atom_cache(
+            self.native.bind_split_cache(
                 list(binding.key_planes),
                 list(binding.value_planes),
                 [int(value) for value in binding.block_counts],
@@ -221,8 +179,6 @@ class PersistentDecoder:
             )
         except Exception as error:  # noqa: BLE001
             raise PrelaunchError(f"native cache binding failed: {error}") from error
-
-    bind_cache = bind_atom_cache
 
     def bind_weights(self, weights: Iterable[torch.Tensor]) -> None:
         """Internal checkpoint-loader primitive for the current native ABI."""
@@ -294,11 +250,9 @@ class PersistentDecoder:
 
 
 __all__ = [
-    "AtomCacheBinding",
+    "KVCacheBinding",
     "PersistentDecoder",
     "QuantumRequest",
     "QuantumResult",
     "persistent_checkpoint_bytes",
-    "write_atom_fp16_cache",
-    "write_atom_shuffled_cache",
 ]

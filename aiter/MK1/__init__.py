@@ -14,16 +14,14 @@ from .errors import (
     UnsupportedConfigurationError,
 )
 from .persistent_decoder import (
-    AtomCacheBinding,
+    KVCacheBinding,
     PersistentDecoder,
     QuantumRequest,
     QuantumResult,
-    write_atom_fp16_cache,
-    write_atom_shuffled_cache,
 )
 
 __all__ = [
-    "AtomCacheBinding",
+    "KVCacheBinding",
     "BackendLaunchError",
     "CheckpointError",
     "CheckpointInfo",
@@ -39,6 +37,4 @@ __all__ = [
     "is_supported",
     "persistent_checkpoint_bytes",
     "validate_checkpoint",
-    "write_atom_fp16_cache",
-    "write_atom_shuffled_cache",
 ]

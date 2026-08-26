@@ -53,14 +53,6 @@ if hasattr(torch, "float8_e4m3fn"):
 
 PERSISTENT_LAYER_COUNT = 36
 PERSISTENT_BINDING_COUNT = 471
-_CHECKPOINT_BACKEND_ALIASES = {
-    "gpt_oss_gfx950_atom_v1": (
-        "gpt_oss_gfx950_atom_v1",
-        "gpt_oss_gfx950_v1",
-    )
-}
-
-
 def persistent_binding_order() -> tuple[str, ...]:
     """Return the public native ABI order for GPT-OSS-120B MK1 weights."""
 
@@ -153,18 +145,14 @@ def _backend_manifest(
 ) -> tuple[dict[str, Any], str]:
     backends = manifest.get("persistent_decoder_backends")
     if isinstance(backends, dict):
-        candidates = _CHECKPOINT_BACKEND_ALIASES.get(backend, (backend,))
-        for candidate in candidates:
-            selected = backends.get(candidate)
-            if isinstance(selected, dict):
-                return selected, candidate
+        selected = backends.get(backend)
+        if isinstance(selected, dict):
+            return selected, backend
         raise CheckpointError(
-            f"checkpoint does not declare a compatible backend for {backend}: "
-            f"expected one of {candidates}"
+            f"checkpoint does not declare backend {backend}"
         )
     declared = _first_string(manifest, "backend", "backend_abi")
-    candidates = _CHECKPOINT_BACKEND_ALIASES.get(backend, (backend,))
-    if declared is not None and declared not in candidates:
+    if declared is not None and declared != backend:
         raise CheckpointError(
             f"checkpoint backend {declared} does not match requested backend {backend}"
         )
