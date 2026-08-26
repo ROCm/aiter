@@ -11,9 +11,28 @@ Result is bit-identical to the NCCL all-gather: destination row is
 ``tp_rank * m_local + local_row``, i.e. the same rank-major layout.
 """
 
+import functools
+
+import flydsl.compiler as flyc
+import flydsl.expr as fx
+import mori.ir.flydsl as mori_shmem
 import torch
+from flydsl.expr import const_expr, range_constexpr
 
 import mori.shmem as ms
+
+from .. import buffer_ops
+from .. import communication_ops_utils as comm_ops
+from ..tensor_shim import _run_compiled
+from .collective_sched import copy_row, emit_epoch_rendezvous, emit_ticket_and_roles
+from .gemm_util import _buffer_load, _make_buffer_from_addr
+
+# ``copy_row`` carries its own ``@flyc.jit``; the two ``emit_*`` helpers do not,
+# so their ``if <device value>:`` statements would reach Python's ``__bool__``
+# instead of being rewritten into device branches. Wrapping applies the same AST
+# rewrite the decorator would, without editing collective_sched.py.
+emit_ticket_and_roles = flyc.jit(emit_ticket_and_roles)
+emit_epoch_rendezvous = flyc.jit(emit_epoch_rendezvous)
 
 _SUPPORTED_TP = (4, 8)
 _RESET_COUNTERS = 1  # push_done
@@ -54,6 +73,140 @@ def _p2p_table(t, rank, npes, device):
     for pe in range(npes):
         table[pe] = ms.shmem_ptr_p2p(t.data_ptr(), rank, pe)
     return table
+
+
+# fmt: off
+@functools.cache
+def compile_tp_gather(*, model_dim: int, npes: int, rank: int, producer_blocks: int,
+        num_waves: int = 4, slots: int = 2):
+    """Push this rank's quantized rows into every peer's symmetric receive buffer."""
+    TOTAL_THREADS = num_waves * 64
+    ROW_BYTES = model_dim
+    SCALE_BYTES = model_dim // 32
+    ROW_I32 = ROW_BYTES // 4
+    SCALE_I32 = SCALE_BYTES // 4
+    ROW_SAFE_END = (ROW_I32 // 512) * 512
+    SCALE_SAFE_END = (SCALE_I32 // 512) * 512
+    BLOCKS_PER_DEST = producer_blocks // npes
+    LAUNCH_GRID_X = 1 + producer_blocks
+    EPOCH_SLOT = 0
+
+    kernel_name = (
+        f"tp_gather_d{model_dim}_n{npes}_pb{producer_blocks}"
+        f"_w{num_waves}_s{slots}"
+    )
+
+    # Declared in the factory scope, not inside the kernel body -- this mirrors
+    # mega_moe_stage1.py:160-163, where SharedStorage sits outside @flyc.kernel.
+    @fx.struct
+    class SharedStorage:
+        scratch: fx.Array[fx.Int8, 64, 16]
+
+    @flyc.kernel(name=kernel_name, known_block_size=[TOTAL_THREADS, 1, 1])
+    def kernel(
+        addr_x_q: fx.Int64, addr_x_scale: fx.Int64,
+        addr_p2p_rx_x: fx.Int64, addr_p2p_rx_scale: fx.Int64,
+        addr_p2p_payload_ready: fx.Int64, addr_p2p_launch_ready: fx.Int64,
+        addr_payload_ready: fx.Int64, addr_launch_ready: fx.Int64,
+        addr_parity: fx.Int64, addr_expected: fx.Int64,
+        addr_epoch_gate: fx.Int64, addr_entry_count: fx.Int64,
+        addr_reset: fx.Int64,
+        m_local: fx.Int32, x_slab_bytes: fx.Int32, scale_slab_bytes: fx.Int32,
+    ):
+        tid = fx.thread_idx.x
+        lane = tid & fx.Int32(63)
+        warp = tid // fx.Int32(64)
+        lds = fx.SharedAllocator().allocate(SharedStorage).peek()
+
+        parity_rsrc = _make_buffer_from_addr(addr_parity, fx.Int32)
+        expected_rsrc = _make_buffer_from_addr(addr_expected, fx.Int32)
+
+        gate_addr, gate_epoch, is_owner, is_producer, producer_slot = emit_ticket_and_roles(
+            tid=tid, lds_scratch=lds.scratch, a_entry_count=addr_entry_count,
+            a_epoch_gate=addr_epoch_gate, epoch_slot=EPOCH_SLOT,
+            launch_grid_x=LAUNCH_GRID_X, producer_blocks=producer_blocks)
+
+        emit_epoch_rendezvous(
+            tid=tid, is_owner=is_owner, parity_rsrc=parity_rsrc,
+            expected_rsrc=expected_rsrc, p_launch_ready=addr_p2p_launch_ready,
+            a_launch_ready=addr_launch_ready, a_reset_counters=addr_reset,
+            reset_count=1, gate_addr=gate_addr, gate_epoch=gate_epoch,
+            npes=npes, rank=rank)
+
+        parity = _buffer_load(parity_rsrc, fx.Int32(0), fx.Int32, cache_modifier=1)
+        expected = _buffer_load(expected_rsrc, parity, fx.Int32, cache_modifier=1)
+        if const_expr(slots == 1):
+            slab = fx.Int32(0)
+        else:
+            slab = parity
+        x_base_off = fx.Int64(slab) * fx.Int64(x_slab_bytes)
+        s_base_off = fx.Int64(slab) * fx.Int64(scale_slab_bytes)
+
+        if is_producer:
+            destination = producer_slot // fx.Int32(BLOCKS_PER_DEST)
+            sub = producer_slot - destination * fx.Int32(BLOCKS_PER_DEST)
+            rx_table = _make_buffer_from_addr(addr_p2p_rx_x, fx.Int64)
+            sc_table = _make_buffer_from_addr(addr_p2p_rx_scale, fx.Int64)
+            peer_x = _buffer_load(rx_table, destination, fx.Int64) + x_base_off
+            peer_s = _buffer_load(sc_table, destination, fx.Int64) + s_base_off
+            dest_base = fx.Int32(rank) * m_local
+            row0 = sub + warp * fx.Int32(BLOCKS_PER_DEST)
+            row_stride = fx.Int32(BLOCKS_PER_DEST * num_waves)
+            for row in range(row0, m_local, row_stride):
+                dest_row = dest_base + row
+                copy_row(
+                    buffer_ops.create_buffer_resource_from_addr(addr_x_q + fx.Int64(row) * fx.Int64(ROW_BYTES)),
+                    buffer_ops.create_buffer_resource_from_addr(peer_x + fx.Int64(dest_row) * fx.Int64(ROW_BYTES)),
+                    lane, safe_end_i32=ROW_SAFE_END, n_i32=ROW_I32)
+                copy_row(
+                    buffer_ops.create_buffer_resource_from_addr(addr_x_scale + fx.Int64(row) * fx.Int64(SCALE_BYTES)),
+                    buffer_ops.create_buffer_resource_from_addr(peer_s + fx.Int64(dest_row) * fx.Int64(SCALE_BYTES)),
+                    lane, safe_end_i32=SCALE_SAFE_END, n_i32=SCALE_I32)
+            fx.rocdl.s_waitcnt(0)
+            fx.barrier()
+            # Last producer block on this rank publishes once to every peer, so
+            # payload_ready advances by exactly npes per launch and the expected
+            # step in emit_epoch_rendezvous stays npes.
+            if tid == fx.Int32(0):
+                comm_ops.fence_system_release()
+                done = fx.Int32(comm_ops.atomic_add_agent(addr_reset, fx.Int32(1)))
+                if done == fx.Int32(producer_blocks - 1):
+                    pr_table = _make_buffer_from_addr(addr_p2p_payload_ready, fx.Int64)
+                    for pe in range_constexpr(npes):
+                        remote = _buffer_load(pr_table, fx.Int32(pe), fx.Int64)
+                        comm_ops.atomic_add_system(
+                            remote + fx.Int64(parity) * fx.Int64(4), fx.Int32(1))
+
+        if tid == fx.Int32(0):
+            mori_shmem.int32_wait_until_equals(
+                addr_payload_ready + fx.Int64(parity) * fx.Int64(4), expected)
+            comm_ops.fence_system_acquire()
+        fx.barrier()
+
+    @flyc.jit
+    def launch(
+        addr_x_q: fx.Int64, addr_x_scale: fx.Int64,
+        addr_p2p_rx_x: fx.Int64, addr_p2p_rx_scale: fx.Int64,
+        addr_p2p_payload_ready: fx.Int64, addr_p2p_launch_ready: fx.Int64,
+        addr_payload_ready: fx.Int64, addr_launch_ready: fx.Int64,
+        addr_parity: fx.Int64, addr_expected: fx.Int64,
+        addr_epoch_gate: fx.Int64, addr_entry_count: fx.Int64, addr_reset: fx.Int64,
+        m_local: fx.Int32, x_slab_bytes: fx.Int32, scale_slab_bytes: fx.Int32,
+        stream: fx.Stream,
+    ):
+        kernel(
+            addr_x_q, addr_x_scale, addr_p2p_rx_x, addr_p2p_rx_scale,
+            addr_p2p_payload_ready, addr_p2p_launch_ready, addr_payload_ready,
+            addr_launch_ready, addr_parity, addr_expected, addr_epoch_gate,
+            addr_entry_count, addr_reset, m_local, x_slab_bytes, scale_slab_bytes,
+            value_attrs={
+                "rocdl.waves_per_eu": 2,
+                "rocdl.flat_work_group_size": f"{TOTAL_THREADS},{TOTAL_THREADS}",
+            },
+        ).launch(grid=(LAUNCH_GRID_X, 1, 1), block=(TOTAL_THREADS, 1, 1), stream=stream)
+
+    return launch
+# fmt: on
 
 
 class TPActivationGather:
@@ -222,5 +375,42 @@ class TPActivationGather:
         scale = self.rx_scale[parity, :n]
         return x, scale
 
-    def gather(self, x_q, x_scale):
-        raise NotImplementedError("push kernel lands in task 3")
+    def gather(self, x_q, x_scale, stream=None):
+        """Push this rank's rows to every peer and wait for theirs.
+
+        Returns ``(rx_x, rx_scale)`` views of shape ``[tp_size*m_local, ...]``,
+        valid until the next call (double buffering gives one round of slack).
+        """
+        m_local = self._validate(x_q, x_scale)
+        launch = compile_tp_gather(
+            model_dim=self.model_dim,
+            npes=self.tp_size,
+            rank=self.tp_rank,
+            producer_blocks=self.producer_blocks,
+            num_waves=self.num_waves,
+            slots=self.slots,
+        )
+        if stream is None:
+            stream = fx.Stream(torch.cuda.current_stream())
+        parity = self.current_parity()
+        _run_compiled(
+            launch,
+            fx.Int64(x_q.data_ptr()),
+            fx.Int64(x_scale.data_ptr()),
+            fx.Int64(self.p2p_rx_x.data_ptr()),
+            fx.Int64(self.p2p_rx_scale.data_ptr()),
+            fx.Int64(self.p2p_payload_ready.data_ptr()),
+            fx.Int64(self.p2p_launch_ready.data_ptr()),
+            fx.Int64(self.payload_ready.data_ptr()),
+            fx.Int64(self.launch_ready.data_ptr()),
+            fx.Int64(self.epoch_parity.data_ptr()),
+            fx.Int64(self.epoch_expected.data_ptr()),
+            fx.Int64(self.epoch_gate.data_ptr()),
+            fx.Int64(self.entry_count.data_ptr()),
+            fx.Int64(self.reset_counters.data_ptr()),
+            fx.Int32(m_local),
+            fx.Int32(self.slab_bytes("x")),
+            fx.Int32(self.slab_bytes("scale")),
+            stream,
+        )
+        return self.views(m_local, parity)

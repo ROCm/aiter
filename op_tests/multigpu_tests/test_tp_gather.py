@@ -51,6 +51,11 @@ def _make_x(m_local, device, seed):
     return x.contiguous()
 
 
+def _u8(t):
+    """Byte view, so fp8 and uint8 tensors compare with torch.equal identically."""
+    return t.contiguous().view(torch.uint8)
+
+
 def _nccl_gather(t, world):
     out = torch.empty(
         (t.shape[0] * world,) + tuple(t.shape[1:]), dtype=t.dtype, device=t.device
@@ -134,7 +139,113 @@ def case_construct():
         _teardown()
 
 
-CASES = {"construct": case_construct}
+def case_bitexact():
+    """The push must reproduce dist.all_gather_into_tensor byte for byte."""
+    rank, world, device = _setup()
+    try:
+        g = TPActivationGather(
+            model_dim=MODEL_DIM,
+            tp_size=world,
+            tp_rank=rank,
+            max_tok_per_rank=256,
+            device=device,
+        )
+        for m_local in (1, 2, 7, 8, 64, 128, 256):
+            x = _make_x(m_local, device, 3000 + rank * 13 + m_local)
+            x_q, x_s = per_1x32_mx_quant(x, quant_mode="fp8")
+            want_x = _nccl_gather(x_q, world)
+            want_s = _nccl_gather(x_s, world)
+            got_x, got_s = g.gather(x_q, x_s)
+            torch.cuda.synchronize()
+            assert got_x.shape == want_x.shape, (got_x.shape, want_x.shape)
+            assert torch.equal(_u8(got_x), _u8(want_x)), (
+                f"activation mismatch at m_local={m_local}: "
+                f"{int((_u8(got_x) != _u8(want_x)).sum())} bytes"
+            )
+            assert torch.equal(_u8(got_s), _u8(want_s)), (
+                f"scale mismatch at m_local={m_local}: "
+                f"{int((_u8(got_s) != _u8(want_s)).sum())} bytes"
+            )
+            if rank == 0:
+                print(f"  m_local={m_local} rows={got_x.shape[0]} bit-identical")
+        if rank == 0:
+            print("case_bitexact OK")
+    finally:
+        _teardown()
+
+
+def case_repeat():
+    """The epoch/parity protocol must survive repeated calls, not just the first."""
+    rank, world, device = _setup()
+    try:
+        g = TPActivationGather(
+            model_dim=MODEL_DIM,
+            tp_size=world,
+            tp_rank=rank,
+            max_tok_per_rank=128,
+            device=device,
+        )
+        for it in range(12):
+            m_local = (it % 4) * 8 + 8
+            x = _make_x(m_local, device, 5000 + rank * 7 + it)
+            x_q, x_s = per_1x32_mx_quant(x, quant_mode="fp8")
+            want_x = _nccl_gather(x_q, world)
+            got_x, _ = g.gather(x_q, x_s)
+            torch.cuda.synchronize()
+            assert torch.equal(_u8(got_x), _u8(want_x)), (
+                f"iteration {it} (m_local={m_local}) mismatch: "
+                f"{int((_u8(got_x) != _u8(want_x)).sum())} bytes"
+            )
+        if rank == 0:
+            print("case_repeat OK (12 iterations)")
+    finally:
+        _teardown()
+
+
+def case_skew():
+    """A slow rank must not corrupt a fast rank's buffer.
+
+    Rank 0 sleeps before each call so the ranks enter the kernel far apart. The
+    launch_ready handshake plus double buffering is what makes this safe; with
+    either removed, a fast rank's round N+1 push lands in a buffer a slow rank
+    is still reading from round N.
+    """
+    import time
+
+    rank, world, device = _setup()
+    try:
+        g = TPActivationGather(
+            model_dim=MODEL_DIM,
+            tp_size=world,
+            tp_rank=rank,
+            max_tok_per_rank=128,
+            device=device,
+        )
+        for it in range(6):
+            if rank == 0:
+                time.sleep(0.05)
+            m_local = 64
+            x = _make_x(m_local, device, 7000 + rank * 11 + it)
+            x_q, x_s = per_1x32_mx_quant(x, quant_mode="fp8")
+            want_x = _nccl_gather(x_q, world)
+            got_x, _ = g.gather(x_q, x_s)
+            torch.cuda.synchronize()
+            bad = int((_u8(got_x) != _u8(want_x)).sum())
+            assert (
+                bad == 0
+            ), f"iteration {it} rank {rank}: {bad} bytes differ under skew"
+        if rank == 0:
+            print("case_skew OK (6 iterations, rank 0 delayed 50ms)")
+    finally:
+        _teardown()
+
+
+CASES = {
+    "construct": case_construct,
+    "bitexact": case_bitexact,
+    "repeat": case_repeat,
+    "skew": case_skew,
+}
 
 
 def main():
