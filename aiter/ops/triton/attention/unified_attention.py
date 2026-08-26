@@ -6,6 +6,10 @@ from typing import NamedTuple
 import torch
 import triton
 
+from aiter.aiter.ops.triton.utils.core import (
+    AITER_TRITON_CONFIGS_PATH,
+    load_config_json,
+)
 from aiter.ops.triton._triton_kernels.attention.unified_attention import (
     kernel_unified_attention_2d,
     kernel_unified_attention_3d,
@@ -45,6 +49,17 @@ DEVICE_ARCH = arch_info.get_arch()
 IS_DEVICE_ARCH_GFX12 = DEVICE_ARCH in ("gfx1250",)
 WARP_SIZE = 32 if IS_DEVICE_ARCH_GFX12 else 64
 WARP_SIZE_LOG2 = int(math.log2(WARP_SIZE))
+
+_GLUON_SUPPORTED_ARCHS = ("gfx1250",)
+
+
+def _is_gluon_available():
+    try:
+        return any(
+            supported in arch_info.get_arch() for supported in _GLUON_SUPPORTED_ARCHS
+        )
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def is_gfx950_small_head(head_size):
@@ -119,9 +134,97 @@ class _UAParams(NamedTuple):
     skip_reduce: bool = False
 
 
-def is_2d_gluon_available(params: _UAParams):
+def _get_config_2d(params: _UAParams, backend: str):
+    # load json
+    dev = arch_info.get_arch()
+    fpath = f"{AITER_TRITON_CONFIGS_PATH}/{dev}/{backend}/unified_attention/2d"
+    tuned = load_config_json(fpath)
+
+    # build key
+    key = ""
+    if not params.all_decode:
+        key += "prefill"
+    else:
+        key += "decode"
+    if params.head_size >= 512:
+        key += "_head_ge512"
+    elif params.head_size >= 256:
+        key += "_head_ge256"
+    if params.max_seqlen_q >= 256:
+        key += "_q_ge256"
+
+    # fallback
+    if key not in tuned:
+        key = "any"
+    assert key in tuned, f"Could not find any valid {backend} config for {dev}"
+
+    # tuned configs
+    BLOCK_M = tuned["BLOCK_M"]
+    BLOCK_Q = BLOCK_M // params.num_queries_per_kv
+    TILE_SIZE = tuned["TILE_SIZE"]
+    num_warps = tuned["num_warps"]
+    num_stages = tuned["num_stages"]
+    waves_per_eu = tuned["waves_per_eus"]
+
+    # cap num_stages
+    max_num_stages = 2 if params.head_size > 128 else 4
+    num_stages = min(max_num_stages, num_stages)
+
+    # fix TILE_SIZE for a8w8
+    if params.shuffled_kv_cache:
+        if params.q_dtype == e4m3_dtype and params.kv_cache_dtype == e4m3_dtype:
+            assert params.block_size >= 32, (
+                "For A8W8 Unified Attention with pre-shuffled KV cache, only block_size >= 32 is supported"
+            )
+        TILE_SIZE = params.block_size
+    elif params.q_dtype == e4m3_dtype and params.kv_cache_dtype == e4m3_dtype:
+        TILE_SIZE = max(32, TILE_SIZE)
+
+    cfg = {
+        "BLOCK_M": BLOCK_M,
+        "BLOCK_Q": BLOCK_Q,
+        "TILE_SIZE": TILE_SIZE,
+        "num_warps": num_warps,
+        "num_stages": num_stages,
+        "waves_per_eu": waves_per_eu,
+    }
+    return cfg
+
+
+def _get_config_3d(params: _UAParams, backend: str):
+    cfg = {
+        "BLOCK_M": None,
+        "BLOCK_Q": None,
+        "TILE_SIZE": None,
+        "NUM_SEGMENTS_PER_SEQ": None,
+        "num_warps": None,
+        "num_stages": None,
+        "waves_per_eu": None,
+    }
+    return cfg
+
+
+def _get_config_reduce(params: _UAParams, backend: str):
+    cfg = {
+        "BLOCK_M": None,
+        "BLOCK_Q": None,
+        "TILE_SIZE": None,
+        "NUM_SEGMENTS_PER_SEQ": None,
+        "num_warps": None,
+        "num_stages": None,
+        "waves_per_eu": None,
+    }
+    return cfg
+
+
+def is_2d_gluon_available(params: _UAParams, force_gluon=False):
+    if force_gluon:
+        assert _is_gluon_available(), (
+            f"2d gluon kernel is not available for {DEVICE_ARCH}"
+        )
+        return True
     use_gluon_2d = (
-        IS_DEVICE_ARCH_GFX12
+        _is_gluon_available()
         and _unified_attention_gluon_kernel_2d is not None
         and not params.softcap
         and not params.use_qq_bias
@@ -133,16 +236,34 @@ def is_2d_gluon_available(params: _UAParams):
     return use_gluon_2d
 
 
-def is_3d_gluon_available(params: _UAParams):
-    use_gluon_3d = IS_DEVICE_ARCH_GFX12 and params.shuffled_kv_cache
+def is_3d_gluon_available(params: _UAParams, force_gluon=False):
+    if force_gluon:
+        assert _is_gluon_available(), (
+            f"3d gluon kernel is not available for {DEVICE_ARCH}"
+        )
+        return True
+    use_gluon_3d = (
+        _is_gluon_available()
+        and _unified_attention_gluon_kernel_3d is not None
+        and params.shuffled_kv_cache
+    )
     return use_gluon_3d
 
 
 def is_reduce_gluon_available(
-    params: _UAParams, NUM_SEGMENTS, head_size_padded, gluon_num_warps
+    params: _UAParams,
+    NUM_SEGMENTS,
+    head_size_padded,
+    gluon_num_warps,
+    force_gluon=False,
 ):
+    if force_gluon:
+        assert _is_gluon_available(), (
+            f"Reduce gluon kernel is not available for {DEVICE_ARCH}"
+        )
+        return True
     use_gluon_reduce = (
-        IS_DEVICE_ARCH_GFX12
+        _is_gluon_available()
         and _reduce_segments_gluon is not None
         and params.all_decode
         and NUM_SEGMENTS <= _GLUON_REDUCE_MAX_SEGMENTS
@@ -431,8 +552,23 @@ def unified_attention(
     sinks=None,
     shuffled_kv_cache: bool = False,
     skip_reduce: bool = False,
+    # backend
+    backend: str | None = None,  # "triton" | "gluon"
 ):
     assert causal, "Only causal attention is supported"
+
+    if backend is None:
+        backend = "gluon" if _is_gluon_available() else "triton"
+    backend = backend.lower()
+    assert backend in (
+        "triton",
+        "gluon",
+    ), f"Unknown backend '{backend}', must be 'triton' or 'gluon'"
+    if backend == "gluon":
+        assert _is_gluon_available(), (
+            f"Gluon backend requires one of {_GLUON_SUPPORTED_ARCHS}, got '{get_arch()}'"
+        )
+    force_gluon = backend == "gluon"
 
     use_alibi_slopes = alibi_slopes is not None
     use_qq_bias = qq_bias is not None
@@ -560,7 +696,7 @@ def unified_attention(
     if use_2d_kernel(params):
         # The gfx1250 Gluon 2d kernel only handles bf16/fp8 q+kv (with optional
         # sinks / output_scale / shuffled_kv_cache)
-        use_gluon_2d = is_2d_gluon_available(params)
+        use_gluon_2d = is_2d_gluon_available(params, force_gluon)
         if use_gluon_2d:
             _unified_attention_2d_gfx1250(params)
         else:
@@ -609,7 +745,7 @@ def unified_attention(
             segm_max = out  # dummy ptr
             segm_expsum = out  # dummy ptr
 
-        use_gluon_3d = is_3d_gluon_available(params)
+        use_gluon_3d = is_3d_gluon_available(params, force_gluon)
         if use_gluon_3d:
             _unified_attention_3d_gfx1250(
                 params,
@@ -646,7 +782,7 @@ def unified_attention(
         gluon_num_warps = 8 if num_query_heads % 8 == 0 else 4
 
         use_gluon_reduce = is_reduce_gluon_available(
-            params, NUM_SEGMENTS, head_size_padded, gluon_num_warps
+            params, NUM_SEGMENTS, head_size_padded, gluon_num_warps, force_gluon
         )
         if use_gluon_reduce:
             _reduce_segments_gfx1250(
@@ -672,7 +808,7 @@ def unified_attention(
     return out
 
 
-def _unified_attention_2d_triton(params):
+def _unified_attention_2d_triton(params: _UAParams):
     config = select_2d_config(
         params.block_size,
         params.head_size,
@@ -747,7 +883,7 @@ def _unified_attention_2d_triton(params):
 
 
 def _unified_attention_3d_triton(
-    params,
+    params: _UAParams,
     BLOCK_M,
     BLOCK_Q,
     NUM_SEGMENTS,
@@ -816,7 +952,7 @@ def _unified_attention_3d_triton(
 
 
 def _reduce_segments_triton(
-    params,
+    params: _UAParams,
     BLOCK_Q,
     segm_output,
     segm_max,
@@ -844,7 +980,7 @@ def _reduce_segments_triton(
     )
 
 
-def _unified_attention_2d_gfx1250(params, loop_variant=None):
+def _unified_attention_2d_gfx1250(params: _UAParams, loop_variant=None):
     """
     Internal wrapper for the gfx1250 gluon kernel.
 
@@ -1002,7 +1138,7 @@ def _unified_attention_2d_gfx1250(params, loop_variant=None):
 
 
 def _unified_attention_3d_gfx1250(
-    params,
+    params: _UAParams,
     BLOCK_M,
     BLOCK_Q,
     NUM_SEGMENTS,
@@ -1086,7 +1222,7 @@ def _unified_attention_3d_gfx1250(
 
 
 def _reduce_segments_gfx1250(
-    params,
+    params: _UAParams,
     NUM_SEGMENTS,
     segm_output,
     segm_max,
