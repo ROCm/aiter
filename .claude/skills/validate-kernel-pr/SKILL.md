@@ -176,8 +176,9 @@ both correctness targets, and index scan all ran.
 These are fields, not prose, so a report cannot overclaim by omission:
 
 - **`arch_coverage`** — per architecture, `runtime`, `compile-only`, or `not-covered`.
-  `compile-only` requires an actual architecture-specific compile; a gfx950 host does not earn
-  gfx942 coverage merely by lacking a gfx942 device.
+  A GPU claim alone earns no runtime coverage; `runtime` is added only after a selected head
+  correctness test is collected and executed with that device visible. `compile-only` requires
+  an actual architecture-specific compile.
 - **`isolation`** — the real level. Where no container runtime is available it is
   `git-worktree + private caches`, and the report says `container: false`.
 - **`degraded_mode`** — `NO_GPU` when no device was claimable; required stages then make the

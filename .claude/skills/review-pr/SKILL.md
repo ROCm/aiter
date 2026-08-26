@@ -150,13 +150,23 @@ for name in required_stages:
         raise SystemExit(f"validation stage {name} is malformed: {stage!r}")
 if report.get("verdict") not in {"PASS", "NEEDS_WORK", "BLOCK", "INCONCLUSIVE"}:
     raise SystemExit(f"validation report has an invalid verdict: {report.get('verdict')!r}")
+findings = report.get("findings")
+if not isinstance(findings, list):
+    raise SystemExit("validation report findings must be a list")
+for finding in findings:
+    if (
+        not isinstance(finding, dict)
+        or finding.get("severity") not in {"blocker", "should-fix", "note"}
+        or not finding.get("stage")
+        or not finding.get("detail")
+    ):
+        raise SystemExit(f"validation report has a malformed finding: {finding!r}")
 selection = report.get("test_selection", {})
 if not selection.get("pytest_target"):
     raise SystemExit("validation report does not name the pytest target it selected")
 severities = {
     finding.get("severity")
-    for finding in report.get("findings", [])
-    if isinstance(finding, dict)
+    for finding in findings
 }
 complete = (
     report["stages"]["merge_sim"]["status"] == "pass"

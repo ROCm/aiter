@@ -159,6 +159,28 @@ else:
 PY
 }
 
+mark_runtime_coverage() {
+  python3 - "$JSON" "$1" <<'PY'
+import json
+import pathlib
+import re
+import sys
+
+report_path, log_path = sys.argv[1:3]
+log = pathlib.Path(log_path).read_text(errors="replace")
+collected = re.search(r"\bcollected\s+[1-9]\d*\s+items?\b", log)
+completed = re.search(r"\b[1-9]\d*\s+(?:passed|failed)\b", log)
+if not (collected or completed):
+    raise SystemExit(0)
+data = json.load(open(report_path))
+gpu = data["stages"].get("gpu_claim", {})
+arch = gpu.get("arch")
+if gpu.get("status") == "pass" and arch:
+    data["arch_coverage"][arch] = "runtime"
+    json.dump(data, open(report_path, "w"), indent=2)
+PY
+}
+
 finish_report() {
   python3 - "$JSON" "$OUT" <<'PY'
 import datetime
@@ -299,9 +321,11 @@ jset_string "repo.kind" "$REPO_KIND"
 
 if [ -n "$PATCHF" ]; then
   DIRTY=$(git -C "$REPO_WT" status --porcelain --untracked-files=all)
-  if [ -n "$DIRTY" ]; then
-    stage_note "merge_sim" "skip" "supplied worktree is not clean; patch was not applied"
-    finding "note" "merge_sim" "worktree contains tracked or untracked changes, so merge simulation is inconclusive"
+  if [ -n "$DIRTY" ] || [ -n "$INITIAL_IGNORED" ]; then
+    stage_note "merge_sim" "skip" \
+      "supplied worktree has tracked, untracked, or ignored artifacts; patch was not applied"
+    finding "note" "merge_sim" \
+      "worktree is not isolated-clean, so merge simulation is inconclusive"
     jset_json "repo.head" 'null'
     finish_report
     exit 2
@@ -415,16 +439,6 @@ PY
         finding "note" "gpu_claim" "GPU identity could not be verified; no runtime correctness claim is made"
       else
         jset_json "stages.gpu_claim" "$GPU_INFO"
-        python3 - "$JSON" "$GPU_INFO" <<'PY'
-import json
-import sys
-
-path, raw = sys.argv[1:3]
-data = json.load(open(path))
-info = json.loads(raw)
-data["arch_coverage"] = {info["arch"]: "runtime"}
-json.dump(data, open(path, "w"), indent=2)
-PY
       fi
     fi
   fi
@@ -441,7 +455,11 @@ import re
 import sys
 
 diff = open(sys.argv[1], encoding="utf-8").read()
-paths = re.findall(r"^(?:--- a/|\+\+\+ b/)(.+)$", diff, re.MULTILINE)
+paths = re.findall(
+    r"^(?:--- a/|\+\+\+ b/|rename (?:from|to) )(.+)$",
+    diff,
+    re.MULTILINE,
+)
 print(int(any(path.startswith("python/flydsl/") for path in paths)))
 PY
 )
@@ -800,10 +818,18 @@ else
       fi
       if [ "$GRID_HOOK_OK" -eq 1 ]; then
         if [ -f "$REPO_WT/$TEST_FILE" ]; then
-          BASE_GRID_RESULT=$(run_pytest "base-grid" "$SHAPE_ENV=$GRID")
-          BASE_GRID_RC=${BASE_GRID_RESULT%%|*}
-          BASE_GRID_LOG=${BASE_GRID_RESULT##*|}
-          BASE_GRID_STATE="ran"
+          BASE_PROBE_RESULT=$(run_pytest \
+            "base-grid-probe" "$SHAPE_ENV=__VALIDATOR_INVALID_GRID__")
+          BASE_PROBE_RC=${BASE_PROBE_RESULT%%|*}
+          BASE_PROBE_LOG=${BASE_PROBE_RESULT##*|}
+          if [ "$BASE_PROBE_RC" -eq 0 ]; then
+            BASE_GRID_STATE="hook-not-consumed"
+          else
+            BASE_GRID_RESULT=$(run_pytest "base-grid" "$SHAPE_ENV=$GRID")
+            BASE_GRID_RC=${BASE_GRID_RESULT%%|*}
+            BASE_GRID_LOG=${BASE_GRID_RESULT##*|}
+            BASE_GRID_STATE="ran"
+          fi
         else
           BASE_GRID_STATE="target-not-present"
         fi
@@ -838,11 +864,21 @@ else
     else
       python3 - "$JSON" "$BASE_REPO_STATE" "${BASE_REPO_RC:-}" \
         "$BASE_REPO_LOG" "$BASE_GRID_STATE" "${BASE_GRID_RC:-}" \
-        "$BASE_GRID_LOG" <<'PY'
+        "$BASE_GRID_LOG" "${BASE_PROBE_RC:-}" "${BASE_PROBE_LOG:-}" <<'PY'
 import json
 import sys
 
-path, repo_state, repo_exit, repo_log, grid_state, grid_exit, grid_log = sys.argv[1:8]
+(
+    path,
+    repo_state,
+    repo_exit,
+    repo_log,
+    grid_state,
+    grid_exit,
+    grid_log,
+    probe_exit,
+    probe_log,
+) = sys.argv[1:10]
 stage = {
     "status": "pass",
     "repo_tests": {"state": repo_state},
@@ -854,6 +890,9 @@ if repo_exit:
 if grid_exit:
     stage["s1_grid"]["exit"] = int(grid_exit)
     stage["s1_grid"]["log"] = grid_log
+if probe_exit:
+    stage["s1_grid"]["hook_probe_exit"] = int(probe_exit)
+    stage["s1_grid"]["hook_probe_log"] = probe_log
 data = json.load(open(path))
 data["stages"]["baseline_control"] = stage
 json.dump(data, open(path, "w"), indent=2)
@@ -881,6 +920,7 @@ data["stages"]["correctness_repo_tests"] = {
 }
 json.dump(data, open(path, "w"), indent=2)
 PY
+    mark_runtime_coverage "$HEAD_LOG"
     if [ "$HEAD_RC" -ne 0 ]; then
       HEAD_EXCERPT=$(log_excerpt "$HEAD_LOG")
       if [ -z "$PATCHF" ]; then
@@ -899,37 +939,54 @@ PY
     fi
 
     if [ "$GRID_HOOK_OK" -eq 1 ]; then
-      HEAD_GRID_RESULT=$(run_pytest "head-grid" "$SHAPE_ENV=$GRID")
-      HEAD_GRID_RC=${HEAD_GRID_RESULT%%|*}
-      HEAD_GRID_LOG=${HEAD_GRID_RESULT##*|}
-      python3 - "$JSON" "$HEAD_GRID_RC" "$GRID" "$HEAD_GRID_LOG" <<'PY'
+      HEAD_PROBE_RESULT=$(run_pytest \
+        "head-grid-probe" "$SHAPE_ENV=__VALIDATOR_INVALID_GRID__")
+      HEAD_PROBE_RC=${HEAD_PROBE_RESULT%%|*}
+      HEAD_PROBE_LOG=${HEAD_PROBE_RESULT##*|}
+      if [ "$HEAD_PROBE_RC" -eq 0 ]; then
+        stage_note "correctness_s1_grid" "skip" \
+          "pytest target ignores the shape environment variable at runtime"
+        jset_json "stages.correctness_s1_grid.hook_probe_exit" "$HEAD_PROBE_RC"
+        jset_string "stages.correctness_s1_grid.hook_probe_log" "$HEAD_PROBE_LOG"
+        finding "note" "correctness" \
+          "the selected pytest target passes an invalid shape-grid probe, so grid consumption is unproven"
+      else
+        HEAD_GRID_RESULT=$(run_pytest "head-grid" "$SHAPE_ENV=$GRID")
+        HEAD_GRID_RC=${HEAD_GRID_RESULT%%|*}
+        HEAD_GRID_LOG=${HEAD_GRID_RESULT##*|}
+        python3 - "$JSON" "$HEAD_GRID_RC" "$GRID" "$HEAD_GRID_LOG" \
+          "$HEAD_PROBE_RC" "$HEAD_PROBE_LOG" <<'PY'
 import json
 import sys
 
-path, exit_code, grid, log = sys.argv[1:5]
+path, exit_code, grid, log, probe_exit, probe_log = sys.argv[1:7]
 data = json.load(open(path))
 data["stages"]["correctness_s1_grid"] = {
     "status": "pass" if int(exit_code) == 0 else "fail",
     "exit": int(exit_code),
     "grid": grid,
     "log": log,
+    "hook_probe_exit": int(probe_exit),
+    "hook_probe_log": probe_log,
 }
 json.dump(data, open(path, "w"), indent=2)
 PY
-      if [ "$HEAD_GRID_RC" -ne 0 ]; then
-        GRID_EXCERPT=$(log_excerpt "$HEAD_GRID_LOG")
-        if [ -z "$PATCHF" ]; then
-          finding "blocker" "correctness" \
-            "the independent shape grid fails on the supplied head checkout: $GRID_EXCERPT"
-        elif [ "$BASE_GRID_STATE" = "target-not-present" ]; then
-          finding "blocker" "correctness" \
-            "the PR adds this target and its independent shape grid fails: $GRID_EXCERPT"
-        elif [ "$BASE_GRID_STATE" = "ran" ] && [ "$BASE_GRID_RC" -eq 0 ]; then
-          finding "blocker" "correctness" \
-            "the independent shape grid passes on base and fails on head: $GRID_EXCERPT"
-        else
-          finding "note" "correctness" \
-            "the independent grid is red on both baseline and head; attribution is inconclusive"
+        mark_runtime_coverage "$HEAD_GRID_LOG"
+        if [ "$HEAD_GRID_RC" -ne 0 ]; then
+          GRID_EXCERPT=$(log_excerpt "$HEAD_GRID_LOG")
+          if [ -z "$PATCHF" ]; then
+            finding "blocker" "correctness" \
+              "the independent shape grid fails on the supplied head checkout: $GRID_EXCERPT"
+          elif [ "$BASE_GRID_STATE" = "target-not-present" ]; then
+            finding "blocker" "correctness" \
+              "the PR adds this target and its independent shape grid fails: $GRID_EXCERPT"
+          elif [ "$BASE_GRID_STATE" = "ran" ] && [ "$BASE_GRID_RC" -eq 0 ]; then
+            finding "blocker" "correctness" \
+              "the independent shape grid passes on base and fails on head: $GRID_EXCERPT"
+          else
+            finding "note" "correctness" \
+              "the independent grid is red on both baseline and head; attribution is inconclusive"
+          fi
         fi
       fi
     elif [ -n "$SHAPE_ENV" ] && [ -n "$GRID" ]; then
