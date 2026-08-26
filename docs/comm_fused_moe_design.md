@@ -183,9 +183,9 @@ MI355X/gfx950、TP8，同一节点完成结构重构后的全量验证：
 
 | M | uniform Graph us | skew Graph us | max_abs | rel_l2 约值 |
 | ---: | ---: | ---: | ---: | ---: |
-| 256 | 136.63 | 102.96 | 0.8125 | 0.0313 |
-| 512 | 151.17 | 148.75 | 0.8125 | 0.0313 |
-| 1024 | 181.43 | 184.76 | 0.7500 | 0.0313 |
+| 256 | 143.39 | 113.05 | 0.7500 | 0.0301 |
+| 512 | 162.90 | 158.68 | 0.8125 | 0.0301 |
+| 1024 | 164.08 | 167.29 | 0.7500 | 0.0313 |
 | 2048 | 245.45 | 251.79 | 0.7500 | 0.0300 |
 | 4096 | 373.69 | 384.46 | 0.7500 | 0.0300 |
 | 8192 | 615.26 | 626.23 | 0.8125 | 0.0301 |
@@ -197,6 +197,26 @@ winner 做了 smoke，Graph rank-max 约 `138.91 us`，精度 `0.7500 / 0.031323
 256/512/8192/16384/32768 在同一 TP8 进程组内依次 lazy 创建 runner 的验证也已通过。
 uniform M=8192/32768 另用 7 轮、每轮 50 次 Graph replay 复测，分别为
 `615.26 / 1953.16 us`，确认首轮不到 1% 的波动是测量噪声。
+
+M=128 在 2026-08-27 用 5 轮、每轮 50 次 Graph replay 复核，没有加入 production
+CSV。`TM32/TN256/TK128, SBM32, W1792, LW128, SG126` persistent 候选在 uniform
+下为 `135.71 us`，慢于 ordinary 的 `114.75 us`；在 skew 下为 `62.70 us`，慢于
+ordinary 的 `60.53 us`。此前 2 轮短筛出现的 skew 小幅领先未能在独立正式 A/B 中复现。
+同一轮正式复核中，现有 M=256 atomic winner 相对 ordinary 在 uniform/skew 分别为
+`143.39 vs 146.67 us`、`113.05 vs 115.67 us`；M=512 分别为
+`162.90 vs 178.18 us`、`158.68 vs 171.28 us`，因此两条现有 production 配置保持不变。
+
+随后对 M=256/512 单独进行了 W1792 persistent-window 短筛（2 轮、每轮 20 次，
+每个候选与 atomic 同场交替测量）。M=256 最好的双路由折中是 `LW128/SG126`：
+uniform 为 `136.60 vs 131.46 us`，skew 为 `104.09 vs 103.34 us`，仍分别慢
+`3.9%/0.7%`。M=512 最好的折中是 `LW512/SG98`：uniform 为
+`143.89 vs 145.66 us`，快 `1.2%`；skew 为 `146.01 vs 145.59 us`，慢 `0.3%`。
+该幅度不足以证明稳定收益，而且没有同时改善两种 route，因此不替换现有 atomic winner。
+
+M=1024 在 2026-08-27 完成 persistent-window promotion。最终配置为
+`TM32/TN256/TK128, SBM32, W1792, LW512, SG126`，service 固定先于 producer
+发射。5 轮、每轮 50 次 Graph replay 的最慢 rank 中位数为 uniform `164.08 us`、
+skew `167.29 us`；同轮 atomic 分别为 `188.68 us`、`188.49 us`。
 
 MORI SDMA、CU push 等实验未超过当前 compressed direct-pull 完整 pipeline，因此不进入
 production。MORI 只在初始化时注册 external window，热路径没有 MORI host 调用。

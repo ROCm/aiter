@@ -104,7 +104,7 @@ TP: 8
 不能用 uniform 的收益掩盖 skew 回退，也不能用某轮偶然最小值代替交替 A/B 的 rank-max
 median。
 
-当前 production 参数为：
+本计划冻结基线时的 production 参数为：
 
 | M | family | compute | local/collective 参数 |
 |---:|---|---|---|
@@ -445,6 +445,29 @@ ordinary 同轮记录但不参与 5% 判定。M=512 未通过这个冻结门禁�
 ## 7. 第二阶段：M=1024
 
 M=1024 复用 M=512 的候选，但重新寻找算法分界点，不能直接继承 winner。
+
+2026-08-27 已完成这一阶段并将 winner 固化到 production CSV：
+
+```text
+family          persistent
+tile            32 x 256 x 128
+sort_block_m    32
+window          1792
+local_workers   512
+service_grid    126
+service order   first
+```
+
+正式同场 A/B 使用 5 轮、每轮 50 次 CUDA Graph replay，并取八个 rank 中最慢
+rank 的跨轮中位数：
+
+| route | atomic baseline | persistent winner | speedup |
+| --- | ---: | ---: | ---: |
+| uniform | 188.68 us | 164.08 us | 1.1499x |
+| skew | 188.49 us | 167.29 us | 1.1268x |
+
+正确性为 `max_abs=0.75`、`rel_l2≈0.0313`。下面保留当时的实验顺序和门禁，作为
+该 winner 的设计依据。
 
 实验顺序：
 

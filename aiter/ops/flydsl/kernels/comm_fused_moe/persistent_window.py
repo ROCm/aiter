@@ -102,7 +102,60 @@ class Config:
         return self.shard_rows * self.groups_per_row
 
 
-def _compile_compute(config: Config, window: int, compose=None):
+@dataclass(frozen=True)
+class Schedule:
+    producer_workers_per_n_tile: int | None = None
+    producer_ctas_per_cu_limit: int = 1
+
+
+_DEFAULT_SCHEDULE = Schedule()
+_PRODUCTION_SCHEDULES = {
+    # Four N tiles per 1024-wide window: 112 * 4 = 448 producer CTAs.
+    2048: Schedule(
+        producer_workers_per_n_tile=112,
+        producer_ctas_per_cu_limit=2,
+    ),
+    # Four N tiles per 1024-wide window: 104 * 4 = 416 producer CTAs.
+    16384: Schedule(
+        producer_workers_per_n_tile=104,
+        producer_ctas_per_cu_limit=2,
+    ),
+}
+
+
+def production_schedule(config: Config) -> Schedule:
+    return _PRODUCTION_SCHEDULES.get(config.m, _DEFAULT_SCHEDULE)
+
+
+def _config_cache_tag(kind: str, config: Config, *extra: int):
+    """Return only stable scalar values used by a FlyDSL specialization.
+
+    FlyDSL's runtime cache does not reliably distinguish JIT launchers by a
+    captured dataclass instance.  Keep the complete persistent-window config
+    in an explicitly referenced tuple so differently sized runners cannot
+    reuse one another's compiled launcher.
+    """
+    return (
+        kind,
+        config.m,
+        config.tile_m,
+        config.tile_n,
+        config.tile_k,
+        config.sort_block_m,
+        config.window,
+        config.local_workers,
+        config.service_grid,
+        *extra,
+    )
+
+
+def _compile_compute(
+    config: Config,
+    window: int,
+    compose=None,
+    *,
+    persistent_m_workers_per_n_tile: int | None = None,
+):
     return compile_mixed_moe_gemm2_common(
         model_dim=H,
         inter_dim=I,
@@ -116,12 +169,15 @@ def _compile_compute(config: Config, window: int, compose=None):
         b_dtype="fp4",
         out_dtype="fp8",
         accumulate=False,
-        persist_m=1,
+        persist_m=(
+            -1 if persistent_m_workers_per_n_tile is not None else 1
+        ),
         sort_block_m=config.sort_block_m,
         _n_tile_range=(
             window * config.tiles_per_window,
             (window + 1) * config.tiles_per_window,
         ),
+        _persistent_cu_num=persistent_m_workers_per_n_tile,
         _compose_entry=compose,
     )
 
@@ -130,6 +186,43 @@ def _compile_compute(config: Config, window: int, compose=None):
 def compile_stage2_compute(config: Config, window: int):
     """Compile one compact Stage2 window."""
     return _compile_compute(config, window)
+
+
+@functools.cache
+def compile_stage2_compute_bounded(
+    config: Config,
+    window: int,
+    workers_per_n_tile: int,
+    ctas_per_cu_limit: int = 1,
+):
+    """Compile one compact window with an explicit producer CTA budget.
+
+    ``ctas_per_cu_limit=1`` requires a fully resident grid.  A larger explicit
+    budget allows a service-first kernel to reserve CUs while producer CTAs
+    drain through the remaining slots.
+    """
+    from aiter.jit.utils.chip_info import get_cu_num
+
+    if not isinstance(workers_per_n_tile, int) or workers_per_n_tile < 1:
+        raise ValueError(
+            f"workers_per_n_tile must be int >= 1, got {workers_per_n_tile}"
+        )
+    if not isinstance(ctas_per_cu_limit, int) or ctas_per_cu_limit < 1:
+        raise ValueError(
+            f"ctas_per_cu_limit must be int >= 1, got {ctas_per_cu_limit}"
+        )
+    producer_ctas = config.tiles_per_window * workers_per_n_tile
+    resident_limit = get_cu_num() * ctas_per_cu_limit
+    if producer_ctas > resident_limit:
+        raise ValueError(
+            "bounded Stage2 grid exceeds its explicit CTA budget: "
+            f"producer_ctas={producer_ctas}, resident_limit={resident_limit}"
+        )
+    return _compile_compute(
+        config,
+        window,
+        persistent_m_workers_per_n_tile=workers_per_n_tile,
+    )
 
 
 def _emit_local(config: Config, route, partial, shared, worker):
@@ -256,6 +349,8 @@ def _publish_partial(config: Config, state, phase: int):
 
 
 def _compose_persistent_producer(config: Config, phase: int):
+    cache_tag = _config_cache_tag("producer", config, phase)
+
     def compose(*, module_name, emit_gemm2, allocator):
         @flyc.kernel(
             name=(
@@ -341,6 +436,7 @@ def _compose_persistent_producer(config: Config, phase: int):
             state,
             stream,
         ):
+            _ = cache_tag
             allocator.finalized = False
             ctx = CompilationContext.get_current()
             with ir.InsertionPoint(ctx.gpu_module_body):
@@ -385,6 +481,8 @@ def compile_persistent_cycle(config: Config, phase: int):
 
 @functools.cache
 def compile_persistent_drain(config: Config):
+    cache_tag = _config_cache_tag("drain", config)
+
     @flyc.kernel(
         name=(
             f"flydsl_fused_moe_pwin_drain_sr{config.shard_rows}"
@@ -404,6 +502,7 @@ def compile_persistent_drain(config: Config):
 
     @flyc.jit
     def launch(route, partial, shared, state, stream):
+        _ = cache_tag
         kernel(route, partial, shared, state).launch(
             grid=(config.local_workers, 1, 1),
             block=(BLOCK, 1, 1),
@@ -415,6 +514,8 @@ def compile_persistent_drain(config: Config):
 
 @functools.cache
 def compile_persistent_final_publish(config: Config):
+    cache_tag = _config_cache_tag("final_publish", config)
+
     @flyc.kernel(
         name=(
             f"flydsl_fused_moe_pwin_publish_w{config.window}"
@@ -433,6 +534,7 @@ def compile_persistent_final_publish(config: Config):
 
     @flyc.jit
     def launch(state, stream):
+        _ = cache_tag
         kernel(state).launch(grid=(1, 1, 1), block=(64, 1, 1), stream=stream)
 
     return launch
@@ -491,6 +593,7 @@ def _store_agent(addr, value):
 
 @functools.cache
 def compile_stage2_service(config: Config):
+    cache_tag = _config_cache_tag("service", config)
     m = config.m
     window = config.window
     shard_rows = config.shard_rows
@@ -659,6 +762,7 @@ def compile_stage2_service(config: Config):
         rank,
         stream,
     ):
+        _ = cache_tag
         kernel(
             state,
             state_flat_base,
