@@ -192,6 +192,10 @@ def compile_preshuffle_gemm(
     _has_gelu = epilogue == "bias_gelu"
     if split_k > 1 and _has_epilogue:
         raise ValueError("split_k > 1 does not support fused bias or activation")
+    if split_k > 1 and tile_n % _REDUCE_VEC:
+        raise ValueError(
+            f"split_k > 1 needs tile_n divisible by {_REDUCE_VEC}; got {tile_n}"
+        )
 
     is_fp8 = in_dtype == "fp8"
     is_int8 = in_dtype == "int8"
@@ -814,7 +818,6 @@ def compile_preshuffle_gemm(
 
             split_flag_ptr = lds.split_flag.ptr
             semaphore_idx = fx.Int32(bid_x) * (N // tile_n) + fx.Int32(bid_y)
-            arrival = fx.Int32(0)
             if tid == fx.Int32(0):
                 semaphore_addr = fx.Int64(
                     fx.ptrtoint(fx.get_iter(arg_semaphore))
@@ -875,11 +878,17 @@ def compile_preshuffle_gemm(
                                 out_linear,
                             )
                 if tid == fx.Int32(0):
+                    # Hand the counter back for the next launch. Same cross-XCD
+                    # handoff as the partials, so it writes through too.
                     semaphore_rsrc = buffer_ops.create_buffer_resource(
                         arg_semaphore, max_size=True
                     )
-                    semaphore_idx = fx.Int32(bid_x) * (N // tile_n) + fx.Int32(bid_y)
-                    buffer_ops.buffer_store(fx.Int32(0), semaphore_rsrc, semaphore_idx)
+                    buffer_ops.buffer_store(
+                        fx.Int32(0),
+                        semaphore_rsrc,
+                        semaphore_idx,
+                        cache_modifier=_CPOL_COHERENT,
+                    )
 
     # ── Host launcher ─────────────────────────────────────────────
     @flyc.jit

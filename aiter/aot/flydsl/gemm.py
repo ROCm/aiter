@@ -373,18 +373,25 @@ def _compile_preshuffle_to_cache(
     # FlyDSL preshuffle kernels consume raw quantized bytes for fp8/int8 paths.
     a = torch.empty((m * k,), device=dev, dtype=torch.int8)
     b = torch.empty((n * k,), device=dev, dtype=torch.int8)
+    from aiter.ops.flydsl.gemm_kernels import (
+        PRESHUFFLE_SPLIT_K_MAX_TILES,
+        PRESHUFFLE_SPLIT_K_WORKSPACE_ELEMS,
+    )
+
     # k_split > 1 accumulates fp32 partials in a workspace that the last
     # arriving split reduces in-kernel, so the launcher takes the workspace,
-    # the final output and the per-tile semaphore.
+    # the final output and the per-tile semaphore. Both are sized to the bounds
+    # the runtime uses, so the AOT signature matches.
     out = torch.empty((m * n,), device=dev, dtype=out_torch_dtype)
     workspace = (
-        torch.empty((k_split * m * n,), device=dev, dtype=torch.float32)
+        torch.empty(PRESHUFFLE_SPLIT_K_WORKSPACE_ELEMS, device=dev, dtype=torch.float32)
         if k_split > 1
         else out
     )
-    tile_count = ((m + tile_m - 1) // tile_m) * (n // tile_n)
     semaphore = torch.zeros(
-        tile_count if k_split > 1 else 0, device=dev, dtype=torch.int32
+        PRESHUFFLE_SPLIT_K_MAX_TILES if k_split > 1 else 0,
+        device=dev,
+        dtype=torch.int32,
     )
     scale_a = torch.empty((max(m, 1),), device=dev, dtype=torch.float32)
     scale_b = torch.empty((max(n, 1),), device=dev, dtype=torch.float32)

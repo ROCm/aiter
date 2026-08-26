@@ -971,22 +971,50 @@ def _get_compile_fn():
     return _flydsl_compile_fn
 
 
-@functools.lru_cache(maxsize=64)
+# k_split_candidates only proposes split-K while the tile grid is under one CTA
+# per CU and caps k_split * tile_count at four per CU, so tile_count < CU_NUM and
+# the fp32 workspace is at most 4 * CU_NUM * tile_m * tile_n floats. Sizing to
+# those bounds keeps one allocation per stream instead of one per (m, n, tile,
+# k_split): a shape-keyed cache both grows without limit and can evict a buffer
+# whose address a captured CUDA graph still holds.
+PRESHUFFLE_SPLIT_K_MAX_TILES = 256
+PRESHUFFLE_SPLIT_K_MAX_TILE_ELEMS = 32 * 128
+PRESHUFFLE_SPLIT_K_WORKSPACE_ELEMS = (
+    4 * PRESHUFFLE_SPLIT_K_MAX_TILES * PRESHUFFLE_SPLIT_K_MAX_TILE_ELEMS
+)
+
+
+@functools.lru_cache(maxsize=128)
 def _get_preshuffle_split_buffers(
     device: torch.device,
     stream: torch.cuda.Stream,
-    split_k: int,
-    m: int,
-    n: int,
-    tile_m: int,
-    tile_n: int,
 ) -> tuple[Tensor, Tensor]:
-    # One cache entry per stream makes reuse safe: launches on the same stream
-    # are ordered, and the fused reduction resets every tile semaphore to zero.
-    workspace = torch.empty((split_k, m, n), dtype=torch.float32, device=device)
-    tile_count = ((m + tile_m - 1) // tile_m) * (n // tile_n)
-    semaphore = torch.zeros(tile_count, dtype=torch.int32, device=device)
+    # Reuse across launches on one stream is safe: they are ordered, and the
+    # reduction hands the semaphore back zeroed.
+    workspace = torch.empty(
+        PRESHUFFLE_SPLIT_K_WORKSPACE_ELEMS, dtype=torch.float32, device=device
+    )
+    semaphore = torch.zeros(
+        PRESHUFFLE_SPLIT_K_MAX_TILES, dtype=torch.int32, device=device
+    )
     return workspace, semaphore
+
+
+def _check_preshuffle_split_capacity(
+    m: int, n: int, tile_m: int, tile_n: int, split_k: int
+) -> None:
+    tiles = ((m + tile_m - 1) // tile_m) * (n // tile_n)
+    if tiles > PRESHUFFLE_SPLIT_K_MAX_TILES:
+        raise RuntimeError(
+            f"[FlyDSL] split_k needs {tiles} tile semaphores, "
+            f"more than {PRESHUFFLE_SPLIT_K_MAX_TILES}"
+        )
+    elems = split_k * m * n
+    if elems > PRESHUFFLE_SPLIT_K_WORKSPACE_ELEMS:
+        raise RuntimeError(
+            f"[FlyDSL] split_k needs a {elems}-element fp32 workspace, "
+            f"more than {PRESHUFFLE_SPLIT_K_WORKSPACE_ELEMS}"
+        )
 
 
 def flydsl_preshuffle_gemm_a8(
@@ -1073,18 +1101,16 @@ def flydsl_preshuffle_gemm_a8(
     # default epilogue="none" path.
     _dummy_bias = torch.empty(0, dtype=Out.dtype, device=Out.device)
     if split_k > 1:
+        _check_preshuffle_split_capacity(m, n, tile_m, tile_n, split_k)
         workspace, semaphore = _get_preshuffle_split_buffers(
-            Out.device,
-            torch.cuda.current_stream(),
-            split_k,
-            m,
-            n,
-            tile_m,
-            tile_n,
+            Out.device, torch.cuda.current_stream(device=Out.device)
         )
     else:
         workspace = out_contig
-        semaphore = _dummy_bias
+        # int32 to match what the AOT pre-compile passes; dtype is part of the
+        # executable's cache signature, so a mismatch here misses the AOT cache
+        # for every non-split-K kernel.
+        semaphore = torch.empty(0, dtype=torch.int32, device=Out.device)
     # The layout-API launcher (PR #754) takes fx.Tensor args (it builds views via
     # fx.get_iter/make_view), so pass flat torch tensors directly rather than raw
     # pointers.
