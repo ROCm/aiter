@@ -1,53 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Tests for aiter's OPUS-based sparse paged prefill attention.
+"""Correctness and performance tests for sparse prefill attention.
 
-We validate both precision variants of the OPUS two-region sparse paged
-prefill kernel (gfx950 compiled from source, gfx1250 loaded from a prebuilt
-code object) against explicit PyTorch references (per-token online-softmax +
-per-head sink):
-
-* ``pa_sparse_prefill_opus`` -- bf16/fp16 Q/K/V/O in a single ``D=512``
-  head-dim tensor.
-* ``pa_sparse_prefill_fp8_opus`` -- split-precision DSA inputs: NoPE part
-  in fp8 (with embedded per-32-block E8M0 scales, 448 + 14 scales + pad =
-  512 fp8 slots/row) plus a bf16 RoPE part (64), bf16 output.
-
-A single ``prec`` axis (``"bf16"`` / ``"fp16"`` / ``"fp8"``) drives both
-paths through the same shape/mode sweep, so fp8 is exercised with the same
-test parameters as bf16/fp16.
-
-The same harness drives:
-
-* A pytest-parametrised correctness sweep (CI).
-* A standalone CLI for single-point runs with optional benchmark and
-  TFLOPS reporting, mirroring the style of ``op_tests/test_batch_prefill.py``.
-
-Example CLI usage (inside the aiter source tree)::
-
-    # default sweep: N x H_Q x total_pages x {sparse, dense} x {bf16, fp8}, with bench
-    PYTHONPATH=. python3 op_tests/test_pa_sparse_prefill_opus.py
-
-    # only dense CSR for both prefix and extend
-    PYTHONPATH=. python3 op_tests/test_pa_sparse_prefill_opus.py --mode dense
-
-    # single shape, fp8 only, no correctness check
-    PYTHONPATH=. python3 op_tests/test_pa_sparse_prefill_opus.py \\
-        -n 1024 --h_q 128 --prec fp8 --mode sparse --no-verify
-
-Reference design notes (Q&A):
-
-* Why does the reference cast q/k/v to fp32? The GPU kernel accumulates in
-  fp32 (``D_ACC = float``). Computing the reference in bf16/fp16 would
-  let softmax / accumulation errors dominate the comparison; fp32 inside
-  the ref keeps the diff focused on the kernel's intermediate casts and
-  is the same convention used by ``test_batch_prefill.py``,
-  ``aiter/test_mha_common.py::attention_ref(upcast=True)`` etc.
-* Why are ``kv_indptr`` / ``kv_indices`` cast to int64 in the ref? Only
-  for the PyTorch ``index_select`` call -- the API requires Long. The
-  kernel's ABI still consumes int32 indices on the GPU side; the cast
-  happens entirely on CPU/GPU but on the ref path only.
+Each case uses one shared Q/KV/CSR input and compares the applicable
+implementations: OPUS (bf16/fp16 or split fp8), gfx1250 MLA asm (split fp8),
+and the portable Triton kernel. Pytest runs correctness coverage; the CLI also
+supports benchmark and explicit CSR-boundary sweeps.
 """
 
 from __future__ import annotations
@@ -56,18 +15,22 @@ import argparse
 import itertools
 import math
 import os
-import sys
 
 import pandas as pd
 import pytest
 import torch
+import triton
 
 import aiter  # noqa: F401  (registers the top-level export)
+from aiter.ops.mla_sparse_prefill import mla_sparse_prefill_fp8_asm
 from aiter.ops.pa_sparse_prefill_opus import (
     pa_sparse_prefill_fp8_opus,
     pa_sparse_prefill_opus,
 )
-from aiter.test_common import benchmark, checkAllclose, perftest
+from aiter.ops.triton._triton_kernels.attention.sparse_attention_dsv4 import (
+    _sparse_attn_prefill_kernel,
+)
+from aiter.test_common import benchmark, checkAllclose, perftest, run_perftest
 
 # ---------------------------------------------------------------------------
 # Skip helpers
@@ -191,7 +154,6 @@ _FP8_D_HEAD = _FP8_D_NOPE + _FP8_D_ROPE  # 512
 _FP8_NBLK = _FP8_D_NOPE // 32  # 14
 _FP8_BLK = 32
 _FP8_MAX = 448.0  # e4m3fn max normal
-_FP8_KV_TILE_SIZE = 64  # KV_TILE_SIZE of the fp8 16mx1_16nx4 kernel
 
 
 def _quantize_nope(real: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -267,29 +229,31 @@ def _ref_pa_sparse_prefill_fp8(
 # CSR index generators
 # ---------------------------------------------------------------------------
 
-# Must match the KV_TILE_SIZE template default in
-# csrc/include/pa_sparse_prefill_opus.h. The kernel inner loop advances the
-# K/V dimension in chunks of this size, so the trailing-tile branches (full /
-# half / over-tile) are most likely to break when nnz_per_row sits at one of
-# these boundary values.
-_KV_TILE_SIZE = 32
+# Cover the KV tile sizes used by the OPUS and asm candidates. The kernel inner
+# loop advances the K/V dimension in chunks of these sizes, so the trailing-tile
+# branches are most likely to break when nnz_per_row sits at one of these
+# boundary values.
+_CSR_TILE_SIZES = (32, 64)
 
 
-def _boundary_nnz(kv_tile_size: int, total_rows: int) -> list:
+def _boundary_nnz(kv_tile_sizes, total_rows: int) -> list:
     """Tile-boundary nnz values seeded into the leading rows of a sparse CSR,
     mirroring gcnasm/opus_attn/sparse_paged_attn/pa_host.cc::
     init_sparse_kv_indices. Clamped into [0, total_rows]."""
-    cands = [
-        0,
-        1,
-        kv_tile_size - 1,
-        kv_tile_size,
-        kv_tile_size + 1,
-        2 * kv_tile_size,
-        2 * kv_tile_size + 1,
-        total_rows,
-    ]
-    return [max(0, min(v, total_rows)) for v in cands]
+    if isinstance(kv_tile_sizes, int):
+        kv_tile_sizes = (kv_tile_sizes,)
+    cands = {0, 1, total_rows}
+    for tile_size in kv_tile_sizes:
+        cands.update(
+            (
+                tile_size - 1,
+                tile_size,
+                tile_size + 1,
+                2 * tile_size,
+                2 * tile_size + 1,
+            )
+        )
+    return [max(0, min(v, total_rows)) for v in sorted(cands)]
 
 
 def _random_csr(
@@ -297,7 +261,7 @@ def _random_csr(
     total_rows: int,
     *,
     allow_empty: bool = True,
-    kv_tile_size: int = _KV_TILE_SIZE,
+    kv_tile_size=_CSR_TILE_SIZES,
     device: torch.device,
     seed: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -368,126 +332,62 @@ def _empty_csr(n: int, *, device: torch.device) -> tuple[torch.Tensor, torch.Ten
 _MODES = ("sparse", "dense", "empty")
 
 
-def _make_inputs(
+def _fixed_csr(n: int, nnz: int, total_rows: int, *, device):
+    """CSR with exactly ``nnz`` entries on every row."""
+    if nnz == 0:
+        return _empty_csr(n, device=device)
+    indptr = torch.arange(n + 1, dtype=torch.int32, device=device) * nnz
+    indices = (
+        torch.arange(nnz, dtype=torch.int32, device=device) % max(total_rows, 1)
+    ).repeat(n)
+    return indptr, indices
+
+
+def _make_sparse_case(
     n: int,
     h: int,
     d: int,
     total_pages: int,
     total_tokens: int,
-    dtype: torch.dtype,
     *,
     mode: str = "sparse",
+    nnz_prefix: int | None = None,
+    nnz_extend: int | None = None,
     device: torch.device | str = "cuda",
     seed: int = 0,
 ) -> dict:
-    assert mode in _MODES
-    torch.manual_seed(seed)
+    """Generate one logical sparse-attention problem shared by all candidates."""
+    assert mode in _MODES or mode == "fixed"
     device = torch.device(device)
-
-    q = (torch.randn(n, h, d, device=device, dtype=torch.float32) * 0.5).to(dtype)
-    unified_kv = (
-        torch.randn(total_pages, d, device=device, dtype=torch.float32) * 0.5
-    ).to(dtype)
-    kv = (torch.randn(total_tokens, d, device=device, dtype=torch.float32) * 0.5).to(
-        dtype
+    gen = torch.Generator(device=device)
+    gen.manual_seed(seed)
+    q_fp32 = torch.randn(n, h, d, device=device, generator=gen) * 0.5
+    unified_kv_fp32 = (
+        torch.randn(total_pages, d, device=device, generator=gen) * 0.5
     )
-    attn_sink = torch.randn(h, device=device, dtype=torch.float32) * 0.25
+    kv_fp32 = torch.randn(total_tokens, d, device=device, generator=gen) * 0.5
+    attn_sink = torch.randn(h, device=device, generator=gen) * 0.25
 
-    def _csr(total_rows: int, seed_offset: int):
+    def _csr(total_rows: int, nnz: int | None, seed_offset: int):
+        if nnz is not None:
+            return _fixed_csr(n, nnz, total_rows, device=device)
         if mode == "sparse":
             return _random_csr(
                 n,
                 total_rows,
                 device=device,
+                kv_tile_size=_CSR_TILE_SIZES,
                 seed=seed * 2 + seed_offset,
             )
         if mode == "dense":
             return _dense_csr(n, total_rows, device=device)
         return _empty_csr(n, device=device)
 
-    ip_p, ix_p = _csr(total_pages, 1)
-    ip_e, ix_e = _csr(total_tokens, 2)
-
+    ip_p, ix_p = _csr(total_pages, nnz_prefix, 1)
+    ip_e, ix_e = _csr(total_tokens, nnz_extend, 2)
     return {
-        "q": q,
-        "unified_kv": unified_kv,
-        "kv_indices_prefix": ix_p,
-        "kv_indptr_prefix": ip_p,
-        "kv": kv,
-        "kv_indices_extend": ix_e,
-        "kv_indptr_extend": ip_e,
-        "attn_sink": attn_sink,
-    }
-
-
-def _make_inputs_fp8(
-    n: int,
-    h: int,
-    total_pages: int,
-    total_tokens: int,
-    *,
-    mode: str = "sparse",
-    device: torch.device | str = "cuda",
-    seed: int = 0,
-) -> dict:
-    """Build split NoPE-fp8 / RoPE-bf16 inputs plus the matching fp32
-    reference rows. Returns ``{"kernel": ..., "ref": ...}`` where ``kernel``
-    holds the tensors passed to ``pa_sparse_prefill_fp8_opus`` and ``ref``
-    holds the dequantized ``*_fp32`` rows passed to ``_ref_pa_sparse_prefill_fp8``.
-    """
-    assert mode in _MODES
-    torch.manual_seed(seed)
-    device = torch.device(device)
-
-    def _streams(rows: int):
-        nope_fp8, deq = _quantize_nope(
-            torch.randn(rows, _FP8_D_NOPE, device=device) * 0.5
-        )
-        rope = (torch.randn(rows, _FP8_D_ROPE, device=device) * 0.5).to(torch.bfloat16)
-        row_fp32 = torch.cat([deq, rope.to(torch.float32)], dim=1)  # [rows, 512]
-        return nope_fp8, rope, row_fp32
-
-    qn, qr, q_fp32 = _streams(n * h)
-    qn = qn.reshape(n, h, _FP8_D_NOPE_PADDED)
-    qr = qr.reshape(n, h, _FP8_D_ROPE)
-    q_fp32 = q_fp32.reshape(n, h, _FP8_D_HEAD)
-    ukn, ukr, ukv_fp32 = _streams(total_pages)
-    kn, kr, kv_fp32 = _streams(total_tokens)
-
-    attn_sink = torch.randn(h, device=device, dtype=torch.float32) * 0.25
-
-    def _csr(total_rows: int, seed_offset: int):
-        if mode == "sparse":
-            return _random_csr(
-                n,
-                total_rows,
-                device=device,
-                kv_tile_size=_FP8_KV_TILE_SIZE,
-                seed=seed * 2 + seed_offset,
-            )
-        if mode == "dense":
-            return _dense_csr(n, total_rows, device=device)
-        return _empty_csr(n, device=device)
-
-    ip_p, ix_p = _csr(total_pages, 1)
-    ip_e, ix_e = _csr(total_tokens, 2)
-
-    kernel = {
-        "q_nope": qn,
-        "q_rope": qr,
-        "unified_kv_nope": ukn,
-        "unified_kv_rope": ukr,
-        "kv_indices_prefix": ix_p,
-        "kv_indptr_prefix": ip_p,
-        "kv_nope": kn,
-        "kv_rope": kr,
-        "kv_indices_extend": ix_e,
-        "kv_indptr_extend": ip_e,
-        "attn_sink": attn_sink,
-    }
-    ref = {
         "q_fp32": q_fp32,
-        "ukv_fp32": ukv_fp32,
+        "unified_kv_fp32": unified_kv_fp32,
         "kv_fp32": kv_fp32,
         "kv_indices_prefix": ix_p,
         "kv_indptr_prefix": ip_p,
@@ -495,7 +395,120 @@ def _make_inputs_fp8(
         "kv_indptr_extend": ip_e,
         "attn_sink": attn_sink,
     }
-    return {"kernel": kernel, "ref": ref}
+
+
+def _make_single_inputs(case: dict, dtype: torch.dtype) -> dict:
+    return {
+        "q": case["q_fp32"].to(dtype),
+        "unified_kv": case["unified_kv_fp32"].to(dtype),
+        "kv_indices_prefix": case["kv_indices_prefix"],
+        "kv_indptr_prefix": case["kv_indptr_prefix"],
+        "kv": case["kv_fp32"].to(dtype),
+        "kv_indices_extend": case["kv_indices_extend"],
+        "kv_indptr_extend": case["kv_indptr_extend"],
+        "attn_sink": case["attn_sink"],
+    }
+
+
+def _make_split_inputs(case: dict) -> dict:
+    def split_rows(rows: torch.Tensor):
+        flat = rows.reshape(-1, _FP8_D_HEAD)
+        nope, deq = _quantize_nope(flat[:, :_FP8_D_NOPE])
+        rope = flat[:, _FP8_D_NOPE :].to(torch.bfloat16)
+        return nope, rope, torch.cat([deq, rope.to(torch.float32)], dim=1)
+
+    qn, qr, q_fp32 = split_rows(case["q_fp32"])
+    ukn, ukr, ukv_fp32 = split_rows(case["unified_kv_fp32"])
+    kn, kr, kv_fp32 = split_rows(case["kv_fp32"])
+    n, h, _ = case["q_fp32"].shape
+    return {
+        "kernel": {
+            "q_nope": qn.reshape(n, h, _FP8_D_NOPE_PADDED),
+            "q_rope": qr.reshape(n, h, _FP8_D_ROPE),
+            "unified_kv_nope": ukn,
+            "unified_kv_rope": ukr,
+            "kv_indices_prefix": case["kv_indices_prefix"],
+            "kv_indptr_prefix": case["kv_indptr_prefix"],
+            "kv_nope": kn,
+            "kv_rope": kr,
+            "kv_indices_extend": case["kv_indices_extend"],
+            "kv_indptr_extend": case["kv_indptr_extend"],
+            "attn_sink": case["attn_sink"],
+        },
+        "ref": {
+            "q_fp32": q_fp32.reshape(n, h, _FP8_D_HEAD),
+            "ukv_fp32": ukv_fp32,
+            "kv_fp32": kv_fp32,
+            "kv_indices_prefix": case["kv_indices_prefix"],
+            "kv_indptr_prefix": case["kv_indptr_prefix"],
+            "kv_indices_extend": case["kv_indices_extend"],
+            "kv_indptr_extend": case["kv_indptr_extend"],
+            "attn_sink": case["attn_sink"],
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
+# Portable Triton candidate.
+# ---------------------------------------------------------------------------
+
+_ASM_HEADS = 128
+_ERR_TOL = 0.05
+
+
+def _merge_two_sources(ukv, kv, ix_p, ip_p, ix_e, ip_e):
+    """Merge the two CSR sources for the portable Triton candidate."""
+    total_pages = ukv.shape[0]
+    pool = torch.cat([ukv, kv], dim=0)
+    lens_p = (ip_p[1:] - ip_p[:-1]).to(torch.int64)
+    lens_e = (ip_e[1:] - ip_e[:-1]).to(torch.int64)
+    indptr = torch.zeros(ip_p.numel(), dtype=torch.int32, device=ukv.device)
+    indptr[1:] = torch.cumsum(lens_p + lens_e, 0).to(torch.int32)
+    parts = []
+    pp = ip_p.to(torch.int64).tolist()
+    pe = ip_e.to(torch.int64).tolist()
+    for i in range(len(pp) - 1):
+        parts.append(ix_p[pp[i] : pp[i + 1]])
+        parts.append(ix_e[pe[i] : pe[i + 1]] + total_pages)
+    indices = (
+        torch.cat(parts).to(torch.int32)
+        if parts
+        else torch.zeros(0, dtype=torch.int32, device=ukv.device)
+    )
+    return pool, indices, indptr
+
+
+def _run_triton(q, pool, indices, indptr, attn_sink, softmax_scale):
+    """Run the portable Triton sparse-prefill candidate."""
+    out = torch.empty_like(q)
+    num_queries, num_heads, head_dim = q.shape
+
+    def grid(META):
+        return (num_queries, triton.cdiv(num_heads, META["BLOCK_H"]))
+
+    _sparse_attn_prefill_kernel[grid](
+        q,
+        pool,
+        indices,
+        indptr,
+        attn_sink,
+        out,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        pool.stride(0),
+        pool.stride(1),
+        out.stride(0),
+        out.stride(1),
+        out.stride(2),
+        num_heads,
+        head_dim,
+        pool.shape[0],
+        softmax_scale,
+        HAS_ATTN_SINK=True,
+        BLOCK_D=triton.next_power_of_2(head_dim),
+    )
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -528,14 +541,14 @@ def _get_tolerances(prec: str) -> tuple[float, float]:
 
 
 # ---------------------------------------------------------------------------
-# Single-case driver -- both pytest and CLI go through this.
+# Single-case driver -- all candidates share this one logical input case.
 # `@benchmark()` collects the kwargs into a row dict and merges in whatever
 # this function returns, so the CLI can build a pandas DataFrame.
 # ---------------------------------------------------------------------------
 
 
 @benchmark()
-def run_pa_sparse_prefill_opus(
+def run_sparse_prefill(
     n: int,
     h: int,
     d: int,
@@ -544,6 +557,8 @@ def run_pa_sparse_prefill_opus(
     prec: str,
     *,
     mode: str = "sparse",
+    nnz_prefix: int | None = None,
+    nnz_extend: int | None = None,
     seed: int = 0,
     verify: bool = True,
     bench: bool = True,
@@ -558,46 +573,126 @@ def run_pa_sparse_prefill_opus(
         f"prec={prec} mode={mode}]"
     )
 
+    case = _make_sparse_case(
+        n,
+        h,
+        d,
+        total_pages,
+        total_tokens,
+        mode=mode,
+        nnz_prefix=nnz_prefix,
+        nnz_extend=nnz_extend,
+        seed=seed,
+    )
+    nnz_p = int(case["kv_indices_prefix"].numel())
+    nnz_e = int(case["kv_indices_extend"].numel())
+    total_nnz = nnz_p + nnz_e
+    candidates = []
+
     if prec == "fp8":
-        data = _make_inputs_fp8(n, h, total_pages, total_tokens, mode=mode, seed=seed)
-        kernel_inputs = data["kernel"]
-        kernel_fn = pa_sparse_prefill_fp8_opus
-        ref_fn, ref_inputs = _ref_pa_sparse_prefill_fp8, data["ref"]
+        split = _make_split_inputs(case)
+        candidates.append(
+            (
+                "opus",
+                lambda: pa_sparse_prefill_fp8_opus(
+                    **split["kernel"], softmax_scale=softmax_scale
+                ),
+                _ref_pa_sparse_prefill_fp8(
+                    **split["ref"], softmax_scale=softmax_scale
+                ),
+                "fp8",
+                1,
+            )
+        )
     else:
-        kernel_inputs = _make_inputs(
-            n,
-            h,
-            d,
-            total_pages,
-            total_tokens,
-            _PREC_TO_DTYPE[prec],
-            mode=mode,
-            seed=seed,
+        single = _make_single_inputs(case, _PREC_TO_DTYPE[prec])
+        candidates.append(
+            (
+                "opus",
+                lambda: pa_sparse_prefill_opus(
+                    **single, softmax_scale=softmax_scale
+                ),
+                _ref_pa_sparse_prefill_opus(
+                    **single, softmax_scale=softmax_scale
+                ),
+                prec,
+                torch.tensor([], dtype=_PREC_TO_DTYPE[prec]).element_size(),
+            )
         )
-        kernel_fn = pa_sparse_prefill_opus
-        ref_fn, ref_inputs = _ref_pa_sparse_prefill_opus, kernel_inputs
 
-    nnz_p = int(kernel_inputs["kv_indices_prefix"].numel())
-    nnz_e = int(kernel_inputs["kv_indices_extend"].numel())
+    bf16_inputs = _make_single_inputs(case, torch.bfloat16)
+    pool, merged_indices, merged_indptr = _merge_two_sources(
+        bf16_inputs["unified_kv"],
+        bf16_inputs["kv"],
+        case["kv_indices_prefix"],
+        case["kv_indptr_prefix"],
+        case["kv_indices_extend"],
+        case["kv_indptr_extend"],
+    )
+    triton_ref = _ref_pa_sparse_prefill_opus(
+        **bf16_inputs, softmax_scale=softmax_scale
+    )
+    candidates.append(
+        (
+            "triton",
+            lambda: _run_triton(
+                bf16_inputs["q"],
+                pool,
+                merged_indices,
+                merged_indptr,
+                case["attn_sink"],
+                softmax_scale,
+            ),
+            triton_ref,
+            "bf16",
+            2,
+        )
+    )
+
+    if h == _ASM_HEADS and _get_gpu_arch() == "gfx1250":
+        split = _make_split_inputs(case)
+        candidates.append(
+            (
+                "asm",
+                lambda: mla_sparse_prefill_fp8_asm(
+                    **split["kernel"], softmax_scale=softmax_scale
+                ),
+                split["ref"],
+                "fp8",
+                1,
+            )
+        )
+
     row: dict = {"nnz_prefix": nnz_p, "nnz_extend": nnz_e}
+    for name, invoke, ref, candidate_prec, kv_esz in candidates:
+        if verify:
+            rtol, atol = _get_tolerances(candidate_prec)
+            err = checkAllclose(
+                invoke(),
+                ref,
+                rtol=rtol,
+                atol=atol,
+                tol_err_ratio=_ERR_TOL,
+                msg=f"{name}: {msg}",
+            )
+            row[f"{name} err"] = err
 
-    if verify:
-        ref = ref_fn(**ref_inputs, softmax_scale=softmax_scale)
-        got = kernel_fn(**kernel_inputs, softmax_scale=softmax_scale)
-        rtol, atol = _get_tolerances(prec)
-        checkAllclose(got, ref, rtol=rtol, atol=atol, msg=msg)
-
-    if bench:
-        # `@perftest()` returns (data, avg_us_per_iter).
-        _, lat_us = _profile_func(
-            kernel_fn, **kernel_inputs, softmax_scale=softmax_scale
-        )
-        # Sparse attention FLOPS: 4 * H * total_nnz * D
-        total_nnz = nnz_p + nnz_e
-        flops = 4.0 * h * total_nnz * d
-        tflops = flops / max(lat_us * 1e-6, 1e-12) / 1e12
-        row["latency_us"] = round(float(lat_us), 2)
-        row["TFLOPS"] = round(float(tflops), 2)
+        if bench:
+            _, lat_us = _profile_func(invoke)
+            flops = 4.0 * h * total_nnz * d
+            tflops = flops / max(lat_us * 1e-6, 1e-12) / 1e12
+            row[f"{name} us"] = round(float(lat_us), 2)
+            row[f"{name} TFLOPS"] = round(float(tflops), 2)
+            row[f"{name} TB/s"] = round(
+                (
+                    n * h * d * kv_esz
+                    + total_nnz * d * kv_esz
+                    + n * h * d * 2
+                )
+                / max(lat_us, 1e-12)
+                / 1e6,
+                2,
+            )
 
     return row
 
@@ -625,9 +720,9 @@ _PYTEST_MODES = ["sparse", "dense", "empty"]
     ids=lambda v: "x".join(map(str, v)) if isinstance(v, tuple) else str(v),
 )
 @pytest.mark.parametrize("mode", _PYTEST_MODES)
-def test_pa_sparse_prefill_opus(prec, n, h, total_pages, total_tokens, mode):
+def test_pa_sparse_prefill(prec, n, h, total_pages, total_tokens, mode):
     # bench=False keeps pytest fast; CLI path does the timing.
-    run_pa_sparse_prefill_opus(
+    run_sparse_prefill(
         n=n,
         h=h,
         d=512,
@@ -649,8 +744,8 @@ def test_pa_sparse_prefill_opus(prec, n, h, total_pages, total_tokens, mode):
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description=(
-        "pa_sparse_prefill_opus correctness + benchmark driver.\n"
-        "All list arguments are swept via itertools.product."
+        "PA OPUS and gfx1250 asm MLA sparse-prefill correctness + benchmark "
+        "driver.\nAll list arguments are swept via itertools.product."
     ),
 )
 parser.add_argument(
@@ -734,6 +829,33 @@ parser.add_argument(
     default=0,
     help="RNG seed for input + CSR generation",
 )
+parser.add_argument(
+    "--nnz",
+    type=int,
+    nargs="*",
+    default=[],
+    help="explicit per-row nnz values for the shared boundary sweep",
+)
+parser.add_argument(
+    "--nnz-prefix",
+    type=int,
+    nargs="*",
+    default=[],
+    help="explicit per-row prefix nnz values for the shared shape sweep",
+)
+parser.add_argument(
+    "--nnz-extend",
+    type=int,
+    nargs="*",
+    default=[],
+    help="explicit per-row extend nnz values for the shared shape sweep",
+)
+parser.add_argument(
+    "--pool",
+    type=int,
+    default=4096,
+    help="prefix/extend pool rows for explicit CSR sweeps",
+)
 
 
 if __name__ == "__main__":
@@ -750,7 +872,7 @@ if __name__ == "__main__":
         # 0 is the sentinel for "mirror -n" on a per-sweep-point basis.
         total_pages = pages_arg if pages_arg > 0 else n
         total_tokens = args.total_tokens if args.total_tokens is not None else n
-        row = run_pa_sparse_prefill_opus(
+        row = run_sparse_prefill(
             n=n,
             h=h,
             d=args.head_dim,
@@ -765,13 +887,59 @@ if __name__ == "__main__":
         if row:
             rows.append(row)
 
+    if args.nnz:
+        pool = max(args.pool, max(args.nnz))
+        for n, h, prec, nnz in itertools.product(
+            args.n_tokens, args.h_q, args.prec, args.nnz
+        ):
+            for npx, nex in ((nnz, 0), (0, nnz), (nnz, nnz)):
+                row = run_sparse_prefill(
+                    n=n,
+                    h=h,
+                    d=args.head_dim,
+                    total_pages=pool,
+                    total_tokens=pool,
+                    prec=prec,
+                    mode="fixed",
+                    nnz_prefix=npx,
+                    nnz_extend=nex,
+                    seed=args.seed,
+                    verify=not args.no_verify,
+                    bench=not args.no_bench,
+                )
+                if row:
+                    rows.append(row)
+
+    if args.nnz_prefix and args.nnz_extend:
+        pool = max(args.pool, max(args.nnz_prefix), max(args.nnz_extend))
+        for n, h, prec, npx, nex in itertools.product(
+            args.n_tokens,
+            args.h_q,
+            args.prec,
+            args.nnz_prefix,
+            args.nnz_extend,
+        ):
+            row = run_sparse_prefill(
+                n=n,
+                h=h,
+                d=args.head_dim,
+                total_pages=pool,
+                total_tokens=pool,
+                prec=prec,
+                mode="fixed",
+                nnz_prefix=npx,
+                nnz_extend=nex,
+                seed=args.seed,
+                verify=not args.no_verify,
+                bench=not args.no_bench,
+            )
+            if row:
+                rows.append(row)
+
     if rows:
         df = pd.DataFrame(rows)
-        # Drop columns that don't carry signal in the default sweep.
         drop_cols = [c for c in ("verify", "bench", "seed") if c in df.columns]
         if drop_cols:
             df = df.drop(columns=drop_cols)
         print()
         print(df.to_string(index=False))
-        sys.exit(0)
-    sys.exit(0)
