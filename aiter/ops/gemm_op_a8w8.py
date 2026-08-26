@@ -1310,6 +1310,23 @@ def gemm_a8w8_mxfp8(
     scales. Kernel auto-selected from M/N/K unless ``kernelName`` is given."""
     M = A.shape[0]
     N = B.shape[0]
+    K = A.shape[1]
+    if dtype != dtypes.bf16:
+        raise NotImplementedError(
+            f"gfx1250 a8w8 MXFP8 GEMM: unsupported output dtype {dtype}"
+        )
+    if K % 128 != 0:  # A (m/2,k/128) preshuffle
+        raise NotImplementedError(
+            f"gfx1250 a8w8 MXFP8 GEMM requires K%128==0, got K={K}"
+        )
+    if N % 16 != 0:  # B 16x16 preshuffle
+        raise NotImplementedError(
+            f"gfx1250 a8w8 MXFP8 GEMM requires N%16==0, got N={N}"
+        )
+    if a_preshuffle and M % 2 != 0:  # A (m/2,k/128) preshuffle
+        raise NotImplementedError(
+            f"gfx1250 a8w8 MXFP8 GEMM a_preshuffle requires M%2==0, got M={M}"
+        )
     out = torch.empty((M, N), dtype=dtype, device=A.device)
     _mxfp8_mxfp8_gemm_asm(
         A,

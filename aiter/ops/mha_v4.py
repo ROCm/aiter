@@ -17,7 +17,6 @@ from torch import Tensor
 from aiter import dtypes
 from aiter.jit.core import compile_ops
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.quant import rotate_activation
 from aiter.ops.triton._triton_kernels.quant.sage_attention_quant import (
     mha_v4_per_tensor_amax_kernel,
     mha_v4_per_tensor_quant_kernel,
@@ -44,6 +43,11 @@ MHA_V4_PER_TENSOR_BLOCK_SIZE = 8192
 def mha_v4_q_multiplier(softmax_scale: float) -> float:
     """Return the Q multiplier expected by the MX attention quantizers."""
     return softmax_scale * MHA_V4_LOG2E
+
+
+@compile_ops("module_fmha_v4_fwd")
+def rotate_activation_hd128(out: Tensor, input: Tensor) -> None:
+    """Apply normalized Walsh-Hadamard rotation to contiguous hd128 rows."""
 
 
 @compile_ops("module_fmha_v4_fwd")
@@ -138,6 +142,7 @@ class AttentionScaleMode(IntEnum):
 _FP8_FORMATS = (AttentionFormat.FP8_E4M3, AttentionFormat.FP8_E4M3_FNUZ)
 _MX_FORMATS = (AttentionFormat.FP6_E2M3, AttentionFormat.FP4_E2M1)
 _PACKED_QK_WIDTH = {
+    AttentionFormat.BF16: 128,
     AttentionFormat.INT8: 128,
     AttentionFormat.FP8_E4M3: 128,
     AttentionFormat.FP8_E4M3_FNUZ: 128,
@@ -176,6 +181,10 @@ def _validate_format_contract(
         )
     if q_format != k_format:
         raise ValueError("MHA v4 currently requires matching Q and K formats")
+    if q_format == AttentionFormat.BF16:
+        if v_format != AttentionFormat.BF16:
+            raise ValueError("BF16 Q/K currently requires BF16 V")
+        return
     if q_format not in _PACKED_QK_WIDTH:
         raise ValueError(f"unsupported Q/K format: {q_format!r}")
     if v_format not in (
@@ -200,6 +209,12 @@ def scale_modes_for_formats(
 ) -> tuple[AttentionScaleMode, AttentionScaleMode, AttentionScaleMode]:
     """Return the canonical Q, K, and V scale modes for a format recipe."""
     _validate_format_contract(q_format, k_format, v_format)
+    if q_format == AttentionFormat.BF16:
+        return (
+            AttentionScaleMode.NONE,
+            AttentionScaleMode.NONE,
+            AttentionScaleMode.NONE,
+        )
     if q_format == AttentionFormat.INT8 or q_format in _FP8_FORMATS:
         v_scale_mode = (
             AttentionScaleMode.F32_PER_TENSOR
@@ -380,10 +395,14 @@ def mha_v4_packed(
         raise ValueError("Q, K, and V must have the same batch size")
     if k.shape[1] != v.shape[1] or k.shape[2] != v.shape[2]:
         raise ValueError("K and V must have matching sequence and head dimensions")
-    if query_heads != k.shape[2]:
-        raise ValueError(
-            "MHA v4 initially supports MHA only; Q and KV heads must match"
-        )
+    kv_heads = k.shape[2]
+    if kv_heads == 0:
+        raise ValueError("MHA v4 requires non-empty KV heads")
+    if query_heads % kv_heads != 0:
+        raise ValueError("MHA v4 requires query heads to be divisible by KV heads")
+    gqa_ratio = query_heads // kv_heads
+    if gqa_ratio > 16 or gqa_ratio & (gqa_ratio - 1):
+        raise ValueError("MHA v4 supports power-of-two GQA ratios up to 16")
     if not q.is_cuda or not k.is_cuda or not v.is_cuda:
         raise ValueError("MHA v4 expects GPU tensors")
     if q.device != k.device or q.device != v.device:
@@ -508,7 +527,7 @@ def quantize_fp8_rotated(input: Tensor) -> tuple[Tensor, Tensor]:
     if input.shape[-1] != 128 or not input.is_contiguous():
         raise ValueError("rotated FP8 quantization requires contiguous hd128 input")
     rotated = torch.empty_like(input)
-    rotate_activation(rotated, input)
+    rotate_activation_hd128(rotated, input)
     return quantize_fp8(rotated)
 
 
@@ -902,6 +921,73 @@ def _launch_mxfp6_fake(
     del out
 
 
+def _validate_mha_v4_raw_inputs(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    out: Optional[Tensor],  # noqa: UP045
+    operation: str,
+) -> Tensor:
+    if q.dim() != 4 or k.dim() != 4 or v.dim() != 4:
+        raise ValueError(f"{operation} expects BSHD Q, K, and V tensors")
+    if (
+        q.dtype != torch.bfloat16
+        or k.dtype != torch.bfloat16
+        or v.dtype != torch.bfloat16
+    ):
+        raise ValueError(f"{operation} currently expects BF16 Q, K, and V inputs")
+    if q.shape[-1] != 128 or k.shape[-1] != 128 or v.shape[-1] != 128:
+        raise ValueError(f"{operation} currently supports head dimension 128 only")
+    if not q.is_contiguous() or not k.is_contiguous() or not v.is_contiguous():
+        raise ValueError(f"{operation} currently requires contiguous BSHD inputs")
+    if out is None:
+        return torch.empty_like(q, dtype=torch.bfloat16)
+    if out.shape != q.shape or out.dtype != torch.bfloat16 or out.device != q.device:
+        raise ValueError("out must match Q's shape/device and have BF16 dtype")
+    return out
+
+
+def mha_v4_mxfp8(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    softmax_scale: Optional[float] = None,  # noqa: UP045
+    out: Optional[Tensor] = None,  # noqa: UP045
+    return_lse: bool = False,
+) -> Tensor:
+    """Quantize BF16 BSHD Q/K to MXFP8 and V to per-tensor FP8.
+
+    K and V may have fewer heads than Q for GQA. The Q-to-KV head ratio must
+    be a power of two no greater than 16; output retains Q's head count.
+    """
+    if return_lse:
+        raise NotImplementedError("MHA v4 kernels do not produce LSE yet")
+    out = _validate_mha_v4_raw_inputs(q, k, v, out, "mha_v4_mxfp8")
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** -0.5
+
+    fp8_format = native_fp8_format()
+    q_quantized, q_descale = quantize_mxfp8_q(q, mha_v4_q_multiplier(softmax_scale))
+    k_quantized, k_descale = quantize_mxfp8_k(k)
+    v_quantized, v_descale = quantize_fp8(v)
+    return mha_v4_packed(
+        q_quantized,
+        k_quantized,
+        v_quantized,
+        q_descale,
+        k_descale,
+        v_descale,
+        fp8_format,
+        fp8_format,
+        fp8_format,
+        AttentionScaleMode.E8M0_PER_1X32,
+        AttentionScaleMode.E8M0_PER_1X32,
+        AttentionScaleMode.F32_PER_TENSOR,
+        softmax_scale=softmax_scale,
+        out=out,
+    )
+
+
 def mha_v4(
     q: Tensor,
     k: Tensor,
@@ -917,29 +1003,33 @@ def mha_v4(
 
     Q and K formats must match. The selected Q/K/V recipe determines canonical
     quantizers, scale modes, and the packed ASM row; output is BF16 BSHD.
+    K and V may have fewer heads than Q for GQA. The Q-to-KV head ratio must
+    be a power of two no greater than 16; output retains Q's head count.
     """
     if return_lse:
         raise NotImplementedError("MHA v4 kernels do not produce LSE yet")
-    if q.dim() != 4 or k.dim() != 4 or v.dim() != 4:
-        raise ValueError("mha_v4 expects BSHD Q, K, and V tensors")
-    if (
-        q.dtype != torch.bfloat16
-        or k.dtype != torch.bfloat16
-        or v.dtype != torch.bfloat16
-    ):
-        raise ValueError("mha_v4 currently expects BF16 Q, K, and V inputs")
-    if q.shape[-1] != 128 or k.shape[-1] != 128 or v.shape[-1] != 128:
-        raise ValueError("mha_v4 currently supports head dimension 128 only")
+    out = _validate_mha_v4_raw_inputs(q, k, v, out, "mha_v4")
     q_scale_mode, k_scale_mode, v_scale_mode = scale_modes_for_formats(
         q_format, k_format, v_format
     )
-    if not q.is_contiguous() or not k.is_contiguous() or not v.is_contiguous():
-        raise ValueError("mha_v4 currently requires contiguous BSHD inputs")
-    if out is None:
-        out = torch.empty_like(q, dtype=torch.bfloat16)
-    elif out.shape != q.shape or out.dtype != torch.bfloat16 or out.device != q.device:
-        raise ValueError("out must match Q's shape/device and have BF16 dtype")
 
+    if q_format == AttentionFormat.BF16:
+        return mha_v4_packed(
+            q,
+            k,
+            v,
+            q,
+            k,
+            v,
+            q_format,
+            k_format,
+            v_format,
+            q_scale_mode,
+            k_scale_mode,
+            v_scale_mode,
+            softmax_scale=softmax_scale,
+            out=out,
+        )
     if q_format == AttentionFormat.INT8 and _is_fp8_format(v_format):
         q_quantized, q_descale = quantize_int8(q)
         k_quantized, k_descale = quantize_int8(k)
@@ -948,9 +1038,8 @@ def mha_v4(
         q_format,
         AttentionFormat.MXFP6,
     ):
-        quantize_qk = quantize_fp8 if _is_fp8_format(v_format) else quantize_fp8_rotated
-        q_quantized, q_descale = quantize_qk(q)
-        k_quantized, k_descale = quantize_qk(k)
+        q_quantized, q_descale = quantize_fp8_rotated(q)
+        k_quantized, k_descale = quantize_fp8_rotated(k)
         if _is_fp8_format(v_format):
             v_quantized, v_descale = quantize_fp8(v)
         else:
