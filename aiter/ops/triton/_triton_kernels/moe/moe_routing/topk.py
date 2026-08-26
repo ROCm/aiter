@@ -261,9 +261,7 @@ def _topk(
 
     # normalize selected values
     if APPLY_SOFTMAX:
-        y_values = tl.softmax(y_values.to(tl.float32), dim=1, keep_dims=True).to(
-            x_dtype
-        )
+        y_values = tl.softmax(y_values.to(tl.float32), dim=1).to(x_dtype)
     elif APPLY_RENORM:
         y_f = tl.where(real_mask, y_values.to(tl.float32), 0.0)
         s = tl.sum(y_f, axis=1, keep_dims=True)
