@@ -1,32 +1,52 @@
 ---
 name: review-pr
-description: AI code review for aiter and FlyDSL PRs. Catches perf regressions, silent correctness bugs, dispatch gate holes, and AI-generated code patterns. Invoke with a PR number (optionally owner/repo#N); works through fetch → semantic understanding → rule checklist → verdict. For kernel PRs it consumes validate-kernel-pr's validation_report.json as evidence. Add new rules here as patterns emerge from real reviews.
-argument-hint: <PR number> [owner/repo]
+description: Advisory AI code review for aiter and FlyDSL PRs. Catches perf regressions, silent correctness bugs, dispatch gate holes, and AI-generated code patterns, but never acts as a merge gate. Invoke with a PR number (optionally owner/repo#N) and an explicit validation report path; deterministic validation is reported separately.
+argument-hint: <PR number> [owner/repo] [validation-report]
 ---
 
-# aiter PR Review
+# aiter PR Review — advisory tier
+
+This skill supplies hints to a human reviewer. Its judgement is stochastic and never blocks a
+merge. Only a reproducible blocker from an explicitly supplied, head-matched
+`validation_report.json` may be used as a deterministic gate.
 
 ---
 
 ## Step 1 — Fetch
 
 ```bash
+set -euo pipefail
+
 # Per-invocation scratch dir. Fixed /tmp paths collide: two reviews running at once
 # overwrite each other's pr.diff between the write and the read, and the second review
 # silently analyses the first one's diff under its own PR number. Observed.
 WORK=$(mktemp -d /tmp/review-pr-XXXXXX)
+PROJECT_ROOT=$(git rev-parse --show-toplevel) || {
+  echo "review-pr must run inside the repository that owns .claude/skills" >&2
+  exit 1
+}
+SKILLS_ROOT="$PROJECT_ROOT/.claude/skills"
 
 PR=$1  # PR number from skill argument
 # Second argument, or a PR given as owner/repo#N, selects the repository. FlyDSL kernels
 # are reviewed from their own repo, so this must not be hard-coded to aiter.
 REPO="${2:-ROCm/aiter}"
-case "$1" in */*#*) REPO="${1%#*}"; PR="${1##*#}";; esac
+VALIDATION_REPORT="${3:-}"
+case "$1" in
+  */*#*)
+    REPO="${1%#*}"
+    PR="${1##*#}"
+    VALIDATION_REPORT="${2:-}"
+    ;;
+esac
 
 # Full metadata
-gh pr view $PR --repo $REPO --json title,body,number,labels,files,author,reviews,comments > "$WORK/pr_meta.json"
+gh pr view "$PR" --repo "$REPO" \
+  --json title,body,number,labels,files,author,reviews,comments,baseRefOid,headRefOid \
+  > "$WORK/pr_meta.json"
 
 # Diff
-gh pr diff $PR --repo $REPO > "$WORK/pr.diff"
+gh pr diff "$PR" --repo "$REPO" > "$WORK/pr.diff"
 
 # Linked issue (extract from body "fix: #NNN" or "close #NNN")
 ISSUE=$(cat "$WORK/pr_meta.json" | python3 -c "
@@ -35,7 +55,7 @@ body = json.load(sys.stdin).get('body','') or ''
 m = re.search(r'(?:fix|close|resolve)[s]?[: ]*#(\d+)', body, re.I)
 print(m.group(1) if m else '')
 ")
-[ -n "$ISSUE" ] && gh issue view $ISSUE --repo $REPO --json title,body > "$WORK/pr_issue.json"
+[ -n "$ISSUE" ] && gh issue view "$ISSUE" --repo "$REPO" --json title,body > "$WORK/pr_issue.json"
 
 # Prior reviewer comments (top-level)
 cat "$WORK/pr_meta.json" | python3 -c "
@@ -54,20 +74,124 @@ for c in d.get('comments',[]):
 # Step 5 asks for mid-checklist does not happen: in a 14-PR controlled run the revised D9 text
 # caught 0 of 3 known overflow defects and no run invoked the scanner at all. Put the candidate
 # list in context before the rule pass instead of relying on the reviewer to remember it.
-SCAN=.claude/skills/validate-kernel-pr/scan_index_width.py
-[ -x "$SCAN" ] && "$SCAN" --diff "$WORK/pr.diff"
+SCAN="$SKILLS_ROOT/validate-kernel-pr/scan_index_width.py"
+if [ ! -x "$SCAN" ]; then
+  echo "required scanner is missing or not executable: $SCAN" >&2
+  exit 1
+fi
+if ! "$SCAN" --diff "$WORK/pr.diff"; then
+  echo "required index-width scan failed; do not report an empty candidate list" >&2
+  exit 1
+fi
 # The candidates above cannot be judged without deployment scale, and the scale facts are
 # useless 400 lines away from them -- print both together.
-cat .claude/skills/validate-kernel-pr/production_scale.md 2>/dev/null
-# FlyDSL repos only: legacy spellings, and tests this PR adds that `python3 <file>` never runs.
-S3=.claude/skills/downstream-impact-check/scan_downstream_consumers.py
-[ -x "$S3" ] && "$S3" --diff "$WORK/pr.diff" --aiter . 2>/dev/null
+SCALE="$SKILLS_ROOT/validate-kernel-pr/production_scale.md"
+if [ ! -r "$SCALE" ]; then
+  echo "required production-scale evidence is missing: $SCALE" >&2
+  exit 1
+fi
+cat "$SCALE"
 
-for S2 in .claude/skills/review-flydsl-kernel/scan_legacy_spelling.py \
-          .claude/skills/review-flydsl-kernel/scan_unreachable_tests.py; do
-  [ -x "$S2" ] || continue
-  case "$S2" in *unreachable*) "$S2" --diff "$WORK/pr.diff" . ;; *) "$S2" --diff "$WORK/pr.diff" ;; esac
-done
+# Validation is opt-in and explicit. Never auto-load ./validation_report.json: a stale report
+# from another PR is worse than no report. Reject reports that do not name this exact head.
+if [ -n "$VALIDATION_REPORT" ]; then
+  python3 - "$WORK/pr_meta.json" "$WORK/pr.diff" \
+    "$VALIDATION_REPORT" "$WORK/validation_report.json" <<'PY'
+import hashlib
+import json
+import pathlib
+import sys
+
+meta_path, diff_path, report_path, out_path = map(pathlib.Path, sys.argv[1:])
+meta = json.loads(meta_path.read_text())
+report = json.loads(report_path.read_text())
+expected_head = meta["headRefOid"]
+actual_head = report.get("repo", {}).get("head")
+if actual_head != expected_head:
+    raise SystemExit(
+        "validation report is stale or for another checkout: "
+        f"expected head {expected_head}, got {actual_head}"
+    )
+expected_base = meta["baseRefOid"]
+actual_base = report.get("repo", {}).get("base")
+if actual_base != expected_base:
+    raise SystemExit(
+        "validation report used a stale merge base: "
+        f"expected {expected_base}, got {actual_base}"
+    )
+expected_patch = hashlib.sha256(diff_path.read_bytes()).hexdigest()
+actual_patch = report.get("repo", {}).get("patch_sha256")
+if actual_patch != expected_patch:
+    raise SystemExit(
+        "validation report patch does not match the current PR diff: "
+        f"expected {expected_patch}, got {actual_patch}"
+    )
+required_stages = {
+    "merge_sim",
+    "gpu_claim",
+    "runtime_compat",
+    "test_policy",
+    "baseline_control",
+    "correctness_repo_tests",
+    "correctness_s1_grid",
+    "index_width_scan",
+}
+missing = required_stages - report.get("stages", {}).keys()
+if missing:
+    raise SystemExit(f"validation report omits required stages: {sorted(missing)}")
+for name in required_stages:
+    stage = report["stages"][name]
+    if not isinstance(stage, dict) or stage.get("status") not in {
+        "pass",
+        "fail",
+        "skip",
+        "info",
+    }:
+        raise SystemExit(f"validation stage {name} is malformed: {stage!r}")
+if report.get("verdict") not in {"PASS", "NEEDS_WORK", "BLOCK", "INCONCLUSIVE"}:
+    raise SystemExit(f"validation report has an invalid verdict: {report.get('verdict')!r}")
+selection = report.get("test_selection", {})
+if not selection.get("pytest_target"):
+    raise SystemExit("validation report does not name the pytest target it selected")
+severities = {
+    finding.get("severity")
+    for finding in report.get("findings", [])
+    if isinstance(finding, dict)
+}
+complete = (
+    report["stages"]["merge_sim"]["status"] == "pass"
+    and report["stages"]["gpu_claim"]["status"] == "pass"
+    and report["stages"]["runtime_compat"]["status"] == "pass"
+    and report["stages"]["test_policy"]["status"] == "pass"
+    and report["stages"]["baseline_control"]["status"] == "pass"
+    and report["stages"]["correctness_repo_tests"]["status"] == "pass"
+    and report["stages"]["correctness_s1_grid"]["status"] == "pass"
+    and report["stages"]["index_width_scan"]["status"] == "info"
+)
+expected_verdict = (
+    "BLOCK"
+    if "blocker" in severities
+    else "NEEDS_WORK"
+    if "should-fix" in severities
+    else "PASS"
+    if complete
+    else "INCONCLUSIVE"
+)
+if report["verdict"] != expected_verdict:
+    raise SystemExit(
+        "validation verdict contradicts its stages/findings: "
+        f"expected {expected_verdict}, got {report['verdict']}"
+    )
+out_path.write_text(json.dumps(report, indent=2) + "\n")
+print(
+    f"validation report accepted for head {expected_head}; "
+    f"target={selection['pytest_target']}; "
+    f"grid={selection.get('grid') or 'not configured'}"
+)
+PY
+else
+  echo "validation report not supplied: this is a static-only advisory review"
+fi
 
 # Inline review comments (line-level code comments — often more specific than top-level)
 gh api "repos/$REPO/pulls/$PR/comments" | python3 -c "
@@ -140,7 +264,7 @@ Check which type(s) apply; these determine which Step 5 categories are mandatory
 - [ ] **Perf / benchmark PR** → P1 (numbers with units), P5 (setup cost excluded?), P2 (production shapes), P3 (reproducible)
 - [ ] **Test / benchmark only** → P2 (production shapes), HK6 (aiter-op-test format)
 - [ ] **Async / multi-stream** → G1 (stream sync missing), G1b (blocking queue.get without timeout in serving code)
-- [ ] **FlyDSL kernel** → D10 (compile result called?), D10b (arith.unwrap() before arith.bitcast?), and **require a `validation_report.json`** — load `validate-kernel-pr` and treat its stages as the evidence base. A FlyDSL/Triton kernel PR reviewed without one is `[static-only review]` (see Step 8); its own green test suite is not evidence, because a suite whose non-aligned shapes are commented out passes on an out-of-bounds tail store.
+- [ ] **FlyDSL kernel** → D10 (compile result called?), D10b (arith.unwrap() before arith.bitcast?). If an exact-head `validation_report.json` was supplied, use its deterministic stages as evidence. Otherwise mark the result `[static-only advisory review]` (see Step 8) and make no runtime clearance claim; absence of a report is not itself a blocker.
 - [ ] **New if/elif dispatch with variable assignment** → D1b (UnboundLocalError on uninitialized path)
 - [ ] **Change to behavior/dispatch of a downstream-consumed op** (mla / fused_moe / attention / mha / quant / gemm_op_a8w8 / moe_op / jit-core) → E4 (is downstream CI triggered or skipped?), E5 (stable-API owner sign-off)
 - [ ] **New `@compile_ops` / `torch.library.custom_op`, or change to an op's return dtype/arity** → D7 (fake/abstract impl exists?), D6 (fake dtype/shape matches real op?)
@@ -217,9 +341,11 @@ For **Tier 2** files (fused_moe, mha, attention, gemm, mla, tuned_gemm, quant):
 
 ## Step 5 — Rule Checklist
 
-Six failure categories — work all six in order. Severity per finding: 🔴 block / ⚠️ should fix / 📝 note.
+Six failure categories — work all six in order. Advisory severity per finding:
+🔴 high risk / ⚠️ should fix / 📝 note. These labels prioritize human attention; they do not
+themselves gate a merge.
 
-**🔴 gate — before firing any 🔴, write down the concrete input that triggers it.** Name the specific shape / scale / dtype / arch / value that makes the finding fire (e.g. "at `token_id` > 16M with H=32, D=128 the int32 product exceeds 2^31", or "when `arch=='gfx1250'` with fp4 input the branch assumes fp8"). If you cannot state a concrete triggering case, the 🔴 is unproven — **downgrade to ⚠️ ("worth checking") or drop it.** A 🔴 that reads as a definite blocker but names no demonstrable triggering input is exactly how a false positive lands on a maintainer's PR. This gate applies to every rule below — including those whose own text omits an explicit FP self-check (e.g. D9): the same index expression is safe in a capped/small-batch kernel and unsafe only at a scale you must actually exhibit.
+**🔴 evidence threshold — before firing any 🔴, write down the concrete input that triggers it.** Name the specific shape / scale / dtype / arch / value that makes the finding fire (e.g. "at `token_id` > 16M with H=32, D=128 the int32 product exceeds 2^31", or "when `arch=='gfx1250'` with fp4 input the branch assumes fp8"). If you cannot state a concrete triggering case, the 🔴 is unproven — **downgrade to ⚠️ ("worth checking") or drop it.** A 🔴 that reads as a definite defect but names no demonstrable triggering input is exactly how a false positive lands on a maintainer's PR. This threshold applies to every rule below — including those whose own text omits an explicit FP self-check (e.g. D9): the same index expression is safe in a capped/small-batch kernel and unsafe only at a scale you must actually exhibit.
 
 | Category | Core question | Key triggers |
 |---|---|---|
@@ -616,18 +742,19 @@ If the answer is yes, add it to the findings. If the answer is no, proceed.
 - Output ONLY the card below. Nothing before it, nothing after it.
 - If there are no findings, the findings section is omitted entirely.
 - "What it does" must be one sentence, written for a reviewer who hasn't read the diff.
-- **At most 5 findings, ordered most-severe first.** Rank by (severity, then blast radius), keep the top 5, and drop the rest — do not append them as a tail. A maintainer reads a 5-item card; a 12-item card is skimmed, and the 🔴 at position 9 is the one that gets missed. Measured: this skill averaged 7.1 findings per PR over a 14-PR backtest, and removing everything judged noise still left 5.4.
+- **At most 5 findings, ordered most-severe first.** Rank by (severity, then blast radius), keep the top 5, and drop the rest — do not append them as a tail. This is a readability limit, not a measured recall claim; no committed replay corpus currently establishes recall@5.
 - **State the validation evidence** on the line under the verdict:
-  - with a report: `Validation: <verdict> — <arch> runtime, <arch> compile-only` plus the stages that failed.
-  - without one: `Validation: [static-only review] — no validation_report.json`. Then no finding may assert runtime behaviour (perf, accuracy, launch failure) as fact; such findings are `[inferred]` and phrased as questions.
+  - with an accepted exact-head report: `Validation (deterministic): <verdict>` plus selected pytest target, runtime arch, and failed/skipped stages.
+  - without one: `Validation (deterministic): NOT RUN — no exact-head validation_report.json`. Then no finding may assert runtime behaviour (perf, accuracy, launch failure) as fact; such findings are `[inferred]` and phrased as questions.
+- The review line is always advisory. `🔴 HIGH RISK` requests human attention; it is not a merge gate. A deterministic `Validation: BLOCK` may gate because its reproducer is in the report.
 
 ```
 ## [repo] PR #NNN — [title]
 
 **[One sentence: what this PR does, in plain terms.]**
 
-[✅ LGTM | ⚠️ NEEDS WORK | 🔴 BLOCK]
-Validation: [PASS/NEEDS WORK/BLOCK — gfx950 runtime, gfx942 compile-only | [static-only review] — no validation_report.json]
+Review (advisory): [✅ NO FINDINGS | ⚠️ NEEDS WORK | 🔴 HIGH RISK]
+Validation (deterministic): [PASS/NEEDS_WORK/BLOCK/INCONCLUSIVE — target, exact runtime, and skipped-stage evidence | NOT RUN — no exact-head validation_report.json]
 
 🔴 [specific finding — what, where, why it matters]
 ⚠️ [specific finding]
