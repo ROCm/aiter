@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""AOT pre-compile for the FlyDSL mxmoe a4w4 MoE port (gemm1 / gemm2).
+"""AOT pre-compile for FlyDSL mxmoe and layout-v2 GEMM2 kernels.
 
-Parses the flydsl_mxmoe_* port rows from the fp4 tuned CSVs and warms the FlyDSL
-disk cache via the same runtime entry points, keyed identically so inference
-hits the cache.
+Parses flydsl_mxmoe_* and flydsl_moe2_layout_* rows from the existing model
+configs plus the active FMoE CSV, and warms the FlyDSL disk cache via the same
+runtime entry points, keyed identically so inference hits the cache.
 
 Standalone:
     python -m aiter.aot.flydsl.mxfp4_moe [--csv /path/to/foo_fp4_tuned_fmoe.csv]
@@ -19,7 +19,7 @@ import sys
 import time
 
 from aiter.aot.flydsl.common import collect_aot_jobs, compile_only_env, override_env
-from aiter.jit.core import AITER_ROOT_DIR
+from aiter.jit.core import AITER_CONFIGS, AITER_ROOT_DIR
 
 _MODEL_CONFIG_DIR = f"{AITER_ROOT_DIR}/aiter/configs/model_configs"
 # moe.py defers every ``flydsl_moe2_layout_`` name to this module, so a CSV the
@@ -29,6 +29,9 @@ DEFAULT_CSVS = sorted(
     | set(glob.glob(f"{_MODEL_CONFIG_DIR}/*_a4w4_tuned_fmoe.csv"))
     | set(glob.glob(f"{_MODEL_CONFIG_DIR}/*_a8w4_tuned_fmoe.csv"))
 )
+_ACTIVE_FMOE_CSV = AITER_CONFIGS.AITER_CONFIG_FMOE_FILE
+if os.path.exists(_ACTIVE_FMOE_CSV) and _ACTIVE_FMOE_CSV not in DEFAULT_CSVS:
+    DEFAULT_CSVS.append(_ACTIVE_FMOE_CSV)
 
 # Mirror the runtime gate so the default build skips the opt-in mxfp4-out path.
 _MXFP4_INTERMEDIATE = os.environ.get("AITER_MXFP4_INTERMEDIATE", "0") not in ("0", "")
@@ -48,12 +51,15 @@ def _job_key(job: dict) -> tuple:
             job["epilog"],
             job["D_INTER"],
             job["N_OUT"],
+            job["a_dtype"],
+            job["b_dtype"],
             job["topk"] if job["epilog"] == "reduce" else 1,
             job["SBM"],
             job["persist"],
             job["cu_num"] if job["persist"] else 0,
             job["has_pad"],
             job["out_dtype"],
+            job.get("enable_bias", False),
             job.get("g2_spart"),
             job.get("g2_bf16_lds"),
         )
@@ -147,35 +153,44 @@ def parse_csv(csv_path: str):
                     if v2_g2["epilog"] == "reduce" and _STAGE2_FP8_ROUTE_OUT
                     else "bf16"
                 )
-                _add(
-                    {
-                        "stage": 2,
-                        "v2_stage2": True,
-                        "kernel_name": kn2,
-                        "BM": bm,
-                        "BN": v2_g2["tile_n"],
-                        "BK": v2_g2["tile_k"],
-                        "use_nt": v2_g2["use_nt"],
-                        "NE": expert,
-                        "N_OUT": model_dim,
-                        "epilog": v2_g2["epilog"],
-                        "D_INTER": v2_d_inter,
-                        "D_INTER_REAL": v2_d_inter_real,
-                        "topk": topk,
-                        "SBM": v2_g2["sort_block_m"] or bm,
-                        "persist": v2_g2["persist"],
-                        "cu_num": int(row.get("cu_num", "0") or "0"),
-                        "a_dtype": v2_g2["a_dtype"],
-                        "inter_dim_pad": inter_dim_pad,
-                        "model_dim_pad": model_dim_pad,
-                        "has_pad": inter_dim_pad > 0 or model_dim_pad > 0,
-                        "out_dtype": out_dtype,
-                        # In the compiled kernel tag: must match the runtime
-                        # wrapper or the AOT entry is keyed differently.
-                        "g2_spart": v2_g2["spart"],
-                        "g2_bf16_lds": v2_g2["bf16_lds"],
-                    }
+                bias_supported = (
+                    row.get("q_type", "").strip().split(".")[-1] == "per_1x32"
+                    and row.get("dtype", "") in ("torch.bfloat16", "torch.float16")
+                    and "float4_e2m1fn_x2" in row.get("q_dtype_w", "")
                 )
+                enable_bias_options = [False, True] if bias_supported else [False]
+                for enable_bias in enable_bias_options:
+                    _add(
+                        {
+                            "stage": 2,
+                            "v2_stage2": True,
+                            "kernel_name": kn2,
+                            "BM": bm,
+                            "BN": v2_g2["tile_n"],
+                            "BK": v2_g2["tile_k"],
+                            "use_nt": v2_g2["use_nt"],
+                            "NE": expert,
+                            "N_OUT": model_dim,
+                            "epilog": v2_g2["epilog"],
+                            "D_INTER": v2_d_inter,
+                            "D_INTER_REAL": v2_d_inter_real,
+                            "topk": topk,
+                            "SBM": v2_g2["sort_block_m"] or bm,
+                            "persist": v2_g2["persist"],
+                            "cu_num": int(row.get("cu_num", "0") or "0"),
+                            "a_dtype": v2_g2["a_dtype"],
+                            "b_dtype": v2_g2["b_dtype"],
+                            "inter_dim_pad": inter_dim_pad,
+                            "model_dim_pad": model_dim_pad,
+                            "has_pad": inter_dim_pad > 0 or model_dim_pad > 0,
+                            "out_dtype": out_dtype,
+                            "enable_bias": enable_bias,
+                            # In the compiled kernel tag: must match the runtime
+                            # wrapper or the AOT entry is keyed differently.
+                            "g2_spart": v2_g2["spart"],
+                            "g2_bf16_lds": v2_g2["bf16_lds"],
+                        }
+                    )
             elif _is_mxfp4_kname(kn2):
                 p2 = _parse_mxfp4_g2_kname(kn2)
                 if p2["mxfp4out"] and not _MXFP4_INTERMEDIATE:
@@ -277,6 +292,7 @@ def _compile_v2_stage2(job):
     from aiter.ops.flydsl.kernels.mxmoe_dispatcher import mxfp4_moe_gemm2
 
     d = _dummy()
+    bias = _dummy(max(256, job["NE"] * job["N_OUT"] * 4))
     max_sorted = job["BM"]
     if job["persist"]:
         max_sorted = max(max_sorted, job["cu_num"] * job["BM"])
@@ -323,6 +339,7 @@ def _compile_v2_stage2(job):
         BK=job["BK"],
         use_nt=job["use_nt"],
         a_dtype=job["a_dtype"],
+        b_dtype=job["b_dtype"],
         epilog=job["epilog"],
         SBM=job["SBM"],
         persist=job["persist"],
@@ -333,6 +350,7 @@ def _compile_v2_stage2(job):
         out_dtype=job["out_dtype"],
         g2_spart=job.get("g2_spart"),
         g2_bf16_lds=job.get("g2_bf16_lds"),
+        bias=bias if job.get("enable_bias", False) else None,
         stream=0,
     )
     if job["epilog"] == "reduce":
@@ -383,7 +401,7 @@ def compile_one_config(**job):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="AOT pre-compile FlyDSL mxmoe a4w4 MoE port kernels from fp4 tuned CSVs",
+        description="AOT pre-compile FlyDSL mxmoe/layout-v2 kernels from tuned FMoE CSVs",
         formatter_class=argparse.RawTextHelpFormatter,
     )
     parser.add_argument(
@@ -391,7 +409,7 @@ def main():
         type=str,
         nargs="+",
         default=DEFAULT_CSVS,
-        help="Path(s) to fp4 tuned CSV(s); default: all *_fp4_tuned_fmoe.csv",
+        help="Path(s) to tuned FMoE CSVs; default: existing model configs plus active merged FMoE config",
     )
     args = parser.parse_args()
 

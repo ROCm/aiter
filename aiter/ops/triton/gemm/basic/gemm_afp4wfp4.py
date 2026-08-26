@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+
 import torch
 import triton
 
@@ -433,11 +434,23 @@ def gemm_afp4wfp4_preshuffle(
 
     Args:
         x (torch.Tensor): FP4 E2M1 input matrix with shape (M, K//2).
-        w (torch.Tensor): FP4 E2M1 weight matrix with shape (N//16, K*16), internally transposed.
-        x_scales (torch.Tensor): E8M0 per-group scale for x with shape (M//32, K) if M >= 32 otherwise (M, K//32).
-            One scale per 32 elements in K dimension.
-        w_scales (torch.Tensor): E8M0 per-group scale for w with shape (M//32, K).
-            One scale per 32 elements in K dimension.
+        w (torch.Tensor): FP4 E2M1 weight matrix with shape (N//16, K*16),
+            preshuffled via aiter.ops.shuffle.shuffle_weight_gfx1250 (or
+            equivalently shuffle_weight(layout=(16, 16)) reshaped to
+            (N//16, K*16) — both produce the same bytes). Internally transposed.
+        x_scales (torch.Tensor): E8M0 per-group scale for x, one scale per 32
+            elements in K. For M >= 32: preshuffled via
+            aiter.ops.shuffle.shuffle_scale (identical layout on gfx950 and
+            gfx1250), then viewed as one row per 32-row stripe, i.e.
+            (M_pad//32, (K//32)*32) where M_pad = M rounded up to a multiple
+            of 256. shuffle_scale returns the buffer flat as
+            (M_pad, K//32), so the caller owns the reshape:
+            ``s = shuffle_scale(x_scales); s.view(-1, s.shape[-1] * 32)``
+            (take the shape off the shuffled tensor -- shuffle_scale pads both
+            dims). For M < 32: un-shuffled (M, K//32) row-major.
+        w_scales (torch.Tensor): E8M0 per-group scale for w, one scale per 32
+            elements in K: same shuffle_scale + stripe view as x_scales,
+            i.e. (N_pad//32, (K//32)*32). Always shuffled, including M < 32.
         dtype (Optional[torch.dtype]): Output datatype (BF16 or FP16).
         y (Optional[torch.Tensor]): Pre-allocated output tensor with shape (M, N).
         config (Optional[dict]): Kernel tuning parameters (BLOCK_SIZE_M, BLOCK_SIZE_N,
@@ -458,8 +471,12 @@ def gemm_afp4wfp4_preshuffle(
 
     if config is None:
         # _get_config doubles K itself (logical K = 2 * K_bytes) — pass bytes,
-        # matching the non-preshuffled path.
-        config, _ = _get_config(M, N, K_bytes, True)
+        # matching the non-preshuffled path. The two backends take disjoint
+        # params (gluon: NUM_BUFFERS, triton: NUM_KSPLIT/GROUP_SIZE_M/...), so
+        # the config must come from the dir of the backend we actually launch.
+        config, _ = _get_config(
+            M, N, K_bytes, True, backend="gluon" if use_gluon else "triton"
+        )
 
     config["BLOCK_SIZE_N"] = max(config["BLOCK_SIZE_N"], 32)
     if M < 32:
@@ -470,6 +487,19 @@ def gemm_afp4wfp4_preshuffle(
         assert (
             config["BLOCK_SIZE_M"] >= 32
         ), "for M >= 32, BLOCK_SIZE_M must be 32 or more as x_scale are assumed to be preshuffled"
+
+    # shuffle_scale pads K//32 up to a multiple of 8 (its k-chunk), but the
+    # kernels bound the scale reads at (K//32)*32 columns per stripe row. A
+    # k-chunk interleaves its 8 k-groups across all 256 of its bytes, so a
+    # bound that lands mid-chunk silently masks *real* k-groups to zero rather
+    # than only the padding -- e.g. K=896 loses k-groups 26 and 27. Require
+    # whole k-chunks. w_scales are always preshuffled, so this holds for M < 32
+    # too, where x_scales themselves are un-shuffled.
+    assert K_elems % 256 == 0, (
+        f"preshuffled scales require K % 256 == 0 (K//32 a multiple of 8), got K={K_elems}. "
+        "shuffle_scale pads K//32 to a multiple of 8 and the kernels cannot mask a "
+        "partial k-chunk"
+    )
 
     if use_gluon:
         from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_mxfp4 import (
@@ -501,13 +531,6 @@ def gemm_afp4wfp4_preshuffle(
             config["BLOCK_SIZE_K"],
         )
 
-        # Kernel consumes preshuffled scales directly for M >= 32 (address math
-        # inverts the shuffle in registers) and un-shuffled (M, K // 32) scales for M < 32
-        if M < 32:
-            assert x_scales.shape[-1] == K_elems // 32 and x_scales.stride(-1) == 1, (
-                "x_scales must be un-shuffled (M, K // 32) K-contiguous for "
-                f"M < 32, got shape {tuple(x_scales.shape)}"
-            )
         _gluon_gemm_mxfp4_preshuffle_gfx1250[grid](
             x_fp4,
             w_preshuf,
