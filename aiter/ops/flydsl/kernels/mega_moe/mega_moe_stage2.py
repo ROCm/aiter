@@ -34,7 +34,7 @@ _BUFFER_OFFSET_ABI_BYTES = 1 << 31
 
 
 class _Stage2KernelSpec:
-    __slots__ = ("kernel", "block_n")
+    __slots__ = ("block_n", "kernel")
 
     def __init__(self, kernel, block_n):
         self.kernel = kernel

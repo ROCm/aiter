@@ -18,10 +18,10 @@ from .dispatch import (
     DispatchSlot,
     emit_direct_fixed_slot_finalize,
     emit_direct_fixed_slot_payload,
-    emit_expand_payload_tile,
     emit_dispatch_group,
     emit_dispatch_payload,
     emit_dispatch_plan,
+    emit_expand_payload_tile,
     emit_unique_payload,
 )
 from .gemm1 import _LdsF32View, build_fused_gemm1
@@ -40,7 +40,7 @@ _ENTRY_COUNT_SHARDS = 16
 
 
 class _Stage1KernelSpec:
-    __slots__ = ("kernel", "grid_x", "block_x", "waves_per_eu_hint")
+    __slots__ = ("block_x", "grid_x", "kernel", "waves_per_eu_hint")
 
     def __init__(self, kernel, grid_x, block_x, waves_per_eu_hint):
         self.kernel = kernel
@@ -521,7 +521,9 @@ def compile_mega_moe_stage1(
                         payload_tile_ready=payload_tile_ready,
                         deduplicate_payload=False,
                     )
-        if const_expr(direct_fixed_slot):
+        # Keep the compile-time fixed-slot branch separate from the device-side
+        # owner predicate; FlyDSL lowers them through different control-flow paths.
+        if const_expr(direct_fixed_slot):  # noqa: SIM102
             if compact_owner:
                 emit_direct_fixed_slot_finalize(
                     fz_npes=fz_npes, fz_epr=fz_epr, fz_cap=fz_cap, fz_mtpr=fz_mtpr, fz_rank=fz_rank,

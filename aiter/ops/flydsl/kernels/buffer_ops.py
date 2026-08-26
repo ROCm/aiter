@@ -37,7 +37,6 @@ from flydsl._mlir.extras import types as T
 from flydsl.expr.meta import dsl_loc_tracing
 from flydsl.runtime.device import is_rdna_arch
 
-
 # FlyDSL changed raw buffer cache policy from an i32 operand to an enum
 # attribute. Keep this vendored compatibility layer usable with both forms.
 _RAW_PTR_BUFFER_AUX_IS_ATTRIBUTE = (

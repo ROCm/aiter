@@ -7,14 +7,14 @@ import pytest
 
 os.environ.setdefault("AITER_AOT_IMPORT", "1")
 
+from aiter.aot.flydsl.mega_moe import default_jobs
 from aiter.ops.flydsl.kernels.mega_moe.mega_moe_config import (
+    TOKEN_BUCKETS,
     Stage2BundleKey,
     Stage2Config,
-    TOKEN_BUCKETS,
     build_mega_moe_bundle_plan,
     select_mega_moe_config,
 )
-from aiter.aot.flydsl.mega_moe import default_jobs
 
 
 def test_mtpr8192_bundle_deduplicates_expected_variants():
