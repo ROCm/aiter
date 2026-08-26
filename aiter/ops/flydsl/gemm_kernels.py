@@ -977,6 +977,10 @@ def _get_compile_fn():
 # those bounds keeps one allocation per stream instead of one per (m, n, tile,
 # k_split): a shape-keyed cache both grows without limit and can evict a buffer
 # whose address a captured CUDA graph still holds.
+# Mirrors preshuffle_gemm.PRESHUFFLE_M_MAX. Kept as a literal here because this
+# module must import without FlyDSL present; the kernel asserts they agree.
+PRESHUFFLE_M_MAX = 65536
+
 PRESHUFFLE_SPLIT_K_MAX_TILES = 256
 PRESHUFFLE_SPLIT_K_MAX_TILE_ELEMS = 32 * 128
 PRESHUFFLE_SPLIT_K_WORKSPACE_ELEMS = (
@@ -1042,6 +1046,11 @@ def flydsl_preshuffle_gemm_a8(
     m, k = XQ.shape[0], XQ.shape[-1]
     n = WQ.shape[0]
 
+    if m > PRESHUFFLE_M_MAX:
+        raise RuntimeError(
+            f"[FlyDSL] M ({m}) exceeds {PRESHUFFLE_M_MAX}; the preshuffle kernel "
+            f"views A and C through a layout bounded by that many rows."
+        )
     if n % tile_n != 0:
         raise RuntimeError(
             f"[FlyDSL] N ({n}) is not a multiple of tile_n ({tile_n}). "

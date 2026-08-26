@@ -119,6 +119,10 @@ def _get_preload(tile_m, tile_n, tile_k):
     )
 
 
+# A/C are viewed through a layout with this many rows, so M must stay under it.
+# gemm_kernels mirrors this value to guard on the host without importing FlyDSL.
+PRESHUFFLE_M_MAX = 65536
+
 # 4 f32 in is one dwordx4, 4 bf16 out is one dwordx2.
 _REDUCE_VEC = 4
 
@@ -321,7 +325,7 @@ def compile_preshuffle_gemm(
             c_tensor = fx.Tensor(
                 fx.make_view(
                     fx.add_offset(fx.get_iter(arg_c), c_split_offset),
-                    fx.make_layout((65536, N), (N, 1)),
+                    fx.make_layout((PRESHUFFLE_M_MAX, N), (N, 1)),
                 )
             )
         gC = fx.rocdl.make_buffer_tensor(
@@ -404,7 +408,9 @@ def compile_preshuffle_gemm(
             # OOB rows as 0 instead of faulting past the allocation.
             gA_flat = fx.rocdl.make_buffer_tensor(
                 fx.Tensor(
-                    fx.make_view(fx.get_iter(arg_a), fx.make_layout(65536 * K, 1))
+                    fx.make_view(
+                        fx.get_iter(arg_a), fx.make_layout(PRESHUFFLE_M_MAX * K, 1)
+                    )
                 ),
                 max_size=False,
                 num_records_bytes=fx.Int64(i32_m) * fx.Int64(K) * fx.Int64(elem_bytes),
@@ -961,7 +967,7 @@ def compile_preshuffle_gemm(
         )
 
         # Reshape A and C to 2D
-        M_max = 65536
+        M_max = PRESHUFFLE_M_MAX
         arg_a_2d = fx.Tensor(
             fx.make_view(fx.get_iter(arg_a), fx.make_layout((M_max, K), (K, 1)))
         )
