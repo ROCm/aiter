@@ -39,11 +39,18 @@ from aiter.ops.triton.utils.types import e4m3_dtype
 
 # Max NUM_SEGMENTS the gluon reduce holds in-thread; larger split counts fall back to the Triton reduce_segments.
 _GLUON_REDUCE_MAX_SEGMENTS = 8
+_MAX_2D_KV_TOKENS = 512
 
 DEVICE_ARCH = arch_info.get_arch()
 IS_DEVICE_ARCH_GFX12 = DEVICE_ARCH in ("gfx1250",)
 WARP_SIZE = 32 if IS_DEVICE_ARCH_GFX12 else 64
 WAPR_SIZE_LOG2 = int(math.log2(WARP_SIZE))
+
+
+def _active_kv_length(max_seqlen_k, sliding_window):
+    if sliding_window is not None and sliding_window > 0:
+        return min(sliding_window, max_seqlen_k)
+    return max_seqlen_k
 
 
 def is_gfx950_small_head(head_size):
@@ -169,6 +176,9 @@ def select_3d_config(
     SLIDING_WINDOW: int | None = None,
 ):
     arch = get_arch()
+    # Size split-KV launches for the data that can contribute to the result,
+    # rather than for expired tokens outside a sliding window.
+    active_seqlen_k = _active_kv_length(max_seqlen_k, SLIDING_WINDOW)
     reduce_num_warps = 2
     attn_warps = 2
     waves_per_eu = 2
@@ -204,14 +214,11 @@ def select_3d_config(
             # GFX12 fallback
             waves_per_eu = 1
 
-        if SLIDING_WINDOW is not None and SLIDING_WINDOW > 0:
-            num_segments = 1
-        else:
-            occ = waves_per_eu * 4 // attn_warps
-            MAX_SEGMENTS = max(1, math.ceil(max_seqlen_k / TILE_SIZE))
-            num_segments = max(1, target_num_prgms // 4 * occ // max(1, num_2d_prgms))
-            num_segments = min(MAX_SEGMENTS, num_segments)
-            num_segments = triton.next_power_of_2(num_segments)
+        occ = waves_per_eu * 4 // attn_warps
+        MAX_SEGMENTS = max(1, math.ceil(active_seqlen_k / TILE_SIZE))
+        num_segments = max(1, target_num_prgms // 4 * occ // max(1, num_2d_prgms))
+        num_segments = min(MAX_SEGMENTS, num_segments)
+        num_segments = triton.next_power_of_2(num_segments)
 
         # # this section increases the num_warps if the occ is too high
         # total_num_wg = num_2d_prgms * num_segments
@@ -243,7 +250,7 @@ def select_3d_config(
             # same de-vectorization fix as the 2D path
             TILE_SIZE = 64
 
-        MAX_SEGMENTS = min(128, math.ceil(max_seqlen_k / TILE_SIZE))
+        MAX_SEGMENTS = min(128, math.ceil(active_seqlen_k / TILE_SIZE))
         # the >= 8 floor would clamp the smaller splits (4 and 2) back up to 8
         MIN_SEGMENTS = 1 if wide_lds_copy else min(8, MAX_SEGMENTS)
         if head_size >= 512 and not arch.is_rdna:
@@ -314,22 +321,57 @@ def use_2d_kernel(
     head_size,
     sliding_window,
     all_decode,
-    max_seqlen_q,
     max_seqlen_k,
     target_num_prgms,
     num_2d_prgms,
 ):
-    # if IS_DEVICE_ARCH_GFX12, always use 3D if all_decode and 2D otherwise
+    arch = get_arch()
+    active_seqlen_k = _active_kv_length(max_seqlen_k, sliding_window)
+
+    # The live-window 3-D path adds parallelism without scanning expired KV
+    # tiles. Apply the same workload rule as full-context decode, independent
+    # of head size or GPU architecture.
+    if (
+        all_decode
+        and active_seqlen_k > _MAX_2D_KV_TOKENS
+        and num_2d_prgms <= target_num_prgms
+    ):
+        return False
+
+    # Preserve gfx1250's existing choices for non-window decode and for the
+    # short or already-parallel sliding-window cases not handled above.
     if IS_DEVICE_ARCH_GFX12:
         return (sliding_window > 0) or (not all_decode)
 
-    if head_size >= 512 and not get_arch().is_rdna and not all_decode:
+    if head_size >= 512 and not arch.is_rdna and not all_decode:
         return True
 
     return (
         (sliding_window > 0)
-        or (max_seqlen_k <= 512)
+        or (max_seqlen_k <= _MAX_2D_KV_TOKENS)
         or (num_2d_prgms > target_num_prgms)
+    )
+
+
+def is_3d_gluon_available(q_dtype, kv_cache_dtype, shuffled_kv_cache, sliding_window):
+    """Return whether the gfx12 Gluon producer supports this 3-D workload.
+
+    The 2-D/3-D choice remains workload-based. Once 3-D is selected, use the
+    existing gfx12 Gluon producer for shuffled caches and unshuffled FP8
+    live-window decode; the generic Triton FP8 producer is not reliable for the
+    latter on gfx12.
+    """
+    return (
+        IS_DEVICE_ARCH_GFX12
+        and _unified_attention_gluon_kernel_3d is not None
+        and (
+            shuffled_kv_cache
+            or (
+                sliding_window > 0
+                and q_dtype == e4m3_dtype
+                and kv_cache_dtype == e4m3_dtype
+            )
+        )
     )
 
 
@@ -440,7 +482,6 @@ def unified_attention(
         head_size,
         SLIDING_WINDOW,
         ALL_DECODE,
-        max_seqlen_q,
         max_seqlen_k,
         target_num_prgms,
         num_2d_prgms,
@@ -590,7 +631,9 @@ def unified_attention(
             segm_max = out  # dummy ptr
             segm_expsum = out  # dummy ptr
 
-        if IS_DEVICE_ARCH_GFX12 and shuffled_kv_cache:
+        if is_3d_gluon_available(
+            q_dtype, kv_cache_dtype, shuffled_kv_cache, SLIDING_WINDOW
+        ):
             _unified_attention_gluon_kernel_3d[
                 (total_num_q_blocks, num_kv_heads, NUM_SEGMENTS)
             ](
@@ -747,6 +790,8 @@ def unified_attention(
                 D=head_size,
                 D_PAD=head_size_padded,
                 TILE_SIZE=reduce_config["TILE_SIZE"],
+                SLIDING_WINDOW=SLIDING_WINDOW,
+                ALL_DECODE=ALL_DECODE,
                 NUM_WARPS=gluon_num_warps,
                 IS_FP8_OUT=(out.dtype == e4m3_dtype),
                 FP8_MIN=torch.finfo(e4m3_dtype).min,
@@ -771,6 +816,8 @@ def unified_attention(
             HEAD_SIZE_PADDED=head_size_padded,
             query_start_len_ptr=cu_seqlens_q,
             BLOCK_Q=BLOCK_Q,
+            SLIDING_WINDOW=SLIDING_WINDOW,
+            ALL_DECODE=ALL_DECODE,
             **reduce_config,
         )
 

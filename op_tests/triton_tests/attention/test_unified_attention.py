@@ -364,17 +364,25 @@ def ref_paged_attn(
 
 
 @pytest.mark.parametrize(
-    "seq_lens",
+    "seq_lens, sliding_window",
     [
-        [(1, 1328)],
-        [(1, 8192)] * 32,
-        [(1, 523), (1, 37), (1, 2011)],
-        [(1, 1328), (1, 523), (1, 37), (1, 2011), (1, 8192)],
+        pytest.param([(1, 1328)], None, id="single-decode"),
+        pytest.param([(1, 8192)] * 32, None, id="batched-decode"),
+        pytest.param([(1, 523), (1, 37), (1, 2011)], None, id="ragged-decode"),
+        pytest.param(
+            [(1, 1328), (1, 523), (1, 37), (1, 2011), (1, 8192)],
+            None,
+            id="mixed-decode",
+        ),
+        pytest.param(
+            [(1, 8203)] * 32,
+            2053,
+            id="large-sliding-window-off-tile",
+        ),
     ],
 )
 @pytest.mark.parametrize("num_heads", [(64, 8), (8, 1)])
 @pytest.mark.parametrize("head_size", [64])
-@pytest.mark.parametrize("sliding_window", [None])
 @pytest.mark.parametrize(
     "q_dtype, kv_dtype, o_dtype, block_size, use_out_scale",
     [
@@ -407,11 +415,11 @@ def test_triton_unified_attn_3d(
     torch.cuda.empty_cache()
 
     if DEVICE_ARCH not in (
+        "gfx942",
         "gfx950",
         "gfx1250",
     ):
-        # gfx1250 -> Gluon
-        # gfx950 -> Triton
+        # gfx1250 shuffled KV -> Gluon; other covered paths -> Triton.
         pytest.skip(f"skip {DEVICE_ARCH}")
 
     if kv_dtype == torch.uint8:
