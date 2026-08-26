@@ -100,8 +100,6 @@ class kernelInstance:
                 ),
                 self.sScheduler.lower(),
             ]
-            # Only split-K candidates carry the suffix, so names already in the
-            # tuned CSVs keep parsing (and comparing) exactly as before.
             + ([f"ks{self.k_split}"] if self.k_split > 1 else [])
         )
 
@@ -233,8 +231,6 @@ def kernel_fits_shape(ki: kernelInstance, M: int, N: int, K: int) -> bool:
         return False
     if N % ki.tile_n != 0 or K % ki.tile_k != 0:
         return False
-    # Split-K slices the K-tile count evenly; the kernel rejects anything else.
-    # Only reachable for k_split > 1, so k_split == 1 candidates are unaffected.
     if ki.k_split > 1 and (K // ki.tile_k) % ki.k_split != 0:
         return False
     if _padded_m(M) % ki.tile_m != 0:
@@ -339,9 +335,8 @@ def _estimate_max_wpe(tile_m: int, tile_n: int, total_vgpr: int = 512) -> int:
     return int(total_vgpr / max(est_per_wave, 1))
 
 
-# A slice must own a whole number of K-tiles, so the legal values are the
-# divisors of K//tile_k -- shape-dependent (K=7168 gives {2,7} at tile_k=512 and
-# {2,4,7,14} at tile_k=256), hence enumerated rather than hardcoded.
+# Legal values are the divisors of K//tile_k, which is shape-dependent, so they
+# are enumerated rather than hardcoded.
 K_SPLIT_MIN_TILES_PER_SLICE = 2  # keep the ping-pong loop fed
 K_SPLIT_MAX_CTA_OVERSUBSCRIBE = 4  # no point going far past one CU each
 

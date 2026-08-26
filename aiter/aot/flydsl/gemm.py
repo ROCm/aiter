@@ -378,10 +378,7 @@ def _compile_preshuffle_to_cache(
         PRESHUFFLE_SPLIT_K_WORKSPACE_ELEMS,
     )
 
-    # k_split > 1 accumulates fp32 partials in a workspace that the last
-    # arriving split reduces in-kernel, so the launcher takes the workspace,
-    # the final output and the per-tile semaphore. Both are sized to the bounds
-    # the runtime uses, so the AOT signature matches.
+    # Sized to the same bounds the runtime uses, so the signatures match.
     out = torch.empty((m * n,), device=dev, dtype=out_torch_dtype)
     workspace = (
         torch.empty(PRESHUFFLE_SPLIT_K_WORKSPACE_ELEMS, device=dev, dtype=torch.float32)

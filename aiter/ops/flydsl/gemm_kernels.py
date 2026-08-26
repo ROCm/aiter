@@ -971,14 +971,12 @@ def _get_compile_fn():
     return _flydsl_compile_fn
 
 
-# k_split_candidates only proposes split-K while the tile grid is under one CTA
-# per CU and caps k_split * tile_count at four per CU, so tile_count < CU_NUM and
-# the fp32 workspace is at most 4 * CU_NUM * tile_m * tile_n floats. Sizing to
-# those bounds keeps one allocation per stream instead of one per (m, n, tile,
-# k_split): a shape-keyed cache both grows without limit and can evict a buffer
-# whose address a captured CUDA graph still holds.
-# Mirrors preshuffle_gemm.PRESHUFFLE_M_MAX. Kept as a literal here because this
-# module must import without FlyDSL present; the kernel asserts they agree.
+# Fixed size rather than one buffer per shape: a shape-keyed cache grows without
+# limit and can evict a buffer a captured CUDA graph still points at. The bounds
+# come from k_split_candidates, which keeps tile_count under CU_NUM and
+# k_split * tile_count at four per CU.
+# Mirrors preshuffle_gemm.PRESHUFFLE_M_MAX; duplicated so this module imports
+# without FlyDSL present.
 PRESHUFFLE_M_MAX = 65536
 
 PRESHUFFLE_SPLIT_K_MAX_TILES = 256
@@ -993,8 +991,8 @@ def _get_preshuffle_split_buffers(
     device: torch.device,
     stream: torch.cuda.Stream,
 ) -> tuple[Tensor, Tensor]:
-    # Reuse across launches on one stream is safe: they are ordered, and the
-    # reduction hands the semaphore back zeroed.
+    # Safe to reuse: launches on a stream are ordered and the reduction hands
+    # the semaphore back zeroed.
     workspace = torch.empty(
         PRESHUFFLE_SPLIT_K_WORKSPACE_ELEMS, dtype=torch.float32, device=device
     )
@@ -1116,9 +1114,8 @@ def flydsl_preshuffle_gemm_a8(
         )
     else:
         workspace = out_contig
-        # int32 to match what the AOT pre-compile passes; dtype is part of the
-        # executable's cache signature, so a mismatch here misses the AOT cache
-        # for every non-split-K kernel.
+        # dtype is part of the executable's cache signature, so this must match
+        # what the AOT pre-compile passes or every non-split-K kernel misses it.
         semaphore = torch.empty(0, dtype=torch.int32, device=Out.device)
     # The layout-API launcher (PR #754) takes fx.Tensor args (it builds views via
     # fx.get_iter/make_view), so pass flat torch tensors directly rather than raw

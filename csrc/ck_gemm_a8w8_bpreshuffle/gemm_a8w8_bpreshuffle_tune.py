@@ -556,9 +556,6 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
                 ki = pipe.kernels_list[i]
                 if not pipe.fits(ki, M, N, K):
                     continue
-                # k_split=1 plus whatever divisors of this shape's K-tile count
-                # actually buy occupancy -- derived per shape rather than from a
-                # fixed list, since the legal set depends on K // tile_k.
                 for ks in [1] + (
                     k_split_candidates(ki, M, N, K, cu_num=self.get_cu_num())
                     if pipe.name == "preshuffle"

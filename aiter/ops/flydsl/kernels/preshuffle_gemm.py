@@ -119,18 +119,15 @@ def _get_preload(tile_m, tile_n, tile_k):
     )
 
 
-# A/C are viewed through a layout with this many rows, so M must stay under it.
-# gemm_kernels mirrors this value to guard on the host without importing FlyDSL.
+# Row bound of the A/C layout views; gemm_kernels mirrors it to guard on the host.
 PRESHUFFLE_M_MAX = 65536
 
 # 4 f32 in is one dwordx4, 4 bf16 out is one dwordx2.
 _REDUCE_VEC = 4
 
-# Split-K partials pass between CTAs that may sit on different XCDs, each with
-# its own L2, so they must reach a common point. An agent-scope fence does that
-# with a whole-L2 buffer_wbl2 per CTA, which also evicts the A/B tiles every
-# other in-flight CTA is reading -- 2-3x slower than not splitting at all.
-# sc0|sc1 writes through just these accesses instead.
+# Split-K partials cross XCDs, which do not share L2. An agent-scope fence
+# would write back the whole L2 per CTA and evict the A/B tiles everyone else
+# is reading; sc0|sc1 writes through just these accesses.
 _CPOL_COHERENT = 0x1 | 0x10
 
 
@@ -227,7 +224,6 @@ def compile_preshuffle_gemm(
         layout_elem = Float8E4M3FN if is_gfx950 else Float8E4M3FNUZ
     final_out_elem_cls = BFloat16 if out_dtype == "bf16" else Float16
     final_out_elem_bytes = 2
-    # split_k > 1 stores fp32 partials; the last split converts them.
     out_elem_cls = Float32 if split_k > 1 else final_out_elem_cls
     out_elem_bytes = 4 if split_k > 1 else final_out_elem_bytes
 
@@ -281,7 +277,6 @@ def compile_preshuffle_gemm(
     ):
         tid = fx.thread_idx.x
         bid_x, bid_y, bid_z = fx.block_idx
-        # First K-tile this split owns; 0 when split_k == 1.
         k_off = fx.Int32(bid_z) * num_tiles
 
         if const_expr(xcd_swizzle > 0):
@@ -391,8 +386,6 @@ def compile_preshuffle_gemm(
         frag_C = thr_mma.make_fragment_C(tC)
         frag_A_retile = thr_s2r.retile(frag_A)
         frag_B_retile_stages = [thr_g2r_B.retile(b) for b in frag_B_stages]
-        # split_k > 1 makes this the CTA-to-CTA partial path; split_k == 1 is
-        # the ordinary final store and stays cached.
         out_cpol = _CPOL_COHERENT if split_k > 1 else 0
         copy_op = fx.rocdl.BufferCopy32b if split_k > 1 else fx.rocdl.BufferCopy16b
         buf_copy_out = fx.make_copy_atom(copy_op(out_cpol), out_elem_cls)
@@ -816,9 +809,7 @@ def compile_preshuffle_gemm(
 
         fx.copy(buf_copy_out, frag_C_retile, pC_g)
         if const_expr(split_k > 1):
-            # That store published this CTA's fp32 partial; only the last split
-            # to arrive at the tile reduces and converts it. The store carries
-            # sc0|sc1, so waiting on it is the whole release.
+            # The store carries sc0|sc1, so waiting on it is the whole release.
             rocdl.s_waitcnt(0)
             gpu.barrier()
 
@@ -847,8 +838,6 @@ def compile_preshuffle_gemm(
                     * fx.Int64(N)
                     * fx.Int64(final_out_elem_bytes),
                 )
-                # One thread owns _REDUCE_VEC contiguous N elements; tile_n is
-                # a multiple of 4, so a vector never straddles a row.
                 vecs_per_row = tile_n // _REDUCE_VEC
                 vecs_per_tile = tile_m * vecs_per_row
                 vecs_per_thread = (vecs_per_tile + total_threads - 1) // total_threads
@@ -862,8 +851,8 @@ def compile_preshuffle_gemm(
                         col = fx.Int32(bid_y) * tile_n + local_n
                         if row < i32_m:
                             out_linear = row * fx.Int32(N) + col
-                            # Issue every load before summing, so the adds
-                            # pipeline behind one memory latency.
+                            # All loads first, so the adds pipeline behind one
+                            # memory latency.
                             parts = []
                             for s in range_constexpr(split_k):
                                 parts.append(
@@ -884,8 +873,7 @@ def compile_preshuffle_gemm(
                                 out_linear,
                             )
                 if tid == fx.Int32(0):
-                    # Hand the counter back for the next launch. Same cross-XCD
-                    # handoff as the partials, so it writes through too.
+                    # Same cross-XCD handoff as the partials, one launch later.
                     semaphore_rsrc = buffer_ops.create_buffer_resource(
                         arg_semaphore, max_size=True
                     )
