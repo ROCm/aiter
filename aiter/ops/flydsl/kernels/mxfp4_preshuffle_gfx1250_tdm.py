@@ -930,77 +930,118 @@ def launch_gemm_a8w4_tdm(
                 d_sb = (new_sb - orig_sb_off0) * 4
                 return [d_a, d_b, d_sa, d_sb]
 
-            def run_persist_mainloop(td):
-                for i in range_constexpr(num_buffers):
-                    issue(i, i, tile_deltas=td)
-                n_steady = K_TILES - num_buffers
-                if const_expr(next_stage_on):
-                    # Use split fence so the initial load_state's ds_loads
-                    # are not drained by an implicit s_wait_dscnt 0.
-                    pipeline_fence_signal(outstanding=TDM_PER * (num_buffers - 1))
-                    pipeline_fence_wait()
-                    load_state(rmem_slots[0], ptr_to_idx(buf_ptr(0)), 0)
+            # How many prologue TDMs the overlap window pre-issues for the
+            # next tile.  Capped by K_TILES so tiny-K doesn't over-issue.
+            PRE_ISSUE_COUNT = min(num_buffers - 1, K // tile_k)
 
-                def _steady(my_jobs):
-                    for kt in range(n_steady):
-                        s = kt % num_buffers
-                        buf = ptr_to_idx(buf_ptr(s))
-                        if const_expr(not next_stage_on):
-                            pipeline_fence_signal(
-                                outstanding=TDM_PER * (num_buffers - 1)
-                            )
-                            pipeline_fence_wait()
-                        next_stage_buf = (
-                            ptr_to_idx(buf_ptr((kt + 1) % num_buffers))
-                            if const_expr(next_stage_on)
-                            else None
+            def _make_mainloop_body(pre_issued):
+                """Build a mainloop with ``pre_issued`` buffers already in
+                flight from a prior overlap window.
+
+                Returns a callable ``mainloop(td)`` whose prologue skips
+                the first ``pre_issued`` TDM issues and whose initial
+                fence accounts for all ``num_buffers`` TDMs being in flight.
+                Each distinct ``pre_issued`` value (0 for the first tile,
+                PRE_ISSUE_COUNT for loop tiles) traces into its own
+                specialised code.
+                """
+
+                def mainloop(td):
+                    # Issue only the buffers NOT already pre-issued.
+                    for i in range_constexpr(num_buffers):
+                        if const_expr(i >= pre_issued):
+                            issue(i, i, tile_deltas=td)
+                    n_steady = K_TILES - num_buffers
+                    if const_expr(next_stage_on):
+                        # All num_buffers TDMs are now in flight (some
+                        # pre-issued, the rest just issued).  Fence to
+                        # let the oldest one (buffer 0) land.
+                        pipeline_fence_signal(
+                            outstanding=TDM_PER * (num_buffers - 1)
                         )
-                        compute_ktile(
-                            buf,
-                            None,
-                            next_stage_on,
-                            next_stage_buf,
-                            next_stage_wait=(
-                                TDM_PER * (num_buffers - 2)
+                        pipeline_fence_wait()
+                        load_state(rmem_slots[0], ptr_to_idx(buf_ptr(0)), 0)
+
+                    def _steady(my_jobs):
+                        for kt in range(n_steady):
+                            s = kt % num_buffers
+                            buf = ptr_to_idx(buf_ptr(s))
+                            if const_expr(not next_stage_on):
+                                pipeline_fence_signal(
+                                    outstanding=TDM_PER * (num_buffers - 1)
+                                )
+                                pipeline_fence_wait()
+                            next_stage_buf = (
+                                ptr_to_idx(buf_ptr((kt + 1) % num_buffers))
                                 if const_expr(next_stage_on)
                                 else None
-                            ),
-                        )
-                        rocdl.s_barrier_signal(WGP_BARRIER_ID)
-                        rocdl.s_barrier_wait(WGP_BARRIER_ID)
-                        issue(s, kt + num_buffers, my_jobs, tile_deltas=td)
+                            )
+                            compute_ktile(
+                                buf,
+                                None,
+                                next_stage_on,
+                                next_stage_buf,
+                                next_stage_wait=(
+                                    TDM_PER * (num_buffers - 2)
+                                    if const_expr(next_stage_on)
+                                    else None
+                                ),
+                            )
+                            rocdl.s_barrier_signal(WGP_BARRIER_ID)
+                            rocdl.s_barrier_wait(WGP_BARRIER_ID)
+                            issue(s, kt + num_buffers, my_jobs, tile_deltas=td)
 
-                dispatch_wave_job(_steady)
-                for j_drain in range_constexpr(num_buffers):
-                    kt = n_steady + j_drain
-                    buf = ptr_to_idx(buf_ptr(kt % num_buffers))
-                    has_next = next_stage_on and j_drain + 1 < num_buffers
-                    pipeline_fence_signal(
-                        outstanding=TDM_PER
-                        * max(0, num_buffers - 1 - j_drain - (1 if has_next else 0))
-                    )
-                    pipeline_fence_wait()
-                    next_stage_buf = (
-                        ptr_to_idx(buf_ptr((kt + 1) % num_buffers))
-                        if const_expr(has_next)
-                        else None
-                    )
-                    compute_ktile(buf, None, next_stage_on, next_stage_buf)
+                    dispatch_wave_job(_steady)
+                    for j_drain in range_constexpr(num_buffers):
+                        kt = n_steady + j_drain
+                        buf = ptr_to_idx(buf_ptr(kt % num_buffers))
+                        has_next = next_stage_on and j_drain + 1 < num_buffers
+                        pipeline_fence_signal(
+                            outstanding=TDM_PER
+                            * max(
+                                0,
+                                num_buffers
+                                - 1
+                                - j_drain
+                                - (1 if has_next else 0),
+                            )
+                        )
+                        pipeline_fence_wait()
+                        next_stage_buf = (
+                            ptr_to_idx(buf_ptr((kt + 1) % num_buffers))
+                            if const_expr(has_next)
+                            else None
+                        )
+                        compute_ktile(buf, None, next_stage_on, next_stage_buf)
+
+                return mainloop
+
+            # Two specialisations: full prologue (first tile) and
+            # pre-issued prologue (loop tiles after overlap).
+            run_persist_mainloop_full = _make_mainloop_body(0)
+            run_persist_mainloop_preissued = _make_mainloop_body(PRE_ISSUE_COUNT)
 
             def run_persist_tile(
                 t_blk_m, t_blk_n, t_blk_m64, t_blk_n64,
                 t_expert, t_mn_oob, td, skip_final_wait,
+                use_preissued=False,
             ):
-                """Mainloop + epilogue for one tile in persistent mode."""
+                """Mainloop + epilogue for one tile in persistent mode.
+
+                ``use_preissued``: constexpr bool.  When True, the prologue
+                skips the first PRE_ISSUE_COUNT TDMs that the overlap
+                window already issued.
+                """
                 if t_expert < n_experts:
-                    # Reset accumulators
                     for cf in c_frags:
                         cf.store(
                             fx.constant_vector(0.0, T.vec(WMMA_VECTOR_DWORDS, T.f32))
                         )
-                    run_persist_mainloop(td)
+                    if const_expr(use_preissued):
+                        run_persist_mainloop_preissued(td)
+                    else:
+                        run_persist_mainloop_full(td)
 
-                    # Epilogue: read accumulators
                     accs = []
                     output_fragments_per_acc = WMMA_N // 16
                     for idx in range_constexpr(n_acc):
@@ -1159,12 +1200,16 @@ def launch_gemm_a8w4_tdm(
                             tdm_ops.tensor_wait(0)
 
             # ---- Execute persistent tiles ----
-            # First tile (coords from bid_x)
+            # First tile (coords from bid_x): full prologue, no pre-issued.
             run_persist_tile(
                 blk_m, blk_n, blk_m64, blk_n64,
                 expert, mn_oob, zero_deltas, True,
+                use_preissued=False,
             )
-            # Grid-stride loop for remaining tiles
+            # Grid-stride loop for remaining tiles.
+            # Between tiles, overlap: issue PRE_ISSUE_COUNT prologue TDMs
+            # for the next tile while the previous epilogue store is still
+            # in flight, then fence; the next mainloop skips those buffers.
             for tile_flat_iv in range(bid_x + grid_nb, total_tiles_rt, grid_nb):
                 tile_flat = fx.Int32(tile_flat_iv)
                 (
@@ -1175,18 +1220,22 @@ def launch_gemm_a8w4_tdm(
                 td = compute_deltas(new_a_off0, new_b_off0, new_sb_off0, new_sa_off0)
 
                 if const_expr(C_PERSIST_OFF > 0):
-                    # Overlap: issue num_buffers-1 prologue loads for new tile
-                    # while previous tile's epilogue store is still in flight
                     if new_expert < n_experts:
-                        for i in range_constexpr(min(num_buffers - 1, K // tile_k)):
+                        for i in range_constexpr(PRE_ISSUE_COUNT):
                             issue(i, i, tile_deltas=td)
-                # Wait for previous epilogue store + barrier
-                tdm_ops.tensor_wait(0)
+                        # Drain the previous epilogue store but keep
+                        # the PRE_ISSUE_COUNT pre-issued TDMs in flight.
+                        tdm_ops.tensor_wait(TDM_PER * PRE_ISSUE_COUNT)
+                    else:
+                        tdm_ops.tensor_wait(0)
+                if const_expr(not (C_PERSIST_OFF > 0)):
+                    tdm_ops.tensor_wait(0)
                 workgroup_barrier()
 
                 run_persist_tile(
                     new_blk_m, new_blk_n, new_blk_m64, new_blk_n64,
                     new_expert, new_mn_oob, td, True,
+                    use_preissued=(C_PERSIST_OFF > 0),
                 )
             # Final wait for last tile's store
             tdm_ops.tensor_wait(0)
