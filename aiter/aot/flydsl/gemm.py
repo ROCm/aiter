@@ -377,17 +377,14 @@ def _compile_preshuffle_to_cache(
     # arriving split reduces in-kernel, so the launcher takes the workspace,
     # the final output and the per-tile semaphore.
     out = torch.empty((m * n,), device=dev, dtype=out_torch_dtype)
-    workspace_splits = 1 if k_split == 2 else k_split
     workspace = (
-        torch.empty((workspace_splits * m * n,), device=dev, dtype=torch.float32)
+        torch.empty((k_split * m * n,), device=dev, dtype=torch.float32)
         if k_split > 1
         else out
     )
     tile_count = ((m + tile_m - 1) // tile_m) * (n // tile_n)
     semaphore = torch.zeros(
-        (2 * tile_count if k_split == 2 else tile_count) if k_split > 1 else 0,
-        device=dev,
-        dtype=torch.int32,
+        tile_count if k_split > 1 else 0, device=dev, dtype=torch.int32
     )
     scale_a = torch.empty((max(m, 1),), device=dev, dtype=torch.float32)
     scale_b = torch.empty((max(n, 1),), device=dev, dtype=torch.float32)

@@ -983,13 +983,9 @@ def _get_preshuffle_split_buffers(
 ) -> tuple[Tensor, Tensor]:
     # One cache entry per stream makes reuse safe: launches on the same stream
     # are ordered, and the fused reduction resets every tile semaphore to zero.
-    workspace_splits = 1 if split_k == 2 else split_k
-    workspace = torch.empty(
-        (workspace_splits, m, n), dtype=torch.float32, device=device
-    )
+    workspace = torch.empty((split_k, m, n), dtype=torch.float32, device=device)
     tile_count = ((m + tile_m - 1) // tile_m) * (n // tile_n)
-    semaphore_count = 2 * tile_count if split_k == 2 else tile_count
-    semaphore = torch.zeros(semaphore_count, dtype=torch.int32, device=device)
+    semaphore = torch.zeros(tile_count, dtype=torch.int32, device=device)
     return workspace, semaphore
 
 

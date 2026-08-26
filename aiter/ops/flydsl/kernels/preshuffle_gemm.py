@@ -119,28 +119,22 @@ def _get_preload(tile_m, tile_n, tile_k):
     )
 
 
-# Elements per thread in the fused split-K reduce. 4 is the width where both
-# sides sit in one instruction: 4 f32 in = dwordx4, 4 bf16 out = dwordx2.
+# 4 f32 in is one dwordx4, 4 bf16 out is one dwordx2.
 _REDUCE_VEC = 4
 
-# CDNA3/4 cache-policy bits. Split-K partials are handed between CTAs that may
-# sit on different XCDs, and each XCD has its own L2, so the partials have to
-# reach a common point. Doing that with an agent-scope fence costs a whole-L2
-# buffer_wbl2 per CTA plus a buffer_inv on the reader, which also evicts the A/B
-# tiles every other in-flight CTA is still reading. Marking just these accesses
-# sc0|sc1 writes them through instead, leaving the rest of L2 alone.
-_CPOL_SC0 = 0x1
-_CPOL_SC1 = 0x10
-# nt was measured too: it costs ~8% here, so the partials stay cacheable.
-_CPOL_COHERENT = _CPOL_SC0 | _CPOL_SC1
+# Split-K partials pass between CTAs that may sit on different XCDs, each with
+# its own L2, so they must reach a common point. An agent-scope fence does that
+# with a whole-L2 buffer_wbl2 per CTA, which also evicts the A/B tiles every
+# other in-flight CTA is reading -- 2-3x slower than not splitting at all.
+# sc0|sc1 writes through just these accesses instead.
+_CPOL_COHERENT = 0x1 | 0x10
 
 
 def _pairwise_sum(parts):
     """Sum a Python list of Vectors as a balanced tree.
 
-    Module level on purpose: the kernel AST rewriter turns a ``while`` in a
-    kernel body into an ``scf.while``, but this loop is pure trace-time
-    metaprogramming over a Python list.
+    Module level because the kernel AST rewriter would turn this ``while`` into
+    an ``scf.while``; it is trace-time metaprogramming over a Python list.
     """
     while len(parts) > 1:
         nxt = []
@@ -324,7 +318,7 @@ def compile_preshuffle_gemm(
         )
         gB = fx.rocdl.make_buffer_tensor(arg_b)
         c_tensor = arg_c
-        if const_expr(split_k > 2):
+        if const_expr(split_k > 1):
             c_split_offset = fx.Int64(bid_z) * fx.Int64(i32_m) * fx.Int64(N)
             c_tensor = fx.Tensor(
                 fx.make_view(
@@ -341,21 +335,6 @@ def compile_preshuffle_gemm(
         tA = fx.flat_divide(gA, fx.make_tile(tile_m, tile_k))[None, None, bid_x, None]
         tB = fx.flat_divide(gB, fx.make_tile(tile_n, tile_k))[None, None, bid_y, None]
         tC = fx.flat_divide(gC, fx.make_tile(tile_m, tile_n))[None, None, bid_x, bid_y]
-        gOut = fx.rocdl.make_buffer_tensor(
-            fx.Tensor(
-                fx.make_view(
-                    fx.get_iter(arg_out),
-                    fx.make_layout((65536, N), (N, 1)),
-                )
-            ),
-            max_size=False,
-            num_records_bytes=fx.Int64(i32_m)
-            * fx.Int64(N)
-            * fx.Int64(final_out_elem_bytes),
-        )
-        tOut = fx.flat_divide(gOut, fx.make_tile(tile_m, tile_n))[
-            None, None, bid_x, bid_y
-        ]
 
         buf_copy = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), layout_elem)
         uni_copy = fx.make_copy_atom(fx.UniversalCopy128b(), layout_elem)
@@ -410,9 +389,8 @@ def compile_preshuffle_gemm(
         frag_C = thr_mma.make_fragment_C(tC)
         frag_A_retile = thr_s2r.retile(frag_A)
         frag_B_retile_stages = [thr_g2r_B.retile(b) for b in frag_B_stages]
-        # split_k > 1 makes this the fp32 *partial* path, which is CTA-to-CTA
-        # traffic and must bypass the local L2; split_k == 1 is the ordinary
-        # final store and stays cached.
+        # split_k > 1 makes this the CTA-to-CTA partial path; split_k == 1 is
+        # the ordinary final store and stays cached.
         out_cpol = _CPOL_COHERENT if split_k > 1 else 0
         buf_copy_out = fx.make_copy_atom(
             (
@@ -426,20 +404,6 @@ def compile_preshuffle_gemm(
         pC_g = thr_r2g_C.partition_S(tC)
         frag_C_out = fx.make_fragment_like(frag_C, out_elem_cls.ir_type)
         frag_C_retile = thr_r2g_C.retile(frag_C_out)
-        buf_copy_final = fx.make_copy_atom(
-            (
-                fx.rocdl.BufferCopy32b()
-                if final_out_elem_bytes == 4
-                else fx.rocdl.BufferCopy16b()
-            ),
-            final_out_elem_cls,
-        )
-        thr_r2g_final = fx.make_tiled_copy_C(buf_copy_final, tiled_mma).get_slice(tid)
-        pOut_g = thr_r2g_final.partition_S(tOut)
-        frag_C_final = fx.make_fragment_like(frag_C, final_out_elem_cls.ir_type)
-        frag_C_final_retile = thr_r2g_final.retile(frag_C_final)
-        frag_C_previous = fx.make_fragment_like(frag_C, Float32.ir_type)
-        frag_C_previous_retile = thr_r2g_C.retile(frag_C_previous)
 
         # ── Async gmem->LDS DMA (buffer_load_lds) for the A tile ──
         if const_expr(use_async_copy):
@@ -892,71 +856,11 @@ def compile_preshuffle_gemm(
 
         if const_expr(split_k == 1):
             fx.copy(buf_copy_out, frag_C_retile, pC_g)
-        elif const_expr(split_k == 2):
-            # The first-arriving split publishes its fp32 fragment. The second
-            # keeps its own fragment in VGPRs, loads only the first partial, and
-            # writes the final bf16/fp16 tile. This avoids a second kernel launch
-            # and avoids writing/reading both split partials.
-            split_flag_ptr = lds.split_flag.ptr
-            semaphore_idx = fx.Int32(bid_x) * (N // tile_n) + fx.Int32(bid_y)
-            tile_count = (
-                (i32_m + fx.Int32(tile_m - 1)) // fx.Int32(tile_m)
-            ) * fx.Int32(N // tile_n)
-            semaphore_base = fx.Int64(fx.ptrtoint(fx.get_iter(arg_semaphore)))
-            arrival_addr = semaphore_base + fx.Int64(semaphore_idx) * fx.Int64(4)
-            ready_addr = semaphore_base + fx.Int64(
-                tile_count + semaphore_idx
-            ) * fx.Int64(4)
-
-            if tid == fx.Int32(0):
-                arrival = fx.Int32(comm_ops.atomic_add_agent(arrival_addr, fx.Int32(1)))
-                fx.ptr_store(Vec.from_elements([arrival], fx.Int32), split_flag_ptr)
-            gpu.barrier()
-            arrival = Vec(fx.make_view(split_flag_ptr, fx.make_layout(1, 1)).load())[0]
-
-            if arrival == fx.Int32(0):
-                fx.copy(buf_copy_out, frag_C_retile, pC_g)
-                rocdl.s_waitcnt(0)
-                gpu.barrier()
-                if tid == fx.Int32(0):
-                    comm_ops.atomic_add_agent(ready_addr, fx.Int32(1))
-            else:
-                if tid == fx.Int32(0):
-                    ready = fx.Int32(comm_ops.atomic_add_agent(ready_addr, fx.Int32(0)))
-                    while ready == fx.Int32(0):
-                        ready = fx.Int32(
-                            comm_ops.atomic_add_agent(ready_addr, fx.Int32(0))
-                        )
-                    fx.ptr_store(Vec.from_elements([ready], fx.Int32), split_flag_ptr)
-                gpu.barrier()
-                fx.copy(
-                    buf_copy_out,
-                    pC_g,
-                    frag_C_previous_retile,
-                )
-                rocdl.s_waitcnt(0)
-                frag_C_final.store(
-                    (Vec(frag_C_out.load()) + Vec(frag_C_previous.load())).to(
-                        final_out_elem_cls
-                    )
-                )
-                fx.copy(buf_copy_final, frag_C_final_retile, pOut_g)
-                if tid == fx.Int32(0):
-                    semaphore_rsrc = buffer_ops.create_buffer_resource(
-                        arg_semaphore, max_size=True
-                    )
-                    buffer_ops.buffer_store(fx.Int32(0), semaphore_rsrc, semaphore_idx)
-                    buffer_ops.buffer_store(
-                        fx.Int32(0),
-                        semaphore_rsrc,
-                        tile_count + semaphore_idx,
-                    )
         else:
             fx.copy(buf_copy_out, frag_C_retile, pC_g)
-            # Publish this CTA's fp32 partial, then let only the last split for
-            # each (M tile, N tile) reduce and convert to the final output.
-            # The stores above carry sc0|sc1, so waiting on them is the whole
-            # release: no cache maintenance is needed on top.
+            # Publish this CTA's fp32 partial; only the last split to arrive at
+            # the tile reduces and converts it.
+            # The stores carry sc0|sc1, so waiting on them is the whole release.
             rocdl.s_waitcnt(0)
             gpu.barrier()
 
@@ -986,9 +890,8 @@ def compile_preshuffle_gemm(
                     * fx.Int64(N)
                     * fx.Int64(final_out_elem_bytes),
                 )
-                # One thread owns _REDUCE_VEC contiguous N elements: 4 f32 in
-                # is one dwordx4, 4 bf16 out is one dwordx2. tile_n is always a
-                # multiple of 4, so a vector never straddles a row.
+                # One thread owns _REDUCE_VEC contiguous N elements; tile_n is
+                # a multiple of 4, so a vector never straddles a row.
                 vecs_per_row = tile_n // _REDUCE_VEC
                 vecs_per_tile = tile_m * vecs_per_row
                 vecs_per_thread = (vecs_per_tile + total_threads - 1) // total_threads
@@ -1002,9 +905,8 @@ def compile_preshuffle_gemm(
                         col = fx.Int32(bid_y) * tile_n + local_n
                         if row < i32_m:
                             out_linear = row * fx.Int32(N) + col
-                            # Issue every split's load before summing any of
-                            # them, so the adds pipeline behind a single memory
-                            # latency instead of serialising split_k of them.
+                            # Issue every load before summing, so the adds
+                            # pipeline behind one memory latency.
                             parts = []
                             for s in range_constexpr(split_k):
                                 parts.append(
@@ -1018,7 +920,6 @@ def compile_preshuffle_gemm(
                                         )
                                     )
                                 )
-                            # Pairwise, so the chain is log2(split_k) deep.
                             total = _pairwise_sum(parts)
                             buffer_ops.buffer_store(
                                 total.to(final_out_elem_cls),
