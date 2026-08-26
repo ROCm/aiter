@@ -366,7 +366,7 @@ def _combined_routing_fused(
 def _ep_gate_prep_scan_kernel(
     DispatchIds,  # (M, topk) int32, GLOBAL expert ids
     ExpertMap,  # (E_map,) int32
-    NumLocalTokens,  # (1,) int32
+    NumLocalTokens,  # (1,) int32, or None to skip the row mask entirely.
     GateValid,  # (G,) int32 out
     ExptIndx,  # (G,) int32 out, local id or SENTINEL
     HistAtomic,  # (N_BINS,) int32 scratch, ZERO on entry, left ZERO on exit
@@ -397,7 +397,7 @@ def _ep_gate_prep_scan_kernel(
     Gating replaces ~9 elementwise launches that all share the G = M*topk axis:
         ids   = dispatch_ids.long().clamp_(0, E_map-1)
         local = expert_map[ids]
-        local = where(row < R, local, -1)
+        local = where(row < R, local, -1)   # only when NumLocalTokens is given
         gate_valid = (local >= 0).reshape(-1).int()
         expt_indx  = where(local < 0, SENTINEL, local).reshape(-1).int()
 
@@ -429,9 +429,11 @@ def _ep_gate_prep_scan_kernel(
     ids = tl.load(DispatchIds + offs, mask=mask, other=0)
     ids = tl.minimum(tl.maximum(ids, 0), e_map_numel - 1)
     local = tl.load(ExpertMap + ids, mask=mask, other=-1)
-    row = offs // TOPK
-    r = tl.load(NumLocalTokens)
-    valid = (local >= 0) & (row < r) & mask
+    valid = (local >= 0) & mask
+    if NumLocalTokens is not None:
+        row = offs // TOPK
+        r = tl.load(NumLocalTokens)
+        valid = valid & (row < r)
 
     tl.store(GateValid + offs, valid.to(tl.int32), mask=mask)
     expt = tl.where(valid, local, SENTINEL).to(tl.int32)
