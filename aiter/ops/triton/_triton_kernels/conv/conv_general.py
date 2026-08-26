@@ -7,7 +7,7 @@ import triton.language as tl
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils.conv_config_utils import get_conv_config
 
-from ..activation import _gelu_tanh, _relu, _relu6
+from ..activation import _apply_activation_from_str
 
 
 def _get_config(shape_key=None, M=None, variants=()):
@@ -160,12 +160,7 @@ def _conv2d_general_kernel(
         b = tl.load(BIAS + offs_n, mask=offs_n < K_out, other=0.0).to(tl.float32)
         acc += b[None, :]
 
-    if ACTIVATION == "relu":
-        acc = _relu(acc)
-    elif ACTIVATION == "relu6":
-        acc = _relu6(acc)
-    elif ACTIVATION == "gelu":
-        acc = _gelu_tanh(acc)
+    acc = _apply_activation_from_str(acc, ACTIVATION)
 
     y_ptrs = (
         Y

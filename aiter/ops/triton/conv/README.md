@@ -210,7 +210,7 @@ Tested on ROCm 7.2 / PyTorch `2.9.1+gitff65f5b` / Triton 3.7 (commit `23f4e522d`
 
 Per-kernel configs ship as JSON under `aiter/ops/triton/configs/conv/`, one
 file per `(arch, kernel)` — e.g. `gfx1201-CONV-3X3-NHWC.json` and
-`gfx1201-CONV-PREPACK.json`. The loader walks four tiers: layout/dtype shape
+`gfx1201-CONV-PREPACK.json`. The loader walks four tiers: layout-specific shape
 pin → generic shape pin → `M_LEQ_x` bucket → `"any"` fallback. No
 runtime autotune in the hot path, so CI compile time stays predictable and
 the first call hits no tuning tax.

@@ -232,12 +232,12 @@ def test_exact_nchw_pin_uses_complete_shape_key(
     )
 
 
-def test_conv_config_variant_precedence(monkeypatch, isolated_conv_config_cache):
+def test_conv_config_layout_variant_precedence(
+    monkeypatch, isolated_conv_config_cache
+):
     shape_key = "test-shape"
     config = {
-        "shapes_nhwc_fp16": {shape_key: {"source": "layout_dtype"}},
         "shapes_nhwc": {shape_key: {"source": "layout"}},
-        "shapes_fp16": {shape_key: {"source": "dtype"}},
         "shapes": {shape_key: {"source": "generic"}},
         "M_LEQ_64": {"source": "bucket"},
         "any": {"source": "any"},
@@ -251,9 +251,7 @@ def test_conv_config_variant_precedence(monkeypatch, isolated_conv_config_cache)
             "TEST-CONV-VARIANTS", shape_key=key, M=M, variants=variants
         )["source"]
 
-    assert selected("nhwc_fp16", "nhwc", "fp16") == "layout_dtype"
-    assert selected("nhwc", "fp16") == "layout"
-    assert selected("fp16") == "dtype"
+    assert selected("nhwc") == "layout"
     assert selected() == "generic"
-    assert selected("nhwc_fp16", key="missing") == "bucket"
-    assert selected("nhwc_fp16", key="missing", M=65) == "any"
+    assert selected("nhwc", key="missing") == "bucket"
+    assert selected("nhwc", key="missing", M=65) == "any"

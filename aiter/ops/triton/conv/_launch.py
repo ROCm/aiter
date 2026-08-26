@@ -51,8 +51,9 @@ from aiter.ops.triton.utils.conv_config_utils import (
 )
 
 
-def _dtype_variant(dtype):
-    return "fp16" if dtype == torch.float16 else "bf16"
+def _kernel_activation(activation):
+    """Map the public Conv2D GELU name to its existing tanh approximation."""
+    return "gelu_tanh" if activation == "gelu" else activation
 
 
 def _make_mn_grid(M_total, K_out):
@@ -163,11 +164,10 @@ def _launch_1x1(
         dh=1,
         dw=1,
     )
-    dtype_variant = _dtype_variant(x.dtype)
     config = _get_config_1x1(
         shape_key=shape_key,
         M=M_total,
-        variants=(f"{layout}_{dtype_variant}", layout, dtype_variant),
+        variants=(layout,),
     )
 
     _conv2d_1x1_kernel[_make_mn_grid(M_total, K_out)](
@@ -188,7 +188,7 @@ def _launch_1x1(
         pw,
         M_total,
         HAS_BIAS=bias_fp32 is not None,
-        ACTIVATION=activation,
+        ACTIVATION=_kernel_activation(activation),
         LAYOUT=layout,
         **config,
     )
@@ -237,7 +237,6 @@ def _launch_3x3_nhwc(
     config = _get_config_nhwc(
         shape_key=shape_key,
         M=M_total,
-        variants=(_dtype_variant(x.dtype),),
     )
 
     _conv2d_3x3_nhwc_kernel[_make_mn_grid(M_total, K_out)](
@@ -261,7 +260,7 @@ def _launch_3x3_nhwc(
         dw,
         M_total,
         HAS_BIAS=bias_fp32 is not None,
-        ACTIVATION=activation,
+        ACTIVATION=_kernel_activation(activation),
         **config,
     )
 
@@ -310,7 +309,6 @@ def _launch_3x3_cblocked(
     config = _get_config_cblocked(
         shape_key=shape_key,
         M=M_total,
-        variants=(_dtype_variant(x_blocked.dtype),),
     )
 
     _conv2d_3x3_cblocked_kernel[_make_mn_grid(M_total, K_out)](
@@ -335,7 +333,7 @@ def _launch_3x3_cblocked(
         dw,
         M_total,
         HAS_BIAS=bias_fp32 is not None,
-        ACTIVATION=activation,
+        ACTIVATION=_kernel_activation(activation),
         **config,
     )
 
@@ -402,7 +400,7 @@ def _launch_3x3_nchw(
         dw,
         M_total,
         HAS_BIAS=bias is not None,
-        ACTIVATION=activation,
+        ACTIVATION=_kernel_activation(activation),
         ROW_ALIGNED=row_aligned,
         **config,
     )
@@ -454,11 +452,10 @@ def _launch_general(
         dh=dh,
         dw=dw,
     )
-    dtype_variant = _dtype_variant(x.dtype)
     config = _get_config_general(
         shape_key=shape_key,
         M=M_total,
-        variants=(f"{layout}_{dtype_variant}", layout, dtype_variant),
+        variants=(layout,),
     )
 
     _conv2d_general_kernel[_make_mn_grid(M_total, K_out)](
@@ -484,7 +481,7 @@ def _launch_general(
         dw,
         M_total,
         HAS_BIAS=bias_fp32 is not None,
-        ACTIVATION=activation,
+        ACTIVATION=_kernel_activation(activation),
         LAYOUT=layout,
         **config,
     )
@@ -578,7 +575,7 @@ def _launch_winograd_f4x3(
         tile_W,
         T,
         HAS_BIAS=bias_fp32 is not None,
-        ACTIVATION=activation,
+        ACTIVATION=_kernel_activation(activation),
         LAYOUT=layout,
         **output_config,
     )
@@ -672,6 +669,6 @@ def _launch_winograd_f4x3_cblocked(
         tile_W,
         T,
         HAS_BIAS=bias_fp32 is not None,
-        ACTIVATION=activation,
+        ACTIVATION=_kernel_activation(activation),
         **output_config,
     )

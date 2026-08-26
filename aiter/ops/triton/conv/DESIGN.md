@@ -661,7 +661,7 @@ a shape-keyed lookup table with a four-tier fallback, so it can never "miss":
 
 ```
 get_conv_config walks, first hit wins:
-  1. shapes_<variant>[shape_key]  optional layout/dtype-specific pin
+  1. shapes_<variant>[shape_key]  optional layout-specific pin
   2. shapes[shape_key]            generic exact-shape pin
   3. M_LEQ_<n>                    nearest row-count bucket (M_total, or T)
   4. "any"                        global fallback

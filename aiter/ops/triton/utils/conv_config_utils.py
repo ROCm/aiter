@@ -80,7 +80,7 @@ def _get_conv_config_cached(
     dev = arch_info.get_arch()
     config_dict = _get_conv_config_file(config_name)
 
-    # Tier 1: optional layout/dtype-specific exact-shape pins.
+    # Tier 1: optional variant-specific exact-shape pins.
     if shape_key is not None:
         for variant in variants:
             shapes = config_dict.get(f"shapes_{variant}", {})
@@ -136,7 +136,7 @@ def get_conv_config(
     """Load a conv kernel config for the running GPU arch.
 
     Walk order (first hit wins):
-        1. ``shapes_<variant>[shape_key]`` — optional layout/dtype pin.
+        1. ``shapes_<variant>[shape_key]`` — optional variant-specific pin.
         2. ``shapes[shape_key]`` — generic exact-shape pin.
         3. ``M_LEQ_<n>`` — row-count bucket walk (M_total for GEMM-like
            kernels, T for Winograd).

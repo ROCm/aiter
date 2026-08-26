@@ -30,14 +30,14 @@ def _conv_dims(x, w_oihw, stride, padding, dilation):
 
 def _alloc_output(N, K_out, P, Q, x, layout):
     """Allocate the output tensor, channels_last for nhwc else contiguous."""
-    if layout == "nhwc":
-        return torch.empty(
-            (N, K_out, P, Q),
-            device=x.device,
-            dtype=x.dtype,
-            memory_format=torch.channels_last,
-        )
-    return torch.empty((N, K_out, P, Q), device=x.device, dtype=x.dtype)
+    return torch.empty(
+        (N, K_out, P, Q),
+        device=x.device,
+        dtype=x.dtype,
+        memory_format=(
+            torch.channels_last if layout == "nhwc" else torch.contiguous_format
+        ),
+    )
 
 
 def _prep_bias(bias):

@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import logging
 import os
 from enum import Enum
 
@@ -206,13 +205,19 @@ def conv2d(
     if layout not in ("nchw", "nhwc"):
         raise ValueError(f"layout must be 'nchw' or 'nhwc', got '{layout}'")
 
-    if _LOGGER.get_logger().isEnabledFor(logging.INFO):
-        _LOGGER.info(
-            f"CONV2D: x={tuple(x.shape)} w={tuple(w_oihw.shape)} stride={stride} "
-            f"padding={padding} dilation={dilation} layout={layout} "
-            f"dtype={x.dtype} bias={'yes' if bias is not None else 'no'} "
-            f"act={activation}"
-        )
+    _LOGGER.get_logger().info(
+        "CONV2D: x=%s w=%s stride=%s padding=%s dilation=%s "
+        "layout=%s dtype=%s bias=%s act=%s",
+        tuple(x.shape),
+        tuple(w_oihw.shape),
+        stride,
+        padding,
+        dilation,
+        layout,
+        x.dtype,
+        "yes" if bias is not None else "no",
+        activation,
+    )
 
     if layout == "nhwc":
         return conv2d_nhwc(x, w_oihw, bias, stride, padding, dilation, activation)
