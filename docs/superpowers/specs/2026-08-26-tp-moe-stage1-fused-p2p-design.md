@@ -224,9 +224,33 @@ MegaMoE 的 `ATileLoader.for_tile(tile_row_base)` 假设 tile 的 32 行内存�
 
 ### 6.1 抽取范围
 
-新建 `aiter/ops/flydsl/kernels/mega_moe/collective_sched.py`，放六样与 EP 语义无关的调度同步 helper：ticket 与 generation 计算、epoch/parity 翻转、`epoch_gate` 本地重置、`launch_ready` 跨卡握手、分片 work pool 取活与 LDS 广播、`_copy_token_row`。
+新建 `aiter/ops/flydsl/kernels/mega_moe/collective_sched.py`，放四个与 EP 语义无关的 helper：
+
+| helper | 来源 | 性质 |
+|---|---|---|
+| `_copy_token_row` | `dispatch.py:183-201` | 已经是独立 `@flyc.jit`，纯剪切粘贴 |
+| `emit_ticket_and_roles` | `mega_moe_stage1.py:210-225` | 现为内联代码，需引入函数边界 |
+| `emit_epoch_rendezvous` | `mega_moe_stage1.py:227-279` | 同上 |
+| `emit_work_pool_loop` | `mega_moe_stage1.py:425-453` | 同上 |
+
+原本设想的六样合成了四个，原因有二。第一，epoch/parity 翻转、`launch_ready` 握手、`epoch_gate` 重置在源码里是**同一条 `if compact_owner: ... else: ...` 语句**（227 到 279 行），拆成三个 helper 就得改分支结构，那就不是纯搬家了。第二，`launch_ready` 握手依赖 parity 翻转产生的 `launch_epoch`，本来也分不开。
+
+引入函数边界不影响生成的代码。`@flyc.jit` 在 tracing 期间（`ir.Context` 存活时）是普通 Python 调用，函数体直接内联进 trace，不发 `func.call`：
+
+```python
+# flydsl/compiler/jit_function.py:1357-1359
+def __call__(self, *args, **kwargs):
+    if ir.Context.current is not None:
+        return self.func(*args, **kwargs)
+```
+
+真正会破坏 IR 一致性的是语句重排或常量折叠结果改变，不是函数边界本身。
+
+两处实现细节必须注意。`emit_ticket_and_roles` 与 `emit_work_pool_loop` 共用 `SharedStorage.pool` 的第 0 字节做 LDS 广播（分别 recast 成 `fx.Int64` 和 `fx.Int32`），这块 LDS 在调用方分配（`mega_moe_stage1.py:187`），所以要作为参数传进 helper。`emit_epoch_rendezvous` 里 `next_parity_lane` 和 `launch_epoch_lane` 在嵌套的 `if tid == 0` 内被重新绑定、退出后再读，那对 `readfirstlane` 必须跟 `if tid == 0` 留在同一个 helper 里，否则 SSA 合并点位置变化，IR 文本就变了。
 
 `mega_moe_stage1.py` 与 `dispatch.py` 改成从此 import，函数体一行不动。TP 新 kernel 也从此 import。
+
+另外 `compile_mega_moe_stage1` 整个函数处于 `# fmt: off`（第 69 行起，之后再没开回来），搬出去的代码会被 black 重新格式化。格式化本身不改 IR，但会让 diff 变得难读，所以 `collective_sched.py` 里要带上 `# fmt: off`。
 
 与 `experts_per_rank` 缠绕的一概不抽：expert-major 路由、srcmap 编码、per-expert 直方图、count matrix 的 all-to-all、capacity/compact 分叉。
 
@@ -234,7 +258,32 @@ MegaMoE 的 `ATileLoader.for_tile(tile_row_base)` 假设 tile 的 32 行内存�
 
 用户已确认放宽阶段一决定 19「`MegaMoEV2` 完全冻结」，条件是守护标准要比现有测试硬。现有 `test_mega_moe_v2.py` 是 `rtol=0.10` 的容差测试，不足以证明纯搬家没改坏。
 
-**第一条，编译产物逐字节相同。** 搬家前后跑同一份 MegaMoEV2 配置，从 JIT cache 的 `CompiledArtifact` 取 `_ir_text` 与 `_source_ir` 比对，必须完全一致。这条直接证明生成的代码没变。
+**第一条，生成的 IR 逐字节相同。** 搬家前后各跑一次同一份 MegaMoEV2 配置，导出 JIT cache 里全部 `CompiledArtifact` 的 `sha256(_ir_text)`，排序后 `diff`，必须完全一致。
+
+这条的具体做法我实测验证过，有两个坑必须避开。
+
+**只能比 `_ir_text`，不能比 `_source_ir`。** 后者把绝对路径和行号烤进了 MLIR：
+
+```
+_ir_text    含 '.py': False   含 loc(): False   含 'mega_moe': 无
+_source_ir  含 '.py': True    含 loc(): True    含 '/root/workspace': True
+```
+
+`_source_ir` 第一行就是 `#loc = loc("/root/workspace/aiter/.../mega_moe_stage2.py":502:0)`。函数换个文件、换个行号，这个字段必然变，但生成的代码可能一条指令都没动，拿它当守护会把每次纯搬家都误报成失败。`_ir_text` 从 `module attributes {gpu.container_module}` 开始，不含任何源码位置信息，才是能用的指纹。
+
+**不能按 cache 目录名配对。** FlyDSL 的 cache key 里直接包含 kernel 函数及其依赖的源码文本：
+
+```python
+# flydsl/compiler/jit_function.py:572-578
+parts.append(_get_func_source(func))
+depSources = _collect_dependency_sources(func, rootFile, owner_cls=owner_cls)
+depSources.sort()
+parts.extend(depSources)
+```
+
+所以搬家后目录名和 `.pkl` 文件名全都不一样。比对必须以哈希的多重集合为单位，两次运行之间要 `rm -rf ~/.flydsl/cache` 保证干净。
+
+**第二条，运行输出逐位相同。** 固定 seed 跑 `test_mega_moe_v2.py` 完整配置，前后输出张量用 `torch.equal` 比，不设容差。
 
 **第二条，运行输出逐位相同。** 固定 seed 跑 `test_mega_moe_v2.py` 完整配置，前后输出张量用 `torch.equal` 比，不设容差。
 
