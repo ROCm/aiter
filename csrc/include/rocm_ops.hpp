@@ -1471,6 +1471,17 @@ namespace py = pybind11;
           py::arg("m_indices")         = std::nullopt, \
           py::arg("reverse_sorted")    = std::nullopt);
 
+#define PA_DECODE_OPUS_PYBIND          \
+    m.def("pa_decode_opus_fwd",        \
+          &pa_decode_opus_fwd,         \
+          py::arg("q"),                \
+          py::arg("k_cache"),          \
+          py::arg("v_cache"),          \
+          py::arg("block_tables"),     \
+          py::arg("context_lens"),     \
+          py::arg("out"),              \
+          py::arg("softmax_scale"));
+
 #define PA_SPARSE_PREFILL_OPUS_PYBIND       \
     m.def("pa_sparse_prefill_opus_fwd",     \
           &pa_sparse_prefill_opus_fwd,      \
