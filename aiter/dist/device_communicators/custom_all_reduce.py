@@ -1584,7 +1584,7 @@ class CustomAllreduce:
                     residual_inp,
                     w=weight,
                     eps=eps,
-                    registered=True,
+                    registered=self.enable_register_for_capturing,
                     use_1stage=use_1stage,
                     out_hidden_dim=out_hidden_dim,
                     gemma_norm=gemma_norm,
@@ -1688,7 +1688,7 @@ class CustomAllreduce:
                     residual_inp,
                     w=weight,
                     eps=eps,
-                    registered=True,
+                    registered=self.enable_register_for_capturing,
                     use_1stage=use_1stage,
                     post_per_token_quant=True,
                     gemma_norm=gemma_norm,
@@ -1886,7 +1886,7 @@ class CustomAllreduce:
                     q_w,
                     k_w,
                     eps,
-                    registered=True,
+                    registered=self.enable_register_for_capturing,
                 )
             else:
                 return (
@@ -1955,7 +1955,7 @@ class CustomAllreduce:
                     head_dim,
                     rotary_dim,
                     eps,
-                    registered=True,
+                    registered=self.enable_register_for_capturing,
                 )
             else:
                 return (
@@ -2057,7 +2057,7 @@ class CustomAllreduce:
                     w=weight,
                     eps=eps,
                     group_size=group_size,
-                    registered=True,
+                    registered=self.enable_register_for_capturing,
                     use_1stage=use_1stage,
                     emit_bf16=emit_bf16,
                     transpose_scale=transpose_scale,
@@ -2116,7 +2116,7 @@ class CustomAllreduce:
                     residual_inp,
                     w=weight,
                     eps=eps,
-                    registered=True,
+                    registered=self.enable_register_for_capturing,
                     use_1stage=use_1stage,
                     emit_bf16=emit_bf16,
                 )
