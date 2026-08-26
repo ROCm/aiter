@@ -7,7 +7,6 @@ from aiter.ops.triton._triton_kernels.moe.moe_routing.bitmatrix import (
 from aiter.ops.triton._triton_kernels.moe.moe_routing.expt_data import (
     _expt_data_compute_stage1,
     _expt_data_compute_stage2,
-    _expt_data_compute_stage2_fused,
 )
 
 
@@ -211,6 +210,23 @@ def _combined_routing(
 
     pid = tl.program_id(0)
 
+    # Empty-expert CTAs have nothing to contribute, so let them out before
+    # stage1. stage1 is a next_pow2(n_expts_tot)-wide cumsum that EVERY CTA
+    # recomputes identically (512 lanes at E=384), and an empty expert's stage2
+    # returns immediately anyway -- so those CTAs pay the scan for nothing. At
+    # decode that is nearly the whole grid: 362-373 of 384 experts hold no
+    # gates, and skipping them measured 22.6us -> 6.5us at M=64.
+    #
+    # pid 0 is exempt because it owns stage1's terminal writes and the
+    # block_pid_map memset, and pid >= blocks1a is the routing half, which reads
+    # TokenStart. Neither depends on another CTA's stage1: every CTA writes the
+    # whole TokenStart/TileStart, so the survivors still see complete data.
+    # ExpertHist is final on entry here (a prior launch filled it), unlike in
+    # `_combined_routing_fused` where the same gate sits behind a barrier.
+    if pid != 0 and pid < blocks1a:
+        if tl.load(ExpertHist + pid) == 0:
+            return
+
     _expt_data_compute_stage1(
         pid,
         ExpertHist,
@@ -314,7 +330,11 @@ def _combined_routing_fused(
     )
 
     if pid < blocks1a:
-        _expt_data_compute_stage2_fused(pid, ExpertHist, TileStart, MDTileInfo)
+        # General stage2, not the one-tile-per-expert form: an expert can hold
+        # more than tile_dim gates as soon as n_tokens > tile_dim, and writing
+        # only its first tile drops the rest of its gates silently. That bound
+        # is what used to pin this kernel to n_tokens <= 16.
+        _expt_data_compute_stage2(pid, ExpertHist, TileStart, MDTileInfo, tile_dim_log2)
     else:
         _routing_compute_indx_fused(
             GatherIndx,

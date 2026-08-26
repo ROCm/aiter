@@ -84,15 +84,6 @@ def _expt_data_compute_stage2(
 
 
 @triton.jit
-def _expt_data_compute_stage2_fused(expt_id, Hist, TileStart, TileInfo):
-    n_tokens = tl.load(Hist + expt_id)
-    if n_tokens == 0:
-        return
-    TileInfo += tl.load(TileStart + expt_id)
-    tl.store(TileInfo, expt_id)
-
-
-@triton.jit
 def _expt_data_only_kernel(
     Hist,
     n_expts_tot,

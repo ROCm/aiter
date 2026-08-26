@@ -153,6 +153,62 @@ def sort_tokens(expt_scal, expt_indx, n_expts_tot, bitmatrix, block_m, HIST_BLOC
     )
 
 
+# `sort_tokens_fused` saves a launch over `sort_tokens` but pays for it twice, and
+# both terms have to stay small for the trade to be worth taking:
+#
+#  * the SORT TILE. It sorts every gate in one CTA, so cost grows with
+#    next_pow2(n_tokens) * next_pow2(n_expts_act) while `sort_tokens`, which
+#    blocks over tokens, stays flat.
+#  * the REDUNDANT BITMATRIX READ. `_sum_bitmatrix_rows_fused` runs in every one
+#    of the n_expts_tot + 1 CTAs, each reading the full
+#    next_pow2(n_tokens) x cdiv(n_expts_tot, 32) word bitmatrix.
+#
+# Measured on gfx1250 (graph replay, us, best num_warps), fused vs sort_tokens:
+#   E=384 k=6  M=8    64 /  36864   9.0 vs  9.9   fused
+#   E=384 k=6  M=32   256/ 147456  11.2 vs 10.4   sort   (bitmatrix term)
+#   E=384 k=6  M=64   512/ 294912  12.8 vs 10.6   sort   (bitmatrix term)
+#   E=256 k=8  M=32   256/  65536   9.0 vs  9.5   fused
+#   E=128 k=4  M=128  512/  65536   8.5 vs  9.4   fused
+#   E=128 k=4  M=256 1024/ 131072  10.8 vs  9.6   sort   (tile term)
+#   E=32  k=4  M=128  512/   4096   8.5 vs  8.9   fused
+#   E=32  k=4  M=512 2048/  16384  14.4 vs  9.2   sort   (tile term)
+# One term alone mispredicts half of these; the pair gets 13 of 14. The miss is
+# E=256 k=8 M=64 (bitmatrix 131072), which picks sort and gives up 0.8us -- the
+# cap is set to keep E=384 (DeepSeek-V4) on the right side instead, since at
+# 73728 it would otherwise pick fused at M=16 and give up 0.7us there.
+_FUSED_SORT_MAX_TILE = 512
+_FUSED_SORT_MAX_BITMATRIX_WORDS = 65536
+
+
+def _fused_sort_tile(n_tokens, n_expts_act):
+    return triton.next_power_of_2(n_expts_act) * triton.next_power_of_2(
+        max(n_tokens, 1)
+    )
+
+
+def use_fused_sort(n_tokens, n_expts_act, n_expts_tot):
+    """Whether `sort_tokens_fused` beats `sort_tokens` at this shape."""
+    bitmatrix_words = (
+        n_expts_tot
+        * triton.cdiv(n_expts_tot, 32)
+        * triton.next_power_of_2(max(n_tokens, 1))
+    )
+    return (
+        _fused_sort_tile(n_tokens, n_expts_act) <= _FUSED_SORT_MAX_TILE
+        and bitmatrix_words <= _FUSED_SORT_MAX_BITMATRIX_WORDS
+    )
+
+
+def _fused_sort_num_warps(n_tokens, n_expts_act):
+    """One warp per 128 gates of sort tile, capped at 8.
+
+    The single-CTA `tl.sort` is the whole cost here, so one warp stops paying
+    once the tile passes ~256: at tile 1024 num_warps=1 measured 23.9us against
+    15.4us at 8, and at tile 2048 68.9us against 22.1us.
+    """
+    return max(1, min(8, _fused_sort_tile(n_tokens, n_expts_act) // 128))
+
+
 def sort_tokens_fused(
     expt_scal, expt_indx, n_expts_tot, bitmatrix, block_m, HIST_BLOCK_M
 ):
@@ -163,6 +219,14 @@ def sort_tokens_fused(
     n_tokens, n_expts_act = expt_scal.shape
     n_gates = n_tokens * n_expts_act
     n_expts_act_pad = triton.next_power_of_2(n_expts_act)
+    # `_routing_compute_indx_fused` ignores its pid and always sorts tile 0, and
+    # `_sum_bitmatrix_rows_fused` reads exactly HIST_BLOCK_M bitmatrix rows, so
+    # one tile has to cover every token. A caller passing a smaller block would
+    # get every CTA redoing tile 0 and the tail tokens dropped, not an error.
+    assert HIST_BLOCK_M >= n_tokens, (
+        f"sort_tokens_fused needs HIST_BLOCK_M ({HIST_BLOCK_M}) >= n_tokens "
+        f"({n_tokens}): the fused kernel covers all tokens in one tile"
+    )
 
     hist = bitmatrix.scratchpad
     hist = hist[:n_expts_tot]
@@ -211,7 +275,7 @@ def sort_tokens_fused(
         BLOCK_A=BLOCK_A,
         EQUAL_A=(hist.shape[0] == BLOCK_A),  # optimization parameters
         USE_TDM=is_tdm_avail(),
-        num_warps=1,
+        num_warps=_fused_sort_num_warps(n_tokens, n_expts_act),
     )
 
     return (
@@ -329,8 +393,8 @@ def routing(
             apply_softmax=not sm_first,
             HIST_BLOCK_M=HIST_BLOCK_M,
         )
-        if num_tokens <= 16:
-            HIST_BLOCK_M = triton.next_power_of_2(num_tokens)
+        if use_fused_sort(num_tokens, n_expts_act, n_expts_tot):
+            HIST_BLOCK_M = triton.next_power_of_2(max(num_tokens, 1))
             sort_fn = sort_tokens_fused
         else:
             sort_fn = sort_tokens
@@ -407,7 +471,7 @@ def routing(
             HIST_BLOCK_M=32,
         )
 
-    if num_tokens <= 16:
+    if use_fused_sort(num_tokens, n_expts_act, n_expts_tot):
         HIST_BLOCK_M = triton.next_power_of_2(max(num_tokens, 1))
         sort_fn = sort_tokens_fused
     else:
@@ -469,7 +533,7 @@ def routing_from_hash(
         routed_scaling_factor=routed_scaling_factor,
     )
 
-    if n_tokens <= 16:
+    if use_fused_sort(n_tokens, n_expts_act, n_expts_tot):
         HIST_BLOCK_M = triton.next_power_of_2(max(n_tokens, 1))
         sort_fn = sort_tokens_fused
     else:

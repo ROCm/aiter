@@ -9,6 +9,8 @@ from aiter.ops.triton.moe.moe_routing.routing import (
     routing,
     routing_from_hash,
     routing_torch,
+    sort_tokens,
+    use_fused_sort,
 )
 from aiter.ops.triton.moe.moe_routing.topk import grouped_topk, topk
 from aiter.ops.triton.utils._triton.arch_info import get_arch
@@ -413,7 +415,7 @@ def _check_routing_data_bucket(
 @pytest.mark.parametrize(
     "n_tokens, n_expts_tot, n_expts_act",
     [
-        (8, 128, 4),  # tiny: hits sort_tokens_fused path (n_tokens <= 16)
+        (8, 128, 4),  # tiny: hits sort_tokens_fused
         (16, 128, 4),  # boundary
         (64, 128, 4),
         (1024, 128, 4),
@@ -943,6 +945,91 @@ def test_routing_score_mode_grouped(
     assert tri_routing_data.n_expts_tot == n_expts_tot
     assert tri_routing_data.n_expts_act == n_expts_act
     assert tri_routing_data.block_m == block_m
+
+
+# --------------------------------------------------------------------------
+# fused sort dispatch
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "n_tokens", [1, 2, 7, 16, 17, 32, 33, 64, 70, 128, 255, 256, 257, 512, 1024]
+)
+@pytest.mark.parametrize(
+    "n_expts_tot, n_expts_act", [(384, 6), (256, 8), (128, 4), (32, 4)]
+)
+def test_fused_sort_matches_blocked_sort(n_tokens, n_expts_tot, n_expts_act):
+    """`routing` must give the same answer whichever sort it dispatches to.
+
+    `sort_tokens_fused` used to emit ONE block_pid_map entry per expert, so it
+    was only correct while max(hist) <= block_m -- which is why `routing` was
+    pinned to n_tokens <= 16. Above that bound an expert holding two tiles kept
+    the 0xFFFFFFFF memset on its second one, the matmul scheduled no block for
+    it, and those gates were dropped with no fault. This walks n_tokens across
+    the dispatch boundary and compares against the blocked path, which never
+    had the bug.
+    """
+    torch.manual_seed(n_tokens * 1000 + n_expts_tot + n_expts_act)
+    dev = "cuda"
+    logits = torch.randn(n_tokens, n_expts_tot, device=dev, dtype=torch.bfloat16)
+    bias = torch.randn(n_expts_tot, device=dev, dtype=torch.float32)
+    kwargs = dict(
+        score_mode="sqrtsoftplus", bias=bias, renorm=True, routed_scaling_factor=2.5
+    )
+    block_m = _routing_block_m(n_tokens, n_expts_act, n_expts_tot)
+
+    tri_rd, tri_gather, tri_scatter = routing(logits, n_expts_act, **kwargs)
+
+    # reference: identical topk, forced down the blocked (never-fused) sort
+    expt_scal, expt_indx, bitmatrix = topk(
+        logits, n_expts_act, apply_softmax=False, HIST_BLOCK_M=32, **kwargs
+    )
+    ref = sort_tokens(expt_scal, expt_indx, n_expts_tot, bitmatrix, block_m, 32)
+    ref_hist, ref_gather, ref_scatter, ref_scal, ref_raw, ref_pad, ref_map = ref
+
+    assert_equal(ref_hist, tri_rd.expt_hist)
+    assert_equal(ref_gather, tri_gather)
+    assert_equal(ref_scatter, tri_scatter)
+    assert_close(ref_scal, tri_rd.gate_scal, 2e-2, 4e-3)
+    assert_equal(ref_raw, tri_rd.expt_data.token_offs_raw)
+    assert_equal(ref_pad, tri_rd.expt_data.token_offs_pad)
+    assert_equal(ref_map, tri_rd.expt_data.block_pid_map)
+
+    # The invariant the old fused stage2 broke, checked without a reference:
+    # every tile an expert needs must have a live block_pid_map entry, or the
+    # gates in the missing tiles never reach a matmul block.
+    hist = tri_rd.expt_hist.cpu()
+    want_tiles = int(((hist + block_m - 1) // block_m).sum())
+    live_tiles = int((tri_rd.expt_data.block_pid_map.cpu() != -1).sum())
+    assert live_tiles == want_tiles, (
+        f"block_pid_map has {live_tiles} live tiles, experts need {want_tiles} "
+        f"(max hist={int(hist.max())}, block_m={block_m}) -- dropped gates"
+    )
+    # ... and every gate must land somewhere exactly once.
+    seen = torch.zeros(n_tokens * n_expts_act, dtype=torch.bool)
+    seen[tri_scatter.long().cpu()] = True
+    assert bool(seen.all()), "scatter index is not a permutation of the gates"
+
+
+@pytest.mark.parametrize(
+    "n_tokens, n_expts_act, n_expts_tot, expected",
+    [
+        (1, 6, 384, True),
+        (8, 6, 384, True),  # tile 64, bitmatrix 36864
+        (16, 6, 384, False),  # tile 128 is fine, bitmatrix 73728 is not
+        (32, 6, 384, False),  # bitmatrix 147456
+        (32, 8, 256, True),  # same tile 256, but half the bitmatrix
+        (128, 4, 128, True),  # tile 512, bitmatrix 65536 -- both at the cap
+        (256, 4, 128, False),  # tile 1024
+        (512, 4, 32, False),  # tile 2048, tiny bitmatrix -- tile still rules
+    ],
+)
+def test_fused_sort_gate_weighs_the_tile_and_the_bitmatrix(
+    n_tokens, n_expts_act, n_expts_tot, expected
+):
+    """Neither term alone predicts the winner: the tile is what the single-CTA
+    `tl.sort` chews through, the bitmatrix is what every CTA re-reads."""
+    assert use_fused_sort(n_tokens, n_expts_act, n_expts_tot) is expected
 
 
 def bench_routing():
