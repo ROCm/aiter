@@ -22,8 +22,10 @@ Two non-negotiables:
 2. **New configs go in the target layout** unless their family is still in the
    legacy directory (see §6).
 
-`GEMM-AFP4WFP4` (gfx950 triton, gfx950/gfx1250 gluon) is the only migrated
-family and the worked reference — copy its shape when in doubt.
+`GEMM-AFP4WFP4` (gfx950 triton, gfx950/gfx1250 gluon) and
+`GEMM-AFP4WFP4_PRESHUFFLED` (gfx950/gfx1250 triton) are the migrated
+families; `GEMM-AFP4WFP4` is the worked reference — copy its shape when in
+doubt.
 
 ---
 
@@ -207,13 +209,14 @@ files by the packed byte width will never be found.
 ## 5. MOE configs
 
 MOE does **not** go through `get_gemm_config()`. There is no probe order, no
-nested-layout support, and no `is_tuned` signal. Three independent loaders read
+nested-layout support, and no `is_tuned` signal. Four independent loaders read
 `configs/moe/` directly, each with its own schema:
 
 | Loader | File | Schema |
 | ------ | ---- | ------ |
 | `utils/moe_config_utils.py::get_moe_configs` | `moe/<arch>-MOE-<dtype_str>.json` | `small_M` / `medium_M` / `large_M` |
 | `moe/moe_op_gemm_a8w4.py::_get_a8w4_dispatch` | `moe/<arch>-A8W4.json` | `bm<block_m>_n<N>_k<K>` |
+| `moe/moe_op_gemm_a4w4.py::_get_a4w4_dispatch` | `moe/<arch>-A4W4.json` | `bm<block_m>_n<N>_k<K>_<bucket>` |
 | `_triton_kernels/moe/moe_routing_sigmoid_top1_fused.py` | `moe/<arch>-MOE_ROUTING_SIGMOID_TOPK1.json` | `N16` → `small` / `medium` / … |
 
 `<dtype_str>` comes from `get_config_dtype_str()`: `DEFAULT`, `FP8_W8A8`,
@@ -222,6 +225,14 @@ nested-layout support, and no `is_tuned` signal. Three independent loaders read
 `small_M` / `medium_M` / `large_M` split on `M_THRESHOLD_SMALL = 256` and
 `M_THRESHOLD_MEDIUM = 1024`, both module constants in `moe_config_utils.py`.
 This is **not** the GEMM `M_LEQ_x` / `M_GEQ_y` scheme — do not mix them.
+
+`A4W4` feeds the **gluon path only** (`get_kernel_config_gluon`); a4w4's triton
+path still computes its config in Python. Its `<bucket>` is a *third* M scheme —
+`m2bucket()` in `moe_op_gemm_a4w4.py`, splitting on 8 / 32 / 128 / 256 / 512 into
+`tiny` / `small` / `medium` / `medium2` / `large` / `xlarge`. Lookup is two tiers:
+`bm<block_m>_n<N>_k<K>_<bucket>`, then `bm<block_m>_any`. Since a missing bucket
+falls all the way through to `_any` and loses the shape's tuning, a tuned shape
+must supply **all six** buckets, even where the values repeat.
 
 ### MOE is the main offender for tuning values in Python
 
@@ -340,10 +351,10 @@ legacy form if a step is ambiguous.
    if absent.
 4. **Do not edit contents in the same commit.** Keep renames at 100% similarity;
    content changes go in a follow-up commit.
-5. **Update docs.** `aiter/ops/triton/README.md` ("How config selection works",
-   "Config file naming convention") and
-   `aiter/ops/triton/utils/_triton/tunning/README.md` (the step that says
-   `cp *.json .../configs/gemm/`) both still describe only the legacy layout.
+5. **Update docs.** `aiter/ops/triton/README.md` ("How GEMM configs resolve",
+   "Config naming") and `aiter/ops/triton/utils/_triton/tunning/README.md`
+   (the copy step under "Verify performance") both describe the two layouts —
+   keep them current if a migration changes what they say.
 6. **Pull any tuning values still hardcoded in Python into the JSON.** A
    migrated family must be fully described by its config files.
 7. **Verify** on the target arch: config resolves, `is_tuned` is `True` for a
