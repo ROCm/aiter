@@ -1184,6 +1184,27 @@ def _assert_mean_abs_within(out, ref, *, mean_atol, label):
     )
 
 
+def _assert_rmse_within(out, ref, *, rmse_ratio, label):
+    """Guard the RMSE *ratio* (‖out-ref‖ / ‖ref‖), not an absolute tolerance.
+
+    For the ungated recurrence (``g=None``) there is no per-chunk decay, so the
+    state ``h`` grows monotonically across the scan and reaches magnitudes in the
+    thousands on a long sequence. The per-chunk math stays correct, but bf16
+    intermediate rounding accumulates over dozens of dependent GEMM steps into a
+    worst-element absolute error far above the O(1) ``atol`` the gated shapes use
+    -- while the *relative* error stays ~1%. An absolute/mean-abs bound is
+    therefore meaningless here; the scale-invariant RMSE ratio is the right
+    measure. (Real GDN always supplies a decay gate that keeps ``h`` bounded, so
+    this only bites the deliberately-ungated regression path.)
+    """
+    diff = (out.float() - ref.float()).pow(2).mean().sqrt()
+    denom = ref.float().pow(2).mean().sqrt() + 1e-8
+    ratio = (diff / denom).item()
+    assert (
+        ratio <= rmse_ratio
+    ), f"{label}: RMSE ratio {ratio:.3e} exceeds {rmse_ratio:.3e}"
+
+
 def _truncate_to_bf16(x):
     """Keep the high 16 bits of an fp32 tensor, i.e. the HIP ``float_to_bf16``
     truncation the bf16 snapshot specialization applies to its accumulators."""
@@ -1947,6 +1968,84 @@ class TestCorrectness:
             fs_ref,
             output_final_state=True,
             label="flydsl_non_mul64",
+        )
+
+    @pytest.mark.parametrize(
+        "tag, context_lens, use_g",
+        [
+            ("nonvarlen_2500_no_g", [2500], False),  # 2500 % 64 == 4
+            ("varlen_1000x2_no_g", [1000, 1000], False),  # 1000 % 64 == 40
+            ("nonvarlen_2048_no_g", [2048], False),  # control: % 64 == 0
+            ("nonvarlen_2500_g", [2500], True),  # 2500 % 64 == 4
+            ("varlen_1000x2_g", [1000, 1000], True),  # 1000 % 64 == 40
+            ("nonvarlen_2048_g", [2048], True),  # control: % 64 == 0
+        ],
+    )
+    def test_use_g_false_partial_chunk(self, tag, context_lens, use_g):
+        """FlyDSL K5 over long sequences whose length is not a multiple of the
+        chunk size ``BT=64``, on both the ungated (``g=None``) and gated paths.
+        """
+        _RMSE_TOL = 3e-2
+        B = 1
+
+        T_total = sum(context_lens)
+        N = len(context_lens)
+        cu = torch.tensor(
+            [0] + [sum(context_lens[: i + 1]) for i in range(N)],
+            dtype=torch.int32,
+            device="cuda",
+        )
+        H, Hg, K, V = 16, 16, 128, 128
+        k = torch.randn(1, T_total, Hg, K, dtype=torch.bfloat16, device="cuda") * 0.1
+        w_orig = (
+            torch.randn(1, T_total, H, K, dtype=torch.bfloat16, device="cuda") * 0.1
+        )
+        u_orig = (
+            torch.randn(1, T_total, H, V, dtype=torch.bfloat16, device="cuda") * 0.1
+        )
+        w_c = w_orig.permute(0, 2, 1, 3).contiguous()
+        u_c = u_orig.permute(0, 2, 1, 3).contiguous()
+        h0 = torch.randn(N, H, V, K, dtype=torch.float32, device="cuda") * 0.01
+
+        g = None
+        if use_g:
+            gh = (
+                torch.randn(B, H, T_total, dtype=torch.float32, device="cuda").abs()
+                * -0.5
+            )
+            g = gh.cumsum(dim=-1).contiguous()
+
+        h_fly, vn_fly, fs_fly = chunk_gated_delta_rule_fwd_h_flydsl(
+            k,
+            w_c,
+            u_c,
+            g=g,
+            initial_state=h0,
+            output_final_state=True,
+            cu_seqlens=cu,
+            use_exp2=False,
+        )
+
+        h_ref, vn_ref, fs_ref = ref_chunk_gated_delta_rule_fwd_h(
+            k,
+            w_orig,
+            u_orig,
+            g=g,
+            initial_state=h0,
+            output_final_state=True,
+            cu_seqlens=cu,
+            g_head_major=g is not None,
+        )
+
+        _assert_rmse_within(h_fly, h_ref, rmse_ratio=_RMSE_TOL, label=f"{tag} h")
+        _assert_rmse_within(
+            _normalize_opt_v_new(vn_fly),
+            vn_ref,
+            rmse_ratio=_RMSE_TOL,
+            label=f"{tag} v_new",
+        )
+        _assert_rmse_within(
+            fs_fly, fs_ref, rmse_ratio=_RMSE_TOL, label=f"{tag} final_state"
         )
 
 

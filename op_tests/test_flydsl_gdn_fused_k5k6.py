@@ -12,32 +12,45 @@ where ``h_ref`` / ``v_new_ref`` come from the pure-PyTorch K5 reference
 from the FlyDSL K5 kernel itself (whose correctness is covered by
 ``test_flydsl_linear_attention_prefill.py``).
 
-Two levels:
+Correctness levels:
   * ``test_fused_unit``     — call the fused wrapper directly.
   * ``test_fused_pipeline`` — call the end-to-end pipeline with
     ``fusion=K5K6Fusion.ALWAYS`` and compare to the NEVER/Triton baseline.
 
-Run as a script for the perf sweep (not collected by pytest):
-    PYTHONPATH=. python op_tests/test_flydsl_gdn_fused_k5k6.py                  # fused
-    PYTHONPATH=. python op_tests/test_flydsl_gdn_fused_k5k6.py --kernel k5      # state scan
-    PYTHONPATH=. python op_tests/test_flydsl_gdn_fused_k5k6.py \
-        --kernel k5 --k5-variants all                                # per-variant K5
+Invocation (mirrors ``test_flydsl_linear_attention_prefill.py``): running the
+file as a script drives pytest, so single cases select the usual way::
+
+    python op_tests/test_flydsl_gdn_fused_k5k6.py                 # all correctness tests
+    python op_tests/test_flydsl_gdn_fused_k5k6.py -k test_fused_unit
+    pytest op_tests/test_flydsl_gdn_fused_k5k6.py::test_fused_final_state
+
+The perf sweep is opt-in behind ``--bench`` and never runs under pytest::
+
+    python op_tests/test_flydsl_gdn_fused_k5k6.py --bench               # fused sweep
+    python op_tests/test_flydsl_gdn_fused_k5k6.py --bench --kernel k5   # state scan
+    python op_tests/test_flydsl_gdn_fused_k5k6.py --bench \
+        --kernel k5 --k5-variants all                          # per-variant K5
 """
 
 from __future__ import annotations
 
-import argparse
+import os
 import sys
 
-import pandas as pd
+# Ensure the repo root is importable so ``from op_tests....`` resolves under a
+# bare ``python op_tests/test_flydsl_gdn_fused_k5k6.py`` invocation (CI runs the
+# file this way). Under pytest the rootdir is already on sys.path, so this is a
+# no-op there. This file imports a sibling test module (unlike the other
+# op_tests, which are self-contained), hence the bootstrap.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
 import pytest
 import torch
 
-import aiter
-from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.utils import is_flydsl_available
-from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 if not torch.cuda.is_available():
     pytest.skip("ROCm not available. Skipping GPU tests.", allow_module_level=True)
@@ -49,7 +62,6 @@ if not is_flydsl_available():
 
 try:
     from aiter.ops.flydsl.linear_attention_prefill_kernels import (
-        K5_VARIANTS,
         chunk_gated_delta_rule_fwd_h_o_flydsl,
     )
     from aiter.ops.triton._triton_kernels.gated_delta_rule.prefill.chunk_o import (
@@ -479,8 +491,22 @@ def test_fused_auto_routing(H, Hg, seq_lens, expect_fused):
 
 
 # --------------------------------------------------------------------------- #
-# Perf sweep (run via __main__)
+# Perf sweep (opt-in: run via ``--bench``; never collected by pytest)
 # --------------------------------------------------------------------------- #
+# The imports below are only needed by the benchmark path, so they live here
+# rather than at module scope -- the default (pytest / correctness) run does not
+# pay for pandas or the benchmarking helpers.
+import aiter
+from aiter import dtypes
+from aiter.ops.flydsl.linear_attention_prefill_kernels import (
+    K5_VARIANTS,
+)
+from aiter.test_common import (
+    benchmark,
+    checkAllclose,
+    run_perftest,
+)
+
 # Shapes: Kimi-K3 (KDA, gk gate) and Qwen (GDN, g gate), real TP configs.
 # Columns: (model_tag, H, Hg, T_flat, N, gate)
 # K=V=128 (fixed for all KDA/GDN production shapes).
@@ -1086,14 +1112,17 @@ def bench_k5(model_tag, H, Hg, T_flat, N, gate, variants=None):
     )
 
 
-def main():
+def main(argv=None):
+    import argparse
+
     if get_gfx() not in SUPPORTED_GFX:
         aiter.logger.warning("fused GDN K5+K6 unsupported on %s; skipping", get_gfx())
         return
 
     parser = argparse.ArgumentParser(
+        prog="test_flydsl_gdn_fused_k5k6.py --bench",
         formatter_class=argparse.RawTextHelpFormatter,
-        description="FlyDSL fused GDN K5+K6 correctness + perf sweep",
+        description="FlyDSL fused GDN K5+K6 perf sweep",
     )
     parser.add_argument(
         "--gate",
@@ -1137,7 +1166,7 @@ def main():
             "Only affects --kernel k5."
         ),
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     gate_set = set(args.gate)
     if args.T == "all":
@@ -1181,6 +1210,8 @@ def main():
                 # it is already encoded in the flydsl_vk:<tag> column names.
                 row.pop("variants", None)
                 rows.append(row)
+        import pandas as pd
+
         title = "fused GDN K5+K6" if kernel == "fused" else "GDN K5 (state scan)"
         aiter.logger.info(
             "%s summary (markdown):\n%s",
@@ -1203,4 +1234,12 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    # Default: drive pytest over this file (correctness only), so single cases
+    # select the usual way -- ``python <file> -k test_fused_unit`` or
+    # ``pytest <file>::test_name``. This is also what CI's bare ``python3 <file>``
+    # runs. The perf sweep is opt-in behind ``--bench`` and never runs here.
+    argv = sys.argv[1:]
+    if "--bench" in argv:
+        argv.remove("--bench")
+        raise SystemExit(main(argv))
+    raise SystemExit(pytest.main([__file__, *argv]))
