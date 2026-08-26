@@ -36,15 +36,18 @@ struct opus_gqa_kargs {
 };
 
 // Configuration traits for the GQA kernel (tile sizes, data types, vector lengths,
-// MFMA config). This integration is D=128 only: MFMA 32x32x16 bf16, K/V loaded in
-// one shot (no D slicing).
+// MFMA config). MFMA 32x32x16 bf16, K/V loaded in one shot (no D slicing), which holds
+// for D=64 and D=128 alike — every quantity below is derived from D_TILE_SIZE and stays
+// integral at both. The static_asserts near the end of the struct enforce that rather
+// than relying on this list being kept in sync.
 template<int Q_TILE_SIZE_ = 32,
         int KV_TILE_SIZE_ = 64,
         int D_TILE_SIZE_ = 128,
         int NUM_WARPS_ = 8,
         bool CAUSAL_ = false>
 struct opus_gqa_traits {
-    static_assert(D_TILE_SIZE_ == 128, "fmha_fwd_hd128_bf16_opus supports D_TILE_SIZE 128 only");
+    static_assert(D_TILE_SIZE_ == 64 || D_TILE_SIZE_ == 128,
+                  "opus_gqa_traits supports D_TILE_SIZE 64 or 128");
 
     static constexpr int Q_TILE_SIZE = Q_TILE_SIZE_;
     static constexpr int KV_TILE_SIZE = KV_TILE_SIZE_;
@@ -105,7 +108,9 @@ struct opus_gqa_traits {
     static constexpr int smem_padding_16B = 16 / sizeof(D_ATTN);
     static constexpr int smem_padding_64B = 64 / sizeof(D_ATTN);
 
-    // K/V smem padding (D=128): K uses 16B padding, V uses 64B padding.
+    // K/V smem padding: K uses 16B padding, V uses 64B padding. Tuned at D=128; kept
+    // identical at D=64 so the port is behaviour-preserving, but it is a tuning knob
+    // (bank-conflict behaviour differs when smem_d_rpt drops from 2 to 1).
     static constexpr int smem_k_padding = smem_padding_16B;
     static constexpr int smem_v_padding = smem_padding_64B;
 
@@ -129,6 +134,18 @@ struct opus_gqa_traits {
     static constexpr int KEEP_VMCNT = k_buffer_load_insts + v_buffer_load_insts;
     static constexpr int k_ds_read_insts = (GEMM0_E_N * GEMM0_E_K * W_N * W_K) / (WARP_SIZE * VEC_KV);
     static constexpr int v_ds_read_insts = (GEMM1_E_N * GEMM1_E_K * W_N * W_K) / (WARP_SIZE * VEC_TR_V);
+
+    // D-generality guards: every derived count above must divide exactly, or the tiling
+    // silently drops work. Checked here so a new D_TILE_SIZE fails at compile time.
+    static_assert(D_TILE_SIZE % D_128B_SIZE == 0, "D_TILE_SIZE must be a multiple of 128B");
+    static_assert(SLICE_D % W_K == 0, "SLICE_D must divide the MFMA K (GEMM0_E_K)");
+    static_assert(SLICE_D % W_N == 0, "SLICE_D must divide the MFMA N (GEMM1_E_N)");
+    static_assert((KV_TILE_SIZE * D_TILE_SIZE) % (BLOCK_SIZE * VEC_KV) == 0,
+                  "K/V tile must divide evenly into whole-block vector loads");
+    static_assert((GEMM0_E_N * GEMM0_E_K * W_N * W_K) % (WARP_SIZE * VEC_KV) == 0,
+                  "K ds_read count must be integral");
+    static_assert((GEMM1_E_N * GEMM1_E_K * W_N * W_K) % (WARP_SIZE * VEC_TR_V) == 0,
+                  "V ds_read count must be integral");
 
     static constexpr size_t smem_size_bytes() {
         // Q-in-LDS layout (K double-buffered + Q/V aliased shared region).

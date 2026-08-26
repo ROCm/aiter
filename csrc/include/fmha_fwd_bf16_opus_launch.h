@@ -143,13 +143,17 @@ inline bool launch_d128(const fmha_fwd_bf16_opus_args& a, hipStream_t stream)
         HIP_CALL_LAUNCH(hipGetLastError());
     };
 
-    if(a.causal)
+    // Tile shape (Q=32, KV=64, 8 waves) is shared by both head dims; only D_TILE_SIZE
+    // differs, and every derived count in opus_gqa_traits follows from it.
+    if(a.hdim_q == 128)
     {
-        launch(opus_gqa_traits<32, 64, 128, 8, true>{});
+        if(a.causal) { launch(opus_gqa_traits<32, 64, 128, 8, true>{}); }
+        else         { launch(opus_gqa_traits<32, 64, 128, 8, false>{}); }
     }
-    else
+    else // D=64 (the dispatcher only routes hdim 64 or 128 here)
     {
-        launch(opus_gqa_traits<32, 64, 128, 8, false>{});
+        if(a.causal) { launch(opus_gqa_traits<32, 64, 64, 8, true>{}); }
+        else         { launch(opus_gqa_traits<32, 64, 64, 8, false>{}); }
     }
     return true;
 }
@@ -286,7 +290,7 @@ inline bool fmha_fwd_bf16_opus_launch(const fmha_fwd_bf16_opus_args& a, hipStrea
 
     const bool is_group = (a.seqstart_q_ptr != nullptr);
 
-    if(a.hdim_q == 128 && a.hdim_v == 128)
+    if(a.hdim_q == a.hdim_v && (a.hdim_q == 64 || a.hdim_q == 128))
     {
         if(is_group)
             return false;

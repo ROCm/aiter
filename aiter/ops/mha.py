@@ -2032,10 +2032,12 @@ def _flash_attn_forward(
             ret = ret and (seqlen_k >= seqlen_q)
         return ret
 
-    def _can_impl_fmha_fwd_hd128_bf16_opus():
+    def _can_impl_fmha_fwd_sym_bf16_opus():
+        # Symmetric-head-dim OPUS forward: D_QK == D_V in {64, 128}. Both share one
+        # kernel template (opus_gqa_traits differs only in D_TILE_SIZE).
         if int(os.environ.get("AITER_ENABLE_FMHA_OPUS", "0")) == 0:
             return False
-        if not (hdim_q == 128 and hdim_v == 128):
+        if hdim_q != hdim_v or hdim_q not in (64, 128):
             return False
         # KV byte extent >= 2^32 wraps the kernel's 32-bit async-load soffset; fall back to
         # v3/CK. Actual seqlen stride (layout-aware, matches the C++ guard).
@@ -2067,7 +2069,7 @@ def _flash_attn_forward(
         ret = ret and (q_descale is None and k_descale is None and v_descale is None)
         ret = ret and (not return_softmax)
         ret = ret and (
-            _can_impl_fmha_fwd_hd128_bf16_opus()
+            _can_impl_fmha_fwd_sym_bf16_opus()
             or _can_impl_fmha_fwd_hd192_v128_bf16_opus()
         )
         return ret
