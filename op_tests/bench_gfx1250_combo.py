@@ -712,13 +712,16 @@ def run_mori_ep(_args):
     """Run MORI EPv2 dispatch/combine at the DSv4 MoE shape."""
     print("\n===== mori_ep (DSv4 dispatch/combine) =====", flush=True)
     mori = os.environ.get("MORI", "/app/mori")
-    for command in (
-        ["git", "fetch", "origin", "main"],
-        ["git", "switch", "main"],
-        ["git", "pull", "--ff-only", "origin", "main"],
-        [sys.executable, "-m", "pip", "install", "."],
-    ):
-        subprocess.run(command, cwd=mori, check=True)
+    # Bench whatever mori the image ships. Re-fetching main and reinstalling it
+    # moved the measurement target between runs, and the rebuild needs a dev
+    # ROCm toolchain that the pip-wheel images do not have.
+    # for command in (
+    #     ["git", "fetch", "origin", "main"],
+    #     ["git", "switch", "main"],
+    #     ["git", "pull", "--ff-only", "origin", "main"],
+    #     [sys.executable, "-m", "pip", "install", "."],
+    # ):
+    #     subprocess.run(command, cwd=mori, check=True)
 
     env = os.environ.copy()
     env["PYTHONPATH"] = f"{mori}/python:{mori}"
@@ -974,9 +977,10 @@ OPS = {
 # Every case passes when run in a fresh process, so this looks like state
 # leaking across cases rather than a kernel bug. Re-enable once isolated.
 PERF_OPS = ["mha", "moe", "mla_v4_decode"]
+# "mori_ep" is out of the default sweep: it benchmarks mori rather than aiter,
+# and it needs a dev ROCm toolchain to build. Run it explicitly when wanted.
 DSV4_OPS = [
     "mega_moe",
-    "mori_ep",
     "moe",
     "a8w8_blockscale",
     "a16w16",
