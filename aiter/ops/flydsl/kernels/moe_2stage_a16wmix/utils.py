@@ -121,8 +121,8 @@ def _int4_nibble_to_bf16x8(raw_i32, scale_f32, *, use_k16=False, old_pack=False)
 
     ``raw_i32`` holds 8 signed-int4 nibbles. ``v_cvt_off_f32_i4`` reads the nibble
     unsigned, subtracts 8, and scales the mantissa by 16, so the x16 is folded into
-    ``eff = scale*16``. ``use_k16`` (gfx942): no ``v_cvt_pk_bf16_f32``; pack bf16
-    with lshr-16 instead of scalar truncf.
+    ``eff = scale*16``. ``use_k16`` (gfx942): pack two f32 high-16s into a bf16
+    pair with lshr-16 (no ``v_cvt_pk_bf16_f32`` on this arch).
 
     ``old_pack`` (a16wi4 consuming the OLD FlyDSL kernel's weight preshuffle,
     ``pack_int8_to_packed_int4``): byte j packs K_j (low nibble) and K_{j+4} (high
@@ -136,8 +136,7 @@ def _int4_nibble_to_bf16x8(raw_i32, scale_f32, *, use_k16=False, old_pack=False)
     raw_even = fx.Int32(raw_i32)
     raw_odd = raw_even.shrui(fx.Int32(4))
     if use_k16:
-        # gfx942: no v_cvt_pk_bf16_f32. High-16-bit pack, not scalar truncf.
-        # Exact for scaled int4.
+        # gfx942: pack two f32 high-16s into a bf16 pair. Exact for scaled int4.
         los = []
         his = []
         for j in range_constexpr(4):
@@ -451,8 +450,7 @@ def make_b_loader(
     here rather than inline in the kernel body does not perturb instruction order.
 
     Cache-key note: FlyDSL hashes this factory's source (not nested helpers).
-    gfx942 a16wi4 W upconvert is lshr-16 bf16 pack in ``_int4_nibble_to_bf16x8``,
-    not scalar truncf.
+    gfx942 a16wi4 W upconvert is lshr-16 bf16 pack in ``_int4_nibble_to_bf16x8``.
     """
     _is_int4 = w_dtype == "int4"
     _is_bf16 = w_dtype == "bf16"
