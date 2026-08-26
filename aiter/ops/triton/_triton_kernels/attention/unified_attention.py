@@ -282,8 +282,6 @@ def kernel_unified_attention_2d(
         v_descale = None
     KV_cache_modifier: tl.constexpr = ".cg" if ALL_DECODE else ""
 
-    # Tiles before the earliest query's causal limit need only head padding masks.
-    # A separate loop keeps their loads free of per-element bounds checks.
     if USE_PREFILL_FAST_PATH and SLIDING_WINDOW <= 0 and not ALL_DECODE:
         min_query_key_limit = context_len + q_block_local_idx * BLOCK_Q + 1
         unmasked_tile_end = tl.minimum(min_query_key_limit // TILE_SIZE, tile_end)
@@ -332,7 +330,6 @@ def kernel_unified_attention_2d(
             S = apply_softcap(S, softcap) * RCP_LN2
 
         if USE_ALIBI_SLOPES:
-            # prescale w. RCP_LN2 for later exp2
             S += alibi_slope[:, None] * (seq_offset - context_len) * RCP_LN2
 
         if USE_QQ_BIAS:
