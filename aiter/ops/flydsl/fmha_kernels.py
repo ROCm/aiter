@@ -52,21 +52,6 @@ __all__ = [
 _FP8_DTYPES = (torch.float8_e4m3fn,)
 
 
-def _live_gfx(device=None) -> str:
-    """Return the normalized architecture of a live GPU, or ``""``."""
-    try:
-        props = torch.cuda.get_device_properties(device)
-        arch = getattr(props, "gcnArchName", "")
-    except Exception:  # noqa: BLE001
-        arch = ""
-    if arch:
-        return arch.lower().split(":")[0]
-    try:
-        return get_gfx_runtime()
-    except Exception:  # noqa: BLE001
-        return ""
-
-
 # ---------------------------------------------------------------------------
 # FP8 quantization (+ optional Hadamard rotation) for the fp8 attention path.
 #
@@ -192,6 +177,26 @@ if _HAS_TRITON:
         tl.store(yp + offs, x.to(yp.dtype.element_ty), mask=rmask[:, None])
 
 
+def _live_gfx(device=None) -> str:
+    """Return the normalized architecture of a live GPU, or ``""``.
+
+    Prefer PyTorch properties so detection follows the tensor's device and does
+    not require ``rocminfo`` in minimal runtime containers. Keep the shared
+    runtime detector as a fallback for environments without ``gcnArchName``.
+    """
+    try:
+        props = torch.cuda.get_device_properties(device)
+        arch = getattr(props, "gcnArchName", "")
+    except Exception:  # noqa: BLE001
+        arch = ""
+    if arch:
+        return arch.lower().split(":")[0]
+    try:
+        return get_gfx_runtime()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def _quant_pertensor_flydsl(x: torch.Tensor, rotate: bool):
     """Per-tensor rotate(optional)+fp8 quant of a single tensor via the fully
     FlyDSL 2-pass kernel. head_dim==128 only."""
@@ -223,28 +228,64 @@ def flydsl_fp8_quant(
 
     ``backend`` selects the producer: ``"flydsl"`` (default) runs the fully-FlyDSL
     2-pass rotate+quant kernels (in-register FWHT, no Triton); ``"triton"`` runs
-    the fused Triton passes; ``"torch"`` runs the reference. All three keep rotated
-    Q/K off HBM (2 reads + 0.5 write). The FlyDSL path requires head_dim==128
-    (per-tensor, so q/k/v may differ in size, e.g. cross-attention); it silently
-    falls back to Triton/torch for other head_dims. The Triton fused path
-    additionally requires same-size q/k/v.
+    the fused Triton passes; ``"torch"`` runs the reference and materializes its
+    rotated Q/K tensors. The FlyDSL and Triton paths recompute the rotation and
+    keep rotated Q/K off HBM (2 reads + 0.5 write). The FlyDSL path requires bf16
+    inputs, gfx1201, and head_dim==128 (per-tensor, so q/k/v may differ in size,
+    e.g. cross-attention); it silently falls back to Triton/torch otherwise. An
+    explicit ``"triton"`` request uses the fused path only when rotation is
+    enabled, a Hadamard matrix exists, and q/k/v have equal element counts; it
+    falls back to the Torch producer otherwise.
     """
+    if not isinstance(backend, str):
+        raise TypeError(f"backend must be a string, got {type(backend).__name__}")
+    be = backend.lower()
+    if be not in {"flydsl", "triton", "torch"}:
+        raise ValueError(
+            f"unsupported fp8 quant backend {backend!r}; "
+            "expected one of: 'flydsl', 'triton', 'torch'"
+        )
+    if not all(torch.is_tensor(x) for x in (q, k, v)):
+        raise TypeError("q/k/v must be torch tensors")
+    if any(x.dim() == 0 for x in (q, k, v)):
+        raise ValueError("q/k/v must have at least one dimension")
+    if not (q.shape[-1] == k.shape[-1] == v.shape[-1]):
+        raise ValueError(
+            "q/k/v must share head_dim, got "
+            f"q={q.shape[-1]} k={k.shape[-1]} v={v.shape[-1]}"
+        )
+    if not (q.dtype == k.dtype == v.dtype):
+        raise ValueError(f"q/k/v dtype must match: {q.dtype}/{k.dtype}/{v.dtype}")
+    if q.dtype not in (torch.bfloat16, torch.float16):
+        raise ValueError(f"q/k/v must be bfloat16 or float16, got {q.dtype}")
+    if not (q.is_cuda and k.is_cuda and v.is_cuda):
+        raise ValueError("q/k/v must be CUDA/HIP tensors")
+    if not (q.device == k.device == v.device):
+        raise ValueError(
+            "q/k/v must reside on the same device, got "
+            f"q={q.device} k={k.device} v={v.device}"
+        )
+
     head_dim = q.shape[-1]
     same_size = q.numel() == k.numel() == v.numel()
-    be = backend.lower()
 
     # Fully-FlyDSL per-tensor path (no Triton). Each tensor is quantized by its
     # own independent launch, so q/k/v need not be the same size (cross-attention
-    # is fine); only head_dim==128 (VEC=4) is required by the MVP kernel. Uses the
-    # in-register FWHT, so it needs no host-side Hadamard matrix.
-    if be == "flydsl" and head_dim == 128:
+    # is fine). The MVP kernel requires bf16 and head_dim==128 (VEC=4). It uses
+    # the in-register FWHT, so it needs no host-side Hadamard matrix.
+    flydsl_supported = (
+        q.dtype == k.dtype == v.dtype == torch.bfloat16
+        and head_dim == 128
+        and _live_gfx(q.device) == "gfx1201"
+    )
+    if be == "flydsl" and flydsl_supported:
         q8, sq = _quant_pertensor_flydsl(q, rotate=rotation)
         k8, sk = _quant_pertensor_flydsl(k, rotate=rotation)
         v8, sv = _quant_pertensor_flydsl(v, rotate=False)
         return q8, k8, v8, sq, sk, sv
 
     # Triton/torch fallbacks rotate with an explicit host-side Hadamard matrix.
-    R = _hadamard_matrix(head_dim, q.device, torch.bfloat16) if rotation else None
+    R = _hadamard_matrix(head_dim, q.device, q.dtype) if rotation else None
     if be == "torch" or not (_HAS_TRITON and R is not None and same_size):
         q8, sq = _quant_one_pertensor(q, R)
         k8, sk = _quant_one_pertensor(k, R)
@@ -395,8 +436,8 @@ def flydsl_flash_attn_func(
 ) -> torch.Tensor:
     """Run FlyDSL Flash Attention on RDNA4 (gfx1201).
 
-    Supports bf16/f16 self- and cross-attention, and a per-tensor fp8 self-attn
-    fast path. Tiles are chosen from the shape; seq_len is padded internally.
+    Supports bf16/f16 and per-tensor fp8 self- and cross-attention. Tiles are
+    chosen from the shape; sequence lengths are padded internally.
 
     Args:
         q: ``[batch, seqlen_q, num_heads, head_dim]`` (BSHD).
@@ -434,7 +475,7 @@ def flydsl_flash_attn_func(
             "q/k/v must reside on the same device, got "
             f"q={q.device} k={k.device} v={v.device}"
         )
-    gfx = _live_gfx()
+    gfx = _live_gfx(q.device)
     if gfx != "gfx1201":
         raise ValueError(
             f"flydsl_flash_attn_func requires gfx1201, got {gfx or 'unknown'!r}"
@@ -458,6 +499,11 @@ def flydsl_flash_attn_func(
 
     batch, seq_q_real, num_heads, head_dim = q.shape
     seq_kv_real = k.shape[1]
+    if batch == 0 or seq_q_real == 0 or seq_kv_real == 0 or num_heads == 0:
+        raise ValueError(
+            "batch, sequence lengths, and num_heads must be non-zero, got "
+            f"q={tuple(q.shape)} k={tuple(k.shape)}"
+        )
     is_cross = seq_kv_real != seq_q_real
     is_fp8 = q.dtype in _FP8_DTYPES
 
@@ -475,6 +521,25 @@ def flydsl_flash_attn_func(
         raise ValueError(
             f"kernel requires head_dim >= 64 and head_dim % 32 == 0, got {head_dim}"
         )
+    if softmax_scale is not None:
+        if torch.is_tensor(softmax_scale):
+            if softmax_scale.numel() != 1:
+                raise ValueError(
+                    "softmax_scale must be a scalar, "
+                    f"got shape {tuple(softmax_scale.shape)}"
+                )
+            if softmax_scale.device.type != "cpu":
+                raise ValueError(
+                    "tensor softmax_scale must be on CPU to avoid a device "
+                    "synchronization; pass a Python float for hot paths"
+                )
+            softmax_scale = softmax_scale.item()
+        try:
+            softmax_scale = float(softmax_scale)
+        except (TypeError, ValueError) as exc:
+            raise TypeError(
+                f"softmax_scale must be convertible to float, got {softmax_scale!r}"
+            ) from exc
 
     block_m, block_n = _pick_tiles(seq_q_real, head_dim)
 
@@ -522,7 +587,14 @@ def flydsl_flash_attn_func(
     tail_mask = (not causal) and (kv_len_for_mask % block_n != 0)
 
     seq_q_pad = ((seq_q_real + block_m - 1) // block_m) * block_m
-    seq_kv_pad = ((seq_kv_real + block_m - 1) // block_m) * block_m
+    # Self-attention aliases the kernel's KV length/stride to the padded Q
+    # length. Cross-attention tracks KV independently and only needs a complete
+    # BLOCK_N tile for the final cooperative load.
+    seq_kv_pad = (
+        seq_q_pad
+        if not is_cross
+        else ((seq_kv_real + block_n - 1) // block_n) * block_n
+    )
 
     q_p = _pad_seq(q, seq_q_pad - seq_q_real)
     k_p = _pad_seq(k, seq_kv_pad - seq_kv_real)

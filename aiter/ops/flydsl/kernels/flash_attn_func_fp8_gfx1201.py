@@ -11,7 +11,7 @@ scale; v_scale folds into the 1/l normalizer.
 
 Performance-relevant choices:
 
-1. BLOCK_N=32: fewer KV iterations and better occupancy than wider tiles.
+1. Shape-selected BLOCK_M/BLOCK_N tiles balance KV-loop work and occupancy.
 2. rocdl.exp2: native ISA exp2 intrinsic, bypasses arith lowering.
 3. Software-pipelined GEMM2: preload the next V pack while the current WMMA
    runs, hiding LDS read latency behind matrix compute.
@@ -39,14 +39,10 @@ Requires: head_dim % 32 == 0, head_dim >= 64.
 """
 
 import math as host_math
-import os
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
-from flydsl._mlir.dialects import (
-    llvm as _llvm,
-)
 from flydsl._mlir.dialects import (
     memref as _memref,
 )
@@ -58,48 +54,42 @@ from flydsl.expr import (
     range_constexpr,
     rocdl,
 )
-from flydsl.expr import math as fmath
-from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 from flydsl.expr.utils.arith import ArithValue
 from flydsl.expr.utils.arith import _to_raw as _raw
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 
-from .kernels_common import dtype_to_elem_type
-from .tensor_shim import _run_compiled
-
 try:
     from flydsl.expr import buffer_ops
 except ImportError:
     from aiter.ops.flydsl.kernels import buffer_ops
 
+from .flash_attn_func_common_gfx1201 import (
+    configure_gpu_module,
+    flatten_and_mask_scores,
+    kv_load_schedule,
+    next_kv_tile_start,
+    pointer_arg,
+    update_online_softmax,
+    wrap_pointer_args,
+)
+from .flash_attn_func_common_gfx1201 import (
+    fast_mul as _fmul,
+)
+from .flash_attn_func_common_gfx1201 import (
+    pointer_load as _pointer_load,
+)
+from .flash_attn_func_common_gfx1201 import (
+    pointer_store as _pointer_store,
+)
+from .flash_attn_func_common_gfx1201 import (
+    pointer_to_llvm_ptr as _pointer_to_llvm_ptr,
+)
+from .kernels_common import dtype_to_elem_type
+from .tensor_shim import _run_compiled
+
 _LOG2E = host_math.log2(host_math.e)
-
-
-def _llvm_value(value):
-    """Unwrap FlyDSL scalar/vector wrappers for LLVM pointer load ops."""
-    if hasattr(value, "ir_value") and not isinstance(value, ir.Value):
-        return value.ir_value()
-    return value
-
-
-def _llvm_ptr_ty():
-    return ir.Type.parse("!llvm.ptr")
-
-
-def _pointer_to_llvm_ptr(ptr) -> ir.Value:
-    """Convert a FlyDSL pointer argument to the LLVM pointer used by raw loads."""
-    ptr_i64 = arith.index_cast(T.i64, fx.ptrtoint(ptr))
-    return _llvm.IntToPtrOp(_llvm_ptr_ty(), ptr_i64).result
-
-
-def _pointer_load(result_type: ir.Type, ptr: ir.Value) -> ir.Value:
-    return _llvm.LoadOp(result_type, _llvm_value(ptr)).result
-
-
-def _pointer_store(value: ir.Value, ptr: ir.Value):
-    return _llvm.StoreOp(_llvm_value(value), _llvm_value(ptr))
 
 
 def build_flash_attn_func_module(
@@ -190,41 +180,42 @@ def build_flash_attn_func_module(
         f"_h{num_heads}_d{head_dim}_m{BLOCK_M}n{BLOCK_N}{_name_flags}"
     )
 
-    # LDS layout -- K uses padding instead of XOR swizzle; V row-major with padding
+    # LDS layout -- K is row-major; V is transposed with the KV row contiguous.
     K_STRIDE = HEAD_DIM + 4  # padding to reduce bank conflicts (no swizzle)
     K_STRIDE_I32 = K_STRIDE // 4  # K in i32 units (4 fp8 per i32)
-    V_STRIDE = HEAD_DIM + 4  # padding to reduce bank conflicts
 
-    ENABLE_LDS_VEC16 = os.getenv("FLYDSL_FLASH_ATTN_FUNC_ENABLE_LDS_VEC16", "1") == "1"
-    VEC_WIDTH = 16 if ENABLE_LDS_VEC16 else 8
-    THREADS_PER_ROW_LOAD = HEAD_DIM // VEC_WIDTH
-    ROWS_PER_BATCH_LOAD = BLOCK_SIZE // THREADS_PER_ROW_LOAD
-
-    if ROWS_PER_BATCH_LOAD >= BLOCK_N:
-        NUM_BATCHES_KV = 1
-        KV_NEEDS_GUARD = ROWS_PER_BATCH_LOAD > BLOCK_N
-    else:
-        NUM_BATCHES_KV = BLOCK_N // ROWS_PER_BATCH_LOAD
-        KV_NEEDS_GUARD = False
+    # The FP8 packing and transposed LDS layout require one 16-byte vector per
+    # lane. The BF16 kernel's vec8 diagnostic toggle does not apply here.
+    VEC_WIDTH = 16
+    (
+        THREADS_PER_ROW_LOAD,
+        ROWS_PER_BATCH_LOAD,
+        NUM_BATCHES_KV,
+        KV_NEEDS_GUARD,
+    ) = kv_load_schedule(BLOCK_SIZE, HEAD_DIM, BLOCK_N, VEC_WIDTH)
 
     LDS_K_TILE_SIZE = BLOCK_N * K_STRIDE
-    LDS_V_TILE_SIZE = BLOCK_N * V_STRIDE
     LDS_K_TOTAL_SIZE = NUM_PREFETCH_K * LDS_K_TILE_SIZE
-    LDS_V_BASE = LDS_K_TOTAL_SIZE // 2  # V right after fp8 K (bf16 elem units)
-    LDS_V_TOTAL_SIZE = NUM_PREFETCH_V * LDS_V_TILE_SIZE
-    # fp8 V stored transposed in LDS (V_T[d][kv_row]) so GEMM2 reads contiguous v2i32.
+    # FP8 V is transposed in LDS (V_T[d][kv_row]) so GEMM2 reads contiguous
+    # v2i32. All V sizing and addressing is expressed directly in bytes.
     KV_STRIDE_FP8 = BLOCK_N + 4  # fp8 bytes per d-row (kv_row inner + pad)
     KV_STRIDE_I32_FP8 = KV_STRIDE_FP8 // 4  # i32 words per d-row (contiguous kv load)
     V_BYTE_BASE = LDS_K_TOTAL_SIZE  # fp8 V region starts after fp8 K region (bytes)
+    LDS_V_TOTAL_BYTES = NUM_PREFETCH_V * HEAD_DIM * KV_STRIDE_FP8
+    LDS_TOTAL_BYTES = LDS_K_TOTAL_SIZE + LDS_V_TOTAL_BYTES
 
+    # PERF(gfx1201): Keep typed SmemPtr views and their required fx.Index
+    # boundaries. FlyDSL 0.2.4 and 0.3.1 SharedAllocator byte-pointer lowering
+    # makes representative FP8 attention shapes 3.7-5.1x slower. Revisit only
+    # when the generated ISA and latency are equivalent.
     allocator = SmemAllocator(
         None,
         arch=gpu_arch,
         global_sym_name=f"flash_attn_func_fp8_gfx1201c_exp_a_smem_{PATH_TAG}",
     )
     lds_kv_offset = allocator._align(allocator.ptr, 16)
-    # FP8 K (1 byte/elem) then V, V placed right after the fp8 K region.
-    allocator.ptr = lds_kv_offset + LDS_K_TOTAL_SIZE * 1 + LDS_V_TOTAL_SIZE * 2
+    # FP8 K (1 byte/elem) followed by the transposed FP8 V region.
+    allocator.ptr = lds_kv_offset + LDS_TOTAL_BYTES
 
     # Map dtype string to a FlyDSL Numeric class (for Vec.make_type and `.to(...)`).
     # aiter's `dtype_to_elem_type` returns a raw MLIR `ir.Type`; the FlyDSL Vector
@@ -241,7 +232,7 @@ def build_flash_attn_func_module(
         Q: fx.Pointer,
         K: fx.Pointer,
         V: fx.Pointer,
-        O: fx.Pointer,  # noqa: E741
+        O: fx.Pointer,
         seq_len: fx.Int32,
         seq_len_real: fx.Int32,
         seq_len_kv: fx.Int32,
@@ -263,24 +254,7 @@ def build_flash_attn_func_module(
         v_scale = _pointer_load(_f32_ty, _pointer_to_llvm_ptr(v_scale_ptr))
         fm_fast = arith.FastMathFlags.fast
 
-        # Local fast-math arithmetic helpers: preserve the fastmath flag while
-        # using the lowercase op names that accept _raw() unwrapping.
-        def _fadd(a, b):
-            return arith.addf(_raw(a), _raw(b), fastmath=fm_fast)
-
-        def _fsub(a, b):
-            return arith.subf(_raw(a), _raw(b), fastmath=fm_fast)
-
-        def _fmul(a, b):
-            return arith.mulf(_raw(a), _raw(b), fastmath=fm_fast)
-
-        def _fmax(a, b):
-            return arith.MaxNumFOp(_raw(a), _raw(b), fastmath=fm_fast).result
-
         v8f32_type = Vec.make_type(8, fx.Float32)
-        v8f16_type = Vec.make_type(8, elem_dtype)
-        vxf16_type = Vec.make_type(VEC_WIDTH, elem_dtype)
-
         v2i32_type = Vec.make_type(2, fx.Int32)
         v4i32_type = Vec.make_type(4, fx.Int32)
         v16i8_type = Vec.make_type(16, fx.Int8)
@@ -295,16 +269,6 @@ def build_flash_attn_func_module(
             return rocdl.wmma_f32_16x16x16_fp8_fp8(
                 res=v8f32_type, a=k_v2i32_raw, b=q_vec, c=c_v8
             ).result
-
-        def wmma_acc(a_v8, b_v8, c_v8):
-            # BF16 WMMA — used only by GEMM2 (PV).
-            if const_expr(dtype_str == "bf16"):
-                a_i16 = Vec(a_v8).bitcast(fx.Int16)
-                b_i16 = Vec(b_v8).bitcast(fx.Int16)
-                return rocdl.wmma_f32_16x16x16_bf16(
-                    v8f32_type, _raw(a_i16), _raw(b_i16), c_v8
-                ).result
-            return rocdl.wmma_f32_16x16x16_f16(v8f32_type, a_v8, b_v8, c_v8).result
 
         seq_len_v = fx.Index(seq_len)
         seq_len_real_v = fx.Index(seq_len_real)
@@ -329,18 +293,17 @@ def build_flash_attn_func_module(
         # fp8 V region views (same base_ptr/offset as lds_kv):
         # i8 view → byte-addressable GEMM2 read; i32 view → vectorized convert-store.
         _i8_mlir_type = ir.IntegerType.get_signless(8)
-        _lds_total_bytes = LDS_K_TOTAL_SIZE + LDS_V_TOTAL_SIZE * 2
         lds_v_i8 = SmemPtr(
             base_ptr,
             lds_kv_offset,
             _i8_mlir_type,
-            shape=(_lds_total_bytes,),
+            shape=(LDS_TOTAL_BYTES,),
         ).get()
         lds_v_i32 = SmemPtr(
             base_ptr,
             lds_kv_offset,
             _i32_mlir_type,
-            shape=(_lds_total_bytes // 4,),
+            shape=(LDS_TOTAL_BYTES // 4,),
         ).get()
 
         block_id = fx.Index(gpu.block_idx.x)
@@ -375,23 +338,11 @@ def build_flash_attn_func_module(
             token = batch_idx * seq_len_kv_v + token_idx
             return token * STRIDE_TOKEN + head_idx * HEAD_DIM + col
 
-        def _load_global_half_vec(ptr, base_idx, vec_type):
-            gep = buffer_ops.get_element_ptr(
-                ptr, fx.Int64(base_idx), elem_type=elem_type
-            )
-            return _pointer_load(vec_type, gep)
-
         def _store_global_half(ptr, base_idx, val):
             gep = buffer_ops.get_element_ptr(
                 ptr, fx.Int64(base_idx), elem_type=elem_type
             )
             _pointer_store(val, gep)
-
-        def load_global_f16xN(base_ptr, base_idx):
-            return _load_global_half_vec(base_ptr, base_idx, vxf16_type)
-
-        def load_global_v8f16(base_ptr, base_idx):
-            return _load_global_half_vec(base_ptr, base_idx, v8f16_type)
 
         def _load_global_fp8(base_ptr, base_idx, vec_type):
             # fp8-input: base_idx is in element units == byte units (fp8 = 1 byte).
@@ -400,65 +351,12 @@ def build_flash_attn_func_module(
             )
             return _pointer_load(vec_type, gep)
 
-        def _bitcast_i32(value):
-            return fx.Int32(ArithValue(value).bitcast(fx.Int32.ir_type))
-
-        def _pack_bf16_pair(lo, hi, shift, mask):
-            lo_i32 = _bitcast_i32(lo)
-            hi_i32 = _bitcast_i32(hi)
-            return (hi_i32 & mask) | lo_i32.shrui(shift)
-
-        def bf16_trunc_pack_v8(f32_vals):
-            """Pack 8 f32 values into v8bf16 via bitwise truncation (upper 16 bits)."""
-            _c16 = fx.Int32(16)
-            _cmask = fx.Int32(0xFFFF0000)
-            pairs = []
-            for j in range_constexpr(4):
-                pairs.append(
-                    _pack_bf16_pair(f32_vals[j * 2], f32_vals[j * 2 + 1], _c16, _cmask)
-                )
-            return Vec.from_elements(pairs, fx.Int32).bitcast(elem_dtype).ir_value()
-
-        def k_buf_base(buf_id):
-            if const_expr(isinstance(buf_id, int)):
-                return fx.Index(buf_id * LDS_K_TILE_SIZE)
-            return buf_id * fx.Index(LDS_K_TILE_SIZE)
-
-        def v_buf_base(buf_id):
-            return fx.Index(LDS_V_BASE + buf_id * LDS_V_TILE_SIZE)
-
-        def _vec16f16_to_4xi32_fp8(vec):
-            # Convert v16f16/v16bf16 → 16 fp8 packed as 4 i32 (4 fp8/i32).
-            # cvt_pk_fp8_f32(i32, f32_a, f32_b, seed, word_sel=0|1):
-            #   word_sel=0 → fills bytes [0:1], word_sel=1 → fills bytes [2:3].
-            # Two calls per i32 to fill all 4 bytes.
-            _i32ty = ir.IntegerType.get_signless(32)
-            _c_zero_i32 = arith.constant(0, type=_i32ty)
-            elems_f32 = []
-            for idx in range_constexpr(VEC_WIDTH):
-                e = _raw(Vec(vec)[idx])
-                elems_f32.append(
-                    arith.extf(T.f32, e, fastmath=arith.FastMathFlags.fast)
-                )
-            # Pack into 4 i32 words (VEC_WIDTH=16 fp8 / 4 fp8 per i32 = 4 i32)
-            result = []
-            for wi in range_constexpr(4):
-                base = wi * 4
-                pk = rocdl.cvt_pk_fp8_f32(
-                    _i32ty, elems_f32[base + 0], elems_f32[base + 1], _c_zero_i32, 0
-                )
-                pk = rocdl.cvt_pk_fp8_f32(
-                    _i32ty, elems_f32[base + 2], elems_f32[base + 3], pk, 1
-                )
-                result.append(pk)
-            return result
-
-        def coop_load_k(tile_start, buf_id=0):
+        def coop_load_k(tile_start):
             # Load K global (already fp8), store as i32 words in lds_k_i32.
             # LDS index in i32 units: k_base_i32 = buf_id * LDS_K_TILE_SIZE // 4
             # Per-row: lds_row * K_STRIDE_I32 + load_col_base // 4
             # VEC_WIDTH=16 fp8 per thread = 4 i32 → stored at consecutive i32 slots.
-            k_base_i32 = fx.Index(buf_id * (LDS_K_TILE_SIZE // 4))
+            k_base_i32 = fx.Index(0)
             load_col_i32 = load_col_base // fx.Index(4)
             for batch in range_constexpr(NUM_BATCHES_KV):
                 row_offset = batch * ROWS_PER_BATCH_LOAD
@@ -522,7 +420,7 @@ def build_flash_attn_func_module(
                 vecs.append(_load_global_fp8(v_ptr, g_idx, v16i8_type))
             return vecs
 
-        def coop_store_v_lds(vecs, buf_id=0):
+        def coop_store_v_lds(vecs):
             for batch in range_constexpr(NUM_BATCHES_KV):
                 row_offset = batch * ROWS_PER_BATCH_LOAD
                 if const_expr(KV_NEEDS_GUARD):
@@ -544,26 +442,6 @@ def build_flash_attn_func_module(
         q_in_bounds = arith.cmpi(arith.CmpIPredicate.slt, _raw(q_row), _raw(seq_len_v))
         q_row_safe = fx.Index(ArithValue(q_in_bounds).select(q_row, fx.Index(0)))
 
-        def _v8f16_to_fp8_v2i32(vec):
-            # v8f16/v8bf16 → [i32_lo, i32_hi] where each i32 = 4 packed fp8 bytes.
-            _i32ty = ir.IntegerType.get_signless(32)
-            _c_zero_i32 = arith.constant(0, type=_i32ty)
-            elems_f32 = []
-            for idx in range_constexpr(8):
-                e = _raw(Vec(vec)[idx])
-                elems_f32.append(
-                    arith.extf(T.f32, e, fastmath=arith.FastMathFlags.fast)
-                )
-            pk0 = rocdl.cvt_pk_fp8_f32(
-                _i32ty, elems_f32[0], elems_f32[1], _c_zero_i32, 0
-            )
-            pk0 = rocdl.cvt_pk_fp8_f32(_i32ty, elems_f32[2], elems_f32[3], pk0, 1)
-            pk1 = rocdl.cvt_pk_fp8_f32(
-                _i32ty, elems_f32[4], elems_f32[5], _c_zero_i32, 0
-            )
-            pk1 = rocdl.cvt_pk_fp8_f32(_i32ty, elems_f32[6], elems_f32[7], pk1, 1)
-            return [pk0, pk1]
-
         c_zero_v2i32_vec = Vec.filled(2, 0, fx.Int32).ir_value()
         q_b_packs = []
         for ks in range_constexpr(K_STEPS_QK):
@@ -583,12 +461,6 @@ def build_flash_attn_func_module(
         # (S = q_scale*k_scale * (Q_fp8 . K_fp8^T)). Runtime scalar, computed once.
         c_sm_scale_log2e_rt = _fmul(_fmul(q_scale, k_scale), c_sm_scale_log2e)
         c_zero_v8f32 = Vec.filled(8, 0.0, fx.Float32)
-        width_i32 = fx.Int32(WARP_SIZE)
-        shuf_16_i32 = fx.Int32(16)
-
-        def reduction_peer(v_f32):
-            return fx.Float32(v_f32).shuffle_xor(shuf_16_i32, width_i32)
-
         _q_end = q_start + BLOCK_M
         if const_expr(CAUSAL):
             kv_upper = fx.Index(
@@ -619,7 +491,7 @@ def build_flash_attn_func_module(
                 for b in range_constexpr(NUM_BATCHES_KV)
             ]
 
-            coop_load_k(kv_block_start, 0)
+            coop_load_k(kv_block_start)
             gpu.barrier()
 
             # ==== GEMM1: S = K @ Q^T (fp8 WMMA) ====
@@ -663,71 +535,30 @@ def build_flash_attn_func_module(
                         s_accs[acc_idx_b],
                     )
 
-            # ==== Online softmax ====
-            s_raw = []
-            for st in range_constexpr(NUM_S_ACCS):
-                for r in range_constexpr(8):
-                    s_raw.append(Vec(s_accs[st])[r])
+            s_raw = flatten_and_mask_scores(
+                s_accs,
+                kv_block_start,
+                klane,
+                q_row_i32,
+                seq_len_real,
+                c_neg_inf,
+                num_s_accs=NUM_S_ACCS,
+                causal=CAUSAL,
+                tail_mask=TAIL_MASK,
+            )
+            p_vals, m_new_raw, l_new, o_accs = update_online_softmax(
+                s_raw,
+                m_running,
+                l_running,
+                o_accs,
+                c_sm_scale_log2e_rt,
+                c_zero_f,
+                num_s_vals=NUM_S_VALS,
+                d_chunks=D_CHUNKS,
+            )
 
-            if const_expr(CAUSAL or TAIL_MASK):
-                # Straight-line per-column masking (no runtime scf.if). Each
-                # s_raw[idx] is one f32 scalar for KV column
-                #   col = kv_start + acc*16 + r + klane*8
-                # (acc bases 0,16,32,... generalize the BN=32 {0,16} pair to any
-                # NUM_S_ACCS). CAUSAL masks col > q_row; TAIL_MASK masks padded
-                # cols col >= seq_len_real. The two are mutually exclusive
-                # (causal never loads a padded col past the last real q_row).
-                # Unconditional selects: cheap VALU, no list-capture through the
-                # if-rewriter, and both flags are false on the aligned non-causal
-                # prod hot path -> this block is not emitted at all.
-                kv_start_i32 = fx.Int32(kv_block_start)
-                klane_off_i32 = fx.Int32(klane) * fx.Int32(8)
-                masked = []
-                for acc in range_constexpr(NUM_S_ACCS):
-                    for r in range_constexpr(8):
-                        idx = acc * 8 + r
-                        col_i32 = kv_start_i32 + fx.Int32(acc * 16 + r) + klane_off_i32
-                        if const_expr(CAUSAL):
-                            pred = ArithValue(col_i32 > q_row_i32)
-                        else:
-                            pred = ArithValue(col_i32 >= seq_len_real)
-                        masked.append(pred.select(c_neg_inf, s_raw[idx]))
-                s_raw = masked
-
-            local_max = s_raw[0]
-            for r in range_constexpr(NUM_S_VALS - 1):
-                local_max = _fmax(local_max, s_raw[r + 1])
-            peer_max = reduction_peer(local_max)
-            row_max = _fmax(local_max, peer_max)
-            m_new_raw = _fmax(m_running, row_max)
-
-            # ---- native exp2 ----
-            diff_m_raw = _fsub(m_running, m_new_raw)
-            diff_m_scaled = _fmul(diff_m_raw, c_sm_scale_log2e_rt)
-            corr = rocdl.exp2(ir.F32Type.get(), _raw(diff_m_scaled))
-
-            scaled_max = _fmul(c_sm_scale_log2e_rt, m_new_raw)
-            neg_scaled_max = _fsub(c_zero_f, scaled_max)
-
-            p_vals = []
-            local_sum = _raw(c_zero_f)
-            for r in range_constexpr(NUM_S_VALS):
-                diff = fmath.fma(s_raw[r], c_sm_scale_log2e_rt, neg_scaled_max)
-                p = rocdl.exp2(ir.F32Type.get(), _raw(diff))
-                p_vals.append(p)
-                local_sum = _fadd(local_sum, p)
-
-            peer_sum = reduction_peer(local_sum)
-            tile_sum = _fadd(local_sum, peer_sum)
-            l_corr = _fmul(corr, l_running)
-            l_new = _fadd(l_corr, tile_sum)
-
-            corr_vec = Vec.from_elements([corr], fx.Float32).broadcast_to(8).ir_value()
-            for dc in range_constexpr(D_CHUNKS):
-                o_accs[dc] = _fmul(o_accs[dc], corr_vec)
-
-            # Store V to LDS (row-major, fast vector store)
-            coop_store_v_lds(_v_vecs_prefetch, 0)
+            # Store V transposed as V_T[d][kv_row] for contiguous GEMM2 loads.
+            coop_store_v_lds(_v_vecs_prefetch)
             gpu.barrier()
 
             # ==== Build P packs (fp8, pair list for wmma_acc_fp8) ====
@@ -800,8 +631,10 @@ def build_flash_attn_func_module(
             l_running = l_new
 
             # ---- Issue the next iteration's V global load ----
-            next_kv_start = kv_block_start + fx.Index(BLOCK_N_OUT)
-            _v_vecs_next = coop_load_v_global(next_kv_start)
+            safe_next_kv_start = next_kv_tile_start(
+                kv_block_start, kv_upper, fx.Index(BLOCK_N_OUT), fx.Index(0)
+            )
+            _v_vecs_next = coop_load_v_global(safe_next_kv_start)
 
             _yield_args = [m_running, l_running] + o_accs
             for batch in range_constexpr(NUM_BATCHES_KV):
@@ -830,7 +663,7 @@ def build_flash_attn_func_module(
         Q: fx.Pointer,
         K: fx.Pointer,
         V: fx.Pointer,
-        O: fx.Pointer,  # noqa: E741
+        O: fx.Pointer,
         batch_size: fx.Int32,
         seq_len: fx.Int32,
         seq_len_real: fx.Int32,
@@ -838,7 +671,7 @@ def build_flash_attn_func_module(
         q_scale_ptr: fx.Pointer,
         k_scale_ptr: fx.Pointer,
         v_scale_ptr: fx.Pointer,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         allocator.finalized = False
         ctx = CompilationContext.get_current()
@@ -864,51 +697,7 @@ def build_flash_attn_func_module(
             v_scale_ptr,
         )
 
-        if const_expr(waves_per_eu is not None):
-            _wpe = int(waves_per_eu)
-            if const_expr(_wpe >= 1):
-                for op in ctx.gpu_module_body.operations:
-                    if const_expr(getattr(op, "OPERATION_NAME", None) == "gpu.func"):
-                        op.attributes["rocdl.waves_per_eu"] = ir.IntegerAttr.get(
-                            T.i32, _wpe
-                        )
-        if const_expr(flat_work_group_size is not None):
-            _fwgs = int(flat_work_group_size)
-            if const_expr(_fwgs >= 1):
-                flat_wg_attr = ir.StringAttr.get(f"{_fwgs},{_fwgs}")
-                for op in ctx.gpu_module_body.operations:
-                    if const_expr(getattr(op, "OPERATION_NAME", None) == "gpu.func"):
-                        op.attributes["rocdl.flat_work_group_size"] = flat_wg_attr
-
-        passthrough_entries = []
-        if const_expr(daz):
-            passthrough_entries.append(
-                ir.ArrayAttr.get(
-                    [
-                        ir.StringAttr.get("denormal-fp-math-f32"),
-                        ir.StringAttr.get("preserve-sign,preserve-sign"),
-                    ]
-                )
-            )
-            passthrough_entries.append(
-                ir.ArrayAttr.get(
-                    [
-                        ir.StringAttr.get("no-nans-fp-math"),
-                        ir.StringAttr.get("true"),
-                    ]
-                )
-            )
-            passthrough_entries.append(
-                ir.ArrayAttr.get(
-                    [
-                        ir.StringAttr.get("unsafe-fp-math"),
-                        ir.StringAttr.get("true"),
-                    ]
-                )
-            )
-        for op in ctx.gpu_module_body.operations:
-            if const_expr(getattr(op, "OPERATION_NAME", None) == "gpu.func"):
-                op.attributes["passthrough"] = ir.ArrayAttr.get(passthrough_entries)
+        configure_gpu_module(ctx, waves_per_eu, flat_work_group_size, daz)
 
         launcher.launch(grid=(grid_x, 1, 1), block=(BLOCK_SIZE, 1, 1), stream=stream)
 
@@ -918,34 +707,15 @@ def build_flash_attn_func_module(
         "llvm_options": {"enable-post-misched": False, "lsr-drop-solution": True},
     }
 
-    def _ptr_arg(t):
-        if hasattr(t, "data_ptr"):
-            type_name = type(t).__name__
-            module_name = type(t).__module__
-            ptr = (
-                0
-                if type_name == "FakeTensor" or "fake_tensor" in module_name
-                else t.data_ptr()
-            )
-            return flyc.from_c_void_p(fx.Uint8, ptr)
-        return t
-
-    def _wrap_qkvo(args, kwargs):
-        args = list(args)
-        for idx in range(min(4, len(args))):
-            args[idx] = _ptr_arg(args[idx])
-        # positional: Q,K,V,O,batch,seq_len,seq_len_real,seq_len_kv,q_scale,k_scale,v_scale
-        for idx in range(8, min(11, len(args))):
-            args[idx] = _ptr_arg(args[idx])
-        for name in ("Q", "K", "V", "O", "q_scale_ptr", "k_scale_ptr", "v_scale_ptr"):
-            if name in kwargs:
-                kwargs[name] = _ptr_arg(kwargs[name])
-        return tuple(args), kwargs
-
     launch_flash_attn_func.compile_hints = dict(_fmha_compile_hints)
 
     def _launch(*args, **kwargs):
-        args, kwargs = _wrap_qkvo(args, kwargs)
+        args, kwargs = wrap_pointer_args(
+            args,
+            kwargs,
+            (0, 1, 2, 3, 8, 9, 10),
+            ("Q", "K", "V", "O", "q_scale_ptr", "k_scale_ptr", "v_scale_ptr"),
+        )
         stream = kwargs.pop("stream", fx.Stream(None))
         _run_compiled(launch_flash_attn_func, *args, stream)
 
@@ -953,7 +723,7 @@ def build_flash_attn_func_module(
         Q,
         K,
         V,
-        O,  # noqa: E741
+        O,
         batch_size,
         seq_len,
         seq_len_real,
@@ -966,17 +736,17 @@ def build_flash_attn_func_module(
         # scales are device f32 pointers (1-element tensors), not host floats.
         return flyc.compile(
             launch_flash_attn_func,
-            _ptr_arg(Q),
-            _ptr_arg(K),
-            _ptr_arg(V),
-            _ptr_arg(O),
+            pointer_arg(Q),
+            pointer_arg(K),
+            pointer_arg(V),
+            pointer_arg(O),
             batch_size,
             seq_len,
             seq_len_real,
             seq_len_kv,
-            _ptr_arg(q_scale),
-            _ptr_arg(k_scale),
-            _ptr_arg(v_scale),
+            pointer_arg(q_scale),
+            pointer_arg(k_scale),
+            pointer_arg(v_scale),
             fx.Stream(stream),
         )
 
