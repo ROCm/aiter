@@ -1609,9 +1609,10 @@ def flydsl_qk_norm_rope_quant(
         bid_arg = q.new_empty(1, dtype=torch.int32)
 
     if is_gfx1250:
+        tdm_quant = quant
         use_tdm = (
             USE_TDM_PREFILL
-            and not quant
+            and (not quant or T_tok * H >= 65536)
             and not kv_write
             and not paged
             and T_tok * H >= TDM_MIN_ROWS
@@ -1620,19 +1621,25 @@ def flydsl_qk_norm_rope_quant(
         )
         if use_tdm:
             num_rows = T_tok * H
-            tiles_per_wg, num_buffers = _tdm_tiles_per_wg(num_rows)
+            tiles_per_wg, num_buffers, rows_per_tile = _tdm_tiles_per_wg(
+                num_rows, head_dim=D
+            )
             launcher = _build_kernel_w32_tdm(
                 num_q_heads=H,
                 head_dim=D,
                 rope_head_dim=RD,
                 num_buffers=num_buffers,
                 tiles_per_wg=tiles_per_wg,
+                rows_per_tile=rows_per_tile,
                 q_weighted=q_weighted,
                 store_cache_modifier=(
                     TDM_DECODE_STORE_CACHE_MODIFIER
                     if (T_tok, H, D, RD) == (512, 128, 512, 64)
                     else 0
                 ),
+                quant=tdm_quant,
+                group_size=G,
+                scale_dtype=scale_dtype,
             )
             if stream is None:
                 stream = torch.cuda.current_stream()
@@ -1647,7 +1654,7 @@ def flydsl_qk_norm_rope_quant(
 
             q_2d = q_view.reshape(num_rows, D)
             kv_c = kv if kv.is_contiguous() else kv.contiguous()
-            per_wg = ROWS_PER_TILE * tiles_per_wg
+            per_wg = rows_per_tile * tiles_per_wg
             args = (
                 # q is a per-call activation: uncached, else the adaptor cache
                 # pins its allocation (see _cached_from_dlpack).
@@ -1658,6 +1665,8 @@ def flydsl_qk_norm_rope_quant(
                 _t_ptr(positions),
                 _t_ptr(q_out.view(num_rows, D)),
                 _t_ptr(kv_out),
+                _t_ptr(q_scale_arg.view(-1)),
+                _t_ptr(kv_scale_arg.view(-1)),
                 _cached_from_dlpack(q_weight_arg.reshape(-1)),
                 _cached_from_dlpack(kv_weight.reshape(-1)),
                 num_rows,
@@ -1666,7 +1675,9 @@ def flydsl_qk_norm_rope_quant(
                 stream if has_direct else Stream(stream),
             )
             _run_compiled(launcher, *args)
-            return q_out, kv_out, None, None
+            return q_out, kv_out, (q_scale if quant else None), (
+                kv_scale if quant else None
+            )
 
         rows_per_wg = ROWS_PER_WG_SMALL if T_tok <= SMALL_T_THRESHOLD else ROWS_PER_WG
         launcher = _build_kernel_w32(
@@ -1759,12 +1770,12 @@ def flydsl_qk_norm_rope_quant(
 
 
 ROWS_PER_TILE = 8  # = waves per WG (256-thread WG)
-NUM_BUFFERS = 6  # K: rotating LDS buffers (1 WG at K=6: 6*32KB=192KB LDS)
+NUM_BUFFERS = 6  # K: rotating LDS buffers (1 WG at K=6: 6*8KB=48KB LDS)
 TILES_PER_WG = 16  # CT: one H=128 token/WG; keeps cos/sin hoisting enabled
 
 
-def _tdm_tiles_per_wg(num_rows):
-    """Pick (CT, K) for a row count — trades prefetch depth vs occupancy.
+def _tdm_tiles_per_wg(num_rows, head_dim=512):
+    """Pick (CT, K, RT) to fill wave slots on gfx1250.
 
     CT is bounded by keeping gx_q = num_rows / (ROWS_PER_TILE * CT) at or above
     the 256 CUs. That bound bites hardest at the low end of the TDM range: at
@@ -1775,14 +1786,13 @@ def _tdm_tiles_per_wg(num_rows):
     K is then free to pick on latency alone. With RT=8, K=6 is best or neutral
     for the rotated T=512 workload and avoids another short-prefill variant.
     """
-    if num_rows <= 65536:
-        return 16, NUM_BUFFERS
+    del head_dim  # tile bytes are implied by ROWS_PER_TILE * D in the kernel
     if num_rows <= 131072:
-        return 16, NUM_BUFFERS
-    return TILES_PER_WG, NUM_BUFFERS
+        return 16, NUM_BUFFERS, ROWS_PER_TILE
+    return TILES_PER_WG, NUM_BUFFERS, ROWS_PER_TILE
 
 
-@lru_cache(maxsize=16)
+@lru_cache(maxsize=32)
 def _build_kernel_w32_tdm(
     *,
     num_q_heads,
@@ -1790,9 +1800,13 @@ def _build_kernel_w32_tdm(
     rope_head_dim,
     num_buffers=NUM_BUFFERS,
     tiles_per_wg=TILES_PER_WG,
+    rows_per_tile=ROWS_PER_TILE,
     hoist_cs=True,
     q_weighted=False,
     store_cache_modifier=0,
+    quant=False,
+    group_size=None,
+    scale_dtype="fp32",
 ):
     H, D, RD = num_q_heads, head_dim, rope_head_dim
     NOPE = D - RD
@@ -1802,23 +1816,37 @@ def _build_kernel_w32_tdm(
     PAIRS = VEC // 2
     K = num_buffers
     CT = tiles_per_wg
-    RT = ROWS_PER_TILE
+    RT = rows_per_tile
+    G = D if group_size is None else group_size
+    NG = D // G
+    TPG = G // VEC
+    log2_tpg = int(math.log2(TPG))
+    is_e8m0 = scale_dtype == "e8m0"
+    if CT < K:
+        raise ValueError(
+            f"TDM prologue issues K={K} tiles but WG only owns CT={CT}; "
+            "need CT >= K to avoid overlapping the next WG's rows"
+        )
     eb = 2
     log2b = int(math.log2(BLOCK_THREADS))
+    amax_start_step = log2b - log2_tpg
     log2H = int(math.log2(H)) if (H & (H - 1)) == 0 else None
+    fp8_mx_dtype = _D.FP8_E4M3
     EVEN = list(range(0, VEC, 2))
     ODD = list(range(1, VEC, 2))
     ILV = [(i // 2) if i % 2 == 0 else (PAIRS + i // 2) for i in range(VEC)]
     tile_bytes = RT * D * eb
     ARENA = K * tile_bytes  # K rotating tile buffers
 
-    name = f"qk_norm_rope_tdm_H{H}_D{D}_RD{RD}_k{K}_ct{CT}"
+    name = f"qk_norm_rope_tdm_H{H}_D{D}_RD{RD}_k{K}_ct{CT}_r{RT}"
     if hoist_cs:
         name += "_h"
     if q_weighted:
         name += "_qw"
     if store_cache_modifier:
         name += f"_sc{store_cache_modifier}"
+    if quant:
+        name += f"_q8g{G}_{scale_dtype}"
     name += "_fused_w32_flydsl"
 
     @flyc.kernel(name=name, known_block_size=[BLOCK_THREADS, RT, 1])
@@ -1830,6 +1858,8 @@ def _build_kernel_w32_tdm(
         positions: fx.Pointer,  # [T] i64
         q_out: fx.Pointer,  # [T*H, D] bf16
         kv_out: fx.Pointer,  # [T, D] bf16
+        q_scale: fx.Pointer,  # [T*H, NG] fp32/u8 (dummy when not quant)
+        kv_scale: fx.Pointer,  # [T, NG] fp32/u8 (dummy when not quant)
         q_weight: fx.Tensor,  # [D] bf16 (dummy when not q_weighted)
         kv_weight: fx.Tensor,  # [D] bf16
         num_rows: Int32,  # T*H
@@ -1918,33 +1948,107 @@ def _build_kernel_w32_tdm(
                 for r in (cos_rsrc, sin_rsrc)
             )
 
-        def norm_rope_store(xv, wv, cosv, sinv, out_rsrc, row_base_bytes):
-            """RMSNorm (+ optional per-channel weight) + GPT-J RoPE + bf16 store.
-            rstd comes from the unweighted x^2 (stock-kernel semantics); the
-            weight multiply commutes into `scaled`."""
+        def norm_rope_store(
+            xv,
+            wv,
+            cosv,
+            sinv,
+            out_rsrc,
+            row_base_bytes,
+            scale_rsrc=None,
+            scale_idx=None,
+        ):
+            """RMSNorm + RoPE and optional per-row FP8 quantization."""
             sq = (xv * xv).reduce(ReductionOp.ADD)
+            if const_expr(quant):
+                xw = xv * wv if wv is not None else xv
+                am = fmath.absf(xw).reduce(ReductionOp.MAX)
             for sh in range_constexpr(log2b):
                 o = BLOCK_THREADS // (2 << sh)
                 sq = sq + sq.shuffle_xor(o, BLOCK_THREADS)
-            rstd = fmath.rsqrt(sq * (1.0 / D) + 1e-6)
-            scaled = (xv * wv * rstd) if wv is not None else (xv * rstd)
-            ev = scaled.shuffle(scaled, EVEN)
-            od = scaled.shuffle(scaled, ODD)
-            rot = (ev * cosv - od * sinv).shuffle(ev * sinv + od * cosv, ILV)
-            _store_bf16_vec(
-                is_rope.select(rot, scaled),
-                out_rsrc,
-                row_base_bytes,
-                tid,
-                VEC,
-                cache_modifier=store_cache_modifier,
-            )
+                if const_expr(quant and sh >= amax_start_step):
+                    am = am.maximumf(am.shuffle_xor(o, BLOCK_THREADS))
+            if const_expr(quant and is_e8m0):
+                rstd_q = fmath.rsqrt(sq * (1.0 / D) + 1e-6)
+                e8m0_biased = fx.Int32(
+                    emit_mx_e8m0_scale(
+                        (am.maximumf(fx.Float32(1e-12)) * rstd_q * _SQRT2).ir_value(),
+                        mode=_DEFAULT_MODE,
+                        dtype=fp8_mx_dtype,
+                    )
+                )
+                factor = rstd_q * (
+                    (fx.Int32(254) - e8m0_biased) << 23
+                ).bitcast(fx.Float32)
+                scaled = xw * factor
+                scale_store = e8m0_biased.to(fx.Int8)
+            elif const_expr(quant):
+                am_safe = am.maximumf(fx.Float32(1e-12))
+                rcp_am = llvm.call_intrinsic(
+                    T.f32, "llvm.amdgcn.rcp.f32", [am_safe.ir_value()], [], []
+                )
+                fc = _fp8_const()
+                factor = fx.Float32(fc["max_over_sqrt2"]) * rcp_am
+                scaled = xw * factor
+            else:
+                rstd = fmath.rsqrt(sq * (1.0 / D) + 1e-6)
+                scaled = (xv * wv * rstd) if wv is not None else (xv * rstd)
+
+            # Only RD / D lanes own the RoPE tail (4 of 32 for D=512,
+            # RD=64). Keep the passthrough value in register memory so an
+            # scf.if can update it without an SSA dominance violation, and
+            # avoid running all RoPE FMAs in the other 28 lanes.
+            out_rmem = fx.make_rmem_tensor(fx.make_layout(VEC, 1), fx.Float32)
+            fx.memref_store_vec(scaled, out_rmem)
+            if is_rope:
+                cur = fx.memref_load_vec(out_rmem)
+                ev = cur.shuffle(cur, EVEN)
+                od = cur.shuffle(cur, ODD)
+                rot = (ev * cosv - od * sinv).shuffle(ev * sinv + od * cosv, ILV)
+                fx.memref_store_vec(rot, out_rmem)
+            final = fx.memref_load_vec(out_rmem)
+            if const_expr(quant):
+                _store_fp8_packed_w32(
+                    [final[i] for i in range_constexpr(VEC)],
+                    out_rsrc,
+                    row_base_bytes,
+                    tid,
+                    VEC,
+                    skip_fnuz_clamp=True,
+                )
+                group_idx = tid >> log2_tpg
+                if (tid & (TPG - 1)) == 0:
+                    if const_expr(is_e8m0):
+                        buffer_ops.buffer_store(
+                            scale_store, scale_rsrc, scale_idx + group_idx
+                        )
+                    else:
+                        # FP8 values depend only on amax. Defer the RMS scale
+                        # path until after the wide output store so rsqrt
+                        # latency overlaps memory retirement.
+                        buffer_ops.buffer_store(
+                            am_safe
+                            * fmath.rsqrt(sq * (1.0 / D) + 1e-6)
+                            * fx.Float32(fc["inv_max_sqrt2"]),
+                            scale_rsrc,
+                            scale_idx + group_idx,
+                        )
+            else:
+                _store_bf16_vec(
+                    final,
+                    out_rsrc,
+                    row_base_bytes,
+                    tid,
+                    VEC,
+                    cache_modifier=store_cache_modifier,
+                )
 
         def emit_q():
             q_out_rsrc = _ptr_res(q_out)
+            q_scale_rsrc = _ptr_res(q_scale) if const_expr(quant) else None
             nr_m1 = num_rows - 1
             tile_base = g * CT  # first tile index this WG owns
-            wave_lds_off = wave * (D * eb)  # this wave's slot in a tile buffer
+            wave_lds_off = wave * (D * eb)
             row_elem = tid * VEC  # LDS read pos within that slot
 
             qw = _load_tensor_vec(q_weight, tid) if const_expr(q_weighted) else None
@@ -1953,7 +2057,10 @@ def _build_kernel_w32_tdm(
                 fx.make_view(fx.get_iter(q_in), fx.make_layout((1, D), (D, 1)))
             )
             tdm_atom = fx.rocdl.make_tdm_atom(
-                q_row0, [num_rows, None], strides=[D, None], num_warps=1
+                q_row0,
+                [num_rows, None],
+                strides=[D, None],
+                num_warps=1,
             )
 
             def row_of(tile_idx):
@@ -1962,7 +2069,7 @@ def _build_kernel_w32_tdm(
             def issue(buf, tile_idx):
                 dst = fx.Tensor(
                     fx.make_view(
-                        fx.inttoptr(lds_bf16_ptr_ty, lds_i32 + (wave_lds_off + buf)),
+                        fx.inttoptr(lds_bf16_ptr_ty, lds_i32 + wave_lds_off + buf),
                         fx.make_layout((1, D), (D, 1)),
                     )
                 )
@@ -1991,7 +2098,9 @@ def _build_kernel_w32_tdm(
                     cosv,
                     sinv,
                     q_out_rsrc,
-                    row_of(tile_idx) * (D * 2),
+                    row_of(tile_idx) * (D if const_expr(quant) else D * 2),
+                    q_scale_rsrc,
+                    row_of(tile_idx) * NG,
                 )
 
             def tok_of(tile_idx):
@@ -2063,7 +2172,16 @@ def _build_kernel_w32_tdm(
             )
             wv = _load_tensor_vec(kv_weight, tid)
             cosv, sinv = load_cs(tok)
-            norm_rope_store(xv, wv, cosv, sinv, _ptr_res(kv_out), tok * (D * 2))
+            norm_rope_store(
+                xv,
+                wv,
+                cosv,
+                sinv,
+                _ptr_res(kv_out),
+                tok * (D if const_expr(quant) else D * 2),
+                _ptr_res(kv_scale) if const_expr(quant) else None,
+                tok * NG,
+            )
 
         if g < gx_q:
             emit_q()
@@ -2079,6 +2197,8 @@ def _build_kernel_w32_tdm(
         positions: fx.Pointer,
         q_out: fx.Pointer,
         kv_out: fx.Pointer,
+        q_scale: fx.Pointer,
+        kv_scale: fx.Pointer,
         q_weight: fx.Tensor,
         kv_weight: fx.Tensor,
         num_rows: fx.Int32,
@@ -2096,6 +2216,8 @@ def _build_kernel_w32_tdm(
             positions,
             q_out,
             kv_out,
+            q_scale,
+            kv_scale,
             q_weight,
             kv_weight,
             num_rows,
