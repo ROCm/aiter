@@ -284,6 +284,8 @@ jset_string "test_selection.grid" "$GRID"
 
 # ---------- stage 1: merge simulation ----------
 BASE_SHA=$(git -C "$REPO_WT" rev-parse HEAD)
+INITIAL_IGNORED=$(git -C "$REPO_WT" status --porcelain \
+  --ignored --untracked-files=all | awk '$1 == "!!"')
 jset_string "repo.worktree" "$REPO_WT"
 jset_string "repo.base" "$BASE_SHA"
 if [ -f "$REPO_WT/aiter/__init__.py" ]; then
@@ -439,7 +441,7 @@ import re
 import sys
 
 diff = open(sys.argv[1], encoding="utf-8").read()
-paths = re.findall(r"^\+\+\+ b/(.+)$", diff, re.MULTILINE)
+paths = re.findall(r"^(?:--- a/|\+\+\+ b/)(.+)$", diff, re.MULTILINE)
 print(int(any(path.startswith("python/flydsl/") for path in paths)))
 PY
 )
@@ -674,6 +676,47 @@ if [ "$REPO_KIND" = "flydsl" ] && [ -n "$PYLIB" ]; then
 else
   TEST_PYTHONPATH="$REPO_WT/python:$REPO_WT${PYLIB:+:$PYLIB}"
 fi
+TEST_FILE=${TESTS%%::*}
+GRID_HOOK_OK=0
+if [ -n "$SHAPE_ENV" ] && [ -n "$GRID" ] \
+    && [ -f "$REPO_WT/$TEST_FILE" ]; then
+  GRID_HOOK_OK=$(python3 - "$REPO_WT/$TEST_FILE" "$SHAPE_ENV" <<'PY'
+import ast
+import sys
+
+tree = ast.parse(open(sys.argv[1], encoding="utf-8").read())
+name = sys.argv[2]
+
+def attr_path(node):
+    parts = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if isinstance(node, ast.Name):
+        parts.append(node.id)
+    return tuple(reversed(parts))
+
+found = False
+for node in ast.walk(tree):
+    if isinstance(node, ast.Call) and node.args:
+        path = attr_path(node.func)
+        key = node.args[0]
+        if (
+            path in {("os", "getenv"), ("os", "environ", "get")}
+            and isinstance(key, ast.Constant)
+            and key.value == name
+        ):
+            found = True
+            break
+    if isinstance(node, ast.Subscript) and attr_path(node.value) == ("os", "environ"):
+        key = node.slice
+        if isinstance(key, ast.Constant) and key.value == name:
+            found = True
+            break
+print(int(found))
+PY
+)
+fi
 
 run_pytest() {
   local label="$1"
@@ -747,7 +790,6 @@ else
     fi
 
     if [ "$BASE_READY" -eq 1 ]; then
-      TEST_FILE=${TESTS%%::*}
       if [ -f "$REPO_WT/$TEST_FILE" ]; then
         BASE_RESULT=$(run_pytest "base-repo" "")
         BASE_REPO_RC=${BASE_RESULT%%|*}
@@ -756,7 +798,7 @@ else
       else
         BASE_REPO_STATE="target-not-present"
       fi
-      if [ -n "$SHAPE_ENV" ] && [ -n "$GRID" ]; then
+      if [ "$GRID_HOOK_OK" -eq 1 ]; then
         if [ -f "$REPO_WT/$TEST_FILE" ]; then
           BASE_GRID_RESULT=$(run_pytest "base-grid" "$SHAPE_ENV=$GRID")
           BASE_GRID_RC=${BASE_GRID_RESULT%%|*}
@@ -765,10 +807,17 @@ else
         else
           BASE_GRID_STATE="target-not-present"
         fi
+      elif [ -n "$SHAPE_ENV" ] && [ -n "$GRID" ]; then
+        BASE_GRID_STATE="hook-not-found"
       else
         BASE_GRID_STATE="not-configured"
       fi
       if [ -n "$(git -C "$REPO_WT" status --porcelain --untracked-files=all)" ]; then
+        BASE_READY=0
+      fi
+      CURRENT_IGNORED=$(git -C "$REPO_WT" status --porcelain \
+        --ignored --untracked-files=all | awk '$1 == "!!"')
+      if [ "$CURRENT_IGNORED" != "$INITIAL_IGNORED" ]; then
         BASE_READY=0
       fi
     fi
@@ -849,7 +898,7 @@ PY
       fi
     fi
 
-    if [ -n "$SHAPE_ENV" ] && [ -n "$GRID" ]; then
+    if [ "$GRID_HOOK_OK" -eq 1 ]; then
       HEAD_GRID_RESULT=$(run_pytest "head-grid" "$SHAPE_ENV=$GRID")
       HEAD_GRID_RC=${HEAD_GRID_RESULT%%|*}
       HEAD_GRID_LOG=${HEAD_GRID_RESULT##*|}
@@ -883,6 +932,11 @@ PY
             "the independent grid is red on both baseline and head; attribution is inconclusive"
         fi
       fi
+    elif [ -n "$SHAPE_ENV" ] && [ -n "$GRID" ]; then
+      stage_note "correctness_s1_grid" "skip" \
+        "configured shape environment variable is not referenced by the pytest target"
+      finding "note" "correctness" \
+        "the selected pytest target does not consume the configured shape-grid hook"
     else
       stage_note "correctness_s1_grid" "skip" \
         "kernel exposes no configured shape override; coverage is repo-default-only"
