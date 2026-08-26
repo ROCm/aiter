@@ -30,7 +30,11 @@ test target; this script does not fetch PRs itself (see
 
 ```bash
 # 1. pin the PR identity and put its base in an isolated worktree
-BASE=$(gh pr view 4394 --repo ROCm/aiter --json baseRefOid --jq .baseRefOid)
+BASE_REF=$(gh pr view 4394 --repo ROCm/aiter --json baseRefName --jq .baseRefName)
+BASE_REF_PATH=$(python3 -c \
+  'import sys,urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' \
+  "$BASE_REF")
+BASE=$(gh api "repos/ROCm/aiter/branches/$BASE_REF_PATH" --jq .commit.sha)
 HEAD=$(gh pr view 4394 --repo ROCm/aiter --json headRefOid --jq .headRefOid)
 git worktree add --detach /tmp/pr-4394 "$BASE"
 gh pr diff 4394 --repo ROCm/aiter > /tmp/pr-4394.patch
