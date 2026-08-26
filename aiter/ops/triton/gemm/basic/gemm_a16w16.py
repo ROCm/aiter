@@ -168,7 +168,7 @@ def gemm_a16w16_(
                 _is_gluon_available()
             ), f"Gluon backend requires one of {_GLUON_SUPPORTED_ARCHS}, got '{get_arch()}'"
             from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_a16w16_persistent import (
-                gemm_a16w16_persistent_kernel_ as _gluon_persistent_kernel,
+                _KERNEL_MAP as _GLUON_PERSISTENT_KERNEL_MAP,
             )
 
             _LOGGER.info(
@@ -183,6 +183,14 @@ def gemm_a16w16_(
                 torch.float16,
                 torch.bfloat16,
             ), f"Weights (w) must be fp16 or bf16, got {w.dtype}"
+
+            kernel_type_from_config = config.pop("kernel_type", None)
+            if kernel_type_from_config is not None:
+                kernel_type = kernel_type_from_config
+            assert kernel_type in _GLUON_PERSISTENT_KERNEL_MAP, (
+                f"Unknown kernel_type '{kernel_type}', must be one of "
+                f"{list(_GLUON_PERSISTENT_KERNEL_MAP.keys())}"
+            )
 
             BLOCK_M = config["BLOCK_M"]
             BLOCK_N = config["BLOCK_N"]
@@ -247,7 +255,7 @@ def gemm_a16w16_(
 
             out_ptr = y if NUM_KSPLIT == 1 else y_pp
 
-            _gluon_persistent_kernel[(min(NUM_WGS, num_tiles),)](
+            _GLUON_PERSISTENT_KERNEL_MAP[kernel_type][(min(NUM_WGS, num_tiles),)](
                 x,
                 w,
                 bias,

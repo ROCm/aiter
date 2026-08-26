@@ -31,6 +31,7 @@ def bench_gemm_fn(
     atomic: bool = False,
     activation: str | None = None,
     persistent: bool = False,
+    kernel_type: str = "bandwidth_bound",
     **kwargs,
 ):
     # NOTE: Assume bias and output has the same dtype
@@ -72,6 +73,7 @@ def bench_gemm_fn(
                 c_dtype,
                 y,
                 activation=activation,
+                kernel_type=kernel_type,
                 backend=backend,
                 persistent=True,
             ),
@@ -138,6 +140,7 @@ def run_model_benchmark(args, backend):
             atomic=args.atomic,
             activation=args.activation,
             persistent=args.persistent,
+            kernel_type=args.kernel_type,
         )
 
     bench_gemm_a16w16.run(save_path="." if args.o else None, print_data=True)
@@ -162,6 +165,7 @@ def run_shape_benchmark(args, backend):
             backend,
             atomic=args.atomic,
             persistent=args.persistent,
+            kernel_type=args.kernel_type,
         )
 
     bench_gemm_a16w16.run(save_path="." if args.o else None, print_data=True)
@@ -225,6 +229,13 @@ def parse_args(args: list[str] | None = None):
         default=False,
         help="Use the persistent kernel (gemm_a16w16(..., persistent=True)) instead of "
         "the standard a16w16 kernel",
+    )
+    parser.add_argument(
+        "--kernel-type",
+        type=str,
+        choices=["bandwidth_bound", "compute_bound"],
+        default="bandwidth_bound",
+        help="Kernel variant to use (gluon only). Default: bandwidth_bound.",
     )
     return get_ff_args(parser, args=args)
 
