@@ -364,14 +364,14 @@ def grouped_gemm(
         bias.stride(0) if bias is not None else 0,
         bias.stride(1) if bias is not None else 0,
     )
-    kwargs = dict(
-        N=N,
-        K=K_dim,
-        E=E,
-        HAS_BIAS=(bias is not None),
-        HAS_GATHER_IDX=(A_idx is not None),
-        HAS_SCATTER_IDX=(scatter_idx is not None),
-    )
+    kwargs = {
+        "N": N,
+        "K": K_dim,
+        "E": E,
+        "HAS_BIAS": (bias is not None),
+        "HAS_GATHER_IDX": (A_idx is not None),
+        "HAS_SCATTER_IDX": (scatter_idx is not None),
+    }
     if fwd_cfg is not None:
         constexprs, launch = split_launch_config(fwd_cfg)
         _grouped_gemm_kernel[grid](*common, **kwargs, **constexprs, **launch)
@@ -413,12 +413,12 @@ def _grouped_gemm_dw(
         out.stride(1),
         out.stride(2),
     )
-    kwargs = dict(
-        N=N,
-        K=K_dim,
-        E=E,
-        HAS_GATHER_IDX=(A_idx is not None),
-    )
+    kwargs = {
+        "N": N,
+        "K": K_dim,
+        "E": E,
+        "HAS_GATHER_IDX": (A_idx is not None),
+    }
     dw_cfg = get_grouped_gemm_dw_config(N, K_dim, E)
     if dw_cfg is not None:
         constexprs, launch = split_launch_config(dw_cfg)

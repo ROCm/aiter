@@ -165,17 +165,17 @@ def token_gather_and_sum_varlen_K_triton(
 
     # 1D grid over T only
     common = (x, w, M_perm, M_offset, out)
-    kwargs = dict(
-        T=T,
-        H=H,
-        MAX_K=MAX_K,
-        stride_xM=x.stride(0),
-        stride_xH=x.stride(1),
-        stride_outT=out.stride(0),
-        stride_outH=out.stride(1),
-        w_is_None=(w is None),
-        is_varlen_K=is_varlen_K,
-    )
+    kwargs = {
+        "T": T,
+        "H": H,
+        "MAX_K": MAX_K,
+        "stride_xM": x.stride(0),
+        "stride_xH": x.stride(1),
+        "stride_outT": out.stride(0),
+        "stride_outH": out.stride(1),
+        "w_is_None": (w is None),
+        "is_varlen_K": is_varlen_K,
+    }
     gather_cfg = get_token_gather_config(H)
     if gather_cfg is not None:
         constexprs, launch = split_launch_config(gather_cfg)
