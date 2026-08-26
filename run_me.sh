@@ -1,8 +1,2 @@
-  AITER_TDM_NEXT_STAGE_PREFETCH=1 \
-  AITER_TDM_B_PREFETCH=1 \
-  AITER_TDM_B_PREFETCH_SCOPE=se \
-  AITER_TDM_B_PREFETCH_TH=1 \
-  AITER_TDM_B_TH=1 \
-  AITER_MOE_DISABLE_REQUANT=1 \
-  FLYDSL_DUMP_IR=0 \
-  ./run_a4w4_bench.sh
+git checkout dev/yadai_a4w4_bench
+AITER_TDM_B_TH=1 bash run_a4w4_v1.sh
