@@ -474,6 +474,8 @@ def test_fmoe(
         "beta": beta,
         "linear_beta": linear_beta,
         "gate_mode": gateMode,
+        # No-op unless the selected config uses the a4w4 aux sort.
+        "output_aux": args.output_aux,
     }
 
     if kernel_bench:
@@ -767,6 +769,17 @@ parser.add_argument(
     "in fp32 so the a2 mxfp4 amax is taken over fp32 (mirrors the fused asm "
     "kernel, which computes amax on the in-register fp32 silu result, instead "
     "of the bf16 round-trip the 2-stage flydsl/torch path does). Default: bf16.",
+)
+
+parser.add_argument(
+    "--output-aux",
+    choices=["threestage", "opus"],
+    default="",
+    help="For configs whose sort emits the a4w4 aux arrays, pick which prologue "
+    "does it: 'threestage' (default) runs the port's own 3-stage sort, 'opus' "
+    "runs the Opus multi-phase sorter (one CTA per expert). Same sorted output "
+    "either way. Passed straight through to fused_moe(output_aux=...); configs "
+    "that do not use the aux sort are unaffected.",
 )
 
 args = parser.parse_args()

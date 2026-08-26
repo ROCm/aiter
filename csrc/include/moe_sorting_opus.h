@@ -2505,6 +2505,8 @@ struct MoeSortingMultiPhaseKernel_P3
         void* p_sorted_weights;
         void* p_expert_mesh; // [token, expert]
         void* p_expert_cumsum;
+        void* p_m_indices;      // optional, see MoeSortingMultiPhaseKernel_P23::Kargs
+        void* p_reverse_sorted; // optional, see MoeSortingMultiPhaseKernel_P23::Kargs
 
         opus::index_t tokens;
         opus::index_t num_experts;
@@ -2524,6 +2526,8 @@ struct MoeSortingMultiPhaseKernel_P3
         k.p_expert_cumsum     = reinterpret_cast<void*>(
             reinterpret_cast<char*>(h.p_ws) +
             impl::moe_sorting_mp_mesh_smem_size(h.tokens, h.num_experts, h.topk));
+        k.p_m_indices      = h.p_m_indices;
+        k.p_reverse_sorted = h.p_reverse_sorted;
         k.tokens      = h.tokens;
         k.num_experts = h.num_experts;
         k.topk_mdiv   = opus::mdiv{static_cast<uint32_t>(h.topk)};
@@ -2553,6 +2557,8 @@ struct MoeSortingMultiPhaseKernel_P3
         IndexType* p_expert_cumsum    = reinterpret_cast<IndexType*>(kargs.p_expert_cumsum);
         const WeightType* p_weights   = static_cast<const WeightType*>(kargs.p_weights);
         WeightType* p_sorted_weights  = reinterpret_cast<WeightType*>(kargs.p_sorted_weights);
+        IndexType* p_m_indices        = reinterpret_cast<IndexType*>(kargs.p_m_indices);
+        IndexType* p_reverse_sorted   = reinterpret_cast<IndexType*>(kargs.p_reverse_sorted);
 
         opus::index_t tokens = [&]() {
             if constexpr(Problem::LocalToken)
@@ -2630,6 +2636,11 @@ struct MoeSortingMultiPhaseKernel_P3
 #endif
                 p_sorted_weights[e_start + position] =
                     p_weights[i_token * kargs.topk_mdiv.divisor + i_topk];
+                if(p_m_indices)
+                    p_m_indices[e_start + position] = i_token & 0x00FFFFFF;
+                if(p_reverse_sorted)
+                    p_reverse_sorted[i_token * kargs.topk_mdiv.divisor + i_topk] =
+                        e_start + position;
             }
         }
 
@@ -2641,6 +2652,8 @@ struct MoeSortingMultiPhaseKernel_P3
             p_sorted_token_ids[i] = tokens;
 #endif
             p_sorted_weights[i] = static_cast<WeightType>(0.0);
+            if(p_m_indices)
+                p_m_indices[i] = tokens; // pad = tokens -> OOB row for gemm1
         }
     }
 };
@@ -2689,6 +2702,11 @@ struct MoeSortingMultiPhaseKernel_P23
         void* p_sorted_weights;
         void* p_moe_buf;
         void* p_local_topk_ids;
+        // Optional a4w4 extras, same contract as the single-kernel
+        // MoeSortingKernel: without them the MXFP4 callers are forced onto
+        // dispatch_policy=1 (that single kernel) purely to get these two arrays.
+        void* p_m_indices;      // [total_padded] sorted slot -> token id (pad = tokens)
+        void* p_reverse_sorted; // [token*topk] (token, slot) -> sorted slot
 
         opus::index_t tokens;
         opus::index_t num_experts;
@@ -2723,6 +2741,9 @@ struct MoeSortingMultiPhaseKernel_P23
 
         k.p_moe_buf        = h.p_moe_buf;
         k.p_local_topk_ids = h.p_local_topk_ids;
+
+        k.p_m_indices      = h.p_m_indices;
+        k.p_reverse_sorted = h.p_reverse_sorted;
 
         k.tokens         = h.tokens;
         k.num_experts    = h.num_experts;
@@ -2982,6 +3003,8 @@ struct MoeSortingMultiPhaseKernel_P23
             IndexType* p_expert_cumsum_smem = s + 4 + 2 * kBlockSize / opus::get_warp_size();
             const WeightType* p_weights     = static_cast<const WeightType*>(kargs.p_weights);
             WeightType* p_sorted_weights    = reinterpret_cast<WeightType*>(kargs.p_sorted_weights);
+            IndexType* p_m_indices          = reinterpret_cast<IndexType*>(kargs.p_m_indices);
+            IndexType* p_reverse_sorted = reinterpret_cast<IndexType*>(kargs.p_reverse_sorted);
 
             int eid     = blockIdx.x;
             int wave_id = threadIdx.x / opus::get_warp_size();
@@ -3148,6 +3171,11 @@ struct MoeSortingMultiPhaseKernel_P23
 #endif
                                 p_sorted_weights[e_start + position] =
                                     p_weights[i_token * kargs.topk_mdiv.divisor + i_topk[j]];
+                                if(p_m_indices)
+                                    p_m_indices[e_start + position] = i_token & 0x00FFFFFF;
+                                if(p_reverse_sorted)
+                                    p_reverse_sorted[i_token * kargs.topk_mdiv.divisor +
+                                                     i_topk[j]] = e_start + position;
                             }
                             position += i_show[j];
                         });
@@ -3225,6 +3253,8 @@ struct MoeSortingMultiPhaseKernel_P23
                 p_sorted_token_ids[i] = tokens;
 #endif
                 p_sorted_weights[i] = static_cast<WeightType>(0.0);
+                if(p_m_indices)
+                    p_m_indices[i] = tokens; // pad = tokens -> OOB row for gemm1
             }
         }
     }

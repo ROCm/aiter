@@ -5,7 +5,7 @@ import functools
 import os
 import re
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 
 import torch
@@ -72,6 +72,43 @@ _USE_FLYDSL_MOE_SORTING = os.environ.get("AITER_USE_FLYDSL_MOE_SORTING", "0") ==
 #     that generated shape set before setting output_aux.
 #   opus / ck -> never use adaptive (legacy; ck still needs AITER_USE_CK_MOE_SORTING)
 _MOE_SORT_BACKEND = os.environ.get("AITER_MOE_SORT_BACKEND", "auto").lower()
+
+# ``output_aux`` values. It gates the whole a4w4 aux-sort path, so it also picks
+# which prologue serves it -- all three states are truthy-compatible with the
+# plain ``if output_aux:`` tests elsewhere.
+#
+#   False              -- no aux arrays; ordinary sorting.
+#   True / "threestage"-- aux via the port's own 3-stage sort
+#                         (csrc/kernels/mxfp4_moe/moe_aux/moe_3stage_sort.cuh),
+#                         through _adaptive_moe_sort. Default; original path.
+#   "opus"             -- aux via the Opus sorter's *multi-phase* kernels, which
+#                         emit m_indices / reverse_sorted too
+#                         (MoeSortingMultiPhaseKernel_P23/_P3). Until they did,
+#                         aux callers were pinned to dispatch_policy=1 -- the
+#                         single-CTA kernel -- which is why the port grew a sort
+#                         of its own. The mp path runs one CTA per expert.
+#                         Applies only at block_m != 16; see _aux_uses_opus.
+#
+# Both aux modes produce the same sorted_token_ids / m_indices / reverse_sorted
+# contract; they differ only in which kernels get there.
+AUX_SORT_THREESTAGE = "threestage"
+AUX_SORT_OPUS = "opus"
+
+
+def _aux_uses_opus(output_aux, block_size):
+    """Whether this call should take the Opus sorter for its aux arrays.
+
+    "opus" only redirects the *3-stage* sort, which _adaptive_moe_sort runs at
+    block_m != 16 (prologue=1). At block_m == 16 it instead runs a single fused
+    kernel that sorts *and* zero-inits moe_buf (prologue=0); the Opus sorter
+    cannot do the zero-init, so taking it there trades one kernel for two.
+    Measured over the 40 block_m=16 rows in the tuned MXFP4 configs that is a
+    1.10x geomean loss (up to 1.34x at token=1), against a 0.97x win over the 26
+    block_m in {32, 128} rows. So the request is honoured only where it helps.
+    """
+    return output_aux == AUX_SORT_OPUS and block_size != 16
+
+
 _ACT_TYPE_DISABLED_KEY = "__ignore__"
 _SWIGLU_MXFP4_BF16_BOUND = int(os.environ.get("GPTOSS_SWIGLU_MXFP4_BF16_BOUND", "256"))
 _MOE_A8W4_BYPASS_QUANT = os.environ.get("AITER_MOE_A8W4_BYPASS_QUANT", "0") == "1"
@@ -201,7 +238,11 @@ def _moe_sorting_impl(
     device = topk_ids.device
     M, topk = topk_ids.shape
 
-    if output_aux and _MOE_SORT_BACKEND not in ("opus", "ck"):
+    if (
+        output_aux
+        and not _aux_uses_opus(output_aux, block_size)
+        and _MOE_SORT_BACKEND not in ("opus", "ck")
+    ):
         # adaptive (fused) sort emits the a4w4 extras (m_indices + reverse_sorted)
         # plus the atomic zero-init; opus single-pass aux is the env-gated fallback.
         return _adaptive_moe_sort(
@@ -243,7 +284,11 @@ def _moe_sorting_impl(
     aux_reverse_sorted = None
     if output_aux:
         use_opus = True
-        dispatch_policy = 1
+        # policy 1 is the single-CTA kernel. It used to be the only one that
+        # emitted m_indices / reverse_sorted; the multi-phase kernels do now, so
+        # output_aux="opus" can take policy 0 (auto: oneshot or multi-phase) and
+        # keep one CTA per expert instead of one CTA total.
+        dispatch_policy = 0 if _aux_uses_opus(output_aux, block_size) else 1
         aux_m_indices = torch.empty(
             max_num_tokens_padded, dtype=dtypes.i32, device=device
         )
@@ -502,6 +547,9 @@ def fused_moe(
     shared_w2_scale: torch.Tensor | None = None,
     shared_expert_id: int = -1,
     stage2_scatter: Stage2ScatterContext | None = None,
+    # "" = leave the tuned config's choice alone; AUX_SORT_THREESTAGE /
+    # AUX_SORT_OPUS re-select which prologue serves an aux-sort config.
+    output_aux: str = "",
 ):
     if (
         any(
@@ -584,6 +632,7 @@ def fused_moe(
         ),
         ep_world_size=stage2_scatter.world_size if enable_ep_scatter else 0,
         ep_source_token_map=scatter_source_map,
+        output_aux=output_aux,
     )
 
 
@@ -621,6 +670,7 @@ def fused_moe_fake(
     ep_max_tokens_per_rank: int = 0,
     ep_world_size: int = 0,
     ep_source_token_map: torch.Tensor | None = None,
+    output_aux: str = "",
 ) -> torch.Tensor:
     device = topk_ids.device
     M, _topk = topk_ids.shape
@@ -665,6 +715,7 @@ def fused_moe_(
     ep_max_tokens_per_rank: int = 0,
     ep_world_size: int = 0,
     ep_source_token_map: torch.Tensor | None = None,
+    output_aux: str = "",
 ) -> torch.Tensor:
     stage2_scatter = None
     if ep_source_token_map is not None:
@@ -703,6 +754,7 @@ def fused_moe_(
         linear_beta=linear_beta,
         gate_mode=gate_mode,
         stage2_scatter=stage2_scatter,
+        output_aux=output_aux,
     )
 
 
@@ -733,6 +785,10 @@ def _fused_moe_impl(
     linear_beta: float | None = None,
     gate_mode: str = GateMode.SEPARATED.value,
     stage2_scatter: Stage2ScatterContext | None = None,
+    # Overrides which prologue serves the aux sort, for configs that request one:
+    # "" keeps whatever the metadata picked, otherwise AUX_SORT_THREESTAGE /
+    # AUX_SORT_OPUS. Ignored when the config does not need aux at all.
+    output_aux: str = "",
     *,
     _q_dtype_a: torch.dtype | None = None,
     _metadata_transform: Callable | None = None,
@@ -919,6 +975,17 @@ def _fused_moe_impl(
     if _metadata_transform is not None:
         metadata = _metadata_transform(metadata)
 
+    if output_aux:
+        if output_aux not in (AUX_SORT_THREESTAGE, AUX_SORT_OPUS):
+            raise ValueError(
+                f"unknown output_aux {output_aux!r}; expected "
+                f"{AUX_SORT_THREESTAGE!r} or {AUX_SORT_OPUS!r}"
+            )
+        # Only a re-selection: configs that do not ask for the aux arrays are
+        # left alone, so this cannot switch a non-aux config into the aux path.
+        if metadata.output_aux:
+            metadata = replace(metadata, output_aux=output_aux)
+
     block_size_M = metadata.block_m if block_size_M is None else block_size_M
     # Ensure block_size_M is int (metadata.block_m from CSV may be float)
     if block_size_M is not None:
@@ -969,7 +1036,7 @@ def _fused_moe_impl(
             dtype,
             block_size_M,
             accumulate=_atomic,
-            output_aux=True,
+            output_aux=metadata.output_aux,
         )
         local_topk_ids = None
     else:
@@ -1373,9 +1440,12 @@ class MOEMetadata:
     stage2_has_bias: bool = False
     flat: bool = False
     # Feature flags:
-    #  - output_aux: the sort emits the gemm/scatter extras (m_indices/reverse_sorted).
+    #  - output_aux: the sort emits the gemm/scatter extras (m_indices/reverse_sorted),
+    #    and picks which prologue does it -- False / True (== AUX_SORT_THREESTAGE,
+    #    the port's own 3-stage sort) / AUX_SORT_OPUS. See the values' docs at the
+    #    top of this module.
     #  - prequant: fused_moe_2stages quantizes a1 before stage1.
-    output_aux: bool = False
+    output_aux: bool | str = False
     prequant: bool = True
     skip_inter_quant: bool = False
     intermediate_sorted: bool = False
