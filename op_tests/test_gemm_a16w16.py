@@ -159,6 +159,9 @@ def test_gemm(dtype, m, n, k, bias=False, otype=None, scaleA=None, scaleB=None):
         and (otype == dtypes.fp32 or otype == dtypes.bf16)
         and k % 64 == 0
         and n % 64 == 0
+        # asm bf16gemm kernels ship for gfx942/gfx950 only; on other archs the
+        # heuristic has an empty config map and throws
+        and get_gfx() in ("gfx942", "gfx950")
     ):
         out_asm = torch.empty(m, n, dtype=otype, device=x.device)
         ### b preshuffle
