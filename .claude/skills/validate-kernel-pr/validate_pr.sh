@@ -11,217 +11,937 @@
 #   * GPU is claimed over a sampling window and locked (kernel-profiling-optimization skill)
 #
 # usage: validate_pr.sh --repo <worktree> --tests <pytest target> [--patch p.patch]
-#                       [--shape-env VAR] [--grid "M,N,dt;..."] [--tol-table f32=1e-5,...]
+#                       [--head-sha <expected PR head>] [--shape-env VAR]
+#                       [--grid "M,N,dt;..."] [--tol-table f32=1e-5,...]
 #                       [--label NAME] [--out report.json]
-set -u
-REPO_WT=""; TESTS=""; PATCHF=""; SHAPE_ENV=""; GRID=""; TOL_TABLE=""; LABEL="run"; OUT=""
+set -uo pipefail
+
+REPO_WT=""
+TESTS=""
+PATCHF=""
+HEAD_SHA=""
+SHAPE_ENV=""
+GRID=""
+TOL_TABLE=""
+LABEL="run"
+OUT=""
 PYLIB="${PYLIB:-}"
-while [ $# -gt 0 ]; do
+TIMEOUT="${TIMEOUT:-1800}"
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+
+need_value() {
+  if [ "$#" -lt 2 ]; then
+    echo "missing value for $1" >&2
+    exit 2
+  fi
+}
+
+while [ "$#" -gt 0 ]; do
   case "$1" in
-    --repo) REPO_WT="$2"; shift 2;;
-    --tests) TESTS="$2"; shift 2;;
-    --patch) PATCHF="$2"; shift 2;;
-    --shape-env) SHAPE_ENV="$2"; shift 2;;
-    --grid) GRID="$2"; shift 2;;
-    --tol-table) TOL_TABLE="$2"; shift 2;;
-    --label) LABEL="$2"; shift 2;;
-    --out) OUT="$2"; shift 2;;
+    --repo) need_value "$@"; REPO_WT="$2"; shift 2;;
+    --tests) need_value "$@"; TESTS="$2"; shift 2;;
+    --patch) need_value "$@"; PATCHF="$2"; shift 2;;
+    --head-sha) need_value "$@"; HEAD_SHA="$2"; shift 2;;
+    --shape-env) need_value "$@"; SHAPE_ENV="$2"; shift 2;;
+    --grid) need_value "$@"; GRID="$2"; shift 2;;
+    --tol-table) need_value "$@"; TOL_TABLE="$2"; shift 2;;
+    --label) need_value "$@"; LABEL="$2"; shift 2;;
+    --out) need_value "$@"; OUT="$2"; shift 2;;
     *) echo "unknown arg $1" >&2; exit 2;;
   esac
 done
+
+if [ -z "$REPO_WT" ] || [ -z "$TESTS" ]; then
+  echo "--repo and --tests are required" >&2
+  exit 2
+fi
+if ! git -C "$REPO_WT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  echo "--repo is not a git worktree: $REPO_WT" >&2
+  exit 2
+fi
+if [ -n "$PATCHF" ] && [ ! -r "$PATCHF" ]; then
+  echo "--patch is not readable: $PATCHF" >&2
+  exit 2
+fi
+if [ -n "$HEAD_SHA" ] && [[ ! "$HEAD_SHA" =~ ^[0-9a-fA-F]{40}$ ]]; then
+  echo "--head-sha must be a full 40-character commit OID" >&2
+  exit 2
+fi
+if [[ ! "$TIMEOUT" =~ ^[1-9][0-9]*$ ]]; then
+  echo "TIMEOUT must be a positive integer" >&2
+  exit 2
+fi
+
 : "${OUT:=$PWD/validation_report.json}"
 mkdir -p "$(dirname "$OUT")"
-WORK=$(mktemp -d "/tmp/s1-$LABEL-XXXX")
-JSON="$WORK/r.json"
-python3 -c "import json,sys;json.dump({'label':sys.argv[1],'stages':{},'findings':[]},open(sys.argv[2],'w'))" "$LABEL" "$JSON"
+WORK=$(mktemp -d "/tmp/validate-kernel-pr-XXXXXX")
+JSON="$WORK/report.json"
+python3 - "$LABEL" "$JSON" <<'PY'
+import json
+import sys
 
-jset() { python3 - "$JSON" "$1" "$2" <<'PY'
-import json,sys
-p,k,v=sys.argv[1],sys.argv[2],sys.argv[3]
-d=json.load(open(p)); cur=d
-ks=k.split(".")
-for kk in ks[:-1]: cur=cur.setdefault(kk,{})
-try: v=json.loads(v)
-except Exception: pass
-cur[ks[-1]]=v
-json.dump(d,open(p,"w"),indent=1)
+json.dump(
+    {"label": sys.argv[1], "stages": {}, "findings": []},
+    open(sys.argv[2], "w"),
+    indent=2,
+)
+PY
+
+jset_json() {
+  python3 - "$JSON" "$1" "$2" <<'PY'
+import json
+import sys
+
+path, key, raw = sys.argv[1:4]
+data = json.load(open(path))
+current = data
+parts = key.split(".")
+for part in parts[:-1]:
+    current = current.setdefault(part, {})
+current[parts[-1]] = json.loads(raw)
+json.dump(data, open(path, "w"), indent=2)
 PY
 }
-finding() { python3 - "$JSON" "$1" "$2" "$3" <<'PY'
-import json,sys
-p,sev,stage,msg=sys.argv[1],sys.argv[2],sys.argv[3],sys.argv[4]
-d=json.load(open(p)); d["findings"].append({"severity":sev,"stage":stage,"detail":msg})
-json.dump(d,open(p,"w"),indent=1)
+
+jset_string() {
+  python3 - "$JSON" "$1" "$2" <<'PY'
+import json
+import sys
+
+path, key, value = sys.argv[1:4]
+data = json.load(open(path))
+current = data
+parts = key.split(".")
+for part in parts[:-1]:
+    current = current.setdefault(part, {})
+current[parts[-1]] = value
+json.dump(data, open(path, "w"), indent=2)
 PY
 }
 
-echo "=== S1 validate-kernel-pr [$LABEL] ==="
-jset "started_utc" "\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\""
-jset "isolation" '{"level":"git-worktree + private caches","container":false,"reason":"no docker CLI available inside this container"}'
+stage_note() {
+  python3 - "$JSON" "$1" "$2" "$3" <<'PY'
+import json
+import sys
+
+path, name, status, note = sys.argv[1:5]
+data = json.load(open(path))
+data["stages"][name] = {"status": status, "note": note}
+json.dump(data, open(path, "w"), indent=2)
+PY
+}
+
+finding() {
+  python3 - "$JSON" "$1" "$2" "$3" <<'PY'
+import json
+import sys
+
+path, severity, stage, detail = sys.argv[1:5]
+data = json.load(open(path))
+data["findings"].append(
+    {"severity": severity, "stage": stage, "detail": detail}
+)
+json.dump(data, open(path, "w"), indent=2)
+PY
+}
+
+log_excerpt() {
+  python3 - "$1" <<'PY'
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+if not path.exists():
+    print("log unavailable")
+else:
+    text = " ".join(path.read_text(errors="replace").splitlines()[-4:])
+    print(text[:220])
+PY
+}
+
+finish_report() {
+  python3 - "$JSON" "$OUT" <<'PY'
+import datetime
+import json
+import shutil
+import sys
+
+source, output = sys.argv[1:3]
+data = json.load(open(source))
+required_stages = (
+    "merge_sim",
+    "gpu_claim",
+    "runtime_compat",
+    "test_policy",
+    "baseline_control",
+    "correctness_repo_tests",
+    "correctness_s1_grid",
+    "index_width_scan",
+)
+for name in required_stages:
+    if name not in data["stages"]:
+        data["stages"][name] = {
+            "status": "skip",
+            "note": "validator internal error: stage did not record a result",
+        }
+        data["findings"].append(
+            {
+                "severity": "note",
+                "stage": name,
+                "detail": "stage result was missing; validation is inconclusive",
+            }
+        )
+
+severities = {finding["severity"] for finding in data["findings"]}
+complete = (
+    data["stages"]["merge_sim"]["status"] == "pass"
+    and data["stages"]["gpu_claim"]["status"] == "pass"
+    and data["stages"]["runtime_compat"]["status"] == "pass"
+    and data["stages"]["test_policy"]["status"] == "pass"
+    and data["stages"]["baseline_control"]["status"] == "pass"
+    and data["stages"]["correctness_repo_tests"]["status"] == "pass"
+    and data["stages"]["correctness_s1_grid"]["status"] == "pass"
+    and data["stages"]["index_width_scan"]["status"] == "info"
+)
+if "blocker" in severities:
+    verdict = "BLOCK"
+elif "should-fix" in severities:
+    verdict = "NEEDS_WORK"
+elif not complete:
+    verdict = "INCONCLUSIVE"
+else:
+    verdict = "PASS"
+data["verdict"] = verdict
+data["finished_utc"] = datetime.datetime.now(datetime.timezone.utc).strftime(
+    "%Y-%m-%dT%H:%M:%SZ"
+)
+json.dump(data, open(source, "w"), indent=2)
+shutil.copyfile(source, output)
+print(f"verdict={verdict}  findings={len(data['findings'])}  -> {output}")
+for item in data["findings"]:
+    print(f"  [{item['severity']}] {item['stage']}: {item['detail'][:150]}")
+PY
+}
+
+BASE_ACTIVE=0
+restore_head() {
+  if [ "$BASE_ACTIVE" -eq 0 ]; then
+    return 0
+  fi
+  if git -C "$REPO_WT" apply --check "$PATCHF" >/dev/null 2>&1 \
+      && git -C "$REPO_WT" apply "$PATCHF" >/dev/null 2>&1; then
+    BASE_ACTIVE=0
+    return 0
+  fi
+  return 1
+}
+cleanup() {
+  if [ "$BASE_ACTIVE" -eq 1 ]; then
+    restore_head || echo "failed to restore candidate patch in $REPO_WT" >&2
+  fi
+}
+trap cleanup EXIT
+
+record_gpu_activity_after() {
+  if [ -z "$PICK" ]; then
+    return
+  fi
+  ACTIVITY_AFTER=$(HIP_ID="$PICK" python3 - <<'PY'
+import os
+
+import amdsmi
+
+requested = int(os.environ["HIP_ID"])
+amdsmi.amdsmi_init()
+try:
+    for handle in amdsmi.amdsmi_get_processor_handles():
+        if amdsmi.amdsmi_get_gpu_enumeration_info(handle).get("hip_id") == requested:
+            print(amdsmi.amdsmi_get_gpu_activity(handle).get("gfx_activity"))
+            break
+    else:
+        raise RuntimeError(f"HIP index {requested} has no amd-smi mapping")
+finally:
+    amdsmi.amdsmi_shut_down()
+PY
+  )
+  if [[ "$ACTIVITY_AFTER" =~ ^[0-9]+$ ]]; then
+    jset_json "stages.gpu_claim.gfx_activity_after_pct" "$ACTIVITY_AFTER"
+  else
+    jset_string "stages.gpu_claim.post_run_note" \
+      "post-run GFX activity could not be recorded"
+  fi
+}
+
+echo "=== validate-kernel-pr [$LABEL] ==="
+jset_string "started_utc" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+jset_json "isolation" \
+  '{"level":"git-worktree + private caches","container":false,"reason":"tests run in the supplied worktree with private HOME and compiler caches"}'
+jset_json "arch_coverage" '{}'
+jset_json "degraded_mode" 'null'
+jset_string "test_selection.pytest_target" "$TESTS"
+jset_string "test_selection.shape_env" "$SHAPE_ENV"
+jset_string "test_selection.grid" "$GRID"
 
 # ---------- stage 1: merge simulation ----------
-BASE_SHA=$(git -C "$REPO_WT" rev-parse HEAD 2>/dev/null)
-jset "repo.worktree" "\"$REPO_WT\""; jset "repo.head" "\"$BASE_SHA\""
+BASE_SHA=$(git -C "$REPO_WT" rev-parse HEAD)
+jset_string "repo.worktree" "$REPO_WT"
+jset_string "repo.base" "$BASE_SHA"
+if [ -f "$REPO_WT/aiter/__init__.py" ]; then
+  REPO_KIND="aiter"
+elif [ -f "$REPO_WT/python/flydsl/__init__.py" ]; then
+  REPO_KIND="flydsl"
+else
+  REPO_KIND="unknown"
+fi
+jset_string "repo.kind" "$REPO_KIND"
+
 if [ -n "$PATCHF" ]; then
-  if git -C "$REPO_WT" apply --check "$PATCHF" 2>/dev/null; then
-    git -C "$REPO_WT" apply "$PATCHF"; jset "stages.merge_sim" '{"status":"pass","note":"patch applies cleanly"}'
+  DIRTY=$(git -C "$REPO_WT" status --porcelain --untracked-files=all)
+  if [ -n "$DIRTY" ]; then
+    stage_note "merge_sim" "skip" "supplied worktree is not clean; patch was not applied"
+    finding "note" "merge_sim" "worktree contains tracked or untracked changes, so merge simulation is inconclusive"
+    jset_json "repo.head" 'null'
+    finish_report
+    exit 2
+  fi
+  if git -C "$REPO_WT" apply --check "$PATCHF" >/dev/null 2>&1 \
+      && git -C "$REPO_WT" apply "$PATCHF" >/dev/null 2>&1; then
+    stage_note "merge_sim" "pass" "patch applies cleanly to the recorded base"
+    jset_string "repo.patch_sha256" "$(sha256sum "$PATCHF" | awk '{print $1}')"
+    if [ -n "$HEAD_SHA" ]; then
+      jset_string "repo.head" "$HEAD_SHA"
+    else
+      jset_json "repo.head" 'null'
+      jset_string "stages.merge_sim.identity_note" \
+        "no --head-sha supplied; report cannot be matched to a remote PR head"
+    fi
   else
-    jset "stages.merge_sim" '{"status":"fail","note":"patch does not apply"}'
+    stage_note "merge_sim" "fail" "patch does not apply to the recorded base"
     finding "blocker" "merge_sim" "patch/PR does not apply to the current base"
-    cp "$JSON" "$OUT"; echo "MERGE CONFLICT -> $OUT"; exit 1
+    jset_json "repo.head" 'null'
+    finish_report
+    exit 1
   fi
 else
-  jset "stages.merge_sim" '{"status":"skip","note":"no patch supplied (base validation run)"}'
+  jset_string "repo.head" "$BASE_SHA"
+  stage_note "merge_sim" "skip" \
+    "checkout validated directly; no base-to-head patch was supplied, so merge and attribution were not tested"
 fi
 
-# ---------- stage 2: GPU claim (sampling window + lock) ----------
+# ---------- stage 2: GPU claim (sampling window + whole-run lock) ----------
 PICKER="${PICKER:-$(command -v pick-idle-gpu.py || true)}"
 if [ -z "$PICKER" ]; then
-  for c in "$HOME/.local/bin/pick-idle-gpu.py" /usr/local/bin/pick-idle-gpu.py /opt/bin/pick-idle-gpu.py; do
-    [ -x "$c" ] && PICKER="$c" && break
+  for candidate in "$HOME/.local/bin/pick-idle-gpu.py" \
+                   /usr/local/bin/pick-idle-gpu.py /opt/bin/pick-idle-gpu.py; do
+    if [ -x "$candidate" ]; then
+      PICKER="$candidate"
+      break
+    fi
   done
 fi
-  PICK=$([ -n "$PICKER" ] && "$PICKER" --samples 10 --interval 1 --quiet 2>/dev/null || true)
-if [ -z "$PICK" ]; then
-  jset "stages.gpu_claim" '{"status":"fail","note":"no idle GPU after sampling window"}'
-  jset "degraded_mode" '"COMPILE_ONLY"'
-  finding "note" "gpu_claim" "no idle GPU -- correctness/perf degraded to compile-only"
+
+PICK=""
+GPU_LOCK_FD=""
+if [ -z "$PICKER" ] || [ ! -x "$PICKER" ]; then
+  stage_note "gpu_claim" "skip" "pick-idle-gpu.py is unavailable"
+  jset_string "degraded_mode" "NO_GPU"
+  finding "note" "gpu_claim" "GPU idleness could not be established; no runtime correctness claim is made"
 else
-  MKT=$(amd-smi static -g "$PICK" 2>/dev/null | grep -m1 MARKET_NAME | awk '{print $2, $3, $4}')
-  ARCH=$(amd-smi static -g "$PICK" 2>/dev/null | grep -m1 TARGET_GRAPHICS_VERSION | awk '{print $2}')
-  BDF=$(amd-smi static -g "$PICK" 2>/dev/null | grep -m1 BDF | awk '{print $2}')
-  ACT0=$(amd-smi metric -g "$PICK" 2>/dev/null | grep -m1 GFX_ACTIVITY | awk '{print $2}')
-  jset "stages.gpu_claim" "{\"status\":\"pass\",\"hip_index\":$PICK,\"model\":\"$MKT\",\"arch\":\"$ARCH\",\"bdf\":\"$BDF\",\"gfx_activity_before_pct\":\"$ACT0\",\"host\":\"$(hostname)\"}"
-  # arch coverage is a fact about this host, not an aspiration
-  jset "arch_coverage" "{\"$ARCH\":\"runtime\",\"gfx942\":\"compile-only (no gfx942 device on this host)\"}"
-fi
-
-# ---------- stage 3: runtime compatibility ----------
-# A pinned prebuilt runtime can be older than the checkout. Say so instead of
-# reporting the resulting ImportError as a code failure.
-RC_OUT=$(cd "$REPO_WT" && PYTHONPATH="$PYLIB:$REPO_WT" timeout 300 python3 -c "
-import importlib,sys
-sys.path.insert(0,'.')
-import flydsl; print('runtime', getattr(flydsl,'__version__','?'))
-" 2>&1 | tail -2)
-if echo "$RC_OUT" | grep -qi "error\|Traceback"; then
-  jset "stages.runtime_compat" "{\"status\":\"fail\",\"detail\":\"$(echo "$RC_OUT" | tail -1 | tr -d '"' | cut -c1-180)\"}"
-  finding "blocker" "runtime_compat" "checkout does not import against the pinned runtime -- rebuild the runtime image before trusting any test result"
-else
-  jset "stages.runtime_compat" "{\"status\":\"pass\",\"detail\":\"$(echo "$RC_OUT" | tail -1 | tr -d '"')\"}"
-fi
-
-# ---------- stage 4: test-policy check (runs BEFORE the suite) ----------
-# A suite that cannot fail is worse than no suite: it produces a green report.
-if [ -n "$TOL_TABLE" ]; then
-  python3 - "$JSON" "$REPO_WT" "$TESTS" "$TOL_TABLE" <<'PY'
-import json,re,subprocess,sys,os
-jp,wt,tests,tbl=sys.argv[1:5]
-rel=tests.split("::")[0]
-path=os.path.join(wt,rel)
-cur=open(path).read() if os.path.exists(path) else ""
-# The question is not "is this tolerance small enough in the abstract" (repos
-# legitimately differ per kernel) but "did THIS change loosen what was there".
-base=subprocess.run(["git","-C",wt,"show",f"HEAD:{rel}"],capture_output=True,text=True).stdout
-def tols(src):
-    a=[float(m) for m in re.findall(r"(?:atol|rtol)\s*=\s*([0-9.eE+-]+)", src)]
-    b=[float(m) for m in re.findall(r'"(?:f32|f16|bf16)"\s*:\s*([0-9.eE+-]+)', src)]
-    return a+b
-cur_t, base_t = tols(cur), tols(base)
-loosened=[]
-if base_t and cur_t and len(cur_t)==len(base_t):
-    loosened=[(b,c) for b,c in zip(base_t,cur_t) if c>b]
-commented=len(re.findall(r'^\s*#\s*\(\s*\d+\s*,\s*\d+\s*,\s*"(?:f32|f16|bf16)"\s*\)', cur, re.M))
-d=json.load(open(jp))
-st={"status":"pass","tolerances_base":base_t,"tolerances_head":cur_t,"commented_out_shape_rows":commented}
-if loosened:
-    st["status"]="fail"; st["loosened"]=loosened
-    d["findings"].append({"severity":"blocker","stage":"test_policy",
-      "detail":f"this change loosens comparison tolerance {loosened} (base -> head) while leaving the kernel path it guards unchanged -- the suite can no longer fail on the regression it was written to catch"})
-if commented:
-    d["findings"].append({"severity":"should-fix","stage":"test_policy",
-      "detail":f"{commented} shape rows are commented out in the test config -- the suite exercises fewer paths than it appears to; the S1 shape grid covers them instead"})
-d["stages"]["test_policy"]=st
-json.dump(d,open(jp,"w"),indent=1)
-PY
-fi
-
-# ---------- stage 5: correctness ----------
-run_pytest() { # $1 = label, $2 = extra env assignment
-  local lbl="$1"
-  local envassign="$2"
-  local log="$WORK/pytest-$lbl.log"
-  local rc
-  ( cd "$REPO_WT" && env HIP_VISIBLE_DEVICES="${PICK:-0}" PYTHONPATH="$PYLIB" \
-      HOME="$WORK/home" FLYDSL_CACHE_DIR="$WORK/flydsl-cache" $envassign \
-      timeout 1800 flock "/tmp/gpu-${PICK:-0}.lock" python -m pytest $TESTS -x -q ) > "$log" 2>&1
-  rc=$?
-  echo "$rc|$log"
-}
-mkdir -p "$WORK/home" "$WORK/flydsl-cache"
-# An unusable test runner is an environment fact, not a defect in the PR. Say so, rather
-# than reporting "the PR's own tests fail" for a missing pytest.
-if ! ( cd "$REPO_WT" && PYTHONPATH="$PYLIB" python -m pytest --version ) >/dev/null 2>&1; then
-  jset "stages.correctness_repo_tests" '"'"'{"status":"skip","note":"pytest not runnable in this environment - correctness not attempted"}'"'"'
-  jset "stages.correctness_s1_grid" '"'"'{"status":"skip","note":"pytest not runnable in this environment"}'"'"'
-  finding "note" "correctness" "test runner unavailable (python -m pytest failed to start) - this report makes no correctness claim"
-  PICK=""
-fi
-if [ -n "${PICK:-}" ]; then
-  # Baseline control: with a patch applied, a failure only belongs to the PR if the SAME
-  # target passes without it. Without this the harness charges pre-existing red to the
-  # author -- the exact misattribution this skill exists to prevent. Learned from an
-  # end-to-end run where base and head failed the same unrelated shape.
-  BASE_RC=""
-  if [ -n "$PATCHF" ]; then
-    git -C "$REPO_WT" stash -q 2>/dev/null
-    R0=$(run_pytest base ""); BASE_RC=${R0%%|*}; BASE_LOG=${R0##*|}
-    git -C "$REPO_WT" stash pop -q 2>/dev/null
-    jset "stages.baseline_control" "{\"status\":\"$([ "$BASE_RC" -eq 0 ] && echo clean || echo "pre-existing-failures")\",\"exit\":$BASE_RC,\"log\":\"$BASE_LOG\"}"
+  PICK=$("$PICKER" --samples 10 --interval 1 --quiet 2>"$WORK/gpu-picker.log")
+  PICK_RC=$?
+  if [ "$PICK_RC" -ne 0 ] || [[ ! "$PICK" =~ ^[0-9]+$ ]]; then
+    PICK=""
+    stage_note "gpu_claim" "skip" \
+      "no verified-idle GPU was claimable (picker exit $PICK_RC)"
+    jset_string "degraded_mode" "NO_GPU"
+    finding "note" "gpu_claim" "no verified-idle GPU was claimable; no runtime correctness claim is made"
   else
-    jset "stages.baseline_control" '"'"'{"status":"skip","note":"no patch: this run IS a base measurement, failures are not attributable to any PR"}'"'"'
-  fi
-
-  R=$(run_pytest repo ""); RC=${R%%|*}; LOG=${R##*|}
-  jset "stages.correctness_repo_tests" "{\"status\":\"$([ $RC -eq 0 ] && echo pass || echo fail)\",\"exit\":$RC,\"log\":\"$LOG\"}"
-  if [ $RC -ne 0 ]; then
-    if [ -n "$PATCHF" ] && [ "${BASE_RC:-0}" -ne 0 ]; then
-      finding "note" "correctness" "test target is red BOTH with and without this change -- pre-existing, not attributable to the PR: $(tail -3 "$LOG" | tr -d '"' | tr '\n' ' ' | cut -c1-150)"
+    exec {GPU_LOCK_FD}>"/tmp/gpu-$PICK.lock"
+    if ! flock -n "$GPU_LOCK_FD"; then
+      PICK=""
+      stage_note "gpu_claim" "skip" \
+        "selected GPU was claimed by another process before the lock was acquired"
+      jset_string "degraded_mode" "NO_GPU"
+      finding "note" "gpu_claim" "GPU claim raced with another process; no runtime correctness claim is made"
     else
-      finding "blocker" "correctness" "the PR's own test target fails (base is clean): $(tail -3 "$LOG" | tr -d '"' | tr '\n' ' ' | cut -c1-180)"
+      GPU_INFO=$(HIP_ID="$PICK" python3 - <<'PY'
+import json
+import os
+import socket
+
+import amdsmi
+
+requested = int(os.environ["HIP_ID"])
+amdsmi.amdsmi_init()
+try:
+    match = None
+    for smi_index, handle in enumerate(amdsmi.amdsmi_get_processor_handles()):
+        enumeration = amdsmi.amdsmi_get_gpu_enumeration_info(handle)
+        if enumeration.get("hip_id") == requested:
+            match = (smi_index, handle)
+            break
+    if match is None:
+        raise RuntimeError(f"HIP index {requested} has no amd-smi mapping")
+    smi_index, handle = match
+    asic = amdsmi.amdsmi_get_gpu_asic_info(handle)
+    activity = amdsmi.amdsmi_get_gpu_activity(handle)
+    print(
+        json.dumps(
+            {
+                "status": "pass",
+                "hip_index": requested,
+                "amd_smi_index": smi_index,
+                "model": asic.get("market_name", "unknown"),
+                "arch": asic.get("target_graphics_version", "unknown"),
+                "bdf": amdsmi.amdsmi_get_gpu_device_bdf(handle),
+                "gfx_activity_before_pct": activity.get("gfx_activity"),
+                "host": socket.gethostname(),
+            }
+        )
+    )
+finally:
+    amdsmi.amdsmi_shut_down()
+PY
+)
+      GPU_INFO_RC=$?
+      if [ "$GPU_INFO_RC" -ne 0 ]; then
+        flock -u "$GPU_LOCK_FD"
+        PICK=""
+        stage_note "gpu_claim" "skip" \
+          "selected HIP index could not be mapped back to amd-smi metadata"
+        jset_string "degraded_mode" "NO_GPU"
+        finding "note" "gpu_claim" "GPU identity could not be verified; no runtime correctness claim is made"
+      else
+        jset_json "stages.gpu_claim" "$GPU_INFO"
+        python3 - "$JSON" "$GPU_INFO" <<'PY'
+import json
+import sys
+
+path, raw = sys.argv[1:3]
+data = json.load(open(path))
+info = json.loads(raw)
+data["arch_coverage"] = {info["arch"]: "runtime"}
+json.dump(data, open(path, "w"), indent=2)
+PY
+      fi
     fi
   fi
+fi
 
-  # S1-owned shape grid: non-toy, boundary/odd, large-M. Independent of what the PR chose to test.
-  if [ -n "$SHAPE_ENV" ] && [ -n "$GRID" ]; then
-    R=$(run_pytest grid "$SHAPE_ENV=$GRID"); RC2=${R%%|*}; LOG2=${R##*|}
-    jset "stages.correctness_s1_grid" "{\"status\":\"$([ $RC2 -eq 0 ] && echo pass || echo fail)\",\"exit\":$RC2,\"grid\":\"$GRID\",\"log\":\"$LOG2\"}"
-    [ $RC2 -ne 0 ] && finding "blocker" "correctness" "S1 shape grid fails where the PR's own tests pass -- grid: $GRID; $(grep -iE 'mismatch|fail|error' "$LOG2" | head -2 | tr -d '"' | tr '\n' ' ' | cut -c1-200)"
-  else
-    jset "stages.correctness_s1_grid" '{"status":"skip","note":"kernel exposes no shape override; coverage is repo-default-only"}'
-    finding "note" "correctness" "no shape-grid hook for this kernel -- coverage claim limited to the repo default shapes"
+# ---------- stage 3: repo-aware runtime compatibility ----------
+RUNTIME_OK=0
+FLYDSL_SOURCE_CHANGED=0
+RC_OUT=""
+RC=0
+if [ -n "$PATCHF" ]; then
+  FLYDSL_SOURCE_CHANGED=$(python3 - "$PATCHF" <<'PY'
+import re
+import sys
+
+diff = open(sys.argv[1], encoding="utf-8").read()
+paths = re.findall(r"^\+\+\+ b/(.+)$", diff, re.MULTILINE)
+print(int(any(path.startswith("python/flydsl/") for path in paths)))
+PY
+)
+fi
+case "$REPO_KIND" in
+  aiter)
+    PROBE_PATH="$REPO_WT${PYLIB:+:$PYLIB}"
+    RC_OUT=$(
+      cd "$REPO_WT" \
+        && AITER_TRITON_ONLY=1 PYTHONDONTWRITEBYTECODE=1 \
+          PYTHONPATH="$PROBE_PATH" timeout 300 \
+          python3 - "$REPO_WT" 2>&1 <<'PY'
+import importlib
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1]).resolve()
+module = importlib.import_module("aiter")
+module_path = pathlib.Path(module.__file__).resolve()
+if root not in module_path.parents:
+    raise RuntimeError(f"aiter resolved outside checkout: {module_path}")
+print(f"aiter {getattr(module, '__version__', '?')} from {module_path}")
+PY
+    )
+    RC=$?
+    ;;
+  flydsl)
+    if [ "$FLYDSL_SOURCE_CHANGED" -eq 1 ] && [ -n "$PYLIB" ]; then
+      RC=2
+      RC_OUT="patch changes python/flydsl, but PYLIB would shadow that source; a checkout-matched rebuilt runtime is required"
+    elif [ -n "$PYLIB" ]; then
+      PROBE_PATH="$PYLIB:$REPO_WT/python"
+      EXPECTED_FLYDSL_ROOT="$PYLIB"
+    elif [ "$FLYDSL_SOURCE_CHANGED" -eq 1 ]; then
+      PROBE_PATH="$REPO_WT/python"
+      EXPECTED_FLYDSL_ROOT="$REPO_WT/python"
+    else
+      PROBE_PATH="$REPO_WT/python"
+      EXPECTED_FLYDSL_ROOT="$REPO_WT/python"
+    fi
+    if [ "$RC_OUT" = "" ]; then
+      RC_OUT=$(
+        cd "$REPO_WT" \
+          && PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$PROBE_PATH" timeout 300 \
+            python3 - "$REPO_WT/python/flydsl/__init__.py" \
+              "$EXPECTED_FLYDSL_ROOT" 2>&1 <<'PY'
+import importlib
+import pathlib
+import re
+import sys
+
+source_init = pathlib.Path(sys.argv[1]).resolve()
+expected_root = pathlib.Path(sys.argv[2]).resolve()
+module = importlib.import_module("flydsl")
+module_path = pathlib.Path(module.__file__).resolve()
+if expected_root not in module_path.parents:
+    raise RuntimeError(f"flydsl resolved outside expected runtime: {module_path}")
+match = re.search(
+    r"""__version__\s*=\s*["']([^"']+)["']""",
+    source_init.read_text(),
+)
+source_version = match.group(1) if match else None
+runtime_version = getattr(module, "__version__", None)
+if source_version and runtime_version != source_version:
+    raise RuntimeError(
+        f"FlyDSL source/runtime version mismatch: {source_version} != {runtime_version}"
+    )
+print(f"flydsl {runtime_version or '?'} from {module_path}")
+PY
+      )
+      RC=$?
+    fi
+    ;;
+  *)
+    RC=2
+    RC_OUT="unsupported repository layout; expected aiter/ or python/flydsl/"
+    ;;
+esac
+
+RC_DETAIL=$(python3 - "$RC_OUT" <<'PY'
+import sys
+
+print(" ".join(sys.argv[1].splitlines()[-3:])[:300])
+PY
+)
+if [ "$RC" -eq 0 ]; then
+  stage_note "runtime_compat" "pass" "$RC_DETAIL"
+  RUNTIME_OK=1
+else
+  stage_note "runtime_compat" "skip" "$RC_DETAIL"
+  jset_string "stages.runtime_compat.reason" "runtime_mismatch"
+  finding "note" "runtime_compat" \
+    "checkout/runtime compatibility was not established; correctness stages are skipped rather than blamed on the PR"
+fi
+
+# ---------- stage 4: test policy (before execution) ----------
+if [ -n "$PATCHF" ]; then
+  if ! python3 - "$JSON" "$REPO_WT" "$TESTS" "$TOL_TABLE" <<'PY'
+import json
+import os
+import re
+import subprocess
+import sys
+
+report_path, worktree, tests, table = sys.argv[1:5]
+relative_test = tests.split("::", 1)[0]
+head_path = os.path.join(worktree, relative_test)
+head = open(head_path).read() if os.path.exists(head_path) else ""
+base_result = subprocess.run(
+    ["git", "-C", worktree, "show", f"HEAD:{relative_test}"],
+    capture_output=True,
+    text=True,
+)
+base = base_result.stdout if base_result.returncode == 0 else ""
+changed = subprocess.run(
+    ["git", "-C", worktree, "diff", "--name-only", "HEAD"],
+    check=True,
+    capture_output=True,
+    text=True,
+).stdout.splitlines()
+
+def tolerances(source):
+    assignments = [
+        float(value)
+        for value in re.findall(
+            r"(?:atol|rtol)\s*=\s*([0-9.eE+-]+)", source
+        )
+    ]
+    mappings = [
+        float(value)
+        for value in re.findall(
+            r"""["'](?:f32|f16|bf16)["']\s*:\s*([0-9.eE+-]+)""",
+            source,
+        )
+    ]
+    return assignments + mappings
+
+head_tolerances = tolerances(head)
+base_tolerances = tolerances(base)
+loosened = []
+if (
+    base_tolerances
+    and head_tolerances
+    and len(base_tolerances) == len(head_tolerances)
+):
+    loosened = [
+        [before, after]
+        for before, after in zip(base_tolerances, head_tolerances)
+        if after > before
+    ]
+
+commented_pattern = (
+    r"""^\s*#\s*\(\s*\d+\s*,\s*\d+\s*,\s*["']"""
+    r"""(?:f32|f16|bf16)["']\s*\)"""
+)
+commented_base = len(re.findall(commented_pattern, base, re.MULTILINE))
+commented_head = len(re.findall(commented_pattern, head, re.MULTILINE))
+commented_added = max(0, commented_head - commented_base)
+reference = {}
+for item in filter(None, table.split(",")):
+    name, value = item.split("=", 1)
+    reference[name] = float(value)
+
+kernel_suffixes = (".py", ".cu", ".cuh", ".h", ".hpp", ".cpp")
+kernel_changed = any(
+    path.endswith(kernel_suffixes)
+    and not path.startswith(("tests/", "op_tests/"))
+    for path in changed
+)
+data = json.load(open(report_path))
+stage = {
+    "status": "fail" if loosened else "pass",
+    "tolerances_base": base_tolerances,
+    "tolerances_head": head_tolerances,
+    "reference_tolerances": reference,
+    "commented_out_shape_rows_base": commented_base,
+    "commented_out_shape_rows": commented_head,
+    "commented_out_shape_rows_added": commented_added,
+    "kernel_files_changed": kernel_changed,
+}
+if loosened:
+    stage["loosened"] = loosened
+    if kernel_changed:
+        data["findings"].append(
+            {
+                "severity": "should-fix",
+                "stage": "test_policy",
+                "detail": (
+                    f"comparison tolerance widened {loosened} while kernel code also "
+                    "changed; require a numerical justification instead of treating "
+                    "the green suite as clearance"
+                ),
+            }
+        )
+    else:
+        data["findings"].append(
+            {
+                "severity": "blocker",
+                "stage": "test_policy",
+                "detail": (
+                    f"test-only change widens comparison tolerance {loosened} "
+                    "(base -> head), so the suite can no longer enforce its prior bound"
+                ),
+            }
+        )
+if commented_added:
+    data["findings"].append(
+        {
+            "severity": "should-fix",
+            "stage": "test_policy",
+            "detail": (
+                f"this change comments out {commented_added} additional shape rows; "
+                "independent boundary-grid coverage must remain explicit"
+            ),
+        }
+    )
+data["stages"]["test_policy"] = stage
+json.dump(data, open(report_path, "w"), indent=2)
+PY
+  then
+    stage_note "test_policy" "skip" "test-policy analyzer failed"
+    finding "note" "test_policy" "test-policy analysis failed; validation is inconclusive"
   fi
 else
-  jset "stages.correctness_repo_tests" '{"status":"skip","note":"COMPILE_ONLY: no GPU claimed"}'
+  stage_note "test_policy" "skip" \
+    "no patch supplied; base-to-head tolerance and test-shape policy cannot be compared"
 fi
 
-# ---------- stage 6: index-width scan (informational; feeds the reviewer, not the verdict) ----------
-# Rule D9's name-list trigger misses stride/offset multiplies whose operands are not on that
-# list. This records the structural candidates so the reviewer has a "check these" list.
-if [ -n "$PATCHF" ] && [ -x "$(dirname "$0")/scan_index_width.py" ]; then
-  SCAN=$("$(dirname "$0")/scan_index_width.py" --diff "$PATCHF" 2>/dev/null | grep -c "^  " || true)
-  jset "stages.index_width_scan" "{\"status\":\"info\",\"candidates\":${SCAN:-0},\"note\":\"index x stride with no 64-bit widening; reviewer must judge each\"}"
-  [ "${SCAN:-0}" -gt 0 ] && finding "note" "index_width_scan" "$SCAN index/stride multiply sites carry no 64-bit widening - confirm each cannot exceed 2^31 at production scale"
+# ---------- stage 5: correctness with an exact baseline control ----------
+if [ "$REPO_KIND" = "flydsl" ] && [ -n "$PYLIB" ]; then
+  TEST_PYTHONPATH="$PYLIB:$REPO_WT:$REPO_WT/python"
+else
+  TEST_PYTHONPATH="$REPO_WT/python:$REPO_WT${PYLIB:+:$PYLIB}"
 fi
 
-# ---------- verdict ----------
-python3 - "$JSON" "$OUT" <<'PY'
-import json,sys,shutil
-d=json.load(open(sys.argv[1]))
-sev=[f["severity"] for f in d["findings"]]
-d["verdict"]="BLOCK" if "blocker" in sev else ("NEEDS WORK" if "should-fix" in sev else "PASS")
-d["finished_utc"]=__import__("datetime").datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
-json.dump(d,open(sys.argv[1],"w"),indent=1); shutil.copy(sys.argv[1],sys.argv[2])
-print(f"verdict={d['verdict']}  findings={len(d['findings'])}  -> {sys.argv[2]}")
-for f in d["findings"]: print(f"  [{f['severity']}] {f['stage']}: {f['detail'][:150]}")
+run_pytest() {
+  local label="$1"
+  local shape_assignment="$2"
+  local log="$WORK/pytest-$label.log"
+  local phase=${label%%-*}
+  local cache_root="$WORK/$phase"
+  mkdir -p "$cache_root/home" "$cache_root/xdg-cache" \
+    "$cache_root/flydsl-cache" "$cache_root/triton-cache" \
+    "$cache_root/torch-extensions" "$cache_root/pytest-cache"
+  local -a environment=(
+    "HIP_VISIBLE_DEVICES=$PICK"
+    "PYTHONPATH=$TEST_PYTHONPATH"
+    "PYTHONDONTWRITEBYTECODE=1"
+    "HOME=$cache_root/home"
+    "XDG_CACHE_HOME=$cache_root/xdg-cache"
+    "FLYDSL_CACHE_DIR=$cache_root/flydsl-cache"
+    "FLYDSL_RUNTIME_CACHE_DIR=$cache_root/flydsl-cache"
+    "TRITON_CACHE_DIR=$cache_root/triton-cache"
+    "TORCH_EXTENSIONS_DIR=$cache_root/torch-extensions"
+  )
+  if [ -n "$shape_assignment" ]; then
+    environment+=("$shape_assignment")
+  fi
+  (
+    cd "$REPO_WT" \
+      && env "${environment[@]}" timeout "$TIMEOUT" \
+        python -m pytest "$TESTS" -x -q -o "cache_dir=$cache_root/pytest-cache"
+  ) >"$log" 2>&1
+  local result=$?
+  echo "$result|$log"
+}
+
+CAN_TEST=1
+SKIP_REASON=""
+if [ -z "$PICK" ]; then
+  CAN_TEST=0
+  SKIP_REASON="no verified-idle GPU was claimed"
+elif [ "$RUNTIME_OK" -ne 1 ]; then
+  CAN_TEST=0
+  SKIP_REASON="runtime compatibility was not established"
+elif ! (
+  cd "$REPO_WT" \
+    && PYTHONPATH="$TEST_PYTHONPATH" python -m pytest --version
+) >/dev/null 2>&1; then
+  CAN_TEST=0
+  SKIP_REASON="python -m pytest is not runnable in this environment"
+fi
+
+BASE_REPO_STATE="not-run"
+BASE_REPO_RC=""
+BASE_REPO_LOG=""
+BASE_GRID_STATE="not-run"
+BASE_GRID_RC=""
+BASE_GRID_LOG=""
+
+if [ "$CAN_TEST" -eq 0 ]; then
+  stage_note "baseline_control" "skip" "$SKIP_REASON"
+  stage_note "correctness_repo_tests" "skip" "$SKIP_REASON"
+  stage_note "correctness_s1_grid" "skip" "$SKIP_REASON"
+  finding "note" "correctness" "$SKIP_REASON; this report makes no correctness claim"
+else
+  BASE_READY=0
+  if [ -n "$PATCHF" ]; then
+    if git -C "$REPO_WT" apply -R --check "$PATCHF" >/dev/null 2>&1 \
+        && git -C "$REPO_WT" apply -R "$PATCHF" >/dev/null 2>&1; then
+      BASE_ACTIVE=1
+      if [ -z "$(git -C "$REPO_WT" status --porcelain --untracked-files=all)" ]; then
+        BASE_READY=1
+      fi
+    fi
+
+    if [ "$BASE_READY" -eq 1 ]; then
+      TEST_FILE=${TESTS%%::*}
+      if [ -f "$REPO_WT/$TEST_FILE" ]; then
+        BASE_RESULT=$(run_pytest "base-repo" "")
+        BASE_REPO_RC=${BASE_RESULT%%|*}
+        BASE_REPO_LOG=${BASE_RESULT##*|}
+        BASE_REPO_STATE="ran"
+      else
+        BASE_REPO_STATE="target-not-present"
+      fi
+      if [ -n "$SHAPE_ENV" ] && [ -n "$GRID" ]; then
+        if [ -f "$REPO_WT/$TEST_FILE" ]; then
+          BASE_GRID_RESULT=$(run_pytest "base-grid" "$SHAPE_ENV=$GRID")
+          BASE_GRID_RC=${BASE_GRID_RESULT%%|*}
+          BASE_GRID_LOG=${BASE_GRID_RESULT##*|}
+          BASE_GRID_STATE="ran"
+        else
+          BASE_GRID_STATE="target-not-present"
+        fi
+      else
+        BASE_GRID_STATE="not-configured"
+      fi
+      if [ -n "$(git -C "$REPO_WT" status --porcelain --untracked-files=all)" ]; then
+        BASE_READY=0
+      fi
+    fi
+
+    if ! restore_head; then
+      BASE_READY=0
+      CAN_TEST=0
+      stage_note "baseline_control" "skip" \
+        "candidate patch could not be restored after the baseline run"
+      finding "note" "baseline_control" \
+        "failed to restore the candidate patch; head tests were not run"
+    elif [ "$BASE_READY" -ne 1 ]; then
+      CAN_TEST=0
+      stage_note "baseline_control" "skip" \
+        "base run did not leave a clean worktree; head tests were not run"
+      finding "note" "baseline_control" \
+        "base isolation failed or produced worktree artifacts; attribution is inconclusive"
+    else
+      python3 - "$JSON" "$BASE_REPO_STATE" "${BASE_REPO_RC:-}" \
+        "$BASE_REPO_LOG" "$BASE_GRID_STATE" "${BASE_GRID_RC:-}" \
+        "$BASE_GRID_LOG" <<'PY'
+import json
+import sys
+
+path, repo_state, repo_exit, repo_log, grid_state, grid_exit, grid_log = sys.argv[1:8]
+stage = {
+    "status": "pass",
+    "repo_tests": {"state": repo_state},
+    "s1_grid": {"state": grid_state},
+}
+if repo_exit:
+    stage["repo_tests"]["exit"] = int(repo_exit)
+    stage["repo_tests"]["log"] = repo_log
+if grid_exit:
+    stage["s1_grid"]["exit"] = int(grid_exit)
+    stage["s1_grid"]["log"] = grid_log
+data = json.load(open(path))
+data["stages"]["baseline_control"] = stage
+json.dump(data, open(path, "w"), indent=2)
 PY
+    fi
+  else
+    stage_note "baseline_control" "skip" \
+      "no patch supplied; failures on this checkout cannot be attributed against a base control"
+  fi
+
+  if [ "$CAN_TEST" -eq 1 ]; then
+    HEAD_RESULT=$(run_pytest "head-repo" "")
+    HEAD_RC=${HEAD_RESULT%%|*}
+    HEAD_LOG=${HEAD_RESULT##*|}
+    python3 - "$JSON" "$HEAD_RC" "$HEAD_LOG" <<'PY'
+import json
+import sys
+
+path, exit_code, log = sys.argv[1:4]
+data = json.load(open(path))
+data["stages"]["correctness_repo_tests"] = {
+    "status": "pass" if int(exit_code) == 0 else "fail",
+    "exit": int(exit_code),
+    "log": log,
+}
+json.dump(data, open(path, "w"), indent=2)
+PY
+    if [ "$HEAD_RC" -ne 0 ]; then
+      HEAD_EXCERPT=$(log_excerpt "$HEAD_LOG")
+      if [ -z "$PATCHF" ]; then
+        finding "blocker" "correctness" \
+          "the supplied head checkout's test target fails: $HEAD_EXCERPT"
+      elif [ "$BASE_REPO_STATE" = "target-not-present" ]; then
+        finding "blocker" "correctness" \
+          "the PR adds this test target and it fails on head: $HEAD_EXCERPT"
+      elif [ "$BASE_REPO_STATE" = "ran" ] && [ "$BASE_REPO_RC" -eq 0 ]; then
+        finding "blocker" "correctness" \
+          "the test target passes on base and fails on head: $HEAD_EXCERPT"
+      else
+        finding "note" "correctness" \
+          "the test target is red on both baseline and head; the failure is not attributed without matching failure evidence"
+      fi
+    fi
+
+    if [ -n "$SHAPE_ENV" ] && [ -n "$GRID" ]; then
+      HEAD_GRID_RESULT=$(run_pytest "head-grid" "$SHAPE_ENV=$GRID")
+      HEAD_GRID_RC=${HEAD_GRID_RESULT%%|*}
+      HEAD_GRID_LOG=${HEAD_GRID_RESULT##*|}
+      python3 - "$JSON" "$HEAD_GRID_RC" "$GRID" "$HEAD_GRID_LOG" <<'PY'
+import json
+import sys
+
+path, exit_code, grid, log = sys.argv[1:5]
+data = json.load(open(path))
+data["stages"]["correctness_s1_grid"] = {
+    "status": "pass" if int(exit_code) == 0 else "fail",
+    "exit": int(exit_code),
+    "grid": grid,
+    "log": log,
+}
+json.dump(data, open(path, "w"), indent=2)
+PY
+      if [ "$HEAD_GRID_RC" -ne 0 ]; then
+        GRID_EXCERPT=$(log_excerpt "$HEAD_GRID_LOG")
+        if [ -z "$PATCHF" ]; then
+          finding "blocker" "correctness" \
+            "the independent shape grid fails on the supplied head checkout: $GRID_EXCERPT"
+        elif [ "$BASE_GRID_STATE" = "target-not-present" ]; then
+          finding "blocker" "correctness" \
+            "the PR adds this target and its independent shape grid fails: $GRID_EXCERPT"
+        elif [ "$BASE_GRID_STATE" = "ran" ] && [ "$BASE_GRID_RC" -eq 0 ]; then
+          finding "blocker" "correctness" \
+            "the independent shape grid passes on base and fails on head: $GRID_EXCERPT"
+        else
+          finding "note" "correctness" \
+            "the independent grid is red on both baseline and head; attribution is inconclusive"
+        fi
+      fi
+    else
+      stage_note "correctness_s1_grid" "skip" \
+        "kernel exposes no configured shape override; coverage is repo-default-only"
+      finding "note" "correctness" \
+        "no independent shape-grid hook was configured; coverage is limited to repository defaults"
+    fi
+  else
+    stage_note "correctness_repo_tests" "skip" \
+      "candidate patch was not restored after baseline control"
+    stage_note "correctness_s1_grid" "skip" \
+      "candidate patch was not restored after baseline control"
+  fi
+fi
+
+# ---------- stage 6: index-width scan (informational) ----------
+SCANNER="$SCRIPT_DIR/scan_index_width.py"
+if [ -z "$PATCHF" ]; then
+  stage_note "index_width_scan" "skip" \
+    "no patch supplied; there is no base-to-head diff to scan"
+elif [ ! -x "$SCANNER" ]; then
+  stage_note "index_width_scan" "skip" \
+    "required scan_index_width.py is missing or not executable"
+  finding "note" "index_width_scan" \
+    "required index-width scan did not run; do not interpret this as an empty candidate list"
+else
+  SCAN_JSON=$("$SCANNER" --diff "$PATCHF" --json 2>"$WORK/index-width-scan.log")
+  SCAN_RC=$?
+  if [ "$SCAN_RC" -ne 0 ]; then
+    stage_note "index_width_scan" "skip" "index-width scanner failed"
+    finding "note" "index_width_scan" \
+      "index-width scan failed; do not interpret this as an empty candidate list"
+  else
+    python3 - "$JSON" "$SCAN_JSON" <<'PY'
+import json
+import sys
+
+path, raw = sys.argv[1:3]
+data = json.load(open(path))
+stage = json.loads(raw)
+stage["status"] = "info"
+stage["note"] = (
+    "index x stride with no 64-bit widening; candidates require scale-aware review"
+)
+data["stages"]["index_width_scan"] = stage
+json.dump(data, open(path, "w"), indent=2)
+PY
+    SCAN_COUNT=$(python3 - "$SCAN_JSON" <<'PY'
+import json
+import sys
+
+print(json.loads(sys.argv[1])["total_candidates"])
+PY
+)
+    if [ "$SCAN_COUNT" -gt 0 ]; then
+      finding "note" "index_width_scan" \
+        "$SCAN_COUNT index/stride candidates carry no explicit 64-bit widening; review each against production scale"
+    fi
+  fi
+fi
+
+record_gpu_activity_after
+finish_report

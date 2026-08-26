@@ -5,6 +5,12 @@ diff does not contain. Without these numbers a reviewer cannot name a triggering
 correctly clears every candidate above. Snapshot -- keep sourced and current; a stale row
 produces a confidently wrong verdict.
 
+The first three rows are partly **in-sample**: they come from the problem statements of the
+fix PRs that also supplied the known-defect labels used during development. They demonstrate
+that scale facts can make the arithmetic decidable; they do not establish holdout recall or
+generalize to deployments with different limits. Replace them with deployment-config sources
+before treating this table as production policy.
+
 | quantity | scale | source |
 |---|---|---|
 | DeepSeek-V4 unified KV pool | ~150M rows | aiter#4680 problem statement |
