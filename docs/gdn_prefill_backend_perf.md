@@ -244,9 +244,9 @@ C-input 家族（CF/CS）要求 gfx942 且 `full_prompt_len` 被 BT=64 整除，
 seqlen ∈ {1K,2K,4K,8K} 留给列。于是 GQA ratio 4 和 2 **各一张表，16 行 × 4 列
 共 128 格**，全部跑通，用时 71 秒。
 
-下面是静态截图；用 `render_gdn_mode_grid.py` 可以从随附的 JSON 生成交互式版本
-（悬停任意格可看该形状下 4 个 mode 的耗时和 B·H，顶部可切换「叠加耗时」），
-见第 11 节。
+下面是静态截图。交互式版本是 [`gdn-mode-by-seqlen.html`](./gdn-mode-by-seqlen.html)，
+单文件、直接双击打开：悬停任意格可看该形状下 4 个 mode 的耗时和 B·H，顶部可切换
+「叠加耗时」。
 
 ![各参数下最快的 mode](./images/gdn-mode-by-seqlen.png)
 
@@ -334,7 +334,8 @@ T ≥ 4K 时被 GPU 时间完全盖住（生产形状上 launch gap 只有 2us�
 | 文件 | 说明 |
 | --- | --- |
 | `docs/gdn_prefill_backend_perf.md` | 本文档 |
-| `docs/images/gdn-mode-by-seqlen.png` | 第 10 节那张 mode 网格的静态截图 |
+| `docs/gdn-mode-by-seqlen.html` | 第 10 节 mode 网格的交互式网页（单文件，可悬停查看每格 4 个 mode 的耗时） |
+| `docs/images/gdn-mode-by-seqlen.png` | 同一张网格的静态截图，供本文档内嵌 |
 | `op_tests/flydsl_tests/bench_gdn_block_ws_vs_flydsl.py` | 块级 bench，第 3~9 节的全部数值出自它 |
 | `op_tests/flydsl_tests/sweep_gdn_mode_grid.py` | 第 10 节的网格采集脚本 |
 | `op_tests/flydsl_tests/render_gdn_mode_grid.py` | 由网格 JSON 渲染交互式网页 |
@@ -360,8 +361,11 @@ HIP_VISIBLE_DEVICES=7 python op_tests/flydsl_tests/sweep_gdn_mode_grid.py \
 python op_tests/flydsl_tests/render_gdn_mode_grid.py
 ```
 
-两个脚本的默认输入输出都在自己所在目录：sweep 写 `gdn_prefill_mode_grid.json`，
-render 读它并生成 `gdn-mode-by-seqlen.html`（单文件，直接双击打开，未随仓库提交）。
+两个脚本不传参就地更新入库的那几份：sweep 写自己旁边的
+`gdn_prefill_mode_grid.json`，render 读它并覆盖 `docs/gdn-mode-by-seqlen.html`。
+截图需要另外补：用无头浏览器打开该网页整页截屏，存到
+`docs/images/gdn-mode-by-seqlen.png`。
+
 sweep 复用块级 bench 的输入构造与计时函数，只是跳过 profiler（网格只需要知道谁
 最快），128 格约 71 秒。`--hv` 是模型的 value head 数，配合 `--tps` 给出每行的
 H = Hv/TP；`--n-seqs` 是打包的序列条数 B，行按 B·H 递增排；`--seqlens` 是列。

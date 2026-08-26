@@ -12,7 +12,9 @@ import json
 from pathlib import Path
 
 DEFAULT_JSON = Path(__file__).with_name("gdn_prefill_mode_grid.json")
-DEFAULT_HTML = Path(__file__).with_name("gdn-mode-by-seqlen.html")
+# The page is a deliverable next to the document that embeds its screenshot, so
+# a plain re-run refreshes the checked-in copy instead of leaving a stray one.
+DEFAULT_HTML = Path(__file__).resolve().parents[2] / "docs" / "gdn-mode-by-seqlen.html"
 
 # Mode colours.  CF blue / CS orange / WS green / WF pink follow the existing
 # GDN mode charts; prep (the FlyDSL path) is new, so it gets violet.

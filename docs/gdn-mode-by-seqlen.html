@@ -1,0 +1,1078 @@
+<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>GDN Prefill 最快 mode · varlen</title>
+<style>
+:root {
+  --bg:#f6f7f9; --card:#fff; --ink:#111827; --dim:#6b7280; --line:#e5e7eb;
+}
+* { box-sizing:border-box }
+body {
+  margin:0; padding:28px; background:var(--bg); color:var(--ink);
+  font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",
+       "PingFang SC",Roboto,Helvetica,Arial,sans-serif;
+}
+.wrap { max-width:1400px; margin:0 auto }
+header {
+  background:var(--card); border:1px solid var(--line); border-radius:12px;
+  padding:18px 20px; margin-bottom:20px;
+}
+h1 { margin:0 0 4px; font-size:18px; font-weight:650; letter-spacing:.2px }
+.sub { color:var(--dim); font-size:12px; margin-bottom:14px }
+.legend { display:flex; flex-wrap:wrap; gap:10px }
+.lg {
+  display:flex; align-items:center; gap:7px; padding:6px 11px 6px 8px;
+  border:1px solid var(--line); border-radius:9px; background:var(--pale);
+  font-weight:640; font-size:13px;
+}
+.lg i { width:11px; height:11px; border-radius:3px; background:var(--mid); flex:none }
+.lg em { font-style:normal; color:var(--dim); font-weight:450; font-size:12px }
+.lg b { color:var(--deep); font-weight:600; font-size:12px; margin-left:2px }
+.lg.zero { background:#fafafa; opacity:.55 }
+.lg.zero b { color:var(--dim); font-weight:450 }
+.controls { display:flex; gap:8px; margin:14px 0 0; align-items:center }
+button {
+  font:inherit; font-size:12px; padding:5px 12px; border-radius:7px; cursor:pointer;
+  border:1px solid var(--line); background:#fff; color:var(--dim);
+}
+button.on { background:var(--ink); color:#fff; border-color:var(--ink) }
+section {
+  background:var(--card); border:1px solid var(--line); border-radius:12px;
+  padding:16px 20px 20px; margin-bottom:20px; overflow-x:auto;
+}
+h2 {
+  margin:0 0 12px; font-size:14px; font-weight:640;
+  display:flex; align-items:baseline; gap:12px; flex-wrap:wrap;
+}
+.tally { font-size:12px; font-weight:500; color:var(--dim) }
+th.bh { color:var(--ink); font-weight:650; padding-right:12px }
+tr.grp td, tr.grp th { border-top:1px solid var(--line); padding-top:7px }
+tr.brk td, tr.brk th { border-top:2px solid #111827; padding-top:5px }
+tr.hl th.rh { color:var(--ink); font-weight:700 }
+tr.hl td.cell { box-shadow:0 0 0 1px rgba(17,24,39,.34) }
+.tag {
+  font-size:9px; font-weight:600; color:#fff; background:#111827; letter-spacing:.3px;
+  border-radius:4px; padding:1.5px 4px; margin-right:7px; vertical-align:1.5px;
+}
+body.show-us .cell { min-width:84px }
+body.show-us .cell .pill { font-size:11px }
+table { border-collapse:separate; border-spacing:4px; width:100% }
+th { font-weight:600; font-size:12px; color:var(--dim); padding:2px 6px; white-space:nowrap }
+thead th { text-align:center; padding-bottom:6px }
+.grouphead {
+  font-weight:500; font-size:11px; color:#9ca3af; padding-bottom:2px;
+  border-bottom:1px solid var(--line);
+}
+.grouphead.left { text-align:right; padding-right:10px }
+th.rh { text-align:right; min-width:34px }
+th.rh.sub { color:#9ca3af; font-weight:450 }
+td { text-align:center; padding:0 }
+.cell {
+  border-radius:8px; cursor:default; min-width:62px; height:30px;
+  background:var(--bg); border:1px solid var(--bd);
+}
+.cell .pill {
+  font-size:12px; font-weight:660; letter-spacing:.2px; color:var(--fg);
+}
+.cell:hover { outline:2px solid var(--deep); outline-offset:1px }
+.empty { color:#d1d5db; font-size:12px }
+body.show-us .cell .pill::after { content:" " attr(data-us) }
+#tip {
+  position:fixed; z-index:50; pointer-events:none; opacity:0; transition:opacity .09s;
+  background:#111827; color:#f9fafb; padding:9px 11px; border-radius:8px;
+  font:12px/1.55 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  white-space:pre; box-shadow:0 8px 22px rgba(0,0,0,.22); max-width:340px;
+}
+footer { color:var(--dim); font-size:12px; line-height:1.8; padding:0 4px 10px }
+footer p { margin:0 0 9px; max-width:1000px }
+footer code { background:#eef0f3; padding:1px 5px; border-radius:4px; font-size:11px }
+</style></head>
+<body>
+<div class="wrap">
+<header>
+  <h1>GDN Prefill 各参数下最快的 mode</h1>
+  <div class="sub">AMD Instinct MI308X · gfx942:sramecc+:xnack- · 80 CU · torch 2.10.0+rocm7.2.4.git3d3aa833 · wall = 50 次迭代中位数 · packed varlen, state I/O on · K=V=128 bf16 · Hv=64 · TP 1/2/4/8 · seqlen 1K~8K · B·H 8~512</div>
+  <div class="legend"><span class="lg" style="--deep:#db2777;--mid:#ec4899;--pale:#fce7f3"><i></i>WF<em>opus WF</em><b>80 格 · 62%</b></span><span class="lg" style="--deep:#16a34a;--mid:#22c55e;--pale:#dcfce7"><i></i>WS<em>opus WS</em><b>48 格 · 38%</b></span><span class="lg zero" style="--deep:#2563eb;--mid:#3b82f6;--pale:#dbeafe"><i></i>CF<em>opus CF</em><b>从未最快</b></span><span class="lg zero" style="--deep:#ea580c;--mid:#f97316;--pale:#ffedd5"><i></i>CS<em>opus CS</em><b>从未最快</b></span></div>
+  <div class="controls">
+    <button id="b-mode" class="on">显示 mode</button>
+    <button id="b-us">叠加耗时</button>
+    <span style="color:var(--dim);font-size:12px">
+      色深 = 领先第二名的幅度（越深越稳），悬停看该格全部 mode 的耗时
+    </span>
+  </div>
+</header>
+
+    <section>
+      <h2>GQA ratio 4（Hg = H/4）<span class="tally"><span style="color:#db2777">WF 40 格</span> · <span style="color:#16a34a">WS 24 格</span> · 共 64 格</span></h2>
+      <table>
+        <thead>
+          <tr class="grouprow">
+            <th colspan="5" class="grouphead left">形状（按链条数 B·H 递增）</th>
+            <th colspan="4" class="grouphead">
+              每条序列多长（总 token 数 T = B × seqlen）
+            </th>
+          </tr>
+          <tr>
+            <th class="rh">TP</th><th class="rh sub">H</th><th class="rh sub">Hg</th>
+            <th class="rh">B</th><th class="rh bh">B·H</th><th>1K</th><th>2K</th><th>4K</th><th>8K</th>
+          </tr>
+        </thead>
+        <tbody><tr class="hl"><th class="rh"><span class="tag">生产</span>8</th><th class="rh sub">8</th><th class="rh sub">2</th><th class="rh">1</th><th class="rh bh">8</th><td class="cell" data-tip="TP=8 · H=8 · Hg=2 · B=1 · B·H=8
+seqlen=1,024 × B=1  ⇒  T=1,024
+最快 WS 109.2 us · 领先第二名 23.3%
+
+  WS    109.2 us  —
+  CS    134.7 us  +23.3%
+  WF    186.1 us  +70.3%
+  CF    314.0 us  +187.4%" data-mode="ws" data-us="109us" data-margin="23.3" style="--deep:#16a34a;--bg:#99e4b5;--bd:#6cd294;--fg:#138f41"><span class="pill">WS</span></td><td class="cell" data-tip="TP=8 · H=8 · Hg=2 · B=1 · B·H=8
+seqlen=2,048 × B=1  ⇒  T=2,048
+最快 WS 168.9 us · 领先第二名 41.9%
+
+  WS    168.9 us  —
+  CS    239.7 us  +41.9%
+  WF    351.0 us  +107.9%
+  CF    596.4 us  +253.2%" data-mode="ws" data-us="169us" data-margin="41.9" style="--deep:#16a34a;--bg:#99e4b5;--bd:#6cd294;--fg:#138f41"><span class="pill">WS</span></td><td class="cell" data-tip="TP=8 · H=8 · Hg=2 · B=1 · B·H=8
+seqlen=4,096 × B=1  ⇒  T=4,096
+最快 WS 293.2 us · 领先第二名 50.0%
+
+  WS    293.2 us  —
+  CS    439.8 us  +50.0%
+  WF    670.3 us  +128.6%
+  CF    1.152 ms  +292.8%" data-mode="ws" data-us="293us" data-margin="50.0" style="--deep:#16a34a;--bg:#99e4b5;--bd:#6cd294;--fg:#138f41"><span class="pill">WS</span></td><td class="cell" data-tip="TP=8 · H=8 · Hg=2 · B=1 · B·H=8
+seqlen=8,192 × B=1  ⇒  T=8,192
+最快 WS 538.7 us · 领先第二名 55.3%
+
+  WS    538.7 us  —
+  CS    836.8 us  +55.3%
+  WF    1.305 ms  +142.3%
+  CF    2.259 ms  +319.3%" data-mode="ws" data-us="539us" data-margin="55.3" style="--deep:#16a34a;--bg:#99e4b5;--bd:#6cd294;--fg:#138f41"><span class="pill">WS</span></td></tr><tr class="grp"><th class="rh">4</th><th class="rh sub">16</th><th class="rh sub">4</th><th class="rh">1</th><th class="rh bh">16</th><td class="cell" data-tip="TP=4 · H=16 · Hg=4 · B=1 · B·H=16
+seqlen=1,024 × B=1  ⇒  T=1,024
+最快 WS 143.4 us · 领先第二名 21.4%
+
+  WS    143.4 us  —
+  CS    174.2 us  +21.4%
+  WF    203.8 us  +42.1%
+  CF    327.8 us  +128.5%" data-mode="ws" data-us="143us" data-margin="21.4" style="--deep:#16a34a;--bg:#99e4b5;--bd:#6cd294;--fg:#138f41"><span class="pill">WS</span></td><td class="cell" data-tip="TP=4 · H=16 · Hg=4 · B=1 · B·H=16
+seqlen=2,048 × B=1  ⇒  T=2,048
+最快 WS 240.4 us · 领先第二名 26.5%
+
+  WS    240.4 us  —
+  CS    304.2 us  +26.5%
+  WF    377.4 us  +57.0%
+  CF    609.6 us  +153.6%" data-mode="ws" data-us="240us" data-margin="26.5" style="--deep:#16a34a;--bg:#99e4b5;--bd:#6cd294;--fg:#138f41"><span class="pill">WS</span></td><td class="cell" data-tip="TP=4 · H=16 · Hg=4 · B=1 · B·H=16
+seqlen=4,096 × B=1  ⇒  T=4,096
+最快 WS 434.8 us · 领先第二名 30.1%
+
+  WS    434.8 us  —
+  CS    565.7 us  +30.1%
+  WF    722.0 us  +66.1%
+  CF    1.173 ms  +169.7%" data-mode="ws" data-us="435us" data-margin="30.1" style="--deep:#16a34a;--bg:#99e4b5;--bd:#6cd294;--fg:#138f41"><span class="pill">WS</span></td><td class="cell" data-tip="TP=4 · H=16 · Hg=4 · B=1 · B·H=16
+seqlen=8,192 × B=1  ⇒  T=8,192
+最快 WS 843.3 us · 领先第二名 31.8%
+
+  WS    843.3 us  —
+  CS    1.112 ms  +31.8%
+  WF    1.420 ms  +68.4%
+  CF    2.312 ms  +174.1%" data-mode="ws" data-us="843us" data-margin="31.8" style="--deep:#16a34a;--bg:#99e4b5;--bd:#6cd294;--fg:#138f41"><span class="pill">WS</span></td></tr><tr class=""><th class="rh">8</th><th class="rh sub">8</th><th class="rh sub">2</th><th class="rh">2</th><th class="rh bh">16</th><td class="cell" data-tip="TP=8 · H=8 · Hg=2 · B=2 · B·H=16
+seqlen=1,024 × B=2  ⇒  T=2,048
+最快 WS 141.6 us · 领先第二名 22.0%
+
+  WS    141.6 us  —
+  CS    172.8 us  +22.0%
+  WF    204.8 us  +44.6%
+  CF    328.0 us  +131.7%" data-mode="ws" data-us="142us" data-margin="22.0" style="--deep:#16a34a;--bg:#99e4b5;--bd:#6cd294;--fg:#138f41"><span class="pill">WS</span></td><td class="cell" data-tip="TP=8 · H=8 · Hg=2 · B=2 · B·H=16
+seqlen=2,048 × B=2  ⇒  T=4,096
+最快 WS 239.0 us · 领先第二名 26.9%
+
+  WS    239.0 us  —
+  CS    303.3 us  +26.9%
+  WF    377.4 us  +57.9%
+  CF    615.0 us  +157.4%" data-mode="ws" data-us="239us" data-margin="26.9" style="--deep:#16a34a;--bg:#99e4b5;--bd:#6cd294;--fg:#138f41"><span class="pill">WS</span></td><td class="cell" data-tip="TP=8 · H=8 · Hg=2 · B=2 · B·H=16
+seqlen=4,096 × B=2  ⇒  T=8,192
+最快 WS 434.6 us · 领先第二名 30.6%
+
+  WS    434.6 us  —
+  CS    567.5 us  +30.6%
+  WF    721.0 us  +65.9%
+  CF    1.174 ms  +170.1%" data-mode="ws" data-us="435us" data-margin="30.6" style="--deep:#16a34a;--bg:#99e4b5;--bd:#6cd294;--fg:#138f41"><span class="pill">WS</span></td><td class="cell" data-tip="TP=8 · H=8 · Hg=2 · B=2 · B·H=16
+seqlen=8,192 × B=2  ⇒  T=16,384
+最快 WS 840.9 us · 领先第二名 32.1%
+
+  WS    840.9 us  —
+  CS    1.110 ms  +32.1%
+  WF    1.416 ms  +68.4%
+  CF    2.307 ms  +174.4%" data-mode="ws" data-us="841us" data-margin="32.1" style="--deep:#16a34a;--bg:#99e4b5;--bd:#6cd294;--fg:#138f41"><span class="pill">WS</span></td></tr><tr class="grp"><th class="rh">2</th><th class="rh sub">32</th><th class="rh sub">8</th><th class="rh">1</th><th class="rh bh">32</th><td class="cell" data-tip="TP=2 · H=32 · Hg=8 · B=1 · B·H=32
+seqlen=1,024 × B=1  ⇒  T=1,024
+最快 WS 215.2 us · 领先第二名 6.3%
+
+  WS    215.2 us  —
+  WF    228.7 us  +6.3%
+  CS    251.1 us  +16.7%
+  CF    350.7 us  +63.0%" data-mode="ws" data-us="215us" data-margin="6.3" style="--deep:#16a34a;--bg:#beeed0;--bd:#98dab3;--fg:#138f41"><span class="pill">WS</span></td><td class="cell" data-tip="TP=2 · H=32 · Hg=8 · B=1 · B·H=32
+seqlen=2,048 × B=1  ⇒  T=2,048
+最快 WS 385.8 us · 领先第二名 10.6%
+
+  WS    385.8 us  —
+  WF    426.6 us  +10.6%
+  CS    457.6 us  +18.6%
+  CF    650.0 us  +68.5%" data-mode="ws" data-us="386us" data-margin="10.6" style="--deep:#16a34a;--bg:#ace9c2;--bd:#82d6a3;--fg:#138f41"><span class="pill">WS</span></td><td class="cell" data-tip="TP=2 · H=32 · Hg=8 · B=1 · B·H=32
+seqlen=4,096 × B=1  ⇒  T=4,096
+最快 WS 742.4 us · 领先第二名 12.0%
+
+  WS    742.4 us  —
+  WF    831.1 us  +12.0%
+  CS    880.2 us  +18.6%
+  CF    1.248 ms  +68.1%" data-mode="ws" data-us="742us" data-margin="12.0" style="--deep:#16a34a;--bg:#ace9c2;--bd:#82d6a3;--fg:#138f41"><span class="pill">WS</span></td><td class="cell" data-tip="TP=2 · H=32 · Hg=8 · B=1 · B·H=32
+seqlen=8,192 × B=1  ⇒  T=8,192
+最快 WS 1.570 ms · 领先第二名 7.5%
+
+  WS    1.570 ms  —
+  WF    1.688 ms  +7.5%
+  CS    1.774 ms  +13.0%
+  CF    2.449 ms  +55.9%" data-mode="ws" data-us="1.57ms" data-margin="7.5" style="--deep:#16a34a;--bg:#beeed0;--bd:#98dab3;--fg:#138f41"><span class="pill">WS</span></td></tr><tr class=""><th class="rh">4</th><th class="rh sub">16</th><th class="rh sub">4</th><th class="rh">2</th><th class="rh bh">32</th><td class="cell" data-tip="TP=4 · H=16 · Hg=4 · B=2 · B·H=32
+seqlen=1,024 × B=2  ⇒  T=2,048
+最快 WS 220.0 us · 领先第二名 4.7%
+
+  WS    220.0 us  —
+  WF    230.4 us  +4.7%
+  CS    253.0 us  +15.0%
+  CF    349.2 us  +58.7%" data-mode="ws" data-us="220us" data-margin="4.7" style="--deep:#16a34a;--bg:#d0f3dd;--bd:#adddc3;--fg:#138f41"><span class="pill">WS</span></td><td class="cell" data-tip="TP=4 · H=16 · Hg=4 · B=2 · B·H=32
+seqlen=2,048 × B=2  ⇒  T=4,096
+最快 WS 387.2 us · 领先第二名 10.9%
+
+  WS    387.2 us  —
+  WF    429.3 us  +10.9%
+  CS    454.0 us  +17.2%
+  CF    641.9 us  +65.8%" data-mode="ws" data-us="387us" data-margin="10.9" style="--deep:#16a34a;--bg:#ace9c2;--bd:#82d6a3;--fg:#138f41"><span class="pill">WS</span></td><td class="cell" data-tip="TP=4 · H=16 · Hg=4 · B=2 · B·H=32
+seqlen=4,096 × B=2  ⇒  T=8,192
+最快 WS 745.4 us · 领先第二名 11.8%
+
+  WS    745.4 us  —
+  WF    833.4 us  +11.8%
+  CS    878.4 us  +17.8%
+  CF    1.238 ms  +66.1%" data-mode="ws" data-us="745us" data-margin="11.8" style="--deep:#16a34a;--bg:#ace9c2;--bd:#82d6a3;--fg:#138f41"><span class="pill">WS</span></td><td class="cell" data-tip="TP=4 · H=16 · Hg=4 · B=2 · B·H=32
+seqlen=8,192 × B=2  ⇒  T=16,384
+最快 WS 1.570 ms · 领先第二名 7.6%
+
+  WS    1.570 ms  —
+  WF    1.689 ms  +7.6%
+  CS    1.759 ms  +12.1%
+  CF    2.425 ms  +54.5%" data-mode="ws" data-us="1.57ms" data-margin="7.6" style="--deep:#16a34a;--bg:#beeed0;--bd:#98dab3;--fg:#138f41"><span class="pill">WS</span></td></tr><tr class=""><th class="rh">8</th><th class="rh sub">8</th><th class="rh sub">2</th><th class="rh">4</th><th class="rh bh">32</th><td class="cell" data-tip="TP=8 · H=8 · Hg=2 · B=4 · B·H=32
+seqlen=1,024 × B=4  ⇒  T=4,096
+最快 WS 217.0 us · 领先第二名 6.3%
+
+  WS    217.0 us  —
+  WF    230.8 us  +6.3%
+  CS    251.5 us  +15.9%
+  CF    356.6 us  +64.3%" data-mode="ws" data-us="217us" data-margin="6.3" style="--deep:#16a34a;--bg:#beeed0;--bd:#98dab3;--fg:#138f41"><span class="pill">WS</span></td><td class="cell" data-tip="TP=8 · H=8 · Hg=2 · B=4 · B·H=32
+seqlen=2,048 × B=4  ⇒  T=8,192
+最快 WS 388.1 us · 领先第二名 10.2%
+
+  WS    388.1 us  —
+  WF    427.7 us  +10.2%
+  CS    455.6 us  +17.4%
+  CF    650.9 us  +67.7%" data-mode="ws" data-us="388us" data-margin="10.2" style="--deep:#16a34a;--bg:#ace9c2;--bd:#82d6a3;--fg:#138f41"><span class="pill">WS</span></td><td class="cell" data-tip="TP=8 · H=8 · Hg=2 · B=4 · B·H=32
+seqlen=4,096 × B=4  ⇒  T=16,384
+最快 WS 747.5 us · 领先第二名 11.4%
+
+  WS    747.5 us  —
+  WF    832.4 us  +11.4%
+  CS    880.4 us  +17.8%
+  CF    1.234 ms  +65.1%" data-mode="ws" data-us="748us" data-margin="11.4" style="--deep:#16a34a;--bg:#ace9c2;--bd:#82d6a3;--fg:#138f41"><span class="pill">WS</span></td><td class="cell" data-tip="TP=8 · H=8 · Hg=2 · B=4 · B·H=32
+seqlen=8,192 × B=4  ⇒  T=32,768
+最快 WS 1.564 ms · 领先第二名 7.4%
+
+  WS    1.564 ms  —
+  WF    1.679 ms  +7.4%
+  CS    1.764 ms  +12.8%
+  CF    2.420 ms  +54.8%" data-mode="ws" data-us="1.56ms" data-margin="7.4" style="--deep:#16a34a;--bg:#beeed0;--bd:#98dab3;--fg:#138f41"><span class="pill">WS</span></td></tr><tr class="brk"><th class="rh">1</th><th class="rh sub">64</th><th class="rh sub">16</th><th class="rh">1</th><th class="rh bh">64</th><td class="cell" data-tip="TP=1 · H=64 · Hg=16 · B=1 · B·H=64
+seqlen=1,024 × B=1  ⇒  T=1,024
+最快 WF 280.9 us · 领先第二名 36.6%
+
+  WF    280.9 us  —
+  CS    383.7 us  +36.6%
+  WS    400.0 us  +42.4%
+  CF    459.1 us  +63.4%" data-mode="wf" data-us="281us" data-margin="36.6" style="--deep:#db2777;--bg:#f6abd0;--bd:#e984b8;--fg:#c12269"><span class="pill">WF</span></td><td class="cell" data-tip="TP=1 · H=64 · Hg=16 · B=1 · B·H=64
+seqlen=2,048 × B=1  ⇒  T=2,048
+最快 WF 538.2 us · 领先第二名 30.2%
+
+  WF    538.2 us  —
+  CS    700.6 us  +30.2%
+  WS    743.9 us  +38.2%
+  CF    871.4 us  +61.9%" data-mode="wf" data-us="538us" data-margin="30.2" style="--deep:#db2777;--bg:#f6abd0;--bd:#e984b8;--fg:#c12269"><span class="pill">WF</span></td><td class="cell" data-tip="TP=1 · H=64 · Hg=16 · B=1 · B·H=64
+seqlen=4,096 × B=1  ⇒  T=4,096
+最快 WF 1.103 ms · 领先第二名 27.9%
+
+  WF    1.103 ms  —
+  CS    1.411 ms  +27.9%
+  WS    1.565 ms  +41.9%
+  CF    1.706 ms  +54.6%" data-mode="wf" data-us="1.10ms" data-margin="27.9" style="--deep:#db2777;--bg:#f6abd0;--bd:#e984b8;--fg:#c12269"><span class="pill">WF</span></td><td class="cell" data-tip="TP=1 · H=64 · Hg=16 · B=1 · B·H=64
+seqlen=8,192 × B=1  ⇒  T=8,192
+最快 WF 2.252 ms · 领先第二名 27.4%
+
+  WF    2.252 ms  —
+  CS    2.871 ms  +27.4%
+  WS    3.191 ms  +41.7%
+  CF    3.452 ms  +53.3%" data-mode="wf" data-us="2.25ms" data-margin="27.4" style="--deep:#db2777;--bg:#f6abd0;--bd:#e984b8;--fg:#c12269"><span class="pill">WF</span></td></tr><tr class=""><th class="rh">2</th><th class="rh sub">32</th><th class="rh sub">8</th><th class="rh">2</th><th class="rh bh">64</th><td class="cell" data-tip="TP=2 · H=32 · Hg=8 · B=2 · B·H=64
+seqlen=1,024 × B=2  ⇒  T=2,048
+最快 WF 280.8 us · 领先第二名 33.2%
+
+  WF    280.8 us  —
+  CS    374.2 us  +33.2%
+  WS    390.6 us  +39.1%
+  CF    460.3 us  +63.9%" data-mode="wf" data-us="281us" data-margin="33.2" style="--deep:#db2777;--bg:#f6abd0;--bd:#e984b8;--fg:#c12269"><span class="pill">WF</span></td><td class="cell" data-tip="TP=2 · H=32 · Hg=8 · B=2 · B·H=64
+seqlen=2,048 × B=2  ⇒  T=4,096
+最快 WF 538.2 us · 领先第二名 30.6%
+
+  WF    538.2 us  —
+  CS    703.2 us  +30.6%
+  WS    746.8 us  +38.8%
+  CF    877.0 us  +62.9%" data-mode="wf" data-us="538us" data-margin="30.6" style="--deep:#db2777;--bg:#f6abd0;--bd:#e984b8;--fg:#c12269"><span class="pill">WF</span></td><td class="cell" data-tip="TP=2 · H=32 · Hg=8 · B=2 · B·H=64
+seqlen=4,096 × B=2  ⇒  T=8,192
+最快 WF 1.093 ms · 领先第二名 29.4%
+
+  WF    1.093 ms  —
+  CS    1.415 ms  +29.4%
+  WS    1.570 ms  +43.6%
+  CF    1.703 ms  +55.8%" data-mode="wf" data-us="1.09ms" data-margin="29.4" style="--deep:#db2777;--bg:#f6abd0;--bd:#e984b8;--fg:#c12269"><span class="pill">WF</span></td><td class="cell" data-tip="TP=2 · H=32 · Hg=8 · B=2 · B·H=64
+seqlen=8,192 × B=2  ⇒  T=16,384
+最快 WF 2.220 ms · 领先第二名 28.6%
+
+  WF    2.220 ms  —
+  CS    2.856 ms  +28.6%
+  WS    3.172 ms  +42.9%
+  CF    3.449 ms  +55.3%" data-mode="wf" data-us="2.22ms" data-margin="28.6" style="--deep:#db2777;--bg:#f6abd0;--bd:#e984b8;--fg:#c12269"><span class="pill">WF</span></td></tr><tr class=""><th class="rh">4</th><th class="rh sub">16</th><th class="rh sub">4</th><th class="rh">4</th><th class="rh bh">64</th><td class="cell" data-tip="TP=4 · H=16 · Hg=4 · B=4 · B·H=64
+seqlen=1,024 × B=4  ⇒  T=4,096
+最快 WF 282.6 us · 领先第二名 32.0%
+
+  WF    282.6 us  —
+  CS    373.1 us  +32.0%
+  WS    391.6 us  +38.6%
+  CF    462.9 us  +63.8%" data-mode="wf" data-us="283us" data-margin="32.0" style="--deep:#db2777;--bg:#f6abd0;--bd:#e984b8;--fg:#c12269"><span class="pill">WF</span></td><td class="cell" data-tip="TP=4 · H=16 · Hg=4 · B=4 · B·H=64
+seqlen=2,048 × B=4  ⇒  T=8,192
+最快 WF 541.3 us · 领先第二名 30.0%
+
+  WF    541.3 us  —
+  CS    703.5 us  +30.0%
+  WS    748.3 us  +38.3%
+  CF    870.3 us  +60.8%" data-mode="wf" data-us="541us" data-margin="30.0" style="--deep:#db2777;--bg:#f6abd0;--bd:#e984b8;--fg:#c12269"><span class="pill">WF</span></td><td class="cell" data-tip="TP=4 · H=16 · Hg=4 · B=4 · B·H=64
+seqlen=4,096 × B=4  ⇒  T=16,384
+最快 WF 1.097 ms · 领先第二名 28.6%
+
+  WF    1.097 ms  —
+  CS    1.410 ms  +28.6%
+  WS    1.575 ms  +43.6%
+  CF    1.694 ms  +54.5%" data-mode="wf" data-us="1.10ms" data-margin="28.6" style="--deep:#db2777;--bg:#f6abd0;--bd:#e984b8;--fg:#c12269"><span class="pill">WF</span></td><td class="cell" data-tip="TP=4 · H=16 · Hg=4 · B=4 · B·H=64
+seqlen=8,192 × B=4  ⇒  T=32,768
+最快 WF 2.235 ms · 领先第二名 27.6%
+
+  WF    2.235 ms  —
+  CS    2.852 ms  +27.6%
+  WS    3.179 ms  +42.2%
+  CF    3.416 ms  +52.8%" data-mode="wf" data-us="2.24ms" data-margin="27.6" style="--deep:#db2777;--bg:#f6abd0;--bd:#e984b8;--fg:#c12269"><span class="pill">WF</span></td></tr><tr class=""><th class="rh">8</th><th class="rh sub">8</th><th class="rh sub">2</th><th class="rh">8</th><th class="rh bh">64</th><td class="cell" data-tip="TP=8 · H=8 · Hg=2 · B=8 · B·H=64
+seqlen=1,024 × B=8  ⇒  T=8,192
+最快 WF 282.2 us · 领先第二名 32.8%
+
+  WF    282.2 us  —
+  CS    374.8 us  +32.8%
+  WS    394.0 us  +39.6%
+  CF    462.9 us  +64.1%" data-mode="wf" data-us="282us" data-margin="32.8" style="--deep:#db2777;--bg:#f6abd0;--bd:#e984b8;--fg:#c12269"><span class="pill">WF</span></td><td class="cell" data-tip="TP=8 · H=8 · Hg=2 · B=8 · B·H=64
+seqlen=2,048 × B=8  ⇒  T=16,384
+最快 WF 539.5 us · 领先第二名 30.5%
+
+  WF    539.5 us  —
+  CS    704.0 us  +30.5%
+  WS    750.6 us  +39.1%
+  CF    873.8 us  +62.0%" data-mode="wf" data-us="539us" data-margin="30.5" style="--deep:#db2777;--bg:#f6abd0;--bd:#e984b8;--fg:#c12269"><span class="pill">WF</span></td><td class="cell" data-tip="TP=8 · H=8 · Hg=2 · B=8 · B·H=64
+seqlen=4,096 × B=8  ⇒  T=32,768
+最快 WF 1.094 ms · 领先第二名 28.2%
+
+  WF    1.094 ms  —
+  CS    1.403 ms  +28.2%
+  WS    1.567 ms  +43.3%
+  CF    1.702 ms  +55.6%" data-mode="wf" data-us="1.09ms" data-margin="28.2" style="--deep:#db2777;--bg:#f6abd0;--bd:#e984b8;--fg:#c12269"><span class="pill">WF</span></td><td class="cell" data-tip="TP=8 · H=8 · Hg=2 · B=8 · B·H=64
+seqlen=8,192 × B=8  ⇒  T=65,536
+最快 WF 2.229 ms · 领先第二名 27.6%
+
+  WF    2.229 ms  —
+  CS    2.843 ms  +27.6%
+  WS    3.169 ms  +42.2%
+  CF    3.421 ms  +53.5%" data-mode="wf" data-us="2.23ms" data-margin="27.6" style="--deep:#db2777;--bg:#f6abd0;--bd:#e984b8;--fg:#c12269"><span class="pill">WF</span></td></tr><tr class="grp"><th class="rh">1</th><th class="rh sub">64</th><th class="rh sub">16</th><th class="rh">2</th><th class="rh bh">128</th><td class="cell" data-tip="TP=1 · H=64 · Hg=16 · B=2 · B·H=128
+seqlen=1,024 × B=2  ⇒  T=2,048
+最快 WF 545.2 us · 领先第二名 31.3%
+
+  WF    545.2 us  —
+  CS    715.7 us  +31.3%
+  WS    755.0 us  +38.5%
+  CF    888.7 us  +63.0%" data-mode="wf" data-us="545us" data-margin="31.3" style="--deep:#db2777;--bg:#f6abd0;--bd:#e984b8;--fg:#c12269"><span class="pill">WF</span></td><td class="cell" data-tip="TP=1 · H=64 · Hg=16 · B=2 · B·H=128
+seqlen=2,048 × B=2  ⇒  T=4,096
+最快 WF 1.106 ms · 领先第二名 28.8%
+
+  WF    1.106 ms  —
+  CS    1.424 ms  +28.8%
+  WS    1.561 ms  +41.1%
+  CF    1.714 ms  +55.0%" data-mode="wf" data-us="1.11ms" data-margin="28.8" style="--deep:#db2777;--bg:#f6abd0;--bd:#e984b8;--fg:#c12269"><span class="pill">WF</span></td><td class="cell" data-tip="TP=1 · H=64 · Hg=16 · B=2 · B·H=128
+seqlen=4,096 × B=2  ⇒  T=8,192
+最快 WF 2.262 ms · 领先第二名 27.1%
+
+  WF    2.262 ms  —
+  CS    2.875 ms  +27.1%
+  WS    3.189 ms  +41.0%
+  CF    3.423 ms  +51.3%" data-mode="wf" data-us="2.26ms" data-margin="27.1" style="--deep:#db2777;--bg:#f6abd0;--bd:#e984b8;--fg:#c12269"><span class="pill">WF</span></td><td class="cell" data-tip="TP=1 · H=64 · Hg=16 · B=2 · B·H=128
+seqlen=8,192 × B=2  ⇒  T=16,384
+最快 WF 4.448 ms · 领先第二名 28.1%
+
+  WF    4.448 ms  —
+  CS    5.698 ms  +28.1%
+  WS    6.291 ms  +41.5%
+  CF    6.881 ms  +54.7%" data-mode="wf" data-us="4.45ms" data-margin="28.1" style="--deep:#db2777;--bg:#f6abd0;--bd:#e984b8;--fg:#c12269"><span class="pill">WF</span></td></tr><tr class=""><th class="rh">2</th><th class="rh sub">32</th><th class="rh sub">8</th><th class="rh">4</th><th class="rh bh">128</th><td class="cell" data-tip="TP=2 · H=32 · Hg=8 · B=4 · B·H=128
+seqlen=1,024 × B=4  ⇒  T=4,096
+最快 WF 544.7 us · 领先第二名 31.8%
+
+  WF    544.7 us  —
+  CS    717.8 us  +31.8%
+  WS    757.2 us  +39.0%
+  CF    889.6 us  +63.3%" data-mode="wf" data-us="545us" data-margin="31.8" style="--deep:#db2777;--bg:#f6abd0;--bd:#e984b8;--fg:#c12269"><span class="pill">WF</span></td><td class="cell" data-tip="TP=2 · H=32 · Hg=8 · B=4 · B·H=128
+seqlen=2,048 × B=4  ⇒  T=8,192
+最快 WF 1.111 ms · 领先第二名 28.6%
+
+  WF    1.111 ms  —
+  CS    1.428 ms  +28.6%
+  WS    1.581 ms  +42.3%
+  CF    1.713 ms  +54.2%" data-mode="wf" data-us="1.11ms" data-margin="28.6" style="--deep:#db2777;--bg:#f6abd0;--bd:#e984b8;--fg:#c12269"><span class="pill">WF</span></td><td class="cell" data-tip="TP=2 · H=32 · Hg=8 · B=4 · B·H=128
+seqlen=4,096 × B=4  ⇒  T=16,384
+最快 WF 2.223 ms · 领先第二名 28.6%
+
+  WF    2.223 ms  —
+  CS    2.860 ms  +28.6%
+  WS    3.161 ms  +42.2%
+  CF    3.420 ms  +53.8%" data-mode="wf" data-us="2.22ms" data-margin="28.6" style="--deep:#db2777;--bg:#f6abd0;--bd:#e984b8;--fg:#c12269"><span class="pill">WF</span></td><td class="cell" data-tip="TP=2 · H=32 · Hg=8 · B=4 · B·H=128
+seqlen=8,192 × B=4  ⇒  T=32,768
+最快 WF 4.420 ms · 领先第二名 28.0%
+
+  WF    4.420 ms  —
+  CS    5.659 ms  +28.0%
+  WS    6.299 ms  +42.5%
+  CF    6.861 ms  +55.2%" data-mode="wf" data-us="4.42ms" data-margin="28.0" style="--deep:#db2777;--bg:#f6abd0;--bd:#e984b8;--fg:#c12269"><span class="pill">WF</span></td></tr><tr class=""><th class="rh">4</th><th class="rh sub">16</th><th class="rh sub">4</th><th class="rh">8</th><th class="rh bh">128</th><td class="cell" data-tip="TP=4 · H=16 · Hg=4 · B=8 · B·H=128
+seqlen=1,024 × B=8  ⇒  T=8,192
+最快 WF 547.3 us · 领先第二名 31.6%
+
+  WF    547.3 us  —
+  CS    720.1 us  +31.6%
+  WS    760.6 us  +39.0%
+  CF    883.1 us  +61.4%" data-mode="wf" data-us="547us" data-margin="31.6" style="--deep:#db2777;--bg:#f6abd0;--bd:#e984b8;--fg:#c12269"><span class="pill">WF</span></td><td class="cell" data-tip="TP=4 · H=16 · Hg=4 · B=8 · B·H=128
+seqlen=2,048 × B=8  ⇒  T=16,384
+最快 WF 1.106 ms · 领先第二名 28.8%
+
+  WF    1.106 ms  —
+  CS    1.425 ms  +28.8%
+  WS    1.578 ms  +42.7%
+  CF    1.691 ms  +52.8%" data-mode="wf" data-us="1.11ms" data-margin="28.8" style="--deep:#db2777;--bg:#f6abd0;--bd:#e984b8;--fg:#c12269"><span class="pill">WF</span></td><td class="cell" data-tip="TP=4 · H=16 · Hg=4 · B=8 · B·H=128
+seqlen=4,096 × B=8  ⇒  T=32,768
+最快 WF 2.242 ms · 领先第二名 27.4%
+
+  WF    2.242 ms  —
+  CS    2.857 ms  +27.4%
+  WS    3.187 ms  +42.2%
+  CF    3.370 ms  +50.3%" data-mode="wf" data-us="2.24ms" data-margin="27.4" style="--deep:#db2777;--bg:#f6abd0;--bd:#e984b8;--fg:#c12269"><span class="pill">WF</span></td><td class="cell" data-tip="TP=4 · H=16 · Hg=4 · B=8 · B·H=128
+seqlen=8,192 × B=8  ⇒  T=65,536
+最快 WF 4.423 ms · 领先第二名 27.8%
+
+  WF    4.423 ms  —
+  CS    5.654 ms  +27.8%
+  WS    6.311 ms  +42.7%
+  CF    6.743 ms  +52.4%" data-mode="wf" data-us="4.42ms" data-margin="27.8" style="--deep:#db2777;--bg:#f6abd0;--bd:#e984b8;--fg:#c12269"><span class="pill">WF</span></td></tr><tr class="grp"><th class="rh">1</th><th class="rh sub">64</th><th class="rh sub">16</th><th class="rh">4</th><th class="rh bh">256</th><td class="cell" data-tip="TP=1 · H=64 · Hg=16 · B=4 · B·H=256
+seqlen=1,024 × B=4  ⇒  T=4,096
+最快 WF 1.124 ms · 领先第二名 24.3%
+
+  WF    1.124 ms  —
+  CS    1.398 ms  +24.3%
+  WS    1.528 ms  +36.0%
+  CF    1.699 ms  +51.1%" data-mode="wf" data-us="1.12ms" data-margin="24.3" style="--deep:#db2777;--bg:#f6abd0;--bd:#e984b8;--fg:#c12269"><span class="pill">WF</span></td><td class="cell" data-tip="TP=1 · H=64 · Hg=16 · B=4 · B·H=256
+seqlen=2,048 × B=4  ⇒  T=8,192
+最快 WF 2.241 ms · 领先第二名 23.8%
+
+  WF    2.241 ms  —
+  CS    2.774 ms  +23.8%
+  WS    3.039 ms  +35.6%
+  CF    3.351 ms  +49.5%" data-mode="wf" data-us="2.24ms" data-margin="23.8" style="--deep:#db2777;--bg:#f6abd0;--bd:#e984b8;--fg:#c12269"><span class="pill">WF</span></td><td class="cell" data-tip="TP=1 · H=64 · Hg=16 · B=4 · B·H=256
+seqlen=4,096 × B=4  ⇒  T=16,384
+最快 WF 4.459 ms · 领先第二名 23.3%
+
+  WF    4.459 ms  —
+  CS    5.496 ms  +23.3%
+  WS    6.062 ms  +36.0%
+  CF    6.676 ms  +49.7%" data-mode="wf" data-us="4.46ms" data-margin="23.3" style="--deep:#db2777;--bg:#f6abd0;--bd:#e984b8;--fg:#c12269"><span class="pill">WF</span></td><td class="cell" data-tip="TP=1 · H=64 · Hg=16 · B=4 · B·H=256
+seqlen=8,192 × B=4  ⇒  T=32,768
+最快 WF 8.925 ms · 领先第二名 23.4%
+
+  WF    8.925 ms  —
+  CS   11.010 ms  +23.4%
+  WS   12.151 ms  +36.1%
+  CF   13.320 ms  +49.2%" data-mode="wf" data-us="8.93ms" data-margin="23.4" style="--deep:#db2777;--bg:#f6abd0;--bd:#e984b8;--fg:#c12269"><span class="pill">WF</span></td></tr><tr class=""><th class="rh">2</th><th class="rh sub">32</th><th class="rh sub">8</th><th class="rh">8</th><th class="rh bh">256</th><td class="cell" data-tip="TP=2 · H=32 · Hg=8 · B=8 · B·H=256
+seqlen=1,024 × B=8  ⇒  T=8,192
+最快 WF 1.122 ms · 领先第二名 24.5%
+
+  WF    1.122 ms  —
+  CS    1.398 ms  +24.5%
+  WS    1.538 ms  +37.1%
+  CF    1.703 ms  +51.8%" data-mode="wf" data-us="1.12ms" data-margin="24.5" style="--deep:#db2777;--bg:#f6abd0;--bd:#e984b8;--fg:#c12269"><span class="pill">WF</span></td><td class="cell" data-tip="TP=2 · H=32 · Hg=8 · B=8 · B·H=256
+seqlen=2,048 × B=8  ⇒  T=16,384
+最快 WF 2.236 ms · 领先第二名 23.4%
+
+  WF    2.236 ms  —
+  CS    2.759 ms  +23.4%
+  WS    3.047 ms  +36.3%
+  CF    3.358 ms  +50.2%" data-mode="wf" data-us="2.24ms" data-margin="23.4" style="--deep:#db2777;--bg:#f6abd0;--bd:#e984b8;--fg:#c12269"><span class="pill">WF</span></td><td class="cell" data-tip="TP=2 · H=32 · Hg=8 · B=8 · B·H=256
+seqlen=4,096 × B=8  ⇒  T=32,768
+最快 WF 4.432 ms · 领先第二名 23.1%
+
+  WF    4.432 ms  —
+  CS    5.457 ms  +23.1%
+  WS    6.058 ms  +36.7%
+  CF    6.682 ms  +50.8%" data-mode="wf" data-us="4.43ms" data-margin="23.1" style="--deep:#db2777;--bg:#f6abd0;--bd:#e984b8;--fg:#c12269"><span class="pill">WF</span></td><td class="cell" data-tip="TP=2 · H=32 · Hg=8 · B=8 · B·H=256
+seqlen=8,192 × B=8  ⇒  T=65,536
+最快 WF 8.831 ms · 领先第二名 23.9%
+
+  WF    8.831 ms  —
+  CS   10.940 ms  +23.9%
+  WS   12.128 ms  +37.3%
+  CF   13.333 ms  +51.0%" data-mode="wf" data-us="8.83ms" data-margin="23.9" style="--deep:#db2777;--bg:#f6abd0;--bd:#e984b8;--fg:#c12269"><span class="pill">WF</span></td></tr><tr class="grp"><th class="rh">1</th><th class="rh sub">64</th><th class="rh sub">16</th><th class="rh">8</th><th class="rh bh">512</th><td class="cell" data-tip="TP=1 · H=64 · Hg=16 · B=8 · B·H=512
+seqlen=1,024 × B=8  ⇒  T=8,192
+最快 WF 2.128 ms · 领先第二名 27.5%
+
+  WF    2.128 ms  —
+  CS    2.713 ms  +27.5%
+  WS    3.049 ms  +43.3%
+  CF    3.202 ms  +50.4%" data-mode="wf" data-us="2.13ms" data-margin="27.5" style="--deep:#db2777;--bg:#f6abd0;--bd:#e984b8;--fg:#c12269"><span class="pill">WF</span></td><td class="cell" data-tip="TP=1 · H=64 · Hg=16 · B=8 · B·H=512
+seqlen=2,048 × B=8  ⇒  T=16,384
+最快 WF 4.171 ms · 领先第二名 27.6%
+
+  WF    4.171 ms  —
+  CS    5.324 ms  +27.6%
+  WS    5.975 ms  +43.2%
+  CF    6.212 ms  +48.9%" data-mode="wf" data-us="4.17ms" data-margin="27.6" style="--deep:#db2777;--bg:#f6abd0;--bd:#e984b8;--fg:#c12269"><span class="pill">WF</span></td><td class="cell" data-tip="TP=1 · H=64 · Hg=16 · B=8 · B·H=512
+seqlen=4,096 × B=8  ⇒  T=32,768
+最快 WF 8.332 ms · 领先第二名 26.6%
+
+  WF    8.332 ms  —
+  CS   10.549 ms  +26.6%
+  WS   11.934 ms  +43.2%
+  CF   12.395 ms  +48.8%" data-mode="wf" data-us="8.33ms" data-margin="26.6" style="--deep:#db2777;--bg:#f6abd0;--bd:#e984b8;--fg:#c12269"><span class="pill">WF</span></td><td class="cell" data-tip="TP=1 · H=64 · Hg=16 · B=8 · B·H=512
+seqlen=8,192 × B=8  ⇒  T=65,536
+最快 WF 16.756 ms · 领先第二名 25.7%
+
+  WF   16.756 ms  —
+  CS   21.069 ms  +25.7%
+  WS   23.955 ms  +43.0%
+  CF   24.759 ms  +47.8%" data-mode="wf" data-us="16.76ms" data-margin="25.7" style="--deep:#db2777;--bg:#f6abd0;--bd:#e984b8;--fg:#c12269"><span class="pill">WF</span></td></tr></tbody>
+      </table>
+    </section>
+    <section>
+      <h2>GQA ratio 2（Hg = H/2）<span class="tally"><span style="color:#db2777">WF 40 格</span> · <span style="color:#16a34a">WS 24 格</span> · 共 64 格</span></h2>
+      <table>
+        <thead>
+          <tr class="grouprow">
+            <th colspan="5" class="grouphead left">形状（按链条数 B·H 递增）</th>
+            <th colspan="4" class="grouphead">
+              每条序列多长（总 token 数 T = B × seqlen）
+            </th>
+          </tr>
+          <tr>
+            <th class="rh">TP</th><th class="rh sub">H</th><th class="rh sub">Hg</th>
+            <th class="rh">B</th><th class="rh bh">B·H</th><th>1K</th><th>2K</th><th>4K</th><th>8K</th>
+          </tr>
+        </thead>
+        <tbody><tr class=""><th class="rh">8</th><th class="rh sub">8</th><th class="rh sub">4</th><th class="rh">1</th><th class="rh bh">8</th><td class="cell" data-tip="TP=8 · H=8 · Hg=4 · B=1 · B·H=8
+seqlen=1,024 × B=1  ⇒  T=1,024
+最快 WS 102.5 us · 领先第二名 30.7%
+
+  WS    102.5 us  —
+  CS    134.0 us  +30.7%
+  WF    184.4 us  +79.9%
+  CF    315.0 us  +207.4%" data-mode="ws" data-us="102us" data-margin="30.7" style="--deep:#16a34a;--bg:#99e4b5;--bd:#6cd294;--fg:#138f41"><span class="pill">WS</span></td><td class="cell" data-tip="TP=8 · H=8 · Hg=4 · B=1 · B·H=8
+seqlen=2,048 × B=1  ⇒  T=2,048
+最快 WS 168.1 us · 领先第二名 42.3%
+
+  WS    168.1 us  —
+  CS    239.2 us  +42.3%
+  WF    350.2 us  +108.4%
+  CF    600.9 us  +257.5%" data-mode="ws" data-us="168us" data-margin="42.3" style="--deep:#16a34a;--bg:#99e4b5;--bd:#6cd294;--fg:#138f41"><span class="pill">WS</span></td><td class="cell" data-tip="TP=8 · H=8 · Hg=4 · B=1 · B·H=8
+seqlen=4,096 × B=1  ⇒  T=4,096
+最快 WS 291.3 us · 领先第二名 50.4%
+
+  WS    291.3 us  —
+  CS    438.0 us  +50.4%
+  WF    669.2 us  +129.7%
+  CF    1.158 ms  +297.6%" data-mode="ws" data-us="291us" data-margin="50.4" style="--deep:#16a34a;--bg:#99e4b5;--bd:#6cd294;--fg:#138f41"><span class="pill">WS</span></td><td class="cell" data-tip="TP=8 · H=8 · Hg=4 · B=1 · B·H=8
+seqlen=8,192 × B=1  ⇒  T=8,192
+最快 WS 540.4 us · 领先第二名 55.4%
+
+  WS    540.4 us  —
+  CS    839.8 us  +55.4%
+  WF    1.305 ms  +141.5%
+  CF    2.277 ms  +321.4%" data-mode="ws" data-us="540us" data-margin="55.4" style="--deep:#16a34a;--bg:#99e4b5;--bd:#6cd294;--fg:#138f41"><span class="pill">WS</span></td></tr><tr class="grp"><th class="rh">4</th><th class="rh sub">16</th><th class="rh sub">8</th><th class="rh">1</th><th class="rh bh">16</th><td class="cell" data-tip="TP=4 · H=16 · Hg=8 · B=1 · B·H=16
+seqlen=1,024 × B=1  ⇒  T=1,024
+最快 WS 143.7 us · 领先第二名 22.2%
+
+  WS    143.7 us  —
+  CS    175.6 us  +22.2%
+  WF    203.1 us  +41.4%
+  CF    329.2 us  +129.1%" data-mode="ws" data-us="144us" data-margin="22.2" style="--deep:#16a34a;--bg:#99e4b5;--bd:#6cd294;--fg:#138f41"><span class="pill">WS</span></td><td class="cell" data-tip="TP=4 · H=16 · Hg=8 · B=1 · B·H=16
+seqlen=2,048 × B=1  ⇒  T=2,048
+最快 WS 240.4 us · 领先第二名 28.9%
+
+  WS    240.4 us  —
+  CS    309.9 us  +28.9%
+  WF    375.4 us  +56.2%
+  CF    614.8 us  +155.8%" data-mode="ws" data-us="240us" data-margin="28.9" style="--deep:#16a34a;--bg:#99e4b5;--bd:#6cd294;--fg:#138f41"><span class="pill">WS</span></td><td class="cell" data-tip="TP=4 · H=16 · Hg=8 · B=1 · B·H=16
+seqlen=4,096 × B=1  ⇒  T=4,096
+最快 WS 434.6 us · 领先第二名 32.5%
+
+  WS    434.6 us  —
+  CS    575.7 us  +32.5%
+  WF    720.7 us  +65.8%
+  CF    1.187 ms  +173.1%" data-mode="ws" data-us="435us" data-margin="32.5" style="--deep:#16a34a;--bg:#99e4b5;--bd:#6cd294;--fg:#138f41"><span class="pill">WS</span></td><td class="cell" data-tip="TP=4 · H=16 · Hg=8 · B=1 · B·H=16
+seqlen=8,192 × B=1  ⇒  T=8,192
+最快 WS 845.6 us · 领先第二名 33.0%
+
+  WS    845.6 us  —
+  CS    1.125 ms  +33.0%
+  WF    1.420 ms  +67.9%
+  CF    2.339 ms  +176.6%" data-mode="ws" data-us="846us" data-margin="33.0" style="--deep:#16a34a;--bg:#99e4b5;--bd:#6cd294;--fg:#138f41"><span class="pill">WS</span></td></tr><tr class=""><th class="rh">8</th><th class="rh sub">8</th><th class="rh sub">4</th><th class="rh">2</th><th class="rh bh">16</th><td class="cell" data-tip="TP=8 · H=8 · Hg=4 · B=2 · B·H=16
+seqlen=1,024 × B=2  ⇒  T=2,048
+最快 WS 142.8 us · 领先第二名 22.5%
+
+  WS    142.8 us  —
+  CS    174.9 us  +22.5%
+  WF    204.1 us  +42.9%
+  CF    336.7 us  +135.7%" data-mode="ws" data-us="143us" data-margin="22.5" style="--deep:#16a34a;--bg:#99e4b5;--bd:#6cd294;--fg:#138f41"><span class="pill">WS</span></td><td class="cell" data-tip="TP=8 · H=8 · Hg=4 · B=2 · B·H=16
+seqlen=2,048 × B=2  ⇒  T=4,096
+最快 WS 239.5 us · 领先第二名 28.1%
+
+  WS    239.5 us  —
+  CS    306.9 us  +28.1%
+  WF    376.7 us  +57.3%
+  CF    619.9 us  +158.8%" data-mode="ws" data-us="239us" data-margin="28.1" style="--deep:#16a34a;--bg:#99e4b5;--bd:#6cd294;--fg:#138f41"><span class="pill">WS</span></td><td class="cell" data-tip="TP=8 · H=8 · Hg=4 · B=2 · B·H=16
+seqlen=4,096 × B=2  ⇒  T=8,192
+最快 WS 436.0 us · 领先第二名 31.9%
+
+  WS    436.0 us  —
+  CS    575.0 us  +31.9%
+  WF    720.0 us  +65.1%
+  CF    1.188 ms  +172.4%" data-mode="ws" data-us="436us" data-margin="31.9" style="--deep:#16a34a;--bg:#99e4b5;--bd:#6cd294;--fg:#138f41"><span class="pill">WS</span></td><td class="cell" data-tip="TP=8 · H=8 · Hg=4 · B=2 · B·H=16
+seqlen=8,192 × B=2  ⇒  T=16,384
+最快 WS 843.6 us · 领先第二名 32.8%
+
+  WS    843.6 us  —
+  CS    1.121 ms  +32.8%
+  WF    1.417 ms  +68.0%
+  CF    2.333 ms  +176.6%" data-mode="ws" data-us="844us" data-margin="32.8" style="--deep:#16a34a;--bg:#99e4b5;--bd:#6cd294;--fg:#138f41"><span class="pill">WS</span></td></tr><tr class="grp"><th class="rh">2</th><th class="rh sub">32</th><th class="rh sub">16</th><th class="rh">1</th><th class="rh bh">32</th><td class="cell" data-tip="TP=2 · H=32 · Hg=16 · B=1 · B·H=32
+seqlen=1,024 × B=1  ⇒  T=1,024
+最快 WS 215.8 us · 领先第二名 6.5%
+
+  WS    215.8 us  —
+  WF    229.9 us  +6.5%
+  CS    250.0 us  +15.8%
+  CF    353.4 us  +63.7%" data-mode="ws" data-us="216us" data-margin="6.5" style="--deep:#16a34a;--bg:#beeed0;--bd:#98dab3;--fg:#138f41"><span class="pill">WS</span></td><td class="cell" data-tip="TP=2 · H=32 · Hg=16 · B=1 · B·H=32
+seqlen=2,048 × B=1  ⇒  T=2,048
+最快 WS 386.8 us · 领先第二名 10.5%
+
+  WS    386.8 us  —
+  WF    427.4 us  +10.5%
+  CS    458.4 us  +18.5%
+  CF    657.5 us  +70.0%" data-mode="ws" data-us="387us" data-margin="10.5" style="--deep:#16a34a;--bg:#ace9c2;--bd:#82d6a3;--fg:#138f41"><span class="pill">WS</span></td><td class="cell" data-tip="TP=2 · H=32 · Hg=16 · B=1 · B·H=32
+seqlen=4,096 × B=1  ⇒  T=4,096
+最快 WS 744.0 us · 领先第二名 11.7%
+
+  WS    744.0 us  —
+  WF    831.4 us  +11.7%
+  CS    881.0 us  +18.4%
+  CF    1.262 ms  +69.6%" data-mode="ws" data-us="744us" data-margin="11.7" style="--deep:#16a34a;--bg:#ace9c2;--bd:#82d6a3;--fg:#138f41"><span class="pill">WS</span></td><td class="cell" data-tip="TP=2 · H=32 · Hg=16 · B=1 · B·H=32
+seqlen=8,192 × B=1  ⇒  T=8,192
+最快 WS 1.587 ms · 领先第二名 7.7%
+
+  WS    1.587 ms  —
+  WF    1.709 ms  +7.7%
+  CS    1.794 ms  +13.0%
+  CF    2.483 ms  +56.5%" data-mode="ws" data-us="1.59ms" data-margin="7.7" style="--deep:#16a34a;--bg:#beeed0;--bd:#98dab3;--fg:#138f41"><span class="pill">WS</span></td></tr><tr class=""><th class="rh">4</th><th class="rh sub">16</th><th class="rh sub">8</th><th class="rh">2</th><th class="rh bh">32</th><td class="cell" data-tip="TP=4 · H=16 · Hg=8 · B=2 · B·H=32
+seqlen=1,024 × B=2  ⇒  T=2,048
+最快 WS 218.2 us · 领先第二名 5.5%
+
+  WS    218.2 us  —
+  WF    230.3 us  +5.5%
+  CS    252.3 us  +15.6%
+  CF    350.5 us  +60.6%" data-mode="ws" data-us="218us" data-margin="5.5" style="--deep:#16a34a;--bg:#beeed0;--bd:#98dab3;--fg:#138f41"><span class="pill">WS</span></td><td class="cell" data-tip="TP=4 · H=16 · Hg=8 · B=2 · B·H=32
+seqlen=2,048 × B=2  ⇒  T=4,096
+最快 WS 386.0 us · 领先第二名 10.9%
+
+  WS    386.0 us  —
+  WF    427.8 us  +10.9%
+  CS    456.4 us  +18.3%
+  CF    650.3 us  +68.5%" data-mode="ws" data-us="386us" data-margin="10.9" style="--deep:#16a34a;--bg:#ace9c2;--bd:#82d6a3;--fg:#138f41"><span class="pill">WS</span></td><td class="cell" data-tip="TP=4 · H=16 · Hg=8 · B=2 · B·H=32
+seqlen=4,096 × B=2  ⇒  T=8,192
+最快 WS 745.6 us · 领先第二名 11.9%
+
+  WS    745.6 us  —
+  WF    834.1 us  +11.9%
+  CS    879.7 us  +18.0%
+  CF    1.253 ms  +68.0%" data-mode="ws" data-us="746us" data-margin="11.9" style="--deep:#16a34a;--bg:#ace9c2;--bd:#82d6a3;--fg:#138f41"><span class="pill">WS</span></td><td class="cell" data-tip="TP=4 · H=16 · Hg=8 · B=2 · B·H=32
+seqlen=8,192 × B=2  ⇒  T=16,384
+最快 WS 1.581 ms · 领先第二名 8.5%
+
+  WS    1.581 ms  —
+  WF    1.716 ms  +8.5%
+  CS    1.784 ms  +12.8%
+  CF    2.459 ms  +55.5%" data-mode="ws" data-us="1.58ms" data-margin="8.5" style="--deep:#16a34a;--bg:#beeed0;--bd:#98dab3;--fg:#138f41"><span class="pill">WS</span></td></tr><tr class=""><th class="rh">8</th><th class="rh sub">8</th><th class="rh sub">4</th><th class="rh">4</th><th class="rh bh">32</th><td class="cell" data-tip="TP=8 · H=8 · Hg=4 · B=4 · B·H=32
+seqlen=1,024 × B=4  ⇒  T=4,096
+最快 WS 217.6 us · 领先第二名 6.1%
+
+  WS    217.6 us  —
+  WF    231.0 us  +6.1%
+  CS    251.5 us  +15.6%
+  CF    359.3 us  +65.1%" data-mode="ws" data-us="218us" data-margin="6.1" style="--deep:#16a34a;--bg:#beeed0;--bd:#98dab3;--fg:#138f41"><span class="pill">WS</span></td><td class="cell" data-tip="TP=8 · H=8 · Hg=4 · B=4 · B·H=32
+seqlen=2,048 × B=4  ⇒  T=8,192
+最快 WS 388.4 us · 领先第二名 10.3%
+
+  WS    388.4 us  —
+  WF    428.3 us  +10.3%
+  CS    457.5 us  +17.8%
+  CF    650.5 us  +67.5%" data-mode="ws" data-us="388us" data-margin="10.3" style="--deep:#16a34a;--bg:#ace9c2;--bd:#82d6a3;--fg:#138f41"><span class="pill">WS</span></td><td class="cell" data-tip="TP=8 · H=8 · Hg=4 · B=4 · B·H=32
+seqlen=4,096 × B=4  ⇒  T=16,384
+最快 WS 748.4 us · 领先第二名 11.2%
+
+  WS    748.4 us  —
+  WF    832.5 us  +11.2%
+  CS    882.1 us  +17.9%
+  CF    1.249 ms  +66.9%" data-mode="ws" data-us="748us" data-margin="11.2" style="--deep:#16a34a;--bg:#ace9c2;--bd:#82d6a3;--fg:#138f41"><span class="pill">WS</span></td><td class="cell" data-tip="TP=8 · H=8 · Hg=4 · B=4 · B·H=32
+seqlen=8,192 × B=4  ⇒  T=32,768
+最快 WS 1.575 ms · 领先第二名 8.2%
+
+  WS    1.575 ms  —
+  WF    1.705 ms  +8.2%
+  CS    1.792 ms  +13.8%
+  CF    2.452 ms  +55.6%" data-mode="ws" data-us="1.58ms" data-margin="8.2" style="--deep:#16a34a;--bg:#beeed0;--bd:#98dab3;--fg:#138f41"><span class="pill">WS</span></td></tr><tr class="brk"><th class="rh">1</th><th class="rh sub">64</th><th class="rh sub">32</th><th class="rh">1</th><th class="rh bh">64</th><td class="cell" data-tip="TP=1 · H=64 · Hg=32 · B=1 · B·H=64
+seqlen=1,024 × B=1  ⇒  T=1,024
+最快 WF 280.8 us · 领先第二名 35.1%
+
+  WF    280.8 us  —
+  CS    379.2 us  +35.1%
+  WS    394.5 us  +40.5%
+  CF    475.6 us  +69.4%" data-mode="wf" data-us="281us" data-margin="35.1" style="--deep:#db2777;--bg:#f6abd0;--bd:#e984b8;--fg:#c12269"><span class="pill">WF</span></td><td class="cell" data-tip="TP=1 · H=64 · Hg=32 · B=1 · B·H=64
+seqlen=2,048 × B=1  ⇒  T=2,048
+最快 WF 537.1 us · 领先第二名 30.9%
+
+  WF    537.1 us  —
+  CS    702.8 us  +30.9%
+  WS    743.9 us  +38.5%
+  CF    904.7 us  +68.5%" data-mode="wf" data-us="537us" data-margin="30.9" style="--deep:#db2777;--bg:#f6abd0;--bd:#e984b8;--fg:#c12269"><span class="pill">WF</span></td><td class="cell" data-tip="TP=1 · H=64 · Hg=32 · B=1 · B·H=64
+seqlen=4,096 × B=1  ⇒  T=4,096
+最快 WF 1.110 ms · 领先第二名 28.7%
+
+  WF    1.110 ms  —
+  CS    1.429 ms  +28.7%
+  WS    1.583 ms  +42.6%
+  CF    1.772 ms  +59.7%" data-mode="wf" data-us="1.11ms" data-margin="28.7" style="--deep:#db2777;--bg:#f6abd0;--bd:#e984b8;--fg:#c12269"><span class="pill">WF</span></td><td class="cell" data-tip="TP=1 · H=64 · Hg=32 · B=1 · B·H=64
+seqlen=8,192 × B=1  ⇒  T=8,192
+最快 WF 2.236 ms · 领先第二名 29.1%
+
+  WF    2.236 ms  —
+  CS    2.886 ms  +29.1%
+  WS    3.178 ms  +42.1%
+  CF    3.568 ms  +59.5%" data-mode="wf" data-us="2.24ms" data-margin="29.1" style="--deep:#db2777;--bg:#f6abd0;--bd:#e984b8;--fg:#c12269"><span class="pill">WF</span></td></tr><tr class=""><th class="rh">2</th><th class="rh sub">32</th><th class="rh sub">16</th><th class="rh">2</th><th class="rh bh">64</th><td class="cell" data-tip="TP=2 · H=32 · Hg=16 · B=2 · B·H=64
+seqlen=1,024 × B=2  ⇒  T=2,048
+最快 WF 282.0 us · 领先第二名 33.8%
+
+  WF    282.0 us  —
+  CS    377.3 us  +33.8%
+  WS    391.8 us  +39.0%
+  CF    479.4 us  +70.0%" data-mode="wf" data-us="282us" data-margin="33.8" style="--deep:#db2777;--bg:#f6abd0;--bd:#e984b8;--fg:#c12269"><span class="pill">WF</span></td><td class="cell" data-tip="TP=2 · H=32 · Hg=16 · B=2 · B·H=64
+seqlen=2,048 × B=2  ⇒  T=4,096
+最快 WF 540.0 us · 领先第二名 31.2%
+
+  WF    540.0 us  —
+  CS    708.3 us  +31.2%
+  WS    748.2 us  +38.6%
+  CF    915.9 us  +69.6%" data-mode="wf" data-us="540us" data-margin="31.2" style="--deep:#db2777;--bg:#f6abd0;--bd:#e984b8;--fg:#c12269"><span class="pill">WF</span></td><td class="cell" data-tip="TP=2 · H=32 · Hg=16 · B=2 · B·H=64
+seqlen=4,096 × B=2  ⇒  T=8,192
+最快 WF 1.108 ms · 领先第二名 29.0%
+
+  WF    1.108 ms  —
+  CS    1.429 ms  +29.0%
+  WS    1.581 ms  +42.7%
+  CF    1.788 ms  +61.3%" data-mode="wf" data-us="1.11ms" data-margin="29.0" style="--deep:#db2777;--bg:#f6abd0;--bd:#e984b8;--fg:#c12269"><span class="pill">WF</span></td><td class="cell" data-tip="TP=2 · H=32 · Hg=16 · B=2 · B·H=64
+seqlen=8,192 × B=2  ⇒  T=16,384
+最快 WF 2.241 ms · 领先第二名 28.5%
+
+  WF    2.241 ms  —
+  CS    2.880 ms  +28.5%
+  WS    3.204 ms  +43.0%
+  CF    3.586 ms  +60.0%" data-mode="wf" data-us="2.24ms" data-margin="28.5" style="--deep:#db2777;--bg:#f6abd0;--bd:#e984b8;--fg:#c12269"><span class="pill">WF</span></td></tr><tr class=""><th class="rh">4</th><th class="rh sub">16</th><th class="rh sub">8</th><th class="rh">4</th><th class="rh bh">64</th><td class="cell" data-tip="TP=4 · H=16 · Hg=8 · B=4 · B·H=64
+seqlen=1,024 × B=4  ⇒  T=4,096
+最快 WF 283.0 us · 领先第二名 33.1%
+
+  WF    283.0 us  —
+  CS    376.6 us  +33.1%
+  WS    392.8 us  +38.8%
+  CF    479.6 us  +69.5%" data-mode="wf" data-us="283us" data-margin="33.1" style="--deep:#db2777;--bg:#f6abd0;--bd:#e984b8;--fg:#c12269"><span class="pill">WF</span></td><td class="cell" data-tip="TP=4 · H=16 · Hg=8 · B=4 · B·H=64
+seqlen=2,048 × B=4  ⇒  T=8,192
+最快 WF 543.6 us · 领先第二名 30.6%
+
+  WF    543.6 us  —
+  CS    710.0 us  +30.6%
+  WS    753.1 us  +38.5%
+  CF    911.0 us  +67.6%" data-mode="wf" data-us="544us" data-margin="30.6" style="--deep:#db2777;--bg:#f6abd0;--bd:#e984b8;--fg:#c12269"><span class="pill">WF</span></td><td class="cell" data-tip="TP=4 · H=16 · Hg=8 · B=4 · B·H=64
+seqlen=4,096 × B=4  ⇒  T=16,384
+最快 WF 1.103 ms · 领先第二名 29.4%
+
+  WF    1.103 ms  —
+  CS    1.428 ms  +29.4%
+  WS    1.575 ms  +42.7%
+  CF    1.774 ms  +60.7%" data-mode="wf" data-us="1.10ms" data-margin="29.4" style="--deep:#db2777;--bg:#f6abd0;--bd:#e984b8;--fg:#c12269"><span class="pill">WF</span></td><td class="cell" data-tip="TP=4 · H=16 · Hg=8 · B=4 · B·H=64
+seqlen=8,192 × B=4  ⇒  T=32,768
+最快 WF 2.246 ms · 领先第二名 27.8%
+
+  WF    2.246 ms  —
+  CS    2.871 ms  +27.8%
+  WS    3.194 ms  +42.2%
+  CF    3.574 ms  +59.1%" data-mode="wf" data-us="2.25ms" data-margin="27.8" style="--deep:#db2777;--bg:#f6abd0;--bd:#e984b8;--fg:#c12269"><span class="pill">WF</span></td></tr><tr class=""><th class="rh">8</th><th class="rh sub">8</th><th class="rh sub">4</th><th class="rh">8</th><th class="rh bh">64</th><td class="cell" data-tip="TP=8 · H=8 · Hg=4 · B=8 · B·H=64
+seqlen=1,024 × B=8  ⇒  T=8,192
+最快 WF 283.4 us · 领先第二名 32.3%
+
+  WF    283.4 us  —
+  CS    374.9 us  +32.3%
+  WS    392.6 us  +38.6%
+  CF    476.0 us  +68.0%" data-mode="wf" data-us="283us" data-margin="32.3" style="--deep:#db2777;--bg:#f6abd0;--bd:#e984b8;--fg:#c12269"><span class="pill">WF</span></td><td class="cell" data-tip="TP=8 · H=8 · Hg=4 · B=8 · B·H=64
+seqlen=2,048 × B=8  ⇒  T=16,384
+最快 WF 541.0 us · 领先第二名 31.2%
+
+  WF    541.0 us  —
+  CS    709.6 us  +31.2%
+  WS    752.9 us  +39.2%
+  CF    906.4 us  +67.5%" data-mode="wf" data-us="541us" data-margin="31.2" style="--deep:#db2777;--bg:#f6abd0;--bd:#e984b8;--fg:#c12269"><span class="pill">WF</span></td><td class="cell" data-tip="TP=8 · H=8 · Hg=4 · B=8 · B·H=64
+seqlen=4,096 × B=8  ⇒  T=32,768
+最快 WF 1.099 ms · 领先第二名 29.6%
+
+  WF    1.099 ms  —
+  CS    1.424 ms  +29.6%
+  WS    1.570 ms  +42.9%
+  CF    1.768 ms  +60.9%" data-mode="wf" data-us="1.10ms" data-margin="29.6" style="--deep:#db2777;--bg:#f6abd0;--bd:#e984b8;--fg:#c12269"><span class="pill">WF</span></td><td class="cell" data-tip="TP=8 · H=8 · Hg=4 · B=8 · B·H=64
+seqlen=8,192 × B=8  ⇒  T=65,536
+最快 WF 2.239 ms · 领先第二名 27.6%
+
+  WF    2.239 ms  —
+  CS    2.857 ms  +27.6%
+  WS    3.186 ms  +42.3%
+  CF    3.551 ms  +58.6%" data-mode="wf" data-us="2.24ms" data-margin="27.6" style="--deep:#db2777;--bg:#f6abd0;--bd:#e984b8;--fg:#c12269"><span class="pill">WF</span></td></tr><tr class="grp"><th class="rh">1</th><th class="rh sub">64</th><th class="rh sub">32</th><th class="rh">2</th><th class="rh bh">128</th><td class="cell" data-tip="TP=1 · H=64 · Hg=32 · B=2 · B·H=128
+seqlen=1,024 × B=2  ⇒  T=2,048
+最快 WF 543.7 us · 领先第二名 31.8%
+
+  WF    543.7 us  —
+  CS    716.8 us  +31.8%
+  WS    752.6 us  +38.4%
+  CF    913.3 us  +68.0%" data-mode="wf" data-us="544us" data-margin="31.8" style="--deep:#db2777;--bg:#f6abd0;--bd:#e984b8;--fg:#c12269"><span class="pill">WF</span></td><td class="cell" data-tip="TP=1 · H=64 · Hg=32 · B=2 · B·H=128
+seqlen=2,048 × B=2  ⇒  T=4,096
+最快 WF 1.108 ms · 领先第二名 29.7%
+
+  WF    1.108 ms  —
+  CS    1.438 ms  +29.7%
+  WS    1.567 ms  +41.4%
+  CF    1.771 ms  +59.8%" data-mode="wf" data-us="1.11ms" data-margin="29.7" style="--deep:#db2777;--bg:#f6abd0;--bd:#e984b8;--fg:#c12269"><span class="pill">WF</span></td><td class="cell" data-tip="TP=1 · H=64 · Hg=32 · B=2 · B·H=128
+seqlen=4,096 × B=2  ⇒  T=8,192
+最快 WF 2.265 ms · 领先第二名 27.9%
+
+  WF    2.265 ms  —
+  CS    2.896 ms  +27.9%
+  WS    3.212 ms  +41.8%
+  CF    3.529 ms  +55.8%" data-mode="wf" data-us="2.27ms" data-margin="27.9" style="--deep:#db2777;--bg:#f6abd0;--bd:#e984b8;--fg:#c12269"><span class="pill">WF</span></td><td class="cell" data-tip="TP=1 · H=64 · Hg=32 · B=2 · B·H=128
+seqlen=8,192 × B=2  ⇒  T=16,384
+最快 WF 4.470 ms · 领先第二名 28.5%
+
+  WF    4.470 ms  —
+  CS    5.745 ms  +28.5%
+  WS    6.324 ms  +41.5%
+  CF    7.076 ms  +58.3%" data-mode="wf" data-us="4.47ms" data-margin="28.5" style="--deep:#db2777;--bg:#f6abd0;--bd:#e984b8;--fg:#c12269"><span class="pill">WF</span></td></tr><tr class=""><th class="rh">2</th><th class="rh sub">32</th><th class="rh sub">16</th><th class="rh">4</th><th class="rh bh">128</th><td class="cell" data-tip="TP=2 · H=32 · Hg=16 · B=4 · B·H=128
+seqlen=1,024 × B=4  ⇒  T=4,096
+最快 WF 547.1 us · 领先第二名 32.0%
+
+  WF    547.1 us  —
+  CS    722.4 us  +32.0%
+  WS    758.8 us  +38.7%
+  CF    919.4 us  +68.0%" data-mode="wf" data-us="547us" data-margin="32.0" style="--deep:#db2777;--bg:#f6abd0;--bd:#e984b8;--fg:#c12269"><span class="pill">WF</span></td><td class="cell" data-tip="TP=2 · H=32 · Hg=16 · B=4 · B·H=128
+seqlen=2,048 × B=4  ⇒  T=8,192
+最快 WF 1.110 ms · 领先第二名 30.2%
+
+  WF    1.110 ms  —
+  CS    1.445 ms  +30.2%
+  WS    1.578 ms  +42.2%
+  CF    1.779 ms  +60.3%" data-mode="wf" data-us="1.11ms" data-margin="30.2" style="--deep:#db2777;--bg:#f6abd0;--bd:#e984b8;--fg:#c12269"><span class="pill">WF</span></td><td class="cell" data-tip="TP=2 · H=32 · Hg=16 · B=4 · B·H=128
+seqlen=4,096 × B=4  ⇒  T=16,384
+最快 WF 2.246 ms · 领先第二名 28.6%
+
+  WF    2.246 ms  —
+  CS    2.888 ms  +28.6%
+  WS    3.182 ms  +41.7%
+  CF    3.556 ms  +58.3%" data-mode="wf" data-us="2.25ms" data-margin="28.6" style="--deep:#db2777;--bg:#f6abd0;--bd:#e984b8;--fg:#c12269"><span class="pill">WF</span></td><td class="cell" data-tip="TP=2 · H=32 · Hg=16 · B=4 · B·H=128
+seqlen=8,192 × B=4  ⇒  T=32,768
+最快 WF 4.456 ms · 领先第二名 28.9%
+
+  WF    4.456 ms  —
+  CS    5.745 ms  +28.9%
+  WS    6.353 ms  +42.5%
+  CF    7.121 ms  +59.8%" data-mode="wf" data-us="4.46ms" data-margin="28.9" style="--deep:#db2777;--bg:#f6abd0;--bd:#e984b8;--fg:#c12269"><span class="pill">WF</span></td></tr><tr class=""><th class="rh">4</th><th class="rh sub">16</th><th class="rh sub">8</th><th class="rh">8</th><th class="rh bh">128</th><td class="cell" data-tip="TP=4 · H=16 · Hg=8 · B=8 · B·H=128
+seqlen=1,024 × B=8  ⇒  T=8,192
+最快 WF 549.0 us · 领先第二名 31.3%
+
+  WF    549.0 us  —
+  CS    720.9 us  +31.3%
+  WS    759.2 us  +38.3%
+  CF    910.8 us  +65.9%" data-mode="wf" data-us="549us" data-margin="31.3" style="--deep:#db2777;--bg:#f6abd0;--bd:#e984b8;--fg:#c12269"><span class="pill">WF</span></td><td class="cell" data-tip="TP=4 · H=16 · Hg=8 · B=8 · B·H=128
+seqlen=2,048 × B=8  ⇒  T=16,384
+最快 WF 1.116 ms · 领先第二名 29.3%
+
+  WF    1.116 ms  —
+  CS    1.443 ms  +29.3%
+  WS    1.581 ms  +41.7%
+  CF    1.764 ms  +58.1%" data-mode="wf" data-us="1.12ms" data-margin="29.3" style="--deep:#db2777;--bg:#f6abd0;--bd:#e984b8;--fg:#c12269"><span class="pill">WF</span></td><td class="cell" data-tip="TP=4 · H=16 · Hg=8 · B=8 · B·H=128
+seqlen=4,096 × B=8  ⇒  T=32,768
+最快 WF 2.262 ms · 领先第二名 27.6%
+
+  WF    2.262 ms  —
+  CS    2.886 ms  +27.6%
+  WS    3.216 ms  +42.2%
+  CF    3.539 ms  +56.5%" data-mode="wf" data-us="2.26ms" data-margin="27.6" style="--deep:#db2777;--bg:#f6abd0;--bd:#e984b8;--fg:#c12269"><span class="pill">WF</span></td><td class="cell" data-tip="TP=4 · H=16 · Hg=8 · B=8 · B·H=128
+seqlen=8,192 × B=8  ⇒  T=65,536
+最快 WF 4.457 ms · 领先第二名 28.6%
+
+  WF    4.457 ms  —
+  CS    5.729 ms  +28.6%
+  WS    6.381 ms  +43.2%
+  CF    7.051 ms  +58.2%" data-mode="wf" data-us="4.46ms" data-margin="28.6" style="--deep:#db2777;--bg:#f6abd0;--bd:#e984b8;--fg:#c12269"><span class="pill">WF</span></td></tr><tr class="grp"><th class="rh">1</th><th class="rh sub">64</th><th class="rh sub">32</th><th class="rh">4</th><th class="rh bh">256</th><td class="cell" data-tip="TP=1 · H=64 · Hg=32 · B=4 · B·H=256
+seqlen=1,024 × B=4  ⇒  T=4,096
+最快 WF 1.131 ms · 领先第二名 24.9%
+
+  WF    1.131 ms  —
+  CS    1.412 ms  +24.9%
+  WS    1.545 ms  +36.6%
+  CF    1.757 ms  +55.3%" data-mode="wf" data-us="1.13ms" data-margin="24.9" style="--deep:#db2777;--bg:#f6abd0;--bd:#e984b8;--fg:#c12269"><span class="pill">WF</span></td><td class="cell" data-tip="TP=1 · H=64 · Hg=32 · B=4 · B·H=256
+seqlen=2,048 × B=4  ⇒  T=8,192
+最快 WF 2.273 ms · 领先第二名 23.4%
+
+  WF    2.273 ms  —
+  CS    2.804 ms  +23.4%
+  WS    3.098 ms  +36.3%
+  CF    3.462 ms  +52.3%" data-mode="wf" data-us="2.27ms" data-margin="23.4" style="--deep:#db2777;--bg:#f6abd0;--bd:#e984b8;--fg:#c12269"><span class="pill">WF</span></td><td class="cell" data-tip="TP=1 · H=64 · Hg=32 · B=4 · B·H=256
+seqlen=4,096 × B=4  ⇒  T=16,384
+最快 WF 4.501 ms · 领先第二名 23.1%
+
+  WF    4.501 ms  —
+  CS    5.541 ms  +23.1%
+  WS    6.112 ms  +35.8%
+  CF    6.862 ms  +52.4%" data-mode="wf" data-us="4.50ms" data-margin="23.1" style="--deep:#db2777;--bg:#f6abd0;--bd:#e984b8;--fg:#c12269"><span class="pill">WF</span></td><td class="cell" data-tip="TP=1 · H=64 · Hg=32 · B=4 · B·H=256
+seqlen=8,192 × B=4  ⇒  T=32,768
+最快 WF 8.978 ms · 领先第二名 23.0%
+
+  WF    8.978 ms  —
+  CS   11.042 ms  +23.0%
+  WS   12.240 ms  +36.3%
+  CF   13.625 ms  +51.8%" data-mode="wf" data-us="8.98ms" data-margin="23.0" style="--deep:#db2777;--bg:#f6abd0;--bd:#e984b8;--fg:#c12269"><span class="pill">WF</span></td></tr><tr class=""><th class="rh">2</th><th class="rh sub">32</th><th class="rh sub">16</th><th class="rh">8</th><th class="rh bh">256</th><td class="cell" data-tip="TP=2 · H=32 · Hg=16 · B=8 · B·H=256
+seqlen=1,024 × B=8  ⇒  T=8,192
+最快 WF 1.129 ms · 领先第二名 25.4%
+
+  WF    1.129 ms  —
+  CS    1.417 ms  +25.4%
+  WS    1.549 ms  +37.1%
+  CF    1.769 ms  +56.6%" data-mode="wf" data-us="1.13ms" data-margin="25.4" style="--deep:#db2777;--bg:#f6abd0;--bd:#e984b8;--fg:#c12269"><span class="pill">WF</span></td><td class="cell" data-tip="TP=2 · H=32 · Hg=16 · B=8 · B·H=256
+seqlen=2,048 × B=8  ⇒  T=16,384
+最快 WF 2.255 ms · 领先第二名 24.0%
+
+  WF    2.255 ms  —
+  CS    2.795 ms  +24.0%
+  WS    3.089 ms  +37.0%
+  CF    3.484 ms  +54.5%" data-mode="wf" data-us="2.25ms" data-margin="24.0" style="--deep:#db2777;--bg:#f6abd0;--bd:#e984b8;--fg:#c12269"><span class="pill">WF</span></td><td class="cell" data-tip="TP=2 · H=32 · Hg=16 · B=8 · B·H=256
+seqlen=4,096 × B=8  ⇒  T=32,768
+最快 WF 4.468 ms · 领先第二名 23.6%
+
+  WF    4.468 ms  —
+  CS    5.523 ms  +23.6%
+  WS    6.115 ms  +36.9%
+  CF    6.923 ms  +54.9%" data-mode="wf" data-us="4.47ms" data-margin="23.6" style="--deep:#db2777;--bg:#f6abd0;--bd:#e984b8;--fg:#c12269"><span class="pill">WF</span></td><td class="cell" data-tip="TP=2 · H=32 · Hg=16 · B=8 · B·H=256
+seqlen=8,192 × B=8  ⇒  T=65,536
+最快 WF 8.868 ms · 领先第二名 24.2%
+
+  WF    8.868 ms  —
+  CS   11.014 ms  +24.2%
+  WS   12.195 ms  +37.5%
+  CF   13.773 ms  +55.3%" data-mode="wf" data-us="8.87ms" data-margin="24.2" style="--deep:#db2777;--bg:#f6abd0;--bd:#e984b8;--fg:#c12269"><span class="pill">WF</span></td></tr><tr class="grp"><th class="rh">1</th><th class="rh sub">64</th><th class="rh sub">32</th><th class="rh">8</th><th class="rh bh">512</th><td class="cell" data-tip="TP=1 · H=64 · Hg=32 · B=8 · B·H=512
+seqlen=1,024 × B=8  ⇒  T=8,192
+最快 WF 2.136 ms · 领先第二名 28.3%
+
+  WF    2.136 ms  —
+  CS    2.741 ms  +28.3%
+  WS    3.082 ms  +44.3%
+  CF    3.299 ms  +54.5%" data-mode="wf" data-us="2.14ms" data-margin="28.3" style="--deep:#db2777;--bg:#f6abd0;--bd:#e984b8;--fg:#c12269"><span class="pill">WF</span></td><td class="cell" data-tip="TP=1 · H=64 · Hg=32 · B=8 · B·H=512
+seqlen=2,048 × B=8  ⇒  T=16,384
+最快 WF 4.216 ms · 领先第二名 26.8%
+
+  WF    4.216 ms  —
+  CS    5.347 ms  +26.8%
+  WS    6.022 ms  +42.8%
+  CF    6.486 ms  +53.8%" data-mode="wf" data-us="4.22ms" data-margin="26.8" style="--deep:#db2777;--bg:#f6abd0;--bd:#e984b8;--fg:#c12269"><span class="pill">WF</span></td><td class="cell" data-tip="TP=1 · H=64 · Hg=32 · B=8 · B·H=512
+seqlen=4,096 × B=8  ⇒  T=32,768
+最快 WF 8.408 ms · 领先第二名 26.0%
+
+  WF    8.408 ms  —
+  CS   10.594 ms  +26.0%
+  WS   12.009 ms  +42.8%
+  CF   12.823 ms  +52.5%" data-mode="wf" data-us="8.41ms" data-margin="26.0" style="--deep:#db2777;--bg:#f6abd0;--bd:#e984b8;--fg:#c12269"><span class="pill">WF</span></td><td class="cell" data-tip="TP=1 · H=64 · Hg=32 · B=8 · B·H=512
+seqlen=8,192 × B=8  ⇒  T=65,536
+最快 WF 16.722 ms · 领先第二名 26.9%
+
+  WF   16.722 ms  —
+  CS   21.224 ms  +26.9%
+  WS   24.047 ms  +43.8%
+  CF   25.496 ms  +52.5%" data-mode="wf" data-us="16.72ms" data-margin="26.9" style="--deep:#db2777;--bg:#f6abd0;--bd:#e984b8;--fg:#c12269"><span class="pill">WF</span></td></tr></tbody>
+      </table>
+    </section>
+<footer>
+  <p>这是 <b>packed varlen</b> 的排布：一次调用里打包 <b>B</b> 条序列，每条 seqlen 个
+  token，总 token 数 T = B × seqlen。每卡 value head 数 <b>H</b> 不是自由参数，它由
+  TP 决定（Hv=64，所以 TP 1/2/4/8 对应
+  H 64/32/16/8），<b>Hg</b> 是相应的 key head 数。<br>
+  行按 <b>B·H</b> 递增排 —— 这是 state scan 要跑的 (序列, head) 链条数，也就是它的
+  并行度，和本机 80 个 CU 一比就知道有没有喂饱。胜负只跟着 B·H 走，与 H 和 B
+  各自是多少无关：B·H 相同的几行（比如 TP1/B=1 与 TP8/B=8 都是 64，浅线圈在一起）
+  结论完全一致，所以<b>整张表只有一条粗线</b>，横穿全部 seqlen 列。
+  标了「生产」的一行是 Qwen3.5 TP8 单条请求（Hk=16 / Hv=64 切到每卡 Hg=2 / H=8，B=1）。</p>
+  <p>每格取该形状下 wall 最短的那条路径，wall 是 50 次迭代的中位数。
+  色深表示领先第二名的幅度：越深越是稳赢，最浅的一档意味着前两名相差不到 2%，
+  换一次测量就可能易主。<code>—</code> 表示该形状下没有任何路径跑出结果。</p>
+  <p>数据 <code>mode_grid.json</code> 由 <code>sweep_gdn_mode_grid.py</code> 采集，
+  本页由 <code>render_gdn_mode_grid.py</code> 渲染，aiter 来自
+  <code>/workspace/code/aiter/aiter/__init__.py</code>。</p>
+</footer>
+</div>
+<div id="tip"></div>
+<script>
+const tip = document.getElementById('tip');
+document.querySelectorAll('[data-tip]').forEach(el => {
+  el.addEventListener('mouseenter', e => {
+    tip.textContent = el.dataset.tip; tip.style.opacity = 1;
+  });
+  el.addEventListener('mousemove', e => {
+    const r = tip.getBoundingClientRect();
+    let x = e.clientX + 14, y = e.clientY + 14;
+    if (x + r.width > innerWidth - 8) x = e.clientX - r.width - 14;
+    if (y + r.height > innerHeight - 8) y = e.clientY - r.height - 14;
+    tip.style.left = x + 'px'; tip.style.top = y + 'px';
+  });
+  el.addEventListener('mouseleave', () => tip.style.opacity = 0);
+});
+document.querySelectorAll('.cell').forEach(td => {
+  td.querySelector('.pill').dataset.us = td.dataset.us;
+});
+const bm = document.getElementById('b-mode'), bu = document.getElementById('b-us');
+bm.onclick = () => { document.body.classList.remove('show-us'); bm.classList.add('on'); bu.classList.remove('on'); };
+bu.onclick = () => { document.body.classList.add('show-us'); bu.classList.add('on'); bm.classList.remove('on'); };
+</script>
+</body></html>
