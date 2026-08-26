@@ -595,7 +595,10 @@ def launch_gemm_a8w4_tdm(
         # Split each region's offset into a lane-varying base, which keepalive
         # can pin, and a compile-time part that folds into ds_load's offset:.
         lds_a_lane_off = (
-            lane16 * 0
+            (
+                ((wave_m * wmma_m_rep * (tile_k // 128) * 4 + kgrp) * 16 + lane16)
+                * 16
+            )
             if a_preshuffle
             else (wmb + lane16) * A_LDS_ROW + kgrp * 16
         )
@@ -633,13 +636,11 @@ def launch_gemm_a8w4_tdm(
             base = lds_a_base(buf)
             if const_expr(a_is_fp4):
                 if const_expr(a_preshuffle):
-                    m_rept = tile_m // 16
                     k_rept = tile_k // 128
-                    mr = wave_m * wmma_m_rep + wm
-                    off = (
-                        (((mr * k_rept + ksl) * 4 + kgrp) * 16 + lane16)
-                        * 16
-                    )
+                    # wave_m, kgrp, and lane16 are already folded into the
+                    # pinned LDS base.  Keep only compile-time WMMA repeats in
+                    # ds_load offsets so the K loop needs no A address VALU.
+                    off = (wm * k_rept + ksl) * 4 * 16 * 16
                     return Vec(lds_load_b128(base, fx.Int32(off))).shuffle(
                         Vec(lds_load_b128(base, fx.Int32(off + 2 * 16 * 16))),
                         list(range(8)),

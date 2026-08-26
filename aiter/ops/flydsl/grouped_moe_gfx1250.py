@@ -677,7 +677,10 @@ def _grouped_a8w4_tdm_moe(
     # The separate quant pass produces row-major A2, which is then permuted with
     # the exact GEMM2 tile geometry. Fusing that permutation into the GEMM1
     # requant epilogue is a follow-up optimization.
-    _fuse_quant = _b1 is None and not a_preshuffle
+    # Keep the legacy fused-requant path as the default, but allow A-layout
+    # experiments to compare the GEMM with identical BF16 epilogues.
+    disable_requant = _as_bool(os.environ.get("AITER_TDM_DISABLE_REQUANT"), False)
+    _fuse_quant = _b1 is None and not a_preshuffle and not disable_requant
     w1_u8 = _grouped_weight_uint8(w1)
     w1s_i32 = w1_scale.reshape(-1).view(torch.int32)
 
