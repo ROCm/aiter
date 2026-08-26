@@ -30,7 +30,7 @@ from aiter.ops.pa_sparse_prefill_opus import (
 from aiter.ops.triton._triton_kernels.attention.sparse_attention_dsv4 import (
     _sparse_attn_prefill_kernel,
 )
-from aiter.test_common import benchmark, checkAllclose, perftest, run_perftest
+from aiter.test_common import benchmark, checkAllclose, perftest
 
 # ---------------------------------------------------------------------------
 # Skip helpers
