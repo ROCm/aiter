@@ -18,14 +18,16 @@ SUPPORTED_GFX = ["gfx942", "gfx950"]
 
 def run_torch(
     logits: torch.Tensor,
-    context_len: int,
+    context_lens: list[int],
     next_n: int,
     top_k: int,
     stable: bool,
 ) -> torch.Tensor:
     rows = []
     for row in range(logits.shape[0]):
-        row_len = context_len - next_n + row % next_n + 1
+        row_len = (
+            context_lens[row // next_n] - next_n + row % next_n + 1
+        )
         if stable:
             selected = torch.argsort(
                 logits[row, :row_len], descending=True, stable=True
@@ -106,8 +108,13 @@ def test_flydsl_topk_decode(
             num_rows, context_len + row_padding, dtype=torch.float32
         )
     logits = logits_storage[:, :context_len]
-    seq_lens = torch.full((batch_size,), context_len, dtype=torch.int32)
-    ref = run_torch(logits, context_len, next_n, top_k, stable)
+    min_seq_len = top_k + next_n - 1
+    context_lens = [
+        max(min_seq_len, context_len - (request * 17) % 257)
+        for request in range(batch_size)
+    ]
+    seq_lens = torch.tensor(context_lens, dtype=torch.int32, device=logits.device)
+    ref = run_torch(logits, context_lens, next_n, top_k, stable)
 
     outputs = {
         "flydsl": torch.empty(num_rows, top_k, dtype=torch.int32),
@@ -159,9 +166,11 @@ def main():
         formatter_class=argparse.RawTextHelpFormatter,
         description="FlyDSL per-row decode TopK correctness and performance",
     )
-    parser.add_argument("-b", "--batch-size", type=int, nargs="*", default=[4])
-    parser.add_argument("-c", "--context-len", type=int, nargs="*", default=[131072])
-    parser.add_argument("-k", "--top-k", type=int, nargs="*", default=[2048])
+    parser.add_argument("-b", "--batch-size", type=int, nargs="*", default=[2, 4])
+    parser.add_argument(
+        "-c", "--context-len", type=int, nargs="*", default=[4101, 131072]
+    )
+    parser.add_argument("-k", "--top-k", type=int, nargs="*", default=[1, 2048, 4096])
     parser.add_argument("-n", "--next-n", type=int, nargs="*", default=[1, 4])
     parser.add_argument("--row-padding", type=int, nargs="*", default=[0, 17])
     parser.add_argument(
@@ -171,19 +180,19 @@ def main():
 
     rows = []
     for (
-        batch_size,
         context_len,
         top_k,
         next_n,
-        row_padding,
         stable,
+        batch_size,
+        row_padding,
     ) in itertools.product(
-        args.batch_size,
         args.context_len,
         args.top_k,
         args.next_n,
-        args.row_padding,
         args.stable,
+        args.batch_size,
+        args.row_padding,
     ):
         rows.append(
             test_flydsl_topk_decode(

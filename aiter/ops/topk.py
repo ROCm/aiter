@@ -557,9 +557,8 @@ def flydsl_top_k_per_row_decode(
 ) -> None:
     """FlyDSL per-row decode TopK with the same call shape as the HIP interface.
 
-    The multi-CTA kernel specializes each ``k`` at compile time and supports
-    float32 input, int32 indices, and contiguous rows. With ``stable=True``,
-    indices are emitted in ascending order with smallest-index tie-breaking.
+    This path is optimized for long-context decode, where its multi-CTA radix
+    selection typically outperforms the HIP one-block implementation.
     """
     from .flydsl.topk_per_row import (
         flydsl_top_k_per_row_decode as _flydsl_top_k_per_row_decode,
