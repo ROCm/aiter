@@ -270,59 +270,65 @@ def _qk_gemm(*, k_values, q_frags_list, n_block):
     return s_acc_list
 
 
-def _tree_reduce(vals, op3, op2):
-    """Balanced 3-way tree reduction (fast-math): critical path ~ceil(log3(N)) vs N-1
-    for a left-fold. op3 = nested op2 so the backend fuses it (v_max3_f32 for max)."""
-    cur = list(vals)
-    while len(cur) > 1:
-        nxt, i, n = [], 0, len(cur)
-        while i < n:
-            if n - i >= 3:
-                nxt.append(op3(cur[i], cur[i + 1], cur[i + 2])); i += 3
-            elif n - i == 2:
-                nxt.append(op2(cur[i], cur[i + 1])); i += 2
-            else:
-                nxt.append(cur[i]); i += 1
-        cur = nxt
-    return cur[0]
+def _tree_reduce_multi(lists, op3, op2):
+    """Balanced 3-way tree reduction of R independent lists in lockstep, returning one result
+    per list. Per list the critical path is ~ceil(log3(N)) vs N-1 for a left-fold, and op3 =
+    nested op2 so the backend fuses it (v_max3_f32 for max). Each layer's combines are emitted
+    POSITION-MAJOR across the lists (list0[pos], list1[pos], ...) so the R independent ops sit
+    adjacent in the IR -> the backend can dual-issue them and hide one row's cross-lane /
+    latency bubble behind the other's work."""
+    curs = [list(v) for v in lists]
+    while max(len(c) for c in curs) > 1:
+        nxts = [[] for _ in curs]
+        idxs = [0] * len(curs)
+        while any(idxs[k] < len(curs[k]) for k in range(len(curs))):
+            for k in range(len(curs)):
+                cur, i, n = curs[k], idxs[k], len(curs[k])
+                if i >= n:
+                    continue
+                if n - i >= 3:
+                    nxts[k].append(op3(cur[i], cur[i + 1], cur[i + 2])); idxs[k] += 3
+                elif n - i == 2:
+                    nxts[k].append(op2(cur[i], cur[i + 1])); idxs[k] += 2
+                else:
+                    nxts[k].append(cur[i]); idxs[k] += 1
+        curs = nxts
+    return [c[0] for c in curs]
 
 
-def _softmax(*, s, m_prev, d_prev, lane_idx, n_block,
-            kv_pos_base=None, q_max=None, q_min=None, kv_len=None):
-    """Online-softmax update for one KV tile. ``s`` already includes softmax_scale
+def _softmax(*, s_list, m_prev_list, d_prev_list, lane_idx, n_block,
+            kv_pos_base=None, q_max_list=None, q_min_list=None, kv_len=None):
+    """Online-softmax update for one KV tile, for ALL R q-WMMA-tiles this wave owns.
+
+    The R rows are independent (each owns its S, running m/d, and mask bounds) but share
+    the tile's K/V. Processing them together lets the two rows' balanced max-tree and
+    sum-tree reductions emit INTERLEAVED (position-major across rows, via
+    ``_tree_reduce_multi``) so the backend can dual-issue row0/row1 combines and hide each
+    other's cross-lane permlanex16 latency. ``s_list[r]`` already includes softmax_scale
     (folded into Q), so exp uses plain LOG2E.
 
-    Layout (from ``_qk_gemm``): ``s`` is a list of ``NKV = n_block//WMMA_N`` v8-f32
-    accumulators; this lane owns query ``q = warp*16 + l%16`` and, in tile ``kvt``,
-    the kv rows ``kvt*16 + (l//16)*8 + [0..8)`` (its half). The peer lane ``l^16``
-    holds the other 8-row half of the same q, so the row max/sum reduce locally over
-    (kvt, i) then across the ``shuffle_xor(16)`` partner.
+    Layout (from ``_qk_gemm``): ``s_list[r]`` is a list of ``NKV = n_block//WMMA_N`` v8-f32
+    accumulators; this lane owns query ``q = warp*16 + l%16`` and, in tile ``kvt``, the kv
+    rows ``kvt*16 + (l//16)*8 + [0..8)`` (its half). The peer lane ``l^16`` holds the other
+    8-row half of the same q, so the row max/sum reduce locally over (kvt, i) then across
+    the ``shuffle_xor(16)`` partner.
 
-    Masking (per element, sequence-relative kv position ``kv_pos = kv_pos_base +
-    (l//16)*8 + kvt*16 + i``; all bounds are fx.Int32):
-      q_max (band upper edge): when set, mask ``kv_pos > q_max``
-        (``q_max = q_seq + (kv_len-q_len) + window_right``; causal has window_right=0).
-        When kv_len is also passed (last tile), q_max is clamped to ``kv_len-1`` to
-        fold in the tail mask (rows past kv_len that the clamped OOB load left holding
-        duplicate data); interior tiles pass kv_len=None (no tail, no clamp needed).
-      q_min (band lower edge): when set, mask ``kv_pos < q_min``
-        (``q_min = q_seq + (kv_len-q_len) - window_left``).
-      kv_len (only when q_max is None): mask ``kv_pos >= kv_len`` (the standalone tail
-        mask for the non-causal / no-upper-bound case).
+    Masking (per element, per row r, sequence-relative ``kv_pos = kv_pos_base + (l//16)*8 +
+    kvt*16 + i``; all bounds fx.Int32): ``q_max_list[r]`` masks ``kv_pos > q_max`` (band
+    upper edge = ``q_seq + (kv_len-q_len) + window_right``; clamped to ``kv_len-1`` on the
+    last tile to fold the tail); ``q_min_list[r]`` masks ``kv_pos < q_min`` (band lower edge
+    = ``q_seq + (kv_len-q_len) - window_left``); kv_len (only when q_max is None) masks
+    ``kv_pos >= kv_len`` (standalone tail for the non-causal case). A None bound skips it.
 
-    Args:
-      m_prev, d_prev: running max / denom (fx.Float32, shared by the l<->l^16 pair).
+    Args: ``s_list``/``m_prev_list``/``d_prev_list``/``q_max_list``/``q_min_list`` are
+    length-R lists (R = WMMA_ROW_PER_WAVE); the q_*_list default to all-None. m_prev/d_prev
+    are fx.Float32 shared by the l<->l^16 pair.
 
-    Returns ``(p, m_new, d_new, corr, do_rescale)``:
-      p:     list of NKV v8 **bf16** — P^T = exp(S^T - m_new) (PV B-operand).
-      m_new: updated running max (fx.Float32). Kept STALE (== m_prev) when the
-             deferred-rescale ballot did not fire (FAv4, §9.1.1).
-      d_new: updated running denom = corr*d_prev + rowsum(p) (fx.Float32).
-      corr:  exp(m_prev - m_new), the O-accumulator rescale factor (fx.Float32);
-             == 1 on the deferred (stale) path since m_new == m_prev.
-      do_rescale: wave-uniform i1 ir.Value — True when the running max moved past
-             RESCALE_THRESHOLD so the caller must apply corr to oaccu; None when
-             deferral is compiled out (caller always rescales). See ENABLE_DEFER_RESCALE.
+    Returns 5 length-R lists ``(p, m_new, d_new, corr, do_rescale)`` — per row: p = NKV v8
+    **bf16** P^T = exp(S^T - m_new); m_new = updated running max, STALE (== m_prev) when the
+    deferred-rescale ballot did not fire (FAv4 §9.1.1); d_new = corr*d_prev + rowsum(p);
+    corr = exp(m_prev - m_new) (== 1 on the stale path); do_rescale = wave-uniform i1 (None
+    when deferral is compiled out).
     """
     NKV = n_block // WMMA_N
     f32 = ir.F32Type.get()
@@ -364,79 +370,106 @@ def _softmax(*, s, m_prev, d_prev, lane_idx, n_block,
 
     khalf = lane_idx // fx.Int32(WMMA_M)  # 0/1: which 8-row kv half this lane owns
 
-    # ---- Pass 1: masked S values + running row max ----
-    s_masked = []  # flattened (kvt, i) order
-    for kvt in range(NKV):
-        svec = fx.Vector(_ir(s[kvt]))
-        for i in range(8):
-            sval = fx.Float32(svec[i])
-            if q_max is not None or q_min is not None or kv_len is not None:
-                kv_pos = kv_pos_base + khalf * fx.Int32(8) + fx.Int32(kvt * WMMA_N + i)
-                if q_max is not None:
-                    ubound = q_max if kv_len is None else _min_i32(q_max, kv_len - fx.Int32(1))
-                    sval = (kv_pos > ubound).select(neg_inf, sval)
-                if q_min is not None:
-                    sval = (kv_pos < q_min).select(neg_inf, sval)
-                if kv_len is not None and q_max is None:
-                    sval = (kv_pos >= kv_len).select(neg_inf, sval)
-            s_masked.append(sval)
+    R = len(s_list)
+    q_max_list = q_max_list if q_max_list is not None else [None] * R
+    q_min_list = q_min_list if q_min_list is not None else [None] * R
 
+    # ---- Pass 1 (all R rows): masked S values, flattened (kvt, i) order. Built for every
+    # row first so the row max-trees below emit INTERLEAVED. ----
+    s_masked_list = []
+    for r in range(R):
+        s = s_list[r]
+        q_max, q_min = q_max_list[r], q_min_list[r]
+        s_masked = []
+        for kvt in range(NKV):
+            svec = fx.Vector(_ir(s[kvt]))
+            for i in range(8):
+                sval = fx.Float32(svec[i])
+                if q_max is not None or q_min is not None or kv_len is not None:
+                    kv_pos = kv_pos_base + khalf * fx.Int32(8) + fx.Int32(kvt * WMMA_N + i)
+                    if q_max is not None:
+                        ubound = q_max if kv_len is None else _min_i32(q_max, kv_len - fx.Int32(1))
+                        sval = (kv_pos > ubound).select(neg_inf, sval)
+                    if q_min is not None:
+                        sval = (kv_pos < q_min).select(neg_inf, sval)
+                    if kv_len is not None and q_max is None:
+                        sval = (kv_pos >= kv_len).select(neg_inf, sval)
+                s_masked.append(sval)
+        s_masked_list.append(s_masked)
+
+    # ---- Row max: the R rows' balanced max-trees emitted INTERLEAVED (position-major
+    # across rows) so the backend dual-issues row0/row1 combines and hides the cross-lane
+    # permlanex16 latency. ----
     max3 = lambda a, b, c: fmax(fmax(a, b), c)
-    local_max = _tree_reduce(s_masked, max3, fmax)
-    row_max = fmax(local_max, peer(local_max))
-    m_full = fmax(m_prev, row_max)
+    local_max_list = _tree_reduce_multi(s_masked_list, max3, fmax)
 
-    # ---- Deferred oaccu rescale decision (FAv4, hk_mla spec 9.1.1). Keep m STALE while
-    # the running max barely moves: if NO lane's row_max exceeds m_prev by more than
-    # RESCALE_THRESHOLD logits, defer -> m_new = m_prev, corr = exp(0) = 1, and the caller
-    # SKIPS the wide `o_acc *= corr` multiply. Promote the per-lane test to wave-uniform
-    # via ballot so the caller's rescale branch is non-divergent. A NaN diff (a fully
-    # masked lane sees row_max = -inf, m_prev = -inf seed -> -inf - -inf = NaN) fails the
-    # ORDERED OGT -> never spuriously forces a rescale. Safe on the stale path because
-    # row_max - m_prev <= 8 there, so p = exp(S - m_prev) <= e^8 (no fp32 overflow). ----
-    if ENABLE_DEFER_RESCALE and RESCALE_THRESHOLD >= 0.0:
-        need = arith.cmpf(arith.CmpFPredicate.OGT,
-                          _raw(fsub(row_max, m_prev)), _raw(fx.Float32(RESCALE_THRESHOLD)))
-        mask = rocdl.ballot(ir.IntegerType.get_signless(32), need)
-        do_rescale = arith.cmpi(arith.CmpIPredicate.ne, mask, _raw(fx.Int32(0)))
-        m_new = fx.Float32(arith.select(do_rescale, _raw(m_full), _raw(m_prev)))
-    else:
-        do_rescale = None
-        m_new = m_full
+    # ---- Per row: peer reduce + deferred-rescale decision + corr / neg_m. ----
+    m_new_list, corr_list, neg_m_list, do_rescale_list = [], [], [], []
+    for r in range(R):
+        m_prev, q_min = m_prev_list[r], q_min_list[r]
+        row_max = fmax(local_max_list[r], peer(local_max_list[r]))
+        m_full = fmax(m_prev, row_max)
 
-    # corr = exp(m_prev - m_new); neg_m = -(m_new * log2e) for the fused p exp.
-    if q_min is not None:
-        # Finite-left window: a lane's leading tiles can be wholly masked (row_max=
-        # -inf) while m is still the -inf seed -> corr/neg_m feed NaN into corr/p.
-        # Clamp maxes to a finite floor: all-masked -> corr=1, p=0; once any real key
-        # is seen the clamp is inert (byte-identical to the -inf path).
-        big_neg = fx.Float32(-1.0e30)
-        m_safe = fmax(m_new, big_neg)
-        mp_safe = fmax(m_prev, big_neg)
-        corr = exp2(fmul(fsub(mp_safe, m_safe), log2e))
-        neg_m = fsub(zero, fmul(m_safe, log2e))
-    else:
-        corr = exp2(fmul(fsub(m_prev, m_new), log2e))
-        neg_m = fsub(zero, fmul(m_new, log2e))
+        # Deferred oaccu rescale (FAv4, hk_mla spec 9.1.1): keep m STALE while the running
+        # max barely moves (< RESCALE_THRESHOLD logits) so the caller SKIPS the wide
+        # `o_acc *= corr` multiply. Ballot promotes the per-lane test to wave-uniform (non-
+        # divergent branch). ORDERED OGT: a fully-masked lane's -inf - -inf = NaN never
+        # forces a rescale. Safe stale path: row_max - m_prev <= 8 -> p <= e^8, no overflow.
+        if ENABLE_DEFER_RESCALE and RESCALE_THRESHOLD >= 0.0:
+            need = arith.cmpf(arith.CmpFPredicate.OGT,
+                              _raw(fsub(row_max, m_prev)), _raw(fx.Float32(RESCALE_THRESHOLD)))
+            mask = rocdl.ballot(ir.IntegerType.get_signless(32), need)
+            do_rescale = arith.cmpi(arith.CmpIPredicate.ne, mask, _raw(fx.Int32(0)))
+            m_new = fx.Float32(arith.select(do_rescale, _raw(m_full), _raw(m_prev)))
+        else:
+            do_rescale = None
+            m_new = m_full
 
-    # ---- Pass 2: p = exp(S - m_new) (bf16, per tile) + row sum (tree-reduced) ----
-    p = []
-    p_flat = []
-    idx = 0
-    for kvt in range(NKV):
-        pe = []
-        for i in range(8):
-            # exp2(s*log2e - m_new*log2e) via one fma.
-            pj = exp2(fx.Float32(fmath.fma(_raw(s_masked[idx]), _raw(log2e), _raw(neg_m))))
-            pe.append(pj)
-            p_flat.append(pj)
-            idx += 1
-        p.append(fx.Vector.from_elements(pe, fx.Float32).to(fx.BFloat16))
+        # corr = exp(m_prev - m_new); neg_m = -(m_new * log2e) for the fused p exp.
+        if q_min is not None:
+            # Finite-left window: a lane's leading tiles can be wholly masked (row_max=
+            # -inf) while m is still the -inf seed -> corr/neg_m feed NaN into corr/p.
+            # Clamp maxes to a finite floor: all-masked -> corr=1, p=0; once any real key
+            # is seen the clamp is inert (byte-identical to the -inf path).
+            big_neg = fx.Float32(-1.0e30)
+            m_safe = fmax(m_new, big_neg)
+            mp_safe = fmax(m_prev, big_neg)
+            corr = exp2(fmul(fsub(mp_safe, m_safe), log2e))
+            neg_m = fsub(zero, fmul(m_safe, log2e))
+        else:
+            corr = exp2(fmul(fsub(m_prev, m_new), log2e))
+            neg_m = fsub(zero, fmul(m_new, log2e))
+        m_new_list.append(m_new); corr_list.append(corr)
+        neg_m_list.append(neg_m); do_rescale_list.append(do_rescale)
 
+    # ---- Pass 2 (all R rows): p = exp(S - m_new) (bf16, per tile) + flat p for the sum
+    # tree. Built for every row first so the row sum-trees below emit INTERLEAVED. ----
+    p_list, p_flat_list = [], []
+    for r in range(R):
+        neg_m, s_masked = neg_m_list[r], s_masked_list[r]
+        p, p_flat, idx = [], [], 0
+        for kvt in range(NKV):
+            pe = []
+            for i in range(8):
+                # exp2(s*log2e - m_new*log2e) via one fma.
+                pj = exp2(fx.Float32(fmath.fma(_raw(s_masked[idx]), _raw(log2e), _raw(neg_m))))
+                pe.append(pj)
+                p_flat.append(pj)
+                idx += 1
+            p.append(fx.Vector.from_elements(pe, fx.Float32).to(fx.BFloat16))
+        p_list.append(p); p_flat_list.append(p_flat)
+
+    # ---- Row sum: R rows' balanced sum-trees emitted INTERLEAVED. fadd_t (fast-math minus
+    # reassoc) so LLVM's Reassociate does NOT re-linearize the tree into a serial chain. ----
     add3 = lambda a, b, c: fadd_t(fadd_t(a, b), c)
-    local_sum = _tree_reduce(p_flat, add3, fadd_t)
-    d_new = fadd(fmul(corr, d_prev), fadd(local_sum, peer(local_sum)))
-    return p, m_new, d_new, corr, do_rescale
+    local_sum_list = _tree_reduce_multi(p_flat_list, add3, fadd_t)
+
+    d_new_list = []
+    for r in range(R):
+        d_new_list.append(
+            fadd(fmul(corr_list[r], d_prev_list[r]),
+                 fadd(local_sum_list[r], peer(local_sum_list[r]))))
+    return p_list, m_new_list, d_new_list, corr_list, do_rescale_list
 
 
 def _pv_gemm(*, v_values, p_list, v_hdim, n_block, o_acc_list=None):
@@ -885,26 +918,23 @@ def _core_attention(
         # passes all-None and does zero per-element masking. kv_len is passed only on
         # the last tile (folds the OOB tail into the q_max clamp / standalone tail
         # mask). K/V are shared, but each q-tile has its own S and running m/d. ----
-        p_list, m_new_list, d_new_list, corr_list, do_rescale_list = [], [], [], [], []
-        for qt in range(R):
-            q_max = seq_idx[qt] + causal_off + window_right if mask_right else None
-            q_min = seq_idx[qt] + causal_off - window_left if mask_left else None
-            p, m_new, d_new, corr, do_rescale = _softmax(
-                s=s_list[qt],
-                m_prev=m_prev[qt],
-                d_prev=d_prev[qt],
-                lane_idx=lane_idx,
-                n_block=n_block,
-                kv_pos_base=kv_tile_start,
-                q_max=q_max,
-                q_min=q_min,
-                kv_len=kv_len,
-            )
-            p_list.append(p)
-            m_new_list.append(m_new)
-            d_new_list.append(d_new)
-            corr_list.append(corr)
-            do_rescale_list.append(do_rescale)
+        # Softmax for ALL R q-tiles in ONE call so the rows' max/sum tree reductions emit
+        # INTERLEAVED (ILP): the rows are independent (own S, m, d) but share this tile's K/V.
+        q_max_list = [seq_idx[qt] + causal_off + window_right if mask_right else None
+                      for qt in range(R)]
+        q_min_list = [seq_idx[qt] + causal_off - window_left if mask_left else None
+                      for qt in range(R)]
+        p_list, m_new_list, d_new_list, corr_list, do_rescale_list = _softmax(
+            s_list=s_list,
+            m_prev_list=m_prev,
+            d_prev_list=d_prev,
+            lane_idx=lane_idx,
+            n_block=n_block,
+            kv_pos_base=kv_tile_start,
+            q_max_list=q_max_list,
+            q_min_list=q_min_list,
+            kv_len=kv_len,
+        )
 
         # ---- Rescale each q-tile's running O by its corr, then GEMM2 accumulates this
         # tile. When deferral is active (do_rescale is a wave-uniform i1) the wide
