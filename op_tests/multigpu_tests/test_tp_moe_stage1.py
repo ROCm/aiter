@@ -740,6 +740,93 @@ def case_exports():
     print("case_exports OK")
 
 
+def case_ref_fidelity():
+    """TPMoEStage1NCCLRef must be a faithful copy: bit-identical to production.
+
+    The two are the same code today, so anything other than bit-equality means
+    the copy was botched. Once the fused path lands this case is what proves the
+    reference still represents phase-1 behaviour.
+    """
+    from tp_moe_stage1_nccl_ref import TPMoEStage1NCCLRef
+
+    rank, world, device = _setup_dist()
+    model_dim = NETWORK["model_dim"]
+    experts, topk = NETWORK["experts"], NETWORK["topk"]
+    inter_dim, limit = 384, NETWORK["swiglu_limit"]
+
+    _, _, w1_shuf, w1_scale_shuf = build_mxfp4_w1(
+        experts, inter_dim, model_dim, device, seed=4242
+    )
+    common = dict(
+        model_dim=model_dim,
+        inter_dim=inter_dim,
+        experts=experts,
+        topk=topk,
+        w1=w1_shuf,
+        w1_scale=w1_scale_shuf,
+        device=device,
+        swiglu_limit=limit,
+        stage1_kernel_name=STAGE1_KERNEL,
+    )
+    prod = TPMoEStage1(**common)
+    ref = TPMoEStage1NCCLRef(**common)
+
+    for m_local in (1, 8, 64):
+        g = torch.Generator(device="cpu").manual_seed(9100 + rank * 17 + m_local)
+        x = torch.randn((m_local, model_dim), generator=g).to(
+            device=device, dtype=torch.bfloat16
+        ) * (model_dim**-0.25)
+        ids, wts = _random_routes(m_local, experts, topk, device, seed=71 + rank)
+
+        a = prod.forward(x, wts, ids)
+        b = ref.forward(x, wts, ids)
+
+        assert type(b).__name__ == "TPMoEStage1Output", type(b)
+        assert a.m_logical == b.m_logical, (a.m_logical, b.m_logical)
+        assert a.max_sorted == b.max_sorted, (a.max_sorted, b.max_sorted)
+        nvalid = int(a.num_valid_ids[0].item())
+        assert nvalid == int(b.num_valid_ids[0].item())
+        for name in (
+            "sorted_token_ids",
+            "sorted_expert_ids",
+            "sorted_weights",
+            "num_valid_ids",
+        ):
+            ta, tb = getattr(a, name), getattr(b, name)
+            n = nvalid if name != "sorted_expert_ids" else nvalid // prod.sort_block_m
+            n = min(n, ta.shape[0])
+            assert torch.equal(ta[:n], tb[:n]), f"{name} differs at m_local={m_local}"
+        # Compare only genuinely-routed rows, the same scoping case_prequant_
+        # equivalence uses. Stage1 never writes the payload or the output scale of
+        # padding rows, so those bytes are uninitialized torch.empty memory: two
+        # identical prod.forward() calls already disagree on 1424/1472 payload rows
+        # and on 64% of the shuffled-scale bytes (measured on 8x gfx950).
+        tok = (a.sorted_token_ids[:nvalid] & 0x00FFFFFF).long()
+        keep = tok < a.m_logical
+        assert int(keep.sum()) == a.m_logical * topk, (
+            int(keep.sum()),
+            a.m_logical * topk,
+        )
+        qa = a.inter_sorted_quant.view(torch.uint8)[:nvalid][keep]
+        qb = b.inter_sorted_quant.view(torch.uint8)[:nvalid][keep]
+        assert torch.equal(qa, qb), f"payload differs at m_local={m_local}"
+        cols = inter_dim // 32
+        sa = read_shuffled_scale(a.inter_sorted_shuffled_scale, nvalid, cols)[keep]
+        sb = read_shuffled_scale(b.inter_sorted_shuffled_scale, nvalid, cols)[keep]
+        assert torch.isfinite(sa).all(), f"routed scale non-finite at m_local={m_local}"
+        assert torch.equal(sa, sb), f"scale differs at m_local={m_local}"
+        if rank == 0:
+            print(
+                f"  m_local={m_local} nvalid={nvalid} routed={int(keep.sum())} "
+                f"bit-identical"
+            )
+
+    dist.barrier()
+    dist.destroy_process_group()
+    if rank == 0:
+        print("case_ref_fidelity OK")
+
+
 CASES = {
     "construct": case_construct_validates,
     "capacity": case_capacity,
@@ -749,6 +836,7 @@ CASES = {
     "prequant": case_prequant_equivalence,
     "e2e": case_end_to_end,
     "exports": case_exports,
+    "ref_fidelity": case_ref_fidelity,
 }
 
 
