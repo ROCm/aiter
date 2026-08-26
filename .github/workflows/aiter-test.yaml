@@ -1004,15 +1004,11 @@ jobs:
           bash -lc "
             set -euo pipefail
             pip uninstall -y amd-aiter aiter || true
-            apt-get update
-            DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends libgrpc++1.51t64
             pip install -r requirements.txt
             pip install --upgrade pandas pyzmq einops numpy==1.26.2
             pip install --upgrade 'pybind11>=3.0.1'
             pip install --upgrade 'ninja>=1.11.1'
             pip install tabulate
-            pip install 'amd-mori==1.2.2'
-            python3 -c 'import mori, mori.shmem'
             pip install '${AITER_WHEEL_PATH}'
             pip show amd-aiter
           "

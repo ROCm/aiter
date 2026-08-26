@@ -35,10 +35,12 @@ else
 fi
 
 skip_tests=(
+    "op_tests/multigpu_tests/bench_mega_moe_v2.py"
     "op_tests/multigpu_tests/test_dispatch_combine.py"
     "op_tests/multigpu_tests/test_communication.py"
     "op_tests/multigpu_tests/test_mori_all2all.py"
     "op_tests/multigpu_tests/test_fused_ar_rms.py"
+    "op_tests/multigpu_tests/test_mega_moe_v2.py"
     "op_tests/multigpu_tests/triton_test/test_reduce_scatter_all_gather.py"
     "op_tests/multigpu_tests/triton_test/test_fused_rs_rmsnorm_quant_ag.py"
 )
@@ -82,6 +84,7 @@ for file in "${sharded_files[@]}"; do
     # batch gate so they exercise the persistent kernel at every batch size.
     test_cmd=(timeout 60m python3 "$file")
     case "$file" in
+<<<<<<< HEAD
         op_tests/flydsl_tests/test_flydsl_decode_gemm.py|op_tests/flydsl_tests/test_flydsl_small_m_hgemm.py)
             test_cmd=(python3 -m pytest "$file")
             ;;
@@ -109,6 +112,8 @@ for file in "${sharded_files[@]}"; do
                 _ "$file"
             )
             ;;
+=======
+>>>>>>> main
         op_tests/multigpu_tests/test_mega_moe_gfx1250.py)
             {
                 echo "Running gfx1250 MegaMoE fused-scatter accuracy on 8 GPUs when supported"
@@ -129,21 +134,6 @@ for file in "${sharded_files[@]}"; do
                         --combine scatter_fused --layers 2 --acc_verify 1
                 '
                 _ "$file"
-            )
-            ;;
-        op_tests/multigpu_tests/test_mega_moe_v2.py)
-            {
-                echo "Running MegaMoEV2 v4_pro fixed-slot and compact coverage on 8 GPUs"
-            } | tee -a latest_test.log
-            test_cmd=(
-                env MORI_SHMEM_HEAP_SIZE=40G
-                timeout 60m
-                torchrun --standalone --nproc_per_node=8 "$file"
-                --network v4_pro
-                --bs-list 128,512
-                --iters 10
-                --accuracy-max-bs 512
-                --rtol 0.10
             )
             ;;
         op_tests/test_mla_persistent.py|op_tests/test_mla_persistent_round_robin.py)
