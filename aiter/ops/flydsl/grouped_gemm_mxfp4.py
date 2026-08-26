@@ -26,6 +26,17 @@ def _select_next_stage_prefetch(csv_next_stage_prefetch: int) -> int:
     return int(value)
 
 
+def _select_a_multicast(csv_a_multicast: int) -> int:
+    """Selects the environment override or the CSV setting."""
+    value = os.environ.get("AITER_TDM_A_MULTICAST")
+    if value is None:
+        return int(bool(csv_a_multicast))
+    value = value.strip()
+    if value not in ("0", "1"):
+        raise ValueError("AITER_TDM_A_MULTICAST must be 0 or 1")
+    return int(value)
+
+
 def _select_cluster_n(n_tiles: int, csv_cluster_n: int) -> int:
     """Selects the environment override or CSV cluster degree."""
     env_cluster_n = os.environ.get("AITER_FLYDSL_MXFP4_CLUSTER_N")
@@ -89,6 +100,7 @@ def flydsl_grouped_gemm_a8w4_masked(
     quant_scale=None,
     quant_wmma_rep=1,
     cluster_n=-1,
+    a_multicast=1,
     waves_per_tensor_tdm=-1,
     next_stage_prefetch=0,
     a_preshuffle=0,
@@ -152,6 +164,7 @@ def flydsl_grouped_gemm_a8w4_masked(
         quant_wmma_rep,
         quant_scale_tensor,
         cluster_n,
+        _select_a_multicast(a_multicast),
         _select_next_stage_prefetch(next_stage_prefetch),
         waves_per_tensor_tdm,
         a_preshuffle,

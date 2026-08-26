@@ -72,6 +72,7 @@ def launch_gemm_a8w4_tdm(
     quant_wmma_rep: Constexpr[int] = 1,
     arg_quant_scale: fx.Tensor = None,
     cluster_n: Constexpr[int] = 1,
+    a_multicast: Constexpr[int] = 1,
     next_stage_prefetch: Constexpr[int] = 0,
     num_waves_per_tensor_tdm: Constexpr[int] = 2,
     a_preshuffle: Constexpr[int] = 0,
@@ -89,16 +90,18 @@ def launch_gemm_a8w4_tdm(
 
     ``cluster_n`` > 1 launches (cluster_n, 1, 1) workgroup clusters whose peers
     all share one m_tile (and therefore one expert) and differ only in n_tile, so
-    one A / A-scale load can serve the whole cluster.
+    one A / A-scale load can serve the whole cluster when ``a_multicast`` is
+    enabled. When it is disabled, every peer independently loads the same A
+    payload while retaining the cluster mapping and launch geometry.
 
-    No cluster barrier is emitted, and none is needed: a non-zero workgroup_mask
-    turns the load into CLUSTER_LOAD_ASYNC, which rendezvouses with the peers the
-    mask names, and each workgroup's own s_wait_tensorcnt still covers its own
-    LDS. That is the same protocol as opus (see csrc/opus_gemm/include/gfx1250/
+    No cluster barrier is emitted. With multicast, the non-zero workgroup mask
+    makes CLUSTER_LOAD_ASYNC rendezvous with the named peers, while each
+    workgroup's s_wait_tensorcnt still covers its own LDS. This matches opus (see
+    csrc/opus_gemm/include/gfx1250/
     opus_gemm_pipeline_a16w16_clusterlaunch_tdm_splitk_ws_gfx1250.cuh), which
-    emits s_barrier -3 only for a 2D cluster whose mask is a strided group; for a
-    1-D cluster like this one the mask is contiguous, the barrier is unnecessary,
-    and on a thin 1-D cluster it can hang on co-residency.
+    emits s_barrier -3 only for a 2D cluster whose mask is a strided group. With
+    multicast disabled, every workgroup owns and waits for its independent A
+    load, so no inter-workgroup barrier is needed either.
 
     The rendezvous replaces drift bounding with two hard preconditions, and
     breaking either hangs rather than corrupts:
@@ -139,6 +142,7 @@ def launch_gemm_a8w4_tdm(
         stage1_quant_out,
         quant_wmma_rep,
         cluster_n,
+        a_multicast,
         next_stage_on,
         num_waves_per_tensor_tdm,
         a_preshuffle,
@@ -224,6 +228,7 @@ def launch_gemm_a8w4_tdm(
     _bias = "_bias" if has_bias else ""
     _grouped = f"_e{n_experts}" if n_experts > 0 else ""
     _cl = f"_cn{cluster_n}" if cluster_n > 1 else ""
+    _amc = "_amc0" if cluster_n > 1 and not a_multicast else ""
     # Marked when on, so the baseline keeps its original symbol.
     _next_stage = "_prefetch" if next_stage_on else ""
     _waves_per_tensor = (
@@ -234,7 +239,8 @@ def launch_gemm_a8w4_tdm(
         f"a8w4_tdm_{_afp}"
         f"_t{tile_m}x{tile_n}x{tile_k}_w{m_warp}x{n_warp}"
         f"_b{num_buffers}_K{K}{_ashuf}"
-        f"{_grouped}{_act}{_bias}{_qout}{_cl}{_next_stage}{_waves_per_tensor}{_ep}"
+        f"{_grouped}{_act}{_bias}{_qout}{_cl}{_amc}{_next_stage}"
+        f"{_waves_per_tensor}{_ep}"
     )
 
     @flyc.kernel(name=_kname, known_block_size=[block, 1, 1])
@@ -292,9 +298,8 @@ def launch_gemm_a8w4_tdm(
             if cluster_n > 1
             else n_unit * tile_n
         )
-        # Peers differ only in n_tile, so A alone is broadcast, to the whole
-        # cluster -- a constant all-ones mask, no cluster-local id needed.
-        a_mcast_mask = (1 << cluster_n) - 1 if cluster_n > 1 else 0
+        # A multicast is optional, but peers retain the same cluster mapping.
+        a_mcast_mask = (1 << cluster_n) - 1 if cluster_n > 1 and a_multicast else 0
         blk_m64 = fx.Int64(blk_m)
         blk_n64 = fx.Int64(blk_n)
         n64 = fx.Int64(i32_n)
