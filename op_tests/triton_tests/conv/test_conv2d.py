@@ -232,9 +232,7 @@ def test_exact_nchw_pin_uses_complete_shape_key(
     )
 
 
-def test_conv_config_layout_variant_precedence(
-    monkeypatch, isolated_conv_config_cache
-):
+def test_conv_config_layout_variant_precedence(monkeypatch, isolated_conv_config_cache):
     shape_key = "test-shape"
     config = {
         "shapes_nhwc": {shape_key: {"source": "layout"}},
