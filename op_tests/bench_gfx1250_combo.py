@@ -399,6 +399,67 @@ def _print_table(name, rows, keep=None):
     print(df.to_markdown(index=False))
 
 
+# Compiler / logger / IR-dump chatter the child UTs interleave with results.
+_NOISE = (
+    "[flydsl.compile]",
+    "[aiter INFO]",
+    "[aiter WARNING]",
+    "In file included from",
+    "torch/distributed/run.py",
+    "Building extension",
+    "Emitting ninja",
+    "hipcc",
+    "warning:",
+    "UserWarning",
+    "_warn_once",
+)
+
+
+def _md_row(line):
+    """Markdown table row emitted by a child UT."""
+    return line.startswith("|")
+
+
+def _quiet(line):
+    """Any non-empty line that is not compiler/logger noise."""
+    return bool(line.strip()) and not any(n in line for n in _NOISE)
+
+
+def _table_row(*headers):
+    """Whitespace-aligned table: the header line plus its numeric rows."""
+
+    def keep(line):
+        if any(h in line for h in headers):
+            return True
+        stripped = line.strip()
+        return bool(stripped) and stripped[0].isdigit()
+
+    return keep
+
+
+def _run_child(name, cmd, cwd, env=None, keep=_md_row, tail=30):
+    """Run a child UT with its output captured and surface only its results.
+
+    Child UTs print their own progress, aiter INFO lines and (with FlyDSL) a
+    couple of thousand IR-dump lines, which buries the numbers. Capture all of
+    it, echo only the rows `keep` accepts, and fall back to the tail of the
+    output when the child fails or emits nothing recognisable.
+    """
+    proc = subprocess.run(
+        cmd, cwd=cwd, env=env, text=True,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+    )
+    lines = proc.stdout.splitlines()
+    rows = [ln for ln in lines if keep(ln)]
+    print(f"\n===== {name} =====", flush=True)
+    print("\n".join(rows) if rows else "(no result rows recognised)", flush=True)
+    if proc.returncode != 0 or not rows:
+        print(f"--- {name}: exit={proc.returncode}, last {tail} lines ---")
+        print("\n".join(lines[-tail:]), flush=True)
+    if proc.returncode != 0:
+        raise subprocess.CalledProcessError(proc.returncode, cmd)
+
+
 # --- per-op runners: sweep axes silently, then print one table ---
 
 
@@ -552,8 +613,8 @@ def run_f8gemm(args):
 
 def run_a8w8_blockscale(_args):
     """Run DSv4 FP8 blockscale linear projections at M=512."""
-    print("\n===== gemm_a8w8_blockscale (DSv4) =====", flush=True)
-    subprocess.run(
+    _run_child(
+        "gemm_a8w8_blockscale (DSv4)",
         [
             sys.executable,
             "op_tests/test_gemm_a8w8_blockscale.py",
@@ -571,7 +632,6 @@ def run_a8w8_blockscale(_args):
             "--flydsl",
         ],
         cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-        check=True,
     )
 
 
@@ -621,22 +681,19 @@ def run_mega_moe(_args):
     # so the env var and the quant key have to move together.
     for quant, force_a8w4 in (("a4w4_mxfp4", "0"), ("a8w4_mxfp4", "1")):
         for label, combine in (("non-Mega", "base"), ("Mega", "fused")):
-            print(
-                f"\n===== mega_moe ({quant}, {label}, combine={combine}) =====",
-                flush=True,
-            )
-            subprocess.run(
+            _run_child(
+                f"mega_moe ({quant}, {label}, combine={combine})",
                 [*base_cmd, "-q", quant, "--combine", combine],
                 cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                 env={**env, "AITER_FORCE_A8W4": force_a8w4},
-                check=True,
+                keep=_quiet,
             )
 
 
 def run_mhc(_args):
     """Run the DSv4 mHC fused-RMSNorm benchmark at M=512, N=7168."""
-    print("\n===== mhc (DSv4, fused RMSNorm) =====", flush=True)
-    subprocess.run(
+    _run_child(
+        "mhc (DSv4, fused RMSNorm)",
         [
             sys.executable,
             "op_tests/test_mhc.py",
@@ -647,7 +704,6 @@ def run_mhc(_args):
             "--fuse_rmsnorm",
         ],
         cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-        check=True,
     )
 
 
@@ -670,11 +726,10 @@ def run_qk_norm(_args):
         ("prefill", ["16384"]),
         ("decode", ["1", "2", "4", "8", "16", "32", "64"]),
     ):
-        print(f"\n===== qk_norm ({phase}) =====", flush=True)
-        subprocess.run(
+        _run_child(
+            f"qk_norm ({phase})",
             [*base_cmd, "-T", *tokens],
             cwd=repo_root,
-            check=True,
         )
 
 
@@ -697,20 +752,16 @@ def run_score_qk(_args):
         "64",
     ]
     for label, kv_length in (("1K/1K average", "384"), ("long", "10240")):
-        print(
-            f"\n===== score_qk (decode, B=512, {label} CSA KV={kv_length}) =====",
-            flush=True,
-        )
-        subprocess.run(
+        _run_child(
+            f"score_qk (decode, B=512, {label} CSA KV={kv_length})",
             [*base_cmd, "-kv_length", kv_length],
             cwd=repo_root,
-            check=True,
+            keep=_table_row("paged_mqa_logits", "batch_size"),
         )
 
 
 def run_mori_ep(_args):
     """Run MORI EPv2 dispatch/combine at the DSv4 MoE shape."""
-    print("\n===== mori_ep (DSv4 dispatch/combine) =====", flush=True)
     mori = os.environ.get("MORI", "/app/mori")
     # Bench whatever mori the image ships. Re-fetching main and reinstalling it
     # moved the measurement target between runs, and the rebuild needs a dev
@@ -751,7 +802,8 @@ def run_mori_ep(_args):
             "CWPB": "",
         }
     )
-    subprocess.run(
+    _run_child(
+        "mori_ep (DSv4 dispatch/combine)",
         [
             "torchrun",
             "--standalone",
@@ -760,8 +812,7 @@ def run_mori_ep(_args):
         ],
         cwd=mori,
         env=env,
-        timeout=3600,
-        check=True,
+        keep=_quiet,
     )
 
 
@@ -923,11 +974,8 @@ def run_mla_v4_decode(args):
 
 def run_mla_v4_prefill(_args):
     """Run DSv4 FP8 prefill at M=16K across two pools and CSR modes."""
-    print(
-        "\n===== mla_v4 prefill (FP8, M=16384, prefix=4096/16384) =====",
-        flush=True,
-    )
-    subprocess.run(
+    _run_child(
+        "mla_v4 prefill (FP8, M=16384, prefix=4096/16384)",
         [
             sys.executable,
             "op_tests/test_pa_sparse_prefill_opus.py",
@@ -950,7 +998,7 @@ def run_mla_v4_prefill(_args):
             "--no-verify",
         ],
         cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-        check=True,
+        keep=_table_row("latency_us"),
     )
 
 
@@ -966,7 +1014,9 @@ OPS = {
     "mhc": run_mhc,
     "qk_norm": run_qk_norm,
     "score_qk": run_score_qk,
-    "mori_ep": run_mori_ep,
+    # "mori_ep" benchmarks mori, not aiter, and building it needs a dev ROCm
+    # toolchain the pip-wheel images do not ship. run_mori_ep is kept below.
+    # "mori_ep": run_mori_ep,
     "mega_moe": run_mega_moe,
 }
 # "gemm" and "f8gemm" are temporarily disabled on gfx1250.
