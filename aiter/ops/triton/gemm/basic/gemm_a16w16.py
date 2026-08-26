@@ -163,11 +163,6 @@ def gemm_a16w16_(
             if backend == "triton":
                 config = compute_splitk_params(config, K)
 
-        assert config.get("NUM_KSPLIT", 1) == 1, (
-            f"persistent=True does not support split-K yet (got NUM_KSPLIT="
-            f"{config.get('NUM_KSPLIT')}); call without persistent=True instead"
-        )
-
         if backend == "gluon":
             assert (
                 _is_gluon_available()
@@ -195,15 +190,34 @@ def gemm_a16w16_(
             NUM_BUFFERS = config.get("NUM_BUFFERS", 2)
             GROUP_SIZE_M = config.get("GROUP_SIZE_M", 1)
             num_warps = config["num_warps"]
+            num_stages = config.get("num_stages", 0)
+            waves_per_eu = config.get("waves_per_eu", 0)
+            NUM_KSPLIT = config.get("NUM_KSPLIT", 1)
+
+            # Compute split-K parameters
+            SPLITK_BLOCK_SIZE = triton.cdiv(K, NUM_KSPLIT)
+            while NUM_KSPLIT > 1 and BLOCK_K > SPLITK_BLOCK_SIZE:
+                NUM_KSPLIT = max(NUM_KSPLIT // 2, 1)
+                SPLITK_BLOCK_SIZE = triton.cdiv(K, NUM_KSPLIT)
+            if NUM_KSPLIT > 1 and SPLITK_BLOCK_SIZE % BLOCK_K != 0:
+                SPLITK_BLOCK_SIZE = triton.cdiv(SPLITK_BLOCK_SIZE, BLOCK_K) * BLOCK_K
+                NUM_KSPLIT = triton.cdiv(K, SPLITK_BLOCK_SIZE)
 
             w = w.T
 
-            # Clamp the pipeline depth
-            num_k_tiles = triton.cdiv(K, BLOCK_K)
+            # Clamp the pipeline depth (per-partition k tiles)
+            num_k_tiles = triton.cdiv(SPLITK_BLOCK_SIZE, BLOCK_K)
             NUM_BUFFERS = max(2, min(NUM_BUFFERS, num_k_tiles + 1))
 
             if y is None:
                 y = torch.empty((M, N), dtype=dtype, device=x.device)
+
+            if NUM_KSPLIT > 1:
+                y_pp = torch.empty(
+                    (NUM_KSPLIT, M, N), dtype=torch.float32, device=x.device
+                )
+            else:
+                y_pp = None
 
             assert x.stride(1) == 1, (
                 f"gluon persistent gemm requires x row-major (M, K), got strides "
@@ -225,17 +239,19 @@ def gemm_a16w16_(
                 for i in range(num_warps.bit_length() - 1)
             )
 
-            # Persistent, NUM_WGS processes num_tiles
             _LOGGER.info(
                 f"GEMM_A16W16 [gluon, persistent]: x={tuple(x.shape)} w={tuple(w.shape)}"
             )
-            num_tiles = triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N)
+            num_mn_tiles = triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N)
+            num_tiles = num_mn_tiles * NUM_KSPLIT
+
+            out_ptr = y if NUM_KSPLIT == 1 else y_pp
 
             _gluon_persistent_kernel[(min(NUM_WGS, num_tiles),)](
                 x,
                 w,
                 bias,
-                y,
+                out_ptr,
                 M,
                 N,
                 K,
@@ -244,21 +260,60 @@ def gemm_a16w16_(
                 x.stride(1),
                 w.stride(0),
                 w.stride(1),
-                y.stride(0),
-                y.stride(1),
+                0 if NUM_KSPLIT == 1 else y_pp.stride(0),
+                out_ptr.stride(-2),
+                out_ptr.stride(-1),
                 BLOCK_M=BLOCK_M,
                 BLOCK_N=BLOCK_N,
                 BLOCK_K=BLOCK_K,
                 GROUP_SIZE_M=GROUP_SIZE_M,
                 NUM_BUFFERS=NUM_BUFFERS,
+                NUM_KSPLIT=NUM_KSPLIT,
+                SPLITK_BLOCK_SIZE=SPLITK_BLOCK_SIZE,
                 WARP_BASES=warp_bases,
                 TRANSPOSE=TRANSPOSE,
                 activation=_get_activation_from_str(activation) if activation else None,
                 USE_ACTIVATION=activation is not None,
                 ADD_BIAS=(bias is not None),
+                SKIP_REDUCE=bool(skip_reduce),
                 NUM_WGS=NUM_WGS,
                 num_warps=num_warps,
+                num_stages=num_stages,
+                waves_per_eu=waves_per_eu,
             )
+
+            if NUM_KSPLIT > 1:
+                if skip_reduce:
+                    return y_pp
+
+                REDUCE_BLOCK_SIZE_M = 32
+                REDUCE_BLOCK_SIZE_N = 32
+                ACTUAL_KSPLIT = triton.cdiv(K, SPLITK_BLOCK_SIZE)
+
+                grid_reduce = (
+                    triton.cdiv(M, REDUCE_BLOCK_SIZE_M),
+                    triton.cdiv(N, REDUCE_BLOCK_SIZE_N),
+                )
+                _gemm_splitk_reduce_kernel[grid_reduce](
+                    y_pp,
+                    y,
+                    bias,
+                    M,
+                    N,
+                    y_pp.stride(0),
+                    y_pp.stride(1),
+                    y_pp.stride(2),
+                    y.stride(0),
+                    y.stride(1),
+                    REDUCE_BLOCK_SIZE_M,
+                    REDUCE_BLOCK_SIZE_N,
+                    ACTUAL_KSPLIT,
+                    triton.next_power_of_2(NUM_KSPLIT),
+                    ADD_BIAS=(bias is not None),
+                    activation=_get_activation_from_str(activation) if activation else "",
+                    use_activation=activation is not None,
+                    KERNEL_NAME="_gemm_a16w16_persistent_reduce_kernel",
+                )
 
             return y
 

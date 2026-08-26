@@ -24,11 +24,11 @@
         "GROUP_SIZE_M": 2
     },
     "any": {
-        "BLOCK_M": 256,
-        "BLOCK_N": 256,
+        "BLOCK_M": 64,
+        "BLOCK_N": 64,
         "BLOCK_K": 128,
-        "NUM_BUFFERS": 4,
-        "num_warps": 4,
-        "GROUP_SIZE_M": 4
+        "NUM_BUFFERS": 2,
+        "num_warps": 2,
+        "GROUP_SIZE_M": 2
     }
 }

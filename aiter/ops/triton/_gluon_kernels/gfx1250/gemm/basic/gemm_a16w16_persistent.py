@@ -18,11 +18,16 @@ _GLUON_REPR_KEYS = [
     "BLOCK_K",
     "GROUP_SIZE_M",
     "NUM_BUFFERS",
+    "NUM_KSPLIT",
+    "SPLITK_BLOCK_SIZE",
     "TRANSPOSE",
     "USE_ACTIVATION",
     "ADD_BIAS",
+    "SKIP_REDUCE",
     "NUM_WGS",
     "num_warps",
+    "num_stages",
+    "waves_per_eu",
 ]
 
 _gemm_a16w16_persistent_repr = make_kernel_repr(
@@ -48,6 +53,7 @@ def gemm_a16w16_persistent_kernel_(
     stride_ak,
     stride_bk,
     stride_bn,
+    stride_ck,
     stride_cm,
     stride_cn,
     # Meta-parameters
@@ -56,13 +62,18 @@ def gemm_a16w16_persistent_kernel_(
     BLOCK_K: gl.constexpr,
     GROUP_SIZE_M: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
+    NUM_KSPLIT: gl.constexpr,
+    SPLITK_BLOCK_SIZE: gl.constexpr,
     WARP_BASES: gl.constexpr,
     TRANSPOSE: gl.constexpr,
     activation: gl.constexpr,
     USE_ACTIVATION: gl.constexpr,
     ADD_BIAS: gl.constexpr,
+    SKIP_REDUCE: gl.constexpr,
     NUM_WGS: gl.constexpr,
     num_warps: gl.constexpr,
+    num_stages: gl.constexpr = 0,
+    waves_per_eu: gl.constexpr = 0,
 ):
 
     gl.static_assert(NUM_BUFFERS >= 2, "persistent gemm requires NUM_BUFFERS >= 2")
@@ -140,121 +151,133 @@ def gemm_a16w16_persistent_kernel_(
             layout=SHARED_LAYOUT_B,
         )
 
-    num_k_tiles = gl.cdiv(K, BLOCK_K)
-
     # Persistent loop
     for tile_id in range(start_pid, num_tiles, NUM_WGS):
         # remap tile index
         t = remap_xcd(tile_id, num_tiles, NUM_XCDS=8)
-        pid_m, pid_n = pid_grid(t, num_pid_m, num_pid_n, GROUP_SIZE_M=GROUP_SIZE_M)
+        pid_k = t % NUM_KSPLIT
+        pid = t // NUM_KSPLIT
+
+        if NUM_KSPLIT == 1:
+            pid_m, pid_n = pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M=GROUP_SIZE_M)
+        else:
+            pid_m = pid // num_pid_n
+            pid_n = pid % num_pid_n
 
         m_off = pid_m * BLOCK_M
         n_off = pid_n * BLOCK_N
 
-        load_idx = 0
-        compute_idx = 0
+        split_k_start = pid_k * SPLITK_BLOCK_SIZE
+        if split_k_start < K:
+            split_k_end = gl.minimum(split_k_start + SPLITK_BLOCK_SIZE, K)
+            k_span = split_k_end - split_k_start
+            num_k_tiles = gl.cdiv(k_span, BLOCK_K)
 
-        accumulator = gl.zeros((BLOCK_M, BLOCK_N), dtype=gl.float32, layout=WMMA_LAYOUT)
-        if ADD_BIAS:
-            offs_bias = n_off + gl.arange(
-                0, BLOCK_N, layout=gl.SliceLayout(0, WMMA_LAYOUT)
-            )
-            bias_vals = gl.load(bias_ptr + offs_bias, mask=offs_bias < N, other=0.0)
-            accumulator = accumulator + bias_vals[None, :]
+            load_idx = 0
+            compute_idx = 0
 
-        # fill buffers with tiles
-        for _ in gl.static_range(NUM_BUFFERS - 1):
-            gl.amd.gfx1250.tdm.async_load(
-                a_desc,
-                [m_off, load_idx * BLOCK_K],
-                a_buffer.index(load_idx % NUM_BUFFERS),
-            )
-            if TRANSPOSE:
+            accumulator = gl.zeros((BLOCK_M, BLOCK_N), dtype=gl.float32, layout=WMMA_LAYOUT)
+            if ADD_BIAS:
+                if NUM_KSPLIT == 1 or (SKIP_REDUCE and pid_k == 0):
+                    offs_bias = n_off + gl.arange(
+                        0, BLOCK_N, layout=gl.SliceLayout(0, WMMA_LAYOUT)
+                    )
+                    bias_vals = gl.load(bias_ptr + offs_bias, mask=offs_bias < N, other=0.0)
+                    accumulator = accumulator + bias_vals[None, :]
+
+            # fill buffers with tiles
+            for _ in gl.static_range(NUM_BUFFERS - 1):
                 gl.amd.gfx1250.tdm.async_load(
-                    b_desc,
-                    [load_idx * BLOCK_K, n_off],
-                    b_buffer.index(load_idx % NUM_BUFFERS),
+                    a_desc,
+                    [m_off, split_k_start + load_idx * BLOCK_K],
+                    a_buffer.index(load_idx % NUM_BUFFERS),
                 )
-            else:
+                if TRANSPOSE:
+                    gl.amd.gfx1250.tdm.async_load(
+                        b_desc,
+                        [split_k_start + load_idx * BLOCK_K, n_off],
+                        b_buffer.index(load_idx % NUM_BUFFERS),
+                    )
+                else:
+                    gl.amd.gfx1250.tdm.async_load(
+                        b_desc,
+                        [n_off, split_k_start + load_idx * BLOCK_K],
+                        b_buffer.index(load_idx % NUM_BUFFERS),
+                    )
+                load_idx += 1
+
+            # produce and consume k tiles
+            for _ in range(num_k_tiles - (NUM_BUFFERS - 1)):
                 gl.amd.gfx1250.tdm.async_load(
-                    b_desc,
-                    [n_off, load_idx * BLOCK_K],
-                    b_buffer.index(load_idx % NUM_BUFFERS),
+                    a_desc,
+                    [m_off, split_k_start + load_idx * BLOCK_K],
+                    a_buffer.index(load_idx % NUM_BUFFERS),
                 )
-            load_idx += 1
+                if TRANSPOSE:
+                    gl.amd.gfx1250.tdm.async_load(
+                        b_desc,
+                        [split_k_start + load_idx * BLOCK_K, n_off],
+                        b_buffer.index(load_idx % NUM_BUFFERS),
+                    )
+                else:
+                    gl.amd.gfx1250.tdm.async_load(
+                        b_desc,
+                        [n_off, split_k_start + load_idx * BLOCK_K],
+                        b_buffer.index(load_idx % NUM_BUFFERS),
+                    )
+                # leave the NUM_BUFFERS-1 most recent pairs in flight
+                gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * 2)
 
-        # produce and consume k tiles
-        for _ in range(num_k_tiles - (NUM_BUFFERS - 1)):
-            gl.amd.gfx1250.tdm.async_load(
-                a_desc,
-                [m_off, load_idx * BLOCK_K],
-                a_buffer.index(load_idx % NUM_BUFFERS),
+                load_idx += 1
+
+                cur_a = gl.amd.cdna4.async_copy.load_shared_relaxed(
+                    a_buffer.index(compute_idx % NUM_BUFFERS), OPERAND_LAYOUT_A
+                )
+                if TRANSPOSE:
+                    cur_b = gl.amd.cdna4.async_copy.load_shared_relaxed(
+                        b_buffer.index(compute_idx % NUM_BUFFERS), OPERAND_LAYOUT_B
+                    )
+                else:
+                    cur_b = gl.amd.cdna4.async_copy.load_shared_relaxed(
+                        b_buffer.index(compute_idx % NUM_BUFFERS).permute([1, 0]),
+                        OPERAND_LAYOUT_B,
+                    )
+                accumulator = gl.amd.gfx1250.wmma(cur_a, cur_b, accumulator)
+                compute_idx += 1
+
+            # drain remaining loads
+            for i in gl.static_range(NUM_BUFFERS - 1):
+                gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2 - i) * 2)
+
+                cur_a = gl.amd.cdna4.async_copy.load_shared_relaxed(
+                    a_buffer.index(compute_idx % NUM_BUFFERS), OPERAND_LAYOUT_A
+                )
+                if TRANSPOSE:
+                    cur_b = gl.amd.cdna4.async_copy.load_shared_relaxed(
+                        b_buffer.index(compute_idx % NUM_BUFFERS), OPERAND_LAYOUT_B
+                    )
+                else:
+                    cur_b = gl.amd.cdna4.async_copy.load_shared_relaxed(
+                        b_buffer.index(compute_idx % NUM_BUFFERS).permute([1, 0]),
+                        OPERAND_LAYOUT_B,
+                    )
+                accumulator = gl.amd.gfx1250.wmma(cur_a, cur_b, accumulator)
+                compute_idx += 1
+
+            if USE_ACTIVATION and NUM_KSPLIT == 1:
+                accumulator = activation(accumulator)
+
+            offs_cm = m_off + gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, WMMA_LAYOUT))
+            offs_cn = n_off + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, WMMA_LAYOUT))
+            offs_c = stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :] + pid_k * stride_ck
+            mask_c = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+
+            gl.amd.gfx1250.buffer_store(
+                accumulator.to(c_ptr.type.element_ty),
+                c_ptr,
+                offs_c,
+                mask=mask_c,
             )
-            if TRANSPOSE:
-                gl.amd.gfx1250.tdm.async_load(
-                    b_desc,
-                    [load_idx * BLOCK_K, n_off],
-                    b_buffer.index(load_idx % NUM_BUFFERS),
-                )
-            else:
-                gl.amd.gfx1250.tdm.async_load(
-                    b_desc,
-                    [n_off, load_idx * BLOCK_K],
-                    b_buffer.index(load_idx % NUM_BUFFERS),
-                )
-            # leave the NUM_BUFFERS-1 most recent pairs in flight
-            gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * 2)
-
-            load_idx += 1
-
-            cur_a = gl.amd.cdna4.async_copy.load_shared_relaxed(
-                a_buffer.index(compute_idx % NUM_BUFFERS), OPERAND_LAYOUT_A
-            )
-            if TRANSPOSE:
-                cur_b = gl.amd.cdna4.async_copy.load_shared_relaxed(
-                    b_buffer.index(compute_idx % NUM_BUFFERS), OPERAND_LAYOUT_B
-                )
-            else:
-                cur_b = gl.amd.cdna4.async_copy.load_shared_relaxed(
-                    b_buffer.index(compute_idx % NUM_BUFFERS).permute([1, 0]),
-                    OPERAND_LAYOUT_B,
-                )
-            accumulator = gl.amd.gfx1250.wmma(cur_a, cur_b, accumulator)
-            compute_idx += 1
-
-        # drain remaining loads
-        for i in gl.static_range(NUM_BUFFERS - 1):
-            gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2 - i) * 2)
-
-            cur_a = gl.amd.cdna4.async_copy.load_shared_relaxed(
-                a_buffer.index(compute_idx % NUM_BUFFERS), OPERAND_LAYOUT_A
-            )
-            if TRANSPOSE:
-                cur_b = gl.amd.cdna4.async_copy.load_shared_relaxed(
-                    b_buffer.index(compute_idx % NUM_BUFFERS), OPERAND_LAYOUT_B
-                )
-            else:
-                cur_b = gl.amd.cdna4.async_copy.load_shared_relaxed(
-                    b_buffer.index(compute_idx % NUM_BUFFERS).permute([1, 0]),
-                    OPERAND_LAYOUT_B,
-                )
-            accumulator = gl.amd.gfx1250.wmma(cur_a, cur_b, accumulator)
-            compute_idx += 1
-
-        if USE_ACTIVATION:
-            accumulator = activation(accumulator)
-
-        offs_cm = m_off + gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, WMMA_LAYOUT))
-        offs_cn = n_off + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, WMMA_LAYOUT))
-        offs_c = stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
-        mask_c = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-
-        gl.amd.gfx1250.buffer_store(
-            accumulator.to(c_ptr.type.element_ty),
-            c_ptr,
-            offs_c,
-            mask=mask_c,
-        )
 
         gl.barrier()
 
@@ -273,6 +296,7 @@ def gemm_a16w16_persistent_compute_bound_kernel_(
     stride_ak,
     stride_bk,
     stride_bn,
+    stride_ck,
     stride_cm,
     stride_cn,
     # Meta-parameters
@@ -281,13 +305,18 @@ def gemm_a16w16_persistent_compute_bound_kernel_(
     BLOCK_K: gl.constexpr,
     GROUP_SIZE_M: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
+    NUM_KSPLIT: gl.constexpr,
+    SPLITK_BLOCK_SIZE: gl.constexpr,
     WARP_BASES: gl.constexpr,
     TRANSPOSE: gl.constexpr,
     activation: gl.constexpr,
     USE_ACTIVATION: gl.constexpr,
     ADD_BIAS: gl.constexpr,
+    SKIP_REDUCE: gl.constexpr,
     NUM_WGS: gl.constexpr,
     num_warps: gl.constexpr,
+    num_stages: gl.constexpr = 0,
+    waves_per_eu: gl.constexpr = 0,
 ):
     gl.static_assert(
         NUM_BUFFERS >= 2, "persistent compute_bound requires NUM_BUFFERS >= 2"
@@ -366,143 +395,155 @@ def gemm_a16w16_persistent_compute_bound_kernel_(
             layout=SHARED_LAYOUT_B,
         )
 
-    num_k_tiles = gl.cdiv(K, BLOCK_K)
-
     # Persistent loop
     for tile_id in range(start_pid, num_tiles, NUM_WGS):
         # remap tile index
         t = remap_xcd(tile_id, num_tiles, NUM_XCDS=8)
-        pid_m, pid_n = pid_grid(t, num_pid_m, num_pid_n, GROUP_SIZE_M=GROUP_SIZE_M)
+        pid_k = t % NUM_KSPLIT
+        pid = t // NUM_KSPLIT
+
+        if NUM_KSPLIT == 1:
+            pid_m, pid_n = pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M=GROUP_SIZE_M)
+        else:
+            pid_m = pid // num_pid_n
+            pid_n = pid % num_pid_n
 
         m_off = pid_m * BLOCK_M
         n_off = pid_n * BLOCK_N
 
-        load_idx = 0
-        compute_idx = 0
+        split_k_start = pid_k * SPLITK_BLOCK_SIZE
+        if split_k_start < K:
+            split_k_end = gl.minimum(split_k_start + SPLITK_BLOCK_SIZE, K)
+            k_span = split_k_end - split_k_start
+            num_k_tiles = gl.cdiv(k_span, BLOCK_K)
 
-        accumulator = gl.zeros((BLOCK_M, BLOCK_N), dtype=gl.float32, layout=WMMA_LAYOUT)
-        if ADD_BIAS:
-            offs_bias = n_off + gl.arange(
-                0, BLOCK_N, layout=gl.SliceLayout(0, WMMA_LAYOUT)
-            )
-            bias_vals = gl.load(bias_ptr + offs_bias, mask=offs_bias < N, other=0.0)
-            accumulator = accumulator + bias_vals[None, :]
+            load_idx = 0
+            compute_idx = 0
 
-        for _ in gl.static_range(NUM_BUFFERS):
-            gl.amd.gfx1250.tdm.async_load(
-                a_desc,
-                [m_off, load_idx * BLOCK_K],
-                a_buffer.index(load_idx % NUM_BUFFERS),
-            )
-            if TRANSPOSE:
+            accumulator = gl.zeros((BLOCK_M, BLOCK_N), dtype=gl.float32, layout=WMMA_LAYOUT)
+            if ADD_BIAS:
+                if NUM_KSPLIT == 1 or (SKIP_REDUCE and pid_k == 0):
+                    offs_bias = n_off + gl.arange(
+                        0, BLOCK_N, layout=gl.SliceLayout(0, WMMA_LAYOUT)
+                    )
+                    bias_vals = gl.load(bias_ptr + offs_bias, mask=offs_bias < N, other=0.0)
+                    accumulator = accumulator + bias_vals[None, :]
+
+            for _ in gl.static_range(NUM_BUFFERS):
                 gl.amd.gfx1250.tdm.async_load(
-                    b_desc,
-                    [load_idx * BLOCK_K, n_off],
-                    b_buffer.index(load_idx % NUM_BUFFERS),
+                    a_desc,
+                    [m_off, split_k_start + load_idx * BLOCK_K],
+                    a_buffer.index(load_idx % NUM_BUFFERS),
                 )
-            else:
-                gl.amd.gfx1250.tdm.async_load(
-                    b_desc,
-                    [n_off, load_idx * BLOCK_K],
-                    b_buffer.index(load_idx % NUM_BUFFERS),
-                )
-            load_idx += 1
+                if TRANSPOSE:
+                    gl.amd.gfx1250.tdm.async_load(
+                        b_desc,
+                        [split_k_start + load_idx * BLOCK_K, n_off],
+                        b_buffer.index(load_idx % NUM_BUFFERS),
+                    )
+                else:
+                    gl.amd.gfx1250.tdm.async_load(
+                        b_desc,
+                        [n_off, split_k_start + load_idx * BLOCK_K],
+                        b_buffer.index(load_idx % NUM_BUFFERS),
+                    )
+                load_idx += 1
 
-        gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * 2)
-
-        cur_a = gl.amd.cdna4.async_copy.load_shared_relaxed(
-            a_buffer.index(compute_idx % NUM_BUFFERS), OPERAND_LAYOUT_A
-        )
-        if TRANSPOSE:
-            cur_b = gl.amd.cdna4.async_copy.load_shared_relaxed(
-                b_buffer.index(compute_idx % NUM_BUFFERS), OPERAND_LAYOUT_B
-            )
-        else:
-            cur_b = gl.amd.cdna4.async_copy.load_shared_relaxed(
-                b_buffer.index(compute_idx % NUM_BUFFERS).permute([1, 0]),
-                OPERAND_LAYOUT_B,
-            )
-
-        for _ in range(num_k_tiles - NUM_BUFFERS):
-            accumulator = gl.amd.gfx1250.wmma(cur_a, cur_b, accumulator)
-
-            gl.amd.gfx1250.tdm.async_load(
-                a_desc,
-                [m_off, load_idx * BLOCK_K],
-                a_buffer.index(load_idx % NUM_BUFFERS),
-            )
-            if TRANSPOSE:
-                gl.amd.gfx1250.tdm.async_load(
-                    b_desc,
-                    [load_idx * BLOCK_K, n_off],
-                    b_buffer.index(load_idx % NUM_BUFFERS),
-                )
-            else:
-                gl.amd.gfx1250.tdm.async_load(
-                    b_desc,
-                    [n_off, load_idx * BLOCK_K],
-                    b_buffer.index(load_idx % NUM_BUFFERS),
-                )
             gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * 2)
 
-            load_idx += 1
-
-            next_a = gl.amd.cdna4.async_copy.load_shared_relaxed(
-                a_buffer.index((compute_idx + 1) % NUM_BUFFERS), OPERAND_LAYOUT_A
+            cur_a = gl.amd.cdna4.async_copy.load_shared_relaxed(
+                a_buffer.index(compute_idx % NUM_BUFFERS), OPERAND_LAYOUT_A
             )
             if TRANSPOSE:
-                next_b = gl.amd.cdna4.async_copy.load_shared_relaxed(
-                    b_buffer.index((compute_idx + 1) % NUM_BUFFERS),
-                    OPERAND_LAYOUT_B,
+                cur_b = gl.amd.cdna4.async_copy.load_shared_relaxed(
+                    b_buffer.index(compute_idx % NUM_BUFFERS), OPERAND_LAYOUT_B
                 )
             else:
-                next_b = gl.amd.cdna4.async_copy.load_shared_relaxed(
-                    b_buffer.index((compute_idx + 1) % NUM_BUFFERS).permute([1, 0]),
+                cur_b = gl.amd.cdna4.async_copy.load_shared_relaxed(
+                    b_buffer.index(compute_idx % NUM_BUFFERS).permute([1, 0]),
                     OPERAND_LAYOUT_B,
                 )
 
-            cur_a = next_a
-            cur_b = next_b
-            compute_idx += 1
+            for _ in range(num_k_tiles - NUM_BUFFERS):
+                accumulator = gl.amd.gfx1250.wmma(cur_a, cur_b, accumulator)
 
-        for i in gl.static_range(NUM_BUFFERS - 1):
-            gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2 - i) * 2)
+                gl.amd.gfx1250.tdm.async_load(
+                    a_desc,
+                    [m_off, split_k_start + load_idx * BLOCK_K],
+                    a_buffer.index(load_idx % NUM_BUFFERS),
+                )
+                if TRANSPOSE:
+                    gl.amd.gfx1250.tdm.async_load(
+                        b_desc,
+                        [split_k_start + load_idx * BLOCK_K, n_off],
+                        b_buffer.index(load_idx % NUM_BUFFERS),
+                    )
+                else:
+                    gl.amd.gfx1250.tdm.async_load(
+                        b_desc,
+                        [n_off, split_k_start + load_idx * BLOCK_K],
+                        b_buffer.index(load_idx % NUM_BUFFERS),
+                    )
+                gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * 2)
 
-            next_a = gl.amd.cdna4.async_copy.load_shared_relaxed(
-                a_buffer.index((compute_idx + 1) % NUM_BUFFERS), OPERAND_LAYOUT_A
-            )
-            if TRANSPOSE:
-                next_b = gl.amd.cdna4.async_copy.load_shared_relaxed(
-                    b_buffer.index((compute_idx + 1) % NUM_BUFFERS),
-                    OPERAND_LAYOUT_B,
+                load_idx += 1
+
+                next_a = gl.amd.cdna4.async_copy.load_shared_relaxed(
+                    a_buffer.index((compute_idx + 1) % NUM_BUFFERS), OPERAND_LAYOUT_A
                 )
-            else:
-                next_b = gl.amd.cdna4.async_copy.load_shared_relaxed(
-                    b_buffer.index((compute_idx + 1) % NUM_BUFFERS).permute([1, 0]),
-                    OPERAND_LAYOUT_B,
+                if TRANSPOSE:
+                    next_b = gl.amd.cdna4.async_copy.load_shared_relaxed(
+                        b_buffer.index((compute_idx + 1) % NUM_BUFFERS),
+                        OPERAND_LAYOUT_B,
+                    )
+                else:
+                    next_b = gl.amd.cdna4.async_copy.load_shared_relaxed(
+                        b_buffer.index((compute_idx + 1) % NUM_BUFFERS).permute([1, 0]),
+                        OPERAND_LAYOUT_B,
+                    )
+
+                cur_a = next_a
+                cur_b = next_b
+                compute_idx += 1
+
+            for i in gl.static_range(NUM_BUFFERS - 1):
+                gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2 - i) * 2)
+
+                next_a = gl.amd.cdna4.async_copy.load_shared_relaxed(
+                    a_buffer.index((compute_idx + 1) % NUM_BUFFERS), OPERAND_LAYOUT_A
                 )
+                if TRANSPOSE:
+                    next_b = gl.amd.cdna4.async_copy.load_shared_relaxed(
+                        b_buffer.index((compute_idx + 1) % NUM_BUFFERS),
+                        OPERAND_LAYOUT_B,
+                    )
+                else:
+                    next_b = gl.amd.cdna4.async_copy.load_shared_relaxed(
+                        b_buffer.index((compute_idx + 1) % NUM_BUFFERS).permute([1, 0]),
+                        OPERAND_LAYOUT_B,
+                    )
+                accumulator = gl.amd.gfx1250.wmma(cur_a, cur_b, accumulator)
+
+                cur_a = next_a
+                cur_b = next_b
+                compute_idx += 1
+
             accumulator = gl.amd.gfx1250.wmma(cur_a, cur_b, accumulator)
 
-            cur_a = next_a
-            cur_b = next_b
-            compute_idx += 1
+            if USE_ACTIVATION and NUM_KSPLIT == 1:
+                accumulator = activation(accumulator)
 
-        accumulator = gl.amd.gfx1250.wmma(cur_a, cur_b, accumulator)
+            offs_cm = m_off + gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, WMMA_LAYOUT))
+            offs_cn = n_off + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, WMMA_LAYOUT))
+            offs_c = stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :] + pid_k * stride_ck
+            mask_c = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
 
-        if USE_ACTIVATION:
-            accumulator = activation(accumulator)
-
-        offs_cm = m_off + gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, WMMA_LAYOUT))
-        offs_cn = n_off + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, WMMA_LAYOUT))
-        offs_c = stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
-        mask_c = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-
-        gl.amd.gfx1250.buffer_store(
-            accumulator.to(c_ptr.type.element_ty),
-            c_ptr,
-            offs_c,
-            mask=mask_c,
-        )
+            gl.amd.gfx1250.buffer_store(
+                accumulator.to(c_ptr.type.element_ty),
+                c_ptr,
+                offs_c,
+                mask=mask_c,
+            )
 
         gl.barrier()
 

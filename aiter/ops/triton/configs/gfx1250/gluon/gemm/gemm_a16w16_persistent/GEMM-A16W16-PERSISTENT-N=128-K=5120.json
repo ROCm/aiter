@@ -24,11 +24,12 @@
         "GROUP_SIZE_M": 2
     },
     "any": {
-        "BLOCK_M": 128,
-        "BLOCK_N": 128,
-        "BLOCK_K": 128,
-        "NUM_BUFFERS": 3,
-        "num_warps": 2,
-        "GROUP_SIZE_M": 2
+        "BLOCK_M": 32,
+        "BLOCK_N": 32,
+        "BLOCK_K": 256,
+        "NUM_BUFFERS": 4,
+        "num_warps": 4,
+        "GROUP_SIZE_M": 1,
+        "waves_per_eu": 7
     }
 }

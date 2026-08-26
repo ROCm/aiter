@@ -21,6 +21,8 @@ _gemm_a16w16_repr = make_kernel_repr(
         "ADD_BIAS",
         "SKIP_REDUCE",
         "NUM_WGS",
+        "num_stages",
+        "waves_per_eu",
     ],
 )
 
@@ -68,6 +70,8 @@ def gemm_a16w16_persistent_kernel_(
     ADD_BIAS: tl.constexpr,
     SKIP_REDUCE: tl.constexpr,
     NUM_WGS: tl.constexpr,
+    num_stages: tl.constexpr = 0,
+    waves_per_eu: tl.constexpr = 0,
 ):
     """Kernel for computing the matmul C = A x B.
     A has shape (M, K), B has shape (K, N) and C has shape (M, N)
