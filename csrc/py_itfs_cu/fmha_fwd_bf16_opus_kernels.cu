@@ -44,11 +44,11 @@ void launch_d128(at::Tensor& q,
     const int H_KV = static_cast<int>(k.size(2));
     const int N_KV = static_cast<int>(k.size(1));      // seqlen_kv (cross-attn: may != N)
 
-    TORCH_CHECK(D == 128, "launch_d128 only compiles D=128, got D=", D);
+    TORCH_CHECK(D == 64 || D == 128, "launch_d128 compiles D=64 or D=128, got D=", D);
     TORCH_CHECK(k.size(0) == B && v.size(0) == B, "k/v batch must equal q batch B");
     TORCH_CHECK(v.size(1) == N_KV, "k/v seqlen must match (v seqlen != k seqlen)");
     TORCH_CHECK(v.size(2) == H_KV, "k/v must share H_KV");
-    TORCH_CHECK(k.size(3) == D && v.size(3) == D, "k/v head dim must equal D=128");
+    TORCH_CHECK(k.size(3) == D && v.size(3) == D, "k/v head dim must equal q head dim D");
     TORCH_CHECK(H_KV > 0 && (H % H_KV) == 0, "H must be divisible by H_KV (GQA group)");
     TORCH_CHECK(out.size(0) == B && out.size(1) == N && out.size(2) == H && out.size(3) == D,
                 "out shape must match q [B, N, H, D]");
@@ -61,7 +61,7 @@ void launch_d128(at::Tensor& q,
     const long long kv_slice_bytes =
         (long long)N_KV * std::max(k.stride(1), v.stride(1)) * 2LL;  // bf16
     TORCH_CHECK(kv_slice_bytes < (1LL << 32),
-                "OPUS D=128: KV byte extent ", kv_slice_bytes,
+                "OPUS D=", D, ": KV byte extent ", kv_slice_bytes,
                 " reaches the 32-bit buffer-offset limit (2^32); reduce seqlen_kv or use another backend");
 
     if (B == 0 || N == 0 || H == 0) return;
@@ -293,15 +293,17 @@ void fmha_fwd_bf16_opus_fwd(at::Tensor& q,
     const int D_V  = static_cast<int>(v.size(-1));
     const bool is_group = seqstart_q.has_value() && seqstart_q->numel() > 0;
 
-    if (D_QK == 128 && D_V == 128) {
-        TORCH_CHECK(!is_group, "OPUS D=128 kernel supports batch mode only (no varlen)");
+    if (D_QK == D_V && (D_QK == 64 || D_QK == 128)) {
+        TORCH_CHECK(!is_group, "OPUS symmetric D=", D_QK,
+                    " kernel supports batch mode only (no varlen)");
         launch_d128(q, k, v, out, causal, softmax_scale, lse);
     } else if (D_QK == 192 && D_V == 128) {
         launch_d192_v128(q, k, v, out, causal, softmax_scale, lse,
                          seqstart_q, seqstart_k, seqstart_q_pad, seqstart_k_pad,
                          max_seqlen_q, max_seqlen_k);
     } else {
-        TORCH_CHECK(false, "OPUS fwd supports (D_QK,D_V) in {(128,128),(192,128)}, got (",
+        TORCH_CHECK(false,
+                    "OPUS fwd supports (D_QK,D_V) in {(64,64),(128,128),(192,128)}, got (",
                     D_QK, ",", D_V, ")");
     }
 }
