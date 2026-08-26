@@ -211,13 +211,16 @@ class QManager16b:
     ``gqa_ratio``, ``num_waves`` and the ring depth ``lds_tiles``.
     """
 
-    def __init__(self, *, qk_hdim, gqa_ratio, num_waves=_DEFAULT_NUM_WAVES, lds_tiles=None):
+    def __init__(self, *, qk_hdim, gqa_ratio, num_waves=_DEFAULT_NUM_WAVES,
+                 lds_tiles=None, q_tiles_per_wave=1):
         if qk_hdim % _WMMA_K != 0:
             raise ValueError(f"qk_hdim must be a multiple of {_WMMA_K}; got {qk_hdim}")
         self.qk_hdim = qk_hdim  # compile-time
         self.gqa_ratio = gqa_ratio  # compile-time
         self.num_waves = num_waves  # compile-time (threadgroup wave count)
-        self.block_m = _WMMA_M * num_waves  # Q rows per threadgroup
+        # Each wave owns q_tiles_per_wave adjacent 16-row Q WMMA tiles (contiguous).
+        self.q_tiles_per_wave = q_tiles_per_wave  # compile-time (R)
+        self.block_m = _WMMA_M * q_tiles_per_wave * num_waves  # Q rows per threadgroup
         self.k_tiles = qk_hdim // _WMMA_K
 
         # Ring-buffer depth: how many K-tiles of a wave's Q live in LDS at once
@@ -231,8 +234,16 @@ class QManager16b:
             raise ValueError(
                 f"lds_tiles must be in [1, {self.k_tiles}]; got {lds_tiles}"
             )
+        # R>1 shares the async/ds counters across the wave's tiles; the gradual
+        # ring drain assumes a single tile-chain, so require fully-resident there.
+        if q_tiles_per_wave > 1 and lds_tiles != self.k_tiles:
+            raise ValueError(
+                "q_tiles_per_wave>1 requires fully-resident Q (lds_tiles==k_tiles)"
+            )
         self.lds_tiles = lds_tiles
-        self._warp_stride = _WMMA_M * self.lds_tiles * _WMMA_K * _BF16_BYTES
+        # Per-tile LDS span; a wave stacks its R tiles contiguously.
+        self._tile_stride = _WMMA_M * self.lds_tiles * _WMMA_K * _BF16_BYTES
+        self._warp_stride = q_tiles_per_wave * self._tile_stride
 
     def get_lds_size_in_byte(self):
         """LDS bytes the caller must reserve for Q staging (all waves)."""
@@ -336,79 +347,114 @@ class QManager16b:
         """Part 1 of the Q load: compute all global/LDS offsets (stashed as members),
         then issue the prime chunk of async global->LDS loads. A trailing
         ``sched_barrier`` pins these above the caller's SALU so that work fills the
-        load's shadow. Call ``load_q_to_vgpr_part2`` after to drain + read."""
-        lds_q_base = ptr_lds + warp_idx * self._warp_stride
-        warp_row0 = block_x * self.block_m + warp_idx * _WMMA_M
+        load's shadow. Call ``load_q_to_vgpr_part2`` after to drain + read.
 
-        # All address VALU up front (2 async b128 + 2 ds_load per tile).
-        gptrs, lds_wr_ptrs = self.global_load_ptrs(
-            ptr_Q=ptr_Q,
-            lds_q_base=lds_q_base,
-            warp_row0=warp_row0,
-            kv_head=kv_head,
-            q_start=q_start,
-            q_len=q_len,
-            stride_q_seq=stride_q_seq,
-            stride_q_head=stride_q_head,
-            lane_idx=lane_idx,
-        )
-        ds_ptrs = self.ds_load_ptrs(lds_q_base=lds_q_base, lane_idx=lane_idx)
+        The wave owns R = q_tiles_per_wave contiguous 16-row Q tiles; per-tile
+        pointer lists are stashed as lists-of-lists (index [qt]). Prime loads are
+        issued qt-major then tile-major so part2's global asynccnt countdown matches
+        the completion order (fully-resident when R>1)."""
+        R = self.q_tiles_per_wave
+        warp_base = ptr_lds + warp_idx * self._warp_stride
+        warp_row0_wave = block_x * self.block_m + warp_idx * (R * _WMMA_M)
 
-        # Prime: issue the first lds_tiles tiles (2 loads each).
+        self._q_gptrs = []
+        self._q_lds_wr_ptrs = []
+        self._q_ds_ptrs = []
+        for qt in fx.range_constexpr(R):
+            lds_q_base = warp_base + qt * self._tile_stride
+            warp_row0 = warp_row0_wave + qt * _WMMA_M
+            # All address VALU up front (2 async b128 + 2 ds_load per tile).
+            gptrs, lds_wr_ptrs = self.global_load_ptrs(
+                ptr_Q=ptr_Q,
+                lds_q_base=lds_q_base,
+                warp_row0=warp_row0,
+                kv_head=kv_head,
+                q_start=q_start,
+                q_len=q_len,
+                stride_q_seq=stride_q_seq,
+                stride_q_head=stride_q_head,
+                lane_idx=lane_idx,
+            )
+            ds_ptrs = self.ds_load_ptrs(lds_q_base=lds_q_base, lane_idx=lane_idx)
+            self._q_gptrs.append(gptrs)
+            self._q_lds_wr_ptrs.append(lds_wr_ptrs)
+            self._q_ds_ptrs.append(ds_ptrs)
+
+        # Prime: issue the first lds_tiles tiles (2 loads each) of every q-tile.
         n_prime = 2 * self.lds_tiles
-        self._async_load_vram_to_lds(gptrs[:n_prime], lds_wr_ptrs[:n_prime])
+        for qt in fx.range_constexpr(R):
+            self._async_load_vram_to_lds(
+                self._q_gptrs[qt][:n_prime], self._q_lds_wr_ptrs[qt][:n_prime]
+            )
         rocdl.sched_barrier(0)  # pin the prime loads above the caller's SALU
-
-        # Stash for part 2 (drain + reads, and steady-loop refills when lds_tiles<k_tiles).
-        self._q_gptrs = gptrs
-        self._q_lds_wr_ptrs = lds_wr_ptrs
-        self._q_ds_ptrs = ds_ptrs
 
     def load_q_to_vgpr_part2(self, *, scale):
         """Part 2 of the Q load: drain the async loads issued in part 1 and read the
         tiles into WMMA A fragments (``scale`` folded in). A leading ``sched_barrier``
         keeps the waits/reads below the caller's SALU so it stays in the load shadow.
-        Async is drained GRADUALLY (in-issue-order assumption); ``lds_tiles ==
-        k_tiles`` (default) skips the steady loop = fully-resident drain-only."""
+
+        Returns a length-R list (``R = q_tiles_per_wave``); entry ``qt`` is that
+        q-tile's list of k_tiles v16-bf16 WMMA A fragments."""
         rocdl.sched_barrier(0)  # keep waits/reads below the caller's SALU
+        R = self.q_tiles_per_wave
         k_tiles = self.k_tiles
         lds_tiles = self.lds_tiles
-        ds_ptrs = self._q_ds_ptrs
         v8_ty = fx.Vector.make_type(_CHUNK_ELEMS, fx.BFloat16)
+        scale_bf16 = scale.to(fx.BFloat16)
 
-        def _read_tile(tile):
-            # Self-scheduled reads: the surrounding s_wait_asynccnt / s_wait_dscnt
-            # pipeline (below) already orders these against the async refills.
+        def _read_tile(ds_ptrs, tile):
             lo = fx.Vector(llvm_dialect.load(v8_ty, ds_ptrs[2 * tile]))
             hi = fx.Vector(llvm_dialect.load(v8_ty, ds_ptrs[2 * tile + 1]))
             return lo, hi
 
+        if lds_tiles == k_tiles:
+            # Fully-resident (the only R>1 mode): all R*k_tiles*2 async loads were
+            # issued in part1 in qt-major then tile-major order; completion is
+            # in-issue-order. Drain with a GLOBAL asynccnt countdown so tile
+            # (qt,tile) is read once its 2 loads have landed. Reduces to the
+            # single-chain drain when R==1.
+            total = 2 * R * k_tiles
+            q_frags_list = [[] for _ in range(R)]
+            for qt in fx.range_constexpr(R):
+                ds_ptrs = self._q_ds_ptrs[qt]
+                for tile in fx.range_constexpr(k_tiles):
+                    landed = 2 * (qt * k_tiles + tile) + 2  # this tile's lo+hi
+                    rocdl.s_wait_asynccnt(total - landed)
+                    lo, hi = _read_tile(ds_ptrs, tile)
+                    rocdl.s_wait_dscnt(1)  # lo landed (in-order LDS return)
+                    lo = lo * scale_bf16
+                    rocdl.s_wait_dscnt(0)  # hi landed
+                    hi = hi * scale_bf16
+                    q_frags_list[qt].append(lo.shuffle(hi, list(range(16))))
+            return q_frags_list
+
+        # Non-fully-resident ring drain — R==1 only (guarded in __init__).
+        ds_ptrs = self._q_ds_ptrs[0]
+        gptrs = self._q_gptrs[0]
+        lds_wr_ptrs = self._q_lds_wr_ptrs[0]
+
         def _refill(tile):
             lo = 2 * tile
-            self._async_load_vram_to_lds(
-                self._q_gptrs[lo:lo + 2], self._q_lds_wr_ptrs[lo:lo + 2],
-            )
-
-        scale_bf16 = scale.to(fx.BFloat16)
+            self._async_load_vram_to_lds(gptrs[lo:lo + 2], lds_wr_ptrs[lo:lo + 2])
 
         q_frags = []
         # Steady loop: read+evict tile (i-lds_tiles), refill tile i into its slot.
         for i in fx.range_constexpr(lds_tiles, k_tiles):
             rocdl.s_wait_asynccnt((lds_tiles - 1) * 2)  # oldest tile's 2 loads landed
-            lo, hi = _read_tile(i - lds_tiles)
+            lo, hi = _read_tile(ds_ptrs, i - lds_tiles)
             rocdl.s_wait_dscnt(0)  # slot free to overwrite
             _refill(i)
             q_frags.append(lo.shuffle(hi, list(range(16))) * scale_bf16)
         # Drain loop: read the last lds_tiles tiles, no refill; overlap lo scale w/ hi load.
         for i in fx.range_constexpr(0, lds_tiles):
             rocdl.s_wait_asynccnt((lds_tiles - 1 - i) * 2)
-            lo, hi = _read_tile(k_tiles - lds_tiles + i)
+            lo, hi = _read_tile(ds_ptrs, k_tiles - lds_tiles + i)
             rocdl.s_wait_dscnt(1)  # lo landed (in-order LDS return)
             lo = lo * scale_bf16
             rocdl.s_wait_dscnt(0)  # hi landed
             hi = hi * scale_bf16
             q_frags.append(lo.shuffle(hi, list(range(16))))
-        return q_frags
+        return [q_frags]
 
 
 # ============================================================================
@@ -856,6 +902,7 @@ class OManager16b:
         v_hdim,
         gqa_ratio,
         num_waves=_DEFAULT_NUM_WAVES,
+        q_tiles_per_wave=1,
         cols_per_tile=_O_COLS_PER_TILE,
         inflight_units=_O_INFLIGHT_UNITS,
         lds_budget_bytes=_O_LDS_BUDGET_BYTES,
@@ -865,7 +912,10 @@ class OManager16b:
         self.v_hdim = v_hdim
         self.gqa_ratio = gqa_ratio
         self.num_waves = num_waves
-        self.block_m = _WMMA_M * num_waves  # Q/O rows per threadgroup
+        # Each wave owns q_tiles_per_wave adjacent 16-row O tiles (contiguous); the
+        # R tiles serialize through the SAME per-warp ring (caller loops qtile).
+        self.q_tiles_per_wave = q_tiles_per_wave
+        self.block_m = _WMMA_M * q_tiles_per_wave * num_waves  # Q/O rows per threadgroup
         self.d_tiles = v_hdim // _WMMA_M  # WMMA output tiles == frags/lane
 
         cpt = min(v_hdim, cols_per_tile)
@@ -923,6 +973,7 @@ class OManager16b:
         lane_idx,
         ptr_lds,  # fx.Int32: base byte addr of the caller's O staging allocation
         o_frags,  # list[d_tiles] of v8 f32 (pre-normalized) WMMA accumulators
+        qtile=0,  # which of this wave's q_tiles_per_wave tiles this call stores
     ):
         """Reshape this warp's 16 x v_hdim fp32 accumulator to bf16 and store it.
 
@@ -939,7 +990,11 @@ class OManager16b:
         q_st = lane_idx % _WMMA_M
         d_half = (lane_idx // _WMMA_M) * _CHUNK_ELEMS  # 0 or 8
         v8_ty = fx.Vector.make_type(_CHUNK_ELEMS, fx.BFloat16)
-        base_row = block_x * self.block_m + warp_idx * _WMMA_M
+        base_row = (
+            block_x * self.block_m
+            + warp_idx * (self.q_tiles_per_wave * _WMMA_M)
+            + qtile * _WMMA_M
+        )
         G = self._chunks_per_row
         TPU = self.tiles_per_unit  # ds_store ops per unit == ds_load rounds per unit
         NSL = self.inflight_units  # ring depth (units resident at once)

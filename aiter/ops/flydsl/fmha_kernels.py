@@ -29,7 +29,7 @@ import torch.nn.functional as F
 
 from .kernels.flash_attn_func_gfx1201 import build_flash_attn_func_module
 from .kernels.fmha_gfx1250.fmha_kernel import flash_attn_varlen_d192_gfx1250
-from .kernels.fmha_gfx1250.fmha_fwd_prefill_m16x8 import (
+from .kernels.fmha_gfx1250.fmha_fwd_prefill_m32x8 import (
     flash_attn_varlen_m16x8,
     flash_attn_batch_m16x8,
 )
