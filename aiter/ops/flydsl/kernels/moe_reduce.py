@@ -5,10 +5,9 @@
 
 ``Y[t, d] = sum_k X[t, k, d]``, optionally gated by the EP validity mask
 (``valid[t,k] = expert_mask[topk_ids[t,k]] != 0``). Epilogue of stage2
-``mode="reduce"``, shared by every dtype's reduce path. Extracted from
-``moe_gemm_2stage.py``. Build a per-shape launcher with ``compile_moe_reduction``
-(cached); the kernel's compile-time params are ``Constexpr`` so flyc specializes
-per shape/dtype.
+``mode="reduce"``, shared by every dtype's reduce path. Build a per-shape launcher
+with ``compile_moe_reduction`` (cached); the kernel's compile-time params are
+``Constexpr`` so flyc specializes per shape/dtype.
 
 ``dtype_str="fp8"`` reduces MXFP8 route-out rows (a flat uint8 buffer of
 ``[model_dim fp8 bytes | model_dim/scale_blk e8m0 scale bytes]`` per row): each fp8
@@ -47,6 +46,7 @@ def moe_reduction_kernel(
     use_weight: fx.Constexpr[bool],
     scale_blk: fx.Constexpr[int],
     fp8_row_stride: fx.Constexpr[int],
+    NTHREADS: fx.Constexpr[int],
 ):
     # One tiled-copy reduce for every dtype. Dense (f16/bf16/f32) loads V elems
     # and extends to f32; fp8 route-out loads 8 fp8 bytes + their e8m0 microscale
@@ -71,7 +71,7 @@ def moe_reduction_kernel(
         load_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), in_elem)
     out_bytes = out_numeric.width // 8
     is_16b = out_numeric.width < 32
-    TILE = BLOCK * V
+    TILE = NTHREADS * V
     store_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), out_numeric)
 
     token, tile, tid = gpu.block_id("x"), gpu.block_id("y"), gpu.thread_id("x")
@@ -124,9 +124,9 @@ def moe_reduction_kernel(
             f32pt, fx.Int64(ptrtoint(topk_weights)) + tok64 * fx.Int64(topk * 4)
         )
 
-    # Tiled copy: BLOCK threads across the tile, V contiguous elems per thread.
+    # Tiled copy: NTHREADS threads across the tile, V contiguous elems per thread.
     tile_mn, tv_layout = fx.make_layout_tv(
-        fx.make_layout((1, BLOCK), (1, 1)), fx.make_layout((1, V), (1, 1))
+        fx.make_layout((1, NTHREADS), (1, 1)), fx.make_layout((1, V), (1, 1))
     )
     thr_load = fx.make_tiled_copy(load_atom, tv_layout, tile_mn).get_slice(tid)
     thr_store = fx.make_tiled_copy(store_atom, tv_layout, tile_mn).get_slice(tid)
@@ -194,6 +194,14 @@ def moe_reduction_kernel(
         _reduce_tile()
 
 
+def _pick_reduce_block(model_dim: int, V: int) -> int:
+    need = -(-model_dim // V)
+    block = BLOCK
+    while block < need and block < 1024:
+        block *= 2
+    return block
+
+
 @functools.lru_cache(maxsize=1024)
 def compile_moe_reduction(
     *,
@@ -215,7 +223,8 @@ def compile_moe_reduction(
     stays correct.
     """
     V = FP8_VEC if dtype_str == "fp8" else 128 // (32 if dtype_str == "f32" else 16)
-    gy = (model_dim + BLOCK * V - 1) // (BLOCK * V)
+    block = _pick_reduce_block(model_dim, V)
+    gy = (model_dim + block * V - 1) // (block * V)
     out_tag = out_dtype_str or dtype_str
     if dtype_str == "fp8":
         scale_blk = fp8out_scale_blk(model_dim) if scale_blk is None else int(scale_blk)
@@ -254,8 +263,9 @@ def compile_moe_reduction(
             use_weight,
             scale_blk,
             fp8_row_stride,
+            block,
         ).launch(
-            grid=(fx.Int64(i32_m_tokens), gy, 1), block=(BLOCK, 1, 1), stream=stream
+            grid=(fx.Int64(i32_m_tokens), gy, 1), block=(block, 1, 1), stream=stream
         )
 
     return launch

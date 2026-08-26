@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 import os
+import sys
 from dataclasses import dataclass, field
 
 # Legacy cache policy = traits default for split-barrier & persistent a16w16 (see
@@ -63,6 +64,16 @@ class OpusGemmInstance:
     # Optional generated name tag override for same-pipeline variants.
     name_tag: str = ""
     # SplitK workspace storage dtype; splitK launchers still use fp32 tune dispatch.
+    # Split-K partial type, per kid. Keep the DEFAULT at fp32: several pipelines
+    # static_assert on it -- gfx942's em3en4_lds1_pgr2_sk among them -- so a
+    # bf16 default silently retargets every split-K family on every arch and
+    # only shows up as a compile error on the arches you did not build.
+    # The gfx1250 _ws families opt in to bf16 (see _gfx1250_ws_bf16_partial):
+    # it halves what the reduce reads back and what a sweep allocates, and it
+    # clears the gate the tuner applies -- at rtol=atol=5e-2, which is what a
+    # bf16 output gets, err_ratio measures 0.004-0.012 against a 0.05 line, flat
+    # from split_k=1 to 16. It is the coarser choice: against a 1e-2 tolerance
+    # the same partials fail from split_k=2 on.
     splitk_workspace_dtype: str = "fp32_t"
 
     # gfx1250 cluster/TDM split-K consumer tiling: "tileN" (split N) or
@@ -82,6 +93,15 @@ class OpusGemmInstance:
     # a16w16_clusterlaunch_tdm_splitk_ws tag; ignored by every other pipeline.
     cluster_wg_m: int = 4
     cluster_wg_n: int = 4
+
+    # gfx1250 FUSED single-kernel split-K (a16w16_clusterlaunch_tdm_splitk_fuse):
+    # SplitK and MClusterWg are COMPILE-TIME (cluster dims (SplitK, MClusterWg, 1)),
+    # so each kid bakes one combo. fuse_ws_dtype = DataWs partial storage
+    # ("bf16_t" default; "fp32_t" for higher reduce precision). Ignored by every
+    # other pipeline. fuse_split_k == 0 marks "not a fuse kid".
+    fuse_split_k: int = 0
+    fuse_m_cluster: int = 1
+    fuse_ws_dtype: str = "bf16_t"
 
     # --- a8w8_mxscale BMM flatmm-splitK axes (kernel_tag ==
     # "a8w8_mxscale_bmm_flatmm_splitk"). The BMM main kernel template is
@@ -121,6 +141,24 @@ class OpusGemmInstance:
     preload_sf_lds: bool = False
     # Symbol root ("opus_gemm" for GEMM, "opus_bmm" for the batched frontends).
     name_root: str = "opus_gemm"
+
+    # --- pre-compiled (.co) families only (kernel_tag in _A16W16_CO_TAGS) ------
+    # Device-side entry-point attributes. They never reach the host launcher --
+    # it only needs the traits constants -- but they DO reach the symbol name,
+    # because two entries differing only in these must not collide on one .co.
+    # co_num_vgpr == 0 omits the amdgpu_num_vgpr attribute entirely.
+    co_num_vgpr: int = 0
+    co_min_waves_per_eu: int = 1
+    # Device-pass flags for this entry, verbatim. A tuple so the dataclass stays
+    # hashable-ish and no two instances can share a mutable default.
+    co_device_flags: tuple = ()
+    # Free-form name suffix, for entries that differ ONLY in co_device_flags.
+    co_variant: str = ""
+    # a/b/c/acc spellings; co_traits_args() in the gfx1250 codegen reads these.
+    co_dtypes: tuple = ("bf16_t", "bf16_t", "bf16_t", "fp32_t")
+    # (TileM, TileN): how the 4 waves tile the block. Only the wave-layout co
+    # family reads it; (4, 1) is the fixed layout of the original pipeline.
+    co_wave_layout: tuple = (4, 1)
 
     @property
     def name(self) -> str:
@@ -211,6 +249,50 @@ class OpusGemmInstance:
             parts.insert(tag_at, "splitk_clusterlaunch_tdm_ws")
             parts.append(f"c{self.cluster_wg_m}x{self.cluster_wg_n}")
             parts.append(f"p{self.num_slots}w{self.wg_per_cu}")
+        elif self.kernel_tag == "a16w16_clusterlaunch_tdm_splitk_fuse":
+            # FUSED single-kernel split-K. The visible segment is "skfuse" (NOT
+            # "splitk_...") so the reduce-TU detection (keys on "_splitk_" in the
+            # kernel name, gen_instances.py) never emits a reduce kernel for it.
+            # It IS still in SPLITK_TAGS (fp32 lookup ABI). m{m}s{split_k}ws{dt}
+            # + cluster geometry keep each (tile, split_k, m_cluster, ws_dtype)
+            # symbol unique.
+            parts.insert(tag_at, "skfuse")
+            # fuse_m_cluster now groups N-tile peers (A-multicast); tag as n{}.
+            parts.append(f"n{self.fuse_m_cluster}s{self.fuse_split_k}")
+            parts.append("wsf32" if self.fuse_ws_dtype == "fp32_t" else "wsbf16")
+            parts.append(f"p{self.num_slots}w{self.wg_per_cu}")
+        elif self.kernel_tag.startswith("a16w16_4wave"):
+            # gfx1250 symmetric 4-wave compute pipeline, loaded from a
+            # pre-compiled .co (see include/gfx1250/opus_co_launch_gfx1250.cuh).
+            # This name is used THREE ways and they must stay equal: the host
+            # launcher symbol, the extern "C" kernel symbol inside the .co, and
+            # the .co filename. That identity is what lets the codegen emit the
+            # load call without reading any sidecar. No "splitk_" segment: the
+            # reduce-TU detection in gen_instances.py keys on that substring and
+            # this pipeline has no reduce kernel.
+            #
+            # The trailing segments carry every axis a .co can differ on:
+            # cluster dims, ring depth, the pinned VGPR budget and the
+            # launch_bounds waves-per-EU. Two JSON entries differing in any one
+            # of them are two distinct symbols and two distinct .co files; if
+            # they differ ONLY in device_flags, co_variant separates them.
+            parts.insert(
+                tag_at,
+                (
+                    "4wave_wl_co"
+                    if self.kernel_tag == "a16w16_4wave_wl_co"
+                    else "4wave_co"
+                ),
+            )
+            # Wave layout only shows up for the family that can vary it, so the
+            # 4wave_co names already on disk are untouched.
+            if self.kernel_tag == "a16w16_4wave_wl_co":
+                parts.append(f"w{self.co_wave_layout[0]}x{self.co_wave_layout[1]}")
+            parts.append(f"c{self.cluster_wg_m}x{self.cluster_wg_n}")
+            parts.append(f"p{self.num_slots}")
+            parts.append(f"v{self.co_num_vgpr}w{self.co_min_waves_per_eu}")
+            if self.co_variant:
+                parts.append(self.co_variant)
         elif self.name_tag:
             parts.insert(tag_at, self.name_tag)
         elif self.kernel_tag in _GFX942_KERNEL_NAME_TAGS:
@@ -1316,8 +1398,9 @@ GFX1250_BASE_KIDS = frozenset(gfx1250_kernels_list.keys())
 # (cluster_wg_m x cluster_wg_n x 1) workgroup CLUSTER: peers co-reside and share
 # A/B TDM loads via CLUSTER_LOAD_ASYNC multicast (named-barrier producer/consumer
 # handshake, same as the plain base). The host launcher rounds the grid up to the
-# cluster dims and asserts an exact cluster fill (no OOB tail WG). Distinct kid
-# band (20500+) so it never collides with the no-cluster base kids (20000..20087).
+# cluster dims; the workgroups that round-up adds own no tile and return at their
+# cluster-barrier arrival, so no shape needs an exact cluster fill. Distinct kid
+# band (20100+) so it never collides with the no-cluster base kids (20000..20099).
 def _a16w16_clusterlaunch_tdm_splitk_ws_gfx1250(
     bm, bn, bk, layout, cwm, cwn, num_slots=3, wg_per_cu=2
 ):
@@ -1411,6 +1494,297 @@ for _bm, _bn, _bk, _wg in _GFX1250_CLUSTERLAUNCH_TILES:
 assert _cl_kid <= 21000, f"clusterlaunch gfx1250 kids overflow [20100,21000): {_cl_kid}"
 GFX1250_CLUSTERLAUNCH_KIDS = frozenset(gfx1250_clusterlaunch_kernels_list.keys())
 
+
+# -- gfx1250 FUSED single-kernel split-K (a16w16_clusterlaunch_tdm_splitk_fuse) --
+# Single kernel: last split WG folds bias + reduces the SplitK-1 partials in-kernel
+# (cluster-barrier sync), no separate reduce kernel. SplitK / MClusterWg are
+# COMPILE-TIME (cluster dims (SplitK, MClusterWg, 1)); DataWs (bf16/fp32) is a kid
+# property. B is TDM-multicast across the MClusterWg M-peers.
+#
+# CURRENTLY UNREGISTERED (see GFX1250_SPLITK_FUSE_ENABLED below): the pipeline is
+# still being fixed, so the family contributes no kid. Its band has been moved to
+# [27000, 30000) -- the pre-compiled .co family took over the [21000, 27000) head
+# while this one is unregistered.
+def _a16w16_splitk_fuse_gfx1250(
+    bm, bn, bk, layout, split_k, m_cluster, ws_dtype="bf16_t",
+    num_slots=3, wg_per_cu=2,
+):
+    from dataclasses import replace
+
+    inst = _a16w16_cluster_tdm_splitk_ws_gfx1250(
+        bm, bn, bk, layout, num_slots=num_slots, wg_per_cu=wg_per_cu
+    )
+    return replace(
+        inst,
+        kernel_tag="a16w16_clusterlaunch_tdm_splitk_fuse",
+        # output_dtypes MUST stay ["fp32_t"] (the split-K lookup invariant): the
+        # host launcher is instantiated ONLY as <fp32_t> and opus_gemm.cu forces
+        # the fuse band to the <fp32_t> dispatch slot; the launcher then picks the
+        # real Y dtype at RUNTIME (if Y.dtype()==bf16 ... else float). Advertising
+        # bf16_t here would make gen_a16w16_tune_lookup emit &{name}<bf16_t> in the
+        # BF16 tune map -> undefined symbol (that specialization is never built).
+        # The tuner exempts fuse kids from the output-dtype narrowing separately.
+        output_dtypes=["fp32_t"],
+        fuse_split_k=split_k,
+        fuse_m_cluster=m_cluster,
+        fuse_ws_dtype=ws_dtype,
+    )
+
+
+# Registration switch for the whole fused family. False sweeps no (tile, split_k,
+# n_cluster, ws) combination at all, so gfx1250_splitk_fuse_kernels_list stays
+# empty: no kid to look up, nothing for the tuner to pick, nothing for the codegen
+# to emit, and the kid band below is unclaimed. The factory above, the emitter in
+# codegen/gen_instances_gfx1250.py and the device pipeline are all still here --
+# flipping this back to True is the only step needed to bring the family back.
+GFX1250_SPLITK_FUSE_ENABLED = False
+
+gfx1250_splitk_fuse_kernels_list = {}
+# Kid band the family claims WHEN ENABLED. The current sweep needs 1377 kids, so
+# [23000, 30000) has room to spare; while disabled the whole range is free.
+# It used to start at 21000 -- the pre-compiled .co family took [21000, 23000)
+# while this one was unregistered.
+GFX1250_SPLITK_FUSE_KID_BASE = 27000
+_sf_kid = GFX1250_SPLITK_FUSE_KID_BASE
+# (B_M, B_N, B_K, layout, split_k, m_cluster, ws_dtype) -> kid, for the tuner /
+# candidate selection to look a fuse kid up by config.
+GFX1250_SPLITK_FUSE_KID_OF = {}
+# Fuse tiles = the SAME no-spill (B_M, B_N, B_K) set as the clusterlaunch sweep
+# (_GFX1250_CLUSTERLAUNCH_TILES), so fuse covers the full tile range. Layout
+# follows the base rule (B_M==16 -> tileN, else tileM); wg_per_cu is inherited
+# per tile from the clusterlaunch table (the fuse producer shares the same TDM
+# request profile, so that wg keeps 2-WG/CU co-residency TDM-budget-safe).
+#
+# N-DIRECTION MULTICAST: the cluster is (SplitK, n_cluster, 1) where the 2nd dim
+# (stored in the fuse_m_cluster field) groups n_cluster N-tile peers that share
+# A[M-tile] via TDM multicast (mirrors the clusterlaunch cwn A-multicast that
+# wins at small M). n_cluster is swept 1..5 (TDM fan-out <= 5) subject to
+# SplitK*n_cluster <= 16 (16-WG cluster budget).
+#
+# split_k sweep per workspace dtype:
+#   * bf16 workspace: split_k 2..15
+#   * fp32 workspace: split_k 2..8 (kept conservative; the reduce now stages
+#     partials through a bounded LDS RING (kFuseReduceRing in the pipeline), so
+#     split_k is NO LONGER LDS-bounded -- this cap could be lifted to 15 too).
+# SplitK is capped at 15 (NOT 16): each __cluster_dims__ axis is a 4-bit field.
+# SplitK / n_cluster are COMPILE-TIME (cluster dims), so each (tile, split_k,
+# n_cluster, ws) is a distinct kid; neither is a runtime knob for fuse.
+_FUSE_REDUCE_RING = 3  # must match kFuseReduceRing in the fuse pipeline header
+_FUSE_NUM_SLOTS = 3
+
+
+def _fuse_ring_lds_ok(bm, bn, bk, wg, ws_bytes):
+    """Guard: the reduce LDS ring (kFuseReduceRing tiles of B_M*B_N*ws_bytes)
+    must fit kLdsTotalBytes. Mirrors the traits LDS formula so we never emit a
+    kid that would fail the pipeline's ring static_assert at compile time."""
+    pitch = bk + 8
+    seg_ab = _FUSE_NUM_SLOTS * (bm + bn) * pitch * 2  # bf16 A/B footprint
+    lds_total = (160 * 1024 + 1024) if (wg == 1 and seg_ab <= 160 * 1024) else seg_ab
+    return _FUSE_REDUCE_RING * bm * bn * ws_bytes <= lds_total
+
+
+_FUSE_WS_SWEEP = (("bf16_t", 2, 15), ("fp32_t", 4, 8))  # (ws_dtype, elem_bytes, sk_hi)
+# N-direction cluster (A-multicast) fan-out: the fuse_m_cluster field holds the
+# cluster's 2nd-dim WG count, which for this pipeline groups N-tile peers sharing
+# A. TDM multicast fans out to <= 5 WGs, and the cluster (SplitK, n_cluster, 1)
+# must satisfy SplitK*n_cluster <= 16 (16-bit workgroup_mask / 16-WG budget).
+_FUSE_MAX_NCLUSTER = 5
+_fuse_tiles_seen = set()
+_fuse_tiles = _GFX1250_CLUSTERLAUNCH_TILES if GFX1250_SPLITK_FUSE_ENABLED else ()
+for _bm, _bn, _bk, _wg in _fuse_tiles:
+    if (_bm, _bn, _bk) in _fuse_tiles_seen:
+        continue
+    _fuse_tiles_seen.add((_bm, _bn, _bk))
+    _layout = "tileN" if _bm == 16 else "tileM"
+    for _ws, _ws_bytes, _sk_hi in _FUSE_WS_SWEEP:
+        if not _fuse_ring_lds_ok(_bm, _bn, _bk, _wg, _ws_bytes):
+            continue  # ring wouldn't fit LDS for this (tile, ws) -- skip
+        for _nc in range(1, _FUSE_MAX_NCLUSTER + 1):
+            for _sk in range(2, _sk_hi + 1):
+                if _sk * _nc > 16:  # SplitK * n_cluster <= 16 (cluster budget)
+                    continue
+                gfx1250_splitk_fuse_kernels_list[_sf_kid] = _a16w16_splitk_fuse_gfx1250(
+                    _bm, _bn, _bk, _layout,
+                    split_k=_sk, m_cluster=_nc, ws_dtype=_ws, wg_per_cu=_wg,
+                )
+                GFX1250_SPLITK_FUSE_KID_OF[
+                    (_bm, _bn, _bk, _layout, _sk, _nc, _ws)
+                ] = _sf_kid
+                _sf_kid += 1
+assert _sf_kid <= 30000, f"splitk_fuse gfx1250 kids overflow [27000,30000): {_sf_kid}"
+GFX1250_SPLITK_FUSE_KIDS = frozenset(gfx1250_splitk_fuse_kernels_list.keys())
+
+
+# -- gfx1250 SYMMETRIC 4-WAVE COMPUTE, pre-compiled .co (a16w16_4wave_co) -----
+# No producer/consumer split: all 4 waves issue TDM and run WMMA, each owning
+# 32 M rows and the full B_N across the whole K loop (~256 fp32 VGPR/lane of
+# accumulators live throughout). No workspace, no split-K, no bias -- bf16 C is
+# stored straight out through LDS by one TDM per wave.
+#
+# THE DEVICE SIDE OF THIS FAMILY IS NOT JIT-COMPILED. The kernel needs
+# __builtin_amdgcn_pin_vgpr / amdgpu_num_vgpr / -amdgpu-expert-scheduling-mode,
+# none of which a release ROCm toolchain provides, so it is built ahead of time
+# by gen_co/build_co.py into gen_co/gfx1250/<name>.co and loaded at runtime.
+# gen_co/co_kernels.json is the single source of truth for BOTH the offline
+# build and the JIT codegen, which is what keeps the .co filename, the .co's
+# extern "C" symbol and the host launcher symbol identical. Adding a variant
+# (another VGPR budget, another cluster shape, other device flags) is an edit to
+# that file only -- nothing here enumerates configurations.
+# A full tile x wave-layout x ring-depth x cluster sweep is a few thousand
+# entries, so the co band is 6000 wide. splitk_fuse sits above it at 27000.
+GFX1250_4WAVE_CO_KID_BASE = 21000
+GFX1250_4WAVE_CO_KID_END = 27000
+
+CO_KERNELS_JSON = os.path.join(os.path.dirname(__file__), "gen_co", "co_kernels.json")
+
+# Which kid band each pre-compiled tag is allowed to claim. A tag with no entry
+# here is rejected outright rather than landing on some other family's kids.
+_CO_KID_BANDS = {
+    "a16w16_4wave_co": (GFX1250_4WAVE_CO_KID_BASE, GFX1250_4WAVE_CO_KID_END),
+    # Same band: kids are explicit in the JSON, so the two co families just
+    # continue the numbering rather than each reserving a sub-range.
+    "a16w16_4wave_wl_co": (GFX1250_4WAVE_CO_KID_BASE, GFX1250_4WAVE_CO_KID_END),
+}
+
+
+_CO_DTYPE_BYTES = {"bf16_t": 2, "fp16_t": 2, "fp32_t": 4, "fp8_t": 1, "bf8_t": 1}
+
+
+def _co_instance_from_json(arch, e):
+    """One JSON entry -> one OpusGemmInstance. Every field the .co and the host
+    launcher must agree on comes from this single conversion."""
+    tag = e["tag"]
+    bm, bn, bk = e["tile"]
+    cwm, cwn = e["cluster"]
+    lb_threads, lb_waves = e["launch_bounds"]
+    d = e["dtypes"]
+    # The host launcher starts the grid with dim3(Traits::BLOCK_SIZE); if these
+    # two disagree the kernel is launched with a block size its
+    # __launch_bounds__ never promised, which fails silently rather than loudly.
+    assert lb_threads == e["block_size"], (
+        f"co kid {e['kid']}: launch_bounds[0]={lb_threads} must equal "
+        f"block_size={e['block_size']}"
+    )
+    vec_a = 16 // _CO_DTYPE_BYTES[d["a"]]
+    vec_b = 16 // _CO_DTYPE_BYTES[d["b"]]
+    return OpusGemmInstance(
+        e["block_size"],
+        bm, bn, bk,
+        4, 1,           # T_M, T_N: the 4 waves split M, each owns the full N
+        16, 16, 32,     # WMMA 16x16x32
+        vec_a, vec_b, 8,
+        0, 0, 0,        # GROUP (unused)
+        tag,
+        # The kernel stores C straight through LDS with no reduce kernel behind
+        # it to cast anything else, so unlike the gfx1250 split-K kids this is
+        # the real output dtype, not an ABI placeholder for a workspace slot.
+        [d["c"]],
+        arch_prefix=arch,
+        num_slots=e["num_slots"],
+        cluster_wg_m=cwm,
+        cluster_wg_n=cwn,
+        co_num_vgpr=e.get("num_vgpr", 0),
+        co_min_waves_per_eu=lb_waves,
+        co_device_flags=tuple(e.get("device_flags", ())),
+        co_variant=e.get("variant", ""),
+        co_dtypes=(d["a"], d["b"], d["c"], d["acc"]),
+        co_wave_layout=tuple(e.get("wave_layout", (4, 1))),
+    )
+
+
+def co_image_path(path, inst):
+    """Where the pre-built image for `inst` lives, relative to co_kernels.json.
+
+    The one place the layout `gen_co/<arch>/<symbol>.co` is spelled on the Python
+    side; the C++ loader spells the same thing under $OPUS_GEN_CO_DIR.
+    """
+    return os.path.join(os.path.dirname(path), inst.arch_prefix, f"{inst.name}.co")
+
+
+def _load_co_kernels(path, require_image=True):
+    """Parse gen_co/co_kernels.json into {kid: OpusGemmInstance}.
+
+    A MISSING FILE IS NOT AN ERROR: the family goes empty, exactly like
+    GFX1250_SPLITK_FUSE_ENABLED=False. A data file that failed to ship should
+    cost the co kids, not the whole opus codegen. A malformed one still raises.
+
+    ``require_image`` extends that same degradation to the images themselves: an
+    entry whose .co is not on disk is DROPPED (with a warning) rather than
+    registered. Without this, a kid can exist all the way through codegen, the
+    tuner and the tuned CSV and only fail at its first launch -- which is
+    precisely what a wheel built from a tree where the .co files were never
+    committed would ship. build_co.py is the one caller that must see the
+    unfiltered table: it is what produces the missing images.
+    """
+    if not os.path.exists(path):
+        return {}
+    import json
+
+    with open(path) as f:
+        doc = json.load(f)
+
+    out = {}
+    seen_names = {}
+    missing = []
+    for arch, entries in doc.items():
+        if arch.startswith("_"):  # "_comment"
+            continue
+        for e in entries:
+            kid = e["kid"]
+            lo, hi = _CO_KID_BANDS[e["tag"]]
+            assert lo <= kid < hi, (
+                f"co kid {kid} (tag {e['tag']}) outside its band [{lo},{hi})"
+            )
+            assert kid not in out, f"duplicate co kid {kid} in {path}"
+            inst = _co_instance_from_json(arch, e)
+            # The name is the .co filename, the .co's extern "C" symbol AND the
+            # host launcher symbol. Two entries colliding here would silently
+            # overwrite one .co with the other.
+            assert inst.name not in seen_names, (
+                f"co kids {seen_names[inst.name]} and {kid} generate the same "
+                f"symbol {inst.name!r} -- give one of them a distinct "
+                f'"variant" string'
+            )
+            seen_names[inst.name] = kid
+            if require_image and not os.path.exists(co_image_path(path, inst)):
+                missing.append((kid, inst.name))
+                continue
+            out[kid] = inst
+    if missing:
+        print(
+            f"[opus] {len(missing)} pre-compiled (.co) kid(s) dropped -- image "
+            f"not found under {os.path.dirname(path)}: "
+            # A full sweep is thousands of entries; naming every one turns a
+            # warning into a wall of text on every codegen run.
+            + ", ".join(f"{kid} ({name}.co)" for kid, name in missing[:5])
+            + (f", ... and {len(missing) - 5} more" if len(missing) > 5 else "")
+            + ". Build them with csrc/opus_gemm/gen_co/build_co.py --llvm-bin "
+            "<pin-capable LLVM>.",
+            file=sys.stderr,
+        )
+    return out
+
+
+gfx1250_4wave_co_kernels_list = {
+    kid: inst
+    for kid, inst in _load_co_kernels(CO_KERNELS_JSON).items()
+    if inst.kernel_tag.startswith("a16w16_4wave")
+}
+# Every JSON entry, image on disk or not. ONLY for build_co.py (the producer);
+# everything that dispatches must use the filtered table above.
+gfx1250_4wave_co_kernels_declared = {
+    kid: inst
+    for kid, inst in _load_co_kernels(CO_KERNELS_JSON, require_image=False).items()
+    if inst.kernel_tag.startswith("a16w16_4wave")
+}
+# symbol name -> kid, for candidate selection. Keyed on the name rather than on
+# (tile, cluster) because two variants may share a tile and differ only in the
+# VGPR budget -- a (tile, cluster) key would silently drop one of them.
+GFX1250_4WAVE_CO_KID_OF = {
+    k.name: kid for kid, k in gfx1250_4wave_co_kernels_list.items()
+}
+GFX1250_4WAVE_CO_KIDS = frozenset(gfx1250_4wave_co_kernels_list.keys())
+
 # combined list (used by production gen_instances / dispatch)
 kernels_list = {
     **a8w8_scale_kernels_list,
@@ -1435,6 +1809,8 @@ kernels_list = {
     **gfx942_kernels_list,
     **gfx1250_kernels_list,
     **gfx1250_clusterlaunch_kernels_list,
+    **gfx1250_splitk_fuse_kernels_list,
+    **gfx1250_4wave_co_kernels_list,
 }
 
 default_kernels_dict = {
@@ -1443,6 +1819,21 @@ default_kernels_dict = {
     (-3): _a16w16(512, 256, 256, 64, 4, 16, 16, 32),  # same as a16w16 #9
 }
 # fmt: on
+
+
+# The gfx1250 _ws families are the ones that opt in to a bf16 split-K partial;
+# see splitk_workspace_dtype for what that buys and costs. Applied here rather
+# than in each constructor so the set is one list, and scoped by tag so it
+# cannot reach the gfx942/gfx950 split-K pipelines, several of which
+# static_assert an fp32 workspace.
+_GFX1250_WS_BF16_PARTIAL_TAGS = (
+    "a16w16_cluster_tdm_splitk_ws",
+    "a16w16_clusterlaunch_tdm_splitk_ws",
+)
+for _inst in kernels_list.values():
+    if _inst.kernel_tag in _GFX1250_WS_BF16_PARTIAL_TAGS:
+        _inst.splitk_workspace_dtype = "bf16_t"
+del _inst
 
 
 # Subset-compile kid taxonomy (consumed by gen_instances.py for the `HEURISTIC_DEFAULT_KIDS ?
@@ -1549,16 +1940,25 @@ HEURISTIC_DEFAULT_KIDS_GFX942 = frozenset(
 # must be force-compiled as the always-available (M,N,K) fallback. Every other
 # plain kid and ALL clusterlaunch kids are compiled on demand by the tuner
 # (candidate selection + sidecar expansion), so default builds stay small.
-HEURISTIC_DEFAULT_KIDS_GFX1250 = frozenset(
-    GFX1250_PLAIN_KID_OF[_t]
-    for _t in (
-        (16, 32, 128),
-        (16, 64, 128),
-        (16, 128, 128),
-        (32, 32, 128),
-        (32, 64, 128),
-        (32, 128, 128),
+HEURISTIC_DEFAULT_KIDS_GFX1250 = (
+    frozenset(
+        GFX1250_PLAIN_KID_OF[_t]
+        for _t in (
+            (16, 32, 128),
+            (16, 64, 128),
+            (16, 128, 128),
+            (32, 32, 128),
+            (32, 64, 128),
+            (32, 128, 128),
+        )
+        # The 4wave_co kids are NOT reachable from the C++ shape heuristic; they are
+        # here only for this set's other job -- membership in the subset-compile set
+        # S (gen_instances.py), so the explicit-kernelId path can always reach them.
+        # Their device side is a pre-built .co, so "compiling" one is just the host
+        # launcher: no per-kid device TU is emitted (see the co emit branch in
+        # codegen/gen_instances_gfx1250.py).
     )
+    | GFX1250_4WAVE_CO_KIDS
 )
 
 HEURISTIC_DEFAULT_KIDS = (
