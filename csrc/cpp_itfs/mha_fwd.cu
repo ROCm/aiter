@@ -1,5 +1,6 @@
 #include "mha_fwd.h"
 #include "aiter_hip_common.h"
+#include "mha_fwd_dump.h"
 #if FAV3_ON
 #include "asm_fmha_v3_fwd_configs.hpp"
 #endif
@@ -359,6 +360,14 @@ float fmha_fwd_ck(mha_fwd_args a, const ck_tile::stream_config& s)
                        a.drop_seed_offset,
                        a.block_scale_size_q,
                        a.block_scale_size_kv};
+
+    // Runtime dump: only batch mode is emitted here so that varlen (group)
+    // details can be printed by the entry-point layer (which has access to
+    // host-side cu_seqlens tensors). Guarded by env AITER_DUMP_MHA_FWD_INFO.
+    if(!a.is_group_mode)
+    {
+        dump_mha_fwd_info_batch(a);
+    }
 
     return fmha_fwd(traits, args, s);
 }
