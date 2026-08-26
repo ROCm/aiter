@@ -971,6 +971,28 @@ def _get_compile_fn():
     return _flydsl_compile_fn
 
 
+@functools.lru_cache(maxsize=64)
+def _get_preshuffle_split_buffers(
+    device: torch.device,
+    stream: torch.cuda.Stream,
+    split_k: int,
+    m: int,
+    n: int,
+    tile_m: int,
+    tile_n: int,
+) -> tuple[Tensor, Tensor]:
+    # One cache entry per stream makes reuse safe: launches on the same stream
+    # are ordered, and the fused reduction resets every tile semaphore to zero.
+    workspace_splits = 1 if split_k == 2 else split_k
+    workspace = torch.empty(
+        (workspace_splits, m, n), dtype=torch.float32, device=device
+    )
+    tile_count = ((m + tile_m - 1) // tile_m) * (n // tile_n)
+    semaphore_count = 2 * tile_count if split_k == 2 else tile_count
+    semaphore = torch.zeros(semaphore_count, dtype=torch.int32, device=device)
+    return workspace, semaphore
+
+
 def flydsl_preshuffle_gemm_a8(
     XQ: Tensor,
     WQ: Tensor,
@@ -985,8 +1007,9 @@ def flydsl_preshuffle_gemm_a8(
     xcd_swizzle: int = 0,
     lds_stage: int = 2,
     enable_scheduler: bool = True,
+    split_k: int = 1,
 ) -> Tensor:
-    """Compile (cached via lru_cache) and run a FlyDSL preshuffle GEMM kernel."""
+    """Compile and run FlyDSL preshuffle GEMM, optionally with fp32 split-K."""
     compile_fn = _get_compile_fn()
     if compile_fn is None:
         raise RuntimeError("[FlyDSL] compile function not available")
@@ -1000,9 +1023,14 @@ def flydsl_preshuffle_gemm_a8(
             f"[FlyDSL] N ({n}) is not a multiple of tile_n ({tile_n}). "
             f"Arguments not supported! Skipping gemm!"
         )
-    if k % tile_k != 0:
+    if split_k < 1 or k % split_k != 0:
         raise RuntimeError(
-            f"[FlyDSL] K ({k}) is not a multiple of tile_k ({tile_k}). "
+            f"[FlyDSL] K ({k}) must be divisible by split_k ({split_k})."
+        )
+    if (k // split_k) % tile_k != 0:
+        raise RuntimeError(
+            f"[FlyDSL] K/split_k ({k // split_k}) is not a multiple of "
+            f"tile_k ({tile_k}). "
             f"Arguments not supported! Skipping gemm!"
         )
 
@@ -1037,6 +1065,7 @@ def flydsl_preshuffle_gemm_a8(
         enable_scheduler=bool(enable_scheduler),
         xcd_swizzle=int(xcd_swizzle),
         lds_stage=int(lds_stage),
+        split_k=int(split_k),
     )
 
     def _as_i8(t):
@@ -1047,12 +1076,27 @@ def flydsl_preshuffle_gemm_a8(
     # epilogue != "none"). Pass an empty tensor as a placeholder for the
     # default epilogue="none" path.
     _dummy_bias = torch.empty(0, dtype=Out.dtype, device=Out.device)
+    if split_k > 1:
+        workspace, semaphore = _get_preshuffle_split_buffers(
+            Out.device,
+            torch.cuda.current_stream(),
+            split_k,
+            m,
+            n,
+            tile_m,
+            tile_n,
+        )
+    else:
+        workspace = out_contig
+        semaphore = _dummy_bias
     # The layout-API launcher (PR #754) takes fx.Tensor args (it builds views via
     # fx.get_iter/make_view), so pass flat torch tensors directly rather than raw
     # pointers.
     _run_compiled(
         exe,
+        workspace.view(-1),
         out_contig.view(-1),
+        semaphore,
         _as_i8(XQ.contiguous()).view(-1),
         _as_i8(WQ.contiguous()).view(-1),
         x_scale.contiguous().view(-1),
