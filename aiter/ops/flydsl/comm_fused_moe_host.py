@@ -482,8 +482,15 @@ class _WindowedRunner:
 
 
 class _PersistentWindowRunner:
-    def __init__(self, tp_group, config: persistent_window.Config) -> None:
+    def __init__(
+        self,
+        tp_group,
+        config: persistent_window.Config,
+        *,
+        schedule: persistent_window.Schedule | None = None,
+    ) -> None:
         k = persistent_window
+        schedule = schedule or k.Schedule()
         self.config = config
         self.rank = int(tp_group.rank_in_group)
         self.device = torch.device(tp_group.device)
@@ -522,7 +529,21 @@ class _PersistentWindowRunner:
             self.reduced_scale_flat_base,
         ) = bases
         self.service = k.compile_stage2_service(config)
-        self.service_stream = torch.cuda.Stream(device=self.device)
+        self.phase0_compute = (
+            k.compile_stage2_compute(config, 0)
+            if schedule.producer_workers_per_n_tile is None
+            else k.compile_stage2_compute_bounded(
+                config,
+                0,
+                schedule.producer_workers_per_n_tile,
+                schedule.producer_ctas_per_cu_limit,
+            )
+        )
+        self.schedule = schedule
+        self.service_stream = torch.cuda.Stream(
+            device=self.device,
+            priority=-1 if schedule.service_first else 0,
+        )
         self.start_event = torch.cuda.Event()
         self.done_event = torch.cuda.Event()
 
@@ -566,8 +587,10 @@ class _PersistentWindowRunner:
         config = self.config
         producer = torch.cuda.current_stream(self.device)
         common = _stage2_args(stage2_args, stage2_kwargs, k, config)
+        if self.schedule.service_first:
+            self._launch_service()
         _run_compiled(
-            k.compile_stage2_compute(config, 0),
+            self.phase0_compute,
             (ptr_arg(self.routes[0]), *common, producer),
         )
         for phase in range(config.phases - 1):
@@ -581,7 +604,7 @@ class _PersistentWindowRunner:
                     producer,
                 ),
             )
-            if phase == 0:
+            if phase == 0 and not self.schedule.service_first:
                 self.start_event.record(producer)
                 self.service_stream.wait_event(self.start_event)
                 self._launch_service()
@@ -609,6 +632,12 @@ _RUNNER_TYPES = {
 
 
 def create_runner(tp_group, config: PipelineConfig):
+    if isinstance(config, persistent_window.Config):
+        return _PersistentWindowRunner(
+            tp_group,
+            config,
+            schedule=persistent_window.production_schedule(config),
+        )
     return _RUNNER_TYPES[type(config)](tp_group, config)
 
 

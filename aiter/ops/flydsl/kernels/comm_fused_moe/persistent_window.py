@@ -102,7 +102,41 @@ class Config:
         return self.shard_rows * self.groups_per_row
 
 
-def _compile_compute(config: Config, window: int, compose=None):
+@dataclass(frozen=True)
+class Schedule:
+    producer_workers_per_n_tile: int | None = None
+    producer_ctas_per_cu_limit: int = 1
+    service_first: bool = False
+
+
+_DEFAULT_SCHEDULE = Schedule()
+_PRODUCTION_SCHEDULES = {
+    # Four N tiles per 1024-wide window: 112 * 4 = 448 producer CTAs.
+    2048: Schedule(
+        producer_workers_per_n_tile=112,
+        producer_ctas_per_cu_limit=2,
+        service_first=True,
+    ),
+    # Four N tiles per 1024-wide window: 104 * 4 = 416 producer CTAs.
+    16384: Schedule(
+        producer_workers_per_n_tile=104,
+        producer_ctas_per_cu_limit=2,
+        service_first=True,
+    ),
+}
+
+
+def production_schedule(config: Config) -> Schedule:
+    return _PRODUCTION_SCHEDULES.get(config.m, _DEFAULT_SCHEDULE)
+
+
+def _compile_compute(
+    config: Config,
+    window: int,
+    compose=None,
+    *,
+    persistent_m_workers_per_n_tile: int | None = None,
+):
     return compile_mixed_moe_gemm2_common(
         model_dim=H,
         inter_dim=I,
@@ -116,12 +150,15 @@ def _compile_compute(config: Config, window: int, compose=None):
         b_dtype="fp4",
         out_dtype="fp8",
         accumulate=False,
-        persist_m=1,
+        persist_m=(
+            -1 if persistent_m_workers_per_n_tile is not None else 1
+        ),
         sort_block_m=config.sort_block_m,
         _n_tile_range=(
             window * config.tiles_per_window,
             (window + 1) * config.tiles_per_window,
         ),
+        _persistent_cu_num=persistent_m_workers_per_n_tile,
         _compose_entry=compose,
     )
 
@@ -130,6 +167,43 @@ def _compile_compute(config: Config, window: int, compose=None):
 def compile_stage2_compute(config: Config, window: int):
     """Compile one compact Stage2 window."""
     return _compile_compute(config, window)
+
+
+@functools.cache
+def compile_stage2_compute_bounded(
+    config: Config,
+    window: int,
+    workers_per_n_tile: int,
+    ctas_per_cu_limit: int = 1,
+):
+    """Compile one compact window with an explicit producer CTA budget.
+
+    ``ctas_per_cu_limit=1`` requires a fully resident grid.  A larger explicit
+    budget allows a service-first kernel to reserve CUs while producer CTAs
+    drain through the remaining slots.
+    """
+    from aiter.jit.utils.chip_info import get_cu_num
+
+    if not isinstance(workers_per_n_tile, int) or workers_per_n_tile < 1:
+        raise ValueError(
+            f"workers_per_n_tile must be int >= 1, got {workers_per_n_tile}"
+        )
+    if not isinstance(ctas_per_cu_limit, int) or ctas_per_cu_limit < 1:
+        raise ValueError(
+            f"ctas_per_cu_limit must be int >= 1, got {ctas_per_cu_limit}"
+        )
+    producer_ctas = config.tiles_per_window * workers_per_n_tile
+    resident_limit = get_cu_num() * ctas_per_cu_limit
+    if producer_ctas > resident_limit:
+        raise ValueError(
+            "bounded Stage2 grid exceeds its explicit CTA budget: "
+            f"producer_ctas={producer_ctas}, resident_limit={resident_limit}"
+        )
+    return _compile_compute(
+        config,
+        window,
+        persistent_m_workers_per_n_tile=workers_per_n_tile,
+    )
 
 
 def _emit_local(config: Config, route, partial, shared, worker):

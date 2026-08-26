@@ -3425,6 +3425,7 @@ def compile_mixed_moe_gemm2_common(
     xcd_swizzle: int = 0,
     shared_expert_id: int | None = None,
     _n_tile_range: tuple[int, int] | None = None,
+    _persistent_cu_num: int | None = None,
     _compose_entry=None,
 ):
     """Compile stage2 kernel (moe_gemm2): A2 @ W2.T -> [tokens, model_dim], atomic-add."""
@@ -3594,13 +3595,19 @@ def compile_mixed_moe_gemm2_common(
 
     epilog_tag = "cshuffle"
     persistent = persist_m <= 0
+    bounded_persistent = persistent and _persistent_cu_num is not None
     if const_expr(not isinstance(cu_num_mul, int) or cu_num_mul < 1):
         raise ValueError(f"cu_num_mul must be int >= 1, got {cu_num_mul}")
     if const_expr(persistent):
-        from aiter.jit.utils.chip_info import get_cu_num
+        if _persistent_cu_num is None:
+            from aiter.jit.utils.chip_info import get_cu_num
 
-        cu_num = get_cu_num() * int(cu_num_mul)
+            cu_num = get_cu_num() * int(cu_num_mul)
+        else:
+            cu_num = int(_persistent_cu_num)
     else:
+        if const_expr(_persistent_cu_num is not None):
+            raise ValueError("_persistent_cu_num requires persist_m <= 0")
         cu_num = 0
     sbm_tag = "" if _sort_block_m == tile_m else f"_sbm{_sort_block_m}"
     pm_tag = f"_persist_cu{cu_num}" if persistent else f"_pm{persist_m}"
@@ -3929,9 +3936,14 @@ def compile_mixed_moe_gemm2_common(
                 tiles_per_block = tiles_per_block_base + extra_tile
                 start_tail = arith.select(has_extra_tile, bx_persist, tiles_remainder)
                 persist_start_tile = bx_persist * tiles_per_block_base + start_tail
-                i1 = ir.IntegerType.get_signless(1)
-                init_active = arith.constant(1, type=i1)
-                for_persist = scf.ForOp(c0_p, tiles_per_block, c1_p, [init_active])
+                if const_expr(bounded_persistent):
+                    for_persist = scf.ForOp(c0_p, tiles_per_block, c1_p)
+                else:
+                    i1 = ir.IntegerType.get_signless(1)
+                    init_active = arith.constant(1, type=i1)
+                    for_persist = scf.ForOp(
+                        c0_p, tiles_per_block, c1_p, [init_active]
+                    )
             else:
                 c_pm = arith.constant(persist_m, index=True)
                 init_prev_expert = arith.constant(0, type=T.i32)
@@ -3948,8 +3960,9 @@ def compile_mixed_moe_gemm2_common(
             mi_p = for_persist.induction_variable
 
             if const_expr(persistent):
-                still_active = for_persist.inner_iter_args[0]
                 bx = persist_start_tile + mi_p
+                if const_expr(not bounded_persistent):
+                    still_active = for_persist.inner_iter_args[0]
             else:
                 prev_expert_i32 = for_persist.inner_iter_args[0]
                 prev_expert_b_base = for_persist.inner_iter_args[1]
@@ -5423,15 +5436,27 @@ def compile_mixed_moe_gemm2_common(
                     moe_gemm2_then_body()
 
             if const_expr(persistent):
-                cur_active = arith.andi(still_active, blk_valid)
-                do_gemm = arith.andi(cur_active, arith.andi(exp_valid, tile_has_tokens))
+                if const_expr(bounded_persistent):
+                    do_gemm = arith.andi(exp_valid, tile_has_tokens)
+                else:
+                    cur_active = arith.andi(still_active, blk_valid)
+                    do_gemm = arith.andi(
+                        cur_active, arith.andi(exp_valid, tile_has_tokens)
+                    )
                 if_valid = scf.IfOp(do_gemm)
                 with ir.InsertionPoint(if_valid.then_block):
                     emit_moe_gemm2_body()
                     scf.YieldOp([])
 
-                gpu.barrier()
-                scf.YieldOp([cur_active])
+                if const_expr(bounded_persistent):
+                    # The C-shuffle epilogue has completed all LDS reads.  Keep
+                    # the workgroup rendezvous before reusing LDS without
+                    # draining independent global output stores.
+                    barrier(lgkmcnt=0)
+                    scf.YieldOp([])
+                else:
+                    gpu.barrier()
+                    scf.YieldOp([cur_active])
             else:
                 if_valid = scf.IfOp(all_valid)
                 with ir.InsertionPoint(if_valid.then_block):
