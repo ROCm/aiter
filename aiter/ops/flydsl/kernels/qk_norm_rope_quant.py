@@ -1745,12 +1745,15 @@ TILES_PER_WG = 40  # CT: tiles streamed per WG (unrolled; CT % (H/RT) == 0)
 def _tdm_tiles_per_wg(num_rows):
     """Pick (CT, K) for a row count — trades prefetch depth vs occupancy.
 
-    On gfx1250 each CU has 320 KB LDS and can host 2 WGs (2048 threads).
-    At K=6 the arena is 192 KB so only 1 WG fits; K<=5 (<=160 KB) allows
-    2 WG/CU which doubles occupancy and helps bandwidth-bound small-T cases.
+    CT is bounded by keeping enough workgroups to cover the 256 CUs: at
+    num_rows=65536 (T=512, H=128) CT=8 gives gx_q=256, exactly one WG per CU,
+    so LDS is not the limiter there and K is free to pick on latency alone.
+    K=4 measures ~2.4% faster than K=5 at that point (15.31 vs 15.69 us);
+    the shallower rotation is not LDS- or occupancy-driven, so re-measure
+    rather than extrapolate this choice to other shapes.
     """
     if num_rows <= 65536:
-        return 8, 5
+        return 8, 4
     if num_rows <= 131072:
         return 16, NUM_BUFFERS
     return TILES_PER_WG, NUM_BUFFERS
