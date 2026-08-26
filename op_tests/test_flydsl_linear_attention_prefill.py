@@ -1988,6 +1988,8 @@ class TestCorrectness:
         _RMSE_TOL = 3e-2
         B = 1
 
+        torch.manual_seed(_case_seed(context_lens))
+
         T_total = sum(context_lens)
         N = len(context_lens)
         cu = torch.tensor(

@@ -524,7 +524,11 @@ def compile_chunk_gated_delta_h(
             #     g[i_h * T_flat + (bos + row)]
             g_last_off = i_h * T_flat + (bos + last_idx_raw)
             g_row_off_list = []
-            g_row_in_bounds = []
+            # frag_row_ok: the C-fragment row in-bounds predicate. The MFMA C
+            # fragment gives each thread 4 rows of the BT tile,
+            # i_t*BT + wid*16 + lane_m_base*4 + e, and this says which of them
+            # are real tokens rather than tail-chunk padding.
+            frag_row_ok = []
             for elem_i in range_constexpr(4):
                 abs_row = (
                     i_t_i32 * fx.Int32(BT)
@@ -536,7 +540,7 @@ def compile_chunk_gated_delta_h(
                 safe_row = in_bounds.select(abs_row, fx.Int32(0))
                 g_row_off = i_h * T_flat + (bos + safe_row)
                 g_row_off_list.append(g_row_off)
-                g_row_in_bounds.append(in_bounds)
+                frag_row_ok.append(in_bounds)
             g_last_prefetch_cell = [None]
             g_row_prefetch = [None] * 4
 
@@ -601,12 +605,10 @@ def compile_chunk_gated_delta_h(
                 idx,
                 _g=g_,
                 _offs=g_row_off_list,
-                _bnds=g_row_in_bounds,
                 _arr=g_row_prefetch,
             ):
                 _off_i = _offs[idx]
-                _bnd_i = _bnds[idx]
-                return lambda: _arr.__setitem__(idx, (_g[fx.Int64(_off_i)], _bnd_i))
+                return lambda: _arr.__setitem__(idx, _g[fx.Int64(_off_i)])
 
             def _make_emit_gk(
                 idx, _gk=_gk_local, _offs=gk_off_flat, _arr=gk_raw_prefetch
@@ -760,7 +762,12 @@ def compile_chunk_gated_delta_h(
                             vn_off = vn_base + vn_bt_row * fx.Int32(V) + vn_col
                             _emit_vn_store(vn_off, bf16_v)
 
-            # -- 3. Gating -- g values prefetched before MFMA --
+            # -- 3. Tail-chunk row mask + gating -- g prefetched before MFMA --
+            #
+            # The row mask must not be conditional on USE_G. On the final chunk
+            # of a sequence, BT rows past T_local are padding whose w/u/k loads
+            # were address-clamped to row 0 above, so they carry live data.
+            # Zeroing v_new is the only thing that neutralises them.
             if const_expr(USE_G):
                 g_last = g_last_prefetch_cell[0]
                 exp_g_last = _fast_exp(g_last)
@@ -770,14 +777,20 @@ def compile_chunk_gated_delta_h(
                 # lets LLVM pack the 4 lanes directly as register-immediate.
                 gate_elems = []
                 for elem_i in range_constexpr(4):
-                    g_row, in_bounds = g_row_prefetch[elem_i]
-                    gate = _fast_exp(g_last - g_row)
-                    gate_elems.append(in_bounds.select(gate, fx.Float32(0.0)))
-                gate_vec = fx.Vector.from_elements(gate_elems, dtype=fx.Float32)
+                    gate = _fast_exp(g_last - g_row_prefetch[elem_i])
+                    gate_elems.append(frag_row_ok[elem_i].select(gate, fx.Float32(0.0)))
+            else:
+                # Ungated: the "gate" degenerates to the bare padding mask.
+                gate_elems = [
+                    frag_row_ok[elem_i].select(fx.Float32(1.0), fx.Float32(0.0))
+                    for elem_i in range_constexpr(4)
+                ]
 
-                for nr in range_constexpr(N_REPEAT):
-                    vn_frags[nr] = vn_frags[nr] * gate_vec
+            gate_vec = fx.Vector.from_elements(gate_elems, dtype=fx.Float32)
+            for nr in range_constexpr(N_REPEAT):
+                vn_frags[nr] = vn_frags[nr] * gate_vec
 
+            if const_expr(USE_G):
                 # Wrap raw ArithValue in fx.Float32 so fx.full's broadcast
                 # accepts it (filled() requires a Numeric or Python scalar).
                 exp_g_last_vec = fx.full(4, fx.Float32(exp_g_last), fx.Float32)
