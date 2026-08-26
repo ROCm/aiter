@@ -615,17 +615,17 @@ def _grouped_a8w4_tdm_moe(
         num_valid_routes=_ep_nvr,
     )
 
-    # Fuse gemm1 silu/swiglu + fp8 quantization + scale preshuffle into the
-    # kernel epilogue (a8w4 only), eliminating the standalone
+    # Fuse gemm1 activation + MX quantization + scale preshuffle into the
+    # kernel epilogue, eliminating the standalone
     # flydsl_moe_fused_quant_preshuffle call between gemm1 and gemm2.
-    _fuse_quant = (not _is_fp4) and (_b1 is None)
+    _fuse_quant = _b1 is None
     w1_u8 = _grouped_weight_uint8(w1)
     w1s_i32 = w1_scale.reshape(-1).view(torch.int32)
 
     if _fuse_quant:
-        # Pre-allocate fp8 payload + preshuffled e8m0 scale for gemm1 output.
+        # Pre-allocate MX payload + preshuffled e8m0 scale for gemm1 output.
         # These are written directly by the kernel's fused quant epilogue.
-        payload_bytes = inter_dim  # fp8: 1 byte per element
+        payload_bytes = inter_dim // 2 if _is_fp4 else inter_dim
         scale_bytes = inter_dim // 32  # one e8m0 byte per 32-element MX block
         a2_payload = torch.empty(
             (1, contiguous_m, payload_bytes), dtype=torch.uint8, device=device

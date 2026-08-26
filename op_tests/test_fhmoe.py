@@ -5,7 +5,7 @@
 
 The default case is deliberately small. Set AITER_HETERO_MOE_DSV4=1 to use
 the exact DeepSeek-V4-Pro TP8 dimensions; that profile allocates several GiB.
-Set AITER_HETERO_MOE_FULL_SWEEP=1 to cover M=4,8,16,32,64 and
+Set AITER_HETERO_MOE_FULL_SWEEP=1 to cover M=1,4,8,16,24,32,40,64 and
 AITER_HETERO_MOE_STRESS_REPEATS=500 to stress both stage-2 epilogues and
 bound the default atomic path's run-to-run variation.
 """
@@ -80,13 +80,13 @@ class _Weights:
 
 def _profile() -> _Profile:
     if os.environ.get("AITER_HETERO_MOE_DSV4", "0") == "1":
-        return _Profile(7168, 512, 384, 385, 6)
+        return _Profile(7168, 384, 384, 385, 6)
     return _Profile(256, 128, 128, 9, 2)
 
 
 def _m_values() -> list[int]:
     if os.environ.get("AITER_HETERO_MOE_FULL_SWEEP", "0") == "1":
-        return [4, 8, 16, 32, 64]
+        return [1, 4, 8, 16, 24, 32, 40, 64]
     return [4]
 
 
@@ -900,23 +900,406 @@ def test_fhmoe_runtime_compile_bridge_forwards_xcd(monkeypatch: pytest.MonkeyPat
     ]
 
 
-def test_fhmoe_aot_jobs_preserve_xcd_swizzling():
-    from aiter.aot.flydsl.moe import parse_csv
-    from aiter.ops.flydsl.moe_kernels import get_flydsl_kernel_params
+def _mock_dsv4_i384_fhmoe_metadata(monkeypatch: pytest.MonkeyPatch):
+    import importlib
 
-    csv_path = (
+    fused_moe_module = importlib.import_module("aiter.fused_moe")
+    monkeypatch.setattr(fused_moe_module, "get_cu_num", lambda: 256)
+    monkeypatch.setattr(fused_moe_module, "get_gfx_runtime", lambda: "gfx950")
+    monkeypatch.setattr(fused_moe_module, "is_flydsl_available", lambda: True)
+    monkeypatch.delenv("AITER_BYPASS_TUNE_CONFIG", raising=False)
+    fused_moe_module.get_2stage_cfgs.cache_clear()
+    fused_moe_module.cfg_2stages_by_file.clear()
+    return fused_moe_module
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected"),
+    (
+        ({}, True),
+        ({"token_num": 2048}, True),
+        ({"token_num": 0}, False),
+        ({"token_num": 2049}, False),
+        ({"model_dim": 7169}, False),
+        ({"inter_dim": 512}, False),
+        ({"experts": 384}, False),
+        ({"topk": 6}, False),
+        ({"hidden_pad": 128}, False),
+        ({"intermediate_pad": 128}, False),
+        ({"gate_mode": GateMode.SEPARATED}, False),
+        ({"doweight_stage1": True}, False),
+    ),
+)
+def test_dsv4_i384_fhmoe_config_scope(
+    monkeypatch: pytest.MonkeyPatch, overrides, expected
+):
+    from aiter.fhmoe import _uses_dsv4_fhmoe_config
+
+    _mock_dsv4_i384_fhmoe_metadata(monkeypatch)
+    args = {
+        "token_num": 1,
+        "model_dim": 7168,
+        "inter_dim": 384,
+        "experts": 385,
+        "topk": 7,
+        "hidden_pad": 0,
+        "intermediate_pad": 0,
+        "gate_mode": GateMode.INTERLEAVE,
+        "doweight_stage1": False,
+    }
+    args.update(overrides)
+
+    assert _uses_dsv4_fhmoe_config(**args) is expected
+
+
+@pytest.mark.parametrize(
+    ("max_tokens", "expected"),
+    (
+        (0, False),
+        (1, True),
+        (1536, True),
+        (2048, True),
+        (2049, False),
+        (True, False),
+    ),
+)
+def test_dsv4_i384_fhmoe_capability(
+    monkeypatch: pytest.MonkeyPatch, max_tokens, expected
+):
+    from aiter.fhmoe import supports_dsv4_i384_fhmoe
+
+    _mock_dsv4_i384_fhmoe_metadata(monkeypatch)
+    assert supports_dsv4_i384_fhmoe(max_tokens) is expected
+
+
+def test_dsv4_i384_fhmoe_capability_follows_csv(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    import csv
+    import importlib
+
+    fhmoe = importlib.import_module("aiter.fhmoe")
+    _mock_dsv4_i384_fhmoe_metadata(monkeypatch)
+    config_path = Path(__file__).resolve().parents[1] / "aiter/configs/tuned_fhmoe.csv"
+    with config_path.open(newline="") as config:
+        reader = csv.DictReader(config)
+        rows = list(reader)
+        assert reader.fieldnames is not None
+        fieldnames = reader.fieldnames
+
+    row_4096 = dict(rows[-1])
+    row_4096["token"] = "4096"
+    complete_path = tmp_path / "complete.csv"
+    with complete_path.open("w", newline="") as config:
+        writer = csv.DictWriter(config, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows([*rows, row_4096])
+
+    monkeypatch.setattr(
+        fhmoe, "_dsv4_i384_fhmoe_config_file", lambda: str(complete_path)
+    )
+    assert fhmoe.supports_dsv4_i384_fhmoe(2049)
+    assert fhmoe.supports_dsv4_i384_fhmoe(4096)
+
+    gap_path = tmp_path / "gap.csv"
+    with gap_path.open("w", newline="") as config:
+        writer = csv.DictWriter(config, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows([row for row in [*rows, row_4096] if row["token"] != "16"])
+    monkeypatch.setattr(fhmoe, "_dsv4_i384_fhmoe_config_file", lambda: str(gap_path))
+    assert not fhmoe.supports_dsv4_i384_fhmoe(2048)
+    assert not fhmoe.supports_dsv4_i384_fhmoe(4096)
+
+    duplicate_path = tmp_path / "duplicate.csv"
+    with duplicate_path.open("w", newline="") as config:
+        writer = csv.DictWriter(config, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows([*rows, rows[-1]])
+    monkeypatch.setattr(
+        fhmoe, "_dsv4_i384_fhmoe_config_file", lambda: str(duplicate_path)
+    )
+    assert not fhmoe.supports_dsv4_i384_fhmoe(2048)
+
+    invalid_path = tmp_path / "invalid.csv"
+    invalid_rows = [dict(row) for row in rows]
+    invalid_rows[4]["kernelName1"] = "flydsl_moe1_invalid"
+    with invalid_path.open("w", newline="") as config:
+        writer = csv.DictWriter(config, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(invalid_rows)
+    monkeypatch.setattr(
+        fhmoe, "_dsv4_i384_fhmoe_config_file", lambda: str(invalid_path)
+    )
+    assert not fhmoe.supports_dsv4_i384_fhmoe(2048)
+
+
+def test_dsv4_i384_fhmoe_capability_fails_closed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    import importlib
+
+    fhmoe = importlib.import_module("aiter.fhmoe")
+    _mock_dsv4_i384_fhmoe_metadata(monkeypatch)
+    monkeypatch.setattr(
+        fhmoe,
+        "_dsv4_i384_fhmoe_config_file",
+        lambda: str(tmp_path / "missing.csv"),
+    )
+    assert not fhmoe.supports_dsv4_i384_fhmoe(1)
+
+
+@pytest.mark.parametrize("bypass", ("1", "2", "invalid"))
+def test_dsv4_i384_fhmoe_capability_rejects_config_bypass(
+    monkeypatch: pytest.MonkeyPatch, bypass: str
+):
+    import importlib
+
+    fhmoe = importlib.import_module("aiter.fhmoe")
+    config_path = Path(__file__).resolve().parents[1] / "aiter/configs/tuned_fhmoe.csv"
+    monkeypatch.setattr(fhmoe, "_dsv4_i384_fhmoe_config_file", lambda: str(config_path))
+    monkeypatch.setenv("AITER_BYPASS_TUNE_CONFIG", bypass)
+    assert not fhmoe.supports_dsv4_i384_fhmoe(1)
+
+
+@pytest.mark.parametrize(
+    ("num_tokens", "expected_stage1", "expected_stage2"),
+    (
+        (
+            1,
+            "flydsl_moe1_afp8_wfp4_bf16_t32x64x256_w4_gui_kw4_fp8",
+            "flydsl_moe2_afp8_wfp4_bf16_t32x256x128_atomic",
+        ),
+        (
+            16,
+            "flydsl_moe1_afp8_wfp4_bf16_t32x128x256_w2_gui_fp8",
+            "flydsl_moe2_afp8_wfp4_bf16_t32x128x128_atomic_bnt2",
+        ),
+        (
+            1536,
+            "flydsl_moe1_afp8_wfp4_bf16_t64x128x256_w3_bnt0_gui",
+            "flydsl_moe2_afp8_wfp4_bf16_t64x128x128_atomic",
+        ),
+        (
+            2048,
+            "flydsl_moe1_afp8_wfp4_bf16_t64x128x256_w3_bnt0_gui",
+            "flydsl_moe2_afp8_wfp4_bf16_t64x128x128_atomic",
+        ),
+    ),
+)
+def test_dsv4_i384_fhmoe_uses_dedicated_config(
+    monkeypatch: pytest.MonkeyPatch,
+    num_tokens: int,
+    expected_stage1: str,
+    expected_stage2: str,
+):
+    import importlib
+
+    fused_moe_module = importlib.import_module("aiter.fused_moe")
+
+    config_path = Path(__file__).resolve().parents[1] / "aiter/configs/tuned_fhmoe.csv"
+    monkeypatch.setattr(fused_moe_module, "get_cu_num", lambda: 256)
+    monkeypatch.setattr(fused_moe_module, "get_gfx_runtime", lambda: "gfx950")
+    monkeypatch.setattr(fused_moe_module, "is_flydsl_available", lambda: True)
+    fused_moe_module.get_2stage_cfgs.cache_clear()
+    fused_moe_module.cfg_2stages_by_file.clear()
+
+    metadata = fused_moe_module.get_2stage_cfgs(
+        fused_moe_module.get_padded_M(num_tokens),
+        7168,
+        384,
+        385,
+        7,
+        torch.bfloat16,
+        dtypes.fp8,
+        dtypes.fp4x2,
+        aiter.QuantType.per_1x32,
+        True,
+        aiter.ActivationType.Silu,
+        False,
+        0,
+        0,
+        True,
+        GateMode.INTERLEAVE,
+        config_file=str(config_path),
+    )
+
+    assert metadata.stage1.keywords["kernelName"] == expected_stage1
+    assert metadata.stage2.keywords["kernelName"] == expected_stage2
+
+
+@pytest.mark.parametrize("num_tokens", (768, 2049))
+def test_dsv4_i384_fhmoe_config_requires_exact_bucket(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    num_tokens: int,
+):
+    import csv
+    import importlib
+
+    fused_moe_module = importlib.import_module("aiter.fused_moe")
+    source_path = Path(__file__).resolve().parents[1] / "aiter/configs/tuned_fhmoe.csv"
+    with source_path.open(newline="") as config:
+        reader = csv.DictReader(config)
+        rows = list(reader)
+        assert reader.fieldnames is not None
+        fieldnames = reader.fieldnames
+
+    missing_token = str(fused_moe_module.get_padded_M(num_tokens))
+    config_path = tmp_path / f"missing_{missing_token}.csv"
+    with config_path.open("w", newline="") as config:
+        writer = csv.DictWriter(config, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(row for row in rows if row["token"] != missing_token)
+
+    monkeypatch.setattr(fused_moe_module, "get_cu_num", lambda: 256)
+    monkeypatch.setattr(fused_moe_module, "get_gfx_runtime", lambda: "gfx950")
+    monkeypatch.setattr(fused_moe_module, "is_flydsl_available", lambda: True)
+    monkeypatch.setenv("AITER_ONLINE_TUNE", "1")
+    fused_moe_module.get_2stage_cfgs.cache_clear()
+    fused_moe_module.cfg_2stages_by_file.clear()
+
+    with pytest.raises(NotImplementedError, match="requires an exact tuned config"):
+        fused_moe_module.get_2stage_cfgs(
+            fused_moe_module.get_padded_M(num_tokens),
+            7168,
+            384,
+            385,
+            7,
+            torch.bfloat16,
+            dtypes.fp8,
+            dtypes.fp4x2,
+            aiter.QuantType.per_1x32,
+            True,
+            aiter.ActivationType.Silu,
+            False,
+            0,
+            0,
+            True,
+            GateMode.INTERLEAVE,
+            config_file=str(config_path),
+        )
+
+
+def test_dsv4_i384_fhmoe_config_has_true_shapes():
+    import csv
+
+    config_path = Path(__file__).resolve().parents[1] / "aiter/configs/tuned_fhmoe.csv"
+    ordinary_path = (
         Path(__file__).resolve().parents[1]
         / "aiter/configs/model_configs/dsv4_fp8fp4_tuned_fmoe.csv"
     )
-    jobs = parse_csv(str(csv_path))
-    fhmoe_jobs = [job for job in jobs if job.get("shared_expert_id", -1) >= 0]
+    with config_path.open(newline="") as f:
+        rows = list(csv.DictReader(f))
+    with ordinary_path.open(newline="") as f:
+        ordinary_rows = list(csv.DictReader(f))
 
-    assert len(fhmoe_jobs) == 32
-    assert any(job.get("xcd_swizzle", 0) > 0 for job in fhmoe_jobs)
-    for job in fhmoe_jobs:
+    assert {int(row["token"]) for row in rows} == {
+        1,
+        2,
+        4,
+        8,
+        16,
+        32,
+        64,
+        128,
+        256,
+        512,
+        1024,
+        2048,
+    }
+    assert all(int(row["inter_dim"]) == 384 for row in rows)
+    assert all(int(row["shared_expert_id"]) == 384 for row in rows)
+    assert all(int(row["hidden_pad"]) == 0 for row in rows)
+    assert all(int(row["intermediate_pad"]) == 0 for row in rows)
+    assert all(row["gate_mode"] == "GateMode.INTERLEAVE" for row in rows)
+    assert all(row["kernelName1"].startswith("flydsl_") for row in rows)
+    assert all(row["kernelName2"].startswith("flydsl_") for row in rows)
+
+    ordinary_m16 = next(
+        row
+        for row in ordinary_rows
+        if int(row["token"]) == 16
+        and int(row["inter_dim"]) == 384
+        and int(row["expert"]) == 385
+        and int(row["topk"]) == 7
+    )
+    assert ordinary_m16["kernelName2"].startswith("opus_")
+
+
+def test_fhmoe_aot_manifest_covers_native_i384():
+    from aiter.aot.flydsl.moe import parse_csv
+    from aiter.ops.flydsl.moe_kernels import get_flydsl_kernel_params
+
+    ordinary_path = (
+        Path(__file__).resolve().parents[1]
+        / "aiter/configs/model_configs/dsv4_fp8fp4_tuned_fmoe.csv"
+    )
+    config_path = Path(__file__).resolve().parents[1] / "aiter/configs/tuned_fhmoe.csv"
+    ordinary_jobs = parse_csv(str(ordinary_path))
+    dedicated_jobs = parse_csv(str(config_path))
+    ordinary_fhmoe_jobs = [
+        job for job in ordinary_jobs if job.get("shared_expert_id", -1) >= 0
+    ]
+
+    assert not ordinary_fhmoe_jobs
+    assert len(dedicated_jobs) == 24
+    assert all(job["inter_dim"] == 384 for job in dedicated_jobs)
+    assert all(job["shared_expert_id"] == 384 for job in dedicated_jobs)
+    assert all(not job.get("enable_bias", False) for job in dedicated_jobs)
+    assert {job["token_num"] for job in dedicated_jobs} == {
+        1,
+        2,
+        4,
+        8,
+        16,
+        32,
+        64,
+        128,
+        256,
+        512,
+        1024,
+        2048,
+    }
+    for job in dedicated_jobs:
         params = get_flydsl_kernel_params(job["kernel_name"])
         assert params is not None
         assert job.get("xcd_swizzle", 0) == params.get("xcd_swizzle", 0)
+        if job["stage"] == 1:
+            assert 384 % job["tile_n"] == 0
+        else:
+            assert 384 % job["tile_k"] == 0
+
+    m2048_names = {
+        job["kernel_name"] for job in dedicated_jobs if job["token_num"] == 2048
+    }
+    assert m2048_names == {
+        "flydsl_moe1_afp8_wfp4_bf16_t64x128x256_w3_bnt0_gui",
+        "flydsl_moe2_afp8_wfp4_bf16_t64x128x128_atomic",
+    }
+
+
+def test_fhmoe_aot_precompile_keeps_native_i384(monkeypatch: pytest.MonkeyPatch):
+    from aiter.aot.flydsl import fhmoe as aot_fhmoe
+    from aiter.aot.flydsl import moe as aot_moe
+
+    forwarded = {}
+
+    def precompile(**kwargs):
+        forwarded.update(kwargs)
+
+    monkeypatch.setattr(aot_moe, "_precompile_to_cache", precompile)
+    aot_fhmoe.precompile_fhmoe_to_cache(
+        experts=385,
+        shared_expert_id=384,
+        cu_num=256,
+        stage=2,
+        model_dim=7168,
+        inter_dim=384,
+        topk=7,
+    )
+
+    assert forwarded["inter_dim"] == 384
+    assert forwarded["_aot_backend"].shared_expert_id == 384
 
 
 def test_fhmoe_aot_stage1_forwards_optional_swiglu_abi(

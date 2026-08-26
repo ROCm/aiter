@@ -356,6 +356,7 @@ def get_edge_case_shapes():
 
 
 def run_edge_cases(suite: TestSuite, activation: str = "none", method: str = "default"):
+    torch.manual_seed(0)
     for (
         N,
         C,
@@ -392,6 +393,7 @@ def run_edge_cases(suite: TestSuite, activation: str = "none", method: str = "de
 def run_activations(
     suite: TestSuite, method: str = "default", activation: str = "relu"
 ):
+    torch.manual_seed(0)
     N, C, H, W, K_out = 2, 32, 16, 16, 64
     R, S = 3, 3
     stride, padding, dilation = (1, 1), (1, 1), (1, 1)
@@ -413,6 +415,7 @@ def run_activations(
 
 
 def run_no_bias(suite: TestSuite, method: str = "default"):
+    torch.manual_seed(0)
     shapes = [
         (1, 64, 8, 8, 128, 1, 1, (1, 1), (0, 0), (1, 1), "1x1 no bias"),
         (2, 32, 16, 16, 64, 3, 3, (1, 1), (1, 1), (1, 1), "3x3 no bias"),
@@ -442,6 +445,7 @@ def run_cross_method(suite: TestSuite):
     cross-kernel equivalence: if kernel A and B both match the same
     F.conv2d output within tolerance, they match each other within ~2x.
     """
+    torch.manual_seed(0)
     for N, C, H, W, K_out, R, S, stride, padding, dilation, desc in COMMON_SHAPES:
         x = torch.randn((N, C, H, W), device=suite.device, dtype=suite.dtype)
         w = torch.randn((K_out, C, R, S), device=suite.device, dtype=suite.dtype)
@@ -472,6 +476,7 @@ def run_random_fuzzing(
     for ad-hoc development sweeps.
     """
     random.seed(seed)
+    torch.manual_seed(seed)
     for i in range(num_tests):
         N = random.randint(1, 8)
         C = random.choice([1, 3, 16, 32, 64, 128, 256])
