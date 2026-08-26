@@ -54,6 +54,7 @@ def copy_row(source_rsrc, destination_rsrc, lane, *, safe_end_i32, n_i32):
             buffer_ops.buffer_store(value, destination_rsrc, column)
 
 
+@flyc.jit
 def emit_ticket_and_roles(*, tid, lds_scratch, a_entry_count, a_epoch_gate,
         epoch_slot, launch_grid_x, producer_blocks):
     """Take this CTA's launch ticket and derive its role for the round.
@@ -84,6 +85,7 @@ def emit_ticket_and_roles(*, tid, lds_scratch, a_entry_count, a_epoch_gate,
     return gate_addr, gate_epoch, is_owner, is_producer, producer_slot
 
 
+@flyc.jit
 def emit_epoch_rendezvous(*, tid, is_owner, parity_rsrc, expected_rsrc,
         p_launch_ready, a_launch_ready, a_reset_counters, reset_count,
         gate_addr, gate_epoch, npes, rank):

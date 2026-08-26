@@ -30,9 +30,6 @@ from .gemm_util import _buffer_load, _make_buffer_from_addr
 # ``copy_row`` carries its own ``@flyc.jit``; the two ``emit_*`` helpers do not,
 # so their ``if <device value>:`` statements would reach Python's ``__bool__``
 # instead of being rewritten into device branches. Wrapping applies the same AST
-# rewrite the decorator would, without editing collective_sched.py.
-emit_ticket_and_roles = flyc.jit(emit_ticket_and_roles)
-emit_epoch_rendezvous = flyc.jit(emit_epoch_rendezvous)
 
 _SUPPORTED_TP = (4, 8)
 _RESET_COUNTERS = 1  # push_done

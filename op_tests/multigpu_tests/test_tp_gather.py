@@ -205,10 +205,17 @@ def case_repeat():
 def case_skew():
     """A slow rank must not corrupt a fast rank's buffer.
 
-    Rank 0 sleeps before each call so the ranks enter the kernel far apart. The
-    launch_ready handshake plus double buffering is what makes this safe; with
-    either removed, a fast rank's round N+1 push lands in a buffer a slow rank
-    is still reading from round N.
+    Rank 0 sleeps before each gather so the ranks enter the kernel far apart.
+    The launch_ready handshake plus double buffering is what makes this safe:
+    without them a fast rank's round N+1 push lands in a buffer a slow rank is
+    still reading from round N.
+
+    The NCCL reference gathers are computed UP FRONT, outside the skewed loop.
+    An earlier version called _nccl_gather() inside the loop right before
+    g.gather(), which silently defeated the whole test -- a collective is a full
+    barrier across all 8 ranks, so it erased the skew the sleep had just created
+    and the push always ran with the ranks in lockstep. With that version, three
+    consecutive runs with the handshake deleted still passed.
     """
     import time
 
@@ -221,21 +228,29 @@ def case_skew():
             max_tok_per_rank=128,
             device=device,
         )
-        for it in range(6):
-            if rank == 0:
-                time.sleep(0.05)
-            m_local = 64
+        iters, m_local = 6, 64
+        inputs, refs = [], []
+        for it in range(iters):
             x = _make_x(m_local, device, 7000 + rank * 11 + it)
             x_q, x_s = per_1x32_mx_quant(x, quant_mode="fp8")
-            want_x = _nccl_gather(x_q, world)
+            inputs.append((x_q, x_s))
+            refs.append(_u8(_nccl_gather(x_q, world)).clone())
+        dist.barrier()
+        torch.cuda.synchronize()
+
+        # From here on: no collectives, so the sleep actually skews the ranks.
+        for it in range(iters):
+            if rank == 0:
+                time.sleep(0.05)
+            x_q, x_s = inputs[it]
             got_x, _ = g.gather(x_q, x_s)
             torch.cuda.synchronize()
-            bad = int((_u8(got_x) != _u8(want_x)).sum())
+            bad = int((_u8(got_x) != refs[it]).sum())
             assert (
                 bad == 0
             ), f"iteration {it} rank {rank}: {bad} bytes differ under skew"
         if rank == 0:
-            print("case_skew OK (6 iterations, rank 0 delayed 50ms)")
+            print(f"case_skew OK ({iters} iterations, rank 0 delayed 50ms each)")
     finally:
         _teardown()
 
