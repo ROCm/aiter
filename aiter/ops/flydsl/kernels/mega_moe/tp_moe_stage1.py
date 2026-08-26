@@ -79,6 +79,7 @@ class TPMoEStage1:
         swiglu_limit: float = 0.0,
         stage1_kernel_name: str = _DEFAULT_STAGE1_KERNEL,
         transport: str = _TRANSPORT_NCCL,
+        max_tok_per_rank: int | None = None,
     ):
         self.group = group
         if (tp_size is None) != (tp_rank is None):
@@ -176,6 +177,37 @@ class TPMoEStage1:
             )
         self.w1 = w1
         self.w1_scale = w1_scale
+
+        # The fused path's symmetric receive buffers are a collective allocation:
+        # every rank must make it with identical arguments, at the same point in
+        # the program. Building it here rather than on the first forward_fused
+        # call turns a mismatched max_tok_per_rank into a construction error
+        # instead of a hang deep inside Mori.
+        self.max_tok_per_rank = (
+            None if max_tok_per_rank is None else int(max_tok_per_rank)
+        )
+        self._fused = None
+        if self.max_tok_per_rank is not None:
+            from .tp_fused_stage1 import TPFusedStage1Runner
+            from .tp_gather import TPActivationGather
+
+            gather = TPActivationGather(
+                model_dim=self.model_dim,
+                tp_size=self.tp_size,
+                tp_rank=self.tp_rank,
+                max_tok_per_rank=self.max_tok_per_rank,
+                device=self.device,
+            )
+            self._fused = TPFusedStage1Runner(
+                gather=gather,
+                w=self.w1,
+                w_scale=self.w1_scale,
+                model_dim=self.model_dim,
+                inter_dim=self.inter_dim,
+                experts=self.experts,
+                sort_block_m=self.sort_block_m,
+                swiglu_limit=self.swiglu_limit,
+            )
 
     def m_logical_for(self, m_local: int) -> int:
         return self.tp_size * int(m_local)
@@ -342,6 +374,57 @@ class TPMoEStage1:
         )
         payload, scale = self._run_gemm1(
             a_fp8, a_scale_sorted, sorted_ids, sorted_expert_ids, num_valid_ids
+        )
+        return self._pack(
+            payload,
+            scale,
+            sorted_ids,
+            sorted_weights,
+            sorted_expert_ids,
+            num_valid_ids,
+            m_global,
+        )
+
+    def _run_fused(
+        self, x_q, x_scale, sorted_ids, sorted_expert_ids, num_valid_ids, m_local
+    ):
+        if self._fused is None:
+            raise RuntimeError(
+                "forward_fused needs the symmetric receive buffers; construct "
+                "TPMoEStage1 with max_tok_per_rank=<max m_local> (a collective "
+                "allocation, so every rank must pass the same value)"
+            )
+        sbm = self.sort_block_m
+        max_sorted = -(-int(sorted_ids.shape[0]) // sbm) * sbm
+        return self._fused.run(
+            x_q=x_q,
+            x_scale=x_scale,
+            sorted_token_ids=sorted_ids,
+            expert_ids=sorted_expert_ids,
+            num_valid_ids=num_valid_ids,
+            max_sorted=max_sorted,
+        )
+
+    def forward_fused(self, x_bf16, route_weights, topk_ids) -> "TPMoEStage1Output":
+        """Fused entry: local quant, one metadata collective, sort, then one kernel."""
+        m_local = self._validate_call(x_bf16, route_weights, topk_ids, torch.bfloat16)
+        m_global = self.m_logical_for(m_local)
+        x_q, x_scale = self.quantize(x_bf16)
+        # topk_ids and route_weights have the same shape; ship them as one int32
+        # buffer so the metadata costs one collective instead of two.
+        meta = torch.empty(
+            (m_local, 2 * self.topk), dtype=torch.int32, device=self.device
+        )
+        meta[:, : self.topk] = topk_ids
+        meta[:, self.topk :] = route_weights.view(torch.int32)
+        meta_g = self._all_gather_one(meta)
+        ids_g = meta_g[:, : self.topk].contiguous()
+        wts_g = meta_g[:, self.topk :].contiguous().view(torch.float32)
+        sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids = self._sort(
+            ids_g, wts_g
+        )
+        payload, scale = self._run_fused(
+            x_q, x_scale, sorted_ids, sorted_expert_ids, num_valid_ids, m_local
         )
         return self._pack(
             payload,
