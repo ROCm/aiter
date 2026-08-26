@@ -11,7 +11,23 @@ import os
 import sys
 
 import mori.shmem as ms
-import torch
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+
+# FlyDSL's disk-cache key walks *functions* reachable from the launcher; it never
+# reads the source of a class, so editing ATileLoader / TPATileLoader / any other
+# loader leaves the key unchanged and the stale binary is reused. That would make
+# the negative controls below pass while testing nothing. Fingerprinting the whole
+# mega_moe package restores the dependency. Must precede the flydsl import.
+_MEGA_MOE_DIR = os.path.normpath(
+    os.path.join(_HERE, "..", "..", "aiter", "ops", "flydsl", "kernels", "mega_moe")
+)
+_extra = os.environ.get("FLYDSL_EXTRA_SOURCE_DIRS", "")
+os.environ["FLYDSL_EXTRA_SOURCE_DIRS"] = (
+    f"{_extra}:{_MEGA_MOE_DIR}" if _extra else _MEGA_MOE_DIR
+)
+
+import torch  # noqa: E402
 import torch.distributed as dist
 
 from aiter.ops.flydsl.kernels.mega_moe.quant import per_1x32_mx_quant
