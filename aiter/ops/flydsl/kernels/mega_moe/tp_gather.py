@@ -24,7 +24,7 @@ import mori.shmem as ms
 from .. import buffer_ops
 from .. import communication_ops_utils as comm_ops
 from ..tensor_shim import _run_compiled
-from .collective_sched import copy_row, emit_epoch_rendezvous, emit_ticket_and_roles
+from .collective_sched import copy_row, emit_launch_rendezvous, emit_ticket_and_roles
 from .gemm_util import _buffer_load, _make_buffer_from_addr
 
 # ``copy_row`` carries its own ``@flyc.jit``; the two ``emit_*`` helpers do not,
@@ -105,33 +105,27 @@ def compile_tp_gather(*, model_dim: int, npes: int, rank: int, producer_blocks: 
         addr_p2p_rx_x: fx.Int64, addr_p2p_rx_scale: fx.Int64,
         addr_p2p_payload_ready: fx.Int64, addr_p2p_launch_ready: fx.Int64,
         addr_payload_ready: fx.Int64, addr_launch_ready: fx.Int64,
-        addr_parity: fx.Int64, addr_expected: fx.Int64,
         addr_epoch_gate: fx.Int64, addr_entry_count: fx.Int64,
         addr_reset: fx.Int64,
         m_local: fx.Int32, x_slab_bytes: fx.Int32, scale_slab_bytes: fx.Int32,
+        parity: fx.Int32, expected: fx.Int32, launch_epoch: fx.Int32,
     ):
         tid = fx.thread_idx.x
         lane = tid & fx.Int32(63)
         warp = tid // fx.Int32(64)
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
 
-        parity_rsrc = _make_buffer_from_addr(addr_parity, fx.Int32)
-        expected_rsrc = _make_buffer_from_addr(addr_expected, fx.Int32)
-
         gate_addr, gate_epoch, is_owner, is_producer, producer_slot = emit_ticket_and_roles(
             tid=tid, lds_scratch=lds.scratch, a_entry_count=addr_entry_count,
             a_epoch_gate=addr_epoch_gate, epoch_slot=EPOCH_SLOT,
             launch_grid_x=LAUNCH_GRID_X, producer_blocks=producer_blocks)
 
-        emit_epoch_rendezvous(
-            tid=tid, is_owner=is_owner, parity_rsrc=parity_rsrc,
-            expected_rsrc=expected_rsrc, p_launch_ready=addr_p2p_launch_ready,
+        emit_launch_rendezvous(
+            tid=tid, is_owner=is_owner, p_launch_ready=addr_p2p_launch_ready,
             a_launch_ready=addr_launch_ready, a_reset_counters=addr_reset,
             reset_count=1, gate_addr=gate_addr, gate_epoch=gate_epoch,
-            npes=npes, rank=rank)
+            launch_epoch=launch_epoch, npes=npes, rank=rank)
 
-        parity = _buffer_load(parity_rsrc, fx.Int32(0), fx.Int32, cache_modifier=1)
-        expected = _buffer_load(expected_rsrc, parity, fx.Int32, cache_modifier=1)
         if const_expr(slots == 1):
             slab = fx.Int32(0)
         else:
@@ -162,8 +156,8 @@ def compile_tp_gather(*, model_dim: int, npes: int, rank: int, producer_blocks: 
             fx.rocdl.s_waitcnt(0)
             fx.barrier()
             # Last producer block on this rank publishes once to every peer, so
-            # payload_ready advances by exactly npes per launch and the expected
-            # step in emit_epoch_rendezvous stays npes.
+            # payload_ready advances by exactly npes per launch, which is the
+            # step the host's _expected_for() assumes.
             if tid == fx.Int32(0):
                 comm_ops.fence_system_release()
                 done = fx.Int32(comm_ops.atomic_add_agent(addr_reset, fx.Int32(1)))
@@ -186,16 +180,17 @@ def compile_tp_gather(*, model_dim: int, npes: int, rank: int, producer_blocks: 
         addr_p2p_rx_x: fx.Int64, addr_p2p_rx_scale: fx.Int64,
         addr_p2p_payload_ready: fx.Int64, addr_p2p_launch_ready: fx.Int64,
         addr_payload_ready: fx.Int64, addr_launch_ready: fx.Int64,
-        addr_parity: fx.Int64, addr_expected: fx.Int64,
         addr_epoch_gate: fx.Int64, addr_entry_count: fx.Int64, addr_reset: fx.Int64,
         m_local: fx.Int32, x_slab_bytes: fx.Int32, scale_slab_bytes: fx.Int32,
+        parity: fx.Int32, expected: fx.Int32, launch_epoch: fx.Int32,
         stream: fx.Stream,
     ):
         kernel(
             addr_x_q, addr_x_scale, addr_p2p_rx_x, addr_p2p_rx_scale,
             addr_p2p_payload_ready, addr_p2p_launch_ready, addr_payload_ready,
-            addr_launch_ready, addr_parity, addr_expected, addr_epoch_gate,
+            addr_launch_ready, addr_epoch_gate,
             addr_entry_count, addr_reset, m_local, x_slab_bytes, scale_slab_bytes,
+            parity, expected, launch_epoch,
             value_attrs={
                 "rocdl.waves_per_eu": 2,
                 "rocdl.flat_work_group_size": f"{TOTAL_THREADS},{TOTAL_THREADS}",
@@ -316,9 +311,13 @@ class TPActivationGather:
             self.launch_ready, self.tp_rank, self.tp_size, dev
         )
 
+        # Round counter kept on the host: parity is deterministic (every rank
+        # calls the same number of times), so deriving it here avoids a
+        # GPU->CPU sync per call. Measured cost of that sync: ~15us, 13-26% of
+        # the gather.
+        self._round = 0
+
         # Local (non-symmetric) per-launch state.
-        self.epoch_parity = torch.zeros(1, dtype=torch.int32, device=dev)
-        self.epoch_expected = torch.zeros(2, dtype=torch.int32, device=dev)
         self.epoch_gate = torch.zeros(10, dtype=torch.int32, device=dev)
         self.entry_count = torch.zeros(10, dtype=torch.int64, device=dev)
         # One 64-byte cache line per counter, like MegaMoE's work_head.
@@ -362,8 +361,23 @@ class TPActivationGather:
         return m_local
 
     def current_parity(self):
-        """Parity the NEXT gather() will write. The kernel flips before pushing."""
-        return int(self.epoch_parity[0].item()) ^ 1 if self.slots == 2 else 0
+        """Parity the NEXT gather() will write. Host-derived, no device read."""
+        return (self._round % 2) if self.slots == 2 else 0
+
+    def _expected_for(self, parity):
+        """How many source-rank publishes payload_ready[parity] holds after this round.
+
+        With two slots a given parity is used every other round, so by the end
+        of round ``self._round`` it has been used ``(self._round - parity) // 2
+        + 1`` times. With a single slot parity is always 0 and the slot is used
+        every round, so the count is ``self._round + 1``. Each use adds exactly
+        ``tp_size`` publishes, one per source rank.
+        """
+        if self.slots == 1:
+            rounds = self._round + 1
+        else:
+            rounds = (self._round - parity) // 2 + 1
+        return rounds * self.tp_size
 
     def views(self, m_local, parity):
         """Views of the gathered result for a given round. Valid until the next gather."""
@@ -400,14 +414,16 @@ class TPActivationGather:
             fx.Int64(self.p2p_launch_ready.data_ptr()),
             fx.Int64(self.payload_ready.data_ptr()),
             fx.Int64(self.launch_ready.data_ptr()),
-            fx.Int64(self.epoch_parity.data_ptr()),
-            fx.Int64(self.epoch_expected.data_ptr()),
             fx.Int64(self.epoch_gate.data_ptr()),
             fx.Int64(self.entry_count.data_ptr()),
             fx.Int64(self.reset_counters.data_ptr()),
             fx.Int32(m_local),
             fx.Int32(self.slab_bytes("x")),
             fx.Int32(self.slab_bytes("scale")),
+            fx.Int32(parity),
+            fx.Int32(self._expected_for(parity)),
+            fx.Int32(self._round + 1),
             stream,
         )
+        self._round += 1
         return self.views(m_local, parity)

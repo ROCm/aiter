@@ -86,6 +86,48 @@ def emit_ticket_and_roles(*, tid, lds_scratch, a_entry_count, a_epoch_gate,
 
 
 @flyc.jit
+def emit_launch_rendezvous(*, tid, is_owner, p_launch_ready, a_launch_ready,
+        a_reset_counters, reset_count, gate_addr, gate_epoch, launch_epoch,
+        npes, rank):
+    """Rendezvous with every peer, reset per-launch counters, open the gate.
+
+    Same as emit_epoch_rendezvous minus the parity flip: the caller derives
+    parity and launch_epoch on the host, which removes a GPU->CPU sync from the
+    per-call path. The peer wait still does the real work -- it is what stops
+    rank A's round N+1 push from landing in a buffer rank B is still reading in
+    round N, because on a single stream B entering round N+1 means B's round-N
+    kernel retired.
+    """
+    if is_owner:
+        if tid < fx.Int32(npes):
+            peer = (tid + fx.Int32(rank)) % fx.Int32(npes)
+            comm_ops.fence_system_release()
+            launch_ready_table = _make_buffer_from_addr(p_launch_ready, fx.Int64)
+            remote_launch_ready = _buffer_load(launch_ready_table, peer, fx.Int64)
+            comm_ops.store_i32_system(remote_launch_ready, fx.Int32(rank), launch_epoch)
+            mori_shmem.int32_wait_until_greater_than(
+                a_launch_ready + fx.Int64(peer) * fx.Int64(4), launch_epoch - fx.Int32(1)
+            )
+            comm_ops.fence_system_acquire()
+        if tid == fx.Int32(0):
+            reset_rsrc = _make_buffer_from_addr(a_reset_counters, fx.Int32)
+            for slot in range_constexpr(reset_count):
+                _buffer_store(reset_rsrc, fx.Int32(slot * 16), fx.Int32(0), fx.Int32)
+        fx.rocdl.s_waitcnt(0)
+        fx.barrier()
+        if tid == fx.Int32(0):
+            comm_ops.fence_agent_release()
+            comm_ops.store_i32_system(gate_addr, fx.Int32(0), gate_epoch)
+        fx.rocdl.s_waitcnt(0)
+        fx.barrier()
+    else:
+        if tid == fx.Int32(0):
+            mori_shmem.int32_wait_until_equals(gate_addr, gate_epoch)
+            comm_ops.fence_agent_acquire()
+        fx.barrier()
+
+
+@flyc.jit
 def emit_epoch_rendezvous(*, tid, is_owner, parity_rsrc, expected_rsrc,
         p_launch_ready, a_launch_ready, a_reset_counters, reset_count,
         gate_addr, gate_epoch, npes, rank):
