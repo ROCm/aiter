@@ -149,13 +149,11 @@ def build_fmha_fwd_d72_module(
     ROWS_PER_WAVE = _ROWS_PER_WAVE
     M_REPEAT = ROWS_PER_WAVE // MFMA_M
     N_REPEAT = BLOCK_N // MFMA_N
-    K_STEPS_QK = HEAD_DIM_PAD // MFMA_K
     # hd=72 only needs ceil(72/16)=5 QK K-steps; the last pad-16 is Q=0.
     K_STEPS_QK_COMPUTE = (HEAD_DIM + MFMA_K - 1) // MFMA_K
     D_CHUNK = MFMA_N
     D_CHUNKS = HEAD_DIM_PAD // D_CHUNK
     C_ELEMS = 16
-    NUM_Q_ROWS = M_REPEAT
     NUM_O_ACCS = M_REPEAT * D_CHUNKS
     PV_K_STEPS = BLOCK_N // MFMA_K
     VEC = 8
@@ -466,9 +464,7 @@ def build_fmha_fwd_d72_module(
                 coop_dma_k_iter(base, tile_start, it, skip_tok)
 
         def coop_dma_v_iter(tile_start, it, v_lds, skip_tok=False):
-            coop_dma_kv_iter(
-                v_rsrc, v_lds, tile_start, it, v_elem, V_STRIDE, skip_tok
-            )
+            coop_dma_kv_iter(v_rsrc, v_lds, tile_start, it, v_elem, V_STRIDE, skip_tok)
 
         def coop_dma_v(tile_start, v_lds, skip_tok=False):
             for it in range_constexpr(NUM_V_ITERS):
@@ -589,9 +585,7 @@ def build_fmha_fwd_d72_module(
             return _p_to_pack8(ps), psum
 
         q_row = q_tile_start + wave_id * ROWS_PER_WAVE + lane32
-        q_valid = arith.cmpi(
-            arith.CmpIPredicate.ult, _raw(q_row), _raw(actual_q_len)
-        )
+        q_valid = arith.cmpi(arith.CmpIPredicate.ult, _raw(q_row), _raw(actual_q_len))
         first_full = arith.cmpi(
             arith.CmpIPredicate.uge, _raw(actual_kv_len), _raw(fx.Index(BLOCK_N))
         )
@@ -614,9 +608,7 @@ def build_fmha_fwd_d72_module(
         ):
             m_running = inner_iter_args[0]
             l_running = inner_iter_args[1]
-            o_accs = [
-                inner_iter_args[2 + i] for i in range_constexpr(NUM_O_ACCS)
-            ]
+            o_accs = [inner_iter_args[2 + i] for i in range_constexpr(NUM_O_ACCS)]
 
             v_lds = lds_v
             kv_i = fx.Int32(kv_block_start) // fx.Int32(BLOCK_N)
@@ -636,17 +628,12 @@ def build_fmha_fwd_d72_module(
             s_accs = [_raw(c_zero_v16f32) for _ in range(N_REPEAT)]
             _setprio(1)
             for ks in range_constexpr(K_STEPS_QK_COMPUTE):
-                if const_expr(ks < NUM_V_ITERS):
-                    if is_first:
-                        if first_full:
-                            coop_dma_v_iter(
-                                kv_block_start, ks, v_lds, skip_tok=True
-                            )
-                        else:
-                            coop_dma_v_iter(
-                                kv_block_start, ks, v_lds, skip_tok=False
-                            )
-                        rocdl.sched_vmem(1)
+                if const_expr(ks < NUM_V_ITERS) and is_first:
+                    if first_full:
+                        coop_dma_v_iter(kv_block_start, ks, v_lds, skip_tok=True)
+                    else:
+                        coop_dma_v_iter(kv_block_start, ks, v_lds, skip_tok=False)
+                    rocdl.sched_vmem(1)
                 q_pack = q_frags[ks]
                 k_pack = load_k_frag(0, ks, k_lds)
                 for ni in range_constexpr(N_REPEAT):
@@ -662,23 +649,22 @@ def build_fmha_fwd_d72_module(
                         k_pack = k_nxt
                 rocdl.sched_mfma(N_REPEAT)
             _setprio(0)
-            if const_expr(NUM_V_ITERS > K_STEPS_QK_COMPUTE):
-                if is_first:
-                    for it in range_constexpr(NUM_V_ITERS - K_STEPS_QK_COMPUTE):
-                        if first_full:
-                            coop_dma_v_iter(
-                                kv_block_start,
-                                K_STEPS_QK_COMPUTE + it,
-                                v_lds,
-                                skip_tok=True,
-                            )
-                        else:
-                            coop_dma_v_iter(
-                                kv_block_start,
-                                K_STEPS_QK_COMPUTE + it,
-                                v_lds,
-                                skip_tok=False,
-                            )
+            if const_expr(NUM_V_ITERS > K_STEPS_QK_COMPUTE) and is_first:
+                for it in range_constexpr(NUM_V_ITERS - K_STEPS_QK_COMPUTE):
+                    if first_full:
+                        coop_dma_v_iter(
+                            kv_block_start,
+                            K_STEPS_QK_COMPUTE + it,
+                            v_lds,
+                            skip_tok=True,
+                        )
+                    else:
+                        coop_dma_v_iter(
+                            kv_block_start,
+                            K_STEPS_QK_COMPUTE + it,
+                            v_lds,
+                            skip_tok=False,
+                        )
 
             next_start = kv_block_start + fx.Index(BLOCK_N)
             more_k = arith.cmpi(
@@ -693,12 +679,11 @@ def build_fmha_fwd_d72_module(
             if const_expr(NUM_K_BUFS == 2):
                 kv_i = fx.Int32(kv_block_start) // fx.Int32(BLOCK_N)
                 nxt_buf = fx.Int32(1) - (kv_i % fx.Int32(2))
-            if const_expr(NEXT_K_AFTER_QK):
-                if more_k:
-                    if next_full:
-                        coop_dma_k(next_start, nxt_buf, skip_tok=True)
-                    else:
-                        coop_dma_k(next_start, nxt_buf, skip_tok=False)
+            if const_expr(NEXT_K_AFTER_QK) and more_k:
+                if next_full:
+                    coop_dma_k(next_start, nxt_buf, skip_tok=True)
+                else:
+                    coop_dma_k(next_start, nxt_buf, skip_tok=False)
 
             kv_start_i32 = fx.Int32(kv_block_start)
             kv_len_i32 = fx.Int32(actual_kv_len)
@@ -706,18 +691,16 @@ def build_fmha_fwd_d72_module(
                 arith.CmpIPredicate.ugt, _raw(next_start), _raw(actual_kv_len)
             )
 
-            def _mask_acc_ir(acc_ir, ni):
+            def _mask_acc_ir(acc_ir, ni, kv_start, kv_len):
                 acc = Vec(acc_ir)
                 kv_base = (
-                    kv_start_i32
-                    + fx.Int32(ni * MFMA_N)
-                    + fx.Int32(kgrp) * fx.Int32(8)
+                    kv_start + fx.Int32(ni * MFMA_N) + fx.Int32(kgrp) * fx.Int32(8)
                 )
                 elems = []
                 for i in range_constexpr(C_ELEMS):
                     kv_col = kv_base + fx.Int32(_c_kv(i))
                     in_kv = arith.cmpi(
-                        arith.CmpIPredicate.slt, _raw(kv_col), _raw(kv_len_i32)
+                        arith.CmpIPredicate.slt, _raw(kv_col), _raw(kv_len)
                     )
                     elems.append(ArithValue(in_kv).select(acc[i], c_neg_inf))
                 return Vec.from_elements(elems, fx.Float32).ir_value()
@@ -731,14 +714,12 @@ def build_fmha_fwd_d72_module(
             with ir.InsertionPoint(mask_if.then_block):
                 _scf.YieldOp(
                     [
-                        _mask_acc_ir(s_accs[ni], ni)
+                        _mask_acc_ir(s_accs[ni], ni, kv_start_i32, kv_len_i32)
                         for ni in range_constexpr(N_REPEAT)
                     ]
                 )
             with ir.InsertionPoint(mask_if.else_block):
-                _scf.YieldOp(
-                    [_raw(s_accs[ni]) for ni in range_constexpr(N_REPEAT)]
-                )
+                _scf.YieldOp([_raw(s_accs[ni]) for ni in range_constexpr(N_REPEAT)])
 
             s_by_ni = []
             local_max = c_neg_inf
@@ -806,9 +787,7 @@ def build_fmha_fwd_d72_module(
                         rocdl.sched_barrier(0)
                         _wait_lgkmcnt(0)
                     o_accs[dc] = mfma32(v_pack, p_pack, o_accs[dc])
-                    if const_expr(
-                        (dc + 1 < D_CHUNKS) or (kstep + 1 < PV_K_STEPS)
-                    ):
+                    if const_expr((dc + 1 < D_CHUNKS) or (kstep + 1 < PV_K_STEPS)):
                         v_pack = v_nxt
                 rocdl.sched_mfma(D_CHUNKS)
 
@@ -845,9 +824,7 @@ def build_fmha_fwd_d72_module(
                         + fx.Int32(kgrp) * fx.Int32(4)
                         + fx.Int32(_c_d(i0))
                     )
-                    _store_vec(
-                        o_ptr, o_elem(q_row, fx.Index(d_abs)), packed.ir_value()
-                    )
+                    _store_vec(o_ptr, o_elem(q_row, fx.Index(d_abs)), packed.ir_value())
 
     @flyc.jit
     def launch_fmha_fwd_d72(
@@ -870,7 +847,7 @@ def build_fmha_fwd_d72_module(
         batch_size: fx.Int32,
         num_heads: fx.Int32,
         tensor_bytes: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         ctx = CompilationContext.get_current()
         _ = kernel_sym

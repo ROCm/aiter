@@ -252,12 +252,7 @@ def flydsl_flash_attn_varlen_func(
         and not deterministic
         and not return_attn_probs
     )
-    if (
-        gfx == "gfx1250"
-        and plain
-        and q.shape[-1] == 192
-        and v.shape[-1] == 128
-    ):
+    if gfx == "gfx1250" and plain and q.shape[-1] == 192 and v.shape[-1] == 128:
         if out is None:
             out = torch.empty_like(q[:, :, : v.shape[-1]])
         return flash_attn_varlen_d192_gfx1250(

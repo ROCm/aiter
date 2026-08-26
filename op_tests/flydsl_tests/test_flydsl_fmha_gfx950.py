@@ -81,7 +81,9 @@ def _assert_close(out, ref, min_cos=0.99, mean_cos=0.999):
 
 @pytest.mark.parametrize("seqlen", [128, 256])
 def test_flydsl_fmha_gfx950_single_seq(seqlen):
-    q, k, v, cu, max_s = _pack_varlen([seqlen], num_heads=16, head_dim=HEAD_DIM, dtype=torch.bfloat16)
+    q, k, v, cu, max_s = _pack_varlen(
+        [seqlen], num_heads=16, head_dim=HEAD_DIM, dtype=torch.bfloat16
+    )
     out = flydsl_flash_attn_varlen_func(
         q, k, v, cu, cu, max_s, max_s, softmax_scale=SOFTMAX_SCALE, causal=False
     )
@@ -92,7 +94,9 @@ def test_flydsl_fmha_gfx950_single_seq(seqlen):
 
 def test_flydsl_fmha_gfx950_packed_remainders():
     seqlens = [17, 64, 80, 130]
-    q, k, v, cu, max_s = _pack_varlen(seqlens, num_heads=16, head_dim=HEAD_DIM, dtype=torch.bfloat16)
+    q, k, v, cu, max_s = _pack_varlen(
+        seqlens, num_heads=16, head_dim=HEAD_DIM, dtype=torch.bfloat16
+    )
     out = flydsl_flash_attn_varlen_func(
         q, k, v, cu, cu, max_s, max_s, softmax_scale=SOFTMAX_SCALE, causal=False
     )
@@ -103,7 +107,9 @@ def test_flydsl_fmha_gfx950_packed_remainders():
 
 def test_flydsl_fmha_gfx950_trailing_empty_slot():
     seqlens = [128, 80, 0]
-    q, k, v, cu, max_s = _pack_varlen(seqlens, num_heads=16, head_dim=HEAD_DIM, dtype=torch.bfloat16)
+    q, k, v, cu, max_s = _pack_varlen(
+        seqlens, num_heads=16, head_dim=HEAD_DIM, dtype=torch.bfloat16
+    )
     out = flydsl_flash_attn_varlen_func(
         q, k, v, cu, cu, max_s, max_s, softmax_scale=SOFTMAX_SCALE, causal=False
     )
@@ -113,7 +119,9 @@ def test_flydsl_fmha_gfx950_trailing_empty_slot():
 
 
 def test_flydsl_fmha_gfx950_skips_causal():
-    q, k, v, cu, max_s = _pack_varlen([128], num_heads=4, head_dim=HEAD_DIM, dtype=torch.bfloat16)
+    q, k, v, cu, max_s = _pack_varlen(
+        [128], num_heads=4, head_dim=HEAD_DIM, dtype=torch.bfloat16
+    )
     got = flydsl_flash_attn_varlen_func(
         q, k, v, cu, cu, max_s, max_s, softmax_scale=SOFTMAX_SCALE, causal=True
     )
@@ -121,7 +129,9 @@ def test_flydsl_fmha_gfx950_skips_causal():
 
 
 def test_flydsl_fmha_gfx950_skips_other_head_dim():
-    q, k, v, cu, max_s = _pack_varlen([128], num_heads=4, head_dim=64, dtype=torch.bfloat16)
+    q, k, v, cu, max_s = _pack_varlen(
+        [128], num_heads=4, head_dim=64, dtype=torch.bfloat16
+    )
     got = flydsl_flash_attn_varlen_func(
         q, k, v, cu, cu, max_s, max_s, softmax_scale=1.0 / math.sqrt(64), causal=False
     )
