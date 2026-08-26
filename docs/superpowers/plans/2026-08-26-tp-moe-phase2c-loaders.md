@@ -81,7 +81,7 @@ row_byte = row * fx.Int32(self._row_bytes)
 ```python
 row = lin // fx.Int32(chunks_per_row)
 tok = _buffer_load(self._tok_rsrc, tile_row_base_i32 + row, fx.Int32)
-tok = (tok & fx.Int32(0x00FFFFFF)).min(fx.Int32(self._pad_row))
+tok = _clamp_to_pad(tok & fx.Int32(0x00FFFFFF), self._pad_row)
 row_byte = tok * fx.Int32(self._row_bytes)
 ```
 
@@ -102,7 +102,7 @@ chunks_per_row = n_scale // 16
 row = lin // chunks_per_row
 cir = lin - row * chunks_per_row
 tok = _buffer_load(self._tok_rsrc, tile_row_base_i32 + row, fx.Int32)
-tok = (tok & fx.Int32(0x00FFFFFF)).min(fx.Int32(self._pad_row))
+tok = _clamp_to_pad(tok & fx.Int32(0x00FFFFFF), self._pad_row)
 src_group = (tok * fx.Int32(self._n_scale) + cir * fx.Int32(16)) // fx.Int32(16)
 ```
 
@@ -161,6 +161,12 @@ from flydsl.expr.typing import Vector as Vec
 from .gemm_util import _PACK, _buffer_load, _make_buffer
 
 
+def _clamp_to_pad(tok, pad_row):
+    """min(tok, pad_row) -- fx.Int32 has no .min(), only .minimumf() for floats."""
+    pad = fx.Int32(pad_row)
+    return (tok < pad).select(tok, pad)
+
+
 class TPATileLoader:
     """Dense rank-major A rows gathered by token id, gmem->reg->LDS."""
 
@@ -195,6 +201,7 @@ class TPATileLoader:
             assert total_threads % 64 == 0
             assert (sort_block_m * 16) % total_threads == 0
             assert row_bytes % 16 == 0 and k_step_bytes % 16 == 0
+            self._dma_atom = fx.make_copy_atom(fx.rocdl.BufferCopyLDS128b(), 128)
             self._dma = fx.rocdl.make_buffer_tensor(
                 fx.Tensor(fx.make_view(
                     fx.get_iter(x_tensor),
@@ -207,7 +214,7 @@ class TPATileLoader:
         """sorted slot -> dense A row. Padding slots clamp to the zeroed pad row."""
         tok = _buffer_load(self._tok_rsrc, tile_row_base_i32 + row_i32, fx.Int32)
         tok = tok & fx.Int32(0x00FFFFFF)
-        return tok.min(fx.Int32(self._pad_row))
+        return _clamp_to_pad(tok, self._pad_row)
 
     def for_tile(self, tile_row_base_i32):
         """Precompute this tile's per-thread global byte offsets and LDS slots."""
@@ -320,7 +327,7 @@ class TPAScaleLoader:
                 row = lin // fx.Int32(chunks_per_row)
                 cir = lin - row * fx.Int32(chunks_per_row)
                 tok = _buffer_load(self._tok_rsrc, tile_row_base_i32 + row, fx.Int32)
-                tok = (tok & fx.Int32(0x00FFFFFF)).min(fx.Int32(self._pad_row))
+                tok = _clamp_to_pad(tok & fx.Int32(0x00FFFFFF), self._pad_row)
                 src_group = (tok * fx.Int32(self._n_scale) + cir * fx.Int32(16)) // fx.Int32(16)
                 v = _buffer_load(self._rsrc, src_group, fx.Int32, 4)
                 dst = fx.make_view(
