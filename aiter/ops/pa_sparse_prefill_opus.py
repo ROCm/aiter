@@ -51,9 +51,7 @@ def _dispatch(gfx: str, op_gfx950, op_gfx1250):
         return op_gfx1250
     if gfx == "gfx950":
         return op_gfx950
-    raise RuntimeError(
-        f"pa_sparse_prefill_opus supports {SUPPORTED_ARCHS}, got {gfx}"
-    )
+    raise RuntimeError(f"pa_sparse_prefill_opus supports {SUPPORTED_ARCHS}, got {gfx}")
 
 
 @compile_ops(MD_NAME, develop=True)
