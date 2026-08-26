@@ -5,15 +5,13 @@
 
 # mypy: allow-untyped-defs
 
-import functools
-
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-import torch
 from flydsl._mlir.dialects import llvm
 from flydsl.expr import (
     arith,
     Array,
+    const_expr,
     Float32,
     gpu,
     Int32,
@@ -21,9 +19,6 @@ from flydsl.expr import (
     rocdl as fly_rocdl,
 )
 from flydsl.expr.typing import T
-from flydsl.runtime.device import get_rocm_arch
-
-from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
 
 _RADIX_BITS = 8
@@ -52,10 +47,17 @@ _STATE_EQ_COUNTER = 4
 _STATE_SIZE = 5
 _STABLE_ABOVE_SHIFT = 16
 _STABLE_COUNT_MASK = (1 << _STABLE_ABOVE_SHIFT) - 1
-_STABLE_MAX_VALUES_PER_CHUNK = 1 << 15
+_STABLE_PACKED_COUNT_LIMIT = 1 << 15
+_STABLE_ABOVE_BIN = _N_HIST_BINS
+_STABLE_EQUAL_BIN = _STABLE_ABOVE_BIN + 1
 
 
-def _i32_const(x: int) -> int:
+def topk_per_row_decode_workspace_shapes(rows: int, stable: bool):
+    hist_bins = _N_HIST_BINS + 2 * int(stable)
+    return (rows, _CHUNKS_PER_ROW, hist_bins), (rows, _STATE_SIZE)
+
+
+def _uint32_to_int32(x: int) -> int:
     return x - (1 << 32) if x >= (1 << 31) else x
 
 
@@ -65,10 +67,6 @@ def _f32_to_ord(val):
     abs_bits = bits & fx.Int32(0x7FFFFFFF)
     is_nan = arith.cmpi(arith.CmpIPredicate.ugt, abs_bits, fx.Int32(0x7F800000))
     return arith.select(is_nan, fx.Int32(0x7FFFFFFF), ords)
-
-
-def _make_compile_arg(tensor: torch.Tensor):
-    return flyc.from_torch_tensor(tensor).mark_shape_dynamic(0)
 
 
 def _make_hist_storage():
@@ -93,25 +91,18 @@ def _make_gather_storage(k: int):
     return GatherStorage
 
 
-def _make_stable_count_storage():
-    @fx.struct
-    class StableCountStorage:
-        above_count: Array[Int32, 1, 4]
-        equal_count: Array[Int32, 1, 4]
-
-    return StableCountStorage
-
-
 def _make_stable_write_storage():
     @fx.struct
     class StableWriteStorage:
-        packed_scan: Array[Int32, _NUM_WAVES + 1, 16]
-        packed_running: Array[Int32, 1, 4]
+        primary_scan: Array[Int32, _NUM_WAVES + 1, 16]
+        equal_scan: Array[Int32, _NUM_WAVES + 1, 16]
+        primary_running: Array[Int32, 1, 4]
+        equal_running: Array[Int32, 1, 4]
 
     return StableWriteStorage
 
 
-def _build_topk_per_row_decode_module(
+def build_topk_per_row_decode_module(
     n: int,
     next_n: int,
     k: int,
@@ -124,8 +115,10 @@ def _build_topk_per_row_decode_module(
     stable_vectors = (n + _VEC - 1) // _VEC
     stable_vectors_per_chunk = (stable_vectors + chunks_per_row - 1) // chunks_per_row
     stable_steps = (stable_vectors_per_chunk + _BLOCK_THREADS - 1) // _BLOCK_THREADS
-    if stable and stable_vectors_per_chunk * _VEC >= _STABLE_MAX_VALUES_PER_CHUNK:
-        raise ValueError("stable TopK supports fewer than 32768 values per chunk")
+    # n is compile-time, so only the selected scan implementation is emitted.
+    use_packed_stable_scan = (
+        stable_vectors_per_chunk * _VEC < _STABLE_PACKED_COUNT_LIMIT
+    )
 
     @flyc.kernel(known_block_size=[_BLOCK_THREADS, 1, 1])
     def histogram_kernel(
@@ -160,11 +153,43 @@ def _build_topk_per_row_decode_module(
 
         storage = fx.SharedAllocator().allocate(_make_hist_storage())
         s_hist = storage.bins.peek().view(fx.make_layout(_N_HIST_BINS, 1))
+        s_scan = storage.scan.peek().view(fx.make_layout(_NUM_WAVES + 1, 1))
 
         def load_vec_f32(idx):
             r = fx.make_rmem_tensor(_VEC, Float32)
             fx.copy_atom_call(copy_atom_v, fx.slice(input_div, (None, idx)), r)
             return fx.memref_load_vec(r)
+
+        def unwrap_val(val):
+            return val.ir_value() if hasattr(val, "ir_value") else arith.unwrap(val)
+
+        def warp_inclusive_prefix_i32(val, lane):
+            val_raw = unwrap_val(val)
+            zero_raw = unwrap_val(0)
+            for dpp_op, threshold in (
+                (_DPP_ROW_SHR_1, 1),
+                (_DPP_ROW_SHR_2, 2),
+                (_DPP_ROW_SHR_4, 4),
+                (_DPP_ROW_SHR_8, 8),
+            ):
+                remote = fly_rocdl.update_dpp(
+                    T.i32,
+                    zero_raw,
+                    val_raw,
+                    dpp_op,
+                    _DPP_ROW_MASK,
+                    _DPP_BANK_MASK,
+                    True,
+                )
+                val = (lane >= fx.Int32(threshold)).select(val + fx.Int32(remote), val)
+                val_raw = unwrap_val(val)
+
+            src_lane_16 = (lane & fx.Int32(0x30)) - 1
+            remote16 = fly_rocdl.ds_bpermute(T.i32, src_lane_16 * fx.Int32(4), val)
+            val = (lane >= fx.Int32(16)).select(val + fx.Int32(remote16), val)
+            src_lane_32 = (lane & fx.Int32(0x30)) - fx.Int32(17)
+            remote32 = fly_rocdl.ds_bpermute(T.i32, src_lane_32 * fx.Int32(4), val)
+            return (lane >= fx.Int32(32)).select(val + fx.Int32(remote32), val)
 
         def atomic_add_shared(memref, val, offset):
             ptr = fx.to_llvm_ptr(fx.get_iter(memref) + offset)
@@ -176,6 +201,36 @@ def _build_topk_per_row_decode_module(
                 syncscope="workgroup",
                 alignment=4,
             )
+
+        # Preserve each chunk's values eliminated above the selected radix bin.
+        if stable:
+            if first_pass != 0:
+                if tid == 0:
+                    chunk_hist[_STABLE_ABOVE_BIN] = 0
+            else:
+                previous_shift = shift + fx.Int32(_RADIX_BITS)
+                previous_xor = (previous_shift == fx.Int32(24)).select(
+                    fx.Int32(_RADIX_SIGN_BIT), fx.Int32(0)
+                )
+                previous_bin = (
+                    (row_state[_STATE_PREFIX] >> previous_shift) & fx.Int32(_RADIX_MASK)
+                ) ^ previous_xor
+                previous_above = (tid > previous_bin).select(
+                    chunk_hist[tid], fx.Int32(0)
+                )
+                lane = tid % fx.Int32(_WAVE_SIZE)
+                warp = tid // fx.Int32(_WAVE_SIZE)
+                wave_total = warp_inclusive_prefix_i32(previous_above, lane)
+                if lane == fx.Int32(_WAVE_SIZE - 1):
+                    s_scan[warp] = wave_total
+                gpu.barrier()
+                if tid == 0:
+                    block_total = fx.Int32(0)
+                    for wave in range_constexpr(_NUM_WAVES):
+                        block_total = block_total + s_scan[wave]
+                    chunk_hist[_STABLE_ABOVE_BIN] = (
+                        chunk_hist[_STABLE_ABOVE_BIN] + block_total
+                    )
 
         for hist_item in range_constexpr(
             (_N_HIST_BINS + _BLOCK_THREADS - 1) // _BLOCK_THREADS
@@ -191,17 +246,37 @@ def _build_topk_per_row_decode_module(
             prefix = row_state[_STATE_PREFIX]
             decided_mask = row_state[_STATE_MASK]
 
-        for step in range_constexpr(vec_steps):
-            vec_idx = step * vecs_per_grid_step + chunk * _BLOCK_THREADS + tid
-            if vec_idx < full_vecs:
-                rvals = load_vec_f32(vec_idx)
-                for vi in range_constexpr(_VEC):
-                    ords = _f32_to_ord(rvals[vi])
-                    if first_pass != 0 or (ords & decided_mask) == prefix:
-                        byte_val = ((ords >> shift) & fx.Int32(_RADIX_MASK)) ^ xor_val
-                        atomic_add_shared(s_hist, 1, byte_val)
+        if stable:
+            vector_end = (chunk + 1) * stable_vectors_per_chunk
+            for step in range_constexpr(stable_steps):
+                vec_idx = chunk * stable_vectors_per_chunk + step * _BLOCK_THREADS + tid
+                if vec_idx < vector_end:
+                    if vec_idx < full_vecs:
+                        rvals = load_vec_f32(vec_idx)
+                        for vi in range_constexpr(_VEC):
+                            ords = _f32_to_ord(rvals[vi])
+                            if first_pass != 0 or (ords & decided_mask) == prefix:
+                                byte_val = (
+                                    (ords >> shift) & fx.Int32(_RADIX_MASK)
+                                ) ^ xor_val
+                                atomic_add_shared(s_hist, 1, byte_val)
+        else:
+            for step in range_constexpr(vec_steps):
+                vec_idx = step * vecs_per_grid_step + chunk * _BLOCK_THREADS + tid
+                if vec_idx < full_vecs:
+                    rvals = load_vec_f32(vec_idx)
+                    for vi in range_constexpr(_VEC):
+                        ords = _f32_to_ord(rvals[vi])
+                        if first_pass != 0 or (ords & decided_mask) == prefix:
+                            byte_val = (
+                                (ords >> shift) & fx.Int32(_RADIX_MASK)
+                            ) ^ xor_val
+                            atomic_add_shared(s_hist, 1, byte_val)
 
-        if chunk == 0 and tid < tail_count:
+        tail_chunk = fx.Int32(0)
+        if stable:
+            tail_chunk = full_vecs // fx.Int32(stable_vectors_per_chunk)
+        if chunk == tail_chunk and tid < tail_count:
             col = tail_start + tid
             ords = _f32_to_ord(row_in[col])
             if first_pass != 0 or (ords & decided_mask) == prefix:
@@ -441,104 +516,114 @@ def _build_topk_per_row_decode_module(
                 row_indices[out_pos] = s_equal_idxs[local_pos]
 
     @flyc.kernel(known_block_size=[_BLOCK_THREADS, 1, 1])
-    def stable_count_kernel(
-        input: fx.Tensor,
-        row_ends: fx.Tensor,
+    def stable_hist_count_kernel(
         partial_hist: fx.Tensor,
         state: fx.Tensor,
     ):
         row = fx.block_idx.x
         chunk = fx.block_idx.y
         tid = fx.thread_idx.x
-        row_i32 = fx.Int32(row)
-        chunk_i32 = fx.Int32(chunk)
-        tid_i32 = fx.Int32(tid)
+        threshold_bin = state[row, _STATE_PREFIX] & fx.Int32(_RADIX_MASK)
 
-        input_buf = fx.rocdl.make_buffer_tensor(input)
-        row_in = fx.slice(input_buf, (row, None))
-        request = row_i32 // fx.Int32(next_n)
-        offset = row_i32 % fx.Int32(next_n)
-        row_len = row_ends[request] - fx.Int32(next_n) + offset + 1
-        row_len = (row_len < 0).select(fx.Int32(0), row_len)
-        row_len = (row_len > n).select(fx.Int32(n), row_len)
-        threshold = state[row, _STATE_PREFIX]
+        storage = fx.SharedAllocator().allocate(_make_hist_storage())
+        s_scan = storage.scan.peek().view(fx.make_layout(_NUM_WAVES + 1, 1))
 
-        storage = fx.SharedAllocator().allocate(_make_stable_count_storage())
-        s_above_count = storage.above_count.peek().view(fx.make_layout(1, 1))
-        s_equal_count = storage.equal_count.peek().view(fx.make_layout(1, 1))
+        def unwrap_val(val):
+            return val.ir_value() if hasattr(val, "ir_value") else arith.unwrap(val)
 
-        def atomic_add_shared(memref, val):
-            ptr = fx.to_llvm_ptr(fx.get_iter(memref))
-            llvm.AtomicRMWOp(
-                llvm.AtomicBinOp.add,
-                ptr,
-                arith.unwrap(val),
-                llvm.AtomicOrdering.monotonic,
-                syncscope="workgroup",
-                alignment=4,
-            )
-
-        if tid == 0:
-            s_above_count[0] = 0
-            s_equal_count[0] = 0
-        gpu.barrier()
-
-        local_above = fx.Int32(0)
-        local_equal = fx.Int32(0)
-        vector_end = (chunk_i32 + fx.Int32(1)) * fx.Int32(stable_vectors_per_chunk)
-        for step in range_constexpr(stable_steps):
-            vector_idx = (
-                chunk_i32 * fx.Int32(stable_vectors_per_chunk)
-                + fx.Int32(step * _BLOCK_THREADS)
-                + tid_i32
-            )
-            base = vector_idx * fx.Int32(_VEC)
-            for vi in range_constexpr(_VEC):
-                col = base + fx.Int32(vi)
-                safe_col = (col < fx.Int32(n)).select(col, fx.Int32(0))
-                ords = _f32_to_ord(row_in[safe_col])
-                above = (ords > threshold).select(fx.Int32(1), fx.Int32(0))
-                equal = (ords == threshold).select(fx.Int32(1), fx.Int32(0))
-                valid_above = (vector_idx < vector_end).select(
-                    (col < row_len).select(above, fx.Int32(0)), fx.Int32(0)
+        def warp_inclusive_prefix_i32(val, lane):
+            val_raw = unwrap_val(val)
+            zero_raw = unwrap_val(0)
+            for dpp_op, threshold in (
+                (_DPP_ROW_SHR_1, 1),
+                (_DPP_ROW_SHR_2, 2),
+                (_DPP_ROW_SHR_4, 4),
+                (_DPP_ROW_SHR_8, 8),
+            ):
+                remote = fly_rocdl.update_dpp(
+                    T.i32,
+                    zero_raw,
+                    val_raw,
+                    dpp_op,
+                    _DPP_ROW_MASK,
+                    _DPP_BANK_MASK,
+                    True,
                 )
-                valid_equal = (vector_idx < vector_end).select(
-                    (col < row_len).select(equal, fx.Int32(0)), fx.Int32(0)
-                )
-                local_above = local_above + valid_above
-                local_equal = local_equal + valid_equal
+                val = (lane >= fx.Int32(threshold)).select(val + fx.Int32(remote), val)
+                val_raw = unwrap_val(val)
 
-        if local_above != 0:
-            atomic_add_shared(s_above_count, local_above)
-        if local_equal != 0:
-            atomic_add_shared(s_equal_count, local_equal)
+            src_lane_16 = (lane & fx.Int32(0x30)) - 1
+            remote16 = fly_rocdl.ds_bpermute(T.i32, src_lane_16 * fx.Int32(4), val)
+            val = (lane >= fx.Int32(16)).select(val + fx.Int32(remote16), val)
+            src_lane_32 = (lane & fx.Int32(0x30)) - fx.Int32(17)
+            remote32 = fly_rocdl.ds_bpermute(T.i32, src_lane_32 * fx.Int32(4), val)
+            return (lane >= fx.Int32(32)).select(val + fx.Int32(remote32), val)
+
+        count = (tid > threshold_bin).select(partial_hist[row, chunk, tid], fx.Int32(0))
+        lane = tid % fx.Int32(_WAVE_SIZE)
+        warp = tid // fx.Int32(_WAVE_SIZE)
+        wave_total = warp_inclusive_prefix_i32(count, lane)
+        if lane == fx.Int32(_WAVE_SIZE - 1):
+            s_scan[warp] = wave_total
         gpu.barrier()
 
         if tid == 0:
-            partial_hist[row, chunk, 0] = s_above_count[0]
-            partial_hist[row, chunk, 1] = s_equal_count[0]
+            above_count = partial_hist[row, chunk, _STABLE_ABOVE_BIN]
+            for wave in range_constexpr(_NUM_WAVES):
+                above_count = above_count + s_scan[wave]
+            equal_count = partial_hist[row, chunk, threshold_bin]
+            partial_hist[row, chunk, _STABLE_ABOVE_BIN] = above_count
+            partial_hist[row, chunk, _STABLE_EQUAL_BIN] = equal_count
 
-    @flyc.kernel(known_block_size=[1, 1, 1])
+    @flyc.kernel(known_block_size=[_WAVE_SIZE, 1, 1])
     def stable_prefix_kernel(partial_hist: fx.Tensor):
         row = fx.block_idx.x
-        init = [fx.Int32(0).ir_value(), fx.Int32(0).ir_value()]
-        for chunk, loop_state in range(
-            fx.Int32(0),
-            fx.Int32(chunks_per_row),
-            fx.Int32(1),
-            init=init,
-        ):
-            chunk_i32 = fx.Int32(chunk)
-            above_prefix = fx.Int32(loop_state[0])
-            equal_prefix = fx.Int32(loop_state[1])
-            above_count = partial_hist[row, chunk_i32, 0]
-            equal_count = partial_hist[row, chunk_i32, 1]
-            partial_hist[row, chunk_i32, 0] = above_prefix
-            partial_hist[row, chunk_i32, 1] = equal_prefix
-            _results = yield [
-                (above_prefix + above_count).ir_value(),
-                (equal_prefix + equal_count).ir_value(),
-            ]
+        tid = fx.thread_idx.x
+
+        def unwrap_val(val):
+            return val.ir_value() if hasattr(val, "ir_value") else arith.unwrap(val)
+
+        def warp_inclusive_prefix_i32(val, lane):
+            val_raw = unwrap_val(val)
+            zero_raw = unwrap_val(0)
+            for dpp_op, threshold in (
+                (_DPP_ROW_SHR_1, 1),
+                (_DPP_ROW_SHR_2, 2),
+                (_DPP_ROW_SHR_4, 4),
+                (_DPP_ROW_SHR_8, 8),
+            ):
+                remote = fly_rocdl.update_dpp(
+                    T.i32,
+                    zero_raw,
+                    val_raw,
+                    dpp_op,
+                    _DPP_ROW_MASK,
+                    _DPP_BANK_MASK,
+                    True,
+                )
+                val = (tid >= fx.Int32(threshold)).select(val + fx.Int32(remote), val)
+                val_raw = unwrap_val(val)
+
+            src_lane_16 = (tid & fx.Int32(0x30)) - 1
+            remote16 = fly_rocdl.ds_bpermute(T.i32, src_lane_16 * fx.Int32(4), val)
+            val = (tid >= fx.Int32(16)).select(val + fx.Int32(remote16), val)
+            src_lane_32 = (tid & fx.Int32(0x30)) - fx.Int32(17)
+            remote32 = fly_rocdl.ds_bpermute(T.i32, src_lane_32 * fx.Int32(4), val)
+            return (tid >= fx.Int32(32)).select(val + fx.Int32(remote32), val)
+
+        active = tid < fx.Int32(chunks_per_row)
+        safe_chunk = active.select(tid, fx.Int32(0))
+        above_count = active.select(
+            partial_hist[row, safe_chunk, _STABLE_ABOVE_BIN], fx.Int32(0)
+        )
+        equal_count = active.select(
+            partial_hist[row, safe_chunk, _STABLE_EQUAL_BIN], fx.Int32(0)
+        )
+        above_prefix = warp_inclusive_prefix_i32(above_count, tid) - above_count
+        equal_prefix = warp_inclusive_prefix_i32(equal_count, tid) - equal_count
+        if active:
+            partial_hist[row, tid, _STABLE_ABOVE_BIN] = above_prefix
+            partial_hist[row, tid, _STABLE_EQUAL_BIN] = equal_prefix
 
     @flyc.kernel(known_block_size=[_BLOCK_THREADS, 1, 1])
     def stable_write_kernel(
@@ -566,14 +651,17 @@ def _build_topk_per_row_decode_module(
 
         threshold = state[row, _STATE_PREFIX]
         remaining_k = state[row, _STATE_REMAINING_K]
-        above_prefix = partial_hist[row, chunk, 0]
-        equal_prefix = partial_hist[row, chunk, 1]
+        above_prefix = partial_hist[row, chunk, _STABLE_ABOVE_BIN]
+        equal_prefix = partial_hist[row, chunk, _STABLE_EQUAL_BIN]
 
         storage = fx.SharedAllocator().allocate(_make_stable_write_storage())
-        s_packed_scan = storage.packed_scan.peek().view(
+        # primary holds packed counts on the fast path and above counts otherwise.
+        s_primary_scan = storage.primary_scan.peek().view(
             fx.make_layout(_NUM_WAVES + 1, 1)
         )
-        s_packed_running = storage.packed_running.peek().view(fx.make_layout(1, 1))
+        s_equal_scan = storage.equal_scan.peek().view(fx.make_layout(_NUM_WAVES + 1, 1))
+        s_primary_running = storage.primary_running.peek().view(fx.make_layout(1, 1))
+        s_equal_running = storage.equal_running.peek().view(fx.make_layout(1, 1))
 
         def unwrap_val(val):
             return val.ir_value() if hasattr(val, "ir_value") else arith.unwrap(val)
@@ -632,8 +720,59 @@ def _build_topk_per_row_decode_module(
             gpu.barrier()
             return result, total
 
+        def block_exclusive_prefix_i32_pair(first, second, first_scan, second_scan):
+            lane = tid_i32 % fx.Int32(_WAVE_SIZE)
+            warp = tid_i32 // fx.Int32(_WAVE_SIZE)
+            first_inclusive = warp_inclusive_prefix_i32(first, lane)
+            second_inclusive = warp_inclusive_prefix_i32(second, lane)
+            first_exclusive = first_inclusive - first
+            second_exclusive = second_inclusive - second
+            if lane == fx.Int32(_WAVE_SIZE - 1):
+                first_scan[warp] = first_inclusive
+                second_scan[warp] = second_inclusive
+            gpu.barrier()
+
+            if warp == 0:
+                first_warp = fx.Int32(0)
+                second_warp = fx.Int32(0)
+                if lane < fx.Int32(_NUM_WAVES):
+                    first_warp = first_scan[lane]
+                    second_warp = second_scan[lane]
+                first_warp_inclusive = warp_inclusive_prefix_i32(first_warp, lane)
+                second_warp_inclusive = warp_inclusive_prefix_i32(second_warp, lane)
+                if lane < fx.Int32(_NUM_WAVES):
+                    first_scan[lane] = first_warp_inclusive - first_warp
+                    second_scan[lane] = second_warp_inclusive - second_warp
+                if lane == fx.Int32(_NUM_WAVES - 1):
+                    first_scan[_NUM_WAVES] = first_warp_inclusive
+                    second_scan[_NUM_WAVES] = second_warp_inclusive
+            gpu.barrier()
+            first_result = first_scan[warp] + first_exclusive
+            second_result = second_scan[warp] + second_exclusive
+            first_total = first_scan[_NUM_WAVES]
+            second_total = second_scan[_NUM_WAVES]
+            gpu.barrier()
+            return first_result, second_result, first_total, second_total
+
+        def write_values(
+            row_indices, classes_reg, base, remaining_k, my_above, my_equal
+        ):
+            for vi in range_constexpr(_VEC):
+                cls = classes_reg[vi]
+                col = base + fx.Int32(vi)
+                accepted_before = (my_equal < remaining_k).select(my_equal, remaining_k)
+                out_pos = my_above + accepted_before
+                if cls == 2:
+                    row_indices[out_pos] = col
+                    my_above = my_above + 1
+                elif cls == 1:
+                    if my_equal < remaining_k:
+                        row_indices[out_pos] = col
+                    my_equal = my_equal + 1
+
         if tid == 0:
-            s_packed_running[0] = 0
+            s_primary_running[0] = 0
+            s_equal_running[0] = 0
         gpu.barrier()
 
         start = fx.Int32(0)
@@ -649,6 +788,8 @@ def _build_topk_per_row_decode_module(
             base = vector_idx * fx.Int32(_VEC)
             classes_reg = fx.make_rmem_tensor(_VEC, Int32)
             packed_local = fx.Int32(0)
+            local_above = fx.Int32(0)
+            local_equal = fx.Int32(0)
             for vi in range_constexpr(_VEC):
                 col = base + fx.Int32(vi)
                 safe_col = (col < fx.Int32(n)).select(col, fx.Int32(0))
@@ -668,42 +809,64 @@ def _build_topk_per_row_decode_module(
                     fx.Int32(0),
                 )
                 classes_reg[vi] = above * fx.Int32(2) + equal
-                # High 16 bits count above-threshold values; low 16 count ties.
-                # The per-chunk bound prevents either packed field from carrying.
-                packed_local = (
-                    packed_local + (above << fx.Int32(_STABLE_ABOVE_SHIFT)) + equal
+                if const_expr(use_packed_stable_scan):
+                    packed_local = (
+                        packed_local + (above << fx.Int32(_STABLE_ABOVE_SHIFT)) + equal
+                    )
+                else:
+                    local_above = local_above + above
+                    local_equal = local_equal + equal
+
+            if const_expr(use_packed_stable_scan):
+                packed_prefix, packed_total = block_exclusive_prefix_i32(
+                    packed_local, s_primary_scan
                 )
-
-            packed_prefix, packed_total = block_exclusive_prefix_i32(
-                packed_local, s_packed_scan
-            )
-            packed_running = s_packed_running[0]
-            my_above = (
-                above_prefix
-                + (packed_running >> fx.Int32(_STABLE_ABOVE_SHIFT))
-                + (packed_prefix >> fx.Int32(_STABLE_ABOVE_SHIFT))
-            )
-            my_equal = (
-                equal_prefix
-                + (packed_running & fx.Int32(_STABLE_COUNT_MASK))
-                + (packed_prefix & fx.Int32(_STABLE_COUNT_MASK))
-            )
-
-            for vi in range_constexpr(_VEC):
-                cls = classes_reg[vi]
-                col = base + fx.Int32(vi)
-                accepted_before = (my_equal < remaining_k).select(my_equal, remaining_k)
-                out_pos = my_above + accepted_before
-                if cls == 2:
-                    row_indices[out_pos] = col
-                    my_above = my_above + 1
-                elif cls == 1:
-                    if my_equal < remaining_k:
-                        row_indices[out_pos] = col
-                    my_equal = my_equal + 1
-
-            if tid == 0:
-                s_packed_running[0] = s_packed_running[0] + packed_total
+                packed_running = s_primary_running[0]
+                my_above = (
+                    above_prefix
+                    + (packed_running >> fx.Int32(_STABLE_ABOVE_SHIFT))
+                    + (packed_prefix >> fx.Int32(_STABLE_ABOVE_SHIFT))
+                )
+                my_equal = (
+                    equal_prefix
+                    + (packed_running & fx.Int32(_STABLE_COUNT_MASK))
+                    + (packed_prefix & fx.Int32(_STABLE_COUNT_MASK))
+                )
+                write_values(
+                    row_indices,
+                    classes_reg,
+                    base,
+                    remaining_k,
+                    my_above,
+                    my_equal,
+                )
+                if tid == 0:
+                    s_primary_running[0] = s_primary_running[0] + packed_total
+            else:
+                (
+                    local_above_prefix,
+                    local_equal_prefix,
+                    local_above_total,
+                    local_equal_total,
+                ) = block_exclusive_prefix_i32_pair(
+                    local_above,
+                    local_equal,
+                    s_primary_scan,
+                    s_equal_scan,
+                )
+                my_above = above_prefix + s_primary_running[0] + local_above_prefix
+                my_equal = equal_prefix + s_equal_running[0] + local_equal_prefix
+                write_values(
+                    row_indices,
+                    classes_reg,
+                    base,
+                    remaining_k,
+                    my_above,
+                    my_equal,
+                )
+                if tid == 0:
+                    s_primary_running[0] = s_primary_running[0] + local_above_total
+                    s_equal_running[0] = s_equal_running[0] + local_equal_total
             gpu.barrier()
 
     @flyc.jit
@@ -738,7 +901,7 @@ def _build_topk_per_row_decode_module(
                 state,
                 fx.Int32(shift),
                 fx.Int32(xor_val),
-                fx.Int32(_i32_const(_RADIX_MASK << shift)),
+                fx.Int32(_uint32_to_int32(_RADIX_MASK << shift)),
                 fx.Int32(byte_pos == 0),
             )
             reduce_select.launch(
@@ -748,7 +911,7 @@ def _build_topk_per_row_decode_module(
             )
 
         if stable:
-            stable_count = stable_count_kernel(input, row_ends, partial_hist, state)
+            stable_count = stable_hist_count_kernel(partial_hist, state)
             stable_count.launch(
                 grid=(rows_m, chunks_per_row, 1),
                 block=(_BLOCK_THREADS, 1, 1),
@@ -757,7 +920,7 @@ def _build_topk_per_row_decode_module(
             stable_prefix = stable_prefix_kernel(partial_hist)
             stable_prefix.launch(
                 grid=(rows_m, 1, 1),
-                block=(1, 1, 1),
+                block=(_WAVE_SIZE, 1, 1),
                 stream=stream,
             )
             stable_write = stable_write_kernel(
@@ -781,88 +944,3 @@ def _build_topk_per_row_decode_module(
             )
 
     return launch_topk_per_row_decode
-
-
-@functools.cache
-def _get_topk_per_row_decode_launcher(
-    n: int,
-    next_n: int,
-    k: int,
-    stable: bool,
-    arch: str,
-    backend: str,
-    tensor_compile_key: tuple,
-):
-    return _build_topk_per_row_decode_module(
-        n,
-        next_n,
-        k,
-        stable,
-    )
-
-
-def _tensor_compile_key(*tensors: torch.Tensor) -> tuple:
-    return tuple(
-        (tuple(tensor.shape[1:]), tuple(tensor.stride()), tensor.dtype)
-        for tensor in tensors
-    )
-
-
-def topk_per_row_decode_impl(
-    input_2d: torch.Tensor,
-    row_ends: torch.Tensor,
-    indices_2d: torch.Tensor,
-    *,
-    k: int,
-    next_n: int = 1,
-    stable: bool = False,
-) -> None:
-    rows_m, n = input_2d.shape
-    partial_hist = torch.empty(
-        (rows_m, _CHUNKS_PER_ROW, _N_HIST_BINS),
-        device=input_2d.device,
-        dtype=torch.int32,
-    )
-    state = torch.empty(
-        (rows_m, _STATE_SIZE),
-        device=input_2d.device,
-        dtype=torch.int32,
-    )
-
-    with torch.cuda.device(input_2d.device):
-        stream = torch.cuda.current_stream(input_2d.device)
-        launcher = _get_topk_per_row_decode_launcher(
-            n,
-            next_n,
-            k,
-            stable,
-            str(get_rocm_arch()),
-            flyc.compile_backend_name(),
-            _tensor_compile_key(
-                input_2d,
-                row_ends,
-                indices_2d,
-                partial_hist,
-                state,
-            ),
-        )
-        runtime_args = (
-            input_2d,
-            row_ends,
-            indices_2d,
-            partial_hist,
-            state,
-            rows_m,
-            stream,
-        )
-        if getattr(launcher, "_cf", None) is None:
-            runtime_args = (
-                _make_compile_arg(input_2d),
-                _make_compile_arg(row_ends),
-                _make_compile_arg(indices_2d),
-                _make_compile_arg(partial_hist),
-                _make_compile_arg(state),
-                rows_m,
-                stream,
-            )
-        _run_compiled(launcher, *runtime_args)
