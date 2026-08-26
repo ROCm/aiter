@@ -279,6 +279,35 @@ _SUPPORTED_TP = (4, 8)
 _RESET_COUNTERS = 1  # push_done
 
 
+def _shmem_looks_initialised():
+    """Best-effort check that Mori SHMEM is up on the current device.
+
+    Reads Mori's own Python-level bookkeeping: ``_ensure_shmem_module()`` is the
+    common entry point of all three init paths and records the HIP device id in
+    ``_shmem_module_loaded_gpus``; ``shmem_finalize()`` removes it.
+
+    This exists because calling ``ms.shmem_npes()`` on an uninitialised Mori
+    SEGFAULTs the process -- it dereferences an unset GpuStates in C++, so there
+    is nothing for Python to catch (measured: exit code 139, no output). A
+    best-effort guard that turns that into a readable error is worth depending
+    on two private names for.
+
+    Returns None if Mori's internals no longer look like this, in which case the
+    caller should skip the check rather than fail: this is a foot-gun guard, not
+    a correctness mechanism.
+    """
+    try:
+        import mori.shmem.api as _api
+
+        loaded = getattr(_api, "_shmem_module_loaded_gpus", None)
+        current = getattr(_api, "_current_hip_device", None)
+        if loaded is None or current is None:
+            return None
+        return current() in loaded
+    except Exception:  # noqa: BLE001 - never let the guard itself break construction
+        return None
+
+
 def _p2p_table(t, rank, npes, device):
     """i64[npes] table of intra-node P2P pointers to ``t`` on every peer."""
     table = torch.zeros(npes, dtype=torch.int64, device=device)
@@ -319,19 +348,26 @@ class TPActivationGather:
                 f"producer_blocks={producer_blocks} must be divisible by tp_size={tp_size}"
             )
 
-        try:
-            shmem_npes = int(ms.shmem_npes())
-        except Exception as exc:  # noqa: BLE001 - surface the real cause
+        # NOTE (corrected during execution): calling ms.shmem_npes() on an
+        # uninitialised Mori SEGFAULTs -- it dereferences an unset GpuStates in
+        # C++, exit code 139, nothing for Python to catch. Probe Mori's own
+        # Python-level bookkeeping instead, and degrade to skipping the check if
+        # those private names ever move. See _shmem_looks_initialised above.
+        initialised = _shmem_looks_initialised()
+        if initialised is False:
             raise RuntimeError(
                 "Mori SHMEM is not initialised; call "
                 "mori.shmem.shmem_torch_process_group_init(<pg name>) before "
-                f"constructing TPActivationGather ({type(exc).__name__}: {exc})"
-            ) from exc
-        if shmem_npes != int(tp_size):
-            raise ValueError(
-                f"Mori SHMEM world size {shmem_npes} != tp_size {tp_size}; the "
-                "shmem communicator must be the TP group"
+                "constructing TPActivationGather. (Constructing anyway would "
+                "SEGFAULT inside Mori rather than raise.)"
             )
+        if initialised:
+            shmem_npes = int(ms.shmem_npes())
+            if shmem_npes != int(tp_size):
+                raise ValueError(
+                    f"Mori SHMEM world size {shmem_npes} != tp_size {tp_size}; the "
+                    "shmem communicator must be the TP group"
+                )
 
         self.model_dim = int(model_dim)
         self.tp_size = int(tp_size)
@@ -534,7 +570,10 @@ def case_construct():
         x = _make_x(4, device, 1)
         x_q, x_s = per_1x32_mx_quant(x, quant_mode="fp8")
         for bad, want in (
-            ((x_q[:200000], x_s), "must be positive"),
+            # x_q[:0], not x_q[:200000]: Python clamps an over-long slice bound,
+            # so the latter returns the tensor unchanged and never trips the
+            # m_local <= 0 branch it is meant to exercise.
+            ((x_q[:0], x_s), "must be positive"),
             ((x_q.to(torch.uint8), x_s), "float8_e4m3fn"),
             ((x_q, x_s[:, :2]), "x_scale must be"),
         ):
@@ -602,7 +641,11 @@ else:
 "
 ```
 
-Expected：`CAUGHT: Mori SHMEM is not initialised; ...`。若它没抛而是崩溃或成功，说明 `ms.shmem_npes()` 在未初始化时的行为与假设不符，**停下来报告**，改用别的探测方式。
+Expected：`CAUGHT: Mori SHMEM is not initialised; ...`。
+
+> **执行时已修正。** 方案最初用 `try: ms.shmem_npes() except Exception:` 来探测，实测这条路走不通：未初始化时 `shmem_npes()` 直接 SIGSEGV（退出码 139，两个分支的 print 都没打出来），Python 接不住。现在改成读 Mori 自己的 Python 层记账 `_shmem_module_loaded_gpus`，并在私有名字消失时降级为跳过检查。`shmem_npes()` 只在确认已初始化之后才调。
+
+再补一条，确认降级逻辑没有把检查永久置真：`shmem_finalize()` 之后 `_shmem_looks_initialised()` 必须变回 `False`。
 
 - [ ] **Step 5: 提交**
 
