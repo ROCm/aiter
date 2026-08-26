@@ -647,7 +647,7 @@ def run_sparse_prefill(
                 lambda: mla_sparse_prefill_fp8_asm(
                     **split["kernel"], softmax_scale=softmax_scale
                 ),
-                split["ref"],
+                _ref_pa_sparse_prefill_fp8(**split["ref"], softmax_scale=softmax_scale),
                 "fp8",
                 1,
             )
