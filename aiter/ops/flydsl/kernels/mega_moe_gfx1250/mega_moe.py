@@ -143,7 +143,7 @@ class MegaMoEStage2Config:
     dispatch_block_num: int | None = None
     dispatch_warp_num_per_block: int | None = None
     schedule: tuple | None = None
-    dispatch_backend: str = "flydsl"
+    dispatch_backend: str = "mori"
     # What dispatch puts on the wire. fp8 halves the payload and fp4 quarters it,
     # each sending a per-token e8m0 row along; the receiver then skips its own
     # quant. Combine is unaffected -- it moves post-expert tokens, which are bf16
@@ -422,7 +422,7 @@ class MegaMoEGfx1250:
                 dispatch_backend=(
                     dispatch_backend
                     if dispatch_backend is not None
-                    else os.environ.get("MEGA_DISPATCH", "flydsl")
+                    else os.environ.get("MEGA_DISPATCH", "mori")
                 ),
                 dispatch_wire=(
                     dispatch_wire
@@ -721,6 +721,10 @@ class MegaMoEGfx1250:
                 "built by mori's CMake and is not shipped by every install"
             ) from error
 
+        # Passed only on a quantizing wire, matching scale_dst_nbytes: mori grew
+        # scale_bytes in #593 and rejects UNKNOWN kwargs outright, so sending the
+        # bf16 wire's harmless 0 would make an older mori refuse the whole plan.
+        scale_kw = {"scale_bytes": config.scale_nbytes} if config.is_quant_wire else {}
         plans = {}
         for spec in self._dispatch_specs:
             plan = EpDispatchPlan(
@@ -734,7 +738,7 @@ class MegaMoEGfx1250:
                 max_recv=config.max_recv,
                 dtype=config.wire.mori_dtype,
                 use_weights=True,
-                scale_bytes=config.scale_nbytes,
+                **scale_kw,
                 block_num=spec[0],
                 warp_per_block=spec[1],
                 arena=self._arena,
