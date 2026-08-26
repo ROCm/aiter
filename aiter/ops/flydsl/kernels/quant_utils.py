@@ -35,7 +35,7 @@ view to :func:`emit_mx_e8m0_scale` -- both round-trip through
 from __future__ import annotations
 
 from flydsl._mlir.dialects import llvm
-from flydsl.expr import arith
+from flydsl.expr import arith, rocdl
 from flydsl.expr.arith import CmpIPredicate
 from flydsl.expr.typing import T
 
@@ -265,11 +265,20 @@ def emit_amax_e8m0_native_scale(all_vals, *, wave_size, dtype=_D.FP8_E4M3):
     c23 = arith.constant(23, type=T.i32)
     c_wave = arith.constant(wave_size, type=T.i32)
 
-    block_amax = arith.constant(0.0, type=T.f32)
-    for v in all_vals:
-        abs_v = llvm.call_intrinsic(T.f32, "llvm.fabs.f32", [_raw(v)], [], [])
-        block_amax = arith.maxnumf(block_amax, abs_v)
-    block_amax = arith.minnumf(block_amax, c_flt_max)
+    # Pairwise tree, not a linear accumulate: a chain of N maxes is N deep and
+    # every step stalls on the last (one s_delay_alu each). The tree is log2(N)
+    # deep with N/2 independent maxes per level for the scheduler to interleave.
+    level = [arith.constant(0.0, type=T.f32)] + [
+        llvm.call_intrinsic(T.f32, "llvm.fabs.f32", [_raw(v)], [], []) for v in all_vals
+    ]
+    while len(level) > 1:
+        nxt = [
+            arith.maxnumf(level[i], level[i + 1]) for i in range(0, len(level) - 1, 2)
+        ]
+        if len(level) % 2:
+            nxt.append(level[-1])
+        level = nxt
+    block_amax = arith.minnumf(level[0], c_flt_max)
     peer = block_amax.shuffle_xor(c16, c_wave)
     block_amax = arith.maxnumf(block_amax, peer)
 
@@ -295,5 +304,14 @@ def emit_cvt_scalef32_pk8_fp8_f32(src_v8f32, scale_f32, *, v2i32_ty, rocdl):
     return rocdl.cvt_scalef32_pk8_fp8_f32(
         v2i32_ty,
         _raw(src_v8f32),
+        _raw(scale_f32),
+    )
+
+
+def emit_cvt_scalef32_pk8_fp4_bf16(src_v8bf16, scale_f32, *, i32_ty):
+    """Native gfx1250 scaled conversion of eight bf16 values to packed FP4."""
+    return rocdl.cvt_scalef32_pk8_fp4_bf16(
+        i32_ty,
+        _raw(src_v8bf16),
         _raw(scale_f32),
     )

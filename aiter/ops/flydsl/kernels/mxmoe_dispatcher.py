@@ -94,6 +94,20 @@ def _spart_output_tile_index(block_1d_id, M0, N0, group_num, m01, nmajor=False):
     return m_block_idx, n_block_idx
 
 
+def _pick_epi_lanes(BM, BN, route_out_fp8, g2_scale_blk, nthreads=256):
+    if not route_out_fp8:
+        return None
+    order = (32, 16, 8) if BN >= 512 else (16, 8, 32)
+    for lanes in order:
+        epi_rows = nthreads // lanes
+        route_vec = BN // lanes
+        if BM % epi_rows or BN % lanes or route_vec % 4:
+            continue
+        if g2_scale_blk in (route_vec, 2 * route_vec, 4 * route_vec):
+            return lanes
+    return None
+
+
 def compile_gemm2_a4w4_port(
     BM=32,
     BN=256,
@@ -114,7 +128,11 @@ def compile_gemm2_a4w4_port(
     g2_spart=None,
     g2_bf16_lds=None,
     g2_kstatic=False,
+    k_valid_halves=None,
+    has_kpad=False,
+    has_npad=False,
     out_dtype="bf16",
+    enable_bias=False,
 ):
     """Compile gemm2 a4w4 down-proj; epilog 'atomic' (weighted atomic-fadd) or 'reduce' (store into out[token_id*topk+slot]). inter_dim runtime; SBM None -> SBM==BM byte-identical."""
     SBM = _norm_sbm(SBM, BM)
@@ -182,6 +200,16 @@ def compile_gemm2_a4w4_port(
     aStages = 3 if (not g2_bf16_lds or 3 * slot_bytes <= c_lds_bytes) else 2
     a_slot_alias = aStages <= kStages
     lds_bytes = max(c_lds_bytes, aStages * slot_bytes)
+    K_TILES_RT_MAX = INTER_MAX // BK
+    g2_apre = g2_kstatic and aStages >= K_TILES_RT_MAX
+    a_preload = min(aStages, K_TILES_RT_MAX) if g2_apre else kStages
+    total_k_halves = K_TILES_RT_MAX * (BK // 128)
+    if k_valid_halves is None:
+        k_valid_halves = total_k_halves
+    if k_valid_halves < 0 or k_valid_halves > total_k_halves:
+        raise AssertionError(
+            f"k_valid_halves must be in [0, {total_k_halves}], " f"got {k_valid_halves}"
+        )
     # N_OUT = model_dim/hidden is runtime; HIDDEN_MAX is a compile/cache bucket
     # so different runtime hidden sizes can reuse one compiled launcher.
     assert (
@@ -217,7 +245,13 @@ def compile_gemm2_a4w4_port(
     sblk_tag = f"_sblk{g2_scale_blk}" if (route_out_fp8 and g2_scale_blk != 8) else ""
     out_tag = "_fp8out" if route_out_fp8 else ""
     tile_tag = "" if (BN, BK) == (256, 256) else f"_bn{BN}_bk{BK}"
-    tag = f"hmax{HIDDEN_MAX}_imax{INTER_MAX}_bm{BM}{tile_tag}{'_nt' if use_nt else ''}_{etag}{atag}{btag}{sbm_tag}{persist_tag}{pad_tag}{bh_tag}{apf_tag}{spart_tag}{bf16lds_tag}{dw_tag}{kst_tag}{pitch_tag}{sblk_tag}{out_tag}_v2"
+    bias_tag = "_bias" if enable_bias else ""
+    kh_tag = (
+        f"_kh{k_valid_halves}" if has_pad and k_valid_halves < total_k_halves else ""
+    )
+    pad_mode_tag = f"_kp{int(has_kpad)}_np{int(has_npad)}" if has_pad else ""
+    g2_epi_lanes = _pick_epi_lanes(BM, BN, route_out_fp8, g2_scale_blk)
+    tag = f"hmax{HIDDEN_MAX}_imax{INTER_MAX}_bm{BM}{tile_tag}{'_nt' if use_nt else ''}_{etag}{atag}{btag}{sbm_tag}{persist_tag}{pad_tag}{pad_mode_tag}{kh_tag}{bh_tag}{apf_tag}{spart_tag}{bf16lds_tag}{dw_tag}{kst_tag}{pitch_tag}{sblk_tag}{out_tag}{bias_tag}_v2_biasabi6"
     name = f"gemm2_a4w4_port_{tag}"
 
     @fx.struct
@@ -234,6 +268,7 @@ def compile_gemm2_a4w4_port(
         arg_cumsum,
         arg_stids,
         arg_sweights,
+        arg_bias,
         arg_out,
         bx_i32,
         lane,
@@ -254,7 +289,7 @@ def compile_gemm2_a4w4_port(
         lds_base_i32 = fx.Int32(fx.ptrtoint(lds.buf.ptr))
 
         def issue_all_a_loads(m_row0):
-            for slot in range_constexpr(kStages):
+            for slot in range_constexpr(a_preload):
                 issue_a_load_lds_dt(
                     arg_aq,
                     aq_num,
@@ -280,6 +315,7 @@ def compile_gemm2_a4w4_port(
                 arg_eids,
                 arg_stids,
                 arg_sweights,
+                arg_bias,
                 i32_M,
                 i32_max_m_blocks,
                 arg_out,
@@ -312,6 +348,12 @@ def compile_gemm2_a4w4_port(
                 g2_out_pitch_align=g2_out_pitch_align,
                 g2_scale_blk=g2_scale_blk,
                 route_out_fp8=route_out_fp8,
+                g2_epi_lanes=g2_epi_lanes,
+                g2_apre=g2_apre,
+                enable_bias=enable_bias,
+                k_valid_halves=k_valid_halves,
+                has_kpad=has_kpad,
+                has_npad=has_npad,
                 mn_idx=mn_idx,
             )
 
@@ -379,6 +421,7 @@ def compile_gemm2_a4w4_port(
         arg_cumsum: fx.Int64,
         arg_stids: fx.Int64,
         arg_sweights: fx.Int64,
+        arg_bias: fx.Int64,
         i32_M: fx.Int32,
         i32_max_m_blocks: fx.Int32,
         i32_inter: fx.Int32,
@@ -404,6 +447,7 @@ def compile_gemm2_a4w4_port(
             arg_cumsum,
             arg_stids,
             arg_sweights,
+            arg_bias,
             arg_out,
             bx_i32,
             lane,
@@ -427,6 +471,7 @@ def compile_gemm2_a4w4_port(
         arg_cumsum: fx.Int64,
         arg_stids: fx.Int64,
         arg_sweights: fx.Int64,
+        arg_bias: fx.Int64,
         i32_M: fx.Int32,
         i32_max_m_blocks: fx.Int32,
         i32_grid_blocks: fx.Int32,
@@ -450,6 +495,7 @@ def compile_gemm2_a4w4_port(
             arg_cumsum,
             arg_stids,
             arg_sweights,
+            arg_bias,
             i32_M,
             i32_max_m_blocks,
             i32_inter,
@@ -487,6 +533,10 @@ def get_g2(
     g2_bf16_lds=None,
     g2_spart=None,
     g2_kstatic=False,
+    k_valid_halves=None,
+    has_kpad=False,
+    has_npad=False,
+    enable_bias=False,
 ):
     # Cache key uses compile-time buckets; runtime inter_dim/model_dim share a
     # launcher while remaining within their respective caps.
@@ -525,7 +575,11 @@ def get_g2(
         g2_spart,
         g2_bf16_lds,
         g2_kstatic,
+        k_valid_halves,
+        has_kpad,
+        has_npad,
         out_dtype,
+        enable_bias,
     )
     launch = G2_CACHE.get(key)
     if launch is None:
@@ -549,7 +603,11 @@ def get_g2(
             g2_spart=g2_spart,
             g2_bf16_lds=g2_bf16_lds,
             g2_kstatic=g2_kstatic,
+            k_valid_halves=k_valid_halves,
+            has_kpad=has_kpad,
+            has_npad=has_npad,
             out_dtype=out_dtype,
+            enable_bias=enable_bias,
         )
         G2_CACHE[key] = launch
     return launch
@@ -591,6 +649,7 @@ def mxfp4_moe_gemm2(
     g2_bf16_lds=None,
     g2_spart=None,
     stream=None,
+    bias=None,
 ):
     """Stage-2 down-proj gemm; epilog 'atomic' (weighted atomic.fadd) or 'reduce' (store into out[token_id*topk+slot]). inter_dim_pad/model_dim_pad>0 enable has_pad pad-skip (both 0 -> byte-identical); persist = fixed cu_num m-slot grid (default OFF)."""
     import torch
@@ -621,6 +680,14 @@ def mxfp4_moe_gemm2(
         raise AssertionError(
             f"D_INTER ({D_INTER}) exceeds compile cap INTER_MAX ({INTER_MAX})"
         )
+    if not 0 <= inter_dim_pad <= D_INTER:
+        raise AssertionError(
+            f"inter_dim_pad must be in [0, {D_INTER}], got {inter_dim_pad}"
+        )
+    if not 0 <= model_dim_pad <= D_HIDDEN:
+        raise AssertionError(
+            f"model_dim_pad must be in [0, {D_HIDDEN}], got {model_dim_pad}"
+        )
     if (
         str(out_dtype).strip().lower() == "bf16"
         and getattr(out, "dtype", None) != torch.bfloat16
@@ -637,6 +704,16 @@ def mxfp4_moe_gemm2(
     _kstatic = os.environ.get("MXFP4_G2_KSTATIC", "1") == "1"
     if _kstatic:
         INTER_MAX = D_INTER
+    real_k = D_INTER - inter_dim_pad
+    # Keep the half containing a partial real-K tail, matching v1. This
+    # skips complete trailing halves while allowing the final partial half
+    # to perform its unavoidable extra work (e.g. GPT-OSS 2880 -> 3072).
+    k_valid_halves = (real_k + 127) // 128
+    if bias is not None:
+        if bias.dtype != torch.float32:
+            bias = bias.to(torch.float32)
+        if not bias.is_contiguous():
+            bias = bias.contiguous()
     launch = get_g2(
         BM,
         BN,
@@ -656,6 +733,10 @@ def mxfp4_moe_gemm2(
         out_dtype=out_dtype,
         g2_bf16_lds=g2_bf16_lds,
         g2_spart=g2_spart,
+        k_valid_halves=k_valid_halves,
+        has_kpad=inter_dim_pad > 0,
+        has_npad=model_dim_pad > 0,
+        enable_bias=bias is not None,
     )
     max_m_blocks = (max_sorted + BM - 1) // BM
     if persist:
@@ -681,6 +762,7 @@ def mxfp4_moe_gemm2(
         cumsum_tensor.data_ptr(),
         sorted_token_ids.data_ptr(),
         sorted_weights.data_ptr(),
+        (bias if bias is not None else out).data_ptr(),
         M_logical,
         max_m_blocks,
         grid_blocks,
