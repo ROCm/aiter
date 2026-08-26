@@ -156,6 +156,8 @@ def test_gemm_afp8wfp8(
     transpose_x_scale: bool,
 ):
     torch.manual_seed(0)
+    if arch_info.get_arch() == "gfx1250":
+        pytest.skip("MXFP8 GEMM has no gfx1250 Triton config")
     if not arch_info.is_fp8_avail():
         pytest.skip("MXFP8 GEMM requires FP8-capable arch")
     torch.cuda.empty_cache()
@@ -215,6 +217,8 @@ def test_gemm_afp8wfp8_preshuffle(
     transpose_x_scale: bool,
 ):
     torch.manual_seed(0)
+    if arch_info.get_arch() == "gfx1250":
+        pytest.skip("MXFP8 GEMM has no gfx1250 Triton config")
     if not arch_info.is_fp8_avail():
         pytest.skip("MXFP8 GEMM requires FP8-capable arch")
     if N % 16 != 0 or K % 32 != 0:

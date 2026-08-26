@@ -8,6 +8,7 @@ import torch.nn.functional as F
 from aiter.ops.triton.gemm.fused.fused_gemm_a16w16_quant_x import (
     fused_gemm_a16w16_quant_x,
 )
+from aiter.ops.triton.utils._triton import arch_info
 from op_tests.triton_tests.gemm.basic.test_gemm_a16w16 import (
     generate_gemm_a16w16_inputs,
 )
@@ -15,6 +16,11 @@ from op_tests.triton_tests.gemm.basic.test_gemm_a16w16 import (
 _QUANT_BLOCK_SIZE = 32
 # 0xFF800000 in two's complement int32. Mask keeps sign + 8-bit exponent + top mantissa bit.
 _E8M0_MASK_INT32 = -8388608
+
+requires_quant_x_config = pytest.mark.skipif(
+    arch_info.get_arch() == "gfx1250",
+    reason="fused GEMM quant-x has no compatible gfx1250 Triton config",
+)
 
 
 def torch_mxfp8_quant_from_fp32(x_fp32: torch.Tensor):
@@ -70,6 +76,7 @@ def _assert_quant_close(triton_x_quant, triton_x_scales, x):
 
 
 @pytest.mark.parametrize("M, N, K", get_x_vals())
+@requires_quant_x_config
 def test_fused_gemm_a16w16_quant_x(M: int, N: int, K: int):
     torch.cuda.empty_cache()
     x, w, _, _, _ = generate_gemm_a16w16_inputs(
@@ -96,6 +103,7 @@ def get_fewer_x_vals():
 @pytest.mark.parametrize("M, N, K", get_fewer_x_vals())
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("output", [True, False])
+@requires_quant_x_config
 def test_fused_gemm_a16w16_quant_x_activation(
     M: int, N: int, K: int, dtype, output, activation
 ):
@@ -124,6 +132,7 @@ def test_fused_gemm_a16w16_quant_x_activation(
 
 @pytest.mark.parametrize("M, N, K", get_fewer_x_vals())
 @pytest.mark.parametrize("skip_reduce", [True, False])
+@requires_quant_x_config
 def test_fused_gemm_a16w16_quant_x_skip_reduce(M: int, N: int, K: int, skip_reduce):
     torch.cuda.empty_cache()
     x, w, _, _, _ = generate_gemm_a16w16_inputs(

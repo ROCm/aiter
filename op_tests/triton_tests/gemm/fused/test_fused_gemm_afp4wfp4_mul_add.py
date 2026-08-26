@@ -61,6 +61,8 @@ def test_fused_gemm_afp4wfp4_mul_add(
     b_type_is_scalar,
     fuse_type,
 ):
+    if arch_info.get_arch() == "gfx1250":
+        pytest.skip("fused mul/add has no gfx1250 Triton config")
     if not (arch_info.is_fp4_avail()):
         pytest.skip("MXFP4 not supported on this architecture")
 
