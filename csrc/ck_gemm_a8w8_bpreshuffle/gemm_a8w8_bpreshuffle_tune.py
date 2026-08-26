@@ -153,7 +153,7 @@ def run_gemm_flydsl(x, weight_shuffle, x_scale, w_scale, out, kernel_id, k_split
         ki.xcd_swizzle,
         ki.lds_stage,
         ki.enable_scheduler,
-        k_split=k_split,
+        split_k=k_split,
     )
     return out
 
