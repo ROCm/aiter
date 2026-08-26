@@ -1604,11 +1604,12 @@ def flydsl_qk_norm_rope_quant(
         )
         if use_tdm:
             num_rows = T_tok * H
-            tiles_per_wg = _tdm_tiles_per_wg(num_rows)
+            tiles_per_wg, num_buffers = _tdm_tiles_per_wg(num_rows)
             launcher = _build_kernel_w32_tdm(
                 num_q_heads=H,
                 head_dim=D,
                 rope_head_dim=RD,
+                num_buffers=num_buffers,
                 tiles_per_wg=tiles_per_wg,
                 q_weighted=q_weighted,
             )
@@ -1742,12 +1743,17 @@ TILES_PER_WG = 40  # CT: tiles streamed per WG (unrolled; CT % (H/RT) == 0)
 
 
 def _tdm_tiles_per_wg(num_rows):
-    """Pick CT (tiles per workgroup) for a row count — trades prefetch depth vs occupancy."""
+    """Pick (CT, K) for a row count — trades prefetch depth vs occupancy.
+
+    On gfx1250 each CU has 320 KB LDS and can host 2 WGs (2048 threads).
+    At K=6 the arena is 192 KB so only 1 WG fits; K<=5 (<=160 KB) allows
+    2 WG/CU which doubles occupancy and helps bandwidth-bound small-T cases.
+    """
     if num_rows <= 65536:
-        return 8
+        return 8, 5
     if num_rows <= 131072:
-        return 16
-    return TILES_PER_WG
+        return 16, NUM_BUFFERS
+    return TILES_PER_WG, NUM_BUFFERS
 
 
 @lru_cache(maxsize=16)
@@ -1859,6 +1865,14 @@ def _build_kernel_w32_tdm(
                     i32
                 )
             )
+            return _cs_from_pos(pos_i32)
+
+        def issue_pos(tok):
+            """Fire position buffer_load (returns raw i64, no wait)."""
+            return buffer_ops.buffer_load(pos_rsrc, tok, vec_width=1, dtype=T.i64)
+
+        def _cs_from_pos(pos_i32):
+            """Load cos/sin given an already-resolved position value."""
             cs = pos_i32 * (RD // 2) + rope_rel * PAIRS
             if const_expr(PAIRS == 1):
                 return tuple(
@@ -1949,29 +1963,43 @@ def _build_kernel_w32_tdm(
                 tdm_ops.tensor_wait(K - 1)
                 rocdl.s_wait_dscnt(0)
 
-            def cs_of(tile_idx):
+            def tok_of(tile_idx):
                 my_row = row_of(tile_idx)
                 if const_expr(log2H is not None):
-                    return load_cs(my_row >> log2H)
-                return load_cs(_idiv(my_row, fx.Int32(H)))
+                    return my_row >> log2H
+                return _idiv(my_row, fx.Int32(H))
+
+            def cs_of(tile_idx):
+                return load_cs(tok_of(tile_idx))
 
             GROUP = (H // RT) if (log2H is not None and H % RT == 0) else 1
             do_hoist = hoist_cs and GROUP > 1 and (CT % GROUP == 0)
 
             for k in range_constexpr(K):
                 issue(bufs[k], tile_base + k)
+
             cs_cache = [None, None]
+            if const_expr(do_hoist):
+                pending_pos = [issue_pos(tok_of(tile_base + 0))]
+                cs_cache[0], cs_cache[1] = _cs_from_pos(
+                    fx.Int32(pending_pos[0].trunci(i32))
+                )
             for i in range_constexpr(CT):
                 fence()
                 if const_expr(do_hoist):
-                    if const_expr(i % GROUP == 0):
-                        cs_cache[0], cs_cache[1] = cs_of(tile_base + i)
                     cosv, sinv = cs_cache[0], cs_cache[1]
                 else:
                     cosv, sinv = cs_of(tile_base + i)
                 compute_store(bufs[i % K], tile_base + i, cosv, sinv)
                 if const_expr(i + K < CT):
                     issue(bufs[i % K], tile_base + i + K)  # reuse after read
+                if const_expr(do_hoist and (i + 1) % GROUP == 0 and i + 1 < CT):
+                    pending_pos[0] = issue_pos(
+                        tok_of(tile_base + i + 1)
+                    )
+                    cs_cache[0], cs_cache[1] = _cs_from_pos(
+                        fx.Int32(pending_pos[0].trunci(i32))
+                    )
 
         def emit_kv():
             gk = g - gx_q
