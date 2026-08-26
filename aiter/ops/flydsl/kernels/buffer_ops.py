@@ -28,12 +28,22 @@ Example:
 
 from __future__ import annotations
 
+import inspect
+
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import arith as std_arith
 from flydsl._mlir.dialects import llvm, rocdl
 from flydsl._mlir.extras import types as T
 from flydsl.expr.meta import dsl_loc_tracing
 from flydsl.runtime.device import is_rdna_arch
+
+
+# FlyDSL changed raw buffer cache policy from an i32 operand to an enum
+# attribute. Keep this vendored compatibility layer usable with both forms.
+_RAW_PTR_BUFFER_AUX_IS_ATTRIBUTE = (
+    inspect.signature(rocdl.RawPtrBufferLoadOp).parameters["aux"].kind
+    is inspect.Parameter.KEYWORD_ONLY
+)
 
 
 def _get_buffer_flags(arch=None):
@@ -593,10 +603,10 @@ def buffer_load(
             soffset = _create_i32_constant(soffset_bytes)
         else:
             soffset = _to_i32_offset(_unwrap_value(soffset_bytes))
-    aux_attr = (
+    aux = (
         ir.IntegerAttr.get(ir.IntegerType.get_signless(32), cache_modifier)
-        if cache_modifier
-        else None
+        if _RAW_PTR_BUFFER_AUX_IS_ATTRIBUTE
+        else _create_i32_constant(cache_modifier)
     )
 
     # Emit buffer load
@@ -605,7 +615,7 @@ def buffer_load(
         rsrc,
         offset,
         soffset,
-        aux=aux_attr,
+        aux=aux,
     )
 
     return load_op.result
@@ -683,10 +693,10 @@ def buffer_store(
             soffset = _create_i32_constant(int(soffset_bytes))
         else:
             soffset = _to_i32_offset(_unwrap_value(soffset_bytes))
-    aux_attr = (
+    aux = (
         ir.IntegerAttr.get(ir.IntegerType.get_signless(32), cache_modifier)
-        if cache_modifier
-        else None
+        if _RAW_PTR_BUFFER_AUX_IS_ATTRIBUTE
+        else _create_i32_constant(cache_modifier)
     )
 
     # Emit buffer store
@@ -695,5 +705,5 @@ def buffer_store(
         rsrc,
         offset,
         soffset,
-        aux=aux_attr,
+        aux=aux,
     )

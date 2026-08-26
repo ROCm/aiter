@@ -200,8 +200,9 @@ def _time_graph(fn, device, iters):
     for _ in range(10):
         graph.replay()
     torch.cuda.synchronize()
-    start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(
-        enable_timing=True
+    start, end = (
+        torch.cuda.Event(enable_timing=True),
+        torch.cuda.Event(enable_timing=True),
     )
     start.record()
     for _ in range(iters):
@@ -313,6 +314,13 @@ def _install_config_policy(moe, config_tokens, unify_fields):
                     p2p_quant = reference.p2p_quant
                 else:
                     raise ValueError(f"invalid config field {field!r}")
+            coupled_stage1 = {
+                "payload_tile_ready",
+                "deduplicate_payload",
+            }
+            if coupled_stage1 & stage1_updates.keys():
+                for name in coupled_stage1:
+                    stage1_updates.setdefault(name, getattr(reference.stage1, name))
             config = replace(
                 local,
                 stage1=replace(local.stage1, **stage1_updates),

@@ -3,6 +3,8 @@
 # ruff: noqa: B023, I001
 """Fused GEMM2 and weighted cross-rank P2P scatter."""
 
+from dataclasses import astuple
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import const_expr, range_constexpr, rocdl
@@ -26,8 +28,17 @@ from .gemm2 import (
     issue_a_load_lds_dt,
     kStages,
 )
+from .mega_moe_config import Stage2BundleKey, mega_moe_bundle_source_fingerprint
 
 _BUFFER_OFFSET_ABI_BYTES = 1 << 31
+
+
+class _Stage2KernelSpec:
+    __slots__ = ("kernel", "block_n")
+
+    def __init__(self, kernel, block_n):
+        self.kernel = kernel
+        self.block_n = int(block_n)
 
 
 @flyc.jit
@@ -273,7 +284,7 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
     SBM: int | None = None,
     persist: bool = False, cu_num: int = 0, has_pad: bool = False, g2_bhoist=None, g2_ascale_pf=None,
     g2_spart=None, persist_strided: bool = False, g2_bf16_lds: bool = False, p2p_quant_type: str = "none",
-    fixed_slot_dispatch: bool = False, skew_cu: int = 0):
+    fixed_slot_dispatch: bool = False, skew_cu: int = 0, _return_kernel_spec: bool = False):
 # fmt: on
     """Compile fused GEMM2 and weighted cross-rank P2P scatter."""
     arch = str(get_rocm_arch() or "")
@@ -326,6 +337,7 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
     dispatch_path = "fixedslot" if fixed_slot_dispatch else "compact"
     kernel_name = (
         f"megamoe_stage2_{dispatch_path}_t{BM}x{BN}x{BK}"
+        f"_r{rank}"
         f"_sbm{SBM}_{a_dtype}_nt{int(use_nt)}"
         f"_p{int(persist)}cu{cu_num}s{int(persist_strided)}_pad{int(has_pad)}"
         f"_sk{skew_cu}"
@@ -498,6 +510,9 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
                 if fx.Int32(m_block) < total_m_blocks:
                     run_unit(unit_bx, m_block)
 
+    if _return_kernel_spec:
+        return _Stage2KernelSpec(kernel_epilog_v2, BN)
+
     # fmt: off
     @flyc.jit
     def launch(arg_aq: fx.Int64, arg_ascale: fx.Int64, arg_bq: fx.Int64, arg_bscale: fx.Int64,
@@ -518,6 +533,7 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
 
 
 _G2_LAUNCH_CACHE = {}
+_G2_BUNDLE_LAUNCH_CACHE = {}
 
 
 def _get_g2_launch(**compile_kw):
@@ -527,6 +543,76 @@ def _get_g2_launch(**compile_kw):
     if launch is None:
         launch = compile_mega_moe_stage2(**compile_kw)
         _G2_LAUNCH_CACHE[key] = launch
+    return launch
+
+
+def compile_mega_moe_stage2_bundle(
+    *, model_dim: int, inter_dim: int, experts: int, topk: int, rank: int, npes: int,
+    max_tok: int, recv_cap: int, comb_inp_nbytes_by_quant: tuple[tuple[str, int], ...],
+    HIDDEN_MAX: int, INTER_MAX: int, cu_num: int, variants: tuple[Stage2BundleKey, ...],
+    a_dtype: str = "fp8",
+):
+    """Compile all ABI-complete Stage2 variants into one GPU module."""
+    if not variants:
+        raise ValueError("MegaMoE Stage2 bundle requires at least one variant")
+    comb_sizes = dict(comb_inp_nbytes_by_quant)
+    specs = []
+    for variant in variants:
+        config = variant.config
+        launch_cu_num = (
+            min(cu_num, config.persist_cu)
+            if config.persist and config.persist_cu > 0
+            else cu_num
+        )
+        spec = compile_mega_moe_stage2(
+            model_dim=model_dim, inter_dim=inter_dim, experts=experts, topk=topk,
+            rank=rank, npes=npes, max_tok=max_tok, recv_cap=recv_cap,
+            comb_inp_nbytes=comb_sizes[variant.p2p_quant], BM=config.block_m,
+            BN=config.block_n, BK=256, use_nt=config.use_nt,
+            HIDDEN_MAX=HIDDEN_MAX, INTER_MAX=INTER_MAX, a_dtype=a_dtype,
+            SBM=variant.sbm, persist=config.persist, cu_num=launch_cu_num,
+            g2_bhoist=True, g2_ascale_pf=True, g2_spart=402,
+            persist_strided=config.persist_strided, g2_bf16_lds=False,
+            p2p_quant_type=variant.p2p_quant,
+            fixed_slot_dispatch=variant.fixed_slot_dispatch, skew_cu=config.skew_cu,
+            _return_kernel_spec=True,
+        )
+        specs.append(spec)
+    kernels = [spec.kernel for spec in specs]
+    block_ns = tuple(spec.block_n for spec in specs)
+    bundle_source_tag = mega_moe_bundle_source_fingerprint()
+    bundle_variants_tag = tuple(astuple(variant) for variant in variants)
+
+    # fmt: off
+    @flyc.jit
+    def launch(arg_aq: fx.Int64, arg_ascale: fx.Int64, arg_bq: fx.Int64, arg_bscale: fx.Int64,
+        arg_eids: fx.Int64, arg_cumsum: fx.Int64, arg_max_expert_tiles: fx.Int64, arg_stids: fx.Int64,
+        arg_sweights: fx.Int64, arg_trb: fx.Int64, arg_p2p_comb_inp: fx.Int64, i32_max_m_blocks: fx.Int32,
+        i32_grid_blocks: fx.Int32, i32_inter: fx.Int32, i32_hidden: fx.Int32, i32_kpad: fx.Int32,
+        i32_npad: fx.Int32, variant_id: fx.Int32, stream: fx.Stream):
+    # fmt: on
+        _ = bundle_source_tag
+        _ = bundle_variants_tag
+        for index in range_constexpr(len(kernels)):
+            if variant_id == fx.Int32(index):
+                num_n_blocks = fx.Int32(i32_hidden) // fx.Int32(block_ns[index])
+                grid_x = i32_grid_blocks * num_n_blocks
+                kernels[index](
+                    arg_aq, arg_ascale, arg_bq, arg_bscale, arg_eids, arg_cumsum,
+                    arg_max_expert_tiles, arg_stids, arg_sweights, arg_trb,
+                    arg_p2p_comb_inp, i32_max_m_blocks, i32_inter, i32_hidden,
+                    i32_kpad, i32_npad,
+                ).launch(grid=(grid_x, 1, 1), block=(256, 1, 1), stream=stream)
+
+    return launch
+
+
+def _get_g2_bundle_launch(**compile_kw):
+    key = tuple(sorted(compile_kw.items()))
+    launch = _G2_BUNDLE_LAUNCH_CACHE.get(key)
+    if launch is None:
+        launch = compile_mega_moe_stage2_bundle(**compile_kw)
+        _G2_BUNDLE_LAUNCH_CACHE[key] = launch
     return launch
 
 
@@ -554,4 +640,34 @@ def run_mega_moe_stage2(arg_aq, arg_ascale, arg_bq, arg_bscale, arg_eids, arg_cu
         launch, arg_aq, arg_ascale, arg_bq, arg_bscale, arg_eids, arg_cumsum,
         arg_max_expert_tiles, arg_stids, arg_sweights, arg_trb, arg_p2p, fx.Int32(max_m_blocks),
         fx.Int32(grid_blocks), fx.Int32(i32_inter), fx.Int32(i32_hidden), fx.Int32(0), fx.Int32(0), stream,
+    )
+
+
+def run_mega_moe_stage2_bundle(arg_aq, arg_ascale, arg_bq, arg_bscale, arg_eids, arg_cumsum,
+    arg_max_expert_tiles, arg_stids, arg_sweights, arg_trb, arg_p2p, row_capacity, i32_inter,
+    i32_hidden, variant_id, stream, *, model_dim, inter_dim, experts, topk, rank, npes, max_tok,
+    recv_cap, comb_inp_nbytes_by_quant, HIDDEN_MAX, INTER_MAX, cu_num, variants):
+    variants = tuple(variants)
+    if not 0 <= int(variant_id) < len(variants):
+        raise ValueError(f"invalid Stage2 bundle variant_id={variant_id}")
+    variant = variants[int(variant_id)]
+    config = variant.config
+    launch_cu_num = (
+        min(cu_num, config.persist_cu)
+        if config.persist and config.persist_cu > 0
+        else cu_num
+    )
+    launch = _get_g2_bundle_launch(
+        model_dim=model_dim, inter_dim=inter_dim, experts=experts, topk=topk,
+        rank=rank, npes=npes, max_tok=max_tok, recv_cap=recv_cap,
+        comb_inp_nbytes_by_quant=tuple(comb_inp_nbytes_by_quant), HIDDEN_MAX=HIDDEN_MAX,
+        INTER_MAX=INTER_MAX, cu_num=cu_num, variants=variants,
+    )
+    max_m_blocks = (row_capacity + config.block_m - 1) // config.block_m
+    grid_blocks = launch_cu_num if config.persist else max_m_blocks
+    _run_compiled(
+        launch, arg_aq, arg_ascale, arg_bq, arg_bscale, arg_eids, arg_cumsum,
+        arg_max_expert_tiles, arg_stids, arg_sweights, arg_trb, arg_p2p,
+        fx.Int32(max_m_blocks), fx.Int32(grid_blocks), fx.Int32(i32_inter),
+        fx.Int32(i32_hidden), fx.Int32(0), fx.Int32(0), fx.Int32(variant_id), stream,
     )
