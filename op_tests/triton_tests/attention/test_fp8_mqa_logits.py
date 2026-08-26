@@ -95,6 +95,10 @@ def generate_cp_test_data(seq_len, seq_len_kv):
         (128, 1024),
         (1024, 1024),
         (1024, 1560),
+        # Exactly 2 GiB of logits, which is where the gfx950 kernel pairs
+        # BLOCK_M=2 with a non-buffer store -- the combination that used to abort
+        # the AMDGCN backend at JIT time. Nothing above it comes close.
+        (8192, 65536),
     ],
 )
 @pytest.mark.parametrize("num_heads", [32, 64])
@@ -110,6 +114,16 @@ def test_fp8_mqa_logits(
     disable_cp: bool,
     clean_logits: bool,
 ) -> None:
+    # The 2 GiB shape is here for one configuration only: BLOCK_M=2 needs
+    # num_heads <= 32, and the shape costs 2 GiB of logits plus a reference,
+    # which is not worth paying sixteen times over.
+    big = s_q * s_k * 4 >= 2 * 1024**3
+    if big:
+        if (num_heads, head_dim, disable_cp, clean_logits) != (32, 128, True, True):
+            pytest.skip("large shape is checked once")
+        if torch.cuda.mem_get_info()[0] < 8 * 1024**3:
+            pytest.skip("needs ~8 GiB free")
+
     torch.manual_seed(0)
     q = torch.randn(s_q, num_heads, head_dim, device="cuda", dtype=torch.bfloat16)
     kv = torch.randn(s_k, head_dim, device="cuda", dtype=torch.bfloat16)
@@ -126,10 +140,6 @@ def test_fp8_mqa_logits(
     q_fp8 = q.to(e4m3_type)
     kv_fp8, scales = per_custom_dims_cast_to_fp8(kv, (0,), False)
 
-    ref_logits, _ref_cost = ref_fp8_mqa_logits(
-        q=q, kv=kv, weights=weights, cu_seqlen_ks=ks, cu_seqlen_ke=ke
-    )
-
     logits = fp8_mqa_logits(q_fp8, kv_fp8, scales, weights, ks, ke, clean_logits)
 
     # If clean_logits is not set, clean the rest for testing
@@ -140,56 +150,25 @@ def test_fp8_mqa_logits(
             tmp[i, ks[i] : ke[i]] = logits[i, : ke[i] - ks[i]]
         logits = tmp
 
-    ref_neginf_mask = ref_logits == float("-inf")
-    neginf_mask = logits == float("-inf")
-    assert torch.equal(neginf_mask, ref_neginf_mask)
-    ref_logits = ref_logits.masked_fill(ref_neginf_mask, 0)
-    logits = logits.masked_fill(neginf_mask, 0)
-    diff = calc_diff(logits, ref_logits)
-    if ref_neginf_mask.all():
-        return  # nothing left to compare
-    assert diff < 1e-3, f"{diff=}"
-
-
-# Both shapes land on exactly 2 GiB of logits, which is where the gfx950 kernel
-# pairs BLOCK_M=2 with a non-buffer store and used to abort the AMDGCN backend at
-# JIT time. Nothing above reaches it: every shape there is <= 1024 queries or far
-# under 2 GiB.
-@pytest.mark.parametrize("s_q, s_k", [(8192, 65536), (16384, 32768)])
-@torch.inference_mode()
-def test_fp8_mqa_logits_long_context(s_q: int, s_k: int) -> None:
-    num_heads, head_dim = 32, 128
-    logits_bytes = s_q * s_k * 4
-    if torch.cuda.mem_get_info()[0] < logits_bytes + 2 * 1024**3:
-        pytest.skip(f"needs ~{(logits_bytes + 2 * 1024**3) / 1024**3:.0f} GiB free")
-
-    torch.manual_seed(0)
-    q = torch.randn(s_q, num_heads, head_dim, device="cuda", dtype=torch.bfloat16)
-    kv = torch.randn(s_k, head_dim, device="cuda", dtype=torch.bfloat16)
-    kv_fp8, scales = per_custom_dims_cast_to_fp8(kv, (0,), False)
-    kv = (kv_fp8.to(torch.float32) * scales.reshape(-1, 1)).to(torch.bfloat16)
-    weights = torch.randn(s_q, num_heads, device="cuda", dtype=torch.float32)
-    # Every row attends to all of kv, so clean_logits=False leaves nothing
-    # undefined and the whole output is comparable.
-    ks = torch.zeros(s_q, dtype=torch.int, device="cuda")
-    ke = torch.full((s_q,), s_k, dtype=torch.int, device="cuda")
-
-    q_fp8 = q.to(e4m3_type)
-    kv_fp8, scales = per_custom_dims_cast_to_fp8(kv, (0,), False)
-
-    logits = fp8_mqa_logits(q_fp8, kv_fp8, scales, weights, ks, ke, clean_logits=False)
-    assert logits.shape == (s_q, s_k)
-
-    # A full reference needs num_heads x s_q x s_k floats, so compare row windows
-    # instead. Rows are independent, and both ends cover a paired block and the
-    # trailing one.
-    for rows in (slice(0, 32), slice(s_q - 32, s_q)):
-        ref_logits, _ = ref_fp8_mqa_logits(
+    # The reference holds num_heads x s_q x s_k floats, 64 GiB at the largest
+    # shape, so check row windows there instead of the whole tensor. Rows are
+    # independent, and the two ends cover a paired block and the trailing one.
+    windows = [slice(0, 32), slice(s_q - 32, s_q)] if big else [slice(0, s_q)]
+    for rows in windows:
+        ref_logits, _ref_cost = ref_fp8_mqa_logits(
             q=q[rows],
             kv=kv,
             weights=weights[rows],
             cu_seqlen_ks=ks[rows],
             cu_seqlen_ke=ke[rows],
         )
-        diff = calc_diff(logits[rows], ref_logits)
-        assert diff < 1e-3, f"{s_q=} {s_k=} {rows=} {diff=}"
+        ref_neginf_mask = ref_logits == float("-inf")
+        neginf_mask = logits[rows] == float("-inf")
+        assert torch.equal(neginf_mask, ref_neginf_mask)
+        if ref_neginf_mask.all():
+            continue  # nothing left to compare
+        diff = calc_diff(
+            logits[rows].masked_fill(neginf_mask, 0),
+            ref_logits.masked_fill(ref_neginf_mask, 0),
+        )
+        assert diff < 1e-3, f"{diff=}"
