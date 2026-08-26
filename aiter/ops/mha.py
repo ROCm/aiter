@@ -3107,9 +3107,9 @@ def _flash_attn_varlen_forward(
             assert t.is_cuda, f"{name} must be on CUDA"
             assert t.dtype == torch.int32, f"{name} must be int32, actual: {t.dtype}"
             assert t.is_contiguous(), f"{name} must be contiguous"
-            assert t.numel() == cu_seqlens_q.numel(), (
-                f"{name} length mismatch with batch"
-            )
+            assert (
+                t.numel() == cu_seqlens_q.numel()
+            ), f"{name} length mismatch with batch"
             # light monotonic check (first and last only; deeper check in C++)
             assert t[0].item() == 0, f"{name}[0] must be 0"
 
