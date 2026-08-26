@@ -21,36 +21,32 @@ def _expt_data_compute_stage1(
     BLOCK: tl.constexpr,
     EQUAL_BLOCK: tl.constexpr,
 ):
+    offs_n = tl.arange(0, BLOCK)
     if EQUAL_BLOCK:
-        offs_n = tl.arange(0, BLOCK)
         hist_token = tl.load(Hist + offs_n)
-        hist_tile = _cdiv_pow2(hist_token, tile_dim_log2)
-        token_starts = tl.cumsum(hist_token, 0) - hist_token
-        tile_starts = tl.cumsum(hist_tile, 0) - hist_tile
-        tl.store(TokenStart + offs_n, token_starts)
-        tl.store(TileStart + offs_n, tile_starts)
     else:
-        token_acc = tl.zeros([BLOCK], dtype=TokenStart.dtype.element_ty)
-        tile_acc = tl.zeros([BLOCK], dtype=TileStart.dtype.element_ty)
-        offs_n = tl.arange(0, BLOCK)
-        for i in range(0, n_expts_tot, BLOCK):
-            mask_n = offs_n < n_expts_tot
-            hist_token = tl.load(Hist + offs_n, mask=mask_n, other=0)
-            hist_tile = _cdiv_pow2(hist_token, tile_dim_log2)
-            token_starts = tl.cumsum(hist_token, 0) - hist_token + token_acc
-            tile_starts = tl.cumsum(hist_tile, 0) - hist_tile + tile_acc
-            token_acc += tl.sum(hist_token, 0)
-            tile_acc += tl.sum(hist_tile, 0)
+        mask_n = offs_n < n_expts_tot
+        hist_token = tl.load(Hist + offs_n, mask=mask_n, other=0)
+    hist_tile = _cdiv_pow2(hist_token, tile_dim_log2)
+    token_starts = tl.cumsum(hist_token, 0) - hist_token
+    tile_starts = tl.cumsum(hist_tile, 0) - hist_tile
+
+    if pid < n_expts_tot:
+        expt_id = tl.zeros([1], tl.int32) + pid
+        tile_start = tl.gather(tile_starts, expt_id, 0)
+        token_start = tl.gather(token_starts, expt_id, 0)
+        tl.store(TileStart + expt_id, tile_start)
+        tl.store(TokenStart + expt_id, token_start)
+    else:
+        tile_start = tl.zeros([1], tl.int32)
+        if EQUAL_BLOCK:
             tl.store(TokenStart + offs_n, token_starts)
-            tl.store(TileStart + offs_n, tile_starts)
-            offs_n += BLOCK
+        else:
+            tl.store(TokenStart + offs_n, token_starts, mask=mask_n)
 
     if pid == 0:
         tl.store(TokenStart + n_expts_tot, n_gates)
-
-        hist_tok_last = tl.load(Hist + n_expts_tot - 1)
-        hist_tile_last = _cdiv_pow2(hist_tok_last, tile_dim_log2)
-        tile_off_last = tl.load(TileStart + n_expts_tot - 1) + hist_tile_last
+        tile_off_last = tl.sum(hist_tile, 0)
         tl.store(TileStart + n_expts_tot, tile_off_last)
 
         MEMSET_BLOCK: tl.constexpr = 16
@@ -60,10 +56,12 @@ def _expt_data_compute_stage1(
                 MDTileInfo + block_offs, 0xFFFFFFFF, mask=block_offs < max_num_tiles
             )
 
+    return tile_start
+
 
 @triton.jit
 def _expt_data_compute_stage2(
-    pid, Hist, TileStart, TileInfo, tile_dim_log2: tl.constexpr
+    pid, Hist, tile_start, TileInfo, tile_dim_log2: tl.constexpr
 ):
 
     expt_id = pid
@@ -73,7 +71,7 @@ def _expt_data_compute_stage2(
         return
     BLOCK: tl.constexpr = 8
     n_blocks = _cdiv_pow2(n_tokens, tile_dim_log2)
-    TileInfo += tl.load(TileStart + expt_id)
+    TileInfo += tile_start
 
     n_blocks = _cdiv_pow2(n_tokens, tile_dim_log2)
     block_offs = tl.arange(0, BLOCK)
@@ -84,43 +82,9 @@ def _expt_data_compute_stage2(
 
 
 @triton.jit
-def _expt_data_compute_stage2_fused(expt_id, Hist, TileStart, TileInfo):
+def _expt_data_compute_stage2_fused(expt_id, Hist, tile_start, TileInfo):
     n_tokens = tl.load(Hist + expt_id)
     if n_tokens == 0:
         return
-    TileInfo += tl.load(TileStart + expt_id)
+    TileInfo += tile_start
     tl.store(TileInfo, expt_id)
-
-
-@triton.jit
-def _expt_data_only_kernel(
-    Hist,
-    n_expts_tot,
-    TokenStart,
-    TileStart,
-    MDTileInfo,
-    max_num_tiles,
-    n_gates,
-    tile_dim_log2: tl.constexpr,
-    BLOCK: tl.constexpr,
-    EQUAL_BLOCK: tl.constexpr,
-):
-    """Standalone stage1+stage2 launch — builds ExptData from a precomputed
-    histogram with no memset. Grid: (n_expts_tot,)."""
-    pid = tl.program_id(0)
-
-    _expt_data_compute_stage1(
-        pid,
-        Hist,
-        n_expts_tot,
-        TokenStart,
-        TileStart,
-        MDTileInfo,
-        max_num_tiles,
-        n_gates,
-        tile_dim_log2,
-        BLOCK,
-        EQUAL_BLOCK,
-    )
-
-    _expt_data_compute_stage2(pid, Hist, TileStart, MDTileInfo, tile_dim_log2)

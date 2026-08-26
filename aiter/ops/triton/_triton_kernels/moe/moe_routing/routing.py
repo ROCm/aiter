@@ -211,7 +211,7 @@ def _combined_routing(
 
     pid = tl.program_id(0)
 
-    _expt_data_compute_stage1(
+    tile_start = _expt_data_compute_stage1(
         pid,
         ExpertHist,
         n_expts_tot,
@@ -226,7 +226,9 @@ def _combined_routing(
     )
 
     if pid < blocks1a:
-        _expt_data_compute_stage2(pid, ExpertHist, TileStart, MDTileInfo, tile_dim_log2)
+        _expt_data_compute_stage2(
+            pid, ExpertHist, tile_start, MDTileInfo, tile_dim_log2
+        )
     else:
         pid -= blocks1a
         _routing_compute_indx(
@@ -294,12 +296,7 @@ def _combined_routing_fused(
 
     tl.debug_barrier()
 
-    if pid != 0 and pid < blocks1a:
-        n_tokens = tl.load(ExpertHist + pid)
-        if n_tokens == 0:
-            return
-
-    _expt_data_compute_stage1(
+    tile_start = _expt_data_compute_stage1(
         pid,
         ExpertHist,
         N_EXPTS_TOT,
@@ -314,7 +311,7 @@ def _combined_routing_fused(
     )
 
     if pid < blocks1a:
-        _expt_data_compute_stage2_fused(pid, ExpertHist, TileStart, MDTileInfo)
+        _expt_data_compute_stage2_fused(pid, ExpertHist, tile_start, MDTileInfo)
     else:
         _routing_compute_indx_fused(
             GatherIndx,
