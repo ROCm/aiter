@@ -1881,6 +1881,8 @@ def _mxfp4_a4w4_stage2_fw(
     sorted_weights=None,
     kernelName2="",
     reverse_sorted=None,
+    inter_dim_pad: int = 0,
+    model_dim_pad: int = 0,
     **_kwargs,
 ):
 
@@ -1902,15 +1904,20 @@ def _mxfp4_a4w4_stage2_fw(
         # with gemm2_body_v2's native-BM scale-chunk layout at SBM=BM (verified
         # for BM in {16,32,64,128} x epilog {atomic,reduce}).
         if inter_real is not None and inter_real != D_INTER:
-            # This path does not thread the v2 gemm2's K-pad skip (has_pad +
-            # i32_kpad), so the pad columns would be accumulated instead of
-            # skipped. v2 needs K aligned only to its BK, so an unpadded shard
-            # is the intended input here.
-            raise NotImplementedError(
-                f"FlyDSL v2 stage2 requires an unpadded inter_dim shard, got "
-                f"w2.inter_real={inter_real} with D_INTER={D_INTER}. Use a "
-                f"native flydsl_mxmoe_g2 kernelName2 for pre-padded weights."
-            )
+            if not 0 < inter_real < D_INTER:
+                raise ValueError(
+                    f"Invalid w2.inter_real={inter_real} for D_INTER={D_INTER}"
+                )
+            inferred_pad = D_INTER - int(inter_real)
+            if inter_dim_pad not in (0, inferred_pad):
+                raise ValueError(
+                    f"inter_dim_pad={inter_dim_pad} disagrees with "
+                    f"w2.inter_real={inter_real} and D_INTER={D_INTER}"
+                )
+            # Some callers only preserve the tensor metadata, while others
+            # pass the fused_moe pad explicitly. Accept either source when
+            # they describe the same physical-K layout.
+            inter_dim_pad = inferred_pad
         return _flydsl_v2_stage2_wrapper(
             inter_states=inter_states,
             w1=None,
@@ -1927,6 +1934,8 @@ def _mxfp4_a4w4_stage2_fw(
             w2_scale=w2_scale,
             a2_scale=a2_scale,
             sorted_weights=sorted_weights,
+            inter_dim_pad=inter_dim_pad,
+            model_dim_pad=model_dim_pad,
             block_m=block_m,
         )
     out = _mxfp4_a4w4_stage2(
@@ -2097,6 +2106,7 @@ def _flydsl_v2_stage2_wrapper(
         g2_bf16_lds=cfg["bf16_lds"],
         g2_spart=cfg["spart"],
         out_dtype="fp8" if _s2_fp8_inter else "bf16",
+        bias=bias2,
     )
     if epilog == "reduce":
         from aiter.ops.flydsl.moe_kernels import _run_moe_reduction
@@ -2493,7 +2503,12 @@ def get_2stage_cfgs(
                 kernelName1=kernelName1,
                 interleave=(gate_mode == GateMode.INTERLEAVE),
             ),
-            stage2=functools.partial(_mxfp4_a4w4_stage2_fw, kernelName2=kernelName2),
+            stage2=functools.partial(
+                _mxfp4_a4w4_stage2_fw,
+                kernelName2=kernelName2,
+                inter_dim_pad=intermediate_pad,
+                model_dim_pad=hidden_pad,
+            ),
             block_m=_bm,
             ksplit=int(ksplit),
             fuse_quant="fp4",
@@ -2620,8 +2635,7 @@ def get_2stage_cfgs(
             run_1stage,
             has_bias=enable_bias and (is_opus1 or is_flydsl1),
             fuse_quant=_fuse_quant,
-            stage2_has_bias=enable_bias
-            and ((is_flydsl2 and not is_flydsl2_layout) or is_cktile2),
+            stage2_has_bias=enable_bias and (is_flydsl2 or is_cktile2),
             skip_inter_quant="_moe2_layout_" in str(kernelName2),
             **route_bucket_metadata,
         )
@@ -3095,6 +3109,18 @@ def fused_moe_2stages(
             M = sorted_ids.shape[0]
             a1_scale = torch.ones(
                 [M, a1.shape[-1] // 32], dtype=dtypes.fp8_e8m0, device=a1.device
+            )
+        elif hidden_states.dtype == dtypes.fp8 and a1_scale is not None:
+            # MXFP8 dispatch passthrough: activations already carry group-32 e8m0
+            # scales, so skip the quant and only sort the scale, exactly as the
+            # fp4x2 pre-quantized branch below does.
+            a1 = hidden_states
+            a1_scale = mxfp4_moe_sort_fwd(
+                a1_scale,
+                sorted_ids=sorted_ids,
+                num_valid_ids=num_valid_ids,
+                token_num=token_num,
+                cols=model_dim,
             )
         else:
             # stage1 input is not topk-replicated, so M==token_num and the HIP
