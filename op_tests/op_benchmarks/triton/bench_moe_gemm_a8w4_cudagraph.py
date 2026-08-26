@@ -474,7 +474,6 @@ def bench_mlp_single_weight_init(
     # uncompressed [n_tokens, dim1] rows the reduction then combines.
     moe2_bytes = (
         x2.numel() * x2.element_size()
-        + x2.numel() // 32
         + w_bytes(w2)
         + w_scale_bytes(w2)
         + n_tokens * dim1 * y2.element_size()
