@@ -522,11 +522,11 @@ _BWD_CSV_COLUMNS: list[str] = [
     "block_n",
     "num_waves",
     "waves_per_eu",
-    "duration",
+    "duration_us",
 ]
 
 # Columns that identify the *problem* (everything except the tuned tile params +
-# duration).
+# duration_us).
 _BWD_TILE_COLUMNS = ("block_m", "block_n", "num_waves", "waves_per_eu")
 
 
@@ -537,7 +537,7 @@ def _bwd_tuned_config_map(tuned_file: str | None = None) -> dict[tuple, dict]:
         if not required.issubset(row.keys()):
             raise KeyError(f"missing columns: {required - set(row.keys())}")
 
-        duration = float(row["duration"])
+        duration = float(row["duration_us"])
 
         problem_key = _problem_key(
             row["arch"],

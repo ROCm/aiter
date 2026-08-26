@@ -632,6 +632,12 @@ def build_hstu_attention_bwd_dq(
             gpu.barrier()  # V published; K still resident in LDS for dQ's B-operand
             ds_packs = compute_ds_packs(g_meta)
             dq_acc = accum_dq_tile(dq_acc, ds_packs)
+            # accum_dq_tile reads the K/V LDS tiles at the end of the body, so without a
+            # closing barrier a wave that finishes early wraps around and DMAs the next
+            # tile over LDS another wave is still reading (WAR). Left open, dQ is wrong
+            # and not bitwise reproducible once batch*num_heads is large enough for
+            # waves to drift apart across tiles.
+            gpu.barrier()
             return dq_acc
 
         if active:

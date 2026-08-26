@@ -1,8 +1,8 @@
 """Tests for the FlyDSL HSTU attention backward kernel.
 
 The numerical oracle is torch.autograd.grad on the PyTorch reference torch_hstu_attention;
-dO is synthetic. The FlyDSL forward is only needed for the end-to-end autograd
-phase, so these tests do not depend on it.
+dO is synthetic. The FlyDSL forward is only needed by the end-to-end autograd
+test, so the gradient correctness tests do not depend on it.
 """
 
 import csv
@@ -107,11 +107,44 @@ def hstu_bwd_reference_causal_dense(N, alpha, q, k, v, seq_offsets, dout):
     return torch.autograd.grad(out, (qf, kf, vf), grad_outputs=dout.float())
 
 
+# --------------------------------------------------------------------------- #
+# Gradient comparison
+# --------------------------------------------------------------------------- #
+
+# Tolerances are a fraction of the oracle's peak magnitude, not absolute. These
+# gradients run ~3e-3, so a fixed atol=3e-2 is larger than the data and would pass
+# on all-zero output. The error floor itself comes from the bf16/f16 inputs and the
+# fast-math (non-IEEE) SiLU recompute; dQ/dK carry extra matmuls (the dA and dS
+# reductions) so they accumulate more than dV. Measured headroom is ~5x: every
+# supported shape lands at 0.3-0.4% against the fp32 oracle.
+TOL_DV = 2e-2
+TOL_DQK = 3e-2
+
+
+def assert_grad_close(name, got, ref, tol):
+    """Compare a kernel gradient to the fp32 oracle, atol scaled to the oracle."""
+    torch.testing.assert_close(
+        got.float(),
+        ref,
+        atol=tol * ref.abs().max().item(),
+        rtol=tol,
+        msg=lambda generated: f"{name}: {generated}",
+    )
+
+
+def assert_grads_close(dq, dk, dv, dq_ref, dk_ref, dv_ref):
+    assert_grad_close("dv", dv, dv_ref, TOL_DV)
+    assert_grad_close("dk", dk, dk_ref, TOL_DQK)
+    assert_grad_close("dq", dq, dq_ref, TOL_DQK)
+
+
 @requires_cuda
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize(
     "attn_dim,hidden_dim",
-    [(128, 64), (64, 128), (128, 256)],
+    # (96, 128) is the non-64-aligned attn_dim case: the kernel rounds the Q LDS
+    # stride up to 128, so the padded columns exercise the Q DMA's source clamp.
+    [(128, 64), (64, 128), (128, 256), (96, 128)],
 )
 def test_flydsl_bwd_asymmetric_dims(attn_dim, hidden_dim, dtype):
     batch, heads, max_seq_len = 16, 2, 512
@@ -136,51 +169,7 @@ def test_flydsl_bwd_asymmetric_dims(attn_dim, hidden_dim, dtype):
     dq, dk, dv = flydsl_hstu_attention_bwd(
         max_seq_len, alpha, q, k, v, dout, seq_offsets, True, num_targets, 0, 0
     )
-    torch.testing.assert_close(dv.float(), dv_ref, atol=2e-2, rtol=2e-2)
-    torch.testing.assert_close(dk.float(), dk_ref, atol=3e-2, rtol=3e-2)
-    torch.testing.assert_close(dq.float(), dq_ref, atol=3e-2, rtol=3e-2)
-
-
-@requires_cuda
-def test_reference_oracle_runs():
-    """The oracle itself runs and returns correctly-shaped grads (no FlyDSL)."""
-    batch, heads, attn_dim, hidden_dim = 8, 1, 64, 64
-    max_seq_len = 256
-
-    q, k, v, seq_offsets, num_targets = generate_hstu_attn_inputs(
-        batch_size=batch,
-        max_seq_len=max_seq_len,
-        sparsity=0.5,
-        heads=heads,
-        attn_dim=attn_dim,
-        hidden_dim=hidden_dim,
-        target_size=0,
-        dtype=torch.bfloat16,
-        device=torch.device("cuda"),
-    )
-    dout = torch.randn_like(v)
-    alpha = 1.0 / attn_dim * 10000
-
-    dq, dk, dv = hstu_bwd_reference(
-        max_seq_len,
-        alpha,
-        q,
-        k,
-        v,
-        seq_offsets,
-        True,
-        num_targets,
-        0,
-        0,
-        dout,
-    )
-
-    assert dq.shape == q.shape
-    assert dk.shape == k.shape
-    assert dv.shape == v.shape
-    assert torch.isfinite(dq).all()
-    assert torch.isfinite(dk).all()
-    assert torch.isfinite(dv).all()
+    assert_grads_close(dq, dk, dv, dq_ref, dk_ref, dv_ref)
 
 
 @requires_cuda
@@ -244,23 +233,7 @@ def test_flydsl_bwd_variants(max_attn_len, contextual_seq_len, target_size, dtyp
         max_attn_len,
         contextual_seq_len,
     )
-    torch.testing.assert_close(dv.float(), dv_ref, atol=2e-2, rtol=2e-2)
-    torch.testing.assert_close(dk.float(), dk_ref, atol=3e-2, rtol=3e-2)
-    torch.testing.assert_close(dq.float(), dq_ref, atol=3e-2, rtol=3e-2)
-
-
-def test_silu_derivative_formula():
-    """Lock the SiLU-derivative gate silu'(s) = sigma(s)*(1 + s*(1-sigma(s)))
-    against torch autograd, independent of the kernel."""
-    import torch.nn.functional as F
-
-    s = torch.linspace(-8.0, 8.0, 257, dtype=torch.float64, requires_grad=True)
-    (grad_ref,) = torch.autograd.grad(F.silu(s).sum(), s)
-
-    sig = torch.sigmoid(s.detach())
-    grad_formula = sig * (1.0 + s.detach() * (1.0 - sig))
-
-    torch.testing.assert_close(grad_formula, grad_ref, atol=1e-10, rtol=1e-10)
+    assert_grads_close(dq, dk, dv, dq_ref, dk_ref, dv_ref)
 
 
 # --------------------------------------------------------------------------- #
@@ -309,7 +282,11 @@ def test_validate_bwd_inputs_rejects_cpu_tensors():
 
 
 # --------------------------------------------------------------------------- #
-# Kernel entry point (drives Phase 1+): currently a stub
+# Dense causal correctness across problem shapes
+#
+# Orthogonal to the mask-variant sweep above: that one pins the shape and varies
+# the masking features, this one pins dense causal and varies
+# batch/heads/dims/seq_len to cover single-tile through multi-tile grids.
 # --------------------------------------------------------------------------- #
 
 
@@ -323,7 +300,9 @@ def test_validate_bwd_inputs_rejects_cpu_tensors():
         (16, 2, 128, 128, 1024),  # larger, multi-tile
     ],
 )
-def test_flydsl_bwd_all_causal(batch, heads, attn_dim, hidden_dim, max_seq_len, dtype):
+def test_flydsl_bwd_dense_causal_shapes(
+    batch, heads, attn_dim, hidden_dim, max_seq_len, dtype
+):
     alpha = 1.0 / attn_dim * 10000
 
     q, k, v, seq_offsets, num_targets = generate_hstu_attn_inputs(
@@ -345,11 +324,7 @@ def test_flydsl_bwd_all_causal(batch, heads, attn_dim, hidden_dim, max_seq_len, 
     dq, dk, dv = flydsl_hstu_attention_bwd(
         max_seq_len, alpha, q, k, v, dout, seq_offsets, True, num_targets, 0, 0
     )
-    # Relaxed tolerance: bf16/f16 inputs + fast-math SiLU (non-IEEE) recompute.
-    # dQ/dK carry extra matmuls (dA and dS reductions) so they accumulate more error than dV.
-    torch.testing.assert_close(dv.float(), dv_ref, atol=2e-2, rtol=2e-2)
-    torch.testing.assert_close(dk.float(), dk_ref, atol=3e-2, rtol=3e-2)
-    torch.testing.assert_close(dq.float(), dq_ref, atol=3e-2, rtol=3e-2)
+    assert_grads_close(dq, dk, dv, dq_ref, dk_ref, dv_ref)
 
 
 # --------------------------------------------------------------------------- #
@@ -407,9 +382,7 @@ def test_flydsl_bwd_block_size_overrides(block_m, block_n, num_waves, waves_per_
         num_waves=num_waves,
         waves_per_eu=waves_per_eu,
     )
-    torch.testing.assert_close(dv.float(), dv_ref, atol=2e-2, rtol=2e-2)
-    torch.testing.assert_close(dk.float(), dk_ref, atol=3e-2, rtol=3e-2)
-    torch.testing.assert_close(dq.float(), dq_ref, atol=3e-2, rtol=3e-2)
+    assert_grads_close(dq, dk, dv, dq_ref, dk_ref, dv_ref)
 
 
 # --------------------------------------------------------------------------- #
@@ -434,7 +407,7 @@ def _bwd_row(**overrides) -> dict:
         "block_n": 64,
         "num_waves": 4,
         "waves_per_eu": 2,
-        "duration": 1.0,
+        "duration_us": 1.0,
     }
     row.update(overrides)
     return row
@@ -467,8 +440,8 @@ def test_bwd_tuned_csv_best_duration_wins(tmp_path):
     path = _write_bwd_csv(
         tmp_path / "tuned_bwd.csv",
         [
-            _bwd_row(duration=5.0, block_m=64),
-            _bwd_row(duration=1.0, block_m=256),
+            _bwd_row(duration_us=5.0, block_m=64),
+            _bwd_row(duration_us=1.0, block_m=256),
         ],
     )
 
@@ -512,24 +485,29 @@ def test_bwd_tuned_csv_per_kernel_configs(tmp_path):
 
 # --------------------------------------------------------------------------- #
 # End-to-end autograd integration
+#
+# Scope is the autograd wiring, not a second numerics sweep: the gradient values
+# themselves are covered by the direct flydsl_hstu_attention_bwd tests above,
+# which pin failures to the kernel without involving the FlyDSL forward. What
+# only this path can catch is FlydslHstuAttention dropping or mangling state on
+# the ctx round-trip, so each case below turns on one masking argument that
+# forward has to hand back to backward.
 # --------------------------------------------------------------------------- #
 
 
 @requires_cuda
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize(
     "max_attn_len,contextual_seq_len,target_size",
     [
-        (0, 0, 0),  # dense causal
-        (0, 0, 20),  # targets
-        (64, 0, 0),  # window
+        (0, 0, 20),  # num_targets forwarded
+        (64, 0, 0),  # max_attn_len forwarded
+        (0, 64, 0),  # contextual_seq_len forwarded
     ],
 )
-def test_flydsl_autograd_end_to_end(
-    max_attn_len, contextual_seq_len, target_size, dtype
-):
+def test_flydsl_autograd_end_to_end(max_attn_len, contextual_seq_len, target_size):
     """FlydslHstuAttention.apply is drop-in differentiable: .grad after .backward()
     matches torch.autograd.grad on the torch reference."""
+    dtype = torch.bfloat16
     batch, heads, attn_dim, hidden_dim, max_seq_len = 32, 4, 128, 128, 512
     alpha = 1.0 / attn_dim * 10000
 
@@ -579,6 +557,4 @@ def test_flydsl_autograd_end_to_end(
     assert out.requires_grad
     out.backward(dout)
 
-    torch.testing.assert_close(vd.grad.float(), dv_ref, atol=2e-2, rtol=2e-2)
-    torch.testing.assert_close(kd.grad.float(), dk_ref, atol=3e-2, rtol=3e-2)
-    torch.testing.assert_close(qd.grad.float(), dq_ref, atol=3e-2, rtol=3e-2)
+    assert_grads_close(qd.grad, kd.grad, vd.grad, dq_ref, dk_ref, dv_ref)

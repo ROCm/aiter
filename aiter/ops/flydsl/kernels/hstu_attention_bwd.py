@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+
 """hstu_attention_bwd - FlyDSL KV-owned **fused** backward (dV + dK in one pass)
 
 Backward of HSTU attention. Given dO, recompute S = alpha*Q*K^T and sigma from
@@ -257,6 +260,10 @@ def build_hstu_attention_bwd_dvdk(
     stride_qk_n = num_heads * head_dim
 
     Q_STRIDE = HEAD_DIM_K
+    # Columns in [head_dim, HEAD_DIM_K) have no backing element in this head, so the
+    # Q DMA source needs clamping (see async_load_q). Only live when padded; a
+    # 64-aligned head_dim makes it compile-time false and emits no compare/select.
+    Q_COL_GUARD = head_dim < HEAD_DIM_K
     DO_STRIDE = hidden_dim
 
     q_tile_elems = BLOCK_N * Q_STRIDE
@@ -390,11 +397,6 @@ def build_hstu_attention_bwd_dvdk(
         do_lds_byte_base = buffer_ops.extract_base_index(do_view, address_space=3)
 
         # ── Copy-atom global->LDS DMA (buffer_load_lds via fx.copy) ──
-        # Mirrors flash_attn_gfx950's _buffer_load_lds helper: a BufferCopyLDS atom
-        # drives the same buffer_load_lds instruction the raw ROCDL path did, but
-        # through the FlyDSL copy-atom API (rebased buffer view + fx.copy). The atom
-        # only exposes soffset/imm-offset state and hardcodes the cache-policy/aux
-        # operand to 0, so this intentionally drops the raw path's aux=1.
         _buf_flags_i32 = fx.Int32(buffer_ops._get_buffer_flags())
         _dma_atom = fx.make_copy_atom(
             fx.rocdl.BufferCopyLDS(DMA_BYTES * 8), DMA_BYTES * 8
@@ -561,13 +563,21 @@ def build_hstu_attention_bwd_dvdk(
         wave_lds_lane0_q = rocdl.readfirstlane(fx.Int64.ir_type, wave_lds_base_q)
         q_dma_rows = []
         q_dma_gcols = []
+        q_dma_col_ok = []
         for d in range_constexpr(NUM_DMA_Q):
             pair = tid + fx.Int32(d * BLOCK_THREADS)
             row = pair // c_pairs_per_row_q
             col_pair = pair % c_pairs_per_row_q
             col = col_pair * c_dma_elems
+            row_gcol = q_swz_col(row, col)
             q_dma_rows.append(row)
-            q_dma_gcols.append(q_swz_col(row, col))
+            q_dma_gcols.append(row_gcol)
+            if const_expr(Q_COL_GUARD):
+                # The swizzle XORs within a 64-column block above the DMA granule, so
+                # the fetched column stays DMA_ELEMS-aligned and head_dim % MFMA_K == 0
+                # means an in-range start never straddles head_dim. Loop-invariant in
+                # q_start, so hoisted out of the query sweep.
+                q_dma_col_ok.append(row_gcol < fx.Int32(head_dim))
 
         c_stride_qk_n = fx.Int32(stride_qk_n)
 
@@ -577,6 +587,15 @@ def build_hstu_attention_bwd_dvdk(
                 in_bounds = (q_start + row) < seq_len
                 local_tok = in_bounds.select(q_start + row, fx.Int32(0))
                 src_elem = local_tok * c_stride_qk_n + q_dma_gcols[d]
+                if const_expr(Q_COL_GUARD):
+                    # A pad column would index into the next head, and on the last
+                    # token/head past the tensor entirely -- the rebased descriptor
+                    # carries a 4 GiB bound, so the hardware does not clamp it. Fold
+                    # those lanes onto element 0. compute_s_tile pairs every pad
+                    # contraction step with a zero K operand, so the value never
+                    # reaches an output; it only has to be finite, since 0 * NaN
+                    # would poison S.
+                    src_elem = q_dma_col_ok[d].select(src_elem, fx.Int32(0))
                 lds_byte = fx.Int32(
                     wave_lds_lane0_q + fx.Int64(d * BLOCK_THREADS * DMA_BYTES)
                 )
@@ -800,6 +819,11 @@ def build_hstu_attention_bwd_dvdk(
             dk_acc = [acc[N_ACC_DV + i] for i in range(N_ACC_DK)]
             dv_acc = accum_dv_tile(dv_acc, p_packs)
             dk_acc = accum_dk_tile(dk_acc, compute_ds_packs(s_meta))
+            # _dk_gather reads the Q LDS tile at the very end of the body, so without a
+            # closing barrier a wave that finishes early wraps around and DMAs the next
+            # tile over LDS another wave is still reading (WAR). Left open, dK is not
+            # bitwise reproducible run to run.
+            gpu.barrier()
             return dv_acc + dk_acc
 
         if active:

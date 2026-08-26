@@ -31,9 +31,13 @@ from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 from aiter.ops.flydsl.hstu_attention_kernels import flydsl_hstu_attention_bwd
 
-# torch-autograd oracle from the pytest correctness suite (single source of truth;
-# it lives at module top level for exactly this reuse).
-from op_tests.flydsl_tests.test_flydsl_hstu_attention_bwd import hstu_bwd_reference
+# torch-autograd oracle and tolerances from the pytest correctness suite (single
+# source of truth; they live at module top level for exactly this reuse).
+from op_tests.flydsl_tests.test_flydsl_hstu_attention_bwd import (
+    TOL_DQK,
+    TOL_DV,
+    hstu_bwd_reference,
+)
 
 torch.set_default_device("cuda")
 
@@ -115,29 +119,25 @@ def test_flydsl_hstu_bwd(b, h, n, d, dtype, mask):
     )
 
     msg = f"{mask} B{b}H{h}N{n}d{d}"
-    # dQ/dK carry the extra dA/dS reductions, so they accumulate more bf16/fast-math
-    # error than dV — same relaxed tolerances the pytest suite locks in.
-    err_dv = checkAllclose(
-        dv.to(dtypes.fp32),
-        dv_ref.to(dtypes.fp32),
-        rtol=2e-2,
-        atol=2e-2,
-        msg=f"{msg}: dv",
-    )
-    err_dk = checkAllclose(
-        dk.to(dtypes.fp32),
-        dk_ref.to(dtypes.fp32),
-        rtol=3e-2,
-        atol=3e-2,
-        msg=f"{msg}: dk",
-    )
-    err_dq = checkAllclose(
-        dq.to(dtypes.fp32),
-        dq_ref.to(dtypes.fp32),
-        rtol=3e-2,
-        atol=3e-2,
-        msg=f"{msg}: dq",
-    )
+
+    # Tolerances scale with the oracle's peak, matching the pytest suite: these
+    # gradients run ~1e-3, so a fixed atol would exceed the data and pass on
+    # all-zero output. dQ/dK carry the extra dA/dS reductions, so they accumulate
+    # more bf16/fast-math error than dV.
+    def _check(got, ref, tol, name):
+        ref_f32 = ref.to(dtypes.fp32)
+        scale = ref_f32.abs().max().item()
+        return checkAllclose(
+            got.to(dtypes.fp32),
+            ref_f32,
+            rtol=tol,
+            atol=tol * scale,
+            msg=f"{msg}: {name}",
+        )
+
+    err_dv = _check(dv, dv_ref, TOL_DV, "dv")
+    err_dk = _check(dk, dk_ref, TOL_DQK, "dk")
+    err_dq = _check(dq, dq_ref, TOL_DQK, "dq")
 
     # Roofline. Causal pairs per sequence = L*(L+1)/2; bwd = 3*f1 + 2*f2 with
     # f1 = 2*attn_dim (S recompute / dK / dQ share the attn-dim contraction),
