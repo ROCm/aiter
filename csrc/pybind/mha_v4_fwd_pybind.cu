@@ -22,6 +22,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("k_scale_mode"),
           py::arg("v_scale_mode"),
           py::arg("softmax_scale"));
+    m.def("rotate_activation_hd128",
+          &aiter::torch_itfs::rotate_activation_hd128,
+          py::arg("out"),
+          py::arg("input"));
     m.def("rotate_activation_mxfp8_quant",
           &aiter::torch_itfs::rotate_activation_mxfp8_quant,
           py::arg("out"),
