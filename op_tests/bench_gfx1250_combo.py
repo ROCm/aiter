@@ -15,11 +15,97 @@ are then printed to real stdout.
 Run from the aiter repo root so `op_tests/` siblings import cleanly:
 
     cd /app/aiter
-    python op_tests/bench_gfx1250_combo.py            # all ops, curated defaults
-    python op_tests/bench_gfx1250_combo.py --ops mha  # just one op
-    python op_tests/bench_gfx1250_combo.py --ops moe  # just FlyDSL MoE
-    python op_tests/bench_gfx1250_combo.py --ops gemm  # just gemm_a4w4 (16384^3)
-    python op_tests/bench_gfx1250_combo.py --ops mla_v4  # asm vs Triton MLA v4 compare
+    # Hardware-oriented single-op performance (no model-specific shape contract).
+    python op_tests/bench_gfx1250_combo.py --perf                 # all perf ops
+    python op_tests/bench_gfx1250_combo.py --perf --ops mha       # MHA
+    python op_tests/bench_gfx1250_combo.py --perf --ops moe       # grouped MoE FC1/FC2 (a4w4 + a8w4)
+    python op_tests/bench_gfx1250_combo.py --perf --ops gemm      # F4GEMM
+    python op_tests/bench_gfx1250_combo.py --perf --ops f8gemm    # F8GEMM
+    python op_tests/bench_gfx1250_combo.py --perf --ops mla_v4_decode  # MLA v4 decode
+
+    # DeepSeek-V4 operators at the model shapes used by the DSv4 workload.
+    python op_tests/bench_gfx1250_combo.py --dsv4                 # all DSv4 ops
+    python op_tests/bench_gfx1250_combo.py --dsv4 --ops moe       # grouped MoE FC1/FC2 (DSv4 a8w4)
+    python op_tests/bench_gfx1250_combo.py --dsv4 --ops a8w8_blockscale  # DSv4 FP8 linears
+    python op_tests/bench_gfx1250_combo.py --dsv4 --ops a16w16    # DSv4 BF16 linears
+    python op_tests/bench_gfx1250_combo.py --dsv4 --ops mla_v4_decode   # sparse MLA v4 decode
+    python op_tests/bench_gfx1250_combo.py --dsv4 --ops mla_v4_prefill  # MLA v4 prefill
+    python op_tests/bench_gfx1250_combo.py --dsv4 --ops mhc       # mHC fused RMSNorm
+    python op_tests/bench_gfx1250_combo.py --dsv4 --ops qk_norm   # QK norm + RoPE
+    python op_tests/bench_gfx1250_combo.py --dsv4 --ops score_qk  # FP8 paged MQA logits
+    python op_tests/bench_gfx1250_combo.py --dsv4 --ops mori_ep   # MORI EPv2 dispatch/combine
+    python op_tests/bench_gfx1250_combo.py --dsv4 --ops mega_moe  # Mega on/off, 4 GPUs
+
+The ``mori_ep`` op updates and installs ``${MORI:-/app/mori}``, then runs its
+existing EPv2 benchmark. Environment variables select backend, token tiers,
+eager/graph modes, EP size, dispatch dtype, and correctness checking:
+
+    TOKENS=512 MODES=graph \
+      python op_tests/bench_gfx1250_combo.py --dsv4 --ops mori_ep
+
+The ``mhc`` op runs:
+
+    python3 op_tests/test_mhc.py -n 7168 -m 512 --fuse_rmsnorm
+
+The ``qk_norm`` op runs both DSv4 phases:
+
+    python3 op_tests/test_flydsl_qk_norm_rope_quant.py \
+      -T 16384 --H 128 --D 512 --RD 64 --no-quant --qweight
+
+    python3 op_tests/test_flydsl_qk_norm_rope_quant.py \
+      -T 1 2 4 8 16 32 64 --H 128 --D 512 --RD 64 --no-quant --qweight
+
+The ``score_qk`` op runs two decode KV lengths at batch 512:
+
+    python3 op_tests/op_benchmarks/triton/bench_deepgemm_attention.py \
+      --batch 512 --heads 64 --index_dim 128 -kv_length 384 -mtp 0 \
+      --kv_preshuffle --blocksize 64
+
+    python3 op_tests/op_benchmarks/triton/bench_deepgemm_attention.py \
+      --batch 512 --heads 64 --index_dim 128 -kv_length 10240 -mtp 0 \
+      --kv_preshuffle --blocksize 64
+
+For the 1K-input/1K-output workload, the average decode context is 1536 source
+tokens. CSA compresses KV by 4, so score-QK scans an average KV length of 384.
+
+The DSv4 ``mla_v4_decode`` op runs sparse decode with GQA/H=128, batch=512 and
+q_seq=1 (M=512), sweeping KV lengths 256/512/1024 and split counts 1/2/4.
+
+The DSv4 ``mla_v4_prefill`` op runs four FP8 performance cases at M=16384,
+H=128 and D=512: compressed prefix-pool rows 4096/16384 crossed with
+dense/sparse CSR modes. The current 16K-token chunk remains uncompressed:
+
+    python3 op_tests/test_pa_sparse_prefill_opus.py \
+      -n 16384 --h_q 128 -d 512 \
+      --total_pages 4096 16384 --total_tokens 16384 \
+      --prec fp8 --mode dense sparse --no-verify
+
+The ``a8w8_blockscale`` op runs:
+
+    python3 op_tests/test_gemm_a8w8_blockscale.py \
+      -m 512 \
+      -nk 2048,7168 7168,16384 6144,7168 \
+          7168,3072 65536,1536 8192,1536 \
+      --ck_preshuffle True --flydsl
+
+The ``a16w16`` op uses ``test_opus_a16w16_gemm.py`` with batch=1, M=512,
+K=7168 and N=64,384,1024,2048,32320,129280.
+
+The ``mega_moe`` op runs both sides of the comparison:
+
+    MORI_V2_KERNEL_BACKEND=hip MEGA_DISPATCH=mori \
+    torchrun --standalone --nproc_per_node=4 \
+      op_tests/multigpu_tests/test_mega_moe_gfx1250.py \
+      -e 384 -k 6 -hd 7168 -id 3072 \
+      --layers 61 -tpr 512 --combine scatter_fused \
+      --acc_verify 0 --profile_table 1
+
+    MORI_V2_KERNEL_BACKEND=hip MEGA_DISPATCH=mori \
+    torchrun --standalone --nproc_per_node=4 \
+      op_tests/multigpu_tests/test_mega_moe_gfx1250.py \
+      -e 384 -k 6 -hd 7168 -id 3072 \
+      --layers 61 -tpr 512 --combine gather \
+      --acc_verify 0 --profile_table 1
 
 gfx1250's bundled CK does not compile, so the asm JIT modules must be built with
 ENABLE_CK=0. The script sets it (before importing aiter) so a plain run just
@@ -44,6 +130,7 @@ os.environ.setdefault("AITER_FORCE_GFX1250", "1")
 import argparse
 import contextlib
 import itertools
+import subprocess
 import sys
 import warnings
 
@@ -86,6 +173,8 @@ with _silence():
     import test_flydsl_grouped_gemm_gfx1250 as moe_mod
     import test_fmha_fwd_with_sink_asm as mha_mod  # has __main__ guard
     import test_mla_v4_kargpreld as mla_v4_kargpreld_mod
+    import test_mxfp8fp4gemm as f8gemm_mod
+    import test_opus_a16w16_gemm as a16w16_mod
     import torch
     from triton_tests.attention import test_mla_v4_triton as mla_v4_triton_mod
 
@@ -226,6 +315,7 @@ _MOE_CONFIG = {
     "use_bias": False,
 }
 _GEMM_KEEP = [
+    "workload",
     "intype",
     "M",
     "N",
@@ -234,13 +324,20 @@ _GEMM_KEEP = [
     "outtype",
     "data_init",
     "scale_init",
+    "knl_name",
     "asm us",
     "asm TFLOPS",
     "asm TB/s",
+    "asm err",
+    "asm result",
 ]
-# gemm_a4w4 throughput square only (no FUNC_SHAPES / other M,N,K sweeps).
+# gemm_a4w4 throughput square.
 _GEMM_A4W4_SHAPE = (16384, 16384, 16384)
 
+_F8GEMM_PERF_SHAPES = {
+    "a8w8": [(32768, 16384, 8192), (2, 1048576, 16384)],
+    "a8w4": [(16384, 16384, 16384), (2, 1048576, 16384)],
+}
 # Curated (gqa_ratio, batch, kv_seq_lens, num_kv_splits) grid for MLA v4 nm
 # kernarg-preload perf (mirrors op_tests/test_mla_v4_kargpreld.py sweep subset).
 _MLA_V4_KARGPRELD_SHAPES = [
@@ -262,6 +359,11 @@ _MLA_V4_KARGPRELD_SHAPES = [
     (128, 64, 1024, 1),
     (128, 64, 1024, 2),
     (128, 64, 1024, 4),
+]
+_MLA_V4_DSV4_SHAPES = [
+    (128, 512, kv_seq_lens, num_kv_splits)
+    for kv_seq_lens in (256, 512, 1024)
+    for num_kv_splits in (1, 2, 4)
 ]
 _MLA_V4_COMPARE_KEEP = [
     "dtype",
@@ -323,7 +425,8 @@ def run_moe(args):
     tokens = cfg["tokens"]
     activation = moe_mod.ActivationType.Silu
     rows = []
-    for fmt in _MOE_DATA_FORMATS:
+    data_formats = ["a8w4"] if args.suite == "dsv4" else _MOE_DATA_FORMATS
+    for fmt in data_formats:
         moe_mod.set_data_format(fmt)
         with _silence():
             metrics = moe_mod.run_moe(
@@ -390,19 +493,266 @@ def run_moe(args):
 
 
 def run_gemm(args):
-    # op_tests/test_f4gemm.py perf-mode intype/outtype/init sweep at one shape only.
+    # Hardware throughput sweep only. Functional/UT mode belongs in the source
+    # op test and is intentionally not exposed by this performance driver.
     M, N, K = _GEMM_A4W4_SHAPE
-    rows = []
     init_pairs = [("constant", "constant"), ("uniform", "auto")]
+    rows = []
     with _silence():
-        for (di, si), intype, apre, outtype in itertools.product(
+        for (di, si), intype, outtype in itertools.product(
             init_pairs,
             ["mxfp4", "nvfp4"],
-            [1],
             ["bf16", "fp8"],
         ):
-            rows.append(gemm_mod.test_gemm(intype, M, N, K, apre, outtype, di, si))
-    _print_table("gemm_a4w4", rows, keep=_GEMM_KEEP)
+            rows.append(
+                gemm_mod.test_gemm(
+                    intype,
+                    M,
+                    N,
+                    K,
+                    1,
+                    outtype,
+                    di,
+                    si,
+                    mode="perf",
+                )
+            )
+    _print_table("gemm_a4w4 (perf)", rows, keep=_GEMM_KEEP)
+
+
+def run_f8gemm(args):
+    # Generic MXFP8 hardware sweep. DSv4's projection path uses the separate
+    # a8w8_blockscale runner below, not this F8GEMM kernel family.
+    rows = []
+    with _silence():
+        cases = [
+            ("hardware", intype, M, N, K, di, si)
+            for (di, si), intype in itertools.product(
+                [("constant", "constant"), ("uniform", "auto")],
+                ["a8w8", "a8w4"],
+            )
+            for M, N, K in _F8GEMM_PERF_SHAPES[intype]
+        ]
+        for workload, intype, M, N, K, di, si in cases:
+            row = f8gemm_mod.test_gemm(
+                intype,
+                M,
+                N,
+                K,
+                1,
+                data_init=di,
+                scale_init=si,
+                mode="perf",
+            )
+            if row is not None:
+                row["workload"] = workload
+            rows.append(row)
+    _print_table(f"mxfp8fp4gemm ({args.suite})", rows, keep=_GEMM_KEEP)
+
+
+def run_a8w8_blockscale(_args):
+    """Run DSv4 FP8 blockscale linear projections at M=512."""
+    print("\n===== gemm_a8w8_blockscale (DSv4) =====", flush=True)
+    subprocess.run(
+        [
+            sys.executable,
+            "op_tests/test_gemm_a8w8_blockscale.py",
+            "-m",
+            "512",
+            "-nk",
+            "2048,7168",
+            "7168,16384",
+            "6144,7168",
+            "7168,3072",
+            "65536,1536",
+            "8192,1536",
+            "--ck_preshuffle",
+            "True",
+            "--flydsl",
+        ],
+        cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        check=True,
+    )
+
+
+def run_a16w16(_args):
+    """Run the DSv4 BF16 linear shapes through the Opus GEMM UT."""
+    print("\n===== gemm_a16w16_opus (DSv4) =====", flush=True)
+    for n in (64, 384, 1024, 2048, 32320, 129280):
+        a16w16_mod.test_a16w16(
+            batch=1,
+            M=512,
+            N=n,
+            K=7168,
+        )
+
+
+def run_mega_moe(_args):
+    """Run the four-rank DSv4 Mega MoE path and its non-Mega baseline."""
+    # The child ranks need GPU 0 as well. Release any cached allocations held by
+    # this orchestration process before torchrun starts the four workers.
+    torch.cuda.empty_cache()
+    env = os.environ.copy()
+    env.update({"MORI_V2_KERNEL_BACKEND": "hip", "MEGA_DISPATCH": "mori"})
+    base_cmd = [
+        "torchrun",
+        "--standalone",
+        "--nproc_per_node=4",
+        "op_tests/multigpu_tests/test_mega_moe_gfx1250.py",
+        "-e",
+        "384",
+        "-k",
+        "6",
+        "-hd",
+        "7168",
+        "-id",
+        "3072",
+        "--layers",
+        "61",
+        "-tpr",
+        "512",
+        "--acc_verify",
+        "0",
+        "--profile_table",
+        "1",
+    ]
+    for label, combine in (("Mega", "scatter_fused"), ("non-Mega", "gather")):
+        print(f"\n===== mega_moe ({label}, combine={combine}) =====", flush=True)
+        subprocess.run(
+            [*base_cmd, "--combine", combine],
+            cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            env=env,
+            check=True,
+        )
+
+
+def run_mhc(_args):
+    """Run the DSv4 mHC fused-RMSNorm benchmark at M=512, N=7168."""
+    print("\n===== mhc (DSv4, fused RMSNorm) =====", flush=True)
+    subprocess.run(
+        [
+            sys.executable,
+            "op_tests/test_mhc.py",
+            "-n",
+            "7168",
+            "-m",
+            "512",
+            "--fuse_rmsnorm",
+        ],
+        cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        check=True,
+    )
+
+
+def run_qk_norm(_args):
+    """Run DSv4 QK norm + RoPE for prefill and decode token counts."""
+    base_cmd = [
+        sys.executable,
+        "op_tests/test_flydsl_qk_norm_rope_quant.py",
+        "--H",
+        "128",
+        "--D",
+        "512",
+        "--RD",
+        "64",
+        "--no-quant",
+        "--qweight",
+    ]
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    for phase, tokens in (
+        ("prefill", ["16384"]),
+        ("decode", ["1", "2", "4", "8", "16", "32", "64"]),
+    ):
+        print(f"\n===== qk_norm ({phase}) =====", flush=True)
+        subprocess.run(
+            [*base_cmd, "-T", *tokens],
+            cwd=repo_root,
+            check=True,
+        )
+
+
+def run_score_qk(_args):
+    """Run DSv4 decode score-QK at batch 512 for short and long CSA KV."""
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    base_cmd = [
+        sys.executable,
+        "op_tests/op_benchmarks/triton/bench_deepgemm_attention.py",
+        "--batch",
+        "512",
+        "--heads",
+        "64",
+        "--index_dim",
+        "128",
+        "-mtp",
+        "0",
+        "--kv_preshuffle",
+        "--blocksize",
+        "64",
+    ]
+    for label, kv_length in (("1K/1K average", "384"), ("long", "10240")):
+        print(
+            f"\n===== score_qk (decode, B=512, {label} CSA KV={kv_length}) =====",
+            flush=True,
+        )
+        subprocess.run(
+            [*base_cmd, "-kv_length", kv_length],
+            cwd=repo_root,
+            check=True,
+        )
+
+
+def run_mori_ep(_args):
+    """Run MORI EPv2 dispatch/combine at the DSv4 MoE shape."""
+    print("\n===== mori_ep (DSv4 dispatch/combine) =====", flush=True)
+    mori = os.environ.get("MORI", "/app/mori")
+    for command in (
+        ["git", "fetch", "origin", "main"],
+        ["git", "switch", "main"],
+        ["git", "pull", "--ff-only", "origin", "main"],
+        [sys.executable, "-m", "pip", "install", "."],
+    ):
+        subprocess.run(command, cwd=mori, check=True)
+
+    env = os.environ.copy()
+    env["PYTHONPATH"] = f"{mori}/python:{mori}"
+    env["MORI_SOCKET_IFNAME"] = "lo"
+    env["GLOO_SOCKET_IFNAME"] = "lo"
+    env["PYTHONUNBUFFERED"] = "1"
+    backend = env.get("BACKEND", "hip")
+    env.update(
+        {
+            "BACKENDS": backend,
+            "MORI_V2_KERNEL_BACKEND": backend,
+            "HIDDEN": env.get("HIDDEN", "7168"),
+            "TOPK": env.get("TOPK", "6"),
+            "EPR": env.get("EPR", "96"),
+            "SWEEP": env.get(
+                "TOKENS", "64,128,256,512,1024,2048,4096,8192,16384"
+            ),
+            "ITERS": env.get("ITERS", "200"),
+            "WARMUP": "10",
+            "MODES": env.get("MODES", "eager,graph"),
+            "COMBINE_IN": env.get("COMBINE_IN", "inplace"),
+            "DISP": env.get("DISP", "bf16"),
+            "CHECK": env.get("CHECK", "1"),
+            "DBN": "",
+            "DWPB": "",
+            "CBN": "",
+            "CWPB": "",
+        }
+    )
+    subprocess.run(
+        [
+            "torchrun",
+            "--standalone",
+            f"--nproc_per_node={env.get('EP', '4')}",
+            "tests/python/ops/dispatch_combine_v2/bench_ep.py",
+        ],
+        cwd=mori,
+        env=env,
+        timeout=3600,
+        check=True,
+    )
 
 
 def _perf_ratio(num, den):
@@ -514,13 +864,18 @@ def _bench_mla_v4_asm_staged(gqa, batch, ctx, split_kv, num_iters, num_warmup):
     }
 
 
-def run_mla_v4(args):
+def run_mla_v4_decode(args):
     # Side-by-side asm (kargpreld) vs Triton sparse decode on the same shape grid.
     iters = args.mla_v4_kargpreld_iters
     warmup = args.mla_v4_kargpreld_warmup
     mla_v4_triton_mod._PERF["num_iters"] = iters
     mla_v4_triton_mod._PERF["num_warmup"] = warmup
-    shapes = args.mla_v4_kargpreld_shapes or _MLA_V4_KARGPRELD_SHAPES
+    default_shapes = (
+        _MLA_V4_DSV4_SHAPES
+        if args.suite == "dsv4"
+        else _MLA_V4_KARGPRELD_SHAPES
+    )
+    shapes = args.mla_v4_kargpreld_shapes or default_shapes
     rows = []
     with _silence():
         for gqa, batch, ctx, split_kv in shapes:
@@ -549,15 +904,74 @@ def run_mla_v4(args):
             rows.append(row)
     for row in rows:
         row["dtype"] = "bf16"
-    _print_table("mla_v4 (bf16, asm vs triton)", rows, keep=_MLA_V4_COMPARE_KEEP)
+    _print_table(
+        "mla_v4 decode (bf16, asm vs triton)",
+        rows,
+        keep=_MLA_V4_COMPARE_KEEP,
+    )
+
+
+def run_mla_v4_prefill(_args):
+    """Run DSv4 FP8 prefill at M=16K across two pools and CSR modes."""
+    print(
+        "\n===== mla_v4 prefill (FP8, M=16384, prefix=4096/16384) =====",
+        flush=True,
+    )
+    subprocess.run(
+        [
+            sys.executable,
+            "op_tests/test_pa_sparse_prefill_opus.py",
+            "-n",
+            "16384",
+            "--h_q",
+            "128",
+            "-d",
+            "512",
+            "--total_pages",
+            "4096",
+            "16384",
+            "--total_tokens",
+            "16384",
+            "--prec",
+            "fp8",
+            "--mode",
+            "dense",
+            "sparse",
+            "--no-verify",
+        ],
+        cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        check=True,
+    )
 
 
 OPS = {
     "mha": run_mha,
     "moe": run_moe,
     "gemm": run_gemm,
-    "mla_v4": run_mla_v4,
+    "f8gemm": run_f8gemm,
+    "a8w8_blockscale": run_a8w8_blockscale,
+    "a16w16": run_a16w16,
+    "mla_v4_decode": run_mla_v4_decode,
+    "mla_v4_prefill": run_mla_v4_prefill,
+    "mhc": run_mhc,
+    "qk_norm": run_qk_norm,
+    "score_qk": run_score_qk,
+    "mori_ep": run_mori_ep,
+    "mega_moe": run_mega_moe,
 }
+PERF_OPS = ["mha", "moe", "gemm", "f8gemm", "mla_v4_decode"]
+DSV4_OPS = [
+    "mega_moe",
+    "mori_ep",
+    "moe",
+    "a8w8_blockscale",
+    "a16w16",
+    "mla_v4_decode",
+    "mla_v4_prefill",
+    "mhc",
+    "qk_norm",
+    "score_qk",
+]
 
 
 def main():
@@ -571,12 +985,26 @@ def main():
         formatter_class=argparse.RawTextHelpFormatter,
         description="combined gfx1250 asm-kernel perf bench (prints only summaries)",
     )
+    suite = p.add_mutually_exclusive_group(required=True)
+    suite.add_argument(
+        "--perf",
+        action="store_true",
+        help=f"run hardware-oriented benchmarks (default ops: {', '.join(PERF_OPS)})",
+    )
+    suite.add_argument(
+        "--dsv4",
+        action="store_true",
+        help=(
+            "run the DeepSeek-V4 fixed-shape suite "
+            f"(default ops: {', '.join(DSV4_OPS)})"
+        ),
+    )
     p.add_argument(
         "--ops",
         nargs="*",
         choices=list(OPS),
-        default=list(OPS),
-        help="which ops to bench (default: all)",
+        default=None,
+        help="select operations from the active suite (default: suite defaults)",
     )
     # mha (SWA fwd asm) — fixed 4-shape grid; init sweep only
     p.add_argument(
@@ -595,7 +1023,7 @@ def main():
         default=None,
         metavar="GQA,BATCH,CTX,SPLIT",
         help="Override curated shape grid as gqa,batch,ctx,split tuples "
-        "(default: built-in 18-row grid)",
+        "(default: suite-specific built-in grid)",
     )
     p.add_argument(
         "--mla-v4-kargpreld-iters",
@@ -611,7 +1039,13 @@ def main():
     )
     args = p.parse_args()
 
-    for name in args.ops:
+    args.suite = "dsv4" if args.dsv4 else "perf"
+    default_ops = DSV4_OPS if args.dsv4 else PERF_OPS
+    selected_ops = args.ops or default_ops
+    invalid_ops = sorted(set(selected_ops) - set(default_ops))
+    if invalid_ops:
+        p.error(f"{args.suite} does not provide ops: {', '.join(invalid_ops)}")
+    for name in selected_ops:
         OPS[name](args)
 
 
