@@ -544,26 +544,10 @@ def _select_bounded_stage1(
     )
 
 
-_LARGE_PAYLOAD_GEOMETRY_DEFAULT = (384, True)
-# Keyed by mtpr (rank-invariant capacity), NOT the per-rank token bucket. The payload
-# tile-ready handshake is cross-rank, so every rank must derive identical geometry;
-# mtpr is the same on all ranks while local token counts (and their buckets) are not.
-_LARGE_PAYLOAD_GEOMETRY_BY_MTPR = {
-    2048: (0, False),
-    16384: (1536, True),
-    32768: (768, True),
-}
-
-
-def _large_payload_geometry(mtpr: int) -> tuple[int, bool]:
-    return _LARGE_PAYLOAD_GEOMETRY_BY_MTPR.get(mtpr, _LARGE_PAYLOAD_GEOMETRY_DEFAULT)
-
-
 def _select_large_stage1(
     bucket: int,
     experts_per_rank: int,
     inter_dim: int,
-    mtpr: int,
 ) -> Stage1Config:
     sort_block_m, tile_n, num_waves, mfma_amajor, async_a_copy = (
         _derive_stage1_geometry(
@@ -699,14 +683,12 @@ def _select_bucket_config(
     model_dim: int,
     inter_dim: int,
     p2p_quant: str,
-    mtpr: int,
 ) -> MegaMoEConfig:
     if mtpr_class == MAX_MTPR_CLASS:
         stage1 = _select_large_stage1(
             bucket,
             experts_per_rank,
             inter_dim,
-            mtpr,
         )
         stage2 = _select_large_stage2(
             bucket,
@@ -777,10 +759,17 @@ def select_mega_moe_config(
     model_dim: int = DEFAULT_MODEL_DIM,
     inter_dim: int = DEFAULT_INTER_DIM,
 ) -> MegaMoEConfig:
-    """Return base MegaMoEV2 config (no tuning patches applied).
+    """Return the fp8-safe base MegaMoEV2 config (no tuning patches applied).
 
-    For production use, prefer resolve_mega_moe_config() which applies tuning patches.
+    Only fp8 activations are supported here: the fp4 async-copy safety fixup
+    (SBM->64) lives in the tuning layer, so fp4 must go through
+    resolve_mega_moe_config().
     """
+    if a_dtype != ACTIVATION_FP8:
+        raise ValueError(
+            "select_mega_moe_config emits fp8-safe base configs only; "
+            "use resolve_mega_moe_config() for fp4 (applies async-copy safety)."
+        )
     bucket, mtpr_class, p2p_quant = _normalize_config_request(
         tokens,
         mtpr,
@@ -797,7 +786,6 @@ def select_mega_moe_config(
         model_dim,
         inter_dim,
         p2p_quant,
-        mtpr,
     )
 
 
@@ -814,24 +802,6 @@ def _apply_config_patch(config: MegaMoEConfig, patch: ConfigPatch) -> MegaMoECon
         stage2=(
             replace(config.stage2, **stage2_values) if stage2_values else config.stage2
         ),
-    )
-
-
-def _make_tuning_context(
-    config: MegaMoEConfig,
-    tokens: int,
-    a_dtype: str,
-    mtpr: int,
-) -> TuningContext:
-    _validate_activation_dtype(a_dtype)
-    _validate_mtpr(mtpr)
-    return TuningContext(
-        tokens=tokens,
-        bucket=nearest_token_bucket(tokens),
-        mtpr=mtpr,
-        capacity_mode=capacity_mode_for_mtpr(mtpr),
-        a_dtype=a_dtype,
-        p2p_quant=config.p2p_quant,
     )
 
 
@@ -902,18 +872,6 @@ def _select_tuning_patches(
     return tuple(patches)
 
 
-def _apply_mega_moe_quant_config(
-    config: MegaMoEConfig,
-    tokens: int,
-    a_dtype: str,
-    *,
-    mtpr: int,
-) -> MegaMoEConfig:
-    """Testing helper for applying tuning to an already selected base config."""
-    context = _make_tuning_context(config, tokens, a_dtype, mtpr)
-    return _apply_tuning_context(config, context)
-
-
 def _apply_tuning_context(
     config: MegaMoEConfig,
     context: TuningContext,
@@ -977,7 +935,6 @@ def resolve_mega_moe_config(
         model_dim,
         inter_dim,
         p2p_quant,
-        mtpr,
     )
     return _resolve_tuned_config(
         config,
