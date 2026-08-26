@@ -34,6 +34,7 @@ except:  # noqa: E722
     _reduce_segments_gluon = None
 
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import get_arch
+from aiter.ops.flydsl.utils import get_shared_memory_per_block
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.types import e4m3_dtype
 
@@ -156,6 +157,29 @@ def select_2d_config(
     }
 
 
+def _unified_3d_lds_footprint(
+    tile_size: int,
+    head_size_padded: int,
+    kv_elem_bytes: int,
+    q_elem_bytes: int,
+    block_m: int,
+    num_stages: int,
+) -> int:
+    """Shared memory (LDS) requested by kernel_unified_attention_3d on the gfx1201 stack.
+
+    The gfx1201 Triton stack honors the requested pipeline depth and double-buffers
+    both the K and V tiles: ``2 (K, V) * tile * head * kv_elem_bytes * num_stages``,
+    plus the Q tile (``block_m * head * q_elem_bytes``). At TILE_SIZE=64 / head_size=128 /
+    bf16 KV that is 65792-73728 B, over the 64 KB limit (issue #4329, downstream
+    vllm-project/vllm#48723). The formula reproduces all three reported footprints
+    exactly (measured via ``triton.compile(...).metadata.shared``).
+    """
+    return (
+        2 * tile_size * head_size_padded * kv_elem_bytes * num_stages
+        + block_m * head_size_padded * q_elem_bytes
+    )
+
+
 def select_3d_config(
     head_size,
     block_size,
@@ -167,6 +191,7 @@ def select_3d_config(
     shuffled_kv_cache: bool = False,
     NUM_BLOCKS_GATHER_PER_TILE: int = 1,
     SLIDING_WINDOW: int | None = None,
+    block_m: int = 16,
 ):
     arch = get_arch()
     reduce_num_warps = 2
@@ -290,6 +315,54 @@ def select_3d_config(
     # with bitwise-identical output. Mirrors the waves_per_eu=8 gfx1151 tuning above.
     if DEVICE_ARCH == "gfx1151":
         attn_warps = 8
+
+    # gfx1201: clamp the 3D config to the device LDS budget. This stack's Triton honors
+    # the requested pipeline depth, so the shared request can exceed 64 KB (e.g.
+    # TILE_SIZE=64 / head_size=128 / bf16 KV), which Triton rejects at kernel launch
+    # (issue #4329, downstream vllm-project/vllm#48723). Other archs are untouched:
+    # gfx1250 has 320 KB of LDS, and the gfx1151 stack resolves the same request to
+    # 33024 B (measured), so clamping there would change working configs.
+    if DEVICE_ARCH == "gfx1201":
+        head_size_padded = triton.next_power_of_2(head_size)
+        kv_elem_bytes = 1 if kv_cache_dtype in (e4m3_dtype, torch.uint8) else 2
+        q_elem_bytes = 1 if q_dtype == e4m3_dtype else 2
+        lds_budget = get_shared_memory_per_block(fallback_gfx=DEVICE_ARCH)
+        lds_footprint = _unified_3d_lds_footprint(
+            TILE_SIZE, head_size_padded, kv_elem_bytes, q_elem_bytes, block_m, attn_stages
+        )
+        if lds_footprint > lds_budget:
+            # Drop a pipeline stage first: it halves the K/V term and keeps the tiling
+            # (TILE_SIZE) that the segment and gather sizing above depends on.
+            if attn_stages > 1:
+                attn_stages = 1
+                lds_footprint = _unified_3d_lds_footprint(
+                    TILE_SIZE, head_size_padded, kv_elem_bytes, q_elem_bytes, block_m, attn_stages
+                )
+            # Shrink TILE_SIZE only where the tiling is not coupled to the KV block
+            # layout: shuffled cache loads one block per tile, and gather mode derives
+            # NUM_BLOCKS_GATHER_PER_TILE from TILE_SIZE.
+            if (
+                lds_footprint > lds_budget
+                and not shuffled_kv_cache
+                and NUM_BLOCKS_GATHER_PER_TILE == 1
+            ):
+                while lds_footprint > lds_budget and TILE_SIZE > 16:
+                    TILE_SIZE = TILE_SIZE // 2
+                    lds_footprint = _unified_3d_lds_footprint(
+                        TILE_SIZE,
+                        head_size_padded,
+                        kv_elem_bytes,
+                        q_elem_bytes,
+                        block_m,
+                        attn_stages,
+                    )
+            if lds_footprint > lds_budget:
+                raise ValueError(
+                    f"unified_attention 3D config does not fit the {lds_budget} B LDS budget: "
+                    f"TILE_SIZE={TILE_SIZE} head_size={head_size} kv_dtype={kv_cache_dtype} "
+                    f"q_dtype={q_dtype} block_m={block_m} num_stages={attn_stages} "
+                    f"requires {lds_footprint} B (issue #4329)"
+                )
 
     attn_config = {
         "TILE_SIZE": TILE_SIZE,
@@ -560,6 +633,7 @@ def unified_attention(
             shuffled_kv_cache,
             NUM_BLOCKS_GATHER_PER_TILE,
             SLIDING_WINDOW,
+            BLOCK_M,
         )
         NUM_SEGMENTS = attn_config["NUM_SEGMENTS_PER_SEQ"]
         if NUM_SEGMENTS > 1:
