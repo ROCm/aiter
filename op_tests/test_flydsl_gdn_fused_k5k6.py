@@ -64,9 +64,7 @@ try:
     from aiter.ops.flydsl.linear_attention_prefill_kernels import (
         chunk_gated_delta_rule_fwd_h_o_flydsl,
     )
-    from aiter.ops.triton._triton_kernels.gated_delta_rule.prefill.chunk_o import (
-        chunk_fwd_o_opt_vk,
-    )
+    from aiter.ops.triton.gated_delta_net.gated_delta_rule import chunk_fwd_o_opt_vk
     from op_tests.test_flydsl_linear_attention_prefill import (
         ref_chunk_gated_delta_rule_fwd_h,
     )
@@ -746,13 +744,13 @@ def bench_fused_k5k6(model_tag, H, Hg, T_flat, N, gate):
         chunk_gated_delta_rule_fwd_h_o_auto,
         chunk_gated_delta_rule_fwd_h_o_flydsl,
     )
-    from aiter.ops.triton._triton_kernels.gated_delta_rule.prefill.chunk_delta_h import (
-        chunk_gated_delta_rule_fwd_h_opt_vk as k5_triton,
-    )
-    from aiter.ops.triton._triton_kernels.gated_delta_rule.prefill.chunk_o import (
+    from aiter.ops.triton._triton_kernels.gated_delta_rule.utils import K5K6Fusion
+    from aiter.ops.triton.gated_delta_net.gated_delta_rule import (
         chunk_fwd_o_opt_vk as k6_triton,
     )
-    from aiter.ops.triton._triton_kernels.gated_delta_rule.utils import K5K6Fusion
+    from aiter.ops.triton.gated_delta_net.gated_delta_rule import (
+        chunk_gated_delta_rule_fwd_h_opt_vk as k5_triton,
+    )
 
     K = V = 128
     BT = 64
@@ -1003,7 +1001,7 @@ def bench_k5(model_tag, H, Hg, T_flat, N, gate, variants=None):
         chunk_gated_delta_rule_fwd_h_flydsl,
         chunk_gated_delta_rule_fwd_h_flydsl_opt,
     )
-    from aiter.ops.triton._triton_kernels.gated_delta_rule.prefill.chunk_delta_h import (
+    from aiter.ops.triton.gated_delta_net.gated_delta_rule import (
         chunk_gated_delta_rule_fwd_h_opt_vk as k5_triton,
     )
 

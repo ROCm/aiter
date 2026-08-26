@@ -2293,9 +2293,7 @@ def chunk_gated_delta_rule_fwd_h_o_auto(
     if o is None:
         B, T = q.shape[:2]
         o = u.new_empty(B, T, H, V)
-    from ..triton._triton_kernels.gated_delta_rule.prefill.chunk_o import (
-        chunk_fwd_o_opt_vk,
-    )
+    from ..triton.gated_delta_net.gated_delta_rule import chunk_fwd_o_opt_vk
 
     chunk_fwd_o_opt_vk(
         q=q,

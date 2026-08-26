@@ -23,7 +23,9 @@ import triton
 
 from aiter.ops.triton._triton_kernels.gated_delta_rule import (
     _fused_recurrent_gated_delta_rule_fwd_kernel,
+    chunk_fwd_o_opt_vk,  # noqa: F401  (re-exported public K6 wrapper)
     chunk_gated_delta_rule_fwd,
+    chunk_gated_delta_rule_fwd_h_opt_vk,  # noqa: F401  (re-exported public K5 wrapper)
     chunk_gated_delta_rule_fwd_opt,
     chunk_gated_delta_rule_fwd_opt_vk,
 )
