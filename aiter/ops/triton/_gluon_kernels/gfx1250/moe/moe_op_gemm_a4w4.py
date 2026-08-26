@@ -4,7 +4,26 @@ from triton._C.libtriton.gluon_ir import make_cga_layout
 from triton.experimental import gluon
 
 from aiter.ops.triton._triton_kernels.moe.activations import _swiglu
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
+
+_MOE_GEMM_A4W4_REPR_KEYS = [
+    "BLOCK_M",
+    "BLOCK_N",
+    "BLOCK_K",
+    "SWIZZLE_MX_SCALE",
+    "APPLY_SWIGLU",
+    "num_warps",
+    "NUM_BUFFERS",
+]
+
+_moe_gemm_a4w4_prefill_repr = make_kernel_repr(
+    "_moe_gemm_a4w4_prefill", _MOE_GEMM_A4W4_REPR_KEYS
+)
+
+_moe_gemm_a4w4_decode_repr = make_kernel_repr(
+    "_moe_gemm_a4w4_decode", _MOE_GEMM_A4W4_REPR_KEYS
+)
 
 
 def matmul_launch_metadata(grid, kernel, args):
@@ -517,7 +536,7 @@ def unshuffle_weights_gfx1250(
     )
 
 
-@gluon.jit(launch_metadata=matmul_launch_metadata)
+@gluon.jit(launch_metadata=matmul_launch_metadata, repr=_moe_gemm_a4w4_prefill_repr)
 def _moe_gemm_a4w4_prefill(
     Y,
     stride_y_m,
@@ -1171,6 +1190,7 @@ def _moe_gemm_a4w4_prefill(
 @gluon.jit(
     launch_metadata=matmul_launch_metadata,
     do_not_specialize=["num_tokens"],
+    repr=_moe_gemm_a4w4_decode_repr,
 )
 def _moe_gemm_a4w4_decode(
     Y,

@@ -54,6 +54,15 @@ struct opus_gqa_d192_kargs {
     // Runtime option bits (see OPT_* below). Decided once by the host and read by the
     // kernel, so the head/tail-merge decision is NOT recomputed on both sides.
     int opt;
+    // ── optional log-sum-exp output (fp32, natural log) ──
+    // nullptr => not produced (the kernel skips the store entirely; scalar branch).
+    // One value per (head, query row), unit stride along the query dim:
+    //   batch mode: [B, H, N]        (stride_lse_b, stride_lse_h)
+    //   group mode: [H, total_q]     (stride_lse_h; the group's row offset comes from
+    //                                seqstart_q_pad, same as Q/O)
+    void* __restrict__ ptr_lse;
+    int stride_lse_b;
+    int stride_lse_h;
 };
 
 // opus_gqa_d192_kargs::opt bit flags.

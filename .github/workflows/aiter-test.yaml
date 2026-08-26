@@ -1002,6 +1002,7 @@ jobs:
           -w /workspace \
           aiter_test \
           bash -lc "
+            set -euo pipefail
             pip uninstall -y amd-aiter aiter || true
             pip install -r requirements.txt
             pip install --upgrade pandas pyzmq einops numpy==1.26.2

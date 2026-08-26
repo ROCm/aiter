@@ -4,17 +4,20 @@
 import pytest
 import torch
 
+from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.mha_v4 import (
     MHA_V4_LOG2E,
     AttentionFormat,
     AttentionScaleMode,
     mha_v4,
+    mha_v4_mxfp8,
     mha_v4_packed,
     mha_v4_q_multiplier,
     mxfp4_k_view,
     mxfp4_v_view,
     mxfp6_k_view,
+    native_fp8_format,
     quantize_fp8,
     quantize_fp8_rotated,
     quantize_int8,
@@ -25,6 +28,7 @@ from aiter.ops.mha_v4 import (
     quantize_mxfp8_q,
     quantize_v_mxfp4,
     quantize_v_mxfp6,
+    rotate_activation_hd128,
     rotate_activation_mxfp6_quant,
     scale_modes_for_formats,
 )
@@ -48,6 +52,18 @@ def _e2m1_code_ties_low(value):
         magnitude > midpoint for midpoint in (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0)
     ).to(torch.uint8)
     return code | ((value < 0).to(torch.uint8) << 3)
+
+
+def _rotate_hd128_reference(value):
+    rotated = value.float()
+    group_size = 1
+    while group_size < 128:
+        pairs = rotated.reshape(*value.shape[:-1], -1, 2, group_size)
+        left = pairs[..., 0, :]
+        right = pairs[..., 1, :]
+        rotated = torch.cat((left + right, left - right), dim=-1).reshape(value.shape)
+        group_size *= 2
+    return (rotated / 128**0.5).to(value.dtype)
 
 
 def _reference_mxfp4_v(value):
@@ -149,6 +165,16 @@ def test_mha_v4_f8f6_scale_recipe():
     )
 
 
+def test_mha_v4_bf16_scale_recipe():
+    assert scale_modes_for_formats(
+        AttentionFormat.BF16, AttentionFormat.BF16, AttentionFormat.BF16
+    ) == (
+        AttentionScaleMode.NONE,
+        AttentionScaleMode.NONE,
+        AttentionScaleMode.NONE,
+    )
+
+
 def test_mha_v4_rejects_f8f4_format_pair():
     with pytest.raises(ValueError, match="matching FP8 or MXFP6 V"):
         scale_modes_for_formats(
@@ -194,12 +220,14 @@ def test_mha_v4_mxfp6_v_direct_buffers_match_combined_reference(sequence):
     value = torch.randn((1, sequence, 2, 128), device="cuda", dtype=torch.bfloat16)
     tiles = (sequence + 127) // 128
     if sequence % 128:
-        value = torch.cat(
+        reference_value = torch.cat(
             [value, value[:, -1:].expand(-1, tiles * 128 - sequence, -1, -1)],
             dim=1,
         )
+    else:
+        reference_value = value
 
-    combined = quantize_fp6_v_clean_triton(value, direct_p=True).view(
+    combined = quantize_fp6_v_clean_triton(reference_value, direct_p=True).view(
         1, 2, tiles, 12800
     )
     data, scale = quantize_fp6_v_data_scale_triton(value)
@@ -247,20 +275,84 @@ def test_mha_v4_fp8_quantization_matches_torch():
     assert torch.equal(scale, expected_scale.reshape(1))
 
 
-@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 rotated FP8 quantization")
-def test_mha_v4_rotated_fp8_quantization_matches_native_rotation():
-    from aiter.ops.quant import rotate_activation
-
+@pytest.mark.skipif(
+    get_gfx() not in ("gfx942", "gfx950"),
+    reason="gfx942/gfx950 rotated FP8 quantization",
+)
+@pytest.mark.parametrize("sequence,heads", [(257, 3), (512, 1), (2048, 1)])
+def test_mha_v4_rotated_fp8_quantization_matches_reference(sequence, heads):
     torch.manual_seed(23)
-    value = torch.randn((1, 257, 3, 128), device="cuda", dtype=torch.bfloat16)
+    value = torch.randn((1, heads, sequence, 128), device="cuda", dtype=torch.bfloat16)
+    value = value.permute(0, 2, 1, 3).contiguous()
+    expected_rotated = _rotate_hd128_reference(value)
     rotated = torch.empty_like(value)
-    rotate_activation(rotated, value)
-    expected, expected_scale = quantize_fp8(rotated)
+    rotate_activation_hd128(rotated, value)
+    expected, expected_scale = quantize_fp8(expected_rotated)
 
     actual, scale = quantize_fp8_rotated(value)
 
+    assert torch.equal(rotated, expected_rotated)
     assert torch.equal(actual, expected)
     assert torch.equal(scale, expected_scale)
+
+
+def test_mha_v4_rotated_fp8_quantization_rejects_noncontiguous_input():
+    value = torch.randn((1, 1, 128, 2), device="cuda", dtype=torch.bfloat16)
+    value = value.transpose(-1, -2)
+
+    with pytest.raises(ValueError, match="requires contiguous hd128 input"):
+        quantize_fp8_rotated(value)
+
+
+@pytest.mark.skipif(
+    get_gfx() not in ("gfx942", "gfx950"),
+    reason="gfx942/gfx950 activation rotation",
+)
+def test_mha_v4_rotate_activation_hd128_accepts_empty_input():
+    value = torch.empty((1, 0, 1, 128), device="cuda", dtype=torch.bfloat16)
+    rotated = torch.empty_like(value)
+
+    rotate_activation_hd128(rotated, value)
+
+    assert rotated.shape == value.shape
+    assert rotated.numel() == 0
+
+
+@pytest.mark.skipif(
+    get_gfx() not in ("gfx942", "gfx950"),
+    reason="gfx942/gfx950 FP8 recipe validation",
+)
+def test_mha_v4_fp8_raw_recipe_matches_rotated_packed():
+    torch.manual_seed(29)
+    q = torch.randn((1, 512, 5, 128), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    fp8_format = native_fp8_format()
+
+    q_quantized, q_descale = quantize_fp8_rotated(q)
+    k_quantized, k_descale = quantize_fp8_rotated(k)
+    v_quantized, v_descale = quantize_fp8(v)
+    expected = mha_v4_packed(
+        q_quantized,
+        k_quantized,
+        v_quantized,
+        q_descale,
+        k_descale,
+        v_descale,
+        fp8_format,
+        fp8_format,
+        fp8_format,
+        *scale_modes_for_formats(fp8_format, fp8_format, fp8_format),
+    )
+
+    actual = mha_v4(q, k, v, fp8_format, fp8_format, fp8_format)
+    compiled = torch.compile(mha_v4, fullgraph=True)(
+        q, k, v, fp8_format, fp8_format, fp8_format
+    )
+    torch.cuda.synchronize()
+
+    assert torch.equal(actual, expected)
+    assert torch.equal(compiled, expected)
 
 
 @pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MXFP8 quantization")
@@ -510,7 +602,7 @@ def test_mha_v4_rejects_reserved_raw_formats(q_format):
         )
 
 
-@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 six-format validation")
+@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MHA v4 validation")
 def test_mha_v4_packed_rejects_wrong_scale_recipe():
     q = torch.zeros((1, 128, 2, 128), device="cuda", dtype=torch.int8)
     v = torch.zeros((1, 128, 2, 128), device="cuda", dtype=torch.float8_e4m3fn)
@@ -553,7 +645,7 @@ def test_mha_v4_packed_accepts_mxfp8_scale_recipe():
     )
 
 
-@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 six-format validation")
+@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MHA v4 validation")
 def test_mha_v4_packed_rejects_wrong_fp8_encoding():
     q = torch.zeros((1, 128, 2, 128), device="cuda", dtype=torch.float8_e4m3fn)
     scale = torch.ones(1, device="cuda", dtype=torch.float32)
@@ -613,26 +705,64 @@ def test_mha_v4_packed_rejects_wrong_mxfp4_k_layout():
     assert coalesced_k.stride() == (16384, 64, 8192, 1)
 
 
-@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 six-format validation")
-@pytest.mark.parametrize("q_format", [AttentionFormat.INT8, AttentionFormat.FP8])
-def test_mha_v4_zero_inputs_are_finite(q_format):
+@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MHA v4 validation")
+@pytest.mark.parametrize(
+    ("q_format", "v_format"),
+    [
+        (AttentionFormat.BF16, AttentionFormat.BF16),
+        (AttentionFormat.INT8, AttentionFormat.FP8),
+        (AttentionFormat.FP8, AttentionFormat.FP8),
+    ],
+)
+def test_mha_v4_zero_inputs_are_finite(q_format, v_format):
     q = torch.zeros((1, 128, 2, 128), device="cuda", dtype=torch.bfloat16)
-    out = mha_v4(q, q, q, q_format, q_format, AttentionFormat.FP8)
+    out = mha_v4(q, q, q, q_format, q_format, v_format)
     torch.cuda.synchronize()
     assert torch.count_nonzero(out) == 0
     assert torch.isfinite(out).all()
 
 
-@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 six-format validation")
+@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 GQA validation")
+def test_mha_v4_mxfp4_gqa_matches_repeated_kv():
+    torch.manual_seed(41)
+    q = torch.randn((2, 129, 64, 128), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((2, 257, 4, 128), device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+
+    gqa = mha_v4(
+        q,
+        k,
+        v,
+        AttentionFormat.MXFP4,
+        AttentionFormat.MXFP4,
+        AttentionFormat.FP8,
+    )
+    mha = mha_v4(
+        q,
+        k.repeat_interleave(16, dim=2),
+        v.repeat_interleave(16, dim=2),
+        AttentionFormat.MXFP4,
+        AttentionFormat.MXFP4,
+        AttentionFormat.FP8,
+    )
+    torch.cuda.synchronize()
+
+    assert torch.equal(gqa, mha)
+
+
+@pytest.mark.skipif(
+    get_gfx() not in ("gfx942", "gfx950"), reason="gfx942/gfx950 I8FP8 validation"
+)
 def test_mha_v4_packed_i8fp8_compile_parity():
     torch.manual_seed(17)
     q = torch.randint(-32, 33, (1, 512, 5, 128), device="cuda", dtype=torch.int8)
     k = torch.randint(-32, 33, (1, 512, 5, 128), device="cuda", dtype=torch.int8)
-    v = torch.randn((1, 512, 5, 128), device="cuda").to(torch.float8_e4m3fn)
+    v = torch.randn((1, 512, 5, 128), device="cuda").to(dtypes.fp8)
     q_descale = torch.tensor([0.02], device="cuda")
     k_descale = torch.tensor([0.03], device="cuda")
     v_descale = torch.tensor([0.04], device="cuda")
     scale = 128**-0.5
+    fp8_format = native_fp8_format()
 
     eager = mha_v4_packed(
         q,
@@ -643,7 +773,7 @@ def test_mha_v4_packed_i8fp8_compile_parity():
         v_descale,
         AttentionFormat.INT8,
         AttentionFormat.INT8,
-        AttentionFormat.FP8,
+        fp8_format,
         AttentionScaleMode.F32_PER_TENSOR,
         AttentionScaleMode.F32_PER_TENSOR,
         AttentionScaleMode.F32_PER_TENSOR,
@@ -658,7 +788,7 @@ def test_mha_v4_packed_i8fp8_compile_parity():
         v_descale,
         AttentionFormat.INT8,
         AttentionFormat.INT8,
-        AttentionFormat.FP8,
+        fp8_format,
         AttentionScaleMode.F32_PER_TENSOR,
         AttentionScaleMode.F32_PER_TENSOR,
         AttentionScaleMode.F32_PER_TENSOR,
@@ -668,7 +798,52 @@ def test_mha_v4_packed_i8fp8_compile_parity():
     assert torch.equal(eager, compiled)
 
 
-@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 six-format validation")
+@pytest.mark.skipif(
+    get_gfx() not in ("gfx942", "gfx950"), reason="gfx942/gfx950 FP8 validation"
+)
+def test_mha_v4_packed_fp8_compile_parity():
+    torch.manual_seed(23)
+    q = torch.randn((1, 512, 5, 128), device="cuda").to(dtypes.fp8)
+    k = torch.randn((1, 512, 5, 128), device="cuda").to(dtypes.fp8)
+    v = torch.randn((1, 512, 5, 128), device="cuda").to(dtypes.fp8)
+    q_descale = torch.tensor([0.02], device="cuda")
+    k_descale = torch.tensor([0.03], device="cuda")
+    v_descale = torch.tensor([0.04], device="cuda")
+    fp8_format = native_fp8_format()
+    scale_modes = scale_modes_for_formats(fp8_format, fp8_format, fp8_format)
+    scale = 128**-0.5
+
+    eager = mha_v4_packed(
+        q,
+        k,
+        v,
+        q_descale,
+        k_descale,
+        v_descale,
+        fp8_format,
+        fp8_format,
+        fp8_format,
+        *scale_modes,
+        softmax_scale=scale,
+    )
+    compiled = torch.compile(mha_v4_packed, fullgraph=True)(
+        q,
+        k,
+        v,
+        q_descale,
+        k_descale,
+        v_descale,
+        fp8_format,
+        fp8_format,
+        fp8_format,
+        *scale_modes,
+        softmax_scale=scale,
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(eager, compiled)
+
+
+@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MHA v4 validation")
 def test_mha_v4_native_schema_mutates_only_out():
     q = torch.zeros((1, 128, 2, 128), device="cuda", dtype=torch.float8_e4m3fn)
     scale = torch.ones(1, device="cuda", dtype=torch.float32)
@@ -695,10 +870,11 @@ def test_mha_v4_native_schema_mutates_only_out():
     assert schema.endswith("-> ()")
 
 
-@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 six-format validation")
+@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MHA v4 validation")
 @pytest.mark.parametrize(
     ("q_format", "v_format"),
     [
+        (AttentionFormat.BF16, AttentionFormat.BF16),
         (AttentionFormat.INT8, AttentionFormat.FP8),
         (AttentionFormat.FP8, AttentionFormat.FP8),
         (AttentionFormat.FP8, AttentionFormat.MXFP6),
@@ -709,6 +885,7 @@ def test_mha_v4_native_schema_mutates_only_out():
     ],
 )
 def test_mha_v4_raw_compile_parity(q_format, v_format):
+    torch._dynamo.reset()
     torch.manual_seed(31)
     q = torch.randn((1, 512, 5, 128), device="cuda", dtype=torch.bfloat16)
     k = torch.randn_like(q)
@@ -729,6 +906,25 @@ def test_mha_v4_raw_compile_parity(q_format, v_format):
     assert torch.equal(eager, compiled)
     assert torch.isfinite(consumed).all()
     assert churn.numel() == 16 * 1024 * 1024
+
+
+@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MXFP8 validation")
+def test_mha_v4_mxfp8_raw_compile_parity():
+    torch.manual_seed(41)
+    q = torch.randn((1, 257, 5, 128), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    eager_out = torch.empty_like(q)
+    compiled_out = torch.empty_like(q)
+
+    eager = mha_v4_mxfp8(q, k, v, out=eager_out)
+    compiled = torch.compile(mha_v4_mxfp8, fullgraph=True)(q, k, v, out=compiled_out)
+    torch.cuda.synchronize()
+
+    assert eager.data_ptr() == eager_out.data_ptr()
+    assert compiled.data_ptr() == compiled_out.data_ptr()
+    assert torch.equal(eager, compiled)
+    assert torch.isfinite(compiled).all()
 
 
 @pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MXFP4 V validation")
