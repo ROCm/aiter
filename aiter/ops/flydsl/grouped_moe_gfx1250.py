@@ -372,6 +372,53 @@ def _tdm_align_up(x: int, a: int) -> int:
     return ((int(x) + a - 1) // a) * a
 
 
+def _preshuffle_a4_payload(
+    payload: torch.Tensor, *, tile_m: int, tile_k: int
+) -> torch.Tensor:
+    """Preshuffle packed FP4 A tiles for the gfx1250 TDM consumer.
+
+    The innermost physical layout is
+    ``(k_rept, m_rept, 4, 16, 16)``, where ``k_rept=tile_k/128`` and
+    ``m_rept=tile_m/16``. The final dimension is 16 packed-K bytes, so the
+    four K cells cover one logical K128 FP4 operand.
+    """
+    payload_u8 = payload.view(torch.uint8)
+    rows = payload_u8.shape[-2]
+    k_bytes = payload_u8.shape[-1]
+    if tile_m % 16 or tile_k % 128:
+        raise ValueError(
+            "A4 preshuffle requires tile_m % 16 == 0 and tile_k % 128 == 0, "
+            f"got tile_m={tile_m}, tile_k={tile_k}"
+        )
+    if rows % tile_m or k_bytes % (tile_k // 2):
+        raise ValueError(
+            "A4 payload does not divide into complete TDM tiles: "
+            f"shape={tuple(payload_u8.shape)}, tile_m={tile_m}, tile_k={tile_k}"
+        )
+
+    leading = payload_u8.shape[:-2]
+    m_tiles = rows // tile_m
+    k_tiles = k_bytes // (tile_k // 2)
+    m_rept = tile_m // 16
+    k_rept = tile_k // 128
+    tiled = payload_u8.reshape(
+        *leading, m_tiles, m_rept, 16, k_tiles, k_rept, 4, 16
+    )
+    leading_dims = list(range(len(leading)))
+    base = len(leading)
+    tiled = tiled.permute(
+        *leading_dims,
+        base,
+        base + 3,
+        base + 4,
+        base + 1,
+        base + 5,
+        base + 2,
+        base + 6,
+    )
+    return tiled.contiguous().reshape_as(payload_u8)
+
+
 def get_wmma_m_rep(
     tile_m: int, tile_n: int, m_warp: int, n_warp: int, label: str
 ) -> int:
@@ -446,6 +493,7 @@ def _grouped_a8w4_tdm_moe(
     stage2_scatter: Stage2ScatterContext | None = None,
     situ_beta=1.0,
     situ_linear_beta=1.0,
+    a_preshuffle=False,
 ):
     import functools
 
@@ -600,6 +648,8 @@ def _grouped_a8w4_tdm_moe(
         else None
     )
     _is_fp4 = data_format == "fp4"
+    if a_preshuffle and not _is_fp4:
+        raise ValueError("A preshuffle is currently supported only for A4W4")
     _quant_mode = "fp4" if _is_fp4 else "fp8"
     _a_is_fp4 = 1 if _is_fp4 else 0
 
@@ -614,11 +664,19 @@ def _grouped_a8w4_tdm_moe(
         source_topk=topk,
         num_valid_routes=_ep_nvr,
     )
+    if a_preshuffle:
+        a1_payload = _preshuffle_a4_payload(
+            a1_payload, tile_m=tile_m, tile_k=tile_k
+        )
 
     # Fuse gemm1 activation + MX quantization + scale preshuffle into the
     # kernel epilogue, eliminating the standalone
     # flydsl_moe_fused_quant_preshuffle call between gemm1 and gemm2.
-    _fuse_quant = _b1 is None
+    # Keep the first A-preshuffle implementation focused on the GEMM data path.
+    # The separate quant pass produces row-major A2, which is then permuted with
+    # the exact GEMM2 tile geometry. Fusing that permutation into the GEMM1
+    # requant epilogue is a follow-up optimization.
+    _fuse_quant = _b1 is None and not a_preshuffle
     w1_u8 = _grouped_weight_uint8(w1)
     w1s_i32 = w1_scale.reshape(-1).view(torch.int32)
 
@@ -627,7 +685,7 @@ def _grouped_a8w4_tdm_moe(
         # These are written directly by the kernel's fused quant epilogue.
         payload_bytes = inter_dim // 2 if _is_fp4 else inter_dim
         scale_bytes = inter_dim // 32  # one e8m0 byte per 32-element MX block
-        a2_payload = torch.empty(
+        a2_payload_raw = torch.empty(
             (1, contiguous_m, payload_bytes), dtype=torch.uint8, device=device
         )
         a2_scale = torch.empty(
@@ -639,7 +697,7 @@ def _grouped_a8w4_tdm_moe(
         # `out` / arg_c) and preshuffled e8m0 scale to `a2_scale` (passed via
         # quant_scale / arg_quant_scale).
         flydsl_grouped_gemm_a8w4_masked(
-            a2_payload.view(torch.uint8),
+            a2_payload_raw.view(torch.uint8),
             a1_payload,
             w1_u8,
             a1_scale,
@@ -666,7 +724,15 @@ def _grouped_a8w4_tdm_moe(
             cluster_n=cluster_n,
             waves_per_tensor_tdm=waves_per_tensor_tdm,
             next_stage_prefetch=next_stage_prefetch,
+            a_preshuffle=int(a_preshuffle),
             **_situ_kw,
+        )
+        a2_payload = (
+            _preshuffle_a4_payload(
+                a2_payload_raw, tile_m=tile_m2, tile_k=tile_k2
+            )
+            if a_preshuffle
+            else a2_payload_raw
         )
     else:
         # Original path: bf16 intermediate + separate quant kernel.
@@ -696,6 +762,7 @@ def _grouped_a8w4_tdm_moe(
             cluster_n=cluster_n,
             waves_per_tensor_tdm=waves_per_tensor_tdm,
             next_stage_prefetch=next_stage_prefetch,
+            a_preshuffle=int(a_preshuffle),
             **_situ_kw,
         )
         a2_payload, a2_scale = flydsl_moe_fused_quant_preshuffle(
@@ -707,6 +774,10 @@ def _grouped_a8w4_tdm_moe(
             masked_m=None,
             topids_to_rows=None,
         )
+        if a_preshuffle:
+            a2_payload = _preshuffle_a4_payload(
+                a2_payload, tile_m=tile_m2, tile_k=tile_k2
+            )
 
     grouped_out = torch.empty((1, contiguous_m, model_dim), dtype=dtype, device=device)
     w2_u8 = _grouped_weight_uint8(w2)
@@ -736,6 +807,7 @@ def _grouped_a8w4_tdm_moe(
         waves_per_tensor_tdm=waves_per_tensor_tdm,
         next_stage_prefetch=next_stage_prefetch,
         **_ep_gemm2_kwargs,
+        a_preshuffle=int(a_preshuffle),
     )
 
     if kernel_bench_callable is not None:
@@ -772,6 +844,7 @@ def _grouped_a8w4_tdm_moe(
                         cluster_n=cluster_n,
                         waves_per_tensor_tdm=waves_per_tensor_tdm,
                         next_stage_prefetch=next_stage_prefetch,
+                        a_preshuffle=int(a_preshuffle),
                         **_situ_kw,
                     ),
                 )
@@ -806,6 +879,7 @@ def _grouped_a8w4_tdm_moe(
                         cluster_n=cluster_n,
                         waves_per_tensor_tdm=waves_per_tensor_tdm,
                         next_stage_prefetch=next_stage_prefetch,
+                        a_preshuffle=int(a_preshuffle),
                         **_situ_kw,
                     ),
                 )
@@ -838,6 +912,7 @@ def _grouped_a8w4_tdm_moe(
                     cluster_n=cluster_n,
                     waves_per_tensor_tdm=waves_per_tensor_tdm,
                     next_stage_prefetch=next_stage_prefetch,
+                    a_preshuffle=int(a_preshuffle),
                 ),
             )
         )
@@ -1146,6 +1221,14 @@ def grouped_gemm_gfx1250_a8w4(
             _tdm_kw["n_warp"] = _base_nw
             _tdm_kw["m_warp2"] = _ov_mw2 if _ov_mw2 is not None else _base_mw
             _tdm_kw["n_warp2"] = _ov_nw2 if _ov_nw2 is not None else _base_nw
+        requested_a_preshuffle = _as_bool(
+            os.environ.get("AITER_TDM_A_PRESHUFFLE"),
+            _as_bool(cfg_row.get("a_preshuffle"), False) if cfg_row else False,
+        )
+        # A8W4 deliberately retains the main-branch row-major A contract.
+        _tdm_kw["a_preshuffle"] = bool(
+            is_grouped_a4w4 and requested_a_preshuffle
+        )
         return _grouped_a8w4_tdm_moe(
             hidden_states,
             w1,

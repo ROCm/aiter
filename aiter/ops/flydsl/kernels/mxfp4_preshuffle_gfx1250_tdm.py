@@ -74,6 +74,7 @@ def launch_gemm_a8w4_tdm(
     cluster_n: Constexpr[int] = 1,
     next_stage_prefetch: Constexpr[int] = 0,
     num_waves_per_tensor_tdm: Constexpr[int] = 2,
+    a_preshuffle: Constexpr[int] = 0,
     enable_ep_scatter: Constexpr[int] = 0,
     ep_arena_handle: Constexpr[int] = 0,
     ep_combine_input_offset: Constexpr[int] = 0,
@@ -140,6 +141,7 @@ def launch_gemm_a8w4_tdm(
         cluster_n,
         next_stage_on,
         num_waves_per_tensor_tdm,
+        a_preshuffle,
         enable_ep_scatter,
         ep_arena_handle,
         ep_combine_input_offset,
@@ -153,6 +155,8 @@ def launch_gemm_a8w4_tdm(
             raise ValueError("enable_ep_scatter is gemm2-only (stage1_act must be 0)")
         if stage1_quant_out:
             raise ValueError("enable_ep_scatter is incompatible with stage1_quant_out")
+    if a_preshuffle and not a_is_fp4:
+        raise ValueError("A preshuffle is currently supported only for A4W4")
     warp_tile_m = tile_m // m_warp
     warp_tile_n = tile_n // n_warp
     wmma_m_rep = warp_tile_m // WMMA_M
@@ -168,7 +172,7 @@ def launch_gemm_a8w4_tdm(
     ACT_ELEM = fx.Float4E2M1FN if a_is_fp4 else fx.Float8E4M3FN
     ACT_NDW = 8 if a_is_fp4 else 16
 
-    LDS_PAD_A = 16
+    LDS_PAD_A = 0 if a_preshuffle else 16
     A_LDS_ROW = A_ROW_B + LDS_PAD_A
     B_LDS_ROW = PACK_TK * 16
     STAGE_A = ((tile_m * A_LDS_ROW + 15) // 16) * 16
@@ -214,6 +218,7 @@ def launch_gemm_a8w4_tdm(
         ), "stage1 quant requires complete four-WMMA N groups"
 
     _afp = "fp4" if a_is_fp4 else "fp8"
+    _ashuf = "_ashuf" if a_preshuffle else ""
     _act = f"_act{stage1_act}" if stage1_act else ""
     _qout = f"_q{stage1_quant_out}r{quant_wmma_rep}" if stage1_quant_out else ""
     _bias = "_bias" if has_bias else ""
@@ -228,7 +233,7 @@ def launch_gemm_a8w4_tdm(
     _kname = (
         f"a8w4_tdm_{_afp}"
         f"_t{tile_m}x{tile_n}x{tile_k}_w{m_warp}x{n_warp}"
-        f"_b{num_buffers}_K{K}"
+        f"_b{num_buffers}_K{K}{_ashuf}"
         f"{_grouped}{_act}{_bias}{_qout}{_cl}{_next_stage}{_waves_per_tensor}{_ep}"
     )
 
@@ -462,21 +467,37 @@ def launch_gemm_a8w4_tdm(
                 )
             )
 
-        add_tdm_loads(
-            gA_base,
-            a_off0,
-            A_KROW,
-            mn_oob,
-            A_ROW_B,
-            tile_m,
-            on_i32=False,
-            lds_off=0,
-            lds_row=A_LDS_ROW,
-            k_adv=A_ROW_B,
-            wv=waves[0],
-            pad=(A_ROW_B, LDS_PAD_A),
-            wg_mask=a_mcast_mask,
-        )
+        if const_expr(a_preshuffle):
+            add_tdm_loads(
+                gA_base,
+                a_off0,
+                A_ROW_B,
+                None,
+                A_ROW_B,
+                tile_m,
+                on_i32=False,
+                lds_off=0,
+                lds_row=A_ROW_B,
+                k_adv=tile_m * A_ROW_B,
+                wv=waves[0],
+                wg_mask=a_mcast_mask,
+            )
+        else:
+            add_tdm_loads(
+                gA_base,
+                a_off0,
+                A_KROW,
+                mn_oob,
+                A_ROW_B,
+                tile_m,
+                on_i32=False,
+                lds_off=0,
+                lds_row=A_LDS_ROW,
+                k_adv=A_ROW_B,
+                wv=waves[0],
+                pad=(A_ROW_B, LDS_PAD_A),
+                wg_mask=a_mcast_mask,
+            )
         add_tdm_loads(
             gB_base,
             b_off0,
@@ -563,7 +584,11 @@ def launch_gemm_a8w4_tdm(
 
         # Split each region's offset into a lane-varying base, which keepalive
         # can pin, and a compile-time part that folds into ds_load's offset:.
-        lds_a_lane_off = (wmb + lane16) * A_LDS_ROW + kgrp * 16
+        lds_a_lane_off = (
+            lane16 * 0
+            if a_preshuffle
+            else (wmb + lane16) * A_LDS_ROW + kgrp * 16
+        )
         lds_b_lane_off = STAGE_A + (wnb // 16) * B_LDS_ROW + kgrp * 256 + lane16 * 16
         assert wmma_m_rep == 1 or wmma_m_rep % 2 == 0
         sa_lane = lane16 if wmma_m_rep == 1 else lane
@@ -596,11 +621,23 @@ def launch_gemm_a8w4_tdm(
 
         def load_a(buf, wm, ksl):
             base = lds_a_base(buf)
-            off = wm * 16 * A_LDS_ROW + ksl * A_KSTEP
             if const_expr(a_is_fp4):
+                if const_expr(a_preshuffle):
+                    m_rept = tile_m // 16
+                    mr = wave_m * wmma_m_rep + wm
+                    off = (
+                        (((ksl * m_rept + mr) * 4 + kgrp) * 16 + lane16)
+                        * 16
+                    )
+                    return Vec(lds_load_b128(base, fx.Int32(off))).shuffle(
+                        Vec(lds_load_b128(base, fx.Int32(off + 2 * 16 * 16))),
+                        list(range(8)),
+                    )
+                off = wm * 16 * A_LDS_ROW + ksl * A_KSTEP
                 return Vec(lds_load_b128(base, fx.Int32(off))).shuffle(
                     Vec(lds_load_b128(base, fx.Int32(off + 32))), list(range(8))
                 )
+            off = wm * 16 * A_LDS_ROW + ksl * A_KSTEP
             v = [
                 Vec(lds_load_b128(base, fx.Int32(off + 32 * j)))
                 for j in range_constexpr(4)
@@ -900,7 +937,7 @@ def launch_gemm_a8w4_tdm(
                 )
             # Post-compute wins for decode and for shallow pipelines: at
             # num_buffers<=2 mid-compute prefetches one tile and under-overlaps.
-            if const_expr(tile_m <= 64 or num_buffers <= 2):
+            if const_expr(tile_m <= 32 or num_buffers <= 2):
                 # Post-compute issue: better for decode (small tile_m).
                 for i in range_constexpr(num_buffers):
                     issue(i, i)
