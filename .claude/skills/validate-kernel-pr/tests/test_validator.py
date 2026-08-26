@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import shutil
 import stat
 import subprocess
 import tempfile
@@ -81,6 +82,8 @@ class ValidatorFixture:
         (self.repo / "aiter" / "__init__.py").write_text('__version__ = "test"\n')
         (self.repo / "aiter" / "kernel.py").write_text("VALUE = 1\n")
         (self.repo / "tests" / "test_sample.py").write_text(
+            "import os\n"
+            '_GRID = os.environ.get("VALIDATOR_TEST_GRID", "")\n'
             '# (7, 257, "f32")\n'
             "def test_sample():\n"
             "    atol = 1e-5\n"
@@ -139,6 +142,7 @@ class ValidatorFixture:
         tests="tests/test_sample.py",
         picker=None,
         path_prefix=None,
+        pylib=None,
         grid=True,
     ):
         report = self.root / f"{patch.stem}-report.json"
@@ -172,6 +176,8 @@ class ValidatorFixture:
         environment["PICKER"] = str(picker or self.picker)
         environment["PYTHONPATH"] = str(self.fake_modules)
         environment["TIMEOUT"] = "30"
+        if pylib:
+            environment["PYLIB"] = str(pylib)
         if path_prefix:
             environment["PATH"] = f"{path_prefix}:{environment['PATH']}"
         result = run(command, env=environment, check=False)
@@ -285,6 +291,94 @@ class ValidateKernelPrTests(unittest.TestCase):
         self.assertEqual("skip", report["stages"]["correctness_s1_grid"]["status"])
         self.assert_complete_stage_objects(report)
 
+    def test_flydsl_source_change_is_not_shadowed_by_pylib(self):
+        shutil.rmtree(self.fixture.repo / "aiter")
+        source = self.fixture.repo / "python" / "flydsl"
+        source.mkdir(parents=True)
+        (source / "__init__.py").write_text('__version__ = "test"\n')
+        run(["git", "add", "-A"], cwd=self.fixture.repo)
+        run(
+            [
+                "git",
+                "-c",
+                "user.name=Validator Test",
+                "-c",
+                "user.email=validator@example.com",
+                "commit",
+                "-q",
+                "-m",
+                "flydsl base",
+            ],
+            cwd=self.fixture.repo,
+        )
+        runtime = self.fixture.root / "runtime" / "flydsl"
+        runtime.mkdir(parents=True)
+        (runtime / "__init__.py").write_text('__version__ = "test"\n')
+
+        def change_flydsl(repo):
+            path = repo / "python" / "flydsl" / "__init__.py"
+            path.write_text(path.read_text() + "CHANGED = True\n")
+
+        patch = self.fixture.make_patch(change_flydsl, "flydsl-source.patch")
+        _, report = self.fixture.validate(
+            patch,
+            pylib=runtime.parent,
+        )
+
+        self.assertEqual("INCONCLUSIVE", report["verdict"])
+        self.assertEqual("skip", report["stages"]["runtime_compat"]["status"])
+        self.assertIn("would shadow", report["stages"]["runtime_compat"]["note"])
+
+    def test_grid_pass_cannot_ignore_shape_environment(self):
+        def remove_grid_hook(repo):
+            path = repo / "tests" / "test_sample.py"
+            path.write_text(
+                path.read_text().replace("VALIDATOR_TEST_GRID", "UNRELATED_ENV")
+                + '\nUNUSED_GRID_NAME = "VALIDATOR_TEST_GRID"\n'
+                + "\n# VALIDATOR_TEST_GRID is intentionally not consumed.\n"
+            )
+
+        patch = self.fixture.make_patch(remove_grid_hook, "ignored-grid.patch")
+        _, report = self.fixture.validate(patch)
+
+        self.assertEqual("INCONCLUSIVE", report["verdict"])
+        self.assertEqual("skip", report["stages"]["correctness_s1_grid"]["status"])
+        self.assertIn(
+            "not referenced",
+            report["stages"]["correctness_s1_grid"]["note"],
+        )
+
+    def test_base_artifact_prevents_contaminated_head_run(self):
+        (self.fixture.repo / ".gitignore").write_text("baseline-artifact\n")
+        test_file = self.fixture.repo / "tests" / "test_sample.py"
+        test_file.write_text(
+            test_file.read_text()
+            + "\nfrom pathlib import Path\n"
+            + "Path('baseline-artifact').write_text('created')\n"
+        )
+        run(["git", "add", "-A"], cwd=self.fixture.repo)
+        run(
+            [
+                "git",
+                "-c",
+                "user.name=Validator Test",
+                "-c",
+                "user.email=validator@example.com",
+                "commit",
+                "-q",
+                "-m",
+                "artifact base",
+            ],
+            cwd=self.fixture.repo,
+        )
+        patch = self.fixture.make_patch(self.harmless_change, "base-artifact.patch")
+
+        _, report = self.fixture.validate(patch)
+
+        self.assertEqual("INCONCLUSIVE", report["verdict"])
+        self.assertEqual("skip", report["stages"]["baseline_control"]["status"])
+        self.assertEqual("skip", report["stages"]["correctness_repo_tests"]["status"])
+
 
 class IndexScannerTests(unittest.TestCase):
     def test_json_count_is_deduplicated(self):
@@ -311,6 +405,8 @@ class ReviewSkillContractTests(unittest.TestCase):
         self.assertIn("advisory tier", review_skill)
         self.assertIn("required scanner is missing or not executable", review_skill)
         self.assertIn("Validation (deterministic)", review_skill)
+        self.assertIn("baseRefOid", review_skill)
+        self.assertIn("expected_verdict", review_skill)
         self.assertNotIn("downstream-impact-check", review_skill)
         self.assertNotIn("review-flydsl-kernel/scan_", review_skill)
 

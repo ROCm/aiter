@@ -110,6 +110,10 @@ the tree, and the resulting `ImportError` looks exactly like a defect in the PR.
 environment fact: `runtime_compat` and correctness are skipped, the verdict is `INCONCLUSIVE`,
 and nothing is attributed to the author.
 
+If the patch itself changes `python/flydsl/`, a `PYLIB` package would shadow those edits even when
+the version string matches. The validator therefore requires a rebuilt checkout-matched runtime
+for that shape and returns `INCONCLUSIVE` instead of testing the stale package.
+
 This matters most for FlyDSL kernels: the Python kernels import symbols from a compiled runtime,
 so "one fresh container per PR" would mean rebuilding MLIR/LLVM per PR. The workable shape is a
 pinned prebuilt image plus this compatibility gate.
@@ -131,9 +135,10 @@ A suite that cannot fail is worse than no suite, because it produces a green rep
 Both, and they are reported separately, because the interesting case is when they disagree.
 
 For a patch run, the validator reverses the exact patch to create the baseline, verifies that the
-worktree is clean, runs both targets, and reapplies the patch before the head run. This removes
-new files too; a PR-added failing test is therefore `target-not-present` on base, not falsely
-classified as a pre-existing failure. Any reverse/reapply failure aborts attribution and produces
+worktree is clean, runs both targets under base-only caches, and reapplies the patch before a
+head run with separate caches. This removes new files too; a PR-added failing test is therefore
+`target-not-present` on base, not falsely classified as a pre-existing failure. Any worktree
+artifact, reverse/reapply failure, or cache-isolation failure aborts the head run and produces
 `INCONCLUSIVE`.
 
 The S1-owned grid must cover three classes the PR's own tests routinely miss:
@@ -143,6 +148,10 @@ The S1-owned grid must cover three classes the PR's own tests routinely miss:
 | non-toy | `M=1` / `M=16` only is the standard agent-generated test |
 | boundary / odd | odd N, N not a multiple of the tile — where tail masks fail |
 | long-context / large M | where 32-bit index arithmetic wraps |
+
+The grid stage runs only when the selected pytest source references the configured
+`--shape-env`; otherwise it is `skip` and the verdict is `INCONCLUSIVE`. This is a positive
+control against reporting the same default test run twice under different stage names.
 
 When the kernel exposes no shape override, the report says `repo-default-only` rather than
 claiming coverage it does not have.
