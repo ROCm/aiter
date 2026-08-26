@@ -18,7 +18,9 @@ from aiter.jit.core import (
     get_asm_dir,
 )
 from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
-from aiter.ops.opus import opus_gemm
+from aiter.ops.opus.gemm_op_a8w8 import (
+    opus_gemm_a8w8_blockscale_bpreshuffle_tune,
+)
 from aiter.ops.shuffle import shuffle_weight
 from aiter.utility.base_tuner import GemmCommonTuner
 from aiter.utility.mp_tuner import mp_tuner
@@ -162,14 +164,8 @@ def run_gemm_a8w8_blockscale_opus(
     """
     Run gfx942 Opus a8w8 blockscale bpreshuffle tuned kernel.
     """
-    return opus_gemm(
-        x,
-        weight,
-        out,
-        kid=kernel_id,
-        layout="bpreshuffle",
-        x_scale=x_scale,
-        w_scale=w_scale,
+    return opus_gemm_a8w8_blockscale_bpreshuffle_tune(
+        x, weight, x_scale, w_scale, out, kernelId=kernel_id
     )
 
 

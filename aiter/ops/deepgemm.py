@@ -6,7 +6,7 @@ DeepGEMM front-end (CK backend).
 Hosts the CK-backed `deepgemm_ck` binding plus a thin `deepgemm()`
 wrapper. Opus entries have been extracted under `aiter.ops.opus.*`;
 see `aiter.ops.opus.gemm_a16w16_opus` for BF16 matmul and
-`aiter.ops.opus.opus_gemm_a16w16_tune` for id-based kernel selection.
+`aiter.ops.opus.opus_gemm` for exact-id kernel selection.
 
 `opus_gemm_a16w16_tune` is kept here as a deprecation shim for one
 release to ease migration from the old aggregate entry.
@@ -57,7 +57,17 @@ def opus_gemm_a16w16_tune(
         DeprecationWarning,
         stacklevel=2,
     )
-    return _opus.opus_gemm(XQ, WQ, Y, kid=kernelId, split_k=splitK)
+    if all(tensor.dim() == 3 and tensor.size(0) == 1 for tensor in (XQ, WQ, Y)):
+        _opus.opus_gemm(
+            XQ.squeeze(0),
+            WQ.squeeze(0),
+            Y.squeeze(0),
+            kid=kernelId,
+            split_k=splitK,
+        )
+    else:
+        _opus.opus_bmm(XQ, WQ, Y, kid=kernelId, split_k=splitK)
+    return Y
 
 
 __all__ = [

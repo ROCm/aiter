@@ -113,6 +113,32 @@ def _opus_gemm_a8w8_blockscale_bpreshuffle_launch_raw(
 ) -> Tensor: ...
 
 
+def opus_gemm_a8w8_blockscale_bpreshuffle_tune(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    Y: Tensor | None = None,
+    kernelId: int = 11000,
+) -> Tensor:
+    """Compatibility entry for the existing A8W8 blockscale tuner."""
+    if Y is None:
+        Y = torch.empty(
+            (XQ.shape[-2], WQ.shape[-2]),
+            device=XQ.device,
+            dtype=torch.bfloat16,
+        )
+
+    return _launch_a8w8_blockscale_bpreshuffle_gemm(
+        XQ,
+        WQ,
+        x_scale,
+        w_scale,
+        Y,
+        kid=int(kernelId),
+    )
+
+
 def _gen_opus_gemm_a8w8_mxscale_bmm_launch_fake_tensors(
     XQ: Tensor,
     WQ: Tensor,
@@ -526,4 +552,4 @@ def _launch_a8w8_mxscale_bmm(
     return Y
 
 
-__all__: list[str] = []
+__all__ = ["opus_gemm_a8w8_blockscale_bpreshuffle_tune"]

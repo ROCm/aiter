@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""A16W16 exact launch and Torch workspace support."""
+"""A16W16 exact launch, Torch workspace, and shape-driven compatibility."""
 
 import ctypes
 from functools import lru_cache, wraps
@@ -492,4 +492,154 @@ def _launch_a16w16_bmm(
     )
 
 
-__all__: list[str] = []
+def _prepare_shape_driven_a16w16(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    bias: torch.Tensor | None,
+    output_dtype: torch.dtype,
+    out: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, bool]:
+    """Normalize the legacy 2D/3D caller contract to batch-first tensors."""
+    if not isinstance(A, torch.Tensor) or not isinstance(B, torch.Tensor):
+        raise TypeError("gemm_a16w16_opus requires Tensor A and B")
+    if A.dtype != torch.bfloat16 or B.dtype != torch.bfloat16:
+        raise NotImplementedError(
+            "gemm_a16w16_opus only supports bf16 A/B "
+            f"(got A.dtype={A.dtype}, B.dtype={B.dtype})"
+        )
+    if output_dtype not in (torch.bfloat16, torch.float32):
+        raise NotImplementedError(
+            "gemm_a16w16_opus only supports bf16/fp32 output dtype, "
+            f"got {output_dtype}"
+        )
+    if A.device != B.device:
+        raise ValueError(
+            f"gemm_a16w16_opus requires A/B on one device; got {A.device}/{B.device}"
+        )
+
+    is_gemm = A.dim() == 2
+    if is_gemm:
+        M, K = map(int, A.shape)
+        batch = 1
+    elif A.dim() == 3:
+        batch, M, K = map(int, A.shape)
+    else:
+        raise ValueError(f"A must be 2D or 3D, got shape {tuple(A.shape)}")
+
+    if B.dim() == 2:
+        N, K_b = map(int, B.shape)
+        if batch != 1:
+            raise NotImplementedError(
+                "gemm_a16w16_opus requires a real 3D [batch,N,K] weight "
+                f"when A is batched; got A.shape={tuple(A.shape)}, "
+                f"B.shape={tuple(B.shape)}"
+            )
+    elif B.dim() == 3:
+        b_b, N, K_b = map(int, B.shape)
+        if b_b != batch:
+            raise ValueError(f"B batch mismatch: expected {batch}, got {b_b}")
+    else:
+        raise ValueError(
+            f"B must be 2D [N,K] or 3D [batch,N,K], got shape {tuple(B.shape)}"
+        )
+    if K_b != K:
+        raise ValueError(f"K dimension mismatch: A has K={K}, B has K={K_b}")
+
+    Y = out
+    if Y is None:
+        Y = torch.empty((batch, M, N), dtype=output_dtype, device=A.device)
+    elif not isinstance(Y, torch.Tensor):
+        raise TypeError(f"gemm_a16w16_opus out must be a Tensor, got {type(Y)!r}")
+    elif Y.device != A.device or Y.dtype != output_dtype:
+        raise ValueError(
+            "gemm_a16w16_opus out must match A.device and dtype; "
+            f"got {Y.device}/{Y.dtype}, expected {A.device}/{output_dtype}"
+        )
+
+    XQ = A.unsqueeze(0) if is_gemm else A
+    WQ = B.unsqueeze(0) if B.dim() == 2 else B
+    _check_a16w16_launch_layout(XQ, WQ, Y)
+    if bias is not None:
+        if not isinstance(bias, torch.Tensor):
+            raise TypeError("gemm_a16w16_opus bias must be a Tensor")
+        if bias.device != A.device or bias.dtype not in (output_dtype, torch.float32):
+            raise ValueError(
+                "gemm_a16w16_opus bias must be on A.device and use fp32 or "
+                f"the output dtype; got {bias.device}/{bias.dtype}"
+            )
+        if not bias.is_contiguous():
+            raise ValueError("gemm_a16w16_opus bias must be contiguous")
+        if tuple(bias.shape) not in ((N,), (batch, N)):
+            raise ValueError(
+                f"gemm_a16w16_opus bias must have shape [{N}] or [{batch},{N}], "
+                f"got shape {tuple(bias.shape)}"
+            )
+
+    return XQ, WQ, Y, is_gemm
+
+
+def gemm_a16w16_opus(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    dtype: torch.dtype = torch.bfloat16,
+    *,
+    kernelId: int | None = None,
+    splitK: int | None = None,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Shape-driven A16W16 compatibility API over the exact-kid launchers.
+
+    Explicit ``kernelId`` bypasses policy. Otherwise a present OPUS tuned row
+    is attempted as-is, while a tuned miss uses the migrated architecture
+    heuristic.
+    """
+    XQ, WQ, Y, is_gemm = _prepare_shape_driven_a16w16(A, B, bias, dtype, out)
+    if kernelId is None:
+        from .policy import (
+            lookup_a16w16_opus_config,
+            resolve_a16w16_heuristic_candidate,
+        )
+
+        arch, cu_num = _device_arch_and_cu(A.device)
+        batch, M, K = map(int, XQ.shape)
+        N = int(WQ.shape[1])
+        lookup_args = {
+            "arch": arch,
+            "cu_num": cu_num,
+            "M": M,
+            "N": N,
+            "K": K,
+            "has_bias": bias is not None,
+            "input_dtype": A.dtype,
+            "output_dtype": Y.dtype,
+        }
+        config = lookup_a16w16_opus_config(**lookup_args)
+        if config is not None:
+            kid, split_k = int(config["solidx"]), int(config["splitK"])
+        else:
+            plan = resolve_a16w16_heuristic_candidate(batch=batch, **lookup_args)
+            if plan is None:
+                raise RuntimeError(
+                    "gemm_a16w16_opus found no valid OPUS kernel for "
+                    f"arch={arch}, shape=({batch},{M},{N},{K})"
+                )
+            kid, split_k = plan.resolved_kid, 0
+    else:
+        kid = int(kernelId)
+        split_k = int(splitK or 0)
+
+    if is_gemm:
+        return _launch_a16w16_gemm(
+            XQ.squeeze(0),
+            WQ.squeeze(0),
+            Y.squeeze(0),
+            kid=kid,
+            bias=bias,
+            split_k=split_k,
+        )
+
+    return _launch_a16w16_bmm(XQ, WQ, Y, kid=kid, bias=bias, split_k=split_k)
+
+
+__all__ = ["gemm_a16w16_opus"]

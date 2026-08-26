@@ -21,7 +21,6 @@ from aiter import logger
 from csrc.opus_gemm.opus_gemm_common import (
     DEFAULT_COMPILED_KIDS_BY_ARCH,
     GFX942_BF16WS_EXACT_N,
-    a16w16_flatmm_prefetch_k_iter,
     canonical_output_dtype,
     get_kernel_instance,
 )
@@ -35,6 +34,109 @@ from .launch_plan import (
 )
 
 # ---- A16W16 tuned-candidate and heuristic policy -------------------------
+
+_A16W16_TUNED_KEY_COLUMNS = (
+    "gfx",
+    "cu_num",
+    "M",
+    "N",
+    "K",
+    "bias",
+    "dtype",
+    "outdtype",
+    "scaleAB",
+    "bpreshuffle",
+)
+
+
+@cache
+def _load_a16w16_opus_tuned() -> dict:
+    """Load only OPUS rows from the merged global A16W16 tuned config."""
+    path = AITER_CONFIGS.AITER_CONFIG_GEMM_BF16_FILE
+    try:
+        df = pd.read_csv(path).drop_duplicates()
+    except (FileNotFoundError, pd.errors.EmptyDataError):
+        return {}
+    except (OSError, UnicodeDecodeError, pd.errors.ParserError) as exc:
+        logger.warning(
+            "Ignoring unreadable A16W16 tuned CSV %r; OPUS will use its "
+            "heuristic fallback: %s",
+            path,
+            exc,
+        )
+        return {}
+
+    required = set(_A16W16_TUNED_KEY_COLUMNS) | {"libtype", "solidx", "splitK"}
+    missing = required.difference(df.columns)
+    if missing:
+        logger.warning(
+            "Ignoring A16W16 tuned CSV %r; missing columns %s",
+            path,
+            sorted(missing),
+        )
+        return {}
+
+    df = df[df["libtype"].eq("opus")]
+    if df.empty:
+        return {}
+
+    integer_columns = ["solidx", "splitK"]
+    numeric = df[integer_columns].apply(pd.to_numeric, errors="coerce")
+    valid = (
+        numeric.notna().all(axis=1)
+        & numeric.ge(0).all(axis=1)
+        & numeric.lt(float("inf")).all(axis=1)
+        & numeric.eq(numeric.round()).all(axis=1)
+    )
+    invalid_rows = int((~valid).sum())
+    if invalid_rows:
+        logger.warning(
+            "Skipping %d malformed OPUS row(s) in A16W16 tuned CSV %r: "
+            "solidx and splitK must be non-negative integers",
+            invalid_rows,
+            path,
+        )
+    df = df.loc[valid].copy()
+    if df.empty:
+        return {}
+    df[integer_columns] = numeric.loc[valid].astype("int64")
+
+    if "us" in df.columns:
+        df["_opus_sort_us"] = pd.to_numeric(df["us"], errors="coerce")
+        df = df.sort_values("_opus_sort_us", kind="stable", na_position="last").drop(
+            columns="_opus_sort_us"
+        )
+    keys = list(_A16W16_TUNED_KEY_COLUMNS)
+    return df.drop_duplicates(keys).set_index(keys).to_dict("index")
+
+
+@lru_cache(maxsize=4096)
+def lookup_a16w16_opus_config(
+    *,
+    arch: str,
+    cu_num: int,
+    M: int,
+    N: int,
+    K: int,
+    has_bias: bool,
+    input_dtype: object,
+    output_dtype: object,
+) -> dict | None:
+    """Return the exact-shape OPUS tuned row used by the legacy OPUS caller."""
+    key = (
+        str(arch).lower().split(":", 1)[0],
+        int(cu_num),
+        int(M),
+        int(N),
+        int(K),
+        bool(has_bias),
+        str(input_dtype),
+        str(output_dtype),
+        False,
+        False,
+    )
+    config = _load_a16w16_opus_tuned().get(key)
+    return None if config is None else dict(config)
 
 
 def _heuristic_a16w16_kid_gfx950(
@@ -231,52 +333,40 @@ _A16W16_HEURISTICS = {
     "gfx1250": _heuristic_a16w16_kid_gfx1250,
 }
 
-_GFX950_HEURISTIC_BASE_KID = {
-    1200: 200,
-    1206: 206,
-    1208: 208,
-    1300: 300,
-}
+_UINT32_MAX_BYTES = (1 << 32) - 1
 
 
-def _a16w16_heuristic_candidates(arch: str, preferred: int) -> tuple[int, ...]:
-    """Return a short ordered fallback chain for a rejected heuristic kid."""
-    if arch != "gfx950":
-        return (preferred,)
-    ordered = [preferred]
-    base = _GFX950_HEURISTIC_BASE_KID.get(preferred)
-    if base is not None:
-        ordered.append(base)
-    # kid 200 handles K/N tails once its flatmm prefetch minimum is met;
-    # kid 4 covers smaller aligned K through the split-barrier pipeline.
-    ordered.extend((200, 4, 6))
-    return tuple(dict.fromkeys(ordered))
+def _check_a16w16_heuristic_4g(
+    *,
+    arch: str,
+    M: int,
+    N: int,
+    K: int,
+    output_dtype: object,
+) -> None:
+    """Mirror the legacy C++ heuristic guard for 32-bit buffer descriptors."""
+    if arch not in ("gfx950", "gfx1250"):
+        return
 
+    output_itemsize = {"bf16_t": 2, "fp32_t": 4}.get(
+        canonical_output_dtype(output_dtype)
+    )
+    if output_itemsize is None:
+        return
 
-def _gfx950_heuristic_shape_compatible(kid: int, M: int, N: int, K: int) -> bool:
-    """Apply pipeline-only guards before accepting a heuristic fallback.
+    M, N, K = map(int, (M, N, K))
+    if max(M * K * 2, N * K * 2, M * N * output_itemsize) <= _UINT32_MAX_BYTES:
+        return
 
-    Exact public calls intentionally leave these dynamic checks to C++.  The
-    caller-side heuristic, however, must not choose a kid that is known to
-    throw after output/workspace allocation.
-    """
-    instance = get_kernel_instance("gfx950", "a16w16", int(kid))
-    if instance is None:
-        return False
-    loops = (int(K) + instance.B_K - 1) // instance.B_K
-    if instance.kernel_tag == "a16w16_flatmm_splitk":
-        if loops < a16w16_flatmm_prefetch_k_iter(instance):
-            return False
-        return instance.has_oob or (
-            M % instance.B_M == 0 and N % instance.B_N == 0 and K % instance.B_K == 0
-        )
-    if instance.kernel_tag in ("a16w16", "a16w16_persistent"):
-        if loops < 2 or loops % 2 != 0 or N % 16 != 0:
-            return False
-        return instance.has_oob or (
-            M % instance.B_M == 0 and N % instance.B_N == 0 and K % instance.B_K == 0
-        )
-    return True
+    reason = (
+        "legacy kids require a tuned 4g_safe kid"
+        if arch == "gfx950"
+        else "launcher gmem descriptors are 32-bit"
+    )
+    raise RuntimeError(
+        f"opus {arch} a16w16 heuristic refuses >4 GiB shape "
+        f"(M={M} N={N} K={K}): {reason}"
+    )
 
 
 def select_a16w16_heuristic_kid(
@@ -397,6 +487,13 @@ def resolve_a16w16_heuristic_candidate(
     arch = str(arch).lower().split(":", 1)[0]
     try:
         split_k = int(requested_split_k)
+        _check_a16w16_heuristic_4g(
+            arch=arch,
+            M=M,
+            N=N,
+            K=K,
+            output_dtype=output_dtype,
+        )
         preferred = select_a16w16_heuristic_kid(
             arch=arch,
             M=M,
@@ -408,25 +505,19 @@ def resolve_a16w16_heuristic_candidate(
         )
     except (TypeError, ValueError):
         return None
-    for kid in _a16w16_heuristic_candidates(arch, preferred):
-        if arch == "gfx950" and not _gfx950_heuristic_shape_compatible(kid, M, N, K):
-            continue
-        plan = _resolve_a16w16_candidate(
-            arch=arch,
-            M=M,
-            N=N,
-            K=K,
-            batch=batch,
-            cu_num=cu_num,
-            has_bias=has_bias,
-            input_dtype=input_dtype,
-            output_dtype=output_dtype,
-            kid=kid,
-            split_k=split_k,
-        )
-        if plan is not None:
-            return plan
-    return None
+    return _resolve_a16w16_candidate(
+        arch=arch,
+        M=M,
+        N=N,
+        K=K,
+        batch=batch,
+        cu_num=cu_num,
+        has_bias=has_bias,
+        input_dtype=input_dtype,
+        output_dtype=output_dtype,
+        kid=preferred,
+        split_k=split_k,
+    )
 
 
 def resolve_a16w16_caller_candidate(
@@ -443,7 +534,7 @@ def resolve_a16w16_caller_candidate(
     requested_kid: object | None,
     requested_split_k: object = 0,
 ) -> A16W16LaunchPlan | None:
-    """Compatibility wrapper for the former combined caller resolver."""
+    """Resolve a tuned kid when supplied, otherwise use the arch heuristic."""
     if requested_kid is None:
         return resolve_a16w16_heuristic_candidate(
             arch=arch,
@@ -636,6 +727,7 @@ def resolve_a8w8_mxscale_bmm_plan(
 
 
 __all__ = [
+    "lookup_a16w16_opus_config",
     "lookup_mxscale_bmm_config",
     "resolve_a8w8_mxscale_bmm_plan",
     "resolve_a16w16_caller_candidate",

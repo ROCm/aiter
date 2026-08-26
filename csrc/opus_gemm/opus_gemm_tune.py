@@ -68,23 +68,8 @@ from opus_gemm_common import (
     NON_SPLITK_KIDS,
     SPLITK_KIDS,
     _opus_sidecar_path,
-    a16w16_flatmm_kernels_list,
     a16w16_flatmm_prefetch_k_iter,
-    a16w16_flatmm_splitk_kernels_list,
-    a16w16_flatmm_splitk_kernels_list_nooob,
-    a16w16_kernels_list,
-    a16w16_kernels_list_cpol,
-    a16w16_kernels_list_cpol_nooob,
-    a16w16_kernels_list_nooob,
-    a16w16_persistent_kernels_list,
-    a16w16_persistent_kernels_list_cpol,
-    a16w16_persistent_kernels_list_cpol_nooob,
-    a16w16_persistent_kernels_list_nooob,
-    gfx942_nosplit_kernels_list,
-    gfx942_splitk_kernels_list,
-    gfx1250_clusterlaunch_kernels_list,
-    gfx1250_kernels_list,
-    gfx1250_splitk_fuse_kernels_list,
+    kernels_list,
 )
 
 from aiter import dtypes, logger
@@ -1082,25 +1067,13 @@ OPUS_DEBUG_TUNED_CSV = os.getenv(
 _AITER_VERBOSE = bool(int(os.environ.get("AITER_VERBOSE", "0")))
 
 
-# Merge every a16w16-family kid into one tuner search space: * split-barrier a16w16: 4..9 legacy
-# cpol = (0, 17) (traits default) ...
+# Derive the tuner search space from the canonical registry.  Keeping a second
+# hand-maintained merge here previously omitted mono-tile and 4g-safe kids and
+# could retain stale metadata when a new family reused an existing numeric id.
 a16w16_all_kernels = {
-    **a16w16_kernels_list,
-    **a16w16_kernels_list_nooob,
-    **a16w16_kernels_list_cpol,
-    **a16w16_kernels_list_cpol_nooob,
-    **a16w16_flatmm_kernels_list,
-    **a16w16_flatmm_splitk_kernels_list,
-    **a16w16_flatmm_splitk_kernels_list_nooob,
-    **a16w16_persistent_kernels_list,
-    **a16w16_persistent_kernels_list_cpol,
-    **a16w16_persistent_kernels_list_nooob,
-    **a16w16_persistent_kernels_list_cpol_nooob,
-    **gfx942_nosplit_kernels_list,
-    **gfx942_splitk_kernels_list,
-    **gfx1250_kernels_list,
-    **gfx1250_clusterlaunch_kernels_list,
-    **gfx1250_splitk_fuse_kernels_list,
+    kid: instance
+    for kid, instance in kernels_list.items()
+    if instance.kernel_tag.startswith("a16w16")
 }
 
 # Arch-filter the kid enumeration so the tuner only dispatches kids whose pipeline body has a

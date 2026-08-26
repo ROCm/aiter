@@ -26,14 +26,17 @@ caller final kid
 C++ does not choose a default kid, read a CSV, run a shape heuristic, redirect
 an id, allocate a workspace, or fall back to another backend.
 
-For A16 calls without an explicit id, the existing Python high-level caller
-validates tuned CSV candidates and otherwise continues to its normal skinny
-or PyTorch fallback. It does not automatically enter an OPUS heuristic on a
-tuned miss. A successful tuned result is reduced to one final integer kid
-before the public Python router and this C++ layer are entered. Reusable
-candidate/heuristic policy helpers live in `aiter/ops/opus/policy.py`;
-the A16 family module keeps only exact execution and workspace
-responsibilities.
+The Python layer retains two distinct A16 shape-driven flows. The generic
+`aiter.gemm_a16w16` dispatcher uses the global multi-backend tuned result and,
+on a miss or invalid OPUS row, keeps its original skinny, gfx1250 Triton, or
+PyTorch fallback. It does not run an OPUS heuristic. The OPUS-only
+`gemm_a16w16_opus` compatibility entry instead uses an explicit id when
+provided, otherwise attempts a present OPUS tuned row as-is and runs the
+migrated per-architecture OPUS heuristic only when no tuned row exists. Every
+successful OPUS selection is reduced to one final integer kid before the local
+A16 exact launcher and this C++ layer are entered. The compatibility entry does
+not re-enter the package-level `opus_gemm`/`opus_bmm` family router. Reusable
+candidate/heuristic policy helpers live in `aiter/ops/opus/policy.py`.
 
 ## Family entries
 
@@ -195,6 +198,11 @@ For two-stage BMM split-K, the caller supplies a direct FP32 partial-buffer
 pointer. Fused split-K stores partials and aligned tile counters in the same
 caller Tensor. The reduce kernel also receives the direct pointer. No BMM
 launcher allocates, frees, registers or retains workspace memory.
+
+For global kid 8326 (family-local kid 326), codegen sets
+`PRELOAD_SF_LDS=false` only on the `split_k > 1`, `D_OUT=void` workspace
+specialization that writes partial sums. Its direct BF16/FP32
+`split_k == 1` specializations keep `PRELOAD_SF_LDS=true`.
 
 ## Source layout
 

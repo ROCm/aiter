@@ -348,6 +348,7 @@ class OpusBmmMxscaleTuner(GemmCommonTuner):
         # sit at the ~1e-4 fp8 e8m0 quant floor; a column-transposed kid is ~0.5.
         "errRatio": 0.02,
         "batch": 100,
+        "config_env_name": "AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE",
     }
 
     KEYS: ClassVar[list[str]] = ["gfx", "b", "m", "n", "k"]
@@ -465,24 +466,11 @@ class OpusBmmMxscaleTuner(GemmCommonTuner):
             help="overwrite the shipped tuned CSV in place (implies --all)",
         )
 
-    def parse_args(self):
-        args = super().parse_args()
-        if args.run_config or args.compare:
-            self.parser.error(
-                "MXFP8 BMM tuner does not implement --run_config/--compare; "
-                "use ordinary offline tuning"
-            )
-        return args
-
     # --- shape sourcing -----------------------------------------------------
     def _shapes_from_shipped(self):
         return sorted(set(_read_shape_csv(SHIPPED_CSV)))
 
     def pre_process(self, args):
-        if getattr(args, "run_config", False) or getattr(args, "compare", False):
-            raise ValueError(
-                "MXFP8 BMM tuner does not implement --run_config/--compare"
-            )
         if args.apply:
             args.tune_file = SHIPPED_CSV
             # Reading and writing the shipped CSV otherwise makes every source
@@ -531,6 +519,65 @@ class OpusBmmMxscaleTuner(GemmCommonTuner):
             if args.verbose and mask.any():
                 logger.info("skipping %d already-tuned shapes", int(mask.sum()))
             self.untunedf = self.untunedf[~mask].reset_index(drop=True)
+
+    # --- production-path benchmark -----------------------------------------
+    def _clear_op_caches(self):
+        from aiter.ops import batched_gemm_op_a8w8
+        from aiter.ops.opus import policy
+
+        policy._load_mxscale_bmm_tuned.cache_clear()
+        policy.lookup_mxscale_bmm_config.cache_clear()
+        policy._mxscale_bmm_kid_m_align.cache_clear()
+        batched_gemm_op_a8w8._MXSCALE_BMM_LAUNCH_PLANS.clear()
+
+    def run_config(self, args):
+        from aiter.ops.batched_gemm_op_a8w8 import batched_gemm_a8w8_mxscale
+        from aiter.test_common import checkAllclose, run_perftest
+
+        results = []
+        for seed, (_, row) in enumerate(self.untunedf.iterrows(), start=1):
+            b, m, n, k = (int(row[name]) for name in ("b", "m", "n", "k"))
+            shape_str = f"({b}, {m}, {n}, {k})"
+            allowed, allowed_desc = self._get_run_config_err_ratio_limit(row, args)
+            try:
+                O_mx, W_mx, _Y, xs_mx, ws_mx, _workspace, ref = gen_bmm_mxscale_data(
+                    b,
+                    m,
+                    n,
+                    k,
+                    seed,
+                    dtypes.bf16,
+                    8000,
+                    1,
+                )
+                out, us = run_perftest(
+                    batched_gemm_a8w8_mxscale,
+                    O_mx.transpose(0, 1),
+                    W_mx,
+                    xs_mx.transpose(0, 1),
+                    ws_mx,
+                    dtype=dtypes.bf16,
+                    num_warmup=args.warmup,
+                    num_iters=args.iters,
+                )
+                err_ratio = checkAllclose(
+                    out,
+                    ref,
+                    rtol=1e-2,
+                    atol=1e-2,
+                    msg=f"run_config {shape_str}",
+                )
+                status = (
+                    "ok"
+                    if err_ratio <= allowed
+                    else f"mismatch:err_ratio={err_ratio:.6g}(>{allowed_desc})"
+                )
+                results.append({"shape": shape_str, "e2e_us": us, "status": status})
+            except Exception as exc:  # noqa: BLE001
+                results.append(
+                    {"shape": shape_str, "e2e_us": -1, "status": f"error:{exc}"}
+                )
+        return results
 
     # --- tuning -------------------------------------------------------------
     def tune(self, untunedf, tunedf, args):

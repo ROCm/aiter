@@ -1,11 +1,16 @@
 # OPUS GEMM and BMM Python interfaces
 
-OPUS exposes separate public functions for logical 2D GEMM and batch-first 3D
-BMM. The caller resolves the final kernel id before the call; OPUS does not
-select a kernel from the shape.
+OPUS exposes strict exact-kid functions for logical 2D GEMM and batch-first 3D
+BMM, plus the retained shape-driven `gemm_a16w16_opus` compatibility entry.
+The exact functions never select a kernel from the shape; the compatibility
+entry resolves an A16W16 kid before entering the same exact path.
+
+## Public API
 
 ```python
-from aiter.ops.opus import opus_bmm, opus_gemm
+import torch
+
+from aiter.ops.opus import gemm_a16w16_opus, opus_bmm, opus_gemm
 
 opus_gemm(  # XQ [M,K], WQ [N,K], Y [M,N]
     XQ,
@@ -34,11 +39,16 @@ opus_bmm(  # XQ [B,M,K], WQ [B,N,K], Y [B,M,N]
     split_k=0,
     workspace=None,
 )
+
+# Retained A16W16 shape-driven API. An explicit kernelId wins; otherwise this
+# performs OPUS-only tuned lookup followed by the per-architecture heuristic.
+result = gemm_a16w16_opus(A, B, bias=None, dtype=torch.bfloat16)
 ```
 
-`kid` is mandatory. `Y` is caller-owned and is returned unchanged after the
-launch. The selected public function determines the logical rank, while the
-resolved family must support that operation; dtype does not determine it.
+For `opus_gemm` and `opus_bmm`, `kid` is mandatory. `Y` is caller-owned and is
+returned unchanged after the launch. The selected exact function determines
+the logical rank, while the resolved family must support that operation;
+dtype does not determine it.
 Among A8 families, no-scale, blockscale and blockscale-bpreshuffle are
 GEMM-only, while MXFP8 is BMM-only. The disjoint architecture id bands and the
 merged `kernels_list` form the canonical registry. Both entries call
@@ -68,23 +78,35 @@ M-major views with `transpose(0, 1)`, which does not copy storage. The physical
 3D raw ABI used by a non-MX A8 GEMM is not exposed as public BMM.
 
 There is no tuned-CSV lookup, architecture heuristic, redirect, or framework
-fallback inside either exact public path. The existing high-level A16 caller
-resolves those policies before entering it:
+fallback inside either exact public path. The two shape-driven A16 callers
+remain intentionally different:
 
 ```text
-explicit kid -> exact public launch
-otherwise: tuned CSV -> validated final kid -> exact public launch
-                  |
-                  +-> no valid row -> skinny (if eligible) -> PyTorch fallback
+aiter.gemm_a16w16
+  -> global multi-backend tuned row -> selected backend
+  -> no valid row -> skinny (eligible gfx90a/gfx942/gfx950)
+                  -> gfx1250 Triton
+                  -> otherwise PyTorch
+
+gemm_a16w16_opus
+  -> explicit kernelId -> local exact A16 GEMM/BMM launcher
+  -> otherwise OPUS-only tuned row -> attempt that exact kid as-is
+  -> missing OPUS row -> per-arch OPUS heuristic
+                       -> validate -> local exact A16 GEMM/BMM launcher
 ```
 
-The shared caller policy helpers are isolated in `policy.py`, while
-`tuned_gemm.py` imports the tuned-candidate validator directly from that
-module; the execution module does not re-export policy helpers. A missing
-tuned row does not invoke an OPUS heuristic. Invalid tuned `(kid, split-K)`
-pairs are discarded together before the caller continues to its normal skinny
-or PyTorch fallback. Legacy gfx942 requested-to-actual resolution also happens
-in the caller, so only the final integer id reaches `opus_gemm` or `opus_bmm`.
+The shared OPUS candidate helpers are isolated in `policy.py`.
+`tuned_gemm.py` uses only the tuned-candidate validator; a missing or invalid
+OPUS row continues through its normal framework fallback and never invokes an
+OPUS heuristic. `gemm_op_a16w16.py` owns the compatibility wrapper and applies
+the migrated gfx942/gfx950/gfx1250 heuristic only after an OPUS-only tuned
+miss. A present but invalid OPUS row is not replaced by a heuristic kid: the
+exact launcher reports the invalid row. If the heuristic-selected kid is
+invalid, the OPUS-only wrapper raises instead of trying secondary kids or
+silently switching backend. Legacy gfx942 requested-to-actual resolution
+happens before heuristic launch, so only a final integer id reaches
+the local exact A16 family launcher. The compatibility entry calls that
+launcher directly rather than re-entering the package-level family router.
 
 There is currently no high-level A16W16 BF16 BMM wrapper. In particular,
 `aiter/ops/batched_gemm_op_bf16.py` contains the existing CK entry points but
@@ -134,6 +156,9 @@ require BMM batch one. Exact instances can impose additional tile, output
 dtype, bias, or K-loop constraints. The BMM example is a direct exact-API call;
 there is no current `batched_gemm_bf16_OPUS` high-level wrapper.
 
+A16 bias follows the `F.linear` output-feature convention: `[N]` broadcasts
+across batch and `[batch,N]` supplies a separate bias for each batch.
+
 ### gfx950 A8W8 without scales
 
 ```python
@@ -146,8 +171,8 @@ opus_gemm(XQ, WQ, Y, kid=2)
 Y = aiter.gemm_a8w8(XQ, WQ, dtype=torch.float32)
 ```
 
-Passing both `x_scale` and `w_scale` to `aiter.gemm_a8w8` retains its
-historical row-scale CK/Triton semantics; passing only one scale is rejected.
+Passing both `x_scale` and `w_scale` to `aiter.gemm_a8w8` retains its existing
+row-scale CK/Triton semantics; passing only one scale is rejected.
 
 ### gfx950 A8W8 blockscale
 
@@ -233,6 +258,17 @@ their respective backends. gfx950 currently registers zero OPUS kids for this
 family, so a gfx950 OPUS validation must report it unavailable rather than run
 a non-OPUS fallback as coverage.
 
+## Tuning compatibility
+
+The exact public APIs execute a caller-selected kid. A16 production tuning
+continues through `csrc/gemm_a16w16/gemm_a16w16_tune.py`; MXFP8 BMM uses
+`csrc/opus_gemm/opus_bmm_mxscale_tune.py`.
+
+The CK-owned blockscale tuner remains unchanged. Its legacy
+`opus_gemm_a8w8_blockscale_bpreshuffle_tune(...)` import is retained in
+`gemm_op_a8w8.py` and calls the bpreshuffle family launcher directly. New
+OPUS-specific tuning code should live under `csrc/opus_gemm/`.
+
 ## A16 Torch workspace
 
 Workspace ownership is call-scoped and remains in Torch:
@@ -267,11 +303,11 @@ Let `padded_M=ceil_div(M,B_M)*B_M` and
 | gfx950 two-stage | `[workspace_capacity_split_k,batch,padded_M,padded_N]` | FP32 |
 | gfx942 two-stage | `[workspace_capacity_split_k,batch,padded_M,padded_N]` | exact BF16/FP32 dtype |
 | gfx1250 two-stage | `[workspace_capacity_split_k,padded_M,padded_N]` | BF16 |
+| gfx1250 fused | not publicly registered | factory/emitter/source retained for repair |
 
 For gfx942, `workspace_capacity_split_k` records the allocated capacity while
 `abi_split_k` records the possibly down-clamped value passed to the launcher.
 Both are fields of the same immutable launch plan.
-| gfx1250 fused | not publicly registered | factory/emitter/source retained for repair |
 
 An explicit workspace must be on the XQ device, contiguous, 16-byte aligned,
 of the exact instance dtype, and large enough for the final split. A direct
@@ -301,6 +337,11 @@ family-specific A16W16 and A8W8 plans. Its `A8W8MxscaleBMMPlan` records the
 resolved exact kid, the split-K value passed to the ABI and an optional
 `WorkspaceSpec`. `gemm_op_a8w8.py` only adapts logical layouts, materializes
 that workspace and invokes `_launch_a8w8_backend`.
+
+For gfx950 kid 8326, only the `split_k > 1`, `D_OUT=void` workspace
+specialization sets `PRELOAD_SF_LDS=false` to avoid the ROCm 7.2.4 compiler
+failure. Its direct BF16/FP32 `split_k == 1` specializations keep
+`PRELOAD_SF_LDS=true`.
 
 ## A8 pybind backend
 
@@ -352,12 +393,13 @@ exact-routable.
 
 ## Migration
 
-The former shape-driven and family-specific Python APIs were removed. Allocate
-`Y` and resolve the final id in the caller. Use `opus_gemm` for A16 logical 2D
-calls and every non-MX A8 family. Use `opus_bmm` for A16 batch-first 3D calls
-or MXFP8 BMM. Do not infer the operation from dtype or expose the physical 3D
-raw ABI of a GEMM-only A8 family as public BMM. The private family modules
-intentionally export an empty `__all__`.
+For new exact-id integrations, allocate `Y`, resolve the final id in the
+caller, use `opus_gemm` for logical 2D calls, and use `opus_bmm` for
+batch-first 3D calls. The retained `gemm_a16w16_opus` entry preserves the
+former A16W16 shape-driven behavior: explicit id, then OPUS-only tuned lookup,
+then the migrated per-architecture heuristic. Do not infer the operation from
+dtype or expose the physical 3D raw ABI of a GEMM-only A8 family as public
+BMM. The A8 family module exports only its legacy tuner compatibility name.
 
 ## Validation
 
@@ -377,12 +419,12 @@ skip on another architecture is not a pass for that target.
 
 | Path | Role |
 |---|---|
-| `__init__.py` | strict public `opus_gemm`/`opus_bmm` contracts and exact-kid routing |
+| `__init__.py` | strict public `opus_gemm`/`opus_bmm` contracts, exact-kid routing, and lazy `gemm_a16w16_opus` compatibility export |
 | `_arch.py` | per-explicit-device architecture/CU scalar cache |
 | `policy.py` | A16 tuned/heuristic candidate selection plus MXFP8 tuned CSV discovery, padded-M lookup, local-to-global kid normalization and heuristic fallback |
 | `launch_plan.py` | shared `WorkspaceSpec`, A16 exact-kid/split-K planning, and A8 family contract/MXFP8 BMM planning |
-| `gemm_op_a16w16.py` | A16 GEMM/BMM adapters, one executor with call-scoped Torch workspace materialization, and the unified `_launch_a16w16_backend` entry over pybind priming/C ABI |
-| `gemm_op_a8w8.py` | three non-MX A8 GEMM adapters, MXFP8 BMM workspace materialization, and the unified `_launch_a8w8_backend` over four pybind raw bindings |
+| `gemm_op_a16w16.py` | retained shape-driven OPUS wrapper plus A16 GEMM/BMM adapters, call-scoped Torch workspace materialization, and the unified `_launch_a16w16_backend` entry over pybind priming/C ABI |
+| `gemm_op_a8w8.py` | three non-MX A8 GEMM adapters, the legacy bpreshuffle tuner compatibility entry, MXFP8 BMM workspace materialization, and the unified `_launch_a8w8_backend` over four pybind raw bindings |
 | `../gemm_op_a8w8.py` | high-level no-scale/plain-blockscale OPUS entry points plus the existing CK/CKTile/ASM/Triton A8 dispatchers |
 | `../batched_gemm_op_bf16.py` | existing high-level CK BF16 BMM path; it is not an OPUS A16W16 BMM wrapper |
 | `../batched_gemm_op_a8w8.py` | MXFP8 high-level caller, scalar launch cache, output allocation and split-one/workspace execution choice |

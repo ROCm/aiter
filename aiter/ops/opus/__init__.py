@@ -320,4 +320,28 @@ def opus_bmm(
     )
 
 
-__all__ = ["opus_bmm", "opus_gemm"]
+def gemm_a16w16_opus(
+    A: Tensor,
+    B: Tensor,
+    bias: Tensor | None = None,
+    dtype: torch.dtype = torch.bfloat16,
+    *,
+    kernelId: int | None = None,
+    splitK: int | None = None,
+    out: Tensor | None = None,
+) -> Tensor:
+    """Run the legacy shape-driven A16W16 OPUS selection path."""
+    from .gemm_op_a16w16 import gemm_a16w16_opus as _impl
+
+    return _impl(
+        A,
+        B,
+        bias,
+        dtype,
+        kernelId=kernelId,
+        splitK=splitK,
+        out=out,
+    )
+
+
+__all__ = ["gemm_a16w16_opus", "opus_bmm", "opus_gemm"]
