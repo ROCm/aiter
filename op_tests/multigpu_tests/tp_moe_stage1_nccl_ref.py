@@ -16,13 +16,14 @@ import torch.distributed as dist
 
 from aiter.fused_moe import moe_sorting
 from aiter.ops.flydsl.kernels.mega_moe.quant import per_1x32_mx_quant
-from aiter.ops.flydsl.kernels.mega_moe.tp_moe_stage1 import TPMoEStage1Output
+from aiter.ops.flydsl.kernels.mega_moe.tp_moe_stage1 import (
+    _DEFAULT_STAGE1_KERNEL,
+    _SUPPORTED_TP,
+    TPMoEStage1Output,
+)
 from aiter.ops.flydsl.moe_kernels import flydsl_moe_stage1, get_flydsl_kernel_params
 from aiter.ops.quant import fused_dynamic_mxfp8_quant_moe_sort
 from aiter.utility.fp4_utils import moe_mxfp4_sort
-
-_SUPPORTED_TP = (4, 8)
-_DEFAULT_STAGE1_KERNEL = "flydsl_moe1_afp8_wfp4_bf16_t32x64x256_w4_gui_xcd4_kw4_fp8"
 
 
 class TPMoEStage1NCCLRef:

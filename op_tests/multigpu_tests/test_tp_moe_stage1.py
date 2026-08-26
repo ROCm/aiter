@@ -9,6 +9,8 @@ Single-rank cases (construct/capacity) also run as plain `python3 <file>`.
 """
 
 import argparse
+import dataclasses
+import inspect
 import os
 import sys
 
@@ -771,6 +773,17 @@ def case_ref_fidelity():
     prod = TPMoEStage1(**common)
     ref = TPMoEStage1NCCLRef(**common)
 
+    # A new behaviour-changing keyword on the production constructor must be
+    # mirrored by the copy; without this the test never passes the new argument
+    # to either side and the divergence goes unnoticed.
+    p_prod = [
+        p
+        for p in inspect.signature(TPMoEStage1.__init__).parameters
+        if p != "transport"
+    ]
+    p_ref = list(inspect.signature(TPMoEStage1NCCLRef.__init__).parameters)
+    assert p_prod == p_ref, (p_prod, p_ref)
+
     for m_local in (1, 8, 64):
         g = torch.Generator(device="cpu").manual_seed(9100 + rank * 17 + m_local)
         x = torch.randn((m_local, model_dim), generator=g).to(
@@ -781,11 +794,22 @@ def case_ref_fidelity():
         a = prod.forward(x, wts, ids)
         b = ref.forward(x, wts, ids)
 
-        assert type(b).__name__ == "TPMoEStage1Output", type(b)
-        assert a.m_logical == b.m_logical, (a.m_logical, b.m_logical)
-        assert a.max_sorted == b.max_sorted, (a.max_sorted, b.max_sorted)
+        # Every non-tensor field, discovered from the dataclass so a field added
+        # later is covered without editing this case. Swapping two same-typed
+        # metadata fields in the copy's _pack (e.g. sort_block_m=self.topk) leaves
+        # the tensors identical and would otherwise pass.
+        for f in dataclasses.fields(TPMoEStage1Output):
+            va, vb = getattr(a, f.name), getattr(b, f.name)
+            if not isinstance(va, torch.Tensor):
+                assert va == vb, f"{f.name}: prod={va} ref={vb} at m_local={m_local}"
+        # The payload comparison below goes through .view(torch.uint8), which
+        # erases dtype: a copy that dropped its .view(torch.float8_e4m3fn) would
+        # still compare equal and hand GEMM2 the wrong operand type.
+        assert a.inter_sorted_quant.dtype == b.inter_sorted_quant.dtype, (
+            a.inter_sorted_quant.dtype,
+            b.inter_sorted_quant.dtype,
+        )
         nvalid = int(a.num_valid_ids[0].item())
-        assert nvalid == int(b.num_valid_ids[0].item())
         for name in (
             "sorted_token_ids",
             "sorted_expert_ids",
@@ -793,8 +817,8 @@ def case_ref_fidelity():
             "num_valid_ids",
         ):
             ta, tb = getattr(a, name), getattr(b, name)
+            assert ta.shape == tb.shape, f"{name}: {ta.shape} vs {tb.shape}"
             n = nvalid if name != "sorted_expert_ids" else nvalid // prod.sort_block_m
-            n = min(n, ta.shape[0])
             assert torch.equal(ta[:n], tb[:n]), f"{name} differs at m_local={m_local}"
         # Compare only genuinely-routed rows, the same scoping case_prequant_
         # equivalence uses. Stage1 never writes the payload or the output scale of
