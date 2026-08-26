@@ -27,6 +27,8 @@ _RADIX_SIGN_BIT = 1 << (_RADIX_BITS - 1)
 _NUM_RADIX_PASSES = 32 // _RADIX_BITS
 _N_HIST_BINS = 1 << _RADIX_BITS
 _VEC = 4
+_STABLE_WIDE_VEC = 8
+_STABLE_WIDE_VEC_MIN_STEPS = 8
 _DPP_ROW_SHR_1 = 0x111
 _DPP_ROW_SHR_2 = 0x112
 _DPP_ROW_SHR_4 = 0x114
@@ -112,13 +114,31 @@ def build_topk_per_row_decode_module(
     total_vecs = n // _VEC
     vecs_per_grid_step = chunks_per_row * _BLOCK_THREADS
     vec_steps = (total_vecs + vecs_per_grid_step - 1) // vecs_per_grid_step
-    stable_vectors = (n + _VEC - 1) // _VEC
-    stable_vectors_per_chunk = (stable_vectors + chunks_per_row - 1) // chunks_per_row
-    stable_steps = (stable_vectors_per_chunk + _BLOCK_THREADS - 1) // _BLOCK_THREADS
-    # n is compile-time, so only the selected scan implementation is emitted.
-    use_packed_stable_scan = (
-        stable_vectors_per_chunk * _VEC < _STABLE_PACKED_COUNT_LIMIT
+    stable_narrow_vectors = (n + _VEC - 1) // _VEC
+    stable_narrow_vectors_per_chunk = (
+        stable_narrow_vectors + chunks_per_row - 1
+    ) // chunks_per_row
+    stable_narrow_steps = (
+        stable_narrow_vectors_per_chunk + _BLOCK_THREADS - 1
+    ) // _BLOCK_THREADS
+    # Wider batches amortize block scans on long rows but add register cost on short rows.
+    stable_vec = (
+        _STABLE_WIDE_VEC if stable_narrow_steps >= _STABLE_WIDE_VEC_MIN_STEPS else _VEC
     )
+    stable_write_vectors = (n + stable_vec - 1) // stable_vec
+    stable_write_vectors_per_chunk = (
+        stable_write_vectors + chunks_per_row - 1
+    ) // chunks_per_row
+    stable_values_per_chunk = stable_write_vectors_per_chunk * stable_vec
+    stable_hist_vectors_per_chunk = stable_values_per_chunk // _VEC
+    stable_hist_steps = (
+        stable_hist_vectors_per_chunk + _BLOCK_THREADS - 1
+    ) // _BLOCK_THREADS
+    stable_write_steps = (
+        stable_write_vectors_per_chunk + _BLOCK_THREADS - 1
+    ) // _BLOCK_THREADS
+    # n is compile-time, so only the selected scan implementation is emitted.
+    use_packed_stable_scan = stable_values_per_chunk < _STABLE_PACKED_COUNT_LIMIT
 
     @flyc.kernel(known_block_size=[_BLOCK_THREADS, 1, 1])
     def histogram_kernel(
@@ -247,9 +267,11 @@ def build_topk_per_row_decode_module(
             decided_mask = row_state[_STATE_MASK]
 
         if stable:
-            vector_end = (chunk + 1) * stable_vectors_per_chunk
-            for step in range_constexpr(stable_steps):
-                vec_idx = chunk * stable_vectors_per_chunk + step * _BLOCK_THREADS + tid
+            vector_end = (chunk + 1) * stable_hist_vectors_per_chunk
+            for step in range_constexpr(stable_hist_steps):
+                vec_idx = (
+                    chunk * stable_hist_vectors_per_chunk + step * _BLOCK_THREADS + tid
+                )
                 if vec_idx < vector_end:
                     if vec_idx < full_vecs:
                         rvals = load_vec_f32(vec_idx)
@@ -275,7 +297,7 @@ def build_topk_per_row_decode_module(
 
         tail_chunk = fx.Int32(0)
         if stable:
-            tail_chunk = full_vecs // fx.Int32(stable_vectors_per_chunk)
+            tail_chunk = full_vecs // fx.Int32(stable_hist_vectors_per_chunk)
         if chunk == tail_chunk and tid < tail_count:
             col = tail_start + tid
             ords = _f32_to_ord(row_in[col])
@@ -357,7 +379,6 @@ def build_topk_per_row_decode_module(
                     scan[_NUM_WAVES] = warp_inclusive
             gpu.barrier()
             result = scan[warp] + exclusive
-            gpu.barrier()
             return result
 
         select_bin = fx.Int32(_N_HIST_BINS - 1) - tid
@@ -643,6 +664,8 @@ def build_topk_per_row_decode_module(
         input_buf = fx.rocdl.make_buffer_tensor(input)
         row_in = fx.slice(input_buf, (row, None))
         row_indices = fx.slice(indices, (row, None))
+        input_div = fx.logical_divide(row_in, fx.make_layout(_VEC, 1))
+        copy_atom_v = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), 32)
         request = row_i32 // fx.Int32(next_n)
         offset = row_i32 % fx.Int32(next_n)
         row_len = row_ends[request] - fx.Int32(next_n) + offset + 1
@@ -662,6 +685,27 @@ def build_topk_per_row_decode_module(
         s_equal_scan = storage.equal_scan.peek().view(fx.make_layout(_NUM_WAVES + 1, 1))
         s_primary_running = storage.primary_running.peek().view(fx.make_layout(1, 1))
         s_equal_running = storage.equal_running.peek().view(fx.make_layout(1, 1))
+
+        def load_vec_f32(idx):
+            r = fx.make_rmem_tensor(_VEC, Float32)
+            if const_expr(total_vecs > 0):
+                fx.copy_atom_call(copy_atom_v, fx.slice(input_div, (None, idx)), r)
+            else:
+                for vi in range_constexpr(_VEC):
+                    r[vi] = fx.Float32(0.0)
+            return fx.memref_load_vec(r)
+
+        def load_stable_vec_f32(idx):
+            r = fx.make_rmem_tensor(stable_vec, Float32)
+            for group in range_constexpr(stable_vec // _VEC):
+                input_vec_idx = idx * fx.Int32(stable_vec // _VEC) + fx.Int32(group)
+                safe_input_vec_idx = (input_vec_idx < fx.Int32(total_vecs)).select(
+                    input_vec_idx, fx.Int32(0)
+                )
+                values = load_vec_f32(safe_input_vec_idx)
+                for vi in range_constexpr(_VEC):
+                    r[group * _VEC + vi] = values[vi]
+            return fx.memref_load_vec(r)
 
         def unwrap_val(val):
             return val.ir_value() if hasattr(val, "ir_value") else arith.unwrap(val)
@@ -717,7 +761,6 @@ def build_topk_per_row_decode_module(
             gpu.barrier()
             result = scan[warp] + exclusive
             total = scan[_NUM_WAVES]
-            gpu.barrier()
             return result, total
 
         def block_exclusive_prefix_i32_pair(first, second, first_scan, second_scan):
@@ -751,13 +794,12 @@ def build_topk_per_row_decode_module(
             second_result = second_scan[warp] + second_exclusive
             first_total = first_scan[_NUM_WAVES]
             second_total = second_scan[_NUM_WAVES]
-            gpu.barrier()
             return first_result, second_result, first_total, second_total
 
         def write_values(
             row_indices, classes_reg, base, remaining_k, my_above, my_equal
         ):
-            for vi in range_constexpr(_VEC):
+            for vi in range_constexpr(stable_vec):
                 cls = classes_reg[vi]
                 col = base + fx.Int32(vi)
                 accepted_before = (my_equal < remaining_k).select(my_equal, remaining_k)
@@ -776,24 +818,34 @@ def build_topk_per_row_decode_module(
         gpu.barrier()
 
         start = fx.Int32(0)
-        stop = fx.Int32(stable_steps)
+        stop = fx.Int32(stable_write_steps)
         step_value = fx.Int32(1)
-        vector_end = (chunk_i32 + fx.Int32(1)) * fx.Int32(stable_vectors_per_chunk)
+        vector_end = (chunk_i32 + fx.Int32(1)) * fx.Int32(
+            stable_write_vectors_per_chunk
+        )
         for step in range(start, stop, step_value):
             vector_idx = (
-                chunk_i32 * fx.Int32(stable_vectors_per_chunk)
+                chunk_i32 * fx.Int32(stable_write_vectors_per_chunk)
                 + step * fx.Int32(_BLOCK_THREADS)
                 + tid_i32
             )
-            base = vector_idx * fx.Int32(_VEC)
-            classes_reg = fx.make_rmem_tensor(_VEC, Int32)
+            base = vector_idx * fx.Int32(stable_vec)
+            rvals = load_stable_vec_f32(vector_idx)
+            classes_reg = fx.make_rmem_tensor(stable_vec, Int32)
             packed_local = fx.Int32(0)
             local_above = fx.Int32(0)
             local_equal = fx.Int32(0)
-            for vi in range_constexpr(_VEC):
+            for vi in range_constexpr(stable_vec):
                 col = base + fx.Int32(vi)
                 safe_col = (col < fx.Int32(n)).select(col, fx.Int32(0))
-                ords = _f32_to_ord(row_in[safe_col])
+                value = rvals[vi]
+                if const_expr(n % _VEC != 0):
+                    input_vec_idx = vector_idx * fx.Int32(
+                        stable_vec // _VEC
+                    ) + fx.Int32(vi // _VEC)
+                    if input_vec_idx == fx.Int32(total_vecs):
+                        value = row_in[safe_col]
+                ords = _f32_to_ord(value)
                 above = (vector_idx < vector_end).select(
                     (col < row_len).select(
                         (ords > threshold).select(fx.Int32(1), fx.Int32(0)),
