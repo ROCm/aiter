@@ -6,12 +6,41 @@
 Grid: Qwen3.5-35B (Hv=32) and Qwen3.5-397B (Hv=64), TP 1/2/4/8.
 Dense T=1k/2k/4k/8k/16k/32k/64k; varlen total T=16k/32k/64k with seqlen 1k/2k/4k/8k.
 
-Filter cases (omit shape flags for the full 304-case grid)::
+Two shape grids
+---------------
+The three shape-swept tests (``test_correctness_flydsl``,
+``test_correctness_flydsl_opt``, ``test_perf_comparison``) are parametrized over
+one of two grids, chosen at collection time:
+
+===================  ======  =====  ==========================================
+Grid                 Shapes  Tests  How to run it
+===================  ======  =====  ==========================================
+CI (default)             24    211  ``pytest <this file>``
+Full                    368   1243  ``pytest <this file> --full``
+===================  ======  =====  ==========================================
+
+``--full`` is an ordinary pytest flag (registered in ``op_tests/conftest.py``).
+
+Filtering by shape
+------------------
+The ``--model/--tp/--t/--n/--dense/--snapshot-dtype`` filters narrow whichever grid
+is active. They are parsed by this module's own argv parser, so they only work via
+the ``__main__`` entry point, not under a bare ``pytest`` invocation::
 
     python op_tests/test_flydsl_linear_attention_prefill.py \\
-        TestPerformance --model 397b --tp 4 --t 8192 --n 8 --snapshot-dtype bf16 fp32
+        --full --model 397b --tp 4 --t 8192 --n 8 --snapshot-dtype bf16 fp32
 
-Plain ``pytest`` without these flags still runs the full grid.
+Benchmarks
+----------
+``TestPerformance`` reports timings against the Triton / HIP references rather than
+asserting, so it is marked ``perf`` and **skipped by default**. Opt in with
+``--perf``::
+
+    pytest op_tests/test_flydsl_linear_attention_prefill.py --perf -k "397B and tp4"
+    python op_tests/test_flydsl_linear_attention_prefill.py --perf --model 397b --tp 4
+
+``perf`` is a real marker, so marker selection works as usual: ``-m perf`` for the
+benchmarks alone, ``-m "not perf"`` to exclude them.
 """
 
 from __future__ import annotations
@@ -534,17 +563,6 @@ def _current_cli_opts_raw():
     return sys.argv[1:]
 
 
-def _full_grid_requested() -> bool:
-    """True when pytest was invoked with ``-m full_grid`` (or ``--marker full_grid``)."""
-    raw = _current_cli_opts_raw()
-    for i, arg in enumerate(raw):
-        if arg in ("-m", "--marker") and i + 1 < len(raw):
-            return "full_grid" in raw[i + 1]
-        if arg.startswith("-m") and len(arg) > 2:
-            return "full_grid" in arg[2:]
-    return False
-
-
 def _current_cli_opts():
     return _build_prefill_cli_parser().parse_known_args(_current_cli_opts_raw())[0]
 
@@ -592,9 +610,8 @@ def _case_matches_cli(args: PrefillArgs, opts) -> bool:
 def _filtered_prefill_params(pool=None):
     """Return the param list for the perf harness, applying CLI shape filters.
 
-    ``pool`` defaults to whichever grid is active (CI or full). The perf
-    harness always filters the active grid; the full grid is only active
-    when ``-m full_grid`` is passed.
+    ``pool`` defaults to ``PREFILL_PARAMS`` (the CI grid). Under pytest,
+    ``pytest_generate_tests`` passes the grid selected by ``--full``.
     """
     if pool is None:
         pool = PREFILL_PARAMS
@@ -612,9 +629,12 @@ def _filtered_prefill_params(pool=None):
 CI_PREFILL_PARAMS = expand_groups(_CI_PREFILL_GROUPS)
 FULL_PREFILL_PARAMS = expand_groups(_FULL_PREFILL_GROUPS)
 
-# PREFILL_PARAMS: active grid selected at collection time.
-# CI by default; full grid when ``pytest -m full_grid`` is used.
-PREFILL_PARAMS = FULL_PREFILL_PARAMS if _full_grid_requested() else CI_PREFILL_PARAMS
+# PREFILL_PARAMS / PREFILL_TEST_IDS: the CI grid, as module-level constants.
+# Under pytest the active grid is chosen per-collection in
+# ``pytest_generate_tests`` from ``--full``; these names exist for
+# non-pytest importers, notably ``csrc/gdn_k5/chunk_gdn_h_opt_tune.py``, which
+# execs this module and reads them directly.
+PREFILL_PARAMS = CI_PREFILL_PARAMS
 
 PREFILL_TEST_IDS = [repr(p) for p in PREFILL_PARAMS]
 
@@ -626,7 +646,9 @@ def pytest_generate_tests(metafunc):
         "test_perf_comparison",
     ):
         return
-    params = _filtered_prefill_params(PREFILL_PARAMS)
+    full_grid = metafunc.config.getoption("full", default=False)
+    pool = FULL_PREFILL_PARAMS if full_grid else CI_PREFILL_PARAMS
+    params = _filtered_prefill_params(pool)
     metafunc.parametrize("args", params, ids=[repr(p) for p in params])
 
 
@@ -2482,12 +2504,11 @@ class TestVariantSelection:
         assert tag == "bv32"
 
 
+@pytest.mark.perf
 class TestPerformance:
+    """Timing comparison vs the Triton / HIP references; skipped without --perf."""
+
     def test_perf_comparison(self, args: PrefillArgs):
-        if "TestPerformance" not in _current_cli_opts_raw():
-            pytest.skip(
-                "perf benchmark — run explicitly: python op_tests/test_flydsl_linear_attention_prefill.py TestPerformance"
-            )
         _run_perf_comparison(args)
 
 
