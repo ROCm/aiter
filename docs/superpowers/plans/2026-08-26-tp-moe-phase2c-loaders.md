@@ -840,6 +840,18 @@ Co-Authored-By: Claude <noreply@anthropic.com>"
 
 ---
 
+## 执行时发现的重大问题：FlyDSL 缓存不认类的改动
+
+Task 2 执行时，Step 5 的负对照**第一次跑是通过的**——删掉 topk-slot 掩码之后测试照样绿。原因不在 loader，在缓存。
+
+`_get_underlying_func`（`flydsl/compiler/jit_function.py:375-388`）对**类**返回 `None`，而 `:250-254` 只在非 `None` 时才把依赖源码收进 cache key。所以 kernel 里 `a_gather = TPATileLoader(...)` 这个类的类体改了多少次，key 都不变，`~/.flydsl/cache` 原样吐回上一次的二进制。
+
+修法是在测试顶部、`import flydsl` **之前**设 `FLYDSL_EXTRA_SOURCE_DIRS` 指向 `mega_moe` 包目录，它会哈希目录下全部 `.py` 并进 `_flydsl_key_cached`。加上之后同一个改动立刻报错。
+
+**这不是本方案独有的问题，仓库里每一个改 loader、epilogue、scheduler 这类**类**之后跑的 kernel 测试都受影响。**已写进 `CLAUDE.md` 的 rigor 规则第 6 条。是否要把这个环境变量提到比单个测试文件更中心的位置，留给后续决定。
+
+---
+
 ## Self-Review
 
 **Spec 覆盖：** 设计文档 2.3 节（融合路径的 A-scale 是 row-major、shuffle 在 LDS 现做）是本方案能成立的前提；5.5 节的两处 loader 改动由 Task 1 实现，PAD 行钳位也在里面。
