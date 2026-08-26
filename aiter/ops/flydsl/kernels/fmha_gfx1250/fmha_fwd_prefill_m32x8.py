@@ -34,6 +34,7 @@ Target: gfx1250, wave32, 8 waves per threadgroup (256 threads).
 """
 
 import functools
+from enum import IntEnum
 
 import torch
 
@@ -47,6 +48,7 @@ from flydsl.expr import arith, gpu, rocdl
 from flydsl.expr import math as fmath
 
 from aiter.ops.flydsl.kernels import buffer_ops
+from aiter.ops.flydsl.utils import get_shared_memory_per_block
 from flydsl.expr.typing import T
 from flydsl.expr.utils.arith import _to_raw as _raw
 from flydsl.compiler.ast_rewriter import ReplaceIfWithDispatch
@@ -86,6 +88,15 @@ WMMA_K = 32  # WMMA contraction depth (bf16 v_wmma_f32_16x16x32); d-tile width
 WMMA_ROW_PER_WAVE = 2  # Q WMMA tiles per wave (the "x2" step from m16x8 to m32x8)
 BLOCK_M = WMMA_M * WMMA_ROW_PER_WAVE * NUM_WAVES  # 256
 
+
+class WarpType(IntEnum):
+    """Warp-specialization role (compile-time). gfx1250 pairs wave i with wave i+4 on
+    one SIMD; the low half (waves 0..3) and high half (waves 4..7) run different
+    main-loop preamble orderings so one wave drives memory while its SIMD-mate computes."""
+
+    LO_WARP = 0  # waves 0..NUM_WAVES/2-1
+    HI_WARP = 1  # waves NUM_WAVES/2..NUM_WAVES-1
+
 # v1 defaults (compile-time; see module docstring).
 DEFAULT_QK_HDIM = 128
 DEFAULT_V_HDIM = 128
@@ -97,6 +108,9 @@ DEFAULT_N_BLOCK = 64
 
 # Ping-pong K LDS buffers the main loop rotates through (double-buffered prefetch).
 N_KV_PP = 2
+
+# Each K/V ping-pong block is floored to this many bytes (reserved headroom).
+MIN_KV_BLK_BYTES = 64 * 1024
 
 # log2(e): exp(x) = exp2(x * LOG2E). Softmax uses the native ISA exp2 intrinsic.
 LOG2E = 1.4426950408889634
@@ -128,6 +142,18 @@ RESCALE_THRESHOLD = 8.0
 def _warp_id():
     """Wave (warp) index within the workgroup, matching opus ``waveid_in_workgroup()``."""
     return fx.Int32(rocdl.wave_id())
+
+
+def _named_barrier_pair(warp_idx):
+    """2-wave SIMD-pair rendezvous (warp `i` ↔ `i+4`) for warp specialization.
+
+    TODO(named-barrier): wire the gfx1250 named barrier — one `@__nbar[warp_idx & 3]`
+    per SIMD pair (`s_barrier_signal_var(ptr, 2)` + `s_barrier_wait`), joined once in
+    the prologue. Currently a NO-OP: the LO/HI split only reorders each wave's own
+    self-contained load→compute, so it stays correct under the workgroup `gpu.barrier()`
+    alone; the named barrier is a perf-only SIMD-issue rendezvous, added after the
+    standalone probe validates allocation + per-pair sync."""
+    del warp_idx
 
 
 def _lane_id():
@@ -242,16 +268,16 @@ def _qk_gemm(*, k_values, q_frags_list, n_block):
 
     ``k_values`` is the already-burst-loaded flat ``(kv, dt, half)`` list of
     v8-bf16 ds_load results (from ``k_mgr.load_k_to_reg``, kept OUT of the WMMA stream so
-    there is no wmma->ds_load issue bubble). A single ``s_wait_dscnt(0)`` drains
-    that burst here before any WMMA; each K fragment is the two 16-col halves of a
+    there is no wmma->ds_load issue bubble). Each K fragment is the two 16-col halves of a
     d-tile shuffled into a v16 fragment matching the Q frag layout.
+
+    NOTE: the ``s_wait_dscnt(0)`` that drains the K ds_load burst is now issued by the
+    (warp-specialized) main-loop preamble before this call — under warp specialization the
+    LO and HI warps drain at different points, so the wait can't live inside the gemm.
     """
     R = len(q_frags_list)
     NKV = n_block // WMMA_N          # output kv tiles (WMMA_N kv rows each)
     NDT = len(q_frags_list[0])       # contraction d-tiles (== qk_hdim // WMMA_K)
-
-    # Drain the whole ds_load burst once; every k_values entry is now resident.
-    rocdl.s_wait_dscnt(0)
 
     # Consume in (kv, dt, half) order: a (half=0, half=1) pair shuffles into a v16
     # K fragment (shared by all q-tiles); NDT d-tiles accumulate into one kv-tile's
@@ -532,6 +558,14 @@ def _pv_gemm(*, v_values, p_list, v_hdim, n_block, o_acc_list=None):
 # ============================================================================
 
 
+def _alloc_lds():
+    """Allocate the full per-CU LDS once and return its base (fx.Int32). Called once per
+    kernel body before the warp-type dispatch so both ``_core_attention`` traces share the
+    single SharedAllocator flydsl permits; K/V, Q, and the O epilogue all carve this base."""
+    smem = fx.SharedAllocator().allocate(get_shared_memory_per_block(fallback_gfx="gfx1250"))
+    return fx.Int32(fx.ptrtoint(smem.peek().ptr))
+
+
 def _core_attention(
     *,
     qk_hdim,
@@ -572,46 +606,42 @@ def _core_attention(
     # mask_left, window_right only when mask_right. Causal == mask_right, window_right=0.
     window_left,
     window_right,
+    warp_idx,  # runtime fx.Int32 wave index
+    warp_type,  # compile-time WarpType (LO_WARP / HI_WARP)
+    lds_base,  # LDS base (fx.Int32), allocated once by the caller (_alloc_lds)
 ):
     """Layout-agnostic m32x8 compute — empty scaffold.
 
     Shared by the THD and BSHD kernel entries. The caller resolves the per-batch
     token ranges (``q_start``/``q_len`` and ``kv_start``/``kv_len``) — the only
     part that differs between varlen and batched layouts — and passes them here.
+
+    Warp-specialized: the caller dispatches on runtime ``warp_type`` and traces this
+    body TWICE (once per compile-time ``warp_type``); the two instantiations differ in
+    the ``main_loop`` preamble ordering (LO drives K load, HI shadows it) and rendezvous
+    on a 2-wave named barrier (``_named_barrier_pair``, currently a no-op stub).
     """
-    warp_idx = _warp_id()
     lane_idx = _lane_id()
     kv_head, q_head_idx, seq_idx = _packed_tile_indices(gqa_ratio, warp_idx, lane_idx)
 
-    # One SharedAllocator per kernel (flydsl constraint); K/V carve the whole 320KB
-    # LDS (occupancy=1). Each manager only reports the byte count it needs — the
-    # swizzled layout inside each region is the manager's own business.
-    smem = fx.SharedAllocator()
-
-    # ---- K/V staging FIRST: N_KV_PP ping-pong slots, K and V interleaved so each slot
-    # is a contiguous ``K.ppX | V.ppX``: [K.pp0 | V.pp0][K.pp1 | V.pp1]. m32x8 floors
-    # each block at 64KB so a slot is 128KB (reserved headroom for a later n_block
-    # expansion; actual K/V data stays 16KB at n_block=64). The 256KB KV allocation
-    # alone forces occupancy=1 (2 WG = 512KB > 320KB LDS). O later reuses a full
-    # non-current 128KB slot; Q time-shares slot 1 (see below). ----
-    MIN_KV_BLK_BYTES = 64 * 1024
+    # K/V staging: N_KV_PP ping-pong slots ([K.pp0|V.pp0][K.pp1|V.pp1]), blocks floored
+    # at 64KB -> 128KB/slot, 256KB total -> occupancy=1. O reuses a non-current slot; Q
+    # time-shares slot 1. slot_bytes is compile-time (no allocation; lds_base is passed in).
     k_mgr = KManager16b(qk_hdim=qk_hdim, n_block=n_block, num_waves=NUM_WAVES)
     v_mgr = VManager16b(v_hdim=v_hdim, n_block=n_block, num_waves=NUM_WAVES)
     k_blk_bytes = max(k_mgr.get_lds_size_in_byte(), MIN_KV_BLK_BYTES)
     v_blk_bytes = max(v_mgr.get_lds_size_in_byte(), MIN_KV_BLK_BYTES)
     slot_bytes = k_blk_bytes + v_blk_bytes
-    kv_smem = smem.allocate(N_KV_PP * slot_bytes)
-    kv_lds_base = fx.Int32(fx.ptrtoint(kv_smem.peek().ptr))
 
     def _k_lds_buf(pp):  # K base of ping-pong slot ``pp`` (int or fx.Int32; folds when const)
         if isinstance(pp, int):
             pp = fx.Int32(pp)
-        return kv_lds_base + pp * fx.Int32(slot_bytes)
+        return lds_base + pp * fx.Int32(slot_bytes)
 
     def _v_lds_buf(pp):  # V base of ping-pong slot ``pp`` (== K base + k_blk_bytes)
         if isinstance(pp, int):
             pp = fx.Int32(pp)
-        return kv_lds_base + pp * fx.Int32(slot_bytes) + fx.Int32(k_blk_bytes)
+        return lds_base + pp * fx.Int32(slot_bytes) + fx.Int32(k_blk_bytes)
 
     # ---- Q staging TIME-SHARES slot 1: Q's LDS base = slot-1 base (kv_base +
     # slot_bytes). Q is loaded + drained into VGPR in the prologue, then dead; the
@@ -626,7 +656,7 @@ def _core_attention(
     assert q_mgr.get_lds_size_in_byte() <= slot_bytes, (
         f"Q footprint {q_mgr.get_lds_size_in_byte()}B exceeds slot {slot_bytes}B"
     )
-    q_lds_base = kv_lds_base + fx.Int32(slot_bytes)
+    q_lds_base = lds_base + fx.Int32(slot_bytes)
 
     q_mgr.load_q_to_vgpr_part1(
         ptr_Q=ptr_Q,
@@ -835,68 +865,62 @@ def _core_attention(
         v_curr = [state[_PTR_BASE + 4], state[_PTR_BASE + 5]]
         v_next = [state[_PTR_BASE + 6], state[_PTR_BASE + 7]]
 
-        # ---- Address phase: compute ALL K + V pointers as pure VALU up front, BEFORE
-        # the async drain so this address VALU overlaps the outstanding copy -- the
-        # tile t+1 global->LDS prefetch sources/dests for BOTH K and V, AND this
-        # tile's K + V ds_load LDS sources. Computing the next-tile global pointers
-        # unconditionally is safe: pure arithmetic (create_llvm_ptr, no access); only
-        # the async ISSUE below is guarded by `nxt < n_tiles`. ----
+        # Warp-specialized preamble: same pieces, ordered so the SIMD-mate pair (i / i+4)
+        # staggers K load vs prefetch around `_named_barrier_pair`. Correctness is
+        # warp-type-independent (each wave reads its own resident K under the workgroup
+        # barrier); the rendezvous is a perf-only stagger.
         nxt = t + fx.Int32(1)
         nxt_row0 = nxt * fx.Int32(n_block)
         nxt_valid = _kv_valid(nxt_row0)
-        k_next_gptrs, k_next_lds_ptrs, k_next_imm = k_mgr.global_load_ptrs(
-            ptr_lds=_k_lds_buf(nxt_pp),
-            ptr_K=ptr_K,
-            stride_k_seq=stride_k_seq,
-            stride_k_head=stride_k_head,
-            kv_head=kv_head,
-            kv_row0=kv_start + nxt_row0,
-            kv_valid=nxt_valid,
-            warp_idx=warp_idx,
-            lane_idx=lane_idx,
-        )
-        v_next_gptrs, v_next_lds_ptrs, v_next_imm = v_mgr.global_load_ptrs(
-            ptr_lds=_v_lds_buf(nxt_pp),
-            ptr_V=ptr_V,
-            stride_v_seq=stride_v_seq,
-            stride_v_head=stride_v_head,
-            kv_head=kv_head,
-            kv_row0=kv_start + nxt_row0,
-            kv_valid=nxt_valid,
-            warp_idx=warp_idx,
-            lane_idx=lane_idx,
-        )
-        # Current tile's KV is already resident in its buffer (prefetched during the
-        # previous tile's compute). Drain that async, then cross-wave barrier so no
-        # wave still reads the OTHER buffer that this tile's t+1 prefetch is about to
-        # overwrite. `sched_barrier(0)` then pins all the address VALU above so the K/V
-        # memory ops below issue back-to-back (no address VALU interleaved into the
-        # load burst).
-        rocdl.s_wait_asynccnt(0)
-        gpu.barrier()
-        rocdl.sched_barrier(0)
 
-        # ---- Load phase: burst ALL this-tile K ds_loads (out of the WMMA stream),
-        # THEN issue the tile t+1 async prefetch (K + V) so its issue shadows the
-        # ds_load latency. The prefetch targets the OTHER ping-pong buffer, so it
-        # never races this tile's reads of buffer t % N_KV_PP; the barrier above
-        # already retired tile t-1's reads of that other buffer before this overwrite.
-        # Prefetch ONLY when tile t+1 exists: the last iteration (t == n_tiles-1) has
-        # no next tile; issuing its would-be prefetch drops a dead async load into
-        # slot n_tiles%N_KV_PP -- exactly the slot the O epilogue reuses -- which races
-        # the epilogue's O write across waves. Skipping it leaves that slot idle so the
-        # epilogue needs no barrier. nxt_valid still clamps the mask_right tail. ----
-        k_values = k_mgr.load_k_to_reg(k_curr)
+        def _addr_phase():
+            k_g, k_l, k_i = k_mgr.global_load_ptrs(
+                ptr_lds=_k_lds_buf(nxt_pp), ptr_K=ptr_K,
+                stride_k_seq=stride_k_seq, stride_k_head=stride_k_head,
+                kv_head=kv_head, kv_row0=kv_start + nxt_row0, kv_valid=nxt_valid,
+                warp_idx=warp_idx, lane_idx=lane_idx,
+            )
+            v_g, v_l, v_i = v_mgr.global_load_ptrs(
+                ptr_lds=_v_lds_buf(nxt_pp), ptr_V=ptr_V,
+                stride_v_seq=stride_v_seq, stride_v_head=stride_v_head,
+                kv_head=kv_head, kv_row0=kv_start + nxt_row0, kv_valid=nxt_valid,
+                warp_idx=warp_idx, lane_idx=lane_idx,
+            )
+            return (k_g, k_l, k_i, v_g, v_l, v_i)
 
-        def _prefetch_next_kv():
-            _async_load_to_lds(k_next_gptrs, k_next_lds_ptrs, cluster=True, imm_offs=k_next_imm)
-            _async_load_to_lds(v_next_gptrs, v_next_lds_ptrs, cluster=True, imm_offs=v_next_imm)
+        def _drain_barrier():
+            rocdl.s_wait_asynccnt(0)
+            rocdl.sched_barrier(0)
+            gpu.barrier()
+            rocdl.sched_barrier(0)
 
-        scf_if_dispatch(nxt < fx.Int32(n_tiles), _prefetch_next_kv)
+        def _prefetch(addr):
+            # Skip t+1 prefetch on the last tile: a dead async into the O-epilogue slot
+            # races the epilogue O write across waves.
+            def _issue():
+                k_g, k_l, k_i, v_g, v_l, v_i = addr
+                _async_load_to_lds(k_g, k_l, cluster=True, imm_offs=k_i)
+                _async_load_to_lds(v_g, v_l, cluster=True, imm_offs=v_i)
 
-        # ---- GEMM1: S^T = K @ Q^T for this KV tile (== P^T pre-softmax). WMMA
-        # consumes the pre-loaded k_values; one s_wait_dscnt(0) inside drains the
-        # burst before the first WMMA. ----
+            scf_if_dispatch(nxt < fx.Int32(n_tiles), _issue)
+
+        if warp_type == WarpType.LO_WARP:
+            addr = _addr_phase()
+            _drain_barrier()
+            k_values = k_mgr.load_k_to_reg(k_curr)
+            _prefetch(addr)
+            rocdl.s_wait_dscnt(0)
+            _named_barrier_pair(warp_idx)
+        else:
+            _drain_barrier()
+            addr = _addr_phase()
+            _prefetch(addr)
+            _named_barrier_pair(warp_idx)
+            k_values = k_mgr.load_k_to_reg(k_curr)
+            rocdl.s_wait_dscnt(0)
+
+        # ---- GEMM1: S^T = K @ Q^T for this KV tile (== P^T pre-softmax); consumes the
+        # pre-loaded k_values (K burst already drained by the preamble above). ----
         s_list = _qk_gemm(
             k_values=k_values,
             q_frags_list=q_frags,
@@ -1239,41 +1263,29 @@ def build_fmha_fwd_prefill_m32x8(
             # write. Self-attn's kv_len==0 implies q_len==0, so this only skips
             # genuinely empty work. (varlen may carry a per-batch kv_len==0 tail.)
             if (q_len > fx.Int32(0)) & (kv_len > fx.Int32(0)):
-                _core_attention(
-                    qk_hdim=QK_HDIM,
-                    v_hdim=V_HDIM,
-                    n_block=N_BLOCK,
-                    mask_left=MASK_LEFT,
-                    mask_right=MASK_RIGHT,
-                    return_lse=RET_LSE,
-                    has_sink=HAS_SINK,
-                    gqa_ratio=GQA_RATIO,
-                    ptr_O=ptr_O,
-                    ptr_Q=ptr_Q,
-                    ptr_K=ptr_K,
-                    ptr_V=ptr_V,
-                    ptr_LSE=ptr_LSE,
-                    ptr_sink=ptr_sink,
-                    softmax_scale=softmax_scale,
-                    stride_q_seq=stride_q_seq,
-                    stride_k_seq=stride_k_seq,
-                    stride_v_seq=stride_v_seq,
-                    stride_o_seq=stride_o_seq,
-                    stride_q_head=stride_q_head,
-                    stride_k_head=stride_k_head,
-                    stride_v_head=stride_v_head,
-                    stride_o_head=stride_o_head,
-                    stride_lse_seq=stride_lse_seq,
-                    stride_lse_head=stride_lse_head,
+                _ca_kw = dict(
+                    qk_hdim=QK_HDIM, v_hdim=V_HDIM, n_block=N_BLOCK,
+                    mask_left=MASK_LEFT, mask_right=MASK_RIGHT, return_lse=RET_LSE,
+                    has_sink=HAS_SINK, gqa_ratio=GQA_RATIO,
+                    ptr_O=ptr_O, ptr_Q=ptr_Q, ptr_K=ptr_K, ptr_V=ptr_V,
+                    ptr_LSE=ptr_LSE, ptr_sink=ptr_sink, softmax_scale=softmax_scale,
+                    stride_q_seq=stride_q_seq, stride_k_seq=stride_k_seq,
+                    stride_v_seq=stride_v_seq, stride_o_seq=stride_o_seq,
+                    stride_q_head=stride_q_head, stride_k_head=stride_k_head,
+                    stride_v_head=stride_v_head, stride_o_head=stride_o_head,
+                    stride_lse_seq=stride_lse_seq, stride_lse_head=stride_lse_head,
                     lse_base_elems=lse_base_elems,
                     lse_num_records_bytes=lse_num_records_bytes,
-                    q_start=q_start,
-                    q_len=q_len,
-                    kv_start=kv_start,
-                    kv_len=kv_len,
-                    window_left=window_left,
-                    window_right=window_right,
+                    q_start=q_start, q_len=q_len, kv_start=kv_start, kv_len=kv_len,
+                    window_left=window_left, window_right=window_right,
                 )
+                # Warp specialization: LO warp (waves 0..N/2-1) vs HI warp (N/2..N-1).
+                lds_base = _alloc_lds()
+                warp_idx = _warp_id()
+                if warp_idx // fx.Int32(NUM_WAVES // 2) == fx.Int32(0):
+                    _core_attention(warp_idx=warp_idx, warp_type=WarpType.LO_WARP, lds_base=lds_base, **_ca_kw)
+                else:
+                    _core_attention(warp_idx=warp_idx, warp_type=WarpType.HI_WARP, lds_base=lds_base, **_ca_kw)
 
         return kn_fmha_fwd_prefill_m32x8_thd
 
@@ -1315,41 +1327,30 @@ def build_fmha_fwd_prefill_m32x8(
         lse_base_elems = batch * stride_lse_batch
         lse_num_records_bytes = (lse_base_elems + stride_lse_batch) * fx.Int32(4)
 
-        _core_attention(
-            qk_hdim=QK_HDIM,
-            v_hdim=V_HDIM,
-            n_block=N_BLOCK,
-            mask_left=MASK_LEFT,
-            mask_right=MASK_RIGHT,
-            return_lse=RET_LSE,
-            has_sink=HAS_SINK,
-            gqa_ratio=GQA_RATIO,
-            ptr_O=ptr_O,
-            ptr_Q=ptr_Q,
-            ptr_K=ptr_K,
-            ptr_V=ptr_V,
-            ptr_LSE=ptr_LSE,
-            ptr_sink=ptr_sink,
-            softmax_scale=softmax_scale,
-            stride_q_seq=stride_q_seq,
-            stride_k_seq=stride_k_seq,
-            stride_v_seq=stride_v_seq,
-            stride_o_seq=stride_o_seq,
-            stride_q_head=stride_q_head,
-            stride_k_head=stride_k_head,
-            stride_v_head=stride_v_head,
-            stride_o_head=stride_o_head,
-            stride_lse_seq=stride_lse_seq,
-            stride_lse_head=stride_lse_head,
+        _ca_kw = dict(
+            qk_hdim=QK_HDIM, v_hdim=V_HDIM, n_block=N_BLOCK,
+            mask_left=MASK_LEFT, mask_right=MASK_RIGHT, return_lse=RET_LSE,
+            has_sink=HAS_SINK, gqa_ratio=GQA_RATIO,
+            ptr_O=ptr_O, ptr_Q=ptr_Q, ptr_K=ptr_K, ptr_V=ptr_V,
+            ptr_LSE=ptr_LSE, ptr_sink=ptr_sink, softmax_scale=softmax_scale,
+            stride_q_seq=stride_q_seq, stride_k_seq=stride_k_seq,
+            stride_v_seq=stride_v_seq, stride_o_seq=stride_o_seq,
+            stride_q_head=stride_q_head, stride_k_head=stride_k_head,
+            stride_v_head=stride_v_head, stride_o_head=stride_o_head,
+            stride_lse_seq=stride_lse_seq, stride_lse_head=stride_lse_head,
             lse_base_elems=lse_base_elems,
             lse_num_records_bytes=lse_num_records_bytes,
-            q_start=batch * seq_len_q,
-            q_len=seq_len_q,
-            kv_start=batch * seq_len_k,
-            kv_len=seq_len_k,
-            window_left=window_left,
-            window_right=window_right,
+            q_start=batch * seq_len_q, q_len=seq_len_q,
+            kv_start=batch * seq_len_k, kv_len=seq_len_k,
+            window_left=window_left, window_right=window_right,
         )
+        # Warp specialization: LO warp (waves 0..N/2-1) vs HI warp (N/2..N-1).
+        lds_base = _alloc_lds()
+        warp_idx = _warp_id()
+        if warp_idx // fx.Int32(NUM_WAVES // 2) == fx.Int32(0):
+            _core_attention(warp_idx=warp_idx, warp_type=WarpType.LO_WARP, lds_base=lds_base, **_ca_kw)
+        else:
+            _core_attention(warp_idx=warp_idx, warp_type=WarpType.HI_WARP, lds_base=lds_base, **_ca_kw)
 
     return kn_fmha_fwd_prefill_m32x8_bshd
 
