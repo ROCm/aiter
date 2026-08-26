@@ -118,7 +118,7 @@ def generate_hstu_attn_inputs(
     return q.contiguous(), k.contiguous(), v.contiguous(), seq_offsets, num_targets
 
 
-# Validated on gfx942; gfx950 is permitted but unvalidated.
+# Validated on gfx942 and gfx950
 HSTU_SUPPORTED_GFX = ["gfx942", "gfx950"]
 
 
