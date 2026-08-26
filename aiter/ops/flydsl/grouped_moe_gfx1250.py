@@ -378,7 +378,7 @@ def _preshuffle_a4_payload(
     """Preshuffle packed FP4 A tiles for the gfx1250 TDM consumer.
 
     The innermost physical layout is
-    ``(k_rept, m_rept, 4, 16, 16)``, where ``k_rept=tile_k/128`` and
+    ``(m_rept, k_rept, 4, 16, 16)``, where ``k_rept=tile_k/128`` and
     ``m_rept=tile_m/16``. The final dimension is 16 packed-K bytes, so the
     four K cells cover one logical K128 FP4 operand.
     """
@@ -410,8 +410,8 @@ def _preshuffle_a4_payload(
         *leading_dims,
         base,
         base + 3,
-        base + 4,
         base + 1,
+        base + 4,
         base + 5,
         base + 2,
         base + 6,

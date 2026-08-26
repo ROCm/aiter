@@ -447,7 +447,7 @@ def launch_gemm_a8w4_tdm(
                 num_warps=nw,
                 # Descriptor bit 21: release to the peers already present and
                 # re-broadcast later, so early arrivals are not held for a merge.
-                early_timeout=bool(wg_mask),
+                early_timeout=bool(False),
                 **pad_kw,
             )
             if wg_mask:
@@ -469,11 +469,15 @@ def launch_gemm_a8w4_tdm(
             )
 
         if const_expr(a_preshuffle):
+            # Physical A is (m_rept, k_rept, 4, 16, 16), so every contiguous
+            # group of 16 rows contains all K repeats for one M16 operand row.
+            # Round the valid extent up to that indivisible M16 unit.
+            a_oob = (mn_oob + 15) // 16 * 16
             add_tdm_loads(
                 gA_base,
                 a_off0,
                 A_ROW_B,
-                None,
+                a_oob,
                 A_ROW_B,
                 tile_m,
                 on_i32=False,
@@ -625,9 +629,10 @@ def launch_gemm_a8w4_tdm(
             if const_expr(a_is_fp4):
                 if const_expr(a_preshuffle):
                     m_rept = tile_m // 16
+                    k_rept = tile_k // 128
                     mr = wave_m * wmma_m_rep + wm
                     off = (
-                        (((ksl * m_rept + mr) * 4 + kgrp) * 16 + lane16)
+                        (((mr * k_rept + ksl) * 4 + kgrp) * 16 + lane16)
                         * 16
                     )
                     return Vec(lds_load_b128(base, fx.Int32(off))).shuffle(
