@@ -28,6 +28,12 @@ either way, which is the w4 half of a8w4:
         quant kernel -- and so `moe1` here includes that quantization.
   mx8   mxfp8, i.e. e4m3 plus one ue8m0 scale per 32 values along K. Layer 1
         writes bf16 and layer 2's input is quantized separately.
+  mx8-fused
+        the same mxfp8, but emitted from layer 1's epilogue -- the GEMM writes
+        e4m3 plus the ue8m0 scales directly, so `moe1` covers the quantization
+        the way it does under fp8 and no quant kernel runs between the
+        projections. Pair it with mx8 to price the fusion. The op requires
+        split_k == 1, no scatter -- both hold for layer 1 -- and N_out % 32 == 0.
 
 Both static scales are calibrated from the data they quantize (max / 448),
 outside the timed region; the layer-2 one needs layer 1's output magnitude, so
@@ -72,8 +78,12 @@ from aiter.ops.triton.utils.shuffle import shuffle_scale_moe
 
 # measurable layers, in report order; see the module docstring
 LAYERS = ("moe1", "moe2", "total")
-# activation formats --act-dtype accepts; the weights are always mxfp4
-ACT_DTYPES = ("fp8", "mx8")
+# activation formats --act-dtype accepts; the weights are always mxfp4.
+# mx8-fused is mx8 with layer 1 emitting layer 2's input from its epilogue.
+ACT_DTYPES = ("fp8", "mx8", "mx8-fused")
+# what main() resolves those to -- the format the tensors actually reach the
+# kernel in, which is all the benchmark body below knows about
+ACT_TENSOR_DTYPES = ("fp8", "mx8")
 
 
 def compute_roofline(
@@ -284,6 +294,7 @@ def bench_mlp_single_weight_init(
     w_dtype,
     TP,
     preshuffle,
+    fuse_mx_quant,
     backend,
     routed_experts,
     rep,
@@ -293,7 +304,9 @@ def bench_mlp_single_weight_init(
     dev = f"cuda:{rank}"
 
     assert dim2 % TP == 0, f"{dim2=}, {TP=}, dim2 must be divisible by TP"
-    assert x_dtype in ACT_DTYPES, f"{x_dtype=} must be one of {ACT_DTYPES}"
+    assert (
+        x_dtype in ACT_TENSOR_DTYPES
+    ), f"{x_dtype=} must be one of {ACT_TENSOR_DTYPES}"
     assert w_dtype == "mx4", f"a8w4 weights are mxfp4 (E2M1), got {w_dtype}"
     if preshuffle:
         assert (
@@ -302,6 +315,11 @@ def bench_mlp_single_weight_init(
         assert (
             backend_name(backend) == "gluon"
         ), "--preshuffle needs the gluon kernel, which --backend triton excludes"
+    if fuse_mx_quant:
+        assert x_dtype == "mx8", (
+            "--act-dtype mx8-fused emits layer 2's mxfp8 input from layer "
+            f"1's epilogue, so the activations must be mx8, got {x_dtype}"
+        )
     if routed_experts is not None:
         # every token needs n_expts_act distinct experts, so the pool can't be smaller
         assert n_expts_act <= routed_experts <= n_expts_tot, (
@@ -371,6 +389,7 @@ def bench_mlp_single_weight_init(
             out_dtype=out_dtype,
             apply_swiglu=True,
             preshuffled=preshuffle,
+            out_mx_quant=fuse_mx_quant,
             backend=backend,
         )
 
@@ -394,8 +413,17 @@ def bench_mlp_single_weight_init(
     # scales) once here so the timed region holds only the two GEMMs. This
     # doubles as the compile warmup.
     y1 = layer1()
+    if fuse_mx_quant:
+        # layer 1's epilogue emitted layer 2's input directly: e4m3 plus one
+        # ue8m0 scale per 32 values along K -- the layout quantize() would have
+        # produced, so no quant kernel runs between the projections
+        y1, y1_mx_scale = y1
+    else:
+        y1_mx_scale = None
     y1_bytes = y1.numel() * y1.element_size()
-    if static_fp8:
+    if fuse_mx_quant:
+        x2, x2_scale = y1, y1_mx_scale
+    elif static_fp8:
         # already e4m3, quantized by layer 1 with x2_static_scale
         x2, x2_scale = y1, None
     else:
@@ -499,6 +527,7 @@ def bench_mlp(
     w_dtype,
     TP,
     preshuffle,
+    fuse_mx_quant,
     backend,
     routed_experts,
     rep,
@@ -517,6 +546,7 @@ def bench_mlp(
             w_dtype,
             TP,
             preshuffle,
+            fuse_mx_quant,
             backend,
             routed_experts,
             rep,
@@ -556,6 +586,7 @@ def roofline_mlp(
     w_dtype,
     TP,
     preshuffle,
+    fuse_mx_quant,
     backend,
     routed_experts,
     rep,
@@ -578,6 +609,8 @@ def roofline_mlp(
     stem += f"-{backend_name(backend)}"
     if preshuffle:
         stem += "-preshuffled"
+    if fuse_mx_quant:
+        stem += "-mxfused"
     if tuple(layers) != LAYERS:
         # a partial run holds a subset of the rows, so give it its own file
         stem += "-layers=" + "+".join(layers)
@@ -592,6 +625,7 @@ def roofline_mlp(
         w_dtype,
         TP,
         preshuffle,
+        fuse_mx_quant,
         backend,
         routed_experts,
         rep,  # fixed args
@@ -644,9 +678,10 @@ def parse_args(args: list[str] | None = None):
         choices=list(ACT_DTYPES),
         default="fp8",
         help="Activation format: fp8 (e4m3 with one static scale per tensor, "
-        "layer 1 emitting layer 2's input directly) or mx8 (mxfp8, one ue8m0 "
-        "scale per 32 values along K). Weights are mxfp4 either way. "
-        "Default: fp8.",
+        "layer 1 emitting layer 2's input directly), mx8 (mxfp8, one ue8m0 "
+        "scale per 32 values along K, quantized in a separate kernel) or "
+        "mx8-fused (that same mxfp8 emitted from layer 1's epilogue, so moe1 "
+        "carries the quant cost). Weights are mxfp4 either way. Default: fp8.",
     )
     parser.add_argument(
         "--backend",
@@ -717,7 +752,11 @@ def main(args: list[str] | None = None) -> None:
         batch_sizes_moe = list(chain(*[range(*r) for r in batch_ranges_moe]))
     else:
         batch_sizes_moe = parsed_args.M
-    quantized_dtypes = [parsed_args.act_dtype, "mx4"]
+    # mx8-fused names a quantization *site*, not a third activation dtype:
+    # the tensors that reach the kernel are mx8 either way
+    fuse_mx_quant = parsed_args.act_dtype == "mx8-fused"
+    act_dtype = "mx8" if fuse_mx_quant else parsed_args.act_dtype
+    quantized_dtypes = [act_dtype, "mx4"]
 
     roofline_mlp(
         batch_sizes_moe,
@@ -729,6 +768,7 @@ def main(args: list[str] | None = None) -> None:
         quantized_dtypes[1],
         TP=1,
         preshuffle=parsed_args.preshuffle,
+        fuse_mx_quant=fuse_mx_quant,
         backend=parsed_args.backend,
         routed_experts=parsed_args.routed_experts,
         rep=parsed_args.rep,
