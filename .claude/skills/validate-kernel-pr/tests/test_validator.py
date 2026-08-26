@@ -84,6 +84,8 @@ class ValidatorFixture:
         (self.repo / "tests" / "test_sample.py").write_text(
             "import os\n"
             '_GRID = os.environ.get("VALIDATOR_TEST_GRID", "")\n'
+            'if _GRID == "__VALIDATOR_INVALID_GRID__":\n'
+            '    raise ValueError("invalid validator grid probe")\n'
             '# (7, 257, "f32")\n'
             "def test_sample():\n"
             "    atol = 1e-5\n"
@@ -289,6 +291,7 @@ class ValidateKernelPrTests(unittest.TestCase):
         self.assertEqual("INCONCLUSIVE", report["verdict"])
         self.assertEqual("skip", report["stages"]["correctness_repo_tests"]["status"])
         self.assertEqual("skip", report["stages"]["correctness_s1_grid"]["status"])
+        self.assertEqual({}, report["arch_coverage"])
         self.assert_complete_stage_objects(report)
 
     def test_flydsl_source_change_is_not_shadowed_by_pylib(self):
@@ -296,6 +299,7 @@ class ValidateKernelPrTests(unittest.TestCase):
         source = self.fixture.repo / "python" / "flydsl"
         source.mkdir(parents=True)
         (source / "__init__.py").write_text('__version__ = "test"\n')
+        (source / "module.py").write_text("VALUE = 1\n")
         run(["git", "add", "-A"], cwd=self.fixture.repo)
         run(
             [
@@ -316,10 +320,10 @@ class ValidateKernelPrTests(unittest.TestCase):
         (runtime / "__init__.py").write_text('__version__ = "test"\n')
 
         def change_flydsl(repo):
-            path = repo / "python" / "flydsl" / "__init__.py"
-            path.write_text(path.read_text() + "CHANGED = True\n")
+            root = repo / "python" / "flydsl"
+            (root / "module.py").rename(root / "renamed.py")
 
-        patch = self.fixture.make_patch(change_flydsl, "flydsl-source.patch")
+        patch = self.fixture.make_patch(change_flydsl, "flydsl-rename.patch")
         _, report = self.fixture.validate(
             patch,
             pylib=runtime.parent,
@@ -345,6 +349,26 @@ class ValidateKernelPrTests(unittest.TestCase):
         self.assertEqual("skip", report["stages"]["correctness_s1_grid"]["status"])
         self.assertIn(
             "not referenced",
+            report["stages"]["correctness_s1_grid"]["note"],
+        )
+
+    def test_grid_pass_requires_runtime_shape_handshake(self):
+        def ignore_grid_value(repo):
+            path = repo / "tests" / "test_sample.py"
+            path.write_text(
+                path.read_text().replace(
+                    'if _GRID == "__VALIDATOR_INVALID_GRID__":',
+                    "if False and _GRID:",
+                )
+            )
+
+        patch = self.fixture.make_patch(ignore_grid_value, "unused-grid.patch")
+        _, report = self.fixture.validate(patch)
+
+        self.assertEqual("INCONCLUSIVE", report["verdict"])
+        self.assertEqual("skip", report["stages"]["correctness_s1_grid"]["status"])
+        self.assertIn(
+            "ignores",
             report["stages"]["correctness_s1_grid"]["note"],
         )
 
@@ -378,6 +402,34 @@ class ValidateKernelPrTests(unittest.TestCase):
         self.assertEqual("INCONCLUSIVE", report["verdict"])
         self.assertEqual("skip", report["stages"]["baseline_control"]["status"])
         self.assertEqual("skip", report["stages"]["correctness_repo_tests"]["status"])
+
+    def test_existing_ignored_artifact_rejects_nonisolated_worktree(self):
+        (self.fixture.repo / ".gitignore").write_text("ignored-cache/\n")
+        run(["git", "add", ".gitignore"], cwd=self.fixture.repo)
+        run(
+            [
+                "git",
+                "-c",
+                "user.name=Validator Test",
+                "-c",
+                "user.email=validator@example.com",
+                "commit",
+                "-q",
+                "-m",
+                "ignore cache",
+            ],
+            cwd=self.fixture.repo,
+        )
+        ignored = self.fixture.repo / "ignored-cache"
+        ignored.mkdir()
+        (ignored / "state").write_text("pre-existing")
+        patch = self.fixture.make_patch(self.harmless_change, "ignored-artifact.patch")
+
+        result, report = self.fixture.validate(patch)
+
+        self.assertEqual(2, result.returncode)
+        self.assertEqual("INCONCLUSIVE", report["verdict"])
+        self.assertEqual("skip", report["stages"]["merge_sim"]["status"])
 
 
 class IndexScannerTests(unittest.TestCase):

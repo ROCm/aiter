@@ -53,7 +53,7 @@
 
     "arch_coverage": {
       "type": "object",
-      "description": "Per-architecture coverage. 'runtime' means kernels were executed on that device; 'compile-only' means an explicit architecture-specific compile ran without execution. An untested architecture is 'not-covered' or absent; lack of a device alone does not establish compile coverage.",
+      "description": "Per-architecture coverage. 'runtime' means at least one selected correctness test was collected and executed with that claimed device visible; GPU claim alone is insufficient. 'compile-only' means an explicit architecture-specific compile ran without execution. An untested architecture is 'not-covered' or absent.",
       "additionalProperties": { "type": "string", "enum": ["runtime", "compile-only", "not-covered"] },
       "examples": [{ "gfx950": "runtime", "gfx942": "not-covered" }]
     },
