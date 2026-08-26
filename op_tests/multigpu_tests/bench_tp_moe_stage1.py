@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Stage breakdown for TPMoEStage1, to size the phase-2 fused all-gather.
+"""Stage breakdown for the phase-1 NCCL pipeline, kept as the fused path's baseline.
 
 The question this answers: how much time can a fused, overlapped all-gather
 actually save? The ceiling is NOT the all-gather time -- overlap can only hide
@@ -30,9 +30,9 @@ import torch.distributed as dist
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from aiter.ops.flydsl.kernels.mega_moe.tp_moe_stage1 import TPMoEStage1
 from aiter.ops.quant import fused_dynamic_mxfp8_quant_moe_sort
 from aiter.utility.fp4_utils import moe_mxfp4_sort
+from tp_moe_stage1_nccl_ref import TPMoEStage1NCCLRef
 from tp_moe_stage1_ref import build_mxfp4_w1
 
 NETWORK = dict(model_dim=7168, experts=384, topk=6, swiglu_limit=10.0)
@@ -137,7 +137,7 @@ def main():
     _, _, w1_shuf, w1_scale_shuf = build_mxfp4_w1(
         experts, inter_dim, model_dim, device, seed=2026
     )
-    op = TPMoEStage1(
+    op = TPMoEStage1NCCLRef(
         model_dim=model_dim,
         inter_dim=inter_dim,
         experts=experts,

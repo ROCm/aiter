@@ -4,9 +4,10 @@
 
 Each TP rank owns ALL experts and one 1/tp shard of the intermediate
 dimension. The caller passes its own DP token shard; this operator
-all-gathers across the TP group (DP group == TP group), runs grouping,
-GEMM1, SwiGLU and per-1x32 FP8 output quantization, and returns the
-six tensors the ordinary FlyDSL v2 FMoE GEMM2 consumes.
+quantizes locally, pushes the rows into every peer over P2P from inside
+the GEMM1 kernel (DP group == TP group), runs grouping, GEMM1, SwiGLU and
+per-1x32 FP8 output quantization, and returns the six tensors the
+ordinary FlyDSL v2 FMoE GEMM2 consumes.
 """
 
 from dataclasses import dataclass
@@ -15,21 +16,12 @@ import torch
 import torch.distributed as dist
 
 from aiter.fused_moe import moe_sorting
-from aiter.ops.flydsl.moe_kernels import flydsl_moe_stage1, get_flydsl_kernel_params
-from aiter.ops.quant import fused_dynamic_mxfp8_quant_moe_sort
-from aiter.utility.fp4_utils import moe_mxfp4_sort
+from aiter.ops.flydsl.moe_kernels import get_flydsl_kernel_params
 
 from .quant import per_1x32_mx_quant
 
 _SUPPORTED_TP = (4, 8)
 _DEFAULT_STAGE1_KERNEL = "flydsl_moe1_afp8_wfp4_bf16_t32x64x256_w4_gui_xcd4_kw4_fp8"
-
-# How the operator collects every rank's activation shard. The names describe the
-# mechanism, not the payload dtype: both entry points (bf16 ``forward`` and fp8
-# ``forward_prequant``) run over whichever transport is selected.
-_TRANSPORT_NCCL = "nccl_allgather"  # dist.all_gather_into_tensor, outside the kernel
-_TRANSPORT_FUSED = "fused_p2p"  # phase 2: in-kernel P2P over Mori SHMEM
-_TRANSPORTS = frozenset({_TRANSPORT_NCCL, _TRANSPORT_FUSED})
 
 
 @dataclass(frozen=True)
@@ -78,7 +70,6 @@ class TPMoEStage1:
         sort_block_m: int = 32,
         swiglu_limit: float = 0.0,
         stage1_kernel_name: str = _DEFAULT_STAGE1_KERNEL,
-        transport: str = _TRANSPORT_NCCL,
         max_tok_per_rank: int | None = None,
     ):
         self.group = group
@@ -125,15 +116,6 @@ class TPMoEStage1:
             )
         if float(swiglu_limit) < 0:
             raise ValueError("swiglu_limit must be non-negative")
-        if transport not in _TRANSPORTS:
-            raise ValueError(
-                f"unknown transport={transport!r}; expected one of {sorted(_TRANSPORTS)}"
-            )
-        if transport != _TRANSPORT_NCCL:
-            raise NotImplementedError(
-                f"transport={transport!r} is not implemented yet; only "
-                f"{_TRANSPORT_NCCL!r} is available"
-            )
 
         self.tp_size = int(tp_size)
         self.tp_rank = int(tp_rank)
@@ -149,14 +131,13 @@ class TPMoEStage1:
         self.swiglu_limit = float(swiglu_limit)
         self.stage1_kernel_name = stage1_kernel_name
         self.stage1_params = params
-        self.transport = transport
         dev = device or torch.device("cuda", torch.cuda.current_device())
         if dev.type == "cuda" and dev.index is None:
             # Normalise "cuda" -> "cuda:N"; _validate_call compares devices by
             # equality and torch.device("cuda") != torch.device("cuda", 0).
             dev = torch.device("cuda", torch.cuda.current_device())
         self.device = dev
-        # flydsl_moe_stage1 derives E and inter_dim from w1 itself and ignores the
+        # The GEMM1 kernel derives E and inter_dim from w1 itself and ignores the
         # constructor values, so a mis-sized shard (e.g. a TP4 slice handed to a
         # TP8-configured op) would silently produce wrong numbers.
         expected_w1 = (self.experts, 2 * self.inter_dim, self.model_dim // 2)
@@ -180,7 +161,7 @@ class TPMoEStage1:
 
         # The fused path's symmetric receive buffers are a collective allocation:
         # every rank must make it with identical arguments, at the same point in
-        # the program. Building it here rather than on the first forward_fused
+        # the program. Building it here rather than on the first forward
         # call turns a mismatched max_tok_per_rank into a construction error
         # instead of a hang deep inside Mori.
         self.max_tok_per_rank = (
@@ -237,18 +218,6 @@ class TPMoEStage1:
         dist.all_gather_into_tensor(out, t, group=self.group)
         return out
 
-    def _all_gather_inputs(self, x, route_weights, topk_ids):
-        """Gather the three per-rank inputs in rank-major order.
-
-        Returns (x_g, weights_g, ids_g) laid out so that
-        ``global_token = src_rank * m_local + local_token``.
-        """
-        return (
-            self._all_gather_one(x),
-            self._all_gather_one(route_weights),
-            self._all_gather_one(topk_ids),
-        )
-
     def _validate_call(self, x, route_weights, topk_ids, x_dtype):
         if x.dtype != x_dtype or not x.is_contiguous():
             raise ValueError(f"x must be contiguous {x_dtype}")
@@ -296,38 +265,6 @@ class TPMoEStage1:
         )
         return sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids
 
-    def _run_gemm1(
-        self, a_fp8, a_scale_sorted, sorted_ids, sorted_expert_ids, num_valid_ids
-    ):
-        p = self.stage1_params
-        payload, scale = flydsl_moe_stage1(
-            a_fp8,
-            self.w1,
-            sorted_ids,
-            sorted_expert_ids,
-            num_valid_ids,
-            out=None,
-            topk=self.topk,
-            tile_m=int(p["tile_m"]),
-            tile_n=int(p["tile_n"]),
-            tile_k=int(p["tile_k"]),
-            a_dtype=str(p["a_dtype"]),
-            b_dtype=str(p["b_dtype"]),
-            out_dtype=str(p["out_dtype"]),
-            act="silu",
-            w1_scale=self.w1_scale,
-            a1_scale=a_scale_sorted,
-            sorted_weights=None,
-            waves_per_eu=int(p.get("waves_per_eu", 3)),
-            b_nt=int(p.get("b_nt", 0)),
-            gate_mode=str(p.get("gate_mode", "separated")),
-            xcd_swizzle=int(p.get("xcd_swizzle", 0)),
-            k_wave=int(p.get("k_wave", 1)),
-            swiglu_limit=(self.swiglu_limit or None),
-            v2_output_layout=True,
-        )
-        return payload, scale
-
     def _pack(
         self,
         payload,
@@ -354,43 +291,12 @@ class TPMoEStage1:
             sort_block_m=self.sort_block_m,
         )
 
-    def forward(self, x_bf16, route_weights, topk_ids) -> "TPMoEStage1Output":
-        """BF16 entry. Gathers bf16, then quantizes after sorting."""
-        m_local = self._validate_call(x_bf16, route_weights, topk_ids, torch.bfloat16)
-        m_global = self.m_logical_for(m_local)
-
-        x_g, wts_g, ids_g = self._all_gather_inputs(x_bf16, route_weights, topk_ids)
-        sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids = self._sort(
-            ids_g, wts_g
-        )
-        a_fp8, a_scale_sorted = fused_dynamic_mxfp8_quant_moe_sort(
-            x_g,
-            sorted_ids=sorted_ids,
-            num_valid_ids=num_valid_ids,
-            token_num=m_global,
-            topk=self.topk,
-            block_size=self.sort_block_m,
-            sorted_weights=None,
-        )
-        payload, scale = self._run_gemm1(
-            a_fp8, a_scale_sorted, sorted_ids, sorted_expert_ids, num_valid_ids
-        )
-        return self._pack(
-            payload,
-            scale,
-            sorted_ids,
-            sorted_weights,
-            sorted_expert_ids,
-            num_valid_ids,
-            m_global,
-        )
-
     def _run_fused(
         self, x_q, x_scale, sorted_ids, sorted_expert_ids, num_valid_ids, m_local
     ):
         if self._fused is None:
             raise RuntimeError(
-                "forward_fused needs the symmetric receive buffers; construct "
+                "forward needs the symmetric receive buffers; construct "
                 "TPMoEStage1 with max_tok_per_rank=<max m_local> (a collective "
                 "allocation, so every rank must pass the same value)"
             )
@@ -405,8 +311,14 @@ class TPMoEStage1:
             max_sorted=max_sorted,
         )
 
-    def forward_fused(self, x_bf16, route_weights, topk_ids) -> "TPMoEStage1Output":
-        """Fused entry: local quant, one metadata collective, sort, then one kernel."""
+    def forward(self, x_bf16, route_weights, topk_ids) -> "TPMoEStage1Output":
+        """BF16 entry: local quant, one metadata collective, sort, then one kernel.
+
+        The activation rows never travel over a collective: they are pushed into
+        every peer's symmetric receive buffer over P2P from inside the GEMM1
+        kernel, so the only thing NCCL still carries is the packed routing
+        metadata.
+        """
         m_local = self._validate_call(x_bf16, route_weights, topk_ids, torch.bfloat16)
         m_global = self.m_logical_for(m_local)
         x_q, x_scale = self.quantize(x_bf16)
@@ -439,61 +351,6 @@ class TPMoEStage1:
     def quantize(self, x_bf16):
         """Local per-1x32 BF16 -> FP8 E4M3 + E8M0. Same routine MegaMoEV2 uses."""
         return per_1x32_mx_quant(x_bf16, quant_mode="fp8")
-
-    def forward_prequant(
-        self, x_fp8, x_scale, route_weights, topk_ids
-    ) -> TPMoEStage1Output:
-        """Prequantized entry.
-
-        Gathers FP8 payload + E8M0 scale instead of BF16, i.e. quantize-then-gather.
-        Per row this moves ``model_dim + model_dim/32`` bytes instead of
-        ``model_dim * 2``.
-        """
-        m_local = self._validate_call(
-            x_fp8, route_weights, topk_ids, torch.float8_e4m3fn
-        )
-        if not x_scale.is_contiguous():
-            raise ValueError("x_scale must be contiguous")
-        if x_scale.device != self.device:
-            raise ValueError(f"x_scale is on {x_scale.device}, expected {self.device}")
-        # moe_mxfp4_sort does a bare .view(torch.uint8); anything wider than one
-        # byte would be silently reinterpreted instead of converted.
-        if x_scale.dtype not in (torch.uint8, torch.float8_e8m0fnu):
-            raise ValueError(
-                f"x_scale must be uint8 or float8_e8m0fnu E8M0 scales, "
-                f"got {x_scale.dtype}"
-            )
-        if x_scale.shape != (m_local, self.model_dim // 32):
-            raise ValueError(
-                f"x_scale must be [{m_local}, {self.model_dim // 32}], "
-                f"got {tuple(x_scale.shape)}"
-            )
-        m_global = self.m_logical_for(m_local)
-
-        x_g, wts_g, ids_g = self._all_gather_inputs(x_fp8, route_weights, topk_ids)
-        scale_g = self._all_gather_one(x_scale)
-        sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids = self._sort(
-            ids_g, wts_g
-        )
-        a_scale_sorted = moe_mxfp4_sort(
-            scale_g.view(m_global, 1, -1),
-            sorted_ids,
-            num_valid_ids,
-            m_global,
-            self.sort_block_m,
-        )
-        payload, scale = self._run_gemm1(
-            x_g, a_scale_sorted, sorted_ids, sorted_expert_ids, num_valid_ids
-        )
-        return self._pack(
-            payload,
-            scale,
-            sorted_ids,
-            sorted_weights,
-            sorted_expert_ids,
-            num_valid_ids,
-            m_global,
-        )
 
     __call__ = forward
     forward_bf16 = forward

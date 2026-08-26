@@ -43,6 +43,7 @@ from aiter.ops.shuffle import shuffle_scale_a16w4, shuffle_weight_a16w4
 # same-directory reference module importable by name.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from tp_moe_stage1_nccl_ref import TPMoEStage1NCCLRef  # noqa: E402
 from tp_moe_stage1_ref import (  # noqa: E402
     build_global_weights,
     build_mxfp4_w1,
@@ -203,7 +204,7 @@ def case_all_gather():
     m_local = 5
     inter_dim = 384
     w1, w1_scale = _fake_w1(NETWORK["experts"], inter_dim, NETWORK["model_dim"], device)
-    op = TPMoEStage1(
+    op = TPMoEStage1NCCLRef(
         model_dim=NETWORK["model_dim"],
         inter_dim=inter_dim,
         experts=NETWORK["experts"],
@@ -264,7 +265,7 @@ def case_forward_contract():
     model_dim = NETWORK["model_dim"]
     experts, topk = NETWORK["experts"], NETWORK["topk"]
     w1, w1_scale = _fake_w1(experts, inter_dim, model_dim, device)
-    op = TPMoEStage1(
+    op = TPMoEStage1NCCLRef(
         model_dim=model_dim,
         inter_dim=inter_dim,
         experts=experts,
@@ -366,7 +367,7 @@ def case_numerics():
     w1_ref, w1_scale_ref, w1_shuf, w1_scale_shuf = build_mxfp4_w1(
         experts, inter_dim, model_dim, device, seed=2026
     )
-    op = TPMoEStage1(
+    op = TPMoEStage1NCCLRef(
         model_dim=model_dim,
         inter_dim=inter_dim,
         experts=experts,
@@ -475,7 +476,7 @@ def case_prequant_equivalence():
     _, _, w1_shuf, w1_scale_shuf = build_mxfp4_w1(
         experts, inter_dim, model_dim, device, seed=2026
     )
-    op = TPMoEStage1(
+    op = TPMoEStage1NCCLRef(
         model_dim=model_dim,
         inter_dim=inter_dim,
         experts=experts,
@@ -592,7 +593,7 @@ def case_end_to_end():
     w1_loc, w1_s_loc = shard_w1(w1_q, w1_s, rank, world, inter_global)
     w2_loc, w2_s_loc = shard_w2(w2_q, w2_s, rank, world, inter_global, model_dim)
 
-    op = TPMoEStage1(
+    op = TPMoEStage1NCCLRef(
         model_dim=model_dim,
         inter_dim=inter_dim,
         experts=experts,
@@ -719,54 +720,67 @@ def case_exports():
         assert name in mm.__all__, f"existing export {name} disappeared"
         assert getattr(mm, name) is not None
 
-    # The phase-2 extension point: the knob exists, a known-but-unbuilt transport
-    # raises NotImplementedError, and a typo raises ValueError instead of being
-    # silently accepted.
-    device = torch.device("cuda", 0)
-    w1, w1_scale = _fake_w1(NETWORK["experts"], 384, NETWORK["model_dim"], device)
-
-    def _build(transport):
-        return TPMoEStage1(
-            model_dim=NETWORK["model_dim"],
-            inter_dim=384,
-            experts=NETWORK["experts"],
-            topk=NETWORK["topk"],
-            w1=w1,
-            w1_scale=w1_scale,
-            tp_size=8,
-            tp_rank=0,
-            device=device,
-            transport=transport,
-        )
-
-    try:
-        _build("fused_p2p")
-    except NotImplementedError as exc:
-        assert "fused_p2p" in str(exc), exc
-    else:
-        raise AssertionError("unimplemented transport must raise NotImplementedError")
-
-    try:
-        _build("allgather_bf16")  # the pre-rename name is no longer valid
-    except ValueError as exc:
-        assert "unknown transport" in str(exc), exc
-    else:
-        raise AssertionError("unknown transport must raise ValueError")
-
-    assert _build("nccl_allgather").transport == "nccl_allgather"
+    # The public callables the operator promises. forward is the fused path now;
+    # __call__ and forward_bf16 must still name that same implementation, since
+    # callers written against phase 1 use them.
+    for name in ("forward", "__call__", "forward_bf16"):
+        assert callable(getattr(TPMoEStage1, name)), name
+    assert TPMoEStage1.__call__ is TPMoEStage1.forward
+    assert TPMoEStage1.forward_bf16 is TPMoEStage1.forward
     print("case_exports OK")
 
 
-def case_ref_fidelity():
-    """TPMoEStage1NCCLRef must be a faithful copy: bit-identical to production.
+MAX_TOK_PER_RANK = 128
 
-    The two are the same code today, so anything other than bit-equality means
-    the copy was botched. Once the fused path lands this case is what proves the
-    reference still represents phase-1 behaviour.
+
+def _assert_ctor_signatures_mirror():
+    """The reference must accept every keyword production accepts.
+
+    A new behaviour-changing keyword on the production constructor has to be
+    mirrored by the copy; without this the test never passes the new argument to
+    either side and the divergence goes unnoticed.
+
+    ``max_tok_per_rank`` is the one legitimate asymmetry: it sizes the fused
+    path's symmetric receive buffers, which the phase-1 copy deliberately does
+    not have. Assert it really is present on production before excluding it, so
+    that a stale exclusion set cannot make the comparison pass vacuously.
     """
-    from tp_moe_stage1_nccl_ref import TPMoEStage1NCCLRef
+    p_prod = list(inspect.signature(TPMoEStage1.__init__).parameters)
+    p_ref = list(inspect.signature(TPMoEStage1NCCLRef.__init__).parameters)
+    _FUSED_ONLY = {"max_tok_per_rank"}
+    assert _FUSED_ONLY <= set(p_prod), (_FUSED_ONLY, p_prod)
+    assert not (_FUSED_ONLY & set(p_ref)), (_FUSED_ONLY, p_ref)
+    assert [p for p in p_prod if p not in _FUSED_ONLY] == p_ref, (p_prod, p_ref)
+
+
+def case_ref_fidelity():
+    """The fused production path must stay bit-identical to the NCCL reference.
+
+    Phase 1 and phase 2 feed the same GEMM1 the same quantized bytes in the same
+    sorted order, so the payload is expected to match bit for bit, not merely
+    within a tolerance. ``case_fused_numerics`` is the loose companion check;
+    this one is what would catch a silent reordering or a dropped row.
+    """
+    import mori.shmem as ms
 
     rank, world, device = _setup_dist()
+    import torch._C._distributed_c10d as c10d
+
+    c10d._register_process_group("default", dist.group.WORLD)
+    ms.shmem_torch_process_group_init("default")
+    try:
+        _ref_fidelity_body(rank, device)
+    finally:
+        try:
+            ms.shmem_finalize()
+        finally:
+            if dist.is_initialized():
+                dist.destroy_process_group()
+    if rank == 0:
+        print("case_ref_fidelity OK")
+
+
+def _ref_fidelity_body(rank, device):
     model_dim = NETWORK["model_dim"]
     experts, topk = NETWORK["experts"], NETWORK["topk"]
     inter_dim, limit = 384, NETWORK["swiglu_limit"]
@@ -785,22 +799,10 @@ def case_ref_fidelity():
         swiglu_limit=limit,
         stage1_kernel_name=STAGE1_KERNEL,
     )
-    prod = TPMoEStage1(**common)
+    prod = TPMoEStage1(max_tok_per_rank=MAX_TOK_PER_RANK, **common)
     ref = TPMoEStage1NCCLRef(**common)
 
-    # A new behaviour-changing keyword on the production constructor must be
-    # mirrored by the copy; without this the test never passes the new argument
-    # to either side and the divergence goes unnoticed.
-    # "transport" and "max_tok_per_rank" only exist to select and size the fused
-    # P2P path, which the phase-1 copy deliberately does not have.
-    _FUSED_ONLY = {"transport", "max_tok_per_rank"}
-    p_prod = [
-        p
-        for p in inspect.signature(TPMoEStage1.__init__).parameters
-        if p not in _FUSED_ONLY
-    ]
-    p_ref = list(inspect.signature(TPMoEStage1NCCLRef.__init__).parameters)
-    assert p_prod == p_ref, (p_prod, p_ref)
+    _assert_ctor_signatures_mirror()
 
     for m_local in (1, 8, 64):
         g = torch.Generator(device="cpu").manual_seed(9100 + rank * 17 + m_local)
@@ -863,17 +865,9 @@ def case_ref_fidelity():
                 f"bit-identical"
             )
 
-    dist.barrier()
-    dist.destroy_process_group()
-    if rank == 0:
-        print("case_ref_fidelity OK")
-
-
-MAX_TOK_PER_RANK = 128
-
 
 def case_fused_numerics():
-    """forward_fused vs the phase-1 NCCL reference, same inputs, same process.
+    """forward vs the phase-1 NCCL reference, same inputs, same process.
 
     Routing metadata comes out of the same ``moe_sorting`` call fed identical
     inputs, so it must be bit-identical. The payload cannot be: the fused kernel
@@ -883,8 +877,6 @@ def case_fused_numerics():
     the PAD rows, so those bytes are leftover ``torch.empty`` memory.
     """
     import mori.shmem as ms
-
-    from tp_moe_stage1_nccl_ref import TPMoEStage1NCCLRef
 
     rank, world, device = _setup_dist()
     import torch._C._distributed_c10d as c10d
@@ -920,7 +912,7 @@ def case_fused_numerics():
             ) * (model_dim**-0.25)
             ids, wts = _random_routes(m_local, experts, topk, device, seed=131 + rank)
 
-            a = fused.forward_fused(x, wts, ids)
+            a = fused.forward(x, wts, ids)
             b = ref.forward(x, wts, ids)
             torch.cuda.synchronize()
 
