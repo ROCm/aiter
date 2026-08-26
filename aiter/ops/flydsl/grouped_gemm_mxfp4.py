@@ -109,7 +109,9 @@ def flydsl_grouped_gemm_a8w4_masked(
         if float(situ_linear_beta) <= 0.0:
             raise ValueError(f"situ_linear_beta must be > 0, got {situ_linear_beta!r}")
     num_buffers = min(num_buffers, max(1, K // tile_k))
-    if persistent_mode and (stage1_quant_out or (stage2_scatter is not None)):
+    # EP gemm2-fused scatter still has no persistent epilogue; the fused stage1
+    # quant output (stage1_quant_out) now does, so it stays persistent-capable.
+    if persistent_mode and (stage2_scatter is not None):
         persistent_mode = 0
     if persistent_mode and num_buffers >= 3:
         next_stage_prefetch = 1

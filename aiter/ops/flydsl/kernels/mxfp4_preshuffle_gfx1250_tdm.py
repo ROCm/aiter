@@ -290,6 +290,21 @@ def launch_gemm_a8w4_tdm(
         )
         tile_map = fx.recast_iter(i32_ptr, arg_m_tile_map)
 
+        # Persistent load balancing: the experts occupy the contiguous prefix
+        # [0, R_m) of m-tiles, with R_m = ceil(real_rows / tile_m). The shared
+        # psum's last entry (tile_map[n_experts-1]) is the grand total of real
+        # rows; contiguous_m is a static worst-case upper bound, so everything
+        # past R_m is a bypass tile that does no compute. Scheduling only
+        # [0, sched_m_tiles) drops every bypass tile so each CU gets a balanced
+        # share of effective work. Non-persistent (and the exotic n_experts==0
+        # plain-GEMM) path keeps the full m-tile range.
+        if const_expr(persistent_mode and n_experts > 0):
+            _real_rows = tile_map[n_experts - 1]
+            sched_m_tiles = (_real_rows + (tile_m - 1)) // tile_m
+        else:
+            sched_m_tiles = total_m_tiles
+        sched_tiles_rt = sched_m_tiles * total_n_tiles
+
         def compute_tile_coords(eff_bid_x):
             """Swizzle + expert bisect from a flat tile index."""
             swz_id = eff_bid_x // cluster_n if cluster_n > 1 else eff_bid_x
@@ -299,7 +314,7 @@ def launch_gemm_a8w4_tdm(
             group = swz_id // blocks_per_group
             group_first_tile = group * TILES_PER_GROUP
             in_group = swz_id - group * blocks_per_group
-            rem_tiles = total_m_tiles - group_first_tile
+            rem_tiles = sched_m_tiles - group_first_tile
             group_tiles = (rem_tiles < TILES_PER_GROUP).select(
                 rem_tiles, TILES_PER_GROUP
             )
@@ -342,11 +357,20 @@ def launch_gemm_a8w4_tdm(
                 _a_off0, _b_off0, _sb_off0, _sa_off0,
             )
 
+        # Persistent: clamp the first tile index so an idle block (bid_x past
+        # the last real tile, possible when sched_tiles_rt < grid) still builds
+        # valid TDM descriptors; its actual execution is guarded below.
+        _bid_i32 = fx.Int32(bid_x)
+        _first_bid = (
+            (_bid_i32 < sched_tiles_rt).select(_bid_i32, sched_tiles_rt - 1)
+            if const_expr(persistent_mode)
+            else bid_x
+        )
         (
             blk_m, blk_n, blk_m64, blk_n64,
             expert, eb64, mn_oob,
             a_off0, b_off0, sb_off0, sa_off0,
-        ) = compute_tile_coords(bid_x)
+        ) = compute_tile_coords(_first_bid)
 
         c_outer_off, c_inner_off, c_stride = blk_m64, blk_n64, i32_n
 
@@ -910,9 +934,11 @@ def launch_gemm_a8w4_tdm(
 
         if const_expr(persistent_mode):
             # ---- Persistent grid-stride loop ----
-            # Grid is capped at NUM_CU; each WG loops over tiles.
+            # Grid is capped at NUM_CU; each WG loops over tiles. Only the real
+            # (non-bypass) tiles [0, sched_tiles_rt) are scheduled, so the plain
+            # bid+k*grid stride hands every CU floor/ceil(real/grid) tiles.
             # With separate C-store LDS, epilogue store overlaps next prologue.
-            total_tiles_rt = total_m_tiles * total_n_tiles
+            total_tiles_rt = sched_tiles_rt
             grid_nb = fx.Int32(fx.grid_dim.x)
             persist_stC_idx = ptr_to_idx(base_ptr + C_PERSIST_OFF) if C_PERSIST_OFF else stC_idx
             persist_base_ptr_c = (base_ptr + C_PERSIST_OFF) if C_PERSIST_OFF else base_ptr
@@ -1138,6 +1164,140 @@ def launch_gemm_a8w4_tdm(
                                     )
 
                     if const_expr(stage1_quant_out and stage1_act):
+                        # Fused activation + MX quant; payload to persistent
+                        # C-LDS, scale to global. Ported from the non-persistent
+                        # epilogue (uses t_blk_*/t_mn_oob/persist_stC_idx).
+                        i32_ptr_g = fx.PointerType.get(
+                            elem_ty=fx.Int8.ir_type,
+                            address_space=fx.AddressSpace.Global,
+                            alignment=1,
+                        )
+                        scale_ptr = fx.recast_iter(i32_ptr_g, fx.get_iter(arg_quant_scale))
+                        is_kgrp0 = fx.Int32(kgrp) == fx.Int32(0)
+                        # i32_n is the pre-activation gate+up width; the quantized
+                        # output has half as many columns and one scale dword per K128.
+                        q_dst_scale_dwpr = i32_n // 256
+
+                        v2i32_ty = T.vec(2, T.i32)
+                        QRPT_LOG2 = int(math.log2(QUANT_ROWS_PER_TILE))
+                        N_MX_BLKS = output_n_rep // WN_PER_MX_BLOCK
+                        for wm in range_constexpr(wmma_m_rep):
+                            # A 16-row block entirely past this expert's valid rows
+                            # has its output OOB-clamped away, so skip its work.
+                            # Wave-uniform: one scalar branch, not per-lane masking.
+                            if wmb + wm * 16 < t_mn_oob:
+                                row_rel = wmb + wm * 16 + lane16
+                                row_i32 = fx.Int32(t_blk_m + row_rel)
+                                scale_tile = row_i32 >> QRPT_LOG2
+                                row_in_tile = row_i32 & (QUANT_ROWS_PER_TILE - 1)
+                                wmma_row = row_in_tile >> 4
+                                scale_lane = row_in_tile & 15
+
+                                e8m0_bytes = []
+                                mx_blk_is = []
+                                for mx_blk in range_constexpr(N_MX_BLKS):
+                                    # Gather (gate, up) pairs for this MX block.
+                                    pairs = []
+                                    for sub_wn in range_constexpr(WN_PER_MX_BLOCK):
+                                        wn = mx_blk * WN_PER_MX_BLOCK + sub_wn
+                                        acc = Vec(accs[wm * output_n_rep + wn])
+                                        for p in range_constexpr(4):
+                                            pairs.append((acc[2 * p], acc[2 * p + 1]))
+
+                                    if const_expr(is_situv2):
+                                        all_vals = batched_situv2(
+                                            pairs,
+                                            consts=situ_c,
+                                            range_constexpr=range_constexpr,
+                                        )
+                                    else:
+                                        all_vals = batched_silu_swiglu(
+                                            pairs,
+                                            swiglu=is_swiglu,
+                                            limit_f32=f32_swiglu_limit,
+                                            neg_limit_f32=neg_limit,
+                                            range_constexpr=range_constexpr,
+                                        )
+
+                                    scale_f32, e8m0_byte = emit_amax_e8m0_native_scale(
+                                        all_vals,
+                                        wave_size=WAVE,
+                                        dtype=(
+                                            MxDtype.FP4_E2M1
+                                            if is_fp4_quant
+                                            else MxDtype.FP8_E4M3
+                                        ),
+                                    )
+                                    mx_col = t_blk_n + wnb + mx_blk * WN_PER_MX_BLOCK * 16
+                                    mx_blk_i = fx.Int32(mx_col) >> 6
+                                    e8m0_bytes.append(e8m0_byte)
+                                    mx_blk_is.append(mx_blk_i)
+
+                                    if const_expr(is_fp4_quant):
+                                        for sub_wn in range_constexpr(WN_PER_MX_BLOCK):
+                                            wn = mx_blk * WN_PER_MX_BLOCK + sub_wn
+                                            local_vals = all_vals[sub_wn * 4 : sub_wn * 4 + 4]
+                                            peer_vals = [
+                                                fx.Float32(value).shuffle_xor(16, WAVE)
+                                                for value in local_vals
+                                            ]
+                                            src = Vec.from_elements(
+                                                local_vals + peer_vals, fx.Float32
+                                            )
+                                            packed_i32 = emit_cvt_scalef32_pk8_fp4_bf16(
+                                                src.to(fx.BFloat16).ir_value(),
+                                                scale_f32,
+                                                i32_ty=T.i32,
+                                            )
+                                            if kgrp == 0:
+                                                col_fp4 = (wnb + wn * 16) // 4
+                                                lds_store_b32(
+                                                    persist_stC_idx,
+                                                    row_rel * STORE_N + col_fp4,
+                                                    Vec.from_elements([packed_i32], fx.Int32),
+                                                )
+                                    else:
+                                        for half in range_constexpr(WN_PER_MX_BLOCK // 2):
+                                            src = Vec.from_elements(
+                                                all_vals[half * 8 : half * 8 + 8],
+                                                fx.Float32,
+                                            )
+                                            packed_v2i32 = emit_cvt_scalef32_pk8_fp8_f32(
+                                                src.ir_value(),
+                                                scale_f32,
+                                                v2i32_ty=v2i32_ty,
+                                                rocdl=rocdl,
+                                            )
+                                            for sub in range_constexpr(2):
+                                                sub_wn = half * 2 + sub
+                                                wn = mx_blk * WN_PER_MX_BLOCK + sub_wn
+                                                packed_i32 = vector.extract(
+                                                    packed_v2i32,
+                                                    static_position=[sub],
+                                                    dynamic_position=[],
+                                                )
+                                                col_fp8 = (wnb + wn * 16 + kgrp * 8) // 2
+                                                lds_store_b32(
+                                                    persist_stC_idx,
+                                                    row_rel * STORE_N + col_fp8,
+                                                    Vec.from_elements([packed_i32], fx.Int32),
+                                                )
+
+                                # Preshuffled e8m0 scale: one branch per wm.
+                                if row_rel < t_mn_oob and is_kgrp0:
+                                    for mx_blk in range_constexpr(N_MX_BLKS):
+                                        scale_dw = mx_blk_is[mx_blk] >> 2
+                                        byte_in_dw = mx_blk_is[mx_blk] & 3
+                                        dst_byte = (
+                                            (
+                                                (scale_tile * q_dst_scale_dwpr + scale_dw)
+                                                * quant_wmma_rep
+                                                + wmma_row
+                                            )
+                                            * 16
+                                            + scale_lane
+                                        ) * 4 + byte_in_dw
+                                        fx.ptr_store(e8m0_bytes[mx_blk], scale_ptr + dst_byte)
                         rocdl.s_wait_dscnt(0)
                         rocdl.s_barrier_signal(-1)
                         rocdl.s_barrier_wait(-1)
@@ -1201,11 +1361,15 @@ def launch_gemm_a8w4_tdm(
 
             # ---- Execute persistent tiles ----
             # First tile (coords from bid_x): full prologue, no pre-issued.
-            run_persist_tile(
-                blk_m, blk_n, blk_m64, blk_n64,
-                expert, mn_oob, zero_deltas, True,
-                use_preissued=False,
-            )
+            # Guard: a block whose bid_x is past the last real tile (only when
+            # sched_tiles_rt < grid) owns no work -- skip so it does not
+            # re-compute the clamped tile. Uniform across the workgroup.
+            if _bid_i32 < sched_tiles_rt:
+                run_persist_tile(
+                    blk_m, blk_n, blk_m64, blk_n64,
+                    expert, mn_oob, zero_deltas, True,
+                    use_preissued=False,
+                )
             # Grid-stride loop for remaining tiles.
             # Between tiles, overlap: issue PRE_ISSUE_COUNT prologue TDMs
             # for the next tile while the previous epilogue store is still
