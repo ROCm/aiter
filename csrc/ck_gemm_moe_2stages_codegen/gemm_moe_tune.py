@@ -6166,7 +6166,14 @@ class Mxfp4FlydslTuner(FmoeTuner):
         "config_env_name": "AITER_CONFIG_FMOE",
     }
     XCD_SWIZZLES: ClassVar[tuple[int, ...]] = (0, 2, 4)
-    A4W4_INTERLEAVE_BNS: ClassVar[tuple[int, ...]] = (128,)
+    # A4W4 interleaved GEMM1 is not tuned. `interleave` is the gate/up layout of
+    # the w1 tensor the caller supplies (gate_mode), not a tuning knob: a4w4
+    # through fused_moe is SEPARATED, so an `_il` winner can never be dispatched
+    # for it -- and forcing it produced output uncorrelated with the reference
+    # (logits_diff ~1.0 on all 21 tuned _il rows). The candidates also crash this
+    # tuner with `list index out of range`. The a8w4/fp8 GEMM1 path below keeps
+    # interleave=True because there gate_mode genuinely is INTERLEAVE.
+    A4W4_INTERLEAVE_BNS: ClassVar[tuple[int, ...]] = ()
     STAGE1_KERNEL_MARKERS: ClassVar[tuple[str, ...]] = ("gemm1_a4w4_port_",)
     STAGE2_KERNEL_MARKERS: ClassVar[tuple[str, ...]] = (
         "mfma_moe2_",
@@ -6196,7 +6203,10 @@ class Mxfp4FlydslTuner(FmoeTuner):
         self.parser.add_argument(
             "--tune-stage",
             choices=self.TUNE_STAGES,
-            default="auto",
+            # gemm1 by default: this tuner exists to sweep the replacement
+            # GEMM1, and locking GEMM2 + block_m keeps a re-tune from silently
+            # rewriting the rest of the row.
+            default="gemm1",
             help=(
                 "Which stage of the FlyDSL MoE 2-stage pipeline to sweep. "
                 "'both' tunes the (GEMM1, GEMM2) pair jointly; 'gemm1'/'gemm2' "
@@ -6224,15 +6234,36 @@ class Mxfp4FlydslTuner(FmoeTuner):
             ),
         )
 
-    def run(self, args, fast_mode=False):
-        # get_untuned_gemm_list() takes no args, so the stage selection has to be
-        # visible on the instance before the input CSVs are read.
-        self._tune_stage = str(getattr(args, "tune_stage", "auto") or "auto")
+    def apply_stage_defaults(self, args):
+        """Resolve --tune-stage / --baseline-config onto the instance.
+
+        get_untuned_gemm_list() takes no args, so the stage selection has to be
+        visible on the instance before the input CSVs are read. Every entry
+        point that reads those CSVs must call this -- run() and plan_only()
+        alike.
+        """
+        self._tune_stage = str(getattr(args, "tune_stage", "gemm1") or "gemm1")
         self._baseline_config = str(getattr(args, "baseline_config", "") or "")
+        # With a stage locked and no explicit baseline, lock it from the tuned
+        # CSV we are about to update -- i.e. the config currently shipped on
+        # main. That keeps GEMM2/block_m at their in-tree values so a GEMM1
+        # sweep is measured against what actually ships, and lets a shape-only
+        # untuned CSV drive --tune-stage gemm1 with no extra flag.
+        if not self._baseline_config and self._tune_stage in self.STAGE_LOCK_COLUMNS:
+            tune_file = str(getattr(args, "tune_file", "") or "")
+            if tune_file and os.path.exists(tune_file):
+                self._baseline_config = tune_file
+                print(
+                    f"[mxfp4-port] --tune-stage {self._tune_stage}: locking the "
+                    f"other stage from the in-tree tuned CSV {tune_file}"
+                )
         if self._baseline_config and self._tune_stage not in self.STAGE_LOCK_COLUMNS:
             raise ValueError(
                 "--baseline-config requires --tune-stage gemm1 or --tune-stage gemm2"
             )
+
+    def run(self, args, fast_mode=False):
+        self.apply_stage_defaults(args)
         return super().run(args, fast_mode)
 
     # Columns --baseline-config adds to untunedf. They are not tuning keys, and

@@ -34,7 +34,20 @@ if __package__ in (None, "") and str(_REPO_ROOT) not in sys.path:
 
 import torch
 
-from aiter.ops.flydsl.mxfp4_gemm1_kernels import _effective_use_nt
+try:  # pragma: no cover - depends on which GEMM1 launcher this tree ships
+    from aiter.ops.flydsl.mxfp4_gemm1_kernels import _effective_use_nt
+except ImportError:  # launcher without the BM32 streaming-load override
+
+    def _effective_use_nt(*, n_tokens, topk, NE, BM, use_nt, inline_quant):
+        """Identity fallback.
+
+        This only describes what the runtime will actually do with the
+        candidate's ``use_nt``. A launcher that does not override it is
+        described correctly by returning it unchanged.
+        """
+        return use_nt
+
+
 from aiter.ops.flydsl.mxfp4_kname import (
     _parse_mxfp4_g1_kname,
     _parse_mxfp4_g2_kname,
@@ -776,8 +789,7 @@ class OpenAIMxfp4FlydslTuner(Mxfp4FlydslTuner):
 
     def plan_only(self, args):
         """Populate the recommendation cache without touching the GPU."""
-        self._tune_stage = str(getattr(args, "tune_stage", "auto") or "auto")
-        self._baseline_config = str(getattr(args, "baseline_config", "") or "")
+        self.apply_stage_defaults(args)
         untunedf = self.get_untuned_gemm_list(args.untune_file)
         rows = [series.to_dict() for _, series in untunedf.iterrows()]
         plans = self._plan_rows(rows, args)

@@ -16,6 +16,21 @@ _SUPPORTED = {
     (16, True, True),
 }
 
+# GEMM1 variants per activation dtype. fp4 reuses _SUPPORTED by reference so the
+# tuner can only ever enumerate variants this launcher actually compiles; a8w4
+# consumes an already-quantized fp8 activation, so it drops the inline-quant
+# BM16 entry's partner variants that only exist to quantize.
+_SUPPORTED_BY_DTYPE = {
+    "fp4": _SUPPORTED,
+    "fp8": {
+        (32, True, False),
+        (32, False, False),
+        (64, False, False),
+        (128, False, False),
+        (16, True, True),
+    },
+}
+
 
 @functools.cache
 def _get_compiled_mxfp4_gemm1_port(

@@ -100,14 +100,12 @@ def test_candidate_rows_cover_every_gemm2_family():
         _parse_mxfp4_g1_kname(candidate["kernelName1"]) for candidate in candidates
     ]
     assert any(
-        candidate["BN"] == 128 and candidate["interleave"] for candidate in parsed
-    )
-    assert any(
         candidate["BN"] == 128 and not candidate["interleave"] for candidate in parsed
     )
-    assert all(
-        not candidate["interleave"] for candidate in parsed if candidate["BN"] == 256
-    )
+    # A4W4 interleaved GEMM1 is deliberately not tuned: `interleave` is the
+    # gate/up layout of the caller's w1 (gate_mode), not a tuning knob, and a4w4
+    # through fused_moe is always SEPARATED -- see A4W4_INTERLEAVE_BNS.
+    assert all(not candidate["interleave"] for candidate in parsed)
 
 
 def test_token_one_excludes_inaccurate_bm16_inline_quant():

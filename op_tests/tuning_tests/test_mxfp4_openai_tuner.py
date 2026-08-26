@@ -20,6 +20,7 @@ from csrc.ck_gemm_moe_2stages_codegen.tune_mxfp4_flydsl_openai import (
     _candidate_descriptor,
     _candidate_id,
     _deduplicate_effective_candidates,
+    _effective_use_nt,
     _install_modern_gemm2_parser,
     _openai_mxfp4_shape_worker,
     _select_baseline,
@@ -147,8 +148,23 @@ def test_effective_use_nt_candidates_are_deduplicated():
 
     candidates = _deduplicate_effective_candidates(row, [non_temporal, cached])
 
-    assert len(candidates) == 1
-    assert candidates[0]["kernelName1"] == cached["kernelName1"]
+    # The pair only collapses when the GEMM1 launcher in this tree actually
+    # overrides use_nt for the shape. A launcher without that override leaves
+    # the two candidates genuinely distinct, and deduplicating them would hide
+    # a real choice from the sweep.
+    launcher_overrides = not _effective_use_nt(
+        n_tokens=int(row["token"]),
+        topk=int(row["topk"]),
+        NE=int(row["expert"]),
+        BM=32,
+        use_nt=True,
+        inline_quant=False,
+    )
+    if launcher_overrides:
+        assert len(candidates) == 1
+        assert candidates[0]["kernelName1"] == cached["kernelName1"]
+    else:
+        assert len(candidates) == 2
 
 
 def test_safety_baseline_preserves_baseline_interleave_layout():
