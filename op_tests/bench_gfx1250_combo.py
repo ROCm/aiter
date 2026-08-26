@@ -588,7 +588,7 @@ def run_a16w16(_args):
 
 
 def run_mega_moe(_args):
-    """Run the four-rank DSv4 Mega MoE path and its non-Mega baseline."""
+    """Run the four-rank DSv4 Mega MoE path vs its base combine, a4w4 and a8w4."""
     # The child ranks need GPU 0 as well. Release any cached allocations held by
     # this orchestration process before torchrun starts the four workers.
     torch.cuda.empty_cache()
@@ -616,14 +616,21 @@ def run_mega_moe(_args):
         "--profile_table",
         "1",
     ]
-    for label, combine in (("Mega", "scatter_fused"), ("non-Mega", "gather")):
-        print(f"\n===== mega_moe ({label}, combine={combine}) =====", flush=True)
-        subprocess.run(
-            [*base_cmd, "--combine", combine],
-            cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-            env=env,
-            check=True,
-        )
+    # AITER_FORCE_A8W4 selects the grouped kernel's ACTIVATION dtype (0 -> fp4,
+    # 1 -> fp8); the weights are mxfp4 either way and -q only picks their layout,
+    # so the env var and the quant key have to move together.
+    for quant, force_a8w4 in (("a4w4_mxfp4", "0"), ("a8w4_mxfp4", "1")):
+        for label, combine in (("non-Mega", "base"), ("Mega", "fused")):
+            print(
+                f"\n===== mega_moe ({quant}, {label}, combine={combine}) =====",
+                flush=True,
+            )
+            subprocess.run(
+                [*base_cmd, "-q", quant, "--combine", combine],
+                cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                env={**env, "AITER_FORCE_A8W4": force_a8w4},
+                check=True,
+            )
 
 
 def run_mhc(_args):
