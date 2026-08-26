@@ -243,6 +243,8 @@ def flydsl_flash_attn_varlen_func(
     gfx = get_gfx()
     plain = (
         q.dtype == torch.bfloat16
+        and k.dtype == torch.bfloat16
+        and v.dtype == torch.bfloat16
         and dropout_p == 0.0
         and tuple(window_size[:2]) == (-1, -1)
         and block_table is None
@@ -280,6 +282,7 @@ def flydsl_flash_attn_varlen_func(
         and v.shape[-1] == 72
         and k.shape[-1] == 72
         and q.shape[1] == k.shape[1]
+        and q.shape[1] == v.shape[1]
     ):
         from .kernels.fmha_gfx950.fmha_kernel import flash_attn_varlen_d72_gfx950
 

@@ -1009,10 +1009,12 @@ def flash_attn_varlen_d72_gfx950(
     if return_lse:
         raise ValueError("flash_attn_varlen_d72_gfx950 v0 does not return LSE")
     assert q.dtype == torch.bfloat16
+    assert k.dtype == torch.bfloat16
+    assert v.dtype == torch.bfloat16
     assert q.shape[-1] == HEAD_DIM
     assert k.shape[-1] == HEAD_DIM
     assert v.shape[-1] == HEAD_DIM
-    if q.shape[1] != k.shape[1]:
+    if q.shape[1] != k.shape[1] or q.shape[1] != v.shape[1]:
         raise ValueError("v0 does not support GQA")
 
     nheads_q = q.shape[1]

@@ -150,33 +150,33 @@ def test_flydsl_fmha_gfx950_bench_vs_ck(num_seqs):
     q, k, v, cu, max_s = _pack_varlen(
         seqlens, num_heads=16, head_dim=HEAD_DIM, dtype=torch.bfloat16, seed=1
     )
+    old_hd72 = os.environ.get("AITER_FLYDSL_FMHA_HD72")
     os.environ["AITER_FLYDSL_FMHA_HD72"] = "1"
-    out_fd = flydsl_flash_attn_varlen_func(
-        q, k, v, cu, cu, max_s, max_s, softmax_scale=SOFTMAX_SCALE, causal=False
-    )
-    assert out_fd is not None
-
-    def _sync_time(fn, iters=20, warmup=5):
-        for _ in range(warmup):
-            fn()
-        torch.cuda.synchronize()
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        start.record()
-        for _ in range(iters):
-            fn()
-        end.record()
-        torch.cuda.synchronize()
-        return start.elapsed_time(end) * 1000.0 / iters
-
-    fly_us = _sync_time(
-        lambda: flydsl_flash_attn_varlen_func(
+    try:
+        out_fd = flydsl_flash_attn_varlen_func(
             q, k, v, cu, cu, max_s, max_s, softmax_scale=SOFTMAX_SCALE, causal=False
         )
-    )
-    old = os.environ.get("AITER_FLYDSL_FMHA_HD72", "1")
-    os.environ["AITER_FLYDSL_FMHA_HD72"] = "0"
-    try:
+        assert out_fd is not None
+
+        def _sync_time(fn, iters=20, warmup=5):
+            for _ in range(warmup):
+                fn()
+            torch.cuda.synchronize()
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            for _ in range(iters):
+                fn()
+            end.record()
+            torch.cuda.synchronize()
+            return start.elapsed_time(end) * 1000.0 / iters
+
+        fly_us = _sync_time(
+            lambda: flydsl_flash_attn_varlen_func(
+                q, k, v, cu, cu, max_s, max_s, softmax_scale=SOFTMAX_SCALE, causal=False
+            )
+        )
+        os.environ["AITER_FLYDSL_FMHA_HD72"] = "0"
         ck_us = _sync_time(
             lambda: mha_varlen(
                 q,
@@ -191,6 +191,9 @@ def test_flydsl_fmha_gfx950_bench_vs_ck(num_seqs):
             )
         )
     finally:
-        os.environ["AITER_FLYDSL_FMHA_HD72"] = old
+        if old_hd72 is None:
+            os.environ.pop("AITER_FLYDSL_FMHA_HD72", None)
+        else:
+            os.environ["AITER_FLYDSL_FMHA_HD72"] = old_hd72
     print(f"num_seqs={num_seqs} flydsl={fly_us:.1f}us ck={ck_us:.1f}us")
     assert fly_us > 0 and ck_us > 0
