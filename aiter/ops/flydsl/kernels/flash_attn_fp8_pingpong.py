@@ -111,26 +111,7 @@ def build_flash_attn_fp8_module(
     IGLP_VARIANT = 1
     SOFTMAX_PRIO = 1
 
-    USE_SCHRAUDOLPH = True
-    USE_ROLLBACK = False
-
-    USE_QK_SCALE_FOLD = True
-
-    USE_FROZEN_MAX = True
-
-    USE_WATCHDOG = True
-
-    USE_BIAS_FOLD = True
-
-    # How many of the four KV tiles reduce their L denominator on the VALU
-    # pipe; the rest go through the ones-column MFMA, which is issued at the
-    # head of the *next* MFMA phase (in apply_pv) rather than at the tail of
-    # the softmax. 2 splits it exactly like the asm: the first half is
-    # _L_k0_sum_fp32() on the VALU during softmax, the second half is
-    # _matmul_l_issue() at the top of gemm_PV.
     L_SPLIT_TILES = 2
-    # p_pack is contracted in PV_K_STEPS slabs of two KV tiles each, so the
-    # VALU covers slabs [0, L_SPLIT_TILES//2) and the MFMA the rest.
     L_MFMA_SLABS = PV_K_STEPS - L_SPLIT_TILES // 2
 
     SCHRAUDOLPH_2P23 = 1 << 23
@@ -138,18 +119,7 @@ def build_flash_attn_fp8_module(
     E8M0_ONE = 0x7F7F7F7F
     SCHRAUDOLPH_CAP = 1138753536.0
 
-    if USE_QK_SCALE_FOLD:
-        assert USE_SCHRAUDOLPH, "the 2^23 in A only makes sense for Schraudolph"
-    if USE_WATCHDOG:
-        assert USE_SCHRAUDOLPH, "the cap is expressed in the Schraudolph domain"
-    if USE_FROZEN_MAX:
-        assert USE_WATCHDOG, "a frozen max without a watchdog can overflow fp8"
     assert L_SPLIT_TILES in (0, 2, 4), "the ones-column MFMA contracts two blocks"
-    if L_SPLIT_TILES:
-        assert USE_SCHRAUDOLPH, "the vector partial reads the Schraudolph pattern"
-    if USE_BIAS_FOLD:
-        assert USE_SCHRAUDOLPH, "the seed is the Schraudolph bias"
-        assert USE_FROZEN_MAX, "an unfrozen m cannot be seeded before its own GEMM"
     EXP2_SHIFT = 4.0
 
     @flyc.kernel(known_block_size=[BLOCK_SIZE, 1, 1])
@@ -497,28 +467,29 @@ def build_flash_attn_fp8_module(
             raw = _pointer_load(v_i8x32, gep)
             raw = ArithValue(q_in_bounds).select(raw, zero_qpack.ir_value())
             qw = Vec(raw).bitcast(fx.Int32)
-            if const_expr(USE_QK_SCALE_FOLD):
-                scaled = []
-                for w in range_constexpr(A_FP8_PER_LANE // 4):
-                    word = qw[w]
-                    lo2 = Vec(
-                        rocdl.cvt_pk_f32_fp8(
-                            Vec.make_type(2, fx.Float32), _raw(word), False
-                        )
+
+            scaled = []
+            for w in range_constexpr(A_FP8_PER_LANE // 4):
+                word = qw[w]
+                lo2 = Vec(
+                    rocdl.cvt_pk_f32_fp8(
+                        Vec.make_type(2, fx.Float32), _raw(word), False
                     )
-                    hi2 = Vec(
-                        rocdl.cvt_pk_f32_fp8(
-                            Vec.make_type(2, fx.Float32), _raw(word), True
-                        )
+                )
+                hi2 = Vec(
+                    rocdl.cvt_pk_f32_fp8(
+                        Vec.make_type(2, fx.Float32), _raw(word), True
                     )
-                    f = [
-                        _fmul(lo2[0], q_mant),
-                        _fmul(lo2[1], q_mant),
-                        _fmul(hi2[0], q_mant),
-                        _fmul(hi2[1], q_mant),
-                    ]
-                    scaled.append(_f32x4_to_fp8_word(*f))
-                qw = Vec.from_elements(scaled, fx.Int32)
+                )
+                f = [
+                    _fmul(lo2[0], q_mant),
+                    _fmul(lo2[1], q_mant),
+                    _fmul(hi2[0], q_mant),
+                    _fmul(hi2[1], q_mant),
+                ]
+                scaled.append(_f32x4_to_fp8_word(*f))
+            qw = Vec.from_elements(scaled, fx.Int32)
+
             q_packs.append(qw)
 
         v_tr8_ty = Vec.make_type(2, fx.Int32)
@@ -555,7 +526,6 @@ def build_flash_attn_fp8_module(
             lr_acc,
             p_pack,
             p_rowsum,
-            corr,
             v_off,
             preloaded_vw,
             k_buf_off,
@@ -565,9 +535,6 @@ def build_flash_attn_fp8_module(
                 # asm: s_setprio(1) at the head of gemm_PV -- the MFMA phase
                 # outranks the peer half's softmax until gemm_QK drops it.
                 rocdl.s_setprio(1)
-            corr_vec = Vec.from_elements([corr], fx.Float32).broadcast_to(
-                C_F32_PER_LANE
-            )
             if const_expr(USE_ROLLBACK or USE_FROZEN_MAX):
                 grew = arith.cmpf(
                     arith.CmpFPredicate.OLT, _raw(corr), _raw(fx.Float32(1.0))
@@ -719,19 +686,9 @@ def build_flash_attn_fp8_module(
                     vi = u - (QK_UNITS - PREFETCH_DEPTH)
                     vw_prime[vi] = read_v_pack(v_off, vi // PV_K_STEPS, vi % PV_K_STEPS)
                 _sched_barrier()
-            # Every ds_read of this phase has now been issued, so the DMA can
-            # no longer force a vmcnt drain in front of one.
             for _dp in range_constexpr(len(l_ptrs)):
                 _dma_fire(dma_rsrc, l_ptrs[_dp], g_ptrs[_dp])
             _sched_barrier()
-            # asm: the s_barrier + s_setprio(0) that close gemm_QK. This is the
-            # rendezvous with the peer half, which is closing its softmax --
-            # the two groups run opposite phases, so one barrier pairs them.
-            #
-            # No vmcnt drain here: the DMA this GEMM just issued is not read
-            # until the *next* iteration's GEMM, so it drains at the end of the
-            # softmax phase instead. Draining it here would stall on a load
-            # issued a few instructions ago and cost the whole tile latency.
             _gpu_barrier()
             rocdl.s_setprio(0)
             return s_accs, vw_prime
@@ -788,10 +745,9 @@ def build_flash_attn_fp8_module(
                 T.f32, arith.shli(_raw(x_i32), _raw(fx.Int32(16)))
             )
 
-        def _bias_split(m):
+        def _bias_split(m_term):
             """Three-chunk bf16 decomposition of the Schraudolph seed."""
-            d = _fadd(_fsub(c_zero_f, m), c_exp2_bias)
-            c0 = rocdl.cvt_pk_bf16_f32(_raw(d), _raw(d))
+            c0 = rocdl.cvt_pk_bf16_f32(_raw(m_term), _raw(m_term))
             r1 = _fsub(d, _f32_of_bf16_hi(c0))
             c1 = rocdl.cvt_pk_bf16_f32(_raw(r1), _raw(r1))
             r2 = _fsub(r1, _f32_of_bf16_hi(c1))
@@ -850,119 +806,74 @@ def build_flash_attn_fp8_module(
         def do_softmax(
             s_accs,
             m_running,
+            m_term=None,
+            bias_chunks=None,
             set_prio=False,
-            first_tile=True,
             seeded=False,
             barrier=False,
         ):
             if const_expr(SOFTMAX_PRIO != 0 and set_prio):
                 rocdl.s_setprio(SOFTMAX_PRIO)
-            if const_expr(USE_QK_SCALE_FOLD):
-                to_log2 = c_inv_2p23
-            else:
-                to_log2 = scale_log2e
+            to_log2 = c_inv_2p23
 
-            frozen = const_expr(USE_FROZEN_MAX and not first_tile)
-            if const_expr(frozen):
+            if const_expr(seeded):
                 m_new = m_running
-                corr = fx.Float32(1.0)
             else:
                 m_new = _rowmax(s_accs, m_running)
-                corr = (
-                    fx.Float32(1.0)
-                    if const_expr(USE_FROZEN_MAX)
-                    else rocdl.exp2(
-                        T.f32, _raw(_fmul(_fsub(m_running, m_new), to_log2))
-                    )
+                m_term = _fadd(_fsub(c_zero_f, m_new), c_exp2_bias)
+                mt_vec = Vec.from_elements([m_term], fx.Float32).broadcast_to(
+                    C_F32_PER_LANE
                 )
+                bias_chunks = _bias_split(m_term)
 
             n_groups = C_F32_PER_LANE // 4
 
             p_words = []
             v_partial = None
-            rscale = None
-            if const_expr(USE_SCHRAUDOLPH):
-                if const_expr(USE_QK_SCALE_FOLD):
-                    m_term = _fadd(_fsub(c_zero_f, m_new), c_exp2_bias)
-                    sx_vec = None
-                else:
-                    neg_scaled_m_new = _fsub(c_zero_f, _fmul(scale_log2e, m_new))
-                    scale_x2p23 = _fmul(scale_log2e, c_2p23)
-                    m_term = _fadd(_fmul(neg_scaled_m_new, c_2p23), c_exp2_bias)
-                    sx_vec = Vec.from_elements([scale_x2p23], fx.Float32).broadcast_to(
-                        C_F32_PER_LANE
-                    )
+            zero_vec = Vec.filled(C_F32_PER_LANE, 0.0, fx.Float32)
+            cap_vec = Vec.filled(C_F32_PER_LANE, SCHRAUDOLPH_CAP, fx.Float32)
+            i32_vec_ty = Vec.make_type(C_F32_PER_LANE, fx.Int32)
+            f32_vec_ty = Vec.make_type(C_F32_PER_LANE, fx.Float32)
+            for nt in range_constexpr(N_KV_TILES):
                 if const_expr(seeded):
-                    if const_expr(USE_WATCHDOG):
-                        m_new, corr, rscale = _watchdog_seeded(s_accs, m_new)
-                elif const_expr(frozen and USE_WATCHDOG):
-                    m_term, m_new, corr = _watchdog(s_accs, m_term, m_new)
-
-                mt_vec = Vec.from_elements([m_term], fx.Float32).broadcast_to(
-                    C_F32_PER_LANE
+                    ## TODO: why cap?
+                    # clamp to [0, cap] -- v_med3_f32 does both ends in
+                    # one instruction, halving the VALU here. FMED3 has no
+                    # vector pattern, so build the vector element-wise.
+                    _s = Vec(s_accs[nt])
+                    biased = Vec.from_elements(
+                        [
+                            rocdl.fmed3(
+                                T.f32,
+                                _raw(_s[r]),
+                                _raw(c_zero_f),
+                                _raw(c_sch_cap),
+                            )
+                            for r in range_constexpr(C_F32_PER_LANE)
+                        ],
+                        fx.Float32,
+                    )
+                else:
+                    aff = _fadd(Vec(s_accs[nt]), mt_vec)
+                    biased = _fmax(aff, zero_vec)
+                ps_v = Vec(
+                    arith.bitcast(
+                        f32_vec_ty, arith.fptoui(i32_vec_ty, _raw(biased))
+                    )
                 )
-                zero_vec = Vec.filled(C_F32_PER_LANE, 0.0, fx.Float32)
-                cap_vec = Vec.filled(C_F32_PER_LANE, SCHRAUDOLPH_CAP, fx.Float32)
-                i32_vec_ty = Vec.make_type(C_F32_PER_LANE, fx.Int32)
-                f32_vec_ty = Vec.make_type(C_F32_PER_LANE, fx.Float32)
-                for nt in range_constexpr(N_KV_TILES):
-                    if const_expr(seeded):
-                        # clamp to [0, cap] -- v_med3_f32 does both ends in
-                        # one instruction, halving the VALU here. FMED3 has no
-                        # vector pattern, so build the vector element-wise.
-                        _s = Vec(s_accs[nt])
-                        biased = Vec.from_elements(
-                            [
-                                rocdl.fmed3(
-                                    T.f32,
-                                    _raw(_s[r]),
-                                    _raw(c_zero_f),
-                                    _raw(c_sch_cap),
-                                )
-                                for r in range_constexpr(C_F32_PER_LANE)
-                            ],
-                            fx.Float32,
-                        )
-                    else:
-                        if const_expr(USE_QK_SCALE_FOLD):
-                            aff = _fadd(Vec(s_accs[nt]), mt_vec)
-                        else:
-                            aff = _fadd(_fmul(Vec(s_accs[nt]), sx_vec), mt_vec)
-                        biased = _fmax(aff, zero_vec)
-                    ps_v = Vec(
-                        arith.bitcast(
-                            f32_vec_ty, arith.fptoui(i32_vec_ty, _raw(biased))
+                if const_expr(nt < L_SPLIT_TILES):
+                    v_partial = (
+                        Vec(ps_v)
+                        if const_expr(v_partial is None)
+                        else _fadd(Vec(v_partial), Vec(ps_v))
+                    )
+                for rg in range_constexpr(n_groups):
+                    p_words.append(
+                        _f32x4_to_fp8_word(
+                            *[ps_v[rg * 4 + i] for i in range_constexpr(4)],
+                            rscale=None,
                         )
                     )
-                    if const_expr(nt < L_SPLIT_TILES):
-                        v_partial = (
-                            Vec(ps_v)
-                            if const_expr(v_partial is None)
-                            else _fadd(Vec(v_partial), Vec(ps_v))
-                        )
-                    for rg in range_constexpr(n_groups):
-                        p_words.append(
-                            _f32x4_to_fp8_word(
-                                *[ps_v[rg * 4 + i] for i in range_constexpr(4)],
-                                rscale=rscale,
-                            )
-                        )
-            else:
-                neg_scaled_m_new = _fsub(c_zero_f, _fmul(scale_log2e, m_new))
-                scale_vec = Vec.from_elements([scale_log2e], fx.Float32).broadcast_to(
-                    C_F32_PER_LANE
-                )
-                neg_m_vec = Vec.from_elements(
-                    [neg_scaled_m_new], fx.Float32
-                ).broadcast_to(C_F32_PER_LANE)
-                for nt in range_constexpr(N_KV_TILES):
-                    aff = Vec(_fadd(_fmul(Vec(s_accs[nt]), scale_vec), neg_m_vec))
-                    for rg in range_constexpr(n_groups):
-                        ps = [
-                            rocdl.exp2(T.f32, _raw(aff[rg * 4 + i]))
-                            for i in range_constexpr(4)
-                        ]
-                        p_words.append(_f32x4_to_fp8_word(*ps))
             # Pin the P words to this block. g0 loop-carries p_pack across the
             # back-edge, so without this the scheduler sinks half the
             # producer chain (32 med3 + 32 cvt_u32 + 32 cvt_fp8) into the
@@ -981,14 +892,9 @@ def build_flash_attn_fp8_module(
                     v_sum,
                     fx.Float32(v_sum).shuffle_xor(fx.Int32(32), fx.Int32(WARP_SIZE)),
                 )
-                if const_expr(rscale is not None):
-                    v_sum = _fmul(v_sum, corr)
                 p_rowsum = v_sum
             if const_expr(SOFTMAX_PRIO != 0 and set_prio):
                 rocdl.s_setprio(0)
-            # Split the next tile's QK seed into bf16 chunks here, on the VALU,
-            # so the MFMA phase only pays the one prefill MFMA.
-            bias_chunks = _bias_split(m_new) if const_expr(USE_BIAS_FOLD) else None
             if const_expr(barrier):
                 # asm: the trailing s_barrier of _softmax_rescale_R_frozen,
                 # preceded by the vmcnt(0) that publishes the tile the previous
@@ -997,7 +903,7 @@ def build_flash_attn_fp8_module(
                 _wait_vmcnt()
                 _wait_lgkmcnt()
                 _gpu_barrier()
-            return m_new, corr, p_pack, p_rowsum, bias_chunks
+            return m_new, m_term, bias_chunks, p_pack, p_rowsum
 
         ones_pack = Vec.filled(A_FP8_PER_LANE // 4, 0x38383838, fx.Int32)
 
@@ -1048,14 +954,15 @@ def build_flash_attn_fp8_module(
                 ## HBM k offs
                 g_koffs = get_hbm_koffs(BLOCK_N)
                 sA, vwp = do_qk(k_buf_off, preloaded_kw=kvw, v_off=v_buff_off, dma=(k_rsrc, l_koffs, g_koffs))
-                m_new, corr_new, p_new, prowsum_new, bc_new = do_softmax(sA, m_init)
+                m_frozen, m_term, bc, p_new, prowsum_new = do_softmax(sA, m_init)
 
                 g_koffs = get_hbm_koffs(BLOCK_N * 2)
                 _wait_lgkmcnt()
                 _wait_vmcnt()
                 _gpu_barrier()
                 return (
-                    m_new,
+                    m_frozen,
+                    m_term,
                     l_init,
                     o_init[0],
                     o_init[1],
@@ -1064,8 +971,7 @@ def build_flash_attn_fp8_module(
                     lr_init,
                     p_new,
                     prowsum_new,
-                    corr_new,
-                    *(bc_new if const_expr(USE_BIAS_FOLD) else ()),
+                    bc,
                     _v_slot(0),
                     _v_slot(1),
                     _v_slot(2),
@@ -1112,8 +1018,8 @@ def build_flash_attn_fp8_module(
                     as_dsl_value(a, ex)
                     for a, ex in zip(for_op.inner_iter_args, g0_carry)
                 ]
-                m_r, l_a, oo0, oo1, oo2, oo3, lr_a = _g0_args[:7]
-                p_c, prowsum_c, corr_c = _g0_args[7:10]
+                m_frozen, m_term, bc, l_a, oo0, oo1, oo2, oo3, lr_a = _g0_args[:8]
+                p_c, prowsum_c = _g0_args[8:10]
                 bc_c = _g0_args[10 : 10 + N_BIAS_CHUNKS]
                 _rest = _g0_args[10 + N_BIAS_CHUNKS :]
                 v_buff_off, v_next_off, v_further_off = _rest[0:3]
@@ -1132,7 +1038,6 @@ def build_flash_attn_fp8_module(
                     lr_a,
                     p_c,
                     prowsum_c,
-                    corr_c,
                     v_buff_off,
                     preloaded_vw=vwp,
                     k_buf_off=k_buf_off,
