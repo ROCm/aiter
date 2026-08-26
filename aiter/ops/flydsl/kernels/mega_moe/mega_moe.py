@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2025 FlyDSL Project Contributors
-"""MegaMoEV2 fused dispatch, GEMM1, GEMM2, and combine implementation."""
+"""MegaMoE v2 fused dispatch, GEMM1, GEMM2, and combine implementation."""
 
 import flydsl.expr as fx
 import mori.shmem as ms
