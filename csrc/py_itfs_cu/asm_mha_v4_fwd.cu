@@ -130,7 +130,11 @@ static_assert(offsetof(FmhaV4Kernarg, ptr_v_descale) == 0x220);
 
 void check_format_tensor(const at::Tensor& tensor, int64_t format, const char* name)
 {
-    if(format == format_id(AttentionFormat::Int8))
+    if(format == format_id(AttentionFormat::Bf16))
+    {
+        TORCH_CHECK(tensor.scalar_type() == at::ScalarType::BFloat16, name, " must be BF16");
+    }
+    else if(format == format_id(AttentionFormat::Int8))
     {
         TORCH_CHECK(tensor.scalar_type() == at::ScalarType::Char, name, " must be int8");
     }
@@ -255,8 +259,13 @@ void fmha_v4_fwd(const at::Tensor& q,
     TORCH_CHECK(batch > 0 && seqlen_q > 0 && seqlen_k > 0 && nhead_q > 0,
                 "MHA v4 requires non-empty inputs");
     TORCH_CHECK(k.size(0) == batch && v.size(0) == batch, "Q, K, and V batch sizes must match");
-    TORCH_CHECK(nhead_q == nhead_k && v.size(2) == nhead_k,
-                "MHA v4 initially supports MHA only; Q and KV heads must match");
+    TORCH_CHECK(nhead_k > 0 && v.size(2) == nhead_k,
+                "MHA v4 requires matching non-empty K and V head dimensions");
+    TORCH_CHECK(nhead_q % nhead_k == 0,
+                "MHA v4 requires query heads to be divisible by KV heads");
+    const int64_t gqa_ratio = nhead_q / nhead_k;
+    TORCH_CHECK(gqa_ratio <= 16 && (gqa_ratio & (gqa_ratio - 1)) == 0,
+                "MHA v4 supports power-of-two GQA ratios up to 16");
     TORCH_CHECK(k.size(1) == v.size(1), "K and V sequence lengths must match");
     TORCH_CHECK(q.size(3) == packed_width && k.size(3) == packed_width,
                 "Q/K packed width does not match the explicit format");
@@ -276,10 +285,18 @@ void fmha_v4_fwd(const at::Tensor& q,
 
     const bool mx_qk_format = q_format == format_id(AttentionFormat::Fp6E2M3) ||
                               q_format == format_id(AttentionFormat::Fp4E2M1);
+    const bool bf16_format = q_format == format_id(AttentionFormat::Bf16);
     const bool e8m0_qk_scales =
         q_scale_mode == scale_mode_id(AttentionScaleMode::E8M0Per1x32) &&
         k_scale_mode == scale_mode_id(AttentionScaleMode::E8M0Per1x32);
-    if(e8m0_qk_scales)
+    if(bf16_format)
+    {
+        TORCH_CHECK(q_scale_mode == scale_mode_id(AttentionScaleMode::None) &&
+                        k_scale_mode == scale_mode_id(AttentionScaleMode::None) &&
+                        v_scale_mode == scale_mode_id(AttentionScaleMode::None),
+                    "BF16 Q/K/V must use NONE scale modes");
+    }
+    else if(e8m0_qk_scales)
     {
         TORCH_CHECK(q_descale.scalar_type() == at::ScalarType::Byte &&
                         k_descale.scalar_type() == at::ScalarType::Byte,
@@ -299,7 +316,11 @@ void fmha_v4_fwd(const at::Tensor& q,
     }
     const bool mx_v = v_format == format_id(AttentionFormat::Fp6E2M3) ||
                       v_format == format_id(AttentionFormat::Fp4E2M1);
-    if(mx_v)
+    if(bf16_format)
+    {
+        // Raw BF16 operands do not use descale tensors.
+    }
+    else if(mx_v)
     {
         const int64_t tiles = (seqlen_k + 127) / 128;
         TORCH_CHECK(v_scale_mode == 5 && v_descale.scalar_type() == at::ScalarType::Byte,
@@ -337,44 +358,45 @@ void fmha_v4_fwd(const at::Tensor& q,
     const float scale = static_cast<float>(softmax_scale);
     std::memcpy(&args.scalar.value, &scale, sizeof(scale));
     args.s_seq_len.value     = seqlen_q;
-    args.s_Seqs.value        = q.stride(1);
-    args.s_Ts.value          = cfg.ts_qo * q.stride(1);
-    args.s_Hs.value          = q.stride(2);
-    args.s_Bs.value          = q.stride(0);
-    args.s_gqa.value         = 1; // Initial v4 rows are MHA-only.
-    args.s_k_Seqs.value      = k.stride(1);
-    args.s_k_Hs.value        = k.stride(2);
-    args.s_k_Bs.value        = k.stride(0);
+    args.s_Seqs.value        = q.stride(1) * q.element_size();
+    args.s_Ts.value          = cfg.ts_qo * q.stride(1) * q.element_size();
+    args.s_Hs.value          = q.stride(2) * q.element_size();
+    args.s_Bs.value          = q.stride(0) * q.element_size();
+    args.s_gqa.value         = gqa_ratio;
+    args.s_k_Seqs.value      = k.stride(1) * k.element_size();
+    args.s_k_Hs.value        = k.stride(2) * k.element_size();
+    args.s_k_Bs.value        = k.stride(0) * k.element_size();
     args.s_opt.value         = 5; // Dense, non-causal v1 tuning mode inherited by these binaries.
     args.s_lse.value         = 0;
     args.s_kv_seq_len.value  = seqlen_k;
     args.s_qk_head_dim.value = kHeadDim;
     args.s_v_head_dim.value  = kHeadDim;
     args.s_q_head_num.value  = nhead_q;
-    args.s_v_Seqs.value      = v.stride(1);
-    args.s_v_Hs.value        = v.stride(2);
-    args.s_v_Bs.value        = v.stride(0);
-    // Input tensors are byte-addressed packed formats, so their element strides already equal
-    // byte strides. BF16 output strides require the explicit two-byte conversion.
-    args.s_o_Seqs.value      = out.stride(1) * 2;
-    args.s_o_Hs.value        = out.stride(2) * 2;
-    args.s_o_Bs.value        = out.stride(0) * 2;
+    args.s_v_Seqs.value      = v.stride(1) * v.element_size();
+    args.s_v_Hs.value        = v.stride(2) * v.element_size();
+    args.s_v_Bs.value        = v.stride(0) * v.element_size();
+    args.s_o_Seqs.value      = out.stride(1) * out.element_size();
+    args.s_o_Hs.value        = out.stride(2) * out.element_size();
+    args.s_o_Bs.value        = out.stride(0) * out.element_size();
 
-    set_descale_strides(
-        q_descale,
-        q_descale.dim() >= 3 ? 2 : 1,
-        args.s_descale_q_Bs.value,
-        args.s_descale_q_Hs.value);
-    set_descale_strides(
-        k_descale,
-        k_descale.dim() >= 3 ? 2 : 1,
-        args.s_descale_k_Bs.value,
-        args.s_descale_k_Hs.value);
-    // Production V descales are [batch, head, channel], so the head dimension is 1.
-    set_descale_strides(v_descale,
-                        1,
-                        args.s_descale_v_Bs.value,
-                        args.s_descale_v_Hs.value);
+    if(!bf16_format)
+    {
+        set_descale_strides(
+            q_descale,
+            q_descale.dim() >= 3 ? 2 : 1,
+            args.s_descale_q_Bs.value,
+            args.s_descale_q_Hs.value);
+        set_descale_strides(
+            k_descale,
+            k_descale.dim() >= 3 ? 2 : 1,
+            args.s_descale_k_Bs.value,
+            args.s_descale_k_Hs.value);
+        // Production V descales are [batch, head, channel], so the head dimension is 1.
+        set_descale_strides(v_descale,
+                            1,
+                            args.s_descale_v_Bs.value,
+                            args.s_descale_v_Hs.value);
+    }
 
     static SynchronizedCache<std::string, AiterAsmKernel> kernels;
     const std::string cache_key = arch + "|" + cfg.knl_name + "|" + cfg.co_name;
