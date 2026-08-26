@@ -112,6 +112,16 @@ def gemm_a8w8_blockscale(
     assert scale_k == -(-K // scale_block_k), f"bad scale_k {scale_k} for K {K}"
     assert scale_n == -(-N // scale_block_n), f"bad scale_n {scale_n} for N {N}"
     assert dtype in (torch.bfloat16, torch.float16, torch.float32), f"bad dtype {dtype}"
+    assert (
+        x.stride(1) == 1 or K == 1
+    ), f"x needs unit-stride K for TDM, got strides {tuple(x.stride())}"
+    assert (
+        w.stride(1) == 1 or w.shape[1] == 1
+    ), f"w needs unit-stride K for TDM, got strides {tuple(w.stride())}"
+    assert (
+        x_scale.stride(1) == 1 or scale_k == 1
+    ), f"x_scale needs unit-stride K, got strides {tuple(x_scale.stride())}"
+    assert w_scale.is_contiguous(), "w_scale must be contiguous"
     _splitk_f32_accum = split_k > 1 and dtype in (torch.bfloat16, torch.float16)
     buf_dtype = torch.float32 if _splitk_f32_accum else dtype
     _half_str = "fp16" if dtype == torch.float16 else "bf16"
@@ -163,6 +173,12 @@ def gemm_a8w8_blockscale(
         split_k,
     )
 
+    lda = x.stride(0) if M > 1 else K
+    ldb = w.stride(0) if w.shape[0] > 1 else w.shape[1]
+    lds = (x_scale.stride(0) if M > 1 else x_scale.shape[1]) * 4
+    assert y_buf.stride(1) == 1, "output must have unit-stride N"
+    ldc = y_buf.stride(0) if y_buf.shape[0] > 1 else y_buf.shape[1]
+
     stream = torch.cuda.current_stream(device=x.device).cuda_stream
     _run_compiled(
         launcher,
@@ -173,7 +189,10 @@ def gemm_a8w8_blockscale(
         _p(w_scale),
         M,
         N,
-        N_stride,
+        ldc,
+        lda,
+        ldb,
+        lds,
         _fx.Stream(stream),
     )
 

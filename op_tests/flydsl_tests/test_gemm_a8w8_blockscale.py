@@ -607,6 +607,112 @@ def test_gemm_a8w8_blockscale_ragged_n_preallocated_output(M, N, K):
     _assert_close(out, ref, rtol=1e-2, atol=1e-2)
 
 
+_W_CHUNK_K = [
+    (4096, 1),
+    (8192, 2),
+    (12288, 3),
+    (16384, 4),
+]
+
+
+@pytest.mark.parametrize("K, expected_chunks", _W_CHUNK_K)
+def test_gemm_a8w8_blockscale_w_scale_chunks(K, expected_chunks):
+    """Cover the multi-chunk W-scale prefetch path (>=3 chunks was untested)."""
+    _check_gfx1250()
+    M, N = 128, 256
+    _check_shape_compat(M, N, K)
+    assert -(-(K // SCALE_BLOCK_K) // 32) == expected_chunks
+    torch.cuda.empty_cache()
+
+    x, w, x_scale, w_scale = _generate_inputs(M, N, K)
+    ref = _reference_output(x, w, x_scale, w_scale, dtype=torch.bfloat16)
+    w = shuffle_weight_gfx1250(w)
+    out = gemm_a8w8_blockscale(x, w, x_scale, w_scale, dtype=torch.bfloat16)
+    _assert_close(out, ref, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.parametrize("K", [12288, 16384])
+@pytest.mark.parametrize("variant", ["compute_bound", "memory_bound"])
+def test_gemm_a8w8_blockscale_w_scale_chunks_variant(K, variant):
+    """Multi-chunk W-scale window under both pipeline variants."""
+    _check_gfx1250()
+    M, N = 256, 512
+    _check_shape_compat(M, N, K)
+    torch.cuda.empty_cache()
+
+    x, w, x_scale, w_scale = _generate_inputs(M, N, K)
+    ref = _reference_output(x, w, x_scale, w_scale, dtype=torch.bfloat16)
+    w = shuffle_weight_gfx1250(w)
+    out = gemm_a8w8_blockscale(
+        x, w, x_scale, w_scale, dtype=torch.bfloat16, variant=variant
+    )
+    _assert_close(out, ref, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.parametrize("K", [12288, 16384])
+@pytest.mark.parametrize("split_k", [2, 4])
+def test_gemm_a8w8_blockscale_w_scale_chunks_split_k(K, split_k):
+    """Multi-chunk W-scale window with split_k (split_kb_base offsets the window)."""
+    _check_gfx1250()
+    M, N = 128, 256
+    tile_k, num_buffers = 128, 3
+    if (K // split_k) // tile_k < num_buffers - 1:
+        pytest.skip(f"per-split num_k_tiles < num_buffers-1 (split_k={split_k})")
+    torch.cuda.empty_cache()
+
+    x, w, x_scale, w_scale = _generate_inputs(M, N, K)
+    ref = _reference_output(x, w, x_scale, w_scale, dtype=torch.bfloat16)
+    w = shuffle_weight_gfx1250(w)
+    out = gemm_a8w8_blockscale(
+        x,
+        w,
+        x_scale,
+        w_scale,
+        dtype=torch.bfloat16,
+        variant="memory_bound",
+        split_k=split_k,
+    )
+    _assert_close(out, ref, rtol=1e-2, atol=1e-2)
+
+
+def test_gemm_a8w8_blockscale_non_contiguous_rows():
+    """Runtime lda/ldb/lds: operands sliced out of a wider buffer still work."""
+    _check_gfx1250()
+    M, N, K = 128, 256, 512
+    _check_shape_compat(M, N, K)
+    torch.cuda.empty_cache()
+
+    x, w, x_scale, w_scale = _generate_inputs(M, N, K)
+    ref = _reference_output(x, w, x_scale, w_scale, dtype=torch.bfloat16)
+
+    # Widen X and its scales, then slice back -> unit-stride K, padded row stride.
+    x_wide = torch.zeros((M, K * 2), dtype=x.dtype, device=x.device)
+    x_wide[:, :K] = x
+    x_view = x_wide[:, :K]
+    scale_k = x_scale.shape[1]
+    xs_wide = torch.zeros((M, scale_k * 2), dtype=x_scale.dtype, device=x.device)
+    xs_wide[:, :scale_k] = x_scale
+    xs_view = xs_wide[:, :scale_k]
+    assert x_view.stride(0) == K * 2 and x_view.stride(1) == 1
+    assert xs_view.stride(0) == scale_k * 2
+
+    w = shuffle_weight_gfx1250(w)
+    out = gemm_a8w8_blockscale(x_view, w, xs_view, w_scale, dtype=torch.bfloat16)
+    _assert_close(out, ref, rtol=1e-2, atol=1e-2)
+
+
+def test_gemm_a8w8_blockscale_rejects_bad_strides():
+    """A transposed (non-unit-stride K) operand must raise, not silently corrupt."""
+    _check_gfx1250()
+    M, N, K = 128, 256, 512
+    x, w, x_scale, w_scale = _generate_inputs(M, N, K)
+    w = shuffle_weight_gfx1250(w)
+    x_bad = x.t().contiguous().t()  # stride(1) == M, not 1
+    assert x_bad.stride(1) != 1
+    with pytest.raises(AssertionError):
+        gemm_a8w8_blockscale(x_bad, w, x_scale, w_scale, dtype=torch.bfloat16)
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("-M", type=int, default=128)
