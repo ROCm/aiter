@@ -359,9 +359,17 @@ def qsa_select_paged_tokens(
 
     columns = page_table.shape[1] * compressed_k_cache.shape[1]
     block_topk = token_topk // compress_ratio
-    if block_topk > columns:
-        raise ValueError("compressed top-k exceeds paged-cache capacity")
-    rows_per_chunk = max(1, logits_workspace_bytes // max(columns * 4, 1))
+    # The serving-time page table is sized for the active requests, so short
+    # decode rows can expose fewer compressed-cache columns than the model's
+    # fixed block_topk.  The radix top-k kernel still expects its model-defined
+    # output width; pad the score matrix with -inf rather than rejecting a
+    # valid short context.  The corresponding dummy indices are filtered by
+    # qsa_expand_block_indices against each request's context length.
+    # While padding, the compact logits and the fixed-width padded logits are
+    # simultaneously live until the copy completes.  Account for both so the
+    # advertised workspace bound remains valid for large decode batches.
+    score_columns_per_row = columns + block_topk if columns < block_topk else columns
+    rows_per_chunk = max(1, logits_workspace_bytes // max(score_columns_per_row * 4, 1))
     for row_start in range(0, rows, rows_per_chunk):
         row_end = min(row_start + rows_per_chunk, rows)
         row_slice = slice(row_start, row_end)
@@ -375,6 +383,15 @@ def qsa_select_paged_tokens(
             compress_ratio,
             backend=selected_backend,
         )
+        if columns < block_topk:
+            padded_logits = torch.full(
+                (row_end - row_start, block_topk),
+                float("-inf"),
+                dtype=logits.dtype,
+                device=logits.device,
+            )
+            padded_logits[:, :columns].copy_(logits)
+            logits = padded_logits
         selected_groups = torch.empty(
             (row_end - row_start, block_topk),
             dtype=torch.int32,

@@ -96,5 +96,8 @@ Consequently, both validated gfx950 specializations auto-select Gluon.
 - Separate K and V caches.
 - Integer page tables and request metadata.
 - `token_topk` must be divisible by `compress_ratio`.
+- Short contexts whose compressed page-table capacity is smaller than the
+  model's fixed top-k are supported; missing score columns are treated as
+  invalid selections.
 - AITER's compiled `module_top_k_per_row` extension is required for the fused
   selection pipeline.

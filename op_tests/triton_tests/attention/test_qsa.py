@@ -221,6 +221,44 @@ def test_qsa_selection_pipeline_matches_reference():
         )
 
 
+def test_qsa_selection_pipeline_supports_short_cache_capacity():
+    """Fixed model top-k must also work before the cache reaches that width."""
+    torch.manual_seed(31)
+    q = torch.randn(2, 4, 16, device="cuda", dtype=torch.bfloat16)
+    cache = torch.randn(2, 2, 1, 16, device="cuda", dtype=torch.bfloat16)
+    page_table = torch.tensor([[0], [1]], device="cuda", dtype=torch.int32)
+    token_to_request = torch.tensor([0, 1], device="cuda", dtype=torch.int32)
+    query_positions = torch.tensor([3, 1], device="cuda", dtype=torch.int32)
+    context_lens = torch.tensor([4, 2], device="cuda", dtype=torch.int32)
+
+    actual = qsa_select_paged_tokens(
+        q,
+        cache,
+        page_table,
+        token_to_request,
+        query_positions,
+        context_lens,
+        token_topk=8,
+        compress_ratio=2,
+    )
+
+    visible = torch.tensor([2, 1], device="cuda", dtype=torch.int32)
+    logits = _mqa_reference(q, cache, page_table, token_to_request, visible)
+    padded_logits = torch.full((2, 4), -torch.inf, device="cuda")
+    padded_logits[:, : logits.shape[1]] = logits
+    selected = torch.topk(padded_logits, 4, dim=1).indices.to(torch.int32)
+    row_context_lens = context_lens.index_select(0, token_to_request.long())
+    expected = _expand_reference(selected, query_positions, row_context_lens, 2, 8)
+
+    for row in range(expected.shape[0]):
+        actual_valid = actual[row][actual[row] >= 0]
+        expected_valid = expected[row][expected[row] >= 0]
+        torch.testing.assert_close(
+            torch.sort(actual_valid).values,
+            torch.sort(expected_valid).values,
+        )
+
+
 @pytest.mark.parametrize(
     ("name", "values"),
     (
