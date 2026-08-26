@@ -3454,3 +3454,55 @@ if __name__ == "__main__":
         "pts_quant_shuffle_block_layout parity summary (markdown):\n%s",
         df.to_markdown(index=False),
     )
+
+
+def _run_pts_v_norm_case(head_size: int, v_norm: bool):
+    """fused_qk_norm_rope_cache_pts_quant_shuffle should write a weightless
+    RMS-normalized V to the cache when v_norm=True (Gemma4), and raw V otherwise.
+    Covers head_dim 256 (sliding) and 512 (full-attention) layers."""
+    from aiter.ops.fused_qk_norm_rope_cache_quant import (
+        fused_qk_norm_rope_cache_pts_quant_shuffle,
+    )
+
+    dtype = torch.bfloat16
+    dev = "cuda"
+    nt, hq, hk, hv = 1, 1, 1, 1
+    num_heads = hq + hk + hv
+    eps = 1e-6
+    block_size = 1
+
+    qkv = torch.randn(nt, num_heads * head_size, dtype=dtype, device=dev)
+    qw = torch.randn(head_size, dtype=dtype, device=dev)
+    kw = torch.randn(head_size, dtype=dtype, device=dev)
+    cos_sin = torch.randn(8, head_size, dtype=dtype, device=dev)
+    positions = torch.zeros(nt, dtype=torch.int64, device=dev)
+    q_out = torch.empty(nt, hq * head_size, dtype=dtype, device=dev)
+    # NHD contiguous cache: [num_blocks, block_size, num_heads, head_size]
+    k_cache = torch.zeros(1, block_size, hk, head_size, dtype=dtype, device=dev)
+    v_cache = torch.zeros(1, block_size, hv, head_size, dtype=dtype, device=dev)
+    slot_mapping = torch.zeros(nt, dtype=torch.int64, device=dev)
+    k_scale = torch.ones(1, dtype=torch.float32, device=dev)
+    v_scale = torch.ones(1, dtype=torch.float32, device=dev)
+    x = 16 // k_cache.element_size()
+
+    fused_qk_norm_rope_cache_pts_quant_shuffle(
+        qkv, qw, kw, cos_sin, positions, nt, hq, hk, hv, head_size,
+        True, eps, q_out, k_cache, v_cache, slot_mapping, k_scale, v_scale,
+        None, None, False, False, block_size, x, 0, v_norm,
+    )
+    torch.cuda.synchronize()
+
+    v_in = qkv[:, (hq + hk) * head_size:].view(nt, hv, head_size).float()
+    if v_norm:
+        v_ref = v_in * torch.rsqrt(v_in.pow(2).mean(-1, keepdim=True) + eps)
+    else:
+        v_ref = v_in
+    checkAllclose(
+        v_ref, v_cache.view(nt, hv, head_size).float(), atol=1e-2, rtol=1e-2
+    )
+
+
+def test_fused_qk_norm_rope_cache_pts_v_norm():
+    for head_size in (256, 512):
+        for v_norm in (False, True):
+            _run_pts_v_norm_case(head_size, v_norm)
