@@ -76,9 +76,9 @@ GEMM1 行数比 = 6.8x
 
 `topk_ids` 只在本卡读，跨卡交换的是 384 个 int32 的计数矩阵（`dispatch.py:517-522`）；`route_weights` 搭着 payload 逐行推送，lane 0 各写一个 dword（`dispatch.py:901-907`）。EP 下没有任何一张卡需要全局路由表，TP 下每张卡都需要。
 
-**2.6 `CompiledArtifact` 可以当重构的指纹。**
+**2.6 `MegaMoEV2` 的输出 run-to-run 不可复现。**
 
-FlyDSL JIT cache 的 pkl 反序列化后是 `flydsl.compiler.jit_executor.CompiledArtifact`，字段含 `_ir_text`（26 KB 优化后 IR）与 `_source_ir`（208 KB 源 MLIR）。
+在与 `main` 逐字节相同的生产代码上，固定 seed、清空 JIT cache 连跑两次，八个 rank 输出全不一致而编译 IR 完全一致。详见 6.3。这条不是本方案的立论依据，而是它否掉了「抽公共模块」那条路。
 
 ---
 
@@ -214,78 +214,71 @@ MegaMoE 的 `ATileLoader.for_tile(tile_row_base)` 假设 tile 的 32 行内存�
 
 ### 5.6 复用清单
 
-**直接复用不改**：ticket 与 generation 计算、epoch/parity 协议、`epoch_gate` 本地重置、`launch_ready` 跨卡握手、分片 work pool 及 LDS 广播、`_copy_token_row`、`AScaleLoader` 落 LDS 后的 shuffle 与打包、GEMM1 的 MFMA 主循环与 epilogue。
+**照抄 MegaMoE、逻辑不变**（写进 TP 自己的 `collective_sched.py`，不改 MegaMoE 源文件，见第 6 节）：ticket 与 generation 计算、epoch/parity 协议、`epoch_gate` 本地重置、`launch_ready` 跨卡握手、分片 work pool 及 LDS 广播、`_copy_token_row`。其中 epoch/parity 那段在 TP 下要改 `expected` 的递增步长，work pool 那段要关掉逐 tile 等待，详见 6.2。
+
+**直接调用现有实现、一行不改**：`AScaleLoader` 落 LDS 后的 shuffle 与打包、GEMM1 的 MFMA 主循环与 epilogue。
 
 **需新写**：TP 的 producer 任务划分与推送、按 token id 取数的 A 与 scale loader、把这些接起来的 kernel 主体。
 
 ---
 
-## 6. 公共模块抽取与冻结守护
+## 6. 调度同步代码的复用方式：拷贝，不改 MegaMoEV2
 
-### 6.1 抽取范围
+### 6.1 决定
 
-新建 `aiter/ops/flydsl/kernels/mega_moe/collective_sched.py`，放四个与 EP 语义无关的 helper：
+TP 的融合 kernel 需要用到 MegaMoE 里四段与 EP 语义无关的调度同步代码。**做法是在 `aiter/ops/flydsl/kernels/mega_moe/collective_sched.py` 里写 TP 自己的一份，`mega_moe_stage1.py` 与 `dispatch.py` 一行不改。**
 
-| helper | 来源 | 性质 |
+这推翻了本文档早先版本里「抽公共模块、旧文件改成 import」的写法，也恢复了阶段一决定 19「`MegaMoEV2` 完全冻结，纯增量」。推翻的理由见 6.3。
+
+### 6.2 四段代码在 TP 下的差异
+
+逐个核对过，真正逐字相同的只有前两个：
+
+| 来源 | 行数 | TP 下是否要改 |
 |---|---|---|
-| `_copy_token_row` | `dispatch.py:183-201` | 已经是独立 `@flyc.jit`，纯剪切粘贴 |
-| `emit_ticket_and_roles` | `mega_moe_stage1.py:210-225` | 现为内联代码，需引入函数边界 |
-| `emit_epoch_rendezvous` | `mega_moe_stage1.py:227-279` | 同上 |
-| `emit_work_pool_loop` | `mega_moe_stage1.py:425-453` | 同上 |
+| `_copy_token_row`（`dispatch.py:183-201`） | 19 | 完全一样。参数只有行字节长度，推 activation 传 `model_dim`、推 scale 传 `model_dim/32` |
+| ticket 与角色划分（`mega_moe_stage1.py:210-225`） | 16 | 完全一样。TP 的角色也是 owner、producer、consumer 三类 |
+| 分片 work pool（`mega_moe_stage1.py:425-453`） | 28 | 结构一样，但 TP 只在进 pool 前统一等一次，要关掉挂在 `const_expr(not direct_fixed_slot)` 上的逐 tile 等待 |
+| epoch/parity 与握手（`mega_moe_stage1.py:227-279`） | 45 | **真的不一样** |
 
-原本设想的六样合成了四个，原因有二。第一，epoch/parity 翻转、`launch_ready` 握手、`epoch_gate` 重置在源码里是**同一条 `if compact_owner: ... else: ...` 语句**（227 到 279 行），拆成三个 helper 就得改分支结构，那就不是纯搬家了。第二，`launch_ready` 握手依赖 parity 翻转产生的 `launch_epoch`，本来也分不开。
-
-引入函数边界不影响生成的代码。`@flyc.jit` 在 tracing 期间（`ir.Context` 存活时）是普通 Python 调用，函数体直接内联进 trace，不发 `func.call`：
+最后一个的差异在 `expected` 的递增步长：
 
 ```python
-# flydsl/compiler/jit_function.py:1357-1359
-def __call__(self, *args, **kwargs):
-    if ir.Context.current is not None:
-        return self.func(*args, **kwargs)
+next_expected = previous_expected + fx.Int32(fz_npes)
+launch_epoch_lane = (next_expected // fx.Int32(fz_npes)) * fx.Int32(2) - next_parity_lane
 ```
 
-真正会破坏 IR 一致性的是语句重排或常量折叠结果改变，不是函数边界本身。
+EP 下每个源 rank 每个 expert 发布一次，步长是 `npes`。按 5.4 节，TP 是每个 producer block 发布一次，步长应该是 `npes * blocks_per_destination`，下面 `launch_epoch` 的推导也跟着要改。此外这段里还有三处 EP 专属的 `const_expr` 分支（`payload_tile_ready`、`external_grouping`、`direct_fixed_slot`），TP 全都用不上，所以 TP 版本会比原版短一半左右。
 
-两处实现细节必须注意。`emit_ticket_and_roles` 与 `emit_work_pool_loop` 共用 `SharedStorage.pool` 的第 0 字节做 LDS 广播（分别 recast 成 `fx.Int64` 和 `fx.Int32`），这块 LDS 在调用方分配（`mega_moe_stage1.py:187`），所以要作为参数传进 helper。`emit_epoch_rendezvous` 里 `next_parity_lane` 和 `launch_epoch_lane` 在嵌套的 `if tid == 0` 内被重新绑定、退出后再读，那对 `readfirstlane` 必须跟 `if tid == 0` 留在同一个 helper 里，否则 SSA 合并点位置变化，IR 文本就变了。
+有一个设计选择能让它也变成完全一样：让 TP 每个源 rank 只发布**一次** ready flag，producer block 先在本地累加、最后一个 block 代表本卡向所有 peer 发布，步长就还是 `npes`。代价是多一次本地 atomic 和一次 block 间同步。这个选择留到实现时再定。
 
-`mega_moe_stage1.py` 与 `dispatch.py` 改成从此 import，函数体一行不动。TP 新 kernel 也从此 import。
+### 6.3 为什么放弃抽取
 
-另外 `compile_mega_moe_stage1` 整个函数处于 `# fmt: off`（第 69 行起，之后再没开回来），搬出去的代码会被 black 重新格式化。格式化本身不改 IR，但会让 diff 变得难读，所以 `collective_sched.py` 里要带上 `# fmt: off`。
+当初选择抽取的隐含前提是有一套硬守护能证明没改坏 `MegaMoEV2`：生成的 IR 逐字节相同，加上输出逐位相同。实测发现**第二条不成立**。
 
-与 `experts_per_rank` 缠绕的一概不抽：expert-major 路由、srcmap 编码、per-expert 直方图、count matrix 的 all-to-all、capacity/compact 分叉。
-
-### 6.2 守护（两条都过才算搬家安全）
-
-用户已确认放宽阶段一决定 19「`MegaMoEV2` 完全冻结」，条件是守护标准要比现有测试硬。现有 `test_mega_moe_v2.py` 是 `rtol=0.10` 的容差测试，不足以证明纯搬家没改坏。
-
-**第一条，生成的 IR 逐字节相同。** 搬家前后各跑一次同一份 MegaMoEV2 配置，导出 JIT cache 里全部 `CompiledArtifact` 的 `sha256(_ir_text)`，排序后 `diff`，必须完全一致。
-
-这条的具体做法我实测验证过，有两个坑必须避开。
-
-**只能比 `_ir_text`，不能比 `_source_ir`。** 后者把绝对路径和行号烤进了 MLIR：
+在与 `main` 逐字节相同的、完全未经修改的生产代码上，固定 seed、清空 JIT cache 连跑两次 `MegaMoEV2`：
 
 ```
-_ir_text    含 '.py': False   含 loc(): False   含 'mega_moe': 无
-_source_ir  含 '.py': True    含 loc(): True    含 '/root/workspace': True
+MISMATCH rank0: 144991 bytes differ out of 1835008
+...（八个 rank 全部不一致）
+IR REPRODUCIBLE
 ```
 
-`_source_ir` 第一行就是 `#loc = loc("/root/workspace/aiter/.../mega_moe_stage2.py":502:0)`。函数换个文件、换个行号，这个字段必然变，但生成的代码可能一条指令都没动，拿它当守护会把每次纯搬家都误报成失败。`_ir_text` 从 `module attributes {gpu.container_module}` 开始，不含任何源码位置信息，才是能用的指纹。
+编译产物完全一致，输出不一致。差异形态不像浮点重结合：128 行里有 19 行整行不同、其余行逐位相同，差异行的逐元素相对误差中位数约 4%，单行 relL2 最高 11%。看起来像某些 token 少算了一份 expert 贡献。
 
-**不能按 cache 目录名配对。** FlyDSL 的 cache key 里直接包含 kernel 函数及其依赖的源码文本：
+剩下的那条容差判据也不够硬。`test_mega_moe_v2.py` 的 `--rtol` 默认 0.10，是随 MegaMoE 最初的提交 `97d0c6e4c`（2026-08-10）一起进来的，代码里没有写为什么选这个数；同类量在阶段一 TP 测试里用的是 0.005 和 0.01。实测的 run-to-run 波动 2% 到 3% 塞进 0.10 还剩三四倍余量，但拿 0.005 去量每次都会红。
 
-```python
-# flydsl/compiler/jit_function.py:572-578
-parts.append(_get_func_source(func))
-depSources = _collect_dependency_sources(func, rootFile, owner_cls=owner_cls)
-depSources.sort()
-parts.extend(depSources)
-```
+结论是：为 35 行完全相同的代码，去改一个自身可预测性存疑、且守护只剩一半的生产 kernel，风险与收益不成比例。拷贝的代价只是那 35 行有两份。
 
-所以搬家后目录名和 `.pkl` 文件名全都不一样。比对必须以哈希的多重集合为单位，两次运行之间要 `rm -rf ~/.flydsl/cache` 保证干净。
+### 6.4 顺带记录的两个技术事实
 
-**第二条，运行输出逐位相同。** 固定 seed 跑 `test_mega_moe_v2.py` 完整配置，前后输出张量用 `torch.equal` 比，不设容差。
+这两条是为守护做验证时查清的，本方案不再用到，但将来真要重构 `MegaMoEV2` 时有用。
 
-**第二条，运行输出逐位相同。** 固定 seed 跑 `test_mega_moe_v2.py` 完整配置，前后输出张量用 `torch.equal` 比，不设容差。
+**只能比 `_ir_text`，不能比 `_source_ir`。** 后者第一行是 `#loc = loc("/abs/path.py":502:0)`，把绝对路径和行号烤进了 MLIR，函数换文件必然变；`_ir_text` 从 `module attributes {gpu.container_module}` 开始，不含任何源码位置信息。
+
+**不能按 cache 目录名配对。** FlyDSL 的 cache key 包含 kernel 函数及其依赖的源码文本（`flydsl/compiler/jit_function.py` 的 `_jit_function_cache_key`），搬家后目录名全变，比对必须以哈希的多重集合为单位。
+
+按这两条写的指纹工具曾提交在 `2647b3223`，因失去调用方且存在两个已知缺陷（workload 只编译出一部分时会误报成功、读的是全机共享目录）而在后续提交中删除，需要时从历史里取。
 
 ---
 
