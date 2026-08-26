@@ -141,21 +141,22 @@ def _get_config_2d(params: _UAParams, backend: str):
     tuned = load_config_json(fpath)
 
     # build key
-    key = ""
+    suffix = ""
     if not params.all_decode:
-        key += "prefill"
+        prefix = "prefill"
     else:
-        key += "decode"
+        prefix = "decode"
     if params.head_size >= 512:
-        key += "_head_ge512"
+        suffix += "_head_ge512"
     elif params.head_size >= 256:
-        key += "_head_ge256"
+        suffix += "_head_ge256"
     if params.max_seqlen_q >= 256:
-        key += "_q_ge256"
+        suffix += "_q_ge256"
 
     # fallback
+    key = prefix + suffix
     if key not in tuned:
-        key = "any"
+        key = prefix + "_any"
     assert key in tuned, f"Could not find any valid {backend} config for {dev}"
 
     # tuned configs
