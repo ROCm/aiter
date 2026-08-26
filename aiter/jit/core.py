@@ -472,6 +472,15 @@ AITER_GRADLIB_DIR = f"{AITER_META_DIR}/gradlib"
 gfxs = get_gfx_list()
 AITER_ASM_DIR = f"{AITER_META_DIR}/hsa/"
 os.environ["AITER_ASM_DIR"] = AITER_ASM_DIR
+# Pre-compiled opus code objects (csrc/opus_gemm/gen_co/<arch>/<symbol>.co).
+# Resolved HERE, at import time, for the same reason AITER_ASM_DIR is: the
+# module also carries -DOPUS_GEN_CO_DIR, but that macro is baked when the module
+# is COMPILED, which for a prebuilt wheel is the build tree's aiter_meta/ (a
+# directory setup.py deletes when it is done). Only an import-time value knows
+# where the files ended up after install. The C++ loader prefers this env var
+# over the macro, so an explicit user override still wins.
+OPUS_GEN_CO_DIR = f"{AITER_CSRC_DIR}/opus_gemm/gen_co"
+os.environ.setdefault("OPUS_GEN_CO_DIR", OPUS_GEN_CO_DIR)
 
 CK_3RDPARTY_DIR = os.environ.get(
     "CK_DIR", f"{AITER_META_DIR}/3rdparty/composable_kernel"
@@ -936,7 +945,16 @@ def build_module(
             flags_hip += ["-mllvm -amdgpu-coerce-illegal-types=1"]
         if get_gfx() != "gfx942" and int(os.getenv("AITER_FP4x2", "1")) > 0:
             flags_hip += ["-D__Float4_e2m1fn_x2"]
-        if get_gfx() == "gfx1250" and hip_version >= Version("7.0.0"):
+        # Cluster launch is a HOST-side API question (hipDrvLaunchKernelEx +
+        # HIP_LAUNCH_CONFIG appear in ROCm 7.0), not a question about which GPU
+        # this machine has -- so the arch test must accept a cross-compile for
+        # gfx1250 the way the gfx1250 flags in optCompilerConfig.json already do.
+        # get_gfx() alone reads the LAST entry of a multi-arch GPU_ARCHS, which
+        # left "gfx1250;gfx942" building gfx1250 kernels whose cluster launch
+        # path was compiled out (AiterAsmKernelFast then rejects them at launch).
+        if (
+            get_gfx() == "gfx1250" or "gfx1250" in os.environ.get("GPU_ARCHS", "")
+        ) and hip_version >= Version("7.0.0"):
             flags_hip += ["-DAITER_ENABLE_CLUSTER_LAUNCH"]
 
         if not torch_exclude:
