@@ -278,10 +278,6 @@ def test_mla_decode_fwd(
     use_out_scale: bool,
     shuffled_kv_cache: bool,
 ):
-    torch.cuda.empty_cache()
-    num_query_heads, num_kv_heads = num_heads
-    qk_head_dim = kv_lora_rank + qk_rope_head_dim
-
     if DEVICE_ARCH not in (
         "gfx950",
         "gfx1250",
@@ -295,6 +291,12 @@ def test_mla_decode_fwd(
             pytest.skip(f"NVFP4 requires {DEVICE_ARCH}")
         if not shuffled_kv_cache:
             pytest.skip("NVFP4 requires shuffled KV cache")
+
+    torch.cuda.empty_cache()
+    random.seed(0)
+    torch.manual_seed(0)
+    num_query_heads, num_kv_heads = num_heads
+    qk_head_dim = kv_lora_rank + qk_rope_head_dim
 
     cu_seqlens_q = torch.zeros(batch_size + 1, dtype=torch.int, device="cuda")
     seq_lens_qo = torch.empty(batch_size, dtype=torch.int, device="cuda")
@@ -461,6 +463,9 @@ def test_mla_prefill_fwd(
     use_out_scale: bool,
 ):
     torch.cuda.empty_cache()
+    random.seed(0)
+    torch.manual_seed(0)
+
     num_query_heads, num_kv_heads = num_heads
     cu_seqlens_q = torch.zeros(batch_size + 1, dtype=torch.int, device="cuda")
     seq_lens_qo = torch.empty(batch_size, dtype=torch.int, device="cuda")

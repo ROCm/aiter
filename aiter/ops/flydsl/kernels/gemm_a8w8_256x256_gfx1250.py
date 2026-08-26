@@ -276,6 +276,7 @@ def launch_gemm_a8w8_256x256(
                     0,
                     True,
                 )
+            inner_bound = mn_oob if const_expr(owner == 2 and not mx32) else None
             desc = tdm_ops.make_tensor_descriptor_2d(
                 global_ptr=tensor,
                 lds_memref=_view(
@@ -292,6 +293,7 @@ def launch_gemm_a8w8_256x256(
                 workgroup_mask=mask,
                 early_timeout=early,
                 oob_outer_bound=bound,
+                oob_inner_bound=inner_bound,
             )
             step = shape[1]
             if const_expr(not mx32):
