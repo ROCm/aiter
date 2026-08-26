@@ -1,4 +1,4 @@
-# TPMoEStage1 阶段二设计：kernel 内 P2P all-gather（`transport="fused_p2p"`）
+# TPMoEStage1 阶段二设计：kernel 内 P2P all-gather
 
 日期：2026-08-26
 分支：`dev/all_gather_merge_stage1`
@@ -110,6 +110,20 @@ FlyDSL JIT cache 的 pkl 反序列化后是 `flydsl.compiler.jit_executor.Compil
 | 融合部分 | 0.3530 | ~0.377（含推送 6.6 MB 约 24 µs） |
 | 合计 | 0.5365 | ~0.443 |
 
+### 3.5 NCCL 实现搬出生产模块
+
+`TPMoEStage1` 只保留融合这一条实现，阶段一那条 NCCL 路径整个搬到 `op_tests/multigpu_tests/tp_moe_stage1_nccl_ref.py`，类名 `TPMoEStage1NCCLRef`。
+
+**理由。** 这条路径的唯一用途是给融合实现当对拍参照，用完就删，两边不需要同步演进。留在生产模块里会逼出一层用不上的抽象，也让 `TPMoEStage1` 背着一条永远不会上线的分支。放进 `op_tests` 之后，它的位置本身就说明了它是一次性的，将来删除时不会有人误以为在删公开 API。
+
+**代码重复是可接受的。** `_validate_call`、`_sort`、`_run_gemm1`、`_pack` 这几个方法会有两份，但它们不需要同步修改。唯一共享的是 `TPMoEStage1Output`，参照实现从生产模块 import 它而不是复制，因为这个 dataclass 正是两边都要满足的输出契约，复制会让契约有两个定义。
+
+**`transport` 构造参数删除。** 一个类只剩一条实现，这个参数就没有取值可选了。今天刚做的 `nccl_allgather` / `fused_p2p` 改名（提交 `05e6e656a`）随之作废，那次改动成本很低，留在历史里无害。
+
+**实施顺序。** 先把 NCCL 实现复制进 `op_tests` 并让阶段一的全部用例改跑参照实现，确认绿；再在 `TPMoEStage1` 里长出融合路径；最后删掉生产模块里的 NCCL 路径与 `transport` 参数。中间会有一段两份代码并存的窗口，这是有意的，为的是任何一步出问题都能立刻对比。
+
+**`aiter/ops/flydsl/kernels/mega_moe/__init__.py` 不变**，仍然导出 `TPMoEStage1` 与 `TPMoEStage1Output` 两个名字。
+
 ---
 
 ## 4. 内存布局与构造前提
@@ -135,12 +149,16 @@ FlyDSL JIT cache 的 pkl 反序列化后是 `flydsl.compiler.jit_executor.Compil
 
 ### 输出每次调用新分配
 
-GEMM1 输出 `payload` 与 `osd` 是普通 torch 张量，不需 peer 可见，保持阶段一决定 11 的做法。这样两个 transport 的实例能在同一进程跑同一份输入而结果互不覆盖。
+GEMM1 输出 `payload` 与 `osd` 是普通 torch 张量，不需 peer 可见，保持阶段一决定 11 的做法。这样融合实现与 NCCL 参照实现能在同一进程跑同一份输入而结果互不覆盖。
 
-### 构造前提（仅 `fused_p2p`，`nccl_allgather` 不受影响）
+### 构造前提
+
+`TPMoEStage1` 只有融合这一条实现（见第 3.5 节），所以下面两条是无条件的，不再按 transport 分情况：
 
 1. 调用方必须已执行 `shmem_torch_process_group_init`。Mori 无查询接口，检查办法是调 `ms.shmem_npes()`，捕获异常并核对返回值等于 `tp_size`。这同时能抓到 shmem 通信域与 TP group 不一致的错误。
 2. 必须给出 `max_tok_per_rank`，运行时 `m_local > max_tok_per_rank` 报错。
+
+这一点修正了设计过程中的一个较早决定。当时问的是「新前提可否只限 `fused_p2p`」，答的是「可以，但只限 `fused_p2p`」。既然 NCCL 实现整个搬出 `aiter` 包，类里就没有另一条路径可以豁免了，前提自然变成无条件。搬出去的参照实现不受这两条约束，它照旧任意 `m_local`、零 Mori 依赖。
 
 ---
 
@@ -231,17 +249,17 @@ MegaMoE 的 `ATileLoader.for_tile(tile_row_base)` 假设 tile 的 32 行内存�
 | `case_fused_construct` | shmem 未初始化报错、`m_local > MTPR` 报错、`shmem_npes() != tp_size` 报错 | 不适用（校验类） |
 | `case_fused_gather` | 推送后 `rx_x`/`rx_scale` 与 `all_gather(quantize(x))` **逐位相同** | 目标行号写成 `t * tp_size + rank`（行主序），必须失败 |
 | `case_fused_numerics` | 对 `tp_moe_stage1_ref.py` 比 rel_l2 | gate/up 调换 0.75、scale 广播 bug 0.37、TP 分片窗口错位 1.33 |
-| `case_fused_vs_nccl` | 两个 transport 同输入比结果，**设容差** | 见下 |
+| `case_fused_vs_ref` | `TPMoEStage1` 与 `TPMoEStage1NCCLRef` 同输入比结果，**设容差** | 见下 |
 | `case_fused_repeat` | 连续调用十次，每次都要正确 | 去掉 epoch 翻转，必须失败 |
 | `case_fused_skew` | rank 0 调用前 sleep，验证握手与双缓冲 | 关掉 `launch_ready`，必须失败 |
 
-**`case_fused_vs_nccl` 为何不能要求逐位相同：** 两条路径用不同的 GEMM1 实现（`mixed_moe_gemm_2stage_common` 对 `mega_moe/gemm1.py`），累加顺序不同。逐位相同的要求只放在 `case_fused_gather`，那里是纯拷贝，且 2.2 已证明量化顺序不影响结果。
+**`case_fused_vs_ref` 为何不能要求逐位相同：** 两条路径用不同的 GEMM1 实现（`mixed_moe_gemm_2stage_common` 对 `mega_moe/gemm1.py`），累加顺序不同。逐位相同的要求只放在 `case_fused_gather`，那里是纯拷贝，且 2.2 已证明量化顺序不影响结果。
 
 ---
 
 ## 8. 性能验收
 
-`bench_tp_moe_stage1.py` 增加 `fused_p2p` 模式，测 m_local 64、128、256 三档。基线只测到 128，256 那档要先补 `nccl_allgather` 的数。
+`bench_tp_moe_stage1.py` 同时跑 `TPMoEStage1` 与 `TPMoEStage1NCCLRef`，测 m_local 64、128、256 三档。基线只测到 128，256 那档要先补参照实现的数。
 
 **验收线：m_local=128 时总时间从 0.5365 ms 降到 0.48 ms 以内（至少快 10%）。** 达不到说明融合 kernel 自身的协议开销吃掉了收益，需要重新评估是否还值得走向方案 A。
 
