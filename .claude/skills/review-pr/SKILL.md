@@ -42,11 +42,21 @@ esac
 
 # Full metadata
 gh pr view "$PR" --repo "$REPO" \
-  --json title,body,number,labels,files,author,reviews,comments,baseRefOid,headRefOid \
+  --json title,body,number,labels,files,author,reviews,comments,baseRefName,headRefOid \
   > "$WORK/pr_meta.json"
 
 # Diff
 gh pr diff "$PR" --repo "$REPO" > "$WORK/pr.diff"
+
+# Current base branch tip. PR metadata's base OID can remain the historical merge base after
+# main advances, so it is not sufficient for stale merge-simulation detection.
+BASE_REF=$(python3 -c \
+  'import json,sys; print(json.load(open(sys.argv[1]))["baseRefName"])' \
+  "$WORK/pr_meta.json")
+BASE_REF_PATH=$(python3 -c \
+  'import sys,urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' \
+  "$BASE_REF")
+gh api "repos/$REPO/branches/$BASE_REF_PATH" --jq .commit.sha > "$WORK/base_head.txt"
 
 # Linked issue (extract from body "fix: #NNN" or "close #NNN")
 ISSUE=$(cat "$WORK/pr_meta.json" | python3 -c "
@@ -95,14 +105,16 @@ cat "$SCALE"
 # Validation is opt-in and explicit. Never auto-load ./validation_report.json: a stale report
 # from another PR is worse than no report. Reject reports that do not name this exact head.
 if [ -n "$VALIDATION_REPORT" ]; then
-  python3 - "$WORK/pr_meta.json" "$WORK/pr.diff" \
+  python3 - "$WORK/pr_meta.json" "$WORK/base_head.txt" "$WORK/pr.diff" \
     "$VALIDATION_REPORT" "$WORK/validation_report.json" <<'PY'
 import hashlib
 import json
 import pathlib
 import sys
 
-meta_path, diff_path, report_path, out_path = map(pathlib.Path, sys.argv[1:])
+meta_path, base_path, diff_path, report_path, out_path = map(
+    pathlib.Path, sys.argv[1:]
+)
 meta = json.loads(meta_path.read_text())
 report = json.loads(report_path.read_text())
 expected_head = meta["headRefOid"]
@@ -112,7 +124,7 @@ if actual_head != expected_head:
         "validation report is stale or for another checkout: "
         f"expected head {expected_head}, got {actual_head}"
     )
-expected_base = meta["baseRefOid"]
+expected_base = base_path.read_text().strip()
 actual_base = report.get("repo", {}).get("base")
 if actual_base != expected_base:
     raise SystemExit(
