@@ -804,13 +804,11 @@ def compile_preshuffle_gemm(
             )
             frag_C_out.store(out_vec)
 
-        if const_expr(split_k == 1):
-            fx.copy(buf_copy_out, frag_C_retile, pC_g)
-        else:
-            fx.copy(buf_copy_out, frag_C_retile, pC_g)
-            # Publish this CTA's fp32 partial; only the last split to arrive at
-            # the tile reduces and converts it.
-            # The stores carry sc0|sc1, so waiting on them is the whole release.
+        fx.copy(buf_copy_out, frag_C_retile, pC_g)
+        if const_expr(split_k > 1):
+            # That store published this CTA's fp32 partial; only the last split
+            # to arrive at the tile reduces and converts it. The store carries
+            # sc0|sc1, so waiting on it is the whole release.
             rocdl.s_waitcnt(0)
             gpu.barrier()
 
