@@ -29,6 +29,7 @@ Run from the aiter repo root so `op_tests/` siblings import cleanly:
     python op_tests/bench_gfx1250_combo.py --dsv4 --ops a8w8_blockscale  # DSv4 FP8 linears
     python op_tests/bench_gfx1250_combo.py --dsv4 --ops a16w16    # DSv4 BF16 linears
     python op_tests/bench_gfx1250_combo.py --dsv4 --ops mla_v4_decode   # sparse MLA v4 decode
+    python op_tests/bench_gfx1250_combo.py --dsv4 --ops inverse_rope  # inverse RoPE + group quant
     python op_tests/bench_gfx1250_combo.py --dsv4 --ops mla_v4_prefill  # MLA v4 prefill
     python op_tests/bench_gfx1250_combo.py --dsv4 --ops mla_v4_prefill_fp8  # FP8 MLA v4 prefill
     python op_tests/bench_gfx1250_combo.py --dsv4 --ops mhc       # mHC fused RMSNorm
@@ -84,6 +85,12 @@ dense/sparse CSR modes. The current 16K-token chunk remains uncompressed:
 The separate ``mla_v4_prefill_fp8`` op runs:
 
     PYTHONPATH=. python3 op_tests/test_pa_sparse_prefill.py
+
+The ``inverse_rope`` op runs the tp1 attention-output shape (-b is
+(n_local_heads, n_local_groups); 128,16 is V4-Pro at dp/tp1):
+
+    python3 op_tests/test_inverse_rope_group_quant.py \
+      -b 128,16 -s <token sweep> -l n32k4 --group-size 32
 
 The ``a8w8_blockscale`` op runs:
 
@@ -311,6 +318,7 @@ _MOE_KEEP = [
     "total us",
     "total TFLOPS",
     "total TB/s",
+    "kernel",
 ]
 # Fixed kernel-bench config (mirrors test_flydsl_grouped_gemm_gfx1250.py --scenario kernel).
 _MOE_DATA_FORMATS = ["a4w4", "a8w4"]
@@ -619,10 +627,66 @@ def _table_row(*headers):
     return keep
 
 
+def _gpu_trace_rows(lines):
+    """(kernel, calls, device_us) for every GPU row in a profiler fragment.
+
+    Rows look like '<idx> <kernel> <cnt> <host_us> <device_us> <avg_us> CUDA <id>';
+    the kernel name carries spaces, the trailing column count does not. host_us
+    is 0 on GPU rows, so the time to report is device_us.
+    """
+    for line in lines:
+        fields = line.rsplit(maxsplit=6)
+        if len(fields) != 7 or fields[-2] != "CUDA":
+            continue
+        _, cnt, _host, device_us, _avg, _, _ = fields
+        if not (_isnum(cnt) and _isnum(device_us)):
+            continue
+        head = fields[0].split(None, 1)
+        name = head[1].strip() if len(head) == 2 and head[0].isdigit() else fields[0]
+        if name:
+            yield name, float(cnt.replace(",", "")), float(device_us.replace(",", ""))
+
+
+def _kernel_names(lines):
+    """Distinct GPU kernel names in the order they first appear."""
+    names = []
+    for name, _, _ in _gpu_trace_rows(lines):
+        if name not in names:
+            names.append(name)
+    return names
+
+
+def _kernel_digest(lines):
+    """Which GPU kernels actually ran, from the trace fragments in the output.
+
+    A table of microseconds does not say which code path produced them, so a
+    silent fallback (or a shape that quietly picked another kernel) reads as a
+    normal result. The profiler fragments name every kernel that reached the
+    GPU -- roll them up so each op states what it actually ran.
+    """
+    total, calls = {}, {}
+    for name, n, us in _gpu_trace_rows(lines):
+        total[name] = total.get(name, 0.0) + us
+        calls[name] = calls.get(name, 0.0) + n
+    if not total:
+        return []
+    ranked = sorted(total, key=total.get, reverse=True)
+    table = pd.DataFrame(
+        [
+            {"kernel": k, "calls": round(calls[k]), "device us": round(total[k], 1)}
+            for k in ranked
+        ]
+    )
+    return ["", "----- kernels on GPU -----"] + table.to_markdown(
+        index=False
+    ).splitlines()
+
+
 _DEFAULT_EXTRACT = _md_tables()
 
 
-def _run_child(name, cmd, cwd, env=None, extract=None, timeout=None, tail=30):
+def _run_child(name, cmd, cwd, env=None, extract=None, timeout=None, tail=30,
+               kernels=True):
     """Run a child UT with its output captured and surface only its results.
 
     Child UTs print their own progress, aiter INFO lines and (with FlyDSL) a
@@ -644,6 +708,8 @@ def _run_child(name, cmd, cwd, env=None, extract=None, timeout=None, tail=30):
         raise
     lines = proc.stdout.splitlines()
     rows = extract(lines)
+    if kernels:
+        rows = list(rows) + _kernel_digest(lines)
     print(f"\n===== {name} =====", flush=True)
     print("\n".join(rows) if rows else "(no result rows recognised)", flush=True)
     if proc.returncode != 0 or not rows:
@@ -680,7 +746,7 @@ def run_moe(args):
     rows = []
     data_formats = ["a8w4"] if args.suite == "dsv4" else _MOE_DATA_FORMATS
     for tokens, fmt in itertools.product(cfg["tokens"], data_formats):
-        with _silence():
+        with _capture() as box:
             moe_mod.set_data_format(fmt)
             metrics = moe_mod.run_moe(
                 fmt,
@@ -740,6 +806,7 @@ def run_moe(args):
                 "total us": round(total_us, 2) if total_us else None,
                 "total TFLOPS": _tflops(flop1 + flop2, total_us),
                 "total TB/s": bwt,
+                "kernel": " + ".join(_kernel_names(box[0].splitlines())) or None,
             }
         )
     _print_table("flydsl_grouped_gemm (kernel, silu)", rows, keep=_MOE_KEEP)
@@ -837,8 +904,9 @@ def run_a16w16(_args):
     for M, n in itertools.product(_TOKENS, (64, 384, 1024, 2048, 32320, 129280)):
         with _capture() as box:
             err = a16w16_mod.test_a16w16(batch=batch, M=M, N=n, K=K)
+        captured = box[0].splitlines()
         row = {"batch": batch, "M": M, "N": n, "K": K, "err": err}
-        for line in box[0].splitlines():
+        for line in captured:
             if not line.startswith("[a16w16]"):
                 continue
             fields = [f.strip() for f in line.split("|")]
@@ -847,11 +915,14 @@ def run_a16w16(_args):
             row["us"] = float(us[:-2]) if us else None
             row["TFLOPS"] = float(tflops[:-7]) if tflops else None
             break
+        # Which kernel served this shape: a16w16 switches between a splitk pair
+        # and a 4wave_wl_co variant, and the timing alone does not say which.
+        row["kernel"] = " + ".join(_kernel_names(captured)) or None
         rows.append(row)
     _print_table(
         "gemm_a16w16_opus (DSv4)",
         rows,
-        keep=["batch", "M", "N", "K", "us", "TFLOPS", "err"],
+        keep=["batch", "M", "N", "K", "us", "TFLOPS", "kernel", "err"],
     )
 
 
@@ -896,6 +967,7 @@ def run_mega_moe(_args):
             cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
             env={**env, "AITER_FORCE_A8W4": force_a8w4},
             extract=_md_kernel_table,
+                kernels=False,
         )
 
 
@@ -1156,7 +1228,7 @@ def run_mla_v4_decode(args):
     )
     shapes = args.mla_v4_kargpreld_shapes or default_shapes
     rows = []
-    with _silence():
+    with _capture() as box:
         for gqa, batch, ctx, split_kv in shapes:
             row = {
                 "gqa_ratio": gqa,
@@ -1187,6 +1259,30 @@ def run_mla_v4_decode(args):
         "mla_v4 decode (bf16, asm vs triton)",
         rows,
         keep=_MLA_V4_COMPARE_KEEP,
+    )
+    print("\n".join(_kernel_digest(box[0].splitlines())), flush=True)
+
+
+def run_inverse_rope(_args):
+    """Run DSv4 inverse RoPE + group quant at the tp1 attention-output shape."""
+    # -b is (n_local_heads, n_local_groups); 128,16 is V4-Pro at dp/tp1. The UT
+    # defaults to the two smallest configs instead, which never reach the shape
+    # the model runs, so name it explicitly.
+    _run_child(
+        "inverse_rope_group_quant (DSv4, tp1)",
+        [
+            sys.executable,
+            "op_tests/test_inverse_rope_group_quant.py",
+            "-b",
+            "128,16",
+            "-s",
+            *[str(t) for t in _TOKENS],
+            "-l",
+            "n32k4",
+            "--group-size",
+            "32",
+        ],
+        cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
     )
 
 
@@ -1246,6 +1342,7 @@ OPS = {
     "a8w8_blockscale": run_a8w8_blockscale,
     "a16w16": run_a16w16,
     "mla_v4_decode": run_mla_v4_decode,
+    "inverse_rope": run_inverse_rope,
     "mla_v4_prefill": run_mla_v4_prefill,
     "mla_v4_prefill_fp8": run_mla_v4_prefill_fp8,
     "mhc": run_mhc,
@@ -1275,6 +1372,7 @@ DSV4_OPS = [
     # "a8w8_blockscale",
     "a16w16",
     "mla_v4_decode",
+    "inverse_rope",
     "mla_v4_prefill",
     "mla_v4_prefill_fp8",
     "mhc",
