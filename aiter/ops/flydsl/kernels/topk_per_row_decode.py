@@ -21,8 +21,11 @@ from flydsl.expr import (
 from flydsl.expr.typing import T
 
 
-_RADIX_PASSES_4 = ((24, 8), (16, 8), (8, 8), (0, 8))
-_RADIX_PASSES_3 = ((21, 11), (10, 11), (0, 10))
+_RADIX_BITS = 11
+# ceil(32 / 11) gives three passes; the launcher derives 11/11/10 bits
+# and right shifts 21/10/0 directly from this single radix-width constant.
+_NUM_RADIX_PASSES = (32 + _RADIX_BITS - 1) // _RADIX_BITS
+_FINAL_RADIX_BITS = 32 - (_NUM_RADIX_PASSES - 1) * _RADIX_BITS
 _VEC = 4
 _STABLE_WIDE_VEC = 8
 _STABLE_WIDE_VEC_MIN_STEPS = 8
@@ -33,12 +36,10 @@ _DPP_ROW_SHR_8 = 0x118
 _DPP_ROW_MASK = 0xF
 _DPP_BANK_MASK = 0xF
 
-_DEFAULT_BLOCK_THREADS = 256
-_WIDE_BLOCK_THREADS = 1024
-_DEFAULT_REDUCE_THREADS = 256
+_BLOCK_THREADS = 1024
+_REDUCE_THREADS = 256
 _FUSED_PREFIX_THREADS = 1024
-_DEFAULT_CHUNKS_PER_ROW = 48
-_WIDE_CHUNKS_PER_ROW = 16
+_CHUNKS_PER_ROW = 16
 _WAVE_SIZE = 64
 _FUSED_PREFIX_NUM_WAVES = _FUSED_PREFIX_THREADS // _WAVE_SIZE
 _STATE_PREFIX = 0
@@ -53,24 +54,9 @@ _STABLE_COUNT_MASK = (1 << _STABLE_ABOVE_SHIFT) - 1
 _STABLE_PACKED_COUNT_LIMIT = 1 << 15
 
 
-def should_use_three_pass_radix(n: int, rows: int, stable: bool) -> bool:
-    """gfx950 gate for the three-pass, 1024-thread data geometry."""
-    # The 1024-thread/16-chunk geometry wins across the measured 2K–1M width
-    # range for unordered output and for stable rows <= 32. Large stable batches
-    # keep a width gate because their ordered-write path loses at very small N.
-    if not stable:
-        return True
-    return rows <= 32 or n >= (6 << 16)
-
-
-def topk_per_row_decode_workspace_shapes(
-    rows: int, stable: bool, use_three_pass: bool = False
-):
-    radix_passes = _RADIX_PASSES_3 if use_three_pass else _RADIX_PASSES_4
-    max_radix_bits = max(radix_bits for _, radix_bits in radix_passes)
-    chunks_per_row = _WIDE_CHUNKS_PER_ROW if use_three_pass else _DEFAULT_CHUNKS_PER_ROW
-    hist_bins = (1 << max_radix_bits) + 2 * int(stable)
-    return (rows, chunks_per_row, hist_bins), (rows, _STATE_SIZE)
+def topk_per_row_decode_workspace_shapes(rows: int, stable: bool):
+    hist_bins = (1 << _RADIX_BITS) + 2 * int(stable)
+    return (rows, _CHUNKS_PER_ROW, hist_bins), (rows, _STATE_SIZE)
 
 
 def _uint32_to_int32(x: int) -> int:
@@ -132,25 +118,20 @@ def build_topk_per_row_decode_module(
     next_n: int,
     k: int,
     stable: bool,
-    use_three_pass: bool = False,
 ):
-    radix_passes = _RADIX_PASSES_3 if use_three_pass else _RADIX_PASSES_4
-    max_radix_bits = max(radix_bits for _, radix_bits in radix_passes)
+    max_radix_bits = _RADIX_BITS
     max_n_hist_bins = 1 << max_radix_bits
-    final_radix_mask = (1 << radix_passes[-1][1]) - 1
-    final_n_hist_bins = 1 << radix_passes[-1][1]
+    final_radix_mask = (1 << _FINAL_RADIX_BITS) - 1
+    final_n_hist_bins = 1 << _FINAL_RADIX_BITS
     stable_above_bin = max_n_hist_bins
     stable_equal_bin = stable_above_bin + 1
-    # Wide radix uses a wave-rich block and fewer chunks: at rows 26–32 this
-    # keeps 416–512 blocks in flight while cutting partial-histogram traffic.
-    # Reduce stays at 256 threads for vectorized bin loads; four-pass radix keeps
-    # the lower-contention 256-thread/48-chunk data geometry.
-    wide_geometry = use_three_pass
-    block_threads = _WIDE_BLOCK_THREADS if wide_geometry else _DEFAULT_BLOCK_THREADS
-    reduce_threads = _DEFAULT_REDUCE_THREADS
+    # The data kernels use wave-rich blocks and fewer chunks while the reduction
+    # stays at 256 threads to retain vectorized partial-histogram loads.
+    block_threads = _BLOCK_THREADS
+    reduce_threads = _REDUCE_THREADS
     block_num_waves = block_threads // _WAVE_SIZE
     reduce_num_waves = reduce_threads // _WAVE_SIZE
-    chunks_per_row = _WIDE_CHUNKS_PER_ROW if wide_geometry else _DEFAULT_CHUNKS_PER_ROW
+    chunks_per_row = _CHUNKS_PER_ROW
     total_vecs = n // _VEC
     vecs_per_grid_step = chunks_per_row * block_threads
     vec_steps = (total_vecs + vecs_per_grid_step - 1) // vecs_per_grid_step
@@ -470,24 +451,16 @@ def build_topk_per_row_decode_module(
             # Wide radix assigns each thread one contiguous 4/8-bin group. Read that
             # group as dwordx4 vectors per chunk, then reverse the lanes to retain the
             # descending-bin order expected by the block prefix scan.
-            if const_expr(bins_per_thread >= _VEC):
-                group_low = select_bin - fx.Int32(bins_per_thread - 1)
-                for chunk in range_constexpr(chunks_per_row):
-                    for vec_item in range_constexpr(bins_per_thread // _VEC):
-                        values = load_hist_vec(
-                            fx.Int32(chunk),
-                            (group_low // fx.Int32(_VEC)) + fx.Int32(vec_item),
-                        )
-                        for vi in range_constexpr(_VEC):
-                            bin_item = bins_per_thread - 1 - (vec_item * _VEC + vi)
-                            bin_counts[bin_item] = bin_counts[bin_item] + values[vi]
-            else:
-                for bin_item in range_constexpr(bins_per_thread):
-                    hist_bin = select_bin - fx.Int32(bin_item)
-                    bin_count = fx.Int32(0)
-                    for chunk in range_constexpr(chunks_per_row):
-                        bin_count = bin_count + partial_hist[row, chunk, hist_bin]
-                    bin_counts[bin_item] = bin_count
+            group_low = select_bin - fx.Int32(bins_per_thread - 1)
+            for chunk in range_constexpr(chunks_per_row):
+                for vec_item in range_constexpr(bins_per_thread // _VEC):
+                    values = load_hist_vec(
+                        fx.Int32(chunk),
+                        (group_low // fx.Int32(_VEC)) + fx.Int32(vec_item),
+                    )
+                    for vi in range_constexpr(_VEC):
+                        bin_item = bins_per_thread - 1 - (vec_item * _VEC + vi)
+                        bin_counts[bin_item] = bin_counts[bin_item] + values[vi]
             for bin_item in range_constexpr(bins_per_thread):
                 count = count + bin_counts[bin_item]
 
@@ -1038,13 +1011,15 @@ def build_topk_per_row_decode_module(
         rows_m: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
-        for pass_idx in range_constexpr(len(radix_passes)):
-            shift, radix_bits = radix_passes[pass_idx]
+        for pass_idx in range_constexpr(_NUM_RADIX_PASSES):
+            remaining_bits = 32 - pass_idx * _RADIX_BITS
+            radix_bits = min(_RADIX_BITS, remaining_bits)
+            shift = remaining_bits - radix_bits
             radix_mask = (1 << radix_bits) - 1
             xor_val = 1 << (radix_bits - 1) if pass_idx == 0 else 0
             num_bins = 1 << radix_bits
-            previous_shift = 0 if pass_idx == 0 else radix_passes[pass_idx - 1][0]
-            previous_radix_bits = 0 if pass_idx == 0 else radix_passes[pass_idx - 1][1]
+            previous_shift = 0 if pass_idx == 0 else shift + radix_bits
+            previous_radix_bits = 0 if pass_idx == 0 else _RADIX_BITS
             previous_mask = 0 if pass_idx == 0 else (1 << previous_radix_bits) - 1
             previous_xor = 1 << (previous_radix_bits - 1) if pass_idx == 1 else 0
             previous_num_bins = 0 if pass_idx == 0 else 1 << previous_radix_bits

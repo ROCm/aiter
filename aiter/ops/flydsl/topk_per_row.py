@@ -7,12 +7,9 @@ import functools
 
 import torch
 
-from aiter.jit.utils.chip_info import get_gfx
-
 from .kernels.tensor_shim import _run_compiled
 from .kernels.topk_per_row_decode import (
     build_topk_per_row_decode_module,
-    should_use_three_pass_radix,
     topk_per_row_decode_workspace_shapes,
 )
 
@@ -23,9 +20,8 @@ def _get_topk_launcher(
     next_n: int,
     k: int,
     stable: bool,
-    use_three_pass: bool,
 ):
-    return build_topk_per_row_decode_module(n, next_n, k, stable, use_three_pass)
+    return build_topk_per_row_decode_module(n, next_n, k, stable)
 
 
 def _is_stream_capturing() -> bool:
@@ -176,12 +172,7 @@ def flydsl_top_k_per_row_decode(
     )
 
     rows, n = logits.shape
-    use_three_pass = get_gfx() == "gfx950" and should_use_three_pass_radix(
-        n, rows, stable
-    )
-    hist_shape, state_shape = topk_per_row_decode_workspace_shapes(
-        rows, stable, use_three_pass
-    )
+    hist_shape, state_shape = topk_per_row_decode_workspace_shapes(rows, stable)
     partial_hist, state = _get_topk_workspace(
         logits.device,
         hist_shape,
@@ -193,7 +184,6 @@ def flydsl_top_k_per_row_decode(
         next_n,
         k,
         stable,
-        use_three_pass,
     )
     _run_compiled(
         launcher,
