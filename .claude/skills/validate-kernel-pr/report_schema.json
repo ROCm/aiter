@@ -11,10 +11,12 @@
     "arch_coverage",
     "degraded_mode",
     "repo",
+    "runtime_identity",
     "test_selection",
     "stages",
     "findings",
-    "verdict"
+    "verdict",
+    "process_exit_code"
   ],
   "additionalProperties": true,
   "definitions": {
@@ -33,6 +35,18 @@
         }
       },
       "additionalProperties": true
+    },
+    "pytest_stats": {
+      "type": "object",
+      "required": ["tests", "failures", "errors", "skipped", "executed"],
+      "properties": {
+        "tests": { "type": "integer", "minimum": 0 },
+        "failures": { "type": "integer", "minimum": 0 },
+        "errors": { "type": "integer", "minimum": 0 },
+        "skipped": { "type": "integer", "minimum": 0 },
+        "executed": { "type": "integer", "minimum": 0 },
+        "junit_xml": { "type": "string" }
+      }
     }
   },
   "properties": {
@@ -84,9 +98,35 @@
       }
     },
 
+    "runtime_identity": {
+      "type": ["object", "null"],
+      "description": "Interpreter, package and loaded native-library identity used by the runtime probe. Null when compatibility was not established; trusted source-to-binary provenance is not yet implemented.",
+      "properties": {
+        "module": { "type": "string" },
+        "module_path": { "type": "string" },
+        "module_version": { "type": ["string", "null"] },
+        "expected_root": { "type": "string" },
+        "python_executable": { "type": "string" },
+        "python_version": { "type": "string" },
+        "source_sha": { "type": ["string", "null"] },
+        "native_artifacts": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["path", "size", "sha256"],
+            "properties": {
+              "path": { "type": "string" },
+              "size": { "type": "integer" },
+              "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+            }
+          }
+        }
+      }
+    },
+
     "test_selection": {
       "type": "object",
-      "required": ["pytest_target", "shape_env", "grid"],
+      "required": ["pytest_target", "shape_env", "grid", "expected_route", "shape_vars"],
       "properties": {
         "pytest_target": {
           "type": "string",
@@ -100,6 +140,14 @@
         "grid": {
           "type": "string",
           "description": "Independent shape grid supplied by the caller, or an empty string."
+        },
+        "expected_route": {
+          "type": "string",
+          "description": "Kernel or dispatch route that the execution receipt must prove."
+        },
+        "shape_vars": {
+          "type": "string",
+          "description": "Comma-separated local variable names captured from each observed route call."
         }
       }
     },
@@ -115,6 +163,7 @@
         "baseline_control",
         "correctness_repo_tests",
         "correctness_s1_grid",
+        "execution_receipt",
         "index_width_scan"
       ],
       "additionalProperties": {
@@ -163,12 +212,30 @@
         },
         "correctness_repo_tests": {
           "allOf": [{ "$ref": "#/definitions/stage" }],
-          "description": "The suite the PR itself ships."
+          "description": "The suite the PR itself ships, including JUnit collected/executed/skipped counts.",
+          "properties": {
+            "stats": { "$ref": "#/definitions/pytest_stats" }
+          }
         },
         "correctness_s1_grid": {
           "allOf": [{ "$ref": "#/definitions/stage" }],
           "description": "A shape grid this skill owns, independent of what the PR chose to test: non-toy, boundary/odd, long-context. 'skip' with repo-default-only when the kernel exposes no shape override.",
-          "properties": { "grid": { "type": "string" } }
+          "properties": {
+            "grid": { "type": "string" },
+            "stats": { "$ref": "#/definitions/pytest_stats" }
+          }
+        },
+        "execution_receipt": {
+          "allOf": [{ "$ref": "#/definitions/stage" }],
+          "description": "Machine-readable proof from the selected test naming the observed route, kernel symbols and every executed grid shape.",
+          "properties": {
+            "route": { "type": "string" },
+            "producer": { "type": "string" },
+            "kernel_symbols": { "type": "array", "items": { "type": "string" } },
+            "required_shapes": { "type": "array", "items": { "type": "string" } },
+            "executed_shapes": { "type": "array", "items": { "type": "string" } },
+            "receipt_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+          }
         },
         "index_width_scan": {
           "allOf": [{ "$ref": "#/definitions/stage" }],
@@ -210,6 +277,123 @@
       "type": "string",
       "enum": ["PASS", "NEEDS_WORK", "BLOCK", "INCONCLUSIVE"],
       "description": "BLOCK is a reproducible candidate defect; INCONCLUSIVE means required evidence did not run. PASS is possible only when every required validation stage completed."
+    },
+    "process_exit_code": { "type": "integer", "enum": [0, 1, 2] }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "verdict": { "const": "PASS" }
+        }
+      },
+      "then": {
+        "properties": {
+          "process_exit_code": { "const": 0 },
+          "runtime_identity": {
+            "type": "object",
+            "required": [
+              "module",
+              "module_path",
+              "python_executable",
+              "python_version",
+              "native_artifacts"
+            ]
+          },
+          "test_selection": {
+            "properties": {
+              "expected_route": { "minLength": 1 },
+              "shape_vars": { "minLength": 1 }
+            }
+          },
+          "stages": {
+            "properties": {
+              "merge_sim": {
+                "properties": { "status": { "const": "pass" } }
+              },
+              "gpu_claim": {
+                "required": ["status", "hip_index", "arch", "bdf"],
+                "properties": { "status": { "const": "pass" } }
+              },
+              "runtime_compat": {
+                "properties": { "status": { "const": "pass" } }
+              },
+              "test_policy": {
+                "properties": { "status": { "const": "pass" } }
+              },
+              "baseline_control": {
+                "properties": { "status": { "const": "pass" } }
+              },
+              "correctness_repo_tests": {
+                "required": ["status", "exit", "stats"],
+                "properties": {
+                  "status": { "const": "pass" },
+                  "exit": { "const": 0 },
+                  "stats": {
+                    "type": "object",
+                    "required": ["tests", "failures", "errors", "skipped", "executed"],
+                    "properties": {
+                      "failures": { "const": 0 },
+                      "errors": { "const": 0 },
+                      "executed": { "type": "integer", "minimum": 1 }
+                    }
+                  }
+                }
+              },
+              "correctness_s1_grid": {
+                "required": ["status", "exit", "stats"],
+                "properties": {
+                  "status": { "const": "pass" },
+                  "exit": { "const": 0 },
+                  "stats": {
+                    "type": "object",
+                    "required": ["tests", "failures", "errors", "skipped", "executed"],
+                    "properties": {
+                      "failures": { "const": 0 },
+                      "errors": { "const": 0 },
+                      "executed": { "type": "integer", "minimum": 1 }
+                    }
+                  }
+                }
+              },
+              "execution_receipt": {
+                "required": [
+                  "status",
+                  "producer",
+                  "route",
+                  "kernel_symbols",
+                  "required_shapes",
+                  "executed_shapes",
+                  "receipt_sha256"
+                ],
+                "properties": {
+                  "status": { "const": "pass" },
+                  "producer": { "const": "validate-kernel-pr.validation_probe" },
+                  "route": { "type": "string", "minLength": 1 },
+                  "kernel_symbols": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": { "type": "string", "minLength": 1 }
+                  },
+                  "required_shapes": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": { "type": "string", "minLength": 1 }
+                  },
+                  "executed_shapes": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": { "type": "string", "minLength": 1 }
+                  }
+                }
+              },
+              "index_width_scan": {
+                "properties": { "status": { "const": "info" } }
+              }
+            }
+          }
+        }
+      }
     }
-  }
+  ]
 }

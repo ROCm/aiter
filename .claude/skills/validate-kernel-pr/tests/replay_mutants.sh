@@ -87,21 +87,29 @@ for entry in "${CASES[@]}"; do
   git -C "$FLYDSL_REPO" worktree add --detach "$ACTIVE_WORKTREE" "$BASE" >/dev/null
 
   echo "== $case_id =="
+  rm -f "$OUT_DIR/$case_id.json" "$OUT_DIR/$case_id.exit"
+  set +e
   "$SKILL_DIR/validate_pr.sh" \
     --repo "$ACTIVE_WORKTREE" \
     --patch "$ACTIVE_PATCH" \
     --tests "$TESTS" \
+    --expected-route kernels.norm.softmax_kernel:build_softmax_module \
+    --shape-vars M,N,dtype_str \
     --shape-env "$SHAPE_ENV" \
     --grid "$GRID" \
     --tol-table "$TOLERANCES" \
     --label "$case_id" \
     --out "$OUT_DIR/$case_id.json"
+  validator_rc=$?
+  set -e
+  printf '%s\n' "$validator_rc" > "$OUT_DIR/$case_id.exit"
 
   git -C "$ACTIVE_WORKTREE" apply -R "$ACTIVE_PATCH"
   ACTIVE_PATCH=""
   git -C "$FLYDSL_REPO" worktree remove "$ACTIVE_WORKTREE"
   ACTIVE_WORKTREE=""
   rmdir "$case_root"
+  echo "validator_exit=$validator_rc"
 done
 
 python3 - "$MANIFEST" "$OUT_DIR" "$CASE_FILTER" <<'PY'
@@ -117,6 +125,12 @@ for case in manifest["cases"]:
     if case_filter and case["id"] != case_filter:
         continue
     report = json.loads((report_dir / f"{case['id']}.json").read_text())
+    expected_exit = 0 if report["verdict"] == "PASS" else (2 if report["verdict"] == "INCONCLUSIVE" else 1)
+    actual_exit = int((report_dir / f"{case['id']}.exit").read_text())
+    if actual_exit != expected_exit or report["process_exit_code"] != expected_exit:
+        failed.append(
+            f"{case['id']}: actual/report exits {actual_exit}/{report['process_exit_code']} != {expected_exit}"
+        )
     if report["verdict"] != case["expected_verdict"]:
         failed.append(
             f"{case['id']}: expected {case['expected_verdict']}, "

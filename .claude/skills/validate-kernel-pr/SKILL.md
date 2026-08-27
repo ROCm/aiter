@@ -29,24 +29,30 @@ test target; this script does not fetch PRs itself (see
 [Not implemented yet](#not-implemented-yet)).
 
 ```bash
+# Example for a FlyDSL softmax PR.
+REPO=ROCm/FlyDSL
+PR="${PR:?set PR to the open softmax PR number}"
+
 # 1. pin the PR identity and put its base in an isolated worktree
-BASE_REF=$(gh pr view 4394 --repo ROCm/aiter --json baseRefName --jq .baseRefName)
+BASE_REF=$(gh pr view "$PR" --repo "$REPO" --json baseRefName --jq .baseRefName)
 BASE_REF_PATH=$(python3 -c \
   'import sys,urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' \
   "$BASE_REF")
-BASE=$(gh api "repos/ROCm/aiter/branches/$BASE_REF_PATH" --jq .commit.sha)
-HEAD=$(gh pr view 4394 --repo ROCm/aiter --json headRefOid --jq .headRefOid)
-git worktree add --detach /tmp/pr-4394 "$BASE"
-gh pr diff 4394 --repo ROCm/aiter > /tmp/pr-4394.patch
+BASE=$(gh api "repos/$REPO/branches/$BASE_REF_PATH" --jq .commit.sha)
+HEAD=$(gh pr view "$PR" --repo "$REPO" --json headRefOid --jq .headRefOid)
+git worktree add --detach "/tmp/pr-$PR" "$BASE"
+gh pr diff "$PR" --repo "$REPO" > "/tmp/pr-$PR.patch"
 
 # 2. validate base and head under the same runner and GPU lock
 .claude/skills/validate-kernel-pr/validate_pr.sh \
-    --repo /tmp/pr-4394 \
-    --patch /tmp/pr-4394.patch \
+    --repo "/tmp/pr-$PR" \
+    --patch "/tmp/pr-$PR.patch" \
     --head-sha "$HEAD" \
-    --tests op_tests/test_moe_2stage.py \
-    --shape-env AITER_TEST_SHAPES \
-    --grid "1,4096,f32;7,2000,bf16;16384,8192,bf16" \
+    --tests tests/kernels/test_softmax.py \
+    --expected-route kernels.softmax_kernel:build_softmax_module \
+    --shape-vars M,N,dtype_str \
+    --shape-env ROCDSL_SOFTMAX_SHAPES \
+    --grid "64,2048,f32;64,2000,f32" \
     --tol-table "f32=1e-5,f16=2e-3,bf16=1e-2" \
     --out validation_report.json
 ```
@@ -60,6 +66,8 @@ For a local candidate with no remote head, omit `--head-sha`. The report then re
 | `--tests` | pytest target the PR ships |
 | `--patch` | patch to apply first; conflict is a blocker |
 | `--head-sha` | exact remote PR head represented by the patch |
+| `--expected-route` | exact `module:function` route the validator-owned profiler must observe |
+| `--shape-vars` | comma-separated local names captured from each route call, in grid order |
 | `--shape-env` `--grid` | env var and shape list for the S1-owned grid |
 | `--tol-table` | reference tolerances, e.g. `f32=1e-5,f16=2e-3,bf16=1e-2` |
 | `--label` `--out` | run name and report path (default `./validation_report.json`) |
@@ -114,9 +122,12 @@ the tree, and the resulting `ImportError` looks exactly like a defect in the PR.
 environment fact: `runtime_compat` and correctness are skipped, the verdict is `INCONCLUSIVE`,
 and nothing is attributed to the author.
 
-If the patch itself changes `python/flydsl/`, a `PYLIB` package would shadow those edits even when
-the version string matches. The validator therefore requires a rebuilt checkout-matched runtime
-for that shape and returns `INCONCLUSIVE` instead of testing the stale package.
+The report records the Python executable/version, resolved package path/version, and SHA-256
+identities for native libraries loaded by the runtime probe.
+If a FlyDSL PR changes Python, C++/MLIR bindings, headers, CMake, or packaging inputs, a prebuilt
+`PYLIB` is not accepted: trusted build-system provenance is not implemented, and caller-authored
+metadata cannot prove which source produced a binary. Such runs return `INCONCLUSIVE` instead of
+testing a stale package.
 
 This matters most for FlyDSL kernels: the Python kernels import symbols from a compiled runtime,
 so "one fresh container per PR" would mean rebuilding MLIR/LLVM per PR. The workable shape is a
@@ -137,6 +148,7 @@ A suite that cannot fail is worse than no suite, because it produces a green rep
 ### 5 — `correctness` — the repo's tests, then a grid the repo does not run
 
 Both, and they are reported separately, because the interesting case is when they disagree.
+Every run emits JUnit XML; a zero-executed/all-skipped target is `skip`, never `pass`.
 
 For a patch run, the validator reverses the exact patch to create the baseline, verifies that the
 worktree is clean, runs both targets under base-only caches, and reapplies the patch before a
@@ -160,18 +172,39 @@ control against reporting the same default test run twice under different stage 
 When the kernel exposes no shape override, the report says `repo-default-only` rather than
 claiming coverage it does not have.
 
-### 6 — `index_width_scan` (informational)
+### 6 — `execution_receipt`
+
+The validator loads its own pytest profiling plugin before test collection. The caller names an
+exact Python `module:function` route and the route's shape-local variable names; the plugin
+records actual calls and writes:
+
+```json
+{
+  "schema_version": 1,
+  "route": "aiter.ops.flydsl.kernels.moe_2stage_a16wmix:flydsl_a16w4_gemm1",
+  "kernel_symbols": ["aiter.ops.flydsl.kernels.moe_2stage_a16wmix:flydsl_a16w4_gemm1"],
+  "executed_shapes": ["1,3584,384", "128,3584,384"]
+}
+```
+
+`PASS` requires the observed route to equal `--expected-route`, at least one observed route
+symbol, and every shape named by `--grid`. The tested PR cannot obtain credit merely by writing
+its own receipt; `validate-kernel-pr.validation_probe` owns the receipt producer.
+
+### 7 — `index_width_scan` (informational)
 
 Runs `scan_index_width.py` over the diff and records the count of index×stride multiplies that
 carry no 64-bit widening. Candidates, not verdicts — the reviewer judges each. See
 [Why this stage exists](#why-the-index-width-scan-is-a-separate-stage).
 
-### 7 — verdict
+### 8 — verdict
 
 `BLOCK` if a reproducible candidate defect fired, `NEEDS_WORK` if a deterministic policy concern
 fired, `INCONCLUSIVE` if any required stage did not complete, else `PASS`. `PASS` therefore means
 the merge simulation, GPU claim, repo-aware runtime probe, policy comparison, baseline control,
-both correctness targets, and index scan all ran.
+both correctness targets, execution receipt, and index scan all ran.
+
+Process exit codes match the verdict: `PASS=0`, `BLOCK/NEEDS_WORK=1`, and `INCONCLUSIVE=2`.
 
 ---
 
@@ -191,6 +224,8 @@ These are fields, not prose, so a report cannot overclaim by omission:
   a reason; it never disappears and never becomes a JSON string.
 - **`test_selection`** — the exact pytest target and independent grid chosen by the caller. A
   verdict applies only to those named inputs.
+- **`runtime_identity`** — resolved package, interpreter, source SHA, and native artifact hashes.
+- **`execution_receipt`** — observed route, kernel symbols, and exact shapes emitted by the test.
 - **Every perf number keeps its provenance.** A number in the PR description that does not
   reproduce is tagged `[unreproducible]`; it is not quietly dropped.
 
@@ -235,6 +270,9 @@ a seeded defect, and these have not been:
   same locked GPU, and reproducing the numbers in the PR description — and the script emits
   neither. A report today carries no performance evidence, and a review must not read the absence
   of a `perf` stage as "no regression".
+- **Adversarial route attestation.** The validator-owned profiler prevents accidental and
+  worktree-shadowed receipts, but arbitrary Python running in the same process can still spoof a
+  matching frame. A hostile-code gate needs an out-of-process HIP/rocprof trace.
 
 ## What this skill does not do
 
