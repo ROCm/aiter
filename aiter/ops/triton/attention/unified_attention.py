@@ -438,8 +438,14 @@ def unified_attention(
                 return _flydsl_out
 
     # FlyDSL declined (or this isn't gfx950); the Triton fallback below only
-    # implements the causal mask.
-    assert causal, "Only causal attention is supported"
+    # implements the causal mask. A real raise, not an assert: `python -O`
+    # strips asserts, which would silently run the causal kernel against a
+    # non-causal call and write a wrong mask.
+    if not causal:
+        raise NotImplementedError(
+            "The Triton unified_attention fallback implements only the causal "
+            "mask; non-causal requires the FlyDSL gfx950 backend."
+        )
 
     BLOCK_M = (
         16 if num_queries_per_kv <= 16 else triton.next_power_of_2(num_queries_per_kv)

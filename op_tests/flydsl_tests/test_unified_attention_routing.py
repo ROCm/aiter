@@ -297,6 +297,46 @@ def test_non_causal_routes_and_agrees():
     _assert_close(got, want)
 
 
+@pytest.mark.parametrize(
+    "label,query_lens,kv_lens",
+    [
+        # _decode_dispatch_action's own cede band: mid-batch (9..48) x deep
+        # context (>=8192). num_seqs=16 sits inside it.
+        ("mid-batch-decode-cede-band", [1] * 16, [8192] * 16),
+        # The prefill-body tier-selection cede a few lines below it: a
+        # mixed-shape (max_seqlen_q > 1) batch with num_seqs > 1 that
+        # underfills the machine (num_2d_prgms << target).
+        ("mixed-underfill-cede-band", [4] * 4, [4096] * 4),
+    ],
+)
+def test_non_causal_served_in_perf_cede_bands(label, query_lens, kv_lens):
+    """Both PERFORMANCE-cede bands must never cede a non-causal call.
+
+    Triton's fallback below the dispatch implements only the causal mask
+    (`assert causal` -> `NotImplementedError` post-fix), so a non-causal call
+    ceded into it would raise; the fix instead keeps non-causal on FlyDSL in
+    both bands. A correct result here, from a call that would otherwise cede
+    under causal=True, IS the proof FlyDSL served it rather than Triton.
+
+    regression: non-causal must be served on FlyDSL, not ceded into the
+    causal-only Triton fallback (PR #4676 review P1).
+    """
+    import aiter.ops.flydsl.unified_attention_kernels as uak
+
+    real = uak.flydsl_unified_attention
+    seen = {}
+
+    def spy(*a, **kw):
+        r = real(*a, **kw)
+        seen["served"] = r is not None
+        return r
+
+    with mock.patch.object(uak, "flydsl_unified_attention", spy):
+        got, want = _call_with_ref(query_lens, kv_lens, causal=False)
+    assert seen.get("served") is True, f"{label}: non-causal call was ceded to Triton"
+    _assert_close(got, want)
+
+
 def test_fp16_output_routes_and_agrees():
     """`out.dtype == float16` is accepted now (was declined); check it both
     routes and agrees with the fp32 reference through the public entry."""
@@ -589,6 +629,32 @@ def test_padded_q_stride_declines_to_triton():
         v_descale=v_ds,
     )
     _assert_close(got.float(), want.float().reshape(got.shape))
+
+
+# --- host-only unit tests, no GPU needed -------------------------------------
+
+
+def test_env_decode_kernel_defensive_parse(monkeypatch):
+    """`_env_use_decode_kernel` must fall back to the default (True) on any
+    value that is not a clean integer, rather than raising -- a bad
+    AITER_DECODE_KERNEL used to take a bare `int(...)` and crash at import.
+
+    regression: bad AITER_DECODE_KERNEL must fall back to default, not
+    ValueError at import (PR #4676 review P2).
+    """
+    import aiter.ops.flydsl.unified_attention_kernels as uak
+
+    monkeypatch.setenv("AITER_DECODE_KERNEL", "1")
+    assert uak._env_use_decode_kernel() is True
+    monkeypatch.setenv("AITER_DECODE_KERNEL", "0")
+    assert uak._env_use_decode_kernel() is False
+    for bad in ("true", "", "yes"):
+        monkeypatch.setenv("AITER_DECODE_KERNEL", bad)
+        assert (
+            uak._env_use_decode_kernel() is True
+        ), f"bad value {bad!r} did not fall back"
+    monkeypatch.delenv("AITER_DECODE_KERNEL", raising=False)
+    assert uak._env_use_decode_kernel() is True
 
 
 # --- 4. the gate predicate, without a GPU ------------------------------------

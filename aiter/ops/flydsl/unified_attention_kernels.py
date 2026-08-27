@@ -248,10 +248,27 @@ def _get_kernel(
 # retuning is a one-line edit. See _decode_dispatch_action for how they
 # combine.
 # ===========================================================================
+def _env_use_decode_kernel(default: bool = True) -> bool:
+    """Defensive parse of AITER_DECODE_KERNEL, the decode-kernel master switch.
+
+    Mirrors ``_env_max_kv_splits``: a bad value (non-integer, e.g. ``true``/
+    ``on``/empty) must not abort import. The importer in unified_attention.py
+    catches only ImportError, so a bare ``int(...)`` raising ValueError here
+    would take down the whole public op rather than falling back to Triton.
+    """
+    raw = os.environ.get("AITER_DECODE_KERNEL")
+    if raw is None:
+        return default
+    try:
+        return bool(int(raw))
+    except ValueError:
+        return default
+
+
 # GQA group size the decode-specialized kernel is built for (BLOCK_M=16).
 _DECODE_GQA = 16
 # Master on/off; AITER_DECODE_KERNEL=0 forces the legacy prefill-body/cede path.
-_USE_DECODE_KERNEL = bool(int(os.environ.get("AITER_DECODE_KERNEL", "1")))
+_USE_DECODE_KERNEL = _env_use_decode_kernel()
 # Conservative cede band: mid-batch x deep-context is the measured
 # near-parity/loss region vs Triton on gfx950 (crossover sweep; noisy and not
 # cleanly separable), so cede the whole band to guarantee no regression. Retune
@@ -270,6 +287,7 @@ def _decode_dispatch_action(
     num_seqs,
     max_seqlen_k,
     from_split,
+    causal,
 ):
     """Single decode-dispatch decision: ``"route"`` the decode-specialized
     kernel, ``"cede"`` to Triton, or ``"legacy"`` (fall through to the
@@ -289,9 +307,12 @@ def _decode_dispatch_action(
         return "legacy"
     # cede the mid-batch x deep-context loss band (see constants). Never cede a
     # decode half reached via the mixed split -- the split drops its return value
-    # on the invariant that a decode sub-call always serves.
+    # on the invariant that a decode sub-call always serves. Only a PERFORMANCE
+    # cede, so never take it for non-causal: Triton's fallback is causal-only,
+    # and FlyDSL already builds and supports the non-causal binary.
     if (
-        not from_split
+        causal
+        and not from_split
         and _DECODE_CEDE_MIN_SEQS <= num_seqs <= _DECODE_CEDE_MAX_SEQS
         and max_seqlen_k >= _DECODE_CEDE_MIN_KV
     ):
@@ -859,6 +880,7 @@ def flydsl_unified_attention(
         num_seqs,
         max_seqlen_k,
         _from_split,
+        bool(causal),
     )
     if _decode_action == "cede":
         return None
@@ -886,12 +908,18 @@ def flydsl_unified_attention(
     # runs Triton). Guard on max_seqlen_k > _PAGE_SIZE * 20 keeps the shallow
     # region (always a win, and never split-K'd) on FlyDSL regardless of batch
     # size; above that, cede once the KV-read volume crosses _DECODE_CEDE_WORK.
-    # Scoped to the top-level entry only (not _from_split): the mixed-batch
-    # split below drops the decode sub-call's return value on the invariant
-    # that it never declines, so a decode half reached via the split must never
-    # cede here -- see the `_from_split=True` call site.
+    # Scoped to the top-level entry only (not _from_split): a decode half
+    # reached via the mixed-batch split below must never cede here even though
+    # it never declines today, since a future cede would leave that half's rows
+    # unwritten (the split has no Triton fall-through of its own) -- see the
+    # `_from_split=True` call site, whose caller checks the sub-call's return.
+    # Also scoped to causal:
+    # this is a PERFORMANCE cede (Triton is faster in this band), and Triton's
+    # fallback only implements the causal mask, so a non-causal call must never
+    # take it -- FlyDSL already supports non-causal.
     if (
-        not _from_split
+        causal
+        and not _from_split
         and max_seqlen_q == 1
         and max_seqlen_k > _PAGE_SIZE * 20
         and num_seqs * max_seqlen_k > _DECODE_CEDE_WORK
@@ -986,8 +1014,9 @@ def flydsl_unified_attention(
                     skip_reduce=skip_reduce,
                     # The split path owns its own routing for both halves; the
                     # pure-decode cede above applies only to the top-level entry,
-                    # since this decode sub-call's return value is never checked
-                    # (see the invariant note below) and must never be None.
+                    # since this decode sub-call is not expected to decline today.
+                    # Its return is still checked below, defensively -- see that
+                    # guard's comment.
                     _from_split=True,
                 )
 
@@ -995,12 +1024,17 @@ def flydsl_unified_attention(
             # decline (return None from the tier-selection guard below); the split
             # has no Triton fall-through, only the external caller does, so cede the
             # whole batch to Triton rather than leaving its rows unwritten. The decode
-            # half has max_q == 1 and never declines.
+            # half has max_q == 1 and never declines today, but a future cede or a
+            # _supported failure on the sliced views could return None too -- if so,
+            # its rows would be left unwritten while this function still returns
+            # `out`, so check it the same way as the prefill half rather than
+            # dropping the return value.
             if (
                 _sub(pre_rows, pre_seqs, n_pre, pre_max_q) is None
             ):  # prefill -> single-pass 2d
                 return None
-            _sub(dec_rows, dec_seqs, n_dec, 1)  # decode -> split-K 3d
+            if _sub(dec_rows, dec_seqs, n_dec, 1) is None:  # decode -> split-K 3d
+                return None
             return out
 
     num_query_heads = q.shape[1]
@@ -1068,7 +1102,13 @@ def flydsl_unified_attention(
             # all-decode (max_seqlen_q == 1, won via split-K below) and
             # single-seq prefill (num_seqs == 1). Deep-decode mixed already took
             # the dispatch split above and never reaches here.
-            if max_seqlen_q > 1 and num_seqs > 1:
+            #
+            # Also excluded, and for a different reason: non-causal. This is a
+            # PERFORMANCE cede -- Triton wins this band -- but Triton's fallback
+            # only implements the causal mask, so a non-causal call must stay on
+            # FlyDSL (which `_supported` already approved) rather than crash in
+            # Triton's causal-only kernel.
+            if causal and max_seqlen_q > 1 and num_seqs > 1:
                 return None
             num_kv_splits = _split_count(num_2d_prgms, target_num_prgms)
 

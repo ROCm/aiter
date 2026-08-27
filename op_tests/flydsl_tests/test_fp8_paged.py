@@ -33,6 +33,10 @@ from aiter.ops.flydsl.utils import is_flydsl_available
 from op_tests.flydsl_tests._common import assert_attn_close as _check
 from op_tests.flydsl_tests._common import build_fp8_gfx950 as _build_module
 from op_tests.flydsl_tests._common import q8
+from op_tests.flydsl_tests.test_flydsl_unified_attention import (
+    _shuffle_k_to_vectorized,
+    _shuffle_v_to_vectorized,
+)
 from op_tests.triton_tests.attention.test_unified_attention import (
     ref_paged_attn,
 )
@@ -79,15 +83,19 @@ PAGED_VARLEN_CASES = [
 ]
 
 
-def to_pages(kf, npages_per_seq, perm, hkv, d):
+def to_pages(kf, npages_per_seq, perm, hkv, d, pool_blocks=None):
     """Scatter a contiguous [B, S, HKV, D] fp8 tensor into a permuted page pool.
 
     Returns the pool as [total_pages, PAGE, HKV, D]. `perm[b][t]` is the pool
     index holding batch b's logical tile t, so the pool is in no useful order --
     a kernel that read it linearly would get garbage.
+
+    `pool_blocks` pads the pool past `b * npages_per_seq` (the default) so
+    `perm` may name ids far above what a dense pool would have -- the
+    large-page-id BufferDesc rebasing case.
     """
     b, s, _, _ = kf.shape
-    total = b * npages_per_seq
+    total = b * npages_per_seq if pool_blocks is None else pool_blocks
     pool = torch.zeros(total, PAGE, hkv, d, device=DEV, dtype=kf.dtype)
     padded = torch.zeros(b, npages_per_seq * PAGE, hkv, d, device=DEV, dtype=kf.dtype)
     padded[:, :s] = kf
@@ -248,6 +256,105 @@ def _run_paged_varlen(build, seqs, d, seed, causal=True):
     ).item()
     bad = int(((of - want).abs().amax(dim=(1, 2)) > 1e-1).sum().item())
     return err, cos, bad
+
+
+def _run_paged_shuffled_large_page(build, b, s, h, hkv, d, seed, pool_blocks):
+    """Like `_run_paged`, but (a) K/V are the shuffled 5D vectorized cache
+    layout and (b) the block table's page ids sit at the TOP of a pool padded
+    to `pool_blocks` (65536 blocks = 2 GB fp8, the production pool size),
+    instead of the low ids a dense `b*npages` pool would pick -- the per-page
+    BufferDesc rebasing case with a genuinely large page-id byte offset.
+    """
+    g = torch.Generator(device=DEV).manual_seed(seed)
+    mk = lambda n: torch.randn(
+        b, s, n, d, generator=g, device=DEV, dtype=torch.bfloat16
+    )
+    qf, qs = q8(mk(h))
+    kf, ks = q8(mk(hkv))
+    vf, vs = q8(mk(hkv))
+
+    npages = (s + PAGE - 1) // PAGE
+    total_used = b * npages
+    pg = torch.Generator().manual_seed(seed + 7)
+    high_ids = (pool_blocks - total_used) + torch.randperm(total_used, generator=pg)
+    perm = [high_ids[bi * npages : (bi + 1) * npages].tolist() for bi in range(b)]
+
+    kpool = to_pages(kf, npages, perm, hkv, d, pool_blocks=pool_blocks)
+    vpool = to_pages(vf, npages, perm, hkv, d, pool_blocks=pool_blocks)
+    block_table = torch.tensor(perm, device=DEV, dtype=torch.int32)
+
+    mod = build(
+        num_heads=h,
+        head_dim=d,
+        causal=True,
+        dtype_str="fp8",
+        num_kv_heads=hkv,
+        paged=True,
+        kv_cache_layout="vectorized",
+    )
+    o = torch.empty(b, s, h, d, device=DEV, dtype=torch.bfloat16)
+    mod(
+        qf.contiguous().view(-1),
+        _shuffle_k_to_vectorized(kpool).contiguous().view(-1),
+        _shuffle_v_to_vectorized(vpool).contiguous().view(-1),
+        o.contiguous().view(-1),
+        b,
+        s,
+        block_table=block_table.contiguous().view(-1),
+        block_table_stride=npages,
+        q_descale=qs,
+        k_descale=ks,
+        v_descale=vs,
+    )
+    torch.cuda.synchronize()
+
+    # Reference reads the LINEAR (unshuffled) pool -- ref_paged_attn only
+    # understands that layout; the kernel above consumed the shuffled one.
+    want = ref_paged_attn(
+        query=qf.reshape(b * s, h, d),
+        key_cache=kpool,
+        value_cache=vpool,
+        query_lens=[s] * b,
+        kv_lens=[s] * b,
+        block_tables=block_table,
+        scale=d**-0.5,
+        out_dtype=torch.float32,
+        q_descale=qs,
+        k_descale=ks,
+        v_descale=vs,
+        causal=1,
+    )
+    of = o.float().reshape(b * s, h, d)
+    err = (of - want).abs().max().item()
+    cos = torch.nn.functional.cosine_similarity(
+        of.flatten(), want.flatten(), dim=0
+    ).item()
+    bad = int(((of - want).abs().amax(dim=(1, 2)) > 1e-1).sum().item())
+    return err, cos, bad
+
+
+def test_paged_shuffled_large_page_id():
+    """Shuffled 5D fp8 KV cache whose block table names ids at the top of a
+    padded pool, not the low ids a small dense pool would pick -- the
+    per-page BufferDesc rebasing case with a genuinely large page-id byte
+    offset.
+
+    pool_blocks=65535, not the production 65536: this dualwave module (unlike
+    the decode-specialized kernel) addresses K/V as a whole-pool memref sized
+    by total elements, and 65536 * PAGE(64) * hkv(4) * D(128) is exactly
+    2**31 -- one past int32 range, so it overflows the compiled kernel's i32
+    element-count argument. 65535 keeps the same large-page-id stress just
+    under that unrelated limit.
+
+    coverage: shuffled-5D fp8 KV + large page id, direct module call vs
+    ref_paged_attn (PR #4676 review).
+    """
+    build = _build_module()
+    err, cos, bad = _run_paged_shuffled_large_page(
+        build, b=2, s=512, h=64, hkv=4, d=HEAD_DIM, seed=SEED, pool_blocks=65535
+    )
+    _check(err, cos, bad)
+    torch.cuda.empty_cache()
 
 
 @pytest.mark.parametrize("label,b,s,hkv,causal", CASES, ids=[c[0] for c in CASES])

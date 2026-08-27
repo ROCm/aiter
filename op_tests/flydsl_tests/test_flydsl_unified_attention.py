@@ -519,6 +519,87 @@ def test_non_multiple_of_page():
     _check(*r)
 
 
+def _run_decode_with_empty_seq(query_lens, kv_lens, seed=9):
+    """All-decode call whose last sequence has `seqused_k == 0` (empty KV),
+    mixed into an otherwise-normal batch. Returns (got, want); `want` is
+    `ref_paged_attn`'s own zero result for the empty row (a zero-length KV
+    softmax sums zero terms, no special-casing needed -- see the einsum in
+    `ref_paged_attn`)."""
+    from aiter.ops.flydsl.unified_attention_kernels import flydsl_unified_attention
+
+    num_heads, num_kv_heads = 64, 4
+    q, k, v, out, cu_q, seqused_k, bt, q_ds, k_ds, v_ds = _build(
+        query_lens, kv_lens, num_heads, num_kv_heads, seed
+    )
+    got = flydsl_unified_attention(
+        q,
+        k,
+        v,
+        out,
+        cu_q,
+        max(query_lens),
+        seqused_k,
+        max(kv_lens),
+        1.0 / math.sqrt(HEAD_DIM),
+        True,
+        (-1, -1),
+        bt,
+        0,
+        q_ds,
+        k_ds,
+        v_ds,
+        num_kv_heads=num_kv_heads,
+        block_size=PAGE,
+        num_queries_per_kv=num_heads // num_kv_heads,
+        num_seqs=len(query_lens),
+    )
+    assert got is not None, "adapter declined a supported all-decode config"
+    want = ref_paged_attn(
+        query=q,
+        key_cache=k,
+        value_cache=v,
+        query_lens=query_lens,
+        kv_lens=kv_lens,
+        block_tables=bt,
+        scale=1.0 / math.sqrt(HEAD_DIM),
+        out_dtype=out.dtype,
+        q_descale=q_ds,
+        k_descale=k_ds,
+        v_descale=v_ds,
+    )
+    return got.float(), want.float().reshape(got.shape)
+
+
+def test_empty_kv_direct_store():
+    """seqused_k==0 for the last of 8 decode sequences, shallow enough
+    (max_seqlen_k=64 -> 1 page -> plan_num_kv_splits==1) to hit the decode
+    kernel's direct-store epilogue rather than the split-K combine.
+
+    regression: empty-KV (den==0) must yield a defined zero result, not NaN,
+    in both the direct-store epilogue and the split-K combine (PR #4676
+    review P2).
+    """
+    got, want = _run_decode_with_empty_seq([1] * 8, [64] * 7 + [0])
+    assert torch.isfinite(got).all(), "empty-KV row produced NaN/inf"
+    assert torch.all(got[-1] == 0), "empty-KV row must be exactly zero, not garbage"
+    _check(got, want)
+
+
+def test_empty_kv_splitk_combine():
+    """Same seqused_k==0 mix, but deep context (max_seqlen_k=8192 -> 128
+    pages) drives `plan_num_kv_splits` to S=8, exercising the split-K
+    combine kernel's den==0 guard instead of the direct-store one.
+
+    regression: empty-KV (den==0) must yield a defined zero result, not NaN,
+    in both the direct-store epilogue and the split-K combine (PR #4676
+    review P2).
+    """
+    got, want = _run_decode_with_empty_seq([1] * 8, [8192] * 7 + [0])
+    assert torch.isfinite(got).all(), "empty-KV row produced NaN/inf"
+    assert torch.all(got[-1] == 0), "empty-KV row must be exactly zero, not garbage"
+    _check(got, want)
+
+
 def test_out_not_overwritten_past_active_rows():
     """The last Q block of a sequence overhangs its real rows; only the buffer
     descriptor's num_records bound stops it writing past them. Poison `out` and

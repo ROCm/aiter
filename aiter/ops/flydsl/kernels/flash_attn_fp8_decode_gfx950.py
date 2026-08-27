@@ -668,7 +668,14 @@ def build_flash_attn_fp8_decode_module(
             gws[ws_base + fx.Int64(D * BLOCK_M) + fx.Int64(n)] = mg
             gws[ws_base + fx.Int64(D * BLOCK_M + BLOCK_M) + fx.Int64(n)] = den
         else:
-            inv = vd / den  # vd folds the V descale into the combined 1/l
+            # vd folds the V descale into the combined 1/l. Guard den == 0 (a
+            # fully-empty sequence, seqused_k==0 / npages==0) the same way the
+            # prefill body's _safe_l_inv does, or this divides to NaN.
+            den_rcp = rocdl.rcp(T.f32, _to_raw(den))
+            den_inv = (fx.Float32(den) > fx.Float32(0.0)).select(
+                den_rcp, fx.Float32(0.0)
+            )
+            inv = vd * den_inv
             o_row_base = (
                 fx.Int64(token) * (H * D) + (fx.Int64(h) * 16 + fx.Int64(n)) * D
             )
@@ -792,7 +799,11 @@ def build_flash_attn_fp8_decode_module(
             s_w = _exp2(m_of(s) - mg)
             sc.append(s_w)
             den = den + l_of(s) * s_w
-        inv = vd / den
+        # Guard den == 0 (a fully-empty sequence) the same way the prefill
+        # body's _safe_l_inv does, or this divides to NaN.
+        den_rcp = rocdl.rcp(T.f32, _to_raw(den))
+        den_inv = (fx.Float32(den) > fx.Float32(0.0)).select(den_rcp, fx.Float32(0.0))
+        inv = vd * den_inv
 
         o_row_base = fx.Int64(token) * (H * D) + (fx.Int64(h) * 16 + fx.Int64(n)) * D
         for c in range_constexpr(8):
@@ -823,21 +834,30 @@ def build_flash_attn_fp8_decode_module(
             stream=stream,
         )
 
+    # Keyed on device.index, not a single "cuda" cache slot: this closure is
+    # memoized (per kernel config) across the process by _get_decode_kernel's
+    # lru_cache in unified_attention_kernels.py, so a "cuda" allocation binds
+    # to whatever device was current on first use and gets reused -- wrongly
+    # -- by a later launch on another device, whose stream belongs to that
+    # other device. Mirrors the Aug-12 _target_num_prgms fix (@cache keyed on
+    # device.index).
     _dummy_holder = {}
 
-    def _dummy_f32():
+    def _dummy_f32(device):
         import torch
 
-        if "d" not in _dummy_holder:
-            _dummy_holder["d"] = torch.zeros(1, device="cuda", dtype=torch.float32)
-        return _dummy_holder["d"]
+        key = ("d", device.index)
+        if key not in _dummy_holder:
+            _dummy_holder[key] = torch.zeros(1, device=device, dtype=torch.float32)
+        return _dummy_holder[key]
 
-    def _dummy_i32():
+    def _dummy_i32(device):
         import torch
 
-        if "i" not in _dummy_holder:
-            _dummy_holder["i"] = torch.zeros(1, device="cuda", dtype=torch.int32)
-        return _dummy_holder["i"]
+        key = ("i", device.index)
+        if key not in _dummy_holder:
+            _dummy_holder[key] = torch.zeros(1, device=device, dtype=torch.int32)
+        return _dummy_holder[key]
 
     def workspace_elems(batch):
         """f32 workspace element count for a split-K launch (0 when SPLK==1)."""
@@ -865,15 +885,16 @@ def build_flash_attn_fp8_decode_module(
 
         if stream is None:
             stream = torch.cuda.current_stream()
-        cuq = cu_seqlens_q if cu_seqlens_q is not None else _dummy_i32()
-        cukv = cu_seqlens_kv if cu_seqlens_kv is not None else _dummy_i32()
+        device = q.device
+        cuq = cu_seqlens_q if cu_seqlens_q is not None else _dummy_i32(device)
+        cukv = cu_seqlens_kv if cu_seqlens_kv is not None else _dummy_i32(device)
         if SPLITK:
             need = workspace_elems(int(batch))
             if workspace is None or workspace.numel() < need:
-                workspace = torch.empty(need, device="cuda", dtype=torch.float32)
+                workspace = torch.empty(need, device=device, dtype=torch.float32)
             ws = workspace
         else:
-            ws = _dummy_f32()
+            ws = _dummy_f32(device)
         # K/V are plain pointers: the kernel rebases a BufferDesc per page from
         # the block table (no whole-pool memref), so any pool size is fine.
         _run_compiled(
