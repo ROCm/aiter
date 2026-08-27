@@ -4936,7 +4936,8 @@ class FmoeTuner(TunerCommon):
             #   TUNE_ONLY=flydsl  -> only gen_flydsl_2stages_task
             #   TUNE_ONLY=opus    -> only gen_opus_2stages_task
             # unset = flydslv2; empty = all (subject to OPUS_ONLY / OPUS_SKIP_CKTILE).
-            _tune_only = {s for s in os.environ.get("TUNE_ONLY", "flydslv2").split(",") if s}
+            tune_only = os.environ.get("TUNE_ONLY", "flydslv2")
+            _tune_only = {s for s in tune_only.split(",") if s}
 
             def _want(name, _opus_only=_opus_only, _tune_only=_tune_only):
                 if _tune_only:
