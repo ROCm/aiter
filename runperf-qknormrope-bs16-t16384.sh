@@ -19,6 +19,9 @@
 #   QWEIGHT=0 ./runperf-qknorm-bs16-t16384.sh # no-q_weight only
 #   TRACE=1 ./runperf-qknorm-bs16-t16384.sh  # + kernel-trace to confirm r32_w32
 export HIP_VISIBLE_DEVICES=${HIP_VISIBLE_DEVICES:-0}
+# `python op_tests/foo.py` puts op_tests/ (not the repo root) on sys.path, so
+# `import aiter` needs the repo root added explicitly.
+export PYTHONPATH="${PYTHONPATH:+$PYTHONPATH:}$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 set -euo pipefail
 
 TEST="${TEST:-op_tests/test_flydsl_qk_norm_rope_quant.py}"
@@ -36,18 +39,21 @@ COMMON="--H ${H} --D ${D} --RD ${RD} --no-quant"
 # qw variant carries an extra "qw" tag; regex matches both.
 KREGEX="${KREGEX:-qk_norm_rope_tdm_H${H}_D${D}_RD${RD}_.*ct16.*flydsl}"
 
+LOGFILE=$(mktemp /tmp/runperf-qknorm-XXXXXX.log)
+trap 'rm -f "$LOGFILE"' EXIT
+
 echo "config: bs=16 tok=${T} (T=${T})  H=${H} D=${D} RD=${RD} dtype=BF16  QWEIGHT=${QWEIGHT}  TRACE=${TRACE}"
 echo "expect kernel(s): qk_norm_rope_tdm_H${H}_D${D}_RD${RD}_*_ct16[_h][_qw]_fused_w32_flydsl"
 echo
 
 # --- perf sweep (qw off + on) ------------------------------------------------
-python "$TEST" -T ${T} $COMMON
+python "$TEST" -T ${T} $COMMON 2>&1 | tee -a "$LOGFILE"
 
 # --- also run T=512 if the primary T is not already 512 ----------------------
 if [[ "$T" != "512" ]]; then
     echo
     echo "=== T=512 sweep ==="
-    python "$TEST" -T 512 $COMMON
+    python "$TEST" -T 512 $COMMON 2>&1 | tee -a "$LOGFILE"
 fi
 
 # --- optional: confirm the real dispatched kernel name(s) are TDM ct16 -------
@@ -63,3 +69,23 @@ if [[ "$TRACE" == "1" ]]; then
         echo "WARNING: no match for '$KREGEX' -- inspect $OUTDIR/ manually"
     fi
 fi
+
+# --- combined summary table from all runs ------------------------------------
+echo
+echo "================================================================================"
+echo "                        COMBINED PERFORMANCE SUMMARY"
+echo "================================================================================"
+echo
+# Replay each markdown table block with labels extracted from surrounding log.
+awk '
+/summary \(markdown\):/ {
+    # Capture the label from the log line preceding the table.
+    label = $0; sub(/.*INFO */, "", label); sub(/ *summary \(markdown\):.*/, "", label)
+    printf "--- %s ---\n", label
+    next
+}
+/^\|/ { print; next }
+# Blank line after a table block -> visual separator.
+prev_pipe && !/^\|/ { print ""; }
+{ prev_pipe = /^\|/ }
+' "$LOGFILE"
