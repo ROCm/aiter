@@ -1555,7 +1555,8 @@ namespace py = pybind11;
           py::arg("seqstart_q_pad") = std::nullopt, \
           py::arg("seqstart_k_pad") = std::nullopt, \
           py::arg("max_seqlen_q")   = 0,            \
-          py::arg("max_seqlen_k")   = 0);
+          py::arg("max_seqlen_k")   = 0,            \
+          py::arg("sink")           = std::nullopt);
 
 #define NORM_PYBIND                                \
     m.def("layernorm2d_fwd",                       \

@@ -34,6 +34,9 @@ struct fmha_fwd_bf16_opus_args
     void* o_ptr       = nullptr;
     // nullptr => the kernel skips the log-sum-exp store entirely.
     void* lse_ptr = nullptr;
+    // Optional attention sink: one fp32 logit per query head, [nhead]. nullptr => no sink.
+    // Symmetric (d128) kernel only; the d192/v128 kernel has no sink support.
+    const void* sink_ptr = nullptr;
 
     // Group / varlen, int32, length batch+1. A null seqstart_q_ptr selects batch mode.
     // The *_pad arrays give the physical row offsets (equal to the non-pad arrays when
@@ -132,6 +135,7 @@ inline bool launch_d128(const fmha_fwd_bf16_opus_args& a, hipStream_t stream)
     kargs.ptr_lse      = a.lse_ptr;
     kargs.stride_lse_b = a.stride_lse_b;
     kargs.stride_lse_h = a.stride_lse_h;
+    kargs.ptr_sink     = a.sink_ptr;  // nullptr => no sink (d192/v128 never sets it)
 
     auto launch = [&](auto traits_tag) {
         using Traits          = decltype(traits_tag);

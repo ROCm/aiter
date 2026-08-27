@@ -691,6 +691,30 @@ __device__ __attribute__((always_inline)) void gqa_d128_impl(opus_gqa_kargs karg
     // label_write_out`. The stagger balancing barrier stays outside it: the no-keys path
     // runs no prologue, so neither wave group owes the other one.
     auto store_result = [&]() {
+        // ── attention sink ────────────────────────────────────────────────────────────
+        // A learned per-head logit acting as one extra key that contributes to the
+        // softmax denominator but carries no value. Since
+        //   out = (sum_j exp(s_j - m) v_j) / (sum_j exp(s_j - m) + exp(sink - m))
+        // it enters ONLY the denominator: v_o needs no rescale, and folding it into l_row
+        // here fixes both the O normalization and the LSE below in one place.
+        //
+        // m_row/l_row are base-2 (exp2, with log2(e) folded into temperature_scale) while
+        // the sink arrives as a natural-log logit, hence the LOG2_E conversion.
+        //
+        // l_row == 0 means no key contributed (no keys at all, or all masked). m_row is
+        // then still lowest(), so referencing the exponent to it would overflow; reference
+        // the sink to itself instead, giving l_row = 1, O = 0 and lse = sink -- the
+        // correct "attends entirely to the sink" answer.
+        if (kargs.ptr_sink != nullptr) {
+            const D_ACC sink_b2 =
+                reinterpret_cast<const D_ACC*>(kargs.ptr_sink)[h] * D_ACC(LOG2_E);
+            const bool have_keys = (l_row > D_ACC(0.0f));
+            const D_ACC m_ref = have_keys ? m_row : sink_b2;
+            l_row = (have_keys ? l_row : D_ACC(0.0f)) +
+                    __builtin_amdgcn_exp2f(sink_b2 - m_ref);
+            m_row = m_ref;
+        }
+
         if (kargs.ptr_lse != nullptr && lane_id < T::W_M) {
             constexpr D_ACC LN2 = D_ACC(0.69314718055994531f);   // 1 / log2(e)
             const D_ACC lse = (l_row > D_ACC(0.0f))

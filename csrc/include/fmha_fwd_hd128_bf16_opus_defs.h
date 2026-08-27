@@ -33,6 +33,11 @@ struct opus_gqa_kargs {
     void* __restrict__ ptr_lse;
     int stride_lse_b;
     int stride_lse_h;
+    // Optional attention sinks: one fp32 learned logit per QUERY head, [H], unit stride.
+    // A sink behaves as one extra key that contributes to the softmax denominator but
+    // carries no value, so it only shifts the normalizer (see store_result in the
+    // kernel). nullptr => no sink. gpt-oss sets one on every attention layer.
+    const void* __restrict__ ptr_sink;
 };
 
 // Configuration traits for the GQA kernel (tile sizes, data types, vector lengths,
