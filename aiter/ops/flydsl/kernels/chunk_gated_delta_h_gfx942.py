@@ -21,6 +21,7 @@ elide the two HBM drains that only the separate K6 kernel consumes.
 """
 
 import math
+import os
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -100,61 +101,95 @@ def _make_fast_exp(g_is_log2_scaled: bool):
     return _fast_exp
 
 
-def _to_bf16_fast(val, n=1):
-    """f32 -> bf16 as ``(bitcast<u32>(x) + 0x8000) >> 16`` (round-half-away).
+# -- f32 -> bf16 conversion ----------------------------------------------------
+# Two variants, selected by the ``FAST_FP32_TO_FP16`` environment variable.
+#
+# DEFAULT (unset) -- ``arith.truncf``: plain IEEE round-to-nearest-EVEN. No
+#   custom code, unbiased rounding, and NaN/Inf classification falls out of the
+#   semantic instead of needing a guard. gfx942 has no ``v_cvt_pk_bf16_f32`` so
+#   the backend expands RNE inline.
+#
+# FAST_FP32_TO_FP16=1 -- ``(bitcast<u32>(x) + 0x8000) >> 16``, round-half-AWAY
+#   from zero. 2 VALU/element. **UNSAFE: it does not preserve NaN.** This is the
+#   original pre-review conversion, kept as an opt-in performance escape hatch.
+#
+# What "unsafe" means concretely, verified by bit math over the pattern space:
+#
+#   input                       default (truncf)   FAST_FP32_TO_FP16=1
+#   0x7F800001 low-payload NaN        NaN                +Inf
+#   0xFF800001 negative NaN           NaN                -Inf
+#   0x7FFFFFFF all-ones mantissa      NaN                -0.0   <-- finite!
+#   +-Inf                             +-Inf              +-Inf
+#   finite                            finite             finite
+#
+_FAST_BF16_ENV = "FAST_FP32_TO_FP16"
+
+
+def _fast_bf16_from_env() -> bool:
+    """Read ``FAST_FP32_TO_FP16`` once, at import.
+
+    Read at import rather than per call so the value cannot change midway
+    through a process and leave some kernels built one way and some the other.
+    Changing it therefore needs a fresh process, not just a fresh compile.
+    """
+    raw = os.environ.get(_FAST_BF16_ENV)
+    if raw is None:
+        return False
+    val = raw.strip().lower()
+    if val in ("1", "true", "yes", "on"):
+        return True
+    if val in ("", "0", "false", "no", "off"):
+        return False
+    raise ValueError(
+        f"{_FAST_BF16_ENV}={raw!r} is not a boolean; use 1/0, true/false, "
+        "yes/no or on/off."
+    )
+
+
+USE_FAST_BF16 = _fast_bf16_from_env()
+
+# Folded into the kernel name below. An env var does not change any source file,
+# so it does not invalidate the FlyDSL disk cache on its own.
+_BF16_KERNEL_SUFFIX = "_fastcvt" if USE_FAST_BF16 else ""
+
+
+def _to_bf16(val, n=1, fast=None):
+    """f32 -> bf16. Which variant is used is decided by :data:`USE_FAST_BF16`.
 
     ``n`` is the element count: 1 for a scalar ``Float32``, N for an f32xN
     ``Vector``. Returns a raw ``ir.Value``.
 
-    Do not replace this with ``.truncf()`` / ``.to(BFloat16)``. Those emit
-    ``arith.truncf``, which MLIR defines as round-to-nearest-even; gfx942 lacks
-    ``v_cvt_pk_bf16_f32``, and this implementationis tuned for gfx942.
+    ``fast`` selects the variant; ``None`` (the default) means "whatever
+    :data:`USE_FAST_BF16` says", i.e. the ``FAST_FP32_TO_FP16`` environment
+    variable.
 
-    Plain truncation (``bits >> 16``) is ~2 VALU but too lossy here.
-    The 0x8000 bias costs one add and restores <=0.5 ulp symmetric error.
+    Default: one ``arith.truncf`` -- IEEE round-to-nearest-even, NaN and Inf
+    carried through by construction.
 
-    Ties round away from zero, not to even. Values are sign-magnitude so one
-    bias serves both signs, and the carry can only perturb the exponent within
-    ~1 ulp of FLT_MAX.
-
-    NaN needs a guard. The 0x8000 bias carries into the exponent field for any
-    NaN whose payload lives entirely below bit 16 -- 0x7F800001 rounds to
-    0x7F80, which is +Inf, turning "not a number" into "infinitely large". Such
-    low-payload NaNs are what an integer-coded or hardware-generated NaN
-    typically looks like. Infinity itself survives the bias untouched
-    (0x7F800000 + 0x8000 >> 16 == 0x7F80), so only NaN needs handling.
-
-    For NaN we take the raw high half and force the quiet bit instead of
-    rounding: that keeps the sign and the payload bits bf16 can represent, and
-    quietens a signaling NaN. Quietening is what IEEE-754 conversion and the
-    hardware ``v_cvt`` do -- bf16 has no way to carry a payload small enough to
-    distinguish sNaN from qNaN, so preserving NaN-ness is the strongest
-    guarantee available.
+    ``FAST_FP32_TO_FP16=1``: ``(bitcast<u32>(x) + 0x8000) >> 16``, i.e.
+    round-half-AWAY-from-zero. Values are sign-magnitude so one bias serves both
+    signs, and for finite values the carry can only perturb the exponent within
+    ~1 ulp of FLT_MAX. It does not preserve NaN.
     """
+    if fast is None:
+        fast = USE_FAST_BF16
+
     is_vec = n > 1
+    bf16_ty = T.vec(n, T.bf16) if is_vec else T.bf16
+
+    if not fast:
+        return _arith.truncf(bf16_ty, as_ir_value(val))
+
     i32_ty = T.vec(n, T.i32) if is_vec else T.i32
     i16_ty = T.vec(n, T.i16) if is_vec else T.i16
-    bf16_ty = T.vec(n, T.bf16) if is_vec else T.bf16
 
     def _splat(c):
         return as_ir_value(fx.full(n, c, fx.Int32) if is_vec else fx.Int32(c))
 
     bits = _arith.bitcast(i32_ty, as_ir_value(val))
-    # The shift may be signed or unsigned: the following trunci keeps only the
-    # low 16 bits, which are bits 16..31 of the input either way.
+    # The shift may be signed or unsigned: the trunci below keeps only the low
+    # 16 bits, which are bits 16..31 of the input either way.
     hi = _arith.shrui(_arith.addi(bits, _splat(0x8000)), _splat(16))
-
-    # NaN iff |bits| > 0x7F800000 (exponent all ones and payload non-zero).
-    # Tested on the integer bits so scalar and vector share one path.
-    is_nan = _arith.cmpi(
-        _arith.CmpIPredicate.ugt,
-        _arith.andi(bits, _splat(0x7FFFFFFF)),
-        _splat(0x7F800000),
-    )
-    # Sign + exponent + top payload bits, with the quiet bit (0x0040) forced.
-    nan_hi = _arith.ori(_arith.shrui(bits, _splat(16)), _splat(0x0040))
-    hi = _arith.select(is_nan, nan_hi, hi)
-
     narrowed = _arith.trunci(i16_ty, hi)
     cast = _vector.bitcast if is_vec else _arith.bitcast
     return cast(bf16_ty, narrowed)
@@ -461,8 +496,14 @@ def compile_chunk_gated_delta_h_gfx942(
     )
 
     _kernel_name = (
-        "chunk_gdn_fwd_h_o_flydsl_vk" if COMPUTE_OUTPUT else "chunk_gdn_fwd_h_flydsl_vk"
-    ) + f"_{_variant_tag(BV, NUM_WARPS)}"
+        (
+            "chunk_gdn_fwd_h_o_flydsl_vk"
+            if COMPUTE_OUTPUT
+            else "chunk_gdn_fwd_h_flydsl_vk"
+        )
+        + f"_{_variant_tag(BV, NUM_WARPS)}"
+        + _BF16_KERNEL_SUFFIX
+    )
 
     @flyc.kernel(name=_kernel_name, **_kernel_deco_kwargs)
     def gdn_h_kernel(
@@ -539,27 +580,44 @@ def compile_chunk_gated_delta_h_gfx942(
             n = fx.get_scalar(fx.cosize(fx.get_layout(buf)))
             return fx.Tensor(fx.make_view(fx.get_iter(buf), fx.make_layout((n,), (1,))))
 
-        if const_expr(USE_G):
-            # ``g`` is head-major [B, H, T_flat]. The view must span the whole
-            # tensor (B*H*T_flat): a bound of H*T_flat would read a hardware
-            # zero for every i_n>0 batch in dense mode.
-            g_buf = _flat_buffer(g_tensor)
-        if const_expr(USE_GK):
-            # [n/4, 4]: one row is gk's 4-wide contiguous quad. The element
-            # offset is always 4-aligned -- K % 4 == 0 (asserted above) and
-            # every addend (H*K, i_h*K, kb*64, wid_m*16, lane_m_base*4) is a
-            # multiple of 4 -- so quad // 4 is exact.
-            #
-            # The extent comes from the tensor, not from T_flat*H*K: dense
-            # ``gk`` is [B, T_flat, H, K] and the read offset below carries a
-            # batch term (bos = i_n*T_val), so a one-batch bound would read a
-            # hardware zero for every i_n>0, silently dropping the gate.
-            _gk_buf = fx.rocdl.make_buffer_tensor(gk_tensor, max_size=False)
-            _gk_n = fx.get_scalar(fx.cosize(fx.get_layout(_gk_buf)))
-            gk_buf = fx.Tensor(
-                fx.make_view(
-                    fx.get_iter(_gk_buf),
-                    fx.make_layout((_gk_n // 4, 4), (4, 1)),
+        def _elems(tensor):
+            """Element count of ``tensor``'s whole footprint."""
+            return fx.get_scalar(fx.cosize(fx.get_layout(tensor)))
+
+        def _seq_view(tensor, base_elems, rows, row_stride, shape, stride):
+            """Buffer view rooted at ``base_elems``, bounded to ``rows`` rows.
+
+            THE BUILD ORDER IS THE POINT. ``add_offset`` runs on the raw GLOBAL
+            pointer, so the sequence/head base lands in the descriptor's BASE
+            word and ``num_records`` is measured from it -- which is what lets
+            the bound be per-sequence instead of per-tensor. Doing it the other
+            way round (buffer first, then offset) would leave the bound relative
+            to the tensor origin and every guard below would still be needed.
+
+            The hardware test is ``offset >= num_records``, so a bound of
+            ``rows * row_stride`` elements excludes row ``rows`` exactly while
+            admitting every column of rows ``0 .. rows-1`` (every tensor here
+            has ``row_stride >= innermost extent``). A read past the sequence
+            therefore returns a HARDWARE ZERO rather than the neighbouring
+            sequence's live data -- the invariant the tail guards used to fake.
+
+            ``num_records`` is in BYTES, and the width is taken from the tensor
+            rather than assumed: k/w/u/q are bf16 but the gates are f32, and
+            hard-coding 2 here silently halves every gate descriptor -- which
+            zeroes the back half of every sequence, not just its tail.
+            """
+            elem_bytes = tensor.element_type.width // 8
+            assert elem_bytes * 8 == tensor.element_type.width, (
+                "_seq_view needs a byte-sized element type; got "
+                f"{tensor.element_type.width} bits"
+            )
+            it = fx.add_offset(fx.get_iter(tensor), base_elems)
+            view = fx.make_view(it, fx.make_layout(shape, stride))
+            return fx.Tensor(
+                fx.rocdl.make_buffer_tensor(
+                    view,
+                    num_records_bytes=fx.Int64(rows * row_stride)
+                    * fx.Int64(elem_bytes),
                 )
             )
 
@@ -614,7 +672,7 @@ def compile_chunk_gated_delta_h_gfx942(
             """Convert an f32 accumulator to bf16 and copy it into ``dst_view``."""
             pD = tc.partition_D(dst_view)
             frag = fx.make_fragment_like(pD)
-            frag.store(_to_bf16_fast(acc_vec, n))
+            frag.store(_to_bf16(acc_vec, n))
             fx.copy(atom, frag, pD)
 
         # -- LDS views --
@@ -742,8 +800,8 @@ def compile_chunk_gated_delta_h_gfx942(
         if const_expr(USE_G):
             # ``g`` is head-major [B, H, T_flat], so its batch stride is
             # H*T_flat -- unlike the token-major tensors, ``bos`` cannot be
-            # folded into the row index. Indexing is ``g_base + row`` where the
-            # row is sequence-relative.
+            # folded into the row index. It goes into the descriptor base
+            # instead, leaving the in-loop index sequence-relative.
             if const_expr(IS_VARLEN):
                 g_base = i_h * T_flat + bos
             else:
@@ -752,6 +810,32 @@ def compile_chunk_gated_delta_h_gfx942(
         # This CTA owns the [i_v*BV, (i_v+1)*BV) column window of u, so the
         # column offset folds into the base and gU is a [BT, BV] view.
         u_base = v_base + i_v * fx.Int32(BV)
+
+        # -- Gate buffers: rooted here, not at the top, because the base and the
+        # -- bound both need bos / T_local from the prologue above.
+        # The layout shape is only the addressing DOMAIN -- what actually limits
+        # a read is num_records -- so it stays whole-tensor-sized, exactly as it
+        # was before, and only the base and the bound change.
+        if const_expr(USE_G):
+            # Head-major [B, H, T_flat], so this head's run of this sequence's
+            # tokens is contiguous and the bound is simply T_local elements.
+            g_buf = _seq_view(
+                g_tensor, g_base, T_local, fx.Int32(1), (_elems(g_tensor),), (1,)
+            )
+        if const_expr(USE_GK):
+            # [n/4, 4]: one row is gk's 4-wide contiguous quad. The element
+            # offset is always 4-aligned -- K % 4 == 0 (asserted above) and
+            # every addend (H*K, i_h*K, kb*64, wid_m*16, lane_m_base*4) is a
+            # multiple of 4 -- so quad // 4 is exact.
+            gk_base = bos * fx.Int32(H * K) + i_h * fx.Int32(K)
+            gk_buf = _seq_view(
+                gk_tensor,
+                gk_base,
+                T_local,
+                fx.Int32(H * K),
+                (_elems(gk_tensor) // 4, 4),
+                (4, 1),
+            )
 
         # -- Tiled w staging: HBM [BT, K] tile -> lds_w --
         # Two destination views:
@@ -785,19 +869,12 @@ def compile_chunk_gated_delta_h_gfx942(
             univ_cp_r2s_64b_bf16, tv_store, copy_tile
         ).get_slice(tid)
 
-        # WU decomposition layout definitions.
-        w_buf_tensor = fx.get_iter(
-            fx.rocdl.make_buffer_tensor(w_tensor, max_size=False)
-        )
-        u_buf_tensor = fx.get_iter(
-            fx.rocdl.make_buffer_tensor(u_tensor, max_size=False)
-        )
-        gW = fx.Tensor(
-            fx.make_view(w_buf_tensor, fx.make_layout((BT, K), (STRIDE_W_C, 1)))
-        )
-        gU = fx.Tensor(
-            fx.make_view(u_buf_tensor, fx.make_layout((BT, BV), (STRIDE_U_C, 1)))
-        )
+        # WU decomposition layout definitions. Both are rooted at this CTA's
+        # (sequence, head) -- and for u, its V-column window -- and bounded to
+        # T_local rows, so the chunk offset is all that rides in soffset and a
+        # tail row reads a hardware zero.
+        gW = _seq_view(w_tensor, w_base, T_local, stride_w, (BT, K), (STRIDE_W_C, 1))
+        gU = _seq_view(u_tensor, u_base, T_local, stride_v, (BT, BV), (STRIDE_U_C, 1))
         pS_w = tiled_cp_g2r.partition_S(gW)
         # u goes through the MMA's C partitioning, not tiled_cp_g2r: its
         # consumer wants the C-fragment layout, not a row-contiguous tile.
@@ -806,15 +883,13 @@ def compile_chunk_gated_delta_h_gfx942(
         pD_w_hi = tiled_cp_r2s.partition_D(sW_hi)
 
         if const_expr(COMPUTE_OUTPUT):
-            q_git = fx.get_iter(fx.rocdl.make_buffer_tensor(q_tensor, max_size=False))
-            gQ = fx.Tensor(
-                fx.make_view(q_git, fx.make_layout((BT, K), (STRIDE_Q_C, 1)))
+            gQ = _seq_view(
+                q_tensor, q_base, T_local, stride_q, (BT, K), (STRIDE_Q_C, 1)
             )
             pS_q = tiled_cp_g2r.partition_S(gQ)
 
         # -- Tiled k staging --
         swz_kt = fx.static(_single_xor_swz(LDS_KT_COLS, LDS_KT_NG))
-        k_git = fx.get_iter(fx.rocdl.make_buffer_tensor(k_tensor, max_size=False))
         if const_expr(KT_TRANSPOSED):
             # HBM [BT, K] -> lds_kt [K, BT]. This is a genuine transpose and its
             # LDS write is hand-addressed (see _grp_idx above): the composed
@@ -825,19 +900,17 @@ def compile_chunk_gated_delta_h_gfx942(
             # slots; a slot is 4 BT-consecutive rows at one K_VEC_WIDTH-wide
             # k-col group, so the 4 rows form one bt-group -> one ds_write_b64.
             # [n/K_VEC_WIDTH, K_VEC_WIDTH]: one row is one contiguous k-col
-            # group. k_off is always K_VEC_WIDTH-aligned (k_base/stride_k are
-            # multiples of K and kx_col_base is a multiple of K_VEC_WIDTH), so
-            # off // K_VEC_WIDTH is exact.
-            _k_bt = fx.rocdl.make_buffer_tensor(k_tensor, max_size=False)
-            _k_n = fx.get_scalar(fx.cosize(fx.get_layout(_k_bt)))
-            k_kt_buf = fx.Tensor(
-                fx.make_view(
-                    fx.get_iter(_k_bt),
-                    fx.make_layout(
-                        (_k_n // fx.Int32(K_VEC_WIDTH), K_VEC_WIDTH),
-                        (K_VEC_WIDTH, 1),
-                    ),
-                )
+            # group. The offset is always K_VEC_WIDTH-aligned (stride_k is a
+            # multiple of K and kx_col_base is a multiple of K_VEC_WIDTH), so
+            # off // K_VEC_WIDTH is exact. Rooted at (sequence, head) and
+            # bounded to T_local rows, so a tail row reads a hardware zero.
+            k_kt_buf = _seq_view(
+                k_tensor,
+                k_base,
+                T_local,
+                stride_k,
+                (_elems(k_tensor) // fx.Int32(K_VEC_WIDTH), K_VEC_WIDTH),
+                (K_VEC_WIDTH, 1),
             )
             kx_col_base = (tid % fx.Int32(K_COL_GROUPS)) * fx.Int32(K_VEC_WIDTH)
             kx_row_quad = tid // fx.Int32(K_COL_GROUPS)
@@ -850,8 +923,8 @@ def compile_chunk_gated_delta_h_gfx942(
                 lds_kt_ptr,
                 fx.make_composed_layout(swz_kt, LDS_HALF, w_inner_layout),
             )
-            gK = fx.Tensor(
-                fx.make_view(k_git, fx.make_layout((BT, K), (STRIDE_K_C, 1)))
+            gK = _seq_view(
+                k_tensor, k_base, T_local, stride_k, (BT, K), (STRIDE_K_C, 1)
             )
             pS_k = tiled_cp_g2r.partition_S(gK)
             pD_k_lo = tiled_cp_r2s.partition_D(sK_lo)
@@ -892,18 +965,21 @@ def compile_chunk_gated_delta_h_gfx942(
                 fx.Tensor(fx.make_view(h_git, fx.make_layout((BV, K), (K, 1))))
             )
 
-        def _stage_g2r(atom, pS, base, stride, it_i32):
+        def _stage_g2r(atom, pS, stride, it_i32):
             """Issue chunk ``it_i32``'s [BT, *] tile into a register fragment.
 
             ``atom`` MUST be the atom ``pS`` was partitioned with. ``stride`` is
-            the row pitch, so the chunk offset is ``it_i32 * BT`` rows.
+            the row pitch, so the chunk offset is ``it_i32 * BT`` rows. The
+            offset is sequence-relative: the (sequence, head) base already sits
+            in the descriptor (see ``_seq_view``), which is what makes the
+            hardware bound per-sequence.
             """
             frag = fx.make_fragment_like(pS)
             fx.copy(
                 atom,
                 pS,
                 frag,
-                soffset=base + it_i32 * fx.Int32(BT) * stride,
+                soffset=it_i32 * fx.Int32(BT) * stride,
             )
             return frag.load()
 
@@ -1004,28 +1080,28 @@ def compile_chunk_gated_delta_h_gfx942(
             loads never force a wait where they are issued.
             """
             out = [
-                _stage_g2r(buf_cp_g2r_128b_bf16, pS_w, w_base, stride_w, it_i32),
-                _stage_g2r(cp_u_g2r, pS_u, u_base, stride_v, it_i32),
+                _stage_g2r(buf_cp_g2r_128b_bf16, pS_w, stride_w, it_i32),
+                _stage_g2r(cp_u_g2r, pS_u, stride_v, it_i32),
             ]
             next_end = (it_i32 + fx.Int32(1)) * fx.Int32(BT)
+            # Semantic clamp, NOT a bounds guard: the decay factor is the LAST
+            # VALID token's gate, so a hardware zero here would be wrong.
             last_idx = (next_end < T_local).select(next_end, T_local) - fx.Int32(1)
             row_base = (
                 it_i32 * fx.Int32(BT) + wid_m * fx.Int32(16) + lane_m_base * fx.Int32(4)
             )
             if const_expr(USE_G):
-                out.append(g_buf[(g_base + last_idx,)])
+                out.append(g_buf[(last_idx,)])
                 for elem_i in range_constexpr(4):
-                    # No address clamp: g_buf is bounds-checked, so a row past
-                    # the tensor reads a hardware zero, and both use sites
-                    # already discard out-of-range rows (K5 masks the gate via
-                    # in_bounds.select, the fused path guards the o store).
-                    abs_row = row_base + fx.Int32(elem_i)
-                    out.append(g_buf[(g_base + abs_row,)])
+                    # No address clamp: g_buf is bounded to this sequence's
+                    # T_local rows, so a row past the sequence end reads a
+                    # hardware zero -- and the gate mask discards it anyway
+                    # (exp(g_last - 0) is not 0, so that mask has to stay).
+                    out.append(g_buf[(row_base + fx.Int32(elem_i),)])
             if const_expr(USE_GK):
-                gk_chunk_base = (bos + last_idx) * fx.Int32(H * K) + i_h * fx.Int32(K)
                 for kb in range_constexpr(NUM_K_BLOCKS):
                     quad = (
-                        gk_chunk_base
+                        last_idx * fx.Int32(H * K)
                         + fx.Int32(kb * 64)
                         + wid_m * fx.Int32(16)
                         + lane_m_base * fx.Int32(4)
@@ -1088,12 +1164,22 @@ def compile_chunk_gated_delta_h_gfx942(
                     N_REPEAT_LOCAL * 4,
                 )
 
-            # The drain below reads lds_h groups written by other threads; the
-            # fused build has no drain, so it needs no barrier here (its lds_h
-            # readers are GEMM1/GEMM3, both after the post-lds_w barrier).
-            if const_expr(STORE_H):
-                gpu.barrier()
+            # -- Store prefetched w to LDS (two b64 halves per bf16x8) --
+            # Staged BEFORE the barrier so one barrier publishes both lds_h and
+            # lds_w. w_frag is loop-carried, so this has no dependency on the
+            # drain below and moving it up only shortens its live range. The
+            # WAR against the previous chunk's GEMM1 reads of lds_w is covered
+            # by the post-lds_kt/lds_vnt barrier at the end of the body.
+            _stage_r2s(w_frag, pD_w_lo, pD_w_hi)
 
+            gpu.barrier()
+
+            # The drain reads lds_h groups written by other threads, so it has
+            # to follow a barrier -- but not its own. Sitting after the shared
+            # barrier instead of between two of them lets its LDS reads and the
+            # HBM store overlap the GEMM1 MFMA chain, and costs two barriers per
+            # chunk rather than three. (The fused build has no drain at all.)
+            if const_expr(STORE_H):
                 # -- LDS -> HBM h snapshot --
                 # 8 contiguous k per thread is one 16 B HBM store,
                 # but two non-adjacent b64 LDS reads, because
@@ -1127,11 +1213,6 @@ def compile_chunk_gated_delta_h_gfx942(
                     soffset=offset,
                 )
 
-            # -- Store prefetched w to LDS (two b64 halves per bf16x8) --
-            _stage_r2s(w_frag, pD_w_lo, pD_w_hi)
-
-            gpu.barrier()
-
             # -- k prefetch (issued now, stored to LDS after GEMM1) --
             if const_expr(KT_TRANSPOSED):
                 # Each thread owns K_SLOTS_PER_THREAD slots; a slot is 4
@@ -1140,6 +1221,14 @@ def compile_chunk_gated_delta_h_gfx942(
                 # ds_write_b64 with no cross-lane movement. k_prefetch[s][j] is
                 # k[row = (kx_row_quad + s*K_ROW_QUAD_STRIDE)*4 + j,
                 #   col = kx_col_base + (0..K_VEC_WIDTH-1)].
+                #
+                # No row clamp and no value mask. k_kt_buf is rooted at this
+                # (sequence, head) and bounded to T_local rows, so a row past
+                # the sequence end is out of range of the descriptor and the
+                # hardware returns zero -- it can no longer reach the next
+                # head/sequence's live data, which is what used to force the
+                # clamp, and a hardware zero cannot be the Inf/NaN that used to
+                # force the value mask.
                 k_prefetch = []
                 k_prefetch_lds_t = []  # row-quad per slot -> lds_kt[k, bt] group
                 for s in range_constexpr(K_SLOTS_PER_THREAD):
@@ -1148,36 +1237,16 @@ def compile_chunk_gated_delta_h_gfx942(
                     for j in range_constexpr(4):
                         row = row_quad * fx.Int32(4) + fx.Int32(j)
                         abs_row = i_t_i32 * fx.Int32(BT) + row
-                        row_ok = abs_row < T_local
-                        # The clamp keeps the ADDRESS in range; it cannot be
-                        # dropped in favour of the buffer's bounds check,
-                        # because a row past T_local is still a live element of
-                        # the next head/sequence rather than a hardware zero.
-                        # But the clamped load then returns row 0's real k, so
-                        # zero the VALUE explicitly: these lanes only survive
-                        # into GEMM2 as k^T @ v_new, and while v_new is already
-                        # zeroed there, Inf*0 and NaN*0 are NaN -- a non-finite
-                        # k in row 0 would poison the state update.
-                        safe_row = row_ok.select(abs_row, fx.Int32(0))
-                        k_off = k_base + safe_row * stride_k + kx_col_base
-                        k_val = fx.Vector(
-                            k_kt_buf[(k_off // fx.Int32(K_VEC_WIDTH), None)].load()
-                        )
+                        k_off = abs_row * stride_k + kx_col_base
                         quad_rows.append(
-                            fx.Vector.from_elements(
-                                [
-                                    row_ok.select(k_val[e], fx.BFloat16(0.0))
-                                    for e in range_constexpr(K_VEC_WIDTH)
-                                ],
-                                dtype=fx.BFloat16,
+                            fx.Vector(
+                                k_kt_buf[(k_off // fx.Int32(K_VEC_WIDTH), None)].load()
                             )
                         )
                     k_prefetch.append(quad_rows)
                     k_prefetch_lds_t.append(row_quad)
             else:
-                k_prefetch = _stage_g2r(
-                    buf_cp_g2r_128b_bf16, pS_k, k_base, stride_k, i_t_i32
-                )
+                k_prefetch = _stage_g2r(buf_cp_g2r_128b_bf16, pS_k, stride_k, i_t_i32)
 
             # -- g / gk: type this chunk's values, prefetched last iter --
             # They come off the loop-carried state as bare IR values.
@@ -1240,27 +1309,15 @@ def compile_chunk_gated_delta_h_gfx942(
                 u_f32 = fx.Vector.from_elements(u_f32_elems, dtype=fx.Float32)
                 vn_frags.append(u_f32 - bv_val)
 
-            # -- Tail-chunk row mask --
-            # On the final chunk, BT rows beyond T_local are padding whose w/u/k
-            # loads read past the tensor (bounds-checked to zero). They must be
-            # zeroed in v_new before the k^T @ v_new state update or
-            # final_state is corrupted.
-            #
-            # Selected, not multiplied by a 0.0/1.0 vector: a padding lane can
-            # carry a NaN or Inf (a non-finite input propagates through the
-            # GEMM into b_v), and NaN*0 == NaN while Inf*0 == NaN, so a
-            # multiplicative mask leaves the poison in place and it reaches the
-            # state update. Cost is unchanged -- v_cndmask for v_mul, 4 of each
-            # per fragment.
-            for nr in range_constexpr(N_REPEAT_LOCAL):
-                vn_val = vn_frags[nr]
-                vn_frags[nr] = fx.Vector.from_elements(
-                    [
-                        frag_row_ok[e].select(vn_val[e], fx.Float32(0.0))
-                        for e in range_constexpr(4)
-                    ],
-                    dtype=fx.Float32,
-                )
+            # No tail-chunk row mask on v_new. On the final chunk the BT rows
+            # beyond T_local are padding, and w / u / k are all bounded to
+            # T_local rows (see _seq_view), so those rows load a hardware zero
+            # and v_new = u - w @ h is already exactly zero there -- nothing
+            # reaches the k^T @ v_new state update. The mask that used to live
+            # here existed because the descriptors spanned the whole tensor and
+            # padding rows returned a neighbour's live (possibly non-finite)
+            # data; a hardware zero cannot be Inf or NaN, so the argument for it
+            # is gone with the descriptor change.
 
             # -- 2b. Store v_new for output --
             if const_expr(SAVE_NEW_VALUE):
@@ -1276,7 +1333,7 @@ def compile_chunk_gated_delta_h_gfx942(
                     for elem_i in range_constexpr(4):
                         if frag_row_ok[elem_i].ir_value():
                             f32_v = vn_val[elem_i]
-                            bf16_v = _to_bf16_fast(f32_v)
+                            bf16_v = _to_bf16(f32_v)
                             vn_off = vn_base + frag_row[elem_i] * fx.Int32(V) + vn_col
                             _emit_vn_store(vn_off, bf16_v)
 
@@ -1291,8 +1348,13 @@ def compile_chunk_gated_delta_h_gfx942(
                 exp_g_last = _fast_exp(g_last_val)
                 gate_elems = []
                 for elem_i in range_constexpr(4):
-                    gate = _fast_exp(g_last_val - g_row_raw[elem_i])
-                    gate_elems.append(frag_row_ok[elem_i].select(gate, fx.Float32(0.0)))
+                    # No row mask on the gate. v_new is already EXACTLY zero on
+                    # padding rows (w and u are bounded to T_local, so both read
+                    # a hardware zero and 0 - 0*h == 0), and the gate is finite
+                    # there -- g_row reads a hardware zero and g is a cumsum of
+                    # non-positive values, so exp(g_last - 0) = exp(g_last) is
+                    # in (0, 1]. 0 * finite == 0, so the mask changes nothing.
+                    gate_elems.append(_fast_exp(g_last_val - g_row_raw[elem_i]))
                 gate_vec = fx.Vector.from_elements(gate_elems, dtype=fx.Float32)
                 for nr in range_constexpr(N_REPEAT_LOCAL):
                     vn_frags[nr] = vn_frags[nr] * gate_vec
@@ -1336,7 +1398,7 @@ def compile_chunk_gated_delta_h_gfx942(
                     vnt_v = _nr_v(nr) + lane_n
                     vnt_g = wid_m * fx.Int32(4) + lane_m_base
                     fx.ptr_store(
-                        _to_bf16_fast(vn_frags[nr], 4),
+                        _to_bf16(vn_frags[nr], 4),
                         lds_vnt_ptr + _lds_vnt_idx(vnt_v, vnt_g),
                     )
             else:
@@ -1397,9 +1459,7 @@ def compile_chunk_gated_delta_h_gfx942(
                 # Issue q's HBM loads before GEMM2 so their latency hides behind
                 # GEMM2's MFMA chain. q is independent of GEMM2; only the lds_q
                 # store must wait for GEMM1's lds_w readers.
-                q_prefetch = _stage_g2r(
-                    buf_cp_g2r_128b_bf16, pS_q, q_base, stride_q, i_t_i32
-                )
+                q_prefetch = _stage_g2r(buf_cp_g2r_128b_bf16, pS_q, stride_q, i_t_i32)
 
             # -- GEMM2: h += k^T @ v_new  (contraction over BT) --
             # Output h is [K, V], contraction BT.
@@ -1636,18 +1696,18 @@ def compile_chunk_gated_delta_h_gfx942(
                 masked = []
                 for nr in range_constexpr(BT_STEPS_LOCAL):
                     bt_col = _nr_v(nr) + lane_n
-                    col_abs = i_t_i32 * fx.Int32(BT) + bt_col
                     a_acc = fx.Vector(frag_a[None, None, nr].load())
                     for e in range_constexpr(4):
-                        causal = (
-                            (frag_row_local[e] >= bt_col)
-                            & frag_row_ok[e]
-                            & (col_abs < T_local)
-                        )
-                        # Select, not a multiply by 0.0: masked-out lanes can
-                        # hold a NaN or Inf from an out-of-range load, and
-                        # NaN*0 is NaN while Inf*0 is NaN. A select discards
-                        # the value outright. Same VALU cost (v_cndmask).
+                        # Triangle only. The two in-bounds terms this used to
+                        # AND in (query row < T_local, key col < T_local) are
+                        # redundant now that q and k are bounded to T_local:
+                        # a padding row or column reads a hardware zero, so
+                        # A = q @ k^T is already exactly zero there and cannot
+                        # carry the NaN/Inf the select was guarding against.
+                        # Dropping them also collapses a 3-term lane-mask AND
+                        # chain into one compare, which is why the saving shows
+                        # up mostly in SALU.
+                        causal = frag_row_local[e] >= bt_col
                         masked.append(causal.select(a_acc[e], fx.Float32(0.0)))
                 # lds_A's 4 C values are BT apart so this is goes out through the scalar copy atom.
                 _cfrag_to_lds(
@@ -1748,7 +1808,7 @@ def compile_chunk_gated_delta_h_gfx942(
                     for elem_i in range_constexpr(4):
                         if frag_row_ok[elem_i].ir_value():
                             o_off = o_base + frag_row[elem_i] * stride_o + o_col
-                            _emit_o_store(o_off, _to_bf16_fast(o_scaled[elem_i]))
+                            _emit_o_store(o_off, _to_bf16(o_scaled[elem_i]))
 
                 next_prefetch = _stage_prefetch(i_t_i32 + fx.Int32(1))
 
@@ -1771,7 +1831,7 @@ def compile_chunk_gated_delta_h_gfx942(
                     h_accs_c[kb].load(), (N_REPEAT_LOCAL * 4,), fx.Float32
                 )
                 if const_expr(STATE_DTYPE_BF16):
-                    f_ht.store(_to_bf16_fast(acc_whole, N_REPEAT_LOCAL * 4))
+                    f_ht.store(_to_bf16(acc_whole, N_REPEAT_LOCAL * 4))
                 else:
                     f_ht.store(acc_whole)
                 fx.copy(

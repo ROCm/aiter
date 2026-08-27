@@ -50,6 +50,7 @@ import math
 import zlib
 from dataclasses import dataclass, replace
 
+import numpy as np
 import pytest
 import torch
 import triton
@@ -1939,6 +1940,101 @@ class TestCorrectness:
             fs_fly, fs_ref, rmse_ratio=_RMSE_TOL, label=f"{tag} final_state"
         )
 
+    @pytest.mark.parametrize("gate", ["g", "gk", None])
+    @pytest.mark.parametrize("H, Hg", [(16, 16), (16, 8)])
+    def test_varlen_ragged_partial_chunks(self, gate, H, Hg):
+        """Varlen batch whose sequences have DIFFERING, non-multiple-of-64 lengths.
+
+        This is the discriminating case for a per-sequence buffer bound that is
+        too WIDE. Such a bound misbehaves only on non-final sequences: the final
+        sequence over-reads into genuinely out-of-range memory and still gets the
+        hardware zero it wanted, so a single-sequence or last-sequence-only test
+        passes either way. A bound that is too NARROW fails everywhere and any
+        test catches it.
+
+        Every other multi-sequence varlen case in this file uses EQUAL-length
+        segments, and the two partial-chunk tests above are single-sequence or
+        equal-length, so nothing else covers this. Sequence 0 is deliberately
+        short and ragged so its padding rows sit directly in front of sequence
+        1's live data.
+        """
+        _RMSE_TOL = 3e-2
+        context_lens = [613, 1000, 128]  # 613 % 64 == 37, 1000 % 64 == 40
+        K, V = 128, 128
+        N = len(context_lens)
+        T_total = sum(context_lens)
+
+        torch.manual_seed(_case_seed(context_lens) + (H + Hg))
+
+        cu = torch.tensor(
+            [0] + [sum(context_lens[: i + 1]) for i in range(N)],
+            dtype=torch.int32,
+            device="cuda",
+        )
+        k = torch.randn(1, T_total, Hg, K, dtype=torch.bfloat16, device="cuda") * 0.1
+        w_orig = (
+            torch.randn(1, T_total, H, K, dtype=torch.bfloat16, device="cuda") * 0.1
+        )
+        u_orig = (
+            torch.randn(1, T_total, H, V, dtype=torch.bfloat16, device="cuda") * 0.1
+        )
+        w_c = w_orig.permute(0, 2, 1, 3).contiguous()
+        u_c = u_orig.permute(0, 2, 1, 3).contiguous()
+        h0 = torch.randn(N, H, V, K, dtype=torch.float32, device="cuda") * 0.01
+
+        g = gk = None
+        if gate == "g":
+            g = (
+                torch.randn(1, H, T_total, dtype=torch.float32, device="cuda")
+                .abs()
+                .mul(-0.5)
+                .cumsum(dim=-1)
+                .contiguous()
+            )
+        elif gate == "gk":
+            gk = (
+                torch.randn(T_total, H, K, dtype=torch.float32, device="cuda")
+                .abs()
+                .mul(-0.1)
+                .cumsum(dim=0)
+                .contiguous()
+            )
+
+        h_fly, vn_fly, fs_fly = chunk_gated_delta_rule_fwd_h_flydsl(
+            k,
+            w_c,
+            u_c,
+            g=g,
+            gk=gk,
+            initial_state=h0,
+            output_final_state=True,
+            cu_seqlens=cu,
+            use_exp2=False,
+        )
+        h_ref, vn_ref, fs_ref = ref_chunk_gated_delta_rule_fwd_h(
+            k,
+            w_orig,
+            u_orig,
+            g=g,
+            gk=gk,
+            initial_state=h0,
+            output_final_state=True,
+            cu_seqlens=cu,
+            g_head_major=g is not None,
+        )
+
+        tag = f"ragged_{gate}_H{H}_Hg{Hg}"
+        _assert_rmse_within(h_fly, h_ref, rmse_ratio=_RMSE_TOL, label=f"{tag} h")
+        _assert_rmse_within(
+            _normalize_opt_v_new(vn_fly),
+            vn_ref,
+            rmse_ratio=_RMSE_TOL,
+            label=f"{tag} v_new",
+        )
+        _assert_rmse_within(
+            fs_fly, fs_ref, rmse_ratio=_RMSE_TOL, label=f"{tag} final_state"
+        )
+
 
 # -- Performance benchmark (flydsl-hip vs hip vs triton) -----------------
 
@@ -2325,6 +2421,116 @@ _SELECT_CASES = [
     (16, 16, 8192, 5, "g", "bv32"),  # H*N = 80
     (16, 16, 8192, 6, "g", "bv64w8"),  # H*N = 96
 ]
+
+
+# -- bf16 NaN/Inf classification ----------------------------------------
+
+# (label, f32 bit pattern). Chosen to cover every way the `+0x8000` rounding
+# bias in the fast converter (``FAST_FP32_TO_FP16=1``) can destroy a
+# non-finite value:
+#
+#   * low-payload NaN  -- the case PR #4884 review item 4 named: the bias
+#     carries out of the payload into the exponent and yields Inf.
+#   * all-ones-mantissa NaN -- the carry ripples through the *whole* exponent
+#     and into the sign, yielding -0.0. That is strictly worse than Inf,
+#     because -0.0 is finite and participates silently in later arithmetic.
+#   * signaling vs quiet -- only the quiet bit (f32 bit 22) distinguishes them,
+#     and it sits above bit 16, so it changes whether the carry is absorbed.
+#   * +-Inf -- must survive unchanged; the bias alone does not perturb them,
+#     so these are the negative controls.
+_NAN_INF_PATTERNS = [
+    ("low_payload_snan_pos", 0x7F800001, "nan"),
+    ("low_payload_snan_neg", 0xFF800001, "nan"),
+    ("low_payload_qnan_pos", 0x7FC00001, "nan"),
+    ("all_ones_mantissa_qnan", 0x7FFFFFFF, "nan"),
+    ("snan_mantissa_bits16_21_ones", 0x7FBFFFFF, "nan"),
+    ("qnan_high_payload", 0x7FD5AAAA, "nan"),
+    ("pos_inf", 0x7F800000, "+inf"),
+    ("neg_inf", 0xFF800000, "-inf"),
+]
+
+
+def _assert_class(vals, kind, label):
+    """Assert every element of ``vals`` has IEEE class ``kind``."""
+    f = vals.float()
+    if kind == "nan":
+        assert torch.isnan(f).all(), (
+            f"{label}: expected NaN, got {f.tolist()} -- the bf16 conversion "
+            "destroyed the NaN classification"
+        )
+    elif kind == "+inf":
+        assert torch.isposinf(f).all(), f"{label}: expected +Inf, got {f.tolist()}"
+    else:
+        assert torch.isneginf(f).all(), f"{label}: expected -Inf, got {f.tolist()}"
+
+
+@pytest.mark.skipif(not is_flydsl_available(), reason="flydsl not available")
+class TestBf16NanClassification:
+    """The f32 -> bf16 converter must preserve NaN/Inf classification.
+    """
+
+    @staticmethod
+    def _inputs(H, Hg, K, V, T, bits):
+        dev = "cuda"
+        k = torch.zeros(1, T, Hg, K, dtype=torch.bfloat16, device=dev)
+        w = torch.zeros(1, H, T, K, dtype=torch.bfloat16, device=dev)
+        u = torch.zeros(1, H, T, V, dtype=torch.bfloat16, device=dev)
+        raw = np.full((1, H, V, K), np.uint32(bits), dtype=np.uint32)
+        h0 = torch.from_numpy(raw.view(np.int32)).to(dev).view(torch.float32)
+        return k, w, u, h0
+
+    @pytest.mark.parametrize("label,bits,kind", _NAN_INF_PATTERNS)
+    def test_vk_k5_snapshot_preserves_class(self, label, bits, kind):
+        """VK K5: the bf16 h snapshot must keep the class of every h0 element."""
+        H, Hg, K, V, T = 4, 2, 128, 128, 64
+        k, w, u, h0 = self._inputs(H, Hg, K, V, T, bits)
+        h, _, _ = chunk_gated_delta_rule_fwd_h_flydsl(
+            k, w, u, initial_state=h0, output_final_state=False, save_new_value=False
+        )
+        assert h.dtype == torch.bfloat16, (
+            f"this must have bf16 snapshot is bf16, got {h.dtype}"
+        )
+        _assert_class(h[0, 0, :, :, :4].flatten(), kind, f"vk_k5 {label}")
+
+    @pytest.mark.parametrize("label,bits,kind", _NAN_INF_PATTERNS)
+    def test_fused_output_preserves_class(self, label, bits, kind):
+        """Fused K5+K6: a non-finite state must not silently become finite.
+
+        ``o = scale * (q @ h_snapshot^T + A @ v_new)`` with a unit ``q`` and a
+        zero ``v_new``, so ``o`` is a sum over the poisoned state. NaN must stay
+        NaN; +-Inf must stay non-finite (its sign can legitimately flip or
+        become NaN once summed, so only finiteness is asserted there).
+        """
+        from aiter.ops.flydsl.gdn_fused_gfx942_kernels import (
+            chunk_gated_delta_rule_fwd_h_o_flydsl,
+        )
+
+        H, Hg, K, V, T = 4, 2, 128, 128, 64
+        k, w, u, h0 = self._inputs(H, Hg, K, V, T, bits)
+        q = torch.ones(1, T, Hg, K, dtype=torch.bfloat16, device="cuda")
+        g = torch.zeros(1, H, T, dtype=torch.float32, device="cuda")
+        o, _ = chunk_gated_delta_rule_fwd_h_o_flydsl(
+            q=q,
+            k=k,
+            w=w,
+            u=u,
+            g=g,
+            gk=None,
+            scale=1.0,
+            initial_state=h0,
+            output_final_state=False,
+            cu_seqlens=None,
+        )
+        vals = o.float().flatten()
+        if kind == "nan":
+            assert torch.isnan(vals).any(), (
+                f"fused {label}: a NaN state produced an all-finite output -- "
+                "the conversion lost the NaN"
+            )
+        else:
+            assert not torch.isfinite(
+                vals
+            ).all(), f"fused {label}: an Inf state produced an all-finite output"
 
 
 class TestVariantSelection:
