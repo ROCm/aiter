@@ -80,7 +80,8 @@ _MOE_SORT_BACKEND = os.environ.get("AITER_MOE_SORT_BACKEND", "auto").lower()
 #   False              -- no aux arrays; ordinary sorting.
 #   True / "threestage"-- aux via the port's own 3-stage sort
 #                         (csrc/kernels/mxfp4_moe/moe_aux/moe_3stage_sort.cuh),
-#                         through _adaptive_moe_sort. Default; original path.
+#                         through _adaptive_moe_sort. The original path; pass
+#                         it explicitly to get the pre-Opus behaviour back.
 #   "opus"             -- aux via the Opus sorter's *multi-phase* kernels, which
 #                         emit m_indices / reverse_sorted too
 #                         (MoeSortingMultiPhaseKernel_P23/_P3). Until they did,
@@ -88,6 +89,7 @@ _MOE_SORT_BACKEND = os.environ.get("AITER_MOE_SORT_BACKEND", "auto").lower()
 #                         single-CTA kernel -- which is why the port grew a sort
 #                         of its own. The mp path runs one CTA per expert.
 #                         Applies only at block_m != 16; see _aux_uses_opus.
+#                         This is what the MXFP4 a4w4 configs select by default.
 #
 # Both aux modes produce the same sorted_token_ids / m_indices / reverse_sorted
 # contract; they differ only in which kernels get there.
@@ -2742,9 +2744,16 @@ def get_2stage_cfgs(
             # fused prologue for atomic-GEMM2 configs, so m_indices came back
             # None and fused_moe fell back to generic opus sorting plus a torch
             # `sorted_token_ids & 0xFFFFFF` and a zero-fill -- ~12 us/iter of
-            # extra GPU work at BM16. Keep main's unconditional True; the
+            # extra GPU work at BM16. Keep it unconditionally on; the
             # reverse-map buffer is cheap next to losing the fused sort.
-            output_aux=True,
+            #
+            # AUX_SORT_OPUS rather than plain True: the Opus multi-phase sorter
+            # runs one CTA per expert against the 3-stage sort's 16, and is
+            # 0.979 (block_m 32) / 0.980 (block_m 128) geomean over the tuned
+            # MXFP4 rows. _aux_uses_opus() confines it to block_m != 16 -- at
+            # BM16 the prologue above is the *fused* sort+zero-init kernel,
+            # which Opus cannot replace and where it measured 1.10x slower.
+            output_aux=AUX_SORT_OPUS,
             prequant=_p1["a_dtype"] == "fp8" and not _p1["inline_quant"],
             has_bias=enable_bias and _p1.get("enable_bias", False),
             stage2_has_bias=enable_bias and stage2_supports_bias,

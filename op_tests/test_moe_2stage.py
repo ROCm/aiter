@@ -776,10 +776,12 @@ parser.add_argument(
     choices=["threestage", "opus"],
     default="",
     help="For configs whose sort emits the a4w4 aux arrays, pick which prologue "
-    "does it: 'threestage' (default) runs the port's own 3-stage sort, 'opus' "
-    "runs the Opus multi-phase sorter (one CTA per expert). Same sorted output "
-    "either way. Passed straight through to fused_moe(output_aux=...); configs "
-    "that do not use the aux sort are unaffected.",
+    "does it: 'opus' (the default those configs already select) runs the Opus "
+    "multi-phase sorter, one CTA per expert; 'threestage' forces the port's own "
+    "3-stage sort instead. Same sorted output either way, and block_m=16 keeps "
+    "its fused sort regardless. Passed straight through to "
+    "fused_moe(output_aux=...); configs that do not use the aux sort are "
+    "unaffected.",
 )
 
 args = parser.parse_args()
