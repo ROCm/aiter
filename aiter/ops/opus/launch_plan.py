@@ -25,6 +25,9 @@ _WORKSPACE_DTYPES = {
     "fp32_t": torch.float32,
 }
 _GFX1250_FUSED_SPLITK_TAG = "a16w16_clusterlaunch_tdm_splitk_fuse"
+_GFX1250_CO_TAGS = frozenset(
+    {"a16w16_4wave_co", "a16w16_4wave_wl_co"}
+)
 
 
 @dataclass(frozen=True)
@@ -284,6 +287,11 @@ def _build_a16w16_launch_plan(
         )
 
     needs_workspace = resolved_kid in SPLITK_KIDS
+    if instance.kernel_tag in _GFX1250_CO_TAGS and requested_split_k > 1:
+        raise ValueError(
+            f"gfx1250 CO kid {resolved_kid} does not support split-K; "
+            f"got split_k={requested_split_k}"
+        )
     if (
         registry_arch == "gfx942"
         and needs_workspace

@@ -40,6 +40,7 @@ from opus_gemm_common import (
     gfx942_nosplit_kernels_list,
     gfx942_splitk_kernels_list,
     gfx1250_clusterlaunch_kernels_list,
+    gfx1250_4wave_co_kernels_list,
     gfx1250_kernels_list,
     gfx1250_splitk_fuse_kernels_list,
     kernels_list,
@@ -163,36 +164,6 @@ def _splitk_reduce_baseline_instantiations(
 # table -- accepted as a clang extension, and already the case before the split
 # for e.g. the gfx1250 fp32 (M,N,K) table in a gfx1250-only build.
 LOOKUP_MACRO_ARCHES = ("gfx950", "gfx942", "gfx1250")
-
-
-def _splitk_reduce_baseline_instantiations(
-    reduce_kernel, ws_ptr_type, has_oob, vec=16, block=64, split_ks=(None,), d_ws=None
-):
-    # gfx1250 tunes the reduce to VEC=8/BLOCK=128 (coalesced dwordx4 bf16 store,
-    # no cross-lane shuffle), a bf16 workspace (d_ws="__bf16", half the reduce read
-    # traffic), and a COMPILE-TIME split_k (SPLIT_K_ template) dispatched per
-    # value -> split_ks lists every value the launch helper switches on (0 = the
-    # runtime-`split_k` fallback, 1..16 = fully-unrolled). gfx950/gfx942 keep the
-    # legacy 6-param VEC=16/BLOCK=64 fp32-workspace form (split_ks=(None,)).
-    has_oob_str = "true" if has_oob else "false"
-    out = f"// HAS_OOB={has_oob_str} variants\n"
-    for sk in split_ks:
-        tail = "" if sk is None else f", {sk}, {d_ws}"
-        out += (
-            f"template __global__ void {reduce_kernel}<{vec}, {block}, __bf16, true,  __bf16, {has_oob_str}{tail}>(\n"
-            f"    {ws_ptr_type}, __bf16*, int, int, int, int, int, int,\n"
-            f"    const __bf16*, int);\n"
-            f"template __global__ void {reduce_kernel}<{vec}, {block}, __bf16, false, __bf16, {has_oob_str}{tail}>(\n"
-            f"    {ws_ptr_type}, __bf16*, int, int, int, int, int, int,\n"
-            f"    const __bf16*, int);\n"
-            f"template __global__ void {reduce_kernel}<{vec}, {block}, float,  true,  float,  {has_oob_str}{tail}>(\n"
-            f"    {ws_ptr_type}, float*,  int, int, int, int, int, int,\n"
-            f"    const float*,  int);\n"
-            f"template __global__ void {reduce_kernel}<{vec}, {block}, float,  false, float,  {has_oob_str}{tail}>(\n"
-            f"    {ws_ptr_type}, float*,  int, int, int, int, int, int,\n"
-            f"    const float*,  int);\n"
-        )
-    return out
 
 
 def _pipeline_header_for(k):
@@ -1197,6 +1168,16 @@ if __name__ == "__main__":
         "a16w16_cluster_tdm_splitk_ws": gfx1250_kernels_list,
         "a16w16_clusterlaunch_tdm_splitk_ws": gfx1250_clusterlaunch_kernels_list,
         "a16w16_clusterlaunch_tdm_splitk_fuse": gfx1250_splitk_fuse_kernels_list,
+        "a16w16_4wave_co": {
+            kid: instance
+            for kid, instance in gfx1250_4wave_co_kernels_list.items()
+            if instance.kernel_tag == "a16w16_4wave_co"
+        },
+        "a16w16_4wave_wl_co": {
+            kid: instance
+            for kid, instance in gfx1250_4wave_co_kernels_list.items()
+            if instance.kernel_tag == "a16w16_4wave_wl_co"
+        },
     }
 
     # --- Compute the subset-compile set S ------------------------------------ S = (CSV opus rows'

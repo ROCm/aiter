@@ -19,31 +19,57 @@ PIPELINE_HEADER_MAP = {
     "a16w16_clusterlaunch_tdm_splitk_fuse": (
         "gfx1250/opus_gemm_pipeline_a16w16_clusterlaunch_tdm_splitk_fuse_gfx1250.cuh"
     ),
+    # CO device bodies are built offline. Point generic codegen lookup at the
+    # release-toolchain-safe traits header; the host-only emitter never includes
+    # either pipeline header.
+    "a16w16_4wave_co": "gfx1250/opus_gemm_traits_a16w16_gfx1250.cuh",
+    "a16w16_4wave_wl_co": "gfx1250/opus_gemm_traits_a16w16_gfx1250.cuh",
 }
 
 TRAITS_HEADER_MAP = {
     "a16w16_cluster_tdm_splitk_ws": "gfx1250/opus_gemm_traits_a16w16_gfx1250.cuh",
     "a16w16_clusterlaunch_tdm_splitk_ws": "gfx1250/opus_gemm_traits_a16w16_gfx1250.cuh",
     "a16w16_clusterlaunch_tdm_splitk_fuse": "gfx1250/opus_gemm_traits_a16w16_gfx1250.cuh",
+    "a16w16_4wave_co": "gfx1250/opus_gemm_traits_a16w16_gfx1250.cuh",
+    "a16w16_4wave_wl_co": "gfx1250/opus_gemm_traits_a16w16_gfx1250.cuh",
 }
 
 KERNEL_FUNC_MAP = {
     "a16w16_cluster_tdm_splitk_ws": "gemm_a16w16_cluster_tdm_splitk_ws_kernel_gfx1250",
     "a16w16_clusterlaunch_tdm_splitk_ws": "gemm_a16w16_clusterlaunch_tdm_splitk_ws_kernel_gfx1250",
     "a16w16_clusterlaunch_tdm_splitk_fuse": "gemm_a16w16_splitk_fuse_kernel_gfx1250",
+    "a16w16_4wave_co": "gemm_a16w16_4wave_compute_body_gfx1250",
+    "a16w16_4wave_wl_co": "gemm_a16w16_4wave_wl_body_gfx1250",
 }
 
 TRAITS_NAME_MAP = {
     "a16w16_cluster_tdm_splitk_ws": "opus_cluster_tdm_splitk_ws_traits_gfx1250",
     "a16w16_clusterlaunch_tdm_splitk_ws": "opus_cluster_tdm_splitk_ws_traits_gfx1250",
     "a16w16_clusterlaunch_tdm_splitk_fuse": "opus_cluster_tdm_splitk_ws_traits_gfx1250",
+    "a16w16_4wave_co": "opus_a16w16_4wave_compute_traits_gfx1250",
+    "a16w16_4wave_wl_co": "opus_a16w16_4wave_wl_traits_gfx1250",
 }
 
 KARGS_NAME_MAP = {
     "a16w16_cluster_tdm_splitk_ws": "opus_gemm_cluster_tdm_ws_kargs_gfx1250",
     "a16w16_clusterlaunch_tdm_splitk_ws": "opus_gemm_cluster_tdm_ws_kargs_gfx1250",
     "a16w16_clusterlaunch_tdm_splitk_fuse": "opus_gemm_splitk_fuse_kargs_gfx1250",
+    "a16w16_4wave_co": "opus_gemm_4wave_compute_kargs_gfx1250",
+    "a16w16_4wave_wl_co": "opus_gemm_4wave_compute_kargs_gfx1250",
 }
+
+
+def co_traits_args(k):
+    """Return the traits arguments shared by the offline and host generators."""
+    d_a, d_b, d_c, d_acc = k.co_dtypes
+    args = (
+        f"{k.BLOCK_SIZE}, {k.B_M}, {k.B_N}, {k.B_K}, {k.num_slots}, "
+        f"{d_a}, {d_b}, {d_c}, {d_acc}, "
+        f"{k.cluster_wg_m}, {k.cluster_wg_n}"
+    )
+    if k.kernel_tag == "a16w16_4wave_wl_co":
+        args += f", {k.co_wave_layout[0]}, {k.co_wave_layout[1]}"
+    return args
 
 # fuse workspace storage dtype -> (C type, byte size) for the fuse kernel instantiation.
 _FUSE_WS_CTYPE = {"bf16_t": ("__bf16", 2), "fp32_t": ("float", 4)}
@@ -590,7 +616,120 @@ void
         )
 
 
+def gen_4wave_co_instance(
+    cg,
+    k,
+    traits_header,
+    traits_name,
+    kargs_name,
+    **_unused,
+):
+    """Emit a host launcher for one pre-built gfx1250 CO exact kid.
+
+    The launcher uses the repository's existing five-argument non-workspace
+    A16W16 ABI. No device instantiation is emitted: the matching device image is
+    loaded from ``gen_co/gfx1250/<symbol>.co`` on first use.
+    """
+    traits_alias = f"""
+// The pre-built image fixes this complete traits configuration.
+using {k.name}_Traits = {traits_name}<{co_traits_args(k)}>;
+"""
+
+    instance_impl = f"""// SPDX-License-Identifier: MIT
+// Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
+//
+// Auto-generated. Do not edit. See codegen/gen_instances_gfx1250.py.
+// Pre-compiled CO kid: host launcher only; no device TU is emitted.
+#pragma once
+#if !defined(__HIP_DEVICE_COMPILE__) && !defined(__HIPCC_RTC__)
+#include "aiter_tensor.h"
+#include "aiter_stream.h"
+#include <optional>
+#endif
+#include "{traits_header}"
+{traits_alias}
+#if !defined(__HIP_DEVICE_COMPILE__) && !defined(__HIPCC_RTC__)
+#include "gfx1250/opus_co_launch_gfx1250.cuh"
+
+template <typename D_C>
+void
+{k.name}(
+    aiter_tensor_t &XQ,
+    aiter_tensor_t &WQ,
+    aiter_tensor_t &Y,
+    std::optional<aiter_tensor_t> bias,
+    int splitK)
+{{
+    static_assert(std::is_same<D_C, bf16_t>::value,
+        "gfx1250 4wave CO kernels write bf16 output directly");
+
+    int batch = XQ.size(0);
+    int M = XQ.size(1);
+    int N = WQ.size(1);
+    int K = XQ.size(2);
+    using Traits = {k.name}_Traits;
+
+    AITER_CHECK(Y.dtype() == AITER_DTYPE_bf16,
+        "4wave CO output must be bf16, got ", AiterDtype_to_str(Y.dtype()));
+    AITER_CHECK(!bias.has_value(), "4wave CO kernels do not support bias");
+    AITER_CHECK(splitK == 0 || splitK == 1,
+        "4wave CO kernels require splitK in {{0,1}} (got splitK=", splitK, ")");
+    AITER_CHECK(M >= 1 && N >= 1 && K >= 1 && batch >= 1,
+        "M, N, K and batch must be >= 1");
+
+    {kargs_name} kargs{{}};
+    kargs.ptr_a = XQ.data_ptr();
+    kargs.ptr_b = WQ.data_ptr();
+    kargs.ptr_c = Y.data_ptr();
+    kargs.stride_a_batch = XQ.stride(0);
+    kargs.stride_b_batch = WQ.stride(0);
+    kargs.m = M;
+    kargs.n = N;
+    kargs.k = K;
+    kargs.stride_a = XQ.stride(1);
+    kargs.stride_b = WQ.stride(1);
+    kargs.stride_c = Y.stride(1);
+
+    int grid_m = (M + Traits::kBlockM - 1) / Traits::kBlockM;
+    int grid_n = (N + Traits::kBlockN - 1) / Traits::kBlockN;
+    grid_m = (grid_m + Traits::kClusterWgM - 1) /
+             Traits::kClusterWgM * Traits::kClusterWgM;
+    grid_n = (grid_n + Traits::kClusterWgN - 1) /
+             Traits::kClusterWgN * Traits::kClusterWgN;
+
+    static AiterAsmKernelFast& kernel =
+        opus_gfx1250_co::co_kernel("{k.name}");
+    opus_co_launch_gfx1250<Traits>(
+        kernel,
+        dim3(grid_m, grid_n, batch),
+        dim3(Traits::BLOCK_SIZE),
+        kargs,
+        aiter::getCurrentHIPStream());
+}}
+#endif
+"""
+    Path(os.path.join(cg.impl_path, f"{k.name}.cuh")).write_text(instance_impl)
+
+    # Intentionally append host instantiations only. This is the compile bypass
+    # that keeps release hipcc away from the pin-VGPR device pipeline.
+    for c_dtype in k.output_dtypes:
+        host_decl = (
+            "template void\n"
+            f"{k.name}<{c_dtype}>(\n"
+            "    aiter_tensor_t &XQ,\n"
+            "    aiter_tensor_t &WQ,\n"
+            "    aiter_tensor_t &Y,\n"
+            "    std::optional<aiter_tensor_t>,\n"
+            "    int);\n"
+        )
+        cg._host_instantiations.append(
+            {"kid_name": k.name, "dtype": c_dtype, "host_decl": host_decl}
+        )
+
+
 # ---------- Self-register at import time ----------
+register_emit("gfx1250", "a16w16_4wave_co", gen_4wave_co_instance)
+register_emit("gfx1250", "a16w16_4wave_wl_co", gen_4wave_co_instance)
 register_emit(
     "gfx1250", "a16w16_cluster_tdm_splitk_ws", gen_cluster_tdm_splitk_ws_instance
 )

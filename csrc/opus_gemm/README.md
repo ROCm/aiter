@@ -96,14 +96,16 @@ build and remains private for parity and performance A/B tests.
 
 | Family | gfx942 | gfx950 | gfx1250 |
 |---|---|---|---|
-| `a16w16` | direct + two-stage | direct + two-stage | two-stage; fused source retained but unregistered |
+| `a16w16` | direct + two-stage | direct + two-stage | two-stage + pre-built BF16 direct; fused source retained but unregistered |
 | `a8w8` | empty | kid 2, FP32 Y | empty |
 | `a8w8_blockscale` | empty | kid 1, FP32 Y | empty |
 | `a8w8_blockscale_bpreshuffle` | kid 11000, BF16 Y | empty | empty |
 | `a8w8_mxscale_bmm` | empty | 45 exact ids in 8000--8653, BF16/FP32 Y | empty |
 
 Empty tables are explicit capability states. The merged registry currently
-contains 706 final ids. The MXFP8 BMM ids are
+contains 925 final ids, including 219 pre-built gfx1250 A16W16 CO ids. Those CO
+ids currently occupy 21016--21315 inside the reserved `[21000,27000)` band.
+The MXFP8 BMM ids are
 `8000 + family_local_kid`, which places them in an unused global band while
 preserving family-local tuning/debug correlation. Historical child-dictionary
 collisions are resolved by the final merge; runtime routing always follows the
@@ -137,13 +139,21 @@ Full canonical A16 counts are:
 |---|---:|---:|---:|
 | gfx942 | 14 | 1 | 8 |
 | gfx950 | 92 | 92 | 48 |
-| gfx1250 | 0 | 0 | 496 |
+| gfx1250 | 219 | 0 | 496 |
 
 `gen_instances.py` treats tuned CSV ids, the sidecar, the per-architecture
 default compile floor, and mandatory A8 ids as build availability. It emits no
 runtime shape table. All 45 gfx950 MXFP8 BMM ids are emitted as one family and
 deduplicated by generated symbol name rather than entering the ordinary
-per-kid subset.
+per-kid subset. All available gfx1250 CO ids are in the gfx1250 compile floor;
+codegen emits their five-argument host launchers but no device translation
+units. The device bodies come from `gen_co/gfx1250/<symbol>.co`.
+
+The two CO tags (`a16w16_4wave_co` and `a16w16_4wave_wl_co`) use the existing
+BF16 direct exact-kid table. Their contract is BF16 XQ/WQ/Y, no bias, no
+workspace, and `split_k` 0 or 1. The current gfx1250 public shape policy also
+keeps batch at one. Python validates these capabilities before the unchanged
+unified A16 C ABI is called; there is no C++ `(M,N,K)` CO lookup table.
 
 ## A16 workspace checks
 
@@ -171,7 +181,8 @@ using the VEC=8/BLOCK=128 geometry.
 
 The fused gfx1250 factory, emitter and device pipeline remain in-tree for repair,
 but `GFX1250_SPLITK_FUSE_ENABLED` is `False`. No fused kid is registered, the
-unified capability tables cannot return one, and `[21000, 30000)` is unclaimed.
+unified capability tables cannot return one, and its `[27000,30000)` band is
+unclaimed. The preceding `[21000,27000)` band is reserved for CO ids.
 
 gfx942 continues to wave-uniformize both halves of the direct 64-bit workspace
 pointer with `__builtin_amdgcn_readfirstlane` in main and reduce kernels.
@@ -213,6 +224,8 @@ specialization that writes partial sums. Its direct BF16/FP32
 | `opus_gemm_common.py` | canonical registry, unique route map and compile-floor constants |
 | `gen_instances.py` | subset selection, manifests and typed dispatch generation |
 | `codegen/gen_instances_gfx*.py` | exact-instance host launchers and generated input checks |
+| `gen_co/` | offline CO manifest/builder, build metadata and packaged gfx1250 ELF images |
 | `include/gfx950/opus_bmm_*` | MXFP8 BMM traits, launchers and pipelines |
+| `include/gfx1250/opus_co_launch_gfx1250.cuh` | first-use CO loader and cluster launcher |
 | `include/gfx*/opus_gemm_arch_*.cuh` | sorted exact-kid tables |
 | `include/gfx*/**/opus_gemm_traits*.cuh` | kernel arguments and traits |

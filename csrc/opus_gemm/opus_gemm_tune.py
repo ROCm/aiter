@@ -95,6 +95,9 @@ GFX1250_SPLITK_BIAS = 0.02  # tiny per-extra-split bias (splitk stays dynamic)
 # occupancy fit; this only widens which splitK values get benchmarked on the
 # selected tiles (so some over-occupancy / higher-split candidates are explored).
 GFX1250_SPLITK_WINDOW_HI_MULT = 4
+GFX1250_CO_TOP_TILES = 6
+GFX1250_CO_TOP_CLUSTERS = 6
+_A16W16_CO_TAGS = frozenset({"a16w16_4wave_co", "a16w16_4wave_wl_co"})
 
 # Tune-time host helpers (defined here, not in opus_gemm_common.py).
 
@@ -271,6 +274,86 @@ def _gfx1250_fuse_candidates(M, N, K, cu_num, top_tiles=GFX1250_TOP_TILES):
     return out
 
 
+def _gfx1250_cluster_waste(gx: int, gy: int, cwm: int, cwn: int) -> float:
+    """Return the fraction of rounded cluster workgroups with no output tile."""
+    launched = _round_up(gx, cwm) * _round_up(gy, cwn)
+    return (launched - gx * gy) / launched
+
+
+def _gfx1250_co_cluster_dims(gx, gy, available, top_clusters, cu_num):
+    """Rank cluster dimensions for a CO tile without requiring exact fill."""
+
+    def _roundup_is_free(cwm, cwn):
+        return _round_up(gx, cwm) * _round_up(gy, cwn) <= cu_num
+
+    feasible = [
+        (_gfx1250_cluster_waste(gx, gy, cwm, cwn), cwm, cwn)
+        for cwm, cwn in available
+        if (cwm <= gx and cwn <= gy) or _roundup_is_free(cwm, cwn)
+    ]
+    if not feasible:
+        return []
+    admitted = [
+        candidate
+        for candidate in feasible
+        if candidate[0] <= GFX1250_MAX_CLUSTER_WASTE
+        or _roundup_is_free(candidate[1], candidate[2])
+    ]
+    if not admitted:
+        tightest = min(candidate[0] for candidate in feasible)
+        admitted = [candidate for candidate in feasible if candidate[0] == tightest]
+    bucket = GFX1250_CLUSTER_WASTE_BUCKET
+    admitted.sort(
+        key=lambda candidate: (
+            candidate[0] if bucket <= 0 else int(candidate[0] / bucket),
+            -(candidate[1] * candidate[2]),
+            abs(candidate[1] * gy - candidate[2] * gx),
+            (candidate[1], candidate[2]),
+        )
+    )
+    return [(cwm, cwn) for _waste, cwm, cwn in admitted[:top_clusters]]
+
+
+# tile -> cluster dims -> all exact kids. Multiple wave-layout variants for one
+# geometry remain together because only measurement can rank them.
+_GFX1250_CO_BY_TILE: dict[tuple[int, int, int], dict[tuple[int, int], list[int]]] = {}
+for _co_kid, _co_instance in kernels_list.items():
+    if _co_instance.kernel_tag not in _A16W16_CO_TAGS:
+        continue
+    _GFX1250_CO_BY_TILE.setdefault(
+        (_co_instance.B_M, _co_instance.B_N, _co_instance.B_K), {}
+    ).setdefault(
+        (_co_instance.cluster_wg_m, _co_instance.cluster_wg_n), []
+    ).append(_co_kid)
+
+
+def _gfx1250_co_candidates(
+    M,
+    N,
+    K,
+    cu_num,
+    top_tiles=GFX1250_CO_TOP_TILES,
+    top_clusters=GFX1250_CO_TOP_CLUSTERS,
+):
+    """Select a bounded tile/cluster subset of pre-built non-split-K kids."""
+
+    def _tile_score(tile):
+        bm, bn, _bk = tile
+        return _gfx1250_occ_cost(_ceil_div(M, bm) * _ceil_div(N, bn), cu_num)
+
+    selected = set()
+    tiles = sorted(_GFX1250_CO_BY_TILE, key=lambda tile: (_tile_score(tile), tile))
+    for tile in tiles[:top_tiles]:
+        bm, bn, _bk = tile
+        gx, gy = _ceil_div(M, bm), _ceil_div(N, bn)
+        available = _GFX1250_CO_BY_TILE[tile]
+        for dims in _gfx1250_co_cluster_dims(
+            gx, gy, available, top_clusters, cu_num
+        ):
+            selected.update(available[dims])
+    return selected
+
+
 def _gfx1250_select_candidates(
     M,
     N,
@@ -346,6 +429,7 @@ def _gfx1250_select_candidates(
         and os.environ.get("OPUS_TUNE_NO_FUSE") != "1"
     ):
         sel |= _gfx1250_fuse_candidates(M, N, K, cu_num)
+    sel |= _gfx1250_co_candidates(M, N, K, cu_num)
     return frozenset(sel)
 
 
@@ -366,6 +450,9 @@ def candidate_splitK(M: int, N: int, K: int, batch: int, cu_num: int, k_inst):
     range. We compute the same per-slice budget the host reject uses and
     silently drop any split_k that would push workspace past 4 GiB.
     """
+    if k_inst.kernel_tag in _A16W16_CO_TAGS:
+        return [0]
+
     if k_inst.kernel_tag == "a16w16_clusterlaunch_tdm_splitk_fuse":
         # Runtime splitK is ignored by this family. Store the baked value in
         # tuning rows so the CSV remains self-describing and never suggests a
@@ -475,6 +562,11 @@ def kid_rejects_shape(k_inst, M, N, K):
             splitk main kernel's mask_va_tail cover both edge cases, so
             splitk is safe for any (M, N, K).
     """
+    # CO pipelines use dimension-clamped TDM descriptors for A/B/C, have no
+    # split-K buffer, and support M/N/K tails. Their scalar extents remain int.
+    if k_inst.kernel_tag in _A16W16_CO_TAGS:
+        return M < 1 or N < 1 or K < 1
+
     # 4 GiB buffer-resource filter. Legacy a16w16 kids build a single
     # AMDGPU buffer-resource per tensor (A/B/C), whose `num_records` field
     # is 32-bit -- any of the three exceeding UINT32_MAX bytes wraps and

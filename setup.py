@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import glob
 import os
 import shutil
 import subprocess
@@ -165,6 +166,9 @@ def prepare_packaging():
         os.makedirs("aiter_meta/hsa", exist_ok=True)
     shutil.copytree("gradlib", "aiter_meta/gradlib")
     shutil.copytree("csrc", "aiter_meta/csrc")
+    # Keep runtime .co assets, but do not package optional disassembly dumps.
+    for asm_dir in glob.glob("aiter_meta/csrc/opus_gemm/gen_co/*/asm"):
+        shutil.rmtree(asm_dir, ignore_errors=True)
     open("aiter_meta/__init__.py", "w").close()
     write_install_mode()
 
@@ -285,8 +289,6 @@ if PREBUILD_KERNELS != 0:
             "skip precompilation in this environment"
         )
     else:
-        import glob
-
         from jit.utils.mha_recipes import (
             get_mha_varlen_prebuild_variants_by_names,
         )

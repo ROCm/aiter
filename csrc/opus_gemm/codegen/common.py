@@ -30,6 +30,7 @@ _GFX942_A16W16_TAGS = (
     )
     + _NOSPLIT
 )
+_A16W16_CO_TAGS = ("a16w16_4wave_co", "a16w16_4wave_wl_co")
 _A16W16_TAGS = (
     "a16w16",
     "a16w16_flatmm",
@@ -43,6 +44,9 @@ _A16W16_TAGS = (
     # gfx1250 fused in-cluster reduction source (currently unregistered). When
     # enabled it consumes caller-owned typed workspace without a second reduce.
     "a16w16_clusterlaunch_tdm_splitk_fuse",
+    # Pre-built gfx1250 device images. Their generated host launchers reuse the
+    # ordinary five-argument non-workspace exact-kid ABI.
+    *_A16W16_CO_TAGS,
 ) + _GFX942_A16W16_TAGS
 
 EMIT_REGISTRY = {}

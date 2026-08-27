@@ -3,7 +3,10 @@
 """OPUS kernel registrations shared by selection and code generation."""
 
 import os
+import sys
 from dataclasses import dataclass, field
+
+_A16W16_CO_TAGS = frozenset({"a16w16_4wave_co", "a16w16_4wave_wl_co"})
 
 # Legacy cache policy = traits default for split-barrier & persistent a16w16 (see
 # opus_gemm_traits_a16w16_gfx950.cuh).
@@ -115,6 +118,16 @@ class OpusGemmInstance:
     # the current N-direction pipeline this is the number of N-tile peers.
     fuse_m_cluster: int = 1
 
+    # Pre-compiled (.co) family metadata. These fields participate in the
+    # stable symbol/image name and are otherwise consumed only by gfx1250
+    # CO code generation.
+    co_num_vgpr: int = 0
+    co_min_waves_per_eu: int = 1
+    co_device_flags: tuple = ()
+    co_variant: str = ""
+    co_dtypes: tuple = ("bf16_t", "bf16_t", "bf16_t", "fp32_t")
+    co_wave_layout: tuple = (4, 1)
+
     @property
     def name(self) -> str:
         parts = [
@@ -212,6 +225,25 @@ class OpusGemmInstance:
                 "wsf32" if self.splitk_workspace_dtype == "fp32_t" else "wsbf16"
             )
             parts.append(f"p{self.num_slots}w{self.wg_per_cu}")
+        elif self.kernel_tag in _A16W16_CO_TAGS:
+            # The host launcher symbol, ELF entry point and .co filename must
+            # remain identical. Encode every device configuration axis that
+            # can distinguish two pre-built images in this stable name.
+            parts.insert(
+                tag_at,
+                (
+                    "4wave_wl_co"
+                    if self.kernel_tag == "a16w16_4wave_wl_co"
+                    else "4wave_co"
+                ),
+            )
+            if self.kernel_tag == "a16w16_4wave_wl_co":
+                parts.append(f"w{self.co_wave_layout[0]}x{self.co_wave_layout[1]}")
+            parts.append(f"c{self.cluster_wg_m}x{self.cluster_wg_n}")
+            parts.append(f"p{self.num_slots}")
+            parts.append(f"v{self.co_num_vgpr}w{self.co_min_waves_per_eu}")
+            if self.co_variant:
+                parts.append(self.co_variant)
         elif self.name_tag:
             parts.insert(tag_at, self.name_tag)
         elif self.kernel_tag in _GFX942_KERNEL_NAME_TAGS:
@@ -1376,7 +1408,8 @@ GFX1250_CLUSTERLAUNCH_KIDS = frozenset(gfx1250_clusterlaunch_kernels_list.keys()
 #
 # The final #4246 decision leaves this family unregistered until its pipeline
 # is fixed. The factory, emitter, and device source remain available, but no kid
-# is visible to exact dispatch/capability queries and [21000, 30000) is free.
+# is visible to exact dispatch/capability queries. Its reserved band starts at
+# 27000 because pre-compiled CO kids own [21000, 27000).
 def _a16w16_splitk_fuse_gfx1250(
     bm,
     bn,
@@ -1409,7 +1442,7 @@ def _a16w16_splitk_fuse_gfx1250(
 GFX1250_SPLITK_FUSE_ENABLED = False
 
 gfx1250_splitk_fuse_kernels_list = {}
-GFX1250_SPLITK_FUSE_KID_BASE = 21000
+GFX1250_SPLITK_FUSE_KID_BASE = 27000
 GFX1250_SPLITK_FUSE_KID_OF = {}
 _sf_kid = GFX1250_SPLITK_FUSE_KID_BASE
 
@@ -1465,11 +1498,181 @@ for _bm, _bn, _bk, _wg in _fuse_tiles:
                 _sf_kid += 1
 
 assert _sf_kid <= 30000, (
-    "splitk_fuse gfx1250 kids overflow [21000,30000): "
+    "splitk_fuse gfx1250 kids overflow [27000,30000): "
     f"ended at {_sf_kid - 1}"
 )
 GFX1250_SPLITK_FUSE_KIDS = frozenset(gfx1250_splitk_fuse_kernels_list.keys())
 assert bool(GFX1250_SPLITK_FUSE_KIDS) == GFX1250_SPLITK_FUSE_ENABLED
+
+
+# -- gfx1250 symmetric 4-wave compute, pre-compiled .co ---------------------
+# JSON is the single source of truth shared by the offline image builder and
+# this host-launcher registry. The device kernels need compiler facilities not
+# available in the release JIT toolchain, so gen_instances emits host launchers
+# only and loads the matching image at runtime.
+GFX1250_4WAVE_CO_KID_BASE = 21000
+GFX1250_4WAVE_CO_KID_END = 27000
+CO_KERNELS_JSON = os.path.join(os.path.dirname(__file__), "gen_co", "co_kernels.json")
+
+_CO_KID_BANDS = {
+    tag: (GFX1250_4WAVE_CO_KID_BASE, GFX1250_4WAVE_CO_KID_END)
+    for tag in _A16W16_CO_TAGS
+}
+_CO_DTYPE_BYTES = {
+    "bf16_t": 2,
+    "fp16_t": 2,
+    "fp32_t": 4,
+    "fp8_t": 1,
+    "bf8_t": 1,
+}
+
+
+def _co_instance_from_json(arch, entry):
+    """Convert one JSON record to the exact host/device CO configuration."""
+    tag = entry["tag"]
+    bm, bn, bk = entry["tile"]
+    cwm, cwn = entry["cluster"]
+    lb_threads, lb_waves = entry["launch_bounds"]
+    dtypes = entry["dtypes"]
+    assert lb_threads == entry["block_size"], (
+        f"co kid {entry['kid']}: launch_bounds[0]={lb_threads} must equal "
+        f"block_size={entry['block_size']}"
+    )
+    vec_a = 16 // _CO_DTYPE_BYTES[dtypes["a"]]
+    vec_b = 16 // _CO_DTYPE_BYTES[dtypes["b"]]
+    return OpusGemmInstance(
+        entry["block_size"],
+        bm,
+        bn,
+        bk,
+        4,
+        1,
+        16,
+        16,
+        32,
+        vec_a,
+        vec_b,
+        8,
+        0,
+        0,
+        0,
+        tag,
+        [dtypes["c"]],
+        arch_prefix=arch,
+        num_slots=entry["num_slots"],
+        cluster_wg_m=cwm,
+        cluster_wg_n=cwn,
+        co_num_vgpr=entry.get("num_vgpr", 0),
+        co_min_waves_per_eu=lb_waves,
+        co_device_flags=tuple(entry.get("device_flags", ())),
+        co_variant=entry.get("variant", ""),
+        co_dtypes=(dtypes["a"], dtypes["b"], dtypes["c"], dtypes["acc"]),
+        co_wave_layout=tuple(entry.get("wave_layout", (4, 1))),
+    )
+
+
+def _validate_co_instance(kid, instance):
+    """Validate the runtime contract baked into one pre-built image."""
+    if instance.arch_prefix != "gfx1250":
+        raise ValueError(
+            f"CO kid {kid} must target gfx1250, got {instance.arch_prefix!r}"
+        )
+    if instance.output_dtypes != ["bf16_t"]:
+        raise ValueError(f"CO kid {kid} must expose BF16 output only")
+    if instance.co_dtypes != (
+        "bf16_t",
+        "bf16_t",
+        "bf16_t",
+        "fp32_t",
+    ):
+        raise ValueError(f"CO kid {kid} has unsupported dtype contract")
+    if instance.splitk_workspace_dtype is not None:
+        raise ValueError(f"CO kid {kid} must not declare workspace storage")
+
+
+def co_image_path(path, instance):
+    """Return the pre-built image corresponding to an instance JSON file."""
+    return os.path.join(
+        os.path.dirname(path), instance.arch_prefix, f"{instance.name}.co"
+    )
+
+
+def _load_co_kernels(path, require_image=True):
+    """Load pre-built CO instances, safely dropping records with no image."""
+    if not os.path.exists(path):
+        return {}
+
+    import json
+
+    with open(path) as stream:
+        document = json.load(stream)
+
+    instances = {}
+    seen_names = {}
+    missing = []
+    for arch, entries in document.items():
+        if arch.startswith("_"):
+            continue
+        for entry in entries:
+            kid = entry["kid"]
+            tag = entry["tag"]
+            if tag not in _CO_KID_BANDS:
+                raise ValueError(f"unsupported CO kernel tag {tag!r} for kid {kid}")
+            lo, hi = _CO_KID_BANDS[tag]
+            assert lo <= kid < hi, (
+                f"co kid {kid} (tag {tag}) outside its band [{lo},{hi})"
+            )
+            assert kid not in instances, f"duplicate co kid {kid} in {path}"
+            instance = _co_instance_from_json(arch, entry)
+            _validate_co_instance(kid, instance)
+            assert instance.name not in seen_names, (
+                f"co kids {seen_names[instance.name]} and {kid} generate the same "
+                f"symbol {instance.name!r}"
+            )
+            seen_names[instance.name] = kid
+            if require_image and not os.path.exists(co_image_path(path, instance)):
+                missing.append((kid, instance.name))
+                continue
+            instances[kid] = instance
+
+    if missing:
+        preview = ", ".join(f"{kid} ({name}.co)" for kid, name in missing[:5])
+        suffix = f", ... and {len(missing) - 5} more" if len(missing) > 5 else ""
+        print(
+            f"[opus] {len(missing)} pre-compiled (.co) kid(s) dropped -- image "
+            f"not found under {os.path.dirname(path)}: {preview}{suffix}. Build "
+            "them with csrc/opus_gemm/gen_co/build_co.py.",
+            file=sys.stderr,
+        )
+    return instances
+
+
+gfx1250_4wave_co_kernels_list = {
+    kid: instance
+    for kid, instance in _load_co_kernels(CO_KERNELS_JSON).items()
+    if instance.kernel_tag in _A16W16_CO_TAGS
+}
+# The offline builder must see declared records even before their images exist.
+gfx1250_4wave_co_kernels_declared = {
+    kid: instance
+    for kid, instance in _load_co_kernels(
+        CO_KERNELS_JSON, require_image=False
+    ).items()
+    if instance.kernel_tag in _A16W16_CO_TAGS
+}
+GFX1250_4WAVE_CO_KID_OF = {
+    instance.name: kid for kid, instance in gfx1250_4wave_co_kernels_list.items()
+}
+GFX1250_4WAVE_CO_KIDS = frozenset(gfx1250_4wave_co_kernels_list)
+
+_GFX1250_PRE_CO_KIDS = (
+    frozenset(gfx1250_kernels_list)
+    | frozenset(gfx1250_clusterlaunch_kernels_list)
+    | GFX1250_SPLITK_FUSE_KIDS
+)
+assert not (GFX1250_4WAVE_CO_KIDS & _GFX1250_PRE_CO_KIDS), (
+    "gfx1250 CO kids overlap an existing gfx1250 family"
+)
 
 # Flatten the eight BMM launcher tags into the same canonical exact-kid
 # registry used by every other OPUS family.
@@ -1505,6 +1708,7 @@ kernels_list = {
     **gfx1250_kernels_list,
     **gfx1250_clusterlaunch_kernels_list,
     **gfx1250_splitk_fuse_kernels_list,
+    **gfx1250_4wave_co_kernels_list,
 }
 
 # fmt: on
@@ -1556,6 +1760,7 @@ NON_SPLITK_KIDS = (
     | frozenset(a16w16_persistent_kernels_list_cpol_nooob.keys())
     | frozenset(a16w16_mono_tile_kernels_list.keys())
     | frozenset(gfx942_nosplit_kernels_list.keys())
+    | GFX1250_4WAVE_CO_KIDS
 )
 
 # 4g_safe kid families. Per-WG-tight BR sizing -- selectable for any shape
@@ -1631,20 +1836,22 @@ DEFAULT_COMPILED_KIDS_GFX942 = frozenset(
     }
 )
 
-# Keep six representative gfx1250 exact-id launchers in default builds. Every
-# other plain kid and all clusterlaunch kids are compiled on demand by the
-# tuner (candidate selection + sidecar expansion), so default builds stay
-# small.
-DEFAULT_COMPILED_KIDS_GFX1250 = frozenset(
-    GFX1250_PLAIN_KID_OF[_t]
-    for _t in (
-        (16, 32, 128),
-        (16, 64, 128),
-        (16, 128, 128),
-        (32, 32, 128),
-        (32, 64, 128),
-        (32, 128, 128),
+# Keep six representative workspace launchers plus every available CO host
+# launcher in default gfx1250 builds. Other plain/clusterlaunch device kernels
+# are compiled on demand by the tuner (candidate selection + sidecar expansion).
+DEFAULT_COMPILED_KIDS_GFX1250 = (
+    frozenset(
+        GFX1250_PLAIN_KID_OF[_t]
+        for _t in (
+            (16, 32, 128),
+            (16, 64, 128),
+            (16, 128, 128),
+            (32, 32, 128),
+            (32, 64, 128),
+            (32, 128, 128),
+        )
     )
+    | GFX1250_4WAVE_CO_KIDS
 )
 
 DEFAULT_COMPILED_KIDS = (
@@ -1729,6 +1936,8 @@ OPUS_KERNEL_TAGS_BY_ARCH_FAMILY = {
                 "a16w16_cluster_tdm_splitk_ws",
                 "a16w16_clusterlaunch_tdm_splitk_fuse",
                 "a16w16_clusterlaunch_tdm_splitk_ws",
+                "a16w16_4wave_co",
+                "a16w16_4wave_wl_co",
             }
         ),
         "a8w8": frozenset(),

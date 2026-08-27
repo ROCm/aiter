@@ -20,6 +20,7 @@
 
 #include "../opus_gemm_utils.cuh"
 
+#include <cstdint>
 #include <type_traits>
 
 // ── Consumer-wave tiling layout ─────────────────────────────────────────────
@@ -92,6 +93,108 @@ struct opus_gemm_splitk_fuse_kargs_gfx1250
     int num_tiles_n;       // ceil(N / B_N)
 };
 #endif
+
+#ifndef OPUS_GEMM_4WAVE_COMPUTE_KARGS_GFX1250_DEFINED
+#define OPUS_GEMM_4WAVE_COMPUTE_KARGS_GFX1250_DEFINED
+// Exact kernarg ABI baked into every pre-built 4wave CO image. Batch strides
+// are 64-bit element counts; grid.z carries the batch count and C's batch
+// stride is derived from m * stride_c in the device pipeline.
+struct opus_gemm_4wave_compute_kargs_gfx1250 {
+    const void* __restrict__ ptr_a;   //  0: bf16 [batch, M, K]
+    const void* __restrict__ ptr_b;   //  8: bf16 [batch, N, K]
+    void*       __restrict__ ptr_c;   // 16: bf16 [batch, M, N]
+    int64_t stride_a_batch;           // 24
+    int64_t stride_b_batch;           // 32
+    int m;                            // 40
+    int n;                            // 44
+    int k;                            // 48
+    int stride_a;                     // 52
+    int stride_b;                     // 56
+    int stride_c;                     // 60
+};
+static_assert(sizeof(opus_gemm_4wave_compute_kargs_gfx1250) == 64,
+              "the pre-built 4wave CO kernarg ABI must remain 64 bytes");
+#endif
+
+// Host-visible configuration shared with the offline 4wave device build.
+template<int BLOCK_SIZE_,
+         int B_M_, int B_N_, int B_K_,
+         int NUM_SLOTS_,
+         typename D_A_, typename D_B_, typename D_C_, typename D_ACC_,
+         int CLUSTER_WG_M_ = 4,
+         int CLUSTER_WG_N_ = 4>
+struct opus_a16w16_4wave_compute_traits_gfx1250 {
+    static constexpr int BLOCK_SIZE = BLOCK_SIZE_;
+    static constexpr int B_M = B_M_;
+    static constexpr int B_N = B_N_;
+    static constexpr int B_K = B_K_;
+
+    using D_A = D_A_;
+    using D_B = D_B_;
+    using D_C = D_C_;
+    using D_ACC = D_ACC_;
+    using DataA = D_A;
+    using DataB = D_B;
+    using DataC = D_C;
+    using DataAcc = D_ACC;
+    static_assert(std::is_same<D_A, D_B>::value, "A/B dtype must match");
+
+    static constexpr int VEC_A = 16 / (int)sizeof(D_A);
+    static constexpr int VEC_B = 16 / (int)sizeof(D_B);
+    static constexpr int NUM_SLOTS = NUM_SLOTS_;
+    static_assert(NUM_SLOTS >= 2, "the LDS ring needs at least two slots");
+
+    static constexpr int CLUSTER_WG_M = CLUSTER_WG_M_;
+    static constexpr int CLUSTER_WG_N = CLUSTER_WG_N_;
+    static_assert(CLUSTER_WG_M >= 1 && CLUSTER_WG_N >= 1 &&
+                  CLUSTER_WG_M <= 5 && CLUSTER_WG_N <= 5 &&
+                  CLUSTER_WG_M * CLUSTER_WG_N <= 16,
+                  "cluster dims must be 1..5 per side and <= 16 WGs total");
+
+    static_assert((B_K & (B_K - 1)) == 0,
+                  "B_K must be a power of two for the TDM padding scheme");
+    static constexpr int PAD_ELEMS = 16 / (int)sizeof(D_A);
+    static constexpr int SMEM_PITCH = B_K + PAD_ELEMS;
+    static constexpr int SLOT_BYTES_A = B_M * SMEM_PITCH * (int)sizeof(D_A);
+    static constexpr int SLOT_BYTES_B = B_N * SMEM_PITCH * (int)sizeof(D_B);
+    static constexpr int SEG_BYTES_A = NUM_SLOTS * SLOT_BYTES_A;
+    static constexpr int SEG_BYTES_B = NUM_SLOTS * SLOT_BYTES_B;
+    static constexpr int SEG_BYTES_AB = SEG_BYTES_A + SEG_BYTES_B;
+
+    // Enforce the one-WG/CU occupancy used to validate the shipped images.
+    static constexpr int kHalfLds = 160 * 1024;
+#ifdef OPUS_CO_NO_1WG_PAD
+    static constexpr int LDS_BYTES = SEG_BYTES_AB;
+#else
+    static constexpr int LDS_BYTES =
+        (SEG_BYTES_AB <= kHalfLds) ? (kHalfLds + 1024) : SEG_BYTES_AB;
+#endif
+    static_assert(LDS_BYTES <= 320 * 1024, "LDS exceeds the 320KB/CU budget");
+
+    static constexpr int kBlockM = B_M;
+    static constexpr int kBlockN = B_N;
+    static constexpr int kBlockK = B_K;
+    static constexpr int kNumSlots = NUM_SLOTS;
+    static constexpr int kClusterWgM = CLUSTER_WG_M;
+    static constexpr int kClusterWgN = CLUSTER_WG_N;
+    static constexpr int kLdsTotalBytes = LDS_BYTES;
+};
+
+template<int BLOCK_SIZE_,
+         int B_M_, int B_N_, int B_K_,
+         int NUM_SLOTS_,
+         typename D_A_, typename D_B_, typename D_C_, typename D_ACC_,
+         int CLUSTER_WG_M_ = 4,
+         int CLUSTER_WG_N_ = 4,
+         int TILE_M_ = 4,
+         int TILE_N_ = 1>
+struct opus_a16w16_4wave_wl_traits_gfx1250
+    : opus_a16w16_4wave_compute_traits_gfx1250<
+          BLOCK_SIZE_, B_M_, B_N_, B_K_, NUM_SLOTS_,
+          D_A_, D_B_, D_C_, D_ACC_, CLUSTER_WG_M_, CLUSTER_WG_N_> {
+    static constexpr int TILE_M = TILE_M_;
+    static constexpr int TILE_N = TILE_N_;
+};
 
 // ── User-facing traits = the SINGLE compile-time config the pipeline reads ──
 //   D_A=D_B=bf16, D_ACC=float (WMMA fp32 acc), D_WS is bf16 or fp32.

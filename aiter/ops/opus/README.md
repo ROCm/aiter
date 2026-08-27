@@ -129,6 +129,13 @@ to the same `_execute_a16w16` planner/executor used by A16W16 GEMM.
 Empty family tables on another architecture are valid capability states. A
 kid registered for another architecture is rejected before family launch.
 
+gfx1250 also has 219 pre-built A16W16 CO exact kids under the two tags
+`a16w16_4wave_co` and `a16w16_4wave_wl_co`. They accept BF16 XQ/WQ/Y only,
+reject bias and explicit workspace, and permit `split_k` only in `{0,1}`. The
+current gfx1250 batch-one guard remains in force. Their actual ids are
+21016--21315 in the reserved `[21000,27000)` CO band; callers still select one
+exact id through the same registry and A16 C ABI as every other A16 kernel.
+
 ## Examples
 
 ### A16W16 GEMM and BMM
@@ -303,6 +310,7 @@ Let `padded_M=ceil_div(M,B_M)*B_M` and
 | gfx950 two-stage | `[workspace_capacity_split_k,batch,padded_M,padded_N]` | FP32 |
 | gfx942 two-stage | `[workspace_capacity_split_k,batch,padded_M,padded_N]` | exact BF16/FP32 dtype |
 | gfx1250 two-stage | `[workspace_capacity_split_k,padded_M,padded_N]` | BF16 |
+| gfx1250 pre-built CO direct | none | none |
 | gfx1250 fused | not publicly registered | factory/emitter/source retained for repair |
 
 For gfx942, `workspace_capacity_split_k` records the allocated capacity while
@@ -316,7 +324,9 @@ kid requires `workspace=None`.
 gfx1250 clusterlaunch exact kids round the physical launch grid up to complete
 clusters; tile-less workgroups exit inside the pipeline. This does not change
 the logical workspace shape above. The experimental fused family is disabled,
-so no kid in `[21000,30000)` can be resolved through the public registry.
+so no fused kid in `[27000,30000)` can be resolved through the public registry.
+The `[21000,27000)` band belongs to pre-built CO kids, which are direct and
+therefore never request a workspace.
 
 gfx942 BF16-workspace kids `10210`, `10213`, and `10216` are exact ids. Their
 registered exact-N contract is `{64,128,256,384,512,1024,2048}`. A different N
@@ -375,6 +385,12 @@ entry; its priming state, mixed-module C ABI loader and thread-local descriptor
 pool live in the same backend section of `gemm_op_a16w16.py`. Generic JIT
 machinery owns module discovery and build, but not per-call workspace state.
 
+A CO image is opened and registered on the first call to its launcher. That
+first load must happen before graph capture; warm-up followed by capture/replay
+is supported, while first-ever loading inside capture is not. `import aiter`
+sets `OPUS_GEN_CO_DIR` to the packaged `csrc/opus_gemm/gen_co` directory, and an
+explicit environment value overrides it for testing locally rebuilt images.
+
 ## Build-time subset compile
 
 Tuned CSV and the compiled-kids sidecar are build inputs only. Their valid
@@ -389,7 +405,8 @@ may read a tuned row at runtime, but the public/C++ path receives only its
 resolved id. Calling a known non-BMM registry kid that was omitted from a
 subset build produces an uncompiled-id error. A gfx950 build emits all 45
 MXFP8 BMM routes as one deduplicated family so every registered BMM id remains
-exact-routable.
+exact-routable. A gfx1250 build keeps all 219 available CO host launchers in its
+default compile floor; their device code remains in the packaged `.co` files.
 
 ## Migration
 

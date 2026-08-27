@@ -92,3 +92,7 @@ aiter/ops/opus/configs/
 # vim swaps
 *.swo
 *.swp
+
+# Debug assembly dumps produced by the OPUS offline CO builder. The adjacent
+# .co runtime images remain tracked and are included in wheels.
+csrc/opus_gemm/gen_co/*/asm/
