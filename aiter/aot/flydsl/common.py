@@ -34,6 +34,7 @@ class OpKind(enum.Enum):
     GEMM = "gemm"
     GROUPED_MOE = "grouped_moe"
     CHUNK_GDN_H = "chunk_gdn_h"
+    UNIFIED_ATTENTION = "unified_attention"
 
 
 @dataclass(frozen=True)
@@ -82,6 +83,12 @@ def collect_aot_jobs(
 ) -> list[dict[str, Any]]:
     jobs = []
     for csv_path in csv_paths:
+        if csv_path is None:
+            # Non-CSV family (e.g. unified_attention): no tuning CSV; jobs come
+            # straight from parse_csv, which ignores its argument. Flows through
+            # the same tail dedupe as file-sourced jobs.
+            jobs.extend(parse_csv(csv_path))
+            continue
         if os.path.isfile(csv_path):
             jobs.extend(parse_csv(csv_path))
         elif on_missing_csv is not None:
@@ -146,6 +153,8 @@ def _collect_aot_jobs_for(kind: OpKind) -> list[dict[str, Any]]:
         from .grouped_moe import DEFAULT_CSVS, parse_csv
     elif kind is OpKind.CHUNK_GDN_H:
         from .chunk_gdn_h import DEFAULT_CSVS, parse_csv
+    elif kind is OpKind.UNIFIED_ATTENTION:
+        from .unified_attention import DEFAULT_CSVS, parse_csv
     else:
         raise ValueError(f"unknown FlyDSL AOT kind: {kind!r}")
     return collect_aot_jobs(DEFAULT_CSVS, parse_csv)
@@ -162,6 +171,8 @@ def _compile_one_config_for(kind: OpKind) -> Callable[..., dict[str, Any]]:
         from .grouped_moe import compile_one_config
     elif kind is OpKind.CHUNK_GDN_H:
         from .chunk_gdn_h import compile_one_config
+    elif kind is OpKind.UNIFIED_ATTENTION:
+        from .unified_attention import compile_one_config
     elif kind is OpKind.GROUPED_MOE:
         # grouped_moe AOT not wired up yet (no jobs are ever collected); keep a
         # trivial stub so the dispatch is total.
