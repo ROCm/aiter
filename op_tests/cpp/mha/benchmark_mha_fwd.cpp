@@ -119,7 +119,7 @@ auto create_args(int argc, char* argv[])
         .insert("fwd_v3",
                 "0",
                 "0: not used, 1: some cases will call the fwd v3(asm) kernel,\n"
-                "2: call the opus kernel(bf16 + bshd only, hdim 128/128 or 192/128)")
+                "2: call the opus kernel")
         .insert("is_v3_check",
                 "0",
                 "if set to 1, check whether the input scenarios is supported by the asm kernel.");
@@ -1145,6 +1145,7 @@ bool run(const ck_tile::ArgParser& arg_parser)
             opus_args.v_ptr   = v_buf.GetDeviceBuffer();
             opus_args.o_ptr   = o_buf.GetDeviceBuffer();
             opus_args.lse_ptr = (lse ? lse_buf.GetDeviceBuffer() : nullptr);
+            opus_args.data_type = data_type;
 
             // seqstart_q/k already hold the padded starts when a padded seqlen_k was asked
             // for, so the same pair covers the real and the physical role either way.

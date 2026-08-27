@@ -8,17 +8,18 @@
 // descriptor choice are decided in one place no matter which front end ran.
 //
 // Callers validate their own inputs and hand over raw pointers plus strides; this layer
-// only refuses what the kernels themselves cannot express (head-dim combination, 32-bit
-// buffer extent).
+// only refuses what the kernels themselves cannot express (data type, head-dim combination,
+// 32-bit buffer extent).
 //
 // Single-header and IMPL-guarded like the kernel headers it pulls in: define
 // FMHA_FWD_BF16_OPUS_LAUNCH_IMPL in the one translation unit that should own the device
 // kernel instantiation. Including it without the macro yields just the argument struct.
 #pragma once
 
+#include "aiter_hip_common.h"
 #include <hip/hip_runtime.h>
+#include <string>
 
-// One opus forward launch, in the layout the kernels read:
 //   Batch mode: q [B, N, H, D_QK]  k [B, N, H_KV, D_QK]  v [B, N, H_KV, D_V]
 //               o [B, N, H, D_V]   lse [B, H, N]
 //   Group mode: q/k/v/o packed along a single sequence dim, each group located through the
@@ -61,6 +62,8 @@ struct fmha_fwd_bf16_opus_args
     float softmax_scale = 0.f;
     // Bottom-right aligned when seqlen_q != seqlen_k.
     bool causal = false;
+
+    std::string data_type = "bf16";
 };
 
 #ifdef FMHA_FWD_BF16_OPUS_LAUNCH_IMPL
@@ -85,7 +88,7 @@ inline float resolve_scale(float softmax_scale, int hdim_q)
 // D_QK = D_V = 128 (symmetric), batch mode only.
 inline bool launch_d128(const fmha_fwd_bf16_opus_args& a, hipStream_t stream)
 {
-    // A kv extent reaching 2^32 wraps the async-load soffset and silently produces wrong
+    // A kv extent reaching 2^32 wraps the async-load offset and silently produces wrong
     // output, so refuse it instead.
     const int kv_stride_n = (a.stride_k_n > a.stride_v_n ? a.stride_k_n : a.stride_v_n);
     if(static_cast<long long>(a.seqlen_k) * kv_stride_n * 2LL >= (1LL << 32))
@@ -158,6 +161,10 @@ inline bool launch_d192_v128(const fmha_fwd_bf16_opus_args& a, hipStream_t strea
     constexpr int Q_BLOCK = Q_TILE_SIZE * NUM_WARPS; // 256
 
     const bool is_group    = (a.seqstart_q_ptr != nullptr);
+    if(is_group && (!a.seqstart_k_ptr || !a.seqstart_q_pad_ptr || !a.seqstart_k_pad_ptr))
+    {
+        return false;
+    }
     const int num_q_blocks = ceil_div(a.seqlen_q, Q_BLOCK);
     if(a.batch == 0 || a.nhead == 0 || num_q_blocks == 0)
     {
@@ -264,11 +271,19 @@ inline bool launch_d192_v128(const fmha_fwd_bf16_opus_args& a, hipStream_t strea
 } // namespace fmha_fwd_bf16_opus_detail
 
 // Launches the opus forward kernel that matches the argument head dims on `stream`.
-// Returns false when the shape is outside what the kernels cover: a (hdim_q, hdim_v) other
-// than (128,128) or (192,128), group mode asked of the batch-only symmetric kernel, or a kv
-// extent past the 32-bit buffer-offset limit.
+// Returns false when the input is outside what the kernels cover: a data type other than
+// bf16, a (hdim_q, hdim_v) other than (128,128) or (192,128), group mode asked of the
+// batch-only symmetric kernel, or (for the 128/128 kernel only) a kv extent past the
+// 32-bit async-load offset limit.
 inline bool fmha_fwd_bf16_opus_launch(const fmha_fwd_bf16_opus_args& a, hipStream_t stream)
 {
+    std::string arch_id = get_gpu_arch();
+    if((arch_id != "gfx950") || (a.data_type != "bf16"))
+    {
+        AITER_LOG_WARNING("unsupported condition in opus fwd!!! data_type: " << a.data_type);
+        return false;
+    }
+
     const bool is_group = (a.seqstart_q_ptr != nullptr);
 
     if(a.hdim_q == 128 && a.hdim_v == 128)
