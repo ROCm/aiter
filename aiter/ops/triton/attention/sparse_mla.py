@@ -192,11 +192,17 @@ def sparse_mla_fwd(
     out: torch.Tensor | None = None,
     return_lse: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """Sparse (top-k gathered) MLA attention, separated-rope geometry.
+    """Sparse (top-k gathered) MLA attention.
+
+    ``qk_rope_head_dim`` selects the geometry: separated rope (DeepSeek-V3.2,
+    GLM-5.1/5.2), where the query is the latent plus an appended rope, or
+    rope-free (GLM-5.3-Flash), where the query is the latent alone.
 
     Args:
         q: [C, H, kv_lora_rank + qk_rope_head_dim] queries, one row per
             query token (prefill and decode alike).
+        qk_rope_head_dim: width of the appended rope. 0 means rope-free, and
+            the QK contraction becomes a single dot over kv_lora_rank.
         kv_buffer: the KV pool [nb, block, R] / [slots, 1, 1, R] /
             [slots, R] in bf16, the same shapes in fp8 (+ scalar
             kv_scale), or [nb, block, 656] uint8 (vLLM ``fp8_ds_mla``).
@@ -260,6 +266,7 @@ def sparse_mla_fwd(
     assert (
         d_qk == kv_lora_rank + qk_rope_head_dim
     ), f"q last dim {d_qk} != {kv_lora_rank} + {qk_rope_head_dim}"
+    assert qk_rope_head_dim >= 0, "qk_rope_head_dim cannot be negative"
     _LOGGER.info(
         f"SPARSE_MLA C={num_queries} H={num_heads} d_qk={d_qk} "
         f"nnz={kv_indices.shape[0]}"
@@ -415,7 +422,7 @@ def sparse_mla_fwd(
         NOPE_DIM=kv_lora_rank,
         ROPE_DIM=qk_rope_head_dim,
         HEAD_SIZE=kv_lora_rank,
-        ROPE_SEPARATE=True,
+        ROPE_SEPARATE=qk_rope_head_dim > 0,
         BLOCK_M=block_m,
         BLOCK_K=block_k,
         NUM_SPLITS=num_splits,

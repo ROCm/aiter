@@ -1,7 +1,11 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Tests for sparse_mla_fwd (gfx950 gluon, separated-rope MLA)."""
+"""Tests for sparse_mla_fwd (gfx950 gluon MLA).
+
+Covers both geometries: separated rope (DSV3.2, GLM-5.1, GLM-5.2) and
+rope-free (GLM-5.3-Flash), where the query is the latent alone.
+"""
 
 import pytest
 import torch
@@ -87,10 +91,11 @@ def rel_err(out, ref):
     return ((out.float() - ref).abs().max() / ref.abs().max()).item()
 
 
-def _build(fmt, C, H, topk, pool, ragged, seed=0):
+def _build(fmt, C, H, topk, pool, ragged, seed=0, rope=ROPE):
     torch.manual_seed(seed)
-    q = torch.randn(C, H, D_QK, dtype=torch.bfloat16, device="cuda") * 0.125
-    kv = torch.randn(pool, D_QK, dtype=torch.bfloat16, device="cuda") * 0.125
+    d_qk = KV_LORA + rope
+    q = torch.randn(C, H, d_qk, dtype=torch.bfloat16, device="cuda") * 0.125
+    kv = torch.randn(pool, d_qk, dtype=torch.bfloat16, device="cuda") * 0.125
     idx, ptr = make_indices(C, pool, topk, "cuda", seed + 7, ragged)
     ks = None
     if fmt == "bf16":
@@ -104,11 +109,15 @@ def _build(fmt, C, H, topk, pool, ragged, seed=0):
     return q, cache, ks, idx, ptr, truth
 
 
-def _run_and_check(fmt, C, H, topk, ragged, tol=2e-2, pool=1 << 16, **kwargs):
-    sm = D_QK**-0.5
-    q, cache, ks, idx, ptr, truth = _build(fmt, C, H, topk, pool, ragged)
+def _run_and_check(
+    fmt, C, H, topk, ragged, tol=2e-2, pool=1 << 16, rope=ROPE, **kwargs
+):
+    sm = (KV_LORA + rope) ** -0.5
+    q, cache, ks, idx, ptr, truth = _build(fmt, C, H, topk, pool, ragged, rope=rope)
     ref = reference(q, truth.to(torch.bfloat16), idx, ptr, sm)
-    out, _ = sparse_mla_fwd(q, cache, ptr, idx, sm, kv_scale=ks, **kwargs)
+    out, _ = sparse_mla_fwd(
+        q, cache, ptr, idx, sm, kv_scale=ks, qk_rope_head_dim=rope, **kwargs
+    )
     e = rel_err(out, ref)
     assert e < tol, f"{fmt} C={C} H={H} topk={topk} ragged={ragged}: rel-err {e:.3e}"
 
@@ -184,3 +193,29 @@ def test_global_load_path():
     out, _ = sparse_mla_fwd(q, big, ptr, idx, sm, kv_scale=ks)
     e = rel_err(out, reference(q, truth.to(torch.bfloat16), idx, ptr, sm))
     assert e < 2e-2, f"global load path: rel-err {e:.3e}"
+
+
+@pytest.mark.parametrize(
+    "fmt,dots,tol",
+    [("bf16", "bf16", 2e-2), ("tensor", "bf16", 2e-2), ("tensor", "fp8", 7e-2)],
+    ids=["bf16", "tensor", "tensor_fp8"],
+)
+@pytest.mark.parametrize("H", [8, 16])
+@pytest.mark.parametrize(
+    "C,topk,ragged,pool",
+    [(8, 2048, False, 1 << 16), (8, 500, True, 1 << 16), (2048, 256, True, 1 << 13)],
+    ids=["topk2048", "ragged500", "prefill"],
+)
+def test_sparse_mla_rope_free(fmt, dots, tol, H, C, topk, ragged, pool):
+    _skip_unless_gfx950()
+    _run_and_check(
+        fmt,
+        C=C,
+        H=H,
+        topk=topk,
+        ragged=ragged,
+        pool=pool,
+        tol=tol,
+        rope=0,
+        dot_precision=dots,
+    )
