@@ -33,7 +33,6 @@ def _expt_data_compute_stage1(
         tile_starts = tl.cumsum(hist_tile, 0) - hist_tile
         expt_id = tl.zeros([1], tl.int32) + pid
         tile_start = tl.gather(tile_starts, expt_id, 0)
-        tl.store(TileStart + expt_id, tile_start)
     else:
         tile_start = tl.zeros([1], tl.int32)
         token_starts = tl.cumsum(hist_token, 0) - hist_token
