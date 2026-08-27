@@ -23,6 +23,7 @@ def fused_qk_norm_rope_cached(
     """Per-head RMSNorm then partial NeoX RoPE on q and k, in place.
 
         q[t, h] = rope(rmsnorm(q[t, h], q_weight), cos_sin_cache[t])
+        k[t, h] = rope(rmsnorm(k[t, h], k_weight), cos_sin_cache[t])
 
     Written for diffusion transformers, where the rotated subspace is a
     fraction of the head that is neither the whole head nor half of it -- 96 of
@@ -45,8 +46,9 @@ def fused_qk_norm_rope_cached(
     - (q, k), the same tensors
     """
     _LOGGER.info(
-        f"FUSED_QK_NORM_ROPE_CACHED: q={tuple(q.shape)} "
-        f"cache={tuple(cos_sin_cache.shape)}"
+        "FUSED_QK_NORM_ROPE_CACHED: q=%s cache=%s",
+        tuple(q.shape),
+        tuple(cos_sin_cache.shape),
     )
 
     assert q.ndim == 3 and k.ndim == 3, "q and k must be [T, H, D]"
@@ -69,8 +71,6 @@ def fused_qk_norm_rope_cached(
     assert (
         rot % 2 == 0 and rot <= D
     ), f"rotated width {rot} must be even and at most head_dim {D}"
-    if T == 0:
-        return q, k
 
     _fused_qk_norm_rope_cached_kernel[(T,)](
         q,

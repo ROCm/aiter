@@ -60,7 +60,7 @@ def _fused_rmsnorm_indexed_adaln_kernel(
 
     # torch.nn.RMSNorm reduces in fp32 for reduced-precision input; match that
     # rather than the storage dtype, or the norm drifts on long rows.
-    rstd = 1.0 / tl.sqrt(acc / N + eps)
+    rstd = tl.rsqrt(acc / N + eps)
 
     for start in tl.range(0, N, BLOCK_N):
         cols = start + tl.arange(0, BLOCK_N)

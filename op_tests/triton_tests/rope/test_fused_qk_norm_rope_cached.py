@@ -69,7 +69,7 @@ def test_q_and_k_use_their_own_weights():
     q, k, qw, kw, cache = make(16, 4, 128, 96, torch.float32)
     kw = kw * 3.0
     wq, wk = reference(q.clone(), k.clone(), qw, kw, cache, 1e-5)
-    gq, gk = fused_qk_norm_rope_cached(q, k, qw, kw, cache)
+    gq, gk = fused_qk_norm_rope_cached(q, k, qw, kw, cache, eps=1e-5)
     torch.testing.assert_close(gq, wq, atol=2e-5, rtol=2e-5)
     torch.testing.assert_close(gk, wk, atol=2e-5, rtol=2e-5)
     assert not torch.allclose(gq, gk)
@@ -79,7 +79,7 @@ def test_untouched_tail_is_passed_through():
     """Dims beyond the rotated width get the norm but no rotation."""
     q, k, qw, kw, cache = make(16, 4, 128, 96, torch.float32)
     q0 = q.clone()
-    fused_qk_norm_rope_cached(q, k, qw, kw, cache)
+    fused_qk_norm_rope_cached(q, k, qw, kw, cache, eps=1e-5)
     normed = torch.nn.functional.rms_norm(q0, (128,), qw, 1e-5)
     torch.testing.assert_close(q[..., 96:], normed[..., 96:], atol=2e-5, rtol=2e-5)
 

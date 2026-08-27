@@ -65,7 +65,7 @@ def _fused_qk_norm_rope_cached_kernel(
 
         x = tl.load(base + offs, mask=mask, other=0.0).to(tl.float32)
         # RMSNorm is per head over D, reduced in fp32 like torch.nn.RMSNorm.
-        rstd = 1.0 / tl.sqrt(tl.sum(x * x, axis=1) / D + eps)
+        rstd = tl.rsqrt(tl.sum(x * x, axis=1) / D + eps)
         w = tl.load(w_ptr + dims, mask=dim_mask, other=0.0).to(tl.float32)
         normed = x * rstd[:, None] * w[None, :]
 

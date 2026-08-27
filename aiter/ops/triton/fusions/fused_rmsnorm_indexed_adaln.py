@@ -51,8 +51,10 @@ def fused_rmsnorm_indexed_adaln(
     - out: [M, N], same dtype as x
     """
     _LOGGER.info(
-        f"FUSED_RMSNORM_INDEXED_ADALN: x={tuple(x.shape)} "
-        f"table={tuple(scale.shape)} idx={tuple(indices.shape)}"
+        "FUSED_RMSNORM_INDEXED_ADALN: x=%s table=%s idx=%s",
+        tuple(x.shape),
+        tuple(scale.shape),
+        tuple(indices.shape),
     )
 
     assert x.ndim == 2, f"x must be 2-D, got {tuple(x.shape)}"
@@ -69,10 +71,10 @@ def fused_rmsnorm_indexed_adaln(
     if out is None:
         out = torch.empty_like(x)
     else:
-        assert out.shape == x.shape and out.dtype == x.dtype
+        assert (
+            out.shape == x.shape and out.dtype == x.dtype
+        ), f"out must be [{M}, {N}] {x.dtype}, got {tuple(out.shape)} {out.dtype}"
         assert out.is_contiguous(), "out must be contiguous"
-    if M == 0:
-        return out
 
     # Wide rows are walked in tiles rather than padded to the next power of two:
     # a 5376-wide row would mask off a third of every access at 8192.

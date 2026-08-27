@@ -66,23 +66,36 @@ def test_matches_norm_then_gathered_affine(dtype, M, N, G, runs):
 def test_uniform_and_scattered_indices_agree():
     """The uniform-index fast path must not change the result.
 
-    A block of rows sharing an index takes a different route through the kernel
-    than a mixed block; feeding the same logical work both ways is what catches
-    a broadcast that quietly ignores per-row indices.
+    The kernel asks whether every row in a block shares an index
+    (``tl.min(idx) == tl.max(idx)``) and, when they do, broadcasts a single
+    modulation row instead of gathering [BLOCK_M, BLOCK_N]. To compare the two
+    branches the same modulation has to be reachable both ways, so two table
+    entries are made identical: indexing them uniformly takes the broadcast, and
+    alternating between them takes the gather, for a result that must be equal
+    bit for bit.
     """
     dev = "cuda"
-    M, N, G = 256, 5376, 4
+    M, N, G = 256, 5376, 6
     x, weight, shift, scale, _ = make(M, N, G, torch.bfloat16, dev)
-    same = torch.full((M,), 2, dtype=torch.int64, device=dev)
-    fast = fused_rmsnorm_indexed_adaln(x, weight, shift, scale, same)
+    # Entries 2 and 5 now modulate identically, so which one a row picks is
+    # invisible in the output but decides which branch its block takes.
+    shift[5] = shift[2]
+    scale[5] = scale[2]
 
-    # Same indices, but arranged so no block is uniform.
-    alternating = torch.full((M,), 2, dtype=torch.int64, device=dev)
-    slow = fused_rmsnorm_indexed_adaln(x, weight, shift, scale, alternating)
+    same = torch.full((M,), 2, dtype=torch.int64, device=dev)
+    fast = fused_rmsnorm_indexed_adaln(x, weight, shift, scale, same, eps=1e-5)
+
+    # Same modulation, but no block is uniform.
+    alternating = torch.where(
+        torch.arange(M, device=dev) % 2 == 0,
+        torch.full((M,), 2, dtype=torch.int64, device=dev),
+        torch.full((M,), 5, dtype=torch.int64, device=dev),
+    )
+    slow = fused_rmsnorm_indexed_adaln(x, weight, shift, scale, alternating, eps=1e-5)
     torch.testing.assert_close(fast, slow, atol=0, rtol=0)
 
     mixed = torch.arange(M, device=dev, dtype=torch.int64) % G
-    got = fused_rmsnorm_indexed_adaln(x, weight, shift, scale, mixed)
+    got = fused_rmsnorm_indexed_adaln(x, weight, shift, scale, mixed, eps=1e-5)
     want = reference(x, weight, shift, scale, mixed, 1e-5)
     torch.testing.assert_close(got.float(), want.float(), atol=3e-2, rtol=3e-2)
 
@@ -94,7 +107,7 @@ def test_every_index_is_honoured():
     N, G = 512, 6
     x, weight, shift, scale, _ = make(G, N, G, torch.float32, dev)
     indices = torch.arange(G, device=dev, dtype=torch.int64)
-    got = fused_rmsnorm_indexed_adaln(x, weight, shift, scale, indices)
+    got = fused_rmsnorm_indexed_adaln(x, weight, shift, scale, indices, eps=1e-5)
     want = reference(x, weight, shift, scale, indices, 1e-5)
     torch.testing.assert_close(got, want, atol=2e-6, rtol=2e-6)
 
@@ -103,7 +116,9 @@ def test_out_parameter_is_written_in_place():
     dev = "cuda"
     x, weight, shift, scale, indices = make(64, 1024, 3, torch.bfloat16, dev)
     dst = torch.empty_like(x)
-    got = fused_rmsnorm_indexed_adaln(x, weight, shift, scale, indices, out=dst)
+    got = fused_rmsnorm_indexed_adaln(
+        x, weight, shift, scale, indices, out=dst, eps=1e-5
+    )
     assert got.data_ptr() == dst.data_ptr()
     torch.testing.assert_close(
         dst.float(),
@@ -116,8 +131,10 @@ def test_out_parameter_is_written_in_place():
 def test_int32_indices_are_accepted():
     dev = "cuda"
     x, weight, shift, scale, indices = make(64, 1024, 3, torch.bfloat16, dev)
-    got = fused_rmsnorm_indexed_adaln(x, weight, shift, scale, indices.to(torch.int32))
-    want = fused_rmsnorm_indexed_adaln(x, weight, shift, scale, indices)
+    got = fused_rmsnorm_indexed_adaln(
+        x, weight, shift, scale, indices.to(torch.int32), eps=1e-5
+    )
+    want = fused_rmsnorm_indexed_adaln(x, weight, shift, scale, indices, eps=1e-5)
     torch.testing.assert_close(got, want, atol=0, rtol=0)
 
 
