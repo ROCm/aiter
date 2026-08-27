@@ -15,6 +15,7 @@ from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import get_arc
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.device_info import get_num_sms
 from aiter.ops.triton.utils.types import e4m3_dtype
+from aiter.ops.triton.utils.unified_attention_utils import get_dtype_str
 
 # gfx1250
 try:
@@ -442,21 +443,8 @@ def unified_attention(
 
     BLOCK_SCALES_SIZE = 16
     if q_dtype == torch.uint8:
-        # A4W4
         assert q_scales is not None and q_scales.dtype == e4m3_dtype
         head_size = head_size * 2
-        QUERY_DTYPE = "nvfp4"
-    elif q_dtype == e4m3_dtype:
-        QUERY_DTYPE = "fp8"
-    else:
-        QUERY_DTYPE = "bf16"
-
-    if kv_cache_dtype == torch.uint8:
-        KV_CACHE_DTYPE = "nvfp4"
-    elif kv_cache_dtype == e4m3_dtype:
-        KV_CACHE_DTYPE = "fp8"
-    else:
-        KV_CACHE_DTYPE = "bf16"
 
     if shuffled_kv_cache:
         SCALE_K_WIDTH = 4
@@ -615,9 +603,6 @@ def unified_attention(
                 segm_max,
                 segm_expsum,
                 attn_config,
-                NUM_BLOCKS_GATHER_PER_TILE,
-                QUERY_DTYPE,
-                KV_CACHE_DTYPE,
             )
         else:
             _unified_attention_3d_triton(
@@ -636,14 +621,9 @@ def unified_attention(
         elif skip_reduce:
             return segm_output, segm_max, segm_expsum
 
-        head_size_padded = triton.next_power_of_2(head_size)
         # Gluon reduce (one workgroup/token, in-wave segment merge); valid for all-decode with small split counts, else the Triton reduce_segments.
-        gluon_num_warps = 8 if num_query_heads % 8 == 0 else 4
-
         use_gluon_reduce = (
-            is_reduce_gluon_available(
-                params, NUM_SEGMENTS, head_size_padded, gluon_num_warps, backend
-            )
+            is_reduce_gluon_available(params, NUM_SEGMENTS, backend)
             and backend == "gluon"
         )
         if use_gluon_reduce:
@@ -653,8 +633,6 @@ def unified_attention(
                 segm_output,
                 segm_max,
                 segm_expsum,
-                head_size_padded,
-                gluon_num_warps,
                 reduce_config,
             )
         else:
@@ -664,7 +642,6 @@ def unified_attention(
                 segm_output,
                 segm_max,
                 segm_expsum,
-                head_size_padded,
                 reduce_config,
             )
     return out
@@ -703,10 +680,11 @@ def is_3d_gluon_available(params: _UAParams, backend: str):
     return use_gluon and use_gluon_arch
 
 
-def is_reduce_gluon_available(
-    params: _UAParams, NUM_SEGMENTS, head_size_padded, gluon_num_warps, backend: str
-):
+def is_reduce_gluon_available(params: _UAParams, NUM_SEGMENTS, backend: str):
     use_gluon = backend == "gluon" and _is_gluon_available()
+
+    head_size_padded = triton.next_power_of_2(params.head_size)
+    gluon_num_warps = 8 if params.num_query_heads % 8 == 0 else 4
 
     # arch-specific gates
     use_gluon_arch = False
@@ -871,9 +849,9 @@ def _reduce_segments_triton(
     segm_output,
     segm_max,
     segm_expsum,
-    head_size_padded,
     reduce_config,
 ):
+    head_size_padded = triton.next_power_of_2(params.head_size)
     reduce_segments[(params.num_tokens, params.num_query_heads)](
         output_ptr=params.out,
         segm_output_ptr=segm_output,
@@ -892,6 +870,32 @@ def _reduce_segments_triton(
         BLOCK_Q=BLOCK_Q,
         **reduce_config,
     )
+
+
+"""
+Below are arch-specific Gluon kernel wrappers.
+unified_attention() picks one per kernel through the is_*_gluon_available() gates,
+so the wrappers for a given kernel follows the signature below:
+```
+_unified_attention_2d_{arch}(
+    params: _UAParams,
+): ...
+
+_unified_attention_3d_{arch}(
+    params: _UAParams,
+    segm_output,
+    segm_max,
+    segm_expsum,
+): ...
+
+_reduce_segments_{arch}(
+    params: _UAParams,
+    segm_output,
+    segm_max,
+    segm_expsum,
+): ...
+```
+"""
 
 
 def _unified_attention_2d_gfx1250(params: _UAParams, loop_variant=None):
@@ -1060,10 +1064,10 @@ def _unified_attention_3d_gfx1250(
     segm_max,
     segm_expsum,
     attn_config,
-    NUM_BLOCKS_GATHER_PER_TILE,
-    QUERY_DTYPE,
-    KV_CACHE_DTYPE,
 ):
+    NUM_BLOCKS_GATHER_PER_TILE = 1
+    QUERY_DTYPE = get_dtype_str(params.q_dtype)
+    KV_CACHE_DTYPE = get_dtype_str(params.kv_cache_dtype)
     _unified_attention_kernel_3d_gfx1250[
         (params.total_num_q_blocks, params.num_kv_heads, NUM_SEGMENTS)
     ](
@@ -1141,10 +1145,10 @@ def _reduce_segments_gfx1250(
     segm_output,
     segm_max,
     segm_expsum,
-    head_size_padded,
-    gluon_num_warps,
     reduce_config,
 ):
+    head_size_padded = triton.next_power_of_2(params.head_size)
+    gluon_num_warps = 8 if params.num_query_heads % 8 == 0 else 4
     _reduce_segments_kernel_gfx1250[(params.num_tokens,)](
         output_ptr=params.out,
         segm_output_ptr=segm_output,
