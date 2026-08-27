@@ -62,7 +62,9 @@ scf_if_dispatch = ReplaceIfWithDispatch.scf_if_dispatch
 # Q/K/V staging managers (own their LDS swizzles + async copy schedules). They are
 # self-contained: this kernel maintains its own arch constants below and passes the
 # config each manager needs through its constructor.
-from .mha_buffer_managers import QManager16b, KManager16b, VManager16b, OManager16b
+from .mha_buffer_managers import QManager16b, KManager16bV1, VManager16bV1, OManager16b
+from .mha_buffer_managers import KManager16bV2, VManager16bV2
+from flydsl.expr.rocdl import tdm_ops
 
 # Single source of truth for gfx1250 Expert Scheduling Mode 2 (DEP_MODE=2). Lives
 # in mha_buffer_managers. Under mode 2 the LLVM setreg (via the
@@ -128,6 +130,10 @@ LOG2E = 1.4426950408889634
 # Set ENABLE_DEFER_RESCALE=False (or threshold < 0) to always rescale.
 ENABLE_DEFER_RESCALE = True
 RESCALE_THRESHOLD = 8.0
+
+# Compile-time K/V loader select. False = V1 (cluster_load_async + swizzled LDS);
+# True = V2 (TDM global->LDS + row-major padded LDS, HW OOB, fewer address VGPRs).
+USE_TDM_LOADER = True
 
 # NOTE: the remaining tiling constants (chunk sizes, K/V write-tile + V swizzle
 # granularity) live inside mha_buffer_managers.py — they are intrinsic to the
@@ -627,8 +633,12 @@ def _core_attention(
     # K/V staging: N_KV_PP ping-pong slots ([K.pp0|V.pp0][K.pp1|V.pp1]), blocks floored
     # at 64KB -> 128KB/slot, 256KB total -> occupancy=1. O reuses a non-current slot; Q
     # time-shares slot 1. slot_bytes is compile-time (no allocation; lds_base is passed in).
-    k_mgr = KManager16b(qk_hdim=qk_hdim, n_block=n_block, num_waves=NUM_WAVES)
-    v_mgr = VManager16b(v_hdim=v_hdim, n_block=n_block, num_waves=NUM_WAVES)
+    if USE_TDM_LOADER:
+        k_mgr = KManager16bV2(qk_hdim=qk_hdim, n_block=n_block, num_waves=NUM_WAVES)
+        v_mgr = VManager16bV2(v_hdim=v_hdim, n_block=n_block, num_waves=NUM_WAVES)
+    else:
+        k_mgr = KManager16bV1(qk_hdim=qk_hdim, n_block=n_block, num_waves=NUM_WAVES)
+        v_mgr = VManager16bV1(v_hdim=v_hdim, n_block=n_block, num_waves=NUM_WAVES)
     k_blk_bytes = max(k_mgr.get_lds_size_in_byte(), MIN_KV_BLK_BYTES)
     v_blk_bytes = max(v_mgr.get_lds_size_in_byte(), MIN_KV_BLK_BYTES)
     slot_bytes = k_blk_bytes + v_blk_bytes
@@ -732,50 +742,57 @@ def _core_attention(
     # pointers via a constant immediate offset.
     start_pp = 0
     start_row0 = start_tile * fx.Int32(n_block)
-    k_gptrs, k_lds_ptrs, k_imm_offs = k_mgr.global_load_ptrs(
-        ptr_lds=_k_lds_buf(start_pp),
-        ptr_K=ptr_K,
-        stride_k_seq=stride_k_seq,
-        stride_k_head=stride_k_head,
-        kv_head=kv_head,
-        kv_row0=kv_start + start_row0,
-        kv_valid=_kv_valid(start_row0),
-        warp_idx=warp_idx,
-        lane_idx=lane_idx,
-    )
-    v_gptrs, v_lds_ptrs, v_imm_offs = v_mgr.global_load_ptrs(
-        ptr_lds=_v_lds_buf(start_pp),
-        ptr_V=ptr_V,
-        stride_v_seq=stride_v_seq,
-        stride_v_head=stride_v_head,
-        kv_head=kv_head,
-        kv_row0=kv_start + start_row0,
-        kv_valid=_kv_valid(start_row0),
-        warp_idx=warp_idx,
-        lane_idx=lane_idx,
-    )
-
-    # (3) QMgr part2 — Q ds_load LDS->VGPR (drains the part1 Q async). Moved AHEAD of the
-    # loads (ordering experiment): part2's Q-scaling is what reuses the load source regs,
-    # so completing it BEFORE the cluster_loads issue removes that reuse from the load
-    # shadow. Loop init moves to AFTER the barrier (step 7).
-    q_frags = q_mgr.load_q_to_vgpr_part2(scale=softmax_scale)
-
-    # (4)+(5) Issue K then V cluster_loads LAST — bulk-load the first tile
-    # (start_tile)'s K and V into its ping-pong buffer (the ONLY use of the full-block
-    # loaders; later tiles prefetch inside the loop). Nothing runs between these loads
-    # and the prologue barrier.
-    _async_load_to_lds(k_gptrs, k_lds_ptrs, cluster=True, imm_offs=k_imm_offs)
-    _async_load_to_lds(v_gptrs, v_lds_ptrs, cluster=True, imm_offs=v_imm_offs)
-    # mode-2 async-source-WAR fix (ISA-proven): the prologue cluster_loads (K + V) must
-    # issue as ONE packed burst before the compiler reuses their source address VGPRs
-    # (part2's Q-scaling clobbers exactly those regs). Lighter fences here (s_wait_asynccnt
-    # alone / sched_barrier alone) are optimized away by the backend and leave the loads
-    # scattered -> latched-late sources read garbage addresses -> causal-only corruption.
-    # Only the non-removable cross-wave s_barrier survives as an immovable scheduling wall
-    # that packs the burst. Cost: one barrier per kernel launch (prologue only).
-    rocdl.s_wait_asynccnt(0)
-    gpu.barrier()
+    if USE_TDM_LOADER:
+        # V2: build the TDM copy views for the first tile (pure), run Q part2, then issue
+        # the K/V TDM copies and drain with tensor_wait before the prologue barrier.
+        k_views = k_mgr.load_views(
+            ptr_lds=_k_lds_buf(start_pp), ptr_K=ptr_K,
+            stride_k_seq=stride_k_seq, stride_k_head=stride_k_head,
+            kv_head=kv_head, kv_row0=kv_start + start_row0, kv_valid=_kv_valid(start_row0),
+        )
+        v_views = v_mgr.load_views(
+            ptr_lds=_v_lds_buf(start_pp), ptr_V=ptr_V,
+            stride_v_seq=stride_v_seq, stride_v_head=stride_v_head,
+            kv_head=kv_head, kv_row0=kv_start + start_row0, kv_valid=_kv_valid(start_row0),
+        )
+        q_frags = q_mgr.load_q_to_vgpr_part2(scale=softmax_scale)
+        fx.copy_atom_call(*k_views)
+        fx.copy_atom_call(*v_views)
+        tdm_ops.tensor_wait(0)
+        gpu.barrier()
+    else:
+        k_gptrs, k_lds_ptrs, k_imm_offs = k_mgr.global_load_ptrs(
+            ptr_lds=_k_lds_buf(start_pp),
+            ptr_K=ptr_K,
+            stride_k_seq=stride_k_seq,
+            stride_k_head=stride_k_head,
+            kv_head=kv_head,
+            kv_row0=kv_start + start_row0,
+            kv_valid=_kv_valid(start_row0),
+            warp_idx=warp_idx,
+            lane_idx=lane_idx,
+        )
+        v_gptrs, v_lds_ptrs, v_imm_offs = v_mgr.global_load_ptrs(
+            ptr_lds=_v_lds_buf(start_pp),
+            ptr_V=ptr_V,
+            stride_v_seq=stride_v_seq,
+            stride_v_head=stride_v_head,
+            kv_head=kv_head,
+            kv_row0=kv_start + start_row0,
+            kv_valid=_kv_valid(start_row0),
+            warp_idx=warp_idx,
+            lane_idx=lane_idx,
+        )
+        # (3) QMgr part2 — Q ds_load LDS->VGPR (drains the part1 Q async), issued AHEAD of
+        # the cluster_loads so its Q-scaling reg reuse leaves the load shadow.
+        q_frags = q_mgr.load_q_to_vgpr_part2(scale=softmax_scale)
+        # (4)+(5) Issue K then V cluster_loads LAST as ONE packed burst before the compiler
+        # reuses their source address VGPRs (part2 clobbers them). Only the cross-wave
+        # s_barrier is an immovable wall that packs the burst (mode-2 async-source-WAR fix).
+        _async_load_to_lds(k_gptrs, k_lds_ptrs, cluster=True, imm_offs=k_imm_offs)
+        _async_load_to_lds(v_gptrs, v_lds_ptrs, cluster=True, imm_offs=v_imm_offs)
+        rocdl.s_wait_asynccnt(0)
+        gpu.barrier()
 
     # (7) Loop init — MOVED to after the prologue barrier (ordering experiment). Online-
     # softmax seed + O accumulators (iter_args) and loop bounds.
@@ -812,20 +829,18 @@ def _core_attention(
             _raw(d_init[qt]),
         ] + [_raw(fx.Vector.filled(8, 0.0, fx.Float32)) for _ in range(d_tiles)]
 
-    # ---- ds_load LDS base pointers (2 per mgr) for both ping-pong buffers, carried as
-    # iter_args and swapped curr<->next each iteration (buffer selected by pointer, not
-    # immediate -> scales past n_block=64). Swap lowers to 4 s_swap_b32. ----
-    k_lds_ld_curr_ptrs = k_mgr.ds_load_ptrs(ptr_lds=_k_lds_buf(0), lane_idx=lane_idx)
-    v_lds_ld_curr_ptrs = v_mgr.ds_load_ptrs(ptr_lds=_v_lds_buf(0), lane_idx=lane_idx)
-    k_lds_ld_next_ptrs = k_mgr.ds_load_ptrs(ptr_lds=_k_lds_buf(1), lane_idx=lane_idx)
-    v_lds_ld_next_ptrs = v_mgr.ds_load_ptrs(ptr_lds=_v_lds_buf(1), lane_idx=lane_idx)
-    _PTR_BASE = len(_init)  # index of the first ds pointer within loop-carried state
-    _init = _init + [
-        k_lds_ld_curr_ptrs[0], k_lds_ld_curr_ptrs[1],
-        k_lds_ld_next_ptrs[0], k_lds_ld_next_ptrs[1],
-        v_lds_ld_curr_ptrs[0], v_lds_ld_curr_ptrs[1],
-        v_lds_ld_next_ptrs[0], v_lds_ld_next_ptrs[1],
-    ]
+    # ---- ds_load LDS base pointers for both ping-pong buffers, carried as iter_args and
+    # swapped curr<->next each iteration (buffer selected by pointer). Base count per mgr
+    # is manager-defined (V1: 2, V2: 1) — carried generically. Same machinery for V1/V2;
+    # only the global->LDS ISSUE (_addr_phase/_prefetch/_drain) differs. ----
+    k_lds_ld_curr = k_mgr.ds_load_ptrs(ptr_lds=_k_lds_buf(0), lane_idx=lane_idx)
+    v_lds_ld_curr = v_mgr.ds_load_ptrs(ptr_lds=_v_lds_buf(0), lane_idx=lane_idx)
+    k_lds_ld_next = k_mgr.ds_load_ptrs(ptr_lds=_k_lds_buf(1), lane_idx=lane_idx)
+    v_lds_ld_next = v_mgr.ds_load_ptrs(ptr_lds=_v_lds_buf(1), lane_idx=lane_idx)
+    _NKB = len(k_lds_ld_curr)  # ds bases per K buffer (V1: 2, V2: 1)
+    _NVB = len(v_lds_ld_curr)
+    _PTR_BASE = len(_init)
+    _init = _init + k_lds_ld_curr + k_lds_ld_next + v_lds_ld_curr + v_lds_ld_next
 
     # ========================================================================
     # Main KV loop -- stream tiles [start_tile, n_tiles) through the N_KV_PP ping-pong
@@ -860,20 +875,37 @@ def _core_attention(
             [fx.Vector(state[qt * _QS + 2 + dt]) for dt in range(d_tiles)]
             for qt in range(R)
         ]
-        k_curr = [state[_PTR_BASE + 0], state[_PTR_BASE + 1]]
-        k_next = [state[_PTR_BASE + 2], state[_PTR_BASE + 3]]
-        v_curr = [state[_PTR_BASE + 4], state[_PTR_BASE + 5]]
-        v_next = [state[_PTR_BASE + 6], state[_PTR_BASE + 7]]
+        k_curr = list(state[_PTR_BASE + 0 * _NKB:_PTR_BASE + 1 * _NKB])
+        k_next = list(state[_PTR_BASE + 1 * _NKB:_PTR_BASE + 2 * _NKB])
+        _VB0 = _PTR_BASE + 2 * _NKB
+        v_curr = list(state[_VB0 + 0 * _NVB:_VB0 + 1 * _NVB])
+        v_next = list(state[_VB0 + 1 * _NVB:_VB0 + 2 * _NVB])
 
         # Warp-specialized preamble: same pieces, ordered so the SIMD-mate pair (i / i+4)
         # staggers K load vs prefetch around `_named_barrier_pair`. Correctness is
         # warp-type-independent (each wave reads its own resident K under the workgroup
-        # barrier); the rendezvous is a perf-only stagger.
+        # barrier); the rendezvous is a perf-only stagger. The READ (load_k_to_reg(k_curr))
+        # and ping-pong pointer machinery are UNIFORM; only the global->LDS ISSUE branches
+        # by USE_TDM_LOADER (V1 cluster_load_async / V2 TDM copy).
         nxt = t + fx.Int32(1)
         nxt_row0 = nxt * fx.Int32(n_block)
         nxt_valid = _kv_valid(nxt_row0)
 
         def _addr_phase():
+            # Pure (no memory op) -> hoistable: V2 the TDM copy views, V1 the per-lane
+            # global/LDS pointer lists, for tile t+1's K/V into the nxt_pp buffer.
+            if USE_TDM_LOADER:
+                k_views = k_mgr.load_views(
+                    ptr_lds=_k_lds_buf(nxt_pp), ptr_K=ptr_K,
+                    stride_k_seq=stride_k_seq, stride_k_head=stride_k_head,
+                    kv_head=kv_head, kv_row0=kv_start + nxt_row0, kv_valid=nxt_valid,
+                )
+                v_views = v_mgr.load_views(
+                    ptr_lds=_v_lds_buf(nxt_pp), ptr_V=ptr_V,
+                    stride_v_seq=stride_v_seq, stride_v_head=stride_v_head,
+                    kv_head=kv_head, kv_row0=kv_start + nxt_row0, kv_valid=nxt_valid,
+                )
+                return (k_views, v_views)
             k_g, k_l, k_i = k_mgr.global_load_ptrs(
                 ptr_lds=_k_lds_buf(nxt_pp), ptr_K=ptr_K,
                 stride_k_seq=stride_k_seq, stride_k_head=stride_k_head,
@@ -889,18 +921,26 @@ def _core_attention(
             return (k_g, k_l, k_i, v_g, v_l, v_i)
 
         def _drain_barrier():
-            rocdl.s_wait_asynccnt(0)
+            if USE_TDM_LOADER:
+                tdm_ops.tensor_wait(0)
+            else:
+                rocdl.s_wait_asynccnt(0)
             rocdl.sched_barrier(0)
             gpu.barrier()
             rocdl.sched_barrier(0)
 
         def _prefetch(addr):
-            # Skip t+1 prefetch on the last tile: a dead async into the O-epilogue slot
+            # Skip t+1 prefetch on the last tile: a dead copy into the O-epilogue slot
             # races the epilogue O write across waves.
             def _issue():
-                k_g, k_l, k_i, v_g, v_l, v_i = addr
-                _async_load_to_lds(k_g, k_l, cluster=True, imm_offs=k_i)
-                _async_load_to_lds(v_g, v_l, cluster=True, imm_offs=v_i)
+                if USE_TDM_LOADER:
+                    k_views, v_views = addr
+                    fx.copy_atom_call(*k_views)
+                    fx.copy_atom_call(*v_views)
+                else:
+                    k_g, k_l, k_i, v_g, v_l, v_i = addr
+                    _async_load_to_lds(k_g, k_l, cluster=True, imm_offs=k_i)
+                    _async_load_to_lds(v_g, v_l, cluster=True, imm_offs=v_i)
 
             scf_if_dispatch(nxt < fx.Int32(n_tiles), _issue)
 
@@ -1005,10 +1045,8 @@ def _core_attention(
                 [_raw(m_new_list[qt]), _raw(d_new_list[qt])]
                 + [_raw(o) for o in o_new_list[qt]]
             )
-        out += (
-            [k_next[0], k_next[1], k_curr[0], k_curr[1]]
-            + [v_next[0], v_next[1], v_curr[0], v_curr[1]]
-        )
+        # Swap curr<->next ds bases (manager-defined count each).
+        out += k_next + k_curr + v_next + v_curr
         return out
 
     # ---- Stream tiles [start_tile, n_tiles) through 3 sub-loops split by the attention
@@ -1639,12 +1677,12 @@ def flash_attn_varlen_m16x8(
     # family convention; revisit when the clean kernel body is implemented.
     bpp = q.element_size()
     stride_q_seq = q.stride(0) * bpp
-    stride_k_seq = k.stride(0) * bpp
-    stride_v_seq = v.stride(0) * bpp
+    stride_k_seq = k.stride(0)  # K/V strides in ELEMENTS (V2 TDM uses directly; V1 ×bpp)
+    stride_v_seq = v.stride(0)
     stride_o_seq = out.stride(0)
     stride_q_head = q.stride(1) * bpp
-    stride_k_head = k.stride(1) * bpp
-    stride_v_head = v.stride(1) * bpp
+    stride_k_head = k.stride(1)
+    stride_v_head = v.stride(1)
     stride_o_head = out.stride(1)
 
     _ensure_thd_kernel(mask_left, mask_right, bool(return_lse), has_sink, gqa)
@@ -1776,12 +1814,12 @@ def flash_attn_batch_m16x8(
     # dim 2 — the per-batch base is derived in-kernel as batch_idx * seq_len.
     bpp = q.element_size()
     stride_q_seq = q.stride(1) * bpp
-    stride_k_seq = k.stride(1) * bpp
-    stride_v_seq = v.stride(1) * bpp
+    stride_k_seq = k.stride(1)  # K/V strides in ELEMENTS (V2 TDM uses directly; V1 ×bpp)
+    stride_v_seq = v.stride(1)
     stride_o_seq = out.stride(1)
     stride_q_head = q.stride(2) * bpp
-    stride_k_head = k.stride(2) * bpp
-    stride_v_head = v.stride(2) * bpp
+    stride_k_head = k.stride(2)
+    stride_v_head = v.stride(2)
     stride_o_head = out.stride(2)
 
     _ensure_bshd_kernel(mask_left, mask_right, bool(return_lse), has_sink, gqa)

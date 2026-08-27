@@ -18,8 +18,8 @@ its own manager family (different chunk arithmetic), hence the explicit width ta
 
 Contents:
   - ``QManager16b`` — Q loader (ring-buffered async stage, natural ``ds_load_b128``).
-  - ``KManager16b`` — K loader (one-block stage, natural ``ds_load_b128`` B-fragment).
-  - ``VManager16b`` — V loader (V-specific swizzle, transpose ``ds_load_tr16_b128``).
+  - ``KManager16bV1`` — K loader (one-block stage, natural ``ds_load_b128`` B-fragment).
+  - ``VManager16bV1`` — V loader (V-specific swizzle, transpose ``ds_load_tr16_b128``).
   - ``OManager16b`` — O writer (WMMA accumulator -> LDS reshape -> coalesced store).
 
 Target: gfx1250 (MI400 / mi450), wave32, 8 waves per threadgroup (256 threads).
@@ -29,6 +29,7 @@ import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm as llvm_dialect
 from flydsl._mlir.dialects import rocdl as rocdl_dialect
 from flydsl.expr import gpu, rocdl
+from flydsl.expr.rocdl import tdm_ops
 
 from aiter.ops.flydsl.kernels import buffer_ops
 
@@ -75,7 +76,7 @@ _O_LDS_BUDGET_BYTES = 32 * 1024
 _K_WR_TILE_KV = 8
 _K_WR_TILE_HD = _WMMA_K
 
-# V staging swizzle granularity (see VManager16b). A V block is stored as stacked
+# V staging swizzle granularity (see VManager16bV1). A V block is stored as stacked
 # 32(kv) x v_hdim sub-blocks; each is split into 32x32 tiles, each into 4(kv)x16(d)
 # subtiles, with the subtile col index XOR-swizzled by (subtile row index & 1) to
 # make the transpose load (ds_load_tr16_b128) bank-conflict-free.
@@ -462,10 +463,10 @@ class QManager16b:
 # ============================================================================
 
 
-class KManager16b:
+class KManager16bV1:
     """Owns K's LDS staging and the global->LDS->VGPR B-fragment load.
 
-    Unlike QManager16b there is no ring buffer here: KManager16b only reports the
+    Unlike QManager16b there is no ring buffer here: KManager16bV1 only reports the
     byte size of ONE ``n_block x qk_hdim`` K block (``get_lds_size_in_byte``). The
     caller reserves however many ping-pong buffers it wants and passes the chosen
     buffer base (``ptr_lds``) into every method — the manager is not bound to a
@@ -578,8 +579,9 @@ class KManager16b:
                 kv_row = (kv_row < kv_valid).select(kv_row, fx.Int32(0))  # clamp OOB
             token = kv_row0 + kv_row
             # Row base at hdim column 0 (col term lives in the immediate); computed once.
-            g_base = token * stride_k_seq + kv_head * stride_k_head + (
-                chunk * _CHUNK_ELEMS
+            # stride_k_seq/head are ELEMENT strides -> ×_BF16_BYTES to a byte offset.
+            g_base = (
+                token * stride_k_seq + kv_head * stride_k_head + chunk * _CHUNK_ELEMS
             ) * _BF16_BYTES
             gptr = buffer_ops.create_llvm_ptr(base_i64 + fx.Int64(g_base), address_space=1)
             for i in fx.range_constexpr(self.n_wr_tile_cols):
@@ -610,8 +612,8 @@ class KManager16b:
             g_off = (
                 token * stride_k_seq
                 + kv_head * stride_k_head
-                + (col_idx + chunk * _CHUNK_ELEMS) * _BF16_BYTES
-            )
+                + col_idx + chunk * _CHUNK_ELEMS
+            ) * _BF16_BYTES
             gptrs.append(
                 buffer_ops.create_llvm_ptr(base_i64 + fx.Int64(g_off), address_space=1)
             )
@@ -669,7 +671,7 @@ class KManager16b:
 # ============================================================================
 
 
-class VManager16b:
+class VManager16bV1:
     """Owns V's LDS staging and the global->LDS->VGPR **transpose** load.
 
     PV computes O^T = V^T @ P^T, so V is the WMMA A-operand ``V^T[d, kv]``. Since V
@@ -756,7 +758,7 @@ class VManager16b:
         later in softmax); the LDS position uses the UNCLAMPED kv_row.
 
         **Immediate column-stride (HK trick, when num_waves == n_wr_tile_rows):** as in
-        ``KManager16b.global_load_ptrs`` -- one 8-kv row-block per warp, the d columns
+        ``KManager16bV1.global_load_ptrs`` -- one 8-kv row-block per warp, the d columns
         share a VRAM row so the row base is computed once and the async immediate carries
         the d stride (pre-subtracted from the swizzled LDS dest, which it also shifts).
         Other configs fall back to the per-tile round-robin path with imm=0."""
@@ -780,8 +782,9 @@ class VManager16b:
                 safe_kv = (kv_row < kv_valid).select(kv_row, fx.Int32(0))  # clamp OOB
             token = kv_row0 + safe_kv
             # Row base at d column 0 (col term lives in the immediate); computed once.
-            g_base = token * stride_v_seq + kv_head * stride_v_head + (
-                chunk * _CHUNK_ELEMS
+            # stride_v_seq/head are ELEMENT strides -> ×_BF16_BYTES to a byte offset.
+            g_base = (
+                token * stride_v_seq + kv_head * stride_v_head + chunk * _CHUNK_ELEMS
             ) * _BF16_BYTES
             gptr = buffer_ops.create_llvm_ptr(v_base_i64 + fx.Int64(g_base), address_space=1)
             for i in fx.range_constexpr(self.n_wr_tile_cols):
@@ -808,7 +811,7 @@ class VManager16b:
             if check_oob:
                 safe_kv = (kv_row < kv_valid).select(kv_row, fx.Int32(0))  # clamp OOB
             token = kv_row0 + safe_kv
-            g_off = token * stride_v_seq + kv_head * stride_v_head + d_col * _BF16_BYTES
+            g_off = (token * stride_v_seq + kv_head * stride_v_head + d_col) * _BF16_BYTES
             gptrs.append(
                 buffer_ops.create_llvm_ptr(v_base_i64 + fx.Int64(g_off), address_space=1)
             )
@@ -860,6 +863,177 @@ class VManager16b:
                     p = base_ptrs[dt % 2]
                     if imm:
                         p = buffer_ops.get_element_ptr(p, static_byte_offset=imm)
+                    out.append(fx.Vector(rocdl.ds_load_tr16_b128(v8_ty, p)))
+        return out
+
+
+# ============================================================================
+# V2 K/V loaders — TDM (Tensor DMA) global->LDS + row-major PADDED LDS.
+#
+# vs V1 (cluster/global_load_async + swizzled LDS): the whole n_block x hdim tile
+# is copied by ONE TDM atom whose descriptor carries base/extent/stride as state, so
+# there is NO per-lane address VALU (saves address VGPRs) and the per-dim extent gives
+# HARDWARE OOB (zero-fill) — no software kv_valid `.select` clamps. The LDS is plain
+# row-major with per-row padding (TDM pad_interval/pad_amount, in bf16 elements) so the
+# WMMA ds_load fetch stays bank-conflict-free: K pads 8 elems (4 DW / 16 B), V pads 16
+# elems (8 DW / 32 B). Element (row, col) lives at ``row*ROW_ELEMS + col`` (elements).
+# The read collapses to ONE per-lane base + compile-time immediates (leaner than V1's 2).
+# ============================================================================
+
+_K_PAD_ELEMS = 8   # 4 DW = 16 B per K row
+_V_PAD_ELEMS = 16  # 8 DW = 32 B per V row
+
+
+def _tdm_load_views(*, ptr_x, stride_seq, stride_head, head, row0, valid,
+                    n_rows, hdim, pad_elems, lds_base):
+    """Build ``(atom, g_view, lds_view)`` for ONE TDM global->LDS tile copy — PURE
+    view/descriptor construction (no memory op), so the caller can hoist it before the
+    drain and issue the copy later. Src base = ``ptr_x[row0, head]``; ``lds_base`` is the
+    LDS byte base (fx.Int32); per-row extent ``valid`` gives HW OOB zero-fill; LDS dst is
+    row-major with ``hdim + pad_elems`` element row stride; all 8 waves split the tile
+    (``num_warps``). Issue with ``fx.copy_atom_call(atom, g_view, lds_view)``.
+    ``stride_seq``/``stride_head`` are in ELEMENTS (host passes K/V strides element-count);
+    TDM strides + ``add_offset`` on the bf16 iter are element-based, so no conversion."""
+    off = fx.Int64(row0) * fx.Int64(stride_seq) + fx.Int64(head) * fx.Int64(stride_head)
+    base = fx.add_offset(fx.get_iter(ptr_x), off)
+    g_view = fx.Tensor(fx.make_view(base, fx.make_layout((n_rows, hdim), (hdim, 1))))
+    atom = fx.rocdl.make_tdm_atom(
+        g_view, [valid, None], strides=[stride_seq, None],
+        num_warps=_DEFAULT_NUM_WAVES, pad_interval=hdim, pad_amount=pad_elems,
+    )
+    lds_ptr_ty = fx.PointerType.get(
+        elem_ty=fx.BFloat16.ir_type, address_space=fx.AddressSpace.Shared, alignment=16,
+    )
+    lds_iter = fx.inttoptr(lds_ptr_ty, lds_base)
+    lds_view = fx.Tensor(
+        fx.make_view(lds_iter, fx.make_layout((n_rows, hdim), (hdim + pad_elems, 1)))
+    )
+    return atom, g_view, lds_view
+
+
+class KManager16bV2:
+    """K loader (TDM + row-major padded LDS). Same B-fragment output as ``KManager16bV1``
+    (``_qk_gemm`` order ``[(kv, dt, half)...]``, natural ``ds_load_b128``)."""
+
+    def __init__(self, *, qk_hdim, n_block=_DEFAULT_N_BLOCK, num_waves=_DEFAULT_NUM_WAVES):
+        if qk_hdim % _WMMA_K != 0:
+            raise ValueError(f"qk_hdim must be a multiple of {_WMMA_K}; got {qk_hdim}")
+        if n_block not in _N_BLOCK_CHOICES:
+            raise ValueError(f"n_block must be one of {_N_BLOCK_CHOICES}; got {n_block}")
+        if num_waves != _DEFAULT_NUM_WAVES:
+            raise NotImplementedError("V2 TDM loader assumes 8 waves")
+        self.qk_hdim = qk_hdim
+        self.n_block = n_block
+        self.num_waves = num_waves
+        self.row_elems = qk_hdim + _K_PAD_ELEMS          # padded LDS row stride (elems)
+        self.row_bytes = self.row_elems * _BF16_BYTES
+
+    def get_lds_size_in_byte(self):
+        return self.n_block * self.row_bytes
+
+    def load_views(self, *, ptr_lds, ptr_K, stride_k_seq, stride_k_head,
+                   kv_head, kv_row0, kv_valid):
+        """Return ``(atom, g_view, lds_view)`` for this block's K tile TDM copy into the
+        padded LDS at ``ptr_lds`` (fx.Int32 byte base). Pure (hoistable); issue with
+        ``fx.copy_atom_call(atom, g_view, lds_view)``, then drain with ``tdm_ops.tensor_wait(0)``."""
+        return _tdm_load_views(
+            ptr_x=ptr_K, stride_seq=stride_k_seq, stride_head=stride_k_head,
+            head=kv_head, row0=kv_row0, valid=kv_valid,
+            n_rows=self.n_block, hdim=self.qk_hdim, pad_elems=_K_PAD_ELEMS,
+            lds_base=ptr_lds,
+        )
+
+    def ds_load_ptrs(self, *, ptr_lds, lane_idx):
+        """The **1** per-lane ds_load base pointer (list of 1, matching V1's API) that
+        ``load_k_to_reg`` reaches every ``ds_load_b128`` from by a compile-time immediate.
+        Lane ``l`` fetches at row ``l%16``, d-byte ``(l//16)*16`` of the block; every
+        fragment ``(kv, dt, half)`` is that base + a lane-independent immediate."""
+        lane_base = (ptr_lds
+                     + (lane_idx % _WMMA_M) * fx.Int32(self.row_bytes)
+                     + (lane_idx // _WMMA_M) * fx.Int32(_CHUNK_ELEMS * _BF16_BYTES))
+        return [buffer_ops.create_llvm_ptr(lane_base, address_space=3)]
+
+    def load_k_to_reg(self, base_ptrs, lds_imm_offset=0):
+        """Burst all K ``ds_load_b128`` from the row-major padded block, in ``_qk_gemm``
+        order ``[(kv, dt, half)...]``, off the single base of ``ds_load_ptrs``. Fragment
+        (kv, dt, half) = base + ``kv*16*row_bytes + (dt*32 + half*16)*2`` bytes."""
+        v8_ty = fx.Vector.make_type(8, fx.BFloat16)
+        NKV = self.n_block // _WMMA_M
+        NDT = self.qk_hdim // _WMMA_K
+        base = base_ptrs[0]
+        out = []
+        for kv in range(NKV):
+            for dt in range(NDT):
+                for half in range(2):
+                    imm = (kv * _WMMA_M * self.row_bytes
+                           + (dt * _WMMA_K + half * _WMMA_M) * _BF16_BYTES
+                           + lds_imm_offset)
+                    p = base
+                    if imm:
+                        p = buffer_ops.get_element_ptr(base, static_byte_offset=imm)
+                    out.append(fx.Vector(llvm_dialect.load(v8_ty, p)))
+        return out
+
+
+class VManager16bV2:
+    """V loader (TDM + row-major padded LDS, 32 B/row pad). Same A-fragment output as
+    ``VManager16bV1`` (``_pv_gemm`` order ``[(dt, kt, half)...]``, transpose
+    ``ds_load_tr16_b128`` crossbar ``V[kv+(l//16)*8+l%8, d+((l//8)%2)*8]``)."""
+
+    def __init__(self, *, v_hdim, n_block=_DEFAULT_N_BLOCK, num_waves=_DEFAULT_NUM_WAVES):
+        if v_hdim % _WMMA_M != 0:
+            raise ValueError(f"v_hdim must be a multiple of {_WMMA_M}; got {v_hdim}")
+        if n_block % _WMMA_K != 0:
+            raise ValueError(f"n_block must be a multiple of {_WMMA_K}; got {n_block}")
+        if num_waves != _DEFAULT_NUM_WAVES:
+            raise NotImplementedError("V2 TDM loader assumes 8 waves")
+        self.v_hdim = v_hdim
+        self.n_block = n_block
+        self.num_waves = num_waves
+        self.row_elems = v_hdim + _V_PAD_ELEMS
+        self.row_bytes = self.row_elems * _BF16_BYTES
+
+    def get_lds_size_in_byte(self):
+        return self.n_block * self.row_bytes
+
+    def load_views(self, *, ptr_lds, ptr_V, stride_v_seq, stride_v_head,
+                   kv_head, kv_row0, kv_valid):
+        """Return ``(atom, g_view, lds_view)`` for this block's V tile TDM copy. Pure;
+        issue with ``fx.copy_atom_call(atom, g_view, lds_view)``, then drain with ``tdm_ops.tensor_wait(0)``."""
+        return _tdm_load_views(
+            ptr_x=ptr_V, stride_seq=stride_v_seq, stride_head=stride_v_head,
+            head=kv_head, row0=kv_row0, valid=kv_valid,
+            n_rows=self.n_block, hdim=self.v_hdim, pad_elems=_V_PAD_ELEMS,
+            lds_base=ptr_lds,
+        )
+
+    def ds_load_ptrs(self, *, ptr_lds, lane_idx):
+        """The **1** per-lane transpose-load base pointer (list of 1, matching V1's API).
+        Crossbar fetch at ``kv = (l//16)*8 + l%8``, ``d = ((l//8)%2)*8`` of the block;
+        every fragment ``(dt, kt, half)`` is that base + a lane-independent immediate."""
+        lane_kv = (lane_idx // _WMMA_M) * fx.Int32(8) + lane_idx % fx.Int32(8)
+        lane_d = ((lane_idx // fx.Int32(8)) % fx.Int32(2)) * fx.Int32(8)
+        lane_base = ptr_lds + lane_kv * fx.Int32(self.row_bytes) + lane_d * fx.Int32(_BF16_BYTES)
+        return [buffer_ops.create_llvm_ptr(lane_base, address_space=3)]
+
+    def load_v_to_reg(self, base_ptrs, lds_imm_offset=0):
+        """Burst all V ``ds_load_tr16_b128`` from the row-major padded block, in
+        ``_pv_gemm`` order ``[(dt, kt, half)...]``, off the single base of ``ds_load_ptrs``.
+        Fragment (dt, kt, half) = base + ``(kt*32 + half*16)*row_bytes + dt*16*2`` bytes."""
+        v8_ty = fx.Vector.make_type(8, fx.BFloat16)
+        d_tiles = self.v_hdim // _WMMA_M
+        nkt = self.n_block // _WMMA_K
+        base = base_ptrs[0]
+        out = []
+        for dt in range(d_tiles):
+            for kt in range(nkt):
+                for half in range(2):
+                    imm = ((kt * _WMMA_K + half * _WMMA_M) * self.row_bytes
+                           + dt * _WMMA_M * _BF16_BYTES
+                           + lds_imm_offset)
+                    p = base
+                    if imm:
+                        p = buffer_ops.get_element_ptr(base, static_byte_offset=imm)
                     out.append(fx.Vector(rocdl.ds_load_tr16_b128(v8_ty, p)))
         return out
 
