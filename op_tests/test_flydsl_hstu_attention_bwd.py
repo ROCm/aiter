@@ -22,14 +22,14 @@ perf-oriented gate.
 import argparse
 import itertools
 
-import aiter
 import pandas as pd
 import torch
+
+import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.test_common import benchmark, checkAllclose, run_perftest
-
 from aiter.ops.flydsl.hstu_attention_kernels import flydsl_hstu_attention_bwd
+from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 # torch-autograd oracle and tolerances from the pytest correctness suite (single
 # source of truth; they live at module top level for exactly this reuse).
@@ -205,7 +205,7 @@ def main():
         type=int,
         nargs="*",
         default=[4, 8],
-        help="""Head counts (require (batch*heads) %% 8 == 0).
+        help="""Head counts.
         e.g.: -H 4 8""",
     )
     parser.add_argument(

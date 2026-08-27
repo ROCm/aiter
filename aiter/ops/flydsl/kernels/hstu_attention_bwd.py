@@ -473,10 +473,12 @@ def build_hstu_attention_bwd_dvdk(
 
         def silu_and_grad_batch(s_list):
             # Fast (non-IEEE) SiLU + derivative on fp32 lanes. The fastmath context
-            # gives every add/mul the `fast` flag (matches the compile hints). exp2
-            # and rcp stay on the amdgcn approximate hardware ops: exp2 is emitted as
-            # the v_exp_f32 intrinsic directly because math.exp2 lowers to a slower
-            # expansion here (~1.6% on the dV/dK kernel); rcp uses the rocdl builder.
+            # gives every add/mul the `fast` flag (matches the compile hints) and turns
+            # the reciprocal into v_rcp_f32, so no rocdl builder is needed there. exp2
+            # is the exception: it stays on the amdgcn intrinsic, which FlyDSL
+            # docs/api_stability.md classes as unstable, because the stable
+            # fx.math.exp2 does not reach v_exp_f32 even under this context
+            # (+2.7% mean, +6.1% worst over the b=120 shape sweep).
             with arith.fastmath(arith.FastMathFlags.fast):
                 sc = [s * c_alpha for s in s_list]
                 tt = [s * c_neg_log2e for s in sc]
@@ -489,7 +491,7 @@ def build_hstu_attention_bwd_dvdk(
                     for t in tt
                 ]
                 den = [c_one_f + e for e in emu]
-                sig = [fx.Float32(rocdl.rcp(compute_type, d)) for d in den]
+                sig = [c_one_f / d for d in den]
                 silu = [sc[i] * sig[i] for i in range(len(s_list))]
                 grad = [
                     sig[i] * (c_one_f + sc[i] * (c_one_f + c_neg_one_f * sig[i]))
@@ -552,6 +554,10 @@ def build_hstu_attention_bwd_dvdk(
         wave_lds_base_q = fx.Int32(q_lds_byte_base) + fx.Int32(wave_id) * fx.Int32(
             WARP_SIZE * DMA_BYTES
         )
+        # The base is wave-uniform, so pull it into an SGPR for the DMA destination.
+        # readfirstlane is unstable per FlyDSL docs/api_stability.md (absent from
+        # rocdl.__all__) and has no stable counterpart: fx.gpu exports lane_id and the
+        # shuffle_* family only. Same for the dO base below and the dQ kernel's K base.
         wave_lds_lane0_q = rocdl.readfirstlane(fx.Int32.ir_type, wave_lds_base_q)
         q_dma_rows = []
         q_dma_gcols = []

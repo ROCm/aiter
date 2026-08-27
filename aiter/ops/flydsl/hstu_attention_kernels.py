@@ -15,16 +15,16 @@ import torch
 from flydsl.runtime.device import get_rocm_arch
 
 from aiter import logger
-from aiter.ops.flydsl.kernels.hstu_attention_fwd import (
-    build_hstu_attention_fwd,
-    validate_hstu_attention_fwd,
-)
 from aiter.ops.flydsl.kernels.hstu_attention_bwd import (
-    build_hstu_attention_bwd_dvdk,
     NUM_GRID_GROUPS,
+    build_hstu_attention_bwd_dvdk,
 )
 from aiter.ops.flydsl.kernels.hstu_attention_bwd_dq import (
     build_hstu_attention_bwd_dq,
+)
+from aiter.ops.flydsl.kernels.hstu_attention_fwd import (
+    build_hstu_attention_fwd,
+    validate_hstu_attention_fwd,
 )
 from aiter.ops.triton.utils.common_utils import prev_power_of_2
 

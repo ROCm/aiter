@@ -344,10 +344,9 @@ def build_hstu_attention_bwd_dq(
         def silu_grad_batch(s_list):
             """silu'(alpha*s) = sigma*(1 + alpha*s*(1-sigma)); same fast sigmoid as forward.
 
-            The fastmath context gives every add/mul the `fast` flag; exp2 and rcp stay
-            on the amdgcn approximate hardware ops (exp2 emitted as the v_exp_f32
-            intrinsic directly since math.exp2 lowers to a slower expansion; rcp via the
-            rocdl builder)."""
+            The fastmath context gives every add/mul the `fast` flag and turns the
+            reciprocal into v_rcp_f32; only exp2 stays on the amdgcn intrinsic. See the
+            dV/dK kernel for why the stable fx.math.exp2 is not used."""
             with arith.fastmath(arith.FastMathFlags.fast):
                 sc = [s * c_alpha for s in s_list]
                 tt = [s * c_neg_log2e for s in sc]
@@ -360,7 +359,7 @@ def build_hstu_attention_bwd_dq(
                     for t in tt
                 ]
                 den = [c_one_f + e for e in emu]
-                sig = [fx.Float32(rocdl.rcp(compute_type, d)) for d in den]
+                sig = [c_one_f / d for d in den]
                 return [
                     sig[i] * (c_one_f + sc[i] * (c_one_f + c_neg_one_f * sig[i]))
                     for i in range(len(s_list))
@@ -419,6 +418,8 @@ def build_hstu_attention_bwd_dq(
         wave_lds_base_k = fx.Int32(k_lds_byte_base) + fx.Int32(wave_id) * fx.Int32(
             WARP_SIZE * DMA_BYTES
         )
+        # Wave-uniform base pulled into an SGPR; see the dV/dK kernel on why this
+        # unstable rocdl builder has no stable replacement.
         wave_lds_lane0_k = rocdl.readfirstlane(fx.Int32.ir_type, wave_lds_base_k)
         k_dma_rows = []
         k_dma_gcols = []
