@@ -198,6 +198,10 @@ with _silence():
 
 SUPPORTED_GFX = ["gfx1250"]
 _TOKENS = (1, 16, 32, 64, 128, 256, 512, 1024, 2048, 65536)
+# inverse_rope dispatches on the token count itself -- THREAD_DATA_SIZE steps at
+# s<=4 and s<=128, K_PER_BLOCK at s>128 and s>512 -- so it sweeps the shared set
+# plus the UT's own mid-range tiers, which _TOKENS jumps straight over.
+_INVERSE_ROPE_TOKENS = tuple(sorted(set(_TOKENS) | {8, 4096, 8192, 16384}))
 _MLA_DECODE_TOKENS = tuple(t for t in _TOKENS if t <= 1024)
 _MLA_PREFILL_TOKENS = tuple(t for t in _TOKENS if t >= 1024)
 
@@ -1276,7 +1280,7 @@ def run_inverse_rope(_args):
             "-b",
             "128,16",
             "-s",
-            *[str(t) for t in _TOKENS],
+            *[str(t) for t in _INVERSE_ROPE_TOKENS],
             "-l",
             "n32k4",
             "--group-size",
