@@ -113,17 +113,16 @@ def _make_seq_offsets(B, Mi, regime, seed, device, sparsity=0.95):
         so = torch.zeros(B + 1, dtype=torch.int32, device=device)
         so[1:] = torch.cumsum(lengths, dim=0).to(torch.int32)
         return so
-    g = torch.Generator().manual_seed(seed)
-    u = torch.rand(B, generator=g)
+    g = torch.Generator(device=device).manual_seed(seed)
+    u = torch.rand(B, generator=g, device=device)
     t = (Mi * (u**4)).floor().to(torch.int64)
     t[: max(1, B // 5)] = 0  # ~20% empty groups
     t[-1] = Mi  # one full-envelope group
     if B > 1:
         t[-2] = int(0.9 * Mi)  # one near-full group
-    so = torch.zeros(B + 1, dtype=torch.int32)
-    for i in range(B):
-        so[i + 1] = so[i] + int(t[i])
-    return so.to(device)
+    so = torch.zeros(B + 1, dtype=torch.int32, device=device)
+    so[1:] = torch.cumsum(t, 0).to(torch.int32)
+    return so
 
 
 def _make_inputs(
