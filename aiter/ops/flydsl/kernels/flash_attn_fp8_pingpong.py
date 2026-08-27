@@ -903,7 +903,6 @@ def build_flash_attn_fp8_module(
                 m_frozen, bias_chunks, p_pack, l_valu = do_softmax(s_accs, m_init, l_valu_init)
 
                 g_koffs = get_hbm_koffs(BLOCK_N * 2)
-                _gpu_barrier()
                 return (
                     m_frozen,
                     l_valu,
@@ -970,6 +969,10 @@ def build_flash_attn_fp8_module(
 
                 v_preloaded = _rest[5 + DMA_PASSES :]
                 kv_start = fx.Index(iv)
+
+                _sched_barrier()
+                rocdl.s_setprio(0)
+                _gpu_barrier()
                 o, l_mfma, k_preloaded = apply_pv(
                     [o0, o1, o2, o3],
                     l_mfma,
@@ -989,6 +992,7 @@ def build_flash_attn_fp8_module(
                 )
 
                 _sched_barrier()
+                rocdl.s_setprio(1)
                 _gpu_barrier()
                 m_frozen, bias_chunks, p_pack, l_valu = do_softmax(
                     s_accs,
@@ -1000,9 +1004,6 @@ def build_flash_attn_fp8_module(
                 # Address math for the *next* tile's DMA is computed here, in
                 # the VALU phase; do_qk only fires the buffer_loads.
                 g_koffs = get_hbm_koffs(kv_start + fx.Index(BLOCK_N * 2))
-                _sched_barrier()
-                _gpu_barrier()
-
                 scf.YieldOp(
                     [
                         _raw(m_frozen),
@@ -1125,6 +1126,7 @@ def build_flash_attn_fp8_module(
                 l_voffs = get_lds_voffs(v_buff_off)
                 g_voffs = get_hbm_voffs(kv_start + fx.Index(2 * BLOCK_N))
                 _sched_barrier()
+                rocdl.s_setprio(0)
                 _gpu_barrier()
 
                 o, l_mfma, k_preloaded = apply_pv(
@@ -1145,6 +1147,7 @@ def build_flash_attn_fp8_module(
                     dma=(v_rsrc, l_voffs, g_voffs),
                 )
                 _sched_barrier()
+                rocdl.s_setprio(1)
                 _gpu_barrier()
                 scf.YieldOp(
                     [
