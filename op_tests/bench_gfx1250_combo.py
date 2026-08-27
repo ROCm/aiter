@@ -76,7 +76,7 @@ The DSv4 ``mla_v4_prefill`` op runs four FP8 performance cases at M=16384,
 H=128 and D=512: compressed prefix-pool rows 4096/16384 crossed with
 dense/sparse CSR modes. The current 16K-token chunk remains uncompressed:
 
-    python3 op_tests/test_pa_sparse_prefill_opus.py \
+    python3 op_tests/test_pa_sparse_prefill.py \
       -n 16384 --h_q 128 -d 512 \
       --total_pages 4096 16384 --total_tokens 16384 \
       --prec fp8 --mode dense sparse --no-verify
@@ -569,6 +569,36 @@ def _md_from_pandas(marker, columns):
                 continue
             df = pd.DataFrame([values], columns=list(columns))
             return df.to_markdown(index=False).splitlines()
+        return []
+
+    return extract
+
+
+def _md_from_space_table(header_col):
+    """Re-emit a UT's own DataFrame.to_string() summary as markdown.
+
+    Anchors on the header row carrying `header_col` and takes the aligned rows
+    that follow, so the table survives the aiter trace fragments and compiler
+    warnings interleaved before it.
+    """
+
+    def extract(lines):
+        for i, line in enumerate(lines):
+            if header_col not in line.split():
+                continue
+            cols = line.split()
+            rows = []
+            for follower in lines[i + 1 :]:
+                fields = follower.split()
+                if len(fields) != len(cols):
+                    break
+                rows.append(fields)
+            if rows:
+                return (
+                    pd.DataFrame(rows, columns=cols)
+                    .to_markdown(index=False)
+                    .splitlines()
+                )
         return []
 
     return extract
@@ -1167,7 +1197,7 @@ def run_mla_v4_prefill(_args):
             f"mla_v4 prefill (FP8, M={tokens}, prefix=4096/16384)",
             [
                 sys.executable,
-                "op_tests/test_pa_sparse_prefill_opus.py",
+                "op_tests/test_pa_sparse_prefill.py",
                 "-n",
                 str(tokens),
                 "--h_q",
@@ -1195,21 +1225,16 @@ def run_mla_v4_prefill_fp8(_args):
     """Run the default gfx1250 MLA v4 sparse-prefill FP8 sweep."""
     env = os.environ.copy()
     env["PYTHONPATH"] = "."
+    # Keep the UT's own -n default ([512, 1024, 2048, 4096]). N=65536 faults the
+    # GPU (HSA_STATUS_ERROR_MEMORY_FAULT) after its case verifies, and because
+    # the UT prints its summary table only at the very end, that fault costs the
+    # whole sweep: the smaller shapes run fine but never get reported.
     _run_child(
         "mla_v4 prefill FP8 (sparse-prefill default sweep)",
-        [
-            sys.executable,
-            "op_tests/test_pa_sparse_prefill.py",
-            "-n",
-            "512",
-            "1024",
-            "2048",
-            "4096",
-            "65536",
-        ],
+        [sys.executable, "op_tests/test_pa_sparse_prefill.py"],
         cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
         env=env,
-        extract=_lines(_table_row("opus us", "triton us", "asm us")),
+        extract=_md_from_space_table("n_tokens"),
     )
 
 
