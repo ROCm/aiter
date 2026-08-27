@@ -250,7 +250,7 @@ def _run_prefill(
         TOPK=problem.topk,
         BLOCK_TILE_SIZE_M=config.BLOCK_M,
         BLOCK_TILE_SIZE_N=config.BLOCK_N,
-        BLOCK_TILE_SIZE_K=None,
+        BLOCK_TILE_SIZE_K=config.BLOCK_K,
         stage="gateup",
         alg="prefill_1x4",
         E=problem.experts,
@@ -298,6 +298,7 @@ def _run_prefill(
         TOPK=problem.topk,
         BLOCK_TILE_SIZE_M=config.BLOCK_M,
         BLOCK_TILE_SIZE_N=128,
+        # Down-prefill uses its own dtype-sized K chunk; Config.BLOCK_K tunes gateup.
         stage="down",
         alg="prefill_1x4",
         E=problem.experts,
