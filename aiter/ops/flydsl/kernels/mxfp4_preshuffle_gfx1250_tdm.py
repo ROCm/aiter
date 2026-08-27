@@ -1076,6 +1076,7 @@ def launch_gemm_a8w4_tdm(
                 next_stage_buf=None,
                 my_jobs=None,
                 next_stage_wait=None,
+                xt_issue=None,
             ):
                 """Compute one k-tile, carrying one k128 of A/B/scales across tiles.
 
@@ -1120,7 +1121,12 @@ def launch_gemm_a8w4_tdm(
                     # Spread the tail issue's TDMs over the WMMA groups: one burst
                     # would block the MFMA pipe for its whole descriptor setup.
                     tdm_schedule = spread(
-                        TDM_PER if (prefetch_kt is not None and ksl + 1 == KWS) else 0,
+                        TDM_PER
+                        if (
+                            (prefetch_kt is not None or xt_issue is not None)
+                            and ksl + 1 == KWS
+                        )
+                        else 0,
                         schedule_slots,
                     )
                     for i in range_constexpr(schedule_slots):
@@ -1159,7 +1165,11 @@ def launch_gemm_a8w4_tdm(
                         issue_fn=(
                             do_issue
                             if const_expr(prefetch_kt is not None and is_last)
-                            else None
+                            else (
+                                xt_issue
+                                if const_expr(xt_issue is not None and is_last)
+                                else None
+                            )
                         ),
                     )
                     # One region per k128: sched_group_barrier only partitions
@@ -1330,9 +1340,11 @@ def launch_gemm_a8w4_tdm(
                         _own_wait = TDM_PER * max(
                             0, num_buffers - 1 - j - (1 if has_next else 0)
                         )
-                        if const_expr(persistent_active and j > 0):
+                        # Iterations 1..nb-1 each issued one slot mid-compute, so
+                        # TDM_PER*(j-1) next-tile ops are already outstanding here.
+                        if const_expr(persistent_active and j > 1):
                             if has_next_tile:
-                                tdm_ops.tensor_wait(_own_wait + TDM_PER * j)
+                                tdm_ops.tensor_wait(_own_wait + TDM_PER * (j - 1))
                             else:
                                 tdm_ops.tensor_wait(_own_wait)
                         else:
@@ -1348,24 +1360,36 @@ def launch_gemm_a8w4_tdm(
                             if const_expr(has_next)
                             else None
                         )
-                        compute_ktile(buf, None, next_stage_on, next_stage_buf)
-                        if const_expr(persistent_active and j < num_buffers - 1):
-                            if has_next_tile:
-                                # Slot s_j was just fully consumed by compute_ktile
-                                # above and the drain visits each slot exactly once, so
-                                # this tile never reads it again -- issue the NEXT tile's
-                                # matching k-tile s_j into it now (into slot s_j so the
-                                # preloaded prologue's slot=k-tile layout holds). The
-                                # barrier alone is the needed hazard guard: every wave
-                                # must finish reading this slot before any wave overwrites
-                                # it. No tensor_wait -- the fresh async load stays in
-                                # flight to overlap this tile's epilogue, whose C staging
-                                # lives in a disjoint LDS region in persistent mode.
-                                # Slot s_j was just fully consumed by the compute_ktile
-                                # above, so its ds-reads have drained -- the barrier only
-                                # needs the cross-wave rendezvous, not another dscnt wait.
-                                reuse_barrier()
-                                issue(s_j, s_j, jobs_list=jobs_next)
+                        # Cross-tile prefetch, interleaved with this iteration's
+                        # WMMAs instead of trailing them in one burst.
+                        #
+                        # Issuing into the slot THIS iteration just consumed would
+                        # have to wait for its own WMMAs to finish reading it, which
+                        # is why it used to sit after compute_ktile behind an extra
+                        # barrier -- a lump of descriptor setup with no MFMA to hide
+                        # behind. Target the slot the PREVIOUS iteration freed
+                        # instead: the fence+barrier at the top of this iteration
+                        # already rendezvoused every wave past it, so it is safe to
+                        # overwrite for the whole of this compute_ktile and the issue
+                        # can go inside the last k128, where emit_hints' sched_vmem /
+                        # sched_mfma slots interleave it with the WMMA groups exactly
+                        # like the mainloop's own prefetch.
+                        # Same set of (slot, k-tile) pairs as before -- s_0..s_{nb-2},
+                        # each still issued into the slot matching its k-tile index so
+                        # the preloaded prologue's slot==k-tile layout holds -- just
+                        # one iteration later each.
+                        _xt = None
+                        if const_expr(persistent_active and j >= 1):
+                            _s_prev = (n_steady + j - 1) % num_buffers
+
+                            def _xt_fn(_s=_s_prev):
+                                if has_next_tile:
+                                    issue(_s, _s, jobs_list=jobs_next)
+
+                            _xt = _xt_fn
+                        compute_ktile(
+                            buf, None, next_stage_on, next_stage_buf, xt_issue=_xt
+                        )
                 else:
                     # Mid-compute prefetch: better for prefill. PRE is both the tiles
                     # resident before the loop and the issue lead; the carry adds one.
