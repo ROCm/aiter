@@ -166,6 +166,13 @@ def compile_gemm2_a4w4_port(
     _K_HALF = k_half_for(_K)
     _K_TILES_TOTAL = k_tiles_total_for(_K, BK)
     _persistent = epilog in ("nonatomic", "nonatomic_mxfp4")
+    _split_next_b_vgpr = (
+        epilog == "nonatomic"
+        and BM == 128
+        and _K_TILES_TOTAL == 2
+        and _K_REAL == _K
+        and not use_nt
+    )
     _slot_bytes = saq_slot_bytes(BM, KH_TILE)
     _aStages = kStages if _K_TILES_TOTAL <= kStages else 3
     _acc_rows = min(BM, 64) if epilog == "nonatomic_cshuffle" else BM
@@ -410,6 +417,13 @@ def _gemm2_body(
     _num_n_blocks = num_n_blocks_for(N_OUT, BN)
     _n_load_waves, _rows_per_wave, _kSubBlocks = tiling(BM)
     b_aux = 2 if use_nt else 0
+    split_next_b_vgpr = (
+        epilog == "nonatomic"
+        and BM == 128
+        and _K_TILES_TOTAL == 2
+        and _K_REAL == _K
+        and not use_nt
+    )
 
     m_block_idx = _udiv(bx_i32, _num_n_blocks)
     n_block_idx = bx_i32 - m_block_idx * fx.Int32(_num_n_blocks)
@@ -543,47 +557,50 @@ def _gemm2_body(
     zero4 = Vec.filled(4, 0.0, fx.Float32)
     accm = [[None, None, None, None] for _ in range(_kMChunks)]
 
-    def mfma_cluster(b_tile, a, a_scale_sub, b_scale_slot, init, kt=0):
+    def mfma_one_j(J, b_j, a, a_scale_sub, b_scale_slot, init, kt=0):
         _skip_h1 = (kt * 2 + 1) >= _n_real_half
+        mni = J // 2
+        in_b = J % 2
+        sb = b_scale_slot[mni]
+        b_J0 = b_j[0]
+        b_J1 = None if const_expr(_skip_h1) else b_j[1]
+        for sub in range_constexpr(_kSubBlocks):
+            sa = a_scale_sub[sub]
+            i0 = sub * 2
+            i1 = sub * 2 + 1
+            if const_expr(init):
+                accm[i0][J] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
+                    mfma_res_ty, [a[i0][0], b_J0, zero4, 4, 4, 0, sa, 0 + in_b, sb]
+                )
+                if const_expr(_kMChunks > 1):
+                    accm[i1][J] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
+                        mfma_res_ty,
+                        [a[i1][0], b_J0, zero4, 4, 4, 1, sa, 0 + in_b, sb],
+                    )
+            else:
+                accm[i0][J] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
+                    mfma_res_ty,
+                    [a[i0][0], b_J0, accm[i0][J], 4, 4, 0, sa, 0 + in_b, sb],
+                )
+                if const_expr(_kMChunks > 1):
+                    accm[i1][J] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
+                        mfma_res_ty,
+                        [a[i1][0], b_J0, accm[i1][J], 4, 4, 1, sa, 0 + in_b, sb],
+                    )
+            if const_expr(not _skip_h1):
+                accm[i0][J] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
+                    mfma_res_ty,
+                    [a[i0][1], b_J1, accm[i0][J], 4, 4, 2, sa, 2 + in_b, sb],
+                )
+                if const_expr(_kMChunks > 1):
+                    accm[i1][J] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
+                        mfma_res_ty,
+                        [a[i1][1], b_J1, accm[i1][J], 4, 4, 3, sa, 2 + in_b, sb],
+                    )
+
+    def mfma_cluster(b_tile, a, a_scale_sub, b_scale_slot, init, kt=0):
         for J in range_constexpr(4):
-            mni = J // 2
-            in_b = J % 2
-            sb = b_scale_slot[mni]
-            b_J0 = b_tile[J][0]
-            b_J1 = None if const_expr(_skip_h1) else b_tile[J][1]
-            for sub in range_constexpr(_kSubBlocks):
-                sa = a_scale_sub[sub]
-                i0 = sub * 2
-                i1 = sub * 2 + 1
-                if const_expr(init):
-                    accm[i0][J] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
-                        mfma_res_ty, [a[i0][0], b_J0, zero4, 4, 4, 0, sa, 0 + in_b, sb]
-                    )
-                    if const_expr(_kMChunks > 1):
-                        accm[i1][J] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
-                            mfma_res_ty,
-                            [a[i1][0], b_J0, zero4, 4, 4, 1, sa, 0 + in_b, sb],
-                        )
-                else:
-                    accm[i0][J] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
-                        mfma_res_ty,
-                        [a[i0][0], b_J0, accm[i0][J], 4, 4, 0, sa, 0 + in_b, sb],
-                    )
-                    if const_expr(_kMChunks > 1):
-                        accm[i1][J] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
-                            mfma_res_ty,
-                            [a[i1][0], b_J0, accm[i1][J], 4, 4, 1, sa, 0 + in_b, sb],
-                        )
-                if const_expr(not _skip_h1):
-                    accm[i0][J] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
-                        mfma_res_ty,
-                        [a[i0][1], b_J1, accm[i0][J], 4, 4, 2, sa, 2 + in_b, sb],
-                    )
-                    if const_expr(_kMChunks > 1):
-                        accm[i1][J] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
-                            mfma_res_ty,
-                            [a[i1][1], b_J1, accm[i1][J], 4, 4, 3, sa, 2 + in_b, sb],
-                        )
+            mfma_one_j(J, b_tile[J], a, a_scale_sub, b_scale_slot, init, kt)
 
     def load_b_bundle(kt):
         return load_b_tile(kt), load_b_scale_tile(kt)
@@ -592,15 +609,48 @@ def _gemm2_body(
         b_tile, b_scale = bundle
         mfma_cluster(b_tile, a, a_scale_sub, b_scale, init=init, kt=kt)
 
-    gemm2_main_loop(
-        load_a_scale_tile,
-        load_b_bundle,
-        issue_a_ds_read,
-        issue_a_load_lds,
-        mfma_tile,
-        k_tiles_total=_K_TILES_TOTAL,
-        a_stages=_aStages,
-    )
+    if const_expr(split_next_b_vgpr):
+        a_scale_v = [
+            load_a_scale_tile(kt) for kt in range_constexpr(_K_TILES_TOTAL)
+        ]
+        b_scale_v = [
+            load_b_scale_tile(kt) for kt in range_constexpr(_K_TILES_TOTAL)
+        ]
+        b_tile_0 = load_b_tile(0)
+
+        gpu.barrier()
+        a_tile_0 = issue_a_ds_read(0)
+        rocdl.sched_barrier(0)
+        b_tile_1 = load_b_tile(1)
+        mfma_cluster(
+            b_tile_0,
+            a_tile_0,
+            a_scale_v[0],
+            b_scale_v[0],
+            init=True,
+            kt=0,
+        )
+
+        gpu.barrier()
+        a_tile_1 = issue_a_ds_read(1)
+        mfma_cluster(
+            b_tile_1,
+            a_tile_1,
+            a_scale_v[1],
+            b_scale_v[1],
+            init=False,
+            kt=1,
+        )
+    else:
+        gemm2_main_loop(
+            load_a_scale_tile,
+            load_b_bundle,
+            issue_a_ds_read,
+            issue_a_load_lds,
+            mfma_tile,
+            k_tiles_total=_K_TILES_TOTAL,
+            a_stages=_aStages,
+        )
 
     if epilog == "nonatomic":
         out_base = _global_base_ptr1(arg_out)
