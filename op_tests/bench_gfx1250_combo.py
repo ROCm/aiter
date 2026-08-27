@@ -38,6 +38,47 @@ Run from the aiter repo root so `op_tests/` siblings import cleanly:
     python op_tests/bench_gfx1250_combo.py --dsv4 --ops mori_ep   # MORI EPv2 dispatch/combine
     python op_tests/bench_gfx1250_combo.py --dsv4 --ops mega_moe  # Mega on/off, 4 GPUs
 
+Environment
+-----------
+
+One variable, applied to every op that sweeps a token count:
+
+    AITER_BENCH_TOKENS=1,128,512 python op_tests/bench_gfx1250_combo.py --dsv4
+
+Two ops ignore it and pin their sweep in the source, because a global token
+count would mean the wrong thing for them:
+
+    mla_v4_decode   1..1024. Decode carries one token per sequence, so the
+                    axis is really the batch; AITER_BENCH_TOKENS=65536 would
+                    ask for a shape the model never runs.
+    inverse_rope    1..16384. The axis is -s at a fixed -b 128,16, and 65536
+                    faults -- in the triton reference the UT compares against,
+                    not in the kernel under test.
+
+With the variable unset, the child-UT ops (score_qk, a8w8_blockscale,
+mla_v4_prefill_fp8) pass no shape flag at all, so each UT sweeps the range its
+owner maintains. The in-process ops (moe, a16w16, mha, mla_v4_prefill) iterate
+shapes here and take their default from the module.
+
+Other variables:
+
+    MORI_SHMEM_HEAP_SIZE=17179869184   mega_moe symmetric arena, bytes.
+                                       Defaulted to 16 GiB here; MoRI's own
+                                       default of 4 GiB is too small from
+                                       tokens/rank=65536 up (needs 7.5 GB) and
+                                       fails in setup() before any kernel runs.
+    ENABLE_CK=0                        set before importing aiter; the module
+                                       already setdefault()s it.
+
+Failures do not stop the sweep: a case that aborts is recorded and the run
+moves to the next one, with a "N failed, M ops selected" list at the end and a
+non-zero exit code. A GPU fault inside this process is the exception -- it
+takes the interpreter down and no handler runs, which is why the child-UT ops
+are the ones that survive their own crashes.
+
+``--ops`` accepts any op, including one held out of a suite's defaults because
+it is broken on the current arch, so it can be re-checked on a newer image.
+
 The ``mori_ep`` op runs the EPv2 benchmark from ``${MORI:-/app/mori}`` as the
 image provides it -- this script never updates or installs mori. Environment
 variables select backend, token tiers, eager/graph modes, EP size, dispatch
@@ -68,8 +109,12 @@ The ``score_qk`` op runs two decode KV lengths at batch 512:
       --batch 512 --heads 64 --index_dim 128 -kv_length 10240 -mtp 0 \
       --kv_preshuffle --blocksize 64
 
-For the 1K-input/1K-output workload, the average decode context is 1536 source
-tokens. CSA compresses KV by 4, so score-QK scans an average KV length of 384.
+score-QK is a decode op, so its KV length is the average context one decode
+step scans -- input + output/2 -- after CSA's 4x KV compression:
+
+    1K in / 1K out   -> (1024  + 512)  / 4 =   384
+    16K in / 4K out  -> (16384 + 2048) / 4 =  4608
+    32K in / 16K out -> (32768 + 8192) / 4 = 10240
 
 The DSv4 ``mla_v4_decode`` op runs sparse decode with GQA/H=128, batch=512 and
 q_seq=1 (M=512), sweeping KV lengths 256/512/1024 and split counts 1/2/4.
@@ -120,15 +165,11 @@ The ``mega_moe`` op runs both sides of the comparison:
       --layers 61 -tpr 512 --combine gather \
       --acc_verify 0 --profile_table 1
 
-Token sweeps are per-op and overridable from the environment, because the ops
-do not share a supported range: score_qk asserts out past batch 1024, a16w16's
-launcher refuses operands over 4 GiB, and inverse_rope faults the GPU at its
-largest tokens. AITER_BENCH_TOKENS sets the default for every op and
-AITER_BENCH_TOKENS_<OP> overrides one:
-
-    AITER_BENCH_TOKENS=1,128,512 \
-    AITER_BENCH_TOKENS_INVERSE_ROPE=1,8,128 \
-      python op_tests/bench_gfx1250_combo.py --dsv4
+Token sweeps come from one variable, AITER_BENCH_TOKENS (see Environment
+above). The ops do not share a supported range -- score_qk asserts out past
+batch 1024, a16w16's launcher refuses operands over 4 GiB, inverse_rope faults
+at its largest tokens -- so ops whose usable range is fixed pin their sweep in
+the source and ignore the variable.
 
 gfx1250's bundled CK does not compile, so the asm JIT modules must be built with
 ENABLE_CK=0. The script sets it (before importing aiter) so a plain run just
@@ -210,27 +251,25 @@ with _silence():
 SUPPORTED_GFX = ["gfx1250"]
 # The gfx1250 launcher addresses gmem with 32-bit descriptors.
 _GMEM_DESCRIPTOR_LIMIT = 4 << 30
+# a16w16 N shapes at K=7168: attention/router projections, then lm_head twice
+# (129280 is the DeepSeek vocab, 32320 is that sharded over TP4).
+_A16W16_NS = (64, 384, 1024, 2048, 32320, 129280)
+_A16W16_WIDE_N = 2048
+_A16W16_WIDE_N_MAX_M = 2048
 
 
-def _tokens(name, default=None):
-    """Token sweep for one op, from the environment.
+def _tokens(default=None):
+    """Token sweep from AITER_BENCH_TOKENS, else the op's own default.
 
-    Ops do not share a supported range -- some shapes are refused by a kernel
-    heuristic, some fault the GPU -- and the useful range also shifts while
-    chasing a regression. AITER_BENCH_TOKENS sets the sweep for every op and
-    AITER_BENCH_TOKENS_<OP> overrides one, e.g.
+    One variable for the whole bench. Ops whose axis is not a token count, or
+    whose usable range is fixed, ignore it and pin their sweep in the source
+    instead -- see _MLA_DECODE_TOKENS and _INVERSE_ROPE_TOKENS.
 
-        AITER_BENCH_TOKENS=1,128,512 \\
-        AITER_BENCH_TOKENS_INVERSE_ROPE=1,8,128 \\
-          python op_tests/bench_gfx1250_combo.py --dsv4
-
-    Returns None when nothing is set and the op has no default of its own: the
-    op then passes no shape flag at all and the UT sweeps its own default, which
-    is the range its owner keeps working.
+    Returns None when the variable is unset and the op has no default of its
+    own: the op then passes no shape flag at all and the UT sweeps its own
+    default, which is the range its owner keeps working.
     """
-    raw = os.environ.get(f"AITER_BENCH_TOKENS_{name.upper()}") or os.environ.get(
-        "AITER_BENCH_TOKENS"
-    )
+    raw = os.environ.get("AITER_BENCH_TOKENS")
     if raw:
         return tuple(int(t) for t in raw.replace(",", " ").split())
     return tuple(default) if default is not None else None
@@ -239,12 +278,34 @@ def _tokens(name, default=None):
 # The in-process ops call their UT per shape, so they need a sweep to iterate;
 # keep one here. The ops that shell out pass no shape flag unless asked, letting
 # each UT sweep the range its owner maintains.
-_TOKENS = _tokens("all", (1, 16, 32, 64, 128, 256, 512, 1024, 2048, 65536))
-_INVERSE_ROPE_TOKENS = _tokens("inverse_rope")
-_SCORE_QK_TOKENS = _tokens("score_qk")
-_A8W8_BLOCKSCALE_TOKENS = _tokens("a8w8_blockscale")
-_MLA_DECODE_TOKENS = _tokens("mla_v4_decode", (t for t in _TOKENS if t <= 1024))
-_MLA_PREFILL_TOKENS = _tokens("mla_v4_prefill", (t for t in _TOKENS if t >= 1024))
+_TOKENS = _tokens((1, 16, 32, 64, 128, 256, 512, 1024, 2048, 65536))
+# Pinned, not env-driven. This axis is -s (sequence length) at a fixed
+# -b 128,16, not the token count the other ops sweep, so a global setting would
+# mean something different here. 65536 is left off: it faults, and in the
+# triton reference the UT compares against rather than the kernel under test.
+_INVERSE_ROPE_TOKENS = (1, 16, 32, 64, 128, 256, 512, 1024, 2048, 16384)
+_SCORE_QK_TOKENS = _tokens()
+# score_qk is decode, so its KV length is the average context a decode step
+# scans: input + output/2, then CSA's 4x compression.
+#   1K in / 1K out  -> (1024  + 512)  / 4 =   384
+#   16K in / 4K out -> (16384 + 2048) / 4 =  4608
+#   32K in / 16K out-> (32768 + 8192) / 4 = 10240
+_SCORE_QK_KV_LENGTHS = (
+    ("1K/1K average", "384"),
+    ("16K/4K average", "4608"),
+    ("32K/16K average", "10240"),
+)
+_A8W8_BLOCKSCALE_TOKENS = _tokens()
+# Pinned, not env-driven. Decode carries one token per sequence, so the token
+# axis here is the batch, and past 1024 it stops being a shape the model runs.
+# AITER_BENCH_TOKENS is deliberately not consulted for this op.
+_MLA_DECODE_TOKENS = (1, 16, 32, 64, 128, 256, 512, 1024)
+# 16384 is the DSv4 prefill chunk and leads the default, but it is part of the
+# default rather than pinned ahead of it: at M=16K one sweep is eight combos
+# against a per-token PyTorch reference, so it has to be possible to drop.
+_MLA_PREFILL_TOKENS = _tokens((16384, *(t for t in _TOKENS if t >= 1024)))
+# Unset by default so the UT keeps its own -n ([512, 1024, 2048, 4096]).
+_MLA_PREFILL_FP8_TOKENS = _tokens()
 
 
 def _int_quad(s):
@@ -582,6 +643,7 @@ def _md_kernel_table(lines):
     the column count is fixed even when the name is not.
     """
     out, rows, cols = [], [], None
+    seen = set()
 
     def flush():
         if cols and rows:
@@ -600,6 +662,13 @@ def _md_kernel_table(lines):
             rows.append(fields)
             continue
         flush()
+        # Non-table lines are kept for the "[cfg] ..." summary, but the child
+        # also emits "no grouped CSV config matched (...)" once per layer per
+        # rank -- hundreds of byte-identical lines around one table. Keep the
+        # first of each; a repeat carries nothing the first did not.
+        if line in seen:
+            continue
+        seen.add(line)
         out.append(line)
     flush()
     return "\n".join(out).splitlines()
@@ -734,6 +803,36 @@ def _kernel_digest(lines):
 _DEFAULT_EXTRACT = _md_tables()
 
 
+_FAILURES = []
+
+
+def _note_failure(label, why):
+    """Record a dead case and let the sweep continue past it."""
+    _FAILURES.append((label, why))
+    print(f"--- {label}: FAILED ({why}), continuing ---", flush=True)
+
+
+@contextlib.contextmanager
+def _keep_going(label):
+    """Op-level net for whatever _run_child cannot catch.
+
+    A child UT that aborts is already handled inside _run_child; this catches
+    the in-process ops raising Python exceptions. A GPU fault in this process
+    is not recoverable -- it takes the interpreter with it, and no handler runs.
+    """
+    try:
+        yield
+    except Exception as exc:  # noqa: BLE001 - a sweep must outlive one bad op
+        _note_failure(label, f"{type(exc).__name__}: {exc}")
+    finally:
+        # A half-finished op can leave allocations behind; the next one should
+        # not inherit them.
+        try:
+            torch.cuda.empty_cache()
+        except Exception:  # noqa: BLE001 - cleanup must not mask the failure
+            pass
+
+
 def _run_child(name, cmd, cwd, env=None, extract=None, timeout=None, tail=30,
                kernels=True):
     """Run a child UT with its output captured and surface only its results.
@@ -754,7 +853,8 @@ def _run_child(name, cmd, cwd, env=None, extract=None, timeout=None, tail=30,
         print(f"\n===== {name} =====", flush=True)
         print(f"--- timed out after {timeout}s, last {tail} lines ---")
         print("\n".join(captured.splitlines()[-tail:]), flush=True)
-        raise
+        _note_failure(name, f"timed out after {timeout}s")
+        return
     lines = proc.stdout.splitlines()
     # `results` decides whether the op reported anything; the kernel digest is
     # an annotation and must not stand in for a result table, or an extractor
@@ -763,13 +863,16 @@ def _run_child(name, cmd, cwd, env=None, extract=None, timeout=None, tail=30,
     rows = list(results) + (_kernel_digest(lines) if kernels else [])
     print(f"\n===== {name} =====", flush=True)
     print("\n".join(rows) if rows else "(no result rows recognised)", flush=True)
-    if not results:
-        print(f"--- {name}: extractor matched no result rows ---")
     if proc.returncode != 0 or not results:
         print(f"--- {name}: exit={proc.returncode}, last {tail} lines ---")
         print("\n".join(lines[-tail:]), flush=True)
+    # Recorded, not raised: one dead shape used to take the rest of the sweep
+    # with it -- a mega_moe case aborting at tokens/rank=65536 meant the seven
+    # ops queued behind it never ran at all.
     if proc.returncode != 0:
-        raise subprocess.CalledProcessError(proc.returncode, cmd, proc.stdout)
+        _note_failure(name, f"child exited {proc.returncode}")
+    elif not results:
+        _note_failure(name, "no result rows")
 
 
 # --- per-op runners: sweep axes silently, then print one table ---
@@ -925,6 +1028,12 @@ def run_f8gemm(args):
 
 def run_a8w8_blockscale(_args):
     """Run DSv4 FP8 blockscale linear projections at M=512."""
+    # AITER_LOG_MORE=1 is set at module scope for the FlyDSL MoE ops, and a
+    # child started with env=None inherits this process's whole environ. In this
+    # UT that turned a clean sweep into an intermittent HSA memory fault, so
+    # drop it for this child only -- every other op keeps it.
+    env = os.environ.copy()
+    env.pop("AITER_LOG_MORE", None)
     _run_child(
         "gemm_a8w8_blockscale (DSv4)",
         [
@@ -947,6 +1056,7 @@ def run_a8w8_blockscale(_args):
             "--flydsl",
         ],
         cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        env=env,
     )
 
 
@@ -957,7 +1067,15 @@ def run_a16w16(_args):
     # so capture the block and parse that line back out.
     batch, K = 1, 7168
     rows = []
-    for M, n in itertools.product(_TOKENS, (64, 384, 1024, 2048, 32320, 129280)):
+    for M, n in itertools.product(_TOKENS, _A16W16_NS):
+        # N=32320/129280 is lm_head (the DeepSeek vocab, whole and TP4-sharded).
+        # lm_head only ever sees one row per sequence, so a large M there is not
+        # a shape the model produces -- and M*N*2 passes 4 GiB anyway.
+        if n > _A16W16_WIDE_N and M > _A16W16_WIDE_N_MAX_M:
+            rows.append({"batch": batch, "M": M, "N": n, "K": K,
+                         "err_msg": f"skipped: N>{_A16W16_WIDE_N} is lm_head, "
+                                    f"capped at M<={_A16W16_WIDE_N_MAX_M}"})
+            continue
         # The gfx1250 launcher addresses gmem with 32-bit descriptors, so the
         # heuristic refuses any operand past 4 GiB (opus_gemm_arch_gfx1250.cuh)
         # and raises instead of running. Skip those rather than fail the sweep.
@@ -995,7 +1113,16 @@ def run_mega_moe(_args):
     # this orchestration process before torchrun starts the four workers.
     torch.cuda.empty_cache()
     env = os.environ.copy()
-    env.update({"MORI_V2_KERNEL_BACKEND": "hip", "MEGA_DISPATCH": "mori"})
+    env.update({
+        "MORI_V2_KERNEL_BACKEND": "hip",
+        "MEGA_DISPATCH": "mori",
+        # The symmetric arena is sized from tokens/rank: at 65536 it asks for
+        # 7.5 GB against a 4 GB default heap and setup() dies before the first
+        # kernel. Cards here have 432 GiB, so 16 GB costs nothing.
+        "MORI_SHMEM_HEAP_SIZE": os.environ.get(
+            "MORI_SHMEM_HEAP_SIZE", str(16 << 30)
+        ),
+    })
     base_cmd = [
         "torchrun",
         "--standalone",
@@ -1100,7 +1227,7 @@ def run_score_qk(_args):
     ]
     # None => let the UT pick the batch, so run the KV lengths once each.
     for tokens, (label, kv_length) in itertools.product(
-        _SCORE_QK_TOKENS or (None,), (("1K/1K average", "384"), ("long", "10240"))
+        _SCORE_QK_TOKENS or (None,), _SCORE_QK_KV_LENGTHS
     ):
         _run_child(
             f"score_qk (decode, B={tokens or 'UT default'}, {label} CSA KV={kv_length})",
@@ -1347,10 +1474,10 @@ def run_inverse_rope(_args):
 
 
 def run_mla_v4_prefill(_args):
-    """Run DSv4 FP8 prefill at M=16K across two pools and CSR modes."""
-    for tokens in (16384, *_MLA_PREFILL_TOKENS):
+    """Run DSv4 prefill across two precisions, pools and CSR modes."""
+    for tokens in _MLA_PREFILL_TOKENS:
         _run_child(
-            f"mla_v4 prefill (FP8, M={tokens}, prefix=4096/16384)",
+            f"mla_v4 prefill (M={tokens}, prec=fp8/bf16, pages=4096/16384)",
             [
                 sys.executable,
                 "op_tests/test_pa_sparse_prefill.py",
@@ -1367,13 +1494,26 @@ def run_mla_v4_prefill(_args):
                 str(tokens),
                 "--prec",
                 "fp8",
+                "bf16",
+                # bf16 takes the single-tensor Q/K/V/O kernel; only fp8 has an
+                # asm candidate, so the bf16 rows compare opus against triton
+                # and leave the asm columns empty.
                 "--mode",
                 "dense",
                 "sparse",
                 "--no-verify",
+                # Empty the nnz list: the UT runs the mode/total_pages sweep and
+                # the explicit-nnz sweep independently, and the latter is exactly
+                # what mla_v4_prefill_fp8 covers. Left on, every M repeats those
+                # five cases for nothing.
+                "--nnz-prefix",
             ],
             cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-            extract=_lines(_table_row("latency_us")),
+            # Not _table_row: the UT has no "latency_us" column (it prints
+            # "opus us"/"asm us"), so that predicate fell through to its
+            # starts-with-a-number rule, swallowed the profiler's kernel lines
+            # as data, and dropped the real header, which starts with "n".
+            extract=_space_table("total_pages"),
         )
 
 
@@ -1387,7 +1527,15 @@ def run_mla_v4_prefill_fp8(_args):
     # whole sweep: the smaller shapes run fine but never get reported.
     _run_child(
         "mla_v4 prefill FP8 (sparse-prefill default sweep)",
-        [sys.executable, "op_tests/test_pa_sparse_prefill.py"],
+        [
+            sys.executable,
+            "op_tests/test_pa_sparse_prefill.py",
+            *(
+                ["-n", *map(str, _MLA_PREFILL_FP8_TOKENS)]
+                if _MLA_PREFILL_FP8_TOKENS
+                else []
+            ),
+        ],
         cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
         env=env,
         extract=_space_table("nnz_prefix"),
@@ -1427,9 +1575,14 @@ PERF_OPS = ["mha", "moe", "f8gemm", "mla_v4_decode"]
 DSV4_OPS = [
     "mega_moe",
     "moe",
-    # "a8w8_blockscale" hits an intermittent HSA_STATUS_ERROR_MEMORY_FAULT on
-    # gfx1250 at the (m=512, n=7168, k=16384) shape -- it passed one run and
-    # aborted the next with the same binary.
+    # "a8w8_blockscale" has no working path on gfx1250 as of the 20260826-ut
+    # image, so it stays out of the default sweep. Both routes are dead:
+    #   asm    -> asm_a8w8_blockscale_bpreshuffle.cu:281 "no kernel support
+    #             a8w8 blockscale for GPU arch: gfx1250"
+    #   triton -> --ck_preshuffle True --flydsl reaches the preshuffle kernel
+    #             instead, which fails to compile (PassManager::run failed,
+    #             tt.make_tensor_descriptor cannot be legalized for gfx1250)
+    # Run it explicitly with --ops a8w8_blockscale to re-check on a newer image.
     # "a8w8_blockscale",
     "a16w16",
     "mla_v4_decode",
@@ -1472,7 +1625,11 @@ def main():
         nargs="*",
         choices=list(OPS),
         default=None,
-        help="select operations from the active suite (default: suite defaults)",
+        help=(
+            "run these ops instead of the suite defaults. Any op is allowed, "
+            "including ones held out of the defaults because they are broken "
+            "on this arch (default: suite defaults)"
+        ),
     )
     # mha (SWA fwd asm) — fixed 4-shape grid; init sweep only
     p.add_argument(
@@ -1509,12 +1666,21 @@ def main():
 
     args.suite = "dsv4" if args.dsv4 else "perf"
     default_ops = DSV4_OPS if args.dsv4 else PERF_OPS
+    # --ops selects from every op, not just the suite's defaults: an op pulled
+    # out of the defaults because it is broken on this arch still has to be
+    # runnable by name to check whether a newer image fixed it. argparse already
+    # rejects names outside OPS.
     selected_ops = args.ops or default_ops
-    invalid_ops = sorted(set(selected_ops) - set(default_ops))
-    if invalid_ops:
-        p.error(f"{args.suite} does not provide ops: {', '.join(invalid_ops)}")
     for name in selected_ops:
-        OPS[name](args)
+        with _keep_going(name):
+            OPS[name](args)
+
+    if _FAILURES:
+        print(f"\n===== {len(_FAILURES)} failed, "
+              f"{len(selected_ops)} ops selected =====", flush=True)
+        for label, why in _FAILURES:
+            print(f"  {label}: {why}", flush=True)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
