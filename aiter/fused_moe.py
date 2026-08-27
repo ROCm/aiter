@@ -1979,14 +1979,19 @@ def _mxfp4_a4w4_stage2_fw(
     return moe_out
 
 
-@functools.lru_cache(maxsize=2048)
-def _mxfp4_scale_u8(scale):
+def _mxfp4_tensor_u8(tensor):
     """FlyDSL can't ingest fp4/e8m0 dtype codes via DLPack, so pass a uint8 view (the
     same reinterpret_cast HIP does). Returns the uint8 view, or the input (already
     uint8, or None) unchanged."""
-    if scale is not None and scale.element_size() == 1 and scale.dtype != torch.uint8:
-        return scale.view(torch.uint8)
-    return scale
+    if tensor is not None and tensor.element_size() == 1 and tensor.dtype != torch.uint8:
+        return tensor.view(torch.uint8)
+    return tensor
+
+
+@functools.lru_cache(maxsize=2048)
+def _mxfp4_scale_u8(scale):
+    """Cache uint8 views for model-lifetime MXFP4 weight scales."""
+    return _mxfp4_tensor_u8(scale)
 
 
 def _flydsl_stage2_fp8_enabled():
@@ -2086,9 +2091,9 @@ def _flydsl_v2_stage2_wrapper(
             # masked reduction to prevent speculative loads of stale NaN data.
             target.zero_()
     mxfp4_moe_gemm2(
-        inter_sorted_quant=_mxfp4_scale_u8(inter_states),
-        inter_sorted_shuffled_scale=_mxfp4_scale_u8(a2_scale),
-        w2_u8=_mxfp4_scale_u8(w2),
+        inter_sorted_quant=_mxfp4_tensor_u8(inter_states),
+        inter_sorted_shuffled_scale=_mxfp4_tensor_u8(a2_scale),
+        w2_u8=_mxfp4_tensor_u8(w2),
         w2_scale_u8=_mxfp4_scale_u8(w2_scale),
         sorted_expert_ids=sorted_expert_ids,
         cumsum_tensor=num_valid_ids,
