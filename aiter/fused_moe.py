@@ -80,8 +80,7 @@ _MOE_SORT_BACKEND = os.environ.get("AITER_MOE_SORT_BACKEND", "auto").lower()
 #   False              -- no aux arrays; ordinary sorting.
 #   True / "threestage"-- aux via the port's own 3-stage sort
 #                         (csrc/kernels/mxfp4_moe/moe_aux/moe_3stage_sort.cuh),
-#                         through _adaptive_moe_sort. The original path; pass
-#                         it explicitly to get the pre-Opus behaviour back.
+#                         through _adaptive_moe_sort. Default; original path.
 #   "opus"             -- aux via the Opus sorter's *multi-phase* kernels, which
 #                         emit m_indices / reverse_sorted too
 #                         (MoeSortingMultiPhaseKernel_P23/_P3). Until they did,
@@ -89,7 +88,6 @@ _MOE_SORT_BACKEND = os.environ.get("AITER_MOE_SORT_BACKEND", "auto").lower()
 #                         single-CTA kernel -- which is why the port grew a sort
 #                         of its own. The mp path runs one CTA per expert.
 #                         Applies only at block_m != 16; see _aux_uses_opus.
-#                         This is what the MXFP4 a4w4 configs select by default.
 #
 # Both aux modes produce the same sorted_token_ids / m_indices / reverse_sorted
 # contract; they differ only in which kernels get there.
@@ -1148,6 +1146,7 @@ def _fused_moe_impl(
             _metadata_config_file=_metadata_config_file,
             _stage1_extra_args=_stage1_extra_args,
             _stage2_extra_args=_stage2_extra_args,
+            output_aux=metadata.output_aux,
         )
 
 
@@ -1692,6 +1691,7 @@ def _mxfp4_a4w4_stage1(
     num_waves=4,
     native_scale_layout=False,
     k_wave=1,
+    prequantized=False,
 ):
     if a_dtype == "fp8" and not inline_quant:
         if a_scale is None:
@@ -1700,6 +1700,12 @@ def _mxfp4_a4w4_stage1(
     elif a_dtype == "fp8":
         # Inline quant reads hidden_states directly and ignores both A buffers.
         a_scale_sorted_shuffled = _empty_u8(device)
+    elif prequantized:
+        # The Opus aux path can use fused_dynamic_mxfp4_quant_moe_sort before
+        # stage1. Its returned E8M0 scale already has the exact flattened
+        # [M/32, K/256, 4, 16, 4] layout consumed by this GEMM1, so avoid the
+        # separate mxfp4_moe_quant + mxfp4_moe_sort_scales kernels.
+        a_scale_sorted_shuffled = a_scale
     elif not inline_quant:
         aiter.mxfp4_moe_quant(
             a_input=hidden_states,
@@ -1973,7 +1979,10 @@ def _mxfp4_a4w4_stage1_fw(
     if w1.element_size() == 1 and w1.dtype != torch.uint8:
         w1 = w1.view(torch.uint8)
     NE = w1.shape[0]
-    D_HIDDEN = hidden_states.shape[1]
+    # hidden_states may already be packed FP4, whose physical last dimension
+    # is D_HIDDEN/2. w2 keeps the logical output dimension in mode 1 for both
+    # packed and unpacked inputs, so it is the stable source of the GEMM1 K.
+    D_HIDDEN = w2.shape[1]
     D_INTER = w1.shape[1] // 2
     if p1.get("enable_bias", False) and bias1 is None:
         bias1 = torch.zeros((NE, D_INTER * 2), dtype=dtypes.fp32, device=device)
@@ -1981,7 +1990,13 @@ def _mxfp4_a4w4_stage1_fw(
     M = hidden_states.shape[0]
     if m_indices is None:
         m_indices = (sorted_token_ids & 0xFFFFFF).contiguous()
-    if p1["a_dtype"] == "fp8":
+    prequantized = (
+        p1["a_dtype"] == "fp4"
+        and not inline_quant
+        and hidden_states.dtype == dtypes.fp4x2
+        and a1_scale is not None
+    )
+    if p1["a_dtype"] == "fp8" or prequantized:
         a_quant = hidden_states
         a_scale = a1_scale
     else:
@@ -2033,6 +2048,7 @@ def _mxfp4_a4w4_stage1_fw(
         num_waves=p1.get("num_waves", 4),
         native_scale_layout=native_scale_layout,
         k_wave=p1.get("k_wave", 1),
+        prequantized=prequantized,
     )
     return inter_sorted_quant, inter_sorted_scale
 
@@ -2763,16 +2779,9 @@ def get_2stage_cfgs(
             # fused prologue for atomic-GEMM2 configs, so m_indices came back
             # None and fused_moe fell back to generic opus sorting plus a torch
             # `sorted_token_ids & 0xFFFFFF` and a zero-fill -- ~12 us/iter of
-            # extra GPU work at BM16. Keep it unconditionally on; the
+            # extra GPU work at BM16. Keep main's unconditional True; the
             # reverse-map buffer is cheap next to losing the fused sort.
-            #
-            # AUX_SORT_OPUS rather than plain True: the Opus multi-phase sorter
-            # runs one CTA per expert against the 3-stage sort's 16, and is
-            # 0.979 (block_m 32) / 0.980 (block_m 128) geomean over the tuned
-            # MXFP4 rows. _aux_uses_opus() confines it to block_m != 16 -- at
-            # BM16 the prologue above is the *fused* sort+zero-init kernel,
-            # which Opus cannot replace and where it measured 1.10x slower.
-            output_aux=AUX_SORT_OPUS,
+            output_aux=True,
             prequant=_p1["a_dtype"] == "fp8" and not _p1["inline_quant"],
             has_bias=enable_bias and _p1.get("enable_bias", False),
             stage2_has_bias=enable_bias and stage2_supports_bias,
@@ -3306,6 +3315,7 @@ def fused_moe_2stages(
     _metadata_config_file: str | None = None,
     _stage1_extra_args: dict | None = None,
     _stage2_extra_args: dict | None = None,
+    output_aux: bool | str = False,
 ):
     quant_func = get_quant(quant_type)
     gate_mode = GateMode(gate_mode)
@@ -3344,6 +3354,17 @@ def fused_moe_2stages(
     )
     if _metadata_transform is not None:
         metadata = _metadata_transform(metadata)
+    if output_aux:
+        metadata = replace(metadata, output_aux=output_aux)
+    if getattr(
+        metadata.stage1, "func", metadata.stage1
+    ) is _mxfp4_a4w4_stage1_fw and _aux_uses_opus(
+        metadata.output_aux, int(metadata.block_m)
+    ):
+        # Main's fused prequant already writes the E8M0 scale layout consumed by
+        # replacement GEMM1. Only Opus takes this path; an explicit threestage
+        # override retains the original quant + sort_scales pipeline.
+        metadata = replace(metadata, prequant=True)
     if not metadata.prequant:
         a1 = hidden_states
         a1_scale = None
