@@ -25,7 +25,6 @@ Run from the aiter repo root so `op_tests/` siblings import cleanly:
 
     # DeepSeek-V4 operators at the model shapes used by the DSv4 workload.
     python op_tests/bench_gfx1250_combo.py --dsv4                 # all DSv4 ops
-    python op_tests/bench_gfx1250_combo.py --dsv4 --ops moe       # grouped MoE FC1/FC2 (DSv4 a8w4)
     python op_tests/bench_gfx1250_combo.py --dsv4 --ops a8w8_blockscale  # DSv4 FP8 linears
     python op_tests/bench_gfx1250_combo.py --dsv4 --ops a16w16    # DSv4 BF16 linears
     python op_tests/bench_gfx1250_combo.py --dsv4 --ops mla_v4_decode   # sparse MLA v4 decode
@@ -119,6 +118,16 @@ The ``mega_moe`` op runs both sides of the comparison:
       --layers 61 -tpr 512 --combine gather \
       --acc_verify 0 --profile_table 1
 
+Token sweeps are per-op and overridable from the environment, because the ops
+do not share a supported range: score_qk asserts out past batch 1024, a16w16's
+launcher refuses operands over 4 GiB, and inverse_rope faults the GPU at its
+largest tokens. AITER_BENCH_TOKENS sets the default for every op and
+AITER_BENCH_TOKENS_<OP> overrides one:
+
+    AITER_BENCH_TOKENS=1,128,512 \
+    AITER_BENCH_TOKENS_INVERSE_ROPE=1,8,128 \
+      python op_tests/bench_gfx1250_combo.py --dsv4
+
 gfx1250's bundled CK does not compile, so the asm JIT modules must be built with
 ENABLE_CK=0. The script sets it (before importing aiter) so a plain run just
 works; an explicit env override still wins.
@@ -197,13 +206,43 @@ with _silence():
     from aiter.test_common import run_perftest
 
 SUPPORTED_GFX = ["gfx1250"]
-_TOKENS = (1, 16, 32, 64, 128, 256, 512, 1024, 2048, 65536)
-# inverse_rope dispatches on the token count itself -- THREAD_DATA_SIZE steps at
-# s<=4 and s<=128, K_PER_BLOCK at s>128 and s>512 -- so it sweeps the shared set
-# plus the UT's own mid-range tiers, which _TOKENS jumps straight over.
-_INVERSE_ROPE_TOKENS = tuple(sorted(set(_TOKENS) | {8, 4096, 8192, 16384}))
-_MLA_DECODE_TOKENS = tuple(t for t in _TOKENS if t <= 1024)
-_MLA_PREFILL_TOKENS = tuple(t for t in _TOKENS if t >= 1024)
+# The gfx1250 launcher addresses gmem with 32-bit descriptors.
+_GMEM_DESCRIPTOR_LIMIT = 4 << 30
+
+
+def _tokens(name, default=None):
+    """Token sweep for one op, from the environment.
+
+    Ops do not share a supported range -- some shapes are refused by a kernel
+    heuristic, some fault the GPU -- and the useful range also shifts while
+    chasing a regression. AITER_BENCH_TOKENS sets the sweep for every op and
+    AITER_BENCH_TOKENS_<OP> overrides one, e.g.
+
+        AITER_BENCH_TOKENS=1,128,512 \\
+        AITER_BENCH_TOKENS_INVERSE_ROPE=1,8,128 \\
+          python op_tests/bench_gfx1250_combo.py --dsv4
+
+    Returns None when nothing is set and the op has no default of its own: the
+    op then passes no shape flag at all and the UT sweeps its own default, which
+    is the range its owner keeps working.
+    """
+    raw = os.environ.get(f"AITER_BENCH_TOKENS_{name.upper()}") or os.environ.get(
+        "AITER_BENCH_TOKENS"
+    )
+    if raw:
+        return tuple(int(t) for t in raw.replace(",", " ").split())
+    return tuple(default) if default is not None else None
+
+
+# The in-process ops call their UT per shape, so they need a sweep to iterate;
+# keep one here. The ops that shell out pass no shape flag unless asked, letting
+# each UT sweep the range its owner maintains.
+_TOKENS = _tokens("all", (1, 16, 32, 64, 128, 256, 512, 1024, 2048, 65536))
+_INVERSE_ROPE_TOKENS = _tokens("inverse_rope")
+_SCORE_QK_TOKENS = _tokens("score_qk")
+_A8W8_BLOCKSCALE_TOKENS = _tokens("a8w8_blockscale")
+_MLA_DECODE_TOKENS = _tokens("mla_v4_decode", (t for t in _TOKENS if t <= 1024))
+_MLA_PREFILL_TOKENS = _tokens("mla_v4_prefill", (t for t in _TOKENS if t >= 1024))
 
 
 def _int_quad(s):
@@ -748,7 +787,7 @@ def run_moe(args):
     cfg = _MOE_CONFIG
     activation = moe_mod.ActivationType.Silu
     rows = []
-    data_formats = ["a8w4"] if args.suite == "dsv4" else _MOE_DATA_FORMATS
+    data_formats = _MOE_DATA_FORMATS
     for tokens, fmt in itertools.product(cfg["tokens"], data_formats):
         with _capture() as box:
             moe_mod.set_data_format(fmt)
@@ -881,8 +920,11 @@ def run_a8w8_blockscale(_args):
         [
             sys.executable,
             "op_tests/test_gemm_a8w8_blockscale.py",
-            "-m",
-            *map(str, _TOKENS),
+            *(
+                ["-m", *map(str, _A8W8_BLOCKSCALE_TOKENS)]
+                if _A8W8_BLOCKSCALE_TOKENS
+                else []
+            ),
             "-nk",
             "2048,7168",
             "7168,16384",
@@ -906,6 +948,13 @@ def run_a16w16(_args):
     batch, K = 1, 7168
     rows = []
     for M, n in itertools.product(_TOKENS, (64, 384, 1024, 2048, 32320, 129280)):
+        # The gfx1250 launcher addresses gmem with 32-bit descriptors, so the
+        # heuristic refuses any operand past 4 GiB (opus_gemm_arch_gfx1250.cuh)
+        # and raises instead of running. Skip those rather than fail the sweep.
+        if max(M * K, n * K, M * n) * 2 > _GMEM_DESCRIPTOR_LIMIT:
+            rows.append({"batch": batch, "M": M, "N": n, "K": K,
+                         "err_msg": "skipped: >4GiB operand"})
+            continue
         with _capture() as box:
             err = a16w16_mod.test_a16w16(batch=batch, M=M, N=n, K=K)
         captured = box[0].splitlines()
@@ -1039,12 +1088,18 @@ def run_score_qk(_args):
         "--blocksize",
         "64",
     ]
+    # None => let the UT pick the batch, so run the KV lengths once each.
     for tokens, (label, kv_length) in itertools.product(
-        _TOKENS, (("1K/1K average", "384"), ("long", "10240"))
+        _SCORE_QK_TOKENS or (None,), (("1K/1K average", "384"), ("long", "10240"))
     ):
         _run_child(
-            f"score_qk (decode, B={tokens}, {label} CSA KV={kv_length})",
-            [*base_cmd, "--batch", str(tokens), "-kv_length", kv_length],
+            f"score_qk (decode, B={tokens or 'UT default'}, {label} CSA KV={kv_length})",
+            [
+                *base_cmd,
+                *(["--batch", str(tokens)] if tokens else []),
+                "-kv_length",
+                kv_length,
+            ],
             cwd=repo_root,
             extract=_md_from_pandas(
                 "paged_mqa_logits:",
@@ -1279,8 +1334,7 @@ def run_inverse_rope(_args):
             "op_tests/test_inverse_rope_group_quant.py",
             "-b",
             "128,16",
-            "-s",
-            *[str(t) for t in _INVERSE_ROPE_TOKENS],
+            *(["-s", *map(str, _INVERSE_ROPE_TOKENS)] if _INVERSE_ROPE_TOKENS else []),
             "-l",
             "n32k4",
             "--group-size",
@@ -1369,7 +1423,10 @@ PERF_OPS = ["mha", "moe", "mla_v4_decode"]
 # and it needs a dev ROCm toolchain to build. Run it explicitly when wanted.
 DSV4_OPS = [
     "mega_moe",
-    "moe",
+    # a4w4 / a8w4 grouped GEMM is a hardware-throughput comparison, so it
+    # lives in --perf. DSv4 MoE is covered by mega_moe, which runs both quant
+    # keys across the real 4-rank EP path.
+    # "moe",
     # "a8w8_blockscale" hits an intermittent HSA_STATUS_ERROR_MEMORY_FAULT on
     # gfx1250 at the (m=512, n=7168, k=16384) shape -- it passed one run and
     # aborted the next with the same binary.
