@@ -1477,11 +1477,15 @@ PERF_OPS = ["mha", "moe", "f8gemm", "mla_v4_decode"]
 DSV4_OPS = [
     "mega_moe",
     "moe",
-    # Back in the sweep now that AITER_LOG_MORE no longer leaks into it (see
-    # run_a8w8_blockscale). It still fails on the 20260826-ut image, but earlier
-    # and for an unrelated reason: the gluon gemm_mxfp8 kernel cannot legalize
-    # tt.make_tensor_descriptor on gfx1250, 8/8 runs, with or without that var.
-    "a8w8_blockscale",
+    # "a8w8_blockscale" has no working path on gfx1250 as of the 20260826-ut
+    # image, so it stays out of the default sweep. Both routes are dead:
+    #   asm    -> asm_a8w8_blockscale_bpreshuffle.cu:281 "no kernel support
+    #             a8w8 blockscale for GPU arch: gfx1250"
+    #   triton -> --ck_preshuffle True --flydsl reaches the preshuffle kernel
+    #             instead, which fails to compile (PassManager::run failed,
+    #             tt.make_tensor_descriptor cannot be legalized for gfx1250)
+    # Run it explicitly with --ops a8w8_blockscale to re-check on a newer image.
+    # "a8w8_blockscale",
     "a16w16",
     "mla_v4_decode",
     "inverse_rope",
