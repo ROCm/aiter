@@ -24,8 +24,8 @@ from flydsl.runtime.device import get_rocm_arch
 
 from aiter.ops.flydsl.kernels import buffer_ops, vector
 
-from . import communication_ops_utils as comm_ops
 from .mfma_preshuffle_pipeline import xcd_remap_bx_by
+from .splitk_epilogue import CPOL_COHERENT, splitk_reduce_epilogue
 
 # (dsrd_preload, dvmem_preload) per (tile_m, tile_n, tile_k).
 _TILE_PRELOAD_TABLE = {
@@ -122,30 +122,6 @@ def _get_preload(tile_m, tile_n, tile_k):
 # Row bound of the A/C layout views; gemm_kernels mirrors it to guard on the host.
 PRESHUFFLE_M_MAX = 65536
 
-# 4 f32 in is one dwordx4, 4 bf16 out is one dwordx2.
-_REDUCE_VEC = 4
-
-# Split-K partials cross XCDs, which do not share L2. An agent-scope fence
-# would write back the whole L2 per CTA and evict the A/B tiles everyone else
-# is reading; sc0|sc1 writes through just these accesses.
-_CPOL_COHERENT = 0x1 | 0x10
-
-
-def _pairwise_sum(parts):
-    """Sum a Python list of Vectors as a balanced tree.
-
-    Module level because the kernel AST rewriter would turn this ``while`` into
-    an ``scf.while``; it is trace-time metaprogramming over a Python list.
-    """
-    while len(parts) > 1:
-        nxt = []
-        for lhs, rhs in zip(parts[0::2], parts[1::2]):
-            nxt.append(lhs + rhs)
-        if len(parts) % 2:
-            nxt.append(parts[-1])
-        parts = nxt
-    return parts[0]
-
 
 @functools.lru_cache(maxsize=1024)
 def compile_preshuffle_gemm(
@@ -193,10 +169,6 @@ def compile_preshuffle_gemm(
     _has_gelu = epilogue == "bias_gelu"
     if split_k > 1 and _has_epilogue:
         raise ValueError("split_k > 1 does not support fused bias or activation")
-    if split_k > 1 and tile_n % _REDUCE_VEC:
-        raise ValueError(
-            f"split_k > 1 needs tile_n divisible by {_REDUCE_VEC}; got {tile_n}"
-        )
 
     is_fp8 = in_dtype == "fp8"
     is_int8 = in_dtype == "int8"
@@ -223,9 +195,8 @@ def compile_preshuffle_gemm(
     else:
         layout_elem = Float8E4M3FN if is_gfx950 else Float8E4M3FNUZ
     final_out_elem_cls = BFloat16 if out_dtype == "bf16" else Float16
-    final_out_elem_bytes = 2
     out_elem_cls = Float32 if split_k > 1 else final_out_elem_cls
-    out_elem_bytes = 4 if split_k > 1 else final_out_elem_bytes
+    out_elem_bytes = 4 if split_k > 1 else 2
 
     # Tile geometry (tile_K_perm = K-elements grouped per MMA k-step)
     tile_K_perm = 128 if use_mfma_scale_128 else (64 if is_8bit else 32)
@@ -386,7 +357,7 @@ def compile_preshuffle_gemm(
         frag_C = thr_mma.make_fragment_C(tC)
         frag_A_retile = thr_s2r.retile(frag_A)
         frag_B_retile_stages = [thr_g2r_B.retile(b) for b in frag_B_stages]
-        out_cpol = _CPOL_COHERENT if split_k > 1 else 0
+        out_cpol = CPOL_COHERENT if split_k > 1 else 0
         copy_op = fx.rocdl.BufferCopy32b if split_k > 1 else fx.rocdl.BufferCopy16b
         buf_copy_out = fx.make_copy_atom(copy_op(out_cpol), out_elem_cls)
         thr_r2g_C = fx.make_tiled_copy_C(buf_copy_out, tiled_mma).get_slice(tid)
@@ -812,77 +783,27 @@ def compile_preshuffle_gemm(
             # The store carries sc0|sc1, so waiting on it is the whole release.
             rocdl.s_waitcnt(0)
             gpu.barrier()
-
-            split_flag_ptr = lds.split_flag.ptr
-            semaphore_idx = fx.Int32(bid_x) * (N // tile_n) + fx.Int32(bid_y)
-            if tid == fx.Int32(0):
-                semaphore_addr = fx.Int64(
-                    fx.ptrtoint(fx.get_iter(arg_semaphore))
-                ) + fx.Int64(semaphore_idx) * fx.Int64(4)
-                arrival = fx.Int32(
-                    comm_ops.atomic_add_agent(semaphore_addr, fx.Int32(1))
-                )
-                is_last = (arrival == fx.Int32(split_k - 1)).select(
-                    fx.Int32(1), fx.Int32(0)
-                )
-                fx.ptr_store(Vec.from_elements([is_last], fx.Int32), split_flag_ptr)
-            gpu.barrier()
-
-            is_last = Vec(fx.make_view(split_flag_ptr, fx.make_layout(1, 1)).load())[0]
-            if is_last != fx.Int32(0):
-                workspace_rsrc = buffer_ops.create_buffer_resource(arg_c, max_size=True)
-                out_rsrc = buffer_ops.create_buffer_resource(
-                    arg_out,
-                    max_size=False,
-                    num_records_bytes=fx.Int64(i32_m)
-                    * fx.Int64(N)
-                    * fx.Int64(final_out_elem_bytes),
-                )
-                vecs_per_row = tile_n // _REDUCE_VEC
-                vecs_per_tile = tile_m * vecs_per_row
-                vecs_per_thread = (vecs_per_tile + total_threads - 1) // total_threads
-                split_stride = i32_m * fx.Int32(N)
-                for i in range_constexpr(vecs_per_thread):
-                    vec_linear = fx.Int32(tid) + fx.Int32(i * total_threads)
-                    if vec_linear < fx.Int32(vecs_per_tile):
-                        local_m = vec_linear // fx.Int32(vecs_per_row)
-                        local_n = (vec_linear % fx.Int32(vecs_per_row)) * _REDUCE_VEC
-                        row = fx.Int32(bid_x) * tile_m + local_m
-                        col = fx.Int32(bid_y) * tile_n + local_n
-                        if row < i32_m:
-                            out_linear = row * fx.Int32(N) + col
-                            # All loads first, so the adds pipeline behind one
-                            # memory latency.
-                            parts = []
-                            for s in range_constexpr(split_k):
-                                parts.append(
-                                    Vec(
-                                        buffer_ops.buffer_load(
-                                            workspace_rsrc,
-                                            fx.Int32(s) * split_stride + out_linear,
-                                            vec_width=_REDUCE_VEC,
-                                            dtype=T.f32,
-                                            cache_modifier=_CPOL_COHERENT,
-                                        )
-                                    )
-                                )
-                            total = _pairwise_sum(parts)
-                            buffer_ops.buffer_store(
-                                total.to(final_out_elem_cls),
-                                out_rsrc,
-                                out_linear,
-                            )
-                if tid == fx.Int32(0):
-                    # Same cross-XCD handoff as the partials, one launch later.
-                    semaphore_rsrc = buffer_ops.create_buffer_resource(
-                        arg_semaphore, max_size=True
+            splitk_reduce_epilogue(
+                arg_c,
+                fx.Tensor(
+                    fx.make_view(
+                        fx.get_iter(arg_out),
+                        fx.make_layout((PRESHUFFLE_M_MAX, N), (N, 1)),
                     )
-                    buffer_ops.buffer_store(
-                        fx.Int32(0),
-                        semaphore_rsrc,
-                        semaphore_idx,
-                        cache_modifier=_CPOL_COHERENT,
-                    )
+                ),
+                arg_semaphore,
+                lds.split_flag.ptr,
+                tile_m,
+                tile_n,
+                total_threads,
+                final_out_elem_cls,
+                tid,
+                bid_x,
+                bid_y,
+                i32_m,
+                N,
+                split_k,
+            )
 
     # ── Host launcher ─────────────────────────────────────────────
     @flyc.jit
