@@ -87,9 +87,15 @@ _PERF_MI = 7680
 
 
 def _make_seq_offsets(B, Mi, regime, seed=SEED, device="cuda", sparsity=0.95):
-    """Per-group prefix-sum offsets. uniform: every group == Mi. skew: Mi*U**4
-    with ~20% empty groups + one full and one near-full group (deployment dist).
-    genrec: M_i ~ Uniform(1, Mi) * sparsity, clamped >=1."""
+    """Per-group prefix-sum offsets.
+
+    uniform: every group length == Mi.
+    skew:    M_i = floor(Mi * U^4), ~20% empty groups, plus one full (Mi) and
+             one near-full (0.9*Mi) group.
+    genrec:  M_i = Uniform{1, ..., Mi} * sparsity, clamped >= 1 (local recipe;
+             similar sparsity intent to HSTU's generate_sparse_seq_len, not identical).
+    Mi is the max_seq_len envelope, not the per-group length.
+    """
     if regime == "uniform":
         return torch.arange(0, (B + 1) * Mi, Mi, dtype=torch.int32, device=device)
     if regime == "genrec":
