@@ -265,8 +265,6 @@ def build_flash_attn_fp8_module(
         )
 
         def qk_mfma(a, b, c):
-            if const_expr(not USE_QK_SCALE_FOLD):
-                return mfma.call(a, b, c)
             return rocdl.mfma_scale_f32_32x32x64_f8f6f4_(
                 res=mfma.accum_type,
                 a=_raw(a),
@@ -550,14 +548,14 @@ def build_flash_attn_fp8_module(
                 un = u + PREFETCH_DEPTH
                 if const_expr(un < PV_UNITS):
                     kv_windows[un % 4] = read_v_pack(
-                        v_off, un // PV_K_STEPS, un % PV_K_STEPS
+                        v_buff_off, un // PV_K_STEPS, un % PV_K_STEPS
                     )
                 else:
                     ki = u - (PV_UNITS - PREFETCH_DEPTH)
                     kv_windows[un % 4] = _load_k_unit(k_buff_off, ki // K_STEPS, ki % K_STEPS)
                     k_preloaded[ki] = kv_windows[un % 4]
                 _sched_barrier()
-            return o, l_mfma, k_preloaded
+            return o_accs, l_mfma, k_preloaded
 
         QK_UNITS = N_KV_TILES * K_STEPS
 
@@ -698,11 +696,11 @@ def build_flash_attn_fp8_module(
         def _bias_split(m_term):
             """Three-chunk bf16 decomposition of the Schraudolph seed."""
             c0 = rocdl.cvt_pk_bf16_f32(_raw(m_term), _raw(m_term))
-            r1 = _fsub(d, _f32_of_bf16_hi(c0))
+            r1 = _fsub(m_term, _f32_of_bf16_hi(c0))
             c1 = rocdl.cvt_pk_bf16_f32(_raw(r1), _raw(r1))
             r2 = _fsub(r1, _f32_of_bf16_hi(c1))
             return (
-                rocdl.cvt_pk_bf16_f32(_raw(d), _raw(r1)),
+                rocdl.cvt_pk_bf16_f32(_raw(m_term), _raw(r1)),
                 rocdl.cvt_pk_bf16_f32(_raw(r2), _raw(c_zero_f)),
             )
 
@@ -777,8 +775,8 @@ def build_flash_attn_fp8_module(
             seeded=False,
         ):
             if const_expr(not seeded):
-                m_frozen = _rowmax(s_accs, m_running)
-                m_term = _fadd(_fsub(c_zero_f, m_new), c_exp2_bias)
+                m_frozen = _rowmax(s_accs, m_frozen)
+                m_term = _fadd(_fsub(c_zero_f, m_frozen), c_exp2_bias)
                 mt_vec = Vec.from_elements([m_term], fx.Float32).broadcast_to(
                     C_F32_PER_LANE
                 )
@@ -861,9 +859,9 @@ def build_flash_attn_fp8_module(
 
         is_g0 = wave_id < fx.Index(NUM_WAVES // 2)
 
-        k_preloaded = [None] * PREFETCH_DEPTH
+        k_preloaded_prologue = [None] * PREFETCH_DEPTH
         for u in range_constexpr(PREFETCH_DEPTH):
-            k_preloaded[u] = _load_k_unit_global(fx.Index(0), u // K_STEPS, u % K_STEPS)
+            k_preloaded_prologue[u] = _load_k_unit_global(fx.Index(0), u // K_STEPS, u % K_STEPS)
 
         # Tiles 0 and 1 are prefetched into buffers 0 and 1; from there on the
         # loops rotate their carried LDS byte offsets.
@@ -878,13 +876,17 @@ def build_flash_attn_fp8_module(
         _gpu_barrier()
 
         loop_step = fx.Int32(BLOCK_N)
-        of0 = Vec.filled(C_F32_PER_LANE, 0.0, fx.Float32)
-        of1 = Vec.filled(C_F32_PER_LANE, 0.0, fx.Float32)
-        of2 = Vec.filled(C_F32_PER_LANE, 0.0, fx.Float32)
-        of3 = Vec.filled(C_F32_PER_LANE, 0.0, fx.Float32)
         l_valu_init = c_zero_f
         l_mfma_init = mfma.zero_value # c output of L-sum mfma (32x32x64_fp8)
         m_init = c_neg_inf
+
+        ## for epilogue
+        le_valu = c_zero_f
+        le_mfma = mfma.zero_value
+        oe0 = Vec.filled(C_F32_PER_LANE, 0.0, fx.Float32)
+        oe1 = Vec.filled(C_F32_PER_LANE, 0.0, fx.Float32)
+        oe2 = Vec.filled(C_F32_PER_LANE, 0.0, fx.Float32)
+        oe3 = Vec.filled(C_F32_PER_LANE, 0.0, fx.Float32)
 
         if is_g0:
 
@@ -897,7 +899,7 @@ def build_flash_attn_fp8_module(
                 l_koffs = get_lds_koffs(_k_slot(1))
                 ## HBM k offs
                 g_koffs = get_hbm_koffs(BLOCK_N)
-                s_accs, v_preloaded = do_qk(k_buff_off, k_preloaded, v_buff_off, dma=(k_rsrc, l_koffs, g_koffs))
+                s_accs, v_preloaded = do_qk(k_buff_off, k_preloaded_prologue, v_buff_off, dma=(k_rsrc, l_koffs, g_koffs))
                 m_frozen, bias_chunks, p_pack, l_valu = do_softmax(s_accs, m_init, l_valu_init)
 
                 g_koffs = get_hbm_koffs(BLOCK_N * 2)
@@ -1011,15 +1013,15 @@ def build_flash_attn_fp8_module(
                         _raw(o[2]),
                         _raw(o[3]),
                         _raw(p_pack),
-                        *[_raw(c) for c in bias_chunks],
+                        *[_raw(bc) for bc in bias_chunks],
                         # Rotate the V triple and swap the K pair.
                         _raw(v_next_off),
                         _raw(v_further_off),
                         _raw(v_buff_off),
                         _raw(k_next_off),
                         _raw(k_buff_off),
-                        *[_raw(w) for w in g_koffs],
-                        *[_raw(w) for w in v_preloaded],
+                        *[_raw(gk) for gk in g_koffs],
+                        *[_raw(vp) for vp in v_preloaded],
                     ]
                 )
 
@@ -1040,7 +1042,7 @@ def build_flash_attn_fp8_module(
                 l_voffs = get_lds_voffs(_v_slot(2))
                 ## HBM v offs
                 g_voffs = get_hbm_voffs(2 * BLOCK_N)
-                s_accs, v_preloaded = do_qk(k_buff_off, k_preloaded, v_buff_off, dma=(v_rsrc, l_voffs, g_voffs))
+                s_accs, v_preloaded = do_qk(k_buff_off, k_preloaded_prologue, v_buff_off, dma=(v_rsrc, l_voffs, g_voffs))
                 m_frozen, bias_chunks, s_accs = do_softmax_prepare(s_accs, m_init)
                 _sched_barrier()
                 _gpu_barrier()
@@ -1105,7 +1107,7 @@ def build_flash_attn_fp8_module(
                 ]
                 m_frozen, l_valu, l_mfma, o0, o1, o2, o3 = _g1_args[:7]
                 s0, s1, s2, s3 = _g1_args[7:11]
-                bias_chunks = _g0_args[11 : 11 + N_BIAS_CHUNKS]
+                bias_chunks = _g1_args[11 : 11 + N_BIAS_CHUNKS]
                 _rest = _g1_args[11 + N_BIAS_CHUNKS:]
                 v_buff_off, v_next_off, v_further_off = _rest[0:3]
                 k_buff_off, k_next_off = _rest[3:5]
@@ -1157,19 +1159,19 @@ def build_flash_attn_fp8_module(
                         _raw(s_accs[1]),
                         _raw(s_accs[2]),
                         _raw(s_accs[3]),
-                        *[_raw(c) for c in bias_chunks],
+                        *[_raw(bc) for bc in bias_chunks],
                         # Rotate the V triple and swap the K pair.
                         _raw(v_next_off),
                         _raw(v_further_off),
                         _raw(v_buff_off),
                         _raw(k_next_off),
                         _raw(k_buff_off),
-                        *[_raw(w) for w in v_preloaded],
+                        *[_raw(vp) for vp in v_preloaded],
                     ]
                 )
 
             _g1_res = [as_dsl_value(r, ex) for r, ex in zip(for_op.results, g1_carry)]
-            oe, le_mfma, le_valu = g0_epilogue(*_g1_res)
+            oe, le_mfma, le_valu = g1_epilogue(*_g1_res)
             oe0 = oe[0]
             oe1 = oe[1]
             oe2 = oe[2]
@@ -1178,7 +1180,7 @@ def build_flash_attn_fp8_module(
         o_finals = [oe0, oe1, oe2, oe3]
         # asm: output_complete_results folds the MFMA half of L (_v_LR) into
         # the VALU half (_v_L) right before the reciprocal.
-        l_final = _fadd(l_valu, Vec(l_mfma)[0]) if const_expr(L_MFMA_SLABS) else l_valu
+        l_final = _fadd(le_valu, Vec(le_mfma)[0]) if const_expr(L_MFMA_SLABS) else le_valu
 
         inv_l = rocdl.rcp(T.f32, l_final)
         inv_l_v = _fmul(inv_l, v_descale)
