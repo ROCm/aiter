@@ -12,7 +12,6 @@ Convention (TN layout):
 where both lhs and rhs are stored in FP8 with per-block E8M0 scales.
 """
 
-
 import torch
 import triton
 

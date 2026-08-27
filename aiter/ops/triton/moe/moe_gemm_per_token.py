@@ -16,7 +16,6 @@ Convention (TN layout):
     ``out[tokens_for_e] = lhs[tokens_for_e] @ rhs[e]^T * x_scale * w_scale``
 """
 
-
 import torch
 import triton
 

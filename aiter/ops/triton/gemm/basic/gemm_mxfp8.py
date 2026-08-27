@@ -12,7 +12,6 @@ Scale conversion:  ``scale_fp32 = 2^(e8m0_val - 127)``
 Implemented as a bit-shift:  ``(e8m0.to(int32) << 23).view(float32)``
 """
 
-
 import torch
 
 from aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale import gemm_a8w8_blockscale
