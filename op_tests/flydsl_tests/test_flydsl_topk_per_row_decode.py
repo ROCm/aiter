@@ -11,7 +11,10 @@ import torch
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl import topk_per_row as topk_per_row_impl
-from aiter.ops.flydsl.kernels.topk_per_row_decode import should_use_three_pass_radix
+from aiter.ops.flydsl.kernels.topk_per_row_decode import (
+    should_use_three_pass_radix,
+    topk_per_row_decode_workspace_shapes,
+)
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 torch.set_default_device("cuda")
@@ -21,11 +24,14 @@ SUPPORTED_GFX = ["gfx942", "gfx950"]
 
 def test_flydsl_topk_three_pass_dispatch_thresholds():
     threshold = 6 << 16
-    assert should_use_three_pass_radix(threshold, 26, True)
-    assert not should_use_three_pass_radix(threshold - 1, 26, True)
-    assert not should_use_three_pass_radix(threshold, 25, True)
-    assert not should_use_three_pass_radix(threshold, 26, False)
-    assert should_use_three_pass_radix(5 << 18, 7, True)
+    assert should_use_three_pass_radix(2048, 1, True)
+    assert should_use_three_pass_radix(threshold - 1, 32, True)
+    assert not should_use_three_pass_radix(threshold - 1, 64, True)
+    assert should_use_three_pass_radix(threshold, 64, True)
+    assert should_use_three_pass_radix(2048, 128, False)
+    assert topk_per_row_decode_workspace_shapes(26, True, True)[0][1] == 16
+    assert topk_per_row_decode_workspace_shapes(26, True, False)[0][1] == 48
+    assert topk_per_row_decode_workspace_shapes(128, False, True)[0][1] == 16
 
 
 def test_flydsl_topk_workspace_cache_reuses_allocation():

@@ -33,12 +33,13 @@ _DPP_ROW_SHR_8 = 0x118
 _DPP_ROW_MASK = 0xF
 _DPP_BANK_MASK = 0xF
 
-_BLOCK_THREADS = 256
-_REDUCE_THREADS = 256
+_DEFAULT_BLOCK_THREADS = 256
+_WIDE_BLOCK_THREADS = 1024
+_DEFAULT_REDUCE_THREADS = 256
 _FUSED_PREFIX_THREADS = 1024
-_CHUNKS_PER_ROW = 48
+_DEFAULT_CHUNKS_PER_ROW = 48
+_WIDE_CHUNKS_PER_ROW = 16
 _WAVE_SIZE = 64
-_NUM_WAVES = _REDUCE_THREADS // _WAVE_SIZE
 _FUSED_PREFIX_NUM_WAVES = _FUSED_PREFIX_THREADS // _WAVE_SIZE
 _STATE_PREFIX = 0
 _STATE_MASK = 1
@@ -53,14 +54,13 @@ _STABLE_PACKED_COUNT_LIMIT = 1 << 15
 
 
 def should_use_three_pass_radix(n: int, rows: int, stable: bool) -> bool:
-    """gfx950 gate where one fewer input scan amortizes the wider histograms."""
-    # Three passes save one full-N scan, but their 1024/2048-bin histograms cost
-    # more to clear, write, and reduce than four 256-bin passes. gfx950 benchmarks
-    # show that the saved scan wins at 384K elements for many rows, while smaller
-    # row counts need about 1.25M elements to amortize the wider histograms.
-    return stable and (
-        (n >= (6 << 16) and rows >= 26) or (n >= (5 << 18) and rows >= 7)
-    )
+    """gfx950 gate for the three-pass, 1024-thread data geometry."""
+    # The 1024-thread/16-chunk geometry wins across the measured 2K–1M width
+    # range for unordered output and for stable rows <= 32. Large stable batches
+    # keep a width gate because their ordered-write path loses at very small N.
+    if not stable:
+        return True
+    return rows <= 32 or n >= (6 << 16)
 
 
 def topk_per_row_decode_workspace_shapes(
@@ -68,8 +68,9 @@ def topk_per_row_decode_workspace_shapes(
 ):
     radix_passes = _RADIX_PASSES_3 if use_three_pass else _RADIX_PASSES_4
     max_radix_bits = max(radix_bits for _, radix_bits in radix_passes)
+    chunks_per_row = _WIDE_CHUNKS_PER_ROW if use_three_pass else _DEFAULT_CHUNKS_PER_ROW
     hist_bins = (1 << max_radix_bits) + 2 * int(stable)
-    return (rows, _CHUNKS_PER_ROW, hist_bins), (rows, _STATE_SIZE)
+    return (rows, chunks_per_row, hist_bins), (rows, _STATE_SIZE)
 
 
 def _uint32_to_int32(x: int) -> int:
@@ -84,20 +85,20 @@ def _f32_to_ord(val):
     return arith.select(is_nan, fx.Int32(0x7FFFFFFF), ords)
 
 
-def _make_hist_storage(max_n_hist_bins: int):
+def _make_hist_storage(max_n_hist_bins: int, num_waves: int):
     @fx.struct
     class HistStorage:
         bins: Array[Int32, max_n_hist_bins, 16]
-        scan: Array[Int32, _NUM_WAVES + 1, 16]
+        scan: Array[Int32, num_waves + 1, 16]
 
     return HistStorage
 
 
-def _make_stable_count_prefix_storage():
+def _make_stable_count_prefix_storage(chunks_per_row: int):
     @fx.struct
     class StableCountPrefixStorage:
-        above: Array[Int32, _CHUNKS_PER_ROW, 16]
-        equal: Array[Int32, _CHUNKS_PER_ROW, 16]
+        above: Array[Int32, chunks_per_row, 16]
+        equal: Array[Int32, chunks_per_row, 16]
 
     return StableCountPrefixStorage
 
@@ -115,11 +116,11 @@ def _make_gather_storage(k: int):
     return GatherStorage
 
 
-def _make_stable_write_storage():
+def _make_stable_write_storage(num_waves: int):
     @fx.struct
     class StableWriteStorage:
-        primary_scan: Array[Int32, _NUM_WAVES + 1, 16]
-        equal_scan: Array[Int32, _NUM_WAVES + 1, 16]
+        primary_scan: Array[Int32, num_waves + 1, 16]
+        equal_scan: Array[Int32, num_waves + 1, 16]
         primary_running: Array[Int32, 1, 4]
         equal_running: Array[Int32, 1, 4]
 
@@ -140,17 +141,26 @@ def build_topk_per_row_decode_module(
     final_n_hist_bins = 1 << radix_passes[-1][1]
     stable_above_bin = max_n_hist_bins
     stable_equal_bin = stable_above_bin + 1
-    chunks_per_row = _CHUNKS_PER_ROW
+    # Wide radix uses a wave-rich block and fewer chunks: at rows 26–32 this
+    # keeps 416–512 blocks in flight while cutting partial-histogram traffic.
+    # Reduce stays at 256 threads for vectorized bin loads; four-pass radix keeps
+    # the lower-contention 256-thread/48-chunk data geometry.
+    wide_geometry = use_three_pass
+    block_threads = _WIDE_BLOCK_THREADS if wide_geometry else _DEFAULT_BLOCK_THREADS
+    reduce_threads = _DEFAULT_REDUCE_THREADS
+    block_num_waves = block_threads // _WAVE_SIZE
+    reduce_num_waves = reduce_threads // _WAVE_SIZE
+    chunks_per_row = _WIDE_CHUNKS_PER_ROW if wide_geometry else _DEFAULT_CHUNKS_PER_ROW
     total_vecs = n // _VEC
-    vecs_per_grid_step = chunks_per_row * _BLOCK_THREADS
+    vecs_per_grid_step = chunks_per_row * block_threads
     vec_steps = (total_vecs + vecs_per_grid_step - 1) // vecs_per_grid_step
     stable_narrow_vectors = (n + _VEC - 1) // _VEC
     stable_narrow_vectors_per_chunk = (
         stable_narrow_vectors + chunks_per_row - 1
     ) // chunks_per_row
     stable_narrow_steps = (
-        stable_narrow_vectors_per_chunk + _BLOCK_THREADS - 1
-    ) // _BLOCK_THREADS
+        stable_narrow_vectors_per_chunk + block_threads - 1
+    ) // block_threads
     # Wider batches amortize block scans on long rows but add register cost on short rows.
     stable_vec = (
         _STABLE_WIDE_VEC if stable_narrow_steps >= _STABLE_WIDE_VEC_MIN_STEPS else _VEC
@@ -162,16 +172,16 @@ def build_topk_per_row_decode_module(
     stable_values_per_chunk = stable_write_vectors_per_chunk * stable_vec
     stable_hist_vectors_per_chunk = stable_values_per_chunk // _VEC
     stable_hist_steps = (
-        stable_hist_vectors_per_chunk + _BLOCK_THREADS - 1
-    ) // _BLOCK_THREADS
+        stable_hist_vectors_per_chunk + block_threads - 1
+    ) // block_threads
     stable_write_steps = (
-        stable_write_vectors_per_chunk + _BLOCK_THREADS - 1
-    ) // _BLOCK_THREADS
-    output_steps = (k + _BLOCK_THREADS - 1) // _BLOCK_THREADS
+        stable_write_vectors_per_chunk + block_threads - 1
+    ) // block_threads
+    output_steps = (k + block_threads - 1) // block_threads
     # n is compile-time, so only the selected scan implementation is emitted.
     use_packed_stable_scan = stable_values_per_chunk < _STABLE_PACKED_COUNT_LIMIT
 
-    @flyc.kernel(known_block_size=[_BLOCK_THREADS, 1, 1])
+    @flyc.kernel(known_block_size=[block_threads, 1, 1])
     def histogram_kernel(
         input: fx.Tensor,
         row_ends: fx.Tensor,
@@ -215,14 +225,16 @@ def build_topk_per_row_decode_module(
             row_state[_STATE_DIRECT] = direct.select(fx.Int32(1), fx.Int32(0))
         if first_pass != 0 and chunk == 0 and direct:
             for output_step in range_constexpr(output_steps):
-                out_pos = fx.Int32(output_step * _BLOCK_THREADS) + fx.Int32(tid)
+                out_pos = fx.Int32(output_step * block_threads) + fx.Int32(tid)
                 if out_pos < fx.Int32(k):
                     row_indices[out_pos] = (out_pos < row_len).select(
                         out_pos, fx.Int32(-1)
                     )
-        storage = fx.SharedAllocator().allocate(_make_hist_storage(max_n_hist_bins))
+        storage = fx.SharedAllocator().allocate(
+            _make_hist_storage(max_n_hist_bins, block_num_waves)
+        )
         s_hist = storage.bins.peek().view(fx.make_layout(max_n_hist_bins, 1))
-        s_scan = storage.scan.peek().view(fx.make_layout(_NUM_WAVES + 1, 1))
+        s_scan = storage.scan.peek().view(fx.make_layout(block_num_waves + 1, 1))
 
         def load_vec_f32(idx):
             r = fx.make_rmem_tensor(_VEC, Float32)
@@ -283,12 +295,13 @@ def build_topk_per_row_decode_module(
                     ) ^ previous_xor
                     previous_above = fx.Int32(0)
                     for hist_item in range_constexpr(
-                        (previous_num_bins + _BLOCK_THREADS - 1) // _BLOCK_THREADS
+                        (previous_num_bins + block_threads - 1) // block_threads
                     ):
-                        hist_bin = tid + hist_item * _BLOCK_THREADS
-                        previous_above = previous_above + (
-                            hist_bin > previous_bin
-                        ).select(chunk_hist[hist_bin], fx.Int32(0))
+                        hist_bin = tid + hist_item * block_threads
+                        if hist_bin < previous_num_bins:
+                            previous_above = previous_above + (
+                                hist_bin > previous_bin
+                            ).select(chunk_hist[hist_bin], fx.Int32(0))
                     lane = tid % fx.Int32(_WAVE_SIZE)
                     warp = tid // fx.Int32(_WAVE_SIZE)
                     wave_total = warp_inclusive_prefix_i32(previous_above, lane)
@@ -297,16 +310,16 @@ def build_topk_per_row_decode_module(
                     gpu.barrier()
                     if tid == 0:
                         block_total = fx.Int32(0)
-                        for wave in range_constexpr(_NUM_WAVES):
+                        for wave in range_constexpr(block_num_waves):
                             block_total = block_total + s_scan[wave]
                         chunk_hist[stable_above_bin] = (
                             chunk_hist[stable_above_bin] + block_total
                         )
 
             for hist_item in range_constexpr(
-                (num_bins + _BLOCK_THREADS - 1) // _BLOCK_THREADS
+                (num_bins + block_threads - 1) // block_threads
             ):
-                hist_bin = tid + hist_item * _BLOCK_THREADS
+                hist_bin = tid + hist_item * block_threads
                 if hist_bin < num_bins:
                     s_hist[hist_bin] = 0
             gpu.barrier()
@@ -322,7 +335,7 @@ def build_topk_per_row_decode_module(
                 for step in range_constexpr(stable_hist_steps):
                     vec_idx = (
                         chunk * stable_hist_vectors_per_chunk
-                        + step * _BLOCK_THREADS
+                        + step * block_threads
                         + tid
                     )
                     if vec_idx < vector_end:
@@ -335,7 +348,7 @@ def build_topk_per_row_decode_module(
                                     atomic_add_shared(s_hist, 1, byte_val)
             else:
                 for step in range_constexpr(vec_steps):
-                    vec_idx = step * vecs_per_grid_step + chunk * _BLOCK_THREADS + tid
+                    vec_idx = step * vecs_per_grid_step + chunk * block_threads + tid
                     if vec_idx < full_vecs:
                         rvals = load_vec_f32(vec_idx)
                         for vi in range_constexpr(_VEC):
@@ -355,13 +368,13 @@ def build_topk_per_row_decode_module(
                     atomic_add_shared(s_hist, 1, byte_val)
             gpu.barrier()
             for hist_item in range_constexpr(
-                (num_bins + _BLOCK_THREADS - 1) // _BLOCK_THREADS
+                (num_bins + block_threads - 1) // block_threads
             ):
-                hist_bin = tid + hist_item * _BLOCK_THREADS
+                hist_bin = tid + hist_item * block_threads
                 if hist_bin < num_bins:
                     chunk_hist[hist_bin] = s_hist[hist_bin]
 
-    @flyc.kernel(known_block_size=[_REDUCE_THREADS, 1, 1])
+    @flyc.kernel(known_block_size=[reduce_threads, 1, 1])
     def reduce_select_kernel(
         partial_hist: fx.Tensor,
         state: fx.Tensor,
@@ -378,8 +391,10 @@ def build_topk_per_row_decode_module(
         row_hist = fx.slice(partial_hist_buf, (row, None, None))
         copy_atom_i32 = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), 32)
 
-        storage = fx.SharedAllocator().allocate(_make_hist_storage(max_n_hist_bins))
-        s_scan = storage.scan.peek().view(fx.make_layout(_NUM_WAVES + 1, 1))
+        storage = fx.SharedAllocator().allocate(
+            _make_hist_storage(max_n_hist_bins, reduce_num_waves)
+        )
+        s_scan = storage.scan.peek().view(fx.make_layout(reduce_num_waves + 1, 1))
 
         def load_hist_vec(chunk, vec_idx):
             chunk_hist = fx.slice(row_hist, (chunk, None))
@@ -434,19 +449,19 @@ def build_topk_per_row_decode_module(
 
             if warp == 0:
                 warp_val = fx.Int32(0)
-                if lane < fx.Int32(_NUM_WAVES):
+                if lane < fx.Int32(reduce_num_waves):
                     warp_val = scan[lane]
                 warp_inclusive = warp_inclusive_prefix_i32(warp_val, lane)
-                if lane < fx.Int32(_NUM_WAVES):
+                if lane < fx.Int32(reduce_num_waves):
                     scan[lane] = warp_inclusive - warp_val
-                if lane == fx.Int32(_NUM_WAVES - 1):
-                    scan[_NUM_WAVES] = warp_inclusive
+                if lane == fx.Int32(reduce_num_waves - 1):
+                    scan[reduce_num_waves] = warp_inclusive
             gpu.barrier()
             result = scan[warp] + exclusive
             return result
 
         if row_state[_STATE_DIRECT] == 0:
-            bins_per_thread = num_bins // _REDUCE_THREADS
+            bins_per_thread = num_bins // reduce_threads
             select_bin = fx.Int32(num_bins - 1) - tid * fx.Int32(bins_per_thread)
             bin_counts = fx.make_rmem_tensor(bins_per_thread, Int32)
             count = fx.Int32(0)
@@ -501,7 +516,7 @@ def build_topk_per_row_decode_module(
                     row_state[_STATE_REMAINING_K] = remaining_k - bin_elems_above
                 bin_elems_above = bin_elems_above + bin_count
 
-    @flyc.kernel(known_block_size=[_BLOCK_THREADS, 1, 1])
+    @flyc.kernel(known_block_size=[block_threads, 1, 1])
     def gather_kernel(
         input: fx.Tensor,
         row_ends: fx.Tensor,
@@ -530,7 +545,7 @@ def build_topk_per_row_decode_module(
         if chunk == 0 and row_len < fx.Int32(k):
             for output_step in range_constexpr(output_steps):
                 out_pos = (
-                    row_len + fx.Int32(output_step * _BLOCK_THREADS) + fx.Int32(tid)
+                    row_len + fx.Int32(output_step * block_threads) + fx.Int32(tid)
                 )
                 if out_pos < fx.Int32(k):
                     row_indices[out_pos] = fx.Int32(-1)
@@ -592,7 +607,7 @@ def build_topk_per_row_decode_module(
 
         if row_state[_STATE_DIRECT] == 0:
             for step in range_constexpr(vec_steps):
-                vec_idx = step * vecs_per_grid_step + chunk * _BLOCK_THREADS + tid
+                vec_idx = step * vecs_per_grid_step + chunk * block_threads + tid
                 if vec_idx < full_vecs:
                     base = vec_idx * _VEC
                     rvals = load_vec_f32(vec_idx)
@@ -636,8 +651,8 @@ def build_topk_per_row_decode_module(
                 )
             gpu.barrier()
 
-            for step in range_constexpr((k + _BLOCK_THREADS - 1) // _BLOCK_THREADS):
-                local_pos = step * _BLOCK_THREADS + tid
+            for step in range_constexpr((k + block_threads - 1) // block_threads):
+                local_pos = step * block_threads + tid
                 if local_pos < s_above_count[0]:
                     out_pos = s_above_base[0] + local_pos
                     row_indices[out_pos] = s_above_idxs[local_pos]
@@ -656,7 +671,9 @@ def build_topk_per_row_decode_module(
         warp = tid // fx.Int32(_WAVE_SIZE)
         threshold_bin = state[row, _STATE_PREFIX] & fx.Int32(final_radix_mask)
 
-        storage = fx.SharedAllocator().allocate(_make_stable_count_prefix_storage())
+        storage = fx.SharedAllocator().allocate(
+            _make_stable_count_prefix_storage(chunks_per_row)
+        )
         s_above = storage.above.peek().view(fx.make_layout(chunks_per_row, 1))
         s_equal = storage.equal.peek().view(fx.make_layout(chunks_per_row, 1))
 
@@ -725,7 +742,7 @@ def build_topk_per_row_decode_module(
                     partial_hist[row, lane, stable_above_bin] = above_prefix
                     partial_hist[row, lane, stable_equal_bin] = equal_prefix
 
-    @flyc.kernel(known_block_size=[_BLOCK_THREADS, 1, 1])
+    @flyc.kernel(known_block_size=[block_threads, 1, 1])
     def stable_write_kernel(
         input: fx.Tensor,
         row_ends: fx.Tensor,
@@ -753,7 +770,7 @@ def build_topk_per_row_decode_module(
 
         if chunk_i32 == 0 and row_len < fx.Int32(k):
             for output_step in range_constexpr(output_steps):
-                out_pos = row_len + fx.Int32(output_step * _BLOCK_THREADS) + tid_i32
+                out_pos = row_len + fx.Int32(output_step * block_threads) + tid_i32
                 if out_pos < fx.Int32(k):
                     row_indices[out_pos] = fx.Int32(-1)
 
@@ -763,12 +780,16 @@ def build_topk_per_row_decode_module(
         above_prefix = partial_hist[row, chunk, stable_above_bin]
         equal_prefix = partial_hist[row, chunk, stable_equal_bin]
 
-        storage = fx.SharedAllocator().allocate(_make_stable_write_storage())
+        storage = fx.SharedAllocator().allocate(
+            _make_stable_write_storage(block_num_waves)
+        )
         # primary holds packed counts on the fast path and above counts otherwise.
         s_primary_scan = storage.primary_scan.peek().view(
-            fx.make_layout(_NUM_WAVES + 1, 1)
+            fx.make_layout(block_num_waves + 1, 1)
         )
-        s_equal_scan = storage.equal_scan.peek().view(fx.make_layout(_NUM_WAVES + 1, 1))
+        s_equal_scan = storage.equal_scan.peek().view(
+            fx.make_layout(block_num_waves + 1, 1)
+        )
         s_primary_running = storage.primary_running.peek().view(fx.make_layout(1, 1))
         s_equal_running = storage.equal_running.peek().view(fx.make_layout(1, 1))
 
@@ -837,16 +858,16 @@ def build_topk_per_row_decode_module(
 
             if warp == 0:
                 warp_val = fx.Int32(0)
-                if lane < fx.Int32(_NUM_WAVES):
+                if lane < fx.Int32(block_num_waves):
                     warp_val = scan[lane]
                 warp_inclusive = warp_inclusive_prefix_i32(warp_val, lane)
-                if lane < fx.Int32(_NUM_WAVES):
+                if lane < fx.Int32(block_num_waves):
                     scan[lane] = warp_inclusive - warp_val
-                if lane == fx.Int32(_NUM_WAVES - 1):
-                    scan[_NUM_WAVES] = warp_inclusive
+                if lane == fx.Int32(block_num_waves - 1):
+                    scan[block_num_waves] = warp_inclusive
             gpu.barrier()
             result = scan[warp] + exclusive
-            total = scan[_NUM_WAVES]
+            total = scan[block_num_waves]
             return result, total
 
         def block_exclusive_prefix_i32_pair(first, second, first_scan, second_scan):
@@ -864,22 +885,22 @@ def build_topk_per_row_decode_module(
             if warp == 0:
                 first_warp = fx.Int32(0)
                 second_warp = fx.Int32(0)
-                if lane < fx.Int32(_NUM_WAVES):
+                if lane < fx.Int32(block_num_waves):
                     first_warp = first_scan[lane]
                     second_warp = second_scan[lane]
                 first_warp_inclusive = warp_inclusive_prefix_i32(first_warp, lane)
                 second_warp_inclusive = warp_inclusive_prefix_i32(second_warp, lane)
-                if lane < fx.Int32(_NUM_WAVES):
+                if lane < fx.Int32(block_num_waves):
                     first_scan[lane] = first_warp_inclusive - first_warp
                     second_scan[lane] = second_warp_inclusive - second_warp
-                if lane == fx.Int32(_NUM_WAVES - 1):
-                    first_scan[_NUM_WAVES] = first_warp_inclusive
-                    second_scan[_NUM_WAVES] = second_warp_inclusive
+                if lane == fx.Int32(block_num_waves - 1):
+                    first_scan[block_num_waves] = first_warp_inclusive
+                    second_scan[block_num_waves] = second_warp_inclusive
             gpu.barrier()
             first_result = first_scan[warp] + first_exclusive
             second_result = second_scan[warp] + second_exclusive
-            first_total = first_scan[_NUM_WAVES]
-            second_total = second_scan[_NUM_WAVES]
+            first_total = first_scan[block_num_waves]
+            second_total = second_scan[block_num_waves]
             return first_result, second_result, first_total, second_total
 
         def write_values(
@@ -912,7 +933,7 @@ def build_topk_per_row_decode_module(
         for step in range(start, stop, step_value):
             vector_idx = (
                 chunk_i32 * fx.Int32(stable_write_vectors_per_chunk)
-                + step * fx.Int32(_BLOCK_THREADS)
+                + step * fx.Int32(block_threads)
                 + tid_i32
             )
             base = vector_idx * fx.Int32(stable_vec)
@@ -1045,7 +1066,7 @@ def build_topk_per_row_decode_module(
             )
             histogram.launch(
                 grid=(rows_m, chunks_per_row, 1),
-                block=(_BLOCK_THREADS, 1, 1),
+                block=(block_threads, 1, 1),
                 stream=stream,
             )
             reduce_select = reduce_select_kernel(
@@ -1059,7 +1080,7 @@ def build_topk_per_row_decode_module(
             )
             reduce_select.launch(
                 grid=(rows_m, 1, 1),
-                block=(_REDUCE_THREADS, 1, 1),
+                block=(reduce_threads, 1, 1),
                 stream=stream,
             )
 
@@ -1079,14 +1100,14 @@ def build_topk_per_row_decode_module(
             )
             stable_write.launch(
                 grid=(rows_m, chunks_per_row, 1),
-                block=(_BLOCK_THREADS, 1, 1),
+                block=(block_threads, 1, 1),
                 stream=stream,
             )
         else:
             gather = gather_kernel(input, row_ends, indices, state)
             gather.launch(
                 grid=(rows_m, chunks_per_row, 1),
-                block=(_BLOCK_THREADS, 1, 1),
+                block=(block_threads, 1, 1),
                 stream=stream,
             )
 
