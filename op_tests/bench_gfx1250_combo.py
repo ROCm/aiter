@@ -627,31 +627,35 @@ def _md_from_pandas(marker, columns):
     return extract
 
 
-def _md_from_space_table(header_col):
-    """Re-emit a UT's own DataFrame.to_string() summary as markdown.
+def _space_table(header_col):
+    """Keep a UT's own aligned summary table, verbatim.
 
-    Anchors on the header row carrying `header_col` and takes the aligned rows
-    that follow, so the table survives the aiter trace fragments and compiler
-    warnings interleaved before it.
+    Anchors on the header row carrying `header_col` and takes the data rows that
+    follow, so the table survives the trace fragments and compiler warnings
+    interleaved before it.
+
+    Emitted as the UT formatted it rather than rebuilt as markdown: pandas
+    writes multi-word column names ("opus us", "asm TFLOPS"), so the header
+    splits into 33 words against 21 data fields and cannot be mapped back to
+    columns. A column name also appears in the UT's argument echo
+    ("nnz_prefix = 256,"), so require the next line to look like data.
     """
 
     def extract(lines):
         for i, line in enumerate(lines):
-            if header_col not in line.split():
+            if header_col not in line.split() or i + 1 >= len(lines):
                 continue
-            cols = line.split()
-            rows = []
+            first = lines[i + 1].split()
+            if not first or not _isnum(first[0]):
+                continue
+            width = len(first)
+            out = [line]
             for follower in lines[i + 1 :]:
                 fields = follower.split()
-                if len(fields) != len(cols):
+                if len(fields) != width or not _isnum(fields[0]):
                     break
-                rows.append(fields)
-            if rows:
-                return (
-                    pd.DataFrame(rows, columns=cols)
-                    .to_markdown(index=False)
-                    .splitlines()
-                )
+                out.append(follower)
+            return out
         return []
 
     return extract
@@ -752,12 +756,16 @@ def _run_child(name, cmd, cwd, env=None, extract=None, timeout=None, tail=30,
         print("\n".join(captured.splitlines()[-tail:]), flush=True)
         raise
     lines = proc.stdout.splitlines()
-    rows = extract(lines)
-    if kernels:
-        rows = list(rows) + _kernel_digest(lines)
+    # `results` decides whether the op reported anything; the kernel digest is
+    # an annotation and must not stand in for a result table, or an extractor
+    # that stops matching turns into a silent hole instead of a failure.
+    results = extract(lines)
+    rows = list(results) + (_kernel_digest(lines) if kernels else [])
     print(f"\n===== {name} =====", flush=True)
     print("\n".join(rows) if rows else "(no result rows recognised)", flush=True)
-    if proc.returncode != 0 or not rows:
+    if not results:
+        print(f"--- {name}: extractor matched no result rows ---")
+    if proc.returncode != 0 or not results:
         print(f"--- {name}: exit={proc.returncode}, last {tail} lines ---")
         print("\n".join(lines[-tail:]), flush=True)
     if proc.returncode != 0:
@@ -1382,7 +1390,7 @@ def run_mla_v4_prefill_fp8(_args):
         [sys.executable, "op_tests/test_pa_sparse_prefill.py"],
         cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
         env=env,
-        extract=_md_from_space_table("n_tokens"),
+        extract=_space_table("nnz_prefix"),
     )
 
 
