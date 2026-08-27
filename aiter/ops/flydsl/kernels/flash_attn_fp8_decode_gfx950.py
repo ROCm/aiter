@@ -365,6 +365,41 @@ def build_flash_attn_fp8_decode_module(
             token = b  # decode: sq==1, so token index == batch index
             kv_len = seq_len_kv
 
+        # [token, q_head, d] row-major layout of Q/O. crd2idx computes in the
+        # coordinate width, so Int64 coords keep the token*(H*D) term 64-bit
+        # (matches the prior explicit fx.Int64 arithmetic); the token extent is
+        # a nominal upper bound -- a point coord takes no modulo, so only the
+        # strides matter.
+        qo_layout = fx.make_layout((1 << 31, H, D), (H * D, D, 1))
+
+        def qo_row_base(tok, hh, nn):
+            # base element offset of (token=tok, q_head=hh*16+nn, d=0)
+            return fx.Int64(
+                fx.get_scalar(
+                    fx.crd2idx(
+                        (fx.Int64(tok), fx.Int64(hh) * 16 + fx.Int64(nn), fx.Int64(0)),
+                        qo_layout,
+                    )
+                )
+            )
+
+        # Split-K workspace [B, HKV, SPLK, WS_PER] row-major. crd2idx in Int64
+        # matches the prior fx.Int64((b*HKV+h)*SPLK+split)*WS_PER arithmetic.
+        ws_layout = fx.make_layout(
+            (1 << 20, HKV, SPLK, WS_PER),
+            (HKV * SPLK * WS_PER, SPLK * WS_PER, WS_PER, 1),
+        )
+
+        def ws_row_base(bb, hh, ss):
+            return fx.Int64(
+                fx.get_scalar(
+                    fx.crd2idx(
+                        (fx.Int64(bb), fx.Int64(hh), fx.Int64(ss), fx.Int64(0)),
+                        ws_layout,
+                    )
+                )
+            )
+
         mma = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 32, FP8))
 
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
@@ -404,12 +439,23 @@ def build_flash_attn_fp8_decode_module(
             # is the WITHIN-page offset (kv-head + layout), int32-safe.
             kdv = k_page_div(page_id)
             hoff32 = fx.Int32(h) * fx.Int32(SHUF_HEAD_STRIDE)
+            # flat0 decomposes as [n_kv, d0] (d contiguous); the shuffled 5D K
+            # region within a (page, head) is [d_chunk=D//VEC, n_kv=PAGE, VEC]
+            # with strides (SHUF_K_DCHUNK_STRIDE, VEC, 1). flat0 is a multiple of
+            # VEC so the d0%VEC coordinate is 0 -- kept for layout-faithfulness.
+            flat_layout = fx.make_layout((PAGE, D), (D, 1))
+            k_shuf_layout = fx.make_layout(
+                (D // VEC, PAGE, VEC), (SHUF_K_DCHUNK_STRIDE, VEC, 1)
+            )
             for c in range_constexpr(8):
                 flat0 = fx.Int32(c * 1024) + fx.Int32(lane) * 16
-                n_kv = flat0 // D
-                d0 = flat0 % D
-                k_src = (
-                    hoff32 + (d0 // VEC) * fx.Int32(SHUF_K_DCHUNK_STRIDE) + n_kv * VEC
+                crd = fx.idx2crd(fx.Int32(flat0), flat_layout)
+                n_kv = fx.Int32(fx.get(crd, 0))
+                d0 = fx.Int32(fx.get(crd, 1))
+                k_src = hoff32 + fx.Int32(
+                    fx.get_scalar(
+                        fx.crd2idx((d0 // VEC, n_kv, d0 % VEC), k_shuf_layout)
+                    )
                 )
                 dma128(kdv, lk_base + kbufoff + fx.Int32(c * 1024), k_src)
 
@@ -428,7 +474,7 @@ def build_flash_attn_fp8_decode_module(
 
         # ---- Q operand fragments (B-operand: N=m_q=lane%16, K=d) ----
         # Loaded once; Q is [token, q_head=h*16+m_q, d], d contiguous.
-        q_row_base = fx.Int64(token) * (H * D) + (fx.Int64(h) * 16 + fx.Int64(n)) * D
+        q_row_base = qo_row_base(token, h, n)
         q_frags = []
         for c in range_constexpr(4):
             base = q_row_base + fx.Int64(c * 32) + fx.Int64(lg) * 8
@@ -521,12 +567,20 @@ def build_flash_attn_fp8_decode_module(
                 page_id = gbt[b * bt_stride + pvi]
                 kdv = k_page_div(page_id)  # BufferDesc rebased to this page
                 gvp = v_page_flat(page_id)
+                # flat0 decomposes as [n_kv, d0] (d contiguous); the linear 4D
+                # pool indexes [n_kv, d] within a page at token stride
+                # LIN_T_STRIDE (=HKV*D), plus the head offset h*D.
+                flat_layout = fx.make_layout((PAGE, D), (D, 1))
+                lin_layout = fx.make_layout((PAGE, D), (LIN_T_STRIDE, 1))
                 for c in range_constexpr(8):
                     flat0 = fx.Int32(c * 1024) + fx.Int32(lane) * 16
-                    n_kv = flat0 // D
-                    d0 = flat0 % D
+                    crd = fx.idx2crd(fx.Int32(flat0), flat_layout)
+                    n_kv = fx.Int32(fx.get(crd, 0))
+                    d0 = fx.Int32(fx.get(crd, 1))
                     # within-page linear offset (page anchored in the BufferDesc)
-                    k_src = n_kv * fx.Int32(LIN_T_STRIDE) + fx.Int32(h) * D + d0
+                    k_src = fx.Int32(h) * D + fx.Int32(
+                        fx.get_scalar(fx.crd2idx((n_kv, d0), lin_layout))
+                    )
                     dma128(kdv, lk_base + wave_kv + fx.Int32(c * 1024), k_src)
                 base_lin = fx.Int32(lane) * fx.Int32(LIN_T_STRIDE) + fx.Int32(h) * D
                 for d in range_constexpr(D):
@@ -652,9 +706,7 @@ def build_flash_attn_fp8_decode_module(
             # mg and combined l=den) to the global workspace. The combine kernel
             # LSE-merges the SPLK splits and applies vd + 1/l. Layout per
             # (b,h,split): O[D*BLOCK_M] + m[BLOCK_M] + l[BLOCK_M].
-            ws_base = fx.Int64(
-                (b * fx.Int32(HKV) + h) * fx.Int32(SPLK) + split
-            ) * fx.Int64(WS_PER)
+            ws_base = ws_row_base(b, h, split)
             for c in range_constexpr(8):
                 for v in range_constexpr(4):
                     d_idx = fx.Int32(c * 16) + lg * 4 + fx.Int32(v)
@@ -676,9 +728,7 @@ def build_flash_attn_fp8_decode_module(
                 den_rcp, fx.Float32(0.0)
             )
             inv = vd * den_inv
-            o_row_base = (
-                fx.Int64(token) * (H * D) + (fx.Int64(h) * 16 + fx.Int64(n)) * D
-            )
+            o_row_base = qo_row_base(token, h, n)
             for c in range_constexpr(8):
                 for v in range_constexpr(4):
                     d_idx = fx.Int32(c * 16) + lg * 4 + fx.Int32(v)
@@ -779,15 +829,30 @@ def build_flash_attn_fp8_decode_module(
         else:
             token = b
 
-        # ws_base(s) = ((b*HKV + h)*SPLK + s) * WS_PER
-        bh = (b * fx.Int32(HKV) + h) * fx.Int32(SPLK)
+        # Split-K workspace [B, HKV, SPLK, WS_PER] row-major (mirrors the
+        # decode kernel's ws_row_base). Int64 crd2idx keeps the *WS_PER term
+        # 64-bit as the prior explicit fx.Int64 arithmetic did.
+        ws_layout = fx.make_layout(
+            (1 << 20, HKV, SPLK, WS_PER),
+            (HKV * SPLK * WS_PER, SPLK * WS_PER, WS_PER, 1),
+        )
+
+        def ws_base_of(s):
+            return fx.Int64(
+                fx.get_scalar(
+                    fx.crd2idx(
+                        (fx.Int64(b), fx.Int64(h), fx.Int64(s), fx.Int64(0)),
+                        ws_layout,
+                    )
+                )
+            )
 
         def m_of(s):
-            base = fx.Int64(bh + fx.Int32(s)) * fx.Int64(WS_PER)
+            base = ws_base_of(s)
             return gws[base + fx.Int64(D * BLOCK_M) + fx.Int64(n)]
 
         def l_of(s):
-            base = fx.Int64(bh + fx.Int32(s)) * fx.Int64(WS_PER)
+            base = ws_base_of(s)
             return gws[base + fx.Int64(D * BLOCK_M + BLOCK_M) + fx.Int64(n)]
 
         mg = m_of(0)
@@ -805,13 +870,22 @@ def build_flash_attn_fp8_decode_module(
         den_inv = (fx.Float32(den) > fx.Float32(0.0)).select(den_rcp, fx.Float32(0.0))
         inv = vd * den_inv
 
-        o_row_base = fx.Int64(token) * (H * D) + (fx.Int64(h) * 16 + fx.Int64(n)) * D
+        # [token, q_head, d] row-major layout of O (mirrors the decode kernel).
+        qo_layout = fx.make_layout((1 << 31, H, D), (H * D, D, 1))
+        o_row_base = fx.Int64(
+            fx.get_scalar(
+                fx.crd2idx(
+                    (fx.Int64(token), fx.Int64(h) * 16 + fx.Int64(n), fx.Int64(0)),
+                    qo_layout,
+                )
+            )
+        )
         for c in range_constexpr(8):
             for v in range_constexpr(4):
                 d_idx = fx.Int32(c * 16) + lg * 4 + fx.Int32(v)
                 acc = fx.Float32(0.0)
                 for s in range_constexpr(SPLK):
-                    base = fx.Int64(bh + fx.Int32(s)) * fx.Int64(WS_PER)
+                    base = ws_base_of(s)
                     acc = (
                         acc
                         + gws[base + fx.Int64(d_idx * BLOCK_M) + fx.Int64(n)] * sc[s]

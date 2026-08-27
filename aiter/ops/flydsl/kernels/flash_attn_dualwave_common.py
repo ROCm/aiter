@@ -2056,11 +2056,26 @@ class DualwaveFp8KvGmemToLdsLoader(DualwaveFp8PageIdLoader):
                 head_region_base = self.kv_head_idx * fx.Int64(
                     traits.HEAD_DIM * traits.BLOCK_N
                 )
-                src_elem = (
-                    head_region_base
-                    + (global_d // fx.Int64(vec)) * fx.Int64(traits.BLOCK_N * vec)
-                    + n_in_tile * fx.Int64(vec)
-                    + global_d % fx.Int64(vec)
+                # Shuffled 5D K region within a (block, kv_head): layout
+                # [d_chunk=HEAD_DIM//vec, n=BLOCK_N, vec] with strides
+                # (BLOCK_N*vec, vec, 1). Int64 coords keep the arithmetic 64-bit
+                # (n_in_tile is a runtime lane/wave value), matching the prior
+                # explicit fx.Int64 terms.
+                k_shuf_layout = fx.make_layout(
+                    (traits.HEAD_DIM // vec, traits.BLOCK_N, vec),
+                    (traits.BLOCK_N * vec, vec, 1),
+                )
+                src_elem = head_region_base + fx.Int64(
+                    fx.get_scalar(
+                        fx.crd2idx(
+                            (
+                                fx.Int64(global_d) // fx.Int64(vec),
+                                fx.Int64(n_in_tile),
+                                fx.Int64(global_d) % fx.Int64(vec),
+                            ),
+                            k_shuf_layout,
+                        )
+                    )
                 )
             else:
                 src_elem = (
@@ -2149,10 +2164,18 @@ class DualwaveFp8KvGmemToLdsLoader(DualwaveFp8PageIdLoader):
         # stride HD*vec=2048 B between consecutive lanes -- the scatter path's
         # poor coalescing.) The LDS write address is computed from (d, tc)
         # explicitly, so this assignment is free to optimise the load.
-        d = self.tid % fx.Int32(HD)
-        tc = self.tid // fx.Int32(HD)
+        # tid decomposes as (tc, d) over [., HD] (d contiguous); the coalesced
+        # gmem src is [tc, d] with strides (HD*vec, vec) within the head region.
+        # Int64 crd2idx keeps the address 64-bit as the prior fx.Int64 terms did.
+        tid_layout = fx.make_layout((1 << 20, HD), (HD, 1))
+        src_layout = fx.make_layout((1 << 20, HD), (HD * vec, vec))
+        crd = fx.idx2crd(fx.Int32(self.tid), tid_layout)
+        tc = fx.Int32(fx.get(crd, 0))
+        d = fx.Int32(fx.get(crd, 1))
         head_region_base = self.kv_head_idx * fx.Int64(HD * traits.BLOCK_N)
-        src_elem = head_region_base + tc * fx.Int64(HD * vec) + d * fx.Int64(vec)
+        src_elem = head_region_base + fx.Int64(
+            fx.get_scalar(fx.crd2idx((fx.Int64(tc), fx.Int64(d)), src_layout))
+        )
         v16 = fly.copy_atom_call_ssa(
             [Vec.make_type(4, fx.Int32)],
             self.load_atom_128,
@@ -2164,6 +2187,8 @@ class DualwaveFp8KvGmemToLdsLoader(DualwaveFp8PageIdLoader):
         quads_per_group = vec // 4  # 4
         for qi in range_constexpr(quads_per_group):
             qglobal = tc * fx.Int32(quads_per_group) + fx.Int32(qi)
+            # Hand-tuned bank-conflict mod-rotation, kept as raw arithmetic (a
+            # SwizzleType composition for it is unresolved), not a layout crd2idx.
             col = ((qglobal + dmask) % fx.Int32(nquads)) * fx.Int32(4)
             p = buffer_ops.create_llvm_ptr(row + col, address_space=3)
             llvm.StoreOp(as_mlir_value(fx.Int32(v4[qi])), p, alignment=4)
