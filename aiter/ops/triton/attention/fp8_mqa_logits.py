@@ -214,8 +214,6 @@ def fp8_mqa_logits(
 
         # gfx950 H64D128 variant:
         # FIXME: unify later
-        h64d128_block_m = 4
-        h64d128_block_kv = 64
         if (
             arch == "gfx950"
             and _gluon_fp8_mqa_logits_kernel_H64D128 is not None
@@ -224,9 +222,9 @@ def fp8_mqa_logits(
             and head_size == 128
             and seq_len >= 4096
         ):
-            _gluon_fp8_mqa_logits_kernel_H64D128[
-                ((seq_len + h64d128_block_m - 1) // h64d128_block_m,)
-            ](
+            block_m = 4
+            block_kv = 64
+            _gluon_fp8_mqa_logits_kernel_H64D128[((seq_len + block_m - 1) // block_m,)](
                 Q_ptr=Q,
                 KV_ptr=KV,
                 kv_scales_ptr=kv_scales,
@@ -247,13 +245,11 @@ def fp8_mqa_logits(
                 stride_w_h=stride_w_h,
                 stride_logits_s=stride_logits_s,
                 stride_logits_k=stride_logits_k,
-                BLOCK_KV=h64d128_block_kv,
-                NUM_WARPS=4,
+                BLOCK_KV=block_kv,
                 NUM_BUFFERS=3,
                 USE_BUFFER_LOAD=use_buffer_load,
                 USE_BUFFER_STORE=use_buffer_store,
-                BLOCK_M=h64d128_block_m,
-                TILES_PER_WARP_M=4,
+                BLOCK_M=block_m,
                 USE_FMA_FOLD=USE_FOLDED_REDUCTION,
                 NUM_CHAINS=2,
                 num_warps=4,

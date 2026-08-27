@@ -989,13 +989,11 @@ def _gluon_fp8_mqa_logits_kernel_H64D128(
     stride_logits_s: gl.int32,
     stride_logits_k: gl.int32,
     BLOCK_KV: gl.constexpr,
-    NUM_WARPS: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
     USE_BUFFER_LOAD: gl.constexpr,
     USE_BUFFER_STORE: gl.constexpr,
     BLOCK_M: gl.constexpr,
-    TILES_PER_WARP_M: gl.constexpr = 4,
-    IS_TRANSPOSED: gl.constexpr = False,
+    MFMA_NONK_DIM: gl.constexpr = 16,
     USE_FMA_FOLD: gl.constexpr = True,
     NUM_CHAINS: gl.constexpr = 2,
 ):
@@ -1008,23 +1006,24 @@ def _gluon_fp8_mqa_logits_kernel_H64D128(
         BLOCK_KV == 64 or BLOCK_KV == 32,
         "tiled kernel is specialized to BLOCK_KV in {32, 64}",
     )
-    gl.static_assert(NUM_WARPS == 4, "tiled kernel is specialized to 4 waves")
     gl.static_assert(NUM_BUFFERS == 3, "tiled kernel assumes triple buffering")
     # keeps the head reduction intra-wave
-    gl.static_assert(TILES_PER_WARP_M == 4, "requires TILES_PER_WARP_M == 4")
     gl.static_assert(
-        not IS_TRANSPOSED, "the out_layout below assumes isTransposed=false"
+        MFMA_NONK_DIM == 16 or MFMA_NONK_DIM == 32,
+        "MFMA_NONK_DIM must be 16 or 32",
     )
 
     M: gl.constexpr = BLOCK_M * NUM_HEADS
 
     # ---- layouts ----------------------------------------------------------
+    # a warp owns one query row = NUM_HEADS of the M axis
+    TILES_PER_WARP_M: gl.constexpr = NUM_HEADS // MFMA_NONK_DIM
     mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
         version=4,
-        instr_shape=[16, 16, 128],
+        instr_shape=[16, 16, 128] if MFMA_NONK_DIM == 16 else [32, 32, 64],
         warps_per_cta=[4, 1],
         tiles_per_warp=[TILES_PER_WARP_M, 1],
-        transposed=IS_TRANSPOSED,
+        transposed=False,
     )
     K_WIDTH: gl.constexpr = 16
     dot_a_layout: gl.constexpr = gl.DotOperandLayout(
@@ -1047,51 +1046,36 @@ def _gluon_fp8_mqa_logits_kernel_H64D128(
     )
 
     # KV tile [HEAD_SIZE, BLOCK_KV] fp8 in LDS
+    # fmt: off
     kv_shared_layout: gl.constexpr = gl.PaddedSharedLayout(
-        interval_padding_pairs=[[1024, 16]],
+        interval_padding_pairs=[[1024, 32]] if MFMA_NONK_DIM == 16 else [[1024, 16]],
         offset_bases=(
-            [
-                [1, 0],
-                [2, 0],
-                [4, 0],
-                [8, 0],
-                [16, 0],
-                [32, 0],
-                [64, 0],
-                [0, 4],
-                [0, 8],
-                [0, 16],
-                [0, 1],
-                [0, 2],
-                [0, 32],
-            ]
+            [[1,0],[2,0],[4,0],[8,0],[16,0],[32,0],[64,0],[0,8],[0,16],[0,32],[0,1],[0,2],[0,4]]
+            if BLOCK_KV == 64 and MFMA_NONK_DIM == 32
+            else [[1,0],[2,0],[4,0],[8,0],[16,0],[32,0],[64,0],[0,4],[0,8],[0,16],[0,1],[0,2],[0,32]]
             if BLOCK_KV == 64
-            else [
-                [1, 0],
-                [2, 0],
-                [4, 0],
-                [8, 0],
-                [16, 0],
-                [32, 0],
-                [64, 0],
-                [0, 4],
-                [0, 8],
-                [0, 16],
-                [0, 1],
-                [0, 2],
-            ]
+            else [[1,0],[2,0],[4,0],[8,0],[16,0],[32,0],[64,0],[0,4],[0,8],[0,16],[0,1],[0,2]]
         ),
         cga_layout=[],
         shape=[HEAD_SIZE, BLOCK_KV],
     )
+    # fmt: on
     # The same base list as above
     kv_blocked: gl.constexpr = gl.DistributedLinearLayout(
         reg_bases=(
-            [[1, 0], [2, 0], [4, 0], [8, 0], [0, 32]]
-            if BLOCK_KV == 64
-            else [[1, 0], [2, 0], [4, 0], [8, 0]]
+            [[1, 0], [2, 0], [4, 0], [8, 0], [0, 4]]
+            if BLOCK_KV == 64 and MFMA_NONK_DIM == 32
+            else (
+                [[1, 0], [2, 0], [4, 0], [8, 0], [0, 32]]
+                if BLOCK_KV == 64
+                else [[1, 0], [2, 0], [4, 0], [8, 0]]
+            )
         ),
-        lane_bases=[[16, 0], [32, 0], [64, 0], [0, 4], [0, 8], [0, 16]],
+        lane_bases=(
+            [[16, 0], [32, 0], [64, 0], [0, 8], [0, 16], [0, 32]]
+            if BLOCK_KV == 64 and MFMA_NONK_DIM == 32
+            else [[16, 0], [32, 0], [64, 0], [0, 4], [0, 8], [0, 16]]
+        ),
         warp_bases=[[0, 1], [0, 2]],
         block_bases=[],
         shape=[HEAD_SIZE, BLOCK_KV],
@@ -1100,7 +1084,6 @@ def _gluon_fp8_mqa_logits_kernel_H64D128(
     weight_shared_layout: gl.constexpr = gl.SwizzledSharedLayout(
         vec=1, per_phase=1, max_phase=1, order=[1, 0]
     )
-    # Same bases in order: lg2(1 fp32)=0 -> reg, next 6 -> lane, 2 -> warp.
     weight_blocked: gl.constexpr = gl.DistributedLinearLayout(
         reg_bases=[],
         lane_bases=[[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32]],
@@ -1116,10 +1099,6 @@ def _gluon_fp8_mqa_logits_kernel_H64D128(
 
     if not USE_BUFFER_STORE:
         stride_logits_s = stride_logits_s.to(gl.int64)
-    # USE_BUFFER_LOAD is a statement about KV alone (dispatch derives it from
-    # KV's byte size), so only the KV async copies below switch on it. q,
-    # weights and kv_scales stay buffer ops: kv_scales is KV/32 bytes, so it
-    # cannot exceed the cap when KV does not.
     if not USE_BUFFER_LOAD:
         stride_kv_s = stride_kv_s.to(gl.int64)
 
@@ -1234,7 +1213,9 @@ def _gluon_fp8_mqa_logits_kernel_H64D128(
             a=mfma_q,
             a_scale=None,
             a_format="e4m3",
-            b=kv_shared.index(cur).load(layout=dot_b_layout),
+            b=gl.amd.cdna4.async_copy.load_shared_relaxed(
+                kv_shared.index(cur), dot_b_layout
+            ),
             b_scale=None,
             b_format="e4m3",
             acc=gl.zeros([M, BLOCK_KV], dtype=gl.float32, layout=mfma_layout),
