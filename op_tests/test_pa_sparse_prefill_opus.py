@@ -3,9 +3,10 @@
 
 """Tests for aiter's OPUS-based sparse paged prefill attention.
 
-We validate both precision variants of the gfx950 OPUS two-region sparse
-paged prefill kernel against explicit PyTorch references (per-token
-online-softmax + per-head sink):
+We validate both precision variants of the OPUS two-region sparse paged
+prefill kernel (gfx950 compiled from source, gfx1250 loaded from a prebuilt
+code object) against explicit PyTorch references (per-token online-softmax +
+per-head sink):
 
 * ``pa_sparse_prefill_opus`` -- bf16/fp16 Q/K/V/O in a single ``D=512``
   head-dim tensor.
@@ -93,14 +94,22 @@ def _get_gpu_arch() -> str | None:
     return None
 
 
-def _skip_if_unsupported(d: int) -> bool:
+_SUPPORTED_ARCHS = ("gfx950", "gfx1250")
+
+
+def _skip_if_unsupported(d: int, prec: str | None = None) -> bool:
     if not torch.cuda.is_available():
         return _skip("CUDA/HIP device not available")
     arch = _get_gpu_arch()
-    if arch != "gfx950":
-        return _skip(f"pa_sparse_prefill_opus requires gfx950, found {arch}")
+    if arch not in _SUPPORTED_ARCHS:
+        return _skip(
+            f"pa_sparse_prefill_opus requires one of {_SUPPORTED_ARCHS}, found {arch}"
+        )
     if d != 512:
         return _skip(f"Only D=512 is compiled, requested D={d}")
+    # The gfx1250 code object only carries the bf16 traits.
+    if arch == "gfx1250" and prec == "fp16":
+        return _skip("gfx1250 only provides the bf16 variant")
     return False
 
 
@@ -540,7 +549,7 @@ def run_pa_sparse_prefill_opus(
     bench: bool = True,
 ) -> dict | None:
     assert prec in _PRECS, f"unknown prec {prec!r}"
-    if _skip_if_unsupported(d=d):
+    if _skip_if_unsupported(d=d, prec=prec):
         return None
 
     softmax_scale = 1.0 / math.sqrt(d)
