@@ -32,6 +32,15 @@ fptr_t init_custom_ar(int64_t meta_ptr,
                       const std::vector<int64_t>& all_meta_ptrs,
                       int64_t rank,
                       bool fully_connected);
+// IPC transport variant (ROCm >= 7.15): peer buffers shared via hipIpc
+// handles+offsets instead of direct pointers. Same gfx1250 kernel.
+fptr_t init_custom_ar_ipc(int64_t meta_ptr,
+                          int64_t rank_data_ptr,
+                          int64_t rank_data_sz,
+                          const std::vector<int64_t>& ipc_handle_ptrs,
+                          const std::vector<int64_t>& offsets,
+                          int64_t rank,
+                          bool fully_connected);
 void all_reduce(fptr_t _fa,
                 const aiter_tensor_t& inp,
                 const aiter_tensor_t& out,
@@ -68,6 +77,15 @@ void register_input_buffer(fptr_t _fa,
 void register_output_buffer(fptr_t _fa,
                             int64_t self_ptr,
                             const std::vector<int64_t>& all_ptrs);
+// IPC transport variants (ROCm >= 7.15): peer buffers via handles+offsets.
+void register_input_buffer_ipc(fptr_t _fa,
+                               int64_t self_ptr,
+                               const std::vector<int64_t>& ipc_handle_ptrs,
+                               const std::vector<int64_t>& offsets);
+void register_output_buffer_ipc(fptr_t _fa,
+                                int64_t self_ptr,
+                                const std::vector<int64_t>& ipc_handle_ptrs,
+                                const std::vector<int64_t>& offsets);
 int64_t get_graph_buffer_count(fptr_t _fa);
 void get_graph_buffer_ptrs(fptr_t _fa, int64_t ptrs_out);
 void register_graph_buffers(fptr_t _fa,

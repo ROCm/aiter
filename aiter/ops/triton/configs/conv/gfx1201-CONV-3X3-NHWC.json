@@ -5,7 +5,7 @@
             "BLOCK_N": 128,
             "BLOCK_K": 64,
             "GROUP_SIZE_M": 8,
-            "num_warps": 8,
+            "num_warps": 4,
             "num_stages": 1
         },
         "N=1,C=128,H=28,W=28,K=128,R=3,S=3,sh=1,sw=1,ph=1,pw=1,dh=1,dw=1": {
@@ -21,7 +21,7 @@
             "BLOCK_N": 128,
             "BLOCK_K": 64,
             "GROUP_SIZE_M": 8,
-            "num_warps": 8,
+            "num_warps": 4,
             "num_stages": 1
         },
         "N=1,C=128,H=512,W=512,K=3,R=3,S=3,sh=1,sw=1,ph=1,pw=1,dh=1,dw=1": {
@@ -77,7 +77,7 @@
             "BLOCK_N": 128,
             "BLOCK_K": 64,
             "GROUP_SIZE_M": 8,
-            "num_warps": 8,
+            "num_warps": 4,
             "num_stages": 1
         },
         "N=1,C=256,H=257,W=257,K=256,R=3,S=3,sh=2,sw=2,ph=0,pw=0,dh=1,dw=1": {
@@ -101,7 +101,7 @@
             "BLOCK_N": 128,
             "BLOCK_K": 64,
             "GROUP_SIZE_M": 8,
-            "num_warps": 8,
+            "num_warps": 4,
             "num_stages": 1
         },
         "N=1,C=256,H=512,W=512,K=256,R=3,S=3,sh=1,sw=1,ph=1,pw=1,dh=1,dw=1": {
@@ -109,7 +109,7 @@
             "BLOCK_N": 128,
             "BLOCK_K": 64,
             "GROUP_SIZE_M": 8,
-            "num_warps": 8,
+            "num_warps": 4,
             "num_stages": 1
         },
         "N=1,C=3,H=512,W=512,K=128,R=3,S=3,sh=1,sw=1,ph=1,pw=1,dh=1,dw=1": {
@@ -157,7 +157,7 @@
             "BLOCK_N": 128,
             "BLOCK_K": 64,
             "GROUP_SIZE_M": 8,
-            "num_warps": 8,
+            "num_warps": 4,
             "num_stages": 1
         },
         "N=1,C=512,H=256,W=256,K=512,R=3,S=3,sh=1,sw=1,ph=1,pw=1,dh=1,dw=1": {
@@ -165,7 +165,7 @@
             "BLOCK_N": 128,
             "BLOCK_K": 64,
             "GROUP_SIZE_M": 8,
-            "num_warps": 8,
+            "num_warps": 4,
             "num_stages": 1
         },
         "N=1,C=512,H=64,W=64,K=32,R=3,S=3,sh=1,sw=1,ph=1,pw=1,dh=1,dw=1": {

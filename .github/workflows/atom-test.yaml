@@ -27,6 +27,15 @@ env:
   GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id || github.sha }}
 
 jobs:
+  ci_config:
+    if: >-
+      github.event_name != 'pull_request' ||
+      (github.event.pull_request.draft == false &&
+      (contains(github.event.pull_request.labels.*.name, 'ci:atom') ||
+      contains(github.event.pull_request.labels.*.name, 'ci:atom_full') ||
+      contains(github.event.pull_request.labels.*.name, 'ci:all')))
+    uses: ./.github/workflows/ci-config.yaml
+
   check-signal:
     if: >-
       github.event_name != 'pull_request' ||
@@ -100,17 +109,17 @@ jobs:
           runner_overrides = {
               "atom-mi355-8gpu.predownload": "linux-aiter-do-mi350x-8",
               "linux-atom-do-mi350x-8": "linux-aiter-do-mi350x-8",
-              "linux-atom-mi35x-4": "linux-aiter-mi35x-4",
+              "linux-atom-mi35x-4": "linux-aiter-do-mi350x-4",
               "linux-atom-mi35x-1": "linux-aiter-mi35x-1",
           }
 
           # Per-model runner pin (overrides the generic mapping above). Kimi-K2.7
           # runs the downstream gate on the AITER MI350X pool (TP4 -> 4 GPUs).
           model_runner_overrides = {
-              "Kimi-K2.7-Code-MXFP4": "linux-aiter-mi35x-4",
+              "Kimi-K2.7-Code-MXFP4": "linux-aiter-do-mi350x-4",
               "DeepSeek-V4-Pro": "linux-aiter-do-mi350x-8",       # -tp 8
-              "Qwen3.5-397B-A17B-FP8": "linux-aiter-mi35x-4",  # -tp 4
-              "MiniMax-M2.7-MXFP4": "linux-aiter-mi35x-4",     # -tp 2 (MXFP4)
+              "Qwen3.5-397B-A17B-FP8": "linux-aiter-do-mi350x-4",  # -tp 4
+              "MiniMax-M2.7-MXFP4": "linux-aiter-do-mi350x-4",     # -tp 2 (MXFP4)
               "GLM-5.1-FP8": "linux-aiter-do-mi350x-8",            # -tp 8
           }
 
@@ -195,11 +204,11 @@ jobs:
       (contains(github.event.pull_request.labels.*.name, 'ci:atom') ||
       contains(github.event.pull_request.labels.*.name, 'ci:atom_full') ||
       contains(github.event.pull_request.labels.*.name, 'ci:all')))
-    needs: [check-signal, load-atom-models]
+    needs: [check-signal, load-atom-models, ci_config]
     name: Accuracy (${{ matrix.display_name }}, ${{ matrix.runner }})
     strategy:
       fail-fast: false
-      max-parallel: 1
+      max-parallel: 2
       matrix:
         include: ${{ fromJson(needs.load-atom-models.outputs.models_json) }}
     runs-on: ${{ matrix.runner }}
@@ -212,7 +221,10 @@ jobs:
           ref: ${{ env.ATOM_BRANCH }}
 
       - name: Docker login
-        run: docker login -u rocmshared -p ${{ secrets.DOCKER_PASSWORD }} || true
+        env:
+          DOCKER_USERNAME: ${{ secrets[needs.ci_config.outputs.docker_username_secret] }}
+          DOCKER_PASSWORD: ${{ secrets[needs.ci_config.outputs.docker_password_secret] }}
+        run: echo "$DOCKER_PASSWORD" | docker login -u "$DOCKER_USERNAME" --password-stdin || true
 
       - name: Download the ATOM base image
         if: matrix.run_on_pr == true || github.event_name != 'pull_request'

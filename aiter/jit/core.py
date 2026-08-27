@@ -15,16 +15,17 @@ import time
 import traceback
 import types
 import typing
-from typing import Any, Callable, List, Optional
+from collections.abc import Callable
+from typing import Any, Optional
 
 from packaging.version import Version, parse
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, f"{this_dir}/utils/")
-from chip_info import get_gfx, get_gfx_list, get_gfx_runtime  # noqa: E402
-from cpp_extension import _jit_compile, executable_path, get_hip_version  # noqa: E402
-from file_baton import FileBaton  # noqa: E402
-from torch_guard import torch_compile_guard  # noqa: E402
+from chip_info import get_gfx, get_gfx_list, get_gfx_runtime
+from cpp_extension import _jit_compile, executable_path, get_hip_version
+from file_baton import FileBaton
+from torch_guard import torch_compile_guard
 
 AITER_REBUILD = int(os.environ.get("AITER_REBUILD", "0"))
 ENABLE_CK = int(os.environ.get("ENABLE_CK", "1")) != 0
@@ -50,8 +51,8 @@ aiter_lib = None
 def mp_lock(
     lockPath: str,
     MainFunc: Callable,
-    FinalFunc: Optional[Callable] = None,
-    WaitFunc: Optional[Callable] = None,
+    FinalFunc: Callable | None = None,
+    WaitFunc: Callable | None = None,
 ):
     """
     Using FileBaton for multiprocessing.
@@ -68,7 +69,7 @@ def mp_lock(
             return ret
         # Could not acquire: another process holds the lock. Wait for it.
         # wait() returns True if the holder released normally (work done),
-        # or False if it broke a stale lock left by a dead/abandoned holder —
+        # or False if it broke a stale lock left by a dead/abandoned holder --
         # in which case we loop and try to acquire + build ourselves.
         if baton.wait():
             if WaitFunc is not None:
@@ -82,8 +83,8 @@ PY = sys.executable
 this_dir = os.path.dirname(os.path.abspath(__file__))
 
 AITER_ROOT_DIR = os.path.abspath(f"{this_dir}/../../")
-AITER_LOG_MORE = int(os.getenv("AITER_LOG_MORE", 0))
-AITER_LOG_TUNED_CONFIG = int(os.getenv("AITER_LOG_TUNED_CONFIG", 0))
+AITER_LOG_MORE = int(os.getenv("AITER_LOG_MORE", "0"))
+AITER_LOG_TUNED_CONFIG = int(os.getenv("AITER_LOG_TUNED_CONFIG", "0"))
 
 
 # config_env start here
@@ -112,6 +113,11 @@ AITER_CONFIG_FMOE = os.getenv(
     f"{AITER_ROOT_DIR}/aiter/configs/tuned_fmoe.csv",
 )
 
+AITER_CONFIG_FHMOE = os.getenv(
+    "AITER_CONFIG_FHMOE",
+    f"{AITER_ROOT_DIR}/aiter/configs/tuned_fhmoe.csv",
+)
+
 AITER_CONFIG_GROUPED_FMOE = os.getenv(
     "AITER_CONFIG_GROUPED_FMOE",
     f"{AITER_ROOT_DIR}/aiter/configs/tuned_grouped_fmoe.csv",
@@ -132,13 +138,35 @@ AITER_CONFIG_BF16_BATCHED_GEMM = os.getenv(
     f"{AITER_ROOT_DIR}/aiter/configs/bf16_tuned_batched_gemm.csv",
 )
 
+# fp8 e8m0 mxscale (block-scale) batched-GEMM tuned config. Its own family
+# (scale type baked into the filename, matching the a8w8_/bf16_ split) so a
+# future fp32 rowwise-scale variant lands in a separate CSV and never collides
+# on key. The scale type is identified by the filename alone. The
+# per-model tuned data currently lives under model_configs/ (e.g.
+# dsv4_batched_gemm_a8w8_blockscale_mxscale_tuned.csv), merged in at runtime by
+# get_config_file; this canonical path may not exist on disk.
+AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE = os.getenv(
+    "AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE",
+    f"{AITER_ROOT_DIR}/aiter/configs/batched_gemm_a8w8_blockscale_mxscale_tuned.csv",
+)
+
 AITER_CONFIG_GEMM_BF16 = os.getenv(
     "AITER_CONFIG_GEMM_BF16",
     f"{AITER_ROOT_DIR}/aiter/configs/bf16_tuned_gemm.csv",
 )
 
+# K5 opt BV tuned config. Per-model tuned rows live under model_configs/
+# (qwen3_5_*_chunk_gdn_h_opt_tuned.csv) and get merged into this canonical file by
+# get_config_file. It ships header-only: with no per-model table present
+# get_config_file returns this path as-is, and the opt AOT reads it, so it has to
+# be a readable csv rather than a missing path.
+AITER_CONFIG_GDN_K5_OPT = os.getenv(
+    "AITER_CONFIG_GDN_K5_OPT",
+    f"{AITER_ROOT_DIR}/aiter/configs/chunk_gdn_h_opt_tuned.csv",
+)
 
-class AITER_CONFIG(object):
+
+class AITER_CONFIG:
     @property
     def AITER_CONFIG_GEMM_A4W4_FILE(self):
         return self.get_config_file(
@@ -173,6 +201,12 @@ class AITER_CONFIG(object):
     def AITER_CONFIG_FMOE_FILE(self):
         return self.get_config_file(
             "AITER_CONFIG_FMOE", AITER_CONFIG_FMOE, "tuned_fmoe"
+        )
+
+    @property
+    def AITER_CONFIG_FHMOE_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_FHMOE", AITER_CONFIG_FHMOE, "tuned_fhmoe"
         )
 
     @property
@@ -211,6 +245,22 @@ class AITER_CONFIG(object):
     def AITER_CONFIG_GEMM_BF16_FILE(self):
         return self.get_config_file(
             "AITER_CONFIG_GEMM_BF16", AITER_CONFIG_GEMM_BF16, "bf16_tuned_gemm"
+        )
+
+    @property
+    def AITER_CONFIG_GDN_K5_OPT_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_GDN_K5_OPT",
+            AITER_CONFIG_GDN_K5_OPT,
+            "chunk_gdn_h_opt_tuned",
+        )
+
+    @property
+    def AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE",
+            AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE,
+            "batched_gemm_a8w8_blockscale_mxscale_tuned",
         )
 
     def update_config_files(self, file_path: str, merge_name: str):
@@ -268,11 +318,10 @@ class AITER_CONFIG(object):
             merge_df["_tag"] = merge_df["_tag"].fillna("")
 
         ## get keys from untuned file to drop_duplicates
-        untuned_name = (
-            re.sub(r"(?:_)?tuned$", r"\1untuned", merge_name)
-            if re.search(r"(?:_)?tuned$", merge_name)
-            else merge_name.replace("tuned", "untuned")
-        )
+        # Turn the tuned-file base name into its untuned sibling by rewriting the
+        # LAST "tuned" token (handles both mid-string names like
+        # "a8w8_tuned_gemm" and trailing ones like "..._mxscale_tuned").
+        untuned_name = "untuned".join(merge_name.rsplit("tuned", 1))
         untuned_path = f"{AITER_ROOT_DIR}/aiter/configs/{untuned_name}.csv"
         if os.path.exists(untuned_path):
             untunedf = pd.read_csv(untuned_path)
@@ -282,6 +331,11 @@ class AITER_CONFIG(object):
             if "gfx" in merge_df.columns and "gfx" not in keys:
                 keys.append("gfx")
             dedup_keys = keys + ["_tag"] if has_tag else keys
+            # Only key on columns actually present in the merged frame. Most
+            # families carry cu_num, but some (e.g. the mxscale batched-GEMM
+            # table) key on gfx and never carry cu_num; keeping a missing column
+            # in the subset would raise inside pandas' duplicated().
+            dedup_keys = [k for k in dedup_keys if k in merge_df.columns]
             duplicated_mask = merge_df.duplicated(subset=dedup_keys, keep=False)
             if duplicated_mask.any():
                 dup_count = int(duplicated_mask.sum())
@@ -329,6 +383,7 @@ class AITER_CONFIG(object):
             logger.warning(
                 f"Untuned config file not found: {untuned_path}. Using all columns for deduplication."
             )
+
         from pathlib import Path
 
         config_path = Path("/tmp/aiter_configs/")
@@ -345,7 +400,9 @@ class AITER_CONFIG(object):
         mp_lock(lock_path, write_config)
         return new_file_path
 
-    @functools.lru_cache(maxsize=20)
+    # Cache is keyed on (self, env_name, ...); this object is a
+    # process-lifetime singleton, so the retained reference is not a leak.
+    @functools.lru_cache(maxsize=20)  # noqa: B019
     def get_config_file(self, env_name, default_file, tuned_file_name):
         config_env_file = os.getenv(env_name)
         # default_file = f"{AITER_ROOT_DIR}/aiter/configs/{tuned_file_name}.csv"
@@ -415,6 +472,15 @@ AITER_GRADLIB_DIR = f"{AITER_META_DIR}/gradlib"
 gfxs = get_gfx_list()
 AITER_ASM_DIR = f"{AITER_META_DIR}/hsa/"
 os.environ["AITER_ASM_DIR"] = AITER_ASM_DIR
+# Pre-compiled opus code objects (csrc/opus_gemm/gen_co/<arch>/<symbol>.co).
+# Resolved HERE, at import time, for the same reason AITER_ASM_DIR is: the
+# module also carries -DOPUS_GEN_CO_DIR, but that macro is baked when the module
+# is COMPILED, which for a prebuilt wheel is the build tree's aiter_meta/ (a
+# directory setup.py deletes when it is done). Only an import-time value knows
+# where the files ended up after install. The C++ loader prefers this env var
+# over the macro, so an explicit user override still wins.
+OPUS_GEN_CO_DIR = f"{AITER_CSRC_DIR}/opus_gemm/gen_co"
+os.environ.setdefault("OPUS_GEN_CO_DIR", OPUS_GEN_CO_DIR)
 
 CK_3RDPARTY_DIR = os.environ.get(
     "CK_DIR", f"{AITER_META_DIR}/3rdparty/composable_kernel"
@@ -488,7 +554,7 @@ def validate_and_update_archs():
     return archs
 
 
-@functools.lru_cache()
+@functools.lru_cache
 def hip_flag_checker(flag_hip: str) -> bool:
     import subprocess
 
@@ -505,7 +571,7 @@ def hip_flag_checker(flag_hip: str) -> bool:
     return True
 
 
-@functools.lru_cache()
+@functools.lru_cache
 def check_LLVM_MAIN_REVISION():
     # for https://github.com/ROCm/ROCm/issues/5646 and https://github.com/ROCm/composable_kernel/pull/3469
     # ck using following logic...
@@ -554,12 +620,12 @@ def rename_cpp_to_cu(els, dst, hipify, recursive=False):
     def do_rename_and_mv(name, src, dst, ret):
         newName = name
         if hipify:
-            if name.endswith(".cpp") or name.endswith(".cu"):
+            if name.endswith((".cpp", ".cu")):
                 newName = name.replace(".cpp", ".cu")
                 ret.append(f"{dst}/{newName}")
             shutil.copy(f"{src}/{name}", f"{dst}/{newName}")
         else:
-            if name.endswith(".cpp") or name.endswith(".cu"):
+            if name.endswith((".cpp", ".cu")):
                 ret.append(f"{src}/{newName}")
 
     ret = []
@@ -592,7 +658,7 @@ def check_numa_custom_op() -> None:
         )
 
 
-@functools.lru_cache()
+@functools.lru_cache
 def check_numa():
     check_numa_custom_op()
 
@@ -602,14 +668,12 @@ __mds = {}
 
 @torch_compile_guard()
 def get_module_custom_op(md_name: str) -> None:
-    global __mds
     if md_name not in __mds:
         if "AITER_JIT_DIR" in os.environ:
             __mds[md_name] = importlib.import_module(md_name)
         else:
             __mds[md_name] = importlib.import_module(f"{__package__}.{md_name}")
         logger.info(f"import [{md_name}] under {__mds[md_name].__file__}")
-    return
 
 
 def _so_offload_archs(so_path):
@@ -621,10 +685,11 @@ def _so_offload_archs(so_path):
 
     archs = set()
     try:
-        with open(so_path, "rb") as f:
-            with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
-                for m in re.finditer(rb"amdhsa--(gfx[0-9a-z]+)", mm):
-                    archs.add(m.group(1).decode())
+        with open(so_path, "rb") as f, mmap.mmap(
+            f.fileno(), 0, access=mmap.ACCESS_READ
+        ) as mm:
+            for m in re.finditer(rb"amdhsa--(gfx[0-9a-z]+)", mm):
+                archs.add(m.group(1).decode())
     except (OSError, ValueError, OverflowError):
         pass
     return archs
@@ -637,7 +702,7 @@ def _needs_arch_rebuild(md_name):
     # force a JIT rebuild for the native arch instead.
     try:
         cur = get_gfx_runtime()
-    except Exception:
+    except Exception:  # noqa: BLE001
         # running arch undetectable (e.g. no GPU) -> keep normal behaviour
         return False
     so_path = os.path.join(get_user_jit_dir(), f"{md_name}.so")
@@ -681,7 +746,7 @@ def clone_3rdparty(third_party: str) -> None:
                         return (major > required_major) or (
                             major == required_major and minor >= required_minor
                         )
-                except Exception as e:
+                except Exception as e:  # noqa: BLE001
                     logger.warning(f"Failed to check git version: {e}")
                 return False
 
@@ -880,7 +945,16 @@ def build_module(
             flags_hip += ["-mllvm -amdgpu-coerce-illegal-types=1"]
         if get_gfx() != "gfx942" and int(os.getenv("AITER_FP4x2", "1")) > 0:
             flags_hip += ["-D__Float4_e2m1fn_x2"]
-        if get_gfx() == "gfx1250" and hip_version >= Version("7.0.0"):
+        # Cluster launch is a HOST-side API question (hipDrvLaunchKernelEx +
+        # HIP_LAUNCH_CONFIG appear in ROCm 7.0), not a question about which GPU
+        # this machine has -- so the arch test must accept a cross-compile for
+        # gfx1250 the way the gfx1250 flags in optCompilerConfig.json already do.
+        # get_gfx() alone reads the LAST entry of a multi-arch GPU_ARCHS, which
+        # left "gfx1250;gfx942" building gfx1250 kernels whose cluster launch
+        # path was compiled out (AiterAsmKernelFast then rejects them at launch).
+        if (
+            get_gfx() == "gfx1250" or "gfx1250" in os.environ.get("GPU_ARCHS", "")
+        ) and hip_version >= Version("7.0.0"):
             flags_hip += ["-DAITER_ENABLE_CLUSTER_LAUNCH"]
 
         if not torch_exclude:
@@ -907,9 +981,10 @@ def build_module(
         # ASM kernel debug instrumentation (host prints + post-launch sync) in
         # *.cu is compiled only when AITER_ASM_DEBUG=1, mirroring poc_kl's
         # `compile-dbg` / -DASM_DEBUG. Default builds stay free of debug code.
-        if int(os.environ.get("AITER_ASM_DEBUG", "0")) != 0:
-            if not any("ASM_DEBUG" in f for f in flags_extra_hip):
-                flags_hip.append("-DASM_DEBUG")
+        if int(os.environ.get("AITER_ASM_DEBUG", "0")) != 0 and not any(
+            "ASM_DEBUG" in f for f in flags_extra_hip
+        ):
+            flags_hip.append("-DASM_DEBUG")
 
         flags_cc += flags_extra_cc
         flags_hip += flags_extra_hip
@@ -1016,7 +1091,7 @@ def build_module(
                         "error:",
                         "\033[31merror:\033[0m",
                         "-->".join(traceback.format_exception(*sys.exc_info())),
-                        flags=re.I,
+                        flags=re.IGNORECASE,
                     ),
                 )
             )
@@ -1048,7 +1123,7 @@ def _get_ck_exclude_modules():
     try:
         with open(cfg_path, "r", encoding="utf-8") as f:
             config_data = json.load(f)
-    except Exception:
+    except Exception:  # noqa: BLE001
         config_data = {}
 
     # Pattern-matched CK modules
@@ -1072,6 +1147,7 @@ def _get_ck_exclude_modules():
         "module_cache",
         "module_fused_qk_norm_mrope_cache_quant_shuffle",
         "module_fused_qk_norm_rope_cache_quant_shuffle",
+        "module_inverse_rope_group_quant",
         "module_mla_metadata",
         "module_mla_reduce",
         "module_moe_asm",
@@ -1102,7 +1178,9 @@ def _get_ck_exclude_modules():
     return ck_modules
 
 
-def get_args_of_build(ops_name: str, exclude=[]):
+def get_args_of_build(ops_name: str, exclude=None):
+    if exclude is None:
+        exclude = []
     d_opt_build_args = {
         "srcs": [],
         "md_name": "",
@@ -1136,7 +1214,11 @@ def get_args_of_build(ops_name: str, exclude=[]):
                 for idx, el in enumerate(val):
                     if isinstance(el, str):
                         if "torch" in el:
-                            import torch as torch
+                            # Bound solely for the eval() below: these config
+                            # strings can reference torch (e.g.
+                            # torch.utils.cmake_prefix_path). Static analysis
+                            # cannot see that use, hence the noqa.
+                            import torch  # noqa: F401
                         val[idx] = eval(el)
                 d_ops[k] = val
             elif isinstance(val, str):
@@ -1169,28 +1251,32 @@ def get_args_of_build(ops_name: str, exclude=[]):
                     "blob_gen_cmd": [],
                 }
                 # traverse opts
-                for ops_name, d_ops in data.items():
+                for op_name, d_ops in data.items():
                     # Cannot contain tune ops
-                    if ops_name.endswith("tune"):
+                    if op_name.endswith("tune"):
                         continue
                     # exclude
-                    if ops_name in exclude:
+                    if op_name in exclude:
                         continue
                     single_ops = convert(d_ops)
                     # exclude experimental ops if AITER_ENABLE_EXPERIMENTAL is not set
-                    if not is_experimental_enabled():
-                        if single_ops.get("is_experimental", False):
-                            continue
+                    if not is_experimental_enabled() and single_ops.get(
+                        "is_experimental", False
+                    ):
+                        continue
                     d_single_ops = {
-                        "md_name": ops_name,
+                        "md_name": op_name,
                         "srcs": single_ops["srcs"],
                         "flags_extra_cc": single_ops["flags_extra_cc"],
                         "flags_extra_hip": single_ops["flags_extra_hip"],
+                        "extra_ldflags": single_ops["extra_ldflags"],
                         "extra_include": single_ops["extra_include"],
                         "blob_gen_cmd": single_ops["blob_gen_cmd"],
                         "third_party": single_ops["third_party"],
                     }
-                    for k in d_all_ops.keys():
+                    for (  # noqa: PLC0206  loop mutates d_all_ops[k] by key while reading single_ops[k]; .items() does not help
+                        k
+                    ) in d_all_ops:
                         if isinstance(single_ops[k], list):
                             d_all_ops[k] += single_ops[k]
                         elif isinstance(single_ops[k], str) and single_ops[k] != "":
@@ -1221,6 +1307,21 @@ def _is_union(origin):
     return origin is typing.Union or origin is types.UnionType
 
 
+# Per-parameter conversion kinds, resolved once per op from the type hints (see
+# _ensure_loaded) so the per-call loop is an int compare instead of a fresh
+# typing.get_origin/get_args round trip. _ARG_SCALAR covers int/float/anything
+# else: with c_func.argtypes declared, ctypes converts the raw Python value.
+(
+    _ARG_TENSOR,
+    _ARG_OPT_TENSOR,
+    _ARG_OPT_INT,
+    _ARG_OPT_STR,
+    _ARG_STR,
+    _ARG_BOOL,
+    _ARG_SCALAR,
+) = range(7)
+
+
 def _ctypes_call(func, fc_name, md_name):
     """Build a ctypes-based caller for a torch-free .so module.
 
@@ -1246,6 +1347,17 @@ def _ctypes_call(func, fc_name, md_name):
     import torch
 
     from ..utility.dtypes import aiter_tensor_t, torch_to_aiter
+
+    # Avoid constructing a Python Stream object on every ctypes invocation.
+    # Keep the public API fallback for torch versions without the private raw
+    # stream getter, and preserve the first tensor's device selection.
+    raw_stream = getattr(torch._C, "_cuda_getCurrentRawStream", None)
+    if raw_stream is None:
+
+        def raw_stream(device_index):
+            return torch.cuda.current_stream(device_index).cuda_stream
+
+    current_device = torch.cuda.current_device
 
     _cache = {}
     _arg_checked = False
@@ -1293,16 +1405,19 @@ def _ctypes_call(func, fc_name, md_name):
         ret_hint = _hints.get("return")
         ctypes_data_return = ctypes_status_mode and ret_hint is int
 
-        if ctypes_status_mode:
-            c_func.restype = ctypes.c_int
-        elif ret_hint is int:
+        if ctypes_status_mode or ret_hint is int:
             c_func.restype = ctypes.c_int
         elif ret_hint is float:
             c_func.restype = ctypes.c_float
         else:
             c_func.restype = None
 
+        # `argtypes` and `kinds` are produced by the SAME pass over the type
+        # hints, so the ctypes type a parameter is declared as and the branch
+        # caller() takes for it can never drift apart. Hints are static, so this
+        # runs once per op instead of on every call.
         argtypes = []
+        kinds = []
         has_tensor = False
         for pname in _sig.parameters:
             hint = _hints.get(pname)
@@ -1310,30 +1425,48 @@ def _ctypes_call(func, fc_name, md_name):
             type_args = typing.get_args(hint)
             if hint is torch.Tensor:
                 argtypes.append(ctypes.POINTER(aiter_tensor_t))
+                kinds.append(_ARG_TENSOR)
                 has_tensor = True
             elif _is_union(origin) and torch.Tensor in type_args:
                 argtypes.append(ctypes.POINTER(aiter_tensor_t))
+                kinds.append(_ARG_OPT_TENSOR)
                 has_tensor = True
             elif _is_union(origin) and int in type_args:
                 argtypes.append(ctypes.c_int64)
+                kinds.append(_ARG_OPT_INT)
             elif _is_union(origin) and str in type_args:
                 argtypes.append(ctypes.c_char_p)
+                kinds.append(_ARG_OPT_STR)
             elif hint is str:
                 argtypes.append(ctypes.c_char_p)
+                kinds.append(_ARG_STR)
             elif hint is bool:
                 argtypes.append(ctypes.c_int)
+                kinds.append(_ARG_BOOL)
             elif hint is int:
                 argtypes.append(ctypes.c_int64)
+                kinds.append(_ARG_SCALAR)
             elif hint is float:
                 argtypes.append(ctypes.c_float)
+                kinds.append(_ARG_SCALAR)
             else:
                 argtypes.append(ctypes.c_void_p)
+                kinds.append(_ARG_SCALAR)
         # hipStream_t: the caller always appends the current stream to the args, so the
         # argtypes must always declare it -- otherwise ctypes takes the variadic path
         # (ffi_prep_cif_var) for torch-free modules whose params are all non-tensor, which
         # fails on stricter libffi builds.
         argtypes.append(ctypes.c_void_p)  # hipStream_t
         c_func.argtypes = argtypes
+
+        # Positional fast path in caller(): with no *args/**kwargs/keyword-only
+        # parameters, the values are already in parameter order, so inspect's
+        # binding machinery has nothing to figure out. Anything else (kwargs,
+        # too few args) falls back to _sig.bind so error messages and binding
+        # semantics stay exactly as they were.
+        params = list(_sig.parameters.values())
+        fast_ok = all(p.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD for p in params)
+        empty = inspect.Parameter.empty
 
         _cache["lib"] = lib
         _cache["c_func"] = c_func
@@ -1342,6 +1475,17 @@ def _ctypes_call(func, fc_name, md_name):
         _cache["ctypes_status_mode"] = ctypes_status_mode
         _cache["ctypes_data_return"] = ctypes_data_return
         _cache["has_tensor"] = has_tensor
+        _cache["kinds"] = tuple(kinds)
+        _cache["names"] = tuple(_sig.parameters)
+        _cache["defaults"] = tuple(
+            None if p.default is empty else p.default for p in params
+        )
+        _cache["n_params"] = len(params)
+        _cache["n_required"] = sum(1 for p in params if p.default is empty)
+        _cache["fast_ok"] = fast_ok
+        # A NULL aiter_tensor_t* carries no state, so one instance is reused for
+        # every omitted Optional[Tensor] instead of allocating per call.
+        _cache["null_tensor"] = ctypes.POINTER(aiter_tensor_t)()
 
     def _check_args_before_convert(bound_args, hints):
         for pname, value in bound_args.items():
@@ -1388,12 +1532,11 @@ def _ctypes_call(func, fc_name, md_name):
                     raise TypeError(
                         f"{fc_name}: '{pname}' expects int, got {type(value).__name__}"
                     )
-            elif hint is float:
-                if not isinstance(value, (float, int)):
-                    raise TypeError(
-                        f"{fc_name}: '{pname}' expects float, "
-                        f"got {type(value).__name__}"
-                    )
+            elif hint is float and not isinstance(value, (float, int)):
+                raise TypeError(
+                    f"{fc_name}: '{pname}' expects float, "
+                    f"got {type(value).__name__}"
+                )
 
     def caller(*args, **kwargs):
         nonlocal _arg_checked
@@ -1408,55 +1551,69 @@ def _ctypes_call(func, fc_name, md_name):
             from ..test_common import log_args
 
             log_args(func, *args, **kwargs)
-        bound = _sig.bind(*args, **kwargs)
-        bound.apply_defaults()
+
+        kinds = _cache["kinds"]
+        n_params = _cache["n_params"]
+        n_args = len(args)
+        if (
+            _cache["fast_ok"]
+            and not kwargs
+            and _cache["n_required"] <= n_args <= n_params
+        ):
+            # Already in parameter order; only the omitted tail needs defaults.
+            defaults = _cache["defaults"]
+            values = args if n_args == n_params else args + defaults[n_args:]
+        else:
+            # kwargs, a missing required arg, or an exotic signature -- let
+            # inspect do the binding (and raise the usual TypeError).
+            bound = _sig.bind(*args, **kwargs)
+            bound.apply_defaults()
+            values = tuple(bound.arguments.values())
 
         if not _arg_checked:
-            _check_args_before_convert(bound.arguments, _hints)
+            _check_args_before_convert(dict(zip(_cache["names"], values)), _hints)
             _arg_checked = True
 
         c_args = []
         aiter_refs = []
         tensor_device = None
+        add_arg = c_args.append
+        keep_alive = aiter_refs.append
 
-        for pname, value in bound.arguments.items():
-            hint = _hints.get(pname)
-            origin = typing.get_origin(hint)
-            type_args = typing.get_args(hint)
+        null_tensor = _cache["null_tensor"]
 
-            if hint is torch.Tensor:
+        for kind, value in zip(kinds, values):
+            if kind == _ARG_SCALAR:
+                # int / float / anything else: c_func.argtypes drives the
+                # conversion, so the raw Python value goes straight through.
+                add_arg(value)
+            elif kind == _ARG_TENSOR:
                 if tensor_device is None:
-                    tensor_device = value.device
+                    tensor_device = value.get_device()
                 at = torch_to_aiter(value)
-                aiter_refs.append(at)
-                c_args.append(ctypes.byref(at))
-            elif _is_union(origin) and torch.Tensor in type_args:
+                keep_alive(at)
+                add_arg(ctypes.byref(at))
+            elif kind == _ARG_OPT_TENSOR:
                 if value is not None:
                     if tensor_device is None:
-                        tensor_device = value.device
+                        tensor_device = value.get_device()
                     at = torch_to_aiter(value)
-                    aiter_refs.append(at)
-                    c_args.append(ctypes.byref(at))
+                    keep_alive(at)
+                    add_arg(ctypes.byref(at))
                 else:
-                    c_args.append(ctypes.POINTER(aiter_tensor_t)())
-            elif _is_union(origin) and int in type_args:
-                c_args.append(value if value is not None else -1)
-            elif _is_union(origin) and str in type_args:
-                c_args.append(value.encode() if value is not None else None)
-            elif hint is str:
-                c_args.append(value.encode())
-            elif hint is bool:
-                c_args.append(1 if value else 0)
-            elif hint is int:
-                c_args.append(ctypes.c_int64(value))
-            elif hint is float:
-                c_args.append(ctypes.c_float(value))
-            else:
-                c_args.append(value)
+                    add_arg(null_tensor)
+            elif kind == _ARG_OPT_INT:
+                add_arg(value if value is not None else -1)
+            elif kind == _ARG_OPT_STR:
+                add_arg(value.encode() if value is not None else None)
+            elif kind == _ARG_STR:
+                add_arg(value.encode())
+            else:  # _ARG_BOOL
+                add_arg(1 if value else 0)
 
-        c_args.append(
-            ctypes.c_void_p(torch.cuda.current_stream(tensor_device).cuda_stream)
-        )
+        if tensor_device is None:
+            tensor_device = current_device()
+        c_args.append(ctypes.c_void_p(raw_stream(tensor_device)))
         if err_clear is not None:
             err_clear()
         ret = c_func(*c_args)
@@ -1482,11 +1639,46 @@ def _ctypes_call(func, fc_name, md_name):
     return caller
 
 
+_pybind_develop_hooks_cache = None
+
+
+def _pybind_develop_hooks():
+    """Everything the develop=True pybind path needs, resolved once.
+
+    All four are per-call on that path -- the converter runs once per tensor
+    argument -- and importing them inside the wrapper meant a sys.modules round
+    trip each time for names that never change. aiter.utility.dtypes imports back
+    into this module, so binding them at import time is not an option either.
+    """
+    global _pybind_develop_hooks_cache
+    if _pybind_develop_hooks_cache is None:
+        import torch
+
+        from ..utility.dtypes import torch_to_aiter_pybind
+
+        # Hands back the same handle as current_stream().cuda_stream without
+        # building the Python Stream object to carry it. Private, so fall back to
+        # the public spelling rather than assume a torch version floor.
+        raw_stream = getattr(torch._C, "_cuda_getCurrentRawStream", None)
+        if raw_stream is None:
+
+            def raw_stream(_device_index):
+                return torch.cuda.current_stream().cuda_stream
+
+        _pybind_develop_hooks_cache = (
+            torch_to_aiter_pybind,
+            torch.Tensor,
+            raw_stream,
+            torch.cuda.current_device,
+        )
+    return _pybind_develop_hooks_cache
+
+
 def compile_ops(
     _md_name: str,
-    fc_name: Optional[str] = None,
-    gen_func: Optional[Callable[..., dict[str, Any]]] = None,
-    gen_fake: Optional[Callable[..., Any]] = None,
+    fc_name: str | None = None,
+    gen_func: Callable[..., dict[str, Any]] | None = None,
+    gen_fake: Callable[..., Any] | None = None,
     ffi_type: str = "pybind",
     develop: bool = False,
 ):
@@ -1510,8 +1702,10 @@ def compile_ops(
             func.arg_checked = False
 
             @functools.wraps(func)
-            def wrapper(*args, custom_build_args={}, **kwargs):
+            def wrapper(*args, custom_build_args=None, **kwargs):
 
+                if custom_build_args is None:
+                    custom_build_args = {}
                 md_name = _md_name
                 try:
                     module = None
@@ -1616,17 +1810,25 @@ def compile_ops(
                             aiter_tensor_t = get_module(
                                 "module_aiter_core"
                             ).aiter_tensor_t
-                        except Exception:
+                        except (
+                            Exception  # noqa: BLE001  blanket catch is intentional here
+                        ):
                             aiter_tensor_t = object
+                        # Every name the doc_str rewriting above can emit has to
+                        # be bound here. `from aiter import *` in the exec below
+                        # is not a reliable source: it only ever supplied these
+                        # by accident, via submodules that happened to do
+                        # `from typing import ...` at module scope.
                         namespace = {
-                            "List": List,
+                            "List": list,
+                            "Tuple": tuple,
                             "Optional": Optional,
                             "torch": torch,
                             "typing": typing,
                             "aiter_tensor_t": aiter_tensor_t,
                         }
 
-                        exec(
+                        exec(  # noqa: S102
                             f"from aiter import*\ndef {doc_str}: pass",
                             namespace,
                         )
@@ -1702,7 +1904,7 @@ def compile_ops(
                                 return int
 
                             origin = typing.get_origin(hint)
-                            if origin in (list, List):
+                            if origin in (list, list):
                                 return (
                                     "list",
                                     tuple(
@@ -1756,27 +1958,20 @@ def compile_ops(
                     log_args(func, *args, **kwargs)
                 # develop=True: torch.Tensor -> pybind aiter_tensor_t before C++ (activation, CAR, ...).
                 if develop:
-                    import torch
-
-                    from ..utility.dtypes import torch_to_aiter_pybind
+                    convert, tensor_cls, raw_stream, current_device = (
+                        _pybind_develop_hooks()
+                    )
 
                     args = tuple(
-                        torch_to_aiter_pybind(a) if isinstance(a, torch.Tensor) else a
-                        for a in args
+                        convert(a) if isinstance(a, tensor_cls) else a for a in args
                     )
-                    kwargs = {
-                        k: (
-                            torch_to_aiter_pybind(v)
-                            if isinstance(v, torch.Tensor)
-                            else v
-                        )
-                        for k, v in kwargs.items()
-                    }
+                    if kwargs:
+                        kwargs = {
+                            k: convert(v) if isinstance(v, tensor_cls) else v
+                            for k, v in kwargs.items()
+                        }
 
-                if develop:
-                    module._set_current_hip_stream(
-                        torch.cuda.current_stream().cuda_stream
-                    )
+                    module._set_current_hip_stream(raw_stream(current_device()))
                 return op(*args, **kwargs)
 
             @torch_compile_guard(device="cuda", gen_fake=gen_fake, calling_func_=func)

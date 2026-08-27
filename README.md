@@ -22,6 +22,7 @@
 
 ## News
 
+- **[2026/07]** [Kimi-K3 support](https://github.com/ROCm/aiter/pull/4397) — FlyDSL SiTUv2 fused-MoE kernels, strided grouped-topk router, and tuned GEMM/fused-MoE configs (BF16, A8W4, FP4) for Kimi-K3
 - **[2026/04]** [AITER v0.1.12.post1 Released](https://github.com/ROCm/aiter/releases/tag/v0.1.12.post1) — patch on v0.1.12 with GEMM and scale masking accuracy fixes; v0.1.12 highlights include blockwise sparse Sage Attention, fused gated RMSNorm+group quantization, etc., plus MI355X tuned configs for Kimi-K2.5 and DeepSeek-V3
 - **[2026/02]** [JAX-AITER: Bringing AMD's Optimized AI Kernels to JAX on ROCm](https://rocm.blogs.amd.com/software-tools-optimization/jax-aiter/README.html)
 - **[2026/02]** [Beyond Porting: How vLLM Orchestrates High-Performance Inference on AMD ROCm](https://blog.vllm.ai/2026/02/27/rocm-attention-backend.html)
@@ -69,6 +70,11 @@ AITER is the **default kernel backend for LLM inference on AMD GPUs**, integrate
 | AMD Instinct MI325X | gfx942 (CDNA3) | Fully supported |
 | AMD Instinct MI350 | gfx950 (CDNA4) | Supported |
 | AMD Instinct MI355X | gfx950 (CDNA4) | Supported |
+| AMD Pro W7900 | gfx1100 (RDNA3) | Experimental<sup>1</sup> |
+| AMD AI Max and Max Pro 400/300 Series | gfx1151 (RDNA3.5) | Experimental<sup>1</sup> |
+| AMD Radeon AI PRO R9700 | gfx1201 (RDNA4) | Experimental<sup>1</sup> |
+
+<sup>1</sup> On RDNA, Triton and most FlyDSL kernels run, as do most HIP kernels (norm, RoPE, quant, activation, plus some GEMM/attention). Most CK and ASM kernels are CDNA-only.
 
 ## Operators
 

@@ -1,19 +1,21 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 import pytest
-import triton
 import torch
+import triton
+
+from aiter.ops.shuffle import shuffle_scale, shuffle_weight
 from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import (
     gemm_afp4wfp4 as triton_gemm_afp4wfp4,
+)
+from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import (
     gemm_afp4wfp4_preshuffle,
 )
 from aiter.ops.triton.gluon.gemm_afp4wfp4 import (
     gemm_afp4wfp4 as gluon_gemm_afp4wfp4_CDNA4,
 )
-
-import aiter.ops.triton.utils._triton.arch_info as arch_info
+from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.types import str_to_torch_dtype
-from aiter.ops.triton.utils.shuffle import shuffle_weight, shuffle_scale_gemm
 
 DEVICE_ARCH = arch_info.get_arch()
 
@@ -77,33 +79,27 @@ def generate_gemm_afp4wfp4_inputs(
     x_scales = x_scales.T
     w_scales = w_scales.T
     if shuffle_scales_fg:
-        if DEVICE_ARCH == "gfx1250":
-            if M >= 32:
-                x_scales_shuffled = shuffle_scale_gemm(
-                    x_scales, arch="gfx1250", preshuffle_factor=16, scale_kwidth=4
-                )
-            else:
-                x_scales_shuffled = x_scales.contiguous()
-            w_scales_shuffled = shuffle_scale_gemm(
-                w_scales, arch="gfx1250", preshuffle_factor=16, scale_kwidth=4
-            )
+        # Arch-independent aiter.ops.shuffle.shuffle_scale layout (shared with
+        # the CK/asm GEMMs): 32-row stripes of 8 k-groups, returned flat as
+        # (pad256(rows), pad8(K//32)). The kernels index one row per 32-row
+        # stripe, so view it as (pad256(rows)//32, pad8(K//32)*32) -- taken off
+        # the shuffled tensor's own shape, which is padded on both dims.
+        # M < 32 stays un-shuffled (M, K//32) row-major.
+        if M >= 32:
+            xs = shuffle_scale(x_scales[:M])
+            x_scales_shuffled = xs.view(-1, xs.shape[1] * 32)
         else:
-            if M >= 32:
-                x_scales_shuffled = shuffle_scale_gemm(
-                    x_scales, arch="gfx950", preshuffle_factor=32, scale_kwidth=8
-                )
-            else:
-                x_scales_shuffled = x_scales.contiguous()
-            w_scales_shuffled = shuffle_scale_gemm(
-                w_scales, arch="gfx950", preshuffle_factor=32, scale_kwidth=8
-            )
+            x_scales_shuffled = x_scales[:M].contiguous()
+        ws = shuffle_scale(w_scales)
+        w_scales_shuffled = ws.view(-1, ws.shape[1] * 32)
     else:
-        x_scales_shuffled = x_scales
+        x_scales_shuffled = x_scales[:M]
         w_scales_shuffled = w_scales
 
     if shuffle_weight_fg:
-        # shuffle_weight returns the (N, K) shuffled weight on both arches; reshape
-        # to the (N//16, K*16) layout the kernel consumes
+        # aiter.ops.shuffle.shuffle_weight (layout=(16, 16)) returns the (N, K)
+        # shuffled weight, byte-identical on both arches; reshape to the
+        # (N//16, K*16) layout the kernel consumes
         w_shuffed = shuffle_weight(w).reshape(w.shape[0] // 16, w.shape[1] * 16)
     else:
         w_shuffed = w
@@ -121,7 +117,7 @@ def generate_gemm_afp4wfp4_inputs(
         w_shuffed,
         x_scales[:M],
         w_scales,
-        x_scales_shuffled[:M],
+        x_scales_shuffled,
         w_scales_shuffled,
         out_dtype,
         y,
@@ -136,6 +132,7 @@ def get_x_vals():
     x_vals += [(v, 2112, 7168) for v in (128, 192, 4096, 8000)]
     x_vals += [(v, 8192, 512) for v in (128, 192, 4096, 8000)]
     x_vals += [(2048, 8192, 4096)]
+    x_vals += [(1, 256, 512), (16, 256, 256), (31, 7168, 4608)]  # M < 32 case
     return x_vals
 
 
@@ -228,7 +225,7 @@ def test_gemm_afp4_wfp4(
         w_scales,
         x_scales_triton,
         w_scales_triton,
-        out_dtype,
+        _out_dtype,
         y,
     ) = generate_gemm_afp4wfp4_inputs(
         M,
@@ -308,7 +305,7 @@ def test_gemm_mxfp4_preshuffled_gfx1250(
         w_scales,
         x_scales_shuffled,
         w_scales_shuffled,
-        out_dtype,
+        _out_dtype,
         y,
     ) = generate_gemm_afp4wfp4_inputs(
         M,

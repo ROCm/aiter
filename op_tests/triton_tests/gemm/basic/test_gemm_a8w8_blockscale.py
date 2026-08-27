@@ -1,8 +1,11 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import torch
 import pytest
+import torch
+import torch.nn.functional as F
+
+from aiter.ops.shuffle import shuffle_weight
 from aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale import (
     gemm_a8w8_blockscale,
     gemm_a8w8_blockscale_preshuffle,
@@ -10,11 +13,8 @@ from aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale import (
 from aiter.ops.triton.gluon.gemm_a8w8_blockscale import (
     gemm_a8w8_blockscale as gluon_gfx950_gemm_a8w8_blockscale,
 )
-from aiter.ops.triton.utils.types import str_to_torch_dtype, get_fp8_dtypes
-import torch.nn.functional as F
-
-from aiter.ops.shuffle import shuffle_weight
-import aiter.ops.triton.utils._triton.arch_info as arch_info
+from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.types import get_fp8_dtypes, str_to_torch_dtype
 
 block_shape = (128, 128)
 DEVICE_ARCH = arch_info.get_arch()
@@ -67,6 +67,10 @@ def get_x_vals():
     x_vals += [(v, 7168, 768) for v in (1, 32, 64, 128, 256, 1024)]
     x_vals += [(v, 2048, 7168) for v in (1, 32, 64, 128, 256, 1024)]
     x_vals += [(v, 16384, 1536) for v in (1, 32, 64, 128, 256, 1024)]
+    x_vals += [(v, 65536, 1536) for v in (1, 32, 64, 128, 256, 1024)]
+    x_vals += [(v, 7168, 16384) for v in (1, 32, 64, 128, 256, 1024)]
+    x_vals += [(v, 6144, 7168) for v in (1, 32, 64, 128, 256, 1024)]
+    x_vals += [(v, 7168, 3072) for v in (1, 32, 64, 128, 256, 1024)]
     return x_vals
 
 
@@ -156,11 +160,10 @@ def test_gemm(dtype, M, N, K, layout, output, backend, shuffle):
         elif DEVICE_ARCH not in ("gfx950", "gfx1250"):
             pytest.skip("Gluon implementation requires gfx950 or gfx1250.")
 
-    if shuffle:
-        if N % 16 > 0 or K % 32 > 0:
-            pytest.skip(
-                "N has to be multiple of 16 and K has to be multiple of 32 for preshuffle cases"
-            )
+    if shuffle and (N % 16 > 0 or K % 32 > 0):
+        pytest.skip(
+            "N has to be multiple of 16 and K has to be multiple of 32 for preshuffle cases"
+        )
 
     if backend not in ("gluon",) and K < 512:
         pytest.skip("Small-K shapes exercise gluon-only paths.")

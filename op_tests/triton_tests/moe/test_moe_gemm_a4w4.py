@@ -2,19 +2,21 @@
 # original code https://github.com/triton-lang/triton/blob/main/python/triton_kernels/tests/test_matmul.py
 
 from dataclasses import dataclass, fields
+
 import pytest
 import torch
 
-# routing utilities
-from aiter.ops.triton.moe.moe_routing.routing import routing
+from aiter.ops.shuffle import moe_shuffle_scale, moe_shuffle_weight
 
 # matmul utilities
 from aiter.ops.triton.moe.moe_op_gemm_a4w4 import (
-    mxfp4_quant,
     moe_gemm_a4w4,
     moe_gemm_torch,
+    mxfp4_quant,
 )
-from aiter.ops.triton.utils.shuffle import shuffle_scale_moe
+
+# routing utilities
+from aiter.ops.triton.moe.moe_routing.routing import routing
 
 # numerics utilities
 from aiter.ops.triton.moe.quant_moe import (
@@ -23,7 +25,30 @@ from aiter.ops.triton.moe.quant_moe import (
 )
 
 # target-specific utilities
-from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton.utils._triton.arch_info import get_arch, is_fp4_avail
+from aiter.ops.triton.utils.shuffle import moe_weight_decode_view, shuffle_scale_moe
+
+
+def preshuffle_moe_weight(w: torch.Tensor) -> torch.Tensor:
+    """``(E, K, N)`` -> the gfx1250 WMMA TDM view ``(E, K*16, N//16)``.
+
+    ``moe_shuffle_weight`` takes the ``(E, N, K)`` MoE weight orientation and
+    returns the shuffled buffer in that same shape; ``moe_weight_decode_view``
+    then reinterprets it (zero-copy) as the flattened view the kernel loads.
+    """
+    return moe_weight_decode_view(moe_shuffle_weight(w.transpose(-1, -2)))
+
+
+def preshuffle_moe_wscale(s: torch.Tensor) -> torch.Tensor:
+    """``(E, K//32, N)`` B-scale -> gfx1250 n32k4 layout, same orientation back.
+
+    ``moe_shuffle_scale`` is the n32k4 tile (preshuffle 32, scale kwidth 4) and
+    takes the ``(E, N, K//32)`` orientation, so transpose in and back out. This
+    is the kwidth-4 counterpart of ``shuffle_scale_moe(..., scale_kwidth=4)``
+    and must stay in step with ``SCALE_KWIDTH`` in the gfx1250 gluon kernels.
+    """
+    return moe_shuffle_scale(s.transpose(-1, -2)).transpose(-1, -2)
+
 
 # ---------------
 # initialize data
@@ -136,21 +161,17 @@ def assert_close(ref, tri, maxtol=None, rmstol=None, description="--", verbose=T
 
     if verbose:
         print(
-            "%s maximum relative error = %s (threshold = %s)"
-            % (description, max_err, maxtol)
+            f"{description} maximum relative error = {max_err} (threshold = {maxtol})"
         )
-        print(
-            "%s RMS relative error = %s (threshold = %s)"
-            % (description, rms_err, rmstol)
-        )
+        print(f"{description} RMS relative error = {rms_err} (threshold = {rmstol})")
 
     if max_err > maxtol:
         bad_idxs = torch.nonzero(rel_err > maxtol)
         num_nonzero = bad_idxs.size(0)
         bad_idxs = bad_idxs[:1000]
         print(
-            "%d / %d mismatched elements (shape = %s) at coords %s"
-            % (num_nonzero, rel_err.numel(), tuple(rel_err.shape), bad_idxs.tolist())
+            f"{num_nonzero} / {rel_err.numel()} mismatched elements "
+            f"(shape = {tuple(rel_err.shape)}) at coords {bad_idxs.tolist()}"
         )
 
         bad_idxs = bad_idxs.unbind(-1)
@@ -174,6 +195,7 @@ class Case:
     n_expts_tot: int = 1
     n_expts_act: int = 1
     hbm_swizzling: bool = False
+    preshuffle_weights: bool = False
 
 
 @pytest.mark.parametrize(
@@ -198,6 +220,12 @@ class Case:
             Case(32, 6144, 3072, 128, 4, hbm_swizzling=True),
             Case(4096, 3072, 3072, 128, 4),
             Case(8192, 7168, 4096, 256, 8),
+            # gfx1250 gluon preshuffled weights
+            Case(16, 4096, 7168, 256, 8, hbm_swizzling=True, preshuffle_weights=True),
+            Case(16, 512, 7168, 256, 8, hbm_swizzling=True, preshuffle_weights=True),
+            Case(16, 1024, 1024, 128, 4, preshuffle_weights=True),
+            Case(1024, 7168, 2048, 256, 8, hbm_swizzling=True, preshuffle_weights=True),
+            Case(256, 1024, 1024, 8, 4, preshuffle_weights=True),
         ]
     ],
 )
@@ -212,7 +240,7 @@ class Case:
 )
 @pytest.mark.parametrize("has_y_gammas", [False, True])
 @pytest.mark.parametrize("apply_swiglu", [False, True])
-@pytest.mark.parametrize("fused_quant", [False, True])
+@pytest.mark.parametrize("backend", ["gluon", "triton"])
 def test_op(
     m,
     n,
@@ -221,23 +249,45 @@ def test_op(
     do_scatter,
     has_y_gammas,
     apply_swiglu,
-    fused_quant,
     n_expts_tot,
     n_expts_act,
     hbm_swizzling,
+    preshuffle_weights,
+    backend,
     device="cuda",
 ):
-    if get_arch() != "gfx950":
-        pytest.skip("FP4 kernels are not supported on MI300.")
+    if get_arch() != "gfx950" and get_arch() != "gfx1250":
+        pytest.skip("Kernel not supported on this GPU.")
+    if not is_fp4_avail():
+        pytest.skip(f"FP4 kernels are not supported on {get_arch()}.")
+
+    if backend == "gluon" and get_arch() != "gfx1250":
+        pytest.skip(f"Gluon backend requires gfx1250, got {get_arch()}.")
     if hbm_swizzling:
-        if n % 32 != 0 or k % (32 * 8) != 0:
+        if get_arch() == "gfx950" and (n % 32 != 0 or k % (32 * 8) != 0):
             pytest.skip(
-                f"Shape {m}x{n}x{k} is not supported for scale swizzling on AMD GPU"
+                f"Shape {m}x{n}x{k} is not supported for scale swizzling on gfx950."
+            )
+        # gfx1250 uses the n32k4 layout (scale kwidth 4), so K only needs
+        # K//32 divisible by 4; gfx950 still needs 8.
+        if get_arch() == "gfx1250" and (n % 32 != 0 or k % (32 * 4) != 0):
+            pytest.skip(
+                f"Shape {m}x{n}x{k} is not supported for scale swizzling on gfx1250."
+            )
+
+    if preshuffle_weights:
+        if get_arch() != "gfx1250":
+            pytest.skip("Preshuffling weights is only supported on gfx1250")
+        if backend == "triton":
+            pytest.skip("Preshuffled weights are decoded by the gluon kernel only")
+        if n % 16 != 0 or (k // 2) % 32 != 0:
+            pytest.skip(
+                f"Preshuffling weights requires n divisible by 16 and k//2 divisible "
+                f"by 32, got n={n}, k//2={k // 2}"
             )
 
     torch.manual_seed(0)
 
-    act_mxfp4 = "mxfloat4_e2m1"
     weight_mxfp4 = "mxfloat4_e2m1"
     weight_dtype_str = weight_mxfp4[2:]
 
@@ -264,16 +314,23 @@ def test_op(
     w_tri, w_scale_tri = downcast_to_mxfp(w_tri, weight_dtype, axis=1)
     w_ref = upcast_from_mxfp(w_tri, w_scale_tri, torch.bfloat16, axis=1)
     if hbm_swizzling:
-        swizzle_mx_scale = "CDNA4_SCALE"
-        w_scale_tri = shuffle_scale_moe(
-            w_scale_tri, arch="gfx950", preshuffle_factor=32, scale_kwidth=8
-        )
+        if get_arch() == "gfx1250":
+            swizzle_mx_scale = "GFX1250_SCALE"
+            w_scale_tri = preshuffle_moe_wscale(w_scale_tri)
+        elif get_arch() == "gfx950":
+            swizzle_mx_scale = "CDNA4_SCALE"
+            w_scale_tri = shuffle_scale_moe(
+                w_scale_tri, arch="gfx950", preshuffle_factor=32, scale_kwidth=8
+            )
+        else:
+            assert False, "Unsupported architecture"
     else:
         swizzle_mx_scale = None
+    if preshuffle_weights:
+        w_tri = preshuffle_moe_weight(w_tri)
 
     x_tri, x_mx_scales_tri = mxfp4_quant(x_tri)
     x_ref = upcast_from_mxfp(x_tri, x_mx_scales_tri, torch.bfloat16, axis=-1)
-    x_static_scale = None
     out_dtype = torch.bfloat16
     maxtol = None
     rmstol = None
@@ -281,26 +338,22 @@ def test_op(
     ref_y = moe_gemm_torch(
         x_ref, w_ref, bias_ref, rdata, gindx, sindx, gammas, apply_swiglu
     )
-    if not act_mxfp4 and fused_quant:
-        quant_static_scale = ref_y.abs().max().float() / 448.0
-    else:
-        quant_static_scale = None
+
+    # run kernel
     tri_y = moe_gemm_a4w4(
         x_tri,
         w_tri,
         x_mx_scales_tri,
         w_scale_tri,
-        x_static_scale,
-        quant_static_scale,
         bias_tri,
         rdata,
         gindx,
         sindx,
         gammas,
         swizzle_mx_scale,
+        preshuffle_weights,
         out_dtype,
         apply_swiglu,
+        backend=backend,
     )
-    if not act_mxfp4 and fused_quant:
-        tri_y = (tri_y.float() * quant_static_scale).to(ref_y.dtype)
     assert_close(ref_y, tri_y, maxtol=maxtol, rmstol=rmstol)

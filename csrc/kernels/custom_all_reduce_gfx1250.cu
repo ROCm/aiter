@@ -51,13 +51,55 @@ fptr_t init_custom_ar(int64_t meta_ptr,
                                                fully_connected);
 }
 
+// IPC transport init (ROCm >= 7.15): peer meta buffers are shared via hipIpc
+// handles+offsets (like the old-arch path) instead of VMM-exported fds. The
+// gfx1250 kernel is unchanged.
+fptr_t init_custom_ar_ipc(int64_t meta_ptr,
+                          int64_t rank_data_ptr,
+                          int64_t rank_data_sz,
+                          const std::vector<int64_t>& ipc_handle_ptrs,
+                          const std::vector<int64_t>& offsets,
+                          int64_t rank,
+                          bool fully_connected)
+{
+    int world_size = offsets.size();
+    if(world_size > 4)
+        throw std::invalid_argument("gfx1250 custom allreduce: world size > 4 is not supported");
+    if(world_size % 2 != 0)
+        throw std::invalid_argument("Odd num gpus is not supported for now");
+    if(world_size != (int)ipc_handle_ptrs.size())
+        throw std::invalid_argument("handles length should equal to offsets length");
+    if(rank < 0 || rank >= world_size)
+        throw std::invalid_argument("invalid rank passed in");
+
+    hipIpcMemHandle_t ipc_handles[4];
+    for(int i = 0; i < world_size; i++)
+    {
+        std::memcpy(&ipc_handles[i], (void*)ipc_handle_ptrs[i], sizeof(hipIpcMemHandle_t));
+    }
+    return (fptr_t) new aiter::CustomAllreduce(reinterpret_cast<aiter::Signal*>(meta_ptr),
+                                               (void*)rank_data_ptr,
+                                               rank_data_sz,
+                                               ipc_handles,
+                                               offsets,
+                                               rank,
+                                               fully_connected);
+}
+
 void dispose(fptr_t _fa)
 {
     auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
     delete fa;
 }
 
-int64_t meta_size() { return sizeof(aiter::Signal); }
+// Shared meta buffer = Signal struct + LL staging scratch appended after it.
+// The LL fast path derives each peer's scratch base as (peer meta) +
+// kLLScratchOffset, reusing the existing cross-rank meta exchange. The whole
+// region is zero-initialized by the caller (which also resets the LL flags).
+int64_t meta_size()
+{
+    return (int64_t)(aiter::kLLScratchOffset + aiter::llScratchBytes());
+}
 
 // ---- Internal dispatch helper ----
 
@@ -179,6 +221,38 @@ void register_output_buffer(fptr_t _fa,
 {
     auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
     fa->register_output_buffer(all_ptrs, (void*)self_ptr);
+}
+
+// ---- Buffer registration (IPC handle-based, ROCm >= 7.15) ----
+
+void register_input_buffer_ipc(fptr_t _fa,
+                               int64_t self_ptr,
+                               const std::vector<int64_t>& ipc_handle_ptrs,
+                               const std::vector<int64_t>& offsets)
+{
+    auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
+    int world_size = ipc_handle_ptrs.size();
+    std::vector<hipIpcMemHandle_t> ipc_handles(world_size);
+    for(int i = 0; i < world_size; i++)
+    {
+        std::memcpy(&ipc_handles[i], (void*)ipc_handle_ptrs[i], sizeof(hipIpcMemHandle_t));
+    }
+    fa->register_input_buffer(ipc_handles.data(), offsets.data(), (void*)self_ptr);
+}
+
+void register_output_buffer_ipc(fptr_t _fa,
+                                int64_t self_ptr,
+                                const std::vector<int64_t>& ipc_handle_ptrs,
+                                const std::vector<int64_t>& offsets)
+{
+    auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
+    int world_size = ipc_handle_ptrs.size();
+    std::vector<hipIpcMemHandle_t> ipc_handles(world_size);
+    for(int i = 0; i < world_size; i++)
+    {
+        std::memcpy(&ipc_handles[i], (void*)ipc_handle_ptrs[i], sizeof(hipIpcMemHandle_t));
+    }
+    fa->register_output_buffer(ipc_handles.data(), offsets.data(), (void*)self_ptr);
 }
 
 int64_t get_graph_buffer_count(fptr_t _fa)

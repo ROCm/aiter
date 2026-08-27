@@ -1,16 +1,17 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-import os
-import torch
 import argparse
-import aiter
-from aiter import dtypes
-from aiter.fused_moe import fused_topk, fused_moe
-from aiter.ops.shuffle import shuffle_weight
-import mori
 import multiprocessing as mp
-from aiter import get_hip_quant
+import os
+
+import mori
+import torch
+
+import aiter
+from aiter import dtypes, get_hip_quant
+from aiter.fused_moe import fused_moe, fused_topk
+from aiter.ops.shuffle import shuffle_weight
 from aiter.test_common import checkAllclose, run_perftest
 
 
