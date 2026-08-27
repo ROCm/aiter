@@ -310,8 +310,8 @@ def get_meta_param(
         #   - tg_factor (caller-supplied): the v4 nm wrapper passes
         #     ceil(num_heads/64) so gqa=128 (2 head-group WGs) is counted as 2x.
         #   - wg_per_split (auto, from main): qh128 decode on gfx1250 launches 2
-        #     head-group workgroups per (batch, split) along z (mirrors gdz =
-        #     kv_split*2 in asm_mla.cu).
+        #     head-group workgroups per (batch, split) along x (mirrors gdx = 2
+        #     for gqa=128 in asm_mla.cu, where z stays the plain kv split id).
         # Take the max so either path applies; for V3 callers (tg_factor=1) the
         # gfx1250 auto-rule still kicks in, and for v4 callers the explicit
         # tg_factor governs.
