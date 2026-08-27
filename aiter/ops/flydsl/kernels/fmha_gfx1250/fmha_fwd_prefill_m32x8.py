@@ -904,8 +904,10 @@ def _core_attention(
 
             scf_if_dispatch(nxt < fx.Int32(n_tiles), _issue)
 
+        # Address VALU up front (no barrier dependency) so it overlaps the drain; only
+        # the async issue in _prefetch must stay after the barrier.
+        addr = _addr_phase()
         if warp_type == WarpType.LO_WARP:
-            addr = _addr_phase()
             _drain_barrier()
             k_values = k_mgr.load_k_to_reg(k_curr)
             _prefetch(addr)
@@ -913,11 +915,13 @@ def _core_attention(
             _named_barrier_pair(warp_idx)
         else:
             _drain_barrier()
-            addr = _addr_phase()
             _prefetch(addr)
             _named_barrier_pair(warp_idx)
             k_values = k_mgr.load_k_to_reg(k_curr)
             rocdl.s_wait_dscnt(0)
+
+        # Fence the drained K burst out of the WMMA stream (no wmma<-ds_load bubble).
+        rocdl.sched_barrier(0)
 
         # ---- GEMM1: S^T = K @ Q^T for this KV tile (== P^T pre-softmax); consumes the
         # pre-loaded k_values (K burst already drained by the preamble above). ----
@@ -1451,7 +1455,10 @@ def _ensure_thd_kernel(
             stream=stream,
         )
 
-    _launch.compile_hints["llvm_options"] = {"amdgpu-expert-scheduling-mode": ENABLE_SCHED_MODE2}
+    _launch.compile_hints["llvm_options"] = {
+        "amdgpu-expert-scheduling-mode": ENABLE_SCHED_MODE2,
+        # "amdgpu-sched-strategy": "coexec",  # gfx1250 co-exec sched; revisit after named barrier
+    }
     _launch.compile_hints["waves_per_eu"] = 2
     _launch_fns[key] = _launch
 
@@ -1540,7 +1547,10 @@ def _ensure_bshd_kernel(
             stream=stream,
         )
 
-    _launch.compile_hints["llvm_options"] = {"amdgpu-expert-scheduling-mode": ENABLE_SCHED_MODE2}
+    _launch.compile_hints["llvm_options"] = {
+        "amdgpu-expert-scheduling-mode": ENABLE_SCHED_MODE2,
+        # "amdgpu-sched-strategy": "coexec",  # gfx1250 co-exec sched; revisit after named barrier
+    }
     _launch.compile_hints["waves_per_eu"] = 2
     _launch_fns[key] = _launch
 
