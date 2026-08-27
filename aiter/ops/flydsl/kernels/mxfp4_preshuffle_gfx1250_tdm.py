@@ -404,6 +404,46 @@ def launch_gemm_a8w4_tdm(
         )
         tile_map = fx.recast_iter(_i32_ptr, arg_m_tile_map)
 
+        # Hoisted out of ``run_tile``: only one SharedAllocator is allowed per
+        # kernel, and the psum staging below needs to allocate from it before the
+        # persistent tile loop. ARENA_B is still allocated FIRST so the ring/C
+        # layout every offset below is computed against is bit-identical to before.
+        # static=False (one dyn-shared base) only where a second region is
+        # needed, so the non-scatter path keeps its per-leaf static allocation.
+        _smem = (
+            fx.SharedAllocator(static=False)
+            if const_expr(enable_ep_scatter)
+            else fx.SharedAllocator()
+        )
+        base_ptr = _smem.allocate(ARENA_B)._ptr
+
+        # Persistent mode re-runs the expert bisect for every tile it is assigned,
+        # and each bisect step is a global load whose address depends on the
+        # previous one -- an n_experts-deep SERIALIZED chain per tile, on the
+        # critical path before that tile can issue anything. The array is tiny
+        # (n_experts int32) and identical for every tile, so stage it in LDS once
+        # per workgroup and bisect against that: ds_read instead of a global
+        # round-trip. Non-persistently there is one tile, so the staging cost would
+        # not be amortised -- keep reading global there.
+        if const_expr(persistent_active):
+            _WG = num_waves * WAVE
+            _tm_lds = _smem.allocate(n_experts * 4)._ptr
+            _tm_base = fx.index_cast(T.index, fx.ptrtoint(_tm_lds))
+            _tm_ld, _tm_st = make_lds_copy_ops(32)
+            # One dword per thread, chunked so it holds for any n_experts vs
+            # workgroup size (96 experts vs 128 threads here: a single chunk).
+            for _c in range_constexpr((n_experts + _WG - 1) // _WG):
+                _e = tid + _c * _WG
+                if _e < n_experts:
+                    _tm_st(_tm_base, _e * 4, Vec.from_elements([tile_map[_e]], fx.Int32))
+            workgroup_barrier()
+
+        def _psum(idx):
+            """psum[idx] -- from the LDS copy in persistent mode, else global."""
+            if const_expr(persistent_active):
+                return _tm_ld(_tm_base, idx * 4)[0]
+            return tile_map[idx]
+
         def tile_coords(bx):
             """Swizzle + expert bisect for flat tile ``bx``.
 
@@ -442,13 +482,13 @@ def launch_gemm_a8w4_tdm(
             ):
                 mid = (lo + hi) >> 1
                 mid_clamped = (mid < n_experts - 1).select(mid, n_experts - 1)
-                go_right = tile_map[mid_clamped] <= blk_m
+                go_right = _psum(mid_clamped) <= blk_m
                 lo = go_right.select(mid + 1, lo)
                 hi = go_right.select(hi, mid)
             expert = lo
             # Per-expert A-data OOB: bound to the owning expert's valid-row
             mn_oob = (
-                tile_map[(expert < n_experts).select(expert, n_experts - 1)] - blk_m
+                _psum((expert < n_experts).select(expert, n_experts - 1)) - blk_m
             )
             return blk_m, blk_n, expert, mn_oob
 
@@ -469,15 +509,6 @@ def launch_gemm_a8w4_tdm(
             c_outer_off, c_inner_off, c_stride = blk_m64, blk_n64, i32_n
             SB_OUTER_STRIDE = K4
             sb_batch_off = eb64 * (N_SUPERS * K4)
-
-            # static=False (one dyn-shared base) only where a second region is
-            # needed, so the non-scatter path keeps its per-leaf static allocation.
-            _smem = (
-                fx.SharedAllocator(static=False)
-                if const_expr(enable_ep_scatter)
-                else fx.SharedAllocator()
-            )
-            base_ptr = _smem.allocate(ARENA_B)._ptr
 
             def ptr_to_idx(p):
                 return fx.index_cast(T.index, fx.ptrtoint(p))
@@ -1202,14 +1233,16 @@ def launch_gemm_a8w4_tdm(
                         # first) -- enough for the carry.
                         if const_expr(persistent_active):
                             if preloaded_tile:
-                                # A preloaded tile issues only `_missing_slot` fresh and
-                                # inherits the rest from the previous drain in an order
-                                # that need not put slot 0 first, so a partial count
-                                # cannot prove slot 0 landed: drain fully. This is cheap
-                                # -- the inherited slots already landed during the
-                                # previous tile's epilogue; only the one fresh slot is
-                                # awaited.
-                                tdm_ops.tensor_wait(0)
+                                # A preloaded tile inherits nb-1 slots from the previous
+                                # tile's drain tail, which issued them in ascending j --
+                                # so slot 0 is the OLDEST outstanding TDM and landing it
+                                # only needs the first TDM_PER ops retired, not a full
+                                # drain. Outstanding here, oldest first:
+                                #   slots 0..nb-2 (TDM_PER*(nb-1)) | prev C store (1)
+                                #   | _missing_slot just issued (TDM_PER)
+                                # so waiting to TDM_PER*(nb-1)+1 retires exactly slot 0
+                                # and keeps the rest overlapping this tile's mainloop.
+                                tdm_ops.tensor_wait(TDM_PER * (num_buffers - 1) + 1)
                             else:
                                 # The FIRST tile a CU runs has no predecessor to hide its
                                 # prologue, and issued every buffer in slot order. Land
@@ -1281,10 +1314,29 @@ def launch_gemm_a8w4_tdm(
                         # own operands), so the barrier only needs the cross-wave
                         # rendezvous -- skip the redundant s_wait_dscnt 0x0 by using the
                         # dscnt-free reuse_barrier() instead of pipeline_fence().
-                        tdm_ops.tensor_wait(
-                            TDM_PER
-                            * max(0, num_buffers - 1 - j - (1 if has_next else 0))
+                        # This tile's own buffers were all issued back in the
+                        # mainloop, so every next-tile prefetch the earlier drain
+                        # iterations issued (TDM_PER each, j of them) is strictly
+                        # NEWER than anything this fence waits on. Adding them to the
+                        # threshold therefore retires exactly the same set of OUR ops
+                        # while leaving the cross-tile prefetch in flight. Without
+                        # this the formula reaches 0 on the last iterations and
+                        # drains the very prefetches the tail just issued -- which
+                        # made the whole cross-tile pipeline a no-op.
+                        # The exemption is only valid when those ops actually exist,
+                        # and `has_next_tile` is runtime, so it has to be a branch:
+                        # on the last tile nothing extra is outstanding and a raised
+                        # threshold would under-wait our own buffers.
+                        _own_wait = TDM_PER * max(
+                            0, num_buffers - 1 - j - (1 if has_next else 0)
                         )
+                        if const_expr(persistent_active and j > 0):
+                            if has_next_tile:
+                                tdm_ops.tensor_wait(_own_wait + TDM_PER * j)
+                            else:
+                                tdm_ops.tensor_wait(_own_wait)
+                        else:
+                            tdm_ops.tensor_wait(_own_wait)
                         reuse_barrier()
                         if const_expr(enable_ep_scatter and j == num_buffers - 1):
                             # Last drain tile: issue the rowmap TDM here so it overlaps
@@ -1786,7 +1838,21 @@ def launch_gemm_a8w4_tdm(
                     fx.copy(atomC, src, gtC)
                     if const_expr(stage1_quant_out and stage1_act):
                         rocdl.s_wait_storecnt(0)
-                    tdm_ops.tensor_wait(0)
+                    # Draining to 0 here would also retire the next tile's
+                    # num_buffers-1 prefetches that the drain tail deliberately left
+                    # in flight -- the whole point of the cross-tile pipeline. This
+                    # store only has to land before the NEXT tile restages C into the
+                    # same LDS, and that tile's pre-staging fence
+                    # (pipeline_fence(TDM_PER*(num_buffers-1))) already retires it:
+                    # the store is older than that tile's own nb-1 prefetches, and
+                    # TDM ops retire in order. So leave it in flight here.
+                    if const_expr(persistent_active):
+                        if has_next_tile:
+                            pass
+                        else:
+                            tdm_ops.tensor_wait(0)
+                    else:
+                        tdm_ops.tensor_wait(0)
 
         if const_expr(persistent_active):
             # Carry the expert bisect across the tile loop. Iteration i has to
