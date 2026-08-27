@@ -181,7 +181,15 @@ def build_flash_attn_fp8_module(
 
         def _f32x4_to_fp8_word(f0, f1, f2, f3, rscale=None):
             if const_expr(rscale is None):
-                w0 = rocdl.cvt_pk_fp8_f32(T.i32, _raw(f0), _raw(f1), fx.Int32(0), False)
+                # The first convert has opsel=False, so it writes *both* halves
+                # of the result and the `old` operand is dead on arrival.
+                # Passing a literal 0 makes the backend materialise a
+                # `v_mov_b32 vX, 0` into a fresh VGPR ahead of every convert --
+                # 16 dead VALU per softmax phase, ~7% of that phase. undef
+                # lets the register allocator pick whatever is already live.
+                w0 = rocdl.cvt_pk_fp8_f32(
+                    T.i32, _raw(f0), _raw(f1), llvm.mlir_undef(T.i32), False
+                )
                 w1 = rocdl.cvt_pk_fp8_f32(T.i32, _raw(f2), _raw(f3), _raw(w0), True)
                 return w1
             # Chain through the `old` operand with opsel, exactly as the
