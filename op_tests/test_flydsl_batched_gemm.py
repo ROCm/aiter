@@ -35,7 +35,6 @@ import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.batched_gemm_op_a8w8 import batched_gemm_a8w8_mxscale_bpreshuffle
-from aiter.ops.flydsl.batched_gemm_a8w8_gfx1250 import run_bmm_a8w8_mxfp8_128_gfx1250
 from aiter.ops.flydsl.batched_gemm_mxfp4 import (
     flydsl_batched_gemm_a8w4_v2,
     preshuffle_a8w4_weight_mbn,
@@ -205,14 +204,10 @@ def test_batched_gemm(b, m, n, k, dtype, layout):
         x8, xs8 = quant_act_e8m0_128(o_mbn)
         w8, ws8 = quant_weight_e8m0_128(w_bnk)
         w8_shuf = shuffle_weight(w8)
-        y8 = torch.empty(m, b, n, dtype=dtype)
-        candidates["a8w8"] = lambda: run_bmm_a8w8_mxfp8_128_gfx1250(
-            x8, w8_shuf, xs8, ws8, y8
-        ).transpose(0, 1)
-        candidates["a8w8 auto"] = lambda: batched_gemm_a8w8_mxscale_bpreshuffle(
+        candidates["a8w8"] = lambda: batched_gemm_a8w8_mxscale_bpreshuffle(
             x8, w8_shuf, xs8, ws8, dtype=dtype
         ).transpose(0, 1)
-        nbytes["a8w8"] = nbytes["a8w8 auto"] = (
+        nbytes["a8w8"] = (
             m * b * k  # fp8 A
             + b * n * k  # fp8 B (twice the fp4 codes)
             + m * b * (k // BLOCK)  # A scale (per-token x 128)

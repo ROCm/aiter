@@ -146,17 +146,17 @@ def pick_bmm_kernel_name(b: int, m: int, n: int, k: int) -> str:
         )
     num_cu = get_cu_num() or 256
     want_tm = min(_MAX_HEURISTIC_TILE_M, max(16, 1 << (m - 1).bit_length()))
-    tall = min(c["tile_m"] for c in cands) > want_tm
 
     def rank(c):
         wgs = -(-m // c["tile_m"]) * (n // c["tile_n"]) * b
         tail = -(-wgs // num_cu) * num_cu - wgs
-        depth = (
-            (-c["tile_k"], -c["num_buffers"])
-            if tall
-            else (-c["num_buffers"], -c["tile_k"])
+        return (
+            tail,
+            abs(c["tile_m"] - want_tm),
+            -c["tile_n"],
+            -c["num_buffers"],
+            -c["tile_k"],
         )
-        return (tail, abs(c["tile_m"] - want_tm), -c["tile_n"]) + depth
 
     c = min(cands, key=rank)
     preload = (
