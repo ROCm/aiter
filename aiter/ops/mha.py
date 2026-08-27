@@ -3744,9 +3744,19 @@ def flash_attn_varlen_func(
             return False
         if cu_seqlens_q.numel() != 2 or cu_seqlens_k.numel() != 2:
             return False
-        if q.shape[0] != max_seqlen_q or k.shape[0] != max_seqlen_k:
+        # The K/V buffer may be LONGER than the sequence: vLLM's chunked-context path
+        # gathers into a fixed-size workspace (_CP_TOKENS_PER_ITER_ROCM) and then
+        # describes a shorter valid range, so requiring an exact match silently rejected
+        # every chunk that was not exactly workspace-sized. Accept an oversized K/V buffer
+        # and slice the valid prefix below. Q stays EXACT -- a varlen call returns one
+        # output row per query row, so an oversized Q buffer would silently drop rows.
+        #
+        # Slicing K/V to max_seqlen_k is safe because we already require exactly one
+        # sequence: by the varlen contract max_seqlen_k is the batch maximum, which for one
+        # sequence IS its length. Rows past it are stale workspace content, not attended.
+        if q.shape[0] != max_seqlen_q:
             return False
-        if v.shape[0] != max_seqlen_k:
+        if k.shape[0] < max_seqlen_k or v.shape[0] < max_seqlen_k:
             return False
         # flash_attn_func has no `out` parameter, and routing here with a caller
         # buffer would mean a hidden extra copy -- decline instead. (vLLM's extend
@@ -3768,11 +3778,12 @@ def flash_attn_varlen_func(
         return q.shape[-2] % k.shape[-2] == 0
 
     if can_route_single_seq_to_dense():
-        # unsqueeze is a view: a single packed sequence is already [S, H, D] contiguous.
+        # Q is exact; the K/V prefix slice and every unsqueeze are views -- a single
+        # packed sequence is a contiguous [S, H, D] prefix -- so this copies nothing.
         r = flash_attn_func(
             q.unsqueeze(0),
-            k.unsqueeze(0),
-            v.unsqueeze(0),
+            k[:max_seqlen_k].unsqueeze(0),
+            v[:max_seqlen_k].unsqueeze(0),
             dropout_p=dropout_p,
             softmax_scale=softmax_scale,
             causal=causal,
@@ -3781,6 +3792,8 @@ def flash_attn_varlen_func(
             return_lse=return_lse,
             sink_ptr=sink_ptr,
         )
+        # Output is [1, max_seqlen_q, H, D]; varlen callers expect [total_q, H, D], and
+        # total_q == max_seqlen_q for one sequence, so squeeze yields the right extent.
         if return_lse:
             dense_out, lse = r[0], r[1]
             # dense lse is [B, H, S]; varlen callers expect [H, total_q]
