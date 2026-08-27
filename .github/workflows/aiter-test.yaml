@@ -4,7 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
+    types: [opened, synchronize, reopened, ready_for_review, labeled]
     branches: [main]  # Triggers on PRs targeting `main`
 
   workflow_dispatch:
@@ -13,7 +13,8 @@ on:
 
 concurrency:
   # Keep scheduled main runs from blocking push-triggered validation.
-  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
+  # Keep opt-in label runs from canceling normal PR validation.
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}-${{ github.event.action == 'labeled' && github.event.label.name || 'default' }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
@@ -31,6 +32,7 @@ jobs:
       pull-requests: read
     outputs:
       run_tests: ${{ steps.detect.outputs.run_tests }}
+      run_multigpu_tests: ${{ steps.detect.outputs.run_multigpu_tests }}
       reason: ${{ steps.detect.outputs.reason }}
     steps:
       - name: Detect whether Aiter tests are required
@@ -39,11 +41,19 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           PR_DRAFT: ${{ github.event.pull_request.draft }}
+          EVENT_ACTION: ${{ github.event.action }}
+          LABEL_NAME: ${{ github.event.label.name }}
+          HAS_MULTIGPU_LABEL: ${{ github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'multigpu') && 'true' || 'false' }}
         run: |
           set -euo pipefail
 
           if [ "${GITHUB_EVENT_NAME}" != "pull_request" ]; then
             echo "run_tests=true" >> "$GITHUB_OUTPUT"
+            if [ "${GITHUB_REF}" = "refs/heads/main" ]; then
+              echo "run_multigpu_tests=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "run_multigpu_tests=false" >> "$GITHUB_OUTPUT"
+            fi
             echo "reason=non_pull_request_event" >> "$GITHUB_OUTPUT"
             echo "Aiter tests are required for ${GITHUB_EVENT_NAME}." >> "$GITHUB_STEP_SUMMARY"
             exit 0
@@ -51,8 +61,23 @@ jobs:
 
           if [ "${PR_DRAFT}" = "true" ]; then
             echo "run_tests=false" >> "$GITHUB_OUTPUT"
+            echo "run_multigpu_tests=false" >> "$GITHUB_OUTPUT"
             echo "reason=draft_pull_request" >> "$GITHUB_OUTPUT"
             echo "Aiter tests are skipped because this pull request is a draft." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          if [ "${EVENT_ACTION}" = "labeled" ]; then
+            echo "run_tests=false" >> "$GITHUB_OUTPUT"
+            if [ "${LABEL_NAME}" = "multigpu" ]; then
+              echo "run_multigpu_tests=true" >> "$GITHUB_OUTPUT"
+              echo "reason=multigpu_label" >> "$GITHUB_OUTPUT"
+              echo "Aiter multi-GPU tests are required because the multigpu label was added." >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "run_multigpu_tests=false" >> "$GITHUB_OUTPUT"
+              echo "reason=non_multigpu_label" >> "$GITHUB_OUTPUT"
+              echo "Aiter tests are skipped for label '${LABEL_NAME}'." >> "$GITHUB_STEP_SUMMARY"
+            fi
             exit 0
           fi
 
@@ -82,6 +107,7 @@ jobs:
           done
 
           echo "run_tests=${run_tests}" >> "$GITHUB_OUTPUT"
+          echo "run_multigpu_tests=${HAS_MULTIGPU_LABEL}" >> "$GITHUB_OUTPUT"
           echo "reason=${reason}" >> "$GITHUB_OUTPUT"
 
           {
@@ -89,19 +115,28 @@ jobs:
             echo
             echo "- Changed files: ${#changed_files[@]}"
             echo "- Aiter tests required: ${run_tests}"
+            echo "- Aiter multi-GPU tests required: ${HAS_MULTIGPU_LABEL}"
             echo "- Reason: ${reason}"
             if [ "${run_tests}" = "true" ]; then
               echo "Aiter tests are required because at least one changed file matches the Aiter test scope."
+            elif [ "${HAS_MULTIGPU_LABEL}" = "true" ]; then
+              echo "Aiter multi-GPU tests are required because the multigpu label is present."
             else
               echo "Aiter tests are not required for this pull request."
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
   ci_config:
+    if: >-
+      needs.detect_aiter_test_scope.outputs.run_tests == 'true' ||
+      needs.detect_aiter_test_scope.outputs.run_multigpu_tests == 'true'
+    needs: detect_aiter_test_scope
     uses: ./.github/workflows/ci-config.yaml
 
   check-signal:
-    if: ${{ needs.detect_aiter_test_scope.outputs.run_tests == 'true' }}
+    if: >-
+      needs.detect_aiter_test_scope.outputs.run_tests == 'true' ||
+      needs.detect_aiter_test_scope.outputs.run_multigpu_tests == 'true'
     needs: detect_aiter_test_scope
     runs-on: ubuntu-latest
     steps:
@@ -115,7 +150,9 @@ jobs:
           GITHUB_SHA: ${{ github.sha }}
 
   build_aiter_wheels:
-    if: ${{ needs.detect_aiter_test_scope.outputs.run_tests == 'true' }}
+    if: >-
+      needs.detect_aiter_test_scope.outputs.run_tests == 'true' ||
+      needs.detect_aiter_test_scope.outputs.run_multigpu_tests == 'true'
     runs-on: build-only-aiter
     needs: [detect_aiter_test_scope, check-signal, ci_config]
     permissions:
@@ -133,14 +170,37 @@ jobs:
             build_enabled: true
     steps:
       # ---- Common steps (fork and non-fork) ----
-      - name: Checkout code
+      - name: Restore Aiter wheel cache
         if: ${{ matrix.build_enabled }}
+        id: restore_aiter_wheel
+        continue-on-error: true
+        uses: actions/cache/restore@v4
+        env:
+          SEGMENT_DOWNLOAD_TIMEOUT_MINS: 30
+        with:
+          path: aiter_wheels
+          key: ${{ runner.os }}-aiter-wheel-${{ github.event.pull_request.head.sha || github.sha }}-py${{ matrix.python_version }}
+
+      - name: Validate restored Aiter wheel cache
+        if: ${{ matrix.build_enabled && steps.restore_aiter_wheel.outputs.cache-hit == 'true' }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          wheels=(aiter_wheels/*.whl)
+          if [ "${#wheels[@]}" -ne 1 ]; then
+            echo "::error::Expected exactly one restored Aiter wheel, found ${#wheels[@]}"
+            exit 1
+          fi
+          ls -lh "${wheels[0]}"
+
+      - name: Checkout code
+        if: ${{ matrix.build_enabled && steps.restore_aiter_wheel.outputs.cache-hit != 'true' }}
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: Sync submodules for wheel build
-        if: ${{ matrix.build_enabled }}
+        if: ${{ matrix.build_enabled && steps.restore_aiter_wheel.outputs.cache-hit != 'true' }}
         run: |
           set -ex
           if [ "${{ github.event_name }}" = "schedule" ]; then
@@ -156,7 +216,7 @@ jobs:
           echo "CK commit: $(git -C 3rdparty/composable_kernel rev-parse HEAD)"
 
       - name: Docker login
-        if: ${{ matrix.build_enabled && (!github.event.pull_request || !github.event.pull_request.head.repo.fork) }}
+        if: ${{ matrix.build_enabled && steps.restore_aiter_wheel.outputs.cache-hit != 'true' && (!github.event.pull_request || !github.event.pull_request.head.repo.fork) }}
         env:
           DOCKER_USERNAME: ${{ secrets[needs.ci_config.outputs.docker_username_secret] }}
           DOCKER_PASSWORD: ${{ secrets[needs.ci_config.outputs.docker_password_secret] }}
@@ -175,7 +235,7 @@ jobs:
           exit 0
 
       - name: Build Aiter wheel in base container
-        if: ${{ matrix.build_enabled }}
+        if: ${{ matrix.build_enabled && steps.restore_aiter_wheel.outputs.cache-hit != 'true' }}
         run: |
           set -euo pipefail
           docker run --rm \
@@ -219,7 +279,7 @@ jobs:
             '
 
       - name: Summarize Aiter prebuild
-        if: ${{ always() && matrix.build_enabled }}
+        if: ${{ always() && matrix.build_enabled && steps.restore_aiter_wheel.outputs.cache-hit != 'true' }}
         run: |
           set -euo pipefail
           if [ ! -f .aiter-prebuild.env ]; then
@@ -238,7 +298,7 @@ jobs:
             --end "${PREBUILD_END}"
 
       - name: Verify prebuilt kernels in wheel
-        if: ${{ matrix.build_enabled }}
+        if: ${{ matrix.build_enabled && steps.restore_aiter_wheel.outputs.cache-hit != 'true' }}
         run: |
           set -euo pipefail
           python3 - <<'PY'
@@ -272,7 +332,7 @@ jobs:
           PY
 
       - name: Prepare Aiter wheel cache
-        if: ${{ matrix.build_enabled }}
+        if: ${{ matrix.build_enabled && steps.restore_aiter_wheel.outputs.cache-hit != 'true' }}
         run: |
           set -euo pipefail
           rm -rf aiter_wheels
@@ -281,19 +341,20 @@ jobs:
           ls -lh aiter_wheels
 
       - name: Save Aiter wheel cache
-        if: ${{ matrix.build_enabled }}
+        if: ${{ matrix.build_enabled && steps.restore_aiter_wheel.outputs.cache-hit != 'true' }}
         continue-on-error: true
         uses: actions/cache/save@v4
         with:
           path: aiter_wheels
-          key: ${{ runner.os }}-aiter-wheel-${{ github.run_id }}-py${{ matrix.python_version }}
+          key: ${{ runner.os }}-aiter-wheel-${{ github.event.pull_request.head.sha || github.sha }}-py${{ matrix.python_version }}
 
       - name: Upload wheel as artifact
         if: ${{ matrix.build_enabled }}
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.AITER_WHEEL_ARTIFACT_NAME }}-py${{ matrix.python_version }}
-          path: dist/*.whl
+          path: aiter_wheels/*.whl
+          if-no-files-found: error
           compression-level: 0
           retention-days: 14
 
@@ -435,13 +496,85 @@ jobs:
           retention-days: 7
 
   prepare_triton_wheel:
-    if: ${{ needs.detect_aiter_test_scope.outputs.run_tests == 'true' }}
+    if: >-
+      needs.detect_aiter_test_scope.outputs.run_tests == 'true' ||
+      needs.detect_aiter_test_scope.outputs.run_multigpu_tests == 'true'
     needs: [detect_aiter_test_scope, check-signal, ci_config]
     uses: ./.github/workflows/prepare-triton-wheel.yaml
     with:
       docker-image: ${{ needs.ci_config.outputs.pytorch_py312_image }}
       artifact-name: ${{ needs.ci_config.outputs.triton_wheel_artifact_name }}
       retention-days: 3
+
+  detect_multigpu_test_scope:
+    name: Detect Multi-GPU Test Scope
+    if: >-
+      always() &&
+      (needs.detect_aiter_test_scope.outputs.run_tests == 'true' ||
+      needs.detect_aiter_test_scope.outputs.run_multigpu_tests == 'true') &&
+      needs.check-signal.result == 'success' &&
+      needs.build_aiter_wheels.result == 'success' &&
+      needs.prepare_triton_wheel.result == 'success'
+    needs: [detect_aiter_test_scope, check-signal, build_aiter_wheels, prepare_triton_wheel]
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
+    outputs:
+      run_multigpu_tests: ${{ steps.detect.outputs.run_multigpu_tests }}
+      reason: ${{ steps.detect.outputs.reason }}
+    steps:
+      - name: Detect whether multi-GPU tests are required
+        id: detect
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_DRAFT: ${{ github.event.pull_request.draft }}
+          EVENT_ACTION: ${{ github.event.action }}
+          LABEL_NAME: ${{ github.event.label.name }}
+        run: |
+          set -euo pipefail
+
+          if [ "${GITHUB_EVENT_NAME}" != "pull_request" ]; then
+            if [ "${GITHUB_REF}" = "refs/heads/main" ]; then
+              echo "run_multigpu_tests=true" >> "$GITHUB_OUTPUT"
+              echo "reason=main_branch" >> "$GITHUB_OUTPUT"
+              echo "Aiter multi-GPU tests are required on main." >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "run_multigpu_tests=false" >> "$GITHUB_OUTPUT"
+              echo "reason=non_main_non_pull_request_event" >> "$GITHUB_OUTPUT"
+              echo "Aiter multi-GPU tests are not required for ${GITHUB_EVENT_NAME} on ${GITHUB_REF}." >> "$GITHUB_STEP_SUMMARY"
+            fi
+            exit 0
+          fi
+
+          if [ "${PR_DRAFT}" = "true" ]; then
+            echo "run_multigpu_tests=false" >> "$GITHUB_OUTPUT"
+            echo "reason=draft_pull_request" >> "$GITHUB_OUTPUT"
+            echo "Aiter multi-GPU tests are skipped because this pull request is a draft." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          if [ "${EVENT_ACTION}" = "labeled" ] && [ "${LABEL_NAME}" != "multigpu" ]; then
+            echo "run_multigpu_tests=false" >> "$GITHUB_OUTPUT"
+            echo "reason=non_multigpu_label" >> "$GITHUB_OUTPUT"
+            echo "Aiter multi-GPU tests are skipped for label '${LABEL_NAME}'." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          labels="$(gh pr view "${PR_NUMBER}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --json labels \
+            --jq '.labels[].name')"
+
+          if printf '%s\n' "${labels}" | grep -Fxq "multigpu"; then
+            echo "run_multigpu_tests=true" >> "$GITHUB_OUTPUT"
+            echo "reason=multigpu_label_present_after_build" >> "$GITHUB_OUTPUT"
+            echo "Aiter multi-GPU tests are required because the multigpu label is present after build." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "run_multigpu_tests=false" >> "$GITHUB_OUTPUT"
+            echo "reason=no_multigpu_label_after_build" >> "$GITHUB_OUTPUT"
+            echo "Aiter multi-GPU tests are not required because the multigpu label is not present after build." >> "$GITHUB_STEP_SUMMARY"
+          fi
 
   standard:
     if: >-
@@ -586,7 +719,7 @@ jobs:
           SEGMENT_DOWNLOAD_TIMEOUT_MINS: 30
         with:
           path: aiter_wheels
-          key: ${{ runner.os }}-aiter-wheel-${{ github.run_id }}-py3.12
+          key: ${{ runner.os }}-aiter-wheel-${{ github.event.pull_request.head.sha || github.sha }}-py3.12
 
       - name: Download Aiter wheel artifact
         if: steps.restore_aiter_wheel.outputs.cache-hit != 'true'
@@ -860,8 +993,8 @@ jobs:
 
   multi-gpu:
     name: Multi-GPU Tests (8 GPU)
-    if: github.ref == 'refs/heads/main'
-    needs: [build_aiter_wheels, prepare_triton_wheel, ci_config]
+    if: ${{ needs.detect_multigpu_test_scope.outputs.run_multigpu_tests == 'true' }}
+    needs: [detect_multigpu_test_scope, build_aiter_wheels, prepare_triton_wheel, ci_config]
     env:
       DOCKER_IMAGE: ${{ needs.ci_config.outputs.pytorch_py312_image }}
       TRITON_WHEEL_ARTIFACT_NAME: ${{ needs.ci_config.outputs.triton_wheel_artifact_name }}
@@ -887,7 +1020,7 @@ jobs:
           SEGMENT_DOWNLOAD_TIMEOUT_MINS: 30
         with:
           path: aiter_wheels
-          key: ${{ runner.os }}-aiter-wheel-${{ github.run_id }}-py3.12
+          key: ${{ runner.os }}-aiter-wheel-${{ github.event.pull_request.head.sha || github.sha }}-py3.12
 
       - name: Download Aiter wheel artifact
         if: steps.restore_aiter_wheel.outputs.cache-hit != 'true'
@@ -1002,14 +1135,13 @@ jobs:
           -w /workspace \
           aiter_test \
           bash -lc "
+            set -euo pipefail
             pip uninstall -y amd-aiter aiter || true
             pip install -r requirements.txt
             pip install --upgrade pandas pyzmq einops numpy==1.26.2
             pip install --upgrade 'pybind11>=3.0.1'
             pip install --upgrade 'ninja>=1.11.1'
             pip install tabulate
-            pip install 'amd-mori==1.2.2'
-            python3 -c 'import mori, mori.shmem'
             pip install '${AITER_WHEEL_PATH}'
             pip show amd-aiter
           "
@@ -1285,20 +1417,27 @@ jobs:
       - build_aiter_wheels
       - split_aiter_tests
       - prepare_triton_wheel
+      - detect_multigpu_test_scope
       - standard
       - standard-test-finish
+      - multi-gpu
     steps:
       - name: Evaluate Aiter test gate
         env:
           RUN_TESTS: ${{ needs.detect_aiter_test_scope.outputs.run_tests }}
+          REQUEST_MULTIGPU_TESTS: ${{ needs.detect_aiter_test_scope.outputs.run_multigpu_tests }}
+          RUN_MULTIGPU_TESTS: ${{ needs.detect_multigpu_test_scope.outputs.run_multigpu_tests }}
           REASON: ${{ needs.detect_aiter_test_scope.outputs.reason }}
+          MULTIGPU_REASON: ${{ needs.detect_multigpu_test_scope.outputs.reason }}
           DETECT_RESULT: ${{ needs.detect_aiter_test_scope.result }}
+          MULTIGPU_DETECT_RESULT: ${{ needs.detect_multigpu_test_scope.result }}
           CHECK_SIGNAL_RESULT: ${{ needs['check-signal'].result }}
           BUILD_RESULT: ${{ needs.build_aiter_wheels.result }}
           SPLIT_RESULT: ${{ needs.split_aiter_tests.result }}
           TRITON_RESULT: ${{ needs.prepare_triton_wheel.result }}
           STANDARD_RESULT: ${{ needs.standard.result }}
           STANDARD_FINISH_RESULT: ${{ needs['standard-test-finish'].result }}
+          MULTIGPU_RESULT: ${{ needs['multi-gpu'].result }}
         run: |
           set -euo pipefail
 
@@ -1307,7 +1446,10 @@ jobs:
             echo
             echo "- Scope detection: ${DETECT_RESULT}"
             echo "- Aiter tests required: ${RUN_TESTS:-unknown}"
+            echo "- Aiter multi-GPU tests requested: ${REQUEST_MULTIGPU_TESTS:-unknown}"
+            echo "- Aiter multi-GPU tests required after build: ${RUN_MULTIGPU_TESTS:-unknown}"
             echo "- Reason: ${REASON:-unknown}"
+            echo "- Multi-GPU reason: ${MULTIGPU_REASON:-unknown}"
           } >> "$GITHUB_STEP_SUMMARY"
 
           if [ "${DETECT_RESULT}" != "success" ]; then
@@ -1315,27 +1457,41 @@ jobs:
             exit 1
           fi
 
-          if [ "${RUN_TESTS}" != "true" ]; then
+          multigpu_required="${RUN_MULTIGPU_TESTS:-false}"
+          if [ "${REQUEST_MULTIGPU_TESTS}" = "true" ]; then
+            multigpu_required=true
+          fi
+
+          if [ "${RUN_TESTS}" != "true" ] && [ "${multigpu_required}" != "true" ]; then
             echo "Aiter tests are not required for this change." >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
 
           failed=()
-          for result in \
-            "check-signal=${CHECK_SIGNAL_RESULT}" \
-            "build_aiter_wheels=${BUILD_RESULT}" \
-            "split_aiter_tests=${SPLIT_RESULT}" \
-            "prepare_triton_wheel=${TRITON_RESULT}" \
-            "standard=${STANDARD_RESULT}" \
-            "standard-test-finish=${STANDARD_FINISH_RESULT}"
-          do
-            job="${result%%=*}"
-            status="${result#*=}"
+
+          check_result() {
+            local job="$1"
+            local status="$2"
             echo "- ${job}: ${status}" >> "$GITHUB_STEP_SUMMARY"
             if [ "${status}" != "success" ]; then
               failed+=("${job}=${status}")
             fi
-          done
+          }
+
+          check_result "check-signal" "${CHECK_SIGNAL_RESULT}"
+          check_result "build_aiter_wheels" "${BUILD_RESULT}"
+          check_result "prepare_triton_wheel" "${TRITON_RESULT}"
+          check_result "detect_multigpu_test_scope" "${MULTIGPU_DETECT_RESULT}"
+
+          if [ "${RUN_TESTS}" = "true" ]; then
+            check_result "split_aiter_tests" "${SPLIT_RESULT}"
+            check_result "standard" "${STANDARD_RESULT}"
+            check_result "standard-test-finish" "${STANDARD_FINISH_RESULT}"
+          fi
+
+          if [ "${multigpu_required}" = "true" ]; then
+            check_result "multi-gpu" "${MULTIGPU_RESULT}"
+          fi
 
           if [ "${#failed[@]}" -gt 0 ]; then
             printf 'Aiter test gate failed because required jobs did not pass:\n' >&2
