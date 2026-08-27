@@ -34,10 +34,10 @@ shapes, in op_benchmarks/triton/model_benchmarking_tool/bench_models.py).
 
 import pytest
 import torch
-from aiter.ops.triton.utils._triton.arch_info import get_arch
 
 import aiter.ops.triton.conv.conv2d as conv2d_module
 from aiter.ops.triton.utils import config_utils
+from aiter.ops.triton.utils._triton.arch_info import get_arch
 
 from ._helpers import (
     ALL_SUPPORTED_ARCHS,

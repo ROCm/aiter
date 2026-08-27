@@ -5,15 +5,15 @@ import copy
 
 import pytest
 import torch
+
 from aiter.ops.shuffle import shuffle_weight
 from aiter.ops.triton.gemm.basic.gemm_afp8wfp8 import (
     gemm_afp8wfp8,
     gemm_afp8wfp8_preshuffle,
 )
-from aiter.test_common import checkAllclose
-
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.config_utils import get_gemm_config
+from aiter.test_common import checkAllclose
 
 SCALE_GROUP_SIZE = 32  # A: 1x32 e8m0 scale group
 W_SCALE_K_GROUP = 128  # B: 128 in K direction
@@ -278,10 +278,11 @@ def test_gluon_preshuffle_cga_multicast(ctas_m: int, ctas_n: int, ragged: bool):
     if not _gluon_available():
         pytest.skip("Gluon MXFP8 preshuffle CGA multicast requires gfx1250")
 
+    from triton._C.libtriton.gluon_ir import make_cga_layout
+
     from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_mxfp8 import (
         cga_bases,
     )
-    from triton._C.libtriton.gluon_ir import make_cga_layout
 
     # The kernel cannot call make_cga_layout (nanobind, rejected by gluon's
     # dependency walker), so it reimplements it -- pin the two together.
