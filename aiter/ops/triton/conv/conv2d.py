@@ -6,6 +6,16 @@ from enum import Enum
 
 import torch
 import triton
+
+from aiter.ops.triton.conv._launch import (
+    _launch_1x1,
+    _launch_3x3_cblocked,
+    _launch_3x3_nchw,
+    _launch_3x3_nhwc,
+    _launch_general,
+    _launch_winograd_f4x3,
+    _launch_winograd_f4x3_cblocked,
+)
 from aiter.ops.triton.conv._prepack import (
     get_or_make_weight_pack,
     get_or_make_weight_pack_3x3,
@@ -23,23 +33,13 @@ from aiter.ops.triton.conv._utils import (
     _prep_bias,
     _require_winograd_eligible,
 )
-from aiter.ops.triton.utils.logger import AiterTritonLogger
-
-from aiter.ops.triton.conv._launch import (
-    _launch_1x1,
-    _launch_3x3_cblocked,
-    _launch_3x3_nchw,
-    _launch_3x3_nhwc,
-    _launch_general,
-    _launch_winograd_f4x3,
-    _launch_winograd_f4x3_cblocked,
-)
 from aiter.ops.triton.utils.config_utils import (
     conv_config_uses_exact_routes,
     format_shape_key,
     has_conv_config,
     has_exact_conv_config,
 )
+from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
 
