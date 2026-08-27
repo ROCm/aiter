@@ -101,6 +101,9 @@ def select_2d_config(
 
     # base prefill, for short cases
     if not all_decode:
+        # large prefill config — apply BLOCK_M scaling regardless of head_size
+        if max_seqlen_q >= 256:
+            BLOCK_M = 64 if arch.is_rdna else 128
         if head_size >= 512 and not arch.is_rdna:
             num_warps, num_stages_2d = 4, 2
             TILE_SIZE = 16
@@ -108,9 +111,7 @@ def select_2d_config(
             num_warps, num_stages_2d = 2, 2
             TILE_SIZE = 32
         else:
-            # large prefill config
             if max_seqlen_q >= 256:
-                BLOCK_M = 64 if arch.is_rdna else 128
                 num_stages_2d, num_warps = 1, 4
             else:
                 num_stages_2d, num_warps = 1, 2
