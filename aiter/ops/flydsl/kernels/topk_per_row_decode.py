@@ -137,6 +137,7 @@ def build_topk_per_row_decode_module(
     stable_write_steps = (
         stable_write_vectors_per_chunk + _BLOCK_THREADS - 1
     ) // _BLOCK_THREADS
+    output_steps = (k + _BLOCK_THREADS - 1) // _BLOCK_THREADS
     # n is compile-time, so only the selected scan implementation is emitted.
     use_packed_stable_scan = stable_values_per_chunk < _STABLE_PACKED_COUNT_LIMIT
 
@@ -169,6 +170,8 @@ def build_topk_per_row_decode_module(
         row_state = fx.slice(state, (row, None))
         chunk_hist = fx.slice(partial_hist, (row, chunk, None))
         if first_pass != 0 and chunk == 0 and tid == 0:
+            row_state[_STATE_PREFIX] = 0
+            row_state[_STATE_MASK] = 0
             row_state[_STATE_REMAINING_K] = (row_len < k).select(row_len, fx.Int32(k))
 
         storage = fx.SharedAllocator().allocate(_make_hist_storage())
@@ -429,6 +432,14 @@ def build_topk_per_row_decode_module(
         input_div = fx.logical_divide(row_in, fx.make_layout(_VEC, 1))
         copy_atom_v = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), 32)
 
+        if chunk == 0 and row_len < fx.Int32(k):
+            for output_step in range_constexpr(output_steps):
+                out_pos = (
+                    row_len + fx.Int32(output_step * _BLOCK_THREADS) + fx.Int32(tid)
+                )
+                if out_pos < fx.Int32(k):
+                    row_indices[out_pos] = fx.Int32(-1)
+
         threshold = row_state[_STATE_PREFIX]
         remaining_k = row_state[_STATE_REMAINING_K]
         storage = fx.SharedAllocator().allocate(_make_gather_storage(k))
@@ -671,6 +682,16 @@ def build_topk_per_row_decode_module(
         row_len = row_ends[request] - fx.Int32(next_n) + offset + 1
         row_len = (row_len < 0).select(fx.Int32(0), row_len)
         row_len = (row_len > n).select(fx.Int32(n), row_len)
+
+        if chunk_i32 == 0 and row_len < fx.Int32(k):
+            for output_step in range_constexpr(output_steps):
+                out_pos = (
+                    row_len
+                    + fx.Int32(output_step * _BLOCK_THREADS)
+                    + tid_i32
+                )
+                if out_pos < fx.Int32(k):
+                    row_indices[out_pos] = fx.Int32(-1)
 
         threshold = state[row, _STATE_PREFIX]
         remaining_k = state[row, _STATE_REMAINING_K]

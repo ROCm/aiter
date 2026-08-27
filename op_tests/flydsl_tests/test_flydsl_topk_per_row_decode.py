@@ -6,6 +6,7 @@ import itertools
 
 import aiter
 import pandas as pd
+import pytest
 import torch
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
@@ -25,16 +26,28 @@ def run_torch(
 ) -> torch.Tensor:
     rows = []
     for row in range(logits.shape[0]):
-        row_len = (
-            context_lens[row // next_n] - next_n + row % next_n + 1
+        row_len = min(
+            logits.shape[1],
+            max(
+                0,
+                context_lens[row // next_n] - next_n + row % next_n + 1,
+            ),
+        )
+        valid_k = min(row_len, top_k)
+        padded = torch.full(
+            (top_k,), -1, dtype=torch.int64, device=logits.device
         )
         if stable:
             selected = torch.argsort(
                 logits[row, :row_len], descending=True, stable=True
-            )[:top_k]
-            rows.append(torch.sort(selected).values)
+            )[:valid_k]
+            padded[:valid_k] = torch.sort(selected).values
         else:
-            rows.append(torch.topk(logits[row, :row_len], top_k, sorted=False).indices)
+            if valid_k > 0:
+                padded[:valid_k] = torch.topk(
+                    logits[row, :row_len], valid_k, sorted=False
+                ).indices
+        rows.append(padded)
     return torch.stack(rows).to(torch.int32)
 
 
@@ -82,6 +95,58 @@ def _run_hip(
     return indices
 
 
+@pytest.mark.parametrize("stable", [False, True])
+def test_flydsl_topk_short_rows_are_minus_one_padded(stable: bool):
+    top_k = 2048
+    context_len = 4096
+    next_n = 1
+    valid_lens = [0, 1, top_k - 1, top_k]
+    num_rows = len(valid_lens)
+
+    torch.manual_seed(123)
+    logits = torch.randn(num_rows, context_len, dtype=torch.float32)
+    seq_lens = torch.tensor(valid_lens, dtype=torch.int32, device=logits.device)
+    expected = run_torch(logits, valid_lens, next_n, top_k, stable)
+
+    eager_output = torch.full((num_rows, top_k), -777, dtype=torch.int32)
+    _run_flydsl(logits, next_n, seq_lens, eager_output, top_k, stable)
+    torch.cuda.synchronize()
+
+    # Capture with full rows, then replay with shorter rows. This verifies that
+    # stale indices from the captured execution are overwritten by -1.
+    graph_seq_lens = torch.full(
+        (num_rows,), context_len, dtype=torch.int32, device=logits.device
+    )
+    graph_output = torch.full((num_rows, top_k), -777, dtype=torch.int32)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        _run_flydsl(
+            logits, next_n, graph_seq_lens, graph_output, top_k, stable
+        )
+    graph_seq_lens.copy_(seq_lens)
+    graph.replay()
+    torch.cuda.synchronize()
+
+    expected_compare = (
+        expected if stable else torch.sort(expected, dim=-1).values
+    )
+    for name, output in (("eager", eager_output), ("graph", graph_output)):
+        output_compare = (
+            output if stable else torch.sort(output, dim=-1).values
+        )
+        torch.testing.assert_close(
+            output_compare,
+            expected_compare,
+            rtol=0,
+            atol=0,
+            msg=f"{name} output mismatch",
+        )
+        for row, valid_len in enumerate(valid_lens):
+            assert torch.all(output[row, valid_len:] == -1), (
+                f"{name} row {row} did not overwrite its padded tail"
+            )
+
+
 @benchmark()
 def test_flydsl_topk_decode(
     batch_size: int,
@@ -91,8 +156,8 @@ def test_flydsl_topk_decode(
     row_padding: int,
     stable: bool,
 ) -> dict:
-    if context_len - next_n + 1 < top_k:
-        raise ValueError("every effective decode row must contain at least top_k items")
+    if top_k > context_len:
+        raise ValueError("top_k must not exceed the logits row width")
 
     num_rows = batch_size * next_n
     torch.manual_seed(42)
