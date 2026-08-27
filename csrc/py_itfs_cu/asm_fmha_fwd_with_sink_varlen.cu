@@ -165,10 +165,16 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     AITER_CHECK((int)v->size(0) == total_k,     "fmha_fwd_with_sink_varlen_asm: v total_k mismatch with k");
     AITER_CHECK((int)v->size(1) == kv_head_num, "fmha_fwd_with_sink_varlen_asm: v head_num mismatch with k");
     AITER_CHECK(q_head_num % kv_head_num == 0,  "fmha_fwd_with_sink_varlen_asm: q_head_num must be a multiple of kv_head_num");
-    AITER_CHECK(qk_head_dim == 64 || qk_head_dim == 128,
-                "fmha_fwd_with_sink_varlen_asm: only head_dim 64 or 128 supported, got ", qk_head_dim);
-    AITER_CHECK(v_head_dim == qk_head_dim,
-                "fmha_fwd_with_sink_varlen_asm: v_head_dim must equal qk_head_dim");
+    // (64,64) / (128,128) are the symmetric D64 / D128 kernels (sub_K=256);
+    // (192,128) is the asymmetric D192x128 kernel (sub_K=128).  head_dim never
+    // reaches the kernel through the kernarg block -- it is compiled into the
+    // .co -- so this only has to agree with what the csv registers.
+    const bool hd_supported =
+        (v_head_dim == qk_head_dim && (qk_head_dim == 64 || qk_head_dim == 128)) ||
+        (qk_head_dim == 192 && v_head_dim == 128);
+    AITER_CHECK(hd_supported,
+                "fmha_fwd_with_sink_varlen_asm: supported (qk_head_dim, v_head_dim) are "
+                "(64,64), (128,128), (192,128); got (", qk_head_dim, ",", v_head_dim, ")");
 
     AITER_CHECK(out->dim() == 3 &&
                 (int)out->size(0) == total_q && (int)out->size(1) == q_head_num &&
@@ -215,8 +221,8 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     args.gqa        = gqa;
     args.q_head_num = q_head_num;
     // s_opt: bit0 reverse_kv | bit1 double_q | bit2 remap_xy.
-    // 6 = 0b110 -> reverse_kv=0, double_q=1, remap_xy=1.  Must match how the
-    // shipped VARLEN .co was built.
+    // 7 = 0b111 -> all three on.  Must match how the shipped VARLEN .co was
+    // built (REMAP_XY=1 in particular, since we swap gdx/gdy at launch).
     args.opt        = 7;
     args.lse        = return_lse ? 1 : 0;
     args.max_q_len  = max_seqlen_q;

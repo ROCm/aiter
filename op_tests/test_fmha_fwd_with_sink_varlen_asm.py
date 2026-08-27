@@ -17,12 +17,17 @@ Layout (packed THD; batch folded into the token axis):
     out : (total_q, nheads,   hdim_v)
     cu_seqlens_q / cu_seqlens_k : int32 [batch+1] cumulative
 
+Head dims: (64, 64) and (128, 128) are the symmetric kernels; (192, 128) is the
+asymmetric D192x128 one (qk_head_dim=192, v_head_dim=128), which tiles KV by 128
+instead of 256.
+
 Sink convention (same as the fixed-batch path): `sink` ([q_head_num] fp32) is a
 per-Q-head logit in the scaled domain, a zero-value virtual KV column passed
-verbatim.  D64 kernels read it; D128 kernels ignore it (pass None).
+verbatim.  D64 kernels read it; D128 and D192x128 kernels ignore it (pass None).
 
-KV-length constraint (mask=0 only): non-causal kernels require per-sequence
-kv_seqlen that is a multiple of 256.
+KV-length constraint (mask=0 only): the non-causal D64/D128 kernels require
+per-sequence kv_seqlen that is a multiple of 256.  D192x128 has no such
+constraint (sub_K=128 with the border mask compiled in).
 """
 
 import argparse
@@ -165,12 +170,18 @@ def run_kernel(
     raise ValueError(f"unknown via={via!r}")
 
 
-def _flops_bytes(seqlens, hq, hk, d, is_causal, total, esz):
-    """Attention roofline numerators summed over the packed batches."""
-    flops = sum(4.0 * hq * s * s * d for s in seqlens)  # 2 GEMMs (QK^T, PV)
+def _flops_bytes(seqlens, hq, hk, d, dv, is_causal, total, esz):
+    """Attention roofline numerators summed over the packed batches.
+
+    QK^T contributes 2*d MACs per (q, k) pair and PV contributes 2*dv, so the
+    asymmetric D192x128 case is 2*(192+128) rather than 4*192 or 4*128.
+    Degenerates to the familiar 4*d when d == dv.
+    """
+    flops = sum(2.0 * hq * s * s * (d + dv) for s in seqlens)  # 2 GEMMs (QK^T, PV)
     if is_causal:
         flops /= 2.0
-    nbytes = (2 * total * hq * d + 2 * total * hk * d) * esz  # q+o, k+v
+    # q (d) + o (dv) per q head, k (d) + v (dv) per kv head
+    nbytes = (total * hq * (d + dv) + total * hk * (d + dv)) * esz
     return flops, nbytes
 
 
@@ -178,35 +189,51 @@ def _flops_bytes(seqlens, hq, hk, d, is_causal, total, esz):
 # Shape tables
 # ---------------------------------------------------------------------------
 
-# Correctness shapes (torch reference feasible).  hq=64; hk=8 (D64) / 4 (D128).
-# Non-causal (mask=0) kernels require every kv_seqlen % 256 == 0 (filtered).
-# (head_dim, hq, hk, seqlens)
+# Correctness shapes (torch reference feasible).  hq=64; hk=8 (D64) / 4 (D128/D192x128).
+# The symmetric D64/D128 kernels tile KV by 256 and their non-causal (mask=0)
+# variants require every kv_seqlen % 256 == 0 (filtered); D192x128 tiles by 128
+# with a border mask, so unaligned lengths are in scope for it too.
+# (hdim_q, hdim_v, hq, hk, seqlens)
 _CORRECTNESS_SHAPES = [
-    (64, 64, 8, [256]),
-    (128, 64, 4, [256]),
-    (64, 64, 8, [128, 256, 384]),  # mixed (some unaligned) -> causal only
-    (128, 64, 4, [128, 256, 384]),
-    (64, 64, 8, [100, 200, 300]),  # unaligned
-    (128, 64, 4, [100, 200, 300]),
-    (64, 64, 8, [256, 512]),  # 256-aligned (causal AND mask=0)
-    (128, 64, 4, [256, 512]),
-    (64, 64, 8, [256, 512, 768]),
-    (128, 64, 4, [256, 512, 768]),
-    (64, 64, 8, [512, 1024]),
-    (128, 64, 4, [512, 1024]),
+    (64, 64, 64, 8, [256]),
+    (128, 128, 64, 4, [256]),
+    (192, 128, 64, 4, [256]),
+    (64, 64, 64, 8, [128, 256, 384]),  # mixed (some unaligned) -> causal only
+    (128, 128, 64, 4, [128, 256, 384]),
+    (192, 128, 64, 4, [128, 256, 384]),
+    (64, 64, 64, 8, [100, 200, 300]),  # unaligned
+    (128, 128, 64, 4, [100, 200, 300]),
+    (192, 128, 64, 4, [100, 200, 300]),
+    (64, 64, 64, 8, [256, 512]),  # 256-aligned (causal AND mask=0)
+    (128, 128, 64, 4, [256, 512]),
+    (192, 128, 64, 4, [256, 512]),
+    (64, 64, 64, 8, [256, 512, 768]),
+    (128, 128, 64, 4, [256, 512, 768]),
+    (64, 64, 64, 8, [512, 1024]),
+    (128, 128, 64, 4, [512, 1024]),
+    (192, 128, 64, 4, [512, 1024]),
 ]
 
 # Perf-only shapes (torch ref O(s^2) infeasible at 16384/32768).
-# (head_dim, hq, hk, seqlens)
+# (hdim_q, hdim_v, hq, hk, seqlens)
 _VARLEN_PERF_SHAPES = [
-    (64, 64, 8, [4096, 4096]),
-    (128, 64, 4, [2048, 2048]),
-    (128, 64, 4, [16384]),
-    (64, 64, 8, [32768]),
+    (64, 64, 64, 8, [4096, 4096]),
+    (128, 128, 64, 4, [2048, 2048]),
+    (128, 128, 64, 4, [16384]),
+    (64, 64, 64, 8, [32768]),
+    (192, 128, 64, 4, [2048, 2048]),
+    (192, 128, 64, 4, [16384]),
 ]
 
 
-def _kv_256_aligned(seqlens):
+def _kv_alignment_ok(hdim_q, seqlens):
+    """Non-causal eligibility for the per-head-dim KV tile.
+
+    D64/D128 use sub_K=256 and need every kv_seqlen to be a multiple of it.
+    D192x128 uses sub_K=128 and compiles the border mask in, so any length works.
+    """
+    if hdim_q == 192:
+        return True
     return all(s % 256 == 0 for s in seqlens)
 
 
@@ -216,17 +243,19 @@ def _kv_256_aligned(seqlens):
 
 
 @benchmark()
-def test_fmha_fwd_with_sink_varlen_asm(head_dim, hq, hk, seqlens, is_causal, init):
-    q, k, v, cu = make_varlen_packed(seqlens, hq, hk, head_dim, head_dim, init=init)
+def test_fmha_fwd_with_sink_varlen_asm(
+    hdim_q, hdim_v, hq, hk, seqlens, is_causal, init
+):
+    q, k, v, cu = make_varlen_packed(seqlens, hq, hk, hdim_q, hdim_v, init=init)
     max_seqlen_q = max(seqlens)
-    scale = 1.0 / math.sqrt(head_dim)
-    sink = _d64_sink(hq) if head_dim == 64 else None
+    scale = 1.0 / math.sqrt(hdim_q)
+    sink = _d64_sink(hq) if hdim_q == 64 else None
 
     ref_out, ref_lse = run_torch(q, k, v, cu, cu, is_causal=is_causal, sink=sink)
 
     total = q.shape[0]
     flops, nbytes = _flops_bytes(
-        seqlens, hq, hk, head_dim, is_causal, total, q.element_size()
+        seqlens, hq, hk, hdim_q, hdim_v, is_causal, total, q.element_size()
     )
 
     # The model calls the public dispatcher (flash_attn_varlen_func) → asm path.
@@ -256,28 +285,30 @@ def test_fmha_fwd_with_sink_varlen_asm(head_dim, hq, hk, seqlens, is_causal, ini
             out.to(dtypes.fp32),
             rtol=1e-2,
             atol=1e-2,
-            msg=f"{name} O d={head_dim} c={is_causal}",
+            msg=f"{name} O d={hdim_q}x{hdim_v} c={is_causal}",
         )
         ret[f"{name} err(LSE)"] = checkAllclose(
             ref_lse.to(dtypes.fp32),
             lse.to(dtypes.fp32),
             rtol=1e-2,
             atol=1e-2,
-            msg=f"{name} LSE d={head_dim} c={is_causal}",
+            msg=f"{name} LSE d={hdim_q}x{hdim_v} c={is_causal}",
         )
     return ret
 
 
 @benchmark()
-def test_fmha_fwd_with_sink_varlen_asm_perf(head_dim, hq, hk, seqlens, is_causal, init):
-    q, k, v, cu = make_varlen_packed(seqlens, hq, hk, head_dim, head_dim, init=init)
+def test_fmha_fwd_with_sink_varlen_asm_perf(
+    hdim_q, hdim_v, hq, hk, seqlens, is_causal, init
+):
+    q, k, v, cu = make_varlen_packed(seqlens, hq, hk, hdim_q, hdim_v, init=init)
     max_seqlen_q = max(seqlens)
-    scale = 1.0 / math.sqrt(head_dim)
-    sink = _d64_sink(hq) if head_dim == 64 else None
+    scale = 1.0 / math.sqrt(hdim_q)
+    sink = _d64_sink(hq) if hdim_q == 64 else None
 
     total = q.shape[0]
     flops, nbytes = _flops_bytes(
-        seqlens, hq, hk, head_dim, is_causal, total, q.element_size()
+        seqlens, hq, hk, hdim_q, hdim_v, is_causal, total, q.element_size()
     )
 
     candidates = {
@@ -320,9 +351,10 @@ def main():
         "--head_dim",
         type=int,
         nargs="*",
-        choices=[64, 128],
-        default=[64, 128],
-        help="head dim(s) to test (default: 64 128)",
+        choices=[64, 128, 192],
+        default=[64, 128, 192],
+        help="qk head dim(s) to test; 192 selects the D192x128 kernels "
+        "(default: 64 128 192)",
     )
     parser.add_argument(
         "-c",
@@ -346,15 +378,15 @@ def main():
 
     # ---- correctness + perf table ----
     df = []
-    for head_dim, hq, hk, seqlens in _CORRECTNESS_SHAPES:
-        if head_dim not in args.head_dim:
+    for hdim_q, hdim_v, hq, hk, seqlens in _CORRECTNESS_SHAPES:
+        if hdim_q not in args.head_dim:
             continue
         for is_causal, init in itertools.product(causal_modes, args.init):
-            if not is_causal and not _kv_256_aligned(seqlens):
+            if not is_causal and not _kv_alignment_ok(hdim_q, seqlens):
                 continue
             df.append(
                 test_fmha_fwd_with_sink_varlen_asm(
-                    head_dim, hq, hk, seqlens, is_causal, init
+                    hdim_q, hdim_v, hq, hk, seqlens, is_causal, init
                 )
             )
     df = pd.DataFrame(df)
@@ -365,13 +397,13 @@ def main():
 
     # ---- perf-only table (large shapes; ref infeasible) ----
     df = []
-    for head_dim, hq, hk, seqlens in _VARLEN_PERF_SHAPES:
-        if head_dim not in args.head_dim:
+    for hdim_q, hdim_v, hq, hk, seqlens in _VARLEN_PERF_SHAPES:
+        if hdim_q not in args.head_dim:
             continue
         for is_causal, init in itertools.product(causal_modes, args.init):
             df.append(
                 test_fmha_fwd_with_sink_varlen_asm_perf(
-                    head_dim, hq, hk, seqlens, is_causal, init
+                    hdim_q, hdim_v, hq, hk, seqlens, is_causal, init
                 )
             )
     df = pd.DataFrame(df)
