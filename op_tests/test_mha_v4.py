@@ -1456,6 +1456,62 @@ def test_mha_v4_sparse_follows_the_lut_across_query_tiles():
         ), f"query tile {q_tile} did not attend to tiles {tiles}"
 
 
+@pytest.mark.skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 sparse validation")
+@pytest.mark.skipif(
+    not _mha_v4_sparse_co_available(),
+    reason="sorted-sparse MHA v4 code object is not deployed",
+)
+@pytest.mark.parametrize("tail_rows", [64, 128, 200])
+def test_mha_v4_sparse_partial_query_tile_follows_the_lut(tail_rows):
+    """A trailing partial query tile has to select and zero the same way a full one does.
+
+    Production sequence lengths are not multiples of the 256-row query tile, and the empty-row
+    no-op is built on the same tail masking the partial tile uses, so the two belong in one
+    case: the short tile must still read the KV blocks its row names, and an all-False row on
+    that tile must come back zero rather than reading the masked-off remainder.
+    """
+    heads = 2
+    kv_tile = mha_v4_kv_tile()
+    kv_tiles = 4
+    q_tiles = 3
+    per_tile = ((0, (0,)), (1, (1, 2)), (2, (3,)))
+    q, k, v = _sparse_fp8_operands(
+        sequence_k=kv_tiles * kv_tile,
+        heads=heads,
+        sequence_q=256 * (q_tiles - 1) + tail_rows,
+    )
+
+    mask = torch.zeros((1, heads, q_tiles, kv_tiles), device="cuda", dtype=torch.bool)
+    for q_tile, tiles in per_tile:
+        for tile in tiles:
+            mask[:, :, q_tile, tile] = True
+    mask[:, 1, q_tiles - 1, :] = False  # head 1's partial-tile row selects nothing
+    sparse = _sparse_fp8_launch(q, k, v, block_mask=mask)
+    torch.cuda.synchronize()
+
+    for q_tile, tiles in per_tile:
+        dense = _sparse_fp8_launch(
+            q, _gather_kv_tiles(k, tiles), _gather_kv_tiles(v, tiles)
+        )
+        torch.cuda.synchronize()
+        rows = slice(q_tile * 256, min((q_tile + 1) * 256, sparse.shape[1]))
+        live_heads = 1 if q_tile == q_tiles - 1 else heads
+        assert torch.equal(
+            sparse[:, rows, :live_heads], dense[:, rows, :live_heads]
+        ), f"query tile {q_tile} did not attend to tiles {tiles}"
+
+    tail = slice((q_tiles - 1) * 256, sparse.shape[1])
+    assert torch.equal(
+        sparse[:, tail, 1], torch.zeros_like(sparse[:, tail, 1])
+    ), "empty row on the partial query tile is not zero"
+    # Without this the case would also pass on a kernel that skipped the short tile entirely,
+    # since both sides of the comparison above would then be zero.
+    assert (
+        sparse[:, tail, 0].abs().max() > 0
+    ), "live partial-tile row came back degenerate"
+    assert torch.isfinite(sparse).all(), "partial query tile leaked NaN or infinity"
+
+
 def _gfx950_only(launch, label):
     return pytest.param(
         launch,
