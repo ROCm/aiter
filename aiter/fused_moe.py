@@ -1976,11 +1976,13 @@ def _mxfp4_a4w4_stage2_fw(
     return moe_out
 
 
-@functools.lru_cache(maxsize=2048)
 def _mxfp4_scale_u8(scale):
     """FlyDSL can't ingest fp4/e8m0 dtype codes via DLPack, so pass a uint8 view (the
     same reinterpret_cast HIP does). Returns the uint8 view, or the input (already
-    uint8, or None) unchanged."""
+    uint8, or None) unchanged.
+
+    Not memoized: tensors hash by identity, so per-call intermediates never hit and
+    the cache would pin them on the device instead."""
     if scale is not None and scale.element_size() == 1 and scale.dtype != torch.uint8:
         return scale.view(torch.uint8)
     return scale
