@@ -223,7 +223,7 @@ def _combined_routing(
     # whole TokenStart/TileStart, so the survivors still see complete data.
     # ExpertHist is final on entry here (a prior launch filled it), unlike in
     # `_combined_routing_fused` where the same gate sits behind a barrier.
-    if pid != 0 and pid < blocks1a:
+    if pid != 0 and pid < blocks1a:  # noqa: SIM102
         if tl.load(ExpertHist + pid) == 0:
             return
 

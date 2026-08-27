@@ -973,7 +973,7 @@ def test_fused_sort_matches_blocked_sort(n_tokens, n_expts_tot, n_expts_act):
     dev = "cuda"
     logits = torch.randn(n_tokens, n_expts_tot, device=dev, dtype=torch.bfloat16)
     bias = torch.randn(n_expts_tot, device=dev, dtype=torch.float32)
-    kwargs = dict(
+    kwargs = dict(  # noqa: C408
         score_mode="sqrtsoftplus", bias=bias, renorm=True, routed_scaling_factor=2.5
     )
     block_m = _routing_block_m(n_tokens, n_expts_act, n_expts_tot)
