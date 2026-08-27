@@ -62,13 +62,15 @@ shapes here and take their default from the module.
 
 Other variables:
 
-    MORI_SHMEM_HEAP_SIZE=17179869184   mega_moe symmetric arena, bytes.
-                                       Defaulted to 16 GiB here; MoRI's own
-                                       default of 4 GiB is too small from
-                                       tokens/rank=65536 up (needs 7.5 GB) and
-                                       fails in setup() before any kernel runs.
     ENABLE_CK=0                        set before importing aiter; the module
                                        already setdefault()s it.
+
+mega_moe at tokens/rank=65536 fails in setup(), asking 7.5 GB for cco's VMM
+arena against a 4 GiB default. MORI_SHMEM_HEAP_SIZE does not reach that arena
+(see run_mega_moe), so exporting it changes nothing -- and exporting it
+sweep-wide takes the machine down, because that heap is preallocated per rank
+for every case. The tier is out of the sweep; fixing it means passing
+per_rank_vmm at Communicator.init().
 
 Failures do not stop the sweep: a case that aborts is recorded and the run
 moves to the next one, with a "N failed, M ops selected" list at the end and a
@@ -300,12 +302,29 @@ _A8W8_BLOCKSCALE_TOKENS = _tokens()
 # axis here is the batch, and past 1024 it stops being a shape the model runs.
 # AITER_BENCH_TOKENS is deliberately not consulted for this op.
 _MLA_DECODE_TOKENS = (1, 16, 32, 64, 128, 256, 512, 1024)
-# 16384 is the DSv4 prefill chunk and leads the default, but it is part of the
-# default rather than pinned ahead of it: at M=16K one sweep is eight combos
-# against a per-token PyTorch reference, so it has to be possible to drop.
-_MLA_PREFILL_TOKENS = _tokens((16384, *(t for t in _TOKENS if t >= 1024)))
+# Pinned to the one n that has never faulted. Measured on gfx1250 / 20260827
+# with --no-verify on, so no reference is involved:
+#   1024   3/3 pass
+#   2048   2/3 fault  <- intermittent, not a shape rule
+#   4096   1/1 fault
+#   8192   1/1 fault
+#   16384  3/3 fault
+#   65536  1/1 fault
+# Only 16384 is reproducibly dead; the middle tiers have too few observations to
+# tell an intermittent fault from a deterministic one. 16384 is the DSv4 prefill
+# chunk and is what this op exists to measure, so this is coverage lost to a
+# kernel bug, not a shape the model does not run. Restore the list once the
+# fault is fixed. AITER_BENCH_TOKENS still overrides, for re-checking.
+_MLA_PREFILL_TOKENS = _tokens((1024,))
 # Unset by default so the UT keeps its own -n ([512, 1024, 2048, 4096]).
 _MLA_PREFILL_FP8_TOKENS = _tokens()
+# UT default minus 8192, the one value that faults. See run_mla_v4_prefill_fp8.
+_MLA_PREFILL_FP8_NNZ = (256, 1024, 4096, 16384)
+# Pinned, not env-driven. tokens/rank=65536 dies in pipe.setup() building the
+# symmetric arena: cco sizes it from Communicator.DEFAULT_PER_RANK_VMM (4 GiB)
+# and asks for 7.5 GB. That is a per_rank_vmm the UT never passes, not
+# something MORI_SHMEM_HEAP_SIZE reaches, so the tier cannot run from here.
+_MEGA_MOE_TOKENS = (1, 16, 32, 64, 128, 256, 512, 1024, 2048)
 
 
 def _int_quad(s):
@@ -1113,16 +1132,23 @@ def run_mega_moe(_args):
     # this orchestration process before torchrun starts the four workers.
     torch.cuda.empty_cache()
     env = os.environ.copy()
-    env.update({
-        "MORI_V2_KERNEL_BACKEND": "hip",
-        "MEGA_DISPATCH": "mori",
-        # The symmetric arena is sized from tokens/rank: at 65536 it asks for
-        # 7.5 GB against a 4 GB default heap and setup() dies before the first
-        # kernel. Cards here have 432 GiB, so 16 GB costs nothing.
-        "MORI_SHMEM_HEAP_SIZE": os.environ.get(
-            "MORI_SHMEM_HEAP_SIZE", str(16 << 30)
-        ),
-    })
+    # No MORI_SHMEM_HEAP_SIZE default here, for two independent reasons.
+    #
+    # Raising it sweep-wide took the machine down: the heap is preallocated per
+    # rank for every case, not sized per case, so 16 GB became 64 GB reserved on
+    # every one of them and b45-2 hard-rebooted at tokens/rank=512 -- long
+    # before the case it was meant to help.
+    #
+    # And it would not have helped anyway. The 7.5 GB request at 65536 goes to
+    # cco's VMM arena, not the shmem heap: "ccoMemAlloc: slot exhausted ... in
+    # perRankSize=4294967296. Increase perRankVmmSize at ccoCommCreate". That
+    # size is a ccoCommCreate argument with no environment variable behind it
+    # (Communicator.DEFAULT_PER_RANK_VMM, 4 GiB), and
+    # test_mega_moe_gfx1250.py:512 calls Communicator.init() without passing it.
+    # MORI_SHMEM_HEAP_SIZE is read only in mori/src/shmem/init.cpp and feeds a
+    # different allocator. The same error also prints "Hint: Increase via
+    # MORI_SHMEM_HEAP_SIZE" -- that hint is what points the wrong way.
+    env.update({"MORI_V2_KERNEL_BACKEND": "hip", "MEGA_DISPATCH": "mori"})
     base_cmd = [
         "torchrun",
         "--standalone",
@@ -1147,7 +1173,7 @@ def run_mega_moe(_args):
     # 1 -> fp8); the weights are mxfp4 either way and -q only picks their layout,
     # so the env var and the quant key have to move together.
     for tokens, (quant, force_a8w4), (label, combine) in itertools.product(
-        _TOKENS,
+        _MEGA_MOE_TOKENS,
         (("a4w4_mxfp4", "0"), ("a8w4_mxfp4", "1")),
         (("non-Mega", "base"), ("Mega", "fused")),
     ):
@@ -1521,10 +1547,16 @@ def run_mla_v4_prefill_fp8(_args):
     """Run the default gfx1250 MLA v4 sparse-prefill FP8 sweep."""
     env = os.environ.copy()
     env["PYTHONPATH"] = "."
-    # Keep the UT's own -n default ([512, 1024, 2048, 4096]). N=65536 faults the
-    # GPU (HSA_STATUS_ERROR_MEMORY_FAULT) after its case verifies, and because
-    # the UT prints its summary table only at the very end, that fault costs the
-    # whole sweep: the smaller shapes run fine but never get reported.
+    # Keep the UT's own -n default ([512, 1024, 2048, 4096]).
+    #
+    # --nnz-prefix drops 8192 from the UT's default [256, 1024, 4096, 8192,
+    # 16384]. 256/1024/4096/16384 all pass, so this is one bad point, not a size
+    # limit -- and the kernel is not what breaks: at (n=2048, nnz_prefix=8192)
+    # the run faults with verify on and passes with --no-verify, reporting
+    # 2040 TFLOPS. It is the reference or the comparison that dies. Dropped here
+    # anyway because this op runs the UT bare, where verify is on, and the UT
+    # prints its table only at the very end, so the fault costs every shape that
+    # already ran.
     _run_child(
         "mla_v4 prefill FP8 (sparse-prefill default sweep)",
         [
@@ -1535,6 +1567,8 @@ def run_mla_v4_prefill_fp8(_args):
                 if _MLA_PREFILL_FP8_TOKENS
                 else []
             ),
+            "--nnz-prefix",
+            *map(str, _MLA_PREFILL_FP8_NNZ),
         ],
         cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
         env=env,
@@ -1556,9 +1590,7 @@ OPS = {
     "mhc": run_mhc,
     "qk_norm": run_qk_norm,
     "score_qk": run_score_qk,
-    # "mori_ep" benchmarks mori, not aiter, and building it needs a dev ROCm
-    # toolchain the pip-wheel images do not ship. run_mori_ep is kept below.
-    # "mori_ep": run_mori_ep,
+    "mori_ep": run_mori_ep,
     "mega_moe": run_mega_moe,
 }
 # "gemm" (f4gemm a4w4) stays out: two back-to-back cases differing only in
@@ -1570,19 +1602,38 @@ OPS = {
 # profiler recorded no GPU work, not that the kernel was fast -- read it
 # alongside the kernel digest, which says whether anything reached the GPU.
 PERF_OPS = ["mha", "moe", "f8gemm", "mla_v4_decode"]
-# "mori_ep" is out of the default sweep: it benchmarks mori rather than aiter,
-# and it needs a dev ROCm toolchain to build. Run it explicitly when wanted.
 DSV4_OPS = [
     "mega_moe",
+    # mori's own EPv2 bench, not an aiter kernel, but it is the dispatch and
+    # combine either MoE path pays for -- the sweep is incomplete without the
+    # two all2all legs beside the GEMMs. Reads the mori tree the image ships
+    # (MORI=/app/mori); keeping that tree current is the image's job.
+    "mori_ep",
     "moe",
-    # "a8w8_blockscale" has no working path on gfx1250 as of the 20260826-ut
-    # image, so it stays out of the default sweep. Both routes are dead:
-    #   asm    -> asm_a8w8_blockscale_bpreshuffle.cu:281 "no kernel support
-    #             a8w8 blockscale for GPU arch: gfx1250"
-    #   triton -> --ck_preshuffle True --flydsl reaches the preshuffle kernel
-    #             instead, which fails to compile (PassManager::run failed,
-    #             tt.make_tensor_descriptor cannot be legalized for gfx1250)
-    # Run it explicitly with --ops a8w8_blockscale to re-check on a newer image.
+    # "a8w8_blockscale" stays out of the default sweep, but NOT because the op is
+    # dead on gfx1250 -- an earlier note here said that and it was wrong. The op
+    # runs: 20260827, the six DSv4 (n,k) at -m 512 give err=0 at 1210-3564
+    # TFLOPS, over ck / asm / flydsl.
+    #
+    # What kills it is the tuning table. gemm_op_a8w8.py routes a shape whose
+    # winning row has libtype=triton into gemm_afp8wfp8_preshuffle with
+    # backend="gluon", and that gluon kernel does not compile on this image
+    # (PassManager::run failed in triton's make_llir). gfx1250 has 11 such rows,
+    # all at M=16 and M=64, added by #4773 -- which replaced 11 faster flydsl
+    # rows and copied their tflops/bw columns over unchanged, so the rows do not
+    # even agree with their own us.
+    #
+    # All 11 were run: 11/11 fail, across K 768..7168 and N 1536..16384, every
+    # one at the same make_llir. Three shapes whose M misses those rows pass.
+    # So this is the gluon kernel, not eleven unlucky configs -- re-tuning
+    # cannot fix it either, since the tuner would fail to compile the same
+    # candidates and simply drop them.
+    #
+    # This op passes no -m, so the UT sweeps its 28-value default and hits M=2
+    # (padded onto the M=16 row) on the second value. Measured at n=2048,k=7168:
+    # 1/32/96/112/128/512 pass, 2/4/8/16/64 fail, 4/4 reproducible either way.
+    # Pinning -m past those M would make it runnable here, but the reported
+    # kernel would no longer be the tuned one. Fix #4773's rows instead.
     # "a8w8_blockscale",
     "a16w16",
     "mla_v4_decode",
