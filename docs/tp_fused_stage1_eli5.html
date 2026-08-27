@@ -179,54 +179,112 @@
   </div>
 </section>
 
-<!-- 3 -->
+<!-- 3a -->
+<section>
+  <h2>名词</h2>
+  <h3>「小队」是什么</h3>
+  <p class="lede">GPU 跑一个 kernel，起来的不是一大团线程，而是<strong>一批互相独立的工作组</strong>
+     （workgroup，CUDA 里叫 thread block）。本文里的「小队」就是它。</p>
+
+  <div class="fig">
+    <svg viewBox="0 0 900 165" role="img" aria-label="1024 个 workgroup，每个 256 线程">
+      <rect x="0" y="18" width="200" height="58" rx="8" fill="#161b22" stroke="#30363d"/>
+      <text x="100" y="42" fill="#e6edf3" font-size="15" text-anchor="middle" font-weight="700">1024 个小队</text>
+      <text x="100" y="62" fill="#8b949e" font-size="11.5" text-anchor="middle">256 CU × 4</text>
+
+      <text x="216" y="53" fill="#8b949e" font-size="16">×</text>
+
+      <rect x="238" y="18" width="200" height="58" rx="8" fill="#161b22" stroke="#30363d"/>
+      <text x="338" y="42" fill="#e6edf3" font-size="15" text-anchor="middle" font-weight="700">每队 256 线程</text>
+      <text x="338" y="62" fill="#8b949e" font-size="11.5" text-anchor="middle">4 个 wave × 64</text>
+
+      <text x="454" y="53" fill="#8b949e" font-size="16">=</text>
+
+      <rect x="476" y="18" width="230" height="58" rx="8" fill="#3fb950" opacity=".18" stroke="#3fb950"/>
+      <text x="591" y="52" fill="#3fb950" font-size="15" text-anchor="middle" font-weight="700">26 万个线程一起跑</text>
+
+      <text x="0" y="112" fill="#e6edf3" font-size="13">队内能商量，跨队不能</text>
+      <text x="0" y="136" fill="#8b949e" font-size="12.5">
+        同一队的 256 个线程共享一块片上暂存区，可以用 barrier 互相等；
+      </text>
+      <text x="0" y="156" fill="#8b949e" font-size="12.5">
+        不同队之间既不共享暂存区，也没法直接互等。所以「队」这个边界是真的。
+      </text>
+    </svg>
+  </div>
+</section>
+
+<!-- 3b -->
 <section>
   <h2>结构 · 第一步</h2>
   <h3>1024 个小队，抽号分工</h3>
-  <p class="lede">kernel 启动时会同时跑起 <strong>1024 个工作小队</strong>（每队 256 个线程）。
-     它们本来完全一样，需要有人负责搬数据、有人负责收尾。办法是<strong>抽号</strong>。</p>
+  <p class="lede">1024 个小队的代码<strong>完全一样</strong>，但需要有人搬数据、有人做准备。
+     办法是让每队去同一个计数器上加 1，拿走加之前的旧值，那就是它的号码。</p>
+
+<pre>ticket64 = <span class="f">atomic_add_agent</span>(a_entry_count, <span class="n">1</span>)   <span class="c"># 拿走旧值</span></pre>
+
+  <p>这个计数器<strong>永不清零</strong>，所以号码一直往上涨：</p>
 
   <div class="fig">
-    <svg viewBox="0 0 900 210" role="img" aria-label="抽号决定角色">
-      <rect x="0" y="10" width="180" height="46" rx="8" fill="#161b22" stroke="#30363d"/>
-      <text x="90" y="32" fill="#e6edf3" font-size="13" text-anchor="middle">一个计数器</text>
-      <text x="90" y="48" fill="#8b949e" font-size="11" text-anchor="middle">每队来加 1，拿走旧值</text>
-
-      <path d="M186 33 L232 33" stroke="#8b949e" stroke-width="1.5" marker-end="url(#ar)"/>
-      <defs><marker id="ar" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
-        <path d="M0 0 L8 4 L0 8 z" fill="#8b949e"/></marker></defs>
-
-      <g transform="translate(240,0)">
-        <rect x="0" y="10" width="120" height="46" rx="8" fill="#bc8cff" opacity=".22" stroke="#bc8cff"/>
-        <text x="60" y="30" fill="#bc8cff" font-size="14" text-anchor="middle" font-weight="700">号码 0</text>
-        <text x="60" y="47" fill="#c9b6e8" font-size="11.5" text-anchor="middle">队长</text>
-
-        <rect x="132" y="10" width="180" height="46" rx="8" fill="#58a6ff" opacity=".22" stroke="#58a6ff"/>
-        <text x="222" y="30" fill="#58a6ff" font-size="14" text-anchor="middle" font-weight="700">号码 1 – 32</text>
-        <text x="222" y="47" fill="#a9cff5" font-size="11.5" text-anchor="middle">搬运工</text>
-
-        <rect x="324" y="10" width="300" height="46" rx="8" fill="#3fb950" opacity=".18" stroke="#3fb950"/>
-        <text x="474" y="30" fill="#3fb950" font-size="14" text-anchor="middle" font-weight="700">号码 33 – 1023</text>
-        <text x="474" y="47" fill="#a6dfb2" font-size="11.5" text-anchor="middle">先待命</text>
+    <svg viewBox="0 0 900 260" role="img" aria-label="号码劈成轮次和角色两部分">
+      <text x="0" y="16" fill="#8b949e" font-size="13">号码一直涨</text>
+      <g font-size="12.5">
+        <text x="0"   y="42" fill="#8b949e">第 0 次调用</text>
+        <text x="120" y="42" fill="#e6edf3">0 … 1023</text>
+        <text x="0"   y="64" fill="#8b949e">第 1 次调用</text>
+        <text x="120" y="64" fill="#e6edf3">1024 … 2047</text>
+        <text x="0"   y="86" fill="#8b949e">第 2 次调用</text>
+        <text x="120" y="86" fill="#e6edf3">2048 … 3071</text>
       </g>
 
-      <rect x="0" y="98" width="864" height="1" fill="#30363d"/>
-      <text x="0" y="126" fill="#8b949e" font-size="13">搬运完之后</text>
-      <rect x="0" y="140" width="864" height="46" rx="8" fill="#3fb950" opacity=".18" stroke="#3fb950"/>
-      <text x="432" y="169" fill="#3fb950" font-size="14" text-anchor="middle" font-weight="700">
-        全部 1024 个小队一起做矩阵乘法（队长和搬运工也回来干活）
+      <rect x="300" y="24" width="1" height="72" fill="#30363d"/>
+
+      <text x="330" y="42" fill="#e6edf3" font-size="13" font-weight="600">除以 1024，商和余各有用处</text>
+      <rect x="330" y="54" width="240" height="42" rx="7" fill="#d29922" opacity=".18" stroke="#d29922"/>
+      <text x="450" y="72" fill="#d29922" font-size="12.5" text-anchor="middle" font-weight="700">商 = 第几次调用</text>
+      <text x="450" y="88" fill="#e0c078" font-size="11" text-anchor="middle">拿去当绿灯的暗号</text>
+      <rect x="586" y="54" width="240" height="42" rx="7" fill="#bc8cff" opacity=".18" stroke="#bc8cff"/>
+      <text x="706" y="72" fill="#bc8cff" font-size="12.5" text-anchor="middle" font-weight="700">余 = 本次的角色</text>
+      <text x="706" y="88" fill="#c9b6e8" font-size="11" text-anchor="middle">0 队长 / 1–32 搬运工 / 其余待命</text>
+
+      <rect x="0" y="122" width="864" height="1" fill="#30363d"/>
+
+      <text x="0" y="150" fill="#e6edf3" font-size="13" font-weight="600">
+        余数不只说「我是搬运工」，它把活也分完了
+      </text>
+      <g font-size="12.5">
+        <text x="0"   y="178" fill="#8b949e">号码 9</text>
+        <text x="80"  y="178" fill="#8b949e">→</text>
+        <text x="110" y="178" fill="#e6edf3">搬运工第 8 号</text>
+        <text x="240" y="178" fill="#8b949e">→</text>
+        <text x="270" y="178" fill="#58a6ff">8 ÷ 4 = 2，发给 GPU 2</text>
+        <text x="500" y="178" fill="#8b949e">→</text>
+        <text x="530" y="178" fill="#58a6ff">8 % 4 = 0，队里首个 wave 搬第 0、16、32… 行</text>
+      </g>
+      <text x="0" y="212" fill="#8b949e" font-size="12.5">
+        「发给谁」和「发哪些行」全由这一个数字定死，不查表、不协商。
+      </text>
+      <text x="0" y="238" fill="#8b949e" font-size="12.5">
+        32 个搬运队 ÷ 8 张卡 = 每张卡 4 队，所以除以 4、模 4。
       </text>
     </svg>
-    <p class="cap">抽号只用一次原子加法。号码除以队伍总数得到「第几轮调用」，余数就是角色。<br><strong style="color:#e6edf3">角色按抢到的先后分，不按编号分</strong>——谁先被调度上去、先执行到这条原子加法，谁就是队长。最早开工的那个去干准备工作，别人等得最短。</p>
   </div>
 
-<pre>gate_addr, gate_epoch, <span class="n">is_owner</span>, <span class="n">is_producer</span>, producer_slot = (
-    <span class="f">emit_ticket_and_roles</span>(
-        tid=tid, lds_scratch=lds.pool, a_entry_count=addr_entry_count,
-        a_epoch_gate=addr_epoch_gate, epoch_slot=_EPOCH_SLOT,
-        launch_grid_x=<span class="n">GRID_X</span>, producer_blocks=producer_blocks)
-)</pre>
-<p class="src">aiter/ops/flydsl/kernels/mega_moe/tp_fused_stage1.py:186–191</p>
+  <div class="grid2">
+    <div class="card">
+      <h4>为什么绿灯要带轮次号</h4>
+      <p>那个共享变量跨调用不清零。每轮都写 1 的话，第 2 轮的队伍会看到第 1 轮留下的 1
+         直接冲过去。带上轮次号，第 2 轮等的是 3，旧值骗不了它。清零要 host 介入同步，这么做绕开了。</p>
+    </div>
+    <div class="card">
+      <h4>号码不是 block 编号</h4>
+      <p>每个小队有两个身份。<strong>抽到的号码</strong>按到达先后分配，决定推送阶段干什么；
+         <strong>block 编号</strong>是硬件给的固定值，决定计算阶段领哪些块。两者互不相干。</p>
+    </div>
+  </div>
+
+  <p style="margin-top:22px">推送阶段用到达顺序，是为了让最早被调度上去的那队当队长，别人等得最短。
+     计算阶段用固定编号就够了，因为那时候大家已经被绿灯拉齐在同一起跑线。</p>
 </section>
 
 <!-- 4a -->
@@ -478,24 +536,37 @@ fx.<span class="f">barrier</span>()</pre>
 <!-- 8 -->
 <section>
   <h2>细节</h2>
-  <h3>片上小内存被用了两次</h3>
-  <p>每个小队有一块很小很快的暂存区（LDS）。<strong>抽号的时候</strong>用它的第 0 个字节
-     把号码广播给队里 256 个线程；<strong>算矩阵的时候</strong>整块拿来放数据。
-     一先一后，不冲突，所以不用开两块。</p>
+  <h3>抽号为什么要用到片上暂存区</h3>
+  <p class="lede">抽号那条原子加法<strong>只能让 1 个线程去做</strong>。
+     256 个线程都去加的话，一口气就消耗 256 个号码，「每队一个号」就变成「每线程一个号」，
+     角色划分整个乱掉。</p>
+  <p>可是拿完之后，剩下 255 个线程也得知道这个号——它们要判断自己是不是搬运工、该搬哪几行。
+     同队内部传一个值，最便宜的办法就是写进暂存区，等一下，大家各自读。</p>
 
+<pre><span class="k">if</span> tid == fx.Int32(<span class="n">0</span>):                      <span class="c"># 只有 0 号线程去抢</span>
+    ticket64 = <span class="f">atomic_add_agent</span>(a_entry_count, <span class="n">1</span>)
+    fx.<span class="f">ptr_store</span>(..., ticket_scratch)      <span class="c"># 写进暂存区第 0 个字节</span>
+fx.<span class="f">barrier</span>()                              <span class="c"># 等 0 号写完</span>
+ticket64 = Vec(ticket_view.<span class="f">load</span>())[<span class="n">0</span>]      <span class="c"># 256 个线程各自读出来</span></pre>
+<p class="src">collective_sched.py，<code>emit_ticket_and_roles</code></p>
+
+  <h3 style="margin-top:44px">同一块暂存区，先后两种用途</h3>
   <div class="fig">
-    <svg viewBox="0 0 900 120" role="img" aria-label="LDS 先后两次使用">
-      <rect x="0" y="24" width="864" height="46" rx="8" fill="#161b22" stroke="#30363d"/>
-      <rect x="4" y="28" width="60" height="38" rx="5" fill="#bc8cff" opacity=".5"/>
-      <text x="34" y="52" fill="#1a1024" font-size="10.5" text-anchor="middle" font-weight="700">号码</text>
-      <text x="90" y="52" fill="#8b949e" font-size="12">← 第一步用它广播</text>
+    <svg viewBox="0 0 900 150" role="img" aria-label="LDS 先用 8 字节广播号码，后整块放矩阵数据">
+      <text x="0" y="16" fill="#8b949e" font-size="13">每队 ≈ 23 KB 暂存区</text>
+      <rect x="0" y="30" width="864" height="46" rx="8" fill="#161b22" stroke="#30363d"/>
+      <rect x="4" y="34" width="26" height="38" rx="4" fill="#bc8cff" opacity=".6"/>
+      <text x="46" y="52" fill="#bc8cff" font-size="11.5">8 字节</text>
+      <text x="46" y="66" fill="#8b949e" font-size="10.5">抽号时广播</text>
+      <text x="440" y="57" fill="#8b949e" font-size="12">其余暂时空着</text>
 
-      <rect x="290" y="24" width="574" height="46" rx="8" fill="#3fb950" opacity=".22" stroke="#3fb950"/>
-      <text x="577" y="52" fill="#3fb950" font-size="13" text-anchor="middle" font-weight="700">
-        第五步整块拿来放矩阵数据
+      <rect x="0" y="90" width="864" height="46" rx="8" fill="#3fb950" opacity=".18" stroke="#3fb950"/>
+      <text x="432" y="118" fill="#3fb950" font-size="13.5" text-anchor="middle" font-weight="700">
+        算矩阵时整块拿来放数据，把那 8 字节一起覆盖掉
       </text>
-      <text x="0" y="100" fill="#8b949e" font-size="12.5">同一块内存，先后两种用途。这是 MegaMoE 原本就在用的做法。</text>
     </svg>
+    <p class="cap">覆盖掉没关系，号码早就读进寄存器了。时间上错开，所以不用为抽号单独再申请一块。
+       暂存区是稀缺资源，每个 CU 上就那么多，占得越少能同时跑的小队越多。</p>
   </div>
 </section>
 
