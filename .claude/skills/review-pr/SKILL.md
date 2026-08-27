@@ -101,22 +101,32 @@ if [ ! -r "$SCALE" ]; then
   exit 1
 fi
 cat "$SCALE"
+SCHEMA="$SKILLS_ROOT/validate-kernel-pr/report_schema.json"
+if [ ! -r "$SCHEMA" ]; then
+  echo "required validation report schema is missing: $SCHEMA" >&2
+  exit 1
+fi
 
 # Validation is opt-in and explicit. Never auto-load ./validation_report.json: a stale report
 # from another PR is worse than no report. Reject reports that do not name this exact head.
 if [ -n "$VALIDATION_REPORT" ]; then
-  python3 - "$WORK/pr_meta.json" "$WORK/base_head.txt" "$WORK/pr.diff" \
+  python3 - "$WORK/pr_meta.json" "$WORK/base_head.txt" "$WORK/pr.diff" "$SCHEMA" \
     "$VALIDATION_REPORT" "$WORK/validation_report.json" <<'PY'
 import hashlib
 import json
 import pathlib
 import sys
 
-meta_path, base_path, diff_path, report_path, out_path = map(
+meta_path, base_path, diff_path, schema_path, report_path, out_path = map(
     pathlib.Path, sys.argv[1:]
 )
 meta = json.loads(meta_path.read_text())
 report = json.loads(report_path.read_text())
+try:
+    import jsonschema
+except ImportError as error:
+    raise SystemExit(f"jsonschema is required to consume validation evidence: {error}")
+jsonschema.validate(report, json.loads(schema_path.read_text()))
 expected_head = meta["headRefOid"]
 actual_head = report.get("repo", {}).get("head")
 if actual_head != expected_head:
@@ -146,6 +156,7 @@ required_stages = {
     "baseline_control",
     "correctness_repo_tests",
     "correctness_s1_grid",
+    "execution_receipt",
     "index_width_scan",
 }
 missing = required_stages - report.get("stages", {}).keys()
@@ -176,6 +187,46 @@ for finding in findings:
 selection = report.get("test_selection", {})
 if not selection.get("pytest_target"):
     raise SystemExit("validation report does not name the pytest target it selected")
+if not selection.get("expected_route"):
+    raise SystemExit("validation report does not name the expected kernel route")
+if not selection.get("shape_vars"):
+    raise SystemExit("validation report does not name the route-call shape variables")
+identity = report.get("runtime_identity")
+if (
+    not isinstance(identity, dict)
+    or not identity.get("module_path")
+    or not identity.get("python_executable")
+    or not isinstance(identity.get("native_artifacts"), list)
+):
+    raise SystemExit("validation report has no runtime build identity")
+for stage_name in ("correctness_repo_tests", "correctness_s1_grid"):
+    stage = report["stages"][stage_name]
+    stats = stage.get("stats")
+    if stats is not None:
+        stat_keys = ("tests", "failures", "errors", "skipped", "executed")
+        if any(type(stats.get(key)) is not int for key in stat_keys):
+            raise SystemExit(f"{stage_name} has malformed JUnit counters")
+        if stats["executed"] != stats["tests"] - stats["skipped"]:
+            raise SystemExit(f"{stage_name} has inconsistent JUnit counters")
+    elif stage["status"] == "pass":
+        raise SystemExit(f"{stage_name} passed without JUnit counters")
+    if stage["status"] == "pass" and (
+        stage.get("exit") != 0
+        or stats.get("executed", 0) < 1
+        or stats.get("failures", 0) != 0
+        or stats.get("errors", 0) != 0
+    ):
+        raise SystemExit(f"{stage_name} has a hollow or contradictory pass")
+receipt = report["stages"]["execution_receipt"]
+required_shapes = [shape.strip() for shape in selection.get("grid", "").split(";") if shape.strip()]
+if receipt.get("status") == "pass" and (
+    receipt.get("producer") != "validate-kernel-pr.validation_probe"
+    or receipt.get("route") != selection["expected_route"]
+    or selection["expected_route"] not in receipt.get("kernel_symbols", [])
+    or sorted(set(receipt.get("required_shapes", []))) != sorted(set(required_shapes))
+    or not set(required_shapes).issubset(set(receipt.get("executed_shapes", [])))
+):
+    raise SystemExit("execution receipt contradicts the selected route/grid")
 severities = {
     finding.get("severity")
     for finding in findings
@@ -188,6 +239,7 @@ complete = (
     and report["stages"]["baseline_control"]["status"] == "pass"
     and report["stages"]["correctness_repo_tests"]["status"] == "pass"
     and report["stages"]["correctness_s1_grid"]["status"] == "pass"
+    and report["stages"]["execution_receipt"]["status"] == "pass"
     and report["stages"]["index_width_scan"]["status"] == "info"
 )
 expected_verdict = (
@@ -203,6 +255,14 @@ if report["verdict"] != expected_verdict:
     raise SystemExit(
         "validation verdict contradicts its stages/findings: "
         f"expected {expected_verdict}, got {report['verdict']}"
+    )
+expected_exit = 0 if expected_verdict == "PASS" else (
+    2 if expected_verdict == "INCONCLUSIVE" else 1
+)
+if report.get("process_exit_code") != expected_exit:
+    raise SystemExit(
+        "validation report exit-code contract is inconsistent: "
+        f"expected {expected_exit}, got {report.get('process_exit_code')}"
     )
 out_path.write_text(json.dumps(report, indent=2) + "\n")
 print(

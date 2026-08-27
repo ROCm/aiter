@@ -13,7 +13,7 @@
 # usage: validate_pr.sh --repo <worktree> --tests <pytest target> [--patch p.patch]
 #                       [--head-sha <expected PR head>] [--shape-env VAR]
 #                       [--grid "M,N,dt;..."] [--tol-table f32=1e-5,...]
-#                       [--label NAME] [--out report.json]
+#                       --expected-route NAME [--label NAME] [--out report.json]
 set -uo pipefail
 
 REPO_WT=""
@@ -22,6 +22,8 @@ PATCHF=""
 HEAD_SHA=""
 SHAPE_ENV=""
 GRID=""
+EXPECTED_ROUTE=""
+SHAPE_VARS=""
 TOL_TABLE=""
 LABEL="run"
 OUT=""
@@ -44,6 +46,8 @@ while [ "$#" -gt 0 ]; do
     --head-sha) need_value "$@"; HEAD_SHA="$2"; shift 2;;
     --shape-env) need_value "$@"; SHAPE_ENV="$2"; shift 2;;
     --grid) need_value "$@"; GRID="$2"; shift 2;;
+    --expected-route) need_value "$@"; EXPECTED_ROUTE="$2"; shift 2;;
+    --shape-vars) need_value "$@"; SHAPE_VARS="$2"; shift 2;;
     --tol-table) need_value "$@"; TOL_TABLE="$2"; shift 2;;
     --label) need_value "$@"; LABEL="$2"; shift 2;;
     --out) need_value "$@"; OUT="$2"; shift 2;;
@@ -76,6 +80,9 @@ fi
 mkdir -p "$(dirname "$OUT")"
 WORK=$(mktemp -d "/tmp/validate-kernel-pr-XXXXXX")
 JSON="$WORK/report.json"
+PROBE_DIR="$WORK/probe"
+PROBE_MODULE="validation_probe_${RANDOM}_${RANDOM}"
+mkdir -p "$PROBE_DIR"
 python3 - "$LABEL" "$JSON" <<'PY'
 import json
 import sys
@@ -162,15 +169,11 @@ PY
 mark_runtime_coverage() {
   python3 - "$JSON" "$1" <<'PY'
 import json
-import pathlib
-import re
 import sys
 
-report_path, log_path = sys.argv[1:3]
-log = pathlib.Path(log_path).read_text(errors="replace")
-collected = re.search(r"\bcollected\s+[1-9]\d*\s+items?\b", log)
-completed = re.search(r"\b[1-9]\d*\s+(?:passed|failed)\b", log)
-if not (collected or completed):
+report_path, raw_stats = sys.argv[1:3]
+stats = json.loads(raw_stats)
+if stats["executed"] < 1:
     raise SystemExit(0)
 data = json.load(open(report_path))
 gpu = data["stages"].get("gpu_claim", {})
@@ -198,6 +201,7 @@ required_stages = (
     "baseline_control",
     "correctness_repo_tests",
     "correctness_s1_grid",
+    "execution_receipt",
     "index_width_scan",
 )
 for name in required_stages:
@@ -216,13 +220,16 @@ for name in required_stages:
 
 severities = {finding["severity"] for finding in data["findings"]}
 complete = (
-    data["stages"]["merge_sim"]["status"] == "pass"
+    isinstance(data.get("runtime_identity"), dict)
+    and bool(data["runtime_identity"].get("module_path"))
+    and data["stages"]["merge_sim"]["status"] == "pass"
     and data["stages"]["gpu_claim"]["status"] == "pass"
     and data["stages"]["runtime_compat"]["status"] == "pass"
     and data["stages"]["test_policy"]["status"] == "pass"
     and data["stages"]["baseline_control"]["status"] == "pass"
     and data["stages"]["correctness_repo_tests"]["status"] == "pass"
     and data["stages"]["correctness_s1_grid"]["status"] == "pass"
+    and data["stages"]["execution_receipt"]["status"] == "pass"
     and data["stages"]["index_width_scan"]["status"] == "info"
 )
 if "blocker" in severities:
@@ -234,6 +241,9 @@ elif not complete:
 else:
     verdict = "PASS"
 data["verdict"] = verdict
+data["process_exit_code"] = (
+    0 if verdict == "PASS" else (2 if verdict == "INCONCLUSIVE" else 1)
+)
 data["finished_utc"] = datetime.datetime.now(datetime.timezone.utc).strftime(
     "%Y-%m-%dT%H:%M:%SZ"
 )
@@ -300,9 +310,12 @@ jset_json "isolation" \
   '{"level":"git-worktree + private caches","container":false,"reason":"tests run in the supplied worktree with private HOME and compiler caches"}'
 jset_json "arch_coverage" '{}'
 jset_json "degraded_mode" 'null'
+jset_json "runtime_identity" 'null'
 jset_string "test_selection.pytest_target" "$TESTS"
 jset_string "test_selection.shape_env" "$SHAPE_ENV"
 jset_string "test_selection.grid" "$GRID"
+jset_string "test_selection.expected_route" "$EXPECTED_ROUTE"
+jset_string "test_selection.shape_vars" "$SHAPE_VARS"
 
 # ---------- stage 1: merge simulation ----------
 BASE_SHA=$(git -C "$REPO_WT" rev-parse HEAD)
@@ -446,11 +459,11 @@ fi
 
 # ---------- stage 3: repo-aware runtime compatibility ----------
 RUNTIME_OK=0
-FLYDSL_SOURCE_CHANGED=0
+RUNTIME_SOURCE_CHANGED=0
 RC_OUT=""
 RC=0
 if [ -n "$PATCHF" ]; then
-  FLYDSL_SOURCE_CHANGED=$(python3 - "$PATCHF" <<'PY'
+  RUNTIME_SOURCE_CHANGED=$(python3 - "$PATCHF" <<'PY'
 import re
 import sys
 
@@ -460,7 +473,17 @@ paths = re.findall(
     diff,
     re.MULTILINE,
 )
-print(int(any(path.startswith("python/flydsl/") for path in paths)))
+runtime_prefixes = (
+    "python/flydsl/",
+    "python/mlir_flydsl/",
+    "lib/",
+    "include/",
+    "cmake/",
+    "thirdparty/",
+    "tools/",
+)
+runtime_files = {"CMakeLists.txt", "MANIFEST.in", "setup.py", "pyproject.toml"}
+print(int(any(path.startswith(runtime_prefixes) or path in runtime_files for path in paths)))
 PY
 )
 fi
@@ -487,13 +510,13 @@ PY
     RC=$?
     ;;
   flydsl)
-    if [ "$FLYDSL_SOURCE_CHANGED" -eq 1 ] && [ -n "$PYLIB" ]; then
+    if [ "$RUNTIME_SOURCE_CHANGED" -eq 1 ] && [ -n "$PYLIB" ]; then
       RC=2
-      RC_OUT="patch changes python/flydsl, but PYLIB would shadow that source; a checkout-matched rebuilt runtime is required"
+      RC_OUT="patch changes FlyDSL runtime/build inputs; trusted build provenance is not implemented, so PYLIB cannot validate this patch"
     elif [ -n "$PYLIB" ]; then
       PROBE_PATH="$PYLIB:$REPO_WT/python"
       EXPECTED_FLYDSL_ROOT="$PYLIB"
-    elif [ "$FLYDSL_SOURCE_CHANGED" -eq 1 ]; then
+    elif [ "$RUNTIME_SOURCE_CHANGED" -eq 1 ]; then
       PROBE_PATH="$REPO_WT/python"
       EXPECTED_FLYDSL_ROOT="$REPO_WT/python"
     else
@@ -546,8 +569,45 @@ print(" ".join(sys.argv[1].splitlines()[-3:])[:300])
 PY
 )
 if [ "$RC" -eq 0 ]; then
-  stage_note "runtime_compat" "pass" "$RC_DETAIL"
-  RUNTIME_OK=1
+  IDENTITY_FILE="$WORK/runtime-identity.json"
+  if [ "$REPO_KIND" = "aiter" ]; then
+    DEPENDENCY_ARGS=()
+    [ -n "$PYLIB" ] && DEPENDENCY_ARGS=(--dependency-root "$PYLIB")
+    (
+      cd "$REPO_WT" \
+        && AITER_TRITON_ONLY=1 PYTHONDONTWRITEBYTECODE=1 \
+          PYTHONPATH="$PROBE_PATH" timeout 300 \
+          python3 "$SCRIPT_DIR/validate_evidence.py" runtime aiter "$REPO_WT" \
+          "${DEPENDENCY_ARGS[@]}" --output "$IDENTITY_FILE"
+    ) >"$WORK/runtime-identity.log" 2>&1
+    IDENTITY_RC=$?
+  else
+    (
+      cd "$REPO_WT" \
+        && PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$PROBE_PATH" \
+          timeout 300 python3 "$SCRIPT_DIR/validate_evidence.py" runtime flydsl \
+          "$EXPECTED_FLYDSL_ROOT" --output "$IDENTITY_FILE"
+    ) >"$WORK/runtime-identity.log" 2>&1
+    IDENTITY_RC=$?
+  fi
+  if [ "$IDENTITY_RC" -eq 0 ] && [ -s "$IDENTITY_FILE" ]; then
+    RUNTIME_IDENTITY=$(<"$IDENTITY_FILE")
+    if python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$IDENTITY_FILE" \
+        && jset_json "runtime_identity" "$RUNTIME_IDENTITY"; then
+      stage_note "runtime_compat" "pass" "$RC_DETAIL"
+      RUNTIME_OK=1
+    else
+      stage_note "runtime_compat" "skip" \
+        "runtime identity output was not valid JSON"
+      finding "note" "runtime_compat" \
+        "runtime build identity could not be parsed; correctness is not trusted"
+    fi
+  else
+    stage_note "runtime_compat" "skip" \
+      "runtime imported but build identity collection failed"
+    finding "note" "runtime_compat" \
+      "runtime build identity could not be recorded; correctness is not trusted"
+  fi
 else
   stage_note "runtime_compat" "skip" "$RC_DETAIL"
   jset_string "stages.runtime_compat.reason" "runtime_mismatch"
@@ -694,6 +754,7 @@ if [ "$REPO_KIND" = "flydsl" ] && [ -n "$PYLIB" ]; then
 else
   TEST_PYTHONPATH="$REPO_WT/python:$REPO_WT${PYLIB:+:$PYLIB}"
 fi
+TEST_PYTHONPATH="$PROBE_DIR:$SCRIPT_DIR:$TEST_PYTHONPATH"
 TEST_FILE=${TESTS%%::*}
 GRID_HOOK_OK=0
 if [ -n "$SHAPE_ENV" ] && [ -n "$GRID" ] \
@@ -742,9 +803,26 @@ run_pytest() {
   local log="$WORK/pytest-$label.log"
   local phase=${label%%-*}
   local cache_root="$WORK/$phase"
+  local junit="$cache_root/junit-$label.xml"
+  local receipt="$cache_root/execution-receipt.json"
   mkdir -p "$cache_root/home" "$cache_root/xdg-cache" \
     "$cache_root/flydsl-cache" "$cache_root/triton-cache" \
     "$cache_root/torch-extensions" "$cache_root/pytest-cache"
+  rm -f "$junit" "$receipt"
+  python3 - "$SCRIPT_DIR/validation_probe.py" \
+    "$PROBE_DIR/$PROBE_MODULE.py" "$EXPECTED_ROUTE" "$SHAPE_VARS" "$receipt" <<'PY'
+import pathlib
+import sys
+
+source, output, route, shape_vars, receipt = sys.argv[1:6]
+text = pathlib.Path(source).read_text()
+text += (
+    f"\n_VALIDATION_EXPECTED_ROUTE = {route!r}\n"
+    f"_VALIDATION_SHAPE_VARS = {shape_vars!r}\n"
+    f"_VALIDATION_RECEIPT_PATH = {receipt!r}\n"
+)
+pathlib.Path(output).write_text(text)
+PY
   local -a environment=(
     "HIP_VISIBLE_DEVICES=$PICK"
     "PYTHONPATH=$TEST_PYTHONPATH"
@@ -755,6 +833,7 @@ run_pytest() {
     "FLYDSL_RUNTIME_CACHE_DIR=$cache_root/flydsl-cache"
     "TRITON_CACHE_DIR=$cache_root/triton-cache"
     "TORCH_EXTENSIONS_DIR=$cache_root/torch-extensions"
+    "VALIDATION_PHASE=$label"
   )
   if [ -n "$shape_assignment" ]; then
     environment+=("$shape_assignment")
@@ -762,10 +841,32 @@ run_pytest() {
   (
     cd "$REPO_WT" \
       && env "${environment[@]}" timeout "$TIMEOUT" \
-        python -m pytest "$TESTS" -x -q -o "cache_dir=$cache_root/pytest-cache"
+        python -m pytest -p "$PROBE_MODULE" "$TESTS" -x -q \
+          --junitxml="$junit" -o "cache_dir=$cache_root/pytest-cache"
   ) >"$log" 2>&1
   local result=$?
   echo "$result|$log"
+}
+
+pytest_stats() {
+  local label="$1"
+  local phase=${label%%-*}
+  local junit="$WORK/$phase/junit-$label.xml"
+  if [ -f "$junit" ]; then
+    python3 "$SCRIPT_DIR/validate_evidence.py" pytest-stats "$junit"
+  else
+    printf '%s\n' \
+      '{"tests":0,"failures":0,"errors":1,"skipped":0,"executed":0,"note":"JUnit XML missing"}'
+  fi
+}
+
+stats_field() {
+  python3 - "$1" "$2" <<'PY'
+import json
+import sys
+
+print(json.loads(sys.argv[1])[sys.argv[2]])
+PY
 }
 
 CAN_TEST=1
@@ -795,6 +896,7 @@ if [ "$CAN_TEST" -eq 0 ]; then
   stage_note "baseline_control" "skip" "$SKIP_REASON"
   stage_note "correctness_repo_tests" "skip" "$SKIP_REASON"
   stage_note "correctness_s1_grid" "skip" "$SKIP_REASON"
+  stage_note "execution_receipt" "skip" "$SKIP_REASON"
   finding "note" "correctness" "$SKIP_REASON; this report makes no correctness claim"
 else
   BASE_READY=0
@@ -812,7 +914,13 @@ else
         BASE_RESULT=$(run_pytest "base-repo" "")
         BASE_REPO_RC=${BASE_RESULT%%|*}
         BASE_REPO_LOG=${BASE_RESULT##*|}
-        BASE_REPO_STATE="ran"
+        BASE_REPO_STATS=$(pytest_stats "base-repo")
+        if [ "$BASE_REPO_RC" -eq 0 ] \
+            && [ "$(stats_field "$BASE_REPO_STATS" executed)" -eq 0 ]; then
+          BASE_REPO_STATE="all-skipped"
+        else
+          BASE_REPO_STATE="ran"
+        fi
       else
         BASE_REPO_STATE="target-not-present"
       fi
@@ -828,7 +936,13 @@ else
             BASE_GRID_RESULT=$(run_pytest "base-grid" "$SHAPE_ENV=$GRID")
             BASE_GRID_RC=${BASE_GRID_RESULT%%|*}
             BASE_GRID_LOG=${BASE_GRID_RESULT##*|}
-            BASE_GRID_STATE="ran"
+            BASE_GRID_STATS=$(pytest_stats "base-grid")
+            if [ "$BASE_GRID_RC" -eq 0 ] \
+                && [ "$(stats_field "$BASE_GRID_STATS" executed)" -eq 0 ]; then
+              BASE_GRID_STATE="all-skipped"
+            else
+              BASE_GRID_STATE="ran"
+            fi
           fi
         else
           BASE_GRID_STATE="target-not-present"
@@ -862,9 +976,14 @@ else
       finding "note" "baseline_control" \
         "base isolation failed or produced worktree artifacts; attribution is inconclusive"
     else
+      [ -n "${BASE_REPO_STATS:-}" ] || \
+        BASE_REPO_STATS='{"tests":0,"failures":0,"errors":0,"skipped":0,"executed":0}'
+      [ -n "${BASE_GRID_STATS:-}" ] || \
+        BASE_GRID_STATS='{"tests":0,"failures":0,"errors":0,"skipped":0,"executed":0}'
       python3 - "$JSON" "$BASE_REPO_STATE" "${BASE_REPO_RC:-}" \
-        "$BASE_REPO_LOG" "$BASE_GRID_STATE" "${BASE_GRID_RC:-}" \
-        "$BASE_GRID_LOG" "${BASE_PROBE_RC:-}" "${BASE_PROBE_LOG:-}" <<'PY'
+        "$BASE_REPO_LOG" "$BASE_REPO_STATS" "$BASE_GRID_STATE" \
+        "${BASE_GRID_RC:-}" "$BASE_GRID_LOG" "$BASE_GRID_STATS" \
+        "${BASE_PROBE_RC:-}" "${BASE_PROBE_LOG:-}" <<'PY'
 import json
 import sys
 
@@ -873,16 +992,18 @@ import sys
     repo_state,
     repo_exit,
     repo_log,
+    repo_stats,
     grid_state,
     grid_exit,
     grid_log,
+    grid_stats,
     probe_exit,
     probe_log,
-) = sys.argv[1:10]
+) = sys.argv[1:12]
 stage = {
     "status": "pass",
-    "repo_tests": {"state": repo_state},
-    "s1_grid": {"state": grid_state},
+    "repo_tests": {"state": repo_state, "stats": json.loads(repo_stats)},
+    "s1_grid": {"state": grid_state, "stats": json.loads(grid_stats)},
 }
 if repo_exit:
     stage["repo_tests"]["exit"] = int(repo_exit)
@@ -907,21 +1028,33 @@ PY
     HEAD_RESULT=$(run_pytest "head-repo" "")
     HEAD_RC=${HEAD_RESULT%%|*}
     HEAD_LOG=${HEAD_RESULT##*|}
-    python3 - "$JSON" "$HEAD_RC" "$HEAD_LOG" <<'PY'
+    HEAD_STATS=$(pytest_stats "head-repo")
+    HEAD_EXECUTED=$(stats_field "$HEAD_STATS" executed)
+    python3 - "$JSON" "$HEAD_RC" "$HEAD_LOG" "$HEAD_STATS" <<'PY'
 import json
 import sys
 
-path, exit_code, log = sys.argv[1:4]
+path, exit_code, log, raw_stats = sys.argv[1:5]
 data = json.load(open(path))
+stats = json.loads(raw_stats)
+status = "fail" if int(exit_code) else ("pass" if stats["executed"] else "skip")
 data["stages"]["correctness_repo_tests"] = {
-    "status": "pass" if int(exit_code) == 0 else "fail",
+    "status": status,
     "exit": int(exit_code),
     "log": log,
+    "stats": stats,
 }
+if status == "skip":
+    data["stages"]["correctness_repo_tests"]["note"] = (
+        "pytest completed with no executed tests"
+    )
 json.dump(data, open(path, "w"), indent=2)
 PY
-    mark_runtime_coverage "$HEAD_LOG"
-    if [ "$HEAD_RC" -ne 0 ]; then
+    mark_runtime_coverage "$HEAD_STATS"
+    if [ "$HEAD_RC" -eq 0 ] && [ "$HEAD_EXECUTED" -eq 0 ]; then
+      finding "note" "correctness" \
+        "repository pytest target collected no executable tests; no correctness claim is made"
+    elif [ "$HEAD_RC" -ne 0 ]; then
       HEAD_EXCERPT=$(log_excerpt "$HEAD_LOG")
       if [ -z "$PATCHF" ]; then
         finding "blocker" "correctness" \
@@ -946,6 +1079,8 @@ PY
       if [ "$HEAD_PROBE_RC" -eq 0 ]; then
         stage_note "correctness_s1_grid" "skip" \
           "pytest target ignores the shape environment variable at runtime"
+        stage_note "execution_receipt" "skip" \
+          "shape environment runtime handshake failed"
         jset_json "stages.correctness_s1_grid.hook_probe_exit" "$HEAD_PROBE_RC"
         jset_string "stages.correctness_s1_grid.hook_probe_log" "$HEAD_PROBE_LOG"
         finding "note" "correctness" \
@@ -954,25 +1089,37 @@ PY
         HEAD_GRID_RESULT=$(run_pytest "head-grid" "$SHAPE_ENV=$GRID")
         HEAD_GRID_RC=${HEAD_GRID_RESULT%%|*}
         HEAD_GRID_LOG=${HEAD_GRID_RESULT##*|}
+        HEAD_GRID_STATS=$(pytest_stats "head-grid")
+        HEAD_GRID_EXECUTED=$(stats_field "$HEAD_GRID_STATS" executed)
         python3 - "$JSON" "$HEAD_GRID_RC" "$GRID" "$HEAD_GRID_LOG" \
-          "$HEAD_PROBE_RC" "$HEAD_PROBE_LOG" <<'PY'
+          "$HEAD_GRID_STATS" "$HEAD_PROBE_RC" "$HEAD_PROBE_LOG" <<'PY'
 import json
 import sys
 
-path, exit_code, grid, log, probe_exit, probe_log = sys.argv[1:7]
+path, exit_code, grid, log, raw_stats, probe_exit, probe_log = sys.argv[1:8]
 data = json.load(open(path))
+stats = json.loads(raw_stats)
+status = "fail" if int(exit_code) else ("pass" if stats["executed"] else "skip")
 data["stages"]["correctness_s1_grid"] = {
-    "status": "pass" if int(exit_code) == 0 else "fail",
+    "status": status,
     "exit": int(exit_code),
     "grid": grid,
     "log": log,
+    "stats": stats,
     "hook_probe_exit": int(probe_exit),
     "hook_probe_log": probe_log,
 }
+if status == "skip":
+    data["stages"]["correctness_s1_grid"]["note"] = (
+        "pytest grid completed with no executed tests"
+    )
 json.dump(data, open(path, "w"), indent=2)
 PY
-        mark_runtime_coverage "$HEAD_GRID_LOG"
-        if [ "$HEAD_GRID_RC" -ne 0 ]; then
+        mark_runtime_coverage "$HEAD_GRID_STATS"
+        if [ "$HEAD_GRID_RC" -eq 0 ] && [ "$HEAD_GRID_EXECUTED" -eq 0 ]; then
+          finding "note" "correctness" \
+            "shape-grid pytest target executed no tests; no grid claim is made"
+        elif [ "$HEAD_GRID_RC" -ne 0 ]; then
           GRID_EXCERPT=$(log_excerpt "$HEAD_GRID_LOG")
           if [ -z "$PATCHF" ]; then
             finding "blocker" "correctness" \
@@ -988,15 +1135,36 @@ PY
               "the independent grid is red on both baseline and head; attribution is inconclusive"
           fi
         fi
+        RECEIPT_JSON=$(
+          python3 "$SCRIPT_DIR/validate_evidence.py" receipt \
+            "$WORK/head/execution-receipt.json" \
+            --expected-route "$EXPECTED_ROUTE" --grid "$GRID"
+        )
+        jset_json "stages.execution_receipt" "$RECEIPT_JSON"
+        RECEIPT_STATUS=$(python3 - "$RECEIPT_JSON" <<'PY'
+import json
+import sys
+
+print(json.loads(sys.argv[1])["status"])
+PY
+)
+        if [ "$RECEIPT_STATUS" != "pass" ]; then
+          finding "note" "execution_receipt" \
+            "route/shape execution receipt was not established; PASS is not permitted"
+        fi
       fi
     elif [ -n "$SHAPE_ENV" ] && [ -n "$GRID" ]; then
       stage_note "correctness_s1_grid" "skip" \
         "configured shape environment variable is not referenced by the pytest target"
+      stage_note "execution_receipt" "skip" \
+        "shape-grid hook was not established"
       finding "note" "correctness" \
         "the selected pytest target does not consume the configured shape-grid hook"
     else
       stage_note "correctness_s1_grid" "skip" \
         "kernel exposes no configured shape override; coverage is repo-default-only"
+      stage_note "execution_receipt" "skip" \
+        "no shape grid was configured"
       finding "note" "correctness" \
         "no independent shape-grid hook was configured; coverage is limited to repository defaults"
     fi
@@ -1004,6 +1172,8 @@ PY
     stage_note "correctness_repo_tests" "skip" \
       "candidate patch was not restored after baseline control"
     stage_note "correctness_s1_grid" "skip" \
+      "candidate patch was not restored after baseline control"
+    stage_note "execution_receipt" "skip" \
       "candidate patch was not restored after baseline control"
   fi
 fi
@@ -1056,3 +1226,16 @@ fi
 
 record_gpu_activity_after
 finish_report
+FINAL_VERDICT=$(python3 - "$OUT" <<'PY'
+import json
+import sys
+
+print(json.load(open(sys.argv[1]))["verdict"])
+PY
+)
+case "$FINAL_VERDICT" in
+  PASS) exit 0;;
+  BLOCK|NEEDS_WORK) exit 1;;
+  INCONCLUSIVE) exit 2;;
+  *) exit 2;;
+esac

@@ -19,6 +19,7 @@ REQUIRED_STAGES = {
     "baseline_control",
     "correctness_repo_tests",
     "correctness_s1_grid",
+    "execution_receipt",
     "index_width_scan",
 }
 
@@ -32,10 +33,12 @@ def validate_report_contract(report):
         "arch_coverage",
         "degraded_mode",
         "repo",
+        "runtime_identity",
         "test_selection",
         "stages",
         "findings",
         "verdict",
+        "process_exit_code",
     }
     if missing := required - report.keys():
         raise AssertionError(f"report fields missing: {sorted(missing)}")
@@ -87,9 +90,16 @@ class ValidatorFixture:
             'if _GRID == "__VALIDATOR_INVALID_GRID__":\n'
             '    raise ValueError("invalid validator grid probe")\n'
             '# (7, 257, "f32")\n'
+            "def run_kernel(M, N, dtype_str):\n"
+            "    assert M > 0 and N > 0 and dtype_str\n"
+            "\n"
             "def test_sample():\n"
             "    atol = 1e-5\n"
             "    assert atol < 1\n"
+            '    shapes = _GRID or "7,257,f32"\n'
+            "    for shape in shapes.split(';'):\n"
+            "        M, N, dtype_str = shape.split(',')\n"
+            "        run_kernel(int(M), int(N), dtype_str)\n"
         )
         run(["git", "init", "-q"], cwd=self.repo)
         run(["git", "add", "."], cwd=self.repo)
@@ -129,6 +139,39 @@ class ValidatorFixture:
     def close(self):
         self.tempdir.cleanup()
 
+    def convert_to_flydsl(self):
+        shutil.rmtree(self.repo / "aiter")
+        source = self.repo / "python" / "flydsl"
+        source.mkdir(parents=True)
+        (source / "__init__.py").write_text('__version__ = "test"\n')
+        (source / "module.py").write_text("VALUE = 1\n")
+        native = self.repo / "lib" / "Bindings"
+        native.mkdir(parents=True)
+        (native / "module.cpp").write_text("int value = 1;\n")
+        mlir_python = self.repo / "python" / "mlir_flydsl"
+        mlir_python.mkdir(parents=True)
+        (mlir_python / "FlyRegisterEverything.cpp").write_text("int value = 1;\n")
+        (self.repo / "MANIFEST.in").write_text("include README.md\n")
+        run(["git", "add", "-A"], cwd=self.repo)
+        run(
+            [
+                "git",
+                "-c",
+                "user.name=Validator Test",
+                "-c",
+                "user.email=validator@example.com",
+                "commit",
+                "-q",
+                "-m",
+                "flydsl base",
+            ],
+            cwd=self.repo,
+        )
+        runtime = self.root / "runtime" / "flydsl"
+        runtime.mkdir(parents=True)
+        (runtime / "__init__.py").write_text('__version__ = "test"\n')
+        return source, runtime
+
     def make_patch(self, mutate, name="candidate.patch"):
         mutate(self.repo)
         run(["git", "add", "-A"], cwd=self.repo)
@@ -146,6 +189,8 @@ class ValidatorFixture:
         path_prefix=None,
         pylib=None,
         grid=True,
+        expected_route="test_sample:run_kernel",
+        grid_value="7,257,f32",
     ):
         report = self.root / f"{patch.stem}-report.json"
         command = [
@@ -158,6 +203,10 @@ class ValidatorFixture:
             "b" * 40,
             "--tests",
             tests,
+            "--expected-route",
+            expected_route,
+            "--shape-vars",
+            "M,N,dtype_str",
             "--tol-table",
             "f32=1e-5,f16=2e-3,bf16=1e-2",
             "--label",
@@ -171,7 +220,7 @@ class ValidatorFixture:
                     "--shape-env",
                     "VALIDATOR_TEST_GRID",
                     "--grid",
-                    "7,257,f32",
+                    grid_value,
                 ]
             )
         environment = os.environ.copy()
@@ -215,8 +264,9 @@ class ValidateKernelPrTests(unittest.TestCase):
         no_gpu_picker = self.fixture.tools / "no-gpu-picker"
         write_executable(no_gpu_picker, "#!/usr/bin/env bash\nexit 1\n")
 
-        _, report = self.fixture.validate(patch, picker=no_gpu_picker)
+        result, report = self.fixture.validate(patch, picker=no_gpu_picker)
 
+        self.assertEqual(2, result.returncode)
         self.assertEqual("INCONCLUSIVE", report["verdict"])
         self.assertEqual("skip", report["stages"]["gpu_claim"]["status"])
         self.assertEqual("NO_GPU", report["degraded_mode"])
@@ -228,8 +278,12 @@ class ValidateKernelPrTests(unittest.TestCase):
     def test_runtime_probe_uses_aiter_checkout_and_full_run_can_pass(self):
         patch = self.fixture.make_patch(self.harmless_change, "repo-aware.patch")
 
-        _, report = self.fixture.validate(patch)
+        result, report = self.fixture.validate(
+            patch,
+            grid_value="7,257,f32;8,513,bf16",
+        )
 
+        self.assertEqual(0, result.returncode)
         self.assertEqual("PASS", report["verdict"])
         runtime = report["stages"]["runtime_compat"]
         self.assertEqual("pass", runtime["status"])
@@ -244,6 +298,11 @@ class ValidateKernelPrTests(unittest.TestCase):
             "tests/test_sample.py",
             report["test_selection"]["pytest_target"],
         )
+        self.assertEqual("pass", report["stages"]["execution_receipt"]["status"])
+        self.assertEqual(
+            "test_sample:run_kernel", report["stages"]["execution_receipt"]["route"]
+        )
+        self.assertEqual("aiter", report["runtime_identity"]["module"])
 
     def test_new_failing_test_is_not_mislabeled_preexisting(self):
         def add_failing_test(repo):
@@ -252,12 +311,13 @@ class ValidateKernelPrTests(unittest.TestCase):
             )
 
         patch = self.fixture.make_patch(add_failing_test, "new-test.patch")
-        _, report = self.fixture.validate(
+        result, report = self.fixture.validate(
             patch,
             tests="tests/test_new.py",
             grid=False,
         )
 
+        self.assertEqual(1, result.returncode)
         self.assertEqual("BLOCK", report["verdict"])
         baseline = report["stages"]["baseline_control"]["repo_tests"]
         self.assertEqual("target-not-present", baseline["state"])
@@ -274,8 +334,9 @@ class ValidateKernelPrTests(unittest.TestCase):
         no_gpu_picker = self.fixture.tools / "no-gpu-picker"
         write_executable(no_gpu_picker, "#!/usr/bin/env bash\nexit 1\n")
 
-        _, report = self.fixture.validate(patch, picker=no_gpu_picker)
+        result, report = self.fixture.validate(patch, picker=no_gpu_picker)
 
+        self.assertEqual(1, result.returncode)
         self.assertEqual("BLOCK", report["verdict"])
         self.assertEqual("fail", report["stages"]["test_policy"]["status"])
         self.assertEqual([[1e-5, 1e-1]], report["stages"]["test_policy"]["loosened"])
@@ -294,30 +355,120 @@ class ValidateKernelPrTests(unittest.TestCase):
         self.assertEqual({}, report["arch_coverage"])
         self.assert_complete_stage_objects(report)
 
-    def test_flydsl_source_change_is_not_shadowed_by_pylib(self):
-        shutil.rmtree(self.fixture.repo / "aiter")
-        source = self.fixture.repo / "python" / "flydsl"
-        source.mkdir(parents=True)
-        (source / "__init__.py").write_text('__version__ = "test"\n')
-        (source / "module.py").write_text("VALUE = 1\n")
-        run(["git", "add", "-A"], cwd=self.fixture.repo)
-        run(
-            [
-                "git",
-                "-c",
-                "user.name=Validator Test",
-                "-c",
-                "user.email=validator@example.com",
-                "commit",
-                "-q",
-                "-m",
-                "flydsl base",
-            ],
-            cwd=self.fixture.repo,
+    def test_all_skipped_pytest_is_inconclusive(self):
+        def skip_test(repo):
+            path = repo / "tests" / "test_sample.py"
+            path.write_text(
+                "import pytest\n"
+                "pytestmark = pytest.mark.skip(reason='not applicable')\n"
+                + path.read_text()
+            )
+
+        patch = self.fixture.make_patch(skip_test, "all-skipped.patch")
+        result, report = self.fixture.validate(patch)
+
+        self.assertEqual(2, result.returncode)
+        self.assertEqual("INCONCLUSIVE", report["verdict"])
+        stage = report["stages"]["correctness_repo_tests"]
+        self.assertEqual("skip", stage["status"])
+        self.assertEqual(0, stage["stats"]["executed"])
+        self.assertEqual(1, stage["stats"]["skipped"])
+        self.assertEqual({}, report["arch_coverage"])
+
+    def test_missing_execution_receipt_prevents_pass(self):
+        def remove_route_call(repo):
+            path = repo / "tests" / "test_sample.py"
+            path.write_text(
+                path.read_text().replace(
+                    "        run_kernel(int(M), int(N), dtype_str)\n",
+                    "        assert int(M) > 0 and int(N) > 0 and dtype_str\n",
+                )
+            )
+
+        patch = self.fixture.make_patch(remove_route_call, "missing-receipt.patch")
+        result, report = self.fixture.validate(patch)
+
+        self.assertEqual(2, result.returncode)
+        self.assertEqual("INCONCLUSIVE", report["verdict"])
+        self.assertEqual("skip", report["stages"]["execution_receipt"]["status"])
+
+    def test_worktree_cannot_shadow_validator_probe(self):
+        def add_fake_probe_and_remove_route(repo):
+            (repo / "validation_probe.py").write_text(
+                "def pytest_configure(config): pass\n"
+                "def pytest_sessionfinish(session, exitstatus): pass\n"
+            )
+            (repo / "conftest.py").write_text(
+                "import json\n"
+                "import os\n"
+                "import pytest\n"
+                "@pytest.hookimpl(trylast=True)\n"
+                "def pytest_sessionfinish(session, exitstatus):\n"
+                '    path = os.environ.get("VALIDATION_EVIDENCE_PATH")\n'
+                "    if path:\n"
+                "        open(path, 'w').write(json.dumps({\n"
+                "            'schema_version': 1,\n"
+                "            'producer': 'validate-kernel-pr.validation_probe',\n"
+                "            'route': 'test_sample:run_kernel',\n"
+                "            'kernel_symbols': ['test_sample:run_kernel'],\n"
+                "            'executed_shapes': ['7,257,f32'],\n"
+                "        }))\n"
+            )
+            path = repo / "tests" / "test_sample.py"
+            path.write_text(
+                path.read_text().replace(
+                    "        run_kernel(int(M), int(N), dtype_str)\n",
+                    "        assert int(M) > 0 and int(N) > 0 and dtype_str\n",
+                )
+            )
+
+        patch = self.fixture.make_patch(
+            add_fake_probe_and_remove_route,
+            "shadow-probe.patch",
         )
-        runtime = self.fixture.root / "runtime" / "flydsl"
-        runtime.mkdir(parents=True)
-        (runtime / "__init__.py").write_text('__version__ = "test"\n')
+        result, report = self.fixture.validate(patch)
+
+        self.assertEqual(2, result.returncode)
+        self.assertEqual("INCONCLUSIVE", report["verdict"])
+        self.assertEqual("skip", report["stages"]["execution_receipt"]["status"])
+
+    def test_incomplete_shape_receipt_prevents_pass(self):
+        def omit_shape(repo):
+            path = repo / "tests" / "test_sample.py"
+            path.write_text(
+                path.read_text().replace(
+                    "    for shape in shapes.split(';'):\n",
+                    "    for shape in shapes.split(';')[:1]:\n",
+                )
+            )
+
+        patch = self.fixture.make_patch(omit_shape, "missing-shape.patch")
+        result, report = self.fixture.validate(
+            patch,
+            grid_value="7,257,f32;8,513,bf16",
+        )
+
+        self.assertEqual(2, result.returncode)
+        self.assertEqual("INCONCLUSIVE", report["verdict"])
+        receipt = report["stages"]["execution_receipt"]
+        self.assertEqual("skip", receipt["status"])
+        self.assertIn("missing required shapes", receipt["note"])
+
+    def test_wrong_route_receipt_prevents_pass(self):
+        patch = self.fixture.make_patch(self.harmless_change, "wrong-route.patch")
+        result, report = self.fixture.validate(
+            patch,
+            expected_route="test_sample:different_route",
+        )
+
+        self.assertEqual(2, result.returncode)
+        self.assertEqual("INCONCLUSIVE", report["verdict"])
+        receipt = report["stages"]["execution_receipt"]
+        self.assertEqual("skip", receipt["status"])
+        self.assertIn("expected route", receipt["note"])
+
+    def test_flydsl_source_change_is_not_shadowed_by_pylib(self):
+        _, runtime = self.fixture.convert_to_flydsl()
 
         def change_flydsl(repo):
             root = repo / "python" / "flydsl"
@@ -331,7 +482,47 @@ class ValidateKernelPrTests(unittest.TestCase):
 
         self.assertEqual("INCONCLUSIVE", report["verdict"])
         self.assertEqual("skip", report["stages"]["runtime_compat"]["status"])
-        self.assertIn("would shadow", report["stages"]["runtime_compat"]["note"])
+        self.assertIn(
+            "trusted build provenance", report["stages"]["runtime_compat"]["note"]
+        )
+
+    def test_flydsl_native_change_is_inconclusive_without_provenance(self):
+        _, runtime = self.fixture.convert_to_flydsl()
+
+        def change_native_source(repo):
+            path = repo / "python" / "mlir_flydsl" / "FlyRegisterEverything.cpp"
+            path.write_text("int value = 2;\n")
+
+        patch = self.fixture.make_patch(change_native_source, "flydsl-native.patch")
+        result, report = self.fixture.validate(
+            patch,
+            pylib=runtime.parent,
+        )
+
+        self.assertEqual(2, result.returncode)
+        self.assertEqual("INCONCLUSIVE", report["verdict"])
+        self.assertEqual("skip", report["stages"]["runtime_compat"]["status"])
+        self.assertIn(
+            "trusted build provenance", report["stages"]["runtime_compat"]["note"]
+        )
+
+    def test_flydsl_packaging_change_is_inconclusive_without_provenance(self):
+        _, runtime = self.fixture.convert_to_flydsl()
+
+        def change_manifest(repo):
+            (repo / "MANIFEST.in").write_text("recursive-include python *.cpp\n")
+
+        patch = self.fixture.make_patch(change_manifest, "flydsl-manifest.patch")
+        result, report = self.fixture.validate(
+            patch,
+            pylib=runtime.parent,
+        )
+
+        self.assertEqual(2, result.returncode)
+        self.assertEqual("INCONCLUSIVE", report["verdict"])
+        self.assertIn(
+            "trusted build provenance", report["stages"]["runtime_compat"]["note"]
+        )
 
     def test_grid_pass_cannot_ignore_shape_environment(self):
         def remove_grid_hook(repo):
@@ -355,10 +546,14 @@ class ValidateKernelPrTests(unittest.TestCase):
     def test_grid_pass_requires_runtime_shape_handshake(self):
         def ignore_grid_value(repo):
             path = repo / "tests" / "test_sample.py"
+            source = path.read_text().replace(
+                'if _GRID == "__VALIDATOR_INVALID_GRID__":',
+                "if False and _GRID:",
+            )
             path.write_text(
-                path.read_text().replace(
-                    'if _GRID == "__VALIDATOR_INVALID_GRID__":',
-                    "if False and _GRID:",
+                source.replace(
+                    '    shapes = _GRID or "7,257,f32"',
+                    '    _ = _GRID\n    shapes = "7,257,f32"',
                 )
             )
 
@@ -454,12 +649,15 @@ class ReviewSkillContractTests(unittest.TestCase):
     def test_review_skill_is_advisory_and_has_no_dead_scanner_paths(self):
         review_skill = (SKILL_DIR.parent / "review-pr" / "SKILL.md").read_text()
 
+        self.assertTrue((SKILL_DIR / "validate_evidence.py").is_file())
+        self.assertTrue((SKILL_DIR / "validation_probe.py").is_file())
         self.assertIn("advisory tier", review_skill)
         self.assertIn("required scanner is missing or not executable", review_skill)
         self.assertIn("Validation (deterministic)", review_skill)
         self.assertIn("baseRefName", review_skill)
         self.assertIn("base_head.txt", review_skill)
         self.assertIn("expected_verdict", review_skill)
+        self.assertIn("if stats is not None", review_skill)
         self.assertNotIn("downstream-impact-check", review_skill)
         self.assertNotIn("review-flydsl-kernel/scan_", review_skill)
 
