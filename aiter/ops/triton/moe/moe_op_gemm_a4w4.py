@@ -3,8 +3,6 @@
 
 import functools
 import itertools
-import json
-import os
 
 import torch
 import triton
@@ -22,17 +20,26 @@ from aiter.ops.triton._triton_kernels.moe.moe_op_gemm_a4w4 import (
 from aiter.ops.triton.moe.moe_routing.routing import RoutingData
 from aiter.ops.triton.moe.reduce import reduce_grouped
 from aiter.ops.triton.utils._triton.arch_info import get_arch
-from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
-from aiter.ops.triton.utils.gemm_config_utils import pick_gemm_num_stages
+from aiter.ops.triton.utils.core import load_config_json
+from aiter.ops.triton.utils.gemm_config_utils import (
+    pick_gemm_num_stages,
+    resolve_config_dir,
+)
 
 
 @functools.lru_cache
 def _get_a4w4_dispatch(arch: str) -> dict:
-    fpath = f"{AITER_TRITON_CONFIGS_PATH}/moe/{arch}-A4W4.json"
-    if os.path.exists(fpath):
-        with open(fpath, "r") as f:
-            return json.load(f)
-    return {}
+    """Per-(block_m, N, K, bucket) dispatch table for moe_gemm_a4w4. Returns {}
+    if no tuned file is shipped for this arch.
+
+    ``arch`` stays in the signature for the callers that already resolved it;
+    resolve_config_dir() reads the same value from arch_info."""
+    # No backend= on purpose: the only tuned a4w4 table ships under gfx1250's
+    # gluon/ directory (it feeds the gluon dispatch path), so the probe has to
+    # fall through triton/ to gluon/ the same way a8w4 does.
+    cfg_dir, _ = resolve_config_dir("moe", "A4W4")
+    dispatch = load_config_json(f"{cfg_dir}/DEFAULT.json", required=False)
+    return dispatch if dispatch is not None else {}
 
 
 # -----------------------------------------------------------------------------
