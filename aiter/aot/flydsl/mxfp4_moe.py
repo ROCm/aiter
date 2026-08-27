@@ -63,6 +63,7 @@ def _job_key(job: dict) -> tuple:
             job["cu_num"] if job["persist"] else 0,
             job["has_pad"],
             job["out_dtype"],
+            job.get("enable_bias", False),
             job.get("g2_spart"),
             job.get("g2_bf16_lds"),
         )
@@ -293,36 +294,44 @@ def parse_csv(csv_path: str):
                     if v2_g2["epilog"] == "reduce" and _STAGE2_FP8_ROUTE_OUT
                     else "bf16"
                 )
-                _add(
-                    {
-                        "stage": 2,
-                        "v2_stage2": True,
-                        "kernel_name": kn2,
-                        "BM": bm,
-                        "BN": v2_g2["tile_n"],
-                        "BK": v2_g2["tile_k"],
-                        "use_nt": v2_g2["use_nt"],
-                        "NE": expert,
-                        "N_OUT": model_dim,
-                        "epilog": v2_g2["epilog"],
-                        "D_INTER": v2_d_inter,
-                        "D_INTER_REAL": v2_d_inter_real,
-                        "topk": topk,
-                        "SBM": v2_g2["sort_block_m"] or bm,
-                        "persist": v2_g2["persist"],
-                        "cu_num": int(row.get("cu_num", "0") or "0"),
-                        "a_dtype": v2_g2["a_dtype"],
-                        "b_dtype": v2_g2["b_dtype"],
-                        "inter_dim_pad": inter_dim_pad,
-                        "model_dim_pad": model_dim_pad,
-                        "has_pad": inter_dim_pad > 0 or model_dim_pad > 0,
-                        "out_dtype": out_dtype,
-                        # In the compiled kernel tag: must match the runtime
-                        # wrapper or the AOT entry is keyed differently.
-                        "g2_spart": v2_g2["spart"],
-                        "g2_bf16_lds": v2_g2["bf16_lds"],
-                    }
+                bias_supported = (
+                    row.get("q_type", "").strip().split(".")[-1] == "per_1x32"
+                    and row.get("dtype", "") in ("torch.bfloat16", "torch.float16")
+                    and "float4_e2m1fn_x2" in row.get("q_dtype_w", "")
                 )
+                enable_bias_options = [False, True] if bias_supported else [False]
+                for enable_bias in enable_bias_options:
+                    _add(
+                        {
+                            "stage": 2,
+                            "v2_stage2": True,
+                            "kernel_name": kn2,
+                            "BM": bm,
+                            "BN": v2_g2["tile_n"],
+                            "BK": v2_g2["tile_k"],
+                            "use_nt": v2_g2["use_nt"],
+                            "NE": expert,
+                            "N_OUT": model_dim,
+                            "epilog": v2_g2["epilog"],
+                            "D_INTER": v2_d_inter,
+                            "D_INTER_REAL": v2_d_inter_real,
+                            "topk": topk,
+                            "SBM": v2_g2["sort_block_m"] or bm,
+                            "persist": v2_g2["persist"],
+                            "cu_num": int(row.get("cu_num", "0") or "0"),
+                            "a_dtype": v2_g2["a_dtype"],
+                            "b_dtype": v2_g2["b_dtype"],
+                            "inter_dim_pad": inter_dim_pad,
+                            "model_dim_pad": model_dim_pad,
+                            "has_pad": inter_dim_pad > 0 or model_dim_pad > 0,
+                            "out_dtype": out_dtype,
+                            "enable_bias": enable_bias,
+                            # In the compiled kernel tag: must match the runtime
+                            # wrapper or the AOT entry is keyed differently.
+                            "g2_spart": v2_g2["spart"],
+                            "g2_bf16_lds": v2_g2["bf16_lds"],
+                        }
+                    )
             elif _is_mxfp4_kname(kn2):
                 p2 = _parse_mxfp4_g2_kname(kn2)
                 if p2["mxfp4out"] and not _MXFP4_INTERMEDIATE:
@@ -437,6 +446,7 @@ def _compile_v2_stage2(job):
     from aiter.ops.flydsl.kernels.mxmoe_dispatcher import mxfp4_moe_gemm2
 
     d = _dummy()
+    bias = _dummy(max(256, job["NE"] * job["N_OUT"] * 4))
     max_sorted = job["BM"]
     if job["persist"]:
         max_sorted = max(max_sorted, job["cu_num"] * job["BM"])
@@ -494,6 +504,7 @@ def _compile_v2_stage2(job):
         out_dtype=job["out_dtype"],
         g2_spart=job.get("g2_spart"),
         g2_bf16_lds=job.get("g2_bf16_lds"),
+        bias=bias if job.get("enable_bias", False) else None,
         stream=0,
     )
     if job["epilog"] == "reduce":
