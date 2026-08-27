@@ -26,6 +26,14 @@ def _select_next_stage_prefetch(csv_next_stage_prefetch: int) -> int:
     return int(value)
 
 
+def _select_persistent() -> int:
+    """AITER_TDM_PERSISTENT enables the persistent-CU pipeline (default off)."""
+    value = os.environ.get("AITER_TDM_PERSISTENT", "0").strip()
+    if value not in ("0", "1"):
+        raise ValueError("AITER_TDM_PERSISTENT must be 0 or 1")
+    return int(value)
+
+
 def _select_cluster_n(n_tiles: int, csv_cluster_n: int) -> int:
     """Selects the environment override or CSV cluster degree."""
     env_cluster_n = os.environ.get("AITER_FLYDSL_MXFP4_CLUSTER_N")
@@ -151,6 +159,7 @@ def flydsl_grouped_gemm_a8w4_masked(
         cluster_n,
         _select_next_stage_prefetch(next_stage_prefetch),
         waves_per_tensor_tdm,
+        persistent=_select_persistent(),
         enable_ep_scatter=int(enable_ep_scatter),
         ep_arena_handle=(int(stage2_scatter.arena_handle) if enable_ep_scatter else 0),
         ep_combine_input_offset=(
