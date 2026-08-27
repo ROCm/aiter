@@ -165,15 +165,11 @@ The ``mega_moe`` op runs both sides of the comparison:
       --layers 61 -tpr 512 --combine gather \
       --acc_verify 0 --profile_table 1
 
-Token sweeps are per-op and overridable from the environment, because the ops
-do not share a supported range: score_qk asserts out past batch 1024, a16w16's
-launcher refuses operands over 4 GiB, and inverse_rope faults the GPU at its
-largest tokens. AITER_BENCH_TOKENS sets the default for every op and
-AITER_BENCH_TOKENS_<OP> overrides one:
-
-    AITER_BENCH_TOKENS=1,128,512 \
-    AITER_BENCH_TOKENS_INVERSE_ROPE=1,8,128 \
-      python op_tests/bench_gfx1250_combo.py --dsv4
+Token sweeps come from one variable, AITER_BENCH_TOKENS (see Environment
+above). The ops do not share a supported range -- score_qk asserts out past
+batch 1024, a16w16's launcher refuses operands over 4 GiB, inverse_rope faults
+at its largest tokens -- so ops whose usable range is fixed pin their sweep in
+the source and ignore the variable.
 
 gfx1250's bundled CK does not compile, so the asm JIT modules must be built with
 ENABLE_CK=0. The script sets it (before importing aiter) so a plain run just
