@@ -1653,13 +1653,12 @@ def flydsl_qk_norm_rope_quant(
                 )
 
             q_2d = q_view.reshape(num_rows, D)
-            kv_c = kv if kv.is_contiguous() else kv.contiguous()
             per_wg = rows_per_tile * tiles_per_wg
             args = (
                 # q is a per-call activation: uncached, else the adaptor cache
                 # pins its allocation (see _cached_from_dlpack).
                 flyc.from_dlpack(q_2d),
-                _t_ptr(kv_c),
+                _t_ptr(kv),
                 _cached_from_dlpack(cos_2d),
                 _cached_from_dlpack(sin_2d),
                 _t_ptr(positions),
@@ -1672,6 +1671,7 @@ def flydsl_qk_norm_rope_quant(
                 num_rows,
                 T_tok,
                 (num_rows + per_wg - 1) // per_wg,
+                kv.stride(0),
                 stream if has_direct else Stream(stream),
             )
             _run_compiled(launcher, *args)
@@ -1771,25 +1771,28 @@ def flydsl_qk_norm_rope_quant(
 
 ROWS_PER_TILE = 8  # = waves per WG (256-thread WG)
 NUM_BUFFERS = 6  # K: rotating LDS buffers (1 WG at K=6: 6*8KB=48KB LDS)
+NUM_BUFFERS_DENSE = 2  # K once the grid is deep enough to hide a short prologue
 TILES_PER_WG = 16  # CT: one H=128 token/WG; keeps cos/sin hoisting enabled
+TDM_DENSE_MIN_ROWS = 131072  # num_rows from which K=2 beats K=6
 
 
 def _tdm_tiles_per_wg(num_rows, head_dim=512):
     """Pick (CT, K, RT) to fill wave slots on gfx1250.
 
     CT is bounded by keeping gx_q = num_rows / (ROWS_PER_TILE * CT) at or above
-    the 256 CUs. That bound bites hardest at the low end of the TDM range: at
-    num_rows=32768 (T=256, H=128) the old ROWS_PER_TILE=32 with CT=8 gave only
-    128 workgroups, leaving half the CUs idle. RT=8 with CT=16 gives 256 there
-    and 512 at num_rows=65536.
+    the 256 CUs: RT=8 with CT=16 gives 256 workgroups at num_rows=32768 (T=256,
+    H=128) and 512 at 65536.
 
-    K is then free to pick on latency alone. With RT=8, K=6 is best or neutral
-    for the rotated T=512 workload and avoids another short-prefill variant.
+    K trades prefetch depth against the length of the load-only prologue. Once
+    the grid is deep enough that one WG's prologue overlaps another's steady
+    state, the shallow K=2 wins (-3.0% at num_rows=131072, -5.1% at 262144,
+    -2.9% at 2097152). Below that a WG must cover its own load latency and the
+    deeper K=6 is needed: K=2 costs +31.9% at 32768, +9.8% at 49152 and +4.1%
+    at 65536.
     """
     del head_dim  # tile bytes are implied by ROWS_PER_TILE * D in the kernel
-    if num_rows <= 131072:
-        return 16, NUM_BUFFERS, ROWS_PER_TILE
-    return TILES_PER_WG, NUM_BUFFERS, ROWS_PER_TILE
+    k = NUM_BUFFERS_DENSE if num_rows >= TDM_DENSE_MIN_ROWS else NUM_BUFFERS
+    return TILES_PER_WG, k, ROWS_PER_TILE
 
 
 @lru_cache(maxsize=32)
@@ -1852,7 +1855,7 @@ def _build_kernel_w32_tdm(
     @flyc.kernel(name=name, known_block_size=[BLOCK_THREADS, RT, 1])
     def kernel(
         q_in: fx.Tensor,  # [T*H, D] bf16
-        kv_in: fx.Pointer,  # [T, D] bf16 (contiguous)
+        kv_in: fx.Pointer,  # [T, D] bf16, may be strided
         cos_cache: fx.Tensor,
         sin_cache: fx.Tensor,
         positions: fx.Pointer,  # [T] i64
@@ -1865,6 +1868,7 @@ def _build_kernel_w32_tdm(
         num_rows: Int32,  # T*H
         num_tokens: Int32,  # T
         gx_q: Int32,  # workgroups owned by the Q path
+        kv_in_row_stride: Int32,  # KV row stride in bf16 elements
     ):
         i32 = T.i32
         tid = fx.thread_idx.x
@@ -2162,7 +2166,7 @@ def _build_kernel_w32_tdm(
                     fx.Vector(
                         buffer_ops.buffer_load(
                             kv_rsrc,
-                            tok * D + tid * VEC + (c * 8),
+                            tok * kv_in_row_stride + tid * VEC + (c * 8),
                             vec_width=8,
                             dtype=T.bf16,
                         )
@@ -2204,6 +2208,7 @@ def _build_kernel_w32_tdm(
         num_rows: fx.Int32,
         num_tokens: fx.Int32,
         gx_q: fx.Int32,
+        kv_in_row_stride: fx.Int32,
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         gx_kv = _idiv(num_tokens + (RT - 1), fx.Int32(RT))
@@ -2223,6 +2228,7 @@ def _build_kernel_w32_tdm(
             num_rows,
             num_tokens,
             gx_q,
+            kv_in_row_stride,
         )
         k.launch(
             grid=(fx.Index(gx), 1, 1),
