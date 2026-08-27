@@ -30,6 +30,7 @@ Run from the aiter repo root so `op_tests/` siblings import cleanly:
     python op_tests/bench_gfx1250_combo.py --dsv4 --ops a16w16    # DSv4 BF16 linears
     python op_tests/bench_gfx1250_combo.py --dsv4 --ops mla_v4_decode   # sparse MLA v4 decode
     python op_tests/bench_gfx1250_combo.py --dsv4 --ops mla_v4_prefill  # MLA v4 prefill
+    python op_tests/bench_gfx1250_combo.py --dsv4 --ops mla_v4_prefill_fp8  # FP8 MLA v4 prefill
     python op_tests/bench_gfx1250_combo.py --dsv4 --ops mhc       # mHC fused RMSNorm
     python op_tests/bench_gfx1250_combo.py --dsv4 --ops qk_norm   # QK norm + RoPE
     python op_tests/bench_gfx1250_combo.py --dsv4 --ops score_qk  # FP8 paged MQA logits
@@ -79,6 +80,10 @@ dense/sparse CSR modes. The current 16K-token chunk remains uncompressed:
       -n 16384 --h_q 128 -d 512 \
       --total_pages 4096 16384 --total_tokens 16384 \
       --prec fp8 --mode dense sparse --no-verify
+
+The separate ``mla_v4_prefill_fp8`` op runs:
+
+    PYTHONPATH=. python3 op_tests/test_pa_sparse_prefill.py
 
 The ``a8w8_blockscale`` op runs:
 
@@ -1171,6 +1176,19 @@ def run_mla_v4_prefill(_args):
     )
 
 
+def run_mla_v4_prefill_fp8(_args):
+    """Run the default gfx1250 MLA v4 sparse-prefill FP8 sweep."""
+    env = os.environ.copy()
+    env["PYTHONPATH"] = "."
+    _run_child(
+        "mla_v4 prefill FP8 (sparse-prefill default sweep)",
+        [sys.executable, "op_tests/test_pa_sparse_prefill.py"],
+        cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        env=env,
+        extract=_lines(_table_row("opus us", "triton us", "asm us")),
+    )
+
+
 OPS = {
     "mha": run_mha,
     "moe": run_moe,
@@ -1180,6 +1198,7 @@ OPS = {
     "a16w16": run_a16w16,
     "mla_v4_decode": run_mla_v4_decode,
     "mla_v4_prefill": run_mla_v4_prefill,
+    "mla_v4_prefill_fp8": run_mla_v4_prefill_fp8,
     "mhc": run_mhc,
     "qk_norm": run_qk_norm,
     "score_qk": run_score_qk,
@@ -1208,6 +1227,7 @@ DSV4_OPS = [
     "a16w16",
     "mla_v4_decode",
     "mla_v4_prefill",
+    "mla_v4_prefill_fp8",
     "mhc",
     "qk_norm",
     "score_qk",
