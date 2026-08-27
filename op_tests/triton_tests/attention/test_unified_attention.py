@@ -8,6 +8,7 @@ import pytest
 import torch
 
 from aiter.ops.triton.attention.unified_attention import (
+    _is_gluon_available,
     is_2d_gluon_available,
     unified_attention,
 )
@@ -582,6 +583,7 @@ def test_triton_unified_attn_3d(
         False,
     ],
 )
+@pytest.mark.parametrize("backend", ["triton", "gluon"])
 @torch.inference_mode()
 def test_triton_unified_attn(
     seq_lens: list[tuple[int, int]],
@@ -598,7 +600,10 @@ def test_triton_unified_attn(
     use_kv_descale: bool,
     use_out_scale: bool,
     shuffled_kv_cache: bool,
+    backend: str,  # "triton" | "gluon"
 ) -> None:
+    if backend == "gluon" and not _is_gluon_available():
+        pytest.skip(f"skip gluon backend, not available on {DEVICE_ARCH}")
     use_gluon_2d = is_2d_gluon_available(
         SimpleNamespace(
             q_dtype=q_dtype,
@@ -606,7 +611,8 @@ def test_triton_unified_attn(
             softcap=soft_cap,
             use_qq_bias=False,
             use_alibi_slopes=False,
-        )
+        ),
+        backend,
     )
     torch.manual_seed(0)
     # shuffling only supported for gfx1250 gluon kernels
@@ -672,6 +678,7 @@ def test_triton_unified_attn(
         sinks=sinks,
         output_scale=output_scale,
         shuffled_kv_cache=shuffled_kv_cache,
+        backend=backend,
     )
 
     ref_output = ref_paged_attn(
