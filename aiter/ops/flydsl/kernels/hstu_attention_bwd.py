@@ -38,7 +38,6 @@ from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Vector as Vec
 from flydsl.runtime.device import get_rocm_arch
 
-from aiter.ops.flydsl.kernels import buffer_ops
 from aiter.ops.flydsl.kernels.hstu_attention_common import (
     decode_lane,
     grouped_loader,
@@ -392,7 +391,7 @@ def build_hstu_attention_bwd_dvdk(
                 (DO_STRIDE, MFMA_LANE_K, 1),
             )
         )
-        q_lds_byte_base = buffer_ops.extract_base_index(q_view, address_space=3)
+        q_lds_byte_base = fx.ptrtoint(fx.get_iter(q_view))
 
         # Direct dO global->LDS DMA. dO is [L, H, hidden],
         # so the per-token stride is num_heads*hidden_dim; base at this head's slice.
@@ -401,7 +400,7 @@ def build_hstu_attention_bwd_dvdk(
             fx.Int64(seq_start) * fx.Int64(stride_do_n)
             + fx.Int64(head_idx) * fx.Int64(hidden_dim)
         ) * fx.Int64(2)
-        do_lds_byte_base = buffer_ops.extract_base_index(do_view, address_space=3)
+        do_lds_byte_base = fx.ptrtoint(fx.get_iter(do_view))
 
         # ── Copy-atom global->LDS DMA (buffer_load_lds via fx.copy) ──
         _dma_atom = fx.make_copy_atom(
@@ -550,10 +549,10 @@ def build_hstu_attention_bwd_dvdk(
         c_dma_elems = fx.Int32(DMA_ELEMS)
         c_pairs_per_row_q = fx.Int32(PAIRS_PER_ROW_Q)
 
-        wave_lds_base_q = fx.Int64(q_lds_byte_base) + fx.Int64(wave_id) * fx.Int64(
+        wave_lds_base_q = fx.Int32(q_lds_byte_base) + fx.Int32(wave_id) * fx.Int32(
             WARP_SIZE * DMA_BYTES
         )
-        wave_lds_lane0_q = rocdl.readfirstlane(fx.Int64.ir_type, wave_lds_base_q)
+        wave_lds_lane0_q = rocdl.readfirstlane(fx.Int32.ir_type, wave_lds_base_q)
         q_dma_rows = []
         q_dma_gcols = []
         q_dma_col_ok = []
@@ -589,8 +588,8 @@ def build_hstu_attention_bwd_dvdk(
                     # reaches an output; it only has to be finite, since 0 * NaN
                     # would poison S.
                     src_elem = q_dma_col_ok[d].select(src_elem, fx.Int32(0))
-                lds_byte = fx.Int32(
-                    wave_lds_lane0_q + fx.Int64(d * BLOCK_THREADS * DMA_BYTES)
+                lds_byte = fx.Int32(wave_lds_lane0_q) + fx.Int32(
+                    d * BLOCK_THREADS * DMA_BYTES
                 )
                 dst = fx.make_view(
                     fx.inttoptr(_lds_ptr_ty, lds_byte), fx.make_layout(1, 1)
@@ -602,10 +601,10 @@ def build_hstu_attention_bwd_dvdk(
         # OOB q rows fetch token 0's dO (finite); their P/dS are masked to 0 so the
         # value is multiplied out — same safe-garbage contract as the Q DMA.
         c_stride_do_n = fx.Int32(stride_do_n)
-        wave_lds_base_do = fx.Int64(do_lds_byte_base) + fx.Int64(wave_id) * fx.Int64(
+        wave_lds_base_do = fx.Int32(do_lds_byte_base) + fx.Int32(wave_id) * fx.Int32(
             WARP_SIZE * DMA_BYTES
         )
-        wave_lds_lane0_do = rocdl.readfirstlane(fx.Int64.ir_type, wave_lds_base_do)
+        wave_lds_lane0_do = rocdl.readfirstlane(fx.Int32.ir_type, wave_lds_base_do)
         do_dma_rows = []
         do_dma_cols = []
         for d in range_constexpr(NUM_DMA_DO):
@@ -619,8 +618,8 @@ def build_hstu_attention_bwd_dvdk(
                 in_bounds = (q_start + row) < seq_len
                 local_tok = in_bounds.select(q_start + row, fx.Int32(0))
                 src_elem = local_tok * c_stride_do_n + do_dma_cols[d]
-                lds_byte = fx.Int32(
-                    wave_lds_lane0_do + fx.Int64(d * BLOCK_THREADS * DMA_BYTES)
+                lds_byte = fx.Int32(wave_lds_lane0_do) + fx.Int32(
+                    d * BLOCK_THREADS * DMA_BYTES
                 )
                 dst = fx.make_view(
                     fx.inttoptr(_lds_ptr_ty, lds_byte), fx.make_layout(1, 1)

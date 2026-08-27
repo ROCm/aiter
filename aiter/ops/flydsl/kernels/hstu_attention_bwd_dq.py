@@ -33,7 +33,6 @@ from flydsl._mlir.dialects import llvm
 from flydsl.expr import arith, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Vector as Vec
 
-from aiter.ops.flydsl.kernels import buffer_ops
 from aiter.ops.flydsl.kernels.hstu_attention_bwd import (
     _LOG2E,
     MFMA_ELEMS_PER_LANE,
@@ -268,7 +267,7 @@ def build_hstu_attention_bwd_dq(
         v_store_view = lds.v.view(
             fx.make_layout((BLOCK_N, V_STRIDE // VEC_V, VEC_V), (V_STRIDE, VEC_V, 1))
         )
-        k_lds_byte_base = buffer_ops.extract_base_index(k_view, address_space=3)
+        k_lds_byte_base = fx.ptrtoint(fx.get_iter(k_view))
 
         # ── Copy-atom global->LDS DMA (buffer_load_lds via fx.copy) ──
         # Same idiom as the dvdk kernel / flash_attn_gfx950: a BufferCopyLDS atom
@@ -417,10 +416,10 @@ def build_hstu_attention_bwd_dq(
         c_dma_elems = fx.Int32(DMA_ELEMS)
         c_pairs_per_row_k = fx.Int32(PAIRS_PER_ROW_K)
 
-        wave_lds_base_k = fx.Int64(k_lds_byte_base) + fx.Int64(wave_id) * fx.Int64(
+        wave_lds_base_k = fx.Int32(k_lds_byte_base) + fx.Int32(wave_id) * fx.Int32(
             WARP_SIZE * DMA_BYTES
         )
-        wave_lds_lane0_k = rocdl.readfirstlane(fx.Int64.ir_type, wave_lds_base_k)
+        wave_lds_lane0_k = rocdl.readfirstlane(fx.Int32.ir_type, wave_lds_base_k)
         k_dma_rows = []
         k_dma_gcols = []
         for d in range_constexpr(NUM_DMA_K):
@@ -439,8 +438,8 @@ def build_hstu_attention_bwd_dq(
                 in_bounds = (kv_start + row) < seq_len
                 local_tok = in_bounds.select(kv_start + row, fx.Int32(0))
                 src_elem = local_tok * c_stride_qk_n + k_dma_gcols[d]
-                lds_byte = fx.Int32(
-                    wave_lds_lane0_k + fx.Int64(d * BLOCK_THREADS * DMA_BYTES)
+                lds_byte = fx.Int32(wave_lds_lane0_k) + fx.Int32(
+                    d * BLOCK_THREADS * DMA_BYTES
                 )
                 dst = fx.make_view(
                     fx.inttoptr(_lds_ptr_ty, lds_byte), fx.make_layout(1, 1)
