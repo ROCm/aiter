@@ -3,9 +3,8 @@
 
 """Host wrapper for the FlyDSL ``jagged_dense_bmm`` BACKWARD kernels.
 
-Companion to the forward's ``jagged_dense_bmm_dispatch.py``. It folds all the
-host-side glue the backward needs (previously inlined in every bench / example
-driver) into one place:
+Companion to the forward's ``jagged_dense_bmm_dispatch.py``. Centralizes the
+host-side glue the backward needs:
 
     - building (memoized) the per-shape backward launchers via
       ``jagged_dense_bmm_bwd.build_backward(D, split, gj_stages_a, coarsen_m)``,
@@ -18,7 +17,7 @@ driver) into one place:
     - the dense reshape to the backward's **plain ``(n_groups*K, N)`` K-major**
       layout (the documented backward contract; the forward instead consumes a
       tall pre-transposed ``(n_groups*N, K)`` buffer);
-    - ``mark_layout_dynamic`` on the dlpack views (mirrors the validated bench);
+    - ``mark_layout_dynamic`` on the dlpack views (mirrors the validated op test);
     - stream defaulting;
     - calling ``grad_jagged`` then the fused ``grad_dense_bias``.
 
