@@ -219,7 +219,8 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     // s_opt: bit0 reverse_kv | bit1 double_q | bit2 remap_xy.
     // 7 = 0b111 -> all three on.  Must match how the shipped VARLEN .co was
     // built (REMAP_XY=1 in particular, since we swap gdx/gdy at launch).
-    args.opt        = 7;
+    const bool hd192_non_causal = (qk_head_dim == 192 && mask_flag == 0);
+    args.opt        = hd192_non_causal ? 0x4 : 0x7;
     args.lse        = return_lse ? 1 : 0;
     args.max_q_len  = max_seqlen_q;
     args.sink_addr  = sink ? sink->data_ptr() : nullptr;
@@ -243,10 +244,11 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
         name, [&]() { return AiterAsmKernel(name, co_name); });
 
     // ---- launch ------------------------------------------------------------
-    // Dispatch along max_q_len (DOUBLE_Q halves via tg_div); z = batch index.
-    // The kernel early-exits q-tiles that fall beyond a batch's actual seqlen
-    // using cu_seqlens_q.  Shipped VARLEN kernels: ts_qo=128, double_q=1
-    // (tg_div=2), wv_tg=4 (block=128), remap_xy=1.
+    // Dispatch along max_q_len (double_q halves the tile count via tg_div); z is
+    // the batch index.  The kernel early-exits q-tiles that fall beyond a batch's
+    // actual seqlen using cu_seqlens_q.  All shipped VARLEN kernels use ts_qo=128,
+    // wv_tg=4 (block=128) and remap_xy=1; tg_div follows the double_q bit set
+    // above, so D192x128 non-causal launches the full tile count.
     const int sub_Q        = 128;   // ts_qo
     const int wv_tg        = 4;
     const int bdx          = (wv_tg == 4) ? 128 : 256;
