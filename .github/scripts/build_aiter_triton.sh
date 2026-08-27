@@ -56,8 +56,8 @@ echo "##################################################################"
 pip uninstall -y triton triton-kernels pytorch-triton pytorch-triton-rocm triton-rocm amd-triton || true
 
 # Pin triton to a known commit so the build is reproducible.
-# Commit from August 6th, 2026 - [GSan] Stabilize distributed race diagnostics (#11191)
-TRITON_COMMIT='882eb72e1858bfd588fafa4677b86ce00e9da872'
+# Commit from August 27th, 2026 - [NVIDIA] Synchronize tensor-map updates before the collective copy (#11480)
+TRITON_COMMIT='e411a7fddbb7ccb2c082d44d7ec48dcd687c0645'
 echo "[experiment] Target TRITON_COMMIT=${TRITON_COMMIT}"
 
 # Network in CI is flaky and a full clone of triton routinely times out
