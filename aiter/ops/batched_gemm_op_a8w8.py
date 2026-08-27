@@ -280,7 +280,8 @@ def _batched_gemm_a8w8_mxscale_impl(
     if libtype != "opus":
         raise NotImplementedError(
             f"tuned row for B:{g}, M:{m}, N:{n}, K:{k} wants libtype "
-            f"{libtype!r}, which has no batched mxscale backend here yet"
+            f"{libtype!r}, which does not take a raw [G, N, K] weight; "
+            f"{libtype!r} rows are served by batched_gemm_a8w8_mxscale_bpreshuffle"
         )
 
     # Reading opus columns is this branch's job; whether that kernel can run
@@ -346,6 +347,64 @@ def batched_gemm_a8w8_mxscale(
     backend-specific, so pin one at the backend (aiter.ops.opus.bmm_op).
     """
     return _batched_gemm_a8w8_mxscale_impl(x, wo_a, x_scale, w_scale, dtype=dtype)
+
+
+# Same family, preshuffled weight.
+def _batched_gemm_a8w8_mxscale_bpreshuffle_impl(
+    x: Tensor,
+    wo_a: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    dtype: torch.dtype = dtypes.bf16,
+) -> Tensor:
+    """Eager tuned-CSV lookup + libtype dispatch; returns token-major [M, G, N]."""
+    from .flydsl.batched_gemm_a8w8_gfx1250 import run_bmm_a8w8_mxfp8_128_gfx1250
+
+    m, g, k = int(x.shape[0]), int(x.shape[1]), int(x.shape[2])
+    n = int(wo_a.shape[1])
+
+    cfg = lookup_mxscale_bmm_config(g, m, n, k)
+    libtype = cfg["libtype"] if cfg is not None else "flydsl"
+    if libtype != "flydsl":
+        raise NotImplementedError(
+            f"tuned row for B:{g}, M:{m}, N:{n}, K:{k} wants libtype "
+            f"{libtype!r}, which takes a raw [G, N, K] weight; {libtype!r} rows "
+            "are served by batched_gemm_a8w8_mxscale"
+        )
+
+    return run_bmm_a8w8_mxfp8_128_gfx1250(
+        x,
+        wo_a,
+        x_scale,
+        w_scale,
+        torch.empty((m, g, n), dtype=dtype, device=x.device),
+        kernel_name=str(cfg["kernelName"]) if cfg is not None else None,
+    )
+
+
+@torch_compile_guard(mutates_args=[], gen_fake=_batched_gemm_a8w8_mxscale_fake)
+def batched_gemm_a8w8_mxscale_bpreshuffle(
+    x: Tensor,
+    wo_a: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    dtype: torch.dtype = dtypes.bf16,
+) -> Tensor:
+    """fp8 e8m0 mxscale batched GEMM with a preshuffled weight (gfx1250).
+
+    * ``x``       : [M, G, K] fp8 activation, token-major and contiguous.
+    * ``wo_a``    : [G, N, K] fp8 weight, preshuffled as above.
+    * ``x_scale`` : [M, G, K/128] uint8 e8m0, row-major -- exactly what
+                    ``inverse_rope_group_quant(..., quant_group_size=128,
+                    scale_layout="row")`` emits, so no transpose on this path.
+    * ``w_scale`` : [G, N/128, K/128] uint8 e8m0.
+
+    Returns a fresh token-major [M, G, N]. A caller that must write into its own
+    buffer calls ``run_bmm_a8w8_mxfp8_128_gfx1250`` directly (it keeps ``out=``).
+    """
+    return _batched_gemm_a8w8_mxscale_bpreshuffle_impl(
+        x, wo_a, x_scale, w_scale, dtype=dtype
+    )
 
 
 def gen_batched_gemm_a8w8_tune_fake_tensors(
