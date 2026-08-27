@@ -12,7 +12,7 @@ import os
 import torch
 import triton
 
-from aiter.ops.triton.utils.tuned_config_utils import get_tuned_kernel_config
+from aiter.ops.triton.utils.config_utils import get_tuned_kernel_config
 
 SUPPORTS_AUTOTUNE_CACHE = (
     "cache_results" in inspect.signature(triton.autotune).parameters

@@ -7,7 +7,6 @@ from typing import Literal
 
 import torch
 import triton
-
 from aiter.ops.triton._gluon_kernels.gfx1250.fusions.fused_clamp_act_mul import (
     _fused_clamp_silu_mul_kernel as _fused_clamp_silu_mul_gluon_kernel,
 )
@@ -15,8 +14,12 @@ from aiter.ops.triton._triton_kernels.fusions.fused_clamp_act_mul import (
     _fused_clamp_silu_mul_kernel,
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
-from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH, load_config_json
 from aiter.ops.triton.utils.logger import AiterTritonLogger
+
+from aiter.ops.triton.utils.config_utils import (
+    AITER_TRITON_CONFIGS_PATH,
+    load_config_json,
+)
 
 _LOGGER = AiterTritonLogger()
 

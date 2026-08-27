@@ -3,22 +3,22 @@
 
 import torch
 import triton
-
 from aiter.ops.triton._triton_kernels.common.splitk_reduce import (
     _gemm_splitk_reduce_kernel,
 )
-from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a8w8 import (
-    _gemm_a8w8_kernel,
-    _get_config,
-)
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.device_info import get_num_xcds
-from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.types import (
     get_scaled_dot_format_string,
     torch_to_triton_dtype,
 )
+
+from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a8w8 import (
+    _gemm_a8w8_kernel,
+    _get_config,
+)
+from aiter.ops.triton.utils.config_utils import get_gemm_config
 
 _LOGGER = AiterTritonLogger()
 

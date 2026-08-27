@@ -27,12 +27,11 @@ import functools
 
 import triton
 import triton.language as tl
-
 from aiter.ops.triton._triton_kernels.activation import _tanh
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils._triton.pid_preprocessing import remap_xcd
-from aiter.ops.triton.utils.core import load_config_json
-from aiter.ops.triton.utils.gemm_config_utils import resolve_config_dir
+
+from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
 
 _fwd_grouped_kernel_stage1_rope_repr = make_kernel_repr(
     "_fwd_grouped_kernel_stage1_rope",
@@ -403,5 +402,5 @@ def _fwd_kernel_stage2(
 
 @functools.lru_cache(maxsize=1024)
 def _get_config():
-    cfg_dir, _ = resolve_config_dir("attention", "MLA_DECODE_ROPE", backend="triton")
+    cfg_dir = resolve_config_dir("attention", "MLA_DECODE_ROPE", backend="triton")
     return load_config_json(f"{cfg_dir}/DEFAULT.json")

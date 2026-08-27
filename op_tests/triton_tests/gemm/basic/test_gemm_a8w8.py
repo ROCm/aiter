@@ -8,16 +8,16 @@ import sys
 import pytest
 import torch
 import torch.nn.functional as F
-
 from aiter.ops.shuffle import shuffle_weight
+from aiter.ops.triton.utils.types import get_fp8_dtypes, str_to_torch_dtype
+
 from aiter.ops.triton.gemm.basic.gemm_a8w8 import gemm_a8w8 as triton_gemm_a8w8
 from aiter.ops.triton.gemm.basic.gemm_a8w8 import gemm_a8w8_preshuffle
 from aiter.ops.triton.utils._triton import arch_info
-from aiter.ops.triton.utils.gemm_config_utils import (
+from aiter.ops.triton.utils.config_utils import (
     compute_splitk_params,
     get_gemm_config,
 )
-from aiter.ops.triton.utils.types import get_fp8_dtypes, str_to_torch_dtype
 
 DEVICE_ARCH = arch_info.get_arch()
 

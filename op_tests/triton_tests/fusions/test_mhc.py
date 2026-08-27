@@ -24,11 +24,6 @@ Notation (from mHC paper arXiv:2512.24880v2):
 
 import pytest
 import torch
-
-from aiter.ops.triton.fusions.mhc import mhc, mhc_post, mhc_post_pre
-from aiter.ops.triton.utils.mhc_config_utils import (
-    hip_post_dispatch_block as _hip_post_dispatch_block,
-)
 from aiter.test_common import checkAllclose
 from op_tests.triton_tests.utils.mhc_ref import (
     generate_mhc_inputs,
@@ -38,6 +33,11 @@ from op_tests.triton_tests.utils.mhc_ref import (
     mhc_e2e_ref,
     mhc_post_torch,
     mhc_torch,
+)
+
+from aiter.ops.triton.fusions.mhc import mhc, mhc_post, mhc_post_pre
+from aiter.ops.triton.utils.config_utils import (
+    hip_post_dispatch_block as _hip_post_dispatch_block,
 )
 
 try:
@@ -748,11 +748,12 @@ def test_mhc_post_correctness(M, n, C, dtype):
 
 def test_mhc_post_preallocated_output():
     """Verify in-place path: result is out and matches reference."""
-    from aiter.ops.triton.fusions.mhc import mhc_post
     from op_tests.triton_tests.utils.mhc_ref import (
         generate_mhc_post_inputs,
         mhc_post_torch,
     )
+
+    from aiter.ops.triton.fusions.mhc import mhc_post
 
     M, n, C = 128, 4, 1024
     dtype = torch.bfloat16
@@ -778,11 +779,12 @@ def test_mhc_post_preallocated_output():
 
 def test_mhc_post_squeeze_post_mix():
     """Pass post_mix as (M, n, 1) — as mhc() emits it."""
-    from aiter.ops.triton.fusions.mhc import mhc_post
     from op_tests.triton_tests.utils.mhc_ref import (
         generate_mhc_post_inputs,
         mhc_post_torch,
     )
+
+    from aiter.ops.triton.fusions.mhc import mhc_post
 
     M, n, C = 64, 4, 512
     dtype = torch.bfloat16

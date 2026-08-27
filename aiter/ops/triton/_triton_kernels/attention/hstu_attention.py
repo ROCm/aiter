@@ -20,10 +20,9 @@ import triton
 
 # @manual=//triton:triton
 import triton.language as tl
-
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
-from aiter.ops.triton.utils.core import load_config_json
-from aiter.ops.triton.utils.gemm_config_utils import resolve_config_dir
+
+from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
 
 try:
     from triton.language.extra.libdevice import (
@@ -860,7 +859,7 @@ def _hstu_attn_bwd(
 def _get_fwd_config(
     AUTOTUNE_Z: int,
 ):
-    cfg_dir, _ = resolve_config_dir("attention", "HSTU_ATTN_FWD", backend="triton")
+    cfg_dir = resolve_config_dir("attention", "HSTU_ATTN_FWD", backend="triton")
     config = load_config_json(f"{cfg_dir}/DEFAULT.json")
 
     if AUTOTUNE_Z < 512:
@@ -877,7 +876,7 @@ def _get_fwd_config(
 def _get_bwd_config(
     AUTOTUNE_Z: int,
 ):
-    cfg_dir, _ = resolve_config_dir("attention", "HSTU_ATTN_BWD", backend="triton")
+    cfg_dir = resolve_config_dir("attention", "HSTU_ATTN_BWD", backend="triton")
     config = load_config_json(f"{cfg_dir}/DEFAULT.json")
 
     if AUTOTUNE_Z < 512:
