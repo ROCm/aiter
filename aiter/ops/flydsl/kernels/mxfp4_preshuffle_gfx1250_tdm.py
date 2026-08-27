@@ -50,6 +50,25 @@ NUM_CU = 256
 GFX1250_LDS_PER_CU = 327680
 
 
+def reuse_barrier():
+    """Workgroup barrier that guards LDS-slot reuse WITHOUT draining ds-reads.
+
+    ``workgroup_barrier()`` (``gpu.barrier()``) lowers to
+    ``s_wait_dscnt 0x0; s_barrier_signal -1; s_barrier_wait -1`` -- it forces
+    this wave's outstanding LDS reads to 0 before the barrier. At the pipeline's
+    reuse points (steady prefetch, drain cross-tile prefetch) the slot about to
+    be overwritten was already fully consumed by ``compute_ktile``: its final
+    WMMA waited on that slot's ds-reads, so they have landed by the time this
+    wave reaches the barrier. The only ds-reads still in flight target the NEXT
+    slot's register prefetch, which never aliases the slot being re-issued, so
+    draining them here is pure stall -- it just delays the prefetch overlap.
+    Emit the bare cross-wave rendezvous (the real WAR guard) and skip the
+    redundant ``s_wait_dscnt 0x0``.
+    """
+    rocdl.s_barrier_signal(-1)
+    rocdl.s_barrier_wait(-1)
+
+
 @flyc.jit
 def launch_gemm_a8w4_tdm(
     arg_c: fx.Tensor,
@@ -231,36 +250,51 @@ def launch_gemm_a8w4_tdm(
     c_lds_pad_elems = (_lds_row_bytes - C_ROW_BYTES) // 2 if enable_ep_scatter else 0
     store_pad = c_lds_pad_elems if enable_ep_scatter else 16
     C_STORE_B = ((tile_m * (tile_n + store_pad) * 2 + 127) // 128) * 128
-    # Persistent mode keeps the next tile's ring buffers live in LDS while this
-    # tile's C epilogue drains through a DISJOINT arena region, so the budget is
-    # additive (num_buffers*PITCH + C_STORE_B), unlike the non-persistent max().
-    # At the tuned num_buffers that sum can exceed per-CU LDS; the LDS-short
-    # fallback is to drop one ring-buffer slot at a time until it fits. The floor
-    # is 2: the k128 carry needs a double buffer and the cross-tile prologue
-    # hiding needs at least one slot freed per drain iteration. (The other option
-    # -- buffer-store C straight to global, freeing C_STORE_B entirely -- is a
-    # larger epilogue rewrite left for later.)
-    if persistent_active:
-        while (
-            num_buffers > 2
-            and num_buffers * PITCH + C_STORE_B > GFX1250_LDS_PER_CU
-        ):
-            num_buffers -= 1
-    # Cross-tile prologue hiding keeps the next tile's ring-buffer prefetch live in
-    # LDS while this tile's epilogue is still cshuffling C through the same arena,
-    # so (unlike the non-persistent path) they can no longer share bytes
-    # sequentially -- the budget is additive, not a max(). A ternary, not an
-    # if/else statement: @flyc.jit does not let branch-local names escape (see the
-    # other ternaries above), and this is a host-side/compile-time computation.
+    # Persistent mode keeps the NEXT tile's ring buffers live in LDS while THIS
+    # tile's C epilogue drains. The drain tail (below) re-issues the next tile's
+    # prefetch into every ring slot it frees EXCEPT one -- ``_missing_slot``, the
+    # slot holding the last k-tile, consumed here but left un-prefetched. So during
+    # the epilogue that one slot is free AND disjoint from the live next-tile
+    # loads: stage C into it whenever C fits in a single PITCH slot, keeping the
+    # budget non-additive (num_buffers*PITCH) so the tuned num_buffers survives.
+    # This reuses the non-persistent C-overlay-on-a-ring-slot pattern (which stages
+    # into slot 0), just targeting the guaranteed-free slot. Only when C is too big
+    # for one slot do we fall back to a DISJOINT region past the ring, making the
+    # budget additive (num_buffers*PITCH + C_STORE_B).
+    _c_fits_slot = C_STORE_B <= PITCH
+    # LDS-short fallback: drop ring slots until the budget fits, floor 2 (the k128
+    # carry needs a double buffer; cross-tile prologue hiding needs >=1 slot freed
+    # per drain iteration). Closed form, NOT a `while` loop: @flyc.jit rewrites a
+    # `while` STATEMENT into a traced scf.while, which would turn the compile-time
+    # ``num_buffers`` into a dynamic ir.Value and poison every constant derived
+    # from it (PITCH indexing, the ring modulus, the kernel name). Arithmetic +
+    # ternaries stay host-side.
+    _persist_budget = (
+        GFX1250_LDS_PER_CU if _c_fits_slot else GFX1250_LDS_PER_CU - C_STORE_B
+    )
+    num_buffers = (
+        max(2, min(num_buffers, _persist_budget // PITCH))
+        if persistent_active
+        else num_buffers
+    )
+    # The single ring slot the drain tail leaves un-prefetched (holds this tile's
+    # last k-tile). Compile-time: K, tile_k, num_buffers are all constants.
+    _missing_slot = (K // tile_k - 1) % num_buffers
+    # C-staging byte offset into the arena: the freed in-ring slot when C fits,
+    # else a disjoint region just past the ring. Ternaries, not if/else: @flyc.jit
+    # does not let branch-local names escape (see the other ternaries above).
+    C_STAGE_OFF = _missing_slot * PITCH if _c_fits_slot else num_buffers * PITCH
     ARENA_B = (
-        num_buffers * PITCH + C_STORE_B
+        max(num_buffers * PITCH, C_STAGE_OFF + C_STORE_B)
         if persistent_active
         else max(num_buffers * PITCH, C_STORE_B)
     )
     if persistent_active and ARENA_B > GFX1250_LDS_PER_CU:
         raise ValueError(
             f"persistent mode LDS overflow: needs {ARENA_B} bytes "
-            f"(num_buffers*PITCH={num_buffers * PITCH} + C_STORE_B={C_STORE_B}) "
+            f"(num_buffers*PITCH={num_buffers * PITCH}, "
+            f"C_STAGE_OFF={C_STAGE_OFF}, C_STORE_B={C_STORE_B}, "
+            f"c_fits_slot={_c_fits_slot}) "
             f"> {GFX1250_LDS_PER_CU} available per CU on gfx1250 "
             f"(tile_m={tile_m}, tile_n={tile_n}, tile_k={tile_k}, "
             f"num_buffers={num_buffers})"
@@ -411,12 +445,6 @@ def launch_gemm_a8w4_tdm(
             sb_batch_off = eb64 * (N_SUPERS * K4)
             # Per-expert A-data OOB: bound to the owning expert's valid-row
             mn_oob = tile_map[(expert < n_experts).select(expert, n_experts - 1)] - blk_m
-            if tid == fx.Int32(0):
-                if bid_x < fx.Int32(4):
-                    fx.printf(
-                        "[CUR ] bid_x={} blk_m={} blk_n={} expert={} mn_oob={}",
-                        bid_x, blk_m, blk_n, expert, mn_oob,
-                    )
 
             # static=False (one dyn-shared base) only where a second region is
             # needed, so the non-scatter path keeps its per-leaf static allocation.
@@ -430,14 +458,14 @@ def launch_gemm_a8w4_tdm(
             def ptr_to_idx(p):
                 return fx.index_cast(T.index, fx.ptrtoint(p))
 
-            # In persistent mode the C epilogue must not reuse the ring-buffer
-            # bytes: the previous drain's next-tile prefetch is still landing into
-            # slots 0..num_buffers-1 while this tile stages C. Stage C in the
-            # DISJOINT region the additive ARENA_B reserved just past the ring
-            # (base_ptr + num_buffers*PITCH). Non-persistently the arena is a
-            # max(), so C reuses base_ptr as before.
+            # In persistent mode the C epilogue must not clobber the next tile's
+            # live prefetches: the drain tail leaves them in every ring slot except
+            # ``_missing_slot``, so C stages at ``C_STAGE_OFF`` -- that freed slot
+            # when C fits one PITCH, else a disjoint region past the ring (see the
+            # host-side ARENA_B block). Non-persistently the arena is a max(), so C
+            # reuses base_ptr as before.
             c_stage_ptr = (
-                base_ptr + num_buffers * PITCH
+                base_ptr + C_STAGE_OFF
                 if const_expr(persistent_active)
                 else base_ptr
             )
@@ -677,13 +705,6 @@ def launch_gemm_a8w4_tdm(
                     tile_map[(expert_n < n_experts).select(expert_n, n_experts - 1)]
                     - blk_m_n
                 )
-                if tid == fx.Int32(0):
-                    if bid_x < fx.Int32(4):
-                        fx.printf(
-                            "[NEXT] from_bid_x={} for_bx={} blk_m_n={} blk_n_n={} "
-                            "expert_n={} mn_oob_n={}",
-                            bid_x, bx, blk_m_n, blk_n_n, expert_n, mn_oob_n,
-                        )
 
                 b_outer_row_n = eb64_n * B_BATCH_ROWS + blk_n64_n // 16
                 a_off0_n = blk_m64_n * A_KROW
@@ -1007,7 +1028,15 @@ def launch_gemm_a8w4_tdm(
                 """Compute one k128 while optionally loading the next LDS slot."""
                 reuse_cur_rmem = load_nxt_fn is not None and next_rmem is cur_rmem
                 if const_expr(num_outstanding_tdm is not None):
-                    pipeline_fence(outstanding=num_outstanding_tdm)
+                    # Carry fence at the last k128's top: the tensorcnt wait +
+                    # cross-wave rendezvous is the point (it publishes the next
+                    # tile's just-loaded subtile-0 LDS write). The outstanding
+                    # ds-reads here are THIS k128's own WMMA operands, which the
+                    # WMMAs below already wait on to their exact level -- draining
+                    # them to 0 at the barrier only over-serializes the read pipe,
+                    # so use the dscnt-free barrier.
+                    tdm_ops.tensor_wait(num_outstanding_tdm)
+                    reuse_barrier()
                 if const_expr(issue_fn is not None):
                     issue_fn()
                 if const_expr(load_nxt_fn is not None and not reuse_cur_rmem):
@@ -1180,14 +1209,25 @@ def launch_gemm_a8w4_tdm(
                         # outside ``dispatch_wave_job``, since every wave runs this once.
                         # Non-persistently the buffers were just issued in slot order,
                         # so waiting to `num_buffers-1` outstanding lands slot 0 (issued
-                        # first) -- enough for the carry. Persistently a preloaded tile
-                        # issues only `_missing_slot` fresh and inherits the rest from
-                        # the previous drain in an order that need not put slot 0 first,
-                        # so a partial count cannot prove slot 0 landed: drain fully.
-                        # This is cheap -- the inherited slots already landed during the
-                        # previous tile's epilogue; only the one fresh slot is awaited.
+                        # first) -- enough for the carry.
                         if const_expr(persistent_active):
-                            tdm_ops.tensor_wait(0)
+                            if preloaded_tile:
+                                # A preloaded tile issues only `_missing_slot` fresh and
+                                # inherits the rest from the previous drain in an order
+                                # that need not put slot 0 first, so a partial count
+                                # cannot prove slot 0 landed: drain fully. This is cheap
+                                # -- the inherited slots already landed during the
+                                # previous tile's epilogue; only the one fresh slot is
+                                # awaited.
+                                tdm_ops.tensor_wait(0)
+                            else:
+                                # The FIRST tile a CU runs has no predecessor to hide its
+                                # prologue, and issued every buffer in slot order. Land
+                                # all but the last-issued buffer (enough to start compute
+                                # at slot 0) and keep just that last buffer's TDM in
+                                # flight to overlap the main loop -- s_wait_tensorcnt
+                                # TDM_PER (0x2 for TDM_PER=2).
+                                tdm_ops.tensor_wait(TDM_PER)
                         else:
                             tdm_ops.tensor_wait(TDM_PER * (num_buffers - 1))
                         workgroup_barrier()
@@ -1210,12 +1250,22 @@ def launch_gemm_a8w4_tdm(
                                 next_stage_on,
                                 next_stage_buf,
                                 next_stage_wait=(
+                                    # The carry at this fence loads the immediately-next
+                                    # slot (kt+1) -- the oldest in-flight buffer. With
+                                    # num_buffers-1 buffers ahead in flight, that slot
+                                    # only lands once outstanding drops to (nb-2)*TDM_PER
+                                    # (=0x4). A looser 0x6 would read it before its TDM
+                                    # lands, so this stays 0x4 in both modes.
                                     TDM_PER * (num_buffers - 2)
                                     if const_expr(next_stage_on)
                                     else None
                                 ),
                             )
-                            workgroup_barrier()
+                            # Slot s was just consumed by the compute_ktile above;
+                            # its ds-reads have drained (the WMMAs waited on them),
+                            # so the barrier need not re-drain them -- only rendezvous
+                            # before re-issuing the TDM store into slot s.
+                            reuse_barrier()
                             issue(s, kt + num_buffers, my_jobs)
 
                     dispatch_wave_job(steady_post)
@@ -1235,10 +1285,17 @@ def launch_gemm_a8w4_tdm(
                         # iteration regardless, so leaving them be only forfeits
                         # some overlap here -- never a correctness risk -- while the
                         # post-mainloop fence below still exempts what's left.
-                        pipeline_fence(
-                            outstanding=TDM_PER
+                        # Fence the freed slot's TDM store before compute_ktile reads
+                        # it. The slot this iteration consumes had its ds-reads drained
+                        # by the previous compute_ktile's WMMAs (which waited on their
+                        # own operands), so the barrier only needs the cross-wave
+                        # rendezvous -- skip the redundant s_wait_dscnt 0x0 by using the
+                        # dscnt-free reuse_barrier() instead of pipeline_fence().
+                        tdm_ops.tensor_wait(
+                            TDM_PER
                             * max(0, num_buffers - 1 - j - (1 if has_next else 0))
                         )
+                        reuse_barrier()
                         if const_expr(enable_ep_scatter and j == num_buffers - 1):
                             # Last drain tile: issue the rowmap TDM here so it overlaps
                             # this final WMMA on the otherwise idle HBM. Nothing waits
@@ -1262,7 +1319,10 @@ def launch_gemm_a8w4_tdm(
                                 # it. No tensor_wait -- the fresh async load stays in
                                 # flight to overlap this tile's epilogue, whose C staging
                                 # lives in a disjoint LDS region in persistent mode.
-                                workgroup_barrier()
+                                # Slot s_j was just fully consumed by the compute_ktile
+                                # above, so its ds-reads have drained -- the barrier only
+                                # needs the cross-wave rendezvous, not another dscnt wait.
+                                reuse_barrier()
                                 issue(s_j, s_j, jobs_list=jobs_next)
                 else:
                     # Mid-compute prefetch: better for prefill. PRE is both the tiles
