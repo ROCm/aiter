@@ -5,7 +5,7 @@
 
 Correctness (pytest, Mi=512): dispatch config resolution, cos > 0.999 vs torch-eager
 reference on all three grads (dJagged, dDense, dBias), tail-over-read regression,
-forced split=2 reduce-path coverage, and autograd (D<=256).
+forced split=2 reduce-path coverage, and end-to-end autograd at headline shapes.
 
 Performance (``main()``, Mi=7680): FlyDSL vs upstream Triton on headline deployment
 shapes, swept over regime and backward component (``jagged`` / ``dense_bias`` / ``all``).
@@ -323,7 +323,7 @@ def _eager_grads(jagged, dense, bias, seq_offsets, grad_out, B):
     return j.grad, d.grad, bi.grad
 
 
-def _run_autograd_case(D, B, Mi, regime, *, seed=SEED, sparsity=0.95):
+def _run_autograd_case(D, B, Mi, regime, *, seed=SEED, sparsity=0.95, label=""):
     from aiter.ops.flydsl import jagged_dense_bmm_autograd
 
     jagged, dense, grad_out, seq_offsets, L, N, _K = _make_inputs(
@@ -341,7 +341,7 @@ def _run_autograd_case(D, B, Mi, regime, *, seed=SEED, sparsity=0.95):
     gj_e, gd_e, gb_e = _eager_grads(jagged, dense, bias, seq_offsets, grad_out, B)
     c_j, c_d, c_b = _cos(jf.grad, gj_e), _cos(df.grad, gd_e), _cos(bf.grad, gb_e)
     ok = min(c_j, c_d, c_b) > _COS_THRESH
-    tag = f"[autograd] B={B} D={D} Mi={Mi} {regime:6s} L={L}"
+    tag = f"{label}[autograd] B={B} D={D} Mi={Mi} {regime:6s} L={L}"
     return (
         ok,
         f"[{'PASS' if ok else 'FAIL'}] {tag}  grad cos(dJ={c_j:.5f}, dD={c_d:.5f}, dB={c_b:.5f})",
@@ -439,15 +439,24 @@ def _worker(D: int) -> int:
         ok &= case_ok
         print(msg)
 
-    if D <= 256:
-        for B, Mi, regime in [(120, 512, "genrec"), (120, 512, "skew")]:
-            case_ok, msg = _run_autograd_case(D, B, Mi, regime)
-            ok &= case_ok
-            print(msg)
-    else:
-        print(
-            f"[SKIP] autograd D={D}: forward int32-overflow at large L (separate forward fix)"
+    for B, Mi, regime in _HEADLINE:
+        case_ok, msg = _run_autograd_case(D, B, Mi, regime)
+        ok &= case_ok
+        print(msg)
+
+    if D == 512:
+        r = _REGRESSION
+        case_ok, msg = _run_autograd_case(
+            D,
+            r["B"],
+            r["Mi"],
+            r["regime"],
+            seed=r["seed"],
+            sparsity=r["sparsity"],
+            label="[regression] ",
         )
+        ok &= case_ok
+        print(msg)
 
     print(f"\nD={D} RESULT:", "PASS" if ok else "FAIL")
     return 0 if ok else 1
