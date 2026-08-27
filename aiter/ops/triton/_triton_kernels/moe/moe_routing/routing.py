@@ -296,6 +296,11 @@ def _combined_routing_fused(
 
     tl.debug_barrier()
 
+    if pid != 0 and pid < blocks1a:
+        n_tokens = tl.load(ExpertHist + pid)
+        if n_tokens == 0:
+            return
+
     tile_start = _expt_data_compute_stage1(
         pid,
         ExpertHist,

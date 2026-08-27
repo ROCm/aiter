@@ -27,24 +27,29 @@ def _expt_data_compute_stage1(
     else:
         mask_n = offs_n < n_expts_tot
         hist_token = tl.load(Hist + offs_n, mask=mask_n, other=0)
-    hist_tile = _cdiv_pow2(hist_token, tile_dim_log2)
-    token_starts = tl.cumsum(hist_token, 0) - hist_token
-    tile_starts = tl.cumsum(hist_tile, 0) - hist_tile
 
     if pid < n_expts_tot:
+        hist_tile = _cdiv_pow2(hist_token, tile_dim_log2)
+        tile_starts = tl.cumsum(hist_tile, 0) - hist_tile
         expt_id = tl.zeros([1], tl.int32) + pid
         tile_start = tl.gather(tile_starts, expt_id, 0)
-        token_start = tl.gather(token_starts, expt_id, 0)
         tl.store(TileStart + expt_id, tile_start)
-        tl.store(TokenStart + expt_id, token_start)
     else:
         tile_start = tl.zeros([1], tl.int32)
+        token_starts = tl.cumsum(hist_token, 0) - hist_token
         if EQUAL_BLOCK:
             tl.store(TokenStart + offs_n, token_starts)
         else:
             tl.store(TokenStart + offs_n, token_starts, mask=mask_n)
 
     if pid == 0:
+        hist_tile = _cdiv_pow2(hist_token, tile_dim_log2)
+        tile_starts = tl.cumsum(hist_tile, 0) - hist_tile
+        if EQUAL_BLOCK:
+            tl.store(TileStart + offs_n, tile_starts)
+        else:
+            tl.store(TileStart + offs_n, tile_starts, mask=mask_n)
+
         tl.store(TokenStart + n_expts_tot, n_gates)
         tile_off_last = tl.sum(hist_tile, 0)
         tl.store(TileStart + n_expts_tot, tile_off_last)
