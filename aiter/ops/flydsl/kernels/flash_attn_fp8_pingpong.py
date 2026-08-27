@@ -111,7 +111,7 @@ def build_flash_attn_fp8_module(
     IGLP_VARIANT = 1
     SOFTMAX_PRIO = 1
 
-    L_SPLIT_TILES = 2
+    L_SPLIT_TILES = 0
     L_MFMA_SLABS = PV_K_STEPS - L_SPLIT_TILES // 2
 
     SCHRAUDOLPH_2P23 = 1 << 23
@@ -971,7 +971,7 @@ def build_flash_attn_fp8_module(
                 kv_start = fx.Index(iv)
 
                 _sched_barrier()
-                rocdl.s_setprio(0)
+                rocdl.s_setprio(1)
                 _gpu_barrier()
                 o, l_mfma, k_preloaded = apply_pv(
                     [o0, o1, o2, o3],
@@ -992,7 +992,7 @@ def build_flash_attn_fp8_module(
                 )
 
                 _sched_barrier()
-                rocdl.s_setprio(1)
+                rocdl.s_setprio(0)
                 _gpu_barrier()
                 m_frozen, bias_chunks, p_pack, l_valu = do_softmax(
                     s_accs,
@@ -1126,7 +1126,7 @@ def build_flash_attn_fp8_module(
                 l_voffs = get_lds_voffs(v_buff_off)
                 g_voffs = get_hbm_voffs(kv_start + fx.Index(2 * BLOCK_N))
                 _sched_barrier()
-                rocdl.s_setprio(0)
+                rocdl.s_setprio(1)
                 _gpu_barrier()
 
                 o, l_mfma, k_preloaded = apply_pv(
@@ -1147,7 +1147,7 @@ def build_flash_attn_fp8_module(
                     dma=(v_rsrc, l_voffs, g_voffs),
                 )
                 _sched_barrier()
-                rocdl.s_setprio(1)
+                rocdl.s_setprio(0)
                 _gpu_barrier()
                 scf.YieldOp(
                     [
