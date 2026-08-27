@@ -367,40 +367,54 @@ def chunk_gated_delta_rule_fwd_opt_vk(
 
     # The fused K5+K6 kernel has no state-pool gather and no snapshot-dtype
     # override (it never materialises the snapshot). Requesting either forces
-    # the separate K5 + K6 pipeline, whose K5 wrapper does implement them --
-    # otherwise the fused path would silently drop them.
-    _fused_unsupported = (
-        initial_state_indices is not None
-        or inplace_final_state is True
-        or (snapshot_dtype is not None and snapshot_dtype != k.dtype)
-    )
-    if _fused_unsupported and fusion is K5K6Fusion.ALWAYS:
-        raise ValueError(
-            "fusion=ALWAYS is incompatible with `initial_state_indices`, "
-            "`inplace_final_state` or a `snapshot_dtype` override; the fused "
-            "FlyDSL K5+K6 kernel implements none of them."
+    # the separate K5 + K6 pipeline, whose K5 wrapper does implement them.
+    if initial_state_indices is not None:
+        _fused_unsupported_message = (
+            "`initial_state_indices` requires a state-pool gather"
+        )
+    elif inplace_final_state is True:
+        _fused_unsupported_message = (
+            "`inplace_final_state` requires an in-place write-back"
+        )
+    elif snapshot_dtype is not None and snapshot_dtype != k.dtype:
+        _fused_unsupported_message = (
+            f"a `snapshot_dtype` override ({snapshot_dtype}) requires the "
+            f"snapshot to be materialised"
+        )
+    elif not use_chunk_flydsl:
+        # This is the case that used to vanish: an arch guard above can clear
+        # ``use_chunk_flydsl``, and ALWAYS was then dropped without a word.
+        _fused_unsupported_message = (
+            "the FlyDSL path is disabled here (either use_chunk_flydsl=False was "
+            "passed, or this runtime/decode configuration turned it off)"
+        )
+    else:
+        from aiter.ops.flydsl.gdn_fused_gfx942_kernels import (
+            is_fused_k5k6_gfx942_unsupported,
         )
 
-    # Fusion is resolved *after* the fallbacks above so that an arch that turned
-    # ``use_chunk_flydsl`` off cannot leave the fused flag stranded at True.
-    if use_chunk_flydsl and not _fused_unsupported:
-        if fusion is K5K6Fusion.ALWAYS:
-            use_chunk_flydsl_fused = True
-        elif fusion is K5K6Fusion.AUTO:
-            from aiter.ops.flydsl.linear_attention_prefill_kernels import (
-                should_use_fused_gfx942,
-            )
+        _fused_unsupported_message = is_fused_k5k6_gfx942_unsupported()
 
-            _N = (
-                len(cu_seqlens) - 1 - num_decodes
-                if cu_seqlens is not None
-                else v.shape[0]
-            )
-            use_chunk_flydsl_fused = should_use_fused_gfx942(
-                H=v.shape[2], N=_N, V=v.shape[-1]
-            )
-        else:
-            use_chunk_flydsl_fused = False
+    # ALWAYS is a hard request: it must either fuse or say why it is not possible.
+    if fusion is K5K6Fusion.ALWAYS and _fused_unsupported_message is not None:
+        raise ValueError(
+            f"fusion=ALWAYS was requested, but the fused FlyDSL K5+K6 kernel "
+            f"cannot be used here: {_fused_unsupported_message}."
+        )
+
+    if _fused_unsupported_message is not None:
+        use_chunk_flydsl_fused = False
+    elif fusion is K5K6Fusion.ALWAYS:
+        use_chunk_flydsl_fused = True
+    elif fusion is K5K6Fusion.AUTO:
+        from aiter.ops.flydsl.gdn_fused_gfx942_kernels import (
+            should_use_fused_k5k6_gfx942,
+        )
+
+        _N = len(cu_seqlens) - 1 - num_decodes if cu_seqlens is not None else v.shape[0]
+        use_chunk_flydsl_fused = should_use_fused_k5k6_gfx942(
+            H=v.shape[2], N=_N, V=v.shape[-1]
+        )
     else:
         use_chunk_flydsl_fused = False
 
@@ -468,7 +482,7 @@ def chunk_gated_delta_rule_fwd_opt_vk(
         # ``g_cumsum`` from K1+K2 is head-major [B, H, T] (same convention as
         # the K5 wrapper). K6 gating uses scalar ``g`` only; the KDA (gk) path
         # folds its decay into K5 and is not routed through this scalar pipeline.
-        from aiter.ops.flydsl.linear_attention_prefill_kernels import (
+        from aiter.ops.flydsl.gdn_fused_gfx942_kernels import (
             chunk_gated_delta_rule_fwd_h_o_flydsl,
         )
 

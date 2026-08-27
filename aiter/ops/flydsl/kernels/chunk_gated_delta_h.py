@@ -775,20 +775,25 @@ def compile_chunk_gated_delta_h(
                 # Build the 4-lane gate vector via a single from_elements
                 # instead of fx.full(0.0) + 4x vector.insert: less SSA chain,
                 # lets LLVM pack the 4 lanes directly as register-immediate.
-                gate_elems = []
-                for elem_i in range_constexpr(4):
-                    gate = _fast_exp(g_last - g_row_prefetch[elem_i])
-                    gate_elems.append(frag_row_ok[elem_i].select(gate, fx.Float32(0.0)))
-            else:
-                # Ungated: the "gate" degenerates to the bare padding mask.
                 gate_elems = [
-                    frag_row_ok[elem_i].select(fx.Float32(1.0), fx.Float32(0.0))
+                    _fast_exp(g_last - g_row_prefetch[elem_i])
                     for elem_i in range_constexpr(4)
                 ]
+            else:
+                # Ungated: the gate degenerates to unity.
+                gate_elems = [fx.Float32(1.0) for _ in range_constexpr(4)]
 
             gate_vec = fx.Vector.from_elements(gate_elems, dtype=fx.Float32)
             for nr in range_constexpr(N_REPEAT):
-                vn_frags[nr] = vn_frags[nr] * gate_vec
+                gated = vn_frags[nr] * gate_vec
+                # The padding rows are zeroed here.
+                vn_frags[nr] = fx.Vector.from_elements(
+                    [
+                        frag_row_ok[e].select(gated[e], fx.Float32(0.0))
+                        for e in range_constexpr(4)
+                    ],
+                    dtype=fx.Float32,
+                )
 
             if const_expr(USE_G):
                 # Wrap raw ArithValue in fx.Float32 so fx.full's broadcast

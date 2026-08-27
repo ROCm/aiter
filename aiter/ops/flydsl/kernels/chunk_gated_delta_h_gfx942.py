@@ -116,6 +116,20 @@ def _to_bf16_fast(val, n=1):
     Ties round away from zero, not to even. Values are sign-magnitude so one
     bias serves both signs, and the carry can only perturb the exponent within
     ~1 ulp of FLT_MAX.
+
+    NaN needs a guard. The 0x8000 bias carries into the exponent field for any
+    NaN whose payload lives entirely below bit 16 -- 0x7F800001 rounds to
+    0x7F80, which is +Inf, turning "not a number" into "infinitely large". Such
+    low-payload NaNs are what an integer-coded or hardware-generated NaN
+    typically looks like. Infinity itself survives the bias untouched
+    (0x7F800000 + 0x8000 >> 16 == 0x7F80), so only NaN needs handling.
+
+    For NaN we take the raw high half and force the quiet bit instead of
+    rounding: that keeps the sign and the payload bits bf16 can represent, and
+    quietens a signaling NaN. Quietening is what IEEE-754 conversion and the
+    hardware ``v_cvt`` do -- bf16 has no way to carry a payload small enough to
+    distinguish sNaN from qNaN, so preserving NaN-ness is the strongest
+    guarantee available.
     """
     is_vec = n > 1
     i32_ty = T.vec(n, T.i32) if is_vec else T.i32
@@ -129,6 +143,18 @@ def _to_bf16_fast(val, n=1):
     # The shift may be signed or unsigned: the following trunci keeps only the
     # low 16 bits, which are bits 16..31 of the input either way.
     hi = _arith.shrui(_arith.addi(bits, _splat(0x8000)), _splat(16))
+
+    # NaN iff |bits| > 0x7F800000 (exponent all ones and payload non-zero).
+    # Tested on the integer bits so scalar and vector share one path.
+    is_nan = _arith.cmpi(
+        _arith.CmpIPredicate.ugt,
+        _arith.andi(bits, _splat(0x7FFFFFFF)),
+        _splat(0x7F800000),
+    )
+    # Sign + exponent + top payload bits, with the quiet bit (0x0040) forced.
+    nan_hi = _arith.ori(_arith.shrui(bits, _splat(16)), _splat(0x0040))
+    hi = _arith.select(is_nan, nan_hi, hi)
+
     narrowed = _arith.trunci(i16_ty, hi)
     cast = _vector.bitcast if is_vec else _arith.bitcast
     return cast(bf16_ty, narrowed)
@@ -523,10 +549,17 @@ def compile_chunk_gated_delta_h_gfx942(
             # offset is always 4-aligned -- K % 4 == 0 (asserted above) and
             # every addend (H*K, i_h*K, kb*64, wid_m*16, lane_m_base*4) is a
             # multiple of 4 -- so quad // 4 is exact.
+            #
+            # The extent comes from the tensor, not from T_flat*H*K: dense
+            # ``gk`` is [B, T_flat, H, K] and the read offset below carries a
+            # batch term (bos = i_n*T_val), so a one-batch bound would read a
+            # hardware zero for every i_n>0, silently dropping the gate.
+            _gk_buf = fx.rocdl.make_buffer_tensor(gk_tensor, max_size=False)
+            _gk_n = fx.get_scalar(fx.cosize(fx.get_layout(_gk_buf)))
             gk_buf = fx.Tensor(
                 fx.make_view(
-                    fx.get_iter(fx.rocdl.make_buffer_tensor(gk_tensor, max_size=False)),
-                    fx.make_layout((T_flat * fx.Int32(H * K // 4), 4), (4, 1)),
+                    fx.get_iter(_gk_buf),
+                    fx.make_layout((_gk_n // 4, 4), (4, 1)),
                 )
             )
 
@@ -1115,11 +1148,28 @@ def compile_chunk_gated_delta_h_gfx942(
                     for j in range_constexpr(4):
                         row = row_quad * fx.Int32(4) + fx.Int32(j)
                         abs_row = i_t_i32 * fx.Int32(BT) + row
-                        safe_row = (abs_row < T_local).select(abs_row, fx.Int32(0))
+                        row_ok = abs_row < T_local
+                        # The clamp keeps the ADDRESS in range; it cannot be
+                        # dropped in favour of the buffer's bounds check,
+                        # because a row past T_local is still a live element of
+                        # the next head/sequence rather than a hardware zero.
+                        # But the clamped load then returns row 0's real k, so
+                        # zero the VALUE explicitly: these lanes only survive
+                        # into GEMM2 as k^T @ v_new, and while v_new is already
+                        # zeroed there, Inf*0 and NaN*0 are NaN -- a non-finite
+                        # k in row 0 would poison the state update.
+                        safe_row = row_ok.select(abs_row, fx.Int32(0))
                         k_off = k_base + safe_row * stride_k + kx_col_base
+                        k_val = fx.Vector(
+                            k_kt_buf[(k_off // fx.Int32(K_VEC_WIDTH), None)].load()
+                        )
                         quad_rows.append(
-                            fx.Vector(
-                                k_kt_buf[(k_off // fx.Int32(K_VEC_WIDTH), None)].load()
+                            fx.Vector.from_elements(
+                                [
+                                    row_ok.select(k_val[e], fx.BFloat16(0.0))
+                                    for e in range_constexpr(K_VEC_WIDTH)
+                                ],
+                                dtype=fx.BFloat16,
                             )
                         )
                     k_prefetch.append(quad_rows)
@@ -1195,12 +1245,22 @@ def compile_chunk_gated_delta_h_gfx942(
             # loads read past the tensor (bounds-checked to zero). They must be
             # zeroed in v_new before the k^T @ v_new state update or
             # final_state is corrupted.
-            row_mask_vec = fx.Vector.from_elements(
-                [ok.select(fx.Float32(1.0), fx.Float32(0.0)) for ok in frag_row_ok],
-                dtype=fx.Float32,
-            )
+            #
+            # Selected, not multiplied by a 0.0/1.0 vector: a padding lane can
+            # carry a NaN or Inf (a non-finite input propagates through the
+            # GEMM into b_v), and NaN*0 == NaN while Inf*0 == NaN, so a
+            # multiplicative mask leaves the poison in place and it reaches the
+            # state update. Cost is unchanged -- v_cndmask for v_mul, 4 of each
+            # per fragment.
             for nr in range_constexpr(N_REPEAT_LOCAL):
-                vn_frags[nr] = vn_frags[nr] * row_mask_vec
+                vn_val = vn_frags[nr]
+                vn_frags[nr] = fx.Vector.from_elements(
+                    [
+                        frag_row_ok[e].select(vn_val[e], fx.Float32(0.0))
+                        for e in range_constexpr(4)
+                    ],
+                    dtype=fx.Float32,
+                )
 
             # -- 2b. Store v_new for output --
             if const_expr(SAVE_NEW_VALUE):
@@ -1584,9 +1644,11 @@ def compile_chunk_gated_delta_h_gfx942(
                             & frag_row_ok[e]
                             & (col_abs < T_local)
                         )
-                        masked.append(
-                            a_acc[e] * causal.select(fx.Float32(1.0), fx.Float32(0.0))
-                        )
+                        # Select, not a multiply by 0.0: masked-out lanes can
+                        # hold a NaN or Inf from an out-of-range load, and
+                        # NaN*0 is NaN while Inf*0 is NaN. A select discards
+                        # the value outright. Same VALU cost (v_cndmask).
+                        masked.append(causal.select(a_acc[e], fx.Float32(0.0)))
                 # lds_A's 4 C values are BT apart so this is goes out through the scalar copy atom.
                 _cfrag_to_lds(
                     cp_lds_x1,
