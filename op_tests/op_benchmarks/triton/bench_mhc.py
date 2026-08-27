@@ -39,6 +39,9 @@ from typing import Any, ClassVar
 
 import torch
 import triton
+
+from aiter.ops.triton.fusions.mhc import mhc, mhc_post
+from aiter.ops.triton.utils.config_utils import hip_post_dispatch_block
 from aiter.test_common import checkAllclose
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_caller_name_no_ext,
@@ -49,17 +52,13 @@ from op_tests.triton_tests.utils.mhc_ref import (
     mhc_e2e_ref,
 )
 
-from aiter.ops.triton.fusions.mhc import mhc, mhc_post
-from aiter.ops.triton.utils.config_utils import hip_post_dispatch_block
-
 logger = logging.getLogger(__name__)
 
 # Optional HIP imports; --with-hip code paths fail loudly at runtime via
 # _validate_with_hip when these are None.
 try:  # pragma: no cover
-    import aiter.jit.utils.chip_info as _aiter_chip_info
-
     import aiter as _aiter
+    import aiter.jit.utils.chip_info as _aiter_chip_info
 except ImportError:  # pragma: no cover
     _aiter = None
     _aiter_chip_info = None
