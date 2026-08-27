@@ -57,7 +57,7 @@ pytestmark = [pytest.mark.l2_device, pytest.mark.rocm_lower]
 # Routing: normal (random) by default; round-robin balanced only when
 # AITER_MOE_EXPERT_BALANCE=1 (mirrors op_tests/test_moe_2stage.py).
 AITER_MOE_EXPERT_BALANCE = (
-    os.environ.get("AITER_MOE_EXPERT_BALANCE", "False").lower() == "true"
+    os.environ.get("AITER_MOE_EXPERT_BALANCE", "True").lower() == "true"
 )
 
 

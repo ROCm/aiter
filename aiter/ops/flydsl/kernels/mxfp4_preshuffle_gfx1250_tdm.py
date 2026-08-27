@@ -397,17 +397,37 @@ def launch_gemm_a8w4_tdm(
         # whole range), or the original total_m_tiles non-persistently.
         _swz_m_tiles = total_valid_m_tiles if persistent_active else total_m_tiles
 
-        def run_tile(bid_x):
-            swz_id = bid_x // cluster_n if cluster_n > 1 else bid_x
-            local_n = bid_x - swz_id * cluster_n if cluster_n > 1 else None
+        # Hoisted out of ``run_tile``: the psum array and its element type are
+        # loop-invariant across every persistent tile a CU runs.
+        _i32_ptr = fx.PointerType.get(
+            elem_ty=fx.Int32.ir_type, address_space=fx.AddressSpace.Global, alignment=4
+        )
+        tile_map = fx.recast_iter(_i32_ptr, arg_m_tile_map)
+
+        def tile_coords(bx):
+            """Swizzle + expert bisect for flat tile ``bx``.
+
+            Returns ``(blk_m, blk_n, expert, mn_oob)`` -- everything about a tile
+            that needs a memory read. The bisect below is a chain of
+            ``num_experts``-deep dependent global loads, so in persistent mode the
+            caller computes this ONCE per tile and carries it across the tile loop
+            (see the driver at the bottom) rather than recomputing it both for the
+            drain-tail prefetch and again at the next tile's top.
+            """
+            swz_id = bx // cluster_n if cluster_n > 1 else bx
+            local_n = bx - swz_id * cluster_n if cluster_n > 1 else None
             n_units = total_n_tiles // cluster_n if cluster_n > 1 else total_n_tiles
             blocks_per_group = n_units * TILES_PER_GROUP
             group = swz_id // blocks_per_group
             group_first_tile = group * TILES_PER_GROUP
             in_group = swz_id - group * blocks_per_group
             rem_tiles = _swz_m_tiles - group_first_tile
-            group_tiles = (rem_tiles < TILES_PER_GROUP).select(rem_tiles, TILES_PER_GROUP)
-            m_tile = group_first_tile + (in_group - (in_group // group_tiles) * group_tiles)
+            group_tiles = (rem_tiles < TILES_PER_GROUP).select(
+                rem_tiles, TILES_PER_GROUP
+            )
+            m_tile = group_first_tile + (
+                in_group - (in_group // group_tiles) * group_tiles
+            )
             blk_m = m_tile * tile_m
             n_unit = in_group // group_tiles
             blk_n = (
@@ -415,6 +435,25 @@ def launch_gemm_a8w4_tdm(
                 if cluster_n > 1
                 else n_unit * tile_n
             )
+            # In-kernel bisect: find expert owning this M-tile via psum
+            lo, hi = blk_m * 0, blk_m * 0 + n_experts
+            for _ in range_constexpr(
+                max(1, math.ceil(math.log2(max(2, n_experts))) + 1)
+            ):
+                mid = (lo + hi) >> 1
+                mid_clamped = (mid < n_experts - 1).select(mid, n_experts - 1)
+                go_right = tile_map[mid_clamped] <= blk_m
+                lo = go_right.select(mid + 1, lo)
+                hi = go_right.select(hi, mid)
+            expert = lo
+            # Per-expert A-data OOB: bound to the owning expert's valid-row
+            mn_oob = (
+                tile_map[(expert < n_experts).select(expert, n_experts - 1)] - blk_m
+            )
+            return blk_m, blk_n, expert, mn_oob
+
+        def run_tile(bid_x, coords, next_coords=None):
+            blk_m, blk_n, expert, mn_oob = coords
             # Peers differ only in n_tile, so A alone is broadcast, to the whole
             # cluster -- a constant all-ones mask, no cluster-local id needed.
             a_mcast_mask = (1 << cluster_n) - 1 if cluster_n > 1 else 0
@@ -422,19 +461,6 @@ def launch_gemm_a8w4_tdm(
             blk_n64 = fx.Int64(blk_n)
             n64 = fx.Int64(i32_n)
 
-            # In-kernel bisect: find expert owning this M-tile via psum
-            i32_ptr = fx.PointerType.get(
-                elem_ty=fx.Int32.ir_type, address_space=fx.AddressSpace.Global, alignment=4
-            )
-            tile_map = fx.recast_iter(i32_ptr, arg_m_tile_map)
-            lo, hi = blk_m * 0, blk_m * 0 + n_experts
-            for _ in range_constexpr(max(1, math.ceil(math.log2(max(2, n_experts))) + 1)):
-                mid = (lo + hi) >> 1
-                mid_clamped = (mid < n_experts - 1).select(mid, n_experts - 1)
-                go_right = tile_map[mid_clamped] <= blk_m
-                lo = go_right.select(mid + 1, lo)
-                hi = go_right.select(hi, mid)
-            expert = lo
             eb64 = fx.Int64(expert)
             B_BATCH_ROWS = n64 // 16
             N_SUPERS = (n64 + 31) // 32
@@ -443,8 +469,6 @@ def launch_gemm_a8w4_tdm(
             c_outer_off, c_inner_off, c_stride = blk_m64, blk_n64, i32_n
             SB_OUTER_STRIDE = K4
             sb_batch_off = eb64 * (N_SUPERS * K4)
-            # Per-expert A-data OOB: bound to the owning expert's valid-row
-            mn_oob = tile_map[(expert < n_experts).select(expert, n_experts - 1)] - blk_m
 
             # static=False (one dyn-shared base) only where a second region is
             # needed, so the non-scatter path keeps its per-leaf static allocation.
@@ -658,53 +682,19 @@ def launch_gemm_a8w4_tdm(
                 wv=waves[3],
             )
 
-            def build_next_jobs(bx):
+            def build_next_jobs(next_coords):
                 """Rebuild the (blk_m, blk_n, expert, mn_oob)-derived job list for
-                tile ``bx`` -- used to prefetch the NEXT persistent tile's A/B/scale
-                loads during THIS tile's drain tail. Mirrors the current tile's own
-                setup above exactly, parametrized on ``bx`` instead of ``bid_x``, and
-                appending into a fresh list instead of the closed-over ``jobs``."""
-                swz_id_n = bx // cluster_n if cluster_n > 1 else bx
-                local_n_n = bx - swz_id_n * cluster_n if cluster_n > 1 else None
-                n_units_n = (
-                    total_n_tiles // cluster_n if cluster_n > 1 else total_n_tiles
-                )
-                blocks_per_group_n = n_units_n * TILES_PER_GROUP
-                group_n = swz_id_n // blocks_per_group_n
-                group_first_tile_n = group_n * TILES_PER_GROUP
-                in_group_n = swz_id_n - group_n * blocks_per_group_n
-                rem_tiles_n = _swz_m_tiles - group_first_tile_n
-                group_tiles_n = (rem_tiles_n < TILES_PER_GROUP).select(
-                    rem_tiles_n, TILES_PER_GROUP
-                )
-                m_tile_n = group_first_tile_n + (
-                    in_group_n - (in_group_n // group_tiles_n) * group_tiles_n
-                )
-                blk_m_n = m_tile_n * tile_m
-                n_unit_n = in_group_n // group_tiles_n
-                blk_n_n = (
-                    (n_unit_n * cluster_n + local_n_n) * tile_n
-                    if cluster_n > 1
-                    else n_unit_n * tile_n
-                )
+                the NEXT persistent tile -- used to prefetch its A/B/scale loads
+                during THIS tile's drain tail.
+
+                ``next_coords`` is the already-bisected ``tile_coords`` tuple handed
+                down by the driver, so this is pure offset arithmetic: no swizzle
+                replay and no second dependent-load bisect chain. The next iteration
+                receives the same tuple and skips its own bisect too."""
+                blk_m_n, blk_n_n, expert_n, mn_oob_n = next_coords
                 blk_m64_n = fx.Int64(blk_m_n)
                 blk_n64_n = fx.Int64(blk_n_n)
-
-                lo_n, hi_n = blk_m_n * 0, blk_m_n * 0 + n_experts
-                for _ in range_constexpr(
-                    max(1, math.ceil(math.log2(max(2, n_experts))) + 1)
-                ):
-                    mid_n = (lo_n + hi_n) >> 1
-                    mid_clamped_n = (mid_n < n_experts - 1).select(mid_n, n_experts - 1)
-                    go_right_n = tile_map[mid_clamped_n] <= blk_m_n
-                    lo_n = go_right_n.select(mid_n + 1, lo_n)
-                    hi_n = go_right_n.select(hi_n, mid_n)
-                expert_n = lo_n
                 eb64_n = fx.Int64(expert_n)
-                mn_oob_n = (
-                    tile_map[(expert_n < n_experts).select(expert_n, n_experts - 1)]
-                    - blk_m_n
-                )
 
                 b_outer_row_n = eb64_n * B_BATCH_ROWS + blk_n64_n // 16
                 a_off0_n = blk_m64_n * A_KROW
@@ -784,7 +774,7 @@ def launch_gemm_a8w4_tdm(
                 # loops for an unrelated intra-tile K_TILES-wraparound flag.
                 preloaded_tile = bid_x > base_cu
                 has_next_tile = (bid_x + 1) < (base_cu + count_cu)
-                jobs_next = build_next_jobs(bid_x + 1)
+                jobs_next = build_next_jobs(next_coords)
 
             # Wave ids are runtime, so one stream serves every wave and one test per
             # owner list is the floor. Dispatched bodies receive their jobs directly.
@@ -1799,10 +1789,22 @@ def launch_gemm_a8w4_tdm(
                     tdm_ops.tensor_wait(0)
 
         if const_expr(persistent_active):
+            # Carry the expert bisect across the tile loop. Iteration i has to
+            # resolve tile i+1's coords anyway -- the drain tail prefetches that
+            # tile's first num_buffers-1 k-tiles -- so hand the same tuple to
+            # iteration i+1 instead of letting it repeat the identical
+            # dependent-load chain at its own top. One bisect per tile, not two;
+            # a later tile then only recomputes TDM offsets.
+            # ``cur`` is assigned before the loop and reassigned in the body, so
+            # the rewriter carries it as an scf.for iter_arg (the tuple is
+            # flattened elementwise); ``nxt`` is body-local and is not carried.
+            cur = tile_coords(base_cu)
             for _local_i in range(fx.Int32(0), count_cu, fx.Int32(1)):
-                run_tile(base_cu + _local_i)
+                nxt = tile_coords(base_cu + _local_i + 1)
+                run_tile(base_cu + _local_i, cur, nxt)
+                cur = nxt
         else:
-            run_tile(fx.block_idx.x)
+            run_tile(fx.block_idx.x, tile_coords(fx.block_idx.x))
 
     m_tiles = (i32_m + (tile_m - 1)) // tile_m
     n_tiles = (N + (tile_n - 1)) // tile_n
