@@ -7,9 +7,12 @@ import functools
 
 import torch
 
+from aiter.jit.utils.chip_info import get_gfx
+
 from .kernels.tensor_shim import _run_compiled
 from .kernels.topk_per_row_decode import (
     build_topk_per_row_decode_module,
+    should_use_three_pass_radix,
     topk_per_row_decode_workspace_shapes,
 )
 
@@ -20,8 +23,67 @@ def _get_topk_launcher(
     next_n: int,
     k: int,
     stable: bool,
+    use_three_pass: bool,
 ):
-    return build_topk_per_row_decode_module(n, next_n, k, stable)
+    return build_topk_per_row_decode_module(n, next_n, k, stable, use_three_pass)
+
+
+def _is_stream_capturing() -> bool:
+    try:
+        return torch.cuda.is_current_stream_capturing()
+    except RuntimeError:
+        return False
+
+
+_current_raw_stream = getattr(torch._C, "_cuda_getCurrentRawStream", None)
+
+
+def _stream_key(device: torch.device) -> int:
+    if _current_raw_stream is not None:
+        return int(_current_raw_stream(device.index))
+    return int(torch.cuda.current_stream(device).cuda_stream)
+
+
+@functools.lru_cache(maxsize=16)
+def _get_cached_workspace(
+    device_index: int,
+    stream_id: int,
+    hist_shape: tuple[int, ...],
+    state_shape: tuple[int, ...],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Keep scratch isolated by device, stream, and exact kernel layout."""
+    del stream_id
+    device = torch.device("cuda", device_index)
+    return (
+        torch.empty(hist_shape, device=device, dtype=torch.int32),
+        torch.empty(state_shape, device=device, dtype=torch.int32),
+    )
+
+
+def _get_topk_workspace(
+    device: torch.device,
+    hist_shape: tuple[int, ...],
+    state_shape: tuple[int, ...],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    # A graph-pool allocation must not escape capture through this process cache.
+    if _is_stream_capturing():
+        return (
+            torch.empty(hist_shape, device=device, dtype=torch.int32),
+            torch.empty(state_shape, device=device, dtype=torch.int32),
+        )
+    device_index = device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    return _get_cached_workspace(
+        device_index,
+        _stream_key(device),
+        hist_shape,
+        state_shape,
+    )
+
+
+def clear_topk_per_row_decode_workspace_cache() -> None:
+    _get_cached_workspace.cache_clear()
 
 
 @functools.lru_cache(maxsize=128)
@@ -114,15 +176,24 @@ def flydsl_top_k_per_row_decode(
     )
 
     rows, n = logits.shape
-    hist_shape, state_shape = topk_per_row_decode_workspace_shapes(rows, stable)
-    partial_hist = torch.empty(hist_shape, device=logits.device, dtype=torch.int32)
-    state = torch.empty(state_shape, device=logits.device, dtype=torch.int32)
+    use_three_pass = get_gfx() == "gfx950" and should_use_three_pass_radix(
+        n, rows, stable
+    )
+    hist_shape, state_shape = topk_per_row_decode_workspace_shapes(
+        rows, stable, use_three_pass
+    )
+    partial_hist, state = _get_topk_workspace(
+        logits.device,
+        hist_shape,
+        state_shape,
+    )
 
     launcher = _get_topk_launcher(
         n,
         next_n,
         k,
         stable,
+        use_three_pass,
     )
     _run_compiled(
         launcher,

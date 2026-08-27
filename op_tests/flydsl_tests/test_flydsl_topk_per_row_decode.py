@@ -10,11 +10,40 @@ import pytest
 import torch
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
+from aiter.ops.flydsl import topk_per_row as topk_per_row_impl
+from aiter.ops.flydsl.kernels.topk_per_row_decode import should_use_three_pass_radix
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 torch.set_default_device("cuda")
 
 SUPPORTED_GFX = ["gfx942", "gfx950"]
+
+
+def test_flydsl_topk_three_pass_dispatch_thresholds():
+    threshold = 6 << 16
+    assert should_use_three_pass_radix(threshold, 26, True)
+    assert not should_use_three_pass_radix(threshold - 1, 26, True)
+    assert not should_use_three_pass_radix(threshold, 25, True)
+    assert not should_use_three_pass_radix(threshold, 26, False)
+    assert should_use_three_pass_radix(5 << 18, 7, True)
+
+
+def test_flydsl_topk_workspace_cache_reuses_allocation():
+    rows, context_len, top_k = 4, 4096, 2048
+    logits = torch.randn((rows, context_len), dtype=torch.float32, device="cuda")
+    seq_lens = torch.full((rows,), context_len, dtype=torch.int32, device=logits.device)
+    output = torch.empty((rows, top_k), dtype=torch.int32, device=logits.device)
+
+    topk_per_row_impl.clear_topk_per_row_decode_workspace_cache()
+    try:
+        _run_flydsl(logits, 1, seq_lens, output, top_k, True)
+        _run_flydsl(logits, 1, seq_lens, output, top_k, True)
+        torch.cuda.synchronize()
+        cache_info = topk_per_row_impl._get_cached_workspace.cache_info()
+        assert cache_info.misses == 1
+        assert cache_info.hits >= 1
+    finally:
+        topk_per_row_impl.clear_topk_per_row_decode_workspace_cache()
 
 
 def run_torch(
@@ -34,9 +63,7 @@ def run_torch(
             ),
         )
         valid_k = min(row_len, top_k)
-        padded = torch.full(
-            (top_k,), -1, dtype=torch.int64, device=logits.device
-        )
+        padded = torch.full((top_k,), -1, dtype=torch.int64, device=logits.device)
         if stable:
             selected = torch.argsort(
                 logits[row, :row_len], descending=True, stable=True
@@ -120,20 +147,14 @@ def test_flydsl_topk_short_rows_are_minus_one_padded(stable: bool):
     graph_output = torch.full((num_rows, top_k), -777, dtype=torch.int32)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        _run_flydsl(
-            logits, next_n, graph_seq_lens, graph_output, top_k, stable
-        )
+        _run_flydsl(logits, next_n, graph_seq_lens, graph_output, top_k, stable)
     graph_seq_lens.copy_(seq_lens)
     graph.replay()
     torch.cuda.synchronize()
 
-    expected_compare = (
-        expected if stable else torch.sort(expected, dim=-1).values
-    )
+    expected_compare = expected if stable else torch.sort(expected, dim=-1).values
     for name, output in (("eager", eager_output), ("graph", graph_output)):
-        output_compare = (
-            output if stable else torch.sort(output, dim=-1).values
-        )
+        output_compare = output if stable else torch.sort(output, dim=-1).values
         torch.testing.assert_close(
             output_compare,
             expected_compare,
@@ -145,6 +166,44 @@ def test_flydsl_topk_short_rows_are_minus_one_padded(stable: bool):
             assert torch.all(output[row, valid_len:] == -1), (
                 f"{name} row {row} did not overwrite its padded tail"
             )
+
+
+def test_flydsl_topk_three_pass_matches_hip():
+    if get_gfx() != "gfx950":
+        pytest.skip("three-pass radix dispatch is tuned for gfx950")
+
+    top_k = 2048
+    context_len = 5 << 18
+    valid_lens = [
+        0,
+        1,
+        top_k - 1,
+        top_k,
+        context_len // 4,
+        context_len - 17,
+        context_len,
+    ]
+    num_rows = len(valid_lens)
+
+    torch.manual_seed(321)
+    logits = torch.randint(
+        -8,
+        9,
+        (num_rows, context_len),
+        dtype=torch.int32,
+        device="cuda",
+    ).to(torch.float32)
+    seq_lens = torch.tensor(valid_lens, dtype=torch.int32, device="cuda")
+    flydsl_output = torch.full(
+        (num_rows, top_k), -777, dtype=torch.int32, device="cuda"
+    )
+    hip_output = torch.full_like(flydsl_output, -777)
+
+    _run_flydsl(logits, 1, seq_lens, flydsl_output, top_k, True)
+    _run_hip(logits, 1, seq_lens, hip_output, top_k, True)
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(flydsl_output, hip_output, rtol=0, atol=0)
 
 
 @benchmark()
