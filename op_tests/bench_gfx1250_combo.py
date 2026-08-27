@@ -38,9 +38,10 @@ Run from the aiter repo root so `op_tests/` siblings import cleanly:
     python op_tests/bench_gfx1250_combo.py --dsv4 --ops mori_ep   # MORI EPv2 dispatch/combine
     python op_tests/bench_gfx1250_combo.py --dsv4 --ops mega_moe  # Mega on/off, 4 GPUs
 
-The ``mori_ep`` op updates and installs ``${MORI:-/app/mori}``, then runs its
-existing EPv2 benchmark. Environment variables select backend, token tiers,
-eager/graph modes, EP size, dispatch dtype, and correctness checking:
+The ``mori_ep`` op runs the EPv2 benchmark from ``${MORI:-/app/mori}`` as the
+image provides it -- this script never updates or installs mori. Environment
+variables select backend, token tiers, eager/graph modes, EP size, dispatch
+dtype, and correctness checking:
 
     TOKENS=512 MODES=graph \
       python op_tests/bench_gfx1250_combo.py --dsv4 --ops mori_ep
@@ -1111,18 +1112,10 @@ def run_score_qk(_args):
 
 def run_mori_ep(_args):
     """Run MORI EPv2 dispatch/combine at the DSv4 MoE shape."""
+    # Runs whatever mori the image provides; keeping it current is the image's
+    # job. Updating it from here moved the measurement target between runs and
+    # needed a dev ROCm toolchain the pip-wheel images do not ship.
     mori = os.environ.get("MORI", "/app/mori")
-    # Bench whatever mori the image ships. Re-fetching main and reinstalling it
-    # moved the measurement target between runs, and the rebuild needs a dev
-    # ROCm toolchain that the pip-wheel images do not have.
-    # for command in (
-    #     ["git", "fetch", "origin", "main"],
-    #     ["git", "switch", "main"],
-    #     ["git", "pull", "--ff-only", "origin", "main"],
-    #     [sys.executable, "-m", "pip", "install", "."],
-    # ):
-    #     subprocess.run(command, cwd=mori, check=True)
-
     env = os.environ.copy()
     env["PYTHONPATH"] = f"{mori}/python:{mori}"
     env["MORI_SOCKET_IFNAME"] = "lo"
