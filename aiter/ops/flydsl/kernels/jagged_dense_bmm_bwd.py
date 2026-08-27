@@ -246,13 +246,10 @@ def build_backward(D, split=None, gj_stages_a=None, coarsen_m=None):
                     fx.add_offset(fx.get_iter(C), fx.make_int_tuple(c_row_off)),
                     fx.get_layout(C),
                 )
-                # int32 (NOT int64 like a_row_off/c_row_off above): the dense base
-                # offset is bounded by off_b*K*N <= n_groups*D^2, not by L. At the
-                # largest shape (n_groups=1024, D=512) that is 1024*512*512 ≈ 2.7e8 <<
-                # 2^31, so it cannot overflow -- unlike the L-scaled jagged/dOut
-                # offsets, which do reach ~4G. (Would only trip at n_groups*D^2 >= 2^31,
-                # e.g. n_groups >= 8192 at D=512.)
-                b_row_off = fx.Int32(off_b) * fx.Int32(K) * fx.Int32(N)
+                # int64 element offset (same as a_row_off/c_row_off): off_b*K*N scales
+                # with the group count and dense tile size, not with L; the product can
+                # exceed int32, so widen before multiplying.
+                b_row_off = fx.Int64(off_b) * fx.Int64(K) * fx.Int64(N)
                 B_g = fx.make_view(
                     fx.add_offset(fx.get_iter(B), fx.make_int_tuple(b_row_off)),
                     fx.get_layout(B),
@@ -590,11 +587,10 @@ def build_backward(D, split=None, gj_stages_a=None, coarsen_m=None):
         thr_sD_s2r = thr_copy_s2r_B.partition_S(sD)  # (VB, VN, VK)
 
         # Output (K, N) sub-tile of this workgroup, viewed in the fp32 partials scratch.
-        # int32 is safe here (unlike the L-scaled JAGGED/DOUT base offsets, which use
-        # int64): part_off is bounded by n_groups*SPLIT*K*N, i.e. the partials-tensor
-        # element count, not by L. At n_groups=1024, SPLIT=2, D=256 that is ~1.3e8 <<
-        # 2^31; it scales with n_groups*D^2, not with the ~4G packed-row count.
-        part_off = ((off_b * fx.Int32(SPLIT) + off_s) * fx.Int32(K) + k_off) * fx.Int32(
+        # int64 element offset (same rationale as b_row_off): the partials-tile index
+        # scales with the group count and dense tile size; widen before multiplying
+        # to avoid int32 wrap.
+        part_off = ((off_b * fx.Int64(SPLIT) + off_s) * fx.Int64(K) + k_off) * fx.Int64(
             N
         ) + n_off
         PART_g = fx.make_view(
