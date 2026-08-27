@@ -1,5 +1,5 @@
-# SPDX-License-Identifier: Apache-2.0
-# Copyright (c) 2025 FlyDSL Project Contributors
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 #
 # triton.testing.perf_report-style benchmark for the BACKWARD pass of
 # jagged_dense_bmm_broadcast_add (jdbba), the companion to
