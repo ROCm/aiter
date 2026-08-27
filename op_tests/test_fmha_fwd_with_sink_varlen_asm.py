@@ -171,12 +171,7 @@ def run_kernel(
 
 
 def _flops_bytes(seqlens, hq, hk, d, dv, is_causal, total, esz):
-    """Attention roofline numerators summed over the packed batches.
-
-    QK^T contributes 2*d MACs per (q, k) pair and PV contributes 2*dv, so the
-    asymmetric D192x128 case is 2*(192+128) rather than 4*192 or 4*128.
-    Degenerates to the familiar 4*d when d == dv.
-    """
+    """Attention roofline numerators summed over the packed batches."""
     flops = sum(2.0 * hq * s * s * (d + dv) for s in seqlens)  # 2 GEMMs (QK^T, PV)
     if is_causal:
         flops /= 2.0

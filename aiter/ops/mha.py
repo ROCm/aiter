@@ -2964,9 +2964,6 @@ def _flash_attn_varlen_forward(
         # logits (per-Q-head fp32) supported; sink-token (sink_size) not.
         ret = get_gfx() == "gfx1250"
         ret = ret and (q.dtype == dtypes.bf16)
-        # (64,64) / (128,128) are the symmetric D64 / D128 kernels; (192,128) is
-        # the asymmetric D192x128 one.  Must stay in sync with the csv manifest
-        # hsa/gfx1250/fmha_fwd_bf16_varlen/fmha_fwd_bf16_varlen.csv.
         ret = ret and (
             (hdim_q in (64, 128) and hdim_v == hdim_q)
             or (hdim_q == 192 and hdim_v == 128)
@@ -2989,7 +2986,6 @@ def _flash_attn_varlen_forward(
         #   D64  (`_rxy_sink`) binaries compile ENABLE_SINK=1 and ALWAYS read
         #   SINK, so calling with sink_ptr=None would dereference a null pointer
         #   -- require an explicit sink for D64 and fall back to CK otherwise.
-        #   D192x128 binaries also compile ENABLE_SINK=0, same rule as D128.
         if hdim_q in (128, 192):
             ret = ret and (sink_ptr is None)
         elif hdim_q == 64:
@@ -3662,10 +3658,6 @@ def flash_attn_varlen_func(
             return False
         if dropout_p != 0.0 or logits_soft_cap != 0.0:
             return False
-        # D64 / D128 keep their causal-only routing; non-causal for those still
-        # goes to FlyDSL below.  D192x128 takes the ASM path in both directions
-        # -- FlyDSL would otherwise claim it, and the ASM kernel is the faster
-        # of the two for this shape.
         if not causal and not is_hd192x128:
             return False
         if window_size[0] != -1 or window_size[1] != -1:

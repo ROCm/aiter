@@ -165,10 +165,6 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     AITER_CHECK((int)v->size(0) == total_k,     "fmha_fwd_with_sink_varlen_asm: v total_k mismatch with k");
     AITER_CHECK((int)v->size(1) == kv_head_num, "fmha_fwd_with_sink_varlen_asm: v head_num mismatch with k");
     AITER_CHECK(q_head_num % kv_head_num == 0,  "fmha_fwd_with_sink_varlen_asm: q_head_num must be a multiple of kv_head_num");
-    // (64,64) / (128,128) are the symmetric D64 / D128 kernels (sub_K=256);
-    // (192,128) is the asymmetric D192x128 kernel (sub_K=128).  head_dim never
-    // reaches the kernel through the kernarg block -- it is compiled into the
-    // .co -- so this only has to agree with what the csv registers.
     const bool hd_supported =
         (v_head_dim == qk_head_dim && (qk_head_dim == 64 || qk_head_dim == 128)) ||
         (qk_head_dim == 192 && v_head_dim == 128);
