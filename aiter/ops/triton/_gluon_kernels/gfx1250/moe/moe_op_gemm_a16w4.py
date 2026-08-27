@@ -100,6 +100,23 @@ def unswizzle_mx_scale_gfx1250(
     return scale
 
 
+@gluon.jit
+def expand_mx_scale(
+    scale, BLOCK_N, BLOCK_K, MX_SCALE_BLOCK_K, MX_PACK_DIVISOR, EXPANDED_SCALE_LAYOUT
+):
+    # ``scaled_upcast`` consumes one e8m0 byte *per fp4 element*, not per 32-element
+    # group, and requires the scale to carry the unpacked layout implied by the
+    # packed operand and ``axis`` (see gl.amd.gfx1250.scaled_upcast docstring).
+    # The tile in LDS is compact (BLOCK_N, BLOCK_K // 32), so replicate every byte
+    # MX_PACK_DIVISOR times along K and land it in that unpacked layout.
+    scale = (
+        scale.reshape([BLOCK_N, MX_SCALE_BLOCK_K, 1])
+        .broadcast_to([BLOCK_N, MX_SCALE_BLOCK_K, MX_PACK_DIVISOR])
+        .reshape([BLOCK_N, BLOCK_K])
+    )
+    return gl.convert_layout(scale, EXPANDED_SCALE_LAYOUT)
+
+
 @gluon.jit(launch_metadata=matmul_launch_metadata)
 def _moe_gemm_a16w4(
     Y,
@@ -147,7 +164,8 @@ def _moe_gemm_a16w4(
     GROUP_M: gl.constexpr,
     XCD_SWIZZLE: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
-    # Must be None: the kernel takes pre-expanded e8m0 scales (one byte per fp4 element).
+    # None (compact e8m0, one byte per 32 values along K) or "GFX1250_SCALE"
+    # (same bytes, host-preshuffled); either way the tile is expanded in-kernel.
     SWIZZLE_MX_SCALE: gl.constexpr,
     EVEN_K: gl.constexpr,
     SPLIT_K: gl.constexpr,
@@ -321,6 +339,27 @@ def _moe_gemm_a16w4(
         block_bases=[],
         shape=[128, 16],
     )
+    # PACKED_DOT_LAYOUT with every K basis doubled plus a new [0, 1] register
+    # basis: the unpacked (one byte per fp4 element) layout scaled_upcast requires
+    # of its scale operand, so the e8m0 byte lines up element-for-element with the
+    # fp4 value it scales.
+    EXPANDED_SCALE_LAYOUT: gl.constexpr = gl.DistributedLinearLayout(
+        reg_bases=[
+            [0, 1],
+            [0, 2],
+            [0, 4],
+            [0, 16],
+            [0, 32],
+            [0, 64],
+            [0, 128],
+            [0, 256],
+            [64, 0],
+        ],
+        lane_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [0, 8]],
+        warp_bases=[[16, 0], [32, 0]],
+        block_bases=[],
+        shape=[128, 512],
+    )
 
     SHARED_LAYOUT_X: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
         [[BLOCK_K, 8]], [BLOCK_M, BLOCK_K], [1, 0]
@@ -459,8 +498,14 @@ def _moe_gemm_a16w4(
                 SCALE_KWIDTH,
                 MX_PACK_DIVISOR,
             )
-        w_scale = ws_buffer_slice.load(layout=COMPACT_SCALE_LAYOUT)
-        # fp4 -> bf16 with compact per-32 e8m0 scale folded in directly.
+        w_scale = expand_mx_scale(
+            ws_buffer_slice.load(layout=COMPACT_SCALE_LAYOUT),
+            BLOCK_N,
+            BLOCK_K,
+            MX_SCALE_BLOCK_K,
+            MX_PACK_DIVISOR,
+            EXPANDED_SCALE_LAYOUT,
+        )
         w_bf16 = gl.amd.gfx1250.scaled_upcast(w_packed, w_scale, gl.bfloat16, axis=1)
         # (N, K) -> (K, N) for the B operand of WMMA, then move to the dot-operand layout.
         w_kn = gl.convert_layout(w_bf16.trans(1, 0), DOT_LAYOUT_W)
@@ -509,7 +554,14 @@ def _moe_gemm_a16w4(
                 SCALE_KWIDTH,
                 MX_PACK_DIVISOR,
             )
-        w_scale = ws_buffer_slice.load(layout=COMPACT_SCALE_LAYOUT)
+        w_scale = expand_mx_scale(
+            ws_buffer_slice.load(layout=COMPACT_SCALE_LAYOUT),
+            BLOCK_N,
+            BLOCK_K,
+            MX_SCALE_BLOCK_K,
+            MX_PACK_DIVISOR,
+            EXPANDED_SCALE_LAYOUT,
+        )
         w_bf16 = gl.amd.gfx1250.scaled_upcast(w_packed, w_scale, gl.bfloat16, axis=1)
         w_kn = gl.convert_layout(w_bf16.trans(1, 0), DOT_LAYOUT_W)
         acc = gl.amd.gfx1250.wmma(x_tile, w_kn, acc)

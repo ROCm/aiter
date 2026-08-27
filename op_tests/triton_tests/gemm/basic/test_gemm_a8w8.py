@@ -377,3 +377,39 @@ def test_gemm_splitk_skip_reduce(in_dtype, out_dtype, m, n, k, num_ksplit):
 
     b = y_pp.sum(dim=0).to(out_dtype)
     torch.testing.assert_close(a, b, atol=0.02, rtol=1e-2)
+
+
+@pytest.mark.parametrize("in_dtype", ["fp8e4m3", "fp8e5m2"])
+@pytest.mark.parametrize(
+    "m, n, k",
+    [
+        # M3 dense shapes (and generic large-M) whose default gfx1250 config
+        # resolves to BLOCK_SIZE_K=128.
+        (256, 256, 256),
+        (1024, 1024, 1024),
+        (2304, 6144, 6144),
+        (4096, 6144, 2048),
+    ],
+)
+def test_gemm_fp8_default_config_no_nan(in_dtype, m, n, k):
+    """Regression: on gfx1250 the 8-bit ``tl.dot`` miscompiles at
+    ``BLOCK_SIZE_K=128`` for fp8 operands, yielding garbage (~1e20) that
+    overflows bf16 to inf/NaN. The default gfx1250 config resolves to
+    BLOCK_SIZE_K=128 for every non-trivial M, so this exercises the exact path
+    ATOM's ptpc_fp8 recipe takes. int8 at BK=128 is unaffected (see
+    test_gemm_int8). Fixed by clamping BLOCK_SIZE_K<=64 for fp8 on gfx1250 in
+    the gemm_a8w8 wrapper."""
+    torch.cuda.empty_cache()
+
+    in_dtype = str_to_torch_dtype[in_dtype]
+    out_dtype = str_to_torch_dtype["bf16"]
+    x, weight, weight_triton, x_scale, w_scale, _, _ = generate_gemm_a8w8_inputs(
+        M=m, N=n, K=k, in_dtype=in_dtype, out_dtype=out_dtype, layout="TN"
+    )
+
+    # Uses the default resolved config (config=None) -> the real dispatch path.
+    b = triton_gemm_a8w8(x, weight_triton, x_scale, w_scale, None, out_dtype)
+    assert not torch.isnan(b).any(), "gemm_a8w8 fp8 produced NaN on this arch"
+
+    a = run_torch(x, weight, x_scale, w_scale, None, out_dtype)
+    torch.testing.assert_close(a, b, atol=0.05, rtol=1e-2)
