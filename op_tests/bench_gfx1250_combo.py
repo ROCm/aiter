@@ -25,6 +25,7 @@ Run from the aiter repo root so `op_tests/` siblings import cleanly:
 
     # DeepSeek-V4 operators at the model shapes used by the DSv4 workload.
     python op_tests/bench_gfx1250_combo.py --dsv4                 # all DSv4 ops
+    python op_tests/bench_gfx1250_combo.py --dsv4 --ops moe       # grouped MoE FC1/FC2 (DSv4 a8w4)
     python op_tests/bench_gfx1250_combo.py --dsv4 --ops a8w8_blockscale  # DSv4 FP8 linears
     python op_tests/bench_gfx1250_combo.py --dsv4 --ops a16w16    # DSv4 BF16 linears
     python op_tests/bench_gfx1250_combo.py --dsv4 --ops mla_v4_decode   # sparse MLA v4 decode
@@ -787,7 +788,7 @@ def run_moe(args):
     cfg = _MOE_CONFIG
     activation = moe_mod.ActivationType.Silu
     rows = []
-    data_formats = _MOE_DATA_FORMATS
+    data_formats = ["a8w4"] if args.suite == "dsv4" else _MOE_DATA_FORMATS
     for tokens, fmt in itertools.product(cfg["tokens"], data_formats):
         with _capture() as box:
             moe_mod.set_data_format(fmt)
@@ -1411,22 +1412,20 @@ OPS = {
     # "mori_ep": run_mori_ep,
     "mega_moe": run_mega_moe,
 }
-# "gemm" and "f8gemm" are temporarily disabled on gfx1250.
-#   gemm   (f4gemm a4w4): two back-to-back cases differing only in outtype
-#          (bf16 -> fp8) abort with HSA_STATUS_ERROR_MEMORY_FAULT.
-#   f8gemm (mxfp8/fp4):   most cases report "0 us" / "inf TFLOPS" once the sweep
-#          runs back to back, so the table is silently unusable.
-# Every case passes when run in a fresh process, so this looks like state
-# leaking across cases rather than a kernel bug. Re-enable once isolated.
-PERF_OPS = ["mha", "moe", "mla_v4_decode"]
+# "gemm" (f4gemm a4w4) stays out: two back-to-back cases differing only in
+# outtype (bf16 -> fp8) abort with HSA_STATUS_ERROR_MEMORY_FAULT, while each
+# passes in a fresh process -- state leaking across cases, not a kernel bug.
+#
+# f8gemm has been seen reporting "0 us" / "inf TFLOPS" on part of its sweep.
+# run_perftest times through the torch profiler, so a row like that means the
+# profiler recorded no GPU work, not that the kernel was fast -- read it
+# alongside the kernel digest, which says whether anything reached the GPU.
+PERF_OPS = ["mha", "moe", "f8gemm", "mla_v4_decode"]
 # "mori_ep" is out of the default sweep: it benchmarks mori rather than aiter,
 # and it needs a dev ROCm toolchain to build. Run it explicitly when wanted.
 DSV4_OPS = [
     "mega_moe",
-    # a4w4 / a8w4 grouped GEMM is a hardware-throughput comparison, so it
-    # lives in --perf. DSv4 MoE is covered by mega_moe, which runs both quant
-    # keys across the real 4-rank EP path.
-    # "moe",
+    "moe",
     # "a8w8_blockscale" hits an intermittent HSA_STATUS_ERROR_MEMORY_FAULT on
     # gfx1250 at the (m=512, n=7168, k=16384) shape -- it passed one run and
     # aborted the next with the same binary.
