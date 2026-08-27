@@ -132,6 +132,7 @@ import contextlib
 import itertools
 import subprocess
 import sys
+import tempfile
 import warnings
 
 warnings.filterwarnings("ignore")
@@ -383,6 +384,34 @@ _MLA_V4_COMPARE_KEEP = [
 ]
 
 
+@contextlib.contextmanager
+def _capture():
+    """Like _silence, but hand the block's fd-level output back to the caller.
+
+    Yields a one-element list that holds the captured text once the block ends.
+    Backed by a temp file rather than a pipe: an op that emits more than the
+    pipe buffer (64K) would otherwise deadlock with nobody draining it.
+    """
+    sys.stdout.flush()
+    sys.stderr.flush()
+    old1, old2 = os.dup(1), os.dup(2)
+    box = []
+    with tempfile.TemporaryFile(mode="w+") as tmp:
+        try:
+            os.dup2(tmp.fileno(), 1)
+            os.dup2(tmp.fileno(), 2)
+            yield box
+        finally:
+            sys.stdout.flush()
+            sys.stderr.flush()
+            os.dup2(old1, 1)
+            os.dup2(old2, 2)
+            os.close(old1)
+            os.close(old2)
+            tmp.seek(0)
+            box.append(tmp.read())
+
+
 def _print_table(name, rows, keep=None):
     df = pd.DataFrame([r for r in rows if r is not None])
     if not df.empty:
@@ -426,6 +455,102 @@ def _quiet(line):
     return bool(line.strip()) and not any(n in line for n in _NOISE)
 
 
+def _lines(pred):
+    """Adapt a per-line predicate into a block extractor."""
+    return lambda lines: [ln for ln in lines if pred(ln)]
+
+
+def _md_tables(*labels):
+    """Keep the markdown tables, labelling each by the columns it carries.
+
+    A child UT often emits several tables in a row with different columns and
+    nothing saying which is which. `labels` is ((column, ...), title) pairs; the
+    first entry whose columns all appear in a header row names that table.
+    """
+
+    def extract(lines):
+        md = [ln for ln in lines if _md_row(ln)]
+        out = []
+        for i, line in enumerate(md):
+            is_header = i + 1 < len(md) and set(md[i + 1]) <= set("|-: ")
+            if is_header:
+                title = next(
+                    (t for cols, t in labels if all(c in line for c in cols)),
+                    None,
+                )
+                if title:
+                    out.append(f"\n----- {title} -----")
+                elif out:
+                    out.append("")
+            out.append(line)
+        return out
+
+    return extract
+
+
+def _isnum(field):
+    """Does this field parse as a number (thousands separators allowed)?"""
+    try:
+        float(field.replace(",", ""))
+    except ValueError:
+        return False
+    return True
+
+
+def _md_kernel_table(lines):
+    """Render a rank-major kernel table as markdown, keeping the summary lines.
+
+    mega_moe prints '[cfg] ...' / '# MEGA-MOE ...' lines around a space-aligned
+    'Name rank0 rank1 rank2 rank3 avg calls' table. Kernel names contain spaces
+    ("void at::native::reduce_kernel<512, 1, ...>"), so split from the right:
+    the column count is fixed even when the name is not.
+    """
+    out, rows, cols = [], [], None
+
+    def flush():
+        if cols and rows:
+            out.append(pd.DataFrame(rows, columns=cols).to_markdown(index=False))
+            rows.clear()
+
+    for line in lines:
+        if not _quiet(line):
+            continue
+        if line.startswith("Name") and "rank0" in line:
+            flush()
+            cols = line.rsplit(maxsplit=6)
+            continue
+        fields = line.rsplit(maxsplit=6)
+        if cols and len(fields) == 7 and all(_isnum(f) for f in fields[1:]):
+            rows.append(fields)
+            continue
+        flush()
+        out.append(line)
+    flush()
+    return "\n".join(out).splitlines()
+
+
+def _md_from_pandas(marker, columns):
+    """Re-emit a pandas-printed block as markdown.
+
+    Some UTs print their result with DataFrame.__str__ (space aligned, leading
+    index column) right after a marker line, which reads nothing like the
+    markdown every other op produces.
+    """
+
+    def extract(lines):
+        for i, line in enumerate(lines):
+            if line.strip() != marker or i + 2 >= len(lines):
+                continue
+            values = lines[i + 2].split()[1 : len(columns) + 1]
+            if len(values) != len(columns):
+                continue
+            df = pd.DataFrame([values], columns=list(columns))
+            return df.to_markdown(index=False).splitlines()
+        return []
+
+    return extract
+
+
 def _table_row(*headers):
     """Whitespace-aligned table: the header line plus its numeric rows."""
 
@@ -441,14 +566,18 @@ def _table_row(*headers):
     return keep
 
 
-def _run_child(name, cmd, cwd, env=None, keep=_md_row, timeout=None, tail=30):
+_DEFAULT_EXTRACT = _md_tables()
+
+
+def _run_child(name, cmd, cwd, env=None, extract=None, timeout=None, tail=30):
     """Run a child UT with its output captured and surface only its results.
 
     Child UTs print their own progress, aiter INFO lines and (with FlyDSL) a
     couple of thousand IR-dump lines, which buries the numbers. Capture all of
-    it, echo only the rows `keep` accepts, and fall back to the tail of the
-    output when the child fails or emits nothing recognisable.
+    it, echo what `extract` pulls out, and fall back to the tail of the output
+    when the child fails or emits nothing recognisable.
     """
+    extract = extract or _DEFAULT_EXTRACT
     try:
         proc = subprocess.run(
             cmd, cwd=cwd, env=env, text=True, timeout=timeout,
@@ -461,7 +590,7 @@ def _run_child(name, cmd, cwd, env=None, keep=_md_row, timeout=None, tail=30):
         print("\n".join(captured.splitlines()[-tail:]), flush=True)
         raise
     lines = proc.stdout.splitlines()
-    rows = [ln for ln in lines if keep(ln)]
+    rows = extract(lines)
     print(f"\n===== {name} =====", flush=True)
     print("\n".join(rows) if rows else "(no result rows recognised)", flush=True)
     if proc.returncode != 0 or not rows:
@@ -499,8 +628,8 @@ def run_moe(args):
     rows = []
     data_formats = ["a8w4"] if args.suite == "dsv4" else _MOE_DATA_FORMATS
     for fmt in data_formats:
-        moe_mod.set_data_format(fmt)
         with _silence():
+            moe_mod.set_data_format(fmt)
             metrics = moe_mod.run_moe(
                 fmt,
                 experts=cfg["experts"],
@@ -648,14 +777,30 @@ def run_a8w8_blockscale(_args):
 
 def run_a16w16(_args):
     """Run the DSv4 BF16 linear shapes through the Opus GEMM UT."""
-    print("\n===== gemm_a16w16_opus (DSv4) =====", flush=True)
+    # test_a16w16 returns only the error; its timing is printed as
+    #   [a16w16] batch=1 M=512 N=64 K=7168 dtype=... | 7.8us | 12.05 TFLOPs | err=0
+    # so capture the block and parse that line back out.
+    batch, M, K = 1, 512, 7168
+    rows = []
     for n in (64, 384, 1024, 2048, 32320, 129280):
-        a16w16_mod.test_a16w16(
-            batch=1,
-            M=512,
-            N=n,
-            K=7168,
-        )
+        with _capture() as box:
+            err = a16w16_mod.test_a16w16(batch=batch, M=M, N=n, K=K)
+        row = {"batch": batch, "M": M, "N": n, "K": K, "err": err}
+        for line in box[0].splitlines():
+            if not line.startswith("[a16w16]"):
+                continue
+            fields = [f.strip() for f in line.split("|")]
+            us = next((f for f in fields if f.endswith("us")), None)
+            tflops = next((f for f in fields if f.endswith("TFLOPs")), None)
+            row["us"] = float(us[:-2]) if us else None
+            row["TFLOPS"] = float(tflops[:-7]) if tflops else None
+            break
+        rows.append(row)
+    _print_table(
+        "gemm_a16w16_opus (DSv4)",
+        rows,
+        keep=["batch", "M", "N", "K", "us", "TFLOPS", "err"],
+    )
 
 
 def run_mega_moe(_args):
@@ -697,7 +842,7 @@ def run_mega_moe(_args):
                 [*base_cmd, "-q", quant, "--combine", combine],
                 cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                 env={**env, "AITER_FORCE_A8W4": force_a8w4},
-                keep=_quiet,
+                extract=_md_kernel_table,
             )
 
 
@@ -715,6 +860,11 @@ def run_mhc(_args):
             "--fuse_rmsnorm",
         ],
         cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        extract=_md_tables(
+            (("hip_nofuse_us",), "mhc: fused vs unfused RMSNorm"),
+            (("unfused_us",), "mhc_post_pre"),
+            (("hip_us",), "mhc_head"),
+        ),
     )
 
 
@@ -741,6 +891,10 @@ def run_qk_norm(_args):
             f"qk_norm ({phase})",
             [*base_cmd, "-T", *tokens],
             cwd=repo_root,
+            extract=_md_tables(
+                (("quant_group_size",), "rope + quant"),
+                (("rows_written",), "fused SWA write"),
+            ),
         )
 
 
@@ -767,7 +921,10 @@ def run_score_qk(_args):
             f"score_qk (decode, B=512, {label} CSA KV={kv_length})",
             [*base_cmd, "-kv_length", kv_length],
             cwd=repo_root,
-            keep=_table_row("paged_mqa_logits", "batch_size"),
+            extract=_md_from_pandas(
+                "paged_mqa_logits:",
+                ("batch", "next_n", "heads", "index_dim", "avg_kv_len", "TFLOPS"),
+            ),
         )
 
 
@@ -823,7 +980,7 @@ def run_mori_ep(_args):
         ],
         cwd=mori,
         env=env,
-        keep=_quiet,
+        extract=_lines(_quiet),
         timeout=3600,
     )
 
@@ -1010,7 +1167,7 @@ def run_mla_v4_prefill(_args):
             "--no-verify",
         ],
         cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-        keep=_table_row("latency_us"),
+        extract=_lines(_table_row("latency_us")),
     )
 
 
@@ -1044,7 +1201,10 @@ PERF_OPS = ["mha", "moe", "mla_v4_decode"]
 DSV4_OPS = [
     "mega_moe",
     "moe",
-    "a8w8_blockscale",
+    # "a8w8_blockscale" hits an intermittent HSA_STATUS_ERROR_MEMORY_FAULT on
+    # gfx1250 at the (m=512, n=7168, k=16384) shape -- it passed one run and
+    # aborted the next with the same binary.
+    # "a8w8_blockscale",
     "a16w16",
     "mla_v4_decode",
     "mla_v4_prefill",
