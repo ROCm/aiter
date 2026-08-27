@@ -245,26 +245,24 @@ def build_flash_attn_fp8_module(
             return fx.Int32(v - (1 << 32) if v >= (1 << 31) else v)
 
         e8m0_ident = _i32c(E8M0_ONE)
-        qk_scale_e8m0 = e8m0_ident
-        q_mant = None
-        if const_expr(USE_QK_SCALE_FOLD):
-            a_full = _fmul(scale_log2e, c_2p23)
-            a_bits = arith.bitcast(T.i32, _raw(a_full))
-            e_byte = arith.addi(
-                arith.andi(
-                    arith.shrui(_raw(a_bits), _raw(fx.Int32(23))),
-                    _raw(fx.Int32(0xFF)),
-                ),
-                _raw(fx.Int32(1)),
-            )
-            qk_scale_e8m0 = arith.muli(_raw(e_byte), _raw(fx.Int32(0x01010101)))
-            q_mant = arith.bitcast(
-                T.f32,
-                arith.ori(
-                    arith.andi(_raw(a_bits), _raw(_i32c(0x807FFFFF))),
-                    _raw(fx.Int32(0x3F000000)),
-                ),
-            )
+
+        a_full = _fmul(scale_log2e, c_2p23)
+        a_bits = arith.bitcast(T.i32, _raw(a_full))
+        e_byte = arith.addi(
+            arith.andi(
+                arith.shrui(_raw(a_bits), _raw(fx.Int32(23))),
+                _raw(fx.Int32(0xFF)),
+            ),
+            _raw(fx.Int32(1)),
+        )
+        qk_scale_e8m0 = arith.muli(_raw(e_byte), _raw(fx.Int32(0x01010101)))
+        q_mant = arith.bitcast(
+            T.f32,
+            arith.ori(
+                arith.andi(_raw(a_bits), _raw(_i32c(0x807FFFFF))),
+                _raw(fx.Int32(0x3F000000)),
+            ),
+        )
 
         def qk_mfma(a, b, c):
             if const_expr(not USE_QK_SCALE_FOLD):
@@ -522,101 +520,44 @@ def build_flash_attn_fp8_module(
 
         def apply_pv(
             o_accs,
-            l_acc,
-            lr_acc,
+            l_mfma,
             p_pack,
-            p_rowsum,
-            v_off,
-            preloaded_vw,
-            k_buf_off,
-            prio=False,
+            v_buff_off,
+            v_preloaded,
+            k_buff_off,
         ):
-            if const_expr(prio):
-                # asm: s_setprio(1) at the head of gemm_PV -- the MFMA phase
-                # outranks the peer half's softmax until gemm_QK drops it.
-                rocdl.s_setprio(1)
-            if const_expr(USE_ROLLBACK or USE_FROZEN_MAX):
-                grew = arith.cmpf(
-                    arith.CmpFPredicate.OLT, _raw(corr), _raw(fx.Float32(1.0))
-                )
-                any_grew = _wave_or(grew)
-                o_vt = Vec.make_type(C_F32_PER_LANE, fx.Float32)
-                _res_tys = [o_vt, o_vt, o_vt, o_vt, T.f32]
-                if const_expr(L_MFMA_SLABS):
-                    _res_tys.append(o_vt)
-                resc_if = scf.IfOp(any_grew, results_=_res_tys, has_else=True)
-                with ir.InsertionPoint(resc_if.then_block):
-                    _ro = [
-                        _fmul(Vec(o_accs[dt]), corr_vec)
-                        for dt in range_constexpr(D_TILES)
-                    ]
-                    _rl = _fadd(_fmul(l_acc, corr), p_rowsum)
-                    _y = [
-                        _raw(_ro[0]),
-                        _raw(_ro[1]),
-                        _raw(_ro[2]),
-                        _raw(_ro[3]),
-                        _raw(_rl),
-                    ]
-                    if const_expr(L_MFMA_SLABS):
-                        _y.append(_raw(_fmul(Vec(lr_acc), corr_vec)))
-                    scf.YieldOp(_y)
-                with ir.InsertionPoint(resc_if.else_block):
-                    _nl = _fadd(_raw(l_acc), _raw(p_rowsum))
-                    _y = [
-                        _raw(o_accs[0]),
-                        _raw(o_accs[1]),
-                        _raw(o_accs[2]),
-                        _raw(o_accs[3]),
-                        _raw(_nl),
-                    ]
-                    if const_expr(L_MFMA_SLABS):
-                        _y.append(_raw(lr_acc))
-                    scf.YieldOp(_y)
-                o_accs = [
-                    as_dsl_value(resc_if.results[dt], o_accs[dt])
-                    for dt in range_constexpr(D_TILES)
-                ]
-                l2 = as_dsl_value(resc_if.results[4], l_acc)
-                if const_expr(L_MFMA_SLABS):
-                    lr_acc = as_dsl_value(resc_if.results[5], lr_acc)
-            else:
-                l2 = _fadd(_fmul(l_acc, corr), p_rowsum)
             p_ks_list = [
                 Vec(p_pack).shuffle(Vec(p_pack), list(range(r * 8, r * 8 + 8)))
                 for r in range_constexpr(PV_K_STEPS)
             ]
-            # The tail of the L denominator rides the MFMA pipe at the head of
-            # the MFMA phase (asm: _matmul_l_issue at the top of gemm_PV); the
-            # head of it was summed on the VALU during the softmax phase.
+            # The tail of the L denominator from MFMA
             for ks in range_constexpr(PV_K_STEPS - L_MFMA_SLABS, PV_K_STEPS):
-                lr_acc = mfma.call(ones_pack, p_ks_list[ks], lr_acc)
+                l_mfma = mfma.call(ones_pack, p_ks_list[ks], l_mfma)
             PV_UNITS = D_TILES * PV_K_STEPS
-            vw = [None] * 4
-            kw_prime = [None] * PREFETCH_DEPTH
+            kv_windows = [None] * 4
+            k_preloaded = [None] * PREFETCH_DEPTH
             for u in range_constexpr(PREFETCH_DEPTH):
-                vw[u] = preloaded_vw[u]
-            o = list(o_accs)
+                kv_windows[u] = v_preloaded[u]
             for u in range_constexpr(PV_UNITS):
                 dt = u // PV_K_STEPS
                 ks = u % PV_K_STEPS
-                if const_expr(not (USE_ROLLBACK or USE_FROZEN_MAX) and ks == 0):
-                    o[dt] = _fmul(Vec(o[dt]), corr_vec)
                 _sched_barrier()
-                o[dt] = mfma.call(vw[u % 4], p_ks_list[ks], o[dt])
-                # MFMA first, LDS after -- the asm issues the ds_read for the
-                # operands of a later MFMA behind the one that is already
-                # runnable, so the MFMA pipe never waits on lgkmcnt.
-                if const_expr(u + PREFETCH_DEPTH < PV_UNITS):
-                    un = u + PREFETCH_DEPTH
-                    vw[un % 4] = read_v_pack(
+                if const_expr(u < 7):
+                    _wait_lgkmcnt(4)
+                else:
+                    _wait_lgkmcnt(2)
+                o_accs[dt] = mfma.call(kv_windows[u % 4], p_ks_list[ks], o_accs[dt])
+                un = u + PREFETCH_DEPTH
+                if const_expr(un < PV_UNITS):
+                    kv_windows[un % 4] = read_v_pack(
                         v_off, un // PV_K_STEPS, un % PV_K_STEPS
                     )
                 else:
                     ki = u - (PV_UNITS - PREFETCH_DEPTH)
-                    kw_prime[ki] = _load_k_unit(k_buf_off, ki // K_STEPS, ki % K_STEPS)
+                    kv_windows[un % 4] = _load_k_unit(k_buff_off, ki // K_STEPS, ki % K_STEPS)
+                    k_preloaded[ki] = kv_windows[un % 4]
                 _sched_barrier()
-            return o, l2, lr_acc, kw_prime
+            return o, l_mfma, k_preloaded
 
         QK_UNITS = N_KV_TILES * K_STEPS
 
@@ -627,17 +568,17 @@ def build_flash_attn_fp8_module(
 
         K_NT_STRIDE = 32 * K_STRIDE + (32 // K_UNIT_ROWS) * PAD_K
 
-        def _k_base_row(k_buf_off):
+        def _k_base_row(k_buff_off):
             return (
-                k_buf_off
+                k_buff_off
                 + lo * K_STRIDE
                 + (lo // fx.Index(K_UNIT_ROWS)) * fx.Index(PAD_K)
                 + hi * 32
             )
 
-        def _load_k_unit(k_buf_off, nt, ks, base=None):
+        def _load_k_unit(k_buff_off, nt, ks, base=None):
             if const_expr(base is None):
-                base = _k_base_row(k_buf_off)
+                base = _k_base_row(k_buff_off)
             imm = nt * K_NT_STRIDE + ks * MFMA_K
             blk_lo = Vec(
                 Vec.load(v_i8x16, lds, [base + fx.Index(imm)])
@@ -660,11 +601,17 @@ def build_flash_attn_fp8_module(
             raw = ArithValue(k_in_b).select(raw, zero_qpack.ir_value())
             return Vec(raw).bitcast(fx.Int32)
 
-        def do_qk(k_buf_off, preloaded_kw, v_off, seed=None, dma=None):
-            kw = [None] * 4
-            vw_prime = [None] * PREFETCH_DEPTH
+        def do_qk(
+            k_buff_off, 
+            k_preloaded, 
+            v_buff_off, 
+            seed=None, 
+            dma=None
+        ):
+            kv_windows = [None] * 4
+            v_preloaded = [None] * PREFETCH_DEPTH
             for u in range_constexpr(PREFETCH_DEPTH):
-                kw[u] = preloaded_kw[u]
+                kv_windows[u] = k_preloaded[u]
             s_accs = [
                 (mfma.zero_value if const_expr(seed is None) else seed)
                 for _ in range_constexpr(N_KV_TILES)
@@ -676,22 +623,25 @@ def build_flash_attn_fp8_module(
                 nt = u // K_STEPS
                 ks = u % K_STEPS
                 _sched_barrier()
-                s_accs[nt] = qk_mfma(kw[u % 4], q_packs[ks], s_accs[nt])
-                if const_expr(u + PREFETCH_DEPTH < QK_UNITS):
-                    un = u + PREFETCH_DEPTH
-                    kw[un % 4] = _load_k_unit(
-                        k_buf_off, un // K_STEPS, un % K_STEPS
+                if const_expr(u < 7):
+                    _wait_lgkmcnt(2)
+                elif const_expr(u == 7):
+                    _wait_lgkmcnt(4)
+
+                s_accs[nt] = qk_mfma(kv_windows[u % 4], q_packs[ks], s_accs[nt])
+                un = u + PREFETCH_DEPTH
+                if const_expr(un < QK_UNITS):
+                    kv_windows[un % 4] = _load_k_unit(
+                        k_buff_off, un // K_STEPS, un % K_STEPS
                     )
                 else:
                     vi = u - (QK_UNITS - PREFETCH_DEPTH)
-                    vw_prime[vi] = read_v_pack(v_off, vi // PV_K_STEPS, vi % PV_K_STEPS)
+                    kv_windows[un % 4] = read_v_pack(v_buff_off, vi // PV_K_STEPS, vi % PV_K_STEPS)
+                    v_preloaded[vi] = kv_windows[un % 4]
                 _sched_barrier()
             for _dp in range_constexpr(len(l_ptrs)):
                 _dma_fire(dma_rsrc, l_ptrs[_dp], g_ptrs[_dp])
-            _sched_barrier()
-            _gpu_barrier()
-            rocdl.s_setprio(0)
-            return s_accs, vw_prime
+            return s_accs, v_preloaded
 
         def _lane_max(vecs):
             v = _fmax(_fmax(Vec(vecs[0]), Vec(vecs[1])), _fmax(Vec(vecs[2]), Vec(vecs[3])))
@@ -803,23 +753,31 @@ def build_flash_attn_fp8_module(
             corr = rocdl.exp2(T.f32, _raw(_fsub(c_zero_f, _fmul(e, c_inv_2p23))))
             return _fsub(m_term, e), _fadd(_raw(m_frozen), _raw(delta)), corr
 
+        def do_softmax_prepare(
+            s_accs,
+            m_init,
+        ):
+            m_frozen = _rowmax(s_accs, m_init)
+            m_term = _fadd(_fsub(c_zero_f, m_frozen), c_exp2_bias)
+            bias_chunks = _bias_split(m_term)
+
+            mt_vec = Vec.from_elements([m_term], fx.Float32).broadcast_to(
+                C_F32_PER_LANE
+            )
+            for nt in range_constexpr(N_KV_TILES):
+                s_accs[nt] = _fadd(Vec(s_accs[nt]), mt_vec)
+
+            return m_frozen, bias_chunks, s_accs
+
         def do_softmax(
             s_accs,
-            m_running,
-            m_term=None,
+            m_frozen,
+            l_valu,
             bias_chunks=None,
-            set_prio=False,
             seeded=False,
-            barrier=False,
         ):
-            if const_expr(SOFTMAX_PRIO != 0 and set_prio):
-                rocdl.s_setprio(SOFTMAX_PRIO)
-            to_log2 = c_inv_2p23
-
-            if const_expr(seeded):
-                m_new = m_running
-            else:
-                m_new = _rowmax(s_accs, m_running)
+            if const_expr(not seeded):
+                m_frozen = _rowmax(s_accs, m_running)
                 m_term = _fadd(_fsub(c_zero_f, m_new), c_exp2_bias)
                 mt_vec = Vec.from_elements([m_term], fx.Float32).broadcast_to(
                     C_F32_PER_LANE
@@ -884,43 +842,28 @@ def build_flash_attn_fp8_module(
             p_pack = Vec.from_elements(p_words, fx.Int32)
             # The MFMA half of the L reduction has moved to the head of the
             # next MFMA phase (apply_pv); the softmax phase is VALU-only now.
-            if const_expr(v_partial is None):
-                p_rowsum = c_zero_f
-            else:
+            if const_expr(v_partial is not None):
                 v_sum = _lane_sum(v_partial)
                 v_sum = _fadd(
                     v_sum,
                     fx.Float32(v_sum).shuffle_xor(fx.Int32(32), fx.Int32(WARP_SIZE)),
                 )
-                p_rowsum = v_sum
-            if const_expr(SOFTMAX_PRIO != 0 and set_prio):
-                rocdl.s_setprio(0)
-            if const_expr(barrier):
-                # asm: the trailing s_barrier of _softmax_rescale_R_frozen,
-                # preceded by the vmcnt(0) that publishes the tile the previous
-                # GEMM DMA'd. A whole phase of VALU has run since the loads
-                # issued, so this drain is nearly free.
-                _wait_vmcnt()
-                _wait_lgkmcnt()
-                _gpu_barrier()
-            return m_new, m_term, bias_chunks, p_pack, p_rowsum
+                l_valu = _fadd(l_valu, v_sum)
+            return m_frozen, bias_chunks, p_pack, l_valu
 
         ones_pack = Vec.filled(A_FP8_PER_LANE // 4, 0x38383838, fx.Int32)
 
-        m_init = c_neg_inf
-        l_init = c_zero_f
-        lr_init = mfma.zero_value
         o_init = [
             Vec.filled(C_F32_PER_LANE, 0.0, fx.Float32)
             for _ in range_constexpr(D_TILES)
         ]
-        N_BIAS_CHUNKS = 2 if USE_BIAS_FOLD else 0
+        N_BIAS_CHUNKS = 2
 
         is_g0 = wave_id < fx.Index(NUM_WAVES // 2)
 
-        kvw = [None] * PREFETCH_DEPTH
+        k_preloaded = [None] * PREFETCH_DEPTH
         for u in range_constexpr(PREFETCH_DEPTH):
-            kvw[u] = _load_k_unit_global(fx.Index(0), u // K_STEPS, u % K_STEPS)
+            k_preloaded[u] = _load_k_unit_global(fx.Index(0), u // K_STEPS, u % K_STEPS)
 
         # Tiles 0 and 1 are prefetched into buffers 0 and 1; from there on the
         # loops rotate their carried LDS byte offsets.
@@ -939,13 +882,14 @@ def build_flash_attn_fp8_module(
         of1 = Vec.filled(C_F32_PER_LANE, 0.0, fx.Float32)
         of2 = Vec.filled(C_F32_PER_LANE, 0.0, fx.Float32)
         of3 = Vec.filled(C_F32_PER_LANE, 0.0, fx.Float32)
-        lf = c_zero_f
-        lrf = lr_init
+        l_valu_init = c_zero_f
+        l_mfma_init = mfma.zero_value # c output of L-sum mfma (32x32x64_fp8)
+        m_init = c_neg_inf
 
         if is_g0:
 
             def g0_iter0():
-                k_buf_off = _k_slot(0)
+                k_buff_off = _k_slot(0)
 
                 v_buff_off = _v_slot(0)
 
@@ -953,56 +897,49 @@ def build_flash_attn_fp8_module(
                 l_koffs = get_lds_koffs(_k_slot(1))
                 ## HBM k offs
                 g_koffs = get_hbm_koffs(BLOCK_N)
-                sA, vwp = do_qk(k_buf_off, preloaded_kw=kvw, v_off=v_buff_off, dma=(k_rsrc, l_koffs, g_koffs))
-                m_frozen, m_term, bc, p_new, prowsum_new = do_softmax(sA, m_init)
+                s_accs, v_preloaded = do_qk(k_buff_off, k_preloaded, v_buff_off, dma=(k_rsrc, l_koffs, g_koffs))
+                m_frozen, bias_chunks, p_pack, l_valu = do_softmax(s_accs, m_init, l_valu_init)
 
                 g_koffs = get_hbm_koffs(BLOCK_N * 2)
-                _wait_lgkmcnt()
-                _wait_vmcnt()
                 _gpu_barrier()
                 return (
                     m_frozen,
-                    m_term,
-                    l_init,
+                    l_valu,
+                    l_mfma_init,
                     o_init[0],
                     o_init[1],
                     o_init[2],
                     o_init[3],
-                    lr_init,
-                    p_new,
-                    prowsum_new,
-                    bc,
+                    p_pack,
+                    *bias_chunks,
                     _v_slot(0),
                     _v_slot(1),
                     _v_slot(2),
                     _k_slot(1),
                     _k_slot(0),
                     *g_koffs,
-                    *vwp[:PREFETCH_DEPTH],
+                    *v_preloaded,
                 )
 
             def g0_epilogue(*carry):
-                (m_r, l_a, oo0, oo1, oo2, oo3, lr_a, p_c, prowsum_c, corr_c) = carry[
-                    :10
+                m_frozen, l_valu, l_mfma, o0, o1, o2, o3, p_pack = carry[
+                    :8
                 ]
-                rest = carry[10 + N_BIAS_CHUNKS :]
-                v_buff_off_e = rest[0]
-                k_buf_off_e = rest[3]
-                vwp = rest[5 + DMA_PASSES :]
+                _rest = carry[8 + N_BIAS_CHUNKS :]
+                v_buff_off = _rest[0]
+                k_buff_off = _rest[3]
+                v_preloaded = _rest[5 + DMA_PASSES :]
                 # After the final yield the carries describe the iteration that
                 # never ran, so the last tile's K buffer is the second slot.
-                o, l2, lr2, _ = apply_pv(
-                    [oo0, oo1, oo2, oo3],
-                    l_a,
-                    lr_a,
-                    p_c,
-                    prowsum_c,
-                    corr_c,
-                    v_buff_off_e,
-                    preloaded_vw=vwp,
-                    k_buf_off=k_buf_off_e,
+                o, l_mfma, _ = apply_pv(
+                    [o0, o1, o2, o3],
+                    l_mfma,
+                    p_pack,
+                    v_buff_off,
+                    v_preloaded,
+                    k_buff_off,
                 )
-                return o, l2, lr2
+                return o, l_mfma, l_valu
 
             g0_carry = list(g0_iter0())
             for_op = scf.ForOp(
@@ -1018,86 +955,84 @@ def build_flash_attn_fp8_module(
                     as_dsl_value(a, ex)
                     for a, ex in zip(for_op.inner_iter_args, g0_carry)
                 ]
-                m_frozen, m_term, bc, l_a, oo0, oo1, oo2, oo3, lr_a = _g0_args[:8]
-                p_c, prowsum_c = _g0_args[8:10]
-                bc_c = _g0_args[10 : 10 + N_BIAS_CHUNKS]
-                _rest = _g0_args[10 + N_BIAS_CHUNKS :]
+                m_frozen, l_valu, l_mfma, o0, o1, o2, o3, p_pack = _g0_args[:8]
+                bias_chunks = _g0_args[8 : 8 + N_BIAS_CHUNKS]
+                _rest = _g0_args[8 + N_BIAS_CHUNKS :]
                 v_buff_off, v_next_off, v_further_off = _rest[0:3]
-                k_buf_off, k_next_off = _rest[3:5]
+                k_buff_off, k_next_off = _rest[3:5]
                 g_koffs = _rest[5 : 5 + DMA_PASSES]
                 # The DMA of this iteration lands in the buffer the *next* one
                 # reads; its voffsets were computed in the previous softmax
                 # phase, its LDS pointers are wave-uniform SALU rebuilt here.
                 l_koffs = get_lds_koffs(k_next_off)
 
-                vwp = _rest[5 + DMA_PASSES :]
+                v_preloaded = _rest[5 + DMA_PASSES :]
                 kv_start = fx.Index(iv)
-                oA, lA, lrA, kw_prime = apply_pv(
-                    [oo0, oo1, oo2, oo3],
-                    l_a,
-                    lr_a,
-                    p_c,
-                    prowsum_c,
+                o, l_mfma, k_preloaded = apply_pv(
+                    [o0, o1, o2, o3],
+                    l_mfma,
+                    p_pack,
                     v_buff_off,
-                    preloaded_vw=vwp,
-                    k_buf_off=k_buf_off,
-                    prio=True,
+                    v_preloaded,
+                    k_buff_off,
                 )
-                sA, vwp_new = do_qk(
-                    k_buf_off,
-                    preloaded_kw=kw_prime,
-                    v_off=v_next_off,
-                    seed=(_bias_prefill(bc_c) if const_expr(USE_BIAS_FOLD) else None),
+                _wait_vmcnt(0)
+                seed = _bias_prefill(bias_chunks)
+                s_accs, v_preloaded = do_qk(
+                    k_buff_off,
+                    k_preloaded,
+                    v_next_off,
+                    seed=seed,
                     dma=(k_rsrc, l_koffs, g_koffs),
                 )
-                m_new, corr_new, p_new, prowsum_new, bc_new = do_softmax(
-                    sA,
-                    m_r,
-                    first_tile=False,
-                    seeded=const_expr(USE_BIAS_FOLD),
-                    barrier=True,
+
+                _sched_barrier()
+                _gpu_barrier()
+                m_frozen, bias_chunks, p_pack, l_valu = do_softmax(
+                    s_accs,
+                    m_frozen,
+                    l_valu,
+                    bias_chunks,
+                    seeded=True,
                 )
                 # Address math for the *next* tile's DMA is computed here, in
                 # the VALU phase; do_qk only fires the buffer_loads.
                 g_koffs = get_hbm_koffs(kv_start + fx.Index(BLOCK_N * 2))
+                _sched_barrier()
+                _gpu_barrier()
 
-                rocdl.sched_barrier(0)
                 scf.YieldOp(
                     [
-                        _raw(m_new),
-                        _raw(lA),
-                        _raw(oA[0]),
-                        _raw(oA[1]),
-                        _raw(oA[2]),
-                        _raw(oA[3]),
-                        _raw(lrA),
-                        _raw(p_new),
-                        _raw(prowsum_new),
-                        _raw(corr_new),
-                        *[_raw(c) for c in (bc_new or ())],
+                        _raw(m_frozen),
+                        _raw(l_valu),
+                        _raw(l_mfma),
+                        _raw(o[0]),
+                        _raw(o[1]),
+                        _raw(o[2]),
+                        _raw(o[3]),
+                        _raw(p_pack),
+                        *[_raw(c) for c in bias_chunks],
                         # Rotate the V triple and swap the K pair.
                         _raw(v_next_off),
                         _raw(v_further_off),
                         _raw(v_buff_off),
                         _raw(k_next_off),
-                        _raw(k_buf_off),
+                        _raw(k_buff_off),
                         *[_raw(w) for w in g_koffs],
-                        *[_raw(w) for w in vwp_new[:PREFETCH_DEPTH]],
+                        *[_raw(w) for w in v_preloaded],
                     ]
                 )
 
             _g0_res = [as_dsl_value(r, ex) for r, ex in zip(for_op.results, g0_carry)]
-            o_fin, l_fin_g, lr_fin_g = g0_epilogue(*_g0_res)
-            of0 = o_fin[0]
-            of1 = o_fin[1]
-            of2 = o_fin[2]
-            of3 = o_fin[3]
-            lf = l_fin_g
-            lrf = lr_fin_g
+            oe, le_mfma, le_valu = g0_epilogue(*_g0_res)
+            oe0 = oe[0]
+            oe1 = oe[1]
+            oe2 = oe[2]
+            oe3 = oe[3]
         else:
 
             def g1_iter0():
-                k_buf_off = _k_slot(0)
+                k_buff_off = _k_slot(0)
 
                 v_buff_off = _v_slot(0)
 
@@ -1105,62 +1040,54 @@ def build_flash_attn_fp8_module(
                 l_voffs = get_lds_voffs(_v_slot(2))
                 ## HBM v offs
                 g_voffs = get_hbm_voffs(2 * BLOCK_N)
-                sB, vwp = do_qk(k_buf_off, preloaded_kw=kvw, v_off=v_buff_off, dma=(v_rsrc, l_voffs, g_voffs))
-                m_frozen = (
-                    _rowmax(sB, m_init) if const_expr(USE_FROZEN_MAX) else m_init
-                )
-                if const_expr(USE_BIAS_FOLD):
-                    bseed = _bias_seed(m_frozen)
-                    sB = [_fadd(Vec(x), bseed) for x in sB]
-                _wait_lgkmcnt()
-                _wait_vmcnt()
+                s_accs, v_preloaded = do_qk(k_buff_off, k_preloaded, v_buff_off, dma=(v_rsrc, l_voffs, g_voffs))
+                m_frozen, bias_chunks, s_accs = do_softmax_prepare(s_accs, m_init)
+                _sched_barrier()
                 _gpu_barrier()
                 return (
                     m_frozen,
-                    l_init,
+                    l_valu_init,
+                    l_mfma_init,
                     o_init[0],
                     o_init[1],
                     o_init[2],
                     o_init[3],
-                    lr_init,
-                    sB[0],
-                    sB[1],
-                    sB[2],
-                    sB[3],
+                    s_accs[0],
+                    s_accs[1],
+                    s_accs[2],
+                    s_accs[3],
+                    *bias_chunks,
                     # Offsets for the first loop body (i=1); see g0_iter0.
                     _v_slot(0),
                     _v_slot(1),
                     _v_slot(2),
                     _k_slot(1),
                     _k_slot(0),
-                    *vwp[:PREFETCH_DEPTH],
+                    *v_preloaded,
                 )
 
             def g1_epilogue(*carry):
-                m_e, l_e, oe0, oe1, oe2, oe3, lr_e = carry[:7]
-                sce0, sce1, sce2, sce3 = carry[7:11]
-                rest = carry[11:]
-                v_buff_off_e = rest[0]
-                k_buf_off_e = rest[3]
-                vwp = rest[5:]
-                _m_e, corrf, pf, prowsumf, _bc = do_softmax(
-                    [sce0, sce1, sce2, sce3],
-                    m_e,
-                    first_tile=False,
-                    seeded=const_expr(USE_BIAS_FOLD),
+                m_frozen, l_valu, l_mfma, o0, o1, o2, o3 = carry[:7]
+                s0, s1, s2, s3 = carry[7:11]
+                _rest = carry[11 + N_BIAS_CHUNKS:]
+                v_buff_off = _rest[0]
+                k_buff_off = _rest[3]
+                v_preloaded = _rest[5:]
+                m_frozen, _, p_pack, l_valu = do_softmax(
+                    [s0, s1, s2, s3],
+                    m_frozen,
+                    l_valu,
+                    seeded=True,
                 )
-                o, l2, lr2, _ = apply_pv(
-                    [oe0, oe1, oe2, oe3],
-                    l_e,
-                    lr_e,
-                    pf,
-                    prowsumf,
-                    corrf,
-                    v_buff_off_e,
-                    list(vwp),
-                    k_buf_off_e,
+                o, l_mfma, _ = apply_pv(
+                    [o0, o1, o2, o3],
+                    l_mfma,
+                    p_pack,
+                    v_buff_off,
+                    v_preloaded,
+                    k_buff_off,
                 )
-                return o, l2, lr2
+                return o, l_mfma, l_valu
 
             g1_carry = list(g1_iter0())
             for_op = scf.ForOp(
@@ -1176,81 +1103,82 @@ def build_flash_attn_fp8_module(
                     as_dsl_value(a, ex)
                     for a, ex in zip(for_op.inner_iter_args, g1_carry)
                 ]
-                m_r, l_a, oo0, oo1, oo2, oo3, lr_a = _g1_args[:7]
-                ss0, ss1, ss2, ss3 = _g1_args[7:11]
-                _rest = _g1_args[11:]
+                m_frozen, l_valu, l_mfma, o0, o1, o2, o3 = _g1_args[:7]
+                s0, s1, s2, s3 = _g1_args[7:11]
+                bias_chunks = _g0_args[11 : 11 + N_BIAS_CHUNKS]
+                _rest = _g1_args[11 + N_BIAS_CHUNKS:]
                 v_buff_off, v_next_off, v_further_off = _rest[0:3]
-                k_buf_off, k_next_off = _rest[3:5]
-                vwp = _rest[5:]
+                k_buff_off, k_next_off = _rest[3:5]
+                v_preloaded = _rest[5:]
                 kv_start = fx.Index(iv)
-                m_sm, corr_sm, p_sm, prowsum_sm, bc_sm = do_softmax(
-                    [ss0, ss1, ss2, ss3],
-                    m_r,
-                    first_tile=False,
-                    seeded=const_expr(USE_BIAS_FOLD),
-                    barrier=True,
+                m_frozen, bias_chunks, p_pack, l_valu = do_softmax(
+                    [s0, s1, s2, s3],
+                    m_frozen,
+                    l_valu,
+                    bias_chunks,
+                    seeded=True,
                 )
                 # The K DMA's address math belongs to this (VALU) phase; the
                 # buffer_loads themselves are interleaved into do_qk below.
                 l_voffs = get_lds_voffs(v_buff_off)
                 g_voffs = get_hbm_voffs(kv_start + fx.Index(2 * BLOCK_N))
+                _sched_barrier()
+                _gpu_barrier()
 
-                oB, lB, lrB, kw_prime = apply_pv(
-                    [oo0, oo1, oo2, oo3],
-                    l_a,
-                    lr_a,
-                    p_sm,
-                    prowsum_sm,
-                    corr_sm,
+                o, l_mfma, k_preloaded = apply_pv(
+                    [o0, o1, o2, o3],
+                    l_mfma,
+                    p_pack,
                     v_buff_off,
-                    preloaded_vw=vwp,
-                    k_buf_off=k_buf_off,
-                    prio=True,
+                    v_preloaded,
+                    k_buff_off,
                 )
-                sB, vwp_new = do_qk(
-                    k_buf_off,
-                    preloaded_kw=kw_prime,
-                    v_off=v_next_off,
-                    seed=(_bias_prefill(bc_sm) if const_expr(USE_BIAS_FOLD) else None),
+                _wait_vmcnt(0)
+                seed = _bias_prefill(bias_chunks)
+                s_accs, v_preloaded = do_qk(
+                    k_buff_off,
+                    k_preloaded,
+                    v_next_off,
+                    seed=seed,
                     dma=(v_rsrc, l_voffs, g_voffs),
                 )
-                rocdl.sched_barrier(0)
+                _sched_barrier()
+                _gpu_barrier()
                 scf.YieldOp(
                     [
-                        _raw(m_sm),
-                        _raw(lB),
-                        _raw(oB[0]),
-                        _raw(oB[1]),
-                        _raw(oB[2]),
-                        _raw(oB[3]),
-                        _raw(lrB),
-                        _raw(sB[0]),
-                        _raw(sB[1]),
-                        _raw(sB[2]),
-                        _raw(sB[3]),
+                        _raw(m_frozen),
+                        _raw(l_valu),
+                        _raw(l_mfma),
+                        _raw(o[0]),
+                        _raw(o[1]),
+                        _raw(o[2]),
+                        _raw(o[3]),
+                        _raw(s_accs[0]),
+                        _raw(s_accs[1]),
+                        _raw(s_accs[2]),
+                        _raw(s_accs[3]),
+                        *[_raw(c) for c in bias_chunks],
                         # Rotate the V triple and swap the K pair.
                         _raw(v_next_off),
                         _raw(v_further_off),
                         _raw(v_buff_off),
                         _raw(k_next_off),
-                        _raw(k_buf_off),
-                        *[_raw(w) for w in vwp_new[:PREFETCH_DEPTH]],
+                        _raw(k_buff_off),
+                        *[_raw(w) for w in v_preloaded],
                     ]
                 )
 
             _g1_res = [as_dsl_value(r, ex) for r, ex in zip(for_op.results, g1_carry)]
-            o_fin, l_fin_g, lr_fin_g = g1_epilogue(*_g1_res)
-            of0 = o_fin[0]
-            of1 = o_fin[1]
-            of2 = o_fin[2]
-            of3 = o_fin[3]
-            lf = l_fin_g
-            lrf = lr_fin_g
+            oe, le_mfma, le_valu = g0_epilogue(*_g1_res)
+            oe0 = oe[0]
+            oe1 = oe[1]
+            oe2 = oe[2]
+            oe3 = oe[3]
 
-        o_finals = [of0, of1, of2, of3]
+        o_finals = [oe0, oe1, oe2, oe3]
         # asm: output_complete_results folds the MFMA half of L (_v_LR) into
         # the VALU half (_v_L) right before the reciprocal.
-        l_final = _fadd(lf, Vec(lrf)[0]) if const_expr(L_MFMA_SLABS) else lf
+        l_final = _fadd(l_valu, Vec(l_mfma)[0]) if const_expr(L_MFMA_SLABS) else l_valu
 
         inv_l = rocdl.rcp(T.f32, l_final)
         inv_l_v = _fmul(inv_l, v_descale)
