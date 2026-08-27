@@ -1,5 +1,5 @@
 ---
-name: flydsl-kernel-code-cleanup
+name: kernel-code-cleanup
 description: >
   Modernize FlyDSL kernels: replace raw MLIR dialects (arith, scf, vector, llvm,
   memref, math), ArithValue, redundant fx.* wrapping, fx.Index, buffer_ops,
@@ -202,7 +202,7 @@ class SharedStorage:
 
 lds   = fx.SharedAllocator().allocate(SharedStorage).peek()
 lds_a = lds.a.view(fx.make_layout((BLOCK_M, BLOCK_K), (BLOCK_K, 1)))
-lds_b = lds.b.view(fx.make_layout((BLOCK_K, BLOCK_N), (BLOCK_N, 1)))
+lds_b = lds.b.view(fx.make_layout((BLOCK_K, BLOCK_N), (N, 1)))
 ```
 
 - Default `static=True` leaves `launch(smem=...)` unset; only `static=False`
