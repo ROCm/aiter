@@ -22,11 +22,8 @@ LAYOUT RECONCILIATION (the one place fwd↔bwd layouts are bridged):
   input layouts: ``dJagged (L, K)``, ``dDense (n_groups, K, N)``, ``dBias (n_groups, N)``.
 
 CONSTRAINTS (inherited from the backward):
-  * D = K = N is a compile-time constant pinned per process (single-D-per-process).
-  * D=512 is currently blocked at large L by the FORWARD's int32 offset overflow
-    (L≈7.9M) -- a separate forward-kernel fix. The backward already guards that
-    offset; only the forward faults. So this autograd op is validated at D=256
-    today; D=512 training awaits the forward fix.
+  * D = K = N is baked into memoized per-shape kernel builds (multiple D can
+    coexist in one process via the forward/backward dispatch wrappers).
 """
 
 from __future__ import annotations
@@ -140,8 +137,7 @@ def jagged_dense_bmm_autograd(
     routes the forward's XCD-remap/kernel-variant choice (scheduling only, not
     correctness); pass ``False`` for skewed/genrec deployment sequence lengths.
 
-    D = K = N is pinned per process (single-D-per-process). D=512 at large L is
-    blocked by the forward int32-overflow (see module docstring); use D=256 today.
+    D = K = N must be square; each distinct D memoizes its own compiled kernels.
     """
     if n_groups is None:
         n_groups = dense.shape[0]
