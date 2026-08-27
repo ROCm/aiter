@@ -310,6 +310,16 @@ def _block_mask_to_lut(
     q_tiles = (query_length + _MHA_V4_Q_TILE - 1) // _MHA_V4_Q_TILE
     kv_tile = mha_v4_kv_tile()
     kv_tiles = (key_length + kv_tile - 1) // kv_tile
+    # The conversion below counts selected blocks with an arithmetic sum but fills the index list
+    # from truthiness, so anything other than bool can make lut_count disagree with the entries
+    # actually written.
+    if block_mask.dtype != torch.bool:
+        raise ValueError(f"block_mask must be a bool tensor, got {block_mask.dtype}")
+    if block_mask.device != query.device:
+        raise ValueError(
+            f"block_mask must be on the same device as Q; got {block_mask.device} "
+            f"and {query.device}"
+        )
     if block_mask.dim() == 4:
         expected = (batch, query_heads, q_tiles, kv_tiles)
         if tuple(block_mask.shape) != expected:
@@ -1260,7 +1270,8 @@ def mha_v4(
     ``block_mask`` is optional boolean tile metadata: ``[B, H, Qtiles, KVtiles]``
     or ``[B, Qtiles, KVtiles]`` (broadcast heads). Geometry is 256x128 on gfx950
     and 256x64 on gfx942. Sparse LUT rows are one per query head; K/V addressing
-    uses the GQA ratio.
+    uses the GQA ratio. Every row must select at least one KV block; an all-False
+    row is invalid input, not a request for a zero output tile.
     """
     if return_lse:
         raise NotImplementedError("MHA v4 kernels do not produce LSE yet")

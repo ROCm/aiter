@@ -350,7 +350,13 @@ architecture KV tile (128 on gfx950, 64 on gfx942).
 
 The host builds a work table inside the sparse custom op. If every `lut_count` is equal
 (uniform / top-k sparsity), visit order stays raster; otherwise rows are ordered
-longest-LUT-first (LPT). Empty LUT rows still launch as no-ops.
+longest-LUT-first (LPT).
+
+Every LUT row must select at least one KV block. `lut_count == 0` is not a no-op: the ASM has no
+empty-row path and faults, so an all-False `block_mask` row is invalid input rather than a request
+for a zero output tile. A row count is the only content bound the launcher can check without
+reading device data; set `AITER_MHA_V4_VALIDATE_LUT=1` to also check starts, counts, and index
+ranges device-side, which costs a synchronization per launch and is off by default.
 
 Sparse code objects live next to dense ones: `hsa/gfx950/fmha_v4_fwd/` (for example
 `fwd_hd128_fp8_sparse.co`) and `hsa/gfx942/fmha_v4_fwd/MI300/` for the two gfx942 recipes.

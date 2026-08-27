@@ -3,6 +3,7 @@
 
 import math
 import os
+from typing import NamedTuple
 
 import pytest
 import torch
@@ -39,6 +40,7 @@ from aiter.ops.mha_v4 import (
     rotate_activation_mxfp6_quant,
     scale_modes_for_formats,
 )
+from aiter.ops.triton.attention.utils import block_attn_mask_to_ragged_lut
 from aiter.ops.triton.quant.mxfp6_fmha_pack import (
     _v_direct_kvtab,
     fp6_k_raw_buffer_sizes,
@@ -1261,3 +1263,325 @@ def test_mha_v4_sparse_gqa_all_true_mask_matches_repeated_kv(q_format, v_format)
     assert torch.equal(gqa_sparse, gqa_dense)
     assert torch.equal(gqa_sparse, mha_sparse)
     assert torch.isfinite(gqa_sparse).all()
+
+
+class _Operand(NamedTuple):
+    """A quantized MHA v4 operand and the descale it was produced with."""
+
+    quantized: torch.Tensor
+    descale: torch.Tensor
+
+
+def _sparse_fp8_operands(sequence_k, heads=2, sequence_q=256, batch=1, seed=0):
+    """Quantize once so sparse and reference runs share descales exactly.
+
+    Re-quantizing a KV slice would pick a different per-tensor amax, which shifts every
+    value and hides whether the kernel read the KV blocks the LUT named.
+    """
+    torch.manual_seed(seed)
+    q = torch.randn(
+        (batch, sequence_q, heads, 128), device="cuda", dtype=torch.bfloat16
+    )
+    k = torch.randn(
+        (batch, sequence_k, heads, 128), device="cuda", dtype=torch.bfloat16
+    )
+    v = torch.randn_like(k)
+    return (
+        _Operand(*quantize_fp8_rotated(q)),
+        _Operand(*quantize_fp8_rotated(k)),
+        _Operand(*quantize_fp8(v)),
+    )
+
+
+def _sparse_fp8_launch(q, k, v, block_mask=None):
+    lut = {}
+    if block_mask is not None:
+        indices, start, count = block_attn_mask_to_ragged_lut(
+            block_mask,
+            num_heads=block_mask.shape[1],
+            return_none_if_dense=False,
+        )
+        lut = {
+            "kv_block_indices": indices,
+            "lut_start": start,
+            "lut_count": count,
+        }
+    fp8_format = native_fp8_format()
+    return mha_v4_packed(
+        q.quantized,
+        k.quantized,
+        v.quantized,
+        q.descale,
+        k.descale,
+        v.descale,
+        fp8_format,
+        fp8_format,
+        fp8_format,
+        AttentionScaleMode.F32_PER_TENSOR,
+        AttentionScaleMode.F32_PER_TENSOR,
+        AttentionScaleMode.F32_PER_TENSOR,
+        **lut,
+    )
+
+
+def _gather_kv_tiles(operand, tiles):
+    """Concatenate the named KV tiles, leaving the quantized bytes and descale untouched."""
+    kv_tile = mha_v4_kv_tile()
+    gathered = torch.cat(
+        [operand.quantized[:, tile * kv_tile : (tile + 1) * kv_tile] for tile in tiles],
+        dim=1,
+    )
+    return _Operand(gathered.contiguous(), operand.descale)
+
+
+def _tile_mask(heads, kv_tiles, tiles, q_tiles=1, batch=1):
+    mask = torch.zeros(
+        (batch, heads, q_tiles, kv_tiles), device="cuda", dtype=torch.bool
+    )
+    for tile in tiles:
+        mask[:, :, :, tile] = True
+    return mask
+
+
+@pytest.mark.skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 sparse validation")
+@pytest.mark.skipif(
+    not _mha_v4_sparse_co_available(),
+    reason="sorted-sparse MHA v4 code object is not deployed",
+)
+@pytest.mark.parametrize("tiles", [(0,), (1,), (3,), (0, 2), (1, 2, 3)])
+def test_mha_v4_sparse_reads_only_the_kv_tiles_the_lut_names(tiles):
+    """A kernel that ignored kv_block_indices would pass every all-True test."""
+    heads = 2
+    kv_tile = mha_v4_kv_tile()
+    kv_tiles = 4
+    q, k, v = _sparse_fp8_operands(sequence_k=kv_tiles * kv_tile, heads=heads)
+
+    mask = _tile_mask(heads, kv_tiles, tiles)
+    sparse = _sparse_fp8_launch(q, k, v, block_mask=mask)
+    # Dense over exactly the selected tiles: same quantized bytes, same descales, so the
+    # only difference is which KV blocks take part.
+    dense = _sparse_fp8_launch(
+        q, _gather_kv_tiles(k, tiles), _gather_kv_tiles(v, tiles)
+    )
+    torch.cuda.synchronize()
+
+    assert torch.equal(sparse, dense)
+    assert torch.isfinite(sparse).all()
+
+
+@pytest.mark.skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 sparse validation")
+@pytest.mark.skipif(
+    not _mha_v4_sparse_co_available(),
+    reason="sorted-sparse MHA v4 code object is not deployed",
+)
+def test_mha_v4_sparse_distinct_kv_tiles_give_distinct_results():
+    """Guards the reference itself: selecting different tiles must change the output."""
+    heads = 2
+    kv_tile = mha_v4_kv_tile()
+    kv_tiles = 4
+    q, k, v = _sparse_fp8_operands(sequence_k=kv_tiles * kv_tile, heads=heads)
+
+    outputs = [
+        _sparse_fp8_launch(q, k, v, block_mask=_tile_mask(heads, kv_tiles, (tile,)))
+        for tile in range(kv_tiles)
+    ]
+    torch.cuda.synchronize()
+
+    for tile in range(1, kv_tiles):
+        assert not torch.equal(outputs[0], outputs[tile]), (
+            f"kv tile 0 and kv tile {tile} produced identical output, so the kernel is "
+            "not reading kv_block_indices"
+        )
+
+
+@pytest.mark.skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 sparse validation")
+@pytest.mark.skipif(
+    not _mha_v4_sparse_co_available(),
+    reason="sorted-sparse MHA v4 code object is not deployed",
+)
+def test_mha_v4_sparse_gives_each_head_its_own_kv_tiles():
+    """4-D masks may give heads different KV lists; each head must follow its own row."""
+    heads = 3
+    kv_tile = mha_v4_kv_tile()
+    kv_tiles = 4
+    per_head = ((0,), (3,), (1, 2))
+    q, k, v = _sparse_fp8_operands(sequence_k=kv_tiles * kv_tile, heads=heads)
+
+    mask = torch.zeros((1, heads, 1, kv_tiles), device="cuda", dtype=torch.bool)
+    for head, tiles in enumerate(per_head):
+        for tile in tiles:
+            mask[:, head, :, tile] = True
+    sparse = _sparse_fp8_launch(q, k, v, block_mask=mask)
+    torch.cuda.synchronize()
+
+    for head, tiles in enumerate(per_head):
+        dense = _sparse_fp8_launch(
+            q, _gather_kv_tiles(k, tiles), _gather_kv_tiles(v, tiles)
+        )
+        torch.cuda.synchronize()
+        assert torch.equal(
+            sparse[:, :, head], dense[:, :, head]
+        ), f"head {head} did not attend to tiles {tiles}"
+
+
+@pytest.mark.skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 sparse validation")
+@pytest.mark.skipif(
+    not _mha_v4_sparse_co_available(),
+    reason="sorted-sparse MHA v4 code object is not deployed",
+)
+def test_mha_v4_sparse_follows_the_lut_across_query_tiles():
+    """Multiple query tiles exercise the work table on a real launch, not just its ordering."""
+    heads = 2
+    kv_tile = mha_v4_kv_tile()
+    kv_tiles = 4
+    q_tiles = 2
+    q, k, v = _sparse_fp8_operands(
+        sequence_k=kv_tiles * kv_tile, heads=heads, sequence_q=256 * q_tiles
+    )
+
+    mask = torch.zeros((1, heads, q_tiles, kv_tiles), device="cuda", dtype=torch.bool)
+    mask[:, :, 0, 0] = True
+    mask[:, :, 1, 3] = True
+    sparse = _sparse_fp8_launch(q, k, v, block_mask=mask)
+    torch.cuda.synchronize()
+
+    for q_tile, tiles in ((0, (0,)), (1, (3,))):
+        dense = _sparse_fp8_launch(
+            q, _gather_kv_tiles(k, tiles), _gather_kv_tiles(v, tiles)
+        )
+        torch.cuda.synchronize()
+        rows = slice(q_tile * 256, (q_tile + 1) * 256)
+        assert torch.equal(
+            sparse[:, rows], dense[:, rows]
+        ), f"query tile {q_tile} did not attend to tiles {tiles}"
+
+
+def test_mha_v4_rejects_non_bool_block_mask():
+    """Counts come from a sum but the fill uses truthiness, so non-bool masks disagree."""
+    q = torch.zeros((1, 256, 2, 128), dtype=torch.bfloat16)
+    mask = torch.ones((1, 2, 1, 256 // mha_v4_kv_tile()), dtype=torch.int32)
+    with pytest.raises(ValueError, match="block_mask must be a bool tensor"):
+        mha_v4(
+            q,
+            q,
+            q,
+            AttentionFormat.FP8,
+            AttentionFormat.FP8,
+            AttentionFormat.FP8,
+            block_mask=mask,
+        )
+
+
+@pytest.mark.skipif(
+    torch.cuda.device_count() < 2, reason="needs two GPUs to mismatch devices"
+)
+def test_mha_v4_rejects_block_mask_on_another_device():
+    q = torch.zeros((1, 256, 2, 128), dtype=torch.bfloat16, device="cuda:0")
+    mask = torch.ones(
+        (1, 2, 1, 256 // mha_v4_kv_tile()), dtype=torch.bool, device="cuda:1"
+    )
+    with pytest.raises(ValueError, match="block_mask must be on the same device"):
+        mha_v4(
+            q,
+            q,
+            q,
+            AttentionFormat.FP8,
+            AttentionFormat.FP8,
+            AttentionFormat.FP8,
+            block_mask=mask,
+        )
+
+
+@pytest.mark.skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 sparse validation")
+@pytest.mark.skipif(
+    not _mha_v4_sparse_co_available(),
+    reason="sorted-sparse MHA v4 code object is not deployed",
+)
+def test_mha_v4_sparse_rejects_undersized_kv_block_indices():
+    """Every row needs an entry, so a short index buffer is rejected before the ASM reads it."""
+    heads = 2
+    kv_tile = mha_v4_kv_tile()
+    kv_tiles = 4
+    q, k, v = _sparse_fp8_operands(sequence_k=kv_tiles * kv_tile, heads=heads)
+    rows = heads  # batch 1, one query tile
+    device = q.quantized.device
+    fp8_format = native_fp8_format()
+    with pytest.raises(RuntimeError, match="at least one entry per"):
+        mha_v4_packed(
+            q.quantized,
+            k.quantized,
+            v.quantized,
+            q.descale,
+            k.descale,
+            v.descale,
+            fp8_format,
+            fp8_format,
+            fp8_format,
+            AttentionScaleMode.F32_PER_TENSOR,
+            AttentionScaleMode.F32_PER_TENSOR,
+            AttentionScaleMode.F32_PER_TENSOR,
+            kv_block_indices=torch.zeros(rows - 1, dtype=torch.int32, device=device),
+            lut_start=torch.zeros(rows, dtype=torch.int32, device=device),
+            lut_count=torch.ones(rows, dtype=torch.int32, device=device),
+        )
+
+
+@pytest.mark.skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 sparse validation")
+@pytest.mark.skipif(
+    not _mha_v4_sparse_co_available(),
+    reason="sorted-sparse MHA v4 code object is not deployed",
+)
+@pytest.mark.skipif(
+    os.environ.get("AITER_MHA_V4_VALIDATE_LUT", "0") in ("0", ""),
+    reason="opt-in LUT validation is disabled",
+)
+@pytest.mark.parametrize(
+    "mutate,message",
+    [
+        pytest.param(
+            lambda indices, start, count: count.fill_(0),
+            "lut_count == 0",
+            id="empty_row",
+        ),
+        pytest.param(
+            lambda indices, start, count: indices.fill_(9999),
+            "outside",
+            id="index_out_of_range",
+        ),
+        pytest.param(
+            lambda indices, start, count: start.fill_(-1),
+            "negative",
+            id="negative_start",
+        ),
+    ],
+)
+def test_mha_v4_sparse_validation_rejects_malformed_lut(mutate, message):
+    """Only reachable with AITER_MHA_V4_VALIDATE_LUT=1; otherwise these fault in the ASM."""
+    heads = 2
+    kv_tile = mha_v4_kv_tile()
+    kv_tiles = 4
+    q, k, v = _sparse_fp8_operands(sequence_k=kv_tiles * kv_tile, heads=heads)
+    mask = _tile_mask(heads, kv_tiles, (0, 1))
+    indices, start, count = block_attn_mask_to_ragged_lut(
+        mask, num_heads=heads, return_none_if_dense=False
+    )
+    mutate(indices, start, count)
+    fp8_format = native_fp8_format()
+    with pytest.raises(RuntimeError, match=message):
+        mha_v4_packed(
+            q.quantized,
+            k.quantized,
+            v.quantized,
+            q.descale,
+            k.descale,
+            v.descale,
+            fp8_format,
+            fp8_format,
+            fp8_format,
+            AttentionScaleMode.F32_PER_TENSOR,
+            AttentionScaleMode.F32_PER_TENSOR,
+            AttentionScaleMode.F32_PER_TENSOR,
+            kv_block_indices=indices,
+            lut_start=start,
+            lut_count=count,
+        )

@@ -6,6 +6,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 
@@ -370,6 +371,99 @@ build_sorted_work_table(const at::Tensor& lut_count, int64_t batch, int64_t nhea
     return table;
 }
 
+// LUT contents are device data, so the launcher cannot check them without a synchronization. This
+// is therefore opt-in: off, an out-of-range index or an empty row reaches the ASM and faults with
+// only a raw address to go on; on, it fails at the launcher with the offending condition named.
+enum LutError : int32_t
+{
+    kLutNegative   = 1 << 0,
+    kLutOverrun    = 1 << 1,
+    kLutIndexRange = 1 << 2,
+    kLutEmptyRow   = 1 << 3,
+};
+
+__global__ void validate_lut_kernel(const int32_t* __restrict__ lut_start,
+                                    const int32_t* __restrict__ lut_count,
+                                    const int32_t* __restrict__ kv_block_indices,
+                                    const int32_t rows,
+                                    const int32_t kv_tiles,
+                                    const int64_t kv_index_numel,
+                                    int32_t* __restrict__ error)
+{
+    const int32_t row = blockIdx.x * blockDim.x + threadIdx.x;
+    if(row >= rows)
+        return;
+
+    const int32_t start = lut_start[row];
+    const int32_t count = lut_count[row];
+    if(start < 0 || count < 0)
+    {
+        atomicOr(error, kLutNegative);
+        return;
+    }
+    if(count == 0)
+    {
+        atomicOr(error, kLutEmptyRow);
+        return;
+    }
+    if(static_cast<int64_t>(start) + count > kv_index_numel)
+    {
+        atomicOr(error, kLutOverrun);
+        return;
+    }
+    for(int32_t i = 0; i < count; ++i)
+    {
+        const int32_t block = kv_block_indices[start + i];
+        if(block < 0 || block >= kv_tiles)
+        {
+            atomicOr(error, kLutIndexRange);
+            return;
+        }
+    }
+}
+
+bool lut_validation_enabled()
+{
+    static const bool enabled = []() {
+        const char* value = std::getenv("AITER_MHA_V4_VALIDATE_LUT");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    return enabled;
+}
+
+void validate_lut_contents(const at::Tensor& kv_block_indices,
+                           const at::Tensor& lut_start,
+                           const at::Tensor& lut_count,
+                           int64_t lut_rows,
+                           int64_t kv_tiles)
+{
+    auto error               = at::zeros({1}, lut_count.options().dtype(at::kInt));
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
+    constexpr int32_t block  = 256;
+    const dim3 grid(static_cast<uint32_t>((lut_rows + block - 1) / block));
+    validate_lut_kernel<<<grid, dim3(block), 0, stream>>>(lut_start.data_ptr<int32_t>(),
+                                                          lut_count.data_ptr<int32_t>(),
+                                                          kv_block_indices.data_ptr<int32_t>(),
+                                                          static_cast<int32_t>(lut_rows),
+                                                          static_cast<int32_t>(kv_tiles),
+                                                          kv_block_indices.numel(),
+                                                          error.data_ptr<int32_t>());
+    const int32_t flags = error.cpu().item<int32_t>();
+    TORCH_CHECK(!(flags & kLutNegative), "MHA v4 sparse LUT has a negative lut_start or lut_count");
+    TORCH_CHECK(!(flags & kLutEmptyRow),
+                "MHA v4 sparse LUT has a row with lut_count == 0; every (batch, head, query tile) "
+                "must select at least one KV block");
+    TORCH_CHECK(!(flags & kLutOverrun),
+                "MHA v4 sparse LUT has a row whose lut_start + lut_count exceeds "
+                "kv_block_indices.numel() (",
+                kv_block_indices.numel(),
+                ")");
+    TORCH_CHECK(!(flags & kLutIndexRange),
+                "MHA v4 sparse LUT has a KV block index outside [0, ",
+                kv_tiles,
+                ")");
+}
+
 void populate_dense_kernarg(FmhaV4Kernarg& args,
                             const at::Tensor& q,
                             const at::Tensor& k,
@@ -585,6 +679,8 @@ PackedMhaV4Shapes validate_packed_mha_v4(const at::Tensor& q,
 at::Tensor
 mha_v4_sparse_work_table(const at::Tensor& lut_count, int64_t batch, int64_t nhead, int64_t q_tiles)
 {
+    TORCH_CHECK(lut_count.is_cuda(), "lut_count must be a GPU tensor");
+    const HipDeviceGuard device_guard{lut_count.get_device()};
     return build_sorted_work_table(lut_count, batch, nhead, q_tiles);
 }
 
@@ -617,6 +713,10 @@ void fmha_v4_fwd(const at::Tensor& q,
                                                k_scale_mode,
                                                v_scale_mode);
 
+    // Before any device query or launch: get_gpu_arch() reads whichever device is current, and
+    // every launch below inherits the current device's stream.
+    const HipDeviceGuard device_guard{q.get_device()};
+
     const auto arch = get_gpu_arch();
     const auto& cfg = find_config(
         arch, q_format, k_format, v_format, q_scale_mode, k_scale_mode, v_scale_mode, /*mode=*/0);
@@ -643,11 +743,10 @@ void fmha_v4_fwd(const at::Tensor& q,
     auto& kernel                = kernels.get_or_create(
         cache_key, [&]() { return AiterAsmKernel(cfg.knl_name.c_str(), cfg.co_name.c_str()); });
 
-    size_t arg_size = sizeof(args);
-    const int gdx   = (shapes.seqlen_q + cfg.ts_qo - 1) / cfg.ts_qo;
-    const int gdy   = shapes.nhead_q;
-    const int gdz   = shapes.batch;
-    const HipDeviceGuard device_guard{q.get_device()};
+    size_t arg_size          = sizeof(args);
+    const int gdx            = (shapes.seqlen_q + cfg.ts_qo - 1) / cfg.ts_qo;
+    const int gdy            = shapes.nhead_q;
+    const int gdz            = shapes.batch;
     const hipStream_t stream = at::hip::getCurrentHIPStream();
     kernel.launch_kernel({&args, &arg_size, gdx, gdy, gdz, 512, 1, 1, stream});
 }
@@ -683,8 +782,14 @@ void fmha_v4_fwd_sparse(const at::Tensor& q,
                                                q_scale_mode,
                                                k_scale_mode,
                                                v_scale_mode);
-    const auto arch   = get_gpu_arch();
-    const auto& cfg   = find_config(
+
+    // Before any device query or launch. build_sorted_work_table() below launches raw HIP kernels,
+    // which take the current device and its stream rather than Q's, so an unguarded call on a
+    // non-current device faults writing the work table.
+    const HipDeviceGuard device_guard{q.get_device()};
+
+    const auto arch = get_gpu_arch();
+    const auto& cfg = find_config(
         arch, q_format, k_format, v_format, q_scale_mode, k_scale_mode, v_scale_mode, /*mode=*/1);
     TORCH_CHECK(shapes.seqlen_k % cfg.ts_kv == 0,
                 "sorted-sparse MHA v4 requires key length padded to a multiple of ",
@@ -717,11 +822,24 @@ void fmha_v4_fwd_sparse(const at::Tensor& q,
                 ")");
     TORCH_CHECK(kv_block_indices.dim() == 1 && lut_start.dim() == 1 && lut_count.dim() == 1,
                 "LUT tensors must be 1-D");
+    // Every row must select at least one KV block, so a valid LUT indexes at least lut_rows
+    // entries. This is the only content bound derivable without reading device data; the rest is
+    // behind AITER_MHA_V4_VALIDATE_LUT.
+    TORCH_CHECK(kv_block_indices.numel() >= lut_rows,
+                "kv_block_indices must hold at least one entry per (batch, head, query tile); "
+                "expected at least ",
+                lut_rows,
+                ", got ",
+                kv_block_indices.numel());
 
     const auto kv_idx = kv_block_indices.contiguous();
     const auto start  = lut_start.contiguous();
     const auto count  = lut_count.contiguous();
-    auto work_table   = build_sorted_work_table(count, shapes.batch, shapes.nhead_q, q_tiles);
+    if(lut_validation_enabled())
+    {
+        validate_lut_contents(kv_idx, start, count, lut_rows, kv_tiles);
+    }
+    auto work_table = build_sorted_work_table(count, shapes.batch, shapes.nhead_q, q_tiles);
 
     FmhaV4SparseSortedKernarg args{};
     populate_dense_kernarg(args.dense,
@@ -751,8 +869,7 @@ void fmha_v4_fwd_sparse(const at::Tensor& q,
     auto& kernel                = kernels.get_or_create(
         cache_key, [&]() { return AiterAsmKernel(cfg.knl_name.c_str(), cfg.co_name.c_str()); });
 
-    size_t arg_size = sizeof(args);
-    const HipDeviceGuard device_guard{q.get_device()};
+    size_t arg_size          = sizeof(args);
     const hipStream_t stream = at::hip::getCurrentHIPStream();
     kernel.launch_kernel({&args, &arg_size, static_cast<int>(lut_rows), 1, 1, 512, 1, 1, stream});
 }

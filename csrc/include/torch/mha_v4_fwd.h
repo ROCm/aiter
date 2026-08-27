@@ -43,8 +43,9 @@ void fmha_v4_fwd_sparse(const at::Tensor& q,
                         const at::Tensor& lut_start,
                         const at::Tensor& lut_count);
 
-// The work table fmha_v4_fwd_sparse builds internally, exposed so its ordering can be tested. A
-// wrong order costs only load balance, never a wrong result, so nothing else observes it.
+// The work table fmha_v4_fwd_sparse builds internally, exposed so its ordering can be tested.
+// Reordering a permutation costs only load balance, but the table must stay a permutation: each
+// entry names the tile one workgroup claims, so a duplicated entry leaves another tile unwritten.
 at::Tensor mha_v4_sparse_work_table(const at::Tensor& lut_count,
                                     int64_t batch,
                                     int64_t nhead,
