@@ -322,9 +322,9 @@ for _co_kid, _co_instance in kernels_list.items():
         continue
     _GFX1250_CO_BY_TILE.setdefault(
         (_co_instance.B_M, _co_instance.B_N, _co_instance.B_K), {}
-    ).setdefault(
-        (_co_instance.cluster_wg_m, _co_instance.cluster_wg_n), []
-    ).append(_co_kid)
+    ).setdefault((_co_instance.cluster_wg_m, _co_instance.cluster_wg_n), []).append(
+        _co_kid
+    )
 
 
 def _gfx1250_co_candidates(
@@ -347,9 +347,7 @@ def _gfx1250_co_candidates(
         bm, bn, _bk = tile
         gx, gy = _ceil_div(M, bm), _ceil_div(N, bn)
         available = _GFX1250_CO_BY_TILE[tile]
-        for dims in _gfx1250_co_cluster_dims(
-            gx, gy, available, top_clusters, cu_num
-        ):
+        for dims in _gfx1250_co_cluster_dims(gx, gy, available, top_clusters, cu_num):
             selected.update(available[dims])
     return selected
 

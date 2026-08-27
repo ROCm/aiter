@@ -71,6 +71,7 @@ def co_traits_args(k):
         args += f", {k.co_wave_layout[0]}, {k.co_wave_layout[1]}"
     return args
 
+
 # fuse workspace storage dtype -> (C type, byte size) for the fuse kernel instantiation.
 _FUSE_WS_CTYPE = {"bf16_t": ("__bf16", 2), "fp32_t": ("float", 4)}
 

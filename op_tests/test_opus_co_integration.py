@@ -61,9 +61,10 @@ def test_gfx1250_co_registry_and_launch_contract():
     } <= OPUS_KERNEL_TAGS_BY_ARCH_FAMILY["gfx1250"]["a16w16"]
 
     kid = min(GFX1250_4WAVE_CO_KIDS)
-    assert get_kernel_instance(
-        "gfx1250", "a16w16", kid, torch.bfloat16
-    ) is gfx1250_4wave_co_kernels_list[kid]
+    assert (
+        get_kernel_instance("gfx1250", "a16w16", kid, torch.bfloat16)
+        is gfx1250_4wave_co_kernels_list[kid]
+    )
     assert get_kernel_instance("gfx1250", "a16w16", kid, torch.float32) is None
     assert not kernel_needs_external_workspace("gfx1250", "a16w16", kid)
 
@@ -85,8 +86,7 @@ def test_gfx1250_co_registry_and_launch_contract():
 
 def test_gfx1250_co_assets_and_host_only_codegen(tmp_path, monkeypatch):
     symbols_by_kid = {
-        kid: instance.name
-        for kid, instance in gfx1250_4wave_co_kernels_list.items()
+        kid: instance.name for kid, instance in gfx1250_4wave_co_kernels_list.items()
     }
     assert len(set(symbols_by_kid.values())) == 219
 
@@ -99,9 +99,7 @@ def test_gfx1250_co_assets_and_host_only_codegen(tmp_path, monkeypatch):
     image_dir = Path(CO_KERNELS_JSON).parent / "gfx1250"
     build_info = json.loads((image_dir / "build_info.json").read_text())
     assert len(build_info["kernels"]) == 219
-    assert {entry["kernarg_segment_size"] for entry in build_info["kernels"]} == {
-        64
-    }
+    assert {entry["kernarg_segment_size"] for entry in build_info["kernels"]} == {64}
     assert {
         entry["kid"]: entry["symbol"] for entry in build_info["kernels"]
     } == symbols_by_kid

@@ -25,9 +25,7 @@ _WORKSPACE_DTYPES = {
     "fp32_t": torch.float32,
 }
 _GFX1250_FUSED_SPLITK_TAG = "a16w16_clusterlaunch_tdm_splitk_fuse"
-_GFX1250_CO_TAGS = frozenset(
-    {"a16w16_4wave_co", "a16w16_4wave_wl_co"}
-)
+_GFX1250_CO_TAGS = frozenset({"a16w16_4wave_co", "a16w16_4wave_wl_co"})
 
 
 @dataclass(frozen=True)
