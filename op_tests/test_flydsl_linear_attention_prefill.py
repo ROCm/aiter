@@ -53,7 +53,6 @@ from dataclasses import dataclass, replace
 import numpy as np
 import pytest
 import torch
-import triton
 from torch.profiler import ProfilerActivity, profile
 
 from aiter.ops.flydsl.utils import is_flydsl_available
@@ -890,7 +889,7 @@ def _make_inputs(
 
 # -- Pure-PyTorch reference ----------------------------------------------
 
-from op_tests.gdn_common import ref_chunk_gated_delta_rule_fwd_h  # noqa: E402
+from op_tests.gdn_common import ref_chunk_gated_delta_rule_fwd_h
 
 
 def _normalize_opt_v_new(vn_opt):
@@ -2466,8 +2465,7 @@ def _assert_class(vals, kind, label):
 
 @pytest.mark.skipif(not is_flydsl_available(), reason="flydsl not available")
 class TestBf16NanClassification:
-    """The f32 -> bf16 converter must preserve NaN/Inf classification.
-    """
+    """The f32 -> bf16 converter must preserve NaN/Inf classification."""
 
     @staticmethod
     def _inputs(H, Hg, K, V, T, bits):
@@ -2487,9 +2485,9 @@ class TestBf16NanClassification:
         h, _, _ = chunk_gated_delta_rule_fwd_h_flydsl(
             k, w, u, initial_state=h0, output_final_state=False, save_new_value=False
         )
-        assert h.dtype == torch.bfloat16, (
-            f"this must have bf16 snapshot is bf16, got {h.dtype}"
-        )
+        assert (
+            h.dtype == torch.bfloat16
+        ), f"this must have bf16 snapshot is bf16, got {h.dtype}"
         _assert_class(h[0, 0, :, :, :4].flatten(), kind, f"vk_k5 {label}")
 
     @pytest.mark.parametrize("label,bits,kind", _NAN_INF_PATTERNS)

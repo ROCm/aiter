@@ -3,11 +3,11 @@
 
 """Host side logic of the fused gfx942 GDN K5+K6 kernel.
 
-This module owns everything specific to the fused gfx942 build: compile cache, BV/wave selector, 
-launch, and the fused-vs-separate router. 
+This module owns everything specific to the fused gfx942 build: compile cache, BV/wave selector,
+launch, and the fused-vs-separate router.
 
 The master ``linear_attention_prefill_kernels`` module owns the
-separate K5 pipeline and the shape/BV machinery both paths share, i.e., 
+separate K5 pipeline and the shape/BV machinery both paths share, i.e.,
 this module depends on ``linear_attention_prefill_kernels`` but not vice versa.
 
 """
@@ -18,6 +18,10 @@ import torch
 
 from .. import prefill_batch_metadata as _pbm
 from ..gated_delta_rule_fusion import K5K6Fusion
+from ..triton._triton_kernels.gated_delta_rule.utils import (
+    prepare_chunk_offsets,
+    prepare_rebased_cu_seqlens,
+)
 from . import linear_attention_prefill_kernels as _host
 from .kernels.chunk_gated_delta_h_gfx942 import (
     compile_chunk_gated_delta_h_gfx942,
@@ -27,16 +31,12 @@ from .kernels.chunk_gated_delta_h_gfx942 import (
 )
 from .kernels.k5_variants import _bv_waves_of_variant, _legal_bv_candidates
 from .kernels.tensor_shim import _run_compiled
-from ..triton._triton_kernels.gated_delta_rule.utils import (
-    prepare_chunk_offsets,
-    prepare_rebased_cu_seqlens,
-)
 from .linear_attention_prefill_kernels import (
     _GFX942_MIN_FILL,
+    _RCP_LN2,
     _canonical_gate_rank,
     _check_gk_shape,
     _grid_ctas,
-    _RCP_LN2,
     _select_bv_for_grid,
     chunk_gated_delta_rule_fwd_h_flydsl,
 )
@@ -65,6 +65,7 @@ _FUSED_MIN_FILL = 0.45
 # and the bv64 grid fills the device well enough that the extra resident waves
 # have room to help.
 _FUSED_W8_MIN_FILL = 0.55
+
 
 def is_fused_k5k6_gfx942_unsupported() -> str | None:
     """Why the fused K5+K6 kernel cannot run here, or None if it can."""
@@ -237,7 +238,8 @@ def _run_fused_k5k6_gfx942(
 
     final_state = (
         k.new_empty(N, H, V, K, dtype=resolved_state_dtype)
-        if output_final_state else None
+        if output_final_state
+        else None
     )
 
     dummy = torch.empty(1, device=k.device, dtype=torch.float32)
@@ -450,7 +452,7 @@ def chunk_gated_delta_rule_fwd_h_o_flydsl(
     if _host._ARCH != "gfx942":
         raise NotImplementedError(
             f"chunk_gated_delta_rule_fwd_h_o_flydsl: the fused GDN K5+K6 kernel "
-            f"is implemented for gfx942 only; got arch '{_host._ARCH}'. " 
+            f"is implemented for gfx942 only; got arch '{_host._ARCH}'. "
         )
 
     return _run_fused_k5k6_gfx942(

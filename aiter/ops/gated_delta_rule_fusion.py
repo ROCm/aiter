@@ -1,8 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Backend-neutral option type for gated-delta-rule K5+K6 fusion.
-"""
+"""Backend-neutral option type for gated-delta-rule K5+K6 fusion."""
 
 from __future__ import annotations
 

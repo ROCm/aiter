@@ -393,10 +393,10 @@ def test_fused_pipeline(H, Hg, seq_lens):
     """fusion=ALWAYS (FlyDSL backend) matches the pure-Triton baseline."""
     if get_gfx() != "gfx942":
         pytest.skip(f"fused K5+K6 kernel is gfx942-only; arch={get_gfx()}")
+    from aiter.ops.gated_delta_rule_fusion import K5K6Fusion
     from aiter.ops.triton._triton_kernels.gated_delta_rule.prefill.chunk import (
         chunk_gated_delta_rule_fwd_opt_vk,
     )
-    from aiter.ops.gated_delta_rule_fusion import K5K6Fusion
 
     common = _pipeline_inputs(H, Hg, seq_lens)
     # Baseline: pure Triton (no FlyDSL backend -> fusion ignored regardless).
@@ -428,14 +428,13 @@ def test_fused_pipeline(H, Hg, seq_lens):
     ],
 )
 def test_fused_always_raises_when_unsupported(kwargs, reason_fragment):
-    """``ALWAYS`` refuses loudly instead of silently running the separate path.
-    """
+    """``ALWAYS`` refuses loudly instead of silently running the separate path."""
     if get_gfx() != "gfx942":
         pytest.skip(f"fused K5+K6 kernel is gfx942-only; arch={get_gfx()}")
+    from aiter.ops.gated_delta_rule_fusion import K5K6Fusion
     from aiter.ops.triton._triton_kernels.gated_delta_rule.prefill.chunk import (
         chunk_gated_delta_rule_fwd_opt_vk,
     )
-    from aiter.ops.gated_delta_rule_fusion import K5K6Fusion
 
     common = _pipeline_inputs(8, 4, [512])
     with pytest.raises(ValueError, match="fusion=ALWAYS") as exc:
@@ -444,19 +443,19 @@ def test_fused_always_raises_when_unsupported(kwargs, reason_fragment):
         exc.value
     ), f"the error should name the actual reason; got: {exc.value}"
 
+
 def test_fused_always_overrides_the_perf_heuristic():
-    """``ALWAYS`` still fuses a shape AUTO would route to the separate path.
-    """
+    """``ALWAYS`` still fuses a shape AUTO would route to the separate path."""
     if get_gfx() != "gfx942":
         pytest.skip(f"fused K5+K6 kernel is gfx942-only; arch={get_gfx()}")
     from aiter.ops.flydsl.gdn_fused_gfx942_kernels import (
         fused_k5k6_gfx942_supported,
         should_use_fused_k5k6_gfx942,
     )
+    from aiter.ops.gated_delta_rule_fusion import K5K6Fusion
     from aiter.ops.triton._triton_kernels.gated_delta_rule.prefill.chunk import (
         chunk_gated_delta_rule_fwd_opt_vk,
     )
-    from aiter.ops.gated_delta_rule_fusion import K5K6Fusion
 
     H, Hg = 4, 2
     assert fused_k5k6_gfx942_supported()
@@ -512,14 +511,14 @@ def test_fused_selection_heuristic():
     BV_run from the same H*N variant rule the launcher uses."""
     import math
 
-    from aiter.ops.flydsl.kernels.chunk_gated_delta_h_gfx942 import (
-        select_fused_variant,
-    )
-    from aiter.ops.flydsl.kernels.k5_variants import _bv_of_variant
     from aiter.ops.flydsl.gdn_fused_gfx942_kernels import (
         _FUSED_MIN_FILL,
         should_use_fused_k5k6_gfx942,
     )
+    from aiter.ops.flydsl.kernels.chunk_gated_delta_h_gfx942 import (
+        select_fused_variant,
+    )
+    from aiter.ops.flydsl.kernels.k5_variants import _bv_of_variant
     from aiter.ops.flydsl.linear_attention_prefill_kernels import (
         _ARCH,
         _device_cu_count,
@@ -570,10 +569,10 @@ def test_fused_auto_routing(H, Hg, seq_lens, expect_fused):
     """
     from aiter.ops.flydsl.gdn_fused_gfx942_kernels import should_use_fused_k5k6_gfx942
     from aiter.ops.flydsl.linear_attention_prefill_kernels import _ARCH
+    from aiter.ops.gated_delta_rule_fusion import K5K6Fusion
     from aiter.ops.triton._triton_kernels.gated_delta_rule.prefill.chunk import (
         chunk_gated_delta_rule_fwd_opt_vk,
     )
-    from aiter.ops.gated_delta_rule_fusion import K5K6Fusion
 
     N = len(seq_lens)
     if _ARCH == "gfx942":

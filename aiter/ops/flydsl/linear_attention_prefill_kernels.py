@@ -35,7 +35,6 @@ from ..prefill_batch_metadata import (
     GatedDeltaRulePrefillMetadata,
     build_gated_delta_rule_prefill_metadata,
 )
-
 from ..triton._triton_kernels.gated_delta_rule.utils import (
     prepare_chunk_offsets,
     prepare_num_chunks,
@@ -116,7 +115,7 @@ def _check_gk_shape(
     and folds the batch into the token index (``bos = i_n * T``) in dense mode.
     A tensor sized for a single batch therefore does not fault -- the loads fall
     outside the buffer descriptor and return hardware zeros, silently dropping
-    the gate for every batch after the first. This host side checks produces 
+    the gate for every batch after the first. This host side checks produces
     a load error instead of silently dropping the gate.
     """
     token_major = (B, T_flat, H, K)

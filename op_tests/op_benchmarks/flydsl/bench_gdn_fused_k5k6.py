@@ -41,19 +41,19 @@ sys.path.insert(
     0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 )
 
-import aiter  # noqa: E402
-from aiter import dtypes  # noqa: E402
-from aiter.jit.utils.chip_info import get_gfx  # noqa: E402
-from aiter.ops.flydsl.kernels.k5_variants import (  # noqa: E402
+import aiter
+from aiter import dtypes
+from aiter.jit.utils.chip_info import get_gfx
+from aiter.ops.flydsl.kernels.k5_variants import (
     K5_VARIANTS,
-    _legal_bv_candidates,
     _bv_of_variant,
+    _legal_bv_candidates,
 )
-from aiter.test_common import (  # noqa: E402
+from aiter.test_common import (
     checkAllclose,
     run_perftest,
 )
-from op_tests.gdn_common import _make_inputs  # noqa: E402
+from op_tests.gdn_common import _make_inputs
 
 # Shapes: Kimi-K3 (KDA, gk gate) and Qwen (GDN, g gate), real TP configs.
 # Columns: (model_tag, H, Hg, T_flat, N, gate)
@@ -593,7 +593,14 @@ def bench_fused_k5k6(
     # tile, or the FlyDSL vk K5 (its own BV rule, not the fused one) followed
     # by Triton K6.
     routes_fused = should_use_fused_k5k6_gfx942(H=H, N=N, V=V)
-    tag_kw = dict(H=H, Hg=Hg, V=V, T_flat=T_flat, N=N, is_varlen=inp["cu"] is not None)
+    tag_kw = {
+        "H": H,
+        "Hg": Hg,
+        "V": V,
+        "T_flat": T_flat,
+        "N": N,
+        "is_varlen": inp["cu"] is not None,
+    }
     dispatch_name = (
         f"auto_dispatch[fused {_auto_tag('fused', **tag_kw)}]"
         if routes_fused
@@ -790,9 +797,10 @@ def bench_k5(
 def _collect_env_info() -> dict:
     """GPU / toolchain / repo versions, for the report header.
 
-    Every probe is individually guarded: a missing ``hipcc`` or a detached
-    worktree should degrade one field to "N/A", never abort a sweep that has
-    already spent GPU time.
+    Every probe is individually guarded: a missing ``hipcc`` or a checkout with
+    no git metadata should degrade one field to "N/A", never abort a sweep that
+    has already spent GPU time. The guards name the failure modes they cover
+    rather than catching everything, so a genuine bug in here still surfaces.
     """
     info: dict = {}
 
@@ -807,10 +815,13 @@ def _collect_env_info() -> dict:
     info["torch"] = torch.__version__
     for mod in ("triton", "flydsl"):
         try:
+            # Not installed, or installed without a __version__.
             info[mod] = __import__(mod).__version__
-        except Exception:
+        except (ImportError, AttributeError):
             info[mod] = "N/A"
 
+    # OSError covers "hipcc not on PATH"; SubprocessError covers a nonzero
+    # exit; IndexError covers the fallback indexing empty output.
     try:
         hip_ver = subprocess.check_output(
             ["hipcc", "--version"], stderr=subprocess.STDOUT, text=True
@@ -823,7 +834,7 @@ def _collect_env_info() -> dict:
             ),
             hip_ver.splitlines()[0].strip(),
         )
-    except Exception:
+    except (OSError, subprocess.SubprocessError, IndexError):
         info["hip"] = "N/A"
 
     # ``--dirty`` matters more than the hash itself: an A/B run against
@@ -841,7 +852,7 @@ def _collect_env_info() -> dict:
             stderr=subprocess.DEVNULL,
             text=True,
         ).strip()
-    except Exception:
+    except (OSError, subprocess.SubprocessError):
         info["git_commit"] = "N/A"
 
     info["timing"] = f"hipgraph, {_NUM_ITERS} iters/capture, {_NUM_WARMUP} warmup"
