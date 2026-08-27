@@ -522,6 +522,7 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
     def get_flydsl_gemm_a8w8_bpreshuffle_tune_task(
         self,
         info_keys,
+        useSplitK,
         seed,
     ):
         gfx, _cu_num, M, N, K, q_dtype_w = info_keys
@@ -558,7 +559,7 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
                     continue
                 for ks in [1] + (
                     k_split_candidates(ki, M, N, K, cu_num=self.get_cu_num())
-                    if pipe.name == "preshuffle"
+                    if useSplitK and pipe.name == "preshuffle"
                     else []
                 ):
                     name = ki.name if ks == 1 else f"{ki.name}_ks{ks}"
@@ -697,6 +698,7 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
                 task.extend(
                     self.get_flydsl_gemm_a8w8_bpreshuffle_tune_task(
                         info_keys,
+                        useSplitK,
                         seed,
                     )
                 )
