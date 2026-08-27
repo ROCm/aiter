@@ -27,6 +27,15 @@ if TRITON_GE_36:
     except Exception:  # noqa: BLE001
         _gluon_fp8_mqa_logits_kernel = None
 
+_gluon_fp8_mqa_logits_kernel_H64D128 = None
+if TRITON_GE_36 and arch == "gfx950":
+    try:
+        from aiter.ops.triton._gluon_kernels.gfx950.attention.fp8_mqa_logits import (
+            _gluon_fp8_mqa_logits_kernel_H64D128,
+        )
+    except Exception:  # noqa: BLE001
+        _gluon_fp8_mqa_logits_kernel_H64D128 = None
+
 
 # Hacks to see if we can use some newer features
 # TODO: remove when the next Triton release happens so we can rely on version
@@ -194,67 +203,118 @@ def fp8_mqa_logits(
             matrix_instr_nonkdim=matrix_instr_nonkdim,
         )
     else:
-        num_buffers = 2
-        USE_FOLDED_REDUCTION = FOLDED_REDUCTED_SUPPORT and num_heads > 16
-        if arch == "gfx950":
-            num_buffers = 2
-            loop_variant = 0
-            waves_per_eu = 4
-            num_chains = 4 if USE_FOLDED_REDUCTION else 0
-            num_warps = 2 if num_heads <= 32 else 1
-            block_kv = 64 if num_heads <= 32 else 32
-            block_m = 2 if (num_heads <= 32 and seq_len > 4096) else 1
-            mfma_nonk_dim = 32 if (head_size <= 64 or num_heads == 32) else 16
-            other = {
-                "USE_PADDED_SHARED_LAYOUT": ASYNC_COPY_SUPPORTS_DISTRIBUTED,
-                "BLOCK_M": block_m,
-                "MFMA_NONK_DIM": mfma_nonk_dim,
-            }
-        else:
-            loop_variant = 1
-            waves_per_eu = 1
-            num_chains = 8 if USE_FOLDED_REDUCTION else 0
-            num_warps = 4
-            block_kv = 128
-            # This kernel has no BLOCK_M: it walks one query row per program.
-            block_m = 1
-            other = {"LOOP_VARIANT": loop_variant}
-
         # Buffer ops use a 32-bit byte offset (2 GiB resource descriptor cap).
         # Fall back to plain global load/store when a tensor exceeds that.
         BUFFER_LIMIT_BYTES = 2 * 1024 * 1024 * 1024
         use_buffer_load = KV.numel() * KV.element_size() < BUFFER_LIMIT_BYTES
         use_buffer_store = logits.numel() * logits.element_size() < BUFFER_LIMIT_BYTES
-        _gluon_fp8_mqa_logits_kernel[((seq_len + block_m - 1) // block_m,)](
-            Q_ptr=Q,
-            KV_ptr=KV,
-            kv_scales_ptr=kv_scales,
-            weights_ptr=weights,
-            cu_start_ptr=cu_starts,
-            cu_end_ptr=cu_ends,
-            logits_ptr=logits,
-            seq_len=seq_len,
-            seq_len_kv=seq_len_kv,
-            NUM_HEADS=num_heads,
-            HEAD_SIZE=head_size,
-            stride_q_s=stride_q_s,
-            stride_q_h=stride_q_h,
-            stride_q_d=stride_q_d,
-            stride_kv_s=stride_kv_s,
-            stride_kv_d=stride_kv_d,
-            stride_w_s=stride_w_s,
-            stride_w_h=stride_w_h,
-            stride_logits_s=stride_logits_s,
-            stride_logits_k=stride_logits_k,
-            BLOCK_KV=block_kv,
-            NUM_WARPS=num_warps,
-            NUM_BUFFERS=num_buffers,
-            NUM_CHAINS=num_chains,
-            USE_BUFFER_LOAD=use_buffer_load,
-            USE_BUFFER_STORE=use_buffer_store,
-            num_warps=num_warps,
-            waves_per_eu=waves_per_eu,
-            **other,
-        )
+
+    if use_gluon:
+        USE_FOLDED_REDUCTION = FOLDED_REDUCTED_SUPPORT and num_heads > 16
+
+        # gfx950 H64D128 variant:
+        # FIXME: unify later
+        h64d128_block_m = 4
+        h64d128_block_kv = 64
+        if (
+            arch == "gfx950"
+            and _gluon_fp8_mqa_logits_kernel_H64D128 is not None
+            and ASYNC_COPY_SUPPORTS_DISTRIBUTED
+            and num_heads == 64
+            and head_size == 128
+            and seq_len >= 4096
+        ):
+            _gluon_fp8_mqa_logits_kernel_H64D128[
+                ((seq_len + h64d128_block_m - 1) // h64d128_block_m,)
+            ](
+                Q_ptr=Q,
+                KV_ptr=KV,
+                kv_scales_ptr=kv_scales,
+                weights_ptr=weights,
+                cu_start_ptr=cu_starts,
+                cu_end_ptr=cu_ends,
+                logits_ptr=logits,
+                seq_len=seq_len,
+                seq_len_kv=seq_len_kv,
+                NUM_HEADS=num_heads,
+                HEAD_SIZE=head_size,
+                stride_q_s=stride_q_s,
+                stride_q_h=stride_q_h,
+                stride_q_d=stride_q_d,
+                stride_kv_s=stride_kv_s,
+                stride_kv_d=stride_kv_d,
+                stride_w_s=stride_w_s,
+                stride_w_h=stride_w_h,
+                stride_logits_s=stride_logits_s,
+                stride_logits_k=stride_logits_k,
+                BLOCK_KV=h64d128_block_kv,
+                NUM_WARPS=4,
+                NUM_BUFFERS=3,
+                USE_BUFFER_LOAD=use_buffer_load,
+                USE_BUFFER_STORE=use_buffer_store,
+                BLOCK_M=h64d128_block_m,
+                TILES_PER_WARP_M=4,
+                USE_FMA_FOLD=USE_FOLDED_REDUCTION,
+                NUM_CHAINS=2,
+                num_warps=4,
+                waves_per_eu=3,
+            )
+        else:
+            num_buffers = 2
+            if arch == "gfx950":
+                num_buffers = 2
+                loop_variant = 0
+                waves_per_eu = 4
+                num_chains = 4 if USE_FOLDED_REDUCTION else 0
+                num_warps = 2 if num_heads <= 32 else 1
+                block_kv = 64 if num_heads <= 32 else 32
+                block_m = 2 if (num_heads <= 32 and seq_len > 4096) else 1
+                mfma_nonk_dim = 32 if (head_size <= 64 or num_heads == 32) else 16
+                other = {
+                    "USE_PADDED_SHARED_LAYOUT": ASYNC_COPY_SUPPORTS_DISTRIBUTED,
+                    "BLOCK_M": block_m,
+                    "MFMA_NONK_DIM": mfma_nonk_dim,
+                }
+            else:
+                loop_variant = 1
+                waves_per_eu = 1
+                num_chains = 8 if USE_FOLDED_REDUCTION else 0
+                num_warps = 4
+                block_kv = 128
+                # This kernel has no BLOCK_M: it walks one query row per program.
+                block_m = 1
+                other = {"LOOP_VARIANT": loop_variant}
+
+            _gluon_fp8_mqa_logits_kernel[((seq_len + block_m - 1) // block_m,)](
+                Q_ptr=Q,
+                KV_ptr=KV,
+                kv_scales_ptr=kv_scales,
+                weights_ptr=weights,
+                cu_start_ptr=cu_starts,
+                cu_end_ptr=cu_ends,
+                logits_ptr=logits,
+                seq_len=seq_len,
+                seq_len_kv=seq_len_kv,
+                NUM_HEADS=num_heads,
+                HEAD_SIZE=head_size,
+                stride_q_s=stride_q_s,
+                stride_q_h=stride_q_h,
+                stride_q_d=stride_q_d,
+                stride_kv_s=stride_kv_s,
+                stride_kv_d=stride_kv_d,
+                stride_w_s=stride_w_s,
+                stride_w_h=stride_w_h,
+                stride_logits_s=stride_logits_s,
+                stride_logits_k=stride_logits_k,
+                BLOCK_KV=block_kv,
+                NUM_WARPS=num_warps,
+                NUM_BUFFERS=num_buffers,
+                NUM_CHAINS=num_chains,
+                USE_BUFFER_LOAD=use_buffer_load,
+                USE_BUFFER_STORE=use_buffer_store,
+                num_warps=num_warps,
+                waves_per_eu=waves_per_eu,
+                **other,
+            )
 
     return logits
