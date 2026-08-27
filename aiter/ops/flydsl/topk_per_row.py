@@ -90,6 +90,8 @@ def flydsl_top_k_per_row_decode(
 
     For output row ``r``, the valid input length is
     ``seq_lens[r // next_n] - next_n + r % next_n + 1``.
+    If the valid input length is less than ``k``, the remaining output positions
+    are filled with ``-1``.
     When ``stable`` is true, indices are emitted in ascending order and ties at
     the selection threshold prefer the smallest input indices.
     """
