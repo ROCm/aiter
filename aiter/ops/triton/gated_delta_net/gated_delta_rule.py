@@ -515,7 +515,7 @@ def chunk_gated_delta_rule_opt_vk(
             ``seq_lens_cpu`` when several GDR layers process the same batch.
         initial_state_indices: Optional ``[N]`` indices into a larger
             ``initial_state`` pool. K5 reads and writes those slots in place.
-            This is unsupported with ``use_chunk_flydsl=True``.
+            Supported by every K5 path (HIP, FlyDSL, Triton VK).
         inplace_final_state: Controls K5 in-place state write-back. It defaults
             to ``True`` when ``initial_state_indices`` is provided.
         snapshot_dtype (torch.dtype, optional): Temporary chunk snapshot dtype
@@ -543,6 +543,11 @@ def chunk_gated_delta_rule_opt_vk(
                 "The number of state indices must equal the number of "
                 f"prefill sequences, i.e. {n_prefill} rather than "
                 f"{initial_state_indices.numel()}."
+            )
+        if not output_final_state:
+            raise ValueError(
+                "`initial_state_indices` requires `output_final_state=True` "
+                "(the indexed path writes the final state back into the pool)."
             )
     elif initial_state is not None and initial_state.shape[0] != n_prefill:
         raise ValueError(

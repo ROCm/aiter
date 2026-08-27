@@ -4,6 +4,7 @@
 """Fused heterogeneous MoE (FHMoE) MXFP4/FP8 dispatch."""
 
 import functools
+import os
 from dataclasses import replace
 
 import torch
@@ -302,6 +303,7 @@ _flydsl_fhmoe_stage2_wrapper._is_flydsl_stage2 = True
 
 def _use_fhmoe_wrappers(metadata):
     from aiter.fused_moe import _flydsl_stage1_wrapper, _flydsl_stage2_wrapper
+    from aiter.ops.flydsl.moe_kernels import get_flydsl_kernel_params
 
     stage1_func = getattr(metadata.stage1, "func", metadata.stage1)
     stage2_func = getattr(metadata.stage2, "func", metadata.stage2)
@@ -312,6 +314,14 @@ def _use_fhmoe_wrappers(metadata):
     ):
         raise NotImplementedError(
             "Heterogeneous MXFP4/FP8 experts require the two-stage FlyDSL path"
+        )
+    kernel_names = (
+        metadata.stage1.keywords.get("kernelName", ""),
+        metadata.stage2.keywords.get("kernelName", ""),
+    )
+    if any(get_flydsl_kernel_params(name) is None for name in kernel_names):
+        raise NotImplementedError(
+            "Heterogeneous MXFP4/FP8 experts require valid FlyDSL kernels"
         )
     stage1 = functools.partial(
         _flydsl_fhmoe_stage1_wrapper,
@@ -324,6 +334,112 @@ def _use_fhmoe_wrappers(metadata):
         **metadata.stage2.keywords,
     )
     return replace(metadata, stage1=stage1, stage2=stage2)
+
+
+def _dsv4_i384_fhmoe_config_file() -> str:
+    from aiter.jit.core import AITER_CONFIGS
+
+    return AITER_CONFIGS.AITER_CONFIG_FHMOE_FILE
+
+
+@functools.cache
+def _supports_dsv4_i384_fhmoe_config(max_tokens: int, config_file: str) -> bool:
+    try:
+        from aiter.fused_moe import get_2stage_cfgs, get_padded_M
+
+        # Config keys are padded tiers; tensors retain the original M.
+        required_tokens = {
+            get_padded_M(1 << exponent) for exponent in range(max_tokens.bit_length())
+        }
+        required_tokens.add(get_padded_M(max_tokens))
+        for token in required_tokens:
+            metadata = get_2stage_cfgs(
+                token,
+                7168,
+                384,
+                385,
+                7,
+                torch.bfloat16,
+                dtypes.fp8,
+                dtypes.fp4x2,
+                QuantType.per_1x32,
+                True,
+                ActivationType.Silu,
+                False,
+                0,
+                0,
+                True,
+                GateMode.INTERLEAVE,
+                config_file=config_file,
+            )
+            _use_fhmoe_wrappers(metadata)
+    except (
+        ImportError,
+        KeyError,
+        OSError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+    ):
+        return False
+    return True
+
+
+def supports_dsv4_i384_fhmoe(max_tokens: int) -> bool:
+    """Return whether the active FHMoE CSV covers every M through the limit."""
+    if type(max_tokens) is not int or max_tokens <= 0:
+        return False
+
+    try:
+        if int(os.environ.get("AITER_BYPASS_TUNE_CONFIG", "0")) != 0:
+            return False
+        config_file = _dsv4_i384_fhmoe_config_file()
+    except (ImportError, KeyError, OSError, RuntimeError, TypeError, ValueError):
+        return False
+    return _supports_dsv4_i384_fhmoe_config(max_tokens, config_file)
+
+
+def _is_dsv4_i384_fhmoe_contract(
+    model_dim: int,
+    inter_dim: int,
+    experts: int,
+    topk: int,
+    hidden_pad: int,
+    intermediate_pad: int,
+    gate_mode: GateMode,
+    doweight_stage1: bool,
+) -> bool:
+    return (
+        (model_dim, inter_dim, experts, topk) == (7168, 384, 385, 7)
+        and hidden_pad == 0
+        and intermediate_pad == 0
+        and gate_mode == GateMode.INTERLEAVE
+        and not doweight_stage1
+    )
+
+
+def _uses_dsv4_fhmoe_config(
+    token_num: int,
+    model_dim: int,
+    inter_dim: int,
+    experts: int,
+    topk: int,
+    hidden_pad: int,
+    intermediate_pad: int,
+    gate_mode: GateMode,
+    doweight_stage1: bool,
+) -> bool:
+    """Return whether dispatch should use the dedicated DSV4 FHMoE table."""
+    return _is_dsv4_i384_fhmoe_contract(
+        model_dim,
+        inter_dim,
+        experts,
+        topk,
+        hidden_pad,
+        intermediate_pad,
+        gate_mode,
+        doweight_stage1,
+    ) and supports_dsv4_i384_fhmoe(token_num)
 
 
 def fhmoe_fake(
@@ -445,6 +561,29 @@ def fhmoe_(
         bias2,
     )
     q_dtype_a = dtypes.fp8 if gate_mode_enum == GateMode.INTERLEAVE else dtypes.fp4x2
+    experts = w1.shape[0]
+    model_dim = w2.shape[1]
+    inter_dim = w2.shape[2] * (model_dim // w1.shape[-1])
+    topk = topk_ids.shape[1]
+    metadata_config_file = None
+    if _is_dsv4_i384_fhmoe_contract(
+        model_dim,
+        inter_dim,
+        experts,
+        topk,
+        hidden_pad,
+        intermediate_pad,
+        gate_mode_enum,
+        doweight_stage1,
+    ):
+        if not supports_dsv4_i384_fhmoe(hidden_states.shape[0]):
+            raise NotImplementedError(
+                "The active FHMoE config does not cover this DSV4 I384 "
+                f"token shape: M={hidden_states.shape[0]}"
+            )
+        from aiter.jit.core import AITER_CONFIGS
+
+        metadata_config_file = AITER_CONFIGS.AITER_CONFIG_FHMOE_FILE
     return _fused_moe_impl(
         hidden_states=hidden_states,
         w1=w1,
@@ -471,6 +610,7 @@ def fhmoe_(
         gate_mode=gate_mode,
         _q_dtype_a=q_dtype_a,
         _metadata_transform=_use_fhmoe_wrappers,
+        _metadata_config_file=metadata_config_file,
         _stage1_extra_args={
             "shared_w1": shared_w1,
             "shared_w1_scale": shared_w1_scale,

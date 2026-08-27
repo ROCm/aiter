@@ -28,16 +28,10 @@ _LOGGER = AiterTritonLogger()
 _FORCE_GFX1250_EX = os.environ.get("AITER_FORCE_GFX1250_EX", "0") == "1"
 _TRITON_VERSION = Version(triton.__version__)
 
-_GLUON_SUPPORTED_ARCHS = ("gfx1250",)
-
-
-def _is_gluon_available():
-    """Check if the gluon backend is available for the current GPU architecture."""
-    try:
-        arch = get_arch()
-        return any(s in arch for s in _GLUON_SUPPORTED_ARCHS)
-    except Exception:  # noqa: BLE001
-        return False
+_GLUON_SUPPORTED_ARCHS = ("gfx950", "gfx1250")
+_GLUON_PRESHUFFLE_ARCHS = ("gfx1250",)
+_GLUON_DEFAULT_ARCHS = ("gfx1250",)
+_GLUON_KERNEL_TYPES = ("bandwidth_bound", "compute_bound")
 
 
 def gemm_a8w8_blockscale(
@@ -85,11 +79,18 @@ def gemm_a8w8_blockscale(
     w = w.T  # (K, N)
     w_scale = w_scale.T  # (scale_k, scale_n)
 
-    # Resolve backend up-front so the config is loaded from the backend's
-    # config dir (gemm/<backend>/), falling back to the shared gemm/ dir.
     if backend is None:
-        backend = "gluon" if _is_gluon_available() else "triton"
+        backend = "gluon" if get_arch() in _GLUON_DEFAULT_ARCHS else "triton"
     backend = backend.lower()
+    assert backend in (
+        "triton",
+        "gluon",
+    ), f"Unknown backend '{backend}', must be 'triton' or 'gluon'"
+
+    if backend == "gluon":
+        assert (
+            get_arch() in _GLUON_SUPPORTED_ARCHS
+        ), f"Gluon backend requires one of {_GLUON_SUPPORTED_ARCHS}, got '{get_arch()}'"
 
     if config is None:
         config, _ = _get_config(M, N, K, backend=backend)
@@ -133,86 +134,67 @@ def gemm_a8w8_blockscale(
         ),  # Effective launch grid dims: [NUM_KSPLIT, NUM_M_BLOCKS, NUM_N_BLOCKS]
     )
 
-    if backend is None:
-        backend = "gluon" if _is_gluon_available() else "triton"
-    backend = backend.lower()
-    assert backend in (
-        "triton",
-        "gluon",
-    ), f"Unknown backend '{backend}', must be 'triton' or 'gluon'"
-
+    extra_constexpr = {}
     if backend == "gluon":
+        arch = get_arch()
         assert (
-            _is_gluon_available()
-        ), f"Gluon backend requires one of {_GLUON_SUPPORTED_ARCHS}, got '{get_arch()}'"
-        from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_a8w8_blockscale import (
-            _KERNEL_MAP,
-        )
+            kernel_type in _GLUON_KERNEL_TYPES
+        ), f"Unknown kernel_type '{kernel_type}', must be one of {list(_GLUON_KERNEL_TYPES)}"
+        if arch == "gfx950":
+            from aiter.ops.triton._gluon_kernels.gfx950.gemm.basic.gemm_a8w8_blockscale import (
+                _gemm_a8w8_blockscale_kernel as gluon_kernel,
+            )
 
-        assert (
-            kernel_type in _KERNEL_MAP
-        ), f"Unknown kernel_type '{kernel_type}', must be one of {list(_KERNEL_MAP.keys())}"
+            # gfx950 has one blockscale kernel, which serves both kernel types.
+            impl = gluon_kernel
+            extra_constexpr["NUM_WARPS"] = config["num_warps"]
+            extra_constexpr["NUM_STAGES"] = max(config.get("num_stages", 2), 2)
+        elif arch == "gfx1250":
+            from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_a8w8_blockscale import (
+                _KERNEL_MAP,
+            )
+
+            impl = _KERNEL_MAP[kernel_type]
+            warp_bases = [(0, 1)]
+            for i in range(int(math.log2(config["num_warps"] // 2))):
+                warp_bases.append((1 << i, 0))
+            extra_constexpr["warp_bases"] = tuple(warp_bases)
+            config["NUM_BUFFERS"] = config.pop("num_stages", 1)
+        else:
+            raise AssertionError(
+                f"Gluon backend requires one of {_GLUON_SUPPORTED_ARCHS}, got '{arch}'"
+            )
+
         _LOGGER.info(
-            f"GEMM_A8W8 BLOCKSCALE [gluon/gfx1250]: x={tuple(x.shape)} w={tuple(w.shape)} "
-            f"kernel={kernel_type}"
-        )
-
-        impl = _KERNEL_MAP[kernel_type]
-        extra_constexpr = {}
-        warp_bases = [(0, 1)]
-        for i in range(int(math.log2(config["num_warps"] // 2))):
-            warp_bases.append((1 << i, 0))
-        extra_constexpr["warp_bases"] = tuple(warp_bases)
-        config["NUM_BUFFERS"] = config.pop("num_stages", 1)
-
-        impl[grid](
-            x,
-            w,
-            y if config["NUM_KSPLIT"] == 1 else y_pp,
-            x_scale,
-            w_scale,
-            M,
-            N,
-            K,
-            x.stride(0),
-            x.stride(1),
-            w.stride(0),
-            w.stride(1),
-            0 if config["NUM_KSPLIT"] == 1 else y_pp.stride(0),
-            y.stride(0) if config["NUM_KSPLIT"] == 1 else y_pp.stride(1),
-            y.stride(1) if config["NUM_KSPLIT"] == 1 else y_pp.stride(2),
-            x_scale.stride(0),
-            x_scale.stride(1),
-            w_scale.stride(0),
-            w_scale.stride(1),
-            **config,
-            **extra_constexpr,
+            f"GEMM_A8W8 BLOCKSCALE [gluon/{arch}]: x={tuple(x.shape)} "
+            f"w={tuple(w.shape)} kernel={kernel_type}"
         )
     else:
         impl = triton_gemm_a8w8_blockscale_kernel
 
-        impl[grid](
-            x,
-            w,
-            y if config["NUM_KSPLIT"] == 1 else y_pp,
-            x_scale,
-            w_scale,
-            M,
-            N,
-            K,
-            x.stride(0),
-            x.stride(1),
-            w.stride(0),
-            w.stride(1),
-            0 if config["NUM_KSPLIT"] == 1 else y_pp.stride(0),
-            y.stride(0) if config["NUM_KSPLIT"] == 1 else y_pp.stride(1),
-            y.stride(1) if config["NUM_KSPLIT"] == 1 else y_pp.stride(2),
-            x_scale.stride(0),
-            x_scale.stride(1),
-            w_scale.stride(0),
-            w_scale.stride(1),
-            **config,
-        )
+    impl[grid](
+        x,
+        w,
+        y if config["NUM_KSPLIT"] == 1 else y_pp,
+        x_scale,
+        w_scale,
+        M,
+        N,
+        K,
+        x.stride(0),
+        x.stride(1),
+        w.stride(0),
+        w.stride(1),
+        0 if config["NUM_KSPLIT"] == 1 else y_pp.stride(0),
+        y.stride(0) if config["NUM_KSPLIT"] == 1 else y_pp.stride(1),
+        y.stride(1) if config["NUM_KSPLIT"] == 1 else y_pp.stride(2),
+        x_scale.stride(0),
+        x_scale.stride(1),
+        w_scale.stride(0),
+        w_scale.stride(1),
+        **config,
+        **extra_constexpr,
+    )
 
     if config["NUM_KSPLIT"] > 1:
         if skip_reduce:
@@ -301,7 +283,7 @@ def gemm_a8w8_blockscale_preshuffle(
     # Resolve backend up-front so the config is loaded from the backend's
     # config dir (gemm/<backend>/), falling back to the shared gemm/ dir.
     if backend is None:
-        backend = "gluon" if _is_gluon_available() else "triton"
+        backend = "gluon" if get_arch() in _GLUON_PRESHUFFLE_ARCHS else "triton"
     backend = backend.lower()
 
     if config is None:
@@ -371,9 +353,6 @@ def gemm_a8w8_blockscale_preshuffle(
     )
 
     extra_constexpr = {}
-    if backend is None:
-        backend = "gluon" if _is_gluon_available(preshuffle=True) else "triton"
-    backend = backend.lower()
     assert backend in (
         "triton",
         "gluon",
@@ -381,8 +360,8 @@ def gemm_a8w8_blockscale_preshuffle(
 
     if backend == "gluon":
         assert (
-            _is_gluon_available()
-        ), f"Gluon preshuffle requires one of {_GLUON_SUPPORTED_ARCHS}, got '{get_arch()}'"
+            get_arch() in _GLUON_PRESHUFFLE_ARCHS
+        ), f"Gluon preshuffle requires one of {_GLUON_PRESHUFFLE_ARCHS}, got '{get_arch()}'"
         from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_a8w8_blockscale import (
             _PRESHUFFLE_KERNEL_MAP,
         )
