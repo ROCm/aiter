@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2025 FlyDSL Project Contributors
-"""Fused stage1 with low-ID dispatch producers and oversubscribed FP8xFP4 grouped-GEMM1 consumers."""
+"""Fused stage1 with low-ID dispatch producers and FP8xFP4 grouped-GEMM1 consumers."""
 
 import functools
 from dataclasses import astuple
@@ -126,22 +126,29 @@ def compile_mega_moe_stage1(
         )
     planner_blocks = 1
     role_prefix_blocks = dispatch_blocks
+    bounded_compact_roles = not fixed_slot_dispatch and not deduplicate_payload
     if planner_blocks + role_prefix_blocks >= num_cu:
         raise ValueError(
             "planner and producer roles must leave at least one resident consumer CU"
         )
-    # Replace exactly the planner and producer CTAs that retire before GEMM.
-    # This preserves the configured consumer cohort without empty over-issue.
-    replacement_blocks = planner_blocks + role_prefix_blocks
-    if replacement_blocks <= 0:
-        raise ValueError("retired roles require a positive replacement cohort")
+    # Entry counters are shared by every configuration with the same grid
+    # multiplier, so their per-shard population must not vary with the number
+    # of dispatch CTAs.  Compact non-deduplicated roles are finite: keep the
+    # launch at the configured resident cohort and let those CTAs join the
+    # dynamic GEMM queue after their control work completes.
+    if bounded_compact_roles:
+        replacement_blocks = 0
+        launch_grid_x = num_cu * grid_mult
+    else:
+        replacement_blocks = planner_blocks + role_prefix_blocks
+        if replacement_blocks <= 0:
+            raise ValueError("retired roles require a positive replacement cohort")
+        launch_grid_x = num_cu * grid_mult + replacement_blocks
     DEDUP_EXPAND_BLOCKS = 96 if deduplicate_payload else 0
     if DEDUP_EXPAND_BLOCKS > replacement_blocks:
         raise ValueError("payload deduplication requires 96 replacement expanders")
-    total_grid_x = num_cu * grid_mult + replacement_blocks
-    grid_x = total_grid_x - planner_blocks - role_prefix_blocks
+    grid_x = launch_grid_x - planner_blocks - role_prefix_blocks
     assert grid_x > 0, "consumer grid must remain positive"
-    launch_grid_x = planner_blocks + role_prefix_blocks + grid_x
     assert launch_grid_x <= num_cu * 33 + 1
     M_REPEAT = sort_block_m // 16
     NUM_ACC_N = n_per_wave // 16
@@ -216,6 +223,7 @@ def compile_mega_moe_stage1(
     role_suffix = (
         f"_dedup{int(deduplicate_payload)}eb{DEDUP_EXPAND_BLOCKS}"
         f"rb{replacement_blocks}"
+        f"bc{int(bounded_compact_roles)}"
     )
     kernel_name = (
         f"megamoe_stage1_{dispatch_path}_t{sort_block_m}x{tile_n}x{tile_k}"
@@ -530,9 +538,14 @@ def compile_mega_moe_stage1(
                     fz_tile_m=fz_tile_m, n_tiles=N_TILES, addr_disp=addr_disp, parity=payload_parity,
                     expected=payload_expected,
                 )
-        # Primus-style role retirement: control CTAs stop before constructing any GEMM state;
-        # the over-issued cohort enters the unchanged dynamic consumer queue.
-        consumer_active = ticket > fx.Int32(role_prefix_blocks)
+        # Bounded compact control CTAs join the GEMM queue after their finite
+        # planner/producer work.  Other paths retain role retirement and its
+        # replacement cohort.
+        consumer_active = (
+            ticket >= fx.Int32(0)
+            if const_expr(bounded_compact_roles)
+            else ticket > fx.Int32(role_prefix_blocks)
+        )
         if consumer_active:
             if const_expr(not direct_fixed_slot):
                 payload_table = _buffer_load(disp_rsrc, fx.Int32(int(DispatchSlot.P2P_PAYLOAD_READY)), fx.Int64)

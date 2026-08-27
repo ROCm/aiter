@@ -67,20 +67,19 @@ def test_unique_epoch_distinguishes_both_parities():
 
 
 @pytest.mark.parametrize("dispatch_blocks", [64, 96, 128, 160, 192, 224])
-def test_control_roles_are_resident_and_consumers_backfill(
+def test_compact_control_roles_join_the_bounded_consumer_grid(
     dispatch_blocks: int,
 ):
     num_cu = 256
     role_prefix = 1 + dispatch_blocks
-    replacements = role_prefix
-    launch_grid = num_cu + replacements
+    launch_grid = num_cu
 
     assert role_prefix < num_cu
     first_resident = set(range(num_cu))
     assert set(range(role_prefix)) <= first_resident
     assert len(first_resident - set(range(role_prefix))) == num_cu - role_prefix
-    assert launch_grid - num_cu == replacements
-    assert launch_grid - role_prefix == num_cu
+    assert launch_grid == num_cu
+    assert (launch_grid - role_prefix) + role_prefix == num_cu
 
 
 def test_route_headers_index_one_dense_payload_per_source_destination():
@@ -97,38 +96,63 @@ def test_route_headers_index_one_dense_payload_per_source_destination():
     assert route_source_keys == (source_key,) * len(routes)
 
 
-def test_sharded_entry_counters_advance_one_generation_per_launch():
+@pytest.mark.parametrize("grid_mult", [1, 2, 3])
+def test_sharded_entry_counters_survive_cross_shape_dispatch_changes(grid_mult):
     shards = 16
-    launch_grids = tuple(
-        256 * grid_mult + 1 + dispatch_blocks
-        for grid_mult, dispatch_blocks in ((1, 64), (2, 64), (3, 128))
+    num_cu = 256
+    launch_grid = num_cu * grid_mult
+    dispatch_sequence = (
+        96,
+        96,
+        96,
+        64,
+        128,
+        224,
+        64,
     )
-    for launch_grid in launch_grids:
-        populations = tuple(
-            (launch_grid - 1 - shard) // shards + 1 for shard in range(shards)
-        )
-        assert sum(populations) == launch_grid
-        counters = [0] * shards
-        for generation in range(16):
-            for shard, population in enumerate(populations):
-                observed = {counters[shard] // population for _ in range(population)}
-                assert observed == {generation}
-                counters[shard] += population
+    populations = tuple(
+        (launch_grid - 1 - shard) // shards + 1 for shard in range(shards)
+    )
+    assert sum(populations) == launch_grid
+
+    counters = [0] * shards
+    for generation, dispatch_blocks in enumerate(dispatch_sequence):
+        assert 1 + dispatch_blocks < num_cu
+        for shard, population in enumerate(populations):
+            observed = {
+                (counters[shard] + ticket) // population for ticket in range(population)
+            }
+            assert observed == {generation}
+            counters[shard] += population
 
 
 @pytest.mark.parametrize("dispatch_blocks", [64, 96, 128, 160, 192, 224])
 @pytest.mark.parametrize("total_work", [0, 1, 350, 351, 352, 10_980, 65_537])
-def test_static_consumer_stride_covers_every_work_item_once(
+def test_control_roles_join_dynamic_queue_without_losing_work(
     total_work: int, dispatch_blocks: int
 ):
     num_cu = 256
-    launch_grid = num_cu + 1 + dispatch_blocks
-    consumer_blocks = launch_grid - 1 - dispatch_blocks
+    work_shards = 8
+    role_prefix = 1 + dispatch_blocks
+    initial_consumers = list(range(role_prefix, num_cu))
+    finite_control_roles = list(range(role_prefix))
+    consumer_order = initial_consumers + finite_control_roles
 
-    assert consumer_blocks == num_cu
+    assert sorted(consumer_order) == list(range(num_cu))
+    heads = [0] * work_shards
+    active = [True] * len(consumer_order)
     observed = []
-    for consumer_slot in range(consumer_blocks):
-        observed.extend(range(consumer_slot, total_work, consumer_blocks))
+    while any(active):
+        for index, ticket in enumerate(consumer_order):
+            if not active[index]:
+                continue
+            shard = ticket & (work_shards - 1)
+            work = shard + heads[shard] * work_shards
+            heads[shard] += 1
+            if work < total_work:
+                observed.append(work)
+            else:
+                active[index] = False
 
     assert sorted(observed) == list(range(total_work))
     assert len(observed) == len(set(observed))
