@@ -756,6 +756,12 @@ def _fused_moe_impl(
     ], f"Invalid MoE weight: {w1.shape=} {w2.shape=}"
     isG1U1 = inter_dim != w1.shape[1]
     isShuffled = getattr(w1, "is_shuffled", False) or getattr(w2, "is_shuffled", False)
+    # gfx1250: GUGU row-interleave, not 16-row block shuffle.
+    if get_gfx() == "gfx1250" and isG1U1 and gate_mode != GateMode.INTERLEAVE:
+        raise ValueError(
+            "gfx1250 fused_moe requires gu_interleave weight layout "
+            f"(gate_mode={GateMode.INTERLEAVE.value!r}), got {gate_mode.value!r}"
+        )
 
     global_E = E
     if expert_mask is not None:
