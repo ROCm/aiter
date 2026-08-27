@@ -68,8 +68,12 @@ The ``score_qk`` op runs two decode KV lengths at batch 512:
       --batch 512 --heads 64 --index_dim 128 -kv_length 10240 -mtp 0 \
       --kv_preshuffle --blocksize 64
 
-For the 1K-input/1K-output workload, the average decode context is 1536 source
-tokens. CSA compresses KV by 4, so score-QK scans an average KV length of 384.
+score-QK is a decode op, so its KV length is the average context one decode
+step scans -- input + output/2 -- after CSA's 4x KV compression:
+
+    1K in / 1K out   -> (1024  + 512)  / 4 =   384
+    16K in / 4K out  -> (16384 + 2048) / 4 =  4608
+    32K in / 16K out -> (32768 + 8192) / 4 = 10240
 
 The DSv4 ``mla_v4_decode`` op runs sparse decode with GQA/H=128, batch=512 and
 q_seq=1 (M=512), sweeping KV lengths 256/512/1024 and split counts 1/2/4.
@@ -210,6 +214,11 @@ with _silence():
 SUPPORTED_GFX = ["gfx1250"]
 # The gfx1250 launcher addresses gmem with 32-bit descriptors.
 _GMEM_DESCRIPTOR_LIMIT = 4 << 30
+# a16w16 N shapes at K=7168: attention/router projections, then lm_head twice
+# (129280 is the DeepSeek vocab, 32320 is that sharded over TP4).
+_A16W16_NS = (64, 384, 1024, 2048, 32320, 129280)
+_A16W16_WIDE_N = 2048
+_A16W16_WIDE_N_MAX_M = 2048
 
 
 def _tokens(name, default=None):
@@ -242,8 +251,21 @@ def _tokens(name, default=None):
 _TOKENS = _tokens("all", (1, 16, 32, 64, 128, 256, 512, 1024, 2048, 65536))
 _INVERSE_ROPE_TOKENS = _tokens("inverse_rope")
 _SCORE_QK_TOKENS = _tokens("score_qk")
+# score_qk is decode, so its KV length is the average context a decode step
+# scans: input + output/2, then CSA's 4x compression.
+#   1K in / 1K out  -> (1024  + 512)  / 4 =   384
+#   16K in / 4K out -> (16384 + 2048) / 4 =  4608
+#   32K in / 16K out-> (32768 + 8192) / 4 = 10240
+_SCORE_QK_KV_LENGTHS = (
+    ("1K/1K average", "384"),
+    ("16K/4K average", "4608"),
+    ("32K/16K average", "10240"),
+)
 _A8W8_BLOCKSCALE_TOKENS = _tokens("a8w8_blockscale")
-_MLA_DECODE_TOKENS = _tokens("mla_v4_decode", (t for t in _TOKENS if t <= 1024))
+# Pinned, not env-driven. Decode carries one token per sequence, so the token
+# axis here is the batch, and past 1024 it stops being a shape the model runs.
+# AITER_BENCH_TOKENS is deliberately not consulted for this op.
+_MLA_DECODE_TOKENS = (1, 16, 32, 64, 128, 256, 512, 1024)
 _MLA_PREFILL_TOKENS = _tokens("mla_v4_prefill", (t for t in _TOKENS if t >= 1024))
 
 
@@ -925,6 +947,12 @@ def run_f8gemm(args):
 
 def run_a8w8_blockscale(_args):
     """Run DSv4 FP8 blockscale linear projections at M=512."""
+    # AITER_LOG_MORE=1 is set at module scope for the FlyDSL MoE ops, and a
+    # child started with env=None inherits this process's whole environ. In this
+    # UT that turned a clean sweep into an intermittent HSA memory fault, so
+    # drop it for this child only -- every other op keeps it.
+    env = os.environ.copy()
+    env.pop("AITER_LOG_MORE", None)
     _run_child(
         "gemm_a8w8_blockscale (DSv4)",
         [
@@ -947,6 +975,7 @@ def run_a8w8_blockscale(_args):
             "--flydsl",
         ],
         cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        env=env,
     )
 
 
@@ -957,7 +986,15 @@ def run_a16w16(_args):
     # so capture the block and parse that line back out.
     batch, K = 1, 7168
     rows = []
-    for M, n in itertools.product(_TOKENS, (64, 384, 1024, 2048, 32320, 129280)):
+    for M, n in itertools.product(_TOKENS, _A16W16_NS):
+        # N=32320/129280 is lm_head (the DeepSeek vocab, whole and TP4-sharded).
+        # lm_head only ever sees one row per sequence, so a large M there is not
+        # a shape the model produces -- and M*N*2 passes 4 GiB anyway.
+        if n > _A16W16_WIDE_N and M > _A16W16_WIDE_N_MAX_M:
+            rows.append({"batch": batch, "M": M, "N": n, "K": K,
+                         "err_msg": f"skipped: N>{_A16W16_WIDE_N} is lm_head, "
+                                    f"capped at M<={_A16W16_WIDE_N_MAX_M}"})
+            continue
         # The gfx1250 launcher addresses gmem with 32-bit descriptors, so the
         # heuristic refuses any operand past 4 GiB (opus_gemm_arch_gfx1250.cuh)
         # and raises instead of running. Skip those rather than fail the sweep.
@@ -1100,7 +1137,7 @@ def run_score_qk(_args):
     ]
     # None => let the UT pick the batch, so run the KV lengths once each.
     for tokens, (label, kv_length) in itertools.product(
-        _SCORE_QK_TOKENS or (None,), (("1K/1K average", "384"), ("long", "10240"))
+        _SCORE_QK_TOKENS or (None,), _SCORE_QK_KV_LENGTHS
     ):
         _run_child(
             f"score_qk (decode, B={tokens or 'UT default'}, {label} CSA KV={kv_length})",
@@ -1347,10 +1384,10 @@ def run_inverse_rope(_args):
 
 
 def run_mla_v4_prefill(_args):
-    """Run DSv4 FP8 prefill at M=16K across two pools and CSR modes."""
+    """Run DSv4 prefill at M=16K across two precisions, pools and CSR modes."""
     for tokens in (16384, *_MLA_PREFILL_TOKENS):
         _run_child(
-            f"mla_v4 prefill (FP8, M={tokens}, prefix=4096/16384)",
+            f"mla_v4 prefill (M={tokens}, prec=fp8/bf16, pages=4096/16384)",
             [
                 sys.executable,
                 "op_tests/test_pa_sparse_prefill.py",
@@ -1367,13 +1404,26 @@ def run_mla_v4_prefill(_args):
                 str(tokens),
                 "--prec",
                 "fp8",
+                "bf16",
+                # bf16 takes the single-tensor Q/K/V/O kernel; only fp8 has an
+                # asm candidate, so the bf16 rows compare opus against triton
+                # and leave the asm columns empty.
                 "--mode",
                 "dense",
                 "sparse",
                 "--no-verify",
+                # Empty the nnz list: the UT runs the mode/total_pages sweep and
+                # the explicit-nnz sweep independently, and the latter is exactly
+                # what mla_v4_prefill_fp8 covers. Left on, every M repeats those
+                # five cases for nothing.
+                "--nnz-prefix",
             ],
             cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-            extract=_lines(_table_row("latency_us")),
+            # Not _table_row: the UT has no "latency_us" column (it prints
+            # "opus us"/"asm us"), so that predicate fell through to its
+            # starts-with-a-number rule, swallowed the profiler's kernel lines
+            # as data, and dropped the real header, which starts with "n".
+            extract=_space_table("total_pages"),
         )
 
 
@@ -1427,10 +1477,11 @@ PERF_OPS = ["mha", "moe", "f8gemm", "mla_v4_decode"]
 DSV4_OPS = [
     "mega_moe",
     "moe",
-    # "a8w8_blockscale" hits an intermittent HSA_STATUS_ERROR_MEMORY_FAULT on
-    # gfx1250 at the (m=512, n=7168, k=16384) shape -- it passed one run and
-    # aborted the next with the same binary.
-    # "a8w8_blockscale",
+    # Back in the sweep now that AITER_LOG_MORE no longer leaks into it (see
+    # run_a8w8_blockscale). It still fails on the 20260826-ut image, but earlier
+    # and for an unrelated reason: the gluon gemm_mxfp8 kernel cannot legalize
+    # tt.make_tensor_descriptor on gfx1250, 8/8 runs, with or without that var.
+    "a8w8_blockscale",
     "a16w16",
     "mla_v4_decode",
     "inverse_rope",
