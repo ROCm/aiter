@@ -49,4 +49,5 @@ void fmha_fwd_bf16_opus_fwd(at::Tensor& q,
                             std::optional<at::Tensor> seqstart_q_pad = std::nullopt,
                             std::optional<at::Tensor> seqstart_k_pad = std::nullopt,
                             int max_seqlen_q = 0,
-                            int max_seqlen_k = 0);
+                            int max_seqlen_k = 0,
+                            std::optional<at::Tensor> sink = std::nullopt);
