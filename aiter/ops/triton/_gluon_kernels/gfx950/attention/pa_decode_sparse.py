@@ -1740,6 +1740,7 @@ def _pa_decode_sparse(
     PART_STORE_CACHE: gl.constexpr,
     UNI_TILE: gl.constexpr,
     GRID_ORDER: gl.constexpr,
+    Q_CACHE: gl.constexpr,
     # MAIN_SPLITS <= NUM_SPLITS: splitting the SWA window past its tile count
     # only manufactures masked partial tiles, so main stops early and extra
     # keeps all programs (surplus ones get an empty main range).
@@ -1927,7 +1928,7 @@ def _pa_decode_sparse(
         gl.int32
     )
     q = gl.amd.cdna4.buffer_load(
-        ptr=q_ptr, offsets=q_off, mask=h_mask_q[:, None], other=0.0
+        ptr=q_ptr, offsets=q_off, mask=h_mask_q[:, None], other=0.0, cache=Q_CACHE
     )
     if FP8_MFMA and not Q_FP8:
         # bf16 q: quantize here, one e4m3 scale for this program's whole Q tile
@@ -1944,7 +1945,7 @@ def _pa_decode_sparse(
             + offs_d_qr[None, :]
         ).to(gl.int32)
         q_rope = gl.amd.cdna4.buffer_load(
-            ptr=q_ptr, offsets=qr_off, mask=h_mask_q[:, None], other=0.0
+            ptr=q_ptr, offsets=qr_off, mask=h_mask_q[:, None], other=0.0, cache=Q_CACHE
         )
         q_rope_dot = gl.convert_layout(q_rope, cfg.q_layout)
     else:

@@ -610,6 +610,9 @@ def _pa_decode_sparse_gfx950_gluon(
             heads_blocks = hb8
             num_splits = ns8
 
+    # Q is read once per query without split-K, and re-read by every split
+    q_cache = ".cg" if num_splits == 1 else ""
+
     if num_splits > 1:
         part_m = torch.empty(
             (num_queries, num_splits, num_heads), dtype=torch.float32, device=q.device
@@ -713,6 +716,7 @@ def _pa_decode_sparse_gfx950_gluon(
         NOPE_CHUNK=nope_chunk,
         CHUNK_AXIS=chunk_axis,
         PART_STORE_CACHE="",
+        Q_CACHE=q_cache,
         GRID_ORDER="qsh",
         # The partial last tile rides the full-tile body. Gluon inlines, so a peeled
         # masked copy would be a second gather+dequant+MFMA body, and its register

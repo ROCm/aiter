@@ -209,7 +209,7 @@ def sparse_mla_fwd(
         kv_indptr: ``[C + 1]`` int32 prefix sum of per-query index counts.
         kv_indices: flat int32 GLOBAL slot ids into the pool.
         softmax_scale: the layer's softmax scale.
-        kv_scale: ``[1]`` f32 per-tensor cache scale (``layer._k_scale``);
+        kv_scale: ``[1]`` f32 per-tensor cache scale;
             required for the flat fp8 format.
         kv_splits: split-K override; default follows the occupancy policy.
         skip_reduce: with split-K active, return ``(part_acc, part_m, part_l)``
@@ -227,11 +227,8 @@ def sparse_mla_fwd(
             asked for, fp8 q is passed straight through, and fp8 q under "bf16"
             dots is widened in-kernel, which is exact.
         q_scale: scalar f32. Required when q arrives already fp8 (the scale it
-            was quantized with; the aiter asm convention, where vLLM passes
-            the layer's calibrated ``_q_scale``). Optional when q is bf16 and
-            dot_precision="fp8": given, it is used as the static quantization
-            scale, matching production's scaled_fp8_quant(q, layer._q_scale);
-            omitted, a per-tensor amax is taken here.
+            was quantized with; the aiter asm convention. Optional when q is bf16 and
+            dot_precision="fp8".
         out: optional ``[C, H, >= kv_lora_rank]`` bf16 destination.
         return_lse: also return the natural-log log-sum-exp, [C, H] f32, for
             merging partials across context-parallel ranks. A fully masked row
@@ -379,6 +376,8 @@ def sparse_mla_fwd(
     # num_warps stays 4: warps tile the dot's N (MFMA N=16), so a larger BLOCK_K just
     # gives each warp two N tiles.
 
+    # Q is read once per query without split-K, and re-read by every split
+    q_cache = ".cg" if num_splits == 1 else ""
     grid = (num_queries, num_splits, heads_blocks)
     _pa_decode_sparse_gfx950[grid](
         q,
@@ -435,6 +434,7 @@ def sparse_mla_fwd(
         PART_STORE_CACHE="",
         UNI_TILE=True,
         GRID_ORDER="qsh",
+        Q_CACHE=q_cache,
         MAIN_SPLITS=num_splits,
         ADAPTIVE_SPLITS=num_splits > 1,
         ASM_DEQ=False,
