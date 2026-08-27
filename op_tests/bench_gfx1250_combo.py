@@ -190,6 +190,9 @@ with _silence():
     from aiter.test_common import run_perftest
 
 SUPPORTED_GFX = ["gfx1250"]
+_TOKENS = (1, 16, 32, 64, 128, 256, 512, 1024, 2048, 65536)
+_MLA_DECODE_TOKENS = tuple(t for t in _TOKENS if t <= 1024)
+_MLA_PREFILL_TOKENS = tuple(t for t in _TOKENS if t >= 1024)
 
 
 def _int_quad(s):
@@ -285,10 +288,10 @@ _MHA_KEEP = [
 ]
 # Curated (head_dim, seqlen, is_causal) grid — hq=64, hk=8(d64)/4(d128), batch=1.
 _MHA_SHAPES = [
-    (64, 32768, True),
-    (128, 16384, True),
-    (64, 32768, False),
-    (128, 16384, False),
+    (head_dim, tokens, causal)
+    for head_dim in (64, 128)
+    for tokens in _TOKENS
+    for causal in (True, False)
 ]
 _MOE_KEEP = [
     "data_format",
@@ -313,7 +316,7 @@ _MOE_KEEP = [
 _MOE_DATA_FORMATS = ["a4w4", "a8w4"]
 _MOE_CONFIG = {
     "experts": 96,
-    "tokens": 512,
+    "tokens": _TOKENS,
     "topk": 6,
     "model_dim": 7168,
     "inter_dim": 3072,
@@ -338,11 +341,13 @@ _GEMM_KEEP = [
     "asm result",
 ]
 # gemm_a4w4 throughput square.
-_GEMM_A4W4_SHAPE = (16384, 16384, 16384)
+_GEMM_A4W4_SHAPES = [(tokens, 16384, 16384) for tokens in _TOKENS]
 
 _F8GEMM_PERF_SHAPES = {
-    "a8w8": [(32768, 16384, 8192), (2, 1048576, 16384)],
-    "a8w4": [(16384, 16384, 16384), (2, 1048576, 16384)],
+    "a8w8": [(tokens, 16384, 8192) for tokens in _TOKENS]
+    + [(tokens, 1048576, 16384) for tokens in _TOKENS],
+    "a8w4": [(tokens, 16384, 16384) for tokens in _TOKENS]
+    + [(tokens, 1048576, 16384) for tokens in _TOKENS],
 }
 # Curated (gqa_ratio, batch, kv_seq_lens, num_kv_splits) grid for MLA v4 nm
 # kernarg-preload perf (mirrors op_tests/test_mla_v4_kargpreld.py sweep subset).
@@ -365,9 +370,22 @@ _MLA_V4_KARGPRELD_SHAPES = [
     (128, 64, 1024, 1),
     (128, 64, 1024, 2),
     (128, 64, 1024, 4),
+] + [
+    (gqa, tokens, kv_seq_lens, num_kv_splits)
+    for gqa in (64, 128)
+    for tokens in _MLA_DECODE_TOKENS
+    if tokens != 64
+    for kv_seq_lens in (256, 512, 1024)
+    for num_kv_splits in (1, 2, 4)
 ]
 _MLA_V4_DSV4_SHAPES = [
     (128, 512, kv_seq_lens, num_kv_splits)
+    for kv_seq_lens in (256, 512, 1024)
+    for num_kv_splits in (1, 2, 4)
+] + [
+    (128, tokens, kv_seq_lens, num_kv_splits)
+    for tokens in _MLA_DECODE_TOKENS
+    if tokens != 512
     for kv_seq_lens in (256, 512, 1024)
     for num_kv_splits in (1, 2, 4)
 ]
@@ -628,11 +646,10 @@ def run_mha(args):
 
 def run_moe(args):
     cfg = _MOE_CONFIG
-    tokens = cfg["tokens"]
     activation = moe_mod.ActivationType.Silu
     rows = []
     data_formats = ["a8w4"] if args.suite == "dsv4" else _MOE_DATA_FORMATS
-    for fmt in data_formats:
+    for tokens, fmt in itertools.product(cfg["tokens"], data_formats):
         with _silence():
             moe_mod.set_data_format(fmt)
             metrics = moe_mod.run_moe(
@@ -701,11 +718,11 @@ def run_moe(args):
 def run_gemm(args):
     # Hardware throughput sweep only. Functional/UT mode belongs in the source
     # op test and is intentionally not exposed by this performance driver.
-    M, N, K = _GEMM_A4W4_SHAPE
     init_pairs = [("constant", "constant"), ("uniform", "auto")]
     rows = []
     with _silence():
-        for (di, si), intype, outtype in itertools.product(
+        for (M, N, K), (di, si), intype, outtype in itertools.product(
+            _GEMM_A4W4_SHAPES,
             init_pairs,
             ["mxfp4", "nvfp4"],
             ["bf16", "fp8"],
@@ -764,7 +781,7 @@ def run_a8w8_blockscale(_args):
             sys.executable,
             "op_tests/test_gemm_a8w8_blockscale.py",
             "-m",
-            "512",
+            *map(str, _TOKENS),
             "-nk",
             "2048,7168",
             "7168,16384",
@@ -785,9 +802,9 @@ def run_a16w16(_args):
     # test_a16w16 returns only the error; its timing is printed as
     #   [a16w16] batch=1 M=512 N=64 K=7168 dtype=... | 7.8us | 12.05 TFLOPs | err=0
     # so capture the block and parse that line back out.
-    batch, M, K = 1, 512, 7168
+    batch, K = 1, 7168
     rows = []
-    for n in (64, 384, 1024, 2048, 32320, 129280):
+    for M, n in itertools.product(_TOKENS, (64, 384, 1024, 2048, 32320, 129280)):
         with _capture() as box:
             err = a16w16_mod.test_a16w16(batch=batch, M=M, N=n, K=K)
         row = {"batch": batch, "M": M, "N": n, "K": K, "err": err}
@@ -830,8 +847,6 @@ def run_mega_moe(_args):
         "3072",
         "--layers",
         "61",
-        "-tpr",
-        "512",
         "--acc_verify",
         "0",
         "--profile_table",
@@ -840,15 +855,18 @@ def run_mega_moe(_args):
     # AITER_FORCE_A8W4 selects the grouped kernel's ACTIVATION dtype (0 -> fp4,
     # 1 -> fp8); the weights are mxfp4 either way and -q only picks their layout,
     # so the env var and the quant key have to move together.
-    for quant, force_a8w4 in (("a4w4_mxfp4", "0"), ("a8w4_mxfp4", "1")):
-        for label, combine in (("non-Mega", "base"), ("Mega", "fused")):
-            _run_child(
-                f"mega_moe ({quant}, {label}, combine={combine})",
-                [*base_cmd, "-q", quant, "--combine", combine],
-                cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                env={**env, "AITER_FORCE_A8W4": force_a8w4},
-                extract=_md_kernel_table,
-            )
+    for tokens, (quant, force_a8w4), (label, combine) in itertools.product(
+        _TOKENS,
+        (("a4w4_mxfp4", "0"), ("a8w4_mxfp4", "1")),
+        (("non-Mega", "base"), ("Mega", "fused")),
+    ):
+        _run_child(
+            f"mega_moe (tokens/rank={tokens}, {quant}, {label}, combine={combine})",
+            [*base_cmd, "-tpr", str(tokens), "-q", quant, "--combine", combine],
+            cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            env={**env, "AITER_FORCE_A8W4": force_a8w4},
+            extract=_md_kernel_table,
+        )
 
 
 def run_mhc(_args):
@@ -861,7 +879,7 @@ def run_mhc(_args):
             "-n",
             "7168",
             "-m",
-            "512",
+            *map(str, _TOKENS),
             "--fuse_rmsnorm",
         ],
         cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -888,19 +906,15 @@ def run_qk_norm(_args):
         "--qweight",
     ]
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    for phase, tokens in (
-        ("prefill", ["16384"]),
-        ("decode", ["1", "2", "4", "8", "16", "32", "64"]),
-    ):
-        _run_child(
-            f"qk_norm ({phase})",
-            [*base_cmd, "-T", *tokens],
-            cwd=repo_root,
-            extract=_md_tables(
-                (("quant_group_size",), "rope + quant"),
-                (("rows_written",), "fused SWA write"),
-            ),
-        )
+    _run_child(
+        "qk_norm",
+        [*base_cmd, "-T", *map(str, _TOKENS)],
+        cwd=repo_root,
+        extract=_md_tables(
+            (("quant_group_size",), "rope + quant"),
+            (("rows_written",), "fused SWA write"),
+        ),
+    )
 
 
 def run_score_qk(_args):
@@ -909,8 +923,6 @@ def run_score_qk(_args):
     base_cmd = [
         sys.executable,
         "op_tests/op_benchmarks/triton/bench_deepgemm_attention.py",
-        "--batch",
-        "512",
         "--heads",
         "64",
         "--index_dim",
@@ -921,10 +933,12 @@ def run_score_qk(_args):
         "--blocksize",
         "64",
     ]
-    for label, kv_length in (("1K/1K average", "384"), ("long", "10240")):
+    for tokens, (label, kv_length) in itertools.product(
+        _TOKENS, (("1K/1K average", "384"), ("long", "10240"))
+    ):
         _run_child(
-            f"score_qk (decode, B=512, {label} CSA KV={kv_length})",
-            [*base_cmd, "-kv_length", kv_length],
+            f"score_qk (decode, B={tokens}, {label} CSA KV={kv_length})",
+            [*base_cmd, "--batch", str(tokens), "-kv_length", kv_length],
             cwd=repo_root,
             extract=_md_from_pandas(
                 "paged_mqa_logits:",
@@ -1148,32 +1162,33 @@ def run_mla_v4_decode(args):
 
 def run_mla_v4_prefill(_args):
     """Run DSv4 FP8 prefill at M=16K across two pools and CSR modes."""
-    _run_child(
-        "mla_v4 prefill (FP8, M=16384, prefix=4096/16384)",
-        [
-            sys.executable,
-            "op_tests/test_pa_sparse_prefill_opus.py",
-            "-n",
-            "16384",
-            "--h_q",
-            "128",
-            "-d",
-            "512",
-            "--total_pages",
-            "4096",
-            "16384",
-            "--total_tokens",
-            "16384",
-            "--prec",
-            "fp8",
-            "--mode",
-            "dense",
-            "sparse",
-            "--no-verify",
-        ],
-        cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-        extract=_lines(_table_row("latency_us")),
-    )
+    for tokens in (16384, *_MLA_PREFILL_TOKENS):
+        _run_child(
+            f"mla_v4 prefill (FP8, M={tokens}, prefix=4096/16384)",
+            [
+                sys.executable,
+                "op_tests/test_pa_sparse_prefill_opus.py",
+                "-n",
+                str(tokens),
+                "--h_q",
+                "128",
+                "-d",
+                "512",
+                "--total_pages",
+                "4096",
+                "16384",
+                "--total_tokens",
+                str(tokens),
+                "--prec",
+                "fp8",
+                "--mode",
+                "dense",
+                "sparse",
+                "--no-verify",
+            ],
+            cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            extract=_lines(_table_row("latency_us")),
+        )
 
 
 def run_mla_v4_prefill_fp8(_args):
@@ -1182,7 +1197,16 @@ def run_mla_v4_prefill_fp8(_args):
     env["PYTHONPATH"] = "."
     _run_child(
         "mla_v4 prefill FP8 (sparse-prefill default sweep)",
-        [sys.executable, "op_tests/test_pa_sparse_prefill.py"],
+        [
+            sys.executable,
+            "op_tests/test_pa_sparse_prefill.py",
+            "-n",
+            "512",
+            "1024",
+            "2048",
+            "4096",
+            "65536",
+        ],
         cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
         env=env,
         extract=_lines(_table_row("opus us", "triton us", "asm us")),

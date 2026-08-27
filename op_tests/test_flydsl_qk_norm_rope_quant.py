@@ -411,7 +411,7 @@ def test_flydsl_qk_norm_rope_quant_cos_sin_4d():
 # exercise the gate.
 
 _SWA_BLOCK_SIZE = 8  # small, so a block-index overrun is reachable at modest T
-_SWA_MAX_BLOCKS = 4
+_SWA_MAX_BLOCKS = 33  # 32 usable blocks/sequence covers up to 1024 tokens
 _SWA_BS = 4  # sequences in the paged block table
 _SWA_GUARD_ROWS = 16
 
@@ -766,10 +766,9 @@ def main():
         args.swa_mode,
         args.H,
         args.D,
-        # decode range: the scatter is decode-only, and the paged layout holds
-        # _SWA_BS * (max_blocks-1) * block_size == 96 tokens (the last block is
-        # reserved for the out-of-window sentinel).
-        [t for t in args.T if 8 <= t <= 96] or [16, 64],
+        # Decode-only sweep through 1024 tokens. The last paged-table block is
+        # reserved for the out-of-window sentinel.
+        [t for t in args.T if 1 <= t <= 1024] or [16, 64],
     ):
         swa_rows.append(test_flydsl_swa_write(T, H, D, args.RD, mode))
     aiter.logger.info(
