@@ -41,26 +41,24 @@ Run from the aiter repo root so `op_tests/` siblings import cleanly:
 Environment
 -----------
 
-Token sweeps. Comma- or space-separated; the per-op name wins over the global
-one, and with neither set each op falls back to its own default:
+One variable, applied to every op that sweeps a token count:
 
-    AITER_BENCH_TOKENS=1,128,512                  every op that reads tokens
-    AITER_BENCH_TOKENS_INVERSE_ROPE=1,8,128       one op (suffix = op name,
-    AITER_BENCH_TOKENS_SCORE_QK=...               uppercased)
-    AITER_BENCH_TOKENS_A8W8_BLOCKSCALE=...
-    AITER_BENCH_TOKENS_MLA_V4_PREFILL=...
-    AITER_BENCH_TOKENS_MLA_V4_PREFILL_FP8=...
+    AITER_BENCH_TOKENS=1,128,512 python op_tests/bench_gfx1250_combo.py --dsv4
 
-``mla_v4_decode`` is deliberately NOT on that list: its tokens are pinned to
-1..1024 in the source. Decode carries one token per sequence, so the axis is
-the batch, and a stray global AITER_BENCH_TOKENS=65536 would otherwise turn it
-into a shape the model never runs.
+Two ops ignore it and pin their sweep in the source, because a global token
+count would mean the wrong thing for them:
 
-The ops driven by a child UT (inverse_rope, score_qk, a8w8_blockscale,
-mla_v4_prefill_fp8) pass no shape flag at all when their variable is unset, so
-the UT keeps whatever range its owner maintains. The in-process ops (moe,
-a16w16, mha, mla_v4_decode, mla_v4_prefill) iterate shapes here, so they always
-need a default and take it from the module.
+    mla_v4_decode   1..1024. Decode carries one token per sequence, so the
+                    axis is really the batch; AITER_BENCH_TOKENS=65536 would
+                    ask for a shape the model never runs.
+    inverse_rope    1..16384. The axis is -s at a fixed -b 128,16, and 65536
+                    faults -- in the triton reference the UT compares against,
+                    not in the kernel under test.
+
+With the variable unset, the child-UT ops (score_qk, a8w8_blockscale,
+mla_v4_prefill_fp8) pass no shape flag at all, so each UT sweeps the range its
+owner maintains. The in-process ops (moe, a16w16, mha, mla_v4_prefill) iterate
+shapes here and take their default from the module.
 
 Other variables:
 
@@ -264,25 +262,18 @@ _A16W16_WIDE_N = 2048
 _A16W16_WIDE_N_MAX_M = 2048
 
 
-def _tokens(name, default=None):
-    """Token sweep for one op, from the environment.
+def _tokens(default=None):
+    """Token sweep from AITER_BENCH_TOKENS, else the op's own default.
 
-    Ops do not share a supported range -- some shapes are refused by a kernel
-    heuristic, some fault the GPU -- and the useful range also shifts while
-    chasing a regression. AITER_BENCH_TOKENS sets the sweep for every op and
-    AITER_BENCH_TOKENS_<OP> overrides one, e.g.
+    One variable for the whole bench. Ops whose axis is not a token count, or
+    whose usable range is fixed, ignore it and pin their sweep in the source
+    instead -- see _MLA_DECODE_TOKENS and _INVERSE_ROPE_TOKENS.
 
-        AITER_BENCH_TOKENS=1,128,512 \\
-        AITER_BENCH_TOKENS_INVERSE_ROPE=1,8,128 \\
-          python op_tests/bench_gfx1250_combo.py --dsv4
-
-    Returns None when nothing is set and the op has no default of its own: the
-    op then passes no shape flag at all and the UT sweeps its own default, which
-    is the range its owner keeps working.
+    Returns None when the variable is unset and the op has no default of its
+    own: the op then passes no shape flag at all and the UT sweeps its own
+    default, which is the range its owner keeps working.
     """
-    raw = os.environ.get(f"AITER_BENCH_TOKENS_{name.upper()}") or os.environ.get(
-        "AITER_BENCH_TOKENS"
-    )
+    raw = os.environ.get("AITER_BENCH_TOKENS")
     if raw:
         return tuple(int(t) for t in raw.replace(",", " ").split())
     return tuple(default) if default is not None else None
@@ -291,9 +282,13 @@ def _tokens(name, default=None):
 # The in-process ops call their UT per shape, so they need a sweep to iterate;
 # keep one here. The ops that shell out pass no shape flag unless asked, letting
 # each UT sweep the range its owner maintains.
-_TOKENS = _tokens("all", (1, 16, 32, 64, 128, 256, 512, 1024, 2048, 65536))
-_INVERSE_ROPE_TOKENS = _tokens("inverse_rope")
-_SCORE_QK_TOKENS = _tokens("score_qk")
+_TOKENS = _tokens((1, 16, 32, 64, 128, 256, 512, 1024, 2048, 65536))
+# Pinned, not env-driven. This axis is -s (sequence length) at a fixed
+# -b 128,16, not the token count the other ops sweep, so a global setting would
+# mean something different here. 65536 is left off: it faults, and in the
+# triton reference the UT compares against rather than the kernel under test.
+_INVERSE_ROPE_TOKENS = (1, 16, 32, 64, 128, 256, 512, 1024, 2048, 16384)
+_SCORE_QK_TOKENS = _tokens()
 # score_qk is decode, so its KV length is the average context a decode step
 # scans: input + output/2, then CSA's 4x compression.
 #   1K in / 1K out  -> (1024  + 512)  / 4 =   384
@@ -304,7 +299,7 @@ _SCORE_QK_KV_LENGTHS = (
     ("16K/4K average", "4608"),
     ("32K/16K average", "10240"),
 )
-_A8W8_BLOCKSCALE_TOKENS = _tokens("a8w8_blockscale")
+_A8W8_BLOCKSCALE_TOKENS = _tokens()
 # Pinned, not env-driven. Decode carries one token per sequence, so the token
 # axis here is the batch, and past 1024 it stops being a shape the model runs.
 # AITER_BENCH_TOKENS is deliberately not consulted for this op.
@@ -312,11 +307,9 @@ _MLA_DECODE_TOKENS = (1, 16, 32, 64, 128, 256, 512, 1024)
 # 16384 is the DSv4 prefill chunk and leads the default, but it is part of the
 # default rather than pinned ahead of it: at M=16K one sweep is eight combos
 # against a per-token PyTorch reference, so it has to be possible to drop.
-_MLA_PREFILL_TOKENS = _tokens(
-    "mla_v4_prefill", (16384, *(t for t in _TOKENS if t >= 1024))
-)
+_MLA_PREFILL_TOKENS = _tokens((16384, *(t for t in _TOKENS if t >= 1024)))
 # Unset by default so the UT keeps its own -n ([512, 1024, 2048, 4096]).
-_MLA_PREFILL_FP8_TOKENS = _tokens("mla_v4_prefill_fp8")
+_MLA_PREFILL_FP8_TOKENS = _tokens()
 
 
 def _int_quad(s):
