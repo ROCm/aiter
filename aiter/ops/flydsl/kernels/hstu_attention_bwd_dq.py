@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+
 """hstu_attention_bwd_dq - FlyDSL kernel (causal-only; computes dQ)
 
 Companion to hstu_attention_bwd.py. That kernel is KV-owned and produces dV/dK
@@ -116,7 +119,10 @@ def build_hstu_attention_bwd_dq(
     HC_CHUNKS = head_dim // MFMA_M  # dQ accumulator chunks (over head_dim)
 
     num_q_tiles = (max_seq_len + BLOCK_M - 1) // BLOCK_M
-    hz_per_group = (batch * num_heads) // NUM_GRID_GROUPS
+    HZ_TOTAL = batch * num_heads
+    # Ceil (see hstu_attention_bwd.py): batch*num_heads need not divide
+    # NUM_GRID_GROUPS; the padded tail of the last group retires without work.
+    hz_per_group = (HZ_TOTAL + NUM_GRID_GROUPS - 1) // NUM_GRID_GROUPS
 
     stride_qk_n = num_heads * head_dim
 
@@ -193,6 +199,10 @@ def build_hstu_attention_bwd_dq(
         local_hz_idx = pos_in_group // fx.Int32(num_q_tiles)
         q_tile_idx = pos_in_group % fx.Int32(num_q_tiles)
         hz_idx = grid_group * fx.Int32(hz_per_group) + local_hz_idx
+        # Padded tail of the last group (see hstu_attention_bwd.py): clamp to hz_idx=0
+        # for in-bounds reads, then seq_len=0 makes every query tile inactive.
+        block_valid = hz_idx < fx.Int32(HZ_TOTAL)
+        hz_idx = block_valid.select(hz_idx, fx.Int32(0))
         batch_idx = hz_idx // fx.Int32(num_heads)
         head_idx = hz_idx % fx.Int32(num_heads)
         # Optional sort-by-length load balancing (see hstu_attention_bwd.py).
@@ -201,6 +211,7 @@ def build_hstu_attention_bwd_dq(
 
         seq_start = fx.Int32(seq_offsets[batch_idx])
         seq_len = fx.Int32(seq_offsets[batch_idx + fx.Int32(1)]) - seq_start
+        seq_len = block_valid.select(seq_len, fx.Int32(0))
 
         # ---- Masked-id clamps (contextual shift then target-tail clamp; oracle order) ----
         num_target = fx.Int32(0)
@@ -694,7 +705,7 @@ def build_hstu_attention_bwd_dq(
         dq: fx.Tensor,
         stream: fx.Stream,
     ) -> None:
-        grid = num_q_tiles * batch * num_heads
+        grid = num_q_tiles * hz_per_group * NUM_GRID_GROUPS
         hstu_attention_bwd_dq(
             q,
             k,

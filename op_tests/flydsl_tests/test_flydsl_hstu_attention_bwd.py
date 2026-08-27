@@ -110,13 +110,6 @@ def hstu_bwd_reference_causal_dense(N, alpha, q, k, v, seq_offsets, dout):
 # --------------------------------------------------------------------------- #
 # Gradient comparison
 # --------------------------------------------------------------------------- #
-
-# Tolerances are a fraction of the oracle's peak magnitude, not absolute. These
-# gradients run ~3e-3, so a fixed atol=3e-2 is larger than the data and would pass
-# on all-zero output. The error floor itself comes from the bf16/f16 inputs and the
-# fast-math (non-IEEE) SiLU recompute; dQ/dK carry extra matmuls (the dA and dS
-# reductions) so they accumulate more than dV. Measured headroom is ~5x: every
-# supported shape lands at 0.3-0.4% against the fp32 oracle.
 TOL_DV = 2e-2
 TOL_DQK = 3e-2
 
@@ -283,10 +276,6 @@ def test_validate_bwd_inputs_rejects_cpu_tensors():
 
 # --------------------------------------------------------------------------- #
 # Dense causal correctness across problem shapes
-#
-# Orthogonal to the mask-variant sweep above: that one pins the shape and varies
-# the masking features, this one pins dense causal and varies
-# batch/heads/dims/seq_len to cover single-tile through multi-tile grids.
 # --------------------------------------------------------------------------- #
 
 
@@ -298,6 +287,8 @@ def test_validate_bwd_inputs_rejects_cpu_tensors():
         (8, 1, 64, 64, 256),  # single/few tiles
         (8, 4, 64, 64, 512),  # multi-tile
         (16, 2, 128, 128, 1024),  # larger, multi-tile
+        (3, 4, 64, 64, 256),  # batch*heads=12: grid pads the last group
+        (5, 1, 64, 64, 256),  # batch*heads=5 < NUM_GRID_GROUPS: mostly padding
     ],
 )
 def test_flydsl_bwd_dense_causal_shapes(
@@ -558,3 +549,24 @@ def test_flydsl_autograd_end_to_end(max_attn_len, contextual_seq_len, target_siz
     out.backward(dout)
 
     assert_grads_close(qd.grad, kd.grad, vd.grad, dq_ref, dk_ref, dv_ref)
+
+
+@requires_cuda
+def test_flydsl_autograd_rejects_non_causal():
+    """causal=False must fail in forward, not later inside .backward()."""
+    q, k, v, seq_offsets, _ = generate_hstu_attn_inputs(
+        batch_size=8,
+        max_seq_len=256,
+        sparsity=0.5,
+        heads=4,
+        attn_dim=64,
+        hidden_dim=64,
+        target_size=0,
+        dtype=torch.bfloat16,
+        device=torch.device("cuda"),
+    )
+
+    with pytest.raises(ValueError, match="causal"):
+        flydsl_hstu_attention(
+            256, 1.0 / 64 * 10000, q, k, v, seq_offsets, False, None, 0, 0
+        )

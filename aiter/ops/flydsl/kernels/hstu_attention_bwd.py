@@ -23,7 +23,7 @@ are single-writer.
 Constraints:
   - causal + mask variants (num_targets / max_attn_len / contextual_seq_len).
   - dtype in {f16, bf16}; accumulate in fp32.
-  - head_dim % 16 == 0, hidden_dim % 16 == 0; (batch*num_heads) % 8 == 0.
+  - head_dim % 16 == 0, hidden_dim % 16 == 0.
   - block_m must be a multiple of num_waves*16.
   - fast/unsafe FP math: not strict IEEE-754 (mirrors the forward's SiLU).
 """
@@ -141,10 +141,6 @@ def validate_hstu_attention_bwd(
         raise ValueError(
             f"hidden_dim must be positive and a multiple of MFMA_M={MFMA_M}, got {hidden_dim}"
         )
-    if (batch * num_heads) % NUM_GRID_GROUPS != 0:
-        raise ValueError(
-            f"require (batch*num_heads) % {NUM_GRID_GROUPS} == 0, got {batch * num_heads}"
-        )
 
     if block_m <= 0:
         raise ValueError(f"block_m must be positive, got {block_m}")
@@ -256,7 +252,10 @@ def build_hstu_attention_bwd_dvdk(
     HC_CHUNKS = head_dim // MFMA_M
 
     num_kv_tiles = (max_seq_len + BLOCK_M - 1) // BLOCK_M
-    hz_per_group = (batch * num_heads) // NUM_GRID_GROUPS
+    HZ_TOTAL = batch * num_heads
+    # Ceil, so batch*num_heads need not divide NUM_GRID_GROUPS; the last group is
+    # padded and its out-of-range blocks retire without doing work (see the decode).
+    hz_per_group = (HZ_TOTAL + NUM_GRID_GROUPS - 1) // NUM_GRID_GROUPS
     stride_qk_n = num_heads * head_dim
 
     Q_STRIDE = HEAD_DIM_K
@@ -331,6 +330,13 @@ def build_hstu_attention_bwd_dvdk(
         local_hz_idx = pos_in_group // fx.Int32(num_kv_tiles)
         kv_tile_idx = pos_in_group % fx.Int32(num_kv_tiles)
         hz_idx = grid_group * fx.Int32(hz_per_group) + local_hz_idx
+        # hz_per_group is a ceil, so the padded tail of the last group runs past
+        # batch*num_heads. Those blocks clamp to hz_idx=0 to keep the seq_offsets /
+        # perm / num_targets reads in bounds, then take seq_len=0 below: every KV tile
+        # is then inactive, so they stream no query tiles and store nothing (rows past
+        # seq_len belong to the next sequence in the packed layout).
+        block_valid = hz_idx < fx.Int32(HZ_TOTAL)
+        hz_idx = block_valid.select(hz_idx, fx.Int32(0))
         batch_idx = hz_idx // fx.Int32(num_heads)
         head_idx = hz_idx % fx.Int32(num_heads)
 
@@ -342,6 +348,7 @@ def build_hstu_attention_bwd_dvdk(
 
         seq_start = fx.Int32(seq_offsets[batch_idx])
         seq_len = fx.Int32(seq_offsets[batch_idx + fx.Int32(1)]) - seq_start
+        seq_len = block_valid.select(seq_len, fx.Int32(0))
 
         num_target = fx.Int32(0)
         if has_targets:
@@ -883,7 +890,7 @@ def build_hstu_attention_bwd_dvdk(
         out_dk: fx.Tensor,
         stream: fx.Stream,
     ) -> None:
-        grid = num_kv_tiles * batch * num_heads
+        grid = num_kv_tiles * hz_per_group * NUM_GRID_GROUPS
         hstu_attention_bwd_dvdk(
             q,
             k,

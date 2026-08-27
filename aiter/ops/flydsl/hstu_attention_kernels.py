@@ -997,6 +997,11 @@ class FlydslHstuAttention(torch.autograd.Function):
         max_attn_len: int,
         contextual_seq_len: int,
     ) -> torch.Tensor:
+        # Supports only the causal and hstu (causal + targets) masks; reject here
+        # rather than in backward.
+        if not causal:
+            raise ValueError("flydsl_hstu_attention requires causal=True")
+
         saved_tensors = [q, k, v, seq_offsets]
         if num_targets is not None:
             saved_tensors.append(num_targets)
