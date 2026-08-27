@@ -1270,8 +1270,8 @@ def mha_v4(
     ``block_mask`` is optional boolean tile metadata: ``[B, H, Qtiles, KVtiles]``
     or ``[B, Qtiles, KVtiles]`` (broadcast heads). Geometry is 256x128 on gfx950
     and 256x64 on gfx942. Sparse LUT rows are one per query head; K/V addressing
-    uses the GQA ratio. Every row must select at least one KV block; an all-False
-    row is invalid input, not a request for a zero output tile.
+    uses the GQA ratio. A row may select nothing: an all-False row is a no-op
+    that writes a zero output tile.
     """
     if return_lse:
         raise NotImplementedError("MHA v4 kernels do not produce LSE yet")

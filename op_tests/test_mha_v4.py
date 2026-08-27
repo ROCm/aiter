@@ -1456,6 +1456,151 @@ def test_mha_v4_sparse_follows_the_lut_across_query_tiles():
         ), f"query tile {q_tile} did not attend to tiles {tiles}"
 
 
+def _gfx950_only(launch, label):
+    return pytest.param(
+        launch,
+        id=label,
+        marks=pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MX sparse"),
+    )
+
+
+# An FP8 Q always canonicalizes to per-tensor scales, so MXFP8 is unreachable through raw mha_v4
+# and goes through its own entry point instead.
+_EMPTY_ROW_LAUNCHES = [
+    pytest.param(
+        lambda q, k, v, m: mha_v4(
+            q,
+            k,
+            v,
+            native_fp8_format(),
+            native_fp8_format(),
+            native_fp8_format(),
+            block_mask=m,
+        ),
+        id="fp8",
+    ),
+    pytest.param(
+        lambda q, k, v, m: mha_v4(
+            q,
+            k,
+            v,
+            AttentionFormat.INT8,
+            AttentionFormat.INT8,
+            native_fp8_format(),
+            block_mask=m,
+        ),
+        id="i8fp8",
+    ),
+    _gfx950_only(lambda q, k, v, m: mha_v4_mxfp8(q, k, v, block_mask=m), "mxfp8"),
+    _gfx950_only(
+        lambda q, k, v, m: mha_v4(
+            q,
+            k,
+            v,
+            native_fp8_format(),
+            native_fp8_format(),
+            AttentionFormat.MXFP6,
+            block_mask=m,
+        ),
+        "f8f6",
+    ),
+    _gfx950_only(
+        lambda q, k, v, m: mha_v4(
+            q,
+            k,
+            v,
+            AttentionFormat.MXFP6,
+            AttentionFormat.MXFP6,
+            native_fp8_format(),
+            block_mask=m,
+        ),
+        "mxfp6",
+    ),
+    _gfx950_only(
+        lambda q, k, v, m: mha_v4(
+            q,
+            k,
+            v,
+            AttentionFormat.MXFP6,
+            AttentionFormat.MXFP6,
+            AttentionFormat.MXFP4,
+            block_mask=m,
+        ),
+        "f6f4",
+    ),
+    _gfx950_only(
+        lambda q, k, v, m: mha_v4(
+            q,
+            k,
+            v,
+            AttentionFormat.MXFP4,
+            AttentionFormat.MXFP4,
+            native_fp8_format(),
+            block_mask=m,
+        ),
+        "mxfp4",
+    ),
+    _gfx950_only(
+        lambda q, k, v, m: mha_v4(
+            q,
+            k,
+            v,
+            AttentionFormat.MXFP4,
+            AttentionFormat.MXFP4,
+            AttentionFormat.MXFP4,
+            block_mask=m,
+        ),
+        "f4f4",
+    ),
+]
+
+
+@pytest.mark.skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 sparse validation")
+@pytest.mark.skipif(
+    not _mha_v4_sparse_co_available(),
+    reason="sorted-sparse MHA v4 code object is not deployed",
+)
+@pytest.mark.parametrize("launch", _EMPTY_ROW_LAUNCHES)
+def test_mha_v4_sparse_empty_row_writes_zeros(launch):
+    """An all-False row selects no KV block, so its output tile must be zero, not garbage.
+
+    Its lut_start also sits one past the last kv_block_indices entry, which is what used to walk
+    the prologue's unguarded reads into a multi-gigabyte scalar offset and fault the kernel.
+    """
+    heads = 2
+    kv_tiles = 4
+    selected = (0, 1)
+    torch.manual_seed(0)
+    q = torch.randn((1, 256, heads, 128), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(
+        (1, kv_tiles * mha_v4_kv_tile(), heads, 128),
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    v = torch.randn_like(k)
+
+    mask = torch.zeros((1, heads, 1, kv_tiles), device="cuda", dtype=torch.bool)
+    for tile in selected:
+        mask[:, 0, :, tile] = True  # head 0 selects two tiles; head 1 stays all-False
+    out = launch(q, k, v, mask)
+    torch.cuda.synchronize()
+
+    assert torch.equal(
+        out[:, :, 1], torch.zeros_like(out[:, :, 1])
+    ), "empty row is not zero"
+    assert torch.isfinite(out).all(), "empty row leaked NaN or infinity"
+    assert out[:, :, 0].abs().max() > 0, "live row came back degenerate"
+
+    # The empty row must not perturb the row that does select tiles: give head 1 a tile and head 0's
+    # output has to stay bit-identical, since each workgroup owns one (batch, head, query tile).
+    mask[:, 1, :, 0] = True
+    populated = launch(q, k, v, mask)
+    torch.cuda.synchronize()
+    assert torch.equal(
+        out[:, :, 0], populated[:, :, 0]
+    ), "empty row disturbed the live row"
+
+
 def test_mha_v4_rejects_non_bool_block_mask():
     """Counts come from a sum but the fill uses truthiness, so non-bool masks disagree."""
     q = torch.zeros((1, 256, 2, 128), dtype=torch.bfloat16)
@@ -1497,8 +1642,8 @@ def test_mha_v4_rejects_block_mask_on_another_device():
     not _mha_v4_sparse_co_available(),
     reason="sorted-sparse MHA v4 code object is not deployed",
 )
-def test_mha_v4_sparse_rejects_undersized_kv_block_indices():
-    """Every row needs an entry, so a short index buffer is rejected before the ASM reads it."""
+def test_mha_v4_sparse_rejects_empty_kv_block_indices():
+    """Rows may be empty, but the ASM still dereferences the row base, so the buffer cannot be."""
     heads = 2
     kv_tile = mha_v4_kv_tile()
     kv_tiles = 4
@@ -1506,7 +1651,7 @@ def test_mha_v4_sparse_rejects_undersized_kv_block_indices():
     rows = heads  # batch 1, one query tile
     device = q.quantized.device
     fp8_format = native_fp8_format()
-    with pytest.raises(RuntimeError, match="at least one entry per"):
+    with pytest.raises(RuntimeError, match="must be non-empty"):
         mha_v4_packed(
             q.quantized,
             k.quantized,
@@ -1520,7 +1665,7 @@ def test_mha_v4_sparse_rejects_undersized_kv_block_indices():
             AttentionScaleMode.F32_PER_TENSOR,
             AttentionScaleMode.F32_PER_TENSOR,
             AttentionScaleMode.F32_PER_TENSOR,
-            kv_block_indices=torch.zeros(rows - 1, dtype=torch.int32, device=device),
+            kv_block_indices=torch.zeros(0, dtype=torch.int32, device=device),
             lut_start=torch.zeros(rows, dtype=torch.int32, device=device),
             lut_count=torch.ones(rows, dtype=torch.int32, device=device),
         )
@@ -1538,11 +1683,6 @@ def test_mha_v4_sparse_rejects_undersized_kv_block_indices():
 @pytest.mark.parametrize(
     "mutate,message",
     [
-        pytest.param(
-            lambda indices, start, count: count.fill_(0),
-            "lut_count == 0",
-            id="empty_row",
-        ),
         pytest.param(
             lambda indices, start, count: indices.fill_(9999),
             "outside",

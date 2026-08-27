@@ -372,14 +372,14 @@ build_sorted_work_table(const at::Tensor& lut_count, int64_t batch, int64_t nhea
 }
 
 // LUT contents are device data, so the launcher cannot check them without a synchronization. This
-// is therefore opt-in: off, an out-of-range index or an empty row reaches the ASM and faults with
-// only a raw address to go on; on, it fails at the launcher with the offending condition named.
+// is therefore opt-in: off, an out-of-range index reaches the ASM and faults with only a raw address
+// to go on; on, it fails at the launcher with the offending condition named. A row with
+// lut_count == 0 is not an error: the ASM skips it and writes zeros for that query tile.
 enum LutError : int32_t
 {
     kLutNegative   = 1 << 0,
     kLutOverrun    = 1 << 1,
     kLutIndexRange = 1 << 2,
-    kLutEmptyRow   = 1 << 3,
 };
 
 __global__ void validate_lut_kernel(const int32_t* __restrict__ lut_start,
@@ -401,11 +401,8 @@ __global__ void validate_lut_kernel(const int32_t* __restrict__ lut_start,
         atomicOr(error, kLutNegative);
         return;
     }
-    if(count == 0)
-    {
-        atomicOr(error, kLutEmptyRow);
-        return;
-    }
+    // count == 0 is legal and needs no bound: start may sit one past the last entry, and the loop
+    // below reads nothing.
     if(static_cast<int64_t>(start) + count > kv_index_numel)
     {
         atomicOr(error, kLutOverrun);
@@ -450,9 +447,6 @@ void validate_lut_contents(const at::Tensor& kv_block_indices,
                                                           error.data_ptr<int32_t>());
     const int32_t flags = error.cpu().item<int32_t>();
     TORCH_CHECK(!(flags & kLutNegative), "MHA v4 sparse LUT has a negative lut_start or lut_count");
-    TORCH_CHECK(!(flags & kLutEmptyRow),
-                "MHA v4 sparse LUT has a row with lut_count == 0; every (batch, head, query tile) "
-                "must select at least one KV block");
     TORCH_CHECK(!(flags & kLutOverrun),
                 "MHA v4 sparse LUT has a row whose lut_start + lut_count exceeds "
                 "kv_block_indices.numel() (",
@@ -822,15 +816,13 @@ void fmha_v4_fwd_sparse(const at::Tensor& q,
                 ")");
     TORCH_CHECK(kv_block_indices.dim() == 1 && lut_start.dim() == 1 && lut_count.dim() == 1,
                 "LUT tensors must be 1-D");
-    // Every row must select at least one KV block, so a valid LUT indexes at least lut_rows
-    // entries. This is the only content bound derivable without reading device data; the rest is
-    // behind AITER_MHA_V4_VALIDATE_LUT.
-    TORCH_CHECK(kv_block_indices.numel() >= lut_rows,
-                "kv_block_indices must hold at least one entry per (batch, head, query tile); "
-                "expected at least ",
-                lut_rows,
-                ", got ",
-                kv_block_indices.numel());
+    // A row may select nothing, so the entry count is not bounded below by lut_rows. What the ASM
+    // still requires is a dereferenceable row base: an empty row is clamped to element 0, and the
+    // kernels also read speculatively up to one entry past the row they are traversing (that read
+    // is discarded). Per-row bounds need device data and stay behind AITER_MHA_V4_VALIDATE_LUT.
+    TORCH_CHECK(kv_block_indices.numel() >= 1,
+                "kv_block_indices must be non-empty; the sparse kernels dereference the row base "
+                "even for a row that selects no KV block");
 
     const auto kv_idx = kv_block_indices.contiguous();
     const auto start  = lut_start.contiguous();
