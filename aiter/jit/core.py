@@ -2,6 +2,8 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import functools
+import glob
+import hashlib
 import importlib
 import json
 import logging
@@ -1302,6 +1304,81 @@ def get_args_of_build(ops_name: str, exclude=None):
             )
 
 
+_jit_dependency_checked: dict[str, str] = {}
+_jit_dependency_recorded: set[str] = set()
+
+
+def _jit_dependency_fingerprint(patterns: list[str]) -> str:
+    """Hash build-time data files, including their paths and glob patterns."""
+    digest = hashlib.sha256()
+    for pattern in sorted(set(patterns)):
+        digest.update(b"pattern\0")
+        digest.update(pattern.encode())
+        for path in sorted(glob.glob(pattern)):
+            if not os.path.isfile(path):
+                continue
+            digest.update(b"file\0")
+            digest.update(os.path.abspath(path).encode())
+            with open(path, "rb") as file:
+                for chunk in iter(lambda: file.read(1024 * 1024), b""):
+                    digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _get_jit_dependency_patterns(md_name: str) -> list[str]:
+    """Read dependency expressions without evaluating the full build recipe."""
+    with open(this_dir + "/optCompilerConfig.json") as file:
+        module_config = json.load(file).get(md_name, {})
+    patterns = module_config.get("build_dependency_files", [])
+    return [
+        eval(pattern) if isinstance(pattern, str) else pattern for pattern in patterns
+    ]
+
+
+def _prepare_jit_dependencies(md_name: str) -> str | None:
+    """Invalidate a cached extension when its declared data inputs change."""
+    if md_name in _jit_dependency_checked:
+        return _jit_dependency_checked[md_name]
+
+    patterns = _get_jit_dependency_patterns(md_name)
+    if not patterns:
+        return None
+
+    fingerprint = _jit_dependency_fingerprint(patterns)
+    stamp_path = os.path.join(bd_dir, f"{md_name}.dependencies.sha256")
+    module_path = os.path.join(get_user_jit_dir(), f"{md_name}.so")
+    try:
+        with open(stamp_path) as file:
+            previous = file.read().strip()
+    except OSError:
+        previous = None
+
+    if os.path.exists(module_path) and previous != fingerprint:
+        logger.info(
+            "JIT data dependencies changed for [%s]; rebuilding cached module",
+            md_name,
+        )
+        rm_module(md_name)
+        clear_build(md_name)
+        get_module.cache_clear()
+        __mds.pop(md_name, None)
+
+    _jit_dependency_checked[md_name] = fingerprint
+    return fingerprint
+
+
+def _record_jit_dependencies(md_name: str, fingerprint: str | None) -> None:
+    if fingerprint is None or md_name in _jit_dependency_recorded:
+        return
+    stamp_path = os.path.join(bd_dir, f"{md_name}.dependencies.sha256")
+    tmp_path = f"{stamp_path}.{os.getpid()}.tmp"
+    os.makedirs(os.path.dirname(stamp_path), exist_ok=True)
+    with open(tmp_path, "w") as file:
+        file.write(fingerprint)
+    os.replace(tmp_path, stamp_path)
+    _jit_dependency_recorded.add(md_name)
+
+
 def _is_union(origin):
     """Check for both typing.Union (Optional[X]) and types.UnionType (X | None)."""
     return origin is typing.Union or origin is types.UnionType
@@ -1706,6 +1783,7 @@ def compile_ops(
 
                 if custom_build_args is None:
                     custom_build_args = {}
+                dependency_fingerprint = _prepare_jit_dependencies(_md_name)
                 md_name = _md_name
                 try:
                     module = None
@@ -1772,6 +1850,7 @@ def compile_ops(
                     if md_name not in __mds:
                         __mds[md_name] = module
 
+                _record_jit_dependencies(_md_name, dependency_fingerprint)
                 if isinstance(module, types.ModuleType):
                     op = getattr(module, loadName)
                 else:

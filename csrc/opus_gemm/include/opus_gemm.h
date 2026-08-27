@@ -29,6 +29,8 @@ void opus_gemm_a16w16_tune(aiter_tensor_t& XQ,
                            int kernelId,
                            int splitK);
 
+bool opus_gemm_a16w16_has_kernel(int kernelId, bool outputFp32);
+
 void opus_gemm_a8w8_blockscale_bpreshuffle_tune(aiter_tensor_t& XQ,
                                                 aiter_tensor_t& WQ,
                                                 std::optional<aiter_tensor_t> x_scale,

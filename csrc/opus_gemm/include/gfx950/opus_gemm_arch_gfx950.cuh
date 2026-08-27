@@ -120,41 +120,53 @@ constexpr bool kid_is_splitk(int kid) noexcept
 // skipping the cast.
 
 template <typename CDataType>
-inline opus_gfx950_detail::OpusA16W16TuneKernel
-opus_a16w16_tune_dispatch_gfx950(int id);
+struct OpusA16W16TuneTableGfx950;
 
 template <>
-inline opus_gfx950_detail::OpusA16W16TuneKernel
-opus_a16w16_tune_dispatch_gfx950<bf16_t>(int id)
+struct OpusA16W16TuneTableGfx950<bf16_t>
 {
-    using namespace opus_gfx950_detail;
-    static constexpr OpusA16W16TuneEntry kTune[] = {
+    inline static constexpr opus_gfx950_detail::OpusA16W16TuneEntry entries[] = {
         GENERATE_A16W16_TUNE_LOOKUP_BF16_GFX950(bf16_t)
     };
-    constexpr size_t kSize = sizeof(kTune) / sizeof(kTune[0]);
-    OpusA16W16TuneEntry needle{id, nullptr};
-    auto it = std::lower_bound(kTune, kTune + kSize, needle, tune_entry_less);
-    AITER_CHECK(it != kTune + kSize && it->kid == id,
-                "Kernel id ", id,
-                " not found in a16w16 bf16 tune lookup table");
-    return it->func;
-}
+};
 
 template <>
-inline opus_gfx950_detail::OpusA16W16TuneKernel
-opus_a16w16_tune_dispatch_gfx950<fp32_t>(int id)
+struct OpusA16W16TuneTableGfx950<fp32_t>
 {
-    using namespace opus_gfx950_detail;
-    static constexpr OpusA16W16TuneEntry kTune[] = {
+    inline static constexpr opus_gfx950_detail::OpusA16W16TuneEntry entries[] = {
         GENERATE_A16W16_TUNE_LOOKUP_FP32_GFX950(fp32_t)
     };
+};
+
+template <typename CDataType>
+inline opus_gfx950_detail::OpusA16W16TuneKernel
+opus_a16w16_tune_find_gfx950(int id)
+{
+    using namespace opus_gfx950_detail;
+    constexpr auto &kTune = OpusA16W16TuneTableGfx950<CDataType>::entries;
     constexpr size_t kSize = sizeof(kTune) / sizeof(kTune[0]);
     OpusA16W16TuneEntry needle{id, nullptr};
     auto it = std::lower_bound(kTune, kTune + kSize, needle, tune_entry_less);
-    AITER_CHECK(it != kTune + kSize && it->kid == id,
+    return it != kTune + kSize && it->kid == id ? it->func : nullptr;
+}
+
+template <typename CDataType>
+inline bool opus_a16w16_tune_has_gfx950(int id)
+{
+    return opus_a16w16_tune_find_gfx950<CDataType>(id) != nullptr;
+}
+
+template <typename CDataType>
+inline opus_gfx950_detail::OpusA16W16TuneKernel
+opus_a16w16_tune_dispatch_gfx950(int id)
+{
+    auto kernel = opus_a16w16_tune_find_gfx950<CDataType>(id);
+    AITER_CHECK(kernel != nullptr,
                 "Kernel id ", id,
-                " not found in a16w16 fp32 tune lookup table");
-    return it->func;
+                " not found in a16w16 ",
+                std::is_same_v<CDataType, bf16_t> ? "bf16" : "fp32",
+                " tune lookup table");
+    return kernel;
 }
 
 // ── a16w16 runtime dispatch (tuned lookup → heuristic fallback) ─────────────

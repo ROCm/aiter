@@ -302,6 +302,13 @@ namespace py = pybind11;
           py::arg("kernelId")  = 0,            \
           py::arg("splitK")    = 0);
 
+#define OPUS_GEMM_A16W16_HAS_KERNEL_PYBIND \
+    m.def("opus_gemm_a16w16_has_kernel",    \
+          &opus_gemm_a16w16_has_kernel,     \
+          "Return whether this build contains an a16w16 kernel ID.", \
+          py::arg("kernelId"),              \
+          py::arg("outputFp32") = false);
+
 #define OPUS_BMM_A8W8_MXSCALE_PYBIND \
     m.def("opus_bmm_a8w8_mxscale",   \
           &opus_bmm_a8w8_mxscale,    \

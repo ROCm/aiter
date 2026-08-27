@@ -90,6 +90,28 @@ def _opus_gemm_a16w16_tune_raw(
 ) -> torch.Tensor: ...
 
 
+@compile_ops(
+    "module_deepgemm_opus",
+    fc_name="opus_gemm_a16w16_has_kernel",
+    develop=True,
+)
+def _opus_gemm_a16w16_has_kernel_raw(
+    kernelId: int,
+    outputFp32: bool = False,
+) -> bool: ...
+
+
+@functools.lru_cache(maxsize=512)
+def is_a16w16_kernel_compiled(kernelId: int, outdtype: torch.dtype) -> bool:
+    """Return whether the loaded Opus module contains this tuned kernel."""
+    return bool(
+        _opus_gemm_a16w16_has_kernel_raw(
+            int(kernelId),
+            outputFp32=(outdtype == torch.float32),
+        )
+    )
+
+
 def _check_a16w16_tune_layout(XQ: torch.Tensor, WQ: torch.Tensor, Y: torch.Tensor):
     """Reject layouts that the opus launcher's hardcoded strides cannot serve.
 
@@ -651,6 +673,14 @@ def gemm_a16w16_opus(
     )
     if cfg is not None:
         kid = cfg["solidx"]
+        if not is_a16w16_kernel_compiled(kid, dtype):
+            logger.warning(
+                "Opus tuned config selected kernel %d, but it is absent from "
+                "the loaded module; falling back to the Opus heuristic.",
+                kid,
+            )
+            _opus_gemm_bf16_dispatch(XQ, WQ, Y, None, None, None, bias)
+            return _finalize_output(Y, reshape_out_to_2d)
         # Both bf16 and fp32 Y are now valid for splitk kids (the reduce
         # kernel handles the cast / passthrough), so no Y.dtype gating is
         # needed here -- always honor the tuned winner.
@@ -704,6 +734,7 @@ def opus_gemm_workspace_release_all() -> None: ...
 
 __all__ = [
     "gemm_a16w16_opus",
+    "is_a16w16_kernel_compiled",
     "is_splitk_kid",
     "opus_gemm_a16w16_tune",
     "opus_gemm_workspace_init",

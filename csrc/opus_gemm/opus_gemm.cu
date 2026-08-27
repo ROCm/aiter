@@ -364,6 +364,33 @@ static inline bool opus_kid_supports_bias(int kid)
          && !opus_kid_is_gfx942_splitk(kid);
 }
 
+bool opus_gemm_a16w16_has_kernel(int kernelId, bool outputFp32)
+{
+  switch (opus_get_gfx_arch())
+  {
+#ifdef OPUS_BUILD_HAS_GFX950
+    case OpusGfxArch::Gfx950:
+      if (opus_kid_is_splitk(kernelId) || outputFp32)
+        return opus_a16w16_tune_has_gfx950<fp32_t>(kernelId);
+      return opus_a16w16_tune_has_gfx950<bf16_t>(kernelId);
+#endif
+#ifdef OPUS_BUILD_HAS_GFX942
+    case OpusGfxArch::Gfx942:
+      if (opus_kid_is_splitk(kernelId) || outputFp32)
+        return opus_a16w16_tune_has_gfx942<fp32_t>(kernelId);
+      return opus_a16w16_tune_has_gfx942<bf16_t>(kernelId);
+#endif
+#ifdef OPUS_BUILD_HAS_GFX1250
+    case OpusGfxArch::Gfx1250:
+      if (opus_kid_is_gfx1250_co(kernelId))
+        return !outputFp32 && opus_a16w16_co_tune_has_gfx1250(kernelId);
+      return opus_a16w16_tune_has_gfx1250(kernelId);
+#endif
+    default:
+      return false;
+  }
+}
+
 void opus_gemm_a16w16_tune(
     aiter_tensor_t &XQ,
     aiter_tensor_t &WQ,
