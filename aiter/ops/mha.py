@@ -3700,6 +3700,71 @@ def flash_attn_varlen_func(
             sink_ptr,
         )
 
+    # A varlen batch holding exactly ONE sequence is the same problem as a dense
+    # batch-1 call, so route it to the dense entry -- which is where the OPUS
+    # symmetric-head-dim kernels live (they are batch-mode only). This is what lets a
+    # single-request prefill reach OPUS instead of falling back to CK.
+    #
+    # Detection is deliberately sync-free: cu_seqlens has batch+1 entries so
+    # numel() == 2 means one sequence (metadata only, no D2H), and max_seqlen_* are
+    # already host ints. Reading cu_seqlens values would force a device sync on a
+    # path called once per layer. Multi-sequence batches fall through unchanged.
+    def can_route_single_seq_to_dense():
+        if get_gfx() != "gfx950" or q.dtype != dtypes.bf16:
+            return False
+        if int(os.environ.get("AITER_ENABLE_FMHA_OPUS", "0")) == 0:
+            return False
+        if q.dim() != 3 or k.dim() != 3 or v.dim() != 3:
+            return False
+        if q.shape[-1] != v.shape[-1] or q.shape[-1] not in (64, 128):
+            return False
+        # exactly one sequence, and it spans the whole packed tensor
+        if cu_seqlens_q is None or cu_seqlens_k is None:
+            return False
+        if cu_seqlens_q.numel() != 2 or cu_seqlens_k.numel() != 2:
+            return False
+        if q.shape[0] != max_seqlen_q or k.shape[0] != max_seqlen_k:
+            return False
+        if v.shape[0] != max_seqlen_k:
+            return False
+        # flash_attn_func has no `out` parameter, and routing here with a caller
+        # buffer would mean a hidden extra copy -- decline instead. (vLLM's extend
+        # path does not pass out=.)
+        if out is not None:
+            return False
+        # everything the dense OPUS gate also rejects
+        if block_table is not None or bias is not None or alibi_slopes is not None:
+            return False
+        if cu_seqlens_q_padded is not None or cu_seqlens_k_padded is not None:
+            return False
+        if dropout_p != 0.0 or logits_soft_cap != 0.0 or return_attn_probs:
+            return False
+        if window_size[0] != -1 or window_size[1] != -1:
+            return False
+        if (len(window_size) > 2 and window_size[2] != 0) or sink_ptr is not None:
+            return False
+        return q.shape[-2] % k.shape[-2] == 0
+
+    if can_route_single_seq_to_dense():
+        # unsqueeze is a view: a single packed sequence is already [S, H, D] contiguous.
+        r = flash_attn_func(
+            q.unsqueeze(0),
+            k.unsqueeze(0),
+            v.unsqueeze(0),
+            dropout_p=dropout_p,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=window_size,
+            deterministic=deterministic,
+            return_lse=return_lse,
+        )
+        if return_lse:
+            dense_out, lse = r[0], r[1]
+            # dense lse is [B, H, S]; varlen callers expect [H, total_q]
+            return dense_out.squeeze(0), lse.squeeze(0)
+        dense_out = r[0] if isinstance(r, (tuple, list)) else r
+        return dense_out.squeeze(0)
+
     # FlyDSL path returns result if supported, None otherwise.
     from .flydsl.fmha_kernels import flydsl_flash_attn_varlen_func
 
