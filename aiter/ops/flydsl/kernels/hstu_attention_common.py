@@ -26,17 +26,17 @@ def decode_lane(tid, num_waves: int, warp_size: int, mfma_n: int):
     the MFMA lane coordinate. Equivalent to tid//warp_size, tid%warp_size,
     lane//mfma_n, lane%mfma_n, expressed as coordinate maps.
     """
-    # idx2crd/get yield index-typed coordinates; cast back to Int32 to match the
-    # kernels' i32 address arithmetic.
+    # get_/get_scalar yield a single coordinate mode; cast back to Int32 to match
+    # the kernels' i32 address arithmetic.
     wave_lane = fx.idx2crd(tid, fx.make_layout((num_waves, warp_size), (warp_size, 1)))
-    wave_id = fx.Int32(fx.get(wave_lane, 0))
-    lane = fx.Int32(fx.get(wave_lane, 1))
+    wave_id = fx.Int32(fx.get_scalar(fx.get_(wave_lane, 0)))
+    lane = fx.Int32(fx.get_scalar(fx.get_(wave_lane, 1)))
 
     lane_split = fx.idx2crd(
         lane, fx.make_layout((warp_size // mfma_n, mfma_n), (mfma_n, 1))
     )
-    lane_div_n = fx.Int32(fx.get(lane_split, 0))
-    lane_mod_n = fx.Int32(fx.get(lane_split, 1))
+    lane_div_n = fx.Int32(fx.get_scalar(fx.get_(lane_split, 0)))
+    lane_mod_n = fx.Int32(fx.get_scalar(fx.get_(lane_split, 1)))
     return wave_id, lane, lane_div_n, lane_mod_n
 
 

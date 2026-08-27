@@ -275,7 +275,6 @@ def build_hstu_attention_bwd_dq(
         # drives the buffer_load_lds instruction through the FlyDSL copy-atom API
         # (rebased buffer view + fx.copy). The atom hardcodes the cache-policy/aux
         # operand to 0, so this intentionally drops the raw path's aux=1.
-        _buf_flags_i32 = fx.Int32(buffer_ops._get_buffer_flags())
         _dma_atom = fx.make_copy_atom(
             fx.rocdl.BufferCopyLDS(DMA_BYTES * 8), DMA_BYTES * 8
         )
@@ -286,20 +285,7 @@ def build_hstu_attention_bwd_dq(
             # per-lane element index stays a small 32-bit voffset; max_size records.
             base_i64 = fx.Int64(fx.ptrtoint(base_iter))
             shifted = fx.inttoptr(base_iter.type, base_i64 + fx.Int64(byte_off))
-            buf_ptr_ty = fx.PointerType.get(
-                elem_ty=elem_type,
-                address_space=fx.rocdl.TargetAddressSpace.BufferDesc,
-                alignment=base_iter.alignment,
-            )
-            buf_ptr = fx.make_ptr(
-                buf_ptr_ty,
-                [
-                    shifted,
-                    fx.Int16(0).ir_value(),
-                    fx.Int64(0xFFFFFFFF).ir_value(),
-                    _buf_flags_i32.ir_value(),
-                ],
-            )
+            buf_ptr = fx.rocdl.make_buffer_ptr(shifted)
             return fx.logical_divide(
                 fx.make_view(buf_ptr, fx.make_layout(fx.Int32(n_elems), fx.Int32(1))),
                 fx.make_layout(1, 1),
@@ -639,7 +625,7 @@ def build_hstu_attention_bwd_dq(
             g_meta = compute_gate_tile(kv_start, k_packs)
             rocdl.s_waitcnt(vmcnt=0)
             store_v_regs_to_lds(v_vecs)
-            rocdl.sched_group_barrier(rocdl.mask_dswr, NUM_BATCHES_V, 0)
+            rocdl.sched_dswr(NUM_BATCHES_V)
             gpu.barrier()  # V published; K still resident in LDS for dQ's B-operand
             ds_packs = compute_ds_packs(g_meta)
             dq_acc = accum_dq_tile(dq_acc, ds_packs)

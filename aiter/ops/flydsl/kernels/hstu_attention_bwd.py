@@ -404,7 +404,6 @@ def build_hstu_attention_bwd_dvdk(
         do_lds_byte_base = buffer_ops.extract_base_index(do_view, address_space=3)
 
         # ── Copy-atom global->LDS DMA (buffer_load_lds via fx.copy) ──
-        _buf_flags_i32 = fx.Int32(buffer_ops._get_buffer_flags())
         _dma_atom = fx.make_copy_atom(
             fx.rocdl.BufferCopyLDS(DMA_BYTES * 8), DMA_BYTES * 8
         )
@@ -415,20 +414,7 @@ def build_hstu_attention_bwd_dvdk(
             # per-lane element index stays a small 32-bit voffset; max_size records.
             base_i64 = fx.Int64(fx.ptrtoint(base_iter))
             shifted = fx.inttoptr(base_iter.type, base_i64 + fx.Int64(byte_off))
-            buf_ptr_ty = fx.PointerType.get(
-                elem_ty=elem_type,
-                address_space=fx.rocdl.TargetAddressSpace.BufferDesc,
-                alignment=base_iter.alignment,
-            )
-            buf_ptr = fx.make_ptr(
-                buf_ptr_ty,
-                [
-                    shifted,
-                    fx.Int16(0).ir_value(),
-                    fx.Int64(0xFFFFFFFF).ir_value(),
-                    _buf_flags_i32.ir_value(),
-                ],
-            )
+            buf_ptr = fx.rocdl.make_buffer_ptr(shifted)
             return fx.logical_divide(
                 fx.make_view(buf_ptr, fx.make_layout(fx.Int32(n_elems), fx.Int32(1))),
                 fx.make_layout(1, 1),
