@@ -1677,9 +1677,7 @@ def _moe_gemm_a8w4_decode(
         # hidden sizes -- the same reason _scatter_grouped upcasts. The column
         # term is bounded by yN and stays 32-bit.
         gl.store(
-            Y
-            + dst[:, None].to(gl.int64) * stride_y_m
-            + offs_n_d[None, :] * stride_y_n,
+            Y + dst[:, None].to(gl.int64) * stride_y_m + offs_n_d[None, :] * stride_y_n,
             out,
             # dst < 0 covers both the tile's padding rows (offs_m_d >= M, loaded
             # as -1 above) and the rows this rank must not deliver.
@@ -2543,9 +2541,7 @@ def _moe_gemm_a8w4_prefill(
         # hidden sizes -- the same reason _scatter_grouped upcasts. The column
         # term is bounded by yN and stays 32-bit.
         gl.store(
-            Y
-            + dst[:, None].to(gl.int64) * stride_y_m
-            + offs_n_d[None, :] * stride_y_n,
+            Y + dst[:, None].to(gl.int64) * stride_y_m + offs_n_d[None, :] * stride_y_n,
             out,
             # dst < 0 covers both the tile's padding rows (offs_m_d >= M, loaded
             # as -1 above) and the rows this rank must not deliver.

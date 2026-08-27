@@ -496,9 +496,9 @@ def moe_gemm_a8w4(
             "by sorted row, which only exists once the gates are sorted"
         )
         assert not out_mx_quant, "ep_scatter delivers bf16 rows, not MXFP8"
-        assert not apply_swiglu, (
-            "ep_scatter is a GEMM2-side delivery; the activation belongs to GEMM1"
-        )
+        assert (
+            not apply_swiglu
+        ), "ep_scatter is a GEMM2-side delivery; the activation belongs to GEMM1"
         # `residual` is folded in by reduce_grouped, which does not run here --
         # so accepting both would drop the residual silently. It cannot simply
         # move into the scatter either: the residual is per TOKEN, and the rows

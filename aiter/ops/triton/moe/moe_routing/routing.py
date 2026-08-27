@@ -741,9 +741,7 @@ def ep_sort_routing(
             if ep_scatter_geometry is None
             else ep_scatter_geometry.max_tokens_per_rank
         ),
-        PEER_ROWS=(
-            0 if ep_scatter_geometry is None else ep_scatter_geometry.peer_rows
-        ),
+        PEER_ROWS=(0 if ep_scatter_geometry is None else ep_scatter_geometry.peer_rows),
     )
     return hist, topk_indx, gate_indx, gate_scal, gate_valid, dst_row
 

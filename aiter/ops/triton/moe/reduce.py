@@ -128,8 +128,7 @@ def validate_reduce_out(out, shape, dtype, device):
         f"produces {dtype}"
     )
     assert out.device == torch.device(device), (
-        f"provided output buffer is on {out.device}, but this call runs on "
-        f"{device}"
+        f"provided output buffer is on {out.device}, but this call runs on " f"{device}"
     )
     # Only the trailing dim must be packed; stride(0) is free (slice of a
     # taller tensor).
