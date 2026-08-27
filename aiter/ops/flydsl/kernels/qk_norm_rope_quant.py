@@ -99,6 +99,10 @@ ROWS_PER_WG_SMALL = 4
 SMALL_T_THRESHOLD = 96
 USE_TDM_PREFILL = True
 TDM_MIN_ROWS = 32768
+# gfx1250 cache-policy bit 0 reduces the T=512 BF16 output-store drain; larger
+# T already reaches steady-state HBM bandwidth and keeps the default policy.
+TDM_DECODE_STORE_CACHE_MODIFIER = 1
+
 
 
 _SQRT2 = math.sqrt(2.0)
@@ -193,7 +197,7 @@ def _store_bf16_tiled(vals_list, p_dst, copy, vec):
     fx.copy(copy, frag, p_dst)
 
 
-def _store_bf16_vec(vals, out_rsrc, row_base_bytes, idx, vec):
+def _store_bf16_vec(vals, out_rsrc, row_base_bytes, idx, vec, cache_modifier=0):
     """Convert VEC fp32 → bf16 dwords and raw buffer_store (split for VEC>8)."""
     if isinstance(vals, (list, tuple)):
         vals = fx.Vector.from_elements(vals, dtype=fx.Float32)
@@ -205,7 +209,11 @@ def _store_bf16_vec(vals, out_rsrc, row_base_bytes, idx, vec):
 
     if const_expr(dwords <= 4):
         buffer_ops.buffer_store(
-            bf16_as_i32.ir_value(), out_rsrc, off_bytes, offset_is_bytes=True
+            bf16_as_i32.ir_value(),
+            out_rsrc,
+            off_bytes,
+            cache_modifier=cache_modifier,
+            offset_is_bytes=True,
         )
     else:
         lo = fx.Vector.from_elements([bf16_as_i32[i] for i in range(4)], dtype=fx.Int32)
@@ -213,10 +221,18 @@ def _store_bf16_vec(vals, out_rsrc, row_base_bytes, idx, vec):
             [bf16_as_i32[i] for i in range(4, dwords)], dtype=fx.Int32
         )
         buffer_ops.buffer_store(
-            lo.ir_value(), out_rsrc, off_bytes, offset_is_bytes=True
+            lo.ir_value(),
+            out_rsrc,
+            off_bytes,
+            cache_modifier=cache_modifier,
+            offset_is_bytes=True,
         )
         buffer_ops.buffer_store(
-            hi.ir_value(), out_rsrc, off_bytes + 16, offset_is_bytes=True
+            hi.ir_value(),
+            out_rsrc,
+            off_bytes + 16,
+            cache_modifier=cache_modifier,
+            offset_is_bytes=True,
         )
 
 
@@ -1612,6 +1628,11 @@ def flydsl_qk_norm_rope_quant(
                 num_buffers=num_buffers,
                 tiles_per_wg=tiles_per_wg,
                 q_weighted=q_weighted,
+                store_cache_modifier=(
+                    TDM_DECODE_STORE_CACHE_MODIFIER
+                    if (T_tok, H, D, RD) == (512, 128, 512, 64)
+                    else 0
+                ),
             )
             if stream is None:
                 stream = torch.cuda.current_stream()
@@ -1739,7 +1760,7 @@ def flydsl_qk_norm_rope_quant(
 
 ROWS_PER_TILE = 8  # = waves per WG (256-thread WG)
 NUM_BUFFERS = 6  # K: rotating LDS buffers (1 WG at K=6: 6*32KB=192KB LDS)
-TILES_PER_WG = 40  # CT: tiles streamed per WG (unrolled; CT % (H/RT) == 0)
+TILES_PER_WG = 16  # CT: one H=128 token/WG; keeps cos/sin hoisting enabled
 
 
 def _tdm_tiles_per_wg(num_rows):
@@ -1751,13 +1772,11 @@ def _tdm_tiles_per_wg(num_rows):
     128 workgroups, leaving half the CUs idle. RT=8 with CT=16 gives 256 there
     and 512 at num_rows=65536.
 
-    K is then free to pick on latency alone, since LDS is not the limiter at
-    these workgroup counts. K=4 measured ~2.4% faster than K=5 at num_rows=65536
-    back when RT was 32; the shallower rotation is not LDS- or occupancy-driven,
-    so re-measure rather than extrapolate to other shapes.
+    K is then free to pick on latency alone. With RT=8, K=6 is best or neutral
+    for the rotated T=512 workload and avoids another short-prefill variant.
     """
     if num_rows <= 65536:
-        return 16, 4
+        return 16, NUM_BUFFERS
     if num_rows <= 131072:
         return 16, NUM_BUFFERS
     return TILES_PER_WG, NUM_BUFFERS
@@ -1773,6 +1792,7 @@ def _build_kernel_w32_tdm(
     tiles_per_wg=TILES_PER_WG,
     hoist_cs=True,
     q_weighted=False,
+    store_cache_modifier=0,
 ):
     H, D, RD = num_q_heads, head_dim, rope_head_dim
     NOPE = D - RD
@@ -1797,6 +1817,8 @@ def _build_kernel_w32_tdm(
         name += "_h"
     if q_weighted:
         name += "_qw"
+    if store_cache_modifier:
+        name += f"_sc{store_cache_modifier}"
     name += "_fused_w32_flydsl"
 
     @flyc.kernel(name=name, known_block_size=[BLOCK_THREADS, RT, 1])
@@ -1909,8 +1931,14 @@ def _build_kernel_w32_tdm(
             ev = scaled.shuffle(scaled, EVEN)
             od = scaled.shuffle(scaled, ODD)
             rot = (ev * cosv - od * sinv).shuffle(ev * sinv + od * cosv, ILV)
-            final = is_rope.select(rot, scaled)
-            _store_bf16_vec(final, out_rsrc, row_base_bytes, tid, VEC)
+            _store_bf16_vec(
+                is_rope.select(rot, scaled),
+                out_rsrc,
+                row_base_bytes,
+                tid,
+                VEC,
+                cache_modifier=store_cache_modifier,
+            )
 
         def emit_q():
             q_out_rsrc = _ptr_res(q_out)
@@ -1976,7 +2004,9 @@ def _build_kernel_w32_tdm(
                 return load_cs(tok_of(tile_idx))
 
             GROUP = (H // RT) if (log2H is not None and H % RT == 0) else 1
-            do_hoist = hoist_cs and GROUP > 1 and (CT % GROUP == 0)
+            # A WG may cover one or more complete tokens, or an aligned fraction
+            # of one token. Both cases keep cos/sin constant within the WG.
+            do_hoist = hoist_cs and GROUP > 1 and (CT % GROUP == 0 or GROUP % CT == 0)
 
             for k in range_constexpr(K):
                 issue(bufs[k], tile_base + k)

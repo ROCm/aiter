@@ -187,7 +187,7 @@ def _dequant(out_fp8, scale, *, D, quant_group_size, scale_dtype):
 # ============================================================================
 
 # MI355X HBM3e peak. Used only for the "%peak" perf column.
-_PEAK_BW_GBPS = 8000.0
+_PEAK_BW_GBPS = 22000.0
 # Pin the arg-rotation count. Left to itself, run_perftest derives it from
 # `free_memory` at call time, so two rows timed in one process rotate a
 # different number of times and land in different L2 states -- their `us`
