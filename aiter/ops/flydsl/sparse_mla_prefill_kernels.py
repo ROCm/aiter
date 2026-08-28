@@ -117,6 +117,7 @@ def _get_kernel_dsv4(
     rope_bf16: bool,
     rope_fp8: bool,
     r1_tb_carry: bool,
+    persist_wg: int,
     vt_inreg: bool,
     kv_double_buffer: bool,
     kv_pf_late: bool,
@@ -137,6 +138,7 @@ def _get_kernel_dsv4(
         rope_bf16=rope_bf16,
         rope_fp8=rope_fp8,
         r1_tb_carry=r1_tb_carry,
+        persist_wg=persist_wg,
         vt_inreg=vt_inreg,
         kv_double_buffer=kv_double_buffer,
         kv_pf_late=kv_pf_late,
@@ -599,6 +601,7 @@ def flydsl_sparse_mla_prefill_dsv4(
     rope_bf16: bool = False,
     rope_fp8: bool = False,
     r1_tb_carry: bool = False,
+    persist_wg: int = -1,
     single_request: bool = True,
     validate_regions: bool = True,
     vt_inreg: bool = False,
@@ -678,6 +681,18 @@ def flydsl_sparse_mla_prefill_dsv4(
     # fire-and-forget DMA path for free -- worth -5.74%, and bit-identical, because
     # the convert's own output is fnuz anyway.
     r1_convert = (extra_scale_mode == "ue8m0") or (not extra_is_fnuz)
+    if persist_wg < 0:
+        # One workgroup per CU. Occupancy is one workgroup per CU (8 waves at 2
+        # waves/SIMD), so this is the grid at which every workgroup is resident and
+        # each walks a contiguous run of queries; measured -0.89%. Fewer leaves CUs
+        # idle (152 measured +43%), more costs a second scheduling round (+0.56%).
+        # Degrades to one-workgroup-per-query rather than raising when the kernel
+        # cannot be persistent, so 'auto' is always safe to pass.
+        persist_wg = (
+            torch.cuda.get_device_properties(q.device).multi_processor_count
+            if single_request
+            else 0
+        )
     exe = _get_kernel_dsv4(
         has_sink=has_sink,
         r0_convert=r0_convert,
@@ -689,6 +704,7 @@ def flydsl_sparse_mla_prefill_dsv4(
         rope_bf16=rope_bf16,
         rope_fp8=rope_fp8,
         r1_tb_carry=r1_tb_carry,
+        persist_wg=persist_wg,
         vt_inreg=vt_inreg,
         kv_double_buffer=kv_double_buffer,
         kv_pf_late=kv_pf_late,

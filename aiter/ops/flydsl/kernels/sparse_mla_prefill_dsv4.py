@@ -368,6 +368,7 @@ def compile_sparse_mla_prefill_dsv4(
     rope_bf16: bool = False,
     rope_fp8: bool = False,
     r1_tb_carry: bool = False,
+    persist_wg: int = 0,
     vt_inreg: bool = False,
     kv_double_buffer: bool = False,
     kv_pf_late: bool = False,
@@ -394,6 +395,21 @@ def compile_sparse_mla_prefill_dsv4(
                  DMA'd region0 must already be fnuz (r0_convert=False implies
                  r0_is_ocp=False).
     single_request: hardwire req_id=0 instead of reading q_req[q].
+    persist_wg:  launch a fixed grid of this many workgroups, each walking a
+                 contiguous run of queries, instead of one workgroup per query. 0
+                 keeps one-per-query; the wrapper resolves -1 to the CU count.
+
+                 MEASURED -0.89% [-0.77, -1.05] at one workgroup per CU (304 on
+                 MI300X). The grid matters more than the idea: 608 costs +0.56% for a
+                 second scheduling round, and 152 costs +43% by leaving half the CUs
+                 idle. Queries are assigned in contiguous runs rather than by grid
+                 stride, so successive queries stay adjacent in Q, the output and the
+                 CSR ranges -- the stream contiguity xcd_remap showed is worth 1.45%.
+
+                 Needs a cross-query LDS barrier the per-tile one cannot provide (it
+                 sits after the DMA is issued); without it chunk sizes 2 and 4 gave
+                 wrong answers. Requires single_request, since req_id is resolved once
+                 per workgroup and _row_addrs closes over it.
     rope_fp8:    the cache's RoPE tail is already fnuz fp8 in the 64 bytes at
                  PK_NOPE_BYTES, so block 7 rides the same buffer_load_to_lds as
                  blocks 0..6 and the bf16->fp8 convert disappears. That convert's
@@ -500,8 +516,15 @@ def compile_sparse_mla_prefill_dsv4(
     # Region1 can carry too, but only off the convert path: the convert is the sole
     # consumer of the scale base, and only the token base is carried.
     R1_TB_CARRY = TB_CARRY and not R1_CONVERT and bool(r1_tb_carry)
+    PERSIST_WG = int(persist_wg)
     P_LDS_VT, TOTAL_LDS_BYTES = _lds_layout(ROPE_BF16, VT_INREG, VT_WIDE)
 
+    if PERSIST_WG > 0 and not SINGLE_REQUEST:
+        raise ValueError(
+            "persist_wg requires single_request=True: req_id is resolved once per "
+            "workgroup and _row_addrs closes over it, so a workgroup spanning "
+            "queries from different requests would use the wrong block table"
+        )
     if ROPE_FP8 and ROPE_BF16:
         raise ValueError(
             "rope_fp8=True consumes the bf16 rope tail's storage, so it cannot be "
@@ -541,6 +564,7 @@ def compile_sparse_mla_prefill_dsv4(
         extra_block_size: fx.Int32,
         main_max_blocks: fx.Int32,
         extra_max_blocks: fx.Int32,
+        n_queries: fx.Int32,
     ):
         fm_no_inf = (
             arith.FastMathFlags.nnan
@@ -1675,231 +1699,88 @@ def compile_sparse_mla_prefill_dsv4(
             # Only read under ROPE_BF16; the region is not allocated otherwise.
             return _i32(lds_base_idx + P_LDS_RBF + slot * SZ_LDS_RBF)
 
-        # ---- CSR ranges ----
-        main_rng = Vec(
-            buffer_ops.buffer_load(main_indptr_rsrc, q_idx, vec_width=2, dtype=T.i32)
-        )
-        main_start = rocdl.readfirstlane(T.i32, main_rng[0])
-        main_end = rocdl.readfirstlane(T.i32, main_rng[1])
-        main_len = _raw(ArithValue(main_end) - ArithValue(main_start))
-        n0_tiles = _raw((ArithValue(main_len) + (BLOCK_N - 1)).with_signedness(False) // BLOCK_N)
-
-        extra_rng = Vec(
-            buffer_ops.buffer_load(extra_indptr_rsrc, q_idx, vec_width=2, dtype=T.i32)
-        )
-        extra_start = rocdl.readfirstlane(T.i32, extra_rng[0])
-        extra_end = rocdl.readfirstlane(T.i32, extra_rng[1])
-        extra_len = _raw(ArithValue(extra_end) - ArithValue(extra_start))
-        n1_tiles = _raw((ArithValue(extra_len) + (BLOCK_N - 1)).with_signedness(False) // BLOCK_N)
-        total_tiles = _raw(ArithValue(n0_tiles) + ArithValue(n1_tiles))
-
-        if const_expr(R1_TB_CARRY):
-            # The r0->r1 boundary tile cannot take the carry: the trailing region0
-            # tile computes tb_next against main_* and gets -1 past main_end. But
-            # that tile's own base is a per-query constant -- for local==0,
-            # kv_ts == extra_start and _row_addrs then depends only on prologue
-            # values -- so resolve it once here instead. The region1 arm can then
-            # pick between this and the carry with a v_cndmask rather than the
-            # dynamic branch that made the first attempt at this 1.37% slower.
-            tb_r1_head = _row_addrs(
-                extra_indices_rsrc, extra_bt_rsrc, extra_num_rows, extra_block_size,
-                extra_max_blocks, extra_start, extra_end,
-            )[0]
-
-        row_base = _idx(q_idx) * NUM_QO_HEADS + warp_idx * 16
-        # Tile 0's CSR slot goes out before the Q loads so the two round trips
-        # overlap and ``_load_q_direct``'s vmcnt(0) covers both. Left in series
-        # they cost the Q drain plus the slot drain back to back; this is the
-        # coldest chain in the kernel (nothing else is in flight yet), which is
-        # why it is the most expensive _row_addrs instance despite running once.
-        if const_expr(SLOT_HOIST):
-            slot0_pre = _issue_row_slot(main_indices_rsrc, main_start)
-        else:
-            slot0_pre = None
-        q_nope_packs = _load_q_direct(q_idx)
-        q_rope_packs = _load_q_rope_bf16(q_idx) if const_expr(ROPE_BF16) else None
-
-        # NOTE: a one-tile CSR slot lookahead (issue tile g+1's slot loads during
-        # tile g, carry them in the loop state) was implemented and measured as a
-        # net ~1% LOSS, so it is deliberately not here. ATT confirmed it did what
-        # it was meant to -- the 730K-cycle softmax slot wait vanished and total
-        # stall fell 5.4% -- but wall time got worse because at 2 waves/SIMD the
-        # co-resident wave was already covering that stall, while the freed waves
-        # then piled up at the CTA barrier (barrier A doubled, 331K -> 689K).
-        # Per-wave latency hiding is not the lever here; barrier count is.
-
-        # ---- region-0 attend body (const-fixed resources) ----
-        def _attend_region0(kv_tile_start_i32, rm_in, rse_in, oaccu_in, is_first,
-                           slot_pre=None):
-            tb, sb = _row_addrs(
-                main_indices_rsrc, main_bt_rsrc, main_num_rows, main_block_size,
-                main_max_blocks, kv_tile_start_i32, main_end, slot_pre=slot_pre,
+        # ---- per-query body ------------------------------------------------
+        # Factored out so a persistent grid can run it more than once per
+        # workgroup. req_id stays outside (and _row_addrs closes over it), so
+        # persistence is restricted to SINGLE_REQUEST.
+        def _one_query(q_idx):
+            # ---- CSR ranges ----
+            main_rng = Vec(
+                buffer_ops.buffer_load(main_indptr_rsrc, q_idx, vec_width=2, dtype=T.i32)
             )
-            if const_expr(R0_CONVERT):
-                _load_nope_convert(
-                    main_cache_rsrc, p_lds_kv_0_warp, tb, sb,
-                    fx.Float32(1.0) if R0_OCP else fx.Float32(0.0),
-                )
-            else:
-                _load_nope_dma(main_cache_rsrc, p_lds_kv_0_warp, tb)
-            if const_expr(ROPE_FP8):
-                _dma_rope_block(main_cache_rsrc, p_lds_kv_0_warp, tb)
-            else:
-                _load_rope_block(main_cache_rsrc, p_lds_kv_0_warp, tb, p_lds_rbf_base(0))
-            # Tile 1's NoPE blocks are prefetched into buffer 1 during this
-            # tile's QK MFMAs; region0 always owns tile 0, so the resource is
-            # compile-time fixed. Past the end of region0 the token base is -1
-            # and the prefetch degenerates to writing zeros, which the next tile
-            # overwrites (it loads synchronously if it is a region1 tile).
-            kv_ts_next = _raw(ArithValue(kv_tile_start_i32) + BLOCK_N)
-            tb_next, _sb_next = _row_addrs(
-                main_indices_rsrc, main_bt_rsrc, main_num_rows, main_block_size,
-                main_max_blocks, kv_ts_next, main_end,
-            )
-            _barrier(vmcnt=0, lgkmcnt=0)
-            rocdl.sched_barrier(0)
-            pf_kwargs = {}
-            if const_expr(KV_DB and not R0_CONVERT):
-                pf_kwargs = dict(
-                    p_lds_kv_next_warp=p_lds_kv_1_warp,
-                    prefetch_cache_rsrc=main_cache_rsrc,
-                    token_base_next=tb_next,
-                )
-            rm_n, rse_n, p_pack, rescale = _process_tile_gemm1(
-                main_indices_rsrc, main_num_rows, p_lds_kv_0_base, kv_tile_start_i32, main_end,
-                q_nope_packs, rm_in, rse_in, is_first, q_rope_b=q_rope_packs,
-                rbf_base=p_lds_rbf_base(0), **pf_kwargs,
-            )
-            # Issue tile 1's RoPE load after the softmax, so the softmax's own
-            # slot loads do not drag it in via the in-order vmcnt, and nothing
-            # before the next tile's barrier waits on it.
-            if const_expr(ROPE_PF and not ROPE_FP8):
-                nxt = Vec(_issue_rope_load(main_cache_rsrc, tb_next))
-                rp0_n = nxt[0]
-                rp1_n = nxt[1]
-            else:
-                rp0_n = c_zero_i32
-                rp1_n = c_zero_i32
-            tb_n = tb_next if const_expr(TB_CARRY) else c_zero_i32
-            if const_expr(is_first):
-                oaccu_n = _gemm2_first_iter(p_pack, p_lds_kv_0_base)
-            else:
-                oaccu_n = _gemm2_with_rescale(p_pack, rescale, oaccu_in, p_lds_kv_0_base)
-            return rm_n, rse_n, oaccu_n, rp0_n, rp1_n, tb_n
+            main_start = rocdl.readfirstlane(T.i32, main_rng[0])
+            main_end = rocdl.readfirstlane(T.i32, main_rng[1])
+            main_len = _raw(ArithValue(main_end) - ArithValue(main_start))
+            n0_tiles = _raw((ArithValue(main_len) + (BLOCK_N - 1)).with_signedness(False) // BLOCK_N)
 
-        # ---- region-select load + GEMM1 ----
-        # arith.select on the !llvm.ptr<8> buffer descriptors does NOT lower
-        # correctly, and two sequential yield-loops in one body break the
-        # structured-for lowering. So this uses ONE yield-loop with a runtime
-        # ``if`` that selects the region for the load + GEMM1 (each region keeps
-        # compile-time-fixed resources). Only flat scalars cross the if
-        # (rm, rse, the i64 P-pack, rescale) -- the GEMM2 P@V accumulation reads
-        # V^T from LDS and is region-agnostic, so it runs after the if.
-        # Tile g lives in KV buffer g&1. Region0 tiles have their NoPE blocks
-        # DMA'd in during tile g-1's QK MFMAs; the RoPE tail (register-staged, so
-        # not a fire-and-forget DMA) and all of region1 (which needs the convert
-        # path) still load synchronously at the top of the tile. One barrier per
-        # tile covers both hazards: RAW on buf[g&1], and WAR on buf[(g+1)&1]
-        # whose last reader was tile g-1's GEMM2.
-        def _load_gemm1_select(global_t_i32, rm_in, rse_in, is_first, rp0, rp1, tb_c):
-            is_r1 = _raw(ArithValue(global_t_i32) >= ArithValue(n0_tiles))
-            # Without double buffering everything stays in buffer 0, which keeps
-            # the K/V base addresses loop-invariant so they hoist out of the tile
-            # loop. Alternating makes them a runtime select recomputed per tile.
-            if const_expr(KV_DB):
-                is_odd = (ArithValue(global_t_i32) & 1) != 0
-                cur_base = ArithValue(is_odd).select(p_lds_kv_1_base, p_lds_kv_0_base)
-                cur_warp = ArithValue(is_odd).select(p_lds_kv_1_warp, p_lds_kv_0_warp)
-                next_warp = ArithValue(is_odd).select(p_lds_kv_0_warp, p_lds_kv_1_warp)
-                cur_rbf = ArithValue(is_odd).select(p_lds_rbf_base(1), p_lds_rbf_base(0))
+            extra_rng = Vec(
+                buffer_ops.buffer_load(extra_indptr_rsrc, q_idx, vec_width=2, dtype=T.i32)
+            )
+            extra_start = rocdl.readfirstlane(T.i32, extra_rng[0])
+            extra_end = rocdl.readfirstlane(T.i32, extra_rng[1])
+            extra_len = _raw(ArithValue(extra_end) - ArithValue(extra_start))
+            n1_tiles = _raw((ArithValue(extra_len) + (BLOCK_N - 1)).with_signedness(False) // BLOCK_N)
+            total_tiles = _raw(ArithValue(n0_tiles) + ArithValue(n1_tiles))
+
+            if const_expr(R1_TB_CARRY):
+                # The r0->r1 boundary tile cannot take the carry: the trailing region0
+                # tile computes tb_next against main_* and gets -1 past main_end. But
+                # that tile's own base is a per-query constant -- for local==0,
+                # kv_ts == extra_start and _row_addrs then depends only on prologue
+                # values -- so resolve it once here instead. The region1 arm can then
+                # pick between this and the carry with a v_cndmask rather than the
+                # dynamic branch that made the first attempt at this 1.37% slower.
+                tb_r1_head = _row_addrs(
+                    extra_indices_rsrc, extra_bt_rsrc, extra_num_rows, extra_block_size,
+                    extra_max_blocks, extra_start, extra_end,
+                )[0]
+
+            row_base = _idx(q_idx) * NUM_QO_HEADS + warp_idx * 16
+            # Tile 0's CSR slot goes out before the Q loads so the two round trips
+            # overlap and ``_load_q_direct``'s vmcnt(0) covers both. Left in series
+            # they cost the Q drain plus the slot drain back to back; this is the
+            # coldest chain in the kernel (nothing else is in flight yet), which is
+            # why it is the most expensive _row_addrs instance despite running once.
+            if const_expr(SLOT_HOIST):
+                slot0_pre = _issue_row_slot(main_indices_rsrc, main_start)
             else:
-                cur_base = p_lds_kv_0_base
-                cur_warp = p_lds_kv_0_warp
-                next_warp = p_lds_kv_1_warp
-                cur_rbf = p_lds_rbf_base(0)
-            rm_n = c_neg_large
-            rse_n = c_zero_f32
-            pp = fx.Int64(0)
-            rescale = c_one_f32
-            # The RoPE pair is region0-only (region1 either DMAs the rope or loads it
-            # synchronously), so it passes through untouched on this side.
-            nrp0 = rp0
-            nrp1 = rp1
-            ntb = tb_c
-            if is_r1:
-                local = _raw(ArithValue(global_t_i32) - ArithValue(n0_tiles))
-                kv_ts = _raw(ArithValue(extra_start) + ArithValue(local) * BLOCK_N)
-                sb = c_zero_i32
-                tb = c_zero_i32
-                if const_expr(R1_TB_CARRY):
-                    # Resolving the address inline costs region1 615 cyc/tile at the
-                    # tile barrier against region0's 169: the DMA cannot issue until
-                    # the chain lands, so the barrier waits on it. Carrying the base
-                    # lets the DMA go out at the top of the tile as region0's does.
-                    # The boundary tile takes tb_r1_head, hoisted to the prologue, so
-                    # this stays a select instead of splitting the arm in two.
-                    tb = _raw(
-                        ArithValue(_raw(ArithValue(local) == 0)).select(
-                            _raw(tb_r1_head), _raw(tb_c)
-                        )
-                    )
-                else:
-                    tb, sb = _row_addrs(
-                        extra_indices_rsrc, extra_bt_rsrc, extra_num_rows,
-                        extra_block_size, extra_max_blocks, kv_ts, extra_end,
-                    )
-                if const_expr(R1_CONVERT):
-                    _load_nope_convert(
-                        extra_cache_rsrc, cur_warp, tb, sb,
-                        fx.Float32(1.0) if R1_OCP else fx.Float32(0.0),
-                    )
-                else:
-                    _load_nope_dma(extra_cache_rsrc, cur_warp, tb)
-                if const_expr(ROPE_FP8):
-                    _dma_rope_block(extra_cache_rsrc, cur_warp, tb)
-                else:
-                    _load_rope_block(extra_cache_rsrc, cur_warp, tb, cur_rbf)
-                if const_expr(R1_TB_CARRY):
-                    kv_ts_next = _raw(ArithValue(kv_ts) + BLOCK_N)
-                    ntb = _row_addrs(
-                        extra_indices_rsrc, extra_bt_rsrc, extra_num_rows,
-                        extra_block_size, extra_max_blocks, kv_ts_next, extra_end,
-                    )[0]
-                _barrier(vmcnt=0, lgkmcnt=0)
-                rocdl.sched_barrier(0)
-                rm_n, rse_n, pp, rescale = _process_tile_gemm1(
-                    extra_indices_rsrc, extra_num_rows, cur_base, kv_ts, extra_end,
-                    q_nope_packs, rm_in, rse_in, is_first, q_rope_b=q_rope_packs,
-                    rbf_base=cur_rbf,
+                slot0_pre = None
+            q_nope_packs = _load_q_direct(q_idx)
+            q_rope_packs = _load_q_rope_bf16(q_idx) if const_expr(ROPE_BF16) else None
+
+            # NOTE: a one-tile CSR slot lookahead (issue tile g+1's slot loads during
+            # tile g, carry them in the loop state) was implemented and measured as a
+            # net ~1% LOSS, so it is deliberately not here. ATT confirmed it did what
+            # it was meant to -- the 730K-cycle softmax slot wait vanished and total
+            # stall fell 5.4% -- but wall time got worse because at 2 waves/SIMD the
+            # co-resident wave was already covering that stall, while the freed waves
+            # then piled up at the CTA barrier (barrier A doubled, 331K -> 689K).
+            # Per-wave latency hiding is not the lever here; barrier count is.
+
+            # ---- region-0 attend body (const-fixed resources) ----
+            def _attend_region0(kv_tile_start_i32, rm_in, rse_in, oaccu_in, is_first,
+                               slot_pre=None):
+                tb, sb = _row_addrs(
+                    main_indices_rsrc, main_bt_rsrc, main_num_rows, main_block_size,
+                    main_max_blocks, kv_tile_start_i32, main_end, slot_pre=slot_pre,
                 )
-            else:
-                kv_ts = _raw(ArithValue(main_start) + ArithValue(global_t_i32) * BLOCK_N)
-                if const_expr(TB_CARRY):
-                    # Computed as tb_next during the previous tile.
-                    tb = tb_c
-                    sb = c_zero_i32
-                else:
-                    tb, sb = _row_addrs(
-                        main_indices_rsrc, main_bt_rsrc, main_num_rows, main_block_size,
-                        main_max_blocks, kv_ts, main_end,
-                    )
                 if const_expr(R0_CONVERT):
                     _load_nope_convert(
-                        main_cache_rsrc, cur_warp, tb, sb,
+                        main_cache_rsrc, p_lds_kv_0_warp, tb, sb,
                         fx.Float32(1.0) if R0_OCP else fx.Float32(0.0),
                     )
-                elif const_expr(not KV_DB):
-                    _load_nope_dma(main_cache_rsrc, cur_warp, tb)
-                if const_expr(ROPE_FP8):
-                    _dma_rope_block(main_cache_rsrc, cur_warp, tb)
-                elif const_expr(ROPE_PF):
-                    _commit_rope_block(
-                        cur_warp, tb, cur_rbf,
-                        _raw(Vec.from_elements([rp0, rp1], fx.Int32)),
-                    )
                 else:
-                    _load_rope_block(main_cache_rsrc, cur_warp, tb, cur_rbf)
-                kv_ts_next = _raw(ArithValue(kv_ts) + BLOCK_N)
+                    _load_nope_dma(main_cache_rsrc, p_lds_kv_0_warp, tb)
+                if const_expr(ROPE_FP8):
+                    _dma_rope_block(main_cache_rsrc, p_lds_kv_0_warp, tb)
+                else:
+                    _load_rope_block(main_cache_rsrc, p_lds_kv_0_warp, tb, p_lds_rbf_base(0))
+                # Tile 1's NoPE blocks are prefetched into buffer 1 during this
+                # tile's QK MFMAs; region0 always owns tile 0, so the resource is
+                # compile-time fixed. Past the end of region0 the token base is -1
+                # and the prefetch degenerates to writing zeros, which the next tile
+                # overwrites (it loads synchronously if it is a region1 tile).
+                kv_ts_next = _raw(ArithValue(kv_tile_start_i32) + BLOCK_N)
                 tb_next, _sb_next = _row_addrs(
                     main_indices_rsrc, main_bt_rsrc, main_num_rows, main_block_size,
                     main_max_blocks, kv_ts_next, main_end,
@@ -1909,67 +1790,244 @@ def compile_sparse_mla_prefill_dsv4(
                 pf_kwargs = {}
                 if const_expr(KV_DB and not R0_CONVERT):
                     pf_kwargs = dict(
-                        p_lds_kv_next_warp=next_warp,
+                        p_lds_kv_next_warp=p_lds_kv_1_warp,
                         prefetch_cache_rsrc=main_cache_rsrc,
                         token_base_next=tb_next,
                     )
-                rm_n, rse_n, pp, rescale = _process_tile_gemm1(
-                    main_indices_rsrc, main_num_rows, cur_base, kv_ts, main_end,
+                rm_n, rse_n, p_pack, rescale = _process_tile_gemm1(
+                    main_indices_rsrc, main_num_rows, p_lds_kv_0_base, kv_tile_start_i32, main_end,
                     q_nope_packs, rm_in, rse_in, is_first, q_rope_b=q_rope_packs,
-                    rbf_base=cur_rbf, **pf_kwargs,
+                    rbf_base=p_lds_rbf_base(0), **pf_kwargs,
                 )
+                # Issue tile 1's RoPE load after the softmax, so the softmax's own
+                # slot loads do not drag it in via the in-order vmcnt, and nothing
+                # before the next tile's barrier waits on it.
                 if const_expr(ROPE_PF and not ROPE_FP8):
                     nxt = Vec(_issue_rope_load(main_cache_rsrc, tb_next))
-                    nrp0 = nxt[0]
-                    nrp1 = nxt[1]
-                if const_expr(TB_CARRY):
-                    ntb = tb_next
-            return rm_n, rse_n, pp, rescale, cur_base, nrp0, nrp1, ntb
+                    rp0_n = nxt[0]
+                    rp1_n = nxt[1]
+                else:
+                    rp0_n = c_zero_i32
+                    rp1_n = c_zero_i32
+                tb_n = tb_next if const_expr(TB_CARRY) else c_zero_i32
+                if const_expr(is_first):
+                    oaccu_n = _gemm2_first_iter(p_pack, p_lds_kv_0_base)
+                else:
+                    oaccu_n = _gemm2_with_rescale(p_pack, rescale, oaccu_in, p_lds_kv_0_base)
+                return rm_n, rse_n, oaccu_n, rp0_n, rp1_n, tb_n
 
-        # Single yield-loop over the flattened region0||region1 tile space. The
-        # first tile (g==0) is region0 tile 0 (region0 is the always-present
-        # pool) and initialises the shared softmax state via GEMM2-first.
-        rm_first, rse_first, oaccu_first, rp0_first, rp1_first, tb_first = _attend_region0(
-            main_start, c_neg_large, c_zero_f32, None, True, slot_pre=slot0_pre
-        )
-        has_multi = ArithValue(total_tiles) > 1
-        N_ACC = NUM_PV_ITERS * 2
+            # ---- region-select load + GEMM1 ----
+            # arith.select on the !llvm.ptr<8> buffer descriptors does NOT lower
+            # correctly, and two sequential yield-loops in one body break the
+            # structured-for lowering. So this uses ONE yield-loop with a runtime
+            # ``if`` that selects the region for the load + GEMM1 (each region keeps
+            # compile-time-fixed resources). Only flat scalars cross the if
+            # (rm, rse, the i64 P-pack, rescale) -- the GEMM2 P@V accumulation reads
+            # V^T from LDS and is region-agnostic, so it runs after the if.
+            # Tile g lives in KV buffer g&1. Region0 tiles have their NoPE blocks
+            # DMA'd in during tile g-1's QK MFMAs; the RoPE tail (register-staged, so
+            # not a fire-and-forget DMA) and all of region1 (which needs the convert
+            # path) still load synchronously at the top of the tile. One barrier per
+            # tile covers both hazards: RAW on buf[g&1], and WAR on buf[(g+1)&1]
+            # whose last reader was tile g-1's GEMM2.
+            def _load_gemm1_select(global_t_i32, rm_in, rse_in, is_first, rp0, rp1, tb_c):
+                is_r1 = _raw(ArithValue(global_t_i32) >= ArithValue(n0_tiles))
+                # Without double buffering everything stays in buffer 0, which keeps
+                # the K/V base addresses loop-invariant so they hoist out of the tile
+                # loop. Alternating makes them a runtime select recomputed per tile.
+                if const_expr(KV_DB):
+                    is_odd = (ArithValue(global_t_i32) & 1) != 0
+                    cur_base = ArithValue(is_odd).select(p_lds_kv_1_base, p_lds_kv_0_base)
+                    cur_warp = ArithValue(is_odd).select(p_lds_kv_1_warp, p_lds_kv_0_warp)
+                    next_warp = ArithValue(is_odd).select(p_lds_kv_0_warp, p_lds_kv_1_warp)
+                    cur_rbf = ArithValue(is_odd).select(p_lds_rbf_base(1), p_lds_rbf_base(0))
+                else:
+                    cur_base = p_lds_kv_0_base
+                    cur_warp = p_lds_kv_0_warp
+                    next_warp = p_lds_kv_1_warp
+                    cur_rbf = p_lds_rbf_base(0)
+                rm_n = c_neg_large
+                rse_n = c_zero_f32
+                pp = fx.Int64(0)
+                rescale = c_one_f32
+                # The RoPE pair is region0-only (region1 either DMAs the rope or loads it
+                # synchronously), so it passes through untouched on this side.
+                nrp0 = rp0
+                nrp1 = rp1
+                ntb = tb_c
+                if is_r1:
+                    local = _raw(ArithValue(global_t_i32) - ArithValue(n0_tiles))
+                    kv_ts = _raw(ArithValue(extra_start) + ArithValue(local) * BLOCK_N)
+                    sb = c_zero_i32
+                    tb = c_zero_i32
+                    if const_expr(R1_TB_CARRY):
+                        # Resolving the address inline costs region1 615 cyc/tile at the
+                        # tile barrier against region0's 169: the DMA cannot issue until
+                        # the chain lands, so the barrier waits on it. Carrying the base
+                        # lets the DMA go out at the top of the tile as region0's does.
+                        # The boundary tile takes tb_r1_head, hoisted to the prologue, so
+                        # this stays a select instead of splitting the arm in two.
+                        tb = _raw(
+                            ArithValue(_raw(ArithValue(local) == 0)).select(
+                                _raw(tb_r1_head), _raw(tb_c)
+                            )
+                        )
+                    else:
+                        tb, sb = _row_addrs(
+                            extra_indices_rsrc, extra_bt_rsrc, extra_num_rows,
+                            extra_block_size, extra_max_blocks, kv_ts, extra_end,
+                        )
+                    if const_expr(R1_CONVERT):
+                        _load_nope_convert(
+                            extra_cache_rsrc, cur_warp, tb, sb,
+                            fx.Float32(1.0) if R1_OCP else fx.Float32(0.0),
+                        )
+                    else:
+                        _load_nope_dma(extra_cache_rsrc, cur_warp, tb)
+                    if const_expr(ROPE_FP8):
+                        _dma_rope_block(extra_cache_rsrc, cur_warp, tb)
+                    else:
+                        _load_rope_block(extra_cache_rsrc, cur_warp, tb, cur_rbf)
+                    if const_expr(R1_TB_CARRY):
+                        kv_ts_next = _raw(ArithValue(kv_ts) + BLOCK_N)
+                        ntb = _row_addrs(
+                            extra_indices_rsrc, extra_bt_rsrc, extra_num_rows,
+                            extra_block_size, extra_max_blocks, kv_ts_next, extra_end,
+                        )[0]
+                    _barrier(vmcnt=0, lgkmcnt=0)
+                    rocdl.sched_barrier(0)
+                    rm_n, rse_n, pp, rescale = _process_tile_gemm1(
+                        extra_indices_rsrc, extra_num_rows, cur_base, kv_ts, extra_end,
+                        q_nope_packs, rm_in, rse_in, is_first, q_rope_b=q_rope_packs,
+                        rbf_base=cur_rbf,
+                    )
+                else:
+                    kv_ts = _raw(ArithValue(main_start) + ArithValue(global_t_i32) * BLOCK_N)
+                    if const_expr(TB_CARRY):
+                        # Computed as tb_next during the previous tile.
+                        tb = tb_c
+                        sb = c_zero_i32
+                    else:
+                        tb, sb = _row_addrs(
+                            main_indices_rsrc, main_bt_rsrc, main_num_rows, main_block_size,
+                            main_max_blocks, kv_ts, main_end,
+                        )
+                    if const_expr(R0_CONVERT):
+                        _load_nope_convert(
+                            main_cache_rsrc, cur_warp, tb, sb,
+                            fx.Float32(1.0) if R0_OCP else fx.Float32(0.0),
+                        )
+                    elif const_expr(not KV_DB):
+                        _load_nope_dma(main_cache_rsrc, cur_warp, tb)
+                    if const_expr(ROPE_FP8):
+                        _dma_rope_block(main_cache_rsrc, cur_warp, tb)
+                    elif const_expr(ROPE_PF):
+                        _commit_rope_block(
+                            cur_warp, tb, cur_rbf,
+                            _raw(Vec.from_elements([rp0, rp1], fx.Int32)),
+                        )
+                    else:
+                        _load_rope_block(main_cache_rsrc, cur_warp, tb, cur_rbf)
+                    kv_ts_next = _raw(ArithValue(kv_ts) + BLOCK_N)
+                    tb_next, _sb_next = _row_addrs(
+                        main_indices_rsrc, main_bt_rsrc, main_num_rows, main_block_size,
+                        main_max_blocks, kv_ts_next, main_end,
+                    )
+                    _barrier(vmcnt=0, lgkmcnt=0)
+                    rocdl.sched_barrier(0)
+                    pf_kwargs = {}
+                    if const_expr(KV_DB and not R0_CONVERT):
+                        pf_kwargs = dict(
+                            p_lds_kv_next_warp=next_warp,
+                            prefetch_cache_rsrc=main_cache_rsrc,
+                            token_base_next=tb_next,
+                        )
+                    rm_n, rse_n, pp, rescale = _process_tile_gemm1(
+                        main_indices_rsrc, main_num_rows, cur_base, kv_ts, main_end,
+                        q_nope_packs, rm_in, rse_in, is_first, q_rope_b=q_rope_packs,
+                        rbf_base=cur_rbf, **pf_kwargs,
+                    )
+                    if const_expr(ROPE_PF and not ROPE_FP8):
+                        nxt = Vec(_issue_rope_load(main_cache_rsrc, tb_next))
+                        nrp0 = nxt[0]
+                        nrp1 = nxt[1]
+                    if const_expr(TB_CARRY):
+                        ntb = tb_next
+                return rm_n, rse_n, pp, rescale, cur_base, nrp0, nrp1, ntb
 
-        def _multi_tile_path():
-            init_args = (
-                [rm_first, rse_first] + oaccu_first + [rp0_first, rp1_first, tb_first]
+            # Single yield-loop over the flattened region0||region1 tile space. The
+            # first tile (g==0) is region0 tile 0 (region0 is the always-present
+            # pool) and initialises the shared softmax state via GEMM2-first.
+            rm_first, rse_first, oaccu_first, rp0_first, rp1_first, tb_first = _attend_region0(
+                main_start, c_neg_large, c_zero_f32, None, True, slot_pre=slot0_pre
             )
-            for tile_iv, state in range(_idx(1), _idx(total_tiles), _idx(1), init=init_args):
-                tile_i32 = _raw(ArithValue(fx.Int32(tile_iv)))
-                rm_c = state[0]
-                rse_c = state[1]
-                oaccu_c = [state[2 + i] for i in range(N_ACC)]
-                rp0_c = state[2 + N_ACC]
-                rp1_c = state[3 + N_ACC]
-                tb_cc = state[4 + N_ACC]
-                (
-                    rm_n, rse_n, pp, rescale, cur_base, rp0_n, rp1_n, tb_n
-                ) = _load_gemm1_select(
-                    tile_i32, rm_c, rse_c, False, rp0_c, rp1_c, tb_cc
+            has_multi = ArithValue(total_tiles) > 1
+            N_ACC = NUM_PV_ITERS * 2
+
+            def _multi_tile_path():
+                init_args = (
+                    [rm_first, rse_first] + oaccu_first + [rp0_first, rp1_first, tb_first]
                 )
-                oaccu_n = _gemm2_with_rescale(pp, rescale, oaccu_c, cur_base)
-                results = yield [rm_n, rse_n] + oaccu_n + [rp0_n, rp1_n, tb_n]
-            rm_final = results[0]
-            rse_final = results[1]
-            oaccu_final = [results[2 + i] for i in range(N_ACC)]
-            _normalize_and_store(oaccu_final, rm_final, rse_final, row_base)
+                for tile_iv, state in range(_idx(1), _idx(total_tiles), _idx(1), init=init_args):
+                    tile_i32 = _raw(ArithValue(fx.Int32(tile_iv)))
+                    rm_c = state[0]
+                    rse_c = state[1]
+                    oaccu_c = [state[2 + i] for i in range(N_ACC)]
+                    rp0_c = state[2 + N_ACC]
+                    rp1_c = state[3 + N_ACC]
+                    tb_cc = state[4 + N_ACC]
+                    (
+                        rm_n, rse_n, pp, rescale, cur_base, rp0_n, rp1_n, tb_n
+                    ) = _load_gemm1_select(
+                        tile_i32, rm_c, rse_c, False, rp0_c, rp1_c, tb_cc
+                    )
+                    oaccu_n = _gemm2_with_rescale(pp, rescale, oaccu_c, cur_base)
+                    results = yield [rm_n, rse_n] + oaccu_n + [rp0_n, rp1_n, tb_n]
+                rm_final = results[0]
+                rse_final = results[1]
+                oaccu_final = [results[2 + i] for i in range(N_ACC)]
+                _normalize_and_store(oaccu_final, rm_final, rse_final, row_base)
 
-        def _single_tile_path():
-            _normalize_and_store(oaccu_first, rm_first, rse_first, row_base)
+            def _single_tile_path():
+                _normalize_and_store(oaccu_first, rm_first, rse_first, row_base)
 
-        @flyc.jit
-        def _dispatch():
-            if has_multi:
-                _multi_tile_path()
-            else:
-                _single_tile_path()
+            @flyc.jit
+            def _dispatch():
+                if has_multi:
+                    _multi_tile_path()
+                else:
+                    _single_tile_path()
 
-        _dispatch()
+            _dispatch()
+
+        if const_expr(PERSIST_WG > 0):
+            # Contiguous run per workgroup, not a grid stride: successive queries then
+            # sit next to each other in Q, the output and the CSR ranges, which is the
+            # stream contiguity xcd_remap measured as worth 1.45%. A grid stride would
+            # jump by the grid size and give that back.
+            n_wg = _i32(_idx(gpu.grid_dim.x))
+            chunk = _i32(
+                (ArithValue(_i32(n_queries)) + ArithValue(n_wg) - 1).with_signedness(False)
+                // ArithValue(n_wg)
+            )
+            q_lo = _i32(ArithValue(_i32(_idx(q_idx))) * ArithValue(chunk))
+            q_end = _i32(ArithValue(q_lo) + ArithValue(chunk))
+            past = _raw(
+                ArithValue(q_end).with_signedness(False)
+                > ArithValue(_i32(n_queries)).with_signedness(False)
+            )
+            q_hi = _i32(ArithValue(past).select(_raw(_i32(n_queries)), _raw(q_end)))
+            for qi, _st in range(_idx(q_lo), _idx(q_hi), _idx(1), init=[c_zero_i32]):
+                # WAR across queries: the KV and V^T LDS regions are reused, so every
+                # wave must finish reading this query's tiles before any wave's DMA
+                # starts overwriting them for the next. The per-tile barrier cannot
+                # cover this -- it sits after the DMA has already been issued.
+                _barrier(lgkmcnt=0)
+                rocdl.sched_barrier(0)
+                _one_query(_idx(qi))
+                _res = yield [c_zero_i32]
+        else:
+            _one_query(q_idx)
 
     @flyc.jit
     def launch_dsv4(
@@ -1994,13 +2052,16 @@ def compile_sparse_mla_prefill_dsv4(
         extra_max_blocks: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
-        grid_x = arith.index_cast(T.index, _raw(num_queries))
+        if const_expr(PERSIST_WG > 0):
+            grid_x = _idx(PERSIST_WG)
+        else:
+            grid_x = arith.index_cast(T.index, _raw(num_queries))
         kn_sparse_mla_prefill_dsv4(
             query, main_cache, main_indices, main_indptr, main_block_table,
             extra_cache, extra_indices, extra_indptr, extra_block_table,
             q_req, sink_buf, final_output, SOFTMAX_SCALE,
             main_num_rows, extra_num_rows, main_block_size, extra_block_size,
-            main_max_blocks, extra_max_blocks,
+            main_max_blocks, extra_max_blocks, num_queries,
         ).launch(grid=(grid_x, 1, 1), block=(NUM_THREADS, 1, 1), smem=0, stream=stream)
 
     return launch_dsv4
