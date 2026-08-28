@@ -404,10 +404,20 @@ def compile_sparse_mla_prefill_dsv4(
                  for region0, so its KV DMA can issue at the top of the tile instead
                  of after the address chain. ATT motivated it -- region1 pays 615
                  cyc/tile at the tile barrier against region0's 169, because the DMA
-                 cannot go out until the chain lands -- but it MEASURED +1.39%
-                 [+1.22, +1.48] SLOWER: the dynamic branch the first region1 tile
-                 needs (its carry arrives from a region0 tile and is invalid) costs
-                 more than the early issue wins. Off by default; kept for A/B.
+                 cannot go out until the chain lands.
+
+                 MEASURED +1.21% [+1.10, +1.31] SLOWER, and it is not the boundary
+                 branch: the first version resolved the r0->r1 boundary tile with a
+                 dynamic if and cost +1.37%; hoisting that tile's base to the
+                 prologue (it is a per-query constant) and selecting with a
+                 v_cndmask recovered only 0.16%.
+
+                 The real blocker is in-order vmcnt. Issuing the DMA before the
+                 chain gains nothing because _row_addrs's own two dependent
+                 vmcnt(0) drains immediately flush it -- and it is now older in the
+                 queue, so it is what the drain waits on first. Reordering cannot
+                 help here; only partial counts or one less dependent load would.
+                 Off by default; kept for A/B.
     rope_bf16:   dot the 64 RoPE dims in bf16 (vLLM NoPE-fp8 / RoPE-bf16
                  contract) instead of re-quantizing them to fp8.
     vt_inreg:    read V straight from the KV tile in GEMM2 and transpose it in
@@ -1683,6 +1693,19 @@ def compile_sparse_mla_prefill_dsv4(
         n1_tiles = _raw((ArithValue(extra_len) + (BLOCK_N - 1)).with_signedness(False) // BLOCK_N)
         total_tiles = _raw(ArithValue(n0_tiles) + ArithValue(n1_tiles))
 
+        if const_expr(R1_TB_CARRY):
+            # The r0->r1 boundary tile cannot take the carry: the trailing region0
+            # tile computes tb_next against main_* and gets -1 past main_end. But
+            # that tile's own base is a per-query constant -- for local==0,
+            # kv_ts == extra_start and _row_addrs then depends only on prologue
+            # values -- so resolve it once here instead. The region1 arm can then
+            # pick between this and the carry with a v_cndmask rather than the
+            # dynamic branch that made the first attempt at this 1.37% slower.
+            tb_r1_head = _row_addrs(
+                extra_indices_rsrc, extra_bt_rsrc, extra_num_rows, extra_block_size,
+                extra_max_blocks, extra_start, extra_end,
+            )[0]
+
         row_base = _idx(q_idx) * NUM_QO_HEADS + warp_idx * 16
         # Tile 0's CSR slot goes out before the Q loads so the two round trips
         # overlap and ``_load_q_direct``'s vmcnt(0) covers both. Left in series
@@ -1813,16 +1836,13 @@ def compile_sparse_mla_prefill_dsv4(
                     # tile barrier against region0's 169: the DMA cannot issue until
                     # the chain lands, so the barrier waits on it. Carrying the base
                     # lets the DMA go out at the top of the tile as region0's does.
-                    # The first region1 tile is the exception -- its carry comes from
-                    # a region0 tile computed against main_*, which is -1 past
-                    # main_end -- so that one still resolves inline.
-                    if _raw(ArithValue(local) == 0):
-                        tb = _row_addrs(
-                            extra_indices_rsrc, extra_bt_rsrc, extra_num_rows,
-                            extra_block_size, extra_max_blocks, kv_ts, extra_end,
-                        )[0]
-                    else:
-                        tb = tb_c
+                    # The boundary tile takes tb_r1_head, hoisted to the prologue, so
+                    # this stays a select instead of splitting the arm in two.
+                    tb = _raw(
+                        ArithValue(_raw(ArithValue(local) == 0)).select(
+                            _raw(tb_r1_head), _raw(tb_c)
+                        )
+                    )
                 else:
                     tb, sb = _row_addrs(
                         extra_indices_rsrc, extra_bt_rsrc, extra_num_rows,
