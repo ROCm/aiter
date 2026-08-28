@@ -5,8 +5,9 @@
 
 Correctness (pytest, Mi=512): dispatch config resolution, cos > 0.999 vs torch-eager
 reference on all three grads (dJagged, dDense, dBias), tail-over-read regression,
-forced split=2 reduce-path coverage, end-to-end autograd at headline shapes, and
-multi-device backward (cuda:1 tensors, current device cuda:0).
+forced split=2 reduce-path coverage, end-to-end autograd at headline shapes,
+multi-device backward (cuda:1 tensors, current device cuda:0), and large-B
+(n_groups>=8192) int32 offset boundary at D=512.
 
 Performance (``main()``, Mi=7680): FlyDSL vs upstream Triton on headline deployment
 shapes, swept over regime and backward component (``jagged`` / ``dense_bias`` / ``all``).
@@ -77,6 +78,12 @@ _HEADLINE = [
     (1024, 512, "skew"),
 ]
 _REGRESSION = {"B": 32, "Mi": 2048, "regime": "genrec", "seed": 1234, "sparsity": 0.95}
+# Large n_groups with minimal Mi to bound memory and eager-ref cost. Group 8192
+# hits off_b*D*D = 2^31 in int32 (b_row_off in grad_jagged); Mi=1 keeps L small.
+# Run only in _worker(D=512).
+_LARGE_B_OVERFLOW = [
+    (8193, 1, "uniform"),
+]
 
 _PERF_SHAPES = [
     (120, 256, 256),
@@ -427,6 +434,11 @@ def _worker(D: int) -> int:
         print(msg)
 
     if D == 512:
+        for B, Mi, regime in _LARGE_B_OVERFLOW:
+            case_ok, msg = _run_case(D, B, Mi, regime, label="[large-B] ")
+            ok &= case_ok
+            print(msg)
+
         r = _REGRESSION
         case_ok, msg = _run_case(
             D,
