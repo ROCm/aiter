@@ -131,16 +131,14 @@ def config_key(params: _UAParams, op: str) -> str:
 
     if op == "attn_2d":
         if not params.all_decode:
-            # head_size outranks max_seqlen_q: the large-prefill BLOCK_M only
-            # applies below the head_size branches
             if params.head_size >= 512:
                 key = "prefill_hge512"
             elif params.head_size >= 256:
                 key = "prefill_hge256"
-            elif params.max_seqlen_q >= 256:
-                key = "prefill_qge256"
             else:
                 key = "prefill"
+            if params.max_seqlen_q >= 256:
+                key += "_qge256"
             if params.sliding_window > 0:
                 key += "_sw"
             if params.max_seqlen_k < 2048:
