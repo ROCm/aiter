@@ -4,6 +4,7 @@
 """General utilities shared across all FlyDSL kernel families."""
 
 import importlib.util
+import os
 from functools import cache, lru_cache
 
 import torch
@@ -47,7 +48,15 @@ def _get_shared_memory_per_block_cached(device_index: int, fallback_gfx: str) ->
 
 
 def get_shared_memory_per_block(device=None, fallback_gfx: str = "") -> int:
-    """Return per-block shared memory/LDS limit for the active device."""
+    """Return per-block shared memory/LDS limit for the compile/run target.
+
+    AOT sets FLYDSL_GPU_ARCH to the job's target, which may differ from the
+    live GPU. Prefer that over torch.cuda device properties so a gfx942
+    builder can compile gfx950 kernels that need more than 64 KiB LDS.
+    """
+    aot_arch = os.environ.get("FLYDSL_GPU_ARCH", "").strip()
+    if aot_arch:
+        return addressable_lds_bytes_for_gfx(aot_arch)
     if device is None:
         device = _default_cuda_device_index()
     elif isinstance(device, torch.device):
