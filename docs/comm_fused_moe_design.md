@@ -25,7 +25,7 @@ AITer 公共层
   复用普通 MoE 到 Stage1，通过 _stage2_override 接管 Stage2
         ↓
 后端 runner
-  FlyDSL full-width / windowed / persistent-window
+  FlyDSL M=1 megakernel / full-width / windowed / persistent-window
   以后可以增加 Opus / ASM
 ```
 
@@ -38,14 +38,14 @@ shape 或 M winner 直接报错，不在融合路径里静默回退普通 Stage2
 
 | 文件 | 唯一职责 |
 | --- | --- |
-| `aiter/ops/flydsl/comm_fused_moe_host.py` | CSV exact lookup、通信资源、三种真实 pipeline 和 lazy runner cache |
+| `aiter/ops/flydsl/comm_fused_moe_host.py` | CSV exact lookup、通信资源、真实 pipeline 和 lazy runner cache |
 | `op_tests/multigpu_tests/tune_comm_fused_moe.py` | 离线候选、完整 pipeline 测量、精度 gate 和 CSV 输出 |
 | `aiter/configs/comm_fused_moe.csv` | 所有 production winner |
-| `aiter/ops/flydsl/kernels/comm_fused_moe/*.py` | 三种 GPU 算法，不保存 production bucket 表 |
+| `aiter/ops/flydsl/kernels/comm_fused_moe/*.py` | GPU 算法，不保存 production bucket 表 |
 
 生产包只保留 host、winner CSV 和 kernel。离线 tuner 位于 `op_tests`，不会被生产路径导入。
 没有独立 runners package，也不再为 spec、factory、common 和每个 runner 建文件。GPU 算法
-仍按 full/window/persistent 分成三个 kernel 文件。
+按 small/full/window/persistent 分文件维护。
 
 这里没有为了压低 `host.py` 行数把代码搬到别处。buffer 注册、launch 顺序、barrier 和三种
 pipeline 都是真实 host runtime，因此保留在一个文件中；新增 shape/M 不会继续增加这些代码。
@@ -72,6 +72,7 @@ winner 直接保存在一个 CSV 中，每行对应一个 exact ShapeKey/M：
 
 ```csv
 gfx,...,m,kid,family,tile_m,tile_n,tile_k,sort_block_m,window,...
+gfx950,...,1,small_m1_tm16_tn512,small,16,512,128,32,,...
 gfx950,...,256,full_tm32_...,full,32,256,128,32,,...
 gfx950,...,8192,window_tm64_...,window,64,256,128,64,1024,...
 gfx950,...,32768,persistent_tm64_...,persistent,64,256,128,64,1024,...

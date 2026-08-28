@@ -15,6 +15,7 @@ from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.flydsl.kernels.comm_fused_moe import atomic_compressed
 from aiter.ops.flydsl.kernels.comm_fused_moe import full_width
 from aiter.ops.flydsl.kernels.comm_fused_moe import persistent_window
+from aiter.ops.flydsl.kernels.comm_fused_moe import small_m_allreduce
 from aiter.ops.flydsl.kernels.comm_fused_moe import windowed
 from aiter.ops.flydsl.kernels.comm_fused_moe.sync import (
     FLAT_VA_RANK_STRIDE,
@@ -38,12 +39,14 @@ class ShapeKey:
 
 
 PipelineConfig = (
-    atomic_compressed.Config
+    small_m_allreduce.Config
+    | atomic_compressed.Config
     | full_width.Config
     | windowed.Config
     | persistent_window.Config
 )
 _CONFIG_TYPES = {
+    "small": small_m_allreduce.Config,
     "atomic": atomic_compressed.Config,
     "full": full_width.Config,
     "window": windowed.Config,
@@ -132,6 +135,115 @@ def _stage2_args(args, kwargs, kernels, config):
         kernels.I,
         int(sorted_expert_ids.shape[0]) * config.sort_block_m // config.tile_m,
     )
+
+
+class _SmallMRunner:
+    """Exact small-M single-launch GEMM2 + TP8 AllReduce runner."""
+
+    def __init__(self, tp_group, config: small_m_allreduce.Config) -> None:
+        k = small_m_allreduce
+        config.validate()
+        if get_gfx_runtime() != "gfx950" or int(tp_group.world_size) != k.TP:
+            raise ValueError(
+                "small-M megakernel requires gfx950 TP8, got "
+                f"gfx={get_gfx_runtime()} tp={int(tp_group.world_size)}"
+            )
+        self.config = config
+        self.rank = int(tp_group.rank_in_group)
+        self.device = torch.device(tp_group.device)
+        self.routes = symm_mem.empty(
+            (config.m * k.M1_TOPK, k.DEFAULT_HIDDEN),
+            dtype=torch.bfloat16,
+            device=self.device,
+        )
+        self.partial = symm_mem.empty(
+            (k.M1_PARTIAL_BUFFERS, config.m, k.DEFAULT_HIDDEN),
+            dtype=torch.bfloat16,
+            device=self.device,
+        )
+        self.state = _symmetric(self.device, (k.m1_state_layout(config)[-1],))
+        self.output = torch.empty(
+            (config.m, k.DEFAULT_HIDDEN),
+            dtype=torch.bfloat16,
+            device=self.device,
+        )
+        self.state.zero_()
+        self.comm, self.windows, bases = _register(
+            tp_group, self.rank, k.TP, (self.routes, self.partial, self.state)
+        )
+        _routes_flat_base, self.partial_flat_base, self.state_flat_base = bases
+        self.kernel = k.compile_m1_gemm2_allreduce(config, self.rank)
+
+    def __call__(
+        self,
+        *,
+        stage2_args: tuple,
+        stage2_kwargs: dict,
+        shared_partial,
+        ordinary_stage2,
+    ):
+        del ordinary_stage2
+        k = small_m_allreduce
+        if tuple(shared_partial.shape) != (self.config.m, k.DEFAULT_HIDDEN):
+            raise ValueError(
+                "small-M megakernel requires shared_partial shape "
+                f"({self.config.m}, {k.DEFAULT_HIDDEN}), got "
+                f"{tuple(shared_partial.shape)}"
+            )
+        if int(stage2_args[7]) != k.M1_TOPK:
+            raise ValueError(
+                f"small-M megakernel requires topk={k.M1_TOPK}, "
+                f"got {int(stage2_args[7])}"
+            )
+        inter_states, w2 = stage2_args[0], stage2_args[2]
+        sorted_token_ids, sorted_expert_ids, num_valid_ids = stage2_args[3:6]
+        sorted_weights = stage2_kwargs["sorted_weights"]
+        if sorted_weights is None:
+            raise ValueError("small-M megakernel requires Stage2 routing weights")
+        if (
+            stage2_kwargs.get("a2_scale") is None
+            or stage2_kwargs.get("w2_scale") is None
+        ):
+            raise ValueError(
+                "small-M megakernel requires FP8 activation and FP4 weight scales"
+            )
+        # The sorting buffers reserve entries for every expert.  Launching that
+        # full capacity would create hundreds of empty GEMM CTAs at tiny M.
+        # Each token can contribute at most one row to each of its TOPK experts,
+        # so M*TOPK is a safe host-side upper bound on active sort blocks.
+        sort_blocks = min(
+            int(sorted_expert_ids.shape[0]), self.config.m * k.M1_TOPK
+        )
+        size_expert_ids = (
+            sort_blocks * self.config.sort_block_m // self.config.tile_m
+        )
+        _run_compiled(
+            self.kernel,
+            (
+                ptr_arg(self.routes),
+                ptr_arg(inter_states),
+                ptr_arg(w2),
+                ptr_arg(stage2_kwargs["a2_scale"].view(-1)),
+                ptr_arg(stage2_kwargs["w2_scale"].view(-1)),
+                ptr_arg(sorted_token_ids),
+                ptr_arg(sorted_expert_ids),
+                ptr_arg(sorted_weights),
+                ptr_arg(num_valid_ids),
+                ptr_arg(shared_partial),
+                self.config.m,
+                k.DEFAULT_HIDDEN,
+                k.M1_INTER_DIM,
+                size_expert_ids,
+                ptr_arg(self.partial),
+                fx.Int64(self.partial_flat_base),
+                ptr_arg(self.state),
+                fx.Int64(self.state_flat_base),
+                ptr_arg(self.output),
+                self.rank,
+                torch.cuda.current_stream(self.device),
+            ),
+        )
+        return self.output
 
 
 class _AtomicCompressedRunner:
@@ -482,15 +594,8 @@ class _WindowedRunner:
 
 
 class _PersistentWindowRunner:
-    def __init__(
-        self,
-        tp_group,
-        config: persistent_window.Config,
-        *,
-        schedule: persistent_window.Schedule | None = None,
-    ) -> None:
+    def __init__(self, tp_group, config: persistent_window.Config) -> None:
         k = persistent_window
-        schedule = schedule or k.Schedule()
         self.config = config
         self.rank = int(tp_group.rank_in_group)
         self.device = torch.device(tp_group.device)
@@ -531,15 +636,14 @@ class _PersistentWindowRunner:
         self.service = k.compile_stage2_service(config)
         self.phase0_compute = (
             k.compile_stage2_compute(config, 0)
-            if schedule.producer_workers_per_n_tile is None
+            if config.producer_workers_per_n_tile == 0
             else k.compile_stage2_compute_bounded(
                 config,
                 0,
-                schedule.producer_workers_per_n_tile,
-                schedule.producer_ctas_per_cu_limit,
+                config.producer_workers_per_n_tile,
+                config.producer_ctas_per_cu_limit,
             )
         )
-        self.schedule = schedule
         self.service_stream = torch.cuda.Stream(
             device=self.device,
             priority=-1,
@@ -618,6 +722,7 @@ class _PersistentWindowRunner:
 
 
 _RUNNER_TYPES = {
+    small_m_allreduce.Config: _SmallMRunner,
     atomic_compressed.Config: _AtomicCompressedRunner,
     full_width.Config: _FullWidthRunner,
     windowed.Config: _WindowedRunner,
@@ -626,12 +731,6 @@ _RUNNER_TYPES = {
 
 
 def create_runner(tp_group, config: PipelineConfig):
-    if isinstance(config, persistent_window.Config):
-        return _PersistentWindowRunner(
-            tp_group,
-            config,
-            schedule=persistent_window.production_schedule(config),
-        )
     return _RUNNER_TYPES[type(config)](tp_group, config)
 
 

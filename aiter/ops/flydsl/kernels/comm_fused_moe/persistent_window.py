@@ -52,6 +52,8 @@ class Config:
     window: int
     local_workers: int
     service_grid: int
+    producer_workers_per_n_tile: int = 0
+    producer_ctas_per_cu_limit: int = 1
 
     @property
     def shard_rows(self) -> int:
@@ -102,31 +104,6 @@ class Config:
         return self.shard_rows * self.groups_per_row
 
 
-@dataclass(frozen=True)
-class Schedule:
-    producer_workers_per_n_tile: int | None = None
-    producer_ctas_per_cu_limit: int = 1
-
-
-_DEFAULT_SCHEDULE = Schedule()
-_PRODUCTION_SCHEDULES = {
-    # Four N tiles per 1024-wide window: 112 * 4 = 448 producer CTAs.
-    2048: Schedule(
-        producer_workers_per_n_tile=112,
-        producer_ctas_per_cu_limit=2,
-    ),
-    # Four N tiles per 1024-wide window: 104 * 4 = 416 producer CTAs.
-    16384: Schedule(
-        producer_workers_per_n_tile=104,
-        producer_ctas_per_cu_limit=2,
-    ),
-}
-
-
-def production_schedule(config: Config) -> Schedule:
-    return _PRODUCTION_SCHEDULES.get(config.m, _DEFAULT_SCHEDULE)
-
-
 def _config_cache_tag(kind: str, config: Config, *extra: int):
     """Return only stable scalar values used by a FlyDSL specialization.
 
@@ -145,6 +122,8 @@ def _config_cache_tag(kind: str, config: Config, *extra: int):
         config.window,
         config.local_workers,
         config.service_grid,
+        config.producer_workers_per_n_tile,
+        config.producer_ctas_per_cu_limit,
         *extra,
     )
 

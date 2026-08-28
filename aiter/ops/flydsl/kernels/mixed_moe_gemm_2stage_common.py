@@ -3451,6 +3451,7 @@ def compile_mixed_moe_gemm2_common(
     _n_tile_range: tuple[int, int] | None = None,
     _persistent_cu_num: int | None = None,
     _compose_entry=None,
+    _direct_small_m_rows: int = 0,
 ):
     """Compile stage2 kernel (moe_gemm2): A2 @ W2.T -> [tokens, model_dim], atomic-add."""
     heterogeneous_b = shared_expert_id is not None
@@ -3568,6 +3569,20 @@ def compile_mixed_moe_gemm2_common(
         raise ValueError(
             "compile_moe_gemm2(accumulate=False) only supports out_dtype in {'f16','bf16','fp8'}"
         )
+    if const_expr(
+        _direct_small_m_rows
+        and (
+            bool(accumulate)
+            or persist_m != 1
+            or tile_m != 16
+            or need_fp8_out
+            or _direct_small_m_rows not in (1, 2, 4, 8, 16)
+        )
+    ):
+        raise ValueError(
+            "_direct_small_m_rows requires 1 <= rows <= tile_m, "
+            "accumulate=False, persist_m=1, tile_m=16, and an f16/bf16 output"
+        )
     w_elem_bytes = 1
     w_elem_pack = 2 if is_f4_b else 1
     w_nbytes = (experts * model_dim * inter_dim * w_elem_bytes) // w_elem_pack
@@ -3617,7 +3632,11 @@ def compile_mixed_moe_gemm2_common(
     def load_bias_scalar(bias_rsrc, offset):
         return buffer_ops.buffer_load(bias_rsrc, offset, vec_width=1, dtype=T.f32)
 
-    epilog_tag = "cshuffle"
+    epilog_tag = (
+        f"row{_direct_small_m_rows}direct_v2"
+        if _direct_small_m_rows
+        else "cshuffle"
+    )
     persistent = persist_m <= 0
     bounded_persistent = persistent and _persistent_cu_num is not None
     if const_expr(not isinstance(cu_num_mul, int) or cu_num_mul < 1):
@@ -3662,7 +3681,11 @@ def compile_mixed_moe_gemm2_common(
         f"_t{tile_m}x{tile_n}x{tile_k}{variant_tags}"
     ).replace("-", "_")
     lds_x_bytes = 2 * int(tile_m) * int(lds_stride) * int(a_elem_bytes)
-    lds_out_bytes = 2 * int(tile_m) * int(tile_n) if _use_cshuffle_epilog else 0
+    lds_out_bytes = (
+        0
+        if _direct_small_m_rows
+        else (2 * int(tile_m) * int(tile_n) if _use_cshuffle_epilog else 0)
+    )
     lds_tid_bytes = int(tile_m) * 4
     lds_tw_bytes = (int(tile_m) * 4) if bool(doweight_stage2) else 0
     lds_total_bytes = max(lds_x_bytes, lds_out_bytes) + lds_tid_bytes + lds_tw_bytes
@@ -3822,7 +3845,11 @@ def compile_mixed_moe_gemm2_common(
             )
 
             lds_x_b = 2 * int(tile_m) * int(lds_stride) * int(a_elem_bytes)
-            lds_out_b = 2 * int(tile_m) * int(tile_n) if _use_cshuffle_epilog else 0
+            lds_out_b = (
+                0
+                if _direct_small_m_rows
+                else (2 * int(tile_m) * int(tile_n) if _use_cshuffle_epilog else 0)
+            )
             lds_tid_off = max(lds_x_b, lds_out_b)
             lds_tid = SmemPtr(
                 base_ptr, lds_x_ptr.byte_offset + lds_tid_off, T.i32, shape=(tile_m,)
@@ -5410,34 +5437,117 @@ def compile_mixed_moe_gemm2_common(
                             alignment=e_vec * out_elem_bytes,
                         )
 
-                e_vec = 2 if accumulate else min(body_tile_n // 32, 8)
-                rocdl.s_setprio(3)
-                c_shuffle_epilog(
-                    arith=arith,
-                    vector=vector,
-                    gpu=gpu,
-                    scf=scf,
-                    range_constexpr=range_constexpr,
-                    tile_m=tile_m,
-                    tile_n=body_tile_n,
-                    e_vec=e_vec,
-                    m_repeat=m_repeat,
-                    num_acc_n=body_num_acc_n,
-                    tx=tx,
-                    lane_div_16=lane_div_16,
-                    lane_mod_16=lane_mod_16,
-                    bx_m=bx_m,
-                    by_n=body_by_n,
-                    n_tile_base=n_tile_base,
-                    lds_out=lds_out,
-                    frag_elem_type=(
-                        ir.BF16Type.get() if out_is_bf16 else ir.F16Type.get()
-                    ),
-                    write_row_to_lds=write_row_to_lds,
-                    precompute_row=precompute_row,
-                    store_pair=store_pair,
-                )
-                rocdl.s_setprio(0)
+                if const_expr(_direct_small_m_rows):
+                    # Small-M specialization for the composed megakernel only.
+                    # Reuse the standard MFMA row mapping, but store each valid
+                    # row directly instead of materializing a full C tile in LDS.
+                    direct_ii_count = min(4, _direct_small_m_rows)
+
+                    def direct_body_row(*, mi, ii, row_in_tile, row):
+                        # For M=1/2 only the first one/two accumulator rows exist;
+                        # do not even materialize metadata code for the remaining
+                        # compile-time ii values produced by default_epilog.
+                        if ii >= direct_ii_count:
+                            return
+                        row_ctx, row_valid = precompute_row(
+                            row_local=row_in_tile, row=row
+                        )
+                        direct_if = scf.IfOp(row_valid)
+                        with ir.InsertionPoint(direct_if.then_block):
+                            _fused, row_byte_base, _row_byte_off = row_ctx
+                            if const_expr(doweight_stage2):
+                                tw_idx = mi * 4 + ii
+                                tw = (
+                                    tw_pf[tw_idx]
+                                    if tw_pf is not None
+                                    else buffer_ops.buffer_load(
+                                        sorted_w_rsrc,
+                                        row,
+                                        vec_width=1,
+                                        dtype=f32,
+                                    )
+                                )
+                            for ni in range_constexpr(body_num_acc_n):
+                                acc_idx = mi * body_num_acc_n + ni
+                                value = vector.extract(
+                                    acc[acc_idx],
+                                    static_position=[ii],
+                                    dynamic_position=[],
+                                )
+                                if const_expr(enable_bias):
+                                    value = value + bias_pf[ni]
+                                if const_expr(doweight_stage2):
+                                    value = value * tw
+                                value_out = arith.trunc_f(out_elem(), value)
+                                col = (
+                                    body_by_n
+                                    + n_tile_base
+                                    + arith.constant(ni * 16, index=True)
+                                    + lane_mod_16
+                                )
+                                ptr_addr = row_byte_base + col * arith.constant(
+                                    out_elem_bytes, index=True
+                                )
+                                value_raw = (
+                                    value_out._value
+                                    if hasattr(value_out, "_value")
+                                    else value_out
+                                )
+                                llvm.StoreOp(
+                                    value_raw,
+                                    idx_to_llvm_ptr(ptr_addr),
+                                    alignment=out_elem_bytes,
+                                    nontemporal=True,
+                                )
+                            scf.YieldOp([])
+
+                    active_lane_groups = (_direct_small_m_rows + 3) // 4
+                    direct_lanes = scf.IfOp(
+                        arith.cmpi(
+                            CmpIPredicate.ult,
+                            lane_div_16,
+                            arith.index(active_lane_groups),
+                        )
+                    )
+                    with ir.InsertionPoint(direct_lanes.then_block):
+                        default_epilog(
+                            arith=arith,
+                            range_constexpr=range_constexpr,
+                            m_repeat=m_repeat,
+                            lane_div_16=lane_div_16,
+                            bx_m=bx_m,
+                            body_row=direct_body_row,
+                        )
+                        scf.YieldOp([])
+                else:
+                    e_vec = 2 if accumulate else min(body_tile_n // 32, 8)
+                    rocdl.s_setprio(3)
+                    c_shuffle_epilog(
+                        arith=arith,
+                        vector=vector,
+                        gpu=gpu,
+                        scf=scf,
+                        range_constexpr=range_constexpr,
+                        tile_m=tile_m,
+                        tile_n=body_tile_n,
+                        e_vec=e_vec,
+                        m_repeat=m_repeat,
+                        num_acc_n=body_num_acc_n,
+                        tx=tx,
+                        lane_div_16=lane_div_16,
+                        lane_mod_16=lane_mod_16,
+                        bx_m=bx_m,
+                        by_n=body_by_n,
+                        n_tile_base=n_tile_base,
+                        lds_out=lds_out,
+                        frag_elem_type=(
+                            ir.BF16Type.get() if out_is_bf16 else ir.F16Type.get()
+                        ),
+                        write_row_to_lds=write_row_to_lds,
+                        precompute_row=precompute_row,
+                        store_pair=store_pair,
+                    )
+                    rocdl.s_setprio(0)
 
             all_valid = arith.andi(blk_valid, arith.andi(exp_valid, tile_has_tokens))
 

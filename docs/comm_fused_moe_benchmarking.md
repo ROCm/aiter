@@ -22,7 +22,7 @@ ordinary:
 
 fused:
   当前 comm_fused_moe.csv 选中的 production runner
-  -> full / window / persistent / atomic
+  -> small / full / window / persistent / atomic
 ```
 
 `ordinary` 是 `origin/main` 使用的算法路径，但不是从另一个 Git worktree 动态加载的代码。

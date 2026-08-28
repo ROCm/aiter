@@ -24,7 +24,7 @@ from aiter.ops.flydsl.kernels.comm_fused_moe import windowed
 CSV_FIELDS = tuple(
     "gfx model_dim inter_dim experts topk tp m family tile_m tile_n tile_k "
     "sort_block_m window local_workers reduce_scatter_grid all_gather_grid "
-    "service_grid".split()
+    "service_grid producer_workers_per_n_tile producer_ctas_per_cu_limit".split()
 )
 _WINNER_KEY_FIELDS = (
     "gfx",
