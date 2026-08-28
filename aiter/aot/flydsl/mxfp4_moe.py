@@ -134,7 +134,6 @@ def parse_csv(csv_path: str):
         for row in csv.DictReader(f):
             token = int(row["token"])
             topk = int(row["topk"])
-            # Shape comes from CSV columns; v2 GEMM2 aligns K to its encoded BK.
             model_dim = int(row["model_dim"])
             expert = int(row["expert"])
             inter_dim = int(row["inter_dim"])
@@ -244,8 +243,6 @@ def parse_csv(csv_path: str):
                             "has_pad": inter_dim_pad > 0 or model_dim_pad > 0,
                             "out_dtype": out_dtype,
                             "enable_bias": enable_bias,
-                            # In the compiled kernel tag: must match the runtime
-                            # wrapper or the AOT entry is keyed differently.
                             "g2_spart": v2_g2["spart"],
                             "g2_bf16_lds": v2_g2["bf16_lds"],
                         }

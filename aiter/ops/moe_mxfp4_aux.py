@@ -1,30 +1,11 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-#
-# mxfp4_moe -- HIP aux kernels (sort / quant / sort_scales / scatter_reduce) for
-# the MXFP4 A4W4/A8W4 MoE paths. The gemm1/gemm2 themselves run on the FlyDSL port
-# (aiter/ops/flydsl/mxfp4_gemm{1,2}*.py); only these shared aux ops stay in HIP.
-#
-# Each function is a thin @compile_ops binding to a C++ host entry in
-# csrc/kernels/mxfp4_moe/moe_mxfp4_aux.cu. The codegen'd dispatch switches on
-# (NE, TOPK, D_HIDDEN, MB); D_INTER is retained in the support metadata because
-# it determines whether GEMM1/GEMM2 layouts are covered.
-#
-# Shape-parameter glossary (uppercase params on the host-side wrappers):
-#   NE       = num routed experts + 1 shared expert (e.g. 385 for Kimi-K2.5)
-#   TOPK     = top_k + 1 shared
-#   D_HIDDEN = model hidden_size
-#   D_INTER  = per-shard MLP intermediate size = moe_intermediate_size / TP
-#              (mirrors D_HIDDEN naming; the "INTER" matches aiter's main
-#              `inter_dim` convention. Not the expert count.)
-#   MB       = block_m (sort/gemm block size, one of {16, 32, 64, 128})
 
 from torch import Tensor
 
 from ..jit.core import compile_ops
 
-# Keep synchronized with moe_aux/codegen/gen_instances.py::SHAPES. The
-# replacement-dispatch test compares the two definitions.
+# Keep synchronized with moe_aux/codegen/gen_instances.py::SHAPES.
 MXFP4_MOE_SUPPORTED_SHAPES = frozenset(
     {
         (385, 7168, 512, 9),

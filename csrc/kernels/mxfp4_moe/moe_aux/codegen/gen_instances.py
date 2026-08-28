@@ -1,20 +1,11 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-#
-# Codegen for the mxfp4_moe aux template instances (sort / quant / sort_scales /
-# scatter_reduce). The gemm1/gemm2 themselves run on the FlyDSL port
-# (aiter/ops/flydsl/mxfp4_gemm{1,2}*.py); only these shared aux kernels are HIP.
-#
-# Follows the aiter codegen convention: a single codegen class enumerates
-# instance records, fans each out into its own .cu translation unit, and emits a
-# string -> function-pointer lookup header.
 
 import argparse
 from pathlib import Path
 from typing import Any, ClassVar
 
-# -- Supported shape tuples -------------------------------------------------
 # (NE, D_HIDDEN, D_INTER, TOPK)
 SHAPES = [
     (385, 7168, 512, 9),  # Kimi-K2.5 TP=4
@@ -56,16 +47,8 @@ SHAPES = [
 ]
 
 
-# -- Instance record --------------------------------------------------------
 class Instance:
-    """One codegen'd template instance.
-
-    name      kernelName (the dispatch key + the extern "C" symbol).
-    fn_type   the aux_dispatch function-pointer type.
-    include   the .cuh that defines the launch<...> template.
-    params    extern "C" parameter list (one of the *_PARAMS strings).
-    body      the launch<...> call wrapped by the extern "C" function.
-    """
+    """One generated template instance."""
 
     __slots__ = ("body", "fn_type", "include", "name", "params")
 

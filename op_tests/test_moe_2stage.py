@@ -474,7 +474,6 @@ def test_fmoe(
         "beta": beta,
         "linear_beta": linear_beta,
         "gate_mode": gateMode,
-        # No-op unless the selected config uses the a4w4 aux sort.
         "output_aux": args.output_aux,
     }
 

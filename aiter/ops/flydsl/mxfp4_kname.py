@@ -1,12 +1,5 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-#
-# Pure mxmoe kernel-name parsing (no torch / JIT deps) so the AOT pre-compile
-# pass can import it without triggering JIT module loads.
-#
-# Legacy name: flydsl_mxmoe_g{1,2}_a4w4_<BM>x256x256[_flag...], lowercase.
-# New GEMM1 names use activation flags; activation-specific scalar values are
-# fixed by the activation contract and remain in FlyDSL's closure cache key.
 
 import re
 
@@ -27,7 +20,7 @@ _MXMOE_G1_FLAG_TOKENS = {
 }
 _MXMOE_G2_FLAG_TOKENS = {"NT", "ATOMIC", "F4OUT", "CSHUFFLE"}
 _MXMOE_NUMERIC_RE = re.compile(r"^([A-Z]+)(\d+)$")
-_MXMOE_TILE_RE = re.compile(r"^(\d+)x(\d+)x(\d+)$")  # <BM>x<BN>x<BK>
+_MXMOE_TILE_RE = re.compile(r"^(\d+)x(\d+)x(\d+)$")
 _MXMOE_PREFIX = {1: "flydsl_mxmoe_g1_a4w4_", 2: "flydsl_mxmoe_g2_a4w4_"}
 _MXMOE_G1_PREFIX_RE = re.compile(r"^flydsl_mxmoe_g1_a(?P<a>[48])w4_")
 
@@ -66,7 +59,7 @@ def _make_mxfp4_g1_kname(
     num_waves: int = 4,
     k_wave: int = 1,
 ) -> str:
-    """Build a cache-safe GEMM1 name; legacy a4w4 names remain byte-for-byte."""
+    """Build a GEMM1 kernel name."""
     a_dtype = str(a_dtype).lower()
     out_dtype = str(out_dtype).lower()
     act = str(act).lower()

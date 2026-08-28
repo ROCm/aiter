@@ -60,54 +60,17 @@ from aiter.ops.opus.moe_stage1_a8w4 import (
 
 BLOCK_SIZE_M = 32
 
-# Sorting backend flags (mutually exclusive; CK > FlyDSL > Opus priority).
-# Default is Opus.  Set AITER_USE_FLYDSL_MOE_SORTING=1 to prefer FlyDSL when available.
 _USE_CK_MOE_SORTING = os.environ.get("AITER_USE_CK_MOE_SORTING", "0") == "1"
 _USE_FLYDSL_MOE_SORTING = os.environ.get("AITER_USE_FLYDSL_MOE_SORTING", "0") == "1"
-# "adaptive sort" backend selection (mxfp4 sort as a general World-1 backend):
-#   auto (default) / adaptive -> use the adaptive branch. NO shape fallback: the
-#     kernel is codegen'd for a fixed shape set (SHAPES in
-#     csrc/kernels/mxfp4_moe/moe_aux/codegen/gen_instances.py) and an un-codegen'd
-#     shape hits TORCH_CHECK. The MXFP4 replacement capability check must match
-#     that generated shape set before setting output_aux.
-#   opus / ck -> never use adaptive (legacy; ck still needs AITER_USE_CK_MOE_SORTING)
+# Adaptive sort has no shape fallback, so output_aux is limited to generated shapes.
 _MOE_SORT_BACKEND = os.environ.get("AITER_MOE_SORT_BACKEND", "auto").lower()
 
-# ``output_aux`` values. It gates the whole a4w4 aux-sort path, so it also picks
-# which prologue serves it -- all three states are truthy-compatible with the
-# plain ``if output_aux:`` tests elsewhere.
-#
-#   False              -- no aux arrays; ordinary sorting.
-#   True / "threestage"-- aux via the port's own 3-stage sort
-#                         (csrc/kernels/mxfp4_moe/moe_aux/moe_3stage_sort.cuh),
-#                         through _adaptive_moe_sort. The original path; pass
-#                         it explicitly to get the pre-Opus behaviour back.
-#   "opus"             -- aux via the Opus sorter's *multi-phase* kernels, which
-#                         emit m_indices / reverse_sorted too
-#                         (MoeSortingMultiPhaseKernel_P23/_P3). Until they did,
-#                         aux callers were pinned to dispatch_policy=1 -- the
-#                         single-CTA kernel -- which is why the port grew a sort
-#                         of its own. The mp path runs one CTA per expert.
-#                         Applies only at block_m != 16; see _aux_uses_opus.
-#                         This is what the MXFP4 a4w4 configs select by default.
-#
-# Both aux modes produce the same sorted_token_ids / m_indices / reverse_sorted
-# contract; they differ only in which kernels get there.
 AUX_SORT_THREESTAGE = "threestage"
 AUX_SORT_OPUS = "opus"
 
 
 def _aux_uses_opus(output_aux, block_size):
-    """Whether this call should take the Opus sorter for its aux arrays.
-
-    "opus" only redirects the *3-stage* sort, which _adaptive_moe_sort runs at
-    block_m != 16 (prologue=1). At block_m == 16 it instead runs a single fused
-    kernel that sorts *and* zero-inits moe_buf (prologue=0); the Opus sorter
-    cannot do the zero-init, so taking it there trades one kernel for two.
-    Measured over the 40 block_m=16 rows in the tuned MXFP4 configs that is a
-    1.10x geomean loss (up to 1.34x at token=1), against a 0.97x win over the 26
-    block_m in {32, 128} rows. So the request is honoured only where it helps.
-    """
+    """Use Opus only when it replaces the three-stage auxiliary sort."""
     return output_aux == AUX_SORT_OPUS and block_size != 16
 
 
@@ -115,9 +78,7 @@ _ACT_TYPE_DISABLED_KEY = "__ignore__"
 _SWIGLU_MXFP4_BF16_BOUND = int(os.environ.get("GPTOSS_SWIGLU_MXFP4_BF16_BOUND", "256"))
 _MOE_A8W4_BYPASS_QUANT = os.environ.get("AITER_MOE_A8W4_BYPASS_QUANT", "0") == "1"
 
-# Opt-in kernel-bench hook: a caller sets a list here to collect (name, callable)
-# per-kernel launches in fused_moe_2stages ("stage1"/"stage2"); None in production
-# so there is no overhead.
+# Optional hook for collecting per-stage benchmark callables.
 kernel_bench_callable = None
 
 
@@ -246,8 +207,7 @@ def _moe_sorting_impl(
         and not _aux_uses_opus(output_aux, block_size)
         and _MOE_SORT_BACKEND not in ("opus", "ck")
     ):
-        # adaptive (fused) sort emits the a4w4 extras (m_indices + reverse_sorted)
-        # plus the atomic zero-init; opus single-pass aux is the env-gated fallback.
+        # Adaptive sort emits aux metadata and zero-initializes atomic output.
         return _adaptive_moe_sort(
             topk_ids,
             topk_weights,
@@ -260,7 +220,6 @@ def _moe_sorting_impl(
             moebuf_dtype=moebuf_dtype,
         )
 
-    # -- Opus / CK standard path --
     max_num_tokens_padded = int(topk_ids.numel() + num_experts * block_size - topk)
     max_num_m_blocks = int((max_num_tokens_padded + block_size - 1) // block_size)
     sorted_ids = torch.empty(max_num_tokens_padded, dtype=dtypes.i32, device=device)
@@ -287,10 +246,6 @@ def _moe_sorting_impl(
     aux_reverse_sorted = None
     if output_aux:
         use_opus = True
-        # policy 1 is the single-CTA kernel. It used to be the only one that
-        # emitted m_indices / reverse_sorted; the multi-phase kernels do now, so
-        # output_aux="opus" can take policy 0 (auto: oneshot or multi-phase) and
-        # keep one CTA per expert instead of one CTA total.
         dispatch_policy = 0 if _aux_uses_opus(output_aux, block_size) else 1
         aux_m_indices = torch.empty(
             max_num_tokens_padded, dtype=dtypes.i32, device=device
@@ -550,8 +505,6 @@ def fused_moe(
     shared_w2_scale: torch.Tensor | None = None,
     shared_expert_id: int = -1,
     stage2_scatter: Stage2ScatterContext | None = None,
-    # "" = leave the tuned config's choice alone; AUX_SORT_THREESTAGE /
-    # AUX_SORT_OPUS re-select which prologue serves an aux-sort config.
     output_aux: str = "",
 ):
     if (
@@ -788,9 +741,6 @@ def _fused_moe_impl(
     linear_beta: float | None = None,
     gate_mode: str = GateMode.SEPARATED.value,
     stage2_scatter: Stage2ScatterContext | None = None,
-    # Overrides which prologue serves the aux sort, for configs that request one:
-    # "" keeps whatever the metadata picked, otherwise AUX_SORT_THREESTAGE /
-    # AUX_SORT_OPUS. Ignored when the config does not need aux at all.
     output_aux: str = "",
     *,
     _q_dtype_a: torch.dtype | None = None,
@@ -1449,12 +1399,6 @@ class MOEMetadata:
     fuse_quant: str = ""
     stage2_has_bias: bool = False
     flat: bool = False
-    # Feature flags:
-    #  - output_aux: the sort emits the gemm/scatter extras (m_indices/reverse_sorted),
-    #    and picks which prologue does it -- False / True (== AUX_SORT_THREESTAGE,
-    #    the port's own 3-stage sort) / AUX_SORT_OPUS. See the values' docs at the
-    #    top of this module.
-    #  - prequant: fused_moe_2stages quantizes a1 before stage1.
     output_aux: bool | str = False
     prequant: bool = True
     skip_inter_quant: bool = False
@@ -1750,8 +1694,6 @@ def _mxfp4_a4w4_stage1(
     inter_scale_rows = (inter_scale_bytes + inter_scale_cols - 1) // inter_scale_cols
     inter_scale_rows = (inter_scale_rows + 31) // 32 * 32
     inter_scale_dtype = dtypes.fp8_e8m0 if out_dtype == "fp8" else torch.uint8
-    # The GEMM1 launcher clears BM16 scales before dispatch; larger tiles
-    # overwrite all scale bytes consumed by GEMM2.
     inter_sorted_shuffled_scale = torch.empty(
         (inter_scale_rows, inter_scale_cols),
         device=device,
@@ -2714,9 +2656,6 @@ def get_2stage_cfgs(
             return 16 if token < 2048 else 32 if token < 16384 else 64
 
     if _is_mxfp4_kname(kernelName1):
-        # gate_mode is a runtime weight-layout property, not a tuning key: route
-        # any a4w4 kernelName to the port; the bound interleave flag picks the
-        # compiled il/sep variant at runtime.
         try:
             _p1 = _parse_mxfp4_g1_kname(kernelName1)
             _bm = _p1["BM"]
@@ -2756,10 +2695,6 @@ def get_2stage_cfgs(
         )
         runtime_interleave = gate_mode == GateMode.INTERLEAVE
         if _p1["interleave"] != runtime_interleave:
-            # The row was tuned against the other gate/up layout, so its recorded
-            # us1 does not describe this run. Honour the layout we actually hold --
-            # forcing the kernel to the tuned tag instead silently mixes gate and
-            # up columns and the MoE output degenerates to noise.
             logger.warning(
                 "[fused_moe] tuned GEMM1 %r was tuned for gate_mode=%s but this "
                 "call passes gate_mode=%s; running the %s variant instead. "
@@ -2775,8 +2710,6 @@ def get_2stage_cfgs(
                 _mxfp4_a4w4_stage1_fw,
                 kernelName1=kernelName1,
                 interleave=runtime_interleave,
-                # Match main: BM16 always writes one native scale chunk per
-                # sorted M block, independent of the GEMM2 kernel family.
                 native_scale_layout=_bm == 16,
             ),
             stage2=stage2_func,
@@ -3512,10 +3445,7 @@ def fused_moe_2stages(
     if stage1_func in (_flydsl_stage1_wrapper, _mxfp4_a4w4_stage1_fw):
         if stage1_func is _flydsl_stage1_wrapper and metadata.skip_inter_quant:
             extra_stage1_args["v2_output_layout"] = True
-        # SiTUv2 beta/linear_beta -> the stage1 situ_beta/situ_linear_beta params;
-        # None -> 1.0 (plain tanh). _flydsl_stage1_wrapper takes them as runtime
-        # f32 scalars; the mxfp4 a4w4 GEMM1 replacement bakes them into the
-        # compiled kernel (they are keys of _get_compiled_mxfp4_gemm1_port).
+        # MXMOE bakes SiTUv2 scalars into its compile key.
         extra_stage1_args["situ_beta"] = 1.0 if beta is None else float(beta)
         extra_stage1_args["situ_linear_beta"] = (
             1.0 if linear_beta is None else float(linear_beta)
@@ -3540,8 +3470,7 @@ def fused_moe_2stages(
         extra_stage2_args["expert_mask"] = expert_mask
         extra_stage2_args["topk_ids"] = topk_ids
     if not doweight_stage1 and _flydsl_stage2_fp8_enabled():
-        # The MXFP4 GEMM1 front-end delegates layout GEMM2 kernels to the same v2
-        # wrapper, so its FP8 route-out reduction needs the original top-k weights.
+        # FP8 route-output reduction applies the route weights after GEMM2.
         stage2_keywords = getattr(metadata.stage2, "keywords", None) or {}
         uses_flydsl_v2_stage2 = stage2_func is _flydsl_v2_stage2_wrapper or (
             stage2_func is _mxfp4_a4w4_stage2_fw
@@ -3568,12 +3497,7 @@ def fused_moe_2stages(
         block_m=block_size_M,
         a1_scale=a1_scale,
         w1_scale=(
-            # Only reinterpret genuinely-packed (e8m0 / 1-byte) weight scales as
-            # fp8_e8m0. PR #3811 broadened this guard from fp4-only to all fp8 to
-            # add mxfp8 (per_1x32, e8m0 scale) support, but that also caught
-            # per_Token fp8 whose scale is fp32 -- reinterpreting fp32 bytes as
-            # e8m0 makes the host stride (eGUQs = stride(0)*sizeof(float)) 4x too
-            # large -> asm _pf stage1 reads weight scales OOB -> MEMORY_VIOLATION.
+            # Only one-byte packed scales may be reinterpreted as E8M0.
             w1_scale.view(dtypes.fp8_e8m0)
             if w1.dtype in (dtypes.fp4x2, dtypes.fp8)
             and w1_scale is not None

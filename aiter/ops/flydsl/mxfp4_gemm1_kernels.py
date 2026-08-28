@@ -296,9 +296,6 @@ def flydsl_mxfp4_gemm1(
     )
     grid = gemm1_grid(n_tokens, BM, NE=NE, TOPK=topk, INTER=D_INTER, BN=BN)
     if scale_out_uses_atomic(BM):
-        # Only an atomic-accumulating scale epilogue needs a zeroed destination.
-        # The GEMM uses the current/default stream, so this clear would be
-        # ordered before it.
         inter_sorted_shuffled_scale.zero_()
     _moe_kernels._run_compiled(
         launch,

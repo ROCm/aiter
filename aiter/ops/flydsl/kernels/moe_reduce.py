@@ -195,8 +195,7 @@ def moe_reduction_kernel(
         fx.memref_store_vec(acc.truncf(vec_out) if is_16b else acc, ofrag)
         fx.copy(store_atom, ofrag, p_dst)
 
-    # Skip threads whose column group starts past model_dim (their loads would
-    # read the next row -- in-descriptor, wasted BW); only needed when TILE ? md.
+    # Skip column groups beyond model_dim.
     if const_expr(model_dim % TILE != 0):
         if fx.Int32(tile) * fx.Int32(TILE) + fx.Int32(tid) * fx.Int32(V) < fx.Int32(
             model_dim

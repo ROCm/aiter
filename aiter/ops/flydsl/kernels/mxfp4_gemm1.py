@@ -44,16 +44,7 @@ ACC_LDS_PAD_DW = 4
 
 
 def scale_out_uses_atomic(BM):
-    """True when the GEMM1 A-scale epilogue accumulates into the scale buffer
-    with atomics, which obliges the launcher to zero that buffer first.
-
-    Every path now writes disjoint sub-fields of each dword -- the BM16 native
-    layout owns one of two 16-bit halves (selected by ikxdl) and the BM16
-    generic layout owns one of four bytes (selected by byte_pos) -- so a plain
-    narrow store suffices everywhere and no pre-clear is needed. Keep this the
-    single place that answers the question so the launcher cannot drift from
-    the kernel.
-    """
+    """Whether scale output requires an atomic pre-clear."""
     return False
 
 
@@ -228,7 +219,6 @@ def _gemm1_body(
             else:
                 cached_actual_row.append(actual_row)
 
-    # -- b_load_s_base[j], readfirstlane'd uniform per wave --------------------
     N0_HALF = N_OUT // 32
     b_load_s_base = []
     for j in range_constexpr(N_REPS):
@@ -250,7 +240,6 @@ def _gemm1_body(
         v = (e * fx.Int32(N_OUT) + col) * fx.Int32(K_HALF)
         b_load_s_base.append(rocdl.readfirstlane(T.i32, v))
 
-    # -- b_scale_s_base / _hi --------------------------------------------------
     if const_expr(interleave):
         mni_base = n_block_idx * fx.Int32(BN // 32) + wave_n * fx.Int32(BN // 128)
         np_list = [mni_base, mni_base + fx.Int32(1)]
@@ -271,7 +260,6 @@ def _gemm1_body(
         b_scale_s_base.append(base)
         b_scale_s_base_hi.append(base + fx.Int32(16 * kBS_stride_k0_dw * 4))
 
-    # Four independent f32x4 MFMA chains per wave.
     scale_atoms = _scale_mma_atoms(a_dtype)
     accm = [
         [fx.make_rmem_tensor(mem_4x1, fx.Float32) for _ in range(N_REPS)]
@@ -783,10 +771,7 @@ def _gemm1_body(
         v = ((lane_div_16 * fx.Int32(16)) + lane_mod_16) * fx.Int32(4)
         K_C_HI = K_C // 16
         imm = (K_C - K_C_HI * 16) * (kBS_stride_k0_dw * 4)
-        # Bound by B_SCALE_REPS, not a hard 2: interleave+BN128 builds a single
-        # b_scale_s_base entry (mfma_cluster's scale_slot is J//2, and N_REPS==2
-        # there, so only slot 0 is ever read). A hard 2 indexed past the end and
-        # made every interleaved candidate die with IndexError at trace time.
+        # Interleaved BN128 has only one scale slot.
         for mw in range_constexpr(B_SCALE_REPS):
             s_off = b_scale_s_base[mw] if K_C_HI == 0 else b_scale_s_base_hi[mw]
             idx = (v + fx.Int32(imm)) // fx.Int32(4)
@@ -800,9 +785,8 @@ def _gemm1_body(
             bs_slot[mw] = r.load()[0]
 
     def _mma(ci, opsel_a, opsel_b, a_frag, b_frag, sa, sb):
-        # Scaled 16x16x128 MFMA via fx.gemm; accumulate in place (d == c == ci).
         # opsel_a/opsel_b select the e8m0 scale byte in the shared 256-K word and are
-        # baked into the atom, exactly mirroring the raw intrinsic's opsel operands.
+        # baked into the atom.
         fx.gemm(
             scale_atoms[(opsel_a, opsel_b)],
             ci,
@@ -814,7 +798,6 @@ def _gemm1_body(
         )
 
     def mfma_cluster(b_slot, a, a_scale, bs_slot, J):
-        # Accumulators are pre-seeded to 0, so every issue accumulates (A*B + C).
         if const_expr(interleave):
             mni = J // 2
         else:
@@ -1005,8 +988,6 @@ def _gemm1_body(
             value = value + acc_load(acc_idx(fx.Int32(group), row, col))
         return value
 
-    # Expose independent epilogue address arithmetic before the accumulator
-    # stores so LLVM can schedule it in the final MFMA's VALU shadow.
     tx_i32 = wave_n * fx.Int32(64) + lane
     if const_expr(num_waves == 2):
         m_lane = tx_i32 // fx.Int32(4)
@@ -1051,7 +1032,6 @@ def _gemm1_body(
 
     def run_epilogue():
         aqout_layout = fx.make_layout((BM, OUT_ROW_BYTES), (OUT_ROW_BYTES, 1))
-        # UniversalCopy has no nontemporal/cache-hint knob; dropped (perf-neutral).
         aqout_tiles = _global_scalar_tiles(arg_aqout, fx.Int32, 1 << 24)
         scales_per_mr = [None] * EPILOGUE_M_REPS
 
@@ -1092,11 +1072,6 @@ def _gemm1_body(
         def store_output(sorted_row, packed0, packed1):
             store_payload(sorted_row, packed0, packed1)
 
-        # The bias column depends on (e, n_block_idx, wave_grp, kk, ee) -- never
-        # on the M rep -- so hoist the two global loads out of the mr loop. They
-        # were previously re-issued EPILOGUE_M_REPS times per element, which put
-        # EPILOGUE_M_REPS x 16 redundant global loads per wave straight into the
-        # VMEM-issue path that the ATT profile shows as the top stall.
         if const_expr(enable_bias):
             bias_gate = [None] * 8
             bias_up = [None] * 8
@@ -1266,7 +1241,6 @@ def _gemm1_body(
                         ascaleout_layout, chunk, ku, scale_wave_grp, m_lane
                     )
                     byte_pos = ikxdl * fx.Int32(2) + row_half
-                    # byte_pos selects one of the four disjoint bytes.
                     _scalar_store(
                         ascaleout_i8_tiles,
                         dword_off * fx.Int32(4) + byte_pos,
@@ -1308,11 +1282,9 @@ def _gemm1_body(
         if const_expr(num_waves == 2):
             run_epilogue()
         elif const_expr(BN == 64):
-            # BN64 produces one complete 32-column MX quantization group.
             if wave_grp == fx.Int32(0):
                 run_epilogue()
         elif const_expr(BN == 128):
-            # BN128 produces 64 post-activation columns: two 32-column scale groups.
             if wave_grp < fx.Int32(2):
                 run_epilogue()
         else:
