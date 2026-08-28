@@ -2038,8 +2038,8 @@ class TestCorrectness:
     def test_varlen_ragged_v_new_store_bound(self, variant):
         """Per-sequence check that the ``v_new`` store never crosses a sequence.
 
-        The ``v_new`` store has no per-row guard: it relies on ``vn_buf``'s 
-        ``num_records`` (``T_local`` rows from this head's row 0) so the final chunk's 
+        The ``v_new`` store has no per-row guard: it relies on ``vn_buf``'s
+        ``num_records`` (``T_local`` rows from this head's row 0) so the final chunk's
         padding rows are discarded by the hardware. ``v_new`` is head-major
         ``[B, H, T_flat, V]``, so those rows are the next sequence's tokens.
         A too-wide bound writes zeros over them -- bounded damage that a

@@ -582,8 +582,8 @@ def compile_chunk_gated_delta_h_gfx942(
         def _seq_view(tensor, base_elems, rows, row_stride, shape, stride):
             """Buffer view rooted at ``base_elems``, bounded to ``rows`` rows.
 
-            ``add_offset`` runs on the raw pointer, so the sequence/head base 
-            lands in the descriptor's base word and ``num_records`` is measured from it. 
+            ``add_offset`` runs on the raw pointer, so the sequence/head base
+            lands in the descriptor's base word and ``num_records`` is measured from it.
             This lets the bound to become per-sequence instead of per-tensor.
 
             The hardware test is ``offset >= num_records``, so a bound of
@@ -591,7 +591,7 @@ def compile_chunk_gated_delta_h_gfx942(
             admitting every column of rows ``0 .. rows-1`` (every tensor here
             has ``row_stride >= innermost extent``). A read past the sequence
             therefore returns a hardware zero rather than the neighbouring
-            sequence's live data. Writes are bounded the same way: a store past 
+            sequence's live data. Writes are bounded the same way: a store past
             ``num_records`` is discarded.
 
             ``num_records`` is in bytes, and the width is taken from the tensor
@@ -994,7 +994,7 @@ def compile_chunk_gated_delta_h_gfx942(
             fx.copy(univ_cp_r2s_64b_bf16, f_hi, dst_hi)
 
         # -- Output buffers: rooted per-sequence, so the hardware write drops the tail --
-        # A buffer_store whose offset is >= num_records is discarded by the hardware. 
+        # A buffer_store whose offset is >= num_records is discarded by the hardware.
         # Rooting the descriptor at the sequence therefore makes the padding rows of the
         # final chunk store nowhere.
         #
@@ -1334,10 +1334,10 @@ def compile_chunk_gated_delta_h_gfx942(
 
             # -- next iteration's w/u + gate prefetch (K5 build) --
             # Issued here, ahead of the v_new store, for the same reason the
-            # fused build issues its copy ahead of the o store: the stores merge 
-            # into one cluster that the scheduler places before the second barrier. 
-            # Ahead of the store, the distance is a property of the source, and 
-            # the store plus GEMM2's MFMA chain both sit between the loads and their 
+            # fused build issues its copy ahead of the o store: the stores merge
+            # into one cluster that the scheduler places before the second barrier.
+            # Ahead of the store, the distance is a property of the source, and
+            # the store plus GEMM2's MFMA chain both sit between the loads and their
             # consumption at the top of the next iteration.
             #
             # Safe to hoist: _stage_prefetch reads only HBM w/u/g for chunk
