@@ -9,6 +9,9 @@ recomputes S/sigma from q,k and returns (dq, dk, dv); the reference is
 swept (b, h, n, d, dtype, mask) case records the kernel ``us`` plus TFLOPS / TB/s
 rooflines and the max grad error, and emits one markdown table per dtype.
 
+The oracle pads to dense [B, H, N, N] fp32 scores, so it is skipped (``err`` empty)
+for cases where that would not fit. ``--no-ref`` skips it everywhere.
+
 The public ``flydsl_hstu_attention_bwd`` wrapper reads the tuned CSV / heuristic and
 launches the KV-owned dV/dK kernel + the Q-owned dQ kernel, so this one test covers
 every supported gfx9 arch. Correctness edge cases (mask variants, tiling overrides,
@@ -49,6 +52,30 @@ SUPPORTED_GFX = ["gfx942", "gfx950"]
 # ~2 tokens (great for mask edge-cases, useless for a perf table), so we build our
 # own realistic lengths here — matching the perf benches.
 SPARSITY = 0.5
+
+# The oracle pads to dense [B, H, N, N] fp32 scores, so its footprint grows with N^2
+# and blows past device memory long before the kernel does (n=16384 at b=120/h=4 asks
+# for 480 GiB). Autograd retains roughly this many of those tensors across the einsum
+# / silu / mask chain, plus one [B, N, N] mask.
+_ORACLE_DENSE_COPIES = 4
+# Leave room for the kernel's own inputs and workspace alongside the oracle.
+_ORACLE_MEM_HEADROOM = 0.7
+# Set from --no-ref: report timings only, leaving the err column empty.
+_SKIP_REFERENCE = False
+
+
+def _oracle_bytes(b, h, n):
+    """Estimated peak device bytes for the dense fp32 autograd oracle."""
+    fp32 = 4
+    return _ORACLE_DENSE_COPIES * b * h * n * n * fp32 + b * n * n * fp32
+
+
+def _oracle_fits(b, h, n):
+    if _SKIP_REFERENCE:
+        return False
+    free, _total = torch.cuda.mem_get_info()
+    return _oracle_bytes(b, h, n) <= free * _ORACLE_MEM_HEADROOM
+
 
 # label -> (max_attn_len, contextual_seq_len, target_size)
 MASKS = {
@@ -103,21 +130,6 @@ def test_flydsl_hstu_bwd(b, h, n, d, dtype, mask):
         contextual_seq_len,
     )
 
-    # Reference only (fp32 autograd oracle): compared, never timed / tabled.
-    dq_ref, dk_ref, dv_ref = hstu_bwd_reference(
-        n,
-        alpha,
-        q,
-        k,
-        v,
-        seq_offsets,
-        True,
-        num_targets,
-        max_attn_len,
-        contextual_seq_len,
-        dout,
-    )
-
     msg = f"{mask} B{b}H{h}N{n}d{d}"
 
     # Tolerances scale with the oracle's peak, matching the pytest suite: these
@@ -135,9 +147,35 @@ def test_flydsl_hstu_bwd(b, h, n, d, dtype, mask):
             msg=f"{msg}: {name}",
         )
 
-    err_dv = _check(dv, dv_ref, TOL_DV, "dv")
-    err_dk = _check(dk, dk_ref, TOL_DQK, "dk")
-    err_dq = _check(dq, dq_ref, TOL_DQK, "dq")
+    # Reference only (fp32 autograd oracle): compared, never timed / tabled. Skipped
+    # when it would not fit, the pytest suite owns correctness at sizes where the oracle
+    # is affordable.
+    if _oracle_fits(b, h, n):
+        dq_ref, dk_ref, dv_ref = hstu_bwd_reference(
+            n,
+            alpha,
+            q,
+            k,
+            v,
+            seq_offsets,
+            True,
+            num_targets,
+            max_attn_len,
+            contextual_seq_len,
+            dout,
+        )
+        err = max(
+            _check(dv, dv_ref, TOL_DV, "dv"),
+            _check(dk, dk_ref, TOL_DQK, "dk"),
+            _check(dq, dq_ref, TOL_DQK, "dq"),
+        )
+    else:
+        err = float("nan")
+        aiter.logger.warning(
+            "%s: skipping fp32 oracle (needs ~%.0f GiB); perf only",
+            msg,
+            _oracle_bytes(b, h, n) / 1024**3,
+        )
 
     # Roofline. Causal pairs per sequence = L*(L+1)/2; bwd = 3*f1 + 2*f2 with
     # f1 = 2*attn_dim (S recompute / dK / dQ share the attn-dim contraction),
@@ -155,7 +193,7 @@ def test_flydsl_hstu_bwd(b, h, n, d, dtype, mask):
         "us": us,
         "TFLOPS": flops / us / 1e6,
         "TB/s": nbytes / us / 1e6,
-        "err": max(err_dv, err_dk, err_dq),
+        "err": err,
     }
 
 
@@ -225,7 +263,17 @@ def main():
         help="""Mask presets to sweep.
         e.g.: --mask causal hstu""",
     )
+    parser.add_argument(
+        "--no-ref",
+        action="store_true",
+        help="""Skip the fp32 autograd oracle everywhere (perf only, err column empty).
+        It is skipped automatically for cases whose dense [B, H, N, N] scores would
+        not fit in device memory.""",
+    )
     args = parser.parse_args()
+
+    global _SKIP_REFERENCE
+    _SKIP_REFERENCE = args.no_ref
 
     for dtype in args.dtype:  # one table per dtype
         df = []
