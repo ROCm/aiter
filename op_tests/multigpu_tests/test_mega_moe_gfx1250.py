@@ -558,7 +558,9 @@ class DeviceMoEPipeline:
         # identical). max_num_inp_token_per_rank = ct.
         uid = Communicator.get_unique_id() if r == 0 else None
         uid = self.dist_ctx.bcast_uid(uid)
-        self.comm = Communicator.init(self.dist_ctx.world, r, uid)
+        self.comm = Communicator.init(
+            self.dist_ctx.world, r, uid, per_rank_vmm=16 * 1024**3
+        )
         if self.combine_mode == "fused":
             if not self.spec["is_mxfp4"]:
                 raise NotImplementedError(
@@ -968,7 +970,7 @@ def _parse_args():
         "--quant_type",
         type=str,
         choices=QUANT_KEYS,
-        default="a8w4_mxfp4",
+        default="a4w4_mxfp4",
         help="quantization type",
     )
     p.add_argument(

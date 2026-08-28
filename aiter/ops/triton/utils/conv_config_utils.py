@@ -5,10 +5,10 @@ import functools
 
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.core import (
-    AITER_TRITON_CONFIGS_PATH,
     USE_LRU_CACHE,
     load_config_json,
 )
+from aiter.ops.triton.utils.gemm_config_utils import resolve_config_dir
 
 STANDARD_M_BOUNDS: tuple[int, ...] = (
     4,
@@ -61,8 +61,10 @@ def format_prepack_shape_key(N: int, C: int, H: int, W: int, CB: int) -> str:
 
 
 def _conv_config_path(config_name: str) -> str:
-    dev = arch_info.get_arch()
-    return f"{AITER_TRITON_CONFIGS_PATH}/conv/{dev}-{config_name}.json"
+    # Nested layout <arch>/triton/conv/<d_type>/DEFAULT.json; the shared probe
+    # lives in resolve_config_dir().
+    cfg_dir, _ = resolve_config_dir("conv", config_name, backend="triton")
+    return f"{cfg_dir}/DEFAULT.json"
 
 
 def _get_conv_config_file(config_name: str) -> dict:
