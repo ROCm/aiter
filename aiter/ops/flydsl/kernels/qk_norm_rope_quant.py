@@ -2072,9 +2072,8 @@ def _build_kernel_w32_tdm(
                     cache_modifier=store_cache_modifier,
                 )
                 # Same bytes as kv_out, scattered into the SWA ring.
-                if const_expr(kv_write) and do_swa is not None:
-                    if do_swa:
-                        _store_bf16_vec(final, swa_rsrc, swa_row_base, tid, VEC)
+                if const_expr(kv_write) and do_swa:
+                    _store_bf16_vec(final, swa_rsrc, swa_row_base, tid, VEC)
 
         def emit_q():
             q_scale_rsrc = _ptr_res(q_scale) if const_expr(quant) else None
