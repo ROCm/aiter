@@ -21,9 +21,7 @@ def _run(
     weights_out = torch.zeros_like(weights, dtype=torch.float32)
     kv_cache = torch.zeros((1, 16, 132), device=q.device, dtype=dtypes.fp8)
     extra = (
-        {}
-        if compute_all_q_rope is None
-        else {"compute_all_q_rope": compute_all_q_rope}
+        {} if compute_all_q_rope is None else {"compute_all_q_rope": compute_all_q_rope}
     )
     indexer_qk_rope_quant_and_cache(
         q,
@@ -57,9 +55,7 @@ def test_indexer_qk_compute_all_q_rope():
     q = torch.randn(
         num_tokens, num_heads, head_dim, device=device, dtype=torch.bfloat16
     )
-    weights = torch.randn(
-        num_tokens, num_heads, device=device, dtype=torch.bfloat16
-    )
+    weights = torch.randn(num_tokens, num_heads, device=device, dtype=torch.bfloat16)
     k = torch.randn(num_tokens, head_dim, device=device, dtype=torch.bfloat16)
     norm_weight = torch.ones(head_dim, device=device, dtype=torch.float32)
     norm_bias = torch.zeros(head_dim, device=device, dtype=torch.float32)
