@@ -233,10 +233,19 @@ def fp8_mqa_logits(
         if arch == "gfx950":
             num_buffers = 2
             loop_variant = 0
-            waves_per_eu = 4
-            num_chains = 4 if USE_FOLDED_REDUCTION else 0
-            num_warps = 2 if num_heads <= 32 else 1
-            block_kv = 64 if num_heads <= 32 else 32
+            # Tuned on gfx950 / Triton 3.7 over waves_per_eu x NUM_CHAINS x
+            # (BLOCK_KV, NUM_WARPS); see tune_kernel.py. The kernel is not MFMA
+            # bound -- MFMA is ~3% of issued instructions while the per-head
+            # reduction epilogue and the register traffic it forces dominate --
+            # so these pick the lowest-pressure point rather than the highest
+            # occupancy. waves_per_eu is the VGPR budget (512/waves), and at 4
+            # the 32-head BLOCK_M=2 path spills; 64 heads stay under the cap.
+            waves_per_eu = 3 if num_heads <= 32 else 4
+            # 4 parallel FMA chains cost more in live registers than they save
+            # in dependency depth at this tile size.
+            num_chains = 2 if USE_FOLDED_REDUCTION else 0
+            num_warps = 2
+            block_kv = 64
             # On Triton < 3.8, BLOCK_M=2 requires buffer stores: a masked
             # *global* store lowers to a branch, and with two of them per KV
             # tile the extra join blocks trip the SIInsertWaitcnts assert
