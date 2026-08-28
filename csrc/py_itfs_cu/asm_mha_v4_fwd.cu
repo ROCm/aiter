@@ -261,10 +261,8 @@ __global__ void pack_work_table_kernel(int32_t* __restrict__ table,
 }
 
 // Largest table the fused path will order. Keys stage in LDS at 8 bytes each, so this is exactly
-// the 64KB a workgroup gets and there is no room for a second shared array. Build time measured on
-// gfx950 is flat near 5us from 512 entries through 2048, 7us at 4096 and 15us at 8192, against
-// 33-45us once the sort goes to ATen. Measure with a warm module: folding a JIT build into the same
-// process inflates the first readings roughly threefold.
+// the 64KB a workgroup gets and there is no room for a second shared array. Measured build cost
+// either side of the limit is in aiter/ops/mha_v4.md.
 constexpr int32_t kWorkTableFusedMax    = 8192;
 constexpr int32_t kWorkTableSortThreads = 1024;
 // Host-side wave width, only used to size the grid. Device code reads warpSize directly, and the

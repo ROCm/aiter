@@ -1214,6 +1214,41 @@ def test_mha_v4_sparse_all_true_mask_matches_dense(q_format, v_format):
     not _mha_v4_sparse_co_available(),
     reason="sorted-sparse MHA v4 code object is not deployed",
 )
+def test_mha_v4_sparse_block_mask_compiles_without_graph_breaks():
+    """The mask path derives its geometry from host state, which Dynamo cannot trace.
+
+    mha_v4_kv_tile() reads the manifest and get_gfx() shells out to rocminfo, so both sit behind
+    torch_compile_guard. Without that the sparse mask path costs graph breaks per trace and fails
+    under fullgraph, which no other test in this file would notice.
+    """
+    torch.manual_seed(41)
+    kv_tile = mha_v4_kv_tile()
+    q = torch.randn((1, 256, 2, 128), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((1, 4 * kv_tile, 2, 128), device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    mask = torch.ones((1, 2, 1, 4), device="cuda", dtype=torch.bool)
+    fp8_format = native_fp8_format()
+
+    def call():
+        return mha_v4(q, k, v, fp8_format, fp8_format, fp8_format, block_mask=mask)
+
+    explained = torch._dynamo.explain(call)()
+    assert explained.break_reasons == [], [
+        str(reason.reason) for reason in explained.break_reasons
+    ]
+
+    eager = call()
+    compiled = torch.compile(call, fullgraph=True)()
+    torch.cuda.synchronize()
+
+    assert torch.equal(eager, compiled)
+
+
+@pytest.mark.skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 sparse validation")
+@pytest.mark.skipif(
+    not _mha_v4_sparse_co_available(),
+    reason="sorted-sparse MHA v4 code object is not deployed",
+)
 @pytest.mark.parametrize(
     ("q_format", "v_format"),
     [

@@ -352,6 +352,9 @@ The host builds a work table inside the sparse custom op. If every `lut_count` i
 (uniform / top-k sparsity), visit order stays raster; otherwise rows are ordered
 longest-LUT-first (LPT).
 
+Up to 8192 entries one fused kernel ranks and packs the table; past that the sort falls back to
+ATen. The limit is where the 8-byte keys fill the 64 KB of LDS a workgroup gets.
+
 A LUT row may select nothing. `lut_count == 0` is a no-op that writes a zero output tile, so an
 all-False `block_mask` row is valid input: the ASM clamps the row's prologue reads in bounds and
 skips the KV traversal, and the epilogue's zero-row-sum path zeroes the tile. That makes the entry

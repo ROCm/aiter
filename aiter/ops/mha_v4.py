@@ -10,6 +10,9 @@ LUT triple on the packed API; the work table is built inside the sparse
 custom op.
 """
 
+import csv
+import functools
+import os
 from enum import IntEnum
 from typing import Optional
 
@@ -18,8 +21,9 @@ import triton
 from torch import Tensor
 
 from aiter import dtypes
-from aiter.jit.core import compile_ops
+from aiter.jit.core import AITER_ROOT_DIR, compile_ops
 from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.triton._triton_kernels.quant.sage_attention_quant import (
     mha_v4_per_tensor_amax_kernel,
     mha_v4_per_tensor_quant_kernel,
@@ -181,10 +185,10 @@ _PACKED_QK_WIDTH = {
     AttentionFormat.FP4_E2M1: 64,
 }
 
-# Sorted-sparse ASM tiles. gfx950 rows are 256x128; gfx942 FP8/I8FP8 rows are 256x64.
 _MHA_V4_Q_TILE = 256
-_MHA_V4_KV_TILE_GFX950 = 128
-_MHA_V4_KV_TILE_GFX942 = 64
+# mode=1 selects the sorted-sparse manifest rows; the launcher dispatches the same rows through
+# find_config(..., mode=1).
+_MHA_V4_SPARSE_MODE = 1
 
 
 def native_fp8_format() -> AttentionFormat:
@@ -196,9 +200,47 @@ def native_fp8_format() -> AttentionFormat:
     )
 
 
+@functools.cache
 def mha_v4_kv_tile() -> int:
-    """Return the KV tile of sorted-sparse MHA v4 rows on the active GPU."""
-    return _MHA_V4_KV_TILE_GFX942 if get_gfx() == "gfx942" else _MHA_V4_KV_TILE_GFX950
+    """Return the KV tile of sorted-sparse MHA v4 rows on the active GPU.
+
+    Read from the same manifest the launcher dispatches on rather than restated here, so adding a
+    sparse row with a different tile cannot leave the two disagreeing. 256x128 on gfx950, 256x64 on
+    gfx942.
+    """
+    return _mha_v4_kv_tile_from_manifest()
+
+
+# The read has to sit behind the guard, not just behind the cache above: Dynamo traces the body of a
+# cached function regardless of whether the cache is warm, and `open` is not traceable, so an
+# unguarded read costs two graph breaks on every mha_v4(block_mask=...) trace and fails outright
+# under fullgraph=True. get_gfx() keeps its own rocminfo probe opaque the same way.
+@torch_compile_guard()
+def _mha_v4_kv_tile_from_manifest() -> int:
+    gfx = get_gfx()
+    asm_dir = os.environ.get("AITER_ASM_DIR", os.path.join(AITER_ROOT_DIR, "hsa"))
+    manifest = os.path.join(asm_dir, gfx, "fmha_v4_fwd", "fmha_v4_fwd.csv")
+    tiles = set()
+    try:
+        with open(manifest, newline="") as handle:
+            for row in csv.DictReader(
+                filter(lambda line: not line.startswith("#"), handle)
+            ):
+                if int(row["mode"]) == _MHA_V4_SPARSE_MODE:
+                    tiles.add(int(row["ts_kv"]))
+    except FileNotFoundError as error:
+        raise ValueError(
+            f"no MHA v4 manifest for {gfx} at {manifest}; sorted-sparse MHA v4 is "
+            "unavailable on this GPU"
+        ) from error
+    if not tiles:
+        raise ValueError(f"{gfx} has no sorted-sparse MHA v4 manifest row")
+    if len(tiles) > 1:
+        raise ValueError(
+            f"{gfx} sorted-sparse manifest rows disagree on ts_kv ({sorted(tiles)}); the "
+            "mask geometry a caller builds is only well defined when they agree"
+        )
+    return tiles.pop()
 
 
 def _is_fp8_format(format: AttentionFormat) -> bool:
