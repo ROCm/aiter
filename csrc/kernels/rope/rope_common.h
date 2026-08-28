@@ -8378,10 +8378,10 @@ void fused_rope_rms_set_kv(const T* qkv,
                 "x must be a power of 2 when use_shuffle_layout is set, got ", x);
     // The shuffle-layout K write is a single contiguous vec_t store of
     // VEC_SIZE = head_size / WARP_SIZE elements, and get_shuffle_layout_k_base()
-    // assumes all of them land in one x-wide chunk (VEC_SIZE <= x). At
-    // head_size=512 / WARP_SIZE=32 that is VEC_SIZE=16, which exceeds x=8 for a
-    // bf16/fp16 cache (x = 16 / sizeof(elem)) and would silently corrupt the K
-    // cache for block_size>1. Reject that config instead.
+    // assumes all of them land in one x-wide chunk (VEC_SIZE <= x). For
+    // head_size=512 at WARP_SIZE=32, VEC_SIZE=16 which exceeds x=8 for bf16/fp16
+    // caches (x = 16 / sizeof(elem)), so reject shuffle layout unless x >= VEC_SIZE.
+    // (Otherwise a single contiguous vec_t store can cross chunk boundaries and misaddress K.)
     AITER_CHECK(!use_shuffle_layout || x >= head_size / WARP_SIZE,
                 "use_shuffle_layout requires x >= head_size / WARP_SIZE (",
                 head_size / WARP_SIZE,
