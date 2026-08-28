@@ -801,8 +801,7 @@ __global__ void __launch_bounds__(512, 1) owner_read_gather(
         int owner    = owner_rank[row];
         const T* src = (const T*)_dp->ptrs[owner] + row * last_dim;
         T* dst       = result + row * last_dim;
-        for(int j = 0; j < last_dim; j++)
-            dst[j] = src[j];
+        __builtin_memcpy(dst, src, last_dim * sizeof(T));
     }
 
     end_sync<ngpus, true>(sg, self_sg, rank);
