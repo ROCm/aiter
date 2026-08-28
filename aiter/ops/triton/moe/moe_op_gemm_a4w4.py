@@ -1,12 +1,10 @@
 # adapted from triton_kernels package
 # original code https://github.com/triton-lang/triton/blob/main/python/triton_kernels/triton_kernels/matmul_ogs.py
 
-import functools
 import itertools
 
 import torch
 import triton
-
 from aiter.ops.triton._gluon_kernels.gfx1250.moe.moe_op_gemm_a4w4 import (
     _moe_gemm_a4w4_decode,
     _moe_gemm_a4w4_prefill,
@@ -20,27 +18,9 @@ from aiter.ops.triton._triton_kernels.moe.moe_op_gemm_a4w4 import (
 from aiter.ops.triton.moe.moe_routing.routing import RoutingData
 from aiter.ops.triton.moe.reduce import reduce_grouped
 from aiter.ops.triton.utils._triton.arch_info import get_arch
-from aiter.ops.triton.utils.config_utils import (
-    load_config_json,
-    resolve_config_dir,
-)
+
 from aiter.ops.triton.utils.gemm_config_utils import pick_gemm_num_stages
-
-
-@functools.lru_cache
-def _get_a4w4_dispatch(arch: str) -> dict:
-    """Per-(block_m, N, K, bucket) dispatch table for moe_gemm_a4w4. Returns
-    {} if no tuned file is shipped for this arch.
-
-    Only get_kernel_config_gluon() reads this table -- the triton path builds
-    its config in Python -- so the backend is fixed at "gluon".
-
-    ``arch`` stays in the signature for the callers that already resolved it;
-    resolve_config_dir() reads the same value from arch_info."""
-    cfg_dir = resolve_config_dir("moe", "A4W4", backend="gluon")
-    dispatch = load_config_json(f"{cfg_dir}/DEFAULT.json", required=False)
-    return dispatch if dispatch is not None else {}
-
+from aiter.ops.triton.utils.moe_config_utils import get_moe_dispatch
 
 # -----------------------------------------------------------------------------
 #                    Matrix Multiplication + Outer Gather/Scatter
@@ -164,7 +144,7 @@ def get_kernel_config_gluon(m, n, k, routing_data):
     num_xcds = 1
 
     arch = get_arch()
-    tuned = _get_a4w4_dispatch(arch)
+    tuned = get_moe_dispatch("A4W4", arch, "gluon")
     key = f"bm{block_m}_n{n}_k{k}_{m2bucket(m)}"
     if key not in tuned:
         key = f"bm{block_m}_any"
