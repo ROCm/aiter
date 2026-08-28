@@ -342,7 +342,15 @@ def _run_autograd_case(D, B, Mi, regime, *, seed=SEED, sparsity=0.95, label=""):
     jf = jagged.detach().clone().requires_grad_(True)
     df = dense.detach().clone().requires_grad_(True)
     bf = bias.detach().clone().requires_grad_(True)
-    out = jagged_dense_bmm_autograd(jf, df, bf, seq_offsets, n_groups=B, max_seq_len=Mi)
+    out = jagged_dense_bmm_autograd(
+        jf,
+        df,
+        bf,
+        seq_offsets,
+        n_groups=B,
+        max_seq_len=Mi,
+        uniform_seqlen=(regime == "uniform"),
+    )
     out.backward(grad_out)
     torch.cuda.synchronize()
 
