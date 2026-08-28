@@ -25,18 +25,25 @@ from aiter.ops.triton._triton_kernels.moe.moe_op_gemm_a8w4 import (
 from aiter.ops.triton.moe.moe_routing.routing import RoutingData
 from aiter.ops.triton.moe.reduce import reduce_grouped
 from aiter.ops.triton.utils._triton.arch_info import get_arch
-from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH, load_config_json
+from aiter.ops.triton.utils.core import load_config_json
 from aiter.ops.triton.utils.device_info import get_num_sms
-from aiter.ops.triton.utils.gemm_config_utils import pick_gemm_num_stages
+from aiter.ops.triton.utils.gemm_config_utils import (
+    pick_gemm_num_stages,
+    resolve_config_dir,
+)
 
 
 def _get_a8w4_dispatch(arch: str) -> dict:
     """Per-(block_m, N, K) dispatch table for moe_gemm_a8w4. Returns {} if no
     tuned file is shipped for this arch (caller uses the safe-default fallback).
-    Mirrors get_moe_configs() in utils/moe_config_utils.py."""
-    dispatch = load_config_json(
-        f"{AITER_TRITON_CONFIGS_PATH}/moe/{arch}-A8W4.json", required=False
-    )
+
+    ``arch`` stays in the signature for the callers that already resolved it;
+    resolve_config_dir() reads the same value from arch_info."""
+    # No backend= on purpose: this family is split across backends per arch --
+    # gfx950 ships its table under triton/ for the triton dispatch path and
+    # gfx1250 under gluon/ for the gluon one, so the probe must try both.
+    cfg_dir, _ = resolve_config_dir("moe", "A8W4")
+    dispatch = load_config_json(f"{cfg_dir}/DEFAULT.json", required=False)
     return dispatch if dispatch is not None else {}
 
 
@@ -95,9 +102,9 @@ def get_kernel_config_triton(m, n, k, routing_data, swizzle_mx_scale=None):
     split_k = 1
 
     # Tuned dispatch: per-(block_m, N, K) winners from a sweep tuner.
-    # Schema mirrors sister files like gfx950-MOE-FP8_W8A8.json (BLOCK_SIZE_N,
-    # BLOCK_SIZE_K, num_warps, …) except BLOCK_SIZE_M is omitted because block_m
-    # is the dispatch key, not a tunable (routing decides block_m for the layer).
+    # Entries carry BLOCK_SIZE_N, BLOCK_SIZE_K, num_warps, num_stages, … but
+    # omit BLOCK_SIZE_M because block_m is the dispatch key, not a tunable
+    # (routing decides block_m for the layer).
     tuned = _get_a8w4_dispatch(arch).get(f"bm{block_m}_n{n}_k{k}")
     if tuned is not None:
         return {
