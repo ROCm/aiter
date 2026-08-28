@@ -111,6 +111,7 @@ def _get_kernel_dsv4(
     r0_convert: bool,
     r0_is_ocp: bool,
     r1_is_ocp: bool,
+    r1_convert: bool,
     softmax_scale: float,
     single_request: bool,
     rope_bf16: bool,
@@ -128,6 +129,7 @@ def _get_kernel_dsv4(
         r0_convert=r0_convert,
         r0_is_ocp=r0_is_ocp,
         r1_is_ocp=r1_is_ocp,
+        r1_convert=r1_convert,
         softmax_scale=softmax_scale,
         single_request=single_request,
         rope_bf16=rope_bf16,
@@ -600,6 +602,7 @@ def flydsl_sparse_mla_prefill_dsv4(
     scale_coalesce: bool = True,
     slot_hoist: bool = False,
     xcd_remap: bool = True,
+    r1_convert: bool = True,
     stream: torch.cuda.Stream | None = None,
 ) -> None:
     """DSv4-only two-region sparse MLA prefill (dedicated pipelined kernel).
@@ -666,6 +669,7 @@ def flydsl_sparse_mla_prefill_dsv4(
         r0_convert=r0_convert,
         r0_is_ocp=(not main_is_fnuz),
         r1_is_ocp=(not extra_is_fnuz),
+        r1_convert=r1_convert,
         softmax_scale=DEFAULT_SOFTMAX_SCALE,
         single_request=single_request,
         rope_bf16=rope_bf16,

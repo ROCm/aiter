@@ -362,6 +362,7 @@ def compile_sparse_mla_prefill_dsv4(
     r0_convert: bool = False,
     r0_is_ocp: bool = False,
     r1_is_ocp: bool = True,
+    r1_convert: bool = True,
     softmax_scale: float | None = None,
     single_request: bool = True,
     rope_bf16: bool = False,
@@ -380,6 +381,12 @@ def compile_sparse_mla_prefill_dsv4(
     has_sink:    fold a per-head virtual key into the softmax denominator.
     r0_convert:  region0 uses the register-staged convert load (needed when
                  UE8M0 != 1 or region0 is OCP); else the fast DMA path.
+    r1_convert:  region1 uses the register-staged convert load (dequant by the
+                 UE8M0 exponent, requantize, ds_write). False routes region1
+                 through region0's fire-and-forget DMA instead, which requires the
+                 extra cache to already be fnuz with unity scale -- i.e. converted
+                 by a preprocessing pass. r1 tiles cost ~1.8x r0 tiles today and
+                 the convert is why, so this is where region1's headroom is.
     r0_is_ocp / r1_is_ocp: per-region NoPE fp8 convention (fnuz vs OCP).  The
                  fnuz/OCP correction only exists inside the convert load, so a
                  DMA'd region0 must already be fnuz (r0_convert=False implies
@@ -443,6 +450,7 @@ def compile_sparse_mla_prefill_dsv4(
     R0_CONVERT = bool(r0_convert)
     R0_OCP = bool(r0_is_ocp)
     R1_OCP = bool(r1_is_ocp)
+    R1_CONVERT = bool(r1_convert)
     SINGLE_REQUEST = bool(single_request)
     ROPE_BF16 = bool(rope_bf16)
     VT_INREG = bool(vt_inreg)
@@ -1748,10 +1756,13 @@ def compile_sparse_mla_prefill_dsv4(
                     extra_indices_rsrc, extra_bt_rsrc, extra_num_rows, extra_block_size,
                     extra_max_blocks, kv_ts, extra_end,
                 )
-                _load_nope_convert(
-                    extra_cache_rsrc, cur_warp, tb, sb,
-                    fx.Float32(1.0) if R1_OCP else fx.Float32(0.0),
-                )
+                if const_expr(R1_CONVERT):
+                    _load_nope_convert(
+                        extra_cache_rsrc, cur_warp, tb, sb,
+                        fx.Float32(1.0) if R1_OCP else fx.Float32(0.0),
+                    )
+                else:
+                    _load_nope_dma(extra_cache_rsrc, cur_warp, tb)
                 _load_rope_block(extra_cache_rsrc, cur_warp, tb, cur_rbf)
                 _barrier(vmcnt=0, lgkmcnt=0)
                 rocdl.sched_barrier(0)
