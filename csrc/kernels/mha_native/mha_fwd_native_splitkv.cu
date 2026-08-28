@@ -1,9 +1,5 @@
-#include <ATen/hip/HIPContext.h>
-#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
-#include <torch/extension.h>
-#include <vector>
-
 #include "aiter_hip_common.h"   // aiter common HIP helpers
+#include "aiter_stream.h"       // aiter::getCurrentHIPStream (torch-free)
 #include "mha_native.h"
 #include "mha_native_launch.h"
 #include "runner/params.hpp"    // FmhaFwdParams, FmhaFwdSplitParams, FmhaFwdCombineParams, kM0, kBlockSize
@@ -28,19 +24,20 @@ namespace aiter {
 // Convert natural-e softmax scale to the base-2 form the kernel's exp2 softmax wants.
 static constexpr float kLog2e = 1.4426950408889634f;
 
-std::vector<at::Tensor> mha_fwd_native_splitkv(
-    at::Tensor q, at::Tensor k, at::Tensor v,
-    std::optional<at::Tensor> out_opt,
+void mha_fwd_native_splitkv(
+    aiter_tensor_t& q, aiter_tensor_t& k, aiter_tensor_t& v,
+    aiter_tensor_t& o, aiter_tensor_t& lse,
+    aiter_tensor_t& scratch_o, aiter_tensor_t& scratch_lse,
     double softmax_scale, bool causal, bool return_lse, int64_t num_splits)
 {
-    TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda(), "q/k/v must be HIP tensors");
-    TORCH_CHECK(q.scalar_type() == at::kBFloat16 && k.scalar_type() == at::kBFloat16 &&
-                    v.scalar_type() == at::kBFloat16,
+    AITER_CHECK(q.is_gpu() && k.is_gpu() && v.is_gpu(), "q/k/v must be HIP tensors");
+    AITER_CHECK(q.dtype() == AITER_DTYPE_bf16 && k.dtype() == AITER_DTYPE_bf16 &&
+                    v.dtype() == AITER_DTYPE_bf16,
                 "native splitkv is bf16 only");
-    TORCH_CHECK(q.dim() == 4 && k.dim() == 4 && v.dim() == 4,
+    AITER_CHECK(q.dim() == 4 && k.dim() == 4 && v.dim() == 4,
                 "q/k/v must be 4-D BSHD tensors");
     // Kernel indexes D contiguously and only uses batch/seqlen/head strides.
-    TORCH_CHECK(q.stride(-1) == 1 && k.stride(-1) == 1 && v.stride(-1) == 1,
+    AITER_CHECK(q.stride(-1) == 1 && k.stride(-1) == 1 && v.stride(-1) == 1,
                 "q/k/v last dim must be contiguous");
 
     // aiter layout is BSHD: (B, S, H, D).
@@ -50,34 +47,19 @@ std::vector<at::Tensor> mha_fwd_native_splitkv(
     const int D  = q.size(3);
     const int Sk = k.size(1);
     const int Hk = k.size(2);
-    TORCH_CHECK(D == 64 && v.size(3) == 64, "native splitkv is D64 only");
+    AITER_CHECK(D == 64 && v.size(3) == 64, "native splitkv is D64 only");
     // GQA grouping assumes Hk divides Hq; Hk > Hq would divide by zero on device.
-    TORCH_CHECK(Hk > 0 && Hq % Hk == 0, "nhead_q must be a multiple of nhead_k");
+    AITER_CHECK(Hk > 0 && Hq % Hk == 0, "nhead_q must be a multiple of nhead_k");
     const int G = static_cast<int>(num_splits);
-    TORCH_CHECK(G >= 1, "num_splits must be >= 1");
+    AITER_CHECK(G >= 1, "num_splits must be >= 1");
 
-    auto opts_bf16 = q.options();
-    auto opts_f32  = q.options().dtype(at::kFloat);
-
-    at::Tensor o;
-    if (out_opt.has_value() && out_opt->defined()) {
-        o = out_opt.value();
-        TORCH_CHECK(o.scalar_type() == at::kBFloat16, "out must be bf16");
-        TORCH_CHECK(o.device() == q.device(), "out must be on the same device as q");
-        TORCH_CHECK(o.dim() == 4 && o.size(0) == B && o.size(1) == Sq &&
-                        o.size(2) == Hq && o.size(3) == D,
-                    "out must have shape (B, Sq, Hq, D)");
-        TORCH_CHECK(o.stride(-1) == 1, "out last dim must be contiguous");
-    } else {
-        o = at::empty({B, Sq, Hq, D}, opts_bf16);
-    }
-
-    at::Tensor lse = return_lse ? at::empty({B, Hq, Sq}, opts_f32)
-                                : at::empty({0}, opts_f32);
-
-    // split-major fp32 scratch: [G][B][Hq][Sq][D] (partial O) + [G][B][Hq][Sq] (partial LSE)
-    at::Tensor scratch_o   = at::empty({G, B, Hq, Sq, D}, opts_f32);
-    at::Tensor scratch_lse = at::empty({G, B, Hq, Sq}, opts_f32);
+    // o / lse / scratch_o / scratch_lse are pre-allocated by the caller
+    // (aiter/ops/mha.py). Validate o's shape/dtype like the old out path did.
+    AITER_CHECK(o.dtype() == AITER_DTYPE_bf16, "out must be bf16");
+    AITER_CHECK(o.dim() == 4 && o.size(0) == B && o.size(1) == Sq &&
+                    o.size(2) == Hq && o.size(3) == D,
+                "out must have shape (B, Sq, Hq, D)");
+    AITER_CHECK(o.stride(-1) == 1, "out last dim must be contiguous");
 
     FmhaFwdParams base{};
     base.q   = reinterpret_cast<const __hip_bfloat16*>(q.data_ptr());
@@ -97,13 +79,13 @@ std::vector<at::Tensor> mha_fwd_native_splitkv(
 
     FmhaFwdSplitParams sp{};
     sp.base        = base;
-    sp.scratch_o   = scratch_o.data_ptr<float>();
-    sp.scratch_lse = scratch_lse.data_ptr<float>();
+    sp.scratch_o   = static_cast<float*>(scratch_o.data_ptr());
+    sp.scratch_lse = static_cast<float*>(scratch_lse.data_ptr());
     sp.num_splits  = G;
     sp.split_idx   = 0;  // vestigial: globals decode split from blockIdx.z
 
-    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(q));
-    const hipStream_t stream = at::hip::getCurrentHIPStream();
+    HipDeviceGuard device_guard(q.device_id);
+    const hipStream_t stream = aiter::getCurrentHIPStream();
 
     const int m_tiles = (Sq + kM0 - 1) / kM0;
     dim3 grid_prod(Hq, m_tiles, B * G);
@@ -111,10 +93,10 @@ std::vector<at::Tensor> mha_fwd_native_splitkv(
     else        launch_msk0_split(sp, grid_prod, stream);
 
     FmhaFwdCombineParams cp{};
-    cp.scratch_o   = scratch_o.data_ptr<float>();
-    cp.scratch_lse = scratch_lse.data_ptr<float>();
+    cp.scratch_o   = static_cast<float*>(scratch_o.data_ptr());
+    cp.scratch_lse = static_cast<float*>(scratch_lse.data_ptr());
     cp.o           = reinterpret_cast<__hip_bfloat16*>(o.data_ptr());
-    cp.lse         = return_lse ? lse.data_ptr<float>() : nullptr;
+    cp.lse         = return_lse ? static_cast<float*>(lse.data_ptr()) : nullptr;
     cp.num_splits  = G;
     cp.seqlen_q    = Sq;
     cp.nhead_q     = Hq;
@@ -126,7 +108,6 @@ std::vector<at::Tensor> mha_fwd_native_splitkv(
     launch_combine(cp, grid_comb, stream);
 
     HIP_CHECK(hipGetLastError());
-    return {o, lse};
 }
 
 }  // namespace aiter

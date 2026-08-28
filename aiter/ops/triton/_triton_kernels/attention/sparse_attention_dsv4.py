@@ -291,7 +291,12 @@ def _sparse_attn_prefill_kernel(
     BLOCK_D: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
-    query_idx = tl.program_id(0)
+    # 64-bit before the multiply, same reasoning as `slot_off` below: the
+    # program id fits 32 bits, but `query_idx * q_stride_t` does not once
+    # num_queries passes 32K, because q_stride_t is num_heads * head_dim
+    # (128 * 512 = 65536) in the V4 layout. Unlike the pool read, the wrapped
+    # offset lands outside the q/out allocations, so it page-faults.
+    query_idx = tl.program_id(0).to(tl.int64)
     pid_h = tl.program_id(1)
 
     head_offsets = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)

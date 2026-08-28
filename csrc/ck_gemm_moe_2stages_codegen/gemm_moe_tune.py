@@ -70,6 +70,11 @@ from aiter.utility import fp4_utils
 from aiter.utility.base_tuner import TunerCommon
 from aiter.utility.fp4_utils import moe_mxfp4_sort
 from aiter.utility.mp_tuner import mp_tuner
+from csrc.opus_moe.opus_moe_common import (
+    OPUS_A8W4_GFX950_DECODE_KERNEL_CONTRACT,
+    get_opus_a8w4_stage2_kernels,
+    opus_a8w4_stage1_instances_for_shape,
+)
 
 try:
     from aiter.ops.flydsl.utils import is_flydsl_available
@@ -1210,8 +1215,8 @@ class FmoeTuner(TunerCommon):
         # The tuner's blockM is the moe_sorting block_m (== the kid's
         # SORT_BLOCK_M); the kernel's own B_M is kparams["kernel_block_m"].
         from aiter.ops.opus.moe_stage2_a8w4 import (
-            opus_moe_stage2_a8w4_decode_fwd,
-            opus_moe_stage2_reduce_token_slot_route_output_fwd,
+            opus_moe_stage2_a8w4_fwd,
+            stage2_launch_config,
         )
 
         block_n = int(kparams.get("kernel_block_n"))
@@ -1223,41 +1228,20 @@ class FmoeTuner(TunerCommon):
                 f"block_n={kparams.get('kernel_block_n')}"
             )
         kid = kparams["kid"]
-        reduce_block_n = kparams.get("reduce_block_n")
-        route_shape = {"token_num": int(moe_buf.shape[0]), "topk": int(topk)}
         # w2_qt / w2_scale here are ALREADY the a16w4 MFMA-tile shuffle:
         # gen_opus_2stages_task feeds "w2_qt_shffle_ck" (shuffle_weight_a16w4)
         # and "w2_scale_aiter" (shuffle_scale_a16w4). opus consumes them as-is.
         w2_use = w2_qt
         w2_scale_opus = w2_scale
-        if kparams["route_out"]:
-            route_out = opus_moe_stage2_a8w4_decode_fwd(
-                a2_qt,
-                w2_use,
-                a2_scale,
-                w2_scale_opus,
-                sorted_ids,
-                sorted_weights,
-                sorted_expert_ids,
-                num_valid_ids,
-                block_m=blockM,
-                kernel_id=kid,
-                inter_dim_pad=0,
-                return_per_slot=True,
-                **route_shape,
+        launch = stage2_launch_config(kid)
+        if launch.sort_block_m != int(blockM):
+            raise ValueError(
+                f"Opus A8W4 stage2 kid {kid} requires sort block_m="
+                f"{launch.sort_block_m}, got {blockM}"
             )
-            if route_out.dtype == torch.uint8:  # MXFP8 route_out
-                return opus_moe_stage2_reduce_token_slot_route_output_fwd(
-                    route_out, out=moe_buf, topk=int(topk), block_n=reduce_block_n
-                )
-            return opus_moe_stage2_reduce_token_slot_route_output_fwd(
-                route_out.view(moe_buf.shape[0], int(topk), moe_buf.shape[1]),
-                out=moe_buf,
-                topk=int(topk),
-                block_n=reduce_block_n,
-            )
-        moe_buf.zero_()
-        return opus_moe_stage2_a8w4_decode_fwd(
+        if not launch.route_out:
+            moe_buf.zero_()
+        return opus_moe_stage2_a8w4_fwd(
             a2_qt,
             w2_use,
             a2_scale,
@@ -1266,11 +1250,11 @@ class FmoeTuner(TunerCommon):
             sorted_weights,
             sorted_expert_ids,
             num_valid_ids,
+            launch=launch,
             out=moe_buf,
-            block_m=blockM,
-            kernel_id=kid,
             inter_dim_pad=0,
-            **route_shape,
+            token_num=int(moe_buf.shape[0]),
+            topk=int(topk),
         )
 
     @staticmethod
@@ -4003,16 +3987,6 @@ class FmoeTuner(TunerCommon):
             doweight_stage1,
         ) = info
 
-        from aiter.ops.opus.moe_stage2_a8w4_meta import (
-            OPUS_A8W4_GFX950_DECODE_KERNEL_CONTRACT,
-            get_opus_a8w4_stage2_kernels,
-        )
-
-        sys.path.insert(0, f"{AITER_CSRC_DIR}/opus_moe/")
-        from opus_moe_common import (
-            opus_a8w4_stage1_instances_for_shape,
-        )
-
         k_step_packed = (
             OPUS_A8W4_GFX950_DECODE_KERNEL_CONTRACT.bk_logical
             // OPUS_A8W4_GFX950_DECODE_KERNEL_CONTRACT.fp4_values_per_byte
@@ -4961,8 +4935,9 @@ class FmoeTuner(TunerCommon):
             # TUNE_ONLY: comma-list subset gate to isolate sources, e.g.
             #   TUNE_ONLY=flydsl  -> only gen_flydsl_2stages_task
             #   TUNE_ONLY=opus    -> only gen_opus_2stages_task
-            # empty = all (subject to OPUS_ONLY / OPUS_SKIP_CKTILE below).
-            _tune_only = {s for s in os.environ.get("TUNE_ONLY", "").split(",") if s}
+            # unset = flydslv2; empty = all (subject to OPUS_ONLY / OPUS_SKIP_CKTILE).
+            tune_only = os.environ.get("TUNE_ONLY", "flydslv2")
+            _tune_only = {s for s in tune_only.split(",") if s}
 
             def _want(name, _opus_only=_opus_only, _tune_only=_tune_only):
                 if _tune_only:

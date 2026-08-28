@@ -22,8 +22,10 @@ Two non-negotiables:
 2. **New configs go in the target layout** unless their family is still in the
    legacy directory (see §6).
 
-`GEMM-AFP4WFP4` (gfx950 triton, gfx950/gfx1250 gluon) is the only migrated
-family and the worked reference — copy its shape when in doubt.
+`GEMM-AFP4WFP4` (gfx950 triton, gfx950/gfx1250 gluon) and
+`GEMM-AFP4WFP4_PRESHUFFLED` (gfx950/gfx1250 triton) are the migrated
+families; `GEMM-AFP4WFP4` is the worked reference — copy its shape when in
+doubt.
 
 ---
 
@@ -121,11 +123,9 @@ Consequences to keep in mind:
   instead).
 
 Direct-path loaders bypass the resolver's directory probe. Grep for
-`f"{AITER_TRITON_CONFIGS_PATH}/..."` before moving anything —
-`gluon/gemm_a8w8_blockscale.py` still builds legacy `gemm/gluon/` paths by
-hand (via `load_config_json`) and must be edited when its configs move.
-`gluon/gemm_a8w8.py` and `gluon/gemm_afp4wfp4.py` go through
-`get_gemm_config(backend="gluon")` and need no changes.
+`f"{AITER_TRITON_CONFIGS_PATH}/..."` before moving anything.
+`gluon/gemm_afp4wfp4.py` goes through `get_gemm_config(backend="gluon")` and
+needs no changes.
 
 ---
 
@@ -349,10 +349,10 @@ legacy form if a step is ambiguous.
    if absent.
 4. **Do not edit contents in the same commit.** Keep renames at 100% similarity;
    content changes go in a follow-up commit.
-5. **Update docs.** `aiter/ops/triton/README.md` ("How config selection works",
-   "Config file naming convention") and
-   `aiter/ops/triton/utils/_triton/tunning/README.md` (the step that says
-   `cp *.json .../configs/gemm/`) both still describe only the legacy layout.
+5. **Update docs.** `aiter/ops/triton/README.md` ("How GEMM configs resolve",
+   "Config naming") and `aiter/ops/triton/utils/_triton/tunning/README.md`
+   (the copy step under "Verify performance") both describe the two layouts —
+   keep them current if a migration changes what they say.
 6. **Pull any tuning values still hardcoded in Python into the JSON.** A
    migrated family must be fully described by its config files.
 7. **Verify** on the target arch: config resolves, `is_tuned` is `True` for a
