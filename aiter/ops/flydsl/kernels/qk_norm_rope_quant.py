@@ -104,7 +104,6 @@ TDM_MIN_ROWS = 32768
 TDM_DECODE_STORE_CACHE_MODIFIER = 1
 
 
-
 _SQRT2 = math.sqrt(2.0)
 
 
@@ -1675,8 +1674,11 @@ def flydsl_qk_norm_rope_quant(
                 stream if has_direct else Stream(stream),
             )
             _run_compiled(launcher, *args)
-            return q_out, kv_out, (q_scale if quant else None), (
-                kv_scale if quant else None
+            return (
+                q_out,
+                kv_out,
+                (q_scale if quant else None),
+                (kv_scale if quant else None),
             )
 
         rows_per_wg = ROWS_PER_WG_SMALL if T_tok <= SMALL_T_THRESHOLD else ROWS_PER_WG
@@ -1981,9 +1983,9 @@ def _build_kernel_w32_tdm(
                         dtype=fp8_mx_dtype,
                     )
                 )
-                factor = rstd_q * (
-                    (fx.Int32(254) - e8m0_biased) << 23
-                ).bitcast(fx.Float32)
+                factor = rstd_q * ((fx.Int32(254) - e8m0_biased) << 23).bitcast(
+                    fx.Float32
+                )
                 scaled = xw * factor
                 scale_store = e8m0_biased.to(fx.Int8)
             elif const_expr(quant):
@@ -2150,9 +2152,7 @@ def _build_kernel_w32_tdm(
                 if const_expr(i + K < CT):
                     issue(bufs[i % K], tile_base + i + K)  # reuse after read
                 if const_expr(do_hoist and (i + 1) % GROUP == 0 and i + 1 < CT):
-                    pending_pos[0] = issue_pos(
-                        tok_of(tile_base + i + 1)
-                    )
+                    pending_pos[0] = issue_pos(tok_of(tile_base + i + 1))
                     cs_cache[0], cs_cache[1] = _cs_from_pos(
                         fx.Int32(pending_pos[0].trunci(i32))
                     )
