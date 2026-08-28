@@ -23,7 +23,11 @@ are single-writer.
 Constraints:
   - causal + mask variants (num_targets / max_attn_len / contextual_seq_len).
   - dtype in {f16, bf16}; accumulate in fp32.
-  - head_dim % 16 == 0, hidden_dim % 16 == 0.
+  - head_dim % 16 == 0, hidden_dim % 16 == 0. Necessary but not sufficient: the two
+    streamed tiles must each divide the arch's DMA pass and hidden_dim/vec_v lanes
+    per row must divide the thread block, which ties the usable dims to num_waves
+    (and rules some out entirely -- hidden_dim 144/176/208/240 have no valid tile).
+    A multiple of 64 is always safe; validate_hstu_attention_bwd is the authority.
   - block_m must be a multiple of num_waves*16.
   - fast/unsafe FP math: not strict IEEE-754 (mirrors the forward's SiLU).
 """
@@ -156,7 +160,7 @@ def validate_hstu_attention_bwd(
     if block_n % MFMA_M != 0:
         raise ValueError(f"block_n {block_n} must be a multiple of MFMA_M={MFMA_M}")
 
-    _, dma_elems, _, _ = _arch_dma_params()
+    _, dma_elems, _, _ = _arch_dma_params(arch)
     block_threads = num_waves * WARP_SIZE
     elems_per_dma_pass = block_threads * dma_elems
     head_dim_k = ((head_dim + 63) // 64) * 64
@@ -183,7 +187,7 @@ def validate_hstu_attention_bwd(
             f"rows_per_batch_v={rows_per_batch_v} must divide block_n={block_n}, unless rows_per_batch_v > block_n"
         )
 
-    lds_cap = lds_cap_bytes()
+    lds_cap = lds_cap_bytes(arch)
     lds_bytes = block_n * head_dim_k * 2 + block_n * hidden_dim * 2
     if lds_bytes > lds_cap:
         raise ValueError(f"LDS tile {lds_bytes} B exceeds the {lds_cap} B budget")
@@ -477,8 +481,7 @@ def build_hstu_attention_bwd_dvdk(
             # the reciprocal into v_rcp_f32, so no rocdl builder is needed there. exp2
             # is the exception: it stays on the amdgcn intrinsic, which FlyDSL
             # docs/api_stability.md classes as unstable, because the stable
-            # fx.math.exp2 does not reach v_exp_f32 even under this context
-            # (+2.7% mean, +6.1% worst over the b=120 shape sweep).
+            # fx.math.exp2 does not reach v_exp_f32 perf even under this context
             with arith.fastmath(arith.FastMathFlags.fast):
                 sc = [s * c_alpha for s in s_list]
                 tt = [s * c_neg_log2e for s in sc]

@@ -16,6 +16,7 @@ from aiter.ops.flydsl.hstu_attention_kernels import (
     flydsl_hstu_attention,
     flydsl_hstu_attention_bwd,
 )
+from aiter.ops.flydsl.kernels.hstu_attention_bwd import validate_hstu_attention_bwd
 
 # Reuse the forward test's self-contained input generator.
 from op_tests.flydsl_tests.test_flydsl_hstu_attention import (
@@ -135,9 +136,11 @@ def assert_grads_close(dq, dk, dv, dq_ref, dk_ref, dv_ref):
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize(
     "attn_dim,hidden_dim",
-    # (96, 128) is the non-64-aligned attn_dim case: the kernel rounds the Q LDS
-    # stride up to 128, so the padded columns exercise the Q DMA's source clamp.
-    [(128, 64), (64, 128), (128, 256), (96, 128)],
+    # (96, 128) is the non-64-aligned attn_dim case: the kernel rounds the Q/K LDS
+    # stride up to 128, so the padded columns exercise both DMAs' source clamps.
+    # (96, 96) and (128, 192) additionally have a hidden_dim the default tile cannot
+    # serve, so they only build via the fallback's candidate search.
+    [(128, 64), (64, 128), (128, 256), (96, 128), (96, 96), (128, 192)],
 )
 def test_flydsl_bwd_asymmetric_dims(attn_dim, hidden_dim, dtype):
     batch, heads, max_seq_len = 16, 2, 512
@@ -374,6 +377,57 @@ def test_flydsl_bwd_block_size_overrides(block_m, block_n, num_waves, waves_per_
         waves_per_eu=waves_per_eu,
     )
     assert_grads_close(dq, dk, dv, dq_ref, dk_ref, dv_ref)
+
+
+# --------------------------------------------------------------------------- #
+# Untuned fallback config
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize("arch", ["gfx942", "gfx950"])
+@pytest.mark.parametrize("kernel", ["dvdk", "dq"])
+@pytest.mark.parametrize("head_dim", [64, 96, 128])
+@pytest.mark.parametrize("hidden_dim", [64, 96, 128, 192, 256])
+def test_bwd_default_config_validates(arch, kernel, head_dim, hidden_dim):
+    """The untuned fallback must never hand back a config the kernel rejects.
+
+    hidden_dim 96/192 do not divide the dO/V DMA pass at the default wave count, and
+    on gfx950 the wider dwordx4 pass rules out more of the space still -- both are
+    only reachable through the fallback's candidate search. Arch-parametrized so the
+    gfx950 geometry is covered from a gfx942 host.
+    """
+    config = hstu_kernels._get_bwd_default_config(
+        kernel, head_dim=head_dim, hidden_dim=hidden_dim, arch=arch
+    )
+    validate_hstu_attention_bwd(
+        1,
+        head_dim,
+        hidden_dim,
+        1,
+        True,
+        0,
+        0,
+        False,
+        1.0,
+        "bf16",
+        512,
+        arch=arch,
+        **config,
+    )
+
+
+def test_bwd_validation_honors_arch_argument():
+    """Tile checks must follow the requested arch, not the local device.
+
+    gfx950's dwordx4 DMA gives a 4x wider pass, so hidden_dim=16 at the default tile
+    is fine on gfx942 and invalid on gfx950. If the arch argument were dropped, this
+    would agree with whichever device happens to be running the suite.
+    """
+    config = {"block_m": 128, "block_n": 32, "num_waves": 4, "waves_per_eu": 0}
+    args = (1, 128, 16, 1, True, 0, 0, False, 1.0, "bf16", 512)
+    validate_hstu_attention_bwd(*args, arch="gfx942", **config)
+    with pytest.raises(ValueError, match="dO DMA tile"):
+        validate_hstu_attention_bwd(*args, arch="gfx950", **config)
 
 
 # --------------------------------------------------------------------------- #

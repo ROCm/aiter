@@ -126,6 +126,11 @@ def build_hstu_attention_bwd_dq(
     stride_qk_n = num_heads * head_dim
 
     K_STRIDE = HEAD_DIM_K
+    # Columns in [head_dim, HEAD_DIM_K) have no backing element in this head, so the
+    # K DMA source needs clamping (see async_load_k) -- the dV/dK kernel's Q_COL_GUARD
+    # on its own padded operand. Only live when padded; a 64-aligned head_dim makes it
+    # compile-time false and emits no compare/select.
+    K_COL_GUARD = head_dim < HEAD_DIM_K
     V_STRIDE = hidden_dim
 
     k_tile_elems = BLOCK_N * K_STRIDE
@@ -423,13 +428,21 @@ def build_hstu_attention_bwd_dq(
         wave_lds_lane0_k = rocdl.readfirstlane(fx.Int32.ir_type, wave_lds_base_k)
         k_dma_rows = []
         k_dma_gcols = []
+        k_dma_col_ok = []
         for d in range_constexpr(NUM_DMA_K):
             pair = tid + fx.Int32(d * BLOCK_THREADS)
             row = pair // c_pairs_per_row_k
             col_pair = pair % c_pairs_per_row_k
             col = col_pair * c_dma_elems
+            row_gcol = k_swz_col(row, col)
             k_dma_rows.append(row)
-            k_dma_gcols.append(k_swz_col(row, col))
+            k_dma_gcols.append(row_gcol)
+            if K_COL_GUARD:
+                # The swizzle XORs within a 64-column block above the DMA granule, so
+                # the fetched column stays DMA_ELEMS-aligned and head_dim % MFMA_K == 0
+                # means an in-range start never straddles head_dim. Loop-invariant in
+                # kv_start, so hoisted out of the KV sweep.
+                k_dma_col_ok.append(row_gcol < fx.Int32(head_dim))
 
         c_stride_qk_n = fx.Int32(stride_qk_n)
 
@@ -439,6 +452,14 @@ def build_hstu_attention_bwd_dq(
                 in_bounds = (kv_start + row) < seq_len
                 local_tok = in_bounds.select(kv_start + row, fx.Int32(0))
                 src_elem = local_tok * c_stride_qk_n + k_dma_gcols[d]
+                if K_COL_GUARD:
+                    # A pad column would index into the next head, and on the last
+                    # token/head past the tensor entirely -- the rebased descriptor
+                    # carries a 4 GiB bound, so the hardware does not clamp it. Fold
+                    # those lanes onto element 0. GEMM1 pairs every pad contraction
+                    # step with a zero Q operand, so the value never reaches an
+                    # output; it only has to be finite, since 0 * NaN would poison S.
+                    src_elem = k_dma_col_ok[d].select(src_elem, fx.Int32(0))
                 lds_byte = fx.Int32(wave_lds_lane0_k) + fx.Int32(
                     d * BLOCK_THREADS * DMA_BYTES
                 )

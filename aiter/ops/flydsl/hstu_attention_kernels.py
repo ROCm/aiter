@@ -18,6 +18,7 @@ from aiter import logger
 from aiter.ops.flydsl.kernels.hstu_attention_bwd import (
     NUM_GRID_GROUPS,
     build_hstu_attention_bwd_dvdk,
+    validate_hstu_attention_bwd,
 )
 from aiter.ops.flydsl.kernels.hstu_attention_bwd_dq import (
     build_hstu_attention_bwd_dq,
@@ -657,18 +658,78 @@ def _build_balance_perm(
     return perm
 
 
-def _get_bwd_default_config(kernel: str) -> dict:
+# Fallback tiles tried after the per-kernel pick, in descending size order. A
+# hidden_dim that is not a multiple of 64 constrains the V DMA (the hidden_dim /
+# vec_v lanes per row must divide the thread block), and on gfx950 the wider dwordx4
+# DMA makes the dO tile divide a 4x larger pass -- num_waves is what buys back both,
+# so these trade block size for a wave count that fits. The forward's equivalent map
+# only has to cover 96/160/192; the backward streams a second (dO) tile, so more of
+# the dim space needs a non-default wave count.
+_BWD_FALLBACK_TILES = (
+    (96, 48, 3, 0),
+    (160, 80, 5, 0),
+    (96, 64, 3, 0),
+    (64, 64, 2, 0),
+    (112, 112, 7, 0),
+    (48, 96, 3, 0),
+    (32, 32, 2, 0),
+    (16, 16, 1, 0),
+)
+
+
+@functools.lru_cache(maxsize=1024)
+def _get_bwd_default_config(
+    kernel: str, *, head_dim: int, hidden_dim: int, arch: str | None = None
+) -> dict:
     """Conservative heuristic default when no tuned entry exists.
 
-    These tiles are valid across every supported shape (including asymmetric and
-    non-64-divisible dims) and are what the correctness suite runs against.
-    Per-kernel tuned CSV entries override them; the per-kernel win comes from the
-    tuned CSV, whose entries are validated per shape.
+    Picks the first candidate tile this (head_dim, hidden_dim, arch) actually
+    validates for, so the fallback cannot advertise a config the kernel refuses to
+    build. Per-kernel tuned CSV entries override the result; the per-kernel win
+    comes from the tuned CSV, whose entries are validated per shape.
 
+    The probe passes neutral values for the args that do not enter the tile
+    geometry (head/batch counts, mask extents, alpha, seq len) -- only the dims,
+    the tile, and the arch's DMA width and LDS budget do.
     """
-    if kernel == _BWD_KERNEL_DVDK:
-        return {"block_m": 128, "block_n": 32, "num_waves": 4, "waves_per_eu": 0}
-    return {"block_m": 64, "block_n": 32, "num_waves": 4, "waves_per_eu": 0}
+    base = (
+        (128, 32, 4, 0) if kernel == _BWD_KERNEL_DVDK else (64, 32, 4, 0)
+    )  # historical pick, kept first so 64-aligned dims are unaffected
+    candidates = (base, *_BWD_FALLBACK_TILES)
+    last_error = None
+    for block_m, block_n, num_waves, waves_per_eu in candidates:
+        config = {
+            "block_m": block_m,
+            "block_n": block_n,
+            "num_waves": num_waves,
+            "waves_per_eu": waves_per_eu,
+        }
+        try:
+            validate_hstu_attention_bwd(
+                1,
+                head_dim,
+                hidden_dim,
+                1,
+                True,
+                0,
+                0,
+                False,
+                1.0,
+                "bf16",
+                512,
+                arch=arch,
+                **config,
+            )
+        except ValueError as e:
+            last_error = e
+            continue
+        return config
+    raise ValueError(
+        f"no valid backward tile for head_dim={head_dim}, hidden_dim={hidden_dim} on "
+        f"{arch or get_rocm_arch()}: none of the {len(candidates)} fallback tiles "
+        f"validate (last: {last_error}). Pass an explicit block_m / block_n / "
+        f"num_waves, or use a hidden_dim that is a multiple of 64."
+    )
 
 
 @functools.lru_cache(maxsize=16384)
@@ -723,7 +784,7 @@ def _compile_bwd_launcher(
             has_targets=has_targets,
         )
         return {
-            **_get_bwd_default_config(kernel),
+            **_get_bwd_default_config(kernel, head_dim=head_dim, hidden_dim=hidden_dim),
             **tuned_config,
             **custom_config,
         }
