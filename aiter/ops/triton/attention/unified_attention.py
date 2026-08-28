@@ -886,6 +886,7 @@ _unified_attention_3d_{arch}(
     segm_output,
     segm_max,
     segm_expsum,
+    NUM_SEGMENTS,
 ): ...
 
 _reduce_segments_{arch}(
@@ -893,6 +894,7 @@ _reduce_segments_{arch}(
     segm_output,
     segm_max,
     segm_expsum,
+    NUM_SEGMENTS,
 ): ...
 ```
 """
