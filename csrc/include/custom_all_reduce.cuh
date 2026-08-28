@@ -4140,8 +4140,7 @@ void dispatchOwnerReadGather(
         owner_read_gather<T, 2><<<grid, block, 0, stream>>>(
             ptrs, sg_, self_sg_, output, rank_, n_total, last_dim, owner_rank);
         break;
-    default: printf("owner_read_gather world_size error
-");
+    default: printf("owner_read_gather world_size error\n");
     }
 }
 
