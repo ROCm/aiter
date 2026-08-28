@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       shapes:
-        description: 'Comma separated shape names to run, e.g. ck_batched_gemm_a8w8, ck_gemm_a8w8, ck_gemm_a8w8_blockscale, ck_gemm_a8w8_blockscale_bpreshuffle, ck_gemm_a8w8_bpreshuffle etc. (leave empty for all)'
+        description: 'Comma separated shape names to run, e.g. ck_batched_gemm_a8w8, ck_batched_gemm_bf16, gemm_a16w16, ck_gemm_a8w8, ck_gemm_a8w8_blockscale, ck_gemm_a8w8_blockscale_bpreshuffle, ck_gemm_a8w8_bpreshuffle etc. (leave empty for all)'
         required: false
         default: ''
       arguments:
@@ -17,13 +17,19 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
+  ci_config:
+    uses: ./.github/workflows/ci-config.yaml
+
   operators_tuning:
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux-aiter-mi300x-1] # TODO: add more runners
+        runner: [linux-aiter-oci-mi300x-1] # TODO: add more runners
     name: Operators tuning
     runs-on: ${{ matrix.runner }}
+    needs: ci_config
+    env:
+      DOCKER_IMAGE: ${{ needs.ci_config.outputs.pytorch_py312_image }}
 
     steps:
       - name: Checkout aiter repo
@@ -52,7 +58,7 @@ jobs:
           -v "${{ github.workspace }}:/workspace" \
           -w /workspace \
           --name operators_tuning_test \
-          rocm/pytorch:latest
+          $DOCKER_IMAGE
 
       - name: Setup Aiter and Triton
         run: |

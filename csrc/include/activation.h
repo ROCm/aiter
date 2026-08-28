@@ -5,8 +5,24 @@
 
 namespace aiter {
 
-void silu_and_mul(const aiter_tensor_t& out, const aiter_tensor_t& input);
+void silu_and_mul(const aiter_tensor_t& out, const aiter_tensor_t& input, float limit = 0.0f);
+void swiglu_and_mul(const aiter_tensor_t& out, const aiter_tensor_t& input);
+void silu_and_mul_bias(const aiter_tensor_t& out,
+                       const aiter_tensor_t& input,
+                       const aiter_tensor_t& expert_ids,
+                       const aiter_tensor_t& bias);
+void swiglu_and_mul_bias(const aiter_tensor_t& out,
+                         const aiter_tensor_t& input,
+                         const aiter_tensor_t& expert_ids,
+                         const aiter_tensor_t& bias);
+void gelu_and_mul_bias(const aiter_tensor_t& out,
+                       const aiter_tensor_t& input,
+                       const aiter_tensor_t& expert_ids,
+                       const aiter_tensor_t& bias);
 void scaled_silu_and_mul(const aiter_tensor_t& out, const aiter_tensor_t& input, const aiter_tensor_t& scale);
+void silu_and_mul_quant(const aiter_tensor_t& out, const aiter_tensor_t& input,
+                        const aiter_tensor_t& scale, int group_size,
+                        float limit = 0.0f, bool shuffle_scale = false);
 void gelu_and_mul(const aiter_tensor_t& out, const aiter_tensor_t& input);
 void gelu_tanh_and_mul(const aiter_tensor_t& out, const aiter_tensor_t& input);
 void gelu_fast(const aiter_tensor_t& out, const aiter_tensor_t& input);

@@ -147,12 +147,12 @@ def _kernel_unified_attention_sparse_mla_2d(
     L = tl.full([BLOCK_M], 1.0, dtype=tl.float32)
     acc = tl.zeros([BLOCK_M, KV_LORA_RANK], dtype=tl.float32)
 
-    block_table_offset = seq_idx * block_table_stride
+    seq_idx * block_table_stride
 
     # iterate topk indices in tiles of TILE_SIZE
     num_tiles = (topk_count + TILE_SIZE - 1) // TILE_SIZE
     KV_cache_modifier: tl.constexpr = ".cg" if ALL_DECODE else ""
-    for t in range(0, num_tiles):
+    for t in range(num_tiles):
         tile_start = t * TILE_SIZE
         offs_t = tl.arange(0, TILE_SIZE)
         valid_t = (tile_start + offs_t) < topk_count
@@ -234,7 +234,7 @@ def _kernel_unified_attention_sparse_mla_2d(
             cache_modifier=KV_cache_modifier,
         )
 
-        acc += tl.dot(P.to(V_lora.dtype), V_lora)
+        acc = tl.dot(P.to(V_lora.dtype), V_lora, acc=acc)
 
     # epilogue
     one_over_L = 1.0 / L[:, None]

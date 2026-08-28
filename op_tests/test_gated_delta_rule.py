@@ -1,0 +1,1931 @@
+# Copyright (C) 2023-2026, Songlin Yang, Yu Zhang
+
+import importlib
+import os
+
+os.environ.setdefault("AITER_TRITON_ONLY", "1")
+os.environ.setdefault("AITER_USE_SYSTEM_TRITON", "1")
+
+import pytest
+import torch
+import torch.nn.functional as F
+from einops import rearrange, repeat
+
+from aiter.ops.chunk_gated_delta_rule_fwd_h import (
+    chunk_gated_delta_rule_fwd_h_hip_fn,
+)
+from aiter.ops.flydsl.linear_attention_prefill_kernels import (
+    chunk_gated_delta_rule_fwd_h_flydsl_opt,
+)
+from aiter.ops.triton._triton_kernels.gated_delta_rule.decode.fused_sigmoid_gating_recurrent import (
+    fused_sigmoid_gating_delta_rule_update,
+)
+from aiter.ops.triton._triton_kernels.gated_delta_rule.gated_delta_rule_utils import (
+    IS_AMD,
+    IS_INTEL_ALCHEMIST,
+    assert_close,
+    device,
+)
+from aiter.ops.triton._triton_kernels.gated_delta_rule.prefill import (
+    chunk_gated_delta_rule_fwd_h_opt_vk,
+    fused_chunk_local_cumsum_scaled_dot_kkt_fwd,
+    fused_solve_tril_recompute_w_u,
+)
+from aiter.ops.triton._triton_kernels.gated_delta_rule.prefill import (
+    fused_solve_tril_recompute as fused_solve_module,
+)
+from aiter.ops.triton.gated_delta_net import (
+    chunk_gated_delta_rule,
+    chunk_gated_delta_rule_opt,
+    chunk_gated_delta_rule_opt_vk,
+    fused_recurrent_gated_delta_rule,
+)
+
+
+def _is_gfx12_runtime() -> bool:
+    if not IS_AMD:
+        return False
+    try:
+        props = torch.cuda.get_device_properties(torch.cuda.current_device())
+        arch = getattr(props, "gcnArchName", "")
+        return arch.split(":")[0] in {"gfx1200", "gfx1201"} if arch else False
+    except Exception:  # noqa: BLE001
+        return False
+
+
+@pytest.mark.parametrize(
+    ("arch", "expected"),
+    [
+        ("gfx1200", False),
+        ("gfx1201:sramecc+:xnack-", False),
+        ("gfx1250", True),
+        ("gfx950", False),
+    ],
+)
+def test_chunk_opt_vk_unsupported_gfx12_runtime_allowlist(
+    monkeypatch, arch: str, expected: bool
+):
+    chunk_module = importlib.import_module(
+        "aiter.ops.triton._triton_kernels.gated_delta_rule.prefill.chunk"
+    )
+    props = type("DeviceProperties", (), {"gcnArchName": arch})()
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda device: props)
+
+    assert chunk_module._is_unsupported_gfx12_runtime(torch.device("cuda")) is expected
+
+
+@pytest.mark.parametrize(
+    ("execution_mode", "process_mode", "expected"),
+    [("fused", "split", False), ("split", "fused", True)],
+)
+def test_solve_tril_recompute_explicit_dispatch_overrides_auto_threshold(
+    execution_mode: str,
+    process_mode: str,
+    expected: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(fused_solve_module, "_SOLVE_TRIL_RECOMPUTE_FORCE", process_mode)
+    monkeypatch.setattr(fused_solve_module, "_SOLVE_TRIL_RECOMPUTE_FUSE_NT_MAX", 32)
+    assert (
+        fused_solve_module._should_use_split_path(
+            execution_mode=execution_mode,
+            nt=128,
+            is_varlen=False,
+        )
+        is expected
+    )
+
+
+def test_solve_tril_recompute_auto_dispatch_is_backward_compatible(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(fused_solve_module, "_SOLVE_TRIL_RECOMPUTE_FORCE", "")
+    monkeypatch.setattr(fused_solve_module, "_SOLVE_TRIL_RECOMPUTE_FUSE_NT_MAX", 32)
+    assert not fused_solve_module._should_use_split_path("auto", 32, False)
+    assert fused_solve_module._should_use_split_path("auto", 33, False)
+
+
+def test_solve_tril_recompute_rejects_unknown_execution_mode() -> None:
+    with pytest.raises(ValueError, match="execution_mode"):
+        fused_solve_module._should_use_split_path("invalid", 128, False)
+
+
+def recurrent_gated_delta_rule_ref(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    beta: torch.Tensor,
+    g: torch.Tensor,
+    scale: float | None = None,
+    initial_state: torch.Tensor = None,
+    output_final_state: bool = False,
+):
+    q, k, v, beta, g = (
+        x.transpose(1, 2).contiguous().to(torch.float32) for x in [q, k, v, beta, g]
+    )
+    B, H, T, K, V = *k.shape, v.shape[-1]
+    o = torch.zeros(B, H, T, V).to(v)
+    h = torch.zeros(B, H, K, V).to(v)
+    if initial_state is not None:
+        h = initial_state
+    if scale is None:
+        scale = 1 / (q.shape[-1] ** 0.5)
+    q = q * scale
+    for i in range(T):
+        b_q = q[:, :, i]
+        b_k = k[:, :, i]
+        b_v = v[:, :, i].clone()
+        h = h.clone() * g[:, :, i].exp()[..., None, None]
+        b_beta = beta[:, :, i]
+        b_v = b_v - (h.clone() * b_k[..., None]).sum(-2)
+        b_v = b_v * b_beta[..., None]
+        h = h.clone() + b_k.unsqueeze(-1) * b_v.unsqueeze(-2)
+        o[:, :, i] = torch.einsum("bhd,bhdm->bhm", b_q, h)
+    if not output_final_state:
+        h = None
+    o = o.transpose(1, 2).contiguous()
+    return o, h
+
+
+def chunk_gated_delta_rule_ref(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    chunk_size: int = 64,
+    scale: float | None = None,
+    initial_state: torch.Tensor = None,
+    output_final_state: bool = False,
+):
+    BT = chunk_size
+    if scale is None:
+        scale = 1 / (q.shape[-1] ** 0.5)
+    # Calculate padding needed to make T a multiple of BT
+    q, k, v, beta, g = (
+        x.transpose(1, 2).contiguous().to(torch.float32) for x in [q, k, v, beta, g]
+    )
+
+    T = q.shape[-2]
+    pad_len = (BT - (T % BT)) % BT
+    if pad_len > 0:
+        # Pad all tensors
+        q = F.pad(q, (0, 0, 0, pad_len))
+        k = F.pad(k, (0, 0, 0, pad_len))
+        v = F.pad(v, (0, 0, 0, pad_len))
+        beta = F.pad(beta, (0, pad_len))
+        g = F.pad(g, (0, pad_len))
+    q, k, v, beta, g = (x.to(torch.float32) for x in [q, k, v, beta, g])
+    decay = g
+    chunk_size = BT
+    b, h, seq_len, d_k = q.shape
+    d_v = v.shape[-1]
+    q = q * scale
+    v = v * beta[..., None]
+    k_beta = k * beta[..., None]
+    assert seq_len % chunk_size == 0
+    # note that diagonal is masked.
+    mask = torch.triu(
+        torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=q.device),
+        diagonal=0,
+    )
+    q, k, v, k_beta, decay = (
+        rearrange(x, "b h (n c) d -> b h n c d", c=chunk_size)
+        for x in [q, k, v, k_beta, decay.unsqueeze(-1)]
+    )
+    decay = decay.squeeze(-1).cumsum(-1)
+    decay_exp = decay.exp()[..., None]
+    L_mask = ((decay.unsqueeze(-1) - decay.unsqueeze(-2)).tril().exp().float()).tril()
+    attn = -((k_beta @ k.transpose(-1, -2)) * L_mask).masked_fill(mask, 0)
+    for i in range(1, chunk_size):
+        attn[..., i, :i] = attn[..., i, :i].clone() + (
+            attn[..., i, :i, None].clone() * attn[..., :i, :i].clone()
+        ).sum(-2)
+    attn = attn + torch.eye(chunk_size, dtype=torch.float, device=q.device)
+    attn = attn  # noqa: PLW0127
+    k_cumsum = attn @ v
+    k_cumdecay = attn @ (k_beta * decay_exp)
+    v = k_cumsum
+    S = k.new_zeros(b, h, d_k, d_v)
+    if initial_state is not None:
+        S = initial_state
+    o = torch.zeros_like(v)
+    mask = torch.triu(
+        torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=q.device),
+        diagonal=1,
+    )
+    for i in range(seq_len // chunk_size):
+        q_i, k_i, v_i = q[:, :, i], k[:, :, i], v[:, :, i]
+        attn = (q_i @ k_i.transpose(-1, -2) * L_mask[:, :, i]).masked_fill_(mask, 0)
+        v_prime = (k_cumdecay[:, :, i]) @ S
+        v_new = v_i - v_prime
+        o_inter = (q_i * decay[:, :, i, :, None].exp()) @ S
+        o[:, :, i] = o_inter + attn @ v_new
+        S = (
+            S * decay[:, :, i, -1, None, None].exp()
+            + (
+                k_i * (decay[:, :, i, -1, None] - decay[:, :, i]).exp()[..., None]
+            ).transpose(-1, -2)
+            @ v_new
+        )
+    if not output_final_state:
+        S = None
+    # unpad
+    o = rearrange(o, "b h n c d -> b h (n c) d")
+    o = o[:, :, :T]
+    o = o.transpose(1, 2)
+    return o, S
+
+
+@pytest.mark.parametrize(
+    ("B", "T", "H", "HV", "D", "scale", "gate_logit_normalizer", "dtype"),
+    [
+        pytest.param(
+            *test,
+            id="B{}-T{}-H{}-HV{}-D{}-scale{}-gate_logit_normalizer{}-{}".format(*test),
+        )
+        for test in [
+            (1, 63, 1, 1, 64, 1, 1, torch.float),
+            (2, 500, 4, 4, 60, 1, 1, torch.float),
+            (2, 1000, 2, 8, 128, 1, 0.1, torch.float),
+            (3, 1024, 2, 2, 128, 0.1, 1, torch.float),
+            (4, 1024, 3, 3, 128, 1, 10, torch.float),
+            (4, 2048, 4, 4, 64, 0.1, 1, torch.float),
+            (2, 1024, 4, 4, 128, 1, 0.1, torch.float16),
+            (2, 1024, 4, 8, 128, 1, 10, torch.float16),
+            (2, 1024, 4, 4, 128, 1, 0.1, torch.bfloat16),
+            (2, 1024, 4, 8, 128, 1, 1, torch.bfloat16),
+            (4, 2048, 4, 8, 64, 0.1, 1, torch.bfloat16),
+        ]
+    ],
+)
+def test_fused_recurrent(
+    B: int,
+    T: int,
+    H: int,
+    HV: int,
+    D: int,
+    scale: float,
+    gate_logit_normalizer: float,
+    dtype: torch.dtype,
+):
+    torch.manual_seed(42)
+    q = torch.randn(B, T, H, D, dtype=torch.float32)
+    k = torch.randn(B, T, H, D, dtype=torch.float32)
+    v = torch.randn(B, T, HV, D, dtype=dtype)
+    beta = torch.rand(B, T, HV, dtype=dtype).sigmoid()
+    g = F.logsigmoid(torch.rand(B, T, HV, dtype=torch.float32))
+    g = g / gate_logit_normalizer
+    h0 = torch.randn(B, HV, D, D, dtype=torch.float32)
+    q, k, v, beta, g, h0 = (
+        x.to(device).requires_grad_() for x in (q, k, v, beta, g, h0)
+    )
+    ref, ref_ht = recurrent_gated_delta_rule_ref(
+        q=F.normalize(
+            repeat(q.clone(), "b t h d -> b t (h g) d", g=HV // H), p=2, dim=-1
+        ).to(dtype),
+        k=F.normalize(
+            repeat(k.clone(), "b t h d -> b t (h g) d", g=HV // H), p=2, dim=-1
+        ).to(dtype),
+        v=v.clone(),
+        beta=beta.clone(),
+        g=g.clone(),
+        scale=scale,
+        initial_state=h0.clone(),
+        output_final_state=True,
+    )
+    tri, tri_ht = fused_recurrent_gated_delta_rule(
+        q=q.clone(),
+        k=k.clone(),
+        v=v.clone(),
+        beta=beta.clone(),
+        g=g.clone(),
+        scale=scale,
+        initial_state=h0.clone(),
+        use_qk_l2norm_in_kernel=True,
+        output_final_state=True,
+    )
+    # Use higher tolerance for bfloat16 due to lower precision
+    tol = 0.005 if dtype == torch.bfloat16 else 0.002
+    assert_close("o", ref, tri, tol)
+    assert_close("ht", ref_ht, tri_ht, tol)
+
+
+@pytest.mark.parametrize(
+    (
+        "B",
+        "T",
+        "H",
+        "D",
+        "scale",
+        "gate_logit_normalizer",
+        "mask_p",
+        "use_qk_l2norm_in_kernel",
+        "dtype",
+    ),
+    [
+        pytest.param(
+            *test,
+            id="B{}-T{}-H{}-D{}-scale{}-gate_logit_normalizer{}-mask_p{}-use_qk_l2norm_in_kernel{}-{}".format(
+                *test
+            ),
+        )
+        for test in [
+            (1, 63, 1, 64, 1, 1, 0, False, torch.float16),
+            (2, 500, 3, 60, 1, 1, 0, False, torch.float16),
+            (2, 1000, 3, 64, 0.1, 1, 0.5, False, torch.float16),
+            (3, 1024, 4, 100, 1, 0.1, 0, False, torch.float16),
+            (4, 1024, 4, 128, 0.1, 1, 0, False, torch.float16),
+            (4, 1024, 4, 128, 0.1, 1, 0, True, torch.float16),
+            (2, 1500, 4, 128, 0.1, 10, 0, False, torch.float16),
+            (4, 2048, 8, 64, 0.1, 1, 0, False, torch.float16),
+            # bfloat16 tests
+            (2, 500, 3, 60, 1, 1, 0, False, torch.bfloat16),
+            (2, 1000, 3, 64, 0.1, 1, 0, False, torch.bfloat16),
+            (4, 1024, 4, 128, 0.1, 1, 0, False, torch.bfloat16),
+            (4, 1024, 4, 128, 0.1, 1, 0, True, torch.bfloat16),
+            (4, 2048, 8, 64, 0.1, 1, 0, False, torch.bfloat16),
+        ]
+    ],
+)
+def test_chunk(
+    B: int,
+    T: int,
+    H: int,
+    D: int,
+    scale: float,
+    gate_logit_normalizer: float,
+    mask_p: float,
+    use_qk_l2norm_in_kernel: bool,
+    dtype: torch.dtype,
+):
+    if IS_INTEL_ALCHEMIST and D > 128:
+        pytest.skip(
+            reason="chunk_gated_delta_rule is not supported on alchemist for D>128"
+        )
+
+    torch.manual_seed(42)
+    q = torch.rand(B, T, H, D, dtype=dtype)
+    k = torch.rand(B, T, H, D, dtype=dtype)
+    v = torch.rand(B, T, H, D, dtype=dtype)
+    beta = torch.rand(B, T, H, dtype=dtype).sigmoid()
+    g = F.logsigmoid(torch.rand(B, T, H, dtype=torch.float32))
+    g = g / gate_logit_normalizer
+    g = g * (torch.rand_like(g) > mask_p)
+    h0 = torch.zeros(B, H, D, D, dtype=torch.float32)
+    q, k, v, beta, g, h0 = (
+        x.to(device).requires_grad_(True) for x in (q, k, v, beta, g, h0)
+    )
+
+    tri, tri_ht = chunk_gated_delta_rule(
+        q=(
+            F.normalize(q.clone(), p=2, dim=-1)
+            if not use_qk_l2norm_in_kernel
+            else q.clone()
+        ),
+        k=(
+            F.normalize(k.clone(), p=2, dim=-1)
+            if not use_qk_l2norm_in_kernel
+            else k.clone()
+        ),
+        v=v.clone(),
+        g=g.clone(),
+        beta=beta.clone(),
+        scale=scale,
+        initial_state=h0.clone(),
+        output_final_state=True,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+    )
+    # do = torch.randn_like(v)
+    # dht = torch.randn_like(h0)
+
+    ref, ref_ht = recurrent_gated_delta_rule_ref(
+        q=F.normalize(q.clone(), p=2, dim=-1),
+        k=F.normalize(k.clone(), p=2, dim=-1),
+        v=v.clone(),
+        beta=beta.clone(),
+        g=g.clone(),
+        scale=scale,
+        output_final_state=True,
+        initial_state=h0.clone(),
+    )
+
+    # ((ref * do).sum() + (ref_ht * dht).sum()).backward(retain_graph=True)
+    # ref_dq, ref_dk, ref_dv, ref_dbeta, ref_dg, ref_dh0 = q.grad, k.grad, v.grad, beta.grad, g.grad, h0.grad
+    assert_close("o", ref, tri, 0.005)
+    assert_close("ht", ref_ht, tri_ht, 0.005)
+    # assert_close('dq', ref_dq, tri_dq, 0.008)
+    # assert_close('dk', ref_dk, tri_dk, 0.008)
+    # assert_close('dv', ref_dv, tri_dv, 0.008)
+    # assert_close('db', ref_dbeta, tri_dbeta, 0.02)
+    # assert_close('dg', ref_dg, tri_dg, 0.02)
+    # assert_close('dh0', ref_dh0, tri_dh0, 0.008)
+
+
+@pytest.mark.parametrize(
+    ("B", "T", "H", "HV", "D", "scale", "gate_logit_normalizer", "dtype"),
+    [
+        pytest.param(
+            *test,
+            id="B{}-T{}-H{}-HV{}-D{}-scale{}-gate_logit_normalizer{}-{}".format(*test),
+        )
+        for test in [
+            (1, 63, 1, 1, 64, 1, 1, torch.float),
+            (2, 500, 4, 4, 60, 1, 1, torch.float),
+            (2, 1000, 2, 8, 128, 1, 0.1, torch.float),
+            (3, 1024, 2, 2, 128, 0.1, 1, torch.float),
+            (4, 1024, 3, 3, 128, 1, 10, torch.float),
+            (4, 2048, 4, 4, 64, 0.1, 1, torch.float),
+            (2, 1024, 4, 4, 128, 1, 0.1, torch.float16),
+            (2, 1024, 4, 8, 128, 1, 10, torch.float16),
+            (2, 1024, 4, 4, 128, 1, 0.1, torch.bfloat16),
+            (2, 1024, 4, 8, 128, 1, 1, torch.bfloat16),
+            (4, 2048, 4, 8, 64, 0.1, 1, torch.bfloat16),
+        ]
+    ],
+)
+def test_fused_sigmoid_gating_delta_rule_update(
+    B: int,
+    T: int,
+    H: int,
+    HV: int,
+    D: int,
+    scale: float,
+    gate_logit_normalizer: float,
+    dtype: torch.dtype,
+):
+    """Test fused sigmoid gating delta rule update kernel."""
+    torch.manual_seed(42)
+
+    # Create input tensors
+    q = torch.randn(B, T, H, D, dtype=torch.float32)
+    k = torch.randn(B, T, H, D, dtype=torch.float32)
+    v = torch.randn(B, T, HV, D, dtype=dtype)
+    b = torch.randn(B, T, HV, dtype=dtype)  # beta logits
+
+    # Gating parameters
+    A_log = torch.randn(HV, dtype=torch.float32)
+    a = torch.randn(B, T, HV, dtype=torch.float32)
+    dt_bias = torch.randn(HV, dtype=torch.float32)
+    softplus_beta = 1.0
+    softplus_threshold = 20.0
+
+    # Initial state
+    h0 = torch.randn(B, HV, D, D, dtype=torch.float32)
+    initial_state_indices = torch.arange(B, dtype=torch.long)
+
+    # Move to device
+    q, k, v, b, A_log, a, dt_bias, h0, initial_state_indices = (
+        x.to(device) for x in (q, k, v, b, A_log, a, dt_bias, h0, initial_state_indices)
+    )
+
+    # Compute reference using recurrent implementation
+    # Compute g = -exp(A_log) * softplus(a + dt_bias)
+    # This is already in log-space (negative values for decay)
+    x = a + dt_bias[None, None, :]
+    softplus_x = F.softplus(x, beta=softplus_beta, threshold=softplus_threshold)
+    g = -torch.exp(A_log[None, None, :]) * softplus_x
+    beta = torch.sigmoid(b)
+
+    # Expand q and k to match HV heads for reference implementation
+    q_expanded = F.normalize(
+        repeat(q.clone(), "b t h d -> b t (h g) d", g=HV // H), p=2, dim=-1
+    ).to(dtype)
+    k_expanded = F.normalize(
+        repeat(k.clone(), "b t h d -> b t (h g) d", g=HV // H), p=2, dim=-1
+    ).to(dtype)
+
+    ref, _ = recurrent_gated_delta_rule_ref(
+        q=q_expanded,
+        k=k_expanded,
+        v=v.clone(),
+        beta=beta.clone(),
+        g=g.clone(),
+        scale=scale,
+        initial_state=h0.clone(),
+        output_final_state=True,
+    )
+
+    # Compute using fused kernel
+    tri = fused_sigmoid_gating_delta_rule_update(
+        A_log=A_log,
+        a=a,
+        dt_bias=dt_bias,
+        softplus_beta=softplus_beta,
+        softplus_threshold=softplus_threshold,
+        q=q.clone(),
+        k=k.clone(),
+        v=v.clone(),
+        b=b.clone(),
+        initial_state_source=h0.clone(),
+        initial_state_indices=initial_state_indices,
+        scale=scale,
+        use_qk_l2norm_in_kernel=True,
+    )
+
+    # Use higher tolerance for bfloat16 due to lower precision
+    tol = 0.005 if dtype == torch.bfloat16 else 0.002
+    assert_close("o", ref, tri, tol)
+
+
+@pytest.mark.parametrize(
+    ("H", "D", "mask_p", "cu_seqlens", "dtype"),
+    [
+        pytest.param(*test, id="H{}-D{}-mask_p{}-cu_seqlens{}-{}".format(*test))
+        for test in [
+            (4, 60, 0, [0, 15], torch.float16),
+            (4, 64, 0, [0, 256, 500, 1000], torch.float16),
+            (4, 64, 0.5, [0, 256, 500, 1000], torch.float16),
+            (4, 100, 0, [0, 15, 100, 300, 1200, 2000], torch.float16),
+            # bfloat16 tests
+            (4, 60, 0, [0, 15], torch.bfloat16),
+            (4, 64, 0, [0, 256, 500, 1000], torch.bfloat16),
+            (4, 100, 0, [0, 15, 100, 300, 1200, 2000], torch.bfloat16),
+        ]
+    ],
+)
+@pytest.mark.skipif(
+    os.getenv("SKIP_TEST_CHUNK_VARLEN") == "1",
+    reason="Skipping test_chunk_varlen because SKIP_TEST_CHUNK_VARLEN is set",
+)
+def test_chunk_varlen(
+    H: int,
+    D: int,
+    mask_p: float,
+    cu_seqlens: list[int],
+    dtype: torch.dtype,
+):
+    if IS_INTEL_ALCHEMIST and D > 128:
+        pytest.skip(
+            reason="chunk_gated_delta_rule is not supported on alchemist for D>128"
+        )
+    torch.manual_seed(42)
+    os.environ["TRITON_F32_DEFAULT"] = "ieee"
+    # randomly split the sequence into N segments
+    cu_seqlens = torch.LongTensor(cu_seqlens).to(device)
+    T = cu_seqlens[-1]
+    N = len(cu_seqlens) - 1
+
+    # seq-first required for inputs with variable lengths
+    q = torch.randn((1, T, H, D), dtype=dtype)
+    k = F.normalize(torch.randn(1, T, H, D, dtype=torch.float32), p=2, dim=-1).to(dtype)
+    v = torch.randn((1, T, H, D), dtype=dtype)
+    g = F.logsigmoid(torch.rand(1, T, H, dtype=dtype))
+    g = g * (torch.rand_like(g) > mask_p)
+    beta = torch.rand(1, T, H, dtype=dtype).sigmoid()
+    h0 = torch.randn((N, H, D, D), dtype=dtype)
+
+    q, k, v, beta, g, h0 = (
+        x.to(device).requires_grad_(False) for x in (q, k, v, beta, g, h0)
+    )
+    # do = torch.randn_like(v)
+    # dht = torch.rand_like(h0)
+
+    tri, tri_ht = chunk_gated_delta_rule(
+        q=q.clone(),
+        k=k.clone(),
+        v=v.clone(),
+        beta=beta.clone(),
+        g=g.clone(),
+        initial_state=h0.clone(),
+        output_final_state=True,
+        cu_seqlens=cu_seqlens,
+    )
+    # ((tri * do).sum() + (tri_ht * dht).sum()).backward(retain_graph=True)
+    # tri_dq, tri_dk, tri_dv, tri_dbeta, tri_dg, tri_dh0 = q.grad, k.grad, v.grad, beta.grad, g.grad, h0.grad
+    # q.grad = k.grad = v.grad = beta.grad = g.grad = h0.grad = None
+
+    ref = []
+    ref_ht = []
+    for i in range(N):
+        ref_i, ref_ht_i = recurrent_gated_delta_rule_ref(
+            q=q[:, cu_seqlens[i] : cu_seqlens[i + 1]],
+            k=k[:, cu_seqlens[i] : cu_seqlens[i + 1]],
+            v=v[:, cu_seqlens[i] : cu_seqlens[i + 1]],
+            beta=beta[:, cu_seqlens[i] : cu_seqlens[i + 1]],
+            g=g[:, cu_seqlens[i] : cu_seqlens[i + 1]],
+            initial_state=h0[i],
+            output_final_state=True,
+        )
+        ref.append(ref_i)
+        ref_ht.append(ref_ht_i)
+    ref = torch.cat(ref, 1)
+    ref_ht = torch.cat(ref_ht, 0)
+
+    # ((ref * do).sum() + (ref_ht * dht).sum()).backward(retain_graph=True)
+    # ref_dq, ref_dk, ref_dv, ref_dbeta, ref_dg, ref_dh0 = q.grad, k.grad, v.grad, beta.grad, g.grad, h0.grad
+
+    assert_close("o", ref, tri, 0.005)
+    assert_close("ht", ref_ht, tri_ht, 0.005)
+    # assert_close('dq', ref_dq, tri_dq, 0.007)
+    # assert_close('dk', ref_dk, tri_dk, 0.008)
+    # assert_close('dv', ref_dv, tri_dv, 0.007)
+    # assert_close('db', ref_dbeta, tri_dbeta, 0.015)
+    # assert_close('dg', ref_dg, tri_dg, 0.015)
+    # assert_close('dh0', ref_dh0, tri_dh0, 0.007)
+
+
+@pytest.mark.parametrize(
+    (
+        "B",
+        "T",
+        "H",
+        "D",
+        "scale",
+        "gate_logit_normalizer",
+        "mask_p",
+        "use_qk_l2norm_in_kernel",
+        "dtype",
+    ),
+    [
+        pytest.param(
+            *test,
+            id="B{}-T{}-H{}-D{}-scale{}-gate_logit_normalizer{}-mask_p{}-use_qk_l2norm_in_kernel{}-{}".format(
+                *test
+            ),
+        )
+        for test in [
+            (1, 63, 1, 64, 1, 1, 0, False, torch.float16),
+            (2, 500, 3, 60, 1, 1, 0, False, torch.float16),
+            (2, 1000, 3, 64, 0.1, 1, 0.5, False, torch.float16),
+            (3, 1024, 4, 100, 1, 0.1, 0, False, torch.float16),
+            (4, 1024, 4, 128, 0.1, 1, 0, False, torch.float16),
+            (4, 1024, 4, 128, 0.1, 1, 0, True, torch.float16),
+            (2, 1500, 4, 128, 0.1, 10, 0, False, torch.float16),
+            (4, 2048, 8, 64, 0.1, 1, 0, False, torch.float16),
+            # bfloat16 tests
+            (2, 500, 3, 60, 1, 1, 0, False, torch.bfloat16),
+            (2, 1000, 3, 64, 0.1, 1, 0, False, torch.bfloat16),
+            (4, 1024, 4, 128, 0.1, 1, 0, False, torch.bfloat16),
+            (4, 1024, 4, 128, 0.1, 1, 0, True, torch.bfloat16),
+            (4, 2048, 8, 64, 0.1, 1, 0, False, torch.bfloat16),
+        ]
+    ],
+)
+def test_chunk_opt(
+    B: int,
+    T: int,
+    H: int,
+    D: int,
+    scale: float,
+    gate_logit_normalizer: float,
+    mask_p: float,
+    use_qk_l2norm_in_kernel: bool,
+    dtype: torch.dtype,
+):
+    torch.manual_seed(42)
+    if IS_INTEL_ALCHEMIST and D > 128:
+        pytest.skip(
+            reason="chunk_gated_delta_rule_opt is not supported on alchemist for D>128"
+        )
+
+    q = torch.rand(B, T, H, D, dtype=dtype)
+    k = torch.rand(B, T, H, D, dtype=dtype)
+    v = torch.rand(B, T, H, D, dtype=dtype)
+    beta = torch.rand(B, T, H, dtype=dtype).sigmoid()
+    g = F.logsigmoid(torch.rand(B, T, H, dtype=torch.float32))
+    g = g / gate_logit_normalizer
+    g = g * (torch.rand_like(g) > mask_p)
+    h0 = torch.zeros(B, H, D, D, dtype=torch.float32)
+    q, k, v, beta, g, h0 = (
+        x.to(device).requires_grad_(True) for x in (q, k, v, beta, g, h0)
+    )
+
+    tri, tri_ht = chunk_gated_delta_rule_opt(
+        q=(
+            F.normalize(q.clone(), p=2, dim=-1)
+            if not use_qk_l2norm_in_kernel
+            else q.clone()
+        ),
+        k=(
+            F.normalize(k.clone(), p=2, dim=-1)
+            if not use_qk_l2norm_in_kernel
+            else k.clone()
+        ),
+        v=v.clone(),
+        g=g.clone(),
+        beta=beta.clone(),
+        scale=scale,
+        initial_state=h0.clone(),
+        output_final_state=True,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+    )
+
+    ref, ref_ht = recurrent_gated_delta_rule_ref(
+        q=F.normalize(q.clone(), p=2, dim=-1),
+        k=F.normalize(k.clone(), p=2, dim=-1),
+        v=v.clone(),
+        beta=beta.clone(),
+        g=g.clone(),
+        scale=scale,
+        output_final_state=True,
+        initial_state=h0.clone(),
+    )
+
+    assert_close("o", ref, tri, 0.005)
+    assert_close("ht", ref_ht, tri_ht, 0.005)
+
+
+@pytest.mark.parametrize(
+    (
+        "B",
+        "T",
+        "H",
+        "D",
+        "scale",
+        "gate_logit_normalizer",
+        "mask_p",
+        "use_qk_l2norm_in_kernel",
+        "dtype",
+    ),
+    [
+        pytest.param(
+            *test,
+            id="hip-B{}-T{}-H{}-D{}-scale{}-gate_logit_normalizer{}-mask_p{}-use_qk_l2norm_in_kernel{}-{}".format(
+                *test
+            ),
+        )
+        for test in [
+            (4, 1024, 4, 128, 0.1, 1, 0, False, torch.bfloat16),
+            (4, 1024, 4, 128, 0.1, 1, 0, True, torch.bfloat16),
+            (2, 1500, 4, 128, 0.1, 10, 0, False, torch.bfloat16),
+            (1, 63, 1, 128, 1, 1, 0, False, torch.bfloat16),
+            (2, 500, 3, 128, 1, 1, 0, False, torch.bfloat16),
+        ]
+    ],
+)
+@pytest.mark.parametrize(
+    "state_dtype",
+    [
+        pytest.param(torch.float32, id="state_fp32"),
+        pytest.param(torch.bfloat16, id="state_bf16"),
+    ],
+)
+@pytest.mark.parametrize(
+    "snapshot_dtype",
+    [
+        pytest.param(torch.bfloat16, id="snapshot_bf16"),
+        pytest.param(torch.float32, id="snapshot_fp32"),
+    ],
+)
+@pytest.mark.skipif(not IS_AMD, reason="Skipping HIP-only test on non-AMD backend")
+def test_chunk_opt_hip(
+    B: int,
+    T: int,
+    H: int,
+    D: int,
+    scale: float,
+    gate_logit_normalizer: float,
+    mask_p: float,
+    use_qk_l2norm_in_kernel: bool,
+    dtype: torch.dtype,
+    state_dtype: torch.dtype,
+    snapshot_dtype: torch.dtype,
+):
+    torch.manual_seed(42)
+    if D != 128 or dtype != torch.bfloat16:
+        pytest.skip(reason="HIP kernel requires D=128 and bfloat16")
+
+    q = torch.rand(B, T, H, D, dtype=dtype)
+    k = torch.rand(B, T, H, D, dtype=dtype)
+    v = torch.rand(B, T, H, D, dtype=dtype)
+    beta = torch.rand(B, T, H, dtype=dtype).sigmoid()
+    g = F.logsigmoid(torch.rand(B, T, H, dtype=torch.float32))
+    g = g / gate_logit_normalizer
+    g = g * (torch.rand_like(g) > mask_p)
+    h0 = torch.zeros(B, H, D, D, dtype=torch.float32)
+    q, k, v, beta, g, h0 = (
+        x.to(device).requires_grad_(True) for x in (q, k, v, beta, g, h0)
+    )
+    initial_state = h0.clone().to(state_dtype).transpose(-1, -2).contiguous()
+
+    tri, tri_ht = chunk_gated_delta_rule_opt_vk(
+        q=(
+            F.normalize(q.clone(), p=2, dim=-1)
+            if not use_qk_l2norm_in_kernel
+            else q.clone()
+        ),
+        k=(
+            F.normalize(k.clone(), p=2, dim=-1)
+            if not use_qk_l2norm_in_kernel
+            else k.clone()
+        ),
+        v=v.clone(),
+        g=g.clone(),
+        beta=beta.clone(),
+        scale=scale,
+        initial_state=initial_state,
+        output_final_state=True,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        use_chunk_hip=True,
+        state_dtype=state_dtype,
+        snapshot_dtype=snapshot_dtype,
+    )
+
+    ref, ref_ht = recurrent_gated_delta_rule_ref(
+        q=F.normalize(q.clone(), p=2, dim=-1),
+        k=F.normalize(k.clone(), p=2, dim=-1),
+        v=v.clone(),
+        beta=beta.clone(),
+        g=g.clone(),
+        scale=scale,
+        output_final_state=True,
+        initial_state=h0.clone(),
+    )
+
+    tol = 0.005 if state_dtype == torch.float32 else 0.02
+    assert tri_ht.dtype == state_dtype
+    assert_close("o", ref.float(), tri.float(), tol)
+    assert_close("ht", ref_ht.float(), tri_ht.transpose(-1, -2).float(), tol)
+
+
+@pytest.mark.parametrize(
+    ("H", "D", "mask_p", "cu_seqlens", "dtype"),
+    [
+        pytest.param(*test, id="H{}-D{}-mask_p{}-cu_seqlens{}-{}".format(*test))
+        for test in [
+            (4, 60, 0, [0, 15], torch.float16),
+            (4, 64, 0, [0, 256, 500, 1000], torch.float16),
+            (4, 64, 0.5, [0, 256, 500, 1000], torch.float16),
+            (4, 100, 0, [0, 15, 100, 300, 1200, 2000], torch.float16),
+            # bfloat16 tests
+            (4, 60, 0, [0, 15], torch.bfloat16),
+            (4, 64, 0, [0, 256, 500, 1000], torch.bfloat16),
+            (4, 100, 0, [0, 15, 100, 300, 1200, 2000], torch.bfloat16),
+        ]
+    ],
+)
+@pytest.mark.skipif(
+    os.getenv("SKIP_TEST_CHUNK_VARLEN") == "1",
+    reason="Skipping test_chunk_opt_varlen because SKIP_TEST_CHUNK_VARLEN is set",
+)
+def test_chunk_opt_varlen(
+    H: int,
+    D: int,
+    mask_p: float,
+    cu_seqlens: list[int],
+    dtype: torch.dtype,
+):
+    if IS_INTEL_ALCHEMIST and D > 128:
+        pytest.skip(
+            reason="chunk_gated_delta_rule_opt is not supported on alchemist for D>128"
+        )
+    torch.manual_seed(42)
+    os.environ["TRITON_F32_DEFAULT"] = "ieee"
+    cu_seqlens = torch.LongTensor(cu_seqlens).to(device)
+    T = cu_seqlens[-1]
+    N = len(cu_seqlens) - 1
+
+    q = torch.randn((1, T, H, D), dtype=dtype)
+    k = F.normalize(torch.randn(1, T, H, D, dtype=torch.float32), p=2, dim=-1).to(dtype)
+    v = torch.randn((1, T, H, D), dtype=dtype)
+    g = F.logsigmoid(torch.rand(1, T, H, dtype=dtype))
+    g = g * (torch.rand_like(g) > mask_p)
+    beta = torch.rand(1, T, H, dtype=dtype).sigmoid()
+    h0 = torch.randn((N, H, D, D), dtype=dtype)
+
+    q, k, v, beta, g, h0 = (
+        x.to(device).requires_grad_(False) for x in (q, k, v, beta, g, h0)
+    )
+
+    tri, tri_ht = chunk_gated_delta_rule_opt(
+        q=q.clone(),
+        k=k.clone(),
+        v=v.clone(),
+        beta=beta.clone(),
+        g=g.clone(),
+        initial_state=h0.clone(),
+        output_final_state=True,
+        cu_seqlens=cu_seqlens,
+    )
+
+    ref = []
+    ref_ht = []
+    for i in range(N):
+        ref_i, ref_ht_i = recurrent_gated_delta_rule_ref(
+            q=q[:, cu_seqlens[i] : cu_seqlens[i + 1]],
+            k=k[:, cu_seqlens[i] : cu_seqlens[i + 1]],
+            v=v[:, cu_seqlens[i] : cu_seqlens[i + 1]],
+            beta=beta[:, cu_seqlens[i] : cu_seqlens[i + 1]],
+            g=g[:, cu_seqlens[i] : cu_seqlens[i + 1]],
+            initial_state=h0[i],
+            output_final_state=True,
+        )
+        ref.append(ref_i)
+        ref_ht.append(ref_ht_i)
+    ref = torch.cat(ref, 1)
+    ref_ht = torch.cat(ref_ht, 0)
+
+    assert_close("o", ref, tri, 0.005)
+    assert_close("ht", ref_ht, tri_ht, 0.005)
+
+
+@pytest.mark.parametrize(
+    ("H", "D", "mask_p", "cu_seqlens", "dtype"),
+    [
+        pytest.param(*test, id="hip-H{}-D{}-mask_p{}-cu_seqlens{}-{}".format(*test))
+        for test in [
+            (4, 128, 0, [0, 15], torch.bfloat16),
+            (4, 128, 0, [0, 256, 500, 1000], torch.bfloat16),
+            (4, 128, 0, [0, 15, 100, 300, 1200, 2000], torch.bfloat16),
+        ]
+    ],
+)
+@pytest.mark.skipif(
+    os.getenv("SKIP_TEST_CHUNK_VARLEN") == "1",
+    reason="Skipping test_chunk_opt_varlen_hip because SKIP_TEST_CHUNK_VARLEN is set",
+)
+@pytest.mark.parametrize(
+    "state_dtype",
+    [
+        pytest.param(torch.float32, id="state_fp32"),
+        pytest.param(torch.bfloat16, id="state_bf16"),
+    ],
+)
+@pytest.mark.skipif(not IS_AMD, reason="Skipping HIP-only test on non-AMD backend")
+def test_chunk_opt_varlen_hip(
+    H: int,
+    D: int,
+    mask_p: float,
+    cu_seqlens: list[int],
+    dtype: torch.dtype,
+    state_dtype: torch.dtype,
+):
+    if D != 128 or dtype != torch.bfloat16:
+        pytest.skip(reason="HIP kernel requires D=128 and bfloat16")
+    torch.manual_seed(42)
+    os.environ["TRITON_F32_DEFAULT"] = "ieee"
+    cu_seqlens = torch.LongTensor(cu_seqlens).to(device)
+    T = cu_seqlens[-1]
+    N = len(cu_seqlens) - 1
+
+    q = torch.randn((1, T, H, D), dtype=dtype)
+    k = F.normalize(torch.randn(1, T, H, D, dtype=torch.float32), p=2, dim=-1).to(dtype)
+    v = torch.randn((1, T, H, D), dtype=dtype)
+    g = F.logsigmoid(torch.rand(1, T, H, dtype=dtype))
+    g = g * (torch.rand_like(g) > mask_p)
+    beta = torch.rand(1, T, H, dtype=dtype).sigmoid()
+    h0 = torch.randn((N, H, D, D), dtype=torch.float32)
+
+    q, k, v, beta, g, h0 = (
+        x.to(device).requires_grad_(False) for x in (q, k, v, beta, g, h0)
+    )
+    initial_state = h0.clone().to(state_dtype).transpose(-1, -2).contiguous()
+
+    tri, tri_ht = chunk_gated_delta_rule_opt_vk(
+        q=q.clone(),
+        k=k.clone(),
+        v=v.clone(),
+        beta=beta.clone(),
+        g=g.clone(),
+        initial_state=initial_state,
+        output_final_state=True,
+        cu_seqlens=cu_seqlens,
+        use_chunk_hip=True,
+        state_dtype=state_dtype,
+    )
+
+    ref = []
+    ref_ht = []
+    for i in range(N):
+        ref_i, ref_ht_i = recurrent_gated_delta_rule_ref(
+            q=q[:, cu_seqlens[i] : cu_seqlens[i + 1]],
+            k=k[:, cu_seqlens[i] : cu_seqlens[i + 1]],
+            v=v[:, cu_seqlens[i] : cu_seqlens[i + 1]],
+            beta=beta[:, cu_seqlens[i] : cu_seqlens[i + 1]],
+            g=g[:, cu_seqlens[i] : cu_seqlens[i + 1]],
+            initial_state=h0[i],
+            output_final_state=True,
+        )
+        ref.append(ref_i)
+        ref_ht.append(ref_ht_i)
+    ref = torch.cat(ref, 1)
+    ref_ht = torch.cat(ref_ht, 0)
+
+    tol = 0.005 if state_dtype == torch.float32 else 0.02
+    assert tri_ht.dtype == state_dtype
+    assert_close("o", ref.float(), tri.float(), tol)
+    assert_close("ht", ref_ht.float(), tri_ht.transpose(-1, -2).float(), tol)
+
+
+@pytest.mark.parametrize(
+    "backend",
+    [
+        pytest.param("triton", id="triton"),
+        pytest.param(
+            "hip",
+            id="hip",
+            marks=[
+                pytest.mark.skipif(
+                    not IS_AMD, reason="HIP backend requires an AMD device"
+                )
+            ],
+        ),
+        pytest.param(
+            "flydsl",
+            id="flydsl",
+            marks=[
+                pytest.mark.skipif(
+                    not IS_AMD, reason="FlyDSL backend requires an AMD device"
+                ),
+                pytest.mark.skipif(
+                    _is_gfx12_runtime(),
+                    reason="FlyDSL opt K5 kernel does not support gfx12!",
+                ),
+            ],
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    ("H", "D", "mask_p", "cu_seqlens"),
+    [
+        pytest.param(*test, id="indice-H{}-D{}-mask_p{}-cu_seqlens{}".format(*test))
+        for test in [
+            (4, 128, 0, [0, 15]),
+            (4, 128, 0, [0, 256, 500, 1000]),
+            (4, 128, 0.5, [0, 256, 500, 1000]),
+            (4, 128, 0, [0, 15, 100, 300, 1200, 2000]),
+        ]
+    ],
+)
+@pytest.mark.parametrize(
+    "state_dtype",
+    [
+        pytest.param(torch.float32, id="state_fp32"),
+        pytest.param(torch.bfloat16, id="state_bf16"),
+    ],
+)
+@pytest.mark.parametrize(
+    "snapshot_dtype",
+    [
+        pytest.param(torch.bfloat16, id="snapshot_bf16"),
+        pytest.param(torch.float32, id="snapshot_fp32"),
+    ],
+)
+@pytest.mark.skipif(
+    os.getenv("SKIP_TEST_CHUNK_VARLEN") == "1",
+    reason="Skipping test_chunk_opt_vk_indice because SKIP_TEST_CHUNK_VARLEN is set",
+)
+def test_chunk_opt_vk_indice(
+    backend: str,
+    H: int,
+    D: int,
+    mask_p: float,
+    cu_seqlens: list[int],
+    state_dtype: torch.dtype,
+    snapshot_dtype: torch.dtype,
+):
+    """Functional test for the indexed state-pool fwd_h on both backends.
+
+    The Triton (``chunk_gated_delta_rule_fwd_h_opt_vk``) and HIP
+    (``chunk_gated_delta_rule_fwd_h_hip_fn``) entries share the same dense/indexed
+    contract: the only differences from the dense path are the per-sequence slot
+    gather (``initial_state_indices``) on read and the in-place write-back into
+    that slot. So when the pool holds the same initial states at (scattered)
+    slots, dense vs indexed must be bit-identical, and non-indexed pool slots must
+    stay untouched. The check is a same-backend self-comparison, so it does not
+    depend on the gate layout being interpreted a particular way.
+    """
+    if backend == "hip":
+        fwd_h = chunk_gated_delta_rule_fwd_h_hip_fn
+        # HIP kernel is specialized for D=128 / bf16 and reads head-major gates.
+        if D != 128:
+            pytest.skip(reason="HIP kernel requires D=128 and bfloat16")
+        extra_kwargs = {"g_head_major": True}
+    elif backend == "flydsl":
+        fwd_h = chunk_gated_delta_rule_fwd_h_flydsl_opt
+        # FlyDSL opt is likewise specialized for K=V=128 / bf16. It now
+        # mirrors the HIP g-layout contract (default token-major), and this test
+        # feeds a 3-D head-major [B, H, T] gate, so pass g_head_major=True like
+        # the HIP backend above.
+        if D != 128:
+            pytest.skip(reason="FlyDSL opt kernel requires D=128 and bfloat16")
+        extra_kwargs = {"g_head_major": True}
+    else:
+        fwd_h = chunk_gated_delta_rule_fwd_h_opt_vk
+        extra_kwargs = {}
+
+    torch.manual_seed(42)
+    os.environ["TRITON_F32_DEFAULT"] = "ieee"
+    cu_seqlens = torch.LongTensor(cu_seqlens).to(device)
+    T = int(cu_seqlens[-1])
+    N = len(cu_seqlens) - 1
+    B = 1
+
+    # fwd_h-stage inputs: k [B,T,H,K] token-major, w/u [B,H,T,K|V] head-major,
+    # g head-major [B,H,T]. Hg == H (no GQA).
+    k = torch.randn(B, T, H, D, dtype=torch.bfloat16, device=device)
+    w = torch.randn(B, H, T, D, dtype=torch.bfloat16, device=device)
+    u = torch.randn(B, H, T, D, dtype=torch.bfloat16, device=device)
+    g = F.logsigmoid(torch.rand(B, H, T, dtype=torch.float32, device=device))
+    g = g * (torch.rand_like(g) > mask_p)
+
+    # Dense per-sequence initial states [N, H, V, K] (random, so the gather is
+    # actually exercised -- a wrong slot would read different values).
+    h0 = torch.randn(N, H, D, D, dtype=state_dtype, device=device)
+
+    # --- dense reference: slot == i_n ---
+    h_ref, vnew_ref, ht_ref = fwd_h(
+        k=k.clone(),
+        w=w.clone(),
+        u=u.clone(),
+        g=g.clone(),
+        initial_state=h0.clone(),
+        output_final_state=True,
+        cu_seqlens=cu_seqlens,
+        state_dtype=state_dtype,
+        snapshot_dtype=snapshot_dtype,
+        **extra_kwargs,
+    )
+    assert h_ref.dtype == snapshot_dtype
+    assert ht_ref.dtype == state_dtype
+
+    # --- indexed pool: scatter the N states into a larger pool at unique,
+    # non-identity slots to prove the gather honours initial_state_indices ---
+    pool_size = N + 7
+    perm = torch.randperm(pool_size, device=device)
+    indices = perm[:N].to(torch.int32)
+    pool = torch.randn(pool_size, H, D, D, dtype=state_dtype, device=device)
+    pool_before = pool.clone()
+    pool[indices.long()] = h0.clone()
+
+    # Indexed pool path: passing initial_state_indices switches to slot gather +
+    # in-place write-back (final_state aliases pool).
+    h_idx, vnew_idx, ht_idx = fwd_h(
+        k=k.clone(),
+        w=w.clone(),
+        u=u.clone(),
+        g=g.clone(),
+        initial_state=pool,
+        initial_state_indices=indices,
+        output_final_state=True,
+        cu_seqlens=cu_seqlens,
+        state_dtype=state_dtype,
+        snapshot_dtype=snapshot_dtype,
+        **extra_kwargs,
+    )
+    assert h_idx.dtype == snapshot_dtype
+    assert ht_idx is pool  # in-place: final state aliases the pool buffer
+
+    # 1. snapshots + recomputed values are bit-identical to the dense path
+    assert torch.equal(h_idx, h_ref), "h snapshots differ between dense and indexed"
+    assert torch.equal(vnew_idx, vnew_ref), "v_new differs between dense and indexed"
+
+    # 2. in-place write-back: the final state landed in the indexed pool slots
+    # and equals the dense final state
+    assert torch.equal(
+        pool[indices.long()], ht_ref
+    ), "in-place final state at indexed slots differs from dense final_state"
+
+    # 3. non-indexed pool slots must be left exactly as they were
+    untouched = torch.ones(pool_size, dtype=torch.bool, device=device)
+    untouched[indices.long()] = False
+    assert torch.equal(
+        pool[untouched], pool_before[untouched]
+    ), "non-indexed pool slots were modified by the kernel"
+
+
+@pytest.mark.parametrize(
+    "backend",
+    [
+        pytest.param("triton", id="triton"),
+        pytest.param(
+            "hip",
+            id="hip",
+            marks=[
+                pytest.mark.skipif(
+                    not IS_AMD, reason="HIP backend requires an AMD device"
+                ),
+                pytest.mark.skipif(
+                    _is_gfx12_runtime(),
+                    reason="chunk_gated_delta_rule_fwd_h_hip_fn does not support gfx12!",
+                ),
+            ],
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    "input_dtype",
+    [
+        pytest.param(torch.float16, id="input_fp16"),
+        pytest.param(torch.bfloat16, id="input_bf16"),
+    ],
+)
+def test_chunk_snapshot_dtype_defaults_to_k_dtype(
+    backend: str, input_dtype: torch.dtype
+):
+    """Persistent-state dtype must not change the default snapshot policy."""
+    if backend == "hip" and input_dtype != torch.bfloat16:
+        pytest.skip("HIP K5 supports only BF16 inputs")
+
+    torch.manual_seed(42)
+    B, T, H, D = 1, 128, 2, 128
+    k = torch.randn(B, T, H, D, dtype=input_dtype, device=device)
+    w = torch.randn(B, H, T, D, dtype=input_dtype, device=device)
+    u = torch.randn(B, H, T, D, dtype=input_dtype, device=device)
+    g = F.logsigmoid(torch.rand(B, H, T, dtype=torch.float32, device=device))
+    initial_state = torch.randn(B, H, D, D, dtype=torch.float32, device=device)
+
+    if backend == "hip":
+        fwd_h = chunk_gated_delta_rule_fwd_h_hip_fn
+        extra_kwargs = {"g_head_major": True}
+    else:
+        fwd_h = chunk_gated_delta_rule_fwd_h_opt_vk
+        extra_kwargs = {}
+
+    h, _, final_state = fwd_h(
+        k=k,
+        w=w,
+        u=u,
+        g=g,
+        initial_state=initial_state,
+        output_final_state=True,
+        state_dtype=torch.float32,
+        **extra_kwargs,
+    )
+
+    assert h.dtype == k.dtype == input_dtype
+    assert final_state.dtype == torch.float32
+
+
+@pytest.mark.parametrize(
+    "input_dtype",
+    [
+        pytest.param(torch.float16, id="input_fp16"),
+        pytest.param(torch.bfloat16, id="input_bf16"),
+    ],
+)
+@pytest.mark.parametrize(
+    "state_dtype",
+    [
+        pytest.param(torch.float32, id="state_fp32"),
+        pytest.param(torch.bfloat16, id="state_bf16"),
+    ],
+)
+@pytest.mark.parametrize(
+    "snapshot_dtype",
+    [
+        pytest.param(torch.bfloat16, id="snapshot_bf16"),
+        pytest.param(torch.float32, id="snapshot_fp32"),
+    ],
+)
+def test_chunk_opt_vk_dtype_combinations(
+    input_dtype: torch.dtype,
+    state_dtype: torch.dtype,
+    snapshot_dtype: torch.dtype,
+):
+    """Exercise Triton K5/K6 across independent input, state and snapshot dtypes."""
+    torch.manual_seed(42)
+    B, T, H, D = 1, 128, 2, 128
+    q = torch.randn(B, T, H, D, dtype=input_dtype, device=device)
+    k = F.normalize(
+        torch.randn(B, T, H, D, dtype=torch.float32, device=device),
+        p=2,
+        dim=-1,
+    ).to(input_dtype)
+    v = torch.randn(B, T, H, D, dtype=input_dtype, device=device)
+    beta = torch.rand(B, T, H, dtype=input_dtype, device=device).sigmoid()
+    g = F.logsigmoid(torch.rand(B, T, H, dtype=torch.float32, device=device))
+    # Quantize the reference initial state to the selected persistent dtype so
+    # comparisons isolate kernel behavior rather than input quantization.
+    initial_state_ref = (
+        torch.randn(B, H, D, D, dtype=torch.float32, device=device)
+        .to(state_dtype)
+        .float()
+    )
+    initial_state = initial_state_ref.transpose(-1, -2).to(state_dtype).contiguous()
+
+    out, final_state = chunk_gated_delta_rule_opt_vk(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        initial_state=initial_state,
+        output_final_state=True,
+        state_dtype=state_dtype,
+        snapshot_dtype=snapshot_dtype,
+    )
+    ref, ref_final_state = recurrent_gated_delta_rule_ref(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        initial_state=initial_state_ref,
+        output_final_state=True,
+    )
+
+    tol = 0.005 if state_dtype == torch.float32 else 0.02
+    assert out.dtype == input_dtype
+    assert final_state.dtype == state_dtype
+    assert_close("o", ref.float(), out.float(), tol)
+    assert_close(
+        "ht",
+        ref_final_state.float(),
+        final_state.transpose(-1, -2).float(),
+        tol,
+    )
+
+
+def test_chunk_opt_vk_preserves_legacy_positional_optional_arguments():
+    """The pre-snapshot positional API must keep binding use_exp2 correctly."""
+    torch.manual_seed(42)
+    B, T, H, D = 1, 64, 1, 64
+    dtype = torch.bfloat16
+    q = F.normalize(
+        torch.randn(B, T, H, D, dtype=torch.float32, device=device),
+        p=2,
+        dim=-1,
+    ).to(dtype)
+    k = F.normalize(
+        torch.randn(B, T, H, D, dtype=torch.float32, device=device),
+        p=2,
+        dim=-1,
+    ).to(dtype)
+    v = torch.randn(B, T, H, D, dtype=dtype, device=device)
+    beta = torch.rand(B, T, H, dtype=dtype, device=device).sigmoid()
+    g = F.logsigmoid(torch.rand(B, T, H, dtype=torch.float32, device=device))
+    initial_state_ref = torch.randn(B, H, D, D, dtype=torch.float32, device=device)
+    initial_state = initial_state_ref.transpose(-1, -2).contiguous()
+
+    # Keep this call positional through num_decode_tokens. On the base API,
+    # False is use_exp2; inserting snapshot_dtype before it binds False to a
+    # dtype and raises ValueError.
+    out, final_state = chunk_gated_delta_rule_opt_vk(
+        q,
+        k,
+        v,
+        None,
+        g,
+        beta,
+        None,
+        initial_state,
+        True,
+        False,
+        None,
+        False,
+        False,
+        torch.float32,
+        False,
+        0,
+        0,
+    )
+    ref, ref_final_state = recurrent_gated_delta_rule_ref(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        initial_state=initial_state_ref,
+        output_final_state=True,
+    )
+
+    assert final_state.dtype == torch.float32
+    assert_close("o", ref.float(), out.float(), 0.005)
+    assert_close(
+        "ht",
+        ref_final_state.float(),
+        final_state.transpose(-1, -2).float(),
+        0.005,
+    )
+
+
+@pytest.mark.parametrize(
+    (
+        "B",
+        "T",
+        "H",
+        "D",
+        "scale",
+        "gate_logit_normalizer",
+        "mask_p",
+        "use_qk_l2norm_in_kernel",
+        "dtype",
+    ),
+    [
+        pytest.param(
+            *test,
+            id="B{}-T{}-H{}-D{}-scale{}-gate_logit_normalizer{}-mask_p{}-use_qk_l2norm_in_kernel{}-{}".format(
+                *test
+            ),
+        )
+        for test in [
+            (1, 63, 1, 64, 1, 1, 0, False, torch.float16),
+            (2, 500, 3, 60, 1, 1, 0, False, torch.float16),
+            (2, 1000, 3, 64, 0.1, 1, 0.5, False, torch.float16),
+            (3, 1024, 4, 100, 1, 0.1, 0, False, torch.float16),
+            (4, 1024, 4, 128, 0.1, 1, 0, False, torch.float16),
+            (4, 1024, 4, 128, 0.1, 1, 0, True, torch.float16),
+            (2, 1500, 4, 128, 0.1, 10, 0, False, torch.float16),
+            (4, 2048, 8, 64, 0.1, 1, 0, False, torch.float16),
+            (2, 500, 3, 60, 1, 1, 0, False, torch.bfloat16),
+            (2, 1000, 3, 64, 0.1, 1, 0, False, torch.bfloat16),
+            (4, 1024, 4, 128, 0.1, 1, 0, False, torch.bfloat16),
+            (4, 1024, 4, 128, 0.1, 1, 0, True, torch.bfloat16),
+            (4, 2048, 8, 64, 0.1, 1, 0, False, torch.bfloat16),
+        ]
+    ],
+)
+def test_chunk_opt_vk(
+    B: int,
+    T: int,
+    H: int,
+    D: int,
+    scale: float,
+    gate_logit_normalizer: float,
+    mask_p: float,
+    use_qk_l2norm_in_kernel: bool,
+    dtype: torch.dtype,
+):
+    torch.manual_seed(42)
+    if IS_INTEL_ALCHEMIST and D > 128:
+        pytest.skip(
+            reason="chunk_gated_delta_rule_opt_vk is not supported on alchemist for D>128"
+        )
+
+    q = torch.rand(B, T, H, D, dtype=dtype)
+    k = torch.rand(B, T, H, D, dtype=dtype)
+    v = torch.rand(B, T, H, D, dtype=dtype)
+    beta = torch.rand(B, T, H, dtype=dtype).sigmoid()
+    g = F.logsigmoid(torch.rand(B, T, H, dtype=torch.float32))
+    g = g / gate_logit_normalizer
+    g = g * (torch.rand_like(g) > mask_p)
+    h0 = torch.zeros(B, H, D, D, dtype=torch.float32)
+    q, k, v, beta, g, h0 = (
+        x.to(device).requires_grad_(True) for x in (q, k, v, beta, g, h0)
+    )
+
+    # opt_vk expects initial_state in [N, H, V, K] layout
+    tri, tri_ht = chunk_gated_delta_rule_opt_vk(
+        q=(
+            F.normalize(q.clone(), p=2, dim=-1)
+            if not use_qk_l2norm_in_kernel
+            else q.clone()
+        ),
+        k=(
+            F.normalize(k.clone(), p=2, dim=-1)
+            if not use_qk_l2norm_in_kernel
+            else k.clone()
+        ),
+        v=v.clone(),
+        g=g.clone(),
+        beta=beta.clone(),
+        scale=scale,
+        initial_state=h0.clone().transpose(-1, -2).contiguous(),
+        output_final_state=True,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+    )
+
+    ref, ref_ht = recurrent_gated_delta_rule_ref(
+        q=F.normalize(q.clone(), p=2, dim=-1),
+        k=F.normalize(k.clone(), p=2, dim=-1),
+        v=v.clone(),
+        beta=beta.clone(),
+        g=g.clone(),
+        scale=scale,
+        output_final_state=True,
+        initial_state=h0.clone(),
+    )
+
+    assert_close("o", ref, tri, 0.005)
+    # ref_ht is [B, H, K, V], tri_ht is [N, H, V, K]
+    assert_close("ht", ref_ht, tri_ht.transpose(-1, -2), 0.005)
+
+
+@pytest.mark.parametrize(
+    ("H", "D", "mask_p", "cu_seqlens", "dtype"),
+    [
+        pytest.param(*test, id="H{}-D{}-mask_p{}-cu_seqlens{}-{}".format(*test))
+        for test in [
+            (4, 60, 0, [0, 15], torch.float16),
+            (4, 64, 0, [0, 256, 500, 1000], torch.float16),
+            (4, 64, 0.5, [0, 256, 500, 1000], torch.float16),
+            (4, 100, 0, [0, 15, 100, 300, 1200, 2000], torch.float16),
+            (4, 60, 0, [0, 15], torch.bfloat16),
+            (4, 64, 0, [0, 256, 500, 1000], torch.bfloat16),
+            (4, 100, 0, [0, 15, 100, 300, 1200, 2000], torch.bfloat16),
+        ]
+    ],
+)
+@pytest.mark.skipif(
+    os.getenv("SKIP_TEST_CHUNK_VARLEN") == "1",
+    reason="Skipping test_chunk_opt_vk_varlen because SKIP_TEST_CHUNK_VARLEN is set",
+)
+def test_chunk_opt_vk_varlen(
+    H: int,
+    D: int,
+    mask_p: float,
+    cu_seqlens: list[int],
+    dtype: torch.dtype,
+):
+    if IS_INTEL_ALCHEMIST and D > 128:
+        pytest.skip(
+            reason="chunk_gated_delta_rule_opt_vk is not supported on alchemist for D>128"
+        )
+    torch.manual_seed(42)
+    os.environ["TRITON_F32_DEFAULT"] = "ieee"
+    cu_seqlens = torch.LongTensor(cu_seqlens).to(device)
+    T = cu_seqlens[-1]
+    N = len(cu_seqlens) - 1
+
+    q = torch.randn((1, T, H, D), dtype=dtype)
+    k = F.normalize(torch.randn(1, T, H, D, dtype=torch.float32), p=2, dim=-1).to(dtype)
+    v = torch.randn((1, T, H, D), dtype=dtype)
+    g = F.logsigmoid(torch.rand(1, T, H, dtype=dtype))
+    g = g * (torch.rand_like(g) > mask_p)
+    beta = torch.rand(1, T, H, dtype=dtype).sigmoid()
+    h0 = torch.randn((N, H, D, D), dtype=dtype)
+
+    q, k, v, beta, g, h0 = (
+        x.to(device).requires_grad_(False) for x in (q, k, v, beta, g, h0)
+    )
+
+    # opt_vk expects initial_state in [N, H, V, K] layout
+    tri, tri_ht = chunk_gated_delta_rule_opt_vk(
+        q=q.clone(),
+        k=k.clone(),
+        v=v.clone(),
+        beta=beta.clone(),
+        g=g.clone(),
+        initial_state=h0.clone().transpose(-1, -2).contiguous(),
+        output_final_state=True,
+        cu_seqlens=cu_seqlens,
+    )
+
+    ref = []
+    ref_ht = []
+    for i in range(N):
+        ref_i, ref_ht_i = recurrent_gated_delta_rule_ref(
+            q=q[:, cu_seqlens[i] : cu_seqlens[i + 1]],
+            k=k[:, cu_seqlens[i] : cu_seqlens[i + 1]],
+            v=v[:, cu_seqlens[i] : cu_seqlens[i + 1]],
+            beta=beta[:, cu_seqlens[i] : cu_seqlens[i + 1]],
+            g=g[:, cu_seqlens[i] : cu_seqlens[i + 1]],
+            initial_state=h0[i],
+            output_final_state=True,
+        )
+        ref.append(ref_i)
+        ref_ht.append(ref_ht_i)
+    ref = torch.cat(ref, 1)
+    ref_ht = torch.cat(ref_ht, 0)
+
+    assert_close("o", ref, tri, 0.005)
+    # ref_ht is [N, H, K, V], tri_ht is [N, H, V, K]
+    assert_close("ht", ref_ht, tri_ht.transpose(-1, -2), 0.005)
+
+
+def _free_gib() -> float:
+    if not torch.cuda.is_available():
+        return 0.0
+    return torch.cuda.mem_get_info()[0] / 2**30
+
+
+@pytest.mark.skipif(_free_gib() < 24, reason="needs ~12 GiB of free device memory")
+@pytest.mark.parametrize(
+    "seqlens",
+    [
+        pytest.param([134400], id="single-2100-chunks"),
+        pytest.param([45000, 45000, 45000], id="varlen-2112-chunks"),
+    ],
+)
+def test_chunk_fwd_h_beyond_int32_chunk_offsets(seqlens):
+    """Chunk offsets past 2**31 elements must not wrap.
+
+    With H*K*V == 2**20 the per-chunk stride into ``h`` overflows int32 at chunk
+    2048; before the offsets were widened this wrote behind the buffer and
+    faulted the GPU. Zero k/w/u and no gate leave the state untouched, so every
+    chunk snapshot must come back exactly equal to the initial state.
+    """
+    from aiter.ops.triton._triton_kernels.gated_delta_rule.prefill import (
+        chunk_gated_delta_rule_fwd_h,
+    )
+
+    H, K, V, BT = 64, 128, 128, 64
+    T = sum(seqlens)
+    zero = torch.zeros(1, T, H, K, device=device, dtype=torch.bfloat16)
+    u = torch.zeros(1, T, H, V, device=device, dtype=torch.bfloat16)
+    h0 = torch.randn(len(seqlens), H, K, V, device=device, dtype=torch.float32)
+    cu_seqlens = None
+    if len(seqlens) > 1:
+        cu_seqlens = torch.tensor(
+            [0] + torch.tensor(seqlens).cumsum(0).tolist(),
+            device=device,
+            dtype=torch.int32,
+        )
+
+    h, _, ht = chunk_gated_delta_rule_fwd_h(
+        k=zero,
+        w=zero,
+        u=u,
+        g=None,
+        gk=None,
+        initial_state=h0,
+        output_final_state=True,
+        chunk_size=BT,
+        save_new_value=False,
+        cu_seqlens=cu_seqlens,
+    )
+
+    assert torch.equal(ht, h0)
+    base = 0
+    for s, seqlen in enumerate(seqlens):
+        want = h0[s].to(h.dtype)
+        for i in range(base, base + -(-seqlen // BT)):
+            assert torch.equal(h[0, i], want), f"chunk {i} of sequence {s}"
+        base += -(-seqlen // BT)
+
+
+@pytest.mark.parametrize(
+    "state_dtype",
+    [
+        pytest.param(torch.float32, id="state_fp32"),
+        pytest.param(torch.bfloat16, id="state_bf16"),
+    ],
+)
+@pytest.mark.skipif(not IS_AMD, reason="HIP backend requires an AMD device")
+def test_chunk_opt_vk_full_pipeline_indexed_state_pool(state_dtype: torch.dtype):
+    """Full K1-K6 HIP path supports an indexed SGLang-style state pool."""
+    torch.manual_seed(42)
+    os.environ["TRITON_F32_DEFAULT"] = "ieee"
+    H, D = 4, 128
+    cu_seqlens = torch.tensor([0, 63, 192, 449], device=device, dtype=torch.long)
+    T = int(cu_seqlens[-1])
+    N = len(cu_seqlens) - 1
+
+    q = F.normalize(
+        torch.randn(1, T, H, D, dtype=torch.float32, device=device),
+        p=2,
+        dim=-1,
+    ).to(torch.bfloat16)
+    k = F.normalize(
+        torch.randn(1, T, H, D, dtype=torch.float32, device=device),
+        p=2,
+        dim=-1,
+    ).to(torch.bfloat16)
+    v = (torch.randn(1, T, H, D, dtype=torch.float32, device=device) * 0.1).to(
+        torch.bfloat16
+    )
+    beta = (
+        torch.rand(1, T, H, dtype=torch.float32, device=device)
+        .sigmoid()
+        .to(torch.bfloat16)
+    )
+    g = F.logsigmoid(torch.rand(1, T, H, dtype=torch.float32, device=device))
+    h0 = (torch.randn(N, H, D, D, dtype=torch.float32, device=device) * 0.02).to(
+        state_dtype
+    )
+
+    output_ref, state_ref = chunk_gated_delta_rule_opt_vk(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        initial_state=h0.clone(),
+        output_final_state=True,
+        cu_seqlens=cu_seqlens,
+        use_chunk_hip=True,
+        state_dtype=state_dtype,
+        use_exp2=False,
+    )
+
+    pool_size = N + 7
+    indices = torch.tensor([5, 1, 8], device=device, dtype=torch.int32)
+    pool = torch.randn(pool_size, H, D, D, dtype=state_dtype, device=device)
+    pool_before = pool.clone()
+    pool[indices.long()] = h0
+
+    output_indexed, returned_pool = chunk_gated_delta_rule_opt_vk(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        initial_state=pool,
+        initial_state_indices=indices,
+        output_final_state=True,
+        cu_seqlens=cu_seqlens,
+        use_chunk_hip=True,
+        state_dtype=state_dtype,
+        use_exp2=False,
+    )
+
+    assert returned_pool is pool
+    tol = 0.005 if state_dtype == torch.float32 else 0.02
+    assert_close("indexed full-pipeline output", output_ref, output_indexed, tol)
+    assert_close("indexed full-pipeline state", state_ref, pool[indices.long()], tol)
+
+    untouched = torch.ones(pool_size, dtype=torch.bool, device=device)
+    untouched[indices.long()] = False
+    assert torch.equal(pool[untouched], pool_before[untouched])
+
+
+@pytest.mark.skipif(not IS_AMD, reason="HIP backend requires an AMD device")
+def test_chunk_opt_vk_k5_hip_matches_triton_tail_gfx12():
+    if not _is_gfx12_runtime():
+        pytest.skip(reason="Tail row-group remap is specific to gfx1200/gfx1201")
+
+    torch.manual_seed(42)
+    B, T, H, D = 1, 63, 1, 128
+    k = F.normalize(
+        torch.randn(B, T, H, D, dtype=torch.float32, device=device),
+        p=2,
+        dim=-1,
+    ).to(torch.bfloat16)
+    v = (torch.randn(B, T, H, D, dtype=torch.float32, device=device) * 0.1).to(
+        torch.bfloat16
+    )
+    beta = torch.rand(B, T, H, dtype=torch.bfloat16, device=device).sigmoid()
+    raw_g = F.logsigmoid(torch.rand(B, T, H, dtype=torch.float32, device=device))
+
+    g, A_raw = fused_chunk_local_cumsum_scaled_dot_kkt_fwd(
+        k=k,
+        beta=beta,
+        g=raw_g,
+        use_exp2=False,
+    )
+    w, u = fused_solve_tril_recompute_w_u(
+        A_raw=A_raw,
+        k=k,
+        v=v,
+        beta=beta,
+        g_cumsum=g,
+        use_exp2=False,
+    )
+    initial_state = torch.randn(B, H, D, D, dtype=torch.float32, device=device) * 0.02
+
+    h_triton, v_new_triton, final_state_triton = chunk_gated_delta_rule_fwd_h_opt_vk(
+        k=k,
+        w=w,
+        u=u,
+        g=g,
+        initial_state=initial_state.clone(),
+        output_final_state=True,
+        state_dtype=torch.float32,
+        use_exp2=False,
+    )
+    h_hip, v_new_hip, final_state_hip = chunk_gated_delta_rule_fwd_h_hip_fn(
+        k=k,
+        w=w,
+        u=u,
+        g=g,
+        initial_state=initial_state.clone(),
+        output_final_state=True,
+        state_dtype=torch.float32,
+        use_exp2=False,
+        g_head_major=True,
+    )
+
+    # T=63 means full_chunks=0, so every token exercises the tail-only path.
+    # v_new is checked directly because output/final-state aggregation can hide
+    # a local row-group cross-wire under the existing end-to-end tolerance.
+    assert_close("tail h HIP vs Triton", h_triton, h_hip, 0.005)
+    torch.testing.assert_close(
+        v_new_hip,
+        v_new_triton,
+        rtol=0,
+        atol=1e-3,
+    )
+    assert_close("tail state HIP vs Triton", final_state_triton, final_state_hip, 0.005)
+
+
+def test_chunk_opt_vk_rejects_indexed_flydsl_state_pool():
+    with pytest.raises(ValueError, match="not supported by the FlyDSL K5 path"):
+        chunk_gated_delta_rule_opt_vk(
+            q=torch.empty(1, 1, 1, 128),
+            k=torch.empty(1, 1, 1, 128),
+            v=torch.empty(1, 1, 1, 128),
+            g=torch.empty(1, 1, 1),
+            beta=torch.empty(1, 1, 1),
+            initial_state=torch.empty(1, 1, 128, 128),
+            initial_state_indices=torch.zeros(1, dtype=torch.int32),
+            use_chunk_flydsl=True,
+        )
+
+
+def test_chunk_opt_vk_rejects_dense_index_count_mismatch():
+    with pytest.raises(ValueError, match="state indices.*2 rather than 1"):
+        chunk_gated_delta_rule_opt_vk(
+            q=torch.empty(2, 1, 1, 128),
+            k=torch.empty(2, 1, 1, 128),
+            v=torch.empty(2, 1, 1, 128),
+            g=torch.empty(2, 1, 1),
+            beta=torch.empty(2, 1, 1),
+            initial_state=torch.empty(4, 1, 128, 128),
+            initial_state_indices=torch.zeros(1, dtype=torch.int32),
+        )
+
+
+def test_chunk_opt_vk_hip_downgrade_preserves_indexed_state_args(monkeypatch):
+    chunk_module = importlib.import_module(
+        "aiter.ops.triton._triton_kernels.gated_delta_rule.prefill.chunk"
+    )
+    initial_state = torch.empty(4, 1, 1, 1)
+    initial_state_indices = torch.tensor([3], dtype=torch.int32)
+    captured = {}
+
+    monkeypatch.setattr(
+        chunk_module,
+        "fused_chunk_local_cumsum_scaled_dot_kkt_fwd",
+        lambda **kwargs: (torch.empty(1, 1, 1), torch.empty(1, 1, 1, 1)),
+    )
+    monkeypatch.setattr(
+        chunk_module,
+        "fused_solve_tril_recompute_w_u",
+        lambda **kwargs: (torch.empty(1, 1, 1, 1), torch.empty(1, 1, 1, 1)),
+    )
+
+    def fake_triton_k5(**kwargs):
+        captured.update(kwargs)
+        return (
+            torch.empty(1, 1, 1, 1, 1),
+            torch.empty(1, 1, 1, 1),
+            initial_state,
+        )
+
+    monkeypatch.setattr(
+        chunk_module, "chunk_gated_delta_rule_fwd_h_opt_vk", fake_triton_k5
+    )
+    monkeypatch.setattr(
+        chunk_module,
+        "chunk_fwd_o_opt_vk",
+        lambda **kwargs: kwargs["o"],
+    )
+
+    chunk_module.chunk_gated_delta_rule_fwd_opt_vk(
+        q=torch.empty(1, 1, 1, 1),
+        k=torch.empty(1, 1, 1, 1),
+        v=torch.empty(1, 1, 1, 1),
+        g=torch.empty(1, 1, 1),
+        beta=torch.empty(1, 1, 1),
+        scale=1.0,
+        initial_state=initial_state,
+        output_final_state=True,
+        cu_seqlens=torch.tensor([0, 1, 2]),
+        use_chunk_hip=True,
+        o=torch.empty(1, 1, 1, 1),
+        num_decodes=1,
+        num_decode_tokens=1,
+        initial_state_indices=initial_state_indices,
+        inplace_final_state=True,
+    )
+
+    assert captured["initial_state_indices"] is initial_state_indices
+    assert captured["inplace_final_state"] is True
+
+
+def test_chunk_opt_vk_unsupported_gfx12_downgrades_to_triton(monkeypatch):
+    chunk_module = importlib.import_module(
+        "aiter.ops.triton._triton_kernels.gated_delta_rule.prefill.chunk"
+    )
+    props = type("DeviceProperties", (), {"gcnArchName": "gfx1250"})()
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda device: props)
+    monkeypatch.setattr(
+        chunk_module,
+        "fused_chunk_local_cumsum_scaled_dot_kkt_fwd",
+        lambda **kwargs: (torch.empty(1, 1, 1), torch.empty(1, 1, 1, 1)),
+    )
+    monkeypatch.setattr(
+        chunk_module,
+        "fused_solve_tril_recompute_w_u",
+        lambda **kwargs: (torch.empty(1, 1, 1, 1), torch.empty(1, 1, 1, 1)),
+    )
+    triton_called = False
+
+    def fake_triton_k5(**kwargs):
+        nonlocal triton_called
+        triton_called = True
+        return (
+            torch.empty(1, 1, 1, 1, 1),
+            torch.empty(1, 1, 1, 1),
+            None,
+        )
+
+    monkeypatch.setattr(
+        chunk_module, "chunk_gated_delta_rule_fwd_h_opt_vk", fake_triton_k5
+    )
+    monkeypatch.setattr(
+        chunk_module,
+        "chunk_fwd_o_opt_vk",
+        lambda **kwargs: kwargs["o"],
+    )
+
+    chunk_module.chunk_gated_delta_rule_fwd_opt_vk(
+        q=torch.empty(1, 1, 1, 1),
+        k=torch.empty(1, 1, 1, 1),
+        v=torch.empty(1, 1, 1, 1),
+        g=torch.empty(1, 1, 1),
+        beta=torch.empty(1, 1, 1),
+        scale=1.0,
+        initial_state=None,
+        output_final_state=False,
+        use_chunk_hip=True,
+        o=torch.empty(1, 1, 1, 1),
+    )
+
+    assert triton_called
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

@@ -63,6 +63,7 @@ struct mha_batch_prefill_traits : public fmha_batch_prefill_traits
                              bool has_dropout,
                              quant_scale_enum qscale_type,
                              bool skip_min_seqlen_q,
+                             bool has_sink,
                              ck_tile::BlockAttentionKVCacheMemoryLayoutEnum kv_memory_layout,
                              ck_tile::BlockAttentionKVCacheLookupTableEnum kv_lookup_table,
                              int page_size)
@@ -78,7 +79,7 @@ struct mha_batch_prefill_traits : public fmha_batch_prefill_traits
                                     has_dropout,
                                     qscale_type,
                                     skip_min_seqlen_q,
-                                    false, // has_sink
+                                    has_sink,
                                     kv_memory_layout,
                                     kv_lookup_table,
                                     page_size}

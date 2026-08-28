@@ -1,33 +1,32 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import argparse
+import logging
 import os
-from typing import Optional
+from multiprocessing import Pool, freeze_support, set_start_method
 
+import pandas as pd
 import torch
 import torch.distributed as dist
-from aiter import get_hip_quant, QuantType
-import argparse
-from aiter import dtypes
 
+from aiter import QuantType, dtypes, get_hip_quant
+from aiter.dist.communication_op import tensor_model_parallel_all_reduce
 from aiter.dist.parallel_state import (
+    destroy_distributed_environment,
+    destroy_model_parallel,
     ensure_model_parallel_initialized,
-    init_distributed_environment,
-    set_custom_all_reduce,
     get_tp_group,
     graph_capture,
-    destroy_model_parallel,
-    destroy_distributed_environment,
+    init_distributed_environment,
+    set_custom_all_reduce,
 )
-from aiter.dist.utils import get_open_port, get_distributed_init_method, get_ip
-from aiter.dist.communication_op import tensor_model_parallel_all_reduce
+from aiter.dist.utils import get_distributed_init_method, get_ip, get_open_port
 from aiter.test_common import (
+    benchmark,
     checkAllclose,
     perftest,
-    benchmark,
 )
-from multiprocessing import set_start_method, Pool, freeze_support
-import logging
 
 logger = logging.getLogger("aiter")
 
@@ -40,7 +39,7 @@ def allreduce_custom(
     rankID,
     x,
     withGraph=False,
-    distributed_init_method: Optional[str] = None,
+    distributed_init_method: str | None = None,
 ):
     device = torch.device(f"cuda:{rankID}")
     torch.cuda.set_device(device)
@@ -63,9 +62,8 @@ def allreduce_custom(
 
     if withGraph:
         graph = torch.cuda.CUDAGraph()
-        with graph_capture() as gc:
-            with torch.cuda.graph(graph, stream=gc.stream):
-                out = tensor_model_parallel_all_reduce(x, open_fp8_quant=True)
+        with graph_capture() as gc, torch.cuda.graph(graph, stream=gc.stream):
+            out = tensor_model_parallel_all_reduce(x, open_fp8_quant=True)
         out.fill_(0)
 
         @perftest()
@@ -97,7 +95,7 @@ def test_allreduce_custom(
     shape,
     dtype,
     withGraph=False,
-    distributed_init_method: Optional[str] = None,
+    distributed_init_method: str | None = None,
 ):
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = "49373"
@@ -132,6 +130,8 @@ def test_allreduce_custom(
     fp8_output, scale = quant_function(a, quant_dtype=dtypes.fp8)
     fp32_output = fp8_output.to(torch.float) * scale
     fp16_quanted_ref = fp32_output.to(torch.float16).reshape(128, 8192)
+    all_us = [us for _, us in rets]
+    max_err = 0.0
     for out, us in rets:
         gpu_id = out.device.index
         ori_ref = ref.clone()
@@ -139,7 +139,13 @@ def test_allreduce_custom(
         c = fp16_quanted_ref.clone()
         c[gpu_id * 16 : (gpu_id + 1) * 16][:] = ori_tensor
         msg = f"test_allreduce_custom: {shape=} {dtype=} {withGraph=} {us:>8.2f}"
-        checkAllclose(c.cpu(), out.cpu(), msg=msg)
+        err = checkAllclose(c.cpu(), out.cpu(), msg=msg)
+        max_err = max(max_err, err)
+    return {
+        "min_us": min(all_us),
+        "max_us": max(all_us),
+        "err": max_err,
+    }
 
 
 l_dtype = ["fp16"]
@@ -175,9 +181,10 @@ if __name__ == "__main__":
         l_dtype = [dtypes.d_dtypes[args.dtype]]
     if args.shape is not None:
         l_shape = [args.shape]
+    df = []
     for dtype in l_dtype:
         for shape in l_shape:
-            test_allreduce_custom(
+            ret = test_allreduce_custom(
                 8,
                 1,
                 shape,
@@ -187,3 +194,19 @@ if __name__ == "__main__":
                     get_ip(), get_open_port()
                 ),
             )
+            df.append(ret)
+    df = pd.DataFrame(df)
+    show_cols = [
+        "tp_size",
+        "shape",
+        "dtype",
+        "withGraph",
+        "min_us",
+        "max_us",
+        "err",
+    ]
+    show_cols = [c for c in show_cols if c in df.columns]
+    logger.info(
+        "custom allreduce fp8 summary (markdown):\n%s",
+        df[show_cols].to_markdown(index=False),
+    )

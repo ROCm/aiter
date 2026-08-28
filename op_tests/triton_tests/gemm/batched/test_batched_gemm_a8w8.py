@@ -1,13 +1,14 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import torch
-import pytest
 import functools
-from aiter.ops.triton.gemm.batched.batched_gemm_a8w8 import batched_gemm_a8w8
-from aiter.ops.triton.utils.types import str_to_torch_dtype, get_fp8_dtypes
+
+import pytest
+import torch
 import torch.nn.functional as F
-from typing import Union
+
+from aiter.ops.triton.gemm.batched.batched_gemm_a8w8 import batched_gemm_a8w8
+from aiter.ops.triton.utils.types import get_fp8_dtypes, str_to_torch_dtype
 
 
 def generate_batched_gemm_a8w8_inputs(
@@ -15,7 +16,7 @@ def generate_batched_gemm_a8w8_inputs(
     M: int,
     N: int,
     K: int,
-    dtype: Union[torch.dtype, str],
+    dtype: torch.dtype | str,
     output=bool,
     layout: str = "TN",
 ):
@@ -26,6 +27,7 @@ def generate_batched_gemm_a8w8_inputs(
         - x_scale: shape (B, M, 1)
         - w_scale: shape (B, 1, N)
     """
+    torch.manual_seed(0)
     if isinstance(dtype, str):
         dtype = str_to_torch_dtype[dtype]
     if layout[0] == "T":

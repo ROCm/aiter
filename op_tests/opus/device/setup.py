@@ -39,8 +39,16 @@ _CU_SOURCES = [
     "test_mdiv.cu",
     "test_numeric_limits.cu",
     "test_workgroup_barrier.cu",
+    "test_tdm_gfx1250.cu",
     "test_finfo.cu",
+    "test_opus_gmem_gfx1201.cu",
+    "test_wmma_gfx1201.cu",
+    "test_wmma_gfx1201_w64.cu",
+    "test_wmma_gfx1201_tiled.cu",
 ]
+
+# Sources requiring -mwavefrontsize64 (wave64 builtins).
+_W64_SOURCES = {"test_wmma_gfx1201_w64.cu"}
 
 
 def _detect_arch():
@@ -53,8 +61,21 @@ def _detect_arch():
                 name = line.split()[-1].strip()
                 if name.startswith("gfx"):
                     return name
-    except Exception:
+    except Exception:  # noqa: BLE001,S110
         pass
+    # rocminfo is not always installed, and falling straight through to "native" costs
+    # more than an unresolved arch string: the per-arch skip lists below are keyed by
+    # gfx name, so an undetected arch silently stops applying them. torch is already a
+    # hard requirement of the harness that loads the .so, and reports the same name.
+    try:
+        import torch
+
+        props = torch.cuda.get_device_properties(0)
+        name = getattr(props, "gcnArchName", "").split(":")[0]
+    except (ImportError, AttributeError, AssertionError, RuntimeError):
+        name = ""
+    if name.startswith("gfx"):
+        return name
     return "native"
 
 
@@ -67,14 +88,15 @@ def _find_hipcc():
         return subprocess.check_output(
             ["which", "hipcc"], stderr=subprocess.DEVNULL, text=True
         ).strip()
-    except Exception:
+    except Exception:  # noqa: BLE001,S110
         pass
     return "hipcc"
 
 
 def _compile_one(args):
     """Compile a single .cu -> .o.  Used as a worker function for parallel builds."""
-    src, obj, hipcc, arch, verbose = args
+    src, obj, hipcc, arch, verbose, *rest = args
+    extra_flags = rest[0] if rest else []
     cmd = [
         hipcc,
         f"--offload-arch={arch}",
@@ -83,6 +105,7 @@ def _compile_one(args):
         "-D__HIPCC_RTC__",
         f"-I{_REPO_CSRC}",
         f"-I{_THIS_DIR}",
+        *extra_flags,
         "-c",
         src,
         "-o",
@@ -109,14 +132,44 @@ def build(verbose=False, jobs=None):
     if verbose:
         print(f"[setup] arch={arch}, jobs={jobs}")
 
+    # Per-arch skip list: kernels that use builtins not available on the
+    # target arch. Skipped at .so build time so the rest of the suite
+    # still links; the Python harness sees the missing extern "C" launcher
+    # and reports SKIP for those tests.
+    _ARCH_SKIP_SOURCES = {
+        "gfx1250": {
+            # gfx1201 wave64 WMMA builtins; no gfx1250 spelling.
+            "test_wmma_gfx1201_w64.cu",
+            # opus.hpp's wmma<i8, i8, f32, 16, 16, 128> dispatch does not accept the
+            # scale operands the kernel passes.
+            "test_wmma_scale.cu",
+        },
+    }
+
+    # The inverse list: sources that build for one arch and no other. Stated positively
+    # because the alternative is naming every arch a kernel does NOT support, which is a
+    # list that silently goes wrong every time a new one appears.
+    _ARCH_ONLY_SOURCES = {
+        # The tensor DMA opcodes are gfx1250-only.
+        "test_tdm_gfx1250.cu": {"gfx1250"},
+    }
+
+    skip = set(_ARCH_SKIP_SOURCES.get(arch, set()))
+    skip |= {s for s, archs in _ARCH_ONLY_SOURCES.items() if arch not in archs}
+    sources = [s for s in _CU_SOURCES if s not in skip]
+    if verbose:
+        for s in sorted(skip):
+            print(f"[setup]   skip {s} (incompatible with arch={arch})")
+
     t0 = time.monotonic()
 
     # Parallel compile: each .cu -> .o
     tasks = []
-    for s in _CU_SOURCES:
+    for s in sources:
         src = os.path.join(_THIS_DIR, s)
         obj = os.path.join(_THIS_DIR, s.replace(".cu", ".o"))
-        tasks.append((src, obj, hipcc, arch, verbose))
+        extra = ["-mwavefrontsize64"] if s in _W64_SOURCES else []
+        tasks.append((src, obj, hipcc, arch, verbose, extra))
 
     objs = []
     with ProcessPoolExecutor(max_workers=jobs) as pool:

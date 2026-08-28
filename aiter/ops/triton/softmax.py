@@ -1,5 +1,6 @@
 import torch
 import triton
+
 from aiter.ops.triton._triton_kernels.softmax import _softmax_kernel_online
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
@@ -29,7 +30,7 @@ def softmax(x):
 
     num_programs = n_rows
 
-    grid = lambda meta: (num_programs,)  # noqa: E731
+    grid = lambda meta: (num_programs,)
     _softmax_kernel_online[grid](
         y,
         x,

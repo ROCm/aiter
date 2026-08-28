@@ -9,8 +9,10 @@ def _rmsmorm_op(row, weight, n_cols, epsilon):
     row_norm = row * row
     row_norm = tl.sum(row_norm, axis=-1)
     norm_factor = tl.math.rsqrt((row_norm / n_cols) + epsilon)
-
-    rms_norm = row * norm_factor[:, None] * weight
+    if weight is not None:
+        rms_norm = row * norm_factor[:, None] * weight
+    else:
+        rms_norm = row * norm_factor[:, None]
     return rms_norm
 
 
@@ -390,7 +392,7 @@ def _fused_reduce_act_mul_and_dynamic_mxfp4_quant_kernel(
                     & (x_offs_n[None, None, :] < N1)
                 )
                 other = 0.0
-            elif not (X_NUM_KSPLIT_POW2 == X_NUM_KSPLIT):
+            elif X_NUM_KSPLIT_POW2 != X_NUM_KSPLIT:
                 mask = offs_spk[:, None, None] < X_NUM_KSPLIT
                 other = 0.0
             elif not EVEN_M_N:

@@ -1,9 +1,10 @@
-import torch
 import pytest
+import torch
+
 from aiter.ops.triton.gemm.batched.batched_gemm_a16wfp4 import (
     batched_gemm_a16wfp4,
 )
-import aiter.ops.triton.utils._triton.arch_info as arch_info
+from aiter.ops.triton.utils._triton import arch_info
 
 # Note this is specified by the HW and cannot be changed.
 SCALE_GROUP_SIZE = 32
@@ -117,7 +118,7 @@ def get_x_vals():
     x_vals_with_batch = [
         (b, 2**m, n, k)
         for b in range(1, 17)
-        for m in range(0, 9)
+        for m in range(9)
         for (n, k) in [(512, 128), (128, 512)]
     ]
     # x_vals_with_batch = [(1, 1, 128, 512+128), ] # TODO check
@@ -180,7 +181,7 @@ def test_batched_gemm_a16wfp4(B: int, M: int, N: int, K: int, layout, dtype):
 
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
 
-    x, w, x_scales, w_scales, out = generate_batched_gemm_a16wfp4_inputs(
+    x, w, _x_scales, w_scales, out = generate_batched_gemm_a16wfp4_inputs(
         B, M, N, K, dtype, layout=layout, output=True
     )
 
@@ -189,3 +190,49 @@ def test_batched_gemm_a16wfp4(B: int, M: int, N: int, K: int, layout, dtype):
     batched_gemm_a16wfp4(x, w, w_scales, dtype, out, transpose_bm=False, prequant=True)
 
     torch.testing.assert_close(torch_out, out)
+
+
+def test_batched_gemm_a16wfp4_fake_honors_transpose_bm():
+    """Regression: the fake must match the real kernel's allocation
+    branch on ``transpose_bm`` (lines 100-103 of batched_gemm_a16wfp4.py).
+
+    Pre-fix the fake returned ``(Bx, M, N)`` regardless of
+    ``transpose_bm``, so under ``torch.compile`` AOTAutograd specialized
+    the unbacked SymInt ``M`` of any downstream consumer to the static
+    ``Bx`` -- silently producing wrong output (or a GPU memory access
+    fault) on cudagraph replay at any other ``M``. Post-fix the fake
+    returns ``(M, Bx, N)`` when ``transpose_bm=True``, matching the real
+    kernel.
+
+    Pure meta-tensor test: no GPU, no FP4 hardware, no kernel launch,
+    no ``torch.compile`` trace -- testing the fake function in isolation
+    is the necessary and sufficient condition for the downstream graph
+    to be correct.
+    """
+    from aiter.ops.triton.gemm.batched.batched_gemm_a16wfp4 import (
+        batched_gemm_a16wfp4_fake_tensor,
+    )
+
+    B, M, N, K = 16, 7, 512, 128
+
+    x = torch.empty((B, M, K), dtype=torch.bfloat16, device="meta")
+    w = torch.empty((B, N, K // 2), dtype=torch.uint8, device="meta")
+    w_scales = torch.empty((B, N, K // 32), dtype=torch.uint8, device="meta")
+
+    out_t = batched_gemm_a16wfp4_fake_tensor(
+        x, w, w_scales, dtype=torch.bfloat16, transpose_bm=True
+    )
+    assert out_t.shape == (
+        M,
+        B,
+        N,
+    ), f"transpose_bm=True must return (M, B, N); got {tuple(out_t.shape)}"
+
+    out_f = batched_gemm_a16wfp4_fake_tensor(
+        x, w, w_scales, dtype=torch.bfloat16, transpose_bm=False
+    )
+    assert out_f.shape == (
+        B,
+        M,
+        N,
+    ), f"transpose_bm=False must return (B, M, N); got {tuple(out_f.shape)}"

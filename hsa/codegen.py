@@ -123,14 +123,18 @@ if __name__ == "__main__":
 
     ## deal with same name csv
     cfgs = []
-    have_get_header = False
+    # First pass: load every manifest CSV into a combine_df so we can compute
+    # the union of columns across all manifests. The generated CFG struct must
+    # be a single C++ type that fits every manifest, so we need one shared
+    # column schema -- but individual manifests are allowed to omit columns
+    # they don't care about (those default to 0 for ints / "" for strings).
+    cfg_entries = []
     for cfgname, file_info_list in csv_groups.items():
         dfs = []
         for file_info in file_info_list:
             single_file = file_info["file_path"]
             arch = file_info["arch"]
             df = read_csv_strip_comments(single_file)
-            # check headers
             headers_list = df.columns.tolist()
             required_columns = {"knl_name", "co_name"}
             if not required_columns.issubset(headers_list):
@@ -148,21 +152,42 @@ if __name__ == "__main__":
             combine_df = (
                 pd.concat(dfs, ignore_index=True).fillna(0).infer_objects(copy=False)
             )
-            if not have_get_header:
-                headers_list = combine_df.columns.tolist()
-                required_columns = {"knl_name", "co_name", "arch"}
-                other_columns = [
-                    col for col in headers_list if col not in required_columns
-                ]
-                other_columns_comma = ", ".join(other_columns)
-                sample_row = combine_df.iloc[0]
-                other_columns_cpp_def = "\n".join(
-                    [
-                        f"    {'int' if isinstance(sample_row[col], (int, float, np.integer)) else 'std::string'} {col};"
-                        for col in other_columns
-                    ]
-                )
-                content += f"""
+            cfg_entries.append((cfgname, relpath, combine_df))
+
+    if cfg_entries:
+        required_columns = {"knl_name", "co_name", "arch"}
+        # Union of "other" columns across all manifests, preserving first-seen
+        # order so the generated header is deterministic.
+        other_columns = []
+        seen_cols = set(required_columns)
+        for _, _, combine_df in cfg_entries:
+            for col in combine_df.columns.tolist():
+                if col in seen_cols:
+                    continue
+                seen_cols.add(col)
+                other_columns.append(col)
+
+        # Type for each "other" column: int if any manifest provides a numeric
+        # value for it, else std::string. This way newly added int columns
+        # like "flat" still get an int field even if only one manifest opts
+        # in.
+        col_is_numeric = {col: False for col in other_columns}
+        for _, _, combine_df in cfg_entries:
+            for col in other_columns:
+                if col not in combine_df.columns:
+                    continue
+                first_val = combine_df.iloc[0][col]
+                if isinstance(first_val, (int, float, np.integer)):
+                    col_is_numeric[col] = True
+
+        other_columns_comma = ", ".join(other_columns)
+        other_columns_cpp_def = "\n".join(
+            [
+                f"    {'int' if col_is_numeric[col] else 'std::string'} {col};"
+                for col in other_columns
+            ]
+        )
+        content += f"""
 #define ADD_CFG({other_columns_comma}, arch, path, knl_name, co_name)         \\
     {{                                         \\
         arch knl_name, {{ knl_name, path co_name, arch, {other_columns_comma} }}         \\
@@ -179,7 +204,11 @@ struct {args.module}Config
 using CFG = std::unordered_map<std::string, {args.module}Config>;
 
 """
-                have_get_header = True
+
+        for cfgname, relpath, combine_df in cfg_entries:
+            for col in other_columns:
+                if col not in combine_df.columns:
+                    combine_df[col] = 0 if col_is_numeric[col] else ""
             cfg = [
                 "ADD_CFG("
                 + ", ".join(

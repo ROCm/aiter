@@ -5,35 +5,80 @@
 
 from __future__ import annotations
 
+import csv
+import os
+from pathlib import Path
 
 import torch
+from flydsl.runtime.device import get_rocm_arch
 
-
-from .kernels.gdr_decode import create_shuffle_gdr_decode_kernel
-from .kernels.tensor_shim import get_dtype_str, _run_compiled
+from .kernels.gdr_decode import create_vk_gdr_decode_kernel
+from .kernels.tensor_shim import _run_compiled, get_dtype_str
 
 __all__ = [
     "flydsl_gdr_decode",
 ]
 
 
-def get_default_kwargs(batch_size, seq_length):
+GDR_GLOBAL_CONFIG_MAP = None
+GDR_GPU_ARCH = get_rocm_arch()
+
+
+def get_default_kwargs(
+    dtype_str,
+    state_dtype_str,
+    batch_size,
+    seq_length,
+    num_k_heads,
+    num_v_heads,
+    head_k_dim,
+    head_v_dim,
+):
     d = {}
-    b_to_vs = {
-        1: 4,
-        2: 4,
-        3: 4,
-        4: 2,
-        5: 2,
-        6: 2,
-        7: 2,
-        8: 2,
-        9: 2,
-        10: 2,
-        11: 1,
-    }
-    if b_to_vs.get(batch_size, None) is not None:
-        d["NUM_BLOCKS_PER_V_DIM"] = b_to_vs[batch_size]
+    d["NUM_BLOCKS_PER_V_DIM"] = 1
+    d["NUM_WARPS"] = 4
+    d["WARP_THREADS_K"] = 8
+    global GDR_GLOBAL_CONFIG_MAP
+    if GDR_GLOBAL_CONFIG_MAP is None:
+        _dict = {}
+        fname = os.path.join(Path(__file__).resolve().parent, "gdr_decode_tuned.csv")
+        with open(fname, "r", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                obj = dict(row)
+                arch, b, sq, nkh, nvh, khd, vhd = (
+                    obj["arch"],
+                    int(obj["b"]),
+                    int(obj["sq"]),
+                    int(obj["num_k_heads"]),
+                    int(obj["num_v_heads"]),
+                    int(obj["head_k_dim"]),
+                    int(obj["head_v_dim"]),
+                )
+                d_str, sd_str = obj["dtype"], obj["state_dtype"]
+                if float(obj["duration"]) < 10000.0:
+                    _dict[(d_str, sd_str, arch, b, sq, nkh, nvh, khd, vhd)] = {
+                        "NUM_BLOCKS_PER_V_DIM": int(obj["NUM_BLOCKS_PER_V_DIM"]),
+                        "NUM_WARPS": int(obj["NUM_WARPS"]),
+                        "WARP_THREADS_K": int(obj["WARP_THREADS_K"]),
+                    }
+        GDR_GLOBAL_CONFIG_MAP = _dict
+    config = GDR_GLOBAL_CONFIG_MAP.get(
+        (
+            dtype_str,
+            state_dtype_str,
+            GDR_GPU_ARCH,
+            batch_size,
+            seq_length,
+            num_k_heads,
+            num_v_heads,
+            head_k_dim,
+            head_v_dim,
+        ),
+        None,
+    )
+    if config:
+        d.update(config)
     return d
 
 
@@ -50,30 +95,17 @@ def flydsl_gdr_decode(
     out: torch.Tensor,
     use_qk_l2norm: bool,
     need_shuffle_state: bool,
-    stream: torch.cuda.Stream = torch.cuda.current_stream(),
+    stream: torch.cuda.Stream = None,
+    read_indices: torch.Tensor | None = None,
+    write_indices: torch.Tensor | None = None,
 ):
-    if need_shuffle_state:
-        state_ = state.permute(0, 1, 3, 2).contiguous()
-    else:
-        state_ = state
-    batch_size, seq_length, num_k_heads, head_k_dim = query.shape
-    num_v_heads = value.shape[-2]
-    head_v_dim = value.shape[-1]
-    kwargs = get_default_kwargs(batch_size, seq_length)
-    exe = create_shuffle_gdr_decode_kernel(
-        get_dtype_str(query.dtype),
-        get_dtype_str(A_log.dtype),
-        seq_length,
-        num_k_heads,
-        num_v_heads,
-        head_k_dim,
-        head_v_dim,
-        state.stride(),
-        use_qk_l2norm,
-        **kwargs,
-    )
-    _run_compiled(
-        exe,
+    if stream is None:
+        stream = torch.cuda.current_stream()
+    device = query.device
+    dtype = query.dtype
+    read_indices = indices if read_indices is None else read_indices
+    write_indices = indices if write_indices is None else write_indices
+    for input in [
         query,
         key,
         value,
@@ -81,12 +113,81 @@ def flydsl_gdr_decode(
         b,
         dt_bias,
         A_log,
-        indices,
-        state_,
+        read_indices,
+        write_indices,
         out,
+    ]:
+        assert input.device == device
+    assert state.data_ptr() % 16 == 0
+    for input in [key, value, a, b, dt_bias, out]:
+        assert input.dtype == dtype
+    assert state.dtype in [torch.float, torch.bfloat16]
+    assert A_log.dtype in [torch.float, torch.bfloat16]
+    assert read_indices.dtype == torch.int32
+    assert write_indices.dtype == torch.int32
+    if query.stride(-1) != 1:
+        raise ValueError(
+            "`query` must have a contiguous last dimension for vectorized loads; "
+            f"got stride {query.stride()}."
+        )
+    if key.stride(-1) != 1:
+        raise ValueError(
+            "`key` must have a contiguous last dimension for vectorized loads; "
+            f"got stride {key.stride()}."
+        )
+
+    if need_shuffle_state:
+        state_ = state.permute(0, 1, 3, 2).contiguous()
+    else:
+        state_ = state
+    batch_size, seq_length, num_k_heads, head_k_dim = query.shape
+    num_v_heads = value.shape[-2]
+    head_v_dim = value.shape[-1]
+    kwargs_ = get_default_kwargs(
+        str(dtype),
+        str(state_.dtype),
         batch_size,
-        stream,
+        seq_length,
+        num_k_heads,
+        num_v_heads,
+        head_k_dim,
+        head_v_dim,
     )
+    exe = create_vk_gdr_decode_kernel(
+        get_dtype_str(query.dtype),
+        get_dtype_str(A_log.dtype),
+        get_dtype_str(state_.dtype),
+        seq_length,
+        num_k_heads,
+        num_v_heads,
+        head_k_dim,
+        head_v_dim,
+        query.stride(),
+        key.stride(),
+        value.stride(),
+        state_.stride(),
+        a.stride(),
+        b.stride(),
+        use_qk_l2norm,
+        **kwargs_,
+    )
+    with torch.cuda.device(query.device.index):
+        _run_compiled(
+            exe,
+            query,
+            key,
+            value,
+            a,
+            b,
+            dt_bias.contiguous(),
+            A_log.contiguous(),
+            read_indices.contiguous(),
+            write_indices.contiguous(),
+            state_,
+            out,
+            batch_size,
+            stream,
+        )
     if need_shuffle_state:
         state_ = state_.permute(0, 1, 3, 2).contiguous()
         state.copy_(state_)

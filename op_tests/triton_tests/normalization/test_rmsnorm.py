@@ -3,18 +3,18 @@
 
 import pytest
 import torch
+
 import aiter
-from aiter.ops.triton.utils.types import str_to_torch_dtype
 from aiter.jit.core import get_gfx
 from aiter.ops.triton.normalization.rmsnorm import (
     rms_norm,
     rmsnorm2d_fwd_with_add,
-    rmsnorm2d_fwd_with_smoothquant,
-    rmsnorm2d_fwd_with_dynamicquant,
-    rmsnorm2d_fwd_with_add_smoothquant,
     rmsnorm2d_fwd_with_add_dynamicquant,
-    gluon_rms_norm_kernel,
+    rmsnorm2d_fwd_with_add_smoothquant,
+    rmsnorm2d_fwd_with_dynamicquant,
+    rmsnorm2d_fwd_with_smoothquant,
 )
+from aiter.ops.triton.utils.types import str_to_torch_dtype
 
 
 def generate_rmsnorm_inputs(M, N, dtype):
@@ -25,7 +25,7 @@ def generate_rmsnorm_inputs(M, N, dtype):
 
 
 def torch_rmsnorm(x, g, out_dtype=torch.float16, epsilon=1e-6):
-    M, N = x.shape
+    _M, N = x.shape
     # cast to float32 as the triton kernel
     x_f32 = x.float()
     g_f32 = g.float()
@@ -51,13 +51,15 @@ def run_torch(input, weight, eps, residual=None, x_scale=None, y_scale_dtype=Non
     return output_q, residual_out, y_scale, output
 
 
-def run_triton(input, weight, eps, residual=None, x_scale=None, y_scale_dtype=None):
+def run_triton(
+    input, weight, eps, residual=None, x_scale=None, y_scale_dtype=None, backend=None
+):
     # out_before_quant = None
     if y_scale_dtype is None:
         y_scale = None
         if residual is None:
             residual_out = None
-            output = rms_norm(input, weight, eps)
+            output = rms_norm(input, weight, eps, backend)
         else:
             residual_out = torch.empty_like(input)
             output = torch.empty_like(input)
@@ -130,11 +132,15 @@ def get_vals():
     "M, N",
     [(shape) for shape in get_vals()],
 )
-def test_rmsnorm(M, N, in_dtype_str):
+@pytest.mark.parametrize("backend", [None, "triton", "gluon"])
+def test_rmsnorm(M, N, in_dtype_str, backend):
 
     in_dtype = str_to_torch_dtype[in_dtype_str]
     out_dtype = in_dtype
     torch.manual_seed(0)
+
+    if backend == "gluon" and get_gfx() != "gfx1250":
+        pytest.skip("gluon rmsnorm requires gfx1250 hardware")
 
     x, weight = generate_rmsnorm_inputs(M, N, in_dtype)
 
@@ -144,7 +150,7 @@ def test_rmsnorm(M, N, in_dtype_str):
 
     # forward pass
     y_torch, *_ = run_torch(x, weight, 1e-5)
-    y_triton, *_ = run_triton(x, weight, 1e-5)
+    y_triton, *_ = run_triton(x, weight, 1e-5, backend=backend)
 
     # backward pass (triton)
     y_triton.backward(dy, retain_graph=True)
@@ -228,6 +234,29 @@ def test_fused_add_rmsnorm(M, N, in_dtype_str):
     torch.testing.assert_close(res_triton, res_torch, atol=atol, rtol=rtol)
     torch.testing.assert_close(dx_triton, dx_torch, rtol=rtol, atol=atol)
     torch.testing.assert_close(dg_triton, dg_torch, rtol=rtol, atol=atol)
+
+
+@pytest.mark.parametrize("in_dtype_str", ["fp16", "bf16"])
+def test_fused_add_rmsnorm_gemma_norm(in_dtype_str):
+    in_dtype = str_to_torch_dtype[in_dtype_str]
+    torch.manual_seed(0)
+
+    M, N = 4, 1024
+    x = torch.randn(M, N, device="cuda", dtype=in_dtype)
+    weight = torch.randn(N, device="cuda", dtype=in_dtype)
+    res = torch.randn(M, N, device="cuda", dtype=in_dtype)
+    residual_out = torch.empty_like(x)
+    output = torch.empty_like(x)
+
+    aiter.rmsnorm2d_fwd_with_add(
+        output, x, res, residual_out, weight, 1e-5, gemma_norm=True
+    )
+
+    ref_residual = x + res
+    ref_output = torch_rmsnorm(ref_residual, weight + 1, in_dtype, 1e-5)
+
+    torch.testing.assert_close(residual_out, ref_residual, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(output, ref_output, atol=1e-2, rtol=1e-2)
 
 
 @pytest.mark.parametrize("in_dtype_str", ["fp32", "fp16", "bf16"])
@@ -386,30 +415,3 @@ def test_rms_norm_dynamic_per_token_fp8_quant(
 
     torch.testing.assert_close(xq_dequant, ref_xq_dequant, atol=atol, rtol=rtol)
     torch.testing.assert_close(x_normed, ref_x_normed, atol=atol, rtol=rtol)
-
-
-_IS_GFX1250 = get_gfx() == "gfx1250"
-
-
-@pytest.mark.skipif(not _IS_GFX1250, reason="gluon rmsnorm requires gfx1250 hardware")
-@pytest.mark.parametrize("in_dtype_str", ["fp16", "bf16"])
-@pytest.mark.parametrize(
-    "M, N",
-    [(shape) for shape in get_vals()],
-)
-def test_gluon_rms_norm(M, N, in_dtype_str):
-    in_dtype = str_to_torch_dtype[in_dtype_str]
-    torch.manual_seed(0)
-
-    x, weight = generate_rmsnorm_inputs(M, N, in_dtype)
-
-    out_gluon, _ = gluon_rms_norm_kernel(x, weight, 1e-5)
-    out_ref = torch_rmsnorm(x, weight, in_dtype, 1e-5)
-
-    atol, rtol = 1e-2, 1e-2
-
-    assert (
-        out_gluon.dtype == in_dtype
-    ), f"out_gluon has dtype={out_gluon.dtype}, expected {in_dtype}"
-
-    torch.testing.assert_close(out_gluon, out_ref, atol=atol, rtol=rtol)

@@ -1,6 +1,7 @@
+import pytest
 import torch
 import torch.nn.functional as F
-import pytest
+
 from aiter.ops.triton.gemm.basic.gemm_a16w16_gated import gemm_a16w16_gated
 from op_tests.triton_tests.gemm.basic.test_gemm_a16w16 import get_x_vals
 from op_tests.triton_tests.utils.types import str_to_torch_dtype
@@ -9,6 +10,7 @@ from op_tests.triton_tests.utils.types import str_to_torch_dtype
 
 
 def generate_gemm_a16w16_gated_inputs(M, N, K, dtype, layout="TN", output=True):
+    torch.manual_seed(0)
     if isinstance(dtype, str):
         dtype = str_to_torch_dtype[dtype]
 
@@ -66,7 +68,7 @@ def test_gemm_a16_w16_gated(M: int, N: int, K: int, dtype, output, layout, activ
     elif activation is None:
         gating = torch_out[:, : N // 2]
     else:
-        raise Exception(f"Unsupported activation: {activation}")
+        raise RuntimeError(f"Unsupported activation: {activation}")
     torch_y = torch_out[:, N // 2 :]
     torch_out = gating * torch_y
 

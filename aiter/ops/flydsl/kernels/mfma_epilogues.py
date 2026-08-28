@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2025 FlyDSL Project Contributors
+
 """Reusable epilogue helpers for MFMA 16x16-based kernels.
 
 This module provides:
@@ -20,17 +23,21 @@ This module provides:
     3) remap threads into (MLane, NLane) = (8,32) and read half2 from LDS,
        then call `store_pair(...)` to emit the final global store/atomic.
 
+  When ``lds_out_split`` is provided, the epilogue runs in split-LDS mode:
+  waves are partitioned into two groups (group A uses ``lds_out``, group B
+  uses ``lds_out_split``), each handling half of the N dimension.
+
 These helpers are intentionally *dialect-agnostic*: callers pass the dialect
 modules (`arith`, `vector`, `gpu`) and the `range_constexpr` iterator.
 """
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from contextlib import contextmanager
-from typing import Callable
 
-from flydsl._mlir import ir
 import flydsl.expr as fx
+from flydsl._mlir import ir
 from flydsl._mlir.dialects.arith import CmpIPredicate
 from flydsl.expr.typing import T
 
@@ -223,7 +230,7 @@ def c_shuffle_epilog(
         # -- read phase (each group reads from its own LDS buffer) --
         tx_local = tx - arith.select(_is_group_b, _half_thr_idx, _zero_idx)
         c_nlane_s = arith.constant(CShuffleNLane_s, index=True)
-        m_lane_s = tx_local / c_nlane_s
+        m_lane_s = tx_local // c_nlane_s
         n_lane_s = tx_local % c_nlane_s
         c_evec = arith.constant(EVec, index=True)
 
@@ -257,7 +264,7 @@ def c_shuffle_epilog(
         for mr in range_constexpr(m_reps_s):
             row_local, row, row_ctx, row_pred = _precomputed_rows_s[mr]
 
-            def _do_store_row_split():
+            def _do_store_row_split(row=row, row_ctx=row_ctx, row_local=row_local):
                 row_base_lds = row_local * _half_n_idx
                 for nr in range_constexpr(n_reps_s):
                     col_base_nr = arith.constant(
@@ -388,7 +395,7 @@ def c_shuffle_epilog(
     for mr in range_constexpr(m_reps_shuffle):
         row_local, row, row_ctx, row_pred = _precomputed_rows[mr]
 
-        def _do_store_row():
+        def _do_store_row(row=row, row_ctx=row_ctx, row_local=row_local):
             row_base_lds = row_local * tile_n_idx
             if _lds_row_base_offset is not None:
                 row_base_lds = row_base_lds + _lds_row_base_offset

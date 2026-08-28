@@ -9,6 +9,8 @@ missing untuned files.
 
 import os
 import unittest
+from typing import Any, ClassVar
+
 import pandas as pd
 
 AITER_ROOT = os.path.dirname(
@@ -19,12 +21,13 @@ CONFIGS_DIR = os.path.join(AITER_ROOT, "aiter", "configs")
 
 class TestCSVValidation(unittest.TestCase):
 
-    TUNED_CSVS = {
+    TUNED_CSVS: ClassVar[dict[str, Any]] = {
         "a8w8": "a8w8_tuned_gemm.csv",
         "a8w8_bpreshuffle": "a8w8_bpreshuffle_tuned_gemm.csv",
         "a8w8_blockscale": "a8w8_blockscale_tuned_gemm.csv",
         "a8w8_blockscale_bpreshuffle": "a8w8_blockscale_bpreshuffle_tuned_gemm.csv",
         "a4w4_blockscale": "a4w4_blockscale_tuned_gemm.csv",
+        "a6w6_blockscale": "a6w6_blockscale_tuned_gemm.csv",
         "a8w8_batched": "a8w8_tuned_batched_gemm.csv",
         "bf16": "bf16_tuned_gemm.csv",
         "bf16_batched": "bf16_tuned_batched_gemm.csv",
@@ -41,6 +44,7 @@ class TestCSVValidation(unittest.TestCase):
 
     def _get_key_cols(self, df):
         candidates = [
+            "gfx",
             "cu_num",
             "M",
             "N",
@@ -71,6 +75,39 @@ class TestCSVValidation(unittest.TestCase):
 
     def test_a8w8_blockscale_no_duplicates(self):
         self._check_no_duplicates("a8w8_blockscale")
+
+    def test_a8w8_bpreshuffle_no_duplicates(self):
+        self._check_no_duplicates(
+            "a8w8_bpreshuffle", extra_keys=["q_dtype_w", "libtype"]
+        )
+
+    def test_a8w8_blockscale_bpreshuffle_no_duplicates(self):
+        self._check_no_duplicates("a8w8_blockscale_bpreshuffle", extra_keys=["libtype"])
+
+    def test_a4w4_blockscale_no_duplicates(self):
+        self._check_no_duplicates("a4w4_blockscale")
+
+    def test_a6w6_blockscale_no_duplicates(self):
+        self._check_no_duplicates("a6w6_blockscale")
+
+    def test_a8w8_batched_no_duplicates(self):
+        self._check_no_duplicates("a8w8_batched")
+
+    def test_bf16_no_duplicates(self):
+        self._check_no_duplicates(
+            "bf16",
+            extra_keys=[
+                "bias",
+                "dtype",
+                "outdtype",
+                "scaleAB",
+                "bpreshuffle",
+                "libtype",
+            ],
+        )
+
+    def test_bf16_batched_no_duplicates(self):
+        self._check_no_duplicates("bf16_batched")
 
     def test_fmoe_no_duplicates(self):
         self._check_no_duplicates(
@@ -135,6 +172,7 @@ class TestCSVValidation(unittest.TestCase):
             "a8w8_untuned_gemm.csv",
             "a8w8_bpreshuffle_untuned_gemm.csv",
             "a8w8_blockscale_untuned_gemm.csv",
+            "a6w6_blockscale_untuned_gemm.csv",
             "a8w8_untuned_batched_gemm.csv",
             "bf16_untuned_batched_gemm.csv",
             "untuned_fmoe.csv",

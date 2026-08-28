@@ -24,6 +24,7 @@ It supporst page size = 1.
 # https://github.com/ModelTC/lightllm/blob/f2a54f0912293f683bf1d1695fd12c4098a5bf82/lightllm/models/llama/triton_kernel/context_flashattention_nopad.py#L1
 import triton
 import triton.language as tl
+
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
 _fwd_kernel_repr = make_kernel_repr(
@@ -120,7 +121,7 @@ def _fwd_kernel(
         # mask = tl.load(mask_ptrs + start_n, mask=start_n + offs_n < cur_batch_end_loc, other=0.0)
 
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-        qk += tl.dot(q, k)
+        qk = tl.dot(q, k, acc=qk)
         qk *= sm_scale
 
         if IS_CAUSAL:
@@ -159,7 +160,7 @@ def _fwd_kernel(
         )
 
         p = p.to(v.dtype)
-        acc += tl.dot(p, v)
+        acc = tl.dot(p, v, acc=acc)
         # update m_i and l_i
         l_i = l_i_new
         m_i = m_i_new

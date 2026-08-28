@@ -3,6 +3,7 @@
 
 import triton
 import triton.language as tl
+
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
 # This code is derived from sglang and FLASHNN projects
@@ -280,7 +281,7 @@ def _paged_attn_decode_v1_w_dot_kernel(
         v = v.to(compute_type)
 
         p = p.to(v.dtype)
-        acc += tl.dot(p, v, out_dtype=tl.float32)
+        acc = tl.dot(p, v, out_dtype=tl.float32, acc=acc)
 
         exp_sum = exp_sum * alpha + tl.sum(p, axis=1)
         max_logit = max_logit_new
@@ -705,7 +706,7 @@ def _paged_attn_decode_v2_w_dot_kernel(
         v = v.to(compute_type)
 
         p = p.to(v.dtype)
-        acc += tl.dot(p, v, out_dtype=tl.float32)
+        acc = tl.dot(p, v, out_dtype=tl.float32, acc=acc)
 
         exp_sum = exp_sum * alpha + tl.sum(p, axis=1)
         max_logit = max_logit_new
@@ -1132,7 +1133,7 @@ def _paged_attn_decode_v1_w_dot_kernel_per_token_quant(
         v = v.to(compute_type)
 
         p = p.to(v.dtype)
-        acc += tl.dot(p, v, out_dtype=tl.float32)
+        acc = tl.dot(p, v, out_dtype=tl.float32, acc=acc)
 
         exp_sum = exp_sum * alpha + tl.sum(p, axis=1)
         max_logit = max_logit_new
@@ -1580,7 +1581,7 @@ def _paged_attn_decode_v2_w_dot_kernel_per_token_quant(
         v = v.to(compute_type)
 
         p = p.to(v.dtype)
-        acc += tl.dot(p, v, out_dtype=tl.float32)
+        acc = tl.dot(p, v, out_dtype=tl.float32, acc=acc)
 
         exp_sum = exp_sum * alpha + tl.sum(p, axis=1)
         max_logit = max_logit_new

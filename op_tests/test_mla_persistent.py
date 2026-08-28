@@ -1,26 +1,28 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import torch
-import aiter
-from aiter.jit.utils.chip_info import get_gfx
-from aiter.test_common import checkAllclose, benchmark, run_perftest
-from aiter import dtypes
-import random
-import itertools
 import argparse
-import pandas as pd
+import itertools
 import math
 import os
+import random
 from pathlib import Path
-from typing import Union
+
+import pandas as pd
+import torch
+
+import aiter
+from aiter import dtypes
+from aiter.jit.core import is_experimental_enabled
+from aiter.jit.utils.chip_info import get_gfx
+from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 torch.set_default_device("cuda")
 torch.set_printoptions(sci_mode=False)
 
 
 def dump_mla_metadata_v1_txt(
-    filepath: Union[str, Path],
+    filepath: str | Path,
     *,
     batch: int,
     q_seq_len: int,
@@ -63,8 +65,10 @@ def dump_mla_metadata_v1_txt(
     work_ind_line = " ".join(f"{int(v):>{w}}" for v in wi)
 
     lines = [
-        f"batch:{batch}, q_seq_len:{q_seq_len}, max_num_blocks:{max_num_blocks}, "
-        f"work_q:{work_q}, work_kv:{work_kv}, total_tgs:{total_tgs}\n",
+        (
+            f"batch:{batch}, q_seq_len:{q_seq_len}, max_num_blocks:{max_num_blocks}, "
+            f"work_q:{work_q}, work_kv:{work_kv}, total_tgs:{total_tgs}\n"
+        ),
         line_for("bs_indptr", lambda r: int(r[0].item())),
         line_for("partial_indptr", lambda r: int(r[1].item())),
         line_for("w_q_start", lambda r: int(r[2].item())),
@@ -86,9 +90,7 @@ def dump_mla_metadata_v1_txt(
 def check_support(dtype, kv_dtype, nhead):
     if dtype == dtypes.fp8 and kv_dtype == dtypes.bf16:
         return False
-    if dtype == dtypes.bf16 and nhead == 32 and get_gfx() == "gfx942":
-        return False
-    return True
+    return not (dtype == dtypes.bf16 and nhead == 32 and get_gfx() == "gfx942")
 
 
 def init_3buffer_kv_cache(
@@ -141,9 +143,12 @@ def init_3buffer_kv_cache(
     scale_indices = torch.randint(
         0, len(scale_values), size=(num_page, page_size, 1, scale_dim)
     )
-    kv_nope_scale_factors_fp32 = torch.tensor(
-        [scale_values[idx] for idx in scale_indices.flatten()], dtype=torch.float32
-    ).reshape(num_page, page_size, 1, scale_dim)
+    # Vectorized gather (avoid a per-element Python loop over a CUDA tensor,
+    # which is catastrophically slow for large num_page, e.g. b=256 c=81920).
+    _scale_values_t = torch.tensor(
+        scale_values, dtype=torch.float32, device=scale_indices.device
+    )
+    kv_nope_scale_factors_fp32 = _scale_values_t[scale_indices].to(torch.float32)
 
     # Apply per-channel scaling and quantize to FP8
     kv_nope_scaled_buffer = kv_nope_buffer_fp32.reshape(
@@ -160,6 +165,60 @@ def init_3buffer_kv_cache(
         kv_nope_scale_factors_fp32,
         kv_rope_buffer_bf16,
         kv_nope_buffer_fp32,
+    )
+
+
+def init_3buffer_q_buffer(
+    total_q_len: int,
+    nhead: int,
+    qk_nope_head_dim: int,
+    qk_rope_head_dim: int,
+    scale_dim: int,
+) -> tuple:
+
+    assert (
+        qk_nope_head_dim % scale_dim == 0
+    ), f"qk_nope_head_dim ({qk_nope_head_dim}) must be divisible by scale_dim ({scale_dim})"
+
+    q_nope_buffer_fp32 = torch.randn(
+        (total_q_len, nhead, qk_nope_head_dim), dtype=torch.float32
+    )
+    q_rope_buffer_bf16 = torch.randn(
+        (total_q_len, nhead, qk_rope_head_dim),
+        dtype=torch.bfloat16,
+    )
+
+    # Create full Q buffer (for golden reference without quantization)
+    q_buffer = torch.cat(
+        [q_nope_buffer_fp32.to(torch.bfloat16), q_rope_buffer_bf16], dim=-1
+    )
+
+    # Generate random scale factors
+    scale_values = [1.0, 2.0, 4.0, 8.0]
+    # scale_values = [1.0, 1.0, 1.0, 1.0]
+    scale_indices = torch.randint(
+        0, len(scale_values), size=(total_q_len, nhead, scale_dim)
+    )
+    _scale_values_t = torch.tensor(
+        scale_values, dtype=torch.float32, device=scale_indices.device
+    )
+    q_nope_scale_factors_fp32 = _scale_values_t[scale_indices].to(torch.float32)
+
+    # Apply per-channel scaling and quantize to FP8
+    q_nope_scaled_buffer = q_nope_buffer_fp32.reshape(
+        total_q_len, nhead, scale_dim, qk_nope_head_dim // scale_dim
+    ) / q_nope_scale_factors_fp32.reshape(total_q_len, nhead, scale_dim, 1)
+
+    q_nope_buffer_fp8 = q_nope_scaled_buffer.reshape(
+        total_q_len, nhead, qk_nope_head_dim
+    ).to(dtypes.fp8)
+
+    return (
+        q_buffer,
+        q_nope_buffer_fp8,
+        q_nope_scale_factors_fp32,
+        q_rope_buffer_bf16,
+        q_nope_buffer_fp32,
     )
 
 
@@ -241,8 +300,6 @@ def cal_diff(
     x, y = x.double(), y.double()
     # RMSE = ((x - y) * (x - y)).mean().sqrt().item()
     cos_diff = 1 - 2 * (x * y).sum().item() / max((x * x + y * y).sum().item(), 1e-12)
-    # amax_diff = (x - y).abs().max().item()
-    # print(f"{name}: {cos_diff=}, {RMSE=}, {amax_diff=}")
     if use_fp8:
         assert cos_diff < 3e-2
     else:
@@ -281,7 +338,7 @@ def ref_masked_attention(
     lse = attn_weights.logsumexp(dim=-1)
     m = attn_weights.max(-1).values
     attn_weights_exp = torch.exp(attn_weights - m.unsqueeze(-1))
-    l = attn_weights_exp.sum(-1)  # noqa: E741
+    l = attn_weights_exp.sum(-1)
     if is_fp8_q:
         attn_weights_fp8 = attn_weights_exp.to(dtypes.fp8)
         attn_weights_exp = attn_weights_fp8.to(torch.float)
@@ -363,7 +420,7 @@ def torch_mla_extend(
     q_scale=None,
     kv_scale=None,
 ):
-    num_page, page_size, nhead_kv, _ = kvc_cache.shape
+    _num_page, page_size, _nhead_kv, _ = kvc_cache.shape
     is_fp8_q = q.dtype == dtypes.fp8
     is_fp8_kvc = kvc_cache.dtype == dtypes.fp8
 
@@ -407,6 +464,103 @@ def torch_mla_extend(
     return o, lse
 
 
+def _ds32_to_e8m0(s):
+    """Convert per-block scale factors to the E8M0 exponent byte the ds_32 kernel
+    expects. Accepts uint8 (already E8M0) or float (factor -> exponent byte)."""
+    if s is None or s.dtype == torch.uint8:
+        return s
+    return (
+        ((s.to(torch.float32).view(torch.int32) >> 23) & 0xFF)
+        .to(torch.uint8)
+        .contiguous()
+    )
+
+
+def torch_mla_extend_ds32(
+    q_nope_fp8,  # [total_q, nhead,   kv_lora_rank]      fp8
+    q_rope_bf16,  # [total_q, nhead,   qk_rope_head_dim]  bf16
+    kv_nope_fp8,  # [num_page, page_size, nhead_kv, kv_lora_rank]     fp8
+    kv_rope_bf16,  # [num_page, page_size, nhead_kv, qk_rope_head_dim] bf16
+    q_scale,  # [total_q, nhead,   scale_dim]
+    kv_scale,  # [num_page, page_size, nhead_kv, scale_dim]
+    qo_indptr,
+    kv_indptr,
+    kv_indices,
+    kv_last_page_lens,
+    page_size,
+    nhead_kv,
+    sm_scale,
+    kv_lora_rank,
+    qk_rope_head_dim,
+    dtype,
+    is_causal=True,
+    scale_dim=4,
+):
+    """DSA v3.2 (ds_32) golden reference. Extends torch_mla_extend by dequantizing
+    the split fp8-NoPE / bf16-RoPE Q and KV buffers per the dsa_v32_splitkv.hpp
+    formulas, then delegating the attention itself to torch_mla_extend.
+
+    Dequant (dsa_v32_splitkv.hpp): each 32-wide NoPE block d is scaled by its
+    E8M0/fp32 factor -> x_deq = x_fp8 * scale[block]. QK^T uses the full
+    [NoPE_deq | RoPE] vector (D_QK = kv_lora_rank + qk_rope_head_dim); softmax is
+    scaled by sm_scale; V is the dequantized NoPE part only (D_V = kv_lora_rank).
+    """
+    total_q, nhead = q_nope_fp8.shape[0], q_nope_fp8.shape[1]
+    num_page = kv_nope_fp8.shape[0]
+
+    # Accept E8M0 exponent bytes (kernel format) or fp32 factors. E8M0 byte b
+    # represents the power-of-two factor 2^(b-127); this matches the kernel's
+    # `bit_cast<float>(e8m0 << 23)` dequant so the ref aligns with out_ref.
+    def _scale_to_factor(s):
+        if s.dtype == torch.uint8:
+            return torch.exp2(s.to(torch.float32) - 127.0)
+        return s.to(torch.float32)
+
+    q_scale = _scale_to_factor(q_scale)
+    kv_scale = _scale_to_factor(kv_scale)
+
+    # --- Dequantize Q: NoPE_fp8 * per-block scale, then concat RoPE ---
+    q_nope_deq = (
+        (
+            q_nope_fp8.to(torch.float32).reshape(total_q, nhead, scale_dim, -1)
+            * q_scale.reshape(total_q, nhead, scale_dim, 1)
+        )
+        .reshape(total_q, nhead, kv_lora_rank)
+        .to(torch.bfloat16)
+    )
+    q = torch.cat([q_nope_deq, q_rope_bf16], dim=-1)  # [total_q, nhead, D_QK]
+
+    # --- Dequantize KV: NoPE_fp8 * per-block scale, then concat RoPE ---
+    kv_nope_deq = (
+        (
+            kv_nope_fp8.to(torch.float32).reshape(
+                num_page, page_size, nhead_kv, scale_dim, -1
+            )
+            * kv_scale.reshape(num_page, page_size, nhead_kv, scale_dim, 1)
+        )
+        .reshape(num_page, page_size, nhead_kv, kv_lora_rank)
+        .to(torch.bfloat16)
+    )
+    kvc_cache = torch.cat(
+        [kv_nope_deq, kv_rope_bf16], dim=-1
+    )  # [num_page, page_size, nhead_kv, D_QK]
+
+    # Attention (QK over D_QK, softmax*sm_scale, V = NoPE part) via the base path.
+    return torch_mla_extend(
+        q,
+        kvc_cache,
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        kv_last_page_lens,
+        sm_scale,
+        kv_lora_rank,
+        qk_rope_head_dim,
+        dtype,
+        is_causal,
+    )
+
+
 def torch_mla_extend_split_kv(
     q,  # [total_q, nheads, headdim_q]
     kvc_cache,  # [num_page, page_size, nhead_kv, qk_head_dim]
@@ -427,7 +581,7 @@ def torch_mla_extend_split_kv(
     kv_scale=None,
 ):
 
-    num_page, page_size, nhead_kv, _ = kvc_cache.shape
+    _num_page, page_size, _nhead_kv, _ = kvc_cache.shape
     total_q, nheads, _ = q.shape
     dev = kvc_cache.device
     is_fp8_q = q.dtype == dtypes.fp8
@@ -442,30 +596,29 @@ def torch_mla_extend_split_kv(
     kvc = torch.index_select(kvc_cache, 0, kv_indices)
     kvs = torch.tensor_split(kvc, kv_indptr.tolist()[1:])
     num_works = work_indptr[-1].item()
-    partial_os = []
-    partial_lses = []
+    partial_records = []  # (partial_qo_loc, o, lse) for kv-split (partial) works
     final_out = torch.empty(total_q, nheads, kv_lora_rank, dtype=dtype, device=dev)
     final_lse = torch.empty(total_q, nheads, dtype=torch.float32, device=dev)
 
     io_transformed = False
-    use_qseqlen_fold = False
     q_ratio = 1
     if (
         nheads == 16
         or (get_gfx() == "gfx942" and nheads == 128 and is_fp8_q and is_fp8_kvc)
         or (
             get_gfx() == "gfx950"
-            and nheads == 32
+            and nheads == 128
             and is_fp8_q
             and is_fp8_kvc
-            and max_seqlen_q == 4
+            and is_experimental_enabled()
         )
         or (
-            get_gfx() == "gfx950"
-            and nheads == 32
+            get_gfx() == "gfx942"
+            and nheads in (16, 32, 64)
+            and nheads * max_seqlen_q == 128
             and is_fp8_q
             and is_fp8_kvc
-            and max_seqlen_q == 2
+            and is_experimental_enabled()
         )
         or (
             get_gfx() == "gfx950"
@@ -482,17 +635,26 @@ def torch_mla_extend_split_kv(
             and max_seqlen_q == 2
         )
         or (
+            # fp8/fp8 PS GQA catch-all -- mirrors aiter/mla.py / asm_mla.cu
             get_gfx() == "gfx950"
+            and is_fp8_q
+            and is_fp8_kvc
+            and ((nheads == 32) or (nheads == 64) or (nheads == 128))
+        )
+        or (
+            get_gfx() == "gfx942"
             and nheads == 64
             and is_fp8_q
             and is_fp8_kvc
             and max_seqlen_q == 1
         )
+        or (get_gfx() == "gfx950" and not is_fp8_q and not is_fp8_kvc)
         or (
             get_gfx() == "gfx950"
-            and (nheads * max_seqlen_q) % 128 == 0
-            and not is_fp8_q
-            and not is_fp8_kvc
+            and nheads == 96
+            and is_fp8_q
+            and is_fp8_kvc
+            and max_seqlen_q <= 6
         )
     ):
         # Natively support cases
@@ -501,29 +663,11 @@ def torch_mla_extend_split_kv(
         # we use nhead=16 to simulate such cases by customized metadata
         # metadata also views qo's tensor as shape (total_s * (nhead // 16), 16, ...)
         ori_nheads = nheads
-        use_qseqlen_fold = (
-            get_gfx() == "gfx950"
-            and is_fp8_q
-            and is_fp8_kvc
-            and (
-                (max_seqlen_q * (nheads // 16)) == 4
-                or (nheads == 64 and max_seqlen_q == 2)
-            )
-        )
 
-        if use_qseqlen_fold and nheads == 64 and max_seqlen_q == 2:
-            fold_factor = nheads // 32
-            nheads = 32
-        else:
-            fold_factor = nheads // 16
-            nheads = 16
-
+        fold_factor = nheads // 16
+        nheads = 16
         total_s = total_q * fold_factor
-        if use_qseqlen_fold:
-            max_seqlen_q = max_seqlen_q * fold_factor
-            q_ratio = 1
-            q = q.view(total_s, nheads, -1)
-        elif max_seqlen_q == 1:
+        if max_seqlen_q == 1:
             q_ratio = fold_factor
             q = q.view(total_s, nheads, -1)
         else:
@@ -577,9 +721,21 @@ def torch_mla_extend_split_kv(
         # For a split chunk, we need to account for the position offsets of Q and KV within the batch
         causal_diagonal = None
         if is_causal:
-            q_local_start = qo_start - qo_indptr[batch_idx].item()
+            if q_ratio > 1:
+                # Folded head layout: qo_start/qo_end index the folded token
+                # space, where every (batch, head-group) pair is its own batch of
+                # max_seqlen_q tokens starting at row[0] * max_seqlen_q. qo_indptr
+                # only describes the unfolded batches, so measuring the query
+                # offset against it shifts the diagonal by head_group *
+                # max_seqlen_q for every group past the first.
+                q_local_start = qo_start - row[0].item() * max_seqlen_q
+                total_q_len = max_seqlen_q
+            else:
+                q_local_start = qo_start - qo_indptr[batch_idx].item()
+                total_q_len = (
+                    qo_indptr[batch_idx + 1].item() - qo_indptr[batch_idx].item()
+                )
             kv_local_start = (kv_start - kv_indptr[batch_idx].item()) * page_size
-            total_q_len = qo_indptr[batch_idx + 1].item() - qo_indptr[batch_idx].item()
             causal_diagonal = (
                 q_local_start - kv_local_start + cur_real_kv_seq_len - total_q_len
             )
@@ -602,19 +758,24 @@ def torch_mla_extend_split_kv(
             final_out[qo_start:qo_end, :, :] = o
             final_lse[qo_start:qo_end, :] = lse.transpose(0, 1)  # [seq_q, num_heads]
         else:
-            partial_os.append(o)
-            partial_lses.append(lse)
+            partial_records.append((partial_qo_loc, o, lse))
 
-    partial_o = (
-        torch.concat(partial_os)
-        if partial_os
-        else torch.empty(0, nheads, qk_rope_head_dim, dtype=torch.float32, device=dev)
-    )
-    partial_lse = (
-        torch.concat(partial_lses, dim=1).transpose(0, 1)
-        if partial_lses
-        else torch.empty(0, nheads, dtype=torch.float32, device=dev)
-    )
+    if partial_records:
+        dv = partial_records[0][1].shape[-1]
+        buf_rows = max(loc + o.shape[0] for loc, o, _ in partial_records)
+        partial_o = torch.zeros(buf_rows, nheads, dv, dtype=torch.float32, device=dev)
+        partial_lse = torch.full(
+            (buf_rows, nheads), float("-inf"), dtype=torch.float32, device=dev
+        )
+        for loc, o, lse in partial_records:
+            n = o.shape[0]
+            partial_o[loc : loc + n] = o.to(torch.float32)
+            partial_lse[loc : loc + n] = lse.transpose(0, 1).to(torch.float32)
+    else:
+        partial_o = torch.empty(
+            0, nheads, kv_lora_rank, dtype=torch.float32, device=dev
+        )
+        partial_lse = torch.empty(0, nheads, dtype=torch.float32, device=dev)
     partial_o = torch.where(
         torch.isnan(partial_o), torch.zeros_like(partial_o), partial_o
     )
@@ -625,14 +786,7 @@ def torch_mla_extend_split_kv(
         partial_lse,
     )
 
-    return (
-        partial_o,
-        partial_lse,
-        final_out,
-        final_lse,
-        io_transformed,
-        use_qseqlen_fold,
-    )
+    return (partial_o, partial_lse, final_out, final_lse, io_transformed)
 
 
 def torch_mla_reduce_v1(
@@ -806,7 +960,7 @@ def torch_mla_split_kv_and_reduce(
     kv_scale=None,
 ):
     total_q, nhead, _ = q.shape
-    partial_out, partial_lse, split_out, split_lse, io_transformed, use_qseqlen_fold = (
+    partial_out, partial_lse, split_out, split_lse, io_transformed = (
         torch_mla_extend_split_kv(
             q,
             kv_cache,
@@ -840,7 +994,7 @@ def torch_mla_split_kv_and_reduce(
     )
 
     if io_transformed:
-        if max_seqlen_q == 1 or use_qseqlen_fold:
+        if max_seqlen_q == 1:
             split_out = split_out.reshape(total_q, nhead, kv_lora_rank)
             split_lse = split_lse.reshape(total_q, nhead)
         else:
@@ -960,6 +1114,7 @@ def test_mla(
     paged_layout,
     scale_dim,
     return_lse,
+    causal,
 ):
     ret = {}
 
@@ -997,8 +1152,16 @@ def test_mla(
             kv_last_page_lens.fill_(ctx_lens % page_size)
 
     kv_indptr[1 : batch_size + 1] = torch.cumsum(kv_block_nums, dim=0)
-    num_page = kv_indptr[-1].item()
-    kv_indices = torch.randperm(num_page, dtype=torch.int)
+    if os.environ.get("DS32_DENSE_KV"):
+        assert not varlen, "DS32_DENSE_KV requires uniform seqlen (drop --varlen)"
+        pages_per_batch = int(kv_block_nums[0].item())
+        num_page = pages_per_batch
+        kv_indices = (
+            torch.arange(num_page, dtype=torch.int).repeat(batch_size).contiguous()
+        )
+    else:
+        num_page = kv_indptr[-1].item()
+        kv_indices = torch.randperm(num_page, dtype=torch.int)
     qo_indptr[1 : batch_size + 1] = torch.cumsum(seq_lens_qo, dim=0)
     max_seqlen_qo = seq_lens_qo.max().item()
     # max_seqlen_kv = seq_lens_kv.max().item()
@@ -1014,7 +1177,7 @@ def test_mla(
     kv_nope_buffer_fp8 = None
     kv_rope_buffer_bf16 = None
 
-    if paged_layout == "3BUFFER":
+    if paged_layout == "3BUFFER" or paged_layout == "DS32_OPUS":
         (
             kv_buffer,
             kv_nope_buffer_fp8,
@@ -1045,6 +1208,17 @@ def test_mla(
     qo_indptr[1 : batch_size + 1] = torch.cumsum(seq_lens_qo, dim=0)
     total_q = qo_indptr[-1].item()
     q = torch.randn((total_q, nhead, qk_head_dim), dtype=torch.bfloat16)
+    if paged_layout == "DS32_OPUS":
+        (
+            q,
+            q_nope_buffer_fp8,
+            q_nope_scale_factors_fp32,
+            q_rope_buffer_bf16,
+            _,
+        ) = init_3buffer_q_buffer(
+            total_q, nhead, qk_nope_head_dim, qk_rope_head_dim, scale_dim
+        )
+
     # troch implementation
     out_ref, lse_ref = torch_mla_extend(
         q,
@@ -1056,7 +1230,7 @@ def test_mla(
         sm_scale,
         kv_lora_rank,
         qk_rope_head_dim,
-        is_causal=True,
+        is_causal=causal,
         dtype=out_dtype,
     )
 
@@ -1084,7 +1258,7 @@ def test_mla(
         dtype,
         kvtype,
         is_sparse=False,
-        fast_mode=True if not non_persistent_mode else False,
+        fast_mode=bool(not non_persistent_mode),
         num_kv_splits=max_split_per_batch,
         intra_batch_mode=non_persistent_mode,
     )
@@ -1116,21 +1290,31 @@ def test_mla(
         kv_last_page_lens,
         nhead // nhead_kv,
         nhead_kv,
-        False,
+        causal,
         work_meta_data,
         work_info_set,
         work_indptr,
         reduce_indptr,
         reduce_final_map,
         reduce_partial_map,
-        kv_granularity=max(page_size, 16),  # for qh32 kv split is disabled
+        page_size=page_size,
+        kv_granularity=max(
+            page_size,
+            # QH64 fp8/fp8 native PS kernel is a SUB_KV=32 partial producer; 16-token
+            # works trip its multi-pass path (see asm/mla_a8w8_qh64_ps*.py SUB_KV=32).
+            (
+                32
+                if (nhead == 64 and dtype == dtypes.fp8 and kvtype == dtypes.fp8)
+                else 16
+            ),
+        ),  # for qh32 kv split is disabled
         max_seqlen_qo=int(max_seqlen_qo),
         uni_seqlen_qo=decode_qlen,
-        fast_mode=True if not non_persistent_mode else False,
+        fast_mode=bool(not non_persistent_mode),
         max_split_per_batch=max_split_per_batch,
         intra_batch_mode=non_persistent_mode,
-        dtype_q=dtype,
-        dtype_kv=kvtype,
+        dtype_q_nope=dtype,
+        dtype_kv_nope=kvtype,
     )
 
     if os.environ.get("DUMP_MLA_METADATA", ""):
@@ -1160,7 +1344,7 @@ def test_mla(
     # torch.set_printoptions(linewidth=200)
     # print(f"{kv_indptr=}")
     # print(f"{work_indptr=}")
-    # print(f"{work_info_set[:work_indptr[-1].item()]=}")
+    # print(f"{work_info_set[:32]}")
     # print(f"{reduce_indptr=}")
     # print(f"{reduce_final_map=}")
     # print(f"{reduce_partial_map=}")
@@ -1211,7 +1395,7 @@ def test_mla(
         kv_buffer_fp8 = kv_buffer.to(kvtype)
         kv_scale = torch.ones([1], dtype=torch.float, device="cuda")
 
-        out_ref_fp8, lse_ref_fp8 = torch_mla_extend(
+        out_ref_fp8, _lse_ref_fp8 = torch_mla_extend(
             q,
             kv_buffer_fp8,
             qo_indptr,
@@ -1222,12 +1406,12 @@ def test_mla(
             kv_lora_rank,
             qk_rope_head_dim,
             dtype=out_dtype,
-            is_causal=True,
+            is_causal=causal,
             q_scale=None,
             kv_scale=kv_scale,
         )
 
-        (attn_logits, attn_lse), us_asm_decode = run_perftest(
+        (attn_logits, _attn_lse), us_asm_decode = run_perftest(
             aiter.mla.mla_decode_fwd,
             q,
             kv_buffer_fp8.view(num_page, page_size, nhead_kv, qk_head_dim),
@@ -1249,6 +1433,7 @@ def test_mla(
             reduce_partial_map=reduce_partial_map,
             intra_batch_mode=non_persistent_mode,
             kv_scale=kv_scale,
+            causal=causal,
         )
 
         err = checkAllclose(
@@ -1263,7 +1448,7 @@ def test_mla(
         )
 
         if not non_persistent_mode:
-            partial_out_ref, partial_lse_ref, split_out_ref, split_lse_ref = (
+            partial_out_ref, _partial_lse_ref, split_out_ref, _split_lse_ref = (
                 torch_mla_split_kv_and_reduce(
                     q,
                     kv_buffer_fp8,
@@ -1282,7 +1467,7 @@ def test_mla(
                     reduce_final_map=reduce_final_map,
                     reduce_partial_map=reduce_partial_map,
                     max_seqlen_q=max_seqlen_qo,
-                    is_causal=True,
+                    is_causal=causal,
                     q_scale=None,
                     kv_scale=kv_scale,
                 )
@@ -1325,6 +1510,8 @@ def test_mla(
             reduce_final_map=reduce_final_map,
             reduce_partial_map=reduce_partial_map,
             intra_batch_mode=non_persistent_mode,
+            return_lse=return_lse,
+            causal=causal,
         )
 
         err = checkAllclose(
@@ -1332,8 +1519,14 @@ def test_mla(
             out_asm,
             msg=f"mla_decode-absorb    [golden vs aiter_asm]: {us_asm_decode:>8.2f} us......",
         )
+        if not non_persistent_mode and return_lse:
+            checkAllclose(
+                lse_ref,
+                attn_lse.reshape(total_q, nhead),
+                msg=f"mla_decode-absorb    [lse_ref vs attn_lse]: {us_asm_decode:>8.2f} us......",
+            )
         if not non_persistent_mode:
-            partial_out_ref, partial_lse_ref, split_out_ref, split_lse_ref = (
+            partial_out_ref, _partial_lse_ref, split_out_ref, _split_lse_ref = (
                 torch_mla_split_kv_and_reduce(
                     q,
                     kv_buffer,
@@ -1352,25 +1545,27 @@ def test_mla(
                     reduce_final_map=reduce_final_map,
                     reduce_partial_map=reduce_partial_map,
                     max_seqlen_q=max_seqlen_qo,
-                    is_causal=True,
+                    is_causal=causal,
                 )
             )
 
             checkAllclose(
                 split_out_ref,
                 out_asm,
-                msg=f"mla_decode-absorb_fp8    [golden fp8 split_out_ref vs aiter_asm]: {us_asm_decode:>8.2f} us......",
+                msg=f"mla_decode-absorb    [golden split_out_ref vs aiter_asm]: {us_asm_decode:>8.2f} us......",
             )
             if partial_out_ref.shape[0] > 0:
                 checkAllclose(
                     partial_out_ref,
                     attn_logits[: partial_out_ref.shape[0]].flatten(0, 1),
-                    msg=f"mla_decode-absorb_fp8    [partial_out_ref vs attn_logits]: {us_asm_decode:>8.2f} us......",
+                    msg=f"mla_decode-absorb    [partial_out_ref vs attn_logits]: {us_asm_decode:>8.2f} us......",
                 )
         return err, us_asm_decode
 
     def test_absorb_decode_fp8():
-        kv_last_page_lens = torch.ones(batch_size, dtype=torch.int)
+        # Use the kv_last_page_lens computed in the outer scope (varlen / ctx_lens
+        # aware). The previous unconditional ones() overwrite was correct only
+        # for page_size == 1.
         out_asm = torch.empty((total_q, nhead, v_head_dim), dtype=out_dtype).fill_(-1)
 
         q_fp8 = q.to(dtypes.fp8)
@@ -1379,7 +1574,7 @@ def test_mla(
         kv_buffer_fp8 = kv_buffer.to(dtypes.fp8)
         kv_scale = torch.ones([1], dtype=torch.float, device="cuda")
 
-        out_ref_fp8, lse_ref_fp8 = torch_mla_extend(
+        out_ref_fp8, _lse_ref_fp8 = torch_mla_extend(
             q_fp8 if dtype == dtypes.fp8 else q,
             kv_buffer_fp8,
             qo_indptr,
@@ -1390,7 +1585,7 @@ def test_mla(
             kv_lora_rank,
             qk_rope_head_dim,
             dtype=out_dtype,
-            is_causal=True,
+            is_causal=causal,
             q_scale=None,
             kv_scale=kv_scale,
         )
@@ -1419,6 +1614,7 @@ def test_mla(
             reduce_partial_map=reduce_partial_map,
             intra_batch_mode=non_persistent_mode,
             return_lse=return_lse,
+            causal=causal,
         )
 
         err = checkAllclose(
@@ -1440,7 +1636,7 @@ def test_mla(
         )
 
         if not non_persistent_mode:
-            partial_out_ref, partial_lse_ref, split_out_ref, split_lse_ref = (
+            partial_out_ref, _partial_lse_ref, split_out_ref, _split_lse_ref = (
                 torch_mla_split_kv_and_reduce(
                     q_fp8 if dtype == dtypes.fp8 else q,
                     kv_buffer_fp8,
@@ -1459,7 +1655,7 @@ def test_mla(
                     reduce_final_map=reduce_final_map,
                     reduce_partial_map=reduce_partial_map,
                     max_seqlen_q=max_seqlen_qo,
-                    is_causal=True,
+                    is_causal=causal,
                     q_scale=q_scale,
                     kv_scale=kv_scale,
                 )
@@ -1494,7 +1690,7 @@ def test_mla(
             dim=-1,
         )
 
-        out_ref_fp8, lse_ref_fp8 = torch_mla_extend_3buffer(
+        out_ref_fp8, _lse_ref_fp8 = torch_mla_extend_3buffer(
             q,
             kv_buffer_bytes,
             qo_indptr,
@@ -1507,7 +1703,7 @@ def test_mla(
             kv_lora_rank,
             qk_rope_head_dim,
             dtype=out_dtype,
-            is_causal=True,
+            is_causal=causal,
             scale_dim=scale_dim,
         )
 
@@ -1517,7 +1713,7 @@ def test_mla(
             msg="mla_decode-absorb_fp8    [golden fp8 vs golden]:......",
         )
 
-        (attn_logits, attn_lse), us_asm_decode = run_perftest(
+        (attn_logits, _attn_lse), us_asm_decode = run_perftest(
             aiter.mla.mla_decode_fwd,
             q,
             kv_buffer_bytes,
@@ -1538,6 +1734,7 @@ def test_mla(
             reduce_final_map=reduce_final_map,
             reduce_partial_map=reduce_partial_map,
             intra_batch_mode=non_persistent_mode,
+            causal=causal,
         )
 
         err = checkAllclose(
@@ -1552,7 +1749,7 @@ def test_mla(
         )
 
         if not non_persistent_mode:
-            partial_out_ref, partial_lse_ref, split_out_ref, split_lse_ref = (
+            partial_out_ref, _partial_lse_ref, split_out_ref, _split_lse_ref = (
                 torch_mla_extend_3buffer_split_kv_and_reduce(
                     q,
                     kv_buffer_bytes,
@@ -1573,7 +1770,7 @@ def test_mla(
                     reduce_final_map=reduce_final_map,
                     reduce_partial_map=reduce_partial_map,
                     max_seqlen_q=max_seqlen_qo,
-                    is_causal=True,
+                    is_causal=causal,
                     scale_dim=scale_dim,
                 )
             )
@@ -1594,11 +1791,87 @@ def test_mla(
         cal_diff(out_ref, out_asm, "out", True)
         return err, us_asm_decode
 
+    def test_absorb_decode_ds32_opus():
+
+        out_asm = torch.empty((total_q, nhead, v_head_dim), dtype=out_dtype).fill_(-1)
+        q_scale_e8m0 = _ds32_to_e8m0(q_nope_scale_factors_fp32)
+        kv_scale_e8m0 = _ds32_to_e8m0(kv_nope_scale_factors_fp32)
+        out_ref_fp8, _lse_ref_fp8 = torch_mla_extend_ds32(
+            q_nope_buffer_fp8,
+            q_rope_buffer_bf16,
+            kv_nope_buffer_fp8,
+            kv_rope_buffer_bf16,
+            q_scale_e8m0,
+            kv_scale_e8m0,
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            kv_last_page_lens,
+            page_size,
+            nhead_kv,
+            sm_scale,
+            kv_lora_rank,
+            qk_rope_head_dim,
+            dtype=out_dtype,
+            is_causal=True,
+            scale_dim=scale_dim,
+        )
+
+        err = checkAllclose(
+            out_ref,
+            out_ref_fp8,
+            msg="mla_decode-absorb_fp8    [golden fp8 vs golden]:......",
+        )
+        us_asm_decode = 1e12
+
+        (_attn_logits, _attn_lse), us_asm_decode = run_perftest(
+            aiter.mla.mla_decode_fwd_ds32,
+            q_nope_buffer_fp8,
+            q_rope_buffer_bf16,
+            kv_nope_buffer_fp8,
+            kv_rope_buffer_bf16,
+            out_asm,
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            kv_last_page_lens,
+            max_seqlen_qo,
+            page_size,
+            nhead_kv,
+            sm_scale,
+            num_kv_splits=max_split_per_batch,
+            work_meta_data=work_meta_data,
+            work_indptr=work_indptr,
+            work_info_set=work_info_set,
+            reduce_indptr=reduce_indptr,
+            reduce_final_map=reduce_final_map,
+            reduce_partial_map=reduce_partial_map,
+            intra_batch_mode=non_persistent_mode,
+            q_scale=q_scale_e8m0,
+            kv_scale=kv_scale_e8m0,
+        )
+
+        err = checkAllclose(
+            out_ref,
+            out_asm,
+            msg=f"mla_decode-absorb_fp8    [golden vs aiter_asm]: {us_asm_decode:>8.2f} us......",
+        )
+        checkAllclose(
+            out_ref_fp8,
+            out_asm,
+            msg=f"mla_decode-absorb_fp8    [golden fp8 vs aiter_asm]: {us_asm_decode:>8.2f} us......",
+        )
+
+        cal_diff(out_ref, out_asm, "out", True)
+        return err, us_asm_decode
+
     err = None
     us_asm_decode = 1e12
 
     if paged_layout == "3BUFFER" and not non_persistent_mode:
         err, us_asm_decode = test_absorb_decode_3buffer()
+    elif paged_layout == "DS32_OPUS" and not non_persistent_mode:
+        err, us_asm_decode = test_absorb_decode_ds32_opus()
     elif dtype == torch.bfloat16 and kvtype == dtypes.fp8:
         err, us_asm_decode = test_absorb_decode_bf16_fp8()
     elif dtype == torch.bfloat16:
@@ -1744,7 +2017,7 @@ parser.add_argument(
     "-pl",
     "--paged_layout",
     type=str,
-    choices=["LEGACY", "3BUFFER"],
+    choices=["LEGACY", "3BUFFER", "DS32_OPUS"],
     default="LEGACY",
     help="""kv paged layout for persistent mode.
         LEGACY: kv buffer is common buffer with nope and rope parts.
@@ -1755,9 +2028,9 @@ parser.add_argument(
     "-sd",
     "--scale_dim",
     type=int,
-    default=4,
+    default=16,
     help="""scale dim.
-    e.g.: -sd 4""",
+    e.g.: -sd 16""",
 )
 parser.add_argument(
     "-lse",
@@ -1766,7 +2039,15 @@ parser.add_argument(
     help="""return lse. Default: False.
     --lse # True""",
 )
-
+parser.add_argument(
+    "--causal",
+    action=argparse.BooleanOptionalAction,
+    default=True,
+    help="""apply the causal mask across the decode_qlen query tokens. Default: True.
+    Only matters for decode_qlen > 1; --no-causal needs a non-masked (msk0)
+    kernel, which today exists for gfx950 bf16/bf16 persistent only.
+    e.g.: --no-causal""",
+)
 args = parser.parse_args()
 for nhead, decode_qlen in args.nhead:
     df = []
@@ -1792,6 +2073,7 @@ for nhead, decode_qlen in args.nhead:
                 paged_layout=args.paged_layout,
                 scale_dim=args.scale_dim,
                 return_lse=args.return_lse,
+                causal=args.causal,
             )
             df.append(ret)
     df = pd.DataFrame(df)

@@ -1,5 +1,6 @@
 import pytest
 import torch
+
 from aiter.ops.triton.topk import topk as triton_topk
 
 DEVICE = "cuda"
@@ -63,6 +64,7 @@ def TEST_assert_equal(*a, **kw):
 @pytest.mark.parametrize("dtype", FLOAT_DTYPES)
 def test_topk(batch_size, hiddensize, topk, largest, dtype):
     """Correctness check against torch.topk on small inputs."""
+    torch.manual_seed(0)
     x = torch.arange(hiddensize, dtype=dtype, device=DEVICE).repeat(batch_size, 1)
 
     # Per-row shuffle so every row has a distinct permutation

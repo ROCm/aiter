@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-from typing import Optional
 import torch
 import triton
+
+from aiter.ops.triton._triton_kernels.common.splitk_reduce import (
+    _gemm_splitk_reduce_kernel,
+)
 from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a8w8_per_token_scale import (
     _gemm_a8w8_per_token_scale_kernel,
-    _gemm_a8w8_per_token_scale_reduce_kernel,
     _get_config,
 )
 
@@ -16,8 +18,8 @@ def gemm_a8w8_per_token_scale(
     w: torch.Tensor,
     x_scale: torch.Tensor,
     w_scale: torch.Tensor,
-    dtype: Optional[float] = torch.bfloat16,
-    y: Optional[torch.Tensor] = None,
+    dtype: float | None = torch.bfloat16,
+    y: torch.Tensor | None = None,
     config=None,
 ):
     """
@@ -67,7 +69,7 @@ def gemm_a8w8_per_token_scale(
             config["BLOCK_SIZE_K"] = config["BLOCK_SIZE_K"] // 4
     config["BLOCK_SIZE_K"] = max(config["BLOCK_SIZE_K"], 16)
 
-    grid = lambda META: (  # noqa: E731
+    grid = lambda META: (
         (
             META["NUM_KSPLIT"]
             * triton.cdiv(M, META["BLOCK_SIZE_M"])
@@ -106,9 +108,10 @@ def gemm_a8w8_per_token_scale(
             triton.cdiv(M, REDUCE_BLOCK_SIZE_M),
             triton.cdiv(N, REDUCE_BLOCK_SIZE_N),
         )
-        _gemm_a8w8_per_token_scale_reduce_kernel[grid_reduce](
+        _gemm_splitk_reduce_kernel[grid_reduce](
             y_pp,
             y,
+            None,
             M,
             N,
             y_pp.stride(0),
@@ -120,6 +123,10 @@ def gemm_a8w8_per_token_scale(
             REDUCE_BLOCK_SIZE_N,
             ACTUAL_KSPLIT,
             triton.next_power_of_2(config["NUM_KSPLIT"]),
+            ADD_BIAS=False,
+            activation="",
+            use_activation=False,
+            KERNEL_NAME="_gemm_a8w8_per_token_scale_reduce_kernel",
         )
 
     return y

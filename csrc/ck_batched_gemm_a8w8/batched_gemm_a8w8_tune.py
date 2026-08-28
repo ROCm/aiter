@@ -1,12 +1,15 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-import aiter
+from typing import Any, ClassVar
+
 import torch
 import torch.nn.functional as F
+from batched_gemm_a8w8_common import kernels_list
+
+import aiter
 from aiter import dtypes
 from aiter.jit.core import AITER_CONFIG_A8W8_BATCHED_GEMM
 from aiter.utility.base_tuner import GemmCommonTuner
-from batched_gemm_a8w8_common import kernels_list
 from aiter.utility.mp_tuner import mp_tuner
 
 
@@ -17,10 +20,7 @@ def checkClose(a, b, rtol=1e-3, atol=0.01):
         return True
     else:
         percent = (a[mask]).numel() / a.numel()
-        if percent > 0.01:
-            return False
-        else:
-            return True
+        return not percent > 0.01
 
 
 def run_torch(x, weight, x_scale, w_scale, bias=None, dtype=dtypes.bf16):
@@ -49,12 +49,17 @@ def generate_data(b, m, n, k, device="cuda"):
     x_scale = torch.rand([b, m, 1], dtype=dtypes.bf16, device=device)
     w_scale = torch.rand([b, 1, n], dtype=dtypes.bf16, device=device)
     out = torch.empty(b, m, n, dtype=dtypes.bf16, device=device)
-    # index of data [0, 1, 2, 3, 4]
-    return x, weight, x_scale, w_scale, out
+    return {
+        "x": x,
+        "weight": weight,
+        "x_scale": x_scale,
+        "w_scale": w_scale,
+        "out": out,
+    }
 
 
 class BatchedGemma8W8Tuner(GemmCommonTuner):
-    ARG_DEFAULTS = {
+    ARG_DEFAULTS: ClassVar[dict[str, Any]] = {
         **GemmCommonTuner.ARG_DEFAULTS,
         "tune_file": f"{AITER_CONFIG_A8W8_BATCHED_GEMM}",
         "untune_file": "aiter/configs/a8w8_untuned_batched_gemm.csv",
@@ -76,18 +81,29 @@ class BatchedGemma8W8Tuner(GemmCommonTuner):
 
     def run_config(self, args):
         from aiter.ops.batched_gemm_op_a8w8 import batched_gemm_a8w8
-        from aiter.test_common import run_perftest, checkAllclose
+        from aiter.test_common import checkAllclose, run_perftest
 
         untunedf = self.untunedf
         results = []
         for i in range(len(untunedf)):
-            B = int(untunedf.loc[i, "B"])
-            M = int(untunedf.loc[i, "M"])
-            N = int(untunedf.loc[i, "N"])
-            K = int(untunedf.loc[i, "K"])
+            row = untunedf.iloc[i]
+            B = int(row["B"])
+            M = int(row["M"])
+            N = int(row["N"])
+            K = int(row["K"])
             shape_str = f"({B}, {M}, {N}, {K})"
+            allowed_err_ratio, allowed_err_ratio_desc = (
+                self._get_run_config_err_ratio_limit(row, args)
+            )
             try:
-                x, weight, x_scale, w_scale, out = generate_data(B, M, N, K)
+                gd = generate_data(B, M, N, K)
+                x, weight, x_scale, w_scale, out = (
+                    gd["x"],
+                    gd["weight"],
+                    gd["x_scale"],
+                    gd["w_scale"],
+                    gd["out"],
+                )
                 out, us = run_perftest(
                     batched_gemm_a8w8,
                     x,
@@ -102,22 +118,22 @@ class BatchedGemma8W8Tuner(GemmCommonTuner):
                 err_ratio = checkAllclose(out, ref, msg=f"run_config {shape_str}")
                 status = (
                     "ok"
-                    if err_ratio <= args.errRatio
-                    else f"mismatch:err_ratio={err_ratio:.4f}(>{args.errRatio})"
+                    if err_ratio <= allowed_err_ratio
+                    else f"mismatch:err_ratio={err_ratio:.6g}(>{allowed_err_ratio_desc})"
                 )
                 results.append({"shape": shape_str, "e2e_us": us, "status": status})
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 results.append(
                     {"shape": shape_str, "e2e_us": -1, "status": f"error:{e}"}
                 )
         return results
 
     def calculate(self, results, bpes=(1, 1, 2)):
-        info, time, err_ratio = results
+        info, time, _err_ratio = results
         if time == -1:
             return -1, -1
         print(info[0])
-        gfx, cu_num, b, m, n, k = info[0]
+        _gfx, _cu_num, b, m, n, k = info[0]
         flops = m * n * k * 2 * b
         tflops = round(flops / (time * 1000000), 2)
         lhs_bpe, rhs_bpe, out_bpe = bpes
@@ -185,20 +201,23 @@ class BatchedGemma8W8Tuner(GemmCommonTuner):
                             (B, M, N, K),
                             kernel_instance_test,
                             (
-                                [0, 1, 2, 3, 4],
+                                ["x", "weight", "x_scale", "w_scale", "out"],
                                 kid,
                                 splitK,
-                            ),  # [0, 1, 2, 3, 4] is index of paramters for kernel_instance_test in generate_data
+                            ),
                             {
                                 "num_warmup": args.warmup,
                                 "num_iters": args.iters,
                             },
                             run_torch,
-                            ([0, 1, 2, 3],),
+                            (["x", "weight", "x_scale", "w_scale"],),
                             {},
                             None,
                             1e-2,
                             1e-2,
+                            None,
+                            None,
+                            ("out",),
                         )
                     )
                     total_kernel_nums = total_kernel_nums + 1

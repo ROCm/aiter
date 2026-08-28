@@ -2,14 +2,17 @@
 # original code https://github.com/triton-lang/triton/blob/main/python/triton_kernels/triton_kernels/matmul_ogs.py
 
 import itertools
+
 import torch
 import triton
-from aiter.ops.triton.moe.moe_routing.routing import RoutingData
+
 from aiter.ops.triton._triton_kernels.moe.moe_op_gemm_a8w8 import (
     _moe_gemm_a8w8,
 )
+from aiter.ops.triton.moe.moe_routing.routing import RoutingData
 from aiter.ops.triton.moe.reduce import reduce_grouped
 from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton.utils.gemm_config_utils import pick_gemm_num_stages
 
 # -----------------------------------------------------------------------------
 #                    Matrix Multiplication + Outer Gather/Scatter
@@ -64,14 +67,13 @@ def allocate_output(
     return matmul_output, final_output
 
 
-def get_kernel_config(m, n, k, routing_data):
+def get_kernel_config(m, n, k, routing_data, swizzle_mx_scale=None):
     block_m = routing_data.block_m
     group_m = 4
     num_xcds = 8
     xcd_swizzle = num_xcds
     w_cache_modifier = ".cg" if block_m <= 32 else None
     arch = get_arch()
-    num_stages = 1 if arch == "gfx950" else 2
 
     split_k = 1
     if block_m == 16:
@@ -92,6 +94,19 @@ def get_kernel_config(m, n, k, routing_data):
         block_n = 256
         block_k = 256
         num_warps = 8
+        if swizzle_mx_scale is None:
+            # switch to block_k=128 as 256 exceeds LDS budget
+            block_k = 128
+            if block_m >= 128:
+                block_n = 128
+            elif block_m == 64:
+                num_warps = 4
+    num_stages = pick_gemm_num_stages(
+        arch, block_m, block_n, block_k, 8, 8, use_async_padding=True
+    )
+    if swizzle_mx_scale is None and block_m == 64 and block_k == 128 and block_n == 256:
+        # Override the heuristic to use num_stages=1 for preserving occupancy
+        num_stages = 1
 
     ret = {
         "block_m": block_m,
@@ -108,19 +123,6 @@ def get_kernel_config(m, n, k, routing_data):
         "kpack": 1,
     }
     return ret
-
-
-def swizzle_scales(data):
-    NON_K_PRESHUFFLE_BLOCK_SIZE = 32
-    block_shape = data.shape
-    SCALE_K = block_shape[-2]
-    N = block_shape[-1]
-    data = data.transpose(-1, -2)
-    data = data.view(-1, N // NON_K_PRESHUFFLE_BLOCK_SIZE, 2, 16, SCALE_K // 8, 2, 4, 1)
-    data = data.permute(0, 1, 4, 6, 3, 5, 2, 7).contiguous()
-    E = block_shape[0]
-    data = data.reshape(E, N // 32, SCALE_K * 32)
-    return data.transpose(-1, -2)
 
 
 # -----------------------------------------------------------------------------
@@ -146,7 +148,7 @@ def moe_gemm_a8w8(
     apply_swiglu=False,
     alpha=1.0,
     limit=1.0,
-    add_residual=True,
+    swiglu_add_residual=True,
     unpadded_N=None,
     unpadded_K=None,
 ):
@@ -185,7 +187,7 @@ def moe_gemm_a8w8(
     if unpadded_K and block_m == 16:
         K = unpadded_K
     # compute optimization flags
-    config = get_kernel_config(M, N, K, routing_data)
+    config = get_kernel_config(M, N, K, routing_data, swizzle_mx_scale)
     if apply_swiglu and config["split_k"] > 1:
         apply_swiglu_matmul = False
         reduction_n_matmul = 1
@@ -264,7 +266,7 @@ def moe_gemm_a8w8(
         alpha,
         limit,
         reduction_n_matmul,
-        add_residual,
+        swiglu_add_residual,
         routing_data.n_expts_act,
         config["block_m"],
         config["block_n"],
@@ -298,7 +300,7 @@ def moe_gemm_a8w8(
         limit,
         reduction_n_reduction,
         out_dtype=out_dtype,
-        add_residual=add_residual,
+        swiglu_add_residual=swiglu_add_residual,
     )
     return y_final
 
@@ -360,6 +362,7 @@ def moe_gemm_torch(
         if gather_indx is None:
             idx = torch.arange(lo, hi, device=x.device)
         else:
+            gather_indx = gather_indx.to(torch.int32)
             idx = gather_indx[lo:hi] // n_expts_act
         out = torch.matmul(x[idx, :].float(), w[i].float())
         if bias is not None:
@@ -372,6 +375,7 @@ def moe_gemm_torch(
     if scatter_indx is None:
         return y
     # accumulate output from all experts
+    scatter_indx = scatter_indx.to(torch.int32)
     n_rows = y.shape[0] // n_expts_act
     out = torch.zeros((n_rows, y.shape[-1]), dtype=torch.float32, device=x.device)
     src_idx = scatter_indx.view(-1, n_expts_act)

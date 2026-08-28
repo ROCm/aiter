@@ -8,10 +8,12 @@
 #include <cmath>
 #include "py_itfs_common.h"
 
-using RowwiseKernel = std::function<
-    torch::Tensor(torch::Tensor &, torch::Tensor &,
-                  torch::Tensor &, torch::Tensor &,
-                  std::optional<torch::Tensor>, std::optional<torch::Tensor>)>;
+using RowwiseKernel = torch::Tensor (*)(torch::Tensor&,
+                                        torch::Tensor&,
+                                        torch::Tensor&,
+                                        torch::Tensor&,
+                                        std::optional<torch::Tensor>,
+                                        std::optional<torch::Tensor>);
 
 // For certain high priority shapes, we directly use the best kernel rather
 // than use heuristics.

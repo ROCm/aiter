@@ -1,16 +1,17 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-from typing import Optional
 import torch
 import triton
+
+from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a16w16_atomic import (
     _gemm_a16_w16_atomic_kernel,
     _get_config,
 )
+from aiter.ops.triton.utils.common_utils import deserialize_str, serialize_dict
+from aiter.ops.triton.utils.gemm_config_utils import add_default_gemm_config_params
 from aiter.ops.triton.utils.logger import AiterTritonLogger
-from aiter.ops.triton.utils.common_utils import serialize_dict, deserialize_str
-from aiter.jit.utils.torch_guard import torch_compile_guard
 
 _LOGGER = AiterTritonLogger()
 
@@ -18,9 +19,9 @@ _LOGGER = AiterTritonLogger()
 def gemm_a16w16_atomic_fake_tensor(
     x: torch.Tensor,
     w: torch.Tensor,
-    dtype: Optional[torch.dtype] = torch.bfloat16,
-    y: Optional[torch.Tensor] = None,
-    config: Optional[str] = None,
+    dtype: torch.dtype | None = torch.bfloat16,
+    y: torch.Tensor | None = None,
+    config: str | None = None,
 ) -> torch.Tensor:
     if y is None:
         M, _ = x.shape
@@ -33,9 +34,9 @@ def gemm_a16w16_atomic_fake_tensor(
 def gemm_a16w16_atomic_(
     x: torch.Tensor,
     w: torch.Tensor,
-    dtype: Optional[torch.dtype] = torch.bfloat16,
-    y: Optional[torch.Tensor] = None,
-    config: Optional[str] = None,
+    dtype: torch.dtype | None = torch.bfloat16,
+    y: torch.Tensor | None = None,
+    config: str | None = None,
 ) -> torch.Tensor:
     """
     Computes 16 bit matrix multiplication Y = X @ W^T using atomic operations for split-K reduction.
@@ -66,13 +67,9 @@ def gemm_a16w16_atomic_(
         config, _ = _get_config(M, N, K)
     else:
         config = deserialize_str(config)
-
-    # For compatability reasons, these keys may not exist in the config
-    # TODO: This needs to be embedded in the configs later
-    if "NUM_KSPLIT" not in config:
-        config["NUM_KSPLIT"] = 1
-    if "cache_modifier" not in config:
-        config["cache_modifier"] = ""
+    # Caller-supplied configs may omit NUM_KSPLIT/cache_modifier; backfill
+    # with the canonical defaults (the shipped JSONs always carry both).
+    add_default_gemm_config_params(config)
 
     if y is None:
         # atomic add requires 0 tensor
@@ -81,7 +78,7 @@ def gemm_a16w16_atomic_(
         else:
             y = torch.zeros((M, N), dtype=dtype, device=x.device)
 
-    grid = lambda META: (  # noqa: E731
+    grid = lambda META: (
         triton.cdiv(M, META["BLOCK_SIZE_M"])
         * triton.cdiv(N, META["BLOCK_SIZE_N"])
         * META["NUM_KSPLIT"],
@@ -111,9 +108,9 @@ def gemm_a16w16_atomic_(
 def gemm_a16w16_atomic(
     x: torch.Tensor,
     w: torch.Tensor,
-    dtype: Optional[torch.dtype] = torch.bfloat16,
-    y: Optional[torch.Tensor] = None,
-    config: Optional[dict] = None,
+    dtype: torch.dtype | None = torch.bfloat16,
+    y: torch.Tensor | None = None,
+    config: dict | None = None,
 ) -> torch.Tensor:
     config_hashable = serialize_dict(config) if config else None
     return gemm_a16w16_atomic_(x, w, dtype, y, config_hashable)

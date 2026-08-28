@@ -7,22 +7,22 @@
 
 ### Aiter
 - runs used: `10`
-- discovered files: `64`
-- with samples: `64`
-- added: `2`
-- updated: `42`
-- unchanged: `20`
+- discovered files: `113`
+- with samples: `113`
+- added: `5`
+- updated: `67`
+- unchanged: `41`
 - defaulted (no history): `0`
 - removed stale entries: `0`
 - defaulted files list: `none`
 
 ### Triton
 - runs used: `10`
-- discovered files: `71`
-- with samples: `71`
-- added: `0`
-- updated: `38`
-- unchanged: `33`
-- defaulted (no history): `0`
+- discovered files: `108`
+- with samples: `107`
+- added: `3`
+- updated: `85`
+- unchanged: `20`
+- defaulted (no history): `1`
 - removed stale entries: `0`
-- defaulted files list: `none`
+- defaulted files list: `op_tests/triton_tests/chunk_delta_attn/test_chunk_delta_attn_fwd.py`

@@ -6,18 +6,19 @@
 
 #  Top-K on GPU:  1-stage (tiny rows) + 2-stage (large rows) Triton kernels,
 from __future__ import annotations
-from typing import Tuple
+
 import math
+
 import torch
 import triton
 import triton.language as tl
-
 
 from aiter.ops.triton._triton_kernels.topk import (
     _topk_kernel,
     topk_stage1_kernel,
     topk_stage2_kernel,
 )
+from aiter.ops.triton.utils._triton.arch_info import is_tdm_avail
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
@@ -33,7 +34,7 @@ def _pick_block(m: int, k: int) -> int:
 def one_stage_topk(
     x: torch.Tensor,
     k: int,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     B, M = x.shape
     BLOCK = _pick_block(M, k)
     if M > BLOCK or BLOCK > 1024:
@@ -41,7 +42,6 @@ def one_stage_topk(
 
     out_v = torch.empty((B, k), device=x.device, dtype=x.dtype)
     out_i = torch.empty((B, k), device=x.device, dtype=torch.int64)
-
     _topk_kernel[(B,)](
         x.contiguous(),
         out_v,
@@ -53,6 +53,7 @@ def one_stage_topk(
         K=k,
         BLOCK=BLOCK,
         FILL_VALUE=torch.finfo(torch.float32).min,
+        USE_TDM=is_tdm_avail(),
         num_warps=4,
         num_stages=2,
     )
@@ -102,6 +103,7 @@ def two_stage_topk(x, k, dim=-1, largest=True):
             if descending
             else torch.finfo(torch.float32).max
         ),
+        USE_TDM=is_tdm_avail(),
     )
     stage2_elem_cnt = chunk_num * k
     BLOCK_SIZE = triton.next_power_of_2(stage2_elem_cnt)
@@ -122,6 +124,7 @@ def two_stage_topk(x, k, dim=-1, largest=True):
                 else torch.finfo(torch.float32).max
             ),
             torch.iinfo(torch.int32).min,
+            USE_TDM=is_tdm_avail(),
         )
         if descending
         else tl.constexpr(torch.iinfo(torch.int32).max)

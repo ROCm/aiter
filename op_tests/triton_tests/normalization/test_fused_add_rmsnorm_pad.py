@@ -1,10 +1,12 @@
-import torch
 import pytest
-from aiter.ops.triton.normalization.fused_add_rmsnorm_pad import fused_add_rmsnorm_pad
+import torch
 import torch.nn.functional as F
+
+from aiter.ops.triton.normalization.fused_add_rmsnorm_pad import fused_add_rmsnorm_pad
 
 
 def generate_inputs(M, N, has_res, dtype):
+    torch.manual_seed(0)
     x = torch.randn((M, N), dtype=dtype, device="cuda")
     weight = torch.randn((N,), dtype=dtype, device="cuda")
     res = torch.randn((M, N), dtype=dtype, device="cuda") if has_res else None

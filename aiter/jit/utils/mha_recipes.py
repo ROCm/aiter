@@ -1,4 +1,20 @@
-from typing import List, Dict, Tuple
+def _ck_targets_flag() -> str:
+    """Return ``--targets <runtime arch>`` when the runtime GPU is not gfx9.
+
+    ck-tile's ``generate.py`` defaults to ``--targets gfx9,gfx950``, so any
+    non-gfx9 host (gfx10/11/12) ends up with an empty kernel set and ``mha_fwd``
+    fails at dispatch with "invalid argument for fmha_fwd". For gfx9 hosts we
+    keep the default (covers both gfx942 and gfx950 like before).
+    """
+    try:
+        from chip_info import get_gfx
+
+        gfx = get_gfx()
+    except Exception:  # noqa: BLE001
+        return ""
+    if gfx.startswith("gfx9"):
+        return ""
+    return f" --targets {gfx}"
 
 
 def compose_mha_fwd_variant_suffix_and_filter(
@@ -11,7 +27,7 @@ def compose_mha_fwd_variant_suffix_and_filter(
     dropout_zero: bool,
     skip_zero: bool,
     has_qscale: bool,
-) -> Tuple[str, str]:
+) -> tuple[str, str]:
     dtype_token = f"_{dtype}"
     logits_token = "_logits" if logits_positive else "_nlogits"
     if has_bias:
@@ -77,9 +93,9 @@ def _parse_mha_varlen_fwd_md_name(md_name: str):
 
 
 def get_mha_varlen_prebuild_variants_by_names(
-    md_names: List[str], ck_dir: str, receipt: int = 200
-) -> List[Dict]:
-    variants: List[Dict] = []
+    md_names: list[str], ck_dir: str, receipt: int = 200
+) -> list[dict]:
+    variants: list[dict] = []
     for md_name in md_names:
         (
             dtype,
@@ -104,8 +120,8 @@ def get_mha_varlen_prebuild_variants_by_names(
             has_qscale=has_qscale,
         )
         blob_gen_cmd = [
-            f"{ck_dir}/example/ck_tile/01_fmha/generate.py -d fwd --receipt {receipt} --filter {filter_pattern} --output_dir {{}}",
-            f'{ck_dir}/example/ck_tile/01_fmha/generate.py -d fwd_splitkv --receipt {receipt} --filter " @ " --output_dir {{}}',
+            f"{ck_dir}/example/ck_tile/01_fmha/generate.py -d fwd --receipt {receipt} --filter {filter_pattern} --output_dir {{}}{_ck_targets_flag()}",
+            f'{ck_dir}/example/ck_tile/01_fmha/generate.py -d fwd_splitkv --receipt {receipt} --filter " @ " --output_dir {{}}{_ck_targets_flag()}',
         ]
         variants.append(
             {"md_name": f"mha_varlen_fwd{suffix}", "blob_gen_cmd": blob_gen_cmd}
