@@ -1001,3 +1001,42 @@ def test_flydsl_v2_stage1_result_independent_of_buffer_contents():
     assert not bool(untouched.all()), "kernel wrote nothing; the test is vacuous"
     assert torch.equal(first[untouched], torch.full_like(first[untouched], 0xA5))
     assert torch.equal(second[untouched], torch.full_like(second[untouched], 0x5A))
+
+
+@_SKIP_GFX950_FLYDSL
+def test_flydsl_v2_stage1_rejects_wrong_output_dtype():
+    """A caller-provided v2 stage1 buffer must match the expected output dtype."""
+    from aiter.ops.flydsl.moe_kernels import flydsl_moe_stage1
+
+    torch.set_default_device("cuda")
+    token, model_dim, inter_dim, E, topk, block_m = 64, 512, 256, 16, 4, 32
+    tile_m = 32
+    d = _generate_a8w4_situv2_vec4_data(
+        token, model_dim, inter_dim, E, topk, block_m, seed=22
+    )
+    sorted_rows = max(
+        d["sorted_ids"].shape[0], d["sorted_expert_ids"].shape[0] * tile_m
+    )
+    bad_buf = torch.empty((sorted_rows, inter_dim), dtype=torch.bfloat16, device="cuda")
+    with pytest.raises(ValueError, match="stage1 out has dtype"):
+        flydsl_moe_stage1(
+            a=d["a_q"],
+            w1=d["w1_q_shuf"],
+            sorted_token_ids=d["sorted_ids"],
+            sorted_expert_ids=d["sorted_expert_ids"],
+            num_valid_ids=d["num_valid_ids"],
+            out=bad_buf,
+            topk=d["topk"],
+            tile_m=tile_m,
+            tile_n=256,
+            tile_k=256,
+            a_dtype="fp8",
+            b_dtype="fp4",
+            out_dtype="fp8",
+            act="situv2",
+            situ_beta=SITUV2_BETA,
+            situ_linear_beta=SITUV2_LINEAR_BETA,
+            w1_scale=d["w1_scale_shuf"],
+            a1_scale=d["a_scale_sort"],
+            v2_output_layout=True,
+        )

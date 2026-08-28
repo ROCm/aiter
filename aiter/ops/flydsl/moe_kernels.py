@@ -1606,6 +1606,11 @@ def _flydsl_moe_stage1_impl(
             max(sorted_token_ids.shape[0], sorted_expert_ids.shape[0] * tile_m),
             inter_dim // 2 if _need_fp4 else inter_dim,
         )
+        if out.dtype != torch_out_dtype:
+            raise ValueError(
+                f"stage1 out has dtype {out.dtype}, "
+                f"but the v2 output layout requires {torch_out_dtype}"
+            )
         if tuple(out.shape) != _expected_shape:
             raise ValueError(
                 f"stage1 out has shape {tuple(out.shape)}, "
