@@ -30,8 +30,8 @@ import torch.nn.functional as F
 from .kernels.flash_attn_func_gfx1201 import build_flash_attn_func_module
 from .kernels.fmha_gfx1250.fmha_kernel import flash_attn_varlen_d192_gfx1250
 from .kernels.fmha_gfx1250.fmha_fwd_prefill_m32x8 import (
-    flash_attn_varlen_m16x8,
-    flash_attn_batch_m16x8,
+    flash_attn_varlen_m32x8,
+    flash_attn_batch_m32x8,
 )
 
 __all__ = [
@@ -246,20 +246,23 @@ def flydsl_flash_attn_varlen_func(
     # dropout, sliding window, paging, probs/deterministic) falls through to
     # CK/Triton instead of being silently dropped.
     #
-    # qk_hdim==192 is the production d192 kernel; qk_hdim==128 is the new (empty)
-    # m16x8 kernel, gated behind AITER_ENABLE_EXPERIMENTAL.
+    # Routing (D_v=128, bf16, gfx1250): our m32x8 kernel is the DEFAULT for qk_hdim 128 and 192.
+    # qk_hdim==256 routes to us only under AITER_ENABLE_EXPERIMENTAL=1 (else CK). The production
+    # d192 SIBLING is reached only for qk_hdim==192 under experimental (an A/B fallback to the old
+    # kernel); by default 192 takes ours (it's ~16% faster).
     qk_hdim = q.shape[-1]
-    _allowed_hdim = (192, 128) if is_experimental_enabled() else (192,)
-    # Attention sink is supported only by the m16x8 (qk_hdim==128) path; the d192
-    # kernel has no sink handling, so it still falls through to CK when sink given.
-    _sink_ok = sink is None or qk_hdim == 128
-    # Sliding window (finite window_size[:2]) is supported only by the m16x8
-    # (qk_hdim==128) path; the d192 kernel is full/causal only, so keep rejecting
-    # finite windows there.
-    _window_ok = tuple(window_size[:2]) == (-1, -1) or qk_hdim == 128
+    exp = is_experimental_enabled()
+    _use_wave8_mha = (
+        qk_hdim == 128 or (qk_hdim == 192 and not exp) or (qk_hdim == 256 and exp)
+    )
+    _use_sibling = qk_hdim == 192 and exp
+    # Attention sink + finite sliding window are supported only by our m32x8 path (d192 is
+    # full/causal, no sink), so they require routing to ours.
+    _sink_ok = sink is None or _use_wave8_mha
+    _window_ok = tuple(window_size[:2]) == (-1, -1) or _use_wave8_mha
     supported = (
         get_gfx() == "gfx1250"
-        and qk_hdim in _allowed_hdim
+        and (_use_wave8_mha or _use_sibling)
         and v.shape[-1] == 128
         and q.dtype == torch.bfloat16
         and dropout_p == 0.0
@@ -278,9 +281,9 @@ def flydsl_flash_attn_varlen_func(
     if out is None:
         out = torch.empty_like(q[:, :, : v.shape[-1]])
 
-    if qk_hdim == 128:
-        # New clean-DSL 8-wave prefill kernel (m16x8), D_qk=D_v=128.
-        return flash_attn_varlen_m16x8(
+    if _use_wave8_mha:
+        # New clean-DSL 8-wave prefill kernel (m32x8), D_qk in {128,192,256}, D_v=128.
+        return flash_attn_varlen_m32x8(
             q,
             k,
             v,
@@ -296,7 +299,7 @@ def flydsl_flash_attn_varlen_func(
             sink=sink,
         )
 
-    # D_qk=192 D_v=128
+    # _use_sibling: qk_hdim==192 under experimental -> production d192 (D_qk=192, D_v=128).
     return flash_attn_varlen_d192_gfx1250(
         q,
         k,
@@ -330,7 +333,7 @@ def flydsl_flash_attn_batch_func(
 ):
     """FlyDSL MHA forward, batched BSHD ``[B, S, H, D]`` layout.
 
-    Routes to the dedicated BSHD m16x8 kernel (uniform ``seq_len``, no
+    Routes to the dedicated BSHD m32x8 kernel (uniform ``seq_len``, no
     ``cu_seqlens`` — CUDA-graph safe). Returns the result if FlyDSL can handle
     this configuration, otherwise returns ``None`` so the caller falls through
     to Triton/CK.
@@ -338,12 +341,13 @@ def flydsl_flash_attn_batch_func(
     from ...jit.utils.chip_info import get_gfx
     from ...jit.core import is_experimental_enabled
 
-    # BSHD routes only to the new (empty) m16x8 kernel — gated on experimental.
+    # BSHD routes to the m32x8 kernel (no d192 sibling exists for BSHD). D_v=128. D_qk 128/192 are
+    # the DEFAULT; D_qk==256 needs AITER_ENABLE_EXPERIMENTAL=1 (else CK).
+    _bqk = q.shape[-1]
     supported = (
-        is_experimental_enabled()
-        and get_gfx() == "gfx1250"
+        get_gfx() == "gfx1250"
         and q.dim() == 4
-        and q.shape[-1] == 128
+        and (_bqk in (128, 192) or (_bqk == 256 and is_experimental_enabled()))
         and v.shape[-1] == 128
         and q.dtype == torch.bfloat16
         and dropout_p == 0.0
@@ -354,7 +358,7 @@ def flydsl_flash_attn_batch_func(
     if not supported:
         return None
 
-    return flash_attn_batch_m16x8(
+    return flash_attn_batch_m32x8(
         q,
         k,
         v,

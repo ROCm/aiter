@@ -34,8 +34,8 @@ HEAD_DIM_V = 128
 # kernels grow; anything else is rejected up front rather than silently
 # falling through to CK/Triton and testing nothing.
 SUPPORTED_D_QK_V = {
-    "thd": [(192, 128), (128, 128)],
-    "bshd": [(128, 128)],
+    "thd": [(256, 128), (192, 128), (128, 128)],
+    "bshd": [(256, 128), (192, 128), (128, 128)],
 }
 
 
@@ -503,13 +503,13 @@ def run_route_m16x8_test():
 
     # Spy on the kernel-file entry that flydsl_flash_attn_varlen_func dispatches to.
     calls = {"n": 0}
-    orig = fk.flash_attn_varlen_m16x8
+    orig = fk.flash_attn_varlen_m32x8
 
     def _spy(*a, **kw):
         calls["n"] += 1
         return orig(*a, **kw)
 
-    fk.flash_attn_varlen_m16x8 = _spy
+    fk.flash_attn_varlen_m32x8 = _spy
     ok = True
     try:
         for causal in (False, True):
@@ -527,7 +527,7 @@ def run_route_m16x8_test():
             )
             ok = ok and routed and shape_ok
     finally:
-        fk.flash_attn_varlen_m16x8 = orig
+        fk.flash_attn_varlen_m32x8 = orig
 
     print(f"  [route-m16x8] {'PASS' if ok else 'FAIL'}")
     return ok

@@ -901,31 +901,49 @@ _Q_PAD_ELEMS = 8   # 4 DW = 16 B per Q row (matches K)
 _O_PAD_ELEMS = 8   # 4 DW = 16 B per O row (conflict-free ds_store_b128)
 
 
+def _pow2_segments(width):
+    """Split ``width`` (elements) into power-of-two column segments (largest first). The TDM
+    pad_interval must be a power of two, so a non-pow2 row (192) is copied as multiple segments,
+    each with a pow2 pad_interval. 128 -> [(0,128)]; 192 -> [(0,128),(128,64)]; 256 -> [(0,256)]."""
+    segs, c0, rem = [], 0, width
+    while rem > 0:
+        w = 1 << (rem.bit_length() - 1)  # largest power of two <= rem
+        segs.append((c0, w))
+        c0 += w
+        rem -= w
+    return segs
+
+
 def _tdm_load_views(*, ptr_x, stride_seq, stride_head, head, row0, valid,
                     n_rows, hdim, pad_elems, lds_base):
-    """Build ``(atom, g_view, lds_view)`` for ONE TDM global->LDS tile copy — PURE
-    view/descriptor construction (no memory op), so the caller can hoist it before the
-    drain and issue the copy later. Src base = ``ptr_x[row0, head]``; ``lds_base`` is the
-    LDS byte base (fx.Int32); per-row extent ``valid`` gives HW OOB zero-fill; LDS dst is
-    row-major with ``hdim + pad_elems`` element row stride; all 8 waves split the tile
-    (``num_warps``). Issue with ``fx.copy_atom_call(atom, g_view, lds_view)``.
-    ``stride_seq``/``stride_head`` are in ELEMENTS (host passes K/V strides element-count);
-    TDM strides + ``add_offset`` on the bf16 iter are element-based, so no conversion."""
+    """Build a LIST of ``(atom, g_view, lds_view)`` TDM global->LDS copies for one
+    ``[n_rows, hdim]`` tile into a row-major padded (``hdim + pad_elems`` element row stride) LDS
+    block — PURE (no memory op), issue each with ``fx.copy_atom_call(*view)`` then drain with
+    ``tensor_wait(0)``. hdim is split into power-of-two column segments (pad_interval must be pow2):
+    segment ``(c0, w)`` copies global cols ``[c0, c0+w)`` -> LDS cols ``[c0, c0+w)`` with
+    ``pad_interval=w``, ``pad_amount=(hdim+pad_elems - w)`` so the LDS row still advances by the
+    padded stride. One segment for pow2 hdim (128/256), two for 192. Src base = ``ptr_x[row0, head]``;
+    per-row extent ``valid`` = HW OOB zero-fill; all 8 waves split the tile. Strides in ELEMENTS."""
+    row_elems = hdim + pad_elems
     off = fx.Int64(row0) * fx.Int64(stride_seq) + fx.Int64(head) * fx.Int64(stride_head)
-    base = fx.add_offset(fx.get_iter(ptr_x), off)
-    g_view = fx.Tensor(fx.make_view(base, fx.make_layout((n_rows, hdim), (hdim, 1))))
-    atom = fx.rocdl.make_tdm_atom(
-        g_view, [valid, None], strides=[stride_seq, None],
-        num_warps=_DEFAULT_NUM_WAVES, pad_interval=hdim, pad_amount=pad_elems,
-    )
+    base_iter = fx.get_iter(ptr_x)
     lds_ptr_ty = fx.PointerType.get(
         elem_ty=fx.BFloat16.ir_type, address_space=fx.AddressSpace.Shared, alignment=16,
     )
-    lds_iter = fx.inttoptr(lds_ptr_ty, lds_base)
-    lds_view = fx.Tensor(
-        fx.make_view(lds_iter, fx.make_layout((n_rows, hdim), (hdim + pad_elems, 1)))
-    )
-    return atom, g_view, lds_view
+    views = []
+    for c0, w in _pow2_segments(hdim):
+        gbase = fx.add_offset(base_iter, off + fx.Int64(c0))
+        g_view = fx.Tensor(fx.make_view(gbase, fx.make_layout((n_rows, w), (w, 1))))
+        atom = fx.rocdl.make_tdm_atom(
+            g_view, [valid, None], strides=[stride_seq, None],
+            num_warps=_DEFAULT_NUM_WAVES, pad_interval=w, pad_amount=row_elems - w,
+        )
+        lds_iter = fx.inttoptr(lds_ptr_ty, lds_base + fx.Int32(c0 * _BF16_BYTES))
+        lds_view = fx.Tensor(
+            fx.make_view(lds_iter, fx.make_layout((n_rows, w), (row_elems, 1)))
+        )
+        views.append((atom, g_view, lds_view))
+    return views
 
 
 class QManager16bV2:
@@ -973,24 +991,28 @@ class QManager16bV2:
         n_seq_valid = fx.Int32(arith.maxsi(arith.unwrap(rem), arith.unwrap(fx.Int32(0))))
 
         off = fx.Int64(q_start + seq0) * fx.Int64(stride_q_seq) + fx.Int64(head0) * fx.Int64(stride_q_head)
-        base = fx.add_offset(fx.get_iter(ptr_Q), off)
-        g_view = fx.Tensor(fx.make_view(
-            base, fx.make_layout((n_seq, gqa, self.qk_hdim),
-                                 (gqa * self.qk_hdim, self.qk_hdim, 1))))
-        atom = fx.rocdl.make_tdm_atom(
-            g_view, [n_seq_valid, None, None],
-            strides=[stride_q_seq, stride_q_head, None],
-            num_warps=1, pad_interval=self.qk_hdim, pad_amount=_Q_PAD_ELEMS,
-        )
+        base_iter = fx.get_iter(ptr_Q)
         warp_region = ptr_lds + warp_idx * fx.Int32(self.rows_per_warp * self.row_bytes)
         lds_ptr_ty = fx.PointerType.get(
             elem_ty=fx.BFloat16.ir_type, address_space=fx.AddressSpace.Shared, alignment=16,
         )
-        lds_iter = fx.inttoptr(lds_ptr_ty, warp_region)
-        lds_view = fx.Tensor(fx.make_view(
-            lds_iter, fx.make_layout((n_seq, gqa, self.qk_hdim),
-                                     (gqa * self.row_elems, self.row_elems, 1))))
-        fx.copy_atom_call(atom, g_view, lds_view)
+        # hdim split into pow2 column segments (TDM pad_interval must be pow2): one copy for 128/256,
+        # two for 192. Each segment (c0, w): pad_interval=w, pad_amount=row_elems-w so the padded LDS
+        # row stride is preserved.
+        for c0, w in _pow2_segments(self.qk_hdim):
+            gbase = fx.add_offset(base_iter, off + fx.Int64(c0))
+            g_view = fx.Tensor(fx.make_view(
+                gbase, fx.make_layout((n_seq, gqa, w), (gqa * w, w, 1))))
+            atom = fx.rocdl.make_tdm_atom(
+                g_view, [n_seq_valid, None, None],
+                strides=[stride_q_seq, stride_q_head, None],
+                num_warps=1, pad_interval=w, pad_amount=self.row_elems - w,
+            )
+            lds_iter = fx.inttoptr(lds_ptr_ty, warp_region + fx.Int32(c0 * _BF16_BYTES))
+            lds_view = fx.Tensor(fx.make_view(
+                lds_iter, fx.make_layout((n_seq, gqa, w),
+                                         (gqa * self.row_elems, self.row_elems, 1))))
+            fx.copy_atom_call(atom, g_view, lds_view)
         self._warp_region = warp_region
         self._lane_idx = lane_idx
 
@@ -1045,9 +1067,10 @@ class KManager16bV2:
 
     def load_views(self, *, ptr_lds, ptr_K, stride_k_seq, stride_k_head,
                    kv_head, kv_row0, kv_valid):
-        """Return ``(atom, g_view, lds_view)`` for this block's K tile TDM copy into the
-        padded LDS at ``ptr_lds`` (fx.Int32 byte base). Pure (hoistable); issue with
-        ``fx.copy_atom_call(atom, g_view, lds_view)``, then drain with ``tdm_ops.tensor_wait(0)``."""
+        """Return a LIST of ``(atom, g_view, lds_view)`` TDM copies for this block's K tile into the
+        padded LDS at ``ptr_lds`` (fx.Int32 byte base) — one per pow2 hdim segment (1 for 128/256, 2
+        for 192). Pure (hoistable); issue each with ``fx.copy_atom_call(*view)``, drain with
+        ``tdm_ops.tensor_wait(0)``."""
         return _tdm_load_views(
             ptr_x=ptr_K, stride_seq=stride_k_seq, stride_head=stride_k_head,
             head=kv_head, row0=kv_row0, valid=kv_valid,
@@ -1110,8 +1133,9 @@ class VManager16bV2:
 
     def load_views(self, *, ptr_lds, ptr_V, stride_v_seq, stride_v_head,
                    kv_head, kv_row0, kv_valid):
-        """Return ``(atom, g_view, lds_view)`` for this block's V tile TDM copy. Pure;
-        issue with ``fx.copy_atom_call(atom, g_view, lds_view)``, then drain with ``tdm_ops.tensor_wait(0)``."""
+        """Return a LIST of ``(atom, g_view, lds_view)`` TDM copies for this block's V tile (v_hdim=128
+        is pow2 -> one copy). Pure; issue each with ``fx.copy_atom_call(*view)``, drain with
+        ``tdm_ops.tensor_wait(0)``."""
         return _tdm_load_views(
             ptr_x=ptr_V, stride_seq=stride_v_seq, stride_head=stride_v_head,
             head=kv_head, row0=kv_row0, valid=kv_valid,

@@ -21,7 +21,7 @@ Both resolve their per-workgroup base offsets + sequence bounds, then call the
 layout-agnostic ``_core_attention`` helper.
 
 Scope — v1 (this file is intentionally config-agnostic in its name):
-  - ``qk_hdim == v_hdim == 128``
+  - ``qk_hdim in {128, 192, 256}`` (D_qk), ``v_hdim == 128`` (D_v), ``n_block == 64``
   - dtype: bf16 for Q/K/V/O
   - grouped-query attention (GQA): ``gqa = nheads_q // nheads_k``
   - causal and non-causal
@@ -104,6 +104,9 @@ class WarpType(IntEnum):
 DEFAULT_QK_HDIM = 128
 DEFAULT_V_HDIM = 128
 DEFAULT_DTYPE = "bf16"
+# Supported D_qk (all with D_v=128, n_block=64). 256 needs the K|V slot sized to fit
+# Q staging (see _core_attention slot_bytes).
+SUPPORTED_QK_HDIM = (128, 192, 256)
 
 # KV sequence block (columns of one QK GEMM tile). Configurable; 64 for now.
 N_BLOCK_CHOICES = (32, 64, 128, 256)
@@ -637,17 +640,23 @@ def _core_attention(
     kv_head, q_head_idx, seq_idx = _packed_tile_indices(gqa_ratio, warp_idx, lane_idx)
 
     # K/V staging: N_KV_PP ping-pong slots ([K.pp0|V.pp0][K.pp1|V.pp1]), blocks floored
-    # at 64KB -> 128KB/slot, 256KB total -> occupancy=1. O reuses a non-current slot; Q
-    # time-shares slot 1. slot_bytes is compile-time (no allocation; lds_base is passed in).
+    # at 64KB. O reuses a non-current slot; Q time-shares slot 1, so the slot must also
+    # be >= the Q staging footprint (at qk_hdim=256 that exceeds K|V+128KB -> we grow the
+    # slot, "allocating additional space for K|V"; still occupancy=1). slot_bytes is
+    # compile-time (no allocation; lds_base is passed in).
     if USE_TDM_LOADER:
+        q_mgr = QManager16bV2(qk_hdim=qk_hdim, gqa_ratio=gqa_ratio, num_waves=NUM_WAVES,
+                              q_tiles_per_wave=WMMA_ROW_PER_WAVE)
         k_mgr = KManager16bV2(qk_hdim=qk_hdim, n_block=n_block, num_waves=NUM_WAVES)
         v_mgr = VManager16bV2(v_hdim=v_hdim, n_block=n_block, num_waves=NUM_WAVES)
     else:
+        q_mgr = QManager16bV1(qk_hdim=qk_hdim, gqa_ratio=gqa_ratio, num_waves=NUM_WAVES,
+                              q_tiles_per_wave=WMMA_ROW_PER_WAVE)
         k_mgr = KManager16bV1(qk_hdim=qk_hdim, n_block=n_block, num_waves=NUM_WAVES)
         v_mgr = VManager16bV1(v_hdim=v_hdim, n_block=n_block, num_waves=NUM_WAVES)
     k_blk_bytes = max(k_mgr.get_lds_size_in_byte(), MIN_KV_BLK_BYTES)
     v_blk_bytes = max(v_mgr.get_lds_size_in_byte(), MIN_KV_BLK_BYTES)
-    slot_bytes = k_blk_bytes + v_blk_bytes
+    slot_bytes = max(k_blk_bytes + v_blk_bytes, q_mgr.get_lds_size_in_byte())
 
     def _k_lds_buf(pp):  # K base of ping-pong slot ``pp`` (int or fx.Int32; folds when const)
         if isinstance(pp, int):
@@ -663,16 +672,8 @@ def _core_attention(
     # slot_bytes). Q is loaded + drained into VGPR in the prologue, then dead; the
     # main loop's first slot-1 prefetch reuses the region. Safe with zero new sync —
     # the prologue drains Q (part2) -> s_wait_asynccnt(0) -> gpu.barrier() BEFORE the
-    # loop, and prologue K/V loads target slot 0. No separate allocation (Q's 64KB
-    # footprint fits inside slot 1's 128KB span). ----
-    _QMgr = QManager16bV2 if USE_TDM_LOADER else QManager16bV1
-    q_mgr = _QMgr(
-        qk_hdim=qk_hdim, gqa_ratio=gqa_ratio, num_waves=NUM_WAVES,
-        q_tiles_per_wave=WMMA_ROW_PER_WAVE,
-    )
-    assert q_mgr.get_lds_size_in_byte() <= slot_bytes, (
-        f"Q footprint {q_mgr.get_lds_size_in_byte()}B exceeds slot {slot_bytes}B"
-    )
+    # loop, and prologue K/V loads target slot 0. slot_bytes >= Q footprint by
+    # construction (see above), so Q always fits in slot 1. ----
     q_lds_base = lds_base + fx.Int32(slot_bytes)
 
     q_mgr.load_q_to_vgpr_part1(
@@ -763,8 +764,10 @@ def _core_attention(
             kv_head=kv_head, kv_row0=kv_start + start_row0, kv_valid=_kv_valid(start_row0),
         )
         q_frags = q_mgr.load_q_to_vgpr_part2(scale=softmax_scale)
-        fx.copy_atom_call(*k_views)
-        fx.copy_atom_call(*v_views)
+        for _v in k_views:
+            fx.copy_atom_call(*_v)
+        for _v in v_views:
+            fx.copy_atom_call(*_v)
         tdm_ops.tensor_wait(0)
         gpu.barrier()
     else:
@@ -942,8 +945,10 @@ def _core_attention(
             def _issue():
                 if USE_TDM_LOADER:
                     k_views, v_views = addr
-                    fx.copy_atom_call(*k_views)
-                    fx.copy_atom_call(*v_views)
+                    for _v in k_views:
+                        fx.copy_atom_call(*_v)
+                    for _v in v_views:
+                        fx.copy_atom_call(*_v)
                 else:
                     k_g, k_l, k_i, v_g, v_l, v_i = addr
                     _async_load_to_lds(k_g, k_l, cluster=True, imm_offs=k_i)
@@ -1244,10 +1249,10 @@ def build_fmha_fwd_prefill_m32x8(
     to shift/and when it is a power of two.
     """
     assert layout in ("thd", "bshd"), f"layout must be thd|bshd, got {layout!r}"
-    # v1 supports a single configuration; generalize later.
+    # qk_hdim in {128,192,256} (D_qk, WMMA_K multiple); v_hdim fixed at 128 (D_v).
     assert (
-        qk_hdim == 128 and v_hdim == 128
-    ), f"v1 supports qk_hdim == v_hdim == 128 only, got {qk_hdim}/{v_hdim}"
+        qk_hdim in SUPPORTED_QK_HDIM and v_hdim == 128
+    ), f"supports qk_hdim in {SUPPORTED_QK_HDIM} with v_hdim==128, got {qk_hdim}/{v_hdim}"
     assert dtype_str == "bf16", f"v1 supports bf16 only, got {dtype_str!r}"
     assert gqa_ratio >= 1, f"gqa_ratio must be >= 1, got {gqa_ratio}"
     assert n_block in N_BLOCK_CHOICES, f"n_block must be in {N_BLOCK_CHOICES}, got {n_block}"
@@ -1413,16 +1418,17 @@ _launch_fns = {}  # {(layout, mask_left, mask_right, return_lse, has_sink, gqa_r
 
 
 def _ensure_thd_kernel(
-    mask_left: bool, mask_right: bool, return_lse: bool, has_sink: bool, gqa_ratio: int
+    mask_left: bool, mask_right: bool, return_lse: bool, has_sink: bool, gqa_ratio: int,
+    qk_hdim: int = DEFAULT_QK_HDIM,
 ):
     key = (
         "thd", bool(mask_left), bool(mask_right),
-        bool(return_lse), bool(has_sink), int(gqa_ratio),
+        bool(return_lse), bool(has_sink), int(gqa_ratio), int(qk_hdim),
     )
     if key in _launch_fns:
         return
     kernel = build_fmha_fwd_prefill_m32x8(
-        layout="thd", mask_left=mask_left, mask_right=mask_right,
+        layout="thd", qk_hdim=qk_hdim, mask_left=mask_left, mask_right=mask_right,
         return_lse=return_lse, has_sink=has_sink, gqa_ratio=gqa_ratio,
     )
 
@@ -1507,16 +1513,17 @@ def _ensure_thd_kernel(
 
 
 def _ensure_bshd_kernel(
-    mask_left: bool, mask_right: bool, return_lse: bool, has_sink: bool, gqa_ratio: int
+    mask_left: bool, mask_right: bool, return_lse: bool, has_sink: bool, gqa_ratio: int,
+    qk_hdim: int = DEFAULT_QK_HDIM,
 ):
     key = (
         "bshd", bool(mask_left), bool(mask_right),
-        bool(return_lse), bool(has_sink), int(gqa_ratio),
+        bool(return_lse), bool(has_sink), int(gqa_ratio), int(qk_hdim),
     )
     if key in _launch_fns:
         return
     kernel = build_fmha_fwd_prefill_m32x8(
-        layout="bshd", mask_left=mask_left, mask_right=mask_right,
+        layout="bshd", qk_hdim=qk_hdim, mask_left=mask_left, mask_right=mask_right,
         return_lse=return_lse, has_sink=has_sink, gqa_ratio=gqa_ratio,
     )
 
@@ -1598,7 +1605,7 @@ def _ensure_bshd_kernel(
     _launch_fns[key] = _launch
 
 
-def flash_attn_varlen_m16x8(
+def flash_attn_varlen_m32x8(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -1630,7 +1637,8 @@ def flash_attn_varlen_m16x8(
     used only when ``return_lse``; allocated here when ``return_lse`` and None.
     """
     assert q.dtype == torch.bfloat16, f"Expected bf16, got {q.dtype}"
-    assert q.shape[-1] == 128, f"Expected qk_hdim=128, got {q.shape[-1]}"
+    qk_hdim = q.shape[-1]
+    assert qk_hdim in SUPPORTED_QK_HDIM, f"Expected qk_hdim in {SUPPORTED_QK_HDIM}, got {qk_hdim}"
     assert v.shape[-1] == 128, f"Expected v_hdim=128, got {v.shape[-1]}"
 
     total_q_tokens = q.shape[0]
@@ -1690,11 +1698,11 @@ def flash_attn_varlen_m16x8(
     stride_v_head = v.stride(1)
     stride_o_head = out.stride(1)
 
-    _ensure_thd_kernel(mask_left, mask_right, bool(return_lse), has_sink, gqa)
+    _ensure_thd_kernel(mask_left, mask_right, bool(return_lse), has_sink, gqa, qk_hdim=qk_hdim)
 
     _run_compiled(
         _launch_fns[
-            ("thd", mask_left, mask_right, bool(return_lse), has_sink, gqa)
+            ("thd", mask_left, mask_right, bool(return_lse), has_sink, gqa, qk_hdim)
         ],
         out,
         q,
@@ -1729,7 +1737,7 @@ def flash_attn_varlen_m16x8(
     return out
 
 
-def flash_attn_batch_m16x8(
+def flash_attn_batch_m32x8(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -1760,7 +1768,8 @@ def flash_attn_batch_m16x8(
     """
     assert q.dtype == torch.bfloat16, f"Expected bf16, got {q.dtype}"
     assert q.dim() == 4, f"Expected 4D BSHD tensor, got rank {q.dim()}"
-    assert q.shape[-1] == 128, f"Expected qk_hdim=128, got {q.shape[-1]}"
+    qk_hdim = q.shape[-1]
+    assert qk_hdim in SUPPORTED_QK_HDIM, f"Expected qk_hdim in {SUPPORTED_QK_HDIM}, got {qk_hdim}"
     assert v.shape[-1] == 128, f"Expected v_hdim=128, got {v.shape[-1]}"
 
     batch, seq_len_q, nheads_q, _ = q.shape
@@ -1827,11 +1836,11 @@ def flash_attn_batch_m16x8(
     stride_v_head = v.stride(2)
     stride_o_head = out.stride(2)
 
-    _ensure_bshd_kernel(mask_left, mask_right, bool(return_lse), has_sink, gqa)
+    _ensure_bshd_kernel(mask_left, mask_right, bool(return_lse), has_sink, gqa, qk_hdim=qk_hdim)
 
     _run_compiled(
         _launch_fns[
-            ("bshd", mask_left, mask_right, bool(return_lse), has_sink, gqa)
+            ("bshd", mask_left, mask_right, bool(return_lse), has_sink, gqa, qk_hdim)
         ],
         out,
         q,
