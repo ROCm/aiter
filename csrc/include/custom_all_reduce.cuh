@@ -777,6 +777,37 @@ __global__ void __launch_bounds__(512, 1) allgather_lastdim(RankData* _dp,
     end_sync<ngpus, true>(sg, self_sg, rank);
 }
 
+
+/*
+ * owner_read_gather: each thread copies one row from its designated owner
+ * rank's IPC-registered buffer.  Used for the DSA K-pool CP exchange where
+ * each destination rank needs only a subset of rows from each source rank,
+ * avoiding the full AllGather + discard pattern.  The owner_rank device array
+ * maps each output row to the rank that owns the source data.
+ */
+template <typename T, int ngpus>
+__global__ void __launch_bounds__(512, 1) owner_read_gather(
+    RankData* _dp, RankSignals sg, Signal* self_sg,
+    T* __restrict__ result, int rank,
+    int n_total, int last_dim, const int* __restrict__ owner_rank)
+{
+    start_sync<ngpus>(sg, self_sg, rank);
+
+    int tid    = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = gridDim.x * blockDim.x;
+
+    for(int row = tid; row < n_total; row += stride)
+    {
+        int owner    = owner_rank[row];
+        const T* src = (const T*)_dp->ptrs[owner] + row * last_dim;
+        T* dst       = result + row * last_dim;
+        for(int j = 0; j < last_dim; j++)
+            dst[j] = src[j];
+    }
+
+    end_sync<ngpus, true>(sg, self_sg, rank);
+}
+
 // ========== reduce_scatter kernel start ==========
 //
 // reduce_scatter has 3 categories depending on where the scatter dim sits in
@@ -4081,6 +4112,36 @@ void dispatchAllGather(
             break;
         default: printf("allgather world_size error\n");
         }
+    }
+}
+
+
+template <typename T>
+void dispatchOwnerReadGather(
+    hipStream_t stream, T* input, T* output,
+    int n_total, int last_dim, const int* owner_rank)
+{
+    RankData* ptrs = get_buffer_RD(stream, input);
+    dim3 block(512);
+    int block_num = std::min((n_total + 511) / 512, 80);
+    dim3 grid(block_num);
+
+    switch(world_size_)
+    {
+    case 8:
+        owner_read_gather<T, 8><<<grid, block, 0, stream>>>(
+            ptrs, sg_, self_sg_, output, rank_, n_total, last_dim, owner_rank);
+        break;
+    case 4:
+        owner_read_gather<T, 4><<<grid, block, 0, stream>>>(
+            ptrs, sg_, self_sg_, output, rank_, n_total, last_dim, owner_rank);
+        break;
+    case 2:
+        owner_read_gather<T, 2><<<grid, block, 0, stream>>>(
+            ptrs, sg_, self_sg_, output, rank_, n_total, last_dim, owner_rank);
+        break;
+    default: printf("owner_read_gather world_size error
+");
     }
 }
 

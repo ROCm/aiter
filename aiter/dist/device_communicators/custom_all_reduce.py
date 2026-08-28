@@ -1414,6 +1414,30 @@ class CustomAllreduce:
             )
         return out
 
+    def owner_read_gather(
+        self,
+        inp: torch.Tensor,
+        owner_rank: torch.Tensor,
+        out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        # Selective owner-read gather for DSA K-pool CP exchange.
+        # Each rank reads only its assigned rows from each source rank
+        # IPC-registered buffer, avoiding full AllGather + discard.
+        # owner_rank (int32 device tensor) maps each output row to owner.
+        if out is None:
+            out = torch.empty_like(inp)
+        assert is_weak_contiguous(out), "output not weak-contiguous"
+        ops.owner_read_gather(
+            self._ptr,
+            inp,
+            self._pool["input"].data_ptr,
+            out,
+            self._pool["input"].max_size,
+            owner_rank.data_ptr(),
+        )
+        return out
+
+
     # Int dtypes have no fp counterpart in the C++ dispatch enum, but the
     # all-gather kernel is pure memcpy parametrized only by sizeof(T). View
     # ints as same-size floats so callers gathering token-id tensors work

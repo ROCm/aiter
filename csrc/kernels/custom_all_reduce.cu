@@ -524,6 +524,47 @@ void all_gather_unreg(fptr_t _fa,
                 last_dim_size, dim);
 }
 
+static void _owner_read_gather(fptr_t _fa, void* inp, void* out,
+    int n_total, int last_dim, AiterDtype dtype, const int* owner_rank)
+{
+    hipStream_t stream = aiter::getCurrentHIPStream();
+    auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
+
+    switch(dtype)
+    {
+    case AITER_DTYPE_u8: {
+        fa->dispatchOwnerReadGather<uint8_t>(stream,
+            reinterpret_cast<uint8_t*>(inp), reinterpret_cast<uint8_t*>(out),
+            n_total, last_dim, owner_rank);
+        break;
+    }
+    default:
+        throw std::runtime_error("owner_read_gather currently supports uint8 only");
+    }
+}
+
+void owner_read_gather(fptr_t _fa,
+                       const aiter_tensor_t& inp,
+                       int64_t reg_buffer,
+                       const aiter_tensor_t& out,
+                       int64_t reg_bytes,
+                       int64_t owner_rank_ptr)
+{
+    HipDeviceGuard device_guard(inp.device_id);
+    hipStream_t stream = aiter::getCurrentHIPStream();
+    int64_t data_bytes = inp.numel() * inp.element_size();
+    int64_t last_dim_size = inp.size(-1);
+    int n_total = out.size(0);
+
+    if(data_bytes > reg_bytes)
+        throw std::runtime_error("registered buffer is too small to contain the input");
+    HIP_CALL(hipMemcpyAsync((void*)reg_buffer, inp.data_ptr(), data_bytes,
+                            hipMemcpyDeviceToDevice, stream));
+    _owner_read_gather(_fa, (void*)reg_buffer, out.data_ptr(),
+                       n_total, (int)last_dim_size, inp.dtype(),
+                       (const int*)owner_rank_ptr);
+}
+
 void fused_allreduce_rmsnorm(fptr_t _fa,
                              const aiter_tensor_t& inp,
                              const aiter_tensor_t& res_inp,

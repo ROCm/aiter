@@ -571,6 +571,14 @@ namespace py = pybind11;
           py::arg("out"),                                                            \
           py::arg("reg_bytes"),                                                      \
           py::arg("dim"));                                                           \
+    m.def("owner_read_gather",                                                     \
+          &aiter::owner_read_gather,                                               \
+          py::arg("_fa"),                                                         \
+          py::arg("inp"),                                                         \
+          py::arg("reg_buffer"),                                                  \
+          py::arg("out"),                                                         \
+          py::arg("reg_bytes"),                                                   \
+          py::arg("owner_rank_ptr"));                                             \
     m.def("fused_allreduce_rmsnorm",                                                 \
           &aiter::fused_allreduce_rmsnorm,                                           \
           py::arg("_fa"),                                                            \

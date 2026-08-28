@@ -70,6 +70,18 @@ def all_gather_unreg(
 
 
 @compile_ops("module_custom_all_reduce", develop=True)
+
+@compile_ops("module_custom_all_reduce", develop=True)
+def owner_read_gather(
+    _fa: int,
+    inp: torch.Tensor,
+    reg_buffer: int,
+    out: torch.Tensor,
+    reg_bytes: int,
+    owner_rank_ptr: int,
+) -> None: ...
+
+
 def fused_allreduce_rmsnorm(
     _fa: int,
     inp: torch.Tensor,
