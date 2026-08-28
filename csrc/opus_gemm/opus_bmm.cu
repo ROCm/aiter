@@ -20,6 +20,12 @@
 #include "opus_gemm_utils.cuh"  // bf16_t / fp32_t
 #include "aiter_stream.h"
 #include "gfx950/opus_bmm_launchers_a8w8_mxscale_gfx950.cuh"
+#ifdef OPUS_BUILD_HAS_GFX1250
+// Only under the arch flag: the gfx1250 traits derive TDM window types that need
+// clang >= 22, so pulling them into a gfx950-only build would make an unrelated
+// toolchain a hard error for a path that build cannot reach anyway.
+#include "gfx1250/opus_bmm_launchers_a8w8_mxscale_bpreshuffle_gfx1250.cuh"
+#endif
 
 #include <unordered_map>
 
@@ -80,6 +86,56 @@ void opus_bmm_a8w8_mxscale(
   opus_bmm_a8w8_mxscale_tune_dispatch(kernelId)(
       O, wo_a, Y, x_scale, w_scale, splitK);
 #endif  // OPUS_BUILD_HAS_GFX950
+}
+
+// gfx1250 (MI450) sibling of the above, for a PRESHUFFLED B. Separate entry
+// point rather than a kernelId range on opus_bmm_a8w8_mxscale, because the two
+// take a different wo_a: this one wants shuffle_weight(w, (16,16)), and feeding
+// a row-major weight to it is not a shape error -- it reads in bounds and
+// returns wrong numbers. A distinct symbol makes that a call-site decision.
+//
+// The kernel itself is instantiated in
+// opus_bmm_a8w8_mxscale_bpreshuffle_gfx1250.cu (one hand-written tile, no
+// codegen kid yet); the launcher header only forward-declares it, so this TU
+// stays host-pass-only like the rest of the file.
+void opus_bmm_a8w8_mxscale_bpreshuffle(
+    aiter_tensor_t &O,
+    aiter_tensor_t &wo_a,
+    aiter_tensor_t &Y,
+    aiter_tensor_t &x_scale,
+    aiter_tensor_t &w_scale,
+    int splitK,
+    int kernelId)
+{
+#ifndef OPUS_BUILD_HAS_GFX1250
+  (void)O; (void)wo_a; (void)Y; (void)x_scale; (void)w_scale;
+  (void)splitK; (void)kernelId;
+  aiter_detail::g_aiter_can_throw = true;
+  AITER_CHECK(false,
+              "opus_bmm_a8w8_mxscale_bpreshuffle requires "
+              "OPUS_BUILD_HAS_GFX1250 (add gfx1250 to GPU_ARCHS)");
+#else
+  {
+    const auto &arch_info = opus_get_arch_info();
+    AITER_CHECK(arch_info.arch == OpusGfxArch::Gfx1250,
+                "opus_bmm_a8w8_mxscale_bpreshuffle is gfx1250-only; "
+                "current device ", arch_info.dev, " has gcnArchName='",
+                arch_info.name, "'");
+  }
+  // One tile so far, so kernelId only ever selects the output dtype path. It
+  // stays in the signature because the codegen follow-up turns it into a real
+  // kid lookup shaped like opus_bmm_a8w8_mxscale_tune_dispatch above, and
+  // changing the ABI later is worse than carrying an unused argument now.
+  (void)kernelId;
+  if (Y.dtype() == AITER_DTYPE_bf16)
+    opus_bmm_a8w8_mxscale_bpreshuffle_launch_gfx1250<
+        opus_bmm_a8w8_mxscale_bpreshuffle_tile_gfx1250<bf16_t>>(
+        O, wo_a, Y, x_scale, w_scale, splitK);
+  else
+    opus_bmm_a8w8_mxscale_bpreshuffle_launch_gfx1250<
+        opus_bmm_a8w8_mxscale_bpreshuffle_tile_gfx1250<fp32_t>>(
+        O, wo_a, Y, x_scale, w_scale, splitK);
+#endif  // OPUS_BUILD_HAS_GFX1250
 }
 
 #endif  // !__HIP_DEVICE_COMPILE__

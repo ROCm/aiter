@@ -34,6 +34,23 @@ def _gen_bmm_a8w8_scale_fake_tensors(
 # bmm_a8w8_mxscale_opus below.
 @compile_ops(
     "module_deepgemm_opus",
+    fc_name="opus_bmm_a8w8_mxscale_bpreshuffle",
+    gen_fake=_gen_bmm_a8w8_scale_fake_tensors,
+    develop=True,
+)
+def _opus_bmm_a8w8_mxscale_bpreshuffle_raw(
+    x: torch.Tensor,
+    wo_a: torch.Tensor,
+    Y: torch.Tensor,
+    x_scale: torch.Tensor,
+    w_scale: torch.Tensor,
+    splitK: int = 1,
+    kernelId: int = 0,
+) -> None: ...
+
+
+@compile_ops(
+    "module_deepgemm_opus",
     fc_name="opus_bmm_a8w8_mxscale",
     gen_fake=_gen_bmm_a8w8_scale_fake_tensors,
     develop=True,
@@ -170,6 +187,7 @@ def bmm_a8w8_mxscale_opus(
 
 
 __all__ = [
+    "_opus_bmm_a8w8_mxscale_bpreshuffle_raw",
     "_opus_bmm_a8w8_mxscale_raw",
     "bmm_a8w8_mxscale_opus",
 ]

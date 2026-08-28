@@ -315,6 +315,17 @@ namespace py = pybind11;
           py::arg("w_scale"),                            \
           py::arg("splitK") = 2,                         \
           py::arg("kernelId") = 0);
+#define OPUS_BMM_A8W8_MXSCALE_BPRESHUFFLE_PYBIND \
+    m.def("opus_bmm_a8w8_mxscale_bpreshuffle", \
+          &opus_bmm_a8w8_mxscale_bpreshuffle, \
+          "gfx1250 fp8 e8m0 mxscale BMM with shuffle_weight(16,16) wo_a", \
+          py::arg("O"), \
+          py::arg("wo_a"), \
+          py::arg("Y"), \
+          py::arg("x_scale"), \
+          py::arg("w_scale"), \
+          py::arg("splitK") = 1, \
+          py::arg("kernelId") = 0);
 #define OPUS_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_TUNE_PYBIND \
     m.def("opus_gemm_a8w8_blockscale_bpreshuffle_tune",   \
           &opus_gemm_a8w8_blockscale_bpreshuffle_tune,    \
