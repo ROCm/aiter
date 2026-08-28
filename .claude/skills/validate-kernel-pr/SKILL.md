@@ -1,7 +1,7 @@
 ---
 name: validate-kernel-pr
 description: Reproducible validation executor for kernel PRs. Applies an explicit base-to-head patch in an isolated worktree, runs it on a verified-idle GPU, compares the same targets against base, policy-checks the test diff, and emits a head-bound validation_report.json. Missing environment evidence is INCONCLUSIVE, never PASS.
-argument-hint: --repo <worktree> --tests <pytest target>
+argument-hint: --repo <worktree> --target <script file or pytest target>
 ---
 
 # validate-kernel-pr
@@ -48,7 +48,7 @@ gh pr diff "$PR" --repo "$REPO" > "/tmp/pr-$PR.patch"
     --repo "/tmp/pr-$PR" \
     --patch "/tmp/pr-$PR.patch" \
     --head-sha "$HEAD" \
-    --tests tests/kernels/test_softmax.py \
+    --target tests/kernels/test_softmax.py \
     --expected-route kernels.softmax_kernel:build_softmax_module \
     --shape-vars M,N,dtype_str \
     --shape-env ROCDSL_SOFTMAX_SHAPES \
@@ -63,7 +63,7 @@ For a local candidate with no remote head, omit `--head-sha`. The report then re
 | flag | meaning |
 |---|---|
 | `--repo` | worktree to validate (required) |
-| `--tests` | pytest target the PR ships |
+| `--target` | script file or pytest node/file the PR ships (`--tests` remains an alias) |
 | `--patch` | patch to apply first; conflict is a blocker |
 | `--head-sha` | exact remote PR head represented by the patch |
 | `--expected-route` | exact `module:function` route the validator-owned profiler must observe |
@@ -72,8 +72,11 @@ For a local candidate with no remote head, omit `--head-sha`. The report then re
 | `--tol-table` | reference tolerances, e.g. `f32=1e-5,f16=2e-3,bf16=1e-2` |
 | `--label` `--out` | run name and report path (default `./validation_report.json`) |
 
-Environment knobs: `PYLIB` (runtime modules outside the checkout), `PICKER` (path to
-`pick-idle-gpu.py`), `TIMEOUT` (per-pytest budget, default 1800s).
+Environment knobs: `PYLIB` (runtime modules outside the checkout), `PYTHON_BIN` (one interpreter
+used for pytest and script targets), `PICKER` (override the shipped `pick-idle-gpu.py`), and
+`TIMEOUT` (per-target budget, default 1800s). The executor
+overrides `AITER_JIT_DIR` with separate fresh base/head directories and sets
+`PYTHONDONTWRITEBYTECODE=1`, so repository JIT output cannot cross phases or dirty the worktree.
 
 ---
 
@@ -99,7 +102,8 @@ Claim a GPU over a **sampling window**, not one instantaneous reading, and acqui
 lock immediately after selection. Hold that file descriptor for the whole run:
 
 ```bash
-PICK=$(pick-idle-gpu.py --samples 10 --interval 1 --quiet)
+PICK=$(python3 .claude/skills/validate-kernel-pr/pick-idle-gpu.py \
+    --samples 10 --interval 1 --quiet)
 flock /tmp/gpu-$PICK.lock <command>
 ```
 
@@ -147,8 +151,20 @@ A suite that cannot fail is worse than no suite, because it produces a green rep
 
 ### 5 — `correctness` — the repo's tests, then a grid the repo does not run
 
+Runner selection is structural, not assumed:
+
+- an explicit `path::node`, or a file defining `test*`/`Test*`, uses pytest;
+- otherwise a file with an `if __name__ == "__main__"` guard runs as `python <file>`;
+- a file with neither is `skip`, never a test failure.
+
+The report records `test_selection.runner` and `runner_reason`. Script targets can establish that
+their real repository entry point succeeds or fails, but cannot currently use the pytest route
+profiler, so even a successful script run tops out at `INCONCLUSIVE`.
+
 Both, and they are reported separately, because the interesting case is when they disagree.
-Every run emits JUnit XML; a zero-executed/all-skipped target is `skip`, never `pass`.
+Pytest runs emit JUnit XML and a zero-executed/all-skipped target is `skip`, never `pass`.
+Script runs record their process exit and whether they produced output under an explicit
+`script-*` evidence basis; those counters are not described as JUnit.
 
 For a patch run, the validator reverses the exact patch to create the baseline, verifies that the
 worktree is clean, runs both targets under base-only caches, and reapplies the patch before a
@@ -165,7 +181,7 @@ The S1-owned grid must cover three classes the PR's own tests routinely miss:
 | boundary / odd | odd N, N not a multiple of the tile — where tail masks fail |
 | long-context / large M | where 32-bit index arithmetic wraps |
 
-The grid stage runs only when the selected pytest source references the configured
+The grid stage runs only when the selected target source references the configured
 `--shape-env`; otherwise it is `skip` and the verdict is `INCONCLUSIVE`. This is a positive
 control against reporting the same default test run twice under different stage names.
 
@@ -222,7 +238,7 @@ These are fields, not prose, so a report cannot overclaim by omission:
   verdict `INCONCLUSIVE`.
 - **Every declared stage exists.** A stage that did not run is an object with `status: skip` and
   a reason; it never disappears and never becomes a JSON string.
-- **`test_selection`** — the exact pytest target and independent grid chosen by the caller. A
+- **`test_selection`** — the exact target, selected runner, and independent grid. A
   verdict applies only to those named inputs.
 - **`runtime_identity`** — resolved package, interpreter, source SHA, and native artifact hashes.
 - **`execution_receipt`** — observed route, kernel symbols, and exact shapes emitted by the test.
@@ -261,9 +277,12 @@ Deliberately absent rather than half-built — everything shipped here has been 
 a seeded defect, and these have not been:
 
 - **PR fetch orchestration.** There is no `--pr N`. The caller creates the worktree, as above.
-  Choosing the right `--tests` target from a diff is the unsolved part; an irrelevant target can
+  Choosing the right `--target` from a diff is the unsolved part; an irrelevant target can
   still produce `PASS`. The report names the target so a reviewer can reject that evidence, but
   the executor cannot decide relevance itself.
+- **External grid adapters.** A script-only PR target may lack a shape hook. The validator does
+  not yet accept an independently hashed `--extra-target`, because that harness must be bound
+  without changing the PR diff hash or live-base identity. Such runs remain `INCONCLUSIVE`.
 - **Cross-architecture compilation.** `arch_coverage: compile-only` is reserved for a future
   stage that actually invokes an architecture-specific compiler. No-GPU mode does not claim it.
 - **`perf` and `claims` stages.** The schema reserves both — median-of-N against a baseline on the

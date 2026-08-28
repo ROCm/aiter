@@ -10,7 +10,7 @@
 #   * a green pytest with loosened tolerances is not a pass -- tolerances are policy-checked
 #   * GPU is claimed over a sampling window and locked (kernel-profiling-optimization skill)
 #
-# usage: validate_pr.sh --repo <worktree> --tests <pytest target> [--patch p.patch]
+# usage: validate_pr.sh --repo <worktree> --target <test file or pytest node> [--patch p.patch]
 #                       [--head-sha <expected PR head>] [--shape-env VAR]
 #                       [--grid "M,N,dt;..."] [--tol-table f32=1e-5,...]
 #                       --expected-route NAME [--label NAME] [--out report.json]
@@ -29,6 +29,7 @@ LABEL="run"
 OUT=""
 PYLIB="${PYLIB:-}"
 TIMEOUT="${TIMEOUT:-1800}"
+TARGET_PYTHON="${PYTHON_BIN:-$(command -v python3 || command -v python || true)}"
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 
 need_value() {
@@ -41,6 +42,7 @@ need_value() {
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --repo) need_value "$@"; REPO_WT="$2"; shift 2;;
+    --target) need_value "$@"; TESTS="$2"; shift 2;;
     --tests) need_value "$@"; TESTS="$2"; shift 2;;
     --patch) need_value "$@"; PATCHF="$2"; shift 2;;
     --head-sha) need_value "$@"; HEAD_SHA="$2"; shift 2;;
@@ -56,7 +58,7 @@ while [ "$#" -gt 0 ]; do
 done
 
 if [ -z "$REPO_WT" ] || [ -z "$TESTS" ]; then
-  echo "--repo and --tests are required" >&2
+  echo "--repo and --target are required" >&2
   exit 2
 fi
 if ! git -C "$REPO_WT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
@@ -73,6 +75,10 @@ if [ -n "$HEAD_SHA" ] && [[ ! "$HEAD_SHA" =~ ^[0-9a-fA-F]{40}$ ]]; then
 fi
 if [[ ! "$TIMEOUT" =~ ^[1-9][0-9]*$ ]]; then
   echo "TIMEOUT must be a positive integer" >&2
+  exit 2
+fi
+if [ -z "$TARGET_PYTHON" ] || [ ! -x "$TARGET_PYTHON" ]; then
+  echo "no executable target Python interpreter; set PYTHON_BIN" >&2
   exit 2
 fi
 
@@ -167,19 +173,31 @@ PY
 }
 
 mark_runtime_coverage() {
-  python3 - "$JSON" "$1" <<'PY'
+  python3 - "$JSON" "$1" "$2" "$3" <<'PY'
 import json
+import pathlib
 import sys
 
-report_path, raw_stats = sys.argv[1:3]
+report_path, raw_stats, runner, log_path = sys.argv[1:5]
 stats = json.loads(raw_stats)
 if stats["executed"] < 1:
+    raise SystemExit(0)
+if runner == "script" and pathlib.Path(log_path).stat().st_size == 0:
     raise SystemExit(0)
 data = json.load(open(report_path))
 gpu = data["stages"].get("gpu_claim", {})
 arch = gpu.get("arch")
 if gpu.get("status") == "pass" and arch:
     data["arch_coverage"][arch] = "runtime"
+    data.setdefault("arch_coverage_basis", {})[arch] = (
+        f"pytest-junit-executed:{stats['executed']}"
+        if runner == "pytest"
+        else (
+            "script-exit-zero-with-output"
+            if stats["failures"] == 0
+            else "script-nonzero-with-output"
+        )
+    )
     json.dump(data, open(report_path, "w"), indent=2)
 PY
 }
@@ -278,10 +296,15 @@ record_gpu_activity_after() {
   if [ -z "$PICK" ]; then
     return
   fi
-  ACTIVITY_AFTER=$(HIP_ID="$PICK" python3 - <<'PY'
+  ACTIVITY_AFTER=$(HIP_ID="$PICK" python3 - "$SCRIPT_DIR/pick-idle-gpu.py" <<'PY'
+import importlib.util
 import os
+import sys
 
-import amdsmi
+spec = importlib.util.spec_from_file_location("validation_gpu_picker", sys.argv[1])
+picker = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(picker)
+amdsmi = picker.import_amdsmi()
 
 requested = int(os.environ["HIP_ID"])
 amdsmi.amdsmi_init()
@@ -309,13 +332,16 @@ jset_string "started_utc" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 jset_json "isolation" \
   '{"level":"git-worktree + private caches","container":false,"reason":"tests run in the supplied worktree with private HOME and compiler caches"}'
 jset_json "arch_coverage" '{}'
+jset_json "arch_coverage_basis" '{}'
 jset_json "degraded_mode" 'null'
 jset_json "runtime_identity" 'null'
-jset_string "test_selection.pytest_target" "$TESTS"
+jset_string "test_selection.target" "$TESTS"
 jset_string "test_selection.shape_env" "$SHAPE_ENV"
 jset_string "test_selection.grid" "$GRID"
 jset_string "test_selection.expected_route" "$EXPECTED_ROUTE"
 jset_string "test_selection.shape_vars" "$SHAPE_VARS"
+jset_string "test_selection.runner" "unresolved"
+jset_string "test_selection.runner_reason" "merge simulation has not completed"
 
 # ---------- stage 1: merge simulation ----------
 BASE_SHA=$(git -C "$REPO_WT" rev-parse HEAD)
@@ -370,9 +396,12 @@ fi
 # ---------- stage 2: GPU claim (sampling window + whole-run lock) ----------
 PICKER="${PICKER:-$(command -v pick-idle-gpu.py || true)}"
 if [ -z "$PICKER" ]; then
-  for candidate in "$HOME/.local/bin/pick-idle-gpu.py" \
+  for candidate in "$SCRIPT_DIR/pick-idle-gpu.py" \
+                   "$HOME/.local/bin/pick-idle-gpu.py" \
                    /usr/local/bin/pick-idle-gpu.py /opt/bin/pick-idle-gpu.py; do
-    if [ -x "$candidate" ]; then
+    if [ -x "$candidate" ] || {
+      [ "$candidate" = "$SCRIPT_DIR/pick-idle-gpu.py" ] && [ -r "$candidate" ]
+    }; then
       PICKER="$candidate"
       break
     fi
@@ -381,12 +410,14 @@ fi
 
 PICK=""
 GPU_LOCK_FD=""
-if [ -z "$PICKER" ] || [ ! -x "$PICKER" ]; then
+if [ -z "$PICKER" ] || { [ ! -x "$PICKER" ] && [ ! -r "$PICKER" ]; }; then
   stage_note "gpu_claim" "skip" "pick-idle-gpu.py is unavailable"
   jset_string "degraded_mode" "NO_GPU"
   finding "note" "gpu_claim" "GPU idleness could not be established; no runtime correctness claim is made"
 else
-  PICK=$("$PICKER" --samples 10 --interval 1 --quiet 2>"$WORK/gpu-picker.log")
+  PICKER_CMD=("$PICKER")
+  [ -x "$PICKER" ] || PICKER_CMD=(python3 "$PICKER")
+  PICK=$("${PICKER_CMD[@]}" --samples 10 --interval 1 --quiet 2>"$WORK/gpu-picker.log")
   PICK_RC=$?
   if [ "$PICK_RC" -ne 0 ] || [[ ! "$PICK" =~ ^[0-9]+$ ]]; then
     PICK=""
@@ -403,12 +434,17 @@ else
       jset_string "degraded_mode" "NO_GPU"
       finding "note" "gpu_claim" "GPU claim raced with another process; no runtime correctness claim is made"
     else
-      GPU_INFO=$(HIP_ID="$PICK" python3 - <<'PY'
+      GPU_INFO=$(HIP_ID="$PICK" python3 - "$SCRIPT_DIR/pick-idle-gpu.py" <<'PY'
+import importlib.util
 import json
 import os
 import socket
+import sys
 
-import amdsmi
+spec = importlib.util.spec_from_file_location("validation_gpu_picker", sys.argv[1])
+picker = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(picker)
+amdsmi = picker.import_amdsmi()
 
 requested = int(os.environ["HIP_ID"])
 amdsmi.amdsmi_init()
@@ -462,6 +498,7 @@ RUNTIME_OK=0
 RUNTIME_SOURCE_CHANGED=0
 RC_OUT=""
 RC=0
+mkdir -p "$WORK/head/aiter-jit"
 if [ -n "$PATCHF" ]; then
   RUNTIME_SOURCE_CHANGED=$(python3 - "$PATCHF" <<'PY'
 import re
@@ -492,9 +529,10 @@ case "$REPO_KIND" in
     PROBE_PATH="$REPO_WT${PYLIB:+:$PYLIB}"
     RC_OUT=$(
       cd "$REPO_WT" \
-        && AITER_TRITON_ONLY=1 PYTHONDONTWRITEBYTECODE=1 \
+        && AITER_TRITON_ONLY=1 AITER_JIT_DIR="$WORK/head/aiter-jit" \
+          PYTHONDONTWRITEBYTECODE=1 \
           PYTHONPATH="$PROBE_PATH" timeout 300 \
-          python3 - "$REPO_WT" 2>&1 <<'PY'
+          "$TARGET_PYTHON" - "$REPO_WT" 2>&1 <<'PY'
 import importlib
 import pathlib
 import sys
@@ -527,7 +565,7 @@ PY
       RC_OUT=$(
         cd "$REPO_WT" \
           && PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$PROBE_PATH" timeout 300 \
-            python3 - "$REPO_WT/python/flydsl/__init__.py" \
+            "$TARGET_PYTHON" - "$REPO_WT/python/flydsl/__init__.py" \
               "$EXPECTED_FLYDSL_ROOT" 2>&1 <<'PY'
 import importlib
 import pathlib
@@ -575,9 +613,10 @@ if [ "$RC" -eq 0 ]; then
     [ -n "$PYLIB" ] && DEPENDENCY_ARGS=(--dependency-root "$PYLIB")
     (
       cd "$REPO_WT" \
-        && AITER_TRITON_ONLY=1 PYTHONDONTWRITEBYTECODE=1 \
+        && AITER_TRITON_ONLY=1 AITER_JIT_DIR="$WORK/head/aiter-jit" \
+          PYTHONDONTWRITEBYTECODE=1 \
           PYTHONPATH="$PROBE_PATH" timeout 300 \
-          python3 "$SCRIPT_DIR/validate_evidence.py" runtime aiter "$REPO_WT" \
+          "$TARGET_PYTHON" "$SCRIPT_DIR/validate_evidence.py" runtime aiter "$REPO_WT" \
           "${DEPENDENCY_ARGS[@]}" --output "$IDENTITY_FILE"
     ) >"$WORK/runtime-identity.log" 2>&1
     IDENTITY_RC=$?
@@ -585,7 +624,7 @@ if [ "$RC" -eq 0 ]; then
     (
       cd "$REPO_WT" \
         && PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$PROBE_PATH" \
-          timeout 300 python3 "$SCRIPT_DIR/validate_evidence.py" runtime flydsl \
+          timeout 300 "$TARGET_PYTHON" "$SCRIPT_DIR/validate_evidence.py" runtime flydsl \
           "$EXPECTED_FLYDSL_ROOT" --output "$IDENTITY_FILE"
     ) >"$WORK/runtime-identity.log" 2>&1
     IDENTITY_RC=$?
@@ -756,6 +795,70 @@ else
 fi
 TEST_PYTHONPATH="$PROBE_DIR:$SCRIPT_DIR:$TEST_PYTHONPATH"
 TEST_FILE=${TESTS%%::*}
+TARGET_PATH="$REPO_WT/$TEST_FILE"
+RUNNER_JSON=$(python3 - "$TARGET_PATH" "$TESTS" <<'PY'
+import ast
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+selector = sys.argv[2]
+if "::" in selector:
+    result = {"runner": "pytest", "reason": "explicit pytest node selector"}
+elif not path.is_file():
+    result = {"runner": "none", "reason": "target file does not exist on head"}
+else:
+    try:
+        tree = ast.parse(path.read_text())
+    except (OSError, SyntaxError) as error:
+        result = {"runner": "none", "reason": f"target AST is not readable: {error}"}
+    else:
+        has_pytest = any(
+            (
+                isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and node.name.startswith("test")
+            )
+            or (isinstance(node, ast.ClassDef) and node.name.startswith("Test"))
+            for node in tree.body
+        )
+        has_main = any(
+            isinstance(node, ast.If)
+            and isinstance(node.test, ast.Compare)
+            and isinstance(node.test.left, ast.Name)
+            and node.test.left.id == "__name__"
+            and len(node.test.ops) == 1
+            and isinstance(node.test.ops[0], ast.Eq)
+            and len(node.test.comparators) == 1
+            and isinstance(node.test.comparators[0], ast.Constant)
+            and node.test.comparators[0].value == "__main__"
+            for node in tree.body
+        )
+        if has_pytest:
+            result = {"runner": "pytest", "reason": "target defines pytest test nodes"}
+        elif has_main:
+            result = {"runner": "script", "reason": "target has a __main__ entry point"}
+        else:
+            result = {"runner": "none", "reason": "target has no pytest nodes or __main__ entry point"}
+print(json.dumps(result))
+PY
+)
+TARGET_RUNNER=$(python3 - "$RUNNER_JSON" <<'PY'
+import json
+import sys
+
+print(json.loads(sys.argv[1])["runner"])
+PY
+)
+TARGET_RUNNER_REASON=$(python3 - "$RUNNER_JSON" <<'PY'
+import json
+import sys
+
+print(json.loads(sys.argv[1])["reason"])
+PY
+)
+jset_string "test_selection.runner" "$TARGET_RUNNER"
+jset_string "test_selection.runner_reason" "$TARGET_RUNNER_REASON"
 GRID_HOOK_OK=0
 if [ -n "$SHAPE_ENV" ] && [ -n "$GRID" ] \
     && [ -f "$REPO_WT/$TEST_FILE" ]; then
@@ -800,17 +903,19 @@ fi
 run_pytest() {
   local label="$1"
   local shape_assignment="$2"
-  local log="$WORK/pytest-$label.log"
+  local log="$WORK/$TARGET_RUNNER-$label.log"
   local phase=${label%%-*}
   local cache_root="$WORK/$phase"
   local junit="$cache_root/junit-$label.xml"
   local receipt="$cache_root/execution-receipt.json"
   mkdir -p "$cache_root/home" "$cache_root/xdg-cache" \
     "$cache_root/flydsl-cache" "$cache_root/triton-cache" \
-    "$cache_root/torch-extensions" "$cache_root/pytest-cache"
+    "$cache_root/torch-extensions" "$cache_root/pytest-cache" \
+    "$cache_root/aiter-jit"
   rm -f "$junit" "$receipt"
-  python3 - "$SCRIPT_DIR/validation_probe.py" \
-    "$PROBE_DIR/$PROBE_MODULE.py" "$EXPECTED_ROUTE" "$SHAPE_VARS" "$receipt" <<'PY'
+  if [ "$TARGET_RUNNER" = "pytest" ]; then
+    python3 - "$SCRIPT_DIR/validation_probe.py" \
+      "$PROBE_DIR/$PROBE_MODULE.py" "$EXPECTED_ROUTE" "$SHAPE_VARS" "$receipt" <<'PY'
 import pathlib
 import sys
 
@@ -823,6 +928,7 @@ text += (
 )
 pathlib.Path(output).write_text(text)
 PY
+  fi
   local -a environment=(
     "HIP_VISIBLE_DEVICES=$PICK"
     "PYTHONPATH=$TEST_PYTHONPATH"
@@ -833,26 +939,50 @@ PY
     "FLYDSL_RUNTIME_CACHE_DIR=$cache_root/flydsl-cache"
     "TRITON_CACHE_DIR=$cache_root/triton-cache"
     "TORCH_EXTENSIONS_DIR=$cache_root/torch-extensions"
+    "AITER_JIT_DIR=$cache_root/aiter-jit"
     "VALIDATION_PHASE=$label"
   )
   if [ -n "$shape_assignment" ]; then
     environment+=("$shape_assignment")
   fi
-  (
-    cd "$REPO_WT" \
-      && env "${environment[@]}" timeout "$TIMEOUT" \
-        python -m pytest -p "$PROBE_MODULE" "$TESTS" -x -q \
-          --junitxml="$junit" -o "cache_dir=$cache_root/pytest-cache"
-  ) >"$log" 2>&1
+  if [ "$TARGET_RUNNER" = "pytest" ]; then
+    (
+      cd "$REPO_WT" \
+        && env "${environment[@]}" timeout "$TIMEOUT" \
+          "$TARGET_PYTHON" -m pytest -p "$PROBE_MODULE" "$TESTS" -x -q \
+            --junitxml="$junit" -o "cache_dir=$cache_root/pytest-cache"
+    ) >"$log" 2>&1
+  else
+    (
+      cd "$REPO_WT" \
+        && env "${environment[@]}" timeout "$TIMEOUT" "$TARGET_PYTHON" "$TEST_FILE"
+    ) >"$log" 2>&1
+  fi
   local result=$?
   echo "$result|$log"
 }
 
-pytest_stats() {
+target_stats() {
   local label="$1"
+  local result="$2"
   local phase=${label%%-*}
   local junit="$WORK/$phase/junit-$label.xml"
-  if [ -f "$junit" ]; then
+  if [ "$TARGET_RUNNER" = "script" ]; then
+    python3 - "$result" <<'PY'
+import json
+import sys
+
+result = int(sys.argv[1])
+print(json.dumps({
+    "tests": 1,
+    "failures": int(result != 0),
+    "errors": 0,
+    "skipped": 0,
+    "executed": 1,
+    "basis": "script process exit",
+}))
+PY
+  elif [ -f "$junit" ]; then
     python3 "$SCRIPT_DIR/validate_evidence.py" pytest-stats "$junit"
   else
     printf '%s\n' \
@@ -877,9 +1007,12 @@ if [ -z "$PICK" ]; then
 elif [ "$RUNTIME_OK" -ne 1 ]; then
   CAN_TEST=0
   SKIP_REASON="runtime compatibility was not established"
-elif ! (
+elif [ "$TARGET_RUNNER" = "none" ]; then
+  CAN_TEST=0
+  SKIP_REASON="$TARGET_RUNNER_REASON"
+elif [ "$TARGET_RUNNER" = "pytest" ] && ! (
   cd "$REPO_WT" \
-    && PYTHONPATH="$TEST_PYTHONPATH" python -m pytest --version
+    && PYTHONPATH="$TEST_PYTHONPATH" "$TARGET_PYTHON" -m pytest --version
 ) >/dev/null 2>&1; then
   CAN_TEST=0
   SKIP_REASON="python -m pytest is not runnable in this environment"
@@ -914,7 +1047,7 @@ else
         BASE_RESULT=$(run_pytest "base-repo" "")
         BASE_REPO_RC=${BASE_RESULT%%|*}
         BASE_REPO_LOG=${BASE_RESULT##*|}
-        BASE_REPO_STATS=$(pytest_stats "base-repo")
+        BASE_REPO_STATS=$(target_stats "base-repo" "$BASE_REPO_RC")
         if [ "$BASE_REPO_RC" -eq 0 ] \
             && [ "$(stats_field "$BASE_REPO_STATS" executed)" -eq 0 ]; then
           BASE_REPO_STATE="all-skipped"
@@ -936,7 +1069,7 @@ else
             BASE_GRID_RESULT=$(run_pytest "base-grid" "$SHAPE_ENV=$GRID")
             BASE_GRID_RC=${BASE_GRID_RESULT%%|*}
             BASE_GRID_LOG=${BASE_GRID_RESULT##*|}
-            BASE_GRID_STATS=$(pytest_stats "base-grid")
+            BASE_GRID_STATS=$(target_stats "base-grid" "$BASE_GRID_RC")
             if [ "$BASE_GRID_RC" -eq 0 ] \
                 && [ "$(stats_field "$BASE_GRID_STATS" executed)" -eq 0 ]; then
               BASE_GRID_STATE="all-skipped"
@@ -1028,7 +1161,7 @@ PY
     HEAD_RESULT=$(run_pytest "head-repo" "")
     HEAD_RC=${HEAD_RESULT%%|*}
     HEAD_LOG=${HEAD_RESULT##*|}
-    HEAD_STATS=$(pytest_stats "head-repo")
+    HEAD_STATS=$(target_stats "head-repo" "$HEAD_RC")
     HEAD_EXECUTED=$(stats_field "$HEAD_STATS" executed)
     python3 - "$JSON" "$HEAD_RC" "$HEAD_LOG" "$HEAD_STATS" <<'PY'
 import json
@@ -1046,14 +1179,14 @@ data["stages"]["correctness_repo_tests"] = {
 }
 if status == "skip":
     data["stages"]["correctness_repo_tests"]["note"] = (
-        "pytest completed with no executed tests"
+        "target completed with no executed tests"
     )
 json.dump(data, open(path, "w"), indent=2)
 PY
-    mark_runtime_coverage "$HEAD_STATS"
+    mark_runtime_coverage "$HEAD_STATS" "$TARGET_RUNNER" "$HEAD_LOG"
     if [ "$HEAD_RC" -eq 0 ] && [ "$HEAD_EXECUTED" -eq 0 ]; then
       finding "note" "correctness" \
-        "repository pytest target collected no executable tests; no correctness claim is made"
+        "repository target executed no tests; no correctness claim is made"
     elif [ "$HEAD_RC" -ne 0 ]; then
       HEAD_EXCERPT=$(log_excerpt "$HEAD_LOG")
       if [ -z "$PATCHF" ]; then
@@ -1078,18 +1211,18 @@ PY
       HEAD_PROBE_LOG=${HEAD_PROBE_RESULT##*|}
       if [ "$HEAD_PROBE_RC" -eq 0 ]; then
         stage_note "correctness_s1_grid" "skip" \
-          "pytest target ignores the shape environment variable at runtime"
+          "target ignores the shape environment variable at runtime"
         stage_note "execution_receipt" "skip" \
           "shape environment runtime handshake failed"
         jset_json "stages.correctness_s1_grid.hook_probe_exit" "$HEAD_PROBE_RC"
         jset_string "stages.correctness_s1_grid.hook_probe_log" "$HEAD_PROBE_LOG"
         finding "note" "correctness" \
-          "the selected pytest target passes an invalid shape-grid probe, so grid consumption is unproven"
+          "the selected target passes an invalid shape-grid probe, so grid consumption is unproven"
       else
         HEAD_GRID_RESULT=$(run_pytest "head-grid" "$SHAPE_ENV=$GRID")
         HEAD_GRID_RC=${HEAD_GRID_RESULT%%|*}
         HEAD_GRID_LOG=${HEAD_GRID_RESULT##*|}
-        HEAD_GRID_STATS=$(pytest_stats "head-grid")
+        HEAD_GRID_STATS=$(target_stats "head-grid" "$HEAD_GRID_RC")
         HEAD_GRID_EXECUTED=$(stats_field "$HEAD_GRID_STATS" executed)
         python3 - "$JSON" "$HEAD_GRID_RC" "$GRID" "$HEAD_GRID_LOG" \
           "$HEAD_GRID_STATS" "$HEAD_PROBE_RC" "$HEAD_PROBE_LOG" <<'PY'
@@ -1111,14 +1244,14 @@ data["stages"]["correctness_s1_grid"] = {
 }
 if status == "skip":
     data["stages"]["correctness_s1_grid"]["note"] = (
-        "pytest grid completed with no executed tests"
+        "shape-grid target completed with no executed tests"
     )
 json.dump(data, open(path, "w"), indent=2)
 PY
-        mark_runtime_coverage "$HEAD_GRID_STATS"
+        mark_runtime_coverage "$HEAD_GRID_STATS" "$TARGET_RUNNER" "$HEAD_GRID_LOG"
         if [ "$HEAD_GRID_RC" -eq 0 ] && [ "$HEAD_GRID_EXECUTED" -eq 0 ]; then
           finding "note" "correctness" \
-            "shape-grid pytest target executed no tests; no grid claim is made"
+            "shape-grid target executed no tests; no grid claim is made"
         elif [ "$HEAD_GRID_RC" -ne 0 ]; then
           GRID_EXCERPT=$(log_excerpt "$HEAD_GRID_LOG")
           if [ -z "$PATCHF" ]; then
@@ -1155,11 +1288,11 @@ PY
       fi
     elif [ -n "$SHAPE_ENV" ] && [ -n "$GRID" ]; then
       stage_note "correctness_s1_grid" "skip" \
-        "configured shape environment variable is not referenced by the pytest target"
+        "configured shape environment variable is not referenced by the target"
       stage_note "execution_receipt" "skip" \
         "shape-grid hook was not established"
       finding "note" "correctness" \
-        "the selected pytest target does not consume the configured shape-grid hook"
+        "the selected target does not consume the configured shape-grid hook"
     else
       stage_note "correctness_s1_grid" "skip" \
         "kernel exposes no configured shape override; coverage is repo-default-only"

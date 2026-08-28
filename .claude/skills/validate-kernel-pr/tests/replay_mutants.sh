@@ -92,7 +92,7 @@ for entry in "${CASES[@]}"; do
   "$SKILL_DIR/validate_pr.sh" \
     --repo "$ACTIVE_WORKTREE" \
     --patch "$ACTIVE_PATCH" \
-    --tests "$TESTS" \
+    --target "$TESTS" \
     --expected-route kernels.norm.softmax_kernel:build_softmax_module \
     --shape-vars M,N,dtype_str \
     --shape-env "$SHAPE_ENV" \
