@@ -31,6 +31,10 @@ misleading read for ``qr_int4``.
 the question the table answers is "how fast does my (M, hidden) bf16 all-reduce
 finish", not "how efficiently is the wire used".
 
+Every ``us`` is hipEvent wall time bracketing the call, not summed per-kernel
+device time, so it includes the peer-wait that dominates the 1-stage kernel.
+The torch profiler is not usable here -- see the note in ``_worker``.
+
 Which kernel runs is chosen by the C++ host dispatch in
 ``csrc/include/custom_all_reduce.cuh`` (``CustomAllreduce::allreduce``), keyed on
 world size and message bytes:
@@ -322,7 +326,20 @@ def _worker(
             # (docs/communication_kernels.md §8.6 item 3).
             dist.barrier(group=group)
             torch.cuda.synchronize()
-            got, us = run_perftest(fn, num_iters=num_iters, num_warmup=num_warmup)
+            # hipEvent timing rather than run_perftest's default torch-profiler
+            # path. Ranks are spawned children, and once the parent has
+            # initialized HIP -- which `import aiter` does at module scope --
+            # some ROCm builds hand the children a profiler that records CPU
+            # ops but no GPU activity. That is silent for RCCL (an aten op with
+            # 0 device time) and fatal for the custom-AR candidates, which
+            # register no aten op at all: the event table comes back empty and
+            # get_trace_perf() raises on the missing host_time_sum column.
+            # Events are also the honest metric here -- they bracket the whole
+            # collective, including the start_sync spin the profiler's
+            # per-kernel device time hides.
+            got, us = run_perftest(
+                fn, num_iters=num_iters, num_warmup=num_warmup, use_cuda_event=True
+            )
 
             sqnr = sqnr_db(got, ref)
             floor = SQNR_FLOOR_DB[name]
@@ -552,7 +569,10 @@ def main():
     parser.add_argument(
         "--profile",
         action="store_true",
-        help="also emit a per-rank chrome trace of every candidate's loop",
+        help="also emit a per-rank chrome trace of every candidate's loop.\n"
+        "On ROCm builds where a spawned rank's profiler sees no GPU activity\n"
+        "(the reason the table itself is timed with hipEvents -- see _worker)\n"
+        "the trace carries CPU rows only.",
     )
     parser.add_argument(
         "-b",
