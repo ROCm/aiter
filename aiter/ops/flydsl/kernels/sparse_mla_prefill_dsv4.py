@@ -367,6 +367,7 @@ def compile_sparse_mla_prefill_dsv4(
     single_request: bool = True,
     rope_bf16: bool = False,
     rope_fp8: bool = False,
+    r1_tb_carry: bool = False,
     vt_inreg: bool = False,
     kv_double_buffer: bool = False,
     kv_pf_late: bool = False,
@@ -399,6 +400,14 @@ def compile_sparse_mla_prefill_dsv4(
                  s_waitcnt was the largest single stall in the kernel (571 + 160
                  cyc/wave-tile across the two regions). Mutually exclusive with
                  rope_bf16, which needs the bf16 bytes the fp8 overwrites.
+    r1_tb_carry: carry region1's token base across its tiles the way TB_CARRY does
+                 for region0, so its KV DMA can issue at the top of the tile instead
+                 of after the address chain. ATT motivated it -- region1 pays 615
+                 cyc/tile at the tile barrier against region0's 169, because the DMA
+                 cannot go out until the chain lands -- but it MEASURED +1.39%
+                 [+1.22, +1.48] SLOWER: the dynamic branch the first region1 tile
+                 needs (its carry arrives from a region0 tile and is invalid) costs
+                 more than the early issue wins. Off by default; kept for A/B.
     rope_bf16:   dot the 64 RoPE dims in bf16 (vLLM NoPE-fp8 / RoPE-bf16
                  contract) instead of re-quantizing them to fp8.
     vt_inreg:    read V straight from the KV tile in GEMM2 and transpose it in
@@ -478,6 +487,9 @@ def compile_sparse_mla_prefill_dsv4(
     # ROPE_FP8 retires the rope prefetch, but the token-base carry is worth keeping
     # on its own: it moves _row_addrs a tile earlier rather than adding a call.
     TB_CARRY = (KV_DB or ROPE_PF or ROPE_FP8) and not R0_CONVERT
+    # Region1 can carry too, but only off the convert path: the convert is the sole
+    # consumer of the scale base, and only the token base is carried.
+    R1_TB_CARRY = TB_CARRY and not R1_CONVERT and bool(r1_tb_carry)
     P_LDS_VT, TOTAL_LDS_BYTES = _lds_layout(ROPE_BF16, VT_INREG, VT_WIDE)
 
     if ROPE_FP8 and ROPE_BF16:
@@ -1786,19 +1798,36 @@ def compile_sparse_mla_prefill_dsv4(
             rse_n = c_zero_f32
             pp = fx.Int64(0)
             rescale = c_one_f32
-            # Region1 never prefetches (its convert path is not a DMA, and it is
-            # always the tail of the tile space), so the carried pair passes
-            # through untouched on that side.
+            # The RoPE pair is region0-only (region1 either DMAs the rope or loads it
+            # synchronously), so it passes through untouched on this side.
             nrp0 = rp0
             nrp1 = rp1
             ntb = tb_c
             if is_r1:
                 local = _raw(ArithValue(global_t_i32) - ArithValue(n0_tiles))
                 kv_ts = _raw(ArithValue(extra_start) + ArithValue(local) * BLOCK_N)
-                tb, sb = _row_addrs(
-                    extra_indices_rsrc, extra_bt_rsrc, extra_num_rows, extra_block_size,
-                    extra_max_blocks, kv_ts, extra_end,
-                )
+                sb = c_zero_i32
+                tb = c_zero_i32
+                if const_expr(R1_TB_CARRY):
+                    # Resolving the address inline costs region1 615 cyc/tile at the
+                    # tile barrier against region0's 169: the DMA cannot issue until
+                    # the chain lands, so the barrier waits on it. Carrying the base
+                    # lets the DMA go out at the top of the tile as region0's does.
+                    # The first region1 tile is the exception -- its carry comes from
+                    # a region0 tile computed against main_*, which is -1 past
+                    # main_end -- so that one still resolves inline.
+                    if _raw(ArithValue(local) == 0):
+                        tb = _row_addrs(
+                            extra_indices_rsrc, extra_bt_rsrc, extra_num_rows,
+                            extra_block_size, extra_max_blocks, kv_ts, extra_end,
+                        )[0]
+                    else:
+                        tb = tb_c
+                else:
+                    tb, sb = _row_addrs(
+                        extra_indices_rsrc, extra_bt_rsrc, extra_num_rows,
+                        extra_block_size, extra_max_blocks, kv_ts, extra_end,
+                    )
                 if const_expr(R1_CONVERT):
                     _load_nope_convert(
                         extra_cache_rsrc, cur_warp, tb, sb,
@@ -1810,6 +1839,12 @@ def compile_sparse_mla_prefill_dsv4(
                     _dma_rope_block(extra_cache_rsrc, cur_warp, tb)
                 else:
                     _load_rope_block(extra_cache_rsrc, cur_warp, tb, cur_rbf)
+                if const_expr(R1_TB_CARRY):
+                    kv_ts_next = _raw(ArithValue(kv_ts) + BLOCK_N)
+                    ntb = _row_addrs(
+                        extra_indices_rsrc, extra_bt_rsrc, extra_num_rows,
+                        extra_block_size, extra_max_blocks, kv_ts_next, extra_end,
+                    )[0]
                 _barrier(vmcnt=0, lgkmcnt=0)
                 rocdl.sched_barrier(0)
                 rm_n, rse_n, pp, rescale = _process_tile_gemm1(
