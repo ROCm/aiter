@@ -951,16 +951,16 @@ def _core_attention(
             _drain_barrier()
             k_values = k_mgr.load_k_to_reg(k_curr)
             _prefetch(addr)
-            rocdl.s_wait_dscnt(0)
             _named_barrier_pair(warp_idx)
         else:
             _drain_barrier()
             _prefetch(addr)
             _named_barrier_pair(warp_idx)
             k_values = k_mgr.load_k_to_reg(k_curr)
-            rocdl.s_wait_dscnt(0)
 
-        # Fence the drained K burst out of the WMMA stream (no wmma<-ds_load bubble).
+        # Fence the K burst out of the WMMA stream (no wmma<-ds_load bubble). No explicit
+        # s_wait_dscnt: the K ds_load is SSA-visible, so mode-2 inserts the dscnt cover
+        # itself, placed optimally so the WMMA can issue as soon as its operands land.
         rocdl.sched_barrier(0)
 
         # ---- GEMM1: S^T = K @ Q^T for this KV tile (== P^T pre-softmax); consumes the
