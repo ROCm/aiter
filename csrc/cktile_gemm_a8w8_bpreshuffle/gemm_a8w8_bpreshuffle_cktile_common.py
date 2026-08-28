@@ -411,5 +411,7 @@ else:
 # Must include kernels from ALL arches, not just the current get_gfx() arch.
 # In a multi-target build (GPU_ARCHS=gfx942;gfx950), get_gfx() returns only the
 # last entry, but build_tune_dict processes CSV rows for all build targets.
-_all_bpreshuffle_kernels = {**expand_blockpercu(kernels_list_942), **expand_blockpercu(kernels_list_950)}
-kernels_by_name = {v.name: v for v in _all_bpreshuffle_kernels.values()}
+# Note: cannot use {**a, **b} merge — both arches use overlapping integer IDs,
+# which would drop entries. Collect values from both dicts instead.
+_all_bpreshuffle_kernels = list(expand_blockpercu(kernels_list_942).values()) + list(expand_blockpercu(kernels_list_950).values())
+kernels_by_name = {v.name: v for v in _all_bpreshuffle_kernels}

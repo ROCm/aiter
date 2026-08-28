@@ -149,5 +149,7 @@ else:
 # last entry (gfx950), but build_tune_dict processes CSV rows for all build targets.
 # If the name registry only has the current arch's kernels, codegen crashes when it
 # encounters a CSV row referencing a kernel name from a different arch.
-_all_cktile_kernels = {**expand_blockpercu(kernels_list_942), **expand_blockpercu(kernels_list_95x)}
-candidate_kernels_by_name = {v.name: v for v in _all_cktile_kernels.values()}
+# Note: cannot use {**a, **b} merge — both arches use overlapping integer IDs,
+# which would drop entries. Collect values from both dicts instead.
+_all_cktile_kernels = list(expand_blockpercu(kernels_list_942).values()) + list(expand_blockpercu(kernels_list_95x).values())
+candidate_kernels_by_name = {v.name: v for v in _all_cktile_kernels}
