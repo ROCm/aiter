@@ -507,6 +507,9 @@ __global__ void radix_kernel_persistent(T const* in,
                 atomicAdd(histogram + i, histogram_smem[i]);
             }
         }
+        // Every wave drains its own no-return histogram atomics before
+        // thread 0 participates in the cross-block arrival counter.
+        asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
         __syncthreads();
 
         // Cross-block barrier via atomicInc + spin-wait.
@@ -520,27 +523,26 @@ __global__ void radix_kernel_persistent(T const* in,
         {
             if(threadIdx.x == 0)
             {
-                __atomic_store_n(reinterpret_cast<volatile unsigned int*>(&counter->pass_done),
-                                 static_cast<unsigned int>(pass + 1), __ATOMIC_RELEASE);
+                __hip_atomic_store(&counter->pass_done,
+                                   static_cast<unsigned int>(pass + 1),
+                                   __ATOMIC_RELEASE,
+                                   __HIP_MEMORY_SCOPE_AGENT);
             }
-            // Every wave in the elected block must acquire device-scope
-            // visibility before reloading the global histogram. Unlike
-            // __threadfence(), this omits the unnecessary release side.
-            __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
-            __syncthreads();
         }
-        else
+        if(threadIdx.x == 0)
         {
-            if(threadIdx.x == 0)
+            unsigned int target = static_cast<unsigned int>(pass + 1);
+            while(__hip_atomic_load(&counter->pass_done,
+                                    __ATOMIC_RELAXED,
+                                    __HIP_MEMORY_SCOPE_AGENT) < target)
             {
-                unsigned int target = static_cast<unsigned int>(pass + 1);
-                while(__atomic_load_n(reinterpret_cast<volatile unsigned int*>(&counter->pass_done), __ATOMIC_ACQUIRE) < target)
-                {
-                    __builtin_amdgcn_s_sleep(1);
-                }
+                __builtin_amdgcn_s_sleep(1);
             }
-            __syncthreads();
+            // One acquire/invalidate per block after relaxed polling observes
+            // the released pass value.
+            __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
         }
+        __syncthreads();
 
         // Each block independently computes scan + choose_bucket (same result, no sync needed).
         for(int i = threadIdx.x; i < num_buckets; i += blockDim.x)
