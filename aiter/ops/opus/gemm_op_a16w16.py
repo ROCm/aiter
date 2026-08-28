@@ -199,12 +199,10 @@ def _gfx1250_kids() -> dict:
         return {}
 
 
-@functools.cache
 def _get_opus_workspace(
     device: torch.device, ws_shape: tuple, dtype: torch.dtype
 ) -> torch.Tensor:
-    """Cached split-K workspace with a data_ptr() stable across HIP graph
-    capture and replay.
+    """Split-K workspace, allocated per call.
 
     Allocated with its natural ``[batch, split_k, padded_M, padded_N]`` element
     shape (never a raw byte count) so the tensor is self-describing and matches
@@ -213,13 +211,17 @@ def _get_opus_workspace(
 
     A single torch.empty path serves eager AND capture: torch's caching
     allocator is HIP graph-capture aware, so a torch.empty issued while a
-    capture is active is drawn from the graph's mempool and gets a stable
-    address that stays valid on replay -- exactly how a captured graph allocates
-    all of its other intermediates. lru_cache (keyed by device/ws_shape/dtype)
-    keeps the tensor alive for the process lifetime, so a shape first seen in an
-    eager pass is simply reused (cache hit) when its cudagraph is later captured,
-    and a shape first seen inside capture keeps that buffer pinned for every
-    subsequent replay. No eager pre-warm is required.
+    capture is active is drawn from the graph's mempool and gets an address that
+    stays valid on replay -- exactly how a captured graph allocates all of its
+    other intermediates.
+
+    This used to be @functools.cache'd, to pin one buffer per
+    (device, shape, dtype) for the process lifetime. That is bounded for
+    inference, which sees a handful of shapes, but the tuner sweeps every
+    (tile padding x split_k) pair: 1065 distinct buffers totalling 450 GiB on a
+    432 GiB part, which is what exhausted VRAM mid-tune. Nothing needs the
+    buffers to outlive the call -- only one is live at a time -- so they are not
+    kept.
     """
     return torch.empty(ws_shape, dtype=dtype, device=device)
 
@@ -257,9 +259,16 @@ def _alloc_splitk_workspace(
             split_k = max(int(inst.fuse_split_k), 1)
             ws_dtype = _OPUS_WS_TORCH_DTYPE.get(inst.fuse_ws_dtype, torch.float32)
         else:
-            # ws-variant: fp32 workspace; launcher clamps split_k down from splitK.
+            # ws-variant: the partial type is the kid's own (its traits D_C, which
+            # the main kernel stores and the reduce reads), so read it off the
+            # instance rather than assuming fp32 -- a bf16-partial kid handed an
+            # fp32 buffer would be walked at the wrong stride by both ends.
+            # split_k is runtime, and the launcher clamps it DOWN from splitK, so
+            # splitK is a safe upper bound for sizing.
             split_k = max(1, int(splitK))
-            ws_dtype = torch.float32
+            ws_dtype = _OPUS_WS_TORCH_DTYPE.get(
+                getattr(inst, "splitk_workspace_dtype", "fp32_t"), torch.float32
+            )
     else:
         # Kid table unavailable: widest-element (fp32) upper bound. split_k must
         # cover a fuse kid's max baked split_k (15) and any runtime splitK.
@@ -321,10 +330,13 @@ def opus_gemm_a16w16_tune(
         splitK = new_splitK
         bias = None
     _check_a16w16_tune_layout(XQ, WQ, Y)
-    # gfx1250 split-K kids [20000, 30000) need a workspace tensor allocated
-    # externally (torch.empty) and passed to the C++ launcher.
+    # split-K kids need a workspace tensor allocated externally (torch.empty)
+    # and passed to the C++ launcher. Asked through is_splitk_kid() rather than
+    # a literal range: the gfx1250 band is not contiguous (the pre-compiled .co
+    # kids at [21000, 23000) sit inside it and take no workspace at all), and a
+    # second spelling of the range is a second thing to keep in sync.
     workspace = None
-    if 20000 <= kernelId < 30000:
+    if is_splitk_kid(kernelId):
         batch, M, N = Y.shape
         workspace = _alloc_splitk_workspace(kernelId, batch, M, N, splitK, XQ.device)
     # Mono-tile kid guard: the launcher requires N / K to be tile-aligned
@@ -414,6 +426,8 @@ _SPLITK_KID_RANGES = (
     (1200, 1300),  # gfx950 non-OOB mirror (+1000)
     (10200, 10300),  # gfx942 (+10000)
     (20000, 21000),  # gfx1250 cluster/TDM split-K
+    # [21000, 27000) is the pre-compiled .co family -- NOT split-K, no workspace.
+    (27000, 30000),  # gfx1250 fused single-kernel split-K (currently unregistered)
 )
 
 
