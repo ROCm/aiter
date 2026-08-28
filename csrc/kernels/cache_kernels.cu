@@ -1439,7 +1439,9 @@ __global__ void indexer_qk_rope_quant_and_cache_kernel(
     const float weights_scale,
     const bool use_ue8m0,
     const bool preshuffle,
-    const bool is_neox)
+    const bool is_neox,
+    const int max_position,
+    const bool compute_all_q_rope)
 {
     static_assert(HEAD_DIM == 128, "Indexer fused qk cache currently supports head_dim=128");
     static_assert(ROPE_DIM == 64, "Indexer fused qk cache currently supports rope_dim=64");
@@ -1451,10 +1453,10 @@ __global__ void indexer_qk_rope_quant_and_cache_kernel(
         return;
 
     const int64_t slot_idx = slot_mapping[token_idx];
-    if(slot_idx < 0)
+    if(!compute_all_q_rope && slot_idx < 0)
         return;
-
-    const int64_t pos = positions[token_idx];
+    int64_t pos = positions[token_idx];
+    pos = pos < 0 ? 0 : (pos >= max_position ? max_position - 1 : pos);
     const scalar_t* cos_ptr = cos_cache + pos * cos_stride0;
     const scalar_t* sin_ptr = sin_cache + pos * sin_stride0;
 
@@ -1490,13 +1492,11 @@ __global__ void indexer_qk_rope_quant_and_cache_kernel(
         // Match the separate RoPE path, which materializes q_pe before FP8 quant.
         q_val = static_cast<float>(static_cast<scalar_t>(q_val));
     }
-
     auto max_func = [](float a, float b) { return fmaxf(a, b); };
     float q_amax = fabsf(q_val);
     q_amax = block_reduce<float, decltype(max_func), HEAD_DIM, true>(q_amax, max_func);
 
     const float q_fp8_max = static_cast<float>(opus::finfo<cache_t>::max());
-    // Match unfused per_token_group_quant_fp8: reciprocal-multiply + UE8M0.
     const float q_inv_fp8_max = 1.0f / q_fp8_max;
     float q_scale             = fmaxf(q_amax, 1e-10f) * q_inv_fp8_max;
     if(use_ue8m0)
@@ -1514,7 +1514,7 @@ __global__ void indexer_qk_rope_quant_and_cache_kernel(
             w * q_scale * weights_scale;
     }
 
-    if(head_idx != 0)
+    if(head_idx != 0 || slot_idx < 0)
         return;
 
     __shared__ float normed[HEAD_DIM];
@@ -3559,7 +3559,9 @@ void reshape_and_cache_flash(
                                      weights_scale,                                               \
                                      use_ue8m0,                                                   \
                                      do_preshuffle,                                               \
-                                     is_neox);
+                                     is_neox,                                                      \
+                                     max_position,                                                \
+                                     compute_all_q_rope);
 
 #define CALL_CP_GATHER_INDEXER_K_QUANT_CACHE(BLOCK_Y_SIZE)          \
     aiter::cp_gather_indexer_k_quant_cache_kernel<8, BLOCK_Y_SIZE>  \
@@ -4057,7 +4059,8 @@ void indexer_qk_rope_quant_and_cache(
     const std::string& scale_fmt,
     double weights_scale,
     bool preshuffle,
-    bool is_neox)
+    bool is_neox,
+    bool compute_all_q_rope)
 {
     int num_tokens       = std::min(k.size(0), slot_mapping.size(0));
     int head_dim         = k.size(1);
@@ -4065,6 +4068,7 @@ void indexer_qk_rope_quant_and_cache(
     int rope_dim         = cos_cache.size(-1) * 2;
     int cache_block_size = kv_cache.size(1);
     int cache_stride     = kv_cache.size(2);
+    int max_position     = cos_cache.size(0);
     bool use_ue8m0       = scale_fmt == "ue8m0";
     bool do_preshuffle   = preshuffle;
 
@@ -4102,6 +4106,7 @@ void indexer_qk_rope_quant_and_cache(
     AITER_CHECK(cos_cache.size(0) == sin_cache.size(0) &&
                     cos_cache.size(1) == sin_cache.size(1),
                 "cos_cache and sin_cache shapes must match");
+    AITER_CHECK(max_position > 0, "cos_cache and sin_cache must not be empty");
     AITER_CHECK(cos_cache.stride(1) == 1 && sin_cache.stride(1) == 1,
                 "cos_cache and sin_cache last dimension must be contiguous");
     AITER_CHECK(head_dim == 128, "indexer fused qk cache only supports head_dim=128");
