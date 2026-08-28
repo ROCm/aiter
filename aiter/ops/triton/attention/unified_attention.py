@@ -126,7 +126,7 @@ class _UAParams(NamedTuple):
     skip_reduce: bool = False
 
 
-def generate_config_key(params: _UAParams, op: str) -> str:
+def config_key(params: _UAParams, op: str) -> str:
     assert op in ("attn_2d", "attn_3d", "reduce"), f"Unknown config op '{op}'"
 
     if op == "attn_2d":
@@ -677,7 +677,7 @@ def _unified_attention_2d_triton(params: _UAParams):
 
     config, _ = get_unified_attention_config(
         "attn_2d",
-        generate_config_key(params, "attn_2d"),
+        config_key(params, "attn_2d"),
         params.q_dtype,
         params.kv_cache_dtype,
         params.head_size,
@@ -891,7 +891,7 @@ def _unified_attention_2d_gfx1250(params: _UAParams):
 
     config, _ = get_unified_attention_config(
         "attn_2d",
-        generate_config_key(params, "attn_2d"),
+        config_key(params, "attn_2d"),
         params.q_dtype,
         params.kv_cache_dtype,
         params.head_size,
