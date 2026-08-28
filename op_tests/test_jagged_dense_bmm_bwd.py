@@ -5,7 +5,8 @@
 
 Correctness (pytest, Mi=512): dispatch config resolution, cos > 0.999 vs torch-eager
 reference on all three grads (dJagged, dDense, dBias), tail-over-read regression,
-forced split=2 reduce-path coverage, and end-to-end autograd at headline shapes.
+forced split=2 reduce-path coverage, end-to-end autograd at headline shapes, and
+multi-device backward (cuda:1 tensors, current device cuda:0).
 
 Performance (``main()``, Mi=7680): FlyDSL vs upstream Triton on headline deployment
 shapes, swept over regime and backward component (``jagged`` / ``dense_bias`` / ``all``).
@@ -496,6 +497,98 @@ def test_jdbba_bwd_dispatch_worker(D):
 def test_jdbba_bwd_reduce_path(D):
     ok, msg = _run_reduce_path_case(D, 120, 512, "genrec")
     assert ok, msg
+
+
+@_requires_backend
+def test_jdbba_bwd_multi_device():
+    """Backward on cuda:1 while current device is cuda:0 (stream/device dispatch).
+
+    Runs in a subprocess so a HIP context-pollution failure cannot leak into the
+    rest of the session. Validates ``current_stream(device=jagged.device)`` in
+    ``jagged_dense_bmm_bwd_dispatched`` when tensor device != current device.
+
+    If the FlyDSL runtime pins to device 0 internally, the subprocess may raise
+    ``hipErrorInvalidDevice`` and the test is marked xfail (mirrors FMHA).
+    """
+    if torch.cuda.device_count() < 2:
+        pytest.skip("requires >=2 visible GPUs")
+
+    import subprocess
+    import textwrap
+
+    script = textwrap.dedent(f"""
+        import sys
+        sys.path.insert(0, {_REPO_ROOT!r})
+
+        import torch
+        import torch.nn.functional as F
+        from aiter import dtypes
+        from aiter.ops.flydsl import jagged_dense_bmm_bwd_dispatched
+
+        torch.cuda.set_device(0)
+        dev1 = torch.device("cuda", 1)
+        B, D, Mi = 32, 256, 128
+        N, K = D, D
+        seq_offsets = torch.arange(
+            0, (B + 1) * Mi, Mi, dtype=torch.int32, device=dev1
+        )
+        L = int(seq_offsets[-1].item())
+        jagged = torch.randn(L, K, dtype=dtypes.bf16, device=dev1)
+        dense = torch.randn(B, K, N, dtype=dtypes.bf16, device=dev1)
+        d_out = torch.randn(L, N, dtype=dtypes.bf16, device=dev1)
+
+        dj, dd, db = jagged_dense_bmm_bwd_dispatched(
+            jagged, dense, d_out, seq_offsets, n_groups=B, max_seq_len=Mi
+        )
+        torch.cuda.synchronize(dev1)
+        for t in (dj, dd, db):
+            assert t.device == dev1, f"expected {{dev1}} got {{t.device}}"
+
+        d_jagged = torch.zeros((L, K), dtype=dtypes.bf16, device=dev1)
+        d_dense = torch.zeros((B, K, N), dtype=dtypes.bf16, device=dev1)
+        d_bias = torch.zeros((B, N), dtype=dtypes.bf16, device=dev1)
+        for b in range(B):
+            s = int(seq_offsets[b].item())
+            e = int(seq_offsets[b + 1].item())
+            if e > s:
+                go = d_out[s:e].float()
+                d_jagged[s:e] = (go @ dense[b].float().t()).to(dtypes.bf16)
+                d_dense[b] = (jagged[s:e].float().t() @ go).to(dtypes.bf16)
+                d_bias[b] = go.sum(0).to(dtypes.bf16)
+
+        cos_thresh = {_COS_THRESH}
+        for name, got, ref in (
+            ("dJagged", dj, d_jagged),
+            ("dDense", dd, d_dense),
+            ("dBias", db, d_bias),
+        ):
+            c = F.cosine_similarity(
+                got.float().flatten(), ref.float().flatten(), dim=0
+            ).item()
+            assert c > cos_thresh, f"{{name}} cos={{c:.6f}}"
+
+        print("MULTI_DEVICE_OK", flush=True)
+        """)
+
+    proc = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=180,
+        check=False,
+    )
+    combined = (proc.stdout or "") + "\n" + (proc.stderr or "")
+    if "MULTI_DEVICE_OK" in proc.stdout:
+        return
+    if "hipErrorInvalidDevice" in combined or "invalid device ordinal" in combined:
+        pytest.xfail(
+            "FlyDSL runtime pins to device 0; wrapper-level stream/device "
+            "selection is in place but underlying runtime does not honor it"
+        )
+    raise AssertionError(
+        f"multi-device subprocess failed unexpectedly:\n"
+        f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+    )
 
 
 def main(argv=None) -> int:
