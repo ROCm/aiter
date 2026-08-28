@@ -5,9 +5,6 @@ import os
 
 import torch
 import triton
-from aiter.ops.triton.utils.logger import AiterTritonLogger
-from aiter.utility.triton.triton_metadata_redirect import AOTMetadataContext
-
 from aiter.ops.triton._triton_kernels.gemm.fused.fused_gemm_afp4wfp4_mul_add import (
     _fused_gemm_afp4wfp4_mul_add_kernel,
     _fused_gemm_afp4wfp4_mul_add_reduce_kernel,
@@ -15,6 +12,9 @@ from aiter.ops.triton._triton_kernels.gemm.fused.fused_gemm_afp4wfp4_mul_add imp
     _get_config,
 )
 from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.logger import AiterTritonLogger
+from aiter.utility.triton.triton_metadata_redirect import AOTMetadataContext
+
 from aiter.ops.triton.utils.config_utils import AITER_TRITON_CONFIGS_PATH
 
 _LOGGER = AiterTritonLogger()

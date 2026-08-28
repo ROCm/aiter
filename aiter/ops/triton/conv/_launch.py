@@ -45,7 +45,7 @@ from aiter.ops.triton._triton_kernels.conv.nchw_to_cblocked import (
 from aiter.ops.triton._triton_kernels.conv.nchw_to_cblocked import (
     _nchw_to_cblocked_kernel,
 )
-from aiter.ops.triton.utils.config_utils import (
+from aiter.ops.triton.utils.conv_config_utils import (
     format_prepack_shape_key,
     format_shape_key,
 )

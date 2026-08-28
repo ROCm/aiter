@@ -34,11 +34,10 @@ shapes, in op_benchmarks/triton/model_benchmarking_tool/bench_models.py).
 
 import pytest
 import torch
-from aiter.ops.triton.utils._triton.arch_info import get_arch
 
 import aiter.ops.triton.conv.conv2d as conv2d_module
-from aiter.ops.triton.utils import config_utils
-from aiter.ops.triton.utils._config import conv as conv_config_impl
+from aiter.ops.triton.utils import conv_config_utils
+from aiter.ops.triton.utils._triton.arch_info import get_arch
 
 from ._helpers import (
     ALL_SUPPORTED_ARCHS,
@@ -169,15 +168,15 @@ _UNPINNED = {
 @pytest.fixture
 def isolated_conv_config_cache():
     """Keep mocked architectures and synthetic config tables test-local."""
-    config_utils._get_conv_config_cached.cache_clear()
-    config_utils.has_conv_config.cache_clear()
+    conv_config_utils._get_conv_config_cached.cache_clear()
+    conv_config_utils.has_conv_config.cache_clear()
     yield
-    config_utils._get_conv_config_cached.cache_clear()
-    config_utils.has_conv_config.cache_clear()
+    conv_config_utils._get_conv_config_cached.cache_clear()
+    conv_config_utils.has_conv_config.cache_clear()
 
 
 def _use_arch(monkeypatch, arch):
-    monkeypatch.setattr(config_utils.arch_info, "get_arch", lambda: arch)
+    monkeypatch.setattr(conv_config_utils.arch_info, "get_arch", lambda: arch)
 
 
 def _resolve_nchw_3x3(shape, *, stride=None, padding=None):
@@ -242,11 +241,11 @@ def test_conv_config_layout_variant_precedence(monkeypatch, isolated_conv_config
         "any": {"source": "any"},
     }
     monkeypatch.setattr(
-        conv_config_impl, "_get_conv_config_file", lambda _config_name: config
+        conv_config_utils, "_get_conv_config_file", lambda _config_name: config
     )
 
     def selected(*variants, key=shape_key, M=32):
-        return config_utils.get_conv_config(
+        return conv_config_utils.get_conv_config(
             "TEST-CONV-VARIANTS", shape_key=key, M=M, variants=variants
         )["source"]
 

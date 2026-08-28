@@ -27,9 +27,9 @@ from aiter.ops.triton.utils.device_info import get_num_sms
 
 from aiter.ops.triton.utils.config_utils import (
     load_config_json,
-    pick_gemm_num_stages,
     resolve_config_dir,
 )
+from aiter.ops.triton.utils.gemm_config_utils import pick_gemm_num_stages
 
 
 def _get_a8w4_dispatch(arch: str, backend: str) -> dict:

@@ -39,12 +39,12 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
+
 from aiter.ops.triton.conv._utils import (
     _is_1x1_conv,
     _is_3x3_conv,
     _out_hw,
 )
-
 from aiter.ops.triton.conv.conv2d import (
     _select_3x3_method,
     conv2d_nchw,
@@ -54,7 +54,7 @@ from aiter.ops.triton.conv.conv2d import (
     conv2d_winograd_f4x3,
     conv2d_winograd_f4x3_cblocked,
 )
-from aiter.ops.triton.utils.config_utils import has_conv_config
+from aiter.ops.triton.utils.conv_config_utils import has_conv_config
 
 
 def dynamic_conv_tolerances(dtype: torch.dtype, K_red: int):

@@ -6,13 +6,11 @@ import os
 
 import torch
 import triton
+from packaging.version import Version
+
 from aiter.ops.triton._triton_kernels.common.splitk_reduce import (
     _gemm_splitk_reduce_kernel,
 )
-from aiter.ops.triton.utils._triton.arch_info import get_arch
-from aiter.ops.triton.utils.logger import AiterTritonLogger
-from packaging.version import Version
-
 from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a8w8_blockscale import (
     _gemm_a8w8_blockscale_kernel as triton_gemm_a8w8_blockscale_kernel,
 )
@@ -22,7 +20,9 @@ from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a8w8_blockscale import (
 from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a8w8_blockscale import (
     _get_config,
 )
-from aiter.ops.triton.utils.config_utils import compute_splitk_params
+from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton.utils.gemm_config_utils import compute_splitk_params
+from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
 _FORCE_GFX1250_EX = os.environ.get("AITER_FORCE_GFX1250_EX", "0") == "1"

@@ -3,10 +3,10 @@
 
 import triton
 import triton.language as tl
+
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
-
-from aiter.ops.triton.utils.config_utils import get_gemm_config
+from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
 
 _gemm_afp4wfp4_repr = make_kernel_repr(
     "_gemm_afp4wfp4_kernel",
@@ -720,7 +720,7 @@ def _get_config(
     N: int,
     K: int,
     shuffle: bool = False,
-    backend: str = "triton",
+    backend: str | None = None,
 ):
     # Note: Config files use K=2*K in their naming
     K = 2 * K

@@ -2,8 +2,8 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 """MHC config loading: ``get_mhc_config()`` / ``get_mhc_post_config()``,
-with the documented gfx942 arch fallback. Import via
-``aiter.ops.triton.utils.config_utils``.
+with the documented gfx942 arch fallback, on top of the shared core in
+``config_utils``.
 """
 
 import functools
@@ -11,13 +11,12 @@ import glob
 import os
 import re
 
-from aiter.ops.triton.utils.logger import AiterTritonLogger
-
 from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 logger = AiterTritonLogger()
 
-from aiter.ops.triton.utils._config.core import (
+from aiter.ops.triton.utils.config_utils import (
     USE_LRU_CACHE,
     load_config_json,
     resolve_config_dir,

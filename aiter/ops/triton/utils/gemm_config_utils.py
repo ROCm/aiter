@@ -2,7 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 """GEMM config loading: ``get_gemm_config()`` plus the splitk / num-stages
-helpers. Import via ``aiter.ops.triton.utils.config_utils``.
+helpers, on top of the shared core in ``config_utils``.
 """
 
 import copy
@@ -10,13 +10,12 @@ import functools
 import itertools
 
 import triton
-from aiter.ops.triton.utils.logger import AiterTritonLogger
-
 from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 logger = AiterTritonLogger()
 
-from aiter.ops.triton.utils._config.core import (
+from aiter.ops.triton.utils.config_utils import (
     USE_LRU_CACHE,
     load_config_json,
     resolve_config_dir,

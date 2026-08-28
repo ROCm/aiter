@@ -7,10 +7,10 @@ from _utils import (
     get_input_shape_and_config_list,
     run_profile,
 )
-from aiter.ops.triton.gemm.basic.gemm_afp8wfp8 import gemm_afp8wfp8_preshuffle
-from aiter.ops.triton.utils.types import get_fp8_dtypes
 
-from aiter.ops.triton.utils.config_utils import compute_splitk_params
+from aiter.ops.triton.gemm.basic.gemm_afp8wfp8 import gemm_afp8wfp8_preshuffle
+from aiter.ops.triton.utils.gemm_config_utils import compute_splitk_params
+from aiter.ops.triton.utils.types import get_fp8_dtypes
 from op_tests.triton_tests.gemm.basic.test_gemm_afp8wfp8 import (
     generate_inputs,
 )

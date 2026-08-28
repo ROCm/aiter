@@ -3,19 +3,18 @@
 
 """Tuned kernel entries: ``get_tuned_kernel_config()`` for kernels whose
 autotune search space lives in Python and only need one pinned tile per
-device. Import via ``aiter.ops.triton.utils.config_utils``.
+device, on top of the shared core in ``config_utils``.
 """
 
 import functools
 
 import triton
-from aiter.ops.triton.utils.logger import AiterTritonLogger
-
 from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 logger = AiterTritonLogger()
 
-from aiter.ops.triton.utils._config.core import (
+from aiter.ops.triton.utils.config_utils import (
     AITER_TRITON_CONFIGS_PATH,
     USE_LRU_CACHE,
     _dtype_dir,
