@@ -366,6 +366,7 @@ def compile_sparse_mla_prefill_dsv4(
     softmax_scale: float | None = None,
     single_request: bool = True,
     rope_bf16: bool = False,
+    rope_fp8: bool = False,
     vt_inreg: bool = False,
     kv_double_buffer: bool = False,
     kv_pf_late: bool = False,
@@ -392,6 +393,12 @@ def compile_sparse_mla_prefill_dsv4(
                  DMA'd region0 must already be fnuz (r0_convert=False implies
                  r0_is_ocp=False).
     single_request: hardwire req_id=0 instead of reading q_req[q].
+    rope_fp8:    the cache's RoPE tail is already fnuz fp8 in the 64 bytes at
+                 PK_NOPE_BYTES, so block 7 rides the same buffer_load_to_lds as
+                 blocks 0..6 and the bf16->fp8 convert disappears. That convert's
+                 s_waitcnt was the largest single stall in the kernel (571 + 160
+                 cyc/wave-tile across the two regions). Mutually exclusive with
+                 rope_bf16, which needs the bf16 bytes the fp8 overwrites.
     rope_bf16:   dot the 64 RoPE dims in bf16 (vLLM NoPE-fp8 / RoPE-bf16
                  contract) instead of re-quantizing them to fp8.
     vt_inreg:    read V straight from the KV tile in GEMM2 and transpose it in
@@ -453,6 +460,7 @@ def compile_sparse_mla_prefill_dsv4(
     R1_CONVERT = bool(r1_convert)
     SINGLE_REQUEST = bool(single_request)
     ROPE_BF16 = bool(rope_bf16)
+    ROPE_FP8 = bool(rope_fp8)
     VT_INREG = bool(vt_inreg)
     KV_DB = bool(kv_double_buffer)
     KV_PF_LATE = bool(kv_pf_late)
@@ -467,9 +475,16 @@ def compile_sparse_mla_prefill_dsv4(
     # g, which would run that chain twice per tile -- so carry it instead:
     # tile g's tb_next IS tile g+1's tb. Only valid when region0 skips the
     # convert path, which is the only consumer of the scale base.
-    TB_CARRY = (KV_DB or ROPE_PF) and not R0_CONVERT
+    # ROPE_FP8 retires the rope prefetch, but the token-base carry is worth keeping
+    # on its own: it moves _row_addrs a tile earlier rather than adding a call.
+    TB_CARRY = (KV_DB or ROPE_PF or ROPE_FP8) and not R0_CONVERT
     P_LDS_VT, TOTAL_LDS_BYTES = _lds_layout(ROPE_BF16, VT_INREG, VT_WIDE)
 
+    if ROPE_FP8 and ROPE_BF16:
+        raise ValueError(
+            "rope_fp8=True consumes the bf16 rope tail's storage, so it cannot be "
+            "combined with rope_bf16=True, which needs those bytes for the QK dot"
+        )
     if R0_OCP and not R0_CONVERT:
         raise ValueError(
             "r0_is_ocp=True requires r0_convert=True: the OCP->fnuz exponent "
@@ -840,6 +855,31 @@ def compile_sparse_mla_prefill_dsv4(
                 w = rocdl.cvt_pk_fp8_f32(T.i32, _raw(bf[0]), _raw(bf[1]), c_zero_i32, 0)
                 w = rocdl.cvt_pk_fp8_f32(T.i32, _raw(bf[2]), _raw(bf[3]), w, 1)
                 _ptr_store(w, _lds_ptr_from_i32(dst_addr), alignment=4)
+
+        def _dma_rope_block(cache_rsrc, p_lds_kv_warp, token_base_i32):
+            """Block 7 straight from the cache, no register round-trip.
+
+            Valid only when the rope tail is stored pre-quantized to fnuz fp8 in the
+            64 bytes at PK_NOPE_BYTES. _load_nope_dma's addressing already puts
+            block 7 exactly there, so this is the same instruction blocks 0..6 use
+            and it replaces the bf16->fp8 convert whose s_waitcnt was the largest
+            single stall in the kernel.
+            """
+            blk = PK_ROPE_BLOCK
+            lds_adjust = blk * KV_BLOCK_BYTES - blk * KV_NUM_COLS
+            lds_base_i32 = _i32(ArithValue(p_lds_kv_warp) + lds_adjust)
+            is_oob = ArithValue(token_base_i32) == -1
+            if is_oob:
+                lds_addr = _i32(
+                    ArithValue(lds_base_i32) + blk * KV_NUM_COLS + _i32(lane_idx) * 4
+                )
+                _ptr_store(c_zero_i32, _lds_ptr_from_i32(lds_addr), alignment=4)
+            else:
+                voff = _i32(ArithValue(token_base_i32) + kv_ld_col_base)
+                rocdl.buffer_load_to_lds(
+                    cache_rsrc, _lds_ptr_from_i32(lds_base_i32), voff,
+                    offset=blk * KV_NUM_COLS,
+                )
 
         def _load_rope_block(cache_rsrc, p_lds_kv_warp, token_base_i32, rbf_base):
             _commit_rope_block(
@@ -1667,7 +1707,10 @@ def compile_sparse_mla_prefill_dsv4(
                 )
             else:
                 _load_nope_dma(main_cache_rsrc, p_lds_kv_0_warp, tb)
-            _load_rope_block(main_cache_rsrc, p_lds_kv_0_warp, tb, p_lds_rbf_base(0))
+            if const_expr(ROPE_FP8):
+                _dma_rope_block(main_cache_rsrc, p_lds_kv_0_warp, tb)
+            else:
+                _load_rope_block(main_cache_rsrc, p_lds_kv_0_warp, tb, p_lds_rbf_base(0))
             # Tile 1's NoPE blocks are prefetched into buffer 1 during this
             # tile's QK MFMAs; region0 always owns tile 0, so the resource is
             # compile-time fixed. Past the end of region0 the token base is -1
@@ -1695,7 +1738,7 @@ def compile_sparse_mla_prefill_dsv4(
             # Issue tile 1's RoPE load after the softmax, so the softmax's own
             # slot loads do not drag it in via the in-order vmcnt, and nothing
             # before the next tile's barrier waits on it.
-            if const_expr(ROPE_PF):
+            if const_expr(ROPE_PF and not ROPE_FP8):
                 nxt = Vec(_issue_rope_load(main_cache_rsrc, tb_next))
                 rp0_n = nxt[0]
                 rp1_n = nxt[1]
@@ -1763,7 +1806,10 @@ def compile_sparse_mla_prefill_dsv4(
                     )
                 else:
                     _load_nope_dma(extra_cache_rsrc, cur_warp, tb)
-                _load_rope_block(extra_cache_rsrc, cur_warp, tb, cur_rbf)
+                if const_expr(ROPE_FP8):
+                    _dma_rope_block(extra_cache_rsrc, cur_warp, tb)
+                else:
+                    _load_rope_block(extra_cache_rsrc, cur_warp, tb, cur_rbf)
                 _barrier(vmcnt=0, lgkmcnt=0)
                 rocdl.sched_barrier(0)
                 rm_n, rse_n, pp, rescale = _process_tile_gemm1(
@@ -1789,7 +1835,9 @@ def compile_sparse_mla_prefill_dsv4(
                     )
                 elif const_expr(not KV_DB):
                     _load_nope_dma(main_cache_rsrc, cur_warp, tb)
-                if const_expr(ROPE_PF):
+                if const_expr(ROPE_FP8):
+                    _dma_rope_block(main_cache_rsrc, cur_warp, tb)
+                elif const_expr(ROPE_PF):
                     _commit_rope_block(
                         cur_warp, tb, cur_rbf,
                         _raw(Vec.from_elements([rp0, rp1], fx.Int32)),
@@ -1815,7 +1863,7 @@ def compile_sparse_mla_prefill_dsv4(
                     q_nope_packs, rm_in, rse_in, is_first, q_rope_b=q_rope_packs,
                     rbf_base=cur_rbf, **pf_kwargs,
                 )
-                if const_expr(ROPE_PF):
+                if const_expr(ROPE_PF and not ROPE_FP8):
                     nxt = Vec(_issue_rope_load(main_cache_rsrc, tb_next))
                     nrp0 = nxt[0]
                     nrp1 = nxt[1]

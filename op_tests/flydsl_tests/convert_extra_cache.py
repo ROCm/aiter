@@ -108,6 +108,78 @@ def convert_extra_cache_(cache: torch.Tensor, *, has_scale: bool = False) -> tor
     return cache
 
 
+@triton.jit
+def _rope_bf16_to_fp8_kernel(
+    u8_ptr,
+    i16_ptr,
+    n_tokens,
+    block_size: tl.constexpr,
+    NOPE: tl.constexpr,
+    ROPE: tl.constexpr,
+    ROW: tl.constexpr,
+    TOK: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    if pid >= n_tokens:
+        return
+    blk = pid // block_size
+    pos = pid % block_size
+    # bf16 source: 2 bytes per element, so index the i16 view.
+    src = (blk * (block_size * ROW) + pos * TOK + NOPE) // 2
+    offs = tl.arange(0, ROPE)
+    bits = tl.load(i16_ptr + src + offs)
+    v = bits.to(tl.bfloat16, bitcast=True).to(tl.float32)
+    v = tl.where(v != v, 0.0, v)
+    out = v.to(tl.float8e4b8).to(tl.uint8, bitcast=True)
+    # fp8 needs only ROPE bytes, so it lands at the front of the 2*ROPE the bf16
+    # occupied -- exactly where blocks 0..6's DMA addressing puts block 7.
+    dst = blk * (block_size * ROW) + pos * TOK + NOPE
+    tl.store(u8_ptr + dst + offs, out)
+
+
+def quantize_rope_(cache: torch.Tensor) -> torch.Tensor:
+    """In-place bf16 -> fnuz fp8 on the RoPE tail of a packed cache.
+
+    Writes the 64 fp8 bytes over the front half of the 128 bf16 bytes, which is the
+    offset ``_load_nope_dma`` already computes for block 7, so the kernel can DMA
+    the rope with blocks 0..6 instead of running a bf16->fp8 register round-trip
+    (``_commit_rope_block``, the largest single stall in the kernel). The back half
+    becomes dead space; the row size does not change.
+
+    Destructive: the bf16 rope is gone afterwards, so a cache converted this way
+    cannot be used with ``rope_bf16=True``, which needs it for the QK dot.
+    """
+    assert cache.dtype == torch.uint8 and cache.ndim == 3
+    assert cache.shape[2] == CACHE_ROW
+    num_blocks, block_size, _ = cache.shape
+    n_tokens = num_blocks * block_size
+    _rope_bf16_to_fp8_kernel[(n_tokens,)](
+        cache.view(-1),
+        cache.view(-1).view(torch.int16),
+        n_tokens,
+        block_size=block_size,
+        NOPE=NOPE_BYTES,
+        ROPE=64,
+        ROW=CACHE_ROW,
+        TOK=TOKEN_BYTES,
+        num_warps=1,
+    )
+    return cache
+
+
+def _rope_reference(cache: torch.Tensor) -> torch.Tensor:
+    out = cache.clone()
+    nb, bs, _ = cache.shape
+    flat = out.view(-1)[: nb * bs * CACHE_ROW].view(nb, bs * CACHE_ROW)
+    tok = flat[:, : bs * TOKEN_BYTES].view(nb, bs, TOKEN_BYTES)
+    bf = tok[:, :, NOPE_BYTES:].reshape(nb, bs, 64, 2).reshape(-1, 2)
+    v = bf.contiguous().view(torch.bfloat16).to(torch.float32).reshape(nb, bs, 64)
+    v = torch.where(torch.isnan(v), torch.zeros_like(v), v)
+    q = v.to(torch.float8_e4m3fnuz).view(torch.uint8)
+    tok[:, :, NOPE_BYTES : NOPE_BYTES + 64] = q
+    return out
+
+
 def _reference(cache: torch.Tensor) -> torch.Tensor:
     """Torch equivalent, used only to check the kernel."""
     out = cache.clone()
@@ -140,7 +212,14 @@ def main() -> int:
     got = convert_extra_cache_(cache.clone())
     same = torch.equal(ref, got)
     bad = (ref != got).sum().item()
-    print(f"  vs torch reference: bit-identical={same}  mismatched bytes={bad}")
+    print(f"  nope OCP->fnuz vs torch: bit-identical={same}  mismatched bytes={bad}")
+
+    rref = _rope_reference(cache)
+    rgot = quantize_rope_(cache.clone())
+    rsame = torch.equal(rref, rgot)
+    rbad = (rref != rgot).sum().item()
+    print(f"  rope bf16->fp8 vs torch: bit-identical={rsame}  mismatched bytes={rbad}")
+    same = same and rsame
 
     mb = cache.numel() / 2**20
     for label, fn in (("triton", lambda c: convert_extra_cache_(c)),
