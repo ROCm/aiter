@@ -70,8 +70,6 @@ def all_gather_unreg(
 
 
 @compile_ops("module_custom_all_reduce", develop=True)
-
-@compile_ops("module_custom_all_reduce", develop=True)
 def owner_read_gather(
     _fa: int,
     inp: torch.Tensor,
