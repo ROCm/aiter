@@ -869,37 +869,54 @@ QuickReduce dispatch tables.
 
 **It is usable as an all-reduce**: the API is `QRInt4(group=..., device=..., rank=...,
 world_size=...)` then `.compile(inp, out)` once and `.allreduce(inp, out)`, which is
-a drop-in shape match for `ca_comm.all_reduce`. `bench_comm_allreduce.py` picks it
-up automatically when present (optional import; the bench degrades to
-custom-vs-RCCL when #4970 is not merged).
+a drop-in shape match for `ca_comm.all_reduce`. It is now a permanent third
+candidate in [bench_comm_allreduce.py](../op_tests/multigpu_tests/bench_comm_allreduce.py),
+side by side with `custom` and `rccl`, gated behind the repo's own
+`is_flydsl_available()` and skipped (columns absent) for fp16, TP6, or a
+non-gfx942/950 arch.
 
-**But it is lossy**, and that is the whole story. Measured on 4× gfx950 at DSv4
-hidden 7168, `qr_int4 vs custom` (>1 means QRInt4 faster), against SQNR:
+Because the candidates are not accuracy-equivalent, the bench grades **all** of
+them on SQNR against a shared fp32 reference, each with its own floor in
+`SQNR_FLOOR_DB` (40 dB for the exact kernels, 18 dB for INT4 — the gate #4970's
+own test uses). That way a genuine regression fails the run whichever accuracy
+class it is in, and the accuracy cost of INT4 is visible in the same table as
+its speed.
 
-| tp | tokens | KiB | custom µs | qr_int4 µs | qr_int4 vs custom | custom SQNR | qr_int4 SQNR |
-|---:|---:|---:|---:|---:|---:|---:|---:|
-| 2 | 1 | 14 | 10.59 | 12.23 | 0.87× | 54.9 dB | 19.3 dB |
-| 2 | 8 | 112 | 7.44 | 12.48 | 0.60× | 54.9 dB | 19.2 dB |
-| 2 | 4096 | 57344 | 1055 | **339.3** | **3.11×** | 54.9 dB | 19.1 dB |
-| 4 | 8 | 112 | 12.32 | 12.27 | 1.00× | 55.4 dB | 19.2 dB |
-| 4 | 12 | 168 | 10.29 | 12.32 | 0.84× | 55.5 dB | 19.2 dB |
-| 4 | 1024 | 14336 | 147.2 | **57.6** | **2.55×** | 55.4 dB | 19.2 dB |
-| 4 | 4096 | 57344 | 548.8 | **196.8** | **2.79×** | 55.4 dB | 19.2 dB |
+**But it is lossy**, and that is the whole story. Measured on gfx950 at DSv4
+hidden 7168, bf16, 31 iters:
+
+| tp | tokens | KiB | kernel | custom µs | rccl µs | qr_int4 µs | custom SQNR | rccl SQNR | qr_int4 SQNR |
+|---:|---:|---:|---|---:|---:|---:|---:|---:|---:|
+| 2 | 1 | 14 | 1stage | 10.45 | 18.02 | 12.27 | 54.9 dB | 54.9 dB | 19.3 dB |
+| 2 | 8 | 112 | 1stage | 11.79 | 41.05 | 12.46 | 54.9 dB | 54.9 dB | 19.2 dB |
+| 2 | 12 | 168 | 1stage | 12.82 | 38.95 | 12.63 | 54.9 dB | 54.9 dB | 19.2 dB |
+| 2 | 1024 | 14336 | 1stage | 272.3 | 290.8 | **90.86** | 54.9 dB | 54.9 dB | 19.2 dB |
+| 2 | 4096 | 57344 | 1stage | 1056 | 1118 | **338.9** | 54.9 dB | 54.9 dB | 19.1 dB |
+| 4 | 1 | 14 | 1stage | 10.77 | 29.93 | 11.81 | 55.5 dB | 51.6 dB | 19.1 dB |
+| 4 | 8 | 112 | 1stage | 12.37 | 51.52 | 12.31 | 55.4 dB | 51.5 dB | 19.2 dB |
+| 4 | 12 | 168 | 2stage | 10.32 | 47.72 | 12.24 | 55.5 dB | 51.5 dB | 19.2 dB |
+| 4 | 1024 | 14336 | 2stage | 146.9 | 162.5 | **58.51** | 55.4 dB | 51.4 dB | 19.2 dB |
+| 4 | 4096 | 57344 | 2stage | 548.4 | 593.9 | **197.7** | 55.4 dB | 51.4 dB | 19.2 dB |
+
+(Incidentally: RCCL's SQNR drops from 54.9 dB at TP2 to 51.4 dB at TP4 while the
+custom kernel holds at 55.4 dB. RCCL accumulates in bf16 across hops; the custom
+kernel upcasts to fp32 for the reduction regardless of world size. Small, but it
+means "exact" is the custom kernel's property, not the baseline's.)
 
 Three conclusions:
 
-1. **Nothing at decode.** For M ≤ 12 (≤168 KiB) QRInt4 is 0.60–1.19× — no
-   consistent win, frequently slower. That is expected from §8.6 item 3: decode
-   all-reduce is latency- and skew-bound, not bandwidth-bound, so a 4×-smaller
-   wire buys nothing while the fixed two-shot barrier cost stays. Since DSv4
-   decode is exactly the M ∈ {1,2,4,8} band, **QRInt4 does not help the 27.7%
-   one-stage share at all.**
+1. **Nothing at decode.** For M ≤ 12 (≤168 KiB) QRInt4 lands between 0.84× and
+   1.01× of the custom kernel — no win, sometimes slower. That is expected from
+   §8.6 item 3: decode all-reduce is latency- and skew-bound, not
+   bandwidth-bound, so a 4×-smaller wire buys nothing while the fixed two-shot
+   barrier cost stays. Since DSv4 decode is exactly the M ∈ {1,2,4,8} band,
+   **QRInt4 does not help the 27.7% one-stage share at all.**
 2. **2.5–3.1× at prefill**, which is genuinely bandwidth-bound. At TP4 M=4096 it
-   reaches 447 GB/s of payload-equivalent bandwidth versus 160 GB/s for the exact
+   reaches 446 GB/s of payload-equivalent bandwidth versus 161 GB/s for the exact
    two-shot.
 3. **It gives TP2 the two-shot it otherwise cannot have.** Per §8.7, TP2 is
-   hardcoded to one-shot and crawls at 55.7 GB/s on a 56 MiB prefill. QRInt4 at
-   TP2 M=4096 does 173 GB/s — 3.11×. If TP2 prefill matters, this is the only
+   hardcoded to one-shot and crawls at 55.6 GB/s on a 56 MiB prefill. QRInt4 at
+   TP2 M=4096 does 173 GB/s — 3.12×. If TP2 prefill matters, this is the only
    path to it short of changing the C++ dispatch.
 
 The cost is 19.2 dB SQNR versus the 55 dB bf16-rounding floor of the exact
