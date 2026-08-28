@@ -255,7 +255,7 @@ def gemm_a16w16_(
 
             out_ptr = y if NUM_KSPLIT == 1 else y_pp
 
-            _GLUON_PERSISTENT_KERNEL_MAP[kernel_type][(min(NUM_WGS, num_tiles),)](
+            _GLUON_PERSISTENT_KERNEL_MAP[kernel_type][(NUM_WGS,)](
                 x,
                 w,
                 bias,
