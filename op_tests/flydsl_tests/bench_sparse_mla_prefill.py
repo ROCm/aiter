@@ -20,6 +20,12 @@ Run (gfx942, dsv4 preset: B2 main=512 + extra=128):
     python op_tests/flydsl_tests/bench_sparse_mla_prefill.py --T-sweep
     python op_tests/flydsl_tests/bench_sparse_mla_prefill.py --T 4096
 
+The dsv4 preset runs the DSv4-only kernel by default; ``--kernel general`` selects
+the two-region kernel that also serves the other cache formats, for an A/B of the
+two at identical inputs (they produce bit-identical output):
+
+    python op_tests/flydsl_tests/bench_sparse_mla_prefill.py --kernel general
+
 Requires: flydsl (gfx942), triton (vendored Triton baselines in this directory).
 """
 
@@ -64,7 +70,9 @@ from op_tests.flydsl_tests.sparse_mla_prefill_ref import (  # noqa: E402
     gen_kv_glm,
     gen_q,
     gen_q_glm,
+    gen_correlated_rows,
     gen_ragged_rows,
+    gen_window_rows,
     identity_block_table,
     merge_two_region_csrs,
     pack_fp8_ds_mla_cache,
@@ -113,6 +121,55 @@ class TimingResult:
     total_ms: float
     stages_ms: dict[str, float]
     notes: str = ""
+
+
+# fp8_ds_mla packed cache: 448 fp8 nope + 64 bf16 rope + 8 scale bytes per token.
+FP8_DS_MLA_ROW_BYTES = NOPE_HEAD_DIM + 2 * ROPE_HEAD_DIM + 8
+
+
+@dataclass
+class PerfModel:
+    """Logical FLOP/byte cost of one sparse-MLA forward, independent of the impl.
+
+    The same model is applied to every row of a case so TFLOPS / GB/s are directly
+    comparable: FLOPs count the gathered (query, kv-slot) pairs at full precision,
+    bytes assume bf16 q in + bf16 out + one fp8 cache row per gathered pair (the
+    minimum traffic the fused fp8 path must move). Paths that materialize bf16 KV
+    or run extra prep kernels therefore report lower effective numbers.
+    """
+
+    flops: float
+    mem_bytes: float
+
+    def tflops(self, ms: float) -> float:
+        return self.flops / ms * 1e-9 if ms > 0 else 0.0
+
+    def gbps(self, ms: float) -> float:
+        return self.mem_bytes / ms * 1e-6 if ms > 0 else 0.0
+
+
+def perf_model_b2(inp: BenchInputsB2) -> "PerfModel":
+    nnz = int(inp.main_indptr[-1].item()) + int(inp.extra_indptr[-1].item())
+    h = inp.q.shape[1]
+    flops = 2.0 * h * nnz * (PACKED_HEAD_DIM + PACKED_HEAD_DIM)
+    mem = (
+        inp.q.numel() * inp.q.element_size()
+        + inp.out.numel() * inp.out.element_size()
+        + nnz * FP8_DS_MLA_ROW_BYTES
+    )
+    return PerfModel(flops, float(mem))
+
+
+def perf_model_glm(inp: BenchInputsGLM) -> "PerfModel":
+    nnz = int(inp.indptr[-1].item())
+    h = inp.q.shape[1]
+    flops = 2.0 * h * nnz * (GLM_HEAD_DIM + GLM_V_DIM)
+    mem = (
+        inp.q.numel() * inp.q.element_size()
+        + inp.out.numel() * inp.out.element_size()
+        + nnz * GLM_HEAD_DIM  # fp8 cache row, 1 byte per element
+    )
+    return PerfModel(flops, float(mem))
 
 
 class StageTimer:
@@ -352,13 +409,32 @@ def build_b2_inputs(
     block_size: int,
     seed: int,
     device: str = "cuda",
+    locality: str = "none",
+    corr_len: int = 128,
+    window_stride: int = 1,
 ) -> BenchInputsB2:
+    """``locality='none'`` draws every row i.i.d. uniform, which is what the
+    kernel has always been benchmarked against. It has no cross-query reuse at
+    all -- two queries share ``topk^2/num_slots`` rows by chance -- so any
+    experiment about L2 or XCD grouping is guaranteed to measure zero on it.
+    ``locality='realistic'`` instead models the two regions as they behave:
+    region0 a dense sliding window, region1 scattered top-k that decorrelates
+    over ``corr_len`` queries.
+    """
     main_kv = gen_kv(main_tokens, seed=seed)
     extra_kv = gen_kv(extra_tokens, seed=seed + 1)
     main_cache = pack_fp8_ds_mla_cache(main_kv, block_size, is_extra=False)
     extra_cache = pack_fp8_ds_mla_cache(extra_kv, block_size, is_extra=True)
-    main_rows = gen_ragged_rows(T, topk_main, main_tokens, seed=seed + 2)
-    extra_rows = gen_ragged_rows(T, topk_extra, extra_tokens, seed=seed + 3)
+    if locality == "realistic":
+        main_rows = gen_window_rows(T, topk_main, main_tokens, stride=window_stride)
+        extra_rows = gen_correlated_rows(
+            T, topk_extra, extra_tokens, seed=seed + 3, corr_len=corr_len
+        )
+    elif locality == "none":
+        main_rows = gen_ragged_rows(T, topk_main, main_tokens, seed=seed + 2)
+        extra_rows = gen_ragged_rows(T, topk_extra, extra_tokens, seed=seed + 3)
+    else:
+        raise ValueError(f"locality must be 'none' or 'realistic', got {locality!r}")
     main_indices, main_indptr = ragged_from_rows(main_rows, torch.device(device))
     extra_indices, extra_indptr = ragged_from_rows(extra_rows, torch.device(device))
     q = gen_q(T, H_PROD, seed=seed + 4)
@@ -718,13 +794,28 @@ def check_glm_paths(inp: BenchInputsGLM, state: GlmDecodeState) -> float:
     return _cosine(fly_out, state.out_asm)
 
 
-def bench_flydsl_b2(inp: BenchInputsB2, warmup: int, iters: int) -> TimingResult:
-    from aiter.ops.flydsl import flydsl_sparse_mla_prefill_2region
+def bench_flydsl_b2(
+    inp: BenchInputsB2, warmup: int, iters: int, *, dedicated: bool = True
+) -> TimingResult:
+    """Time the two-region prefill kernel.
+
+    ``dedicated`` picks the DSv4-only kernel over the general two-region one. Both
+    take the same arguments and produce bit-identical output; the dedicated one
+    drops the runtime branches for cache formats and scale modes that DSv4 never
+    exercises, which frees the schedule for optimizations the general path cannot
+    express (-7.6% at this preset).
+    """
+    from aiter.ops.flydsl import (
+        flydsl_sparse_mla_prefill_2region,
+        flydsl_sparse_mla_prefill_dsv4,
+    )
+
+    entry = flydsl_sparse_mla_prefill_dsv4 if dedicated else flydsl_sparse_mla_prefill_2region
 
     def run_once():
         timer = StageTimer()
         timer.begin("flydsl_kernel")
-        flydsl_sparse_mla_prefill_2region(
+        entry(
             inp.q,
             inp.out,
             inp.main_cache,
@@ -744,6 +835,10 @@ def bench_flydsl_b2(inp: BenchInputsB2, warmup: int, iters: int) -> TimingResult
 
     run_once()
     med, stages = _median_ms(run_once, warmup, iters)
+    if dedicated:
+        return TimingResult(
+            "flydsl_b2_dsv4_e2e", med, stages, notes="DSv4-only kernel, gfx942"
+        )
     return TimingResult("flydsl_b2_e2e", med, stages, notes="native 2-region fp8, fused")
 
 
@@ -835,17 +930,30 @@ def bench_triton_decode_kernel_b2(inp: BenchInputsB2, warmup: int, iters: int) -
     )
 
 
-def _print_result(r: TimingResult, baseline_ms: float | None) -> None:
+def _print_result(r: TimingResult, baseline_ms: float | None, perf: PerfModel | None = None) -> None:
     # stages are per-kernel device times (descending); keep that order, not sorted by name.
     stage_str = ", ".join(f"{k}={v:.3f}ms" for k, v in r.stages_ms.items())
     ratio = ""
     if baseline_ms is not None and baseline_ms > 0:
         ratio = f"  ({r.total_ms / baseline_ms:.2f}x vs flydsl)"
-    print(f"{r.name:28s}  gpu_kernel={r.total_ms:8.3f} ms{ratio}")
+    perf_str = ""
+    if perf is not None:
+        perf_str = f"  {perf.tflops(r.total_ms):8.2f} TFLOPS  {perf.gbps(r.total_ms):8.2f} GB/s"
+    print(f"{r.name:28s}  gpu_kernel={r.total_ms:8.3f} ms{perf_str}{ratio}")
     if stage_str:
         print(f"{'':28s}  kernels: {stage_str}")
     if r.notes:
         print(f"{'':28s}  note: {r.notes}")
+
+
+def _print_perf_model(perf: PerfModel) -> None:
+    print(
+        f"TFLOPS/GB/s use the logical fp8 problem cost "
+        f"({perf.flops / 1e9:.1f} GFLOP, {perf.mem_bytes / 1e6:.1f} MB per iter: "
+        "2*H*nnz*(d_qk+d_v) FLOPs, bf16 q+out plus one fp8 cache row per gathered "
+        "pair) divided by each row's kernel time, so paths that materialize bf16 KV "
+        "score lower."
+    )
 
 
 def run_bench(args: argparse.Namespace, T: int) -> None:
@@ -873,14 +981,18 @@ def run_bench(args: argparse.Namespace, T: int) -> None:
         args.block_size,
         args.seed + 100,
     )
-    fly_b2 = bench_flydsl_b2(b2, args.warmup, args.iters)
-    _print_result(fly_b2, None)
+    perf = perf_model_b2(b2)
+    fly_b2 = bench_flydsl_b2(
+        b2, args.warmup, args.iters, dedicated=(args.kernel == "dedicated")
+    )
+    _print_result(fly_b2, None, perf)
     if not args.skip_triton:
         triton_e2e_b2 = bench_triton_prefill_e2e_b2(b2, args.warmup, args.iters, csr_dequant=csr_dequant)
-        _print_result(triton_e2e_b2, fly_b2.total_ms)
+        _print_result(triton_e2e_b2, fly_b2.total_ms, perf)
         triton_dec = bench_triton_decode_kernel_b2(b2, args.warmup, args.iters)
-        _print_result(triton_dec, fly_b2.total_ms)
+        _print_result(triton_dec, fly_b2.total_ms, perf)
     print()
+    _print_perf_model(perf)
     print("All times are summed GPU kernel device self-time per iter (host overhead ignored).")
     print("Compare triton_prefill_e2e_* against flydsl_*_e2e for fair E2E; the per-kernel")
     print("breakdown shows where device time goes. triton_decode_kernel_* is a decode")
@@ -901,11 +1013,13 @@ def run_bench_glm(args: argparse.Namespace, T: int) -> None:
     glm = build_glm_inputs(
         T, args.topk, args.num_tokens, args.block_size, args.seed, args.kv_scale
     )
+    perf = perf_model_glm(glm)
     fly_glm = bench_flydsl_glm(glm, args.warmup, args.iters)
-    _print_result(fly_glm, None)
+    _print_result(fly_glm, None, perf)
 
     if args.skip_aiter_decode:
         print()
+        _print_perf_model(perf)
         print("(aiter mla_decode_fwd skipped via --skip-aiter-decode)")
         print()
         return
@@ -926,8 +1040,9 @@ def run_bench_glm(args: argparse.Namespace, T: int) -> None:
         print(f"correctness  check skipped: {exc}")
 
     dec_glm = bench_mla_decode_fwd_glm(glm, state, args.warmup, args.iters)
-    _print_result(dec_glm, fly_glm.total_ms)
+    _print_result(dec_glm, fly_glm.total_ms, perf)
     print()
+    _print_perf_model(perf)
     print(
         "flydsl_glm_e2e          = fused gather/dequant/attn (bf16 q in, fp8 cache)."
     )
@@ -982,6 +1097,13 @@ def main() -> None:
         choices=("dsv4", "dsv32", "glm"),
         default="dsv4",
         help="dsv4: B2 two-region only. glm/dsv32: single-region flat fp8 head_dim=576, topk=2048.",
+    )
+    parser.add_argument(
+        "--kernel",
+        choices=("dedicated", "general"),
+        default=None,
+        help="dsv4 preset only. 'dedicated' is the DSv4-only kernel (default, -7.6%%); "
+        "'general' is the two-region kernel that also serves other cache formats.",
     )
     parser.add_argument(
         "--topk",
@@ -1041,6 +1163,10 @@ def main() -> None:
         args.topk = GLM_TOPK
     elif not is_glm:
         parser.error("--topk is only used with --preset glm/dsv32; use --topk-main/--topk-extra")
+    if args.kernel is None:
+        args.kernel = "dedicated"
+    elif is_glm:
+        parser.error("--kernel is only used with --preset dsv4; glm/dsv32 is single-region")
     bench_fn = run_bench_glm if is_glm else run_bench
 
     if args.T_sweep is not None:

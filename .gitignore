@@ -92,3 +92,8 @@ aiter/ops/opus/configs/
 # vim swaps
 *.swo
 *.swp
+
+# rocprofv3 --att output: decoded UI bundles and packaged traces (tens of MB each)
+att_*/
+ui_output*/
+ui_output*.tar.gz

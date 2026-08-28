@@ -103,6 +103,78 @@ def gen_ragged_rows(
     return rows
 
 
+def gen_window_rows(
+    num_queries: int,
+    topk: int,
+    num_slots: int,
+    stride: int = 1,
+    device: str = "cuda",
+) -> list[list[int]]:
+    """Region0 as the guaranteed sliding window it actually is.
+
+    Query q covers the ``topk`` slots ending at its own position, advancing
+    ``stride`` slots per query, so neighbouring queries overlap almost entirely
+    and the referenced footprint is only ``num_queries*stride + topk`` slots
+    rather than the whole cache. That is the point: a real window is small and
+    dense enough to sit in one XCD's L2 however the workgroups are grouped, which
+    is why window traffic is not what XCD remapping stands to fix.
+    """
+    rows: list[list[int]] = []
+    for q in range(num_queries):
+        end = min(num_slots - 1, q * stride + topk - 1)
+        start = max(0, end - topk + 1)
+        row = list(range(start, end + 1))
+        if len(row) < topk:                      # only when the cache is tiny
+            row += [row[-1]] * (topk - len(row))
+        rows.append(row)
+    return rows
+
+
+def gen_correlated_rows(
+    num_queries: int,
+    topk: int,
+    num_slots: int,
+    seed: int,
+    corr_len: int = 128,
+    device: str = "cuda",
+) -> list[list[int]]:
+    """Region1 as top-k over compressed history: scattered but locally correlated.
+
+    Neighbouring queries pick nearly the same rows out of a large history, with a
+    few swaps per step, so selections decorrelate over roughly ``corr_len``
+    queries: two queries d apart share about ``topk * (1 - d/corr_len)`` rows.
+    Rows stay spread over the whole cache, so unlike the window the footprint
+    stays far larger than L2.
+
+    ``corr_len`` is the knob that decides whether XCD grouping can pay: an XCD
+    concurrently holds queries spanning ~37 indices when remapped and ~296 when
+    left round-robin, so reuse is available to the remap alone when ``corr_len``
+    falls between those. ``uniform`` (corr_len <= 0) reproduces
+    ``gen_ragged_rows`` and has no reuse for any grouping.
+    """
+    if corr_len <= 0:
+        return gen_ragged_rows(num_queries, topk, num_slots, seed, device)
+    g = torch.Generator(device=device).manual_seed(seed)
+    cur = torch.randint(0, num_slots, (topk,), generator=g, device=device)
+    # Fractional rate, carried between queries: rounding to an integer per query
+    # would floor the swap at one row and pin the effective correlation length to
+    # ``topk`` no matter what was asked for.
+    rate = topk / corr_len
+    acc = 0.0
+    rows: list[list[int]] = []
+    for q in range(num_queries):
+        if q:
+            acc += rate
+            k = int(acc)
+            acc -= k
+            if k:
+                pos = torch.randint(0, topk, (k,), generator=g, device=device)
+                cur = cur.clone()
+                cur[pos] = torch.randint(0, num_slots, (k,), generator=g, device=device)
+        rows.append(cur.tolist())
+    return rows
+
+
 def merge_two_region_csrs(
     main_rows: list[list[int]],
     extra_rows: list[list[int]],
