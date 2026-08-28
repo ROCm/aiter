@@ -6,7 +6,7 @@ import functools
 
 import torch
 
-from aiter.ops.triton.utils.core import USE_LRU_CACHE, load_config_json
+from aiter.ops.triton.utils.config_utils import USE_LRU_CACHE, load_config_json
 from aiter.ops.triton.utils.gemm_config_utils import resolve_config_dir
 from aiter.ops.triton.utils.types import e4m3_dtype
 
