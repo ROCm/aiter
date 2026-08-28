@@ -2765,9 +2765,9 @@ def get_2stage_cfgs(
                 _mxfp4_a4w4_stage1_fw,
                 kernelName1=kernelName1,
                 interleave=runtime_interleave,
-                native_scale_layout=_bm == 16
-                and isinstance(kernelName2, str)
-                and kernelName2.startswith("flydsl_mxmoe_g2_"),
+                # Match main: BM16 always writes one native scale chunk per
+                # sorted M block, independent of the GEMM2 kernel family.
+                native_scale_layout=_bm == 16,
             ),
             stage2=stage2_func,
             block_m=_bm,
