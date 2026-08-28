@@ -27,14 +27,12 @@ try:
     )
 except:  # noqa: E722
     _unified_attention_kernel_3d_gfx1250 = None
-
 try:
     from aiter.ops.triton._gluon_kernels.gfx1250.attention.unified_attention_2d import (
         _unified_attention_gluon_kernel_2d as _unified_attention_kernel_2d_gfx1250,
     )
 except:  # noqa: E722
     _unified_attention_kernel_2d_gfx1250 = None
-
 try:
     from aiter.ops.triton._gluon_kernels.gfx1250.attention.unified_attention_reduce import (
         reduce_segments_gluon as _reduce_segments_kernel_gfx1250,
@@ -48,7 +46,6 @@ _GLUON_REDUCE_MAX_SEGMENTS = 8
 DEVICE_ARCH = arch_info.get_arch()
 IS_DEVICE_ARCH_GFX12 = DEVICE_ARCH in ("gfx1250",)
 WARP_SIZE = 32 if IS_DEVICE_ARCH_GFX12 else 64
-WARP_SIZE_LOG2 = int(math.log2(WARP_SIZE))
 
 _GLUON_SUPPORTED_ARCHS = ("gfx1250",)
 
@@ -446,13 +443,12 @@ def unified_attention(
     #    = floor(q.shape[0] / BLOCK_Q) + num_seqs
     cu_count = get_num_sms()
     target_num_prgms = cu_count * 4
-    ALL_DECODE = max_seqlen_q == 1
+    ALL_DECODE = int(max_seqlen_q) == 1
     if ALL_DECODE:
         total_num_q_blocks = num_seqs
     else:
         total_num_q_blocks = num_tokens // BLOCK_Q + num_seqs
     num_2d_prgms = total_num_q_blocks * num_kv_heads
-    ALL_DECODE = int(max_seqlen_q) == 1
 
     # build parameters
     params = _UAParams(
@@ -507,7 +503,10 @@ def unified_attention(
         # sinks / output_scale / shuffled_kv_cache)
         use_gluon_2d = is_2d_gluon_available(params, backend)
         if use_gluon_2d:
-            _unified_attention_2d_gfx1250(params)
+            if DEVICE_ARCH == "gfx1250":
+                _unified_attention_2d_gfx1250(params)
+            else:
+                assert False, f"No gluon subwrapper for {DEVICE_ARCH}"
         else:
             _unified_attention_2d_triton(params)
     else:
@@ -556,16 +555,19 @@ def unified_attention(
 
         use_gluon_3d = is_3d_gluon_available(params, backend)
         if use_gluon_3d:
-            _unified_attention_3d_gfx1250(
-                params,
-                BLOCK_M,
-                BLOCK_Q,
-                NUM_SEGMENTS,
-                segm_output,
-                segm_max,
-                segm_expsum,
-                attn_config,
-            )
+            if DEVICE_ARCH == "gfx1250":
+                _unified_attention_3d_gfx1250(
+                    params,
+                    BLOCK_M,
+                    BLOCK_Q,
+                    NUM_SEGMENTS,
+                    segm_output,
+                    segm_max,
+                    segm_expsum,
+                    attn_config,
+                )
+            else:
+                assert False, f"No gluon subwrapper for {DEVICE_ARCH}"
         else:
             _unified_attention_3d_triton(
                 params,
@@ -589,14 +591,17 @@ def unified_attention(
             and backend == "gluon"
         )
         if use_gluon_reduce:
-            _reduce_segments_gfx1250(
-                params,
-                NUM_SEGMENTS,
-                segm_output,
-                segm_max,
-                segm_expsum,
-                reduce_config,
-            )
+            if DEVICE_ARCH == "gfx1250":
+                _reduce_segments_gfx1250(
+                    params,
+                    NUM_SEGMENTS,
+                    segm_output,
+                    segm_max,
+                    segm_expsum,
+                    reduce_config,
+                )
+            else:
+                assert False, f"No gluon subwrapper for {DEVICE_ARCH}"
         else:
             _reduce_segments_triton(
                 params,
@@ -872,112 +877,58 @@ _reduce_segments_{arch}(
 """
 
 
-def _unified_attention_2d_gfx1250(params: _UAParams, loop_variant=None):
+def _unified_attention_2d_gfx1250(params: _UAParams):
     """
     Internal wrapper for the gfx1250 gluon kernel.
 
-    Args:
-        params: shared parameters for this unified_attention call.
-        loop_variant:
-            0=plain double buffered version,
-            1=2-stage version,
-            2=4-stage version
+    loop_variant:
+        0=plain double buffered version,
+        1=2-stage version,
+        2=4-stage version
     """
-    # useful for debugging when needed
-    remove_indirect_access = False
     NUM_SEQS = params.num_seqs
-    NUM_Q_HEADS = params.num_query_heads
-    HEAD_SIZE = params.head_size
-    num_blocks = params.num_blocks
-    Q_FP8 = params.q.element_size() == 1
-    KV_FP8 = params.k.element_size() == 1
-    ARCH_NAME = arch_info.get_arch()
-    assert loop_variant in [
-        None,
-        0,
-        1,
-        2,
-    ], "Only [None, 0, 1, 2] supported as loop_variant"
-    assert ARCH_NAME == "gfx1250", "unified_attention_2d_gfx1250 only supports gfx1250"
     assert params.softcap == 0, "Softcap is not supported"
-    BLOCK_SIZE = params.block_size
-    NUM_KV_HEADS = params.num_kv_heads
 
-    SLIDING_WINDOW = params.sliding_window
-    ALL_DECODE = params.all_decode
-    NUM_QUERIES_PER_KV = params.num_queries_per_kv
-    num_buffers = None
-    if ALL_DECODE:
-        sel_loop_variant = 0
-        BLOCK_M = (
-            16
-            if NUM_QUERIES_PER_KV <= 16
-            else triton.next_power_of_2(NUM_QUERIES_PER_KV)
-        )
-        num_warps = 1
-        waves_per_eu = 2
-        TILE_SIZE = 128 if (Q_FP8 and KV_FP8) else 64
-    elif SLIDING_WINDOW > 0:
-        # Prefill, sliding window
-        sel_loop_variant = 0
-        BLOCK_M = 64
-        num_warps = 4
-        waves_per_eu = 4
-        TILE_SIZE = 128 if (Q_FP8 and KV_FP8) else 64
-    else:
-        # Prefill, full attention
-        sel_loop_variant = 2
-        BLOCK_M = 128
-        num_warps = 4
-        waves_per_eu = 2
-        TILE_SIZE = 128 if (Q_FP8 and KV_FP8) else 64
-        num_buffers = 2
+    config, _ = get_unified_attention_config(
+        "attn_2d",
+        generate_config_key(params, "attn_2d"),
+        params.q_dtype,
+        params.kv_cache_dtype,
+        params.head_size,
+        params.num_queries_per_kv,
+        params.block_size,
+        backend="gluon",
+    )
+    TILE_SIZE = config["TILE_SIZE"]
+    # the json holds the tuned BLOCK_M, a query block still has to hold a full
+    # kv head's queries
+    BLOCK_M = max(config["BLOCK_M"], triton.next_power_of_2(params.num_queries_per_kv))
+    loop_variant = config["LOOP_VARIANT"]
 
-        if params.max_seqlen_k < 2048:
-            BLOCK_M = 64
-            num_warps = 2 if (Q_FP8 and KV_FP8) else 1
-            sel_loop_variant = 0
-            num_buffers = 2
-
-    loop_variant = sel_loop_variant if loop_variant is None else loop_variant
     # Non-shuffled KV can't use TDM gather (KV layout), so a tile is one page
-    if not params.shuffled_kv_cache or TILE_SIZE < BLOCK_SIZE:
-        TILE_SIZE = BLOCK_SIZE
-
-    num_kv_blocks = TILE_SIZE // BLOCK_SIZE if params.shuffled_kv_cache else 1
+    if not params.shuffled_kv_cache or TILE_SIZE < params.block_size:
+        TILE_SIZE = params.block_size
+    num_kv_blocks = TILE_SIZE // params.block_size
     assert num_kv_blocks & (num_kv_blocks - 1) == 0, (
-        "num_kv_blocks must be a power of 2"
+        f"TILE_SIZE={TILE_SIZE} must be a power-of-2 multiple of PAGE_SIZE={params.block_size}"
     )
 
-    assert TILE_SIZE >= BLOCK_SIZE, (
-        f"TILE_SIZE={TILE_SIZE} must be multiple of PAGE_SIZE={BLOCK_SIZE}"
-    )
+    # the loop variants other than 0 mask at most twice at the end of the loop,
+    # and need a tile wider than 32
+    query_span = (BLOCK_M - 1) // params.num_queries_per_kv + 1
+    if query_span > TILE_SIZE or TILE_SIZE <= 32:
+        loop_variant = 0
 
-    BLOCK_Q = BLOCK_M // NUM_QUERIES_PER_KV
-    # Upper bound on masked tiles
-    query_span = (BLOCK_M - 1) // NUM_QUERIES_PER_KV + 1
-    max_mask_tiles = (query_span + TILE_SIZE - 1) // TILE_SIZE + 1
-    # other variants do at most 2 masking at the end of loop
-    if max_mask_tiles > 2:
-        loop_variant = 0
-    # fall back to the standard double-buffered loop
-    if TILE_SIZE <= 32:
-        loop_variant = 0
-    if not ALL_DECODE:
-        total_query_blocks = params.num_tokens // BLOCK_Q + NUM_SEQS
-    else:
+    BLOCK_Q = BLOCK_M // params.num_queries_per_kv
+    if params.all_decode:
         total_query_blocks = NUM_SEQS
-    NUM_WARPS = num_warps
-    if num_buffers is None:
-        num_buffers = 2 if loop_variant == 0 else 3
-        num_buffers = 2 if ALL_DECODE else num_buffers
+    else:
+        total_query_blocks = params.num_tokens // BLOCK_Q + NUM_SEQS
 
-    kv_size = params.k.nelement() * params.k.element_size()
+    # buffer ops need the tensor to fit a 32-bit offset; gfx1250 loads through TDM
     MAX_INT32 = 2**31 - 1
-    USE_LOAD_BUFFER_OP = ARCH_NAME != "gfx1250" and kv_size <= MAX_INT32
     USE_STORE_BUFFER_OP = params.out.nelement() * params.out.element_size() <= MAX_INT32
-    grid = (NUM_KV_HEADS, total_query_blocks)
-    _unified_attention_kernel_2d_gfx1250[grid](
+    _unified_attention_kernel_2d_gfx1250[(params.num_kv_heads, total_query_blocks)](
         query_ptr=params.q,
         key_cache_ptr=params.k,
         value_cache_ptr=params.v,
@@ -995,8 +946,8 @@ def _unified_attention_2d_gfx1250(params: _UAParams, loop_variant=None):
         q_descale_ptr=params.q_descale,
         out_scale_ptr=params.output_scale,
         USE_SINKS=(params.sinks is not None),
-        SLIDING_WINDOW=SLIDING_WINDOW,
-        num_blocks=num_blocks,
+        SLIDING_WINDOW=params.sliding_window,
+        num_blocks=params.num_blocks,
         stride_k_cache_0=params.k.stride(0),
         stride_k_cache_1=params.k.stride(1),
         stride_k_cache_2=params.k.stride(2),
@@ -1008,23 +959,24 @@ def _unified_attention_2d_gfx1250(params: _UAParams, loop_variant=None):
         block_table_stride=params.block_table.stride(0),
         num_seqs=NUM_SEQS,
         SCALE=params.softmax_scale,
-        NUM_QUERY_HEADS=NUM_Q_HEADS,
-        NUM_KV_HEADS=NUM_KV_HEADS,
-        BLOCK_SIZE=BLOCK_SIZE,
+        NUM_QUERY_HEADS=params.num_query_heads,
+        NUM_KV_HEADS=params.num_kv_heads,
+        BLOCK_SIZE=params.block_size,
         TILE_SIZE=TILE_SIZE,
-        HEAD_SIZE=HEAD_SIZE,
+        HEAD_SIZE=params.head_size,
         BLOCK_Q=BLOCK_Q,
         BLOCK_M=BLOCK_M,
-        ARCH_NAME=ARCH_NAME,
-        waves_per_eu=waves_per_eu,
-        USE_LOAD_BUFFER_OP=USE_LOAD_BUFFER_OP,
+        ARCH_NAME=DEVICE_ARCH,
+        waves_per_eu=config["waves_per_eu"],
+        USE_LOAD_BUFFER_OP=False,
         USE_STORE_BUFFER_OP=USE_STORE_BUFFER_OP,
-        num_warps=NUM_WARPS,
-        ALL_DECODE=ALL_DECODE,
+        num_warps=config["num_warps"],
+        ALL_DECODE=params.all_decode,
         SHUFFLED_KV_CACHE=params.shuffled_kv_cache,
         CAUSAL=params.causal,
-        REMOVE_INDIRECT_ACCESS=remove_indirect_access,
-        NUM_BUFFERS=num_buffers,
+        # useful for debugging when needed
+        REMOVE_INDIRECT_ACCESS=False,
+        NUM_BUFFERS=config["NUM_BUFFERS"],
         LOOP_VARIANT=loop_variant,
     )
 
