@@ -2077,10 +2077,22 @@ def _build_kernel_w32_tdm(
                         _store_bf16_vec(final, swa_rsrc, swa_row_base, tid, VEC)
 
         def emit_q():
-            q_out_rsrc = _ptr_res(q_out)
             q_scale_rsrc = _ptr_res(q_scale) if const_expr(quant) else None
             nr_m1 = num_rows - 1
             tile_base = g * CT  # first tile index this WG owns
+            wg_row0 = tile_base * RT  # first row this WG owns
+            out_row_bytes = D if const_expr(quant) else D * 2
+            # A buffer descriptor's num_records is 32-bit, so one descriptor
+            # reaches 4 GiB. q_out passes that at T*H*D*2 >= 4 GiB (T>=32768 at
+            # H=128, D=512) and rows past the limit are dropped. Bias the base
+            # per workgroup -- once, outside the tile loop -- so the 32-bit
+            # offset only spans this WG's CT*RT rows.
+            q_out_rsrc = GTensor(
+                q_out,
+                dtype=T.bf16,
+                shape=(CT * RT, D),
+                static_bytes_offset_i64=fx.Int64(wg_row0) * fx.Int64(out_row_bytes),
+            ).rsrc
             wave_lds_off = wave * (D * eb)
             row_elem = tid * VEC  # LDS read pos within that slot
 
@@ -2131,7 +2143,7 @@ def _build_kernel_w32_tdm(
                     cosv,
                     sinv,
                     q_out_rsrc,
-                    row_of(tile_idx) * (D if const_expr(quant) else D * 2),
+                    (row_of(tile_idx) - wg_row0) * out_row_bytes,
                     q_scale_rsrc,
                     row_of(tile_idx) * NG,
                 )
