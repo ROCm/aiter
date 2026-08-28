@@ -4,13 +4,21 @@ import re
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 
+try:
+    import jsonschema
+except ImportError:
+    jsonschema = None
+
 SKILL_DIR = Path(__file__).resolve().parents[1]
 VALIDATOR = SKILL_DIR / "validate_pr.sh"
 SCANNER = SKILL_DIR / "scan_index_width.py"
+SHIPPED_PICKER = SKILL_DIR / "pick-idle-gpu.py"
+REPORT_SCHEMA = json.loads((SKILL_DIR / "report_schema.json").read_text())
 REQUIRED_STAGES = {
     "merge_sim",
     "gpu_claim",
@@ -31,6 +39,7 @@ def validate_report_contract(report):
         "finished_utc",
         "isolation",
         "arch_coverage",
+        "arch_coverage_basis",
         "degraded_mode",
         "repo",
         "runtime_identity",
@@ -96,6 +105,10 @@ class ValidatorFixture:
             "def test_sample():\n"
             "    atol = 1e-5\n"
             "    assert atol < 1\n"
+            '    phase = os.environ.get("VALIDATION_PHASE", "")\n'
+            "    if phase:\n"
+            "        expected = f\"/{phase.split('-')[0]}/aiter-jit\"\n"
+            '        assert expected in os.environ["AITER_JIT_DIR"]\n'
             '    shapes = _GRID or "7,257,f32"\n'
             "    for shape in shapes.split(';'):\n"
             "        M, N, dtype_str = shape.split(',')\n"
@@ -123,6 +136,7 @@ class ValidatorFixture:
         self.fake_modules = self.root / "fake-modules"
         self.fake_modules.mkdir()
         (self.fake_modules / "amdsmi.py").write_text(
+            "class AmdSmiException(Exception): pass\n"
             "def amdsmi_init(): pass\n"
             "def amdsmi_shut_down(): pass\n"
             "def amdsmi_get_processor_handles(): return ['gpu0']\n"
@@ -132,6 +146,8 @@ class ValidatorFixture:
             "'target_graphics_version': 'gfx-test'}\n"
             "def amdsmi_get_gpu_activity(handle): return {'gfx_activity': 0}\n"
             "def amdsmi_get_gpu_device_bdf(handle): return '0000:00:00.0'\n"
+            "def amdsmi_get_gpu_vram_usage(handle):\n"
+            "    return {'vram_used': 256, 'vram_total': 294912}\n"
         )
         self.picker = self.tools / "pick-idle-gpu.py"
         write_executable(self.picker, "#!/usr/bin/env bash\nprintf '7\\n'\n")
@@ -191,6 +207,7 @@ class ValidatorFixture:
         grid=True,
         expected_route="test_sample:run_kernel",
         grid_value="7,257,f32",
+        python_bin=None,
     ):
         report = self.root / f"{patch.stem}-report.json"
         command = [
@@ -201,7 +218,7 @@ class ValidatorFixture:
             str(patch),
             "--head-sha",
             "b" * 40,
-            "--tests",
+            "--target",
             tests,
             "--expected-route",
             expected_route,
@@ -227,6 +244,8 @@ class ValidatorFixture:
         environment["PICKER"] = str(picker or self.picker)
         environment["PYTHONPATH"] = str(self.fake_modules)
         environment["TIMEOUT"] = "30"
+        if python_bin:
+            environment["PYTHON_BIN"] = str(python_bin)
         if pylib:
             environment["PYLIB"] = str(pylib)
         if path_prefix:
@@ -239,6 +258,8 @@ class ValidatorFixture:
             )
         data = json.loads(report.read_text())
         validate_report_contract(data)
+        if jsonschema is not None:
+            jsonschema.validate(data, REPORT_SCHEMA)
         return result, data
 
 
@@ -296,7 +317,7 @@ class ValidateKernelPrTests(unittest.TestCase):
         self.assertEqual(0, policy["commented_out_shape_rows_added"])
         self.assertEqual(
             "tests/test_sample.py",
-            report["test_selection"]["pytest_target"],
+            report["test_selection"]["target"],
         )
         self.assertEqual("pass", report["stages"]["execution_receipt"]["status"])
         self.assertEqual(
@@ -325,6 +346,79 @@ class ValidateKernelPrTests(unittest.TestCase):
         self.assertTrue(any("adds this test target" in detail for detail in details))
         self.assertFalse(any("pre-existing" in detail for detail in details))
 
+    def test_script_only_target_passes_without_false_block(self):
+        def add_script_target(repo):
+            (repo / "tests" / "verify_kernel.py").write_text(
+                "def verify_kernel():\n"
+                "    return True\n"
+                "\n"
+                "if __name__ == '__main__':\n"
+                "    assert verify_kernel()\n"
+                "    print('56/56 cases passed')\n"
+            )
+
+        patch = self.fixture.make_patch(add_script_target, "script-pass.patch")
+        result, report = self.fixture.validate(
+            patch,
+            tests="tests/verify_kernel.py",
+            grid=False,
+        )
+
+        self.assertEqual(2, result.returncode)
+        self.assertEqual("INCONCLUSIVE", report["verdict"])
+        self.assertEqual("script", report["test_selection"]["runner"])
+        self.assertEqual("pass", report["stages"]["correctness_repo_tests"]["status"])
+        self.assertFalse(
+            any(item["severity"] == "blocker" for item in report["findings"])
+        )
+        self.assertEqual(
+            "script-exit-zero-with-output",
+            report["arch_coverage_basis"]["gfx-test"],
+        )
+
+    def test_script_only_target_failure_is_blocking(self):
+        def add_failing_script(repo):
+            (repo / "tests" / "verify_kernel.py").write_text(
+                "def verify_kernel():\n"
+                "    return False\n"
+                "\n"
+                "if __name__ == '__main__':\n"
+                "    assert verify_kernel()\n"
+            )
+
+        patch = self.fixture.make_patch(add_failing_script, "script-fail.patch")
+        result, report = self.fixture.validate(
+            patch,
+            tests="tests/verify_kernel.py",
+            grid=False,
+        )
+
+        self.assertEqual(1, result.returncode)
+        self.assertEqual("BLOCK", report["verdict"])
+        self.assertEqual("script", report["test_selection"]["runner"])
+        self.assertEqual("fail", report["stages"]["correctness_repo_tests"]["status"])
+
+    def test_target_without_entry_point_is_skipped(self):
+        def add_library_only_target(repo):
+            (repo / "tests" / "kernel_helpers.py").write_text(
+                "def verify_kernel():\n" "    return True\n"
+            )
+
+        patch = self.fixture.make_patch(
+            add_library_only_target,
+            "no-runner.patch",
+        )
+        result, report = self.fixture.validate(
+            patch,
+            tests="tests/kernel_helpers.py",
+            grid=False,
+        )
+
+        self.assertEqual(2, result.returncode)
+        self.assertEqual("INCONCLUSIVE", report["verdict"])
+        self.assertEqual("none", report["test_selection"]["runner"])
+        self.assertEqual("skip", report["stages"]["correctness_repo_tests"]["status"])
+
     def test_test_only_tolerance_widening_blocks_without_gpu(self):
         def loosen_tolerance(repo):
             path = repo / "tests" / "test_sample.py"
@@ -347,7 +441,11 @@ class ValidateKernelPrTests(unittest.TestCase):
         fake_bin.mkdir()
         write_executable(fake_bin / "python", "#!/usr/bin/env bash\nexit 1\n")
 
-        _, report = self.fixture.validate(patch, path_prefix=fake_bin)
+        _, report = self.fixture.validate(
+            patch,
+            path_prefix=fake_bin,
+            python_bin=fake_bin / "python",
+        )
 
         self.assertEqual("INCONCLUSIVE", report["verdict"])
         self.assertEqual("skip", report["stages"]["correctness_repo_tests"]["status"])
@@ -645,12 +743,37 @@ class IndexScannerTests(unittest.TestCase):
         self.assertEqual(1, payload["total_candidates"])
 
 
+class GpuPickerTests(unittest.TestCase):
+    def test_shipped_picker_returns_translated_hip_index(self):
+        fixture = ValidatorFixture()
+        try:
+            environment = os.environ.copy()
+            environment["PYTHONPATH"] = str(fixture.fake_modules)
+            result = run(
+                [
+                    sys.executable,
+                    str(SHIPPED_PICKER),
+                    "--samples",
+                    "1",
+                    "--interval",
+                    "0",
+                    "--quiet",
+                ],
+                env=environment,
+            )
+        finally:
+            fixture.close()
+
+        self.assertEqual("7", result.stdout.strip())
+
+
 class ReviewSkillContractTests(unittest.TestCase):
     def test_review_skill_is_advisory_and_has_no_dead_scanner_paths(self):
         review_skill = (SKILL_DIR.parent / "review-pr" / "SKILL.md").read_text()
 
         self.assertTrue((SKILL_DIR / "validate_evidence.py").is_file())
         self.assertTrue((SKILL_DIR / "validation_probe.py").is_file())
+        self.assertTrue(SHIPPED_PICKER.is_file())
         self.assertIn("advisory tier", review_skill)
         self.assertIn("required scanner is missing or not executable", review_skill)
         self.assertIn("Validation (deterministic)", review_skill)

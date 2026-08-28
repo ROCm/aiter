@@ -185,12 +185,16 @@ for finding in findings:
     ):
         raise SystemExit(f"validation report has a malformed finding: {finding!r}")
 selection = report.get("test_selection", {})
-if not selection.get("pytest_target"):
-    raise SystemExit("validation report does not name the pytest target it selected")
+if not selection.get("target"):
+    raise SystemExit("validation report does not name the test target it selected")
 if not selection.get("expected_route"):
     raise SystemExit("validation report does not name the expected kernel route")
 if not selection.get("shape_vars"):
     raise SystemExit("validation report does not name the route-call shape variables")
+if selection.get("runner") not in {"pytest", "script", "none", "unresolved"}:
+    raise SystemExit("validation report has no supported target runner")
+if not selection.get("runner_reason"):
+    raise SystemExit("validation report does not explain its runner selection")
 identity = report.get("runtime_identity")
 if (
     not isinstance(identity, dict)
@@ -199,17 +203,42 @@ if (
     or not isinstance(identity.get("native_artifacts"), list)
 ):
     raise SystemExit("validation report has no runtime build identity")
+coverage = report.get("arch_coverage", {})
+coverage_basis = report.get("arch_coverage_basis", {})
+if any(arch not in coverage_basis for arch, level in coverage.items() if level == "runtime"):
+    raise SystemExit("runtime architecture coverage has no evidence basis")
+gpu_arch = report["stages"]["gpu_claim"].get("arch")
+if coverage and coverage != {gpu_arch: "runtime"}:
+    raise SystemExit("runtime architecture coverage does not match the claimed GPU")
+if set(coverage_basis) != set(coverage):
+    raise SystemExit("architecture coverage and evidence-basis keys differ")
+if coverage:
+    basis = coverage_basis[gpu_arch]
+    if selection["runner"] == "pytest":
+        grid_stats = report["stages"]["correctness_s1_grid"].get("stats", {})
+        basis_stage = (
+            report["stages"]["correctness_s1_grid"]
+            if grid_stats.get("executed", 0) > 0
+            else report["stages"]["correctness_repo_tests"]
+        )
+        expected_basis = (
+            f"pytest-junit-executed:{basis_stage.get('stats', {}).get('executed', 0)}"
+        )
+        if basis != expected_basis:
+            raise SystemExit("pytest architecture coverage basis is inconsistent")
+    elif selection["runner"] == "script" and not basis.startswith("script-"):
+        raise SystemExit("script architecture coverage basis is inconsistent")
 for stage_name in ("correctness_repo_tests", "correctness_s1_grid"):
     stage = report["stages"][stage_name]
     stats = stage.get("stats")
     if stats is not None:
         stat_keys = ("tests", "failures", "errors", "skipped", "executed")
         if any(type(stats.get(key)) is not int for key in stat_keys):
-            raise SystemExit(f"{stage_name} has malformed JUnit counters")
+            raise SystemExit(f"{stage_name} has malformed execution counters")
         if stats["executed"] != stats["tests"] - stats["skipped"]:
-            raise SystemExit(f"{stage_name} has inconsistent JUnit counters")
+            raise SystemExit(f"{stage_name} has inconsistent execution counters")
     elif stage["status"] == "pass":
-        raise SystemExit(f"{stage_name} passed without JUnit counters")
+        raise SystemExit(f"{stage_name} passed without execution counters")
     if stage["status"] == "pass" and (
         stage.get("exit") != 0
         or stats.get("executed", 0) < 1
@@ -232,7 +261,10 @@ severities = {
     for finding in findings
 }
 complete = (
-    report["stages"]["merge_sim"]["status"] == "pass"
+    selection["runner"] == "pytest"
+    and bool(coverage)
+    and bool(coverage_basis)
+    and report["stages"]["merge_sim"]["status"] == "pass"
     and report["stages"]["gpu_claim"]["status"] == "pass"
     and report["stages"]["runtime_compat"]["status"] == "pass"
     and report["stages"]["test_policy"]["status"] == "pass"
@@ -267,7 +299,7 @@ if report.get("process_exit_code") != expected_exit:
 out_path.write_text(json.dumps(report, indent=2) + "\n")
 print(
     f"validation report accepted for head {expected_head}; "
-    f"target={selection['pytest_target']}; "
+    f"target={selection['target']}; "
     f"grid={selection.get('grid') or 'not configured'}"
 )
 PY
@@ -826,7 +858,7 @@ If the answer is yes, add it to the findings. If the answer is no, proceed.
 - "What it does" must be one sentence, written for a reviewer who hasn't read the diff.
 - **At most 5 findings, ordered most-severe first.** Rank by (severity, then blast radius), keep the top 5, and drop the rest — do not append them as a tail. This is a readability limit, not a measured recall claim; no committed replay corpus currently establishes recall@5.
 - **State the validation evidence** on the line under the verdict:
-  - with an accepted exact-head report: `Validation (deterministic): <verdict>` plus selected pytest target, runtime arch, and failed/skipped stages.
+  - with an accepted exact-head report: `Validation (deterministic): <verdict>` plus selected target/runner, runtime arch, and failed/skipped stages.
   - without one: `Validation (deterministic): NOT RUN — no exact-head validation_report.json`. Then no finding may assert runtime behaviour (perf, accuracy, launch failure) as fact; such findings are `[inferred]` and phrased as questions.
 - The review line is always advisory. `🔴 HIGH RISK` requests human attention; it is not a merge gate. A deterministic `Validation: BLOCK` may gate because its reproducer is in the report.
 

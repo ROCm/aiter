@@ -9,6 +9,7 @@
     "finished_utc",
     "isolation",
     "arch_coverage",
+    "arch_coverage_basis",
     "degraded_mode",
     "repo",
     "runtime_identity",
@@ -36,7 +37,7 @@
       },
       "additionalProperties": true
     },
-    "pytest_stats": {
+    "execution_stats": {
       "type": "object",
       "required": ["tests", "failures", "errors", "skipped", "executed"],
       "properties": {
@@ -70,6 +71,12 @@
       "description": "Per-architecture coverage. 'runtime' means at least one selected correctness test was collected and executed with that claimed device visible; GPU claim alone is insufficient. 'compile-only' means an explicit architecture-specific compile ran without execution. An untested architecture is 'not-covered' or absent.",
       "additionalProperties": { "type": "string", "enum": ["runtime", "compile-only", "not-covered"] },
       "examples": [{ "gfx950": "runtime", "gfx942": "not-covered" }]
+    },
+
+    "arch_coverage_basis": {
+      "type": "object",
+      "description": "Per-architecture evidence used to claim runtime coverage.",
+      "additionalProperties": { "type": "string" }
     },
 
     "degraded_mode": {
@@ -126,12 +133,20 @@
 
     "test_selection": {
       "type": "object",
-      "required": ["pytest_target", "shape_env", "grid", "expected_route", "shape_vars"],
+      "required": [
+        "target",
+        "shape_env",
+        "grid",
+        "expected_route",
+        "shape_vars",
+        "runner",
+        "runner_reason"
+      ],
       "properties": {
-        "pytest_target": {
+        "target": {
           "type": "string",
           "minLength": 1,
-          "description": "Exact pytest node or file selected by the caller."
+          "description": "Exact script file or pytest node/file selected by the caller."
         },
         "shape_env": {
           "type": "string",
@@ -148,6 +163,14 @@
         "shape_vars": {
           "type": "string",
           "description": "Comma-separated local variable names captured from each observed route call."
+        },
+        "runner": {
+          "type": "string",
+          "enum": ["pytest", "script", "none", "unresolved"]
+        },
+        "runner_reason": {
+          "type": "string",
+          "minLength": 1
         }
       }
     },
@@ -212,9 +235,9 @@
         },
         "correctness_repo_tests": {
           "allOf": [{ "$ref": "#/definitions/stage" }],
-          "description": "The suite the PR itself ships, including JUnit collected/executed/skipped counts.",
+          "description": "The target the PR itself ships. Pytest uses JUnit counters; script runners use process-based execution counters and an explicit basis.",
           "properties": {
-            "stats": { "$ref": "#/definitions/pytest_stats" }
+            "stats": { "$ref": "#/definitions/execution_stats" }
           }
         },
         "correctness_s1_grid": {
@@ -222,7 +245,7 @@
           "description": "A shape grid this skill owns, independent of what the PR chose to test: non-toy, boundary/odd, long-context. 'skip' with repo-default-only when the kernel exposes no shape override.",
           "properties": {
             "grid": { "type": "string" },
-            "stats": { "$ref": "#/definitions/pytest_stats" }
+            "stats": { "$ref": "#/definitions/execution_stats" }
           }
         },
         "execution_receipt": {
@@ -290,6 +313,8 @@
       "then": {
         "properties": {
           "process_exit_code": { "const": 0 },
+          "arch_coverage": { "minProperties": 1 },
+          "arch_coverage_basis": { "minProperties": 1 },
           "runtime_identity": {
             "type": "object",
             "required": [
@@ -303,7 +328,8 @@
           "test_selection": {
             "properties": {
               "expected_route": { "minLength": 1 },
-              "shape_vars": { "minLength": 1 }
+              "shape_vars": { "minLength": 1 },
+              "runner": { "const": "pytest" }
             }
           },
           "stages": {
