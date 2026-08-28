@@ -115,11 +115,19 @@ def _stage2_quant_sort(
     )
 
 
+# Rows per batch in the cosine check; caps the int64 gather mxfp4_to_f32 does.
+_COS_ROW_CHUNK = 32768
+
+
 def _dequant_inter_sorted_quant(row, inter_dim, adtype):
-    """Convert a v2 sorted intermediate row to fp32 for debug/cosine checks."""
+    """Convert v2 sorted intermediate rows to fp32 for debug/cosine checks.
+
+    Takes a single row or a batch; the trailing dim becomes inter_dim.
+    """
     if adtype == "fp8":
         return row.view(torch.float8_e4m3fn).float()
-    return fp4_utils.mxfp4_to_f32(row.view(dtypes.fp4x2)).view(inter_dim)
+    deq = fp4_utils.mxfp4_to_f32(row.view(dtypes.fp4x2))
+    return deq.reshape(*row.shape[:-1], inter_dim)
 
 
 def _baseline_w1_shuffle(w1_qt, w1_scale, E, adtype):
@@ -617,15 +625,21 @@ def v2_stage1_dequant_cosine_err(ref, res, msg="", printLog=True, *, inter_dim, 
     valid = (ref.abs().sum(dim=1) > 0).nonzero(as_tuple=True)[0]
     if valid.numel() == 0:
         return 1.0
-    cos_all = []
-    for r in valid.tolist():
-        vval = _dequant_inter_sorted_quant(res[r], inter_dim, adtype)
-        rg = ref[r].float().view(inter_dim // 32, 32)
-        vg = vval.view(inter_dim // 32, 32)
-        rn = rg / (rg.norm(dim=1, keepdim=True) + 1e-8)
-        vn = vg / (vg.norm(dim=1, keepdim=True) + 1e-8)
-        cos_all.append((vn * rn).sum(dim=1).mean().item())
-    cos = sum(cos_all) / len(cos_all)
+    groups = inter_dim // 32
+    # Batched: a per-row loop costs one .item() sync per sorted row, ~295k of
+    # them per timed candidate at token=32768/topk=9. Chunked to bound the
+    # int64 gather inside mxfp4_to_f32.
+    cos_rows = []
+    for start in range(0, valid.numel(), _COS_ROW_CHUNK):
+        idx = valid[start : start + _COS_ROW_CHUNK]
+        vg = _dequant_inter_sorted_quant(res[idx], inter_dim, adtype).view(
+            -1, groups, 32
+        )
+        rg = ref[idx].float().view(-1, groups, 32)
+        rn = rg / (rg.norm(dim=2, keepdim=True) + 1e-8)
+        vn = vg / (vg.norm(dim=2, keepdim=True) + 1e-8)
+        cos_rows.append((vn * rn).sum(dim=2).mean(dim=1))
+    cos = torch.cat(cos_rows).mean().item()
     err = 1.0 - cos
     if printLog:
         print(f"{msg}[v2_stage1 cos={cos:.4f} err={err:.4f}]")

@@ -2201,8 +2201,16 @@ struct smem {
         else if constexpr (elem_bits == 4)  { asm volatile("ds_read_b64_tr_b4 %0, %1 offset:%2\n" : "=v"(raw) : "v"(addr), "i"(imm_offset) : "memory"); }
         else { static_assert(sizeof(T_) == 0, "smem::_tr_load: unsupported scalar type"); }
         return __builtin_bit_cast(type, raw);
+#elif defined(__HIP_DEVICE_COMPILE__) && defined(__gfx1250__)
+        using type = vector_type<vec>;
+        constexpr index_t elem_bits = sizeof_bits_v<scalar_type>;
+        OPUS_LDS_ADDR char* p = ptr + v_os + imm_offset;
+        if      constexpr (elem_bits == 16) { return __builtin_bit_cast(type, __builtin_amdgcn_ds_load_tr16_b128_v8i16(reinterpret_cast<OPUS_LDS_ADDR i16x8_t*>(p))); }
+        else if constexpr (elem_bits == 8)  { return __builtin_bit_cast(type, __builtin_amdgcn_ds_load_tr8_b64_v2i32(reinterpret_cast<OPUS_LDS_ADDR i32x2_t*>(p))); }
+        else if constexpr (elem_bits == 4)  { return __builtin_bit_cast(type, __builtin_amdgcn_ds_load_tr4_b64_v2i32(reinterpret_cast<OPUS_LDS_ADDR i32x2_t*>(p))); }
+        else { static_assert(sizeof(T_) == 0, "smem::_tr_load: unsupported scalar type"); return type{}; }
 #elif defined(__HIP_DEVICE_COMPILE__)
-        static_assert(sizeof(T_) == 0, "smem::_tr_load requires __gfx950__");
+        static_assert(sizeof(T_) == 0, "smem::_tr_load requires __gfx950__ or __gfx1250__");
         return _load<vec>(v_os + imm_offset);
 #else
         return _load<vec>(v_os + imm_offset);
@@ -3741,18 +3749,29 @@ struct wmma_adaptor_swap_ab : wmma_adaptor<WMMA> {
 
     template<typename VA, typename VB>
     OPUS_D constexpr auto operator()(const VA& a, const VB& b) {
-        typename WMMA::vtype_c c{0}; return operator()(b, a, c);
+        typename base::vtype_c c{0}; return operator()(a, b, c);
     }
 
-    // Scaled overloads (BX32 / BX16): swap a,b then forward to base
-    template<typename VA, typename VB, typename VC>
-    OPUS_D constexpr auto operator()(const VA& a, const VB& b, const VC& c, int scale_a, int scale_b) {
-        return base::operator()(b, a, c, scale_a, scale_b);
+    // BX32 scaled: scale word is an int holding 4 packed E8M0 bytes.
+    template<typename VA, typename VB, typename VC, index_t a_scale_sel = 0, index_t b_scale_sel = 0>
+    OPUS_D constexpr auto operator()(const VA& a, const VB& b, const VC& c, int scale_a, int scale_b, number<a_scale_sel> = {}, number<b_scale_sel> = {}) {
+        return base::operator()(b, a, c, scale_b, scale_a, number<b_scale_sel>{}, number<a_scale_sel>{});
     }
 
-    template<typename VA, typename VB, typename VC>
-    OPUS_D constexpr auto operator()(const VA& a, const VB& b, const VC& c, long scale_a, long scale_b) {
-        return base::operator()(b, a, c, scale_a, scale_b);
+    template<typename VA, typename VB, index_t a_scale_sel = 0, index_t b_scale_sel = 0>
+    OPUS_D constexpr auto operator()(const VA& a, const VB& b, int scale_a, int scale_b, number<a_scale_sel> = {}, number<b_scale_sel> = {}) {
+        typename base::vtype_c c{0}; return operator()(a, b, c, scale_a, scale_b, number<a_scale_sel>{}, number<b_scale_sel>{});
+    }
+
+    // BX16 scaled: scale word is a long holding 8 packed E8M0 bytes.
+    template<typename VA, typename VB, typename VC, index_t a_scale_sel = 0, index_t b_scale_sel = 0>
+    OPUS_D constexpr auto operator()(const VA& a, const VB& b, const VC& c, long scale_a, long scale_b, number<a_scale_sel> = {}, number<b_scale_sel> = {}) {
+        return base::operator()(b, a, c, scale_b, scale_a, number<b_scale_sel>{}, number<a_scale_sel>{});
+    }
+
+    template<typename VA, typename VB, index_t a_scale_sel = 0, index_t b_scale_sel = 0>
+    OPUS_D constexpr auto operator()(const VA& a, const VB& b, long scale_a, long scale_b, number<a_scale_sel> = {}, number<b_scale_sel> = {}) {
+        typename base::vtype_c c{0}; return operator()(a, b, c, scale_a, scale_b, number<a_scale_sel>{}, number<b_scale_sel>{});
     }
 };
 } // namespace impl (wmma_adaptor)
