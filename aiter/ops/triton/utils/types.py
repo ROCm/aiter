@@ -71,6 +71,17 @@ torch_to_triton_dtype = {
 }
 
 
+def get_scaled_dot_format_string(dtype: tl.dtype):
+    mapping = {
+        tl.float16: "fp16",
+        tl.bfloat16: "bf16",
+        tl.uint8: "e2m1",
+        tl.float8e4nv: "e4m3",
+        tl.float8e5: "e5m2",
+    }
+    return mapping[dtype]
+
+
 def _is_fp8(x):
     if x.dtype in {
         torch.float8_e4m3fnuz,

@@ -32,6 +32,7 @@ namespace py = pybind11;
         .value("Gelu", ActivationType::Gelu)                                                \
         .value("Swiglu", ActivationType::Swiglu)                                            \
         .value("Situv2", ActivationType::Situv2)                                            \
+        .value("GeluTanh", ActivationType::GeluTanh)                                         \
         .export_values();                                                                   \
     pybind11::enum_<MlaVersion>(m, "MlaVersion")                                            \
         .value("V32", MlaVersion::V32)                                                      \
@@ -1410,8 +1411,8 @@ namespace py = pybind11;
     m.def("moe_sum", &aiter::moe_sum, "moe_sum(Tensor! input, Tensor output) -> ()");
 
 #define MOE_TOPK_PYBIND                                      \
-    m.def("topk_softplus",                                   \
-          &aiter::topk_softplus,                             \
+    m.def("topk_gating",                                     \
+          &aiter::topk_gating,                               \
           py::arg("topk_weights"),                           \
           py::arg("topk_indices"),                           \
           py::arg("gating_output"),                          \
@@ -1471,33 +1472,60 @@ namespace py = pybind11;
           py::arg("m_indices")         = std::nullopt, \
           py::arg("reverse_sorted")    = std::nullopt);
 
-#define PA_SPARSE_PREFILL_OPUS_PYBIND       \
-    m.def("pa_sparse_prefill_opus_fwd",     \
-          &pa_sparse_prefill_opus_fwd,      \
-          py::arg("q"),                     \
-          py::arg("unified_kv"),            \
-          py::arg("kv_indices_prefix"),     \
-          py::arg("kv_indptr_prefix"),      \
-          py::arg("kv"),                    \
-          py::arg("kv_indices_extend"),     \
-          py::arg("kv_indptr_extend"),      \
-          py::arg("attn_sink"),             \
-          py::arg("out"),                   \
-          py::arg("softmax_scale"));        \
-    m.def("pa_sparse_prefill_fp8_opus_fwd", \
-          &pa_sparse_prefill_fp8_opus_fwd,  \
-          py::arg("q_nope"),                \
-          py::arg("q_rope"),                \
-          py::arg("unified_kv_nope"),       \
-          py::arg("unified_kv_rope"),       \
-          py::arg("kv_indices_prefix"),     \
-          py::arg("kv_indptr_prefix"),      \
-          py::arg("kv_nope"),               \
-          py::arg("kv_rope"),               \
-          py::arg("kv_indices_extend"),     \
-          py::arg("kv_indptr_extend"),      \
-          py::arg("attn_sink"),             \
-          py::arg("out"),                   \
+#define PA_SPARSE_PREFILL_OPUS_PYBIND               \
+    m.def("pa_sparse_prefill_gfx950_opus_fwd",      \
+          &pa_sparse_prefill_gfx950_opus_fwd,       \
+          py::arg("q"),                             \
+          py::arg("unified_kv"),                    \
+          py::arg("kv_indices_prefix"),             \
+          py::arg("kv_indptr_prefix"),              \
+          py::arg("kv"),                            \
+          py::arg("kv_indices_extend"),             \
+          py::arg("kv_indptr_extend"),              \
+          py::arg("attn_sink"),                     \
+          py::arg("out"),                           \
+          py::arg("softmax_scale"));                \
+    m.def("pa_sparse_prefill_gfx1250_opus_fwd",     \
+          &pa_sparse_prefill_gfx1250_opus_fwd,      \
+          py::arg("q"),                             \
+          py::arg("unified_kv"),                    \
+          py::arg("kv_indices_prefix"),             \
+          py::arg("kv_indptr_prefix"),              \
+          py::arg("kv"),                            \
+          py::arg("kv_indices_extend"),             \
+          py::arg("kv_indptr_extend"),              \
+          py::arg("attn_sink"),                     \
+          py::arg("out"),                           \
+          py::arg("softmax_scale"));                \
+    m.def("pa_sparse_prefill_fp8_gfx950_opus_fwd",  \
+          &pa_sparse_prefill_fp8_gfx950_opus_fwd,   \
+          py::arg("q_nope"),                        \
+          py::arg("q_rope"),                        \
+          py::arg("unified_kv_nope"),               \
+          py::arg("unified_kv_rope"),               \
+          py::arg("kv_indices_prefix"),             \
+          py::arg("kv_indptr_prefix"),              \
+          py::arg("kv_nope"),                       \
+          py::arg("kv_rope"),                       \
+          py::arg("kv_indices_extend"),             \
+          py::arg("kv_indptr_extend"),              \
+          py::arg("attn_sink"),                     \
+          py::arg("out"),                           \
+          py::arg("softmax_scale"));                \
+    m.def("pa_sparse_prefill_fp8_gfx1250_opus_fwd", \
+          &pa_sparse_prefill_fp8_gfx1250_opus_fwd,  \
+          py::arg("q_nope"),                        \
+          py::arg("q_rope"),                        \
+          py::arg("unified_kv_nope"),               \
+          py::arg("unified_kv_rope"),               \
+          py::arg("kv_indices_prefix"),             \
+          py::arg("kv_indptr_prefix"),              \
+          py::arg("kv_nope"),                       \
+          py::arg("kv_rope"),                       \
+          py::arg("kv_indices_extend"),             \
+          py::arg("kv_indptr_extend"),              \
+          py::arg("attn_sink"),                     \
+          py::arg("out"),                           \
           py::arg("softmax_scale"));
 
 #define FMHA_FWD_BF16_OPUS_PYBIND                   \
@@ -1509,6 +1537,7 @@ namespace py = pybind11;
           py::arg("out"),                           \
           py::arg("causal"),                        \
           py::arg("softmax_scale"),                 \
+          py::arg("lse")            = std::nullopt, \
           py::arg("seqstart_q")     = std::nullopt, \
           py::arg("seqstart_k")     = std::nullopt, \
           py::arg("seqstart_q_pad") = std::nullopt, \
@@ -2124,7 +2153,7 @@ namespace py = pybind11;
           py::arg("sin_cache"),                        \
           py::arg("num_groups"),                       \
           py::arg("quant_group_size") = 128,           \
-          py::arg("scale_shuffle")    = false);
+          py::arg("scale_layout")     = 0);
 
 #define SMOOTHQUANT_PYBIND                      \
     m.def("smoothquant_fwd", &smoothquant_fwd); \
@@ -2539,7 +2568,10 @@ namespace py = pybind11;
           py::arg("q"),                                                     \
           py::arg("k"),                                                     \
           py::arg("v"),                                                     \
-          py::arg("out"),                                                   \
+          py::arg("o"),                                                     \
+          py::arg("lse"),                                                   \
+          py::arg("scratch_o"),                                            \
+          py::arg("scratch_lse"),                                          \
           py::arg("softmax_scale"),                                         \
           py::arg("causal"),                                                \
           py::arg("return_lse"),                                            \
@@ -2636,6 +2668,7 @@ namespace py = pybind11;
           py::arg("m_indices"),               \
           py::arg("bf16_zero_out"),           \
           py::arg("bf16_zero_workspace"),     \
+          py::arg("sort3stage_ws"),           \
           py::arg("M_logical"),               \
           py::arg("NE"),                      \
           py::arg("TOPK"),                    \
