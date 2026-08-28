@@ -45,15 +45,25 @@ One variable, applied to every op that sweeps a token count:
 
     AITER_BENCH_TOKENS=1,128,512 python op_tests/bench_gfx1250_combo.py --dsv4
 
-Two ops ignore it and pin their sweep in the source, because a global token
-count would mean the wrong thing for them:
+Leave it unset and every op runs the default in this file, which is the tested
+configuration -- the shapes below are what the suites are expected to pass on.
+Set it and it wins everywhere, with no second-guessing: an explicit request is
+the caller's to make, including for shapes an op is known to fail.
+
+The defaults are not one list, because a single token count does not mean the
+same thing to every op:
 
     mla_v4_decode   1..1024. Decode carries one token per sequence, so the
-                    axis is really the batch; AITER_BENCH_TOKENS=65536 would
-                    ask for a shape the model never runs.
+                    axis is really the batch, and 65536 is not a shape the
+                    model runs.
     inverse_rope    1..16384. The axis is -s at a fixed -b 128,16, and 65536
                     faults -- in the triton reference the UT compares against,
                     not in the kernel under test.
+    mega_moe        1..2048. 65536 cannot allocate its symmetric arena; see
+                    _MEGA_MOE_TOKENS.
+    a8w8_blockscale 1024..65536. Below 1024 it walks into a UT bug; see the
+                    note in DSV4_OPS.
+    mla_v4_prefill  1024 only. Larger n faults in the kernel.
 
 With the variable unset, the child-UT ops (score_qk, a8w8_blockscale,
 mla_v4_prefill_fp8) pass no shape flag at all, so each UT sweeps the range its
@@ -168,9 +178,9 @@ The ``mega_moe`` op runs both sides of the comparison:
       --acc_verify 0 --profile_table 1
 
 Token sweeps come from one variable, AITER_BENCH_TOKENS (see Environment
-above). The ops do not share a supported range -- score_qk asserts out past
-batch 1024, inverse_rope faults at its largest tokens -- so ops whose usable
-range is fixed pin their sweep in the source and ignore the variable.
+above). Unset, each op runs its own default -- the ops do not share a supported
+range, so those defaults differ and each says why at its constant. Set, it
+applies to every op that sweeps tokens, and the file does not argue with it.
 
 ``a16w16`` is not one of them: its range is a function of what opus has tuned,
 not a fixed limit. Shapes with no tuned winner fall back to a split-K kid whose
@@ -297,11 +307,12 @@ _TOKENS = _tokens((1, 16, 32, 64, 128, 256, 512, 1024, 2048, 65536))
 # the prefill chunk sizes never got measured on the BF16 linears. Add them to
 # this op's default; AITER_BENCH_TOKENS still overrides the whole thing.
 _A16W16_MS = _tokens(tuple(sorted({*_TOKENS, 4096, 8192, 16384})))
-# Pinned, not env-driven. This axis is -s (sequence length) at a fixed
-# -b 128,16, not the token count the other ops sweep, so a global setting would
-# mean something different here. 65536 is left off: it faults, and in the
-# triton reference the UT compares against rather than the kernel under test.
-_INVERSE_ROPE_TOKENS = (1, 16, 32, 64, 128, 256, 512, 1024, 2048, 16384)
+# This axis is -s (sequence length) at a fixed -b 128,16, not the token count
+# the other ops sweep, so the default is its own rather than _TOKENS. 65536 is
+# left off it: that value faults, and in the triton reference the UT compares
+# against rather than in the kernel under test. AITER_BENCH_TOKENS still wins if
+# set -- what an explicit request sweeps is the caller's business.
+_INVERSE_ROPE_TOKENS = _tokens((1, 16, 32, 64, 128, 256, 512, 1024, 2048, 16384))
 _SCORE_QK_TOKENS = _tokens()
 # score_qk is decode, so its KV length is the average context a decode step
 # scans: input + output/2, then CSA's 4x compression.
@@ -327,10 +338,10 @@ _SCORE_QK_KV_LENGTHS = (
 # 11 tuned rows that are the only shapes dispatching to gluon. This is a way
 # around the UT bug, not a fix for it.
 _A8W8_BLOCKSCALE_TOKENS = _tokens((1024, 2048, 4096, 8192, 16384, 65536))
-# Pinned, not env-driven. Decode carries one token per sequence, so the token
-# axis here is the batch, and past 1024 it stops being a shape the model runs.
-# AITER_BENCH_TOKENS is deliberately not consulted for this op.
-_MLA_DECODE_TOKENS = (1, 16, 32, 64, 128, 256, 512, 1024)
+# Decode carries one token per sequence, so this axis is the batch, not a token
+# count; past 1024 it stops being a shape the model runs, hence its own default
+# rather than _TOKENS. AITER_BENCH_TOKENS overrides it like everywhere else.
+_MLA_DECODE_TOKENS = _tokens((1, 16, 32, 64, 128, 256, 512, 1024))
 # Pinned to the one n that has never faulted. Measured on gfx1250 / 20260827
 # with --no-verify on, so no reference is involved:
 #   1024   3/3 pass
@@ -349,11 +360,12 @@ _MLA_PREFILL_TOKENS = _tokens((1024,))
 _MLA_PREFILL_FP8_TOKENS = _tokens()
 # UT default minus 8192, the one value that faults. See run_mla_v4_prefill_fp8.
 _MLA_PREFILL_FP8_NNZ = (256, 1024, 4096, 16384)
-# Pinned, not env-driven. tokens/rank=65536 dies in pipe.setup() building the
-# symmetric arena: cco sizes it from Communicator.DEFAULT_PER_RANK_VMM (4 GiB)
-# and asks for 7.5 GB. That is a per_rank_vmm the UT never passes, not
-# something MORI_SHMEM_HEAP_SIZE reaches, so the tier cannot run from here.
-_MEGA_MOE_TOKENS = (1, 16, 32, 64, 128, 256, 512, 1024, 2048)
+# Default stops at 2048: tokens/rank=65536 dies in pipe.setup() building the
+# symmetric arena -- cco sizes it from Communicator.DEFAULT_PER_RANK_VMM (4 GiB)
+# and asks for 7.5 GB. That is a per_rank_vmm the UT never passes, not something
+# MORI_SHMEM_HEAP_SIZE reaches, so the tier cannot run from here. Ask for it via
+# AITER_BENCH_TOKENS anyway and you get it, along with that failure.
+_MEGA_MOE_TOKENS = _tokens((1, 16, 32, 64, 128, 256, 512, 1024, 2048))
 
 
 def _int_quad(s):
