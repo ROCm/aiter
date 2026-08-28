@@ -400,11 +400,13 @@ default_kernels_dict_950 = {
 # fmt: on
 
 arch = get_gfx()
+_expanded_942 = expand_blockpercu(kernels_list_942)
+_expanded_950 = expand_blockpercu(kernels_list_950)
 if arch == "gfx942":
-    kernels_list = expand_blockpercu(kernels_list_942)
+    kernels_list = _expanded_942
     default_kernels_dict = default_kernels_dict_942
 else:
-    kernels_list = expand_blockpercu(kernels_list_950)
+    kernels_list = _expanded_950
     default_kernels_dict = default_kernels_dict_950
 
 # Name-based reverse lookup for get_tune_dict() — built once at import time
@@ -413,5 +415,4 @@ else:
 # last entry, but build_tune_dict processes CSV rows for all build targets.
 # Note: cannot use {**a, **b} merge — both arches use overlapping integer IDs,
 # which would drop entries. Collect values from both dicts instead.
-_all_bpreshuffle_kernels = list(expand_blockpercu(kernels_list_942).values()) + list(expand_blockpercu(kernels_list_950).values())
-kernels_by_name = {v.name: v for v in _all_bpreshuffle_kernels}
+kernels_by_name = {v.name: v for v in list(_expanded_942.values()) + list(_expanded_950.values())}

@@ -138,10 +138,12 @@ default_kernels_cktile_dict = {
 
 
 arch = get_gfx()
+_expanded_942 = expand_blockpercu(kernels_list_942)
+_expanded_95x = expand_blockpercu(kernels_list_95x)
 if arch.startswith("gfx95"):
-    candidate_kernels_cktile_dict = expand_blockpercu(kernels_list_95x)
+    candidate_kernels_cktile_dict = _expanded_95x
 else:
-    candidate_kernels_cktile_dict = expand_blockpercu(kernels_list_942)
+    candidate_kernels_cktile_dict = _expanded_942
 
 # Name-based reverse lookup for get_tune_dict()
 # Must include kernels from ALL arches, not just the current get_gfx() arch.
@@ -151,5 +153,4 @@ else:
 # encounters a CSV row referencing a kernel name from a different arch.
 # Note: cannot use {**a, **b} merge — both arches use overlapping integer IDs,
 # which would drop entries. Collect values from both dicts instead.
-_all_cktile_kernels = list(expand_blockpercu(kernels_list_942).values()) + list(expand_blockpercu(kernels_list_95x).values())
-candidate_kernels_by_name = {v.name: v for v in _all_cktile_kernels}
+candidate_kernels_by_name = {v.name: v for v in list(_expanded_942.values()) + list(_expanded_95x.values())}
