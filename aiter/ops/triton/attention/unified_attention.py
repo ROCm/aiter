@@ -126,12 +126,48 @@ class _UAParams(NamedTuple):
     skip_reduce: bool = False
 
 
-def get_config_name(params: _UAParams):
-    pass
+def generate_config_key(params: _UAParams, op: str) -> str:
+    assert op in ("attn_2d", "attn_3d", "reduce"), f"Unknown config op '{op}'"
 
+    if op == "attn_2d":
+        if not params.all_decode:
+            # head_size outranks max_seqlen_q: the large-prefill BLOCK_M only
+            # applies below the head_size branches
+            if params.head_size >= 512:
+                key = "prefill_hge512"
+            elif params.head_size >= 256:
+                key = "prefill_hge256"
+            elif params.max_seqlen_q >= 256:
+                key = "prefill_qge256"
+            else:
+                key = "prefill"
+            if params.sliding_window > 0:
+                key += "_sw"
+            if params.max_seqlen_k < 2048:
+                key += "_sklt2048"
+        else:
+            if params.head_size >= 512:
+                key = "decode_hge512"
+            elif params.head_size > 128:
+                key = "decode_hgt128"
+            else:
+                key = "decode"
+            if params.sliding_window > 0:
+                key += "_sw"
+    else:
+        # attn_3d / reduce split on head_size alone. head_size == 128 is its own
+        # bucket because the gfx950 wide-LDS path is head_size <= 128 while the
+        # gfx1250 shuffled-KV path is head_size < 128.
+        if params.head_size >= 512:
+            key = "hge512"
+        elif params.head_size > 128:
+            key = "hgt128"
+        elif params.head_size == 128:
+            key = "heq128"
+        else:
+            key = "hlt128"
 
-def get_config():
-    pass
+    return f"{key}_shuffled_kv" if params.shuffled_kv_cache else key
 
 
 def select_2d_config(

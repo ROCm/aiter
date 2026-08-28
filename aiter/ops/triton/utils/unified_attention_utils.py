@@ -13,22 +13,7 @@ from aiter.ops.triton.utils.config_utils import (
 )
 from aiter.ops.triton.utils.types import e4m3_dtype
 
-_DEFAULT_PREFIX_BOUNDS = {
-    "SQ": (1, 16, 64, 128, 256, 512, 1024, 2048, 4096, 8192),  # max_seqlen_q
-    "SK": (
-        512,
-        1024,
-        2048,
-        4096,
-        8192,
-        16384,
-        32768,
-        65536,
-        131072,
-        262144,
-    ),  # max_seqlen_k
-    "PAGE": (16, 32, 64, 128, 256),  # block_size
-}
+_DEFAULT_BS_BOUNDS = (16, 32, 64, 128, 256)
 
 
 def get_dtype_str(dtype: torch.dtype):
@@ -49,13 +34,12 @@ def _dtype_keys(q_tag: str, kv_tag: str):
 def _get_unified_attention_config_cached(
     op: str,  # "attn_2d" | "attn_3d" | "reduce"
     key: str,
-    bucket_prefix: str,  # "SQ" | "SK" | "PAGE"
-    bucket_value: int,
     q_dtype: torch.dtype,
     kv_dtype: torch.dtype,
     head_size: int,
-    block_size: int,
     num_queries_per_kv: int,
+    block_size: int,
+    bounds: tuple[int, ...] | None = None,
     backend: str = "triton",  # "gluon" | "triton"
 ) -> tuple[dict, bool]:
     config_name = "UNIFIED-ATTENTION"
@@ -106,18 +90,18 @@ def _get_unified_attention_config_cached(
         raise KeyError(f"{where}: no dtype entry found for q={q_tag} kv={kv_tag}")
 
     # bounds
-    bounds = _DEFAULT_PREFIX_BOUNDS[bucket_prefix]
+    search_bounds = bounds if bounds is not None else _DEFAULT_BS_BOUNDS
 
-    # search for {bucket_prefix}_LEQ_x keys
-    for bound in bounds:
-        candidate = f"{bucket_prefix}_LEQ_{bound}"
-        if bucket_value <= bound and candidate in dtype_configs:
+    # search for BS_LEQ_x keys
+    for bound in search_bounds:
+        candidate = f"BS_LEQ_{bound}"
+        if block_size <= bound and candidate in dtype_configs:
             return dict(dtype_configs[candidate]), is_tuned
 
-    # search for {bucket_prefix}_GEQ_x keys
-    for bound in reversed(bounds):
-        candidate = f"{bucket_prefix}_GEQ_{bound}"
-        if bucket_value >= bound and candidate in dtype_configs:
+    # search for BS_GEQ_x keys
+    for bound in reversed(search_bounds):
+        candidate = f"BS_GEQ_{bound}"
+        if block_size >= bound and candidate in dtype_configs:
             return dict(dtype_configs[candidate]), is_tuned
 
     if "any" in dtype_configs:
@@ -132,25 +116,23 @@ def _get_unified_attention_config_cached(
 def get_unified_attention_config(
     op: str,  # "attn_2d" | "attn_3d" | "reduce"
     key: str,
-    bucket_prefix: str,  # "SQ" | "SK" | "PAGE"
-    bucket_value: int,
     q_dtype: torch.dtype,
     kv_dtype: torch.dtype,
     head_size: int,
-    block_size: int,
     num_queries_per_kv: int,
+    block_size: int,
+    bounds: tuple[int, ...] | None = None,
     backend: str = "triton",  # "gluon" | "triton"
 ) -> tuple[dict, bool]:
     config, is_tuned = _get_unified_attention_config_cached(
         op,
         key,
-        bucket_prefix,
-        bucket_value,
         q_dtype,
         kv_dtype,
         head_size,
-        block_size,
         num_queries_per_kv,
-        backend,
+        block_size,
+        bounds=bounds,
+        backend=backend,
     )
     return copy.deepcopy(config), is_tuned
