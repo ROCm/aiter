@@ -19,9 +19,7 @@ _LAUNCH_META = frozenset({"num_warps", "num_stages"})
 
 
 def load_sonicmoe_configs() -> dict[str, Any] | None:
-    cfg_dir, name_prefix = resolve_config_dir(
-        "moe", "SONICMOE-BF16", backend="triton"
-    )
+    cfg_dir, name_prefix = resolve_config_dir("moe", "SONICMOE-BF16", backend="triton")
     stem = f"{name_prefix}SONICMOE-BF16" if name_prefix else "DEFAULT"
     return load_config_json(f"{cfg_dir}/{stem}.json", required=False)
 
