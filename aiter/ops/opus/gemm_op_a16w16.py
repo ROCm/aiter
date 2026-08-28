@@ -90,25 +90,12 @@ def _opus_gemm_a16w16_tune_raw(
 ) -> torch.Tensor: ...
 
 
-@compile_ops(
-    "module_deepgemm_opus",
-    fc_name="opus_gemm_a16w16_has_kernel",
-    develop=True,
-)
-def _opus_gemm_a16w16_has_kernel_raw(
-    kernelId: int,
-    outputFp32: bool = False,
-) -> bool: ...
-
-
-@functools.lru_cache(maxsize=512)
-def is_a16w16_kernel_compiled(kernelId: int, outdtype: torch.dtype) -> bool:
-    """Return whether the loaded Opus module contains this tuned kernel."""
-    return bool(
-        _opus_gemm_a16w16_has_kernel_raw(
-            int(kernelId),
-            outputFp32=(outdtype == torch.float32),
-        )
+def _is_missing_tuned_kernel(error: RuntimeError) -> bool:
+    message = str(error)
+    return (
+        "Kernel id " in message
+        and "a16w16" in message
+        and "tune lookup table" in message
     )
 
 
@@ -673,18 +660,20 @@ def gemm_a16w16_opus(
     )
     if cfg is not None:
         kid = cfg["solidx"]
-        if not is_a16w16_kernel_compiled(kid, dtype):
+        # Both bf16 and fp32 Y are now valid for splitk kids (the reduce
+        # kernel handles the cast / passthrough), so no Y.dtype gating is
+        # needed here -- always honor the tuned winner.
+        try:
+            opus_gemm_a16w16_tune(XQ, WQ, Y, bias, kid, int(cfg["splitK"]))
+        except RuntimeError as error:
+            if not _is_missing_tuned_kernel(error):
+                raise
             logger.warning(
                 "Opus tuned config selected kernel %d, but it is absent from "
                 "the loaded module; falling back to the Opus heuristic.",
                 kid,
             )
             _opus_gemm_bf16_dispatch(XQ, WQ, Y, None, None, None, bias)
-            return _finalize_output(Y, reshape_out_to_2d)
-        # Both bf16 and fp32 Y are now valid for splitk kids (the reduce
-        # kernel handles the cast / passthrough), so no Y.dtype gating is
-        # needed here -- always honor the tuned winner.
-        opus_gemm_a16w16_tune(XQ, WQ, Y, bias, kid, int(cfg["splitK"]))
         return _finalize_output(Y, reshape_out_to_2d)
 
     # 3) CSV miss: fall through to the C++ heuristic dispatcher via
@@ -734,7 +723,6 @@ def opus_gemm_workspace_release_all() -> None: ...
 
 __all__ = [
     "gemm_a16w16_opus",
-    "is_a16w16_kernel_compiled",
     "is_splitk_kid",
     "opus_gemm_a16w16_tune",
     "opus_gemm_workspace_init",

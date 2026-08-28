@@ -42,13 +42,9 @@ from aiter.ops.gemm_op_common import get_padded_m
 
 try:
     from aiter.ops.opus.gemm_op_a16w16 import (
-        is_a16w16_kernel_compiled as _opus_kernel_compiled,
-    )
-    from aiter.ops.opus.gemm_op_a16w16 import (
         opus_gemm_a16w16_tune as _opus_tune,
     )
 except Exception:  # noqa: BLE001  blanket catch is intentional here
-    _opus_kernel_compiled = None
     _opus_tune = None
 
 # NOTE: gfx1250 split-K kids allocate their partial-sum workspace as a plain
@@ -567,39 +563,36 @@ def opus_gemm(
     assert not bpreshuffle, "opus_gemm does not support bpreshuffle"
     splitK = int(config.get("splitK", 0)) if config is not None else 0
     output_dtype = otype or inp.dtype
-    if _opus_kernel_compiled is None or not _opus_kernel_compiled(
-        int(solidx), output_dtype
-    ):
-        logger.warning(
-            "opus tuned config selected kernel %d, but it is absent from the "
-            "loaded module; falling back to torch",
-            solidx,
-        )
-        return torch_gemm(
-            inp,
-            weights,
-            solidx,
-            bias,
-            otype,
-            scale_a,
-            scale_b,
-            scale_c,
-            bpreshuffle,
-            config,
-        )
     m, _k = inp.shape
     n = weights.shape[0]
     # The split-K workspace (if any) is allocated capture-safely inside
     # opus_gemm_a16w16_tune -> _get_opus_workspace; no eager pre-warm needed.
     Y = torch.empty(m, n, dtype=output_dtype, device=inp.device)
-    _opus_tune(
-        inp.unsqueeze(0),
-        weights.unsqueeze(0),
-        Y.unsqueeze(0),
-        bias=bias,
-        kernelId=int(solidx),
-        splitK=splitK,
-    )
+    try:
+        _opus_tune(
+            inp.unsqueeze(0),
+            weights.unsqueeze(0),
+            Y.unsqueeze(0),
+            bias=bias,
+            kernelId=int(solidx),
+            splitK=splitK,
+        )
+    except RuntimeError as error:
+        message = str(error)
+        if not (
+            "Kernel id " in message
+            and "a16w16" in message
+            and "tune lookup table" in message
+        ):
+            raise
+        logger.warning(
+            "opus tuned config selected kernel %d, but it is absent from the "
+            "loaded module; falling back to torch",
+            solidx,
+        )
+        fallback = torch_gemm(inp, weights, solidx)
+        fallback = fallback.to(output_dtype)
+        return fallback + bias if bias is not None else fallback
     # NOTE: do NOT add bias again here -- the opus splitk reduce kernel already
     # folds `bias` into the fp32 accumulator before the bf16/fp32 cast (HAS_BIAS
     # path). The previous `Y = Y + bias` double-counted bias (output = A@B^T +

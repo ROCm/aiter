@@ -40,8 +40,9 @@ template <typename CDataType>
 inline opus_gfx1250_detail::OpusA16W16TuneKernel
 opus_a16w16_tune_dispatch_gfx1250(int id);
 
+template <>
 inline opus_gfx1250_detail::OpusA16W16TuneKernel
-opus_a16w16_tune_find_gfx1250(int id)
+opus_a16w16_tune_dispatch_gfx1250<fp32_t>(int id)
 {
     using namespace opus_gfx1250_detail;
     static constexpr OpusA16W16TuneEntry kTune[] = {
@@ -51,23 +52,10 @@ opus_a16w16_tune_find_gfx1250(int id)
     OpusA16W16TuneEntry needle{id, nullptr};
     auto it = std::lower_bound(kTune, kTune + kSize, needle,
                                kid_entry_less<OpusA16W16TuneEntry>);
-    return it != kTune + kSize && it->kid == id ? it->func : nullptr;
-}
-
-inline bool opus_a16w16_tune_has_gfx1250(int id)
-{
-    return opus_a16w16_tune_find_gfx1250(id) != nullptr;
-}
-
-template <>
-inline opus_gfx1250_detail::OpusA16W16TuneKernel
-opus_a16w16_tune_dispatch_gfx1250<fp32_t>(int id)
-{
-    auto kernel = opus_a16w16_tune_find_gfx1250(id);
-    AITER_CHECK(kernel != nullptr,
+    AITER_CHECK(it != kTune + kSize && it->kid == id,
                 "Kernel id ", id,
                 " not found in a16w16 fp32 tune lookup table (gfx1250)");
-    return kernel;
+    return it->func;
 }
 
 template <>
@@ -91,7 +79,7 @@ opus_a16w16_tune_dispatch_gfx1250<bf16_t>(int id)
 // are bf16-out only: the kernel writes bf16 C directly, with no reduce kernel in
 // the way to cast anything else.
 inline opus_gfx1250_detail::OpusA16W16CoKernel
-opus_a16w16_co_tune_find_gfx1250(int id)
+opus_a16w16_co_tune_dispatch_gfx1250(int id)
 {
     using namespace opus_gfx1250_detail;
     static constexpr OpusA16W16CoTuneEntry kTune[] = {
@@ -101,26 +89,14 @@ opus_a16w16_co_tune_find_gfx1250(int id)
     OpusA16W16CoTuneEntry needle{id, nullptr};
     auto it = std::lower_bound(kTune, kTune + kSize, needle,
                                kid_entry_less<OpusA16W16CoTuneEntry>);
-    return it != kTune + kSize && it->kid == id ? it->func : nullptr;
-}
-
-inline bool opus_a16w16_co_tune_has_gfx1250(int id)
-{
-    return opus_a16w16_co_tune_find_gfx1250(id) != nullptr;
-}
-
-inline opus_gfx1250_detail::OpusA16W16CoKernel
-opus_a16w16_co_tune_dispatch_gfx1250(int id)
-{
-    auto kernel = opus_a16w16_co_tune_find_gfx1250(id);
-    AITER_CHECK(kernel != nullptr,
+    AITER_CHECK(it != kTune + kSize && it->kid == id,
                 "Kernel id ", id,
                 " not found in the a16w16 pre-compiled (.co) tune lookup table "
                 "(gfx1250). Either it is not in this build's compile set, or "
                 "the build saw no gen_co/co_kernels.json / no matching "
                 "gen_co/<arch>/*.co and the whole family is empty (the loader "
                 "drops kids whose image is missing).");
-    return kernel;
+    return it->func;
 }
 
 // (M, N, K) -> pre-compiled kernel, nullptr on miss. No heuristic fallback: the
