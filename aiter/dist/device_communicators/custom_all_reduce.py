@@ -1437,6 +1437,28 @@ class CustomAllreduce:
         )
         return out
 
+    def owner_read_gather_fused(
+        self,
+        inp: torch.Tensor,
+        owner_rank: torch.Tensor,
+        out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        # Fused owner-read gather: copies local data to the IPC buffer and
+        # performs the owner-read gather in a single kernel launch, enabling
+        # CUDA graph capture without a separate hipMemcpyAsync step.
+        if out is None:
+            out = torch.empty_like(inp)
+        assert is_weak_contiguous(out), "output not weak-contiguous"
+        ops.owner_read_gather_fused(
+            self._ptr,
+            inp,
+            self._pool["input"].data_ptr,
+            out,
+            self._pool["input"].max_size,
+            owner_rank.data_ptr(),
+        )
+        return out
+
 
     # Int dtypes have no fp counterpart in the C++ dispatch enum, but the
     # all-gather kernel is pure memcpy parametrized only by sizeof(T). View

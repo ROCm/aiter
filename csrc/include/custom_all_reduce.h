@@ -71,6 +71,13 @@ void owner_read_gather(fptr_t _fa,
                        const aiter_tensor_t& out,
                        int64_t reg_bytes,
                        int64_t owner_rank_ptr);
+void owner_read_gather_fused(fptr_t _fa,
+                             const aiter_tensor_t& inp,
+                             int64_t reg_buffer,
+                             const aiter_tensor_t& out,
+                             int64_t reg_bytes,
+                             int64_t owner_rank_ptr);
+
 void fused_allreduce_rmsnorm(fptr_t _fa,
                              const aiter_tensor_t& inp,
                              const aiter_tensor_t& res_inp,

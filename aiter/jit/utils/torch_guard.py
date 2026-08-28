@@ -87,6 +87,7 @@ NONE_WRAPPED_OP = [
     "all_gather_reg",
     "all_gather_unreg",
     "owner_read_gather",
+    "owner_read_gather_fused",
     "fused_allreduce_rmsnorm",
     "fused_allreduce_rmsnorm_quant",
     "fused_qknorm_allreduce",

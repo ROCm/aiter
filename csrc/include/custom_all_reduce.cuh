@@ -806,6 +806,49 @@ __global__ void __launch_bounds__(512, 1) owner_read_gather(
 
     end_sync<ngpus, true>(sg, self_sg, rank);
 }
+/*
+ * owner_read_gather_fused: fuses the local copy-in (hipMemcpyAsync replacement)
+ * with the owner-read gather in a single kernel launch.  Each thread first
+ * copies its local data to this rank's IPC-registered buffer, then a
+ * __threadfence_system() + start_sync pair ensures the copy is visible
+ * system-wide before any peer reads.  This eliminates the separate DMA
+ * setup overhead and makes the operation a single kernel launch suitable
+ * for CUDA graph capture.
+ */
+template <typename T, int ngpus>
+__global__ void __launch_bounds__(512, 1) owner_read_gather_fused(
+    RankData* _dp, RankSignals sg, Signal* self_sg,
+    const T* __restrict__ input, T* __restrict__ result, int rank,
+    int n_total, int last_dim, const int* __restrict__ owner_rank)
+{
+    int tid    = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = gridDim.x * blockDim.x;
+
+    // Phase 1: copy local data to this rank's IPC buffer
+    T* local_buf   = (T*)_dp->ptrs[rank];
+    int total_elems = n_total * last_dim;
+    for(int i = tid; i < total_elems; i += stride)
+        local_buf[i] = input[i];
+
+    // Ensure the copy is complete within the block and visible system-wide
+    // before signalling readiness to peer ranks.
+    __syncthreads();
+    __threadfence_system();
+
+    // Phase 2: signal that this rank's data is ready, then read from owners
+    start_sync<ngpus>(sg, self_sg, rank);
+
+    for(int row = tid; row < n_total; row += stride)
+    {
+        int owner    = owner_rank[row];
+        const T* src = (const T*)_dp->ptrs[owner] + row * last_dim;
+        T* dst       = result + row * last_dim;
+        __builtin_memcpy(dst, src, last_dim * sizeof(T));
+    }
+
+    end_sync<ngpus, true>(sg, self_sg, rank);
+}
+
 
 // ========== reduce_scatter kernel start ==========
 //
@@ -4142,6 +4185,35 @@ void dispatchOwnerReadGather(
     default: printf("owner_read_gather world_size error\n");
     }
 }
+
+template <typename T>
+void dispatchOwnerReadGatherFused(
+    hipStream_t stream, T* input, T* reg_buffer, T* output,
+    int n_total, int last_dim, const int* owner_rank)
+{
+    RankData* ptrs = get_buffer_RD(stream, reg_buffer);
+    dim3 block(512);
+    int block_num = std::min((n_total + 511) / 512, 80);
+    dim3 grid(block_num);
+
+    switch(world_size_)
+    {
+    case 8:
+        owner_read_gather_fused<T, 8><<<grid, block, 0, stream>>>(
+            ptrs, sg_, self_sg_, input, output, rank_, n_total, last_dim, owner_rank);
+        break;
+    case 4:
+        owner_read_gather_fused<T, 4><<<grid, block, 0, stream>>>(
+            ptrs, sg_, self_sg_, input, output, rank_, n_total, last_dim, owner_rank);
+        break;
+    case 2:
+        owner_read_gather_fused<T, 2><<<grid, block, 0, stream>>>(
+            ptrs, sg_, self_sg_, input, output, rank_, n_total, last_dim, owner_rank);
+        break;
+    default: printf("owner_read_gather_fused world_size error\n");
+    }
+}
+
 
 template <typename T>
 void dispatchFusedAllReduceRMSNorm(hipStream_t stream,
