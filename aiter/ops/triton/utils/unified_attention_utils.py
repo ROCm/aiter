@@ -3,6 +3,7 @@
 
 import copy
 import functools
+import itertools
 
 import torch
 
@@ -42,6 +43,27 @@ def _get_unified_attention_config_cached(
     bounds: tuple[int, ...] | None = None,
     backend: str = "triton",  # "gluon" | "triton"
 ) -> tuple[dict, bool]:
+    """
+    Internal cached implementation. Do NOT use this directly. Use
+    `get_unified_attention_config()` instead, which returns a deep-copy
+    so callers can freely mutate the returned dict without polluting
+    the cache.
+
+    Resolves from `<arch>/<backend>/attention/unified_attention/` (
+    default named `DEFAULT.json`).
+    """
+    # input validation
+    assert head_size > 0, "head_size must be positive"
+    assert num_queries_per_kv > 0, "num_queries_per_kv must be positive"
+    assert block_size > 0, "block_size must be positive"
+    assert bounds is None or (
+        len(bounds) > 0
+        and all(x > 0 for x in bounds)
+        and all(x < y for x, y in itertools.pairwise(bounds))
+    ), (
+        "When provided, bounds must be a non-empty tuple of strictly increasing positive numbers"
+    )
+
     config_name = "UNIFIED-ATTENTION"
     q_tag, kv_tag = get_dtype_str(q_dtype), get_dtype_str(kv_dtype)
 
@@ -105,7 +127,7 @@ def _get_unified_attention_config_cached(
             return dict(dtype_configs[candidate]), is_tuned
 
     if "any" in dtype_configs:
-        return dict(dtype_configs["any"]), False
+        return dict(dtype_configs["any"]), is_tuned
 
     raise KeyError(
         f"{where}: no matching configuration found for "
@@ -124,6 +146,34 @@ def get_unified_attention_config(
     bounds: tuple[int, ...] | None = None,
     backend: str = "triton",  # "gluon" | "triton"
 ) -> tuple[dict, bool]:
+    """
+    Load a unified attention configuration using the BS_LEQ_x/BS_GEQ_x/any format.
+
+    This function provides a unified way to load unified attention configs across all kernels.
+    It uses the following logic:
+    1. Load default config file: <arch>/<backend>/attention/unified_attention/DEFAULT.json
+    2. Try the specialized config, which overrides the default:
+       UNIFIED-ATTENTION-D={head_size}-QPKV={num_queries_per_kv}.json
+    3. If it is absent, try UNIFIED-ATTENTION-D={head_size}.json; the first
+       specialized file that exists wins and marks the config as tuned
+    4. Look up the op section (attn_2d|attn_3d|reduce) in the resulting file
+    5. Look up key inside that op, falling back to "any"
+    6. Look up the q/kv dtype entry, trying "{q}_{kv}", "{q}_any", "any_{kv}",
+       then "any", with the tags (nvfp4|fp8|bf16) coming from get_dtype_str()
+    7. Search for BS_LEQ_x keys in order of bounds (default: _DEFAULT_BS_BOUNDS)
+    8. If no BS_LEQ_x matches, search for BS_GEQ_x keys in reverse order
+    9. Fall back to "any" if no bounds match
+
+    Args:
+        op (str): Unified attention operation (attn_2d|attn_3d|reduce)
+        bounds (tuple[int, ...] | None, optional): Custom bounds to use instead of
+            _DEFAULT_BS_BOUNDS. Defaults to None.
+
+    Returns:
+        tuple[dict, bool]:
+            Dictionary with the config params (a fresh deep-copy safe to mutate),
+            bool indicating if the config is tuned.
+    """
     config, is_tuned = _get_unified_attention_config_cached(
         op,
         key,
