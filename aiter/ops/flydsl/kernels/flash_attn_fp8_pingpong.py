@@ -748,12 +748,121 @@ def build_flash_attn_fp8_module(
 
             return m_frozen, bias_chunks, s_accs
 
+        # ---- overflow watchdog + rollback (see tmp/watchdog_rollback_report.md)
+        #
+        # The frozen max is a bet: m is decided on tile 0 and never moves, so a
+        # later tile whose scores climb past it produces P > 1 and can walk off
+        # the top of E4M3 (448).  The watchdog is the hot-path half of the bet:
+        # an in-lane max over this lane's 64 Schraudolph patterns plus one
+        # ballot.  No cross-lane exchange -- the wave-wide OR already unions
+        # every lane, so the exchange only matters once we are inside the
+        # repair.  The compare is written NOT(CAP >= m) rather than m > CAP so
+        # a NaN pattern also fires.
+        #
+        # The rollback is the cold half, and it is exact rather than a clamp.
+        # Everything lives in Schraudolph pattern units, where the exponent is
+        # affine: lowering every pattern of this tile by d is *identical* to
+        # having frozen a max that was larger by d, so P needs no float rescale
+        # and the repair folds into the scalar bias.  The already-accumulated
+        # O / L / LR were built against the old max and are rescaled by
+        # f = 2^(-d/2^23) -- uniform in a lane, so the O/L ratio is untouched
+        # and the result is bit-exactly what a correctly-seeded run would give.
+        # d is chosen to put the row max back at 2^EXP2_SHIFT, i.e. all the
+        # headroom is restored, so the repair is self-healing and cannot
+        # thrash.
+        def _rollback(
+            s_accs, o_accs, l_mfma, l_valu, m_frozen, bias_chunks, m_local, fired
+        ):
+            vt = Vec.make_type(C_F32_PER_LANE, fx.Float32)
+            if_op = scf.IfOp(
+                fired,
+                results_=[vt] * N_KV_TILES
+                + [vt] * D_TILES
+                + [vt, T.f32, T.f32, T.i32, T.i32],
+                has_else=True,
+            )
+            with ir.InsertionPoint(if_op.then_block):
+                # Complete the row: a row of S is one lane's 16 values in each
+                # of the 4 tiles, unioned with its lane^32 peer.
+                t = _fmax(
+                    m_local,
+                    fx.Float32(m_local).shuffle_xor(
+                        fx.Int32(32), fx.Int32(WARP_SIZE)
+                    ),
+                )
+                # Only rows that actually overflowed move; the ballot is
+                # wave-wide, so most lanes inside the branch are innocent.
+                hit = arith.cmpf(
+                    arith.CmpFPredicate.OGT, _raw(t), _raw(c_sch_cap)
+                )
+                d = ArithValue(hit).select(
+                    fx.Float32(_fsub(t, c_exp2_bias)), c_zero_f
+                )
+                f = rocdl.exp2(
+                    T.f32, _raw(_fmul(_fsub(c_zero_f, d), c_inv_2p23))
+                )
+                d_vec = Vec.from_elements([d], fx.Float32).broadcast_to(
+                    C_F32_PER_LANE
+                )
+                f_vec = Vec.from_elements([f], fx.Float32).broadcast_to(
+                    C_F32_PER_LANE
+                )
+                _s = [
+                    _fsub(Vec(s_accs[nt]), d_vec)
+                    for nt in range_constexpr(N_KV_TILES)
+                ]
+                _o = [
+                    _fmul(Vec(o_accs[dt]), f_vec)
+                    for dt in range_constexpr(D_TILES)
+                ]
+                _lm = _fmul(Vec(l_mfma), f_vec)
+                _lv = _fmul(l_valu, f)
+                _m = _fadd(m_frozen, d)
+                # Re-derive the seed: b = C - m.  Later tiles are prefilled
+                # with the new b, so they agree with the rescaled past.
+                _bc = _bias_split(_fsub(c_exp2_bias, _m))
+                scf.YieldOp(
+                    [_raw(v) for v in _s]
+                    + [_raw(v) for v in _o]
+                    + [_raw(_lm), _raw(_lv), _raw(_m)]
+                    + [_raw(bc) for bc in _bc]
+                )
+            with ir.InsertionPoint(if_op.else_block):
+                scf.YieldOp(
+                    [_raw(v) for v in s_accs]
+                    + [_raw(v) for v in o_accs]
+                    + [_raw(l_mfma), _raw(l_valu), _raw(m_frozen)]
+                    + [_raw(bc) for bc in bias_chunks]
+                )
+            r = if_op.results
+            n = N_KV_TILES
+            s_out = [
+                as_dsl_value(r[i], s_accs[i]) for i in range_constexpr(n)
+            ]
+            o_out = [
+                as_dsl_value(r[n + i], o_accs[i]) for i in range_constexpr(D_TILES)
+            ]
+            k = n + D_TILES
+            return (
+                s_out,
+                o_out,
+                as_dsl_value(r[k], l_mfma),
+                as_dsl_value(r[k + 1], l_valu),
+                as_dsl_value(r[k + 2], m_frozen),
+                tuple(
+                    as_dsl_value(r[k + 3 + i], bias_chunks[i])
+                    for i in range_constexpr(N_BIAS_CHUNKS)
+                ),
+            )
+
         def do_softmax(
             s_accs,
             m_frozen,
             l_valu,
             bias_chunks=None,
             seeded=False,
+            o_accs=None,
+            l_mfma=None,
         ):
             if const_expr(not seeded):
                 m_frozen = _rowmax(s_accs, m_frozen)
@@ -762,34 +871,62 @@ def build_flash_attn_fp8_module(
                     C_F32_PER_LANE
                 )
                 bias_chunks = _bias_split(m_term)
+            else:
+                # Watchdog: in-lane max of this lane's patterns, then one
+                # ballot.  Cheap enough to sit on the critical path; the
+                # branch is wave-uniform so the wave never diverges.
+                m_local = _lane_max(s_accs)
+                fired = _wave_or(
+                    arith.cmpf(
+                        arith.CmpFPredicate.UGT, _raw(m_local), _raw(c_sch_cap)
+                    )
+                )
+                (
+                    s_accs,
+                    o_accs,
+                    l_mfma,
+                    l_valu,
+                    m_frozen,
+                    bias_chunks,
+                ) = _rollback(
+                    s_accs,
+                    o_accs,
+                    l_mfma,
+                    l_valu,
+                    m_frozen,
+                    bias_chunks,
+                    m_local,
+                    fired,
+                )
 
             n_groups = C_F32_PER_LANE // 4
 
             p_words = []
             v_partial = None
             zero_vec = Vec.filled(C_F32_PER_LANE, 0.0, fx.Float32)
-            cap_vec = Vec.filled(C_F32_PER_LANE, SCHRAUDOLPH_CAP, fx.Float32)
             i32_vec_ty = Vec.make_type(C_F32_PER_LANE, fx.Int32)
             f32_vec_ty = Vec.make_type(C_F32_PER_LANE, fx.Float32)
             for nt in range_constexpr(N_KV_TILES):
                 if const_expr(seeded):
-                    ## TODO: why cap?
-                    # clamp to [0, cap] -- v_med3_f32 does both ends in
-                    # one instruction, halving the VALU here. FMED3 has no
-                    # vector pattern, so build the vector element-wise.
-                    _s = Vec(s_accs[nt])
-                    biased = Vec.from_elements(
-                        [
-                            rocdl.fmed3(
-                                T.f32,
-                                _raw(_s[r]),
-                                _raw(c_zero_f),
-                                _raw(c_sch_cap),
-                            )
-                            for r in range_constexpr(C_F32_PER_LANE)
-                        ],
-                        fx.Float32,
-                    )
+                    # No clamp: the watchdog + rollback above subsume both
+                    # ends of what the old med3 to [0, CAP] was doing.
+                    #
+                    # Ceiling: t is the max over *every* pattern this lane
+                    # owns, so after the rollback each lane either had t <=
+                    # CAP already (d = 0) or has been lowered by exactly
+                    # t - C, which is bit-exact and lands its max on C.  The
+                    # 0x7F800000 the bitcast would have to reach is 1.9x CAP,
+                    # so the ceiling is unreachable, not merely unlikely.
+                    #
+                    # Floor: the saturating v_cvt_u32_f32 below already maps
+                    # negatives and NaN to 0, which *is* the softmax mask.
+                    #
+                    # This is not belt-and-braces -- disabling detection here
+                    # returns NaN at S=65536, so the rollback is load-bearing;
+                    # it is the clamp that had become redundant.  Worth ~280
+                    # TFLOPS (2436 -> 2714): 64 med3 per softmax phase, on the
+                    # critical path of a VALU-only phase.
+                    biased = Vec(s_accs[nt])
                 else:
                     aff = _fadd(Vec(s_accs[nt]), mt_vec)
                     biased = _fmax(aff, zero_vec)
@@ -828,7 +965,9 @@ def build_flash_attn_fp8_module(
                     fx.Float32(v_sum).shuffle_xor(fx.Int32(32), fx.Int32(WARP_SIZE)),
                 )
                 l_valu = _fadd(l_valu, v_sum)
-            return m_frozen, bias_chunks, p_pack, l_valu
+            # o_accs / l_mfma come back because the rollback may have rescaled
+            # them; on the non-seeded path they are whatever was passed in.
+            return m_frozen, bias_chunks, p_pack, l_valu, o_accs, l_mfma
 
         ones_pack = Vec.filled(A_FP8_PER_LANE // 4, 0x38383838, fx.Int32)
 
@@ -881,7 +1020,9 @@ def build_flash_attn_fp8_module(
                 ## HBM k offs
                 g_koffs = get_hbm_koffs(BLOCK_N)
                 s_accs, v_preloaded = do_qk(k_buff_off, k_preloaded_prologue, v_buff_off, dma=(k_rsrc, l_koffs, g_koffs))
-                m_frozen, bias_chunks, p_pack, l_valu = do_softmax(s_accs, m_init, l_valu_init)
+                m_frozen, bias_chunks, p_pack, l_valu, _, _ = do_softmax(
+                    s_accs, m_init, l_valu_init
+                )
 
                 g_koffs = get_hbm_koffs(BLOCK_N * 2)
                 return (
@@ -975,12 +1116,17 @@ def build_flash_attn_fp8_module(
                 _sched_barrier()
                 rocdl.s_setprio(0)
                 _gpu_barrier()
-                m_frozen, bias_chunks, p_pack, l_valu = do_softmax(
+                # apply_pv has already folded tile i-1 into o / l_mfma, and
+                # tile i's P is not built yet, so this is the one point where
+                # the rollback can rescale the whole past in one shot.
+                m_frozen, bias_chunks, p_pack, l_valu, o, l_mfma = do_softmax(
                     s_accs,
                     m_frozen,
                     l_valu,
                     bias_chunks,
                     seeded=True,
+                    o_accs=o,
+                    l_mfma=l_mfma,
                 )
                 # Address math for the *next* tile's DMA is computed here, in
                 # the VALU phase; do_qk only fires the buffer_loads.
@@ -1057,14 +1203,18 @@ def build_flash_attn_fp8_module(
                 v_buff_off = _rest[0]
                 k_buff_off = _rest[3]
                 v_preloaded = _rest[5:]
-                m_frozen, _, p_pack, l_valu = do_softmax(
+                bias_chunks = carry[11 : 11 + N_BIAS_CHUNKS]
+                m_frozen, _, p_pack, l_valu, o_r, l_mfma = do_softmax(
                     [s0, s1, s2, s3],
                     m_frozen,
                     l_valu,
+                    bias_chunks,
                     seeded=True,
+                    o_accs=[o0, o1, o2, o3],
+                    l_mfma=l_mfma,
                 )
                 o, l_mfma, _ = apply_pv(
-                    [o0, o1, o2, o3],
+                    o_r,
                     l_mfma,
                     p_pack,
                     v_buff_off,
@@ -1095,12 +1245,24 @@ def build_flash_attn_fp8_module(
                 k_buff_off, k_next_off = _rest[3:5]
                 v_preloaded = _rest[5:]
                 kv_start = fx.Index(iv)
-                m_frozen, bias_chunks, p_pack, l_valu = do_softmax(
+                # o / l_mfma still hold only the tiles apply_pv has already
+                # folded in -- i.e. strictly the past relative to the s_accs
+                # being softmaxed here -- so the rescale is well-defined.
+                (
+                    m_frozen,
+                    bias_chunks,
+                    p_pack,
+                    l_valu,
+                    (o0, o1, o2, o3),
+                    l_mfma,
+                ) = do_softmax(
                     [s0, s1, s2, s3],
                     m_frozen,
                     l_valu,
                     bias_chunks,
                     seeded=True,
+                    o_accs=[o0, o1, o2, o3],
+                    l_mfma=l_mfma,
                 )
                 # The K DMA's address math belongs to this (VALU) phase; the
                 # buffer_loads themselves are interleaved into do_qk below.
