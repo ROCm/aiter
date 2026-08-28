@@ -2034,6 +2034,89 @@ class TestCorrectness:
             fs_fly, fs_ref, rmse_ratio=_RMSE_TOL, label=f"{tag} final_state"
         )
 
+    @pytest.mark.parametrize("variant", ["bv16", "bv32", "bv64", "bv64w8"])
+    def test_varlen_ragged_v_new_store_bound(self, variant):
+        """Per-sequence check that the ``v_new`` store never crosses a sequence.
+
+        The ``v_new`` store has no per-row guard: it relies on ``vn_buf``'s 
+        ``num_records`` (``T_local`` rows from this head's row 0) so the final chunk's 
+        padding rows are discarded by the hardware. ``v_new`` is head-major
+        ``[B, H, T_flat, V]``, so those rows are the next sequence's tokens.
+        A too-wide bound writes zeros over them -- bounded damage that a
+        whole-tensor metric dilutes, and which only shows up at all when the
+        ragged sequence has a live neighbour behind it.
+
+        The column mapping ``i_v*BV + _nr_v(nr) + lane_n`` is the part that
+        varies with the tile, and at ``bv64w8`` (``NR_SPLIT=2``) it is split
+        across waves -- so the variants are not redundant with each other here.
+        """
+        _RMSE_TOL = 3e-2
+        context_lens = [613, 1000, 128]  # 613 % 64 == 37, 1000 % 64 == 40
+        H, Hg, K, V = 16, 16, 128, 128
+        N = len(context_lens)
+        T_total = sum(context_lens)
+
+        torch.manual_seed(_case_seed(context_lens))
+
+        cu = torch.tensor(
+            [0] + [sum(context_lens[: i + 1]) for i in range(N)],
+            dtype=torch.int32,
+            device="cuda",
+        )
+        k = torch.randn(1, T_total, Hg, K, dtype=torch.bfloat16, device="cuda") * 0.1
+        w_orig = (
+            torch.randn(1, T_total, H, K, dtype=torch.bfloat16, device="cuda") * 0.1
+        )
+        u_orig = (
+            torch.randn(1, T_total, H, V, dtype=torch.bfloat16, device="cuda") * 0.1
+        )
+        w_c = w_orig.permute(0, 2, 1, 3).contiguous()
+        u_c = u_orig.permute(0, 2, 1, 3).contiguous()
+        h0 = torch.randn(N, H, V, K, dtype=torch.float32, device="cuda") * 0.01
+        g = (
+            torch.randn(1, H, T_total, dtype=torch.float32, device="cuda")
+            .abs()
+            .mul(-0.5)
+            .cumsum(dim=-1)
+            .contiguous()
+        )
+
+        _h_fly, vn_fly, _fs_fly = chunk_gated_delta_rule_fwd_h_flydsl(
+            k,
+            w_c,
+            u_c,
+            g=g,
+            initial_state=h0,
+            output_final_state=True,
+            cu_seqlens=cu,
+            use_exp2=False,
+            variant=variant,
+        )
+        _h_ref, vn_ref, _fs_ref = ref_chunk_gated_delta_rule_fwd_h(
+            k,
+            w_orig,
+            u_orig,
+            g=g,
+            initial_state=h0,
+            output_final_state=True,
+            cu_seqlens=cu,
+            g_head_major=True,
+        )
+
+        vn_out = _normalize_opt_v_new(vn_fly)  # [B, H, T, V] -> [B, T, H, V]
+        start = 0
+        for i, n in enumerate(context_lens):
+            _assert_rmse_within(
+                vn_out[0, start : start + n],
+                vn_ref[0, start : start + n],
+                rmse_ratio=_RMSE_TOL,
+                label=(
+                    f"v_new sequence {i} (len={n}, tokens [{start}, {start + n})) "
+                    f"variant={variant}"
+                ),
+            )
+            start += n
+
 
 # -- Performance benchmark (flydsl-hip vs hip vs triton) -----------------
 

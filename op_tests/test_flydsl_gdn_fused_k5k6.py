@@ -384,6 +384,77 @@ def test_fused_nonaligned(seq_lens):
     ), f"fused nonaligned mismatch: rmse_ratio={ratio:.3e} (seq_lens={seq_lens})"
 
 
+@pytest.mark.parametrize("variant", ["bv16", "bv32", "bv64", "bv64w8"])
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        [613, 512],  # ragged, with an aligned neighbour behind it
+        [37, 512],  # ragged and shorter than one chunk (NT == 1)
+        [613, 1000, 128],  # two ragged sequences, neither of them last
+    ],
+)
+def test_fused_ragged_nonfinal(seq_lens, variant):
+    """A ragged sequence in a NON-FINAL position, checked per sequence.
+
+    The ``o`` store carries no per-row guard. It relies on ``o_buf``'s
+    ``num_records`` (``T_local`` rows measured from ``o_base``) so that the final
+    chunk's padding rows address past the bound and the hardware discards them.
+    ``o`` is token-major ``[B, T_flat, H, V]``, so those padding rows are the
+    NEXT sequence's tokens -- a bound that is too wide clobbers them, racing the
+    neighbour's own CTA.
+
+    Three things have to line up for that to be observable:
+
+    * The ragged sequence must not be last.
+    * The neighbour must be checked.
+    * The metric must be per sequence. The dropped stores would have written
+      zeros (on a padding row ``q`` and ``v_new`` both read a hardware zero), so
+      the damage is bounded by the clobbered rows and a whole-tensor RMSE
+      dilutes it below tolerance once the neighbour is long enough.
+
+    ``variant`` is pinned because the auto rule selects on ``H*N``: at ``H=8``
+    every shape here lands on bv16, so the wider tiles -- including the
+    wave-widened bv64w8 that production uses at high ``H*N`` -- would otherwise
+    never see a tail row.
+
+    Detection strength differs across the shapes, because the bug is a race condition:
+    the neighbour's own CTA writes the same rows correctly, so a stale-bound
+    write is only observed if it lands second.
+    """
+    if get_gfx() != "gfx942":
+        pytest.skip(f"fused K5+K6 kernel is gfx942-only; arch={get_gfx()}")
+    H = Hg = 8
+    K = V = 128
+    T_flat = sum(seq_lens)
+    scale = K**-0.5
+
+    inp = _make_inputs(H, Hg, K, V, T_flat, seq_lens, "g")
+    o_ref = _reference_o(inp, scale=scale, use_exp2=False)
+    o_fused, _ = chunk_gated_delta_rule_fwd_h_o_flydsl(
+        q=inp["q"],
+        k=inp["k"],
+        w=inp["w_hm"],
+        u=inp["u_hm"],
+        g=inp["g"],
+        scale=scale,
+        initial_state=inp["h0"],
+        output_final_state=False,
+        cu_seqlens=inp["cu"],
+        use_exp2=False,
+        variant=variant,
+    )
+
+    start = 0
+    for i, n in enumerate(seq_lens):
+        ratio = _rmse_ratio(o_fused[0, start : start + n], o_ref[0, start : start + n])
+        assert ratio < _RMSE_TOL, (
+            f"fused o mismatch on sequence {i} (len={n}, tokens "
+            f"[{start}, {start + n})): rmse_ratio={ratio:.3e} "
+            f"(seq_lens={seq_lens} variant={variant})"
+        )
+        start += n
+
+
 # --------------------------------------------------------------------------- #
 # Pipeline tests: the K5K6Fusion API on chunk_gated_delta_rule_fwd_opt_vk.
 # --------------------------------------------------------------------------- #

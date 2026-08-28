@@ -252,6 +252,7 @@ def compile_chunk_gated_delta_h_gfx942(
         "SCALE is required iff COMPUTE_OUTPUT (the K6 query scale); got "
         f"COMPUTE_OUTPUT={COMPUTE_OUTPUT}, SCALE={SCALE}."
     )
+    assert V % BV == 0, "BV must tile V; got BV={BV}, V={V}."
     NUM_K_BLOCKS = K // 64
 
     # -- Chiplet (XCD) remap --
@@ -574,12 +575,6 @@ def compile_chunk_gated_delta_h_gfx942(
                 return fx.Int32(nr_local * 16)
             return (fx.Int32(nr_local * NR_SPLIT) + wid_n) * fx.Int32(16)
 
-        def _flat_buffer(tensor):
-            """1-D bounds-checked view over ``tensor``'s whole footprint."""
-            buf = fx.rocdl.make_buffer_tensor(tensor, max_size=False)
-            n = fx.get_scalar(fx.cosize(fx.get_layout(buf)))
-            return fx.Tensor(fx.make_view(fx.get_iter(buf), fx.make_layout((n,), (1,))))
-
         def _elems(tensor):
             """Element count of ``tensor``'s whole footprint."""
             return fx.get_scalar(fx.cosize(fx.get_layout(tensor)))
@@ -587,21 +582,19 @@ def compile_chunk_gated_delta_h_gfx942(
         def _seq_view(tensor, base_elems, rows, row_stride, shape, stride):
             """Buffer view rooted at ``base_elems``, bounded to ``rows`` rows.
 
-            THE BUILD ORDER IS THE POINT. ``add_offset`` runs on the raw GLOBAL
-            pointer, so the sequence/head base lands in the descriptor's BASE
-            word and ``num_records`` is measured from it -- which is what lets
-            the bound be per-sequence instead of per-tensor. Doing it the other
-            way round (buffer first, then offset) would leave the bound relative
-            to the tensor origin and every guard below would still be needed.
+            ``add_offset`` runs on the raw pointer, so the sequence/head base 
+            lands in the descriptor's base word and ``num_records`` is measured from it. 
+            This lets the bound to become per-sequence instead of per-tensor.
 
             The hardware test is ``offset >= num_records``, so a bound of
             ``rows * row_stride`` elements excludes row ``rows`` exactly while
             admitting every column of rows ``0 .. rows-1`` (every tensor here
             has ``row_stride >= innermost extent``). A read past the sequence
-            therefore returns a HARDWARE ZERO rather than the neighbouring
-            sequence's live data -- the invariant the tail guards used to fake.
+            therefore returns a hardware zero rather than the neighbouring
+            sequence's live data. Writes are bounded the same way: a store past 
+            ``num_records`` is discarded.
 
-            ``num_records`` is in BYTES, and the width is taken from the tensor
+            ``num_records`` is in bytes, and the width is taken from the tensor
             rather than assumed: k/w/u/q are bf16 but the gates are f32, and
             hard-coding 2 here silently halves every gate descriptor -- which
             zeroes the back half of every sequence, not just its tail.
@@ -620,11 +613,6 @@ def compile_chunk_gated_delta_h_gfx942(
                     * fx.Int64(elem_bytes),
                 )
             )
-
-        if const_expr(SAVE_NEW_VALUE):
-            vn_buf = _flat_buffer(v_new_tensor)
-        if const_expr(COMPUTE_OUTPUT):
-            o_buf = _flat_buffer(o_tensor)
 
         if const_expr(IS_VARLEN):
             cu_buf = fx.rocdl.make_buffer_tensor(cu_seqlens_tensor, max_size=False)
@@ -1005,16 +993,42 @@ def compile_chunk_gated_delta_h_gfx942(
             fx.copy(univ_cp_r2s_64b_bf16, f_lo, dst_lo)
             fx.copy(univ_cp_r2s_64b_bf16, f_hi, dst_hi)
 
+        # -- Output buffers: rooted per-sequence, so the hardware write drops the tail --
+        # A buffer_store whose offset is >= num_records is discarded by the hardware. 
+        # Rooting the descriptor at the sequence therefore makes the padding rows of the
+        # final chunk store nowhere.
+        #
+        # Offsets at the store sites are consequently sequence-relative, not
+        # absolute, the base now lives in the descriptor.
         if const_expr(SAVE_NEW_VALUE):
+            # v_new is head-major, one row per token, so the row stride is V and
+            # the bound is T_local rows measured from this head's row 0.
             if const_expr(IS_VARLEN):
                 vn_base = (i_h * T_flat + bos) * fx.Int32(V)
             else:
                 vn_base = ((i_n * fx.Int32(H) + i_h) * T_flat) * fx.Int32(V)
+            vn_buf = _seq_view(
+                v_new_tensor,
+                vn_base,
+                T_local,
+                fx.Int32(V),
+                (_elems(v_new_tensor),),
+                (1,),
+            )
 
         if const_expr(COMPUTE_OUTPUT):
             # o is token-major [B, T_flat, H, V] (matches the Triton K6 output).
+            # The base carries a column term (i_h*V) as well as the row term, so
+            # the descriptor is rooted mid-row. That is still exact: a store at
+            # row r < T_local, column c < V lands at r*H*V + c <= (T_local-1)*H*V
+            # + V-1 < T_local*H*V, while row T_local starts at exactly
+            # T_local*H*V and is dropped. No generated offset falls in the gap
+            # between those two, so the bound separates the two cases cleanly.
             o_base = (bos * fx.Int32(H) + i_h) * fx.Int32(V)
             stride_o = fx.Int32(H * V)
+            o_buf = _seq_view(
+                o_tensor, o_base, T_local, stride_o, (_elems(o_tensor),), (1,)
+            )
 
         if const_expr(USE_INITIAL_STATE):
             h0_base = i_nh * fx.Int32(V * K)
@@ -1148,7 +1162,6 @@ def compile_chunk_gated_delta_h_gfx942(
                 for e in range_constexpr(4)
             ]
             frag_row = [i_t_i32 * fx.Int32(BT) + r for r in frag_row_local]
-            frag_row_ok = [r < T_local for r in frag_row]
 
             # -- Store h snapshot to LDS (group-major [BV][K/4][4] + XOR) --
             # h_accs element e = h[v_local = nr*16 + lane_n, k = kb*64 + wid*16 +
@@ -1319,23 +1332,30 @@ def compile_chunk_gated_delta_h_gfx942(
             # data; a hardware zero cannot be Inf or NaN, so the argument for it
             # is gone with the descriptor change.
 
+            # -- next iteration's w/u + gate prefetch (K5 build) --
+            # Issued here, ahead of the v_new store, for the same reason the
+            # fused build issues its copy ahead of the o store: the stores merge 
+            # into one cluster that the scheduler places before the second barrier. 
+            # Ahead of the store, the distance is a property of the source, and 
+            # the store plus GEMM2's MFMA chain both sit between the loads and their 
+            # consumption at the top of the next iteration.
+            #
+            # Safe to hoist: _stage_prefetch reads only HBM w/u/g for chunk
+            # i_t+1 and depends on nothing this chunk computes. On the last
+            # iteration it reads chunk NT, which is out of range and
+            # address-clamped; the values are discarded.
+            if const_expr(not COMPUTE_OUTPUT):
+                next_prefetch = _stage_prefetch(i_t_i32 + fx.Int32(1))
+
             # -- 2b. Store v_new for output --
             if const_expr(SAVE_NEW_VALUE):
-                # The store must go through a helper: a bare ``vn_buf[off] = ...``
-                # inside ``if (...).ir_value():`` makes the scf.if try to yield
-                # the tensor (TypeError).
-                def _emit_vn_store(off, value):
-                    vn_buf[(off,)] = value
-
                 for nr in range_constexpr(N_REPEAT_LOCAL):
                     vn_val = vn_frags[nr]
                     vn_col = i_v * fx.Int32(BV) + _nr_v(nr) + lane_n
                     for elem_i in range_constexpr(4):
-                        if frag_row_ok[elem_i].ir_value():
-                            f32_v = vn_val[elem_i]
-                            bf16_v = _to_bf16(f32_v)
-                            vn_off = vn_base + frag_row[elem_i] * fx.Int32(V) + vn_col
-                            _emit_vn_store(vn_off, bf16_v)
+                        bf16_v = _to_bf16(vn_val[elem_i])
+                        vn_off = frag_row[elem_i] * fx.Int32(V) + vn_col
+                        vn_buf[(vn_off,)] = bf16_v
 
             # -- 3. Gating --
             # K6 note: GEMM4b (the intra-chunk term) reuses the gated v_new because
@@ -1442,20 +1462,7 @@ def compile_chunk_gated_delta_h_gfx942(
 
             gpu.barrier()
 
-            # -- next iteration's w/u + gate prefetch (batched) --
-            # On the last iteration these read chunk NT, which is out of range
-            # and address-clamped; the values are discarded.
-            #
-            # Where this is issued differs between the two builds and is a
-            # deliberate scheduling choice in each:
-            #   K5:    before GEMM2, so the whole MFMA chain sits between the
-            #          loads and their consumption at the top of the next iter.
-            #   fused: after the o store, because that slot is taken by the q
-            #          load, whose latency hides behind GEMM2's MFMA chain,
-            #          the K6 stage then covers these loads.
-            if const_expr(not COMPUTE_OUTPUT):
-                next_prefetch = _stage_prefetch(i_t_i32 + fx.Int32(1))
-            else:
+            if const_expr(COMPUTE_OUTPUT):
                 # Issue q's HBM loads before GEMM2 so their latency hides behind
                 # GEMM2's MFMA chain. q is independent of GEMM2; only the lds_q
                 # store must wait for GEMM1's lds_w readers.
@@ -1794,23 +1801,19 @@ def compile_chunk_gated_delta_h_gfx942(
                             frag_o[None, None, nr].load()
                         ) + fx.Vector(frag_oi[None, None, nr].load())
 
-                # -- Scale and store o -> HBM [T_flat, H, V] token-major --
-                # The store must go through a helper: a bare ``o_buf[off] = ...``
-                # inside ``if (...).ir_value():`` makes the scf.if try to yield
-                # the tensor (TypeError). Same pattern as the v_new store.
-                def _emit_o_store(off, value):
-                    o_buf[(off,)] = value
+                # Issued before the o store, not after. Issuing them here makes the distance a
+                # property of the source instead of the scheduler's pressure
+                # heuristic; the o store below now covers the loads.
+                next_prefetch = _stage_prefetch(i_t_i32 + fx.Int32(1))
 
+                # -- Scale and store o -> HBM [T_flat, H, V] token-major --
                 scale_vec = fx.Vector.filled(4, SCALE, fx.Float32)
                 for nr in range_constexpr(N_REPEAT_LOCAL):
                     o_scaled = o_out[nr] * scale_vec
                     o_col = i_v * fx.Int32(BV) + _nr_v(nr) + lane_n
                     for elem_i in range_constexpr(4):
-                        if frag_row_ok[elem_i].ir_value():
-                            o_off = o_base + frag_row[elem_i] * stride_o + o_col
-                            _emit_o_store(o_off, _to_bf16(o_scaled[elem_i]))
-
-                next_prefetch = _stage_prefetch(i_t_i32 + fx.Int32(1))
+                        o_off = frag_row[elem_i] * stride_o + o_col
+                        o_buf[(o_off,)] = _to_bf16(o_scaled[elem_i])
 
             yield next_prefetch
 
