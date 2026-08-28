@@ -139,7 +139,6 @@ def mma_one_j(
     i0=0,
     single_rg=False,
     rg_off=0,
-    k_start=0,
     k_halves=2,
 ):
     """One J-cluster of scaled MFMAs over a 32-row A-scale group (row-groups i0, i0+1); each is
@@ -147,7 +146,7 @@ def mma_one_j(
     sa: 32-row A-scale reg. single_rg (BM16): one 16-row group, rg_off picks its byte.
     """
     row_groups = (rg_off,) if const_expr(single_rg) else range(2)
-    for k in range(k_start, k_start + k_halves):
+    for k in range(k_halves):
         for im in row_groups:
             i = i0 if const_expr(single_rg) else i0 + im
             fx.gemm(
@@ -264,9 +263,6 @@ def gemm2_body_v2(
     g2_epi_lanes=None,
     g2_apre=False,
     enable_bias=False,
-    k_valid_halves=None,
-    has_kpad=False,
-    has_npad=False,
 ):
     # GEMM2 double-buffers B weight and scale one tile ahead. bhoist issues that
     # prefetch above the LDS barrier; ascale_pf prefetches A-scale one tile ahead.
@@ -302,18 +298,14 @@ def gemm2_body_v2(
     KH4 = _udiv(K_rt, fx.Int32(4 if is_f8_b else 8))
     K_TILES_MAX = INTER_MAX // BK
     K_SCALE_CHUNKS_MAX = (INTER_MAX + 255) // 256
-    total_k_halves = K_TILES_MAX * kHalves
-    if k_valid_halves is None:
-        k_valid_halves = total_k_halves
 
     # has_pad OOB pad-skip (const_expr-gated): K-skip sizes 16N B-weight buffer to REAL K; N-skip zeros fully-pad-N w2 tiles (col >= N_real=N_OUT-npad; PERF-ONLY). B-scale NOT shrunk.
     bq_num_records = None
     N_real = None
-    if const_expr(has_kpad):
+    if const_expr(has_pad):
         K_real = K_rt - fx.Int32(i32_kpad)
         halves_real = _udiv(K_real + fx.Int32(127), fx.Int32(128))
         bq_num_records = halves_real * fx.Int32(1024 * B_PAIR)
-    if const_expr(has_npad):
         N_real = N_OUT_rt - fx.Int32(i32_npad)
 
     # block -> (m_block_idx, n_block_idx); e = sorted_expert_ids[SBM-padded sort block] (SBM==BM: sort_block==m_block_idx).
@@ -451,7 +443,7 @@ def gemm2_body_v2(
     def make_bq_view(j):
         col = n_block_idx * BN + wave * (BN // 4) + j * 16
         nrec = bq_num_records
-        if const_expr(has_npad and has_kpad):
+        if const_expr(has_pad):
             # N-skip: fully-pad-N tile (col >= 16-aligned N_real) -> 0 records so weight loads OOB -> 0.
             nrec = (col < N_real).select(bq_num_records, fx.Int32(0))
         if const_expr(is_f8_b):
@@ -524,11 +516,10 @@ def gemm2_body_v2(
                 bsf[mw],
             )
 
-    def issue_b_load_into(bqf, bsf, kt_rt, valid_halves=None):
+    def issue_b_load_into(bqf, bsf, kt_rt):
         for j in range_constexpr(numAccN):
             for half in range_constexpr(kHalves):
-                if const_expr(valid_halves is None or half < valid_halves):
-                    issue_b_value_load(bqf[j][half], j, half, kt_rt)
+                issue_b_value_load(bqf[j][half], j, half, kt_rt)
         if const_expr(bsf is not None):
             issue_bscale_into(bsf, scale_chunk_tile(kt_rt))
 
@@ -552,9 +543,7 @@ def gemm2_body_v2(
         scale_shift = (kt_rt % fx.Int32(tilesPerScaleChunk)) * fx.Int32(16)
         return scale.shrui(scale_shift)
 
-    K_REAL_RT = K_rt - fx.Int32(i32_kpad)
-
-    def mfma_cluster(bqf, bsf, sa, kt_rt, interleave=None, valid_halves=None):
+    def mfma_cluster(bqf, bsf, sa, kt_rt, interleave=None):
         # opsel (no gate/up split): mni=J//2, in_b=J%2; sa is a per-32-row-chunk list.
         sa = [
             shift_scale_word(sa[sub], kt_rt) for sub in range_constexpr(kScaleSubBlocks)
@@ -566,46 +555,34 @@ def gemm2_body_v2(
         for J in range_constexpr(numAccN):
             mni, in_b = J // 2, J % 2
             sb = sb_words[mni]
-
-            def emit_mma(k_start, k_count, J=J, in_b=in_b, sb=sb):
-                if const_expr(is_bm16):
+            if const_expr(is_bm16):
+                mma_one_j(
+                    J,
+                    in_b,
+                    sa[0],
+                    sb,
+                    bqf,
+                    a_frags,
+                    c_frags,
+                    mma_atoms,
+                    i0=0,
+                    single_rg=True,
+                    k_halves=kHalves,
+                )
+            else:
+                for sub in range_constexpr(kScaleSubBlocks):
                     mma_one_j(
                         J,
                         in_b,
-                        sa[0],
+                        sa[sub],
                         sb,
                         bqf,
                         a_frags,
                         c_frags,
                         mma_atoms,
-                        i0=0,
-                        single_rg=True,
-                        k_start=k_start,
-                        k_halves=k_count,
+                        i0=2 * sub,
+                        k_halves=kHalves,
                     )
-                else:
-                    for sub in range_constexpr(kScaleSubBlocks):
-                        mma_one_j(
-                            J,
-                            in_b,
-                            sa[sub],
-                            sb,
-                            bqf,
-                            a_frags,
-                            c_frags,
-                            mma_atoms,
-                            i0=2 * sub,
-                            k_start=k_start,
-                            k_halves=k_count,
-                        )
-
-            if const_expr(valid_halves is not None):
-                if const_expr(valid_halves > 0):
-                    emit_mma(0, valid_halves)
-            else:
-                for k in range_constexpr(kHalves):
-                    if kt_rt * fx.Int32(BK) + fx.Int32(k * 128) < K_REAL_RT:
-                        emit_mma(k, 1)
             if const_expr(interleave is not None and J > 0):
                 interleave[J - 1]()
         if const_expr(interleave is not None):
@@ -698,22 +675,11 @@ def gemm2_body_v2(
                 _ks_issue_ascale(saf_slots[slot], fx.Int32(kt))
 
         def _ks_prefetch(kt):
-            valid_halves = min(kHalves, max(0, k_valid_halves - kt * kHalves))
-            issue_b_load_into(
-                nxt_bqf,
-                None,
-                fx.Int32(kt),
-                valid_halves=valid_halves,
-            )
+            issue_b_load_into(nxt_bqf, None, fx.Int32(kt))
             if const_expr(kt == 0 or chunk_of[kt] != chunk_of[kt - 1]):
                 _ks_issue_scales(kt)
 
-        issue_b_load_into(
-            cur_bqf,
-            None,
-            fx.Int32(0),
-            valid_halves=min(kHalves, k_valid_halves),
-        )
+        issue_b_load_into(cur_bqf, None, fx.Int32(0))
         _ks_issue_scales(0)
         rocdl.sched_barrier(0)
 
@@ -723,7 +689,6 @@ def gemm2_body_v2(
 
         for kt in range_constexpr(KT):
             kt_rt = fx.Int32(kt)
-            valid_halves_kt = min(kHalves, max(0, k_valid_halves - kt * kHalves))
             cur_bsf = bsf_slots[chunk_of[kt] % n_slots]
             if const_expr(g2_bhoist) and const_expr(kt + 1 < KT):
                 _ks_prefetch(kt + 1)
@@ -752,14 +717,7 @@ def gemm2_body_v2(
                 gpu.barrier()
             rocdl.sched_barrier(0)
             rocdl.s_setprio(1)
-            mfma_cluster(
-                cur_bqf,
-                cur_bsf,
-                sa,
-                kt_rt,
-                interleave=_il,
-                valid_halves=valid_halves_kt,
-            )
+            mfma_cluster(cur_bqf, cur_bsf, sa, kt_rt, interleave=_il)
             rocdl.s_setprio(0)
             rocdl.sched_barrier(0)
             cur_bqf, nxt_bqf = nxt_bqf, cur_bqf
