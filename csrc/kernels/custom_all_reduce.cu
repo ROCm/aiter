@@ -185,8 +185,15 @@ static void _all_gather(fptr_t _fa, void* inp, void* out,
         break;
     }
 #endif
+    case AITER_DTYPE_u8: {
+        fa->dispatchAllGather<uint8_t>(stream,
+                                    reinterpret_cast<uint8_t*>(inp),
+                                    reinterpret_cast<uint8_t*>(out),
+                                    size, last_dim_size, gather_dim);
+        break;
+    }
     default:
-        throw std::runtime_error("custom allreduce only supports float32, float16 and bfloat16");
+        throw std::runtime_error("custom allreduce only supports float32, float16, bfloat16 and uint8");
     }
 }
 
