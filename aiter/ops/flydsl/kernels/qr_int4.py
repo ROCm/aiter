@@ -246,6 +246,8 @@ class QRInt4:
             )
         if not inp.is_contiguous() or not out.is_contiguous():
             raise ValueError("QRInt4 requires contiguous input/output")
+        if int(inp.data_ptr()) % 16 != 0 or int(out.data_ptr()) % 16 != 0:
+            raise ValueError("QRInt4 requires 16-byte-aligned input/output")
         live_bytes = int(inp.numel()) * int(inp.element_size())
         if live_bytes % 16 != 0:
             raise ValueError("byte size must be a multiple of 16 (8 bf16)")

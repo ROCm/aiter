@@ -23,7 +23,12 @@ class UncachedIpcHeap:
     def _load_hip(cls):
         if cls._hip is not None:
             return cls._hip
-        for name in ("libamdhip64.so", "libamdhip64.so.6", "libamdhip64.so.5"):
+        for name in (
+            "libamdhip64.so",
+            "libamdhip64.so.7",
+            "libamdhip64.so.6",
+            "libamdhip64.so.5",
+        ):
             try:
                 cls._hip = ctypes.CDLL(name)
                 break
