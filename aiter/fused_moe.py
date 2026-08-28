@@ -2070,6 +2070,7 @@ def _mxfp4_a4w4_stage2_fw(
     a2_scale=None,
     block_m=None,
     sorted_weights=None,
+    topk_weights=None,
     kernelName2="",
     reverse_sorted=None,
     inter_dim_pad: int = 0,
@@ -2125,6 +2126,7 @@ def _mxfp4_a4w4_stage2_fw(
             w2_scale=w2_scale,
             a2_scale=a2_scale,
             sorted_weights=sorted_weights,
+            topk_weights=topk_weights,
             inter_dim_pad=inter_dim_pad,
             model_dim_pad=model_dim_pad,
             block_m=block_m,
@@ -3559,12 +3561,20 @@ def fused_moe_2stages(
     ):
         extra_stage2_args["expert_mask"] = expert_mask
         extra_stage2_args["topk_ids"] = topk_ids
-    if (
-        stage2_func is _flydsl_v2_stage2_wrapper
-        and not doweight_stage1
-        and _flydsl_stage2_fp8_enabled()
-    ):
-        extra_stage2_args["topk_weights"] = topk_weights.to(torch.float32).contiguous()
+    if not doweight_stage1 and _flydsl_stage2_fp8_enabled():
+        # The MXFP4 GEMM1 front-end delegates layout GEMM2 kernels to the same v2
+        # wrapper, so its FP8 route-out reduction needs the original top-k weights.
+        stage2_keywords = getattr(metadata.stage2, "keywords", None) or {}
+        uses_flydsl_v2_stage2 = stage2_func is _flydsl_v2_stage2_wrapper or (
+            stage2_func is _mxfp4_a4w4_stage2_fw
+            and str(stage2_keywords.get("kernelName2", "")).startswith(
+                "flydsl_moe2_layout_"
+            )
+        )
+        if uses_flydsl_v2_stage2:
+            extra_stage2_args["topk_weights"] = topk_weights.to(
+                torch.float32
+            ).contiguous()
     if m_indices is not None:
         extra_stage1_args["m_indices"] = m_indices
         extra_stage1_args["moe_buf"] = _sort_moe_buf
