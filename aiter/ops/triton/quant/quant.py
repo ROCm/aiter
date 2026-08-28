@@ -342,10 +342,10 @@ def dynamic_mxfp8_quant(
             NUM_WARPS = 4
             NUM_STAGES = 1
         else:
-            NUM_ITER = 2
+            NUM_ITER = 8
             BLOCK_SIZE_M = 64
             BLOCK_SIZE_N = 64
-            NUM_WARPS = 4
+            NUM_WARPS = 1
             NUM_STAGES = 2
 
             if K <= 16384:

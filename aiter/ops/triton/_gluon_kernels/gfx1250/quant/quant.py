@@ -165,11 +165,12 @@ def gluon_dynamic_mxfp4_quant_kernel_gfx1250(
         bs_offs_n = pid_n * NUM_QUANT_BLOCKS + gl.arange(0, NUM_QUANT_BLOCKS)
         bs_offs = bs_offs_m[:, None] * stride_bs_m + bs_offs_n[None, :] * stride_bs_n
         if EVEN_M_N:
-            gl.store(bs_ptr + bs_offs, bs_e8m0)
+            gl.amd.cdna5.buffer_store(bs_e8m0, bs_ptr, bs_offs)
         else:
-            gl.store(
-                bs_ptr + bs_offs,
+            gl.amd.cdna5.buffer_store(
                 bs_e8m0,
+                bs_ptr,
+                bs_offs,
                 mask=(bs_offs_m < M)[:, None]
                 & (
                     bs_offs_n
@@ -206,11 +207,12 @@ def gluon_dynamic_mxfp4_quant_kernel_gfx1250(
         bs_offs_n = pid_n * NUM_QUANT_BLOCKS + gl.arange(0, NUM_QUANT_BLOCKS)
         bs_offs = bs_offs_m[:, None] * stride_bs_m + bs_offs_n[None, :] * stride_bs_n
         if EVEN_M_N:
-            gl.store(bs_ptr + bs_offs, bs_e8m0)
+            gl.amd.cdna5.buffer_store(bs_e8m0, bs_ptr, bs_offs)
         else:
-            gl.store(
-                bs_ptr + bs_offs,
+            gl.amd.cdna5.buffer_store(
                 bs_e8m0,
+                bs_ptr,
+                bs_offs,
                 mask=(bs_offs_m < M)[:, None]
                 & (
                     bs_offs_n
@@ -256,12 +258,12 @@ def gluon_dynamic_mxfp8_quant_kernel_gfx1250(
     x_ptr,
     x_fp8_ptr,
     bs_ptr,
-    stride_x_m_in,
-    stride_x_n_in,
-    stride_x_fp8_m_in,
-    stride_x_fp8_n_in,
-    stride_bs_m_in,
-    stride_bs_n_in,
+    stride_x_m_in: gl.constexpr,
+    stride_x_n_in: gl.constexpr,
+    stride_x_fp8_m_in: gl.constexpr,
+    stride_x_fp8_n_in: gl.constexpr,
+    stride_bs_m_in: gl.constexpr,
+    stride_bs_n_in: gl.constexpr,
     M,
     N,
     BLOCK_SIZE_M: gl.constexpr,
@@ -278,12 +280,12 @@ def gluon_dynamic_mxfp8_quant_kernel_gfx1250(
     pid_m = gl.program_id(0)
     start_n = gl.program_id(1) * NUM_ITER
 
-    stride_x_m = gl.cast(stride_x_m_in, gl.int64)
-    stride_x_n = gl.cast(stride_x_n_in, gl.int64)
-    stride_x_fp8_m = gl.cast(stride_x_fp8_m_in, gl.int64)
-    stride_x_fp8_n = gl.cast(stride_x_fp8_n_in, gl.int64)
-    stride_bs_m = gl.cast(stride_bs_m_in, gl.int64)
-    stride_bs_n = gl.cast(stride_bs_n_in, gl.int64)
+    stride_x_m = stride_x_m_in
+    stride_x_n = stride_x_n_in
+    stride_x_fp8_m = stride_x_fp8_m_in
+    stride_x_fp8_n = stride_x_fp8_n_in
+    stride_bs_m = stride_bs_m_in
+    stride_bs_n = stride_bs_n_in
 
     NUM_QUANT_BLOCKS: gl.constexpr = BLOCK_SIZE_N // MXFP8_QUANT_BLOCK_SIZE
 
@@ -379,11 +381,12 @@ def gluon_dynamic_mxfp8_quant_kernel_gfx1250(
         bs_offs_n = pid_n * NUM_QUANT_BLOCKS + gl.arange(0, NUM_QUANT_BLOCKS)
         bs_offs = bs_offs_m[:, None] * stride_bs_m + bs_offs_n[None, :] * stride_bs_n
         if EVEN_M_N:
-            gl.store(bs_ptr + bs_offs, bs_e8m0)
+            gl.amd.cdna5.buffer_store(bs_e8m0, bs_ptr, bs_offs)
         else:
-            gl.store(
-                bs_ptr + bs_offs,
+            gl.amd.cdna5.buffer_store(
                 bs_e8m0,
+                bs_ptr,
+                bs_offs,
                 mask=(bs_offs_m < M)[:, None]
                 & (
                     bs_offs_n
@@ -423,11 +426,12 @@ def gluon_dynamic_mxfp8_quant_kernel_gfx1250(
         bs_offs_n = pid_n * NUM_QUANT_BLOCKS + gl.arange(0, NUM_QUANT_BLOCKS)
         bs_offs = bs_offs_m[:, None] * stride_bs_m + bs_offs_n[None, :] * stride_bs_n
         if EVEN_M_N:
-            gl.store(bs_ptr + bs_offs, bs_e8m0)
+            gl.amd.cdna5.buffer_store(bs_e8m0, bs_ptr, bs_offs)
         else:
-            gl.store(
-                bs_ptr + bs_offs,
+            gl.amd.cdna5.buffer_store(
                 bs_e8m0,
+                bs_ptr,
+                bs_offs,
                 mask=(bs_offs_m < M)[:, None]
                 & (
                     bs_offs_n

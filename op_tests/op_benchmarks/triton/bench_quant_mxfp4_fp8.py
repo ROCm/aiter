@@ -18,8 +18,10 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
 
 
 def get_default_shapes() -> list[list[int]]:
-    M = [8, 32, 256, 2048, 8192, 16384]
-    N = [1024, 3072, 7168]
+    # M = [8, 32, 256, 2048, 8192, 16384]
+    # N = [1024, 3072, 7168]
+    M = [16384]
+    N = [7168]
     return [[m, n] for m in M for n in N]
 
 
