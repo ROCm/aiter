@@ -16,7 +16,9 @@ _UTILS_PATH = (
 
 
 def _load_utils():
-    spec = importlib.util.spec_from_file_location("flydsl_utils_under_test", _UTILS_PATH)
+    spec = importlib.util.spec_from_file_location(
+        "flydsl_utils_under_test", _UTILS_PATH
+    )
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
