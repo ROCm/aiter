@@ -11,7 +11,6 @@ import functools
 # Triton
 import triton
 import triton.language as tl
-
 from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
 
 # AITER
