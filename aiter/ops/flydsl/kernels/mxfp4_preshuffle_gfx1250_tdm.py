@@ -16,6 +16,7 @@ from flydsl.expr.typing import Vector as Vec
 
 from aiter.ops.flydsl.kernels import buffer_ops, vector
 from aiter.ops.flydsl.kernels import communication_ops_utils as comm_ops
+from aiter.ops.flydsl.utils import get_shared_memory_per_block
 from aiter.utility.mx_types import MxDtypeInt as MxDtype
 
 from .gemm_common_gfx1250 import (
@@ -39,7 +40,7 @@ from .mega_moe_gfx1250.dispatch_compact import (
     compact_workspace_layout,
     emit_compact_payload,
     emit_compact_planner,
-    emit_compact_wait_expert,
+    emit_compact_wait_tile,
 )
 from .quant_utils import (
     emit_amax_e8m0_native_scale,
@@ -79,46 +80,39 @@ TICKET_SLOTS = REMAP_DONE_OFF + REMAP_DONE_DWORDS
 
 
 def _resolve_dispatch_pipe_depth(
-    dispatch_on, wire_stride, num_waves, arena_bytes, max_depth, env_val
+    dispatch_on, wire_stride, num_waves, budget_bytes, env_val
 ):
-    """Producer wire pipe depth: deepest that fits the arena, or a pinned env.
+    """Producer wire tiles per wave, with deeper batching available for tuning.
 
-    Plain host-side helper.  The launcher is ``@flyc.jit`` traced, so ``while``,
-    ``and`` and ternaries there are rewritten into device control flow that
-    would wrap loop-carried depths as dynamic values; doing the whole scan and
-    validation in a module-level function keeps it ordinary Python and hands the
-    launcher a single constant.
+    Wire rows stage in LDS the producer owns, disjoint from the GEMM A/B/C
+    arena. Depths above one batch multiple rows per tensor drain, but remain
+    opt-in because their extra LDS and later tile publication can cost more than
+    the reduced wait count on current gfx1250 shapes.
     """
     if not dispatch_on:
         return 1
 
-    def _fits(depth):
-        return (
-            compact_payload_lds_bytes(
-                wire_stride=wire_stride, num_waves=num_waves, pipe_depth=depth
-            )
-            <= arena_bytes
+    def _bytes(depth):
+        return compact_payload_lds_bytes(
+            wire_stride=wire_stride, num_waves=num_waves, pipe_depth=depth
         )
 
-    if not _fits(1):
-        raise ValueError("compact dispatch wire tiles exceed the GEMM LDS arena")
-    # AITER_DISPATCH_PIPE_DEPTH pins the depth for A/B tuning; it must still fit.
+    if _bytes(1) > budget_bytes:
+        raise ValueError(
+            f"one compact dispatch wire tile per wave needs {_bytes(1)}B of LDS, "
+            f"above the {budget_bytes}B left once the GEMM arena is placed"
+        )
     if env_val is not None and env_val != "":
         req = int(env_val)
         if req < 1:
             raise ValueError("AITER_DISPATCH_PIPE_DEPTH must be >= 1")
-        if not _fits(req):
+        if _bytes(req) > budget_bytes:
             raise ValueError(
-                f"AITER_DISPATCH_PIPE_DEPTH={req} wire tiles do not fit the GEMM "
-                "LDS arena"
+                f"AITER_DISPATCH_PIPE_DEPTH={req} needs {_bytes(req)}B of LDS, "
+                f"above the {budget_bytes}B left once the GEMM arena is placed"
             )
         return req
-    depth = 1
-    cand = 2
-    while cand <= max_depth and _fits(cand):
-        depth = cand
-        cand += 1
-    return depth
+    return 1
 
 
 @flyc.jit
@@ -383,6 +377,7 @@ def launch_gemm_a8w4_tdm(
             experts_per_rank=dispatch_epr,
             max_tokens=dispatch_mtpr,
             topk=producer_topk,
+            max_rows=dispatch_max_rows,
             work_head_count=WORK_QUEUE_SHARDS,
         )
         if dispatch_on
@@ -413,8 +408,19 @@ def launch_gemm_a8w4_tdm(
             raise ValueError("compact dispatch needs at least one producer per rank")
         if dispatch_blocks % dispatch_world:
             raise ValueError("compact dispatch blocks must divide evenly across ranks")
-        if dispatch_persist_blocks < 1 + dispatch_blocks:
-            raise ValueError("persistent grid cannot resident the planner and producers")
+        # MegaMoE v2: num_dispatch_cu < num_cu. Ticket 0 is the planner, so a
+        # producer count that fills the first persist/grid_mult wave leaves no
+        # first-wave GEMM consumer. Host already sizes persist as CU*grid_mult.
+        if dispatch_blocks >= dispatch_persist_blocks:
+            raise ValueError(
+                "compact dispatch producers must be strictly fewer than the "
+                "persistent grid"
+            )
+        if dispatch_persist_blocks <= 1 + dispatch_blocks:
+            raise ValueError(
+                "persistent grid must resident the planner and producers "
+                "and leave at least one initial GEMM consumer"
+            )
         if dispatch_persist_blocks < WORK_QUEUE_SHARDS:
             raise ValueError("compact dispatch persistent grid must cover every queue shard")
         if dispatch_wire_stride < dispatch_payload_bytes + dispatch_scale_bytes:
@@ -529,21 +535,36 @@ def launch_gemm_a8w4_tdm(
     store_pad = c_lds_pad_elems if enable_ep_scatter else 16
     C_STORE_B = ((tile_m * (tile_n + store_pad) * 2 + 127) // 128) * 128
     ARENA_B = max(num_buffers * PITCH, C_STORE_B)
-    # The compact payload producer reuses the GEMM's LDS arena for its wire
-    # tiles, so a deeper pipe (more whole-row loads kept in flight) costs no
-    # occupancy as long as the tiles fit that arena.  Auto-pick the deepest
-    # pipe that fits, capped at _DISPATCH_MAX_PIPE_DEPTH; the gather is fabric
-    # latency bound at the GEMM's low producer occupancy, so keeping many TDM
-    # descriptors live is what feeds the engine.
-    # Resolve the producer wire pipe depth entirely host-side (single constant
-    # into the traced body -- see the helper for why no loop/ternary lives here).
+    # Compact dispatch: local HBM -> TDM -> producer-owned LDS -> TDM ->
+    # destination HBM. GEMM1 later loads that HBM A with its own TDM into
+    # the A/B/C arena. The producer region is disjoint so the copy cannot
+    # overwrite GEMM staging.
+    _DISPATCH_LDS_BUDGET_B = (
+        max(
+            0,
+            get_shared_memory_per_block(fallback_gfx="gfx1250")
+            - ARENA_B
+            - (tile_m * 8 if enable_ep_scatter else 0)
+            - 16,
+        )
+        if dispatch_on
+        else 0
+    )
     _dispatch_pipe_depth = _resolve_dispatch_pipe_depth(
         dispatch_on,
         dispatch_wire_stride,
         num_waves,
-        ARENA_B,
-        4,
+        _DISPATCH_LDS_BUDGET_B,
         os.environ.get("AITER_DISPATCH_PIPE_DEPTH"),
+    )
+    _DISPATCH_LDS_B = (
+        compact_payload_lds_bytes(
+            wire_stride=dispatch_wire_stride,
+            num_waves=num_waves,
+            pipe_depth=_dispatch_pipe_depth,
+        )
+        if dispatch_on
+        else 0
     )
     # The planner scans in the arena rather than in LDS of its own: the plan
     # runs before the first tile is staged, so the space is free, and taking a
@@ -596,6 +617,7 @@ def launch_gemm_a8w4_tdm(
     # lets the profiler aggregate the ranks into a single row.
     _disp = (
         f"_disp{dispatch_blocks}p{dispatch_persist_blocks}w{dispatch_world}"
+        f"d{_dispatch_pipe_depth}"
         if dispatch_on
         else ""
     )
@@ -680,7 +702,9 @@ def launch_gemm_a8w4_tdm(
             # off the SAME allocator so it is disjoint from the A/B/C arena.
             _rowmap_lds_ptr = _smem.allocate(tile_m * 8)._ptr
             rowmap_lds_idx = ptr_to_idx(_rowmap_lds_ptr)
-
+        if const_expr(dispatch_on):
+            _dispatch_lds_ptr = _smem.allocate(_DISPATCH_LDS_B)._ptr
+            dispatch_lds_idx = ptr_to_idx(_dispatch_lds_ptr)
         # Tickets. The role split and the work queue both want one number per
         # workgroup that every wave in it agrees on, so they share one atomic
         # broadcast: lane 0 does the fetch-add and LDS carries it to the rest.
@@ -840,7 +864,7 @@ def launch_gemm_a8w4_tdm(
                         num_waves=num_waves,
                         producer_blocks=dispatch_blocks,
                         producer_slot=entry_id - plan_blocks,
-                        lds_base_i32=arith.index_cast(T.i32, ptr_to_idx(base_ptr)),
+                        lds_base_i32=arith.index_cast(T.i32, dispatch_lds_idx),
                         addr_in_wire=fx.Int64(ptrtoint(arg_dispatch_wire)),
                         addr_in_weights=fx.Int64(ptrtoint(arg_dispatch_weights)),
                         payload_offset=(
@@ -868,7 +892,7 @@ def launch_gemm_a8w4_tdm(
                 # Producers now scatter WMMA-interleaved scales per expert, so
                 # there is no global scale-finalize phase and no launch_ready
                 # barrier: consumers wait per-tile on payload_ready[expert]
-                # (see emit_compact_wait_expert in the work-queue tile loop) and
+                # (see emit_compact_wait_tile in the work-queue tile loop) and
                 # planner/producers rejoin the queue as consumers below.
                 workgroup_barrier()
             elif const_expr(plan_on):
@@ -1069,26 +1093,23 @@ def launch_gemm_a8w4_tdm(
                 lo = go_right.select(mid + 1, lo)
                 hi = go_right.select(hi, mid)
             expert = lo
+            # Per-expert A-data OOB: bound to the owning expert's valid-row
+            # end. Padding tiles decode to expert == n_experts and do not wait.
+            mn_oob = (
+                tile_map[(expert < n_experts).select(expert, n_experts - 1)] - blk_m
+            )
             if const_expr(dispatch_on):
-                # gfx950-style per-tile payload wait: block only on this tile's
-                # expert becoming GEMM-readable (all sources delivered payload +
-                # WMMA-interleaved scales), not on a global launch barrier.
-                # Padding tiles decode to ``expert == n_experts``; clamp so the
-                # workgroup-uniform wait never indexes payload_ready OOB (their
-                # results are masked by ``expert < n_experts`` downstream).
-                _wait_expert = (expert < fx.Int32(n_experts)).select(
-                    expert, fx.Int32(0)
-                )
-                emit_compact_wait_expert(
-                    arena_handle=dispatch_arena_handle,
-                    arena_offset=dispatch_workspace_offset,
-                    layout=dispatch_layout,
-                    rank=dispatch_rank,
-                    npes=dispatch_world,
-                    experts_per_rank=dispatch_epr,
-                    expert=_wait_expert,
-                    parity=entry_gen & fx.Int32(1),
-                )
+                if expert < fx.Int32(n_experts):
+                    rows_needed = (mn_oob < tile_m).select(mn_oob, tile_m)
+                    emit_compact_wait_tile(
+                        arena_handle=dispatch_arena_handle,
+                        arena_offset=dispatch_workspace_offset,
+                        layout=dispatch_layout,
+                        rank=dispatch_rank,
+                        m_tile=blk_m // tile_m,
+                        rows_needed=rows_needed,
+                        parity=entry_gen & fx.Int32(1),
+                    )
             eb64 = fx.Int64(expert)
             B_BATCH_ROWS = n64 // 16
             N_SUPERS = (n64 + 31) // 32
@@ -1097,11 +1118,6 @@ def launch_gemm_a8w4_tdm(
             c_outer_off, c_inner_off, c_stride = blk_m64, blk_n64, i32_n
             SB_OUTER_STRIDE = K4
             sb_batch_off = eb64 * (N_SUPERS * K4)
-            # Per-expert A-data OOB: bound to the owning expert's valid-row
-            mn_oob = (
-                tile_map[(expert < n_experts).select(expert, n_experts - 1)] - blk_m
-            )
-
             def buf_ptr(s):
                 return base_ptr + s * PITCH
 

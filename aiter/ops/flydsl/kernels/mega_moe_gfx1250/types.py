@@ -84,7 +84,7 @@ class Stage1PrequantContext:
 
 @dataclass(frozen=True, slots=True)
 class Stage1DispatchContext:
-    """Resources for the gfx950-style dispatch fused into gfx1250 GEMM1.
+    """Resources for compact dispatch fused into gfx1250 GEMM1.
 
     The sender-side wire remains row-major ``[fp8 payload | e8m0 scales]``.
     Dispatch producers use the destination-owned compact plan to write each

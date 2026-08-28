@@ -583,6 +583,7 @@ class MegaMoEGfx1250:
                 experts_per_rank=config.experts_per_rank,
                 max_tokens=config.max_tokens_per_rank,
                 topk=config.topk,
+                max_rows=config.max_stage1_rows,
             )
             max_rows = config.max_stage1_rows
             scale_bytes = config.hidden_dim // 32

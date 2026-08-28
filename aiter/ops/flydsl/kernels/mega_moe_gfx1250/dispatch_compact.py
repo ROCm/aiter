@@ -7,7 +7,7 @@ This is the compact (destination-owned row plan) counterpart of
 a launch wrapper: the persistent kernel in ``mxfp4_preshuffle_gfx1250_tdm.py``
 can assign its first arrival to :func:`emit_compact_planner` and subsequent
 arrivals to :func:`emit_compact_payload`; every workgroup then rejoins the work
-queue as a consumer and gates each tile on :func:`emit_compact_wait_expert`.
+queue as a consumer and gates each tile on :func:`emit_compact_wait_tile`.
 
 There is no pull phase and no receive-slot reservation.  A route is copied
 straight to the final tile-aligned row assigned by the destination planner.
@@ -22,16 +22,13 @@ Synchronization invariants
 * A source publishes its count-matrix stores with a system release store to
   ``count_done[parity, source]``.  A destination acquires every source slot
   before computing row bases.
-* The destination clears only its current-parity ``payload_ready`` counters
-  before publishing ``plan_ready``.  Payload producers cannot race that clear:
+* The destination clears its current-parity tile-row counters before publishing
+  ``plan_ready``. Payload producers cannot race that clear:
   they wait for that destination's plan-ready generation first.
-* One source publishes exactly once to every ``(destination, local_expert)``,
-  including zero-count tasks.  Therefore ``payload_ready[parity, expert] ==
-  npes`` means all rows (and metadata) for that expert are visible.
-* TDM tensor counters are drained (and remote scale scatters completed) before
-  payload-ready is incremented, so ``payload_ready[parity, expert] == npes``
-  is a sufficient GEMM-readiness gate on its own -- there is no separate
-  launch barrier.
+* Producers publish completed row counts per destination M-tile. A tile becomes
+  readable once its counter reaches that tile's valid-row count.
+* TDM tensor counters and remote scale stores are drained before tile progress
+  is incremented, so the tile counter is the only GEMM-readiness gate.
 
 The input wire scale is row-major.  It must not be exposed as the grouped GEMM
 scale: that layout is ``(Mtile, K//128, wmma_rep, 16, 4)``.  Payload producers
@@ -65,6 +62,7 @@ LANE_MASK = WAVE - 1
 LOG2_WAVE = 5
 DEFAULT_WORK_HEADS = 8
 DEFAULT_ALIGNMENT = 128
+TILE_READY_GRANULARITY = 16
 
 
 def _align(value: int, alignment: int) -> int:
@@ -89,6 +87,7 @@ class CompactWorkspaceLayout:
     npes: int
     experts_per_rank: int
     max_pairs: int
+    tile_ready_capacity: int
     work_head_count: int
     alignment: int
     local_hist: int
@@ -102,6 +101,7 @@ class CompactWorkspaceLayout:
     pair_order_ready: int
     plan_ready: int
     payload_ready: int
+    tile_rows_ready: int
     launch_ready: int
     entry_ticket: int
     epoch_gate: int
@@ -116,6 +116,7 @@ class CompactWorkspaceLayout:
         experts_per_rank: int,
         max_tokens: int,
         topk: int,
+        max_rows: int,
         work_head_count: int = DEFAULT_WORK_HEADS,
         alignment: int = DEFAULT_ALIGNMENT,
     ) -> "CompactWorkspaceLayout":
@@ -124,6 +125,8 @@ class CompactWorkspaceLayout:
             raise ValueError("npes and experts_per_rank must be positive")
         if max_tokens < 0 or topk <= 0:
             raise ValueError("max_tokens must be non-negative and topk positive")
+        if max_rows <= 0 or max_rows % TILE_READY_GRANULARITY:
+            raise ValueError("max_rows must be positive and 16-row aligned")
         if work_head_count <= 0:
             raise ValueError("work_head_count must be positive")
         if alignment < 8 or alignment & (alignment - 1):
@@ -131,6 +134,7 @@ class CompactWorkspaceLayout:
 
         total_experts = npes * experts_per_rank
         max_pairs = max_tokens * topk
+        tile_ready_capacity = max_rows // TILE_READY_GRANULARITY
         cursor = 0
         offsets: dict[str, int] = {}
 
@@ -151,6 +155,7 @@ class CompactWorkspaceLayout:
         put("pair_order_ready", 2 * 4)
         put("plan_ready", 2 * npes * 4)
         put("payload_ready", 2 * experts_per_rank * 4)
+        put("tile_rows_ready", 2 * tile_ready_capacity * 4)
         put("launch_ready", npes * 4)
         put("entry_ticket", 8, 8)
         put("epoch_gate", 4)
@@ -161,6 +166,7 @@ class CompactWorkspaceLayout:
             npes=npes,
             experts_per_rank=experts_per_rank,
             max_pairs=max_pairs,
+            tile_ready_capacity=tile_ready_capacity,
             work_head_count=work_head_count,
             alignment=alignment,
             nbytes=_align(cursor, alignment),
@@ -181,6 +187,7 @@ class CompactWorkspaceLayout:
             "pair_order_ready",
             "plan_ready",
             "payload_ready",
+            "tile_rows_ready",
             "launch_ready",
             "entry_ticket",
             "epoch_gate",
@@ -224,11 +231,8 @@ def compact_payload_lds_bytes(
     ``pipe_depth >= 2`` gives each wave that many wire tiles in separate LDS
     banks: the producer issues ``pipe_depth`` whole-row loads back-to-back so
     that many TDM descriptors stay in flight before any drain, then flushes the
-    chunk.  The producer runs inside the register/LDS-heavy GEMM at low
-    occupancy, so keeping the tensor engine fed this way -- rather than exposing
-    one descriptor's full fabric latency per row -- is what hides the gather.
-    These tiles reuse the GEMM's LDS arena, so a deeper pipe costs no occupancy
-    as long as it fits that arena.
+    chunk.  The producer owns a private LDS region, disjoint from the GEMM
+    A/B/C arena, so a deeper pipe costs occupancy rather than GEMM staging.
     """
     if wire_stride <= 0 or num_waves <= 0:
         raise ValueError("wire_stride and num_waves must be positive")
@@ -347,6 +351,7 @@ def emit_compact_planner(
     pair_order_ready = _local(window, rank, arena_offset, layout.pair_order_ready)
     plan_ready = _local(window, rank, arena_offset, layout.plan_ready)
     payload_ready = _local(window, rank, arena_offset, layout.payload_ready)
+    tile_rows_ready = _local(window, rank, arena_offset, layout.tile_rows_ready)
     map_addr = _local(window, rank, arena_offset, m_tile_map_offset)
     num_valid_addr = _local(window, rank, arena_offset, num_valid_offset)
     idx_rsrc = _rsrc(addr_in_idx)
@@ -359,6 +364,13 @@ def emit_compact_planner(
             payload_ready,
             fx.Int32(parity) * fx.Int32(experts_per_rank) + tid,
             0,
+        )
+    active_tiles = capacity_rows // tile_m
+    for tile in range(tid, active_tiles, block_threads):
+        _store_i32(
+            tile_rows_ready,
+            fx.Int32(parity * layout.tile_ready_capacity) + tile,
+            fx.Int32(0),
         )
     comm_ops.waitcnt_all()
     fx.barrier()
@@ -740,102 +752,112 @@ def emit_compact_payload(
             fx.Int32(1),
         )
 
-        if const_expr(pipe_depth > 1):
-            # Chunked deep pipeline.  Each wave takes ``pipe_depth`` of its
-            # strided rows at a time, issues all their whole-row loads into
-            # separate LDS banks back-to-back (so up to ``pipe_depth`` TDM
-            # descriptors are in flight), drains once, then flushes the whole
-            # chunk (payload store + scale scatter + rowmap) and drains once
-            # more before reusing the banks.  This keeps the tensor engine fed
-            # at the GEMM's low producer occupancy, where the depth-1 path
-            # exposed a full load->store fabric round trip per row because only
-            # one descriptor was ever live.  Draining to zero between the load
-            # and store phase (and between chunks) needs no counter arithmetic,
-            # so the deeper pipe stays correct as ``pipe_depth`` grows.
-            base_row = wave
-            while base_row < source_count:
-                if overflow == fx.Int32(0):
-                    toks = []
-                    dsts = []
-                    routes = []
-                    preds = []
-                    for s in range_constexpr(pipe_depth):
-                        r = base_row + fx.Int32(s * num_waves)
-                        pred = r < source_count
-                        safe_r = pred.select(r, fx.Int32(0))
-                        route = _load_i32(pair_order, source_base + safe_r)
-                        toks.append(route // fx.Int32(topk))
-                        dsts.append(destination_base + r)
-                        routes.append(route)
-                        preds.append(pred)
-                        if pred:
-                            emit_load(wave_tile(fx.Int32(s)), toks[s])
-                    TDM.tdm_wait(0)
-                    for s in range_constexpr(pipe_depth):
-                        if preds[s]:
-                            emit_flush(
-                                wave_tile(fx.Int32(s)), toks[s], dsts[s], routes[s]
-                            )
-                    TDM.tdm_wait(0)
-                base_row = base_row + fx.Int32(pipe_depth * num_waves)
+        # Publish progress at M-tile granularity. A source's rows for one expert
+        # are contiguous but can cross tile boundaries; complete and signal one
+        # segment before moving to the next so GEMM need not wait for the tail.
+        segment_row = fx.Int32(0)
+        while segment_row < source_count:
+            segment_dst = destination_base + segment_row
+            tile_id = segment_dst // fx.Int32(tile_m)
+            tile_end = (tile_id + fx.Int32(1)) * fx.Int32(tile_m)
+            rows_left = source_count - segment_row
+            room = tile_end - segment_dst
+            segment_count = (rows_left < room).select(rows_left, room)
+
+            if const_expr(pipe_depth > 1):
+                base_row = wave
+                while base_row < segment_count:
+                    if overflow == fx.Int32(0):
+                        toks = []
+                        dsts = []
+                        routes = []
+                        preds = []
+                        for s in range_constexpr(pipe_depth):
+                            r = base_row + fx.Int32(s * num_waves)
+                            pred = r < segment_count
+                            safe_r = pred.select(r, fx.Int32(0))
+                            source_row = segment_row + safe_r
+                            route = _load_i32(pair_order, source_base + source_row)
+                            toks.append(route // fx.Int32(topk))
+                            dsts.append(destination_base + segment_row + r)
+                            routes.append(route)
+                            preds.append(pred)
+                            if pred:
+                                emit_load(wave_tile(fx.Int32(s)), toks[s])
+                        # Drain once per multi-row load batch, then once after
+                        # issuing the corresponding remote stores.
+                        TDM.tdm_wait(0)
+                        for s in range_constexpr(pipe_depth):
+                            if preds[s]:
+                                emit_flush(
+                                    wave_tile(fx.Int32(s)),
+                                    toks[s],
+                                    dsts[s],
+                                    routes[s],
+                                )
+                        TDM.tdm_wait(0)
+                    base_row = base_row + fx.Int32(pipe_depth * num_waves)
+            else:
+                row = wave
+                while row < segment_count:
+                    if overflow == fx.Int32(0):
+                        source_row = segment_row + row
+                        route = _load_i32(pair_order, source_base + source_row)
+                        source_token = route // fx.Int32(topk)
+                        destination_row = destination_base + source_row
+                        tile = wave_tile(fx.Int32(0))
+                        emit_load(tile, source_token)
+                        TDM.tdm_wait(0)
+                        emit_flush(tile, source_token, destination_row, route)
+                        TDM.tdm_wait(0)
+                    row = row + fx.Int32(num_waves)
+
             comm_ops.waitcnt_all()
-        else:
-            row = wave
-            while row < source_count:
-                if overflow == fx.Int32(0):
-                    route = _load_i32(pair_order, source_base + row)
-                    source_token = route // fx.Int32(topk)
-                    destination_row = destination_base + row
-                    tile = wave_tile(fx.Int32(0))
-                    emit_load(tile, source_token)
-                    TDM.tdm_wait(0)
-                    emit_flush(tile, source_token, destination_row, route)
-                    TDM.tdm_wait(0)
-                    comm_ops.waitcnt_all()
-                row = row + fx.Int32(num_waves)
-        fx.barrier()
-        if tid == fx.Int32(0):
-            comm_ops.fence_system_release()
-            remote_payload_ready = _peer(
-                window, destination, arena_offset, layout.payload_ready
-            )
-            slot = fx.Int32(parity) * fx.Int32(experts_per_rank) + local_expert
-            comm_ops.atomic_add_system(
-                remote_payload_ready + fx.Int64(slot) * 4, fx.Int32(1)
-            )
-        fx.barrier()
+            fx.barrier()
+            if tid == fx.Int32(0):
+                comm_ops.fence_system_release()
+                remote_tile_ready = _peer(
+                    window, destination, arena_offset, layout.tile_rows_ready
+                )
+                slot = (
+                    fx.Int32(parity) * fx.Int32(layout.tile_ready_capacity)
+                    + tile_id
+                )
+                comm_ops.atomic_add_system(
+                    remote_tile_ready + fx.Int64(slot) * 4, segment_count
+                )
+            fx.barrier()
+            segment_row = segment_row + segment_count
         task = task + fx.Int32(producers_per_destination)
 
 
 @traced
-def emit_compact_wait_expert(
+def emit_compact_wait_tile(
     *,
     arena_handle,
     arena_offset: int,
     layout: CompactWorkspaceLayout,
     rank: int,
-    npes: int,
-    experts_per_rank: int,
-    expert,
+    m_tile,
+    rows_needed,
     parity,
 ) -> None:
-    """Acquire the local destination's operands for one expert's M-tile.
+    """Acquire one destination M-tile as soon as all of its rows have landed.
 
     Called by every consumer (planner/producers rejoin too) right after it
-    resolves the expert owning its claimed work-queue tile.  It waits only for
-    that expert's ``payload_ready`` counter to reach ``npes`` -- i.e. all source
-    ranks delivered its payload and WMMA-interleaved scales -- so consumers on
-    ready experts start computing while producers are still shipping later ones.
-    This replaces the old global ``launch_ready`` barrier and the separate scale
-    finalize phase with gfx950-style per-tile payload waits.
+    Producers add the number of completed rows contributed to this tile after
+    draining their payload, scale and rowmap stores. The consumer waits for the
+    exact valid-row count rather than for every source to finish the expert.
     """
     window = cco.Window(fx.Int64(arena_handle))
-    payload_ready = _local(window, rank, arena_offset, layout.payload_ready)
+    tile_rows_ready = _local(window, rank, arena_offset, layout.tile_rows_ready)
     if fx.thread_idx.x == fx.Int32(0):
-        slot = fx.Int32(parity) * fx.Int32(experts_per_rank) + fx.Int32(expert)
-        # atomicAdd contributes one increment per source, hence equality to npes.
+        slot = (
+            fx.Int32(parity) * fx.Int32(layout.tile_ready_capacity)
+            + fx.Int32(m_tile)
+        )
         comm_ops.spin_until_eq_i32(
-            payload_ready + fx.Int64(slot) * 4, fx.Int32(npes)
+            tile_rows_ready + fx.Int64(slot) * 4, fx.Int32(rows_needed)
         )
     fx.barrier()
     comm_ops.fence_system_acquire()
@@ -847,5 +869,5 @@ __all__ = [
     "compact_workspace_layout",
     "emit_compact_payload",
     "emit_compact_planner",
-    "emit_compact_wait_expert",
+    "emit_compact_wait_tile",
 ]

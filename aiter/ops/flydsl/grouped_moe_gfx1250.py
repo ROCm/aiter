@@ -58,27 +58,19 @@ def _stage1_producer_blocks(
     * Recv-slot producers (``compact=False``): one producer per 384 static
       rows, clamped to [CU/8, CU/4].
 
-    * Compact-dispatch producers (``compact=True``): the cross-fabric copy is
-      the fused-stage1 bottleneck and every producer rejoins as a consumer once
-      its gather drains (``rejoin=1``), so oversubscribing the gather is nearly
-      free -- the count that actually matters is how many workgroups stay
-      resident, which scales with the machine, not the capacity-padded row
-      count (that padding pins the old ``contig_m/384`` estimate near CU/4 for
-      every shape). The knee tracks tile occupancy: small-M tiles keep many
-      workgroups resident so the gather saturates near CU*1.25 producers, while
-      large-M tiles (tile_m>=128) run at lower occupancy and oversubscribe, so
-      ~CU is the knee. On gfx1250 (CU=256) the swept optimum was ~320 for
-      tpr={64,128} (tile_m<=64) and ~256 for tpr={256,512} (tile_m=128); this
-      picks each within ~40us/layer, and any value here beats the old clamp by
-      300-800us/layer.
+    Compact fused dispatch does not use this helper: its producer count is
+    ``_stage1_compact_dispatch_cu``, which follows MegaMoE v2 and stays
+    strictly below the CU count so the first wave still has GEMM consumers.
     """
     raw = os.environ.get("AITER_FLYDSL_STAGE1_PRODUCER_BLOCKS", "auto").strip().lower()
     if raw != "auto":
         return max(0, int(raw))
     cu = _device_cu_count(device)
     if compact:
-        target = cu + cu // 4 if 0 < int(tile_m) <= 64 else cu
-        return min(target, max(1, int(gemm1_tiles)))
+        raise RuntimeError(
+            "compact dispatch producer count is _stage1_compact_dispatch_cu, "
+            "not the recv-slot gather heuristic"
+        )
     producer = (int(contiguous_m) + 383) // 384
     producer = max(max(1, cu // 8), min(producer, max(1, cu // 4)))
     return min(producer, max(1, int(gemm1_tiles)))
@@ -160,15 +152,85 @@ def _stage1_fuse_plan() -> bool:
 
 @functools.lru_cache(maxsize=1)
 def _stage1_plan_grid_mult() -> float:
-    """Workgroups per CU for the persistent grid the fused plan needs.
+    """Workgroups per CU for the recv-slot producer path.
 
-    1.5x CU (384 on gfx1250) beat both 1x and 2x in the 2-GPU DSV4-Pro sweep:
-    enough consumers to drain the live queue without crowding out 48 producer
-    workgroups. Override with AITER_FLYDSL_STAGE1_PERSIST_BLOCKS.
+    Compact dispatch uses the integer ``_stage1_dispatch_grid_mult`` below so
+    its launch geometry follows MegaMoE v2. Keep the old 1.5x default here for
+    the separate recv-slot gather path.
     """
     return max(
         0.25, float(os.environ.get("AITER_FLYDSL_STAGE1_PLAN_GRID_MULT", "1.5"))
     )
+
+
+_STAGE1_GRID_MULT_VALUES = (1, 2, 3, 4, 6, 8, 12, 16, 24, 32)
+
+
+def _stage1_dispatch_grid_mult(tokens: int, mtpr: int) -> int:
+    """CU multiples launched by compact dispatch + GEMM1.
+
+    MegaMoE v2 sizes the whole fused grid as ``CU * grid_mult`` and assigns
+    roles from arrival tickets. The first CU wave always seats
+
+      1 planner + num_producer + first-wave consumers = CU
+
+    so ``num_producer + num_consumer`` on that wave is ``CU - 1``. The 512
+    token bucket uses two waves; larger-capacity buckets use one.
+    Override with ``AITER_FLYDSL_STAGE1_GRID_MULT``.
+    """
+    raw = os.environ.get("AITER_FLYDSL_STAGE1_GRID_MULT")
+    if raw is not None:
+        value = int(raw)
+        if value not in _STAGE1_GRID_MULT_VALUES:
+            raise ValueError(
+                "AITER_FLYDSL_STAGE1_GRID_MULT must be one of "
+                "1,2,3,4,6,8,12,16,24,32"
+            )
+        return value
+    return 2 if mtpr <= tokens else 1
+
+
+def _stage1_compact_dispatch_cu(
+    *,
+    device: torch.device,
+    tokens: int,
+    mtpr: int,
+    experts_per_rank: int,
+    world_size: int,
+    model_dim: int,
+    inter_dim: int,
+) -> int:
+    """Dispatch producer CTAs for fused compact Stage1.
+
+    MegaMoE v2 keeps ``0 < num_dispatch_cu < num_cu`` so producers cannot fill
+    the first CU wave. The planner occupies ticket 0; the remaining
+    fused grid slots are assigned from one arrival-ticket sequence.
+    Override with ``AITER_FLYDSL_STAGE1_PRODUCER_BLOCKS``.
+    """
+    cu = _device_cu_count(device)
+    raw = os.environ.get("AITER_FLYDSL_STAGE1_PRODUCER_BLOCKS", "auto").strip().lower()
+    if raw != "auto":
+        dispatch_cu = max(0, int(raw))
+    else:
+        # Match the requested gfx1250 buckets: the exact-MTPR case uses 128
+        # producers in a two-wave grid; max-capacity cases use 64 in one wave.
+        _ = (experts_per_rank, model_dim, inter_dim)
+        dispatch_cu = 128 if mtpr <= tokens else 64
+    if world_size <= 0:
+        raise ValueError("compact dispatch needs a positive world size")
+    # Leave ticket 0 for the planner and at least one first-wave consumer.
+    max_dispatch = cu - 2
+    max_dispatch -= max_dispatch % world_size
+    if max_dispatch < world_size:
+        raise ValueError(
+            f"CU={cu} cannot seat planner, {world_size} producers, "
+            "and a first-wave GEMM consumer"
+        )
+    dispatch_cu = max(world_size, min(dispatch_cu, max_dispatch))
+    dispatch_cu -= dispatch_cu % world_size
+    if dispatch_cu < world_size:
+        dispatch_cu = world_size
+    return dispatch_cu
 
 
 @functools.lru_cache(maxsize=8)
@@ -186,6 +248,7 @@ def _stage1_grid_plan(
     work_queue: bool,
     gemm1_tiles: int,
     compact_dispatch: bool = False,
+    grid_mult: int | None = None,
 ) -> tuple[int, bool]:
     """Persistent grid width for gemm1 and whether the plan can be fused in.
 
@@ -210,7 +273,12 @@ def _stage1_grid_plan(
         )
     fuse_plan = True if compact_dispatch else _stage1_fuse_plan()
     if not persist and fuse_plan:
-        persist = round(_device_cu_count(device) * _stage1_plan_grid_mult())
+        cu = _device_cu_count(device)
+        persist = (
+            cu * int(grid_mult or 2)
+            if compact_dispatch
+            else round(cu * _stage1_plan_grid_mult())
+        )
     # A persistent grid wider than the tile grid is the tile grid plus idle
     # workgroups, so cap it there -- and drop it entirely once the cap leaves
     # too few workgroups to cover every queue shard.
@@ -218,10 +286,23 @@ def _stage1_grid_plan(
         persist = min(persist, gemm1_tiles)
     if persist < WORK_QUEUE_SHARDS:
         persist = 0
-    # Ticket 0 plans and the next producer_blocks tickets gather, so a grid
-    # that cannot seat all of them would leave the rendezvous waiting on a
-    # producer that never runs.
-    fuse_plan = fuse_plan and persist >= producer_blocks + 1
+    # Ticket 0 plans and the next producer_blocks tickets dispatch. Compact
+    # dispatch additionally requires producers strictly below the CU count
+    # (first-wave ``producer + consumer = CU - 1``) and at least one initial
+    # consumer, matching MegaMoE v2's ``num_dispatch_cu < num_cu`` /
+    # ``grid_x > 0`` invariants. Producers and the planner rejoin that pool
+    # after their first role completes.
+    role_blocks = producer_blocks + 1
+    if compact_dispatch and persist:
+        cu = _device_cu_count(device)
+        if producer_blocks >= cu:
+            raise ValueError(
+                f"compact dispatch producers={producer_blocks} must be < CU={cu} "
+                "so the first wave still has GEMM consumers"
+            )
+    fuse_plan = fuse_plan and (
+        persist > role_blocks if compact_dispatch else persist >= role_blocks
+    )
     return persist, fuse_plan
 
 
@@ -803,16 +884,22 @@ def _grouped_a8w4_tdm_moe(
     _gemm1_tiles = ((contiguous_m + tile_m - 1) // tile_m) * (
         (two_inter + tile_n - 1) // tile_n
     )
+    _dispatch_grid_mult = (
+        _stage1_dispatch_grid_mult(
+            int(token_num), int(stage1_dispatch.max_tokens_per_rank)
+        )
+        if dispatch_on
+        else 1
+    )
     _dispatch_blocks = (
-        _tdm_align_up(
-            max(
-                int(stage1_dispatch.world_size),
-                _stage1_producer_blocks(
-                    device, contiguous_m, _gemm1_tiles, compact=True, tile_m=tile_m
-                )
-                or 128,
-            ),
-            int(stage1_dispatch.world_size),
+        _stage1_compact_dispatch_cu(
+            device=device,
+            tokens=int(token_num),
+            mtpr=int(stage1_dispatch.max_tokens_per_rank),
+            experts_per_rank=int(stage1_dispatch.experts_per_rank),
+            world_size=int(stage1_dispatch.world_size),
+            model_dim=int(model_dim),
+            inter_dim=int(inter_dim),
         )
         if dispatch_on
         else 0
@@ -840,15 +927,29 @@ def _grouped_a8w4_tdm_moe(
         work_queue=_work_queue,
         gemm1_tiles=_gemm1_tiles,
         compact_dispatch=dispatch_on,
+        grid_mult=_dispatch_grid_mult,
+    )
+    _cu = _device_cu_count(device)
+    _initial_consumers = (
+        _persist - 1 - _dispatch_blocks if dispatch_on and _persist else 0
+    )
+    _first_wave_consumers = (
+        max(0, _cu - 1 - _dispatch_blocks) if dispatch_on else 0
     )
     if dispatch_on and not _fuse_plan:
         raise ValueError(
-            "compact stage1 persistent grid cannot seat planner plus dispatch producers"
+            "compact stage1 CU*grid_mult launch cannot seat planner plus "
+            "dispatch producers; raise AITER_FLYDSL_STAGE1_GRID_MULT or lower "
+            "AITER_FLYDSL_STAGE1_PRODUCER_BLOCKS"
         )
     if os.environ.get("AITER_FLYDSL_STAGE1_DEBUG", "0") == "1":
         print(
             f"# stage1 producer={_producer_blocks} persist={_persist} "
             f"dispatch={_dispatch_blocks} "
+            f"initial_consumer={_initial_consumers} "
+            f"first_wave_producer+consumer={_dispatch_blocks + _first_wave_consumers} "
+            f"first_wave_consumer={_first_wave_consumers} "
+            f"grid_mult={_persist / _cu:g} "
             f"fuse_plan={int(_fuse_plan)} gemm1_tiles={_gemm1_tiles} "
             f"contig_m={contiguous_m} tile_m={tile_m} tile_n={tile_n} "
             f"work_queue={int(_work_queue)} rejoin={int(_rejoin)}",
