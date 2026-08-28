@@ -58,6 +58,19 @@ __all__ = [
     "shape_id",
 ]
 
+# Supported targets.
+_JDBBA_BWD_GFX = ("gfx942", "gfx950")
+
+
+def _require_jdbba_bwd_gfx(device: torch.device) -> None:
+    arch = str(torch.cuda.get_device_properties(device).gcnArchName).split(":")[0]
+    if arch not in _JDBBA_BWD_GFX:
+        raise ValueError(
+            "jagged_dense_bmm_bwd_dispatched targets CDNA MFMA (gfx942/gfx950); "
+            f"got {arch}"
+        )
+
+
 # --------------------------------------------------------------------------- #
 # Per-shape JSON dispatch (mirrors jagged_dense_bmm_dispatch's loader shape).    #
 # --------------------------------------------------------------------------- #
@@ -313,6 +326,9 @@ def jagged_dense_bmm_bwd_dispatched(
         max_seq_len = int((seq_offsets[1:] - seq_offsets[:-1]).max().item())
     max_seq_len = int(max_seq_len)
 
+    device = jagged.device
+    _require_jdbba_bwd_gfx(device)
+
     # Resolve per-shape schedule (explicit kwarg > JSON winner > D-bucketed
     # heuristic), then build (memoized) the launchers specialized to this shape.
     # For the backward K == N == D.
@@ -337,7 +353,6 @@ def jagged_dense_bmm_bwd_dispatched(
 
     import flydsl.compiler as flyc
 
-    device = jagged.device
     total_rows = jagged.shape[0]
     # Multi-GPU: from_dlpack and kernel launch require the current device to match
     # jagged.device (mirrors flydsl_flash_attn_func's device-context wrap).
