@@ -6,8 +6,8 @@ JSON loading, and the validated, deterministic nested-layout directory
 builder every loader goes through.
 
 The per-family loaders build on this module and keep their own files:
-``gemm_config_utils``, ``conv_config_utils``, ``mhc_config_utils`` and
-``tuned_config_utils``.
+``gemm_config_utils``, ``conv_config_utils``, ``mhc_config_utils``,
+``moe_config_utils`` and ``tuned_config_utils``.
 """
 
 import functools
